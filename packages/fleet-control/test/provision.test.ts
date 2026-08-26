@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it } from 'vitest';
+import { createHash } from 'node:crypto';
+import { mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { describe, expect, it, vi } from 'vitest';
 import { ActiveRouteAttestationError } from '../src/active-route.js';
 import type {
   BridgeMutationPlan,
@@ -42,11 +46,36 @@ import type {
   InitialExecutionFenceState,
   LiveDeployment,
   MaintenanceHealth,
+  PlainWorkerRouteApi,
   ProvisioningBackend,
   ProvisioningBackendKind,
   SeedDeploymentIdentityOptions,
 } from '../src/types.js';
 import { externalReleaseScriptName } from '../src/workers-for-platforms-backend.js';
+import { WranglerLoopBackend } from '../src/wrangler-loop-backend.js';
+import type { CommandResult, CommandRunner } from '../src/wrangler-runner.js';
+import { memoryStore, routeApi } from './fixtures/plain-worker-port-probe.js';
+import {
+  type PlainWorkerFsControl,
+  registerScratchCleanup,
+} from './fixtures/wrangler-fs-mock.js';
+
+const fsControl = vi.hoisted<PlainWorkerFsControl>(() => ({
+  failFleetCleanup: false,
+  residualDirectory: undefined,
+  cleanupError: new Error('provision upload cleanup failed'),
+}));
+
+vi.mock('node:fs/promises', async () => {
+  const { createFsPromisesMock } = await import(
+    './fixtures/wrangler-fs-mock.js'
+  );
+  return createFsPromisesMock(fsControl);
+});
+
+const exportDirectories = registerScratchCleanup(fsControl, {
+  cleanupError: fsControl.cleanupError,
+});
 
 const secrets: DeploymentSecrets = {
   deploymentIdentity: 'deployment-identity-secret-value-0001',
@@ -680,6 +709,239 @@ class R2RollbackBackend extends FakeBackend {
   ): Promise<void> {
     this.buckets.delete(resource.bucketName);
   }
+}
+
+async function j1Harness(deployment: DeploymentSpec) {
+  const digest = deploymentSpecDigest(deployment);
+  const state = {
+    databaseExists: false,
+    workerExists: false,
+    deploymentExists: false,
+    preexistingVersion: false,
+    candidateVersion: false,
+    publicAccessEnabled: false,
+    sentinelExists: false,
+    databaseOwner: undefined as string | undefined,
+    appliedMigrations: 0,
+  };
+  const runnerCalls: string[][] = [];
+  const runner: CommandRunner = {
+    maxDurationMs: 5 * 60_000,
+    async run(arguments_: readonly string[]): Promise<CommandResult> {
+      runnerCalls.push([...arguments_]);
+      const command = arguments_.slice(0, 2).join(' ');
+      if (command === 'd1 list') {
+        return {
+          stdout: JSON.stringify(
+            state.databaseExists
+              ? [{ uuid: 'database-id', name: deployment.databaseName }]
+              : [],
+          ),
+          stderr: '',
+        };
+      }
+      if (command === 'd1 create') {
+        state.databaseExists = true;
+        return { stdout: '', stderr: '' };
+      }
+      if (command === 'deployments status') {
+        if (!state.deploymentExists) throw new Error('deployment not found');
+        return {
+          stdout: JSON.stringify({
+            versions: [{ id: 'candidate', percentage: 100 }],
+          }),
+          stderr: '',
+        };
+      }
+      if (command === 'versions list') {
+        if (!state.workerExists) throw new Error('script not found');
+        return {
+          stdout: JSON.stringify([
+            ...(state.preexistingVersion
+              ? [
+                  {
+                    id: 'existing',
+                    annotations: { 'workers/tag': digest },
+                  },
+                ]
+              : []),
+            ...(state.candidateVersion
+              ? [
+                  {
+                    id: 'candidate',
+                    annotations: { 'workers/tag': digest },
+                  },
+                ]
+              : []),
+          ]),
+          stderr: '',
+        };
+      }
+      if (command === 'versions view') {
+        return {
+          stdout: JSON.stringify({
+            id: 'candidate',
+            annotations: { 'workers/tag': digest },
+            resources: {
+              bindings: [
+                { type: 'd1', name: 'DB', id: 'database-id' },
+                {
+                  type: 'durable_object_namespace',
+                  name: 'MAINTENANCE',
+                  class_name: 'Maintenance',
+                  namespace_id: 'namespace-maintenance',
+                },
+                {
+                  type: 'plain_text',
+                  name: 'DEPLOYMENT_TENANT',
+                  text: deployment.tenantTag,
+                },
+                {
+                  type: 'plain_text',
+                  name: 'FLEET_ENVIRONMENT',
+                  text: deployment.environment,
+                },
+                {
+                  type: 'plain_text',
+                  name: 'FLEET_SCHEMA_VERSION',
+                  text: String(deployment.schemaVersion),
+                },
+                {
+                  type: 'plain_text',
+                  name: 'FLEET_SPEC_DIGEST',
+                  text: digest,
+                },
+                {
+                  type: 'plain_text',
+                  name: 'FLEET_INGRESS_CONTRACT',
+                  text: 'guarded-object-v1',
+                },
+              ],
+            },
+          }),
+          stderr: '',
+        };
+      }
+      if (arguments_[0] === 'deploy') {
+        state.workerExists = true;
+        state.deploymentExists = true;
+        state.candidateVersion = true;
+        state.publicAccessEnabled = true;
+        return { stdout: '', stderr: '' };
+      }
+      if (arguments_[0] === 'delete') {
+        state.workerExists = false;
+        state.deploymentExists = false;
+        state.preexistingVersion = false;
+        state.candidateVersion = false;
+        state.publicAccessEnabled = false;
+        return { stdout: '', stderr: '' };
+      }
+      throw new Error(`unexpected command ${arguments_.join(' ')}`);
+    },
+  };
+  const plainRouteApi: PlainWorkerRouteApi = routeApi({
+    async queryDatabase(_databaseId, sql, bindings = []) {
+      if (
+        sql.includes("FROM sqlite_schema WHERE type = 'table' ORDER BY name")
+      ) {
+        return state.sentinelExists
+          ? [
+              {
+                name: 'flowsafe_deployment',
+                sql: 'CREATE TABLE IF NOT EXISTS flowsafe_deployment (id INTEGER PRIMARY KEY CHECK (id = 1), tenant_tag TEXT NOT NULL, provisioned_at TEXT NOT NULL)',
+              },
+            ]
+          : [];
+      }
+      if (
+        sql.includes("FROM sqlite_schema WHERE type = 'table' AND name = ?")
+      ) {
+        return state.sentinelExists
+          ? [
+              {
+                sql: 'CREATE TABLE IF NOT EXISTS flowsafe_deployment (id INTEGER PRIMARY KEY CHECK (id = 1), tenant_tag TEXT NOT NULL, provisioned_at TEXT NOT NULL)',
+              },
+            ]
+          : [];
+      }
+      if (sql.startsWith('PRAGMA table_info(flowsafe_deployment)')) {
+        return [
+          { name: 'id', type: 'INTEGER', notnull: 0, pk: 1 },
+          { name: 'tenant_tag', type: 'TEXT', notnull: 1, pk: 0 },
+          { name: 'provisioned_at', type: 'TEXT', notnull: 1, pk: 0 },
+        ];
+      }
+      if (sql.includes('SELECT id, tenant_tag FROM flowsafe_deployment')) {
+        return state.databaseOwner
+          ? [{ id: 1, tenant_tag: state.databaseOwner }]
+          : [];
+      }
+      if (sql.startsWith('CREATE TABLE IF NOT EXISTS flowsafe_deployment')) {
+        state.sentinelExists = true;
+        return [];
+      }
+      if (sql.startsWith('INSERT OR IGNORE INTO flowsafe_deployment')) {
+        state.databaseOwner = bindings[0];
+        return [];
+      }
+      if (sql.includes('SELECT version, sql_sha256')) {
+        return deployment.migrations
+          .slice(0, state.appliedMigrations)
+          .map((migration) => ({
+            version: migration.version,
+            sql_sha256: createHash('sha256')
+              .update(migration.sql)
+              .digest('hex'),
+          }));
+      }
+      return [];
+    },
+    async batchDatabase() {
+      state.appliedMigrations += 1;
+    },
+    async getDatabase(databaseId) {
+      return state.databaseExists && databaseId === 'database-id'
+        ? {
+            id: 'database-id',
+            name: deployment.databaseName,
+            created: false,
+          }
+        : undefined;
+    },
+    async deleteDatabase(databaseId) {
+      if (databaseId === 'database-id') state.databaseExists = false;
+    },
+    async inspectOrdinaryWorkerFootprint() {
+      return {
+        scriptPresent: state.workerExists,
+        workersDevEnabled: state.publicAccessEnabled,
+        previewUrlsEnabled: false,
+        customDomains: [],
+        zoneRoutes: [],
+      };
+    },
+    async disableOrdinaryWorkerPublicAccess() {
+      state.publicAccessEnabled = false;
+    },
+    async listDurableObjectNamespaces() {
+      return state.workerExists ? ['namespace-maintenance'] : [];
+    },
+  });
+
+  const exportDirectory = await mkdtemp(
+    join(tmpdir(), 'provision-b1b-export-'),
+  );
+  exportDirectories.add(exportDirectory);
+  const backend = new WranglerLoopBackend({
+    runner,
+    routeApi: plainRouteApi,
+    exportDirectory,
+    exportStore: memoryStore(),
+  });
+  const store = new MemoryStore();
+
+  return { backend, store, runnerCalls, state };
 }
 
 describe('fleet provisioning', () => {
@@ -2988,5 +3250,66 @@ describe('fleet provisioning', () => {
     ).rejects.toThrow(/failed to clean/);
     expect(backend.events).not.toContain('delete-database');
     expect(store.record?.phase).toBe('worker-deployed');
+  });
+
+  it('rolls back a Worker this attempt created when upload scratch cleanup fails', async () => {
+    const deployment = spec({
+      egressProxyService: undefined,
+    });
+    const { backend, store, runnerCalls, state } = await j1Harness(deployment);
+    fsControl.failFleetCleanup = true;
+
+    const failure = await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: deployment,
+      secrets,
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ProvisioningError);
+    expect((failure as ProvisioningError).cause).toMatchObject({
+      message: expect.stringContaining(
+        'but failed to clean up the adapter credential scratch',
+      ),
+      createdByAttempt: true,
+      resourceState: 'present',
+    });
+    expect(state.workerExists).toBe(false);
+    expect(state.databaseExists).toBe(false);
+    expect(store.record).toBeUndefined();
+    expect(runnerCalls.some(([command]) => command === 'delete')).toBe(true);
+  });
+
+  it('leaves a pre-existing Worker in place when upload scratch cleanup fails', async () => {
+    const deployment = spec({
+      egressProxyService: undefined,
+    });
+    const { backend, store, runnerCalls, state } = await j1Harness(deployment);
+    state.workerExists = true;
+    state.preexistingVersion = true;
+    state.publicAccessEnabled = true;
+    fsControl.failFleetCleanup = true;
+
+    const failure = await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: deployment,
+      secrets,
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ProvisioningError);
+    expect((failure as ProvisioningError).cause).toMatchObject({
+      message: expect.stringContaining(
+        'but failed to clean up the adapter credential scratch',
+      ),
+      createdByAttempt: false,
+      resourceState: 'present',
+    });
+    expect(runnerCalls.some(([command]) => command === 'delete')).toBe(false);
+    expect(state.workerExists).toBe(true);
+    expect(state.databaseExists).toBe(true);
+    expect(store.record).toBeUndefined();
   });
 });

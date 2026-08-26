@@ -56,6 +56,17 @@ export function mutationFence(
   return { mutationLeaseTtlMs: 15 * 60_000, assertOwned };
 }
 
+export async function rejectedValue(
+  operation: Promise<unknown>,
+): Promise<unknown> {
+  try {
+    await operation;
+  } catch (error) {
+    return error;
+  }
+  throw new Error('expected rejection');
+}
+
 export async function drain(body: ReadableStream<Uint8Array>): Promise<{
   readonly size: number;
   readonly sha256: string;

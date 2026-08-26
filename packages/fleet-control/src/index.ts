@@ -62,6 +62,10 @@ export {
 } from './fleet.js';
 export type { HostRoutingTarget } from './host-routing.js';
 export {
+  PlainWorkerBackend,
+  type PlainWorkerBackendOptions,
+} from './plain-worker-backend.js';
+export {
   type PlatformPlaneClient,
   type PlatformPlaneResult,
   type PlatformPlaneSpec,
@@ -136,8 +140,20 @@ export {
   type LiveDeployment,
   type MaintenanceHealth,
   type ObservedActiveRoute,
+  type PlainWorkerCleanupOutcome,
   type PlainWorkerCustomDomain,
+  type PlainWorkerDatabaseExportResult,
+  type PlainWorkerDatabaseInventoryEntry,
+  type PlainWorkerDeploymentStatus,
+  type PlainWorkerMutationOutcome,
+  type PlainWorkerProvisioningApi,
   type PlainWorkerRouteApi,
+  type PlainWorkerUploadIntent,
+  type PlainWorkerUploadIntentBase,
+  type PlainWorkerUploadOutcome,
+  type PlainWorkerVersionBinding,
+  type PlainWorkerVersionDetail,
+  type PlainWorkerVersionSummary,
   type PlatformPlaneLease,
   type PlatformPlaneResourceSet,
   type PlatformPlaneStateStore,

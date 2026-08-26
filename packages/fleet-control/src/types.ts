@@ -625,9 +625,9 @@ export type PlainWorkerMutationOutcome =
   | Readonly<{ status: 'failed'; error: unknown }>;
 
 /**
- * Adapter scratch-cleanup outcome. A failure is never thrown by the adapter
- * after dispatch; the caller surfaces it after reconciliation. An adapter with
- * no adapter-owned scratch always reports `succeeded`.
+ * Adapter-owned post-dispatch cleanup outcome. A failure is never thrown by
+ * the adapter after dispatch; the caller surfaces it after reconciliation. An
+ * adapter with no adapter-owned scratch always reports `succeeded`.
  */
 export type PlainWorkerCleanupOutcome =
   | Readonly<{ status: 'succeeded' }>
@@ -637,21 +637,21 @@ export type PlainWorkerCleanupOutcome =
 export type PlainWorkerUploadOutcome = PlainWorkerMutationOutcome &
   Readonly<{ cleanup: PlainWorkerCleanupOutcome }>;
 
-/** Shared provider mechanics for an ordinary Worker candidate upload. */
-interface PlainWorkerUploadIntentBase {
+/** Shared provider intent for an ordinary Worker candidate upload. */
+export interface PlainWorkerUploadIntentBase {
   /** Provider script name. */
   readonly scriptName: string;
   /** Fleet tag attached to the uploaded candidate. */
   readonly candidateTag: string;
-  /** Main module path written into the generated configuration. */
+  /** Main module selected from the uploaded modules. */
   readonly mainModule: string;
-  /** Worker modules written into the adapter-owned staging directory. */
+  /** Worker modules to upload. */
   readonly modules: readonly WorkerModule[];
   /** Worker compatibility date. */
   readonly compatibilityDate: string;
   /** Worker compatibility flags, preserving provider-config omission. */
   readonly compatibilityFlags: readonly string[] | undefined;
-  /** Worker bindings written into the generated configuration and secrets file. */
+  /** Desired Worker bindings. */
   readonly bindings: {
     readonly plainText: readonly {
       readonly name: string;
@@ -683,7 +683,7 @@ interface PlainWorkerUploadIntentBase {
       readonly bucketName: string;
     }[];
   };
-  /** Worker resource limits written into the generated configuration. */
+  /** Desired Worker resource limits. */
   readonly limits: { readonly cpuMs: number | undefined };
   /** Ordinary Worker public-access mechanics applied by this upload. */
   readonly publicAccess: {
@@ -702,6 +702,14 @@ export type PlainWorkerUploadIntent = PlainWorkerUploadIntentBase &
     | Readonly<{ mode: 'staged' }>
   );
 
+/**
+ * Provider operations shared by ordinary-Worker adapters.
+ *
+ * Every mutating member that takes an `ExternalMutationFence` must assert it
+ * immediately before each provider request it issues. The Cloudflare transport
+ * enforces this requirement for `CloudflareProvisioningClient`.
+ * `withMutationFence` carries the active fence through nested provider calls.
+ */
 export interface PlainWorkerRouteApi {
   withMutationFence<T>(
     fence: ExternalMutationFence,
@@ -815,8 +823,8 @@ export interface PlainWorkerRouteApi {
  * `deleteDatabaseFenced`, asserts it immediately before every provider request
  * it issues through the command runner or route API. `deleteDatabaseFenced`
  * runs inside `withMutationFence` and relies on the route API's per-request
- * assertion (HEAD parity, D10); whether the direct-API adapter additionally
- * pre-asserts is a named conformance question for B2.
+ * assertion (parity with the pre-port Wrangler CLI loop); whether the
+ * direct-API adapter additionally pre-asserts remains an open question.
  *
  * A method that resolves a `PlainWorkerMutationOutcome` over a transport that
  * asserts per request must ALSO assert explicitly before dispatch, so a lost

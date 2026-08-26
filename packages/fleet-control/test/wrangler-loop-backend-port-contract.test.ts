@@ -468,10 +468,10 @@ describe('WranglerLoopBackend provisioning port contract', () => {
     ).toBe(false);
   });
 
-  it('surfaces cleanup failure after reconciliation and leaves the Worker deployed', async () => {
+  it('classifies cleanup failure after reconciliation for caller-owned rollback', async () => {
     fsControl.failFleetCleanup = true;
     const runner = uploadRunner();
-    await expect(
+    const rejection = await rejectedValue(
       (await backend(runner)).deployWorker(
         spec,
         database,
@@ -479,7 +479,15 @@ describe('WranglerLoopBackend provisioning port contract', () => {
         undefined,
         mutationFence(),
       ),
-    ).rejects.toBe(fsControl.cleanupError);
+    );
+    expect(rejection).toEqual(
+      expect.objectContaining({
+        message: `installed Worker '${spec.scriptName}' but failed to clean up the adapter credential scratch: adapter cleanup failed`,
+        createdByAttempt: true,
+        resourceState: 'present',
+      }),
+    );
+    expect((rejection as Error).cause).toBe(fsControl.cleanupError);
     expect(
       runner.calls.some(
         (arguments_) =>
@@ -492,10 +500,10 @@ describe('WranglerLoopBackend provisioning port contract', () => {
     expect(fsControl.residualDirectory).toBeDefined();
   });
 
-  it('surfaces an undefined adapter cleanup rejection after backend reconciliation', async () => {
+  it('wraps an undefined adapter cleanup rejection after backend reconciliation', async () => {
     fsControl.failFleetCleanup = true;
     fsControl.cleanupError = undefined;
-    await expect(
+    const rejection = await rejectedValue(
       (await backend(uploadRunner())).deployWorker(
         spec,
         database,
@@ -503,7 +511,15 @@ describe('WranglerLoopBackend provisioning port contract', () => {
         undefined,
         mutationFence(),
       ),
-    ).rejects.toBeUndefined();
+    );
+    expect(rejection).toEqual(
+      expect.objectContaining({
+        message: `installed Worker '${spec.scriptName}' but failed to clean up the adapter credential scratch`,
+        createdByAttempt: true,
+        resourceState: 'present',
+      }),
+    );
+    expect((rejection as Error).cause).toBeUndefined();
   });
 
   it('uses rediscovery failure when a dispatched upload rejects with undefined', async () => {
@@ -579,27 +595,27 @@ describe('WranglerLoopBackend provisioning port contract', () => {
   it.each([
     [
       'missing version id',
-      'wrangler deployment status has an invalid version',
+      'plain Worker deployment status has an invalid version',
       { versions: [{ percentage: 10 }] },
     ],
     [
       'empty inventory',
-      'wrangler deployment status has no versions',
+      'plain Worker deployment status has no versions',
       { versions: [] },
     ],
     [
       'negative percentage',
-      'wrangler deployment status has an invalid version',
+      'plain Worker deployment status has an invalid version',
       { versions: [{ id: 'v1', percentage: -1 }] },
     ],
     [
       'omitted percentage',
-      'wrangler deployment status has an invalid version',
+      'plain Worker deployment status has an invalid version',
       { versions: [{ id: 'v1' }] },
     ],
     [
       'non-numeric percentage',
-      'wrangler deployment status has an invalid version',
+      'plain Worker deployment status has an invalid version',
       { versions: [{ id: 'v1', percentage: 'NaN' }] },
     ],
   ])('keeps the %s backend deployment-status refusal', async (_title, message, status) => {

@@ -2079,7 +2079,7 @@ export default {
     await expect(
       backend(runner).ensureDatabase(deployment, fence),
     ).rejects.toThrow(
-      'Wrangler command maximum duration must be below the external mutation fence lease TTL',
+      'provider mutation maximum duration must be below the external mutation fence lease TTL',
     );
     expect(runner.calls.map(operation)).toEqual([]);
     expect(fence.assertOwned).not.toHaveBeenCalled();

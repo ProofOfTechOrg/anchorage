@@ -45,6 +45,8 @@ The three Worker exports are deployment artifacts for the platform's own Workers
 
 Construct `WorkersForPlatformsBackend` with a dispatch namespace, one named shared outbound Worker, and a state-egress root secret. All three values are mandatory. The constructor rejects an incomplete dispatch-native configuration before it can call a provider.
 
+`PlainWorkerBackend` is the shared ordinary-Worker core that `WranglerLoopBackend` wraps. It is not intended for subclassing outside Fleet Control.
+
 An ordinary state Worker can exist only as the finalized result of the dedicated plain-to-Workers-for-Platforms switch. Pass its narrow finalized-state provider back to provision, migration, and rollback operations. That provider exact-inspects and advances the retained bridge without allowing the normal backend to originate ordinary state resources.
 
 The state-egress credential digest is immutable after a deployment adopts or creates trusted state. Rotating `FLEET_STATE_EGRESS_ROOT_SECRET` for an existing deployment requires a coordinated credential migration that updates trusted state and host routing together. Fleet control attests the derived digest and the exact secret-name inventory, but Cloudflare does not expose secret values for comparison.

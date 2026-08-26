@@ -174,9 +174,9 @@ export function plainWorkerBindingsToProviderShape(
       case 'unsupported':
         if (binding.issue === 'not-object') return undefined;
         // For `invalid-type` the reconstructed type changes no message (either spelling
-        // fails the type check); for `unsupported-type` it preserves HEAD's `unsupported
-        // or malformed` refusal instead of an index-based `no valid type`. Carried as a
-        // provider fact for B1b/B2 diagnostics.
+        // fails the type check); for `unsupported-type` it preserves the pre-port
+        // `unsupported or malformed` refusal instead of an index-based `no valid type`.
+        // Carried as a provider fact for adapter diagnostics.
         return { type: binding.providerType, name: binding.name };
     }
     // Exhaustiveness tripwire: a new normalized binding must define wire reconstruction.

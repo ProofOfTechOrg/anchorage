@@ -184,6 +184,7 @@ try {
   ActiveRouteAttestationError,
   CloudflareProvisioningClient,
   D1CloudflareApiRateCoordinator,
+  PlainWorkerBackend,
   ProcessLocalCloudflareApiRateCoordinator,
   ProvisioningError,
   WorkersForPlatformsBackend,
@@ -212,8 +213,21 @@ try {
   type FleetStateDatabase,
   type InitialExecutionFenceState,
   type ObservedActiveRoute,
+  type PlainWorkerBackendOptions,
+  type PlainWorkerCleanupOutcome,
   type PlainWorkerCustomDomain,
+  type PlainWorkerDatabaseExportResult,
+  type PlainWorkerDatabaseInventoryEntry,
+  type PlainWorkerDeploymentStatus,
+  type PlainWorkerMutationOutcome,
+  type PlainWorkerProvisioningApi,
   type PlainWorkerRouteApi,
+  type PlainWorkerUploadIntent,
+  type PlainWorkerUploadIntentBase,
+  type PlainWorkerUploadOutcome,
+  type PlainWorkerVersionBinding,
+  type PlainWorkerVersionDetail,
+  type PlainWorkerVersionSummary,
   type ProvisioningBackend,
   type SeedDeploymentIdentityOptions,
   type WorkersForPlatformsApi,
@@ -237,6 +251,28 @@ declare const deploymentSpec: DeploymentSpec;
 declare const provisioningBackend: ProvisioningBackend;
 declare const fleetRecord: FleetRecord;
 declare const plainWorkerRouteApi: PlainWorkerRouteApi;
+declare const plainWorkerProvisioningApiShape: PlainWorkerProvisioningApi;
+const plainWorkerBackendOptions: PlainWorkerBackendOptions = {
+  api: plainWorkerProvisioningApiShape,
+  identityCaller: 'PackedConsumer.seedDeploymentIdentity',
+};
+const plainWorkerBackend: ProvisioningBackend = new PlainWorkerBackend(
+  plainWorkerBackendOptions,
+);
+type PlainWorkerPortRecords = readonly [
+  PlainWorkerCleanupOutcome,
+  PlainWorkerDatabaseExportResult,
+  PlainWorkerDatabaseInventoryEntry,
+  PlainWorkerDeploymentStatus,
+  PlainWorkerMutationOutcome,
+  PlainWorkerUploadIntent,
+  PlainWorkerUploadIntentBase,
+  PlainWorkerUploadOutcome,
+  PlainWorkerVersionBinding,
+  PlainWorkerVersionDetail,
+  PlainWorkerVersionSummary,
+];
+declare const plainWorkerPortRecords: PlainWorkerPortRecords;
 // The provisioning-time fence state a control plane has to choose. Named here
 // because it is a REQUIRED provisionDeployment option: a consumer that cannot
 // import its type cannot type its own provisioning wrapper.
@@ -298,6 +334,7 @@ const settlementHost: FleetSettlementHost = {
 void ActiveRouteAttestationError;
 void CloudflareProvisioningClient;
 void D1CloudflareApiRateCoordinator;
+void PlainWorkerBackend;
 void ProcessLocalCloudflareApiRateCoordinator;
 void ProvisioningError;
 void WorkersForPlatformsBackend;
@@ -326,6 +363,10 @@ void deploymentSpec;
 void provisioningBackend;
 void fleetRecord;
 void plainWorkerRouteApi;
+void plainWorkerProvisioningApiShape;
+void plainWorkerBackendOptions;
+void plainWorkerBackend;
+void plainWorkerPortRecords;
 void initialExecutionFenceState;
 void lockedAtBirth;
 void seedOptions;
