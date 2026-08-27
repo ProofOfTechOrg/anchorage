@@ -6,6 +6,11 @@ import {
   type CloudflareApiRateCoordinator,
   ProcessLocalCloudflareApiRateCoordinator,
 } from '../../src/cloudflare-rate-coordinator.js';
+import {
+  maintenanceResponder,
+  type ProviderWorld,
+  type WorkerRoute,
+} from './provider-world.js';
 
 type PageInfo = Readonly<{
   page?: number;
@@ -72,6 +77,7 @@ export function envelope(result: unknown): Response {
 export function zoneAuthorityResponse(
   url: URL,
   zoneIds: readonly string[],
+  routes?: readonly WorkerRoute[],
 ): Response | undefined {
   if (url.pathname.endsWith('/user/tokens/verify')) {
     return envelope({ id: 'token-id', status: 'active' });
@@ -102,6 +108,16 @@ export function zoneAuthorityResponse(
     expect(url.searchParams.get('account.id')).toBe('account');
     if (url.searchParams.has('page')) return envelope([]);
     return envelope(zoneIds.map((id) => ({ id, account: { id: 'account' } })));
+  }
+  const parts = url.pathname.split('/').filter(Boolean);
+  const zoneIndex = parts.indexOf('zones');
+  const zoneId = zoneIndex >= 0 ? parts[zoneIndex + 1] : undefined;
+  if (routes && zoneId && url.pathname.endsWith('/workers/routes')) {
+    return envelope(
+      routes
+        .filter((route) => route.zoneId === zoneId)
+        .map(({ id, pattern, script }) => ({ id, pattern, script })),
+    );
   }
   return undefined;
 }
@@ -145,16 +161,6 @@ export function deferred<T>(): {
     resolve = next;
   });
   return { promise, resolve };
-}
-
-export function errorChain(error: unknown): string {
-  const messages: string[] = [];
-  let current = error;
-  while (current instanceof Error) {
-    messages.push(current.message);
-    current = current.cause;
-  }
-  return messages.join(' | ');
 }
 
 export interface CloudflareFetchRecord {
@@ -257,30 +263,47 @@ export function recordingFetch(
   return { fetch: fixtureFetch, requests, probes, events };
 }
 
-export interface ProviderWorld {
-  readonly scripts: Map<
-    string,
-    {
-      versions: Array<{
-        versionId: string;
-        tag: string | undefined;
-        bindings: readonly unknown[];
-      }>;
-      deployment?: Array<{ versionId: string; percentage: number }>;
-      subdomain: { enabled: boolean; previewsEnabled: boolean };
-    }
-  >;
-  readonly databases: Array<{ databaseId: string; name: string }>;
-}
-
-export function providerWorld(): ProviderWorld {
-  return { scripts: new Map(), databases: [] };
-}
-
 export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
-  return async ({ method, url, body }) => {
+  return async (request) => {
+    const { method, url, body } = request;
     const target = new URL(url);
+    const maintenance = await maintenanceResponder(world, request);
+    if (maintenance) return maintenance;
+    if (target.hostname === 'd1-export.example.test') {
+      const databaseId = target.pathname
+        .split('/')
+        .at(-1)
+        ?.replace(/\.sql$/u, '');
+      const bytes = databaseId ? world.exports.get(databaseId) : undefined;
+      return bytes
+        ? new Response(bytes, {
+            headers: { 'content-length': String(bytes.byteLength) },
+          })
+        : new Response('missing export', { status: 404 });
+    }
+    if (target.hostname !== 'api.cloudflare.com') {
+      return new Response('provider projection refuses this origin', {
+        status: 403,
+      });
+    }
+    const authority = zoneAuthorityResponse(
+      target,
+      world.zones.map(({ id }) => id),
+      world.routes,
+    );
+    if (authority) return authority;
     const parts = target.pathname.split('/').filter(Boolean);
+    const routeIndex = parts.indexOf('routes');
+    const routeId = routeIndex >= 0 ? parts[routeIndex + 1] : undefined;
+    if (routeId && method === 'DELETE') {
+      const index = world.routes.findIndex(({ id }) => id === routeId);
+      if (index < 0) return Response.json({ errors: [] }, { status: 404 });
+      // Ordinary-Worker public-access writes use subdomain.create; the only
+      // routes.delete caller is disableControlWorkerPublicAccess.
+      world.routes.splice(index, 1);
+      world.mutationLog.push(`delete-route:${routeId}`);
+      return single({});
+    }
     const scriptsIndex = parts.indexOf('scripts');
     const scriptName = scriptsIndex >= 0 ? parts[scriptsIndex + 1] : undefined;
     const bodyField = (name: string): unknown =>
@@ -301,11 +324,20 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
     }
     if (target.pathname.endsWith('/d1/database') && method === 'POST') {
       const name = bodyField('name');
-      const databaseId = `database-${world.databases.length + 1}`;
-      world.databases.push({
-        databaseId,
-        name: typeof name === 'string' ? name : '',
-      });
+      if (
+        typeof name === 'string' &&
+        world.databases.some((database) => database.name === name)
+      ) {
+        return failedResponse();
+      }
+      const failure = world.consumeFailure('createDatabase');
+      if (failure && !failure.dispatched) return failureResponse(failure);
+      const database = world.createDatabase(
+        typeof name === 'string' ? name : '',
+      );
+      await world.applyAfter('createDatabase');
+      if (failure) return failureResponse(failure);
+      const { databaseId } = database;
       return single({ uuid: databaseId, name });
     }
     const databaseIndex = parts.indexOf('database');
@@ -332,40 +364,273 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
         (candidate) => candidate.databaseId === databaseId,
       );
       if (index < 0) return Response.json({ errors: [] }, { status: 404 });
+      const failure = world.consumeFailure('deleteDatabase');
+      if (failure && !failure.dispatched) return failureResponse(failure);
       world.databases.splice(index, 1);
+      world.mutationLog.push(`delete-database:${databaseId}`);
+      await world.applyAfter('deleteDatabase');
+      if (failure) return failureResponse(failure);
       return single({});
     }
     if (databaseId && target.pathname.endsWith('/query') && method === 'POST') {
-      return pageArray([{ success: true, results: [] }]);
+      const database = world.databases.find(
+        (candidate) => candidate.databaseId === databaseId,
+      );
+      if (!database) return Response.json({ errors: [] }, { status: 404 });
+      const batch = bodyField('batch');
+      if (Array.isArray(batch)) {
+        database.d1.batchDatabase(
+          batch.map((statement) => ({
+            sql: readStringFact(statement, 'sql') ?? '',
+            bindings: readStringArray(statement, 'params'),
+          })),
+        );
+        await world.applyAfter('batchDatabase');
+        return pageArray(batch.map(() => ({ success: true, results: [] })));
+      }
+      const sql = bodyField('sql');
+      const rows = database.d1.queryDatabase(
+        typeof sql === 'string' ? sql : '',
+        readStringArray(body, 'params'),
+      );
+      await world.applyAfter('queryDatabase');
+      return pageArray([{ success: true, results: rows }]);
+    }
+    if (
+      databaseId &&
+      target.pathname.endsWith('/export') &&
+      method === 'POST'
+    ) {
+      const failure = world.consumeFailure('exportDatabase');
+      if (failure && !failure.dispatched) return failureResponse(failure);
+      world.mutationLog.push(`export:${databaseId}`);
+      await world.applyAfter('exportDatabase');
+      if (failure) return failureResponse(failure);
+      return single({
+        status: 'complete',
+        result: {
+          signed_url: `https://d1-export.example.test/${encodeURIComponent(databaseId)}.sql?signature=world`,
+        },
+      });
+    }
+    if (target.pathname.endsWith('/workers/scripts') && method === 'GET') {
+      if (target.searchParams.has('page')) return pageArray([]);
+      return pageArray(
+        [...world.scripts.entries()].flatMap(([id, script]) =>
+          script.present ? [{ id }] : [],
+        ),
+      );
+    }
+    if (target.pathname.endsWith('/workers/domains') && method === 'GET') {
+      const domains = world.customDomains.map((domain) => ({ ...domain }));
+      await world.applyAfter('listCustomDomains');
+      return pageArray(domains);
+    }
+    if (target.pathname.endsWith('/workers/domains') && method === 'PUT') {
+      const failure = world.consumeFailure('attachCustomDomain');
+      if (failure && !failure.dispatched) return failureResponse(failure);
+      const hostname = bodyField('hostname');
+      const service = bodyField('service');
+      if (typeof hostname !== 'string' || typeof service !== 'string') {
+        return failedResponse();
+      }
+      const current = world.customDomains.find(
+        (domain) => domain.hostname === hostname,
+      );
+      if (current) current.service = service;
+      else {
+        world.customDomains.push({
+          id: world.allocateDomainId(),
+          hostname,
+          service,
+        });
+      }
+      world.mutationLog.push(`attach-domain:${hostname}`);
+      await world.applyAfter('attachCustomDomain');
+      if (failure) return failureResponse(failure);
+      return single({
+        id: world.customDomains.find((domain) => domain.hostname === hostname)
+          ?.id,
+      });
+    }
+    const domainsIndex = parts.indexOf('domains');
+    const domainId = domainsIndex >= 0 ? parts[domainsIndex + 1] : undefined;
+    if (domainId && method === 'DELETE') {
+      const index = world.customDomains.findIndex(({ id }) => id === domainId);
+      if (index < 0) return Response.json({ errors: [] }, { status: 404 });
+      const failure = world.consumeFailure('detachCustomDomain');
+      if (failure && !failure.dispatched) return failureResponse(failure);
+      world.customDomains.splice(index, 1);
+      world.mutationLog.push(`detach-domain:${domainId}`);
+      await world.applyAfter('detachCustomDomain');
+      if (failure) return failureResponse(failure);
+      return single({});
+    }
+    if (
+      target.pathname.endsWith('/workers/durable_objects/namespaces') &&
+      method === 'GET'
+    ) {
+      if (target.searchParams.has('page')) return pageArray([]);
+      return pageArray(
+        world.durableObjectNamespaces.map((namespace) => ({
+          id: namespace.id,
+          script: namespace.script,
+          class: namespace.className,
+        })),
+      );
+    }
+    if (
+      target.pathname.endsWith('/workers/dispatch/namespaces') &&
+      method === 'GET'
+    ) {
+      return pageArray(
+        world.dispatchNamespaces.map((namespace) => ({
+          namespace_name: namespace.name,
+          trusted_workers: false,
+          script_count: namespace.scripts.length,
+        })),
+      );
+    }
+    const dispatchIndex = parts.indexOf('namespaces');
+    const dispatchNamespace =
+      dispatchIndex >= 0 ? parts[dispatchIndex + 1] : undefined;
+    const dispatchScriptIndex = parts.indexOf('scripts', dispatchIndex + 1);
+    const dispatchScriptName =
+      dispatchScriptIndex >= 0 ? parts[dispatchScriptIndex + 1] : undefined;
+    if (
+      dispatchNamespace &&
+      target.pathname.endsWith(`/${dispatchNamespace}/scripts`) &&
+      method === 'GET'
+    ) {
+      const namespace = world.dispatchNamespaces.find(
+        ({ name }) => name === dispatchNamespace,
+      );
+      return pageArray(
+        namespace?.scripts.map(({ name }) => ({ id: name, tags: [] })) ?? [],
+      );
+    }
+    if (
+      dispatchNamespace &&
+      dispatchScriptName &&
+      target.pathname.endsWith('/settings') &&
+      method === 'GET'
+    ) {
+      const script = world.dispatchNamespaces
+        .find(({ name }) => name === dispatchNamespace)
+        ?.scripts.find(({ name }) => name === dispatchScriptName);
+      return script
+        ? single({ bindings: script.bindings })
+        : Response.json({ errors: [] }, { status: 404 });
     }
     if (!scriptName) {
       throw new Error(`unexpected request ${method} ${target.pathname}`);
     }
-    let script = world.scripts.get(scriptName);
+    const script = world.scripts.get(scriptName);
     if (
       target.pathname.endsWith(`/workers/scripts/${scriptName}`) &&
       method === 'PUT'
     ) {
       const metadata = bodyField('metadata');
-      const versionId = `version-${(script?.versions.length ?? 0) + 1}`;
-      script ??= {
-        versions: [],
-        subdomain: { enabled: false, previewsEnabled: false },
-      };
-      script.versions.unshift({
-        versionId,
-        tag: readVersionTag(metadata),
-        bindings: readBindings(metadata),
-      });
-      world.scripts.set(scriptName, script);
+      const pending = world.peekFailure('uploadCandidate');
+      if (pending && !pending.dispatched) {
+        world.consumeFailure('uploadCandidate');
+        if (pending.at === 'public-access') {
+          throw new Error(
+            "ProviderFailure.at:'public-access' requires dispatched:true",
+          );
+        }
+        if (pending.error) throw pending.error;
+        return pending.response ?? failureResponse(pending);
+      }
+      const settlesAtScript = pending?.at === 'script';
+      if (pending?.error && !settlesAtScript) {
+        world.consumeFailure('uploadCandidate');
+        // subdomain.create is outside the sanitized send() boundary and keeps
+        // the SDK's retries, so thrown fixture errors must settle at the PUT.
+        throw new Error(
+          "ProviderFailure.error requires at:'script' — the subdomain endpoint is outside sanitizeProviderError() and is retried by the SDK",
+        );
+      }
+      const failure = settlesAtScript
+        ? world.consumeFailure('uploadCandidate')
+        : undefined;
+      const versions = world.applyUpload(
+        {
+          scriptName,
+          mode: 'initial',
+          tag: readVersionTag(metadata),
+          bindings: readBindings(metadata),
+          mainModule: readStringFact(metadata, 'main_module') ?? '',
+          modules: readModules(body),
+        },
+        { duplicate: failure?.duplicate },
+      );
+      // The real adapter writes public access with a separate subdomain request
+      // after the script exists; the script PUT records only upload state.
+      if (pending && !settlesAtScript) {
+        world.deferFailure('uploadCandidate');
+      } else {
+        await world.applyAfter('uploadCandidate');
+      }
+      if (failure?.error) throw failure.error;
+      if (failure) return failure.response ?? failureResponse(failure);
+      return single({ id: scriptName, etag: versions[0]?.versionId });
+    }
+    if (!script?.present) return Response.json({ errors: [] }, { status: 404 });
+    if (
+      target.pathname.endsWith(`/workers/scripts/${scriptName}`) &&
+      method === 'GET'
+    ) {
       return single({ id: scriptName });
     }
-    if (!script) return Response.json({ errors: [] }, { status: 404 });
     if (
       target.pathname.endsWith(`/workers/scripts/${scriptName}`) &&
       method === 'DELETE'
     ) {
-      world.scripts.delete(scriptName);
+      const failure = world.consumeFailure('deleteWorkerScript');
+      if (failure && !failure.dispatched) return failureResponse(failure);
+      world.deleteScript(scriptName);
+      await world.applyAfter('deleteWorkerScript');
+      if (failure) return failureResponse(failure);
+      return single({});
+    }
+    if (target.pathname.endsWith('/secrets') && method === 'GET') {
+      if (target.searchParams.has('page')) return pageArray([]);
+      return pageArray(
+        [...script.secretNames].sort().map((name) => ({ name })),
+      );
+    }
+    if (target.pathname.endsWith('/secrets-bulk') && method === 'PATCH') {
+      // Ordinary-Worker secret writes only delete individual secrets; bulkUpdate
+      // belongs to Workers for Platforms and platform-control paths.
+      const secrets = bodyField('secrets');
+      if (secrets && typeof secrets === 'object') {
+        for (const name of Reflect.ownKeys(secrets)) {
+          if (typeof name !== 'string') continue;
+          if (Reflect.get(secrets, name) === null)
+            script.secretNames.delete(name);
+          else script.secretNames.add(name);
+        }
+      }
+      world.mutationLog.push(`update-secrets:${scriptName}`);
+      return single({});
+    }
+    const secretsIndex = parts.indexOf('secrets');
+    const secretName = secretsIndex >= 0 ? parts[secretsIndex + 1] : undefined;
+    if (secretName && method === 'DELETE') {
+      const failure = world.consumeFailure('deleteControlSecrets');
+      if (failure && !failure.dispatched) return failureResponse(failure);
+      script.secretNames.delete(secretName);
+      world.mutationLog.push(`delete-secret:${scriptName}:${secretName}`);
+      await world.applyAfter('deleteControlSecrets');
+      if (failure) return failureResponse(failure);
+      return single({});
+    }
+    if (secretName && method === 'PUT') {
+      // The ordinary-Worker plane only deletes secrets by name; no source path
+      // calls the SDK's single-secret update endpoint.
+      script.secretNames.add(secretName);
+      world.mutationLog.push(`update-secret:${scriptName}:${secretName}`);
       return single({});
     }
     if (target.pathname.endsWith('/deployments') && method === 'GET') {
@@ -399,16 +664,29 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
     }
     if (target.pathname.endsWith('/versions') && method === 'POST') {
       const metadata = bodyField('metadata');
-      const bindings = readBindings(metadata);
-      const versionId = `version-${script.versions.length + 1}`;
-      script.versions.unshift({
-        versionId,
-        tag: readVersionTag(metadata),
-        bindings,
-      });
+      const failure = world.consumeFailure('uploadCandidate');
+      if (failure && !failure.dispatched) {
+        if (failure.error) throw failure.error;
+        return failure.response ?? failureResponse(failure);
+      }
+      const versions = world.applyUpload(
+        {
+          scriptName,
+          mode: 'staged',
+          tag: readVersionTag(metadata),
+          bindings: readBindings(metadata),
+          mainModule: readStringFact(metadata, 'main_module') ?? '',
+          modules: readModules(body),
+        },
+        { duplicate: failure?.duplicate },
+      );
+      await world.applyAfter('uploadCandidate');
+      if (failure?.error) throw failure.error;
+      if (failure) return failure.response ?? failureResponse(failure);
+      const version = versions[0];
       return single({
-        id: versionId,
-        resources: { bindings },
+        id: version?.versionId,
+        resources: { bindings: version?.bindings ?? [] },
       });
     }
     const versionId = parts.at(-1);
@@ -437,24 +715,55 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
       });
     }
     if (target.pathname.endsWith('/subdomain') && method === 'POST') {
+      const uploadFailure = world.consumeDeferredFailure('uploadCandidate');
+      const failure =
+        uploadFailure ?? world.consumeFailure('disablePublicAccess');
+      if (failure && !failure.dispatched) return failureResponse(failure);
       const payload = body && typeof body === 'object' ? body : {};
       script.subdomain.enabled = Reflect.get(payload, 'enabled') === true;
       script.subdomain.previewsEnabled =
         Reflect.get(payload, 'previews_enabled') === true;
+      world.mutationLog.push(`configure-public-access:${scriptName}`);
+      if (uploadFailure) await world.applyAfter('uploadCandidate');
+      else await world.applyAfter('disablePublicAccess');
+      if (failure) return failure.response ?? failureResponse(failure);
       return single({ enabled: script.subdomain.enabled });
     }
     if (target.pathname.endsWith('/deployments') && method === 'POST') {
       const versions = bodyField('versions');
-      script.deployment = Array.isArray(versions)
+      const deployment = Array.isArray(versions)
         ? versions.map((version) => ({
             versionId: readStringFact(version, 'version_id') ?? '',
             percentage: Number(Reflect.get(version, 'percentage')),
           }))
         : [];
+      const operation =
+        deployment.length === 1 && deployment[0]?.percentage === 100
+          ? 'promoteWorker'
+          : 'deployCandidate';
+      const failure = world.consumeFailure(operation);
+      if (failure && !failure.dispatched) return failureResponse(failure);
+      world.applyDeployment(scriptName, deployment);
+      await world.applyAfter(operation);
+      if (failure) return failureResponse(failure);
       return single({ id: 'deployment' });
     }
     throw new Error(`unexpected request ${method} ${target.pathname}`);
   };
+}
+
+function failureResponse(failure: { readonly error?: Error }): Response {
+  return failedResponse(failure.error?.message);
+}
+
+function failedResponse(message = 'injected provider failure'): Response {
+  return Response.json(
+    {
+      success: false,
+      errors: [{ code: 1, message }],
+    },
+    { status: 400 },
+  );
 }
 
 function readVersionTag(metadata: unknown): string | undefined {
@@ -475,4 +784,36 @@ function readBindings(metadata: unknown): readonly unknown[] {
   if (!metadata || typeof metadata !== 'object') return [];
   const bindings = Reflect.get(metadata, 'bindings');
   return Array.isArray(bindings) ? bindings : [];
+}
+
+function readStringArray(value: unknown, name: string): readonly string[] {
+  if (!value || typeof value !== 'object') return [];
+  const values = Reflect.get(value, name);
+  return Array.isArray(values)
+    ? values.flatMap((item) => (typeof item === 'string' ? [item] : []))
+    : [];
+}
+
+function readModules(body: unknown): readonly {
+  name: string;
+  content: string;
+  contentType: string;
+}[] {
+  if (!body || typeof body !== 'object') return [];
+  const files = Reflect.get(body, 'files');
+  if (!Array.isArray(files)) return [];
+  return files.flatMap((file) => {
+    const name = readStringFact(file, 'name');
+    const content = readStringFact(file, 'text');
+    const contentType = readStringFact(file, 'type');
+    return name && content !== undefined
+      ? [
+          {
+            name,
+            content,
+            contentType: contentType ?? 'application/javascript+module',
+          },
+        ]
+      : [];
+  });
 }

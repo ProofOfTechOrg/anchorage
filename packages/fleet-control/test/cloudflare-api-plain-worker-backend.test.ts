@@ -13,9 +13,7 @@ import type {
 } from '../src/types.js';
 import {
   type CloudflareFixtureHandler,
-  type ProviderWorld,
   pageArray,
-  providerWorld,
   recordingFetch,
   restProjection,
   single,
@@ -23,6 +21,10 @@ import {
   zoneAuthorityResponse,
 } from './fixtures/cloudflare-fetch-fixture.js';
 import { memoryStore } from './fixtures/plain-worker-port-probe.js';
+import {
+  type ProviderWorld,
+  providerWorld,
+} from './fixtures/provider-world.js';
 
 const baseSpec: DeploymentSpec = {
   tenantTag: 'acme',
@@ -103,7 +105,11 @@ function projectedHandler(
       }
     }
     if (request.method === 'GET' && url.pathname.endsWith('/workers/scripts')) {
-      return pageArray([...world.scripts.keys()].map((id) => ({ id })));
+      return pageArray(
+        [...world.scripts.entries()].flatMap(([id, script]) =>
+          script.present ? [{ id }] : [],
+        ),
+      );
     }
     if (url.pathname.endsWith('/secrets') && request.method === 'GET') {
       if (url.searchParams.has('page')) return pageArray([]);
@@ -131,18 +137,7 @@ function projectedHandler(
         { status: 500 },
       );
     }
-    const response = await projected(request);
-    const updatedScript = world.scripts.get(baseSpec.scriptName);
-    if (
-      request.method === 'PUT' &&
-      url.pathname.endsWith(`/workers/scripts/${baseSpec.scriptName}`) &&
-      updatedScript?.versions[0]
-    ) {
-      updatedScript.deployment = [
-        { versionId: updatedScript.versions[0].versionId, percentage: 100 },
-      ];
-    }
-    return response;
+    return projected(request);
   };
 }
 
@@ -231,6 +226,39 @@ describe('CloudflareApiPlainWorkerBackend', () => {
     const script = world.scripts.get(baseSpec.scriptName);
     expect(script).toBeDefined();
     expect(script?.versions.length).toBeGreaterThan(0);
+  });
+
+  it('accepts a reconciled initial upload after public access converges', async () => {
+    const world = providerWorld();
+    const { backend } = subject(projectedHandler(world), async () =>
+      maintenanceResponse(baseSpec),
+    );
+    world.failNext('uploadCandidate', { dispatched: true });
+    world.afterNext('uploadCandidate', (current) => {
+      const script = current.scripts.get(baseSpec.scriptName);
+      if (script) {
+        // The seed models a committed subdomain write whose response was lost
+        // after the preceding script upload could no longer report success.
+        script.subdomain = { enabled: true, previewsEnabled: false };
+      }
+    });
+
+    const deployed = await backend.deployWorker(
+      baseSpec,
+      database,
+      secrets,
+      undefined,
+      fence(),
+    );
+    const tagged = world.scripts
+      .get(baseSpec.scriptName)
+      ?.versions.filter(({ tag }) => tag === deploymentSpecDigest(baseSpec));
+
+    expect(deployed).toEqual({
+      artifactVersion: tagged?.[0]?.versionId,
+      created: true,
+    });
+    expect(tagged).toHaveLength(1);
   });
 
   it('runs an initial deploy, staged maintenance, promotion, and ready inspection over REST', async () => {

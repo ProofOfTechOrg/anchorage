@@ -9,6 +9,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { ActiveRouteAttestationError } from '../src/active-route.js';
 import type { DurableDatabaseExportStore } from '../src/cloudflare-client.js';
 import { WorkerDeploymentError } from '../src/deployment-error.js';
+import { plainWorkerIngressModule } from '../src/plain-worker-backend.js';
 import { deploymentSpecDigest } from '../src/spec-digest.js';
 import type {
   DatabaseReference,
@@ -20,10 +21,7 @@ import type {
   PlainWorkerCustomDomain,
   PlainWorkerRouteApi,
 } from '../src/types.js';
-import {
-  plainWorkerIngressModule,
-  WranglerLoopBackend,
-} from '../src/wrangler-loop-backend.js';
+import { WranglerLoopBackend } from '../src/wrangler-loop-backend.js';
 import type { CommandResult, CommandRunner } from '../src/wrangler-runner.js';
 
 const deployment: DeploymentSpec = {

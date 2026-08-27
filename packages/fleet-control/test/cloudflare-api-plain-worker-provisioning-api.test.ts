@@ -10,18 +10,18 @@ import type {
 import {
   type CloudflareFixtureHandler,
   deferred,
-  errorChain,
-  providerWorld,
   recordingFetch,
   restProjection,
   single,
   testRateCoordinator,
 } from './fixtures/cloudflare-fetch-fixture.js';
+import { errorChain } from './fixtures/plain-worker-harnesses.js';
 import {
   memoryStore,
   mutationFence,
   rejectedValue,
 } from './fixtures/plain-worker-port-probe.js';
+import { providerWorld } from './fixtures/provider-world.js';
 
 function uploadIntent(mode: 'initial' | 'staged'): PlainWorkerUploadIntent {
   const base = {
@@ -98,7 +98,7 @@ function emptyScriptWorld(
   subdomain = { enabled: false, previewsEnabled: false },
 ) {
   const world = providerWorld();
-  world.scripts.set('acme-production', {
+  world.seedScript('acme-production', {
     versions: [],
     subdomain,
   });
@@ -135,8 +135,8 @@ function outcomeOperations(
 describe('CloudflareApiPlainWorkerProvisioningApi', () => {
   it('projects the REST world through the provider-neutral read port', async () => {
     const world = providerWorld();
-    world.databases.push({ databaseId: 'database-1', name: 'acme-production' });
-    world.scripts.set('acme-production', {
+    world.seedDatabase('acme-production', { databaseId: 'database-1' });
+    world.seedScript('acme-production', {
       versions: [
         {
           versionId: 'version-1',
@@ -145,6 +145,8 @@ describe('CloudflareApiPlainWorkerProvisioningApi', () => {
             { type: 'd1', name: 'DB', database_id: 'database-1' },
             { type: 'plain_text', name: 'DEPLOYMENT_TENANT', text: 'acme' },
           ],
+          mainModule: 'worker.js',
+          modules: [{ name: 'worker.js', content: 'export default {}' }],
         },
       ],
       deployment: [{ versionId: 'version-1', percentage: 100 }],
@@ -306,8 +308,8 @@ describe('CloudflareApiPlainWorkerProvisioningApi', () => {
       .catch((error: unknown) => error);
 
     expect(errorChain(failure)).toContain(transportFailure.message);
-    // Reads keep the SDK's two retries; D16 disables retries only on the
-    // listed non-idempotent mutations.
+    // Reads keep the SDK's two retries; only the listed non-idempotent
+    // mutations disable them.
     expect(wrapperInvoked).toHaveBeenCalledTimes(3);
     expect(providerIssued).not.toHaveBeenCalled();
     expect(providerFixture.requests).toHaveLength(0);
@@ -331,8 +333,8 @@ describe('CloudflareApiPlainWorkerProvisioningApi', () => {
     await expect(
       api.uploadCandidate(uploadIntent('staged'), ownedFence()),
     ).resolves.toMatchObject({ status: 'failed' });
-    // Idempotent subdomain writes keep the SDK's two retries; D16 disables
-    // retries only on the listed non-idempotent mutations.
+    // Idempotent subdomain writes keep the SDK's two retries; only the listed
+    // non-idempotent mutations disable retries.
     expect(
       fixture.requests.filter(
         ({ method, url }) =>
@@ -534,7 +536,7 @@ describe('CloudflareApiPlainWorkerProvisioningApi', () => {
 
   it('runs deletion and export requests inside the fenced client scope', async () => {
     const world = emptyScriptWorld();
-    world.databases.push({ databaseId: 'database-1', name: 'acme-production' });
+    world.seedDatabase('acme-production', { databaseId: 'database-1' });
     const projected = restProjection(world);
     const handler: CloudflareFixtureHandler = async (request) => {
       const url = new URL(request.url);
@@ -613,7 +615,7 @@ describe('CloudflareApiPlainWorkerProvisioningApi', () => {
 
   it('does not dispatch any mutation after lease takeover following reads', async () => {
     const world = emptyScriptWorld();
-    world.databases.push({ databaseId: 'database-1', name: 'acme-production' });
+    world.seedDatabase('acme-production', { databaseId: 'database-1' });
     const { api, fixture } = subject(restProjection(world), {
       exportStore: memoryStore(),
     });

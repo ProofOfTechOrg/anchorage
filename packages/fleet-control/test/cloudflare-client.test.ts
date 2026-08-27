@@ -14,11 +14,11 @@ import type {
 } from '../src/types.js';
 import {
   envelope,
-  errorChain,
   fenced,
   testRateCoordinator,
   zoneAuthorityResponse,
 } from './fixtures/cloudflare-fetch-fixture.js';
+import { errorChain } from './fixtures/plain-worker-harnesses.js';
 
 function deployment(overrides: Partial<DeploymentSpec> = {}): DeploymentSpec {
   return {

@@ -81,6 +81,8 @@ Both ordinary-Worker backends upload a digest-tagged Worker Version with the exa
 
 The direct API backend must create an initial script before Cloudflare accepts its workers.dev configuration. For either ordinary-Worker backend, tagged-version rediscovery accepts a failed upload only after the Worker footprint attests the intended workers.dev and preview-URL state.
 
+Both built-in ordinary-Worker backends run the same conformance suite. It verifies fleet records, backend results, provider-visible Worker versions and bindings, deployment percentages, secret names, domains, databases, Durable Object namespaces, export bytes and integrity, initial-deploy public access, and mutation ordering where order affects safety. It deliberately excludes transport requests and commands, fence-call counts, pagination mechanics, export locations, provider diagnostics, and adapter scratch-cleanup outcomes. On staged uploads, the direct API adapter also converges workers.dev and preview-URL settings, while `wrangler versions upload` does not; the shared suite therefore does not assert staged public-access state.
+
 When that workers.dev write keeps failing, the refusal's compensating traffic removal also fails and leaves the Worker in the account for operator cleanup; the provisioning error reports `resourceState: 'unknown'`.
 
 The credentialed lane exercises the configured CPU limit at runtime through its `cpu-control` and `cpu-over-limit` probes.

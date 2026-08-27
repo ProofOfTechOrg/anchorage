@@ -17,6 +17,7 @@ import {
   runCredentialedConformance,
   validateOperationalConformance,
 } from '../scripts/credentialed-conformance-runtime.mjs';
+import { plainWorkerIngressModule } from '../src/plain-worker-backend.js';
 import {
   canonicalMaintenanceCapabilityPublicKey,
   FLEET_AUDIT_PROXY_CLASS_NAME,
@@ -32,7 +33,6 @@ import {
   validateDeploymentSecrets,
   validateDeploymentSpec,
 } from '../src/validation.js';
-import { plainWorkerIngressModule } from '../src/wrangler-loop-backend.js';
 
 const REQUIRED_ENVIRONMENT_VARIABLES = [
   'FLEET_CONFORMANCE_CONFIG',

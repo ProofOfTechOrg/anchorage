@@ -54,5 +54,3 @@ export class WranglerLoopBackend extends PlainWorkerBackend {
     });
   }
 }
-
-export { plainWorkerIngressModule } from './plain-worker-backend.js';

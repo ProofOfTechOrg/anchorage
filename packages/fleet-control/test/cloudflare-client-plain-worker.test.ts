@@ -16,20 +16,20 @@ import type {
 } from '../src/types.js';
 import {
   deferred,
-  errorChain,
   fenced,
   pageArray,
   pageItems,
-  providerWorld,
   recordingFetch,
   restProjection,
   single,
   testRateCoordinator,
   zoneAuthorityResponse,
 } from './fixtures/cloudflare-fetch-fixture.js';
+import { errorChain } from './fixtures/plain-worker-harnesses.js';
+import { providerWorld } from './fixtures/provider-world.js';
 
-// Shared-client WFP-plane cases live here because the legacy WFP suite is
-// intentionally imports-only under the checkpoint allowlist.
+// Shared-client WFP-plane cases live here so the legacy WFP request and
+// response pins remain byte-comparable to the pre-plain-worker client.
 
 function apiFailure(status: number, message = 'provider failure'): Response {
   return Response.json(
@@ -340,12 +340,14 @@ describe('CloudflareProvisioningClient plain-worker plane', () => {
       },
       { type: 'plain_text', name: 'FLEET_SCHEMA_VERSION', text: '1' },
     ];
-    world.scripts.set('plain', {
+    world.seedScript('plain', {
       versions: [
         {
           versionId: 'v1',
           tag: undefined,
           bindings,
+          mainModule: 'worker.js',
+          modules: [{ name: 'worker.js', content: 'export default {}' }],
         },
       ],
       deployment: [{ versionId: 'v1', percentage: 100 }],
@@ -878,10 +880,8 @@ describe('CloudflareProvisioningClient plain-worker plane', () => {
 
   it('models the provider-side D1 name filter', async () => {
     const world = providerWorld();
-    world.databases.push(
-      { databaseId: 'target-id', name: 'target' },
-      { databaseId: 'other-id', name: 'other' },
-    );
+    world.seedDatabase('target', { databaseId: 'target-id' });
+    world.seedDatabase('other', { databaseId: 'other-id' });
     const fixture = recordingFetch(restProjection(world));
 
     await expect(

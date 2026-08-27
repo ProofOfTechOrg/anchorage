@@ -711,7 +711,7 @@ class R2RollbackBackend extends FakeBackend {
   }
 }
 
-async function j1Harness(deployment: DeploymentSpec) {
+async function wranglerLoopHarness(deployment: DeploymentSpec) {
   const digest = deploymentSpecDigest(deployment);
   const state = {
     databaseExists: false,
@@ -929,9 +929,7 @@ async function j1Harness(deployment: DeploymentSpec) {
     },
   });
 
-  const exportDirectory = await mkdtemp(
-    join(tmpdir(), 'provision-b1b-export-'),
-  );
+  const exportDirectory = await mkdtemp(join(tmpdir(), 'provision-export-'));
   exportDirectories.add(exportDirectory);
   const backend = new WranglerLoopBackend({
     runner,
@@ -3256,7 +3254,8 @@ describe('fleet provisioning', () => {
     const deployment = spec({
       egressProxyService: undefined,
     });
-    const { backend, store, runnerCalls, state } = await j1Harness(deployment);
+    const { backend, store, runnerCalls, state } =
+      await wranglerLoopHarness(deployment);
     fsControl.failFleetCleanup = true;
 
     const failure = await provisionDeployment({
@@ -3285,7 +3284,8 @@ describe('fleet provisioning', () => {
     const deployment = spec({
       egressProxyService: undefined,
     });
-    const { backend, store, runnerCalls, state } = await j1Harness(deployment);
+    const { backend, store, runnerCalls, state } =
+      await wranglerLoopHarness(deployment);
     state.workerExists = true;
     state.preexistingVersion = true;
     state.publicAccessEnabled = true;
