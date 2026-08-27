@@ -169,6 +169,22 @@ module.exports = {
         via: { pathNot: KNOWN_APPROVAL_API_CYCLE },
       },
     },
+    {
+      name: 'fleet-control-client-layers-are-one-way',
+      severity: 'error',
+      comment:
+        'The ordinary-Worker operations module, the provider-error module, and the active-route leaf sit under the Cloudflare client. A back-import would restore the coupling the extraction removed, and packages/fleet-control is outside no-new-architecture-cycles. tsPreCompilationDeps keeps type-only imports in the graph, so an `import type` back-edge is covered.',
+      from: {
+        path: [
+          '^packages/fleet-control/src/(?:active-route|cloudflare-ordinary-worker-operations|cloudflare-provider-errors)\\.ts$',
+          '^scripts/architecture-fixtures/fleet-control-leaf-imports-client\\.ts$',
+        ],
+      },
+      to: {
+        path: '^packages/fleet-control/src/cloudflare-client\\.ts$',
+        reachable: true,
+      },
+    },
   ],
   required: [
     {

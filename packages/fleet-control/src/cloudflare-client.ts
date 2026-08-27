@@ -3,18 +3,42 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 import Cloudflare from 'cloudflare';
-import type { ScriptUpdateParams } from 'cloudflare/resources/workers/scripts/scripts';
-import type { VersionCreateParams } from 'cloudflare/resources/workers/scripts/versions';
 import type { NamespaceListResponse } from 'cloudflare/resources/workers-for-platforms/dispatch/namespaces/namespaces';
 import { toFile } from 'cloudflare/uploads';
 import PQueue from 'p-queue';
-import { ActiveRouteAttestationError } from './active-route.js';
+import { exactActiveVersionId } from './active-route.js';
 import { canonicalApplicationBindings } from './application-bindings.js';
+import {
+  attachCustomDomain,
+  type CloudflareSdk,
+  deleteOrdinaryWorkerScript,
+  detachCustomDomain,
+  disableOrdinaryWorkerPublicAccess,
+  dispatchOrdinaryWorkerDeployment,
+  dispatchOrdinaryWorkerUpload,
+  findOrdinaryWorkerVersion,
+  inspectActiveWorkerRoute,
+  inspectOrdinaryWorkerFootprint,
+  listCustomDomains,
+  listOrdinaryWorkerDatabases,
+  listOrdinaryWorkerSecretNames,
+  listOrdinaryWorkerVersions,
+  MAX_DATABASE_INVENTORY,
+  type PreparedOrdinaryWorkerDeploymentVersions as OperationsPreparedOrdinaryWorkerDeploymentVersions,
+  type PreparedOrdinaryWorkerUpload as OperationsPreparedOrdinaryWorkerUpload,
+  type OrdinaryWorkerContext,
+  type OrdinaryWorkerFootprint,
+  ordinaryWorkerDeploymentStatus,
+  ordinaryWorkerSecretNames,
+  prepareOrdinaryWorkerDeployment,
+  prepareOrdinaryWorkerUpload,
+  viewOrdinaryWorkerVersion,
+  workerMigrations,
+} from './cloudflare-ordinary-worker-operations.js';
 import {
   isNotFound,
   readErrorFieldSafely,
   sanitizedErrorName,
-  sanitizeProviderError,
 } from './cloudflare-provider-errors.js';
 import type { CloudflareApiRateCoordinator } from './cloudflare-rate-coordinator.js';
 import {
@@ -30,14 +54,8 @@ import {
   FLEET_AUDIT_PROXY_STATE_BINDING,
 } from './platform-resources.js';
 import {
-  assertOrdinaryWorkerDeploymentVersions,
   assertProviderBindingIdentitiesMatchInspection,
   assertSupportedProviderBindings,
-  providerBindingsToPlainWorkerShape,
-  readArrayField,
-  readField,
-  readStringField,
-  uploadIntentToProviderBindings,
 } from './provider-binding-inventory.js';
 import { deploymentSpecDigest } from './spec-digest.js';
 import type {
@@ -67,8 +85,6 @@ const AUDIT_CONSUMER_SETTINGS = Object.freeze({
 });
 const SDK_TRANSPORT_TIMEOUT_MS = 2_147_483_647;
 const DEFAULT_INVENTORY_BOUND = 10_000;
-const MAX_DATABASE_INVENTORY = 25_000;
-const MAX_VERSION_INVENTORY = 5_000;
 
 export interface CloudflareClientOptions {
   readonly accountId: string;
@@ -155,152 +171,26 @@ export interface ControlWorkerInspection {
   readonly zoneRoutes: readonly import('./types.js').WorkerZoneRoute[];
 }
 
-export interface OrdinaryWorkerFootprint {
-  readonly scriptPresent: boolean;
-  readonly workersDevEnabled?: boolean;
-  readonly previewUrlsEnabled?: boolean;
-  readonly customDomains: readonly Readonly<{
-    id: string;
-    hostname: string;
-    service: string;
-  }>[];
-  readonly zoneRoutes: readonly import('./types.js').WorkerZoneRoute[];
-}
+export type { OrdinaryWorkerFootprint } from './cloudflare-ordinary-worker-operations.js';
 
 const SCRIPT_INVENTORY_PREFIX = '__anchorage_script__:';
 const FLEET_SCRIPT_TAG = 'fleet:anchorage';
-
-type ProviderDeployment =
-  | Readonly<{
-      versions?: readonly Readonly<{
-        percentage?: unknown;
-        version_id?: unknown;
-      }>[];
-    }>
-  | undefined;
-
-function exactActiveVersionId(
-  deployment: ProviderDeployment,
-  context: string,
-): string {
-  if (!deployment || !Array.isArray(deployment.versions)) {
-    throw new Error(`${context} has no current deployment`);
-  }
-  for (const version of deployment.versions) {
-    if (
-      typeof version.percentage !== 'number' ||
-      !Number.isFinite(version.percentage) ||
-      version.percentage < 0 ||
-      version.percentage > 100 ||
-      typeof version.version_id !== 'string' ||
-      version.version_id.length === 0
-    ) {
-      throw new Error(`${context} has malformed version traffic metadata`);
-    }
-  }
-  const onlyVersion = deployment.versions[0];
-  if (
-    deployment.versions.length !== 1 ||
-    onlyVersion?.percentage !== 100 ||
-    typeof onlyVersion.version_id !== 'string'
-  ) {
-    throw new Error(
-      `${context} must have exactly one current version receiving 100% of traffic`,
-    );
-  }
-  return onlyVersion.version_id;
-}
-
-/**
- * The traffic split as the provider reported it, for a refusal to carry. Only
- * well-formed entries survive: a malformed one is exactly what
- * `exactActiveVersionId` already refused over, and inventing a shape for it
- * would put a fabricated percentage into an operator-facing error.
- */
-function observedTrafficSplit(
-  deployment: ProviderDeployment,
-): readonly Readonly<{ artifactVersion: string; percentage: number }>[] {
-  return (deployment?.versions ?? []).flatMap((version) =>
-    typeof version.version_id === 'string' &&
-    typeof version.percentage === 'number' &&
-    Number.isFinite(version.percentage)
-      ? [
-          {
-            artifactVersion: version.version_id,
-            percentage: version.percentage,
-          },
-        ]
-      : [],
-  );
-}
-
-/**
- * `exactActiveVersionId` with its refusal restated as an attestation refusal
- * carrying the split. The rule is unchanged and deliberately not relaxed: one
- * version at 100% or nothing, never the version with the largest share.
- */
-function attestedActiveVersionId(
-  deployment: ProviderDeployment,
-  scriptName: string,
-): string {
-  try {
-    return exactActiveVersionId(deployment, `ordinary Worker '${scriptName}'`);
-  } catch (cause) {
-    throw new ActiveRouteAttestationError(
-      cause instanceof Error ? cause.message : String(cause),
-      {
-        routedScriptName: scriptName,
-        trafficSplit: observedTrafficSplit(deployment),
-      },
-      { cause },
-    );
-  }
-}
 
 function tagValue(tags: readonly string[], prefix: string): string | undefined {
   return tags.find((tag) => tag.startsWith(prefix))?.slice(prefix.length);
 }
 
-type CloudflareSdk = InstanceType<typeof Cloudflare>;
-type StagedOrdinaryWorkerUploadMetadata = VersionCreateParams.Metadata & {
-  readonly limits?: { readonly cpu_ms: number };
-};
-type OrdinaryWorkerUploadMetadata =
-  | (ScriptUpdateParams.Metadata & {
-      readonly limits?: { readonly cpu_ms: number };
-    })
-  | StagedOrdinaryWorkerUploadMetadata;
-const PREPARED_ORDINARY_WORKER_UPLOAD: unique symbol = Symbol(
-  'fleet-control.preparedOrdinaryWorkerUpload',
-);
-const PREPARED_ORDINARY_WORKER_DEPLOYMENT_VERSIONS: unique symbol = Symbol(
-  'fleet-control.preparedOrdinaryWorkerDeploymentVersions',
-);
 /** @inline */
-type PreparedOrdinaryWorkerUpload = Readonly<{
-  [PREPARED_ORDINARY_WORKER_UPLOAD]: true;
-  intent: PlainWorkerUploadIntent;
-  files: readonly File[];
-  metadata: string;
-  secretValues: readonly string[];
-}>;
+type PreparedOrdinaryWorkerUpload = OperationsPreparedOrdinaryWorkerUpload;
 /** @inline */
-type PreparedOrdinaryWorkerDeploymentVersions = readonly Readonly<{
-  percentage: number;
-  version_id: string;
-}>[] & {
-  readonly [PREPARED_ORDINARY_WORKER_DEPLOYMENT_VERSIONS]: true;
-};
+type PreparedOrdinaryWorkerDeploymentVersions =
+  OperationsPreparedOrdinaryWorkerDeploymentVersions;
 
 export class CloudflareProviderRequestNotDispatchedError extends Error {
   constructor(cause: unknown) {
     super('Cloudflare provider request was not dispatched', { cause });
     this.name = 'CloudflareProviderRequestNotDispatchedError';
   }
-}
-
-function readWorkerVersionTag(version: unknown): string | undefined {
-  return readStringField(readField(version, 'annotations'), 'workers/tag');
 }
 
 function inventoryBoundExceeded(label: string, max: number): Error {
@@ -458,42 +348,7 @@ export function dispatchMigrations(spec: DeploymentSpec) {
   );
 }
 
-export function workerMigrations(
-  migrations: readonly import('./types.js').DurableObjectMigration[],
-  previousTag?: string,
-) {
-  if (migrations.length === 0) return undefined;
-  let pending = migrations;
-  if (previousTag !== undefined) {
-    const previousIndex = migrations.findIndex(
-      (migration) => migration.tag === previousTag,
-    );
-    if (previousIndex < 0) {
-      throw new Error(
-        `previous Durable Object tag '${previousTag}' is absent from the ordered migration history`,
-      );
-    }
-    pending = migrations.slice(previousIndex + 1);
-  }
-  if (pending.length === 0) return undefined;
-  return {
-    new_tag: pending.at(-1)?.tag,
-    old_tag: previousTag,
-    steps: pending.map((migration) => ({
-      new_sqlite_classes: migration.newSqliteClasses
-        ? [...migration.newSqliteClasses]
-        : undefined,
-      new_classes: migration.newClasses ? [...migration.newClasses] : undefined,
-      deleted_classes: migration.deletedClasses
-        ? [...migration.deletedClasses]
-        : undefined,
-      renamed_classes: migration.renamedClasses?.map((renamed) => ({
-        from: renamed.from,
-        to: renamed.to,
-      })),
-    })),
-  };
-}
+export { workerMigrations } from './cloudflare-ordinary-worker-operations.js';
 
 async function hashExport(
   body: ReadableStream<Uint8Array>,
@@ -535,6 +390,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   readonly #apiToken: string;
   readonly #dispatchNamespace: string | undefined;
   readonly #client: CloudflareSdk;
+  readonly #ordinary: OrdinaryWorkerContext;
   readonly #operationQueue: PQueue;
   readonly #requestQueue: PQueue;
   readonly #rateCoordinator: CloudflareApiRateCoordinator;
@@ -611,6 +467,16 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       // consume the network request's lease-bounded execution budget.
       timeout: SDK_TRANSPORT_TIMEOUT_MS,
     });
+    this.#ordinary = {
+      accountId: this.#accountId,
+      client: this.#client,
+      schedule: (operation) => this.#schedule(operation),
+      collectBounded: (iterable, label, max) =>
+        this.#collectBounded(iterable, label, max),
+      withMutationFence: (fence, operation) =>
+        this.withMutationFence(fence, operation),
+      workerRouteZoneIds: () => this.#workerRouteZoneIds(),
+    };
   }
 
   /** Configured provider request timeout in milliseconds. */
@@ -1183,30 +1049,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   async listOrdinaryWorkerSecretNames(
     scriptName: string,
   ): Promise<readonly string[]> {
-    return this.#schedule(() => this.#ordinaryWorkerSecretNames(scriptName));
-  }
-
-  async #ordinaryWorkerSecretNames(scriptName: string): Promise<string[]> {
-    const names: string[] = [];
-    try {
-      for await (const secret of this.#collectBounded(
-        this.#client.workers.scripts.secrets.list(scriptName, {
-          account_id: this.#accountId,
-        }),
-        'ordinary Worker secret inventory',
-      )) {
-        if (!secret.name) {
-          throw new Error(
-            `ordinary Worker '${scriptName}' returned a secret without a name`,
-          );
-        }
-        names.push(secret.name);
-      }
-    } catch (error) {
-      if (isNotFound(error)) return [];
-      throw error;
-    }
-    return names.sort();
+    return listOrdinaryWorkerSecretNames(this.#ordinary, scriptName);
   }
 
   async #dispatchScripts(
@@ -1306,288 +1149,68 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   async listOrdinaryWorkerDatabases(): Promise<
     readonly PlainWorkerDatabaseInventoryEntry[]
   > {
-    return this.#schedule(async () => {
-      const databases: PlainWorkerDatabaseInventoryEntry[] = [];
-      for await (const database of this.#collectBounded(
-        this.#client.d1.database.list({
-          account_id: this.#accountId,
-          per_page: 100,
-        }),
-        'D1 database inventory',
-        MAX_DATABASE_INVENTORY,
-      )) {
-        databases.push({
-          databaseId: readStringField(database, 'uuid'),
-          name: readStringField(database, 'name'),
-        });
-      }
-      return databases;
-    });
+    return listOrdinaryWorkerDatabases(this.#ordinary);
   }
 
   async ordinaryWorkerDeploymentStatus(
     scriptName: string,
   ): Promise<PlainWorkerDeploymentStatus | undefined> {
-    return this.#schedule(async () => {
-      try {
-        const listed = await this.#client.workers.scripts.deployments.list(
-          scriptName,
-          {
-            account_id: this.#accountId,
-          },
-        );
-        const deployment = listed.deployments[0];
-        if (!deployment) return undefined;
-        return {
-          versions: readArrayField(deployment, 'versions').map((version) => {
-            const rawPercentage = readField(version, 'percentage');
-            return {
-              versionId:
-                readStringField(version, 'id') ??
-                readStringField(version, 'version_id'),
-              percentage:
-                rawPercentage === undefined ? undefined : Number(rawPercentage),
-            };
-          }),
-        };
-      } catch (error) {
-        if (isNotFound(error)) return undefined;
-        throw error;
-      }
-    });
+    return ordinaryWorkerDeploymentStatus(this.#ordinary, scriptName);
   }
 
   async listOrdinaryWorkerVersions(
     scriptName: string,
   ): Promise<readonly PlainWorkerVersionSummary[] | undefined> {
-    return this.#schedule(async () => {
-      let yielded = false;
-      try {
-        const versions: PlainWorkerVersionSummary[] = [];
-        for await (const version of this.#collectBounded(
-          this.#client.workers.scripts.versions.list(scriptName, {
-            account_id: this.#accountId,
-            per_page: 100,
-          }),
-          'ordinary Worker version inventory',
-          MAX_VERSION_INVENTORY,
-        )) {
-          yielded = true;
-          versions.push({
-            versionId:
-              readStringField(version, 'id') ??
-              readStringField(version, 'version_id'),
-            tag: readWorkerVersionTag(version),
-          });
-        }
-        return versions;
-      } catch (error) {
-        if (!yielded && isNotFound(error)) return undefined;
-        throw error;
-      }
-    });
+    return listOrdinaryWorkerVersions(this.#ordinary, scriptName);
   }
 
   async viewOrdinaryWorkerVersion(
     scriptName: string,
     versionId: string,
   ): Promise<PlainWorkerVersionDetail> {
-    return this.#schedule(async () => {
-      const version = await this.#client.workers.scripts.versions.get(
-        versionId,
-        { account_id: this.#accountId, script_name: scriptName },
-      );
-      return {
-        versionId:
-          readStringField(version, 'id') ??
-          readStringField(version, 'version_id'),
-        tag: readWorkerVersionTag(version),
-        bindings: providerBindingsToPlainWorkerShape(
-          readArrayField(readField(version, 'resources'), 'bindings'),
-        ),
-      };
-    });
+    return viewOrdinaryWorkerVersion(this.#ordinary, scriptName, versionId);
   }
 
   async findOrdinaryWorkerVersion(
     scriptName: string,
     versionId: string,
   ): Promise<PlainWorkerVersionDetail | undefined> {
-    try {
-      return await this.viewOrdinaryWorkerVersion(scriptName, versionId);
-    } catch (error) {
-      if (isNotFound(error)) return undefined;
-      throw error;
-    }
+    return findOrdinaryWorkerVersion(this.#ordinary, scriptName, versionId);
   }
 
   async prepareOrdinaryWorkerUpload(
     intent: PlainWorkerUploadIntent,
   ): Promise<PreparedOrdinaryWorkerUpload> {
-    for (const module of intent.modules) {
-      if (
-        !module ||
-        typeof module.name !== 'string' ||
-        (typeof module.content !== 'string' &&
-          !(module.content instanceof Uint8Array)) ||
-        (module.contentType !== undefined &&
-          typeof module.contentType !== 'string')
-      ) {
-        throw new TypeError(
-          'ordinary Worker modules must contain valid upload data',
-        );
-      }
-    }
-    const bindings = uploadIntentToProviderBindings(intent);
-    const secretValues = intent.bindings.secrets.map(({ value }) => value);
-    const baseMetadata: StagedOrdinaryWorkerUploadMetadata = {
-      main_module: intent.mainModule,
-      bindings,
-      compatibility_date: intent.compatibilityDate,
-      compatibility_flags: intent.compatibilityFlags
-        ? [...intent.compatibilityFlags]
-        : undefined,
-      limits:
-        intent.limits.cpuMs === undefined
-          ? undefined
-          : { cpu_ms: intent.limits.cpuMs },
-      annotations: { 'workers/tag': intent.candidateTag },
-    };
-    const metadata: OrdinaryWorkerUploadMetadata =
-      intent.mode === 'initial'
-        ? {
-            ...baseMetadata,
-            migrations: workerMigrations(intent.durableObjectMigrations),
-          }
-        : baseMetadata;
-    const encodedMetadata = JSON.stringify(metadata);
-    const files = await Promise.all(
-      intent.modules.map((module) =>
-        toFile(
-          typeof module.content === 'string'
-            ? new TextEncoder().encode(module.content)
-            : module.content,
-          module.name,
-          {
-            type: module.contentType ?? 'application/javascript+module',
-          },
-        ),
-      ),
-    );
-    return {
-      [PREPARED_ORDINARY_WORKER_UPLOAD]: true,
-      intent,
-      files,
-      metadata: encodedMetadata,
-      secretValues,
-    };
+    return prepareOrdinaryWorkerUpload(intent);
   }
 
   async dispatchOrdinaryWorkerUpload(
     prepared: PreparedOrdinaryWorkerUpload,
   ): Promise<void> {
-    const { files, intent, metadata, secretValues } = prepared;
-    await this.#schedule(async () => {
-      const subdomain = this.#client.workers.scripts.subdomain;
-      const uploadBody = {
-        account_id: this.#accountId,
-        files: [...files],
-        // cloudflare/internal/uploads.mjs:102-129 bracket-flattens objects;
-        // Wrangler 4.118.0 serializes the same metadata value as JSON.
-        metadata: metadata as never,
-      };
-      const send = async (call: () => Promise<unknown>): Promise<void> => {
-        try {
-          await call();
-        } catch (error) {
-          throw sanitizeProviderError(error, secretValues);
-        }
-      };
-      if (intent.mode === 'initial') {
-        await send(() =>
-          this.#client.workers.scripts.update(intent.scriptName, uploadBody, {
-            maxRetries: 0,
-          }),
-        );
-        // Sanitization is limited to the upload request that carries secrets.
-        // Cloudflare rejects subdomain writes before the script exists. The
-        // caller attests public access before adopting a reconciled upload.
-        await subdomain.create(intent.scriptName, {
-          account_id: this.#accountId,
-          enabled: intent.publicAccess.workersDevEnabled,
-          previews_enabled: intent.publicAccess.previewUrlsEnabled,
-        });
-        return;
-      }
-      const current = await subdomain.get(intent.scriptName, {
-        account_id: this.#accountId,
-      });
-      if (
-        current.enabled !== intent.publicAccess.workersDevEnabled ||
-        current.previews_enabled !== intent.publicAccess.previewUrlsEnabled
-      ) {
-        // The staged path can converge public access first because the script
-        // exists; write-on-difference moves it toward the constant intent.
-        await subdomain.create(intent.scriptName, {
-          account_id: this.#accountId,
-          enabled: intent.publicAccess.workersDevEnabled,
-          previews_enabled: intent.publicAccess.previewUrlsEnabled,
-        });
-      }
-      await send(() =>
-        this.#client.workers.scripts.versions.create(
-          intent.scriptName,
-          uploadBody,
-          { maxRetries: 0 },
-        ),
-      );
-    });
+    return dispatchOrdinaryWorkerUpload(this.#ordinary, prepared);
   }
 
   prepareOrdinaryWorkerDeployment(
     versions: readonly OrdinaryWorkerDeploymentVersion[],
   ): PreparedOrdinaryWorkerDeploymentVersions {
-    assertOrdinaryWorkerDeploymentVersions(versions);
-    return Object.assign(
-      versions.map(({ versionId, percentage }) => ({
-        percentage,
-        version_id: versionId,
-      })),
-      { [PREPARED_ORDINARY_WORKER_DEPLOYMENT_VERSIONS]: true as const },
-    );
+    return prepareOrdinaryWorkerDeployment(versions);
   }
 
   async dispatchOrdinaryWorkerDeployment(
     scriptName: string,
     versions: PreparedOrdinaryWorkerDeploymentVersions,
   ): Promise<void> {
-    await this.#schedule(() =>
-      this.#client.workers.scripts.deployments.create(
-        scriptName,
-        {
-          account_id: this.#accountId,
-          strategy: 'percentage',
-          versions: [...versions],
-        },
-        { maxRetries: 0 },
-      ),
+    return dispatchOrdinaryWorkerDeployment(
+      this.#ordinary,
+      scriptName,
+      versions,
     );
   }
 
   async deleteOrdinaryWorkerScript(
     scriptName: string,
   ): Promise<'deleted' | 'absent'> {
-    return this.#schedule(async () => {
-      try {
-        await this.#client.workers.scripts.delete(scriptName, {
-          account_id: this.#accountId,
-        });
-        return 'deleted';
-      } catch (error) {
-        if (isNotFound(error)) return 'absent';
-        throw error;
-      }
-    });
+    return deleteOrdinaryWorkerScript(this.#ordinary, scriptName);
   }
 
   async findDatabase(name: string): Promise<DatabaseReference | undefined> {
@@ -2281,7 +1904,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
           this.#client.workers.scripts.subdomain.get(scriptName, {
             account_id: this.#accountId,
           }),
-          this.#ordinaryWorkerSecretNames(scriptName),
+          ordinaryWorkerSecretNames(this.#ordinary, scriptName),
         ]);
         const bindings = activeVersion.resources.bindings ?? [];
         const databaseIds = bindings.flatMap((binding) =>
@@ -2753,7 +2376,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
           this.#client.workers.scripts.subdomain.get(scriptName, {
             account_id: this.#accountId,
           }),
-          this.#ordinaryWorkerSecretNames(scriptName),
+          ordinaryWorkerSecretNames(this.#ordinary, scriptName),
         ]);
         const bindings = activeVersion.resources.bindings ?? [];
         const databaseIds = bindings.flatMap((binding) =>
@@ -3002,94 +2625,27 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     scriptName: string,
     fence: ExternalMutationFence,
   ): Promise<void> {
-    await this.withMutationFence(fence, () =>
-      this.#schedule(async () => {
-        try {
-          await this.#client.workers.scripts.subdomain.create(scriptName, {
-            account_id: this.#accountId,
-            enabled: false,
-            previews_enabled: false,
-          });
-        } catch (error) {
-          if (!isNotFound(error)) throw error;
-          return;
-        }
-        const subdomain = await (async () => {
-          try {
-            return await this.#client.workers.scripts.subdomain.get(
-              scriptName,
-              { account_id: this.#accountId },
-            );
-          } catch (error) {
-            if (!isNotFound(error)) throw error;
-            return undefined;
-          }
-        })();
-        if (!subdomain) return;
-        if (subdomain.enabled === true || subdomain.previews_enabled === true) {
-          throw new Error(
-            `ordinary Worker '${scriptName}' retains public subdomain ingress`,
-          );
-        }
-      }),
-    );
+    return disableOrdinaryWorkerPublicAccess(this.#ordinary, scriptName, fence);
   }
 
   async listCustomDomains(): Promise<
     readonly OrdinaryWorkerFootprint['customDomains'][number][]
   > {
-    return this.#schedule(async () => {
-      const domains: Array<OrdinaryWorkerFootprint['customDomains'][number]> =
-        [];
-      for await (const domain of this.#collectBounded(
-        this.#client.workers.domains.list({ account_id: this.#accountId }),
-        'custom domain inventory',
-      )) {
-        if (!domain.id || !domain.hostname || !domain.service) {
-          throw new Error(
-            'Cloudflare returned incomplete custom-domain metadata',
-          );
-        }
-        domains.push({
-          id: domain.id,
-          hostname: domain.hostname,
-          service: domain.service,
-        });
-      }
-      return domains;
-    });
+    return listCustomDomains(this.#ordinary);
   }
 
   attachCustomDomain(
     target: { readonly hostname: string; readonly service: string },
     fence: ExternalMutationFence,
   ): Promise<void> {
-    return this.withMutationFence(fence, () =>
-      this.#schedule(async () => {
-        await this.#client.workers.domains.update({
-          account_id: this.#accountId,
-          hostname: target.hostname,
-          service: target.service,
-        });
-      }),
-    );
+    return attachCustomDomain(this.#ordinary, target, fence);
   }
 
   detachCustomDomain(
     domainId: string,
     fence: ExternalMutationFence,
   ): Promise<void> {
-    return this.withMutationFence(fence, () =>
-      this.#schedule(async () => {
-        try {
-          await this.#client.workers.domains.delete(domainId, {
-            account_id: this.#accountId,
-          });
-        } catch (error) {
-          if (!isNotFound(error)) throw error;
-        }
-      }),
-    );
+    return detachCustomDomain(this.#ordinary, domainId, fence);
   }
 
   async inspectActiveWorkerRoute(scriptName: string): Promise<
@@ -3099,104 +2655,13 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       }>
     | undefined
   > {
-    return this.#schedule(async () => {
-      let deploymentList: Awaited<
-        ReturnType<CloudflareSdk['workers']['scripts']['deployments']['list']>
-      >;
-      try {
-        deploymentList = await this.#client.workers.scripts.deployments.list(
-          scriptName,
-          { account_id: this.#accountId },
-        );
-      } catch (error) {
-        if (isNotFound(error)) return undefined;
-        throw error;
-      }
-      const artifactVersion = attestedActiveVersionId(
-        deploymentList.deployments[0],
-        scriptName,
-      );
-      const version = await this.#client.workers.scripts.versions.get(
-        artifactVersion,
-        { account_id: this.#accountId, script_name: scriptName },
-      );
-      const specDigest = (version.resources.bindings ?? []).flatMap(
-        (binding) =>
-          binding.type === 'plain_text' && binding.name === 'FLEET_SPEC_DIGEST'
-            ? [binding.text]
-            : [],
-      )[0];
-      return {
-        artifactVersion,
-        specDigest: typeof specDigest === 'string' ? specDigest : undefined,
-      };
-    });
+    return inspectActiveWorkerRoute(this.#ordinary, scriptName);
   }
 
   async inspectOrdinaryWorkerFootprint(
     scriptName: string,
   ): Promise<OrdinaryWorkerFootprint> {
-    return this.#schedule(async () => {
-      let scriptPresent = false;
-      for await (const script of this.#collectBounded(
-        this.#client.workers.scripts.list({ account_id: this.#accountId }),
-        'ordinary Worker script inventory',
-      )) {
-        if (script.id === scriptName) scriptPresent = true;
-      }
-      const customDomains: Array<{
-        id: string;
-        hostname: string;
-        service: string;
-      }> = [];
-      for await (const domain of this.#collectBounded(
-        this.#client.workers.domains.list({ account_id: this.#accountId }),
-        'custom domain inventory',
-      )) {
-        if (domain.service !== scriptName) continue;
-        if (!domain.id || !domain.hostname) {
-          throw new Error(
-            `ordinary Worker '${scriptName}' has incomplete custom-domain metadata`,
-          );
-        }
-        customDomains.push({
-          id: domain.id,
-          hostname: domain.hostname,
-          service: domain.service,
-        });
-      }
-      const zoneRoutes: import('./types.js').WorkerZoneRoute[] = [];
-      for (const zoneId of await this.#workerRouteZoneIds()) {
-        for await (const route of this.#collectBounded(
-          this.#client.workers.routes.list({ zone_id: zoneId }),
-          'Worker zone-route inventory',
-        )) {
-          if (route.script !== scriptName) continue;
-          if (!route.id || !route.pattern) {
-            throw new Error(
-              `ordinary Worker '${scriptName}' has incomplete zone-route metadata`,
-            );
-          }
-          zoneRoutes.push({
-            zoneId,
-            routeId: route.id,
-            pattern: route.pattern,
-          });
-        }
-      }
-      const subdomain = scriptPresent
-        ? await this.#client.workers.scripts.subdomain.get(scriptName, {
-            account_id: this.#accountId,
-          })
-        : undefined;
-      return {
-        scriptPresent,
-        workersDevEnabled: subdomain?.enabled === true,
-        previewUrlsEnabled: subdomain?.previews_enabled === true,
-        customDomains,
-        zoneRoutes,
-      };
-    });
+    return inspectOrdinaryWorkerFootprint(this.#ordinary, scriptName);
   }
 
   async deleteControlWorker(scriptName: string): Promise<void> {

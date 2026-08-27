@@ -2,10 +2,11 @@
 
 // This module holds safe-read and secret-redaction helpers for Cloudflare SDK
 // errors, and the shared isNotFound predicate.
-// Its two sanitizer consumers use different members: ordinary-Worker upload
-// dispatch calls sanitizeProviderError, while D1 export calls
-// readErrorFieldSafely and sanitizedErrorName; isNotFound is shared by the
-// client's control, WFP, and ordinary-Worker paths.
+// Its two sanitizer consumers use different members: the ordinary-Worker
+// upload dispatch (cloudflare-ordinary-worker-operations.ts) calls
+// sanitizeProviderError, while the client's D1 export calls
+// readErrorFieldSafely and sanitizedErrorName. Both modules import
+// isNotFound.
 
 import { APIConnectionError, APIError } from 'cloudflare';
 import { readField } from './provider-binding-inventory.js';

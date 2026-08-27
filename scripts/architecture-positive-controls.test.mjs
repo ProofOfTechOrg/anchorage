@@ -40,6 +40,8 @@ const controls = {
     'scripts/architecture-fixtures/host-kit-misses-approval-bridge.ts',
   'host-kit-reaches-approval-shapes':
     'scripts/architecture-fixtures/host-kit-misses-approval-shapes.ts',
+  'fleet-control-client-layers-are-one-way':
+    'scripts/architecture-fixtures/fleet-control-leaf-imports-client.ts',
 };
 
 test('every architecture rule has an executable positive control', () => {

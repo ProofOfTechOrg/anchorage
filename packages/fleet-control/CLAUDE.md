@@ -15,7 +15,7 @@ Source map:
 
 - `provision.ts`, `backend-switch.ts`, `fleet.ts`: deployment lifecycle state machines
 - `workers-for-platforms-backend.ts`, `wrangler-loop-backend.ts`: the two provisioning backends
-- `cloudflare-client.ts`, `cloudflare-rate-coordinator.ts`: provider API and its shared quota fence
+- `cloudflare-client.ts`, `cloudflare-ordinary-worker-operations.ts`, `cloudflare-provider-errors.ts`, `cloudflare-rate-coordinator.ts`: provider API (the client, the ordinary-Worker operations behind it, the SDK-error helpers) and its shared quota fence
 - `state-store.ts`, `migration-ledger.ts`, `export-store.ts`: durable fleet state
 - `workers/`: the platform's own deployed Workers, published as separate export entries
 
