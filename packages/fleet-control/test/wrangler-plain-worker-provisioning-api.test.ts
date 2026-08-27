@@ -248,6 +248,30 @@ describe('WranglerPlainWorkerProvisioningApi parsing', () => {
     );
   });
 
+  it('normalizes wrapped binding inventories like direct arrays', async () => {
+    const bindings = [
+      { type: 'd1', name: 'DB', database_id: 'db-id' },
+      { type: 'plain_text', name: 'TEXT', text: 'value' },
+    ];
+    const subject = await api(
+      new FakeRunner(async () => ({
+        stdout: JSON.stringify({
+          resources: { bindings: { result: bindings } },
+        }),
+        stderr: '',
+      })),
+    );
+
+    await expect(
+      subject.viewVersion('worker', 'version'),
+    ).resolves.toMatchObject({
+      bindings: [
+        { type: 'd1', name: 'DB', databaseId: 'db-id' },
+        { type: 'plain-text', name: 'TEXT', value: 'value' },
+      ],
+    });
+  });
+
   it.each([
     [
       'D1 id',

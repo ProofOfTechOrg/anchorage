@@ -6,16 +6,19 @@ Fleet control provisions one D1 database, fleet-owned application R2 buckets, an
 
 ## Choose a provisioning backend
 
-Both backends implement the same ordered `ProvisioningBackend` contract:
+All backends implement the same ordered `ProvisioningBackend` contract:
 
 | Backend | Accepted artifacts | Deployment mechanism |
 | --- | --- | --- |
+| `CloudflareApiPlainWorkerBackend` | Platform-authored only | Direct Cloudflare APIs for ordinary Workers and Worker Versions |
 | `WranglerLoopBackend` | Platform-authored only | Host-provided Wrangler `>=4.118 <5` commands and generated configuration |
 | `WorkersForPlatformsBackend` | Platform-authored catalogs and external project releases | Cloudflare Upload API in an untrusted dispatch namespace |
 
 `WorkersForPlatformsBackend` requires its untrusted dispatch namespace, named shared outbound Worker, and state-egress root secret at construction. It rejects an incomplete configuration before provider access. Normal provisioning always places trusted per-deployment state in that dispatch namespace. Ordinary state scripts exist only as already-persisted bridges managed by the dedicated backend-switch lifecycle.
 
 `WranglerCommandRunner` defaults to `['pnpm', 'exec', 'wrangler']`. Pass its `wranglerCommand` option when the host must select an explicit Wrangler executable or wrapper and fixed arguments. Fleet Control does not install Wrangler for the host.
+
+`CloudflareApiPlainWorkerBackend` uses a `CloudflareProvisioningClient` constructed with `plane: 'plain-worker'`. Do not pass a dispatch namespace. Supply a durable `exportStore` to the client before any lifecycle can delete D1.
 
 The plain backend rejects external artifacts before creating a resource. Switch to Workers for Platforms before you run the first customer-authored artifact. Set `routeHostname` to the customer-facing custom domain. For plain Workers, set `maintenanceBaseUrl` to the distinct Workers control origin; for Workers for Platforms, set it to the control-plane dispatcher origin. Fleet state reserves the route before any Worker can publish it.
 
@@ -74,7 +77,15 @@ Application KV bindings are unsupported. Cloudflare caps an account at [1,000 KV
 
 ### Stage ordinary Worker versions
 
-`WranglerLoopBackend` uploads a digest-tagged Worker Version with the exact built-in and declared application secret set in a mode-0600 file. For an existing deployment, it attaches the candidate at zero percent, sends the maintenance request with `Cloudflare-Workers-Version-Overrides`, and accepts the response only when `deploymentSpecDigest` matches the requested build. It then promotes that version to 100 percent, verifies the live custom-domain owner against `PromotionGuard`, attaches the domain through the explicit Cloudflare API seam, and re-inspects the mapping. A failed maintenance check never publishes the route.
+Both ordinary-Worker backends upload a digest-tagged Worker Version with the exact built-in and declared application secret set. `WranglerLoopBackend` passes those secrets through a mode-0600 file. For an existing deployment, either backend attaches the candidate at zero percent, sends the maintenance request with `Cloudflare-Workers-Version-Overrides`, and accepts the response only when `deploymentSpecDigest` matches the requested build. It then promotes that version to 100 percent, verifies the live custom-domain owner against `PromotionGuard`, attaches the domain, and re-inspects the mapping. A failed maintenance check never publishes the route.
+
+The direct API backend must create an initial script before Cloudflare accepts its workers.dev configuration. For either ordinary-Worker backend, tagged-version rediscovery accepts a failed upload only after the Worker footprint attests the intended workers.dev and preview-URL state.
+
+When that workers.dev write keeps failing, the refusal's compensating traffic removal also fails and leaves the Worker in the account for operator cleanup; the provisioning error reports `resourceState: 'unknown'`.
+
+The credentialed lane exercises the configured CPU limit at runtime through its `cpu-control` and `cpu-over-limit` probes.
+
+Cloudflare error `10220` can refuse a deployment when a secret changed after its version upload. This provider limitation applies to both ordinary-Worker backends. Upload a new candidate carrying the current secret set before deploying it.
 
 An initial Worker that introduces Durable Object classes uses a route-free `wrangler deploy`, validates maintenance through its distinct control origin, and publishes the customer domain afterward. An existing plain Worker cannot stage a new Durable Object lifecycle migration through Workers Versions; perform that change at an explicit immediate-deployment maintenance boundary. No generated configuration contains a cron trigger.
 

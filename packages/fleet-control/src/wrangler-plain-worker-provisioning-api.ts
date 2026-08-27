@@ -8,9 +8,15 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
 import type { DurableDatabaseExportStore } from './cloudflare-client.js';
+import {
+  providerBindingsToPlainWorkerShape,
+  readField,
+  readStringField,
+} from './provider-binding-inventory.js';
 import type {
   DatabaseReference,
   ExternalMutationFence,
+  OrdinaryWorkerDeploymentVersion,
   PlainWorkerDatabaseExportResult,
   PlainWorkerDatabaseInventoryEntry,
   PlainWorkerDeploymentStatus,
@@ -19,7 +25,6 @@ import type {
   PlainWorkerRouteApi,
   PlainWorkerUploadIntent,
   PlainWorkerUploadOutcome,
-  PlainWorkerVersionBinding,
   PlainWorkerVersionDetail,
   PlainWorkerVersionSummary,
 } from './types.js';
@@ -42,17 +47,6 @@ function asArray(value: unknown): readonly unknown[] {
   return [];
 }
 
-function field(value: unknown, name: string): unknown {
-  return value && typeof value === 'object'
-    ? (value as Record<string, unknown>)[name]
-    : undefined;
-}
-
-function stringField(value: unknown, name: string): string | undefined {
-  const candidate = field(value, name);
-  return typeof candidate === 'string' ? candidate : undefined;
-}
-
 function isWranglerNotFound(error: unknown): boolean {
   return (
     error instanceof Error &&
@@ -61,84 +55,14 @@ function isWranglerNotFound(error: unknown): boolean {
 }
 
 function readVersionId(value: unknown): string | undefined {
-  const id = field(value, 'id') ?? field(value, 'version_id');
+  const id = readField(value, 'id') ?? readField(value, 'version_id');
   return typeof id === 'string' ? id : undefined;
 }
 
 function versionTag(value: unknown): string | undefined {
-  const annotations = field(value, 'annotations');
-  const tag = field(annotations, 'workers/tag') ?? field(value, 'tag');
+  const annotations = readField(value, 'annotations');
+  const tag = readField(annotations, 'workers/tag') ?? readField(value, 'tag');
   return typeof tag === 'string' ? tag : undefined;
-}
-
-function normalizeBinding(binding: unknown): PlainWorkerVersionBinding {
-  if (!binding || typeof binding !== 'object' || Array.isArray(binding)) {
-    return {
-      type: 'unsupported',
-      name: undefined,
-      issue: 'not-object',
-    };
-  }
-  const name = stringField(binding, 'name');
-  const rawType = field(binding, 'type');
-  if (
-    typeof rawType !== 'string' ||
-    rawType.length === 0 ||
-    rawType !== rawType.trim()
-  ) {
-    return {
-      type: 'unsupported',
-      name,
-      providerType: typeof rawType === 'string' ? rawType : undefined,
-      issue: 'invalid-type',
-    };
-  }
-  switch (rawType) {
-    case 'd1': {
-      const id = field(binding, 'id') ?? field(binding, 'database_id');
-      return {
-        type: 'd1',
-        name,
-        databaseId: typeof id === 'string' ? id : undefined,
-      };
-    }
-    case 'durable_object_namespace':
-      return {
-        type: 'durable-object',
-        name,
-        className: stringField(binding, 'class_name'),
-        namespaceId: stringField(binding, 'namespace_id'),
-      };
-    case 'service':
-      return {
-        type: 'service',
-        name,
-        service: stringField(binding, 'service'),
-      };
-    case 'queue':
-      return {
-        type: 'queue-producer',
-        name,
-        queueName: stringField(binding, 'queue_name'),
-      };
-    case 'r2_bucket':
-      return {
-        type: 'r2-bucket',
-        name,
-        bucketName: stringField(binding, 'bucket_name'),
-      };
-    case 'plain_text':
-      return { type: 'plain-text', name, value: stringField(binding, 'text') };
-    case 'secret_text':
-      return { type: 'secret-text', name };
-    default:
-      return {
-        type: 'unsupported',
-        name,
-        providerType: rawType,
-        issue: 'unsupported-type',
-      };
-  }
 }
 
 function normalizeVersionSummary(value: unknown): PlainWorkerVersionSummary {
@@ -307,8 +231,8 @@ export class WranglerPlainWorkerProvisioningApi
   async listDatabases(): Promise<readonly PlainWorkerDatabaseInventoryEntry[]> {
     const listed = await this.#runner.run(['d1', 'list', '--json']);
     return asArray(parseJson(listed.stdout, 'd1 list')).map((database) => ({
-      databaseId: stringField(database, 'uuid'),
-      name: stringField(database, 'name'),
+      databaseId: readStringField(database, 'uuid'),
+      name: readStringField(database, 'name'),
     }));
   }
 
@@ -324,9 +248,9 @@ export class WranglerPlainWorkerProvisioningApi
       throw error;
     }
     const parsed = parseJson(result.stdout, 'd1 info');
-    const body = field(parsed, 'result') ?? parsed;
-    const id = field(body, 'uuid');
-    const name = field(body, 'name');
+    const body = readField(parsed, 'result') ?? parsed;
+    const id = readField(body, 'uuid');
+    const name = readField(body, 'name');
     if (id !== databaseId || typeof name !== 'string' || name.length === 0) {
       throw new Error('D1 info result has an invalid uuid or name');
     }
@@ -378,10 +302,10 @@ export class WranglerPlainWorkerProvisioningApi
       throw error;
     }
     const parsed = parseJson(result.stdout, 'deployments status');
-    const body = field(parsed, 'result') ?? parsed;
+    const body = readField(parsed, 'result') ?? parsed;
     return {
-      versions: asArray(field(body, 'versions')).map((version) => {
-        const rawPercentage = field(version, 'percentage');
+      versions: asArray(readField(body, 'versions')).map((version) => {
+        const rawPercentage = readField(version, 'percentage');
         return {
           versionId: readVersionId(version),
           percentage:
@@ -424,11 +348,13 @@ export class WranglerPlainWorkerProvisioningApi
       '--json',
     ]);
     const parsed = parseJson(viewed.stdout, 'versions view');
-    const resources = field(parsed, 'resources');
+    const resources = readField(parsed, 'resources');
     return {
       versionId: readVersionId(parsed),
       tag: versionTag(parsed),
-      bindings: asArray(field(resources, 'bindings')).map(normalizeBinding),
+      bindings: providerBindingsToPlainWorkerShape(
+        asArray(readField(resources, 'bindings')),
+      ),
     };
   }
 
@@ -574,7 +500,7 @@ export class WranglerPlainWorkerProvisioningApi
 
   async createDeployment(
     scriptName: string,
-    versions: readonly { versionId: string; percentage: number }[],
+    versions: readonly OrdinaryWorkerDeploymentVersion[],
     fence: ExternalMutationFence,
   ): Promise<PlainWorkerMutationOutcome> {
     await fence.assertOwned();

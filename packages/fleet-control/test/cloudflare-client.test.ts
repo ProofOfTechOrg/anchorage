@@ -7,12 +7,18 @@ import {
   type DurableDatabaseExportStore,
   dispatchMigrations,
 } from '../src/cloudflare-client.js';
-import { ProcessLocalCloudflareApiRateCoordinator } from '../src/cloudflare-rate-coordinator.js';
 import { canonicalDeploymentEgressPolicy } from '../src/platform-resources.js';
 import type {
   DeploymentSpec,
   ExternalPlatformResources,
 } from '../src/types.js';
+import {
+  envelope,
+  errorChain,
+  fenced,
+  testRateCoordinator,
+  zoneAuthorityResponse,
+} from './fixtures/cloudflare-fetch-fixture.js';
 
 function deployment(overrides: Partial<DeploymentSpec> = {}): DeploymentSpec {
   return {
@@ -38,88 +44,6 @@ function deployment(overrides: Partial<DeploymentSpec> = {}): DeploymentSpec {
     routeHostname: 'acme.example.test',
     ...overrides,
   };
-}
-
-function envelope(result: unknown): Response {
-  return Response.json({
-    success: true,
-    errors: [],
-    messages: [],
-    result,
-    result_info: {
-      page: 1,
-      per_page: 20,
-      count: Array.isArray(result) ? result.length : 1,
-      total_count: Array.isArray(result) ? result.length : 1,
-      total_pages: 1,
-    },
-  });
-}
-
-function zoneAuthorityResponse(
-  url: URL,
-  zoneIds: readonly string[],
-): Response | undefined {
-  if (url.pathname.endsWith('/user/tokens/verify')) {
-    return envelope({ id: 'token-id', status: 'active' });
-  }
-  if (url.pathname.endsWith('/accounts/account/tokens/token-id')) {
-    return envelope({
-      id: 'token-id',
-      status: 'active',
-      policies: [
-        {
-          id: 'zone-authority',
-          effect: 'allow',
-          permission_groups: [
-            { id: 'zone-read', name: 'Zone Read' },
-            { id: 'routes-read', name: 'Workers Routes Read' },
-            { id: 'routes-write', name: 'Workers Routes Write' },
-          ],
-          resources: {
-            'com.cloudflare.api.account.account': {
-              'com.cloudflare.api.account.zone.*': '*',
-            },
-          },
-        },
-      ],
-    });
-  }
-  if (url.pathname.endsWith('/zones')) {
-    expect(url.searchParams.get('account.id')).toBe('account');
-    if (url.searchParams.has('page')) return envelope([]);
-    return envelope(zoneIds.map((id) => ({ id, account: { id: 'account' } })));
-  }
-  return undefined;
-}
-
-function fenced<T>(
-  client: CloudflareProvisioningClient,
-  operation: () => Promise<T>,
-): Promise<T> {
-  return client.withMutationFence(
-    {
-      mutationLeaseTtlMs: 15 * 60_000,
-      assertOwned: async () => {},
-    },
-    operation,
-  );
-}
-
-function testRateCoordinator(
-  intervalCap?: number,
-): ProcessLocalCloudflareApiRateCoordinator {
-  return new ProcessLocalCloudflareApiRateCoordinator(intervalCap);
-}
-
-function errorChain(error: unknown): string {
-  const messages: string[] = [];
-  let current = error;
-  while (current instanceof Error) {
-    messages.push(current.message);
-    current = current.cause;
-  }
-  return messages.join(' | ');
 }
 
 describe('CloudflareProvisioningClient', () => {

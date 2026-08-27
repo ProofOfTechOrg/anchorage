@@ -591,8 +591,8 @@ describe('credentialed conformance command', () => {
 
   it('pins live-only plain-lane request and recovery invariants', () => {
     const source = readFileSync(scriptPath, 'utf8');
-    expect(source).toContain(
-      'const cloudflare = new Cloudflare({ apiToken, maxRetries: 0 });',
+    expect(source).toMatch(
+      /const cloudflare = new Cloudflare\(\{\s*apiToken,\s*logLevel: 'off',\s*maxRetries: 0,\s*\}\);/u,
     );
     expect(source).toMatch(
       /deployment\.store\.withDeploymentLease\(\s*spec\.tenantTag,\s*spec\.environment,\s*async \(fence\)/u,

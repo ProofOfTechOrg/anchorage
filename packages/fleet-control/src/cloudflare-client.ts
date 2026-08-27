@@ -2,7 +2,10 @@
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
-import Cloudflare from 'cloudflare';
+import Cloudflare, { APIConnectionError, APIError } from 'cloudflare';
+import type { ScriptUpdateParams } from 'cloudflare/resources/workers/scripts/scripts';
+import type { VersionCreateParams } from 'cloudflare/resources/workers/scripts/versions';
+import type { NamespaceListResponse } from 'cloudflare/resources/workers-for-platforms/dispatch/namespaces/namespaces';
 import { toFile } from 'cloudflare/uploads';
 import PQueue from 'p-queue';
 import { ActiveRouteAttestationError } from './active-route.js';
@@ -21,8 +24,14 @@ import {
   FLEET_AUDIT_PROXY_STATE_BINDING,
 } from './platform-resources.js';
 import {
+  assertOrdinaryWorkerDeploymentVersions,
   assertProviderBindingIdentitiesMatchInspection,
   assertSupportedProviderBindings,
+  providerBindingsToPlainWorkerShape,
+  readArrayField,
+  readField,
+  readStringField,
+  uploadIntentToProviderBindings,
 } from './provider-binding-inventory.js';
 import { deploymentSpecDigest } from './spec-digest.js';
 import type {
@@ -32,7 +41,13 @@ import type {
   DeploymentSpec,
   ExternalMutationFence,
   FleetResourceInventory,
+  OrdinaryWorkerDeploymentVersion,
+  PlainWorkerDatabaseInventoryEntry,
+  PlainWorkerDeploymentStatus,
   PlainWorkerRouteApi,
+  PlainWorkerUploadIntent,
+  PlainWorkerVersionDetail,
+  PlainWorkerVersionSummary,
   PromotionGuard,
   ProviderBindingIdentity,
   ScriptInventoryTarget,
@@ -45,6 +60,10 @@ const AUDIT_CONSUMER_SETTINGS = Object.freeze({
   max_wait_time_ms: 5_000,
 });
 const SDK_TRANSPORT_TIMEOUT_MS = 2_147_483_647;
+const DEFAULT_INVENTORY_BOUND = 10_000;
+const MAX_DATABASE_INVENTORY = 25_000;
+const MAX_VERSION_INVENTORY = 5_000;
+const MAX_SANITIZED_ERROR_CAUSE_DEPTH = 8;
 
 export interface CloudflareClientOptions {
   readonly accountId: string;
@@ -55,6 +74,24 @@ export interface CloudflareClientOptions {
   readonly requestTimeoutMs?: number;
   readonly fetch?: typeof fetch;
   readonly exportStore?: DurableDatabaseExportStore;
+}
+
+export type PlainWorkerCloudflareClientOptions = Omit<
+  CloudflareClientOptions,
+  'dispatchNamespace'
+> & { readonly plane: 'plain-worker' };
+
+export class CloudflarePlaneCapabilityError extends Error {
+  readonly operation: string;
+  readonly requiredPlane = 'workers-for-platforms' as const;
+
+  constructor(operation: string) {
+    super(
+      `Cloudflare operation '${operation}' requires the workers-for-platforms plane`,
+    );
+    this.name = 'CloudflarePlaneCapabilityError';
+    this.operation = operation;
+  }
 }
 
 export interface DurableDatabaseExportStore {
@@ -220,6 +257,191 @@ function tagValue(tags: readonly string[], prefix: string): string | undefined {
 }
 
 type CloudflareSdk = InstanceType<typeof Cloudflare>;
+type StagedOrdinaryWorkerUploadMetadata = VersionCreateParams.Metadata & {
+  readonly limits?: { readonly cpu_ms: number };
+};
+type OrdinaryWorkerUploadMetadata =
+  | (ScriptUpdateParams.Metadata & {
+      readonly limits?: { readonly cpu_ms: number };
+    })
+  | StagedOrdinaryWorkerUploadMetadata;
+const PREPARED_ORDINARY_WORKER_UPLOAD: unique symbol = Symbol(
+  'fleet-control.preparedOrdinaryWorkerUpload',
+);
+const PREPARED_ORDINARY_WORKER_DEPLOYMENT_VERSIONS: unique symbol = Symbol(
+  'fleet-control.preparedOrdinaryWorkerDeploymentVersions',
+);
+/** @inline */
+type PreparedOrdinaryWorkerUpload = Readonly<{
+  [PREPARED_ORDINARY_WORKER_UPLOAD]: true;
+  intent: PlainWorkerUploadIntent;
+  files: readonly File[];
+  metadata: string;
+  secretValues: readonly string[];
+}>;
+/** @inline */
+type PreparedOrdinaryWorkerDeploymentVersions = readonly Readonly<{
+  percentage: number;
+  version_id: string;
+}>[] & {
+  readonly [PREPARED_ORDINARY_WORKER_DEPLOYMENT_VERSIONS]: true;
+};
+
+export class CloudflareProviderRequestNotDispatchedError extends Error {
+  constructor(cause: unknown) {
+    super('Cloudflare provider request was not dispatched', { cause });
+    this.name = 'CloudflareProviderRequestNotDispatchedError';
+  }
+}
+
+function readWorkerVersionTag(version: unknown): string | undefined {
+  return readStringField(readField(version, 'annotations'), 'workers/tag');
+}
+
+function redactSecretValues(
+  value: string,
+  secretValues: readonly string[],
+): string {
+  return secretValues.reduce(
+    (redacted, secret) =>
+      secret.length > 0 ? redacted.split(secret).join('[redacted]') : redacted,
+    value,
+  );
+}
+
+function readErrorFieldSafely(
+  value: unknown,
+  key: 'cause' | 'constructor' | 'message' | 'name' | 'status',
+): unknown {
+  // A consumer-injected rejection can still be instanceof Error with doctored
+  // or throwing fields; the redaction boundaries must not throw while reading.
+  try {
+    return Reflect.get(value as object, key);
+  } catch {
+    return undefined;
+  }
+}
+
+function isErrorSafely(value: unknown): value is Error {
+  // For object values, `value instanceof Error` walks [[GetPrototypeOf]]; a
+  // Proxy trap or revoked Proxy can throw and replace the sanitized failure,
+  // so every Error check on the foreign cause graph uses this predicate.
+  try {
+    return value instanceof Error;
+  } catch {
+    return false;
+  }
+}
+
+function sanitizedErrorName(error: unknown): string {
+  const name = readErrorFieldSafely(error, 'name');
+  const directName = typeof name === 'string' ? name : undefined;
+  const nameFromConstructor = readErrorFieldSafely(
+    isErrorSafely(error)
+      ? readErrorFieldSafely(error, 'constructor')
+      : undefined,
+    'name',
+  );
+  const constructorName =
+    typeof nameFromConstructor === 'string' ? nameFromConstructor : undefined;
+  const candidate =
+    directName && directName !== 'Error'
+      ? directName
+      : (constructorName ?? directName);
+  return candidate && /^[A-Za-z][A-Za-z0-9]*Error$/.test(candidate)
+    ? candidate
+    : 'unknown';
+}
+
+function sanitizedErrorCause(
+  error: Error,
+  secretValues: readonly string[],
+  depth = 0,
+  seen = new WeakMap<Error, string>(),
+): Error {
+  // This boundary never throws on the values it receives: cycles, depth,
+  // non-string messages, throwing accessors, and hostile prototypes all
+  // degrade to safe values. Fresh Errors copy safe values.
+  const name = sanitizedErrorName(error);
+  seen.set(error, name);
+  const cause = readErrorFieldSafely(error, 'cause');
+  const message = readErrorFieldSafely(error, 'message');
+  let sanitizedCause: Error | { name: string } | undefined;
+  if (isErrorSafely(cause)) {
+    const memoized = seen.get(cause);
+    sanitizedCause =
+      memoized !== undefined
+        ? { name: memoized }
+        : depth + 1 >= MAX_SANITIZED_ERROR_CAUSE_DEPTH
+          ? { name: sanitizedErrorName(cause) }
+          : sanitizedErrorCause(cause, secretValues, depth + 1, seen);
+  }
+  const sanitized = new Error(
+    typeof message === 'string'
+      ? redactSecretValues(message, secretValues)
+      : '',
+    sanitizedCause === undefined ? undefined : { cause: sanitizedCause },
+  );
+  sanitized.name = name;
+  return sanitized;
+}
+
+function sanitizeProviderError(
+  error: unknown,
+  secretValues: readonly string[],
+): unknown {
+  // Wrapped paths supply an SDK-constructed operand. A value that escapes when
+  // the SDK itself throws on the rejection before wrapping it (castToError's
+  // instanceof, internal/errors.mjs:11; the String()/in coercions at
+  // client.mjs:389-390) is outside this boundary's no-throw promise.
+  if (!(error instanceof APIError)) return error;
+  const sanitized = new Error('Cloudflare Worker upload failed');
+  sanitized.name = 'CloudflareProviderError';
+  Object.defineProperties(sanitized, {
+    status: { enumerable: true, value: error.status },
+    errors: {
+      enumerable: true,
+      value: (Array.isArray(error.errors) ? error.errors : []).flatMap(
+        (entry) => {
+          if (!entry || typeof entry !== 'object') return [];
+          const code = readField(entry, 'code');
+          const message = readField(entry, 'message');
+          return [
+            {
+              ...(typeof code === 'number' || typeof code === 'string'
+                ? { code }
+                : {}),
+              ...(typeof message === 'string'
+                ? { message: redactSecretValues(message, secretValues) }
+                : {}),
+            },
+          ];
+        },
+      ),
+    },
+    cause: {
+      enumerable: false,
+      // APIConnectionError keeps a cause chain because, for a rejected fetch,
+      // that chain is the fence or transport failure the adapter classifies
+      // through. The SDK drops the underlying error on its timeout arm
+      // (APIConnectionTimeoutError is constructed without a cause,
+      // core/error.mjs:81-85), so that chain is one constant level. Every other
+      // APIError (a provider response or the SDK's own abort error) collapses
+      // to { name }.
+      value:
+        error instanceof APIConnectionError
+          ? sanitizedErrorCause(error, secretValues)
+          : { name: sanitizedErrorName(error) },
+    },
+  });
+  return sanitized;
+}
+
+function inventoryBoundExceeded(label: string, max: number): Error {
+  return new Error(
+    `${label} exceeded the supported inventory bound of ${max} items`,
+  );
+}
 
 const REQUIRED_ZONE_PERMISSION_GROUPS = [
   ['Zone Read'],
@@ -431,21 +653,66 @@ async function hashExport(
   return { sha256: hash.digest('hex'), size };
 }
 
+let trackProviderDispatch: <T>(
+  client: CloudflareProvisioningClient,
+  operation: () => Promise<T>,
+) => Promise<T>;
+
+/**
+ * Runs `operation`; rejects with
+ * `CloudflareProviderRequestNotDispatchedError` (`cause` = the failure) when it
+ * fails before any provider mutation request was invoked. Provider reads do
+ * not count. Not re-entrant: one scope per outcome member. A nested scope
+ * shadows the outer store, so a mutation dispatched inside it leaves the outer
+ * tracker unmarked and a later outer failure is misclassified as pre-dispatch.
+ */
+export function withProviderDispatchTracking<T>(
+  client: CloudflareProvisioningClient,
+  operation: () => Promise<T>,
+): Promise<T> {
+  return trackProviderDispatch(client, operation);
+}
+
 export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   readonly #accountId: string;
   readonly #apiToken: string;
-  readonly #dispatchNamespace: string;
+  readonly #dispatchNamespace: string | undefined;
   readonly #client: CloudflareSdk;
   readonly #operationQueue: PQueue;
   readonly #requestQueue: PQueue;
   readonly #rateCoordinator: CloudflareApiRateCoordinator;
   readonly #exportStore: DurableDatabaseExportStore | undefined;
   readonly #fetch: typeof fetch;
+  readonly #dispatchTracker = new AsyncLocalStorage<{ dispatched: boolean }>();
   readonly #mutationFence = new AsyncLocalStorage<ExternalMutationFence>();
   readonly #requestTimeoutMs: number;
 
-  constructor(options: CloudflareClientOptions) {
-    if (!options.accountId || !options.apiToken || !options.dispatchNamespace) {
+  static {
+    // This module-private friend keeps dispatch classification out of the
+    // public class; by convention only the direct ordinary-Worker adapter
+    // enters it, and Workers for Platforms callers never do.
+    trackProviderDispatch = (client, operation) =>
+      client.#trackDispatch(operation);
+  }
+
+  constructor(
+    options: CloudflareClientOptions | PlainWorkerCloudflareClientOptions,
+  ) {
+    if ('plane' in options) {
+      if (options.plane !== 'plain-worker') {
+        throw new Error('unsupported Cloudflare client plane');
+      }
+      if (!options.accountId || !options.apiToken) {
+        throw new Error('accountId and apiToken are required');
+      }
+      if ('dispatchNamespace' in options) {
+        throw new Error('plain-worker plane cannot name a dispatch namespace');
+      }
+    } else if (
+      !options.accountId ||
+      !options.apiToken ||
+      !options.dispatchNamespace
+    ) {
       throw new Error(
         'accountId, apiToken, and dispatchNamespace are required',
       );
@@ -455,7 +722,8 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     }
     this.#accountId = options.accountId;
     this.#apiToken = options.apiToken;
-    this.#dispatchNamespace = options.dispatchNamespace;
+    this.#dispatchNamespace =
+      'plane' in options ? undefined : options.dispatchNamespace;
     const concurrency = options.concurrency ?? 8;
     if (!Number.isInteger(concurrency) || concurrency < 1) {
       throw new Error('concurrency must be a positive integer');
@@ -472,18 +740,25 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     ) {
       throw new Error('requestTimeoutMs must be a positive integer');
     }
-    const rateLimitedFetch: typeof fetch = async (input, init) => {
-      return this.#request(input, init);
-    };
+    const rateLimitedFetch: typeof fetch = (input, init) =>
+      this.#request(input, init);
     this.#client = new Cloudflare({
       apiToken: options.apiToken,
       fetch: rateLimitedFetch,
+      // An injected logger cannot be disabled independently, so the client
+      // option must override CLOUDFLARE_LOG before credentials reach the SDK.
+      logLevel: 'off',
       maxRetries: 2,
       // The SDK timeout starts before its custom transport. Apply the real
       // timeout after shared quota acquisition so replica coordination cannot
       // consume the network request's lease-bounded execution budget.
       timeout: SDK_TRANSPORT_TIMEOUT_MS,
     });
+  }
+
+  /** Configured provider request timeout in milliseconds. */
+  get requestTimeoutMs(): number {
+    return this.#requestTimeoutMs;
   }
 
   async #request(
@@ -493,13 +768,20 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     const method = (
       init?.method ?? (input instanceof Request ? input.method : 'GET')
     ).toUpperCase();
+    const mutation = method !== 'GET' && method !== 'HEAD';
+    // These reads are deliberately redundant with the request-queue binding
+    // for explicit call-time capture. The binding stays required for consumer
+    // callbacks (injected fetch, assertOwned, and acquire); the 'runs a queued
+    // request under its enqueuer context' case in
+    // test/cloudflare-client-plain-worker.test.ts pins it.
     const fence = this.#mutationFence.getStore();
+    const tracker = this.#dispatchTracker.getStore();
     const signal =
       init?.signal ?? (input instanceof Request ? input.signal : undefined);
     const response = await this.#requestQueue.add(
-      async () => {
+      this.#inEnqueuerContext(async () => {
         await this.#rateCoordinator.acquire(signal);
-        if (method !== 'GET' && method !== 'HEAD') {
+        if (mutation) {
           if (!fence) {
             throw new Error(
               `Cloudflare ${method} request requires an external mutation fence`,
@@ -508,13 +790,16 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
           await fence.assertOwned();
         }
         const timeoutSignal = AbortSignal.timeout(this.#requestTimeoutMs);
+        // Mark only after quota and fence checks. The SDK's `data:` FormData
+        // probe is a GET, so it neither asserts nor marks.
+        if (mutation && tracker) tracker.dispatched = true;
         return this.#fetch(input, {
           ...init,
           signal: signal
             ? AbortSignal.any([signal, timeoutSignal])
             : timeoutSignal,
         });
-      },
+      }),
       { signal },
     );
     if (!response) {
@@ -524,7 +809,52 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   }
 
   async #schedule<T>(operation: () => Promise<T>): Promise<T> {
-    return (await this.#operationQueue.add(operation)) as T;
+    return (await this.#operationQueue.add(
+      this.#inEnqueuerContext(operation),
+    )) as T;
+  }
+
+  #inEnqueuerContext<T>(operation: () => Promise<T>): () => Promise<T> {
+    // p-queue starts a deferred task from the previous task's microtask, so a
+    // bare callback would run under the previous operation's context. The
+    // operation queue's hop precedes every read in #request; the request
+    // queue's hop runs consumer callbacks that must observe their operation.
+    const run = AsyncLocalStorage.snapshot();
+    return () => run(operation);
+  }
+
+  async #trackDispatch<T>(operation: () => Promise<T>): Promise<T> {
+    const tracker = { dispatched: false };
+    try {
+      return await this.#dispatchTracker.run(tracker, operation);
+    } catch (error) {
+      if (!tracker.dispatched) {
+        throw new CloudflareProviderRequestNotDispatchedError(error);
+      }
+      throw error;
+    }
+  }
+
+  async *#collectBounded<T>(
+    iterable: AsyncIterable<T> | Iterable<T>,
+    label: string,
+    max = DEFAULT_INVENTORY_BOUND,
+  ): AsyncGenerator<T> {
+    let count = 0;
+    for await (const item of iterable) {
+      count += 1;
+      if (count > max) {
+        throw inventoryBoundExceeded(label, max);
+      }
+      yield item;
+    }
+  }
+
+  #requireDispatchNamespace(operation: string): string {
+    if (this.#dispatchNamespace === undefined) {
+      throw new CloudflarePlaneCapabilityError(operation);
+    }
+    return this.#dispatchNamespace;
   }
 
   async withMutationFence<T>(
@@ -581,11 +911,14 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     });
     const zoneIds: string[] = [];
     const seenZoneIds = new Set<string>();
-    for await (const zone of this.#client.zones.list({
-      account: { id: this.#accountId },
-      per_page: 50,
-      type: ['full', 'partial', 'secondary', 'internal'],
-    })) {
+    for await (const zone of this.#collectBounded(
+      this.#client.zones.list({
+        account: { id: this.#accountId },
+        per_page: 50,
+        type: ['full', 'partial', 'secondary', 'internal'],
+      }),
+      'zone inventory',
+    )) {
       if (zone.account.id !== this.#accountId) {
         throw new Error(
           `Cloudflare returned zone '${zone.id}' outside account '${this.#accountId}'`,
@@ -606,13 +939,15 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     accountId: string;
     dispatchNamespace: string;
   }> {
+    const dispatchNamespace =
+      this.#requireDispatchNamespace('platformPlaneScope');
     return {
       accountId: this.#accountId,
-      dispatchNamespace: this.#dispatchNamespace,
+      dispatchNamespace,
     };
   }
 
-  async #assertUntrustedDispatchNamespace(): Promise<
+  async #assertUntrustedDispatchNamespace(dispatchNamespace: string): Promise<
     Readonly<{
       name: string;
       namespaceId?: string;
@@ -622,15 +957,15 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   > {
     const namespace =
       await this.#client.workersForPlatforms.dispatch.namespaces.get(
-        this.#dispatchNamespace,
+        dispatchNamespace,
         { account_id: this.#accountId },
       );
     if (
-      namespace.namespace_name !== this.#dispatchNamespace ||
+      namespace.namespace_name !== dispatchNamespace ||
       namespace.trusted_workers !== false
     ) {
       throw new Error(
-        `dispatch namespace '${this.#dispatchNamespace}' must attest trusted_workers=false`,
+        `dispatch namespace '${dispatchNamespace}' must attest trusted_workers=false`,
       );
     }
     if (
@@ -639,7 +974,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       namespace.script_count < 0
     ) {
       throw new Error(
-        `dispatch namespace '${this.#dispatchNamespace}' returned no valid script_count`,
+        `dispatch namespace '${dispatchNamespace}' returned no valid script_count`,
       );
     }
     return {
@@ -653,9 +988,40 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   }
 
   async assertUntrustedDispatchNamespace(): Promise<void> {
+    const dispatchNamespace = this.#requireDispatchNamespace(
+      'assertUntrustedDispatchNamespace',
+    );
     await this.#schedule(async () => {
-      await this.#assertUntrustedDispatchNamespace();
+      await this.#assertUntrustedDispatchNamespace(dispatchNamespace);
     });
+  }
+
+  async *#dispatchNamespaces(): AsyncGenerator<NamespaceListResponse> {
+    let yielded = false;
+    try {
+      const listed = this.#client.workersForPlatforms.dispatch.namespaces.list({
+        account_id: this.#accountId,
+      });
+      for await (const namespace of this.#collectBounded(
+        listed,
+        'dispatch namespace inventory',
+      )) {
+        yielded = true;
+        yield namespace;
+      }
+    } catch (error) {
+      // Only a plain-only account can prove the account-wide namespace set is
+      // empty from an initial 404; a partial scan is never exhaustive. The
+      // installed SDK's SinglePage never issues a second request, so the
+      // yielded guard is a forward-looking invariant rather than a live path.
+      if (
+        this.#dispatchNamespace !== undefined ||
+        yielded ||
+        !isNotFound(error)
+      ) {
+        throw error;
+      }
+    }
   }
 
   async listWorkerDatabaseAttachments(databaseId: string): Promise<
@@ -685,9 +1051,10 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
         ...(dispatchNamespace ? { dispatchNamespace } : {}),
       });
     };
-    for await (const script of this.#client.workers.scripts.list({
-      account_id: this.#accountId,
-    })) {
+    for await (const script of this.#collectBounded(
+      this.#client.workers.scripts.list({ account_id: this.#accountId }),
+      'ordinary Worker script inventory',
+    )) {
       if (typeof script.id !== 'string' || script.id.length === 0) {
         throw new Error(
           'Cloudflare ordinary Worker listing contained a script without an id',
@@ -744,9 +1111,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
         }
       }
     }
-    for await (const namespace of this.#client.workersForPlatforms.dispatch.namespaces.list(
-      { account_id: this.#accountId },
-    )) {
+    for await (const namespace of this.#dispatchNamespaces()) {
       if (
         typeof namespace.namespace_name !== 'string' ||
         namespace.namespace_name.length === 0
@@ -795,9 +1160,10 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       plane: 'ordinary' | 'dispatch';
       dispatchNamespace?: string;
     }> = [];
-    for await (const script of this.#client.workers.scripts.list({
-      account_id: this.#accountId,
-    })) {
+    for await (const script of this.#collectBounded(
+      this.#client.workers.scripts.list({ account_id: this.#accountId }),
+      'ordinary Worker script inventory',
+    )) {
       if (!script.id) throw new Error('ordinary Worker has no id');
       const deployments = await this.#client.workers.scripts.deployments.list(
         script.id,
@@ -825,9 +1191,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
         }
       }
     }
-    for await (const namespace of this.#client.workersForPlatforms.dispatch.namespaces.list(
-      { account_id: this.#accountId },
-    )) {
+    for await (const namespace of this.#dispatchNamespaces()) {
       if (!namespace.namespace_name) {
         throw new Error('dispatch namespace has no name');
       }
@@ -930,13 +1294,13 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     resource: import('./types.js').ApplicationR2Binding,
   ): Promise<void> {
     await this.#schedule(async () => {
-      for await (const object of this.#client.r2.buckets.objects.list(
-        resource.bucketName,
-        {
+      for await (const object of this.#collectBounded(
+        this.#client.r2.buckets.objects.list(resource.bucketName, {
           account_id: this.#accountId,
           jurisdiction: resource.jurisdiction,
           per_page: 1,
-        },
+        }),
+        'R2 object inventory',
       )) {
         if (object.key) {
           throw new Error(`R2 bucket '${resource.bucketName}' is not empty`);
@@ -968,9 +1332,11 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   async #ordinaryWorkerSecretNames(scriptName: string): Promise<string[]> {
     const names: string[] = [];
     try {
-      for await (const secret of this.#client.workers.scripts.secrets.list(
-        scriptName,
-        { account_id: this.#accountId },
+      for await (const secret of this.#collectBounded(
+        this.#client.workers.scripts.secrets.list(scriptName, {
+          account_id: this.#accountId,
+        }),
+        'ordinary Worker secret inventory',
       )) {
         if (!secret.name) {
           throw new Error(
@@ -987,10 +1353,11 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   }
 
   async #dispatchScripts(
-    dispatchNamespace = this.#dispatchNamespace,
+    dispatchNamespace: string,
   ): Promise<readonly Readonly<{ id: string; tags: readonly string[] }>[]> {
     const scripts: Array<Readonly<{ id: string; tags: readonly string[] }>> =
       [];
+    let itemCount = 0;
     let cursor: string | undefined;
     const seenCursors = new Set<string>();
     do {
@@ -1022,6 +1389,13 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
         );
       }
       for (const item of result) {
+        itemCount += 1;
+        if (itemCount > DEFAULT_INVENTORY_BOUND) {
+          throw inventoryBoundExceeded(
+            'dispatch script inventory',
+            DEFAULT_INVENTORY_BOUND,
+          );
+        }
         if (!item || typeof item !== 'object' || !('id' in item)) {
           throw new Error(
             'Cloudflare dispatch script listing contained an invalid item',
@@ -1072,13 +1446,304 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     return scripts;
   }
 
+  async listOrdinaryWorkerDatabases(): Promise<
+    readonly PlainWorkerDatabaseInventoryEntry[]
+  > {
+    return this.#schedule(async () => {
+      const databases: PlainWorkerDatabaseInventoryEntry[] = [];
+      for await (const database of this.#collectBounded(
+        this.#client.d1.database.list({
+          account_id: this.#accountId,
+          per_page: 100,
+        }),
+        'D1 database inventory',
+        MAX_DATABASE_INVENTORY,
+      )) {
+        databases.push({
+          databaseId: readStringField(database, 'uuid'),
+          name: readStringField(database, 'name'),
+        });
+      }
+      return databases;
+    });
+  }
+
+  async ordinaryWorkerDeploymentStatus(
+    scriptName: string,
+  ): Promise<PlainWorkerDeploymentStatus | undefined> {
+    return this.#schedule(async () => {
+      try {
+        const listed = await this.#client.workers.scripts.deployments.list(
+          scriptName,
+          {
+            account_id: this.#accountId,
+          },
+        );
+        const deployment = listed.deployments[0];
+        if (!deployment) return undefined;
+        return {
+          versions: readArrayField(deployment, 'versions').map((version) => {
+            const rawPercentage = readField(version, 'percentage');
+            return {
+              versionId:
+                readStringField(version, 'id') ??
+                readStringField(version, 'version_id'),
+              percentage:
+                rawPercentage === undefined ? undefined : Number(rawPercentage),
+            };
+          }),
+        };
+      } catch (error) {
+        if (isNotFound(error)) return undefined;
+        throw error;
+      }
+    });
+  }
+
+  async listOrdinaryWorkerVersions(
+    scriptName: string,
+  ): Promise<readonly PlainWorkerVersionSummary[] | undefined> {
+    return this.#schedule(async () => {
+      let yielded = false;
+      try {
+        const versions: PlainWorkerVersionSummary[] = [];
+        for await (const version of this.#collectBounded(
+          this.#client.workers.scripts.versions.list(scriptName, {
+            account_id: this.#accountId,
+            per_page: 100,
+          }),
+          'ordinary Worker version inventory',
+          MAX_VERSION_INVENTORY,
+        )) {
+          yielded = true;
+          versions.push({
+            versionId:
+              readStringField(version, 'id') ??
+              readStringField(version, 'version_id'),
+            tag: readWorkerVersionTag(version),
+          });
+        }
+        return versions;
+      } catch (error) {
+        if (!yielded && isNotFound(error)) return undefined;
+        throw error;
+      }
+    });
+  }
+
+  async viewOrdinaryWorkerVersion(
+    scriptName: string,
+    versionId: string,
+  ): Promise<PlainWorkerVersionDetail> {
+    return this.#schedule(async () => {
+      const version = await this.#client.workers.scripts.versions.get(
+        versionId,
+        { account_id: this.#accountId, script_name: scriptName },
+      );
+      return {
+        versionId:
+          readStringField(version, 'id') ??
+          readStringField(version, 'version_id'),
+        tag: readWorkerVersionTag(version),
+        bindings: providerBindingsToPlainWorkerShape(
+          readArrayField(readField(version, 'resources'), 'bindings'),
+        ),
+      };
+    });
+  }
+
+  async findOrdinaryWorkerVersion(
+    scriptName: string,
+    versionId: string,
+  ): Promise<PlainWorkerVersionDetail | undefined> {
+    try {
+      return await this.viewOrdinaryWorkerVersion(scriptName, versionId);
+    } catch (error) {
+      if (isNotFound(error)) return undefined;
+      throw error;
+    }
+  }
+
+  async prepareOrdinaryWorkerUpload(
+    intent: PlainWorkerUploadIntent,
+  ): Promise<PreparedOrdinaryWorkerUpload> {
+    for (const module of intent.modules) {
+      if (
+        !module ||
+        typeof module.name !== 'string' ||
+        (typeof module.content !== 'string' &&
+          !(module.content instanceof Uint8Array)) ||
+        (module.contentType !== undefined &&
+          typeof module.contentType !== 'string')
+      ) {
+        throw new TypeError(
+          'ordinary Worker modules must contain valid upload data',
+        );
+      }
+    }
+    const bindings = uploadIntentToProviderBindings(intent);
+    const secretValues = intent.bindings.secrets.map(({ value }) => value);
+    const baseMetadata: StagedOrdinaryWorkerUploadMetadata = {
+      main_module: intent.mainModule,
+      bindings,
+      compatibility_date: intent.compatibilityDate,
+      compatibility_flags: intent.compatibilityFlags
+        ? [...intent.compatibilityFlags]
+        : undefined,
+      limits:
+        intent.limits.cpuMs === undefined
+          ? undefined
+          : { cpu_ms: intent.limits.cpuMs },
+      annotations: { 'workers/tag': intent.candidateTag },
+    };
+    const metadata: OrdinaryWorkerUploadMetadata =
+      intent.mode === 'initial'
+        ? {
+            ...baseMetadata,
+            migrations: workerMigrations(intent.durableObjectMigrations),
+          }
+        : baseMetadata;
+    const encodedMetadata = JSON.stringify(metadata);
+    const files = await Promise.all(
+      intent.modules.map((module) =>
+        toFile(
+          typeof module.content === 'string'
+            ? new TextEncoder().encode(module.content)
+            : module.content,
+          module.name,
+          {
+            type: module.contentType ?? 'application/javascript+module',
+          },
+        ),
+      ),
+    );
+    return {
+      [PREPARED_ORDINARY_WORKER_UPLOAD]: true,
+      intent,
+      files,
+      metadata: encodedMetadata,
+      secretValues,
+    };
+  }
+
+  async dispatchOrdinaryWorkerUpload(
+    prepared: PreparedOrdinaryWorkerUpload,
+  ): Promise<void> {
+    const { files, intent, metadata, secretValues } = prepared;
+    await this.#schedule(async () => {
+      const subdomain = this.#client.workers.scripts.subdomain;
+      const uploadBody = {
+        account_id: this.#accountId,
+        files: [...files],
+        // cloudflare/internal/uploads.mjs:102-129 bracket-flattens objects;
+        // Wrangler 4.118.0 serializes the same metadata value as JSON.
+        metadata: metadata as never,
+      };
+      const send = async (call: () => Promise<unknown>): Promise<void> => {
+        try {
+          await call();
+        } catch (error) {
+          throw sanitizeProviderError(error, secretValues);
+        }
+      };
+      if (intent.mode === 'initial') {
+        await send(() =>
+          this.#client.workers.scripts.update(intent.scriptName, uploadBody, {
+            maxRetries: 0,
+          }),
+        );
+        // Sanitization is limited to the upload request that carries secrets.
+        // Cloudflare rejects subdomain writes before the script exists. The
+        // caller attests public access before adopting a reconciled upload.
+        await subdomain.create(intent.scriptName, {
+          account_id: this.#accountId,
+          enabled: intent.publicAccess.workersDevEnabled,
+          previews_enabled: intent.publicAccess.previewUrlsEnabled,
+        });
+        return;
+      }
+      const current = await subdomain.get(intent.scriptName, {
+        account_id: this.#accountId,
+      });
+      if (
+        current.enabled !== intent.publicAccess.workersDevEnabled ||
+        current.previews_enabled !== intent.publicAccess.previewUrlsEnabled
+      ) {
+        // The staged path can converge public access first because the script
+        // exists; write-on-difference moves it toward the constant intent.
+        await subdomain.create(intent.scriptName, {
+          account_id: this.#accountId,
+          enabled: intent.publicAccess.workersDevEnabled,
+          previews_enabled: intent.publicAccess.previewUrlsEnabled,
+        });
+      }
+      await send(() =>
+        this.#client.workers.scripts.versions.create(
+          intent.scriptName,
+          uploadBody,
+          { maxRetries: 0 },
+        ),
+      );
+    });
+  }
+
+  prepareOrdinaryWorkerDeployment(
+    versions: readonly OrdinaryWorkerDeploymentVersion[],
+  ): PreparedOrdinaryWorkerDeploymentVersions {
+    assertOrdinaryWorkerDeploymentVersions(versions);
+    return Object.assign(
+      versions.map(({ versionId, percentage }) => ({
+        percentage,
+        version_id: versionId,
+      })),
+      { [PREPARED_ORDINARY_WORKER_DEPLOYMENT_VERSIONS]: true as const },
+    );
+  }
+
+  async dispatchOrdinaryWorkerDeployment(
+    scriptName: string,
+    versions: PreparedOrdinaryWorkerDeploymentVersions,
+  ): Promise<void> {
+    await this.#schedule(() =>
+      this.#client.workers.scripts.deployments.create(
+        scriptName,
+        {
+          account_id: this.#accountId,
+          strategy: 'percentage',
+          versions: [...versions],
+        },
+        { maxRetries: 0 },
+      ),
+    );
+  }
+
+  async deleteOrdinaryWorkerScript(
+    scriptName: string,
+  ): Promise<'deleted' | 'absent'> {
+    return this.#schedule(async () => {
+      try {
+        await this.#client.workers.scripts.delete(scriptName, {
+          account_id: this.#accountId,
+        });
+        return 'deleted';
+      } catch (error) {
+        if (isNotFound(error)) return 'absent';
+        throw error;
+      }
+    });
+  }
+
   async findDatabase(name: string): Promise<DatabaseReference | undefined> {
     return this.#schedule(async () => {
       const matches: DatabaseReference[] = [];
-      for await (const database of this.#client.d1.database.list({
-        account_id: this.#accountId,
-        name,
-      })) {
+      for await (const database of this.#collectBounded(
+        this.#client.d1.database.list({
+          account_id: this.#accountId,
+          name,
+        }),
+        'D1 database inventory',
+        MAX_DATABASE_INVENTORY,
+      )) {
         if (database.name === name && database.uuid) {
           matches.push({ id: database.uuid, name, created: false });
         }
@@ -1116,12 +1781,18 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   }
 
   async ensureDispatchNamespace(): Promise<void> {
+    const dispatchNamespace = this.#requireDispatchNamespace(
+      'ensureDispatchNamespace',
+    );
     await this.#schedule(async () => {
       let found = false;
-      for await (const namespace of this.#client.workersForPlatforms.dispatch.namespaces.list(
-        { account_id: this.#accountId },
+      for await (const namespace of this.#collectBounded(
+        this.#client.workersForPlatforms.dispatch.namespaces.list({
+          account_id: this.#accountId,
+        }),
+        'dispatch namespace inventory',
       )) {
-        if (namespace.namespace_name === this.#dispatchNamespace) {
+        if (namespace.namespace_name === dispatchNamespace) {
           found = true;
           break;
         }
@@ -1129,10 +1800,10 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       if (!found) {
         await this.#client.workersForPlatforms.dispatch.namespaces.create({
           account_id: this.#accountId,
-          name: this.#dispatchNamespace,
+          name: dispatchNamespace,
         });
       }
-      await this.#assertUntrustedDispatchNamespace();
+      await this.#assertUntrustedDispatchNamespace(dispatchNamespace);
     });
   }
 
@@ -1337,9 +2008,11 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     > = [];
     const routes: FleetResourceInventory['routes'][number][] = [];
     if (options.hostRoutingKvId) {
-      for await (const key of this.#client.kv.namespaces.keys.list(
-        options.hostRoutingKvId,
-        { account_id: this.#accountId },
+      for await (const key of this.#collectBounded(
+        this.#client.kv.namespaces.keys.list(options.hostRoutingKvId, {
+          account_id: this.#accountId,
+        }),
+        'host-routing KV key inventory',
       )) {
         if (!key.name) continue;
         const isRegistration = key.name.startsWith(SCRIPT_INVENTORY_PREFIX);
@@ -1515,7 +2188,9 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     const includeDispatchNamespace =
       options.includeDispatchNamespace ?? options.hostRoutingKvId !== undefined;
     const dispatchScripts = includeDispatchNamespace
-      ? await this.#dispatchScripts()
+      ? await this.#dispatchScripts(
+          this.#requireDispatchNamespace('collectFleetInventory'),
+        )
       : [];
     const dispatchScriptsByName = new Map(
       dispatchScripts.map((script) => [script.id, script]),
@@ -1549,6 +2224,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       try {
         live = await this.inspectDispatchWorker(registration.scriptName);
       } catch (error) {
+        if (error instanceof CloudflarePlaneCapabilityError) throw error;
         findings.push({
           tenantTag: registration.tenantTag,
           environment: registration.environment,
@@ -1641,38 +2317,41 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     let dispatchScriptCount: number | undefined;
     let dispatchNamespaceInventory: FleetResourceInventory['dispatchNamespace'];
     if (includeDispatchNamespace) {
-      const dispatchNamespace =
+      const dispatchNamespace = this.#requireDispatchNamespace(
+        'collectFleetInventory',
+      );
+      const namespaceInventory =
         await this.#client.workersForPlatforms.dispatch.namespaces.get(
-          this.#dispatchNamespace,
+          dispatchNamespace,
           { account_id: this.#accountId },
         );
-      dispatchScriptCount = dispatchNamespace.script_count;
+      dispatchScriptCount = namespaceInventory.script_count;
       if (
         typeof dispatchScriptCount !== 'number' ||
         !Number.isSafeInteger(dispatchScriptCount) ||
         dispatchScriptCount < 0
       ) {
         throw new Error(
-          `dispatch namespace '${this.#dispatchNamespace}' returned no valid script_count`,
+          `dispatch namespace '${dispatchNamespace}' returned no valid script_count`,
         );
       }
       dispatchNamespaceInventory = {
-        name: dispatchNamespace.namespace_name ?? this.#dispatchNamespace,
-        ...(dispatchNamespace.namespace_id
-          ? { namespaceId: dispatchNamespace.namespace_id }
+        name: namespaceInventory.namespace_name ?? dispatchNamespace,
+        ...(namespaceInventory.namespace_id
+          ? { namespaceId: namespaceInventory.namespace_id }
           : {}),
-        trustedWorkers: dispatchNamespace.trusted_workers,
+        trustedWorkers: namespaceInventory.trusted_workers,
         scriptCount: dispatchScriptCount,
       };
       if (
-        dispatchNamespace.namespace_name !== this.#dispatchNamespace ||
-        dispatchNamespace.trusted_workers !== false
+        namespaceInventory.namespace_name !== dispatchNamespace ||
+        namespaceInventory.trusted_workers !== false
       ) {
         findings.push({
           tenantTag: 'unknown',
           environment: 'unknown',
           kind: 'trusted-dispatch-namespace',
-          detail: `dispatch namespace '${this.#dispatchNamespace}' does not attest trusted_workers=false`,
+          detail: `dispatch namespace '${dispatchNamespace}' does not attest trusted_workers=false`,
         });
       }
       if (dispatchScriptCount > dispatchScripts.length) {
@@ -1680,15 +2359,16 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
           tenantTag: 'unknown',
           environment: 'unknown',
           kind: 'unknown-dispatch-scripts',
-          detail: `dispatch namespace '${this.#dispatchNamespace}' reports ${dispatchScriptCount - dispatchScripts.length} script(s) missing from the paginated listing`,
+          detail: `dispatch namespace '${dispatchNamespace}' reports ${dispatchScriptCount - dispatchScripts.length} script(s) missing from the paginated listing`,
         });
       }
     }
 
     const customDomains = [];
-    for await (const domain of this.#client.workers.domains.list({
-      account_id: this.#accountId,
-    })) {
+    for await (const domain of this.#collectBounded(
+      this.#client.workers.domains.list({ account_id: this.#accountId }),
+      'custom domain inventory',
+    )) {
       if (domain.service.startsWith(options.scriptNamePrefix)) {
         customDomains.push(domain);
       }
@@ -1698,9 +2378,10 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     > = [];
     const workerRouteZoneIds = await this.#workerRouteZoneIds();
     for (const zoneId of workerRouteZoneIds) {
-      for await (const route of this.#client.workers.routes.list({
-        zone_id: zoneId,
-      })) {
+      for await (const route of this.#collectBounded(
+        this.#client.workers.routes.list({ zone_id: zoneId }),
+        'Worker zone-route inventory',
+      )) {
         if (
           route.script?.startsWith(options.scriptNamePrefix) &&
           route.id &&
@@ -1719,9 +2400,10 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       string,
       { readonly tenantTag: string; readonly environment: string }
     >();
-    for await (const script of this.#client.workers.scripts.list({
-      account_id: this.#accountId,
-    })) {
+    for await (const script of this.#collectBounded(
+      this.#client.workers.scripts.list({ account_id: this.#accountId }),
+      'ordinary Worker script inventory',
+    )) {
       const scriptName = script.id;
       if (!scriptName?.startsWith(options.scriptNamePrefix)) continue;
       try {
@@ -1939,9 +2621,11 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     }
 
     const databaseIds: string[] = [];
-    for await (const database of this.#client.d1.database.list({
-      account_id: this.#accountId,
-    })) {
+    for await (const database of this.#collectBounded(
+      this.#client.d1.database.list({ account_id: this.#accountId }),
+      'D1 database inventory',
+      MAX_DATABASE_INVENTORY,
+    )) {
       if (
         database.uuid &&
         database.name?.startsWith(options.databaseNamePrefix)
@@ -1953,9 +2637,12 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     const registeredScriptNames = new Set(
       registrations.map((registration) => registration.scriptName),
     );
-    for await (const namespace of this.#client.durableObjects.namespaces.list({
-      account_id: this.#accountId,
-    })) {
+    for await (const namespace of this.#collectBounded(
+      this.#client.durableObjects.namespaces.list({
+        account_id: this.#accountId,
+      }),
+      'Durable Object namespace inventory',
+    )) {
       if (
         namespace.id &&
         namespace.script &&
@@ -1999,6 +2686,14 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
               `R2 bucket '${bucket.name}' has no valid creation date`,
             );
           }
+          if (r2Buckets.length >= DEFAULT_INVENTORY_BOUND) {
+            // The bound counts only accepted fleet-owned buckets, not every
+            // provider item scanned while filtering by prefix.
+            throw inventoryBoundExceeded(
+              'R2 bucket inventory',
+              DEFAULT_INVENTORY_BOUND,
+            );
+          }
           r2Buckets.push({
             bucketName: bucket.name,
             jurisdiction,
@@ -2035,9 +2730,12 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
 
   async hasDurableObjectNamespace(namespaceId: string): Promise<boolean> {
     if (!namespaceId) throw new Error('namespaceId is required');
-    for await (const namespace of this.#client.durableObjects.namespaces.list({
-      account_id: this.#accountId,
-    })) {
+    for await (const namespace of this.#collectBounded(
+      this.#client.durableObjects.namespaces.list({
+        account_id: this.#accountId,
+      }),
+      'Durable Object namespace inventory',
+    )) {
       if (namespace.id === namespaceId) return true;
     }
     return false;
@@ -2048,9 +2746,12 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   ): Promise<readonly string[]> {
     if (!scriptName) throw new Error('scriptName is required');
     const namespaceIds: string[] = [];
-    for await (const namespace of this.#client.durableObjects.namespaces.list({
-      account_id: this.#accountId,
-    })) {
+    for await (const namespace of this.#collectBounded(
+      this.#client.durableObjects.namespaces.list({
+        account_id: this.#accountId,
+      }),
+      'Durable Object namespace inventory',
+    )) {
       if (namespace.script === scriptName && namespace.id) {
         namespaceIds.push(namespace.id);
       }
@@ -2104,9 +2805,11 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   ): Promise<void> {
     await this.#schedule(async () => {
       const currentSecretNames: string[] = [];
-      for await (const secret of this.#client.workers.scripts.secrets.list(
-        scriptName,
-        { account_id: this.#accountId },
+      for await (const secret of this.#collectBounded(
+        this.#client.workers.scripts.secrets.list(scriptName, {
+          account_id: this.#accountId,
+        }),
+        'ordinary Worker secret inventory',
       )) {
         if (!secret.name) {
           throw new Error(
@@ -2135,9 +2838,11 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
         });
       }
       const secretNames: string[] = [];
-      for await (const secret of this.#client.workers.scripts.secrets.list(
-        scriptName,
-        { account_id: this.#accountId },
+      for await (const secret of this.#collectBounded(
+        this.#client.workers.scripts.secrets.list(scriptName, {
+          account_id: this.#accountId,
+        }),
+        'ordinary Worker secret inventory',
       )) {
         if (secret.name) secretNames.push(secret.name);
       }
@@ -2297,18 +3002,20 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
           `control Worker '${scriptName}'`,
         );
         const routeHostnames: string[] = [];
-        for await (const domain of this.#client.workers.domains.list({
-          account_id: this.#accountId,
-        })) {
+        for await (const domain of this.#collectBounded(
+          this.#client.workers.domains.list({ account_id: this.#accountId }),
+          'custom domain inventory',
+        )) {
           if (domain.service === scriptName)
             routeHostnames.push(domain.hostname);
         }
         const zoneRoutes: import('./types.js').WorkerZoneRoute[] = [];
         const workerRouteZoneIds = await this.#workerRouteZoneIds();
         for (const zoneId of workerRouteZoneIds) {
-          for await (const route of this.#client.workers.routes.list({
-            zone_id: zoneId,
-          })) {
+          for await (const route of this.#collectBounded(
+            this.#client.workers.routes.list({ zone_id: zoneId }),
+            'Worker zone-route inventory',
+          )) {
             if (route.script !== scriptName) continue;
             zoneRoutes.push({
               zoneId,
@@ -2351,9 +3058,11 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       const listNames = async (): Promise<string[]> => {
         try {
           const names: string[] = [];
-          for await (const secret of this.#client.workers.scripts.secrets.list(
-            scriptName,
-            { account_id: this.#accountId },
+          for await (const secret of this.#collectBounded(
+            this.#client.workers.scripts.secrets.list(scriptName, {
+              account_id: this.#accountId,
+            }),
+            'ordinary Worker secret inventory',
           )) {
             if (!secret.name) {
               throw new Error(
@@ -2401,9 +3110,10 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       } catch (error) {
         if (!isNotFound(error)) throw error;
       }
-      for await (const domain of this.#client.workers.domains.list({
-        account_id: this.#accountId,
-      })) {
+      for await (const domain of this.#collectBounded(
+        this.#client.workers.domains.list({ account_id: this.#accountId }),
+        'custom domain inventory',
+      )) {
         if (domain.service !== scriptName || !domain.id) continue;
         try {
           await this.#client.workers.domains.delete(domain.id, {
@@ -2414,9 +3124,10 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
         }
       }
       for (const zoneId of workerRouteZoneIds) {
-        for await (const route of this.#client.workers.routes.list({
-          zone_id: zoneId,
-        })) {
+        for await (const route of this.#collectBounded(
+          this.#client.workers.routes.list({ zone_id: zoneId }),
+          'Worker zone-route inventory',
+        )) {
           if (route.script !== scriptName) continue;
           try {
             await this.#client.workers.routes.delete(route.id, {
@@ -2473,9 +3184,10 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     return this.#schedule(async () => {
       const domains: Array<OrdinaryWorkerFootprint['customDomains'][number]> =
         [];
-      for await (const domain of this.#client.workers.domains.list({
-        account_id: this.#accountId,
-      })) {
+      for await (const domain of this.#collectBounded(
+        this.#client.workers.domains.list({ account_id: this.#accountId }),
+        'custom domain inventory',
+      )) {
         if (!domain.id || !domain.hostname || !domain.service) {
           throw new Error(
             'Cloudflare returned incomplete custom-domain metadata',
@@ -2569,9 +3281,10 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   ): Promise<OrdinaryWorkerFootprint> {
     return this.#schedule(async () => {
       let scriptPresent = false;
-      for await (const script of this.#client.workers.scripts.list({
-        account_id: this.#accountId,
-      })) {
+      for await (const script of this.#collectBounded(
+        this.#client.workers.scripts.list({ account_id: this.#accountId }),
+        'ordinary Worker script inventory',
+      )) {
         if (script.id === scriptName) scriptPresent = true;
       }
       const customDomains: Array<{
@@ -2579,9 +3292,10 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
         hostname: string;
         service: string;
       }> = [];
-      for await (const domain of this.#client.workers.domains.list({
-        account_id: this.#accountId,
-      })) {
+      for await (const domain of this.#collectBounded(
+        this.#client.workers.domains.list({ account_id: this.#accountId }),
+        'custom domain inventory',
+      )) {
         if (domain.service !== scriptName) continue;
         if (!domain.id || !domain.hostname) {
           throw new Error(
@@ -2596,9 +3310,10 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       }
       const zoneRoutes: import('./types.js').WorkerZoneRoute[] = [];
       for (const zoneId of await this.#workerRouteZoneIds()) {
-        for await (const route of this.#client.workers.routes.list({
-          zone_id: zoneId,
-        })) {
+        for await (const route of this.#collectBounded(
+          this.#client.workers.routes.list({ zone_id: zoneId }),
+          'Worker zone-route inventory',
+        )) {
           if (route.script !== scriptName) continue;
           if (!route.id || !route.pattern) {
             throw new Error(
@@ -2646,9 +3361,10 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   }): Promise<void> {
     await this.#schedule(async () => {
       const matches = [];
-      for await (const queue of this.#client.queues.list({
-        account_id: this.#accountId,
-      })) {
+      for await (const queue of this.#collectBounded(
+        this.#client.queues.list({ account_id: this.#accountId }),
+        'queue inventory',
+      )) {
         if (queue.queue_name === options.queueName && queue.queue_id) {
           matches.push(queue);
         }
@@ -2661,9 +3377,12 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       const queueId = matches[0]?.queue_id;
       if (!queueId) throw new Error('audit queue result has no queue_id');
       const consumers = [];
-      for await (const consumer of this.#client.queues.consumers.list(queueId, {
-        account_id: this.#accountId,
-      })) {
+      for await (const consumer of this.#collectBounded(
+        this.#client.queues.consumers.list(queueId, {
+          account_id: this.#accountId,
+        }),
+        'queue consumer inventory',
+      )) {
         consumers.push(consumer);
       }
       if (consumers.length > 1) {
@@ -2711,9 +3430,12 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
         );
       }
       const finalConsumers = [];
-      for await (const consumer of this.#client.queues.consumers.list(queueId, {
-        account_id: this.#accountId,
-      })) {
+      for await (const consumer of this.#collectBounded(
+        this.#client.queues.consumers.list(queueId, {
+          account_id: this.#accountId,
+        }),
+        'queue consumer inventory',
+      )) {
         finalConsumers.push(consumer);
       }
       if (
@@ -2730,10 +3452,13 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
 
   async createDatabase(name: string): Promise<DatabaseReference> {
     return this.#schedule(async () => {
-      const database = await this.#client.d1.database.create({
-        account_id: this.#accountId,
-        name,
-      });
+      const database = await this.#client.d1.database.create(
+        {
+          account_id: this.#accountId,
+          name,
+        },
+        { maxRetries: 0 },
+      );
       if (!database.uuid || database.name !== name) {
         throw new Error(
           `Cloudflare returned an invalid D1 create result for '${name}'`,
@@ -2751,11 +3476,18 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     const params = d1RestParameters(bindings, 'D1 query');
     return this.#schedule(async () => {
       const rows: Readonly<Record<string, unknown>>[] = [];
-      for await (const result of this.#client.d1.database.query(databaseId, {
-        account_id: this.#accountId,
-        sql,
-        params,
-      })) {
+      for await (const result of this.#collectBounded(
+        this.#client.d1.database.query(
+          databaseId,
+          {
+            account_id: this.#accountId,
+            sql,
+            params,
+          },
+          { maxRetries: 0 },
+        ),
+        'D1 query result inventory',
+      )) {
         if (result.success === false) {
           throw new Error(`D1 query failed for database '${databaseId}'`);
         }
@@ -2781,10 +3513,17 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       params: d1RestParameters(statement.bindings ?? [], 'D1 batch'),
     }));
     await this.#schedule(async () => {
-      for await (const result of this.#client.d1.database.query(databaseId, {
-        account_id: this.#accountId,
-        batch,
-      })) {
+      for await (const result of this.#collectBounded(
+        this.#client.d1.database.query(
+          databaseId,
+          {
+            account_id: this.#accountId,
+            batch,
+          },
+          { maxRetries: 0 },
+        ),
+        'D1 batch result inventory',
+      )) {
         if (result.success === false) {
           throw new Error(`D1 batch failed for database '${databaseId}'`);
         }
@@ -2799,6 +3538,9 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     platformResources?: import('./types.js').ExternalPlatformResources,
     application?: import('./types.js').ApplicationBindingTopology,
   ): Promise<{ artifactVersion: string }> {
+    const dispatchNamespace = this.#requireDispatchNamespace(
+      'uploadDispatchWorker',
+    );
     if (spec.authoredBy === 'external' && !platformResources) {
       throw new Error('external dispatch upload requires platform resources');
     }
@@ -2917,13 +3659,13 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     const migrations = dispatchMigrations(spec);
 
     return this.#schedule(async () => {
-      await this.#assertUntrustedDispatchNamespace();
+      await this.#assertUntrustedDispatchNamespace(dispatchNamespace);
       const result =
         await this.#client.workersForPlatforms.dispatch.namespaces.scripts.update(
           physicalScriptName,
           {
             account_id: this.#accountId,
-            dispatch_namespace: this.#dispatchNamespace,
+            dispatch_namespace: dispatchNamespace,
             bindings_inherit: 'strict',
             files,
             metadata: {
@@ -2971,6 +3713,9 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     readonly sharedOutboundWorkerName: string;
     readonly stateEgressCredentialDigest: string;
   }): Promise<{ artifactVersion: string }> {
+    const dispatchNamespace = this.#requireDispatchNamespace(
+      'uploadNamespacedStateWorker',
+    );
     const { spec } = options;
     const scriptName = externalStateScriptName(spec);
     const resourceGroupId = externalPlatformResourceGroupId(spec);
@@ -3104,13 +3849,13 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       compatibilityFlags: options.artifact.compatibilityFlags,
     };
     return this.#schedule(async () => {
-      await this.#assertUntrustedDispatchNamespace();
+      await this.#assertUntrustedDispatchNamespace(dispatchNamespace);
       const result =
         await this.#client.workersForPlatforms.dispatch.namespaces.scripts.update(
           scriptName,
           {
             account_id: this.#accountId,
-            dispatch_namespace: this.#dispatchNamespace,
+            dispatch_namespace: dispatchNamespace,
             bindings_inherit: 'strict',
             files,
             metadata: {
@@ -3156,15 +3901,20 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       additionalSecrets?: Readonly<Record<string, string>>;
     }> = {},
   ): Promise<void> {
+    const dispatchNamespace =
+      this.#requireDispatchNamespace('putDispatchSecrets');
     await this.#schedule(async () => {
       const scripts =
         this.#client.workersForPlatforms.dispatch.namespaces.scripts;
       const listSecretNames = async (): Promise<string[]> => {
         const names: string[] = [];
-        for await (const secret of scripts.secrets.list(scriptName, {
-          account_id: this.#accountId,
-          dispatch_namespace: this.#dispatchNamespace,
-        })) {
+        for await (const secret of this.#collectBounded(
+          scripts.secrets.list(scriptName, {
+            account_id: this.#accountId,
+            dispatch_namespace: dispatchNamespace,
+          }),
+          'dispatch Worker secret inventory',
+        )) {
           if (!secret.name) {
             throw new Error(
               `dispatch Worker '${scriptName}' returned a secret without a name`,
@@ -3187,7 +3937,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
         scriptName,
         {
           account_id: this.#accountId,
-          dispatch_namespace: this.#dispatchNamespace,
+          dispatch_namespace: dispatchNamespace,
           secrets: Object.fromEntries([
             ...Object.entries(desiredSecrets).map(
               ([name, text]) =>
@@ -3234,6 +3984,9 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       }
     | undefined
   > {
+    const dispatchNamespace = this.#requireDispatchNamespace(
+      'inspectDispatchWorker',
+    );
     return this.#schedule(async () => {
       try {
         const scripts =
@@ -3241,11 +3994,11 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
         const [script, settings] = await Promise.all([
           scripts.get(scriptName, {
             account_id: this.#accountId,
-            dispatch_namespace: this.#dispatchNamespace,
+            dispatch_namespace: dispatchNamespace,
           }),
           scripts.settings.get(scriptName, {
             account_id: this.#accountId,
-            dispatch_namespace: this.#dispatchNamespace,
+            dispatch_namespace: dispatchNamespace,
           }),
         ]);
         const bindings = settings.bindings ?? [];
@@ -3399,16 +4152,22 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   }
 
   async revokeDispatchSecrets(scriptName: string): Promise<void> {
+    const dispatchNamespace = this.#requireDispatchNamespace(
+      'revokeDispatchSecrets',
+    );
     await this.#schedule(async () => {
       const scripts =
         this.#client.workersForPlatforms.dispatch.namespaces.scripts;
       const listNames = async (): Promise<string[]> => {
         try {
           const names: string[] = [];
-          for await (const secret of scripts.secrets.list(scriptName, {
-            account_id: this.#accountId,
-            dispatch_namespace: this.#dispatchNamespace,
-          })) {
+          for await (const secret of this.#collectBounded(
+            scripts.secrets.list(scriptName, {
+              account_id: this.#accountId,
+              dispatch_namespace: dispatchNamespace,
+            }),
+            'dispatch Worker secret inventory',
+          )) {
             if (!secret.name) {
               throw new Error(
                 `dispatch Worker '${scriptName}' returned a secret without a name`,
@@ -3427,7 +4186,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
         try {
           await scripts.secrets.bulkUpdate(scriptName, {
             account_id: this.#accountId,
-            dispatch_namespace: this.#dispatchNamespace,
+            dispatch_namespace: dispatchNamespace,
             secrets: Object.fromEntries(
               current.map((name) => [name, null] as const),
             ),
@@ -3445,13 +4204,16 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   }
 
   async deleteDispatchWorker(scriptName: string): Promise<void> {
+    const dispatchNamespace = this.#requireDispatchNamespace(
+      'deleteDispatchWorker',
+    );
     await this.#schedule(async () => {
       try {
         await this.#client.workersForPlatforms.dispatch.namespaces.scripts.delete(
           scriptName,
           {
             account_id: this.#accountId,
-            dispatch_namespace: this.#dispatchNamespace,
+            dispatch_namespace: dispatchNamespace,
           },
         );
       } catch (error) {
@@ -3467,77 +4229,96 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       );
     }
     let bookmark: string | undefined;
-    for (let attempt = 0; attempt < 120; attempt += 1) {
-      const response = await this.#schedule(() =>
-        this.#client.d1.database.export(databaseId, {
-          account_id: this.#accountId,
-          output_format: 'polling',
-          current_bookmark: bookmark,
-        }),
-      );
-      if (response.status === 'error') {
-        throw new Error(
-          response.error ?? `D1 export failed for '${databaseId}'`,
-        );
-      }
-      if (response.status === 'complete' && response.result?.signed_url) {
-        const signedUrl = new URL(response.result.signed_url);
-        if (signedUrl.protocol !== 'https:') {
-          throw new Error('D1 export returned a non-HTTPS download URL');
-        }
-        const download = await this.#request(signedUrl, {
-          redirect: 'error',
-        });
-        if (!download.ok || !download.body) {
-          throw new Error(
-            `D1 export download failed with HTTP ${download.status}`,
-          );
-        }
-        const [storeBody, hashBody] = download.body.tee();
-        const contentLengthValue = download.headers.get('content-length');
-        const contentLength = contentLengthValue
-          ? Number(contentLengthValue)
-          : undefined;
-        const hasContentLength =
-          contentLength !== undefined &&
-          Number.isSafeInteger(contentLength) &&
-          contentLength >= 0;
-        const [stored, integrity] = await Promise.all([
-          this.#exportStore.write({
+    let pollCount = 0;
+    let providerStatusError = false;
+    let httpStatus: number | undefined;
+    let safeDetail: string | undefined;
+    const fail: (detail?: string) => never = (detail) => {
+      if (detail !== undefined) safeDetail = detail;
+      throw new Error('D1 export failed');
+    };
+    try {
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        pollCount += 1;
+        const response = await this.#schedule(() =>
+          this.#client.d1.database.export(
             databaseId,
-            fileName: `${databaseId}-${Date.now()}.sql`,
-            body: storeBody,
-            ...(hasContentLength ? { contentLength } : {}),
-          }),
-          hashExport(hashBody),
-        ]);
-        if (!stored.location || integrity.size === 0) {
-          throw new Error('durable D1 export is empty or has no location');
-        }
-        if (hasContentLength && integrity.size !== contentLength) {
-          throw new Error('durable D1 export size differs from the download');
-        }
-        if (
-          stored.size !== integrity.size ||
-          stored.sha256 !== integrity.sha256
-        ) {
-          throw new Error(
-            'committed durable D1 export integrity differs from the download',
-          );
-        }
-        return { databaseId, location: stored.location, ...integrity };
-      }
-      if (!response.at_bookmark) {
-        throw new Error(
-          `D1 export for '${databaseId}' returned no polling bookmark`,
+            {
+              account_id: this.#accountId,
+              output_format: 'polling',
+              current_bookmark: bookmark,
+            },
+            { maxRetries: 0 },
+          ),
         );
+        if (response.status === 'error') {
+          providerStatusError = true;
+          fail();
+        }
+        if (response.status === 'complete' && response.result?.signed_url) {
+          const signedUrl = new URL(response.result.signed_url);
+          if (signedUrl.protocol !== 'https:') {
+            fail('export returned a non-HTTPS download URL');
+          }
+          const download = await this.#request(signedUrl, {
+            redirect: 'error',
+          });
+          httpStatus = download.status;
+          if (!download.ok) fail();
+          const downloadBody = download.body;
+          if (!downloadBody) fail();
+          const [storeBody, hashBody] = downloadBody.tee();
+          const contentLengthValue = download.headers.get('content-length');
+          const contentLength = contentLengthValue
+            ? Number(contentLengthValue)
+            : undefined;
+          const hasContentLength =
+            contentLength !== undefined &&
+            Number.isSafeInteger(contentLength) &&
+            contentLength >= 0;
+          const [stored, integrity] = await Promise.all([
+            this.#exportStore.write({
+              databaseId,
+              fileName: `${databaseId}-${Date.now()}.sql`,
+              body: storeBody,
+              ...(hasContentLength ? { contentLength } : {}),
+            }),
+            hashExport(hashBody),
+          ]);
+          if (!stored.location || integrity.size === 0) {
+            fail('durable D1 export is empty or has no location');
+          }
+          if (hasContentLength && integrity.size !== contentLength) {
+            fail('durable D1 export size differs from the download');
+          }
+          if (
+            stored.size !== integrity.size ||
+            stored.sha256 !== integrity.sha256
+          ) {
+            fail(
+              'committed durable D1 export integrity differs from the download',
+            );
+          }
+          return { databaseId, location: stored.location, ...integrity };
+        }
+        if (!response.at_bookmark) {
+          fail('export returned no polling bookmark');
+        }
+        bookmark = response.at_bookmark;
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
       }
-      bookmark = response.at_bookmark;
-      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      fail('export did not complete within the poll budget');
+    } catch (error) {
+      const errorStatus = readErrorFieldSafely(error, 'status');
+      if (typeof errorStatus === 'number') httpStatus = errorStatus;
+      const name = sanitizedErrorName(error);
+      throw new Error(
+        `${safeDetail ? `${safeDetail}: ` : ''}D1 export for '${databaseId}' failed after ${pollCount} poll(s)${
+          providerStatusError ? " with provider status 'error'" : ''
+        }${httpStatus === undefined ? '' : ` with HTTP ${httpStatus}`}`,
+        { cause: { name } },
+      );
     }
-    throw new Error(
-      `D1 export for '${databaseId}' did not complete within two minutes`,
-    );
   }
 
   async deleteDatabase(databaseId: string): Promise<void> {

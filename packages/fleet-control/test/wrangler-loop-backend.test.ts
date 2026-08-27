@@ -1741,9 +1741,11 @@ export default {
       }
       return { stdout: '', stderr: '' };
     });
+    const reconciledRouteApi = new FakeRouteApi();
+    reconciledRouteApi.workersDevEnabled = true;
 
     await expect(
-      backend(runner).deployWorker(
+      backend(runner, { routeApi: reconciledRouteApi }).deployWorker(
         deployment,
         database,
         secrets,
@@ -1754,7 +1756,7 @@ export default {
 
     const callsBeforeRetry = runner.calls.length;
     await expect(
-      backend(runner).deployWorker(
+      backend(runner, { routeApi: reconciledRouteApi }).deployWorker(
         deployment,
         database,
         secrets,

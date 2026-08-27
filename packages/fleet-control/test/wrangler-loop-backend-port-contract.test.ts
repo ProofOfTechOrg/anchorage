@@ -230,8 +230,19 @@ describe('WranglerLoopBackend provisioning port contract', () => {
   it('reconciles a failed upload by tag rediscovery', async () => {
     const dispatchFailure = new Error('dispatch result unknown');
     const runner = uploadRunner({ dispatchFails: true, dispatchFailure });
+    const reconciledRouteApi = routeApi({
+      async inspectOrdinaryWorkerFootprint() {
+        return {
+          scriptPresent: true,
+          workersDevEnabled: true,
+          previewUrlsEnabled: false,
+          customDomains: [],
+          zoneRoutes: [],
+        };
+      },
+    });
     await expect(
-      (await backend(runner)).deployWorker(
+      (await backend(runner, { routeApi: reconciledRouteApi })).deployWorker(
         spec,
         database,
         secrets,

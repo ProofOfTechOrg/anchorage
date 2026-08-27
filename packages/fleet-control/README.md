@@ -2,7 +2,7 @@
 
 # Operate the isolated deployment fleet
 
-`@proofoftech/fleet-control` is the trusted control-plane package for physically isolated deployments. It contains staged Wrangler Versions and Workers for Platforms backends, fenced durable fleet state, resumable provisioning and decommissioning, content-addressed external release promotion and schema-compatible rollback, authoritative bidirectional inventory, durable export sinks, and the shared platform Workers.
+`@proofoftech/fleet-control` is the trusted control-plane package for physically isolated deployments. It contains direct Cloudflare API and staged Wrangler ordinary-Worker backends, a Workers for Platforms backend, fenced durable fleet state, resumable provisioning and decommissioning, content-addressed external release promotion and schema-compatible rollback, authoritative bidirectional inventory, durable export sinks, and the shared platform Workers.
 
 Read [Provision physically isolated deployments](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/fleet-control.md) for the supported lifecycle, security boundary, and credentialed conformance gate.
 
@@ -43,9 +43,19 @@ Fleet Control does not install a runtime Wrangler dependency. Keep the selected 
 
 The three Worker exports are deployment artifacts for the platform's own Workers, not helpers to import into an application Worker.
 
+Choose a backend from the artifact trust boundary and the provider integration available to your control plane:
+
+| Backend | Use it when |
+| --- | --- |
+| `CloudflareApiPlainWorkerBackend` | Platform-authored ordinary Workers should use Cloudflare APIs without a Wrangler process |
+| `WranglerLoopBackend` | Platform-authored ordinary Workers can use a host-provided Wrangler `>=4.118 <5` command |
+| `WorkersForPlatformsBackend` | External project releases require an untrusted dispatch namespace and isolated trusted state |
+
+Construct `CloudflareApiPlainWorkerBackend` with a `CloudflareProvisioningClient` whose options include `plane: 'plain-worker'`, a shared rate coordinator, and a durable `exportStore`. Plain-only clients reject any `dispatchNamespace` key.
+
 Construct `WorkersForPlatformsBackend` with a dispatch namespace, one named shared outbound Worker, and a state-egress root secret. All three values are mandatory. The constructor rejects an incomplete dispatch-native configuration before it can call a provider.
 
-`PlainWorkerBackend` is the shared ordinary-Worker core that `WranglerLoopBackend` wraps. It is not intended for subclassing outside Fleet Control.
+`PlainWorkerBackend` is the shared ordinary-Worker core that both built-in ordinary-Worker backends wrap. It is not intended for subclassing outside Fleet Control.
 
 An ordinary state Worker can exist only as the finalized result of the dedicated plain-to-Workers-for-Platforms switch. Pass its narrow finalized-state provider back to provision, migration, and rollback operations. That provider exact-inspects and advances the retained bridge without allowing the normal backend to originate ordinary state resources.
 

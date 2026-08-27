@@ -116,6 +116,28 @@ Audit events can contain actor, workflow, run, deployment, connector, and denial
 
 Physical isolation replaces request-level tenant predicates. The following invariants define the boundary.
 
+### Direct Cloudflare API backend
+
+`CloudflareApiPlainWorkerBackend` runs only in the trusted control plane. Give its `CloudflareProvisioningClient` an account-scoped token limited to the account it provisions. The direct backend needs `Workers Scripts Write`, `D1 Edit`, `Zone Read`, `Workers Routes Read`, `Workers Routes Write`, and `API Tokens Read`. Add [`Workers R2 Storage Write`](https://developers.cloudflare.com/r2/api/tokens/#permission-groups) only when the fleet provisions application R2 buckets. Cloudflare requires `D1 Edit` for HTTP API writes, including identity seeding and ledgered migrations.
+
+The direct backend's client paths call these Cloudflare API route families:
+
+- `/accounts/{account_id}/workers/scripts` and nested deployments, versions, secrets, and subdomain routes
+- `/accounts/{account_id}/workers/domains` and `/accounts/{account_id}/workers/durable_objects/namespaces`
+- `/accounts/{account_id}/workers/dispatch/namespaces` for destructive attachment scans, even for a plain-only client
+- `/accounts/{account_id}/d1/database` and nested query and export routes
+- `/accounts/{account_id}/r2/buckets` and nested object-list routes when application R2 is enabled
+- `/user/tokens/verify`, account or user token-policy reads, account-filtered `/zones`, and `/zones/{zone_id}/workers/routes`
+- the provider-issued HTTPS export URL, without the Cloudflare authorization header
+
+Every provider page and request reserves shared quota, and every inventory has a hard item bound. An over-bound inventory fails instead of truncating. Under Workers for Platforms, namespace-list failures, including `404`, propagate and block destructive teardown. Under a plain-only client, only a first-page `404` or an exhaustive empty result proves that no dispatch namespace exists; a later `404` and every other failure block destructive D1 or R2 teardown.
+
+The SDK runs with logging disabled even when `CLOUDFLARE_LOG` requests debug output. Upload errors replace intent secret values before the error enters a mutation outcome. Database export failures discard provider messages, response bodies, headers, signed URLs, and original causes. The signed URL is parsed, downloaded with redirects disabled and no authorization header, hashed, and compared with the durable store's committed size and digest inside one redaction boundary.
+
+Unset `CLOUDFLARE_CUSTOM_HEADERS` in the provisioning host unless every configured header is intended for all SDK requests. Cloudflare SDK 7 reads that process variable as ambient default headers, outside the backend's explicit options.
+
+Hardening of the provisioning host itself does not weaken the token, log, pagination, or destructive-scan requirements above.
+
 ### One organization per resource set
 
 A data-plane Worker serves one organization. Its D1 database, Durable Object namespaces, fleet-owned application R2 buckets, and secrets must not be shared with another organization. A shared audit queue is allowed only behind trusted infrastructure that derives attribution from static deployment bindings; externally authored code receives neither its producer binding nor reusable control-plane credentials.

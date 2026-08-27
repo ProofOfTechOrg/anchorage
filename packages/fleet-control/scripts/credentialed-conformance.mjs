@@ -288,7 +288,11 @@ const client = new CloudflareProvisioningClient({
 });
 // This narrow read client sits outside the client's coordinated fetch path.
 // One explicit acquire therefore covers exactly one SDK request, with no retry.
-const cloudflare = new Cloudflare({ apiToken, maxRetries: 0 });
+const cloudflare = new Cloudflare({
+  apiToken,
+  logLevel: 'off',
+  maxRetries: 0,
+});
 const backend = new WorkersForPlatformsBackend({
   client,
   hostRoutingKvId: config.hostRoutingKvId,

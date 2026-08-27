@@ -14,6 +14,12 @@ export type { InitialExecutionFenceState };
 
 export type ProvisioningBackendKind = 'plain-worker' | 'workers-for-platforms';
 
+/** One immutable Worker version and its intended deployment percentage. */
+export type OrdinaryWorkerDeploymentVersion = Readonly<{
+  versionId: string;
+  percentage: number;
+}>;
+
 export interface WorkerModule {
   readonly name: string;
   readonly content: string | Uint8Array;
@@ -823,27 +829,27 @@ export interface PlainWorkerRouteApi {
  * `deleteDatabaseFenced`, asserts it immediately before every provider request
  * it issues through the command runner or route API. `deleteDatabaseFenced`
  * runs inside `withMutationFence` and relies on the route API's per-request
- * assertion (parity with the pre-port Wrangler CLI loop); whether the
- * direct-API adapter additionally pre-asserts remains an open question.
+ * assertion. The direct-API adapter does not pre-assert either, so both
+ * adapters have identical assertion counts.
  *
  * A method that resolves a `PlainWorkerMutationOutcome` over a transport that
  * asserts per request must ALSO assert explicitly before dispatch, so a lost
  * lease rejects instead of resolving `failed` and triggering readback.
  *
- * `withMutationFence` is re-entrant with the same fence; a
- * `PlainWorkerRouteApi.withMutationFence` implementation is not required to
- * treat entry as an ownership assertion (assertion belongs to each mutating
- * request). An implementation that also asserts on entry is tolerated — the
- * adapter's re-entrancy short-circuit keeps the assertion count stable. Inherited
- * `PlainWorkerRouteApi` members retain their own contract.
+ * `PlainWorkerRouteApi.withMutationFence` entry is not itself an ownership
+ * assertion; assertion belongs to each mutating request. Nested scopes retain
+ * that request-level contract. Inherited `PlainWorkerRouteApi` members retain
+ * their own contract.
  *
- * `undefined` and `'absent'` mean provider absence only. Other failures reject
- * with the provider error unmodified, and fence failures are never classified
- * as absence. Methods without an absence-typed result do not classify absence.
+ * `undefined` and `'absent'` mean provider absence only. Adapters propagate
+ * provider status and classification, may strip transport bodies and redact
+ * secret material from messages, and never classify a fence failure as
+ * absence. Methods without an absence-typed result do not classify absence.
  *
  * `createDatabase`, `uploadCandidate`, and `createDeployment` resolve a failed
- * outcome only after a provider request was dispatched and failed or its result
- * became unknown. They reject failures that provably predate dispatch, including
+ * outcome only after a provider mutation request was dispatched and failed or
+ * its result became unknown; a preceding provider read does not count as
+ * dispatch. They reject failures that provably predate that dispatch, including
  * fence assertion and local preparation failures. Other mutations reject on
  * failure except for their documented absence result.
  */
@@ -874,8 +880,8 @@ export interface PlainWorkerProvisioningApi extends PlainWorkerRouteApi {
   ): Promise<PlainWorkerDeploymentStatus | undefined>;
   /**
    * Lists the provider's Worker version inventory, or `undefined` for provider
-   * absence. Bounded pagination is an open contract question for the direct-API
-   * adapter.
+   * absence. The listing is bounded by item count and rejects rather than
+   * truncating.
    */
   listVersions(
     scriptName: string,
@@ -905,7 +911,7 @@ export interface PlainWorkerProvisioningApi extends PlainWorkerRouteApi {
   /** Creates a deployment and reports a dispatched mutation outcome. */
   createDeployment(
     scriptName: string,
-    versions: readonly { versionId: string; percentage: number }[],
+    versions: readonly OrdinaryWorkerDeploymentVersion[],
     fence: ExternalMutationFence,
   ): Promise<PlainWorkerMutationOutcome>;
   /** Deletes a Worker script, returning absent only for provider absence. */

@@ -182,6 +182,7 @@ try {
     join(consumerDirectory, 'consumer.ts'),
     `import {
   ActiveRouteAttestationError,
+  CloudflareApiPlainWorkerBackend,
   CloudflareProvisioningClient,
   D1CloudflareApiRateCoordinator,
   PlainWorkerBackend,
@@ -203,6 +204,7 @@ try {
   type ActiveRouteAttestation,
   type ActiveRouteExpectation,
   type AttestConvergedActiveRouteOptions,
+  type CloudflareApiPlainWorkerBackendOptions,
   type CloudflareApiRateCoordinator,
   type DeploymentEgressPolicy,
   type DeploymentSpec,
@@ -259,6 +261,17 @@ const plainWorkerBackendOptions: PlainWorkerBackendOptions = {
 const plainWorkerBackend: ProvisioningBackend = new PlainWorkerBackend(
   plainWorkerBackendOptions,
 );
+const directClient = new CloudflareProvisioningClient({
+  accountId: 'account',
+  apiToken: 'token',
+  plane: 'plain-worker',
+  rateCoordinator: new ProcessLocalCloudflareApiRateCoordinator(),
+});
+const directBackendOptions: CloudflareApiPlainWorkerBackendOptions = {
+  client: directClient,
+};
+const directBackend: ProvisioningBackend =
+  new CloudflareApiPlainWorkerBackend(directBackendOptions);
 type PlainWorkerPortRecords = readonly [
   PlainWorkerCleanupOutcome,
   PlainWorkerDatabaseExportResult,
@@ -332,6 +345,7 @@ const settlementHost: FleetSettlementHost = {
 };
 
 void ActiveRouteAttestationError;
+void CloudflareApiPlainWorkerBackend;
 void CloudflareProvisioningClient;
 void D1CloudflareApiRateCoordinator;
 void PlainWorkerBackend;
@@ -366,6 +380,9 @@ void plainWorkerRouteApi;
 void plainWorkerProvisioningApiShape;
 void plainWorkerBackendOptions;
 void plainWorkerBackend;
+void directClient;
+void directBackendOptions;
+void directBackend;
 void plainWorkerPortRecords;
 void initialExecutionFenceState;
 void lockedAtBirth;
@@ -387,6 +404,7 @@ void settlementHost;
     `import assert from 'node:assert/strict';
 import {
   ActiveRouteAttestationError,
+  CloudflareProvisioningClient,
   ProcessLocalCloudflareApiRateCoordinator,
   ProvisioningError,
   WorkersForPlatformsBackend,
@@ -418,6 +436,34 @@ assert.ok(new ActiveRouteAttestationError('probe', {}) instanceof Error);
 assert.equal(typeof attestConvergedActiveRoute, 'function');
 assert.equal(typeof attestFleetRecordActiveRoute, 'function');
 assert.equal(typeof fleetSettlementKey, 'function');
+assert.throws(
+  () =>
+    new CloudflareProvisioningClient({
+      accountId: 'a',
+      apiToken: 't',
+      plane: 'plain-worker',
+      dispatchNamespace: 'x',
+      rateCoordinator: new ProcessLocalCloudflareApiRateCoordinator(),
+    }),
+  /plain-worker plane cannot name a dispatch namespace/,
+);
+assert.throws(
+  () =>
+    new CloudflareProvisioningClient({
+      accountId: 'a',
+      apiToken: 't',
+      rateCoordinator: new ProcessLocalCloudflareApiRateCoordinator(),
+    }),
+  /dispatchNamespace/,
+);
+assert.ok(
+  new CloudflareProvisioningClient({
+    accountId: 'a',
+    apiToken: 't',
+    plane: 'plain-worker',
+    rateCoordinator: new ProcessLocalCloudflareApiRateCoordinator(),
+  }),
+);
 
 // The trusted-configuration constructor must fail closed. This is the barrier
 // that makes a published fleet-control inert without control-plane inputs, so

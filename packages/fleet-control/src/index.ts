@@ -38,12 +38,18 @@ export {
   switchPlainDeploymentToWorkersForPlatforms,
 } from './backend-switch.js';
 export {
+  CloudflareApiPlainWorkerBackend,
+  type CloudflareApiPlainWorkerBackendOptions,
+} from './cloudflare-api-plain-worker-backend.js';
+export {
   type CloudflareClientOptions,
+  CloudflarePlaneCapabilityError,
   CloudflareProvisioningClient,
   type ControlWorkerInspection,
   type ControlWorkerSpec,
   type DurableDatabaseExportStore,
   type OrdinaryWorkerFootprint,
+  type PlainWorkerCloudflareClientOptions,
 } from './cloudflare-client.js';
 export {
   type CloudflareApiRateCoordinator,

@@ -23,6 +23,7 @@ export class WranglerLoopBackend extends PlainWorkerBackend {
     readonly exportStore: DurableDatabaseExportStore;
     readonly fetch?: typeof fetch;
     readonly maintenanceRequestTimeoutMs?: number;
+    /** Stamps `observedAt` on an attestation. Injected so it can be pinned. */
     readonly clock?: () => number;
   }) {
     const {

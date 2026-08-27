@@ -72,7 +72,7 @@ The migration and idempotency surfaces are grouped by subpath:
 | Fleet lifecycle | `migrateFleet`, `rollbackExternalRelease`, `auditFleetDrift`, `fleetVersionReport`, `FleetRecord`, and `D1FleetStateStore` |
 | Active-route attestation | `attestFleetRecordActiveRoute`, `attestConvergedActiveRoute`, `ActiveRouteAttestation`, `ActiveRouteAttestationError`, `ActiveRouteExpectation`, `AttestConvergedActiveRouteOptions`, and `ObservedActiveRoute` |
 | Settlement | `fleetSettlementKey`, `FleetSettlementContext`, `FleetSettlementEntry`, and `FleetSettlementHost` |
-| Backends and provider client | `PlainWorkerBackend`, `PlainWorkerBackendOptions`, `WranglerLoopBackend`, `WorkersForPlatformsBackend`, `CloudflareProvisioningClient`, `D1CloudflareApiRateCoordinator`, and `ProcessLocalCloudflareApiRateCoordinator` |
+| Backends and provider client | `PlainWorkerBackend`, `PlainWorkerBackendOptions`, `CloudflareApiPlainWorkerBackend`, `CloudflareApiPlainWorkerBackendOptions`, `WranglerLoopBackend`, `WorkersForPlatformsBackend`, `CloudflareProvisioningClient`, `CloudflareClientOptions`, `PlainWorkerCloudflareClientOptions`, `CloudflarePlaneCapabilityError`, `D1CloudflareApiRateCoordinator`, and `ProcessLocalCloudflareApiRateCoordinator` |
 
 ## Browser and server boundaries
 

@@ -32,6 +32,7 @@ import type {
   MaintenanceHealth,
   PlainWorkerCustomDomain,
   PlainWorkerProvisioningApi,
+  PlainWorkerUploadIntent,
   PlainWorkerUploadOutcome,
   PlainWorkerVersionDetail,
   PlainWorkerVersionSummary,
@@ -182,8 +183,9 @@ export interface PlainWorkerBackendOptions {
   /** Provider operations used by the shared ordinary-Worker policy. */
   readonly api: PlainWorkerProvisioningApi;
   /**
-   * Prefix for deployment-identity protocol refusal messages. This value is
-   * diagnostic only and is never persisted.
+   * Log-hygiene token prefixed to deployment-identity protocol refusals. The
+   * protocol uses `caller` as its diagnostic prefix and defaults to its own
+   * implementation token when omitted. This value is never persisted.
    */
   readonly identityCaller: string;
   readonly fetch?: typeof fetch;
@@ -195,7 +197,8 @@ export interface PlainWorkerBackendOptions {
 /**
  * Validate the maintenance request timeout before the wrapper constructs its
  * adapter, preserving the historic constructor guard order. This helper is
- * exported for the wrapper but intentionally omitted from the package barrel.
+ * exported for both built-in ordinary-Worker backends but intentionally
+ * omitted from the package barrel.
  */
 export function resolveMaintenanceRequestTimeoutMs(
   value: number | undefined,
@@ -214,11 +217,11 @@ export function resolveMaintenanceRequestTimeoutMs(
  * Shared provider-neutral ordinary-Worker implementation over
  * `PlainWorkerProvisioningApi`.
  *
- * Its constructor options are unstable until the direct-API backend lands. Its
- * public members are invoked by the class itself — database and R2
- * reconciliation, failed-deployment rollback, and teardown — so overriding any
- * of them changes behavior the class depends on internally; do not subclass it
- * outside this package.
+ * Its constructor options are the stable integration surface for built-in
+ * ordinary-Worker backends. Its public members are invoked by the class
+ * itself — database and R2 reconciliation, failed-deployment rollback, and
+ * teardown — so overriding any of them changes behavior the class depends on
+ * internally; do not subclass it outside this package.
  *
  * Mutation duration has two independent bounds. Port-level operations use
  * `maxMutationDurationMs`, while maintenance requests use the injected request
@@ -229,6 +232,11 @@ export function resolveMaintenanceRequestTimeoutMs(
  * custom-domain attach, normal traffic removal's detach, and the maintenance
  * request before dispatch. Force detach, public-access disable, and secret
  * deletion rely on the route contract.
+ *
+ * The port's explicit pre-dispatch assertions are also load-bearing for
+ * outcome-valued database creation, candidate upload, and deployment creation.
+ * Without them, a lost lease represented as `{ status: 'failed' }` could be
+ * masked by the core's provider readback and reconciliation.
  */
 export class PlainWorkerBackend implements ProvisioningBackend {
   readonly kind = 'plain-worker' as const;
@@ -242,6 +250,14 @@ export class PlainWorkerBackend implements ProvisioningBackend {
     const maintenanceRequestTimeoutMs = resolveMaintenanceRequestTimeoutMs(
       options.maintenanceRequestTimeoutMs,
     );
+    if (
+      typeof options.identityCaller !== 'string' ||
+      !/^[\x21-\x7e]{1,128}$/u.test(options.identityCaller)
+    ) {
+      throw new Error(
+        'plain Worker backend identityCaller must be a 1-128 character single-line token',
+      );
+    }
     this.#api = options.api;
     this.#identityCaller = options.identityCaller;
     this.#fetch = options.fetch ?? fetch;
@@ -416,9 +432,11 @@ export class PlainWorkerBackend implements ProvisioningBackend {
     if (!this.#api.createR2Bucket) {
       throw new Error('plain Worker route API does not support application R2');
     }
+    await fence.assertOwned();
     try {
       await this.#api.createR2Bucket(resource, fence);
     } catch (error) {
+      await fence.assertOwned();
       const reconciled = await this.findApplicationR2Bucket(resource);
       if (reconciled) return reconciled;
       if (
@@ -1153,6 +1171,10 @@ export class PlainWorkerBackend implements ProvisioningBackend {
     const ingressModule = plainWorkerIngressModule(spec);
     const digest = deploymentSpecDigest(spec);
     const mode = deployment === undefined ? 'initial' : 'staged';
+    const publicAccess: PlainWorkerUploadIntent['publicAccess'] = {
+      workersDevEnabled: true,
+      previewUrlsEnabled: false,
+    };
     let uploadOutcome: PlainWorkerUploadOutcome | undefined;
     if (!candidateId) {
       this.#assertMutationDuration(fence);
@@ -1225,10 +1247,7 @@ export class PlainWorkerBackend implements ProvisioningBackend {
             })),
           },
           limits: { cpuMs: spec.cpuLimitMs },
-          publicAccess: {
-            workersDevEnabled: true,
-            previewUrlsEnabled: false,
-          },
+          publicAccess,
           ...(mode === 'initial'
             ? {
                 mode,
@@ -1271,6 +1290,19 @@ export class PlainWorkerBackend implements ProvisioningBackend {
         const operationCandidate = operationCandidates[0];
         if (!operationCandidate) {
           throw new Error('new Worker candidate has no artifact version');
+        }
+        if (uploadOutcome?.status === 'failed') {
+          const footprint = await this.#api.inspectOrdinaryWorkerFootprint(
+            spec.scriptName,
+          );
+          if (
+            footprint.workersDevEnabled !== publicAccess.workersDevEnabled ||
+            footprint.previewUrlsEnabled !== publicAccess.previewUrlsEnabled
+          ) {
+            throw new Error(
+              `reconciled Worker upload for '${spec.scriptName}' did not converge public access`,
+            );
+          }
         }
         candidateId = operationCandidate;
       }

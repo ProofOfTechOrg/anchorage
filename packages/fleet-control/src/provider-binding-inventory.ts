@@ -1,9 +1,168 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import type { VersionCreateParams } from 'cloudflare/resources/workers/scripts/versions';
 import type {
+  OrdinaryWorkerDeploymentVersion,
+  PlainWorkerUploadIntent,
   PlainWorkerVersionBinding,
   ProviderBindingIdentity,
 } from './types.js';
+
+export function readField(value: unknown, name: string): unknown {
+  return value && typeof value === 'object'
+    ? Reflect.get(value, name)
+    : undefined;
+}
+
+export function readStringField(
+  value: unknown,
+  name: string,
+): string | undefined {
+  const candidate = readField(value, name);
+  return typeof candidate === 'string' ? candidate : undefined;
+}
+
+export function readArrayField(
+  value: unknown,
+  name: string,
+): readonly unknown[] {
+  const candidate = readField(value, name);
+  return Array.isArray(candidate) ? candidate : [];
+}
+
+export function providerBindingsToPlainWorkerShape(
+  bindings: readonly unknown[],
+): readonly PlainWorkerVersionBinding[] {
+  return bindings.map((binding) => {
+    if (!binding || typeof binding !== 'object' || Array.isArray(binding)) {
+      return { type: 'unsupported', name: undefined, issue: 'not-object' };
+    }
+    const name = readStringField(binding, 'name');
+    const rawType = readField(binding, 'type');
+    if (
+      typeof rawType !== 'string' ||
+      rawType.length === 0 ||
+      rawType !== rawType.trim()
+    ) {
+      return {
+        type: 'unsupported',
+        name,
+        providerType: typeof rawType === 'string' ? rawType : undefined,
+        issue: 'invalid-type',
+      };
+    }
+    switch (rawType) {
+      case 'd1': {
+        const id =
+          readField(binding, 'id') ?? readField(binding, 'database_id');
+        return {
+          type: 'd1',
+          name,
+          databaseId: typeof id === 'string' ? id : undefined,
+        };
+      }
+      case 'durable_object_namespace':
+        return {
+          type: 'durable-object',
+          name,
+          className: readStringField(binding, 'class_name'),
+          namespaceId: readStringField(binding, 'namespace_id'),
+        };
+      case 'service':
+        return {
+          type: 'service',
+          name,
+          service: readStringField(binding, 'service'),
+        };
+      case 'queue':
+        return {
+          type: 'queue-producer',
+          name,
+          queueName: readStringField(binding, 'queue_name'),
+        };
+      case 'r2_bucket':
+        return {
+          type: 'r2-bucket',
+          name,
+          bucketName: readStringField(binding, 'bucket_name'),
+        };
+      case 'plain_text':
+        return {
+          type: 'plain-text',
+          name,
+          value: readStringField(binding, 'text'),
+        };
+      case 'secret_text':
+        return { type: 'secret-text', name };
+      default:
+        return {
+          type: 'unsupported',
+          name,
+          providerType: rawType,
+          issue: 'unsupported-type',
+        };
+    }
+  });
+}
+
+export function assertOrdinaryWorkerDeploymentVersions(
+  versions: readonly OrdinaryWorkerDeploymentVersion[],
+): void {
+  if (versions.length === 0) {
+    throw new Error('ordinary Worker deployment requires at least one version');
+  }
+  const ids = new Set<string>();
+  for (const version of versions) {
+    if (typeof version.versionId !== 'string') {
+      throw new Error('ordinary Worker deployment version ids must be strings');
+    }
+    if (
+      !Number.isFinite(version.percentage) ||
+      version.percentage < 0 ||
+      version.percentage > 100
+    ) {
+      throw new Error(
+        'ordinary Worker deployment percentages must be finite values from 0 to 100',
+      );
+    }
+    if (ids.has(version.versionId)) {
+      throw new Error('ordinary Worker deployment has duplicate version ids');
+    }
+    ids.add(version.versionId);
+  }
+}
+
+export function uploadIntentToProviderBindings(
+  intent: PlainWorkerUploadIntent,
+): NonNullable<VersionCreateParams.Metadata['bindings']> {
+  const bindings: NonNullable<VersionCreateParams.Metadata['bindings']> = [];
+  for (const { name, value } of intent.bindings.plainText) {
+    bindings.push({ name, type: 'plain_text', text: value });
+  }
+  for (const { name, value } of intent.bindings.secrets) {
+    bindings.push({ name, type: 'secret_text', text: value });
+  }
+  for (const { name, databaseId } of intent.bindings.d1) {
+    bindings.push({ name, type: 'd1', database_id: databaseId });
+  }
+  for (const { name, className } of intent.bindings.durableObjects) {
+    bindings.push({
+      name,
+      type: 'durable_object_namespace',
+      class_name: className,
+    });
+  }
+  for (const { name, service } of intent.bindings.services) {
+    bindings.push({ name, type: 'service', service });
+  }
+  for (const { name, queueName } of intent.bindings.queueProducers) {
+    bindings.push({ name, type: 'queue', queue_name: queueName });
+  }
+  for (const { name, bucketName } of intent.bindings.r2Buckets) {
+    bindings.push({ name, type: 'r2_bucket', bucket_name: bucketName });
+  }
+  return bindings;
+}
 
 function bindingKey(binding: ProviderBindingIdentity): string {
   return `${binding.type}\u0000${binding.name}`;

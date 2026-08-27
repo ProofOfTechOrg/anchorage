@@ -473,9 +473,11 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
     fence: ExternalMutationFence,
   ): Promise<DatabaseReference> {
     return this.#withMutationFence(fence, async () => {
+      await fence.assertOwned();
       try {
         return await this.#client.createDatabase(spec.databaseName);
       } catch (cause) {
+        await fence.assertOwned();
         const recovered = await this.#client.findDatabase(spec.databaseName);
         if (recovered) {
           const owner = await this.readDeploymentIdentity(recovered, fence);
@@ -580,9 +582,11 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
         'Workers for Platforms client does not support application R2',
       );
     }
+    await fence.assertOwned();
     try {
       await this.#client.createR2Bucket(resource, fence);
     } catch (error) {
+      await fence.assertOwned();
       const reconciled = await this.findApplicationR2Bucket(resource);
       if (reconciled) return reconciled;
       if (

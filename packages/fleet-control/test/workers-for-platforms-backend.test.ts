@@ -22,6 +22,8 @@ import {
 import { provisionDeployment } from '../src/provision.js';
 import { deploymentSpecDigest } from '../src/spec-digest.js';
 import type {
+  ApplicationR2Binding,
+  ApplicationR2BucketSnapshot,
   DatabaseExport,
   DatabaseReference,
   DeploymentSecrets,
@@ -83,6 +85,11 @@ const platformResources: ExternalPlatformResources = {
 const secrets: DeploymentSecrets = {
   deploymentIdentity: 'deployment-identity-secret-value-0001',
   maintenanceAdmin: 'maintenance-admin-secret-value-00001',
+};
+const r2Resource: ApplicationR2Binding = {
+  name: 'ARTIFACTS',
+  bucketName: 'acme-production-artifacts',
+  jurisdiction: 'default',
 };
 const MAINTENANCE_CAPABILITY_PRIVATE_KEY = {
   kty: 'OKP',
@@ -274,7 +281,13 @@ class FakeApi implements WorkersForPlatformsApi {
   failDisableScriptName: string | undefined;
   failControlUploadAfterCommitScriptName: string | undefined;
   failDatabaseCreateAfterCommit = false;
+  failR2CreateAfterCommit = false;
   database: DatabaseReference | undefined;
+  r2Bucket: ApplicationR2BucketSnapshot | undefined;
+  databaseFindCalls = 0;
+  databaseCreateCalls = 0;
+  r2ReadCalls = 0;
+  r2CreateCalls = 0;
   databaseOwner: string | undefined;
   deploymentSentinelPresent = false;
   readonly migrationRows: Array<{
@@ -339,6 +352,7 @@ class FakeApi implements WorkersForPlatformsApi {
   }
 
   async findDatabase(): Promise<DatabaseReference | undefined> {
+    this.databaseFindCalls += 1;
     return this.database;
   }
 
@@ -354,6 +368,7 @@ class FakeApi implements WorkersForPlatformsApi {
   }
 
   async createDatabase(): Promise<DatabaseReference> {
+    this.databaseCreateCalls += 1;
     this.database = {
       id: 'db-acme',
       name: 'acme-production',
@@ -364,6 +379,25 @@ class FakeApi implements WorkersForPlatformsApi {
       throw new Error('database create response lost');
     }
     return { ...this.database, created: true };
+  }
+
+  async getR2Bucket(): Promise<ApplicationR2BucketSnapshot | undefined> {
+    this.r2ReadCalls += 1;
+    return this.r2Bucket;
+  }
+
+  async createR2Bucket(resource: ApplicationR2Binding): Promise<void> {
+    this.r2CreateCalls += 1;
+    this.r2Bucket = {
+      ...resource,
+      creationDate: '2026-08-26T00:00:00.000Z',
+    };
+    if (this.failR2CreateAfterCommit) {
+      this.failR2CreateAfterCommit = false;
+      throw Object.assign(new Error('bucket create response lost'), {
+        status: 409,
+      });
+    }
   }
 
   async queryDatabase(
@@ -2361,6 +2395,112 @@ describe('WorkersForPlatformsBackend', () => {
       name: deployment.databaseName,
       created: true,
     });
+  });
+
+  it('refuses a D1 create before dispatch when the lease is already lost', async () => {
+    const client = new FakeApi();
+    const subject = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client,
+      hostRoutingKvId: 'host-routing',
+    });
+    const denied = new Error('lease lost');
+    const lostFence: ExternalMutationFence = {
+      mutationLeaseTtlMs: 60_000,
+      assertOwned: vi.fn(async () => Promise.reject(denied)),
+    };
+
+    await expect(subject.ensureDatabase(deployment, lostFence)).rejects.toBe(
+      denied,
+    );
+    expect(client.databaseCreateCalls).toBe(0);
+    expect(client.databaseFindCalls).toBe(0);
+  });
+
+  it('refuses D1 readback when the lease is lost during creation', async () => {
+    const client = new FakeApi();
+    client.failDatabaseCreateAfterCommit = true;
+    const subject = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client,
+      hostRoutingKvId: 'host-routing',
+    });
+    const denied = new Error('lease lost');
+    const assertOwned = vi
+      .fn<() => Promise<void>>()
+      .mockResolvedValueOnce()
+      .mockRejectedValue(denied);
+
+    await expect(
+      subject.ensureDatabase(deployment, {
+        mutationLeaseTtlMs: 60_000,
+        assertOwned,
+      }),
+    ).rejects.toBe(denied);
+    expect(client.databaseCreateCalls).toBe(1);
+    expect(client.databaseFindCalls).toBe(0);
+  });
+
+  it('refuses an R2 create before dispatch when the lease is already lost', async () => {
+    const client = new FakeApi();
+    const subject = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client,
+      hostRoutingKvId: 'host-routing',
+    });
+    const denied = new Error('lease lost');
+
+    await expect(
+      subject.ensureApplicationR2Bucket(r2Resource, {
+        mutationLeaseTtlMs: 60_000,
+        assertOwned: vi.fn(async () => Promise.reject(denied)),
+      }),
+    ).rejects.toBe(denied);
+    expect(client.r2CreateCalls).toBe(0);
+    expect(client.r2ReadCalls).toBe(0);
+  });
+
+  it('refuses R2 readback when the lease is lost during creation', async () => {
+    const client = new FakeApi();
+    client.failR2CreateAfterCommit = true;
+    const subject = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client,
+      hostRoutingKvId: 'host-routing',
+    });
+    const denied = new Error('lease lost');
+    const assertOwned = vi
+      .fn<() => Promise<void>>()
+      .mockResolvedValueOnce()
+      .mockRejectedValue(denied);
+
+    await expect(
+      subject.ensureApplicationR2Bucket(r2Resource, {
+        mutationLeaseTtlMs: 60_000,
+        assertOwned,
+      }),
+    ).rejects.toBe(denied);
+    expect(client.r2CreateCalls).toBe(1);
+    expect(client.r2ReadCalls).toBe(0);
+  });
+
+  it('reconciles a duplicate R2 create while the lease remains healthy', async () => {
+    const client = new FakeApi();
+    client.failR2CreateAfterCommit = true;
+    const subject = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client,
+      hostRoutingKvId: 'host-routing',
+    });
+
+    await expect(
+      subject.ensureApplicationR2Bucket(r2Resource, fence),
+    ).resolves.toEqual({
+      ...r2Resource,
+      creationDate: '2026-08-26T00:00:00.000Z',
+    });
+    expect(client.r2CreateCalls).toBe(1);
+    expect(client.r2ReadCalls).toBe(1);
   });
 
   it('rejects an authorized D1 create race that resolves to another owner', async () => {

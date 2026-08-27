@@ -6,6 +6,7 @@ import { WorkerDeploymentError } from '../src/deployment-error.js';
 import { PlainWorkerBackend } from '../src/plain-worker-backend.js';
 import { deploymentSpecDigest } from '../src/spec-digest.js';
 import type {
+  ApplicationR2Binding,
   DatabaseReference,
   DeploymentSecrets,
   DeploymentSpec,
@@ -24,9 +25,9 @@ import {
   PlainWorkerProvisioningApiFake,
 } from './fixtures/plain-worker-provisioning-api-fake.js';
 
-// The legacy Wrangler suite remains the compatibility proof. This suite proves
-// that the core runs without a CLI adapter and seeds the direct-API conformance
-// fixture. Cases here cover core-to-port policy, not duplicate adapter behavior.
+// The legacy Wrangler suite remains the compatibility proof. The core-policy
+// cases here prove that the core runs without a CLI adapter and seed the
+// direct-API conformance fixture; they do not duplicate adapter behavior.
 
 const spec: DeploymentSpec = {
   tenantTag: 'acme',
@@ -52,6 +53,12 @@ const database: DatabaseReference = {
   created: true,
 };
 
+const r2Resource: ApplicationR2Binding = {
+  name: 'ARTIFACTS',
+  bucketName: 'acme-production-artifacts',
+  jurisdiction: 'default',
+};
+
 const secrets: DeploymentSecrets = {
   deploymentIdentity: 'deployment-identity-secret-value-0001',
   maintenanceAdmin: 'maintenance-admin-secret-value-00001',
@@ -71,17 +78,13 @@ function backend(
   });
 }
 
-function ownedVersion(
-  id: string,
-  deployment = spec,
-  databaseId = database.id,
-): PlainWorkerVersionDetail {
+function ownedVersion(id: string, deployment = spec): PlainWorkerVersionDetail {
   const digest = deploymentSpecDigest(deployment);
   return {
     versionId: id,
     tag: digest,
     bindings: [
-      { type: 'd1', name: 'DB', databaseId },
+      { type: 'd1', name: 'DB', databaseId: database.id },
       {
         type: 'plain-text',
         name: 'DEPLOYMENT_TENANT',
@@ -199,6 +202,40 @@ describe('WranglerLoopBackend construction', () => {
 });
 
 describe('PlainWorkerBackend core policy', () => {
+  it.each([
+    ['empty', ''],
+    ['space', 'contains space'],
+    ['newline', 'contains\nnewline'],
+    ['non-printable', '\u007f'],
+    ['too long', 'x'.repeat(129)],
+    ['non-string', 42 as unknown as string],
+  ])('rejects a %s identity caller', (_label, identityCaller) => {
+    expect(
+      () =>
+        new PlainWorkerBackend({
+          api: new PlainWorkerProvisioningApiFake(),
+          identityCaller,
+        }),
+    ).toThrow(
+      'plain Worker backend identityCaller must be a 1-128 character single-line token',
+    );
+  });
+
+  it('accepts the identity caller boundary lengths', () => {
+    expect(
+      new PlainWorkerBackend({
+        api: new PlainWorkerProvisioningApiFake(),
+        identityCaller: 'x',
+      }),
+    ).toBeInstanceOf(PlainWorkerBackend);
+    expect(
+      new PlainWorkerBackend({
+        api: new PlainWorkerProvisioningApiFake(),
+        identityCaller: 'x'.repeat(128),
+      }),
+    ).toBeInstanceOf(PlainWorkerBackend);
+  });
+
   it('reconciles a failed database creation by provider name', async () => {
     const api = new PlainWorkerProvisioningApiFake();
     const providerError = new Error('create response lost');
@@ -211,15 +248,33 @@ describe('PlainWorkerBackend core policy', () => {
     expect(api.queries).toHaveLength(1);
   });
 
-  it.each([
-    ['succeeded', { status: 'succeeded' } as const],
-    [
-      'failed after dispatch',
-      { status: 'failed', error: new Error('lost') } as const,
-    ],
-  ])('rediscovers a tagged upload when the outcome %s', async (_label, outcome) => {
+  it('rediscovers a tagged upload after a succeeded outcome without reading its footprint', async () => {
     const api = new PlainWorkerProvisioningApiFake();
-    api.uploadOutcome = outcome;
+    installOnUpload(api);
+    const inspectFootprint = vi.spyOn(api, 'inspectOrdinaryWorkerFootprint');
+
+    await expect(
+      backend(api).deployWorker(
+        spec,
+        database,
+        secrets,
+        undefined,
+        mutationFence(),
+      ),
+    ).resolves.toEqual({ artifactVersion: 'candidate', created: true });
+    expect(inspectFootprint).not.toHaveBeenCalled();
+  });
+
+  it('accepts a failed upload rediscovered by tag when public access matches', async () => {
+    const api = new PlainWorkerProvisioningApiFake();
+    api.uploadOutcome = { status: 'failed', error: new Error('lost') };
+    api.footprints.set(spec.scriptName, {
+      scriptPresent: true,
+      workersDevEnabled: true,
+      previewUrlsEnabled: false,
+      customDomains: [],
+      zoneRoutes: [],
+    });
     installOnUpload(api);
 
     await expect(
@@ -231,6 +286,36 @@ describe('PlainWorkerBackend core policy', () => {
         mutationFence(),
       ),
     ).resolves.toEqual({ artifactVersion: 'candidate', created: true });
+  });
+
+  it('refuses a failed upload rediscovered by tag when public access differs', async () => {
+    const api = new PlainWorkerProvisioningApiFake();
+    api.versions.set(spec.scriptName, [ownedVersion('current')]);
+    api.deployments.set(spec.scriptName, {
+      versions: [{ versionId: 'current', percentage: 100 }],
+    });
+    api.uploadOutcome = { status: 'failed', error: new Error('lost') };
+    api.footprints.set(spec.scriptName, {
+      scriptPresent: true,
+      workersDevEnabled: false,
+      previewUrlsEnabled: false,
+      customDomains: [],
+      zoneRoutes: [],
+    });
+    installOnUpload(api);
+
+    await expect(
+      backend(api).deployWorker(
+        spec,
+        database,
+        secrets,
+        undefined,
+        mutationFence(),
+      ),
+    ).rejects.toThrow(
+      `reconciled Worker upload for '${spec.scriptName}' did not converge public access`,
+    );
+    expect(api.events).not.toContain('mutation:createDeployment');
   });
 
   it('uses rediscovery failure for a falsy dispatched upload rejection', async () => {
@@ -455,6 +540,56 @@ describe('PlainWorkerBackend core policy', () => {
       'provider mutation maximum duration must be below the external mutation fence lease TTL',
     );
   });
+
+  it('refuses an R2 create before provider dispatch when the lease is already lost', async () => {
+    const api = new PlainWorkerProvisioningApiFake();
+    const readback = vi.spyOn(api, 'getR2Bucket');
+    const denied = new Error('lease lost');
+
+    await expect(
+      backend(api).ensureApplicationR2Bucket(
+        r2Resource,
+        mutationFence(vi.fn(async () => Promise.reject(denied))),
+      ),
+    ).rejects.toBe(denied);
+    expect(readback).not.toHaveBeenCalled();
+    expect(api.events).not.toContain('mutation:createR2Bucket');
+  });
+
+  it('refuses R2 readback when the lease is lost during provider creation', async () => {
+    const api = new PlainWorkerProvisioningApiFake();
+    const readback = vi.spyOn(api, 'getR2Bucket');
+    const create = vi
+      .spyOn(api, 'createR2Bucket')
+      .mockRejectedValue(new Error('create response lost'));
+    const denied = new Error('lease lost');
+    const assertOwned = vi
+      .fn<() => Promise<void>>()
+      .mockResolvedValueOnce()
+      .mockRejectedValue(denied);
+
+    await expect(
+      backend(api).ensureApplicationR2Bucket(
+        r2Resource,
+        mutationFence(assertOwned),
+      ),
+    ).rejects.toBe(denied);
+    expect(readback).not.toHaveBeenCalled();
+    expect(create).toHaveBeenCalledOnce();
+  });
+
+  it('reconciles a duplicate R2 create while the lease remains healthy', async () => {
+    const api = new PlainWorkerProvisioningApiFake();
+    const creationDate = '2026-08-26T00:00:00.000Z';
+    api.createR2Bucket = vi.fn(async (resource) => {
+      api.buckets.set(resource.bucketName, { ...resource, creationDate });
+      throw Object.assign(new Error('duplicate'), { status: 409 });
+    });
+
+    await expect(
+      backend(api).ensureApplicationR2Bucket(r2Resource, mutationFence()),
+    ).resolves.toEqual({ ...r2Resource, creationDate });
+  });
 });
 
 const fenceModes = ['entry', 'per-request'] satisfies FenceAssertionMode[];
@@ -627,7 +762,8 @@ describe('PlainWorkerBackend direct mutation assertion ownership', () => {
       deployedCandidate(api);
       const request = vi.fn(async () => {
         // Recorded into the fake's stream so the final assertion pins that the
-        // backend asserted the fence BEFORE dispatching, not merely at all.
+        // backend asserted the fence BEFORE dispatching, not merely that it
+        // asserted.
         api.events.push('maintenance-dispatch');
         return maintenanceResponse();
       });
