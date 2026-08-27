@@ -2,7 +2,7 @@
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
-import Cloudflare, { APIConnectionError, APIError } from 'cloudflare';
+import Cloudflare from 'cloudflare';
 import type { ScriptUpdateParams } from 'cloudflare/resources/workers/scripts/scripts';
 import type { VersionCreateParams } from 'cloudflare/resources/workers/scripts/versions';
 import type { NamespaceListResponse } from 'cloudflare/resources/workers-for-platforms/dispatch/namespaces/namespaces';
@@ -10,6 +10,12 @@ import { toFile } from 'cloudflare/uploads';
 import PQueue from 'p-queue';
 import { ActiveRouteAttestationError } from './active-route.js';
 import { canonicalApplicationBindings } from './application-bindings.js';
+import {
+  isNotFound,
+  readErrorFieldSafely,
+  sanitizedErrorName,
+  sanitizeProviderError,
+} from './cloudflare-provider-errors.js';
 import type { CloudflareApiRateCoordinator } from './cloudflare-rate-coordinator.js';
 import {
   type HostRoutingTarget,
@@ -63,7 +69,6 @@ const SDK_TRANSPORT_TIMEOUT_MS = 2_147_483_647;
 const DEFAULT_INVENTORY_BOUND = 10_000;
 const MAX_DATABASE_INVENTORY = 25_000;
 const MAX_VERSION_INVENTORY = 5_000;
-const MAX_SANITIZED_ERROR_CAUSE_DEPTH = 8;
 
 export interface CloudflareClientOptions {
   readonly accountId: string;
@@ -298,145 +303,6 @@ function readWorkerVersionTag(version: unknown): string | undefined {
   return readStringField(readField(version, 'annotations'), 'workers/tag');
 }
 
-function redactSecretValues(
-  value: string,
-  secretValues: readonly string[],
-): string {
-  return secretValues.reduce(
-    (redacted, secret) =>
-      secret.length > 0 ? redacted.split(secret).join('[redacted]') : redacted,
-    value,
-  );
-}
-
-function readErrorFieldSafely(
-  value: unknown,
-  key: 'cause' | 'constructor' | 'message' | 'name' | 'status',
-): unknown {
-  // A consumer-injected rejection can still be instanceof Error with doctored
-  // or throwing fields; the redaction boundaries must not throw while reading.
-  try {
-    return Reflect.get(value as object, key);
-  } catch {
-    return undefined;
-  }
-}
-
-function isErrorSafely(value: unknown): value is Error {
-  // For object values, `value instanceof Error` walks [[GetPrototypeOf]]; a
-  // Proxy trap or revoked Proxy can throw and replace the sanitized failure,
-  // so every Error check on the foreign cause graph uses this predicate.
-  try {
-    return value instanceof Error;
-  } catch {
-    return false;
-  }
-}
-
-function sanitizedErrorName(error: unknown): string {
-  const name = readErrorFieldSafely(error, 'name');
-  const directName = typeof name === 'string' ? name : undefined;
-  const nameFromConstructor = readErrorFieldSafely(
-    isErrorSafely(error)
-      ? readErrorFieldSafely(error, 'constructor')
-      : undefined,
-    'name',
-  );
-  const constructorName =
-    typeof nameFromConstructor === 'string' ? nameFromConstructor : undefined;
-  const candidate =
-    directName && directName !== 'Error'
-      ? directName
-      : (constructorName ?? directName);
-  return candidate && /^[A-Za-z][A-Za-z0-9]*Error$/.test(candidate)
-    ? candidate
-    : 'unknown';
-}
-
-function sanitizedErrorCause(
-  error: Error,
-  secretValues: readonly string[],
-  depth = 0,
-  seen = new WeakMap<Error, string>(),
-): Error {
-  // This boundary never throws on the values it receives: cycles, depth,
-  // non-string messages, throwing accessors, and hostile prototypes all
-  // degrade to safe values. Fresh Errors copy safe values.
-  const name = sanitizedErrorName(error);
-  seen.set(error, name);
-  const cause = readErrorFieldSafely(error, 'cause');
-  const message = readErrorFieldSafely(error, 'message');
-  let sanitizedCause: Error | { name: string } | undefined;
-  if (isErrorSafely(cause)) {
-    const memoized = seen.get(cause);
-    sanitizedCause =
-      memoized !== undefined
-        ? { name: memoized }
-        : depth + 1 >= MAX_SANITIZED_ERROR_CAUSE_DEPTH
-          ? { name: sanitizedErrorName(cause) }
-          : sanitizedErrorCause(cause, secretValues, depth + 1, seen);
-  }
-  const sanitized = new Error(
-    typeof message === 'string'
-      ? redactSecretValues(message, secretValues)
-      : '',
-    sanitizedCause === undefined ? undefined : { cause: sanitizedCause },
-  );
-  sanitized.name = name;
-  return sanitized;
-}
-
-function sanitizeProviderError(
-  error: unknown,
-  secretValues: readonly string[],
-): unknown {
-  // Wrapped paths supply an SDK-constructed operand. A value that escapes when
-  // the SDK itself throws on the rejection before wrapping it (castToError's
-  // instanceof, internal/errors.mjs:11; the String()/in coercions at
-  // client.mjs:389-390) is outside this boundary's no-throw promise.
-  if (!(error instanceof APIError)) return error;
-  const sanitized = new Error('Cloudflare Worker upload failed');
-  sanitized.name = 'CloudflareProviderError';
-  Object.defineProperties(sanitized, {
-    status: { enumerable: true, value: error.status },
-    errors: {
-      enumerable: true,
-      value: (Array.isArray(error.errors) ? error.errors : []).flatMap(
-        (entry) => {
-          if (!entry || typeof entry !== 'object') return [];
-          const code = readField(entry, 'code');
-          const message = readField(entry, 'message');
-          return [
-            {
-              ...(typeof code === 'number' || typeof code === 'string'
-                ? { code }
-                : {}),
-              ...(typeof message === 'string'
-                ? { message: redactSecretValues(message, secretValues) }
-                : {}),
-            },
-          ];
-        },
-      ),
-    },
-    cause: {
-      enumerable: false,
-      // APIConnectionError keeps a cause chain because, for a rejected fetch,
-      // that chain is the fence or transport failure the adapter classifies
-      // through. The SDK drops the underlying error on its timeout arm
-      // (APIConnectionTimeoutError is constructed without a cause,
-      // core/error.mjs:81-85), so that chain is one constant level. Every other
-      // APIError (a provider response or the SDK's own abort error) collapses
-      // to { name }.
-      value:
-        error instanceof APIConnectionError
-          ? sanitizedErrorCause(error, secretValues)
-          : { name: sanitizedErrorName(error) },
-    },
-  });
-  return sanitized;
-}
-
 function inventoryBoundExceeded(label: string, max: number): Error {
   return new Error(
     `${label} exceeded the supported inventory bound of ${max} items`,
@@ -546,15 +412,6 @@ function assertAccountWideZoneToken(options: {
       );
     }
   }
-}
-
-function isNotFound(error: unknown): boolean {
-  return Boolean(
-    error &&
-      typeof error === 'object' &&
-      'status' in error &&
-      error.status === 404,
-  );
 }
 
 function d1RestParameters(
