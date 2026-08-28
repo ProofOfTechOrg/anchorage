@@ -279,7 +279,7 @@ describe('PlainWorkerBackend core policy', () => {
 
   it('refuses a matching database row whose uuid is empty', async () => {
     const api = new PlainWorkerProvisioningApiFake();
-    api.databases.set('database-id', {
+    api.databases.set('', {
       id: '',
       name: spec.databaseName,
       created: false,
@@ -294,18 +294,18 @@ describe('PlainWorkerBackend core policy', () => {
     const api = new PlainWorkerProvisioningApiFake();
     api.databases.set('database-1', {
       id: 'database-1',
-      name: 'acme-production',
+      name: spec.databaseName,
       created: false,
     });
     api.databases.set('database-2', {
       id: 'database-2',
-      name: 'acme-production-canary',
+      name: `${spec.databaseName}-canary`,
       created: false,
     });
 
     await expect(backend(api).findDatabase(spec)).resolves.toEqual({
       id: 'database-1',
-      name: 'acme-production',
+      name: spec.databaseName,
       created: false,
     });
   });

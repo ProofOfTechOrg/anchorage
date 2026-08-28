@@ -186,9 +186,13 @@ describe('CloudflareApiPlainWorkerProvisioningApi', () => {
   it('forwards a D1 database name filter without changing unfiltered requests', async () => {
     const world = providerWorld();
     world.seedDatabase('acme-production', { databaseId: 'database-1' });
+    world.seedDatabase('other-database', { databaseId: 'database-2' });
     const { api, fixture } = subject(restProjection(world));
 
-    await api.listDatabases();
+    await expect(api.listDatabases()).resolves.toEqual([
+      { databaseId: 'database-1', name: 'acme-production' },
+      { databaseId: 'database-2', name: 'other-database' },
+    ]);
     await expect(
       api.listDatabases({ name: 'acme-production' }),
     ).resolves.toEqual([{ databaseId: 'database-1', name: 'acme-production' }]);

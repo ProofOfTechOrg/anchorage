@@ -34,8 +34,9 @@ export class PlainWorkerProvisioningApiFake
   readonly supportsExactDatabaseDeletion = true;
   readonly events: string[] = [];
   readonly failures = new Map<string, unknown>();
-  // absent, buckets, exportResult, and createDeploymentOutcome's failure arm are
-  // deliberately unexercised seed state for the direct-API conformance fixture.
+  // absent, buckets, exportResult, and createDeploymentOutcome's failure arm
+  // are deliberately unexercised seed state for the direct-API conformance
+  // fixture.
   readonly absent = new Set<string>();
   readonly scripts = new Set<string>();
   readonly databases = new Map<string, DatabaseReference>();
@@ -164,11 +165,11 @@ export class PlainWorkerProvisioningApiFake
     filter?: Readonly<{ name?: string }>,
   ): Promise<readonly PlainWorkerDatabaseInventoryEntry[]> {
     this.listDatabaseFilters.push(filter);
+    // Include partial matches to exercise the core's exact-name check.
     return [...this.databases.values()]
-      .filter(({ name }) => {
-        // Include partial matches to exercise the core's exact-name check.
-        return filter?.name === undefined || name.includes(filter.name);
-      })
+      .filter(
+        ({ name }) => filter?.name === undefined || name.includes(filter.name),
+      )
       .map(({ id, name }) => ({
         databaseId: id,
         name,

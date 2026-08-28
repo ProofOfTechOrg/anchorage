@@ -369,7 +369,7 @@ Store deployment secrets in Cloudflare Secrets or an external manager and inject
 - business connectors;
 - SIEM authorization.
 
-Application binding descriptors contain a name and the UTF-8 SHA-256 of the intended value. Supply the plaintext map only through the trusted fleet-control invocation seam. Fleet control requires exact descriptor keys, verifies every digest before provider access, and excludes plaintext from durable records, release identity, and its own logs; upload-error handling has the injected-transport residual described in the Direct Cloudflare API backend section. A secret rotation changes the specification digest, but provider inventory can verify only the secret name after upload.
+Application binding descriptors contain a name and the UTF-8 SHA-256 of the intended value. Supply the plaintext map only through the trusted fleet-control invocation seam. Fleet control requires exact descriptor keys, verifies every digest before provider access, and excludes plaintext from durable records, release identity, and its own logs; upload-error handling has the injected-transport residual described in the [Direct Cloudflare API backend](#direct-cloudflare-api-backend) section. A secret rotation changes the specification digest, but provider inventory can verify only the secret name after upload.
 
 Do not persist raw keys in workflow input, suspend payload, approval context, schedule request context, notification body, audit detail, artifact metadata, or fleet state.
 

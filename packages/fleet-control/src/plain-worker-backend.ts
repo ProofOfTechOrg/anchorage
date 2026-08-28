@@ -2001,8 +2001,9 @@ export class PlainWorkerBackend implements ProvisioningBackend {
         `refusing to delete Worker '${spec.scriptName}' with unexpected custom domains`,
       );
     }
-    // Secret mutations can create new version IDs, so this live check validates
-    // the persisted anchor and deployed identity without repeating artifact-set membership.
+    // Secret mutations can create new version IDs, so this live check
+    // validates the persisted anchor and deployed identity without
+    // repeating artifact-set membership.
     if (
       !(await this.#attestTeardownWorkerOwnership(
         spec,
@@ -2020,8 +2021,8 @@ export class PlainWorkerBackend implements ProvisioningBackend {
       spec.scriptName,
       fence,
     );
-    // Policy treats deleted and absent identically because the residual check follows;
-    // satisfies is a widening tripwire for future adapter outcomes.
+    // Policy treats deleted and absent identically because the residual check
+    // follows; satisfies is a widening tripwire for future adapter outcomes.
     deletionOutcome satisfies 'deleted' | 'absent';
     const [
       status,
