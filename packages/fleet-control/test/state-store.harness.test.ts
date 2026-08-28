@@ -274,8 +274,8 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
     ).resolves.toEqual({ blocked: true, count: 1_100 });
   });
 
-  // Resetting the server recreates storage and rebinds `worker`, so this
-  // case stays last.
+  // Resetting the server recreates storage and rebinds `worker`,
+  // so this case stays last.
   it('initializes the schema under concurrent first writes on fresh D1 storage', async () => {
     await server.reset();
     worker = server.getWorker();

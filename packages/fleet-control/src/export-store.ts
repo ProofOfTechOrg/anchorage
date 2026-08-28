@@ -4,20 +4,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, open, realpath, rename, rm } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import type { DurableDatabaseExportStore } from './cloudflare-client.js';
-
-const FILE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
-const WINDOWS_DEVICE_NAME = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i;
-
-function assertFileName(fileName: string): void {
-  if (
-    !FILE_NAME_PATTERN.test(fileName) ||
-    fileName.endsWith('.') ||
-    WINDOWS_DEVICE_NAME.test(fileName)
-  ) {
-    throw new Error('export fileName must be one portable path segment');
-  }
-}
+import type { DurableDatabaseExportStore } from './database-export-store.js';
+import { assertFileName } from './export-file-name.js';
 
 async function writeChunk(
   file: Awaited<ReturnType<typeof open>>,

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import type { DurableDatabaseExportStore } from './cloudflare-client.js';
+import type { DurableDatabaseExportStore } from './database-export-store.js';
 import {
   PlainWorkerBackend,
   resolveMaintenanceRequestTimeoutMs,

@@ -7,7 +7,7 @@ import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
-import type { DurableDatabaseExportStore } from './cloudflare-client.js';
+import type { DurableDatabaseExportStore } from './database-export-store.js';
 import {
   providerBindingsToPlainWorkerShape,
   readField,

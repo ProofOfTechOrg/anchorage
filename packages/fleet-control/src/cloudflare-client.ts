@@ -41,6 +41,7 @@ import {
   sanitizedErrorName,
 } from './cloudflare-provider-errors.js';
 import type { CloudflareApiRateCoordinator } from './cloudflare-rate-coordinator.js';
+import type { DurableDatabaseExportStore } from './database-export-store.js';
 import {
   type HostRoutingTarget,
   parseHostRoutingTarget,
@@ -115,18 +116,7 @@ export class CloudflarePlaneCapabilityError extends Error {
   }
 }
 
-export interface DurableDatabaseExportStore {
-  write(input: {
-    readonly databaseId: string;
-    readonly fileName: string;
-    readonly body: ReadableStream<Uint8Array>;
-    readonly contentLength?: number;
-  }): Promise<{
-    readonly location: string;
-    readonly size: number;
-    readonly sha256: string;
-  }>;
-}
+export type { DurableDatabaseExportStore } from './database-export-store.js';
 
 export interface ControlWorkerSpec {
   readonly scriptName: string;
