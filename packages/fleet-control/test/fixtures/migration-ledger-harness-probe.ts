@@ -1,36 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 /// <reference types="@cloudflare/workers-types" />
 
-import {
-  applyMigrationsWithLedger,
-  type MigrationDatabase,
-} from '../../src/migration-ledger.js';
+import { D1FleetStateDatabase } from '../../src/d1-fleet-state-database.js';
+import { applyMigrationsWithLedger } from '../../src/migration-ledger.js';
 
 interface Env {
   DB: D1Database;
 }
 
 const LEDGER = 'anchorage_fleet_migrations';
-
-function database(db: D1Database): MigrationDatabase {
-  const statement = (sql: string, bindings: readonly unknown[]) => {
-    const prepared = db.prepare(sql);
-    return bindings.length > 0 ? prepared.bind(...bindings) : prepared;
-  };
-  return {
-    async query(sql, bindings = []) {
-      const result = await statement(sql, bindings).all<
-        Readonly<Record<string, unknown>>
-      >();
-      return result.results;
-    },
-    async batch(statements) {
-      await db.batch(
-        statements.map(({ sql, bindings = [] }) => statement(sql, bindings)),
-      );
-    },
-  };
-}
 
 function errorShape(error: unknown): { name: string; message: string } {
   return error instanceof Error
@@ -72,7 +50,7 @@ async function atomicRollback(db: D1Database): Promise<unknown> {
     .run();
   let failure: unknown;
   try {
-    await applyMigrationsWithLedger(database(db), [
+    await applyMigrationsWithLedger(new D1FleetStateDatabase(db), [
       {
         version,
         sql: `INSERT INTO migration_atomic_values (value) VALUES ('must-rollback')`,
@@ -109,7 +87,7 @@ async function concurrentApplication(db: D1Database): Promise<unknown> {
   };
   const outcomes = await Promise.allSettled(
     Array.from({ length: 12 }, () =>
-      applyMigrationsWithLedger(database(db), [migration]),
+      applyMigrationsWithLedger(new D1FleetStateDatabase(db), [migration]),
     ),
   );
   const values = await db
@@ -142,7 +120,7 @@ async function changedHistoricalSql(db: D1Database): Promise<unknown> {
     .run();
   await db.prepare(`DELETE FROM migration_history_values`).run();
   await db.prepare(`DELETE FROM ${LEDGER}`).run();
-  await applyMigrationsWithLedger(database(db), [
+  await applyMigrationsWithLedger(new D1FleetStateDatabase(db), [
     {
       version,
       sql: `INSERT INTO migration_history_values (value) VALUES ('original')`,
@@ -150,7 +128,7 @@ async function changedHistoricalSql(db: D1Database): Promise<unknown> {
   ]);
   let failure: unknown;
   try {
-    await applyMigrationsWithLedger(database(db), [
+    await applyMigrationsWithLedger(new D1FleetStateDatabase(db), [
       {
         version,
         sql: `INSERT INTO migration_history_values (value) VALUES ('changed')`,
@@ -175,7 +153,7 @@ async function commitAcrossBoundary(db: D1Database): Promise<unknown> {
     .run();
   await db.prepare(`DELETE FROM migration_boundary_values`).run();
   await db.prepare(`DELETE FROM ${LEDGER}`).run();
-  await applyMigrationsWithLedger(database(db), [
+  await applyMigrationsWithLedger(new D1FleetStateDatabase(db), [
     {
       version,
       sql: `INSERT INTO migration_boundary_values (value) VALUES ('durable')`,

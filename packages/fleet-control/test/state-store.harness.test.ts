@@ -273,4 +273,28 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
       ),
     ).resolves.toEqual({ blocked: true, count: 1_100 });
   });
+
+  it('initializes the schema under concurrent first writes on fresh D1 storage', async () => {
+    await server.reset();
+    worker = server.getWorker();
+
+    await expect(
+      probe<{
+        written: string[];
+        columns: string[];
+        rows: number;
+        tables: string[];
+      }>('cold-concurrent-schema-initialization'),
+    ).resolves.toEqual({
+      written: Array.from({ length: 16 }, (_, i) => `cold${i}`).sort(),
+      columns: ['backend_switch_intent', 'settled_settlement_key'],
+      rows: 16,
+      tables: [
+        'anchorage_fleet_deployments',
+        'anchorage_fleet_leases',
+        'anchorage_platform_plane_claims',
+        'anchorage_platform_plane_leases',
+      ],
+    });
+  });
 });

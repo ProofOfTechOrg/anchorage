@@ -2,12 +2,14 @@
 /// <reference types="@cloudflare/workers-types" />
 
 import { D1CloudflareApiRateCoordinator } from '../../src/cloudflare-rate-coordinator.js';
+import { D1FleetStateDatabase } from '../../src/d1-fleet-state-database.js';
 import {
   canonicalDeploymentEgressPolicy,
   externalEgressProxyScriptName,
   externalStateScriptName,
 } from '../../src/platform-resources.js';
 import {
+  ADDED_NULLABLE_TEXT_COLUMNS,
   D1FleetStateStore,
   type FleetStateDatabase,
 } from '../../src/state-store.js';
@@ -28,33 +30,6 @@ const PLATFORM_CLAIM_TABLE = 'anchorage_platform_plane_claims';
 const PLATFORM_LEASE_TABLE = 'anchorage_platform_plane_leases';
 const DB_NOW_MS = "CAST(unixepoch('subsec') * 1000 AS INTEGER)";
 
-function database(db: D1Database): FleetStateDatabase {
-  const statement = (sql: string, bindings: readonly unknown[]) => {
-    const prepared = db.prepare(sql);
-    return bindings.length > 0 ? prepared.bind(...bindings) : prepared;
-  };
-  return {
-    async query(sql, bindings = []) {
-      const result = await statement(sql, bindings).all<
-        Readonly<Record<string, unknown>>
-      >();
-      return result.results;
-    },
-    async execute(sql, bindings = []) {
-      await statement(sql, bindings).run();
-    },
-    async batch(statements) {
-      const results = await db.batch(
-        statements.map(({ sql, bindings = [] }) => statement(sql, bindings)),
-      );
-      return results.map(
-        (result) =>
-          result.results as readonly Readonly<Record<string, unknown>>[],
-      );
-    },
-  };
-}
-
 function controlledLeaseClock(
   db: D1Database,
   leaseTable: string,
@@ -65,7 +40,7 @@ function controlledLeaseClock(
   now(): number;
   heartbeat: Promise<void>;
 }> {
-  const delegate = database(db);
+  const delegate = new D1FleetStateDatabase(db);
   let now = 1_000_000;
   let allowHeartbeat: (() => void) | undefined;
   const heartbeatAllowed = new Promise<void>((resolve) => {
@@ -151,7 +126,7 @@ async function clean(db: D1Database): Promise<void> {
 }
 
 async function readyStore(db: D1Database): Promise<D1FleetStateStore> {
-  const store = new D1FleetStateStore(database(db), {
+  const store = new D1FleetStateStore(new D1FleetStateDatabase(db), {
     accountId: 'account-primary',
   });
   await store.get('warm', 'test');
@@ -172,7 +147,7 @@ async function concurrentAcquisition(db: D1Database): Promise<unknown> {
     settleLosers = resolve;
   });
   const attempts = Array.from({ length: 16 }, () => {
-    const store = new D1FleetStateStore(database(db), {
+    const store = new D1FleetStateStore(new D1FleetStateDatabase(db), {
       accountId: 'account-primary',
     });
     return store
@@ -268,7 +243,7 @@ async function renewal(db: D1Database): Promise<unknown> {
 
 async function takeoverAndFence(db: D1Database): Promise<unknown> {
   const staleStore = await readyStore(db);
-  const winnerStore = new D1FleetStateStore(database(db), {
+  const winnerStore = new D1FleetStateStore(new D1FleetStateDatabase(db), {
     accountId: 'account-primary',
   });
   let staleLease: FleetStateLease | undefined;
@@ -441,7 +416,7 @@ async function forcedLifecycleErrors(
   kind: 'deployment' | 'platform',
 ): Promise<unknown> {
   await readyStore(db);
-  const store = new D1FleetStateStore(database(db), {
+  const store = new D1FleetStateStore(new D1FleetStateDatabase(db), {
     accountId: 'account-primary',
     leaseTtlMs: 1_000,
     leaseRenewalIntervalMs: 100,
@@ -575,7 +550,7 @@ async function platformClaimsAndConcurrency(db: D1Database): Promise<unknown> {
 
 async function platformTakeoverAndFence(db: D1Database): Promise<unknown> {
   const staleStore = await readyStore(db);
-  const winnerStore = new D1FleetStateStore(database(db), {
+  const winnerStore = new D1FleetStateStore(new D1FleetStateDatabase(db), {
     accountId: 'account-primary',
   });
   let staleLease: PlatformPlaneLease | undefined;
@@ -771,10 +746,11 @@ async function crossPlaneClaimExclusion(db: D1Database): Promise<unknown> {
 
 async function atomicClaimBatch(db: D1Database): Promise<unknown> {
   await readyStore(db);
-  const delegate = database(db);
+  const delegate = new D1FleetStateDatabase(db);
   let loseResponse = true;
   const lostResponseDatabase: FleetStateDatabase = {
-    ...delegate,
+    query: (sql, bindings) => delegate.query(sql, bindings),
+    execute: (sql, bindings) => delegate.execute(sql, bindings),
     async batch(statements) {
       const result = await delegate.batch(statements);
       if (loseResponse) {
@@ -964,7 +940,7 @@ async function backendSwitchColumnUpgrade(db: D1Database): Promise<unknown> {
     .bind(base.tenantTag, base.environment)
     .run();
 
-  const upgraded = await new D1FleetStateStore(database(db), {
+  const upgraded = await new D1FleetStateStore(new D1FleetStateDatabase(db), {
     accountId: 'account-primary',
   }).get(base.tenantTag, base.environment);
   const raw = await db
@@ -984,6 +960,53 @@ async function backendSwitchColumnUpgrade(db: D1Database): Promise<unknown> {
     backendSwitchKind: raw?.backend_switch_intent
       ? (JSON.parse(raw.backend_switch_intent) as { kind?: unknown }).kind
       : undefined,
+  };
+}
+
+async function coldConcurrentSchemaInitialization(
+  db: D1Database,
+): Promise<unknown> {
+  const stores = Array.from(
+    { length: 16 },
+    () =>
+      new D1FleetStateStore(new D1FleetStateDatabase(db), {
+        accountId: 'account-primary',
+      }),
+  );
+  const written = await Promise.all(
+    stores.map((store, index) => {
+      const tenantTag = `cold${index}`;
+      return store.withDeploymentLease(
+        tenantTag,
+        'production',
+        async (lease) => {
+          await lease.put(record(tenantTag, 'production'));
+          return tenantTag;
+        },
+      );
+    }),
+  );
+  const columnRows = await db
+    .prepare(`PRAGMA table_info(${STATE_TABLE})`)
+    .all<{ name: string }>();
+  const tableRows = await db
+    .prepare(
+      `SELECT name FROM sqlite_master
+       WHERE type = 'table' AND name IN (?, ?, ?, ?)
+       ORDER BY name`,
+    )
+    .bind(STATE_TABLE, LEASE_TABLE, PLATFORM_CLAIM_TABLE, PLATFORM_LEASE_TABLE)
+    .all<{ name: string }>();
+  const row = await db
+    .prepare(`SELECT COUNT(*) AS count FROM ${STATE_TABLE}`)
+    .first<{ count: number }>();
+  return {
+    written: [...written].sort(),
+    columns: ADDED_NULLABLE_TEXT_COLUMNS.filter((name) =>
+      columnRows.results.some((column) => column.name === name),
+    ),
+    rows: Number(row?.count),
+    tables: tableRows.results.map(({ name }) => name),
   };
 }
 
@@ -1066,6 +1089,10 @@ export default {
           return Response.json(await lifecycleErrors(env.DB));
         case 'cloudflare-rate-coordination':
           return Response.json(await cloudflareRateCoordination(env.DB));
+        case 'cold-concurrent-schema-initialization':
+          return Response.json(
+            await coldConcurrentSchemaInitialization(env.DB),
+          );
         default:
           return Response.json({ error: 'unknown action' }, { status: 400 });
       }
