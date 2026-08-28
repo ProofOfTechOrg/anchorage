@@ -54,7 +54,7 @@
     "test:credentialed": "pnpm build && node scripts/credentialed-conformance.mjs",
     "test:packed-consumer": "node scripts/packed-consumer-test.mjs",
     "test": "vitest run",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.build.json --noEmit"
   },
   "dependencies": {
     "@proofoftech/flowsafe": "workspace:*",

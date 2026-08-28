@@ -338,8 +338,6 @@ export function dispatchMigrations(spec: DeploymentSpec) {
   );
 }
 
-export { workerMigrations } from './cloudflare-ordinary-worker-operations.js';
-
 async function hashExport(
   body: ReadableStream<Uint8Array>,
 ): Promise<{ sha256: string; size: number }> {
@@ -975,14 +973,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
           creationDate: new Date(bucket.creation_date).toISOString(),
         };
       } catch (error) {
-        if (
-          error &&
-          typeof error === 'object' &&
-          'status' in error &&
-          error.status === 404
-        ) {
-          return undefined;
-        }
+        if (isNotFound(error)) return undefined;
         throw error;
       }
     });
@@ -3450,14 +3441,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
         );
         return inspection;
       } catch (error) {
-        if (
-          error &&
-          typeof error === 'object' &&
-          'status' in error &&
-          error.status === 404
-        ) {
-          return undefined;
-        }
+        if (isNotFound(error)) return undefined;
         throw error;
       }
     });

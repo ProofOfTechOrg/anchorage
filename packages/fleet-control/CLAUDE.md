@@ -16,6 +16,7 @@ Source map:
 - `provision.ts`, `backend-switch.ts`, `fleet.ts`: deployment lifecycle state machines
 - `workers-for-platforms-backend.ts`, `plain-worker-backend.ts`, `wrangler-loop-backend.ts`, `cloudflare-api-plain-worker-backend.ts`: provisioning backends (the Workers for Platforms backend, the shared ordinary-Worker core, and its Wrangler and direct-API adapters)
 - `cloudflare-client.ts`, `cloudflare-ordinary-worker-operations.ts`, `cloudflare-provider-errors.ts`, `cloudflare-rate-coordinator.ts`: provider API (the client, the ordinary-Worker operations behind it, the SDK-error helpers) and its shared quota fence
+- `json-field-reads.ts`: JSON field readers shared by provider adapters and error sanitization
 - `state-store.ts`, `migration-ledger.ts`, `d1-fleet-state-database.ts`, `database-export-store.ts`, `export-file-name.ts`, `export-store.ts`, `r2-export-store.ts`: durable fleet state (`d1-fleet-state-database.ts` adapts a Workers D1 binding to the state store's database port; `database-export-store.ts` declares `DurableDatabaseExportStore`, which `export-store.ts` implements over the filesystem and `r2-export-store.ts` over an R2 binding; `export-file-name.ts` holds the portable-segment check both stores use)
 - `workers/`: the platform's own deployed Workers, published as separate export entries
 

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // This module holds ordinary-Worker (plain-plane) provider operations that
-// CloudflareProvisioningClient calls through one-line forwards or directly,
-// plus the worker-migration helper it re-exports. Context-taking functions
+// CloudflareProvisioningClient calls through one-line forwards or directly.
+// Context-taking functions
 // declare the slice of OrdinaryWorkerContext they need; the preparation and
 // migration helpers take no context.
 // Provider requests go through context.client, the client's SDK instance;
@@ -18,11 +18,13 @@ import {
   sanitizeProviderError,
 } from './cloudflare-provider-errors.js';
 import {
-  assertOrdinaryWorkerDeploymentVersions,
-  providerBindingsToPlainWorkerShape,
   readArrayField,
   readField,
   readStringField,
+} from './json-field-reads.js';
+import {
+  assertOrdinaryWorkerDeploymentVersions,
+  providerBindingsToPlainWorkerShape,
   uploadIntentToProviderBindings,
 } from './provider-binding-inventory.js';
 import type {

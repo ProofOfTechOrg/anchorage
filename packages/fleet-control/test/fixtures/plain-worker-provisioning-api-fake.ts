@@ -34,8 +34,8 @@ export class PlainWorkerProvisioningApiFake
   readonly supportsExactDatabaseDeletion = true;
   readonly events: string[] = [];
   readonly failures = new Map<string, unknown>();
-  // absent, buckets, exportResult, and createDeploymentOutcome's failure arm
-  // are deliberately unexercised seed state for the direct-API conformance
+  // absent, exportResult, and createDeploymentOutcome's failure arm are
+  // deliberately unexercised seed state for the direct-API conformance
   // fixture.
   readonly absent = new Set<string>();
   readonly scripts = new Set<string>();

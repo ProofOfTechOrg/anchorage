@@ -19,7 +19,7 @@ import type {
   PlainBackendSnapshot,
 } from './backend-switch.js';
 import { finalizedBridgeForRecord } from './backend-switch.js';
-import { workerMigrations } from './cloudflare-client.js';
+import { workerMigrations } from './cloudflare-ordinary-worker-operations.js';
 import type { HostRoutingTarget } from './host-routing.js';
 import { parseHostRoutingTarget } from './host-routing.js';
 import { d1MigrationHistoryDigest } from './migration-ledger.js';

@@ -9,11 +9,11 @@
 // isNotFound.
 
 import { APIConnectionError, APIError } from 'cloudflare';
-import { readField } from './provider-binding-inventory.js';
+import { readField } from './json-field-reads.js';
 
-export const MAX_SANITIZED_ERROR_CAUSE_DEPTH = 8;
+const MAX_SANITIZED_ERROR_CAUSE_DEPTH = 8;
 
-export function redactSecretValues(
+function redactSecretValues(
   value: string,
   secretValues: readonly string[],
 ): string {
@@ -37,7 +37,7 @@ export function readErrorFieldSafely(
   }
 }
 
-export function isErrorSafely(value: unknown): value is Error {
+function isErrorSafely(value: unknown): value is Error {
   // For object values, `value instanceof Error` walks [[GetPrototypeOf]]; a
   // Proxy trap or revoked Proxy can throw and replace the sanitized failure,
   // so every Error check on the foreign cause graph uses this predicate.
@@ -68,7 +68,7 @@ export function sanitizedErrorName(error: unknown): string {
     : 'unknown';
 }
 
-export function sanitizedErrorCause(
+function sanitizedErrorCause(
   error: Error,
   secretValues: readonly string[],
   depth = 0,

@@ -8,11 +8,8 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
 import type { DurableDatabaseExportStore } from './database-export-store.js';
-import {
-  providerBindingsToPlainWorkerShape,
-  readField,
-  readStringField,
-} from './provider-binding-inventory.js';
+import { readField, readStringField } from './json-field-reads.js';
+import { providerBindingsToPlainWorkerShape } from './provider-binding-inventory.js';
 import type {
   DatabaseReference,
   ExternalMutationFence,

@@ -42,6 +42,10 @@ const controls = {
     'scripts/architecture-fixtures/host-kit-misses-approval-shapes.ts',
   'fleet-control-client-layers-are-one-way':
     'scripts/architecture-fixtures/fleet-control-leaf-imports-client.ts',
+  'fleet-control-ports-do-not-reach-d1-adapter':
+    'scripts/architecture-fixtures/fleet-control-port-imports-d1-adapter.ts',
+  'fleet-control-worker-reachable-modules-avoid-node-builtins':
+    'scripts/architecture-fixtures/fleet-control-worker-reachable-imports-node-builtin.ts',
 };
 
 test('every architecture rule has an executable positive control', () => {

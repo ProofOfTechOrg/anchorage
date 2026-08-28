@@ -173,17 +173,49 @@ module.exports = {
       name: 'fleet-control-client-layers-are-one-way',
       severity: 'error',
       comment:
-        'The ordinary-Worker operations module, the provider-error module, and the active-route leaf sit under the Cloudflare client. A back-import would restore the coupling the extraction removed, and packages/fleet-control is outside no-new-architecture-cycles. tsPreCompilationDeps keeps type-only imports in the graph, so an `import type` back-edge is covered.',
+        'These fleet-control modules must not reach the Cloudflare client; a back-import would restore the coupling the extraction removed. packages/fleet-control is outside no-new-architecture-cycles. tsPreCompilationDeps keeps type-only imports in the graph, so an `import type` back-edge is covered.',
       from: {
         path: [
-          '^packages/fleet-control/src/(?:active-route|cloudflare-ordinary-worker-operations|cloudflare-provider-errors)\\.ts$',
+          '^packages/fleet-control/src/',
           '^scripts/architecture-fixtures/fleet-control-leaf-imports-client\\.ts$',
         ],
+        pathNot:
+          '^packages/fleet-control/src/(?:cloudflare-api-plain-worker-backend|cloudflare-api-plain-worker-provisioning-api|cloudflare-client|index)\\.ts$',
       },
       to: {
         path: '^packages/fleet-control/src/cloudflare-client\\.ts$',
         reachable: true,
       },
+    },
+    {
+      name: 'fleet-control-ports-do-not-reach-d1-adapter',
+      severity: 'error',
+      comment:
+        'The D1 adapter implements ports that state-store.ts and migration-ledger.ts declare and imports state-store.ts, so a port module reaching the adapter would close a cycle.',
+      from: {
+        path: [
+          '^packages/fleet-control/src/(?:state-store|migration-ledger)\\.ts$',
+          '^scripts/architecture-fixtures/fleet-control-port-imports-d1-adapter\\.ts$',
+        ],
+      },
+      to: {
+        path: '^packages/fleet-control/src/d1-fleet-state-database\\.ts$',
+        reachable: true,
+      },
+    },
+    {
+      name: 'fleet-control-worker-reachable-modules-avoid-node-builtins',
+      severity: 'error',
+      comment:
+        'These modules are the Workers this package publishes plus the R2 export store, the D1 adapter, and the two leaf modules the R2 store imports. The two D1 harnesses set nodejs_compat, so a builtin import in the D1 adapter fails this rule rather than a harness; the R2 export harness runs without the flag.',
+      from: {
+        path: [
+          '^packages/fleet-control/src/(?:d1-fleet-state-database|database-export-store|export-file-name|r2-export-store)\\.ts$',
+          '^packages/fleet-control/src/workers/',
+          '^scripts/architecture-fixtures/fleet-control-worker-reachable-imports-node-builtin\\.ts$',
+        ],
+      },
+      to: { dependencyTypes: ['core'] },
     },
   ],
   required: [
