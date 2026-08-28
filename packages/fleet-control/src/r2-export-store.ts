@@ -127,15 +127,17 @@ export class R2DatabaseExportStore implements DurableDatabaseExportStore {
     const prepared = await Promise.resolve()
       .then(() => this.#prepare(input))
       .catch((error: unknown) => {
-        // A tee branch's cancel settles when its sibling drains, so the
-        // refusal does not await it.
+        // A tee branch's cancel settles when the tee source is exhausted
+        // or the other branch is cancelled, so the refusal does not await
+        // it.
         void input.body.cancel(error).catch(() => undefined);
         throw error;
       });
     const controller = new AbortController();
     const collision = new Error('R2 export key already exists');
     // A conforming R2Bucket.put returns a promise; a synchronous throw from
-    // an injected bucket escapes the fixed-message set.
+    // an injected put escapes the fixed-message set. Wrapping the call would
+    // start the put after the pipe, so it stays bare.
     const put = this.#bucket.put(prepared.key, prepared.fixed.readable, {
       onlyIf: { etagDoesNotMatch: '*' },
     });
@@ -175,9 +177,7 @@ export class R2DatabaseExportStore implements DurableDatabaseExportStore {
       );
     }
 
-    const [storedState] = await Promise.allSettled([
-      this.#bucket.get(prepared.key),
-    ]);
+    const storedState = await settled(() => this.#bucket.get(prepared.key));
     if (storedState.status === 'rejected') {
       return this.#failOwned(
         prepared.key,
@@ -198,9 +198,9 @@ export class R2DatabaseExportStore implements DurableDatabaseExportStore {
       );
     }
 
-    const [digestConstructorState] = await Promise.allSettled([
-      Promise.resolve().then(() => new this.#DigestStream('SHA-256')),
-    ]);
+    const digestConstructorState = await settled(
+      () => new this.#DigestStream('SHA-256'),
+    );
     if (digestConstructorState.status === 'rejected') {
       return this.#failOwned(
         prepared.key,
@@ -280,7 +280,7 @@ export class R2DatabaseExportStore implements DurableDatabaseExportStore {
   }
 
   async #failOwned(key: string, error: unknown): Promise<never> {
-    const [cleanupState] = await Promise.allSettled([this.#bucket.delete(key)]);
+    const cleanupState = await settled(() => this.#bucket.delete(key));
     if (cleanupState.status === 'rejected') {
       throw new AggregateError(
         [error, cleanupState.reason],
@@ -289,6 +289,13 @@ export class R2DatabaseExportStore implements DurableDatabaseExportStore {
     }
     throw error;
   }
+}
+
+async function settled<T>(
+  operation: () => T | PromiseLike<T>,
+): Promise<PromiseSettledResult<Awaited<T>>> {
+  const [state] = await Promise.allSettled([Promise.resolve().then(operation)]);
+  return state;
 }
 
 function isKeyPrefix(value: string | undefined): boolean {

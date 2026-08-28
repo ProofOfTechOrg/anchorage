@@ -108,7 +108,7 @@ function workerStreamFrom(
   return fixed.readable;
 }
 
-function metadata(key: string, size: number): R2Object {
+function metadata(key: string, size: number) {
   return {
     key,
     version: '1',
@@ -119,7 +119,7 @@ function metadata(key: string, size: number): R2Object {
     uploaded: new Date(0),
     storageClass: 'Standard',
     writeHttpMetadata() {},
-  };
+  } satisfies R2Object;
 }
 
 function objectBody(
@@ -130,9 +130,6 @@ function objectBody(
 ): R2ObjectBody {
   return {
     ...metadata(key, reportedSize),
-    // Spread types drop method-signature members; restore the one
-    // R2ObjectBody needs.
-    writeHttpMetadata() {},
     body: workerStreamFrom(bodyBytes, readError),
     bodyUsed: false,
     async arrayBuffer() {
@@ -450,6 +447,7 @@ describe('R2DatabaseExportStore', () => {
     const [body] = source.tee();
     const bucket = new FakeR2Bucket();
     await expect(
+      // The race pins the message on the fast path; a suite timeout cannot.
       Promise.race([
         createStore(bucket).write({
           databaseId: 'db',
@@ -466,18 +464,13 @@ describe('R2DatabaseExportStore', () => {
 
   it('cancels on UUID and fixed-stream construction failures', async () => {
     const uuidError = new Error('uuid failed');
-    const uuidBucket = new FakeR2Bucket();
-    const invalidUuidBucket = new FakeR2Bucket();
-    const fixedBucket = new FakeR2Bucket();
-    const cases: readonly [
-      FakeR2Bucket,
-      () => R2DatabaseExportStore,
+    const cases: readonly (readonly [
+      (bucket: FakeR2Bucket) => R2DatabaseExportStore,
       string,
-    ][] = [
+    ])[] = [
       [
-        uuidBucket,
-        () =>
-          createStore(uuidBucket, {
+        (bucket) =>
+          createStore(bucket, {
             randomUUID: () => {
               throw uuidError;
             },
@@ -485,14 +478,12 @@ describe('R2DatabaseExportStore', () => {
         'uuid failed',
       ],
       [
-        invalidUuidBucket,
-        () => createStore(invalidUuidBucket, { randomUUID: () => '../bad' }),
+        (bucket) => createStore(bucket, { randomUUID: () => '../bad' }),
         'R2 export key component must be one portable path segment',
       ],
       [
-        fixedBucket,
-        () =>
-          createStore(fixedBucket, {
+        (bucket) =>
+          createStore(bucket, {
             streams: {
               ...nodeWorkerStreams,
               FixedLengthStream: class {
@@ -508,10 +499,11 @@ describe('R2DatabaseExportStore', () => {
         'fixed failed',
       ],
     ];
-    for (const [bucket, makeStore, message] of cases) {
+    for (const [makeStore, message] of cases) {
+      const bucket = new FakeR2Bucket();
       const source = streamFrom(bytes(1), { stayOpen: true });
       await rejection(
-        makeStore().write({
+        makeStore(bucket).write({
           databaseId: 'db',
           fileName: 'x.db',
           body: source.body,
@@ -522,6 +514,42 @@ describe('R2DatabaseExportStore', () => {
       expect(source.cancellations).toHaveLength(1);
       expect(bucket.putCalls).toBe(0);
     }
+  });
+
+  it('preserves a refusal when source cancellation rejects', async () => {
+    const bucket = new FakeR2Bucket();
+    const source = streamFrom(bytes(1), { rejectCancel: true });
+    await rejection(
+      createStore(bucket).write({
+        databaseId: 'db',
+        fileName: 'x.db',
+        body: source.body,
+        contentLength: 0,
+      }),
+      'R2 export refuses an empty body',
+    );
+    expect(bucket.putCalls).toBe(0);
+    expect(source.cancellations).toHaveLength(1);
+  });
+
+  it('refuses a locked body before starting a put', {
+    timeout: 2_000,
+  }, async () => {
+    const bucket = new FakeR2Bucket();
+    const { body } = streamFrom(bytes(1, 2));
+    body.getReader();
+    await rejection(
+      createStore(bucket).write({
+        databaseId: 'db',
+        fileName: 'x.db',
+        body,
+        contentLength: 2,
+      }),
+      'R2 export body is locked',
+    );
+    expect(bucket.putCalls).toBe(0);
+    expect(bucket.deleteCalls).toHaveLength(0);
+    expect(bucket.objects.size).toBe(0);
   });
 
   it('reports malformed upload lengths without deleting an object', async () => {
@@ -778,67 +806,45 @@ describe('R2DatabaseExportStore', () => {
     expect(error.errors[1]).toBe(bucket.deleteError);
   });
 
-  it('uses a fresh key when retrying after an indeterminate put rejection', async () => {
-    const bucket = new FakeR2Bucket();
-    let attempt = 0;
-    const store = createStore(bucket, {
-      randomUUID: () => `uuid-${++attempt}`,
-    });
-    bucket.putMode = 'reject-before';
-    await rejection(
-      store.write({
-        databaseId: 'db',
-        fileName: 'x.db',
-        body: streamFrom(bytes(1)).body,
-        contentLength: 1,
-      }),
-      'R2 export upload failed',
-    );
-    bucket.putMode = 'normal';
-    const result = await store.write({
-      databaseId: 'db',
-      fileName: 'x.db',
-      body: streamFrom(bytes(1)).body,
-      contentLength: 1,
-    });
-    expect(result.location).toBe('r2://exports/db/uuid-2-x.db');
-  });
-
-  it('uses a fresh key when retrying after a partial put rejection', async () => {
-    const bucket = new FakeR2Bucket();
-    let attempt = 0;
-    const store = createStore(bucket, {
-      randomUUID: () => `uuid-${++attempt}`,
-    });
-    const body = bytes(1, 2, 3, 4);
-    bucket.putMode = 'reject-mid';
-    await rejection(
-      store.write({
+  it('uses a fresh key when retrying after a rejected put', async () => {
+    for (const [mode, body] of [
+      ['reject-before', bytes(1)],
+      ['reject-mid', bytes(1, 2, 3, 4)],
+    ] satisfies readonly (readonly [PutMode, Uint8Array])[]) {
+      const bucket = new FakeR2Bucket();
+      let attempt = 0;
+      const store = createStore(bucket, {
+        randomUUID: () => `uuid-${++attempt}`,
+      });
+      bucket.putMode = mode;
+      await rejection(
+        store.write({
+          databaseId: 'db',
+          fileName: 'x.db',
+          body: streamFrom(body).body,
+          contentLength: body.byteLength,
+        }),
+        'R2 export upload failed',
+      );
+      expect(bucket.deleteCalls).toHaveLength(0);
+      expect(bucket.objects.size).toBe(0);
+      bucket.putMode = 'normal';
+      const result = await store.write({
         databaseId: 'db',
         fileName: 'x.db',
         body: streamFrom(body).body,
         contentLength: body.byteLength,
-      }),
-      'R2 export upload failed',
-    );
-    expect(bucket.deleteCalls).toHaveLength(0);
-    expect(bucket.objects.size).toBe(0);
-    bucket.putMode = 'normal';
-    const result = await store.write({
-      databaseId: 'db',
-      fileName: 'x.db',
-      body: streamFrom(body).body,
-      contentLength: body.byteLength,
-    });
-    expect(result.location).toBe('r2://exports/db/uuid-2-x.db');
-    expect(bucket.objects.get('db/uuid-2-x.db')).toEqual(body);
+      });
+      expect(result.location).toBe('r2://exports/db/uuid-2-x.db');
+      expect(bucket.objects.get('db/uuid-2-x.db')).toEqual(body);
+    }
   });
 
   it('validates constructor inputs and key components with fixed messages', async () => {
     const bucket = new FakeR2Bucket();
-    const BUCKET_MESSAGE =
+    const bucketMessage =
       'R2DatabaseExportStore requires the Workers R2Bucket put/get/delete interface';
-    const STREAMS_MESSAGE =
+    const streamsMessage =
       'R2DatabaseExportStore requires the Workers DigestStream and FixedLengthStream constructors';
     const validOptions = {
       bucket,
@@ -847,26 +853,26 @@ describe('R2DatabaseExportStore', () => {
       randomUUID: () => 'uuid',
     };
     for (const [override, message] of [
-      [{ bucket: Object.create(null) }, BUCKET_MESSAGE],
-      [{ bucket: { get() {}, delete() {} } }, BUCKET_MESSAGE],
-      [{ bucket: { put() {}, delete() {} } }, BUCKET_MESSAGE],
-      [{ bucket: { put() {}, get() {} } }, BUCKET_MESSAGE],
-      [{ bucket: undefined }, BUCKET_MESSAGE],
-      [{ streams: Object.create(null) }, STREAMS_MESSAGE],
+      [{ bucket: Object.create(null) }, bucketMessage],
+      [{ bucket: { get() {}, delete() {} } }, bucketMessage],
+      [{ bucket: { put() {}, delete() {} } }, bucketMessage],
+      [{ bucket: { put() {}, get() {} } }, bucketMessage],
+      [{ bucket: undefined }, bucketMessage],
+      [{ streams: Object.create(null) }, streamsMessage],
       [
         { streams: { FixedLengthStream: nodeWorkerStreams.FixedLengthStream } },
-        STREAMS_MESSAGE,
+        streamsMessage,
       ],
       [
         { streams: { DigestStream: nodeWorkerStreams.DigestStream } },
-        STREAMS_MESSAGE,
+        streamsMessage,
       ],
-      [{ streams: undefined }, STREAMS_MESSAGE],
+      [{ streams: undefined }, streamsMessage],
       [
         { randomUUID: undefined },
         'R2DatabaseExportStore requires a randomUUID function',
       ],
-    ] as const) {
+    ] satisfies readonly (readonly [Record<string, unknown>, string])[]) {
       expect(() =>
         Reflect.construct(R2DatabaseExportStore, [
           { ...validOptions, ...override },
@@ -921,39 +927,47 @@ describe('R2DatabaseExportStore', () => {
     expect(result.location).toBe('r2://exports/a/b/db/uuid-1-x.db');
   });
 
-  it('preserves a refusal when source cancellation rejects', async () => {
-    const bucket = new FakeR2Bucket();
-    const source = streamFrom(bytes(1), { rejectCancel: true });
-    await rejection(
-      createStore(bucket).write({
+  it('funnels a synchronous bucket throw into the fixed messages', async () => {
+    const sentinel = new Error('sync bucket failure');
+    class ThrowingGetBucket extends FakeR2Bucket {
+      override get(): never {
+        throw sentinel;
+      }
+    }
+    const getBucket = new ThrowingGetBucket();
+    const readbackError = await rejection(
+      createStore(getBucket).write({
         databaseId: 'db',
         fileName: 'x.db',
-        body: source.body,
-        contentLength: 0,
-      }),
-      'R2 export refuses an empty body',
-    );
-    expect(bucket.putCalls).toBe(0);
-  });
-
-  it('refuses a locked body before starting a put', {
-    timeout: 2_000,
-  }, async () => {
-    const bucket = new FakeR2Bucket();
-    const { body } = streamFrom(bytes(1, 2));
-    body.getReader();
-    await rejection(
-      createStore(bucket).write({
-        databaseId: 'db',
-        fileName: 'x.db',
-        body,
+        body: streamFrom(bytes(1, 2)).body,
         contentLength: 2,
       }),
-      'R2 export body is locked',
+      'R2 export readback failed',
     );
-    expect(bucket.putCalls).toBe(0);
-    expect(bucket.deleteCalls).toHaveLength(0);
-    expect(bucket.objects.size).toBe(0);
+    expect(readbackError.cause).toBe(sentinel);
+    expect(getBucket.deleteCalls).toEqual(['db/uuid-1-x.db']);
+    expect(getBucket.objects.size).toBe(0);
+
+    class ThrowingDeleteBucket extends FakeR2Bucket {
+      override delete(): never {
+        throw sentinel;
+      }
+    }
+    const deleteBucket = new ThrowingDeleteBucket();
+    deleteBucket.getMode = 'null';
+    const aggregate = await rejection(
+      createStore(deleteBucket).write({
+        databaseId: 'db',
+        fileName: 'x.db',
+        body: streamFrom(bytes(1, 2)).body,
+        contentLength: 2,
+      }),
+      'database export and R2 cleanup failed',
+    );
+    expect(aggregate).toBeInstanceOf(AggregateError);
+    if (!(aggregate instanceof AggregateError))
+      throw new Error('expected aggregate');
+    expect(aggregate.errors[1]).toBe(sentinel);
   });
 
   it('satisfies the database export store contract', () => {
