@@ -294,6 +294,7 @@ export class R2DatabaseExportStore implements DurableDatabaseExportStore {
 async function settled<T>(
   operation: () => T | PromiseLike<T>,
 ): Promise<PromiseSettledResult<Awaited<T>>> {
+  // Resolving through a promise makes a synchronous throw a rejection.
   const [state] = await Promise.allSettled([Promise.resolve().then(operation)]);
   return state;
 }

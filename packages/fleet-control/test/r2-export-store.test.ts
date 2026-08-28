@@ -806,6 +806,55 @@ describe('R2DatabaseExportStore', () => {
     expect(error.errors[1]).toBe(bucket.deleteError);
   });
 
+  it('funnels a synchronous bucket throw into the fixed messages', async () => {
+    const sentinel = new Error('sync bucket failure');
+    class ThrowingGetBucket extends FakeR2Bucket {
+      override get(): never {
+        throw sentinel;
+      }
+    }
+    const getBucket = new ThrowingGetBucket();
+    const readbackError = await rejection(
+      createStore(getBucket).write({
+        databaseId: 'db',
+        fileName: 'x.db',
+        body: streamFrom(bytes(1, 2)).body,
+        contentLength: 2,
+      }),
+      'R2 export readback failed',
+    );
+    expect(readbackError.cause).toBe(sentinel);
+    expect(getBucket.deleteCalls).toEqual(['db/uuid-1-x.db']);
+    expect(getBucket.objects.size).toBe(0);
+
+    class ThrowingDeleteBucket extends FakeR2Bucket {
+      override delete(): never {
+        throw sentinel;
+      }
+    }
+    const deleteBucket = new ThrowingDeleteBucket();
+    deleteBucket.getMode = 'null';
+    const aggregate = await rejection(
+      createStore(deleteBucket).write({
+        databaseId: 'db',
+        fileName: 'x.db',
+        body: streamFrom(bytes(1, 2)).body,
+        contentLength: 2,
+      }),
+      'database export and R2 cleanup failed',
+    );
+    expect(aggregate).toBeInstanceOf(AggregateError);
+    if (!(aggregate instanceof AggregateError))
+      throw new Error('expected aggregate');
+    expect(aggregate.errors[0]).toBeInstanceOf(Error);
+    const exportError = aggregate.errors[0];
+    if (!(exportError instanceof Error)) throw new Error('expected Error');
+    expect(exportError.message).toMatch(
+      exactly('R2 export readback found no object'),
+    );
+    expect(aggregate.errors[1]).toBe(sentinel);
+  });
+
   it('uses a fresh key when retrying after a rejected put', async () => {
     for (const [mode, body] of [
       ['reject-before', bytes(1)],
@@ -925,49 +974,6 @@ describe('R2DatabaseExportStore', () => {
       contentLength: 1,
     });
     expect(result.location).toBe('r2://exports/a/b/db/uuid-1-x.db');
-  });
-
-  it('funnels a synchronous bucket throw into the fixed messages', async () => {
-    const sentinel = new Error('sync bucket failure');
-    class ThrowingGetBucket extends FakeR2Bucket {
-      override get(): never {
-        throw sentinel;
-      }
-    }
-    const getBucket = new ThrowingGetBucket();
-    const readbackError = await rejection(
-      createStore(getBucket).write({
-        databaseId: 'db',
-        fileName: 'x.db',
-        body: streamFrom(bytes(1, 2)).body,
-        contentLength: 2,
-      }),
-      'R2 export readback failed',
-    );
-    expect(readbackError.cause).toBe(sentinel);
-    expect(getBucket.deleteCalls).toEqual(['db/uuid-1-x.db']);
-    expect(getBucket.objects.size).toBe(0);
-
-    class ThrowingDeleteBucket extends FakeR2Bucket {
-      override delete(): never {
-        throw sentinel;
-      }
-    }
-    const deleteBucket = new ThrowingDeleteBucket();
-    deleteBucket.getMode = 'null';
-    const aggregate = await rejection(
-      createStore(deleteBucket).write({
-        databaseId: 'db',
-        fileName: 'x.db',
-        body: streamFrom(bytes(1, 2)).body,
-        contentLength: 2,
-      }),
-      'database export and R2 cleanup failed',
-    );
-    expect(aggregate).toBeInstanceOf(AggregateError);
-    if (!(aggregate instanceof AggregateError))
-      throw new Error('expected aggregate');
-    expect(aggregate.errors[1]).toBe(sentinel);
   });
 
   it('satisfies the database export store contract', () => {
