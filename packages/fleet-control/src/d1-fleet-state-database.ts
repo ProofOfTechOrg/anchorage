@@ -16,12 +16,12 @@ function isUnknownArray(value: unknown): value is readonly unknown[] {
   return Array.isArray(value);
 }
 
-function validateAck(
+function validateAcknowledgement(
   value: unknown,
   message: string,
 ): asserts value is Row & Readonly<{ success: true; meta: Row }> {
-  // Extra envelope and meta fields stay accepted as D1 adds fields; a defined
-  // `error` beside `success: true` is contradictory and refused.
+  // Extra acknowledgement and meta fields stay accepted as D1 adds fields;
+  // a defined `error` beside `success: true` is contradictory and refused.
   if (
     !isRecord(value) ||
     value.success !== true ||
@@ -40,7 +40,7 @@ function validateEnvelope(
   meta: Row;
   results: readonly Row[];
 }> {
-  validateAck(value, message);
+  validateAcknowledgement(value, message);
   if (!isUnknownArray(value.results) || !value.results.every(isRecord)) {
     throw new Error(message);
   }
@@ -80,12 +80,12 @@ export class D1FleetStateDatabase implements FleetStateDatabase {
   }
 
   /**
-   * Validates the acknowledgement because the shim does not backfill
-   * `results` for `run()`, and this method does not read rows.
+   * Validates the acknowledgement because workerd's D1 shim does not
+   * backfill `results` for `run()`, and this method does not read rows.
    */
   async execute(sql: string, bindings: readonly unknown[] = []): Promise<void> {
     const envelope: unknown = await this.#statement(sql, bindings).run();
-    validateAck(envelope, 'D1 execute returned a malformed result');
+    validateAcknowledgement(envelope, 'D1 execute returned a malformed result');
   }
 
   async batch(

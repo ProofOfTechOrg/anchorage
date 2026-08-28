@@ -151,7 +151,7 @@ describe('D1FleetStateDatabase', () => {
     expect(result).toBe(rows);
   });
 
-  it('discards execute rows', async () => {
+  it('resolves execute acknowledgements without results and discards rows', async () => {
     const valid = fakeDatabase({ run: () => envelope([{ changed: 1 }]) });
     await expect(
       new D1FleetStateDatabase(valid.binding).execute('UPDATE records'),
