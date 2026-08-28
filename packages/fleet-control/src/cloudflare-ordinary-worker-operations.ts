@@ -205,6 +205,7 @@ export async function ordinaryWorkerSecretNames(
 
 export async function listOrdinaryWorkerDatabases(
   context: OrdinaryWorkerPagedContext,
+  filter?: Readonly<{ name?: string }>,
 ): Promise<readonly PlainWorkerDatabaseInventoryEntry[]> {
   return context.schedule(async () => {
     const databases: PlainWorkerDatabaseInventoryEntry[] = [];
@@ -212,6 +213,7 @@ export async function listOrdinaryWorkerDatabases(
       context.client.d1.database.list({
         account_id: context.accountId,
         per_page: 100,
+        ...(filter?.name === undefined ? {} : { name: filter.name }),
       }),
       'D1 database inventory',
       MAX_DATABASE_INVENTORY,

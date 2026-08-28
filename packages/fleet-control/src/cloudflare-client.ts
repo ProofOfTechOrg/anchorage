@@ -1136,10 +1136,10 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     return scripts;
   }
 
-  async listOrdinaryWorkerDatabases(): Promise<
-    readonly PlainWorkerDatabaseInventoryEntry[]
-  > {
-    return listOrdinaryWorkerDatabases(this.#ordinary);
+  async listOrdinaryWorkerDatabases(
+    filter?: Readonly<{ name?: string }>,
+  ): Promise<readonly PlainWorkerDatabaseInventoryEntry[]> {
+    return listOrdinaryWorkerDatabases(this.#ordinary, filter);
   }
 
   async ordinaryWorkerDeploymentStatus(

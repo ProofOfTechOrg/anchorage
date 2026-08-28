@@ -169,6 +169,22 @@ describe('WranglerPlainWorkerProvisioningApi parsing', () => {
     ]);
   });
 
+  it('filters database inventory locally without changing Wrangler arguments', async () => {
+    const runner = new FakeRunner(async () => ({
+      stdout: JSON.stringify([
+        { uuid: 'database-1', name: 'acme-production' },
+        { uuid: 'database-2', name: 'other' },
+      ]),
+      stderr: '',
+    }));
+    const subject = await api(runner);
+
+    await expect(
+      subject.listDatabases({ name: 'acme-production' }),
+    ).resolves.toEqual([{ databaseId: 'database-1', name: 'acme-production' }]);
+    expect(runner.calls).toEqual([{ arguments: ['d1', 'list', '--json'] }]);
+  });
+
   it('rejects invalid JSON with the operation name', async () => {
     const subject = await api(
       new FakeRunner(async () => ({ stdout: '{', stderr: '' })),

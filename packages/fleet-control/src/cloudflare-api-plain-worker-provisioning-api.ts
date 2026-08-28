@@ -144,8 +144,10 @@ export class CloudflareApiPlainWorkerProvisioningApi
     return this.#client.disableOrdinaryWorkerPublicAccess(scriptName, fence);
   }
 
-  listDatabases(): Promise<readonly PlainWorkerDatabaseInventoryEntry[]> {
-    return this.#client.listOrdinaryWorkerDatabases();
+  listDatabases(
+    filter?: Readonly<{ name?: string }>,
+  ): Promise<readonly PlainWorkerDatabaseInventoryEntry[]> {
+    return this.#client.listOrdinaryWorkerDatabases(filter);
   }
 
   getDatabase(databaseId: string): Promise<DatabaseReference | undefined> {

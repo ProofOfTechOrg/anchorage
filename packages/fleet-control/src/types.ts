@@ -858,8 +858,15 @@ export interface PlainWorkerProvisioningApi extends PlainWorkerRouteApi {
   readonly maxMutationDurationMs: number;
   /** Whether immutable-ID D1 reads and deletion are both available. */
   readonly supportsExactDatabaseDeletion: boolean;
-  /** Lists all D1 database inventory facts visible to the adapter. */
-  listDatabases(): Promise<readonly PlainWorkerDatabaseInventoryEntry[]>;
+  /**
+   * Lists D1 database inventory facts visible to the adapter. A name filter
+   * narrows the listing toward that name; an adapter forwards it where the
+   * provider accepts one and filters locally otherwise, so a caller that needs
+   * an exact match still compares the returned names.
+   */
+  listDatabases(
+    filter?: Readonly<{ name?: string }>,
+  ): Promise<readonly PlainWorkerDatabaseInventoryEntry[]>;
   /** Reads a D1 database, returning undefined only for provider absence. */
   getDatabase(databaseId: string): Promise<DatabaseReference | undefined>;
   /** Creates a D1 database and reports a dispatched mutation outcome. */

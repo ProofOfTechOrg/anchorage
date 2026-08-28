@@ -14,16 +14,47 @@ import {
   malformedErrorsBody,
   migrationSpec,
   routeAttestation,
+  seedWorkerFromSpec,
   sharedSecrets,
   throwingConstructorError,
 } from './fixtures/plain-worker-harnesses.js';
+import { mutationFence } from './fixtures/plain-worker-port-probe.js';
 import type { ProviderFailure } from './fixtures/provider-world.js';
+import { providerWorld } from './fixtures/provider-world.js';
 import { describePlainWorkerConformance } from './plain-worker-backend-conformance.js';
 
 afterEach(assertHarnessFailuresConsumed);
 
 // The direct harness creates no Wrangler scratch directory or fs mock state.
 describePlainWorkerConformance('direct Cloudflare API', directHarness);
+
+it('converges public-access config during a staged upload', async () => {
+  const world = providerWorld();
+  const currentSpec = initialSpec();
+  const targetSpec = migrationSpec();
+  seedWorkerFromSpec(world, { spec: currentSpec });
+  const script = world.scripts.get(currentSpec.scriptName);
+  const database = world.databases.find(
+    ({ name }) => name === currentSpec.databaseName,
+  );
+  if (!script || !database) throw new Error('ready Worker seed is incomplete');
+  script.subdomain = { enabled: false, previewsEnabled: false };
+  const harness = directHarness(world);
+
+  await harness.backend.deployWorker(
+    targetSpec,
+    { id: database.databaseId, name: database.name, created: false },
+    sharedSecrets,
+    undefined,
+    mutationFence(),
+    undefined,
+  );
+
+  expect(script.subdomain).toEqual({
+    enabled: true,
+    previewsEnabled: false,
+  });
+});
 
 it('settles an initial upload failure at the REST script request when selected', async () => {
   const harness = directHarness();

@@ -39,6 +39,8 @@ export class PlainWorkerProvisioningApiFake
   readonly absent = new Set<string>();
   readonly scripts = new Set<string>();
   readonly databases = new Map<string, DatabaseReference>();
+  readonly listDatabaseFilters: (Readonly<{ name?: string }> | undefined)[] =
+    [];
   readonly versions = new Map<string, PlainWorkerVersionDetail[]>();
   readonly deployments = new Map<string, PlainWorkerDeploymentStatus>();
   readonly domains: PlainWorkerCustomDomain[] = [];
@@ -158,11 +160,19 @@ export class PlainWorkerProvisioningApiFake
     await this.#request('batchDatabase', undefined);
   }
 
-  async listDatabases(): Promise<readonly PlainWorkerDatabaseInventoryEntry[]> {
-    return [...this.databases.values()].map(({ id, name }) => ({
-      databaseId: id,
-      name,
-    }));
+  async listDatabases(
+    filter?: Readonly<{ name?: string }>,
+  ): Promise<readonly PlainWorkerDatabaseInventoryEntry[]> {
+    this.listDatabaseFilters.push(filter);
+    return [...this.databases.values()]
+      .filter(({ name }) => {
+        // Include partial matches to exercise the core's exact-name check.
+        return filter?.name === undefined || name.includes(filter.name);
+      })
+      .map(({ id, name }) => ({
+        databaseId: id,
+        name,
+      }));
   }
 
   async getDatabase(

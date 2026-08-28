@@ -228,12 +228,21 @@ export class WranglerPlainWorkerProvisioningApi
     return this.#routeApi.disableOrdinaryWorkerPublicAccess(scriptName, fence);
   }
 
-  async listDatabases(): Promise<readonly PlainWorkerDatabaseInventoryEntry[]> {
+  async listDatabases(
+    filter?: Readonly<{ name?: string }>,
+  ): Promise<readonly PlainWorkerDatabaseInventoryEntry[]> {
     const listed = await this.#runner.run(['d1', 'list', '--json']);
-    return asArray(parseJson(listed.stdout, 'd1 list')).map((database) => ({
-      databaseId: readStringField(database, 'uuid'),
-      name: readStringField(database, 'name'),
-    }));
+    // The pinned Wrangler command has no name flag, so the adapter filters
+    // the parsed inventory.
+    return asArray(parseJson(listed.stdout, 'd1 list'))
+      .map((database) => ({
+        databaseId: readStringField(database, 'uuid'),
+        name: readStringField(database, 'name'),
+      }))
+      .filter(
+        (database) =>
+          filter?.name === undefined || database.name === filter.name,
+      );
   }
 
   async getDatabase(

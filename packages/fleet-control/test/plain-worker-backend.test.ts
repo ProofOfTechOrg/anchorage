@@ -248,6 +248,68 @@ describe('PlainWorkerBackend core policy', () => {
     expect(api.queries).toHaveLength(1);
   });
 
+  it('passes the deployment database name to inventory listing', async () => {
+    const api = new PlainWorkerProvisioningApiFake();
+    api.databases.set(database.id, { ...database, created: false });
+
+    await expect(backend(api).findDatabase(spec)).resolves.toEqual({
+      ...database,
+      created: false,
+    });
+    expect(api.listDatabaseFilters).toEqual([{ name: spec.databaseName }]);
+  });
+
+  it('refuses duplicate exact database names', async () => {
+    const api = new PlainWorkerProvisioningApiFake();
+    api.databases.set('database-1', {
+      id: 'database-1',
+      name: spec.databaseName,
+      created: false,
+    });
+    api.databases.set('database-2', {
+      id: 'database-2',
+      name: spec.databaseName,
+      created: false,
+    });
+
+    await expect(backend(api).findDatabase(spec)).rejects.toThrow(
+      `multiple D1 databases are named '${spec.databaseName}'`,
+    );
+  });
+
+  it('refuses a matching database row whose uuid is empty', async () => {
+    const api = new PlainWorkerProvisioningApiFake();
+    api.databases.set('database-id', {
+      id: '',
+      name: spec.databaseName,
+      created: false,
+    });
+
+    await expect(backend(api).findDatabase(spec)).rejects.toThrow(
+      'D1 list result has no uuid',
+    );
+  });
+
+  it('selects an exact database name from search-like inventory', async () => {
+    const api = new PlainWorkerProvisioningApiFake();
+    api.databases.set('database-1', {
+      id: 'database-1',
+      name: 'acme-production',
+      created: false,
+    });
+    api.databases.set('database-2', {
+      id: 'database-2',
+      name: 'acme-production-canary',
+      created: false,
+    });
+
+    await expect(backend(api).findDatabase(spec)).resolves.toEqual({
+      id: 'database-1',
+      name: 'acme-production',
+      created: false,
+    });
+  });
+
   it('rediscovers a tagged upload after a succeeded outcome without reading its footprint', async () => {
     const api = new PlainWorkerProvisioningApiFake();
     installOnUpload(api);

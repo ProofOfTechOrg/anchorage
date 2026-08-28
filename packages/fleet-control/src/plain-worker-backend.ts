@@ -293,7 +293,8 @@ export class PlainWorkerBackend implements ProvisioningBackend {
   async findDatabase(
     spec: DeploymentSpec,
   ): Promise<DatabaseReference | undefined> {
-    const listed = await this.#api.listDatabases();
+    const listed = await this.#api.listDatabases({ name: spec.databaseName });
+    // A name filter narrows the listing toward the name, so compare exactly.
     const matches = listed.filter(
       (database) => database.name === spec.databaseName,
     );
