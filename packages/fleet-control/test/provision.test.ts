@@ -11,6 +11,7 @@ import type {
   BridgeSnapshot,
   FinalizedOrdinaryStateProvider,
 } from '../src/backend-switch.js';
+import { migrateFleet, rollbackExternalRelease } from '../src/fleet.js';
 import {
   canonicalDeploymentEgressPolicy,
   externalEgressProxyScriptName,
@@ -1051,6 +1052,228 @@ describe('fleet provisioning', () => {
       }),
     ).rejects.toThrow(/active backend switch 'domain-detach-authorized'/);
     expect(backend.events).toEqual([]);
+  });
+
+  it('refuses every root lifecycle mutation while decommission advances', async () => {
+    const deployment = spec();
+    const external = spec({
+      authoredBy: 'external',
+      durableObjectMigrations: [],
+      egressProxyService: undefined,
+    });
+    const digest = deploymentSpecDigest(deployment);
+    const operationId = '00000000-0000-4000-8000-000000000001';
+    const cases: readonly Readonly<{
+      name: string;
+      run(input: {
+        backend: FakeBackend;
+        store: MemoryStore;
+        current: FleetRecord;
+      }): Promise<unknown>;
+    }>[] = [
+      {
+        name: 'provisionDeployment',
+        run: ({ backend, store }) =>
+          provisionDeployment({
+            initialExecutionFenceState: 'open',
+            backend,
+            store,
+            spec: deployment,
+            secrets,
+          }),
+      },
+      {
+        name: 'migrateFleet',
+        run: ({ backend, store, current }) =>
+          migrateFleet({
+            store,
+            records: [current],
+            canaryTenantTags: [],
+            backendFor: () => backend,
+            specFor: () => deployment,
+            secretsFor: () => secrets,
+          }),
+      },
+      {
+        name: 'rollbackExternalRelease',
+        run: ({ backend, store }) =>
+          rollbackExternalRelease({
+            store,
+            backend,
+            currentSpec: external,
+            rollbackSpec: external,
+            secrets,
+          }),
+      },
+      {
+        name: 'cleanupDeploymentArtifacts',
+        run: ({ backend, store }) =>
+          cleanupDeploymentArtifacts({ backend, store, spec: deployment }),
+      },
+      {
+        name: 'forceDecommissionDeployment',
+        run: ({ backend, store }) =>
+          forceDecommissionDeployment({
+            backend,
+            store,
+            tenantTag: deployment.tenantTag,
+            environment: deployment.environment,
+          }),
+      },
+      {
+        name: 'decommissionDeployment',
+        run: ({ backend, store }) =>
+          decommissionDeployment({ backend, store, spec: deployment }),
+      },
+    ];
+
+    for (const item of cases) {
+      const backend = new FakeBackend();
+      const store = new MemoryStore();
+      const current: FleetRecord = {
+        tenantTag: deployment.tenantTag,
+        environment: deployment.environment,
+        backend: backend.kind,
+        scriptName: deployment.scriptName,
+        databaseId: backend.databaseId,
+        databaseName: deployment.databaseName,
+        schemaVersion: deployment.schemaVersion,
+        artifactVersion: 'artifact-v3',
+        desiredSpecDigest: digest,
+        durableObjectBindings: [],
+        routeHostname: deployment.routeHostname,
+        phase: 'decommission-advancing',
+        decommissionIntent: {
+          version: 1,
+          operationId,
+          revision: 1,
+          generation: 0,
+          updatedAt: '2026-08-11T00:00:00.000Z',
+          identity: {
+            record: {
+              tenantTag: deployment.tenantTag,
+              environment: deployment.environment,
+              backend: backend.kind,
+              scriptName: deployment.scriptName,
+              databaseId: backend.databaseId,
+              databaseName: deployment.databaseName,
+              routeHostname: deployment.routeHostname,
+            },
+            mode: {
+              kind: 'normal',
+              requestedSpecDigest: digest,
+              entryLifecyclePhase: 'ready',
+            },
+          },
+          lifecyclePhase: 'ready',
+          state: 'transitioning',
+        },
+        updatedAt: '2026-08-11T00:00:00.000Z',
+      };
+      store.record = current;
+
+      await expect(
+        item.run({ backend, store, current }),
+        item.name,
+      ).rejects.toThrow(
+        `${item.name} cannot run during an active decommission`,
+      );
+      expect(backend.events, item.name).toEqual([]);
+      expect(backend.findDatabaseCalls, item.name).toBe(0);
+      expect(backend.databaseIdsRead, item.name).toEqual([]);
+    }
+
+    const raceBackend = new FakeBackend();
+    const advancing: FleetRecord = {
+      tenantTag: deployment.tenantTag,
+      environment: deployment.environment,
+      backend: raceBackend.kind,
+      scriptName: deployment.scriptName,
+      databaseId: raceBackend.databaseId,
+      databaseName: deployment.databaseName,
+      schemaVersion: deployment.schemaVersion,
+      artifactVersion: 'artifact-v3',
+      desiredSpecDigest: digest,
+      durableObjectBindings: [],
+      routeHostname: deployment.routeHostname,
+      phase: 'decommission-advancing',
+      decommissionIntent: {
+        version: 1,
+        operationId,
+        revision: 1,
+        generation: 0,
+        updatedAt: '2026-08-11T00:00:00.000Z',
+        identity: {
+          record: {
+            tenantTag: deployment.tenantTag,
+            environment: deployment.environment,
+            backend: raceBackend.kind,
+            scriptName: deployment.scriptName,
+            databaseId: raceBackend.databaseId,
+            databaseName: deployment.databaseName,
+            routeHostname: deployment.routeHostname,
+          },
+          mode: {
+            kind: 'normal',
+            requestedSpecDigest: digest,
+            entryLifecyclePhase: 'ready',
+          },
+        },
+        lifecyclePhase: 'ready',
+        state: 'transitioning',
+      },
+      updatedAt: '2026-08-11T00:00:00.000Z',
+    };
+    const { decommissionIntent: _decommissionIntent, ...ready } = advancing;
+    const raceStore = new MemoryStore();
+    raceStore.record = advancing;
+    let reads = 0;
+    raceStore.get = async () => {
+      reads += 1;
+      return reads === 1
+        ? ({ ...ready, phase: 'ready' } as FleetRecord)
+        : raceStore.record;
+    };
+    await expect(
+      decommissionDeployment({
+        backend: raceBackend,
+        store: raceStore,
+        spec: deployment,
+      }),
+    ).rejects.toThrow(
+      'decommissionDeployment cannot run during an active decommission',
+    );
+    expect(reads).toBe(2);
+    expect(raceBackend.events).toEqual([]);
+
+    const completeStore = new MemoryStore();
+    const activeIntent = advancing.decommissionIntent;
+    if (!activeIntent || activeIntent.state === 'complete') {
+      throw new Error('missing active decommission intent');
+    }
+    completeStore.record = {
+      ...advancing,
+      phase: 'decommissioned',
+      applicationResources: [],
+      databaseExportLocation: 'r2://exports/database.sqlite',
+      databaseExportSha256: 'f'.repeat(64),
+      databaseExportSize: 128,
+      decommissionIntent: {
+        ...activeIntent,
+        lifecyclePhase: 'decommissioned',
+        state: 'complete',
+      },
+    };
+    await expect(
+      forceDecommissionDeployment({
+        backend: raceBackend,
+        store: completeStore,
+        tenantTag: deployment.tenantTag,
+        environment: deployment.environment,
+      }),
+    ).resolves.toBeUndefined();
+    expect(completeStore.record).toBeUndefined();
+    expect(raceBackend.events).toEqual([]);
   });
 
   it('persists the ordered create phases and returns a ready deployment', async () => {

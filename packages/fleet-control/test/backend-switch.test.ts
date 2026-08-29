@@ -585,6 +585,105 @@ describe('backend switch state machine', () => {
     ).toThrow(/exactly one/);
   });
 
+  it('refuses every backend-switch entry while decommission advances', async () => {
+    const cases: readonly Readonly<{
+      name: string;
+      run(
+        store: MemorySwitchStore,
+        provider: FakeSwitchProvider,
+      ): Promise<unknown>;
+    }>[] = [
+      {
+        name: 'reconcileFinalizedBackendSwitchState',
+        run: (store, provider) =>
+          reconcileFinalizedBackendSwitchState({
+            provider,
+            targetSpec,
+            target,
+            record: store.record,
+            lease: {
+              tenantTag: priorSpec.tenantTag,
+              environment: priorSpec.environment,
+              mutationLeaseTtlMs: 15 * 60_000,
+              assertOwned: async () => {},
+              renew: async () => {},
+              put: async () => {},
+              delete: async () => {},
+            },
+            clock: () => 1_000,
+          }),
+      },
+      {
+        name: 'switchPlainDeploymentToWorkersForPlatforms',
+        run: (store, provider) =>
+          switchPlainDeploymentToWorkersForPlatforms(
+            switchOptions(store, provider),
+          ),
+      },
+      {
+        name: 'rollbackBackendSwitch',
+        run: (store, provider) =>
+          rollbackBackendSwitch({
+            store,
+            provider,
+            priorSpec,
+            targetSpec,
+            secrets,
+          }),
+      },
+      {
+        name: 'finalizeBackendSwitch',
+        run: (store, provider) =>
+          finalizeBackendSwitch({ store, provider, targetSpec }),
+      },
+      {
+        name: 'decommissionBackendSwitch',
+        run: (store, provider) =>
+          decommissionBackendSwitch({ store, provider, priorSpec, targetSpec }),
+      },
+    ];
+
+    for (const item of cases) {
+      const store = new MemorySwitchStore();
+      const provider = new FakeSwitchProvider();
+      const current = store.record;
+      store.record = {
+        ...current,
+        phase: 'decommission-advancing',
+        decommissionIntent: {
+          version: 1,
+          operationId: '00000000-0000-4000-8000-000000000001',
+          revision: 1,
+          generation: 0,
+          updatedAt: '2026-08-11T00:00:00.000Z',
+          identity: {
+            record: {
+              tenantTag: current.tenantTag,
+              environment: current.environment,
+              backend: current.backend,
+              scriptName: current.scriptName,
+              databaseId: current.databaseId,
+              databaseName: current.databaseName,
+              routeHostname: current.routeHostname,
+            },
+            mode: {
+              kind: 'normal',
+              requestedSpecDigest: current.desiredSpecDigest,
+              entryLifecyclePhase: 'ready',
+            },
+          },
+          lifecyclePhase: 'ready',
+          state: 'transitioning',
+        },
+      };
+
+      await expect(item.run(store, provider), item.name).rejects.toThrow(
+        `${item.name} cannot run during an active decommission`,
+      );
+      expect(provider.calls, item.name).toEqual([]);
+    }
+  });
+
   it('persists authorization before every mutation and resumes a lost bridge response', async () => {
     const store = new MemorySwitchStore();
     const provider = new FakeSwitchProvider();

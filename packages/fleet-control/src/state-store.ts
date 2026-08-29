@@ -2,6 +2,11 @@
 
 import { createHash, randomUUID } from 'node:crypto';
 import { backendSwitchIntentFromUnknown } from './backend-switch.js';
+import {
+  DECOMMISSION_INTENT_BYTE_BOUND,
+  decommissionAdvanceIntentFromUnknown,
+  normalizeDecommissionAdvanceIntent,
+} from './decommission-intent.js';
 import { isDeploymentScriptName, isSha256 } from './deployment-context.js';
 import {
   assertPlatformResourcesMatchTarget,
@@ -32,7 +37,7 @@ import type {
   PlatformPlaneStateStore,
   ProvisioningPhase,
 } from './types.js';
-import { PROVISIONING_PHASES } from './types.js';
+import { effectiveLifecyclePhase, PROVISIONING_PHASES } from './types.js';
 import { deploymentKey } from './validation.js';
 
 export interface FleetStateDatabase {
@@ -133,6 +138,7 @@ const FLEET_ROW_COLUMNS = [
   'platform_target',
   'migration_intent',
   'backend_switch_intent',
+  'decommission_intent',
   'durable_object_tag',
   'durable_object_migration_history',
   'durable_object_migration_history_digest',
@@ -158,6 +164,7 @@ const FLEET_ROW_COLUMNS = [
 export const ADDED_NULLABLE_TEXT_COLUMNS = [
   'backend_switch_intent',
   'settled_settlement_key',
+  'decommission_intent',
 ] as const;
 
 function isDuplicateColumnError(
@@ -585,6 +592,138 @@ function optionalPlatformResources(
   };
 }
 
+function invalidDecommissionIntent(): Error {
+  return new Error('fleet state row has invalid decommission_intent');
+}
+
+function optionalDecommissionIntent(
+  value: unknown,
+  record: Omit<FleetRecord, 'decommissionIntent'>,
+): FleetRecord['decommissionIntent'] {
+  if (value === null || value === undefined) return undefined;
+  if (
+    typeof value !== 'string' ||
+    value.length > DECOMMISSION_INTENT_BYTE_BOUND
+  ) {
+    throw invalidDecommissionIntent();
+  }
+  let parsed: unknown;
+  try {
+    if (
+      new TextEncoder().encode(value).byteLength >
+      DECOMMISSION_INTENT_BYTE_BOUND
+    ) {
+      throw invalidDecommissionIntent();
+    }
+    parsed = JSON.parse(value) as unknown;
+    return decommissionAdvanceIntentFromUnknown(parsed, record);
+  } catch {
+    throw invalidDecommissionIntent();
+  }
+}
+
+function validateRecordCrossFields(record: FleetRecord): void {
+  const phase = effectiveLifecyclePhase(record);
+  const {
+    activeRelease,
+    backend,
+    migrationIntent,
+    migrationPriorRelease,
+    outboundPolicy,
+    pendingArtifactVersion,
+    pendingRelease,
+    pendingSpecDigest,
+    platformResources,
+    platformTarget,
+    schemaVersion,
+  } = record;
+  if (
+    (backend === 'workers-for-platforms' && !outboundPolicy) ||
+    (backend === 'plain-worker' && outboundPolicy) ||
+    (platformResources &&
+      (platformResources.outboundPolicy ?? platformResources.egressProxy)
+        ?.policyId !== outboundPolicy?.policyId) ||
+    (platformResources &&
+      JSON.stringify(
+        (platformResources.outboundPolicy ?? platformResources.egressProxy)
+          ?.policyHosts,
+      ) !== JSON.stringify(outboundPolicy?.policyHosts)) ||
+    (platformResources &&
+      (platformResources.outboundPolicy ?? platformResources.egressProxy)
+        ?.policyDigest !== outboundPolicy?.policyDigest)
+  ) {
+    throw new Error('fleet state row has inconsistent outbound_policy');
+  }
+  if (
+    (platformTarget &&
+      JSON.stringify(platformTarget.outboundPolicy) !==
+        JSON.stringify(outboundPolicy)) ||
+    (migrationIntent && phase !== 'migrating') ||
+    (migrationIntent &&
+      migrationIntent.targetSpecDigest !==
+        migrationIntent.targetRelease.specDigest) ||
+    (migrationIntent &&
+      migrationIntent.target.d1SchemaVersion !==
+        (migrationIntent.platformOnly === true
+          ? schemaVersion
+          : migrationIntent.targetRelease.releaseSchemaVersion)) ||
+    (migrationIntent &&
+      JSON.stringify(migrationIntent.priorRelease) !==
+        JSON.stringify(activeRelease)) ||
+    (migrationIntent?.platformOnly === true
+      ? JSON.stringify(migrationIntent.targetRelease) !==
+          JSON.stringify(activeRelease) ||
+        migrationPriorRelease !== undefined ||
+        pendingRelease !== undefined ||
+        ['candidate-deployed', 'candidate-armed'].includes(
+          migrationIntent.subphase,
+        )
+      : migrationIntent !== undefined &&
+        (JSON.stringify(migrationIntent.priorRelease) !==
+          JSON.stringify(migrationPriorRelease) ||
+          JSON.stringify(migrationIntent.targetRelease) !==
+            JSON.stringify(pendingRelease)))
+  ) {
+    throw new Error('fleet state row has inconsistent migration intent');
+  }
+  if (
+    (backend === 'plain-worker' && (platformTarget || migrationIntent)) ||
+    (backend === 'workers-for-platforms' &&
+      platformResources !== undefined &&
+      platformTarget === undefined) ||
+    (backend === 'workers-for-platforms' &&
+      phase === 'migrating' &&
+      migrationIntent === undefined)
+  ) {
+    throw new Error('fleet state row has inconsistent platform target');
+  }
+  if (
+    pendingArtifactVersion !== undefined &&
+    (backend !== 'plain-worker' ||
+      phase !== 'migrating' ||
+      typeof pendingSpecDigest !== 'string' ||
+      pendingArtifactVersion.length === 0 ||
+      pendingArtifactVersion === 'pending')
+  ) {
+    throw new Error('fleet state row has inconsistent pending artifact');
+  }
+  if (platformResources && platformTarget) {
+    assertPlatformResourcesMatchTarget(platformResources, platformTarget);
+  }
+  if (
+    migrationIntent &&
+    [
+      'platform-applied',
+      'candidate-deployed',
+      'candidate-armed',
+      'route-published',
+    ].includes(migrationIntent.subphase) &&
+    JSON.stringify(platformTarget) !== JSON.stringify(migrationIntent.target)
+  ) {
+    throw new Error('fleet state row has inconsistent migration target');
+  }
+}
+
 function toRecord(row: Readonly<Record<string, unknown>>): FleetRecord {
   const backend = rowString(row, 'backend');
   if (backend !== 'plain-worker' && backend !== 'workers-for-platforms') {
@@ -998,97 +1137,7 @@ function toRecord(row: Readonly<Record<string, unknown>>): FleetRecord {
   ) {
     throw new Error('fleet state row has invalid backend_switch_intent');
   }
-  if (
-    (backend === 'workers-for-platforms' && !outboundPolicy) ||
-    (backend === 'plain-worker' && outboundPolicy) ||
-    (platformResources &&
-      (platformResources.outboundPolicy ?? platformResources.egressProxy)
-        ?.policyId !== outboundPolicy?.policyId) ||
-    (platformResources &&
-      JSON.stringify(
-        (platformResources.outboundPolicy ?? platformResources.egressProxy)
-          ?.policyHosts,
-      ) !== JSON.stringify(outboundPolicy?.policyHosts)) ||
-    (platformResources &&
-      (platformResources.outboundPolicy ?? platformResources.egressProxy)
-        ?.policyDigest !== outboundPolicy?.policyDigest)
-  ) {
-    throw new Error('fleet state row has inconsistent outbound_policy');
-  }
-  if (
-    (platformTarget &&
-      JSON.stringify(platformTarget.outboundPolicy) !==
-        JSON.stringify(outboundPolicy)) ||
-    (migrationIntent && phase !== 'migrating') ||
-    (migrationIntent &&
-      migrationIntent.targetSpecDigest !==
-        migrationIntent.targetRelease.specDigest) ||
-    (migrationIntent &&
-      migrationIntent.target.d1SchemaVersion !==
-        (migrationIntent.platformOnly === true
-          ? schemaVersion
-          : migrationIntent.targetRelease.releaseSchemaVersion)) ||
-    (migrationIntent &&
-      JSON.stringify(migrationIntent.priorRelease) !==
-        JSON.stringify(activeRelease)) ||
-    (migrationIntent?.platformOnly === true
-      ? JSON.stringify(migrationIntent.targetRelease) !==
-          JSON.stringify(activeRelease) ||
-        migrationPriorRelease !== undefined ||
-        pendingRelease !== undefined ||
-        ['candidate-deployed', 'candidate-armed'].includes(
-          migrationIntent.subphase,
-        )
-      : migrationIntent !== undefined &&
-        (JSON.stringify(migrationIntent.priorRelease) !==
-          JSON.stringify(migrationPriorRelease) ||
-          JSON.stringify(migrationIntent.targetRelease) !==
-            JSON.stringify(pendingRelease)))
-  ) {
-    throw new Error('fleet state row has inconsistent migration intent');
-  }
-  if (
-    (backend === 'plain-worker' && (platformTarget || migrationIntent)) ||
-    (backend === 'workers-for-platforms' &&
-      platformResources !== undefined &&
-      platformTarget === undefined) ||
-    (backend === 'workers-for-platforms' &&
-      phase === 'migrating' &&
-      migrationIntent === undefined)
-  ) {
-    throw new Error('fleet state row has inconsistent platform target');
-  }
-  if (
-    row.pending_artifact_version !== undefined &&
-    row.pending_artifact_version !== null &&
-    (backend !== 'plain-worker' ||
-      phase !== 'migrating' ||
-      typeof row.pending_spec_digest !== 'string' ||
-      typeof row.pending_artifact_version !== 'string' ||
-      row.pending_artifact_version.length === 0 ||
-      row.pending_artifact_version === 'pending')
-  ) {
-    throw new Error('fleet state row has inconsistent pending artifact');
-  }
-  if (platformResources && platformTarget) {
-    assertPlatformResourcesMatchTarget(platformResources, platformTarget);
-  }
-  if (
-    migrationIntent &&
-    [
-      'platform-applied',
-      'candidate-deployed',
-      'candidate-armed',
-      'route-published',
-    ].includes(migrationIntent.subphase)
-  ) {
-    if (
-      JSON.stringify(platformTarget) !== JSON.stringify(migrationIntent.target)
-    ) {
-      throw new Error('fleet state row has inconsistent migration target');
-    }
-  }
-  return {
+  const provisional: Omit<FleetRecord, 'decommissionIntent'> = {
     tenantTag,
     environment,
     backend,
@@ -1141,6 +1190,51 @@ function toRecord(row: Readonly<Record<string, unknown>>): FleetRecord {
       : {}),
     updatedAt: rowString(row, 'updated_at'),
   };
+  const decommissionIntent = optionalDecommissionIntent(
+    row.decommission_intent,
+    provisional,
+  );
+  if (phase === 'decommission-advancing' && !decommissionIntent) {
+    throw invalidDecommissionIntent();
+  }
+  const record: FleetRecord = {
+    ...provisional,
+    ...(decommissionIntent ? { decommissionIntent } : {}),
+  };
+  validateRecordCrossFields(record);
+  return record;
+}
+
+function normalizeRecordForWrite(record: FleetRecord): FleetRecord {
+  const hasDecommissionIntent = Object.hasOwn(record, 'decommissionIntent');
+  const suppliedDecommissionIntent = record.decommissionIntent;
+  if (hasDecommissionIntent && suppliedDecommissionIntent === undefined) {
+    throw invalidDecommissionIntent();
+  }
+  const provisional = { ...record };
+  delete provisional.decommissionIntent;
+  let decommissionIntent: FleetRecord['decommissionIntent'];
+  try {
+    decommissionIntent = hasDecommissionIntent
+      ? normalizeDecommissionAdvanceIntent(
+          suppliedDecommissionIntent as NonNullable<
+            FleetRecord['decommissionIntent']
+          >,
+          provisional,
+        )
+      : undefined;
+  } catch {
+    throw invalidDecommissionIntent();
+  }
+  const normalized: FleetRecord = {
+    ...provisional,
+    ...(decommissionIntent ? { decommissionIntent } : {}),
+  };
+  if (record.phase === 'decommission-advancing' && !decommissionIntent) {
+    throw invalidDecommissionIntent();
+  }
+  validateRecordCrossFields(normalized);
+  return normalized;
 }
 
 export class D1FleetStateStore
@@ -1207,6 +1301,7 @@ export class D1FleetStateStore
       platform_target TEXT,
       migration_intent TEXT,
       backend_switch_intent TEXT,
+      decommission_intent TEXT,
       durable_object_tag TEXT,
       durable_object_migration_history TEXT,
       durable_object_migration_history_digest TEXT,
@@ -1712,6 +1807,18 @@ export class D1FleetStateStore
         `deployment lease '${tenantTag}:${environment}' cannot write '${record.tenantTag}:${record.environment}'`,
       );
     }
+    record = normalizeRecordForWrite(record);
+    const decommissionIntent = record.decommissionIntent
+      ? JSON.stringify(record.decommissionIntent)
+      : null;
+    if (
+      typeof decommissionIntent === 'string' &&
+      (decommissionIntent.length > DECOMMISSION_INTENT_BYTE_BOUND ||
+        new TextEncoder().encode(decommissionIntent).byteLength >
+          DECOMMISSION_INTENT_BYTE_BOUND)
+    ) {
+      throw invalidDecommissionIntent();
+    }
     if (
       record.migrationIntent &&
       record.backendSwitchIntent &&
@@ -1785,6 +1892,7 @@ export class D1FleetStateStore
       record.backendSwitchIntent
         ? JSON.stringify(record.backendSwitchIntent)
         : null,
+      decommissionIntent,
       record.durableObjectTag ?? null,
       record.durableObjectMigrationHistory
         ? JSON.stringify(record.durableObjectMigrationHistory)
@@ -1808,7 +1916,7 @@ export class D1FleetStateStore
         database_name, schema_version, artifact_version, desired_spec_digest,
         pending_spec_digest, pending_artifact_version, active_release, pending_release, migration_prior_release,
         rollback_release, retiring_release, outbound_policy, platform_resources,
-        platform_target, migration_intent, backend_switch_intent, durable_object_tag,
+        platform_target, migration_intent, backend_switch_intent, decommission_intent, durable_object_tag,
         durable_object_migration_history, durable_object_migration_history_digest,
         durable_object_bindings, application_resources, application_bindings,
         route_hostname, phase,
@@ -1819,7 +1927,7 @@ export class D1FleetStateStore
         WHERE tenant_tag = ? AND environment = ? AND owner_token = ?
           AND expires_at > ${DB_NOW_MS}
       ) THEN ? ELSE NULL END,
-      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
       WHERE true
       ON CONFLICT (tenant_tag, environment) DO UPDATE SET
         backend = excluded.backend,
@@ -1841,6 +1949,7 @@ export class D1FleetStateStore
         platform_target = excluded.platform_target,
         migration_intent = excluded.migration_intent,
         backend_switch_intent = excluded.backend_switch_intent,
+        decommission_intent = excluded.decommission_intent,
         durable_object_tag = excluded.durable_object_tag,
         durable_object_migration_history = excluded.durable_object_migration_history,
         durable_object_migration_history_digest = excluded.durable_object_migration_history_digest,

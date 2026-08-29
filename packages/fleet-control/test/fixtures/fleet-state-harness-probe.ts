@@ -104,6 +104,43 @@ function record(
   };
 }
 
+function decommissionRecord(tenantTag: string, revision: number): FleetRecord {
+  const base = {
+    ...record(tenantTag, 'production'),
+    applicationResources: [],
+    applicationBindings: { vars: [], secrets: [], r2Buckets: [] },
+  };
+  return {
+    ...base,
+    phase: 'decommission-advancing',
+    decommissionIntent: {
+      version: 1,
+      operationId: '123e4567-e89b-42d3-a456-426614174000',
+      revision,
+      generation: 0,
+      updatedAt: `2026-08-11T00:00:${String(revision).padStart(2, '0')}.000Z`,
+      identity: {
+        record: {
+          tenantTag: base.tenantTag,
+          environment: base.environment,
+          backend: base.backend,
+          scriptName: base.scriptName,
+          databaseId: base.databaseId,
+          databaseName: base.databaseName,
+          routeHostname: base.routeHostname,
+        },
+        mode: {
+          kind: 'normal',
+          requestedSpecDigest: base.desiredSpecDigest,
+          entryLifecyclePhase: 'ready',
+        },
+      },
+      lifecyclePhase: 'ready',
+      state: 'transitioning',
+    },
+  };
+}
+
 function errorShape(error: unknown): unknown {
   if (error instanceof AggregateError) {
     return {
@@ -680,19 +717,21 @@ async function crossPlaneClaimExclusion(db: D1Database): Promise<unknown> {
   await store.withDeploymentLease(plain.tenantTag, plain.environment, (lease) =>
     lease.put(plain),
   );
+  const externalPolicy = canonicalDeploymentEgressPolicy({
+    policyId: 'policy-claimc',
+    tenantTag: 'claimc',
+    environment: 'production',
+    allowedHosts: [],
+  });
   const external = {
     ...record('claimc', 'production'),
     backend: 'workers-for-platforms' as const,
     scriptName: plain.scriptName,
-    outboundPolicy: canonicalDeploymentEgressPolicy({
-      policyId: 'policy-claimc',
-      tenantTag: 'claimc',
-      environment: 'production',
-      allowedHosts: [],
-    }),
+    outboundPolicy: externalPolicy,
     platformResources: {
       maintenanceCapabilityPublicKey:
         platformSet.maintenanceCapabilityPublicKey,
+      outboundPolicy: externalPolicy,
       stateWorker: {
         scriptName: plain.scriptName,
         artifactVersion: 'bridge-version',
@@ -701,6 +740,22 @@ async function crossPlaneClaimExclusion(db: D1Database): Promise<unknown> {
         durableObjectBindings: [],
         namespaceIds: [],
       },
+      egressProxy: {
+        scriptName: 'claimc-production-egress',
+        artifactVersion: 'bridge-egress-version',
+        artifactDigest: 'c'.repeat(64),
+        ...externalPolicy,
+      },
+    },
+    platformTarget: {
+      maintenanceCapabilityPublicKey:
+        platformSet.maintenanceCapabilityPublicKey,
+      stateArtifactDigest: 'a'.repeat(64),
+      stateDurableObjectHistoryDigest: 'b'.repeat(64),
+      egressArtifactDigest: 'c'.repeat(64),
+      d1SchemaVersion: 1,
+      d1SchemaHistoryDigest: 'd'.repeat(64),
+      outboundPolicy: externalPolicy,
     },
   };
   let bridgeCollision: unknown;
@@ -789,19 +844,21 @@ async function atomicClaimBatch(db: D1Database): Promise<unknown> {
   await store.withDeploymentLease('atomic', 'production', (lease) =>
     lease.put(intended),
   );
+  const switchedPolicy = canonicalDeploymentEgressPolicy({
+    policyId: 'policy-atomic',
+    tenantTag: 'atomic',
+    environment: 'production',
+    allowedHosts: [],
+  });
   const switched: FleetRecord = {
     ...intended,
     backend: 'workers-for-platforms',
     phase: 'ready',
-    outboundPolicy: canonicalDeploymentEgressPolicy({
-      policyId: 'policy-atomic',
-      tenantTag: 'atomic',
-      environment: 'production',
-      allowedHosts: [],
-    }),
+    outboundPolicy: switchedPolicy,
     platformResources: {
       maintenanceCapabilityPublicKey:
         platformSet.maintenanceCapabilityPublicKey,
+      outboundPolicy: switchedPolicy,
       stateWorker: {
         scriptName: intended.scriptName,
         artifactVersion: 'bridge-version',
@@ -810,6 +867,22 @@ async function atomicClaimBatch(db: D1Database): Promise<unknown> {
         durableObjectBindings: [],
         namespaceIds: [],
       },
+      egressProxy: {
+        scriptName: 'atomic-production-egress',
+        artifactVersion: 'bridge-egress-version',
+        artifactDigest: 'c'.repeat(64),
+        ...switchedPolicy,
+      },
+    },
+    platformTarget: {
+      maintenanceCapabilityPublicKey:
+        platformSet.maintenanceCapabilityPublicKey,
+      stateArtifactDigest: 'a'.repeat(64),
+      stateDurableObjectHistoryDigest: 'b'.repeat(64),
+      egressArtifactDigest: 'c'.repeat(64),
+      d1SchemaVersion: 1,
+      d1SchemaHistoryDigest: 'd'.repeat(64),
+      outboundPolicy: switchedPolicy,
     },
   };
   await store.withDeploymentLease('atomic', 'production', (lease) =>
@@ -963,6 +1036,99 @@ async function backendSwitchColumnUpgrade(db: D1Database): Promise<unknown> {
   };
 }
 
+async function decommissionIntentColumnUpgrade(
+  db: D1Database,
+): Promise<unknown> {
+  await readyStore(db);
+  await db
+    .prepare(`ALTER TABLE ${STATE_TABLE} DROP COLUMN decommission_intent`)
+    .run();
+  const store = new D1FleetStateStore(new D1FleetStateDatabase(db), {
+    accountId: 'account-primary',
+  });
+  const intended = decommissionRecord('intentupgrade', 1);
+  await store.withDeploymentLease(
+    intended.tenantTag,
+    intended.environment,
+    (lease) => lease.put(intended),
+  );
+  const columns = await db
+    .prepare(`PRAGMA table_info(${STATE_TABLE})`)
+    .all<{ name: string }>();
+  const upgraded = await store.get(intended.tenantTag, intended.environment);
+  return {
+    phase: upgraded?.phase,
+    revision: upgraded?.decommissionIntent?.revision,
+    columns: columns.results
+      .map(({ name }) => name)
+      .filter((name) => ADDED_NULLABLE_TEXT_COLUMNS.includes(name as never)),
+  };
+}
+
+async function decommissionIntentLostResponse(
+  db: D1Database,
+): Promise<unknown> {
+  await readyStore(db);
+  const delegate = new D1FleetStateDatabase(db);
+  let lose: 'exact' | 'changed' | undefined = 'exact';
+  const database: FleetStateDatabase = {
+    query: (sql, bindings) => delegate.query(sql, bindings),
+    execute: (sql, bindings) => delegate.execute(sql, bindings),
+    async batch(statements) {
+      const results = await delegate.batch(statements);
+      const failure = lose;
+      if (!failure) return results;
+      lose = undefined;
+      if (failure === 'changed') {
+        await db
+          .prepare(
+            `UPDATE ${STATE_TABLE}
+             SET decommission_intent = json_set(
+               decommission_intent, '$.revision', 3
+             )
+             WHERE tenant_tag = 'intentlost'
+               AND environment = 'production'`,
+          )
+          .run();
+      }
+      throw new Error(`committed ${failure} D1 batch response lost`);
+    },
+  };
+  const store = new D1FleetStateStore(database, {
+    accountId: 'account-primary',
+  });
+  const first = decommissionRecord('intentlost', 1);
+  await store.withDeploymentLease(first.tenantTag, first.environment, (lease) =>
+    lease.put(first),
+  );
+  const exact = await store.get(first.tenantTag, first.environment);
+
+  lose = 'changed';
+  let changedFailure: unknown;
+  try {
+    await store.withDeploymentLease(
+      first.tenantTag,
+      first.environment,
+      (lease) => lease.put(decommissionRecord('intentlost', 2)),
+    );
+  } catch (error) {
+    changedFailure = errorShape(error);
+  }
+  const final = await store.get(first.tenantTag, first.environment);
+  const claim = await db
+    .prepare(
+      `SELECT COUNT(*) AS count FROM ${PLATFORM_CLAIM_TABLE}
+       WHERE resource_set_key = 'deployment:intentlost:production'`,
+    )
+    .first<{ count: number }>();
+  return {
+    exactRevision: exact?.decommissionIntent?.revision,
+    changedFailure,
+    finalRevision: final?.decommissionIntent?.revision,
+    claimCount: Number(claim?.count),
+  };
+}
+
 async function coldConcurrentSchemaInitialization(
   db: D1Database,
 ): Promise<unknown> {
@@ -1085,6 +1251,10 @@ export default {
           return Response.json(await finalLeaseAssertionRollback(env.DB));
         case 'backend-switch-column-upgrade':
           return Response.json(await backendSwitchColumnUpgrade(env.DB));
+        case 'decommission-intent-column-upgrade':
+          return Response.json(await decommissionIntentColumnUpgrade(env.DB));
+        case 'decommission-intent-lost-response':
+          return Response.json(await decommissionIntentLostResponse(env.DB));
         case 'lifecycle-errors':
           return Response.json(await lifecycleErrors(env.DB));
         case 'cloudflare-rate-coordination':

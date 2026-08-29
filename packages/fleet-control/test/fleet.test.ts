@@ -43,6 +43,7 @@ import type {
   FleetStateStore,
   LiveDeployment,
   MaintenanceHealth,
+  NormalDecommissionLifecyclePhase,
   PromotionGuard,
   ProvisioningBackend,
   ProvisioningBackendKind,
@@ -116,6 +117,41 @@ function record(
       d1SchemaVersion: 1,
       d1SchemaHistoryDigest: base.desiredSpecDigest,
       outboundPolicy,
+    },
+  };
+}
+
+function advancingRecord(
+  current: FleetRecord,
+  lifecyclePhase: NormalDecommissionLifecyclePhase,
+): FleetRecord {
+  return {
+    ...current,
+    phase: 'decommission-advancing',
+    decommissionIntent: {
+      version: 1,
+      operationId: '00000000-0000-4000-8000-000000000001',
+      revision: 1,
+      generation: 0,
+      updatedAt: '2026-08-11T00:00:00.000Z',
+      identity: {
+        record: {
+          tenantTag: current.tenantTag,
+          environment: current.environment,
+          backend: current.backend,
+          scriptName: current.scriptName,
+          databaseId: current.databaseId,
+          databaseName: current.databaseName,
+          routeHostname: current.routeHostname,
+        },
+        mode: {
+          kind: 'normal',
+          requestedSpecDigest: current.desiredSpecDigest,
+          entryLifecyclePhase: lifecyclePhase,
+        },
+      },
+      lifecyclePhase,
+      state: 'transitioning',
     },
   };
 }
@@ -2256,6 +2292,47 @@ describe('fleet operations', () => {
         ),
         phase,
       ).toEqual([]);
+    }
+  });
+
+  it('uses effective decommission phases for fleet and R2 expectations', async () => {
+    for (const phase of [
+      'ready',
+      'worker-deleted',
+      'platform-resources-deleted',
+      'application-resources-deleted',
+      'database-exported',
+    ] as const) {
+      const legacy: FleetRecord = {
+        ...record(`effective-${phase}`),
+        phase,
+        applicationResources: [
+          {
+            name: 'FILES',
+            bucketName: `effective-${phase}-bucket`,
+            jurisdiction: 'default',
+            state: 'created',
+            reservationNonce: 'a'.repeat(32),
+            creationDate: '2026-08-11T00:00:00.000Z',
+          },
+        ],
+      };
+      const inventory = inventoryFor([legacy]);
+      const audit = (current: FleetRecord) =>
+        auditFleetDrift({
+          store: storeFor([current]),
+          records: [current],
+          inventory,
+          backendFor: () => new FleetBackend(current.backend),
+          specFor: () => spec(legacy),
+          maintenanceSecretFor: () => 'maintenance-admin-secret-value-00001',
+          staleAfterMs: 1_000,
+          now: 10_000,
+        });
+
+      expect(await audit(advancingRecord(legacy, phase)), phase).toEqual(
+        await audit(legacy),
+      );
     }
   });
 

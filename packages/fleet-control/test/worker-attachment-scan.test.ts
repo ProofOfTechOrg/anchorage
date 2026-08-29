@@ -18,9 +18,20 @@ import {
   parseWorkerAttachmentScanProgress,
   type WorkerAttachment,
   type WorkerAttachmentScanChunk,
+  type WorkerAttachmentScanInput,
   type WorkerAttachmentScanProgress,
   type WorkerAttachmentScanTarget,
 } from '../src/cloudflare-worker-attachment-scan.js';
+import {
+  initialWorkerAttachmentScan as initialWorkerAttachmentScanFromState,
+  parseWorkerAttachmentScanProgress as parseWorkerAttachmentScanProgressFromState,
+  type WorkerAttachment as StateWorkerAttachment,
+  type WorkerAttachmentScanChunk as StateWorkerAttachmentScanChunk,
+  type WorkerAttachmentScanInput as StateWorkerAttachmentScanInput,
+  type WorkerAttachmentScanProgress as StateWorkerAttachmentScanProgress,
+  type WorkerAttachmentScanTarget as StateWorkerAttachmentScanTarget,
+} from '../src/cloudflare-worker-attachment-scan-state.js';
+import type { DecommissionAttachmentProgress } from '../src/index.js';
 import * as fleetRoot from '../src/index.js';
 import {
   type CloudflareFixtureHandler,
@@ -1847,8 +1858,35 @@ describe('Cloudflare Worker attachment scan', () => {
   });
 
   it('keeps the scan friend off the root while retaining its internal callable seam', () => {
+    type Equal<Left, Right> =
+      (<Value>() => Value extends Left ? 1 : 2) extends <
+        Value,
+      >() => Value extends Right ? 1 : 2
+        ? true
+        : false;
+    const movedTypesAreIdentical: readonly [
+      Equal<WorkerAttachment, StateWorkerAttachment>,
+      Equal<WorkerAttachmentScanChunk, StateWorkerAttachmentScanChunk>,
+      Equal<WorkerAttachmentScanInput, StateWorkerAttachmentScanInput>,
+      Equal<WorkerAttachmentScanProgress, StateWorkerAttachmentScanProgress>,
+      Equal<WorkerAttachmentScanTarget, StateWorkerAttachmentScanTarget>,
+    ] = [true, true, true, true, true];
+    const decommissionProgressMatchesScanner: WorkerAttachmentScanProgress extends DecommissionAttachmentProgress
+      ? DecommissionAttachmentProgress extends WorkerAttachmentScanProgress
+        ? true
+        : false
+      : false = true;
+
     expect('advanceCloudflareWorkerAttachmentScan' in fleetRoot).toBe(false);
     expect(typeof advanceCloudflareWorkerAttachmentScan).toBe('function');
+    expect(initialWorkerAttachmentScan).toBe(
+      initialWorkerAttachmentScanFromState,
+    );
+    expect(parseWorkerAttachmentScanProgress).toBe(
+      parseWorkerAttachmentScanProgressFromState,
+    );
+    expect(movedTypesAreIdentical).toEqual([true, true, true, true, true]);
+    expect(decommissionProgressMatchesScanner).toBe(true);
     expect(CLOUDFLARE_SDK_MAX_RETRIES).toBe(2);
     expect(CLOUDFLARE_SDK_MAX_ATTEMPTS).toBe(3);
   });

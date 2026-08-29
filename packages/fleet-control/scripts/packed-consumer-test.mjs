@@ -208,12 +208,24 @@ try {
   type CloudflareApiRateCoordinator,
   type DeploymentEgressPolicy,
   type DeploymentSpec,
+  type DecommissionAdvanceIntent,
+  type DecommissionAdvanceToken,
+  type DecommissionAdvanceTokenClassification,
+  type DecommissionAttachmentProgress,
+  type DecommissionAttachmentPurpose,
+  type DecommissionAttachmentScanEvidence,
+  type DecommissionBlockedAttachment,
+  type DecommissionIntentCommon,
+  type DecommissionOperationIdentity,
+  type DecommissionOperationMode,
+  type DecommissionRecordIdentity,
   type FleetRecord,
   type FleetSettlementContext,
   type FleetSettlementEntry,
   type FleetSettlementHost,
   type FleetStateDatabase,
   type InitialExecutionFenceState,
+  type NormalDecommissionLifecyclePhase,
   type ObservedActiveRoute,
   type PlainWorkerBackendOptions,
   type PlainWorkerCleanupOutcome,
@@ -252,6 +264,18 @@ declare const coordinator: CloudflareApiRateCoordinator;
 declare const deploymentSpec: DeploymentSpec;
 declare const provisioningBackend: ProvisioningBackend;
 declare const fleetRecord: FleetRecord;
+declare const decommissionIntent: DecommissionAdvanceIntent;
+declare const decommissionToken: DecommissionAdvanceToken;
+declare const decommissionClassification: DecommissionAdvanceTokenClassification;
+declare const decommissionProgress: DecommissionAttachmentProgress;
+declare const decommissionPurpose: DecommissionAttachmentPurpose;
+declare const decommissionEvidence: DecommissionAttachmentScanEvidence;
+declare const decommissionAttachment: DecommissionBlockedAttachment;
+declare const decommissionCommon: DecommissionIntentCommon;
+declare const decommissionIdentity: DecommissionOperationIdentity;
+declare const decommissionMode: DecommissionOperationMode;
+declare const decommissionRecordIdentity: DecommissionRecordIdentity;
+declare const decommissionPhase: NormalDecommissionLifecyclePhase;
 declare const plainWorkerRouteApi: PlainWorkerRouteApi;
 declare const plainWorkerProvisioningApiShape: PlainWorkerProvisioningApi;
 const plainWorkerBackendOptions: PlainWorkerBackendOptions = {
@@ -319,6 +343,31 @@ type SettledSettlementKeyIsOptional = {} extends Pick<
 const settledSettlementKeyIsOptional: SettledSettlementKeyIsOptional = true;
 const settledSettlementKey: string | undefined =
   fleetRecord.settledSettlementKey;
+type DecommissionIntentIsOptional = {} extends Pick<
+  FleetRecord,
+  'decommissionIntent'
+>
+  ? true
+  : false;
+const decommissionIntentIsOptional: DecommissionIntentIsOptional = true;
+const storedDecommissionIntent: DecommissionAdvanceIntent | undefined =
+  fleetRecord.decommissionIntent;
+void [
+  decommissionIntent,
+  decommissionToken,
+  decommissionClassification,
+  decommissionProgress,
+  decommissionPurpose,
+  decommissionEvidence,
+  decommissionAttachment,
+  decommissionCommon,
+  decommissionIdentity,
+  decommissionMode,
+  decommissionRecordIdentity,
+  decommissionPhase,
+  decommissionIntentIsOptional,
+  storedDecommissionIntent,
+];
 const customDomain: PlainWorkerCustomDomain = {
   id: 'domain-id',
   hostname: 'acme.example.test',

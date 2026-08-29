@@ -188,6 +188,38 @@ module.exports = {
       },
     },
     {
+      name: 'fleet-control-decommission-state-does-not-reach-provider',
+      severity: 'error',
+      comment:
+        'Persisted decommission state is a provider-free authority boundary. Keeping provider clients, operations, and error classification out of its reachable graph prevents the Fleet D1 codec from acquiring credential or transport dependencies.',
+      from: {
+        path: [
+          '^packages/fleet-control/src/(?:strict-plain-data|cloudflare-worker-attachment-scan-state|decommission-intent|state-store)\\.ts$',
+          '^scripts/architecture-fixtures/decommission-state-imports-provider\\.ts$',
+        ],
+      },
+      to: {
+        path: '(?:^packages/fleet-control/src/(?:cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors)\\.ts$|^cloudflare(?:/|$)|(?:^|/)node_modules/(?:\\.pnpm/)?cloudflare(?:@|/))',
+        reachable: true,
+      },
+    },
+    {
+      name: 'fleet-control-strict-plain-data-is-import-free',
+      severity: 'error',
+      comment:
+        'The descriptor-safe plain-data guard is shared by persisted codecs and must remain an import-free leaf so validation cannot execute package code before it rejects hostile input.',
+      from: {
+        path: [
+          '^packages/fleet-control/src/strict-plain-data\\.ts$',
+          '^scripts/architecture-fixtures/decommission-state-imports-provider\\.ts$',
+        ],
+      },
+      to: {
+        path: '.*',
+        reachable: true,
+      },
+    },
+    {
       name: 'fleet-control-ports-do-not-reach-d1-adapter',
       severity: 'error',
       comment:

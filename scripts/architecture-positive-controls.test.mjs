@@ -42,6 +42,10 @@ const controls = {
     'scripts/architecture-fixtures/host-kit-misses-approval-shapes.ts',
   'fleet-control-client-layers-are-one-way':
     'scripts/architecture-fixtures/fleet-control-leaf-imports-client.ts',
+  'fleet-control-decommission-state-does-not-reach-provider':
+    'scripts/architecture-fixtures/decommission-state-imports-provider.ts',
+  'fleet-control-strict-plain-data-is-import-free':
+    'scripts/architecture-fixtures/decommission-state-imports-provider.ts',
   'fleet-control-ports-do-not-reach-d1-adapter':
     'scripts/architecture-fixtures/fleet-control-port-imports-d1-adapter.ts',
   'fleet-control-worker-reachable-modules-avoid-node-builtins':
@@ -97,6 +101,28 @@ for (const [ruleName, fixture] of Object.entries(controls)) {
       violations.includes(ruleName),
       `${fixture} did not trigger ${ruleName}; got ${violations.join(', ')}`,
     );
+    if (
+      ruleName === 'fleet-control-decommission-state-does-not-reach-provider'
+    ) {
+      assert.ok(
+        report.summary.violations.some(
+          (violation) =>
+            violation.rule.name === ruleName && violation.to === 'cloudflare',
+        ),
+        'decommission state control did not reject a direct Cloudflare SDK import',
+      );
+    }
+    if (ruleName === 'fleet-control-strict-plain-data-is-import-free') {
+      for (const target of ['cloudflare', 'crypto']) {
+        assert.ok(
+          report.summary.violations.some(
+            (violation) =>
+              violation.rule.name === ruleName && violation.to === target,
+          ),
+          `strict plain-data control did not reject ${target}`,
+        );
+      }
+    }
     if (ruleName === 'flowsafe-public-entry-no-breakwater') {
       const entry = report.modules.find((module) => module.source === fixture);
       assert.deepEqual(

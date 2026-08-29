@@ -39,6 +39,7 @@ import type {
   FleetStateLease,
   FleetStateStore,
 } from './types.js';
+import { assertNoActiveDecommission } from './types.js';
 
 export const BACKEND_SWITCH_SUBPHASES = [
   'planned',
@@ -1457,6 +1458,10 @@ export async function reconcileFinalizedBackendSwitchState(input: {
   readonly lease: FleetStateLease;
   readonly clock: () => number;
 }): Promise<FleetRecord> {
+  assertNoActiveDecommission(
+    input.record,
+    'reconcileFinalizedBackendSwitchState',
+  );
   const priorBridge = finalizedBridgeForRecord(input.record);
   const switchIntent = input.record.backendSwitchIntent;
   if (!switchIntent) {
@@ -1714,6 +1719,10 @@ export async function switchPlainDeploymentToWorkersForPlatforms(options: {
     options.priorSpec.tenantTag,
     options.priorSpec.environment,
     async (lease) => {
+      assertNoActiveDecommission(
+        lease.current(),
+        'switchPlainDeploymentToWorkersForPlatforms',
+      );
       let intent = await lease.get();
       if (!intent) {
         const prior = await options.provider.snapshotPlainDeployment(
@@ -1949,6 +1958,7 @@ export async function rollbackBackendSwitch(options: {
     options.priorSpec.tenantTag,
     options.priorSpec.environment,
     async (lease) => {
+      assertNoActiveDecommission(lease.current(), 'rollbackBackendSwitch');
       let intent = await lease.get();
       if (!intent) {
         throw new Error('backend switch has no rollback snapshot');
@@ -2145,6 +2155,7 @@ export async function finalizeBackendSwitch(options: {
     options.targetSpec.tenantTag,
     options.targetSpec.environment,
     async (lease) => {
+      assertNoActiveDecommission(lease.current(), 'finalizeBackendSwitch');
       let intent = await lease.get();
       if (!intent?.bridge || !intent.candidate) {
         throw new Error('backend switch has no finalization snapshot');
@@ -2347,6 +2358,7 @@ export async function decommissionBackendSwitch(options: {
     options.priorSpec.tenantTag,
     options.priorSpec.environment,
     async (lease) => {
+      assertNoActiveDecommission(lease.current(), 'decommissionBackendSwitch');
       let intent = await lease.get();
       if (!intent)
         throw new Error('backend switch has no decommission snapshot');

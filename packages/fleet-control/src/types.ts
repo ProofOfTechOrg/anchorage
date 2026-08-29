@@ -206,6 +206,7 @@ export const PROVISIONING_PHASES = [
   'publishing',
   'migrating',
   'ready',
+  'decommission-advancing',
   'decommissioning',
   'traffic-removed',
   'credentials-revoked',
@@ -316,6 +317,228 @@ export interface ExternalMigrationIntent {
   readonly subphase: ExternalMigrationSubphase;
 }
 
+export type NormalDecommissionLifecyclePhase =
+  | 'publishing'
+  | 'ready'
+  | 'migrating'
+  | 'rolling-back'
+  | 'decommissioning'
+  | 'traffic-removed'
+  | 'credentials-revoked'
+  | 'worker-deleted'
+  | 'platform-credentials-revoked'
+  | 'platform-resources-deleted'
+  | 'application-resources-deleting'
+  | 'application-resources-deleted'
+  | 'database-exported'
+  | 'database-deleting';
+
+export interface DecommissionRecordIdentity {
+  readonly tenantTag: string;
+  readonly environment: string;
+  readonly backend: ProvisioningBackendKind;
+  readonly scriptName: string;
+  readonly databaseId: string;
+  readonly databaseName: string;
+  readonly routeHostname: string;
+}
+
+export type DecommissionOperationMode =
+  | Readonly<{
+      kind: 'normal';
+      requestedSpecDigest: string;
+      entryLifecyclePhase: NormalDecommissionLifecyclePhase;
+    }>
+  | Readonly<{
+      kind: 'backend-switch';
+      priorSpecDigest: string;
+      targetSpecDigest: string;
+      decommissionSnapshotSha256: string;
+      backendSwitchSubphase: import('./backend-switch.js').BackendSwitchSubphase;
+    }>;
+
+export interface DecommissionOperationIdentity {
+  readonly record: DecommissionRecordIdentity;
+  readonly mode: DecommissionOperationMode;
+}
+
+export type DecommissionAttachmentPurpose =
+  | Readonly<{
+      kind: 'application-r2-detach';
+      resourceIndex: number;
+      name: string;
+      bucketName: string;
+      jurisdiction: R2Jurisdiction;
+      reservationNonce: string;
+      creationDate: string;
+    }>
+  | Readonly<{ kind: 'database-pre-export'; databaseId: string }>
+  | Readonly<{
+      kind: 'database-pre-delete';
+      databaseId: string;
+      exportLocation: string;
+      exportSha256: string;
+      exportSize: number;
+    }>;
+
+export type DecommissionBlockedAttachment =
+  | Readonly<{ plane: 'ordinary'; scriptName: string }>
+  | Readonly<{
+      plane: 'dispatch';
+      scriptName: string;
+      dispatchNamespace: string;
+    }>;
+
+export type DecommissionAttachmentProgress =
+  | Readonly<{
+      version: 1;
+      target:
+        | Readonly<{ kind: 'd1'; databaseId: string }>
+        | Readonly<{ kind: 'r2'; bucketName: string }>;
+      evidenceSha256: string;
+      evidenceCount: number;
+      stage: 'ordinary-script-inventory';
+      ordinaryInventorySha256?: string;
+      scriptIndex: number;
+    }>
+  | Readonly<{
+      version: 1;
+      target:
+        | Readonly<{ kind: 'd1'; databaseId: string }>
+        | Readonly<{ kind: 'r2'; bucketName: string }>;
+      evidenceSha256: string;
+      evidenceCount: number;
+      stage: 'ordinary-deployment';
+      ordinaryInventorySha256: string;
+      scriptIndex: number;
+      scriptName: string;
+    }>
+  | Readonly<{
+      version: 1;
+      target:
+        | Readonly<{ kind: 'd1'; databaseId: string }>
+        | Readonly<{ kind: 'r2'; bucketName: string }>;
+      evidenceSha256: string;
+      evidenceCount: number;
+      stage: 'ordinary-version';
+      ordinaryInventorySha256: string;
+      scriptIndex: number;
+      scriptName: string;
+      deploymentSha256: string;
+      versionIndex: number;
+    }>
+  | Readonly<{
+      version: 1;
+      target:
+        | Readonly<{ kind: 'd1'; databaseId: string }>
+        | Readonly<{ kind: 'r2'; bucketName: string }>;
+      evidenceSha256: string;
+      evidenceCount: number;
+      stage: 'dispatch-namespace-inventory';
+      ordinaryInventorySha256: string;
+      namespaceInventorySha256?: string;
+      namespaceIndex: number;
+    }>
+  | Readonly<{
+      version: 1;
+      target:
+        | Readonly<{ kind: 'd1'; databaseId: string }>
+        | Readonly<{ kind: 'r2'; bucketName: string }>;
+      evidenceSha256: string;
+      evidenceCount: number;
+      stage: 'dispatch-script-page';
+      ordinaryInventorySha256: string;
+      namespaceInventorySha256: string;
+      namespaceIndex: number;
+      namespaceName: string;
+      pageStartCursor?: string;
+      pageNumber: number;
+      seenCursorSha256: readonly string[];
+      totalDispatchItems: number;
+      dispatchEvidenceSum256: string;
+      dispatchEvidenceCount: number;
+    }>
+  | Readonly<{
+      version: 1;
+      target:
+        | Readonly<{ kind: 'd1'; databaseId: string }>
+        | Readonly<{ kind: 'r2'; bucketName: string }>;
+      evidenceSha256: string;
+      evidenceCount: number;
+      stage: 'dispatch-script-settings';
+      ordinaryInventorySha256: string;
+      namespaceInventorySha256: string;
+      namespaceIndex: number;
+      namespaceName: string;
+      pageStartCursor?: string;
+      nextCursor?: string;
+      pageSha256: string;
+      pageItemCount: number;
+      itemOffset: number;
+      pageNumber: number;
+      seenCursorSha256: readonly string[];
+      totalDispatchItems: number;
+      dispatchEvidenceSum256: string;
+      dispatchEvidenceCount: number;
+    }>;
+
+export interface DecommissionAttachmentScanEvidence {
+  readonly evidenceSha256: string;
+  readonly evidenceCount: number;
+}
+
+export interface DecommissionIntentCommon {
+  readonly version: 1;
+  readonly operationId: string;
+  readonly revision: number;
+  readonly generation: number;
+  readonly updatedAt: string;
+  readonly identity: DecommissionOperationIdentity;
+  readonly lifecyclePhase: NormalDecommissionLifecyclePhase;
+}
+
+export type DecommissionAdvanceIntent =
+  | (DecommissionIntentCommon & Readonly<{ state: 'transitioning' }>)
+  | (DecommissionIntentCommon &
+      Readonly<{
+        state: 'discover';
+        purpose: DecommissionAttachmentPurpose;
+        progress: DecommissionAttachmentProgress;
+      }>)
+  | (DecommissionIntentCommon &
+      Readonly<{
+        state: 'verify';
+        purpose: DecommissionAttachmentPurpose;
+        progress: DecommissionAttachmentProgress;
+        discoverEvidence: DecommissionAttachmentScanEvidence;
+      }>)
+  | (DecommissionIntentCommon &
+      Readonly<{
+        state: 'blocked';
+        purpose: DecommissionAttachmentPurpose;
+        attachment: DecommissionBlockedAttachment;
+      }>)
+  | Readonly<{
+      version: 1;
+      operationId: string;
+      revision: number;
+      generation: number;
+      updatedAt: string;
+      identity: DecommissionOperationIdentity;
+      lifecyclePhase: 'decommissioned';
+      state: 'complete';
+    }>;
+
+export interface DecommissionAdvanceToken {
+  readonly version: 1;
+  readonly tenantTag: string;
+  readonly environment: string;
+  readonly operationId: string;
+  readonly revision: number;
+}
+
+export type DecommissionAdvanceTokenClassification = 'current' | 'stale';
+
 export interface FleetRecord {
   readonly tenantTag: string;
   readonly backend: ProvisioningBackendKind;
@@ -338,6 +561,7 @@ export interface FleetRecord {
   readonly platformTarget?: ExternalPlatformTargetDescription;
   readonly migrationIntent?: ExternalMigrationIntent;
   readonly backendSwitchIntent?: import('./backend-switch.js').BackendSwitchIntent;
+  readonly decommissionIntent?: DecommissionAdvanceIntent;
   readonly applicationResources?: readonly ApplicationR2Resource[];
   readonly applicationBindings?: ApplicationBindingTopology;
   readonly durableObjectTag?: string;
@@ -361,6 +585,43 @@ export interface FleetRecord {
    */
   readonly settledSettlementKey?: string;
   readonly updatedAt: string;
+}
+
+export function effectiveLifecyclePhase(
+  record: FleetRecord,
+): ProvisioningPhase {
+  const intent = record.decommissionIntent;
+  if (record.phase === 'decommission-advancing') {
+    if (!intent || intent.state === 'complete') {
+      throw new Error(
+        'decommission-advancing record has no active decommission intent',
+      );
+    }
+    return intent.lifecyclePhase;
+  }
+  if (
+    intent &&
+    !(record.phase === 'decommissioned' && intent.state === 'complete')
+  ) {
+    throw new Error('fleet record has inconsistent decommission intent state');
+  }
+  return record.phase;
+}
+
+export function assertNoActiveDecommission(
+  record: FleetRecord,
+  operation: string,
+): void {
+  if (
+    record.phase === 'decommission-advancing' ||
+    (record.decommissionIntent &&
+      !(
+        record.phase === 'decommissioned' &&
+        record.decommissionIntent.state === 'complete'
+      ))
+  ) {
+    throw new Error(`${operation} cannot run during an active decommission`);
+  }
 }
 
 export interface MaintenanceHealth {

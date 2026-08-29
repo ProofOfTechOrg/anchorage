@@ -54,6 +54,10 @@ import type {
   ProvisioningBackend,
 } from './types.js';
 import {
+  assertNoActiveDecommission,
+  effectiveLifecyclePhase,
+} from './types.js';
+import {
   targetDurableObjectTag,
   validateDeploymentSecrets,
   validateDeploymentSpec,
@@ -172,10 +176,11 @@ function pendingArtifactVersion(record: FleetRecord): string | undefined {
 }
 
 function expectsDatabase(record: FleetRecord): boolean {
-  return record.phase !== 'decommissioned';
+  return effectiveLifecyclePhase(record) !== 'decommissioned';
 }
 
 function expectsWorker(record: FleetRecord): boolean {
+  const phase = effectiveLifecyclePhase(record);
   return ![
     'database-reserved',
     'database-create-authorized',
@@ -188,10 +193,11 @@ function expectsWorker(record: FleetRecord): boolean {
     'database-exported',
     'database-deleting',
     'decommissioned',
-  ].includes(record.phase);
+  ].includes(phase);
 }
 
 function expectsRoute(record: FleetRecord): boolean {
+  const phase = effectiveLifecyclePhase(record);
   return [
     'publishing',
     'ready',
@@ -199,10 +205,11 @@ function expectsRoute(record: FleetRecord): boolean {
     'rolling-back',
     'decommissioning',
     'credentials-revoked',
-  ].includes(record.phase);
+  ].includes(phase);
 }
 
 function expectsPlatformResources(record: FleetRecord): boolean {
+  const phase = effectiveLifecyclePhase(record);
   return (
     record.platformResources !== undefined &&
     ![
@@ -210,7 +217,7 @@ function expectsPlatformResources(record: FleetRecord): boolean {
       'database-exported',
       'database-deleting',
       'decommissioned',
-    ].includes(record.phase)
+    ].includes(phase)
   );
 }
 
@@ -222,8 +229,9 @@ function expectedReleaseSnapshots(
   record: FleetRecord,
 ): readonly ExternalReleaseSnapshot[] {
   if (!expectsWorker(record) || record.backend === 'plain-worker') return [];
+  const phase = effectiveLifecyclePhase(record);
   const snapshots = (() => {
-    switch (record.phase) {
+    switch (phase) {
       case 'worker-deployed':
       case 'maintenance-armed':
       case 'publishing':
@@ -277,6 +285,7 @@ function expectedReleaseSnapshots(
 function expectedScriptNames(record: FleetRecord): readonly string[] {
   if (!expectsWorker(record)) return [];
   if (record.backend === 'plain-worker') return [record.scriptName];
+  const phase = effectiveLifecyclePhase(record);
   const releases = expectedReleaseSnapshots(record);
   const names = releases.map((release) => release.physicalScriptName);
   if (
@@ -291,7 +300,7 @@ function expectedScriptNames(record: FleetRecord): readonly string[] {
       'decommissioning',
       'traffic-removed',
       'credentials-revoked',
-    ].includes(record.phase)
+    ].includes(phase)
   ) {
     names.push(record.scriptName);
   }
@@ -699,13 +708,14 @@ export async function auditFleetDrift(options: {
     }
   >();
   for (const record of options.records) {
+    const phase = effectiveLifecyclePhase(record);
     if (
       [
         'application-resources-deleted',
         'database-exported',
         'database-deleting',
         'decommissioned',
-      ].includes(record.phase)
+      ].includes(phase)
     ) {
       continue;
     }
@@ -763,6 +773,7 @@ export async function auditFleetDrift(options: {
   }
 
   for (const record of options.records) {
+    const phase = effectiveLifecyclePhase(record);
     const recordMatches =
       recordsByScript.get(`${record.backend}:${liveScriptName(record)}`) ?? [];
     if (recordMatches.length > 1) {
@@ -778,7 +789,7 @@ export async function auditFleetDrift(options: {
     const inventoryDeployment = inventoryMatches[0];
     const recordUpdatedAt = Date.parse(record.updatedAt);
     if (
-      record.phase !== 'ready' &&
+      phase !== 'ready' &&
       (!Number.isFinite(recordUpdatedAt) ||
         now - recordUpdatedAt > options.staleAfterMs)
     ) {
@@ -786,7 +797,7 @@ export async function auditFleetDrift(options: {
         tenantTag: record.tenantTag,
         environment: record.environment,
         kind: 'incomplete-provisioning',
-        detail: `phase '${record.phase}' has not advanced`,
+        detail: `phase '${phase}' has not advanced`,
       });
     }
     const expectedReleases = expectedReleaseSnapshots(record);
@@ -860,7 +871,7 @@ export async function auditFleetDrift(options: {
         });
       }
     }
-    if (record.phase !== 'ready') continue;
+    if (phase !== 'ready') continue;
     if (!inventoryDeployment) {
       continue;
     }
@@ -1416,6 +1427,7 @@ export async function migrateFleet(options: {
           record.environment,
         );
         if (!stored) throw new Error('fleet migration record disappeared');
+        assertNoActiveDecommission(stored, 'migrateFleet');
         assertBackendSwitchInactive(stored);
         const storedSchemaVersion = stored.schemaVersion;
         const backend = options.backendFor(stored);
@@ -2404,6 +2416,7 @@ export async function rollbackExternalRelease(options: {
         currentSpec.environment,
       );
       if (!stored) throw new Error('rollback deployment is not registered');
+      assertNoActiveDecommission(stored, 'rollbackExternalRelease');
       assertBackendSwitchInactive(stored);
       const finalizedOrdinaryState =
         stored.backendSwitchIntent?.subphase === 'finalized' &&

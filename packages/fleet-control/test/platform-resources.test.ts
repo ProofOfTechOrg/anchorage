@@ -19,6 +19,7 @@ import type {
   ExternalPlatformTargetDescription,
   ExternalReleaseSnapshot,
   FleetRecord,
+  NormalDecommissionLifecyclePhase,
 } from '../src/types.js';
 
 const spec: DeploymentSpec = {
@@ -78,6 +79,41 @@ const ROUTE_EXPECTATION_PHASES = [
   ['candidate-armed', false, 'decommissioning', ['prior', 'target']],
   ['route-published', false, 'credentials-revoked', ['target']],
 ] as const;
+
+function advancingRecord(
+  record: FleetRecord,
+  lifecyclePhase: NormalDecommissionLifecyclePhase,
+): FleetRecord {
+  return {
+    ...record,
+    phase: 'decommission-advancing',
+    decommissionIntent: {
+      version: 1,
+      operationId: '00000000-0000-4000-8000-000000000001',
+      revision: 1,
+      generation: 0,
+      updatedAt: '2026-08-11T00:00:00.000Z',
+      identity: {
+        record: {
+          tenantTag: record.tenantTag,
+          environment: record.environment,
+          backend: record.backend,
+          scriptName: record.scriptName,
+          databaseId: record.databaseId,
+          databaseName: record.databaseName,
+          routeHostname: record.routeHostname,
+        },
+        mode: {
+          kind: 'normal',
+          requestedSpecDigest: record.desiredSpecDigest,
+          entryLifecyclePhase: lifecyclePhase,
+        },
+      },
+      lifecyclePhase,
+      state: 'transitioning',
+    },
+  };
+}
 
 describe('external platform resource identity', () => {
   it.each(
@@ -247,6 +283,70 @@ describe('external platform resource identity', () => {
         item === activeRelease ? 'active' : 'pending',
       ),
     ).toEqual(expected);
+  });
+
+  it('uses the effective lifecycle phase for route authority and diagnostics', () => {
+    const activeRelease: ExternalReleaseSnapshot = {
+      physicalScriptName: 'release-active',
+      specDigest: 'a'.repeat(64),
+      artifactVersion: 'etag-active',
+      releaseSchemaVersion: 2,
+    };
+    const target: ExternalPlatformTargetDescription = {
+      maintenanceCapabilityPublicKey: profile.maintenanceCapabilityPublicKey,
+      stateArtifactDigest: '1'.repeat(64),
+      stateDurableObjectHistoryDigest: '2'.repeat(64),
+      sharedOutboundWorkerName: 'shared-outbound',
+      stateEgressCredentialDigest: '3'.repeat(64),
+      d1SchemaVersion: 2,
+      d1SchemaHistoryDigest: '4'.repeat(64),
+      outboundPolicy: canonicalDeploymentEgressPolicy({
+        policyId: 'policy-acme',
+        tenantTag: 'acme',
+        environment: 'production',
+        allowedHosts: ['api.example.com'],
+      }),
+    };
+    const ready: FleetRecord = {
+      tenantTag: 'acme',
+      environment: 'production',
+      backend: 'workers-for-platforms',
+      scriptName: 'acme-production',
+      databaseId: 'db-acme',
+      databaseName: 'acme-production',
+      schemaVersion: 2,
+      artifactVersion: activeRelease.artifactVersion,
+      desiredSpecDigest: activeRelease.specDigest,
+      activeRelease,
+      platformTarget: target,
+      durableObjectBindings: [],
+      routeHostname: 'acme.example.test',
+      phase: 'ready',
+      updatedAt: '2026-08-11T00:00:00.000Z',
+    };
+
+    expect(externalRouteExpectations(advancingRecord(ready, 'ready'))).toEqual([
+      { release: activeRelease, target },
+    ]);
+    expect(() =>
+      externalRouteExpectations(
+        advancingRecord(
+          {
+            ...ready,
+            pendingRelease: activeRelease,
+            platformTarget: undefined,
+          },
+          'publishing',
+        ),
+      ),
+    ).toThrow(
+      'external publishing route authority has no persisted platform target',
+    );
+    expect(() =>
+      externalRouteExpectations(
+        advancingRecord({ ...ready, activeRelease: undefined }, 'ready'),
+      ),
+    ).toThrow('external ready route authority has no persisted release');
   });
 
   it('rejects publishing without its intended release and platform target', () => {

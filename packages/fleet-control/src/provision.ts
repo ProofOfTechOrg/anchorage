@@ -57,6 +57,7 @@ import type {
   ProvisioningPhase,
   ProvisioningResult,
 } from './types.js';
+import { assertNoActiveDecommission } from './types.js';
 import {
   targetDurableObjectTag,
   validateDeploymentSecrets,
@@ -656,7 +657,10 @@ async function provisionDeploymentUnderLease(
     );
   }
   const prior = await store.get(spec.tenantTag, spec.environment);
-  if (prior) assertBackendSwitchInactive(prior);
+  if (prior) {
+    assertNoActiveDecommission(prior, 'provisionDeployment');
+    assertBackendSwitchInactive(prior);
+  }
   const finalizedOrdinaryState =
     prior?.backendSwitchIntent?.subphase === 'finalized' &&
     prior.platformResources?.stateWorker.plane === 'ordinary';
@@ -1456,7 +1460,10 @@ async function cleanupDeploymentArtifactsUnderLease(
   const { backend, store, spec } = options;
   validateDeploymentSpec(spec);
   let record = await store.get(spec.tenantTag, spec.environment);
-  if (record) assertBackendSwitchInactive(record);
+  if (record) {
+    assertNoActiveDecommission(record, 'cleanupDeploymentArtifacts');
+    assertBackendSwitchInactive(record);
+  }
   if (!record) return;
   assertImmutableDeploymentMapping(record, backend, spec);
   if (record.phase === 'database-reserved') {
@@ -1668,6 +1675,9 @@ export async function decommissionDeployment(
     options.spec.tenantTag,
     options.spec.environment,
   );
+  if (current) {
+    assertNoActiveDecommission(current, 'decommissionDeployment');
+  }
   if (
     current?.backendSwitchIntent &&
     current.backendSwitchIntent.subphase !== 'decommissioned'
@@ -1741,6 +1751,7 @@ export async function forceDecommissionDeployment(
     async (lease) => {
       const current = await input.store.get(input.tenantTag, input.environment);
       if (!current) return;
+      assertNoActiveDecommission(current, 'forceDecommissionDeployment');
       if (current.backend !== input.backend.kind) {
         throw new Error(
           'force-decommission backend does not own this deployment',
@@ -1850,6 +1861,7 @@ async function decommissionDeploymentUnderLease(
   validateDeploymentSpec(spec);
   const current = await store.get(spec.tenantTag, spec.environment);
   if (!current) throw new Error('deployment is not registered');
+  assertNoActiveDecommission(current, 'decommissionDeployment');
   assertBackendSwitchInactive(current);
   if (current.backend !== backend.kind) {
     throw new Error('decommission backend does not own this deployment');

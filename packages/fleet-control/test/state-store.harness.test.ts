@@ -242,6 +242,43 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
     });
   });
 
+  it('upgrades a legacy table and round-trips the decommission shell', async () => {
+    await expect(
+      probe<{
+        phase: string;
+        revision: number;
+        columns: string[];
+      }>('decommission-intent-column-upgrade'),
+    ).resolves.toEqual({
+      phase: 'decommission-advancing',
+      revision: 1,
+      columns: [
+        'backend_switch_intent',
+        'settled_settlement_key',
+        'decommission_intent',
+      ],
+    });
+  });
+
+  it('converges only exact lost decommission writes in real D1', async () => {
+    const result = await probe<{
+      exactRevision: number;
+      changedFailure: ProbeError;
+      finalRevision: number;
+      claimCount: number;
+    }>('decommission-intent-lost-response');
+
+    expect(result).toEqual({
+      exactRevision: 1,
+      changedFailure: {
+        name: 'Error',
+        message: expect.stringContaining('mixed atomic ownership commit'),
+      },
+      finalRevision: 3,
+      claimCount: 1,
+    });
+  });
+
   it('preserves operation, heartbeat, and release errors for both lease types', async () => {
     const result = await probe<{
       deployment: ProbeError;
@@ -289,7 +326,11 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
       }>('cold-concurrent-schema-initialization'),
     ).resolves.toEqual({
       written: Array.from({ length: 16 }, (_, index) => `cold${index}`).sort(),
-      columns: ['backend_switch_intent', 'settled_settlement_key'],
+      columns: [
+        'backend_switch_intent',
+        'settled_settlement_key',
+        'decommission_intent',
+      ],
       rows: 16,
       tables: [
         'anchorage_fleet_deployments',
