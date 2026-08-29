@@ -571,6 +571,50 @@ describe('Cloudflare Worker attachment scan', () => {
     expect(
       result.chunks.map((chunk) => chunk.providerFetchAttemptsReserved),
     ).toContain(9);
+
+    let sdkAttempts = 0;
+    const sdkFixture = recordingFetch(({ url }) => {
+      const target = new URL(url);
+      if (target.pathname.endsWith('/workers/scripts')) {
+        sdkAttempts += 1;
+        return sdkAttempts < 3 ? apiFailure(503) : pageArray([]);
+      }
+      if (target.pathname.endsWith('/workers/dispatch/namespaces')) {
+        return pageArray([]);
+      }
+      throw new Error(`unexpected request ${target.pathname}`);
+    });
+    const sdkResult = await drain(client(sdkFixture.fetch), D1_TARGET, {
+      budget: 9,
+    });
+    expect(sdkResult.terminal).toMatchObject({
+      status: 'complete',
+      providerFetchAttemptsReserved: 6,
+    });
+    expect(sdkAttempts).toBe(CLOUDFLARE_SDK_MAX_ATTEMPTS);
+
+    let ceilingAttempts = 0;
+    const ceilingFixture = recordingFetch(({ url }) => {
+      const target = new URL(url);
+      if (target.pathname.endsWith('/workers/scripts')) {
+        ceilingAttempts += 1;
+        return ceilingAttempts <= CLOUDFLARE_SDK_MAX_ATTEMPTS
+          ? apiFailure(503)
+          : pageArray([]);
+      }
+      if (target.pathname.endsWith('/workers/dispatch/namespaces')) {
+        return pageArray([]);
+      }
+      throw new Error(`unexpected request ${target.pathname}`);
+    });
+    let ceilingError: unknown;
+    try {
+      await drain(client(ceilingFixture.fetch), D1_TARGET, { budget: 9 });
+    } catch (error) {
+      ceilingError = error;
+    }
+    expect(ceilingError).toBeInstanceOf(Error);
+    expect(ceilingAttempts).toBe(CLOUDFLARE_SDK_MAX_ATTEMPTS);
   });
 
   it('resumes an ordinary version index without repeating a committed version read', async () => {
@@ -1570,24 +1614,29 @@ describe('Cloudflare Worker attachment scan', () => {
       drain(client(plainFixture.fetch), D1_TARGET),
     ).rejects.toMatchObject({ status: 404 });
 
-    vi.spyOn(BaseNamespaces.prototype, 'list').mockReturnValueOnce(
-      (async function* () {
-        yield { namespace_name: 'first' };
-        throw Object.assign(new Error('later missing'), { status: 404 });
-      })() as never,
-    );
-    const laterFixture = recordingFetch(({ url }) => {
-      const target = new URL(url);
-      if (target.pathname.endsWith('/workers/scripts')) return pageArray([]);
-      if (target.pathname.endsWith('/namespaces/first/scripts')) {
-        return pageArray([]);
-      }
-      throw new Error(`unexpected request ${target.pathname}`);
-    });
-    await expect(
-      drain(client(laterFixture.fetch, { plainOnly: true }), D1_TARGET),
-    ).rejects.toMatchObject({ status: 404 });
-    vi.restoreAllMocks();
+    const namespaceList = vi
+      .spyOn(BaseNamespaces.prototype, 'list')
+      .mockReturnValueOnce(
+        (async function* () {
+          yield { namespace_name: 'first' };
+          throw Object.assign(new Error('later missing'), { status: 404 });
+        })() as never,
+      );
+    try {
+      const laterFixture = recordingFetch(({ url }) => {
+        const target = new URL(url);
+        if (target.pathname.endsWith('/workers/scripts')) return pageArray([]);
+        if (target.pathname.endsWith('/namespaces/first/scripts')) {
+          return pageArray([]);
+        }
+        throw new Error(`unexpected request ${target.pathname}`);
+      });
+      await expect(
+        drain(client(laterFixture.fetch, { plainOnly: true }), D1_TARGET),
+      ).rejects.toMatchObject({ status: 404 });
+    } finally {
+      namespaceList.mockRestore();
+    }
   });
 
   it('returns attached only for a match and makes no provider call after an early match', async () => {
@@ -1779,9 +1828,18 @@ describe('Cloudflare Worker attachment scan', () => {
       headers.push(request.headers.get('authorization') ?? '');
       return pageArray([], { cursor: 42 as unknown as string });
     });
-    await expect(drain(client(fixture.fetch), D1_TARGET)).rejects.toThrow(
+    let refusal: unknown;
+    try {
+      await drain(client(fixture.fetch), D1_TARGET);
+    } catch (error) {
+      refusal = error;
+    }
+    expect(refusal).toBeInstanceOf(Error);
+    expect((refusal as Error).message).toBe(
       'Cloudflare dispatch script listing returned a malformed cursor',
     );
+    expect(String(refusal)).not.toContain('token');
+    expect(String(refusal)).not.toContain('Bearer');
     expect(headers).toEqual(['Bearer token']);
     expect(
       JSON.stringify(initialWorkerAttachmentScan(D1_TARGET)),

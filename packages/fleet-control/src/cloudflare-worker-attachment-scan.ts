@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { createHash } from 'node:crypto';
-import { CLOUDFLARE_SDK_MAX_ATTEMPTS } from './cloudflare-client-config.js';
+import {
+  CLOUDFLARE_INVENTORY_BOUND,
+  CLOUDFLARE_SDK_MAX_ATTEMPTS,
+} from './cloudflare-client-config.js';
 import type { CloudflareSdk } from './cloudflare-ordinary-worker-operations.js';
 import { isNotFound } from './cloudflare-provider-errors.js';
 
-const INVENTORY_BOUND = 10_000;
 const DISPATCH_PAGE_SIZE = 100;
 const DISPATCH_PAGE_BOUND = 100;
 const PROGRESS_BYTE_BOUND = 65_536;
@@ -14,7 +16,7 @@ const EVIDENCE_BOUND = 1_000_000;
 const PLAIN_DATA_DEPTH_BOUND = 64;
 const PLAIN_DATA_NODE_BOUND = 8_192;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
-const EMPTY_MULTISET_SHA256 = '0'.repeat(64);
+const EMPTY_MULTISET_SUM256 = '0'.repeat(64);
 
 export type WorkerAttachmentScanTarget =
   | Readonly<{ kind: 'd1'; databaseId: string }>
@@ -116,16 +118,26 @@ export type WorkerAttachmentScanChunk =
       providerFetchAttemptsReserved: number;
     }>;
 
+export interface DispatchScriptPageInput {
+  readonly namespace: string;
+  readonly cursor?: string;
+  readonly perPage: number;
+  readonly signal?: AbortSignal;
+}
+
+export interface WorkerAttachmentScanInput {
+  readonly target: WorkerAttachmentScanTarget;
+  readonly progress: WorkerAttachmentScanProgress;
+  readonly maxProviderRequests: number;
+  readonly signal?: AbortSignal;
+  readonly stopOnFirstAttachment?: boolean;
+}
+
 export interface CloudflareWorkerAttachmentScanContext {
   readonly accountId: string;
   readonly client: CloudflareSdk;
   readonly dispatchNamespace?: string;
-  requestDispatchScriptPage(input: {
-    readonly namespace: string;
-    readonly cursor?: string;
-    readonly perPage: number;
-    readonly signal?: AbortSignal;
-  }): Promise<Response>;
+  requestDispatchScriptPage(input: DispatchScriptPageInput): Promise<Response>;
 }
 
 interface NormalizedNamespace {
@@ -142,7 +154,6 @@ interface NormalizedDispatchScript {
 interface DispatchScriptPage {
   readonly scripts: readonly NormalizedDispatchScript[];
   readonly nextCursor?: string;
-  readonly attempts: number;
 }
 
 interface ActiveVersion {
@@ -593,7 +604,7 @@ export function parseWorkerAttachmentScanProgress(
           [...COMMON_KEYS, 'scriptIndex'],
           ['ordinaryInventorySha256'],
         ) ||
-        !safeInteger(record.scriptIndex, INVENTORY_BOUND) ||
+        !safeInteger(record.scriptIndex, CLOUDFLARE_INVENTORY_BOUND) ||
         record.ordinaryInventorySha256 !== undefined ||
         record.scriptIndex !== 0 ||
         common.evidenceCount !== 0 ||
@@ -619,7 +630,7 @@ export function parseWorkerAttachmentScanProgress(
           'scriptName',
         ]) ||
         !hash(record.ordinaryInventorySha256) ||
-        !safeInteger(record.scriptIndex, INVENTORY_BOUND) ||
+        !safeInteger(record.scriptIndex, CLOUDFLARE_INVENTORY_BOUND) ||
         !boundedString(record.scriptName) ||
         common.evidenceCount < record.scriptIndex + 1
       ) {
@@ -644,10 +655,10 @@ export function parseWorkerAttachmentScanProgress(
           'versionIndex',
         ]) ||
         !hash(record.ordinaryInventorySha256) ||
-        !safeInteger(record.scriptIndex, INVENTORY_BOUND) ||
+        !safeInteger(record.scriptIndex, CLOUDFLARE_INVENTORY_BOUND) ||
         !boundedString(record.scriptName) ||
         !hash(record.deploymentSha256) ||
-        !safeInteger(record.versionIndex, INVENTORY_BOUND) ||
+        !safeInteger(record.versionIndex, CLOUDFLARE_INVENTORY_BOUND) ||
         common.evidenceCount < record.scriptIndex + record.versionIndex + 2
       ) {
         return malformed();
@@ -670,7 +681,7 @@ export function parseWorkerAttachmentScanProgress(
           ['namespaceInventorySha256'],
         ) ||
         !hash(record.ordinaryInventorySha256) ||
-        !safeInteger(record.namespaceIndex, INVENTORY_BOUND) ||
+        !safeInteger(record.namespaceIndex, CLOUDFLARE_INVENTORY_BOUND) ||
         record.namespaceInventorySha256 !== undefined ||
         record.namespaceIndex !== 0 ||
         common.evidenceCount < 1
@@ -708,18 +719,21 @@ export function parseWorkerAttachmentScanProgress(
         ) ||
         !hash(record.ordinaryInventorySha256) ||
         !hash(record.namespaceInventorySha256) ||
-        !safeInteger(record.namespaceIndex, INVENTORY_BOUND) ||
+        !safeInteger(record.namespaceIndex, CLOUDFLARE_INVENTORY_BOUND) ||
         !boundedString(record.namespaceName) ||
         (record.pageStartCursor !== undefined &&
           !boundedString(record.pageStartCursor)) ||
         !safeInteger(record.pageNumber, DISPATCH_PAGE_BOUND - 1) ||
         !seen ||
-        !safeInteger(record.totalDispatchItems, INVENTORY_BOUND) ||
+        !safeInteger(record.totalDispatchItems, CLOUDFLARE_INVENTORY_BOUND) ||
         !hash(record.dispatchEvidenceSum256) ||
-        !safeInteger(record.dispatchEvidenceCount, INVENTORY_BOUND) ||
+        !safeInteger(
+          record.dispatchEvidenceCount,
+          CLOUDFLARE_INVENTORY_BOUND,
+        ) ||
         record.dispatchEvidenceCount !== record.totalDispatchItems ||
         (record.dispatchEvidenceCount === 0 &&
-          record.dispatchEvidenceSum256 !== EMPTY_MULTISET_SHA256) ||
+          record.dispatchEvidenceSum256 !== EMPTY_MULTISET_SUM256) ||
         seen.length !== record.pageNumber ||
         !validPageStart(record.pageNumber, record.pageStartCursor, seen) ||
         common.evidenceCount < record.namespaceIndex + 2 ||
@@ -768,7 +782,7 @@ export function parseWorkerAttachmentScanProgress(
         ) ||
         !hash(record.ordinaryInventorySha256) ||
         !hash(record.namespaceInventorySha256) ||
-        !safeInteger(record.namespaceIndex, INVENTORY_BOUND) ||
+        !safeInteger(record.namespaceIndex, CLOUDFLARE_INVENTORY_BOUND) ||
         !boundedString(record.namespaceName) ||
         (record.pageStartCursor !== undefined &&
           !boundedString(record.pageStartCursor)) ||
@@ -780,11 +794,14 @@ export function parseWorkerAttachmentScanProgress(
         !safeInteger(record.itemOffset, record.pageItemCount as number) ||
         !safeInteger(record.pageNumber, DISPATCH_PAGE_BOUND - 1) ||
         !seen ||
-        !safeInteger(record.totalDispatchItems, INVENTORY_BOUND) ||
+        !safeInteger(record.totalDispatchItems, CLOUDFLARE_INVENTORY_BOUND) ||
         !hash(record.dispatchEvidenceSum256) ||
-        !safeInteger(record.dispatchEvidenceCount, INVENTORY_BOUND) ||
+        !safeInteger(
+          record.dispatchEvidenceCount,
+          CLOUDFLARE_INVENTORY_BOUND,
+        ) ||
         (record.dispatchEvidenceCount === 0 &&
-          record.dispatchEvidenceSum256 !== EMPTY_MULTISET_SHA256) ||
+          record.dispatchEvidenceSum256 !== EMPTY_MULTISET_SUM256) ||
         record.totalDispatchItems < record.pageItemCount ||
         record.dispatchEvidenceCount !==
           record.totalDispatchItems -
@@ -911,9 +928,8 @@ function targetMatches(
 }
 
 function bindingsFrom(
-  value: unknown,
+  value: readonly unknown[],
 ): readonly Readonly<Record<string, unknown>>[] {
-  if (!Array.isArray(value)) return [];
   return value.map((binding) => {
     const record = plainRecord(binding);
     if (!record) {
@@ -1011,18 +1027,11 @@ function nextCursorFrom(payload: Record<string, unknown>): string | undefined {
 
 export async function listDispatchScriptPage(
   context: CloudflareWorkerAttachmentScanContext,
-  input: {
-    readonly namespace: string;
-    readonly cursor?: string;
-    readonly perPage: number;
-    readonly signal?: AbortSignal;
-  },
+  input: DispatchScriptPageInput,
 ): Promise<DispatchScriptPage> {
   let response: Response | undefined;
-  let attempts = 0;
   for (let attempt = 0; attempt < CLOUDFLARE_SDK_MAX_ATTEMPTS; attempt += 1) {
     checkSignal(input.signal);
-    attempts += 1;
     response = await context.requestDispatchScriptPage(input);
     if (response.status !== 429 && response.status < 500) break;
   }
@@ -1067,7 +1076,6 @@ export async function listDispatchScriptPage(
   return {
     scripts,
     ...(nextCursor === undefined ? {} : { nextCursor }),
-    attempts,
   };
 }
 
@@ -1088,10 +1096,10 @@ export async function listAllDispatchScripts(
       signal,
     });
     scripts.push(...page.scripts);
-    if (scripts.length > INVENTORY_BOUND) {
+    if (scripts.length > CLOUDFLARE_INVENTORY_BOUND) {
       throw inventoryBoundExceeded(
         'dispatch script inventory',
-        INVENTORY_BOUND,
+        CLOUDFLARE_INVENTORY_BOUND,
       );
     }
     cursor = page.nextCursor;
@@ -1133,10 +1141,10 @@ async function listOrdinaryScripts(
       );
     }
     scripts.push(id);
-    if (scripts.length > INVENTORY_BOUND) {
+    if (scripts.length > CLOUDFLARE_INVENTORY_BOUND) {
       throw inventoryBoundExceeded(
         'ordinary Worker script inventory',
-        INVENTORY_BOUND,
+        CLOUDFLARE_INVENTORY_BOUND,
       );
     }
   }
@@ -1183,10 +1191,10 @@ async function listDispatchNamespaces(
             ? namespace.script_count
             : null,
       });
-      if (namespaces.length > INVENTORY_BOUND) {
+      if (namespaces.length > CLOUDFLARE_INVENTORY_BOUND) {
         throw inventoryBoundExceeded(
           'dispatch namespace inventory',
-          INVENTORY_BOUND,
+          CLOUDFLARE_INVENTORY_BOUND,
         );
       }
     }
@@ -1261,10 +1269,10 @@ function deploymentVersions(
           ? percentage
           : undefined,
     });
-    if (versions.length > INVENTORY_BOUND) {
+    if (versions.length > CLOUDFLARE_INVENTORY_BOUND) {
       throw inventoryBoundExceeded(
         `ordinary Worker '${scriptName}' deployment version inventory`,
-        INVENTORY_BOUND,
+        CLOUDFLARE_INVENTORY_BOUND,
       );
     }
   }
@@ -1334,13 +1342,7 @@ function completeDispatchNamespaceEvidence(
 
 export async function advanceWorkerAttachmentScan(
   context: CloudflareWorkerAttachmentScanContext,
-  input: {
-    readonly target: WorkerAttachmentScanTarget;
-    readonly progress: WorkerAttachmentScanProgress;
-    readonly maxProviderRequests: number;
-    readonly signal?: AbortSignal;
-    readonly stopOnFirstAttachment?: boolean;
-  },
+  input: WorkerAttachmentScanInput,
 ): Promise<WorkerAttachmentScanChunk> {
   let progress = parseWorkerAttachmentScanProgress(
     input.progress,
@@ -1614,7 +1616,7 @@ export async function advanceWorkerAttachmentScan(
           pageNumber: 0,
           seenCursorSha256: [],
           totalDispatchItems: 0,
-          dispatchEvidenceSum256: EMPTY_MULTISET_SHA256,
+          dispatchEvidenceSum256: EMPTY_MULTISET_SUM256,
           dispatchEvidenceCount: 0,
         };
         continue;
@@ -1644,10 +1646,10 @@ export async function advanceWorkerAttachmentScan(
         const pageScripts = canonicalDispatchScripts(page.scripts);
         const totalDispatchItems =
           progress.totalDispatchItems + pageScripts.length;
-        if (totalDispatchItems > INVENTORY_BOUND) {
+        if (totalDispatchItems > CLOUDFLARE_INVENTORY_BOUND) {
           throw inventoryBoundExceeded(
             'dispatch script inventory',
-            INVENTORY_BOUND,
+            CLOUDFLARE_INVENTORY_BOUND,
           );
         }
         let seenCursorSha256 = progress.seenCursorSha256;

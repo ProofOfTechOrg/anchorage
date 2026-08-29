@@ -7,7 +7,10 @@ import { toFile } from 'cloudflare/uploads';
 import PQueue from 'p-queue';
 import { exactActiveVersionId } from './active-route.js';
 import { canonicalApplicationBindings } from './application-bindings.js';
-import { CLOUDFLARE_SDK_MAX_RETRIES } from './cloudflare-client-config.js';
+import {
+  CLOUDFLARE_INVENTORY_BOUND,
+  CLOUDFLARE_SDK_MAX_RETRIES,
+} from './cloudflare-client-config.js';
 import {
   attachCustomDomain,
   type CloudflareSdk,
@@ -47,8 +50,7 @@ import {
   listAllDispatchScripts,
   listAllWorkerAttachments,
   type WorkerAttachmentScanChunk,
-  type WorkerAttachmentScanProgress,
-  type WorkerAttachmentScanTarget,
+  type WorkerAttachmentScanInput,
 } from './cloudflare-worker-attachment-scan.js';
 import type { DurableDatabaseExportStore } from './database-export-store.js';
 import {
@@ -94,7 +96,6 @@ const AUDIT_CONSUMER_SETTINGS = Object.freeze({
   max_wait_time_ms: 5_000,
 });
 const SDK_TRANSPORT_TIMEOUT_MS = 2_147_483_647;
-const DEFAULT_INVENTORY_BOUND = 10_000;
 
 export interface CloudflareClientOptions {
   readonly accountId: string;
@@ -369,13 +370,7 @@ let trackProviderDispatch: <T>(
 
 let scanProviderAttachments: (
   client: CloudflareProvisioningClient,
-  input: {
-    readonly target: WorkerAttachmentScanTarget;
-    readonly progress: WorkerAttachmentScanProgress;
-    readonly maxProviderRequests: number;
-    readonly signal?: AbortSignal;
-    readonly stopOnFirstAttachment?: boolean;
-  },
+  input: WorkerAttachmentScanInput,
 ) => Promise<WorkerAttachmentScanChunk>;
 
 /**
@@ -396,13 +391,7 @@ export function withProviderDispatchTracking<T>(
 /** @internal Package-private seam for the resumable lifecycle engine. */
 export function advanceCloudflareWorkerAttachmentScan(
   client: CloudflareProvisioningClient,
-  input: {
-    readonly target: WorkerAttachmentScanTarget;
-    readonly progress: WorkerAttachmentScanProgress;
-    readonly maxProviderRequests: number;
-    readonly signal?: AbortSignal;
-    readonly stopOnFirstAttachment?: boolean;
-  },
+  input: WorkerAttachmentScanInput,
 ): Promise<WorkerAttachmentScanChunk> {
   return scanProviderAttachments(client, input);
 }
@@ -602,7 +591,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   async *#collectBounded<T>(
     iterable: AsyncIterable<T> | Iterable<T>,
     label: string,
-    max = DEFAULT_INVENTORY_BOUND,
+    max = CLOUDFLARE_INVENTORY_BOUND,
   ): AsyncGenerator<T> {
     let count = 0;
     for await (const item of iterable) {
@@ -1906,12 +1895,12 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
               `R2 bucket '${bucket.name}' has no valid creation date`,
             );
           }
-          if (r2Buckets.length >= DEFAULT_INVENTORY_BOUND) {
+          if (r2Buckets.length >= CLOUDFLARE_INVENTORY_BOUND) {
             // The bound counts only accepted fleet-owned buckets, not every
             // provider item scanned while filtering by prefix.
             throw inventoryBoundExceeded(
               'R2 bucket inventory',
-              DEFAULT_INVENTORY_BOUND,
+              CLOUDFLARE_INVENTORY_BOUND,
             );
           }
           r2Buckets.push({
