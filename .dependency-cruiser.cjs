@@ -191,7 +191,7 @@ module.exports = {
       name: 'fleet-control-ports-do-not-reach-d1-adapter',
       severity: 'error',
       comment:
-        'The D1 adapter implements ports that state-store.ts and migration-ledger.ts declare and imports state-store.ts, so a port module reaching the adapter would close a cycle.',
+        'The D1 adapter implements ports that state-store.ts and migration-ledger.ts declare and imports state-store.ts, which reaches migration-ledger.ts through backend-switch.ts, so a port module reaching the adapter would close a cycle.',
       from: {
         path: [
           '^packages/fleet-control/src/(?:state-store|migration-ledger)\\.ts$',
@@ -207,7 +207,7 @@ module.exports = {
       name: 'fleet-control-worker-reachable-modules-avoid-node-builtins',
       severity: 'error',
       comment:
-        'These modules are the Workers this package publishes plus the R2 export store, the D1 adapter, and the two leaf modules the R2 store imports. The two D1 harnesses set nodejs_compat, so a builtin import in the D1 adapter fails this rule rather than a harness; the R2 export harness runs without the flag.',
+        'These modules are Worker entry points or are reached from one in the import graph, where a Node builtin needs nodejs_compat. The two D1 harnesses set nodejs_compat, so a builtin import in the D1 adapter fails this rule rather than a harness; the R2 export harness runs without the flag.',
       from: {
         path: [
           '^packages/fleet-control/src/(?:d1-fleet-state-database|database-export-store|export-file-name|r2-export-store)\\.ts$',

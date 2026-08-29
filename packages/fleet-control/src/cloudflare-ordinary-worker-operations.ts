@@ -2,9 +2,8 @@
 
 // This module holds ordinary-Worker (plain-plane) provider operations that
 // CloudflareProvisioningClient calls through one-line forwards or directly.
-// Context-taking functions
-// declare the slice of OrdinaryWorkerContext they need; the preparation and
-// migration helpers take no context.
+// Context-taking functions declare the slice of OrdinaryWorkerContext they
+// need; the preparation and migration helpers take no context.
 // Provider requests go through context.client, the client's SDK instance;
 // this module imports nothing from cloudflare-client.ts.
 
