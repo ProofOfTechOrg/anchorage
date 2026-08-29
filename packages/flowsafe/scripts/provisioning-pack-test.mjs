@@ -40,6 +40,7 @@ function invokeProvision(cwd, args, env = {}) {
     cwd,
     env: { ...process.env, ...env },
     encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
     stdio: 'pipe',
   });
 }
@@ -86,6 +87,10 @@ if (sql.startsWith('SELECT name, sql')) {
     ...(state.created ? [{ name: 'flowsafe_deployment', sql: schema }] : []),
     ...(state.fence ? [{ name: FENCE, sql: 'CREATE' }] : []),
   ];
+  const padBytes = Number(process.env.FAKE_WRANGLER_PAD_BYTES ?? 0);
+  if (padBytes > 0) {
+    results.push({ name: 'sqlite_pad', sql: 'x'.repeat(padBytes) });
+  }
 } else if (sql.startsWith('CREATE TABLE IF NOT EXISTS ' + FENCE)) {
   state.fence = true;
   results = [];
@@ -623,6 +628,23 @@ void initialFenceState;
         `packed provisioning CLI passed incorrect preview Wrangler argv: ${JSON.stringify(invocation)}`,
       );
     }
+  }
+
+  writeFileSync(logPath, '');
+  const oversized = invokeProvision(consumerRoot, previewArgs, {
+    FAKE_WRANGLER_LOG: logPath,
+    FAKE_WRANGLER_STATE: statePath,
+    FAKE_WRANGLER_PAD_BYTES: String(1536 * 1024),
+  });
+  if (
+    oversized.status !== 0 ||
+    oversized.stdout !==
+      "Deployment identity 'acme' verified in consumer-db (preview), initial execution fence state 'open'.\n"
+  ) {
+    throw new Error(
+      `packed provisioning CLI failed on a Wrangler response above Node's default spawn capture (status=${oversized.status}, signal=${oversized.signal}, error=${oversized.error?.message ?? 'none'})\n${oversized.stderr}`,
+      { cause: oversized.error },
+    );
   }
 
   writeFileSync(
