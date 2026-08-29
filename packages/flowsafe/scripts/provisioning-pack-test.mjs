@@ -630,7 +630,6 @@ void initialFenceState;
     }
   }
 
-  writeFileSync(logPath, '');
   const oversized = invokeProvision(consumerRoot, previewArgs, {
     FAKE_WRANGLER_LOG: logPath,
     FAKE_WRANGLER_STATE: statePath,
@@ -639,7 +638,8 @@ void initialFenceState;
   if (
     oversized.status !== 0 ||
     oversized.stdout !==
-      "Deployment identity 'acme' verified in consumer-db (preview), initial execution fence state 'open'.\n"
+      "Deployment identity 'acme' verified in consumer-db (preview), initial execution fence state 'open'.\n" ||
+    oversized.stderr !== ''
   ) {
     throw new Error(
       `packed provisioning CLI failed on a Wrangler response above Node's default spawn capture (status=${oversized.status}, signal=${oversized.signal}, error=${oversized.error?.message ?? 'none'})\n${oversized.stderr}`,
