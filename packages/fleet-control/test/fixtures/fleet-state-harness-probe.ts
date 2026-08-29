@@ -19,6 +19,7 @@ import type {
   PlatformPlaneLease,
   PlatformPlaneResourceSet,
 } from '../../src/types.js';
+import { decommissionAdvancingRecordFixture } from './decommission-intent-fixture.js';
 
 interface Env {
   DB: D1Database;
@@ -110,35 +111,12 @@ function decommissionRecord(tenantTag: string, revision: number): FleetRecord {
     applicationResources: [],
     applicationBindings: { vars: [], secrets: [], r2Buckets: [] },
   };
-  return {
-    ...base,
-    phase: 'decommission-advancing',
-    decommissionIntent: {
-      version: 1,
-      operationId: '123e4567-e89b-42d3-a456-426614174000',
-      revision,
-      generation: 0,
-      updatedAt: `2026-08-11T00:00:${String(revision).padStart(2, '0')}.000Z`,
-      identity: {
-        record: {
-          tenantTag: base.tenantTag,
-          environment: base.environment,
-          backend: base.backend,
-          scriptName: base.scriptName,
-          databaseId: base.databaseId,
-          databaseName: base.databaseName,
-          routeHostname: base.routeHostname,
-        },
-        mode: {
-          kind: 'normal',
-          requestedSpecDigest: base.desiredSpecDigest,
-          entryLifecyclePhase: 'ready',
-        },
-      },
-      lifecyclePhase: 'ready',
-      state: 'transitioning',
-    },
-  };
+  return decommissionAdvancingRecordFixture(base, 'ready', {
+    operationId: '123e4567-e89b-42d3-a456-426614174000',
+    revision,
+    generation: 0,
+    updatedAt: `2026-08-11T00:00:${String(revision).padStart(2, '0')}.000Z`,
+  });
 }
 
 function errorShape(error: unknown): unknown {

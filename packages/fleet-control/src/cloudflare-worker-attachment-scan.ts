@@ -8,13 +8,13 @@ import {
 import type { CloudflareSdk } from './cloudflare-ordinary-worker-operations.js';
 import { isNotFound } from './cloudflare-provider-errors.js';
 import {
+  WORKER_ATTACHMENT_CURSOR_BYTE_BOUND as CURSOR_BYTE_BOUND,
+  WORKER_ATTACHMENT_DISPATCH_PAGE_BOUND as DISPATCH_PAGE_BOUND,
+  WORKER_ATTACHMENT_DISPATCH_PAGE_SIZE as DISPATCH_PAGE_SIZE,
+  WORKER_ATTACHMENT_EMPTY_MULTISET_SUM256 as EMPTY_MULTISET_SUM256,
+  WORKER_ATTACHMENT_EVIDENCE_BOUND as EVIDENCE_BOUND,
   initialWorkerAttachmentScan,
   parseWorkerAttachmentScanProgress,
-  WORKER_ATTACHMENT_CURSOR_BYTE_BOUND,
-  WORKER_ATTACHMENT_DISPATCH_PAGE_BOUND,
-  WORKER_ATTACHMENT_DISPATCH_PAGE_SIZE,
-  WORKER_ATTACHMENT_EMPTY_MULTISET_SUM256,
-  WORKER_ATTACHMENT_EVIDENCE_BOUND,
   type WorkerAttachment,
   type WorkerAttachmentScanChunk,
   type WorkerAttachmentScanInput,
@@ -32,12 +32,6 @@ export {
   type WorkerAttachmentScanProgress,
   type WorkerAttachmentScanTarget,
 } from './cloudflare-worker-attachment-scan-state.js';
-
-const DISPATCH_PAGE_SIZE = WORKER_ATTACHMENT_DISPATCH_PAGE_SIZE;
-const DISPATCH_PAGE_BOUND = WORKER_ATTACHMENT_DISPATCH_PAGE_BOUND;
-const CURSOR_BYTE_BOUND = WORKER_ATTACHMENT_CURSOR_BYTE_BOUND;
-const EVIDENCE_BOUND = WORKER_ATTACHMENT_EVIDENCE_BOUND;
-const EMPTY_MULTISET_SUM256 = WORKER_ATTACHMENT_EMPTY_MULTISET_SUM256;
 
 export interface DispatchScriptPageInput {
   readonly namespace: string;

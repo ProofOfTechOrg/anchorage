@@ -37,6 +37,7 @@ import {
   composeLegacyBridgeArtifact,
   LEGACY_APPLICATION_MODULE_PLACEHOLDER,
 } from '../src/workers-for-platforms-backend-switch-provider.js';
+import { decommissionAdvancingRecordFixture } from './fixtures/decommission-intent-fixture.js';
 
 function spec(authoredBy: 'platform' | 'external'): DeploymentSpec {
   return {
@@ -647,35 +648,7 @@ describe('backend switch state machine', () => {
       const store = new MemorySwitchStore();
       const provider = new FakeSwitchProvider();
       const current = store.record;
-      store.record = {
-        ...current,
-        phase: 'decommission-advancing',
-        decommissionIntent: {
-          version: 1,
-          operationId: '00000000-0000-4000-8000-000000000001',
-          revision: 1,
-          generation: 0,
-          updatedAt: '2026-08-11T00:00:00.000Z',
-          identity: {
-            record: {
-              tenantTag: current.tenantTag,
-              environment: current.environment,
-              backend: current.backend,
-              scriptName: current.scriptName,
-              databaseId: current.databaseId,
-              databaseName: current.databaseName,
-              routeHostname: current.routeHostname,
-            },
-            mode: {
-              kind: 'normal',
-              requestedSpecDigest: current.desiredSpecDigest,
-              entryLifecyclePhase: 'ready',
-            },
-          },
-          lifecyclePhase: 'ready',
-          state: 'transitioning',
-        },
-      };
+      store.record = decommissionAdvancingRecordFixture(current, 'ready');
 
       await expect(item.run(store, provider), item.name).rejects.toThrow(
         `${item.name} cannot run during an active decommission`,

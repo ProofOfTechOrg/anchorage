@@ -19,8 +19,8 @@ import type {
   ExternalPlatformTargetDescription,
   ExternalReleaseSnapshot,
   FleetRecord,
-  NormalDecommissionLifecyclePhase,
 } from '../src/types.js';
+import { decommissionAdvancingRecordFixture } from './fixtures/decommission-intent-fixture.js';
 
 const spec: DeploymentSpec = {
   tenantTag: 'acme',
@@ -79,41 +79,6 @@ const ROUTE_EXPECTATION_PHASES = [
   ['candidate-armed', false, 'decommissioning', ['prior', 'target']],
   ['route-published', false, 'credentials-revoked', ['target']],
 ] as const;
-
-function advancingRecord(
-  record: FleetRecord,
-  lifecyclePhase: NormalDecommissionLifecyclePhase,
-): FleetRecord {
-  return {
-    ...record,
-    phase: 'decommission-advancing',
-    decommissionIntent: {
-      version: 1,
-      operationId: '00000000-0000-4000-8000-000000000001',
-      revision: 1,
-      generation: 0,
-      updatedAt: '2026-08-11T00:00:00.000Z',
-      identity: {
-        record: {
-          tenantTag: record.tenantTag,
-          environment: record.environment,
-          backend: record.backend,
-          scriptName: record.scriptName,
-          databaseId: record.databaseId,
-          databaseName: record.databaseName,
-          routeHostname: record.routeHostname,
-        },
-        mode: {
-          kind: 'normal',
-          requestedSpecDigest: record.desiredSpecDigest,
-          entryLifecyclePhase: lifecyclePhase,
-        },
-      },
-      lifecyclePhase,
-      state: 'transitioning',
-    },
-  };
-}
 
 describe('external platform resource identity', () => {
   it.each(
@@ -325,12 +290,14 @@ describe('external platform resource identity', () => {
       updatedAt: '2026-08-11T00:00:00.000Z',
     };
 
-    expect(externalRouteExpectations(advancingRecord(ready, 'ready'))).toEqual([
-      { release: activeRelease, target },
-    ]);
+    expect(
+      externalRouteExpectations(
+        decommissionAdvancingRecordFixture(ready, 'ready'),
+      ),
+    ).toEqual([{ release: activeRelease, target }]);
     expect(() =>
       externalRouteExpectations(
-        advancingRecord(
+        decommissionAdvancingRecordFixture(
           {
             ...ready,
             pendingRelease: activeRelease,
@@ -344,7 +311,10 @@ describe('external platform resource identity', () => {
     );
     expect(() =>
       externalRouteExpectations(
-        advancingRecord({ ...ready, activeRelease: undefined }, 'ready'),
+        decommissionAdvancingRecordFixture(
+          { ...ready, activeRelease: undefined },
+          'ready',
+        ),
       ),
     ).toThrow('external ready route authority has no persisted release');
   });

@@ -43,13 +43,13 @@ import type {
   FleetStateStore,
   LiveDeployment,
   MaintenanceHealth,
-  NormalDecommissionLifecyclePhase,
   PromotionGuard,
   ProvisioningBackend,
   ProvisioningBackendKind,
   SeedDeploymentIdentityOptions,
 } from '../src/types.js';
 import { externalReleaseScriptName } from '../src/workers-for-platforms-backend.js';
+import { decommissionAdvancingRecordFixture } from './fixtures/decommission-intent-fixture.js';
 
 const MAINTENANCE_PUBLIC_KEY =
   '{"kty":"OKP","crv":"Ed25519","alg":"EdDSA","kid":"fleet-maintenance-v1","x":"Lhp1XFeTJJx8FLOCKpn4nkO-tWuZZxXX8ziw0LEvUZo"}';
@@ -117,41 +117,6 @@ function record(
       d1SchemaVersion: 1,
       d1SchemaHistoryDigest: base.desiredSpecDigest,
       outboundPolicy,
-    },
-  };
-}
-
-function advancingRecord(
-  current: FleetRecord,
-  lifecyclePhase: NormalDecommissionLifecyclePhase,
-): FleetRecord {
-  return {
-    ...current,
-    phase: 'decommission-advancing',
-    decommissionIntent: {
-      version: 1,
-      operationId: '00000000-0000-4000-8000-000000000001',
-      revision: 1,
-      generation: 0,
-      updatedAt: '2026-08-11T00:00:00.000Z',
-      identity: {
-        record: {
-          tenantTag: current.tenantTag,
-          environment: current.environment,
-          backend: current.backend,
-          scriptName: current.scriptName,
-          databaseId: current.databaseId,
-          databaseName: current.databaseName,
-          routeHostname: current.routeHostname,
-        },
-        mode: {
-          kind: 'normal',
-          requestedSpecDigest: current.desiredSpecDigest,
-          entryLifecyclePhase: lifecyclePhase,
-        },
-      },
-      lifecyclePhase,
-      state: 'transitioning',
     },
   };
 }
@@ -2330,9 +2295,10 @@ describe('fleet operations', () => {
           now: 10_000,
         });
 
-      expect(await audit(advancingRecord(legacy, phase)), phase).toEqual(
-        await audit(legacy),
-      );
+      expect(
+        await audit(decommissionAdvancingRecordFixture(legacy, phase)),
+        phase,
+      ).toEqual(await audit(legacy));
     }
   });
 

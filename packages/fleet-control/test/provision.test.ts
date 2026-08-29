@@ -55,6 +55,7 @@ import type {
 import { externalReleaseScriptName } from '../src/workers-for-platforms-backend.js';
 import { WranglerLoopBackend } from '../src/wrangler-loop-backend.js';
 import type { CommandResult, CommandRunner } from '../src/wrangler-runner.js';
+import { decommissionAdvancingRecordFixture } from './fixtures/decommission-intent-fixture.js';
 import { memoryStore, routeApi } from './fixtures/plain-worker-port-probe.js';
 import {
   type PlainWorkerFsControl,
@@ -1063,6 +1064,26 @@ describe('fleet provisioning', () => {
     });
     const digest = deploymentSpecDigest(deployment);
     const operationId = '00000000-0000-4000-8000-000000000001';
+    const advancingRecord = (backend: FakeBackend) =>
+      decommissionAdvancingRecordFixture(
+        {
+          tenantTag: deployment.tenantTag,
+          environment: deployment.environment,
+          backend: backend.kind,
+          scriptName: deployment.scriptName,
+          databaseId: backend.databaseId,
+          databaseName: deployment.databaseName,
+          schemaVersion: deployment.schemaVersion,
+          artifactVersion: 'artifact-v3',
+          desiredSpecDigest: digest,
+          durableObjectBindings: [],
+          routeHostname: deployment.routeHostname,
+          phase: 'ready',
+          updatedAt: '2026-08-11T00:00:00.000Z',
+        },
+        'ready',
+        { operationId },
+      );
     const cases: readonly Readonly<{
       name: string;
       run(input: {
@@ -1130,46 +1151,7 @@ describe('fleet provisioning', () => {
     for (const item of cases) {
       const backend = new FakeBackend();
       const store = new MemoryStore();
-      const current: FleetRecord = {
-        tenantTag: deployment.tenantTag,
-        environment: deployment.environment,
-        backend: backend.kind,
-        scriptName: deployment.scriptName,
-        databaseId: backend.databaseId,
-        databaseName: deployment.databaseName,
-        schemaVersion: deployment.schemaVersion,
-        artifactVersion: 'artifact-v3',
-        desiredSpecDigest: digest,
-        durableObjectBindings: [],
-        routeHostname: deployment.routeHostname,
-        phase: 'decommission-advancing',
-        decommissionIntent: {
-          version: 1,
-          operationId,
-          revision: 1,
-          generation: 0,
-          updatedAt: '2026-08-11T00:00:00.000Z',
-          identity: {
-            record: {
-              tenantTag: deployment.tenantTag,
-              environment: deployment.environment,
-              backend: backend.kind,
-              scriptName: deployment.scriptName,
-              databaseId: backend.databaseId,
-              databaseName: deployment.databaseName,
-              routeHostname: deployment.routeHostname,
-            },
-            mode: {
-              kind: 'normal',
-              requestedSpecDigest: digest,
-              entryLifecyclePhase: 'ready',
-            },
-          },
-          lifecyclePhase: 'ready',
-          state: 'transitioning',
-        },
-        updatedAt: '2026-08-11T00:00:00.000Z',
-      };
+      const current = advancingRecord(backend);
       store.record = current;
 
       await expect(
@@ -1184,46 +1166,7 @@ describe('fleet provisioning', () => {
     }
 
     const raceBackend = new FakeBackend();
-    const advancing: FleetRecord = {
-      tenantTag: deployment.tenantTag,
-      environment: deployment.environment,
-      backend: raceBackend.kind,
-      scriptName: deployment.scriptName,
-      databaseId: raceBackend.databaseId,
-      databaseName: deployment.databaseName,
-      schemaVersion: deployment.schemaVersion,
-      artifactVersion: 'artifact-v3',
-      desiredSpecDigest: digest,
-      durableObjectBindings: [],
-      routeHostname: deployment.routeHostname,
-      phase: 'decommission-advancing',
-      decommissionIntent: {
-        version: 1,
-        operationId,
-        revision: 1,
-        generation: 0,
-        updatedAt: '2026-08-11T00:00:00.000Z',
-        identity: {
-          record: {
-            tenantTag: deployment.tenantTag,
-            environment: deployment.environment,
-            backend: raceBackend.kind,
-            scriptName: deployment.scriptName,
-            databaseId: raceBackend.databaseId,
-            databaseName: deployment.databaseName,
-            routeHostname: deployment.routeHostname,
-          },
-          mode: {
-            kind: 'normal',
-            requestedSpecDigest: digest,
-            entryLifecyclePhase: 'ready',
-          },
-        },
-        lifecyclePhase: 'ready',
-        state: 'transitioning',
-      },
-      updatedAt: '2026-08-11T00:00:00.000Z',
-    };
+    const advancing = advancingRecord(raceBackend);
     const { decommissionIntent: _decommissionIntent, ...ready } = advancing;
     const raceStore = new MemoryStore();
     raceStore.record = advancing;

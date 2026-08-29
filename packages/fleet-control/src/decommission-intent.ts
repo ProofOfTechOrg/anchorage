@@ -91,7 +91,7 @@ function malformed(): never {
   throw new DecommissionAdvanceIntentError();
 }
 
-function record(value: unknown): Record<string, unknown> {
+function plainRecord(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return malformed();
   }
@@ -121,7 +121,7 @@ function boundedString(value: unknown): value is string {
   );
 }
 
-function safeInteger(value: unknown, minimum = 0): value is number {
+function safeIntegerAtLeast(value: unknown, minimum = 0): value is number {
   return Number.isSafeInteger(value) && Number(value) >= minimum;
 }
 
@@ -141,7 +141,7 @@ function parseRecordIdentity(
   value: unknown,
   source: FleetRecord,
 ): DecommissionRecordIdentity {
-  const candidate = record(value);
+  const candidate = plainRecord(value);
   exactKeys(candidate, [
     'tenantTag',
     'environment',
@@ -240,10 +240,10 @@ function parseIdentity(
   source: FleetRecord,
   lifecyclePhase: NormalDecommissionLifecyclePhase | 'decommissioned',
 ): DecommissionOperationIdentity {
-  const candidate = record(value);
+  const candidate = plainRecord(value);
   exactKeys(candidate, ['record', 'mode']);
   const stored = parseRecordIdentity(candidate.record, source);
-  const mode = record(candidate.mode);
+  const mode = plainRecord(candidate.mode);
   if (mode.kind === 'backend-switch') return malformed();
   exactKeys(mode, ['kind', 'requestedSpecDigest', 'entryLifecyclePhase']);
   if (
@@ -289,7 +289,7 @@ function parsePurpose(
   purpose: DecommissionAttachmentPurpose;
   target: WorkerAttachmentScanTarget;
 }> {
-  const candidate = record(value);
+  const candidate = plainRecord(value);
   if (candidate.kind === 'application-r2-detach') {
     exactKeys(candidate, [
       'kind',
@@ -302,7 +302,7 @@ function parsePurpose(
     ]);
     if (
       lifecyclePhase !== 'application-resources-deleting' ||
-      !safeInteger(candidate.resourceIndex) ||
+      !safeIntegerAtLeast(candidate.resourceIndex) ||
       !boundedString(candidate.name) ||
       !boundedString(candidate.bucketName) ||
       (candidate.jurisdiction !== 'default' &&
@@ -370,7 +370,7 @@ function parsePurpose(
       candidate.exportLocation !== source.databaseExportLocation ||
       !sha256(candidate.exportSha256) ||
       candidate.exportSha256 !== source.databaseExportSha256 ||
-      !safeInteger(candidate.exportSize, 1) ||
+      !safeIntegerAtLeast(candidate.exportSize, 1) ||
       candidate.exportSize !== source.databaseExportSize
     ) {
       return malformed();
@@ -390,7 +390,7 @@ function parsePurpose(
 }
 
 function parseAttachment(value: unknown): DecommissionBlockedAttachment {
-  const candidate = record(value);
+  const candidate = plainRecord(value);
   if (candidate.plane === 'ordinary') {
     exactKeys(candidate, ['plane', 'scriptName']);
     if (!boundedString(candidate.scriptName)) return malformed();
@@ -411,7 +411,7 @@ function parseAttachment(value: unknown): DecommissionBlockedAttachment {
   };
 }
 
-function common(
+function parseIntentCommon(
   candidate: Record<string, unknown>,
   source: FleetRecord,
 ): DecommissionIntentCommon {
@@ -419,8 +419,8 @@ function common(
     candidate.version !== 1 ||
     typeof candidate.operationId !== 'string' ||
     !UUID_V4.test(candidate.operationId) ||
-    !safeInteger(candidate.revision) ||
-    !safeInteger(candidate.generation) ||
+    !safeIntegerAtLeast(candidate.revision) ||
+    !safeIntegerAtLeast(candidate.generation) ||
     !canonicalIso(candidate.updatedAt)
   ) {
     return malformed();
@@ -445,7 +445,7 @@ function assertCompleteRecord(source: FleetRecord): void {
     ) ||
     !boundedString(source.databaseExportLocation) ||
     !sha256(source.databaseExportSha256) ||
-    !safeInteger(source.databaseExportSize, 1) ||
+    !safeIntegerAtLeast(source.databaseExportSize, 1) ||
     source.pendingSpecDigest !== undefined ||
     source.pendingArtifactVersion !== undefined ||
     source.pendingRelease !== undefined ||
@@ -475,7 +475,7 @@ export function decommissionAdvanceIntentFromUnknown(
   } catch {
     return malformed();
   }
-  const candidate = record(plain);
+  const candidate = plainRecord(plain);
   if (candidate.state === 'complete') {
     exactKeys(candidate, [
       'version',
@@ -491,8 +491,8 @@ export function decommissionAdvanceIntentFromUnknown(
       candidate.version !== 1 ||
       typeof candidate.operationId !== 'string' ||
       !UUID_V4.test(candidate.operationId) ||
-      !safeInteger(candidate.revision) ||
-      !safeInteger(candidate.generation) ||
+      !safeIntegerAtLeast(candidate.revision) ||
+      !safeIntegerAtLeast(candidate.generation) ||
       !canonicalIso(candidate.updatedAt) ||
       candidate.lifecyclePhase !== 'decommissioned'
     ) {
@@ -534,7 +534,7 @@ export function decommissionAdvanceIntentFromUnknown(
     ...stateKeys,
   ]);
   if (source.phase !== 'decommission-advancing') return malformed();
-  const parsedCommon = common(candidate, source);
+  const parsedCommon = parseIntentCommon(candidate, source);
   if (state === 'transitioning') {
     return { ...parsedCommon, state };
   }
@@ -565,11 +565,11 @@ export function decommissionAdvanceIntentFromUnknown(
       progress,
     };
   }
-  const evidence = record(candidate.discoverEvidence);
+  const evidence = plainRecord(candidate.discoverEvidence);
   exactKeys(evidence, ['evidenceSha256', 'evidenceCount']);
   if (
     !sha256(evidence.evidenceSha256) ||
-    !safeInteger(evidence.evidenceCount, 2) ||
+    !safeIntegerAtLeast(evidence.evidenceCount, 2) ||
     evidence.evidenceCount > WORKER_ATTACHMENT_EVIDENCE_BOUND
   ) {
     return malformed();
@@ -610,7 +610,7 @@ export function parseDecommissionAdvanceToken(
   }
   let candidate: Record<string, unknown>;
   try {
-    candidate = record(plain);
+    candidate = plainRecord(plain);
     exactKeys(candidate, [
       'version',
       'tenantTag',
@@ -627,7 +627,7 @@ export function parseDecommissionAdvanceToken(
     !boundedString(candidate.environment) ||
     typeof candidate.operationId !== 'string' ||
     !UUID_V4.test(candidate.operationId) ||
-    !safeInteger(candidate.revision)
+    !safeIntegerAtLeast(candidate.revision)
   ) {
     throw new DecommissionAdvanceTokenError();
   }

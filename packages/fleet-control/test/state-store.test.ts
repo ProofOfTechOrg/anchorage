@@ -15,6 +15,10 @@ import {
   type FleetStateDatabase,
 } from '../src/state-store.js';
 import type { FleetRecord, PlatformPlaneResourceSet } from '../src/types.js';
+import {
+  type NormalDecommissionIntentFixtureOptions,
+  normalDecommissionIntentFixture,
+} from './fixtures/decommission-intent-fixture.js';
 
 const MAINTENANCE_PUBLIC_KEY =
   '{"kty":"OKP","crv":"Ed25519","alg":"EdDSA","kid":"fleet-maintenance-v1","x":"Lhp1XFeTJJx8FLOCKpn4nkO-tWuZZxXX8ziw0LEvUZo"}';
@@ -459,34 +463,15 @@ function decommissionBase(): FleetRecord {
   };
 }
 
-function decommissionIntentCommon(
-  record: FleetRecord,
-  lifecyclePhase: import('../src/types.js').NormalDecommissionLifecyclePhase,
+function decommissionFixtureOptions(
   revision: number,
-) {
+): NormalDecommissionIntentFixtureOptions {
   return {
-    version: 1 as const,
     operationId: DECOMMISSION_OPERATION_ID,
     revision,
     generation: 0,
     updatedAt: `2026-08-11T00:00:${String(revision).padStart(2, '0')}.000Z`,
-    identity: {
-      record: {
-        tenantTag: record.tenantTag,
-        environment: record.environment,
-        backend: record.backend,
-        scriptName: record.scriptName,
-        databaseId: record.databaseId,
-        databaseName: record.databaseName,
-        routeHostname: record.routeHostname,
-      },
-      mode: {
-        kind: 'normal' as const,
-        requestedSpecDigest: record.desiredSpecDigest,
-        entryLifecyclePhase: 'ready' as const,
-      },
-    },
-    lifecyclePhase,
+    entryLifecyclePhase: 'ready',
   };
 }
 
@@ -497,7 +482,11 @@ function transitioningRecord(revision = 0): FleetRecord {
     phase: 'decommission-advancing',
     decommissionIntent: {
       state: 'transitioning',
-      ...decommissionIntentCommon(base, 'ready', revision),
+      ...normalDecommissionIntentFixture(
+        base,
+        'ready',
+        decommissionFixtureOptions(revision),
+      ),
     },
   };
 }
@@ -620,6 +609,44 @@ describe('D1FleetStateStore release state', () => {
     const db = new MemoryD1();
     const store = new D1FleetStateStore(db, { accountId: 'account' });
     const base = decommissionBase();
+    const explicitFixture = normalDecommissionIntentFixture(
+      base,
+      'database-deleting',
+      {
+        operationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        revision: 7,
+        generation: 8,
+        updatedAt: '2026-08-29T12:34:56.789Z',
+        requestedSpecDigest: 'e'.repeat(64),
+        entryLifecyclePhase: 'rolling-back',
+      },
+    );
+    expect(JSON.stringify(explicitFixture)).toBe(
+      JSON.stringify({
+        version: 1,
+        operationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        revision: 7,
+        generation: 8,
+        updatedAt: '2026-08-29T12:34:56.789Z',
+        identity: {
+          record: {
+            tenantTag: base.tenantTag,
+            environment: base.environment,
+            backend: base.backend,
+            scriptName: base.scriptName,
+            databaseId: base.databaseId,
+            databaseName: base.databaseName,
+            routeHostname: base.routeHostname,
+          },
+          mode: {
+            kind: 'normal',
+            requestedSpecDigest: 'e'.repeat(64),
+            entryLifecyclePhase: 'rolling-back',
+          },
+        },
+        lifecyclePhase: 'database-deleting',
+      }),
+    );
     await store.withDeploymentLease('acme', 'production', (lease) =>
       lease.put(base),
     );
@@ -647,23 +674,19 @@ describe('D1FleetStateStore release state', () => {
       pendingSpecDigest,
       pendingArtifactVersion: 'candidate-v1',
     };
-    const migratingCommon = decommissionIntentCommon(
+    const migratingCommon = normalDecommissionIntentFixture(
       migratingBase,
       'migrating',
-      1,
+      {
+        ...decommissionFixtureOptions(1),
+        requestedSpecDigest: pendingSpecDigest,
+        entryLifecyclePhase: 'migrating',
+      },
     );
     const migratingRecord: FleetRecord = {
       ...migratingBase,
       decommissionIntent: {
         ...migratingCommon,
-        identity: {
-          ...migratingCommon.identity,
-          mode: {
-            kind: 'normal',
-            requestedSpecDigest: pendingSpecDigest,
-            entryLifecyclePhase: 'migrating',
-          },
-        },
         state: 'transitioning',
       },
     };
@@ -671,18 +694,27 @@ describe('D1FleetStateStore release state', () => {
       pendingArtifactVersion: _pendingArtifactVersion,
       ...migratingWithoutArtifact
     } = migratingRecord;
+    const transitioning = transitioningRecord();
     const records: FleetRecord[] = [
-      transitioningRecord(),
+      transitioning,
       migratingRecord,
       migratingWithoutArtifact,
       active({
-        ...decommissionIntentCommon(base, 'application-resources-deleted', 1),
+        ...normalDecommissionIntentFixture(
+          base,
+          'application-resources-deleted',
+          decommissionFixtureOptions(1),
+        ),
         state: 'discover',
         purpose,
         progress,
       }),
       active({
-        ...decommissionIntentCommon(base, 'application-resources-deleted', 2),
+        ...normalDecommissionIntentFixture(
+          base,
+          'application-resources-deleted',
+          decommissionFixtureOptions(2),
+        ),
         state: 'verify',
         purpose,
         progress,
@@ -692,14 +724,22 @@ describe('D1FleetStateStore release state', () => {
         },
       }),
       active({
-        ...decommissionIntentCommon(base, 'application-resources-deleted', 3),
+        ...normalDecommissionIntentFixture(
+          base,
+          'application-resources-deleted',
+          decommissionFixtureOptions(3),
+        ),
         state: 'blocked',
         purpose,
         attachment: { plane: 'ordinary', scriptName: 'foreign-worker' },
       }),
       { ...base, phase: 'decommissioned' },
       (() => {
-        const common = decommissionIntentCommon(base, 'database-deleting', 4);
+        const common = normalDecommissionIntentFixture(
+          base,
+          'database-deleting',
+          decommissionFixtureOptions(4),
+        );
         return {
           ...base,
           phase: 'decommissioned',
@@ -722,11 +762,30 @@ describe('D1FleetStateStore release state', () => {
       const roundTripped = await store.get('acme', 'production');
       expect(roundTripped).toEqual(record);
       await expect(store.list()).resolves.toEqual([record]);
-      expect(db.row?.decommission_intent).toBe(
+      const persistedIntent = db.row?.decommission_intent;
+      expect(persistedIntent).toBe(
         roundTripped?.decommissionIntent
           ? JSON.stringify(roundTripped.decommissionIntent)
           : null,
       );
+      if (
+        record.decommissionIntent &&
+        record !== migratingRecord &&
+        record !== migratingWithoutArtifact
+      ) {
+        expect(record.decommissionIntent.identity.mode).toMatchObject({
+          kind: 'normal',
+          entryLifecyclePhase: 'ready',
+        });
+      }
+      if (record === transitioning) {
+        expect(JSON.stringify(record.decommissionIntent)).toMatch(
+          /^\{"state":"transitioning"/u,
+        );
+        expect(persistedIntent).not.toBe(
+          JSON.stringify(record.decommissionIntent),
+        );
+      }
     }
     const persisted = structuredClone(db.row);
     for (const pendingArtifactVersion of ['', 'pending', 42]) {
@@ -1283,28 +1342,14 @@ describe('D1FleetStateStore release state', () => {
       ...record,
       phase: 'decommission-advancing',
       decommissionIntent: {
-        version: 1,
-        operationId: '12345678-1234-4abc-8def-1234567890ab',
-        revision: 0,
-        generation: 0,
-        updatedAt: '2026-08-29T12:00:00.000Z',
-        identity: {
-          record: {
-            tenantTag: record.tenantTag,
-            environment: record.environment,
-            backend: record.backend,
-            scriptName: record.scriptName,
-            databaseId: record.databaseId,
-            databaseName: record.databaseName,
-            routeHostname: record.routeHostname,
-          },
-          mode: {
-            kind: 'normal',
-            requestedSpecDigest: record.migrationIntent.targetSpecDigest,
-            entryLifecyclePhase: 'migrating',
-          },
-        },
-        lifecyclePhase: 'migrating',
+        ...normalDecommissionIntentFixture(record, 'migrating', {
+          operationId: '12345678-1234-4abc-8def-1234567890ab',
+          revision: 0,
+          generation: 0,
+          updatedAt: '2026-08-29T12:00:00.000Z',
+          requestedSpecDigest: record.migrationIntent.targetSpecDigest,
+          entryLifecyclePhase: 'migrating',
+        }),
         state: 'transitioning',
       },
     };

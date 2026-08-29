@@ -163,8 +163,10 @@ export function cloneBoundedPlainData(
   value: unknown,
   options: BoundedPlainDataOptions,
 ): unknown {
+  let result: PlainDataResult = { valid: false };
+  let serializedWithinBound = false;
   try {
-    if (
+    const invalidOptions =
       !Number.isSafeInteger(options.maxDepth) ||
       options.maxDepth < 0 ||
       !Number.isSafeInteger(options.maxNodes) ||
@@ -172,21 +174,19 @@ export function cloneBoundedPlainData(
       !Number.isSafeInteger(options.maxScalarBytes) ||
       options.maxScalarBytes < 0 ||
       !Number.isSafeInteger(options.maxSerializedBytes) ||
-      options.maxSerializedBytes < 0
-    ) {
-      throw new Error('invalid bounded plain-data options');
+      options.maxSerializedBytes < 0;
+    if (!invalidOptions) {
+      result = clonePlainData(value, options, new Set<object>(), 0, {
+        nodes: 0,
+        scalarUtf8Bytes: 0,
+      });
+      serializedWithinBound =
+        result.valid &&
+        utf8Length(JSON.stringify(result.value)) <= options.maxSerializedBytes;
     }
-    const result = clonePlainData(value, options, new Set<object>(), 0, {
-      nodes: 0,
-      scalarUtf8Bytes: 0,
-    });
-    if (!result.valid) throw new Error('invalid bounded plain data');
-    const serialized = JSON.stringify(result.value);
-    if (utf8Length(serialized) > options.maxSerializedBytes) {
-      throw new Error('bounded plain data exceeded serialized limit');
-    }
-    return result.value;
   } catch {
     throw options.error();
   }
+  if (!result.valid || !serializedWithinBound) throw options.error();
+  return result.value;
 }

@@ -135,34 +135,59 @@ describe('bounded plain data', () => {
 
   it('throws the exact error supplied by the caller for every refusal', () => {
     const refusal = new Error('fixed refusal');
-    let captured: unknown;
-    try {
-      cloneBoundedPlainData(
-        Symbol('not-json'),
-        limits(() => refusal),
-      );
-    } catch (error) {
-      captured = error;
-    }
-    expect(captured).toBe(refusal);
+    const assertFixedRefusal = (operation: (error: () => Error) => unknown) => {
+      const error = vi.fn(() => refusal);
+      let captured: unknown;
+      try {
+        operation(error);
+      } catch (failure) {
+        captured = failure;
+      }
+      expect(captured).toBe(refusal);
+      expect(error).toHaveBeenCalledOnce();
+    };
 
-    const trapped = new Proxy(
-      {},
-      {
-        getPrototypeOf: () => {
-          throw new Error('hostile trap');
-        },
-      },
+    assertFixedRefusal((error) =>
+      cloneBoundedPlainData(null, { ...limits(error), maxDepth: -1 }),
     );
-    captured = undefined;
-    try {
+    assertFixedRefusal((error) =>
+      cloneBoundedPlainData(Symbol('not-json'), limits(error)),
+    );
+    assertFixedRefusal((error) =>
       cloneBoundedPlainData(
-        trapped,
-        limits(() => refusal),
+        { a: 0 },
+        { ...limits(error), maxSerializedBytes: 6 },
+      ),
+    );
+    assertFixedRefusal((error) =>
+      cloneBoundedPlainData(
+        new Proxy(
+          {},
+          {
+            getPrototypeOf: () => {
+              throw new Error('hostile trap');
+            },
+          },
+        ),
+        limits(error),
+      ),
+    );
+
+    const encode = vi
+      .spyOn(TextEncoder.prototype, 'encode')
+      .mockImplementation(() => {
+        throw new Error('hostile encoder');
+      });
+    try {
+      assertFixedRefusal((error) =>
+        cloneBoundedPlainData('value', limits(error)),
       );
-    } catch (error) {
-      captured = error;
+    } finally {
+      encode.mockRestore();
     }
-    expect(captured).toBe(refusal);
+
+    const successError = vi.fn(() => refusal);
+    expect(cloneBoundedPlainData(null, limits(successError))).toBeNull();
+    expect(successError).not.toHaveBeenCalled();
   });
 });
