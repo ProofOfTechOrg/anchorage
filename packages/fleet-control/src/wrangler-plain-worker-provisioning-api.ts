@@ -81,6 +81,9 @@ export class WranglerPlainWorkerProvisioningApi
     | NonNullable<PlainWorkerRouteApi['deleteDatabase']>
     | undefined;
   readonly maxMutationDurationMs: number;
+  declare readonly advanceDecommissionAttachmentScan?: NonNullable<
+    PlainWorkerRouteApi['advanceDecommissionAttachmentScan']
+  >;
   readonly listWorkerR2Attachments:
     | NonNullable<PlainWorkerRouteApi['listWorkerR2Attachments']>
     | undefined;
@@ -114,6 +117,12 @@ export class WranglerPlainWorkerProvisioningApi
       options.routeApi,
     );
     this.maxMutationDurationMs = options.runner.maxDurationMs;
+    const advanceDecommissionAttachmentScan =
+      options.routeApi.advanceDecommissionAttachmentScan;
+    if (typeof advanceDecommissionAttachmentScan === 'function') {
+      this.advanceDecommissionAttachmentScan =
+        advanceDecommissionAttachmentScan.bind(options.routeApi);
+    }
     this.listWorkerR2Attachments =
       options.routeApi.listWorkerR2Attachments?.bind(options.routeApi);
     this.getR2Bucket = options.routeApi.getR2Bucket?.bind(options.routeApi);

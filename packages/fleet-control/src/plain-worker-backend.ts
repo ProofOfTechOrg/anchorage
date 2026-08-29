@@ -240,6 +240,9 @@ export function resolveMaintenanceRequestTimeoutMs(
  */
 export class PlainWorkerBackend implements ProvisioningBackend {
   readonly kind = 'plain-worker' as const;
+  declare readonly advanceDecommissionAttachmentScan?: NonNullable<
+    ProvisioningBackend['advanceDecommissionAttachmentScan']
+  >;
   readonly #api: PlainWorkerProvisioningApi;
   readonly #identityCaller: string;
   readonly #fetch: typeof fetch;
@@ -263,6 +266,12 @@ export class PlainWorkerBackend implements ProvisioningBackend {
     this.#fetch = options.fetch ?? fetch;
     this.#maintenanceRequestTimeoutMs = maintenanceRequestTimeoutMs;
     this.#clock = options.clock ?? Date.now;
+    const advanceDecommissionAttachmentScan =
+      options.api.advanceDecommissionAttachmentScan;
+    if (typeof advanceDecommissionAttachmentScan === 'function') {
+      this.advanceDecommissionAttachmentScan =
+        advanceDecommissionAttachmentScan.bind(options.api);
+    }
   }
 
   #assertMutationDuration(fence: ExternalMutationFence): void {
@@ -911,7 +920,7 @@ export class PlainWorkerBackend implements ProvisioningBackend {
     return status.versions[0]?.id;
   }
 
-  async assertDatabaseDetached(
+  async #assertDatabaseResidualIdentity(
     spec: DeploymentSpec,
     record: FleetRecord,
     database: DatabaseReference,
@@ -933,19 +942,13 @@ export class PlainWorkerBackend implements ProvisioningBackend {
         `refusing to attest database detachment for mismatched fleet record '${record.tenantTag}:${record.environment}'`,
       );
     }
-    const databaseAttachments = await this.#api.listWorkerDatabaseAttachments(
-      database.id,
-    );
-    if (databaseAttachments.length > 0) {
-      throw new Error(
-        `database '${record.databaseId}' remains attached to ${databaseAttachments
-          .map(
-            (attachment) =>
-              `${attachment.plane} Worker '${attachment.scriptName}'`,
-          )
-          .join(', ')}`,
-      );
-    }
+  }
+
+  async #assertDatabaseResidualTail(
+    spec: DeploymentSpec,
+    record: FleetRecord,
+    fence: ExternalMutationFence,
+  ): Promise<void> {
     const [status, versions, domains, footprint, namespaceIds] =
       await Promise.all([
         this.#deploymentStatus(spec),
@@ -1034,6 +1037,39 @@ export class PlainWorkerBackend implements ProvisioningBackend {
     throw new Error(
       `database '${record.databaseId}' remains attached to owned Worker '${spec.scriptName}'`,
     );
+  }
+
+  async assertDatabaseDeletionResidualsRemoved(
+    spec: DeploymentSpec,
+    record: FleetRecord,
+    database: DatabaseReference,
+    fence: ExternalMutationFence,
+  ): Promise<void> {
+    await this.#assertDatabaseResidualIdentity(spec, record, database, fence);
+    await this.#assertDatabaseResidualTail(spec, record, fence);
+  }
+
+  async assertDatabaseDetached(
+    spec: DeploymentSpec,
+    record: FleetRecord,
+    database: DatabaseReference,
+    fence: ExternalMutationFence,
+  ): Promise<void> {
+    await this.#assertDatabaseResidualIdentity(spec, record, database, fence);
+    const databaseAttachments = await this.#api.listWorkerDatabaseAttachments(
+      database.id,
+    );
+    if (databaseAttachments.length > 0) {
+      throw new Error(
+        `database '${record.databaseId}' remains attached to ${databaseAttachments
+          .map(
+            (attachment) =>
+              `${attachment.plane} Worker '${attachment.scriptName}'`,
+          )
+          .join(', ')}`,
+      );
+    }
+    await this.#assertDatabaseResidualTail(spec, record, fence);
   }
 
   async #customDomain(

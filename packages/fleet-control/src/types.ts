@@ -539,6 +539,41 @@ export interface DecommissionAdvanceToken {
 
 export type DecommissionAdvanceTokenClassification = 'current' | 'stale';
 
+/** Call-local request for one read-only bounded provider scan chunk. */
+export interface DecommissionAttachmentScanInput {
+  readonly progress: DecommissionAttachmentProgress;
+  /** Reserved provider-attempt ceiling; an integer from 9 through 1,000. */
+  readonly maxProviderRequests: number;
+  /** Call-local cancellation; never persisted in a shell or Queue token. */
+  readonly signal?: AbortSignal;
+}
+
+/** Read-only provider facts; never durable absence or deletion authority. */
+export type DecommissionAttachmentScanResult =
+  | Readonly<{
+      /** More read-only provider work remains. */
+      status: 'pending';
+      progress: DecommissionAttachmentProgress;
+      providerFetchAttemptsReserved: number;
+    }>
+  | Readonly<{
+      /** The first safe Worker attachment found by this chunk. */
+      status: 'attached';
+      attachment: DecommissionBlockedAttachment;
+      providerFetchAttemptsReserved: number;
+    }>
+  | Readonly<{
+      /** This pass completed; evidence is not durable deletion authority. */
+      status: 'complete';
+      evidenceSha256: string;
+      evidenceCount: number;
+      providerFetchAttemptsReserved: number;
+    }>
+  | Readonly<{
+      /** Provider inventory changed; the caller must start a new generation. */
+      status: 'drift';
+    }>;
+
 export interface FleetRecord {
   readonly tenantTag: string;
   readonly backend: ProvisioningBackendKind;
@@ -1010,6 +1045,17 @@ export interface PlainWorkerRouteApi {
       dispatchNamespace?: string;
     }>[]
   >;
+  /**
+   * Advances one bounded, read-only attachment scan chunk.
+   *
+   * The implementation must use the same Cloudflare account and credential
+   * authority as this port's teardown mutations, including when a route API is
+   * paired with a Wrangler runner. It never performs an unbounded fallback and
+   * returns no durable absence or deletion authority.
+   */
+  advanceDecommissionAttachmentScan?(
+    input: DecommissionAttachmentScanInput,
+  ): Promise<DecommissionAttachmentScanResult>;
   getR2Bucket?(
     bucketName: string,
     jurisdiction: R2Jurisdiction,
@@ -1435,6 +1481,16 @@ export interface ProvisioningBackend {
     migrations: readonly D1Migration[],
     fence: ExternalMutationFence,
   ): Promise<void>;
+  /**
+   * Advances one bounded, read-only attachment scan chunk.
+   *
+   * It must use the same provider authority as this backend's teardown
+   * mutations, never perform an unbounded fallback, and returns no durable
+   * absence or deletion authority.
+   */
+  advanceDecommissionAttachmentScan?(
+    input: DecommissionAttachmentScanInput,
+  ): Promise<DecommissionAttachmentScanResult>;
   findApplicationR2Bucket?(
     resource: ApplicationR2Binding,
   ): Promise<ApplicationR2BucketSnapshot | undefined>;
@@ -1563,6 +1619,20 @@ export interface ProvisioningBackend {
     fence: ExternalMutationFence,
   ): Promise<void>;
   assertDatabaseDetached(
+    spec: DeploymentSpec,
+    record: FleetRecord,
+    database: DatabaseReference,
+    fence: ExternalMutationFence,
+  ): Promise<void>;
+  /**
+   * Checks deployment-owned D1 deletion residuals without enumerating the
+   * account-wide Worker attachment inventory.
+   *
+   * This retains deployment identity, route, release, inventory, control
+   * Worker, Durable Object, and initial/final lease checks. It is read-only and
+   * is not durable absence or deletion authority.
+   */
+  assertDatabaseDeletionResidualsRemoved?(
     spec: DeploymentSpec,
     record: FleetRecord,
     database: DatabaseReference,

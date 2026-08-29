@@ -8,9 +8,12 @@ import { deploymentSpecDigest } from '../src/spec-digest.js';
 import type {
   ApplicationR2Binding,
   DatabaseReference,
+  DecommissionAttachmentScanInput,
+  DecommissionAttachmentScanResult,
   DeploymentSecrets,
   DeploymentSpec,
   FleetRecord,
+  PlainWorkerProvisioningApi,
   PlainWorkerUploadIntent,
   PlainWorkerVersionDetail,
 } from '../src/types.js';
@@ -202,6 +205,252 @@ describe('WranglerLoopBackend construction', () => {
 });
 
 describe('PlainWorkerBackend core policy', () => {
+  it('exposes a truly optional bound decommission attachment scan capability', async () => {
+    const absentApi = new PlainWorkerProvisioningApiFake();
+    const absent = backend(absentApi);
+    expect(absent.advanceDecommissionAttachmentScan).toBeUndefined();
+    expect('advanceDecommissionAttachmentScan' in absent).toBe(false);
+    expect(Object.hasOwn(absent, 'advanceDecommissionAttachmentScan')).toBe(
+      false,
+    );
+
+    const input: DecommissionAttachmentScanInput = {
+      progress: {
+        version: 1,
+        target: { kind: 'd1', databaseId: database.id },
+        evidenceSha256: 'a'.repeat(64),
+        evidenceCount: 1,
+        stage: 'ordinary-script-inventory',
+        scriptIndex: 0,
+      },
+      maxProviderRequests: 12,
+    };
+    const result: DecommissionAttachmentScanResult = { status: 'drift' };
+    let receiver: PlainWorkerProvisioningApiFake | undefined;
+    let received: DecommissionAttachmentScanInput | undefined;
+    const capableApi = Object.assign(new PlainWorkerProvisioningApiFake(), {
+      async advanceDecommissionAttachmentScan(
+        this: PlainWorkerProvisioningApiFake,
+        candidate: DecommissionAttachmentScanInput,
+      ): Promise<DecommissionAttachmentScanResult> {
+        receiver = this;
+        received = candidate;
+        return result;
+      },
+    });
+    const capable = backend(capableApi);
+    expect(typeof capable.advanceDecommissionAttachmentScan).toBe('function');
+    expect('advanceDecommissionAttachmentScan' in capable).toBe(true);
+    expect(Object.hasOwn(capable, 'advanceDecommissionAttachmentScan')).toBe(
+      true,
+    );
+    await expect(
+      capable.advanceDecommissionAttachmentScan?.(input),
+    ).resolves.toBe(result);
+    expect(receiver).toBe(capableApi);
+    expect(received).toBe(input);
+  });
+
+  it('splits database attachment listing from every residual proof without changing legacy order', async () => {
+    type Attachment = Awaited<
+      ReturnType<PlainWorkerProvisioningApi['listWorkerDatabaseAttachments']>
+    >[number];
+    type Assertion =
+      | 'assertDatabaseDeletionResidualsRemoved'
+      | 'assertDatabaseDetached';
+    const tailReads = [
+      'read:deployment',
+      'read:versions',
+      'read:domains',
+      'read:footprint',
+      'read:namespaces',
+    ] as const;
+    const tracked = (attachments: readonly Attachment[] = []) => {
+      const fake = new PlainWorkerProvisioningApiFake();
+      const api: PlainWorkerProvisioningApi = fake;
+      const deploymentStatus = api.deploymentStatus.bind(api);
+      const listVersions = api.listVersions.bind(api);
+      const listCustomDomains = api.listCustomDomains.bind(api);
+      const inspectOrdinaryWorkerFootprint =
+        api.inspectOrdinaryWorkerFootprint.bind(api);
+      const listDurableObjectNamespaces =
+        api.listDurableObjectNamespaces.bind(api);
+      const viewVersion = api.viewVersion.bind(api);
+      vi.spyOn(api, 'listWorkerDatabaseAttachments').mockImplementation(
+        async () => {
+          fake.events.push('read:attachments');
+          return attachments;
+        },
+      );
+      vi.spyOn(api, 'deploymentStatus').mockImplementation(
+        async (scriptName) => {
+          fake.events.push('read:deployment');
+          return deploymentStatus(scriptName);
+        },
+      );
+      vi.spyOn(api, 'listVersions').mockImplementation(async (scriptName) => {
+        fake.events.push('read:versions');
+        return listVersions(scriptName);
+      });
+      vi.spyOn(api, 'listCustomDomains').mockImplementation(async () => {
+        fake.events.push('read:domains');
+        return listCustomDomains();
+      });
+      vi.spyOn(api, 'inspectOrdinaryWorkerFootprint').mockImplementation(
+        async (scriptName) => {
+          fake.events.push('read:footprint');
+          return inspectOrdinaryWorkerFootprint(scriptName);
+        },
+      );
+      vi.spyOn(api, 'listDurableObjectNamespaces').mockImplementation(
+        async (scriptName) => {
+          fake.events.push('read:namespaces');
+          return listDurableObjectNamespaces(scriptName);
+        },
+      );
+      vi.spyOn(api, 'viewVersion').mockImplementation(
+        async (scriptName, versionId) => {
+          fake.events.push('read:version');
+          return viewVersion(scriptName, versionId);
+        },
+      );
+      return { api: fake, fence: fake.fence(), subject: backend(fake) };
+    };
+    const assertDatabase = (
+      assertion: Assertion,
+      subject: PlainWorkerBackend,
+      fence: ReturnType<PlainWorkerProvisioningApiFake['fence']>,
+      record = fleetRecord(),
+    ) => subject[assertion](spec, record, database, fence);
+    const rejectionFrom = async (operation: Promise<unknown>) => {
+      try {
+        await operation;
+      } catch (error) {
+        return error;
+      }
+      throw new Error('expected database residual assertion to reject');
+    };
+
+    for (const assertion of [
+      'assertDatabaseDeletionResidualsRemoved',
+      'assertDatabaseDetached',
+    ] as const) {
+      const mismatch = tracked();
+      const mismatchRefusal = await rejectionFrom(
+        assertDatabase(assertion, mismatch.subject, mismatch.fence, {
+          ...fleetRecord(),
+          databaseName: 'foreign-database',
+        }),
+      );
+      expect(mismatchRefusal).toBeInstanceOf(Error);
+      expect((mismatchRefusal as Error).message).toBe(
+        `refusing to attest database detachment for mismatched fleet record '${spec.tenantTag}:${spec.environment}'`,
+      );
+      expect(mismatch.api.events).toEqual(['assertOwned']);
+
+      const success = tracked();
+      await expect(
+        assertDatabase(assertion, success.subject, success.fence),
+      ).resolves.toBeUndefined();
+      expect(success.api.events).toEqual([
+        'assertOwned',
+        ...(assertion === 'assertDatabaseDetached' ? ['read:attachments'] : []),
+        ...tailReads,
+        'assertOwned',
+      ]);
+    }
+
+    const attached = tracked([
+      { plane: 'ordinary', scriptName: 'foreign-worker' },
+    ]);
+    const attachmentRefusal = await rejectionFrom(
+      assertDatabase(
+        'assertDatabaseDetached',
+        attached.subject,
+        attached.fence,
+      ),
+    );
+    expect(attachmentRefusal).toBeInstanceOf(Error);
+    expect((attachmentRefusal as Error).message).toBe(
+      `database '${database.id}' remains attached to ordinary Worker 'foreign-worker'`,
+    );
+    expect(attached.api.events).toEqual(['assertOwned', 'read:attachments']);
+
+    const residuals = [
+      {
+        label: 'deployment',
+        configure(api: PlainWorkerProvisioningApiFake) {
+          api.deployments.set(spec.scriptName, {
+            versions: [{ versionId: 'candidate', percentage: 100 }],
+          });
+        },
+        message: `database '${database.id}' has a foreign or mismatched Worker footprint`,
+      },
+      {
+        label: 'version',
+        configure(api: PlainWorkerProvisioningApiFake) {
+          api.versions.set(spec.scriptName, [ownedVersion('candidate')]);
+        },
+        message: `database '${database.id}' remains attached to owned Worker '${spec.scriptName}'`,
+      },
+      {
+        label: 'route',
+        configure(api: PlainWorkerProvisioningApiFake) {
+          api.domains.push({
+            id: 'residual-domain',
+            hostname: spec.routeHostname,
+            service: 'foreign-worker',
+          });
+        },
+        message: `database '${database.id}' has a residual route or Durable Object namespace footprint`,
+      },
+      {
+        label: 'footprint',
+        configure(api: PlainWorkerProvisioningApiFake) {
+          api.footprints.set(spec.scriptName, {
+            scriptPresent: true,
+            customDomains: [],
+            zoneRoutes: [],
+          });
+        },
+        message: `database '${database.id}' has an ordinary Worker footprint that the provider cannot attest`,
+      },
+      {
+        label: 'Durable Object namespace',
+        configure(api: PlainWorkerProvisioningApiFake) {
+          api.namespaces.set(spec.scriptName, ['residual-namespace']);
+        },
+        message: `database '${database.id}' has a residual route or Durable Object namespace footprint`,
+      },
+    ] as const;
+    for (const residual of residuals) {
+      for (const assertion of [
+        'assertDatabaseDeletionResidualsRemoved',
+        'assertDatabaseDetached',
+      ] as const) {
+        const scenario = tracked();
+        residual.configure(scenario.api);
+        const refusal = await rejectionFrom(
+          assertDatabase(assertion, scenario.subject, scenario.fence),
+        );
+        expect(refusal, `${assertion}: ${residual.label}`).toBeInstanceOf(
+          Error,
+        );
+        expect(
+          (refusal as Error).message,
+          `${assertion}: ${residual.label}`,
+        ).toBe(residual.message);
+        expect(
+          scenario.api.events.filter((event) => event === 'assertOwned'),
+          `${assertion}: ${residual.label}`,
+        ).toHaveLength(1);
+        expect(
+          scenario.api.events.filter((event) => event === 'read:attachments'),
+        ).toHaveLength(assertion === 'assertDatabaseDetached' ? 1 : 0);
+      }
+    }
+  });
+
   it.each([
     ['empty', ''],
     ['space', 'contains space'],

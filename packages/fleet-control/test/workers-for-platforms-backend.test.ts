@@ -15,6 +15,7 @@ import { ActiveRouteAttestationError } from '../src/active-route.js';
 import { WorkerDeploymentError } from '../src/deployment-error.js';
 import {
   canonicalDeploymentEgressPolicy,
+  externalEgressProxyScriptName,
   externalPlatformResourceGroupId,
   externalReleaseTopology,
   externalStateScriptName,
@@ -26,6 +27,8 @@ import type {
   ApplicationR2BucketSnapshot,
   DatabaseExport,
   DatabaseReference,
+  DecommissionAttachmentScanInput,
+  DecommissionAttachmentScanResult,
   DeploymentSecrets,
   DeploymentSpec,
   ExternalMutationFence,
@@ -237,6 +240,7 @@ function platformProfile(
 
 class FakeApi implements WorkersForPlatformsApi {
   readonly calls: string[] = [];
+  residualEvents: string[] | undefined;
   failSecrets = false;
   failUpload = false;
   failDelete = false;
@@ -340,6 +344,7 @@ class FakeApi implements WorkersForPlatformsApi {
       plane: 'ordinary' | 'dispatch';
     }>[]
   > {
+    this.residualEvents?.push('attachments');
     return this.databaseAttachments;
   }
 
@@ -559,6 +564,7 @@ class FakeApi implements WorkersForPlatformsApi {
   }
 
   async inspectControlWorker(scriptName: string) {
+    this.residualEvents?.push(`control:${scriptName}`);
     const inspection = this.controlWorkers.get(scriptName);
     return inspection
       ? {
@@ -596,6 +602,7 @@ class FakeApi implements WorkersForPlatformsApi {
   }
 
   async hasDurableObjectNamespace(namespaceId: string): Promise<boolean> {
+    this.residualEvents?.push(`namespace:${namespaceId}`);
     this.namespaceExistenceChecks.push(namespaceId);
     return (
       this.remainingNamespaceIds.has(namespaceId) ||
@@ -608,6 +615,7 @@ class FakeApi implements WorkersForPlatformsApi {
   async listDurableObjectNamespaces(
     scriptName: string,
   ): Promise<readonly string[]> {
+    this.residualEvents?.push(`namespaces:${scriptName}`);
     return [...(this.namespaceIdsByScript.get(scriptName) ?? [])].sort();
   }
 
@@ -796,6 +804,7 @@ class FakeApi implements WorkersForPlatformsApi {
       }
     | undefined
   > {
+    this.residualEvents?.push(`release:${scriptName}`);
     this.inspectedScriptNames.push(scriptName);
     const stateWorker = this.dispatchWorkers.get(scriptName);
     if (stateWorker)
@@ -906,6 +915,7 @@ class FakeApi implements WorkersForPlatformsApi {
   }
 
   async getHostRouting(): Promise<string | undefined> {
+    this.residualEvents?.push('host');
     return this.routeOwner ? JSON.stringify(this.routeOwner) : undefined;
   }
 
@@ -932,6 +942,7 @@ class FakeApi implements WorkersForPlatformsApi {
   }
 
   async getScriptInventory(_namespaceId: string, scriptName: string) {
+    this.residualEvents?.push(`inventory:${scriptName}`);
     return this.scriptInventories.get(scriptName);
   }
 }
@@ -3180,6 +3191,270 @@ describe('WorkersForPlatformsBackend', () => {
       ),
     ).rejects.toThrow(/remains after deletion/);
     expect(api.calls).not.toContain('delete-inventory');
+  });
+
+  it('exposes a bounded attachment scanner only when the client supplies one', async () => {
+    const absentBackend = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client: new FakeApi(),
+      hostRoutingKvId: 'host-routes',
+    });
+    expect(absentBackend.advanceDecommissionAttachmentScan).toBeUndefined();
+    expect('advanceDecommissionAttachmentScan' in absentBackend).toBe(false);
+    expect(
+      Object.hasOwn(absentBackend, 'advanceDecommissionAttachmentScan'),
+    ).toBe(false);
+
+    const input: DecommissionAttachmentScanInput = {
+      progress: {
+        version: 1,
+        target: { kind: 'd1', databaseId: 'db-acme' },
+        evidenceSha256: '0'.repeat(64),
+        evidenceCount: 0,
+        stage: 'ordinary-script-inventory',
+        scriptIndex: 0,
+      },
+      maxProviderRequests: 12,
+      signal: new AbortController().signal,
+    };
+    const result = Object.freeze({
+      status: 'drift',
+    } as const satisfies DecommissionAttachmentScanResult);
+    let receivedThis: WorkersForPlatformsApi | undefined;
+    let receivedInput: DecommissionAttachmentScanInput | undefined;
+    const capability = vi.fn(function (
+      this: WorkersForPlatformsApi,
+      candidate: DecommissionAttachmentScanInput,
+    ) {
+      receivedThis = this;
+      receivedInput = candidate;
+      return Promise.resolve(result);
+    });
+    const capableClient = Object.assign(new FakeApi(), {
+      advanceDecommissionAttachmentScan: capability,
+    });
+    const capableBackend = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client: capableClient,
+      hostRoutingKvId: 'host-routes',
+    });
+
+    expect(typeof capableBackend.advanceDecommissionAttachmentScan).toBe(
+      'function',
+    );
+    expect('advanceDecommissionAttachmentScan' in capableBackend).toBe(true);
+    expect(
+      Object.hasOwn(capableBackend, 'advanceDecommissionAttachmentScan'),
+    ).toBe(true);
+    await expect(
+      capableBackend.advanceDecommissionAttachmentScan?.(input),
+    ).resolves.toBe(result);
+    expect(capability).toHaveBeenCalledTimes(1);
+    expect(receivedThis).toBe(capableClient);
+    expect(receivedInput).toBe(input);
+  });
+
+  it('keeps owned D1 residual checks independent from the legacy attachment scan', async () => {
+    type AssertionPath = 'residual' | 'legacy';
+
+    const database: DatabaseReference = {
+      id: 'db-acme',
+      name: deployment.databaseName,
+      created: false,
+    };
+    const physicalScriptName = externalReleaseScriptName(deployment);
+    const stateName = externalStateScriptName(deployment);
+    const proxyName = externalEgressProxyScriptName(deployment);
+    const record: FleetRecord = {
+      tenantTag: deployment.tenantTag,
+      backend: 'workers-for-platforms',
+      environment: deployment.environment,
+      scriptName: deployment.scriptName,
+      databaseId: database.id,
+      databaseName: database.name,
+      schemaVersion: deployment.schemaVersion,
+      artifactVersion: 'etag-v1',
+      desiredSpecDigest: deploymentSpecDigest(deployment),
+      activeRelease: {
+        physicalScriptName,
+        specDigest: deploymentSpecDigest(deployment),
+        artifactVersion: 'etag-v1',
+        releaseSchemaVersion: deployment.schemaVersion,
+      },
+      durableObjectBindings: [
+        {
+          name: 'MAINTENANCE',
+          className: 'Maintenance',
+          namespaceId: 'namespace-maintenance',
+        },
+      ],
+      routeHostname: deployment.routeHostname,
+      phase: 'database-deleting',
+      updatedAt: '2026-08-11T00:00:00.000Z',
+    };
+    const prefix = (path: AssertionPath): readonly string[] => [
+      'fence',
+      'host',
+      ...(path === 'legacy' ? ['attachments'] : []),
+    ];
+    const successEvents = (path: AssertionPath): readonly string[] => [
+      ...prefix(path),
+      `release:${physicalScriptName}`,
+      `inventory:${physicalScriptName}`,
+      `control:${stateName}`,
+      `control:${proxyName}`,
+      `namespaces:${stateName}`,
+      'namespace:namespace-maintenance',
+      'fence',
+    ];
+    const scenario = async (
+      path: AssertionPath,
+      configure: (client: FakeApi) => void | Promise<void> = () => {},
+      candidateRecord: FleetRecord = record,
+    ) => {
+      const client = new FakeApi();
+      client.exists = false;
+      await configure(client);
+      const events: string[] = [];
+      client.residualEvents = events;
+      const assertOwned = vi.fn(async () => {
+        events.push('fence');
+      });
+      const assertionFence: ExternalMutationFence = {
+        mutationLeaseTtlMs: 60_000,
+        assertOwned,
+      };
+      const backend = new WorkersForPlatformsBackend({
+        namespacedState: NAMESPACED_STATE,
+        client,
+        hostRoutingKvId: 'host-routes',
+      });
+      const invoke = () =>
+        path === 'legacy'
+          ? backend.assertDatabaseDetached(
+              deployment,
+              candidateRecord,
+              database,
+              assertionFence,
+            )
+          : backend.assertDatabaseDeletionResidualsRemoved(
+              deployment,
+              candidateRecord,
+              database,
+              assertionFence,
+            );
+      return { assertOwned, events, invoke };
+    };
+    const failureRows: readonly Readonly<{
+      configure?: (client: FakeApi) => void | Promise<void>;
+      record?: FleetRecord;
+      message: string;
+      expectedEvents(path: AssertionPath): readonly string[];
+    }>[] = [
+      {
+        record: { ...record, databaseId: 'db-other' },
+        message:
+          'refusing to attest database detachment for a different deployment',
+        expectedEvents: () => ['fence'],
+      },
+      {
+        configure(client) {
+          client.routeOwner = hostRoutingTarget(physicalScriptName);
+        },
+        message: `host route '${record.routeHostname}' remains before D1 deletion`,
+        expectedEvents: () => ['fence', 'host'],
+      },
+      {
+        configure(client) {
+          client.exists = true;
+        },
+        message: `dispatch release '${physicalScriptName}' remains before D1 deletion`,
+        expectedEvents: (path) => [
+          ...prefix(path),
+          `release:${physicalScriptName}`,
+        ],
+      },
+      {
+        configure(client) {
+          client.scriptInventories.set(physicalScriptName, {
+            scriptName: physicalScriptName,
+            tenantTag: deployment.tenantTag,
+            environment: deployment.environment,
+            databaseId: database.id,
+            routeHostname: deployment.routeHostname,
+          });
+        },
+        message: `script inventory '${physicalScriptName}' remains before D1 deletion`,
+        expectedEvents: (path) => [
+          ...prefix(path),
+          `release:${physicalScriptName}`,
+          `inventory:${physicalScriptName}`,
+        ],
+      },
+      {
+        async configure(client) {
+          await client.uploadControlWorker({
+            scriptName: stateName,
+            bindings: [],
+          });
+        },
+        message: `trusted platform Worker '${stateName}' remains before D1 deletion`,
+        expectedEvents: (path) => [
+          ...prefix(path),
+          `release:${physicalScriptName}`,
+          `inventory:${physicalScriptName}`,
+          `control:${stateName}`,
+        ],
+      },
+      {
+        configure(client) {
+          client.remainingNamespaceIds.add('namespace-maintenance');
+        },
+        message:
+          "Durable Object namespace 'namespace-maintenance' remains before D1 deletion",
+        expectedEvents: (path) => [...successEvents(path).slice(0, -1)],
+      },
+    ];
+
+    for (const path of ['residual', 'legacy'] as const) {
+      for (const row of failureRows) {
+        const test = await scenario(path, row.configure, row.record ?? record);
+        await expect(test.invoke()).rejects.toMatchObject({
+          message: row.message,
+        });
+        expect(test.events).toEqual(row.expectedEvents(path));
+        expect(test.assertOwned).toHaveBeenCalledTimes(1);
+      }
+    }
+
+    const legacyAttachment = await scenario('legacy', (client) => {
+      client.databaseAttachments.push({
+        plane: 'ordinary',
+        scriptName: 'unrelated-ordinary-worker',
+      });
+    });
+    await expect(legacyAttachment.invoke()).rejects.toMatchObject({
+      message:
+        "database 'db-acme' remains bound to Worker scripts before D1 deletion: ordinary:unrelated-ordinary-worker",
+    });
+    expect(legacyAttachment.events).toEqual(prefix('legacy'));
+    expect(legacyAttachment.assertOwned).toHaveBeenCalledTimes(1);
+
+    const residualSuccess = await scenario('residual', (client) => {
+      client.databaseAttachments.push({
+        plane: 'ordinary',
+        scriptName: 'must-not-be-listed',
+      });
+    });
+    await expect(residualSuccess.invoke()).resolves.toBeUndefined();
+    expect(residualSuccess.events).toEqual(successEvents('residual'));
+    expect(residualSuccess.events).not.toContain('attachments');
+    expect(residualSuccess.assertOwned).toHaveBeenCalledTimes(2);
+
+    const legacySuccess = await scenario('legacy');
+    await expect(legacySuccess.invoke()).resolves.toBeUndefined();
+    expect(legacySuccess.events).toEqual(successEvents('legacy'));
+    expect(legacySuccess.assertOwned).toHaveBeenCalledTimes(2);
   });
 
   it('requires positive route, script, and inventory absence before D1 deletion', async () => {

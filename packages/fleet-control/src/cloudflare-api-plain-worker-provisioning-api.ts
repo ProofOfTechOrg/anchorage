@@ -26,6 +26,9 @@ export class CloudflareApiPlainWorkerProvisioningApi
   readonly #client: CloudflareProvisioningClient;
   readonly maxMutationDurationMs: number;
   readonly supportsExactDatabaseDeletion = true;
+  readonly advanceDecommissionAttachmentScan: NonNullable<
+    PlainWorkerProvisioningApi['advanceDecommissionAttachmentScan']
+  >;
   readonly listWorkerR2Attachments: NonNullable<
     PlainWorkerProvisioningApi['listWorkerR2Attachments']
   >;
@@ -43,6 +46,8 @@ export class CloudflareApiPlainWorkerProvisioningApi
   constructor(options: { readonly client: CloudflareProvisioningClient }) {
     this.#client = options.client;
     this.maxMutationDurationMs = options.client.requestTimeoutMs;
+    this.advanceDecommissionAttachmentScan =
+      options.client.advanceDecommissionAttachmentScan.bind(options.client);
     this.listWorkerR2Attachments = options.client.listWorkerR2Attachments.bind(
       options.client,
     );

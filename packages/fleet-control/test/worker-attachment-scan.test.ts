@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   advanceCloudflareWorkerAttachmentScan,
   CloudflareProvisioningClient,
+  mapDecommissionAttachmentScanChunk,
 } from '../src/cloudflare-client.js';
 import {
   CLOUDFLARE_SDK_MAX_ATTEMPTS,
@@ -1857,6 +1858,291 @@ describe('Cloudflare Worker attachment scan', () => {
     ).not.toContain('token');
   });
 
+  it('maps the real bounded decommission scan and refuses hostile internal results', async () => {
+    const emptyFixture = recordingFetch(
+      worldHandler({ ordinary: [], namespaces: [] }),
+    );
+    const emptyClient = client(emptyFixture.fetch);
+    const initial = initialWorkerAttachmentScan(D1_TARGET);
+    const complete = await emptyClient.advanceDecommissionAttachmentScan({
+      progress: initial,
+      maxProviderRequests: 12,
+    });
+    expect(complete).toMatchObject({
+      status: 'complete',
+      providerFetchAttemptsReserved: 6,
+    });
+    expect(Object.keys(complete).sort()).toEqual([
+      'evidenceCount',
+      'evidenceSha256',
+      'providerFetchAttemptsReserved',
+      'status',
+    ]);
+
+    const ordinaryFixture = recordingFetch(
+      worldHandler({
+        ordinary: [
+          {
+            id: 'ordinary',
+            versions: [
+              {
+                id: 'v1',
+                percentage: 100,
+                bindings: [{ type: 'd1', database_id: 'target-db' }],
+              },
+            ],
+          },
+        ],
+        namespaces: [],
+      }),
+    );
+    await expect(
+      client(ordinaryFixture.fetch).advanceDecommissionAttachmentScan({
+        progress: initial,
+        maxProviderRequests: 12,
+      }),
+    ).resolves.toEqual({
+      status: 'attached',
+      attachment: { plane: 'ordinary', scriptName: 'ordinary' },
+      providerFetchAttemptsReserved: 9,
+    });
+    expect(
+      ordinaryFixture.requests.some(({ url }) =>
+        url.includes('/workers/dispatch/namespaces'),
+      ),
+    ).toBe(false);
+
+    const dispatchFixture = recordingFetch(
+      worldHandler({
+        ordinary: [],
+        namespaces: [
+          {
+            name: 'fleet',
+            pages: [{ scripts: ['dispatch'] }],
+            bindings: {
+              dispatch: [{ type: 'r2_bucket', bucket_name: 'target-bucket' }],
+            },
+          },
+        ],
+      }),
+    );
+    const dispatchClient = client(dispatchFixture.fetch);
+    const dispatchPending =
+      await dispatchClient.advanceDecommissionAttachmentScan({
+        progress: initialWorkerAttachmentScan(R2_TARGET),
+        maxProviderRequests: 12,
+      });
+    expect(dispatchPending).toEqual({
+      status: 'pending',
+      progress: {
+        version: 1,
+        target: R2_TARGET,
+        stage: 'dispatch-script-settings',
+        evidenceSha256:
+          '1c3482eb38516849afb66c2b303a216a39a3946e602a27234d52922a5d7b0293',
+        evidenceCount: 2,
+        ordinaryInventorySha256:
+          '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945',
+        namespaceInventorySha256:
+          'def04ac77fe26c1a976ff1a49bba63c2aaba7d547843733a1db279560b949fc9',
+        namespaceIndex: 0,
+        namespaceName: 'fleet',
+        pageSha256:
+          '2ac417d32ad8b417715caee181af9a3f4dca29e57a9cf5e8f897abd89d53b894',
+        pageItemCount: 1,
+        itemOffset: 0,
+        pageNumber: 0,
+        seenCursorSha256: [],
+        totalDispatchItems: 1,
+        dispatchEvidenceSum256: '0'.repeat(64),
+        dispatchEvidenceCount: 0,
+      },
+      providerFetchAttemptsReserved: 12,
+    });
+    if (dispatchPending.status !== 'pending') {
+      throw new Error('expected pending dispatch scan');
+    }
+    await expect(
+      dispatchClient.advanceDecommissionAttachmentScan({
+        progress: dispatchPending.progress,
+        maxProviderRequests: 9,
+      }),
+    ).resolves.toEqual({
+      status: 'attached',
+      attachment: {
+        plane: 'dispatch',
+        scriptName: 'dispatch',
+        dispatchNamespace: 'fleet',
+      },
+      providerFetchAttemptsReserved: 9,
+    });
+
+    let activeWorld: AttachmentWorld = {
+      ordinary: [
+        { id: 'first', versions: [{ id: 'v1', percentage: 100 }] },
+        { id: 'second', versions: [{ id: 'v2', percentage: 100 }] },
+      ],
+      namespaces: [],
+    };
+    const changingFixture = recordingFetch((request) =>
+      worldHandler(activeWorld)(request),
+    );
+    const changingClient = client(changingFixture.fetch);
+    const pending = await changingClient.advanceDecommissionAttachmentScan({
+      progress: initial,
+      maxProviderRequests: 9,
+    });
+    expect(pending.status).toBe('pending');
+    if (pending.status !== 'pending') throw new Error('expected pending scan');
+    activeWorld = {
+      ordinary: [
+        { id: 'first', versions: [{ id: 'v1', percentage: 100 }] },
+        { id: 'changed', versions: [{ id: 'v2', percentage: 100 }] },
+      ],
+      namespaces: [],
+    };
+    await expect(
+      changingClient.advanceDecommissionAttachmentScan({
+        progress: pending.progress,
+        maxProviderRequests: 12,
+      }),
+    ).resolves.toEqual({ status: 'drift' });
+
+    const abort = new AbortController();
+    const abortReason = new Error('stop bounded scan');
+    abort.abort(abortReason);
+    await expect(
+      emptyClient.advanceDecommissionAttachmentScan({
+        progress: initial,
+        maxProviderRequests: 12,
+        signal: abort.signal,
+      }),
+    ).rejects.toBe(abortReason);
+
+    const sentinel = new Error('provider read failed');
+    sentinel.name = 'CloudflareAttachmentScanDriftError';
+    const sentinelSignal = new AbortController().signal;
+    Object.defineProperty(sentinelSignal, 'throwIfAborted', {
+      value() {
+        throw sentinel;
+      },
+    });
+    await expect(
+      emptyClient.advanceDecommissionAttachmentScan({
+        progress: initial,
+        maxProviderRequests: 12,
+        signal: sentinelSignal,
+      }),
+    ).rejects.toBe(sentinel);
+
+    const basePending = {
+      status: 'pending' as const,
+      progress: initial,
+      attachments: [] as const,
+      providerFetchAttemptsReserved: 3,
+    };
+    expect(mapDecommissionAttachmentScanChunk(basePending)).toEqual({
+      status: 'pending',
+      progress: initial,
+      providerFetchAttemptsReserved: 3,
+    });
+    expect(
+      Object.keys(mapDecommissionAttachmentScanChunk(basePending)),
+    ).toEqual(['status', 'progress', 'providerFetchAttemptsReserved']);
+
+    expect(
+      mapDecommissionAttachmentScanChunk({
+        status: 'attached',
+        attachment: {
+          plane: 'ordinary',
+          scriptName: 'ordinary',
+          dispatchNamespace: 'must-be-stripped',
+          token: 'must-be-stripped',
+        } as never,
+        providerFetchAttemptsReserved: 3,
+      }),
+    ).toEqual({
+      status: 'attached',
+      attachment: { plane: 'ordinary', scriptName: 'ordinary' },
+      providerFetchAttemptsReserved: 3,
+    });
+    expect(
+      mapDecommissionAttachmentScanChunk({
+        status: 'attached',
+        attachment: {
+          plane: 'dispatch',
+          scriptName: 'dispatch',
+          dispatchNamespace: 'fleet',
+          token: 'must-be-stripped',
+        } as never,
+        providerFetchAttemptsReserved: 3,
+      }),
+    ).toEqual({
+      status: 'attached',
+      attachment: {
+        plane: 'dispatch',
+        scriptName: 'dispatch',
+        dispatchNamespace: 'fleet',
+      },
+      providerFetchAttemptsReserved: 3,
+    });
+
+    const expectExactMapperFailure = (
+      operation: () => unknown,
+      message: string,
+    ) => {
+      let refusal: unknown;
+      try {
+        operation();
+      } catch (error) {
+        refusal = error;
+      }
+      expect(refusal).toBeInstanceOf(Error);
+      expect((refusal as Error).message).toBe(message);
+    };
+    for (const chunk of [
+      {
+        ...basePending,
+        attachments: [{ plane: 'ordinary' as const, scriptName: 'unexpected' }],
+      },
+      {
+        status: 'complete' as const,
+        evidenceSha256: 'a'.repeat(64),
+        evidenceCount: 2,
+        attachments: [{ plane: 'ordinary' as const, scriptName: 'unexpected' }],
+        providerFetchAttemptsReserved: 3,
+      },
+    ]) {
+      expectExactMapperFailure(
+        () => mapDecommissionAttachmentScanChunk(chunk),
+        'bounded attachment scan returned unexpected accumulated attachments',
+      );
+    }
+    for (const attachment of [
+      { plane: 'dispatch', scriptName: 'broken' },
+      { plane: 'dispatch', scriptName: 'broken', dispatchNamespace: '' },
+      {
+        plane: 'unknown',
+        scriptName: 'broken',
+        dispatchNamespace: 'fleet',
+      },
+    ]) {
+      expectExactMapperFailure(
+        () =>
+          mapDecommissionAttachmentScanChunk({
+            status: 'attached',
+            attachment: attachment as never,
+            providerFetchAttemptsReserved: 3,
+          }),
+        'bounded attachment scan returned malformed dispatch attachment',
+      );
+    }
+    expectExactMapperFailure(
+      () => mapDecommissionAttachmentScanChunk({ status: 'unknown' } as never),
+      'bounded attachment scan returned unknown result',
+    );
+  });
+
   it('keeps the scan friend off the root while retaining its internal callable seam', () => {
     type Equal<Left, Right> =
       (<Value>() => Value extends Left ? 1 : 2) extends <
@@ -1878,6 +2164,7 @@ describe('Cloudflare Worker attachment scan', () => {
       : false = true;
 
     expect('advanceCloudflareWorkerAttachmentScan' in fleetRoot).toBe(false);
+    expect('mapDecommissionAttachmentScanChunk' in fleetRoot).toBe(false);
     expect(typeof advanceCloudflareWorkerAttachmentScan).toBe('function');
     expect(initialWorkerAttachmentScan).toBe(
       initialWorkerAttachmentScanFromState,

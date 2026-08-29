@@ -214,6 +214,8 @@ try {
   type DecommissionAttachmentProgress,
   type DecommissionAttachmentPurpose,
   type DecommissionAttachmentScanEvidence,
+  type DecommissionAttachmentScanInput,
+  type DecommissionAttachmentScanResult,
   type DecommissionBlockedAttachment,
   type DecommissionIntentCommon,
   type DecommissionOperationIdentity,
@@ -246,6 +248,26 @@ try {
   type SeedDeploymentIdentityOptions,
   type WorkersForPlatformsApi,
 } from '@proofoftech/fleet-control';
+// @ts-expect-error R1's client friend is package-private, not a root API.
+import { advanceCloudflareWorkerAttachmentScan } from '@proofoftech/fleet-control';
+// @ts-expect-error R1 provider attachments stay behind decommission types.
+import type { WorkerAttachment } from '@proofoftech/fleet-control';
+// @ts-expect-error R1 scan targets stay package-private.
+import type { WorkerAttachmentScanTarget } from '@proofoftech/fleet-control';
+// @ts-expect-error R1 progress stays package-private.
+import type { WorkerAttachmentScanProgress } from '@proofoftech/fleet-control';
+// @ts-expect-error R1 scan inputs stay package-private.
+import type { WorkerAttachmentScanInput } from '@proofoftech/fleet-control';
+// @ts-expect-error R1 scan chunks stay package-private.
+import type { WorkerAttachmentScanChunk } from '@proofoftech/fleet-control';
+// @ts-expect-error R1 provider context stays package-private.
+import type { CloudflareWorkerAttachmentScanContext } from '@proofoftech/fleet-control';
+// @ts-expect-error R1 progress errors stay package-private.
+import { CloudflareAttachmentScanProgressError } from '@proofoftech/fleet-control';
+// @ts-expect-error R1 drift errors stay package-private.
+import { CloudflareAttachmentScanDriftError } from '@proofoftech/fleet-control';
+// @ts-expect-error the pure mapper is a deep package-private seam.
+import { mapDecommissionAttachmentScanChunk } from '@proofoftech/fleet-control';
 import type { FleetDispatchEnv } from '@proofoftech/fleet-control/workers/dispatch';
 import {
   createEgressProxyFetch,
@@ -270,6 +292,7 @@ declare const decommissionClassification: DecommissionAdvanceTokenClassification
 declare const decommissionProgress: DecommissionAttachmentProgress;
 declare const decommissionPurpose: DecommissionAttachmentPurpose;
 declare const decommissionEvidence: DecommissionAttachmentScanEvidence;
+declare const decommissionScanInput: DecommissionAttachmentScanInput;
 declare const decommissionAttachment: DecommissionBlockedAttachment;
 declare const decommissionCommon: DecommissionIntentCommon;
 declare const decommissionIdentity: DecommissionOperationIdentity;
@@ -296,6 +319,40 @@ const directBackendOptions: CloudflareApiPlainWorkerBackendOptions = {
 };
 const directBackend: ProvisioningBackend =
   new CloudflareApiPlainWorkerBackend(directBackendOptions);
+const decommissionScanResults: readonly DecommissionAttachmentScanResult[] = [
+  {
+    status: 'pending',
+    progress: decommissionProgress,
+    providerFetchAttemptsReserved: 9,
+  },
+  {
+    status: 'attached',
+    attachment: decommissionAttachment,
+    providerFetchAttemptsReserved: 9,
+  },
+  {
+    status: 'complete',
+    evidenceSha256: decommissionEvidence.evidenceSha256,
+    evidenceCount: decommissionEvidence.evidenceCount,
+    providerFetchAttemptsReserved: 9,
+  },
+  { status: 'drift' },
+];
+const directDecommissionScan =
+  directClient.advanceDecommissionAttachmentScan(decommissionScanInput);
+const routeDecommissionScan =
+  plainWorkerRouteApi.advanceDecommissionAttachmentScan?.(
+    decommissionScanInput,
+  );
+const backendDecommissionScan =
+  provisioningBackend.advanceDecommissionAttachmentScan?.(
+    decommissionScanInput,
+  );
+const wfpDecommissionScan = api.advanceDecommissionAttachmentScan?.(
+  decommissionScanInput,
+);
+const databaseResidualAssertion =
+  provisioningBackend.assertDatabaseDeletionResidualsRemoved;
 type PlainWorkerPortRecords = readonly [
   PlainWorkerCleanupOutcome,
   PlainWorkerDatabaseExportResult,
@@ -359,6 +416,8 @@ void [
   decommissionProgress,
   decommissionPurpose,
   decommissionEvidence,
+  decommissionScanInput,
+  decommissionScanResults,
   decommissionAttachment,
   decommissionCommon,
   decommissionIdentity,
@@ -367,6 +426,11 @@ void [
   decommissionPhase,
   decommissionIntentIsOptional,
   storedDecommissionIntent,
+  directDecommissionScan,
+  routeDecommissionScan,
+  backendDecommissionScan,
+  wfpDecommissionScan,
+  databaseResidualAssertion,
 ];
 const customDomain: PlainWorkerCustomDomain = {
   id: 'domain-id',
@@ -485,6 +549,11 @@ assert.ok(new ActiveRouteAttestationError('probe', {}) instanceof Error);
 assert.equal(typeof attestConvergedActiveRoute, 'function');
 assert.equal(typeof attestFleetRecordActiveRoute, 'function');
 assert.equal(typeof fleetSettlementKey, 'function');
+assert.equal(
+  typeof CloudflareProvisioningClient.prototype
+    .advanceDecommissionAttachmentScan,
+  'function',
+);
 assert.throws(
   () =>
     new CloudflareProvisioningClient({

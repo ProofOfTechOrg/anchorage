@@ -46,6 +46,8 @@ import type {
   D1Migration,
   DatabaseExport,
   DatabaseReference,
+  DecommissionAttachmentScanInput,
+  DecommissionAttachmentScanResult,
   DeploymentEgressPolicy,
   DeploymentSecrets,
   DeploymentSpec,
@@ -129,6 +131,16 @@ export interface WorkersForPlatformsApi {
       dispatchNamespace?: string;
     }>[]
   >;
+  /**
+   * Advances one bounded, read-only attachment scan chunk.
+   *
+   * The implementation must use the same Cloudflare account and credential
+   * authority as this port's teardown mutations. It never performs an
+   * unbounded fallback and returns no durable absence or deletion authority.
+   */
+  advanceDecommissionAttachmentScan?(
+    input: DecommissionAttachmentScanInput,
+  ): Promise<DecommissionAttachmentScanResult>;
   getR2Bucket?(
     bucketName: string,
     jurisdiction: import('./types.js').R2Jurisdiction,
@@ -343,6 +355,9 @@ export function deriveStateEgressCredential(
 export class WorkersForPlatformsBackend implements ProvisioningBackend {
   readonly kind = 'workers-for-platforms' as const;
   readonly immutableExternalArtifacts = true as const;
+  declare readonly advanceDecommissionAttachmentScan?: NonNullable<
+    ProvisioningBackend['advanceDecommissionAttachmentScan']
+  >;
   readonly #client: WorkersForPlatformsApi;
   readonly #fetch: typeof fetch;
   readonly #hostRoutingKvId: string;
@@ -408,6 +423,13 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
       );
     }
     this.#namespacedState = options.namespacedState;
+    const advanceAttachmentScan =
+      options.client.advanceDecommissionAttachmentScan;
+    if (typeof advanceAttachmentScan === 'function') {
+      this.advanceDecommissionAttachmentScan = advanceAttachmentScan.bind(
+        options.client,
+      );
+    }
   }
 
   #stateEgressCredential(spec: DeploymentSpec): string {
@@ -2117,7 +2139,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
     });
   }
 
-  async assertDatabaseDetached(
+  async #assertDatabaseResidualIdentity(
     spec: DeploymentSpec,
     record: FleetRecord,
     database: DatabaseReference,
@@ -2135,6 +2157,9 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
         'refusing to attest database detachment for a different deployment',
       );
     }
+  }
+
+  async #assertHostRouteRemoved(record: FleetRecord): Promise<void> {
     if (
       (await this.#client.getHostRouting(
         this.#hostRoutingKvId,
@@ -2145,15 +2170,13 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
         `host route '${record.routeHostname}' remains before D1 deletion`,
       );
     }
-    const databaseAttachments =
-      await this.#client.listWorkerDatabaseAttachments(database.id);
-    if (databaseAttachments.length > 0) {
-      throw new Error(
-        `database '${database.id}' remains bound to Worker scripts before D1 deletion: ${databaseAttachments
-          .map((attachment) => `${attachment.plane}:${attachment.scriptName}`)
-          .join(', ')}`,
-      );
-    }
+  }
+
+  async #assertDatabaseResidualTail(
+    spec: DeploymentSpec,
+    record: FleetRecord,
+    fence: ExternalMutationFence,
+  ): Promise<void> {
     const fallbackRelease: ExternalReleaseSnapshot = {
       physicalScriptName: this.releaseScriptName(spec),
       specDigest: deploymentSpecDigest(spec),
@@ -2218,6 +2241,37 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
       }
     }
     await fence.assertOwned();
+  }
+
+  async assertDatabaseDeletionResidualsRemoved(
+    spec: DeploymentSpec,
+    record: FleetRecord,
+    database: DatabaseReference,
+    fence: ExternalMutationFence,
+  ): Promise<void> {
+    await this.#assertDatabaseResidualIdentity(spec, record, database, fence);
+    await this.#assertHostRouteRemoved(record);
+    await this.#assertDatabaseResidualTail(spec, record, fence);
+  }
+
+  async assertDatabaseDetached(
+    spec: DeploymentSpec,
+    record: FleetRecord,
+    database: DatabaseReference,
+    fence: ExternalMutationFence,
+  ): Promise<void> {
+    await this.#assertDatabaseResidualIdentity(spec, record, database, fence);
+    await this.#assertHostRouteRemoved(record);
+    const databaseAttachments =
+      await this.#client.listWorkerDatabaseAttachments(database.id);
+    if (databaseAttachments.length > 0) {
+      throw new Error(
+        `database '${database.id}' remains bound to Worker scripts before D1 deletion: ${databaseAttachments
+          .map((attachment) => `${attachment.plane}:${attachment.scriptName}`)
+          .join(', ')}`,
+      );
+    }
+    await this.#assertDatabaseResidualTail(spec, record, fence);
   }
 
   exportDatabase(

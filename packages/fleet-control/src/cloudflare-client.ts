@@ -46,6 +46,7 @@ import {
 import type { CloudflareApiRateCoordinator } from './cloudflare-rate-coordinator.js';
 import {
   advanceWorkerAttachmentScan,
+  CloudflareAttachmentScanDriftError,
   type CloudflareWorkerAttachmentScanContext,
   listAllDispatchScripts,
   listAllWorkerAttachments,
@@ -73,6 +74,8 @@ import { deploymentSpecDigest } from './spec-digest.js';
 import type {
   DatabaseExport,
   DatabaseReference,
+  DecommissionAttachmentScanInput,
+  DecommissionAttachmentScanResult,
   DeploymentSecrets,
   DeploymentSpec,
   ExternalMutationFence,
@@ -394,6 +397,70 @@ export function advanceCloudflareWorkerAttachmentScan(
   input: WorkerAttachmentScanInput,
 ): Promise<WorkerAttachmentScanChunk> {
   return scanProviderAttachments(client, input);
+}
+
+/** @internal Package-private conversion for the bounded lifecycle provider. */
+export function mapDecommissionAttachmentScanChunk(
+  chunk: WorkerAttachmentScanChunk,
+): DecommissionAttachmentScanResult {
+  switch (chunk.status) {
+    case 'pending':
+      if (chunk.attachments.length !== 0) {
+        throw new Error(
+          'bounded attachment scan returned unexpected accumulated attachments',
+        );
+      }
+      return {
+        status: 'pending',
+        progress: chunk.progress,
+        providerFetchAttemptsReserved: chunk.providerFetchAttemptsReserved,
+      };
+    case 'attached':
+      if (chunk.attachment.plane === 'ordinary') {
+        return {
+          status: 'attached',
+          attachment: {
+            plane: 'ordinary',
+            scriptName: chunk.attachment.scriptName,
+          },
+          providerFetchAttemptsReserved: chunk.providerFetchAttemptsReserved,
+        };
+      }
+      if (
+        chunk.attachment.plane !== 'dispatch' ||
+        !chunk.attachment.dispatchNamespace
+      ) {
+        throw new Error(
+          'bounded attachment scan returned malformed dispatch attachment',
+        );
+      }
+      return {
+        status: 'attached',
+        attachment: {
+          plane: 'dispatch',
+          scriptName: chunk.attachment.scriptName,
+          dispatchNamespace: chunk.attachment.dispatchNamespace,
+        },
+        providerFetchAttemptsReserved: chunk.providerFetchAttemptsReserved,
+      };
+    case 'complete':
+      if (chunk.attachments.length !== 0) {
+        throw new Error(
+          'bounded attachment scan returned unexpected accumulated attachments',
+        );
+      }
+      return {
+        status: 'complete',
+        evidenceSha256: chunk.evidenceSha256,
+        evidenceCount: chunk.evidenceCount,
+        providerFetchAttemptsReserved: chunk.providerFetchAttemptsReserved,
+      };
+    default: {
+      const unknownChunk: never = chunk;
+      void unknownChunk;
+      throw new Error('bounded attachment scan returned unknown result');
+    }
+  }
 }
 
 export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
@@ -747,6 +814,26 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     await this.#schedule(async () => {
       await this.#assertUntrustedDispatchNamespace(dispatchNamespace);
     });
+  }
+
+  async advanceDecommissionAttachmentScan(
+    input: DecommissionAttachmentScanInput,
+  ): Promise<DecommissionAttachmentScanResult> {
+    try {
+      const chunk = await scanProviderAttachments(this, {
+        target: input.progress.target,
+        progress: input.progress,
+        maxProviderRequests: input.maxProviderRequests,
+        signal: input.signal,
+        stopOnFirstAttachment: true,
+      });
+      return mapDecommissionAttachmentScanChunk(chunk);
+    } catch (error) {
+      if (error instanceof CloudflareAttachmentScanDriftError) {
+        return { status: 'drift' };
+      }
+      throw error;
+    }
   }
 
   async listWorkerDatabaseAttachments(databaseId: string): Promise<

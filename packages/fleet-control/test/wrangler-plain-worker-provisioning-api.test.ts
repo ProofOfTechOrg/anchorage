@@ -6,11 +6,14 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import type { DurableDatabaseExportStore } from '../src/cloudflare-client.js';
+import { initialWorkerAttachmentScan } from '../src/cloudflare-worker-attachment-scan-state.js';
 import {
   assertSupportedPlainWorkerBindings,
   plainWorkerBindingsToProviderShape,
 } from '../src/provider-binding-inventory.js';
 import type {
+  DecommissionAttachmentScanInput,
+  DecommissionAttachmentScanResult,
   ExternalMutationFence,
   PlainWorkerRouteApi,
   PlainWorkerUploadIntent,
@@ -1256,6 +1259,55 @@ describe('WranglerPlainWorkerProvisioningApi exports', () => {
     });
     expect(mode).toBe(0o600);
     await expectExportScratchRemoved(outputPath);
+  });
+
+  it('conditionally forwards a bounded decommission scanner with exact identity', async () => {
+    const absent = await api(new FakeRunner());
+    expect(absent.advanceDecommissionAttachmentScan).toBeUndefined();
+    expect('advanceDecommissionAttachmentScan' in absent).toBe(false);
+    expect(Object.hasOwn(absent, 'advanceDecommissionAttachmentScan')).toBe(
+      false,
+    );
+
+    const input: DecommissionAttachmentScanInput = {
+      progress: initialWorkerAttachmentScan({ kind: 'd1', databaseId: 'db' }),
+      maxProviderRequests: 12,
+    };
+    const result: DecommissionAttachmentScanResult = { status: 'drift' };
+    const calls: Array<readonly [unknown, DecommissionAttachmentScanInput]> =
+      [];
+    const capableRouteApi = routeApi();
+    let capabilityReads = 0;
+    Object.defineProperty(
+      capableRouteApi,
+      'advanceDecommissionAttachmentScan',
+      {
+        configurable: true,
+        get() {
+          capabilityReads += 1;
+          return function (
+            this: unknown,
+            actual: DecommissionAttachmentScanInput,
+          ) {
+            calls.push([this, actual]);
+            return Promise.resolve(result);
+          };
+        },
+      },
+    );
+    const capable = await api(new FakeRunner(), {
+      routeApi: capableRouteApi,
+    });
+    expect(typeof capable.advanceDecommissionAttachmentScan).toBe('function');
+    expect('advanceDecommissionAttachmentScan' in capable).toBe(true);
+    expect(Object.hasOwn(capable, 'advanceDecommissionAttachmentScan')).toBe(
+      true,
+    );
+    await expect(
+      capable.advanceDecommissionAttachmentScan?.(input),
+    ).resolves.toBe(result);
+    expect(calls).toEqual([[capableRouteApi, input]]);
+    expect(capabilityReads).toBe(1);
   });
 
   it('refuses an empty durable location', async () => {

@@ -121,6 +121,8 @@ export {
   type DecommissionAttachmentProgress,
   type DecommissionAttachmentPurpose,
   type DecommissionAttachmentScanEvidence,
+  type DecommissionAttachmentScanInput,
+  type DecommissionAttachmentScanResult,
   type DecommissionAuditEvent,
   type DecommissionAuditSink,
   type DecommissionBlockedAttachment,

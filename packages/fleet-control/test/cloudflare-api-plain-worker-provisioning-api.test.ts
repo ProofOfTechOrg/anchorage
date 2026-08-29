@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it, vi } from 'vitest';
+import { CloudflareApiPlainWorkerBackend } from '../src/cloudflare-api-plain-worker-backend.js';
 import { CloudflareApiPlainWorkerProvisioningApi } from '../src/cloudflare-api-plain-worker-provisioning-api.js';
 import { CloudflareProvisioningClient } from '../src/cloudflare-client.js';
+import { initialWorkerAttachmentScan } from '../src/cloudflare-worker-attachment-scan-state.js';
 import type {
+  DecommissionAttachmentScanInput,
+  DecommissionAttachmentScanResult,
   ExternalMutationFence,
   PlainWorkerUploadIntent,
 } from '../src/types.js';
@@ -684,6 +688,41 @@ describe('CloudflareApiPlainWorkerProvisioningApi', () => {
       if (preservesLeaseError) expect(failure).toBe(denied);
     }
     expect(fixture.requests).toHaveLength(0);
+  });
+
+  it('forwards bounded decommission scans through the direct public backend', async () => {
+    const world = emptyScriptWorld();
+    const { client } = subject(restProjection(world));
+    const input: DecommissionAttachmentScanInput = {
+      progress: initialWorkerAttachmentScan({
+        kind: 'd1',
+        databaseId: 'database-1',
+      }),
+      maxProviderRequests: 12,
+    };
+    const result: DecommissionAttachmentScanResult = { status: 'drift' };
+    const calls: Array<readonly [unknown, DecommissionAttachmentScanInput]> =
+      [];
+    Object.defineProperty(client, 'advanceDecommissionAttachmentScan', {
+      configurable: true,
+      value(this: unknown, actual: DecommissionAttachmentScanInput) {
+        calls.push([this, actual]);
+        return Promise.resolve(result);
+      },
+    });
+
+    const api = new CloudflareApiPlainWorkerProvisioningApi({ client });
+    const backend = new CloudflareApiPlainWorkerBackend({ client });
+    await expect(api.advanceDecommissionAttachmentScan(input)).resolves.toBe(
+      result,
+    );
+    await expect(
+      backend.advanceDecommissionAttachmentScan?.(input),
+    ).resolves.toBe(result);
+    expect(calls).toEqual([
+      [client, input],
+      [client, input],
+    ]);
   });
 
   it('sanitizes a falsy transport failure without changing cleanup classification', async () => {

@@ -8,11 +8,14 @@ import { pathToFileURL } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import { ActiveRouteAttestationError } from '../src/active-route.js';
 import type { DurableDatabaseExportStore } from '../src/cloudflare-client.js';
+import { initialWorkerAttachmentScan } from '../src/cloudflare-worker-attachment-scan-state.js';
 import { WorkerDeploymentError } from '../src/deployment-error.js';
 import { plainWorkerIngressModule } from '../src/plain-worker-backend.js';
 import { deploymentSpecDigest } from '../src/spec-digest.js';
 import type {
   DatabaseReference,
+  DecommissionAttachmentScanInput,
+  DecommissionAttachmentScanResult,
   DeploymentSecrets,
   DeploymentSpec,
   ExternalMutationFence,
@@ -3224,5 +3227,33 @@ export default {
 
     // #then the refusal reaches the caller intact, percentages included
     expect(failure).toBe(split);
+  });
+
+  it('carries the route-owned bounded scanner through both Wrangler layers', async () => {
+    const routeApi = new FakeRouteApi();
+    const input: DecommissionAttachmentScanInput = {
+      progress: initialWorkerAttachmentScan({
+        kind: 'd1',
+        databaseId: database.id,
+      }),
+      maxProviderRequests: 12,
+    };
+    const result: DecommissionAttachmentScanResult = { status: 'drift' };
+    const calls: Array<readonly [unknown, DecommissionAttachmentScanInput]> =
+      [];
+    Object.defineProperty(routeApi, 'advanceDecommissionAttachmentScan', {
+      configurable: true,
+      value(this: unknown, actual: DecommissionAttachmentScanInput) {
+        calls.push([this, actual]);
+        return Promise.resolve(result);
+      },
+    });
+    const subject = backend(new FakeRunner(), { routeApi });
+
+    expect(typeof subject.advanceDecommissionAttachmentScan).toBe('function');
+    await expect(
+      subject.advanceDecommissionAttachmentScan?.(input),
+    ).resolves.toBe(result);
+    expect(calls).toEqual([[routeApi, input]]);
   });
 });
