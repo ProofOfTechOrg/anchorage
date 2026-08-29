@@ -103,6 +103,24 @@ describe.sequential('migration ledger real-D1 fidelity', {
     });
   });
 
+  it('converges concurrent first applications on a cold ledger', async () => {
+    await expect(
+      probe<{
+        coldBefore: number;
+        settlements: Array<
+          { status: 'fulfilled' } | { status: 'rejected'; message: string }
+        >;
+        values: number;
+        ledger: number;
+      }>('cold-application'),
+    ).resolves.toEqual({
+      coldBefore: 0,
+      settlements: [{ status: 'fulfilled' }, { status: 'fulfilled' }],
+      values: 1,
+      ledger: 1,
+    });
+  });
+
   it('rejects changed SQL for an already committed historical version', async () => {
     await expect(
       probe<{ failure: ProbeError; values: string[] }>('changed-history'),

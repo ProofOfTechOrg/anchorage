@@ -165,6 +165,43 @@ describe('FileSystemDatabaseExportStore', () => {
     await expect(readdir(root)).resolves.toEqual([]);
   });
 
+  it('does not await a tee branch cancel when the write fails', async () => {
+    const parent = await temporaryDirectory();
+    const root = join(parent, 'exports');
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) {
+        // A chunk with no byteLength drives the store's own size refusal
+        // while the tee source stays readable.
+        // The real guard case is oversized; this uses size += undefined.
+        controller.enqueue('not bytes' as unknown as Uint8Array);
+      },
+    });
+    const [branch] = source.tee();
+    const store = new FileSystemDatabaseExportStore(root);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error('write did not settle')),
+        1_000,
+      );
+    });
+    try {
+      await expect(
+        Promise.race([
+          store.write({
+            databaseId: 'database-1',
+            fileName: 'database-1.sql',
+            body: branch,
+          }),
+          timeout,
+        ]),
+      ).rejects.toThrow('export size exceeds the safe integer range');
+    } finally {
+      clearTimeout(timer);
+    }
+    await expect(readdir(root)).resolves.toEqual([]);
+  });
+
   it('cleans its temporary file when content length does not match', async () => {
     const parent = await temporaryDirectory();
     const root = join(parent, 'exports');

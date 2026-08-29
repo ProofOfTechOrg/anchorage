@@ -103,7 +103,10 @@ export class FileSystemDatabaseExportStore
         cleanupErrors.push(cleanupError);
       }
       try {
-        await reader?.cancel(error);
+        // The reader's cancel on a tee branch settles when the tee source is
+        // exhausted or the other branch is cancelled, so cleanup does not
+        // await it.
+        void reader?.cancel(error).catch(() => undefined);
       } catch {}
       try {
         await rm(temporary, { force: true });

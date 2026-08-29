@@ -110,6 +110,53 @@ async function concurrentApplication(db: D1Database): Promise<unknown> {
   };
 }
 
+async function coldApplication(db: D1Database): Promise<unknown> {
+  const version = 1;
+  await db
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS migration_cold_values (value TEXT NOT NULL)`,
+    )
+    .run();
+  await db.prepare(`DELETE FROM migration_cold_values`).run();
+  // No ensureLedger: the ledger's own CREATE runs inside the race.
+  await db.prepare(`DROP TABLE IF EXISTS ${LEDGER}`).run();
+  const coldBefore = await db
+    .prepare(
+      `SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = ?`,
+    )
+    .bind(LEDGER)
+    .first<{ count: number }>();
+  const migration = {
+    version,
+    sql: `INSERT INTO migration_cold_values (value) VALUES ('once')`,
+  };
+  const outcomes = await Promise.allSettled(
+    Array.from({ length: 2 }, () =>
+      applyMigrationsWithLedger(new D1FleetStateDatabase(db), [migration]),
+    ),
+  );
+  const values = await db
+    .prepare(`SELECT COUNT(*) AS count FROM migration_cold_values`)
+    .first<{ count: number }>();
+  const ledger = await db
+    .prepare(`SELECT COUNT(*) AS count FROM ${LEDGER} WHERE version = ?`)
+    .bind(version)
+    .first<{ count: number }>();
+  return {
+    coldBefore: coldBefore?.count,
+    settlements: outcomes.map((outcome) =>
+      outcome.status === 'fulfilled'
+        ? { status: outcome.status }
+        : {
+            status: outcome.status,
+            message: errorShape(outcome.reason).message,
+          },
+    ),
+    values: values?.count,
+    ledger: ledger?.count,
+  };
+}
+
 async function changedHistoricalSql(db: D1Database): Promise<unknown> {
   const version = 1;
   await ensureLedger(db);
@@ -195,6 +242,8 @@ export default {
           return Response.json(await atomicRollback(env.DB));
         case 'concurrent-application':
           return Response.json(await concurrentApplication(env.DB));
+        case 'cold-application':
+          return Response.json(await coldApplication(env.DB));
         case 'changed-history':
           return Response.json(await changedHistoricalSql(env.DB));
         case 'commit-boundary':
