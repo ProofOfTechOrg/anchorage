@@ -217,6 +217,38 @@ module.exports = {
       },
       to: { dependencyTypes: ['core'] },
     },
+    {
+      name: 'fleet-control-client-does-not-reach-its-consumers',
+      severity: 'error',
+      comment:
+        'index.ts, cloudflare-api-plain-worker-backend.ts, and cloudflare-api-plain-worker-provisioning-api.ts import the Cloudflare client, so the client reaching one of them would close a cycle. fleet-control-client-layers-are-one-way holds the client and those three modules in its pathNot, and packages/fleet-control is outside no-new-architecture-cycles.',
+      from: {
+        path: [
+          '^packages/fleet-control/src/cloudflare-client\\.ts$',
+          '^scripts/architecture-fixtures/fleet-control-client-imports-consumer\\.ts$',
+        ],
+      },
+      to: {
+        path: '^packages/fleet-control/src/(?:cloudflare-api-plain-worker-backend|cloudflare-api-plain-worker-provisioning-api|index)\\.ts$',
+        reachable: true,
+      },
+    },
+    {
+      name: 'fleet-control-export-port-does-not-reach-adapters',
+      severity: 'error',
+      comment:
+        'export-store.ts and r2-export-store.ts import DurableDatabaseExportStore from database-export-store.ts to implement it, so the port reaching either store would close a cycle. Those two imports are type-only, and tsPreCompilationDeps keeps a type-only edge in the graph.',
+      from: {
+        path: [
+          '^packages/fleet-control/src/database-export-store\\.ts$',
+          '^scripts/architecture-fixtures/fleet-control-export-port-imports-adapter\\.ts$',
+        ],
+      },
+      to: {
+        path: '^packages/fleet-control/src/(?:export-store|r2-export-store)\\.ts$',
+        reachable: true,
+      },
+    },
   ],
   required: [
     {

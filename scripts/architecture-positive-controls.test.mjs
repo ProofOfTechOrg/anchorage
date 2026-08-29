@@ -46,6 +46,10 @@ const controls = {
     'scripts/architecture-fixtures/fleet-control-port-imports-d1-adapter.ts',
   'fleet-control-worker-reachable-modules-avoid-node-builtins':
     'scripts/architecture-fixtures/fleet-control-worker-reachable-imports-node-builtin.ts',
+  'fleet-control-client-does-not-reach-its-consumers':
+    'scripts/architecture-fixtures/fleet-control-client-imports-consumer.ts',
+  'fleet-control-export-port-does-not-reach-adapters':
+    'scripts/architecture-fixtures/fleet-control-export-port-imports-adapter.ts',
 };
 
 test('every architecture rule has an executable positive control', () => {
