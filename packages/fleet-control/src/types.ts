@@ -1485,7 +1485,7 @@ export interface ProvisioningBackend {
    * Advances one bounded, read-only attachment scan chunk.
    *
    * It must use the same provider authority as this backend's teardown
-   * mutations, never perform an unbounded fallback, and returns no durable
+   * mutations, never perform an unbounded fallback, and return no durable
    * absence or deletion authority.
    */
   advanceDecommissionAttachmentScan?(
