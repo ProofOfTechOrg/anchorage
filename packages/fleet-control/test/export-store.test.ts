@@ -206,31 +206,40 @@ describe('FileSystemDatabaseExportStore', () => {
   it('preserves a refusal when an injected reader cancel throws', async () => {
     const parent = await temporaryDirectory();
     const root = join(parent, 'exports');
-    let cancellations = 0;
+    const cancellationReasons: unknown[] = [];
     const injected = {
       getReader() {
         return {
           async read(): Promise<{ done: true; value: undefined }> {
             return { done: true, value: undefined };
           },
-          cancel(): never {
-            cancellations += 1;
+          cancel(reason: unknown): never {
+            cancellationReasons.push(reason);
             throw new Error('synchronous reader cancel failure');
           },
           releaseLock(): void {},
         };
       },
     } as unknown as ReadableStream<Uint8Array>;
+    const store = new FileSystemDatabaseExportStore(root);
 
-    await expect(
-      new FileSystemDatabaseExportStore(root).write({
+    let refusal: unknown;
+    try {
+      await store.write({
         databaseId: 'database-1',
         fileName: 'database-1.sql',
         body: injected,
         contentLength: 1,
-      }),
-    ).rejects.toThrow('export size differs from contentLength');
-    expect(cancellations).toBe(1);
+      });
+    } catch (error) {
+      refusal = error;
+    }
+    expect(refusal).toBeInstanceOf(Error);
+    expect(refusal).toMatchObject({
+      message: 'export size differs from contentLength',
+    });
+    expect(cancellationReasons).toHaveLength(1);
+    expect(cancellationReasons[0]).toBe(refusal);
     await expect(readdir(root)).resolves.toEqual([]);
   });
 
