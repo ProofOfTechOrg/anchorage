@@ -807,6 +807,7 @@ describe('R2DatabaseExportStore', () => {
     );
     expect(error.cause).toBe(bucket.putError);
     expect(source.cancellations).toHaveLength(1);
+    expect(source.cancellations[0]).toBe(bucket.putError);
     expect(bucket.deleteCalls).toHaveLength(0);
   });
 

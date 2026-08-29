@@ -23,12 +23,12 @@ export type FixedLengthStreamConstructor = new (
 };
 
 export interface R2DatabaseExportStoreStreamPrimitives {
-  /**
-   * These constructors must return conforming Workers streams. If an injected
-   * writable fails to error its paired readable when abort is requested, the
-   * associated R2 put may not settle.
-   */
   readonly DigestStream: DigestStreamConstructor;
+  /**
+   * Must return a conforming Workers paired stream. If an injected writable
+   * fails to error its paired readable when abort is requested, the associated
+   * R2 put may not settle.
+   */
   readonly FixedLengthStream: FixedLengthStreamConstructor;
 }
 
