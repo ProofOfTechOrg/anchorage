@@ -1,0 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
+
+export const CLOUDFLARE_SDK_MAX_RETRIES = 2;
+export const CLOUDFLARE_SDK_MAX_ATTEMPTS = CLOUDFLARE_SDK_MAX_RETRIES + 1;

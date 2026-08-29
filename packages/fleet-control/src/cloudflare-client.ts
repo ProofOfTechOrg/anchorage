@@ -3,11 +3,11 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 import Cloudflare from 'cloudflare';
-import type { NamespaceListResponse } from 'cloudflare/resources/workers-for-platforms/dispatch/namespaces/namespaces';
 import { toFile } from 'cloudflare/uploads';
 import PQueue from 'p-queue';
 import { exactActiveVersionId } from './active-route.js';
 import { canonicalApplicationBindings } from './application-bindings.js';
+import { CLOUDFLARE_SDK_MAX_RETRIES } from './cloudflare-client-config.js';
 import {
   attachCustomDomain,
   type CloudflareSdk,
@@ -41,6 +41,15 @@ import {
   sanitizedErrorName,
 } from './cloudflare-provider-errors.js';
 import type { CloudflareApiRateCoordinator } from './cloudflare-rate-coordinator.js';
+import {
+  advanceWorkerAttachmentScan,
+  type CloudflareWorkerAttachmentScanContext,
+  listAllDispatchScripts,
+  listAllWorkerAttachments,
+  type WorkerAttachmentScanChunk,
+  type WorkerAttachmentScanProgress,
+  type WorkerAttachmentScanTarget,
+} from './cloudflare-worker-attachment-scan.js';
 import type { DurableDatabaseExportStore } from './database-export-store.js';
 import {
   type HostRoutingTarget,
@@ -358,6 +367,17 @@ let trackProviderDispatch: <T>(
   operation: () => Promise<T>,
 ) => Promise<T>;
 
+let scanProviderAttachments: (
+  client: CloudflareProvisioningClient,
+  input: {
+    readonly target: WorkerAttachmentScanTarget;
+    readonly progress: WorkerAttachmentScanProgress;
+    readonly maxProviderRequests: number;
+    readonly signal?: AbortSignal;
+    readonly stopOnFirstAttachment?: boolean;
+  },
+) => Promise<WorkerAttachmentScanChunk>;
+
 /**
  * Runs `operation`; rejects with
  * `CloudflareProviderRequestNotDispatchedError` (`cause` = the failure) when it
@@ -373,12 +393,27 @@ export function withProviderDispatchTracking<T>(
   return trackProviderDispatch(client, operation);
 }
 
+/** @internal Package-private seam for the resumable lifecycle engine. */
+export function advanceCloudflareWorkerAttachmentScan(
+  client: CloudflareProvisioningClient,
+  input: {
+    readonly target: WorkerAttachmentScanTarget;
+    readonly progress: WorkerAttachmentScanProgress;
+    readonly maxProviderRequests: number;
+    readonly signal?: AbortSignal;
+    readonly stopOnFirstAttachment?: boolean;
+  },
+): Promise<WorkerAttachmentScanChunk> {
+  return scanProviderAttachments(client, input);
+}
+
 export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   readonly #accountId: string;
   readonly #apiToken: string;
   readonly #dispatchNamespace: string | undefined;
   readonly #client: CloudflareSdk;
   readonly #ordinary: OrdinaryWorkerContext;
+  readonly #attachmentScan: CloudflareWorkerAttachmentScanContext;
   readonly #operationQueue: PQueue;
   readonly #requestQueue: PQueue;
   readonly #rateCoordinator: CloudflareApiRateCoordinator;
@@ -394,6 +429,8 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     // enters it, and Workers for Platforms callers never do.
     trackProviderDispatch = (client, operation) =>
       client.#trackDispatch(operation);
+    scanProviderAttachments = (client, input) =>
+      advanceWorkerAttachmentScan(client.#attachmentScan, input);
   }
 
   constructor(
@@ -449,7 +486,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       // An injected logger cannot be disabled independently, so the client
       // option must override CLOUDFLARE_LOG before credentials reach the SDK.
       logLevel: 'off',
-      maxRetries: 2,
+      maxRetries: CLOUDFLARE_SDK_MAX_RETRIES,
       // The SDK timeout starts before its custom transport. Apply the real
       // timeout after shared quota acquisition so replica coordination cannot
       // consume the network request's lease-bounded execution budget.
@@ -464,6 +501,22 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       withMutationFence: (fence, operation) =>
         this.withMutationFence(fence, operation),
       workerRouteZoneIds: () => this.#workerRouteZoneIds(),
+    };
+    this.#attachmentScan = {
+      accountId: this.#accountId,
+      client: this.#client,
+      dispatchNamespace: this.#dispatchNamespace,
+      requestDispatchScriptPage: ({ namespace, cursor, perPage, signal }) => {
+        const url = new URL(
+          `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(this.#accountId)}/workers/dispatch/namespaces/${encodeURIComponent(namespace)}/scripts`,
+        );
+        url.searchParams.set('per_page', String(perPage));
+        if (cursor) url.searchParams.set('cursor', cursor);
+        return this.#request(url, {
+          headers: { authorization: `Bearer ${this.#apiToken}` },
+          signal,
+        });
+      },
     };
   }
 
@@ -707,34 +760,6 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     });
   }
 
-  async *#dispatchNamespaces(): AsyncGenerator<NamespaceListResponse> {
-    let yielded = false;
-    try {
-      const listed = this.#client.workersForPlatforms.dispatch.namespaces.list({
-        account_id: this.#accountId,
-      });
-      for await (const namespace of this.#collectBounded(
-        listed,
-        'dispatch namespace inventory',
-      )) {
-        yielded = true;
-        yield namespace;
-      }
-    } catch (error) {
-      // Only a plain-only account can prove the account-wide namespace set is
-      // empty from an initial 404; a partial scan is never exhaustive. The
-      // installed SDK's SinglePage never issues a second request, so the
-      // yielded guard is a forward-looking invariant rather than a live path.
-      if (
-        this.#dispatchNamespace !== undefined ||
-        yielded ||
-        !isNotFound(error)
-      ) {
-        throw error;
-      }
-    }
-  }
-
   async listWorkerDatabaseAttachments(databaseId: string): Promise<
     readonly Readonly<{
       scriptName: string;
@@ -742,121 +767,10 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       dispatchNamespace?: string;
     }>[]
   > {
-    const attachments: Array<{
-      scriptName: string;
-      plane: 'ordinary' | 'dispatch';
-      dispatchNamespace?: string;
-    }> = [];
-    const attachmentKeys = new Set<string>();
-    const addAttachment = (
-      scriptName: string,
-      plane: 'ordinary' | 'dispatch',
-      dispatchNamespace?: string,
-    ): void => {
-      const key = `${plane}:${dispatchNamespace ?? ''}:${scriptName}`;
-      if (attachmentKeys.has(key)) return;
-      attachmentKeys.add(key);
-      attachments.push({
-        scriptName,
-        plane,
-        ...(dispatchNamespace ? { dispatchNamespace } : {}),
-      });
-    };
-    for await (const script of this.#collectBounded(
-      this.#client.workers.scripts.list({ account_id: this.#accountId }),
-      'ordinary Worker script inventory',
-    )) {
-      if (typeof script.id !== 'string' || script.id.length === 0) {
-        throw new Error(
-          'Cloudflare ordinary Worker listing contained a script without an id',
-        );
-      }
-      const deployments = await this.#client.workers.scripts.deployments.list(
-        script.id,
-        {
-          account_id: this.#accountId,
-        },
-      );
-      const active = deployments.deployments[0];
-      if (!active) continue;
-      if (!Array.isArray(active.versions) || active.versions.length === 0) {
-        throw new Error(
-          `Cloudflare current deployment for ordinary Worker '${script.id}' had no versions`,
-        );
-      }
-      let hasLiveVersion = false;
-      const currentVersions = active.versions.map((deployedVersion) => {
-        if (
-          typeof deployedVersion.percentage !== 'number' ||
-          !Number.isFinite(deployedVersion.percentage) ||
-          deployedVersion.percentage < 0 ||
-          deployedVersion.percentage > 100 ||
-          typeof deployedVersion.version_id !== 'string' ||
-          deployedVersion.version_id.length === 0
-        ) {
-          throw new Error(
-            `Cloudflare current deployment for ordinary Worker '${script.id}' had malformed version metadata`,
-          );
-        }
-        if (deployedVersion.percentage > 0) hasLiveVersion = true;
-        return deployedVersion;
-      });
-      if (!hasLiveVersion) {
-        throw new Error(
-          `Cloudflare current deployment for ordinary Worker '${script.id}' had no live versions`,
-        );
-      }
-      for (const deployedVersion of currentVersions) {
-        const version = await this.#client.workers.scripts.versions.get(
-          deployedVersion.version_id,
-          { account_id: this.#accountId, script_name: script.id },
-        );
-        if (
-          (version.resources.bindings ?? []).some(
-            (binding) =>
-              binding.type === 'd1' && binding.database_id === databaseId,
-          )
-        ) {
-          addAttachment(script.id, 'ordinary');
-          break;
-        }
-      }
-    }
-    for await (const namespace of this.#dispatchNamespaces()) {
-      if (
-        typeof namespace.namespace_name !== 'string' ||
-        namespace.namespace_name.length === 0
-      ) {
-        throw new Error(
-          'Cloudflare dispatch namespace listing contained an unidentified namespace',
-        );
-      }
-      for (const script of await this.#dispatchScripts(
-        namespace.namespace_name,
-      )) {
-        const settings =
-          await this.#client.workersForPlatforms.dispatch.namespaces.scripts.settings.get(
-            script.id,
-            {
-              account_id: this.#accountId,
-              dispatch_namespace: namespace.namespace_name,
-            },
-          );
-        if (
-          (settings.bindings ?? []).some(
-            (binding) =>
-              binding.type === 'd1' && binding.database_id === databaseId,
-          )
-        ) {
-          addAttachment(script.id, 'dispatch', namespace.namespace_name);
-        }
-      }
-    }
-    return attachments.sort((left, right) =>
-      `${left.plane}:${left.dispatchNamespace ?? ''}:${left.scriptName}`.localeCompare(
-        `${right.plane}:${right.dispatchNamespace ?? ''}:${right.scriptName}`,
-      ),
-    );
+    return listAllWorkerAttachments(this.#attachmentScan, {
+      kind: 'd1',
+      databaseId,
+    });
   }
 
   async listWorkerR2Attachments(bucketName: string): Promise<
@@ -866,77 +780,10 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       dispatchNamespace?: string;
     }>[]
   > {
-    const attachments: Array<{
-      scriptName: string;
-      plane: 'ordinary' | 'dispatch';
-      dispatchNamespace?: string;
-    }> = [];
-    for await (const script of this.#collectBounded(
-      this.#client.workers.scripts.list({ account_id: this.#accountId }),
-      'ordinary Worker script inventory',
-    )) {
-      if (!script.id) throw new Error('ordinary Worker has no id');
-      const deployments = await this.#client.workers.scripts.deployments.list(
-        script.id,
-        { account_id: this.#accountId },
-      );
-      for (const deployed of deployments.deployments[0]?.versions ?? []) {
-        if (!deployed.version_id) {
-          throw new Error(
-            `ordinary Worker '${script.id}' has a malformed version`,
-          );
-        }
-        const version = await this.#client.workers.scripts.versions.get(
-          deployed.version_id,
-          { account_id: this.#accountId, script_name: script.id },
-        );
-        if (
-          (version.resources.bindings ?? []).some(
-            (binding) =>
-              binding.type === 'r2_bucket' &&
-              binding.bucket_name === bucketName,
-          )
-        ) {
-          attachments.push({ scriptName: script.id, plane: 'ordinary' });
-          break;
-        }
-      }
-    }
-    for await (const namespace of this.#dispatchNamespaces()) {
-      if (!namespace.namespace_name) {
-        throw new Error('dispatch namespace has no name');
-      }
-      for (const script of await this.#dispatchScripts(
-        namespace.namespace_name,
-      )) {
-        const settings =
-          await this.#client.workersForPlatforms.dispatch.namespaces.scripts.settings.get(
-            script.id,
-            {
-              account_id: this.#accountId,
-              dispatch_namespace: namespace.namespace_name,
-            },
-          );
-        if (
-          (settings.bindings ?? []).some(
-            (binding) =>
-              binding.type === 'r2_bucket' &&
-              binding.bucket_name === bucketName,
-          )
-        ) {
-          attachments.push({
-            scriptName: script.id,
-            plane: 'dispatch',
-            dispatchNamespace: namespace.namespace_name,
-          });
-        }
-      }
-    }
-    return attachments.sort((left, right) =>
-      `${left.plane}:${left.dispatchNamespace ?? ''}:${left.scriptName}`.localeCompare(
-        `${right.plane}:${right.dispatchNamespace ?? ''}:${right.scriptName}`,
-      ),
-    );
+    return listAllWorkerAttachments(this.#attachmentScan, {
+      kind: 'r2',
+      bucketName,
+    });
   }
 
   async getR2Bucket(
@@ -1036,95 +883,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   async #dispatchScripts(
     dispatchNamespace: string,
   ): Promise<readonly Readonly<{ id: string; tags: readonly string[] }>[]> {
-    const scripts: Array<Readonly<{ id: string; tags: readonly string[] }>> =
-      [];
-    let itemCount = 0;
-    let cursor: string | undefined;
-    const seenCursors = new Set<string>();
-    do {
-      const url = new URL(
-        `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(this.#accountId)}/workers/dispatch/namespaces/${encodeURIComponent(dispatchNamespace)}/scripts`,
-      );
-      url.searchParams.set('per_page', '1000');
-      if (cursor) url.searchParams.set('cursor', cursor);
-      let response: Response | undefined;
-      for (let attempt = 0; attempt < 3; attempt += 1) {
-        response = await this.#request(url, {
-          headers: { authorization: `Bearer ${this.#apiToken}` },
-        });
-        if (response.status !== 429 && response.status < 500) break;
-      }
-      if (!response?.ok) {
-        throw new Error(
-          `Cloudflare dispatch script listing failed with status ${response?.status ?? 'unknown'}`,
-        );
-      }
-      const payload: unknown = await response.json();
-      if (!payload || typeof payload !== 'object' || !('result' in payload)) {
-        throw new Error('Cloudflare dispatch script listing was malformed');
-      }
-      const result = payload.result;
-      if (!Array.isArray(result)) {
-        throw new Error(
-          'Cloudflare dispatch script listing had no result array',
-        );
-      }
-      for (const item of result) {
-        itemCount += 1;
-        if (itemCount > DEFAULT_INVENTORY_BOUND) {
-          throw inventoryBoundExceeded(
-            'dispatch script inventory',
-            DEFAULT_INVENTORY_BOUND,
-          );
-        }
-        if (!item || typeof item !== 'object' || !('id' in item)) {
-          throw new Error(
-            'Cloudflare dispatch script listing contained an invalid item',
-          );
-        }
-        const id = item.id;
-        const tags = 'tags' in item ? item.tags : undefined;
-        if (
-          typeof id !== 'string' ||
-          id.length === 0 ||
-          (tags !== undefined &&
-            (!Array.isArray(tags) ||
-              !tags.every((tag) => typeof tag === 'string')))
-        ) {
-          throw new Error(
-            'Cloudflare dispatch script listing contained malformed script metadata',
-          );
-        }
-        scripts.push({ id, tags: (tags as string[] | undefined) ?? [] });
-      }
-      const resultInfo =
-        'result_info' in payload &&
-        payload.result_info &&
-        typeof payload.result_info === 'object'
-          ? payload.result_info
-          : undefined;
-      const cursors =
-        resultInfo && 'cursors' in resultInfo && resultInfo.cursors
-          ? resultInfo.cursors
-          : undefined;
-      const nextCursor =
-        resultInfo && 'cursor' in resultInfo
-          ? resultInfo.cursor
-          : cursors && typeof cursors === 'object' && 'after' in cursors
-            ? cursors.after
-            : undefined;
-      cursor =
-        typeof nextCursor === 'string' && nextCursor ? nextCursor : undefined;
-      if (cursor) {
-        if (seenCursors.has(cursor)) {
-          throw new Error(
-            'Cloudflare dispatch script listing repeated a cursor',
-          );
-        }
-        seenCursors.add(cursor);
-      }
-    } while (cursor);
-    return scripts;
+    return listAllDispatchScripts(this.#attachmentScan, dispatchNamespace);
   }
 
   async listOrdinaryWorkerDatabases(
