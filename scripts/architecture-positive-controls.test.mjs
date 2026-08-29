@@ -72,6 +72,7 @@ for (const [ruleName, fixture] of Object.entries(controls)) {
     const result = spawnSync(process.execPath, args, {
       cwd: fileURLToPath(new URL('..', import.meta.url)),
       encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
     });
     const command = [process.execPath, ...args].join(' ');
     if (result.error) {
