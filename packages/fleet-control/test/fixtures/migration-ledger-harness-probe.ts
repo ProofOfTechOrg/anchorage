@@ -122,7 +122,8 @@ async function coldApplication(db: D1Database): Promise<unknown> {
   await db.prepare(`DROP TABLE IF EXISTS ${LEDGER}`).run();
   const coldBefore = await db
     .prepare(
-      `SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = ?`,
+      `SELECT COUNT(*) AS count FROM sqlite_master
+       WHERE type = 'table' AND name = ?`,
     )
     .bind(LEDGER)
     .first<{ count: number }>();

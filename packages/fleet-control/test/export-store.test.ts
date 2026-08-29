@@ -185,6 +185,7 @@ describe('FileSystemDatabaseExportStore', () => {
         1_000,
       );
     });
+
     try {
       await expect(
         Promise.race([
