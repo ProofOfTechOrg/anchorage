@@ -165,6 +165,9 @@ class FakeR2Bucket implements R2Bucket {
   readonly objects = new Map<string, Uint8Array>();
   readonly deleteCalls: string[] = [];
   putCalls = 0;
+  onPut: (() => void) | undefined;
+  transformPutResult: ((object: R2Object) => R2Object) | undefined;
+  transformGetResult: ((object: R2ObjectBody) => R2ObjectBody) | undefined;
   putMode: PutMode = 'normal';
   putResolveAfterBytes: number | undefined;
   getMode: GetMode = 'normal';
@@ -199,12 +202,13 @@ class FakeR2Bucket implements R2Bucket {
         : this.getMode === 'short'
           ? stored.slice(0, -1)
           : stored;
-    return objectBody(
+    const result = objectBody(
       key,
       reportedSize,
       bodyBytes,
       this.getMode === 'read-error' ? this.readError : undefined,
     );
+    return this.transformGetResult?.(result) ?? result;
   }
 
   put(
@@ -219,6 +223,7 @@ class FakeR2Bucket implements R2Bucket {
     options?: R2PutOptions,
   ): Promise<R2Object | null> {
     this.putCalls += 1;
+    this.onPut?.();
     if (!isReadable(value)) throw new Error('fake expects a readable stream');
     if (this.putMode === 'null-before-read') return null;
     if (this.putMode === 'reject-before') throw this.putError;
@@ -237,7 +242,8 @@ class FakeR2Bucket implements R2Bucket {
         const result = combineChunks(chunks, size);
         reader.releaseLock();
         this.objects.set(key, result);
-        return metadata(key, size);
+        const object = metadata(key, size);
+        return this.transformPutResult?.(object) ?? object;
       }
       if (this.putMode === 'reject-mid') {
         await reader.cancel(this.putError);
@@ -254,7 +260,11 @@ class FakeR2Bucket implements R2Bucket {
         : undefined;
     if (conditional === '*' && this.objects.has(key)) return null;
     this.objects.set(key, result);
-    return metadata(key, this.putMode === 'size-mismatch' ? size + 1 : size);
+    const object = metadata(
+      key,
+      this.putMode === 'size-mismatch' ? size + 1 : size,
+    );
+    return this.transformPutResult?.(object) ?? object;
   }
 
   async delete(keys: string | string[]): Promise<void> {
@@ -295,6 +305,20 @@ function combineChunks(
   return result;
 }
 
+function throwingProperty<T extends object, K extends keyof T>(
+  value: T,
+  property: K,
+  error: Error,
+): T {
+  return Object.defineProperty({ ...value }, property, {
+    configurable: true,
+    enumerable: true,
+    get(): never {
+      throw error;
+    },
+  }) as T;
+}
+
 function createStore(
   bucket: R2Bucket,
   options: {
@@ -324,6 +348,20 @@ async function rejection(
   if (!(state[0].reason instanceof Error)) throw new Error('expected Error');
   expect(state[0].reason.message).toMatch(exactly(message));
   return state[0].reason;
+}
+
+async function within<T>(operation: Promise<T>, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), 250);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 describe('Node Worker stream fixtures', () => {
@@ -516,6 +554,53 @@ describe('R2DatabaseExportStore', () => {
     }
   });
 
+  it('cancels before upload when a fixed stream half getter throws', async () => {
+    for (const property of [
+      'readable',
+      'writable',
+    ] satisfies readonly (keyof NodeFixedLengthStream)[]) {
+      const sentinel = new Error(`${property} getter failed`);
+      class ThrowingFixedLengthStream {
+        readonly #fixed: NodeFixedLengthStream;
+
+        constructor(expectedLength: number) {
+          this.#fixed = new NodeFixedLengthStream(expectedLength);
+        }
+
+        get readable(): WorkerReadableStream<Uint8Array> {
+          if (property === 'readable') throw sentinel;
+          return this.#fixed.readable;
+        }
+
+        get writable(): WorkerWritableStream<Uint8Array> {
+          if (property === 'writable') throw sentinel;
+          return this.#fixed.writable;
+        }
+      }
+      const bucket = new FakeR2Bucket();
+      const source = streamFrom(bytes(1), { stayOpen: true });
+      const error = await rejection(
+        createStore(bucket, {
+          streams: {
+            ...nodeWorkerStreams,
+            FixedLengthStream: ThrowingFixedLengthStream,
+          },
+        }).write({
+          databaseId: 'db',
+          fileName: 'x.db',
+          body: source.body,
+          contentLength: 1,
+        }),
+        sentinel.message,
+      );
+      expect(error).toBe(sentinel);
+      expect(source.cancellations).toEqual([sentinel]);
+      expect(bucket.putCalls).toBe(0);
+      expect(bucket.deleteCalls).toHaveLength(0);
+      expect(bucket.objects).toHaveLength(0);
+    }
+  });
+
   it('preserves a refusal when source cancellation rejects', async () => {
     const bucket = new FakeR2Bucket();
     const source = streamFrom(bytes(1), { rejectCancel: true });
@@ -603,6 +688,108 @@ describe('R2DatabaseExportStore', () => {
       expect(bucket.objects).toHaveLength(0);
       expect(bucket.deleteCalls).toHaveLength(0);
     }
+  });
+
+  it('starts the put before piping the source', async () => {
+    const events: string[] = [];
+    const bucket = new FakeR2Bucket();
+    bucket.onPut = () => events.push('put');
+    const source = streamFrom(bytes(1, 2, 3, 4));
+    const body = {
+      locked: false,
+      pipeTo(destination: unknown): Promise<void> {
+        events.push('pipe');
+        return source.body.pipeTo(destination as WritableStream<Uint8Array>);
+      },
+    } as unknown as ReadableStream<Uint8Array>;
+
+    await within(
+      createStore(bucket).write({
+        databaseId: 'db',
+        fileName: 'x.db',
+        body,
+        contentLength: 4,
+      }),
+      'ordered upload did not settle',
+    );
+
+    expect(events).toEqual(['put', 'pipe']);
+    expect(bucket.objects.get('db/uuid-1-x.db')).toEqual(bytes(1, 2, 3, 4));
+  });
+
+  it('does not pipe or await cancellation when put throws synchronously', async () => {
+    const sentinel = new Error('synchronous put failure');
+    const events: string[] = [];
+    const cancellations: unknown[] = [];
+    const bucket = {
+      put(): never {
+        events.push('put');
+        throw sentinel;
+      },
+      get(): never {
+        throw new Error('get must not run');
+      },
+      delete(): never {
+        throw new Error('delete must not run');
+      },
+    } as unknown as R2Bucket;
+    const body = {
+      locked: false,
+      cancel(reason: unknown): Promise<never> {
+        cancellations.push(reason);
+        return new Promise(() => undefined);
+      },
+      pipeTo(): Promise<void> {
+        events.push('pipe');
+        return Promise.resolve();
+      },
+    } as unknown as ReadableStream<Uint8Array>;
+
+    const error = await rejection(
+      within(
+        createStore(bucket).write({
+          databaseId: 'db',
+          fileName: 'x.db',
+          body,
+          contentLength: 1,
+        }),
+        'synchronous put handling did not settle',
+      ),
+      'R2 export upload failed',
+    );
+
+    expect(error.cause).toBe(sentinel);
+    expect(events).toEqual(['put']);
+    expect(cancellations).toEqual([sentinel]);
+  });
+
+  it('funnels a synchronous source pipe throw and settles the upload', async () => {
+    const sentinel = new Error('synchronous pipe failure');
+    const bucket = new FakeR2Bucket();
+    const body = {
+      locked: false,
+      pipeTo(): never {
+        throw sentinel;
+      },
+    } as unknown as ReadableStream<Uint8Array>;
+
+    const error = await rejection(
+      within(
+        createStore(bucket).write({
+          databaseId: 'db',
+          fileName: 'x.db',
+          body,
+          contentLength: 1,
+        }),
+        'synchronous pipe handling did not settle',
+      ),
+      'R2 export upload failed',
+    );
+
+    expect(error.cause).toBe(sentinel);
+    expect(bucket.putCalls).toBe(1);
+    expect(bucket.deleteCalls).toHaveLength(0);
+    expect(bucket.objects).toHaveLength(0);
   });
 
   it('aborts the source when put rejects prior to reading', async () => {
@@ -803,6 +990,203 @@ describe('R2DatabaseExportStore', () => {
     );
     expect(error.cause).toBe(sentinel);
     expect(bucket.deleteCalls).toEqual(['db/uuid-1-x.db']);
+  });
+
+  it('cleans owned objects when upload and stored metadata getters throw', async () => {
+    for (const target of [
+      'uploaded-size',
+      'stored-size',
+      'stored-body',
+    ] as const) {
+      const sentinel = new Error(`${target} failed`);
+      const bucket = new FakeR2Bucket();
+      if (target === 'uploaded-size') {
+        bucket.transformPutResult = (object) =>
+          throwingProperty(object, 'size', sentinel);
+      } else {
+        bucket.transformGetResult = (object) =>
+          throwingProperty(
+            object,
+            target === 'stored-size' ? 'size' : 'body',
+            sentinel,
+          );
+      }
+      const error = await rejection(
+        createStore(bucket).write({
+          databaseId: 'db',
+          fileName: 'x.db',
+          body: streamFrom(bytes(1, 2)).body,
+          contentLength: 2,
+        }),
+        target === 'uploaded-size'
+          ? 'R2 export upload failed'
+          : 'R2 export readback failed',
+      );
+      expect(error.cause).toBe(sentinel);
+      expect(bucket.deleteCalls).toEqual(['db/uuid-1-x.db']);
+      expect(bucket.objects).toHaveLength(0);
+    }
+  });
+
+  it('cleans owned objects when digest reads and conversions throw', async () => {
+    for (const target of [
+      'digest',
+      'bytes-written',
+      'bytes-number',
+      'hex',
+    ] as const) {
+      const sentinel = new Error(`${target} failed`);
+      class ThrowingDigestRead extends WritableStream<
+        ArrayBuffer | ArrayBufferView
+      > {
+        constructor(_algorithm: 'SHA-256') {
+          super();
+        }
+
+        get digest(): Promise<ArrayBuffer> {
+          if (target === 'digest') throw sentinel;
+          if (target === 'hex') {
+            const malformed = new Proxy(Object.create(null), {
+              get(_target, property): unknown {
+                if (property === 'then') return undefined;
+                throw sentinel;
+              },
+            });
+            return Promise.resolve(malformed as ArrayBuffer);
+          }
+          return Promise.resolve(new Uint8Array(32).buffer);
+        }
+
+        get bytesWritten(): number | bigint {
+          if (target === 'bytes-written') throw sentinel;
+          if (target === 'bytes-number') {
+            return {
+              [Symbol.toPrimitive](): never {
+                throw sentinel;
+              },
+            } as unknown as number;
+          }
+          return 2;
+        }
+      }
+      const bucket = new FakeR2Bucket();
+      const error = await rejection(
+        createStore(bucket, {
+          streams: {
+            ...nodeWorkerStreams,
+            DigestStream: ThrowingDigestRead,
+          },
+        }).write({
+          databaseId: 'db',
+          fileName: 'x.db',
+          body: streamFrom(bytes(1, 2)).body,
+          contentLength: 2,
+        }),
+        'R2 export readback failed',
+      );
+      expect(error.cause).toBe(sentinel);
+      expect(bucket.deleteCalls).toEqual(['db/uuid-1-x.db']);
+      expect(bucket.objects).toHaveLength(0);
+    }
+  });
+
+  it('does not await a pending digest after a readback pipe failure', async () => {
+    const readError = new Error('readback pipe failed');
+    const digestAborts: unknown[] = [];
+    class PendingDigestStream extends WritableStream<
+      ArrayBuffer | ArrayBufferView
+    > {
+      readonly digest = new Promise<ArrayBuffer>(() => undefined);
+      readonly bytesWritten = 0;
+
+      constructor(_algorithm: 'SHA-256') {
+        super();
+      }
+
+      override abort(reason?: unknown): Promise<void> {
+        digestAborts.push(reason);
+        return super.abort(reason);
+      }
+    }
+    const bucket = new FakeR2Bucket();
+    bucket.transformGetResult = (object) => {
+      Object.defineProperty(object, 'body', {
+        configurable: true,
+        enumerable: true,
+        value: {
+          pipeTo(): never {
+            throw readError;
+          },
+        } as unknown as WorkerReadableStream<Uint8Array>,
+      });
+      return object;
+    };
+    const error = await rejection(
+      within(
+        createStore(bucket, {
+          streams: {
+            ...nodeWorkerStreams,
+            DigestStream: PendingDigestStream,
+          },
+        }).write({
+          databaseId: 'db',
+          fileName: 'x.db',
+          body: streamFrom(bytes(1, 2)).body,
+          contentLength: 2,
+        }),
+        'readback failure awaited a pending digest',
+      ),
+      'R2 export readback failed',
+    );
+    expect(error.cause).toBe(readError);
+    expect(digestAborts).toEqual([readError]);
+    expect(bucket.deleteCalls).toEqual(['db/uuid-1-x.db']);
+    expect(bucket.objects).toHaveLength(0);
+  });
+
+  it('prefers a readback pipe failure over an observed digest rejection', async () => {
+    const readError = new Error('readback pipe failed');
+    const digestError = new Error('digest failed first');
+    class RejectedDigestStream extends WritableStream<
+      ArrayBuffer | ArrayBufferView
+    > {
+      readonly digest = Promise.reject(digestError);
+      readonly bytesWritten = 0;
+
+      constructor(_algorithm: 'SHA-256') {
+        super();
+      }
+    }
+    const bucket = new FakeR2Bucket();
+    bucket.transformGetResult = (object) => {
+      Object.defineProperty(object, 'body', {
+        configurable: true,
+        enumerable: true,
+        value: {
+          pipeTo(): Promise<never> {
+            return Promise.reject(readError);
+          },
+        } as unknown as WorkerReadableStream<Uint8Array>,
+      });
+      return object;
+    };
+    const error = await rejection(
+      createStore(bucket, {
+        streams: {
+          ...nodeWorkerStreams,
+          DigestStream: RejectedDigestStream,
+        },
+      }).write({
+        databaseId: 'db',
+        fileName: 'x.db',
+        body: streamFrom(bytes(1, 2)).body,
+        contentLength: 2,
+      }),
+      'R2 export readback failed',
+    );
+    expect(error.cause).toBe(readError);
+    expect(bucket.deleteCalls).toEqual(['db/uuid-1-x.db']);
+    expect(bucket.objects).toHaveLength(0);
   });
 
   it('aggregates an owned failure with a cleanup rejection', async () => {

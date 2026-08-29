@@ -23,6 +23,11 @@ export type FixedLengthStreamConstructor = new (
 };
 
 export interface R2DatabaseExportStoreStreamPrimitives {
+  /**
+   * These constructors must return conforming Workers streams. If an injected
+   * writable fails to error its paired readable when abort is requested, the
+   * associated R2 put may not settle.
+   */
   readonly DigestStream: DigestStreamConstructor;
   readonly FixedLengthStream: FixedLengthStreamConstructor;
 }
@@ -137,20 +142,32 @@ export class R2DatabaseExportStore implements DurableDatabaseExportStore {
       });
     const controller = new AbortController();
     const collision = new Error('R2 export key already exists');
-    // A conforming R2Bucket.put returns a promise; a synchronous throw from
-    // an injected put escapes the fixed-message set. Wrapping the call would
-    // start the put after the pipe, so it stays bare.
-    const put = this.#bucket.put(prepared.key, prepared.fixed.readable, {
-      onlyIf: { etagDoesNotMatch: '*' },
-    });
-    const pipe = input.body.pipeTo(prepared.fixed.writable, {
-      signal: controller.signal,
-    });
+    // The wrapper prevents promise assimilation: the provider call starts
+    // before the pipe without waiting for the provider promise to settle.
+    const putStartState = await settled(() => ({
+      operation: this.#bucket.put(prepared.key, prepared.fixed.readable, {
+        onlyIf: { etagDoesNotMatch: '*' },
+      }),
+    }));
+    if (putStartState.status === 'rejected') {
+      try {
+        void input.body.cancel(putStartState.reason).catch(() => undefined);
+      } catch {}
+      throw new Error('R2 export upload failed', {
+        cause: putStartState.reason,
+      });
+    }
+    const put = putStartState.value.operation;
+    const pipe = funnel(() =>
+      input.body.pipeTo(prepared.fixed.writable, {
+        signal: controller.signal,
+      }),
+    );
     // `pipeTo` can reject before locking its destination, and the body can be
     // locked between the check and this call; erroring the fixed writable
     // settles the put.
     void pipe.catch((reason: unknown) => {
-      void prepared.fixed.writable.abort(reason).catch(() => undefined);
+      void settled(() => prepared.fixed.writable.abort(reason));
     });
     void put.then(
       (object) => {
@@ -163,7 +180,8 @@ export class R2DatabaseExportStore implements DurableDatabaseExportStore {
     if (putState.status === 'rejected') {
       throw new Error('R2 export upload failed', { cause: putState.reason });
     }
-    if (putState.value === null) throw collision;
+    const uploaded = putState.value;
+    if (uploaded === null) throw collision;
     if (pipeState.status === 'rejected') {
       return this.#failOwned(
         prepared.key,
@@ -172,7 +190,12 @@ export class R2DatabaseExportStore implements DurableDatabaseExportStore {
         }),
       );
     }
-    if (putState.value.size !== prepared.contentLength) {
+    const uploadedSize = await this.#ownedValue(
+      prepared.key,
+      'R2 export upload failed',
+      () => uploaded.size,
+    );
+    if (uploadedSize !== prepared.contentLength) {
       return this.#failOwned(
         prepared.key,
         new Error('R2 export size differs from contentLength'),
@@ -193,7 +216,12 @@ export class R2DatabaseExportStore implements DurableDatabaseExportStore {
         new Error('R2 export readback found no object'),
       );
     }
-    if (stored.size !== prepared.contentLength) {
+    const storedSize = await this.#ownedValue(
+      prepared.key,
+      'R2 export readback failed',
+      () => stored.size,
+    );
+    if (storedSize !== prepared.contentLength) {
       return this.#failOwned(
         prepared.key,
         new Error('R2 export readback size differs from contentLength'),
@@ -212,17 +240,32 @@ export class R2DatabaseExportStore implements DurableDatabaseExportStore {
       );
     }
     const digest = digestConstructorState.value;
-    const readback: WorkerReadableStream<Uint8Array> = stored.body;
-    const [readState, digestState] = await Promise.allSettled([
-      readback.pipeTo(digest),
-      digest.digest,
-    ]);
+    const readback: WorkerReadableStream<Uint8Array> = await this.#ownedValue(
+      prepared.key,
+      'R2 export readback failed',
+      () => stored.body,
+    );
+    // Capture without assimilating: the pipe must start before this promise is
+    // awaited. Observe rejection now, but await settlement only after the pipe.
+    const capturedDigest = await this.#ownedValue(
+      prepared.key,
+      'R2 export readback failed',
+      () => {
+        const promise = digest.digest;
+        void promise.catch(() => undefined);
+        return { promise };
+      },
+    );
+    const digestSettlement = settled(() => capturedDigest.promise);
+    const readState = await settled(() => readback.pipeTo(digest));
     if (readState.status === 'rejected') {
+      void settled(() => digest.abort(readState.reason));
       return this.#failOwned(
         prepared.key,
         new Error('R2 export readback failed', { cause: readState.reason }),
       );
     }
+    const digestState = await digestSettlement;
     if (digestState.status === 'rejected') {
       return this.#failOwned(
         prepared.key,
@@ -231,17 +274,27 @@ export class R2DatabaseExportStore implements DurableDatabaseExportStore {
     }
     // Commit size, read metadata, and streamed byte count identify distinct
     // disagreement points without buffering the export.
-    if (Number(digest.bytesWritten) !== prepared.contentLength) {
+    const bytesWritten = await this.#ownedValue(
+      prepared.key,
+      'R2 export readback failed',
+      () => Number(digest.bytesWritten),
+    );
+    if (bytesWritten !== prepared.contentLength) {
       return this.#failOwned(
         prepared.key,
         new Error('R2 export readback length differs from contentLength'),
       );
     }
+    const sha256 = await this.#ownedValue(
+      prepared.key,
+      'R2 export readback failed',
+      () => toHex(digestState.value),
+    );
 
     return {
       location: `r2://${this.#bucketName}/${prepared.key}`,
       size: prepared.contentLength,
-      sha256: toHex(digestState.value),
+      sha256,
     };
   }
 
@@ -274,11 +327,27 @@ export class R2DatabaseExportStore implements DurableDatabaseExportStore {
       );
     }
     const key = `${this.#keyPrefix}${input.databaseId}/${uuid}-${input.fileName}`;
+    const fixed = new this.#FixedLengthStream(input.contentLength);
     return {
       key,
       contentLength: input.contentLength,
-      fixed: new this.#FixedLengthStream(input.contentLength),
+      fixed: {
+        readable: fixed.readable,
+        writable: fixed.writable,
+      },
     };
+  }
+
+  async #ownedValue<T>(
+    key: string,
+    message: 'R2 export upload failed' | 'R2 export readback failed',
+    operation: () => T | PromiseLike<T>,
+  ): Promise<Awaited<T>> {
+    const state = await settled(operation);
+    if (state.status === 'rejected') {
+      return this.#failOwned(key, new Error(message, { cause: state.reason }));
+    }
+    return state.value;
   }
 
   async #failOwned(key: string, error: unknown): Promise<never> {
@@ -297,8 +366,12 @@ async function settled<T>(
   operation: () => T | PromiseLike<T>,
 ): Promise<PromiseSettledResult<Awaited<T>>> {
   // Resolving through a promise makes a synchronous throw a rejection.
-  const [state] = await Promise.allSettled([Promise.resolve().then(operation)]);
+  const [state] = await Promise.allSettled([funnel(operation)]);
   return state;
+}
+
+async function funnel<T>(operation: () => T | PromiseLike<T>) {
+  return operation();
 }
 
 function isKeyPrefix(value: string | undefined): boolean {

@@ -97,6 +97,15 @@ describe.sequential('R2DatabaseExportStore Wrangler harness', {
     });
   });
 
+  it('rejects a mid-transfer source error without leaving an object', async () => {
+    await expect(probe('mid-transfer-error')).resolves.toEqual({
+      message: 'R2 export upload failed',
+      objectCount: 0,
+      pullCount: 2,
+      bytesEnqueued: 4096,
+    });
+  });
+
   it('preserves the winner of a conditional collision', async () => {
     const result = await probe('collision');
     expect(result).toMatchObject({

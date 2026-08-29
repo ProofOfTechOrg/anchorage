@@ -122,6 +122,46 @@ async function short(env: Env) {
   };
 }
 
+async function midTransferError(env: Env) {
+  const uuid = 'mid-transfer-uuid';
+  const prefix = 'exports/mid-transfer-db/';
+  let sent = false;
+  let pullCount = 0;
+  let bytesEnqueued = 0;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      pullCount += 1;
+      if (!sent) {
+        sent = true;
+        const chunk = sequence(4096, 41);
+        bytesEnqueued += chunk.byteLength;
+        controller.enqueue(chunk);
+        return;
+      }
+      controller.error(new Error('mid-transfer source failure'));
+    },
+  });
+  const result = await Promise.allSettled([
+    store(env, uuid).write({
+      databaseId: 'mid-transfer-db',
+      fileName: 'export.sqlite3',
+      body,
+      contentLength: 8192,
+    }),
+  ]);
+  const state = result[0];
+  if (state.status === 'fulfilled') {
+    throw new Error('mid-transfer export succeeded');
+  }
+  const listed = await env.EXPORTS.list({ prefix });
+  return {
+    message: messageOf(state.reason),
+    objectCount: listed.objects.length,
+    pullCount,
+    bytesEnqueued,
+  };
+}
+
 async function collision(env: Env) {
   const fixed = 'collision-uuid';
   const first = sequence(4096, 11);
@@ -183,6 +223,8 @@ async function dispatch(action: string, env: Env): Promise<Response> {
       return Response.json(await empty(env));
     case 'short':
       return Response.json(await short(env));
+    case 'mid-transfer-error':
+      return Response.json(await midTransferError(env));
     case 'collision':
       return Response.json(await collision(env));
     default:
