@@ -532,6 +532,30 @@ describe('R2DatabaseExportStore', () => {
     expect(source.cancellations).toHaveLength(1);
   });
 
+  it('preserves a refusal when an injected cancel throws synchronously', async () => {
+    const bucket = new FakeR2Bucket();
+    const cancellations: unknown[] = [];
+    const body = {
+      locked: false,
+      cancel(reason: unknown): never {
+        cancellations.push(reason);
+        throw new Error('synchronous cancel failure');
+      },
+    } as unknown as ReadableStream<Uint8Array>;
+    const refusal = await rejection(
+      createStore(bucket).write({
+        databaseId: 'db',
+        fileName: 'x.db',
+        body,
+        contentLength: 0,
+      }),
+      'R2 export refuses an empty body',
+    );
+    expect(cancellations).toHaveLength(1);
+    expect(cancellations[0]).toBe(refusal);
+    expect(bucket.putCalls).toBe(0);
+  });
+
   it('refuses a locked body before starting a put', {
     timeout: 2_000,
   }, async () => {

@@ -66,8 +66,8 @@ interface PreparedUpload {
  * `write()` is not idempotent.
  *
  * A failure after the put settles aborts the body pipe. When the body is a
- * `tee()` branch, that abort stays pending until the tee source is
- * exhausted or the other branch is cancelled.
+ * `tee()` branch, that abort can stay pending: it settles when the tee
+ * source is exhausted or errors, or the other branch is cancelled.
  */
 export class R2DatabaseExportStore implements DurableDatabaseExportStore {
   readonly #bucket: R2Bucket;
@@ -128,9 +128,11 @@ export class R2DatabaseExportStore implements DurableDatabaseExportStore {
       .then(() => this.#prepare(input))
       .catch((error: unknown) => {
         // A tee branch's cancel settles when the tee source is exhausted
-        // or the other branch is cancelled, so the refusal does not await
-        // it.
-        void input.body.cancel(error).catch(() => undefined);
+        // or errors, or the other branch is cancelled, so the refusal does
+        // not await it.
+        try {
+          void input.body.cancel(error).catch(() => undefined);
+        } catch {}
         throw error;
       });
     const controller = new AbortController();

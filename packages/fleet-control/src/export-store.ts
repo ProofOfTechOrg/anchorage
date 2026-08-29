@@ -104,8 +104,8 @@ export class FileSystemDatabaseExportStore
       }
       try {
         // The reader's cancel on a tee branch settles when the tee source is
-        // exhausted or the other branch is cancelled, so cleanup does not
-        // await it.
+        // exhausted or errors, or the other branch is cancelled, so cleanup
+        // does not await it.
         void reader?.cancel(error).catch(() => undefined);
       } catch {}
       try {

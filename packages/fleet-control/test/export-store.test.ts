@@ -203,6 +203,37 @@ describe('FileSystemDatabaseExportStore', () => {
     await expect(readdir(root)).resolves.toEqual([]);
   });
 
+  it('preserves a refusal when an injected reader cancel throws', async () => {
+    const parent = await temporaryDirectory();
+    const root = join(parent, 'exports');
+    let cancellations = 0;
+    const injected = {
+      getReader() {
+        return {
+          async read(): Promise<{ done: true; value: undefined }> {
+            return { done: true, value: undefined };
+          },
+          cancel(): never {
+            cancellations += 1;
+            throw new Error('synchronous reader cancel failure');
+          },
+          releaseLock(): void {},
+        };
+      },
+    } as unknown as ReadableStream<Uint8Array>;
+
+    await expect(
+      new FileSystemDatabaseExportStore(root).write({
+        databaseId: 'database-1',
+        fileName: 'database-1.sql',
+        body: injected,
+        contentLength: 1,
+      }),
+    ).rejects.toThrow('export size differs from contentLength');
+    expect(cancellations).toBe(1);
+    await expect(readdir(root)).resolves.toEqual([]);
+  });
+
   it('cleans its temporary file when content length does not match', async () => {
     const parent = await temporaryDirectory();
     const root = join(parent, 'exports');
