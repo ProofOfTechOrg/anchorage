@@ -5267,6 +5267,7 @@ async function advanceBoundedSwitchCurrent(
     });
   }
   if (intent.subphase === 'decommission-traffic-authorized') {
+    const pendingArtifact = entryPendingArtifact(snapshot, options);
     await options.provider.removeSwitchTraffic({
       prior: snapshot.prior,
       priorSpec: options.priorSpec,
@@ -5278,9 +5279,7 @@ async function advanceBoundedSwitchCurrent(
       environment: intent.environment,
       routeHostname: snapshot.routeHostname,
       routeTargets: snapshot.routeTargets.map(({ routeTarget }) => routeTarget),
-      ...(entryPendingArtifact(snapshot, options)
-        ? { entryPendingArtifact: entryPendingArtifact(snapshot, options) }
-        : {}),
+      ...(pendingArtifact ? { entryPendingArtifact: pendingArtifact } : {}),
       fence: lease,
     });
     await options.provider.assertSwitchTrafficRemoved({
@@ -5366,6 +5365,7 @@ async function advanceBoundedSwitchCurrent(
         nextBackendSwitchShell(record, authorized, { state: 'transitioning' }),
       );
     }
+    const pendingArtifact = entryPendingArtifact(snapshot, options);
     await options.provider.removeSwitchBridge({
       prior: snapshot.prior,
       priorSpec: options.priorSpec,
@@ -5373,9 +5373,7 @@ async function advanceBoundedSwitchCurrent(
       plan: snapshot.bridgePlan,
       targetSpec: options.targetSpec,
       allowedArtifactVersions: allowedSwitchArtifactVersions(snapshot),
-      ...(entryPendingArtifact(snapshot, options)
-        ? { entryPendingArtifact: entryPendingArtifact(snapshot, options) }
-        : {}),
+      ...(pendingArtifact ? { entryPendingArtifact: pendingArtifact } : {}),
       fence: lease,
     });
     const current = lease.current();
