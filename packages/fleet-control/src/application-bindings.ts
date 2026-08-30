@@ -399,14 +399,31 @@ export async function assertApplicationR2EmptyBeforeDecommission(options: {
   readonly fence: import('./types.js').ExternalMutationFence;
 }): Promise<void> {
   if (options.resources.length === 0) return;
+  const findApplicationR2BucketCandidate =
+    options.backend.findApplicationR2Bucket;
+  if (typeof findApplicationR2BucketCandidate !== 'function') {
+    throw new Error('backend cannot preflight application R2 evacuation');
+  }
+  const findApplicationR2Bucket = findApplicationR2BucketCandidate.bind(
+    options.backend,
+  );
+  const needsEmptyAttestation = options.resources.some(
+    (resource) => resource.state !== 'reserved' && resource.state !== 'deleted',
+  );
+  const assertApplicationR2EmptyCandidate = needsEmptyAttestation
+    ? options.backend.assertApplicationR2Empty
+    : undefined;
   if (
-    !options.backend.findApplicationR2Bucket ||
-    !options.backend.assertApplicationR2Empty
+    needsEmptyAttestation &&
+    typeof assertApplicationR2EmptyCandidate !== 'function'
   ) {
     throw new Error('backend cannot preflight application R2 evacuation');
   }
+  const assertApplicationR2Empty = assertApplicationR2EmptyCandidate?.bind(
+    options.backend,
+  );
   for (const resource of options.resources) {
-    const live = await options.backend.findApplicationR2Bucket(resource);
+    const live = await findApplicationR2Bucket(resource);
     if (resource.state === 'reserved') {
       if (live) {
         throw new Error(
@@ -430,11 +447,366 @@ export async function assertApplicationR2EmptyBeforeDecommission(options: {
     }
     assertLiveR2Identity(resource, live);
     await options.fence.assertOwned();
-    await options.backend.assertApplicationR2Empty(resource, options.fence);
+    await assertApplicationR2Empty?.(resource, options.fence);
   }
 }
 
+/** @internal Package-private result for one application-R2 deletion step. */
+export type ApplicationR2DeletionAdvance =
+  | Readonly<{
+      status: 'complete';
+      resources: readonly ApplicationR2Resource[];
+    }>
+  | Readonly<{
+      status: 'detachment-required';
+      resourceIndex: number;
+      resource: ApplicationR2Resource & {
+        readonly state: 'detach-authorized';
+        readonly creationDate: string;
+      };
+      resources: readonly ApplicationR2Resource[];
+    }>
+  | Readonly<{
+      status: 'resource-advanced';
+      resourceIndex: number;
+      resources: readonly ApplicationR2Resource[];
+    }>;
+
+function replaceApplicationR2Resource(
+  resources: readonly ApplicationR2Resource[],
+  index: number,
+  resource: ApplicationR2Resource,
+): readonly ApplicationR2Resource[] {
+  return resources.map((current, currentIndex) =>
+    currentIndex === index ? resource : current,
+  );
+}
+
+function invalidApplicationR2DeletionStart(): Error {
+  return new Error('application R2 deletion start index is invalid');
+}
+
+function invalidApplicationR2DetachmentProof(): Error {
+  return new Error('application R2 detachment proof is invalid');
+}
+
+/** @internal Advances at most one application-R2 resource state or mutation. */
+export async function advanceApplicationR2Deletion(options: {
+  readonly spec: Pick<
+    DeploymentSpec,
+    'tenantTag' | 'environment' | 'scriptName' | 'databaseName'
+  >;
+  readonly resources: readonly ApplicationR2Resource[];
+  readonly backend: ApplicationR2LifecycleBackend;
+  readonly fence: import('./types.js').ExternalMutationFence;
+  readonly startResourceIndex?: number;
+  readonly verifiedDetachmentResourceIndex?: number;
+}): Promise<ApplicationR2DeletionAdvance> {
+  const resources = [...options.resources];
+  const startResourceIndex = options.startResourceIndex ?? 0;
+  if (
+    !Number.isSafeInteger(startResourceIndex) ||
+    startResourceIndex < 0 ||
+    startResourceIndex > resources.length
+  ) {
+    throw invalidApplicationR2DeletionStart();
+  }
+  const verifiedDetachmentResourceIndex =
+    options.verifiedDetachmentResourceIndex;
+  if (
+    verifiedDetachmentResourceIndex !== undefined &&
+    (!Number.isSafeInteger(verifiedDetachmentResourceIndex) ||
+      verifiedDetachmentResourceIndex < startResourceIndex ||
+      verifiedDetachmentResourceIndex >= resources.length)
+  ) {
+    throw invalidApplicationR2DetachmentProof();
+  }
+  let find:
+    | NonNullable<ApplicationR2LifecycleBackend['findApplicationR2Bucket']>
+    | undefined;
+  let findRead = false;
+  const requireFind = () => {
+    if (!findRead) {
+      findRead = true;
+      const candidate = options.backend.findApplicationR2Bucket;
+      if (typeof candidate === 'function') {
+        find = candidate.bind(options.backend);
+      }
+    }
+    if (!find) {
+      throw new Error('backend cannot inspect application R2 resources');
+    }
+    return find;
+  };
+  let assertEmpty:
+    | NonNullable<ApplicationR2LifecycleBackend['assertApplicationR2Empty']>
+    | undefined;
+  let assertEmptyRead = false;
+  const requireAssertEmpty = () => {
+    if (!assertEmptyRead) {
+      assertEmptyRead = true;
+      const candidate = options.backend.assertApplicationR2Empty;
+      if (typeof candidate === 'function') {
+        assertEmpty = candidate.bind(options.backend);
+      }
+    }
+    if (!assertEmpty) {
+      throw new Error('backend cannot attest application R2 emptiness');
+    }
+    return assertEmpty;
+  };
+  let deleteBucket:
+    | NonNullable<ApplicationR2LifecycleBackend['deleteApplicationR2Bucket']>
+    | undefined;
+  let deleteBucketRead = false;
+  const requireDeleteBucket = () => {
+    if (!deleteBucketRead) {
+      deleteBucketRead = true;
+      const candidate = options.backend.deleteApplicationR2Bucket;
+      if (typeof candidate === 'function') {
+        deleteBucket = candidate.bind(options.backend);
+      }
+    }
+    if (!deleteBucket) {
+      throw new Error('backend cannot delete application R2 resources');
+    }
+    return deleteBucket;
+  };
+  if (startResourceIndex === resources.length) {
+    return { status: 'complete', resources };
+  }
+
+  let index = startResourceIndex;
+  for (; index < resources.length; index += 1) {
+    const resource = resources[index] as ApplicationR2Resource;
+    assertApplicationR2ReservationIdentity(options.spec, resource);
+    if (resource.state === 'reserved') {
+      if (await requireFind()(resource)) {
+        throw new Error(
+          `refusing to delete pre-existing R2 bucket '${resource.bucketName}' from an unauthorized reservation`,
+        );
+      }
+      continue;
+    }
+    if (resource.state === 'deleted') {
+      if (await requireFind()(resource)) {
+        throw new Error(
+          `R2 bucket '${resource.bucketName}' reappeared after deletion`,
+        );
+      }
+      continue;
+    }
+    break;
+  }
+
+  if (index === resources.length) {
+    if (verifiedDetachmentResourceIndex !== undefined) {
+      throw invalidApplicationR2DetachmentProof();
+    }
+    return { status: 'complete', resources };
+  }
+
+  let resource = resources[index] as ApplicationR2Resource;
+  if (
+    verifiedDetachmentResourceIndex !== undefined &&
+    (verifiedDetachmentResourceIndex !== index ||
+      resource.state !== 'detach-authorized')
+  ) {
+    throw invalidApplicationR2DetachmentProof();
+  }
+
+  if (resource.state === 'create-authorized') {
+    const live = await requireFind()(resource);
+    if (live) assertLiveR2Identity(resource, live);
+    resource = live
+      ? {
+          ...resource,
+          state: 'created' as const,
+          creationDate: live.creationDate,
+        }
+      : { ...resource, state: 'delete-authorized' as const };
+    return {
+      status: 'resource-advanced',
+      resourceIndex: index,
+      resources: replaceApplicationR2Resource(resources, index, resource),
+    };
+  }
+
+  if (resource.state === 'created') {
+    const live = await requireFind()(resource);
+    if (!live) {
+      throw new Error(
+        `R2 bucket '${resource.bucketName}' disappeared before delete authorization`,
+      );
+    }
+    assertLiveR2Identity(resource, live);
+    const detachAuthorized = {
+      ...resource,
+      state: 'detach-authorized' as const,
+      creationDate: resource.creationDate ?? live.creationDate,
+    };
+    return {
+      status: 'detachment-required',
+      resourceIndex: index,
+      resource: detachAuthorized,
+      resources: replaceApplicationR2Resource(
+        resources,
+        index,
+        detachAuthorized,
+      ),
+    };
+  }
+
+  if (resource.state === 'detach-authorized') {
+    if (verifiedDetachmentResourceIndex === index) {
+      if (resource.creationDate === undefined) {
+        throw invalidApplicationR2DetachmentProof();
+      }
+      return {
+        status: 'resource-advanced',
+        resourceIndex: index,
+        resources: replaceApplicationR2Resource(resources, index, {
+          ...resource,
+          state: 'detached',
+        }),
+      };
+    }
+    const live = await requireFind()(resource);
+    if (!live) {
+      throw new Error(
+        `R2 bucket '${resource.bucketName}' disappeared before delete authorization`,
+      );
+    }
+    assertLiveR2Identity(resource, live);
+    const detachAuthorized = {
+      ...resource,
+      state: 'detach-authorized' as const,
+      creationDate: resource.creationDate ?? live.creationDate,
+    };
+    return {
+      status: 'detachment-required',
+      resourceIndex: index,
+      resource: detachAuthorized,
+      resources: replaceApplicationR2Resource(
+        resources,
+        index,
+        detachAuthorized,
+      ),
+    };
+  }
+
+  if (resource.state === 'detached') {
+    const live = await requireFind()(resource);
+    if (!live) {
+      throw new Error(
+        `R2 bucket '${resource.bucketName}' disappeared before delete authorization`,
+      );
+    }
+    assertLiveR2Identity(resource, live);
+    return {
+      status: 'resource-advanced',
+      resourceIndex: index,
+      resources: replaceApplicationR2Resource(resources, index, {
+        ...resource,
+        state: 'empty-authorized',
+        creationDate: resource.creationDate ?? live.creationDate,
+      }),
+    };
+  }
+
+  if (resource.state === 'empty-authorized') {
+    const live = await requireFind()(resource);
+    if (!live) {
+      throw new Error(
+        `R2 bucket '${resource.bucketName}' disappeared before delete authorization`,
+      );
+    }
+    assertLiveR2Identity(resource, live);
+    await options.fence.assertOwned();
+    await requireAssertEmpty()(resource, options.fence);
+    return {
+      status: 'resource-advanced',
+      resourceIndex: index,
+      resources: replaceApplicationR2Resource(resources, index, {
+        ...resource,
+        state: 'empty',
+        creationDate: resource.creationDate ?? live.creationDate,
+      }),
+    };
+  }
+
+  if (resource.state === 'empty') {
+    return {
+      status: 'resource-advanced',
+      resourceIndex: index,
+      resources: replaceApplicationR2Resource(resources, index, {
+        ...resource,
+        state: 'delete-authorized',
+      }),
+    };
+  }
+
+  if (resource.state !== 'delete-authorized') {
+    throw new Error('application R2 deletion has invalid persisted progress');
+  }
+
+  const findBucket = requireFind();
+  const live = await findBucket(resource);
+  if (!live) {
+    return {
+      status: 'resource-advanced',
+      resourceIndex: index,
+      resources: replaceApplicationR2Resource(resources, index, {
+        ...resource,
+        state: 'deleted',
+      }),
+    };
+  }
+  assertLiveR2Identity(resource, live);
+  if (resource.creationDate === undefined) {
+    return {
+      status: 'resource-advanced',
+      resourceIndex: index,
+      resources: replaceApplicationR2Resource(resources, index, {
+        ...resource,
+        creationDate: live.creationDate,
+      }),
+    };
+  }
+  await options.fence.assertOwned();
+  try {
+    await requireDeleteBucket()(resource, options.fence);
+  } catch (error) {
+    if (await findBucket(resource)) throw error;
+    return {
+      status: 'resource-advanced',
+      resourceIndex: index,
+      resources: replaceApplicationR2Resource(resources, index, {
+        ...resource,
+        state: 'deleted',
+      }),
+    };
+  }
+  if (await findBucket(resource)) {
+    throw new Error(
+      `R2 bucket '${resource.bucketName}' remains after deletion`,
+    );
+  }
+  return {
+    status: 'resource-advanced',
+    resourceIndex: index,
+    resources: replaceApplicationR2Resource(resources, index, {
+      ...resource,
+      state: 'deleted',
+    }),
+  };
+}
+
 export async function convergeApplicationR2Deletion(options: {
+  readonly spec: Pick<
+    DeploymentSpec,
+    'tenantTag' | 'environment' | 'scriptName' | 'databaseName'
+  >;
   readonly resources: readonly ApplicationR2Resource[];
   readonly backend: ApplicationR2LifecycleBackend;
   readonly fence: import('./types.js').ExternalMutationFence;
@@ -443,127 +815,94 @@ export async function convergeApplicationR2Deletion(options: {
   ) => Promise<void>;
 }): Promise<readonly ApplicationR2Resource[]> {
   if (options.resources.length === 0) return [];
-  const backend = options.backend;
+  const findApplicationR2BucketCandidate =
+    options.backend.findApplicationR2Bucket;
+  const assertApplicationR2DetachedCandidate =
+    options.backend.assertApplicationR2Detached;
+  const assertApplicationR2EmptyCandidate =
+    options.backend.assertApplicationR2Empty;
+  const deleteApplicationR2BucketCandidate =
+    options.backend.deleteApplicationR2Bucket;
   if (
-    !backend.findApplicationR2Bucket ||
-    !backend.assertApplicationR2Detached ||
-    !backend.assertApplicationR2Empty ||
-    !backend.deleteApplicationR2Bucket
+    typeof findApplicationR2BucketCandidate !== 'function' ||
+    typeof assertApplicationR2DetachedCandidate !== 'function' ||
+    typeof assertApplicationR2EmptyCandidate !== 'function' ||
+    typeof deleteApplicationR2BucketCandidate !== 'function'
   ) {
     throw new Error('backend cannot safely delete application R2 resources');
   }
-  let resources = [...options.resources];
-  const persistState = async (
-    index: number,
-    resource: ApplicationR2Resource,
-  ): Promise<void> => {
-    resources = resources.map((current, currentIndex) =>
-      currentIndex === index ? resource : current,
-    );
-    await options.persist(resources);
+  const backend = {
+    findApplicationR2Bucket: findApplicationR2BucketCandidate.bind(
+      options.backend,
+    ),
+    assertApplicationR2Detached: assertApplicationR2DetachedCandidate.bind(
+      options.backend,
+    ),
+    assertApplicationR2Empty: assertApplicationR2EmptyCandidate.bind(
+      options.backend,
+    ),
+    deleteApplicationR2Bucket: deleteApplicationR2BucketCandidate.bind(
+      options.backend,
+    ),
   };
-  for (let index = 0; index < resources.length; index += 1) {
-    let resource = resources[index] as ApplicationR2Resource;
-    if (resource.state === 'reserved') {
-      if (await backend.findApplicationR2Bucket(resource)) {
-        throw new Error(
-          `refusing to delete pre-existing R2 bucket '${resource.bucketName}' from an unauthorized reservation`,
-        );
-      }
-      continue;
-    }
-    if (resource.state === 'create-authorized') {
-      const live = await backend.findApplicationR2Bucket(resource);
-      if (!live) {
-        resource = { ...resource, state: 'delete-authorized' };
-        await persistState(index, resource);
+  let resources = [...options.resources];
+  let startResourceIndex = 0;
+  for (;;) {
+    const result = await advanceApplicationR2Deletion({
+      spec: options.spec,
+      resources,
+      backend,
+      fence: options.fence,
+      startResourceIndex,
+    });
+    if (result.status === 'complete') return result.resources;
+
+    if (result.status === 'detachment-required') {
+      if (
+        result.resources[result.resourceIndex] !==
+        resources[result.resourceIndex]
+      ) {
+        resources = [...result.resources];
+        await options.persist(resources);
       } else {
-        assertLiveR2Identity(resource, live);
-        resource = {
-          ...resource,
-          state: 'created',
-          creationDate: live.creationDate,
-        };
-        await persistState(index, resource);
+        resources = [...result.resources];
       }
-    }
-    if (resource.state === 'deleted') {
-      if (await backend.findApplicationR2Bucket(resource)) {
-        throw new Error(
-          `R2 bucket '${resource.bucketName}' reappeared after deletion`,
-        );
+      await options.fence.assertOwned();
+      await backend.assertApplicationR2Detached(result.resource, options.fence);
+      startResourceIndex = result.resourceIndex;
+      const verified = await advanceApplicationR2Deletion({
+        spec: options.spec,
+        resources,
+        backend,
+        fence: options.fence,
+        startResourceIndex,
+        verifiedDetachmentResourceIndex: result.resourceIndex,
+      });
+      if (
+        verified.status !== 'resource-advanced' ||
+        verified.resourceIndex !== result.resourceIndex ||
+        verified.resources[result.resourceIndex]?.state !== 'detached'
+      ) {
+        throw invalidApplicationR2DetachmentProof();
       }
+      resources = [...verified.resources];
+      await options.persist(resources);
+      startResourceIndex = verified.resourceIndex;
       continue;
     }
+
+    resources = [...result.resources];
+    await options.persist(resources);
     if (
-      resource.state === 'created' ||
-      resource.state === 'detach-authorized'
+      ['reserved', 'deleted'].includes(
+        resources[result.resourceIndex]?.state ?? '',
+      )
     ) {
-      const live = await backend.findApplicationR2Bucket(resource);
-      if (!live) {
-        throw new Error(
-          `R2 bucket '${resource.bucketName}' disappeared before delete authorization`,
-        );
-      }
-      assertLiveR2Identity(resource, live);
-      if (resource.state === 'created') {
-        resource = { ...resource, state: 'detach-authorized' };
-        await persistState(index, resource);
-      }
-      await options.fence.assertOwned();
-      await backend.assertApplicationR2Detached(resource, options.fence);
-      resource = { ...resource, state: 'detached' };
-      await persistState(index, resource);
-    }
-    if (
-      resource.state === 'detached' ||
-      resource.state === 'empty-authorized'
-    ) {
-      const live = await backend.findApplicationR2Bucket(resource);
-      if (!live) {
-        throw new Error(
-          `R2 bucket '${resource.bucketName}' disappeared before delete authorization`,
-        );
-      }
-      assertLiveR2Identity(resource, live);
-      if (resource.state === 'detached') {
-        resource = { ...resource, state: 'empty-authorized' };
-        await persistState(index, resource);
-      }
-      await options.fence.assertOwned();
-      await backend.assertApplicationR2Empty(resource, options.fence);
-      resource = { ...resource, state: 'empty' };
-      await persistState(index, resource);
-    }
-    if (resource.state === 'empty' || resource.state === 'delete-authorized') {
-      if (resource.state === 'empty') {
-        resource = { ...resource, state: 'delete-authorized' };
-        await persistState(index, resource);
-        await options.fence.assertOwned();
-      }
-      const live = await backend.findApplicationR2Bucket(resource);
-      if (live) {
-        if (resource.creationDate === undefined) {
-          resource = { ...resource, creationDate: live.creationDate };
-          await persistState(index, resource);
-        }
-        assertLiveR2Identity(resource, live);
-        try {
-          await backend.deleteApplicationR2Bucket(resource, options.fence);
-        } catch (error) {
-          if (await backend.findApplicationR2Bucket(resource)) throw error;
-        }
-      }
-      if (await backend.findApplicationR2Bucket(resource)) {
-        throw new Error(
-          `R2 bucket '${resource.bucketName}' remains after deletion`,
-        );
-      }
-      resource = { ...resource, state: 'deleted' };
-      await persistState(index, resource);
+      startResourceIndex = result.resourceIndex + 1;
+    } else {
+      startResourceIndex = result.resourceIndex;
     }
   }
-  return resources;
 }
 
 function comparableR2Bindings(

@@ -57,6 +57,21 @@ export {
   type D1CloudflareApiRateCoordinatorOptions,
   ProcessLocalCloudflareApiRateCoordinator,
 } from './cloudflare-rate-coordinator.js';
+export {
+  type AdvanceDecommissionDeploymentOptions,
+  advanceDecommissionDeployment,
+  type DecommissionAdvanceAction,
+  type DecommissionAdvanceCapability,
+  DecommissionAdvanceCapabilityError,
+  DecommissionAdvanceRestartError,
+  type DecommissionAdvanceResult,
+} from './decommission-advance.js';
+export {
+  DecommissionAdvanceTokenDeploymentError,
+  DecommissionAdvanceTokenError,
+  DecommissionAdvanceTokenFutureError,
+  DecommissionAdvanceTokenOperationError,
+} from './decommission-intent.js';
 export { FileSystemDatabaseExportStore } from './export-store.js';
 export {
   auditFleetDrift,

@@ -8,6 +8,7 @@ import {
 import type { CloudflareSdk } from './cloudflare-ordinary-worker-operations.js';
 import { isNotFound } from './cloudflare-provider-errors.js';
 import {
+  assertWorkerAttachmentProviderRequestBudget,
   WORKER_ATTACHMENT_CURSOR_BYTE_BOUND as CURSOR_BYTE_BOUND,
   WORKER_ATTACHMENT_DISPATCH_PAGE_BOUND as DISPATCH_PAGE_BOUND,
   WORKER_ATTACHMENT_DISPATCH_PAGE_SIZE as DISPATCH_PAGE_SIZE,
@@ -73,9 +74,7 @@ class ProviderFetchBudget {
   #reserved = 0;
 
   constructor(maximum: number) {
-    if (!Number.isSafeInteger(maximum) || maximum < 9 || maximum > 1_000) {
-      throw new Error('maxProviderRequests must be an integer from 9 to 1000');
-    }
+    assertWorkerAttachmentProviderRequestBudget(maximum);
     this.#maximum = maximum;
   }
 

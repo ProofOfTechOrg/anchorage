@@ -184,6 +184,12 @@ try {
   ActiveRouteAttestationError,
   CloudflareApiPlainWorkerBackend,
   CloudflareProvisioningClient,
+  DecommissionAdvanceCapabilityError,
+  DecommissionAdvanceRestartError,
+  DecommissionAdvanceTokenDeploymentError,
+  DecommissionAdvanceTokenError,
+  DecommissionAdvanceTokenFutureError,
+  DecommissionAdvanceTokenOperationError,
   D1CloudflareApiRateCoordinator,
   PlainWorkerBackend,
   ProcessLocalCloudflareApiRateCoordinator,
@@ -194,6 +200,7 @@ try {
   attestConvergedActiveRoute,
   attestFleetRecordActiveRoute,
   auditFleetDrift,
+  advanceDecommissionDeployment,
   decommissionDeployment,
   forceDecommissionDeployment,
   deploymentSpecDigest,
@@ -204,11 +211,15 @@ try {
   type ActiveRouteAttestation,
   type ActiveRouteExpectation,
   type AttestConvergedActiveRouteOptions,
+  type AdvanceDecommissionDeploymentOptions,
   type CloudflareApiPlainWorkerBackendOptions,
   type CloudflareApiRateCoordinator,
   type DeploymentEgressPolicy,
   type DeploymentSpec,
   type DecommissionAdvanceIntent,
+  type DecommissionAdvanceAction,
+  type DecommissionAdvanceCapability,
+  type DecommissionAdvanceResult,
   type DecommissionAdvanceToken,
   type DecommissionAdvanceTokenClassification,
   type DecommissionAttachmentProgress,
@@ -222,6 +233,7 @@ try {
   type DecommissionOperationMode,
   type DecommissionRecordIdentity,
   type FleetRecord,
+  type FleetStateStore,
   type FleetSettlementContext,
   type FleetSettlementEntry,
   type FleetSettlementHost,
@@ -268,6 +280,30 @@ import { CloudflareAttachmentScanProgressError } from '@proofoftech/fleet-contro
 import { CloudflareAttachmentScanDriftError } from '@proofoftech/fleet-control';
 // @ts-expect-error the pure mapper is a deep package-private seam.
 import { mapDecommissionAttachmentScanChunk } from '@proofoftech/fleet-control';
+// @ts-expect-error raw action parsing is package-private.
+import { decommissionAdvanceActionFromUnknown } from '@proofoftech/fleet-control';
+// @ts-expect-error token parsing is package-private.
+import { parseDecommissionAdvanceToken } from '@proofoftech/fleet-control';
+// @ts-expect-error token classification is package-private.
+import { classifyDecommissionAdvanceToken } from '@proofoftech/fleet-control';
+// @ts-expect-error intent normalization is package-private.
+import { normalizeDecommissionAdvanceIntent } from '@proofoftech/fleet-control';
+// @ts-expect-error provider budget validation is package-private.
+import { assertWorkerAttachmentProviderRequestBudget } from '@proofoftech/fleet-control';
+// @ts-expect-error one-step R2 deletion is package-private.
+import { advanceApplicationR2Deletion } from '@proofoftech/fleet-control';
+// @ts-expect-error one-step R2 deletion result is package-private.
+import type { ApplicationR2DeletionAdvance } from '@proofoftech/fleet-control';
+// @ts-expect-error release derivation is package-private.
+import { activeExternalRelease } from '@proofoftech/fleet-control';
+// @ts-expect-error release inventory derivation is package-private.
+import { retainedExternalReleases } from '@proofoftech/fleet-control';
+// @ts-expect-error immutable mapping assertion is package-private.
+import { assertImmutableDeploymentMapping } from '@proofoftech/fleet-control';
+// @ts-expect-error persisted database reconciliation is package-private.
+import { reconcilePersistedDatabase } from '@proofoftech/fleet-control';
+// @ts-expect-error intent codec errors are package-private.
+import { DecommissionAdvanceIntentError } from '@proofoftech/fleet-control';
 import type { FleetDispatchEnv } from '@proofoftech/fleet-control/workers/dispatch';
 import {
   createEgressProxyFetch,
@@ -286,6 +322,7 @@ declare const coordinator: CloudflareApiRateCoordinator;
 declare const deploymentSpec: DeploymentSpec;
 declare const provisioningBackend: ProvisioningBackend;
 declare const fleetRecord: FleetRecord;
+declare const fleetStateStore: FleetStateStore;
 declare const decommissionIntent: DecommissionAdvanceIntent;
 declare const decommissionToken: DecommissionAdvanceToken;
 declare const decommissionClassification: DecommissionAdvanceTokenClassification;
@@ -353,6 +390,51 @@ const wfpDecommissionScan = api.advanceDecommissionAttachmentScan?.(
 );
 const databaseResidualAssertion =
   provisioningBackend.assertDatabaseDeletionResidualsRemoved;
+const decommissionActions: readonly DecommissionAdvanceAction[] = [
+  { kind: 'start' },
+  { kind: 'continue', token: decommissionToken },
+  { kind: 'restart-blocked', token: decommissionToken },
+];
+const decommissionCapabilities: readonly DecommissionAdvanceCapability[] = [
+  'attachment-scan',
+  'database-residuals',
+  'application-r2-inspection',
+  'application-r2-empty',
+  'application-r2-delete',
+];
+const decommissionAdvanceOptions: AdvanceDecommissionDeploymentOptions = {
+  backend: provisioningBackend,
+  store: fleetStateStore,
+  spec: deploymentSpec,
+  action: decommissionActions[0]!,
+  maxProviderRequests: 12,
+  randomUUID: () => '00000000-0000-4000-8000-000000000001',
+};
+const decommissionAdvanceResults: readonly DecommissionAdvanceResult[] = [
+  { status: 'pending', token: decommissionToken },
+  {
+    status: 'blocked',
+    token: decommissionToken,
+    purpose: decommissionPurpose,
+    attachment: decommissionAttachment,
+  },
+  {
+    status: 'complete',
+    token: decommissionToken,
+    result: {
+      record: fleetRecord,
+      databaseExport: {
+        databaseId: fleetRecord.databaseId,
+        location: 'r2://exports/database.sql',
+        sha256: 'a'.repeat(64),
+        size: 1,
+      },
+    },
+  },
+];
+const boundedDecommissionAdvance = advanceDecommissionDeployment(
+  decommissionAdvanceOptions,
+);
 type PlainWorkerPortRecords = readonly [
   PlainWorkerCleanupOutcome,
   PlainWorkerDatabaseExportResult,
@@ -431,6 +513,11 @@ void [
   backendDecommissionScan,
   wfpDecommissionScan,
   databaseResidualAssertion,
+  decommissionActions,
+  decommissionCapabilities,
+  decommissionAdvanceOptions,
+  decommissionAdvanceResults,
+  boundedDecommissionAdvance,
 ];
 const customDomain: PlainWorkerCustomDomain = {
   id: 'domain-id',
@@ -518,9 +605,16 @@ void settlementHost;
 import {
   ActiveRouteAttestationError,
   CloudflareProvisioningClient,
+  DecommissionAdvanceCapabilityError,
+  DecommissionAdvanceRestartError,
+  DecommissionAdvanceTokenDeploymentError,
+  DecommissionAdvanceTokenError,
+  DecommissionAdvanceTokenFutureError,
+  DecommissionAdvanceTokenOperationError,
   ProcessLocalCloudflareApiRateCoordinator,
   ProvisioningError,
   WorkersForPlatformsBackend,
+  advanceDecommissionDeployment,
   attestConvergedActiveRoute,
   attestFleetRecordActiveRoute,
   deploymentSpecDigest,
@@ -549,6 +643,30 @@ assert.ok(new ActiveRouteAttestationError('probe', {}) instanceof Error);
 assert.equal(typeof attestConvergedActiveRoute, 'function');
 assert.equal(typeof attestFleetRecordActiveRoute, 'function');
 assert.equal(typeof fleetSettlementKey, 'function');
+assert.equal(typeof advanceDecommissionDeployment, 'function');
+const missingCapability = new DecommissionAdvanceCapabilityError(
+  'attachment-scan',
+);
+assert.equal(missingCapability.name, 'DecommissionAdvanceCapabilityError');
+assert.equal(missingCapability.capability, 'attachment-scan');
+assert.equal(
+  missingCapability.message,
+  'backend cannot perform bounded decommission attachment scans',
+);
+const restartError = new DecommissionAdvanceRestartError();
+assert.equal(restartError.name, 'DecommissionAdvanceRestartError');
+assert.equal(
+  restartError.message,
+  'decommission advance restart requires a current blocked operation',
+);
+for (const ErrorClass of [
+  DecommissionAdvanceTokenDeploymentError,
+  DecommissionAdvanceTokenError,
+  DecommissionAdvanceTokenFutureError,
+  DecommissionAdvanceTokenOperationError,
+]) {
+  assert.ok(new ErrorClass() instanceof Error);
+}
 assert.equal(
   typeof CloudflareProvisioningClient.prototype
     .advanceDecommissionAttachmentScan,

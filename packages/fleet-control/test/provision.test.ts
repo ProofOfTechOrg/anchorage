@@ -11,6 +11,14 @@ import type {
   BridgeSnapshot,
   FinalizedOrdinaryStateProvider,
 } from '../src/backend-switch.js';
+import {
+  type AdvanceDecommissionDeploymentOptions,
+  advanceDecommissionDeployment,
+  DecommissionAdvanceCapabilityError,
+  DecommissionAdvanceRestartError,
+  type DecommissionAdvanceResult,
+} from '../src/decommission-advance.js';
+import { normalizeDecommissionAdvanceIntent } from '../src/decommission-intent.js';
 import { migrateFleet, rollbackExternalRelease } from '../src/fleet.js';
 import {
   canonicalDeploymentEgressPolicy,
@@ -36,6 +44,8 @@ import type {
   ApplicationR2BucketSnapshot,
   ApplicationR2Resource,
   DatabaseReference,
+  DecommissionAttachmentScanInput,
+  DecommissionAttachmentScanResult,
   DeploymentSecrets,
   DeploymentSpec,
   ExternalMutationFence,
@@ -130,6 +140,10 @@ class MemoryStore implements FleetStateStore {
   leaseCalls = 0;
   readonly phases: string[] = [];
   failPutPhase: string | undefined;
+  failPutApplicationState:
+    | Readonly<{ name: string; state: ApplicationR2Resource['state'] }>
+    | undefined;
+  assertOwnedFailure: unknown;
 
   async withDeploymentLease<T>(
     tenantTag: string,
@@ -144,7 +158,11 @@ class MemoryStore implements FleetStateStore {
         tenantTag,
         environment,
         mutationLeaseTtlMs: 15 * 60_000,
-        assertOwned: async () => {},
+        assertOwned: async () => {
+          if (this.assertOwnedFailure !== undefined) {
+            throw this.assertOwnedFailure;
+          }
+        },
         renew: async () => {},
         put: (record) => this.put(record),
         delete: () => this.delete(),
@@ -159,9 +177,33 @@ class MemoryStore implements FleetStateStore {
   }
 
   async put(record: FleetRecord): Promise<void> {
+    if (record.decommissionIntent) {
+      const { decommissionIntent, ...source } = record;
+      record = {
+        ...source,
+        decommissionIntent: normalizeDecommissionAdvanceIntent(
+          decommissionIntent,
+          source,
+        ),
+      };
+    }
     if (this.failPutPhase === record.phase) {
       this.failPutPhase = undefined;
       throw new Error(`failed state write at ${record.phase}`);
+    }
+    const applicationFailure = this.failPutApplicationState;
+    if (
+      applicationFailure &&
+      record.applicationResources?.some(
+        (resource) =>
+          resource.name === applicationFailure.name &&
+          resource.state === applicationFailure.state,
+      )
+    ) {
+      this.failPutApplicationState = undefined;
+      throw new Error(
+        `failed state write at ${applicationFailure.name}:${applicationFailure.state}`,
+      );
     }
     this.record = record;
     this.phases.push(record.phase);
@@ -261,6 +303,10 @@ class FakeBackend implements ProvisioningBackend {
   forceFailOnceAt: ForceDecommissionStep | undefined;
   forceStepGate: Promise<void> | undefined;
   forceStepStarted: (() => void) | undefined;
+  readonly scanInputs: DecommissionAttachmentScanInput[] = [];
+  readonly scanResults: DecommissionAttachmentScanResult[] = [];
+  scanFailure: unknown;
+  residualCalls = 0;
 
   constructor(kind: ProvisioningBackendKind = 'workers-for-platforms') {
     this.kind = kind;
@@ -338,6 +384,21 @@ class FakeBackend implements ProvisioningBackend {
 
   async applyMigrations(): Promise<void> {
     this.#event('migrations');
+  }
+
+  async advanceDecommissionAttachmentScan(
+    input: DecommissionAttachmentScanInput,
+  ): Promise<DecommissionAttachmentScanResult> {
+    this.scanInputs.push(input);
+    if (this.scanFailure !== undefined) throw this.scanFailure;
+    return (
+      this.scanResults.shift() ?? {
+        status: 'complete',
+        evidenceSha256: 'a'.repeat(64),
+        evidenceCount: 2,
+        providerFetchAttemptsReserved: 3,
+      }
+    );
   }
 
   describeExternalPlatformTarget(deployment: DeploymentSpec) {
@@ -594,6 +655,10 @@ class FakeBackend implements ProvisioningBackend {
 
   async assertDatabaseDetached(): Promise<void> {}
 
+  async assertDatabaseDeletionResidualsRemoved(): Promise<void> {
+    this.residualCalls += 1;
+  }
+
   async exportDatabase(): Promise<{
     databaseId: string;
     location: string;
@@ -635,6 +700,11 @@ class R2RollbackBackend extends FakeBackend {
   nonempty = false;
   emptyChecks = 0;
   writeAfterTrafficRemovalOnce = false;
+  r2FindCalls = 0;
+  readonly r2FindNames: string[] = [];
+  deleteCalls = 0;
+  deleteFailureBeforeCommit: unknown;
+  deleteFailureAfterCommit: unknown;
 
   override async removeTraffic(): Promise<void> {
     await super.removeTraffic();
@@ -647,6 +717,8 @@ class R2RollbackBackend extends FakeBackend {
   async findApplicationR2Bucket(
     resource: ApplicationR2Resource,
   ): Promise<ApplicationR2BucketSnapshot | undefined> {
+    this.r2FindCalls += 1;
+    this.r2FindNames.push(resource.name);
     return this.buckets.get(resource.bucketName);
   }
 
@@ -709,7 +781,14 @@ class R2RollbackBackend extends FakeBackend {
   async deleteApplicationR2Bucket(
     resource: ApplicationR2Resource,
   ): Promise<void> {
+    this.deleteCalls += 1;
+    if (this.deleteFailureBeforeCommit !== undefined) {
+      throw this.deleteFailureBeforeCommit;
+    }
     this.buckets.delete(resource.bucketName);
+    if (this.deleteFailureAfterCommit !== undefined) {
+      throw this.deleteFailureAfterCommit;
+    }
   }
 }
 
@@ -942,6 +1021,111 @@ async function wranglerLoopHarness(deployment: DeploymentSpec) {
   const store = new MemoryStore();
 
   return { backend, store, runnerCalls, state };
+}
+
+const DECOMMISSION_OPERATION_ID = '12345678-1234-4abc-8def-1234567890ab';
+
+interface BoundedDecommissionHarness {
+  readonly backend: R2RollbackBackend;
+  readonly store: MemoryStore;
+  readonly deployment: DeploymentSpec;
+  readonly clock: () => number;
+  readonly randomUUID: () => string;
+}
+
+async function boundedDecommissionHarness(
+  options: {
+    readonly kind?: ProvisioningBackendKind;
+    readonly r2Names?: readonly string[];
+    readonly store?: MemoryStore;
+    readonly external?: boolean;
+  } = {},
+): Promise<BoundedDecommissionHarness> {
+  const backend = new R2RollbackBackend(options.kind ?? 'plain-worker');
+  const store = options.store ?? new MemoryStore();
+  const deployment = spec({
+    ...(options.external
+      ? {
+          authoredBy: 'external' as const,
+          durableObjectMigrations: [],
+          egressProxyService: undefined,
+        }
+      : {}),
+    application: {
+      vars: [],
+      secrets: [],
+      r2Buckets: (options.r2Names ?? []).map((name) => ({ name })),
+    },
+  });
+  await provisionDeployment({
+    initialExecutionFenceState: 'open',
+    backend,
+    store,
+    spec: deployment,
+    secrets,
+  });
+  backend.events.length = 0;
+  let tick = Date.parse('2026-08-30T00:00:00.000Z');
+  return {
+    backend,
+    store,
+    deployment,
+    clock: () => {
+      tick += 1_000;
+      return tick;
+    },
+    randomUUID: () => DECOMMISSION_OPERATION_ID,
+  };
+}
+
+function boundedAdvanceOptions(
+  harness: BoundedDecommissionHarness,
+  action: AdvanceDecommissionDeploymentOptions['action'],
+  overrides: Partial<AdvanceDecommissionDeploymentOptions> = {},
+): AdvanceDecommissionDeploymentOptions {
+  return {
+    backend: harness.backend,
+    store: harness.store,
+    spec: harness.deployment,
+    action,
+    maxProviderRequests: 12,
+    clock: harness.clock,
+    randomUUID: harness.randomUUID,
+    ...overrides,
+  };
+}
+
+async function startBoundedDecommission(
+  harness: BoundedDecommissionHarness,
+): Promise<DecommissionAdvanceResult> {
+  return advanceDecommissionDeployment(
+    boundedAdvanceOptions(harness, { kind: 'start' }),
+  );
+}
+
+async function continueBoundedDecommission(
+  harness: BoundedDecommissionHarness,
+  result: DecommissionAdvanceResult,
+): Promise<DecommissionAdvanceResult> {
+  return advanceDecommissionDeployment(
+    boundedAdvanceOptions(harness, {
+      kind: 'continue',
+      token: result.token,
+    }),
+  );
+}
+
+async function driveBoundedUntil(
+  harness: BoundedDecommissionHarness,
+  predicate: (record: FleetRecord) => boolean,
+): Promise<DecommissionAdvanceResult> {
+  let result = await startBoundedDecommission(harness);
+  for (let step = 0; step < 64; step += 1) {
+    const record = harness.store.record;
+    if (record && predicate(record)) return result;
+    result = await continueBoundedDecommission(harness, result);
+  }
+  throw new Error('bounded decommission did not reach the requested state');
 }
 
 describe('fleet provisioning', () => {
@@ -3477,5 +3661,2231 @@ describe('fleet provisioning', () => {
     expect(state.workerExists).toBe(true);
     expect(state.databaseExists).toBe(true);
     expect(store.record).toBeUndefined();
+  });
+
+  it('starts stable operation before I/O and recovers lost start response', async () => {
+    const store = new CommitThenThrowStore();
+    const harness = await boundedDecommissionHarness({ store });
+    store.failAfterCommittedPhase = 'decommission-advancing';
+    const randomUUID = vi.fn(() => DECOMMISSION_OPERATION_ID);
+    const clock = vi.fn(() => Date.parse('2026-08-30T01:00:00.000Z'));
+    await expect(
+      advanceDecommissionDeployment(
+        boundedAdvanceOptions(
+          harness,
+          { kind: 'start' },
+          { randomUUID, clock },
+        ),
+      ),
+    ).rejects.toThrow(/response was lost/u);
+    expect(store.record?.decommissionIntent).toMatchObject({
+      operationId: DECOMMISSION_OPERATION_ID,
+      revision: 0,
+      generation: 0,
+      state: 'transitioning',
+    });
+    expect(randomUUID).toHaveBeenCalledTimes(1);
+    expect(clock).toHaveBeenCalledTimes(1);
+
+    await expect(
+      advanceDecommissionDeployment(
+        boundedAdvanceOptions(
+          harness,
+          { kind: 'start' },
+          { randomUUID, clock },
+        ),
+      ),
+    ).resolves.toMatchObject({ status: 'pending', token: { revision: 0 } });
+    expect(randomUUID).toHaveBeenCalledTimes(1);
+    expect(clock).toHaveBeenCalledTimes(1);
+
+    const missingUuid = await boundedDecommissionHarness();
+    const missingUuidRecord = missingUuid.store.record;
+    const missingUuidLeases = missingUuid.store.leaseCalls;
+    await expect(
+      advanceDecommissionDeployment({
+        ...boundedAdvanceOptions(missingUuid, { kind: 'start' }),
+        randomUUID: undefined as never,
+      }),
+    ).rejects.toThrow(
+      'advanceDecommissionDeployment requires a randomUUID function',
+    );
+    expect(missingUuid.store.record).toBe(missingUuidRecord);
+    expect(missingUuid.store.leaseCalls).toBe(missingUuidLeases);
+    const invalidUuid = await boundedDecommissionHarness();
+    const invalidUuidRecord = invalidUuid.store.record;
+    await expect(
+      advanceDecommissionDeployment(
+        boundedAdvanceOptions(
+          invalidUuid,
+          { kind: 'start' },
+          {
+            randomUUID: () => 'not-a-uuid',
+          },
+        ),
+      ),
+    ).rejects.toThrow('decommission advance token is malformed');
+    expect(invalidUuid.store.record).toBe(invalidUuidRecord);
+
+    const throwingUuid = await boundedDecommissionHarness();
+    const uuidFailure = new Error('uuid source failed');
+    const throwingUuidRecord = throwingUuid.store.record;
+    await expect(
+      advanceDecommissionDeployment(
+        boundedAdvanceOptions(
+          throwingUuid,
+          { kind: 'start' },
+          {
+            randomUUID() {
+              throw uuidFailure;
+            },
+          },
+        ),
+      ),
+    ).rejects.toBe(uuidFailure);
+    expect(throwingUuid.store.record).toBe(throwingUuidRecord);
+
+    const unsupported = await boundedDecommissionHarness();
+    unsupported.store.record = {
+      ...(unsupported.store.record as FleetRecord),
+      phase: 'decommissioned',
+    };
+    const unsupportedRecord = unsupported.store.record;
+    const unsupportedEvents = [...unsupported.backend.events];
+    const unsupportedUuid = vi.fn(() => DECOMMISSION_OPERATION_ID);
+    const unsupportedClock = vi.fn(() => Date.now());
+    await expect(
+      advanceDecommissionDeployment(
+        boundedAdvanceOptions(
+          unsupported,
+          { kind: 'start' },
+          { randomUUID: unsupportedUuid, clock: unsupportedClock },
+        ),
+      ),
+    ).rejects.toThrow(
+      "cannot start bounded decommission in phase 'decommissioned'",
+    );
+    expect(unsupportedUuid).not.toHaveBeenCalled();
+    expect(unsupportedClock).not.toHaveBeenCalled();
+    expect(unsupported.store.record).toBe(unsupportedRecord);
+    expect(unsupported.backend.events).toEqual(unsupportedEvents);
+    expect(unsupported.backend.databaseIdsRead).toHaveLength(0);
+  });
+
+  it('invalid budgets and missing capabilities refuse before the first write', async () => {
+    const invalid = await boundedDecommissionHarness();
+    const leases = invalid.store.leaseCalls;
+    for (const maxProviderRequests of [8, 1_001, 9.5]) {
+      await expect(
+        advanceDecommissionDeployment(
+          boundedAdvanceOptions(
+            invalid,
+            { kind: 'start' },
+            { maxProviderRequests },
+          ),
+        ),
+      ).rejects.toThrow(
+        'maxProviderRequests must be an integer from 9 to 1000',
+      );
+    }
+    expect(invalid.store.leaseCalls).toBe(leases);
+
+    const rows = [
+      [
+        'advanceDecommissionAttachmentScan',
+        'attachment-scan',
+        'backend cannot perform bounded decommission attachment scans',
+      ],
+      [
+        'assertDatabaseDeletionResidualsRemoved',
+        'database-residuals',
+        'backend cannot inspect database deletion residuals',
+      ],
+      [
+        'findApplicationR2Bucket',
+        'application-r2-inspection',
+        'backend cannot inspect application R2 resources',
+      ],
+      [
+        'assertApplicationR2Empty',
+        'application-r2-empty',
+        'backend cannot attest application R2 emptiness',
+      ],
+      [
+        'deleteApplicationR2Bucket',
+        'application-r2-delete',
+        'backend cannot delete application R2 resources',
+      ],
+    ] as const;
+    for (const [property, capability, message] of rows) {
+      const harness = await boundedDecommissionHarness({ r2Names: ['FILES'] });
+      Object.defineProperty(harness.backend, property, {
+        configurable: true,
+        value: undefined,
+      });
+      const before = harness.store.record;
+      const failure = await advanceDecommissionDeployment(
+        boundedAdvanceOptions(harness, { kind: 'start' }),
+      ).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(DecommissionAdvanceCapabilityError);
+      if (!(failure instanceof DecommissionAdvanceCapabilityError)) {
+        throw new Error('missing typed decommission capability refusal');
+      }
+      expect(Object.getPrototypeOf(failure)).toBe(
+        DecommissionAdvanceCapabilityError.prototype,
+      );
+      expect(failure).toMatchObject({
+        name: 'DecommissionAdvanceCapabilityError',
+        message,
+        capability,
+      });
+      expect(harness.store.record).toBe(before);
+    }
+
+    const currentScan = await boundedDecommissionHarness({
+      r2Names: ['FILES'],
+    });
+    const discover = await driveBoundedUntil(
+      currentScan,
+      (record) => record.decommissionIntent?.state === 'discover',
+    );
+    Object.defineProperty(
+      currentScan.backend,
+      'advanceDecommissionAttachmentScan',
+      { configurable: true, value: undefined },
+    );
+    const snapshot = currentScan.store.record;
+    await expect(
+      continueBoundedDecommission(currentScan, discover),
+    ).rejects.toMatchObject({ capability: 'attachment-scan' });
+    expect(currentScan.store.record).toBe(snapshot);
+
+    const currentResidual = await boundedDecommissionHarness();
+    const credentials = await driveBoundedUntil(
+      currentResidual,
+      (record) =>
+        record.decommissionIntent?.lifecyclePhase === 'credentials-revoked',
+    );
+    Object.defineProperty(
+      currentResidual.backend,
+      'assertDatabaseDeletionResidualsRemoved',
+      { configurable: true, value: undefined },
+    );
+    const reads = currentResidual.backend.databaseIdsRead.length;
+    await expect(
+      continueBoundedDecommission(currentResidual, credentials),
+    ).rejects.toMatchObject({ capability: 'database-residuals' });
+    expect(currentResidual.backend.databaseIdsRead).toHaveLength(reads);
+
+    const accessorHarness = await boundedDecommissionHarness({
+      r2Names: ['FILES'],
+    });
+    const findImplementation = accessorHarness.backend.findApplicationR2Bucket;
+    const emptyImplementation =
+      accessorHarness.backend.assertApplicationR2Empty;
+    let findReads = 0;
+    let emptyReads = 0;
+    Object.defineProperty(accessorHarness.backend, 'findApplicationR2Bucket', {
+      configurable: true,
+      get() {
+        findReads += 1;
+        return findImplementation;
+      },
+    });
+    Object.defineProperty(accessorHarness.backend, 'assertApplicationR2Empty', {
+      configurable: true,
+      get() {
+        emptyReads += 1;
+        return emptyImplementation;
+      },
+    });
+    const accessorStart = await startBoundedDecommission(accessorHarness);
+    expect(findReads).toBe(1);
+    expect(emptyReads).toBe(1);
+    await continueBoundedDecommission(accessorHarness, accessorStart);
+    expect(findReads).toBe(2);
+    expect(emptyReads).toBe(2);
+
+    for (const [state, property, capability] of [
+      ['detached', 'assertApplicationR2Empty', 'application-r2-empty'],
+      ['empty', 'deleteApplicationR2Bucket', 'application-r2-delete'],
+    ] as const) {
+      const branch = await boundedDecommissionHarness({ r2Names: ['FILES'] });
+      const current = await driveBoundedUntil(
+        branch,
+        (record) => record.applicationResources?.[0]?.state === state,
+      );
+      Object.defineProperty(branch.backend, property, {
+        configurable: true,
+        value: undefined,
+      });
+      const before = branch.store.record;
+      await expect(
+        continueBoundedDecommission(branch, current),
+      ).rejects.toMatchObject({ capability });
+      expect(branch.store.record).toBe(before);
+    }
+
+    const exactVerify = await boundedDecommissionHarness({
+      r2Names: ['FILES'],
+    });
+    const exactDiscover = await driveBoundedUntil(
+      exactVerify,
+      (record) => record.decommissionIntent?.state === 'discover',
+    );
+    const exactToken = await continueBoundedDecommission(
+      exactVerify,
+      exactDiscover,
+    );
+    const exactFind = exactVerify.backend.findApplicationR2Bucket;
+    let exactFindReads = 0;
+    Object.defineProperty(exactVerify.backend, 'findApplicationR2Bucket', {
+      configurable: true,
+      get() {
+        exactFindReads += 1;
+        return exactFind;
+      },
+    });
+    await expect(
+      continueBoundedDecommission(exactVerify, exactToken),
+    ).resolves.toMatchObject({ status: 'pending' });
+    expect(exactFindReads).toBe(1);
+    expect(exactVerify.store.record?.applicationResources?.[0]?.state).toBe(
+      'detached',
+    );
+
+    const deletedPrefix = await boundedDecommissionHarness({
+      r2Names: ['FILES'],
+    });
+    await driveBoundedUntil(
+      deletedPrefix,
+      (record) => record.applicationResources?.[0]?.state === 'deleted',
+    );
+    const deletedCurrent = await startBoundedDecommission(deletedPrefix);
+    Object.defineProperty(deletedPrefix.backend, 'findApplicationR2Bucket', {
+      configurable: true,
+      value: undefined,
+    });
+    await expect(
+      continueBoundedDecommission(deletedPrefix, deletedCurrent),
+    ).rejects.toMatchObject({ capability: 'application-r2-inspection' });
+
+    for (const lifecyclePhase of ['ready', 'traffic-removed'] as const) {
+      const deletedOnly = await boundedDecommissionHarness({
+        r2Names: ['FILES'],
+      });
+      const resource = deletedOnly.store.record?.applicationResources?.[0];
+      if (!resource) throw new Error('missing deleted-only R2 resource');
+      deletedOnly.backend.buckets.delete(resource.bucketName);
+      deletedOnly.store.record = {
+        ...(deletedOnly.store.record as FleetRecord),
+        phase: lifecyclePhase,
+        applicationResources: [{ ...resource, state: 'deleted' }],
+      };
+      if (lifecyclePhase === 'traffic-removed') {
+        deletedOnly.backend.trafficRemoved = true;
+      }
+      Object.defineProperties(deletedOnly.backend, {
+        assertApplicationR2Empty: {
+          configurable: true,
+          value: undefined,
+        },
+        deleteApplicationR2Bucket: {
+          configurable: true,
+          value: undefined,
+        },
+      });
+      const initialFinds = deletedOnly.backend.r2FindCalls;
+      const initialEvents = deletedOnly.backend.events.length;
+      const initialDatabaseReads = deletedOnly.backend.databaseIdsRead.length;
+      const initialTrafficChecks =
+        deletedOnly.backend.assertTrafficRemovedCalls;
+      const initialWrites = deletedOnly.store.phases.length;
+      const started = await startBoundedDecommission(deletedOnly);
+      expect(deletedOnly.backend.r2FindCalls, lifecyclePhase).toBe(
+        initialFinds,
+      );
+      expect(deletedOnly.backend.events, lifecyclePhase).toHaveLength(
+        initialEvents,
+      );
+      expect(deletedOnly.backend.databaseIdsRead, lifecyclePhase).toHaveLength(
+        initialDatabaseReads,
+      );
+      expect(
+        deletedOnly.backend.assertTrafficRemovedCalls,
+        lifecyclePhase,
+      ).toBe(initialTrafficChecks);
+      expect(deletedOnly.store.phases, lifecyclePhase).toHaveLength(
+        initialWrites + 1,
+      );
+
+      await continueBoundedDecommission(deletedOnly, started);
+      expect(
+        deletedOnly.store.record?.decommissionIntent?.lifecyclePhase,
+        lifecyclePhase,
+      ).toBe(
+        lifecyclePhase === 'ready' ? 'decommissioning' : 'credentials-revoked',
+      );
+      expect(
+        deletedOnly.backend.r2FindNames.slice(initialFinds),
+        lifecyclePhase,
+      ).toEqual(['FILES']);
+      expect(
+        deletedOnly.backend.events.slice(initialEvents),
+        lifecyclePhase,
+      ).toEqual(lifecyclePhase === 'ready' ? [] : ['revoke']);
+      expect(
+        deletedOnly.backend.databaseIdsRead.length - initialDatabaseReads,
+        lifecyclePhase,
+      ).toBe(lifecyclePhase === 'ready' ? 0 : 1);
+      expect(
+        deletedOnly.backend.assertTrafficRemovedCalls - initialTrafficChecks,
+        lifecyclePhase,
+      ).toBe(lifecyclePhase === 'ready' ? 0 : 1);
+      expect(deletedOnly.store.phases, lifecyclePhase).toHaveLength(
+        initialWrites + 2,
+      );
+    }
+
+    for (const state of ['reserved', 'create-authorized'] as const) {
+      const incomplete = await boundedDecommissionHarness({
+        r2Names: ['FILES'],
+      });
+      const resource = incomplete.store.record?.applicationResources?.[0];
+      if (!resource) throw new Error('missing incomplete R2 resource');
+      const { creationDate: _creationDate, ...withoutCreation } = resource;
+      incomplete.store.record = {
+        ...(incomplete.store.record as FleetRecord),
+        applicationResources: [{ ...withoutCreation, state }],
+      };
+      const uuid = vi.fn(() => DECOMMISSION_OPERATION_ID);
+      await expect(
+        advanceDecommissionDeployment(
+          boundedAdvanceOptions(
+            incomplete,
+            { kind: 'start' },
+            {
+              randomUUID: uuid,
+            },
+          ),
+        ),
+      ).rejects.toThrow(/incomplete application R2 reservation/u);
+      expect(uuid).not.toHaveBeenCalled();
+    }
+
+    for (const lifecyclePhase of ['ready', 'traffic-removed'] as const) {
+      for (const state of ['reserved', 'create-authorized'] as const) {
+        const incomplete = await boundedDecommissionHarness({
+          r2Names: ['FILES'],
+        });
+        const current =
+          lifecyclePhase === 'ready'
+            ? await startBoundedDecommission(incomplete)
+            : await driveBoundedUntil(
+                incomplete,
+                (record) =>
+                  record.decommissionIntent?.lifecyclePhase ===
+                  'traffic-removed',
+              );
+        const resource = incomplete.store.record?.applicationResources?.[0];
+        if (!resource)
+          throw new Error('missing current incomplete R2 resource');
+        const { creationDate: _creationDate, ...reservation } = resource;
+        incomplete.store.record = {
+          ...(incomplete.store.record as FleetRecord),
+          applicationResources: [{ ...reservation, state }],
+        };
+        const capabilityImplementations = {
+          advanceDecommissionAttachmentScan:
+            incomplete.backend.advanceDecommissionAttachmentScan,
+          findApplicationR2Bucket: incomplete.backend.findApplicationR2Bucket,
+          assertApplicationR2Empty: incomplete.backend.assertApplicationR2Empty,
+          deleteApplicationR2Bucket:
+            incomplete.backend.deleteApplicationR2Bucket,
+        };
+        const capabilityReads: string[] = [];
+        for (const property of Object.keys(
+          capabilityImplementations,
+        ) as (keyof typeof capabilityImplementations)[]) {
+          Object.defineProperty(incomplete.backend, property, {
+            configurable: true,
+            get() {
+              capabilityReads.push(property);
+              return capabilityImplementations[property];
+            },
+          });
+        }
+        const before = JSON.stringify(incomplete.store.record);
+        const r2Finds = incomplete.backend.r2FindCalls;
+        const scans = incomplete.backend.scanInputs.length;
+        const emptyChecks = incomplete.backend.emptyChecks;
+        const deletes = incomplete.backend.deleteCalls;
+        const databaseReads = incomplete.backend.databaseIdsRead.length;
+        const trafficChecks = incomplete.backend.assertTrafficRemovedCalls;
+        const writes = incomplete.store.phases.length;
+        const events = [...incomplete.backend.events];
+        const failure = await continueBoundedDecommission(
+          incomplete,
+          current,
+        ).catch((error: unknown) => error);
+        expect(failure, `${lifecyclePhase}:${state}`).toMatchObject({
+          name: 'Error',
+          message:
+            'normal decommission cannot consume incomplete application R2 reservation',
+        });
+        expect(capabilityReads, `${lifecyclePhase}:${state}`).toEqual([]);
+        expect(
+          incomplete.backend.r2FindCalls,
+          `${lifecyclePhase}:${state}`,
+        ).toBe(r2Finds);
+        expect(
+          incomplete.backend.scanInputs,
+          `${lifecyclePhase}:${state}`,
+        ).toHaveLength(scans);
+        expect(
+          incomplete.backend.emptyChecks,
+          `${lifecyclePhase}:${state}`,
+        ).toBe(emptyChecks);
+        expect(
+          incomplete.backend.deleteCalls,
+          `${lifecyclePhase}:${state}`,
+        ).toBe(deletes);
+        expect(
+          incomplete.backend.databaseIdsRead,
+          `${lifecyclePhase}:${state}`,
+        ).toHaveLength(databaseReads);
+        expect(
+          incomplete.backend.assertTrafficRemovedCalls,
+          `${lifecyclePhase}:${state}`,
+        ).toBe(trafficChecks);
+        expect(incomplete.backend.events, `${lifecyclePhase}:${state}`).toEqual(
+          events,
+        );
+        expect(
+          incomplete.store.phases,
+          `${lifecyclePhase}:${state}`,
+        ).toHaveLength(writes);
+        expect(
+          JSON.stringify(incomplete.store.record),
+          `${lifecyclePhase}:${state}`,
+        ).toBe(before);
+      }
+    }
+
+    const platformRevoke = await boundedDecommissionHarness({
+      kind: 'workers-for-platforms',
+      external: true,
+    });
+    await driveBoundedUntil(
+      platformRevoke,
+      (record) =>
+        record.decommissionIntent?.lifecyclePhase === 'worker-deleted',
+    );
+    const revokeImplementation =
+      platformRevoke.backend.revokePlatformResourceCredentials;
+    let revokeReads = 0;
+    Object.defineProperty(
+      platformRevoke.backend,
+      'revokePlatformResourceCredentials',
+      {
+        configurable: true,
+        get() {
+          revokeReads += 1;
+          return revokeImplementation;
+        },
+      },
+    );
+    await continueBoundedDecommission(
+      platformRevoke,
+      await startBoundedDecommission(platformRevoke),
+    );
+    expect(revokeReads).toBe(1);
+
+    const platformDelete = await boundedDecommissionHarness({
+      kind: 'workers-for-platforms',
+      external: true,
+    });
+    await driveBoundedUntil(
+      platformDelete,
+      (record) =>
+        record.decommissionIntent?.lifecyclePhase ===
+        'platform-credentials-revoked',
+    );
+    const deleteImplementation = platformDelete.backend.deletePlatformResources;
+    const residualImplementation =
+      platformDelete.backend.assertDatabaseDeletionResidualsRemoved;
+    let deleteReads = 0;
+    let residualReads = 0;
+    Object.defineProperty(platformDelete.backend, 'deletePlatformResources', {
+      configurable: true,
+      get() {
+        deleteReads += 1;
+        return deleteImplementation;
+      },
+    });
+    Object.defineProperty(
+      platformDelete.backend,
+      'assertDatabaseDeletionResidualsRemoved',
+      {
+        configurable: true,
+        get() {
+          residualReads += 1;
+          return residualImplementation;
+        },
+      },
+    );
+    await continueBoundedDecommission(
+      platformDelete,
+      await startBoundedDecommission(platformDelete),
+    );
+    expect(deleteReads).toBe(1);
+    expect(residualReads).toBe(1);
+
+    for (const [lifecyclePhase, property, message] of [
+      [
+        'worker-deleted',
+        'revokePlatformResourceCredentials',
+        'backend cannot revoke trusted platform resource credentials',
+      ],
+      [
+        'platform-credentials-revoked',
+        'deletePlatformResources',
+        'backend cannot delete trusted platform resources',
+      ],
+    ] as const) {
+      const malformed = await boundedDecommissionHarness({
+        kind: 'workers-for-platforms',
+        external: true,
+      });
+      const current = await driveBoundedUntil(
+        malformed,
+        (record) =>
+          record.decommissionIntent?.lifecyclePhase === lifecyclePhase,
+      );
+      let getterReads = 0;
+      Object.defineProperty(malformed.backend, property, {
+        configurable: true,
+        get() {
+          getterReads += 1;
+          return {};
+        },
+      });
+      const before = malformed.store.record;
+      const databaseReads = malformed.backend.databaseIdsRead.length;
+      const events = [...malformed.backend.events];
+      await expect(
+        continueBoundedDecommission(malformed, current),
+      ).rejects.toThrow(message);
+      expect(getterReads).toBe(1);
+      expect(malformed.backend.databaseIdsRead).toHaveLength(databaseReads);
+      expect(malformed.backend.events).toEqual(events);
+      expect(malformed.store.record).toBe(before);
+    }
+  });
+
+  it('classifies token errors before I/O; stale is inert; current advances one group', async () => {
+    const harness = await boundedDecommissionHarness();
+    const getter = vi.fn(() => 'continue');
+    const hostile: Record<string, unknown> = {};
+    Object.defineProperty(hostile, 'kind', { enumerable: true, get: getter });
+    const leases = harness.store.leaseCalls;
+    await expect(
+      advanceDecommissionDeployment(
+        boundedAdvanceOptions(harness, hostile as never),
+      ),
+    ).rejects.toThrow('decommission advance action is malformed');
+    expect(getter).not.toHaveBeenCalled();
+    expect(harness.store.leaseCalls).toBe(leases);
+
+    const tokenGetter = vi.fn(() => ({}));
+    const hostileToken: Record<string, unknown> = { kind: 'continue' };
+    Object.defineProperty(hostileToken, 'token', {
+      enumerable: true,
+      get: tokenGetter,
+    });
+    await expect(
+      advanceDecommissionDeployment(
+        boundedAdvanceOptions(harness, hostileToken as never),
+      ),
+    ).rejects.toThrow('decommission advance action is malformed');
+    expect(tokenGetter).not.toHaveBeenCalled();
+    expect(harness.store.leaseCalls).toBe(leases);
+
+    const cyclicToken: Record<string, unknown> = {};
+    cyclicToken.self = cyclicToken;
+    let deepToken: unknown = 'leaf';
+    for (let depth = 0; depth < 10; depth += 1) {
+      deepToken = { next: deepToken };
+    }
+    for (const action of [
+      { kind: 'start', extra: true },
+      { kind: 'unknown' },
+      { kind: 'continue' },
+      { kind: 'continue', token: {}, extra: true },
+      { kind: 'restart-blocked' },
+      { kind: 'restart-blocked', token: {}, extra: true },
+      { kind: 'continue', token: cyclicToken },
+      { kind: 'continue', token: deepToken },
+      { kind: 'continue', token: Array.from({ length: 40 }, () => 0) },
+      { kind: 'continue', token: 'x'.repeat(2_049) },
+    ]) {
+      await expect(
+        advanceDecommissionDeployment(
+          boundedAdvanceOptions(harness, action as never),
+        ),
+      ).rejects.toThrow('decommission advance action is malformed');
+      expect(harness.store.leaseCalls).toBe(leases);
+    }
+
+    const started = await startBoundedDecommission(harness);
+    await expect(
+      advanceDecommissionDeployment(
+        boundedAdvanceOptions(harness, {
+          kind: 'continue',
+          token: { ...started.token, tenantTag: 'other' },
+        }),
+      ),
+    ).rejects.toThrow('decommission advance token targets another deployment');
+    await expect(
+      advanceDecommissionDeployment(
+        boundedAdvanceOptions(harness, {
+          kind: 'continue',
+          token: { ...started.token, operationId: crypto.randomUUID() },
+        }),
+      ),
+    ).rejects.toThrow('decommission advance token targets another operation');
+    await expect(
+      advanceDecommissionDeployment(
+        boundedAdvanceOptions(harness, {
+          kind: 'continue',
+          token: { ...started.token, revision: 99 },
+        }),
+      ),
+    ).rejects.toThrow('decommission advance token is from the future');
+
+    const advanced = await continueBoundedDecommission(harness, started);
+    const events = [...harness.backend.events];
+    await expect(
+      continueBoundedDecommission(harness, started),
+    ).resolves.toEqual(advanced);
+    expect(harness.backend.events).toEqual(events);
+
+    await expect(
+      advanceDecommissionDeployment(
+        boundedAdvanceOptions(
+          harness,
+          { kind: 'start' },
+          {
+            spec: spec({
+              modules: [{ name: 'worker.js', content: 'changed' }],
+            }),
+          },
+        ),
+      ),
+    ).rejects.toThrow(/different|match/u);
+    const replacementBackend = new R2RollbackBackend('workers-for-platforms');
+    await expect(
+      advanceDecommissionDeployment(
+        boundedAdvanceOptions(
+          harness,
+          { kind: 'start' },
+          { backend: replacementBackend },
+        ),
+      ),
+    ).rejects.toThrow('decommission backend does not own this deployment');
+    expect(replacementBackend.events).toHaveLength(0);
+
+    const absent = await boundedDecommissionHarness();
+    absent.store.record = undefined;
+    await expect(startBoundedDecommission(absent)).rejects.toThrow(
+      'deployment is not registered',
+    );
+    await expect(
+      advanceDecommissionDeployment(
+        boundedAdvanceOptions(absent, {
+          kind: 'continue',
+          token: started.token,
+        }),
+      ),
+    ).rejects.toThrow('decommission advance token targets another operation');
+
+    const intent = harness.store.record?.decommissionIntent;
+    if (!intent) throw new Error('missing decommission intent');
+    harness.store.record = {
+      ...(harness.store.record as FleetRecord),
+      phase: 'decommissioned',
+      applicationResources: [],
+      databaseExportLocation: 'r2://exports/db.sqlite',
+      databaseExportSha256: 'a'.repeat(64),
+      databaseExportSize: 32,
+      decommissionIntent: {
+        version: 1,
+        operationId: intent.operationId,
+        revision: 2,
+        generation: intent.generation,
+        updatedAt: intent.updatedAt,
+        identity: intent.identity,
+        lifecyclePhase: 'decommissioned',
+        state: 'complete',
+      },
+    };
+    const terminalRecord = harness.store.record as FleetRecord;
+    const currentToken = { ...started.token, revision: 2 };
+    const expectedComplete = {
+      status: 'complete',
+      token: currentToken,
+      result: {
+        record: terminalRecord,
+        databaseExport: {
+          databaseId: terminalRecord.databaseId,
+          location: 'r2://exports/db.sqlite',
+          sha256: 'a'.repeat(64),
+          size: 32,
+        },
+      },
+    } as const;
+    const terminalEvents = [...harness.backend.events];
+    const terminalWrites = harness.store.phases.length;
+    const terminalUuid = vi.fn(() => crypto.randomUUID());
+    const terminalClock = vi.fn(() => Date.now());
+    for (const action of [
+      { kind: 'continue', token: currentToken },
+      { kind: 'continue', token: { ...currentToken, revision: 1 } },
+      { kind: 'start' },
+    ] as const) {
+      await expect(
+        advanceDecommissionDeployment(
+          boundedAdvanceOptions(harness, action, {
+            randomUUID: terminalUuid,
+            clock: terminalClock,
+          }),
+        ),
+      ).resolves.toEqual(expectedComplete);
+    }
+    expect(terminalUuid).not.toHaveBeenCalled();
+    expect(terminalClock).not.toHaveBeenCalled();
+    expect(harness.backend.events).toEqual(terminalEvents);
+    expect(harness.store.phases).toHaveLength(terminalWrites);
+  });
+
+  it('a duplicate current token becomes stale after one lifecycle group', async () => {
+    const harness = await boundedDecommissionHarness();
+    let tick = Date.parse('2026-08-30T02:00:00.000Z');
+    const clock = vi.fn(() => (tick += 1_000));
+    const started = await advanceDecommissionDeployment(
+      boundedAdvanceOptions(harness, { kind: 'start' }, { clock }),
+    );
+    expect(clock).toHaveBeenCalledTimes(1);
+    const first = await advanceDecommissionDeployment(
+      boundedAdvanceOptions(
+        harness,
+        { kind: 'continue', token: started.token },
+        { clock },
+      ),
+    );
+    expect(first).toMatchObject({ status: 'pending', token: { revision: 1 } });
+    expect(clock).toHaveBeenCalledTimes(2);
+    const phase = harness.store.record?.decommissionIntent?.lifecyclePhase;
+    const duplicate = await advanceDecommissionDeployment(
+      boundedAdvanceOptions(
+        harness,
+        { kind: 'continue', token: started.token },
+        { clock },
+      ),
+    );
+    expect(duplicate).toEqual(first);
+    expect(clock).toHaveBeenCalledTimes(2);
+    expect(harness.store.record?.decommissionIntent?.lifecyclePhase).toBe(
+      phase,
+    );
+  });
+
+  it('persists exact progress budget signal and scan-only timestamps', async () => {
+    const harness = await boundedDecommissionHarness({ r2Names: ['FILES'] });
+    const atDiscover = await driveBoundedUntil(
+      harness,
+      (record) => record.decommissionIntent?.state === 'discover',
+    );
+    const before = harness.store.record as FleetRecord;
+    const scan = before.decommissionIntent;
+    if (scan?.state !== 'discover')
+      throw new Error('missing discover progress');
+    harness.backend.scanResults.push({
+      status: 'pending',
+      progress: scan.progress,
+      providerFetchAttemptsReserved: 12,
+    });
+    const controller = new AbortController();
+    const next = await advanceDecommissionDeployment(
+      boundedAdvanceOptions(
+        harness,
+        { kind: 'continue', token: atDiscover.token },
+        { signal: controller.signal },
+      ),
+    );
+    expect(harness.backend.scanInputs.at(-1)).toMatchObject({
+      progress: scan.progress,
+      maxProviderRequests: 12,
+      signal: controller.signal,
+    });
+    expect(harness.store.record?.updatedAt).toBe(before.updatedAt);
+    expect(next.token.revision).toBe(atDiscover.token.revision + 1);
+
+    const sentinel = new Error('scan transport failed');
+    harness.backend.scanFailure = sentinel;
+    const snapshot = harness.store.record;
+    await expect(continueBoundedDecommission(harness, next)).rejects.toBe(
+      sentinel,
+    );
+    expect(harness.store.record).toBe(snapshot);
+
+    const aborted = await boundedDecommissionHarness({ r2Names: ['FILES'] });
+    const abortedDiscover = await driveBoundedUntil(
+      aborted,
+      (record) => record.decommissionIntent?.state === 'discover',
+    );
+    const abortedController = new AbortController();
+    const abortReason = new Error('scan aborted by caller');
+    abortedController.abort(abortReason);
+    aborted.backend.scanFailure = abortReason;
+    const abortedSnapshot = aborted.store.record;
+    await expect(
+      advanceDecommissionDeployment(
+        boundedAdvanceOptions(
+          aborted,
+          { kind: 'continue', token: abortedDiscover.token },
+          { signal: abortedController.signal },
+        ),
+      ),
+    ).rejects.toBe(abortReason);
+    expect(aborted.backend.scanInputs.at(-1)?.signal).toBe(
+      abortedController.signal,
+    );
+    expect(aborted.backend.scanInputs.at(-1)?.signal?.aborted).toBe(true);
+    expect(aborted.backend.scanInputs.at(-1)?.signal?.reason).toBe(abortReason);
+    expect(aborted.store.record).toBe(abortedSnapshot);
+  });
+
+  it('discover completion starts a fresh verify pass without an action', async () => {
+    const harness = await boundedDecommissionHarness({ r2Names: ['FILES'] });
+    const discover = await driveBoundedUntil(
+      harness,
+      (record) => record.decommissionIntent?.state === 'discover',
+    );
+    const resourceBefore = harness.store.record?.applicationResources?.[0];
+    const verified = await continueBoundedDecommission(harness, discover);
+    expect(harness.store.record?.decommissionIntent).toMatchObject({
+      state: 'verify',
+      discoverEvidence: {
+        evidenceSha256: 'a'.repeat(64),
+        evidenceCount: 2,
+      },
+    });
+    expect(harness.store.record?.applicationResources?.[0]).toEqual(
+      resourceBefore,
+    );
+    expect(verified.status).toBe('pending');
+  });
+
+  it('matching verify atomically detaches and consumes scan payload', async () => {
+    const harness = await boundedDecommissionHarness({ r2Names: ['FILES'] });
+    const discover = await driveBoundedUntil(
+      harness,
+      (record) => record.decommissionIntent?.state === 'discover',
+    );
+    const verify = await continueBoundedDecommission(harness, discover);
+    await continueBoundedDecommission(harness, verify);
+    expect(harness.store.record?.applicationResources?.[0]?.state).toBe(
+      'detached',
+    );
+    expect(harness.store.record?.decommissionIntent).toMatchObject({
+      state: 'transitioning',
+    });
+    expect(harness.store.record?.decommissionIntent).not.toHaveProperty(
+      'discoverEvidence',
+    );
+  });
+
+  it('drift and independent digest or count mismatch restart discovery', async () => {
+    for (const mode of ['drift', 'digest', 'count'] as const) {
+      const harness = await boundedDecommissionHarness({ r2Names: ['FILES'] });
+      const discover = await driveBoundedUntil(
+        harness,
+        (record) => record.decommissionIntent?.state === 'discover',
+      );
+      const initialGeneration =
+        harness.store.record?.decommissionIntent?.generation ?? -1;
+      if (mode === 'drift') {
+        harness.backend.scanResults.push({ status: 'drift' });
+        await continueBoundedDecommission(harness, discover);
+      } else {
+        const verify = await continueBoundedDecommission(harness, discover);
+        harness.backend.scanResults.push({
+          status: 'complete',
+          evidenceSha256: mode === 'digest' ? 'b'.repeat(64) : 'a'.repeat(64),
+          evidenceCount: mode === 'count' ? 3 : 2,
+          providerFetchAttemptsReserved: 3,
+        });
+        await continueBoundedDecommission(harness, verify);
+      }
+      expect(harness.store.record?.decommissionIntent).toMatchObject({
+        state: 'discover',
+        generation: initialGeneration + 1,
+      });
+    }
+  });
+
+  it('blocks from either pass and only an explicit current restart proceeds', async () => {
+    for (const pass of ['discover', 'verify'] as const) {
+      const harness = await boundedDecommissionHarness({ r2Names: ['FILES'] });
+      let result = await driveBoundedUntil(
+        harness,
+        (record) => record.decommissionIntent?.state === 'discover',
+      );
+      if (pass === 'verify')
+        result = await continueBoundedDecommission(harness, result);
+      harness.backend.scanResults.push({
+        status: 'attached',
+        attachment: { plane: 'ordinary', scriptName: 'consumer' },
+        providerFetchAttemptsReserved: 3,
+      });
+      const blocked = await continueBoundedDecommission(harness, result);
+      expect(blocked).toMatchObject({
+        status: 'blocked',
+        attachment: { plane: 'ordinary', scriptName: 'consumer' },
+      });
+      const calls = harness.backend.scanInputs.length;
+      await expect(
+        continueBoundedDecommission(harness, blocked),
+      ).resolves.toEqual(blocked);
+      expect(harness.backend.scanInputs).toHaveLength(calls);
+      const restarted = await advanceDecommissionDeployment(
+        boundedAdvanceOptions(harness, {
+          kind: 'restart-blocked',
+          token: blocked.token,
+        }),
+      );
+      expect(restarted.status).toBe('pending');
+      expect(harness.store.record?.decommissionIntent?.state).toBe('discover');
+      await expect(
+        advanceDecommissionDeployment(
+          boundedAdvanceOptions(harness, {
+            kind: 'restart-blocked',
+            token: restarted.token,
+          }),
+        ),
+      ).rejects.toBeInstanceOf(DecommissionAdvanceRestartError);
+    }
+
+    const prefixed = await boundedDecommissionHarness({
+      r2Names: ['ARCHIVE', 'FILES'],
+    });
+    const secondDiscover = await driveBoundedUntil(
+      prefixed,
+      (record) =>
+        record.decommissionIntent?.state === 'discover' &&
+        record.decommissionIntent.purpose.kind === 'application-r2-detach' &&
+        record.decommissionIntent.purpose.resourceIndex === 1,
+    );
+    prefixed.backend.scanResults.push({
+      status: 'attached',
+      attachment: { plane: 'ordinary', scriptName: 'consumer' },
+      providerFetchAttemptsReserved: 3,
+    });
+    const secondBlocked = await continueBoundedDecommission(
+      prefixed,
+      secondDiscover,
+    );
+    const prior = prefixed.store.record?.applicationResources?.[0];
+    if (!prior?.creationDate)
+      throw new Error('missing deleted prefix identity');
+    prefixed.backend.buckets.set(prior.bucketName, {
+      name: prior.name,
+      bucketName: prior.bucketName,
+      jurisdiction: prior.jurisdiction,
+      creationDate: prior.creationDate,
+    });
+    const prefixFindImplementation = prefixed.backend.findApplicationR2Bucket;
+    let prefixFindGetterReads = 0;
+    Object.defineProperty(prefixed.backend, 'findApplicationR2Bucket', {
+      configurable: true,
+      get() {
+        prefixFindGetterReads += 1;
+        return prefixFindImplementation;
+      },
+    });
+    const prefixSnapshot = prefixed.store.record;
+    const prefixScans = prefixed.backend.scanInputs.length;
+    const prefixFinds = prefixed.backend.r2FindNames.length;
+    await expect(
+      advanceDecommissionDeployment(
+        boundedAdvanceOptions(prefixed, {
+          kind: 'restart-blocked',
+          token: secondBlocked.token,
+        }),
+      ),
+    ).rejects.toThrow(/reappeared after deletion/u);
+    expect(prefixed.store.record).toBe(prefixSnapshot);
+    expect(prefixed.backend.scanInputs).toHaveLength(prefixScans);
+    expect(prefixFindGetterReads).toBe(1);
+    expect(prefixed.backend.r2FindNames.slice(prefixFinds)).toEqual([
+      'ARCHIVE',
+    ]);
+
+    const d1Blocked = await boundedDecommissionHarness();
+    const d1Started = await startBoundedDecommission(d1Blocked);
+    const d1Intent = d1Blocked.store.record?.decommissionIntent;
+    if (!d1Intent) throw new Error('missing D1 blocked intent');
+    d1Blocked.store.record = {
+      ...(d1Blocked.store.record as FleetRecord),
+      decommissionIntent: {
+        ...d1Intent,
+        lifecyclePhase: 'application-resources-deleted',
+        state: 'blocked',
+        purpose: {
+          kind: 'database-pre-export',
+          databaseId: d1Blocked.store.record?.databaseId as string,
+        },
+        attachment: { plane: 'ordinary', scriptName: 'consumer' },
+      },
+    };
+    await expect(
+      advanceDecommissionDeployment(
+        boundedAdvanceOptions(d1Blocked, {
+          kind: 'restart-blocked',
+          token: d1Started.token,
+        }),
+      ),
+    ).rejects.toBeInstanceOf(DecommissionAdvanceRestartError);
+    expect(d1Blocked.backend.scanInputs).toHaveLength(0);
+  });
+
+  it('rejects hostile provider results before persistence', async () => {
+    const hostile = await boundedDecommissionHarness({ r2Names: ['FILES'] });
+    const hostileDiscover = await driveBoundedUntil(
+      hostile,
+      (record) => record.decommissionIntent?.state === 'discover',
+    );
+    const hostileIntent = hostile.store.record?.decommissionIntent;
+    if (hostileIntent?.state !== 'discover') {
+      throw new Error('missing hostile-result discover progress');
+    }
+    const validProgress = hostileIntent.progress;
+    const rows: readonly DecommissionAttachmentScanResult[] = [
+      {
+        status: 'pending',
+        progress: {} as never,
+        providerFetchAttemptsReserved: 3,
+      },
+      {
+        status: 'pending',
+        progress: {
+          ...validProgress,
+          target: { kind: 'r2', bucketName: 'another-bucket' },
+        },
+        providerFetchAttemptsReserved: 3,
+      },
+      {
+        status: 'pending',
+        progress: validProgress,
+      } as never,
+      {
+        status: 'pending',
+        progress: validProgress,
+        providerFetchAttemptsReserved: -1,
+      },
+      {
+        status: 'pending',
+        progress: validProgress,
+        providerFetchAttemptsReserved: 1.5,
+      },
+      {
+        status: 'pending',
+        progress: validProgress,
+        providerFetchAttemptsReserved: 13,
+      },
+      {
+        status: 'attached',
+        attachment: { plane: 'dispatch', scriptName: 'broken' } as never,
+        providerFetchAttemptsReserved: 3,
+      },
+      {
+        status: 'attached',
+        attachment: {
+          plane: 'ordinary',
+          scriptName: 'é'.repeat(2_049),
+        },
+        providerFetchAttemptsReserved: 3,
+      },
+      {
+        status: 'complete',
+        evidenceSha256: 'not-a-digest',
+        evidenceCount: 2,
+        providerFetchAttemptsReserved: 3,
+      },
+      {
+        status: 'complete',
+        evidenceSha256: 'a'.repeat(64),
+        evidenceCount: 1,
+        providerFetchAttemptsReserved: 3,
+      },
+      {
+        status: 'complete',
+        evidenceSha256: 'a'.repeat(64),
+        evidenceCount: 1_000_001,
+        providerFetchAttemptsReserved: 3,
+      },
+      {
+        status: 'complete',
+        evidenceSha256: 'a'.repeat(64),
+        evidenceCount: 2,
+        providerFetchAttemptsReserved: 13,
+      },
+    ];
+    for (const row of rows) {
+      hostile.backend.scanResults.push(row);
+      const snapshot = hostile.store.record;
+      await expect(
+        continueBoundedDecommission(hostile, hostileDiscover),
+      ).rejects.toThrow(/malformed/u);
+      expect(hostile.store.record).toBe(snapshot);
+    }
+
+    let topLevelGetterReads = 0;
+    const topLevelAccessor: Record<string, unknown> = {};
+    Object.defineProperty(topLevelAccessor, 'status', {
+      enumerable: true,
+      get() {
+        topLevelGetterReads += 1;
+        return 'drift';
+      },
+    });
+    let proxyTrapCalls = 0;
+    const hostileProxy = new Proxy(
+      {},
+      {
+        getPrototypeOf() {
+          proxyTrapCalls += 1;
+          throw new Error('proxy trap must be normalized');
+        },
+      },
+    );
+    let nestedGetterReads = 0;
+    const nestedAccessor: Record<string, unknown> = {
+      scriptName: 'consumer',
+    };
+    Object.defineProperty(nestedAccessor, 'plane', {
+      enumerable: true,
+      get() {
+        nestedGetterReads += 1;
+        return 'ordinary';
+      },
+    });
+    let alternatingScriptNameReads = 0;
+    const alternatingAttachment: Record<string, unknown> = {
+      plane: 'ordinary',
+    };
+    Object.defineProperty(alternatingAttachment, 'scriptName', {
+      enumerable: true,
+      get() {
+        alternatingScriptNameReads += 1;
+        return alternatingScriptNameReads % 2 === 1 ? 'consumer' : '';
+      },
+    });
+    const symbolResult = { status: 'drift' } as Record<
+      string | symbol,
+      unknown
+    >;
+    symbolResult[Symbol('hostile')] = true;
+    const cyclicResult: Record<string, unknown> = { status: 'drift' };
+    cyclicResult.self = cyclicResult;
+    const hostileRows = [
+      {
+        label: 'top-level accessor',
+        row: topLevelAccessor,
+        reads: () => topLevelGetterReads,
+        expectedReads: 0,
+      },
+      {
+        label: 'top-level proxy',
+        row: hostileProxy,
+        reads: () => proxyTrapCalls,
+        expectedReads: 1,
+      },
+      {
+        label: 'nested accessor',
+        row: {
+          status: 'attached',
+          attachment: nestedAccessor,
+          providerFetchAttemptsReserved: 3,
+        },
+        reads: () => nestedGetterReads,
+        expectedReads: 0,
+      },
+      {
+        label: 'alternating scriptName accessor',
+        row: {
+          status: 'attached',
+          attachment: alternatingAttachment,
+          providerFetchAttemptsReserved: 3,
+        },
+        reads: () => alternatingScriptNameReads,
+        expectedReads: 0,
+      },
+      {
+        label: 'symbol key',
+        row: symbolResult,
+        reads: () => 0,
+        expectedReads: 0,
+      },
+      {
+        label: 'cycle',
+        row: cyclicResult,
+        reads: () => 0,
+        expectedReads: 0,
+      },
+      {
+        label: 'scalar bound',
+        row: { status: 'drift', extra: 'x'.repeat(96 * 1_024) },
+        reads: () => 0,
+        expectedReads: 0,
+      },
+      {
+        label: 'node bound',
+        row: {
+          status: 'drift',
+          extra: Array.from({ length: 8_192 }, () => null),
+        },
+        reads: () => 0,
+        expectedReads: 0,
+      },
+    ] as const;
+    for (const row of hostileRows) {
+      hostile.backend.scanResults.push(row.row as never);
+      const before = JSON.stringify(hostile.store.record);
+      const writes = hostile.store.phases.length;
+      const failure = await continueBoundedDecommission(
+        hostile,
+        hostileDiscover,
+      ).catch((error: unknown) => error);
+      expect(failure, row.label).toMatchObject({
+        name: 'Error',
+        message: 'bounded decommission attachment result is malformed',
+      });
+      expect(row.reads(), row.label).toBe(row.expectedReads);
+      expect(hostile.store.phases, row.label).toHaveLength(writes);
+      expect(JSON.stringify(hostile.store.record), row.label).toBe(before);
+    }
+
+    const progressBoundary = await boundedDecommissionHarness({
+      r2Names: ['FILES'],
+    });
+    const progressBoundaryDiscover = await driveBoundedUntil(
+      progressBoundary,
+      (record) => record.decommissionIntent?.state === 'discover',
+    );
+    const progressBoundaryIntent =
+      progressBoundary.store.record?.decommissionIntent;
+    if (progressBoundaryIntent?.state !== 'discover') {
+      throw new Error('missing boundary discover progress');
+    }
+    const digest = (value: string) =>
+      createHash('sha256').update(value).digest('hex');
+    const pageStartCursor = 'p'.repeat(4_096);
+    const nextCursor = 'n'.repeat(4_096);
+    const seenCursorSha256 = [
+      ...Array.from({ length: 97 }, (_, index) => digest(`cursor-${index}`)),
+      digest(pageStartCursor),
+      digest(nextCursor),
+    ];
+    const legalBoundaryProgress = {
+      version: 1,
+      target: progressBoundaryIntent.progress.target,
+      evidenceSha256: 'a'.repeat(64),
+      evidenceCount: 1_000_000,
+      stage: 'dispatch-script-settings',
+      ordinaryInventorySha256: 'b'.repeat(64),
+      namespaceInventorySha256: 'c'.repeat(64),
+      namespaceIndex: 0,
+      namespaceName: 'm'.repeat(4_096),
+      pageStartCursor,
+      nextCursor,
+      pageSha256: 'd'.repeat(64),
+      pageItemCount: 1,
+      itemOffset: 0,
+      pageNumber: 98,
+      seenCursorSha256,
+      totalDispatchItems: 10_000,
+      dispatchEvidenceSum256: 'e'.repeat(64),
+      dispatchEvidenceCount: 9_999,
+    } as const;
+    progressBoundary.backend.scanResults.push({
+      status: 'pending',
+      progress: legalBoundaryProgress,
+      providerFetchAttemptsReserved: 12,
+    });
+    const progressBoundaryPending = await continueBoundedDecommission(
+      progressBoundary,
+      progressBoundaryDiscover,
+    );
+    expect(progressBoundaryPending).toMatchObject({ status: 'pending' });
+    expect(progressBoundary.store.record?.decommissionIntent).toMatchObject({
+      state: 'discover',
+      progress: legalBoundaryProgress,
+    });
+    progressBoundary.backend.scanResults.push({
+      status: 'complete',
+      evidenceSha256: 'f'.repeat(64),
+      evidenceCount: 1_000_000,
+      providerFetchAttemptsReserved: 3,
+    });
+    await expect(
+      continueBoundedDecommission(progressBoundary, progressBoundaryPending),
+    ).resolves.toMatchObject({ status: 'pending' });
+    expect(progressBoundary.store.record?.decommissionIntent).toMatchObject({
+      state: 'verify',
+      discoverEvidence: {
+        evidenceSha256: 'f'.repeat(64),
+        evidenceCount: 1_000_000,
+      },
+    });
+
+    const boundary = await boundedDecommissionHarness({ r2Names: ['FILES'] });
+    const boundaryDiscover = await driveBoundedUntil(
+      boundary,
+      (record) => record.decommissionIntent?.state === 'discover',
+    );
+    boundary.backend.scanResults.push({
+      status: 'attached',
+      attachment: {
+        plane: 'ordinary',
+        scriptName: 'x'.repeat(4_096),
+        token: 'must-not-persist',
+      } as never,
+      providerFetchAttemptsReserved: 3,
+      token: 'must-not-persist',
+    } as never);
+    await expect(
+      continueBoundedDecommission(boundary, boundaryDiscover),
+    ).resolves.toMatchObject({
+      status: 'blocked',
+      attachment: { plane: 'ordinary', scriptName: 'x'.repeat(4_096) },
+    });
+    expect(
+      JSON.stringify(boundary.store.record?.decommissionIntent),
+    ).not.toContain('must-not-persist');
+  });
+
+  it('lease contention and loss fence scan consumption and destructive actions', async () => {
+    const contended = await boundedDecommissionHarness();
+    contended.store.leased = true;
+    await expect(startBoundedDecommission(contended)).rejects.toThrow(
+      /already being modified/u,
+    );
+    contended.store.leased = false;
+
+    const harness = await boundedDecommissionHarness({ r2Names: ['FILES'] });
+    const discover = await driveBoundedUntil(
+      harness,
+      (record) => record.decommissionIntent?.state === 'discover',
+    );
+    const verify = await continueBoundedDecommission(harness, discover);
+    const lost = new Error('lease lost before detach');
+    harness.store.assertOwnedFailure = lost;
+    await expect(continueBoundedDecommission(harness, verify)).rejects.toBe(
+      lost,
+    );
+    expect(harness.store.record?.decommissionIntent?.state).toBe('verify');
+    expect(harness.store.record?.applicationResources?.[0]?.state).toBe(
+      'detach-authorized',
+    );
+    harness.store.assertOwnedFailure = undefined;
+    await continueBoundedDecommission(harness, verify);
+    expect(harness.backend.scanInputs.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('executes one lifecycle group per call through application resource deletion', async () => {
+    const harness = await boundedDecommissionHarness();
+    let result = await startBoundedDecommission(harness);
+    const expected = [
+      {
+        lifecyclePhase: 'decommissioning',
+        events: [],
+        databaseReads: 0,
+        removeTraffic: 0,
+        assertTraffic: 0,
+        residuals: 0,
+      },
+      {
+        lifecyclePhase: 'traffic-removed',
+        events: [],
+        databaseReads: 1,
+        removeTraffic: 1,
+        assertTraffic: 1,
+        residuals: 0,
+      },
+      {
+        lifecyclePhase: 'credentials-revoked',
+        events: ['revoke'],
+        databaseReads: 1,
+        removeTraffic: 0,
+        assertTraffic: 1,
+        residuals: 0,
+      },
+      {
+        lifecyclePhase: 'worker-deleted',
+        events: ['delete-worker'],
+        databaseReads: 1,
+        removeTraffic: 0,
+        assertTraffic: 0,
+        residuals: 1,
+      },
+      {
+        lifecyclePhase: 'platform-credentials-revoked',
+        events: [],
+        databaseReads: 0,
+        removeTraffic: 0,
+        assertTraffic: 0,
+        residuals: 0,
+      },
+      {
+        lifecyclePhase: 'platform-resources-deleted',
+        events: [],
+        databaseReads: 0,
+        removeTraffic: 0,
+        assertTraffic: 0,
+        residuals: 0,
+      },
+      {
+        lifecyclePhase: 'application-resources-deleting',
+        events: [],
+        databaseReads: 0,
+        removeTraffic: 0,
+        assertTraffic: 0,
+        residuals: 0,
+      },
+      {
+        lifecyclePhase: 'application-resources-deleted',
+        events: [],
+        databaseReads: 0,
+        removeTraffic: 0,
+        assertTraffic: 0,
+        residuals: 0,
+      },
+    ] as const;
+    for (const step of expected) {
+      const eventCount = harness.backend.events.length;
+      const databaseReads = harness.backend.databaseIdsRead.length;
+      const removeTraffic = harness.backend.removeTrafficCalls;
+      const assertTraffic = harness.backend.assertTrafficRemovedCalls;
+      const residuals = harness.backend.residualCalls;
+      const writes = harness.store.phases.length;
+      result = await continueBoundedDecommission(harness, result);
+      expect(harness.store.record?.decommissionIntent?.lifecyclePhase).toBe(
+        step.lifecyclePhase,
+      );
+      expect(harness.backend.events.slice(eventCount)).toEqual(step.events);
+      expect(harness.backend.databaseIdsRead.length - databaseReads).toBe(
+        step.databaseReads,
+      );
+      expect(harness.backend.removeTrafficCalls - removeTraffic).toBe(
+        step.removeTraffic,
+      );
+      expect(harness.backend.assertTrafficRemovedCalls - assertTraffic).toBe(
+        step.assertTraffic,
+      );
+      expect(harness.backend.residualCalls - residuals).toBe(step.residuals);
+      expect(harness.store.phases).toHaveLength(writes + 1);
+      expect(harness.store.phases.at(-1)).toBe('decommission-advancing');
+    }
+    expect(result.status).toBe('pending');
+    expect(harness.backend.events).not.toContain('export');
+    expect(harness.backend.events).not.toContain('delete-database');
+
+    const platform = await boundedDecommissionHarness({
+      kind: 'workers-for-platforms',
+      external: true,
+    });
+    expect(platform.store.record?.platformResources).toBeDefined();
+    const platformTrace: string[] = [];
+    const getDatabaseImplementation = platform.backend.getDatabase.bind(
+      platform.backend,
+    );
+    const revokePlatformImplementation =
+      platform.backend.revokePlatformResourceCredentials.bind(platform.backend);
+    const deletePlatformImplementation =
+      platform.backend.deletePlatformResources.bind(platform.backend);
+    const residualImplementation =
+      platform.backend.assertDatabaseDeletionResidualsRemoved.bind(
+        platform.backend,
+      );
+    const putImplementation = platform.store.put.bind(platform.store);
+    Object.defineProperties(platform.backend, {
+      getDatabase: {
+        configurable: true,
+        value: async (databaseId: string) => {
+          platformTrace.push('d1-read');
+          return getDatabaseImplementation(databaseId);
+        },
+      },
+      revokePlatformResourceCredentials: {
+        configurable: true,
+        value: async () => {
+          platformTrace.push('revoke-platform');
+          await revokePlatformImplementation();
+        },
+      },
+      deletePlatformResources: {
+        configurable: true,
+        value: async (deployment: DeploymentSpec, record: FleetRecord) => {
+          platformTrace.push('delete-platform');
+          await deletePlatformImplementation(deployment, record);
+        },
+      },
+      assertDatabaseDeletionResidualsRemoved: {
+        configurable: true,
+        value: async () => {
+          platformTrace.push('residual');
+          await residualImplementation();
+        },
+      },
+    });
+    Object.defineProperty(platform.store, 'put', {
+      configurable: true,
+      value: async (record: FleetRecord) => {
+        platformTrace.push('write');
+        await putImplementation(record);
+      },
+    });
+    let platformResult = await startBoundedDecommission(platform);
+    const platformExpected = [
+      {
+        lifecyclePhase: 'decommissioning',
+        events: [],
+        databaseReads: 0,
+        residuals: 0,
+      },
+      {
+        lifecyclePhase: 'traffic-removed',
+        events: [],
+        databaseReads: 1,
+        residuals: 0,
+      },
+      {
+        lifecyclePhase: 'credentials-revoked',
+        events: ['revoke'],
+        databaseReads: 1,
+        residuals: 0,
+      },
+      {
+        lifecyclePhase: 'worker-deleted',
+        events: ['delete-worker'],
+        databaseReads: 1,
+        residuals: 0,
+      },
+      {
+        lifecyclePhase: 'platform-credentials-revoked',
+        events: ['revoke-platform'],
+        databaseReads: 1,
+        residuals: 0,
+      },
+      {
+        lifecyclePhase: 'platform-resources-deleted',
+        events: ['delete-platform'],
+        databaseReads: 1,
+        residuals: 1,
+      },
+    ] as const;
+    for (const step of platformExpected) {
+      const eventCount = platform.backend.events.length;
+      const databaseReads = platform.backend.databaseIdsRead.length;
+      const residuals = platform.backend.residualCalls;
+      const writes = platform.store.phases.length;
+      const traceStart = platformTrace.length;
+      platformResult = await continueBoundedDecommission(
+        platform,
+        platformResult,
+      );
+      expect(platform.store.record?.decommissionIntent?.lifecyclePhase).toBe(
+        step.lifecyclePhase,
+      );
+      expect(platform.backend.events.slice(eventCount)).toEqual(step.events);
+      expect(platform.backend.databaseIdsRead.length - databaseReads).toBe(
+        step.databaseReads,
+      );
+      expect(platform.backend.residualCalls - residuals).toBe(step.residuals);
+      expect(platform.store.phases).toHaveLength(writes + 1);
+      expect(platform.store.phases.at(-1)).toBe('decommission-advancing');
+      if (step.lifecyclePhase === 'platform-credentials-revoked') {
+        expect(platformTrace.slice(traceStart)).toEqual([
+          'd1-read',
+          'revoke-platform',
+          'write',
+        ]);
+      }
+      if (step.lifecyclePhase === 'platform-resources-deleted') {
+        expect(platformTrace.slice(traceStart)).toEqual([
+          'd1-read',
+          'delete-platform',
+          'residual',
+          'write',
+        ]);
+      }
+    }
+    expect(platform.backend.events).toEqual([
+      'revoke',
+      'delete-worker',
+      'revoke-platform',
+      'delete-platform',
+    ]);
+    expect(platform.backend.databaseIdsRead).toEqual([
+      'database-id',
+      'database-id',
+      'database-id',
+      'database-id',
+      'database-id',
+    ]);
+    expect(platform.backend.residualCalls).toBe(1);
+
+    for (const drift of ['absent', 'name', 'owner'] as const) {
+      const exact = await boundedDecommissionHarness();
+      const decommissioning = await driveBoundedUntil(
+        exact,
+        (record) =>
+          record.decommissionIntent?.lifecyclePhase === 'decommissioning',
+      );
+      if (drift === 'absent') exact.backend.databaseExists = false;
+      if (drift === 'name') exact.backend.databaseName = 'wrong-name';
+      if (drift === 'owner') exact.backend.databaseOwner = 'other-owner';
+      const before = exact.store.record;
+      await expect(
+        continueBoundedDecommission(exact, decommissioning),
+      ).rejects.toThrow(/absent|unexpected identity|owned by/u);
+      expect(exact.store.record).toBe(before);
+      expect(exact.backend.removeTrafficCalls).toBe(0);
+    }
+
+    for (const lifecyclePhase of [
+      'worker-deleted',
+      'platform-credentials-revoked',
+    ] as const) {
+      for (const drift of ['absent', 'name', 'owner'] as const) {
+        const exact = await boundedDecommissionHarness({
+          kind: 'workers-for-platforms',
+          external: true,
+        });
+        await driveBoundedUntil(
+          exact,
+          (record) =>
+            record.decommissionIntent?.lifecyclePhase === lifecyclePhase,
+        );
+        if (drift === 'absent') exact.backend.databaseExists = false;
+        if (drift === 'name') exact.backend.databaseName = 'wrong-name';
+        if (drift === 'owner') exact.backend.databaseOwner = 'other-owner';
+        const authoritative = await startBoundedDecommission(exact);
+        const before = exact.store.record;
+        const eventCount = exact.backend.events.length;
+        await expect(
+          continueBoundedDecommission(exact, authoritative),
+        ).rejects.toThrow(/absent|unexpected identity|owned by/u);
+        expect(exact.store.record).toBe(before);
+        expect(exact.backend.events).toHaveLength(eventCount);
+      }
+    }
+  });
+
+  it('starts exact created and detach-authorized live R2 targets', async () => {
+    const harness = await boundedDecommissionHarness({ r2Names: ['FILES'] });
+    const discover = await driveBoundedUntil(
+      harness,
+      (record) => record.decommissionIntent?.state === 'discover',
+    );
+    const intent = harness.store.record?.decommissionIntent;
+    const resource = harness.store.record?.applicationResources?.[0];
+    expect(intent).toMatchObject({
+      state: 'discover',
+      purpose: {
+        kind: 'application-r2-detach',
+        resourceIndex: 0,
+        name: resource?.name,
+        bucketName: resource?.bucketName,
+        reservationNonce: resource?.reservationNonce,
+      },
+    });
+    expect(discover.status).toBe('pending');
+
+    if (!resource) throw new Error('missing R2 resource');
+    const mutated = {
+      ...resource,
+      reservationNonce: 'z'.repeat(32),
+    };
+    const invalid = await boundedDecommissionHarness({ r2Names: ['FILES'] });
+    invalid.store.record = {
+      ...(invalid.store.record as FleetRecord),
+      applicationResources: [mutated],
+    };
+    const reads = invalid.backend.r2FindCalls;
+    await expect(startBoundedDecommission(invalid)).rejects.toThrow(
+      /reservation nonce/u,
+    );
+    expect(invalid.backend.r2FindCalls).toBe(reads);
+
+    const postTraffic = await boundedDecommissionHarness({
+      r2Names: ['FILES'],
+    });
+    const trafficRemoved = await driveBoundedUntil(
+      postTraffic,
+      (record) =>
+        record.decommissionIntent?.lifecyclePhase === 'traffic-removed',
+    );
+    const postTrafficResource =
+      postTraffic.store.record?.applicationResources?.[0];
+    if (!postTrafficResource) {
+      throw new Error('missing post-traffic R2 resource');
+    }
+    postTraffic.store.record = {
+      ...(postTraffic.store.record as FleetRecord),
+      applicationResources: [
+        { ...postTrafficResource, reservationNonce: 'z'.repeat(32) },
+      ],
+    };
+    const trafficReads = postTraffic.backend.assertTrafficRemovedCalls;
+    await expect(
+      continueBoundedDecommission(postTraffic, trafficRemoved),
+    ).rejects.toThrow(/reservation nonce/u);
+    expect(postTraffic.backend.assertTrafficRemovedCalls).toBe(trafficReads);
+  });
+
+  it('advances detached to empty-authorized and empty-authorized to empty one step each', async () => {
+    const harness = await boundedDecommissionHarness({ r2Names: ['FILES'] });
+    let result = await driveBoundedUntil(
+      harness,
+      (record) => record.applicationResources?.[0]?.state === 'detached',
+    );
+    result = await continueBoundedDecommission(harness, result);
+    expect(harness.store.record?.applicationResources?.[0]?.state).toBe(
+      'empty-authorized',
+    );
+    harness.backend.nonempty = true;
+    const snapshot = harness.store.record;
+    await expect(continueBoundedDecommission(harness, result)).rejects.toThrow(
+      /not empty/u,
+    );
+    expect(harness.store.record).toBe(snapshot);
+    harness.backend.nonempty = false;
+    await continueBoundedDecommission(harness, result);
+    expect(harness.store.record?.applicationResources?.[0]?.state).toBe(
+      'empty',
+    );
+  });
+
+  it('persists empty to delete-authorized before physical deletion', async () => {
+    const harness = await boundedDecommissionHarness({ r2Names: ['FILES'] });
+    let result = await driveBoundedUntil(
+      harness,
+      (record) => record.applicationResources?.[0]?.state === 'empty',
+    );
+    const calls = harness.backend.deleteCalls;
+    result = await continueBoundedDecommission(harness, result);
+    expect(harness.store.record?.applicationResources?.[0]?.state).toBe(
+      'delete-authorized',
+    );
+    expect(harness.backend.deleteCalls).toBe(calls);
+    await continueBoundedDecommission(harness, result);
+    expect(harness.backend.deleteCalls).toBe(calls + 1);
+  });
+
+  it('reconciles lost delete responses and deleted writes without duplicate mutation', async () => {
+    const beforeCommit = await boundedDecommissionHarness({
+      r2Names: ['FILES'],
+    });
+    const authorized = await driveBoundedUntil(
+      beforeCommit,
+      (record) =>
+        record.applicationResources?.[0]?.state === 'delete-authorized',
+    );
+    const sentinel = new Error('delete failed before commit');
+    beforeCommit.backend.deleteFailureBeforeCommit = sentinel;
+    await expect(
+      continueBoundedDecommission(beforeCommit, authorized),
+    ).rejects.toBe(sentinel);
+    expect(beforeCommit.store.record?.applicationResources?.[0]?.state).toBe(
+      'delete-authorized',
+    );
+
+    const precommitStore = new MemoryStore();
+    const precommitWrite = await boundedDecommissionHarness({
+      r2Names: ['FILES'],
+      store: precommitStore,
+    });
+    const precommitAuthorized = await driveBoundedUntil(
+      precommitWrite,
+      (record) =>
+        record.applicationResources?.[0]?.state === 'delete-authorized',
+    );
+    precommitStore.failPutApplicationState = {
+      name: 'FILES',
+      state: 'deleted',
+    };
+    const successfulDeletes = precommitWrite.backend.deleteCalls;
+    await expect(
+      continueBoundedDecommission(precommitWrite, precommitAuthorized),
+    ).rejects.toThrow('failed state write at FILES:deleted');
+    expect(precommitWrite.backend.deleteCalls).toBe(successfulDeletes + 1);
+    expect(precommitWrite.store.record?.applicationResources?.[0]?.state).toBe(
+      'delete-authorized',
+    );
+    await continueBoundedDecommission(precommitWrite, precommitAuthorized);
+    expect(precommitWrite.backend.deleteCalls).toBe(successfulDeletes + 1);
+    expect(precommitWrite.store.record?.applicationResources?.[0]?.state).toBe(
+      'deleted',
+    );
+
+    const afterCommit = await boundedDecommissionHarness({
+      r2Names: ['FILES'],
+      store: new CommitThenThrowStore(),
+    });
+    const deleteToken = await driveBoundedUntil(
+      afterCommit,
+      (record) =>
+        record.applicationResources?.[0]?.state === 'delete-authorized',
+    );
+    afterCommit.backend.deleteFailureAfterCommit = new Error(
+      'delete response lost',
+    );
+    (
+      afterCommit.store as CommitThenThrowStore
+    ).failAfterCommittedApplicationState = {
+      name: 'FILES',
+      state: 'deleted',
+    };
+    await expect(
+      continueBoundedDecommission(afterCommit, deleteToken),
+    ).rejects.toThrow(/response was lost/u);
+    expect(afterCommit.store.record?.applicationResources?.[0]?.state).toBe(
+      'deleted',
+    );
+    expect(afterCommit.backend.deleteCalls).toBe(1);
+    const replayed = await continueBoundedDecommission(
+      afterCommit,
+      deleteToken,
+    );
+    await expect(
+      continueBoundedDecommission(afterCommit, deleteToken),
+    ).resolves.toEqual(replayed);
+    expect(afterCommit.backend.deleteCalls).toBe(1);
+  });
+
+  it('orders two resources without rewind and stops inertly at the D1 boundary', async () => {
+    const harness = await boundedDecommissionHarness({
+      r2Names: ['ARCHIVE', 'FILES'],
+    });
+    let result = await startBoundedDecommission(harness);
+    for (let step = 0; step < 64; step += 1) {
+      const resources = harness.store.record?.applicationResources ?? [];
+      if (
+        resources[0]?.state === 'deleted' &&
+        resources[1]?.state !== 'deleted'
+      ) {
+        const first = resources[0];
+        harness.backend.buckets.set(first.bucketName, {
+          name: first.name,
+          bucketName: first.bucketName,
+          jurisdiction: first.jurisdiction,
+          creationDate: first.creationDate as string,
+        });
+        let authoritative: DecommissionAdvanceResult | undefined;
+        let refusal: unknown;
+        try {
+          authoritative = await continueBoundedDecommission(harness, result);
+        } catch (error) {
+          refusal = error;
+        }
+        if (refusal !== undefined) {
+          expect(refusal).toMatchObject({
+            message: expect.stringMatching(/reappeared/u),
+          });
+        } else {
+          if (!authoritative) throw new Error('missing authoritative token');
+          await expect(
+            continueBoundedDecommission(harness, authoritative),
+          ).rejects.toThrow(/reappeared/u);
+          result = authoritative;
+        }
+        harness.backend.buckets.delete(first.bucketName);
+      }
+      if (
+        harness.store.record?.decommissionIntent?.lifecyclePhase ===
+        'application-resources-deleted'
+      ) {
+        break;
+      }
+      result = await continueBoundedDecommission(harness, result);
+    }
+    expect(
+      harness.store.record?.applicationResources?.map(({ state }) => state),
+    ).toEqual(['deleted', 'deleted']);
+    expect(harness.store.record?.decommissionIntent?.generation).toBe(2);
+    const scans = harness.backend.scanInputs.length;
+    const inert = await continueBoundedDecommission(harness, result);
+    expect(inert).toEqual(result);
+    expect(harness.backend.scanInputs).toHaveLength(scans);
+
+    for (const mode of [
+      'discover',
+      'verify',
+      'pending',
+      'drift',
+      'attached',
+    ] as const) {
+      const prefixed = await boundedDecommissionHarness({
+        r2Names: ['ARCHIVE', 'FILES'],
+      });
+      let current = await driveBoundedUntil(
+        prefixed,
+        (record) =>
+          record.decommissionIntent?.state === 'discover' &&
+          record.decommissionIntent.purpose.kind === 'application-r2-detach' &&
+          record.decommissionIntent.purpose.resourceIndex === 1,
+      );
+      const scanIntent = prefixed.store.record?.decommissionIntent;
+      if (scanIntent?.state !== 'discover') {
+        throw new Error('missing second-resource discover state');
+      }
+      if (mode === 'verify') {
+        current = await continueBoundedDecommission(prefixed, current);
+      } else if (mode === 'pending') {
+        prefixed.backend.scanResults.push({
+          status: 'pending',
+          progress: scanIntent.progress,
+          providerFetchAttemptsReserved: 3,
+        });
+        current = await continueBoundedDecommission(prefixed, current);
+      } else if (mode === 'drift') {
+        prefixed.backend.scanResults.push({ status: 'drift' });
+      } else if (mode === 'attached') {
+        prefixed.backend.scanResults.push({
+          status: 'attached',
+          attachment: { plane: 'ordinary', scriptName: 'consumer' },
+          providerFetchAttemptsReserved: 3,
+        });
+      }
+      const deleted = prefixed.store.record?.applicationResources?.[0];
+      if (!deleted?.creationDate) {
+        throw new Error('missing first-resource deletion identity');
+      }
+      prefixed.backend.buckets.set(deleted.bucketName, {
+        name: deleted.name,
+        bucketName: deleted.bucketName,
+        jurisdiction: deleted.jurisdiction,
+        creationDate: deleted.creationDate,
+      });
+      const snapshot = prefixed.store.record;
+      const scanCount = prefixed.backend.scanInputs.length;
+      const findCount = prefixed.backend.r2FindNames.length;
+      const writeCount = prefixed.store.phases.length;
+      await expect(
+        continueBoundedDecommission(prefixed, current),
+        mode,
+      ).rejects.toThrow(/reappeared after deletion/u);
+      expect(prefixed.store.record, mode).toBe(snapshot);
+      expect(prefixed.backend.scanInputs, mode).toHaveLength(scanCount);
+      expect(prefixed.store.phases, mode).toHaveLength(writeCount);
+      expect(prefixed.backend.r2FindNames.slice(findCount), mode).toEqual([
+        'ARCHIVE',
+      ]);
+    }
+
+    for (const state of ['reserved', 'create-authorized'] as const) {
+      for (const mode of ['discover', 'verify', 'restart'] as const) {
+        const hostile = await boundedDecommissionHarness({
+          r2Names: ['ARCHIVE', 'FILES'],
+        });
+        let current = await driveBoundedUntil(
+          hostile,
+          (record) =>
+            record.decommissionIntent?.state === 'discover' &&
+            record.decommissionIntent.purpose.kind ===
+              'application-r2-detach' &&
+            record.decommissionIntent.purpose.resourceIndex === 1,
+        );
+        if (mode === 'verify') {
+          current = await continueBoundedDecommission(hostile, current);
+        } else if (mode === 'restart') {
+          hostile.backend.scanResults.push({
+            status: 'attached',
+            attachment: { plane: 'ordinary', scriptName: 'consumer' },
+            providerFetchAttemptsReserved: 3,
+          });
+          current = await continueBoundedDecommission(hostile, current);
+          expect(current.status).toBe('blocked');
+        }
+        const resources = hostile.store.record?.applicationResources;
+        const prefix = resources?.[0];
+        if (!prefix || !resources?.[1]) {
+          throw new Error('missing hostile prefix resources');
+        }
+        const { creationDate: _creationDate, ...reservation } = prefix;
+        hostile.store.record = {
+          ...(hostile.store.record as FleetRecord),
+          applicationResources: [
+            { ...reservation, state },
+            ...resources.slice(1),
+          ],
+        };
+        const findImplementation = hostile.backend.findApplicationR2Bucket;
+        const scanImplementation =
+          hostile.backend.advanceDecommissionAttachmentScan;
+        let findReads = 0;
+        let scanReads = 0;
+        Object.defineProperties(hostile.backend, {
+          findApplicationR2Bucket: {
+            configurable: true,
+            get() {
+              findReads += 1;
+              return findImplementation;
+            },
+          },
+          advanceDecommissionAttachmentScan: {
+            configurable: true,
+            get() {
+              scanReads += 1;
+              return scanImplementation;
+            },
+          },
+        });
+        const before = JSON.stringify(hostile.store.record);
+        const findCalls = hostile.backend.r2FindCalls;
+        const scanCalls = hostile.backend.scanInputs.length;
+        const emptyCalls = hostile.backend.emptyChecks;
+        const deleteCalls = hostile.backend.deleteCalls;
+        const writes = hostile.store.phases.length;
+        const events = [...hostile.backend.events];
+        const attempt =
+          mode === 'restart'
+            ? advanceDecommissionDeployment(
+                boundedAdvanceOptions(hostile, {
+                  kind: 'restart-blocked',
+                  token: current.token,
+                }),
+              )
+            : continueBoundedDecommission(hostile, current);
+        await expect(attempt, `${state}:${mode}`).rejects.toThrow(
+          'normal decommission cannot consume incomplete application R2 reservation',
+        );
+        expect(JSON.stringify(hostile.store.record), `${state}:${mode}`).toBe(
+          before,
+        );
+        expect(findReads, `${state}:${mode}:find getter`).toBe(0);
+        expect(scanReads, `${state}:${mode}:scan getter`).toBe(0);
+        expect(hostile.backend.r2FindCalls, `${state}:${mode}`).toBe(findCalls);
+        expect(hostile.backend.scanInputs, `${state}:${mode}`).toHaveLength(
+          scanCalls,
+        );
+        expect(hostile.backend.emptyChecks, `${state}:${mode}`).toBe(
+          emptyCalls,
+        );
+        expect(hostile.backend.deleteCalls, `${state}:${mode}`).toBe(
+          deleteCalls,
+        );
+        expect(hostile.store.phases, `${state}:${mode}`).toHaveLength(writes);
+        expect(hostile.backend.events, `${state}:${mode}`).toEqual(events);
+      }
+    }
+  });
+
+  it('atomically consumes plain and WFP migration carriers while preserving snapshots', async () => {
+    for (const kind of ['plain-worker', 'workers-for-platforms'] as const) {
+      const harness = await boundedDecommissionHarness({ kind });
+      const record = harness.store.record as FleetRecord;
+      const targetDigest = deploymentSpecDigest(harness.deployment);
+      const oldDigest = 'f'.repeat(64);
+      const activeRelease: ExternalReleaseSnapshot = {
+        physicalScriptName: record.scriptName,
+        specDigest: oldDigest,
+        artifactVersion: 'artifact-old',
+        releaseSchemaVersion: record.schemaVersion,
+        application: record.applicationBindings,
+      };
+      const pendingRelease: ExternalReleaseSnapshot = {
+        physicalScriptName:
+          kind === 'plain-worker'
+            ? record.scriptName
+            : `${record.scriptName}-next`,
+        specDigest: targetDigest,
+        artifactVersion: 'artifact-next',
+        releaseSchemaVersion: harness.deployment.schemaVersion,
+        application: record.applicationBindings,
+      };
+      harness.store.record = {
+        ...record,
+        phase: 'migrating',
+        desiredSpecDigest: oldDigest,
+        activeRelease,
+        ...(kind === 'plain-worker'
+          ? {
+              pendingSpecDigest: targetDigest,
+              pendingArtifactVersion: pendingRelease.artifactVersion,
+            }
+          : {
+              pendingSpecDigest: targetDigest,
+              pendingRelease,
+              migrationPriorRelease: activeRelease,
+              migrationIntent: {
+                targetSpecDigest: targetDigest,
+                priorRelease: activeRelease,
+                priorTarget: record.platformTarget as never,
+                priorOutboundPolicy: record.outboundPolicy as never,
+                targetRelease: pendingRelease,
+                target: record.platformTarget as never,
+                subphase: 'route-published',
+              },
+            }),
+      };
+      const started = await startBoundedDecommission(harness);
+      await continueBoundedDecommission(harness, started);
+      expect(harness.store.record).toMatchObject({
+        desiredSpecDigest: targetDigest,
+        activeRelease,
+        pendingRelease,
+        decommissionIntent: {
+          lifecyclePhase: 'decommissioning',
+          identity: { mode: { entryLifecyclePhase: 'migrating' } },
+        },
+      });
+      expect(harness.store.record).not.toHaveProperty('pendingSpecDigest');
+      expect(harness.store.record).not.toHaveProperty('pendingArtifactVersion');
+      expect(harness.store.record).not.toHaveProperty('migrationIntent');
+    }
+
+    const withoutArtifact = await boundedDecommissionHarness({
+      kind: 'plain-worker',
+    });
+    const source = withoutArtifact.store.record as FleetRecord;
+    const targetDigest = deploymentSpecDigest(withoutArtifact.deployment);
+    const activeRelease: ExternalReleaseSnapshot = {
+      physicalScriptName: source.scriptName,
+      specDigest: 'e'.repeat(64),
+      artifactVersion: 'artifact-old',
+      releaseSchemaVersion: source.schemaVersion,
+      application: source.applicationBindings,
+    };
+    withoutArtifact.store.record = {
+      ...source,
+      phase: 'migrating',
+      desiredSpecDigest: activeRelease.specDigest,
+      pendingSpecDigest: targetDigest,
+      activeRelease,
+    };
+    const started = await startBoundedDecommission(withoutArtifact);
+    await continueBoundedDecommission(withoutArtifact, started);
+    expect(withoutArtifact.store.record).toMatchObject({
+      desiredSpecDigest: targetDigest,
+      activeRelease,
+    });
+    expect(withoutArtifact.store.record).not.toHaveProperty('pendingRelease');
+    expect(withoutArtifact.store.record).not.toHaveProperty(
+      'pendingSpecDigest',
+    );
   });
 });

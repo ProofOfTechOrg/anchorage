@@ -24,6 +24,7 @@ import {
   type WorkerAttachmentScanTarget,
 } from '../src/cloudflare-worker-attachment-scan.js';
 import {
+  assertWorkerAttachmentProviderRequestBudget,
   initialWorkerAttachmentScan as initialWorkerAttachmentScanFromState,
   parseWorkerAttachmentScanProgress as parseWorkerAttachmentScanProgressFromState,
   type WorkerAttachment as StateWorkerAttachment,
@@ -560,6 +561,9 @@ describe('Cloudflare Worker attachment scan', () => {
     });
     const subject = client(fixture.fetch);
     for (const invalidBudget of [8, 1_001, 9.5]) {
+      expect(() =>
+        assertWorkerAttachmentProviderRequestBudget(invalidBudget),
+      ).toThrow('maxProviderRequests must be an integer from 9 to 1000');
       const requestCount = fixture.requests.length;
       let budgetError: unknown;
       try {
@@ -577,6 +581,10 @@ describe('Cloudflare Worker attachment scan', () => {
       );
       expect(fixture.requests).toHaveLength(requestCount);
     }
+    expect(() => assertWorkerAttachmentProviderRequestBudget(9)).not.toThrow();
+    expect(() =>
+      assertWorkerAttachmentProviderRequestBudget(1_000),
+    ).not.toThrow();
     const result = await drain(subject, D1_TARGET, { budget: 9 });
     expect(result.terminal.status).toBe('complete');
     expect(rawAttempts).toBe(3);

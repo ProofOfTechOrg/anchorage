@@ -13,7 +13,7 @@ Public behavior:
 
 Source map:
 
-- `provision.ts`, `backend-switch.ts`, `fleet.ts`: deployment lifecycle state machines
+- `provision.ts`, `decommission-advance.ts`, `backend-switch.ts`, `fleet.ts`: deployment lifecycle state machines (the bounded normal-decommission coordinator is isolated in `decommission-advance.ts`)
 - `workers-for-platforms-backend.ts`, `plain-worker-backend.ts`, `wrangler-loop-backend.ts`, `cloudflare-api-plain-worker-backend.ts`: provisioning backends (the Workers for Platforms backend, the shared ordinary-Worker core, and its Wrangler and direct-API adapters)
 - `cloudflare-client.ts`, `cloudflare-ordinary-worker-operations.ts`, `cloudflare-provider-errors.ts`, `cloudflare-rate-coordinator.ts`: provider API (the client, the ordinary-Worker operations behind it, the SDK-error helpers) and its shared quota fence
 - `cloudflare-client-config.ts`, `strict-plain-data.ts`, `cloudflare-worker-attachment-scan-state.ts`, `cloudflare-worker-attachment-scan.ts`: shared SDK retry bounds, strict resumable state, and the request-bounded account-wide D1/R2 attachment scanner

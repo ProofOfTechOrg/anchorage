@@ -2,6 +2,12 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import { initialWorkerAttachmentScan } from '../src/cloudflare-worker-attachment-scan-state.js';
+import type {
+  AdvanceDecommissionDeploymentOptions,
+  DecommissionAdvanceAction,
+  DecommissionAdvanceCapability,
+  DecommissionAdvanceResult,
+} from '../src/decommission-advance.js';
 import {
   classifyDecommissionAdvanceToken,
   DecommissionAdvanceIntentError,
@@ -837,6 +843,27 @@ describe('decommission advance intent', () => {
       revision: 3,
     };
     expect(parseDecommissionAdvanceToken(valid)).toEqual(valid);
+    const actions: readonly DecommissionAdvanceAction[] = [
+      { kind: 'start' },
+      { kind: 'continue', token: valid },
+      { kind: 'restart-blocked', token: valid },
+    ];
+    const capabilities: readonly DecommissionAdvanceCapability[] = [
+      'attachment-scan',
+      'database-residuals',
+      'application-r2-inspection',
+      'application-r2-empty',
+      'application-r2-delete',
+    ];
+    const result: DecommissionAdvanceResult = {
+      status: 'pending',
+      token: valid,
+    };
+    type AdvanceAction = AdvanceDecommissionDeploymentOptions['action'];
+    const action: AdvanceAction = actions[0] as DecommissionAdvanceAction;
+    expect({ actions, capabilities, result, action }).toMatchObject({
+      result: { status: 'pending', token: valid },
+    });
     const tokenAtSerializedBytes = (byteLength: number) => {
       const current = new TextEncoder().encode(
         JSON.stringify(valid),

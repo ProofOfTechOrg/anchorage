@@ -2566,6 +2566,7 @@ export async function decommissionBackendSwitch(options: {
         let r2Intent: BackendSwitchIntent = intent;
 
         await convergeApplicationR2Deletion({
+          spec: options.targetSpec,
           resources: applicationR2Progress.map(({ resource, subphase }) => ({
             ...resource,
             state: subphase,

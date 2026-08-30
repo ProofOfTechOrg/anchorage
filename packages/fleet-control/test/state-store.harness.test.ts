@@ -19,6 +19,33 @@ interface ProbeError {
   readonly errors?: readonly ProbeError[];
 }
 
+interface BoundedDecommissionProbe {
+  readonly result: {
+    readonly status: 'pending' | 'blocked' | 'complete';
+    readonly token: {
+      readonly version: 1;
+      readonly tenantTag: string;
+      readonly environment: string;
+      readonly operationId: string;
+      readonly revision: number;
+    };
+  };
+  readonly trace: string[];
+  readonly phase: string;
+  readonly lifecyclePhase: string;
+  readonly intentState: string;
+  readonly revision: number;
+  readonly generation: number;
+  readonly resourceStates: string[];
+  readonly bucketName: string;
+  readonly lostWriteCount: number;
+  readonly claims: Array<{
+    readonly resourceType: string;
+    readonly resourceName: string;
+    readonly resourceRole: string;
+  }>;
+}
+
 function harnessOptions() {
   return {
     root: ROOT,
@@ -58,11 +85,14 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
     await server.close();
   }, 30_000);
 
-  async function probe<T>(action: string): Promise<T> {
+  async function probe<T>(action: string, input?: unknown): Promise<T> {
     const response = await worker.fetch('/fleet-state', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ action }),
+      body: JSON.stringify({
+        action,
+        ...(input === undefined ? {} : { input }),
+      }),
     });
     const body = (await response.json()) as T | { error: ProbeError };
     if (!response.ok) {
@@ -277,6 +307,216 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
       finalRevision: 3,
       claimCount: 1,
     });
+  });
+
+  it('persists one bounded R2 step per Worker request through two-pass detach and deletion', async () => {
+    const step = (
+      operation: Readonly<
+        { kind: 'start' } | { kind: 'continue'; token: unknown }
+      >,
+    ) =>
+      probe<BoundedDecommissionProbe>('bounded-decommission-step', {
+        tenantTag: 'advance',
+        operation,
+      });
+    const results: BoundedDecommissionProbe[] = [];
+    results.push(await step({ kind: 'start' }));
+    for (let index = 0; index < 8; index += 1) {
+      results.push(
+        await step({
+          kind: 'continue',
+          token: results.at(-1)?.result.token,
+        }),
+      );
+    }
+    const boundary = await step({
+      kind: 'continue',
+      token: results.at(-1)?.result.token,
+    });
+
+    expect(
+      results.map((result) => ({
+        revision: result.revision,
+        generation: result.generation,
+        lifecyclePhase: result.lifecyclePhase,
+        intentState: result.intentState,
+        resourceState: result.resourceStates[0],
+        trace: result.trace,
+      })),
+    ).toEqual([
+      {
+        revision: 0,
+        generation: 0,
+        lifecyclePhase: 'application-resources-deleting',
+        intentState: 'transitioning',
+        resourceState: 'created',
+        trace: [],
+      },
+      {
+        revision: 1,
+        generation: 1,
+        lifecyclePhase: 'application-resources-deleting',
+        intentState: 'discover',
+        resourceState: 'detach-authorized',
+        trace: ['r2-find'],
+      },
+      {
+        revision: 2,
+        generation: 1,
+        lifecyclePhase: 'application-resources-deleting',
+        intentState: 'verify',
+        resourceState: 'detach-authorized',
+        trace: ['r2-find', 'scan:discover'],
+      },
+      {
+        revision: 3,
+        generation: 1,
+        lifecyclePhase: 'application-resources-deleting',
+        intentState: 'transitioning',
+        resourceState: 'detached',
+        trace: ['r2-find', 'scan:verify'],
+      },
+      {
+        revision: 4,
+        generation: 1,
+        lifecyclePhase: 'application-resources-deleting',
+        intentState: 'transitioning',
+        resourceState: 'empty-authorized',
+        trace: ['r2-find'],
+      },
+      {
+        revision: 5,
+        generation: 1,
+        lifecyclePhase: 'application-resources-deleting',
+        intentState: 'transitioning',
+        resourceState: 'empty',
+        trace: ['r2-find', 'r2-empty'],
+      },
+      {
+        revision: 6,
+        generation: 1,
+        lifecyclePhase: 'application-resources-deleting',
+        intentState: 'transitioning',
+        resourceState: 'delete-authorized',
+        trace: [],
+      },
+      {
+        revision: 7,
+        generation: 1,
+        lifecyclePhase: 'application-resources-deleting',
+        intentState: 'transitioning',
+        resourceState: 'deleted',
+        trace: ['r2-find', 'r2-delete', 'r2-find'],
+      },
+      {
+        revision: 8,
+        generation: 1,
+        lifecyclePhase: 'application-resources-deleted',
+        intentState: 'transitioning',
+        resourceState: 'deleted',
+        trace: ['r2-find'],
+      },
+    ]);
+    expect(boundary).toMatchObject({
+      result: { status: 'pending', token: results.at(-1)?.result.token },
+      trace: [],
+      phase: 'decommission-advancing',
+      lifecyclePhase: 'application-resources-deleted',
+      intentState: 'transitioning',
+      revision: 8,
+      generation: 1,
+      resourceStates: ['deleted'],
+    });
+
+    const expectedClaims = [
+      {
+        resourceType: 'r2-bucket',
+        resourceName: results[0]?.bucketName,
+        resourceRole: 'deployment-r2',
+      },
+      {
+        resourceType: 'worker-script',
+        resourceName: 'advance-worker',
+        resourceRole: 'deployment-worker',
+      },
+    ];
+    for (const result of [...results, boundary]) {
+      expect(result.result.status).toBe('pending');
+      expect(result.phase).toBe('decommission-advancing');
+      expect(result.claims).toEqual(expectedClaims);
+      expect(result.lostWriteCount).toBe(0);
+    }
+  });
+
+  it('converges a lost coordinator write and makes the replayed token stale in real D1', async () => {
+    const step = (
+      operation: Readonly<
+        { kind: 'start' } | { kind: 'continue'; token: unknown }
+      >,
+      loseWrite = false,
+    ) =>
+      probe<BoundedDecommissionProbe>('bounded-decommission-step', {
+        tenantTag: 'advancelost',
+        operation,
+        ...(loseWrite ? { loseWrite } : {}),
+      });
+    const started = await step({ kind: 'start' });
+    const discover = await step({
+      kind: 'continue',
+      token: started.result.token,
+    });
+    const verify = await step(
+      { kind: 'continue', token: discover.result.token },
+      true,
+    );
+    const replay = await step({
+      kind: 'continue',
+      token: discover.result.token,
+    });
+
+    expect(verify).toMatchObject({
+      result: {
+        status: 'pending',
+        token: {
+          version: 1,
+          tenantTag: 'advancelost',
+          environment: 'production',
+          operationId: '00000000-0000-4000-8000-000000000102',
+          revision: 2,
+        },
+      },
+      trace: ['r2-find', 'scan:discover'],
+      phase: 'decommission-advancing',
+      lifecyclePhase: 'application-resources-deleting',
+      intentState: 'verify',
+      revision: 2,
+      generation: 1,
+      resourceStates: ['detach-authorized'],
+      lostWriteCount: 1,
+    });
+    expect(replay).toMatchObject({
+      result: { status: 'pending', token: verify.result.token },
+      trace: [],
+      phase: 'decommission-advancing',
+      lifecyclePhase: 'application-resources-deleting',
+      intentState: 'verify',
+      revision: 2,
+      generation: 1,
+      resourceStates: ['detach-authorized'],
+      lostWriteCount: 0,
+    });
+    expect(replay.claims).toEqual([
+      {
+        resourceType: 'r2-bucket',
+        resourceName: verify.bucketName,
+        resourceRole: 'deployment-r2',
+      },
+      {
+        resourceType: 'worker-script',
+        resourceName: 'advancelost-worker',
+        resourceRole: 'deployment-worker',
+      },
+    ]);
   });
 
   it('preserves operation, heartbeat, and release errors for both lease types', async () => {

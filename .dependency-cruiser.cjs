@@ -194,12 +194,28 @@ module.exports = {
         'Persisted decommission state is a provider-free authority boundary. Keeping provider clients, operations, and error classification out of its reachable graph prevents the Fleet D1 codec from acquiring credential or transport dependencies.',
       from: {
         path: [
-          '^packages/fleet-control/src/(?:strict-plain-data|cloudflare-worker-attachment-scan-state|decommission-intent|state-store)\\.ts$',
+          '^packages/fleet-control/src/(?:strict-plain-data|cloudflare-worker-attachment-scan-state|decommission-intent|decommission-advance|state-store)\\.ts$',
           '^scripts/architecture-fixtures/decommission-state-imports-provider\\.ts$',
         ],
       },
       to: {
         path: '(?:^packages/fleet-control/src/(?:cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors)\\.ts$|^cloudflare(?:/|$)|(?:^|/)node_modules/(?:\\.pnpm/)?cloudflare(?:@|/))',
+        reachable: true,
+      },
+    },
+    {
+      name: 'fleet-control-decommission-advance-is-transport-neutral',
+      severity: 'error',
+      comment:
+        'The bounded decommission coordinator depends only on provider-neutral ports and state. Keeping provider clients, Wrangler, export stores, root barrels, and unbounded lifecycle coordinators out of its reachable graph preserves the Worker-safe transport boundary.',
+      from: {
+        path: [
+          '^packages/fleet-control/src/decommission-advance\\.ts$',
+          '^scripts/architecture-fixtures/decommission-advance-imports-provider\\.ts$',
+        ],
+      },
+      to: {
+        path: '(?:^packages/fleet-control/src/(?:cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors|wrangler-plain-worker-provisioning-api|wrangler-loop-backend|wrangler-runner|database-export-store|export-file-name|export-store|r2-export-store|provision|fleet|index)\\.ts$|^packages/fleet-control/src/workers/|^cloudflare(?:/|$)|(?:^|/)node_modules/(?:\\.pnpm/)?cloudflare(?:@|/))',
         reachable: true,
       },
     },

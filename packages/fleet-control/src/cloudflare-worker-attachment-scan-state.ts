@@ -14,6 +14,15 @@ const PLAIN_DATA_NODE_BOUND = 8_192;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 export const WORKER_ATTACHMENT_EMPTY_MULTISET_SUM256 = '0'.repeat(64);
 
+/** @internal Package-private request-budget validation shared by the scanner and lifecycle. */
+export function assertWorkerAttachmentProviderRequestBudget(
+  value: number,
+): void {
+  if (!Number.isSafeInteger(value) || value < 9 || value > 1_000) {
+    throw new Error('maxProviderRequests must be an integer from 9 to 1000');
+  }
+}
+
 export type WorkerAttachmentScanTarget =
   | Readonly<{ kind: 'd1'; databaseId: string }>
   | Readonly<{ kind: 'r2'; bucketName: string }>;

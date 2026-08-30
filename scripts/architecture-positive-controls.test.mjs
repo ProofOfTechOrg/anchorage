@@ -44,6 +44,8 @@ const controls = {
     'scripts/architecture-fixtures/fleet-control-leaf-imports-client.ts',
   'fleet-control-decommission-state-does-not-reach-provider':
     'scripts/architecture-fixtures/decommission-state-imports-provider.ts',
+  'fleet-control-decommission-advance-is-transport-neutral':
+    'scripts/architecture-fixtures/decommission-advance-imports-provider.ts',
   'fleet-control-strict-plain-data-is-import-free':
     'scripts/architecture-fixtures/decommission-state-imports-provider.ts',
   'fleet-control-ports-do-not-reach-d1-adapter':
@@ -110,6 +112,19 @@ for (const [ruleName, fixture] of Object.entries(controls)) {
             violation.rule.name === ruleName && violation.to === 'cloudflare',
         ),
         'decommission state control did not reject a direct Cloudflare SDK import',
+      );
+    }
+    if (
+      ruleName === 'fleet-control-decommission-advance-is-transport-neutral'
+    ) {
+      assert.deepEqual([...new Set(violations)], [ruleName]);
+      assert.ok(
+        report.summary.violations.some(
+          (violation) =>
+            violation.rule.name === ruleName &&
+            violation.to === 'packages/fleet-control/src/cloudflare-client.ts',
+        ),
+        'decommission advance control did not reject the provider client',
       );
     }
     if (ruleName === 'fleet-control-strict-plain-data-is-import-free') {

@@ -9,7 +9,6 @@ import {
 } from './active-route.js';
 import {
   applicationBindingTopology,
-  applicationR2Bindings,
   assertApplicationR2EmptyBeforeDecommission,
   convergeApplicationR2Creation,
   convergeApplicationR2Deletion,
@@ -25,6 +24,12 @@ import {
   finalizedBridgeForRecord,
   reconcileFinalizedBackendSwitchState,
 } from './backend-switch.js';
+import {
+  activeExternalRelease,
+  assertImmutableDeploymentMapping,
+  reconcilePersistedDatabase,
+  retainedExternalReleases,
+} from './decommission-advance.js';
 import { isSha256 } from './deployment-context.js';
 import { WorkerDeploymentError } from './deployment-error.js';
 import {
@@ -64,6 +69,11 @@ import {
   validateDeploymentSpec,
 } from './validation.js';
 
+export {
+  assertImmutableDeploymentMapping,
+  reconcilePersistedDatabase,
+} from './decommission-advance.js';
+
 export class ProvisioningError extends Error {
   readonly cleanupErrors: readonly unknown[];
 
@@ -80,70 +90,6 @@ export class ProvisioningError extends Error {
 
 function nowIso(clock: () => number): string {
   return new Date(clock()).toISOString();
-}
-
-function activeExternalRelease(
-  record: FleetRecord,
-): import('./types.js').ExternalReleaseSnapshot | undefined {
-  return (
-    record.activeRelease ??
-    (record.backend === 'plain-worker' &&
-    record.artifactVersion !== PENDING_ARTIFACT_VERSION
-      ? {
-          physicalScriptName: record.scriptName,
-          specDigest: record.desiredSpecDigest,
-          artifactVersion: record.artifactVersion,
-          releaseSchemaVersion: record.schemaVersion,
-          application: record.applicationBindings ?? {
-            vars: [],
-            secrets: [],
-            r2Buckets: [],
-          },
-        }
-      : undefined)
-  );
-}
-
-function retainedExternalReleases(
-  record: FleetRecord,
-): readonly import('./types.js').ExternalReleaseSnapshot[] {
-  const active = activeExternalRelease(record);
-  const releases = [
-    record.pendingRelease,
-    ...(record.backend === 'plain-worker' &&
-    record.pendingArtifactVersion &&
-    record.pendingSpecDigest
-      ? [
-          {
-            physicalScriptName: record.scriptName,
-            specDigest: record.pendingSpecDigest,
-            artifactVersion: record.pendingArtifactVersion,
-            releaseSchemaVersion: record.schemaVersion,
-          },
-        ]
-      : []),
-    record.rollbackRelease,
-    record.retiringRelease,
-    record.migrationPriorRelease,
-  ].filter(
-    (release): release is import('./types.js').ExternalReleaseSnapshot =>
-      release !== undefined &&
-      (record.backend === 'plain-worker'
-        ? release.artifactVersion !== active?.artifactVersion
-        : release.physicalScriptName !== active?.physicalScriptName),
-  );
-  return releases.filter(
-    (release, index) =>
-      releases.findIndex(
-        (candidate) =>
-          (record.backend === 'plain-worker'
-            ? candidate.artifactVersion
-            : candidate.physicalScriptName) ===
-          (record.backend === 'plain-worker'
-            ? release.artifactVersion
-            : release.physicalScriptName),
-      ) === index,
-  );
 }
 
 function recordAt(
@@ -479,6 +425,7 @@ async function rollbackProvisioning(
     let cleanupRecord = latestRecord ?? record;
     try {
       const resources = await convergeApplicationR2Deletion({
+        spec,
         resources: cleanupRecord.applicationResources ?? [],
         backend,
         fence: lease,
@@ -534,49 +481,6 @@ const RESUMABLE_PROVISIONING_PHASES = new Set<ProvisioningPhase>([
   'publishing',
   'ready',
 ]);
-
-export function assertImmutableDeploymentMapping(
-  prior: FleetRecord,
-  backend: ProvisioningBackend,
-  spec: DeploymentSpec,
-): void {
-  applicationR2Bindings(spec, prior.applicationResources ?? []);
-  if (
-    prior.tenantTag !== spec.tenantTag ||
-    prior.environment !== spec.environment ||
-    prior.backend !== backend.kind ||
-    prior.scriptName !== spec.scriptName ||
-    prior.databaseName !== spec.databaseName ||
-    prior.routeHostname !== spec.routeHostname
-  ) {
-    throw new Error(
-      `deployment '${spec.tenantTag}:${spec.environment}' already exists with a different immutable resource mapping`,
-    );
-  }
-  if (
-    prior.schemaVersion > spec.schemaVersion &&
-    !(
-      backend.immutableExternalArtifacts === true &&
-      spec.authoredBy === 'external' &&
-      prior.activeRelease?.releaseSchemaVersion === spec.schemaVersion
-    )
-  ) {
-    throw new Error('provisioning refuses a schema downgrade');
-  }
-  if (
-    prior.phase !== 'ready' &&
-    prior.phase !== 'rolling-back' &&
-    (prior.phase === 'migrating'
-      ? (prior.migrationIntent?.targetSpecDigest ??
-        prior.pendingRelease?.specDigest ??
-        prior.pendingSpecDigest)
-      : prior.desiredSpecDigest) !== deploymentSpecDigest(spec)
-  ) {
-    throw new Error(
-      `deployment '${spec.tenantTag}:${spec.environment}' retry uses a different desired specification`,
-    );
-  }
-}
 
 export interface ProvisionDeploymentOptions {
   readonly backend: ProvisioningBackend;
@@ -1412,37 +1316,6 @@ export interface CleanupDeploymentArtifactsOptions {
   readonly spec: DeploymentSpec;
 }
 
-export async function reconcilePersistedDatabase(
-  backend: ProvisioningBackend,
-  record: Pick<FleetRecord, 'databaseId' | 'databaseName' | 'tenantTag'>,
-  allowAbsent: boolean,
-  fence: import('./types.js').ExternalMutationFence,
-  requireOwner = true,
-): Promise<(DatabaseReference & { readonly created: false }) | undefined> {
-  const database = await backend.getDatabase(record.databaseId);
-  if (!database) {
-    if (allowAbsent) return undefined;
-    throw new Error(`persisted database '${record.databaseId}' is absent`);
-  }
-  if (
-    database.id !== record.databaseId ||
-    database.name !== record.databaseName
-  ) {
-    throw new Error(
-      `persisted database '${record.databaseId}' resolved with unexpected identity '${database.id}:${database.name}'`,
-    );
-  }
-  if (requireOwner) {
-    const owner = await backend.readDeploymentIdentity(database, fence);
-    if (owner !== record.tenantTag) {
-      throw new Error(
-        `refusing database operation for '${database.id}' owned by '${owner ?? 'no deployment'}'`,
-      );
-    }
-  }
-  return { id: database.id, name: database.name, created: false };
-}
-
 export function cleanupDeploymentArtifacts(
   options: CleanupDeploymentArtifactsOptions,
 ): Promise<void> {
@@ -1622,6 +1495,7 @@ async function cleanupDeploymentArtifactsUnderLease(
   if (errors.length === 0) {
     try {
       await convergeApplicationR2Deletion({
+        spec,
         resources: record.applicationResources ?? [],
         backend,
         fence: lease,
@@ -2019,6 +1893,7 @@ async function decommissionDeploymentUnderLease(
   }
   if (record.phase === 'application-resources-deleting') {
     const applicationResources = await convergeApplicationR2Deletion({
+      spec,
       resources: record.applicationResources ?? [],
       backend,
       fence: lease,

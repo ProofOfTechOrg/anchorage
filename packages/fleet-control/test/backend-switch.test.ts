@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it } from 'vitest';
+import { reserveApplicationR2Resources } from '../src/application-bindings.js';
 import {
   type BackendSwitchIntent,
   type BackendSwitchProvider,
@@ -61,6 +62,23 @@ function spec(authoredBy: 'platform' | 'external'): DeploymentSpec {
 
 const priorSpec = spec('platform');
 const targetSpec = spec('external');
+
+function switchApplicationR2Resource(
+  name: string,
+  jurisdiction: ApplicationR2Resource['jurisdiction'],
+  creationDate: string,
+): ApplicationR2Resource {
+  const [reserved] = reserveApplicationR2Resources({
+    ...targetSpec,
+    application: {
+      vars: [],
+      secrets: [],
+      r2Buckets: [{ name, jurisdiction }],
+    },
+  });
+  if (!reserved) throw new Error('missing reserved application R2 resource');
+  return { ...reserved, state: 'created', creationDate };
+}
 const target: ExternalPlatformTargetDescription = {
   maintenanceCapabilityPublicKey:
     '{"kty":"OKP","crv":"Ed25519","alg":"EdDSA","kid":"fleet-maintenance-v1","x":"Lhp1XFeTJJx8FLOCKpn4nkO-tWuZZxXX8ziw0LEvUZo"}',
@@ -1598,22 +1616,12 @@ describe('backend switch state machine', () => {
 
   it('persists per-bucket R2 teardown across attachments, contents, partial progress, and a lost delete response', async () => {
     const resources: readonly ApplicationR2Resource[] = [
-      {
-        name: 'ARCHIVE',
-        bucketName: 'acme-archive',
-        jurisdiction: 'eu',
-        state: 'created',
-        reservationNonce: 'nonce-archive',
-        creationDate: '2026-08-11T00:00:01.000Z',
-      },
-      {
-        name: 'FILES',
-        bucketName: 'acme-files',
-        jurisdiction: 'default',
-        state: 'created',
-        reservationNonce: 'nonce-files',
-        creationDate: '2026-08-11T00:00:00.000Z',
-      },
+      switchApplicationR2Resource('ARCHIVE', 'eu', '2026-08-11T00:00:01.000Z'),
+      switchApplicationR2Resource(
+        'FILES',
+        'default',
+        '2026-08-11T00:00:00.000Z',
+      ),
     ];
     const application = {
       vars: [],
@@ -1691,14 +1699,11 @@ describe('backend switch state machine', () => {
   });
 
   it('leaves backend-switch traffic and durable state unchanged when R2 evacuation fails', async () => {
-    const resource: ApplicationR2Resource = {
-      name: 'FILES',
-      bucketName: 'acme-files',
-      jurisdiction: 'default',
-      state: 'created',
-      reservationNonce: 'nonce-files',
-      creationDate: '2026-08-11T00:00:00.000Z',
-    };
+    const resource = switchApplicationR2Resource(
+      'FILES',
+      'default',
+      '2026-08-11T00:00:00.000Z',
+    );
     const store = new MemorySwitchStore();
     const provider = new FakeSwitchProvider();
     provider.r2Buckets.set(resource.bucketName, resource);
@@ -1729,14 +1734,11 @@ describe('backend switch state machine', () => {
   });
 
   it('preserves the traffic-removed switch when R2 receives a late write and resumes after direct evacuation', async () => {
-    const resource: ApplicationR2Resource = {
-      name: 'FILES',
-      bucketName: 'acme-files',
-      jurisdiction: 'default',
-      state: 'created',
-      reservationNonce: 'nonce-files',
-      creationDate: '2026-08-11T00:00:00.000Z',
-    };
+    const resource = switchApplicationR2Resource(
+      'FILES',
+      'default',
+      '2026-08-11T00:00:00.000Z',
+    );
     const store = new MemorySwitchStore();
     const provider = new FakeSwitchProvider();
     provider.r2Buckets.set(resource.bucketName, resource);

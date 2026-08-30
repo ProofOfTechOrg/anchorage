@@ -44,6 +44,7 @@ import {
   type WorkersForPlatformsApi,
   WorkersForPlatformsBackend,
 } from '../src/workers-for-platforms-backend.js';
+import { decommissionAdvancingRecordFixture } from './fixtures/decommission-intent-fixture.js';
 
 const deployment: DeploymentSpec = {
   tenantTag: 'acme',
@@ -1964,6 +1965,7 @@ describe('WorkersForPlatformsBackend', () => {
       },
     );
 
+    let teardownRecord = record;
     if (liveVariant === 'provider-committed') {
       await backend.ensurePlatformResources(
         targetSpec,
@@ -1973,18 +1975,68 @@ describe('WorkersForPlatformsBackend', () => {
         record,
         fence,
       );
+      const {
+        migrationIntent: _migrationIntent,
+        pendingSpecDigest: _pendingSpecDigest,
+        pendingArtifactVersion: _pendingArtifactVersion,
+        ...withoutCarrier
+      } = record;
+      teardownRecord = decommissionAdvancingRecordFixture(
+        {
+          ...withoutCarrier,
+          desiredSpecDigest: targetRelease.specDigest,
+        },
+        'worker-deleted',
+        {
+          requestedSpecDigest: targetRelease.specDigest,
+          entryLifecyclePhase: 'migrating',
+        },
+      );
+      const teardownIntent = teardownRecord.decommissionIntent;
+      if (!teardownIntent || teardownIntent.state === 'complete') {
+        throw new Error('missing active decommission recovery marker');
+      }
+      const wrongMarker: FleetRecord = {
+        ...teardownRecord,
+        decommissionIntent: {
+          ...teardownIntent,
+          identity: {
+            ...teardownIntent.identity,
+            mode: {
+              kind: 'normal',
+              requestedSpecDigest: targetRelease.specDigest,
+              entryLifecyclePhase: 'ready',
+            },
+          },
+        },
+      };
+      client.calls.length = 0;
+      await expect(
+        backend.revokePlatformResourceCredentials(
+          targetSpec,
+          wrongMarker,
+          database,
+          fence,
+        ),
+      ).rejects.toThrow(/drifted state Worker/u);
+      expect(client.calls).not.toContain('revoke');
     }
 
     await expect(
       backend.revokePlatformResourceCredentials(
         targetSpec,
-        record,
+        teardownRecord,
         database,
         fence,
       ),
     ).resolves.toBeUndefined();
     await expect(
-      backend.deletePlatformResources(targetSpec, record, database, fence),
+      backend.deletePlatformResources(
+        targetSpec,
+        teardownRecord,
+        database,
+        fence,
+      ),
     ).resolves.toBeUndefined();
     expect(client.dispatchWorkers.size).toBe(0);
     if (liveVariant === 'provider-committed') {

@@ -1,23 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
 /// <reference types="@cloudflare/workers-types" />
 
+import {
+  applicationBindingTopology,
+  reserveApplicationR2Resources,
+} from '../../src/application-bindings.js';
 import { D1CloudflareApiRateCoordinator } from '../../src/cloudflare-rate-coordinator.js';
 import { D1FleetStateDatabase } from '../../src/d1-fleet-state-database.js';
+import { advanceDecommissionDeployment } from '../../src/decommission-advance.js';
 import {
   canonicalDeploymentEgressPolicy,
   externalEgressProxyScriptName,
   externalStateScriptName,
 } from '../../src/platform-resources.js';
+import { deploymentSpecDigest } from '../../src/spec-digest.js';
 import {
   ADDED_NULLABLE_TEXT_COLUMNS,
   D1FleetStateStore,
   type FleetStateDatabase,
 } from '../../src/state-store.js';
 import type {
+  ApplicationR2BucketSnapshot,
+  ApplicationR2Resource,
+  DecommissionAttachmentScanInput,
+  DecommissionAttachmentScanResult,
+  DeploymentSpec,
   FleetRecord,
   FleetStateLease,
   PlatformPlaneLease,
   PlatformPlaneResourceSet,
+  ProvisioningBackend,
 } from '../../src/types.js';
 import { decommissionAdvancingRecordFixture } from './decommission-intent-fixture.js';
 
@@ -117,6 +129,294 @@ function decommissionRecord(tenantTag: string, revision: number): FleetRecord {
     generation: 0,
     updatedAt: `2026-08-11T00:00:${String(revision).padStart(2, '0')}.000Z`,
   });
+}
+
+const DECOMMISSION_SCAN_EVIDENCE = 'b'.repeat(64);
+const DECOMMISSION_SCAN_EVIDENCE_COUNT = 2;
+const DECOMMISSION_CREATED_AT = '2026-08-30T00:00:00.000Z';
+
+function boundedDecommissionSpec(tenantTag: string): DeploymentSpec {
+  return {
+    tenantTag,
+    environment: 'production',
+    scriptName: `${tenantTag}-worker`,
+    databaseName: `${tenantTag}-database`,
+    compatibilityDate: '2026-08-30',
+    mainModule: 'worker.js',
+    modules: [{ name: 'worker.js', content: 'export default {}' }],
+    authoredBy: 'platform',
+    schemaVersion: 1,
+    migrations: [{ version: 1, sql: 'CREATE TABLE example (id TEXT)' }],
+    durableObjectMigrations: [],
+    durableObjectBindings: [],
+    maintenanceBaseUrl: `https://${tenantTag}-control.example.test`,
+    routeHostname: `${tenantTag}.example.test`,
+    application: {
+      vars: [],
+      secrets: [],
+      r2Buckets: [{ name: 'FILES' }],
+    },
+  };
+}
+
+function boundedDecommissionRecord(
+  spec: DeploymentSpec,
+): Readonly<{ record: FleetRecord; resource: ApplicationR2Resource }> {
+  const reserved = reserveApplicationR2Resources(spec)[0];
+  if (!reserved) throw new Error('bounded decommission R2 reservation missing');
+  const resource: ApplicationR2Resource = {
+    ...reserved,
+    state: 'created',
+    creationDate: DECOMMISSION_CREATED_AT,
+  };
+  return {
+    resource,
+    record: {
+      tenantTag: spec.tenantTag,
+      environment: spec.environment,
+      backend: 'plain-worker',
+      scriptName: spec.scriptName,
+      databaseId: `${spec.tenantTag}-database-id`,
+      databaseName: spec.databaseName,
+      schemaVersion: spec.schemaVersion,
+      artifactVersion: `${spec.tenantTag}-artifact-v1`,
+      desiredSpecDigest: deploymentSpecDigest(spec),
+      applicationResources: [resource],
+      applicationBindings: applicationBindingTopology(spec, [resource]),
+      durableObjectBindings: [],
+      routeHostname: spec.routeHostname,
+      phase: 'application-resources-deleting',
+      updatedAt: '2026-08-29T00:00:00.000Z',
+    },
+  };
+}
+
+class BoundedDecommissionBackend implements ProvisioningBackend {
+  readonly kind = 'plain-worker' as const;
+  readonly events: string[] = [];
+  #bucketExists: boolean;
+
+  constructor(
+    readonly resource: ApplicationR2Resource,
+    bucketExists: boolean,
+    readonly scanPass: string | undefined,
+  ) {
+    this.#bucketExists = bucketExists;
+  }
+
+  async advanceDecommissionAttachmentScan(
+    _input: DecommissionAttachmentScanInput,
+  ): Promise<DecommissionAttachmentScanResult> {
+    this.events.push(`scan:${this.scanPass ?? 'unexpected'}`);
+    return {
+      status: 'complete',
+      evidenceSha256: DECOMMISSION_SCAN_EVIDENCE,
+      evidenceCount: DECOMMISSION_SCAN_EVIDENCE_COUNT,
+      providerFetchAttemptsReserved: 6,
+    };
+  }
+
+  async findApplicationR2Bucket(): Promise<
+    ApplicationR2BucketSnapshot | undefined
+  > {
+    this.events.push('r2-find');
+    return this.#bucketExists
+      ? {
+          name: this.resource.name,
+          bucketName: this.resource.bucketName,
+          jurisdiction: this.resource.jurisdiction,
+          creationDate: this.resource.creationDate as string,
+        }
+      : undefined;
+  }
+
+  async assertApplicationR2Empty(): Promise<void> {
+    this.events.push('r2-empty');
+  }
+
+  async deleteApplicationR2Bucket(): Promise<void> {
+    this.events.push('r2-delete');
+    this.#bucketExists = false;
+  }
+
+  async assertApplicationR2Detached(): Promise<never> {
+    throw new Error('bounded coordinator called legacy R2 attachment listing');
+  }
+
+  async assertDatabaseDeletionResidualsRemoved(): Promise<never> {
+    throw new Error('bounded coordinator crossed the inert D1 boundary');
+  }
+
+  async findDatabase(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly found D1');
+  }
+
+  async getDatabase(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly read D1');
+  }
+
+  async ensureDatabase(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly created D1');
+  }
+
+  async seedDeploymentIdentity(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly seeded D1');
+  }
+
+  async readDeploymentIdentity(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly read D1 ownership');
+  }
+
+  async applyMigrations(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly migrated D1');
+  }
+
+  async deployWorker(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly deployed a Worker');
+  }
+
+  async promoteWorker(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly promoted a Worker');
+  }
+
+  async ensureMaintenance(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly armed maintenance');
+  }
+
+  async inspect(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly inspected a Worker');
+  }
+
+  async attestActiveRoute(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly attested a route');
+  }
+
+  async removeTraffic(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly removed traffic');
+  }
+
+  async assertTrafficRemoved(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly attested traffic');
+  }
+
+  async revokeCredentials(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly revoked credentials');
+  }
+
+  async deleteWorker(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly deleted a Worker');
+  }
+
+  async assertDatabaseDetached(): Promise<never> {
+    throw new Error('bounded coordinator called legacy D1 attachment listing');
+  }
+
+  async exportDatabase(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly exported D1');
+  }
+
+  async deleteDatabase(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly deleted D1');
+  }
+}
+
+interface BoundedDecommissionStepInput {
+  readonly tenantTag: 'advance' | 'advancelost';
+  readonly operation: Readonly<
+    { kind: 'start' } | { kind: 'continue'; token: unknown }
+  >;
+  readonly loseWrite?: boolean;
+}
+
+async function boundedDecommissionStep(
+  db: D1Database,
+  input: BoundedDecommissionStepInput,
+): Promise<unknown> {
+  const spec = boundedDecommissionSpec(input.tenantTag);
+  const seedStore = new D1FleetStateStore(new D1FleetStateDatabase(db), {
+    accountId: 'account-primary',
+  });
+  let current = await seedStore.get(spec.tenantTag, spec.environment);
+  if (!current) {
+    const seeded = boundedDecommissionRecord(spec).record;
+    await seedStore.withDeploymentLease(
+      seeded.tenantTag,
+      seeded.environment,
+      (lease) => lease.put(seeded),
+    );
+    current = seeded;
+  }
+
+  const delegate = new D1FleetStateDatabase(db);
+  let lostWriteCount = 0;
+  const database: FleetStateDatabase = input.loseWrite
+    ? {
+        query: (sql, bindings) => delegate.query(sql, bindings),
+        execute: (sql, bindings) => delegate.execute(sql, bindings),
+        async batch(statements) {
+          const result = await delegate.batch(statements);
+          if (lostWriteCount === 0) {
+            lostWriteCount += 1;
+            throw new Error('bounded coordinator write response lost');
+          }
+          return result;
+        },
+      }
+    : delegate;
+  const store = new D1FleetStateStore(database, {
+    accountId: 'account-primary',
+  });
+  const resource = current.applicationResources?.[0];
+  if (!resource) throw new Error('bounded decommission resource missing');
+  const backend = new BoundedDecommissionBackend(
+    resource,
+    resource.state !== 'deleted',
+    current.decommissionIntent?.state,
+  );
+  const result = await advanceDecommissionDeployment({
+    backend,
+    store,
+    spec,
+    action: input.operation,
+    maxProviderRequests: 12,
+    clock: () => Date.parse('2026-08-30T00:00:00.000Z'),
+    randomUUID: () =>
+      input.tenantTag === 'advance'
+        ? '00000000-0000-4000-8000-000000000101'
+        : '00000000-0000-4000-8000-000000000102',
+  });
+  const stored = await store.get(spec.tenantTag, spec.environment);
+  const claims = await db
+    .prepare(
+      `SELECT resource_type, resource_name, resource_role
+       FROM ${PLATFORM_CLAIM_TABLE}
+       WHERE resource_set_key = ?
+       ORDER BY resource_type, resource_name, resource_role`,
+    )
+    .bind(`deployment:${spec.tenantTag}:${spec.environment}`)
+    .all<{
+      resource_type: string;
+      resource_name: string;
+      resource_role: string;
+    }>();
+  return {
+    result,
+    trace: backend.events,
+    phase: stored?.phase,
+    lifecyclePhase: stored?.decommissionIntent?.lifecyclePhase,
+    intentState: stored?.decommissionIntent?.state,
+    revision: stored?.decommissionIntent?.revision,
+    generation: stored?.decommissionIntent?.generation,
+    resourceStates:
+      stored?.applicationResources?.map(({ state }) => state) ?? [],
+    bucketName: resource.bucketName,
+    lostWriteCount,
+    claims: claims.results.map((claim) => ({
+      resourceType: claim.resource_type,
+      resourceName: claim.resource_name,
+      resourceRole: claim.resource_role,
+    })),
+  };
 }
 
 function errorShape(error: unknown): unknown {
@@ -1202,7 +1502,10 @@ export default {
     if (request.method !== 'POST' || url.pathname !== '/fleet-state') {
       return new Response('not found', { status: 404 });
     }
-    const body = (await request.json()) as { action?: unknown };
+    const body = (await request.json()) as {
+      action?: unknown;
+      input?: unknown;
+    };
     try {
       switch (body.action) {
         case 'concurrent-acquisition':
@@ -1233,6 +1536,13 @@ export default {
           return Response.json(await decommissionIntentColumnUpgrade(env.DB));
         case 'decommission-intent-lost-response':
           return Response.json(await decommissionIntentLostResponse(env.DB));
+        case 'bounded-decommission-step':
+          return Response.json(
+            await boundedDecommissionStep(
+              env.DB,
+              body.input as BoundedDecommissionStepInput,
+            ),
+          );
         case 'lifecycle-errors':
           return Response.json(await lifecycleErrors(env.DB));
         case 'cloudflare-rate-coordination':

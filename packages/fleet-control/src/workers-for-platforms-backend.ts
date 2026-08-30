@@ -116,6 +116,58 @@ function localBindingKeys(
   );
 }
 
+function carrierConsumedMigrationDecommissionMatches(
+  spec: DeploymentSpec,
+  record: FleetRecord,
+): boolean {
+  const intent = record.decommissionIntent;
+  const identity = intent?.identity;
+  const mode = identity?.mode;
+  if (
+    record.phase !== 'decommission-advancing' ||
+    !intent ||
+    intent.state === 'complete' ||
+    !identity ||
+    mode?.kind !== 'normal'
+  ) {
+    return false;
+  }
+  return (
+    mode.entryLifecyclePhase === 'migrating' &&
+    mode.requestedSpecDigest === deploymentSpecDigest(spec) &&
+    record.desiredSpecDigest === mode.requestedSpecDigest &&
+    [
+      'decommissioning',
+      'traffic-removed',
+      'credentials-revoked',
+      'worker-deleted',
+      'platform-credentials-revoked',
+      'platform-resources-deleted',
+      'application-resources-deleting',
+      'application-resources-deleted',
+      'database-exported',
+      'database-deleting',
+    ].includes(intent.lifecyclePhase) &&
+    record.migrationIntent === undefined &&
+    record.pendingSpecDigest === undefined &&
+    record.pendingArtifactVersion === undefined &&
+    record.backendSwitchIntent === undefined &&
+    identity.record.tenantTag === record.tenantTag &&
+    identity.record.environment === record.environment &&
+    identity.record.backend === record.backend &&
+    identity.record.backend === 'workers-for-platforms' &&
+    identity.record.scriptName === record.scriptName &&
+    identity.record.databaseId === record.databaseId &&
+    identity.record.databaseName === record.databaseName &&
+    identity.record.routeHostname === record.routeHostname &&
+    identity.record.tenantTag === spec.tenantTag &&
+    identity.record.environment === spec.environment &&
+    identity.record.scriptName === spec.scriptName &&
+    identity.record.databaseName === spec.databaseName &&
+    identity.record.routeHostname === spec.routeHostname
+  );
+}
+
 export interface WorkersForPlatformsApi {
   listWorkerDatabaseAttachments(databaseId: string): Promise<
     readonly Readonly<{
@@ -1256,11 +1308,14 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
         namespacedProfile,
         namespacedTarget,
       );
+      const migrationIntentMatches =
+        record.migrationIntent !== undefined &&
+        JSON.stringify(record.migrationIntent.target) ===
+          JSON.stringify(namespacedTarget);
       if (
         !inspected ||
-        !record.migrationIntent ||
-        JSON.stringify(record.migrationIntent.target) !==
-          JSON.stringify(namespacedTarget)
+        (!migrationIntentMatches &&
+          !carrierConsumedMigrationDecommissionMatches(spec, record))
       ) {
         throw new Error(
           `refusing to revoke credentials for drifted state Worker '${stateName}'`,
