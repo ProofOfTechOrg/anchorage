@@ -6,6 +6,7 @@ import {
   reserveApplicationR2Resources,
 } from '../../src/application-bindings.js';
 import { D1CloudflareApiRateCoordinator } from '../../src/cloudflare-rate-coordinator.js';
+import { initialWorkerAttachmentScan } from '../../src/cloudflare-worker-attachment-scan-state.js';
 import { D1FleetStateDatabase } from '../../src/d1-fleet-state-database.js';
 import { advanceDecommissionDeployment } from '../../src/decommission-advance.js';
 import {
@@ -25,6 +26,7 @@ import type {
   DatabaseExport,
   DatabaseExportReceiptIdentity,
   DatabaseReference,
+  DecommissionAdvanceIntent,
   DecommissionAttachmentScanInput,
   DecommissionAttachmentScanResult,
   DeploymentSpec,
@@ -35,7 +37,10 @@ import type {
   PlatformPlaneResourceSet,
   ProvisioningBackend,
 } from '../../src/types.js';
-import { decommissionAdvancingRecordFixture } from './decommission-intent-fixture.js';
+import {
+  backendSwitchDecommissionRecordFixture,
+  decommissionAdvancingRecordFixture,
+} from './decommission-intent-fixture.js';
 
 interface Env {
   DB: D1Database;
@@ -1710,6 +1715,323 @@ async function finalLeaseAssertionRollback(db: D1Database): Promise<unknown> {
   };
 }
 
+const SWITCH_LOST_TENANT = 'switchlost';
+const SWITCH_LOST_RECEIPT_AUTHORITY =
+  'memory://fleet-exports/backend-switch/receipts/v1';
+const SWITCH_LOST_EXPORT: DatabaseExport = {
+  databaseId: 'database-switchlost-production',
+  location: 'memory://fleet-exports/backend-switch/switchlost.sql',
+  sha256: 'f'.repeat(64),
+  size: 37,
+};
+
+type BackendSwitchLostWriteStage =
+  | 'reset'
+  | 'start'
+  | 'cursor'
+  | 'receipt'
+  | 'barrier'
+  | 'terminal';
+
+function backendSwitchLostWriteSource(): FleetRecord {
+  const base = record(SWITCH_LOST_TENANT, 'production');
+  const outboundPolicy = canonicalDeploymentEgressPolicy({
+    policyId: 'policy-switchlost',
+    tenantTag: base.tenantTag,
+    environment: base.environment,
+    allowedHosts: [],
+  });
+  const target = {
+    maintenanceCapabilityPublicKey: platformSet.maintenanceCapabilityPublicKey,
+    stateArtifactDigest: 'a'.repeat(64),
+    stateDurableObjectHistoryDigest: 'b'.repeat(64),
+    egressArtifactDigest: 'c'.repeat(64),
+    d1SchemaVersion: base.schemaVersion,
+    d1SchemaHistoryDigest: 'd'.repeat(64),
+    outboundPolicy,
+  } as const;
+  const current: FleetRecord = {
+    ...base,
+    backend: 'workers-for-platforms',
+    outboundPolicy,
+    platformTarget: target,
+    platformResources: {
+      maintenanceCapabilityPublicKey:
+        platformSet.maintenanceCapabilityPublicKey,
+      outboundPolicy,
+      stateWorker: {
+        scriptName: base.scriptName,
+        artifactVersion: 'bridge-switchlost-v1',
+        artifactDigest: target.stateArtifactDigest,
+        plane: 'ordinary',
+        durableObjectBindings: [],
+        namespaceIds: [],
+      },
+      egressProxy: {
+        scriptName: 'switchlost-production-egress',
+        artifactVersion: 'egress-switchlost-v1',
+        artifactDigest: target.egressArtifactDigest,
+        ...outboundPolicy,
+      },
+    },
+    applicationResources: [],
+    applicationBindings: { vars: [], secrets: [], r2Buckets: [] },
+  };
+  const prior = {
+    scriptName: current.scriptName,
+    artifactVersion: current.artifactVersion,
+    specDigest: current.desiredSpecDigest,
+    databaseId: current.databaseId,
+    databaseName: current.databaseName,
+    durableObjectBindings: [],
+    namespaceIds: [],
+    secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
+    application: { vars: [], secrets: [], r2Buckets: [] },
+    applicationResources: [],
+    customDomain: {
+      id: 'domain-switchlost',
+      hostname: current.routeHostname,
+    },
+  } as const;
+  return backendSwitchDecommissionRecordFixture(
+    current,
+    {
+      kind: 'backend-switch',
+      tenantTag: current.tenantTag,
+      environment: current.environment,
+      prior,
+      targetSpecDigest: current.desiredSpecDigest,
+      targetApplication: { vars: [], secrets: [], r2Buckets: [] },
+      target,
+      rollbackUntil: '2026-09-30T00:00:00.000Z',
+      subphase: 'decommission-export-authorized',
+      applicationR2Progress: [],
+      decommissionSnapshot: {
+        prior,
+        restoredArtifactVersion: null,
+        entryPendingArtifactVersion: null,
+        entryPendingNamespaceIds: null,
+        providerTargetSpecDigest: current.desiredSpecDigest,
+        routeHostname: current.routeHostname,
+        routeTargets: [],
+        desiredSpecDigest: current.desiredSpecDigest,
+        target,
+        releases: [],
+        applicationResources: [],
+      },
+    },
+    { subphase: 'decommission-export-authorized' },
+  );
+}
+
+function backendSwitchShellCommon(
+  shell: DecommissionAdvanceIntent,
+  revision: number,
+  updatedAt: string,
+): Omit<
+  Extract<DecommissionAdvanceIntent, { readonly state: 'transitioning' }>,
+  'lifecyclePhase' | 'state'
+> {
+  return {
+    version: 1,
+    operationId: shell.operationId,
+    revision,
+    generation: shell.generation,
+    updatedAt,
+    identity: shell.identity,
+    ...(shell.databaseExportReceiptAuthority
+      ? {
+          databaseExportReceiptAuthority: shell.databaseExportReceiptAuthority,
+        }
+      : {}),
+  };
+}
+
+function backendSwitchLostWriteNext(
+  current: FleetRecord,
+  stage: Exclude<BackendSwitchLostWriteStage, 'reset' | 'start'>,
+): FleetRecord {
+  const intent = current.backendSwitchIntent;
+  const shell = current.decommissionIntent;
+  if (!intent || !shell || shell.state === 'complete') {
+    throw new Error('bounded backend-switch harness authority is absent');
+  }
+  const revision = shell.revision + 1;
+  const updatedAt = `2026-08-30T00:00:${String(revision).padStart(2, '0')}.000Z`;
+  const common = backendSwitchShellCommon(shell, revision, updatedAt);
+  if (stage === 'cursor') {
+    const decommissionIntent: DecommissionAdvanceIntent = {
+      ...common,
+      databaseExportReceiptAuthority: SWITCH_LOST_RECEIPT_AUTHORITY,
+      lifecyclePhase: 'application-resources-deleted',
+      state: 'discover',
+      purpose: {
+        kind: 'database-pre-export',
+        databaseId: current.databaseId,
+      },
+      progress: initialWorkerAttachmentScan({
+        kind: 'd1',
+        databaseId: current.databaseId,
+      }),
+    };
+    return {
+      ...current,
+      decommissionIntent,
+      updatedAt,
+    };
+  }
+  if (stage === 'receipt') {
+    const decommissionIntent: DecommissionAdvanceIntent = {
+      ...common,
+      databaseExportReceiptAuthority: SWITCH_LOST_RECEIPT_AUTHORITY,
+      lifecyclePhase: 'database-exported',
+      state: 'transitioning',
+    };
+    return {
+      ...current,
+      backendSwitchIntent: {
+        ...intent,
+        subphase: 'decommission-exported',
+        databaseExport: SWITCH_LOST_EXPORT,
+      },
+      decommissionIntent,
+      databaseExportLocation: SWITCH_LOST_EXPORT.location,
+      databaseExportSha256: SWITCH_LOST_EXPORT.sha256,
+      databaseExportSize: SWITCH_LOST_EXPORT.size,
+      updatedAt,
+    };
+  }
+  if (stage === 'barrier') {
+    const decommissionIntent: DecommissionAdvanceIntent = {
+      ...common,
+      databaseExportReceiptAuthority: SWITCH_LOST_RECEIPT_AUTHORITY,
+      lifecyclePhase: 'database-deleting',
+      state: 'transitioning',
+    };
+    return {
+      ...current,
+      backendSwitchIntent: {
+        ...intent,
+        subphase: 'decommission-database-authorized',
+      },
+      decommissionIntent,
+      updatedAt,
+    };
+  }
+  return backendSwitchDecommissionRecordFixture(
+    current,
+    {
+      ...intent,
+      subphase: 'decommissioned',
+      databaseExport: SWITCH_LOST_EXPORT,
+      applicationR2Progress: [],
+    },
+    {
+      operationId: shell.operationId,
+      revision,
+      generation: shell.generation,
+      ...(intent.decommissionEntrySubphase
+        ? { entrySubphase: intent.decommissionEntrySubphase }
+        : {}),
+      subphase: 'decommissioned',
+      updatedAt,
+    },
+  );
+}
+
+async function backendSwitchLostWriteStep(
+  db: D1Database,
+  input: Readonly<{
+    stage: BackendSwitchLostWriteStage;
+    loseWrite?: boolean;
+  }>,
+): Promise<unknown> {
+  if (input.stage === 'reset') {
+    await readyStore(db);
+    await db
+      .prepare(
+        `DELETE FROM ${STATE_TABLE} WHERE tenant_tag = ? AND environment = 'production'`,
+      )
+      .bind(SWITCH_LOST_TENANT)
+      .run();
+    await db
+      .prepare(
+        `DELETE FROM ${LEASE_TABLE} WHERE tenant_tag = ? AND environment = 'production'`,
+      )
+      .bind(SWITCH_LOST_TENANT)
+      .run();
+    await db
+      .prepare(`DELETE FROM ${PLATFORM_CLAIM_TABLE} WHERE resource_set_key = ?`)
+      .bind(`deployment:${SWITCH_LOST_TENANT}:production`)
+      .run();
+    return { reset: true };
+  }
+  const delegate = new D1FleetStateDatabase(db);
+  let lostWriteCount = 0;
+  const database: FleetStateDatabase = {
+    query: (sql, bindings = []) => delegate.query(sql, bindings),
+    execute: (sql, bindings = []) => delegate.execute(sql, bindings),
+    async batch(statements) {
+      const results = await delegate.batch(statements);
+      if (
+        input.loseWrite &&
+        lostWriteCount === 0 &&
+        statements.some(({ sql }) => sql.includes(`INSERT INTO ${STATE_TABLE}`))
+      ) {
+        lostWriteCount += 1;
+        throw new Error('bounded backend-switch D1 write response lost');
+      }
+      return results;
+    },
+  };
+  const store = new D1FleetStateStore(database, {
+    accountId: 'account-primary',
+  });
+  const current = await store.get(SWITCH_LOST_TENANT, 'production');
+  const next =
+    input.stage === 'start'
+      ? backendSwitchLostWriteSource()
+      : current
+        ? backendSwitchLostWriteNext(current, input.stage)
+        : (() => {
+            throw new Error('bounded backend-switch harness record is absent');
+          })();
+  await store.withDeploymentLease(SWITCH_LOST_TENANT, 'production', (lease) =>
+    lease.put(next),
+  );
+  const persisted = await new D1FleetStateStore(new D1FleetStateDatabase(db), {
+    accountId: 'account-primary',
+  }).get(SWITCH_LOST_TENANT, 'production');
+  const raw = await db
+    .prepare(
+      `SELECT backend_switch_intent, decommission_intent
+       FROM ${STATE_TABLE}
+       WHERE tenant_tag = ? AND environment = 'production'`,
+    )
+    .bind(SWITCH_LOST_TENANT)
+    .first<{
+      backend_switch_intent: string | null;
+      decommission_intent: string | null;
+    }>();
+  return {
+    lostWriteCount,
+    phase: persisted?.phase,
+    switchSubphase: persisted?.backendSwitchIntent?.subphase,
+    shellState: persisted?.decommissionIntent?.state,
+    shellRevision: persisted?.decommissionIntent?.revision,
+    lifecyclePhase: persisted?.decommissionIntent?.lifecyclePhase,
+    scanStage:
+      persisted?.decommissionIntent?.state === 'discover' ||
+      persisted?.decommissionIntent?.state === 'verify'
+        ? persisted.decommissionIntent.progress.stage
+        : undefined,
+    databaseExportLocation: persisted?.databaseExportLocation,
+    columnsPresent:
+      typeof raw?.backend_switch_intent === 'string' &&
+      typeof raw.decommission_intent === 'string',
+  };
+}
+
 async function backendSwitchColumnUpgrade(db: D1Database): Promise<unknown> {
   const store = await readyStore(db);
   const base = record('legacyswitch', 'production');
@@ -2011,6 +2333,16 @@ export default {
           return Response.json(await finalLeaseAssertionRollback(env.DB));
         case 'backend-switch-column-upgrade':
           return Response.json(await backendSwitchColumnUpgrade(env.DB));
+        case 'bounded-backend-switch-write-step':
+          return Response.json(
+            await backendSwitchLostWriteStep(
+              env.DB,
+              body.input as {
+                stage: BackendSwitchLostWriteStage;
+                loseWrite?: boolean;
+              },
+            ),
+          );
         case 'decommission-intent-column-upgrade':
           return Response.json(await decommissionIntentColumnUpgrade(env.DB));
         case 'decommission-intent-lost-response':

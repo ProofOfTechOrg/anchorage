@@ -6,6 +6,7 @@ import { AUDIT_PROXY_INSTANCE_NAME } from '@proofoftech/flowsafe/audit-export';
 import {
   applicationBindingTopology,
   applicationSecretValues,
+  canonicalApplicationBindings,
   DEPLOYMENT_PLATFORM_VARIABLE_NAMES,
   LEGACY_BRIDGE_PLATFORM_VARIABLE_NAMES,
   liveApplicationTopologyMatches,
@@ -17,9 +18,14 @@ import type {
   BridgeMutationPlan,
   BridgeSnapshot,
   PlainBackendSnapshot,
+  SwitchEntryPendingArtifactInspection,
 } from './backend-switch.js';
 import { finalizedBridgeForRecord } from './backend-switch.js';
 import { workerMigrations } from './cloudflare-ordinary-worker-operations.js';
+import {
+  captureDatabaseExportReceiptCapability,
+  databaseExportReceiptIdentityFromUnknown,
+} from './database-export-store.js';
 import type { HostRoutingTarget } from './host-routing.js';
 import { parseHostRoutingTarget } from './host-routing.js';
 import { d1MigrationHistoryDigest } from './migration-ledger.js';
@@ -35,10 +41,17 @@ import {
   trustedArtifactDigest,
   validateExternalPlatformProfile,
 } from './platform-resources.js';
-import { assertProviderBindingIdentitiesMatchInspection } from './provider-binding-inventory.js';
+import {
+  assertProviderBindingIdentitiesMatchInspection,
+  assertSupportedPlainWorkerBindings,
+} from './provider-binding-inventory.js';
 import { deploymentSpecDigest } from './spec-digest.js';
 import type {
   ApplicationBindingTopology,
+  DatabaseExportReceiptIdentity,
+  DatabaseReference,
+  DecommissionAttachmentScanInput,
+  DecommissionAttachmentScanResult,
   DeploymentSecrets,
   DeploymentSpec,
   DurableObjectBindingInventory,
@@ -244,6 +257,45 @@ function expectedSecretNames(
 
 function sameJson(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function sortedRecordEntries(
+  value: Readonly<Record<string, string>>,
+): readonly (readonly [string, string])[] {
+  return Object.entries(value).sort(([left], [right]) =>
+    left < right ? -1 : left > right ? 1 : 0,
+  );
+}
+
+const PLAIN_WORKER_INGRESS_CONTRACT = 'guarded-object-v1';
+
+function sortByName<T extends Readonly<{ name: string }>>(
+  values: readonly T[],
+): readonly T[] {
+  return [...values].sort((left, right) =>
+    left.name < right.name ? -1 : left.name > right.name ? 1 : 0,
+  );
+}
+
+function canonicalUniqueNames(value: readonly string[]): readonly string[] {
+  if (
+    !Array.isArray(value) ||
+    value.some(
+      (name) =>
+        typeof name !== 'string' || name.length === 0 || name !== name.trim(),
+    )
+  ) {
+    throw new Error('backend switch pending artifact inspection is malformed');
+  }
+  const names = [...value].sort();
+  if (new Set(names).size !== names.length) {
+    throw new Error('backend switch pending artifact inspection is malformed');
+  }
+  return names;
+}
+
+function pendingArtifactInspectionMalformed(): Error {
+  return new Error('backend switch pending artifact inspection is malformed');
 }
 
 type ProviderControlWorkerInspection = NonNullable<
@@ -464,6 +516,17 @@ export interface WorkersForPlatformsBackendSwitchProviderOptions {
 }
 
 export interface BackendSwitchApi extends WorkersForPlatformsApi {
+  /** Intersects exact namespace IDs through one bounded account inventory. */
+  existingDurableObjectNamespaceIds(
+    ids: readonly string[],
+  ): Promise<readonly string[]>;
+  /** Reads exactly one immutable ordinary Worker version by provider ID. */
+  findOrdinaryWorkerVersion(
+    scriptName: string,
+    versionId: string,
+  ): Promise<import('./types.js').PlainWorkerVersionDetail | undefined>;
+  /** Reads the authoritative name-only secret inventory for one script. */
+  listOrdinaryWorkerSecretNames(scriptName: string): Promise<readonly string[]>;
   listCustomDomains(): Promise<
     readonly Readonly<{ id: string; hostname: string; service: string }>[]
   >;
@@ -499,11 +562,35 @@ export interface SwitchBridgeRemovalAuthority {
   readonly plan?: BridgeMutationPlan;
   readonly targetSpec: DeploymentSpec;
   readonly allowedArtifactVersions: readonly string[];
+  /**
+   * Call-local immutable authority for a pending ordinary Worker captured
+   * before the decommission shell committed.
+   */
+  readonly entryPendingArtifact?: Readonly<{
+    readonly artifactVersion: string;
+    readonly namespaceIds: readonly string[];
+    readonly spec: DeploymentSpec;
+  }>;
 }
 
 export class WorkersForPlatformsBackendSwitchProvider
   implements BackendSwitchProvider
 {
+  /** Bounded attachment scan capability captured from the client receiver. */
+  declare readonly advanceSwitchDecommissionAttachmentScan?: (
+    input: DecommissionAttachmentScanInput,
+  ) => Promise<DecommissionAttachmentScanResult>;
+  /** Immutable receipt authority paired with `exportSwitchDatabaseReceipt`. */
+  declare readonly databaseExportReceiptAuthority?: string;
+  /** Operation-scoped export receipt captured from the client receiver. */
+  declare readonly exportSwitchDatabaseReceipt?: (
+    identity: DatabaseExportReceiptIdentity,
+    input: Readonly<{
+      prior: PlainBackendSnapshot;
+      targetSpec: DeploymentSpec;
+      fence: BackendSwitchMutationFence;
+    }>,
+  ) => Promise<import('./types.js').DatabaseExport>;
   readonly #client: BackendSwitchApi;
   readonly #backend: WorkersForPlatformsBackend;
   readonly #hostRoutingKvId: string;
@@ -534,6 +621,44 @@ export class WorkersForPlatformsBackendSwitchProvider
     this.#platformProfileFor = options.platformProfileFor;
     this.#assertServing = options.assertServing;
     this.#drainCandidate = options.drainCandidate;
+    const advanceAttachmentScan =
+      options.client.advanceDecommissionAttachmentScan;
+    if (typeof advanceAttachmentScan === 'function') {
+      this.advanceSwitchDecommissionAttachmentScan = advanceAttachmentScan.bind(
+        options.client,
+      );
+    }
+    const receiptCapability = captureDatabaseExportReceiptCapability(
+      options.client,
+      () => [
+        options.client.databaseExportReceiptAuthority,
+        options.client.exportDatabaseReceipt,
+      ],
+    );
+    if (receiptCapability) {
+      const exportDatabaseReceipt = receiptCapability.method as NonNullable<
+        BackendSwitchApi['exportDatabaseReceipt']
+      >;
+      this.databaseExportReceiptAuthority = receiptCapability.authority;
+      this.exportSwitchDatabaseReceipt = (identity, input) => {
+        const canonical = databaseExportReceiptIdentityFromUnknown(
+          identity,
+          receiptCapability.authority,
+        );
+        if (
+          canonical.databaseId !== input.prior.databaseId ||
+          input.prior.databaseName !== input.targetSpec.databaseName ||
+          input.prior.scriptName !== input.targetSpec.scriptName
+        ) {
+          throw new Error(
+            'backend-switch database identity changed before teardown',
+          );
+        }
+        return this.#client.withMutationFence(input.fence, () =>
+          exportDatabaseReceipt(canonical),
+        );
+      };
+    }
   }
 
   async #inspectControlWorker(scriptName: string) {
@@ -556,6 +681,229 @@ export class WorkersForPlatformsBackendSwitchProvider
       );
     }
     return inspection;
+  }
+
+  /**
+   * Captures one immutable pending ordinary Worker version without adopting
+   * active-deployment or account-wide namespace observations as authority.
+   */
+  async captureSwitchEntryPendingArtifact(
+    input: Readonly<{
+      readonly expectedArtifactVersion: string;
+      readonly spec: DeploymentSpec;
+      readonly currentRecord: FleetRecord;
+      readonly fence: BackendSwitchMutationFence;
+    }>,
+  ): Promise<unknown> {
+    const [version, secretInventory] = await Promise.all([
+      this.#client.findOrdinaryWorkerVersion(
+        input.spec.scriptName,
+        input.expectedArtifactVersion,
+      ),
+      this.#client.listOrdinaryWorkerSecretNames(input.spec.scriptName),
+    ]);
+    try {
+      if (!version) throw pendingArtifactInspectionMalformed();
+      const specDigest = deploymentSpecDigest(input.spec);
+      if (
+        version.versionId !== input.expectedArtifactVersion ||
+        version.tag !== specDigest ||
+        input.currentRecord.tenantTag !== input.spec.tenantTag ||
+        input.currentRecord.environment !== input.spec.environment ||
+        input.currentRecord.scriptName !== input.spec.scriptName ||
+        input.currentRecord.databaseName !== input.spec.databaseName
+      ) {
+        throw pendingArtifactInspectionMalformed();
+      }
+      assertSupportedPlainWorkerBindings(
+        version.bindings,
+        `plain Worker '${input.spec.scriptName}' pending version`,
+      );
+      const databaseBindings = version.bindings.flatMap((binding) =>
+        binding.type === 'd1' &&
+        typeof binding.name === 'string' &&
+        typeof binding.databaseId === 'string'
+          ? [{ name: binding.name, databaseId: binding.databaseId }]
+          : [],
+      );
+      const durableObjectBindings = sortByName(
+        version.bindings.flatMap((binding) =>
+          binding.type === 'durable-object' &&
+          typeof binding.name === 'string' &&
+          typeof binding.className === 'string' &&
+          typeof binding.namespaceId === 'string'
+            ? [
+                {
+                  name: binding.name,
+                  className: binding.className,
+                  namespaceId: binding.namespaceId,
+                  ...(binding.scriptName === undefined
+                    ? {}
+                    : { scriptName: binding.scriptName }),
+                  ...(binding.dispatchNamespace === undefined
+                    ? {}
+                    : { dispatchNamespace: binding.dispatchNamespace }),
+                },
+              ]
+            : [],
+        ),
+      );
+      const serviceBindings = sortByName(
+        version.bindings.flatMap((binding) =>
+          binding.type === 'service' &&
+          typeof binding.name === 'string' &&
+          typeof binding.service === 'string'
+            ? [
+                {
+                  name: binding.name,
+                  service: binding.service,
+                  ...(binding.entrypoint === undefined
+                    ? {}
+                    : { entrypoint: binding.entrypoint }),
+                },
+              ]
+            : [],
+        ),
+      );
+      const queueProducerBindings = sortByName(
+        version.bindings.flatMap((binding) =>
+          binding.type === 'queue-producer' &&
+          typeof binding.name === 'string' &&
+          typeof binding.queueName === 'string'
+            ? [{ name: binding.name, queueName: binding.queueName }]
+            : [],
+        ),
+      );
+      const r2BucketBindings = sortByName(
+        version.bindings.flatMap((binding) =>
+          binding.type === 'r2-bucket' &&
+          typeof binding.name === 'string' &&
+          typeof binding.bucketName === 'string'
+            ? [
+                {
+                  name: binding.name,
+                  bucketName: binding.bucketName,
+                  ...(binding.jurisdiction === undefined
+                    ? {}
+                    : { jurisdiction: binding.jurisdiction }),
+                },
+              ]
+            : [],
+        ),
+      );
+      const plainTextBindings = Object.fromEntries(
+        version.bindings.flatMap((binding) =>
+          binding.type === 'plain-text' &&
+          typeof binding.name === 'string' &&
+          typeof binding.value === 'string'
+            ? [[binding.name, binding.value] as const]
+            : [],
+        ),
+      );
+      const versionSecretNames = canonicalUniqueNames(
+        version.bindings.flatMap((binding) =>
+          binding.type === 'secret-text' && typeof binding.name === 'string'
+            ? [binding.name]
+            : [],
+        ),
+      );
+      const authoritativeSecretNames = canonicalUniqueNames(secretInventory);
+      const application = applicationBindingTopology(
+        input.spec,
+        input.currentRecord.applicationResources ?? [],
+      );
+      const expectedDurableObjectBindings = sortByName(
+        input.spec.durableObjectBindings.map((binding) => ({ ...binding })),
+      );
+      const expectedServiceBindings = input.spec.egressProxyService
+        ? [{ name: 'EGRESS_PROXY', service: input.spec.egressProxyService }]
+        : [];
+      const expectedQueueProducerBindings = input.spec.queueProducer
+        ? [
+            {
+              name: input.spec.queueProducer.binding,
+              queueName: input.spec.queueProducer.queueName,
+            },
+          ]
+        : [];
+      const expectedPlainTextBindings = Object.fromEntries(
+        [
+          { name: 'DEPLOYMENT_TENANT', value: input.spec.tenantTag },
+          { name: 'FLEET_ENVIRONMENT', value: input.spec.environment },
+          {
+            name: 'FLEET_SCHEMA_VERSION',
+            value: String(input.spec.schemaVersion),
+          },
+          { name: 'FLEET_SPEC_DIGEST', value: specDigest },
+          {
+            name: 'FLEET_INGRESS_CONTRACT',
+            value: PLAIN_WORKER_INGRESS_CONTRACT,
+          },
+          ...canonicalApplicationBindings(input.spec).vars,
+        ].map(({ name, value }) => [name, value] as const),
+      );
+      const expectedSecrets = expectedSecretNames(false, application);
+      const expectedR2Bindings = sortByName(
+        application.r2Buckets.map(({ name, bucketName, jurisdiction }) => ({
+          name,
+          bucketName,
+          jurisdiction,
+        })),
+      );
+      const observedR2Identity = r2BucketBindings.map(
+        ({ name, bucketName, jurisdiction }) => ({
+          name,
+          bucketName,
+          jurisdiction:
+            jurisdiction ??
+            expectedR2Bindings.find((binding) => binding.name === name)
+              ?.jurisdiction,
+        }),
+      );
+      if (
+        !sameJson(databaseBindings, [
+          { name: 'DB', databaseId: input.currentRecord.databaseId },
+        ]) ||
+        !sameJson(
+          durableObjectBindings.map(
+            ({ name, className, scriptName, dispatchNamespace }) => ({
+              name,
+              className,
+              ...(scriptName === undefined ? {} : { scriptName }),
+              ...(dispatchNamespace === undefined ? {} : { dispatchNamespace }),
+            }),
+          ),
+          expectedDurableObjectBindings,
+        ) ||
+        new Set(durableObjectBindings.map(({ namespaceId }) => namespaceId))
+          .size !== durableObjectBindings.length ||
+        !sameJson(serviceBindings, expectedServiceBindings) ||
+        !sameJson(queueProducerBindings, expectedQueueProducerBindings) ||
+        !sameJson(observedR2Identity, expectedR2Bindings) ||
+        !sameJson(
+          sortedRecordEntries(plainTextBindings),
+          sortedRecordEntries(expectedPlainTextBindings),
+        ) ||
+        !sameJson(authoritativeSecretNames, expectedSecrets) ||
+        (versionSecretNames.length > 0 &&
+          !sameJson(versionSecretNames, authoritativeSecretNames)) ||
+        !sameJson(input.currentRecord.applicationBindings, application)
+      ) {
+        throw pendingArtifactInspectionMalformed();
+      }
+      return {
+        artifactVersion: input.expectedArtifactVersion,
+        specDigest,
+        databaseIds: [input.currentRecord.databaseId],
+        durableObjectBindings,
+        secretNames: authoritativeSecretNames,
+        serviceBindings,
+        queueProducerBindings,
+        application,
+      } satisfies SwitchEntryPendingArtifactInspection;
+    } catch {
+      throw pendingArtifactInspectionMalformed();
+    }
   }
 
   #profile(spec: DeploymentSpec): ExternalPlatformProfile {
@@ -1738,8 +2086,15 @@ export class WorkersForPlatformsBackendSwitchProvider
       this.#profile(input.targetSpec),
       input.targetSpec.queueProducer !== undefined,
     );
+    const {
+      pendingSpecDigest: _pendingSpecDigest,
+      pendingArtifactVersion: _pendingArtifactVersion,
+      pendingRelease: _pendingRelease,
+      migrationIntent: _migrationIntent,
+      ...currentRecord
+    } = input.currentRecord;
     return {
-      ...input.currentRecord,
+      ...currentRecord,
       backend: 'workers-for-platforms',
       scriptName: input.prior.scriptName,
       databaseId: input.prior.databaseId,
@@ -1786,10 +2141,6 @@ export class WorkersForPlatformsBackendSwitchProvider
         sharedOutboundWorkerName: this.#sharedOutboundWorkerName,
       },
       phase: 'ready',
-      pendingSpecDigest: undefined,
-      pendingArtifactVersion: undefined,
-      pendingRelease: undefined,
-      migrationIntent: undefined,
     };
   }
 
@@ -2430,6 +2781,119 @@ export class WorkersForPlatformsBackendSwitchProvider
     return bindings;
   }
 
+  #pendingEntryWorkerMatches(
+    live: ProviderControlWorkerInspection,
+    input: SwitchBridgeRemovalAuthority,
+  ): boolean {
+    const pending = input.entryPendingArtifact;
+    if (!pending || live.artifactVersion !== pending.artifactVersion) {
+      return false;
+    }
+    let application: ApplicationBindingTopology;
+    try {
+      const descriptors = canonicalApplicationBindings(pending.spec);
+      const liveR2 = sortByName(live.r2BucketBindings ?? []);
+      if (
+        !sameJson(
+          liveR2.map(({ name, jurisdiction }) => ({ name, jurisdiction })),
+          descriptors.r2Buckets.map(({ name, jurisdiction }) => ({
+            name,
+            jurisdiction: jurisdiction ?? 'default',
+          })),
+        )
+      ) {
+        return false;
+      }
+      application = {
+        vars: descriptors.vars,
+        secrets: descriptors.secrets,
+        r2Buckets: liveR2,
+      };
+    } catch {
+      return false;
+    }
+    const expectedDurableObjectBindings = sortByName(
+      pending.spec.durableObjectBindings.map((binding) => ({ ...binding })),
+    );
+    const liveDurableObjectBindings = sortByName(
+      live.durableObjectBindings.map(
+        ({ name, className, scriptName, dispatchNamespace }) => ({
+          name,
+          className,
+          ...(scriptName === undefined ? {} : { scriptName }),
+          ...(dispatchNamespace === undefined ? {} : { dispatchNamespace }),
+        }),
+      ),
+    );
+    const expectedServiceBindings = pending.spec.egressProxyService
+      ? [
+          {
+            name: 'EGRESS_PROXY',
+            service: pending.spec.egressProxyService,
+          },
+        ]
+      : [];
+    const expectedQueueBindings = pending.spec.queueProducer
+      ? [
+          {
+            name: pending.spec.queueProducer.binding,
+            queueName: pending.spec.queueProducer.queueName,
+          },
+        ]
+      : [];
+    return (
+      deploymentSpecDigest(pending.spec) ===
+        live.plainTextBindings.FLEET_SPEC_DIGEST &&
+      live.databaseIds.length === 1 &&
+      live.databaseIds[0] === input.prior.databaseId &&
+      live.plainTextBindings.DEPLOYMENT_TENANT === pending.spec.tenantTag &&
+      live.plainTextBindings.FLEET_ENVIRONMENT === pending.spec.environment &&
+      live.plainTextBindings.FLEET_SCHEMA_VERSION ===
+        String(pending.spec.schemaVersion) &&
+      live.plainTextBindings.FLEET_INGRESS_CONTRACT ===
+        PLAIN_WORKER_INGRESS_CONTRACT &&
+      sameJson(liveDurableObjectBindings, expectedDurableObjectBindings) &&
+      sameJson(sortByName(live.serviceBindings), expectedServiceBindings) &&
+      sameJson(
+        sortByName(live.queueProducerBindings ?? []),
+        expectedQueueBindings,
+      ) &&
+      live.kvNamespaceBindings.length === 0 &&
+      sameJson(
+        [...live.secretNames].sort(),
+        expectedSecretNames(false, application),
+      ) &&
+      liveApplicationTopologyMatches(
+        application,
+        live,
+        DEPLOYMENT_PLATFORM_VARIABLE_NAMES,
+      )
+    );
+  }
+
+  #switchRemovalNamespaceIds(
+    input: Pick<
+      SwitchBridgeRemovalAuthority,
+      'prior' | 'bridge' | 'entryPendingArtifact'
+    >,
+    additional: readonly string[] = [],
+  ): readonly string[] {
+    return [
+      ...new Set([
+        ...input.prior.namespaceIds,
+        ...input.prior.durableObjectBindings.map(
+          ({ namespaceId }) => namespaceId,
+        ),
+        ...(input.bridge?.namespaceIds ?? []),
+        ...(input.bridge?.durableObjectBindings.map(
+          ({ namespaceId }) => namespaceId,
+        ) ?? []),
+        ...(input.entryPendingArtifact?.namespaceIds ?? []),
+        ...additional,
+      ]),
+    ].sort();
+  }
+
   async #assertSwitchBridgeRemovalAuthority(
     input: SwitchBridgeRemovalAuthority,
   ): Promise<Awaited<ReturnType<BackendSwitchApi['inspectControlWorker']>>> {
@@ -2438,36 +2902,11 @@ export class WorkersForPlatformsBackendSwitchProvider
     }
     const live = await this.#inspectControlWorker(input.prior.scriptName);
     if (!live) return undefined;
-
-    const liveNamespaceIds =
-      input.plan || input.bridge
-        ? await this.#client.listDurableObjectNamespaces(input.prior.scriptName)
-        : [];
-
-    const plannedBindings =
-      input.plan && !input.bridge
-        ? this.#bridgeBindings(
-            input.targetSpec,
-            input.prior.databaseId,
-            this.#profile(input.targetSpec),
-            input.plan.artifactDigest,
-            input.plan.targetDurableObjectTag,
-            input.prior.application,
-          )
-        : undefined;
-    const isPlannedBridge =
-      input.bridge === undefined &&
-      input.plan !== undefined &&
-      plannedBindings !== undefined &&
-      bridgeTopologyMatches(
-        live,
-        liveNamespaceIds,
-        bridgeTopologyExpectationFromBindings({
-          bindings: plannedBindings,
-          secretNames: input.plan.secretNames,
-          application: input.prior.application,
-        }),
-      );
+    const liveNamespaceIds = [
+      ...(await this.#client.listDurableObjectNamespaces(
+        input.prior.scriptName,
+      )),
+    ].sort();
     const snapshotBindings = input.bridge
       ? this.#snapshotBridgeBindings({ ...input, bridge: input.bridge })
       : undefined;
@@ -2493,8 +2932,6 @@ export class WorkersForPlatformsBackendSwitchProvider
               }),
         }),
       );
-    const isSnapshottedVersion =
-      input.bridge?.artifactVersion === live.artifactVersion;
     const isPriorWorker =
       live.artifactVersion === input.prior.artifactVersion &&
       live.plainTextBindings.FLEET_SPEC_DIGEST === input.prior.specDigest &&
@@ -2541,10 +2978,10 @@ export class WorkersForPlatformsBackendSwitchProvider
       ),
     };
     const isAllowedRestoredWorker =
-      input.bridge !== undefined &&
       input.allowedArtifactVersions.includes(live.artifactVersion) &&
       live.artifactVersion !== input.prior.artifactVersion &&
-      !isSnapshottedVersion &&
+      live.artifactVersion !== input.bridge?.artifactVersion &&
+      live.artifactVersion !== input.entryPendingArtifact?.artifactVersion &&
       live.plainTextBindings.FLEET_SPEC_DIGEST === input.prior.specDigest &&
       JSON.stringify(sortedBindingKeys(live.durableObjectBindings)) ===
         JSON.stringify(sortedBindingKeys(input.prior.durableObjectBindings)) &&
@@ -2562,12 +2999,53 @@ export class WorkersForPlatformsBackendSwitchProvider
         live,
         DEPLOYMENT_PLATFORM_VARIABLE_NAMES,
       );
+    const artifactRoleNamespaceIds: readonly (readonly string[])[] = [
+      ...(live.artifactVersion === input.prior.artifactVersion
+        ? [[...input.prior.namespaceIds].sort()]
+        : []),
+      ...(live.artifactVersion === input.bridge?.artifactVersion && input.bridge
+        ? [[...input.bridge.namespaceIds].sort()]
+        : []),
+      ...(live.artifactVersion ===
+        input.entryPendingArtifact?.artifactVersion &&
+      input.entryPendingArtifact
+        ? [[...input.entryPendingArtifact.namespaceIds].sort()]
+        : []),
+      ...(input.allowedArtifactVersions.includes(live.artifactVersion) &&
+      live.artifactVersion !== input.prior.artifactVersion &&
+      live.artifactVersion !== input.bridge?.artifactVersion
+        ? [[...(input.bridge?.namespaceIds ?? input.prior.namespaceIds)].sort()]
+        : []),
+    ];
     if (
-      (isSnapshottedVersion && !isSnapshottedBridge) ||
-      (!isSnapshottedBridge &&
-        !isPlannedBridge &&
-        !isPriorWorker &&
-        !isAllowedRestoredWorker) ||
+      new Set(
+        artifactRoleNamespaceIds.map((namespaceIds) =>
+          JSON.stringify(namespaceIds),
+        ),
+      ).size > 1
+    ) {
+      throw new Error('refusing to delete a foreign backend-switch bridge');
+    }
+    const roleNamespaceIds: readonly (readonly string[])[] = [
+      ...(isPriorWorker ? [[...input.prior.namespaceIds].sort()] : []),
+      ...(isSnapshottedBridge && input.bridge
+        ? [[...input.bridge.namespaceIds].sort()]
+        : []),
+      ...(isAllowedRestoredWorker
+        ? [[...(input.bridge?.namespaceIds ?? input.prior.namespaceIds)].sort()]
+        : []),
+      ...(this.#pendingEntryWorkerMatches(live, input) &&
+      input.entryPendingArtifact
+        ? [[...input.entryPendingArtifact.namespaceIds].sort()]
+        : []),
+    ];
+    const distinctRoleNamespaceIds = new Set(
+      roleNamespaceIds.map((namespaceIds) => JSON.stringify(namespaceIds)),
+    );
+    if (
+      roleNamespaceIds.length === 0 ||
+      distinctRoleNamespaceIds.size !== 1 ||
+      !sameJson(liveNamespaceIds, roleNamespaceIds[0]) ||
       live.databaseIds.length !== 1 ||
       live.databaseIds[0] !== input.prior.databaseId ||
       live.plainTextBindings.DEPLOYMENT_TENANT !== input.targetSpec.tenantTag ||
@@ -2595,24 +3073,7 @@ export class WorkersForPlatformsBackendSwitchProvider
     },
   ): Promise<void> {
     const live = await this.#assertSwitchBridgeRemovalAuthority(input);
-    const authoritativeNamespaceIds = [
-      ...new Set([
-        ...input.prior.namespaceIds,
-        ...input.prior.durableObjectBindings.flatMap(({ namespaceId }) =>
-          namespaceId ? [namespaceId] : [],
-        ),
-        ...(input.bridge?.namespaceIds ?? []),
-        ...(input.bridge?.durableObjectBindings.flatMap(({ namespaceId }) =>
-          namespaceId ? [namespaceId] : [],
-        ) ?? []),
-        ...(await this.#client.listDurableObjectNamespaces(
-          input.prior.scriptName,
-        )),
-        ...(live?.durableObjectBindings.flatMap(({ namespaceId }) =>
-          namespaceId ? [namespaceId] : [],
-        ) ?? []),
-      ]),
-    ];
+    const authoritativeNamespaceIds = this.#switchRemovalNamespaceIds(input);
     if (live) {
       await this.#client.withMutationFence(input.fence, async () => {
         await this.#client.revokeControlSecrets(input.prior.scriptName);
@@ -2622,12 +3083,15 @@ export class WorkersForPlatformsBackendSwitchProvider
     if (await this.#inspectControlWorker(input.prior.scriptName)) {
       throw new Error('backend-switch bridge remains after decommission');
     }
-    for (const namespaceId of authoritativeNamespaceIds) {
-      if (await this.#client.hasDurableObjectNamespace(namespaceId)) {
-        throw new Error(
-          `backend-switch namespace '${namespaceId}' remains after decommission`,
-        );
-      }
+    const existingNamespaceIds =
+      await this.#client.existingDurableObjectNamespaceIds(
+        authoritativeNamespaceIds,
+      );
+    const remainingNamespaceId = existingNamespaceIds[0];
+    if (remainingNamespaceId) {
+      throw new Error(
+        `backend-switch namespace '${remainingNamespaceId}' remains after decommission`,
+      );
     }
   }
 
@@ -2668,6 +3132,113 @@ export class WorkersForPlatformsBackendSwitchProvider
       throw new Error('backend switch cannot delete application R2');
     }
     await this.#backend.deleteApplicationR2Bucket(resource, fence);
+  }
+
+  /** Reads one switch database by immutable provider ID. */
+  getSwitchDatabase(
+    databaseId: string,
+  ): Promise<DatabaseReference | undefined> {
+    return this.#client.getDatabase(databaseId);
+  }
+
+  /** Reads the raw deployment owner under the supplied mutation fence. */
+  readSwitchDatabaseOwner(
+    database: DatabaseReference,
+    fence: BackendSwitchMutationFence,
+  ): Promise<string | undefined> {
+    return this.#backend.readDeploymentIdentity(database, fence);
+  }
+
+  /**
+   * Reasserts switch-owned residual absence without invoking the legacy
+   * account-wide Worker attachment enumeration.
+   */
+  async assertSwitchDatabaseDeletionResidualsRemoved(
+    input: Readonly<{
+      prior: PlainBackendSnapshot;
+      targetSpec: DeploymentSpec;
+      currentRecord: FleetRecord;
+      database: DatabaseReference;
+      fence: BackendSwitchMutationFence;
+    }>,
+  ): Promise<void> {
+    const snapshot =
+      input.currentRecord.backendSwitchIntent?.decommissionSnapshot;
+    if (
+      !snapshot?.prior ||
+      !sameJson(snapshot.prior, input.prior) ||
+      snapshot.providerTargetSpecDigest !==
+        deploymentSpecDigest(input.targetSpec)
+    ) {
+      throw new Error('backend switch decommission authorization was lost');
+    }
+    await this.assertSwitchTrafficRemoved({
+      prior: input.prior,
+      routeHostname: snapshot.routeHostname,
+    });
+    for (const { release } of snapshot.releases) {
+      if (
+        (await this.#inspectDispatchWorker(release.physicalScriptName)) ||
+        (await this.#client.getScriptInventory(
+          this.#hostRoutingKvId,
+          release.physicalScriptName,
+        ))
+      ) {
+        throw new Error('backend-switch release remains after decommission');
+      }
+    }
+    if (await this.#inspectControlWorker(input.prior.scriptName)) {
+      throw new Error('backend-switch bridge remains after decommission');
+    }
+    const namespaceIds = this.#switchRemovalNamespaceIds(
+      {
+        prior: input.prior,
+        bridge: snapshot.bridge,
+        ...(snapshot.entryPendingArtifactVersion &&
+        snapshot.entryPendingNamespaceIds
+          ? {
+              entryPendingArtifact: {
+                artifactVersion: snapshot.entryPendingArtifactVersion,
+                namespaceIds: snapshot.entryPendingNamespaceIds,
+                spec: input.targetSpec,
+              },
+            }
+          : {}),
+      },
+      snapshot.resources?.stateWorker.namespaceIds ?? [],
+    );
+    const existingNamespaceIds =
+      await this.#client.existingDurableObjectNamespaceIds(namespaceIds);
+    const remainingNamespaceId = existingNamespaceIds[0];
+    if (remainingNamespaceId) {
+      throw new Error(
+        `backend-switch namespace '${remainingNamespaceId}' remains after decommission`,
+      );
+    }
+  }
+
+  /** Deletes the already-reconciled switch database without a legacy scan. */
+  deleteSwitchDatabaseBounded(
+    input: Readonly<{
+      prior: PlainBackendSnapshot;
+      targetSpec: DeploymentSpec;
+      database: DatabaseReference;
+      fence: BackendSwitchMutationFence;
+    }>,
+  ): Promise<void> {
+    if (
+      input.database.id !== input.prior.databaseId ||
+      input.database.name !== input.prior.databaseName ||
+      input.prior.databaseName !== input.targetSpec.databaseName ||
+      input.prior.scriptName !== input.targetSpec.scriptName
+    ) {
+      throw new Error(
+        'backend-switch database identity changed before teardown',
+      );
+    }
+    return this.#client.withMutationFence(input.fence, () =>
+      this.#client.deleteDatabase(input.database.id),
+    );
   }
 
   async exportSwitchDatabase(input: {

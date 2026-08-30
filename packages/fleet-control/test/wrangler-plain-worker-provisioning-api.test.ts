@@ -206,9 +206,26 @@ describe('WranglerPlainWorkerProvisioningApi parsing', () => {
     );
   });
 
-  it('normalizes every binding branch and preserves D1 id precedence', async () => {
+  it('normalizes every binding branch and preserves D1 alias compatibility', async () => {
     const bindings = [
-      { type: 'd1', name: 'DB', id: '', database_id: 'db-alias' },
+      {
+        type: 'd1',
+        name: 'DB_SENTINEL',
+        id: '',
+        database_id: 'db-alias',
+      },
+      {
+        type: 'd1',
+        name: 'DB_EQUAL',
+        id: 'db-equal',
+        database_id: 'db-equal',
+      },
+      {
+        type: 'd1',
+        name: 'DB_CONFLICT',
+        id: 'db-legacy',
+        database_id: 'db-current',
+      },
       {
         type: 'durable_object_namespace',
         name: 'OBJECT',
@@ -235,7 +252,14 @@ describe('WranglerPlainWorkerProvisioningApi parsing', () => {
       versionId: undefined,
       tag: undefined,
       bindings: [
-        { type: 'd1', name: 'DB', databaseId: '' },
+        { type: 'd1', name: 'DB_SENTINEL', databaseId: 'db-alias' },
+        { type: 'd1', name: 'DB_EQUAL', databaseId: 'db-equal' },
+        {
+          type: 'unsupported',
+          name: 'DB_CONFLICT',
+          providerType: 'd1',
+          issue: 'malformed-supported-binding',
+        },
         {
           type: 'durable-object',
           name: 'OBJECT',
@@ -266,9 +290,18 @@ describe('WranglerPlainWorkerProvisioningApi parsing', () => {
         },
       ],
     });
+    expect(
+      assertSupportedPlainWorkerBindings(
+        viewed.bindings.slice(0, 2),
+        "plain Worker 'worker'",
+      ),
+    ).toEqual([
+      { type: 'd1', name: 'DB_EQUAL' },
+      { type: 'd1', name: 'DB_SENTINEL' },
+    ]);
     expect(() =>
       assertSupportedPlainWorkerBindings(
-        viewed.bindings.slice(0, 1),
+        viewed.bindings.slice(2, 3),
         "plain Worker 'worker'",
       ),
     ).toThrow(

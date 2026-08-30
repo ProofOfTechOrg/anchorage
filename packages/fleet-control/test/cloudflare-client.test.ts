@@ -15,6 +15,7 @@ import type {
 import {
   envelope,
   fenced,
+  pageArray,
   testRateCoordinator,
   zoneAuthorityResponse,
 } from './fixtures/cloudflare-fetch-fixture.js';
@@ -1129,6 +1130,9 @@ describe('CloudflareProvisioningClient', () => {
         return envelope([
           { id: 'ns-wfp', script: 'fleet-wfp' },
           { id: 'ns-plain', script: 'fleet-plain' },
+          { id: 'Z', script: 'other' },
+          { id: 'z', script: 'other' },
+          { id: 'é', script: 'other' },
         ]);
       }
       throw new Error(`unexpected Cloudflare request: ${url.href}`);
@@ -1212,6 +1216,150 @@ describe('CloudflareProvisioningClient', () => {
     await expect(client.hasDurableObjectNamespace('ns-absent')).resolves.toBe(
       false,
     );
+    const namespaceRequestCount = () =>
+      request.mock.calls.filter(([input]) => {
+        const url = new URL(
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url,
+        );
+        return url.pathname.endsWith('/workers/durable_objects/namespaces');
+      }).length;
+    let priorNamespaceRequests = namespaceRequestCount();
+    await expect(client.existingDurableObjectNamespaceIds([])).resolves.toEqual(
+      [],
+    );
+    expect(namespaceRequestCount()).toBe(priorNamespaceRequests);
+    await expect(
+      client.existingDurableObjectNamespaceIds([
+        'ns-plain',
+        'missing',
+        'ns-wfp',
+        'ns-plain',
+        'é',
+        'z',
+        'Z',
+      ]),
+    ).resolves.toEqual(['Z', 'ns-plain', 'ns-wfp', 'z', 'é']);
+    const namespaceTraversalRequests =
+      namespaceRequestCount() - priorNamespaceRequests;
+    expect(namespaceTraversalRequests).toBeGreaterThan(0);
+    priorNamespaceRequests = namespaceRequestCount();
+    const maximumIds = Array.from(
+      { length: 10_000 },
+      (_, index) => `namespace-${index}`,
+    );
+    maximumIds[0] = 'ns-wfp';
+    await expect(
+      client.existingDurableObjectNamespaceIds(maximumIds),
+    ).resolves.toEqual(['ns-wfp']);
+    expect(namespaceRequestCount()).toBe(
+      priorNamespaceRequests + namespaceTraversalRequests,
+    );
+    priorNamespaceRequests = namespaceRequestCount();
+    const maximumUtf8Id = 'é'.repeat(2_048);
+    await expect(
+      client.existingDurableObjectNamespaceIds([maximumUtf8Id]),
+    ).resolves.toEqual([]);
+    expect(namespaceRequestCount()).toBe(
+      priorNamespaceRequests + namespaceTraversalRequests,
+    );
+    priorNamespaceRequests = namespaceRequestCount();
+
+    let accessorReads = 0;
+    const accessorArray = ['safe'];
+    Object.defineProperty(accessorArray, '0', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        accessorReads += 1;
+        return 'unsafe';
+      },
+    });
+    const symbolArray = ['safe'];
+    Object.assign(symbolArray, { [Symbol('extra')]: true });
+    const extraArray = Object.assign(['safe'], { extra: true });
+    const holeArray = new Array<string>(1);
+    const nonArrayPrototype = ['safe'];
+    Object.setPrototypeOf(nonArrayPrototype, null);
+    const indexNotWritable = ['safe'];
+    Object.defineProperty(indexNotWritable, '0', { writable: false });
+    const indexNotEnumerable = ['safe'];
+    Object.defineProperty(indexNotEnumerable, '0', { enumerable: false });
+    const indexNotConfigurable = ['safe'];
+    Object.defineProperty(indexNotConfigurable, '0', { configurable: false });
+    const lengthNotWritable = ['safe'];
+    Object.defineProperty(lengthNotWritable, 'length', { writable: false });
+    const transparentProxy = new Proxy(['safe'], {});
+    const revoked = Proxy.revocable(['safe'], {});
+    revoked.revoke();
+    const malformedRows: readonly (readonly [string, unknown])[] = [
+      ['nonarray', { 0: 'safe', length: 1 }],
+      ['hole', holeArray],
+      ['accessor', accessorArray],
+      ['symbol', symbolArray],
+      ['extra string', extraArray],
+      ['non-Array prototype', nonArrayPrototype],
+      ['nonwritable index', indexNotWritable],
+      ['nonenumerable index', indexNotEnumerable],
+      ['nonconfigurable index', indexNotConfigurable],
+      ['nonwritable length', lengthNotWritable],
+      ['transparent proxy', transparentProxy],
+      ['revoked proxy', revoked.proxy],
+      ['empty id', ['']],
+      ['non-string id', [1]],
+      ['overlong UTF-8 id', [`${maximumUtf8Id}a`]],
+      [
+        '10,001 distinct ids',
+        Array.from({ length: 10_001 }, (_, index) => `id-${index}`),
+      ],
+      ['10,001 duplicate ids', Array.from({ length: 10_001 }, () => 'same')],
+    ];
+    for (const [label, value] of malformedRows) {
+      let error: unknown;
+      try {
+        await client.existingDurableObjectNamespaceIds(value as never);
+      } catch (caught) {
+        error = caught;
+      }
+      expect({ label, error: (error as Error | undefined)?.message }).toEqual({
+        label,
+        error: 'Durable Object namespace ID inventory is malformed',
+      });
+      expect(namespaceRequestCount(), label).toBe(priorNamespaceRequests);
+    }
+    expect(accessorReads).toBe(0);
+
+    const iteratorFailure = new Error('namespace iterator failed after match');
+    let iteratorPage = 0;
+    const iteratorClient = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
+      dispatchNamespace: 'fleet',
+      fetch: async () => {
+        iteratorPage += 1;
+        if (iteratorPage === 1) {
+          return pageArray([{ id: 'ns-wfp', script: 'fleet-wfp' }], {
+            page: 1,
+            per_page: 1,
+            count: 1,
+            total_count: 2,
+            total_pages: 2,
+          });
+        }
+        throw iteratorFailure;
+      },
+    });
+    const iteratorRejection = await iteratorClient
+      .existingDurableObjectNamespaceIds(['ns-wfp'])
+      .catch((error: unknown) => error);
+    expect((iteratorRejection as Error & { cause?: unknown }).cause).toBe(
+      iteratorFailure,
+    );
+    expect(iteratorPage).toBeGreaterThan(1);
     expect(inventory.findings.map((finding) => finding.kind)).toEqual(
       expect.arrayContaining([
         'malformed-script-registration',

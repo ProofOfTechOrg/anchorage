@@ -12,6 +12,11 @@ import {
   withProviderDispatchTracking,
 } from '../src/cloudflare-client.js';
 import { databaseExportReceiptError } from '../src/database-export-store.js';
+import {
+  assertSupportedPlainWorkerBindings,
+  plainWorkerBindingsToProviderShape,
+  providerBindingsToPlainWorkerShape,
+} from '../src/provider-binding-inventory.js';
 import type {
   DatabaseExportReceiptIdentity,
   PlainWorkerUploadIntent,
@@ -1010,19 +1015,82 @@ describe('CloudflareProvisioningClient plain-worker plane', () => {
 
   it('maps every supported binding and all unsupported provider facts', async () => {
     const bindings: readonly unknown[] = [
-      { type: 'd1', name: 'D1_ID', id: 'id-wins', database_id: 'ignored' },
+      { type: 'd1', name: 'D1_ID', id: 'id-only' },
       { type: 'd1', name: 'D1_DATABASE', database_id: 'database-id' },
+      {
+        type: 'd1',
+        name: 'D1_EQUAL',
+        id: 'equal-id',
+        database_id: 'equal-id',
+      },
+      {
+        type: 'd1',
+        name: 'D1_SENTINEL',
+        id: '',
+        database_id: 'sentinel-id',
+      },
       {
         type: 'durable_object_namespace',
         name: 'DO',
         class_name: 'State',
         namespace_id: 'namespace',
+        script_name: 'owner',
+        dispatch_namespace: 'dispatch',
       },
-      { type: 'service', name: 'SERVICE', service: 'upstream' },
+      {
+        type: 'service',
+        name: 'SERVICE',
+        service: 'upstream',
+        entrypoint: 'Admin',
+      },
       { type: 'queue', name: 'QUEUE', queue_name: 'jobs' },
-      { type: 'r2_bucket', name: 'R2', bucket_name: 'objects' },
+      {
+        type: 'r2_bucket',
+        name: 'R2',
+        bucket_name: 'objects',
+        jurisdiction: 'eu',
+      },
       { type: 'plain_text', name: 'TEXT', text: 'value' },
       { type: 'secret_text', name: 'SECRET' },
+      {
+        type: 'd1',
+        name: 'D1_CONFLICT',
+        id: 'left',
+        database_id: 'right',
+      },
+      {
+        type: 'durable_object_namespace',
+        name: 'DO_ENV',
+        class_name: 'State',
+        namespace_id: 'namespace',
+        environment: 'production',
+      },
+      {
+        type: 'service',
+        name: 'SERVICE_ENV',
+        service: 'upstream',
+        environment: 'production',
+      },
+      {
+        type: 'r2_bucket',
+        name: 'R2_JURISDICTION',
+        bucket_name: 'objects',
+        jurisdiction: 'fedramp-high',
+      },
+      ...[
+        { type: 'd1', name: 'D1_EXTRA', database_id: 'db' },
+        {
+          type: 'durable_object_namespace',
+          name: 'DO_EXTRA',
+          class_name: 'State',
+          namespace_id: 'namespace',
+        },
+        { type: 'service', name: 'SERVICE_EXTRA', service: 'upstream' },
+        { type: 'queue', name: 'QUEUE_EXTRA', queue_name: 'jobs' },
+        { type: 'r2_bucket', name: 'R2_EXTRA', bucket_name: 'objects' },
+        { type: 'plain_text', name: 'TEXT_EXTRA', text: 'value' },
+        { type: 'secret_text', name: 'SECRET_EXTRA' },
+      ].map((binding) => ({ ...binding, extra: true })),
       null,
       { type: ' ', name: 'INVALID' },
       { type: 'ai', name: 'UNSUPPORTED' },
@@ -1040,19 +1108,58 @@ describe('CloudflareProvisioningClient plain-worker plane', () => {
     expect(viewed.versionId).toBe('v1');
     expect(viewed.tag).toBe('tag');
     expect(viewed.bindings).toEqual<readonly PlainWorkerVersionBinding[]>([
-      { type: 'd1', name: 'D1_ID', databaseId: 'id-wins' },
+      { type: 'd1', name: 'D1_ID', databaseId: 'id-only' },
       { type: 'd1', name: 'D1_DATABASE', databaseId: 'database-id' },
+      { type: 'd1', name: 'D1_EQUAL', databaseId: 'equal-id' },
+      { type: 'd1', name: 'D1_SENTINEL', databaseId: 'sentinel-id' },
       {
         type: 'durable-object',
         name: 'DO',
         className: 'State',
         namespaceId: 'namespace',
+        scriptName: 'owner',
+        dispatchNamespace: 'dispatch',
       },
-      { type: 'service', name: 'SERVICE', service: 'upstream' },
+      {
+        type: 'service',
+        name: 'SERVICE',
+        service: 'upstream',
+        entrypoint: 'Admin',
+      },
       { type: 'queue-producer', name: 'QUEUE', queueName: 'jobs' },
-      { type: 'r2-bucket', name: 'R2', bucketName: 'objects' },
+      {
+        type: 'r2-bucket',
+        name: 'R2',
+        bucketName: 'objects',
+        jurisdiction: 'eu',
+      },
       { type: 'plain-text', name: 'TEXT', value: 'value' },
       { type: 'secret-text', name: 'SECRET' },
+      ...[
+        ['D1_CONFLICT', 'd1'],
+        ['DO_ENV', 'durable_object_namespace'],
+        ['SERVICE_ENV', 'service'],
+        ['R2_JURISDICTION', 'r2_bucket'],
+        ['D1_EXTRA', 'd1'],
+        ['DO_EXTRA', 'durable_object_namespace'],
+        ['SERVICE_EXTRA', 'service'],
+        ['QUEUE_EXTRA', 'queue'],
+        ['R2_EXTRA', 'r2_bucket'],
+        ['TEXT_EXTRA', 'plain_text'],
+        ['SECRET_EXTRA', 'secret_text'],
+      ].map(([name, providerType]) => ({
+        type: 'unsupported' as const,
+        name,
+        providerType: providerType as
+          | 'd1'
+          | 'durable_object_namespace'
+          | 'service'
+          | 'queue'
+          | 'r2_bucket'
+          | 'plain_text'
+          | 'secret_text',
+        issue: 'malformed-supported-binding' as const,
+      })),
       { type: 'unsupported', name: undefined, issue: 'not-object' },
       {
         type: 'unsupported',
@@ -1067,6 +1174,93 @@ describe('CloudflareProvisioningClient plain-worker plane', () => {
         issue: 'unsupported-type',
       },
     ]);
+    expect(
+      plainWorkerBindingsToProviderShape(viewed.bindings.slice(0, 10)),
+    ).toEqual([
+      { type: 'd1', name: 'D1_ID', id: 'id-only' },
+      { type: 'd1', name: 'D1_DATABASE', id: 'database-id' },
+      { type: 'd1', name: 'D1_EQUAL', id: 'equal-id' },
+      { type: 'd1', name: 'D1_SENTINEL', id: 'sentinel-id' },
+      {
+        type: 'durable_object_namespace',
+        name: 'DO',
+        namespace_id: 'namespace',
+        class_name: 'State',
+        script_name: 'owner',
+        dispatch_namespace: 'dispatch',
+      },
+      {
+        type: 'service',
+        name: 'SERVICE',
+        service: 'upstream',
+        entrypoint: 'Admin',
+      },
+      { type: 'queue', name: 'QUEUE', queue_name: 'jobs' },
+      {
+        type: 'r2_bucket',
+        name: 'R2',
+        bucket_name: 'objects',
+        jurisdiction: 'eu',
+      },
+      { type: 'plain_text', name: 'TEXT', text: 'value' },
+      { type: 'secret_text', name: 'SECRET' },
+    ]);
+    for (const binding of viewed.bindings.filter(
+      (binding) =>
+        binding.type === 'unsupported' &&
+        binding.issue === 'malformed-supported-binding',
+    )) {
+      expect(() =>
+        assertSupportedPlainWorkerBindings([binding], 'pending version'),
+      ).toThrow(
+        'pending version has an unsupported or malformed provider binding',
+      );
+      expect(plainWorkerBindingsToProviderShape([binding])).toEqual([
+        undefined,
+      ]);
+    }
+    for (const raw of [
+      Object.assign(
+        { type: 'secret_text', name: 'SYMBOL_SECRET' },
+        { [Symbol('extra')]: true },
+      ),
+      Object.assign(
+        { type: 'plain_text', name: 'SYMBOL_TEXT', text: 'value' },
+        { [Symbol('extra')]: true },
+      ),
+    ]) {
+      const [normalized] = providerBindingsToPlainWorkerShape([raw]);
+      expect(normalized).toMatchObject({
+        type: 'unsupported',
+        issue: 'malformed-supported-binding',
+      });
+      expect(() =>
+        assertSupportedPlainWorkerBindings(
+          [normalized as PlainWorkerVersionBinding],
+          'pending version',
+        ),
+      ).toThrow(
+        'pending version has an unsupported or malformed provider binding',
+      );
+    }
+    let bindingAccessorReads = 0;
+    const accessorBinding = {
+      type: 'service',
+      name: 'ACCESSOR',
+      get service() {
+        bindingAccessorReads += 1;
+        return 'upstream';
+      },
+    };
+    expect(providerBindingsToPlainWorkerShape([accessorBinding])).toEqual([
+      {
+        type: 'unsupported',
+        name: 'ACCESSOR',
+        providerType: 'service',
+        issue: 'malformed-supported-binding',
+      },
+    ]);
+    expect(bindingAccessorReads).toBe(0);
   });
 
   it('uploads initial and staged versions with one JSON metadata part in provider order', async () => {

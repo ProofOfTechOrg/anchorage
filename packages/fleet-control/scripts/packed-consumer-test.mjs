@@ -203,6 +203,7 @@ try {
   attestConvergedActiveRoute,
   attestFleetRecordActiveRoute,
   auditFleetDrift,
+  advanceBackendSwitchDecommission,
   advanceDecommissionDeployment,
   decommissionDeployment,
   forceDecommissionDeployment,
@@ -214,7 +215,9 @@ try {
   type ActiveRouteAttestation,
   type ActiveRouteExpectation,
   type AttestConvergedActiveRouteOptions,
+  type AdvanceBackendSwitchDecommissionOptions,
   type AdvanceDecommissionDeploymentOptions,
+  type BackendSwitchProvider,
   type CloudflareApiPlainWorkerBackendOptions,
   type CloudflareApiRateCoordinator,
   type DeploymentEgressPolicy,
@@ -310,6 +313,38 @@ import { retainedExternalReleases } from '@proofoftech/fleet-control';
 import { assertImmutableDeploymentMapping } from '@proofoftech/fleet-control';
 // @ts-expect-error persisted database reconciliation is package-private.
 import { reconcilePersistedDatabase } from '@proofoftech/fleet-control';
+// @ts-expect-error backend-switch application authority is package-private.
+import type { BackendSwitchApplicationR2Authority } from '@proofoftech/fleet-control';
+// @ts-expect-error backend-switch authority projection is package-private.
+import type { BackendSwitchDecommissionAuthorityProjection } from '@proofoftech/fleet-control';
+// @ts-expect-error backend-switch snapshot hashing is package-private.
+import { backendSwitchDecommissionSnapshotDigest } from '@proofoftech/fleet-control';
+// @ts-expect-error backend-switch shell construction is package-private.
+import { backendSwitchDecommissionShell } from '@proofoftech/fleet-control';
+// @ts-expect-error backend-switch entry normalization is package-private.
+import { normalizeSwitchDecommissionEntry } from '@proofoftech/fleet-control';
+// @ts-expect-error backend-switch capability capture is package-private.
+import { captureBackendSwitchDecommissionCapabilities } from '@proofoftech/fleet-control';
+// @ts-expect-error the production backend-switch lease seam is package-private.
+import { withBackendSwitchLease } from '@proofoftech/fleet-control';
+// @ts-expect-error decommission transitions are package-private.
+import type { DecommissionIntentTransition } from '@proofoftech/fleet-control';
+// @ts-expect-error scan-step options are package-private.
+import type { DecommissionAttachmentScanStepOptions } from '@proofoftech/fleet-control';
+// @ts-expect-error scan-step execution is package-private.
+import { advanceDecommissionAttachmentScanStep } from '@proofoftech/fleet-control';
+// @ts-expect-error D1 callback options are package-private.
+import type { ReconcilePersistedDatabaseFromCallbacksOptions } from '@proofoftech/fleet-control';
+// @ts-expect-error D1 callback reconciliation is package-private.
+import { reconcilePersistedDatabaseFromCallbacks } from '@proofoftech/fleet-control';
+// @ts-expect-error D1 export reconstruction is package-private.
+import { databaseExportFromUnknown } from '@proofoftech/fleet-control';
+// @ts-expect-error D1 receipt identity construction is package-private.
+import { databaseExportReceiptIdentity } from '@proofoftech/fleet-control';
+// @ts-expect-error D1 deletion settlement is package-private.
+import { settleDatabaseDeletionUnderBarrier } from '@proofoftech/fleet-control';
+// @ts-expect-error pending ordinary inspection is package-private.
+import type { SwitchEntryPendingArtifactInspection } from '@proofoftech/fleet-control';
 // @ts-expect-error intent codec errors are package-private.
 import { DecommissionAdvanceIntentError } from '@proofoftech/fleet-control';
 // @ts-expect-error receipt capability capture is package-private.
@@ -355,6 +390,7 @@ declare const policy: DeploymentEgressPolicy;
 declare const coordinator: CloudflareApiRateCoordinator;
 declare const deploymentSpec: DeploymentSpec;
 declare const provisioningBackend: ProvisioningBackend;
+declare const backendSwitchProvider: BackendSwitchProvider;
 declare const fleetRecord: FleetRecord;
 declare const fleetStateStore: FleetStateStore;
 declare const decommissionIntent: DecommissionAdvanceIntent;
@@ -489,6 +525,9 @@ const decommissionCapabilities: readonly DecommissionAdvanceCapability[] = [
   'application-r2-empty',
   'application-r2-delete',
   'database-export-receipt',
+  'database-read',
+  'database-delete',
+  'pending-artifact-inspection',
 ];
 const optionalReceiptAuthority: string | undefined =
   decommissionCommon.databaseExportReceiptAuthority;
@@ -504,6 +543,15 @@ const decommissionAdvanceOptions: AdvanceDecommissionDeploymentOptions = {
   action: decommissionActions[0]!,
   maxProviderRequests: 12,
   randomUUID: () => '00000000-0000-4000-8000-000000000001',
+};
+const backendSwitchAdvanceOptions: AdvanceBackendSwitchDecommissionOptions = {
+  store: fleetStateStore,
+  provider: backendSwitchProvider,
+  priorSpec: deploymentSpec,
+  targetSpec: deploymentSpec,
+  action: decommissionActions[0]!,
+  maxProviderRequests: 12,
+  randomUUID: () => '00000000-0000-4000-8000-000000000003',
 };
 const decommissionAdvanceResults: readonly DecommissionAdvanceResult[] = [
   { status: 'pending', token: decommissionToken },
@@ -530,6 +578,27 @@ const decommissionAdvanceResults: readonly DecommissionAdvanceResult[] = [
 const boundedDecommissionAdvance = advanceDecommissionDeployment(
   decommissionAdvanceOptions,
 );
+const boundedBackendSwitchAdvance = advanceBackendSwitchDecommission(
+  backendSwitchAdvanceOptions,
+);
+const boundedBackendSwitchActions = decommissionActions.map((action) =>
+  advanceBackendSwitchDecommission({
+    ...backendSwitchAdvanceOptions,
+    action,
+  }),
+);
+const switchPendingArtifactCapture =
+  backendSwitchProvider.captureSwitchEntryPendingArtifact;
+const switchAttachmentScan =
+  backendSwitchProvider.advanceSwitchDecommissionAttachmentScan;
+const switchReceiptAuthority: string | undefined =
+  backendSwitchProvider.databaseExportReceiptAuthority;
+const switchReceiptExport = backendSwitchProvider.exportSwitchDatabaseReceipt;
+const switchDatabaseRead = backendSwitchProvider.getSwitchDatabase;
+const switchDatabaseOwnerRead = backendSwitchProvider.readSwitchDatabaseOwner;
+const switchDatabaseResiduals =
+  backendSwitchProvider.assertSwitchDatabaseDeletionResidualsRemoved;
+const switchDatabaseDelete = backendSwitchProvider.deleteSwitchDatabaseBounded;
 type PlainWorkerPortRecords = readonly [
   PlainWorkerCleanupOutcome,
   PlainWorkerDatabaseExportResult,
@@ -614,6 +683,17 @@ void [
   decommissionAdvanceOptions,
   decommissionAdvanceResults,
   boundedDecommissionAdvance,
+  backendSwitchAdvanceOptions,
+  boundedBackendSwitchAdvance,
+  boundedBackendSwitchActions,
+  switchPendingArtifactCapture,
+  switchAttachmentScan,
+  switchReceiptAuthority,
+  switchReceiptExport,
+  switchDatabaseRead,
+  switchDatabaseOwnerRead,
+  switchDatabaseResiduals,
+  switchDatabaseDelete,
   databaseExportIntegrity,
   databaseExportReceiptIdentity,
   legacyExportStore,
@@ -727,6 +807,7 @@ import {
   FileSystemDatabaseExportStore,
   ProvisioningError,
   WorkersForPlatformsBackend,
+  advanceBackendSwitchDecommission,
   advanceDecommissionDeployment,
   attestConvergedActiveRoute,
   attestFleetRecordActiveRoute,
@@ -756,6 +837,7 @@ assert.ok(new ActiveRouteAttestationError('probe', {}) instanceof Error);
 assert.equal(typeof attestConvergedActiveRoute, 'function');
 assert.equal(typeof attestFleetRecordActiveRoute, 'function');
 assert.equal(typeof fleetSettlementKey, 'function');
+assert.equal(typeof advanceBackendSwitchDecommission, 'function');
 assert.equal(typeof advanceDecommissionDeployment, 'function');
 const missingCapability = new DecommissionAdvanceCapabilityError(
   'attachment-scan',
@@ -785,6 +867,24 @@ assert.equal(
   missingReceiptCapability.message,
   'backend cannot write idempotent database export receipts',
 );
+for (const [capability, message] of [
+  [
+    'database-read',
+    'backend cannot read the database for bounded decommission',
+  ],
+  [
+    'database-delete',
+    'backend cannot delete the database for bounded decommission',
+  ],
+  [
+    'pending-artifact-inspection',
+    'backend cannot inspect pending ordinary Worker authority for bounded decommission',
+  ],
+]) {
+  const error = new DecommissionAdvanceCapabilityError(capability);
+  assert.equal(error.capability, capability);
+  assert.equal(error.message, message);
+}
 const restartError = new DecommissionAdvanceRestartError();
 assert.equal(restartError.name, 'DecommissionAdvanceRestartError');
 assert.equal(
@@ -802,6 +902,11 @@ for (const ErrorClass of [
 assert.equal(
   typeof CloudflareProvisioningClient.prototype
     .advanceDecommissionAttachmentScan,
+  'function',
+);
+assert.equal(
+  typeof CloudflareProvisioningClient.prototype
+    .existingDurableObjectNamespaceIds,
   'function',
 );
 const legacyClient = new CloudflareProvisioningClient({

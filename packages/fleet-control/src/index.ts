@@ -16,6 +16,8 @@ export {
   reserveApplicationR2Resources,
 } from './application-bindings.js';
 export {
+  type AdvanceBackendSwitchDecommissionOptions,
+  advanceBackendSwitchDecommission,
   BACKEND_SWITCH_SUBPHASES,
   type BackendSwitchApplicationR2Progress,
   type BackendSwitchCandidateSnapshot,

@@ -18,9 +18,14 @@ const configPath = fileURLToPath(
 const erasedDependencyTypes = new Set(['type-only', 'type-import']);
 const decommissionAdvance =
   'packages/fleet-control/src/decommission-advance.ts';
+const decommissionDatabase =
+  'packages/fleet-control/src/decommission-database.ts';
 const backendSwitch = 'packages/fleet-control/src/backend-switch.ts';
 const switchProvider =
   'packages/fleet-control/src/workers-for-platforms-backend-switch-provider.ts';
+const databaseExportStore =
+  'packages/fleet-control/src/database-export-store.ts';
+const strictPlainData = 'packages/fleet-control/src/strict-plain-data.ts';
 
 function runtimeAdjacency(report) {
   return new Map(
@@ -51,6 +56,24 @@ function reaches(adjacency, source, target) {
     pending.push(...(adjacency.get(current) ?? []));
   }
   return false;
+}
+
+function reachableFrom(adjacency, source) {
+  const reachable = new Set();
+  const pending = [...(adjacency.get(source) ?? [])];
+  while (pending.length > 0) {
+    const current = pending.shift();
+    if (current === undefined || reachable.has(current)) continue;
+    reachable.add(current);
+    pending.push(...(adjacency.get(current) ?? []));
+  }
+  return [...reachable].sort();
+}
+
+function hasCycleThrough(adjacency, source) {
+  return (adjacency.get(source) ?? []).some((target) =>
+    reaches(adjacency, target, source),
+  );
 }
 
 const controls = {
@@ -85,6 +108,8 @@ const controls = {
     'scripts/architecture-fixtures/decommission-advance-imports-provider.ts',
   'fleet-control-decommission-database-is-provider-neutral':
     'scripts/architecture-fixtures/decommission-database-imports-provider.ts',
+  'fleet-control-backend-switch-does-not-reach-its-provider':
+    'scripts/architecture-fixtures/decommission-database-imports-provider.ts',
   'fleet-control-strict-plain-data-is-import-free':
     'scripts/architecture-fixtures/decommission-state-imports-provider.ts',
   'fleet-control-ports-do-not-reach-d1-adapter':
@@ -106,10 +131,34 @@ test('every architecture rule has an executable positive control', () => {
 
 for (const [ruleName, fixture] of Object.entries(controls)) {
   test(`${ruleName} rejects its positive control`, () => {
-    const entries =
-      ruleName === 'fleet-control-decommission-advance-is-transport-neutral'
-        ? [fixture, decommissionAdvance]
-        : [fixture];
+    const entries = (() => {
+      if (
+        ruleName === 'fleet-control-decommission-advance-is-transport-neutral'
+      ) {
+        return [fixture, decommissionAdvance];
+      }
+      if (
+        ruleName === 'fleet-control-decommission-database-is-provider-neutral'
+      ) {
+        return [
+          fixture,
+          decommissionAdvance,
+          decommissionDatabase,
+          backendSwitch,
+        ];
+      }
+      if (
+        ruleName === 'fleet-control-backend-switch-does-not-reach-its-provider'
+      ) {
+        return [
+          fixture,
+          decommissionAdvance,
+          decommissionDatabase,
+          backendSwitch,
+        ];
+      }
+      return [fixture];
+    })();
     const args = [
       cli,
       '--config',
@@ -183,7 +232,10 @@ for (const [ruleName, fixture] of Object.entries(controls)) {
     if (
       ruleName === 'fleet-control-decommission-database-is-provider-neutral'
     ) {
-      assert.deepEqual([...new Set(violations)], [ruleName]);
+      assert.deepEqual([...new Set(violations)].sort(), [
+        'fleet-control-backend-switch-does-not-reach-its-provider',
+        'fleet-control-decommission-database-is-provider-neutral',
+      ]);
       for (const target of [
         'packages/fleet-control/src/cloudflare-client.ts',
         switchProvider,
@@ -194,6 +246,38 @@ for (const [ruleName, fixture] of Object.entries(controls)) {
               violation.rule.name === ruleName && violation.to === target,
           ),
           `decommission database control did not reject ${target}`,
+        );
+      }
+      const adjacency = runtimeAdjacency(report);
+      assert.deepEqual(reachableFrom(adjacency, decommissionDatabase), [
+        databaseExportStore,
+        strictPlainData,
+      ]);
+      assert.equal(
+        adjacency.get(fixture)?.includes(backendSwitch) ?? false,
+        false,
+        'erased fixture edge entered the runtime adjacency map',
+      );
+    }
+    if (
+      ruleName === 'fleet-control-backend-switch-does-not-reach-its-provider'
+    ) {
+      assert.deepEqual([...new Set(violations)].sort(), [
+        'fleet-control-backend-switch-does-not-reach-its-provider',
+        'fleet-control-decommission-database-is-provider-neutral',
+      ]);
+      const adjacency = runtimeAdjacency(report);
+      assert.equal(reaches(adjacency, backendSwitch, switchProvider), false);
+      for (const source of [
+        decommissionAdvance,
+        decommissionDatabase,
+        backendSwitch,
+        switchProvider,
+      ]) {
+        assert.equal(
+          hasCycleThrough(adjacency, source),
+          false,
+          `${source} entered a runtime cycle`,
         );
       }
     }

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { VersionCreateParams } from 'cloudflare/resources/workers/scripts/versions';
-import { readField, readStringField } from './json-field-reads.js';
 import type {
   OrdinaryWorkerDeploymentVersion,
   PlainWorkerUploadIntent,
@@ -16,8 +15,8 @@ export function providerBindingsToPlainWorkerShape(
     if (!binding || typeof binding !== 'object' || Array.isArray(binding)) {
       return { type: 'unsupported', name: undefined, issue: 'not-object' };
     }
-    const name = readStringField(binding, 'name');
-    const rawType = readField(binding, 'type');
+    const name = ownDataStringField(binding, 'name');
+    const rawType = ownDataField(binding, 'type');
     if (
       typeof rawType !== 'string' ||
       rawType.length === 0 ||
@@ -32,46 +31,172 @@ export function providerBindingsToPlainWorkerShape(
     }
     switch (rawType) {
       case 'd1': {
-        const id =
-          readField(binding, 'id') ?? readField(binding, 'database_id');
+        if (
+          !hasExactSupportedBindingKeys(binding, {
+            required: ['type', 'name'],
+            optional: ['database_id', 'id'],
+            requireOneOf: ['database_id', 'id'],
+          })
+        ) {
+          return malformedSupportedBinding(name, rawType);
+        }
+        const databaseId = validNonemptyString(
+          ownDataField(binding, 'database_id'),
+        );
+        const legacyIdValue = ownDataField(binding, 'id');
+        const legacyId = validNonemptyString(legacyIdValue);
+        const hasDatabaseId = Object.hasOwn(binding, 'database_id');
+        const hasLegacyId = Object.hasOwn(binding, 'id');
+        if (
+          (hasDatabaseId && databaseId === undefined) ||
+          (hasLegacyId &&
+            legacyId === undefined &&
+            !(hasDatabaseId && legacyIdValue === '')) ||
+          (databaseId !== undefined &&
+            legacyId !== undefined &&
+            databaseId !== legacyId)
+        ) {
+          return malformedSupportedBinding(name, rawType);
+        }
         return {
           type: 'd1',
           name,
-          databaseId: typeof id === 'string' ? id : undefined,
+          databaseId: databaseId ?? legacyId,
         };
       }
-      case 'durable_object_namespace':
+      case 'durable_object_namespace': {
+        if (
+          !hasExactSupportedBindingKeys(binding, {
+            required: ['type', 'name', 'class_name', 'namespace_id'],
+            optional: ['script_name', 'dispatch_namespace', 'environment'],
+          }) ||
+          Object.hasOwn(binding, 'environment')
+        ) {
+          return malformedSupportedBinding(name, rawType);
+        }
+        const className = validNonemptyString(
+          ownDataField(binding, 'class_name'),
+        );
+        const namespaceId = validNonemptyString(
+          ownDataField(binding, 'namespace_id'),
+        );
+        const scriptName = optionalNonemptyString(binding, 'script_name');
+        const dispatchNamespace = optionalNonemptyString(
+          binding,
+          'dispatch_namespace',
+        );
+        if (
+          className === undefined ||
+          namespaceId === undefined ||
+          scriptName === INVALID_OPTIONAL_STRING ||
+          dispatchNamespace === INVALID_OPTIONAL_STRING
+        ) {
+          return malformedSupportedBinding(name, rawType);
+        }
         return {
           type: 'durable-object',
           name,
-          className: readStringField(binding, 'class_name'),
-          namespaceId: readStringField(binding, 'namespace_id'),
+          className,
+          namespaceId,
+          ...(scriptName === undefined ? {} : { scriptName }),
+          ...(dispatchNamespace === undefined ? {} : { dispatchNamespace }),
         };
-      case 'service':
+      }
+      case 'service': {
+        if (
+          !hasExactSupportedBindingKeys(binding, {
+            required: ['type', 'name', 'service'],
+            optional: ['entrypoint', 'environment'],
+          }) ||
+          Object.hasOwn(binding, 'environment')
+        ) {
+          return malformedSupportedBinding(name, rawType);
+        }
+        const service = validNonemptyString(ownDataField(binding, 'service'));
+        const entrypoint = optionalNonemptyString(binding, 'entrypoint');
+        if (service === undefined || entrypoint === INVALID_OPTIONAL_STRING) {
+          return malformedSupportedBinding(name, rawType);
+        }
         return {
           type: 'service',
           name,
-          service: readStringField(binding, 'service'),
+          service,
+          ...(entrypoint === undefined ? {} : { entrypoint }),
         };
-      case 'queue':
+      }
+      case 'queue': {
+        if (
+          !hasExactSupportedBindingKeys(binding, {
+            required: ['type', 'name', 'queue_name'],
+          })
+        ) {
+          return malformedSupportedBinding(name, rawType);
+        }
+        const queueName = validNonemptyString(
+          ownDataField(binding, 'queue_name'),
+        );
+        if (queueName === undefined) {
+          return malformedSupportedBinding(name, rawType);
+        }
         return {
           type: 'queue-producer',
           name,
-          queueName: readStringField(binding, 'queue_name'),
+          queueName,
         };
-      case 'r2_bucket':
+      }
+      case 'r2_bucket': {
+        if (
+          !hasExactSupportedBindingKeys(binding, {
+            required: ['type', 'name', 'bucket_name'],
+            optional: ['jurisdiction'],
+          })
+        ) {
+          return malformedSupportedBinding(name, rawType);
+        }
+        const bucketName = validNonemptyString(
+          ownDataField(binding, 'bucket_name'),
+        );
+        const jurisdictionValue = ownDataField(binding, 'jurisdiction');
+        const jurisdiction =
+          jurisdictionValue === 'eu' || jurisdictionValue === 'fedramp'
+            ? jurisdictionValue
+            : undefined;
+        if (
+          bucketName === undefined ||
+          (Object.hasOwn(binding, 'jurisdiction') && jurisdiction === undefined)
+        ) {
+          return malformedSupportedBinding(name, rawType);
+        }
         return {
           type: 'r2-bucket',
           name,
-          bucketName: readStringField(binding, 'bucket_name'),
+          bucketName,
+          ...(jurisdiction === undefined ? {} : { jurisdiction }),
         };
-      case 'plain_text':
+      }
+      case 'plain_text': {
+        if (
+          !hasExactSupportedBindingKeys(binding, {
+            required: ['type', 'name', 'text'],
+          }) ||
+          typeof ownDataField(binding, 'text') !== 'string'
+        ) {
+          return malformedSupportedBinding(name, rawType);
+        }
         return {
           type: 'plain-text',
           name,
-          value: readStringField(binding, 'text'),
+          value: ownDataStringField(binding, 'text'),
         };
+      }
       case 'secret_text':
+        if (
+          !hasExactSupportedBindingKeys(binding, {
+            required: ['type', 'name'],
+          })
+        ) {
+          return malformedSupportedBinding(name, rawType);
+        }
         return { type: 'secret-text', name };
       default:
         return {
@@ -82,6 +207,78 @@ export function providerBindingsToPlainWorkerShape(
         };
     }
   });
+}
+
+type SupportedProviderBindingType =
+  | 'd1'
+  | 'durable_object_namespace'
+  | 'service'
+  | 'queue'
+  | 'r2_bucket'
+  | 'plain_text'
+  | 'secret_text';
+
+function malformedSupportedBinding(
+  name: string | undefined,
+  providerType: SupportedProviderBindingType,
+): PlainWorkerVersionBinding {
+  return {
+    type: 'unsupported',
+    name,
+    providerType,
+    issue: 'malformed-supported-binding',
+  };
+}
+
+function ownDataField(binding: object, field: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(binding, field);
+  return descriptor && 'value' in descriptor ? descriptor.value : undefined;
+}
+
+function ownDataStringField(
+  binding: object,
+  field: string,
+): string | undefined {
+  const value = ownDataField(binding, field);
+  return typeof value === 'string' ? value : undefined;
+}
+
+function hasExactSupportedBindingKeys(
+  binding: object,
+  options: Readonly<{
+    required: readonly string[];
+    optional?: readonly string[];
+    requireOneOf?: readonly string[];
+  }>,
+): boolean {
+  const keys = Reflect.ownKeys(binding);
+  if (keys.some((key) => typeof key !== 'string')) return false;
+  const allowed = new Set([...options.required, ...(options.optional ?? [])]);
+  const stringKeys = keys as string[];
+  return (
+    stringKeys.every((key) => allowed.has(key)) &&
+    options.required.every((key) => stringKeys.includes(key)) &&
+    (options.requireOneOf === undefined ||
+      options.requireOneOf.some((key) => stringKeys.includes(key)))
+  );
+}
+
+function validNonemptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 && value === value.trim()
+    ? value
+    : undefined;
+}
+
+const INVALID_OPTIONAL_STRING = Symbol('invalid optional string');
+
+function optionalNonemptyString(
+  binding: object,
+  field: string,
+): string | undefined | typeof INVALID_OPTIONAL_STRING {
+  if (!Object.hasOwn(binding, field)) return undefined;
+  return (
+    validNonemptyString(ownDataField(binding, field)) ?? INVALID_OPTIONAL_STRING
+  );
 }
 
 export function assertOrdinaryWorkerDeploymentVersions(
@@ -282,12 +479,21 @@ export function plainWorkerBindingsToProviderShape(
           name: binding.name,
           namespace_id: binding.namespaceId,
           class_name: binding.className,
+          ...(binding.scriptName === undefined
+            ? {}
+            : { script_name: binding.scriptName }),
+          ...(binding.dispatchNamespace === undefined
+            ? {}
+            : { dispatch_namespace: binding.dispatchNamespace }),
         };
       case 'service':
         return {
           type: 'service',
           name: binding.name,
           service: binding.service,
+          ...(binding.entrypoint === undefined
+            ? {}
+            : { entrypoint: binding.entrypoint }),
         };
       case 'queue-producer':
         return {
@@ -300,6 +506,9 @@ export function plainWorkerBindingsToProviderShape(
           type: 'r2_bucket',
           name: binding.name,
           bucket_name: binding.bucketName,
+          ...(binding.jurisdiction === undefined
+            ? {}
+            : { jurisdiction: binding.jurisdiction }),
         };
       case 'plain-text':
         return {
@@ -311,6 +520,7 @@ export function plainWorkerBindingsToProviderShape(
         return { type: 'secret_text', name: binding.name };
       case 'unsupported':
         if (binding.issue === 'not-object') return undefined;
+        if (binding.issue === 'malformed-supported-binding') return undefined;
         // For `invalid-type` the reconstructed type changes no message (either spelling
         // fails the type check); for `unsupported-type` it preserves the pre-port
         // `unsupported or malformed` refusal instead of an index-based `no valid type`.
@@ -327,6 +537,17 @@ export function assertSupportedPlainWorkerBindings(
   bindings: readonly PlainWorkerVersionBinding[],
   context: string,
 ): readonly ProviderBindingIdentity[] {
+  if (
+    bindings.some(
+      (binding) =>
+        binding.type === 'unsupported' &&
+        binding.issue === 'malformed-supported-binding',
+    )
+  ) {
+    throw new Error(
+      `${context} has an unsupported or malformed provider binding`,
+    );
+  }
   return assertSupportedProviderBindings(
     plainWorkerBindingsToProviderShape(bindings),
     new Set([

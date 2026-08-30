@@ -7,6 +7,8 @@ import {
 } from './cloudflare-worker-attachment-scan-state.js';
 import { cloneBoundedPlainData } from './strict-plain-data.js';
 import type {
+  BackendSwitchIntent,
+  BackendSwitchSubphase,
   DecommissionAdvanceIntent,
   DecommissionAdvanceToken,
   DecommissionAdvanceTokenClassification,
@@ -19,6 +21,7 @@ import type {
   FleetRecord,
   NormalDecommissionLifecyclePhase,
 } from './types.js';
+import { BACKEND_SWITCH_SUBPHASES } from './types.js';
 
 export const DECOMMISSION_INTENT_BYTE_BOUND = 96 * 1024;
 const TOKEN_BYTE_BOUND = 1024;
@@ -248,6 +251,114 @@ function migrationCarrier(
   return { digest: source.desiredSpecDigest, present: false };
 }
 
+/** @internal Maps exact switch progress to its coarse decommission lifecycle. */
+export function backendSwitchDecommissionLifecyclePhase(
+  subphase: BackendSwitchSubphase,
+  entryLifecycle: NormalDecommissionLifecyclePhase | 'decommissioned',
+): NormalDecommissionLifecyclePhase | 'decommissioned' {
+  if (subphase === 'decommissioned') return 'decommissioned';
+  if (subphase === 'decommission-traffic-authorized') return 'decommissioning';
+  if (
+    subphase === 'decommission-traffic-removed' ||
+    subphase === 'decommission-candidate-authorized' ||
+    subphase === 'decommission-candidate-removed' ||
+    subphase === 'decommission-bridge-authorized'
+  ) {
+    return 'traffic-removed';
+  }
+  if (subphase === 'decommission-bridge-removed') {
+    return 'platform-resources-deleted';
+  }
+  if (subphase === 'decommission-application-r2-authorized') {
+    return 'application-resources-deleting';
+  }
+  if (
+    subphase === 'decommission-application-r2-removed' ||
+    subphase === 'decommission-export-authorized'
+  ) {
+    return 'application-resources-deleted';
+  }
+  if (subphase === 'decommission-exported') return 'database-exported';
+  if (subphase === 'decommission-database-authorized') {
+    return 'database-deleting';
+  }
+  return entryLifecycle;
+}
+
+function applicationResourceProgressMatches(
+  source: FleetRecord,
+  intent: BackendSwitchIntent,
+): boolean {
+  const progress = intent.applicationR2Progress;
+  if (!progress) {
+    return (
+      BACKEND_SWITCH_SUBPHASES.indexOf(intent.subphase) <
+      BACKEND_SWITCH_SUBPHASES.indexOf('decommission-application-r2-authorized')
+    );
+  }
+  return (
+    JSON.stringify(source.applicationResources ?? []) ===
+    JSON.stringify(
+      progress.map(({ resource, subphase }) => ({
+        ...resource,
+        state: subphase,
+      })),
+    )
+  );
+}
+
+function parseBackendSwitchMode(
+  mode: Record<string, unknown>,
+  source: FleetRecord,
+  lifecyclePhase: NormalDecommissionLifecyclePhase | 'decommissioned',
+  stored: DecommissionRecordIdentity,
+): DecommissionOperationIdentity {
+  exactKeys(mode, [
+    'kind',
+    'priorSpecDigest',
+    'targetSpecDigest',
+    'decommissionSnapshotSha256',
+    'backendSwitchSubphase',
+  ]);
+  const intent = source.backendSwitchIntent;
+  const current = intent?.subphase;
+  const entry = mode.backendSwitchSubphase;
+  if (
+    mode.kind !== 'backend-switch' ||
+    !intent ||
+    !intent.decommissionSnapshot ||
+    !intent.decommissionSnapshotSha256 ||
+    !intent.decommissionEntrySubphase ||
+    !sha256(mode.priorSpecDigest) ||
+    mode.priorSpecDigest !== intent.prior.specDigest ||
+    !sha256(mode.targetSpecDigest) ||
+    mode.targetSpecDigest !== intent.targetSpecDigest ||
+    !sha256(mode.decommissionSnapshotSha256) ||
+    mode.decommissionSnapshotSha256 !== intent.decommissionSnapshotSha256 ||
+    typeof entry !== 'string' ||
+    !BACKEND_SWITCH_SUBPHASES.includes(entry as BackendSwitchSubphase) ||
+    entry !== intent.decommissionEntrySubphase ||
+    !current ||
+    BACKEND_SWITCH_SUBPHASES.indexOf(current) <
+      BACKEND_SWITCH_SUBPHASES.indexOf(entry as BackendSwitchSubphase) ||
+    backendSwitchDecommissionLifecyclePhase(current, lifecyclePhase) !==
+      lifecyclePhase ||
+    !applicationResourceProgressMatches(source, intent)
+  ) {
+    return malformed();
+  }
+  return {
+    record: stored,
+    mode: {
+      kind: 'backend-switch',
+      priorSpecDigest: mode.priorSpecDigest,
+      targetSpecDigest: mode.targetSpecDigest,
+      decommissionSnapshotSha256: mode.decommissionSnapshotSha256,
+      backendSwitchSubphase: entry as BackendSwitchSubphase,
+    },
+  };
+}
+
 function parseIdentity(
   value: unknown,
   source: FleetRecord,
@@ -257,7 +368,9 @@ function parseIdentity(
   exactKeys(candidate, ['record', 'mode']);
   const stored = parseRecordIdentity(candidate.record, source);
   const mode = plainRecord(candidate.mode);
-  if (mode.kind === 'backend-switch') return malformed();
+  if (mode.kind === 'backend-switch') {
+    return parseBackendSwitchMode(mode, source, lifecyclePhase, stored);
+  }
   exactKeys(mode, ['kind', 'requestedSpecDigest', 'entryLifecyclePhase']);
   if (
     mode.kind !== 'normal' ||
@@ -471,7 +584,11 @@ function parseIntentCommon(
   };
 }
 
-function assertCompleteRecord(source: FleetRecord): void {
+function assertCompleteRecord(
+  source: FleetRecord,
+  mode: DecommissionOperationIdentity['mode'],
+): void {
+  const switchIntent = source.backendSwitchIntent;
   if (
     source.phase !== 'decommissioned' ||
     (source.applicationResources ?? []).some(
@@ -487,7 +604,18 @@ function assertCompleteRecord(source: FleetRecord): void {
     source.rollbackRelease !== undefined ||
     source.retiringRelease !== undefined ||
     source.migrationIntent !== undefined ||
-    source.backendSwitchIntent !== undefined
+    (mode.kind === 'normal' && switchIntent !== undefined) ||
+    (mode.kind === 'backend-switch' &&
+      (switchIntent?.subphase !== 'decommissioned' ||
+        !switchIntent.databaseExport ||
+        switchIntent.databaseExport.location !==
+          source.databaseExportLocation ||
+        switchIntent.databaseExport.sha256 !== source.databaseExportSha256 ||
+        switchIntent.databaseExport.size !== source.databaseExportSize ||
+        !applicationResourceProgressMatches(source, switchIntent) ||
+        (switchIntent.applicationR2Progress ?? []).some(
+          ({ subphase }) => subphase !== 'deleted',
+        )))
   ) {
     malformed();
   }
@@ -535,14 +663,19 @@ export function decommissionAdvanceIntentFromUnknown(
     ) {
       return malformed();
     }
-    assertCompleteRecord(source);
+    const identity = parseIdentity(
+      candidate.identity,
+      source,
+      'decommissioned',
+    );
+    assertCompleteRecord(source, identity.mode);
     return {
       version: 1,
       operationId: candidate.operationId,
       revision: candidate.revision,
       generation: candidate.generation,
       updatedAt: candidate.updatedAt,
-      identity: parseIdentity(candidate.identity, source, 'decommissioned'),
+      identity,
       databaseExportReceiptAuthority: candidate.databaseExportReceiptAuthority,
       lifecyclePhase: 'decommissioned',
       state: 'complete',

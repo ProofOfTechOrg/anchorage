@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it } from 'vitest';
-import { reserveApplicationR2Resources } from '../src/application-bindings.js';
+import { describe, expect, it, vi } from 'vitest';
 import {
+  applicationBindingTopology,
+  reserveApplicationR2Resources,
+} from '../src/application-bindings.js';
+import {
+  advanceBackendSwitchDecommission,
   type BackendSwitchIntent,
   type BackendSwitchProvider,
   type BridgeSnapshot,
+  backendSwitchDecommissionSnapshotDigest,
   backendSwitchIntentFromUnknown,
   decommissionBackendSwitch,
   finalizeBackendSwitch,
@@ -13,6 +18,7 @@ import {
   reconcileFinalizedBackendSwitchState,
   rollbackBackendSwitch,
   switchPlainDeploymentToWorkersForPlatforms,
+  withBackendSwitchLease,
 } from '../src/backend-switch.js';
 import {
   canonicalDeploymentEgressPolicy,
@@ -26,6 +32,7 @@ import {
 import { deploymentSpecDigest } from '../src/spec-digest.js';
 import type {
   ApplicationR2Resource,
+  DecommissionAdvanceIntent,
   DeploymentSpec,
   ExternalPlatformTargetDescription,
   ExternalReleaseSnapshot,
@@ -140,12 +147,24 @@ class MemorySwitchStore implements FleetStateStore {
   failAfterCommittedReleaseDelete = false;
   failAfterCommittedTrafficAuthorization = false;
   failAfterCommittedTrafficRemoval = false;
+  failNextPutBeforeCommit: Error | undefined;
+  failNextPutAfterCommit: Error | undefined;
+  nextGet: FleetRecord | undefined;
+  nextGetAfterCommittedFailure: FleetRecord | undefined;
+  getCalls = 0;
+  putCalls = 0;
 
   get intent(): BackendSwitchIntent | undefined {
     return this.record.backendSwitchIntent;
   }
 
   async get(): Promise<FleetRecord> {
+    this.getCalls += 1;
+    if (this.nextGet) {
+      const next = this.nextGet;
+      this.nextGet = undefined;
+      return next;
+    }
     return this.record;
   }
 
@@ -166,7 +185,20 @@ class MemorySwitchStore implements FleetStateStore {
       renew: async () => {},
       delete: async () => {},
       put: async (record) => {
+        this.putCalls += 1;
+        if (this.failNextPutBeforeCommit) {
+          const error = this.failNextPutBeforeCommit;
+          this.failNextPutBeforeCommit = undefined;
+          throw error;
+        }
         this.record = structuredClone(record);
+        if (this.failNextPutAfterCommit) {
+          const error = this.failNextPutAfterCommit;
+          this.failNextPutAfterCommit = undefined;
+          this.nextGet = this.nextGetAfterCommittedFailure;
+          this.nextGetAfterCommittedFailure = undefined;
+          throw error;
+        }
         if (record.backendSwitchIntent) {
           this.phases.push(record.backendSwitchIntent.subphase);
         }
@@ -250,18 +282,28 @@ class FakeSwitchProvider implements BackendSwitchProvider {
     stateOnly: false,
   };
 
-  async snapshotPlainDeployment(): Promise<PlainBackendSnapshot> {
+  async snapshotPlainDeployment(
+    selectedPriorSpec: DeploymentSpec,
+  ): Promise<PlainBackendSnapshot> {
     this.calls.push('snapshot');
     return {
       scriptName: priorSpec.scriptName,
       artifactVersion: 'plain-v1',
-      specDigest: deploymentSpecDigest(priorSpec),
+      specDigest: deploymentSpecDigest(selectedPriorSpec),
       databaseId: 'db-acme',
       databaseName: priorSpec.databaseName,
       durableObjectBindings: this.bridge.durableObjectBindings,
       namespaceIds: this.bridge.namespaceIds,
       secretNames: ['DEPLOYMENT_IDENTITY_SECRET', 'MAINTENANCE_ADMIN_SECRET'],
       applicationResources: this.applicationResources,
+      ...(this.applicationResources.length > 0
+        ? {
+            application: applicationBindingTopology(
+              selectedPriorSpec,
+              this.applicationResources,
+            ),
+          }
+        : {}),
       customDomain: { id: 'domain-1', hostname: priorSpec.routeHostname },
     };
   }
@@ -305,24 +347,30 @@ class FakeSwitchProvider implements BackendSwitchProvider {
     return this.failBridgeResponseOnce ? undefined : this.bridge;
   }
 
-  async ensureCandidate() {
+  async ensureCandidate(
+    input: Parameters<BackendSwitchProvider['ensureCandidate']>[0],
+  ) {
     this.calls.push('candidate');
+    const application = applicationBindingTopology(
+      input.targetSpec,
+      this.applicationResources,
+    );
     return {
       physicalScriptName: 'acme-candidate',
-      specDigest: deploymentSpecDigest(targetSpec),
+      specDigest: deploymentSpecDigest(input.targetSpec),
       artifactVersion: 'candidate-v1',
       releaseSchemaVersion: 1,
-      application: { vars: [], secrets: [], r2Buckets: [] },
+      application,
       topology: {
         durableObjectBindings: this.bridge.durableObjectBindings,
         serviceBindings: [],
         queueProducerBindings: [],
         secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
-        application: { vars: [], secrets: [], r2Buckets: [] },
+        application,
       },
       maintenance: {
         receipt: 'maintenance-receipt-v1',
-        specDigest: deploymentSpecDigest(targetSpec),
+        specDigest: deploymentSpecDigest(input.targetSpec),
       },
     };
   }
@@ -386,7 +434,6 @@ class FakeSwitchProvider implements BackendSwitchProvider {
           input.target.sharedOutboundWorkerName ?? 'fleet-shared-outbound',
       },
       phase: 'ready' as const,
-      migrationIntent: undefined,
     };
   }
   async routePlainDomainToBridge() {
@@ -554,6 +601,153 @@ function switchOptions(store: MemorySwitchStore, provider: FakeSwitchProvider) {
     secrets,
     rollbackUntil: '2099-01-01T00:00:00.000Z',
   };
+}
+
+class BoundedFakeSwitchProvider extends FakeSwitchProvider {
+  readonly databaseExportReceiptAuthority = 'test-receipts';
+  databasePresent = true;
+  scanCalls = 0;
+  receiptCalls = 0;
+  boundedDeleteCalls = 0;
+  blockScans = false;
+
+  async advanceSwitchDecommissionAttachmentScan() {
+    this.scanCalls += 1;
+    if (this.blockScans) {
+      return {
+        status: 'attached' as const,
+        attachment: {
+          plane: 'ordinary' as const,
+          scriptName: 'foreign-worker',
+        },
+        providerFetchAttemptsReserved: 1,
+      };
+    }
+    return {
+      status: 'complete' as const,
+      evidenceSha256: '7'.repeat(64),
+      evidenceCount: 2,
+      providerFetchAttemptsReserved: 1,
+    };
+  }
+
+  async exportSwitchDatabaseReceipt() {
+    this.receiptCalls += 1;
+    return {
+      databaseId: BOUNDED_DATABASE_ID,
+      location: 'r2://exports/acme-bounded.sql',
+      sha256: '6'.repeat(64),
+      size: 456,
+    };
+  }
+
+  async getSwitchDatabase() {
+    return this.databasePresent
+      ? {
+          id: BOUNDED_DATABASE_ID,
+          name: priorSpec.databaseName,
+          created: false as const,
+        }
+      : undefined;
+  }
+
+  async readSwitchDatabaseOwner() {
+    return priorSpec.tenantTag;
+  }
+
+  async assertSwitchDatabaseDeletionResidualsRemoved() {}
+
+  async deleteSwitchDatabaseBounded() {
+    this.boundedDeleteCalls += 1;
+    this.databasePresent = false;
+  }
+
+  override async exportSwitchDatabase() {
+    this.calls.push('decommission-export');
+    return {
+      databaseId: BOUNDED_DATABASE_ID,
+      location: 'r2://exports/acme-legacy.sql',
+      sha256: '5'.repeat(64),
+      size: 321,
+    };
+  }
+
+  override async deleteSwitchDatabase() {
+    this.calls.push('decommission-database');
+    this.databasePresent = false;
+  }
+}
+
+const BOUNDED_DATABASE_ID = '11111111-1111-1111-1111-111111111111';
+
+function bindBoundedDatabase(
+  store: MemorySwitchStore,
+  provider: BoundedFakeSwitchProvider,
+): void {
+  const intent = store.intent;
+  if (!intent) throw new Error('switch intent is missing');
+  const bridge = intent.bridge
+    ? { ...intent.bridge, databaseId: BOUNDED_DATABASE_ID }
+    : undefined;
+  provider.bridge = { ...provider.bridge, databaseId: BOUNDED_DATABASE_ID };
+  store.record = {
+    ...store.record,
+    databaseId: BOUNDED_DATABASE_ID,
+    backendSwitchIntent: {
+      ...intent,
+      prior: { ...intent.prior, databaseId: BOUNDED_DATABASE_ID },
+      ...(bridge ? { bridge } : {}),
+    },
+  };
+}
+
+function boundedOptions(
+  store: MemorySwitchStore,
+  provider: BoundedFakeSwitchProvider,
+  action: import('../src/decommission-advance.js').DecommissionAdvanceAction,
+  selectedTargetSpec: DeploymentSpec = targetSpec,
+  selectedPriorSpec: DeploymentSpec = priorSpec,
+) {
+  return {
+    store,
+    provider,
+    priorSpec: selectedPriorSpec,
+    targetSpec: selectedTargetSpec,
+    currentSpec: selectedTargetSpec,
+    action,
+    maxProviderRequests: 9,
+    clock: () => Date.parse('2026-08-13T00:00:00.000Z'),
+    randomUUID: () => '123e4567-e89b-42d3-a456-426614174000',
+  };
+}
+
+async function driveBoundedSwitch(
+  store: MemorySwitchStore,
+  provider: BoundedFakeSwitchProvider,
+  selectedTargetSpec: DeploymentSpec = targetSpec,
+  selectedPriorSpec: DeploymentSpec = priorSpec,
+) {
+  let action: import('../src/decommission-advance.js').DecommissionAdvanceAction =
+    {
+      kind: 'start',
+    };
+  for (let index = 0; index < 64; index += 1) {
+    const result = await advanceBackendSwitchDecommission(
+      boundedOptions(
+        store,
+        provider,
+        action,
+        selectedTargetSpec,
+        selectedPriorSpec,
+      ),
+    );
+    if (result.status === 'complete') return result;
+    if (result.status === 'blocked') {
+      throw new Error('bounded switch unexpectedly blocked');
+    }
+    action = { kind: 'continue', token: result.token };
+  }
+  throw new Error('bounded switch did not converge');
 }
 
 describe('backend switch state machine', () => {
@@ -1184,18 +1378,21 @@ describe('backend switch state machine', () => {
     const completed = await switchPlainDeploymentToWorkersForPlatforms(
       switchOptions(store, provider),
     );
+    const { bridge, candidate, ...withoutBridgeOrCandidate } = completed;
+    const { candidate: _candidate, ...withoutCandidate } = completed;
     store.record = {
       ...store.record,
       backendSwitchIntent: {
-        ...completed,
-        subphase,
         ...(subphase === 'bridge-upload-authorized'
-          ? { bridge: undefined, candidate: undefined }
+          ? withoutBridgeOrCandidate
           : subphase === 'candidate-deploy-authorized'
-            ? { candidate: undefined }
-            : {}),
+            ? withoutCandidate
+            : completed),
+        subphase,
       },
     };
+    void bridge;
+    void candidate;
     provider.calls.length = 0;
 
     const decommissioned = await decommissionBackendSwitch({
@@ -1278,7 +1475,7 @@ describe('backend switch state machine', () => {
       phase: 'migrating',
       activeRelease: priorRelease,
       ...(platformOnly
-        ? { pendingRelease: undefined, migrationPriorRelease: undefined }
+        ? {}
         : {
             pendingRelease: targetRelease,
             migrationPriorRelease: priorRelease,
@@ -1592,13 +1789,6 @@ describe('backend switch state machine', () => {
     expect(store.record.phase).toBe('decommissioning');
 
     store.failAfterCommittedReleaseDelete = true;
-    await expect(
-      decommissionBackendSwitch({ store, provider, priorSpec, targetSpec }),
-    ).rejects.toThrow(/release deletion write response lost/);
-    expect(store.intent?.decommissionSnapshot?.releases[0]?.subphase).toBe(
-      'deleted',
-    );
-
     const completed = await decommissionBackendSwitch({
       store,
       provider,
@@ -1718,6 +1908,17 @@ describe('backend switch state machine', () => {
         prior: {
           ...switched.prior,
           applicationResources: [resource],
+          application: {
+            vars: [],
+            secrets: [],
+            r2Buckets: [
+              {
+                name: resource.name,
+                bucketName: resource.bucketName,
+                jurisdiction: resource.jurisdiction,
+              },
+            ],
+          },
         },
       },
     };
@@ -1753,6 +1954,17 @@ describe('backend switch state machine', () => {
         prior: {
           ...switched.prior,
           applicationResources: [resource],
+          application: {
+            vars: [],
+            secrets: [],
+            r2Buckets: [
+              {
+                name: resource.name,
+                bucketName: resource.bucketName,
+                jurisdiction: resource.jurisdiction,
+              },
+            ],
+          },
         },
       },
     };
@@ -1788,30 +2000,62 @@ describe('backend switch state machine', () => {
 
     await expect(
       decommissionBackendSwitch({ store, provider, priorSpec, targetSpec }),
-    ).rejects.toThrow(/traffic authorization write response lost/u);
-    expect(store.intent?.subphase).toBe('decommission-traffic-authorized');
-    expect(provider.calls).not.toContain('decommission-traffic');
-
-    provider.failTrafficRemovalResponseOnce = true;
-    await expect(
-      decommissionBackendSwitch({ store, provider, priorSpec, targetSpec }),
-    ).rejects.toThrow(/switch traffic removal response lost/u);
-    expect(store.intent?.subphase).toBe('decommission-traffic-authorized');
-    expect(provider.switchTrafficRemoved).toBe(true);
-
-    store.failAfterCommittedTrafficRemoval = true;
-    await expect(
-      decommissionBackendSwitch({ store, provider, priorSpec, targetSpec }),
-    ).rejects.toThrow(/traffic removal write response lost/u);
-    expect(store.intent?.subphase).toBe('decommission-traffic-removed');
-    expect(provider.deletedReleases.size).toBe(0);
-
-    await expect(
-      decommissionBackendSwitch({ store, provider, priorSpec, targetSpec }),
     ).resolves.toMatchObject({ subphase: 'decommissioned' });
     expect(
       provider.calls.filter((call) => call === 'decommission-traffic'),
+    ).toHaveLength(1);
+
+    const providerLossStore = new MemorySwitchStore();
+    const providerLoss = new FakeSwitchProvider();
+    await switchPlainDeploymentToWorkersForPlatforms(
+      switchOptions(providerLossStore, providerLoss),
+    );
+    providerLoss.calls.length = 0;
+    providerLoss.failTrafficRemovalResponseOnce = true;
+    await expect(
+      decommissionBackendSwitch({
+        store: providerLossStore,
+        provider: providerLoss,
+        priorSpec,
+        targetSpec,
+      }),
+    ).rejects.toThrow(/switch traffic removal response lost/u);
+    expect(providerLossStore.intent?.subphase).toBe(
+      'decommission-traffic-authorized',
+    );
+    expect(providerLoss.switchTrafficRemoved).toBe(true);
+    await expect(
+      decommissionBackendSwitch({
+        store: providerLossStore,
+        provider: providerLoss,
+        priorSpec,
+        targetSpec,
+      }),
+    ).resolves.toMatchObject({ subphase: 'decommissioned' });
+    expect(
+      providerLoss.calls.filter((call) => call === 'decommission-traffic'),
     ).toHaveLength(2);
+
+    const commitLossStore = new MemorySwitchStore();
+    const commitLossProvider = new FakeSwitchProvider();
+    await switchPlainDeploymentToWorkersForPlatforms(
+      switchOptions(commitLossStore, commitLossProvider),
+    );
+    commitLossProvider.calls.length = 0;
+    commitLossStore.failAfterCommittedTrafficRemoval = true;
+    await expect(
+      decommissionBackendSwitch({
+        store: commitLossStore,
+        provider: commitLossProvider,
+        priorSpec,
+        targetSpec,
+      }),
+    ).resolves.toMatchObject({ subphase: 'decommissioned' });
+    expect(
+      commitLossProvider.calls.filter(
+        (call) => call === 'decommission-traffic',
+      ),
+    ).toHaveLength(1);
   });
 
   it('blocks switch deletion on post-removal ingress drift and reasserts after operator repair', async () => {
@@ -1863,5 +2107,1575 @@ describe('backend switch state machine', () => {
       'decommission-export',
       'decommission-database',
     ]);
+  });
+
+  it('advances one bounded backend-switch action under one stable operation', async () => {
+    const store = new MemorySwitchStore();
+    const provider = new BoundedFakeSwitchProvider();
+    await switchPlainDeploymentToWorkersForPlatforms(
+      switchOptions(store, provider),
+    );
+    bindBoundedDatabase(store, provider);
+    provider.calls.length = 0;
+
+    const started = await advanceBackendSwitchDecommission(
+      boundedOptions(store, provider, { kind: 'start' }),
+    );
+    expect(started).toMatchObject({
+      status: 'pending',
+      token: { operationId: '123e4567-e89b-42d3-a456-426614174000' },
+    });
+    expect(store.record.decommissionIntent).toMatchObject({
+      revision: 0,
+      generation: 0,
+      state: 'transitioning',
+    });
+    expect(provider.calls).toEqual([]);
+
+    Object.defineProperty(provider, 'getSwitchDatabase', {
+      configurable: true,
+      value: undefined,
+    });
+    await expect(
+      advanceBackendSwitchDecommission(
+        boundedOptions(store, provider, { kind: 'start' }),
+      ),
+    ).rejects.toMatchObject({ capability: 'database-read' });
+    Reflect.deleteProperty(provider, 'getSwitchDatabase');
+
+    if (started.status !== 'pending') throw new Error('missing start token');
+    const advanced = await advanceBackendSwitchDecommission(
+      boundedOptions(store, provider, {
+        kind: 'continue',
+        token: started.token,
+      }),
+    );
+    expect(advanced.status).toBe('pending');
+    expect(provider.calls).toEqual(['decommission-traffic']);
+    expect(store.intent?.subphase).toBe('decommission-traffic-removed');
+    await expect(
+      withBackendSwitchLease(
+        store,
+        priorSpec.tenantTag,
+        priorSpec.environment,
+        Date.now,
+        (lease) => lease.put(store.intent as BackendSwitchIntent),
+      ),
+    ).rejects.toThrow(
+      'backend switch lease put requires putOwnership when a decommission shell is present',
+    );
+
+    const currentIntent = store.intent as BackendSwitchIntent;
+    const currentRecord = structuredClone(store.record);
+    const { decommissionIntent: _shell, ...shellless } = currentRecord;
+    let refusedClockCalls = 0;
+    const currentShell = currentRecord.decommissionIntent as Exclude<
+      DecommissionAdvanceIntent,
+      { readonly state: 'complete' }
+    >;
+    const withoutOuterUpdatedAt = structuredClone(currentRecord) as Partial<
+      typeof currentRecord
+    >;
+    Reflect.deleteProperty(withoutOuterUpdatedAt, 'updatedAt');
+    const withoutShellUpdatedAt = structuredClone(currentShell) as Partial<
+      typeof currentShell
+    >;
+    Reflect.deleteProperty(withoutShellUpdatedAt, 'updatedAt');
+    const placeholderCases: readonly Readonly<{
+      label: string;
+      candidate: unknown;
+      message: string;
+    }>[] = [
+      {
+        label: 'shell removal',
+        candidate: shellless,
+        message: 'backend switch decommission record is malformed',
+      },
+      {
+        label: 'transparent proxy',
+        candidate: new Proxy(currentRecord, {}),
+        message: 'backend switch decommission record is malformed',
+      },
+      {
+        label: 'missing outer placeholder',
+        candidate: withoutOuterUpdatedAt,
+        message:
+          'backend switch lease ownership timestamp placeholder is stale',
+      },
+      {
+        label: 'invalid outer placeholder',
+        candidate: { ...currentRecord, updatedAt: 'invalid' },
+        message:
+          'backend switch lease ownership timestamp placeholder is stale',
+      },
+      {
+        label: 'stale outer placeholder',
+        candidate: {
+          ...currentRecord,
+          updatedAt: '2026-08-12T23:59:59.000Z',
+        },
+        message:
+          'backend switch lease ownership timestamp placeholder is stale',
+      },
+      {
+        label: 'missing shell placeholder',
+        candidate: {
+          ...currentRecord,
+          decommissionIntent: withoutShellUpdatedAt,
+        },
+        message:
+          'backend switch lease ownership timestamp placeholder is stale',
+      },
+      {
+        label: 'invalid shell placeholder',
+        candidate: {
+          ...currentRecord,
+          decommissionIntent: { ...currentShell, updatedAt: 'invalid' },
+        },
+        message:
+          'backend switch lease ownership timestamp placeholder is stale',
+      },
+      {
+        label: 'stale shell placeholder',
+        candidate: {
+          ...currentRecord,
+          decommissionIntent: {
+            ...currentShell,
+            updatedAt: '2026-08-12T23:59:59.000Z',
+          },
+        },
+        message:
+          'backend switch lease ownership timestamp placeholder is stale',
+      },
+      {
+        label: 'both equal stale placeholders',
+        candidate: {
+          ...currentRecord,
+          updatedAt: '2026-08-12T23:59:59.000Z',
+          decommissionIntent: {
+            ...currentShell,
+            updatedAt: '2026-08-12T23:59:59.000Z',
+          },
+        },
+        message:
+          'backend switch lease ownership timestamp placeholder is stale',
+      },
+    ];
+    for (const { label, candidate, message } of placeholderCases) {
+      const getCalls = store.getCalls;
+      const putCalls = store.putCalls;
+      await expect(
+        withBackendSwitchLease(
+          store,
+          priorSpec.tenantTag,
+          priorSpec.environment,
+          () => {
+            refusedClockCalls += 1;
+            return Date.parse('2026-08-13T00:00:01.000Z');
+          },
+          (lease) =>
+            lease.putOwnership(
+              candidate as unknown as FleetRecord,
+              currentIntent,
+            ),
+        ),
+        label,
+      ).rejects.toThrow(message);
+      expect(store.getCalls - getCalls, label).toBe(1);
+      expect(store.putCalls - putCalls, label).toBe(0);
+    }
+    expect(refusedClockCalls).toBe(0);
+
+    let successClockCalls = 0;
+    let getCalls = store.getCalls;
+    let putCalls = store.putCalls;
+    await withBackendSwitchLease(
+      store,
+      priorSpec.tenantTag,
+      priorSpec.environment,
+      () => {
+        successClockCalls += 1;
+        return Date.parse('2026-08-13T00:00:01.000Z');
+      },
+      (lease) => lease.putOwnership(lease.current(), currentIntent),
+    );
+    expect(successClockCalls).toBe(1);
+    expect(store.record.updatedAt).toBe('2026-08-13T00:00:01.000Z');
+    expect(store.record.decommissionIntent?.updatedAt).toBe(
+      store.record.updatedAt,
+    );
+    expect(store.getCalls - getCalls).toBe(1);
+    expect(store.putCalls - putCalls).toBe(1);
+
+    const precommit = new Error('switch write failed before commit');
+    store.failNextPutBeforeCommit = precommit;
+    getCalls = store.getCalls;
+    putCalls = store.putCalls;
+    let observedPrecommit: unknown;
+    try {
+      await withBackendSwitchLease(
+        store,
+        priorSpec.tenantTag,
+        priorSpec.environment,
+        () => Date.parse('2026-08-13T00:00:02.000Z'),
+        (lease) => lease.putOwnership(lease.current(), currentIntent),
+      );
+    } catch (error) {
+      observedPrecommit = error;
+    }
+    expect(observedPrecommit).toBe(precommit);
+    expect(store.record.updatedAt).toBe('2026-08-13T00:00:01.000Z');
+    expect(store.getCalls - getCalls).toBe(2);
+    expect(store.putCalls - putCalls).toBe(1);
+
+    const committedResponseLoss = new Error('switch write response lost');
+    store.failNextPutAfterCommit = committedResponseLoss;
+    getCalls = store.getCalls;
+    putCalls = store.putCalls;
+    await withBackendSwitchLease(
+      store,
+      priorSpec.tenantTag,
+      priorSpec.environment,
+      () => Date.parse('2026-08-13T00:00:03.000Z'),
+      (lease) => lease.putOwnership(lease.current(), currentIntent),
+    );
+    expect(store.record.updatedAt).toBe('2026-08-13T00:00:03.000Z');
+    expect(store.getCalls - getCalls).toBe(2);
+    expect(store.putCalls - putCalls).toBe(1);
+
+    const malformedRereadLoss = new Error(
+      'switch malformed reread response lost',
+    );
+    store.failNextPutAfterCommit = malformedRereadLoss;
+    store.nextGetAfterCommittedFailure = {
+      ...store.record,
+      routeHostname: 'foreign.example.test',
+    };
+    getCalls = store.getCalls;
+    putCalls = store.putCalls;
+    let observedMalformedReread: unknown;
+    try {
+      await withBackendSwitchLease(
+        store,
+        priorSpec.tenantTag,
+        priorSpec.environment,
+        () => Date.parse('2026-08-13T00:00:04.000Z'),
+        (lease) => lease.putOwnership(lease.current(), currentIntent),
+      );
+    } catch (error) {
+      observedMalformedReread = error;
+    }
+    expect(observedMalformedReread).toEqual(
+      new Error('backend switch decommission record is malformed'),
+    );
+    expect(observedMalformedReread).not.toBe(malformedRereadLoss);
+    expect(store.getCalls - getCalls).toBe(2);
+    expect(store.putCalls - putCalls).toBe(1);
+
+    provider.blockScans = true;
+    let blocked = await advanceBackendSwitchDecommission(
+      boundedOptions(store, provider, { kind: 'start' }),
+    );
+    for (
+      let index = 0;
+      blocked.status === 'pending' && index < 32;
+      index += 1
+    ) {
+      blocked = await advanceBackendSwitchDecommission(
+        boundedOptions(store, provider, {
+          kind: 'continue',
+          token: blocked.token,
+        }),
+      );
+    }
+    expect(blocked.status).toBe('blocked');
+    let blockedCapabilityReads = 0;
+    Object.defineProperty(provider, 'getSwitchDatabase', {
+      configurable: true,
+      get() {
+        blockedCapabilityReads += 1;
+        return BoundedFakeSwitchProvider.prototype.getSwitchDatabase;
+      },
+    });
+    const repeatedBlocked = await advanceBackendSwitchDecommission(
+      boundedOptions(store, provider, { kind: 'start' }),
+    );
+    expect(repeatedBlocked.status).toBe('blocked');
+    expect(blockedCapabilityReads).toBe(1);
+
+    Object.defineProperty(provider, 'getSwitchDatabase', {
+      configurable: true,
+      value: BoundedFakeSwitchProvider.prototype.getSwitchDatabase,
+    });
+    if (blocked.status !== 'blocked') throw new Error('missing blocked token');
+    const wrongRestartTarget: DeploymentSpec = {
+      ...targetSpec,
+      modules: [
+        { name: 'worker.js', content: 'export default { changed: true }' },
+      ],
+    };
+    getCalls = store.getCalls;
+    putCalls = store.putCalls;
+    const providerCalls = provider.calls.length;
+    await expect(
+      advanceBackendSwitchDecommission(
+        boundedOptions(
+          store,
+          provider,
+          { kind: 'restart-blocked', token: blocked.token },
+          wrongRestartTarget,
+        ),
+      ),
+    ).rejects.toThrow(
+      'backend switch target decommission spec differs from durable intent',
+    );
+    expect(store.getCalls - getCalls).toBe(1);
+    expect(store.putCalls - putCalls).toBe(0);
+    expect(provider.calls).toHaveLength(providerCalls);
+  });
+
+  it('binds one immutable switch snapshot and captured entry subphase', async () => {
+    const store = new MemorySwitchStore();
+    const provider = new BoundedFakeSwitchProvider();
+    const switched = await switchPlainDeploymentToWorkersForPlatforms(
+      switchOptions(store, provider),
+    );
+    bindBoundedDatabase(store, provider);
+
+    const started = await advanceBackendSwitchDecommission(
+      boundedOptions(store, provider, { kind: 'start' }),
+    );
+    if (started.status !== 'pending') throw new Error('missing start token');
+    const intent = store.intent;
+    const snapshot = intent?.decommissionSnapshot;
+    if (!intent || !snapshot) throw new Error('snapshot was not persisted');
+    expect(intent.decommissionEntrySubphase).toBe(switched.subphase);
+    expect(intent.decommissionSnapshotSha256).toBe(
+      backendSwitchDecommissionSnapshotDigest(snapshot),
+    );
+    expect(snapshot).toMatchObject({
+      prior: { ...switched.prior, databaseId: BOUNDED_DATABASE_ID },
+      restoredArtifactVersion: null,
+      entryPendingArtifactVersion: null,
+      entryPendingNamespaceIds: null,
+      providerTargetSpecDigest: switched.targetSpecDigest,
+    });
+    const routeAuthorityCase = async (
+      active: boolean,
+      mutation: 'outer-only' | 'snapshot-only' | 'outer-and-shell',
+    ) => {
+      const routeStore = new MemorySwitchStore();
+      const routeProvider = new BoundedFakeSwitchProvider();
+      await switchPlainDeploymentToWorkersForPlatforms(
+        switchOptions(routeStore, routeProvider),
+      );
+      bindBoundedDatabase(routeStore, routeProvider);
+      if (active) {
+        await advanceBackendSwitchDecommission(
+          boundedOptions(routeStore, routeProvider, { kind: 'start' }),
+        );
+      }
+      const routeIntent = routeStore.intent;
+      if (!routeIntent) throw new Error('route switch intent is missing');
+      const foreignRoute = 'foreign.example.test';
+      if (mutation === 'outer-only') {
+        routeStore.record = {
+          ...routeStore.record,
+          routeHostname: foreignRoute,
+        };
+      } else {
+        const routeSnapshot = routeIntent.decommissionSnapshot;
+        const routeShell = routeStore.record.decommissionIntent;
+        if (
+          !routeSnapshot ||
+          !routeShell ||
+          routeShell.state === 'complete' ||
+          routeShell.identity.mode.kind !== 'backend-switch'
+        ) {
+          throw new Error('active route authority is missing');
+        }
+        const changedSnapshot = {
+          ...routeSnapshot,
+          routeHostname: foreignRoute,
+        };
+        const changedSnapshotSha256 =
+          backendSwitchDecommissionSnapshotDigest(changedSnapshot);
+        const changedIntent = {
+          ...routeIntent,
+          decommissionSnapshot: changedSnapshot,
+          decommissionSnapshotSha256: changedSnapshotSha256,
+        };
+        routeStore.record = {
+          ...routeStore.record,
+          ...(mutation === 'outer-and-shell'
+            ? { routeHostname: foreignRoute }
+            : {}),
+          backendSwitchIntent: changedIntent,
+          decommissionIntent: {
+            ...routeShell,
+            identity: {
+              ...routeShell.identity,
+              record: {
+                ...routeShell.identity.record,
+                ...(mutation === 'outer-and-shell'
+                  ? { routeHostname: foreignRoute }
+                  : {}),
+              },
+              mode: {
+                ...routeShell.identity.mode,
+                decommissionSnapshotSha256: changedSnapshotSha256,
+              },
+            },
+          },
+        };
+      }
+      routeProvider.calls.length = 0;
+      const beforePutCalls = routeStore.putCalls;
+      await expect(
+        advanceBackendSwitchDecommission(
+          boundedOptions(routeStore, routeProvider, { kind: 'start' }),
+        ),
+        `${active ? 'active' : 'shellless'} ${mutation}`,
+      ).rejects.toThrow('backend switch decommission record is malformed');
+      expect(routeStore.putCalls - beforePutCalls).toBe(0);
+      expect(routeProvider.calls).toEqual([]);
+    };
+    await routeAuthorityCase(false, 'outer-only');
+    await routeAuthorityCase(true, 'outer-only');
+    await routeAuthorityCase(true, 'snapshot-only');
+    await routeAuthorityCase(true, 'outer-and-shell');
+    const changedRoutePrior = {
+      ...priorSpec,
+      routeHostname: 'foreign.example.test',
+    } satisfies DeploymentSpec;
+    const changedRouteTarget = {
+      ...targetSpec,
+      routeHostname: 'foreign.example.test',
+    } satisfies DeploymentSpec;
+    const beforeRouteSpecPutCalls = store.putCalls;
+    const beforeRouteSpecProviderCalls = provider.calls.length;
+    await expect(
+      advanceBackendSwitchDecommission(
+        boundedOptions(
+          store,
+          provider,
+          { kind: 'start' },
+          changedRouteTarget,
+          changedRoutePrior,
+        ),
+      ),
+    ).rejects.toThrow(
+      'backend switch prior decommission spec differs from durable intent',
+    );
+    expect(store.putCalls - beforeRouteSpecPutCalls).toBe(0);
+    expect(provider.calls).toHaveLength(beforeRouteSpecProviderCalls);
+    const legacyRouteStore = new MemorySwitchStore();
+    const legacyRouteProvider = new FakeSwitchProvider();
+    await switchPlainDeploymentToWorkersForPlatforms(
+      switchOptions(legacyRouteStore, legacyRouteProvider),
+    );
+    legacyRouteProvider.calls.length = 0;
+    const legacyRoutePutCalls = legacyRouteStore.putCalls;
+    await expect(
+      decommissionBackendSwitch({
+        store: legacyRouteStore,
+        provider: legacyRouteProvider,
+        priorSpec: changedRoutePrior,
+        targetSpec: changedRouteTarget,
+      }),
+    ).rejects.toThrow(
+      'backend switch prior decommission spec differs from durable intent',
+    );
+    expect(legacyRouteStore.putCalls - legacyRoutePutCalls).toBe(0);
+    expect(legacyRouteProvider.calls).toEqual([]);
+    const mutableProgress = {
+      ...snapshot,
+      releases: snapshot.releases.map((entry) => ({
+        ...entry,
+        subphase: 'deleted' as const,
+      })),
+    };
+    expect(backendSwitchDecommissionSnapshotDigest(mutableProgress)).toBe(
+      intent.decommissionSnapshotSha256,
+    );
+
+    for (const [label, authority] of [
+      ['empty', ''],
+      ['overbound UTF-8', 'é'.repeat(2_049)],
+    ] as const) {
+      const malformedStore = new MemorySwitchStore();
+      const malformedProvider = new BoundedFakeSwitchProvider();
+      await switchPlainDeploymentToWorkersForPlatforms(
+        switchOptions(malformedStore, malformedProvider),
+      );
+      bindBoundedDatabase(malformedStore, malformedProvider);
+      Object.defineProperty(
+        malformedProvider,
+        'databaseExportReceiptAuthority',
+        { configurable: true, value: authority },
+      );
+      await expect(
+        advanceBackendSwitchDecommission(
+          boundedOptions(malformedStore, malformedProvider, { kind: 'start' }),
+        ),
+        label,
+      ).rejects.toThrow('database export receipt capability is malformed');
+      expect(malformedStore.record.decommissionIntent, label).toBeUndefined();
+    }
+
+    const wrongSpec = {
+      ...targetSpec,
+      modules: [
+        { name: 'worker.js', content: 'export default { changed: true }' },
+      ],
+    } satisfies DeploymentSpec;
+    const wrongPriorSpec = {
+      ...priorSpec,
+      modules: [
+        { name: 'worker.js', content: 'export default { changed: true }' },
+      ],
+    } satisfies DeploymentSpec;
+    const expectAuthorityRefusal = async (input: {
+      label: string;
+      selectedStore: MemorySwitchStore;
+      selectedProvider: BoundedFakeSwitchProvider;
+      action: import('../src/decommission-advance.js').DecommissionAdvanceAction;
+      selectedPrior?: DeploymentSpec;
+      selectedTarget?: DeploymentSpec;
+      selectedCurrent?: DeploymentSpec;
+      message: string;
+    }) => {
+      const beforeGetCalls = input.selectedStore.getCalls;
+      const beforePutCalls = input.selectedStore.putCalls;
+      const beforeGeneration =
+        input.selectedStore.record.decommissionIntent?.generation;
+      const beforeProvider = {
+        calls: [...input.selectedProvider.calls],
+        scanCalls: input.selectedProvider.scanCalls,
+        receiptCalls: input.selectedProvider.receiptCalls,
+        boundedDeleteCalls: input.selectedProvider.boundedDeleteCalls,
+      };
+      let clockCalls = 0;
+      let uuidCalls = 0;
+      await expect(
+        advanceBackendSwitchDecommission({
+          ...boundedOptions(
+            input.selectedStore,
+            input.selectedProvider,
+            input.action,
+            input.selectedTarget ?? targetSpec,
+            input.selectedPrior ?? priorSpec,
+          ),
+          ...(input.selectedCurrent === undefined
+            ? {}
+            : { currentSpec: input.selectedCurrent }),
+          clock: () => {
+            clockCalls += 1;
+            return Date.parse('2026-08-13T00:00:00.000Z');
+          },
+          randomUUID: () => {
+            uuidCalls += 1;
+            return '123e4567-e89b-42d3-a456-426614174000';
+          },
+        }),
+        input.label,
+      ).rejects.toThrow(input.message);
+      expect(input.selectedStore.getCalls - beforeGetCalls, input.label).toBe(
+        1,
+      );
+      expect(input.selectedStore.putCalls - beforePutCalls, input.label).toBe(
+        0,
+      );
+      expect(
+        input.selectedStore.record.decommissionIntent?.generation,
+        input.label,
+      ).toBe(beforeGeneration);
+      expect(
+        {
+          calls: input.selectedProvider.calls,
+          scanCalls: input.selectedProvider.scanCalls,
+          receiptCalls: input.selectedProvider.receiptCalls,
+          boundedDeleteCalls: input.selectedProvider.boundedDeleteCalls,
+        },
+        input.label,
+      ).toEqual(beforeProvider);
+      expect(clockCalls, input.label).toBe(0);
+      expect(uuidCalls, input.label).toBe(0);
+    };
+    for (const [
+      label,
+      action,
+      selectedPrior,
+      selectedTarget,
+      selectedCurrent,
+      message,
+    ] of [
+      [
+        'active start prior',
+        { kind: 'start' as const },
+        wrongPriorSpec,
+        targetSpec,
+        targetSpec,
+        'backend switch prior decommission spec differs from durable intent',
+      ],
+      [
+        'active start target',
+        { kind: 'start' as const },
+        priorSpec,
+        wrongSpec,
+        targetSpec,
+        'backend switch target decommission spec differs from durable intent',
+      ],
+      [
+        'active start current',
+        { kind: 'start' as const },
+        priorSpec,
+        targetSpec,
+        wrongSpec,
+        'backend switch current decommission spec differs from durable intent',
+      ],
+      [
+        'current work prior',
+        { kind: 'continue' as const, token: started.token },
+        wrongPriorSpec,
+        targetSpec,
+        targetSpec,
+        'backend switch prior decommission spec differs from durable intent',
+      ],
+      [
+        'current work target',
+        { kind: 'continue' as const, token: started.token },
+        priorSpec,
+        wrongSpec,
+        targetSpec,
+        'backend switch target decommission spec differs from durable intent',
+      ],
+      [
+        'current work current',
+        { kind: 'continue' as const, token: started.token },
+        priorSpec,
+        targetSpec,
+        wrongSpec,
+        'backend switch current decommission spec differs from durable intent',
+      ],
+    ] as const) {
+      await expectAuthorityRefusal({
+        label,
+        selectedStore: store,
+        selectedProvider: provider,
+        action,
+        selectedPrior,
+        selectedTarget,
+        selectedCurrent,
+        message,
+      });
+    }
+
+    const priorDesiredStore = new MemorySwitchStore();
+    const priorDesiredProvider = new BoundedFakeSwitchProvider();
+    await switchPlainDeploymentToWorkersForPlatforms(
+      switchOptions(priorDesiredStore, priorDesiredProvider),
+    );
+    bindBoundedDatabase(priorDesiredStore, priorDesiredProvider);
+    priorDesiredStore.record = {
+      ...priorDesiredStore.record,
+      desiredSpecDigest: deploymentSpecDigest(priorSpec),
+    };
+    const {
+      currentSpec: _shelllessCurrentSpec,
+      ...shelllessPriorDesiredOptions
+    } = boundedOptions(priorDesiredStore, priorDesiredProvider, {
+      kind: 'start',
+    });
+    const priorDesiredStarted = await advanceBackendSwitchDecommission(
+      shelllessPriorDesiredOptions,
+    );
+    expect(priorDesiredStarted.status).toBe('pending');
+    const { currentSpec: _activeCurrentSpec, ...activePriorDesiredOptions } =
+      boundedOptions(priorDesiredStore, priorDesiredProvider, {
+        kind: 'start',
+      });
+    await expect(
+      advanceBackendSwitchDecommission(activePriorDesiredOptions),
+    ).resolves.toMatchObject({ status: 'pending' });
+
+    const missingCurrentStore = new MemorySwitchStore();
+    const missingCurrentProvider = new BoundedFakeSwitchProvider();
+    await switchPlainDeploymentToWorkersForPlatforms(
+      switchOptions(missingCurrentStore, missingCurrentProvider),
+    );
+    bindBoundedDatabase(missingCurrentStore, missingCurrentProvider);
+    missingCurrentStore.record = {
+      ...missingCurrentStore.record,
+      desiredSpecDigest: 'e'.repeat(64),
+    };
+    const { currentSpec: _missingCurrentSpec, ...missingCurrentOptions } =
+      boundedOptions(missingCurrentStore, missingCurrentProvider, {
+        kind: 'start',
+      });
+    const missingCurrentPutCalls = missingCurrentStore.putCalls;
+    await expect(
+      advanceBackendSwitchDecommission(missingCurrentOptions),
+    ).rejects.toThrow(
+      'backend switch decommission requires the exact current specification',
+    );
+    expect(missingCurrentStore.putCalls - missingCurrentPutCalls).toBe(0);
+
+    const blockedAuthorityStore = new MemorySwitchStore();
+    const blockedAuthorityProvider = new BoundedFakeSwitchProvider();
+    await switchPlainDeploymentToWorkersForPlatforms(
+      switchOptions(blockedAuthorityStore, blockedAuthorityProvider),
+    );
+    bindBoundedDatabase(blockedAuthorityStore, blockedAuthorityProvider);
+    blockedAuthorityProvider.blockScans = true;
+    let blockedAuthority = await advanceBackendSwitchDecommission(
+      boundedOptions(blockedAuthorityStore, blockedAuthorityProvider, {
+        kind: 'start',
+      }),
+    );
+    for (
+      let index = 0;
+      blockedAuthority.status === 'pending' && index < 32;
+      index += 1
+    ) {
+      blockedAuthority = await advanceBackendSwitchDecommission(
+        boundedOptions(blockedAuthorityStore, blockedAuthorityProvider, {
+          kind: 'continue',
+          token: blockedAuthority.token,
+        }),
+      );
+    }
+    if (blockedAuthority.status !== 'blocked') {
+      throw new Error('authority fixture did not block');
+    }
+    for (const [
+      label,
+      action,
+      selectedPrior,
+      selectedTarget,
+      selectedCurrent,
+      message,
+    ] of [
+      [
+        'blocked start prior',
+        { kind: 'start' as const },
+        wrongPriorSpec,
+        targetSpec,
+        targetSpec,
+        'backend switch prior decommission spec differs from durable intent',
+      ],
+      [
+        'blocked start target',
+        { kind: 'start' as const },
+        priorSpec,
+        wrongSpec,
+        targetSpec,
+        'backend switch target decommission spec differs from durable intent',
+      ],
+      [
+        'blocked start current',
+        { kind: 'start' as const },
+        priorSpec,
+        targetSpec,
+        wrongSpec,
+        'backend switch current decommission spec differs from durable intent',
+      ],
+      [
+        'restart blocked prior',
+        { kind: 'restart-blocked' as const, token: blockedAuthority.token },
+        wrongPriorSpec,
+        targetSpec,
+        targetSpec,
+        'backend switch prior decommission spec differs from durable intent',
+      ],
+      [
+        'restart blocked target',
+        { kind: 'restart-blocked' as const, token: blockedAuthority.token },
+        priorSpec,
+        wrongSpec,
+        targetSpec,
+        'backend switch target decommission spec differs from durable intent',
+      ],
+      [
+        'restart blocked current',
+        { kind: 'restart-blocked' as const, token: blockedAuthority.token },
+        priorSpec,
+        targetSpec,
+        wrongSpec,
+        'backend switch current decommission spec differs from durable intent',
+      ],
+    ] as const) {
+      await expectAuthorityRefusal({
+        label,
+        selectedStore: blockedAuthorityStore,
+        selectedProvider: blockedAuthorityProvider,
+        action,
+        selectedPrior,
+        selectedTarget,
+        selectedCurrent,
+        message,
+      });
+    }
+
+    const receiptStore = new MemorySwitchStore();
+    const receiptProvider = new BoundedFakeSwitchProvider();
+    await switchPlainDeploymentToWorkersForPlatforms(
+      switchOptions(receiptStore, receiptProvider),
+    );
+    bindBoundedDatabase(receiptStore, receiptProvider);
+    let receiptResult = await advanceBackendSwitchDecommission(
+      boundedOptions(receiptStore, receiptProvider, { kind: 'start' }),
+    );
+    for (
+      let index = 0;
+      receiptStore.record.decommissionIntent?.databaseExportReceiptAuthority ===
+        undefined &&
+      receiptResult.status === 'pending' &&
+      index < 32;
+      index += 1
+    ) {
+      receiptResult = await advanceBackendSwitchDecommission(
+        boundedOptions(receiptStore, receiptProvider, {
+          kind: 'continue',
+          token: receiptResult.token,
+        }),
+      );
+    }
+    expect(
+      receiptStore.record.decommissionIntent?.databaseExportReceiptAuthority,
+    ).toBe('test-receipts');
+    Object.defineProperty(receiptProvider, 'databaseExportReceiptAuthority', {
+      configurable: true,
+      value: 'changed-receipts',
+    });
+    await expectAuthorityRefusal({
+      label: 'active start selected receipt',
+      selectedStore: receiptStore,
+      selectedProvider: receiptProvider,
+      action: { kind: 'start' },
+      selectedCurrent: targetSpec,
+      message:
+        'database export receipt authority differs from configured authority',
+    });
+    if (receiptResult.status !== 'pending') {
+      throw new Error('receipt authority fixture has no current token');
+    }
+    await expectAuthorityRefusal({
+      label: 'current work selected receipt',
+      selectedStore: receiptStore,
+      selectedProvider: receiptProvider,
+      action: { kind: 'continue', token: receiptResult.token },
+      selectedCurrent: targetSpec,
+      message:
+        'database export receipt authority differs from configured authority',
+    });
+    Object.defineProperty(receiptProvider, 'databaseExportReceiptAuthority', {
+      configurable: true,
+      value: 'test-receipts',
+    });
+    receiptProvider.blockScans = true;
+    const receiptBlocked = await advanceBackendSwitchDecommission(
+      boundedOptions(receiptStore, receiptProvider, {
+        kind: 'continue',
+        token: receiptResult.token,
+      }),
+    );
+    if (receiptBlocked.status !== 'blocked') {
+      throw new Error('selected receipt authority fixture did not block');
+    }
+    Object.defineProperty(receiptProvider, 'databaseExportReceiptAuthority', {
+      configurable: true,
+      value: 'changed-receipts',
+    });
+    for (const [label, action] of [
+      ['blocked start selected receipt', { kind: 'start' as const }],
+      [
+        'restart blocked selected receipt',
+        { kind: 'restart-blocked' as const, token: receiptBlocked.token },
+      ],
+    ] as const) {
+      await expectAuthorityRefusal({
+        label,
+        selectedStore: receiptStore,
+        selectedProvider: receiptProvider,
+        action,
+        selectedCurrent: targetSpec,
+        message:
+          'database export receipt authority differs from configured authority',
+      });
+    }
+
+    const pendingCurrentSpec = {
+      ...targetSpec,
+      authoredBy: 'platform' as const,
+      durableObjectMigrations: [{ tag: 'v1', newClasses: ['Alpha', 'Runner'] }],
+      durableObjectBindings: [
+        { name: 'ALPHA', className: 'Alpha' },
+        { name: 'RUNNER', className: 'Runner' },
+      ],
+      egressProxyService: 'egress-service',
+      queueProducer: { binding: 'EVENTS', queueName: 'events' },
+      application: {
+        vars: [{ name: 'APP_VAR', value: 'application-value' }],
+        secrets: [{ name: 'APP_SECRET', valueSha256: 'c'.repeat(64) }],
+        r2Buckets: [],
+      },
+    } satisfies DeploymentSpec;
+    const pendingInspection = {
+      application: applicationBindingTopology(pendingCurrentSpec, []),
+      artifactVersion: 'pending-v2',
+      databaseIds: [BOUNDED_DATABASE_ID],
+      durableObjectBindings: [
+        {
+          name: 'ALPHA',
+          className: 'Alpha',
+          namespaceId: 'namespace-z',
+        },
+        {
+          name: 'RUNNER',
+          className: 'Runner',
+          namespaceId: 'namespace-a',
+        },
+      ],
+      queueProducerBindings: [{ name: 'EVENTS', queueName: 'events' }],
+      secretNames: [
+        'APP_SECRET',
+        'DEPLOYMENT_IDENTITY_SECRET',
+        'MAINTENANCE_ADMIN_SECRET',
+      ],
+      serviceBindings: [{ name: 'EGRESS_PROXY', service: 'egress-service' }],
+      specDigest: deploymentSpecDigest(pendingCurrentSpec),
+    };
+    const pendingEntry = async (
+      inspection: unknown,
+      recordApplication = applicationBindingTopology(pendingCurrentSpec, []),
+    ) => {
+      const pendingStore = new MemorySwitchStore();
+      const pendingProvider = new BoundedFakeSwitchProvider();
+      await switchPlainDeploymentToWorkersForPlatforms(
+        switchOptions(pendingStore, pendingProvider),
+      );
+      bindBoundedDatabase(pendingStore, pendingProvider);
+      const switchIntent = pendingStore.intent;
+      if (!switchIntent) throw new Error('switch intent is missing');
+      pendingStore.record = {
+        tenantTag: priorSpec.tenantTag,
+        environment: priorSpec.environment,
+        backend: 'plain-worker',
+        scriptName: priorSpec.scriptName,
+        databaseId: BOUNDED_DATABASE_ID,
+        databaseName: priorSpec.databaseName,
+        schemaVersion: priorSpec.schemaVersion,
+        artifactVersion: 'plain-v1',
+        desiredSpecDigest: deploymentSpecDigest(targetSpec),
+        pendingSpecDigest: deploymentSpecDigest(pendingCurrentSpec),
+        pendingArtifactVersion: 'pending-v2',
+        applicationBindings: recordApplication,
+        durableObjectBindings: [],
+        routeHostname: priorSpec.routeHostname,
+        phase: 'migrating',
+        updatedAt: pendingStore.record.updatedAt,
+        backendSwitchIntent: switchIntent,
+      };
+      Object.defineProperty(
+        pendingProvider,
+        'captureSwitchEntryPendingArtifact',
+        {
+          configurable: true,
+          value: async () => inspection,
+        },
+      );
+      return { pendingStore, pendingProvider };
+    };
+    const validPending = await pendingEntry(pendingInspection);
+    await expect(
+      advanceBackendSwitchDecommission({
+        ...boundedOptions(
+          validPending.pendingStore,
+          validPending.pendingProvider,
+          { kind: 'start' },
+        ),
+        currentSpec: pendingCurrentSpec,
+      }),
+    ).resolves.toMatchObject({ status: 'pending' });
+    expect(
+      validPending.pendingStore.intent?.decommissionSnapshot
+        ?.entryPendingNamespaceIds,
+    ).toEqual(['namespace-a', 'namespace-z']);
+
+    let hostileGetterCalls = 0;
+    let hostileProxyGetCalls = 0;
+    const withoutApplication = { ...pendingInspection } as Partial<
+      typeof pendingInspection
+    >;
+    Reflect.deleteProperty(withoutApplication, 'application');
+    const accessorInspection = { ...pendingInspection };
+    Object.defineProperty(accessorInspection, 'artifactVersion', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        hostileGetterCalls += 1;
+        return 'pending-v2';
+      },
+    });
+    const cyclicInspection = structuredClone(
+      pendingInspection,
+    ) as unknown as Record<string, unknown>;
+    cyclicInspection.application = cyclicInspection;
+    let deepApplication: unknown = { value: 'leaf' };
+    for (let depth = 0; depth < 70; depth += 1) {
+      deepApplication = { value: deepApplication };
+    }
+    const oversizedPendingArtifactVersion = 'x'.repeat(4 * 1024 * 1024 + 1);
+    const pendingCases: readonly Readonly<{
+      label: string;
+      inspection: unknown;
+      recordApplication?: import('../src/types.js').ApplicationBindingTopology;
+    }>[] = [
+      { label: 'missing top-level key', inspection: withoutApplication },
+      {
+        label: 'extra top-level key',
+        inspection: { ...pendingInspection, extra: true },
+      },
+      {
+        label: 'symbol top-level key',
+        inspection: { ...pendingInspection, [Symbol('extra')]: true },
+      },
+      {
+        label: 'artifact version',
+        inspection: { ...pendingInspection, artifactVersion: 'foreign-v2' },
+      },
+      {
+        label: 'spec digest',
+        inspection: { ...pendingInspection, specDigest: 'f'.repeat(64) },
+      },
+      {
+        label: 'database identifier',
+        inspection: { ...pendingInspection, databaseIds: ['foreign-db'] },
+      },
+      {
+        label: 'extra database identifier',
+        inspection: {
+          ...pendingInspection,
+          databaseIds: [BOUNDED_DATABASE_ID, 'foreign-db'],
+        },
+      },
+      {
+        label: 'durable binding name',
+        inspection: {
+          ...pendingInspection,
+          durableObjectBindings: pendingInspection.durableObjectBindings.map(
+            (binding, index) =>
+              index === 0 ? { ...binding, name: 'FOREIGN' } : binding,
+          ),
+        },
+      },
+      {
+        label: 'durable binding class',
+        inspection: {
+          ...pendingInspection,
+          durableObjectBindings: pendingInspection.durableObjectBindings.map(
+            (binding, index) =>
+              index === 0 ? { ...binding, className: 'Foreign' } : binding,
+          ),
+        },
+      },
+      {
+        label: 'durable binding script selector',
+        inspection: {
+          ...pendingInspection,
+          durableObjectBindings: pendingInspection.durableObjectBindings.map(
+            (binding, index) =>
+              index === 0
+                ? { ...binding, scriptName: 'foreign-worker' }
+                : binding,
+          ),
+        },
+      },
+      {
+        label: 'durable binding dispatch selector',
+        inspection: {
+          ...pendingInspection,
+          durableObjectBindings: pendingInspection.durableObjectBindings.map(
+            (binding, index) =>
+              index === 0
+                ? { ...binding, dispatchNamespace: 'foreign-dispatch' }
+                : binding,
+          ),
+        },
+      },
+      {
+        label: 'empty namespace identifier',
+        inspection: {
+          ...pendingInspection,
+          durableObjectBindings: pendingInspection.durableObjectBindings.map(
+            (binding, index) =>
+              index === 0 ? { ...binding, namespaceId: '' } : binding,
+          ),
+        },
+      },
+      {
+        label: 'duplicate namespace identifier',
+        inspection: {
+          ...pendingInspection,
+          durableObjectBindings: pendingInspection.durableObjectBindings.map(
+            (binding) => ({ ...binding, namespaceId: 'namespace-a' }),
+          ),
+        },
+      },
+      {
+        label: 'noncanonical binding-name order',
+        inspection: {
+          ...pendingInspection,
+          durableObjectBindings: [
+            ...pendingInspection.durableObjectBindings,
+          ].reverse(),
+        },
+      },
+      {
+        label: 'service binding name',
+        inspection: {
+          ...pendingInspection,
+          serviceBindings: [{ name: 'FOREIGN', service: 'egress-service' }],
+        },
+      },
+      {
+        label: 'service binding service',
+        inspection: {
+          ...pendingInspection,
+          serviceBindings: [
+            { name: 'EGRESS_PROXY', service: 'foreign-service' },
+          ],
+        },
+      },
+      {
+        label: 'service binding entrypoint',
+        inspection: {
+          ...pendingInspection,
+          serviceBindings: [
+            {
+              name: 'EGRESS_PROXY',
+              service: 'egress-service',
+              entrypoint: 'ForeignEntrypoint',
+            },
+          ],
+        },
+      },
+      {
+        label: 'service binding extra key',
+        inspection: {
+          ...pendingInspection,
+          serviceBindings: [
+            { name: 'EGRESS_PROXY', service: 'egress-service', extra: true },
+          ],
+        },
+      },
+      {
+        label: 'queue binding name',
+        inspection: {
+          ...pendingInspection,
+          queueProducerBindings: [{ name: 'FOREIGN', queueName: 'events' }],
+        },
+      },
+      {
+        label: 'queue binding queue',
+        inspection: {
+          ...pendingInspection,
+          queueProducerBindings: [
+            { name: 'EVENTS', queueName: 'foreign-events' },
+          ],
+        },
+      },
+      {
+        label: 'queue binding extra key',
+        inspection: {
+          ...pendingInspection,
+          queueProducerBindings: [
+            { name: 'EVENTS', queueName: 'events', extra: true },
+          ],
+        },
+      },
+      {
+        label: 'missing secret',
+        inspection: {
+          ...pendingInspection,
+          secretNames: pendingInspection.secretNames.slice(1),
+        },
+      },
+      {
+        label: 'noncanonical secret order',
+        inspection: {
+          ...pendingInspection,
+          secretNames: [...pendingInspection.secretNames].reverse(),
+        },
+      },
+      {
+        label: 'extra secret',
+        inspection: {
+          ...pendingInspection,
+          secretNames: [...pendingInspection.secretNames, 'FOREIGN_SECRET'],
+        },
+      },
+      {
+        label: 'application topology',
+        inspection: {
+          ...pendingInspection,
+          application: {
+            ...pendingInspection.application,
+            vars: [{ name: 'APP_VAR', value: 'changed' }],
+          },
+        },
+      },
+      {
+        label: 'record application topology',
+        inspection: pendingInspection,
+        recordApplication: {
+          ...pendingInspection.application,
+          vars: [{ name: 'APP_VAR', value: 'changed' }],
+        },
+      },
+      { label: 'hostile accessor', inspection: accessorInspection },
+      {
+        label: 'hostile transparent proxy',
+        inspection: new Proxy(structuredClone(pendingInspection), {
+          get(target, key, receiver) {
+            hostileProxyGetCalls += 1;
+            return Reflect.get(target, key, receiver);
+          },
+        }),
+      },
+      { label: 'hostile cycle', inspection: cyclicInspection },
+      {
+        label: 'depth bound',
+        inspection: { ...pendingInspection, application: deepApplication },
+      },
+      {
+        label: 'node bound',
+        inspection: {
+          ...pendingInspection,
+          application: Array.from({ length: 65_537 }, () => null),
+        },
+      },
+      {
+        label: 'scalar bound',
+        inspection: {
+          ...pendingInspection,
+          artifactVersion: oversizedPendingArtifactVersion,
+        },
+      },
+      {
+        label: 'serialized bound',
+        inspection: {
+          ...pendingInspection,
+          application: Array.from({ length: 60_000 }, () => 'x'.repeat(67)),
+        },
+      },
+    ];
+    for (const { label, inspection, recordApplication } of pendingCases) {
+      const malformedPending = await pendingEntry(
+        inspection,
+        recordApplication,
+      );
+      const beforePutCalls = malformedPending.pendingStore.putCalls;
+      const beforeRecord = structuredClone(
+        malformedPending.pendingStore.record,
+      );
+      const beforeProvider = {
+        calls: [...malformedPending.pendingProvider.calls],
+        scanCalls: malformedPending.pendingProvider.scanCalls,
+        receiptCalls: malformedPending.pendingProvider.receiptCalls,
+        boundedDeleteCalls: malformedPending.pendingProvider.boundedDeleteCalls,
+      };
+      let clockCalls = 0;
+      let uuidCalls = 0;
+      const encode =
+        label === 'scalar bound'
+          ? vi.spyOn(TextEncoder.prototype, 'encode')
+          : undefined;
+      try {
+        await expect(
+          advanceBackendSwitchDecommission({
+            ...boundedOptions(
+              malformedPending.pendingStore,
+              malformedPending.pendingProvider,
+              { kind: 'start' },
+            ),
+            currentSpec: pendingCurrentSpec,
+            clock: () => {
+              clockCalls += 1;
+              return Date.parse('2026-08-13T00:00:00.000Z');
+            },
+            randomUUID: () => {
+              uuidCalls += 1;
+              return '123e4567-e89b-42d3-a456-426614174000';
+            },
+          }),
+          label,
+        ).rejects.toThrow(
+          'backend switch pending artifact inspection is malformed',
+        );
+        if (encode) {
+          const serializedOversizedScalar = JSON.stringify(
+            oversizedPendingArtifactVersion,
+          );
+          expect(
+            encode.mock.calls.some(
+              ([value]) => value === serializedOversizedScalar,
+            ),
+            label,
+          ).toBe(false);
+        }
+      } finally {
+        encode?.mockRestore();
+      }
+      expect(
+        malformedPending.pendingStore.putCalls - beforePutCalls,
+        label,
+      ).toBe(0);
+      expect(malformedPending.pendingStore.record, label).toEqual(beforeRecord);
+      expect(
+        {
+          calls: malformedPending.pendingProvider.calls,
+          scanCalls: malformedPending.pendingProvider.scanCalls,
+          receiptCalls: malformedPending.pendingProvider.receiptCalls,
+          boundedDeleteCalls:
+            malformedPending.pendingProvider.boundedDeleteCalls,
+        },
+        label,
+      ).toEqual(beforeProvider);
+      expect(clockCalls, label).toBe(0);
+      expect(uuidCalls, label).toBe(0);
+    }
+    expect(hostileGetterCalls).toBe(0);
+    expect(hostileProxyGetCalls).toBe(1);
+  });
+
+  it('resumes one release or bridge action after provider and Fleet response loss', async () => {
+    const store = new MemorySwitchStore();
+    const provider = new BoundedFakeSwitchProvider();
+    await switchPlainDeploymentToWorkersForPlatforms(
+      switchOptions(store, provider),
+    );
+    bindBoundedDatabase(store, provider);
+    let result = await advanceBackendSwitchDecommission(
+      boundedOptions(store, provider, { kind: 'start' }),
+    );
+    if (result.status !== 'pending') throw new Error('missing start token');
+    result = await advanceBackendSwitchDecommission(
+      boundedOptions(store, provider, {
+        kind: 'continue',
+        token: result.token,
+      }),
+    );
+    if (result.status !== 'pending') throw new Error('missing traffic token');
+    provider.failReleaseDeleteResponseOnce = true;
+    await expect(
+      advanceBackendSwitchDecommission(
+        boundedOptions(store, provider, {
+          kind: 'continue',
+          token: result.token,
+        }),
+      ),
+    ).rejects.toThrow('release delete response lost');
+    expect(store.intent?.decommissionSnapshot?.releases[0]?.subphase).toBe(
+      'delete-authorized',
+    );
+
+    const completed = await decommissionBackendSwitch({
+      store,
+      provider,
+      priorSpec,
+      targetSpec,
+      currentSpec: targetSpec,
+    });
+    expect(completed.subphase).toBe('decommissioned');
+    expect(provider.releaseDeleteMutations.get('acme-candidate')).toBe(1);
+  });
+
+  it('consumes matching R2 verification one resource at a time', async () => {
+    const application = {
+      vars: [],
+      secrets: [],
+      r2Buckets: [{ name: 'FILES', jurisdiction: 'default' as const }],
+    };
+    const selectedPriorSpec: DeploymentSpec = {
+      ...priorSpec,
+      application,
+    };
+    const selectedTargetSpec: DeploymentSpec = {
+      ...targetSpec,
+      application,
+    };
+    const resource = switchApplicationR2Resource(
+      'FILES',
+      'default',
+      '2026-08-11T00:00:00.000Z',
+    );
+    const store = new MemorySwitchStore();
+    const provider = new BoundedFakeSwitchProvider();
+    store.record = {
+      ...store.record,
+      desiredSpecDigest: deploymentSpecDigest(selectedPriorSpec),
+      applicationResources: [resource],
+      applicationBindings: applicationBindingTopology(selectedPriorSpec, [
+        resource,
+      ]),
+    };
+    provider.applicationResources = [resource];
+    provider.r2Buckets.set(resource.bucketName, resource);
+    await switchPlainDeploymentToWorkersForPlatforms({
+      ...switchOptions(store, provider),
+      priorSpec: selectedPriorSpec,
+      targetSpec: selectedTargetSpec,
+    });
+    bindBoundedDatabase(store, provider);
+    store.record = {
+      ...store.record,
+      applicationResources: [resource],
+      applicationBindings: applicationBindingTopology(selectedTargetSpec, [
+        resource,
+      ]),
+    };
+
+    const completed = await driveBoundedSwitch(
+      store,
+      provider,
+      selectedTargetSpec,
+      selectedPriorSpec,
+    );
+    expect(completed.result.record.applicationResources).toMatchObject([
+      { name: 'FILES', state: 'deleted' },
+    ]);
+    expect(provider.r2Buckets.size).toBe(0);
+    expect(provider.scanCalls).toBe(6);
+  });
+
+  it('converges receipt export and fenced D1 deletion without adopting legacy export authorization', async () => {
+    const store = new MemorySwitchStore();
+    const provider = new BoundedFakeSwitchProvider();
+    await switchPlainDeploymentToWorkersForPlatforms(
+      switchOptions(store, provider),
+    );
+    bindBoundedDatabase(store, provider);
+
+    const completed = await driveBoundedSwitch(store, provider);
+    expect(completed.result).toMatchObject({
+      record: { phase: 'decommissioned' },
+      databaseExport: {
+        location: 'r2://exports/acme-bounded.sql',
+        sha256: '6'.repeat(64),
+        size: 456,
+      },
+    });
+    expect(provider.receiptCalls).toBe(1);
+    expect(provider.boundedDeleteCalls).toBe(1);
+    expect(provider.calls).not.toContain('decommission-export');
+    expect(provider.calls).not.toContain('decommission-database');
+
+    let terminalCapabilityReads = 0;
+    Object.defineProperty(provider, 'advanceSwitchDecommissionAttachmentScan', {
+      configurable: true,
+      get() {
+        terminalCapabilityReads += 1;
+        throw new Error('terminal capability getter must stay inert');
+      },
+    });
+    await expect(
+      decommissionBackendSwitch({
+        store,
+        provider,
+        priorSpec,
+        targetSpec,
+        currentSpec: targetSpec,
+      }),
+    ).resolves.toMatchObject({ subphase: 'decommissioned' });
+    expect(terminalCapabilityReads).toBe(0);
+    for (const [label, selectedPrior] of [
+      [
+        'completed prior digest',
+        {
+          ...priorSpec,
+          modules: [
+            { name: 'worker.js', content: 'export default { changed: true }' },
+          ],
+        },
+      ],
+      [
+        'completed prior route',
+        { ...priorSpec, routeHostname: 'foreign.example.test' },
+      ],
+    ] as const) {
+      const beforePutCalls = store.putCalls;
+      const beforeProviderCalls = [...provider.calls];
+      const beforeRecord = structuredClone(store.record);
+      await expect(
+        decommissionBackendSwitch({
+          store,
+          provider,
+          priorSpec: selectedPrior,
+          targetSpec,
+          currentSpec: targetSpec,
+        }),
+        label,
+      ).rejects.toThrow(
+        'backend switch prior decommission spec differs from durable intent',
+      );
+      expect(store.putCalls - beforePutCalls, label).toBe(0);
+      expect(store.record, label).toEqual(beforeRecord);
+      expect(provider.calls, label).toEqual(beforeProviderCalls);
+      expect(terminalCapabilityReads, label).toBe(0);
+    }
+
+    const lateStore = new MemorySwitchStore();
+    const lateProvider = new BoundedFakeSwitchProvider();
+    await switchPlainDeploymentToWorkersForPlatforms(
+      switchOptions(lateStore, lateProvider),
+    );
+    bindBoundedDatabase(lateStore, lateProvider);
+    await advanceBackendSwitchDecommission(
+      boundedOptions(lateStore, lateProvider, { kind: 'start' }),
+    );
+    const lateIntent = lateStore.intent as BackendSwitchIntent;
+    const { decommissionIntent: _lateShell, ...lateRecord } = lateStore.record;
+    lateStore.record = {
+      ...lateRecord,
+      phase: 'decommissioning',
+      backendSwitchIntent: {
+        ...lateIntent,
+        subphase: 'decommission-export-authorized',
+      },
+    };
+    let lateCapabilityReads = 0;
+    Object.defineProperty(
+      lateProvider,
+      'advanceSwitchDecommissionAttachmentScan',
+      {
+        configurable: true,
+        get() {
+          lateCapabilityReads += 1;
+          throw new Error('late compatibility must not read capabilities');
+        },
+      },
+    );
+    await expect(
+      advanceBackendSwitchDecommission(
+        boundedOptions(lateStore, lateProvider, { kind: 'start' }),
+      ),
+    ).rejects.toThrow(
+      'bounded backend-switch decommission cannot adopt shell-less legacy D1 authorization',
+    );
+    expect(lateCapabilityReads).toBe(0);
+    await expect(
+      decommissionBackendSwitch({
+        store: lateStore,
+        provider: lateProvider,
+        priorSpec,
+        targetSpec,
+        currentSpec: targetSpec,
+      }),
+    ).resolves.toMatchObject({ subphase: 'decommissioned' });
+    expect(lateCapabilityReads).toBe(0);
+    expect(lateProvider.calls).toContain('decommission-export');
+    expect(lateProvider.calls).toContain('decommission-database');
   });
 });

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { InitialExecutionFenceState } from '@proofoftech/flowsafe/deployment-identity-protocol';
+import type { HostRoutingTarget } from './host-routing.js';
 
 /**
  * The execution-fence state a freshly provisioned deployment is born in —
@@ -298,6 +299,149 @@ export interface ExternalPlatformTargetDescription {
   readonly outboundPolicy: DeploymentEgressPolicy;
 }
 
+export const BACKEND_SWITCH_SUBPHASES = [
+  'planned',
+  'bridge-upload-authorized',
+  'bridge-deployed',
+  'candidate-deploy-authorized',
+  'candidate-deployed',
+  'host-publish-authorized',
+  'host-published',
+  'domain-detach-authorized',
+  'dispatch-serving',
+  'bridge-private-authorized',
+  'bridge-private',
+  'ownership-commit-authorized',
+  'ready',
+  'rollback-route-authorized',
+  'rollback-routed',
+  'rollback-drain-authorized',
+  'rollback-drained',
+  'rollback-restore-authorized',
+  'rollback-restored',
+  'rollback-ownership-authorized',
+  'rolled-back',
+  'finalize-authorized',
+  'finalized',
+  'decommission-traffic-authorized',
+  'decommission-traffic-removed',
+  'decommission-candidate-authorized',
+  'decommission-candidate-removed',
+  'decommission-bridge-authorized',
+  'decommission-bridge-removed',
+  'decommission-application-r2-authorized',
+  'decommission-application-r2-removed',
+  'decommission-export-authorized',
+  'decommission-exported',
+  'decommission-database-authorized',
+  'decommissioned',
+] as const;
+
+export type BackendSwitchSubphase = (typeof BACKEND_SWITCH_SUBPHASES)[number];
+
+export interface PlainBackendSnapshot {
+  readonly scriptName: string;
+  readonly artifactVersion: string;
+  readonly specDigest: string;
+  readonly databaseId: string;
+  readonly databaseName: string;
+  readonly durableObjectBindings: readonly DurableObjectBindingInventory[];
+  readonly namespaceIds: readonly string[];
+  readonly secretNames: readonly string[];
+  readonly application?: ApplicationBindingTopology;
+  readonly applicationResources: readonly ApplicationR2Resource[];
+  readonly customDomain: Readonly<{ id: string; hostname: string }>;
+}
+
+export interface BridgeSnapshot {
+  readonly scriptName: string;
+  readonly artifactVersion: string;
+  readonly artifactDigest: string;
+  readonly databaseId: string;
+  readonly durableObjectBindings: readonly DurableObjectBindingInventory[];
+  readonly namespaceIds: readonly string[];
+  readonly secretNames: readonly string[];
+  readonly application?: ApplicationBindingTopology;
+  readonly publicRouteAttached: boolean;
+  readonly stateOnly: boolean;
+}
+
+export interface BridgeMutationPlan {
+  readonly artifactDigest: string;
+  readonly durableObjectMigrations: readonly DurableObjectMigration[];
+  readonly priorDurableObjectTag?: string;
+  readonly targetDurableObjectTag?: string;
+  readonly secretNames: readonly string[];
+  readonly mutationDigest: string;
+}
+
+export interface BackendSwitchCandidateSnapshot
+  extends ExternalReleaseSnapshot {
+  readonly maintenance: Readonly<{
+    receipt: string;
+    specDigest: string;
+  }>;
+}
+
+export interface BackendSwitchApplicationR2Progress {
+  readonly resource: ApplicationR2Resource;
+  readonly subphase: ApplicationR2Resource['state'];
+}
+
+export interface BackendSwitchDecommissionRelease {
+  readonly release: ExternalReleaseSnapshot;
+  readonly subphase: 'present' | 'delete-authorized' | 'deleted';
+}
+
+export interface BackendSwitchDecommissionRouteTarget {
+  readonly release: ExternalReleaseSnapshot;
+  readonly target: ExternalPlatformTargetDescription;
+  readonly routeTarget: HostRoutingTarget;
+}
+
+export interface BackendSwitchDecommissionSnapshot {
+  readonly prior?: PlainBackendSnapshot;
+  readonly restoredArtifactVersion?: string | null;
+  readonly entryPendingArtifactVersion?: string | null;
+  readonly entryPendingNamespaceIds?: readonly string[] | null;
+  readonly providerTargetSpecDigest?: string;
+  readonly routeHostname: string;
+  readonly routeTargets: readonly BackendSwitchDecommissionRouteTarget[];
+  readonly desiredSpecDigest: string;
+  readonly target: ExternalPlatformTargetDescription;
+  readonly releases: readonly BackendSwitchDecommissionRelease[];
+  readonly applicationResources: readonly ApplicationR2Resource[];
+  readonly bridge?: BridgeSnapshot;
+  readonly resources?: ExternalPlatformResources;
+  readonly bridgePlan?: BridgeMutationPlan;
+}
+
+export interface BackendSwitchIntent {
+  readonly kind: 'backend-switch';
+  readonly tenantTag: string;
+  readonly environment: string;
+  readonly prior: PlainBackendSnapshot;
+  readonly targetSpecDigest: string;
+  readonly targetApplication: ApplicationBindingTopology;
+  readonly target: ExternalPlatformTargetDescription;
+  readonly rollbackUntil: string;
+  readonly subphase: BackendSwitchSubphase;
+  readonly bridgePlan?: BridgeMutationPlan;
+  readonly bridge?: BridgeSnapshot;
+  readonly candidate?: BackendSwitchCandidateSnapshot;
+  readonly restoredArtifactVersion?: string;
+  readonly databaseExport?: DatabaseExport;
+  readonly applicationR2Progress?: readonly BackendSwitchApplicationR2Progress[];
+  readonly stateReconcileIntent?: Readonly<{
+    targetSpecDigest: string;
+    plan: BridgeMutationPlan;
+    subphase: 'upload-authorized' | 'uploaded';
+  }>;
+  readonly decommissionSnapshot?: BackendSwitchDecommissionSnapshot;
+  readonly decommissionSnapshotSha256?: string;
+  readonly decommissionEntrySubphase?: BackendSwitchSubphase;
+}
+
 export type ExternalMigrationSubphase =
   | 'planned'
   | 'schema-applied'
@@ -354,7 +498,8 @@ export type DecommissionOperationMode =
       priorSpecDigest: string;
       targetSpecDigest: string;
       decommissionSnapshotSha256: string;
-      backendSwitchSubphase: import('./backend-switch.js').BackendSwitchSubphase;
+      /** Immutable entry subphase, not the switch's current progress. */
+      backendSwitchSubphase: BackendSwitchSubphase;
     }>;
 
 export interface DecommissionOperationIdentity {
@@ -597,7 +742,7 @@ export interface FleetRecord {
   readonly platformResources?: ExternalPlatformResources;
   readonly platformTarget?: ExternalPlatformTargetDescription;
   readonly migrationIntent?: ExternalMigrationIntent;
-  readonly backendSwitchIntent?: import('./backend-switch.js').BackendSwitchIntent;
+  readonly backendSwitchIntent?: BackendSwitchIntent;
   readonly decommissionIntent?: DecommissionAdvanceIntent;
   readonly applicationResources?: readonly ApplicationR2Resource[];
   readonly applicationBindings?: ApplicationBindingTopology;
@@ -867,11 +1012,17 @@ export type PlainWorkerVersionBinding =
       name: string | undefined;
       className: string | undefined;
       namespaceId: string | undefined;
+      /** Optional provider script selector retained without reinterpretation. */
+      scriptName?: string;
+      /** Optional provider dispatch selector retained without reinterpretation. */
+      dispatchNamespace?: string;
     }>
   | Readonly<{
       type: 'service';
       name: string | undefined;
       service: string | undefined;
+      /** Optional service entrypoint retained for exact-version comparison. */
+      entrypoint?: string;
     }>
   | Readonly<{
       type: 'queue-producer';
@@ -882,6 +1033,8 @@ export type PlainWorkerVersionBinding =
       type: 'r2-bucket';
       name: string | undefined;
       bucketName: string | undefined;
+      /** Provider-observable jurisdiction when Fleet can represent it. */
+      jurisdiction?: 'eu' | 'fedramp';
     }>
   | Readonly<{
       type: 'plain-text';
@@ -911,6 +1064,21 @@ export type PlainWorkerVersionBinding =
       /** Raw unsupported provider binding type. */
       providerType: string;
       issue: 'unsupported-type';
+    }>
+  | Readonly<{
+      type: 'unsupported';
+      name: string | undefined;
+      /** Supported raw provider type whose decision fields were malformed. */
+      providerType:
+        | 'd1'
+        | 'durable_object_namespace'
+        | 'service'
+        | 'queue'
+        | 'r2_bucket'
+        | 'plain_text'
+        | 'secret_text';
+      /** Prevents malformed supported input from being normalized lossily. */
+      issue: 'malformed-supported-binding';
     }>;
 
 /** Provider facts for one ordinary Worker version summary. */

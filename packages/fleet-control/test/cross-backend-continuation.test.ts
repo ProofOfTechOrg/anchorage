@@ -16,6 +16,7 @@ import {
   type FleetStateLease,
   type FleetStateStore,
 } from '../src/types.js';
+import { restProjection } from './fixtures/cloudflare-fetch-fixture.js';
 import {
   assertHarnessFailuresConsumed,
   buildPlainWorkerSpec,
@@ -88,6 +89,96 @@ function mapping(record: FleetRecord) {
     databaseId: record.databaseId,
     routeHostname: record.routeHostname,
   };
+}
+
+function secretBinding(
+  bindings: readonly unknown[],
+  name = 'DEPLOYMENT_IDENTITY_SECRET',
+): object {
+  const binding = bindings.find(
+    (candidate) =>
+      candidate !== null &&
+      typeof candidate === 'object' &&
+      Reflect.get(candidate, 'type') === 'secret_text' &&
+      Reflect.get(candidate, 'name') === name,
+  );
+  if (!binding || typeof binding !== 'object') {
+    throw new Error(`missing secret binding '${name}'`);
+  }
+  return binding;
+}
+
+async function responseBindings(
+  response: Response,
+): Promise<readonly unknown[]> {
+  const envelope: unknown = await response.json();
+  const result =
+    envelope && typeof envelope === 'object'
+      ? Reflect.get(envelope, 'result')
+      : undefined;
+  const resources =
+    result && typeof result === 'object'
+      ? Reflect.get(result, 'resources')
+      : undefined;
+  const bindings =
+    resources && typeof resources === 'object'
+      ? Reflect.get(resources, 'bindings')
+      : undefined;
+  if (!Array.isArray(bindings)) {
+    throw new Error('projected version response has no binding array');
+  }
+  return bindings;
+}
+
+async function assertVersionProjectionRedaction(
+  world: ProviderWorld,
+  spec: DeploymentSpec,
+): Promise<void> {
+  const script = world.scripts.get(spec.scriptName);
+  const sourceVersion = script?.versions[0];
+  if (!sourceVersion) throw new Error('ready source has no Worker version');
+  expect(Reflect.get(secretBinding(sourceVersion.bindings), 'text')).toBe(
+    sharedSecrets.deploymentIdentity,
+  );
+
+  const responseWorld = world.clone();
+  const stagedResponse = await restProjection(responseWorld)({
+    method: 'POST',
+    url: `https://api.cloudflare.com/client/v4/accounts/account/workers/scripts/${spec.scriptName}/versions`,
+    body: {
+      metadata: {
+        annotations: { 'workers/tag': 'staged-response-proof' },
+        bindings: sourceVersion.bindings,
+        main_module: 'worker.js',
+      },
+      files: [],
+    },
+    headers: new Headers(),
+    redirect: undefined,
+  });
+  const stagedSecret = secretBinding(await responseBindings(stagedResponse));
+  expect(Reflect.ownKeys(stagedSecret).sort()).toEqual(['name', 'type']);
+  expect(
+    Reflect.get(
+      secretBinding(
+        responseWorld.scripts.get(spec.scriptName)?.versions[0]?.bindings ?? [],
+      ),
+      'text',
+    ),
+  ).toBe(sharedSecrets.deploymentIdentity);
+
+  const exactResponse = await restProjection(world)({
+    method: 'GET',
+    url: `https://api.cloudflare.com/client/v4/accounts/account/workers/scripts/${spec.scriptName}/versions/${sourceVersion.versionId}`,
+    body: undefined,
+    headers: new Headers(),
+    redirect: undefined,
+  });
+  const exactSecret = secretBinding(await responseBindings(exactResponse));
+  expect(Reflect.ownKeys(exactSecret).sort()).toEqual(['name', 'type']);
+  expect(Reflect.get(secretBinding(sourceVersion.bindings), 'text')).toBe(
+    sharedSecrets.deploymentIdentity,
+  );
 }
 
 function worldFacts(world: ProviderWorld) {
@@ -675,6 +766,7 @@ describe('ordinary Worker cross-backend continuation', () => {
 
     const source = wrangler();
     const ready = await provision(source, spec);
+    await assertVersionProjectionRedaction(source.world, spec);
     const beforeWorker = source.store.snapshots.find(
       ({ record }) => record.phase === 'application-resources-deployed',
     );
@@ -753,6 +845,36 @@ describe('ordinary Worker cross-backend continuation', () => {
 
     const databaseDeletion = directHarness(source.world.clone());
     databaseDeletion.store.record = structuredClone(ready.record);
+    if (
+      typeof databaseDeletion.backend.advanceDecommissionAttachmentScan !==
+        'function' ||
+      typeof databaseDeletion.backend.exportDatabaseReceipt !== 'function' ||
+      databaseDeletion.backend.databaseExportReceiptAuthority === undefined ||
+      typeof databaseDeletion.backend.assertDatabaseDeletionResidualsRemoved !==
+        'function'
+    ) {
+      throw new Error('direct continuation has no bounded teardown capability');
+    }
+    const boundedScan = vi.spyOn(
+      databaseDeletion.backend,
+      'advanceDecommissionAttachmentScan',
+    );
+    const boundedReceipt = vi.spyOn(
+      databaseDeletion.backend,
+      'exportDatabaseReceipt',
+    );
+    const boundedResiduals = vi.spyOn(
+      databaseDeletion.backend,
+      'assertDatabaseDeletionResidualsRemoved',
+    );
+    const legacyAttachments = vi
+      .spyOn(databaseDeletion.backend, 'assertDatabaseDetached')
+      .mockRejectedValue(
+        new Error('bounded continuation used legacy attachment enumeration'),
+      );
+    const legacyExport = vi
+      .spyOn(databaseDeletion.backend, 'exportDatabase')
+      .mockRejectedValue(new Error('bounded continuation used legacy export'));
     databaseDeletion.world.failNext('deleteDatabase', { dispatched: true });
     const databaseDeleted = await decommissionDeployment({
       backend: databaseDeletion.backend,
@@ -761,6 +883,11 @@ describe('ordinary Worker cross-backend continuation', () => {
     });
     expect(databaseDeleted.record.phase).toBe('decommissioned');
     expect(databaseDeletion.world.databases).toEqual([]);
+    expect(boundedScan).toHaveBeenCalled();
+    expect(boundedReceipt).toHaveBeenCalledTimes(1);
+    expect(boundedResiduals).toHaveBeenCalled();
+    expect(legacyAttachments).not.toHaveBeenCalled();
+    expect(legacyExport).not.toHaveBeenCalled();
     expect(
       databaseDeletion.world.mutationLog.filter(
         (entry) => entry === `delete-database:${ready.record.databaseId}`,

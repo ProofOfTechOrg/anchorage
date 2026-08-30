@@ -100,6 +100,21 @@ function json(value: unknown): CommandResult {
   return { stdout: JSON.stringify(value), stderr: '' };
 }
 
+function versionViewBindings(bindings: readonly unknown[]): readonly unknown[] {
+  return bindings.map((binding) => {
+    const cloned = structuredClone(binding);
+    if (
+      !cloned ||
+      typeof cloned !== 'object' ||
+      Array.isArray(cloned) ||
+      Reflect.get(cloned, 'type') !== 'secret_text'
+    ) {
+      return cloned;
+    }
+    return { name: Reflect.get(cloned, 'name'), type: 'secret_text' };
+  });
+}
+
 function success(): CommandResult {
   return { stdout: '', stderr: '' };
 }
@@ -346,7 +361,7 @@ export function cliProjection(world: ProviderWorld): CommandRunner {
             version.tag === undefined
               ? undefined
               : { 'workers/tag': version.tag },
-          resources: { bindings: version.bindings },
+          resources: { bindings: versionViewBindings(version.bindings) },
         });
       }
       if (

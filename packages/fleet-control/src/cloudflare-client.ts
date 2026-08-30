@@ -106,6 +106,70 @@ const AUDIT_CONSUMER_SETTINGS = Object.freeze({
   max_wait_time_ms: 5_000,
 });
 const SDK_TRANSPORT_TIMEOUT_MS = 2_147_483_647;
+const STRUCTURED_CLONE = structuredClone;
+const UTF8_ENCODER = new TextEncoder();
+const MAX_DURABLE_OBJECT_NAMESPACE_ID_BYTES = 4_096;
+
+function malformedDurableObjectNamespaceInventory(): Error {
+  return new Error('Durable Object namespace ID inventory is malformed');
+}
+
+function canonicalDurableObjectNamespaceIds(value: unknown): readonly string[] {
+  let ids: string[];
+  try {
+    if (
+      !Array.isArray(value) ||
+      Object.getPrototypeOf(value) !== Array.prototype
+    ) {
+      throw malformedDurableObjectNamespaceInventory();
+    }
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+    const length =
+      lengthDescriptor && 'value' in lengthDescriptor
+        ? lengthDescriptor.value
+        : undefined;
+    if (
+      !Number.isSafeInteger(length) ||
+      length < 0 ||
+      length > CLOUDFLARE_INVENTORY_BOUND ||
+      lengthDescriptor?.writable !== true ||
+      lengthDescriptor.enumerable !== false ||
+      lengthDescriptor.configurable !== false
+    ) {
+      throw malformedDurableObjectNamespaceInventory();
+    }
+    const keys = Reflect.ownKeys(value);
+    if (
+      keys.length !== length + 1 ||
+      !keys.includes('length') ||
+      keys.some((key) => typeof key !== 'string')
+    ) {
+      throw malformedDurableObjectNamespaceInventory();
+    }
+    ids = [];
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (
+        !descriptor ||
+        !('value' in descriptor) ||
+        descriptor.writable !== true ||
+        descriptor.enumerable !== true ||
+        descriptor.configurable !== true ||
+        typeof descriptor.value !== 'string' ||
+        descriptor.value.length === 0 ||
+        UTF8_ENCODER.encode(descriptor.value).byteLength >
+          MAX_DURABLE_OBJECT_NAMESPACE_ID_BYTES
+      ) {
+        throw malformedDurableObjectNamespaceInventory();
+      }
+      ids.push(descriptor.value);
+    }
+    STRUCTURED_CLONE(value);
+  } catch {
+    throw malformedDurableObjectNamespaceInventory();
+  }
+  return [...new Set(ids)].sort();
+}
 
 export interface CloudflareClientOptions {
   readonly accountId: string;
@@ -2064,15 +2128,33 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
 
   async hasDurableObjectNamespace(namespaceId: string): Promise<boolean> {
     if (!namespaceId) throw new Error('namespaceId is required');
+    return (
+      (await this.existingDurableObjectNamespaceIds([namespaceId])).length > 0
+    );
+  }
+
+  /**
+   * Returns the requested namespace IDs that still exist after one complete,
+   * bounded account inventory traversal.
+   */
+  async existingDurableObjectNamespaceIds(
+    ids: readonly string[],
+  ): Promise<readonly string[]> {
+    const requestedIds = canonicalDurableObjectNamespaceIds(ids);
+    if (requestedIds.length === 0) return [];
+    const requested = new Set(requestedIds);
+    const existing = new Set<string>();
     for await (const namespace of this.#collectBounded(
       this.#client.durableObjects.namespaces.list({
         account_id: this.#accountId,
       }),
       'Durable Object namespace inventory',
     )) {
-      if (namespace.id === namespaceId) return true;
+      if (namespace.id && requested.has(namespace.id)) {
+        existing.add(namespace.id);
+      }
     }
-    return false;
+    return [...existing].sort();
   }
 
   async listDurableObjectNamespaces(

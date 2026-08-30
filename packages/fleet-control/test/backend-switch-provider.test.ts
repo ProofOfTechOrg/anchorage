@@ -13,12 +13,14 @@ import {
 } from '../src/platform-resources.js';
 import { deploymentSpecDigest } from '../src/spec-digest.js';
 import type {
+  DatabaseExportReceiptIdentity,
   DeploymentSpec,
   ExternalMutationFence,
   ExternalPlatformProfile,
   ExternalPlatformTargetDescription,
   ExternalReleaseSnapshot,
   FleetRecord,
+  PlainWorkerVersionDetail,
 } from '../src/types.js';
 import type { WorkersForPlatformsBackend } from '../src/workers-for-platforms-backend.js';
 import type { BackendSwitchApi } from '../src/workers-for-platforms-backend-switch-provider.js';
@@ -240,9 +242,25 @@ function provider(
 ): WorkersForPlatformsBackendSwitchProvider {
   const inspectControlWorker = client.inspectControlWorker;
   const inspectDispatchWorker = client.inspectDispatchWorker;
+  const listDurableObjectNamespaces =
+    client.listDurableObjectNamespaces ?? (async () => prior.namespaceIds);
+  const existingDurableObjectNamespaceIds =
+    client.existingDurableObjectNamespaceIds ??
+    (async (ids: readonly string[]) => {
+      if (!client.hasDurableObjectNamespace) return [];
+      const existing: string[] = [];
+      for (const id of ids) {
+        if (await client.hasDurableObjectNamespace.call(client, id)) {
+          existing.push(id);
+        }
+      }
+      return existing;
+    });
   return new WorkersForPlatformsBackendSwitchProvider({
     client: {
       ...client,
+      existingDurableObjectNamespaceIds,
+      listDurableObjectNamespaces,
       ...(inspectControlWorker
         ? {
             inspectControlWorker: async (scriptName: string) => {
@@ -517,18 +535,19 @@ async function removePlanOnlyBridge(
   path: 'traffic' | 'bridge',
   bridge?: BridgeSnapshot,
   plan: BridgeMutationPlan = fixture.plan,
-  allowedArtifactVersions: readonly string[] = [
-    prior.artifactVersion,
-    ...(bridge ? [bridge.artifactVersion] : []),
-  ],
+  allowedArtifactVersions?: readonly string[],
 ): Promise<void> {
+  const persistedBridge = bridge ?? persistedBridgeSnapshot(fixture);
   const authority = {
     prior,
     priorSpec,
     targetSpec,
     plan,
-    ...(bridge ? { bridge } : {}),
-    allowedArtifactVersions,
+    bridge: persistedBridge,
+    allowedArtifactVersions: allowedArtifactVersions ?? [
+      prior.artifactVersion,
+      persistedBridge.artifactVersion,
+    ],
     fence,
   };
   if (path === 'traffic') {
@@ -721,6 +740,7 @@ describe('backend switch provider teardown authority', () => {
       fixture.subject.removeSwitchBridge({
         prior,
         priorSpec,
+        bridge: persistedBridgeSnapshot(fixture),
         targetSpec: plannedTargetSpec,
         plan: fixture.plan,
         allowedArtifactVersions: [prior.artifactVersion],
@@ -2110,6 +2130,7 @@ describe('backend switch provider response-loss recovery', () => {
       subject.removeSwitchBridge({
         prior,
         priorSpec,
+        bridge: recovered,
         targetSpec,
         plan,
         allowedArtifactVersions: [prior.artifactVersion],
@@ -2171,5 +2192,808 @@ describe('backend switch provider response-loss recovery', () => {
     await expect(subject.publishCandidateHost(input)).rejects.toThrow(
       /complete durable target/,
     );
+  });
+
+  it('exposes complete bounded switch capabilities under the original receivers', async () => {
+    const receiverCalls: string[] = [];
+    let scannerGetterReads = 0;
+    let receiptAuthorityGetterReads = 0;
+    let receiptMethodGetterReads = 0;
+    const databaseId = '00000000-0000-0000-0000-000000000001';
+    const pendingSpec: DeploymentSpec = {
+      ...priorSpec,
+      durableObjectBindings: [
+        {
+          name: 'RUNNER',
+          className: 'Runner',
+          scriptName: 'object-owner',
+        },
+        {
+          name: 'PENDING',
+          className: 'Pending',
+          dispatchNamespace: 'pending-dispatch',
+        },
+      ],
+      egressProxyService: 'egress-service',
+      queueProducer: { binding: 'EVENTS', queueName: 'events' },
+      application: {
+        vars: [{ name: 'APP_VAR', value: 'application-value' }],
+        secrets: [{ name: 'APP_SECRET', valueSha256: 'c'.repeat(64) }],
+        r2Buckets: [{ name: 'FILES', jurisdiction: 'eu' }],
+      },
+    };
+    const pendingSpecDigest = deploymentSpecDigest(pendingSpec);
+    const boundedPrior = {
+      ...prior,
+      databaseId,
+      databaseName: pendingSpec.databaseName,
+    };
+    const pendingApplicationResource = {
+      name: 'FILES',
+      bucketName: 'pending-files',
+      jurisdiction: 'eu' as const,
+      state: 'created' as const,
+      reservationNonce: 'pending-files-reservation',
+      creationDate: '2026-08-30T00:00:00.000Z',
+    };
+    const pendingApplication = {
+      vars: [{ name: 'APP_VAR', value: 'application-value' }],
+      secrets: [{ name: 'APP_SECRET', valueSha256: 'c'.repeat(64) }],
+      r2Buckets: [
+        {
+          name: 'FILES',
+          bucketName: 'pending-files',
+          jurisdiction: 'eu' as const,
+        },
+      ],
+    };
+    const exactVersion: PlainWorkerVersionDetail = {
+      versionId: 'pending-v2',
+      tag: pendingSpecDigest,
+      bindings: [
+        { type: 'd1', name: 'DB', databaseId },
+        {
+          type: 'durable-object',
+          name: 'RUNNER',
+          className: 'Runner',
+          namespaceId: 'namespace-pending',
+          scriptName: 'object-owner',
+        },
+        {
+          type: 'durable-object',
+          name: 'PENDING',
+          className: 'Pending',
+          namespaceId: 'namespace-pending-extra',
+          dispatchNamespace: 'pending-dispatch',
+        },
+        {
+          type: 'service',
+          name: 'EGRESS_PROXY',
+          service: 'egress-service',
+        },
+        {
+          type: 'queue-producer',
+          name: 'EVENTS',
+          queueName: 'events',
+        },
+        {
+          type: 'r2-bucket',
+          name: 'FILES',
+          bucketName: 'pending-files',
+        },
+        {
+          type: 'plain-text',
+          name: 'DEPLOYMENT_TENANT',
+          value: pendingSpec.tenantTag,
+        },
+        {
+          type: 'plain-text',
+          name: 'FLEET_ENVIRONMENT',
+          value: pendingSpec.environment,
+        },
+        {
+          type: 'plain-text',
+          name: 'FLEET_SCHEMA_VERSION',
+          value: String(pendingSpec.schemaVersion),
+        },
+        {
+          type: 'plain-text',
+          name: 'FLEET_SPEC_DIGEST',
+          value: pendingSpecDigest,
+        },
+        {
+          type: 'plain-text',
+          name: 'FLEET_INGRESS_CONTRACT',
+          value: 'guarded-object-v1',
+        },
+        {
+          type: 'plain-text',
+          name: 'APP_VAR',
+          value: 'application-value',
+        },
+        { type: 'secret-text', name: 'APP_SECRET' },
+        { type: 'secret-text', name: 'DEPLOYMENT_IDENTITY_SECRET' },
+        { type: 'secret-text', name: 'MAINTENANCE_ADMIN_SECRET' },
+      ],
+    };
+    let versionObservation: PlainWorkerVersionDetail | undefined = exactVersion;
+    let secretObservation: readonly string[] = [
+      'APP_SECRET',
+      'DEPLOYMENT_IDENTITY_SECRET',
+      'MAINTENANCE_ADMIN_SECRET',
+    ];
+    let versionFailure: Error | undefined;
+    let secretFailure: Error | undefined;
+    const api = {
+      findOrdinaryWorkerVersion(this: unknown) {
+        expect(this).toBe(api);
+        receiverCalls.push('version');
+        return versionFailure
+          ? Promise.reject(versionFailure)
+          : Promise.resolve(versionObservation);
+      },
+      listOrdinaryWorkerSecretNames(this: unknown) {
+        expect(this).toBe(api);
+        receiverCalls.push('secrets');
+        return secretFailure
+          ? Promise.reject(secretFailure)
+          : Promise.resolve(secretObservation);
+      },
+      getDatabase(this: unknown, id: string) {
+        expect(this).toBe(api);
+        receiverCalls.push(`database:${id}`);
+        return Promise.resolve({
+          id,
+          name: prior.databaseName,
+          created: false,
+        });
+      },
+      withMutationFence<T>(
+        this: unknown,
+        _fence: ExternalMutationFence,
+        operation: () => Promise<T>,
+      ) {
+        expect(this).toBe(api);
+        receiverCalls.push('fence');
+        return operation();
+      },
+      deleteDatabase(this: unknown, id: string) {
+        expect(this).toBe(api);
+        receiverCalls.push(`delete:${id}`);
+        return Promise.resolve();
+      },
+    } as unknown as BackendSwitchApi;
+    Object.defineProperties(api, {
+      advanceDecommissionAttachmentScan: {
+        enumerable: true,
+        get() {
+          scannerGetterReads += 1;
+          return function (this: unknown) {
+            expect(this).toBe(api);
+            receiverCalls.push('scan');
+            return Promise.resolve({ status: 'drift' as const });
+          };
+        },
+      },
+      databaseExportReceiptAuthority: {
+        enumerable: true,
+        get() {
+          receiptAuthorityGetterReads += 1;
+          return 'memory://switch-receipts/v1';
+        },
+      },
+      exportDatabaseReceipt: {
+        enumerable: true,
+        get() {
+          receiptMethodGetterReads += 1;
+          return function (
+            this: unknown,
+            identity: DatabaseExportReceiptIdentity,
+          ) {
+            expect(this).toBe(api);
+            receiverCalls.push('receipt');
+            return Promise.resolve({
+              databaseId: identity.databaseId,
+              location: 'memory://switch-receipts/v1/export.sql',
+              sha256: 'a'.repeat(64),
+              size: 1,
+            });
+          };
+        },
+      },
+    });
+    const backend = {
+      readDeploymentIdentity(
+        this: unknown,
+        _database: unknown,
+        _fence: ExternalMutationFence,
+      ) {
+        expect(this).toBe(backend);
+        receiverCalls.push('owner');
+        return Promise.resolve(pendingSpec.tenantTag);
+      },
+    } as unknown as WorkersForPlatformsBackend;
+    const subject = new WorkersForPlatformsBackendSwitchProvider({
+      client: api,
+      backend,
+      hostRoutingKvId: 'hosts-kv',
+      sharedOutboundWorkerName: 'shared-outbound',
+      stateEgressRootSecret: 'root-secret-012345678901234567890123456789',
+      platformProfileFor: () => profile,
+      assertServing: async () => {},
+      drainCandidate: async () => {},
+    });
+
+    expect(scannerGetterReads).toBe(1);
+    expect(receiptAuthorityGetterReads).toBe(1);
+    expect(receiptMethodGetterReads).toBe(1);
+    expect(
+      Object.hasOwn(subject, 'advanceSwitchDecommissionAttachmentScan'),
+    ).toBe(true);
+    expect(Object.hasOwn(subject, 'exportSwitchDatabaseReceipt')).toBe(true);
+    await subject.advanceSwitchDecommissionAttachmentScan?.({} as never);
+    const currentRecord = {
+      tenantTag: pendingSpec.tenantTag,
+      environment: pendingSpec.environment,
+      scriptName: pendingSpec.scriptName,
+      databaseId,
+      databaseName: pendingSpec.databaseName,
+      applicationBindings: pendingApplication,
+      applicationResources: [pendingApplicationResource],
+    } as unknown as FleetRecord;
+    await expect(
+      subject.captureSwitchEntryPendingArtifact({
+        expectedArtifactVersion: 'pending-v2',
+        spec: pendingSpec,
+        currentRecord,
+        fence,
+      }),
+    ).resolves.toEqual({
+      artifactVersion: 'pending-v2',
+      specDigest: pendingSpecDigest,
+      databaseIds: [databaseId],
+      durableObjectBindings: [
+        {
+          name: 'PENDING',
+          className: 'Pending',
+          namespaceId: 'namespace-pending-extra',
+          dispatchNamespace: 'pending-dispatch',
+        },
+        {
+          name: 'RUNNER',
+          className: 'Runner',
+          namespaceId: 'namespace-pending',
+          scriptName: 'object-owner',
+        },
+      ],
+      secretNames: [
+        'APP_SECRET',
+        'DEPLOYMENT_IDENTITY_SECRET',
+        'MAINTENANCE_ADMIN_SECRET',
+      ],
+      serviceBindings: [{ name: 'EGRESS_PROXY', service: 'egress-service' }],
+      queueProducerBindings: [{ name: 'EVENTS', queueName: 'events' }],
+      application: pendingApplication,
+    });
+    await expect(subject.getSwitchDatabase(databaseId)).resolves.toMatchObject({
+      id: databaseId,
+    });
+    await expect(
+      subject.readSwitchDatabaseOwner(
+        { id: databaseId, name: pendingSpec.databaseName, created: false },
+        fence,
+      ),
+    ).resolves.toBe(pendingSpec.tenantTag);
+    await expect(
+      subject.exportSwitchDatabaseReceipt?.(
+        {
+          version: 1,
+          authority: 'memory://switch-receipts/v1',
+          databaseId,
+          operationId: '00000000-0000-4000-8000-000000000002',
+        },
+        { prior: boundedPrior, targetSpec: pendingSpec, fence },
+      ),
+    ).resolves.toMatchObject({ databaseId });
+    await expect(
+      subject.deleteSwitchDatabaseBounded({
+        prior: boundedPrior,
+        targetSpec: pendingSpec,
+        database: {
+          id: databaseId,
+          name: pendingSpec.databaseName,
+          created: false,
+        },
+        fence,
+      }),
+    ).resolves.toBeUndefined();
+    expect(receiverCalls).toEqual([
+      'scan',
+      'version',
+      'secrets',
+      `database:${databaseId}`,
+      'owner',
+      'fence',
+      'receipt',
+      'fence',
+      `delete:${databaseId}`,
+    ]);
+
+    const captureInput = {
+      expectedArtifactVersion: 'pending-v2',
+      spec: pendingSpec,
+      currentRecord,
+      fence,
+    };
+    const versionReadFailure = new Error('exact version read failed');
+    versionFailure = versionReadFailure;
+    await expect(
+      subject.captureSwitchEntryPendingArtifact(captureInput),
+    ).rejects.toBe(versionReadFailure);
+    versionFailure = undefined;
+    const secretReadFailure = new Error('secret inventory read failed');
+    secretFailure = secretReadFailure;
+    await expect(
+      subject.captureSwitchEntryPendingArtifact(captureInput),
+    ).rejects.toBe(secretReadFailure);
+    secretFailure = undefined;
+
+    const mutateBinding = (
+      type: PlainWorkerVersionDetail['bindings'][number]['type'],
+      name: string,
+      patch: Readonly<Record<string, unknown>>,
+    ): PlainWorkerVersionDetail => {
+      const version = structuredClone(exactVersion);
+      const binding = version.bindings.find(
+        (candidate) => candidate.type === type && candidate.name === name,
+      );
+      if (!binding) throw new Error(`missing ${type}:${name} binding`);
+      Object.assign(binding as unknown as Record<string, unknown>, patch);
+      return version;
+    };
+    const malformedRows: readonly Readonly<{
+      label: string;
+      version: PlainWorkerVersionDetail | undefined;
+      secrets: readonly string[];
+    }>[] = [
+      {
+        label: 'absent exact version',
+        version: undefined,
+        secrets: secretObservation,
+      },
+      {
+        label: 'wrong exact version id',
+        version: { ...exactVersion, versionId: 'pending-v3' },
+        secrets: secretObservation,
+      },
+      {
+        label: 'wrong exact version tag',
+        version: { ...exactVersion, tag: 'd'.repeat(64) },
+        secrets: secretObservation,
+      },
+      {
+        label: 'wrong D1 identifier',
+        version: mutateBinding('d1', 'DB', { databaseId: 'foreign-database' }),
+        secrets: secretObservation,
+      },
+      {
+        label: 'wrong D1 binding name',
+        version: mutateBinding('d1', 'DB', { name: 'FOREIGN_DB' }),
+        secrets: secretObservation,
+      },
+      {
+        label: 'wrong Durable Object name',
+        version: mutateBinding('durable-object', 'RUNNER', {
+          name: 'FOREIGN_RUNNER',
+        }),
+        secrets: secretObservation,
+      },
+      {
+        label: 'wrong Durable Object class',
+        version: mutateBinding('durable-object', 'RUNNER', {
+          className: 'ForeignRunner',
+        }),
+        secrets: secretObservation,
+      },
+      {
+        label: 'wrong Durable Object script selector',
+        version: mutateBinding('durable-object', 'RUNNER', {
+          scriptName: 'foreign-owner',
+        }),
+        secrets: secretObservation,
+      },
+      {
+        label: 'wrong Durable Object dispatch selector',
+        version: mutateBinding('durable-object', 'PENDING', {
+          dispatchNamespace: 'foreign-dispatch',
+        }),
+        secrets: secretObservation,
+      },
+      {
+        label: 'wrong Durable Object namespace',
+        version: mutateBinding('durable-object', 'PENDING', {
+          namespaceId: 'namespace-pending',
+        }),
+        secrets: secretObservation,
+      },
+      {
+        label: 'wrong tenant plain-text fact',
+        version: mutateBinding('plain-text', 'DEPLOYMENT_TENANT', {
+          value: 'foreign-tenant',
+        }),
+        secrets: secretObservation,
+      },
+      {
+        label: 'wrong environment plain-text fact',
+        version: mutateBinding('plain-text', 'FLEET_ENVIRONMENT', {
+          value: 'foreign-environment',
+        }),
+        secrets: secretObservation,
+      },
+      {
+        label: 'wrong schema plain-text fact',
+        version: mutateBinding('plain-text', 'FLEET_SCHEMA_VERSION', {
+          value: '999',
+        }),
+        secrets: secretObservation,
+      },
+      {
+        label: 'wrong digest plain-text fact',
+        version: mutateBinding('plain-text', 'FLEET_SPEC_DIGEST', {
+          value: 'd'.repeat(64),
+        }),
+        secrets: secretObservation,
+      },
+      {
+        label: 'wrong ingress plain-text fact',
+        version: mutateBinding('plain-text', 'FLEET_INGRESS_CONTRACT', {
+          value: 'foreign-ingress',
+        }),
+        secrets: secretObservation,
+      },
+      {
+        label: 'wrong application plain-text fact',
+        version: mutateBinding('plain-text', 'APP_VAR', {
+          value: 'foreign-value',
+        }),
+        secrets: secretObservation,
+      },
+      {
+        label: 'wrong service name',
+        version: mutateBinding('service', 'EGRESS_PROXY', {
+          name: 'FOREIGN_SERVICE',
+        }),
+        secrets: secretObservation,
+      },
+      {
+        label: 'wrong service target',
+        version: mutateBinding('service', 'EGRESS_PROXY', {
+          service: 'foreign-service',
+        }),
+        secrets: secretObservation,
+      },
+      {
+        label: 'wrong queue binding name',
+        version: mutateBinding('queue-producer', 'EVENTS', {
+          name: 'FOREIGN_QUEUE',
+        }),
+        secrets: secretObservation,
+      },
+      {
+        label: 'wrong queue target',
+        version: mutateBinding('queue-producer', 'EVENTS', {
+          queueName: 'foreign-events',
+        }),
+        secrets: secretObservation,
+      },
+      {
+        label: 'wrong R2 binding name',
+        version: mutateBinding('r2-bucket', 'FILES', {
+          name: 'FOREIGN_FILES',
+        }),
+        secrets: secretObservation,
+      },
+      {
+        label: 'wrong R2 bucket',
+        version: mutateBinding('r2-bucket', 'FILES', {
+          bucketName: 'foreign-files',
+        }),
+        secrets: secretObservation,
+      },
+      {
+        label: 'wrong present R2 jurisdiction',
+        version: mutateBinding('r2-bucket', 'FILES', {
+          jurisdiction: 'fedramp',
+        }),
+        secrets: secretObservation,
+      },
+      {
+        label: 'duplicate authoritative secret',
+        version: exactVersion,
+        secrets: [
+          'APP_SECRET',
+          'DEPLOYMENT_IDENTITY_SECRET',
+          'DEPLOYMENT_IDENTITY_SECRET',
+        ],
+      },
+      {
+        label: 'missing authoritative secret',
+        version: exactVersion,
+        secrets: ['APP_SECRET', 'DEPLOYMENT_IDENTITY_SECRET'],
+      },
+      {
+        label: 'version secret disagreement',
+        version: {
+          ...exactVersion,
+          bindings: exactVersion.bindings.filter(
+            (binding) =>
+              binding.type !== 'secret-text' ||
+              binding.name !== 'MAINTENANCE_ADMIN_SECRET',
+          ),
+        },
+        secrets: [
+          'APP_SECRET',
+          'DEPLOYMENT_IDENTITY_SECRET',
+          'MAINTENANCE_ADMIN_SECRET',
+        ],
+      },
+      {
+        label: 'unexpected service entrypoint',
+        version: mutateBinding('service', 'EGRESS_PROXY', {
+          entrypoint: 'Admin',
+        }),
+        secrets: [
+          'APP_SECRET',
+          'DEPLOYMENT_IDENTITY_SECRET',
+          'MAINTENANCE_ADMIN_SECRET',
+        ],
+      },
+      {
+        label: 'malformed supported binding',
+        version: {
+          ...exactVersion,
+          bindings: [
+            ...exactVersion.bindings,
+            {
+              type: 'unsupported',
+              name: 'MALFORMED',
+              providerType: 'secret_text',
+              issue: 'malformed-supported-binding',
+            },
+          ],
+        },
+        secrets: [
+          'APP_SECRET',
+          'DEPLOYMENT_IDENTITY_SECRET',
+          'MAINTENANCE_ADMIN_SECRET',
+        ],
+      },
+    ];
+    for (const row of malformedRows) {
+      versionObservation = row.version;
+      secretObservation = row.secrets;
+      let error: unknown;
+      try {
+        await subject.captureSwitchEntryPendingArtifact(captureInput);
+      } catch (caught) {
+        error = caught;
+      }
+      expect({ label: row.label, message: (error as Error).message }).toEqual({
+        label: row.label,
+        message: 'backend switch pending artifact inspection is malformed',
+      });
+    }
+    versionObservation = exactVersion;
+    secretObservation = [
+      'APP_SECRET',
+      'DEPLOYMENT_IDENTITY_SECRET',
+      'MAINTENANCE_ADMIN_SECRET',
+    ];
+    await expect(
+      subject.captureSwitchEntryPendingArtifact({
+        ...captureInput,
+        currentRecord: {
+          ...currentRecord,
+          applicationBindings: {
+            ...pendingApplication,
+            secrets: [{ name: 'APP_SECRET', valueSha256: 'd'.repeat(64) }],
+          },
+        },
+      }),
+    ).rejects.toThrow(
+      'backend switch pending artifact inspection is malformed',
+    );
+  });
+
+  it('separates bounded switch D1 residuals from legacy attachment enumeration', async () => {
+    let attachmentLists = 0;
+    let bulkNamespaceLists = 0;
+    let deletes = 0;
+    let bulkFailure: Error | undefined;
+    const database = {
+      id: prior.databaseId,
+      name: prior.databaseName,
+      created: false,
+    };
+    const pendingSpec: DeploymentSpec = {
+      ...priorSpec,
+      durableObjectBindings: [
+        ...priorSpec.durableObjectBindings,
+        { name: 'PENDING', className: 'Pending' },
+      ],
+    };
+    const pendingNamespaceIds = ['namespace-pending', 'namespace-runner'];
+    let pendingArtifactVersion = 'pending-v2';
+    let trafficMutations = 0;
+    const pendingSubject = provider({
+      inspectControlWorker: async () =>
+        completeProviderBindingInspection({
+          artifactVersion: pendingArtifactVersion,
+          databaseIds: [prior.databaseId],
+          durableObjectBindings: [
+            ...prior.durableObjectBindings,
+            {
+              name: 'PENDING',
+              className: 'Pending',
+              namespaceId: 'namespace-pending',
+            },
+          ],
+          serviceBindings: [],
+          queueProducerBindings: [],
+          r2BucketBindings: [],
+          kvNamespaceBindings: [],
+          secretNames: [
+            'DEPLOYMENT_IDENTITY_SECRET',
+            'MAINTENANCE_ADMIN_SECRET',
+          ],
+          plainTextBindings: {
+            DEPLOYMENT_TENANT: pendingSpec.tenantTag,
+            FLEET_ENVIRONMENT: pendingSpec.environment,
+            FLEET_SCHEMA_VERSION: String(pendingSpec.schemaVersion),
+            FLEET_SPEC_DIGEST: deploymentSpecDigest(pendingSpec),
+            FLEET_INGRESS_CONTRACT: 'guarded-object-v1',
+          },
+          workersDevEnabled: true,
+          previewUrlsEnabled: false,
+          routeHostnames: [],
+          zoneRoutes: [],
+        }),
+      listDurableObjectNamespaces: async () => pendingNamespaceIds,
+      inspectOrdinaryWorkerFootprint: async () => ordinaryFootprint(),
+      getHostRouting: async () => undefined,
+      deleteHostRouting: async () => {
+        trafficMutations += 1;
+      },
+      listCustomDomains: async () => [],
+      disableOrdinaryWorkerPublicAccess: async () => {
+        trafficMutations += 1;
+      },
+      withMutationFence: async (_fence, operation) => operation(),
+    });
+    const pendingAuthority = {
+      prior,
+      priorSpec,
+      targetSpec,
+      allowedArtifactVersions: [prior.artifactVersion],
+      tenantTag: targetSpec.tenantTag,
+      environment: targetSpec.environment,
+      routeHostname: targetSpec.routeHostname,
+      routeTargets: [],
+      entryPendingArtifact: {
+        artifactVersion: pendingArtifactVersion,
+        namespaceIds: pendingNamespaceIds,
+        spec: pendingSpec,
+      },
+      fence,
+    };
+    await expect(
+      pendingSubject.removeSwitchTraffic(pendingAuthority),
+    ).resolves.toBeUndefined();
+    expect(trafficMutations).toBe(2);
+    pendingArtifactVersion = prior.artifactVersion;
+    await expect(
+      pendingSubject.removeSwitchTraffic({
+        ...pendingAuthority,
+        entryPendingArtifact: {
+          ...pendingAuthority.entryPendingArtifact,
+          artifactVersion: prior.artifactVersion,
+        },
+      }),
+    ).rejects.toThrow('refusing to delete a foreign backend-switch bridge');
+    expect(trafficMutations).toBe(2);
+
+    const client: Partial<BackendSwitchApi> = {
+      getDatabase: async () => database,
+      withMutationFence: async (_fence, operation) => operation(),
+      getHostRouting: async () => undefined,
+      listCustomDomains: async () => [],
+      inspectOrdinaryWorkerFootprint: async () =>
+        ordinaryFootprint({
+          scriptPresent: false,
+          workersDevEnabled: false,
+          previewUrlsEnabled: false,
+        }),
+      inspectControlWorker: async () => undefined,
+      inspectDispatchWorker: async () => undefined,
+      getScriptInventory: async () => undefined,
+      existingDurableObjectNamespaceIds: async () => {
+        bulkNamespaceLists += 1;
+        if (bulkFailure) throw bulkFailure;
+        return [];
+      },
+      listWorkerDatabaseAttachments: async () => {
+        attachmentLists += 1;
+        return [];
+      },
+      exportDatabase: async (databaseId) => ({
+        databaseId,
+        location: 'memory://legacy/export.sql',
+        sha256: 'b'.repeat(64),
+        size: 1,
+      }),
+      deleteDatabase: async () => {
+        deletes += 1;
+      },
+    };
+    const subject = provider(client, {
+      readDeploymentIdentity: async () => priorSpec.tenantTag,
+    });
+    const snapshot = {
+      prior,
+      restoredArtifactVersion: null,
+      entryPendingArtifactVersion: null,
+      entryPendingNamespaceIds: null,
+      providerTargetSpecDigest: deploymentSpecDigest(targetSpec),
+      routeHostname: targetSpec.routeHostname,
+      routeTargets: [],
+      desiredSpecDigest: deploymentSpecDigest(targetSpec),
+      target,
+      releases: [{ release, subphase: 'deleted' as const }],
+      applicationResources: [],
+    };
+    const currentRecord = {
+      backendSwitchIntent: { decommissionSnapshot: snapshot },
+    } as unknown as FleetRecord;
+
+    const residualFailure = new Error('bulk namespace residual failed');
+    bulkFailure = residualFailure;
+    await expect(
+      subject.assertSwitchDatabaseDeletionResidualsRemoved({
+        prior,
+        targetSpec,
+        currentRecord,
+        database,
+        fence,
+      }),
+    ).rejects.toBe(residualFailure);
+    expect(attachmentLists).toBe(0);
+    expect(deletes).toBe(0);
+    bulkFailure = undefined;
+    await expect(
+      subject.assertSwitchDatabaseDeletionResidualsRemoved({
+        prior,
+        targetSpec,
+        currentRecord,
+        database,
+        fence,
+      }),
+    ).resolves.toBeUndefined();
+    expect(attachmentLists).toBe(0);
+    expect(bulkNamespaceLists).toBe(2);
+    await expect(
+      subject.deleteSwitchDatabaseBounded({
+        prior,
+        targetSpec,
+        database,
+        fence,
+      }),
+    ).resolves.toBeUndefined();
+    expect(attachmentLists).toBe(0);
+    expect(deletes).toBe(1);
+
+    await expect(
+      subject.exportSwitchDatabase({ prior, targetSpec, fence }),
+    ).resolves.toMatchObject({ databaseId: prior.databaseId });
+    expect(attachmentLists).toBe(1);
   });
 });

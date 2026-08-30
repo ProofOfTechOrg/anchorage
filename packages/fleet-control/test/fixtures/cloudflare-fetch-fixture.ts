@@ -263,6 +263,21 @@ export function recordingFetch(
   return { fetch: fixtureFetch, requests, probes, events };
 }
 
+function versionViewBindings(bindings: readonly unknown[]): readonly unknown[] {
+  return bindings.map((binding) => {
+    const cloned = structuredClone(binding);
+    if (
+      !cloned ||
+      typeof cloned !== 'object' ||
+      Array.isArray(cloned) ||
+      Reflect.get(cloned, 'type') !== 'secret_text'
+    ) {
+      return cloned;
+    }
+    return { name: Reflect.get(cloned, 'name'), type: 'secret_text' };
+  });
+}
+
 export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
   return async (request) => {
     const { method, url, body } = request;
@@ -686,7 +701,9 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
       const version = versions[0];
       return single({
         id: version?.versionId,
-        resources: { bindings: version?.bindings ?? [] },
+        resources: {
+          bindings: versionViewBindings(version?.bindings ?? []),
+        },
       });
     }
     const versionId = parts.at(-1);
@@ -705,7 +722,7 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
           version.tag === undefined
             ? undefined
             : { 'workers/tag': version.tag },
-        resources: { bindings: version.bindings },
+        resources: { bindings: versionViewBindings(version.bindings) },
       });
     }
     if (target.pathname.endsWith('/subdomain') && method === 'GET') {

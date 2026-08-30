@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it, vi } from 'vitest';
+import { backendSwitchDecommissionSnapshotDigest } from '../src/backend-switch.js';
 import { initialWorkerAttachmentScan } from '../src/cloudflare-worker-attachment-scan-state.js';
 import { DECOMMISSION_INTENT_BYTE_BOUND } from '../src/decommission-intent.js';
 import {
@@ -16,6 +17,7 @@ import {
 } from '../src/state-store.js';
 import type { FleetRecord, PlatformPlaneResourceSet } from '../src/types.js';
 import {
+  backendSwitchDecommissionRecordFixture,
   type NormalDecommissionIntentFixtureOptions,
   normalDecommissionIntentFixture,
 } from './fixtures/decommission-intent-fixture.js';
@@ -513,6 +515,73 @@ function externalPolicyAndTarget(record: FleetRecord) {
   };
 }
 
+function backendSwitchStateRecord(): FleetRecord {
+  const base = decommissionBase();
+  const { outboundPolicy, platformTarget } = externalPolicyAndTarget(base);
+  const prior = {
+    scriptName: base.scriptName,
+    artifactVersion: base.artifactVersion,
+    specDigest: base.desiredSpecDigest,
+    databaseId: base.databaseId,
+    databaseName: base.databaseName,
+    durableObjectBindings: [],
+    namespaceIds: [],
+    secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
+    application: { vars: [], secrets: [], r2Buckets: [] },
+    applicationResources: [],
+    customDomain: { id: 'domain-acme', hostname: base.routeHostname },
+  } as const;
+  const record: FleetRecord = {
+    ...base,
+    backend: 'workers-for-platforms',
+    outboundPolicy,
+    platformTarget,
+    platformResources: {
+      maintenanceCapabilityPublicKey: MAINTENANCE_PUBLIC_KEY,
+      outboundPolicy,
+      stateWorker: {
+        scriptName: base.scriptName,
+        artifactVersion: 'bridge-v1',
+        artifactDigest: platformTarget.stateArtifactDigest,
+        plane: 'ordinary',
+        durableObjectBindings: [],
+        namespaceIds: [],
+      },
+      egressProxy: {
+        scriptName: 'acme-production-egress',
+        artifactVersion: 'egress-v1',
+        artifactDigest: platformTarget.egressArtifactDigest,
+        ...outboundPolicy,
+      },
+    },
+  };
+  const decommissionSnapshot = {
+    prior,
+    restoredArtifactVersion: null,
+    entryPendingArtifactVersion: null,
+    entryPendingNamespaceIds: null,
+    providerTargetSpecDigest: base.desiredSpecDigest,
+    routeHostname: base.routeHostname,
+    routeTargets: [],
+    desiredSpecDigest: base.desiredSpecDigest,
+    target: platformTarget,
+    releases: [],
+    applicationResources: [],
+  } as const;
+  return backendSwitchDecommissionRecordFixture(record, {
+    kind: 'backend-switch',
+    tenantTag: record.tenantTag,
+    environment: record.environment,
+    prior,
+    targetSpecDigest: record.desiredSpecDigest,
+    targetApplication: { vars: [], secrets: [], r2Buckets: [] },
+    target: platformTarget,
+    rollbackUntil: '2026-09-30T00:00:00.000Z',
+    subphase: 'finalized',
+    decommissionSnapshot,
+  });
+}
+
 function platformSet(workerName: string): PlatformPlaneResourceSet {
   return {
     accountId: 'account',
@@ -915,11 +984,11 @@ describe('D1FleetStateStore release state', () => {
     await expectInvalidDecommission(store.get('acme', 'production'));
     db.row = persisted;
 
-    await expectInvalidDecommission(
+    await expect(
       store.withDeploymentLease('acme', 'production', (lease) =>
         lease.put({ ...valid, decommissionIntent: undefined }),
       ),
-    );
+    ).rejects.toThrow('backend switch decommission record is malformed');
     for (const malformed of [null, false]) {
       await expectInvalidDecommission(
         store.withDeploymentLease('acme', 'production', (lease) =>
@@ -1660,5 +1729,232 @@ describe('D1FleetStateStore release state', () => {
     await expect(store.get('acme', 'production')).rejects.toThrow(
       /invalid platform_resources/,
     );
+  });
+
+  it('persists backend-switch and decommission authorities atomically', async () => {
+    const record = backendSwitchStateRecord();
+    const db = new LostResponseD1();
+    const store = new D1FleetStateStore(db, { accountId: 'account' });
+
+    db.lose = 'exact';
+    await expect(
+      store.withDeploymentLease(record.tenantTag, record.environment, (lease) =>
+        lease.put(record),
+      ),
+    ).resolves.toBeUndefined();
+    await expect(
+      store.get(record.tenantTag, record.environment),
+    ).resolves.toEqual(record);
+    expect(db.row).toMatchObject({
+      phase: 'decommission-advancing',
+      backend_switch_intent: expect.any(String),
+      decommission_intent: expect.any(String),
+    });
+    const committedRow = db.row;
+    const committedClaims = [...db.claims.entries()];
+    const switchIntent = record.backendSwitchIntent;
+    if (!switchIntent)
+      throw new Error('backend-switch fixture lost its intent');
+    const batch = vi.spyOn(db, 'batch');
+    const batchCalls = batch.mock.calls.length;
+    let switchGetterCalls = 0;
+    const accessorRecord = { ...record };
+    Object.defineProperty(accessorRecord, 'backendSwitchIntent', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        switchGetterCalls += 1;
+        return switchIntent;
+      },
+    });
+    const hidingProxy = new Proxy(record, {
+      ownKeys(target) {
+        return Reflect.ownKeys(target).filter(
+          (key) => key !== 'backendSwitchIntent',
+        );
+      },
+    });
+    const revoked = Proxy.revocable(record, {});
+    revoked.revoke();
+    const hostileWrites = [
+      ['accessor', accessorRecord],
+      ['symbol', { ...record, [Symbol('hostile')]: true }],
+      ['transparent proxy', new Proxy(record, {})],
+      ['hiding proxy', hidingProxy],
+      ['revoked proxy', revoked.proxy],
+    ] as const;
+    for (const [label, hostile] of hostileWrites) {
+      await expect(
+        store.withDeploymentLease(
+          record.tenantTag,
+          record.environment,
+          (lease) => lease.put(hostile as FleetRecord),
+        ),
+        label,
+      ).rejects.toThrow('backend switch decommission record is malformed');
+      expect(batch.mock.calls.length, label).toBe(batchCalls);
+    }
+    expect(switchGetterCalls).toBe(0);
+    expect(db.row).toBe(committedRow);
+    expect([...db.claims.entries()]).toEqual(committedClaims);
+
+    await expect(
+      store.withDeploymentLease(record.tenantTag, record.environment, (lease) =>
+        lease.put({ ...record, backendSwitchIntent: undefined }),
+      ),
+    ).rejects.toThrow('backend switch decommission record is malformed');
+    await expect(
+      store.withDeploymentLease(record.tenantTag, record.environment, (lease) =>
+        lease.put({ ...record, decommissionIntent: undefined }),
+      ),
+    ).rejects.toThrow('backend switch decommission record is malformed');
+    const { backendSwitchIntent: _switchIntent, ...shellWithoutSwitch } =
+      record;
+    await expect(
+      store.withDeploymentLease(record.tenantTag, record.environment, (lease) =>
+        lease.put(shellWithoutSwitch),
+      ),
+    ).rejects.toThrow('backend switch decommission record is malformed');
+    const { outboundPolicy: _outboundPolicy, ...withoutOutboundPolicy } =
+      record;
+    await expect(
+      store.withDeploymentLease(record.tenantTag, record.environment, (lease) =>
+        lease.put(withoutOutboundPolicy),
+      ),
+    ).rejects.toThrow('backend switch decommission record is malformed');
+    await expect(
+      store.withDeploymentLease(record.tenantTag, record.environment, (lease) =>
+        lease.put({
+          ...record,
+          updatedAt: '2026-08-11T00:00:01.000Z',
+        }),
+      ),
+    ).rejects.toThrow('backend switch decommission record is malformed');
+    await expect(
+      store.withDeploymentLease(record.tenantTag, record.environment, (lease) =>
+        lease.put({
+          ...record,
+          backendSwitchIntent: {
+            ...switchIntent,
+            decommissionSnapshotSha256: 'f'.repeat(64),
+          },
+        }),
+      ),
+    ).rejects.toThrow('backend switch decommission record is malformed');
+    const routeMutant = (
+      mutation: 'outer-only' | 'snapshot-only' | 'outer-and-shell',
+    ): FleetRecord => {
+      const snapshot = switchIntent.decommissionSnapshot;
+      const shell = record.decommissionIntent;
+      if (
+        !snapshot ||
+        !shell ||
+        shell.state === 'complete' ||
+        shell.identity.mode.kind !== 'backend-switch'
+      ) {
+        throw new Error('backend-switch route fixture is incomplete');
+      }
+      if (mutation === 'outer-only') {
+        return { ...record, routeHostname: 'foreign.example.test' };
+      }
+      const changedSnapshot = {
+        ...snapshot,
+        routeHostname: 'foreign.example.test',
+      };
+      const changedSnapshotSha256 =
+        backendSwitchDecommissionSnapshotDigest(changedSnapshot);
+      return {
+        ...record,
+        ...(mutation === 'outer-and-shell'
+          ? { routeHostname: 'foreign.example.test' }
+          : {}),
+        backendSwitchIntent: {
+          ...switchIntent,
+          decommissionSnapshot: changedSnapshot,
+          decommissionSnapshotSha256: changedSnapshotSha256,
+        },
+        decommissionIntent: {
+          ...shell,
+          identity: {
+            ...shell.identity,
+            record: {
+              ...shell.identity.record,
+              ...(mutation === 'outer-and-shell'
+                ? { routeHostname: 'foreign.example.test' }
+                : {}),
+            },
+            mode: {
+              ...shell.identity.mode,
+              decommissionSnapshotSha256: changedSnapshotSha256,
+            },
+          },
+        },
+      };
+    };
+    for (const mutation of [
+      'outer-only',
+      'snapshot-only',
+      'outer-and-shell',
+    ] as const) {
+      await expect(
+        store.withDeploymentLease(
+          record.tenantTag,
+          record.environment,
+          (lease) => lease.put(routeMutant(mutation)),
+        ),
+        `${mutation} write`,
+      ).rejects.toThrow('backend switch decommission record is malformed');
+      expect(batch.mock.calls.length, mutation).toBe(batchCalls);
+      expect(db.row, mutation).toBe(committedRow);
+    }
+    expect(db.row).toBe(committedRow);
+    expect([...db.claims.entries()]).toEqual(committedClaims);
+
+    db.row = {
+      ...db.row,
+      updated_at: '2026-08-11T00:00:01.000Z',
+    };
+    await expect(
+      store.get(record.tenantTag, record.environment),
+    ).rejects.toThrow('backend switch decommission record is malformed');
+    db.row = committedRow;
+
+    for (const mutation of [
+      'outer-only',
+      'snapshot-only',
+      'outer-and-shell',
+    ] as const) {
+      const mutant = routeMutant(mutation);
+      db.row = {
+        ...committedRow,
+        route_hostname: mutant.routeHostname,
+        backend_switch_intent: JSON.stringify(mutant.backendSwitchIntent),
+        decommission_intent: JSON.stringify(mutant.decommissionIntent),
+      };
+      await expect(
+        store.get(record.tenantTag, record.environment),
+        `${mutation} read`,
+      ).rejects.toThrow('backend switch decommission record is malformed');
+    }
+    db.row = committedRow;
+
+    db.row = {
+      ...committedRow,
+      backend_switch_intent: null,
+      migration_intent: null,
+    };
+    await expect(
+      store.get(record.tenantTag, record.environment),
+    ).rejects.toThrow('backend switch decommission record is malformed');
+    db.row = committedRow;
+
+    db.row = {
+      ...db.row,
+      migration_intent: db.row?.backend_switch_intent,
+      backend_switch_intent: null,
+    };
+    await expect(
+      store.get(record.tenantTag, record.environment),
+    ).resolves.toEqual(record);
   });
 });

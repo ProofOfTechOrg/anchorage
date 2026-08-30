@@ -19,11 +19,14 @@ import {
 } from './application-bindings.js';
 import {
   assertBackendSwitchInactive,
+  BACKEND_SWITCH_RECORD_ERROR,
   type BackendSwitchProvider,
+  backendSwitchFleetRecordFromUnknown,
   decommissionBackendSwitch,
   type FinalizedOrdinaryStateProvider,
   finalizedBridgeForRecord,
   reconcileFinalizedBackendSwitchState,
+  structuralBackendSwitchFleetRecordFromUnknown,
 } from './backend-switch.js';
 import {
   activeExternalRelease,
@@ -34,6 +37,7 @@ import {
   reconcilePersistedDatabase,
   retainedExternalReleases,
 } from './decommission-advance.js';
+import { decommissionAdvanceIntentFromUnknown } from './decommission-intent.js';
 import { isSha256 } from './deployment-context.js';
 import { WorkerDeploymentError } from './deployment-error.js';
 import {
@@ -73,6 +77,22 @@ import {
   validateDeploymentSpec,
 } from './validation.js';
 
+function canonicalNormalDecommissionRecord(record: FleetRecord): FleetRecord {
+  const { decommissionIntent, ...source } = record;
+  try {
+    const intent = decommissionAdvanceIntentFromUnknown(
+      decommissionIntent,
+      source,
+    );
+    if (intent.identity.mode.kind !== 'normal') {
+      throw new Error(BACKEND_SWITCH_RECORD_ERROR);
+    }
+    return { ...source, decommissionIntent: intent };
+  } catch {
+    throw new Error(BACKEND_SWITCH_RECORD_ERROR);
+  }
+}
+
 export {
   assertImmutableDeploymentMapping,
   reconcilePersistedDatabase,
@@ -90,6 +110,26 @@ export class ProvisioningError extends Error {
     this.name = 'ProvisioningError';
     this.cleanupErrors = cleanupErrors;
   }
+}
+
+function canonicalStructuralValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalStructuralValue);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(
+    Object.keys(value as Record<string, unknown>)
+      .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0))
+      .map((key) => [
+        key,
+        canonicalStructuralValue((value as Record<string, unknown>)[key]),
+      ]),
+  );
+}
+
+function sameCanonicalStructure(left: unknown, right: unknown): boolean {
+  return (
+    JSON.stringify(canonicalStructuralValue(left)) ===
+    JSON.stringify(canonicalStructuralValue(right))
+  );
 }
 
 function nowIso(clock: () => number): string {
@@ -693,12 +733,18 @@ async function provisionDeploymentUnderLease(
           rollbackCompatibleTarget,
         );
         if (
-          JSON.stringify(platform.resources) !==
-            JSON.stringify(converged.platformResources) ||
-          JSON.stringify(rollbackCompatibleTarget) !==
-            JSON.stringify(converged.platformTarget) ||
-          JSON.stringify(rollbackCompatibleTarget.outboundPolicy) !==
-            JSON.stringify(converged.outboundPolicy)
+          !sameCanonicalStructure(
+            platform.resources,
+            converged.platformResources,
+          ) ||
+          !sameCanonicalStructure(
+            rollbackCompatibleTarget,
+            converged.platformTarget,
+          ) ||
+          !sameCanonicalStructure(
+            rollbackCompatibleTarget.outboundPolicy,
+            converged.outboundPolicy,
+          )
         ) {
           converged = {
             ...converged,
@@ -972,6 +1018,7 @@ async function provisionDeploymentUnderLease(
       );
       workerCreated = deployed.created;
       workerResourceState = deployed.created ? 'present' : 'absent';
+      const deployedDurableObjectTag = targetDurableObjectTag(spec);
       record = {
         ...record,
         phase: 'worker-deployed',
@@ -996,7 +1043,9 @@ async function provisionDeploymentUnderLease(
               },
             }
           : {}),
-        durableObjectTag: targetDurableObjectTag(spec),
+        ...(deployedDurableObjectTag
+          ? { durableObjectTag: deployedDurableObjectTag }
+          : {}),
         ...(spec.authoredBy === 'platform'
           ? {
               durableObjectMigrationHistory:
@@ -1121,11 +1170,14 @@ async function provisionDeploymentUnderLease(
           'maintenance bootstrap',
         );
       }
+      const liveDurableObjectTag = targetDurableObjectTag(spec);
       record = {
         ...record,
         phase: 'maintenance-armed',
         artifactVersion: live.artifactVersion,
-        durableObjectTag: targetDurableObjectTag(spec),
+        ...(liveDurableObjectTag
+          ? { durableObjectTag: liveDurableObjectTag }
+          : {}),
         ...(spec.authoredBy === 'platform'
           ? {
               durableObjectMigrationHistory:
@@ -1235,11 +1287,14 @@ async function provisionDeploymentUnderLease(
         readyRecord.activeRelease = readyRecord.pendingRelease;
         delete readyRecord.pendingRelease;
       }
+      const routedDurableObjectTag = targetDurableObjectTag(spec);
       record = {
         ...readyRecord,
         phase: 'ready',
         artifactVersion: attestation.artifactVersion,
-        durableObjectTag: targetDurableObjectTag(spec),
+        ...(routedDurableObjectTag
+          ? { durableObjectTag: routedDurableObjectTag }
+          : {}),
         durableObjectBindings: live.durableObjectBindings,
         updatedAt: nowIso(clock),
       };
@@ -1549,14 +1604,34 @@ export interface DecommissionDeploymentOptions {
 export async function decommissionDeployment(
   options: DecommissionDeploymentOptions,
 ): Promise<DecommissionResult> {
-  const current = await options.store.get(
+  const loaded = await options.store.get(
     options.spec.tenantTag,
     options.spec.environment,
   );
-  if (
-    current?.backendSwitchIntent &&
-    current.backendSwitchIntent.subphase !== 'decommissioned'
-  ) {
+  const reconstructed =
+    loaded === undefined
+      ? undefined
+      : structuralBackendSwitchFleetRecordFromUnknown(loaded);
+  let current = reconstructed?.record;
+  if (reconstructed?.carriesBackendSwitchAuthority) {
+    current = backendSwitchFleetRecordFromUnknown(current).record;
+    const currentSwitch = current.backendSwitchIntent;
+    if (!currentSwitch) {
+      throw new Error('backend switch decommission record is malformed');
+    }
+    if (currentSwitch.subphase === 'decommissioned') {
+      if (!currentSwitch.databaseExport) {
+        throw new Error(
+          'backend switch decommission did not commit its export',
+        );
+      }
+      const result = {
+        record: current,
+        databaseExport: currentSwitch.databaseExport,
+      };
+      await emitDecommissionAudit(options.audit, result.record, false);
+      return result;
+    }
     if (!options.backendSwitch) {
       throw new Error(
         'active backend switch decommission requires its dedicated provider and both specifications',
@@ -1567,20 +1642,25 @@ export async function decommissionDeployment(
       provider: options.backendSwitch.provider,
       priorSpec: options.backendSwitch.priorSpec,
       targetSpec: options.backendSwitch.targetSpec,
+      currentSpec: options.spec,
     });
-    const record = await options.store.get(
+    const stored = await options.store.get(
       options.spec.tenantTag,
       options.spec.environment,
     );
-    if (!record || !intent.databaseExport) {
+    const record = backendSwitchFleetRecordFromUnknown(stored).record;
+    if (!intent.databaseExport) {
       throw new Error('backend switch decommission did not commit its export');
     }
     const result = { record, databaseExport: intent.databaseExport };
     await emitDecommissionAudit(options.audit, result.record, false);
     return result;
   }
-  const hasNormalIntent =
-    current?.decommissionIntent?.identity.mode.kind === 'normal';
+  let hasNormalIntent = false;
+  if (current?.decommissionIntent !== undefined) {
+    current = canonicalNormalDecommissionRecord(current);
+    hasNormalIntent = true;
+  }
   const shellLessLatePhase =
     current !== undefined &&
     current.decommissionIntent === undefined &&

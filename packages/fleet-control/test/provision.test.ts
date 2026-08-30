@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { ActiveRouteAttestationError } from '../src/active-route.js';
 import type {
+  BackendSwitchProvider,
   BridgeMutationPlan,
   BridgeSnapshot,
   FinalizedOrdinaryStateProvider,
@@ -70,7 +71,10 @@ import { effectiveLifecyclePhase } from '../src/types.js';
 import { externalReleaseScriptName } from '../src/workers-for-platforms-backend.js';
 import { WranglerLoopBackend } from '../src/wrangler-loop-backend.js';
 import type { CommandResult, CommandRunner } from '../src/wrangler-runner.js';
-import { decommissionAdvancingRecordFixture } from './fixtures/decommission-intent-fixture.js';
+import {
+  backendSwitchDecommissionRecordFixture,
+  decommissionAdvancingRecordFixture,
+} from './fixtures/decommission-intent-fixture.js';
 import { memoryStore, routeApi } from './fixtures/plain-worker-port-probe.js';
 import {
   type PlainWorkerFsControl,
@@ -7335,6 +7339,81 @@ describe('fleet provisioning', () => {
     ).resolves.toMatchObject({ record: { phase: 'decommissioned' } });
     expect(activeAudit).toHaveBeenCalledTimes(1);
 
+    const malformedNormal = await boundedDecommissionHarness();
+    await startBoundedDecommission(malformedNormal);
+    const normalRecord = malformedNormal.store.record;
+    const normalIntent = normalRecord?.decommissionIntent;
+    if (!normalRecord || !normalIntent) {
+      throw new Error('normal decommission fixture lacks its active intent');
+    }
+    const { identity: _missingIdentity, ...withoutIdentity } = normalIntent;
+    const { mode: _missingMode, ...identityWithoutMode } =
+      normalIntent.identity;
+    let identityGetterCalls = 0;
+    const accessorIntent = { ...normalIntent };
+    Object.defineProperty(accessorIntent, 'identity', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        identityGetterCalls += 1;
+        return normalIntent.identity;
+      },
+    });
+    const malformedNormalRows: readonly (readonly [string, unknown])[] = [
+      ['empty shell', {}],
+      ['missing identity', withoutIdentity],
+      ['missing mode', { ...normalIntent, identity: identityWithoutMode }],
+      [
+        'unknown mode',
+        {
+          ...normalIntent,
+          identity: { ...normalIntent.identity, mode: { kind: 'future' } },
+        },
+      ],
+      ['malformed normal shell', { ...normalIntent, revision: -1 }],
+      ['accessor shell', accessorIntent],
+      ['transparent proxy shell', new Proxy(normalIntent, {})],
+    ];
+    let normalBackendTrapCalls = 0;
+    const normalBackendTrap = new Proxy({} as ProvisioningBackend, {
+      get() {
+        normalBackendTrapCalls += 1;
+        throw new Error('malformed normal shell read the provider');
+      },
+      has() {
+        normalBackendTrapCalls += 1;
+        throw new Error('malformed normal shell reflected the provider');
+      },
+    });
+    const malformedNormalAudit = vi.fn();
+    for (const [label, shell] of malformedNormalRows) {
+      const hostileStore = new MemoryStore();
+      hostileStore.record = {
+        ...normalRecord,
+        decommissionIntent: shell,
+      } as FleetRecord;
+      let failure: unknown;
+      try {
+        await decommissionDeployment({
+          backend: normalBackendTrap,
+          store: hostileStore,
+          spec: malformedNormal.deployment,
+          audit: malformedNormalAudit,
+        });
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure, label).toBeInstanceOf(Error);
+      expect((failure as Error).name, label).toBe('Error');
+      expect((failure as Error).message, label).toBe(
+        'backend switch decommission record is malformed',
+      );
+      expect(hostileStore.leaseCalls, label).toBe(0);
+    }
+    expect(identityGetterCalls).toBe(0);
+    expect(normalBackendTrapCalls).toBe(0);
+    expect(malformedNormalAudit).not.toHaveBeenCalled();
+
     const activeSwitch = await boundedDecommissionHarness();
     activeSwitch.store.record = {
       ...(activeSwitch.store.record as FleetRecord),
@@ -7357,9 +7436,7 @@ describe('fleet provisioning', () => {
         store: activeSwitch.store,
         spec: activeSwitch.deployment,
       }),
-    ).rejects.toThrow(
-      'active backend switch decommission requires its dedicated provider and both specifications',
-    );
+    ).rejects.toThrow('backend switch decommission record is malformed');
 
     const race = await boundedDecommissionHarness();
     const ready = race.store.record as FleetRecord;
@@ -7674,5 +7751,340 @@ describe('fleet provisioning', () => {
     expect(withoutArtifact.store.record).not.toHaveProperty(
       'pendingSpecDigest',
     );
+  });
+
+  it('drains bounded backend-switch teardown and preserves legacy late recovery', async () => {
+    const harness = await boundedDecommissionHarness({
+      kind: 'workers-for-platforms',
+      external: true,
+    });
+    const current = harness.store.record;
+    if (!current?.platformTarget || !current.platformResources) {
+      throw new Error(
+        'backend-switch wrapper fixture lacks platform authority',
+      );
+    }
+    const priorSpec: DeploymentSpec = {
+      ...harness.deployment,
+      authoredBy: 'platform',
+    };
+    const prior = {
+      scriptName: current.scriptName,
+      artifactVersion: current.artifactVersion,
+      specDigest: deploymentSpecDigest(priorSpec),
+      databaseId: current.databaseId,
+      databaseName: current.databaseName,
+      durableObjectBindings: current.durableObjectBindings,
+      namespaceIds: current.durableObjectBindings.map(
+        ({ namespaceId }) => namespaceId,
+      ),
+      secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
+      application: current.applicationBindings,
+      applicationResources: [],
+      customDomain: {
+        id: 'domain-acme',
+        hostname: current.routeHostname,
+      },
+    } as const;
+    const databaseExport: DatabaseExport = {
+      databaseId: current.databaseId,
+      location: 'memory://fleet-exports/backend-switch.sql',
+      sha256: 'f'.repeat(64),
+      size: 37,
+    };
+    const decommissionSnapshot = {
+      prior,
+      restoredArtifactVersion: null,
+      entryPendingArtifactVersion: null,
+      entryPendingNamespaceIds: null,
+      providerTargetSpecDigest: current.desiredSpecDigest,
+      routeHostname: current.routeHostname,
+      routeTargets: [],
+      desiredSpecDigest: current.desiredSpecDigest,
+      target: current.platformTarget,
+      releases: [],
+      applicationResources: [],
+    } as const;
+    harness.store.record = backendSwitchDecommissionRecordFixture(
+      JSON.parse(JSON.stringify(current)) as FleetRecord,
+      {
+        kind: 'backend-switch',
+        tenantTag: current.tenantTag,
+        environment: current.environment,
+        prior,
+        targetSpecDigest: current.desiredSpecDigest,
+        targetApplication: current.applicationBindings ?? {
+          vars: [],
+          secrets: [],
+          r2Buckets: [],
+        },
+        target: current.platformTarget,
+        rollbackUntil: '2026-09-30T00:00:00.000Z',
+        subphase: 'decommission-application-r2-removed',
+        applicationR2Progress: [],
+        decommissionSnapshot,
+      },
+      { subphase: 'decommission-application-r2-removed' },
+    );
+    const audit = vi.fn();
+    const providerTrap = new Proxy({} as ProvisioningBackend, {
+      get() {
+        throw new Error('terminal switch read the normal provider');
+      },
+      has() {
+        throw new Error('terminal switch reflected the normal provider');
+      },
+    });
+    let databasePresent = true;
+    let scanCalls = 0;
+    let receiptCalls = 0;
+    let boundedDeleteCalls = 0;
+    let legacyExportCalls = 0;
+    let legacyDeleteCalls = 0;
+    const boundedProvider = {
+      databaseExportReceiptAuthority: RECEIPT_AUTHORITY,
+      async advanceSwitchDecommissionAttachmentScan() {
+        scanCalls += 1;
+        return {
+          status: 'complete',
+          evidenceSha256: 'a'.repeat(64),
+          evidenceCount: 2,
+          providerFetchAttemptsReserved: 3,
+        };
+      },
+      async exportSwitchDatabaseReceipt() {
+        receiptCalls += 1;
+        return databaseExport;
+      },
+      async getSwitchDatabase(databaseId: string) {
+        return databasePresent && databaseId === current.databaseId
+          ? {
+              id: current.databaseId,
+              name: current.databaseName,
+              created: false as const,
+            }
+          : undefined;
+      },
+      async readSwitchDatabaseOwner() {
+        return current.tenantTag;
+      },
+      async assertSwitchDatabaseDeletionResidualsRemoved() {},
+      async deleteSwitchDatabaseBounded() {
+        boundedDeleteCalls += 1;
+        databasePresent = false;
+      },
+      async exportSwitchDatabase() {
+        legacyExportCalls += 1;
+        return databaseExport;
+      },
+      async deleteSwitchDatabase() {
+        legacyDeleteCalls += 1;
+      },
+    } as unknown as BackendSwitchProvider;
+    const activeRecord = harness.store.record as FleetRecord;
+    const rejectedAudit = vi.fn();
+    const missingProviderStore = new MemoryStore();
+    missingProviderStore.record = activeRecord;
+    await expect(
+      decommissionDeployment({
+        backend: providerTrap,
+        store: missingProviderStore,
+        spec: harness.deployment,
+        audit: rejectedAudit,
+      }),
+    ).rejects.toThrow(
+      'active backend switch decommission requires its dedicated provider and both specifications',
+    );
+    const partialStore = new MemoryStore();
+    partialStore.record = activeRecord;
+    await expect(
+      decommissionDeployment({
+        backend: providerTrap,
+        store: partialStore,
+        spec: harness.deployment,
+        audit: rejectedAudit,
+        backendSwitch: {
+          provider: {
+            advanceSwitchDecommissionAttachmentScan:
+              boundedProvider.advanceSwitchDecommissionAttachmentScan,
+            databaseExportReceiptAuthority: RECEIPT_AUTHORITY,
+          } as unknown as BackendSwitchProvider,
+          priorSpec,
+          targetSpec: harness.deployment,
+        },
+      }),
+    ).rejects.toThrow('database export receipt capability is malformed');
+    expect(rejectedAudit).not.toHaveBeenCalled();
+
+    let backendSwitchGetterCalls = 0;
+    const accessorRecord = { ...activeRecord };
+    Object.defineProperty(accessorRecord, 'backendSwitchIntent', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        backendSwitchGetterCalls += 1;
+        return activeRecord.backendSwitchIntent;
+      },
+    });
+    const hidingProxy = new Proxy(activeRecord, {
+      ownKeys(target) {
+        return Reflect.ownKeys(target).filter(
+          (key) => key !== 'backendSwitchIntent',
+        );
+      },
+    });
+    let revokeAfterResolution = () => {};
+    const revoked = Proxy.revocable(activeRecord, {
+      get(target, property, receiver) {
+        if (property === 'then') {
+          queueMicrotask(revokeAfterResolution);
+          return undefined;
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    revokeAfterResolution = revoked.revoke;
+    const {
+      backendSwitchIntent: _removedSwitchIntent,
+      ...backendShellWithoutSwitch
+    } = activeRecord;
+    const hostileRows = [
+      ['accessor', accessorRecord],
+      ['symbol', { ...activeRecord, [Symbol('hostile')]: true }],
+      ['transparent proxy', new Proxy(activeRecord, {})],
+      ['hiding proxy', hidingProxy],
+      ['revoked proxy', revoked.proxy],
+      ['backend shell without switch', backendShellWithoutSwitch],
+    ] as const;
+    for (const [label, hostile] of hostileRows) {
+      const hostileStore = new MemoryStore();
+      hostileStore.record = hostile as FleetRecord;
+      await expect(
+        decommissionDeployment({
+          backend: providerTrap,
+          store: hostileStore,
+          spec: harness.deployment,
+          audit: rejectedAudit,
+        }),
+        label,
+      ).rejects.toThrow('backend switch decommission record is malformed');
+      expect(hostileStore.leaseCalls, label).toBe(0);
+    }
+    expect(backendSwitchGetterCalls).toBe(0);
+    expect(scanCalls).toBe(0);
+    expect(receiptCalls).toBe(0);
+    expect(boundedDeleteCalls).toBe(0);
+    expect(rejectedAudit).not.toHaveBeenCalled();
+
+    const boundedResult = await decommissionDeployment({
+      backend: providerTrap,
+      store: harness.store,
+      spec: harness.deployment,
+      audit,
+      backendSwitch: {
+        provider: boundedProvider,
+        priorSpec,
+        targetSpec: harness.deployment,
+      },
+    });
+    expect(boundedResult).toEqual({
+      record: harness.store.record,
+      databaseExport,
+    });
+    expect(audit).toHaveBeenCalledTimes(1);
+    expect(scanCalls).toBe(4);
+    expect(receiptCalls).toBe(1);
+    expect(boundedDeleteCalls).toBe(1);
+    expect(legacyExportCalls).toBe(0);
+    expect(legacyDeleteCalls).toBe(0);
+
+    const auditFailure = new Error('backend-switch audit rejected');
+    await expect(
+      decommissionDeployment({
+        backend: providerTrap,
+        store: harness.store,
+        spec: harness.deployment,
+        audit: () => Promise.reject(auditFailure),
+      }),
+    ).rejects.toBe(auditFailure);
+
+    const legacyStore = new MemoryStore();
+    legacyStore.record = {
+      ...(JSON.parse(JSON.stringify(current)) as FleetRecord),
+      backendSwitchIntent: {
+        kind: 'backend-switch',
+        tenantTag: current.tenantTag,
+        environment: current.environment,
+        prior,
+        targetSpecDigest: current.desiredSpecDigest,
+        targetApplication: current.applicationBindings ?? {
+          vars: [],
+          secrets: [],
+          r2Buckets: [],
+        },
+        target: current.platformTarget,
+        rollbackUntil: '2026-09-30T00:00:00.000Z',
+        subphase: 'decommission-exported',
+        databaseExport,
+        applicationR2Progress: [],
+        decommissionSnapshot: {
+          routeHostname: current.routeHostname,
+          routeTargets: [],
+          desiredSpecDigest: current.desiredSpecDigest,
+          target: current.platformTarget,
+          releases: [],
+          applicationResources: [],
+        },
+      },
+    };
+    databasePresent = true;
+    const lateGetter = vi.fn(() => {
+      throw new Error('legacy late row read a bounded capability');
+    });
+    const legacyProvider = new Proxy(boundedProvider, {
+      get(target, property, receiver) {
+        if (
+          property === 'advanceSwitchDecommissionAttachmentScan' ||
+          property === 'databaseExportReceiptAuthority' ||
+          property === 'exportSwitchDatabaseReceipt'
+        ) {
+          return lateGetter();
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const legacyAudit = vi.fn();
+    const legacyResult = await decommissionDeployment({
+      backend: providerTrap,
+      store: legacyStore,
+      spec: harness.deployment,
+      audit: legacyAudit,
+      backendSwitch: {
+        provider: legacyProvider,
+        priorSpec,
+        targetSpec: harness.deployment,
+      },
+    });
+    expect(legacyResult).toEqual({
+      record: legacyStore.record,
+      databaseExport,
+    });
+    expect(lateGetter).not.toHaveBeenCalled();
+    expect(legacyAudit).toHaveBeenCalledTimes(1);
+    expect(legacyExportCalls).toBe(0);
+    expect(legacyDeleteCalls).toBe(1);
+
+    const malformed = harness.store.record;
+    harness.store.record = {
+      ...malformed,
+      backendSwitchIntent: undefined,
+    };
+    await expect(
+      decommissionDeployment({
+        backend: providerTrap,
+        store: harness.store,
+        spec: harness.deployment,
+      }),
+    ).rejects.toThrow('backend switch decommission record is malformed');
   });
 });

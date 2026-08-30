@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { createHash, randomUUID } from 'node:crypto';
-import { backendSwitchIntentFromUnknown } from './backend-switch.js';
+import {
+  BACKEND_SWITCH_RECORD_ERROR,
+  backendSwitchFleetRecordFromUnknown,
+  backendSwitchIntentFromUnknown,
+  structuralBackendSwitchFleetRecordFromUnknown,
+} from './backend-switch.js';
 import {
   DECOMMISSION_INTENT_BYTE_BOUND,
   decommissionAdvanceIntentFromUnknown,
@@ -1190,15 +1195,51 @@ function toRecord(row: Readonly<Record<string, unknown>>): FleetRecord {
       : {}),
     updatedAt: rowString(row, 'updated_at'),
   };
+  let rawDecommissionIntent: unknown;
+  try {
+    const value = row.decommission_intent;
+    if (value !== null && value !== undefined) {
+      if (
+        typeof value !== 'string' ||
+        value.length > DECOMMISSION_INTENT_BYTE_BOUND ||
+        new TextEncoder().encode(value).byteLength >
+          DECOMMISSION_INTENT_BYTE_BOUND
+      ) {
+        throw new Error();
+      }
+      rawDecommissionIntent = JSON.parse(value) as unknown;
+    }
+  } catch {
+    if (backendSwitchIntent) throw new Error(BACKEND_SWITCH_RECORD_ERROR);
+    throw invalidDecommissionIntent();
+  }
+  const reconstructed = structuralBackendSwitchFleetRecordFromUnknown({
+    ...provisional,
+    ...(rawDecommissionIntent === undefined
+      ? {}
+      : { decommissionIntent: rawDecommissionIntent }),
+  });
+  if (reconstructed.carriesBackendSwitchAuthority) {
+    const canonical = backendSwitchFleetRecordFromUnknown(
+      reconstructed.record,
+    ).record;
+    validateRecordCrossFields(canonical);
+    return canonical;
+  }
+  const { decommissionIntent: _rawDecommissionIntent, ...normalProvisional } =
+    reconstructed.record;
   const decommissionIntent = optionalDecommissionIntent(
     row.decommission_intent,
-    provisional,
+    normalProvisional,
   );
-  if (phase === 'decommission-advancing' && !decommissionIntent) {
+  if (
+    normalProvisional.phase === 'decommission-advancing' &&
+    !decommissionIntent
+  ) {
     throw invalidDecommissionIntent();
   }
   const record: FleetRecord = {
-    ...provisional,
+    ...normalProvisional,
     ...(decommissionIntent ? { decommissionIntent } : {}),
   };
   validateRecordCrossFields(record);
@@ -1206,6 +1247,13 @@ function toRecord(row: Readonly<Record<string, unknown>>): FleetRecord {
 }
 
 function normalizeRecordForWrite(record: FleetRecord): FleetRecord {
+  const reconstructed = structuralBackendSwitchFleetRecordFromUnknown(record);
+  record = reconstructed.record;
+  if (reconstructed.carriesBackendSwitchAuthority) {
+    const canonical = backendSwitchFleetRecordFromUnknown(record).record;
+    validateRecordCrossFields(canonical);
+    return canonical;
+  }
   const hasDecommissionIntent = Object.hasOwn(record, 'decommissionIntent');
   const suppliedDecommissionIntent = record.decommissionIntent;
   if (hasDecommissionIntent && suppliedDecommissionIntent === undefined) {
@@ -1801,13 +1849,13 @@ export class D1FleetStateStore
     token: string,
     record: FleetRecord,
   ): Promise<void> {
+    record = normalizeRecordForWrite(record);
     deploymentKey(record.tenantTag, record.environment);
     if (record.tenantTag !== tenantTag || record.environment !== environment) {
       throw new Error(
         `deployment lease '${tenantTag}:${environment}' cannot write '${record.tenantTag}:${record.environment}'`,
       );
     }
-    record = normalizeRecordForWrite(record);
     const decommissionIntent = record.decommissionIntent
       ? JSON.stringify(record.decommissionIntent)
       : null;

@@ -138,6 +138,9 @@ export type DecommissionAdvanceCapability =
   | 'attachment-scan'
   | 'database-residuals'
   | 'database-export-receipt'
+  | 'database-read'
+  | 'database-delete'
+  | 'pending-artifact-inspection'
   | 'application-r2-inspection'
   | 'application-r2-empty'
   | 'application-r2-delete';
@@ -150,6 +153,11 @@ const CAPABILITY_MESSAGES: Readonly<
   'database-residuals': 'backend cannot inspect database deletion residuals',
   'database-export-receipt':
     'backend cannot write idempotent database export receipts',
+  'database-read': 'backend cannot read the database for bounded decommission',
+  'database-delete':
+    'backend cannot delete the database for bounded decommission',
+  'pending-artifact-inspection':
+    'backend cannot inspect pending ordinary Worker authority for bounded decommission',
   'application-r2-inspection':
     'backend cannot inspect application R2 resources',
   'application-r2-empty': 'backend cannot attest application R2 emptiness',
@@ -494,6 +502,31 @@ type IntentTransition =
       lifecyclePhase?: NormalDecommissionLifecyclePhase;
     }>;
 
+/** @internal State transition emitted by the shared bounded scan step. */
+export type DecommissionIntentTransition = IntentTransition;
+
+/** @internal Provider-neutral callbacks for one discover/verify scan chunk. */
+export interface DecommissionAttachmentScanStepOptions {
+  readonly intent: Extract<
+    DecommissionAdvanceIntent,
+    { readonly state: 'discover' | 'verify' }
+  >;
+  readonly scan: (
+    input: import('./types.js').DecommissionAttachmentScanInput,
+  ) => Promise<unknown>;
+  readonly maxProviderRequests: number;
+  readonly signal?: AbortSignal;
+  readonly persist: (
+    transition: DecommissionIntentTransition,
+  ) => Promise<FleetRecord>;
+  readonly consumeMatchingVerify: (
+    input: Readonly<{
+      intent: Extract<DecommissionAdvanceIntent, { readonly state: 'verify' }>;
+      evidence: DecommissionAttachmentScanEvidence;
+    }>,
+  ) => Promise<FleetRecord>;
+}
+
 function nextIntent(
   intent: Exclude<DecommissionAdvanceIntent, { readonly state: 'complete' }>,
   timestamp: string,
@@ -691,6 +724,113 @@ function purposeTarget(purpose: DecommissionAttachmentPurpose) {
   return purpose.kind === 'application-r2-detach'
     ? ({ kind: 'r2', bucketName: purpose.bucketName } as const)
     : ({ kind: 'd1', databaseId: purpose.databaseId } as const);
+}
+
+/** @internal Advances one strict provider-neutral discover/verify scan step. */
+export async function advanceDecommissionAttachmentScanStep(
+  options: DecommissionAttachmentScanStepOptions,
+): Promise<FleetRecord> {
+  const { intent } = options;
+  const raw = await options.scan({
+    progress: intent.progress,
+    maxProviderRequests: options.maxProviderRequests,
+    signal: options.signal,
+  });
+  let plain: unknown;
+  try {
+    plain = cloneBoundedPlainData(raw, {
+      maxDepth: RESULT_PLAIN_DATA_DEPTH_BOUND,
+      maxNodes: RESULT_PLAIN_DATA_NODE_BOUND,
+      maxScalarBytes: RESULT_PLAIN_DATA_BYTE_BOUND,
+      maxSerializedBytes: RESULT_PLAIN_DATA_BYTE_BOUND,
+      error: () => new Error(RESULT_ERROR),
+    });
+    Reflect.apply(STRUCTURED_CLONE, undefined, [raw]);
+  } catch {
+    return malformedResult();
+  }
+  if (!plain || typeof plain !== 'object' || Array.isArray(plain)) {
+    return malformedResult();
+  }
+  const result = plain as Record<string, unknown>;
+  if (result.status === 'drift') {
+    return options.persist({
+      state: 'discover',
+      purpose: intent.purpose,
+      progress: initialWorkerAttachmentScan(purposeTarget(intent.purpose)),
+      generation: intent.generation + 1,
+    });
+  }
+  assertReservedAttempts(
+    result.providerFetchAttemptsReserved,
+    options.maxProviderRequests,
+  );
+  if (result.status === 'pending') {
+    let progress: DecommissionAttachmentProgress;
+    try {
+      progress = parseWorkerAttachmentScanProgress(
+        result.progress,
+        purposeTarget(intent.purpose),
+      );
+    } catch {
+      return malformedResult();
+    }
+    return options.persist(
+      intent.state === 'verify'
+        ? {
+            state: 'verify',
+            purpose: intent.purpose,
+            progress,
+            discoverEvidence: intent.discoverEvidence,
+          }
+        : { state: 'discover', purpose: intent.purpose, progress },
+    );
+  }
+  if (result.status === 'attached') {
+    return options.persist({
+      state: 'blocked',
+      purpose: intent.purpose,
+      attachment: safeAttachment(result.attachment),
+    });
+  }
+  if (
+    result.status !== 'complete' ||
+    typeof result.evidenceSha256 !== 'string' ||
+    !Number.isSafeInteger(result.evidenceCount)
+  ) {
+    return malformedResult();
+  }
+  const evidence = {
+    evidenceSha256: result.evidenceSha256,
+    evidenceCount: Number(result.evidenceCount),
+  };
+  if (
+    !/^[a-f0-9]{64}$/u.test(evidence.evidenceSha256) ||
+    evidence.evidenceCount < 2 ||
+    evidence.evidenceCount > WORKER_ATTACHMENT_EVIDENCE_BOUND
+  ) {
+    return malformedResult();
+  }
+  if (intent.state === 'discover') {
+    return options.persist({
+      state: 'verify',
+      purpose: intent.purpose,
+      progress: initialWorkerAttachmentScan(purposeTarget(intent.purpose)),
+      discoverEvidence: evidence,
+    });
+  }
+  if (
+    evidence.evidenceSha256 !== intent.discoverEvidence.evidenceSha256 ||
+    evidence.evidenceCount !== intent.discoverEvidence.evidenceCount
+  ) {
+    return options.persist({
+      state: 'discover',
+      purpose: intent.purpose,
+      progress: initialWorkerAttachmentScan(purposeTarget(intent.purpose)),
+      generation: intent.generation + 1,
+    });
+  }
+  return options.consumeMatchingVerify({ intent, evidence });
 }
 
 async function commitShellOnly(
@@ -1466,144 +1606,44 @@ async function advanceAttachmentScan(
     options.backend.advanceDecommissionAttachmentScan,
     'attachment-scan',
   ).bind(options.backend);
-  const raw: unknown = await scan({
-    progress: intent.progress,
+  const clock = options.clock ?? Date.now;
+  return advanceDecommissionAttachmentScanStep({
+    intent,
+    scan,
     maxProviderRequests: options.maxProviderRequests,
     signal: options.signal,
-  });
-  let plain: unknown;
-  try {
-    plain = cloneBoundedPlainData(raw, {
-      maxDepth: RESULT_PLAIN_DATA_DEPTH_BOUND,
-      maxNodes: RESULT_PLAIN_DATA_NODE_BOUND,
-      maxScalarBytes: RESULT_PLAIN_DATA_BYTE_BOUND,
-      maxSerializedBytes: RESULT_PLAIN_DATA_BYTE_BOUND,
-      error: () => new Error(RESULT_ERROR),
-    });
-    Reflect.apply(STRUCTURED_CLONE, undefined, [raw]);
-  } catch {
-    return malformedResult();
-  }
-  if (!plain || typeof plain !== 'object' || Array.isArray(plain)) {
-    malformedResult();
-  }
-  const result = plain as Record<string, unknown>;
-  const clock = options.clock ?? Date.now;
-  if (result.status === 'drift') {
-    return commitShellOnly(lease, record, intent, clock, {
-      state: 'discover',
-      purpose: intent.purpose,
-      progress: initialWorkerAttachmentScan(purposeTarget(intent.purpose)),
-      generation: intent.generation + 1,
-    });
-  }
-  assertReservedAttempts(
-    result.providerFetchAttemptsReserved,
-    options.maxProviderRequests,
-  );
-  if (result.status === 'pending') {
-    let progress: DecommissionAttachmentProgress;
-    try {
-      progress = parseWorkerAttachmentScanProgress(
-        result.progress,
-        purposeTarget(intent.purpose),
-      );
-    } catch {
-      return malformedResult();
-    }
-    return commitShellOnly(
-      lease,
-      record,
-      intent,
-      clock,
-      intent.state === 'verify'
-        ? {
-            state: 'verify',
-            purpose: intent.purpose,
-            progress,
-            discoverEvidence: intent.discoverEvidence,
-          }
-        : { state: 'discover', purpose: intent.purpose, progress },
-    );
-  }
-  if (result.status === 'attached') {
-    return commitShellOnly(lease, record, intent, clock, {
-      state: 'blocked',
-      purpose: intent.purpose,
-      attachment: safeAttachment(result.attachment),
-    });
-  }
-  if (
-    result.status !== 'complete' ||
-    typeof result.evidenceSha256 !== 'string' ||
-    !Number.isSafeInteger(result.evidenceCount)
-  ) {
-    return malformedResult();
-  }
-  const evidence = {
-    evidenceSha256: result.evidenceSha256,
-    evidenceCount: Number(result.evidenceCount),
-  };
-  if (
-    !/^[a-f0-9]{64}$/u.test(evidence.evidenceSha256) ||
-    evidence.evidenceCount < 2 ||
-    evidence.evidenceCount > WORKER_ATTACHMENT_EVIDENCE_BOUND
-  ) {
-    return malformedResult();
-  }
-  if (intent.state === 'discover') {
-    let next: DecommissionAdvanceIntent;
-    try {
-      next = nextIntent(intent, nowIso(clock), {
-        state: 'verify',
-        purpose: intent.purpose,
-        progress: initialWorkerAttachmentScan(purposeTarget(intent.purpose)),
-        discoverEvidence: evidence,
+    persist: (transition) =>
+      commitShellOnly(lease, record, intent, clock, transition),
+    consumeMatchingVerify: async ({ intent: verified }) => {
+      if (verified.purpose.kind !== 'application-r2-detach') {
+        return consumeDatabaseVerify(options, lease, record, verified, receipt);
+      }
+      await lease.assertOwned();
+      const detached = await advanceApplicationR2Deletion({
+        spec: options.spec,
+        resources: record.applicationResources ?? [],
+        backend: inspectionBackend as NonNullable<typeof inspectionBackend>,
+        fence: lease,
+        startResourceIndex: 0,
+        verifiedDetachmentResourceIndex: verified.purpose.resourceIndex,
       });
-      next = normalizeIntent(next, record);
-    } catch {
-      return malformedResult();
-    }
-    return writeIntent(lease, record, next);
-  }
-  if (
-    evidence.evidenceSha256 !== intent.discoverEvidence.evidenceSha256 ||
-    evidence.evidenceCount !== intent.discoverEvidence.evidenceCount
-  ) {
-    return commitShellOnly(lease, record, intent, clock, {
-      state: 'discover',
-      purpose: intent.purpose,
-      progress: initialWorkerAttachmentScan(purposeTarget(intent.purpose)),
-      generation: intent.generation + 1,
-    });
-  }
-  if (intent.purpose.kind !== 'application-r2-detach') {
-    return consumeDatabaseVerify(options, lease, record, intent, receipt);
-  }
-  await lease.assertOwned();
-  const detached = await advanceApplicationR2Deletion({
-    spec: options.spec,
-    resources: record.applicationResources ?? [],
-    backend: inspectionBackend as NonNullable<typeof inspectionBackend>,
-    fence: lease,
-    startResourceIndex: 0,
-    verifiedDetachmentResourceIndex: intent.purpose.resourceIndex,
+      if (
+        detached.status !== 'resource-advanced' ||
+        detached.resourceIndex !== verified.purpose.resourceIndex ||
+        detached.resources[detached.resourceIndex]?.state !== 'detached'
+      ) {
+        return malformedResult();
+      }
+      return commitRecord(
+        lease,
+        record,
+        verified,
+        clock,
+        { applicationResources: detached.resources },
+        { state: 'transitioning' },
+      );
+    },
   });
-  if (
-    detached.status !== 'resource-advanced' ||
-    detached.resourceIndex !== intent.purpose.resourceIndex ||
-    detached.resources[detached.resourceIndex]?.state !== 'detached'
-  ) {
-    return malformedResult();
-  }
-  return commitRecord(
-    lease,
-    record,
-    intent,
-    clock,
-    { applicationResources: detached.resources },
-    { state: 'transitioning' },
-  );
 }
 
 function startRecord(

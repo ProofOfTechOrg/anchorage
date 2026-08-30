@@ -18,9 +18,11 @@ import {
   decommissionAdvanceIntentFromUnknown,
   parseDecommissionAdvanceToken,
 } from '../src/decommission-intent.js';
+import { canonicalDeploymentEgressPolicy } from '../src/platform-resources.js';
 import {
   type ApplicationR2Resource,
   assertNoActiveDecommission,
+  type BackendSwitchIntent,
   type DecommissionAdvanceIntent,
   type DecommissionAttachmentPurpose,
   effectiveLifecyclePhase,
@@ -28,6 +30,7 @@ import {
   type NormalDecommissionLifecyclePhase,
   PROVISIONING_PHASES,
 } from '../src/types.js';
+import { backendSwitchDecommissionRecordFixture } from './fixtures/decommission-intent-fixture.js';
 
 const OPERATION_ID = '12345678-1234-4abc-8def-1234567890ab';
 const DATABASE_ID = '00000000-0000-0000-0000-000000000001';
@@ -108,6 +111,72 @@ function identity(
       entryLifecyclePhase,
     },
   };
+}
+
+function backendSwitchRecord(): FleetRecord {
+  const base = fleetRecord({
+    backend: 'workers-for-platforms',
+    phase: 'ready',
+    applicationResources: [],
+    applicationBindings: { vars: [], secrets: [], r2Buckets: [] },
+  });
+  const outboundPolicy = canonicalDeploymentEgressPolicy({
+    policyId: 'policy-acme',
+    tenantTag: base.tenantTag,
+    environment: base.environment,
+    allowedHosts: [],
+  });
+  const target = {
+    maintenanceCapabilityPublicKey:
+      '{"kty":"OKP","crv":"Ed25519","alg":"EdDSA","kid":"fleet-maintenance-v1","x":"Lhp1XFeTJJx8FLOCKpn4nkO-tWuZZxXX8ziw0LEvUZo"}',
+    stateArtifactDigest: 'd'.repeat(64),
+    stateDurableObjectHistoryDigest: 'e'.repeat(64),
+    egressArtifactDigest: 'f'.repeat(64),
+    d1SchemaVersion: base.schemaVersion,
+    d1SchemaHistoryDigest: '1'.repeat(64),
+    outboundPolicy,
+  } as const;
+  const prior = {
+    scriptName: base.scriptName,
+    artifactVersion: base.artifactVersion,
+    specDigest: base.desiredSpecDigest,
+    databaseId: base.databaseId,
+    databaseName: base.databaseName,
+    durableObjectBindings: [],
+    namespaceIds: [],
+    secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
+    application: { vars: [], secrets: [], r2Buckets: [] },
+    applicationResources: [],
+    customDomain: { id: 'domain-acme', hostname: base.routeHostname },
+  } as const;
+  const decommissionSnapshot = {
+    prior,
+    restoredArtifactVersion: null,
+    entryPendingArtifactVersion: null,
+    entryPendingNamespaceIds: null,
+    providerTargetSpecDigest: base.desiredSpecDigest,
+    routeHostname: base.routeHostname,
+    routeTargets: [],
+    desiredSpecDigest: base.desiredSpecDigest,
+    target,
+    releases: [],
+    applicationResources: [],
+  } as const;
+  const intent: BackendSwitchIntent = {
+    kind: 'backend-switch',
+    tenantTag: base.tenantTag,
+    environment: base.environment,
+    prior,
+    targetSpecDigest: base.desiredSpecDigest,
+    targetApplication: { vars: [], secrets: [], r2Buckets: [] },
+    target,
+    rollbackUntil: '2026-09-30T00:00:00.000Z',
+    subphase: 'decommission-traffic-authorized',
+    decommissionSnapshot,
+  };
+  return backendSwitchDecommissionRecordFixture(base, intent, {
+    entrySubphase: 'finalized',
+  });
 }
 
 function common(
@@ -1181,5 +1250,70 @@ describe('decommission advance intent', () => {
         fleetRecord(),
       ),
     ).toThrow(DecommissionAdvanceTokenDeploymentError);
+  });
+
+  it('round-trips exact backend-switch decommission identities', () => {
+    const source = backendSwitchRecord();
+    const parsed = decommissionAdvanceIntentFromUnknown(
+      structuredClone(source.decommissionIntent),
+      source,
+    );
+
+    expect(parsed).toEqual(source.decommissionIntent);
+    expect(parsed.identity.mode).toMatchObject({
+      kind: 'backend-switch',
+      priorSpecDigest: DIGEST,
+      targetSpecDigest: DIGEST,
+      backendSwitchSubphase: 'finalized',
+    });
+    expect(effectiveLifecyclePhase(source)).toBe('decommissioning');
+    expect(() => assertNoActiveDecommission(source, 'test')).toThrow(
+      'test cannot run during an active decommission',
+    );
+  });
+
+  it('rejects unreachable switch snapshot subphase and receipt combinations', () => {
+    const source = backendSwitchRecord();
+    const shell = source.decommissionIntent;
+    const switchIntent = source.backendSwitchIntent;
+    if (!shell || !switchIntent)
+      throw new Error('switch fixture is incomplete');
+
+    const unreachable: FleetRecord = {
+      ...source,
+      backendSwitchIntent: {
+        ...switchIntent,
+        subphase: 'planned',
+      },
+    };
+    expect(() =>
+      decommissionAdvanceIntentFromUnknown(shell, unreachable),
+    ).toThrow(DecommissionAdvanceIntentError);
+
+    expect(() =>
+      decommissionAdvanceIntentFromUnknown(
+        {
+          ...shell,
+          identity: {
+            ...shell.identity,
+            mode: {
+              ...shell.identity.mode,
+              decommissionSnapshotSha256: '9'.repeat(64),
+            },
+          },
+        },
+        source,
+      ),
+    ).toThrow(DecommissionAdvanceIntentError);
+
+    expect(() =>
+      decommissionAdvanceIntentFromUnknown(
+        {
+          ...shell,
+          databaseExportReceiptAuthority: RECEIPT_AUTHORITY,
+        },
+        source,
+      ),
+    ).toThrow(DecommissionAdvanceIntentError);
   });
 });

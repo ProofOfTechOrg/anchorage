@@ -162,7 +162,7 @@ module.exports = {
       comment:
         'The principal-contract-types type cycle is the sole existing exception; any cycle involving another module fails.',
       from: {
-        path: '^(?:packages/flowsafe/src|packages/agent-starter/(?:src|test|scripts)|scripts/architecture-fixtures)/',
+        path: '^(?:packages/flowsafe/src|packages/fleet-control/src|packages/agent-starter/(?:src|test|scripts)|scripts/architecture-fixtures)/',
       },
       to: {
         circular: true,
@@ -173,7 +173,7 @@ module.exports = {
       name: 'fleet-control-client-layers-are-one-way',
       severity: 'error',
       comment:
-        'These fleet-control modules must not reach the Cloudflare client; a back-import would restore the coupling the extraction removed. packages/fleet-control is outside no-new-architecture-cycles. tsPreCompilationDeps keeps type-only imports in the graph, so an `import type` back-edge is covered.',
+        'These fleet-control modules must not reach the Cloudflare client; a back-import would restore the coupling the extraction removed. The general cycle rule also covers Fleet Control, and tsPreCompilationDeps keeps type-only imports in the graph.',
       from: {
         path: [
           '^packages/fleet-control/src/',
@@ -215,7 +215,7 @@ module.exports = {
         ],
       },
       to: {
-        path: '(?:^packages/fleet-control/src/(?:cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors|workers-for-platforms-backend-switch-provider|wrangler-plain-worker-provisioning-api|wrangler-loop-backend|wrangler-runner|export-file-name|export-store|r2-export-store|provision|fleet|index)\\.ts$|^packages/fleet-control/src/workers/|^cloudflare(?:/|$)|(?:^|/)node_modules/(?:\\.pnpm/)?cloudflare(?:@|/))',
+        path: '(?:^packages/fleet-control/src/(?:backend-switch|cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors|workers-for-platforms-backend-switch-provider|wrangler-plain-worker-provisioning-api|wrangler-loop-backend|wrangler-runner|export-file-name|export-store|r2-export-store|provision|fleet|index)\\.ts$|^packages/fleet-control/src/workers/|^cloudflare(?:/|$)|(?:^|/)node_modules/(?:\\.pnpm/)?cloudflare(?:@|/))',
         reachable: true,
       },
     },
@@ -235,6 +235,22 @@ module.exports = {
         pathNot:
           '^packages/fleet-control/src/(?:database-export-store|strict-plain-data)\\.ts$',
         dependencyTypesNot: ['type-only', 'type-import'],
+      },
+    },
+    {
+      name: 'fleet-control-backend-switch-does-not-reach-its-provider',
+      severity: 'error',
+      comment:
+        'The root switch coordinator depends on provider-neutral ports. It must not reach the concrete Workers for Platforms switch provider, which implements those ports over Cloudflare transports.',
+      from: {
+        path: [
+          '^packages/fleet-control/src/backend-switch\\.ts$',
+          '^scripts/architecture-fixtures/decommission-database-imports-provider\\.ts$',
+        ],
+      },
+      to: {
+        path: '^packages/fleet-control/src/workers-for-platforms-backend-switch-provider\\.ts$',
+        reachable: true,
       },
     },
     {
@@ -287,7 +303,7 @@ module.exports = {
       name: 'fleet-control-client-does-not-reach-its-consumers',
       severity: 'error',
       comment:
-        'index.ts, cloudflare-api-plain-worker-backend.ts, and cloudflare-api-plain-worker-provisioning-api.ts import the Cloudflare client, so the client reaching one of them would close a cycle. fleet-control-client-layers-are-one-way holds the client and those three modules in its pathNot, and packages/fleet-control is outside no-new-architecture-cycles.',
+        'index.ts, cloudflare-api-plain-worker-backend.ts, and cloudflare-api-plain-worker-provisioning-api.ts import the Cloudflare client, so the client reaching one of them would close a cycle. The one-way rule and the general Fleet Control cycle rule both reject that reverse reach.',
       from: {
         path: [
           '^packages/fleet-control/src/cloudflare-client\\.ts$',

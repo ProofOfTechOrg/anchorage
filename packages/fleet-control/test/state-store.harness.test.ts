@@ -1025,6 +1025,79 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
     await reset();
   });
 
+  it('replays a bounded backend-switch operation after D1 write loss', async () => {
+    type Stage = 'start' | 'cursor' | 'receipt' | 'barrier' | 'terminal';
+    interface Result {
+      readonly lostWriteCount: number;
+      readonly phase: string;
+      readonly switchSubphase: string;
+      readonly shellState: string;
+      readonly shellRevision: number;
+      readonly lifecyclePhase: string;
+      readonly scanStage?: string;
+      readonly databaseExportLocation?: string;
+      readonly columnsPresent: boolean;
+    }
+    await probe<{ reset: true }>('bounded-backend-switch-write-step', {
+      stage: 'reset',
+    });
+    const step = (stage: Stage, loseWrite = true) =>
+      probe<Result>('bounded-backend-switch-write-step', {
+        stage,
+        loseWrite,
+      });
+
+    await expect(step('start')).resolves.toMatchObject({
+      lostWriteCount: 1,
+      phase: 'decommission-advancing',
+      switchSubphase: 'decommission-export-authorized',
+      shellState: 'transitioning',
+      shellRevision: 0,
+      lifecyclePhase: 'application-resources-deleted',
+      columnsPresent: true,
+    });
+    await expect(step('cursor')).resolves.toMatchObject({
+      lostWriteCount: 1,
+      switchSubphase: 'decommission-export-authorized',
+      shellState: 'discover',
+      shellRevision: 1,
+      scanStage: 'ordinary-script-inventory',
+      columnsPresent: true,
+    });
+    await expect(step('receipt')).resolves.toMatchObject({
+      lostWriteCount: 1,
+      switchSubphase: 'decommission-exported',
+      shellState: 'transitioning',
+      shellRevision: 2,
+      lifecyclePhase: 'database-exported',
+      databaseExportLocation:
+        'memory://fleet-exports/backend-switch/switchlost.sql',
+      columnsPresent: true,
+    });
+    await expect(step('barrier')).resolves.toMatchObject({
+      lostWriteCount: 1,
+      switchSubphase: 'decommission-database-authorized',
+      shellRevision: 3,
+      lifecyclePhase: 'database-deleting',
+      columnsPresent: true,
+    });
+    await expect(step('terminal')).resolves.toMatchObject({
+      lostWriteCount: 1,
+      phase: 'decommissioned',
+      switchSubphase: 'decommissioned',
+      shellState: 'complete',
+      shellRevision: 4,
+      lifecyclePhase: 'decommissioned',
+      databaseExportLocation:
+        'memory://fleet-exports/backend-switch/switchlost.sql',
+      columnsPresent: true,
+    });
+
+    await probe<{ reset: true }>('bounded-backend-switch-write-step', {
+      stage: 'reset',
+    });
+  });
+
   it('preserves operation, heartbeat, and release errors for both lease types', async () => {
     const result = await probe<{
       deployment: ProbeError;
