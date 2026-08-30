@@ -53,7 +53,13 @@ import {
   type WorkerAttachmentScanChunk,
   type WorkerAttachmentScanInput,
 } from './cloudflare-worker-attachment-scan.js';
-import type { DurableDatabaseExportStore } from './database-export-store.js';
+import {
+  cancelBodyWithoutAwait,
+  captureDatabaseExportReceiptCapability,
+  type DurableDatabaseExportStore,
+  databaseExportReceiptIdentityFromUnknown,
+  isDatabaseExportReceiptError,
+} from './database-export-store.js';
 import {
   type HostRoutingTarget,
   parseHostRoutingTarget,
@@ -73,6 +79,7 @@ import {
 import { deploymentSpecDigest } from './spec-digest.js';
 import type {
   DatabaseExport,
+  DatabaseExportReceiptIdentity,
   DatabaseReference,
   DecommissionAttachmentScanInput,
   DecommissionAttachmentScanResult,
@@ -366,6 +373,10 @@ async function hashExport(
   return { sha256: hash.digest('hex'), size };
 }
 
+async function funnel<T>(operation: () => T | PromiseLike<T>): Promise<T> {
+  return operation();
+}
+
 let trackProviderDispatch: <T>(
   client: CloudflareProvisioningClient,
   operation: () => Promise<T>,
@@ -464,6 +475,15 @@ export function mapDecommissionAttachmentScanChunk(
 }
 
 export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
+  /** Canonical immutable receipt authority, present only with receipt export. */
+  declare readonly databaseExportReceiptAuthority?: string;
+  /**
+   * Streams one stable operation receipt while independently hashing the
+   * provider download. Exact retries converge; collisions are preserved.
+   */
+  declare readonly exportDatabaseReceipt?: (
+    identity: DatabaseExportReceiptIdentity,
+  ) => Promise<DatabaseExport>;
   readonly #accountId: string;
   readonly #apiToken: string;
   readonly #dispatchNamespace: string | undefined;
@@ -525,7 +545,25 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     this.#operationQueue = new PQueue({ concurrency });
     this.#requestQueue = new PQueue({ concurrency });
     this.#rateCoordinator = options.rateCoordinator;
-    this.#exportStore = options.exportStore;
+    const exportStore = options.exportStore;
+    this.#exportStore = exportStore;
+    const receiptCapability = exportStore
+      ? captureDatabaseExportReceiptCapability(exportStore, () => [
+          exportStore.receiptAuthority,
+          exportStore.writeReceipt,
+        ])
+      : undefined;
+    if (receiptCapability) {
+      const writeReceipt = receiptCapability.method as NonNullable<
+        DurableDatabaseExportStore['writeReceipt']
+      >;
+      this.databaseExportReceiptAuthority = receiptCapability.authority;
+      this.exportDatabaseReceipt = (identity) =>
+        this.#exportDatabaseReceipt(identity, {
+          authority: receiptCapability.authority,
+          method: writeReceipt,
+        });
+    }
     this.#fetch = options.fetch ?? fetch;
     this.#requestTimeoutMs = options.requestTimeoutMs ?? 60_000;
     if (
@@ -3353,7 +3391,34 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     });
   }
 
-  async exportDatabase(databaseId: string): Promise<DatabaseExport> {
+  exportDatabase(databaseId: string): Promise<DatabaseExport> {
+    return this.#exportDatabase(databaseId);
+  }
+
+  #exportDatabaseReceipt(
+    identity: DatabaseExportReceiptIdentity,
+    receipt: Readonly<{
+      authority: string;
+      method: NonNullable<DurableDatabaseExportStore['writeReceipt']>;
+    }>,
+  ): Promise<DatabaseExport> {
+    const canonical = databaseExportReceiptIdentityFromUnknown(
+      identity,
+      receipt.authority,
+    );
+    return this.#exportDatabase(canonical.databaseId, {
+      identity: canonical,
+      method: receipt.method,
+    });
+  }
+
+  async #exportDatabase(
+    databaseId: string,
+    receipt?: Readonly<{
+      identity: DatabaseExportReceiptIdentity;
+      method: NonNullable<DurableDatabaseExportStore['writeReceipt']>;
+    }>,
+  ): Promise<DatabaseExport> {
     if (!this.#exportStore) {
       throw new Error(
         'a durable exportStore is required before D1 can be exported for deletion',
@@ -3407,15 +3472,35 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
             contentLength !== undefined &&
             Number.isSafeInteger(contentLength) &&
             contentLength >= 0;
-          const [stored, integrity] = await Promise.all([
-            this.#exportStore.write({
-              databaseId,
-              fileName: `${databaseId}-${Date.now()}.sql`,
-              body: storeBody,
-              ...(hasContentLength ? { contentLength } : {}),
-            }),
-            hashExport(hashBody),
-          ]);
+          let stored: Awaited<ReturnType<DurableDatabaseExportStore['write']>>;
+          let integrity: Awaited<ReturnType<typeof hashExport>>;
+          if (receipt) {
+            const integrityPromise = hashExport(hashBody);
+            void integrityPromise.catch(() => undefined);
+            const storedPromise = funnel(() =>
+              receipt.method({
+                identity: receipt.identity,
+                body: storeBody,
+                ...(hasContentLength ? { contentLength } : {}),
+                expectedIntegrity: integrityPromise,
+              }),
+            );
+            void storedPromise.catch((primary) =>
+              cancelBodyWithoutAwait(storeBody, primary),
+            );
+            stored = await storedPromise;
+            integrity = await integrityPromise;
+          } else {
+            [stored, integrity] = await Promise.all([
+              this.#exportStore.write({
+                databaseId,
+                fileName: `${databaseId}-${Date.now()}.sql`,
+                body: storeBody,
+                ...(hasContentLength ? { contentLength } : {}),
+              }),
+              hashExport(hashBody),
+            ]);
+          }
           if (!stored.location || integrity.size === 0) {
             fail('durable D1 export is empty or has no location');
           }
@@ -3440,6 +3525,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       }
       fail('export did not complete within the poll budget');
     } catch (error) {
+      if (receipt && isDatabaseExportReceiptError(error)) throw error;
       const errorStatus = readErrorFieldSafely(error, 'status');
       if (typeof errorStatus === 'number') httpStatus = errorStatus;
       const name = sanitizedErrorName(error);

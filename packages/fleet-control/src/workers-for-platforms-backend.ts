@@ -16,6 +16,10 @@ import {
   applicationSecretNames,
   applicationSecretValues,
 } from './application-bindings.js';
+import {
+  captureDatabaseExportReceiptCapability,
+  databaseExportReceiptIdentityFromUnknown,
+} from './database-export-store.js';
 import { isSha256 } from './deployment-context.js';
 import { WorkerDeploymentError } from './deployment-error.js';
 import { parseHostRoutingTarget } from './host-routing.js';
@@ -45,6 +49,7 @@ import type {
   ActiveRouteAttestation,
   D1Migration,
   DatabaseExport,
+  DatabaseExportReceiptIdentity,
   DatabaseReference,
   DecommissionAttachmentScanInput,
   DecommissionAttachmentScanResult,
@@ -334,6 +339,18 @@ export interface WorkersForPlatformsApi {
   revokeDispatchSecrets(scriptName: string): Promise<void>;
   deleteDispatchWorker(scriptName: string): Promise<void>;
   exportDatabase(databaseId: string): Promise<DatabaseExport>;
+  /**
+   * Canonical immutable receipt authority. Present together with
+   * `exportDatabaseReceipt` and unchanged across retries of one identity.
+   */
+  readonly databaseExportReceiptAuthority?: string;
+  /**
+   * Streams one operation-scoped export. Exact retries converge while an
+   * identity or byte collision is preserved and refused.
+   */
+  exportDatabaseReceipt?(
+    identity: DatabaseExportReceiptIdentity,
+  ): Promise<DatabaseExport>;
   deleteDatabase(databaseId: string): Promise<void>;
   putHostRouting(
     namespaceId: string,
@@ -410,6 +427,12 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
   declare readonly advanceDecommissionAttachmentScan?: NonNullable<
     ProvisioningBackend['advanceDecommissionAttachmentScan']
   >;
+  /** Canonical immutable receipt authority, present only with receipt export. */
+  declare readonly databaseExportReceiptAuthority?: string;
+  /** Forwards one canonical receipt under the ambient mutation fence. */
+  declare readonly exportDatabaseReceipt?: NonNullable<
+    ProvisioningBackend['exportDatabaseReceipt']
+  >;
   readonly #client: WorkersForPlatformsApi;
   readonly #fetch: typeof fetch;
   readonly #hostRoutingKvId: string;
@@ -445,7 +468,8 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
     if (!options.hostRoutingKvId) {
       throw new Error('hostRoutingKvId is required');
     }
-    this.#client = options.client;
+    const client = options.client;
+    this.#client = client;
     this.#fetch = options.fetch ?? fetch;
     this.#hostRoutingKvId = options.hostRoutingKvId;
     this.#auditQueueName = options.auditQueueName;
@@ -475,12 +499,32 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
       );
     }
     this.#namespacedState = options.namespacedState;
-    const advanceAttachmentScan =
-      options.client.advanceDecommissionAttachmentScan;
+    const advanceAttachmentScan = client.advanceDecommissionAttachmentScan;
     if (typeof advanceAttachmentScan === 'function') {
-      this.advanceDecommissionAttachmentScan = advanceAttachmentScan.bind(
-        options.client,
-      );
+      this.advanceDecommissionAttachmentScan =
+        advanceAttachmentScan.bind(client);
+    }
+    const receiptCapability = captureDatabaseExportReceiptCapability(
+      client,
+      () => [
+        client.databaseExportReceiptAuthority,
+        client.exportDatabaseReceipt,
+      ],
+    );
+    if (receiptCapability) {
+      const exportDatabaseReceipt = receiptCapability.method as NonNullable<
+        WorkersForPlatformsApi['exportDatabaseReceipt']
+      >;
+      this.databaseExportReceiptAuthority = receiptCapability.authority;
+      this.exportDatabaseReceipt = (identity, fence) => {
+        const canonical = databaseExportReceiptIdentityFromUnknown(
+          identity,
+          receiptCapability.authority,
+        );
+        return this.#withMutationFence(fence, () =>
+          exportDatabaseReceipt(canonical),
+        );
+      };
     }
   }
 

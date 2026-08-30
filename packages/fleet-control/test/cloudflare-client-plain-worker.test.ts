@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash } from 'node:crypto';
 import { BaseNamespaces } from 'cloudflare/resources/workers-for-platforms/dispatch/namespaces/namespaces';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -10,7 +11,9 @@ import {
   type DurableDatabaseExportStore,
   withProviderDispatchTracking,
 } from '../src/cloudflare-client.js';
+import { databaseExportReceiptError } from '../src/database-export-store.js';
 import type {
+  DatabaseExportReceiptIdentity,
   PlainWorkerUploadIntent,
   PlainWorkerVersionBinding,
 } from '../src/types.js';
@@ -42,6 +45,14 @@ function apiFailure(status: number, message = 'provider failure'): Response {
     { status },
   );
 }
+
+const RECEIPT_AUTHORITY = 'memory://fleet-exports/receipts/v1';
+const RECEIPT_IDENTITY: DatabaseExportReceiptIdentity = {
+  version: 1,
+  authority: RECEIPT_AUTHORITY,
+  databaseId: '00000000-0000-0000-0000-000000000001',
+  operationId: '00000000-0000-4000-8000-000000000002',
+};
 
 function uploadIntent(mode: 'initial' | 'staged'): PlainWorkerUploadIntent {
   const base = {
@@ -1546,6 +1557,343 @@ describe('CloudflareProvisioningClient plain-worker plane', () => {
       }),
     ).rejects.toBeDefined();
     expect(fixture.requests).toHaveLength(1);
+  });
+
+  it('exposes receipt export only for a receipt-capable store', () => {
+    const legacy = plainClient({
+      exportStore: {
+        async write() {
+          throw new Error('legacy write must not run');
+        },
+      },
+    });
+    expect(legacy.databaseExportReceiptAuthority).toBeUndefined();
+    expect(legacy.exportDatabaseReceipt).toBeUndefined();
+    expect('databaseExportReceiptAuthority' in legacy).toBe(false);
+    expect('exportDatabaseReceipt' in legacy).toBe(false);
+
+    let authorityReads = 0;
+    let methodReads = 0;
+    const store: DurableDatabaseExportStore = {
+      async write() {
+        throw new Error('legacy write must not run');
+      },
+    };
+    Object.defineProperties(store, {
+      receiptAuthority: {
+        configurable: true,
+        get() {
+          authorityReads += 1;
+          return RECEIPT_AUTHORITY;
+        },
+      },
+      writeReceipt: {
+        configurable: true,
+        get() {
+          methodReads += 1;
+          return async () => ({
+            location: 'memory://receipt',
+            size: 1,
+            sha256: 'a'.repeat(64),
+          });
+        },
+      },
+    });
+    const capable = plainClient({ exportStore: store });
+    expect(capable.databaseExportReceiptAuthority).toBe(RECEIPT_AUTHORITY);
+    expect(typeof capable.exportDatabaseReceipt).toBe('function');
+    expect(Object.hasOwn(capable, 'databaseExportReceiptAuthority')).toBe(true);
+    expect(Object.hasOwn(capable, 'exportDatabaseReceipt')).toBe(true);
+    expect([authorityReads, methodReads]).toEqual([1, 1]);
+
+    for (const malformed of [
+      { receiptAuthority: RECEIPT_AUTHORITY },
+      { writeReceipt: async () => undefined },
+      { receiptAuthority: '', writeReceipt: async () => undefined },
+      {
+        receiptAuthority: 'x'.repeat(4_097),
+        writeReceipt: async () => undefined,
+      },
+      { receiptAuthority: RECEIPT_AUTHORITY, writeReceipt: 'not-callable' },
+    ]) {
+      const failure = (() => {
+        try {
+          plainClient({
+            exportStore: {
+              async write() {
+                throw new Error('legacy write must not run');
+              },
+              ...malformed,
+            } as DurableDatabaseExportStore,
+          });
+        } catch (error) {
+          return error;
+        }
+        throw new Error('expected malformed receipt capability to fail');
+      })();
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toBe(
+        'database export receipt capability is malformed',
+      );
+      expect((failure as Error).cause).toBeUndefined();
+    }
+
+    for (const property of ['receiptAuthority', 'writeReceipt'] as const) {
+      const throwingStore: DurableDatabaseExportStore = {
+        async write() {
+          throw new Error('legacy write must not run');
+        },
+      };
+      if (property === 'writeReceipt') {
+        Object.defineProperty(throwingStore, 'receiptAuthority', {
+          configurable: true,
+          value: RECEIPT_AUTHORITY,
+        });
+      }
+      Object.defineProperty(throwingStore, property, {
+        configurable: true,
+        get() {
+          throw new Error(`${property} getter must not escape`);
+        },
+      });
+      const failure = (() => {
+        try {
+          return plainClient({ exportStore: throwingStore });
+        } catch (error) {
+          return error;
+        }
+      })();
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toBe(
+        'database export receipt capability is malformed',
+      );
+      expect((failure as Error).cause).toBeUndefined();
+    }
+  });
+
+  it('streams one canonical receipt with independently verified direct integrity', async () => {
+    const bytes = 'CREATE TABLE receipt (id TEXT);';
+    const expectedSha256 = createHash('sha256').update(bytes).digest('hex');
+    const events: string[] = [];
+    let storeReceiver: unknown;
+    let receivedIntegrity: Promise<unknown> | undefined;
+    const store: DurableDatabaseExportStore = {
+      receiptAuthority: RECEIPT_AUTHORITY,
+      async write() {
+        throw new Error('legacy write must not run');
+      },
+      async writeReceipt(input) {
+        storeReceiver = this;
+        events.push('store:start');
+        expect(input.identity).toEqual(RECEIPT_IDENTITY);
+        expect(input.contentLength).toBe(Buffer.byteLength(bytes));
+        receivedIntegrity = input.expectedIntegrity;
+        expect(input.expectedIntegrity).toBeInstanceOf(Promise);
+        const body = Buffer.from(await new Response(input.body).arrayBuffer());
+        events.push('store:body');
+        const integrity = await input.expectedIntegrity;
+        expect(integrity).toEqual({
+          size: body.byteLength,
+          sha256: expectedSha256,
+        });
+        return {
+          location: 'memory://receipt',
+          size: body.byteLength,
+          sha256: expectedSha256,
+        };
+      },
+    };
+    const fixture = recordingFetch(({ url }) => {
+      if (new URL(url).hostname === 'download.example.test') {
+        return new Response(bytes, {
+          headers: { 'content-length': String(Buffer.byteLength(bytes)) },
+        });
+      }
+      return single({
+        status: 'complete',
+        result: { signed_url: 'https://download.example.test/receipt.sql' },
+      });
+    });
+    const client = plainClient({ fetch: fixture.fetch, exportStore: store });
+    const exportReceipt = client.exportDatabaseReceipt;
+    if (!exportReceipt) throw new Error('expected receipt export capability');
+    await expect(
+      fenced(client, () => exportReceipt(RECEIPT_IDENTITY)),
+    ).resolves.toEqual({
+      databaseId: RECEIPT_IDENTITY.databaseId,
+      location: 'memory://receipt',
+      size: Buffer.byteLength(bytes),
+      sha256: expectedSha256,
+    });
+    expect(storeReceiver).toBe(store);
+    expect(receivedIntegrity).toBeInstanceOf(Promise);
+    expect(events).toEqual(['store:start', 'store:body']);
+
+    fixture.requests.length = 0;
+    const authorityFailure = await Promise.resolve()
+      .then(() =>
+        exportReceipt({
+          ...RECEIPT_IDENTITY,
+          authority: 'memory://different/receipts/v1',
+        }),
+      )
+      .catch((error: unknown) => error);
+    expect(authorityFailure).toBeInstanceOf(Error);
+    expect((authorityFailure as Error).message).toBe(
+      'database export receipt authority differs from configured authority',
+    );
+    expect((authorityFailure as Error).cause).toBeUndefined();
+    expect(fixture.requests).toHaveLength(0);
+
+    const classified = databaseExportReceiptError('collision');
+    let classifiedFieldReads = 0;
+    for (const property of [
+      'status',
+      'name',
+      'constructor',
+      'cause',
+    ] as const) {
+      Object.defineProperty(classified, property, {
+        configurable: true,
+        get() {
+          classifiedFieldReads += 1;
+          throw new Error(`${property} must not be read`);
+        },
+      });
+    }
+    const classifiedStore: DurableDatabaseExportStore = {
+      receiptAuthority: RECEIPT_AUTHORITY,
+      async write() {
+        throw classified;
+      },
+      async writeReceipt() {
+        throw classified;
+      },
+    };
+    const classifiedClient = plainClient({
+      fetch: fixture.fetch,
+      exportStore: classifiedStore,
+    });
+    const classifiedExportReceipt = classifiedClient.exportDatabaseReceipt;
+    if (!classifiedExportReceipt) {
+      throw new Error('expected classified receipt export capability');
+    }
+    await expect(
+      fenced(classifiedClient, () => classifiedExportReceipt(RECEIPT_IDENTITY)),
+    ).rejects.toBe(classified);
+    expect(classifiedFieldReads).toBe(0);
+    for (const property of [
+      'status',
+      'name',
+      'constructor',
+      'cause',
+    ] as const) {
+      Reflect.deleteProperty(classified, property);
+    }
+    const legacyFailure = await fenced(classifiedClient, () =>
+      classifiedClient.exportDatabase(RECEIPT_IDENTITY.databaseId),
+    ).catch((error: unknown) => error);
+    expect(legacyFailure).not.toBe(classified);
+    expect(String((legacyFailure as Error).message)).toContain('D1 export for');
+
+    const forged = new Error(classified.message);
+    let forgedStatusReads = 0;
+    Object.defineProperty(forged, 'status', {
+      configurable: true,
+      get() {
+        forgedStatusReads += 1;
+        throw new Error('forged status must be sanitized');
+      },
+    });
+    const forgedStore: DurableDatabaseExportStore = {
+      receiptAuthority: RECEIPT_AUTHORITY,
+      async write() {
+        throw new Error('legacy write must not run');
+      },
+      async writeReceipt() {
+        throw forged;
+      },
+    };
+    const forgedClient = plainClient({
+      fetch: fixture.fetch,
+      exportStore: forgedStore,
+    });
+    const forgedExportReceipt = forgedClient.exportDatabaseReceipt;
+    if (!forgedExportReceipt) {
+      throw new Error('expected forged receipt export capability');
+    }
+    const forgedFailure = await fenced(forgedClient, () =>
+      forgedExportReceipt(RECEIPT_IDENTITY),
+    ).catch((error: unknown) => error);
+    expect(forgedFailure).not.toBe(forged);
+    expect((forgedFailure as Error).message).toContain('D1 export for');
+    expect(forgedStatusReads).toBe(1);
+
+    const dishonestStore: DurableDatabaseExportStore = {
+      receiptAuthority: RECEIPT_AUTHORITY,
+      async write() {
+        throw new Error('legacy write must not run');
+      },
+      async writeReceipt(input) {
+        await new Response(input.body).arrayBuffer();
+        const expected = await input.expectedIntegrity;
+        return {
+          location: 'memory://dishonest-receipt',
+          size: expected.size + 1,
+          sha256: expected.sha256,
+        };
+      },
+    };
+    const dishonestClient = plainClient({
+      fetch: fixture.fetch,
+      exportStore: dishonestStore,
+    });
+    const dishonestExportReceipt = dishonestClient.exportDatabaseReceipt;
+    if (!dishonestExportReceipt) {
+      throw new Error('expected dishonest receipt export capability');
+    }
+    const dishonestFailure = await fenced(dishonestClient, () =>
+      dishonestExportReceipt(RECEIPT_IDENTITY),
+    ).catch((error: unknown) => error);
+    expect((dishonestFailure as Error).message).toContain(
+      'committed durable D1 export integrity differs from the download',
+    );
+
+    for (const mode of ['synchronous', 'deferred'] as const) {
+      const lowerFailure = databaseExportReceiptError('collision');
+      const cancellationReasons: unknown[] = [];
+      const rejectingStore: DurableDatabaseExportStore = {
+        receiptAuthority: RECEIPT_AUTHORITY,
+        async write() {
+          throw new Error('legacy write must not run');
+        },
+        writeReceipt(input): Promise<never> {
+          Object.defineProperty(input.body, 'cancel', {
+            configurable: true,
+            value(reason: unknown) {
+              cancellationReasons.push(reason);
+              return Promise.resolve();
+            },
+          });
+          if (mode === 'synchronous') throw lowerFailure;
+          return Promise.resolve().then(() => {
+            throw lowerFailure;
+          });
+        },
+      };
+      const rejectingClient = plainClient({
+        fetch: fixture.fetch,
+        exportStore: rejectingStore,
+      });
+      const rejectingExportReceipt = rejectingClient.exportDatabaseReceipt;
+      if (!rejectingExportReceipt) {
+        throw new Error('expected rejecting receipt export capability');
+      }
+      await expect(
+        fenced(rejectingClient, () => rejectingExportReceipt(RECEIPT_IDENTITY)),
+      ).rejects.toBe(lowerFailure);
+      expect(cancellationReasons).toEqual([lowerFailure]);
+    }
   });
 
   it.each([

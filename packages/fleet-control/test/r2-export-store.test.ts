@@ -17,6 +17,10 @@ import type {
 import { describe, expect, it } from 'vitest';
 import type { DurableDatabaseExportStore } from '../src/database-export-store.js';
 import { R2DatabaseExportStore } from '../src/r2-export-store.js';
+import type {
+  DatabaseExportIntegrity,
+  DatabaseExportReceiptIdentity,
+} from '../src/types.js';
 import {
   NodeDigestStream,
   NodeFixedLengthStream,
@@ -34,6 +38,7 @@ type PutValue =
 type PutMode =
   | 'normal'
   | 'reject-before'
+  | 'reject-after-commit'
   | 'reject-mid'
   | 'size-mismatch'
   | 'null-before-read';
@@ -108,7 +113,11 @@ function workerStreamFrom(
   return fixed.readable;
 }
 
-function metadata(key: string, size: number) {
+function metadata(
+  key: string,
+  size: number,
+  customMetadata?: Record<string, string>,
+) {
   return {
     key,
     version: '1',
@@ -118,6 +127,7 @@ function metadata(key: string, size: number) {
     checksums: { toJSON: () => ({}) },
     uploaded: new Date(0),
     storageClass: 'Standard',
+    ...(customMetadata === undefined ? {} : { customMetadata }),
     writeHttpMetadata() {},
   } satisfies R2Object;
 }
@@ -126,10 +136,11 @@ function objectBody(
   key: string,
   reportedSize: number,
   bodyBytes: Uint8Array,
+  customMetadata?: Record<string, string>,
   readError?: Error,
 ): R2ObjectBody {
   return {
-    ...metadata(key, reportedSize),
+    ...metadata(key, reportedSize, customMetadata),
     body: workerStreamFrom(bodyBytes, readError),
     bodyUsed: false,
     async arrayBuffer() {
@@ -163,7 +174,9 @@ function isReadable(
 
 class FakeR2Bucket implements R2Bucket {
   readonly objects = new Map<string, Uint8Array>();
+  readonly customMetadata = new Map<string, Record<string, string>>();
   readonly deleteCalls: string[] = [];
+  getCalls = 0;
   putCalls = 0;
   onPut: (() => void) | undefined;
   transformPutResult: ((object: R2Object) => R2Object) | undefined;
@@ -188,6 +201,7 @@ class FakeR2Bucket implements R2Bucket {
     key: string,
     _options?: R2GetOptions,
   ): Promise<R2ObjectBody | null> {
+    this.getCalls += 1;
     if (this.getMode === 'get-reject') throw this.readError;
     if (this.getMode === 'null') return null;
     const stored = this.objects.get(key);
@@ -206,6 +220,7 @@ class FakeR2Bucket implements R2Bucket {
       key,
       reportedSize,
       bodyBytes,
+      this.customMetadata.get(key),
       this.getMode === 'read-error' ? this.readError : undefined,
     );
     return this.transformGetResult?.(result) ?? result;
@@ -242,7 +257,11 @@ class FakeR2Bucket implements R2Bucket {
         const result = combineChunks(chunks, size);
         reader.releaseLock();
         this.objects.set(key, result);
-        const object = metadata(key, size);
+        const customMetadata = options?.customMetadata;
+        if (customMetadata !== undefined) {
+          this.customMetadata.set(key, { ...customMetadata });
+        }
+        const object = metadata(key, size, this.customMetadata.get(key));
         return this.transformPutResult?.(object) ?? object;
       }
       if (this.putMode === 'reject-mid') {
@@ -260,10 +279,16 @@ class FakeR2Bucket implements R2Bucket {
         : undefined;
     if (conditional === '*' && this.objects.has(key)) return null;
     this.objects.set(key, result);
+    const customMetadata = options?.customMetadata;
+    if (customMetadata !== undefined) {
+      this.customMetadata.set(key, { ...customMetadata });
+    }
     const object = metadata(
       key,
       this.putMode === 'size-mismatch' ? size + 1 : size,
+      this.customMetadata.get(key),
     );
+    if (this.putMode === 'reject-after-commit') throw this.putError;
     return this.transformPutResult?.(object) ?? object;
   }
 
@@ -273,6 +298,7 @@ class FakeR2Bucket implements R2Bucket {
     for (const key of values) {
       this.deleteCalls.push(key);
       this.objects.delete(key);
+      this.customMetadata.delete(key);
     }
   }
 
@@ -334,6 +360,96 @@ function createStore(
     keyPrefix: options.keyPrefix,
     randomUUID: options.randomUUID ?? (() => 'uuid-1'),
     streams: options.streams ?? nodeWorkerStreams,
+  });
+}
+
+const RECEIPT_DATABASE_ID = '11111111-1111-1111-1111-111111111111';
+const RECEIPT_OPERATION_ID = '22222222-2222-4222-8222-222222222222';
+
+function integrityOf(value: Uint8Array): DatabaseExportIntegrity {
+  return {
+    size: value.byteLength,
+    sha256: createHash('sha256').update(value).digest('hex'),
+  };
+}
+
+async function integrityOfBody(
+  body: ReadableStream<Uint8Array>,
+): Promise<DatabaseExportIntegrity> {
+  const reader = body.getReader();
+  const hash = createHash('sha256');
+  let size = 0;
+  try {
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      hash.update(chunk.value);
+      size += chunk.value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return { size, sha256: hash.digest('hex') };
+}
+
+function receiptIdentity(
+  store: R2DatabaseExportStore,
+  override: Partial<DatabaseExportReceiptIdentity> = {},
+): DatabaseExportReceiptIdentity {
+  return {
+    version: 1,
+    authority: store.receiptAuthority,
+    databaseId: RECEIPT_DATABASE_ID,
+    operationId: RECEIPT_OPERATION_ID,
+    ...override,
+  };
+}
+
+function receiptMetadataFor(
+  identity: DatabaseExportReceiptIdentity,
+): Record<string, string> {
+  return {
+    anchorageReceiptVersion: '1',
+    anchorageReceiptAuthority: identity.authority,
+    anchorageDatabaseId: identity.databaseId,
+    anchorageOperationId: identity.operationId,
+  };
+}
+
+function receiptKey(prefix = ''): string {
+  return `${prefix}receipts/v1/${RECEIPT_DATABASE_ID}/${RECEIPT_OPERATION_ID}.sql`;
+}
+
+function seedReceipt(
+  bucket: FakeR2Bucket,
+  store: R2DatabaseExportStore,
+  value: Uint8Array,
+  metadataOverride?: Record<string, string>,
+): void {
+  const key = receiptKey();
+  bucket.objects.set(key, value.slice());
+  bucket.customMetadata.set(
+    key,
+    metadataOverride ?? receiptMetadataFor(receiptIdentity(store)),
+  );
+}
+
+function writeReceipt(
+  store: R2DatabaseExportStore,
+  value: Uint8Array,
+  options: {
+    readonly identity?: DatabaseExportReceiptIdentity;
+    readonly expectedIntegrity?: Promise<DatabaseExportIntegrity>;
+    readonly contentLength?: number;
+    readonly body?: ReadableStream<Uint8Array>;
+  } = {},
+) {
+  return store.writeReceipt({
+    identity: options.identity ?? receiptIdentity(store),
+    body: options.body ?? streamFrom(value).body,
+    contentLength: options.contentLength ?? value.byteLength,
+    expectedIntegrity:
+      options.expectedIntegrity ?? Promise.resolve(integrityOf(value)),
   });
 }
 
@@ -1383,6 +1499,705 @@ describe('R2DatabaseExportStore', () => {
       contentLength: 1,
     });
     expect(result.location).toBe('r2://exports/a/b/db/uuid-1-x.db');
+  });
+
+  it('uses one canonical receipt key and exact metadata without minting a UUID', async () => {
+    const bucket = new FakeR2Bucket();
+    const source = bytes(1, 2, 3, 4);
+    let uuidCalls = 0;
+    const store = createStore(bucket, {
+      keyPrefix: 'tenant/exports/',
+      randomUUID: () => {
+        uuidCalls += 1;
+        throw new Error('receipt mode must not mint a UUID');
+      },
+    });
+    expect(store.receiptAuthority).toBe(
+      'r2://exports/tenant/exports/receipts/v1',
+    );
+    const identity = receiptIdentity(store);
+    const result = await writeReceipt(store, source, { identity });
+    const key = receiptKey('tenant/exports/');
+    expect(result).toEqual({
+      location: `r2://exports/${key}`,
+      ...integrityOf(source),
+    });
+    expect(bucket.objects.get(key)).toEqual(source);
+    expect(bucket.customMetadata.get(key)).toEqual(
+      receiptMetadataFor(identity),
+    );
+    expect(Object.keys(bucket.customMetadata.get(key) ?? {})).toHaveLength(4);
+    expect(bucket.putCalls).toBe(1);
+    expect(bucket.deleteCalls).toHaveLength(0);
+    expect(uuidCalls).toBe(0);
+
+    const controlledBucket = new FakeR2Bucket();
+    const controlledStore = createStore(controlledBucket);
+    let signalPutStarted!: () => void;
+    let signalPipeStarted!: () => void;
+    let resolveExpected!: (value: DatabaseExportIntegrity) => void;
+    const putStarted = new Promise<void>((resolve) => {
+      signalPutStarted = resolve;
+    });
+    const pipeStarted = new Promise<void>((resolve) => {
+      signalPipeStarted = resolve;
+    });
+    const expected = new Promise<DatabaseExportIntegrity>((resolve) => {
+      resolveExpected = resolve;
+    });
+    controlledBucket.onPut = signalPutStarted;
+    const streamed = streamFrom(source).body;
+    const controlledBody = {
+      get locked() {
+        return streamed.locked;
+      },
+      pipeTo(
+        destination: WritableStream<Uint8Array>,
+        options?: StreamPipeOptions,
+      ) {
+        signalPipeStarted();
+        return streamed.pipeTo(destination, options);
+      },
+      cancel(reason?: unknown) {
+        return streamed.cancel(reason);
+      },
+    } as ReadableStream<Uint8Array>;
+    const operation = writeReceipt(controlledStore, source, {
+      body: controlledBody,
+      expectedIntegrity: expected,
+      identity: receiptIdentity(controlledStore, {
+        operationId: '55555555-5555-4555-8555-555555555555',
+      }),
+    });
+    await within(
+      Promise.all([putStarted, pipeStarted]),
+      'receipt upload awaited expected integrity before streaming',
+    );
+    resolveExpected(integrityOf(source));
+    await expect(operation).resolves.toMatchObject(integrityOf(source));
+  });
+
+  it('converges exact sequential and conditional receipt collisions', async () => {
+    const source = bytes(5, 6, 7, 8);
+    const sequentialBucket = new FakeR2Bucket();
+    const sequentialStore = createStore(sequentialBucket);
+    const first = await writeReceipt(sequentialStore, source);
+    const replayBody = streamFrom(source, { stayOpen: true });
+    const replay = await writeReceipt(sequentialStore, source, {
+      body: replayBody.body,
+    });
+    expect(replay).toEqual(first);
+    expect(replayBody.cancellations).toHaveLength(1);
+    expect(sequentialBucket.putCalls).toBe(1);
+    expect(sequentialBucket.objects).toHaveLength(1);
+
+    const concurrentBucket = new FakeR2Bucket();
+    const concurrentStore = createStore(concurrentBucket);
+    const results = await Promise.all([
+      writeReceipt(concurrentStore, source),
+      writeReceipt(concurrentStore, source),
+    ]);
+    expect(results[0]).toEqual(results[1]);
+    expect(results[0]).toEqual({
+      location: `r2://exports/${receiptKey()}`,
+      ...integrityOf(source),
+    });
+    expect(concurrentBucket.objects).toHaveLength(1);
+    expect(concurrentBucket.putCalls).toBe(2);
+    expect(concurrentBucket.deleteCalls).toHaveLength(0);
+  });
+
+  it('recovers an exact commit whose put response is lost', async () => {
+    const source = bytes(9, 10, 11, 12);
+    const committedBucket = new FakeR2Bucket();
+    committedBucket.putMode = 'reject-after-commit';
+    const committedStore = createStore(committedBucket);
+    await expect(writeReceipt(committedStore, source)).resolves.toEqual({
+      location: `r2://exports/${receiptKey()}`,
+      ...integrityOf(source),
+    });
+    expect(committedBucket.objects.get(receiptKey())).toEqual(source);
+    expect(committedBucket.deleteCalls).toHaveLength(0);
+
+    for (const mode of [
+      'reject-before',
+      'reject-mid',
+    ] satisfies readonly PutMode[]) {
+      const absentBucket = new FakeR2Bucket();
+      absentBucket.putMode = mode;
+      const error = await rejection(
+        within(
+          writeReceipt(createStore(absentBucket), source),
+          `${mode} recovery did not settle`,
+        ),
+        'R2 export upload failed',
+      );
+      expect(error.cause).toBe(absentBucket.putError);
+      expect(absentBucket.objects).toHaveLength(0);
+      expect(absentBucket.deleteCalls).toHaveLength(0);
+    }
+
+    const synchronousBucket = new FakeR2Bucket();
+    const synchronousError = new Error('synchronous put failure');
+    Object.defineProperty(synchronousBucket, 'put', {
+      value(): never {
+        throw synchronousError;
+      },
+    });
+    const synchronousResult = await rejection(
+      within(
+        writeReceipt(createStore(synchronousBucket), source),
+        'synchronous put recovery did not settle',
+      ),
+      'R2 export upload failed',
+    );
+    expect(synchronousResult.cause).toBe(synchronousError);
+    expect(synchronousBucket.objects).toHaveLength(0);
+    expect(synchronousBucket.deleteCalls).toHaveLength(0);
+  });
+
+  it('preserves unowned or ambiguous mismatched receipt winners', async () => {
+    const source = bytes(1, 3, 5, 7);
+    const winner = bytes(2, 4, 6, 8);
+    for (const mode of [
+      'null-before-read',
+      'reject-before',
+    ] satisfies readonly PutMode[]) {
+      const bucket = new FakeR2Bucket();
+      const store = createStore(bucket);
+      bucket.putMode = mode;
+      bucket.onPut = () => seedReceipt(bucket, store, winner);
+      await rejection(
+        within(writeReceipt(store, source), `${mode} mismatch did not settle`),
+        'database export receipt collision differs from the committed export',
+      );
+      expect(bucket.objects.get(receiptKey())).toEqual(winner);
+      expect(bucket.deleteCalls).toHaveLength(0);
+    }
+
+    for (const metadataMutation of [
+      (metadata: Record<string, string>) => {
+        Reflect.deleteProperty(metadata, 'anchorageOperationId');
+      },
+      (metadata: Record<string, string>) => {
+        metadata.extra = 'no';
+      },
+      (metadata: Record<string, string>) => {
+        metadata.anchorageReceiptAuthority = 'r2://other/receipts/v1';
+      },
+    ]) {
+      const bucket = new FakeR2Bucket();
+      const store = createStore(bucket);
+      const customMetadata = receiptMetadataFor(receiptIdentity(store));
+      metadataMutation(customMetadata);
+      seedReceipt(bucket, store, winner, customMetadata);
+      await rejection(
+        writeReceipt(store, source),
+        'database export receipt collision differs from the committed export',
+      );
+      expect(bucket.objects.get(receiptKey())).toEqual(winner);
+      expect(bucket.deleteCalls).toHaveLength(0);
+    }
+  });
+
+  it('fails closed on malformed receipt, integrity, key, and readback boundaries', async () => {
+    const source = bytes(13, 14, 15, 16);
+    const malformedIdentities: readonly (readonly [unknown, string])[] = [
+      [
+        {
+          ...receiptIdentity(createStore(new FakeR2Bucket())),
+          databaseId: 'AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA',
+        },
+        'database export receipt identity is malformed',
+      ],
+      [
+        { ...receiptIdentity(createStore(new FakeR2Bucket())), version: 2 },
+        'database export receipt identity is malformed',
+      ],
+      [
+        { ...receiptIdentity(createStore(new FakeR2Bucket())), extra: true },
+        'database export receipt identity is malformed',
+      ],
+      [
+        Object.assign(
+          { ...receiptIdentity(createStore(new FakeR2Bucket())) },
+          { [Symbol('extra')]: true },
+        ),
+        'database export receipt identity is malformed',
+      ],
+      [
+        Object.defineProperty(
+          { ...receiptIdentity(createStore(new FakeR2Bucket())) },
+          'databaseId',
+          {
+            enumerable: true,
+            get(): never {
+              throw new Error('identity accessor must not run');
+            },
+          },
+        ),
+        'database export receipt identity is malformed',
+      ],
+      [
+        (() => {
+          const revoked = Proxy.revocable(
+            { ...receiptIdentity(createStore(new FakeR2Bucket())) },
+            {},
+          );
+          revoked.revoke();
+          return revoked.proxy;
+        })(),
+        'database export receipt identity is malformed',
+      ],
+      [
+        new Proxy({ ...receiptIdentity(createStore(new FakeR2Bucket())) }, {}),
+        'database export receipt identity is malformed',
+      ],
+      [
+        {
+          ...receiptIdentity(createStore(new FakeR2Bucket())),
+          operationId: 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA',
+        },
+        'database export receipt identity is malformed',
+      ],
+      [
+        (() => {
+          const identity = {
+            ...receiptIdentity(createStore(new FakeR2Bucket())),
+          };
+          Reflect.deleteProperty(identity, 'operationId');
+          return identity;
+        })(),
+        'database export receipt identity is malformed',
+      ],
+      [
+        {
+          ...receiptIdentity(createStore(new FakeR2Bucket())),
+          authority: 'r2://different/receipts/v1',
+        },
+        'database export receipt authority differs from configured authority',
+      ],
+    ];
+    for (const [identity, message] of malformedIdentities) {
+      const bucket = new FakeR2Bucket();
+      const store = createStore(bucket);
+      const streamed = streamFrom(source, { stayOpen: true });
+      await rejection(
+        store.writeReceipt({
+          identity: identity as DatabaseExportReceiptIdentity,
+          body: streamed.body,
+          contentLength: source.byteLength,
+          expectedIntegrity: Promise.resolve(integrityOf(source)),
+        }),
+        message,
+      );
+      expect(streamed.cancellations).toHaveLength(1);
+      expect(bucket.getCalls).toBe(0);
+      expect(bucket.putCalls).toBe(0);
+    }
+
+    for (const contentLength of [
+      undefined,
+      0,
+      -1,
+      1.5,
+      Number.MAX_SAFE_INTEGER + 1,
+    ]) {
+      const bucket = new FakeR2Bucket();
+      const store = createStore(bucket);
+      const streamed = streamFrom(source, { stayOpen: true });
+      await rejection(
+        store.writeReceipt({
+          identity: receiptIdentity(store),
+          body: streamed.body,
+          contentLength,
+          expectedIntegrity: Promise.resolve(integrityOf(source)),
+        }),
+        'database export receipt contentLength must be a positive safe integer',
+      );
+      expect(streamed.cancellations).toHaveLength(1);
+      expect(bucket.getCalls).toBe(0);
+      expect(bucket.putCalls).toBe(0);
+    }
+
+    {
+      const bucket = new FakeR2Bucket();
+      const store = createStore(bucket);
+      const locked = streamFrom(source).body;
+      locked.getReader();
+      await rejection(
+        writeReceipt(store, source, { body: locked }),
+        'database export receipt body is locked or malformed',
+      );
+      expect(bucket.getCalls).toBe(0);
+      expect(bucket.putCalls).toBe(0);
+    }
+
+    for (const cancellation of ['throw', 'reject'] as const) {
+      const bucket = new FakeR2Bucket();
+      const store = createStore(bucket);
+      const reasons: unknown[] = [];
+      const scripted = streamFrom(source, {
+        stayOpen: true,
+        rejectCancel: cancellation === 'reject',
+      });
+      const body =
+        cancellation === 'reject'
+          ? scripted.body
+          : ({
+              locked: false,
+              cancel(reason: unknown): never {
+                reasons.push(reason);
+                throw new Error('synchronous cancellation failure');
+              },
+            } as unknown as ReadableStream<Uint8Array>);
+      const error = await rejection(
+        store.writeReceipt({
+          identity: { ...receiptIdentity(store), version: 2 } as never,
+          body,
+          contentLength: source.byteLength,
+          expectedIntegrity: Promise.resolve(integrityOf(source)),
+        }),
+        'database export receipt identity is malformed',
+      );
+      if (cancellation === 'throw') expect(reasons).toEqual([error]);
+      else expect(scripted.cancellations).toEqual([error]);
+      expect(bucket.getCalls).toBe(0);
+      expect(bucket.putCalls).toBe(0);
+    }
+
+    {
+      const bucket = new FakeR2Bucket();
+      const store = createStore(bucket);
+      const streamed = streamFrom(source, { stayOpen: true });
+      const thenable = Object.defineProperty({}, 'then', {
+        value() {},
+      }) as unknown as Promise<DatabaseExportIntegrity>;
+      await rejection(
+        writeReceipt(store, source, {
+          body: streamed.body,
+          expectedIntegrity: thenable,
+        }),
+        'database export receipt integrity is malformed',
+      );
+      expect(streamed.cancellations).toHaveLength(1);
+      expect(bucket.getCalls).toBe(0);
+      expect(bucket.putCalls).toBe(0);
+    }
+
+    {
+      const bucket = new FakeR2Bucket();
+      const store = createStore(bucket);
+      const streamed = streamFrom(source, { stayOpen: true });
+      const input = Object.defineProperties(Object.create(null), {
+        body: { enumerable: true, value: streamed.body },
+        expectedIntegrity: {
+          enumerable: true,
+          get(): never {
+            throw new Error('expected-integrity accessor must not escape');
+          },
+        },
+      });
+      await rejection(
+        store.writeReceipt(input as never),
+        'database export receipt integrity is malformed',
+      );
+      expect(streamed.cancellations).toHaveLength(1);
+      expect(bucket.getCalls).toBe(0);
+      expect(bucket.putCalls).toBe(0);
+    }
+
+    {
+      const bucket = new FakeR2Bucket();
+      const store = createStore(bucket);
+      const error = await rejection(
+        writeReceipt(store, source, {
+          expectedIntegrity: Promise.resolve({
+            size: 0,
+            sha256: '0'.repeat(64),
+          }),
+        }),
+        'database export receipt integrity is malformed',
+      );
+      expect(error).not.toHaveProperty('cause');
+      expect(bucket.deleteCalls).toHaveLength(0);
+    }
+
+    {
+      const bucket = new FakeR2Bucket();
+      const store = createStore(bucket);
+      const error = await rejection(
+        writeReceipt(store, source, {
+          expectedIntegrity: Promise.resolve(
+            new Proxy(integrityOf(source), {}),
+          ),
+        }),
+        'database export receipt integrity is malformed',
+      );
+      expect(error).not.toHaveProperty('cause');
+      expect(bucket.deleteCalls).toHaveLength(0);
+    }
+
+    {
+      const bucket = new FakeR2Bucket();
+      const store = createStore(bucket);
+      const expected = Promise.resolve(integrityOf(source));
+      Object.defineProperty(expected, 'then', {
+        value(): never {
+          throw new Error('caller-owned then must not run');
+        },
+      });
+      await expect(
+        writeReceipt(store, source, { expectedIntegrity: expected }),
+      ).resolves.toEqual({
+        location: `r2://exports/${receiptKey()}`,
+        ...integrityOf(source),
+      });
+    }
+
+    for (const delta of [0, 1] as const) {
+      const baseLength = receiptKey().length;
+      const segmentLength = 1_024 - baseLength - 1 + delta;
+      const prefix = `${'a'.repeat(segmentLength)}/`;
+      expect(new TextEncoder().encode(receiptKey(prefix))).toHaveLength(
+        1_024 + delta,
+      );
+      const bucket = new FakeR2Bucket();
+      const store = createStore(bucket, { keyPrefix: prefix });
+      const operation = writeReceipt(store, source);
+      if (delta === 0) {
+        await expect(operation).resolves.toMatchObject(integrityOf(source));
+      } else {
+        await rejection(
+          operation,
+          'database export receipt key exceeds 1024 UTF-8 bytes',
+        );
+        expect(bucket.getCalls).toBe(0);
+        expect(bucket.putCalls).toBe(0);
+      }
+      expect(bucket.deleteCalls).toHaveLength(0);
+    }
+
+    for (const putMode of [
+      'normal',
+      'reject-before',
+      'reject-after-commit',
+      'null-before-read',
+    ] satisfies readonly PutMode[]) {
+      const bucket = new FakeR2Bucket();
+      bucket.putMode = putMode;
+      const store = createStore(bucket);
+      const error = await rejection(
+        within(
+          writeReceipt(store, source, {
+            expectedIntegrity: Promise.reject(
+              new Error(`source failed during ${putMode}`),
+            ),
+          }),
+          `${putMode} plus rejected integrity did not settle`,
+        ),
+        'database export receipt integrity is malformed',
+      );
+      expect(error).not.toHaveProperty('cause');
+      expect(bucket.deleteCalls).toHaveLength(0);
+    }
+
+    for (const errorAfter of [0, 2] as const) {
+      const bucket = new FakeR2Bucket();
+      const store = createStore(bucket);
+      const streamed = streamFrom(source, { errorAfter });
+      await rejection(
+        within(
+          writeReceipt(store, source, {
+            body: streamed.body,
+            expectedIntegrity: Promise.resolve(integrityOf(source)),
+          }),
+          `source error after ${errorAfter} bytes did not settle`,
+        ),
+        'R2 export upload failed',
+      );
+      expect(bucket.objects).toHaveLength(0);
+      expect(bucket.deleteCalls).toHaveLength(0);
+    }
+
+    {
+      const bucket = new FakeR2Bucket();
+      bucket.putResolveAfterBytes = source.byteLength;
+      const store = createStore(bucket);
+      const streamed = streamFrom(source, {
+        errorAfter: source.byteLength,
+      });
+      await rejection(
+        within(
+          writeReceipt(store, source, {
+            body: streamed.body,
+            expectedIntegrity: Promise.resolve(integrityOf(source)),
+          }),
+          'post-commit source error did not settle',
+        ),
+        'R2 export body did not stream completely',
+      );
+      expect(bucket.objects.get(receiptKey())).toEqual(source);
+      expect(bucket.deleteCalls).toHaveLength(0);
+      bucket.putResolveAfterBytes = undefined;
+      await expect(writeReceipt(store, source)).resolves.toEqual({
+        location: `r2://exports/${receiptKey()}`,
+        ...integrityOf(source),
+      });
+      expect(bucket.deleteCalls).toHaveLength(0);
+    }
+
+    {
+      const bucket = new FakeR2Bucket();
+      const store = createStore(bucket);
+      const streamed = streamFrom(source, { errorAfter: 2 });
+      const [storeBody, hashBody] = streamed.body.tee();
+      await rejection(
+        within(
+          writeReceipt(store, source, {
+            body: storeBody,
+            expectedIntegrity: integrityOfBody(hashBody),
+          }),
+          'two-branch source error did not settle',
+        ),
+        'database export receipt integrity is malformed',
+      );
+      expect(bucket.objects).toHaveLength(0);
+      expect(bucket.deleteCalls).toHaveLength(0);
+    }
+
+    for (const [getMode, message] of [
+      ['size-mismatch', 'database export receipt readback failed'],
+      ['short', 'database export receipt readback failed'],
+      ['read-error', 'database export receipt readback failed'],
+      [
+        'tamper',
+        'database export receipt collision differs from the committed export',
+      ],
+    ] satisfies readonly (readonly [GetMode, string])[]) {
+      const bucket = new FakeR2Bucket();
+      const store = createStore(bucket);
+      seedReceipt(bucket, store, source);
+      bucket.getMode = getMode;
+      await rejection(writeReceipt(store, source), message);
+      expect(bucket.objects.get(receiptKey())).toEqual(source);
+      expect(bucket.deleteCalls).toHaveLength(0);
+    }
+
+    {
+      const bucket = new FakeR2Bucket();
+      const store = createStore(bucket);
+      bucket.onPut = () => {
+        bucket.getMode = 'get-reject';
+      };
+      await rejection(
+        writeReceipt(store, source),
+        'database export receipt readback failed',
+      );
+      expect(bucket.objects.get(receiptKey())).toEqual(source);
+      expect(bucket.deleteCalls).toHaveLength(0);
+    }
+
+    {
+      const bucket = new FakeR2Bucket();
+      bucket.getMode = 'get-reject';
+      const store = createStore(bucket);
+      const streamed = streamFrom(source, { stayOpen: true });
+      await rejection(
+        within(
+          writeReceipt(store, source, {
+            body: streamed.body,
+            expectedIntegrity: new Promise(() => undefined),
+          }),
+          'preflight get rejection awaited integrity',
+        ),
+        'database export receipt readback failed',
+      );
+      expect(streamed.cancellations).toHaveLength(1);
+      expect(bucket.putCalls).toBe(0);
+      expect(bucket.deleteCalls).toHaveLength(0);
+    }
+
+    {
+      const bucket = new FakeR2Bucket();
+      bucket.getMode = 'get-reject';
+      const error = await rejection(
+        writeReceipt(createStore(bucket), source, {
+          expectedIntegrity: Promise.reject(
+            new Error('rejected alongside preflight get'),
+          ),
+        }),
+        'database export receipt readback failed',
+      );
+      expect(error).not.toHaveProperty('cause');
+      expect(bucket.putCalls).toBe(0);
+      expect(bucket.deleteCalls).toHaveLength(0);
+    }
+
+    {
+      const bucket = new FakeR2Bucket();
+      const store = createStore(bucket);
+      seedReceipt(bucket, store, source, { wrong: 'metadata' });
+      await rejection(
+        within(
+          writeReceipt(store, source, {
+            expectedIntegrity: new Promise(() => undefined),
+          }),
+          'metadata mismatch awaited integrity',
+        ),
+        'database export receipt collision differs from the committed export',
+      );
+      expect(bucket.deleteCalls).toHaveLength(0);
+    }
+
+    {
+      const bucket = new FakeR2Bucket();
+      const store = createStore(bucket);
+      seedReceipt(bucket, store, source, { wrong: 'metadata' });
+      const error = await rejection(
+        writeReceipt(store, source, {
+          expectedIntegrity: Promise.reject(
+            new Error('rejected alongside metadata mismatch'),
+          ),
+        }),
+        'database export receipt collision differs from the committed export',
+      );
+      expect(error).not.toHaveProperty('cause');
+      expect(bucket.deleteCalls).toHaveLength(0);
+    }
+
+    {
+      const bucket = new FakeR2Bucket();
+      const store = createStore(bucket);
+      seedReceipt(bucket, store, source);
+      bucket.getMode = 'read-error';
+      const error = await rejection(
+        writeReceipt(store, source, {
+          expectedIntegrity: Promise.reject(new Error('source failed')),
+        }),
+        'database export receipt integrity is malformed',
+      );
+      expect(error).not.toHaveProperty('cause');
+      expect(bucket.deleteCalls).toHaveLength(0);
+    }
+
+    {
+      const bucket = new FakeR2Bucket();
+      const store = createStore(bucket);
+      const declared = integrityOf(source);
+      const error = await rejection(
+        writeReceipt(store, source, {
+          expectedIntegrity: Promise.resolve({
+            ...declared,
+            sha256: '0'.repeat(64),
+          }),
+        }),
+        'database export receipt source integrity differs from the streamed export',
+      );
+      expect(error).not.toHaveProperty('cause');
+      expect(bucket.objects.get(receiptKey())).toEqual(source);
+      expect(bucket.deleteCalls).toHaveLength(0);
+    }
   });
 
   it('satisfies the database export store contract', () => {

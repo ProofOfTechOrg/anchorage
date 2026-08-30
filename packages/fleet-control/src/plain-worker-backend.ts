@@ -9,6 +9,10 @@ import {
   applicationSecretValues,
   canonicalApplicationBindings,
 } from './application-bindings.js';
+import {
+  captureDatabaseExportReceiptCapability,
+  databaseExportReceiptIdentityFromUnknown,
+} from './database-export-store.js';
 import { isSha256 } from './deployment-context.js';
 import { WorkerDeploymentError } from './deployment-error.js';
 import { maintenanceUrl, readMaintenanceHealth } from './maintenance-health.js';
@@ -243,6 +247,12 @@ export class PlainWorkerBackend implements ProvisioningBackend {
   declare readonly advanceDecommissionAttachmentScan?: NonNullable<
     ProvisioningBackend['advanceDecommissionAttachmentScan']
   >;
+  /** Canonical immutable receipt authority, present only with receipt export. */
+  declare readonly databaseExportReceiptAuthority?: string;
+  /** Forwards one canonical operation receipt through the plain-Worker port. */
+  declare readonly exportDatabaseReceipt?: NonNullable<
+    ProvisioningBackend['exportDatabaseReceipt']
+  >;
   readonly #api: PlainWorkerProvisioningApi;
   readonly #identityCaller: string;
   readonly #fetch: typeof fetch;
@@ -271,6 +281,33 @@ export class PlainWorkerBackend implements ProvisioningBackend {
     if (typeof advanceDecommissionAttachmentScan === 'function') {
       this.advanceDecommissionAttachmentScan =
         advanceDecommissionAttachmentScan.bind(options.api);
+    }
+    const receiptCapability = captureDatabaseExportReceiptCapability(
+      options.api,
+      () => [
+        options.api.databaseExportReceiptAuthority,
+        options.api.exportDatabaseReceipt,
+      ],
+    );
+    if (receiptCapability) {
+      const exportDatabaseReceipt = receiptCapability.method as NonNullable<
+        PlainWorkerProvisioningApi['exportDatabaseReceipt']
+      >;
+      this.databaseExportReceiptAuthority = receiptCapability.authority;
+      this.exportDatabaseReceipt = async (identity, fence) => {
+        this.#assertMutationDuration(fence);
+        const canonical = databaseExportReceiptIdentityFromUnknown(
+          identity,
+          receiptCapability.authority,
+        );
+        const exported = await exportDatabaseReceipt(canonical, fence);
+        return {
+          databaseId: canonical.databaseId,
+          location: exported.location,
+          sha256: exported.sha256,
+          size: exported.size,
+        };
+      };
     }
   }
 

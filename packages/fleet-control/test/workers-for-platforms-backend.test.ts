@@ -26,6 +26,7 @@ import type {
   ApplicationR2Binding,
   ApplicationR2BucketSnapshot,
   DatabaseExport,
+  DatabaseExportReceiptIdentity,
   DatabaseReference,
   DecommissionAttachmentScanInput,
   DecommissionAttachmentScanResult,
@@ -115,6 +116,13 @@ const NAMESPACED_STATE = Object.freeze({
   sharedOutboundWorkerName: 'fleet-shared-outbound',
   stateEgressRootSecret: 'state-egress-root-secret-value-0001',
 });
+const RECEIPT_AUTHORITY = 'r2://fleet-exports/receipts/v1';
+const RECEIPT_IDENTITY: DatabaseExportReceiptIdentity = {
+  version: 1,
+  authority: RECEIPT_AUTHORITY,
+  databaseId: '00000000-0000-0000-0000-000000000001',
+  operationId: '00000000-0000-4000-8000-000000000002',
+};
 
 class MemoryFleetStore implements FleetStateStore {
   record: FleetRecord | undefined;
@@ -1030,6 +1038,148 @@ async function attestedHealthResponse(
 }
 
 describe('WorkersForPlatformsBackend', () => {
+  it('exposes and forwards receipt export only for a capable WFP client', async () => {
+    const absentClient = new FakeApi();
+    const absent = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client: absentClient,
+      hostRoutingKvId: 'host-routing',
+    });
+    expect('databaseExportReceiptAuthority' in absent).toBe(false);
+    expect('exportDatabaseReceipt' in absent).toBe(false);
+
+    const client = new FakeApi();
+    const legacy = vi
+      .spyOn(client, 'exportDatabase')
+      .mockRejectedValue(new Error('legacy export must not run'));
+    let authorityReads = 0;
+    let methodReads = 0;
+    let receiver: unknown;
+    let received: DatabaseExportReceiptIdentity | undefined;
+    Object.defineProperties(client, {
+      databaseExportReceiptAuthority: {
+        configurable: true,
+        get() {
+          authorityReads += 1;
+          return RECEIPT_AUTHORITY;
+        },
+      },
+      exportDatabaseReceipt: {
+        configurable: true,
+        get() {
+          methodReads += 1;
+          return function (
+            this: unknown,
+            identity: DatabaseExportReceiptIdentity,
+          ) {
+            receiver = this;
+            received = identity;
+            return Promise.resolve({
+              databaseId: identity.databaseId,
+              location: 'r2://fleet-exports/receipt.sql',
+              size: 4,
+              sha256: 'a'.repeat(64),
+            });
+          };
+        },
+      },
+    });
+    const capable = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client,
+      hostRoutingKvId: 'host-routing',
+    });
+    expect(capable.databaseExportReceiptAuthority).toBe(RECEIPT_AUTHORITY);
+    expect([authorityReads, methodReads]).toEqual([1, 1]);
+    const exportReceipt = capable.exportDatabaseReceipt;
+    if (!exportReceipt) throw new Error('expected receipt export capability');
+    await expect(exportReceipt(RECEIPT_IDENTITY, fence)).resolves.toEqual({
+      databaseId: RECEIPT_IDENTITY.databaseId,
+      location: 'r2://fleet-exports/receipt.sql',
+      size: 4,
+      sha256: 'a'.repeat(64),
+    });
+    expect(receiver).toBe(client);
+    expect(received).toEqual(RECEIPT_IDENTITY);
+    expect(client.mutationFenceEntries).toBe(1);
+    expect(legacy).not.toHaveBeenCalled();
+
+    received = undefined;
+    const authorityFailure = await Promise.resolve()
+      .then(() =>
+        exportReceipt(
+          { ...RECEIPT_IDENTITY, authority: 'r2://different/receipts/v1' },
+          fence,
+        ),
+      )
+      .catch((error: unknown) => error);
+    expect(authorityFailure).toBeInstanceOf(Error);
+    expect((authorityFailure as Error).message).toBe(
+      'database export receipt authority differs from configured authority',
+    );
+    expect((authorityFailure as Error).cause).toBeUndefined();
+    expect(received).toBeUndefined();
+    expect(client.mutationFenceEntries).toBe(1);
+
+    const incomplete = new FakeApi();
+    Object.defineProperty(incomplete, 'databaseExportReceiptAuthority', {
+      configurable: true,
+      value: RECEIPT_AUTHORITY,
+    });
+    const failure = (() => {
+      try {
+        return new WorkersForPlatformsBackend({
+          namespacedState: NAMESPACED_STATE,
+          client: incomplete,
+          hostRoutingKvId: 'host-routing',
+        });
+      } catch (error) {
+        return error;
+      }
+    })();
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe(
+      'database export receipt capability is malformed',
+    );
+    expect((failure as Error).cause).toBeUndefined();
+
+    for (const property of [
+      'databaseExportReceiptAuthority',
+      'exportDatabaseReceipt',
+    ] as const) {
+      const throwingClient = new FakeApi();
+      if (property === 'exportDatabaseReceipt') {
+        Object.defineProperty(
+          throwingClient,
+          'databaseExportReceiptAuthority',
+          { configurable: true, value: RECEIPT_AUTHORITY },
+        );
+      }
+      Object.defineProperty(throwingClient, property, {
+        configurable: true,
+        get() {
+          throw new Error(`${property} getter must not escape`);
+        },
+      });
+      const getterFailure = (() => {
+        try {
+          return new WorkersForPlatformsBackend({
+            namespacedState: NAMESPACED_STATE,
+            client: throwingClient,
+            hostRoutingKvId: 'host-routing',
+          });
+        } catch (error) {
+          return error;
+        }
+      })();
+      expect(getterFailure).toBeInstanceOf(Error);
+      expect((getterFailure as Error).message).toBe(
+        'database export receipt capability is malformed',
+      );
+      expect((getterFailure as Error).cause).toBeUndefined();
+    }
+  });
+
   it('provisions dispatch-native state without an ordinary per-deployment Worker', async () => {
     const client = new FakeApi();
     const external = {

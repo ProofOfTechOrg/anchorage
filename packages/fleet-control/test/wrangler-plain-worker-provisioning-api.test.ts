@@ -12,6 +12,7 @@ import {
   plainWorkerBindingsToProviderShape,
 } from '../src/provider-binding-inventory.js';
 import type {
+  DatabaseExportReceiptIdentity,
   DecommissionAttachmentScanInput,
   DecommissionAttachmentScanResult,
   ExternalMutationFence,
@@ -30,6 +31,14 @@ import {
   type PlainWorkerFsControl,
   registerScratchCleanup,
 } from './fixtures/wrangler-fs-mock.js';
+
+const RECEIPT_AUTHORITY = 'file:///fleet-exports/.anchorage-receipts/v1';
+const RECEIPT_IDENTITY: DatabaseExportReceiptIdentity = {
+  version: 1,
+  authority: RECEIPT_AUTHORITY,
+  databaseId: '00000000-0000-0000-0000-000000000001',
+  operationId: '00000000-0000-4000-8000-000000000002',
+};
 
 const fsControl = vi.hoisted<PlainWorkerFsControl>(() => ({
   failFleetCleanup: false,
@@ -1047,6 +1056,278 @@ describe('WranglerPlainWorkerProvisioningApi mutations', () => {
 });
 
 describe('WranglerPlainWorkerProvisioningApi exports', () => {
+  it('exports one canonical receipt by immutable database identity and cleans scratch', async () => {
+    const bytes = 'canonical Wrangler receipt';
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    let outputPath = '';
+    const runner = new FakeRunner(async (arguments_) => {
+      outputPath = arguments_[arguments_.indexOf('--output') + 1] as string;
+      expect(arguments_.slice(0, 3)).toEqual([
+        'd1',
+        'export',
+        RECEIPT_IDENTITY.databaseId,
+      ]);
+      await writeFile(outputPath, bytes);
+      return { stdout: '', stderr: '' };
+    });
+    let authorityReads = 0;
+    let methodReads = 0;
+    let receiver: unknown;
+    let expectedPromise: Promise<unknown> | undefined;
+    const store: DurableDatabaseExportStore = {
+      async write() {
+        throw new Error('legacy export must not run');
+      },
+    };
+    Object.defineProperties(store, {
+      receiptAuthority: {
+        configurable: true,
+        get() {
+          authorityReads += 1;
+          return RECEIPT_AUTHORITY;
+        },
+      },
+      writeReceipt: {
+        configurable: true,
+        get() {
+          methodReads += 1;
+          return async function (
+            this: unknown,
+            input: Parameters<
+              NonNullable<DurableDatabaseExportStore['writeReceipt']>
+            >[0],
+          ) {
+            receiver = this;
+            expect(input.identity).toEqual(RECEIPT_IDENTITY);
+            expect(input.contentLength).toBe(Buffer.byteLength(bytes));
+            expectedPromise = input.expectedIntegrity;
+            const body = await drain(input.body);
+            await expect(input.expectedIntegrity).resolves.toEqual({
+              size: Buffer.byteLength(bytes),
+              sha256,
+            });
+            return {
+              location: 'memory://receipt',
+              size: body.size,
+              sha256: body.sha256,
+            };
+          };
+        },
+      },
+    });
+    const subject = await api(runner, { exportStore: store });
+    const exportReceipt = subject.exportDatabaseReceipt;
+    if (!exportReceipt) throw new Error('expected receipt export capability');
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => {
+      throw new Error('receipt export must not consult the clock');
+    });
+    const successfulFence = mutationFence();
+    try {
+      await expect(
+        exportReceipt(RECEIPT_IDENTITY, successfulFence),
+      ).resolves.toEqual({
+        location: 'memory://receipt',
+        size: Buffer.byteLength(bytes),
+        sha256,
+      });
+    } finally {
+      clock.mockRestore();
+    }
+    expect([authorityReads, methodReads]).toEqual([1, 1]);
+    expect(receiver).toBe(store);
+    expect(expectedPromise).toBeInstanceOf(Promise);
+    expect(successfulFence.assertOwned).toHaveBeenCalledTimes(1);
+    await expectExportScratchRemoved(outputPath);
+
+    runner.calls.length = 0;
+    const authorityFailure = await Promise.resolve()
+      .then(() =>
+        exportReceipt(
+          { ...RECEIPT_IDENTITY, authority: 'file:///other/receipts/v1' },
+          mutationFence(),
+        ),
+      )
+      .catch((error: unknown) => error);
+    expect(authorityFailure).toBeInstanceOf(Error);
+    expect((authorityFailure as Error).message).toBe(
+      'database export receipt authority differs from configured authority',
+    );
+    expect((authorityFailure as Error).cause).toBeUndefined();
+    expect(runner.calls).toEqual([]);
+
+    const absent = await api(new FakeRunner());
+    expect('databaseExportReceiptAuthority' in absent).toBe(false);
+    expect('exportDatabaseReceipt' in absent).toBe(false);
+    const malformedCapability = await api(new FakeRunner(), {
+      exportStore: {
+        receiptAuthority: RECEIPT_AUTHORITY,
+        async write() {
+          throw new Error('legacy export must not run');
+        },
+      },
+    }).catch((error: unknown) => error);
+    expect(malformedCapability).toBeInstanceOf(Error);
+    expect((malformedCapability as Error).message).toBe(
+      'database export receipt capability is malformed',
+    );
+    expect((malformedCapability as Error).cause).toBeUndefined();
+
+    for (const property of ['receiptAuthority', 'writeReceipt'] as const) {
+      const throwingStore: DurableDatabaseExportStore = {
+        async write() {
+          throw new Error('legacy export must not run');
+        },
+      };
+      if (property === 'writeReceipt') {
+        Object.defineProperty(throwingStore, 'receiptAuthority', {
+          configurable: true,
+          value: RECEIPT_AUTHORITY,
+        });
+      }
+      Object.defineProperty(throwingStore, property, {
+        configurable: true,
+        get() {
+          throw new Error(`${property} getter must not escape`);
+        },
+      });
+      const getterFailure = await api(new FakeRunner(), {
+        exportStore: throwingStore,
+      }).catch((error: unknown) => error);
+      expect(getterFailure).toBeInstanceOf(Error);
+      expect((getterFailure as Error).message).toBe(
+        'database export receipt capability is malformed',
+      );
+      expect((getterFailure as Error).cause).toBeUndefined();
+    }
+
+    const verifyFailureSettlement = async (
+      primary: unknown,
+      cleanupFails: boolean,
+    ) => {
+      const exportDirectory = await mkdtemp(
+        join(tmpdir(), 'anchorage-fleet-receipt-'),
+      );
+      exportDirectories.add(exportDirectory);
+      const failingRunner = new FakeRunner(async (arguments_) => {
+        const location = arguments_[arguments_.indexOf('--output') + 1];
+        if (!location) throw new Error('missing output path');
+        await writeFile(location, bytes);
+        return { stdout: '', stderr: '' };
+      });
+      const failingStore: DurableDatabaseExportStore = {
+        receiptAuthority: RECEIPT_AUTHORITY,
+        async write() {
+          throw new Error('legacy export must not run');
+        },
+        async writeReceipt() {
+          throw primary;
+        },
+      };
+      const failing = await api(failingRunner, {
+        exportDirectory,
+        exportStore: failingStore,
+      });
+      const failingExportReceipt = failing.exportDatabaseReceipt;
+      if (!failingExportReceipt) {
+        throw new Error('expected failing receipt export capability');
+      }
+      fsControl.failFleetCleanup = cleanupFails;
+      const [state] = await Promise.allSettled([
+        failingExportReceipt(RECEIPT_IDENTITY, mutationFence()),
+      ]);
+      expect(state?.status).toBe('rejected');
+      if (state?.status !== 'rejected') {
+        throw new Error('expected receipt export to reject');
+      }
+      if (cleanupFails) {
+        expect(state.reason).toBeInstanceOf(AggregateError);
+        expect((state.reason as AggregateError).message).toBe(
+          'database export receipt and Wrangler scratch cleanup failed',
+        );
+        expect((state.reason as AggregateError).errors).toEqual([
+          primary,
+          fsControl.cleanupError,
+        ]);
+        fsControl.failFleetCleanup = false;
+        const residual = fsControl.residualDirectory;
+        if (residual) {
+          const actual =
+            await vi.importActual<typeof import('node:fs/promises')>(
+              'node:fs/promises',
+            );
+          await actual.rm(residual, { recursive: true, force: true });
+          fsControl.residualDirectory = undefined;
+        }
+      } else {
+        expect(state.reason).toBe(primary);
+      }
+    };
+    for (const primary of [new Error('primary'), undefined, null]) {
+      await verifyFailureSettlement(primary, false);
+      await verifyFailureSettlement(primary, true);
+    }
+
+    fsControl.failFleetCleanup = true;
+    const cleanupOnlyDirectory = await mkdtemp(
+      join(tmpdir(), 'anchorage-fleet-receipt-'),
+    );
+    exportDirectories.add(cleanupOnlyDirectory);
+    const cleanupOnlySubject = await api(runner, {
+      exportDirectory: cleanupOnlyDirectory,
+      exportStore: store,
+    });
+    const cleanupOnlyExportReceipt = cleanupOnlySubject.exportDatabaseReceipt;
+    if (!cleanupOnlyExportReceipt) {
+      throw new Error('expected cleanup-only receipt export capability');
+    }
+    const cleanupOnlyFence = mutationFence();
+    const cleanupOnlyFailure = await cleanupOnlyExportReceipt(
+      RECEIPT_IDENTITY,
+      cleanupOnlyFence,
+    ).catch((error: unknown) => error);
+    expect(cleanupOnlyFailure).toBe(fsControl.cleanupError);
+    expect(cleanupOnlyFence.assertOwned).toHaveBeenCalledTimes(1);
+    fsControl.failFleetCleanup = false;
+    const cleanupResidual = fsControl.residualDirectory;
+    if (cleanupResidual) {
+      const actual =
+        await vi.importActual<typeof import('node:fs/promises')>(
+          'node:fs/promises',
+        );
+      await actual.rm(cleanupResidual, { recursive: true, force: true });
+      fsControl.residualDirectory = undefined;
+    }
+
+    const dishonestStore: DurableDatabaseExportStore = {
+      receiptAuthority: RECEIPT_AUTHORITY,
+      async write() {
+        throw new Error('legacy export must not run');
+      },
+      async writeReceipt(input) {
+        const body = await drain(input.body);
+        await input.expectedIntegrity;
+        return {
+          location: 'memory://dishonest-receipt',
+          size: body.size + 1,
+          sha256: body.sha256,
+        };
+      },
+    };
+    const dishonest = await api(runner, { exportStore: dishonestStore });
+    const dishonestExportReceipt = dishonest.exportDatabaseReceipt;
+    if (!dishonestExportReceipt) {
+      throw new Error('expected dishonest receipt export capability');
+    }
+    const dishonestFence = mutationFence();
+    await expect(
+      dishonestExportReceipt(RECEIPT_IDENTITY, dishonestFence),
+    ).rejects.toThrow(
+      'durable database export store returned mismatched committed integrity',
+    );
+    expect(dishonestFence.assertOwned).toHaveBeenCalledTimes(1);
+    await expectExportScratchRemoved(outputPath);
+  });
+
   it('removes export scratch when the fence denies dispatch', async () => {
     const exportDirectory = await mkdtemp(join(tmpdir(), 'adapter-export-'));
     exportDirectories.add(exportDirectory);

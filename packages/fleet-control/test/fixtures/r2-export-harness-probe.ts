@@ -7,6 +7,9 @@ interface Env {
   readonly EXPORTS: R2Bucket;
 }
 
+const RECEIPT_DATABASE_ID = '11111111-1111-1111-1111-111111111111';
+const RECEIPT_OPERATION_ID = '22222222-2222-4222-8222-222222222222';
+
 function sequence(length: number, seed: number): Uint8Array {
   return Uint8Array.from({ length }, (_, index) => (index * 31 + seed) % 256);
 }
@@ -55,6 +58,25 @@ function store(env: Env, uuid?: string): R2DatabaseExportStore {
     },
     randomUUID: uuid === undefined ? () => crypto.randomUUID() : () => uuid,
   });
+}
+
+async function integrityOf(value: Uint8Array) {
+  const digest = new crypto.DigestStream('SHA-256');
+  await bodyFrom(value).pipeTo(digest);
+  return { size: value.byteLength, sha256: toHex(await digest.digest) };
+}
+
+function receiptIdentity(exportStore: R2DatabaseExportStore) {
+  return {
+    version: 1 as const,
+    authority: exportStore.receiptAuthority,
+    databaseId: RECEIPT_DATABASE_ID,
+    operationId: RECEIPT_OPERATION_ID,
+  };
+}
+
+function receiptKey(operationId = RECEIPT_OPERATION_ID): string {
+  return `exports/receipts/v1/${RECEIPT_DATABASE_ID}/${operationId}.sql`;
 }
 
 async function success(env: Env) {
@@ -215,6 +237,124 @@ async function collision(env: Env) {
   };
 }
 
+async function receiptReplay(env: Env) {
+  const source = sequence(16_384, 71);
+  const exportStore = store(env);
+  const identity = receiptIdentity(exportStore);
+  const first = await exportStore.writeReceipt({
+    identity,
+    body: bodyFrom(source),
+    contentLength: source.byteLength,
+    expectedIntegrity: integrityOf(source),
+  });
+  const replay = await exportStore.writeReceipt({
+    identity,
+    body: bodyFrom(source),
+    contentLength: source.byteLength,
+    expectedIntegrity: integrityOf(source),
+  });
+  const key = receiptKey();
+  const listed = await env.EXPORTS.list({
+    prefix: `exports/receipts/v1/${RECEIPT_DATABASE_ID}/`,
+  });
+  const object = await env.EXPORTS.get(key);
+  if (object === null) throw new Error('receipt replay object missing');
+  const stored = await object.bytes();
+  const customMetadata = object.customMetadata;
+  await env.EXPORTS.delete(key);
+  return {
+    sameResult:
+      first.location === replay.location &&
+      first.size === replay.size &&
+      first.sha256 === replay.sha256,
+    location: first.location,
+    objectCount: listed.objects.length,
+    bytesEqual: equalBytes(stored, source),
+    customMetadata,
+    cleaned: (await env.EXPORTS.get(key)) === null,
+  };
+}
+
+async function receiptConcurrent(env: Env) {
+  const source = sequence(12_288, 83);
+  const operationId = '33333333-3333-4333-8333-333333333333';
+  const exportStore = store(env);
+  const identity = { ...receiptIdentity(exportStore), operationId };
+  const [first, second] = await Promise.all([
+    exportStore.writeReceipt({
+      identity,
+      body: bodyFrom(source),
+      contentLength: source.byteLength,
+      expectedIntegrity: integrityOf(source),
+    }),
+    exportStore.writeReceipt({
+      identity,
+      body: bodyFrom(source),
+      contentLength: source.byteLength,
+      expectedIntegrity: integrityOf(source),
+    }),
+  ]);
+  const key = receiptKey(operationId);
+  const listed = await env.EXPORTS.list({
+    prefix: `exports/receipts/v1/${RECEIPT_DATABASE_ID}/`,
+  });
+  const object = await env.EXPORTS.get(key);
+  if (object === null) throw new Error('concurrent receipt object missing');
+  const stored = await object.bytes();
+  await env.EXPORTS.delete(key);
+  return {
+    sameResult:
+      first.location === second.location &&
+      first.size === second.size &&
+      first.sha256 === second.sha256,
+    location: first.location,
+    objectCount: listed.objects.length,
+    bytesEqual: equalBytes(stored, source),
+    cleaned: (await env.EXPORTS.get(key)) === null,
+  };
+}
+
+async function receiptMismatch(env: Env) {
+  const winner = sequence(8192, 97);
+  const challenger = sequence(8192, 101);
+  const operationId = '44444444-4444-4444-8444-444444444444';
+  const exportStore = store(env);
+  const identity = { ...receiptIdentity(exportStore), operationId };
+  const committed = await exportStore.writeReceipt({
+    identity,
+    body: bodyFrom(winner),
+    contentLength: winner.byteLength,
+    expectedIntegrity: integrityOf(winner),
+  });
+  const state = await Promise.allSettled([
+    exportStore.writeReceipt({
+      identity,
+      body: bodyFrom(challenger),
+      contentLength: challenger.byteLength,
+      expectedIntegrity: integrityOf(challenger),
+    }),
+  ]);
+  if (state[0].status === 'fulfilled') {
+    throw new Error('mismatched receipt replay succeeded');
+  }
+  const key = receiptKey(operationId);
+  const listed = await env.EXPORTS.list({
+    prefix: `exports/receipts/v1/${RECEIPT_DATABASE_ID}/`,
+  });
+  const object = await env.EXPORTS.get(key);
+  if (object === null) throw new Error('mismatched receipt winner missing');
+  const stored = await object.bytes();
+  await env.EXPORTS.delete(key);
+  return {
+    location: committed.location,
+    message: messageOf(state[0].reason),
+    objectCount: listed.objects.length,
+    winnerPreserved: equalBytes(stored, winner),
+    challengerRejected: !equalBytes(stored, challenger),
+    cleaned: (await env.EXPORTS.get(key)) === null,
+  };
+}
+
 async function dispatch(action: string, env: Env): Promise<Response> {
   switch (action) {
     case 'success':
@@ -227,6 +367,12 @@ async function dispatch(action: string, env: Env): Promise<Response> {
       return Response.json(await midTransferError(env));
     case 'collision':
       return Response.json(await collision(env));
+    case 'receipt-replay':
+      return Response.json(await receiptReplay(env));
+    case 'receipt-concurrent':
+      return Response.json(await receiptConcurrent(env));
+    case 'receipt-mismatch':
+      return Response.json(await receiptMismatch(env));
     default:
       return Response.json({ error: 'unknown action' }, { status: 400 });
   }

@@ -129,6 +129,8 @@ export {
   type ApplicationR2Resource,
   type D1Migration,
   type DatabaseExport,
+  type DatabaseExportIntegrity,
+  type DatabaseExportReceiptIdentity,
   type DatabaseReference,
   type DecommissionAdvanceIntent,
   type DecommissionAdvanceToken,

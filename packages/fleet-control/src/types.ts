@@ -703,11 +703,36 @@ export interface LiveDeployment {
   readonly maintenance: MaintenanceHealth;
 }
 
-export interface DatabaseExport {
+/** Independently verified byte integrity for one complete database export. */
+export interface DatabaseExportIntegrity {
+  /** Positive safe-integer byte length of the complete export. */
+  readonly size: number;
+  /** Lowercase hexadecimal SHA-256 digest of the complete export. */
+  readonly sha256: string;
+}
+
+/**
+ * Immutable identity of one durable database-export receipt.
+ *
+ * `authority` identifies the configured storage root and must remain unchanged
+ * for every retry. Reusing the same complete identity converges only when the
+ * already-committed export has exact byte integrity; a collision is preserved
+ * and refused.
+ */
+export interface DatabaseExportReceiptIdentity {
+  /** Receipt derivation version. Version 1 is permanently stable. */
+  readonly version: 1;
+  /** Canonical identifier of the immutable receipt storage authority. */
+  readonly authority: string;
+  /** Immutable provider database identifier. */
+  readonly databaseId: string;
+  /** Durable UUIDv4 operation identifier reused by every retry. */
+  readonly operationId: string;
+}
+
+export interface DatabaseExport extends DatabaseExportIntegrity {
   readonly databaseId: string;
   readonly location: string;
-  readonly sha256: string;
-  readonly size: number;
 }
 
 export interface FleetInventoryDeployment {
@@ -912,13 +937,10 @@ export interface PlainWorkerDeploymentStatus {
 }
 
 /** Result of a durable ordinary-Worker database export. */
-export interface PlainWorkerDatabaseExportResult {
+export interface PlainWorkerDatabaseExportResult
+  extends DatabaseExportIntegrity {
   /** Durable location returned by the export store. */
   readonly location: string;
-  /** Committed export size in bytes. */
-  readonly size: number;
-  /** Lowercase hexadecimal SHA-256 digest of the complete export. */
-  readonly sha256: string;
 }
 
 /** Outcome of a provider mutation that may have been dispatched. */
@@ -1236,6 +1258,21 @@ export interface PlainWorkerProvisioningApi extends PlainWorkerRouteApi {
   /** Exports a D1 database into the durable store with independent integrity. */
   exportDatabase(
     database: { readonly id: string; readonly name: string },
+    fence: ExternalMutationFence,
+  ): Promise<PlainWorkerDatabaseExportResult>;
+  /**
+   * Canonical receipt storage authority. Present together with
+   * `exportDatabaseReceipt`, absent together when unsupported, and immutable
+   * for every retry of one receipt identity.
+   */
+  readonly databaseExportReceiptAuthority?: string;
+  /**
+   * Streams one operation-scoped export whose eager source-integrity promise is
+   * independently verified by the configured store. An exact retry converges;
+   * an identity or byte collision is preserved and refused.
+   */
+  exportDatabaseReceipt?(
+    identity: DatabaseExportReceiptIdentity,
     fence: ExternalMutationFence,
   ): Promise<PlainWorkerDatabaseExportResult>;
 }
@@ -1640,6 +1677,21 @@ export interface ProvisioningBackend {
   ): Promise<void>;
   exportDatabase(
     database: DatabaseReference,
+    fence: ExternalMutationFence,
+  ): Promise<DatabaseExport>;
+  /**
+   * Canonical receipt storage authority. Present together with
+   * `exportDatabaseReceipt`, absent together when unsupported, and immutable
+   * for every retry of one receipt identity.
+   */
+  readonly databaseExportReceiptAuthority?: string;
+  /**
+   * Exports one operation-scoped receipt. The lower store consumes the body
+   * while its eager source-integrity promise settles, exact retries converge,
+   * and identity or byte collisions are preserved and refused.
+   */
+  exportDatabaseReceipt?(
+    identity: DatabaseExportReceiptIdentity,
     fence: ExternalMutationFence,
   ): Promise<DatabaseExport>;
   deleteDatabase(

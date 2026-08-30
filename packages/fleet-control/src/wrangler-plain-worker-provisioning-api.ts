@@ -7,10 +7,16 @@ import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
-import type { DurableDatabaseExportStore } from './database-export-store.js';
+import {
+  captureDatabaseExportReceiptCapability,
+  type DurableDatabaseExportStore,
+  databaseExportReceiptIdentityFromUnknown,
+} from './database-export-store.js';
 import { readField, readStringField } from './json-field-reads.js';
 import { providerBindingsToPlainWorkerShape } from './provider-binding-inventory.js';
 import type {
+  DatabaseExportIntegrity,
+  DatabaseExportReceiptIdentity,
   DatabaseReference,
   ExternalMutationFence,
   OrdinaryWorkerDeploymentVersion,
@@ -66,9 +72,39 @@ function normalizeVersionSummary(value: unknown): PlainWorkerVersionSummary {
   return { versionId: readVersionId(value), tag: versionTag(value) };
 }
 
+async function funnel<T>(operation: () => T | PromiseLike<T>): Promise<T> {
+  return operation();
+}
+
+async function settleOperation<T>(
+  operation: () => T | PromiseLike<T>,
+): Promise<PromiseSettledResult<Awaited<T>>> {
+  const [state] = await Promise.allSettled([funnel(operation)]);
+  return state;
+}
+
+async function hashScratchFile(
+  location: string,
+): Promise<DatabaseExportIntegrity> {
+  const hash = createHash('sha256');
+  let size = 0;
+  for await (const chunk of createReadStream(location)) {
+    hash.update(chunk);
+    size += chunk.byteLength;
+  }
+  return { size, sha256: hash.digest('hex') };
+}
+
 export class WranglerPlainWorkerProvisioningApi
   implements PlainWorkerProvisioningApi
 {
+  /** Canonical immutable receipt authority, present only with receipt export. */
+  declare readonly databaseExportReceiptAuthority?: string;
+  /** Publishes one immutable-ID receipt and cleans its private scratch file. */
+  declare readonly exportDatabaseReceipt?: (
+    identity: DatabaseExportReceiptIdentity,
+    fence: ExternalMutationFence,
+  ) => Promise<PlainWorkerDatabaseExportResult>;
   readonly #runner: CommandRunner;
   readonly #routeApi: PlainWorkerRouteApi;
   readonly #exportDirectory: string;
@@ -109,7 +145,25 @@ export class WranglerPlainWorkerProvisioningApi
     this.#runner = options.runner;
     this.#routeApi = options.routeApi;
     this.#exportDirectory = resolve(options.exportDirectory);
-    this.#exportStore = options.exportStore;
+    const exportStore = options.exportStore;
+    this.#exportStore = exportStore;
+    const receiptCapability = captureDatabaseExportReceiptCapability(
+      exportStore,
+      () => [exportStore.receiptAuthority, exportStore.writeReceipt],
+    );
+    if (receiptCapability) {
+      const writeReceipt = receiptCapability.method as NonNullable<
+        DurableDatabaseExportStore['writeReceipt']
+      >;
+      this.databaseExportReceiptAuthority = receiptCapability.authority;
+      this.exportDatabaseReceipt = (identity, fence) => {
+        const canonical = databaseExportReceiptIdentityFromUnknown(
+          identity,
+          receiptCapability.authority,
+        );
+        return this.#exportDatabaseReceipt(canonical, fence, writeReceipt);
+      };
+    }
     this.#routeGetDatabase = options.routeApi.getDatabase?.bind(
       options.routeApi,
     );
@@ -602,5 +656,73 @@ export class WranglerPlainWorkerProvisioningApi
     } finally {
       await rm(temporaryDirectory, { recursive: true, force: true });
     }
+  }
+
+  async #exportDatabaseReceipt(
+    identity: DatabaseExportReceiptIdentity,
+    fence: ExternalMutationFence,
+    writeReceipt: NonNullable<DurableDatabaseExportStore['writeReceipt']>,
+  ): Promise<PlainWorkerDatabaseExportResult> {
+    await mkdir(this.#exportDirectory, { recursive: true });
+    const temporaryDirectory = await mkdtemp(
+      join(this.#exportDirectory, '.wrangler-export-'),
+    );
+    const temporaryLocation = join(temporaryDirectory, 'database-export.sql');
+    const operation = await settleOperation(async () => {
+      await fence.assertOwned();
+      await this.#runner.run([
+        'd1',
+        'export',
+        identity.databaseId,
+        '--remote',
+        '--skip-confirmation',
+        '--output',
+        temporaryLocation,
+      ]);
+      await chmod(temporaryLocation, 0o600);
+      const metadata = await stat(temporaryLocation);
+      if (!metadata.isFile() || metadata.size === 0) {
+        throw new Error('Wrangler database export is not a non-empty file');
+      }
+      const integrity = await hashScratchFile(temporaryLocation);
+      if (integrity.size !== metadata.size) {
+        throw new Error('Wrangler database export changed while being hashed');
+      }
+      const expectedIntegrity = Promise.resolve(integrity);
+      const stored = await writeReceipt({
+        identity,
+        body: Readable.toWeb(
+          createReadStream(temporaryLocation),
+        ) as ReadableStream<Uint8Array>,
+        contentLength: integrity.size,
+        expectedIntegrity,
+      });
+      if (
+        !stored.location ||
+        stored.size !== integrity.size ||
+        stored.sha256 !== integrity.sha256
+      ) {
+        throw new Error(
+          'durable database export store returned mismatched committed integrity',
+        );
+      }
+      return {
+        location: stored.location,
+        size: integrity.size,
+        sha256: integrity.sha256,
+      };
+    });
+    const cleanup = await settleOperation(() =>
+      rm(temporaryDirectory, { recursive: true, force: true }),
+    );
+    if (operation.status === 'rejected' && cleanup.status === 'rejected') {
+      throw new AggregateError(
+        [operation.reason, cleanup.reason],
+        'database export receipt and Wrangler scratch cleanup failed',
+      );
+    }
+    if (operation.status === 'rejected') throw operation.reason;
+    if (cleanup.status === 'rejected') throw cleanup.reason;
+    return operation.value;
   }
 }

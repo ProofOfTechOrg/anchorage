@@ -5,7 +5,12 @@ import {
   type CloudflareProvisioningClient,
   withProviderDispatchTracking,
 } from './cloudflare-client.js';
+import {
+  captureDatabaseExportReceiptCapability,
+  databaseExportReceiptIdentityFromUnknown,
+} from './database-export-store.js';
 import type {
+  DatabaseExportReceiptIdentity,
   DatabaseReference,
   ExternalMutationFence,
   OrdinaryWorkerDeploymentVersion,
@@ -23,6 +28,13 @@ import type {
 export class CloudflareApiPlainWorkerProvisioningApi
   implements PlainWorkerProvisioningApi
 {
+  /** Canonical immutable receipt authority, present only with receipt export. */
+  declare readonly databaseExportReceiptAuthority?: string;
+  /** Forwards an exact operation receipt under the supplied mutation fence. */
+  declare readonly exportDatabaseReceipt?: (
+    identity: DatabaseExportReceiptIdentity,
+    fence: ExternalMutationFence,
+  ) => Promise<PlainWorkerDatabaseExportResult>;
   readonly #client: CloudflareProvisioningClient;
   readonly maxMutationDurationMs: number;
   readonly supportsExactDatabaseDeletion = true;
@@ -44,19 +56,44 @@ export class CloudflareApiPlainWorkerProvisioningApi
   >;
 
   constructor(options: { readonly client: CloudflareProvisioningClient }) {
-    this.#client = options.client;
-    this.maxMutationDurationMs = options.client.requestTimeoutMs;
+    const client = options.client;
+    this.#client = client;
+    const receiptCapability = captureDatabaseExportReceiptCapability(
+      client,
+      () => [
+        client.databaseExportReceiptAuthority,
+        client.exportDatabaseReceipt,
+      ],
+    );
+    if (receiptCapability) {
+      const exportDatabaseReceipt = receiptCapability.method as NonNullable<
+        CloudflareProvisioningClient['exportDatabaseReceipt']
+      >;
+      this.databaseExportReceiptAuthority = receiptCapability.authority;
+      this.exportDatabaseReceipt = async (identity, fence) => {
+        const canonical = databaseExportReceiptIdentityFromUnknown(
+          identity,
+          receiptCapability.authority,
+        );
+        await fence.assertOwned();
+        const exported = await this.#client.withMutationFence(fence, () =>
+          exportDatabaseReceipt(canonical),
+        );
+        return {
+          location: exported.location,
+          size: exported.size,
+          sha256: exported.sha256,
+        };
+      };
+    }
+    this.maxMutationDurationMs = client.requestTimeoutMs;
     this.advanceDecommissionAttachmentScan =
-      options.client.advanceDecommissionAttachmentScan.bind(options.client);
-    this.listWorkerR2Attachments = options.client.listWorkerR2Attachments.bind(
-      options.client,
-    );
-    this.getR2Bucket = options.client.getR2Bucket.bind(options.client);
-    this.createR2Bucket = options.client.createR2Bucket.bind(options.client);
-    this.assertR2BucketEmpty = options.client.assertR2BucketEmpty.bind(
-      options.client,
-    );
-    this.deleteR2Bucket = options.client.deleteR2Bucket.bind(options.client);
+      client.advanceDecommissionAttachmentScan.bind(client);
+    this.listWorkerR2Attachments = client.listWorkerR2Attachments.bind(client);
+    this.getR2Bucket = client.getR2Bucket.bind(client);
+    this.createR2Bucket = client.createR2Bucket.bind(client);
+    this.assertR2BucketEmpty = client.assertR2BucketEmpty.bind(client);
+    this.deleteR2Bucket = client.deleteR2Bucket.bind(client);
   }
 
   withMutationFence<T>(

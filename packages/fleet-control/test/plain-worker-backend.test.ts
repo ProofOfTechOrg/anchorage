@@ -7,11 +7,13 @@ import { PlainWorkerBackend } from '../src/plain-worker-backend.js';
 import { deploymentSpecDigest } from '../src/spec-digest.js';
 import type {
   ApplicationR2Binding,
+  DatabaseExportReceiptIdentity,
   DatabaseReference,
   DecommissionAttachmentScanInput,
   DecommissionAttachmentScanResult,
   DeploymentSecrets,
   DeploymentSpec,
+  ExternalMutationFence,
   FleetRecord,
   PlainWorkerProvisioningApi,
   PlainWorkerUploadIntent,
@@ -27,6 +29,14 @@ import {
   type FenceAssertionMode,
   PlainWorkerProvisioningApiFake,
 } from './fixtures/plain-worker-provisioning-api-fake.js';
+
+const RECEIPT_AUTHORITY = 'memory://fleet-exports/receipts/v1';
+const RECEIPT_IDENTITY: DatabaseExportReceiptIdentity = {
+  version: 1,
+  authority: RECEIPT_AUTHORITY,
+  databaseId: '00000000-0000-0000-0000-000000000001',
+  operationId: '00000000-0000-4000-8000-000000000002',
+};
 
 // The legacy Wrangler suite remains the compatibility proof. The core-policy
 // cases here prove that the core runs without a CLI adapter and seed the
@@ -205,6 +215,136 @@ describe('WranglerLoopBackend construction', () => {
 });
 
 describe('PlainWorkerBackend core policy', () => {
+  it('exposes and forwards receipt export only for a capable plain API', async () => {
+    const absentApi = new PlainWorkerProvisioningApiFake();
+    const absent = backend(absentApi);
+    expect('databaseExportReceiptAuthority' in absent).toBe(false);
+    expect('exportDatabaseReceipt' in absent).toBe(false);
+
+    const capableApi = new PlainWorkerProvisioningApiFake();
+    const legacy = vi
+      .spyOn(capableApi, 'exportDatabase')
+      .mockRejectedValue(new Error('legacy export must not run'));
+    let authorityReads = 0;
+    let methodReads = 0;
+    let receiver: unknown;
+    let received: DatabaseExportReceiptIdentity | undefined;
+    Object.defineProperties(capableApi, {
+      databaseExportReceiptAuthority: {
+        configurable: true,
+        get() {
+          authorityReads += 1;
+          return RECEIPT_AUTHORITY;
+        },
+      },
+      exportDatabaseReceipt: {
+        configurable: true,
+        get() {
+          methodReads += 1;
+          return async function (
+            this: unknown,
+            identity: DatabaseExportReceiptIdentity,
+            receiptFence: ExternalMutationFence,
+          ) {
+            receiver = this;
+            received = identity;
+            await receiptFence.assertOwned();
+            return {
+              location: 'memory://receipt',
+              size: 4,
+              sha256: 'a'.repeat(64),
+            };
+          };
+        },
+      },
+    });
+    const capable = backend(capableApi);
+    expect(capable.databaseExportReceiptAuthority).toBe(RECEIPT_AUTHORITY);
+    expect([authorityReads, methodReads]).toEqual([1, 1]);
+    const exportReceipt = capable.exportDatabaseReceipt;
+    if (!exportReceipt) throw new Error('expected receipt export capability');
+    const assertOwned = vi.fn(async () => {});
+    const receiptFence: ExternalMutationFence = {
+      mutationLeaseTtlMs: 15 * 60_000,
+      assertOwned,
+    };
+    await expect(
+      exportReceipt(RECEIPT_IDENTITY, receiptFence),
+    ).resolves.toEqual({
+      databaseId: RECEIPT_IDENTITY.databaseId,
+      location: 'memory://receipt',
+      size: 4,
+      sha256: 'a'.repeat(64),
+    });
+    expect(receiver).toBe(capableApi);
+    expect(received).toEqual(RECEIPT_IDENTITY);
+    expect(assertOwned).toHaveBeenCalledTimes(1);
+    expect(legacy).not.toHaveBeenCalled();
+
+    received = undefined;
+    assertOwned.mockClear();
+    const authorityFailure = await exportReceipt(
+      { ...RECEIPT_IDENTITY, authority: 'memory://other/receipts/v1' },
+      receiptFence,
+    ).catch((error: unknown) => error);
+    expect(authorityFailure).toBeInstanceOf(Error);
+    expect((authorityFailure as Error).message).toBe(
+      'database export receipt authority differs from configured authority',
+    );
+    expect((authorityFailure as Error).cause).toBeUndefined();
+    expect(received).toBeUndefined();
+    expect(assertOwned).not.toHaveBeenCalled();
+
+    const incomplete = new PlainWorkerProvisioningApiFake();
+    Object.defineProperty(incomplete, 'databaseExportReceiptAuthority', {
+      configurable: true,
+      value: RECEIPT_AUTHORITY,
+    });
+    const failure = (() => {
+      try {
+        return backend(incomplete);
+      } catch (error) {
+        return error;
+      }
+    })();
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe(
+      'database export receipt capability is malformed',
+    );
+    expect((failure as Error).cause).toBeUndefined();
+
+    for (const property of [
+      'databaseExportReceiptAuthority',
+      'exportDatabaseReceipt',
+    ] as const) {
+      const throwingApi = new PlainWorkerProvisioningApiFake();
+      if (property === 'exportDatabaseReceipt') {
+        Object.defineProperty(throwingApi, 'databaseExportReceiptAuthority', {
+          configurable: true,
+          value: RECEIPT_AUTHORITY,
+        });
+      }
+      Object.defineProperty(throwingApi, property, {
+        configurable: true,
+        get() {
+          throw new Error(`${property} getter must not escape`);
+        },
+      });
+      const getterFailure = (() => {
+        try {
+          return backend(throwingApi);
+        } catch (error) {
+          return error;
+        }
+      })();
+      expect(getterFailure).toBeInstanceOf(Error);
+      expect((getterFailure as Error).message).toBe(
+        'database export receipt capability is malformed',
+      );
+      expect((getterFailure as Error).cause).toBeUndefined();
+    }
+  });
+
   it('exposes a truly optional bound decommission attachment scan capability', async () => {
     const absentApi = new PlainWorkerProvisioningApiFake();
     const absent = backend(absentApi);

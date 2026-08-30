@@ -191,6 +191,7 @@ try {
   DecommissionAdvanceTokenFutureError,
   DecommissionAdvanceTokenOperationError,
   D1CloudflareApiRateCoordinator,
+  FileSystemDatabaseExportStore,
   PlainWorkerBackend,
   ProcessLocalCloudflareApiRateCoordinator,
   ProvisioningError,
@@ -232,6 +233,11 @@ try {
   type DecommissionOperationIdentity,
   type DecommissionOperationMode,
   type DecommissionRecordIdentity,
+  type DatabaseExport,
+  type DatabaseExportIntegrity,
+  type DatabaseExportReceiptIdentity,
+  type DurableDatabaseExportStore,
+  type ExternalMutationFence,
   type FleetRecord,
   type FleetStateStore,
   type FleetSettlementContext,
@@ -304,6 +310,32 @@ import { assertImmutableDeploymentMapping } from '@proofoftech/fleet-control';
 import { reconcilePersistedDatabase } from '@proofoftech/fleet-control';
 // @ts-expect-error intent codec errors are package-private.
 import { DecommissionAdvanceIntentError } from '@proofoftech/fleet-control';
+// @ts-expect-error receipt capability capture is package-private.
+import { captureDatabaseExportReceiptCapability } from '@proofoftech/fleet-control';
+// @ts-expect-error receipt authority normalization is package-private.
+import { databaseExportReceiptAuthorityFromUnknown } from '@proofoftech/fleet-control';
+// @ts-expect-error receipt identity normalization is package-private.
+import { databaseExportReceiptIdentityFromUnknown } from '@proofoftech/fleet-control';
+// @ts-expect-error receipt integrity normalization is package-private.
+import { databaseExportIntegrityFromUnknown } from '@proofoftech/fleet-control';
+// @ts-expect-error native receipt integrity capture is package-private.
+import { captureDatabaseExportIntegrityPromise } from '@proofoftech/fleet-control';
+// @ts-expect-error receipt body cancellation is package-private.
+import { cancelBodyWithoutAwait } from '@proofoftech/fleet-control';
+// @ts-expect-error tagged receipt errors are package-private.
+import { databaseExportReceiptError } from '@proofoftech/fleet-control';
+// @ts-expect-error the receipt-error classifier is package-private.
+import { isDatabaseExportReceiptError } from '@proofoftech/fleet-control';
+// @ts-expect-error captured receipt capabilities are package-private.
+import type { CapturedDatabaseExportReceiptCapability } from '@proofoftech/fleet-control';
+// @ts-expect-error filesystem receipt primitives are package-private.
+import type { FileSystemDatabaseExportStoreReceiptPrimitives } from '@proofoftech/fleet-control';
+// @ts-expect-error filesystem receipt overrides are package-private.
+import type { FileSystemDatabaseExportStoreReceiptPrimitiveOverrides } from '@proofoftech/fleet-control';
+// @ts-expect-error the filesystem publication seam is package-private.
+import { createFileSystemDatabaseExportStoreWithReceiptPrimitives } from '@proofoftech/fleet-control';
+// @ts-expect-error the R2 implementation remains a deep-only adapter.
+import { R2DatabaseExportStore } from '@proofoftech/fleet-control';
 import type { FleetDispatchEnv } from '@proofoftech/fleet-control/workers/dispatch';
 import {
   createEgressProxyFetch,
@@ -338,6 +370,33 @@ declare const decommissionRecordIdentity: DecommissionRecordIdentity;
 declare const decommissionPhase: NormalDecommissionLifecyclePhase;
 declare const plainWorkerRouteApi: PlainWorkerRouteApi;
 declare const plainWorkerProvisioningApiShape: PlainWorkerProvisioningApi;
+declare const receiptFence: ExternalMutationFence;
+const databaseExportIntegrity: DatabaseExportIntegrity = {
+  size: 1,
+  sha256: 'a'.repeat(64),
+};
+const databaseExportReceiptIdentity: DatabaseExportReceiptIdentity = {
+  version: 1,
+  authority: 'memory://fleet-exports/receipts/v1',
+  databaseId: '00000000-0000-0000-0000-000000000001',
+  operationId: '00000000-0000-4000-8000-000000000002',
+};
+const legacyExportStore: DurableDatabaseExportStore = {
+  async write() {
+    return { location: 'memory://legacy', ...databaseExportIntegrity };
+  },
+};
+const receiptExportStore: DurableDatabaseExportStore = {
+  ...legacyExportStore,
+  receiptAuthority: databaseExportReceiptIdentity.authority,
+  async writeReceipt() {
+    return { location: 'memory://receipt', ...databaseExportIntegrity };
+  },
+};
+const storeReceiptAuthority: string | undefined =
+  receiptExportStore.receiptAuthority;
+const storeReceiptWrite: DurableDatabaseExportStore['writeReceipt'] =
+  receiptExportStore.writeReceipt;
 const plainWorkerBackendOptions: PlainWorkerBackendOptions = {
   api: plainWorkerProvisioningApiShape,
   identityCaller: 'PackedConsumer.seedDeploymentIdentity',
@@ -356,6 +415,32 @@ const directBackendOptions: CloudflareApiPlainWorkerBackendOptions = {
 };
 const directBackend: ProvisioningBackend =
   new CloudflareApiPlainWorkerBackend(directBackendOptions);
+const directReceiptAuthority: string | undefined =
+  directClient.databaseExportReceiptAuthority;
+const directReceiptExport:
+  | ((identity: DatabaseExportReceiptIdentity) => Promise<DatabaseExport>)
+  | undefined = directClient.exportDatabaseReceipt;
+const plainReceiptAuthority: string | undefined =
+  plainWorkerProvisioningApiShape.databaseExportReceiptAuthority;
+const plainReceiptExport:
+  | ((
+      identity: DatabaseExportReceiptIdentity,
+      fence: ExternalMutationFence,
+    ) => Promise<PlainWorkerDatabaseExportResult>)
+  | undefined = plainWorkerProvisioningApiShape.exportDatabaseReceipt;
+const wfpReceiptAuthority: string | undefined =
+  api.databaseExportReceiptAuthority;
+const wfpReceiptExport:
+  | ((identity: DatabaseExportReceiptIdentity) => Promise<DatabaseExport>)
+  | undefined = api.exportDatabaseReceipt;
+const backendReceiptAuthority: string | undefined =
+  provisioningBackend.databaseExportReceiptAuthority;
+const backendReceiptExport:
+  | ((
+      identity: DatabaseExportReceiptIdentity,
+      fence: ExternalMutationFence,
+    ) => Promise<DatabaseExport>)
+  | undefined = provisioningBackend.exportDatabaseReceipt;
 const decommissionScanResults: readonly DecommissionAttachmentScanResult[] = [
   {
     status: 'pending',
@@ -518,6 +603,21 @@ void [
   decommissionAdvanceOptions,
   decommissionAdvanceResults,
   boundedDecommissionAdvance,
+  databaseExportIntegrity,
+  databaseExportReceiptIdentity,
+  legacyExportStore,
+  receiptExportStore,
+  storeReceiptAuthority,
+  storeReceiptWrite,
+  receiptFence,
+  directReceiptAuthority,
+  directReceiptExport,
+  plainReceiptAuthority,
+  plainReceiptExport,
+  wfpReceiptAuthority,
+  wfpReceiptExport,
+  backendReceiptAuthority,
+  backendReceiptExport,
 ];
 const customDomain: PlainWorkerCustomDomain = {
   id: 'domain-id',
@@ -548,6 +648,7 @@ void ActiveRouteAttestationError;
 void CloudflareApiPlainWorkerBackend;
 void CloudflareProvisioningClient;
 void D1CloudflareApiRateCoordinator;
+void FileSystemDatabaseExportStore;
 void PlainWorkerBackend;
 void ProcessLocalCloudflareApiRateCoordinator;
 void ProvisioningError;
@@ -612,6 +713,7 @@ import {
   DecommissionAdvanceTokenFutureError,
   DecommissionAdvanceTokenOperationError,
   ProcessLocalCloudflareApiRateCoordinator,
+  FileSystemDatabaseExportStore,
   ProvisioningError,
   WorkersForPlatformsBackend,
   advanceDecommissionDeployment,
@@ -672,6 +774,24 @@ assert.equal(
     .advanceDecommissionAttachmentScan,
   'function',
 );
+const legacyClient = new CloudflareProvisioningClient({
+  accountId: 'a',
+  apiToken: 't',
+  plane: 'plain-worker',
+  rateCoordinator: new ProcessLocalCloudflareApiRateCoordinator(),
+  exportStore: {
+    async write() {
+      return { location: 'memory://legacy', size: 1, sha256: 'a'.repeat(64) };
+    },
+  },
+});
+assert.equal('databaseExportReceiptAuthority' in legacyClient, false);
+assert.equal('exportDatabaseReceipt' in legacyClient, false);
+const fileStore = new FileSystemDatabaseExportStore('/tmp/fleet-control-packed-receipts');
+if (process.platform !== 'win32') {
+  assert.equal(typeof fileStore.receiptAuthority, 'string');
+  assert.equal(typeof fileStore.writeReceipt, 'function');
+}
 assert.throws(
   () =>
     new CloudflareProvisioningClient({

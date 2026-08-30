@@ -6,6 +6,7 @@ import { CloudflareApiPlainWorkerProvisioningApi } from '../src/cloudflare-api-p
 import { CloudflareProvisioningClient } from '../src/cloudflare-client.js';
 import { initialWorkerAttachmentScan } from '../src/cloudflare-worker-attachment-scan-state.js';
 import type {
+  DatabaseExportReceiptIdentity,
   DecommissionAttachmentScanInput,
   DecommissionAttachmentScanResult,
   ExternalMutationFence,
@@ -26,6 +27,14 @@ import {
   rejectedValue,
 } from './fixtures/plain-worker-port-probe.js';
 import { providerWorld } from './fixtures/provider-world.js';
+
+const RECEIPT_AUTHORITY = 'memory://fleet-exports/receipts/v1';
+const RECEIPT_IDENTITY: DatabaseExportReceiptIdentity = {
+  version: 1,
+  authority: RECEIPT_AUTHORITY,
+  databaseId: '00000000-0000-0000-0000-000000000001',
+  operationId: '00000000-0000-4000-8000-000000000002',
+};
 
 function uploadIntent(mode: 'initial' | 'staged'): PlainWorkerUploadIntent {
   const base = {
@@ -595,6 +604,141 @@ describe('CloudflareApiPlainWorkerProvisioningApi', () => {
     await expect(
       api.deleteDatabaseFenced('database-1', fence),
     ).resolves.toBeUndefined();
+  });
+
+  it('forwards one receipt identity under the original client receiver and fence', async () => {
+    const seeded = subject(async () => single({}));
+    const { client } = seeded;
+    const legacy = vi
+      .spyOn(client, 'exportDatabase')
+      .mockRejectedValue(new Error('legacy export must not run'));
+    let authorityReads = 0;
+    let methodReads = 0;
+    let receiver: unknown;
+    let received: DatabaseExportReceiptIdentity | undefined;
+    Object.defineProperties(client, {
+      databaseExportReceiptAuthority: {
+        configurable: true,
+        get() {
+          authorityReads += 1;
+          return RECEIPT_AUTHORITY;
+        },
+      },
+      exportDatabaseReceipt: {
+        configurable: true,
+        get() {
+          methodReads += 1;
+          return function (
+            this: unknown,
+            identity: DatabaseExportReceiptIdentity,
+          ) {
+            receiver = this;
+            received = identity;
+            return Promise.resolve({
+              databaseId: identity.databaseId,
+              location: 'memory://receipt',
+              size: 4,
+              sha256: 'a'.repeat(64),
+            });
+          };
+        },
+      },
+    });
+    const api = new CloudflareApiPlainWorkerProvisioningApi({ client });
+    expect(api.databaseExportReceiptAuthority).toBe(RECEIPT_AUTHORITY);
+    expect([authorityReads, methodReads]).toEqual([1, 1]);
+    const exportReceipt = api.exportDatabaseReceipt;
+    if (!exportReceipt) throw new Error('expected receipt export capability');
+    const assertOwned = vi.fn(async () => {});
+    const receiptFence: ExternalMutationFence = {
+      mutationLeaseTtlMs: 60_000,
+      assertOwned,
+    };
+    await expect(
+      exportReceipt(RECEIPT_IDENTITY, receiptFence),
+    ).resolves.toEqual({
+      location: 'memory://receipt',
+      size: 4,
+      sha256: 'a'.repeat(64),
+    });
+    expect(receiver).toBe(client);
+    expect(received).toEqual(RECEIPT_IDENTITY);
+    expect(assertOwned).toHaveBeenCalledTimes(1);
+    expect(legacy).not.toHaveBeenCalled();
+
+    assertOwned.mockClear();
+    received = undefined;
+    const authorityFailure = await exportReceipt(
+      { ...RECEIPT_IDENTITY, authority: 'memory://other/receipts/v1' },
+      receiptFence,
+    ).catch((error: unknown) => error);
+    expect(authorityFailure).toBeInstanceOf(Error);
+    expect((authorityFailure as Error).message).toBe(
+      'database export receipt authority differs from configured authority',
+    );
+    expect((authorityFailure as Error).cause).toBeUndefined();
+    expect(assertOwned).not.toHaveBeenCalled();
+    expect(received).toBeUndefined();
+
+    const absentClient = subject(async () => single({})).client;
+    const absent = new CloudflareApiPlainWorkerProvisioningApi({
+      client: absentClient,
+    });
+    expect('databaseExportReceiptAuthority' in absent).toBe(false);
+    expect('exportDatabaseReceipt' in absent).toBe(false);
+
+    Object.defineProperty(absentClient, 'databaseExportReceiptAuthority', {
+      configurable: true,
+      value: RECEIPT_AUTHORITY,
+    });
+    const malformed = (() => {
+      try {
+        return new CloudflareApiPlainWorkerProvisioningApi({
+          client: absentClient,
+        });
+      } catch (error) {
+        return error;
+      }
+    })();
+    expect(malformed).toBeInstanceOf(Error);
+    expect((malformed as Error).message).toBe(
+      'database export receipt capability is malformed',
+    );
+    expect((malformed as Error).cause).toBeUndefined();
+
+    for (const property of [
+      'databaseExportReceiptAuthority',
+      'exportDatabaseReceipt',
+    ] as const) {
+      const throwingClient = subject(async () => single({})).client;
+      if (property === 'exportDatabaseReceipt') {
+        Object.defineProperty(
+          throwingClient,
+          'databaseExportReceiptAuthority',
+          { configurable: true, value: RECEIPT_AUTHORITY },
+        );
+      }
+      Object.defineProperty(throwingClient, property, {
+        configurable: true,
+        get() {
+          throw new Error(`${property} getter must not escape`);
+        },
+      });
+      const failure = (() => {
+        try {
+          return new CloudflareApiPlainWorkerProvisioningApi({
+            client: throwingClient,
+          });
+        } catch (error) {
+          return error;
+        }
+      })();
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toBe(
+        'database export receipt capability is malformed',
+      );
+      expect((failure as Error).cause).toBeUndefined();
+    }
   });
 
   it('classifies only provider 404 as an absent Worker', async () => {

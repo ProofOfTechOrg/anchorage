@@ -117,4 +117,51 @@ describe.sequential('R2DatabaseExportStore Wrangler harness', {
     });
     expect(['first', 'second']).toContain(field(result, 'winner'));
   });
+
+  it('replays one stable receipt without creating another R2 object', async () => {
+    const result = await probe('receipt-replay');
+    expect(result).toMatchObject({
+      sameResult: true,
+      objectCount: 1,
+      bytesEqual: true,
+      cleaned: true,
+      customMetadata: {
+        anchorageReceiptVersion: '1',
+        anchorageReceiptAuthority: 'r2://exports/exports/receipts/v1',
+        anchorageDatabaseId: '11111111-1111-1111-1111-111111111111',
+        anchorageOperationId: '22222222-2222-4222-8222-222222222222',
+      },
+    });
+    expect(field(result, 'location')).toBe(
+      'r2://exports/exports/receipts/v1/11111111-1111-1111-1111-111111111111/22222222-2222-4222-8222-222222222222.sql',
+    );
+  });
+
+  it('converges matching concurrent receipt attempts to one winner', async () => {
+    const result = await probe('receipt-concurrent');
+    expect(result).toMatchObject({
+      sameResult: true,
+      objectCount: 1,
+      bytesEqual: true,
+      cleaned: true,
+    });
+    expect(field(result, 'location')).toBe(
+      'r2://exports/exports/receipts/v1/11111111-1111-1111-1111-111111111111/33333333-3333-4333-8333-333333333333.sql',
+    );
+  });
+
+  it('preserves and refuses a same-operation receipt with different bytes', async () => {
+    const result = await probe('receipt-mismatch');
+    expect(result).toMatchObject({
+      message:
+        'database export receipt collision differs from the committed export',
+      objectCount: 1,
+      winnerPreserved: true,
+      challengerRejected: true,
+      cleaned: true,
+    });
+    expect(field(result, 'location')).toBe(
+      'r2://exports/exports/receipts/v1/11111111-1111-1111-1111-111111111111/44444444-4444-4444-8444-444444444444.sql',
+    );
+  });
 });
