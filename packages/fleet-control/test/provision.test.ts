@@ -6702,7 +6702,7 @@ describe('fleet provisioning', () => {
 
   it('converges receipt commits and database-exported writes without a second artifact', async () => {
     const receiptLoss = await boundedDecommissionHarness();
-    let verify = await driveToPreExportVerify(receiptLoss);
+    const verify = await driveToPreExportVerify(receiptLoss);
     const receiptFailure = new Error('receipt response lost after commit');
     receiptLoss.backend.receiptOutcomes.push({
       status: 'rejected',
@@ -6714,10 +6714,6 @@ describe('fleet provisioning', () => {
     );
     expect(receiptLoss.store.record?.decommissionIntent?.state).toBe('verify');
     expect(receiptLoss.backend.receiptWinners.size).toBe(1);
-    verify = {
-      status: 'pending',
-      token: verify.token,
-    };
     await continueBoundedDecommission(receiptLoss, verify);
     expect(receiptLoss.backend.receiptWinners.size).toBe(1);
     expect(receiptLoss.backend.receiptCalls).toHaveLength(2);

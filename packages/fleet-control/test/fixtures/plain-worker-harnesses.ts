@@ -316,7 +316,6 @@ export class HarnessExportStore implements DurableDatabaseExportStore {
       location: string;
       size: number;
       sha256: string;
-      bytes: Uint8Array;
     }>
   >();
 
@@ -399,7 +398,6 @@ export class HarnessExportStore implements DurableDatabaseExportStore {
       identity,
       location,
       ...integrity,
-      bytes,
     });
     this.exports.set(identity.databaseId, {
       fileName: `${identity.operationId}.sql`,
