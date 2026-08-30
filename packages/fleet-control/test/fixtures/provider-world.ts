@@ -125,6 +125,8 @@ export interface ProviderDatabase {
   readonly d1: D1State;
 }
 
+export type ProviderDatabaseIdMode = 'sequence' | 'uuid';
+
 export interface ProviderUpload {
   readonly scriptName: string;
   readonly mode: 'initial' | 'staged';
@@ -209,11 +211,17 @@ class WorldAllocators {
     );
   }
 
-  databaseId(world: ProviderWorld): string {
-    return this.#next(
-      'database',
-      new Set(world.databases.map(({ databaseId }) => databaseId)),
+  databaseId(world: ProviderWorld, mode: ProviderDatabaseIdMode): string {
+    const occupied = new Set(
+      world.databases.map(({ databaseId }) => databaseId),
     );
+    if (mode === 'sequence') return this.#next('database', occupied);
+    for (;;) {
+      const next = (this.#counters.get('database') ?? 0) + 1;
+      this.#counters.set('database', next);
+      const candidate = `00000000-0000-4000-8000-${String(next).padStart(12, '0')}`;
+      if (!occupied.has(candidate)) return candidate;
+    }
   }
 
   domainId(world: ProviderWorld): string {
@@ -300,6 +308,8 @@ export class ProviderWorld {
   readonly #afterEffects = new Map<string, AfterEffect>();
   readonly #deferredFailures = new Set<string>();
 
+  constructor(readonly databaseIdMode: ProviderDatabaseIdMode = 'sequence') {}
+
   failNext(operation: string, failure: ProviderFailure): void {
     if (this.#failures.has(operation)) {
       throw new Error(`failure already registered for '${operation}'`);
@@ -350,7 +360,10 @@ export class ProviderWorld {
     await effect?.(this);
   }
 
-  createDatabase(name: string, databaseId = this.#allocators.databaseId(this)) {
+  createDatabase(
+    name: string,
+    databaseId = this.#allocators.databaseId(this, this.databaseIdMode),
+  ) {
     const database = this.#insertDatabase(name, databaseId);
     this.mutationLog.push(`create-database:${databaseId}`);
     return database;
@@ -365,7 +378,8 @@ export class ProviderWorld {
   ): ProviderDatabase {
     const database = this.#insertDatabase(
       name,
-      options.databaseId ?? this.#allocators.databaseId(this),
+      options.databaseId ??
+        this.#allocators.databaseId(this, this.databaseIdMode),
     );
     if (options.exportBytes) {
       this.exports.set(
@@ -515,7 +529,7 @@ export class ProviderWorld {
   }
 
   clone(): ProviderWorld {
-    const cloned = new ProviderWorld();
+    const cloned = new ProviderWorld(this.databaseIdMode);
     cloned.maintenanceOrigin = this.maintenanceOrigin;
     cloned.routeOrigin = this.routeOrigin;
     cloned.#allocators = this.#allocators.clone();
@@ -579,8 +593,10 @@ export class ProviderWorld {
   }
 }
 
-export function providerWorld(): ProviderWorld {
-  return new ProviderWorld();
+export function providerWorld(
+  databaseIdMode: ProviderDatabaseIdMode = 'sequence',
+): ProviderWorld {
+  return new ProviderWorld(databaseIdMode);
 }
 
 function versionDigest(

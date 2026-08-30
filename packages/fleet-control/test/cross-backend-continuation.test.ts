@@ -9,11 +9,12 @@ import {
   ProvisioningError,
   provisionDeployment,
 } from '../src/provision.js';
-import type {
-  DeploymentSpec,
-  FleetRecord,
-  FleetStateLease,
-  FleetStateStore,
+import {
+  type DeploymentSpec,
+  effectiveLifecyclePhase,
+  type FleetRecord,
+  type FleetStateLease,
+  type FleetStateStore,
 } from '../src/types.js';
 import {
   assertHarnessFailuresConsumed,
@@ -185,9 +186,13 @@ class RepeatedPhaseFailureStore extends HarnessFleetStore {
   }
 
   override async put(record: FleetRecord): Promise<void> {
-    if (record.phase === this.failedPhase && this.#remainingFailures > 0) {
+    if (
+      (record.phase === this.failedPhase ||
+        effectiveLifecyclePhase(record) === this.failedPhase) &&
+      this.#remainingFailures > 0
+    ) {
       this.#remainingFailures -= 1;
-      throw new Error(`failed state write at ${record.phase}`);
+      throw new Error(`failed state write at ${this.failedPhase}`);
     }
     await super.put(record);
   }
@@ -606,7 +611,9 @@ describe('ordinary Worker cross-backend continuation', () => {
           spec,
         }),
       ).rejects.toThrow(`failed state write at ${row.phase}`);
-      expect(direct.store.record?.phase).toBe(row.predecessor);
+      const retained = direct.store.record;
+      if (!retained) throw new Error('failed write removed the Fleet row');
+      expect(effectiveLifecyclePhase(retained)).toBe(row.predecessor);
 
       const retried = await decommissionDeployment({
         backend: direct.backend,
@@ -747,13 +754,6 @@ describe('ordinary Worker cross-backend continuation', () => {
     const databaseDeletion = directHarness(source.world.clone());
     databaseDeletion.store.record = structuredClone(ready.record);
     databaseDeletion.world.failNext('deleteDatabase', { dispatched: true });
-    await ignoreFailure(
-      decommissionDeployment({
-        backend: databaseDeletion.backend,
-        store: databaseDeletion.store,
-        spec,
-      }),
-    );
     const databaseDeleted = await decommissionDeployment({
       backend: databaseDeletion.backend,
       store: databaseDeletion.store,
@@ -761,6 +761,11 @@ describe('ordinary Worker cross-backend continuation', () => {
     });
     expect(databaseDeleted.record.phase).toBe('decommissioned');
     expect(databaseDeletion.world.databases).toEqual([]);
+    expect(
+      databaseDeletion.world.mutationLog.filter(
+        (entry) => entry === `delete-database:${ready.record.databaseId}`,
+      ),
+    ).toHaveLength(1);
 
     const secretDeletion = directHarness(source.world.clone());
     secretDeletion.store.record = structuredClone(ready.record);

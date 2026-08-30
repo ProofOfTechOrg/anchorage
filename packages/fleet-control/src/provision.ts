@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { randomUUID } from 'node:crypto';
 import { assertInitialExecutionFenceState } from '@proofoftech/flowsafe/deployment-identity-protocol';
 
 import {
@@ -26,7 +27,10 @@ import {
 } from './backend-switch.js';
 import {
   activeExternalRelease,
+  advanceDecommissionDeployment,
   assertImmutableDeploymentMapping,
+  assertNormalDecommissionD1ResourcesDeleted,
+  type DecommissionAdvanceAction,
   reconcilePersistedDatabase,
   retainedExternalReleases,
 } from './decommission-advance.js';
@@ -1549,9 +1553,6 @@ export async function decommissionDeployment(
     options.spec.tenantTag,
     options.spec.environment,
   );
-  if (current) {
-    assertNoActiveDecommission(current, 'decommissionDeployment');
-  }
   if (
     current?.backendSwitchIntent &&
     current.backendSwitchIntent.subphase !== 'decommissioned'
@@ -1578,13 +1579,61 @@ export async function decommissionDeployment(
     await emitDecommissionAudit(options.audit, result.record, false);
     return result;
   }
-  const result = await options.store.withDeploymentLease(
-    options.spec.tenantTag,
-    options.spec.environment,
-    (lease) => decommissionDeploymentUnderLease(options, lease),
-  );
+  const hasNormalIntent =
+    current?.decommissionIntent?.identity.mode.kind === 'normal';
+  const shellLessLatePhase =
+    current !== undefined &&
+    current.decommissionIntent === undefined &&
+    (current.phase === 'database-exported' ||
+      current.phase === 'database-deleting' ||
+      current.phase === 'decommissioned');
+  let useBounded = hasNormalIntent;
+  if (current && !hasNormalIntent && !shellLessLatePhase) {
+    useBounded =
+      Reflect.has(options.backend, 'advanceDecommissionAttachmentScan') &&
+      (Reflect.has(options.backend, 'databaseExportReceiptAuthority') ||
+        Reflect.has(options.backend, 'exportDatabaseReceipt'));
+  }
+  const result = useBounded
+    ? await drainBoundedDecommission(options)
+    : await options.store.withDeploymentLease(
+        options.spec.tenantTag,
+        options.spec.environment,
+        (lease) => decommissionDeploymentUnderLease(options, lease),
+      );
   await emitDecommissionAudit(options.audit, result.record, false);
   return result;
+}
+
+async function drainBoundedDecommission(
+  options: DecommissionDeploymentOptions,
+): Promise<DecommissionResult> {
+  let action: DecommissionAdvanceAction = { kind: 'start' };
+  let firstResult = true;
+  while (true) {
+    const result = await advanceDecommissionDeployment({
+      backend: options.backend,
+      store: options.store,
+      spec: options.spec,
+      action,
+      maxProviderRequests: 1_000,
+      ...(options.clock ? { clock: options.clock } : {}),
+      randomUUID,
+    });
+    if (result.status === 'complete') return result.result;
+    if (result.status === 'blocked') {
+      if (firstResult) {
+        firstResult = false;
+        action = { kind: 'restart-blocked', token: result.token };
+        continue;
+      }
+      throw new Error(
+        'bounded decommission remains blocked by a Worker attachment',
+      );
+    }
+    firstResult = false;
+    action = { kind: 'continue', token: result.token };
+  }
 }
 
 function emitDecommissionAudit(
@@ -1913,6 +1962,14 @@ async function decommissionDeploymentUnderLease(
       updatedAt: nowIso(clock),
     };
     await lease.put(record);
+  }
+  if (
+    record.phase === 'application-resources-deleted' ||
+    record.phase === 'database-exported' ||
+    record.phase === 'database-deleting' ||
+    record.phase === 'decommissioned'
+  ) {
+    assertNormalDecommissionD1ResourcesDeleted(record);
   }
   if (record.phase === 'application-resources-deleted') {
     await backend.assertDatabaseDetached(spec, record, database, lease);

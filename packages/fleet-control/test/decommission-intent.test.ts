@@ -30,6 +30,8 @@ import {
 } from '../src/types.js';
 
 const OPERATION_ID = '12345678-1234-4abc-8def-1234567890ab';
+const DATABASE_ID = '00000000-0000-0000-0000-000000000001';
+const RECEIPT_AUTHORITY = 'memory://fleet-exports/receipts/v1';
 const NOW = '2026-08-29T12:00:00.000Z';
 const DIGEST = 'a'.repeat(64);
 const EVIDENCE = 'b'.repeat(64);
@@ -58,7 +60,7 @@ function fleetRecord(overrides: Partial<FleetRecord> = {}): FleetRecord {
     environment: 'production',
     backend: 'plain-worker',
     scriptName: 'acme-production',
-    databaseId: 'database-id',
+    databaseId: DATABASE_ID,
     databaseName: 'acme-production',
     schemaVersion: 1,
     artifactVersion: 'version-1',
@@ -113,6 +115,7 @@ function common(
   overrides: Partial<{
     revision: number;
     generation: number;
+    databaseExportReceiptAuthority: string;
   }> = {},
 ) {
   return {
@@ -122,6 +125,12 @@ function common(
     generation: overrides.generation ?? 0,
     updatedAt: NOW,
     identity: identity(),
+    ...(overrides.databaseExportReceiptAuthority === undefined
+      ? {}
+      : {
+          databaseExportReceiptAuthority:
+            overrides.databaseExportReceiptAuthority,
+        }),
     lifecyclePhase,
   };
 }
@@ -201,6 +210,7 @@ describe('decommission advance intent', () => {
     });
     const complete = {
       ...common('ready'),
+      databaseExportReceiptAuthority: RECEIPT_AUTHORITY,
       lifecyclePhase: 'decommissioned' as const,
       state: 'complete' as const,
     };
@@ -212,6 +222,9 @@ describe('decommission advance intent', () => {
     const accessor = vi.fn(() => 'transitioning');
     const cyclic: { self?: unknown } = {};
     cyclic.self = cyclic;
+    const transparent = new Proxy(valid, {});
+    const revoked = Proxy.revocable(valid, {});
+    revoked.revoke();
     for (const malformed of [
       { ...valid, version: 2 },
       { ...valid, extra: true },
@@ -223,7 +236,10 @@ describe('decommission advance intent', () => {
         get: accessor,
       }),
       Object.assign({ ...valid }, { [Symbol('extra')]: true }),
+      transparent,
+      revoked.proxy,
       cyclic,
+      { ...valid, databaseExportReceiptAuthority: RECEIPT_AUTHORITY },
     ]) {
       expect(() => parse(malformed)).toThrow(DecommissionAdvanceIntentError);
     }
@@ -385,39 +401,46 @@ describe('decommission advance intent', () => {
   });
 
   it('enforces the D1 purpose, lifecycle, and durable-export table', () => {
+    const source = fleetRecord({
+      applicationResources: [applicationResource('deleted')],
+    });
     const exportPurpose = {
       kind: 'database-pre-export' as const,
-      databaseId: 'database-id',
+      databaseId: DATABASE_ID,
     };
     const exportIntent = {
-      ...common('application-resources-deleted'),
+      ...common('application-resources-deleted', {
+        databaseExportReceiptAuthority: RECEIPT_AUTHORITY,
+      }),
       state: 'discover' as const,
       purpose: exportPurpose,
       progress: initialWorkerAttachmentScan({
         kind: 'd1',
-        databaseId: 'database-id',
+        databaseId: DATABASE_ID,
       }),
     };
-    expect(parse(exportIntent)).toEqual(exportIntent);
+    expect(parse(exportIntent, source)).toEqual(exportIntent);
     const deletePurpose = {
       kind: 'database-pre-delete' as const,
-      databaseId: 'database-id',
+      databaseId: DATABASE_ID,
       exportLocation: 'r2://exports/database.sqlite',
       exportSha256: 'c'.repeat(64),
       exportSize: 128,
     };
     const deleteIntent = {
-      ...common('database-exported'),
+      ...common('database-exported', {
+        databaseExportReceiptAuthority: RECEIPT_AUTHORITY,
+      }),
       state: 'discover' as const,
       purpose: deletePurpose,
       progress: initialWorkerAttachmentScan({
         kind: 'd1',
-        databaseId: 'database-id',
+        databaseId: DATABASE_ID,
       }),
     };
-    expect(parse(deleteIntent)).toEqual(deleteIntent);
+    expect(parse(deleteIntent, source)).toEqual(deleteIntent);
     expect(
-      parse({ ...deleteIntent, lifecyclePhase: 'database-deleting' }),
+      parse({ ...deleteIntent, lifecyclePhase: 'database-deleting' }, source),
     ).toMatchObject({ lifecyclePhase: 'database-deleting' });
     for (const malformed of [
       {
@@ -457,7 +480,102 @@ describe('decommission advance intent', () => {
         }),
       },
     ]) {
-      expect(() => parse(malformed)).toThrow(DecommissionAdvanceIntentError);
+      expect(() => parse(malformed, source)).toThrow(
+        DecommissionAdvanceIntentError,
+      );
+    }
+    for (const malformed of [
+      {
+        ...exportIntent,
+        databaseExportReceiptAuthority: undefined,
+      },
+      (() => {
+        const {
+          databaseExportReceiptAuthority: _databaseExportReceiptAuthority,
+          ...withoutAuthority
+        } = exportIntent;
+        return withoutAuthority;
+      })(),
+      {
+        ...deleteIntent,
+        databaseExportReceiptAuthority: '',
+      },
+      {
+        ...deleteIntent,
+        databaseExportReceiptAuthority: 'x'.repeat(4097),
+      },
+    ]) {
+      expect(() => parse(malformed, source)).toThrow(
+        DecommissionAdvanceIntentError,
+      );
+    }
+    const exactAuthority = 'é'.repeat(2048);
+    expect(new TextEncoder().encode(exactAuthority)).toHaveLength(4096);
+    expect(
+      parse(
+        { ...exportIntent, databaseExportReceiptAuthority: exactAuthority },
+        source,
+      ),
+    ).toMatchObject({ databaseExportReceiptAuthority: exactAuthority });
+    const activeD1Shapes = [
+      exportIntent,
+      deleteIntent,
+      {
+        ...common('database-exported', {
+          databaseExportReceiptAuthority: RECEIPT_AUTHORITY,
+        }),
+        state: 'transitioning' as const,
+      },
+      {
+        ...common('database-deleting', {
+          databaseExportReceiptAuthority: RECEIPT_AUTHORITY,
+        }),
+        state: 'transitioning' as const,
+      },
+      { ...deleteIntent, lifecyclePhase: 'database-deleting' as const },
+      {
+        ...deleteIntent,
+        lifecyclePhase: 'database-deleting' as const,
+        state: 'verify' as const,
+        discoverEvidence: { evidenceSha256: EVIDENCE, evidenceCount: 2 },
+      },
+    ];
+    const completeIntent = {
+      ...common('ready'),
+      databaseExportReceiptAuthority: RECEIPT_AUTHORITY,
+      lifecyclePhase: 'decommissioned' as const,
+      state: 'complete' as const,
+    };
+    for (const state of [
+      'reserved',
+      'create-authorized',
+      'created',
+      'detach-authorized',
+      'detached',
+      'empty-authorized',
+      'empty',
+      'delete-authorized',
+    ] as const) {
+      const malformedResources = [
+        { ...applicationResource(), state } as ApplicationR2Resource,
+      ];
+      for (const shape of activeD1Shapes) {
+        expect(() =>
+          parse(
+            shape,
+            fleetRecord({ applicationResources: malformedResources }),
+          ),
+        ).toThrow(DecommissionAdvanceIntentError);
+      }
+      expect(() =>
+        parse(
+          completeIntent,
+          fleetRecord({
+            phase: 'decommissioned',
+            applicationResources: malformedResources,
+          }),
+        ),
+      ).toThrow(DecommissionAdvanceIntentError);
     }
   });
 
@@ -533,19 +651,33 @@ describe('decommission advance intent', () => {
     const considered = [...INITIAL_PHASES, ...TEARDOWN_PHASES];
     for (const entry of INITIAL_PHASES) {
       for (const current of considered) {
-        const source =
+        const initialSource =
           entry === 'migrating' && current === 'migrating'
             ? fleetRecord({
                 pendingSpecDigest: 'd'.repeat(64),
                 pendingArtifactVersion: 'candidate-v1',
               })
             : fleetRecord();
+        const source = [
+          'application-resources-deleted',
+          'database-exported',
+          'database-deleting',
+        ].includes(current)
+          ? {
+              ...initialSource,
+              applicationResources: [applicationResource('deleted')],
+            }
+          : initialSource;
         const requestedSpecDigest =
           entry === 'migrating' && current === 'migrating'
             ? 'd'.repeat(64)
             : source.desiredSpecDigest;
         const candidate = {
-          ...common(current),
+          ...common(current, {
+            ...(['database-exported', 'database-deleting'].includes(current)
+              ? { databaseExportReceiptAuthority: RECEIPT_AUTHORITY }
+              : {}),
+          }),
           identity: identity(entry, source, requestedSpecDigest),
           state: 'transitioning' as const,
         };
@@ -568,15 +700,28 @@ describe('decommission advance intent', () => {
           entryIndex
         ] as NormalDecommissionLifecyclePhase;
         const currentIndex = TEARDOWN_PHASES.indexOf(current as never);
+        const source = [
+          'application-resources-deleted',
+          'database-exported',
+          'database-deleting',
+        ].includes(current)
+          ? fleetRecord({
+              applicationResources: [applicationResource('deleted')],
+            })
+          : fleetRecord();
         const candidate = {
-          ...common(current),
-          identity: identity(entry),
+          ...common(current, {
+            ...(['database-exported', 'database-deleting'].includes(current)
+              ? { databaseExportReceiptAuthority: RECEIPT_AUTHORITY }
+              : {}),
+          }),
+          identity: identity(entry, source),
           state: 'transitioning' as const,
         };
         if (currentIndex >= entryIndex)
-          expect(parse(candidate)).toEqual(candidate);
+          expect(parse(candidate, source)).toEqual(candidate);
         else
-          expect(() => parse(candidate)).toThrow(
+          expect(() => parse(candidate, source)).toThrow(
             DecommissionAdvanceIntentError,
           );
       }
@@ -623,6 +768,7 @@ describe('decommission advance intent', () => {
       phase: 'ready',
       decommissionIntent: {
         ...common('ready'),
+        databaseExportReceiptAuthority: RECEIPT_AUTHORITY,
         lifecyclePhase: 'decommissioned',
         state: 'complete',
       },
@@ -782,10 +928,21 @@ describe('decommission advance intent', () => {
     const valid = {
       ...common('ready'),
       identity: identity('ready', source),
+      databaseExportReceiptAuthority: RECEIPT_AUTHORITY,
       lifecyclePhase: 'decommissioned' as const,
       state: 'complete' as const,
     };
     expect(parse(valid, source)).toEqual(valid);
+    const {
+      databaseExportReceiptAuthority: _databaseExportReceiptAuthority,
+      ...missingReceiptAuthority
+    } = valid;
+    expect(() => parse(missingReceiptAuthority, source)).toThrow(
+      DecommissionAdvanceIntentError,
+    );
+    expect(() =>
+      parse({ ...valid, databaseExportReceiptAuthority: undefined }, source),
+    ).toThrow(DecommissionAdvanceIntentError);
     expect(() =>
       parse(
         {
@@ -843,6 +1000,15 @@ describe('decommission advance intent', () => {
       revision: 3,
     };
     expect(parseDecommissionAdvanceToken(valid)).toEqual(valid);
+    const transparent = new Proxy(valid, {});
+    const revoked = Proxy.revocable(valid, {});
+    revoked.revoke();
+    expect(() => parseDecommissionAdvanceToken(transparent)).toThrow(
+      DecommissionAdvanceTokenError,
+    );
+    expect(() => parseDecommissionAdvanceToken(revoked.proxy)).toThrow(
+      DecommissionAdvanceTokenError,
+    );
     const actions: readonly DecommissionAdvanceAction[] = [
       { kind: 'start' },
       { kind: 'continue', token: valid },
@@ -854,6 +1020,7 @@ describe('decommission advance intent', () => {
       'application-r2-inspection',
       'application-r2-empty',
       'application-r2-delete',
+      'database-export-receipt',
     ];
     const result: DecommissionAdvanceResult = {
       status: 'pending',
@@ -988,6 +1155,7 @@ describe('decommission advance intent', () => {
       applicationResources: [applicationResource('deleted')],
       decommissionIntent: {
         ...intent,
+        databaseExportReceiptAuthority: RECEIPT_AUTHORITY,
         lifecyclePhase: 'decommissioned',
         state: 'complete',
       },

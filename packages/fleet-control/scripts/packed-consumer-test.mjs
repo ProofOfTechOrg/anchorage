@@ -138,6 +138,8 @@ try {
         name: 'fleet-control-packed-consumer',
         private: true,
         type: 'module',
+        packageManager: 'pnpm@10.34.4',
+        engines: { node: '>=22.22.0', pnpm: '>=10.16.0' },
         dependencies: {
           '@proofoftech/fleet-control': `file:${tarball}`,
           '@proofoftech/flowsafe': `link:${flowsafeDirectory}`,
@@ -154,7 +156,7 @@ try {
   // whole window between the version bump and the release publishing.
   await writeFile(
     join(consumerDirectory, 'pnpm-workspace.yaml'),
-    `packages:\n  - "."\noverrides:\n  "@proofoftech/flowsafe": ${JSON.stringify(
+    `minimumReleaseAge: 10080\npackages:\n  - "."\noverrides:\n  "@proofoftech/flowsafe": ${JSON.stringify(
       `link:${flowsafeDirectory}`,
     )}\n`,
   );
@@ -486,7 +488,15 @@ const decommissionCapabilities: readonly DecommissionAdvanceCapability[] = [
   'application-r2-inspection',
   'application-r2-empty',
   'application-r2-delete',
+  'database-export-receipt',
 ];
+const optionalReceiptAuthority: string | undefined =
+  decommissionCommon.databaseExportReceiptAuthority;
+if (decommissionIntent.state === 'complete') {
+  const requiredReceiptAuthority: string =
+    decommissionIntent.databaseExportReceiptAuthority;
+  void requiredReceiptAuthority;
+}
 const decommissionAdvanceOptions: AdvanceDecommissionDeploymentOptions = {
   backend: provisioningBackend,
   store: fleetStateStore,
@@ -600,6 +610,7 @@ void [
   databaseResidualAssertion,
   decommissionActions,
   decommissionCapabilities,
+  optionalReceiptAuthority,
   decommissionAdvanceOptions,
   decommissionAdvanceResults,
   boundedDecommissionAdvance,
@@ -755,6 +766,25 @@ assert.equal(
   missingCapability.message,
   'backend cannot perform bounded decommission attachment scans',
 );
+const missingReceiptCapability = new DecommissionAdvanceCapabilityError(
+  'database-export-receipt',
+);
+assert.equal(
+  Object.getPrototypeOf(missingReceiptCapability),
+  DecommissionAdvanceCapabilityError.prototype,
+);
+assert.equal(
+  missingReceiptCapability.name,
+  'DecommissionAdvanceCapabilityError',
+);
+assert.equal(
+  missingReceiptCapability.capability,
+  'database-export-receipt',
+);
+assert.equal(
+  missingReceiptCapability.message,
+  'backend cannot write idempotent database export receipts',
+);
 const restartError = new DecommissionAdvanceRestartError();
 assert.equal(restartError.name, 'DecommissionAdvanceRestartError');
 assert.equal(
@@ -870,19 +900,11 @@ assert.ok(new WorkersForPlatformsBackend(complete));
   // metadata mirror, so --offline fails there with ERR_PNPM_NO_OFFLINE_META
   // while passing on a developer machine whose mirror is warm.
   //
-  // Resolution is still pinned: cloudflare and p-queue come from the packed
-  // manifest as exact versions and flowsafe is overridden to the workspace
-  // tree, so nothing floats. The age-gate flag matches the sibling gates.
-  run(
-    'pnpm',
-    [
-      'install',
-      '--prefer-offline',
-      '--ignore-scripts',
-      '--config.minimum-release-age=0',
-    ],
-    { cwd: consumerDirectory },
-  );
+  // Resolution is pinned and the standalone workspace enforces the same
+  // seven-day quarantine as the repository. Lifecycle scripts stay disabled.
+  run('pnpm', ['install', '--prefer-offline', '--ignore-scripts'], {
+    cwd: consumerDirectory,
+  });
   // Prove the override actually took. Without this, deleting the overrides
   // block above leaves this gate green while the consumer resolves the
   // previously published flowsafe instead of the one being released with it.

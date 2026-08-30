@@ -13,6 +13,7 @@ export interface NormalDecommissionIntentFixtureOptions {
   readonly updatedAt?: string;
   readonly requestedSpecDigest?: string;
   readonly entryLifecyclePhase?: NormalDecommissionLifecyclePhase;
+  readonly databaseExportReceiptAuthority?: string;
 }
 
 export function normalDecommissionIntentFixture(
@@ -43,6 +44,12 @@ export function normalDecommissionIntentFixture(
         entryLifecyclePhase: options.entryLifecyclePhase ?? lifecyclePhase,
       },
     },
+    ...(options.databaseExportReceiptAuthority === undefined
+      ? {}
+      : {
+          databaseExportReceiptAuthority:
+            options.databaseExportReceiptAuthority,
+        }),
     lifecyclePhase,
   };
 }

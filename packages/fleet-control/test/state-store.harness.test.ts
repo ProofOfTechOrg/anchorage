@@ -39,6 +39,23 @@ interface BoundedDecommissionProbe {
   readonly resourceStates: string[];
   readonly bucketName: string;
   readonly lostWriteCount: number;
+  readonly precommitWriteFailureCount: number;
+  readonly provider: {
+    readonly databaseId: string;
+    readonly databasePresent: boolean;
+    readonly observedDatabaseId: string;
+    readonly observedDatabaseName: string;
+    readonly owner: string;
+    readonly receiptAuthority: string | null;
+    readonly receiptOperationId: string | null;
+    readonly receiptLocation: string | null;
+    readonly receiptSize: number | null;
+    readonly receiptSha256: string | null;
+    readonly receiptCommitCount: number;
+    readonly exportCallCount: number;
+    readonly deleteCount: number;
+    readonly ownershipAssertionCount: number;
+  };
   readonly claims: Array<{
     readonly resourceType: string;
     readonly resourceName: string;
@@ -321,7 +338,8 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
       });
     const results: BoundedDecommissionProbe[] = [];
     results.push(await step({ kind: 'start' }));
-    for (let index = 0; index < 8; index += 1) {
+    for (let index = 0; index < 20; index += 1) {
+      if (results.at(-1)?.result.status === 'complete') break;
       results.push(
         await step({
           kind: 'continue',
@@ -329,10 +347,6 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
         }),
       );
     }
-    const boundary = await step({
-      kind: 'continue',
-      token: results.at(-1)?.result.token,
-    });
 
     expect(
       results.map((result) => ({
@@ -416,17 +430,80 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
         resourceState: 'deleted',
         trace: ['r2-find'],
       },
+      {
+        revision: 9,
+        generation: 2,
+        lifecyclePhase: 'application-resources-deleted',
+        intentState: 'discover',
+        resourceState: 'deleted',
+        trace: ['d1-get', 'd1-owner'],
+      },
+      {
+        revision: 10,
+        generation: 2,
+        lifecyclePhase: 'application-resources-deleted',
+        intentState: 'verify',
+        resourceState: 'deleted',
+        trace: ['d1-get', 'd1-owner', 'scan:discover'],
+      },
+      {
+        revision: 11,
+        generation: 2,
+        lifecyclePhase: 'database-exported',
+        intentState: 'transitioning',
+        resourceState: 'deleted',
+        trace: [
+          'd1-get',
+          'd1-owner',
+          'scan:verify',
+          'd1-get',
+          'd1-owner',
+          'd1-residuals',
+          'd1-export',
+        ],
+      },
+      {
+        revision: 12,
+        generation: 3,
+        lifecyclePhase: 'database-exported',
+        intentState: 'discover',
+        resourceState: 'deleted',
+        trace: ['d1-get', 'd1-owner'],
+      },
+      {
+        revision: 13,
+        generation: 3,
+        lifecyclePhase: 'database-exported',
+        intentState: 'verify',
+        resourceState: 'deleted',
+        trace: ['d1-get', 'd1-owner', 'scan:discover'],
+      },
+      {
+        revision: 14,
+        generation: 3,
+        lifecyclePhase: 'database-deleting',
+        intentState: 'transitioning',
+        resourceState: 'deleted',
+        trace: [
+          'd1-get',
+          'd1-owner',
+          'scan:verify',
+          'd1-get',
+          'd1-owner',
+          'd1-residuals',
+          'd1-delete',
+          'd1-get',
+        ],
+      },
+      {
+        revision: 15,
+        generation: 3,
+        lifecyclePhase: 'decommissioned',
+        intentState: 'complete',
+        resourceState: 'deleted',
+        trace: ['d1-get'],
+      },
     ]);
-    expect(boundary).toMatchObject({
-      result: { status: 'pending', token: results.at(-1)?.result.token },
-      trace: [],
-      phase: 'decommission-advancing',
-      lifecyclePhase: 'application-resources-deleted',
-      intentState: 'transitioning',
-      revision: 8,
-      generation: 1,
-      resourceStates: ['deleted'],
-    });
 
     const expectedClaims = [
       {
@@ -440,12 +517,87 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
         resourceRole: 'deployment-worker',
       },
     ];
-    for (const result of [...results, boundary]) {
+    for (const result of results.slice(0, -1)) {
       expect(result.result.status).toBe('pending');
       expect(result.phase).toBe('decommission-advancing');
       expect(result.claims).toEqual(expectedClaims);
       expect(result.lostWriteCount).toBe(0);
     }
+    const terminal = results.at(-1);
+    expect(terminal).toMatchObject({
+      result: { status: 'complete' },
+      phase: 'decommissioned',
+      provider: {
+        databaseId: '00000000-0000-4000-8000-000000000201',
+        databasePresent: false,
+        receiptAuthority: 'd1-test://fleet-exports/receipts/v1',
+        receiptOperationId: '00000000-0000-4000-8000-000000000101',
+        receiptSize: 37,
+        receiptSha256: 'c'.repeat(64),
+        receiptCommitCount: 1,
+        exportCallCount: 1,
+        deleteCount: 1,
+      },
+      claims: expectedClaims,
+      lostWriteCount: 0,
+      precommitWriteFailureCount: 0,
+    });
+
+    const reset = () =>
+      probe<{ reset: true }>('bounded-decommission-reset', {
+        tenantTag: 'advance',
+      });
+    const reachD1Verify = async (
+      boundary: 'application-resources-deleted' | 'database-exported',
+    ): Promise<BoundedDecommissionProbe> => {
+      await reset();
+      let current = await probe<BoundedDecommissionProbe>(
+        'bounded-decommission-step',
+        {
+          tenantTag: 'advance',
+          operation: { kind: 'start' },
+          seedAtD1: true,
+        },
+      );
+      for (let index = 0; index < 8; index += 1) {
+        if (
+          current.lifecyclePhase === boundary &&
+          current.intentState === 'verify'
+        ) {
+          return current;
+        }
+        current = await probe<BoundedDecommissionProbe>(
+          'bounded-decommission-step',
+          {
+            tenantTag: 'advance',
+            operation: { kind: 'continue', token: current.result.token },
+          },
+        );
+      }
+      throw new Error(`bounded harness did not reach ${boundary} verify`);
+    };
+    const postScanMutations = [
+      { mutation: 'absent', error: 'is absent' },
+      { mutation: 'id', error: 'resolved with unexpected identity' },
+      { mutation: 'name', error: 'resolved with unexpected identity' },
+      { mutation: 'owner', error: "owned by 'foreign'" },
+    ] as const;
+    for (const boundary of [
+      'application-resources-deleted',
+      'database-exported',
+    ] as const) {
+      for (const row of postScanMutations) {
+        const verify = await reachD1Verify(boundary);
+        await expect(
+          probe<BoundedDecommissionProbe>('bounded-decommission-step', {
+            tenantTag: 'advance',
+            operation: { kind: 'continue', token: verify.result.token },
+            afterScan: row.mutation,
+          }),
+        ).rejects.toThrow(row.error);
+      }
+    }
+    await reset();
   });
 
   it('converges a lost coordinator write and makes the replayed token stale in real D1', async () => {
@@ -453,12 +605,46 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
       operation: Readonly<
         { kind: 'start' } | { kind: 'continue'; token: unknown }
       >,
-      loseWrite = false,
+      faults: Readonly<{
+        failWriteBeforeCommit?: boolean;
+        loseWrite?: boolean;
+        loseReceiptResponse?: boolean;
+        loseDeleteResponse?: boolean;
+        nextExportOutcome?:
+          | Readonly<{
+              status: 'fulfilled';
+              value?: 'default' | 'present' | 'absent';
+            }>
+          | Readonly<{
+              status: 'rejected';
+              reason: 'error' | 'null' | 'undefined';
+            }>;
+        nextDeleteOutcome?:
+          | Readonly<{
+              status: 'fulfilled';
+              value?: 'default' | 'present' | 'absent';
+            }>
+          | Readonly<{
+              status: 'rejected';
+              reason: 'error' | 'null' | 'undefined';
+            }>;
+        nextReadbackOutcome?:
+          | Readonly<{
+              status: 'fulfilled';
+              value?: 'default' | 'present' | 'absent';
+            }>
+          | Readonly<{
+              status: 'rejected';
+              reason: 'error' | 'null' | 'undefined';
+            }>;
+        nextOwnershipFailureOrdinal?: number;
+        seedAtD1?: boolean;
+      }> = {},
     ) =>
       probe<BoundedDecommissionProbe>('bounded-decommission-step', {
         tenantTag: 'advancelost',
         operation,
-        ...(loseWrite ? { loseWrite } : {}),
+        ...faults,
       });
     const started = await step({ kind: 'start' });
     const discover = await step({
@@ -467,7 +653,7 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
     });
     const verify = await step(
       { kind: 'continue', token: discover.result.token },
-      true,
+      { loseWrite: true },
     );
     const replay = await step({
       kind: 'continue',
@@ -517,6 +703,326 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
         resourceRole: 'deployment-worker',
       },
     ]);
+
+    let current = await step({
+      kind: 'continue',
+      token: verify.result.token,
+    });
+    for (let index = 0; index < 10; index += 1) {
+      if (
+        current.lifecyclePhase === 'application-resources-deleted' &&
+        current.intentState === 'verify'
+      ) {
+        break;
+      }
+      current = await step({
+        kind: 'continue',
+        token: current.result.token,
+      });
+    }
+    expect(current).toMatchObject({
+      result: { status: 'pending' },
+      lifecyclePhase: 'application-resources-deleted',
+      intentState: 'verify',
+      revision: 10,
+      generation: 2,
+      provider: {
+        receiptCommitCount: 0,
+        exportCallCount: 0,
+        deleteCount: 0,
+      },
+    });
+    const preExportVerifyToken = current.result.token;
+
+    await expect(
+      step(
+        { kind: 'continue', token: preExportVerifyToken },
+        { loseReceiptResponse: true },
+      ),
+    ).rejects.toThrow('bounded receipt response lost');
+    await expect(
+      step(
+        { kind: 'continue', token: preExportVerifyToken },
+        { failWriteBeforeCommit: true },
+      ),
+    ).rejects.toThrow('mixed atomic ownership commit');
+    const exported = await step(
+      { kind: 'continue', token: preExportVerifyToken },
+      { loseWrite: true },
+    );
+    expect(exported).toMatchObject({
+      lifecyclePhase: 'database-exported',
+      intentState: 'transitioning',
+      revision: 11,
+      lostWriteCount: 1,
+      provider: {
+        receiptAuthority: 'd1-test://fleet-exports/receipts/v1',
+        receiptOperationId: '00000000-0000-4000-8000-000000000102',
+        receiptCommitCount: 1,
+        exportCallCount: 3,
+        deleteCount: 0,
+      },
+    });
+    const exportReplay = await step({
+      kind: 'continue',
+      token: preExportVerifyToken,
+    });
+    expect(exportReplay).toMatchObject({
+      result: { token: exported.result.token },
+      trace: [],
+      revision: 11,
+      provider: { receiptCommitCount: 1, exportCallCount: 3, deleteCount: 0 },
+    });
+
+    const preDeleteDiscover = await step({
+      kind: 'continue',
+      token: exported.result.token,
+    });
+    const preDeleteVerify = await step({
+      kind: 'continue',
+      token: preDeleteDiscover.result.token,
+    });
+    const barrier = await step(
+      { kind: 'continue', token: preDeleteVerify.result.token },
+      { loseDeleteResponse: true },
+    );
+    expect(barrier).toMatchObject({
+      lifecyclePhase: 'database-deleting',
+      intentState: 'transitioning',
+      revision: 14,
+      trace: [
+        'd1-get',
+        'd1-owner',
+        'scan:verify',
+        'd1-get',
+        'd1-owner',
+        'd1-residuals',
+        'd1-delete',
+        'd1-get',
+      ],
+      provider: {
+        databasePresent: false,
+        receiptCommitCount: 1,
+        exportCallCount: 3,
+        deleteCount: 1,
+      },
+    });
+    const terminal = await step(
+      { kind: 'continue', token: barrier.result.token },
+      { loseWrite: true },
+    );
+    expect(terminal).toMatchObject({
+      result: { status: 'complete' },
+      trace: ['d1-get'],
+      phase: 'decommissioned',
+      lifecyclePhase: 'decommissioned',
+      intentState: 'complete',
+      revision: 15,
+      lostWriteCount: 1,
+      provider: {
+        databasePresent: false,
+        receiptCommitCount: 1,
+        exportCallCount: 3,
+        deleteCount: 1,
+      },
+    });
+    const barrierReplay = await step({
+      kind: 'continue',
+      token: barrier.result.token,
+    });
+    expect(barrierReplay).toMatchObject({
+      result: { status: 'complete', token: terminal.result.token },
+      trace: [],
+      revision: 15,
+      provider: { exportCallCount: 3, deleteCount: 1 },
+    });
+
+    const reset = () =>
+      probe<{ reset: true }>('bounded-decommission-reset', {
+        tenantTag: 'advancelost',
+      });
+    const reachExportVerify = async () => {
+      const startedAtD1 = await step({ kind: 'start' }, { seedAtD1: true });
+      const selected = await step({
+        kind: 'continue',
+        token: startedAtD1.result.token,
+      });
+      return step({
+        kind: 'continue',
+        token: selected.result.token,
+      });
+    };
+    const reachDeleteVerify = async () => {
+      const exportVerify = await reachExportVerify();
+      const exported = await step({
+        kind: 'continue',
+        token: exportVerify.result.token,
+      });
+      const deleteDiscover = await step({
+        kind: 'continue',
+        token: exported.result.token,
+      });
+      return step({
+        kind: 'continue',
+        token: deleteDiscover.result.token,
+      });
+    };
+    await reset();
+    const exportVerify = await reachExportVerify();
+    const expectedClaims = [
+      {
+        resourceType: 'r2-bucket',
+        resourceName: exportVerify.bucketName,
+        resourceRole: 'deployment-r2',
+      },
+      {
+        resourceType: 'worker-script',
+        resourceName: 'advancelost-worker',
+        resourceRole: 'deployment-worker',
+      },
+    ];
+    await expect(
+      step(
+        { kind: 'continue', token: exportVerify.result.token },
+        {
+          nextExportOutcome: { status: 'rejected', reason: 'error' },
+        },
+      ),
+    ).rejects.toThrow('bounded provider injected rejection');
+    const afterExportFailure = await step({ kind: 'start' });
+    expect(afterExportFailure).toMatchObject({
+      lifecyclePhase: 'application-resources-deleted',
+      intentState: 'verify',
+      revision: 2,
+      provider: {
+        receiptCommitCount: 0,
+        exportCallCount: 1,
+        deleteCount: 0,
+      },
+      claims: expectedClaims,
+    });
+    const exportRetry = await step({
+      kind: 'continue',
+      token: afterExportFailure.result.token,
+    });
+    expect(exportRetry).toMatchObject({
+      lifecyclePhase: 'database-exported',
+      intentState: 'transitioning',
+      revision: 3,
+      provider: { receiptCommitCount: 1, exportCallCount: 2, deleteCount: 0 },
+      claims: expectedClaims,
+    });
+
+    const deleteDiscover = await step({
+      kind: 'continue',
+      token: exportRetry.result.token,
+    });
+    const deleteVerify = await step({
+      kind: 'continue',
+      token: deleteDiscover.result.token,
+    });
+    await expect(
+      step(
+        { kind: 'continue', token: deleteVerify.result.token },
+        {
+          nextDeleteOutcome: { status: 'rejected', reason: 'error' },
+          nextReadbackOutcome: { status: 'rejected', reason: 'undefined' },
+        },
+      ),
+    ).rejects.toThrow('"name":"undefined"');
+    const afterReadbackFailure = await step({ kind: 'start' });
+    expect(afterReadbackFailure).toMatchObject({
+      lifecyclePhase: 'database-deleting',
+      intentState: 'transitioning',
+      revision: 6,
+      provider: {
+        databasePresent: true,
+        receiptCommitCount: 1,
+        exportCallCount: 2,
+        deleteCount: 0,
+      },
+      claims: expectedClaims,
+    });
+    let converged = await step({
+      kind: 'continue',
+      token: afterReadbackFailure.result.token,
+    });
+    for (
+      let index = 0;
+      index < 6 && converged.result.status !== 'complete';
+      index += 1
+    ) {
+      converged = await step({
+        kind: 'continue',
+        token: converged.result.token,
+      });
+    }
+    expect(converged).toMatchObject({
+      result: { status: 'complete' },
+      phase: 'decommissioned',
+      revision: 10,
+      provider: { databasePresent: false, deleteCount: 1 },
+      claims: expectedClaims,
+    });
+
+    await reset();
+    const ownershipVerify = await reachDeleteVerify();
+    const ownershipClaims = [
+      {
+        resourceType: 'r2-bucket',
+        resourceName: ownershipVerify.bucketName,
+        resourceRole: 'deployment-r2',
+      },
+      {
+        resourceType: 'worker-script',
+        resourceName: 'advancelost-worker',
+        resourceRole: 'deployment-worker',
+      },
+    ];
+    await expect(
+      step(
+        { kind: 'continue', token: ownershipVerify.result.token },
+        { nextOwnershipFailureOrdinal: 1 },
+      ),
+    ).rejects.toThrow('bounded provider lease ownership transferred');
+    const afterOwnershipFailure = await step({ kind: 'start' });
+    expect(afterOwnershipFailure).toMatchObject({
+      lifecyclePhase: 'database-deleting',
+      intentState: 'transitioning',
+      revision: 6,
+      provider: {
+        databasePresent: true,
+        ownershipAssertionCount: 1,
+        deleteCount: 0,
+      },
+      claims: ownershipClaims,
+    });
+    let ownershipRetry = await step({
+      kind: 'continue',
+      token: afterOwnershipFailure.result.token,
+    });
+    for (
+      let index = 0;
+      index < 6 && ownershipRetry.result.status !== 'complete';
+      index += 1
+    ) {
+      ownershipRetry = await step({
+        kind: 'continue',
+        token: ownershipRetry.result.token,
+      });
+    }
+    expect(ownershipRetry).toMatchObject({
+      result: { status: 'complete' },
+      phase: 'decommissioned',
+      revision: 10,
+      provider: {
+        databasePresent: false,
+        ownershipAssertionCount: 4,
+        deleteCount: 1,
+      },
+      claims: ownershipClaims,
+    });
+    await reset();
   });
 
   it('preserves operation, heartbeat, and release errors for both lease types', async () => {

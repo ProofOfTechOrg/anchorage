@@ -15,7 +15,12 @@ import {
   WORKER_ATTACHMENT_EVIDENCE_BOUND,
 } from './cloudflare-worker-attachment-scan-state.js';
 import {
+  captureDatabaseExportReceiptCapability,
+  databaseExportReceiptIdentityFromUnknown,
+} from './database-export-store.js';
+import {
   classifyDecommissionAdvanceToken,
+  DecommissionAdvanceIntentError,
   DecommissionAdvanceTokenDeploymentError,
   DecommissionAdvanceTokenOperationError,
   normalizeDecommissionAdvanceIntent,
@@ -25,6 +30,7 @@ import { deploymentSpecDigest } from './spec-digest.js';
 import { cloneBoundedPlainData } from './strict-plain-data.js';
 import type {
   ApplicationR2Resource,
+  DatabaseExport,
   DatabaseReference,
   DecommissionAdvanceIntent,
   DecommissionAdvanceToken,
@@ -47,10 +53,20 @@ import { validateDeploymentSpec } from './validation.js';
 
 const ACTION_ERROR = 'decommission advance action is malformed';
 const RESULT_ERROR = 'bounded decommission attachment result is malformed';
+const DATABASE_EXPORT_RESULT_ERROR =
+  'bounded decommission database export result is malformed';
+const DATABASE_REFERENCE_ERROR = 'persisted database reference is malformed';
+const DATABASE_OWNER_ERROR = 'persisted database owner is malformed';
+const D1_APPLICATION_RESOURCES_ERROR =
+  'normal decommission D1 work requires every application R2 resource to be deleted';
 const ATTACHMENT_STRING_BYTE_BOUND = 4_096;
 const RESULT_PLAIN_DATA_DEPTH_BOUND = 64;
 const RESULT_PLAIN_DATA_NODE_BOUND = 8_192;
 const RESULT_PLAIN_DATA_BYTE_BOUND = 96 * 1_024;
+const DATABASE_REFERENCE_NODE_BOUND = 8;
+const DATABASE_REFERENCE_BYTE_BOUND = 16_384;
+const SHA256 = /^[0-9a-f]{64}$/u;
+const STRUCTURED_CLONE = structuredClone;
 const NORMAL_ENTRY_PHASES = new Set<NormalDecommissionLifecyclePhase>([
   'publishing',
   'ready',
@@ -125,6 +141,7 @@ export type DecommissionAdvanceResult =
 export type DecommissionAdvanceCapability =
   | 'attachment-scan'
   | 'database-residuals'
+  | 'database-export-receipt'
   | 'application-r2-inspection'
   | 'application-r2-empty'
   | 'application-r2-delete';
@@ -135,6 +152,8 @@ const CAPABILITY_MESSAGES: Readonly<
   'attachment-scan':
     'backend cannot perform bounded decommission attachment scans',
   'database-residuals': 'backend cannot inspect database deletion residuals',
+  'database-export-receipt':
+    'backend cannot write idempotent database export receipts',
   'application-r2-inspection':
     'backend cannot inspect application R2 resources',
   'application-r2-empty': 'backend cannot attest application R2 emptiness',
@@ -174,6 +193,7 @@ export function decommissionAdvanceActionFromUnknown(
       maxSerializedBytes: 2_048,
       error: () => new Error(ACTION_ERROR),
     });
+    Reflect.apply(STRUCTURED_CLONE, undefined, [value]);
   } catch {
     return malformedAction();
   }
@@ -315,11 +335,44 @@ export async function reconcilePersistedDatabase(
   fence: ExternalMutationFence,
   requireOwner = true,
 ): Promise<(DatabaseReference & { readonly created: false }) | undefined> {
-  const database = await backend.getDatabase(record.databaseId);
-  if (!database) {
+  const rawDatabase: unknown = await backend.getDatabase(record.databaseId);
+  if (rawDatabase === undefined) {
     if (allowAbsent) return undefined;
     throw new Error(`persisted database '${record.databaseId}' is absent`);
   }
+  let plainDatabase: unknown;
+  try {
+    plainDatabase = cloneBoundedPlainData(rawDatabase, {
+      maxDepth: 1,
+      maxNodes: DATABASE_REFERENCE_NODE_BOUND,
+      maxScalarBytes: DATABASE_REFERENCE_BYTE_BOUND,
+      maxSerializedBytes: DATABASE_REFERENCE_BYTE_BOUND,
+      error: () => new Error(DATABASE_REFERENCE_ERROR),
+    });
+    Reflect.apply(STRUCTURED_CLONE, undefined, [rawDatabase]);
+  } catch {
+    throw new Error(DATABASE_REFERENCE_ERROR);
+  }
+  if (
+    !plainDatabase ||
+    typeof plainDatabase !== 'object' ||
+    Array.isArray(plainDatabase)
+  ) {
+    throw new Error(DATABASE_REFERENCE_ERROR);
+  }
+  const candidate = plainDatabase as Record<string, unknown>;
+  if (
+    !boundedString(candidate.id) ||
+    !boundedString(candidate.name) ||
+    candidate.created !== false
+  ) {
+    throw new Error(DATABASE_REFERENCE_ERROR);
+  }
+  const database = {
+    id: candidate.id,
+    name: candidate.name,
+    created: false as const,
+  };
   if (
     database.id !== record.databaseId ||
     database.name !== record.databaseName
@@ -329,14 +382,20 @@ export async function reconcilePersistedDatabase(
     );
   }
   if (requireOwner) {
-    const owner = await backend.readDeploymentIdentity(database, fence);
+    const owner: unknown = await backend.readDeploymentIdentity(
+      database,
+      fence,
+    );
+    if (owner !== undefined && !boundedString(owner)) {
+      throw new Error(DATABASE_OWNER_ERROR);
+    }
     if (owner !== record.tenantTag) {
       throw new Error(
         `refusing database operation for '${database.id}' owned by '${owner ?? 'no deployment'}'`,
       );
     }
   }
-  return { id: database.id, name: database.name, created: false };
+  return database;
 }
 
 function requireCapability(
@@ -354,6 +413,55 @@ function requiredCapability<Value>(
 ): NonNullable<Value> {
   requireCapability(available, capability);
   return available as NonNullable<Value>;
+}
+
+type ReceiptCapability = Readonly<{
+  authority: string;
+  exportReceipt: NonNullable<ProvisioningBackend['exportDatabaseReceipt']>;
+}>;
+
+function receiptCapability(backend: ProvisioningBackend): ReceiptCapability {
+  const captured = captureDatabaseExportReceiptCapability(backend, () => [
+    backend.databaseExportReceiptAuthority,
+    backend.exportDatabaseReceipt,
+  ]);
+  if (!captured) {
+    throw new DecommissionAdvanceCapabilityError('database-export-receipt');
+  }
+  return {
+    authority: captured.authority,
+    exportReceipt: captured.method as ReceiptCapability['exportReceipt'],
+  };
+}
+
+function databaseReceiptIdentity(
+  record: Pick<FleetRecord, 'databaseId'>,
+  operationId: string,
+  authority: string,
+  expectedAuthority: string,
+) {
+  return databaseExportReceiptIdentityFromUnknown(
+    {
+      version: 1,
+      authority,
+      databaseId: record.databaseId,
+      operationId,
+    },
+    expectedAuthority,
+  );
+}
+
+/** @internal Cross-field fence before normal-decommission D1 work. */
+export function assertNormalDecommissionD1ResourcesDeleted(
+  record: Pick<FleetRecord, 'applicationResources'>,
+): void {
+  if (
+    (record.applicationResources ?? []).some(
+      (resource) => resource.state !== 'deleted',
+    )
+  ) {
+    throw new Error(D1_APPLICATION_RESOURCES_ERROR);
+  }
 }
 
 function tokenFor(record: FleetRecord): DecommissionAdvanceToken {
@@ -429,6 +537,7 @@ async function writeIntent(
 type IntentTransition =
   | Readonly<{
       state: 'transitioning';
+      databaseExportReceiptAuthority?: string;
       generation?: number;
       lifecyclePhase?: NormalDecommissionLifecyclePhase;
     }>
@@ -436,6 +545,7 @@ type IntentTransition =
       state: 'discover';
       purpose: DecommissionAttachmentPurpose;
       progress: DecommissionAttachmentProgress;
+      databaseExportReceiptAuthority?: string;
       generation?: number;
       lifecyclePhase?: NormalDecommissionLifecyclePhase;
     }>
@@ -444,6 +554,7 @@ type IntentTransition =
       purpose: DecommissionAttachmentPurpose;
       progress: DecommissionAttachmentProgress;
       discoverEvidence: DecommissionAttachmentScanEvidence;
+      databaseExportReceiptAuthority?: string;
       generation?: number;
       lifecyclePhase?: NormalDecommissionLifecyclePhase;
     }>
@@ -451,6 +562,7 @@ type IntentTransition =
       state: 'blocked';
       purpose: DecommissionAttachmentPurpose;
       attachment: DecommissionBlockedAttachment;
+      databaseExportReceiptAuthority?: string;
       generation?: number;
       lifecyclePhase?: NormalDecommissionLifecyclePhase;
     }>;
@@ -460,6 +572,9 @@ function nextIntent(
   timestamp: string,
   values: IntentTransition,
 ): Exclude<DecommissionAdvanceIntent, { readonly state: 'complete' }> {
+  const databaseExportReceiptAuthority =
+    intent.databaseExportReceiptAuthority ??
+    values.databaseExportReceiptAuthority;
   const common = {
     version: 1 as const,
     operationId: intent.operationId,
@@ -467,6 +582,9 @@ function nextIntent(
     generation: values.generation ?? intent.generation,
     updatedAt: timestamp,
     identity: intent.identity,
+    ...(databaseExportReceiptAuthority
+      ? { databaseExportReceiptAuthority }
+      : {}),
     lifecyclePhase: values.lifecyclePhase ?? intent.lifecyclePhase,
   };
   switch (values.state) {
@@ -608,7 +726,7 @@ function assertReservedAttempts(value: unknown, maximum: number): void {
   }
 }
 
-function boundedAttachmentString(value: unknown): value is string {
+function boundedString(value: unknown): value is string {
   return (
     typeof value === 'string' &&
     value.length > 0 &&
@@ -625,13 +743,13 @@ function safeAttachment(value: unknown): DecommissionBlockedAttachment {
   const plane = candidate.plane;
   const scriptName = candidate.scriptName;
   const dispatchNamespace = candidate.dispatchNamespace;
-  if (plane === 'ordinary' && boundedAttachmentString(scriptName)) {
+  if (plane === 'ordinary' && boundedString(scriptName)) {
     return { plane, scriptName };
   }
   if (
     plane === 'dispatch' &&
-    boundedAttachmentString(scriptName) &&
-    boundedAttachmentString(dispatchNamespace)
+    boundedString(scriptName) &&
+    boundedString(dispatchNamespace)
   ) {
     return {
       plane,
@@ -664,9 +782,18 @@ async function commitRecord(
   record: FleetRecord,
   intent: Exclude<DecommissionAdvanceIntent, { readonly state: 'complete' }>,
   clock: () => number,
-  recordValues: Readonly<{
-    applicationResources?: FleetRecord['applicationResources'];
-  }>,
+  recordValues: Readonly<
+    Partial<
+      Pick<
+        FleetRecord,
+        | 'applicationResources'
+        | 'databaseExportLocation'
+        | 'databaseExportSha256'
+        | 'databaseExportSize'
+        | 'phase'
+      >
+    >
+  >,
   intentValues: Parameters<typeof nextIntent>[2],
 ): Promise<FleetRecord> {
   const timestamp = nowIso(clock);
@@ -1140,45 +1267,353 @@ async function advanceR2Transition(
   );
 }
 
-async function advanceR2Scan(
+type ActiveDecommissionIntent = Exclude<
+  DecommissionAdvanceIntent,
+  { readonly state: 'complete' }
+>;
+
+type ScanDecommissionIntent = Extract<
+  DecommissionAdvanceIntent,
+  { readonly state: 'discover' | 'verify' }
+>;
+
+type Settlement<Value> =
+  | Readonly<{ status: 'fulfilled'; value: Value }>
+  | Readonly<{ status: 'rejected'; reason: unknown }>;
+
+async function settleOperation<Value>(
+  operation: () => Promise<Value>,
+): Promise<Settlement<Value>> {
+  try {
+    return { status: 'fulfilled', value: await operation() };
+  } catch (reason) {
+    return { status: 'rejected', reason };
+  }
+}
+
+function selectedReceiptAuthority(intent: ActiveDecommissionIntent): string {
+  const authority = intent.databaseExportReceiptAuthority;
+  if (typeof authority !== 'string' || authority.length === 0) {
+    throw new DecommissionAdvanceIntentError();
+  }
+  return authority;
+}
+
+function databasePreDeletePurpose(
+  record: FleetRecord,
+): Extract<
+  DecommissionAttachmentPurpose,
+  { readonly kind: 'database-pre-delete' }
+> {
+  if (
+    !boundedString(record.databaseExportLocation) ||
+    typeof record.databaseExportSha256 !== 'string' ||
+    !SHA256.test(record.databaseExportSha256) ||
+    !Number.isSafeInteger(record.databaseExportSize) ||
+    Number(record.databaseExportSize) < 1
+  ) {
+    throw new DecommissionAdvanceIntentError();
+  }
+  return {
+    kind: 'database-pre-delete',
+    databaseId: record.databaseId,
+    exportLocation: record.databaseExportLocation,
+    exportSha256: record.databaseExportSha256,
+    exportSize: record.databaseExportSize as number,
+  };
+}
+
+function databaseExportFromUnknown(
+  value: unknown,
+  databaseId: string,
+): DatabaseExport {
+  let plain: unknown;
+  try {
+    plain = cloneBoundedPlainData(value, {
+      maxDepth: RESULT_PLAIN_DATA_DEPTH_BOUND,
+      maxNodes: RESULT_PLAIN_DATA_NODE_BOUND,
+      maxScalarBytes: RESULT_PLAIN_DATA_BYTE_BOUND,
+      maxSerializedBytes: RESULT_PLAIN_DATA_BYTE_BOUND,
+      error: () => new Error(DATABASE_EXPORT_RESULT_ERROR),
+    });
+    Reflect.apply(STRUCTURED_CLONE, undefined, [value]);
+  } catch {
+    throw new Error(DATABASE_EXPORT_RESULT_ERROR);
+  }
+  if (!plain || typeof plain !== 'object' || Array.isArray(plain)) {
+    throw new Error(DATABASE_EXPORT_RESULT_ERROR);
+  }
+  const candidate = plain as Record<string, unknown>;
+  if (
+    candidate.databaseId !== databaseId ||
+    !boundedString(candidate.location) ||
+    !Number.isSafeInteger(candidate.size) ||
+    Number(candidate.size) < 1 ||
+    typeof candidate.sha256 !== 'string' ||
+    !SHA256.test(candidate.sha256)
+  ) {
+    throw new Error(DATABASE_EXPORT_RESULT_ERROR);
+  }
+  return {
+    databaseId,
+    location: candidate.location,
+    size: Number(candidate.size),
+    sha256: candidate.sha256,
+  };
+}
+
+async function completeDatabaseDecommission(
+  lease: FleetStateLease,
+  record: FleetRecord,
+  intent: ActiveDecommissionIntent,
+  clock: () => number,
+): Promise<FleetRecord> {
+  const timestamp = nowIso(clock);
+  const nextRecord: FleetRecord = {
+    ...record,
+    phase: 'decommissioned',
+    updatedAt: timestamp,
+  };
+  const completeIntent: DecommissionAdvanceIntent = {
+    version: 1,
+    operationId: intent.operationId,
+    revision: intent.revision + 1,
+    generation: intent.generation,
+    updatedAt: timestamp,
+    identity: intent.identity,
+    databaseExportReceiptAuthority: selectedReceiptAuthority(intent),
+    lifecyclePhase: 'decommissioned',
+    state: 'complete',
+  };
+  return writeIntent(lease, nextRecord, completeIntent);
+}
+
+async function deleteDatabaseUnderBarrier(
+  backend: ProvisioningBackend,
+  lease: FleetStateLease,
+  record: FleetRecord,
+  database: DatabaseReference,
+  barrier: FleetRecord,
+): Promise<FleetRecord> {
+  await lease.assertOwned();
+  const deletion = await settleOperation(() =>
+    backend.deleteDatabase(database, lease),
+  );
+  await lease.assertOwned();
+  const readback = await settleOperation(() =>
+    backend.getDatabase(record.databaseId),
+  );
+  await lease.assertOwned();
+  if (readback.status === 'rejected') throw readback.reason;
+  if (readback.value === undefined) return barrier;
+  if (deletion.status === 'rejected') throw deletion.reason;
+  throw new Error(`database '${record.databaseId}' remains after deletion`);
+}
+
+async function advanceDatabaseTransition(
   options: AdvanceDecommissionDeploymentOptions,
   lease: FleetStateLease,
   record: FleetRecord,
-  intent: Extract<
-    DecommissionAdvanceIntent,
-    { readonly state: 'discover' | 'verify' }
-  >,
+  intent: ActiveDecommissionIntent,
+  receipt: ReceiptCapability,
 ): Promise<FleetRecord> {
-  if (intent.purpose.kind !== 'application-r2-detach') {
-    throw new Error(
-      'application R2 attachment scanning cannot consume a database attachment purpose',
+  const clock = options.clock ?? Date.now;
+  if (intent.lifecyclePhase === 'application-resources-deleted') {
+    databaseReceiptIdentity(
+      record,
+      intent.operationId,
+      receipt.authority,
+      receipt.authority,
+    );
+    await reconcilePersistedDatabase(
+      options.backend,
+      record,
+      false,
+      lease,
+      true,
+    );
+    return commitShellOnly(lease, record, intent, clock, {
+      state: 'discover',
+      databaseExportReceiptAuthority: receipt.authority,
+      purpose: { kind: 'database-pre-export', databaseId: record.databaseId },
+      progress: initialWorkerAttachmentScan({
+        kind: 'd1',
+        databaseId: record.databaseId,
+      }),
+      generation: intent.generation + 1,
+    });
+  }
+  if (intent.lifecyclePhase === 'database-exported') {
+    await reconcilePersistedDatabase(
+      options.backend,
+      record,
+      false,
+      lease,
+      true,
+    );
+    const purpose = databasePreDeletePurpose(record);
+    return commitShellOnly(lease, record, intent, clock, {
+      state: 'discover',
+      purpose,
+      progress: initialWorkerAttachmentScan({
+        kind: 'd1',
+        databaseId: record.databaseId,
+      }),
+      generation: intent.generation + 1,
+    });
+  }
+  if (intent.lifecyclePhase === 'database-deleting') {
+    const database = await reconcilePersistedDatabase(
+      options.backend,
+      record,
+      true,
+      lease,
+      true,
+    );
+    if (!database) {
+      return completeDatabaseDecommission(lease, record, intent, clock);
+    }
+    const purpose = databasePreDeletePurpose(record);
+    return commitShellOnly(lease, record, intent, clock, {
+      state: 'discover',
+      purpose,
+      progress: initialWorkerAttachmentScan({
+        kind: 'd1',
+        databaseId: record.databaseId,
+      }),
+      generation: intent.generation + 1,
+    });
+  }
+  throw new Error(
+    `unsupported bounded decommission database lifecycle '${intent.lifecyclePhase}'`,
+  );
+}
+
+async function consumeDatabaseVerify(
+  options: AdvanceDecommissionDeploymentOptions,
+  lease: FleetStateLease,
+  record: FleetRecord,
+  intent: Extract<DecommissionAdvanceIntent, { readonly state: 'verify' }>,
+  receipt: ReceiptCapability,
+): Promise<FleetRecord> {
+  const allowAbsent = intent.lifecyclePhase === 'database-deleting';
+  const database = await reconcilePersistedDatabase(
+    options.backend,
+    record,
+    allowAbsent,
+    lease,
+    true,
+  );
+  const clock = options.clock ?? Date.now;
+  if (!database) {
+    return completeDatabaseDecommission(lease, record, intent, clock);
+  }
+  const residual = requiredCapability(
+    options.backend.assertDatabaseDeletionResidualsRemoved,
+    'database-residuals',
+  ).bind(options.backend);
+  await residual(options.spec, record, database, lease);
+  if (intent.purpose.kind === 'database-pre-export') {
+    await lease.assertOwned();
+    const identity = databaseReceiptIdentity(
+      record,
+      intent.operationId,
+      selectedReceiptAuthority(intent),
+      receipt.authority,
+    );
+    const raw: unknown = await receipt.exportReceipt(identity, lease);
+    const exported = databaseExportFromUnknown(raw, record.databaseId);
+    return commitRecord(
+      lease,
+      record,
+      intent,
+      clock,
+      {
+        databaseExportLocation: exported.location,
+        databaseExportSha256: exported.sha256,
+        databaseExportSize: exported.size,
+      },
+      { state: 'transitioning', lifecyclePhase: 'database-exported' },
     );
   }
-  const resource = record.applicationResources?.[intent.purpose.resourceIndex];
-  if (!resource) malformedResult();
-  assertApplicationR2ReservationIdentity(options.spec, resource);
-  const findApplicationR2Bucket = requiredCapability(
-    options.backend.findApplicationR2Bucket,
-    'application-r2-inspection',
-  ).bind(options.backend);
+  if (intent.purpose.kind !== 'database-pre-delete') {
+    return malformedResult();
+  }
+  const barrier = await commitRecord(
+    lease,
+    record,
+    intent,
+    clock,
+    {},
+    { state: 'transitioning', lifecyclePhase: 'database-deleting' },
+  );
+  return deleteDatabaseUnderBarrier(
+    options.backend,
+    lease,
+    record,
+    database,
+    barrier,
+  );
+}
+
+async function advanceAttachmentScan(
+  options: AdvanceDecommissionDeploymentOptions,
+  lease: FleetStateLease,
+  record: FleetRecord,
+  intent: ScanDecommissionIntent,
+  receipt: ReceiptCapability,
+): Promise<FleetRecord> {
+  let inspectionBackend:
+    | Readonly<{
+        findApplicationR2Bucket: NonNullable<
+          ProvisioningBackend['findApplicationR2Bucket']
+        >;
+      }>
+    | undefined;
+  if (intent.purpose.kind === 'application-r2-detach') {
+    const resource =
+      record.applicationResources?.[intent.purpose.resourceIndex];
+    if (!resource) malformedResult();
+    assertApplicationR2ReservationIdentity(options.spec, resource);
+    const findApplicationR2Bucket = requiredCapability(
+      options.backend.findApplicationR2Bucket,
+      'application-r2-inspection',
+    ).bind(options.backend);
+    inspectionBackend = { findApplicationR2Bucket };
+    const preflight = await advanceApplicationR2Deletion({
+      spec: options.spec,
+      resources: record.applicationResources ?? [],
+      backend: inspectionBackend,
+      fence: lease,
+      startResourceIndex: 0,
+    });
+    if (
+      preflight.status !== 'detachment-required' ||
+      preflight.resourceIndex !== intent.purpose.resourceIndex
+    ) {
+      malformedResult();
+    }
+  } else {
+    const database = await reconcilePersistedDatabase(
+      options.backend,
+      record,
+      intent.lifecyclePhase === 'database-deleting',
+      lease,
+      true,
+    );
+    if (!database) {
+      return completeDatabaseDecommission(
+        lease,
+        record,
+        intent,
+        options.clock ?? Date.now,
+      );
+    }
+  }
   const scan = requiredCapability(
     options.backend.advanceDecommissionAttachmentScan,
     'attachment-scan',
   ).bind(options.backend);
-  const inspectionBackend = { findApplicationR2Bucket };
-  const preflight = await advanceApplicationR2Deletion({
-    spec: options.spec,
-    resources: record.applicationResources ?? [],
-    backend: inspectionBackend,
-    fence: lease,
-    startResourceIndex: 0,
-  });
-  if (
-    preflight.status !== 'detachment-required' ||
-    preflight.resourceIndex !== intent.purpose.resourceIndex
-  ) {
-    malformedResult();
-  }
   const raw: unknown = await scan({
     progress: intent.progress,
     maxProviderRequests: options.maxProviderRequests,
@@ -1193,6 +1628,7 @@ async function advanceR2Scan(
       maxSerializedBytes: RESULT_PLAIN_DATA_BYTE_BOUND,
       error: () => new Error(RESULT_ERROR),
     });
+    Reflect.apply(STRUCTURED_CLONE, undefined, [raw]);
   } catch {
     return malformedResult();
   }
@@ -1289,11 +1725,14 @@ async function advanceR2Scan(
       generation: intent.generation + 1,
     });
   }
+  if (intent.purpose.kind !== 'application-r2-detach') {
+    return consumeDatabaseVerify(options, lease, record, intent, receipt);
+  }
   await lease.assertOwned();
   const detached = await advanceApplicationR2Deletion({
     spec: options.spec,
     resources: record.applicationResources ?? [],
-    backend: inspectionBackend,
+    backend: inspectionBackend as NonNullable<typeof inspectionBackend>,
     fence: lease,
     startResourceIndex: 0,
     verifiedDetachmentResourceIndex: intent.purpose.resourceIndex,
@@ -1387,15 +1826,33 @@ async function advanceUnderLease(
     : undefined;
   if (action.kind === 'start' && intent) {
     assertNormalAuthority(record, backend, spec, intent);
+    if (
+      intent.state !== 'blocked' &&
+      intent.state !== 'complete' &&
+      intent.databaseExportReceiptAuthority !== undefined
+    ) {
+      assertNormalDecommissionD1ResourcesDeleted(record);
+      const receipt = receiptCapability(backend);
+      databaseReceiptIdentity(
+        record,
+        intent.operationId,
+        selectedReceiptAuthority(intent),
+        receipt.authority,
+      );
+    }
     return authoritativeResult({ ...record, decommissionIntent: intent });
   }
   if (action.kind === 'start') {
     assertNormalAuthority(record, backend, spec);
+    assertSupportedEntryLifecycle(record);
+    if (effectiveLifecyclePhase(record) === 'application-resources-deleted') {
+      assertNormalDecommissionD1ResourcesDeleted(record);
+    }
     validateReservations(spec, record);
     const resources = record.applicationResources ?? [];
     assertCompleteApplicationR2Reservations(resources);
     requireStartCapabilities(backend, resources);
-    assertSupportedEntryLifecycle(record);
+    const receipt = receiptCapability(backend);
     const operationId = options.randomUUID();
     parseDecommissionAdvanceToken({
       version: 1,
@@ -1404,6 +1861,12 @@ async function advanceUnderLease(
       operationId,
       revision: 0,
     });
+    databaseReceiptIdentity(
+      record,
+      operationId,
+      receipt.authority,
+      receipt.authority,
+    );
     record = startRecord(
       record,
       spec,
@@ -1421,34 +1884,47 @@ async function advanceUnderLease(
   if (classification === 'stale') return authoritativeResult(record);
   if (action.kind === 'restart-blocked') {
     if (intent.state !== 'blocked') throw new DecommissionAdvanceRestartError();
-    if (intent.purpose.kind !== 'application-r2-detach') {
-      throw new DecommissionAdvanceRestartError();
-    }
     assertNormalAuthority(record, backend, spec, intent);
     assertCompleteApplicationR2Reservations(record.applicationResources ?? []);
+    if (intent.purpose.kind !== 'application-r2-detach') {
+      assertNormalDecommissionD1ResourcesDeleted(record);
+    }
+    const receipt = receiptCapability(backend);
+    if (intent.purpose.kind !== 'application-r2-detach') {
+      databaseReceiptIdentity(
+        record,
+        intent.operationId,
+        selectedReceiptAuthority(intent),
+        receipt.authority,
+      );
+    }
     requireCapability(
       backend.advanceDecommissionAttachmentScan,
       'attachment-scan',
     );
-    const resource =
-      record.applicationResources?.[intent.purpose.resourceIndex];
-    if (!resource) malformedResult();
-    assertApplicationR2ReservationIdentity(spec, resource);
-    if (intent.purpose.resourceIndex > 0) {
-      const findApplicationR2Bucket = requiredCapability(
-        backend.findApplicationR2Bucket,
-        'application-r2-inspection',
-      ).bind(backend);
-      const prefix = await advanceApplicationR2Deletion({
-        spec,
-        resources:
-          record.applicationResources?.slice(0, intent.purpose.resourceIndex) ??
-          [],
-        backend: { findApplicationR2Bucket },
-        fence: lease,
-        startResourceIndex: 0,
-      });
-      if (prefix.status !== 'complete') malformedResult();
+    if (intent.purpose.kind === 'application-r2-detach') {
+      const resource =
+        record.applicationResources?.[intent.purpose.resourceIndex];
+      if (!resource) malformedResult();
+      assertApplicationR2ReservationIdentity(spec, resource);
+      if (intent.purpose.resourceIndex > 0) {
+        const findApplicationR2Bucket = requiredCapability(
+          backend.findApplicationR2Bucket,
+          'application-r2-inspection',
+        ).bind(backend);
+        const prefix = await advanceApplicationR2Deletion({
+          spec,
+          resources:
+            record.applicationResources?.slice(
+              0,
+              intent.purpose.resourceIndex,
+            ) ?? [],
+          backend: { findApplicationR2Bucket },
+          fence: lease,
+          startResourceIndex: 0,
+        });
+        if (prefix.status !== 'complete') malformedResult();
+      }
     }
     record = await commitShellOnly(
       lease,
@@ -1467,15 +1943,43 @@ async function advanceUnderLease(
   if (intent.state === 'blocked' || intent.state === 'complete') {
     return authoritativeResult(record);
   }
-  if (intent.lifecyclePhase === 'application-resources-deleted') {
-    return authoritativeResult(record);
-  }
   assertNormalAuthority(record, backend, spec, intent);
   assertCompleteApplicationR2Reservations(record.applicationResources ?? []);
+  const isD1Action = intent.databaseExportReceiptAuthority !== undefined;
+  if (isD1Action || intent.lifecyclePhase === 'application-resources-deleted') {
+    assertNormalDecommissionD1ResourcesDeleted(record);
+  }
+  const receipt = receiptCapability(backend);
+  if (isD1Action) {
+    databaseReceiptIdentity(
+      record,
+      intent.operationId,
+      selectedReceiptAuthority(intent),
+      receipt.authority,
+    );
+  }
   if (intent.state === 'discover' || intent.state === 'verify') {
-    record = await advanceR2Scan(options, lease, record, intent);
+    record = await advanceAttachmentScan(
+      options,
+      lease,
+      record,
+      intent,
+      receipt,
+    );
   } else if (intent.lifecyclePhase === 'application-resources-deleting') {
     record = await advanceR2Transition(options, lease, record, intent);
+  } else if (
+    intent.lifecyclePhase === 'application-resources-deleted' ||
+    intent.lifecyclePhase === 'database-exported' ||
+    intent.lifecyclePhase === 'database-deleting'
+  ) {
+    record = await advanceDatabaseTransition(
+      options,
+      lease,
+      record,
+      intent,
+      receipt,
+    );
   } else {
     record = await advanceLifecycle(options, lease, record, intent);
   }

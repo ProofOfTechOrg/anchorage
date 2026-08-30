@@ -28,6 +28,7 @@ const NODE_BOUND = 8192;
 const SHA256 = /^[0-9a-f]{64}$/u;
 const UUID_V4 =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const STRUCTURED_CLONE = structuredClone;
 
 const INITIAL_PHASES = new Set<NormalDecommissionLifecyclePhase>([
   'publishing',
@@ -135,6 +136,18 @@ function canonicalIso(value: unknown): value is string {
     Number.isFinite(Date.parse(value)) &&
     new Date(value).toISOString() === value
   );
+}
+
+function assertApplicationResourcesDeleted(
+  source: Pick<FleetRecord, 'applicationResources'>,
+): void {
+  if (
+    (source.applicationResources ?? []).some(
+      (resource) => resource.state !== 'deleted',
+    )
+  ) {
+    malformed();
+  }
 }
 
 function parseRecordIdentity(
@@ -414,6 +427,7 @@ function parseAttachment(value: unknown): DecommissionBlockedAttachment {
 function parseIntentCommon(
   candidate: Record<string, unknown>,
   source: FleetRecord,
+  requiresReceiptAuthority: boolean,
 ): DecommissionIntentCommon {
   if (
     candidate.version !== 1 ||
@@ -426,6 +440,23 @@ function parseIntentCommon(
     return malformed();
   }
   const lifecyclePhase = parseLifecyclePhase(candidate.lifecyclePhase);
+  if (
+    [
+      'application-resources-deleted',
+      'database-exported',
+      'database-deleting',
+    ].includes(lifecyclePhase)
+  ) {
+    assertApplicationResourcesDeleted(source);
+  }
+  const databaseExportReceiptAuthority =
+    requiresReceiptAuthority &&
+    boundedString(candidate.databaseExportReceiptAuthority)
+      ? candidate.databaseExportReceiptAuthority
+      : undefined;
+  if (requiresReceiptAuthority && !databaseExportReceiptAuthority) {
+    return malformed();
+  }
   return {
     version: 1,
     operationId: candidate.operationId,
@@ -433,6 +464,9 @@ function parseIntentCommon(
     generation: candidate.generation,
     updatedAt: candidate.updatedAt,
     identity: parseIdentity(candidate.identity, source, lifecyclePhase),
+    ...(databaseExportReceiptAuthority
+      ? { databaseExportReceiptAuthority }
+      : {}),
     lifecyclePhase,
   };
 }
@@ -472,6 +506,7 @@ export function decommissionAdvanceIntentFromUnknown(
       maxSerializedBytes: DECOMMISSION_INTENT_BYTE_BOUND,
       error: () => new DecommissionAdvanceIntentError(),
     });
+    Reflect.apply(STRUCTURED_CLONE, undefined, [value]);
   } catch {
     return malformed();
   }
@@ -484,6 +519,7 @@ export function decommissionAdvanceIntentFromUnknown(
       'generation',
       'updatedAt',
       'identity',
+      'databaseExportReceiptAuthority',
       'lifecyclePhase',
       'state',
     ]);
@@ -494,6 +530,7 @@ export function decommissionAdvanceIntentFromUnknown(
       !safeIntegerAtLeast(candidate.revision) ||
       !safeIntegerAtLeast(candidate.generation) ||
       !canonicalIso(candidate.updatedAt) ||
+      !boundedString(candidate.databaseExportReceiptAuthority) ||
       candidate.lifecyclePhase !== 'decommissioned'
     ) {
       return malformed();
@@ -506,6 +543,7 @@ export function decommissionAdvanceIntentFromUnknown(
       generation: candidate.generation,
       updatedAt: candidate.updatedAt,
       identity: parseIdentity(candidate.identity, source, 'decommissioned'),
+      databaseExportReceiptAuthority: candidate.databaseExportReceiptAuthority,
       lifecyclePhase: 'decommissioned',
       state: 'complete',
     };
@@ -522,6 +560,13 @@ export function decommissionAdvanceIntentFromUnknown(
             ? ['purpose', 'attachment']
             : undefined;
   if (!stateKeys) return malformed();
+  const rawPurpose =
+    state === 'transitioning' ? undefined : plainRecord(candidate.purpose);
+  const requiresReceiptAuthority =
+    candidate.lifecyclePhase === 'database-exported' ||
+    candidate.lifecyclePhase === 'database-deleting' ||
+    rawPurpose?.kind === 'database-pre-export' ||
+    rawPurpose?.kind === 'database-pre-delete';
   exactKeys(candidate, [
     'version',
     'operationId',
@@ -529,12 +574,17 @@ export function decommissionAdvanceIntentFromUnknown(
     'generation',
     'updatedAt',
     'identity',
+    ...(requiresReceiptAuthority ? ['databaseExportReceiptAuthority'] : []),
     'lifecyclePhase',
     'state',
     ...stateKeys,
   ]);
   if (source.phase !== 'decommission-advancing') return malformed();
-  const parsedCommon = parseIntentCommon(candidate, source);
+  const parsedCommon = parseIntentCommon(
+    candidate,
+    source,
+    requiresReceiptAuthority,
+  );
   if (state === 'transitioning') {
     return { ...parsedCommon, state };
   }
@@ -605,6 +655,7 @@ export function parseDecommissionAdvanceToken(
       maxSerializedBytes: TOKEN_BYTE_BOUND,
       error: () => new DecommissionAdvanceTokenError(),
     });
+    Reflect.apply(STRUCTURED_CLONE, undefined, [value]);
   } catch {
     throw new DecommissionAdvanceTokenError();
   }

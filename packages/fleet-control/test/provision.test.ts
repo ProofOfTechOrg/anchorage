@@ -17,6 +17,7 @@ import {
   DecommissionAdvanceCapabilityError,
   DecommissionAdvanceRestartError,
   type DecommissionAdvanceResult,
+  reconcilePersistedDatabase,
 } from '../src/decommission-advance.js';
 import { normalizeDecommissionAdvanceIntent } from '../src/decommission-intent.js';
 import { migrateFleet, rollbackExternalRelease } from '../src/fleet.js';
@@ -43,7 +44,10 @@ import type {
   ActiveRouteAttestation,
   ApplicationR2BucketSnapshot,
   ApplicationR2Resource,
+  DatabaseExport,
+  DatabaseExportReceiptIdentity,
   DatabaseReference,
+  DecommissionAdvanceIntent,
   DecommissionAttachmentScanInput,
   DecommissionAttachmentScanResult,
   DeploymentSecrets,
@@ -62,6 +66,7 @@ import type {
   ProvisioningBackendKind,
   SeedDeploymentIdentityOptions,
 } from '../src/types.js';
+import { effectiveLifecyclePhase } from '../src/types.js';
 import { externalReleaseScriptName } from '../src/workers-for-platforms-backend.js';
 import { WranglerLoopBackend } from '../src/wrangler-loop-backend.js';
 import type { CommandResult, CommandRunner } from '../src/wrangler-runner.js';
@@ -93,6 +98,14 @@ const secrets: DeploymentSecrets = {
   deploymentIdentity: 'deployment-identity-secret-value-0001',
   maintenanceAdmin: 'maintenance-admin-secret-value-00001',
 };
+
+const DATABASE_ID = '00000000-0000-0000-0000-000000000101';
+const REPLACEMENT_DATABASE_ID = '00000000-0000-0000-0000-000000000102';
+const RECEIPT_AUTHORITY = 'memory://fleet-exports/receipts/v1';
+
+type BoxedOutcome<Value> =
+  | Readonly<{ status: 'fulfilled'; value: Value; commit?: boolean }>
+  | Readonly<{ status: 'rejected'; reason: unknown; commit?: boolean }>;
 
 function completeLiveDeployment(
   live: Omit<LiveDeployment, 'providerBindingIdentities'>,
@@ -144,6 +157,9 @@ class MemoryStore implements FleetStateStore {
     | Readonly<{ name: string; state: ApplicationR2Resource['state'] }>
     | undefined;
   assertOwnedFailure: unknown;
+  assertOwnedFailureAt: number | undefined;
+  assertOwnedObserved: (() => void) | undefined;
+  assertOwnedCalls = 0;
 
   async withDeploymentLease<T>(
     tenantTag: string,
@@ -159,8 +175,13 @@ class MemoryStore implements FleetStateStore {
         environment,
         mutationLeaseTtlMs: 15 * 60_000,
         assertOwned: async () => {
+          this.assertOwnedCalls += 1;
+          this.assertOwnedObserved?.();
           if (this.assertOwnedFailure !== undefined) {
             throw this.assertOwnedFailure;
+          }
+          if (this.assertOwnedFailureAt === this.assertOwnedCalls) {
+            throw new Error(`lease assertion ${this.assertOwnedCalls} failed`);
           }
         },
         renew: async () => {},
@@ -187,9 +208,16 @@ class MemoryStore implements FleetStateStore {
         ),
       };
     }
-    if (this.failPutPhase === record.phase) {
+    const lifecyclePhase = record.decommissionIntent
+      ? effectiveLifecyclePhase(record)
+      : record.phase;
+    if (
+      this.failPutPhase === record.phase ||
+      this.failPutPhase === lifecyclePhase
+    ) {
+      const failedPhase = this.failPutPhase;
       this.failPutPhase = undefined;
-      throw new Error(`failed state write at ${record.phase}`);
+      throw new Error(`failed state write at ${failedPhase}`);
     }
     const applicationFailure = this.failPutApplicationState;
     if (
@@ -238,10 +266,17 @@ class CommitThenThrowStore extends MemoryStore {
         state,
       })),
     );
-    if (this.failAfterCommittedPhase === record.phase) {
+    const lifecyclePhase = record.decommissionIntent
+      ? effectiveLifecyclePhase(record)
+      : record.phase;
+    if (
+      this.failAfterCommittedPhase === record.phase ||
+      this.failAfterCommittedPhase === lifecyclePhase
+    ) {
+      const failedPhase = this.failAfterCommittedPhase;
       this.failAfterCommittedPhase = undefined;
       throw new Error(
-        `state write response was lost after committing ${record.phase}`,
+        `state write response was lost after committing ${failedPhase}`,
       );
     }
     const failure = this.failAfterCommittedApplicationState;
@@ -273,6 +308,7 @@ const maintenance: MaintenanceHealth = {
 class FakeBackend implements ProvisioningBackend {
   readonly kind: ProvisioningBackendKind;
   readonly immutableExternalArtifacts?: true;
+  readonly databaseExportReceiptAuthority = RECEIPT_AUTHORITY;
   readonly events: string[] = [];
   failAt: string | undefined;
   cleanupFailAt: string | undefined;
@@ -281,9 +317,9 @@ class FakeBackend implements ProvisioningBackend {
   activeRoute: ActiveRouteAttestation | undefined;
   exportLocation = 'r2://fleet-exports/acme.sql';
   databaseExists = false;
-  databaseId = 'database-id';
+  databaseId = DATABASE_ID;
   databaseName = 'acme-production';
-  databaseOwner: string | undefined;
+  databaseOwner: unknown;
   /** Every fence state provisioning asked for, in call order. */
   readonly seededFenceStates: InitialExecutionFenceState[] = [];
   readonly databaseIdsRead: string[] = [];
@@ -305,6 +341,12 @@ class FakeBackend implements ProvisioningBackend {
   forceStepStarted: (() => void) | undefined;
   readonly scanInputs: DecommissionAttachmentScanInput[] = [];
   readonly scanResults: DecommissionAttachmentScanResult[] = [];
+  scanAfter: (() => void) | undefined;
+  readonly databaseReadOutcomes: BoxedOutcome<unknown>[] = [];
+  readonly deleteOutcomes: BoxedOutcome<void>[] = [];
+  readonly receiptOutcomes: BoxedOutcome<unknown>[] = [];
+  readonly receiptCalls: DatabaseExportReceiptIdentity[] = [];
+  readonly receiptWinners = new Map<string, DatabaseExport>();
   scanFailure: unknown;
   residualCalls = 0;
 
@@ -329,6 +371,11 @@ class FakeBackend implements ProvisioningBackend {
     databaseId: string,
   ): Promise<DatabaseReference | undefined> {
     this.databaseIdsRead.push(databaseId);
+    const outcome = this.databaseReadOutcomes.shift();
+    if (outcome?.status === 'rejected') throw outcome.reason;
+    if (outcome?.status === 'fulfilled') {
+      return outcome.value as DatabaseReference | undefined;
+    }
     return this.databaseExists && databaseId === this.databaseId
       ? {
           id: this.databaseId,
@@ -360,7 +407,7 @@ class FakeBackend implements ProvisioningBackend {
     }
     this.databaseExists = true;
     this.#event('database');
-    return { id: 'database-id', name: 'acme-production', created: true };
+    return { id: DATABASE_ID, name: 'acme-production', created: true };
   }
 
   // The fence state is DECLARED here, not dropped: a fake that omits the
@@ -379,7 +426,7 @@ class FakeBackend implements ProvisioningBackend {
   }
 
   async readDeploymentIdentity(): Promise<string | undefined> {
-    return this.databaseOwner;
+    return this.databaseOwner as string | undefined;
   }
 
   async applyMigrations(): Promise<void> {
@@ -391,14 +438,16 @@ class FakeBackend implements ProvisioningBackend {
   ): Promise<DecommissionAttachmentScanResult> {
     this.scanInputs.push(input);
     if (this.scanFailure !== undefined) throw this.scanFailure;
-    return (
-      this.scanResults.shift() ?? {
-        status: 'complete',
-        evidenceSha256: 'a'.repeat(64),
-        evidenceCount: 2,
-        providerFetchAttemptsReserved: 3,
-      }
-    );
+    const result = this.scanResults.shift() ?? {
+      status: 'complete',
+      evidenceSha256: 'a'.repeat(64),
+      evidenceCount: 2,
+      providerFetchAttemptsReserved: 3,
+    };
+    const after = this.scanAfter;
+    this.scanAfter = undefined;
+    after?.();
+    return result;
   }
 
   describeExternalPlatformTarget(deployment: DeploymentSpec) {
@@ -503,7 +552,7 @@ class FakeBackend implements ProvisioningBackend {
         deployment.authoredBy === 'external'
           ? externalReleaseScriptName(deployment)
           : deployment.scriptName,
-      databaseId: 'database-id',
+      databaseId: DATABASE_ID,
       durableObjectBindings:
         externalTopology?.durableObjectBindings ??
         deployment.durableObjectBindings.map((binding) => ({
@@ -667,15 +716,47 @@ class FakeBackend implements ProvisioningBackend {
   }> {
     this.#event('export');
     return {
-      databaseId: 'database-id',
+      databaseId: DATABASE_ID,
       location: this.exportLocation,
       sha256: 'a'.repeat(64),
       size: 42,
     };
   }
 
+  async exportDatabaseReceipt(
+    identity: DatabaseExportReceiptIdentity,
+  ): Promise<DatabaseExport> {
+    this.#event('export');
+    this.receiptCalls.push(structuredClone(identity));
+    const key = JSON.stringify(identity);
+    const canonical: DatabaseExport = {
+      databaseId: identity.databaseId,
+      location: `${this.exportLocation}/${identity.operationId}`,
+      sha256: 'a'.repeat(64),
+      size: 42,
+    };
+    const outcome = this.receiptOutcomes.shift();
+    if (outcome?.status === 'rejected') {
+      if (outcome.commit === true) this.receiptWinners.set(key, canonical);
+      throw outcome.reason;
+    }
+    if (outcome?.status === 'fulfilled') {
+      return outcome.value as DatabaseExport;
+    }
+    const winner = this.receiptWinners.get(key);
+    if (winner) return structuredClone(winner);
+    this.receiptWinners.set(key, canonical);
+    return structuredClone(canonical);
+  }
+
   async deleteDatabase(): Promise<void> {
     this.#event('delete-database');
+    const outcome = this.deleteOutcomes.shift();
+    if (outcome) {
+      if (outcome.commit === true) this.databaseExists = false;
+      if (outcome.status === 'rejected') throw outcome.reason;
+      return;
+    }
     this.databaseExists = false;
   }
 
@@ -815,7 +896,7 @@ async function wranglerLoopHarness(deployment: DeploymentSpec) {
         return {
           stdout: JSON.stringify(
             state.databaseExists
-              ? [{ uuid: 'database-id', name: deployment.databaseName }]
+              ? [{ uuid: DATABASE_ID, name: deployment.databaseName }]
               : [],
           ),
           stderr: '',
@@ -865,7 +946,7 @@ async function wranglerLoopHarness(deployment: DeploymentSpec) {
             annotations: { 'workers/tag': digest },
             resources: {
               bindings: [
-                { type: 'd1', name: 'DB', id: 'database-id' },
+                { type: 'd1', name: 'DB', id: DATABASE_ID },
                 {
                   type: 'durable_object_namespace',
                   name: 'MAINTENANCE',
@@ -982,16 +1063,16 @@ async function wranglerLoopHarness(deployment: DeploymentSpec) {
       state.appliedMigrations += 1;
     },
     async getDatabase(databaseId) {
-      return state.databaseExists && databaseId === 'database-id'
+      return state.databaseExists && databaseId === DATABASE_ID
         ? {
-            id: 'database-id',
+            id: DATABASE_ID,
             name: deployment.databaseName,
             created: false,
           }
         : undefined;
     },
     async deleteDatabase(databaseId) {
-      if (databaseId === 'database-id') state.databaseExists = false;
+      if (databaseId === DATABASE_ID) state.databaseExists = false;
     },
     async inspectOrdinaryWorkerFootprint() {
       return {
@@ -1128,6 +1209,80 @@ async function driveBoundedUntil(
   throw new Error('bounded decommission did not reach the requested state');
 }
 
+async function driveToPreExportVerify(
+  harness: BoundedDecommissionHarness,
+): Promise<DecommissionAdvanceResult> {
+  let result = await driveBoundedUntil(
+    harness,
+    (record) =>
+      record.decommissionIntent?.lifecyclePhase ===
+        'application-resources-deleted' &&
+      record.decommissionIntent.state === 'transitioning',
+  );
+  result = await continueBoundedDecommission(harness, result);
+  expect(harness.store.record?.decommissionIntent).toMatchObject({
+    lifecyclePhase: 'application-resources-deleted',
+    state: 'discover',
+    purpose: { kind: 'database-pre-export', databaseId: DATABASE_ID },
+    databaseExportReceiptAuthority: RECEIPT_AUTHORITY,
+  });
+  result = await continueBoundedDecommission(harness, result);
+  expect(harness.store.record?.decommissionIntent).toMatchObject({
+    lifecyclePhase: 'application-resources-deleted',
+    state: 'verify',
+  });
+  return result;
+}
+
+async function driveToPreDeleteVerify(
+  harness: BoundedDecommissionHarness,
+): Promise<DecommissionAdvanceResult> {
+  let result = await driveToPreExportVerify(harness);
+  result = await continueBoundedDecommission(harness, result);
+  expect(harness.store.record?.decommissionIntent).toMatchObject({
+    lifecyclePhase: 'database-exported',
+    state: 'transitioning',
+  });
+  result = await continueBoundedDecommission(harness, result);
+  expect(harness.store.record?.decommissionIntent).toMatchObject({
+    lifecyclePhase: 'database-exported',
+    state: 'discover',
+    purpose: { kind: 'database-pre-delete', databaseId: DATABASE_ID },
+  });
+  result = await continueBoundedDecommission(harness, result);
+  expect(harness.store.record?.decommissionIntent).toMatchObject({
+    lifecyclePhase: 'database-exported',
+    state: 'verify',
+  });
+  return result;
+}
+
+function legacyOnlyBackend(backend: FakeBackend): ProvisioningBackend {
+  return new Proxy({} as ProvisioningBackend, {
+    has(_target, property) {
+      if (
+        property === 'advanceDecommissionAttachmentScan' ||
+        property === 'databaseExportReceiptAuthority' ||
+        property === 'exportDatabaseReceipt'
+      ) {
+        return false;
+      }
+      return Reflect.has(backend, property);
+    },
+    get(_target, property) {
+      if (
+        property === 'advanceDecommissionAttachmentScan' ||
+        property === 'databaseExportReceiptAuthority' ||
+        property === 'exportDatabaseReceipt'
+      ) {
+        return undefined;
+      }
+      const value = Reflect.get(backend, property, backend);
+      return typeof value === 'function' ? value.bind(backend) : value;
+    },
+  });
+}
+
 describe('fleet provisioning', () => {
   it('attests empty application bindings exactly while allowing only system-owned variables', () => {
     const deployment = spec();
@@ -1135,7 +1290,7 @@ describe('fleet provisioning', () => {
     const record = {
       tenantTag: deployment.tenantTag,
       environment: deployment.environment,
-      databaseId: 'database-id',
+      databaseId: DATABASE_ID,
       applicationBindings: { vars: [], secrets: [], r2Buckets: [] },
     } satisfies Pick<
       FleetRecord,
@@ -1239,7 +1394,7 @@ describe('fleet provisioning', () => {
     expect(backend.events).toEqual([]);
   });
 
-  it('refuses every root lifecycle mutation while decommission advances', async () => {
+  it('refuses non-advance root lifecycle mutations while decommission advances', async () => {
     const deployment = spec();
     const external = spec({
       authoredBy: 'external',
@@ -1325,11 +1480,6 @@ describe('fleet provisioning', () => {
             environment: deployment.environment,
           }),
       },
-      {
-        name: 'decommissionDeployment',
-        run: ({ backend, store }) =>
-          decommissionDeployment({ backend, store, spec: deployment }),
-      },
     ];
 
     for (const item of cases) {
@@ -1349,31 +1499,9 @@ describe('fleet provisioning', () => {
       expect(backend.databaseIdsRead, item.name).toEqual([]);
     }
 
+    const completeStore = new MemoryStore();
     const raceBackend = new FakeBackend();
     const advancing = advancingRecord(raceBackend);
-    const { decommissionIntent: _decommissionIntent, ...ready } = advancing;
-    const raceStore = new MemoryStore();
-    raceStore.record = advancing;
-    let reads = 0;
-    raceStore.get = async () => {
-      reads += 1;
-      return reads === 1
-        ? ({ ...ready, phase: 'ready' } as FleetRecord)
-        : raceStore.record;
-    };
-    await expect(
-      decommissionDeployment({
-        backend: raceBackend,
-        store: raceStore,
-        spec: deployment,
-      }),
-    ).rejects.toThrow(
-      'decommissionDeployment cannot run during an active decommission',
-    );
-    expect(reads).toBe(2);
-    expect(raceBackend.events).toEqual([]);
-
-    const completeStore = new MemoryStore();
     const activeIntent = advancing.decommissionIntent;
     if (!activeIntent || activeIntent.state === 'complete') {
       throw new Error('missing active decommission intent');
@@ -1387,6 +1515,7 @@ describe('fleet provisioning', () => {
       databaseExportSize: 128,
       decommissionIntent: {
         ...activeIntent,
+        databaseExportReceiptAuthority: RECEIPT_AUTHORITY,
         lifecyclePhase: 'decommissioned',
         state: 'complete',
       },
@@ -1433,7 +1562,7 @@ describe('fleet provisioning', () => {
     ]);
     expect(result.record).toMatchObject({
       phase: 'ready',
-      databaseId: 'database-id',
+      databaseId: DATABASE_ID,
       artifactVersion: 'artifact-v3',
     });
     expect(store.record).toEqual(result.record);
@@ -1487,7 +1616,9 @@ describe('fleet provisioning', () => {
     expect(String((failure as ProvisioningError).cause)).toMatch(
       /did not converge/,
     );
-    expect(store.record?.phase).toBe('publishing');
+    expect(effectiveLifecyclePhase(store.record as FleetRecord)).toBe(
+      'publishing',
+    );
 
     // #and once the route serves the deployed artifact, that is what commits
     backend.activeRoute = undefined;
@@ -2429,7 +2560,7 @@ describe('fleet provisioning', () => {
       backend: 'workers-for-platforms',
       environment: activeSpec.environment,
       scriptName: activeSpec.scriptName,
-      databaseId: 'database-id',
+      databaseId: DATABASE_ID,
       databaseName: activeSpec.databaseName,
       schemaVersion: 2,
       artifactVersion: 'artifact-v1',
@@ -2494,7 +2625,9 @@ describe('fleet provisioning', () => {
       decommissionDeployment({ backend, store, spec: spec() }),
     ).rejects.toThrow(/failed at export/);
     expect(backend.events).toEqual(['revoke', 'delete-worker', 'export']);
-    expect(store.record?.phase).toBe('application-resources-deleted');
+    expect(effectiveLifecyclePhase(store.record as FleetRecord)).toBe(
+      'application-resources-deleted',
+    );
 
     backend.failAt = undefined;
     const result = await decommissionDeployment({
@@ -2510,7 +2643,7 @@ describe('fleet provisioning', () => {
       'delete-database',
     ]);
     expect(result.record.phase).toBe('decommissioned');
-    expect(result.databaseExport.location).toBe(backend.exportLocation);
+    expect(result.databaseExport.location).toContain(backend.exportLocation);
   });
 
   it.each([
@@ -2537,11 +2670,15 @@ describe('fleet provisioning', () => {
     backend.nonempty = true;
 
     await expect(
-      decommissionDeployment({ backend, store, spec: deployment }),
+      decommissionDeployment({
+        backend,
+        store,
+        spec: deployment,
+      }),
     ).rejects.toThrow(/not empty/u);
     expect(backend.emptyChecks).toBe(1);
     expect(backend.events).toEqual([]);
-    expect(store.record?.phase).toBe('ready');
+    expect(effectiveLifecyclePhase(store.record as FleetRecord)).toBe('ready');
 
     backend.nonempty = false;
     await expect(
@@ -2575,7 +2712,9 @@ describe('fleet provisioning', () => {
     await expect(
       decommissionDeployment({ backend, store, spec: deployment }),
     ).rejects.toThrow(/not empty/u);
-    expect(store.record?.phase).toBe('traffic-removed');
+    expect(effectiveLifecyclePhase(store.record as FleetRecord)).toBe(
+      'traffic-removed',
+    );
     expect(backend.events).toEqual([]);
     expect(backend.live).toBeDefined();
     expect(backend.databaseExists).toBe(true);
@@ -2613,7 +2752,9 @@ describe('fleet provisioning', () => {
     await expect(
       decommissionDeployment({ backend, store, spec: deployment }),
     ).rejects.toThrow(/traffic removal response lost/u);
-    expect(store.record?.phase).toBe('decommissioning');
+    expect(effectiveLifecyclePhase(store.record as FleetRecord)).toBe(
+      'decommissioning',
+    );
     expect(backend.removeTrafficCalls).toBe(1);
     expect(backend.events).toEqual([]);
 
@@ -2647,7 +2788,9 @@ describe('fleet provisioning', () => {
     await expect(
       decommissionDeployment({ backend, store, spec: deployment }),
     ).rejects.toThrow(/committing traffic-removed/u);
-    expect(store.record?.phase).toBe('traffic-removed');
+    expect(effectiveLifecyclePhase(store.record as FleetRecord)).toBe(
+      'traffic-removed',
+    );
     expect(backend.events).toEqual([]);
 
     await expect(
@@ -2678,7 +2821,9 @@ describe('fleet provisioning', () => {
         secrets,
       }),
     ).rejects.toThrow(/publishing state is preserved/u);
-    expect(store.record?.phase).toBe('publishing');
+    expect(effectiveLifecyclePhase(store.record as FleetRecord)).toBe(
+      'publishing',
+    );
     expect(backend.live).toBeDefined();
     expect(backend.databaseExists).toBe(true);
     expect(backend.buckets.size).toBe(1);
@@ -2689,7 +2834,9 @@ describe('fleet provisioning', () => {
     await expect(
       decommissionDeployment({ backend, store, spec: deployment }),
     ).rejects.toThrow(/not empty/u);
-    expect(store.record?.phase).toBe('publishing');
+    expect(effectiveLifecyclePhase(store.record as FleetRecord)).toBe(
+      'publishing',
+    );
     expect(backend.events).toEqual([]);
 
     backend.nonempty = false;
@@ -2785,7 +2932,11 @@ describe('fleet provisioning', () => {
     backend.events.length = 0;
 
     await expect(
-      decommissionDeployment({ backend, store, spec: deployment }),
+      decommissionDeployment({
+        backend: legacyOnlyBackend(backend),
+        store,
+        spec: deployment,
+      }),
     ).resolves.toMatchObject({ record: { phase: 'decommissioned' } });
     expect(backend.activeRelease).toEqual(activeRelease);
     expect(
@@ -2893,12 +3044,14 @@ describe('fleet provisioning', () => {
     await expect(
       decommissionDeployment({ backend, store, spec: spec() }),
     ).rejects.toThrow(/failed state write/);
-    expect(store.record?.phase).toBe('database-deleting');
+    expect(effectiveLifecyclePhase(store.record as FleetRecord)).toBe(
+      'database-deleting',
+    );
     expect(backend.databaseExists).toBe(false);
 
     const findDatabaseCalls = backend.findDatabaseCalls;
     backend.databaseExists = true;
-    backend.databaseId = 'replacement-database-id';
+    backend.databaseId = REPLACEMENT_DATABASE_ID;
 
     await expect(
       decommissionDeployment({ backend, store, spec: spec() }),
@@ -2907,7 +3060,7 @@ describe('fleet provisioning', () => {
       backend.events.filter((event) => event === 'delete-database'),
     ).toHaveLength(1);
     expect(backend.databaseExists).toBe(true);
-    expect(backend.databaseIdsRead.at(-1)).toBe('database-id');
+    expect(backend.databaseIdsRead.at(-1)).toBe(DATABASE_ID);
     expect(backend.findDatabaseCalls).toBe(findDatabaseCalls);
   });
 
@@ -2928,7 +3081,9 @@ describe('fleet provisioning', () => {
       decommissionDeployment({ backend, store, spec: spec() }),
     ).rejects.toThrow(/resolved with unexpected identity/);
     expect(backend.events).toEqual([]);
-    expect(store.record?.phase).toBe('ready');
+    expect(effectiveLifecyclePhase(store.record as FleetRecord)).toBe(
+      'decommissioning',
+    );
   });
 
   it('rejects database cleanup when the persisted ID has another sentinel owner', async () => {
@@ -3050,7 +3205,7 @@ describe('fleet provisioning', () => {
     ).resolves.toMatchObject({ record: { phase: 'ready' } });
     expect(backend.events).not.toContain('database');
     expect(backend.events).toContain('identity');
-    expect(backend.databaseIdsRead).toContain('database-id');
+    expect(backend.databaseIdsRead).toContain(DATABASE_ID);
   });
 
   it('does not delete a database after an export without integrity evidence', async () => {
@@ -3064,16 +3219,21 @@ describe('fleet provisioning', () => {
       secrets,
     });
     backend.events.length = 0;
-    backend.exportDatabase = async () => ({
-      databaseId: 'database-id',
-      location: backend.exportLocation,
-      sha256: '',
-      size: 0,
+    backend.receiptOutcomes.push({
+      status: 'fulfilled',
+      value: {
+        databaseId: DATABASE_ID,
+        location: backend.exportLocation,
+        sha256: '',
+        size: 0,
+      },
     });
 
     await expect(
       decommissionDeployment({ backend, store, spec: spec() }),
-    ).rejects.toThrow(/durable, non-empty database export/);
+    ).rejects.toThrow(
+      'bounded decommission database export result is malformed',
+    );
     expect(backend.events).not.toContain('delete-database');
   });
 
@@ -3088,17 +3248,24 @@ describe('fleet provisioning', () => {
       secrets,
     });
     backend.events.length = 0;
-    backend.exportDatabase = async () => ({
-      databaseId: 'replacement-database-id',
-      location: backend.exportLocation,
-      sha256: 'a'.repeat(64),
-      size: 42,
+    backend.receiptOutcomes.push({
+      status: 'fulfilled',
+      value: {
+        databaseId: REPLACEMENT_DATABASE_ID,
+        location: backend.exportLocation,
+        sha256: 'a'.repeat(64),
+        size: 42,
+      },
     });
 
     await expect(
       decommissionDeployment({ backend, store, spec: spec() }),
-    ).rejects.toThrow(/unexpected database 'replacement-database-id'/);
-    expect(store.record?.phase).toBe('application-resources-deleted');
+    ).rejects.toThrow(
+      'bounded decommission database export result is malformed',
+    );
+    expect(effectiveLifecyclePhase(store.record as FleetRecord)).toBe(
+      'application-resources-deleted',
+    );
     expect(backend.events).not.toContain('delete-database');
   });
 
@@ -3502,7 +3669,7 @@ describe('fleet provisioning', () => {
       }),
     ).rejects.toThrow(/already being modified/);
     releaseDatabase?.({
-      id: 'database-id',
+      id: DATABASE_ID,
       name: 'acme-production',
       created: true,
     });
@@ -4317,7 +4484,12 @@ describe('fleet provisioning', () => {
     for (let depth = 0; depth < 10; depth += 1) {
       deepToken = { next: deepToken };
     }
+    const transparentAction = new Proxy({ kind: 'start' as const }, {});
+    const revokedAction = Proxy.revocable({ kind: 'start' as const }, {});
+    revokedAction.revoke();
     for (const action of [
+      transparentAction,
+      revokedAction.proxy,
       { kind: 'start', extra: true },
       { kind: 'unknown' },
       { kind: 'continue' },
@@ -4425,6 +4597,7 @@ describe('fleet provisioning', () => {
         generation: intent.generation,
         updatedAt: intent.updatedAt,
         identity: intent.identity,
+        databaseExportReceiptAuthority: RECEIPT_AUTHORITY,
         lifecyclePhase: 'decommissioned',
         state: 'complete',
       },
@@ -4733,31 +4906,35 @@ describe('fleet provisioning', () => {
     ]);
 
     const d1Blocked = await boundedDecommissionHarness();
-    const d1Started = await startBoundedDecommission(d1Blocked);
-    const d1Intent = d1Blocked.store.record?.decommissionIntent;
-    if (!d1Intent) throw new Error('missing D1 blocked intent');
-    d1Blocked.store.record = {
-      ...(d1Blocked.store.record as FleetRecord),
-      decommissionIntent: {
-        ...d1Intent,
-        lifecyclePhase: 'application-resources-deleted',
-        state: 'blocked',
-        purpose: {
-          kind: 'database-pre-export',
-          databaseId: d1Blocked.store.record?.databaseId as string,
-        },
-        attachment: { plane: 'ordinary', scriptName: 'consumer' },
-      },
-    };
+    let d1Current = await driveBoundedUntil(
+      d1Blocked,
+      (record) =>
+        record.decommissionIntent?.lifecyclePhase ===
+          'application-resources-deleted' &&
+        record.decommissionIntent.state === 'transitioning',
+    );
+    d1Current = await continueBoundedDecommission(d1Blocked, d1Current);
+    d1Blocked.backend.scanResults.push({
+      status: 'attached',
+      attachment: { plane: 'ordinary', scriptName: 'consumer' },
+      providerFetchAttemptsReserved: 3,
+    });
+    const d1BlockedResult = await continueBoundedDecommission(
+      d1Blocked,
+      d1Current,
+    );
     await expect(
       advanceDecommissionDeployment(
         boundedAdvanceOptions(d1Blocked, {
           kind: 'restart-blocked',
-          token: d1Started.token,
+          token: d1BlockedResult.token,
         }),
       ),
-    ).rejects.toBeInstanceOf(DecommissionAdvanceRestartError);
-    expect(d1Blocked.backend.scanInputs).toHaveLength(0);
+    ).resolves.toMatchObject({ status: 'pending' });
+    expect(d1Blocked.store.record?.decommissionIntent).toMatchObject({
+      state: 'discover',
+      purpose: { kind: 'database-pre-export' },
+    });
   });
 
   it('rejects hostile provider results before persistence', async () => {
@@ -4899,6 +5076,19 @@ describe('fleet provisioning', () => {
     symbolResult[Symbol('hostile')] = true;
     const cyclicResult: Record<string, unknown> = { status: 'drift' };
     cyclicResult.self = cyclicResult;
+    const transparentResult = new Proxy({ status: 'drift' as const }, {});
+    let revokeResult!: () => void;
+    const revokedResult = Proxy.revocable(
+      { status: 'drift' as const },
+      {
+        ownKeys(target) {
+          const keys = Reflect.ownKeys(target);
+          revokeResult();
+          return keys;
+        },
+      },
+    );
+    revokeResult = revokedResult.revoke;
     const hostileRows = [
       {
         label: 'top-level accessor',
@@ -4911,6 +5101,18 @@ describe('fleet provisioning', () => {
         row: hostileProxy,
         reads: () => proxyTrapCalls,
         expectedReads: 1,
+      },
+      {
+        label: 'transparent proxy',
+        row: transparentResult,
+        reads: () => 0,
+        expectedReads: 0,
+      },
+      {
+        label: 'revoked proxy',
+        row: revokedResult.proxy,
+        reads: () => 0,
+        expectedReads: 0,
       },
       {
         label: 'nested accessor',
@@ -5339,11 +5541,11 @@ describe('fleet provisioning', () => {
       'delete-platform',
     ]);
     expect(platform.backend.databaseIdsRead).toEqual([
-      'database-id',
-      'database-id',
-      'database-id',
-      'database-id',
-      'database-id',
+      DATABASE_ID,
+      DATABASE_ID,
+      DATABASE_ID,
+      DATABASE_ID,
+      DATABASE_ID,
     ]);
     expect(platform.backend.residualCalls).toBe(1);
 
@@ -5576,7 +5778,7 @@ describe('fleet provisioning', () => {
     expect(afterCommit.backend.deleteCalls).toBe(1);
   });
 
-  it('orders two resources without rewind and stops inertly at the D1 boundary', async () => {
+  it('orders two resources without rewind and selects authority at the D1 boundary', async () => {
     const harness = await boundedDecommissionHarness({
       r2Names: ['ARCHIVE', 'FILES'],
     });
@@ -5627,8 +5829,13 @@ describe('fleet provisioning', () => {
     ).toEqual(['deleted', 'deleted']);
     expect(harness.store.record?.decommissionIntent?.generation).toBe(2);
     const scans = harness.backend.scanInputs.length;
-    const inert = await continueBoundedDecommission(harness, result);
-    expect(inert).toEqual(result);
+    const selected = await continueBoundedDecommission(harness, result);
+    expect(selected.token.revision).toBe(result.token.revision + 1);
+    expect(harness.store.record?.decommissionIntent).toMatchObject({
+      state: 'discover',
+      purpose: { kind: 'database-pre-export' },
+      databaseExportReceiptAuthority: RECEIPT_AUTHORITY,
+    });
     expect(harness.backend.scanInputs).toHaveLength(scans);
 
     for (const mode of [
@@ -5792,6 +5999,1590 @@ describe('fleet provisioning', () => {
         expect(hostile.backend.events, `${state}:${mode}`).toEqual(events);
       }
     }
+  });
+
+  it('selects one immutable receipt authority before bounded D1 work', async () => {
+    const startedHarness = await boundedDecommissionHarness();
+    const started = await startBoundedDecommission(startedHarness);
+    expect(startedHarness.store.record?.decommissionIntent).not.toHaveProperty(
+      'databaseExportReceiptAuthority',
+    );
+    expect(startedHarness.backend.receiptCalls).toEqual([]);
+
+    let boundary = started;
+    for (let step = 0; step < 16; step += 1) {
+      if (
+        startedHarness.store.record?.decommissionIntent?.lifecyclePhase ===
+        'application-resources-deleted'
+      ) {
+        break;
+      }
+      boundary = await continueBoundedDecommission(startedHarness, boundary);
+      expect(
+        startedHarness.store.record?.decommissionIntent,
+      ).not.toHaveProperty('databaseExportReceiptAuthority');
+    }
+    const beforeSelection = startedHarness.store.record;
+    const selected = await continueBoundedDecommission(
+      startedHarness,
+      boundary,
+    );
+    expect(startedHarness.store.record).toMatchObject({
+      phase: 'decommission-advancing',
+      decommissionIntent: {
+        revision: (beforeSelection?.decommissionIntent?.revision as number) + 1,
+        generation:
+          (beforeSelection?.decommissionIntent?.generation as number) + 1,
+        databaseExportReceiptAuthority: RECEIPT_AUTHORITY,
+        lifecyclePhase: 'application-resources-deleted',
+        state: 'discover',
+        purpose: { kind: 'database-pre-export', databaseId: DATABASE_ID },
+      },
+    });
+    expect(selected).toMatchObject({ status: 'pending' });
+
+    for (const row of [
+      {
+        label: 'absent pair',
+        authority: undefined,
+        method: undefined,
+        message: 'backend cannot write idempotent database export receipts',
+      },
+      {
+        label: 'authority only',
+        authority: RECEIPT_AUTHORITY,
+        method: undefined,
+        message: 'database export receipt capability is malformed',
+      },
+      {
+        label: 'method only',
+        authority: undefined,
+        method: async () => ({}),
+        message: 'database export receipt capability is malformed',
+      },
+      {
+        label: 'non-callable',
+        authority: RECEIPT_AUTHORITY,
+        method: 1,
+        message: 'database export receipt capability is malformed',
+      },
+      {
+        label: 'empty authority',
+        authority: '',
+        method: async () => ({}),
+        message: 'database export receipt capability is malformed',
+      },
+      {
+        label: 'over-bound authority',
+        authority: 'x'.repeat(4_097),
+        method: async () => ({}),
+        message: 'database export receipt capability is malformed',
+      },
+    ] as const) {
+      const harness = await boundedDecommissionHarness();
+      const backend = new Proxy(harness.backend, {
+        get(target, property) {
+          if (property === 'databaseExportReceiptAuthority') {
+            return row.authority;
+          }
+          if (property === 'exportDatabaseReceipt') return row.method;
+          const value = Reflect.get(target, property, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+      await expect(
+        advanceDecommissionDeployment(
+          boundedAdvanceOptions(harness, { kind: 'start' }, { backend }),
+        ),
+        row.label,
+      ).rejects.toThrow(row.message);
+      expect(
+        harness.store.record?.decommissionIntent,
+        row.label,
+      ).toBeUndefined();
+    }
+
+    const throwing = await boundedDecommissionHarness();
+    const backend = new Proxy(throwing.backend, {
+      get(target, property) {
+        if (property === 'databaseExportReceiptAuthority') {
+          throw new Error('receipt getter trap');
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    await expect(
+      advanceDecommissionDeployment(
+        boundedAdvanceOptions(throwing, { kind: 'start' }, { backend }),
+      ),
+    ).rejects.toThrow('database export receipt capability is malformed');
+
+    const invalidIdentity = await boundedDecommissionHarness();
+    invalidIdentity.backend.databaseId = 'not-a-uuid';
+    invalidIdentity.store.record = {
+      ...(invalidIdentity.store.record as FleetRecord),
+      databaseId: 'not-a-uuid',
+    };
+    await expect(startBoundedDecommission(invalidIdentity)).rejects.toThrow(
+      'database export receipt identity is malformed',
+    );
+    expect(invalidIdentity.store.record?.decommissionIntent).toBeUndefined();
+
+    for (const state of [
+      'reserved',
+      'create-authorized',
+      'created',
+      'detach-authorized',
+      'detached',
+      'empty-authorized',
+      'empty',
+      'delete-authorized',
+    ] as const) {
+      const fenced = await boundedDecommissionHarness({ r2Names: ['FILES'] });
+      const record = fenced.store.record as FleetRecord;
+      fenced.store.record = {
+        ...record,
+        phase: 'application-resources-deleted',
+        applicationResources: record.applicationResources?.map((resource) => ({
+          ...resource,
+          state,
+        })) as FleetRecord['applicationResources'],
+      };
+      let receiptGetterReads = 0;
+      const fencedBackend = new Proxy(fenced.backend, {
+        get(target, property) {
+          if (
+            property === 'databaseExportReceiptAuthority' ||
+            property === 'exportDatabaseReceipt'
+          ) {
+            receiptGetterReads += 1;
+          }
+          const value = Reflect.get(target, property, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+      await expect(
+        advanceDecommissionDeployment(
+          boundedAdvanceOptions(
+            fenced,
+            { kind: 'start' },
+            { backend: fencedBackend },
+          ),
+        ),
+        state,
+      ).rejects.toThrow(
+        'normal decommission D1 work requires every application R2 resource to be deleted',
+      );
+      expect(receiptGetterReads, state).toBe(0);
+      expect(fenced.backend.databaseIdsRead, state).toEqual([]);
+      expect(fenced.store.record?.decommissionIntent, state).toBeUndefined();
+    }
+
+    const changed = new Proxy(startedHarness.backend, {
+      get(target, property) {
+        if (property === 'databaseExportReceiptAuthority') {
+          return 'memory://different-authority/receipts/v1';
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const readsBeforeChangedAuthority =
+      startedHarness.backend.databaseIdsRead.length;
+    await expect(
+      advanceDecommissionDeployment(
+        boundedAdvanceOptions(
+          startedHarness,
+          { kind: 'continue', token: selected.token },
+          { backend: changed },
+        ),
+      ),
+    ).rejects.toThrow(
+      'database export receipt authority differs from configured authority',
+    );
+    expect(startedHarness.backend.databaseIdsRead).toHaveLength(
+      readsBeforeChangedAuthority,
+    );
+
+    for (const mutation of ['backend', 'mapping', 'digest'] as const) {
+      const authority = await boundedDecommissionHarness();
+      let current = await driveBoundedUntil(
+        authority,
+        (record) =>
+          record.decommissionIntent?.lifecyclePhase ===
+            'application-resources-deleted' &&
+          record.decommissionIntent.state === 'transitioning',
+      );
+      current = await continueBoundedDecommission(authority, current);
+      let receiptPropertyReads = 0;
+      const mutatedBackend = new Proxy(authority.backend, {
+        get(target, property) {
+          if (
+            property === 'databaseExportReceiptAuthority' ||
+            property === 'exportDatabaseReceipt'
+          ) {
+            receiptPropertyReads += 1;
+          }
+          if (mutation === 'backend' && property === 'kind') {
+            return 'workers-for-platforms';
+          }
+          const value = Reflect.get(target, property, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+      const mutatedSpec =
+        mutation === 'mapping'
+          ? { ...authority.deployment, databaseName: 'different-database' }
+          : mutation === 'digest'
+            ? {
+                ...authority.deployment,
+                modules: [
+                  {
+                    name: 'worker.js',
+                    content: 'export default { changed: true }',
+                  },
+                ],
+              }
+            : authority.deployment;
+      const databaseReads = authority.backend.databaseIdsRead.length;
+      const scans = authority.backend.scanInputs.length;
+      const residuals = authority.backend.residualCalls;
+      const exports = authority.backend.receiptCalls.length;
+      const deletes = authority.backend.events.filter(
+        (event) => event === 'delete-database',
+      ).length;
+      const writes = authority.store.phases.length;
+      await expect(
+        advanceDecommissionDeployment(
+          boundedAdvanceOptions(
+            authority,
+            { kind: 'continue', token: current.token },
+            { backend: mutatedBackend, spec: mutatedSpec },
+          ),
+        ),
+        mutation,
+      ).rejects.toThrow();
+      expect(receiptPropertyReads, mutation).toBe(0);
+      expect(authority.backend.databaseIdsRead, mutation).toHaveLength(
+        databaseReads,
+      );
+      expect(authority.backend.scanInputs, mutation).toHaveLength(scans);
+      expect(authority.backend.residualCalls, mutation).toBe(residuals);
+      expect(authority.backend.receiptCalls, mutation).toHaveLength(exports);
+      expect(
+        authority.backend.events.filter((event) => event === 'delete-database'),
+        mutation,
+      ).toHaveLength(deletes);
+      expect(authority.store.phases, mutation).toHaveLength(writes);
+    }
+  });
+
+  it('advances pre-export and pre-delete scans without persisting absence authority', async () => {
+    const harness = await boundedDecommissionHarness();
+    let result = await driveBoundedUntil(
+      harness,
+      (record) =>
+        record.decommissionIntent?.lifecyclePhase ===
+          'application-resources-deleted' &&
+        record.decommissionIntent.state === 'transitioning',
+    );
+    result = await continueBoundedDecommission(harness, result);
+    const preExportDiscover = harness.store.record?.decommissionIntent;
+    expect(preExportDiscover).toMatchObject({
+      state: 'discover',
+      purpose: { kind: 'database-pre-export', databaseId: DATABASE_ID },
+      databaseExportReceiptAuthority: RECEIPT_AUTHORITY,
+    });
+    expect(preExportDiscover).not.toHaveProperty('discoverEvidence');
+
+    const signal = AbortSignal.abort(new Error('scan cancelled'));
+    harness.backend.scanResults.push({
+      status: 'pending',
+      progress: (
+        preExportDiscover as Extract<
+          DecommissionAdvanceIntent,
+          { state: 'discover' }
+        >
+      ).progress,
+      providerFetchAttemptsReserved: 3,
+    });
+    result = await advanceDecommissionDeployment(
+      boundedAdvanceOptions(
+        harness,
+        { kind: 'continue', token: result.token },
+        { signal },
+      ),
+    );
+    expect(harness.backend.scanInputs.at(-1)?.signal).toBe(signal);
+    expect(harness.store.record?.decommissionIntent).toMatchObject({
+      state: 'discover',
+      purpose: { kind: 'database-pre-export' },
+    });
+    expect(harness.store.record?.decommissionIntent).not.toHaveProperty(
+      'discoverEvidence',
+    );
+
+    result = await continueBoundedDecommission(harness, result);
+    expect(harness.store.record?.decommissionIntent).toMatchObject({
+      state: 'verify',
+      purpose: { kind: 'database-pre-export' },
+      discoverEvidence: { evidenceSha256: 'a'.repeat(64), evidenceCount: 2 },
+    });
+    result = await continueBoundedDecommission(harness, result);
+    result = await continueBoundedDecommission(harness, result);
+    expect(harness.store.record?.decommissionIntent).toMatchObject({
+      state: 'discover',
+      purpose: {
+        kind: 'database-pre-delete',
+        databaseId: DATABASE_ID,
+        exportLocation: expect.any(String),
+        exportSha256: 'a'.repeat(64),
+        exportSize: 42,
+      },
+    });
+    expect(harness.store.record?.decommissionIntent).not.toHaveProperty(
+      'discoverEvidence',
+    );
+    result = await continueBoundedDecommission(harness, result);
+    expect(harness.store.record?.decommissionIntent).toMatchObject({
+      state: 'verify',
+      purpose: { kind: 'database-pre-delete' },
+    });
+    expect(result.status).toBe('pending');
+  });
+
+  it('blocks D1 teardown on attachments drift and independent evidence mismatch', async () => {
+    const drift = await boundedDecommissionHarness();
+    let driftResult = await driveBoundedUntil(
+      drift,
+      (record) =>
+        record.decommissionIntent?.lifecyclePhase ===
+          'application-resources-deleted' &&
+        record.decommissionIntent.state === 'transitioning',
+    );
+    driftResult = await continueBoundedDecommission(drift, driftResult);
+    const driftGeneration = drift.store.record?.decommissionIntent?.generation;
+    drift.backend.scanResults.push({ status: 'drift' });
+    driftResult = await continueBoundedDecommission(drift, driftResult);
+    expect(drift.store.record?.decommissionIntent).toMatchObject({
+      state: 'discover',
+      generation: (driftGeneration as number) + 1,
+      purpose: { kind: 'database-pre-export' },
+    });
+    expect(driftResult.status).toBe('pending');
+
+    for (const mismatch of [
+      { evidenceSha256: 'b'.repeat(64), evidenceCount: 2 },
+      { evidenceSha256: 'a'.repeat(64), evidenceCount: 3 },
+    ]) {
+      const harness = await boundedDecommissionHarness();
+      const verify = await driveToPreExportVerify(harness);
+      const generation = harness.store.record?.decommissionIntent?.generation;
+      harness.backend.scanResults.push({
+        status: 'complete',
+        ...mismatch,
+        providerFetchAttemptsReserved: 3,
+      });
+      await continueBoundedDecommission(harness, verify);
+      expect(harness.store.record?.decommissionIntent).toMatchObject({
+        state: 'discover',
+        generation: (generation as number) + 1,
+        purpose: { kind: 'database-pre-export' },
+      });
+      expect(harness.backend.receiptCalls).toEqual([]);
+    }
+
+    for (const attachment of [
+      { plane: 'ordinary' as const, scriptName: 'foreign-worker' },
+      {
+        plane: 'dispatch' as const,
+        scriptName: 'foreign-dispatch',
+        dispatchNamespace: 'fleet',
+      },
+    ]) {
+      const harness = await boundedDecommissionHarness();
+      let result = await driveBoundedUntil(
+        harness,
+        (record) =>
+          record.decommissionIntent?.lifecyclePhase ===
+            'application-resources-deleted' &&
+          record.decommissionIntent.state === 'transitioning',
+      );
+      result = await continueBoundedDecommission(harness, result);
+      harness.backend.scanResults.push({
+        status: 'attached',
+        attachment,
+        providerFetchAttemptsReserved: 3,
+      });
+      result = await continueBoundedDecommission(harness, result);
+      expect(result).toMatchObject({
+        status: 'blocked',
+        purpose: { kind: 'database-pre-export' },
+        attachment,
+      });
+      const scans = harness.backend.scanInputs.length;
+      const writes = harness.store.phases.length;
+      const inert = await continueBoundedDecommission(harness, result);
+      expect(inert).toEqual(result);
+      expect(harness.backend.scanInputs).toHaveLength(scans);
+      expect(harness.store.phases).toHaveLength(writes);
+      const restarted = await advanceDecommissionDeployment(
+        boundedAdvanceOptions(harness, {
+          kind: 'restart-blocked',
+          token: result.token,
+        }),
+      );
+      expect(restarted).toMatchObject({ status: 'pending' });
+      expect(harness.store.record?.decommissionIntent).toMatchObject({
+        state: 'discover',
+        purpose: { kind: 'database-pre-export' },
+      });
+    }
+  });
+
+  it('consumes matching pre-export verification through residuals and one stable receipt', async () => {
+    const harness = await boundedDecommissionHarness();
+    const verify = await driveToPreExportVerify(harness);
+    const residualsBeforeExport = harness.backend.residualCalls;
+    harness.backend.receiptOutcomes.push({
+      status: 'fulfilled',
+      value: {
+        databaseId: DATABASE_ID,
+        location: 'memory://receipt/export.sql',
+        sha256: 'a'.repeat(64),
+        size: 42,
+        secret: 'must-not-persist',
+      },
+    });
+    await continueBoundedDecommission(harness, verify);
+    expect(harness.backend.residualCalls).toBe(residualsBeforeExport + 1);
+    expect(harness.backend.receiptCalls).toEqual([
+      {
+        version: 1,
+        authority: RECEIPT_AUTHORITY,
+        databaseId: DATABASE_ID,
+        operationId: DECOMMISSION_OPERATION_ID,
+      },
+    ]);
+    expect(harness.store.record).toMatchObject({
+      databaseExportLocation: 'memory://receipt/export.sql',
+      databaseExportSha256: 'a'.repeat(64),
+      databaseExportSize: 42,
+      decommissionIntent: {
+        lifecyclePhase: 'database-exported',
+        state: 'transitioning',
+        databaseExportReceiptAuthority: RECEIPT_AUTHORITY,
+      },
+    });
+    expect(JSON.stringify(harness.store.record)).not.toContain(
+      'must-not-persist',
+    );
+
+    const residual = await boundedDecommissionHarness();
+    const residualVerify = await driveToPreExportVerify(residual);
+    const residualFailure = new Error('residual check failed');
+    residual.backend.assertDatabaseDeletionResidualsRemoved = async () => {
+      throw residualFailure;
+    };
+    await expect(
+      continueBoundedDecommission(residual, residualVerify),
+    ).rejects.toBe(residualFailure);
+    expect(residual.backend.receiptCalls).toEqual([]);
+    expect(residual.store.record?.decommissionIntent?.state).toBe('verify');
+
+    const lease = await boundedDecommissionHarness();
+    const leaseVerify = await driveToPreExportVerify(lease);
+    const exportOrder: string[] = [];
+    lease.backend.assertDatabaseDeletionResidualsRemoved = async () => {
+      lease.backend.residualCalls += 1;
+      exportOrder.push('residual');
+    };
+    lease.store.assertOwnedCalls = 0;
+    lease.store.assertOwnedFailureAt = 1;
+    lease.store.assertOwnedObserved = () => exportOrder.push('fence');
+    const leaseWrites = lease.store.phases.length;
+    await expect(
+      continueBoundedDecommission(lease, leaseVerify),
+    ).rejects.toThrow('lease assertion 1 failed');
+    expect(exportOrder).toEqual(['residual', 'fence']);
+    expect(lease.backend.receiptCalls).toEqual([]);
+    expect(lease.store.phases).toHaveLength(leaseWrites);
+    expect(lease.store.record?.decommissionIntent?.state).toBe('verify');
+
+    const preScanIdentity = await boundedDecommissionHarness();
+    const preScanVerify = await driveToPreExportVerify(preScanIdentity);
+    preScanIdentity.backend.databaseName = 'unexpected-name';
+    const preScanCount = preScanIdentity.backend.scanInputs.length;
+    await expect(
+      continueBoundedDecommission(preScanIdentity, preScanVerify),
+    ).rejects.toThrow('resolved with unexpected identity');
+    expect(preScanIdentity.backend.scanInputs).toHaveLength(preScanCount);
+    expect(preScanIdentity.backend.receiptCalls).toEqual([]);
+
+    const postScanIdentity = await boundedDecommissionHarness();
+    const postScanVerify = await driveToPreExportVerify(postScanIdentity);
+    postScanIdentity.backend.scanAfter = () => {
+      postScanIdentity.backend.databaseName = 'changed-after-scan';
+    };
+    await expect(
+      continueBoundedDecommission(postScanIdentity, postScanVerify),
+    ).rejects.toThrow('resolved with unexpected identity');
+    expect(postScanIdentity.backend.receiptCalls).toEqual([]);
+
+    const malformedReference = await boundedDecommissionHarness();
+    const malformedReferenceVerify =
+      await driveToPreExportVerify(malformedReference);
+    malformedReference.backend.databaseReadOutcomes.push({
+      status: 'fulfilled',
+      value: new Proxy(
+        { id: DATABASE_ID, name: 'acme-production', created: false },
+        {},
+      ),
+    });
+    await expect(
+      continueBoundedDecommission(malformedReference, malformedReferenceVerify),
+    ).rejects.toThrow('persisted database reference is malformed');
+
+    const malformedOwner = await boundedDecommissionHarness();
+    const malformedOwnerVerify = await driveToPreExportVerify(malformedOwner);
+    malformedOwner.backend.databaseOwner = false;
+    await expect(
+      continueBoundedDecommission(malformedOwner, malformedOwnerVerify),
+    ).rejects.toThrow('persisted database owner is malformed');
+    expect(malformedOwner.backend.receiptCalls).toEqual([]);
+
+    const exactReferenceText = 'é'.repeat(2_048);
+    const exactOwnerText = 'é'.repeat(2_048);
+    expect(exactReferenceText).toHaveLength(2_048);
+    expect(new TextEncoder().encode(exactReferenceText)).toHaveLength(4_096);
+    expect(exactOwnerText).toHaveLength(2_048);
+    expect(new TextEncoder().encode(exactOwnerText)).toHaveLength(4_096);
+    const exactReferenceBackend = new FakeBackend();
+    exactReferenceBackend.getDatabase = async () => ({
+      id: exactReferenceText,
+      name: exactReferenceText,
+      created: false,
+    });
+    exactReferenceBackend.databaseOwner = exactOwnerText;
+    await expect(
+      reconcilePersistedDatabase(
+        exactReferenceBackend,
+        {
+          databaseId: exactReferenceText,
+          databaseName: exactReferenceText,
+          tenantTag: exactOwnerText,
+        },
+        false,
+        {
+          mutationLeaseTtlMs: 1_000,
+          assertOwned: async () => {},
+        },
+        true,
+      ),
+    ).resolves.toEqual({
+      id: exactReferenceText,
+      name: exactReferenceText,
+      created: false,
+    });
+
+    const multibyteOverBound = `${'é'.repeat(2_048)}x`;
+    expect(multibyteOverBound).toHaveLength(2_049);
+    expect(new TextEncoder().encode(multibyteOverBound)).toHaveLength(4_097);
+    const overReferenceBackend = new FakeBackend();
+    overReferenceBackend.getDatabase = async () => ({
+      id: multibyteOverBound,
+      name: 'database',
+      created: false,
+    });
+    await expect(
+      reconcilePersistedDatabase(
+        overReferenceBackend,
+        {
+          databaseId: multibyteOverBound,
+          databaseName: 'database',
+          tenantTag: 'acme',
+        },
+        false,
+        {
+          mutationLeaseTtlMs: 1_000,
+          assertOwned: async () => {},
+        },
+        true,
+      ),
+    ).rejects.toThrow('persisted database reference is malformed');
+    expect(overReferenceBackend.receiptCalls).toEqual([]);
+
+    const overOwnerBackend = new FakeBackend();
+    overOwnerBackend.databaseExists = true;
+    overOwnerBackend.databaseOwner = multibyteOverBound;
+    await expect(
+      reconcilePersistedDatabase(
+        overOwnerBackend,
+        {
+          databaseId: DATABASE_ID,
+          databaseName: 'acme-production',
+          tenantTag: multibyteOverBound,
+        },
+        false,
+        {
+          mutationLeaseTtlMs: 1_000,
+          assertOwned: async () => {},
+        },
+        true,
+      ),
+    ).rejects.toThrow('persisted database owner is malformed');
+    expect(overOwnerBackend.receiptCalls).toEqual([]);
+
+    const dishonestResults: readonly unknown[] = [
+      {
+        databaseId: REPLACEMENT_DATABASE_ID,
+        location: 'memory://receipt/export.sql',
+        sha256: 'a'.repeat(64),
+        size: 42,
+      },
+      {
+        databaseId: DATABASE_ID,
+        location: '',
+        sha256: 'a'.repeat(64),
+        size: 42,
+      },
+      {
+        databaseId: DATABASE_ID,
+        location: 'memory://receipt/export.sql',
+        sha256: 'A'.repeat(64),
+        size: 42,
+      },
+      {
+        databaseId: DATABASE_ID,
+        location: 'memory://receipt/export.sql',
+        sha256: 'a'.repeat(64),
+        size: 0,
+      },
+      new Proxy(
+        {
+          databaseId: DATABASE_ID,
+          location: 'memory://receipt/export.sql',
+          sha256: 'a'.repeat(64),
+          size: 42,
+        },
+        {},
+      ),
+      Object.defineProperty(
+        {
+          databaseId: DATABASE_ID,
+          location: 'memory://receipt/export.sql',
+          sha256: 'a'.repeat(64),
+        },
+        'size',
+        { enumerable: true, get: () => 42 },
+      ),
+      new (class PrototypeDatabaseExport {
+        readonly databaseId = DATABASE_ID;
+        readonly location = 'memory://receipt/export.sql';
+        readonly sha256 = 'a'.repeat(64);
+        readonly size = 42;
+      })(),
+    ];
+    for (const dishonest of dishonestResults) {
+      const candidate = await boundedDecommissionHarness();
+      const candidateVerify = await driveToPreExportVerify(candidate);
+      candidate.backend.receiptOutcomes.push({
+        status: 'fulfilled',
+        value: dishonest,
+      });
+      await expect(
+        continueBoundedDecommission(candidate, candidateVerify),
+      ).rejects.toThrow(
+        'bounded decommission database export result is malformed',
+      );
+      expect(candidate.store.record?.decommissionIntent?.state).toBe('verify');
+    }
+  });
+
+  it('converges receipt commits and database-exported writes without a second artifact', async () => {
+    const receiptLoss = await boundedDecommissionHarness();
+    let verify = await driveToPreExportVerify(receiptLoss);
+    const receiptFailure = new Error('receipt response lost after commit');
+    receiptLoss.backend.receiptOutcomes.push({
+      status: 'rejected',
+      reason: receiptFailure,
+      commit: true,
+    });
+    await expect(continueBoundedDecommission(receiptLoss, verify)).rejects.toBe(
+      receiptFailure,
+    );
+    expect(receiptLoss.store.record?.decommissionIntent?.state).toBe('verify');
+    expect(receiptLoss.backend.receiptWinners.size).toBe(1);
+    verify = {
+      status: 'pending',
+      token: verify.token,
+    };
+    await continueBoundedDecommission(receiptLoss, verify);
+    expect(receiptLoss.backend.receiptWinners.size).toBe(1);
+    expect(receiptLoss.backend.receiptCalls).toHaveLength(2);
+    expect(receiptLoss.backend.receiptCalls[1]).toEqual(
+      receiptLoss.backend.receiptCalls[0],
+    );
+
+    const precommit = await boundedDecommissionHarness();
+    const precommitVerify = await driveToPreExportVerify(precommit);
+    precommit.store.failPutPhase = 'database-exported';
+    await expect(
+      continueBoundedDecommission(precommit, precommitVerify),
+    ).rejects.toThrow('failed state write at database-exported');
+    expect(precommit.store.record?.decommissionIntent?.state).toBe('verify');
+    expect(precommit.backend.receiptWinners.size).toBe(1);
+    await continueBoundedDecommission(precommit, precommitVerify);
+    expect(precommit.backend.receiptWinners.size).toBe(1);
+    expect(precommit.backend.receiptCalls).toHaveLength(2);
+
+    const committedStore = new CommitThenThrowStore();
+    const committed = await boundedDecommissionHarness({
+      store: committedStore,
+    });
+    const committedVerify = await driveToPreExportVerify(committed);
+    committedStore.failAfterCommittedPhase = 'database-exported';
+    await expect(
+      continueBoundedDecommission(committed, committedVerify),
+    ).rejects.toThrow('committing database-exported');
+    expect(committed.store.record?.decommissionIntent).toMatchObject({
+      lifecyclePhase: 'database-exported',
+      state: 'transitioning',
+    });
+    const receiptCalls = committed.backend.receiptCalls.length;
+    const stale = await continueBoundedDecommission(committed, committedVerify);
+    expect(stale.token).toEqual(
+      expect.objectContaining({
+        revision: committed.store.record?.decommissionIntent?.revision,
+      }),
+    );
+    expect(committed.backend.receiptCalls).toHaveLength(receiptCalls);
+
+    for (const Store of [MemoryStore, CommitThenThrowStore] as const) {
+      const store = new Store();
+      const selection = await boundedDecommissionHarness({ store });
+      const atBoundary = await driveBoundedUntil(
+        selection,
+        (record) =>
+          record.decommissionIntent?.lifecyclePhase ===
+            'application-resources-deleted' &&
+          record.decommissionIntent.state === 'transitioning',
+      );
+      if (store instanceof CommitThenThrowStore) {
+        store.failAfterCommittedPhase = 'application-resources-deleted';
+      } else {
+        store.failPutPhase = 'application-resources-deleted';
+      }
+      await expect(
+        continueBoundedDecommission(selection, atBoundary),
+      ).rejects.toThrow(/application-resources-deleted/u);
+      if (store instanceof CommitThenThrowStore) {
+        expect(store.record?.decommissionIntent).toMatchObject({
+          state: 'discover',
+          databaseExportReceiptAuthority: RECEIPT_AUTHORITY,
+        });
+      } else {
+        expect(store.record?.decommissionIntent).toMatchObject({
+          state: 'transitioning',
+        });
+        expect(store.record?.decommissionIntent).not.toHaveProperty(
+          'databaseExportReceiptAuthority',
+        );
+      }
+    }
+  });
+
+  it('consumes matching pre-delete verification and reconciles delete loss', async () => {
+    const liveReference = {
+      id: DATABASE_ID,
+      name: 'acme-production',
+      created: false as const,
+    };
+    const deletePresentFailure = new Error('delete failed before commit');
+    const readbackFailure = new Error('readback unavailable');
+    const losingDeleteFailure = new Error('delete rejection must lose');
+    const winningReadbackFailure = new Error('readback rejection wins');
+    const rows: readonly Readonly<{
+      label: string;
+      deletion: BoxedOutcome<void>;
+      readback: BoxedOutcome<unknown>;
+      expected?: unknown;
+    }>[] = [
+      {
+        label: 'fulfill absent',
+        deletion: { status: 'fulfilled', value: undefined, commit: true },
+        readback: { status: 'fulfilled', value: undefined },
+      },
+      {
+        label: 'reject absent',
+        deletion: {
+          status: 'rejected',
+          reason: new Error('delete response lost'),
+          commit: true,
+        },
+        readback: { status: 'fulfilled', value: undefined },
+      },
+      {
+        label: 'reject present',
+        deletion: {
+          status: 'rejected',
+          reason: deletePresentFailure,
+        },
+        readback: { status: 'fulfilled', value: liveReference },
+        expected: deletePresentFailure,
+      },
+      {
+        label: 'fulfill present',
+        deletion: { status: 'fulfilled', value: undefined },
+        readback: { status: 'fulfilled', value: liveReference },
+        expected: `database '${DATABASE_ID}' remains after deletion`,
+      },
+      {
+        label: 'readback rejects',
+        deletion: { status: 'fulfilled', value: undefined, commit: true },
+        readback: {
+          status: 'rejected',
+          reason: readbackFailure,
+        },
+        expected: readbackFailure,
+      },
+      {
+        label: 'delete and readback reject',
+        deletion: {
+          status: 'rejected',
+          reason: losingDeleteFailure,
+        },
+        readback: {
+          status: 'rejected',
+          reason: winningReadbackFailure,
+        },
+        expected: winningReadbackFailure,
+      },
+    ];
+    for (const row of rows) {
+      const harness = await boundedDecommissionHarness();
+      const verify = await driveToPreDeleteVerify(harness);
+      harness.backend.deleteOutcomes.push(row.deletion);
+      harness.backend.databaseReadOutcomes.push(
+        { status: 'fulfilled', value: liveReference },
+        { status: 'fulfilled', value: liveReference },
+        row.readback,
+      );
+      const operation = continueBoundedDecommission(harness, verify);
+      if (row.expected === undefined) {
+        await expect(operation, row.label).resolves.toMatchObject({
+          status: 'pending',
+        });
+      } else if (row.expected instanceof Error) {
+        const [settled] = await Promise.allSettled([operation]);
+        expect(settled.status, row.label).toBe('rejected');
+        if (settled.status === 'rejected') {
+          expect(settled.reason, row.label).toBe(row.expected);
+        }
+      } else {
+        await expect(operation, row.label).rejects.toThrow(
+          String(row.expected),
+        );
+      }
+      expect(harness.store.record?.decommissionIntent, row.label).toMatchObject(
+        {
+          lifecyclePhase: 'database-deleting',
+          state: 'transitioning',
+        },
+      );
+      expect(
+        harness.backend.events.filter((event) => event === 'delete-database'),
+        row.label,
+      ).toHaveLength(1);
+    }
+
+    for (const reason of [null, undefined]) {
+      const harness = await boundedDecommissionHarness();
+      const verify = await driveToPreDeleteVerify(harness);
+      harness.backend.deleteOutcomes.push({
+        status: 'rejected',
+        reason: new Error('delete rejection must lose'),
+      });
+      harness.backend.databaseReadOutcomes.push(
+        { status: 'fulfilled', value: liveReference },
+        { status: 'fulfilled', value: liveReference },
+        { status: 'rejected', reason },
+      );
+      const [settled] = await Promise.allSettled([
+        continueBoundedDecommission(harness, verify),
+      ]);
+      expect(settled).toEqual({ status: 'rejected', reason });
+    }
+
+    let hostileReadbackFields = 0;
+    const hostilePresent = new Proxy(
+      {},
+      {
+        get(_target, property) {
+          if (property === 'then') return undefined;
+          hostileReadbackFields += 1;
+          throw new Error('existence-only readback inspected a field');
+        },
+        getOwnPropertyDescriptor() {
+          hostileReadbackFields += 1;
+          throw new Error('existence-only readback inspected a descriptor');
+        },
+        ownKeys() {
+          hostileReadbackFields += 1;
+          throw new Error('existence-only readback enumerated fields');
+        },
+      },
+    );
+    const hostileReadback = await boundedDecommissionHarness();
+    const hostileVerify = await driveToPreDeleteVerify(hostileReadback);
+    hostileReadback.backend.deleteOutcomes.push({
+      status: 'fulfilled',
+      value: undefined,
+    });
+    hostileReadback.backend.databaseReadOutcomes.push(
+      { status: 'fulfilled', value: liveReference },
+      { status: 'fulfilled', value: liveReference },
+      { status: 'fulfilled', value: hostilePresent },
+    );
+    await expect(
+      continueBoundedDecommission(hostileReadback, hostileVerify),
+    ).rejects.toThrow(`database '${DATABASE_ID}' remains after deletion`);
+    expect(hostileReadbackFields).toBe(0);
+
+    const barrier = await boundedDecommissionHarness();
+    const barrierVerify = await driveToPreDeleteVerify(barrier);
+    barrier.store.failPutPhase = 'database-deleting';
+    await expect(
+      continueBoundedDecommission(barrier, barrierVerify),
+    ).rejects.toThrow('failed state write at database-deleting');
+    expect(barrier.backend.events).not.toContain('delete-database');
+
+    const committedBarrierStore = new CommitThenThrowStore();
+    const committedBarrier = await boundedDecommissionHarness({
+      store: committedBarrierStore,
+    });
+    const committedBarrierVerify =
+      await driveToPreDeleteVerify(committedBarrier);
+    const deletesBeforeBarrier = committedBarrier.backend.events.filter(
+      (event) => event === 'delete-database',
+    ).length;
+    committedBarrierStore.failAfterCommittedPhase = 'database-deleting';
+    await expect(
+      continueBoundedDecommission(committedBarrier, committedBarrierVerify),
+    ).rejects.toThrow('committing database-deleting');
+    expect(committedBarrier.store.record?.decommissionIntent).toMatchObject({
+      lifecyclePhase: 'database-deleting',
+      state: 'transitioning',
+    });
+    expect(
+      committedBarrier.backend.events.filter(
+        (event) => event === 'delete-database',
+      ),
+    ).toHaveLength(deletesBeforeBarrier);
+    let retry = await continueBoundedDecommission(
+      committedBarrier,
+      committedBarrierVerify,
+    );
+    for (let index = 0; index < 8 && retry.status !== 'complete'; index += 1) {
+      retry = await continueBoundedDecommission(committedBarrier, retry);
+    }
+    expect(retry.status).toBe('complete');
+    expect(
+      committedBarrier.backend.events.filter(
+        (event) => event === 'delete-database',
+      ),
+    ).toHaveLength(deletesBeforeBarrier + 1);
+
+    for (const ordinal of [1, 2, 3]) {
+      const harness = await boundedDecommissionHarness();
+      const verify = await driveToPreDeleteVerify(harness);
+      harness.store.assertOwnedCalls = 0;
+      harness.store.assertOwnedFailureAt = ordinal;
+      const databaseReads = harness.backend.databaseIdsRead.length;
+      await expect(
+        continueBoundedDecommission(harness, verify),
+      ).rejects.toThrow(`lease assertion ${ordinal} failed`);
+      expect(harness.store.record?.decommissionIntent).toMatchObject({
+        lifecyclePhase: 'database-deleting',
+        state: 'transitioning',
+      });
+      expect(
+        harness.backend.events.filter((event) => event === 'delete-database'),
+      ).toHaveLength(ordinal === 1 ? 0 : 1);
+      expect(harness.backend.databaseIdsRead.length - databaseReads).toBe(
+        ordinal === 3 ? 3 : 2,
+      );
+    }
+  });
+
+  it('recovers terminal writes and keeps token classifications authoritative', async () => {
+    const terminal = await boundedDecommissionHarness();
+    let result = await driveToPreDeleteVerify(terminal);
+    result = await continueBoundedDecommission(terminal, result);
+    expect(terminal.store.record?.decommissionIntent).toMatchObject({
+      lifecyclePhase: 'database-deleting',
+      state: 'transitioning',
+    });
+    expect(terminal.backend.databaseExists).toBe(false);
+    const barrierToken = result.token;
+    result = await continueBoundedDecommission(terminal, result);
+    expect(result).toMatchObject({
+      status: 'complete',
+      result: {
+        record: {
+          phase: 'decommissioned',
+          decommissionIntent: {
+            lifecyclePhase: 'decommissioned',
+            state: 'complete',
+            databaseExportReceiptAuthority: RECEIPT_AUTHORITY,
+          },
+        },
+      },
+    });
+    const completeToken = result.token;
+
+    let terminalReceiptGetterReads = 0;
+    const capabilityTrap = new Proxy(terminal.backend, {
+      get(target, property) {
+        if (
+          property === 'databaseExportReceiptAuthority' ||
+          property === 'exportDatabaseReceipt'
+        ) {
+          terminalReceiptGetterReads += 1;
+          throw new Error('complete read touched receipt capability');
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    await expect(
+      advanceDecommissionDeployment(
+        boundedAdvanceOptions(
+          terminal,
+          { kind: 'start' },
+          {
+            backend: capabilityTrap,
+          },
+        ),
+      ),
+    ).resolves.toMatchObject({ status: 'complete', token: completeToken });
+    await expect(
+      advanceDecommissionDeployment(
+        boundedAdvanceOptions(
+          terminal,
+          { kind: 'continue', token: barrierToken },
+          { backend: capabilityTrap },
+        ),
+      ),
+    ).resolves.toMatchObject({ status: 'complete', token: completeToken });
+    const terminalEvents = terminal.backend.events.length;
+    const terminalDatabaseReads = terminal.backend.databaseIdsRead.length;
+    const terminalScans = terminal.backend.scanInputs.length;
+    const terminalResiduals = terminal.backend.residualCalls;
+    const terminalExports = terminal.backend.receiptCalls.length;
+    const terminalWrites = terminal.store.phases.length;
+    await expect(
+      advanceDecommissionDeployment(
+        boundedAdvanceOptions(
+          terminal,
+          { kind: 'continue', token: completeToken },
+          { backend: capabilityTrap },
+        ),
+      ),
+    ).resolves.toMatchObject({ status: 'complete', token: completeToken });
+    expect(terminal.backend.events).toHaveLength(terminalEvents);
+    expect(terminal.backend.databaseIdsRead).toHaveLength(
+      terminalDatabaseReads,
+    );
+    expect(terminal.backend.scanInputs).toHaveLength(terminalScans);
+    expect(terminal.backend.residualCalls).toBe(terminalResiduals);
+    expect(terminal.backend.receiptCalls).toHaveLength(terminalExports);
+    expect(terminal.store.phases).toHaveLength(terminalWrites);
+
+    const leasesBeforeMalformedToken = terminal.store.leaseCalls;
+    await expect(
+      advanceDecommissionDeployment(
+        boundedAdvanceOptions(
+          terminal,
+          {
+            kind: 'continue',
+            token: { ...completeToken, revision: -1 },
+          },
+          { backend: capabilityTrap },
+        ),
+      ),
+    ).rejects.toThrow('decommission advance token is malformed');
+    expect(terminal.store.leaseCalls).toBe(leasesBeforeMalformedToken);
+    expect(terminal.backend.events).toHaveLength(terminalEvents);
+    expect(terminal.backend.databaseIdsRead).toHaveLength(
+      terminalDatabaseReads,
+    );
+    expect(terminal.backend.scanInputs).toHaveLength(terminalScans);
+    expect(terminal.backend.residualCalls).toBe(terminalResiduals);
+    expect(terminal.backend.receiptCalls).toHaveLength(terminalExports);
+    expect(terminal.store.phases).toHaveLength(terminalWrites);
+    for (const row of [
+      {
+        action: { kind: 'continue', token: completeToken, extra: true },
+        message: 'decommission advance action is malformed',
+      },
+      {
+        action: {
+          kind: 'continue',
+          token: { ...completeToken, tenantTag: 'other' },
+        },
+        message: 'decommission advance token targets another deployment',
+      },
+      {
+        action: {
+          kind: 'continue',
+          token: { ...completeToken, operationId: crypto.randomUUID() },
+        },
+        message: 'decommission advance token targets another operation',
+      },
+      {
+        action: {
+          kind: 'continue',
+          token: { ...completeToken, revision: completeToken.revision + 1 },
+        },
+        message: 'decommission advance token is from the future',
+      },
+    ] as const) {
+      await expect(
+        advanceDecommissionDeployment(
+          boundedAdvanceOptions(
+            terminal,
+            row.action as AdvanceDecommissionDeploymentOptions['action'],
+            { backend: capabilityTrap },
+          ),
+        ),
+      ).rejects.toThrow(row.message);
+    }
+    expect(terminalReceiptGetterReads).toBe(0);
+
+    const precommit = await boundedDecommissionHarness();
+    let precommitResult = await driveToPreDeleteVerify(precommit);
+    precommitResult = await continueBoundedDecommission(
+      precommit,
+      precommitResult,
+    );
+    precommit.store.failPutPhase = 'decommissioned';
+    await expect(
+      continueBoundedDecommission(precommit, precommitResult),
+    ).rejects.toThrow('failed state write at decommissioned');
+    expect(precommit.store.record?.decommissionIntent).toMatchObject({
+      lifecyclePhase: 'database-deleting',
+      state: 'transitioning',
+    });
+    await expect(
+      continueBoundedDecommission(precommit, precommitResult),
+    ).resolves.toMatchObject({ status: 'complete' });
+
+    const committedStore = new CommitThenThrowStore();
+    const committed = await boundedDecommissionHarness({
+      store: committedStore,
+    });
+    let committedResult = await driveToPreDeleteVerify(committed);
+    committedResult = await continueBoundedDecommission(
+      committed,
+      committedResult,
+    );
+    committedStore.failAfterCommittedPhase = 'decommissioned';
+    await expect(
+      continueBoundedDecommission(committed, committedResult),
+    ).rejects.toThrow('committing decommissioned');
+    expect(committed.store.record?.decommissionIntent?.state).toBe('complete');
+    await expect(
+      continueBoundedDecommission(committed, committedResult),
+    ).resolves.toMatchObject({ status: 'complete' });
+
+    for (const malformed of [null, false, 0, '']) {
+      const candidate = await boundedDecommissionHarness();
+      let candidateResult = await driveToPreDeleteVerify(candidate);
+      candidateResult = await continueBoundedDecommission(
+        candidate,
+        candidateResult,
+      );
+      candidate.backend.databaseExists = true;
+      candidate.backend.databaseReadOutcomes.push({
+        status: 'fulfilled',
+        value: malformed,
+      });
+      await expect(
+        continueBoundedDecommission(candidate, candidateResult),
+      ).rejects.toThrow('persisted database reference is malformed');
+      expect(candidate.store.record?.decommissionIntent?.state).toBe(
+        'transitioning',
+      );
+    }
+
+    for (const terminalState of ['discover', 'verify'] as const) {
+      const candidate = await boundedDecommissionHarness();
+      let candidateResult = await driveToPreDeleteVerify(candidate);
+      candidateResult = await continueBoundedDecommission(
+        candidate,
+        candidateResult,
+      );
+      candidate.backend.databaseExists = true;
+      candidateResult = await continueBoundedDecommission(
+        candidate,
+        candidateResult,
+      );
+      expect(candidate.store.record?.decommissionIntent).toMatchObject({
+        lifecyclePhase: 'database-deleting',
+        state: 'discover',
+      });
+      if (terminalState === 'verify') {
+        candidateResult = await continueBoundedDecommission(
+          candidate,
+          candidateResult,
+        );
+        expect(candidate.store.record?.decommissionIntent?.state).toBe(
+          'verify',
+        );
+      }
+      candidate.backend.databaseExists = false;
+      const scans = candidate.backend.scanInputs.length;
+      const residuals = candidate.backend.residualCalls;
+      const deletes = candidate.backend.events.filter(
+        (event) => event === 'delete-database',
+      ).length;
+      await expect(
+        continueBoundedDecommission(candidate, candidateResult),
+      ).resolves.toMatchObject({ status: 'complete' });
+      expect(candidate.backend.scanInputs).toHaveLength(scans);
+      expect(candidate.backend.residualCalls).toBe(residuals);
+      expect(
+        candidate.backend.events.filter((event) => event === 'delete-database'),
+      ).toHaveLength(deletes);
+    }
+
+    const secondReconciliation = await boundedDecommissionHarness();
+    let secondResult = await driveToPreDeleteVerify(secondReconciliation);
+    secondResult = await continueBoundedDecommission(
+      secondReconciliation,
+      secondResult,
+    );
+    secondReconciliation.backend.databaseExists = true;
+    secondResult = await continueBoundedDecommission(
+      secondReconciliation,
+      secondResult,
+    );
+    secondResult = await continueBoundedDecommission(
+      secondReconciliation,
+      secondResult,
+    );
+    const scans = secondReconciliation.backend.scanInputs.length;
+    const residuals = secondReconciliation.backend.residualCalls;
+    const deletes = secondReconciliation.backend.events.filter(
+      (event) => event === 'delete-database',
+    ).length;
+    secondReconciliation.backend.databaseReadOutcomes.push(
+      {
+        status: 'fulfilled',
+        value: {
+          id: DATABASE_ID,
+          name: 'acme-production',
+          created: false,
+        },
+      },
+      { status: 'fulfilled', value: undefined },
+    );
+    await expect(
+      continueBoundedDecommission(secondReconciliation, secondResult),
+    ).resolves.toMatchObject({ status: 'complete' });
+    expect(secondReconciliation.backend.scanInputs).toHaveLength(scans + 1);
+    expect(secondReconciliation.backend.residualCalls).toBe(residuals);
+    expect(
+      secondReconciliation.backend.events.filter(
+        (event) => event === 'delete-database',
+      ),
+    ).toHaveLength(deletes);
+  });
+
+  it('drains bounded and legacy normal decommission with one audit contract', async () => {
+    const bounded = await boundedDecommissionHarness();
+    const boundedAudit = vi.fn();
+    const boundedResult = await decommissionDeployment({
+      backend: bounded.backend,
+      store: bounded.store,
+      spec: bounded.deployment,
+      audit: boundedAudit,
+    });
+    expect(boundedResult.record).toMatchObject({
+      phase: 'decommissioned',
+      decommissionIntent: { state: 'complete' },
+    });
+    expect(bounded.backend.receiptCalls).toHaveLength(1);
+    expect(boundedAudit).toHaveBeenCalledTimes(1);
+
+    const active = await boundedDecommissionHarness();
+    await startBoundedDecommission(active);
+    const activeAudit = vi.fn();
+    const activeHasTrap = new Proxy(active.backend, {
+      has() {
+        throw new Error('active normal intent executed has trap');
+      },
+      get(target, property) {
+        const value = Reflect.get(target, property, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    await expect(
+      decommissionDeployment({
+        backend: activeHasTrap,
+        store: active.store,
+        spec: active.deployment,
+        audit: activeAudit,
+      }),
+    ).resolves.toMatchObject({ record: { phase: 'decommissioned' } });
+    expect(activeAudit).toHaveBeenCalledTimes(1);
+
+    const activeSwitch = await boundedDecommissionHarness();
+    activeSwitch.store.record = {
+      ...(activeSwitch.store.record as FleetRecord),
+      backendSwitchIntent: {
+        subphase: 'domain-detach-authorized',
+      } as FleetRecord['backendSwitchIntent'],
+    };
+    const switchHasTrap = new Proxy(activeSwitch.backend, {
+      has() {
+        throw new Error('active backend switch executed has trap');
+      },
+      get(target, property) {
+        const value = Reflect.get(target, property, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    await expect(
+      decommissionDeployment({
+        backend: switchHasTrap,
+        store: activeSwitch.store,
+        spec: activeSwitch.deployment,
+      }),
+    ).rejects.toThrow(
+      'active backend switch decommission requires its dedicated provider and both specifications',
+    );
+
+    const race = await boundedDecommissionHarness();
+    const ready = race.store.record as FleetRecord;
+    const started = await startBoundedDecommission(race);
+    const advancing = race.store.record as FleetRecord;
+    let reads = 0;
+    race.store.get = async () => {
+      reads += 1;
+      return reads === 1 ? ready : (race.store.record ?? advancing);
+    };
+    race.store.record = advancing;
+    await expect(
+      decommissionDeployment({
+        backend: race.backend,
+        store: race.store,
+        spec: race.deployment,
+      }),
+    ).resolves.toMatchObject({ record: { phase: 'decommissioned' } });
+    expect(reads).toBeGreaterThan(1);
+    expect(started.status).toBe('pending');
+
+    const legacy = await boundedDecommissionHarness();
+    await expect(
+      decommissionDeployment({
+        backend: legacyOnlyBackend(legacy.backend),
+        store: legacy.store,
+        spec: legacy.deployment,
+      }),
+    ).resolves.toMatchObject({ record: { phase: 'decommissioned' } });
+    expect(legacy.backend.receiptCalls).toEqual([]);
+    expect(legacy.backend.events).toContain('export');
+
+    for (const mode of ['partial', 'non-callable', 'throwing'] as const) {
+      const malformed = await boundedDecommissionHarness();
+      const malformedBackend = new Proxy(malformed.backend, {
+        get(target, property) {
+          if (property === 'exportDatabaseReceipt') {
+            if (mode === 'throwing') throw new Error('receipt getter trap');
+            return mode === 'partial' ? undefined : 1;
+          }
+          const value = Reflect.get(target, property, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+      await expect(
+        decommissionDeployment({
+          backend: malformedBackend,
+          store: malformed.store,
+          spec: malformed.deployment,
+        }),
+        mode,
+      ).rejects.toThrow('database export receipt capability is malformed');
+      expect(malformed.store.record?.decommissionIntent, mode).toBeUndefined();
+    }
+
+    for (const present of ['authority', 'exporter'] as const) {
+      const partial = await boundedDecommissionHarness();
+      const hasCalls: PropertyKey[] = [];
+      const partialBackend = new Proxy(partial.backend, {
+        has(target, property) {
+          hasCalls.push(property);
+          if (property === 'advanceDecommissionAttachmentScan') return true;
+          if (property === 'databaseExportReceiptAuthority') {
+            return present === 'authority';
+          }
+          if (property === 'exportDatabaseReceipt') {
+            return present === 'exporter';
+          }
+          return Reflect.has(target, property);
+        },
+        get(target, property) {
+          if (
+            property === 'databaseExportReceiptAuthority' &&
+            present !== 'authority'
+          ) {
+            return undefined;
+          }
+          if (property === 'exportDatabaseReceipt' && present !== 'exporter') {
+            return undefined;
+          }
+          const value = Reflect.get(target, property, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+      await expect(
+        decommissionDeployment({
+          backend: partialBackend,
+          store: partial.store,
+          spec: partial.deployment,
+        }),
+        present,
+      ).rejects.toThrow('database export receipt capability is malformed');
+      expect(hasCalls, present).toContain('advanceDecommissionAttachmentScan');
+      expect(hasCalls, present).toContain(
+        present === 'authority'
+          ? 'databaseExportReceiptAuthority'
+          : 'exportDatabaseReceipt',
+      );
+      expect(partial.backend.events, present).not.toContain('export');
+      expect(partial.store.record?.decommissionIntent, present).toBeUndefined();
+    }
+
+    const lateFenced = await boundedDecommissionHarness({ r2Names: ['FILES'] });
+    lateFenced.store.record = {
+      ...(lateFenced.store.record as FleetRecord),
+      phase: 'database-exported',
+      databaseExportLocation: 'memory://legacy/export.sql',
+      databaseExportSha256: 'a'.repeat(64),
+      databaseExportSize: 42,
+    };
+    lateFenced.backend.events.length = 0;
+    await expect(
+      decommissionDeployment({
+        backend: lateFenced.backend,
+        store: lateFenced.store,
+        spec: lateFenced.deployment,
+      }),
+    ).rejects.toThrow(
+      'normal decommission D1 work requires every application R2 resource to be deleted',
+    );
+    expect(lateFenced.backend.events).toEqual([]);
+    expect(lateFenced.backend.receiptCalls).toEqual([]);
+
+    for (const phase of [
+      'database-exported',
+      'database-deleting',
+      'decommissioned',
+    ] as const) {
+      const late = await boundedDecommissionHarness();
+      late.store.record = {
+        ...(late.store.record as FleetRecord),
+        phase,
+        applicationResources: [],
+        databaseExportLocation: 'memory://legacy/export.sql',
+        databaseExportSha256: 'a'.repeat(64),
+        databaseExportSize: 42,
+      };
+      late.backend.events.length = 0;
+      await expect(
+        decommissionDeployment({
+          backend: late.backend,
+          store: late.store,
+          spec: late.deployment,
+        }),
+        phase,
+      ).resolves.toMatchObject({ record: { phase: 'decommissioned' } });
+      expect(late.backend.receiptCalls, phase).toEqual([]);
+      if (phase === 'decommissioned') {
+        expect(late.backend.events, phase).toEqual([]);
+      } else {
+        expect(late.backend.events, phase).toContain('delete-database');
+      }
+    }
+
+    const blocked = await boundedDecommissionHarness();
+    let blockedResult = await driveBoundedUntil(
+      blocked,
+      (record) =>
+        record.decommissionIntent?.lifecyclePhase ===
+          'application-resources-deleted' &&
+        record.decommissionIntent.state === 'transitioning',
+    );
+    blockedResult = await continueBoundedDecommission(blocked, blockedResult);
+    blocked.backend.scanResults.push({
+      status: 'attached',
+      attachment: { plane: 'ordinary', scriptName: 'removed-before-restart' },
+      providerFetchAttemptsReserved: 3,
+    });
+    blockedResult = await continueBoundedDecommission(blocked, blockedResult);
+    expect(blockedResult.status).toBe('blocked');
+    await expect(
+      decommissionDeployment({
+        backend: blocked.backend,
+        store: blocked.store,
+        spec: blocked.deployment,
+      }),
+    ).resolves.toMatchObject({ record: { phase: 'decommissioned' } });
+
+    const newlyBlocked = await boundedDecommissionHarness();
+    const newlyBlockedAudit = vi.fn();
+    newlyBlocked.backend.scanResults.push({
+      status: 'attached',
+      attachment: { plane: 'ordinary', scriptName: 'still-attached' },
+      providerFetchAttemptsReserved: 3,
+    });
+    await expect(
+      decommissionDeployment({
+        backend: newlyBlocked.backend,
+        store: newlyBlocked.store,
+        spec: newlyBlocked.deployment,
+        audit: newlyBlockedAudit,
+      }),
+    ).rejects.toThrow(
+      'bounded decommission remains blocked by a Worker attachment',
+    );
+    expect(newlyBlockedAudit).not.toHaveBeenCalled();
+
+    const complete = await boundedDecommissionHarness();
+    await decommissionDeployment({
+      backend: complete.backend,
+      store: complete.store,
+      spec: complete.deployment,
+    });
+    const hasTrap = new Proxy(complete.backend, {
+      has() {
+        throw new Error('complete wrapper executed has trap');
+      },
+      get(target, property) {
+        const value = Reflect.get(target, property, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    await expect(
+      decommissionDeployment({
+        backend: hasTrap,
+        store: complete.store,
+        spec: complete.deployment,
+      }),
+    ).resolves.toMatchObject({ record: { phase: 'decommissioned' } });
   });
 
   it('atomically consumes plain and WFP migration carriers while preserving snapshots', async () => {

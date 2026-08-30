@@ -74,7 +74,7 @@ describe('provider projection equivalence', () => {
     });
     const intent = uploadIntentForSpec(
       buildPlainWorkerSpec(),
-      'database-1',
+      '00000000-0000-4000-8000-000000000001',
       'initial',
     );
     const fence = mutationFence();

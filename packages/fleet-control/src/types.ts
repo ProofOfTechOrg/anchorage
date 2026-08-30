@@ -494,6 +494,7 @@ export interface DecommissionIntentCommon {
   readonly generation: number;
   readonly updatedAt: string;
   readonly identity: DecommissionOperationIdentity;
+  readonly databaseExportReceiptAuthority?: string;
   readonly lifecyclePhase: NormalDecommissionLifecyclePhase;
 }
 
@@ -525,6 +526,7 @@ export type DecommissionAdvanceIntent =
       generation: number;
       updatedAt: string;
       identity: DecommissionOperationIdentity;
+      databaseExportReceiptAuthority: string;
       lifecyclePhase: 'decommissioned';
       state: 'complete';
     }>;
@@ -1481,6 +1483,13 @@ export interface ProvisioningBackend {
   readonly immutableExternalArtifacts?: true;
   releaseScriptName?(spec: DeploymentSpec): string;
   findDatabase(spec: DeploymentSpec): Promise<DatabaseReference | undefined>;
+  /**
+   * Reads one database by immutable ID. Only `undefined` means absence.
+   *
+   * Present results are descriptor-safe plain data with bounded `id` and
+   * `name`, `created: false`, and optional safe plain-data fields. Destructive
+   * consumers reconstruct the required fields and discard extras.
+   */
   getDatabase(databaseId: string): Promise<DatabaseReference | undefined>;
   ensureDatabase(
     spec: DeploymentSpec,
@@ -1688,7 +1697,9 @@ export interface ProvisioningBackend {
   /**
    * Exports one operation-scoped receipt. The lower store consumes the body
    * while its eager source-integrity promise settles, exact retries converge,
-   * and identity or byte collisions are preserved and refused.
+   * and identity or byte collisions are preserved and refused. The result must
+   * be descriptor-safe plain data; bounded destructive consumers reconstruct
+   * the required export fields and discard safe extras.
    */
   exportDatabaseReceipt?(
     identity: DatabaseExportReceiptIdentity,

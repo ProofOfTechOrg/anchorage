@@ -205,7 +205,21 @@ The maintenance watchdog evaluates deadline expiry, SLA sweep, retention purge, 
 
 ## Decommission without losing the export
 
-`decommissionDeployment()` persists each destructive phase:
+Use `advanceDecommissionDeployment()` from a Queue-driven control-plane Worker for request-bounded normal decommissioning. Call it first with `start`, then re-enqueue only the pending token returned by each call. Fleet D1 owns the operation and scan progress. A Queue message carries a continuation claim, not authority.
+
+At-least-once delivery is safe. A stale token returns the current durable result without repeating provider work. Future tokens and tokens for another deployment or operation fail closed. A blocked result remains inert until you remove the reported attachment and submit exact `restart-blocked` with its current token.
+
+Each call performs at most one bounded scan chunk. Only an exact matching verify may consume that scan result immediately through one resource action under the same live lease. Evidence never becomes a reusable deletion certificate. A call without matching verify performs at most one lifecycle or resource action group.
+
+Queue-driven bounded decommissioning requires Workers Paid. Each of the two all-application-R2 read groups can reserve up to 708 external subrequests for the supported maximum of 118 application buckets. That exceeds the Free plan limit of 50 subrequests per request and remains below the Paid default of 10,000. These limits were checked on 2026-08-30 in the [Cloudflare Workers limits](https://developers.cloudflare.com/workers/platform/limits/).
+
+Before the first D1 scan or export, Fleet D1 persists one immutable receipt authority. The receipt identity combines that authority, the canonical lowercase D1 UUID, and the decommission operation UUID. Retries after receipt commit or Fleet write loss converge on the same artifact. An authority change or byte collision preserves the committed winner and fails closed.
+
+Custom bounded backends must expose both `databaseExportReceiptAuthority` and `exportDatabaseReceipt()`. The export method must return descriptor-safe plain data with the matching database ID, location, positive size, and lowercase SHA-256 digest. Fleet control accepts safe extra plain-data fields but strips them. It rejects prototype-bearing instances, accessors, proxies, and malformed required fields.
+
+The synchronous `decommissionDeployment()` drains this bounded engine for every row with a normal decommission shell. It also selects bounded execution for an early shell-less row with the scan capability and at least one receipt member, so a malformed partial pair fails closed. The legacy synchronous path remains for shell-less late D1 or terminal rows and for other shell-less rows that lack the complete scan-plus-receipt capability.
+
+Normal decommission persists these destructive phases:
 
 1. Require every fleet-owned application R2 bucket to be empty before any traffic mutation
 2. Remove traffic, prove zero ingress, and persist `traffic-removed`

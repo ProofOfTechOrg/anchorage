@@ -11,10 +11,11 @@ import {
   provisionDeployment,
 } from '../src/provision.js';
 import { deploymentSpecDigest } from '../src/spec-digest.js';
-import type {
-  DeploymentSecrets,
-  DeploymentSpec,
-  FleetRecord,
+import {
+  type DeploymentSecrets,
+  type DeploymentSpec,
+  effectiveLifecyclePhase,
+  type FleetRecord,
 } from '../src/types.js';
 import {
   buildPlainWorkerSpec,
@@ -948,7 +949,7 @@ export function describePlainWorkerConformance(
         'decommissioned',
       ];
 
-      for (const phase of teardownPhases) {
+      for (const [index, phase] of teardownPhases.entries()) {
         const harness = makeHarness(baseline.world.clone());
         harness.store.record = structuredClone(ready.record);
         harness.world.mutationLog.length = 0;
@@ -965,6 +966,11 @@ export function describePlainWorkerConformance(
             spec,
           }),
         ).rejects.toThrow(`failed state write at ${phase}`);
+        const retained = harness.store.record;
+        if (!retained) throw new Error('failed write removed the Fleet row');
+        const predecessor = teardownPhases[index - 1] ?? 'ready';
+        expect(effectiveLifecyclePhase(retained)).toBe(predecessor);
+        expect(retained.phase).toBe('decommission-advancing');
         const result = await decommissionDeployment({
           backend: harness.backend,
           store: harness.store,
@@ -987,6 +993,13 @@ export function describePlainWorkerConformance(
         expect(
           harness.exportStore.exports.get(ready.record.databaseId)?.bytes,
         ).toEqual(expectedBytes);
+        expect(result.record).toMatchObject({
+          phase: 'decommissioned',
+          decommissionIntent: {
+            lifecyclePhase: 'decommissioned',
+            state: 'complete',
+          },
+        });
       }
 
       const exportFailure = makeHarness(baseline.world.clone());

@@ -452,6 +452,7 @@ function reservedRecord(
 }
 
 const DECOMMISSION_OPERATION_ID = '123e4567-e89b-42d3-a456-426614174000';
+const DECOMMISSION_RECEIPT_AUTHORITY = 'memory://fleet-exports/receipts/v1';
 
 function decommissionBase(): FleetRecord {
   return {
@@ -619,6 +620,7 @@ describe('D1FleetStateStore release state', () => {
         updatedAt: '2026-08-29T12:34:56.789Z',
         requestedSpecDigest: 'e'.repeat(64),
         entryLifecyclePhase: 'rolling-back',
+        databaseExportReceiptAuthority: DECOMMISSION_RECEIPT_AUTHORITY,
       },
     );
     expect(JSON.stringify(explicitFixture)).toBe(
@@ -644,6 +646,7 @@ describe('D1FleetStateStore release state', () => {
             entryLifecyclePhase: 'rolling-back',
           },
         },
+        databaseExportReceiptAuthority: DECOMMISSION_RECEIPT_AUTHORITY,
         lifecyclePhase: 'database-deleting',
       }),
     );
@@ -703,7 +706,10 @@ describe('D1FleetStateStore release state', () => {
         ...normalDecommissionIntentFixture(
           base,
           'application-resources-deleted',
-          decommissionFixtureOptions(1),
+          {
+            ...decommissionFixtureOptions(1),
+            databaseExportReceiptAuthority: DECOMMISSION_RECEIPT_AUTHORITY,
+          },
         ),
         state: 'discover',
         purpose,
@@ -713,7 +719,10 @@ describe('D1FleetStateStore release state', () => {
         ...normalDecommissionIntentFixture(
           base,
           'application-resources-deleted',
-          decommissionFixtureOptions(2),
+          {
+            ...decommissionFixtureOptions(2),
+            databaseExportReceiptAuthority: DECOMMISSION_RECEIPT_AUTHORITY,
+          },
         ),
         state: 'verify',
         purpose,
@@ -727,7 +736,10 @@ describe('D1FleetStateStore release state', () => {
         ...normalDecommissionIntentFixture(
           base,
           'application-resources-deleted',
-          decommissionFixtureOptions(3),
+          {
+            ...decommissionFixtureOptions(3),
+            databaseExportReceiptAuthority: DECOMMISSION_RECEIPT_AUTHORITY,
+          },
         ),
         state: 'blocked',
         purpose,
@@ -738,7 +750,10 @@ describe('D1FleetStateStore release state', () => {
         const common = normalDecommissionIntentFixture(
           base,
           'database-deleting',
-          decommissionFixtureOptions(4),
+          {
+            ...decommissionFixtureOptions(4),
+            databaseExportReceiptAuthority: DECOMMISSION_RECEIPT_AUTHORITY,
+          },
         );
         return {
           ...base,
@@ -748,6 +763,7 @@ describe('D1FleetStateStore release state', () => {
           databaseExportSize: 42,
           decommissionIntent: {
             ...common,
+            databaseExportReceiptAuthority: DECOMMISSION_RECEIPT_AUTHORITY,
             lifecyclePhase: 'decommissioned',
             state: 'complete',
           },
@@ -788,6 +804,35 @@ describe('D1FleetStateStore release state', () => {
       }
     }
     const persisted = structuredClone(db.row);
+    await expectInvalidDecommission(
+      store.withDeploymentLease('acme', 'production', (lease) =>
+        lease.put({
+          ...transitioning,
+          decommissionIntent: {
+            ...transitioning.decommissionIntent,
+            databaseExportReceiptAuthority: DECOMMISSION_RECEIPT_AUTHORITY,
+          } as NonNullable<FleetRecord['decommissionIntent']>,
+        }),
+      ),
+    );
+    const d1Record = records[3];
+    if (!d1Record?.decommissionIntent) {
+      throw new Error('missing D1 decommission fixture');
+    }
+    const {
+      databaseExportReceiptAuthority: _databaseExportReceiptAuthority,
+      ...d1IntentWithoutAuthority
+    } = d1Record.decommissionIntent;
+    await expectInvalidDecommission(
+      store.withDeploymentLease('acme', 'production', (lease) =>
+        lease.put({
+          ...d1Record,
+          decommissionIntent: d1IntentWithoutAuthority as NonNullable<
+            FleetRecord['decommissionIntent']
+          >,
+        }),
+      ),
+    );
     for (const pendingArtifactVersion of ['', 'pending', 42]) {
       await expectInvalidDecommission(
         store.withDeploymentLease('acme', 'production', (lease) =>

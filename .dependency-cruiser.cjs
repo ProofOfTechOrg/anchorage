@@ -207,7 +207,7 @@ module.exports = {
       name: 'fleet-control-decommission-advance-is-transport-neutral',
       severity: 'error',
       comment:
-        'The bounded decommission coordinator depends only on provider-neutral ports and state. Keeping provider clients, Wrangler, export stores, root barrels, and unbounded lifecycle coordinators out of its reachable graph preserves the Worker-safe transport boundary.',
+        'The bounded decommission coordinator depends only on provider-neutral ports and state, including the provider-neutral database receipt port. Keeping provider clients, Wrangler, concrete export stores, root barrels, and unbounded lifecycle coordinators out of its reachable graph preserves the Worker-safe transport boundary.',
       from: {
         path: [
           '^packages/fleet-control/src/decommission-advance\\.ts$',
@@ -215,7 +215,7 @@ module.exports = {
         ],
       },
       to: {
-        path: '(?:^packages/fleet-control/src/(?:cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors|wrangler-plain-worker-provisioning-api|wrangler-loop-backend|wrangler-runner|database-export-store|export-file-name|export-store|r2-export-store|provision|fleet|index)\\.ts$|^packages/fleet-control/src/workers/|^cloudflare(?:/|$)|(?:^|/)node_modules/(?:\\.pnpm/)?cloudflare(?:@|/))',
+        path: '(?:^packages/fleet-control/src/(?:cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors|wrangler-plain-worker-provisioning-api|wrangler-loop-backend|wrangler-runner|export-file-name|export-store|r2-export-store|provision|fleet|index)\\.ts$|^packages/fleet-control/src/workers/|^cloudflare(?:/|$)|(?:^|/)node_modules/(?:\\.pnpm/)?cloudflare(?:@|/))',
         reachable: true,
       },
     },

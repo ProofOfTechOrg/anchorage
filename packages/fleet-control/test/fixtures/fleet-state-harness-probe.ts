@@ -22,11 +22,15 @@ import {
 import type {
   ApplicationR2BucketSnapshot,
   ApplicationR2Resource,
+  DatabaseExport,
+  DatabaseExportReceiptIdentity,
+  DatabaseReference,
   DecommissionAttachmentScanInput,
   DecommissionAttachmentScanResult,
   DeploymentSpec,
   FleetRecord,
   FleetStateLease,
+  FleetStateStore,
   PlatformPlaneLease,
   PlatformPlaneResourceSet,
   ProvisioningBackend,
@@ -41,6 +45,7 @@ const STATE_TABLE = 'anchorage_fleet_deployments';
 const LEASE_TABLE = 'anchorage_fleet_leases';
 const PLATFORM_CLAIM_TABLE = 'anchorage_platform_plane_claims';
 const PLATFORM_LEASE_TABLE = 'anchorage_platform_plane_leases';
+const BOUNDED_PROVIDER_TABLE = 'anchorage_test_bounded_decommission_provider';
 const DB_NOW_MS = "CAST(unixepoch('subsec') * 1000 AS INTEGER)";
 
 function controlledLeaseClock(
@@ -134,6 +139,15 @@ function decommissionRecord(tenantTag: string, revision: number): FleetRecord {
 const DECOMMISSION_SCAN_EVIDENCE = 'b'.repeat(64);
 const DECOMMISSION_SCAN_EVIDENCE_COUNT = 2;
 const DECOMMISSION_CREATED_AT = '2026-08-30T00:00:00.000Z';
+const DECOMMISSION_RECEIPT_AUTHORITY = 'd1-test://fleet-exports/receipts/v1';
+const DECOMMISSION_EXPORT_SHA256 = 'c'.repeat(64);
+const DECOMMISSION_EXPORT_SIZE = 37;
+
+function boundedDatabaseId(tenantTag: 'advance' | 'advancelost'): string {
+  return tenantTag === 'advance'
+    ? '00000000-0000-4000-8000-000000000201'
+    : '00000000-0000-4000-8000-000000000202';
+}
 
 function boundedDecommissionSpec(tenantTag: string): DeploymentSpec {
   return {
@@ -161,12 +175,13 @@ function boundedDecommissionSpec(tenantTag: string): DeploymentSpec {
 
 function boundedDecommissionRecord(
   spec: DeploymentSpec,
+  startAtD1 = false,
 ): Readonly<{ record: FleetRecord; resource: ApplicationR2Resource }> {
   const reserved = reserveApplicationR2Resources(spec)[0];
   if (!reserved) throw new Error('bounded decommission R2 reservation missing');
   const resource: ApplicationR2Resource = {
     ...reserved,
-    state: 'created',
+    state: startAtD1 ? 'deleted' : 'created',
     creationDate: DECOMMISSION_CREATED_AT,
   };
   return {
@@ -176,7 +191,9 @@ function boundedDecommissionRecord(
       environment: spec.environment,
       backend: 'plain-worker',
       scriptName: spec.scriptName,
-      databaseId: `${spec.tenantTag}-database-id`,
+      databaseId: boundedDatabaseId(
+        spec.tenantTag as 'advance' | 'advancelost',
+      ),
       databaseName: spec.databaseName,
       schemaVersion: spec.schemaVersion,
       artifactVersion: `${spec.tenantTag}-artifact-v1`,
@@ -185,29 +202,197 @@ function boundedDecommissionRecord(
       applicationBindings: applicationBindingTopology(spec, [resource]),
       durableObjectBindings: [],
       routeHostname: spec.routeHostname,
-      phase: 'application-resources-deleting',
+      phase: startAtD1
+        ? 'application-resources-deleted'
+        : 'application-resources-deleting',
       updatedAt: '2026-08-29T00:00:00.000Z',
     },
   };
 }
 
+type BoundedProviderOutcome =
+  | Readonly<{ status: 'fulfilled'; value?: 'default' | 'present' | 'absent' }>
+  | Readonly<{
+      status: 'rejected';
+      reason: 'error' | 'null' | 'undefined';
+    }>;
+
+interface BoundedProviderRow {
+  readonly tenant_tag: string;
+  readonly database_id: string;
+  readonly database_name: string;
+  readonly observed_database_id: string;
+  readonly observed_database_name: string;
+  readonly owner: string;
+  readonly database_present: number;
+  readonly receipt_authority: string | null;
+  readonly receipt_operation_id: string | null;
+  readonly receipt_location: string | null;
+  readonly receipt_size: number | null;
+  readonly receipt_sha256: string | null;
+  readonly receipt_commit_count: number;
+  readonly export_call_count: number;
+  readonly delete_count: number;
+  readonly next_export_outcome: string | null;
+  readonly next_delete_outcome: string | null;
+  readonly next_readback_outcome: string | null;
+  readonly ownership_assertion_count: number;
+  readonly next_ownership_failure_ordinal: number | null;
+}
+
+async function ensureBoundedProviderState(
+  db: D1Database,
+  tenantTag: 'advance' | 'advancelost',
+  databaseName: string,
+): Promise<void> {
+  await db
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS ${BOUNDED_PROVIDER_TABLE} (
+        tenant_tag TEXT PRIMARY KEY,
+        database_id TEXT NOT NULL,
+        database_name TEXT NOT NULL,
+        observed_database_id TEXT NOT NULL,
+        observed_database_name TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        database_present INTEGER NOT NULL,
+        receipt_authority TEXT,
+        receipt_operation_id TEXT,
+        receipt_location TEXT,
+        receipt_size INTEGER,
+        receipt_sha256 TEXT,
+        receipt_commit_count INTEGER NOT NULL DEFAULT 0,
+        export_call_count INTEGER NOT NULL DEFAULT 0,
+        delete_count INTEGER NOT NULL DEFAULT 0,
+        next_export_outcome TEXT,
+        next_delete_outcome TEXT,
+        next_readback_outcome TEXT,
+        ownership_assertion_count INTEGER NOT NULL DEFAULT 0,
+        next_ownership_failure_ordinal INTEGER
+      )`,
+    )
+    .run();
+  const databaseId = boundedDatabaseId(tenantTag);
+  await db
+    .prepare(
+      `INSERT OR IGNORE INTO ${BOUNDED_PROVIDER_TABLE} (
+        tenant_tag,
+        database_id,
+        database_name,
+        observed_database_id,
+        observed_database_name,
+        owner,
+        database_present
+      ) VALUES (?, ?, ?, ?, ?, ?, 1)`,
+    )
+    .bind(
+      tenantTag,
+      databaseId,
+      databaseName,
+      databaseId,
+      databaseName,
+      tenantTag,
+    )
+    .run();
+}
+
+async function readBoundedProviderState(
+  db: D1Database,
+  tenantTag: 'advance' | 'advancelost',
+): Promise<BoundedProviderRow> {
+  const row = await db
+    .prepare(`SELECT * FROM ${BOUNDED_PROVIDER_TABLE} WHERE tenant_tag = ?`)
+    .bind(tenantTag)
+    .first<BoundedProviderRow>();
+  if (!row) throw new Error('bounded provider state is absent');
+  return row;
+}
+
+function decodeBoundedProviderOutcome(
+  value: string | null,
+): BoundedProviderOutcome | undefined {
+  return value === null
+    ? undefined
+    : (JSON.parse(value) as BoundedProviderOutcome);
+}
+
+function rejectBoundedProviderOutcome(
+  outcome: Extract<BoundedProviderOutcome, { status: 'rejected' }>,
+): never {
+  if (outcome.reason === 'null') throw null;
+  if (outcome.reason === 'undefined') throw undefined;
+  throw new Error('bounded provider injected rejection');
+}
+
 class BoundedDecommissionBackend implements ProvisioningBackend {
   readonly kind = 'plain-worker' as const;
+  readonly databaseExportReceiptAuthority = DECOMMISSION_RECEIPT_AUTHORITY;
   readonly events: string[] = [];
   #bucketExists: boolean;
+  #deleteAttempted = false;
 
   constructor(
+    readonly db: D1Database,
+    readonly tenantTag: 'advance' | 'advancelost',
     readonly resource: ApplicationR2Resource,
     bucketExists: boolean,
     readonly scanPass: string | undefined,
+    readonly options: Readonly<{
+      afterScan?: 'absent' | 'id' | 'name' | 'owner';
+      loseReceiptResponse?: boolean;
+      loseDeleteResponse?: boolean;
+    }>,
   ) {
     this.#bucketExists = bucketExists;
   }
 
   async advanceDecommissionAttachmentScan(
-    _input: DecommissionAttachmentScanInput,
+    input: DecommissionAttachmentScanInput,
   ): Promise<DecommissionAttachmentScanResult> {
     this.events.push(`scan:${this.scanPass ?? 'unexpected'}`);
+    if (input.progress.target.kind === 'd1') {
+      switch (this.options.afterScan) {
+        case 'absent':
+          await this.db
+            .prepare(
+              `UPDATE ${BOUNDED_PROVIDER_TABLE}
+               SET database_present = 0
+               WHERE tenant_tag = ?`,
+            )
+            .bind(this.tenantTag)
+            .run();
+          break;
+        case 'id':
+          await this.db
+            .prepare(
+              `UPDATE ${BOUNDED_PROVIDER_TABLE}
+               SET observed_database_id = database_id || '-drift'
+               WHERE tenant_tag = ?`,
+            )
+            .bind(this.tenantTag)
+            .run();
+          break;
+        case 'name':
+          await this.db
+            .prepare(
+              `UPDATE ${BOUNDED_PROVIDER_TABLE}
+               SET observed_database_name = database_name || '-drift'
+               WHERE tenant_tag = ?`,
+            )
+            .bind(this.tenantTag)
+            .run();
+          break;
+        case 'owner':
+          await this.db
+            .prepare(
+              `UPDATE ${BOUNDED_PROVIDER_TABLE}
+               SET owner = 'foreign'
+               WHERE tenant_tag = ?`,
+            )
+            .bind(this.tenantTag)
+            .run();
+          break;
+      }
+    }
     return {
       status: 'complete',
       evidenceSha256: DECOMMISSION_SCAN_EVIDENCE,
@@ -243,16 +428,53 @@ class BoundedDecommissionBackend implements ProvisioningBackend {
     throw new Error('bounded coordinator called legacy R2 attachment listing');
   }
 
-  async assertDatabaseDeletionResidualsRemoved(): Promise<never> {
-    throw new Error('bounded coordinator crossed the inert D1 boundary');
+  async assertDatabaseDeletionResidualsRemoved(): Promise<void> {
+    this.events.push('d1-residuals');
   }
 
   async findDatabase(): Promise<never> {
     throw new Error('bounded coordinator unexpectedly found D1');
   }
 
-  async getDatabase(): Promise<never> {
-    throw new Error('bounded coordinator unexpectedly read D1');
+  async getDatabase(
+    databaseId: string,
+  ): Promise<DatabaseReference | undefined> {
+    this.events.push('d1-get');
+    const row = await readBoundedProviderState(this.db, this.tenantTag);
+    if (databaseId !== row.database_id) {
+      throw new Error('bounded coordinator read an unexpected D1 ID');
+    }
+    if (this.#deleteAttempted) {
+      const outcome = decodeBoundedProviderOutcome(row.next_readback_outcome);
+      if (outcome) {
+        await this.db
+          .prepare(
+            `UPDATE ${BOUNDED_PROVIDER_TABLE}
+             SET next_readback_outcome = NULL
+             WHERE tenant_tag = ?`,
+          )
+          .bind(this.tenantTag)
+          .run();
+        if (outcome.status === 'rejected') {
+          rejectBoundedProviderOutcome(outcome);
+        }
+        if (outcome.value === 'absent') return undefined;
+        if (outcome.value === 'present') {
+          return {
+            id: row.observed_database_id,
+            name: row.observed_database_name,
+            created: false,
+          };
+        }
+      }
+    }
+    return row.database_present === 0
+      ? undefined
+      : {
+          id: row.observed_database_id,
+          name: row.observed_database_name,
+          created: false,
+        };
   }
 
   async ensureDatabase(): Promise<never> {
@@ -263,8 +485,9 @@ class BoundedDecommissionBackend implements ProvisioningBackend {
     throw new Error('bounded coordinator unexpectedly seeded D1');
   }
 
-  async readDeploymentIdentity(): Promise<never> {
-    throw new Error('bounded coordinator unexpectedly read D1 ownership');
+  async readDeploymentIdentity(): Promise<string | undefined> {
+    this.events.push('d1-owner');
+    return (await readBoundedProviderState(this.db, this.tenantTag)).owner;
   }
 
   async applyMigrations(): Promise<never> {
@@ -315,8 +538,113 @@ class BoundedDecommissionBackend implements ProvisioningBackend {
     throw new Error('bounded coordinator unexpectedly exported D1');
   }
 
-  async deleteDatabase(): Promise<never> {
-    throw new Error('bounded coordinator unexpectedly deleted D1');
+  async exportDatabaseReceipt(
+    identity: DatabaseExportReceiptIdentity,
+  ): Promise<DatabaseExport> {
+    this.events.push('d1-export');
+    const row = await readBoundedProviderState(this.db, this.tenantTag);
+    await this.db
+      .prepare(
+        `UPDATE ${BOUNDED_PROVIDER_TABLE}
+         SET export_call_count = export_call_count + 1
+         WHERE tenant_tag = ?`,
+      )
+      .bind(this.tenantTag)
+      .run();
+    const outcome = decodeBoundedProviderOutcome(row.next_export_outcome);
+    if (outcome) {
+      await this.db
+        .prepare(
+          `UPDATE ${BOUNDED_PROVIDER_TABLE}
+           SET next_export_outcome = NULL
+           WHERE tenant_tag = ?`,
+        )
+        .bind(this.tenantTag)
+        .run();
+      if (outcome.status === 'rejected') {
+        rejectBoundedProviderOutcome(outcome);
+      }
+    }
+    if (
+      identity.authority !== DECOMMISSION_RECEIPT_AUTHORITY ||
+      identity.databaseId !== row.database_id
+    ) {
+      throw new Error(
+        'bounded provider received a mismatched receipt identity',
+      );
+    }
+    const location =
+      row.receipt_location ??
+      `${DECOMMISSION_RECEIPT_AUTHORITY}/${identity.databaseId}/${identity.operationId}.sql`;
+    if (row.receipt_operation_id === null) {
+      await this.db
+        .prepare(
+          `UPDATE ${BOUNDED_PROVIDER_TABLE}
+           SET receipt_authority = ?,
+               receipt_operation_id = ?,
+               receipt_location = ?,
+               receipt_size = ?,
+               receipt_sha256 = ?,
+               receipt_commit_count = receipt_commit_count + 1
+           WHERE tenant_tag = ?`,
+        )
+        .bind(
+          identity.authority,
+          identity.operationId,
+          location,
+          DECOMMISSION_EXPORT_SIZE,
+          DECOMMISSION_EXPORT_SHA256,
+          this.tenantTag,
+        )
+        .run();
+    } else if (
+      row.receipt_authority !== identity.authority ||
+      row.receipt_operation_id !== identity.operationId ||
+      row.receipt_size !== DECOMMISSION_EXPORT_SIZE ||
+      row.receipt_sha256 !== DECOMMISSION_EXPORT_SHA256
+    ) {
+      throw new Error('bounded provider preserved a mismatched receipt winner');
+    }
+    if (this.options.loseReceiptResponse) {
+      throw new Error('bounded receipt response lost');
+    }
+    return {
+      databaseId: identity.databaseId,
+      location,
+      size: DECOMMISSION_EXPORT_SIZE,
+      sha256: DECOMMISSION_EXPORT_SHA256,
+    };
+  }
+
+  async deleteDatabase(): Promise<void> {
+    this.events.push('d1-delete');
+    this.#deleteAttempted = true;
+    const row = await readBoundedProviderState(this.db, this.tenantTag);
+    const outcome = decodeBoundedProviderOutcome(row.next_delete_outcome);
+    if (outcome) {
+      await this.db
+        .prepare(
+          `UPDATE ${BOUNDED_PROVIDER_TABLE}
+           SET next_delete_outcome = NULL
+           WHERE tenant_tag = ?`,
+        )
+        .bind(this.tenantTag)
+        .run();
+      if (outcome.status === 'rejected') {
+        rejectBoundedProviderOutcome(outcome);
+      }
+    }
+    await this.db
+      .prepare(
+        `UPDATE ${BOUNDED_PROVIDER_TABLE}
+         SET database_present = ?, delete_count = delete_count + 1
+         WHERE tenant_tag = ?`,
+      )
+      .bind(outcome?.value === 'present' ? 1 : 0, this.tenantTag)
+      .run();
+    if (this.options.loseDeleteResponse) {
+      throw new Error('bounded delete response lost');
+    }
   }
 }
 
@@ -325,7 +653,93 @@ interface BoundedDecommissionStepInput {
   readonly operation: Readonly<
     { kind: 'start' } | { kind: 'continue'; token: unknown }
   >;
+  readonly afterScan?: 'absent' | 'id' | 'name' | 'owner';
+  readonly failWriteBeforeCommit?: boolean;
   readonly loseWrite?: boolean;
+  readonly loseReceiptResponse?: boolean;
+  readonly loseDeleteResponse?: boolean;
+  readonly nextExportOutcome?: BoundedProviderOutcome;
+  readonly nextDeleteOutcome?: BoundedProviderOutcome;
+  readonly nextReadbackOutcome?: BoundedProviderOutcome;
+  readonly nextOwnershipFailureOrdinal?: number;
+  readonly seedAtD1?: boolean;
+}
+
+async function configureBoundedProviderState(
+  db: D1Database,
+  input: BoundedDecommissionStepInput,
+): Promise<void> {
+  const outcomes = [
+    ['next_export_outcome', input.nextExportOutcome],
+    ['next_delete_outcome', input.nextDeleteOutcome],
+    ['next_readback_outcome', input.nextReadbackOutcome],
+  ] as const;
+  for (const [column, outcome] of outcomes) {
+    if (outcome === undefined) continue;
+    await db
+      .prepare(
+        `UPDATE ${BOUNDED_PROVIDER_TABLE}
+         SET ${column} = ?
+         WHERE tenant_tag = ?`,
+      )
+      .bind(JSON.stringify(outcome), input.tenantTag)
+      .run();
+  }
+  if (input.nextOwnershipFailureOrdinal !== undefined) {
+    await db
+      .prepare(
+        `UPDATE ${BOUNDED_PROVIDER_TABLE}
+         SET ownership_assertion_count = 0,
+             next_ownership_failure_ordinal = ?
+         WHERE tenant_tag = ?`,
+      )
+      .bind(input.nextOwnershipFailureOrdinal, input.tenantTag)
+      .run();
+  }
+}
+
+function providerAssertionStore(
+  db: D1Database,
+  tenantTag: 'advance' | 'advancelost',
+  delegate: D1FleetStateStore,
+): FleetStateStore {
+  return {
+    get: (requestedTenantTag, environment) =>
+      delegate.get(requestedTenantTag, environment),
+    list: () => delegate.list(),
+    withDeploymentLease: (requestedTenantTag, environment, operation) =>
+      delegate.withDeploymentLease(requestedTenantTag, environment, (lease) =>
+        operation({
+          tenantTag: lease.tenantTag,
+          environment: lease.environment,
+          mutationLeaseTtlMs: lease.mutationLeaseTtlMs,
+          async assertOwned() {
+            const state = await readBoundedProviderState(db, tenantTag);
+            const ordinal = state.ownership_assertion_count + 1;
+            await db
+              .prepare(
+                `UPDATE ${BOUNDED_PROVIDER_TABLE}
+                   SET ownership_assertion_count = ?,
+                       next_ownership_failure_ordinal =
+                         CASE WHEN next_ownership_failure_ordinal = ?
+                           THEN NULL
+                           ELSE next_ownership_failure_ordinal
+                         END
+                   WHERE tenant_tag = ?`,
+              )
+              .bind(ordinal, ordinal, tenantTag)
+              .run();
+            if (state.next_ownership_failure_ordinal === ordinal) {
+              throw new Error('bounded provider lease ownership transferred');
+            }
+            await lease.assertOwned();
+          },
+          renew: () => lease.renew(),
+          put: (record) => lease.put(record),
+          delete: () => lease.delete(),
+        }),
+      ),
+  };
 }
 
 async function boundedDecommissionStep(
@@ -333,12 +747,14 @@ async function boundedDecommissionStep(
   input: BoundedDecommissionStepInput,
 ): Promise<unknown> {
   const spec = boundedDecommissionSpec(input.tenantTag);
+  await ensureBoundedProviderState(db, input.tenantTag, spec.databaseName);
+  await configureBoundedProviderState(db, input);
   const seedStore = new D1FleetStateStore(new D1FleetStateDatabase(db), {
     accountId: 'account-primary',
   });
   let current = await seedStore.get(spec.tenantTag, spec.environment);
   if (!current) {
-    const seeded = boundedDecommissionRecord(spec).record;
+    const seeded = boundedDecommissionRecord(spec, input.seedAtD1).record;
     await seedStore.withDeploymentLease(
       seeded.tenantTag,
       seeded.environment,
@@ -349,33 +765,49 @@ async function boundedDecommissionStep(
 
   const delegate = new D1FleetStateDatabase(db);
   let lostWriteCount = 0;
-  const database: FleetStateDatabase = input.loseWrite
-    ? {
-        query: (sql, bindings) => delegate.query(sql, bindings),
-        execute: (sql, bindings) => delegate.execute(sql, bindings),
-        async batch(statements) {
-          const result = await delegate.batch(statements);
-          if (lostWriteCount === 0) {
-            lostWriteCount += 1;
-            throw new Error('bounded coordinator write response lost');
-          }
-          return result;
-        },
-      }
-    : delegate;
+  let precommitWriteFailureCount = 0;
+  const database: FleetStateDatabase =
+    input.loseWrite || input.failWriteBeforeCommit
+      ? {
+          query: (sql, bindings) => delegate.query(sql, bindings),
+          execute: (sql, bindings) => delegate.execute(sql, bindings),
+          async batch(statements) {
+            if (
+              input.failWriteBeforeCommit &&
+              precommitWriteFailureCount === 0
+            ) {
+              precommitWriteFailureCount += 1;
+              throw new Error('bounded coordinator write failed before commit');
+            }
+            const result = await delegate.batch(statements);
+            if (input.loseWrite && lostWriteCount === 0) {
+              lostWriteCount += 1;
+              throw new Error('bounded coordinator write response lost');
+            }
+            return result;
+          },
+        }
+      : delegate;
   const store = new D1FleetStateStore(database, {
     accountId: 'account-primary',
   });
   const resource = current.applicationResources?.[0];
   if (!resource) throw new Error('bounded decommission resource missing');
   const backend = new BoundedDecommissionBackend(
+    db,
+    input.tenantTag,
     resource,
     resource.state !== 'deleted',
     current.decommissionIntent?.state,
+    {
+      afterScan: input.afterScan,
+      loseReceiptResponse: input.loseReceiptResponse,
+      loseDeleteResponse: input.loseDeleteResponse,
+    },
   );
   const result = await advanceDecommissionDeployment({
     backend,
-    store,
+    store: providerAssertionStore(db, input.tenantTag, store),
     spec,
     action: input.operation,
     maxProviderRequests: 12,
@@ -386,6 +818,7 @@ async function boundedDecommissionStep(
         : '00000000-0000-4000-8000-000000000102',
   });
   const stored = await store.get(spec.tenantTag, spec.environment);
+  const provider = await readBoundedProviderState(db, input.tenantTag);
   const claims = await db
     .prepare(
       `SELECT resource_type, resource_name, resource_role
@@ -411,12 +844,58 @@ async function boundedDecommissionStep(
       stored?.applicationResources?.map(({ state }) => state) ?? [],
     bucketName: resource.bucketName,
     lostWriteCount,
+    precommitWriteFailureCount,
+    provider: {
+      databaseId: provider.database_id,
+      databasePresent: provider.database_present === 1,
+      observedDatabaseId: provider.observed_database_id,
+      observedDatabaseName: provider.observed_database_name,
+      owner: provider.owner,
+      receiptAuthority: provider.receipt_authority,
+      receiptOperationId: provider.receipt_operation_id,
+      receiptLocation: provider.receipt_location,
+      receiptSize: provider.receipt_size,
+      receiptSha256: provider.receipt_sha256,
+      receiptCommitCount: provider.receipt_commit_count,
+      exportCallCount: provider.export_call_count,
+      deleteCount: provider.delete_count,
+      ownershipAssertionCount: provider.ownership_assertion_count,
+    },
     claims: claims.results.map((claim) => ({
       resourceType: claim.resource_type,
       resourceName: claim.resource_name,
       resourceRole: claim.resource_role,
     })),
   };
+}
+
+async function resetBoundedDecommission(
+  db: D1Database,
+  tenantTag: 'advance' | 'advancelost',
+): Promise<unknown> {
+  await db
+    .prepare(`DELETE FROM ${PLATFORM_CLAIM_TABLE} WHERE resource_set_key = ?`)
+    .bind(`deployment:${tenantTag}:production`)
+    .run();
+  await db
+    .prepare(
+      `DELETE FROM ${STATE_TABLE}
+       WHERE tenant_tag = ? AND environment = 'production'`,
+    )
+    .bind(tenantTag)
+    .run();
+  await db
+    .prepare(
+      `DELETE FROM ${LEASE_TABLE}
+       WHERE tenant_tag = ? AND environment = 'production'`,
+    )
+    .bind(tenantTag)
+    .run();
+  await db
+    .prepare(`DELETE FROM ${BOUNDED_PROVIDER_TABLE} WHERE tenant_tag = ?`)
+    .bind(tenantTag)
+    .run();
+  return { reset: true };
 }
 
 function errorShape(error: unknown): unknown {
@@ -1541,6 +2020,14 @@ export default {
             await boundedDecommissionStep(
               env.DB,
               body.input as BoundedDecommissionStepInput,
+            ),
+          );
+        case 'bounded-decommission-reset':
+          return Response.json(
+            await resetBoundedDecommission(
+              env.DB,
+              (body.input as { tenantTag: 'advance' | 'advancelost' })
+                .tenantTag,
             ),
           );
         case 'lifecycle-errors':

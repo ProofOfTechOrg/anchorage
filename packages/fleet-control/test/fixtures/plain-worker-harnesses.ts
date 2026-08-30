@@ -5,21 +5,26 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CloudflareApiPlainWorkerBackend } from '../../src/cloudflare-api-plain-worker-backend.js';
+import { CloudflareProvisioningClient } from '../../src/cloudflare-client.js';
 import {
-  CloudflareProvisioningClient,
+  captureDatabaseExportIntegrityPromise,
   type DurableDatabaseExportStore,
-} from '../../src/cloudflare-client.js';
+  databaseExportReceiptError,
+  databaseExportReceiptIdentityFromUnknown,
+} from '../../src/database-export-store.js';
 import { plainWorkerIngressModule } from '../../src/plain-worker-backend.js';
 import { uploadIntentToProviderBindings } from '../../src/provider-binding-inventory.js';
 import { deploymentSpecDigest } from '../../src/spec-digest.js';
-import type {
-  DeploymentSecrets,
-  DeploymentSpec,
-  FleetRecord,
-  FleetStateLease,
-  FleetStateStore,
-  PlainWorkerUploadIntent,
-  ProvisioningBackend,
+import {
+  type DatabaseExportReceiptIdentity,
+  type DeploymentSecrets,
+  type DeploymentSpec,
+  effectiveLifecyclePhase,
+  type FleetRecord,
+  type FleetStateLease,
+  type FleetStateStore,
+  type PlainWorkerUploadIntent,
+  type ProvisioningBackend,
 } from '../../src/types.js';
 import { WranglerLoopBackend } from '../../src/wrangler-loop-backend.js';
 import {
@@ -196,8 +201,15 @@ export function seedWorkerFromSpec(
   } = {},
 ) {
   const spec = options.spec ?? buildPlainWorkerSpec();
-  const databaseId = options.databaseId ?? 'database-1';
-  if (!world.databases.some((database) => database.databaseId === databaseId)) {
+  let databaseId = options.databaseId;
+  if (databaseId === undefined) {
+    databaseId = world.databases.find(
+      (database) => database.name === spec.databaseName,
+    )?.databaseId;
+    databaseId ??= world.seedDatabase(spec.databaseName).databaseId;
+  } else if (
+    !world.databases.some((database) => database.databaseId === databaseId)
+  ) {
     world.seedDatabase(spec.databaseName, { databaseId });
   }
   const intent = uploadIntentForSpec(
@@ -268,9 +280,13 @@ export class HarnessFleetStore implements FleetStateStore {
   }
 
   async put(record: FleetRecord): Promise<void> {
-    if (this.failPutPhase === record.phase) {
+    if (
+      this.failPutPhase === record.phase ||
+      this.failPutPhase === effectiveLifecyclePhase(record)
+    ) {
+      const failedPhase = this.failPutPhase;
       this.failPutPhase = undefined;
-      throw new Error(`failed state write at ${record.phase}`);
+      throw new Error(`failed state write at ${failedPhase}`);
     }
     this.record = structuredClone(record);
     this.phases.push(record.phase);
@@ -288,33 +304,108 @@ export class HarnessFleetStore implements FleetStateStore {
 }
 
 export class HarnessExportStore implements DurableDatabaseExportStore {
+  readonly receiptAuthority = 'memory://fleet-exports/receipts/v1';
   readonly exports = new Map<
     string,
     { readonly fileName: string; readonly bytes: Uint8Array }
   >();
+  readonly receipts = new Map<
+    string,
+    Readonly<{
+      identity: DatabaseExportReceiptIdentity;
+      location: string;
+      size: number;
+      sha256: string;
+      bytes: Uint8Array;
+    }>
+  >();
+
+  async #readBody(body: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+    const chunks: Uint8Array[] = [];
+    const reader = body.getReader();
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      chunks.push(chunk.value);
+    }
+    return new Uint8Array(Buffer.concat(chunks));
+  }
 
   async write(input: {
     readonly databaseId: string;
     readonly fileName: string;
     readonly body: ReadableStream<Uint8Array>;
   }): Promise<{ location: string; size: number; sha256: string }> {
-    const chunks: Uint8Array[] = [];
-    const reader = input.body.getReader();
-    for (;;) {
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      chunks.push(chunk.value);
-    }
-    const bytes = Buffer.concat(chunks);
+    const bytes = await this.#readBody(input.body);
     this.exports.set(input.databaseId, {
       fileName: input.fileName,
-      bytes: new Uint8Array(bytes),
+      bytes,
     });
     return {
       location: `memory://fleet-exports/${input.databaseId}/${input.fileName}`,
       size: bytes.byteLength,
       sha256: createHash('sha256').update(bytes).digest('hex'),
     };
+  }
+
+  async writeReceipt(input: {
+    readonly identity: DatabaseExportReceiptIdentity;
+    readonly body: ReadableStream<Uint8Array>;
+    readonly contentLength?: number;
+    readonly expectedIntegrity: Promise<{
+      readonly size: number;
+      readonly sha256: string;
+    }>;
+  }): Promise<{ location: string; size: number; sha256: string }> {
+    const identity = databaseExportReceiptIdentityFromUnknown(
+      input.identity,
+      this.receiptAuthority,
+    );
+    const expectedPromise = captureDatabaseExportIntegrityPromise(
+      input.expectedIntegrity,
+    );
+    const bytes = await this.#readBody(input.body);
+    const expected = await expectedPromise;
+    const integrity = {
+      size: bytes.byteLength,
+      sha256: createHash('sha256').update(bytes).digest('hex'),
+    };
+    if (
+      integrity.size !== expected.size ||
+      integrity.sha256 !== expected.sha256
+    ) {
+      throw databaseExportReceiptError('source-mismatch');
+    }
+    const key = `${identity.databaseId}:${identity.operationId}`;
+    const winner = this.receipts.get(key);
+    if (winner) {
+      if (
+        winner.identity.authority !== identity.authority ||
+        winner.identity.databaseId !== identity.databaseId ||
+        winner.identity.operationId !== identity.operationId ||
+        winner.size !== integrity.size ||
+        winner.sha256 !== integrity.sha256
+      ) {
+        throw databaseExportReceiptError('collision');
+      }
+      return {
+        location: winner.location,
+        size: winner.size,
+        sha256: winner.sha256,
+      };
+    }
+    const location = `${this.receiptAuthority}/${identity.databaseId}/${identity.operationId}.sql`;
+    this.receipts.set(key, {
+      identity,
+      location,
+      ...integrity,
+      bytes,
+    });
+    this.exports.set(identity.databaseId, {
+      fileName: `${identity.operationId}.sql`,
+      bytes,
+    });
+    return { location, ...integrity };
   }
 }
 
@@ -362,7 +453,7 @@ export function assertHarnessFailuresConsumed(): void {
 }
 
 export function wranglerHarness(
-  world: ProviderWorld = providerWorld(),
+  world: ProviderWorld = providerWorld('uuid'),
   options: PlainWorkerHarnessOptions = {},
 ): PlainWorkerHarness & { readonly exportDirectory: string } {
   const exportStore = new HarnessExportStore();
@@ -392,7 +483,7 @@ export function wranglerHarness(
 }
 
 export function directHarness(
-  world: ProviderWorld = providerWorld(),
+  world: ProviderWorld = providerWorld('uuid'),
   options: PlainWorkerHarnessOptions = {},
 ): PlainWorkerHarness {
   const exportStore = new HarnessExportStore();
