@@ -14,10 +14,13 @@ import {
   parseWorkerAttachmentScanProgress,
   WORKER_ATTACHMENT_EVIDENCE_BOUND,
 } from './cloudflare-worker-attachment-scan-state.js';
+import { captureDatabaseExportReceiptCapability } from './database-export-store.js';
 import {
-  captureDatabaseExportReceiptCapability,
-  databaseExportReceiptIdentityFromUnknown,
-} from './database-export-store.js';
+  databaseExportFromUnknown,
+  databaseExportReceiptIdentity,
+  reconcilePersistedDatabaseFromCallbacks,
+  settleDatabaseDeletionUnderBarrier,
+} from './decommission-database.js';
 import {
   classifyDecommissionAdvanceToken,
   DecommissionAdvanceIntentError,
@@ -30,7 +33,6 @@ import { deploymentSpecDigest } from './spec-digest.js';
 import { cloneBoundedPlainData } from './strict-plain-data.js';
 import type {
   ApplicationR2Resource,
-  DatabaseExport,
   DatabaseReference,
   DecommissionAdvanceIntent,
   DecommissionAdvanceToken,
@@ -53,18 +55,12 @@ import { validateDeploymentSpec } from './validation.js';
 
 const ACTION_ERROR = 'decommission advance action is malformed';
 const RESULT_ERROR = 'bounded decommission attachment result is malformed';
-const DATABASE_EXPORT_RESULT_ERROR =
-  'bounded decommission database export result is malformed';
-const DATABASE_REFERENCE_ERROR = 'persisted database reference is malformed';
-const DATABASE_OWNER_ERROR = 'persisted database owner is malformed';
 const D1_APPLICATION_RESOURCES_ERROR =
   'normal decommission D1 work requires every application R2 resource to be deleted';
 const ATTACHMENT_STRING_BYTE_BOUND = 4_096;
 const RESULT_PLAIN_DATA_DEPTH_BOUND = 64;
 const RESULT_PLAIN_DATA_NODE_BOUND = 8_192;
 const RESULT_PLAIN_DATA_BYTE_BOUND = 96 * 1_024;
-const DATABASE_REFERENCE_NODE_BOUND = 8;
-const DATABASE_REFERENCE_BYTE_BOUND = 16_384;
 const SHA256 = /^[0-9a-f]{64}$/u;
 const STRUCTURED_CLONE = structuredClone;
 const NORMAL_ENTRY_PHASES = new Set<NormalDecommissionLifecyclePhase>([
@@ -335,67 +331,15 @@ export async function reconcilePersistedDatabase(
   fence: ExternalMutationFence,
   requireOwner = true,
 ): Promise<(DatabaseReference & { readonly created: false }) | undefined> {
-  const rawDatabase: unknown = await backend.getDatabase(record.databaseId);
-  if (rawDatabase === undefined) {
-    if (allowAbsent) return undefined;
-    throw new Error(`persisted database '${record.databaseId}' is absent`);
-  }
-  let plainDatabase: unknown;
-  try {
-    plainDatabase = cloneBoundedPlainData(rawDatabase, {
-      maxDepth: 1,
-      maxNodes: DATABASE_REFERENCE_NODE_BOUND,
-      maxScalarBytes: DATABASE_REFERENCE_BYTE_BOUND,
-      maxSerializedBytes: DATABASE_REFERENCE_BYTE_BOUND,
-      error: () => new Error(DATABASE_REFERENCE_ERROR),
-    });
-    Reflect.apply(STRUCTURED_CLONE, undefined, [rawDatabase]);
-  } catch {
-    throw new Error(DATABASE_REFERENCE_ERROR);
-  }
-  if (
-    !plainDatabase ||
-    typeof plainDatabase !== 'object' ||
-    Array.isArray(plainDatabase)
-  ) {
-    throw new Error(DATABASE_REFERENCE_ERROR);
-  }
-  const candidate = plainDatabase as Record<string, unknown>;
-  if (
-    !boundedString(candidate.id) ||
-    !boundedString(candidate.name) ||
-    candidate.created !== false
-  ) {
-    throw new Error(DATABASE_REFERENCE_ERROR);
-  }
-  const database = {
-    id: candidate.id,
-    name: candidate.name,
-    created: false as const,
-  };
-  if (
-    database.id !== record.databaseId ||
-    database.name !== record.databaseName
-  ) {
-    throw new Error(
-      `persisted database '${record.databaseId}' resolved with unexpected identity '${database.id}:${database.name}'`,
-    );
-  }
-  if (requireOwner) {
-    const owner: unknown = await backend.readDeploymentIdentity(
-      database,
-      fence,
-    );
-    if (owner !== undefined && !boundedString(owner)) {
-      throw new Error(DATABASE_OWNER_ERROR);
-    }
-    if (owner !== record.tenantTag) {
-      throw new Error(
-        `refusing database operation for '${database.id}' owned by '${owner ?? 'no deployment'}'`,
-      );
-    }
-  }
-  return database;
+  return reconcilePersistedDatabaseFromCallbacks({
+    getDatabase: (databaseId) => backend.getDatabase(databaseId),
+    readOwner: (database, currentFence) =>
+      backend.readDeploymentIdentity(database, currentFence),
+    record,
+    allowAbsent,
+    requireOwner,
+    fence,
+  });
 }
 
 function requireCapability(
@@ -432,23 +376,6 @@ function receiptCapability(backend: ProvisioningBackend): ReceiptCapability {
     authority: captured.authority,
     exportReceipt: captured.method as ReceiptCapability['exportReceipt'],
   };
-}
-
-function databaseReceiptIdentity(
-  record: Pick<FleetRecord, 'databaseId'>,
-  operationId: string,
-  authority: string,
-  expectedAuthority: string,
-) {
-  return databaseExportReceiptIdentityFromUnknown(
-    {
-      version: 1,
-      authority,
-      databaseId: record.databaseId,
-      operationId,
-    },
-    expectedAuthority,
-  );
 }
 
 /** @internal Cross-field fence before normal-decommission D1 work. */
@@ -1277,20 +1204,6 @@ type ScanDecommissionIntent = Extract<
   { readonly state: 'discover' | 'verify' }
 >;
 
-type Settlement<Value> =
-  | Readonly<{ status: 'fulfilled'; value: Value }>
-  | Readonly<{ status: 'rejected'; reason: unknown }>;
-
-async function settleOperation<Value>(
-  operation: () => Promise<Value>,
-): Promise<Settlement<Value>> {
-  try {
-    return { status: 'fulfilled', value: await operation() };
-  } catch (reason) {
-    return { status: 'rejected', reason };
-  }
-}
-
 function selectedReceiptAuthority(intent: ActiveDecommissionIntent): string {
   const authority = intent.databaseExportReceiptAuthority;
   if (typeof authority !== 'string' || authority.length === 0) {
@@ -1323,45 +1236,6 @@ function databasePreDeletePurpose(
   };
 }
 
-function databaseExportFromUnknown(
-  value: unknown,
-  databaseId: string,
-): DatabaseExport {
-  let plain: unknown;
-  try {
-    plain = cloneBoundedPlainData(value, {
-      maxDepth: RESULT_PLAIN_DATA_DEPTH_BOUND,
-      maxNodes: RESULT_PLAIN_DATA_NODE_BOUND,
-      maxScalarBytes: RESULT_PLAIN_DATA_BYTE_BOUND,
-      maxSerializedBytes: RESULT_PLAIN_DATA_BYTE_BOUND,
-      error: () => new Error(DATABASE_EXPORT_RESULT_ERROR),
-    });
-    Reflect.apply(STRUCTURED_CLONE, undefined, [value]);
-  } catch {
-    throw new Error(DATABASE_EXPORT_RESULT_ERROR);
-  }
-  if (!plain || typeof plain !== 'object' || Array.isArray(plain)) {
-    throw new Error(DATABASE_EXPORT_RESULT_ERROR);
-  }
-  const candidate = plain as Record<string, unknown>;
-  if (
-    candidate.databaseId !== databaseId ||
-    !boundedString(candidate.location) ||
-    !Number.isSafeInteger(candidate.size) ||
-    Number(candidate.size) < 1 ||
-    typeof candidate.sha256 !== 'string' ||
-    !SHA256.test(candidate.sha256)
-  ) {
-    throw new Error(DATABASE_EXPORT_RESULT_ERROR);
-  }
-  return {
-    databaseId,
-    location: candidate.location,
-    size: Number(candidate.size),
-    sha256: candidate.sha256,
-  };
-}
-
 async function completeDatabaseDecommission(
   lease: FleetStateLease,
   record: FleetRecord,
@@ -1388,28 +1262,6 @@ async function completeDatabaseDecommission(
   return writeIntent(lease, nextRecord, completeIntent);
 }
 
-async function deleteDatabaseUnderBarrier(
-  backend: ProvisioningBackend,
-  lease: FleetStateLease,
-  record: FleetRecord,
-  database: DatabaseReference,
-  barrier: FleetRecord,
-): Promise<FleetRecord> {
-  await lease.assertOwned();
-  const deletion = await settleOperation(() =>
-    backend.deleteDatabase(database, lease),
-  );
-  await lease.assertOwned();
-  const readback = await settleOperation(() =>
-    backend.getDatabase(record.databaseId),
-  );
-  await lease.assertOwned();
-  if (readback.status === 'rejected') throw readback.reason;
-  if (readback.value === undefined) return barrier;
-  if (deletion.status === 'rejected') throw deletion.reason;
-  throw new Error(`database '${record.databaseId}' remains after deletion`);
-}
-
 async function advanceDatabaseTransition(
   options: AdvanceDecommissionDeploymentOptions,
   lease: FleetStateLease,
@@ -1419,7 +1271,7 @@ async function advanceDatabaseTransition(
 ): Promise<FleetRecord> {
   const clock = options.clock ?? Date.now;
   if (intent.lifecyclePhase === 'application-resources-deleted') {
-    databaseReceiptIdentity(
+    databaseExportReceiptIdentity(
       record,
       intent.operationId,
       receipt.authority,
@@ -1515,7 +1367,7 @@ async function consumeDatabaseVerify(
   await residual(options.spec, record, database, lease);
   if (intent.purpose.kind === 'database-pre-export') {
     await lease.assertOwned();
-    const identity = databaseReceiptIdentity(
+    const identity = databaseExportReceiptIdentity(
       record,
       intent.operationId,
       selectedReceiptAuthority(intent),
@@ -1547,13 +1399,13 @@ async function consumeDatabaseVerify(
     {},
     { state: 'transitioning', lifecyclePhase: 'database-deleting' },
   );
-  return deleteDatabaseUnderBarrier(
-    options.backend,
+  return settleDatabaseDeletionUnderBarrier({
     lease,
-    record,
-    database,
+    databaseId: record.databaseId,
     barrier,
-  );
+    deleteDatabase: () => options.backend.deleteDatabase(database, lease),
+    readDatabase: () => options.backend.getDatabase(record.databaseId),
+  });
 }
 
 async function advanceAttachmentScan(
@@ -1833,7 +1685,7 @@ async function advanceUnderLease(
     ) {
       assertNormalDecommissionD1ResourcesDeleted(record);
       const receipt = receiptCapability(backend);
-      databaseReceiptIdentity(
+      databaseExportReceiptIdentity(
         record,
         intent.operationId,
         selectedReceiptAuthority(intent),
@@ -1861,7 +1713,7 @@ async function advanceUnderLease(
       operationId,
       revision: 0,
     });
-    databaseReceiptIdentity(
+    databaseExportReceiptIdentity(
       record,
       operationId,
       receipt.authority,
@@ -1891,7 +1743,7 @@ async function advanceUnderLease(
     }
     const receipt = receiptCapability(backend);
     if (intent.purpose.kind !== 'application-r2-detach') {
-      databaseReceiptIdentity(
+      databaseExportReceiptIdentity(
         record,
         intent.operationId,
         selectedReceiptAuthority(intent),
@@ -1951,7 +1803,7 @@ async function advanceUnderLease(
   }
   const receipt = receiptCapability(backend);
   if (isD1Action) {
-    databaseReceiptIdentity(
+    databaseExportReceiptIdentity(
       record,
       intent.operationId,
       selectedReceiptAuthority(intent),

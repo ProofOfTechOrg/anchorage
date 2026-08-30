@@ -18,6 +18,7 @@ Source map:
 - `cloudflare-client.ts`, `cloudflare-ordinary-worker-operations.ts`, `cloudflare-provider-errors.ts`, `cloudflare-rate-coordinator.ts`: provider API (the client, the ordinary-Worker operations behind it, the SDK-error helpers) and its shared quota fence
 - `cloudflare-client-config.ts`, `strict-plain-data.ts`, `cloudflare-worker-attachment-scan-state.ts`, `cloudflare-worker-attachment-scan.ts`: shared SDK retry bounds, strict resumable state, and the request-bounded account-wide D1/R2 attachment scanner
 - `decommission-intent.ts`: strict durable decommission shell and continuation-token codecs
+- `decommission-database.ts`: provider-neutral bounded D1 reference, receipt, export-result, and deletion-settlement choreography
 - `json-field-reads.ts`: JSON field readers shared by provider adapters and error sanitization
 - `state-store.ts`, `migration-ledger.ts`, `d1-fleet-state-database.ts`, `database-export-store.ts`, `export-file-name.ts`, `export-store.ts`, `r2-export-store.ts`: durable fleet state (`d1-fleet-state-database.ts` adapts a Workers D1 binding to the state store's database port; `database-export-store.ts` declares `DurableDatabaseExportStore`, which `export-store.ts` implements over the filesystem and `r2-export-store.ts` over an R2 binding; `export-file-name.ts` holds the portable-segment check both stores use)
 - `workers/`: the platform's own deployed Workers, published as separate export entries

@@ -15,6 +15,43 @@ const cli = fileURLToPath(
 const configPath = fileURLToPath(
   new URL('../.dependency-cruiser.cjs', import.meta.url),
 );
+const erasedDependencyTypes = new Set(['type-only', 'type-import']);
+const decommissionAdvance =
+  'packages/fleet-control/src/decommission-advance.ts';
+const backendSwitch = 'packages/fleet-control/src/backend-switch.ts';
+const switchProvider =
+  'packages/fleet-control/src/workers-for-platforms-backend-switch-provider.ts';
+
+function runtimeAdjacency(report) {
+  return new Map(
+    report.modules.map((module) => [
+      module.source,
+      module.dependencies
+        .filter(
+          (dependency) =>
+            !dependency.dependencyTypes.some((type) =>
+              erasedDependencyTypes.has(type),
+            ),
+        )
+        .map((dependency) => dependency.resolved)
+        .filter((resolved) => typeof resolved === 'string')
+        .sort(),
+    ]),
+  );
+}
+
+function reaches(adjacency, source, target) {
+  const visited = new Set();
+  const pending = [source];
+  while (pending.length > 0) {
+    const current = pending.shift();
+    if (current === target) return true;
+    if (current === undefined || visited.has(current)) continue;
+    visited.add(current);
+    pending.push(...(adjacency.get(current) ?? []));
+  }
+  return false;
+}
 
 const controls = {
   'flowsafe-public-entry-no-agent-host':
@@ -46,6 +83,8 @@ const controls = {
     'scripts/architecture-fixtures/decommission-state-imports-provider.ts',
   'fleet-control-decommission-advance-is-transport-neutral':
     'scripts/architecture-fixtures/decommission-advance-imports-provider.ts',
+  'fleet-control-decommission-database-is-provider-neutral':
+    'scripts/architecture-fixtures/decommission-database-imports-provider.ts',
   'fleet-control-strict-plain-data-is-import-free':
     'scripts/architecture-fixtures/decommission-state-imports-provider.ts',
   'fleet-control-ports-do-not-reach-d1-adapter':
@@ -67,13 +106,17 @@ test('every architecture rule has an executable positive control', () => {
 
 for (const [ruleName, fixture] of Object.entries(controls)) {
   test(`${ruleName} rejects its positive control`, () => {
+    const entries =
+      ruleName === 'fleet-control-decommission-advance-is-transport-neutral'
+        ? [fixture, decommissionAdvance]
+        : [fixture];
     const args = [
       cli,
       '--config',
       configPath,
       '--output-type',
       'json',
-      fixture,
+      ...entries,
     ];
     const result = spawnSync(process.execPath, args, {
       cwd: fileURLToPath(new URL('..', import.meta.url)),
@@ -121,11 +164,38 @@ for (const [ruleName, fixture] of Object.entries(controls)) {
       assert.ok(
         report.summary.violations.some(
           (violation) =>
-            violation.rule.name === ruleName &&
-            violation.to === 'packages/fleet-control/src/cloudflare-client.ts',
+            violation.rule.name === ruleName && violation.to === switchProvider,
         ),
-        'decommission advance control did not reject the provider client',
+        'decommission advance control did not reject the concrete switch provider',
       );
+      const adjacency = runtimeAdjacency(report);
+      assert.equal(
+        reaches(adjacency, decommissionAdvance, backendSwitch),
+        false,
+      );
+      assert.equal(
+        reaches(adjacency, decommissionAdvance, switchProvider),
+        false,
+      );
+      assert.equal(reaches(adjacency, fixture, backendSwitch), true);
+      assert.equal(reaches(adjacency, fixture, switchProvider), true);
+    }
+    if (
+      ruleName === 'fleet-control-decommission-database-is-provider-neutral'
+    ) {
+      assert.deepEqual([...new Set(violations)], [ruleName]);
+      for (const target of [
+        'packages/fleet-control/src/cloudflare-client.ts',
+        switchProvider,
+      ]) {
+        assert.ok(
+          report.summary.violations.some(
+            (violation) =>
+              violation.rule.name === ruleName && violation.to === target,
+          ),
+          `decommission database control did not reject ${target}`,
+        );
+      }
     }
     if (ruleName === 'fleet-control-strict-plain-data-is-import-free') {
       for (const target of ['cloudflare', 'crypto']) {

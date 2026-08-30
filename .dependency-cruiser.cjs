@@ -215,8 +215,26 @@ module.exports = {
         ],
       },
       to: {
-        path: '(?:^packages/fleet-control/src/(?:cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors|wrangler-plain-worker-provisioning-api|wrangler-loop-backend|wrangler-runner|export-file-name|export-store|r2-export-store|provision|fleet|index)\\.ts$|^packages/fleet-control/src/workers/|^cloudflare(?:/|$)|(?:^|/)node_modules/(?:\\.pnpm/)?cloudflare(?:@|/))',
+        path: '(?:^packages/fleet-control/src/(?:cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors|workers-for-platforms-backend-switch-provider|wrangler-plain-worker-provisioning-api|wrangler-loop-backend|wrangler-runner|export-file-name|export-store|r2-export-store|provision|fleet|index)\\.ts$|^packages/fleet-control/src/workers/|^cloudflare(?:/|$)|(?:^|/)node_modules/(?:\\.pnpm/)?cloudflare(?:@|/))',
         reachable: true,
+      },
+    },
+    {
+      name: 'fleet-control-decommission-database-is-provider-neutral',
+      severity: 'error',
+      comment:
+        'The shared bounded-D1 choreography is a provider-neutral runtime leaf. It may import only the database receipt port and strict plain-data guard at runtime; provider shapes remain type-only callback contracts.',
+      from: {
+        path: [
+          '^packages/fleet-control/src/decommission-database\\.ts$',
+          '^scripts/architecture-fixtures/decommission-database-imports-provider\\.ts$',
+        ],
+      },
+      to: {
+        path: '.*',
+        pathNot:
+          '^packages/fleet-control/src/(?:database-export-store|strict-plain-data)\\.ts$',
+        dependencyTypesNot: ['type-only', 'type-import'],
       },
     },
     {
