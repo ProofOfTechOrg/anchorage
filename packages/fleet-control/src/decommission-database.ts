@@ -46,8 +46,10 @@ function boundedString(value: unknown): value is string {
   );
 }
 
+/** @internal Callback contract for provider-neutral persisted-D1 validation. */
 export interface ReconcilePersistedDatabaseFromCallbacksOptions {
   readonly getDatabase: (databaseId: string) => Promise<unknown>;
+  /** Required when `requireOwner` is true; otherwise it is not called. */
   readonly readOwner?: (
     database: DatabaseReference,
     fence: ExternalMutationFence,
@@ -61,6 +63,7 @@ export interface ReconcilePersistedDatabaseFromCallbacksOptions {
   readonly fence: ExternalMutationFence;
 }
 
+/** @internal Reconciles one persisted database through provider-neutral callbacks. */
 export async function reconcilePersistedDatabaseFromCallbacks(
   options: ReconcilePersistedDatabaseFromCallbacksOptions,
 ): Promise<(DatabaseReference & { readonly created: false }) | undefined> {
@@ -127,6 +130,7 @@ export async function reconcilePersistedDatabaseFromCallbacks(
   return database;
 }
 
+/** @internal Reconstructs a bounded export result for the expected database. */
 export function databaseExportFromUnknown(
   value: unknown,
   databaseId: string,
@@ -166,6 +170,7 @@ export function databaseExportFromUnknown(
   };
 }
 
+/** @internal Constructs the canonical receipt identity for one operation. */
 export function databaseExportReceiptIdentity(
   record: Pick<FleetRecord, 'databaseId'>,
   operationId: string,
@@ -183,6 +188,7 @@ export function databaseExportReceiptIdentity(
   );
 }
 
+/** @internal Settles a fenced deletion and readback under a durable barrier. */
 export async function settleDatabaseDeletionUnderBarrier<Barrier>(options: {
   readonly lease: Pick<ExternalMutationFence, 'assertOwned'>;
   readonly databaseId: string;
