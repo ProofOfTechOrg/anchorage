@@ -211,7 +211,7 @@ describe('application bindings', () => {
     ).toBe(false);
   });
 
-  it('persists R2 authorization and reconciles lost create and delete responses', async () => {
+  it('validates, advances, and recovers the complete application R2 lifecycle matrix', async () => {
     const deployment = spec({
       vars: [],
       secrets: [],

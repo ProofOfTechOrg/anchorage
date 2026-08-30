@@ -90,7 +90,7 @@ export interface AdvanceDecommissionDeploymentOptions {
   readonly spec: DeploymentSpec;
   /** Typed command; its token remains an unknown strict-codec boundary. */
   readonly action: DecommissionAdvanceAction;
-  /** R1 provider-attempt budget, integer 9..1,000. */
+  /** Provider-fetch attempt budget for each bounded attachment scan, integer 9..1,000. */
   readonly maxProviderRequests: number;
   /** Call-local cancellation, never persisted. */
   readonly signal?: AbortSignal;
@@ -1037,7 +1037,7 @@ async function advanceR2Transition(
 ): Promise<FleetRecord> {
   const resources = record.applicationResources ?? [];
   const actionableIndex = resources.findIndex(
-    (resource) => resource.state !== 'reserved' && resource.state !== 'deleted',
+    (resource) => resource.state !== 'deleted',
   );
   const actionable =
     actionableIndex < 0 ? undefined : resources[actionableIndex];
@@ -1150,7 +1150,9 @@ async function advanceR2Scan(
   >,
 ): Promise<FleetRecord> {
   if (intent.purpose.kind !== 'application-r2-detach') {
-    throw new Error('R2b-A cannot consume a database attachment purpose');
+    throw new Error(
+      'application R2 attachment scanning cannot consume a database attachment purpose',
+    );
   }
   const resource = record.applicationResources?.[intent.purpose.resourceIndex];
   if (!resource) malformedResult();

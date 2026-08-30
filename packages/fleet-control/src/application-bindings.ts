@@ -893,11 +893,7 @@ export async function convergeApplicationR2Deletion(options: {
 
     resources = [...result.resources];
     await options.persist(resources);
-    if (
-      ['reserved', 'deleted'].includes(
-        resources[result.resourceIndex]?.state ?? '',
-      )
-    ) {
+    if (resources[result.resourceIndex]?.state === 'deleted') {
       startResourceIndex = result.resourceIndex + 1;
     } else {
       startResourceIndex = result.resourceIndex;
