@@ -23,10 +23,7 @@ import {
   databaseExportReceiptIdentityFromUnknown,
 } from './database-export-store.js';
 import { assertFileName } from './export-file-name.js';
-import type {
-  DatabaseExportIntegrity,
-  DatabaseExportReceiptIdentity,
-} from './types.js';
+import type { DatabaseExportIntegrity } from './types.js';
 
 type FileHandle = Awaited<ReturnType<typeof open>>;
 
@@ -679,7 +676,6 @@ async function cleanupTemporaryHandle(
 
 async function publishReceipt(
   input: {
-    readonly identity: DatabaseExportReceiptIdentity;
     readonly body: ReadableStream<Uint8Array>;
     readonly contentLength?: number;
   },
@@ -910,7 +906,6 @@ async function writeReceipt(
       }
       return await publishReceipt(
         {
-          identity,
           body: body as ReadableStream<Uint8Array>,
           ...(contentLengthValue === undefined
             ? {}
