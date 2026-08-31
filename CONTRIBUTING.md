@@ -91,7 +91,8 @@ repository maintenance and docs-only changes do not need one.
 
 ## Releasing
 
-Versioning and publishing run through [changesets](.changeset/README.md), with
+Versioning and publishing run through
+[Changesets](https://github.com/changesets/changesets), with
 version bumps happening ON `dev` (bump-on-dev). Feature and fix PRs target the
 `dev` integration branch and include a changeset (`pnpm exec changeset` — pick
 the packages, a semver bump, and write the CHANGELOG entry) when they change
