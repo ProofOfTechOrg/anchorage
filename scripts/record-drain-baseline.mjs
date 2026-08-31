@@ -42,7 +42,9 @@ const BASELINE_FILE = join(
 );
 const BASELINE_RELATIVE_PATH =
   'packages/fleet-control/test/fixtures/fleet-inventory-drain-baseline.ts';
-const BIOME_BINARY = join(REPOSITORY_ROOT, 'node_modules', '.bin', 'biome');
+// `pnpm exec` rather than a hard-coded node_modules/.bin path, matching
+// build-api-docs.mjs; the .bin shim location is a pnpm implementation detail.
+const PNPM = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm';
 
 function usage(message) {
   process.stderr.write(
@@ -169,15 +171,11 @@ export const DRAIN_BASELINE_INVENTORY = ${render(inventory)} as const satisfies 
 }
 
 function formatGeneratedFile() {
-  if (!existsSync(BIOME_BINARY)) {
-    throw new Error(
-      `biome is not installed at ${BIOME_BINARY}; run pnpm install first`,
-    );
-  }
-  const result = spawnSync(BIOME_BINARY, ['check', '--write', BASELINE_FILE], {
-    cwd: REPOSITORY_ROOT,
-    stdio: ['ignore', 'ignore', 'inherit'],
-  });
+  const result = spawnSync(
+    PNPM,
+    ['exec', 'biome', 'check', '--write', BASELINE_FILE],
+    { cwd: REPOSITORY_ROOT, stdio: ['ignore', 'ignore', 'inherit'] },
+  );
   if (result.error) throw result.error;
   if (result.status !== 0) {
     throw new Error('biome refused the generated baseline');

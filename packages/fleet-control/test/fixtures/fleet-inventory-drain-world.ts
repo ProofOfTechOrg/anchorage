@@ -18,6 +18,14 @@
  * ownership mismatch, both arms of `incomplete-deployment` (public reachability
  * and a zone route on a trusted Worker), and the host-route state-egress parse
  * failure.
+ *
+ * PRESERVED BEHAVIOR NOTE: the recorded request ORDER is part of the frozen
+ * baseline, and parts of it come from `Promise.all` sites in the drain
+ * (`cloudflare-client.ts` per-script inventory and dispatch inspection). That
+ * order is stable for this world but is not guaranteed by construction, so a
+ * later rewrite must preserve it deliberately rather than assume it. If a
+ * rewrite legitimately changes concurrency, the ordering change is a
+ * compatibility decision to escalate — not a baseline to quietly re-record.
  */
 
 import { CloudflareProvisioningClient } from '../../src/cloudflare-client.js';
