@@ -96,6 +96,8 @@ interface BoundedDecommissionProbe {
   }>;
 }
 
+const INVENTORY_OPERATION_ID = '123e4567-e89b-42d3-a456-426614174200';
+
 function harnessOptions() {
   return {
     root: ROOT,
@@ -1290,5 +1292,236 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
         'anchorage_platform_plane_leases',
       ],
     });
+  });
+
+  it('applies the inventory start batch atomically under concurrent stores', async () => {
+    const result = await probe<{
+      started: number;
+      rejected: number;
+      head: {
+        activeOperationId: string | null;
+        latestFinalizedGeneration: number | null;
+        nextGeneration: number;
+      };
+      runs: {
+        operationId: string;
+        generation: number;
+        digestMatches: boolean;
+        finalized: boolean;
+      }[];
+      generation: number;
+    }>('inventory-start-atomicity');
+
+    expect(result.started).toBe(1);
+    expect(result.rejected).toBe(15);
+    expect(result.head).toEqual({
+      activeOperationId: INVENTORY_OPERATION_ID,
+      latestFinalizedGeneration: null,
+      nextGeneration: 2,
+    });
+    expect(result.runs).toEqual([
+      {
+        operationId: INVENTORY_OPERATION_ID,
+        generation: 1,
+        digestMatches: true,
+        finalized: false,
+      },
+    ]);
+    expect(result.generation).toBe(1);
+  });
+
+  it('admits one commit writer and converges the rest under concurrent batches', async () => {
+    const result = await probe<{
+      committed: number;
+      converged: number;
+      conflicts: number;
+      corrupt: number;
+      winnerIsWriter: boolean;
+      lostResponseReplay: string;
+      revision: number;
+      staleReplay: string;
+      rowCounts: { kind: string; count: number }[];
+    }>('inventory-commit-concurrency');
+
+    expect(result).toMatchObject({
+      committed: 1,
+      converged: 0,
+      conflicts: 15,
+      corrupt: 0,
+      winnerIsWriter: true,
+      lostResponseReplay: 'converged',
+      revision: 2,
+      staleReplay: 'conflict',
+    });
+    // The guarded staging inserts fence every loser out, so only the winner's
+    // own meta ordinal and the later trailing chunk's row exist.
+    expect(result.rowCounts).toEqual([
+      { kind: 'deployment', count: 1 },
+      { kind: 'finding', count: 1 },
+      { kind: 'meta', count: 2 },
+      { kind: 'registration', count: 1 },
+    ]);
+  });
+
+  it('converges a lost finalize response through the run and head readback', async () => {
+    const result = await probe<{
+      first: { generation: number; factCount: number; finalizedAtMs: number };
+      replayed: { generation: number };
+      identical: boolean;
+      head: {
+        activeOperationId: string | null;
+        latestFinalizedGeneration: number | null;
+      };
+    }>('inventory-finalize-convergence');
+
+    expect(result.identical).toBe(true);
+    expect(result.first.generation).toBe(1);
+    expect(result.first.factCount).toBe(1);
+    expect(result.first.finalizedAtMs).toBeGreaterThan(0);
+    expect(result.head).toEqual({
+      activeOperationId: null,
+      latestFinalizedGeneration: 1,
+    });
+  });
+
+  it('reads back a finalized generation with its manifest and ordinals', async () => {
+    const result = await probe<{
+      ref: {
+        generation: number;
+        rowManifest: Record<string, number>;
+        factCount: number;
+      };
+      latestMatches: boolean;
+      rowOrdinals: string[];
+      factOrdinals: string[];
+    }>('inventory-generation-readback');
+
+    expect(result.ref.generation).toBe(1);
+    expect(result.ref.rowManifest).toMatchObject({
+      registration: 1,
+      deployment: 1,
+      finding: 1,
+      meta: 0,
+    });
+    expect(result.ref.factCount).toBe(1);
+    expect(result.latestMatches).toBe(true);
+    expect(result.rowOrdinals).toEqual([
+      'deployment:0',
+      'finding:0',
+      'registration:0',
+    ]);
+    expect(result.factOrdinals).toEqual(['0:secret-name:0']);
+  });
+
+  it('refuses a corrupt generation and leaves a mismatched finalize staging', async () => {
+    const result = await probe<{
+      readError: ProbeError;
+      finalizeError: ProbeError;
+      stateAfterFinalize: string | null;
+      latestGeneration: number | null;
+    }>('inventory-corrupt-unreadable');
+
+    expect(result.readError.message).toBe(
+      'fleet inventory generation 1 is corrupt',
+    );
+    expect(result.finalizeError.message).toMatch(
+      /^fleet inventory run '[0-9a-f-]+' does not match its finalize manifest$/,
+    );
+    expect(result.stateAfterFinalize).toBe('staging');
+    expect(result.latestGeneration).toBe(1);
+  });
+
+  it('prunes generations in stable order while protecting latest and pinned', async () => {
+    const result = await probe<{
+      deleted: number[];
+      pinnedSurvives: number;
+      surviving: number[];
+      survivingRowGenerations: number[];
+    }>('inventory-prune-order');
+
+    expect(result.deleted).toEqual([1, 1, 0, 1]);
+    expect(result.pinnedSurvives).toBe(2);
+    expect(result.surviving).toEqual([4]);
+    expect(result.survivingRowGenerations).toEqual([4]);
+  });
+
+  it('upserts the inventory lease when expired and keeps it alive by renewal', async () => {
+    const result = await probe<{
+      takeover: string | ProbeError;
+      heartbeatObserved: boolean;
+      contenderRejected: boolean;
+      leasesAfterRelease: number;
+    }>('inventory-lease-lifecycle');
+
+    expect(result.takeover).toBe('acquired');
+    expect(result.heartbeatObserved).toBe(true);
+    expect(result.contenderRejected).toBe(true);
+    expect(result.leasesAfterRelease).toBe(0);
+  }, 30_000);
+
+  it('initializes the six inventory tables under concurrent first reads on fresh D1 storage', async () => {
+    await server.reset();
+    worker = server.getWorker();
+
+    const result = await probe<{
+      latest: number;
+      columns: Record<string, string[]>;
+      tables: string[];
+      generation: number | null;
+    }>('inventory-cold-concurrent-schema');
+
+    expect(result.latest).toBe(16);
+    expect(result.tables).toEqual([
+      'anchorage_fleet_inventory_deployment_facts',
+      'anchorage_fleet_inventory_heads',
+      'anchorage_fleet_inventory_leases',
+      'anchorage_fleet_inventory_pins',
+      'anchorage_fleet_inventory_rows',
+      'anchorage_fleet_inventory_runs',
+    ]);
+    expect(result.columns).toEqual({
+      anchorage_fleet_inventory_heads: [
+        'account_id:TEXT',
+        'active_operation_id:TEXT',
+        'latest_finalized_generation:INTEGER',
+        'next_generation:INTEGER',
+      ],
+      anchorage_fleet_inventory_runs: [
+        'operation_id:TEXT',
+        'account_id:TEXT',
+        'generation:INTEGER',
+        'options_digest:TEXT',
+        'run_record:TEXT',
+        'created_at_ms:INTEGER',
+        'finalized_at_ms:INTEGER',
+      ],
+      anchorage_fleet_inventory_rows: [
+        'account_id:TEXT',
+        'generation:INTEGER',
+        'kind:TEXT',
+        'ordinal:INTEGER',
+        'payload:TEXT',
+      ],
+      anchorage_fleet_inventory_deployment_facts: [
+        'account_id:TEXT',
+        'generation:INTEGER',
+        'deployment_ordinal:INTEGER',
+        'fact_kind:TEXT',
+        'fact_ordinal:INTEGER',
+        'payload:TEXT',
+      ],
+      anchorage_fleet_inventory_leases: [
+        'account_id:TEXT',
+        'owner_token:TEXT',
+        'expires_at:INTEGER',
+      ],
+      anchorage_fleet_inventory_pins: [
+        'account_id:TEXT',
+        'generation:INTEGER',
+        'pinned_by:TEXT',
+        'pinned_at_ms:INTEGER',
+      ],
+    });
+    expect(result.generation).toBe(1);
   });
 });

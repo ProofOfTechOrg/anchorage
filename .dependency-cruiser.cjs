@@ -220,6 +220,22 @@ module.exports = {
       },
     },
     {
+      name: 'fleet-control-inventory-state-does-not-reach-provider',
+      severity: 'error',
+      comment:
+        'Persisted account inventory state and its D1 run store are a provider-free authority boundary. Keeping provider clients, operations, and error classification out of their reachable graph prevents the inventory codecs and guarded batches from acquiring credential or transport dependencies.',
+      from: {
+        path: [
+          '^packages/fleet-control/src/(?:fleet-inventory-state|d1-fleet-inventory-run-store)\\.ts$',
+          '^scripts/architecture-fixtures/inventory-state-imports-provider\\.ts$',
+        ],
+      },
+      to: {
+        path: '(?:^packages/fleet-control/src/(?:cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors)\\.ts$|^cloudflare(?:/|$)|(?:^|/)node_modules/(?:\\.pnpm/)?cloudflare(?:@|/))',
+        reachable: true,
+      },
+    },
+    {
       name: 'fleet-control-decommission-advance-is-transport-neutral',
       severity: 'error',
       comment:
@@ -305,10 +321,10 @@ module.exports = {
       name: 'fleet-control-ports-do-not-reach-d1-adapter',
       severity: 'error',
       comment:
-        'The D1 adapter implements ports that state-store.ts and migration-ledger.ts declare and imports state-store.ts, which reaches migration-ledger.ts through backend-switch.ts, so a port module reaching the adapter would close a cycle.',
+        'The D1 adapter implements ports that state-store.ts and migration-ledger.ts declare and imports state-store.ts, which reaches migration-ledger.ts through backend-switch.ts, so a port module reaching the adapter would close a cycle. d1-fleet-inventory-run-store.ts consumes the same port and must stay binding-agnostic for the same reason.',
       from: {
         path: [
-          '^packages/fleet-control/src/(?:state-store|migration-ledger)\\.ts$',
+          '^packages/fleet-control/src/(?:state-store|migration-ledger|d1-fleet-inventory-run-store)\\.ts$',
           '^scripts/architecture-fixtures/fleet-control-port-imports-d1-adapter\\.ts$',
         ],
       },

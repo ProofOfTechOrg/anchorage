@@ -7,8 +7,18 @@ import {
 } from '../../src/application-bindings.js';
 import { D1CloudflareApiRateCoordinator } from '../../src/cloudflare-rate-coordinator.js';
 import { initialWorkerAttachmentScan } from '../../src/cloudflare-worker-attachment-scan-state.js';
+import { D1FleetInventoryRunStore } from '../../src/d1-fleet-inventory-run-store.js';
 import { D1FleetStateDatabase } from '../../src/d1-fleet-state-database.js';
 import { advanceDecommissionDeployment } from '../../src/decommission-advance.js';
+import {
+  canonicalFleetInventoryRunOptions,
+  emptyFleetInventoryRowCounts,
+  type FleetInventoryRowKind,
+  type FleetInventoryRunRecord,
+  type FleetInventoryStagedFact,
+  type FleetInventoryStagedRow,
+  fleetInventoryOptionsDigest,
+} from '../../src/fleet-inventory-state.js';
 import {
   canonicalDeploymentEgressPolicy,
   externalEgressProxyScriptName,
@@ -2537,6 +2547,589 @@ async function coldConcurrentSchemaInitialization(
   };
 }
 
+const INVENTORY_TABLES = [
+  'anchorage_fleet_inventory_deployment_facts',
+  'anchorage_fleet_inventory_heads',
+  'anchorage_fleet_inventory_leases',
+  'anchorage_fleet_inventory_pins',
+  'anchorage_fleet_inventory_rows',
+  'anchorage_fleet_inventory_runs',
+];
+const INVENTORY_LEASE_TABLE = 'anchorage_fleet_inventory_leases';
+const INVENTORY_ACCOUNT = 'account-inventory';
+const INVENTORY_OPTIONS = canonicalFleetInventoryRunOptions({
+  hostRoutingKvId: 'kv-host-routing',
+  databaseNamePrefix: 'anchorage-db',
+  scriptNamePrefix: 'anchorage',
+});
+const INVENTORY_DIGEST = fleetInventoryOptionsDigest(INVENTORY_OPTIONS);
+
+function inventoryOperationId(index: number): string {
+  return `123e4567-e89b-42d3-a456-42661417${String(4200 + index)}`;
+}
+
+function inventoryStore(
+  database: FleetStateDatabase,
+): D1FleetInventoryRunStore {
+  return new D1FleetInventoryRunStore(database, {
+    accountId: INVENTORY_ACCOUNT,
+  });
+}
+
+async function readyInventoryStore(
+  db: D1Database,
+): Promise<D1FleetInventoryRunStore> {
+  const store = inventoryStore(new D1FleetStateDatabase(db));
+  await store.latestFinalizedGeneration();
+  for (const table of INVENTORY_TABLES) {
+    await db.prepare(`DELETE FROM ${table}`).run();
+  }
+  return store;
+}
+
+/** Drops the next batch's result rows, reproducing a lost D1 response. */
+function inventoryLostResponse(
+  delegate: FleetStateDatabase,
+): FleetStateDatabase & Readonly<{ loseNextBatch(): void }> {
+  let lose = false;
+  return {
+    query: (sql, bindings) => delegate.query(sql, bindings),
+    execute: (sql, bindings) => delegate.execute(sql, bindings),
+    async batch(statements) {
+      const results = await delegate.batch(statements);
+      if (!lose) return results;
+      lose = false;
+      return results.map(() => []);
+    },
+    loseNextBatch() {
+      lose = true;
+    },
+  };
+}
+
+function inventoryRows(label: string): readonly FleetInventoryStagedRow[] {
+  return [
+    { kind: 'registration', ordinal: 0, payload: { scriptName: label } },
+    { kind: 'deployment', ordinal: 0, payload: { scriptName: label } },
+    {
+      kind: 'finding',
+      ordinal: 0,
+      payload: { detail: `stale route ${label}` },
+    },
+  ];
+}
+
+function inventoryFacts(): readonly FleetInventoryStagedFact[] {
+  return [
+    {
+      deploymentOrdinal: 0,
+      factKind: 'secret-name',
+      factOrdinal: 0,
+      payload: { name: 'ANCHORAGE_NAME_0' },
+    },
+  ];
+}
+
+function inventoryCounts(
+  rows: readonly FleetInventoryStagedRow[],
+): Record<FleetInventoryRowKind, number> {
+  const counts = emptyFleetInventoryRowCounts() as Record<
+    FleetInventoryRowKind,
+    number
+  >;
+  for (const row of rows) counts[row.kind] += 1;
+  return counts;
+}
+
+function inventoryCommitted(
+  record: FleetInventoryRunRecord,
+  rows: readonly FleetInventoryStagedRow[],
+  facts: readonly FleetInventoryStagedFact[],
+): FleetInventoryRunRecord {
+  return {
+    ...record,
+    progress: {
+      ...record.progress,
+      stage: { step: 'finalize' },
+      revision: record.progress.revision + 1,
+      stagedCounts: inventoryCounts(rows),
+      factCount: facts.length,
+      providerRequests: record.progress.providerRequests + 1,
+    },
+    updatedAt: '2026-08-29T00:00:00.000Z',
+  };
+}
+
+async function seedInventoryGeneration(
+  store: D1FleetInventoryRunStore,
+  index: number,
+  rows: readonly FleetInventoryStagedRow[] = inventoryRows(`gen-${index}`),
+  facts: readonly FleetInventoryStagedFact[] = inventoryFacts(),
+): Promise<number> {
+  const operationId = inventoryOperationId(index);
+  return store.withAccountInventoryLease(async (lease) => {
+    const started = await lease.startRun({
+      operationId,
+      options: INVENTORY_OPTIONS,
+      optionsDigest: INVENTORY_DIGEST,
+    });
+    const record = await lease.commitChunk({
+      operationId,
+      expectedRevision: started.progress.revision,
+      runRecord: inventoryCommitted(started, rows, facts),
+      rows,
+      facts,
+    });
+    const ref = await lease.finalizeRun({
+      operationId,
+      expectedRevision: record.progress.revision,
+      manifest: record.progress.stagedCounts,
+      factCount: record.progress.factCount,
+    });
+    return ref.generation;
+  });
+}
+
+async function inventoryStartAtomicity(db: D1Database): Promise<unknown> {
+  await readyInventoryStore(db);
+  const operationId = inventoryOperationId(0);
+  const stores = Array.from({ length: 16 }, () =>
+    inventoryStore(new D1FleetStateDatabase(db)),
+  );
+  const attempts = await Promise.allSettled(
+    stores.map((store) =>
+      store.withAccountInventoryLease((lease) =>
+        lease.startRun({
+          operationId,
+          options: INVENTORY_OPTIONS,
+          optionsDigest: INVENTORY_DIGEST,
+        }),
+      ),
+    ),
+  );
+  const head = await db
+    .prepare(
+      `SELECT active_operation_id, latest_finalized_generation, next_generation
+         FROM anchorage_fleet_inventory_heads WHERE account_id = ?`,
+    )
+    .bind(INVENTORY_ACCOUNT)
+    .first<{
+      active_operation_id: string | null;
+      latest_finalized_generation: number | null;
+      next_generation: number;
+    }>();
+  const run = await db
+    .prepare(
+      `SELECT operation_id, generation, options_digest, finalized_at_ms
+         FROM anchorage_fleet_inventory_runs WHERE account_id = ?`,
+    )
+    .bind(INVENTORY_ACCOUNT)
+    .all<{
+      operation_id: string;
+      generation: number;
+      options_digest: string;
+      finalized_at_ms: number | null;
+    }>();
+  return {
+    started: attempts.filter((attempt) => attempt.status === 'fulfilled')
+      .length,
+    rejected: attempts.filter((attempt) => attempt.status === 'rejected')
+      .length,
+    head: {
+      activeOperationId: head?.active_operation_id ?? null,
+      latestFinalizedGeneration: head?.latest_finalized_generation ?? null,
+      nextGeneration: Number(head?.next_generation),
+    },
+    runs: run.results.map((row) => ({
+      operationId: row.operation_id,
+      generation: Number(row.generation),
+      digestMatches: row.options_digest === INVENTORY_DIGEST,
+      finalized: row.finalized_at_ms !== null,
+    })),
+    generation:
+      run.results.length === 1 ? Number(run.results[0]?.generation) : 0,
+  };
+}
+
+async function inventoryCommitConcurrency(db: D1Database): Promise<unknown> {
+  const store = await readyInventoryStore(db);
+  const operationId = inventoryOperationId(1);
+  // The account lease serializes lease HOLDERS, so the guarded commit batch can
+  // only be raced by concurrent calls under one lease. Concurrency is expressed
+  // exactly like coldConcurrentSchemaInitialization: Promise.allSettled over N
+  // writers inside the one request.
+  return store.withAccountInventoryLease(async (lease) => {
+    const started = await lease.startRun({
+      operationId,
+      options: INVENTORY_OPTIONS,
+      optionsDigest: INVENTORY_DIGEST,
+    });
+    const shared = inventoryRows('race');
+    const writers = Array.from({ length: 16 }, (_unused, index) => {
+      const rows = [
+        ...shared,
+        { kind: 'meta' as const, ordinal: index, payload: { writer: index } },
+      ];
+      const base = inventoryCommitted(started, rows, []);
+      return {
+        operationId,
+        expectedRevision: started.progress.revision,
+        // Each writer's intended record differs, so the winner is the writer
+        // whose own record the guarded UPDATE persisted.
+        runRecord: {
+          ...base,
+          progress: { ...base.progress, providerRequests: index + 1 },
+        },
+        rows,
+        facts: [] as readonly FleetInventoryStagedFact[],
+      };
+    });
+    const settled = await Promise.allSettled(
+      writers.map((input) => lease.commitChunk(input)),
+    );
+    const outcomes = settled.map((result, index) => {
+      if (result.status === 'rejected') {
+        return {
+          index,
+          outcome: (result.reason as Error).message.includes('diverge')
+            ? 'corrupt'
+            : 'conflict',
+        };
+      }
+      const intended = JSON.stringify(writers[index]?.runRecord);
+      return {
+        index,
+        outcome:
+          JSON.stringify(result.value) === intended ? 'committed' : 'converged',
+      };
+    });
+    const winner = outcomes.find((entry) => entry.outcome === 'committed');
+    const winning = writers[winner?.index ?? -1];
+    if (!winning) throw new Error('inventory commit race had no winner');
+    // The winner's own replay is the lost-response case: its rows are already
+    // present byte-identically at the intended revision, so it converges on the
+    // persisted record without advancing the revision a second time.
+    const beforeReplay = (await store.readRunByOperation(operationId))?.progress
+      .revision;
+    const replayResult = await lease.commitChunk(winning).then(
+      (record) => JSON.stringify(record) === JSON.stringify(winning.runRecord),
+      () => false,
+    );
+    const afterReplay = (await store.readRunByOperation(operationId))?.progress
+      .revision;
+    const lostResponseReplay =
+      replayResult && beforeReplay === afterReplay ? 'converged' : 'conflict';
+    const persisted = await store.readRunByOperation(operationId);
+    if (!persisted) throw new Error('inventory commit race lost its run');
+    const trailing = {
+      kind: 'meta' as const,
+      ordinal: 100,
+      payload: { writer: 'trailing' },
+    };
+    const advanced = await lease.commitChunk({
+      operationId,
+      expectedRevision: persisted.progress.revision,
+      runRecord: inventoryCommitted(persisted, [...shared, trailing], []),
+      rows: [trailing],
+      facts: [],
+    });
+    const replayed = writers[0];
+    if (!replayed) throw new Error('inventory commit race had no writer');
+    const staleReplay = await lease.commitChunk(replayed).then(
+      () => 'committed',
+      (error: unknown) =>
+        (error as Error).message.includes('no longer at the expected revision')
+          ? 'conflict'
+          : 'other',
+    );
+    const counts = await db
+      .prepare(
+        `SELECT kind, COUNT(*) AS count FROM anchorage_fleet_inventory_rows
+          WHERE account_id = ? AND generation = ? GROUP BY kind ORDER BY kind`,
+      )
+      .bind(INVENTORY_ACCOUNT, started.progress.generation)
+      .all<{ kind: string; count: number }>();
+    return {
+      committed: outcomes.filter((entry) => entry.outcome === 'committed')
+        .length,
+      converged: outcomes.filter((entry) => entry.outcome === 'converged')
+        .length,
+      conflicts: outcomes.filter((entry) => entry.outcome === 'conflict')
+        .length,
+      corrupt: outcomes.filter((entry) => entry.outcome === 'corrupt').length,
+      winnerIsWriter: typeof winner?.index === 'number',
+      lostResponseReplay,
+      revision: advanced.progress.revision,
+      staleReplay,
+      rowCounts: counts.results.map((row) => ({
+        kind: row.kind,
+        count: Number(row.count),
+      })),
+    };
+  });
+}
+
+async function inventoryFinalizeConvergence(db: D1Database): Promise<unknown> {
+  await readyInventoryStore(db);
+  const database = inventoryLostResponse(new D1FleetStateDatabase(db));
+  const store = inventoryStore(database);
+  const operationId = inventoryOperationId(2);
+  const rows = inventoryRows('finalize');
+  const facts = inventoryFacts();
+  const refs = await store.withAccountInventoryLease(async (lease) => {
+    const started = await lease.startRun({
+      operationId,
+      options: INVENTORY_OPTIONS,
+      optionsDigest: INVENTORY_DIGEST,
+    });
+    const record = await lease.commitChunk({
+      operationId,
+      expectedRevision: started.progress.revision,
+      runRecord: inventoryCommitted(started, rows, facts),
+      rows,
+      facts,
+    });
+    const input = {
+      operationId,
+      expectedRevision: record.progress.revision,
+      manifest: record.progress.stagedCounts,
+      factCount: record.progress.factCount,
+    };
+    database.loseNextBatch();
+    const first = await lease.finalizeRun(input);
+    const replayed = await lease.finalizeRun(input);
+    return { first, replayed };
+  });
+  const head = await db
+    .prepare(
+      `SELECT active_operation_id, latest_finalized_generation
+         FROM anchorage_fleet_inventory_heads WHERE account_id = ?`,
+    )
+    .bind(INVENTORY_ACCOUNT)
+    .first<{
+      active_operation_id: string | null;
+      latest_finalized_generation: number | null;
+    }>();
+  return {
+    first: refs.first,
+    replayed: refs.replayed,
+    identical: JSON.stringify(refs.first) === JSON.stringify(refs.replayed),
+    head: {
+      activeOperationId: head?.active_operation_id ?? null,
+      latestFinalizedGeneration: head?.latest_finalized_generation ?? null,
+    },
+  };
+}
+
+async function inventoryGenerationReadback(db: D1Database): Promise<unknown> {
+  const store = await readyInventoryStore(db);
+  const generation = await seedInventoryGeneration(store, 3);
+  const read = await store.readFinalizedGeneration(generation);
+  const latest = await store.latestFinalizedGeneration();
+  return {
+    ref: read.ref,
+    latestMatches: JSON.stringify(latest) === JSON.stringify(read.ref),
+    rowOrdinals: read.rows.map((row) => `${row.kind}:${row.ordinal}`),
+    factOrdinals: read.facts.map(
+      (fact) =>
+        `${fact.deploymentOrdinal}:${fact.factKind}:${fact.factOrdinal}`,
+    ),
+  };
+}
+
+async function inventoryCorruptUnreadable(db: D1Database): Promise<unknown> {
+  const store = await readyInventoryStore(db);
+  const generation = await seedInventoryGeneration(store, 4);
+  await db
+    .prepare(
+      `DELETE FROM anchorage_fleet_inventory_rows
+        WHERE account_id = ? AND generation = ? AND kind = 'finding'`,
+    )
+    .bind(INVENTORY_ACCOUNT, generation)
+    .run();
+  const readError = await store.readFinalizedGeneration(generation).then(
+    () => null,
+    (error: unknown) => errorShape(error),
+  );
+  const operationId = inventoryOperationId(5);
+  const rows = inventoryRows('mismatch');
+  const facts = inventoryFacts();
+  const finalizeError = await store
+    .withAccountInventoryLease(async (lease) => {
+      const started = await lease.startRun({
+        operationId,
+        options: INVENTORY_OPTIONS,
+        optionsDigest: INVENTORY_DIGEST,
+      });
+      // The persisted record claims more findings than the rows it staged, so
+      // finalize's in-SQL count guard is what refuses.
+      const overstated = inventoryCommitted(started, rows, facts);
+      const record = await lease.commitChunk({
+        operationId,
+        expectedRevision: started.progress.revision,
+        runRecord: {
+          ...overstated,
+          progress: {
+            ...overstated.progress,
+            stagedCounts: { ...overstated.progress.stagedCounts, finding: 9 },
+          },
+        },
+        rows,
+        facts,
+      });
+      return lease.finalizeRun({
+        operationId,
+        expectedRevision: record.progress.revision,
+        manifest: record.progress.stagedCounts,
+        factCount: record.progress.factCount,
+      });
+    })
+    .then(
+      () => null,
+      (error: unknown) => errorShape(error),
+    );
+  const run = await store.readRunByOperation(operationId);
+  return {
+    readError,
+    finalizeError,
+    stateAfterFinalize: run?.state ?? null,
+    latestGeneration:
+      (await store.latestFinalizedGeneration())?.generation ?? null,
+  };
+}
+
+async function inventoryPruneOrder(db: D1Database): Promise<unknown> {
+  const store = await readyInventoryStore(db);
+  for (const index of [10, 11, 12, 13]) {
+    await seedInventoryGeneration(store, index);
+  }
+  await store.pinGeneration({ generation: 2, pinnedBy: 'audit' });
+  const deleted = [
+    await store.pruneInventoryGenerations({ limit: 1 }),
+    await store.pruneInventoryGenerations({ limit: 1 }),
+    await store.pruneInventoryGenerations({ limit: 10 }),
+  ];
+  const pinnedSurvives = (await store.readFinalizedGeneration(2)).ref
+    .generation;
+  await store.releasePin({ generation: 2, pinnedBy: 'audit' });
+  deleted.push(await store.pruneInventoryGenerations({ limit: 10 }));
+  const surviving = await db
+    .prepare(
+      `SELECT generation FROM anchorage_fleet_inventory_runs
+        WHERE account_id = ? ORDER BY generation`,
+    )
+    .bind(INVENTORY_ACCOUNT)
+    .all<{ generation: number }>();
+  const rows = await db
+    .prepare(
+      `SELECT DISTINCT generation FROM anchorage_fleet_inventory_rows
+        WHERE account_id = ? ORDER BY generation`,
+    )
+    .bind(INVENTORY_ACCOUNT)
+    .all<{ generation: number }>();
+  return {
+    deleted: deleted.map((entry) => entry.deleted),
+    pinnedSurvives,
+    surviving: surviving.results.map((row) => Number(row.generation)),
+    survivingRowGenerations: rows.results.map((row) => Number(row.generation)),
+  };
+}
+
+async function inventoryLeaseLifecycle(db: D1Database): Promise<unknown> {
+  await readyInventoryStore(db);
+  await db
+    .prepare(
+      `INSERT INTO ${INVENTORY_LEASE_TABLE} (account_id, owner_token, expires_at)
+       VALUES (?, 'abandoned-token', 1)`,
+    )
+    .bind(INVENTORY_ACCOUNT)
+    .run();
+  const takeover = await inventoryStore(new D1FleetStateDatabase(db))
+    .withAccountInventoryLease(async (lease) => {
+      await lease.assertOwned();
+      return 'acquired';
+    })
+    .catch((error: unknown) => errorShape(error));
+  const clock = controlledLeaseClock(db, INVENTORY_LEASE_TABLE);
+  const store = new D1FleetInventoryRunStore(clock.database, {
+    accountId: INVENTORY_ACCOUNT,
+    leaseTtlMs: 2_500,
+    leaseRenewalIntervalMs: 1,
+  });
+  let contenderRejected = false;
+  await store.withAccountInventoryLease(async () => {
+    const original = await clock.database.query(
+      `SELECT expires_at FROM ${INVENTORY_LEASE_TABLE} WHERE account_id = ?`,
+      [INVENTORY_ACCOUNT],
+    );
+    const originalExpiresAt = Number(original[0]?.expires_at);
+    if (!Number.isFinite(originalExpiresAt)) {
+      throw new Error('inventory lease did not expose its original expiry');
+    }
+    clock.advance(2_000);
+    clock.allowHeartbeat();
+    await clock.heartbeat;
+    clock.advance(600);
+    try {
+      await new D1FleetInventoryRunStore(clock.database, {
+        accountId: INVENTORY_ACCOUNT,
+        leaseTtlMs: 2_500,
+        leaseRenewalIntervalMs: 1,
+      }).withAccountInventoryLease(async () => {});
+    } catch {
+      contenderRejected = true;
+    }
+    if (clock.now() <= originalExpiresAt) {
+      throw new Error('controlled D1 time did not pass the original expiry');
+    }
+  });
+  const remaining = await db
+    .prepare(`SELECT COUNT(*) AS count FROM ${INVENTORY_LEASE_TABLE}`)
+    .first<{ count: number }>();
+  return {
+    takeover,
+    heartbeatObserved: true,
+    contenderRejected,
+    leasesAfterRelease: Number(remaining?.count),
+  };
+}
+
+async function inventoryColdConcurrentSchema(db: D1Database): Promise<unknown> {
+  const stores = Array.from({ length: 16 }, () =>
+    inventoryStore(new D1FleetStateDatabase(db)),
+  );
+  const latest = await Promise.all(
+    stores.map((store) => store.latestFinalizedGeneration()),
+  );
+  const columns: Record<string, string[]> = {};
+  for (const table of INVENTORY_TABLES) {
+    const rows = await db
+      .prepare(`PRAGMA table_info(${table})`)
+      .all<{ name: string; type: string }>();
+    columns[table] = rows.results.map((row) => `${row.name}:${row.type}`);
+  }
+  const tables = await db
+    .prepare(
+      `SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name LIKE 'anchorage_fleet_inventory_%'
+        ORDER BY name`,
+    )
+    .all<{ name: string }>();
+  const started = await stores[0]?.withAccountInventoryLease((lease) =>
+    lease.startRun({
+      operationId: inventoryOperationId(20),
+      options: INVENTORY_OPTIONS,
+      optionsDigest: INVENTORY_DIGEST,
+    }),
+  );
+  return {
+    latest: latest.filter((entry) => entry === undefined).length,
+    columns,
+    tables: tables.results.map((row) => row.name),
+    generation: started?.progress.generation ?? null,
+  };
+}
+
 async function cloudflareRateCoordination(db: D1Database): Promise<unknown> {
   await db
     .prepare('DROP TABLE IF EXISTS anchorage_cloudflare_api_rate_reservations')
@@ -2658,6 +3251,22 @@ export default {
           return Response.json(
             await coldConcurrentSchemaInitialization(env.DB),
           );
+        case 'inventory-start-atomicity':
+          return Response.json(await inventoryStartAtomicity(env.DB));
+        case 'inventory-commit-concurrency':
+          return Response.json(await inventoryCommitConcurrency(env.DB));
+        case 'inventory-finalize-convergence':
+          return Response.json(await inventoryFinalizeConvergence(env.DB));
+        case 'inventory-generation-readback':
+          return Response.json(await inventoryGenerationReadback(env.DB));
+        case 'inventory-corrupt-unreadable':
+          return Response.json(await inventoryCorruptUnreadable(env.DB));
+        case 'inventory-prune-order':
+          return Response.json(await inventoryPruneOrder(env.DB));
+        case 'inventory-lease-lifecycle':
+          return Response.json(await inventoryLeaseLifecycle(env.DB));
+        case 'inventory-cold-concurrent-schema':
+          return Response.json(await inventoryColdConcurrentSchema(env.DB));
         default:
           return Response.json({ error: 'unknown action' }, { status: 400 });
       }
