@@ -7,6 +7,7 @@ import {
   canonicalFleetInventoryRunOptions,
   classifyFleetInventoryRunToken,
   emptyFleetInventoryRowCounts,
+  FleetInventoryFindingValueError,
   type FleetInventoryRunOptions,
   type FleetInventoryRunRecord,
   FleetInventoryRunTokenError,
@@ -20,7 +21,6 @@ import {
   fleetInventoryStagedFactFromUnknown,
   fleetInventoryStagedRowFromUnknown,
   fleetInventoryStageFromUnknown,
-  InventoryFindingValueError,
   initialFleetInventoryStage,
   isInventoryKeyNameShape,
   nextStage,
@@ -112,7 +112,7 @@ describe('fleet inventory state', () => {
         step: 'ordinary-scripts',
         cursor: 'authorization-token',
       }),
-    ).toThrow(InventoryFindingValueError);
+    ).toThrow(FleetInventoryFindingValueError);
   });
 
   it('round-trips the D1, Durable Object, R2, and finalize stage variants', () => {
@@ -464,7 +464,7 @@ describe('fleet inventory state', () => {
       'bearer-of-secrets',
     ]) {
       expect(() => assertInventoryFindingValue(value, 'detail')).toThrow(
-        InventoryFindingValueError,
+        FleetInventoryFindingValueError,
       );
     }
     expect(() =>
@@ -500,10 +500,10 @@ describe('fleet inventory state', () => {
     ).toBe(true);
     expect(() =>
       assertNoCredentialInInventoryText('k'.repeat(513), 'keyName'),
-    ).toThrow(InventoryFindingValueError);
+    ).toThrow(FleetInventoryFindingValueError);
     expect(() =>
       assertNoCredentialInInventoryText('bearer-eyJhbGciOi', 'keyName'),
-    ).toThrow(InventoryFindingValueError);
+    ).toThrow(FleetInventoryFindingValueError);
   });
 
   it('accepts long dotless script names and dispatch namespaces', () => {

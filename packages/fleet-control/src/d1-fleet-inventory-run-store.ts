@@ -96,7 +96,7 @@ export interface D1FleetInventoryRunStoreOptions {
   readonly leaseRenewalIntervalMs?: number;
 }
 
-function rowText(row: Row | undefined, key: string): string {
+function rowString(row: Row | undefined, key: string): string {
   const value = row?.[key];
   if (typeof value !== 'string') {
     throw new Error(`fleet inventory row has invalid ${key}`);
@@ -104,7 +104,7 @@ function rowText(row: Row | undefined, key: string): string {
   return value;
 }
 
-function rowInteger(row: Row | undefined, key: string): number {
+function rowNumber(row: Row | undefined, key: string): number {
   const value = Number(row?.[key]);
   if (!Number.isSafeInteger(value)) {
     throw new Error(`fleet inventory row has invalid ${key}`);
@@ -112,13 +112,10 @@ function rowInteger(row: Row | undefined, key: string): number {
   return value;
 }
 
-function optionalInteger(
-  row: Row | undefined,
-  key: string,
-): number | undefined {
+function optionalNumber(row: Row | undefined, key: string): number | undefined {
   const value = row?.[key];
   if (value === null || value === undefined) return undefined;
-  return rowInteger(row, key);
+  return rowNumber(row, key);
 }
 
 function assertGeneration(generation: number): void {
@@ -587,11 +584,11 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
     const row = persisted[0];
     if (!claimedHead && !row) throw this.#headContention(operationId);
     if (!row) throw unknownRun(operationId);
-    if (rowText(row, 'options_digest') !== optionsDigest) {
+    if (rowString(row, 'options_digest') !== optionsDigest) {
       throw runOptionsConflict(operationId);
     }
     const record = fleetInventoryRunRecordFromUnknown(
-      JSON.parse(rowText(row, 'run_record')),
+      JSON.parse(rowString(row, 'run_record')),
     );
     // Statement 2 wrote nothing while this operation's run exists: either the
     // run already completed, in which case the replay is idempotent and must not
@@ -615,7 +612,7 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
     const row = rows[0];
     if (!row) return undefined;
     return fleetInventoryRunRecordFromUnknown(
-      JSON.parse(rowText(row, 'run_record')),
+      JSON.parse(rowString(row, 'run_record')),
     );
   }
 
@@ -764,14 +761,14 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
     );
     const rowBytes = new Map(
       storedRows.map((row) => [
-        `${rowText(row, 'kind')}:${rowInteger(row, 'ordinal')}`,
-        rowText(row, 'payload'),
+        `${rowString(row, 'kind')}:${rowNumber(row, 'ordinal')}`,
+        rowString(row, 'payload'),
       ]),
     );
     const factBytes = new Map(
       storedFacts.map((row) => [
-        `${rowInteger(row, 'deployment_ordinal')}:${rowText(row, 'fact_kind')}:${rowInteger(row, 'fact_ordinal')}`,
-        rowText(row, 'payload'),
+        `${rowNumber(row, 'deployment_ordinal')}:${rowString(row, 'fact_kind')}:${rowNumber(row, 'fact_ordinal')}`,
+        rowString(row, 'payload'),
       ]),
     );
     let complete = true;
@@ -890,9 +887,9 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
     const runRow = run[0];
     if (!runRow) throw unknownRun(operationId);
     const record = fleetInventoryRunRecordFromUnknown(
-      JSON.parse(rowText(runRow, 'run_record')),
+      JSON.parse(rowString(runRow, 'run_record')),
     );
-    const finalizedAtMs = optionalInteger(runRow, 'finalized_at_ms');
+    const finalizedAtMs = optionalNumber(runRow, 'finalized_at_ms');
     if (record.state !== 'finalized' || finalizedAtMs === undefined) {
       if (record.progress.revision !== expectedRevision) {
         throw runConflict(operationId);
@@ -900,7 +897,7 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
       throw manifestMismatch(operationId);
     }
     const head = await this.#headRow();
-    if (optionalInteger(head, 'latest_finalized_generation') !== generation) {
+    if (optionalNumber(head, 'latest_finalized_generation') !== generation) {
       // The only legal repair: statement 2 alone is idempotent and writes no
       // generation data.
       await this.#db.query(
@@ -1091,7 +1088,7 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
     );
     let deleted = 0;
     for (const candidate of candidates) {
-      const generation = rowInteger(candidate, 'generation');
+      const generation = rowNumber(candidate, 'generation');
       // The pin and latest re-checks live inside the delete batch, so a pin
       // committed after candidate selection still wins.
       const guard = `AND NOT EXISTS (SELECT 1 FROM ${PIN_TABLE}
@@ -1138,7 +1135,7 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
     FleetInventoryGenerationRef | undefined
   > {
     await this.#ensureSchema();
-    const latest = optionalInteger(
+    const latest = optionalNumber(
       await this.#headRow(),
       'latest_finalized_generation',
     );
@@ -1156,7 +1153,7 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
   ): Promise<FleetInventoryGeneration> {
     assertGeneration(generation);
     await this.#ensureSchema();
-    const latest = optionalInteger(
+    const latest = optionalNumber(
       await this.#headRow(),
       'latest_finalized_generation',
     );
@@ -1184,17 +1181,17 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
     );
     const rows = storedRows.map((row) =>
       fleetInventoryStagedRowFromUnknown({
-        kind: rowText(row, 'kind'),
-        ordinal: rowInteger(row, 'ordinal'),
-        payload: JSON.parse(rowText(row, 'payload')),
+        kind: rowString(row, 'kind'),
+        ordinal: rowNumber(row, 'ordinal'),
+        payload: JSON.parse(rowString(row, 'payload')),
       }),
     );
     const facts = storedFacts.map((row) =>
       fleetInventoryStagedFactFromUnknown({
-        deploymentOrdinal: rowInteger(row, 'deployment_ordinal'),
-        factKind: rowText(row, 'fact_kind'),
-        factOrdinal: rowInteger(row, 'fact_ordinal'),
-        payload: JSON.parse(rowText(row, 'payload')),
+        deploymentOrdinal: rowNumber(row, 'deployment_ordinal'),
+        factKind: rowString(row, 'fact_kind'),
+        factOrdinal: rowNumber(row, 'fact_ordinal'),
+        payload: JSON.parse(rowString(row, 'payload')),
       }),
     );
     // Defense in depth behind the in-SQL finalize guard: the live per-kind
@@ -1237,9 +1234,9 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
     );
     const row = rows[0];
     if (!row) throw notFinalized(generation);
-    const finalizedAtMs = optionalInteger(row, 'finalized_at_ms');
+    const finalizedAtMs = optionalNumber(row, 'finalized_at_ms');
     const record = fleetInventoryRunRecordFromUnknown(
-      JSON.parse(rowText(row, 'run_record')),
+      JSON.parse(rowString(row, 'run_record')),
     );
     if (record.state !== 'finalized' || finalizedAtMs === undefined) {
       throw notFinalized(generation);
@@ -1247,7 +1244,7 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
     return {
       ref: {
         generation,
-        operationId: rowText(row, 'operation_id'),
+        operationId: rowString(row, 'operation_id'),
         finalizedAtMs,
         rowManifest: record.progress.stagedCounts,
         factCount: record.progress.factCount,

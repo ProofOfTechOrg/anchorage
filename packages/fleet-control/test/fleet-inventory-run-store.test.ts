@@ -5,6 +5,7 @@ import { D1FleetInventoryRunStore } from '../src/d1-fleet-inventory-run-store.js
 import {
   canonicalFleetInventoryRunOptions,
   emptyFleetInventoryRowCounts,
+  FleetInventoryFindingValueError,
   type FleetInventoryLease,
   type FleetInventoryRowKind,
   type FleetInventoryRunRecord,
@@ -12,7 +13,6 @@ import {
   type FleetInventoryStagedFact,
   type FleetInventoryStagedRow,
   fleetInventoryOptionsDigest,
-  InventoryFindingValueError,
 } from '../src/fleet-inventory-state.js';
 import type { FleetStateDatabase } from '../src/state-store.js';
 
@@ -862,6 +862,6 @@ describe('D1FleetInventoryRunStore', () => {
         }),
       ),
     );
-    expect(error).toBeInstanceOf(InventoryFindingValueError);
+    expect(error).toBeInstanceOf(FleetInventoryFindingValueError);
   });
 });

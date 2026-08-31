@@ -348,10 +348,10 @@ export interface FleetInventoryRunStore {
 }
 
 /** Fixed refusal shared by both durable-text controls. */
-export class InventoryFindingValueError extends Error {
+export class FleetInventoryFindingValueError extends Error {
   constructor(readonly field: string) {
     super(`inventory finding value for '${field}' is not durable-safe`);
-    this.name = 'InventoryFindingValueError';
+    this.name = 'FleetInventoryFindingValueError';
   }
 }
 
@@ -450,11 +450,11 @@ export function assertNoCredentialInInventoryText(
     typeof value !== 'string' ||
     utf8Length(value) > FLEET_INVENTORY_DURABLE_TEXT_BYTE_BOUND
   ) {
-    throw new InventoryFindingValueError(field);
+    throw new FleetInventoryFindingValueError(field);
   }
   const lowered = value.toLowerCase();
   if (CREDENTIAL_SUBSTRINGS.some((marker) => lowered.includes(marker))) {
-    throw new InventoryFindingValueError(field);
+    throw new FleetInventoryFindingValueError(field);
   }
 }
 
@@ -471,7 +471,7 @@ export function assertInventoryFindingValue(
 ): void {
   assertNoCredentialInInventoryText(value, field);
   if (!PRINTABLE_NON_WHITESPACE.test(value)) {
-    throw new InventoryFindingValueError(field);
+    throw new FleetInventoryFindingValueError(field);
   }
 }
 
