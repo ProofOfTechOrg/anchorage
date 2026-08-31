@@ -23,6 +23,8 @@ import {
 import type {
   ApplicationR2BucketSnapshot,
   ApplicationR2Resource,
+  CleanupAdvanceIntent,
+  CleanupTerminalReceipt,
   DatabaseExport,
   DatabaseExportReceiptIdentity,
   DatabaseReference,
@@ -51,6 +53,7 @@ const LEASE_TABLE = 'anchorage_fleet_leases';
 const PLATFORM_CLAIM_TABLE = 'anchorage_platform_plane_claims';
 const PLATFORM_LEASE_TABLE = 'anchorage_platform_plane_leases';
 const BOUNDED_PROVIDER_TABLE = 'anchorage_test_bounded_decommission_provider';
+const CLEANUP_RECEIPT_TABLE = 'anchorage_fleet_cleanup_receipts';
 const DB_NOW_MS = "CAST(unixepoch('subsec') * 1000 AS INTEGER)";
 
 function controlledLeaseClock(
@@ -2208,6 +2211,285 @@ async function decommissionIntentLostResponse(
   };
 }
 
+function cleanupIntentFor(base: FleetRecord): CleanupAdvanceIntent {
+  return {
+    version: 1,
+    operationId: '00000000-0000-4000-8000-0000000000aa',
+    revision: 0,
+    generation: 0,
+    updatedAt: '2026-08-11T00:00:00.000Z',
+    authority: { kind: 'manual-cleanup' },
+    identity: {
+      record: {
+        tenantTag: base.tenantTag,
+        environment: base.environment,
+        backend: base.backend,
+        scriptName: base.scriptName,
+        databaseId: base.databaseId,
+        databaseName: base.databaseName,
+        routeHostname: base.routeHostname,
+      },
+      admittedPhase: 'worker-deployed',
+      externalArtifact: false,
+    },
+    state: { step: 'database-deletion' },
+  };
+}
+
+function cleanupAdvancingFixture(
+  tenantTag: string,
+  operationId?: string,
+): FleetRecord {
+  const base = {
+    ...record(tenantTag, 'production'),
+    phase: 'cleanup-advancing' as const,
+    applicationResources: [],
+    applicationBindings: { vars: [], secrets: [], r2Buckets: [] },
+  };
+  const intent = cleanupIntentFor(base);
+  return {
+    ...base,
+    cleanupIntent: operationId ? { ...intent, operationId } : intent,
+  };
+}
+
+function cleanupReceiptFor(active: FleetRecord): CleanupTerminalReceipt {
+  const intent = active.cleanupIntent;
+  if (!intent) throw new Error('fixture record has no cleanup intent');
+  return {
+    version: 1,
+    operationId: intent.operationId,
+    tenantTag: active.tenantTag,
+    environment: active.environment,
+    backend: active.backend,
+    scriptName: active.scriptName,
+    databaseId: active.databaseId,
+    databaseName: active.databaseName,
+    authority: 'manual-cleanup',
+    admittedPhase: intent.identity.admittedPhase,
+    disposition: 'prepublication-owned-no-export',
+    evidence: {
+      eligibility: 'carrier-null',
+      ingressRemoved: true,
+      workerAbsent: true,
+      platformResourcesAbsent: true,
+      applicationR2Settled: true,
+      databaseAbsentReadback: true,
+      scan: {
+        discover: { evidenceSha256: 'b'.repeat(64), evidenceCount: 2 },
+        verify: { evidenceSha256: 'b'.repeat(64), evidenceCount: 2 },
+      },
+    },
+  };
+}
+
+async function cleanupClaimCount(
+  db: D1Database,
+  tenantTag: string,
+): Promise<number> {
+  const row = await db
+    .prepare(
+      `SELECT COUNT(*) AS count FROM ${PLATFORM_CLAIM_TABLE}
+       WHERE resource_set_key = ?`,
+    )
+    .bind(`deployment:${tenantTag}:production`)
+    .first<{ count: number }>();
+  return Number(row?.count);
+}
+
+async function cleanupReceiptCount(db: D1Database): Promise<number> {
+  const row = await db
+    .prepare(`SELECT COUNT(*) AS count FROM ${CLEANUP_RECEIPT_TABLE}`)
+    .first<{ count: number }>();
+  return Number(row?.count);
+}
+
+async function cleanupTerminalReceipt(db: D1Database): Promise<unknown> {
+  const store = await readyStore(db);
+  await db.prepare(`DELETE FROM ${CLEANUP_RECEIPT_TABLE}`).run();
+  const active = cleanupAdvancingFixture('cleanupterm');
+  const receipt = cleanupReceiptFor(active);
+  return store.withDeploymentLease(
+    'cleanupterm',
+    'production',
+    async (lease) => {
+      if (!lease.completeCleanup) {
+        throw new Error('completeCleanup capability missing');
+      }
+      await lease.put(active);
+      const claimsBefore = await cleanupClaimCount(db, 'cleanupterm');
+      const stale = await lease
+        .completeCleanup({ receipt, expectedRevision: 4 })
+        .then(
+          () => undefined,
+          (error: unknown) => errorShape(error),
+        );
+      const rowAfterStale = await store.get('cleanupterm', 'production');
+      const receiptsAfterStale = await cleanupReceiptCount(db);
+      const persisted = await lease.completeCleanup({
+        receipt,
+        expectedRevision: 0,
+      });
+      const claimsAfter = await cleanupClaimCount(db, 'cleanupterm');
+      const rowAfter = await store.get('cleanupterm', 'production');
+      const replay = await lease.completeCleanup({
+        receipt,
+        expectedRevision: 0,
+      });
+      const reordered: CleanupTerminalReceipt = {
+        ...receipt,
+        evidence: {
+          scan: {
+            verify: { evidenceCount: 2, evidenceSha256: 'b'.repeat(64) },
+            discover: { evidenceCount: 2, evidenceSha256: 'b'.repeat(64) },
+          },
+          databaseAbsentReadback: true,
+          applicationR2Settled: true,
+          platformResourcesAbsent: true,
+          workerAbsent: true,
+          ingressRemoved: true,
+          eligibility: 'carrier-null',
+        },
+      };
+      const keyOrderReplay = await lease.completeCleanup({
+        receipt: reordered,
+        expectedRevision: 0,
+      });
+      const conflict = await lease
+        .completeCleanup({
+          receipt: { ...receipt, disposition: 'reservation-cleared' },
+          expectedRevision: 0,
+        })
+        .then(
+          () => undefined,
+          (error: unknown) => errorShape(error),
+        );
+      const foreign = await lease
+        .completeCleanup({
+          receipt: { ...receipt, tenantTag: 'other' },
+          expectedRevision: 0,
+        })
+        .then(
+          () => undefined,
+          (error: unknown) => errorShape(error),
+        );
+      await lease.put(record('cleanupterm', 'production'));
+      const reprovisioned = await store.get('cleanupterm', 'production');
+      const survivingReceipt = await store.readCleanupReceipt?.(
+        receipt.operationId,
+      );
+      return {
+        stale,
+        rowPhaseAfterStale: rowAfterStale?.phase ?? null,
+        receiptsAfterStale,
+        claimsBefore,
+        claimsAfter,
+        rowAfterTerminal: rowAfter?.phase ?? null,
+        persistedHasCompletedAt: typeof persisted.completedAtMs === 'number',
+        replayEqual: JSON.stringify(replay) === JSON.stringify(persisted),
+        keyOrderReplayEqual:
+          JSON.stringify(keyOrderReplay) === JSON.stringify(persisted),
+        conflict,
+        foreign,
+        reprovisionPhase: reprovisioned?.phase ?? null,
+        survivingOperationId: survivingReceipt?.operationId ?? null,
+      };
+    },
+  );
+}
+
+async function cleanupReceiptPrune(db: D1Database): Promise<unknown> {
+  const store = await readyStore(db);
+  await db.prepare(`DELETE FROM ${CLEANUP_RECEIPT_TABLE}`).run();
+  const operations = [
+    '00000000-0000-4000-8000-0000000000a1',
+    '00000000-0000-4000-8000-0000000000a2',
+    '00000000-0000-4000-8000-0000000000a3',
+  ];
+  for (const [index, operationId] of operations.entries()) {
+    const tenantTag = `prune${index}`;
+    const active = cleanupAdvancingFixture(tenantTag, operationId);
+    const receipt = cleanupReceiptFor(active);
+    await store.withDeploymentLease(tenantTag, 'production', async (lease) => {
+      if (!lease.completeCleanup) {
+        throw new Error('completeCleanup capability missing');
+      }
+      await lease.put(active);
+      await lease.completeCleanup({ receipt, expectedRevision: 0 });
+    });
+  }
+  if (!store.pruneCleanupReceipts) {
+    throw new Error('pruneCleanupReceipts capability missing');
+  }
+  const cutoff = Date.now() + 3_600_000;
+  const invalid: unknown[] = [];
+  for (const limit of [0, 1001, 1.5]) {
+    invalid.push(
+      await store
+        .pruneCleanupReceipts({ completedBeforeMs: cutoff, limit })
+        .then(
+          () => undefined,
+          (error: unknown) => errorShape(error),
+        ),
+    );
+  }
+  const untouched = await cleanupReceiptCount(db);
+  const nothing = await store.pruneCleanupReceipts({
+    completedBeforeMs: 0,
+    limit: 1000,
+  });
+  const firstTwo = await store.pruneCleanupReceipts({
+    completedBeforeMs: cutoff,
+    limit: 2,
+  });
+  const remaining = await db
+    .prepare(
+      `SELECT operation_id FROM ${CLEANUP_RECEIPT_TABLE} ORDER BY operation_id`,
+    )
+    .all<{ operation_id: string }>();
+  const lowerBound = await store.pruneCleanupReceipts({
+    completedBeforeMs: cutoff,
+    limit: 1,
+  });
+  const rest = await store.pruneCleanupReceipts({
+    completedBeforeMs: cutoff,
+    limit: 1000,
+  });
+  return {
+    invalid,
+    untouched,
+    nothing,
+    firstTwo,
+    remainingAfterFirstTwo: remaining.results.map((row) => row.operation_id),
+    lowerBound,
+    rest,
+    finalCount: await cleanupReceiptCount(db),
+  };
+}
+
+async function cleanupClaimsRelease(db: D1Database): Promise<unknown> {
+  const store = await readyStore(db);
+  const active = record('claimsrel', 'production');
+  return store.withDeploymentLease('claimsrel', 'production', async (lease) => {
+    await lease.put(active);
+    const claims = await db
+      .prepare(
+        `SELECT resource_set_key, platform_plane_identity
+           FROM ${PLATFORM_CLAIM_TABLE}`,
+      )
+      .all<{ resource_set_key: string; platform_plane_identity: string }>();
+    if (!lease.deleteReleasingClaims) {
+      throw new Error('deleteReleasingClaims capability missing');
+    }
+    await lease.deleteReleasingClaims();
+    return {
+      identities: claims.results,
+      claimsAfter: await cleanupClaimCount(db, 'claimsrel'),
+      rowAfter: (await store.get('claimsrel', 'production'))?.phase ?? null,
+    };
+  });
+}
+
 async function coldConcurrentSchemaInitialization(
   db: D1Database,
 ): Promise<unknown> {
@@ -2366,6 +2648,12 @@ export default {
           return Response.json(await lifecycleErrors(env.DB));
         case 'cloudflare-rate-coordination':
           return Response.json(await cloudflareRateCoordination(env.DB));
+        case 'cleanup-terminal-receipt':
+          return Response.json(await cleanupTerminalReceipt(env.DB));
+        case 'cleanup-receipt-prune':
+          return Response.json(await cleanupReceiptPrune(env.DB));
+        case 'cleanup-claims-release':
+          return Response.json(await cleanupClaimsRelease(env.DB));
         case 'cold-concurrent-schema-initialization':
           return Response.json(
             await coldConcurrentSchemaInitialization(env.DB),

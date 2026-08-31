@@ -80,6 +80,10 @@ import {
 function canonicalNormalDecommissionRecord(record: FleetRecord): FleetRecord {
   const { decommissionIntent, ...source } = record;
   try {
+    // A cleanup intent never rides beside a decommission shell; fail closed.
+    if (record.cleanupIntent !== undefined) {
+      throw new Error(BACKEND_SWITCH_RECORD_ERROR);
+    }
     const intent = decommissionAdvanceIntentFromUnknown(
       decommissionIntent,
       source,

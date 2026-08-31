@@ -9,6 +9,10 @@ import {
   convergeApplicationR2Deletion,
 } from './application-bindings.js';
 import {
+  invocationAuthorityCarrierFromUnknown,
+  normalizeCleanupAdvanceIntent,
+} from './cleanup-intent.js';
+import {
   assertWorkerAttachmentProviderRequestBudget,
   initialWorkerAttachmentScan,
 } from './cloudflare-worker-attachment-scan-state.js';
@@ -69,6 +73,7 @@ import type {
   BackendSwitchSubphase,
   BridgeMutationPlan,
   BridgeSnapshot,
+  CleanupAdvanceIntent,
   DatabaseExportReceiptIdentity,
   DatabaseReference,
   DecommissionAdvanceIntent,
@@ -85,10 +90,12 @@ import type {
   FleetRecord,
   FleetStateLease,
   FleetStateStore,
+  InvocationAuthorityCarrier,
   PlainBackendSnapshot,
   ProvisioningPhase,
 } from './types.js';
 import {
+  assertNoActiveCleanup,
   assertNoActiveDecommission,
   BACKEND_SWITCH_SUBPHASES,
   effectiveLifecyclePhase,
@@ -1869,6 +1876,8 @@ const BACKEND_SWITCH_RECORD_KEYS = [
   'migrationIntent',
   'backendSwitchIntent',
   'decommissionIntent',
+  'cleanupIntent',
+  'invocationAuthority',
   'applicationResources',
   'applicationBindings',
   'durableObjectTag',
@@ -1978,7 +1987,17 @@ function canonicalFleetRecordFromSource(
   source: Record<string, unknown>,
   switchIntent: BackendSwitchIntent,
   shell: DecommissionAdvanceIntent | undefined,
+  cleanupIntent: CleanupAdvanceIntent | undefined,
+  invocationAuthority: InvocationAuthorityCarrier | undefined,
 ): FleetRecord {
+  // Cross-intent sources must not survive canonicalization even before
+  // validateRecordCrossFields runs: an active cleanup owns the whole record,
+  // and no switch-bearing record — settled or not — can legitimately carry a
+  // cleanup intent (cleanup admission is restricted to prepublication phases,
+  // which no switch record occupies).
+  if (cleanupIntent) {
+    throw new Error(BACKEND_SWITCH_RECORD_ERROR);
+  }
   if (
     typeof source.tenantTag !== 'string' ||
     !isDeploymentTenantTag(source.tenantTag) ||
@@ -2171,6 +2190,8 @@ function canonicalFleetRecordFromSource(
     ...(migrationIntent ? { migrationIntent } : {}),
     backendSwitchIntent: switchIntent,
     ...(shell ? { decommissionIntent: shell } : {}),
+    // cleanupIntent is unconditionally rejected above and never emitted here.
+    ...(invocationAuthority ? { invocationAuthority } : {}),
     ...(applicationResources ? { applicationResources } : {}),
     ...(applicationBindings ? { applicationBindings } : {}),
     ...(typeof source.durableObjectTag === 'string'
@@ -2367,7 +2388,25 @@ export function backendSwitchFleetRecordFromUnknown(
     if (shell && shell.updatedAt !== source.updatedAt) {
       throw new Error(BACKEND_SWITCH_RECORD_ERROR);
     }
-    const record = canonicalFleetRecordFromSource(source, switchIntent, shell);
+    // Unlike the decommission shell, a cleanup intent's updatedAt tracks the
+    // cleanup operation rather than the switch write, so no record-timestamp
+    // equality is required here; the strict codec still validates identity.
+    const cleanupIntent = Object.hasOwn(source, 'cleanupIntent')
+      ? normalizeCleanupAdvanceIntent(
+          source.cleanupIntent as CleanupAdvanceIntent,
+          provisional,
+        )
+      : undefined;
+    const invocationAuthority = Object.hasOwn(source, 'invocationAuthority')
+      ? invocationAuthorityCarrierFromUnknown(source.invocationAuthority)
+      : undefined;
+    const record = canonicalFleetRecordFromSource(
+      source,
+      switchIntent,
+      shell,
+      cleanupIntent,
+      invocationAuthority,
+    );
     return {
       record,
       comparisonBytes: JSON.stringify(canonicalJsonValue(record)),
@@ -2388,6 +2427,7 @@ export function backendSwitchDecommissionShell(
     now: string;
   }>,
 ): import('./types.js').DecommissionAdvanceIntent {
+  assertNoActiveCleanup(input.record, 'backend switch decommission');
   const snapshot = input.intent.decommissionSnapshot;
   if (
     !snapshot ||

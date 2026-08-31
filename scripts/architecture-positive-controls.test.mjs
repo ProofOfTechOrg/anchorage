@@ -104,6 +104,8 @@ const controls = {
     'scripts/architecture-fixtures/fleet-control-leaf-imports-client.ts',
   'fleet-control-decommission-state-does-not-reach-provider':
     'scripts/architecture-fixtures/decommission-state-imports-provider.ts',
+  'fleet-control-cleanup-state-does-not-reach-provider':
+    'scripts/architecture-fixtures/cleanup-state-imports-provider.ts',
   'fleet-control-decommission-advance-is-transport-neutral':
     'scripts/architecture-fixtures/decommission-advance-imports-provider.ts',
   'fleet-control-decommission-database-is-provider-neutral':

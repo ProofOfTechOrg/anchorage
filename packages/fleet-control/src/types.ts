@@ -208,6 +208,7 @@ export const PROVISIONING_PHASES = [
   'migrating',
   'ready',
   'decommission-advancing',
+  'cleanup-advancing',
   'decommissioning',
   'traffic-removed',
   'credentials-revoked',
@@ -721,6 +722,239 @@ export type DecommissionAttachmentScanResult =
       status: 'drift';
     }>;
 
+/** Versioned provider-neutral candidate-invocation authority carrier. */
+export interface InvocationAuthorityCarrier {
+  readonly version: 1;
+  /** ISO timestamp of the durable authorization commit, or null when never authorized. */
+  readonly authorizedAt: string | null;
+}
+
+/** Purpose binding that decommission codecs structurally reject. */
+export interface CleanupAttachmentPurpose {
+  readonly kind: 'cleanup-database-pre-delete';
+  readonly databaseId: string;
+  readonly operationId: string;
+}
+
+/**
+ * Durable scan progress DEFINED here, mirroring the existing
+ * `DecommissionAttachmentProgress` precedent field for field. types.ts does
+ * NOT import cloudflare-worker-attachment-scan-state.ts. There is NO
+ * conversion function: exactly like decommission today, the engine passes
+ * `intent.progress` to the backend scan capability directly and, on a pending
+ * chunk, validates the returned value with `parseWorkerAttachmentScanProgress`
+ * and assigns it structurally (the shapes are identical).
+ */
+export type CleanupAttachmentProgress =
+  | Readonly<{
+      version: 1;
+      target:
+        | Readonly<{ kind: 'd1'; databaseId: string }>
+        | Readonly<{ kind: 'r2'; bucketName: string }>;
+      evidenceSha256: string;
+      evidenceCount: number;
+      stage: 'ordinary-script-inventory';
+      ordinaryInventorySha256?: string;
+      scriptIndex: number;
+    }>
+  | Readonly<{
+      version: 1;
+      target:
+        | Readonly<{ kind: 'd1'; databaseId: string }>
+        | Readonly<{ kind: 'r2'; bucketName: string }>;
+      evidenceSha256: string;
+      evidenceCount: number;
+      stage: 'ordinary-deployment';
+      ordinaryInventorySha256: string;
+      scriptIndex: number;
+      scriptName: string;
+    }>
+  | Readonly<{
+      version: 1;
+      target:
+        | Readonly<{ kind: 'd1'; databaseId: string }>
+        | Readonly<{ kind: 'r2'; bucketName: string }>;
+      evidenceSha256: string;
+      evidenceCount: number;
+      stage: 'ordinary-version';
+      ordinaryInventorySha256: string;
+      scriptIndex: number;
+      scriptName: string;
+      deploymentSha256: string;
+      versionIndex: number;
+    }>
+  | Readonly<{
+      version: 1;
+      target:
+        | Readonly<{ kind: 'd1'; databaseId: string }>
+        | Readonly<{ kind: 'r2'; bucketName: string }>;
+      evidenceSha256: string;
+      evidenceCount: number;
+      stage: 'dispatch-namespace-inventory';
+      ordinaryInventorySha256: string;
+      namespaceInventorySha256?: string;
+      namespaceIndex: number;
+    }>
+  | Readonly<{
+      version: 1;
+      target:
+        | Readonly<{ kind: 'd1'; databaseId: string }>
+        | Readonly<{ kind: 'r2'; bucketName: string }>;
+      evidenceSha256: string;
+      evidenceCount: number;
+      stage: 'dispatch-script-page';
+      ordinaryInventorySha256: string;
+      namespaceInventorySha256: string;
+      namespaceIndex: number;
+      namespaceName: string;
+      pageStartCursor?: string;
+      pageNumber: number;
+      seenCursorSha256: readonly string[];
+      totalDispatchItems: number;
+      dispatchEvidenceSum256: string;
+      dispatchEvidenceCount: number;
+    }>
+  | Readonly<{
+      version: 1;
+      target:
+        | Readonly<{ kind: 'd1'; databaseId: string }>
+        | Readonly<{ kind: 'r2'; bucketName: string }>;
+      evidenceSha256: string;
+      evidenceCount: number;
+      stage: 'dispatch-script-settings';
+      ordinaryInventorySha256: string;
+      namespaceInventorySha256: string;
+      namespaceIndex: number;
+      namespaceName: string;
+      pageStartCursor?: string;
+      nextCursor?: string;
+      pageSha256: string;
+      pageItemCount: number;
+      itemOffset: number;
+      pageNumber: number;
+      seenCursorSha256: readonly string[];
+      totalDispatchItems: number;
+      dispatchEvidenceSum256: string;
+      dispatchEvidenceCount: number;
+    }>;
+
+/** One bounded cleanup attachment-scan pass and its durable progress. */
+export interface CleanupAttachmentScan {
+  readonly purpose: CleanupAttachmentPurpose;
+  readonly pass: 'discover' | 'verify';
+  readonly progress: CleanupAttachmentProgress;
+  /** Present only during the verify pass. */
+  readonly discoverEvidence?: Readonly<{
+    evidenceSha256: string;
+    evidenceCount: number;
+  }>;
+}
+
+/** Who authorized this cleanup, with persisted rollback attempt facts. */
+export type CleanupAuthority =
+  | Readonly<{ kind: 'manual-cleanup' }>
+  | Readonly<{
+      kind: 'provisioning-rollback';
+      reservationOwned: boolean;
+      databaseOwned: boolean;
+      workerCreatedByAttempt: boolean;
+      workerResourceState: 'absent' | 'present' | 'unknown';
+      requestedSpecDigest: string;
+    }>;
+
+/** One durable cleanup step; one call performs at most one step's group. */
+export type CleanupAdvanceState =
+  | Readonly<{ step: 'teardown-traffic' }>
+  | Readonly<{ step: 'teardown-worker' }>
+  | Readonly<{ step: 'teardown-platform' }>
+  | Readonly<{
+      step: 'r2-deletion';
+      startResourceIndex: number;
+      verifiedDetachmentResourceIndex?: number;
+    }>
+  | Readonly<{ step: 'attachment-scan'; scan: CleanupAttachmentScan }>
+  | Readonly<{
+      step: 'blocked';
+      purpose: CleanupAttachmentPurpose;
+      attachment: DecommissionBlockedAttachment;
+    }>
+  | Readonly<{ step: 'database-deletion' }>;
+
+/**
+ * Durable authority for one bounded cleanup or provisioning-rollback
+ * operation. Cleanup has no terminal intent state — the terminal deletes the
+ * Fleet row — so any present intent is active.
+ */
+export interface CleanupAdvanceIntent {
+  readonly version: 1;
+  readonly operationId: string;
+  readonly revision: number;
+  readonly generation: number;
+  readonly updatedAt: string;
+  readonly authority: CleanupAuthority;
+  readonly identity: Readonly<{
+    record: Readonly<{
+      tenantTag: string;
+      environment: string;
+      backend: ProvisioningBackendKind;
+      scriptName: string;
+      databaseId: string;
+      databaseName: string;
+      routeHostname: string;
+    }>;
+    admittedPhase: ProvisioningPhase;
+    /** backend.immutableExternalArtifacts === true at admission. */
+    externalArtifact: boolean;
+  }>;
+  readonly state: CleanupAdvanceState;
+}
+
+/** Transport-neutral non-authoritative continuation token for one cleanup. */
+export interface CleanupAdvanceToken {
+  readonly version: 1;
+  readonly tenantTag: string;
+  readonly environment: string;
+  readonly operationId: string;
+  readonly revision: number;
+}
+
+/** Terminal evidence recorded on the immutable cleanup receipt. */
+export interface CleanupReceiptEvidence {
+  readonly eligibility:
+    | 'carrier-null'
+    | 'legacy-phase-impossible'
+    | 'reservation-only';
+  readonly ingressRemoved: boolean;
+  readonly workerAbsent: boolean;
+  readonly platformResourcesAbsent: boolean;
+  readonly applicationR2Settled: boolean;
+  readonly databaseAbsentReadback: boolean;
+  readonly scan?: Readonly<{
+    discover: Readonly<{ evidenceSha256: string; evidenceCount: number }>;
+    verify: Readonly<{ evidenceSha256: string; evidenceCount: number }>;
+  }>;
+}
+
+/** Operation-keyed immutable terminal receipt persisted outside the Fleet row. */
+export interface CleanupTerminalReceipt {
+  readonly version: 1;
+  readonly operationId: string;
+  readonly tenantTag: string;
+  readonly environment: string;
+  readonly backend: ProvisioningBackendKind;
+  readonly scriptName: string;
+  readonly databaseId: string;
+  readonly databaseName: string;
+  readonly authority: 'manual-cleanup' | 'provisioning-rollback';
+  readonly admittedPhase: ProvisioningPhase;
+  readonly disposition:
+    | 'prepublication-owned-no-export'
+    | 'reservation-cleared';
+  readonly evidence: CleanupReceiptEvidence;
+  /** D1-assigned; present on every read/return path, absent only on the caller-constructed input. */
+  readonly completedAtMs?: number;
+}
+
 export interface FleetRecord {
   readonly tenantTag: string;
   readonly backend: ProvisioningBackendKind;
@@ -744,6 +978,8 @@ export interface FleetRecord {
   readonly migrationIntent?: ExternalMigrationIntent;
   readonly backendSwitchIntent?: BackendSwitchIntent;
   readonly decommissionIntent?: DecommissionAdvanceIntent;
+  readonly cleanupIntent?: CleanupAdvanceIntent;
+  readonly invocationAuthority?: InvocationAuthorityCarrier;
   readonly applicationResources?: readonly ApplicationR2Resource[];
   readonly applicationBindings?: ApplicationBindingTopology;
   readonly durableObjectTag?: string;
@@ -772,6 +1008,15 @@ export interface FleetRecord {
 export function effectiveLifecyclePhase(
   record: FleetRecord,
 ): ProvisioningPhase {
+  if (record.phase === 'cleanup-advancing') {
+    if (!record.cleanupIntent) {
+      throw new Error('cleanup-advancing record has no active cleanup intent');
+    }
+    return 'cleanup-advancing';
+  }
+  if (record.cleanupIntent) {
+    throw new Error('fleet record has inconsistent cleanup intent state');
+  }
   const intent = record.decommissionIntent;
   if (record.phase === 'decommission-advancing') {
     if (!intent || intent.state === 'complete') {
@@ -803,6 +1048,23 @@ export function assertNoActiveDecommission(
       ))
   ) {
     throw new Error(`${operation} cannot run during an active decommission`);
+  }
+}
+
+/**
+ * Refuses lifecycle entries while a bounded cleanup is active. Cleanup has no
+ * terminal intent state — the terminal deletes the Fleet row — so ANY present
+ * intent is active.
+ */
+export function assertNoActiveCleanup(
+  record: FleetRecord,
+  operation: string,
+): void {
+  if (
+    record.phase === 'cleanup-advancing' ||
+    record.cleanupIntent !== undefined
+  ) {
+    throw new Error(`${operation} cannot run during an active cleanup`);
   }
 }
 
@@ -1453,6 +1715,26 @@ export interface FleetStateLease extends ExternalMutationFence {
   renew(): Promise<void>;
   put(record: FleetRecord): Promise<void>;
   delete(): Promise<void>;
+  /**
+   * Atomically persists the immutable terminal cleanup receipt, releases this
+   * deployment's ownership claims, and deletes the Fleet row in one guarded
+   * batch. Optional so external lease implementations do not break; callers
+   * detect it with `Reflect.has`.
+   */
+  completeCleanup?(
+    input: Readonly<{
+      /** The terminal receipt, without `completedAtMs`. */
+      receipt: CleanupTerminalReceipt;
+      /** The intent revision the engine acted on. */
+      expectedRevision: number;
+    }>,
+  ): Promise<CleanupTerminalReceipt>;
+  /**
+   * Force path: deletes the Fleet row AND releases this deployment's current
+   * claims, with no receipt. Optional; legacy lease implementations keep
+   * tombstone claims through `delete()`.
+   */
+  deleteReleasingClaims?(): Promise<void>;
 }
 
 export interface FleetStateStore {
@@ -1463,6 +1745,19 @@ export interface FleetStateStore {
   ): Promise<T>;
   get(tenantTag: string, environment: string): Promise<FleetRecord | undefined>;
   list(): Promise<readonly FleetRecord[]>;
+  /** Reads one immutable terminal cleanup receipt by operation id. */
+  readCleanupReceipt?(
+    operationId: string,
+  ): Promise<CleanupTerminalReceipt | undefined>;
+  /**
+   * Bounded explicit receipt GC: deletes at most `limit` receipts whose
+   * D1-assigned `completedAtMs` is before the cutoff, in stable
+   * completed-time-then-operation order. `limit` is an integer from 1 to
+   * 1,000; anything else fails closed.
+   */
+  pruneCleanupReceipts?(
+    input: Readonly<{ completedBeforeMs: number; limit: number }>,
+  ): Promise<Readonly<{ deleted: number }>>;
 }
 
 export type ForceDecommissionStep =

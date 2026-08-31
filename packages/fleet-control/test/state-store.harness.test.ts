@@ -19,6 +19,39 @@ interface ProbeError {
   readonly errors?: readonly ProbeError[];
 }
 
+interface CleanupTerminalProbe {
+  stale: ProbeError | undefined;
+  rowPhaseAfterStale: string | null;
+  receiptsAfterStale: number;
+  claimsBefore: number;
+  claimsAfter: number;
+  rowAfterTerminal: string | null;
+  persistedHasCompletedAt: boolean;
+  replayEqual: boolean;
+  keyOrderReplayEqual: boolean;
+  conflict: ProbeError | undefined;
+  foreign: ProbeError | undefined;
+  reprovisionPhase: string | null;
+  survivingOperationId: string | null;
+}
+
+interface CleanupPruneProbe {
+  invalid: (ProbeError | undefined)[];
+  untouched: number;
+  nothing: { deleted: number };
+  firstTwo: { deleted: number };
+  remainingAfterFirstTwo: string[];
+  lowerBound: { deleted: number };
+  rest: { deleted: number };
+  finalCount: number;
+}
+
+interface CleanupClaimsProbe {
+  identities: { resource_set_key: string; platform_plane_identity: string }[];
+  claimsAfter: number;
+  rowAfter: string | null;
+}
+
 interface BoundedDecommissionProbe {
   readonly result: {
     readonly status: 'pending' | 'blocked' | 'complete';
@@ -301,6 +334,8 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
       revision: 1,
       columns: [
         'backend_switch_intent',
+        'cleanup_intent',
+        'invocation_authority',
         'settled_settlement_key',
         'decommission_intent',
       ],
@@ -1132,6 +1167,101 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
 
   // Resetting the server recreates storage and rebinds `worker`,
   // so this case stays last.
+
+  it('completes a cleanup terminal atomically with a receipt, claims release, and row delete', async () => {
+    const result = await probe<CleanupTerminalProbe>(
+      'cleanup-terminal-receipt',
+    );
+    expect(result.claimsBefore).toBe(1);
+    expect(result.claimsAfter).toBe(0);
+    expect(result.rowAfterTerminal).toBeNull();
+    expect(result.persistedHasCompletedAt).toBe(true);
+  });
+
+  it('refuses a stale cleanup terminal revision without mutating anything', async () => {
+    const result = await probe<CleanupTerminalProbe>(
+      'cleanup-terminal-receipt',
+    );
+    expect(result.stale).toEqual({
+      name: 'Error',
+      message: expect.stringContaining('no matching active cleanup operation'),
+    });
+    expect(result.rowPhaseAfterStale).toBe('cleanup-advancing');
+    expect(result.receiptsAfterStale).toBe(0);
+  });
+
+  it('converges replayed cleanup terminals across evidence key order', async () => {
+    const result = await probe<CleanupTerminalProbe>(
+      'cleanup-terminal-receipt',
+    );
+    expect(result.replayEqual).toBe(true);
+    expect(result.keyOrderReplayEqual).toBe(true);
+  });
+
+  it('refuses conflicting and foreign cleanup terminal receipts', async () => {
+    const result = await probe<CleanupTerminalProbe>(
+      'cleanup-terminal-receipt',
+    );
+    expect(result.conflict).toEqual({
+      name: 'Error',
+      message: expect.stringContaining('cleanup receipt conflict'),
+    });
+    expect(result.foreign).toEqual({
+      name: 'Error',
+      message: expect.stringContaining('cannot write'),
+    });
+  });
+
+  it('keeps historical cleanup receipts across an immediate same-key reprovision', async () => {
+    const result = await probe<CleanupTerminalProbe>(
+      'cleanup-terminal-receipt',
+    );
+    expect(result.reprovisionPhase).toBe('ready');
+    expect(result.survivingOperationId).toBe(
+      '00000000-0000-4000-8000-0000000000aa',
+    );
+  });
+
+  it('fails closed on invalid cleanup receipt prune limits', async () => {
+    const result = await probe<CleanupPruneProbe>('cleanup-receipt-prune');
+    for (const refusal of result.invalid) {
+      expect(refusal).toEqual({
+        name: 'Error',
+        message: expect.stringContaining('limit'),
+      });
+    }
+    expect(result.untouched).toBe(3);
+  });
+
+  it('prunes cleanup receipts in stable database-time order', async () => {
+    const result = await probe<CleanupPruneProbe>('cleanup-receipt-prune');
+    expect(result.nothing).toEqual({ deleted: 0 });
+    expect(result.firstTwo).toEqual({ deleted: 2 });
+    expect(result.remainingAfterFirstTwo).toEqual([
+      '00000000-0000-4000-8000-0000000000a3',
+    ]);
+    expect(result.lowerBound).toEqual({ deleted: 1 });
+    expect(result.rest).toEqual({ deleted: 0 });
+    expect(result.finalCount).toBe(0);
+  });
+
+  it('releases claims and the fleet row through the force deletion path', async () => {
+    const result = await probe<CleanupClaimsProbe>('cleanup-claims-release');
+    expect(result.claimsAfter).toBe(0);
+    expect(result.rowAfter).toBeNull();
+  });
+
+  it('writes every deployment claim under the deployment identity', async () => {
+    const result = await probe<CleanupClaimsProbe>('cleanup-claims-release');
+    expect(result.identities.length).toBeGreaterThan(0);
+    for (const claim of result.identities) {
+      expect(claim.resource_set_key).toBe('deployment:claimsrel:production');
+      expect(claim.platform_plane_identity).toBe(
+        'deployment:claimsrel:production',
+      );
+    }
+  });
+
   it('initializes the schema under concurrent first writes on fresh D1 storage', async () => {
     await server.reset();
     worker = server.getWorker();
@@ -1149,6 +1279,8 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
         'backend_switch_intent',
         'settled_settlement_key',
         'decommission_intent',
+        'cleanup_intent',
+        'invocation_authority',
       ],
       rows: 16,
       tables: [

@@ -204,6 +204,22 @@ module.exports = {
       },
     },
     {
+      name: 'fleet-control-cleanup-state-does-not-reach-provider',
+      severity: 'error',
+      comment:
+        'Persisted cleanup state is a provider-free authority boundary. Keeping provider clients, operations, and error classification out of its reachable graph prevents the cleanup codec and eligibility classifier from acquiring credential or transport dependencies.',
+      from: {
+        path: [
+          '^packages/fleet-control/src/cleanup-intent\\.ts$',
+          '^scripts/architecture-fixtures/cleanup-state-imports-provider\\.ts$',
+        ],
+      },
+      to: {
+        path: '(?:^packages/fleet-control/src/(?:cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors)\\.ts$|^cloudflare(?:/|$)|(?:^|/)node_modules/(?:\\.pnpm/)?cloudflare(?:@|/))',
+        reachable: true,
+      },
+    },
+    {
       name: 'fleet-control-decommission-advance-is-transport-neutral',
       severity: 'error',
       comment:

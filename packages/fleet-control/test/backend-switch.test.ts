@@ -10,6 +10,7 @@ import {
   type BackendSwitchIntent,
   type BackendSwitchProvider,
   type BridgeSnapshot,
+  backendSwitchDecommissionShell,
   backendSwitchDecommissionSnapshotDigest,
   backendSwitchIntentFromUnknown,
   decommissionBackendSwitch,
@@ -3677,5 +3678,100 @@ describe('backend switch state machine', () => {
     expect(lateCapabilityReads).toBe(0);
     expect(lateProvider.calls).toContain('decommission-export');
     expect(lateProvider.calls).toContain('decommission-database');
+  });
+  it('fails closed when a decommission record carries a cleanup intent', async () => {
+    const base = {
+      tenantTag: 'acme',
+      environment: 'production',
+      backend: 'plain-worker',
+      scriptName: 'acme-production',
+      databaseId: 'db-acme',
+      databaseName: 'acme-production',
+      schemaVersion: 1,
+      artifactVersion: 'artifact-v1',
+      desiredSpecDigest: 'a'.repeat(64),
+      durableObjectBindings: [],
+      applicationResources: [],
+      applicationBindings: { vars: [], secrets: [], r2Buckets: [] },
+      routeHostname: 'acme.example.test',
+      phase: 'ready',
+      updatedAt: '2026-08-29T00:00:00.000Z',
+    } as const satisfies import('../src/types.js').FleetRecord;
+    const hostile = {
+      ...decommissionAdvancingRecordFixture(base, 'ready', {
+        operationId: '123e4567-e89b-42d3-a456-426614174000',
+        revision: 0,
+        generation: 0,
+        updatedAt: '2026-08-29T00:00:01.000Z',
+      }),
+      cleanupIntent: { version: 1 },
+    };
+    const store = {
+      get: async () => hostile,
+      list: async () => [hostile],
+      withDeploymentLease: async () => {
+        throw new Error('lease must not be acquired for a hostile record');
+      },
+    };
+    await expect(
+      decommissionDeployment({
+        backend: {} as never,
+        store: store as never,
+        spec: {
+          tenantTag: 'acme',
+          environment: 'production',
+        } as never,
+      }),
+    ).rejects.toThrow('backend switch decommission record is malformed');
+  });
+
+  it('refuses backend switch decommission shells during an active cleanup', () => {
+    const record = {
+      tenantTag: 'acme',
+      environment: 'production',
+      backend: 'workers-for-platforms',
+      scriptName: 'acme-production',
+      databaseId: '00000000-0000-0000-0000-000000000001',
+      databaseName: 'acme-production',
+      schemaVersion: 1,
+      artifactVersion: 'artifact-v1',
+      desiredSpecDigest: 'a'.repeat(64),
+      durableObjectBindings: [],
+      routeHostname: 'acme.example.test',
+      phase: 'cleanup-advancing',
+      updatedAt: '2026-08-29T00:00:00.000Z',
+      cleanupIntent: {
+        version: 1,
+        operationId: '12345678-1234-4abc-8def-1234567890ab',
+        revision: 0,
+        generation: 0,
+        updatedAt: '2026-08-29T00:00:00.000Z',
+        authority: { kind: 'manual-cleanup' },
+        identity: {
+          record: {
+            tenantTag: 'acme',
+            environment: 'production',
+            backend: 'workers-for-platforms',
+            scriptName: 'acme-production',
+            databaseId: '00000000-0000-0000-0000-000000000001',
+            databaseName: 'acme-production',
+            routeHostname: 'acme.example.test',
+          },
+          admittedPhase: 'worker-deployed',
+          externalArtifact: true,
+        },
+        state: { step: 'teardown-traffic' },
+      },
+    } as const satisfies import('../src/types.js').FleetRecord;
+    expect(() =>
+      backendSwitchDecommissionShell({
+        record,
+        intent: {} as never,
+        operationId: '12345678-1234-4abc-8def-1234567890ab',
+        snapshotSha256: 'a'.repeat(64),
+        entrySubphase: 'decommission-database' as never,
+        now: '2026-08-29T00:00:00.000Z',
+      }),
+    ).toThrow('cannot run during an active cleanup');
   });
 });
