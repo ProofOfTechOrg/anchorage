@@ -19,6 +19,11 @@ import {
   testRateCoordinator,
   zoneAuthorityResponse,
 } from './fixtures/cloudflare-fetch-fixture.js';
+import {
+  DRAIN_BASELINE_INVENTORY,
+  DRAIN_BASELINE_REQUESTS,
+} from './fixtures/fleet-inventory-drain-baseline.js';
+import { runFleetInventoryDrain } from './fixtures/fleet-inventory-drain-world.js';
 import { errorChain } from './fixtures/plain-worker-harnesses.js';
 
 function deployment(overrides: Partial<DeploymentSpec> = {}): DeploymentSpec {
@@ -2966,6 +2971,13 @@ describe('CloudflareProvisioningClient', () => {
       client.inspectActiveWorkerRoute('acme-production'),
     ).resolves.toBeUndefined();
     expect(versionReads).toBe(reads);
+  });
+
+  it('drains the recorded world into the frozen golden inventory and request sequence', async () => {
+    const { requests, inventory } = await runFleetInventoryDrain();
+
+    expect(inventory).toEqual(DRAIN_BASELINE_INVENTORY);
+    expect(requests).toEqual(DRAIN_BASELINE_REQUESTS);
   });
 });
 
