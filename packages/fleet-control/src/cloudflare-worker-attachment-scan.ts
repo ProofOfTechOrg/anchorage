@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import {
   CLOUDFLARE_INVENTORY_BOUND,
   CLOUDFLARE_SDK_MAX_ATTEMPTS,
+  inventoryBoundExceeded,
 } from './cloudflare-client-config.js';
 import type { CloudflareSdk } from './cloudflare-ordinary-worker-operations.js';
 import { isNotFound } from './cloudflare-provider-errors.js';
@@ -179,12 +180,6 @@ function boundedString(
 
 function codeUnitCompare(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
-}
-
-function inventoryBoundExceeded(label: string, max: number): Error {
-  return new Error(
-    `${label} exceeded the supported inventory bound of ${max} items`,
-  );
 }
 
 function drift(): never {

@@ -10,6 +10,7 @@ import { canonicalApplicationBindings } from './application-bindings.js';
 import {
   CLOUDFLARE_INVENTORY_BOUND,
   CLOUDFLARE_SDK_MAX_RETRIES,
+  inventoryBoundExceeded,
 } from './cloudflare-client-config.js';
 import {
   attachCustomDomain,
@@ -265,12 +266,6 @@ export class CloudflareProviderRequestNotDispatchedError extends Error {
     super('Cloudflare provider request was not dispatched', { cause });
     this.name = 'CloudflareProviderRequestNotDispatchedError';
   }
-}
-
-function inventoryBoundExceeded(label: string, max: number): Error {
-  return new Error(
-    `${label} exceeded the supported inventory bound of ${max} items`,
-  );
 }
 
 const REQUIRED_ZONE_PERMISSION_GROUPS = [
