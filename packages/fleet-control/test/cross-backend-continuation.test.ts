@@ -364,6 +364,9 @@ describe('ordinary Worker cross-backend continuation', () => {
       ['application-resources-create-authorized', 2],
       ['application-resources-deployed', 2],
       ['worker-deployed', 2],
+      // The invocation-authority flip commits on a dedicated put before the
+      // first maintenance request.
+      ['worker-deployed', 2],
       ['maintenance-armed', 2],
       ['publishing', 2],
     ]);
@@ -495,7 +498,49 @@ describe('ordinary Worker cross-backend continuation', () => {
 
     expect(directAuthorized.store.record).toBeUndefined();
     expect(directAuthorized.world.databases).toEqual([]);
+    expect([...directAuthorized.store.receipts.values()]).toMatchObject([
+      {
+        disposition: 'prepublication-owned-no-export',
+        admittedPhase: 'database-create-authorized',
+        authority: 'manual-cleanup',
+      },
+    ]);
 
+    const source = wrangler();
+    const spec = buildPlainWorkerSpec();
+    await provision(source, spec);
+    // The never-authorized carrier keeps trusted plain no-export cleanup
+    // through worker-deployed; the maintenance-armed row is authorized and
+    // now refuses toward export-backed decommissioning.
+    const snapshot = source.store.snapshots.find(
+      ({ record }) => record.phase === 'worker-deployed',
+    );
+    if (!snapshot) throw new Error('missing worker-deployed snapshot');
+    expect(snapshot.record.invocationAuthority).toEqual({
+      version: 1,
+      authorizedAt: null,
+    });
+    const direct = directHarness(snapshot.world.clone());
+    direct.store.record = structuredClone(snapshot.record);
+
+    await cleanupDeploymentArtifacts({
+      backend: direct.backend,
+      store: direct.store,
+      spec,
+    });
+
+    expect(direct.store.record).toBeUndefined();
+    expect(direct.world.databases).toEqual([]);
+    expect(direct.world.scripts.get(spec.scriptName)?.present).toBe(false);
+    expect([...direct.store.receipts.values()]).toMatchObject([
+      {
+        disposition: 'prepublication-owned-no-export',
+        admittedPhase: 'worker-deployed',
+      },
+    ]);
+  });
+
+  it('refuses legacy ambiguous-phase snapshots without mutation and routes them to export-backed decommission', async () => {
     const source = wrangler();
     const spec = buildPlainWorkerSpec();
     await provision(source, spec);
@@ -504,18 +549,44 @@ describe('ordinary Worker cross-backend continuation', () => {
         ({ record }) => record.phase === phase,
       );
       if (!snapshot) throw new Error(`missing ${phase} snapshot`);
-      const direct = directHarness(snapshot.world.clone());
-      direct.store.record = structuredClone(snapshot.record);
+      const world = snapshot.world.clone();
+      const direct = directHarness(world);
+      // A legacy row predates the invocation-authority carrier entirely, so
+      // its phase alone cannot rule out a dispatched candidate invocation.
+      const { invocationAuthority: _carrier, ...legacy } = structuredClone(
+        snapshot.record,
+      );
+      direct.store.record = legacy;
+      const before = worldFacts(world);
 
-      await cleanupDeploymentArtifacts({
+      const failure = await captureFailure(
+        cleanupDeploymentArtifacts({
+          backend: direct.backend,
+          store: direct.store,
+          spec,
+        }),
+      );
+
+      expect((failure as Error).message).toBe(
+        'legacy deployment phase cannot rule out candidate invocation; use export-backed decommissioning',
+      );
+      expect(worldFacts(world)).toEqual(before);
+      expect(direct.store.record).toEqual(legacy);
+      expect(direct.store.receipts.size).toBe(0);
+
+      // The refused row stays provisioning-resumable; completing it makes
+      // the deployment decommissionable with its export receipt.
+      const resumed = await provision(direct, spec);
+      expect(resumed.record.phase).toBe('ready');
+      const decommissioned = await decommissionDeployment({
         backend: direct.backend,
         store: direct.store,
         spec,
       });
-
-      expect(direct.store.record).toBeUndefined();
-      expect(direct.world.databases).toEqual([]);
-      expect(direct.world.scripts.get(spec.scriptName)?.present).toBe(false);
+      expect(decommissioned.record.phase).toBe('decommissioned');
+      expect(decommissioned.databaseExport.size).toBeGreaterThan(0);
+      expect(world.databases).toEqual([]);
+      expect(world.scripts.get(spec.scriptName)?.present).toBe(false);
     }
   });
 
@@ -548,9 +619,12 @@ describe('ordinary Worker cross-backend continuation', () => {
       }),
     );
     expect(errorChain(foreignFailure)).toContain("owned by 'foreign'");
-    expect(foreignDirect.store.record?.phase).toBe(
-      'database-create-authorized',
-    );
+    // The provider refusal fires inside the database-deletion group, after
+    // the intent was durably admitted; the row stays resumable there.
+    expect(foreignDirect.store.record?.phase).toBe('cleanup-advancing');
+    expect(
+      foreignDirect.store.record?.cleanupIntent?.identity.admittedPhase,
+    ).toBe('database-create-authorized');
 
     const source = wrangler();
     const spec = buildPlainWorkerSpec();
@@ -576,13 +650,19 @@ describe('ordinary Worker cross-backend continuation', () => {
         spec,
       }),
     );
-    expect(errorChain(mismatchFailure)).toContain(
-      'resolved with unexpected identity',
+    expect(mismatchFailure).toBeInstanceOf(AggregateError);
+    expect(
+      (mismatchFailure as AggregateError).errors.map((error) =>
+        errorChain(error),
+      ),
+    ).toEqual([expect.stringContaining('resolved with unexpected identity')]);
+    expect(mismatched.store.record?.phase).toBe('cleanup-advancing');
+    expect(mismatched.store.record?.cleanupIntent?.identity.admittedPhase).toBe(
+      'worker-deployed',
     );
-    expect(mismatched.store.record?.phase).toBe('worker-deployed');
   });
 
-  it('compensates a Wrangler ambiguous create after direct recovery creates the Worker', async () => {
+  it('preserves a direct recovery whose maintenance request was authorized and completes through export-backed decommission', async () => {
     const authorized = await authorizedWranglerCreate(true);
     const direct = directHarness(authorized.harness.world);
     direct.store.record = structuredClone(authorized.store.record);
@@ -601,17 +681,33 @@ describe('ordinary Worker cross-backend continuation', () => {
 
     expect(failure).toBeInstanceOf(ProvisioningError);
     expect(deployedCreated).toBe(true);
-    expect(direct.store.record).toBeUndefined();
+    // The invocation-authority flip committed before the maintenance
+    // request, so rollback refuses no-export teardown and preserves the
+    // deployment whole for export-backed decommissioning.
+    expect((failure as ProvisioningError).cleanupErrors).toEqual([
+      expect.objectContaining({
+        message:
+          'deployment candidate invocation was durably authorized; use export-backed decommissioning',
+      }),
+    ]);
+    expect(direct.store.record?.phase).toBe('worker-deployed');
+    expect(direct.world.databases).toHaveLength(1);
+    expect(direct.world.scripts.get(authorized.spec.scriptName)?.present).toBe(
+      true,
+    );
+
+    const resumed = await provision(direct, authorized.spec);
+    expect(resumed.record.phase).toBe('ready');
+    const decommissioned = await decommissionDeployment({
+      backend: direct.backend,
+      store: direct.store,
+      spec: authorized.spec,
+    });
+    expect(decommissioned.record.phase).toBe('decommissioned');
+    expect(decommissioned.databaseExport.size).toBeGreaterThan(0);
     expect(direct.world.databases).toEqual([]);
     expect(direct.world.scripts.get(authorized.spec.scriptName)?.present).toBe(
       false,
-    );
-    expect(direct.world.customDomains).toEqual([]);
-    expect(direct.world.mutationLog).toEqual(
-      expect.arrayContaining([
-        `delete-script:${authorized.spec.scriptName}`,
-        expect.stringMatching(/^delete-database:/u),
-      ]),
     );
   });
 

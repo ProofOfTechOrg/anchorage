@@ -45,6 +45,7 @@ import type {
   ActiveRouteAttestation,
   ApplicationR2BucketSnapshot,
   ApplicationR2Resource,
+  CleanupTerminalReceipt,
   DatabaseExport,
   DatabaseExportReceiptIdentity,
   DatabaseReference,
@@ -155,6 +156,11 @@ class MemoryStore implements FleetStateStore {
   record: FleetRecord | undefined;
   leased = false;
   leaseCalls = 0;
+  readonly receipts = new Map<string, CleanupTerminalReceipt>();
+  completedAtMs = 1_000;
+  supportsDeleteReleasingClaims = false;
+  deleteReleasingClaimsCalls = 0;
+  deleteCalls = 0;
   readonly phases: string[] = [];
   failPutPhase: string | undefined;
   failPutApplicationState:
@@ -191,10 +197,48 @@ class MemoryStore implements FleetStateStore {
         renew: async () => {},
         put: (record) => this.put(record),
         delete: () => this.delete(),
+        completeCleanup: (input) => this.completeCleanup(input),
+        ...(this.supportsDeleteReleasingClaims
+          ? {
+              deleteReleasingClaims: async () => {
+                this.deleteReleasingClaimsCalls += 1;
+                this.record = undefined;
+              },
+            }
+          : {}),
       });
     } finally {
       this.leased = false;
     }
+  }
+
+  async completeCleanup(input: {
+    receipt: CleanupTerminalReceipt;
+    expectedRevision: number;
+  }): Promise<CleanupTerminalReceipt> {
+    const current = this.record;
+    if (
+      current?.phase !== 'cleanup-advancing' ||
+      current.cleanupIntent?.operationId !== input.receipt.operationId ||
+      current.cleanupIntent.revision !== input.expectedRevision
+    ) {
+      const existing = this.receipts.get(input.receipt.operationId);
+      if (existing) return existing;
+      throw new Error(
+        `cleanup receipt conflict for operation '${input.receipt.operationId}'`,
+      );
+    }
+    const persisted = { ...input.receipt, completedAtMs: this.completedAtMs };
+    this.completedAtMs += 1;
+    this.receipts.set(persisted.operationId, persisted);
+    this.record = undefined;
+    return persisted;
+  }
+
+  async readCleanupReceipt(
+    operationId: string,
+  ): Promise<CleanupTerminalReceipt | undefined> {
+    return this.receipts.get(operationId);
   }
 
   async get(): Promise<FleetRecord | undefined> {
@@ -242,6 +286,7 @@ class MemoryStore implements FleetStateStore {
   }
 
   async delete(): Promise<void> {
+    this.deleteCalls += 1;
     this.record = undefined;
   }
 
@@ -1536,6 +1581,52 @@ describe('fleet provisioning', () => {
     expect(raceBackend.events).toEqual([]);
   });
 
+  it('fails closed when a decommission record carries a cleanup intent', async () => {
+    const base = {
+      tenantTag: 'acme',
+      environment: 'production',
+      backend: 'plain-worker',
+      scriptName: 'acme-production',
+      databaseId: 'db-acme',
+      databaseName: 'acme-production',
+      schemaVersion: 1,
+      artifactVersion: 'artifact-v1',
+      desiredSpecDigest: 'a'.repeat(64),
+      durableObjectBindings: [],
+      applicationResources: [],
+      applicationBindings: { vars: [], secrets: [], r2Buckets: [] },
+      routeHostname: 'acme.example.test',
+      phase: 'ready',
+      updatedAt: '2026-08-29T00:00:00.000Z',
+    } as const satisfies FleetRecord;
+    const hostile = {
+      ...decommissionAdvancingRecordFixture(base, 'ready', {
+        operationId: '123e4567-e89b-42d3-a456-426614174000',
+        revision: 0,
+        generation: 0,
+        updatedAt: '2026-08-29T00:00:01.000Z',
+      }),
+      cleanupIntent: { version: 1 },
+    };
+    const store = {
+      get: async () => hostile,
+      list: async () => [hostile],
+      withDeploymentLease: async () => {
+        throw new Error('lease must not be acquired for a hostile record');
+      },
+    };
+    await expect(
+      decommissionDeployment({
+        backend: {} as never,
+        store: store as never,
+        spec: {
+          tenantTag: 'acme',
+          environment: 'production',
+        } as never,
+      }),
+    ).rejects.toThrow('backend switch decommission record is malformed');
+  });
+
   it('persists the ordered create phases and returns a ready deployment', async () => {
     const backend = new FakeBackend();
     const store = new MemoryStore();
@@ -1580,6 +1671,9 @@ describe('fleet provisioning', () => {
       'identity-seeded',
       'migrated',
       'application-resources-create-authorized',
+      'application-resources-deployed',
+      // The invocation-authority flip commits on a dedicated put before the
+      // external candidate upload dispatches.
       'application-resources-deployed',
       'worker-deployed',
       'maintenance-armed',
@@ -1811,7 +1905,7 @@ describe('fleet provisioning', () => {
   });
 
   it('clears a database reservation only after the exact reserved name is positively absent', async () => {
-    const backend = new FakeBackend();
+    const backend = new FakeBackend('plain-worker');
     const store = new MemoryStore();
     const deployment = spec();
     const findDatabase = backend.findDatabase.bind(backend);
@@ -1836,10 +1930,13 @@ describe('fleet provisioning', () => {
     ).resolves.toBeUndefined();
     expect(backend.events).toEqual([]);
     expect(store.record).toBeUndefined();
+    expect([...store.receipts.values()]).toMatchObject([
+      { disposition: 'reservation-cleared', authority: 'manual-cleanup' },
+    ]);
   });
 
   it('deletes an unseeded exact-name database left by an ambiguous reserved create', async () => {
-    const backend = new FakeBackend();
+    const backend = new FakeBackend('plain-worker');
     backend.failAt = 'database';
     const store = new MemoryStore();
     const deployment = spec();
@@ -1870,7 +1967,7 @@ describe('fleet provisioning', () => {
   });
 
   it('refuses a pre-existing same-name database before create authorization', async () => {
-    const backend = new FakeBackend();
+    const backend = new FakeBackend('plain-worker');
     backend.databaseExists = true;
     backend.databaseOwner = undefined;
     const store = new MemoryStore();
@@ -1932,9 +2029,8 @@ describe('fleet provisioning', () => {
     'identity',
     'migrations',
     'worker',
-    'maintenance',
   ])('rolls back resources when %s fails', async (failure) => {
-    const backend = new FakeBackend();
+    const backend = new FakeBackend('plain-worker');
     backend.failAt = failure;
     const store = new MemoryStore();
 
@@ -1949,13 +2045,22 @@ describe('fleet provisioning', () => {
     ).rejects.toBeInstanceOf(ProvisioningError);
 
     if (failure === 'identity') {
+      // Ownership was never proven, so rollback keeps the resumable row
+      // instead of admitting an engine that could not delete the database.
       expect(backend.events).not.toContain('delete-database');
       expect(store.record?.phase).toBe('database-created');
+      expect(store.receipts.size).toBe(0);
     } else {
       expect(backend.events.at(-1)).toBe('delete-database');
       expect(store.record).toBeUndefined();
+      expect([...store.receipts.values()]).toMatchObject([
+        {
+          disposition: 'prepublication-owned-no-export',
+          authority: 'provisioning-rollback',
+        },
+      ]);
     }
-    if (failure === 'maintenance') {
+    if (failure === 'worker') {
       expect(backend.events).toContain('revoke');
       expect(backend.events).toContain('delete-worker');
     }
@@ -1963,7 +2068,9 @@ describe('fleet provisioning', () => {
 
   it('passes the persisted plain-Worker release through post-deploy rollback', async () => {
     const backend = new FakeBackend('plain-worker');
-    backend.failAt = 'maintenance';
+    // Fail after the worker-deployed commit but before the maintenance flip:
+    // once maintenance was requested, rollback refuses no-export teardown.
+    backend.failAt = 'inspect';
     const store = new MemoryStore();
     const deployment = spec();
 
@@ -2018,7 +2125,9 @@ describe('fleet provisioning', () => {
       })),
     ).toEqual([
       { name: 'ARCHIVE', state: 'deleted' },
-      { name: 'FILES', state: 'detach-authorized' },
+      // The failed detachment assertion persists nothing; replay re-derives
+      // the detachment requirement from the durable 'created' state.
+      { name: 'FILES', state: 'created' },
     ]);
     expect([...backend.buckets.values()].map(({ name }) => name)).toEqual([
       'FILES',
@@ -2129,7 +2238,9 @@ describe('fleet provisioning', () => {
       })),
     ).toEqual([
       { name: 'ALBUMS', state: 'deleted' },
-      { name: 'ARCHIVE', state: 'detach-authorized' },
+      // The failed detachment assertion persists nothing; replay re-derives
+      // the detachment requirement from the durable 'created' state.
+      { name: 'ARCHIVE', state: 'created' },
     ]);
     expect([...backend.buckets.values()].map(({ name }) => name)).toEqual([
       'ARCHIVE',
@@ -2217,22 +2328,22 @@ describe('fleet provisioning', () => {
     ).rejects.toBeInstanceOf(ProvisioningError);
 
     expect(store.phases).toContain('platform-resources-deployed');
+    // The customer-data-capable external candidate is preserved whole:
+    // rollback refuses before any mutation and routes teardown to
+    // export-backed decommissioning.
     expect(backend.events).toEqual(
-      expect.arrayContaining([
-        'platform-resources',
-        'worker',
-        'revoke-platform',
-        'delete-platform',
-        'delete-database',
-      ]),
+      expect.arrayContaining(['platform-resources', 'worker']),
     );
-    expect(backend.deletedPlatformNamespaceIds).toEqual([
+    expect(backend.events).not.toContain('revoke-platform');
+    expect(backend.events).not.toContain('delete-platform');
+    expect(backend.events).not.toContain('delete-database');
+    expect(store.record?.phase).toBe('platform-resources-deployed');
+    expect(store.record?.platformResources?.stateWorker.namespaceIds).toEqual([
       'state-acme-production-MAINTENANCE',
     ]);
-    expect(store.record).toBeUndefined();
   });
 
-  it('cleans an exact private bootstrap after platform privatization fails before the resource snapshot', async () => {
+  it('preserves a private bootstrap for export-backed decommission after privatization fails before the resource snapshot', async () => {
     const backend = new FakeBackend();
     backend.failAt = 'platform-privatization';
     const store = new MemoryStore();
@@ -2252,18 +2363,15 @@ describe('fleet provisioning', () => {
       }),
     ).rejects.toBeInstanceOf(ProvisioningError);
 
+    // The private bootstrap fails before the resource snapshot commits, so
+    // the durable row never left 'application-resources-deployed'; the WFP
+    // rollback refuses no-export teardown and preserves the deployment.
     expect(backend.events).toEqual(
-      expect.arrayContaining([
-        'platform-resources',
-        'platform-privatization',
-        'revoke-platform',
-        'delete-platform',
-        'delete-database',
-      ]),
+      expect.arrayContaining(['platform-resources', 'platform-privatization']),
     );
-    expect(backend.platformBootstrapPresent).toBe(false);
-    expect(backend.databaseExists).toBe(false);
-    expect(store.record).toBeUndefined();
+    expect(backend.events).not.toContain('delete-database');
+    expect(backend.databaseExists).toBe(true);
+    expect(store.record?.phase).toBe('application-resources-deployed');
   });
 
   it('rejects external artifacts on the plain backend before creating resources', async () => {
@@ -2861,7 +2969,11 @@ describe('fleet provisioning', () => {
       secrets,
     });
     if (!store.record) throw new Error('missing provisioned record');
-    store.record = { ...store.record, phase: 'worker-deployed' };
+    store.record = {
+      ...store.record,
+      phase: 'worker-deployed',
+      invocationAuthority: { version: 1, authorizedAt: null },
+    };
     backend.events.length = 0;
     backend.trafficDrift = true;
 
@@ -2877,7 +2989,18 @@ describe('fleet provisioning', () => {
     expect(backend.events).toEqual([]);
     expect(backend.live).toBeDefined();
     expect(backend.databaseExists).toBe(true);
-    expect(store.record.phase).toBe('worker-deployed');
+    // The failed group leaves a durable intent for retry; remediation then
+    // resumes the same operation to its terminal receipt.
+    expect(store.record?.phase).toBe('cleanup-advancing');
+    expect(store.record?.cleanupIntent?.identity.admittedPhase).toBe(
+      'worker-deployed',
+    );
+    backend.trafficDrift = false;
+    await expect(
+      cleanupDeploymentArtifacts({ backend, store, spec: deployment }),
+    ).resolves.toBeUndefined();
+    expect(store.record).toBeUndefined();
+    expect(store.receipts.size).toBe(1);
   });
 
   it('never deletes the database when export fails', async () => {
@@ -3091,7 +3214,7 @@ describe('fleet provisioning', () => {
   });
 
   it('rejects database cleanup when the persisted ID has another sentinel owner', async () => {
-    const backend = new FakeBackend();
+    const backend = new FakeBackend('plain-worker');
     const store = new MemoryStore();
     await provisionDeployment({
       initialExecutionFenceState: 'open',
@@ -3101,19 +3224,35 @@ describe('fleet provisioning', () => {
       secrets,
     });
     if (!store.record) throw new Error('missing test record');
-    store.record = { ...store.record, phase: 'worker-deployed' };
+    store.record = {
+      ...store.record,
+      phase: 'worker-deployed',
+      invocationAuthority: { version: 1, authorizedAt: null },
+    };
     backend.databaseOwner = 'other-tenant';
     backend.events.length = 0;
 
-    await expect(
-      cleanupDeploymentArtifacts({ backend, store, spec: spec() }),
-    ).rejects.toThrow(/owned by 'other-tenant'/);
-    expect(backend.events).toEqual([]);
-    expect(store.record.phase).toBe('worker-deployed');
+    // The engine reconciles the persisted database at the deletion boundary,
+    // after the absence-tolerant teardown groups; the foreign sentinel then
+    // refuses deletion and the durable intent stays resumable.
+    const failure = await cleanupDeploymentArtifacts({
+      backend,
+      store,
+      spec: spec(),
+    }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toEqual([
+      expect.objectContaining({
+        message: expect.stringMatching(/owned by 'other-tenant'/),
+      }),
+    ]);
+    expect(backend.events).not.toContain('delete-database');
+    expect(backend.databaseExists).toBe(true);
+    expect(store.record?.phase).toBe('cleanup-advancing');
   });
 
   it('converges cleanup when the persisted database ID is positively absent', async () => {
-    const backend = new FakeBackend();
+    const backend = new FakeBackend('plain-worker');
     const store = new MemoryStore();
     await provisionDeployment({
       initialExecutionFenceState: 'open',
@@ -3123,7 +3262,11 @@ describe('fleet provisioning', () => {
       secrets,
     });
     if (!store.record) throw new Error('missing test record');
-    store.record = { ...store.record, phase: 'worker-deployed' };
+    store.record = {
+      ...store.record,
+      phase: 'worker-deployed',
+      invocationAuthority: { version: 1, authorizedAt: null },
+    };
     backend.databaseExists = false;
     backend.events.length = 0;
 
@@ -3132,10 +3275,13 @@ describe('fleet provisioning', () => {
     ).resolves.toBeUndefined();
     expect(backend.events).toEqual(['revoke', 'delete-worker']);
     expect(store.record).toBeUndefined();
+    expect([...store.receipts.values()]).toMatchObject([
+      { disposition: 'reservation-cleared', authority: 'manual-cleanup' },
+    ]);
   });
 
   it('does not treat a persisted-ID lookup failure as database absence', async () => {
-    const backend = new FakeBackend();
+    const backend = new FakeBackend('plain-worker');
     const store = new MemoryStore();
     await provisionDeployment({
       initialExecutionFenceState: 'open',
@@ -3145,17 +3291,30 @@ describe('fleet provisioning', () => {
       secrets,
     });
     if (!store.record) throw new Error('missing test record');
-    store.record = { ...store.record, phase: 'worker-deployed' };
+    store.record = {
+      ...store.record,
+      phase: 'worker-deployed',
+      invocationAuthority: { version: 1, authorizedAt: null },
+    };
     backend.getDatabase = async () => {
       throw new Error('D1 lookup unavailable');
     };
     backend.events.length = 0;
 
-    await expect(
-      cleanupDeploymentArtifacts({ backend, store, spec: spec() }),
-    ).rejects.toThrow(/D1 lookup unavailable/);
-    expect(backend.events).toEqual([]);
-    expect(store.record.phase).toBe('worker-deployed');
+    const failure = await cleanupDeploymentArtifacts({
+      backend,
+      store,
+      spec: spec(),
+    }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toEqual([
+      expect.objectContaining({
+        message: expect.stringMatching(/D1 lookup unavailable/),
+      }),
+    ]);
+    expect(backend.events).not.toContain('delete-database');
+    expect(backend.databaseExists).toBe(true);
+    expect(store.record?.phase).toBe('cleanup-advancing');
   });
 
   it('preserves the database and resumable record when Worker cleanup fails', async () => {
@@ -3750,7 +3909,7 @@ describe('fleet provisioning', () => {
   });
 
   it('does not delete D1 when partial cleanup cannot remove the Worker', async () => {
-    const backend = new FakeBackend();
+    const backend = new FakeBackend('plain-worker');
     const store = new MemoryStore();
     await provisionDeployment({
       initialExecutionFenceState: 'open',
@@ -3760,7 +3919,11 @@ describe('fleet provisioning', () => {
       secrets,
     });
     if (!store.record) throw new Error('missing test record');
-    store.record = { ...store.record, phase: 'worker-deployed' };
+    store.record = {
+      ...store.record,
+      phase: 'worker-deployed',
+      invocationAuthority: { version: 1, authorizedAt: null },
+    };
     backend.cleanupFailAt = 'delete-worker';
     backend.events.length = 0;
 
@@ -3768,7 +3931,8 @@ describe('fleet provisioning', () => {
       cleanupDeploymentArtifacts({ backend, store, spec: spec() }),
     ).rejects.toThrow(/failed to clean/);
     expect(backend.events).not.toContain('delete-database');
-    expect(store.record?.phase).toBe('worker-deployed');
+    expect(backend.databaseExists).toBe(true);
+    expect(store.record?.phase).toBe('cleanup-advancing');
   });
 
   it('rolls back a Worker this attempt created when upload scratch cleanup fails', async () => {
@@ -3832,6 +3996,588 @@ describe('fleet provisioning', () => {
     expect(state.workerExists).toBe(true);
     expect(state.databaseExists).toBe(true);
     expect(store.record).toBeUndefined();
+  });
+
+  it('ignores cleanup for an unregistered deployment without touching the lease or backend', async () => {
+    const backend = new FakeBackend('plain-worker');
+    const store = new MemoryStore();
+
+    await expect(
+      cleanupDeploymentArtifacts({ backend, store, spec: spec() }),
+    ).resolves.toBeUndefined();
+    expect(store.leaseCalls).toBe(0);
+    expect(backend.events).toEqual([]);
+    expect(backend.findDatabaseCalls).toBe(0);
+  });
+
+  it('resumes an active cleanup intent of either authority through the manual drain', async () => {
+    const backend = new FakeBackend('plain-worker');
+    backend.failAt = 'worker';
+    backend.cleanupFailAt = 'delete-worker';
+    const store = new MemoryStore();
+
+    await expect(
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: spec(),
+        secrets,
+      }),
+    ).rejects.toBeInstanceOf(ProvisioningError);
+    const intent = store.record?.cleanupIntent;
+    if (!intent) throw new Error('missing durable rollback intent');
+    expect(intent.authority).toMatchObject({ kind: 'provisioning-rollback' });
+    expect(store.record?.phase).toBe('cleanup-advancing');
+
+    backend.failAt = undefined;
+    backend.cleanupFailAt = undefined;
+    await expect(
+      cleanupDeploymentArtifacts({ backend, store, spec: spec() }),
+    ).resolves.toBeUndefined();
+    expect(store.record).toBeUndefined();
+    // The drain resumed the persisted rollback operation instead of minting
+    // a new manual one.
+    expect(store.receipts.get(intent.operationId)).toMatchObject({
+      authority: 'provisioning-rollback',
+      disposition: 'prepublication-owned-no-export',
+    });
+  });
+
+  it('reports cleanup-advancing lifecycle phases exactly and fails closed on inconsistent pairs', () => {
+    const base: FleetRecord = {
+      tenantTag: 'acme',
+      environment: 'production',
+      backend: 'plain-worker',
+      scriptName: 'acme-production',
+      databaseId: DATABASE_ID,
+      databaseName: 'acme-production',
+      schemaVersion: 3,
+      artifactVersion: 'artifact-v1',
+      desiredSpecDigest: 'a'.repeat(64),
+      durableObjectBindings: [],
+      routeHostname: 'acme.example.test',
+      phase: 'cleanup-advancing',
+      updatedAt: '2026-08-29T00:00:00.000Z',
+    };
+    const cleanupIntent: NonNullable<FleetRecord['cleanupIntent']> = {
+      version: 1,
+      operationId: '9c7b1de2-4c8f-4b9a-8f3e-2a6d5c4b3a21',
+      revision: 0,
+      generation: 0,
+      updatedAt: base.updatedAt,
+      authority: { kind: 'manual-cleanup' },
+      identity: {
+        record: {
+          tenantTag: base.tenantTag,
+          environment: base.environment,
+          backend: base.backend,
+          scriptName: base.scriptName,
+          databaseId: base.databaseId,
+          databaseName: base.databaseName,
+          routeHostname: base.routeHostname,
+        },
+        admittedPhase: 'worker-deployed',
+        externalArtifact: false,
+      },
+      state: { step: 'teardown-traffic' },
+    };
+
+    expect(effectiveLifecyclePhase({ ...base, cleanupIntent })).toBe(
+      'cleanup-advancing',
+    );
+    expect(() => effectiveLifecyclePhase(base)).toThrow(
+      'cleanup-advancing record has no active cleanup intent',
+    );
+    expect(() =>
+      effectiveLifecyclePhase({ ...base, phase: 'ready', cleanupIntent }),
+    ).toThrow('fleet record has inconsistent cleanup intent state');
+  });
+
+  it('refuses external-candidate rollback before mutation and preserves the deployment for export-backed decommissioning', async () => {
+    const backend = new FakeBackend();
+    backend.failAt = 'maintenance';
+    const store = new MemoryStore();
+    const external = spec({
+      authoredBy: 'external',
+      durableObjectMigrations: [],
+      egressProxyService: undefined,
+    });
+
+    const failure = await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: external,
+      secrets,
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ProvisioningError);
+    expect((failure as ProvisioningError).cleanupErrors).toEqual([
+      expect.objectContaining({
+        message:
+          'deployment carries an untrusted data binding; use export-backed decommissioning',
+      }),
+    ]);
+    expect(store.record?.phase).toBe('worker-deployed');
+    expect(store.record?.cleanupIntent).toBeUndefined();
+    expect(backend.events).not.toContain('revoke');
+    expect(backend.events).not.toContain('delete-worker');
+    expect(backend.events).not.toContain('delete-database');
+
+    // The row kept its phase, so a provisioning retry still succeeds.
+    backend.failAt = undefined;
+    await expect(
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: external,
+        secrets,
+      }),
+    ).resolves.toMatchObject({ record: { phase: 'ready' } });
+  });
+
+  it('writes the never-authorized invocation carrier on the first durable put', async () => {
+    class FirstPutProbeStore extends MemoryStore {
+      firstPut: FleetRecord | undefined;
+
+      override async put(record: FleetRecord): Promise<void> {
+        this.firstPut ??= structuredClone(record);
+        await super.put(record);
+      }
+    }
+    const backend = new FakeBackend('plain-worker');
+    const store = new FirstPutProbeStore();
+
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+    });
+
+    expect(store.firstPut?.phase).toBe('database-reserved');
+    expect(store.firstPut?.invocationAuthority).toEqual({
+      version: 1,
+      authorizedAt: null,
+    });
+    expect(typeof store.record?.invocationAuthority?.authorizedAt).toBe(
+      'string',
+    );
+  });
+
+  it('redirects provisioning of a cleanup-advancing row to the bounded cleanup drain', async () => {
+    const backend = new FakeBackend('plain-worker');
+    backend.failAt = 'worker';
+    backend.cleanupFailAt = 'delete-worker';
+    const store = new MemoryStore();
+
+    await expect(
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: spec(),
+        secrets,
+      }),
+    ).rejects.toBeInstanceOf(ProvisioningError);
+    expect(store.record?.phase).toBe('cleanup-advancing');
+
+    backend.failAt = undefined;
+    backend.cleanupFailAt = undefined;
+    backend.events.length = 0;
+    await expect(
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: spec(),
+        secrets,
+      }),
+    ).rejects.toThrow(
+      "deployment 'acme:production' has an active bounded cleanup; complete it with cleanupDeploymentArtifacts() or advanceCleanupDeployment() before provisioning again",
+    );
+    expect(backend.events).toEqual([]);
+
+    // Complete the cleanup, then the key reprovisions fresh.
+    await expect(
+      cleanupDeploymentArtifacts({ backend, store, spec: spec() }),
+    ).resolves.toBeUndefined();
+    await expect(
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: spec(),
+        secrets,
+      }),
+    ).resolves.toMatchObject({ record: { phase: 'ready' } });
+  });
+
+  it('returns the bounded rollback outcome through ProvisioningError.cleanup when failureCleanup is bounded', async () => {
+    const backend = new FakeBackend('plain-worker');
+    backend.failAt = 'worker';
+    const store = new MemoryStore();
+
+    const failure = await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+      failureCleanup: 'bounded',
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ProvisioningError);
+    expect((failure as ProvisioningError).message).toBe(
+      "failed to provision 'acme:production'",
+    );
+    expect((failure as ProvisioningError).cleanup).toMatchObject({
+      status: 'pending',
+      token: {
+        version: 1,
+        tenantTag: 'acme',
+        environment: 'production',
+        revision: 1,
+      },
+    });
+    // Exactly one bounded group advanced.
+    expect(store.record?.cleanupIntent?.state).toEqual({
+      step: 'teardown-worker',
+    });
+
+    await expect(
+      cleanupDeploymentArtifacts({ backend, store, spec: spec() }),
+    ).resolves.toBeUndefined();
+    expect(store.record).toBeUndefined();
+
+    // The default drain keeps the historical error shape.
+    const drainBackend = new FakeBackend('plain-worker');
+    drainBackend.failAt = 'worker';
+    const drainStore = new MemoryStore();
+    const drainFailure = await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend: drainBackend,
+      store: drainStore,
+      spec: spec(),
+      secrets,
+    }).catch((error: unknown) => error);
+    expect(drainFailure).toBeInstanceOf(ProvisioningError);
+    expect((drainFailure as ProvisioningError).cleanup).toBeUndefined();
+    expect(drainStore.record).toBeUndefined();
+  });
+
+  it('commits the invocation authority durably before each candidate-invoking dispatch', async () => {
+    class FlipTimelineStore extends MemoryStore {
+      constructor(private readonly timeline: string[]) {
+        super();
+      }
+
+      override async put(record: FleetRecord): Promise<void> {
+        await super.put(record);
+        const carrier = record.invocationAuthority;
+        this.timeline.push(
+          `put:${record.phase}:${
+            carrier
+              ? carrier.authorizedAt === null
+                ? 'null'
+                : 'authorized'
+              : 'absent'
+          }`,
+        );
+      }
+    }
+
+    const plain = new FakeBackend('plain-worker');
+    const plainStore = new FlipTimelineStore(plain.events);
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend: plain,
+      store: plainStore,
+      spec: spec(),
+      secrets,
+    });
+    const timeline = plain.events;
+    const workerDeployedPut = timeline.indexOf('put:worker-deployed:null');
+    const flipPut = timeline.indexOf('put:worker-deployed:authorized');
+    // The flip never rides the worker-deployed put: that phase stays
+    // no-export-eligible until the maintenance request is authorized.
+    expect(workerDeployedPut).toBeGreaterThanOrEqual(0);
+    expect(flipPut).toBeGreaterThan(workerDeployedPut);
+    expect(flipPut).toBeLessThan(timeline.indexOf('maintenance'));
+    expect(timeline).not.toContain('put:publishing:null');
+    expect(timeline.indexOf('put:publishing:authorized')).toBeLessThan(
+      timeline.indexOf('promote'),
+    );
+    expect(timeline[0]).toBe('put:database-reserved:null');
+
+    const external = new FakeBackend();
+    const externalStore = new FlipTimelineStore(external.events);
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend: external,
+      store: externalStore,
+      spec: spec(),
+      secrets,
+    });
+    const externalTimeline = external.events;
+    // External uploads dispatch the candidate, so the flip commits before
+    // deployWorker on immutable-external backends.
+    expect(
+      externalTimeline.indexOf('put:application-resources-deployed:authorized'),
+    ).toBeLessThan(externalTimeline.indexOf('worker'));
+  });
+
+  it('aborts before dispatch when the invocation-authority flip cannot commit', async () => {
+    class FlipFailureStore extends MemoryStore {
+      failFlipOnce = true;
+
+      override async put(record: FleetRecord): Promise<void> {
+        if (
+          this.failFlipOnce &&
+          record.phase === 'worker-deployed' &&
+          typeof record.invocationAuthority?.authorizedAt === 'string'
+        ) {
+          this.failFlipOnce = false;
+          throw new Error('flip write rejected');
+        }
+        await super.put(record);
+      }
+    }
+    const backend = new FakeBackend('plain-worker');
+    const store = new FlipFailureStore();
+
+    const failure = await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ProvisioningError);
+    expect((failure as Error).cause).toMatchObject({
+      message: 'flip write rejected',
+    });
+    // The rejected flip aborted the flow before the maintenance dispatch.
+    expect(backend.events).not.toContain('maintenance');
+  });
+
+  it('refuses no-export rollback after the maintenance flip and preserves the worker-deployed row', async () => {
+    const backend = new FakeBackend('plain-worker');
+    backend.failAt = 'maintenance';
+    const store = new MemoryStore();
+
+    const failure = await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ProvisioningError);
+    expect((failure as ProvisioningError).cleanupErrors).toEqual([
+      expect.objectContaining({
+        message:
+          'deployment candidate invocation was durably authorized; use export-backed decommissioning',
+      }),
+    ]);
+    // The provider failure landed after the committed flip: the carrier
+    // stays authorized and the deployment is preserved whole.
+    expect(store.record?.phase).toBe('worker-deployed');
+    expect(typeof store.record?.invocationAuthority?.authorizedAt).toBe(
+      'string',
+    );
+    expect(backend.events).not.toContain('delete-worker');
+    expect(backend.events).not.toContain('delete-database');
+
+    backend.failAt = undefined;
+    await expect(
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: spec(),
+        secrets,
+      }),
+    ).resolves.toMatchObject({ record: { phase: 'ready' } });
+  });
+
+  it('errors after a second blocked drain result and leaves the blocked intent restartable', async () => {
+    const backend = new FakeBackend('plain-worker');
+    const store = new MemoryStore();
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+    });
+    if (!store.record) throw new Error('missing provisioned record');
+    store.record = {
+      ...store.record,
+      phase: 'worker-deployed',
+      invocationAuthority: { version: 1, authorizedAt: null },
+    };
+    const attached: DecommissionAttachmentScanResult = {
+      status: 'attached',
+      attachment: { plane: 'ordinary', scriptName: 'holder-script' },
+      providerFetchAttemptsReserved: 3,
+    };
+    backend.scanResults.push(attached, attached);
+
+    await expect(
+      cleanupDeploymentArtifacts({ backend, store, spec: spec() }),
+    ).rejects.toThrow('bounded cleanup remains blocked by a Worker attachment');
+    expect(store.record?.cleanupIntent?.state).toMatchObject({
+      step: 'blocked',
+      attachment: { plane: 'ordinary', scriptName: 'holder-script' },
+    });
+
+    // After remediation the drain restarts the blocked operation itself.
+    await expect(
+      cleanupDeploymentArtifacts({ backend, store, spec: spec() }),
+    ).resolves.toBeUndefined();
+    expect(store.record).toBeUndefined();
+  });
+
+  it('releases current claims on force decommission while preserving receipts and the legacy fallback', async () => {
+    const backend = new FakeBackend('plain-worker');
+    const store = new MemoryStore();
+    store.supportsDeleteReleasingClaims = true;
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+    });
+    const receipt: CleanupTerminalReceipt = {
+      version: 1,
+      operationId: '3d1f6a70-58c8-4b52-9d68-0f1f6f1c2ab3',
+      tenantTag: 'acme',
+      environment: 'production',
+      backend: 'plain-worker',
+      scriptName: 'acme-production',
+      databaseId: DATABASE_ID,
+      databaseName: 'acme-production',
+      authority: 'manual-cleanup',
+      admittedPhase: 'worker-deployed',
+      disposition: 'prepublication-owned-no-export',
+      evidence: {
+        eligibility: 'carrier-null',
+        ingressRemoved: true,
+        workerAbsent: true,
+        platformResourcesAbsent: true,
+        applicationR2Settled: true,
+        databaseAbsentReadback: true,
+      },
+      completedAtMs: 7,
+    };
+    store.receipts.set(receipt.operationId, receipt);
+
+    await forceDecommissionDeployment({
+      backend,
+      store,
+      tenantTag: 'acme',
+      environment: 'production',
+    });
+    expect(store.record).toBeUndefined();
+    expect(store.deleteReleasingClaimsCalls).toBe(1);
+    expect(store.deleteCalls).toBe(0);
+    // Force never reads or deletes historical receipts.
+    expect(store.receipts.get(receipt.operationId)).toEqual(receipt);
+
+    const legacyBackend = new FakeBackend('plain-worker');
+    const legacyStore = new MemoryStore();
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend: legacyBackend,
+      store: legacyStore,
+      spec: spec(),
+      secrets,
+    });
+    await forceDecommissionDeployment({
+      backend: legacyBackend,
+      store: legacyStore,
+      tenantTag: 'acme',
+      environment: 'production',
+    });
+    // A legacy lease without deleteReleasingClaims keeps tombstone claims
+    // through the plain row delete.
+    expect(legacyStore.record).toBeUndefined();
+    expect(legacyStore.deleteReleasingClaimsCalls).toBe(0);
+    expect(legacyStore.deleteCalls).toBe(1);
+  });
+
+  it('refuses force decommission during an active cleanup', async () => {
+    const backend = new FakeBackend('plain-worker');
+    backend.failAt = 'worker';
+    backend.cleanupFailAt = 'delete-worker';
+    const store = new MemoryStore();
+    await expect(
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: spec(),
+        secrets,
+      }),
+    ).rejects.toBeInstanceOf(ProvisioningError);
+    expect(store.record?.phase).toBe('cleanup-advancing');
+    const before = store.record;
+
+    await expect(
+      forceDecommissionDeployment({
+        backend,
+        store,
+        tenantTag: 'acme',
+        environment: 'production',
+      }),
+    ).rejects.toThrow(
+      'forceDecommissionDeployment cannot run during an active cleanup',
+    );
+    expect(backend.forceSteps).toEqual([]);
+    expect(store.record).toEqual(before);
+  });
+
+  it('refuses reprovisioning over foreign physical residue after a forced decommission', async () => {
+    const backend = new FakeBackend('plain-worker');
+    const store = new MemoryStore();
+    store.supportsDeleteReleasingClaims = true;
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+    });
+    await forceDecommissionDeployment({
+      backend,
+      store,
+      tenantTag: 'acme',
+      environment: 'production',
+    });
+    expect(store.record).toBeUndefined();
+
+    // A residual physical database with the reserved name survives force;
+    // provisioning fails closed instead of adopting it.
+    backend.databaseExists = true;
+    backend.databaseOwner = undefined;
+    const failure = await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+    }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(ProvisioningError);
+    expect((failure as Error).cause).toMatchObject({
+      message: expect.stringMatching(/refusing to claim pre-existing database/),
+    });
   });
 
   it('starts stable operation before I/O and recovers lost start response', async () => {

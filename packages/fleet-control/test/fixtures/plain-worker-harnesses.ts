@@ -16,6 +16,7 @@ import { plainWorkerIngressModule } from '../../src/plain-worker-backend.js';
 import { uploadIntentToProviderBindings } from '../../src/provider-binding-inventory.js';
 import { deploymentSpecDigest } from '../../src/spec-digest.js';
 import {
+  type CleanupTerminalReceipt,
   type DatabaseExportReceiptIdentity,
   type DeploymentSecrets,
   type DeploymentSpec,
@@ -232,6 +233,8 @@ export function seedWorkerFromSpec(
 export class HarnessFleetStore implements FleetStateStore {
   record: FleetRecord | undefined;
   failPutPhase: FleetRecord['phase'] | undefined;
+  readonly receipts = new Map<string, CleanupTerminalReceipt>();
+  #completedAtMs = 1_000;
   readonly phases: FleetRecord['phase'][] = [];
   readonly snapshots: Array<{
     readonly record: FleetRecord;
@@ -265,10 +268,44 @@ export class HarnessFleetStore implements FleetStateStore {
         renew: async () => {},
         put: (record) => this.put(record),
         delete: () => this.delete(),
+        completeCleanup: (input) => this.completeCleanup(input),
       });
     } finally {
       this.#leased = false;
     }
+  }
+
+  async completeCleanup(input: {
+    receipt: CleanupTerminalReceipt;
+    expectedRevision: number;
+  }): Promise<CleanupTerminalReceipt> {
+    const current = this.record;
+    if (
+      current?.phase !== 'cleanup-advancing' ||
+      current.cleanupIntent?.operationId !== input.receipt.operationId ||
+      current.cleanupIntent.revision !== input.expectedRevision
+    ) {
+      const existing = this.receipts.get(input.receipt.operationId);
+      if (existing) return structuredClone(existing);
+      throw new Error(
+        `cleanup receipt conflict for operation '${input.receipt.operationId}'`,
+      );
+    }
+    const persisted = {
+      ...structuredClone(input.receipt),
+      completedAtMs: this.#completedAtMs,
+    };
+    this.#completedAtMs += 1;
+    this.receipts.set(persisted.operationId, persisted);
+    this.record = undefined;
+    return structuredClone(persisted);
+  }
+
+  async readCleanupReceipt(
+    operationId: string,
+  ): Promise<CleanupTerminalReceipt | undefined> {
+    const receipt = this.receipts.get(operationId);
+    return receipt ? structuredClone(receipt) : undefined;
   }
 
   async get(): Promise<FleetRecord | undefined> {

@@ -2575,6 +2575,31 @@ export function assertBackendSwitchInactive(record: FleetRecord): void {
   }
 }
 
+/**
+ * @internal Durably commits the candidate-invocation authority flip before a
+ * candidate-invoking provider dispatch. A no-op when the carrier already
+ * carries a timestamp; otherwise the dedicated flip put is awaited so a write
+ * failure aborts the flow before the provider call dispatches. Legacy records
+ * without a carrier receive the whole carrier at the flip.
+ */
+export async function commitInvocationAuthority(
+  lease: Pick<FleetStateLease, 'put'>,
+  record: FleetRecord,
+  clock: () => number,
+): Promise<FleetRecord> {
+  if (typeof record.invocationAuthority?.authorizedAt === 'string') {
+    return record;
+  }
+  const timestamp = new Date(clock()).toISOString();
+  const flipped: FleetRecord = {
+    ...record,
+    invocationAuthority: { version: 1, authorizedAt: timestamp },
+    updatedAt: timestamp,
+  };
+  await lease.put(flipped);
+  return flipped;
+}
+
 /** @internal Package-private test/coordination seam; not a root export. */
 export async function withBackendSwitchLease<T>(
   store: FleetStateStore,
@@ -2632,11 +2657,26 @@ export async function withBackendSwitchLease<T>(
           ) {
             throw new Error('backend switch lease cannot write another intent');
           }
+          const timestamp = new Date(clock()).toISOString();
+          // The invocation-authority flip rides the candidate-invoking
+          // authorization-transition put so the carrier is durable before the
+          // external candidate upload or dispatch call it authorizes.
+          const flip =
+            (intent.subphase === 'candidate-deploy-authorized' ||
+              intent.subphase === 'host-publish-authorized') &&
+            typeof record.invocationAuthority?.authorizedAt !== 'string';
           const provisional = backendSwitchFleetRecordFromUnknown({
             ...record,
+            ...(flip
+              ? {
+                  invocationAuthority: {
+                    version: 1,
+                    authorizedAt: timestamp,
+                  } satisfies InvocationAuthorityCarrier,
+                }
+              : {}),
             backendSwitchIntent: intent,
           }).record;
-          const timestamp = new Date(clock()).toISOString();
           const intended = backendSwitchFleetRecordFromUnknown({
             ...provisional,
             updatedAt: timestamp,
@@ -3004,6 +3044,7 @@ export async function reconcileFinalizedBackendSwitchState(input: {
     input.record,
     'reconcileFinalizedBackendSwitchState',
   );
+  assertNoActiveCleanup(input.record, 'reconcileFinalizedBackendSwitchState');
   const priorBridge = finalizedBridgeForRecord(input.record);
   const switchIntent = input.record.backendSwitchIntent;
   if (!switchIntent) {
@@ -3269,6 +3310,10 @@ export async function switchPlainDeploymentToWorkersForPlatforms(options: {
         lease.current(),
         'switchPlainDeploymentToWorkersForPlatforms',
       );
+      assertNoActiveCleanup(
+        lease.current(),
+        'switchPlainDeploymentToWorkersForPlatforms',
+      );
       let intent = await lease.get();
       if (!intent) {
         const prior = await options.provider.snapshotPlainDeployment(
@@ -3506,6 +3551,7 @@ export async function rollbackBackendSwitch(options: {
     Date.now,
     async (lease) => {
       assertNoActiveDecommission(lease.current(), 'rollbackBackendSwitch');
+      assertNoActiveCleanup(lease.current(), 'rollbackBackendSwitch');
       let intent = await lease.get();
       if (!intent) {
         throw new Error('backend switch has no rollback snapshot');
@@ -3704,6 +3750,7 @@ export async function finalizeBackendSwitch(options: {
     Date.now,
     async (lease) => {
       assertNoActiveDecommission(lease.current(), 'finalizeBackendSwitch');
+      assertNoActiveCleanup(lease.current(), 'finalizeBackendSwitch');
       let intent = await lease.get();
       if (!intent?.bridge || !intent.candidate) {
         throw new Error('backend switch has no finalization snapshot');
@@ -3937,6 +3984,7 @@ async function decommissionBackendSwitchLegacy(options: {
     Date.now,
     async (lease) => {
       assertNoActiveDecommission(lease.current(), 'decommissionBackendSwitch');
+      assertNoActiveCleanup(lease.current(), 'decommissionBackendSwitch');
       let intent = await lease.get();
       if (!intent)
         throw new Error('backend switch has no decommission snapshot');
@@ -5784,6 +5832,9 @@ export async function decommissionBackendSwitch(options: {
   const current = structuralCurrent?.carriesBackendSwitchAuthority
     ? backendSwitchFleetRecordFromUnknown(structuralCurrent.record).record
     : structuralCurrent?.record;
+  if (current) {
+    assertNoActiveCleanup(current, 'decommissionBackendSwitch');
+  }
   if (!current?.backendSwitchIntent) {
     if (current) {
       assertNoActiveDecommission(current, 'decommissionBackendSwitch');

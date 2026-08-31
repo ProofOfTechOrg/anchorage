@@ -40,6 +40,22 @@ export {
   switchPlainDeploymentToWorkersForPlatforms,
 } from './backend-switch.js';
 export {
+  type AdvanceCleanupDeploymentOptions,
+  advanceCleanupDeployment,
+  type CleanupAdvanceAction,
+  type CleanupAdvanceCapability,
+  CleanupAdvanceCapabilityError,
+  CleanupAdvanceRestartError,
+  type CleanupAdvanceResult,
+} from './cleanup-advance.js';
+export {
+  CleanupAdvanceTokenDeploymentError,
+  CleanupAdvanceTokenError,
+  CleanupAdvanceTokenFutureError,
+  CleanupAdvanceTokenOperationError,
+  classifyCleanupDatabaseEligibility,
+} from './cleanup-intent.js';
+export {
   CloudflareApiPlainWorkerBackend,
   type CloudflareApiPlainWorkerBackendOptions,
 } from './cloudflare-api-plain-worker-backend.js';
@@ -129,6 +145,16 @@ export {
   type ApplicationR2Binding,
   type ApplicationR2BucketSnapshot,
   type ApplicationR2Resource,
+  assertNoActiveCleanup,
+  type CleanupAdvanceIntent,
+  type CleanupAdvanceState,
+  type CleanupAdvanceToken,
+  type CleanupAttachmentProgress,
+  type CleanupAttachmentPurpose,
+  type CleanupAttachmentScan,
+  type CleanupAuthority,
+  type CleanupReceiptEvidence,
+  type CleanupTerminalReceipt,
   type D1Migration,
   type DatabaseExport,
   type DatabaseExportIntegrity,
@@ -175,6 +201,7 @@ export {
   type FleetStateStore,
   type ForceDecommissionStep,
   type InitialExecutionFenceState,
+  type InvocationAuthorityCarrier,
   type LiveDeployment,
   type MaintenanceHealth,
   type NormalDecommissionLifecyclePhase,

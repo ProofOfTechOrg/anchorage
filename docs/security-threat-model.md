@@ -148,6 +148,14 @@ Only an application Worker receives application variables, application secrets, 
 
 Fleet control rejects application KV bindings. Cloudflare's [1,000-namespace account limit](https://developers.cloudflare.com/kv/platform/limits/) cannot support the 10,000-deployment horizon with one namespace per deployment. A shared application namespace would make logical key partitioning the tenant boundary. The shared `HOSTS` KV namespace remains a control-plane routing index and is not exposed to application code.
 
+### Bounded no-export cleanup
+
+Destructive no-export cleanup deletes a deployment's database without an export, so its admissibility rests on one durable proof: candidate code never gained execution authority. Every new fleet record carries a versioned invocation-authority carrier from its first durable write, and every candidate-invoking dispatch — an external candidate upload, the first maintenance request, a version override, or a promotion — commits an authorization timestamp durably before the provider call dispatches. A rejected or unacknowledged authority write aborts before dispatch, and a lost provider response counts as possible execution. The eligibility classifier fails closed on malformed carriers, carrier-phase inconsistencies, Workers for Platforms and external-artifact candidates (every current candidate receives the deployment database binding), external staging evidence, and legacy carrier-less rows at phases that cannot rule out a dispatched upload; refusals name export-backed decommissioning as the only remedy, and the classifier re-runs against the persisted admission facts and the live carrier immediately before deletion.
+
+A completed cleanup writes an immutable operation-keyed terminal receipt atomically with claim release and row deletion. Receipts are insert-only, survive same-key reprovisioning and force decommission, and are removed only by explicit bounded pruning. Receipt evidence is provider-text-free: booleans, hash digests, and counts, never continuation tokens, scan cursors, provider messages, URLs, or secrets.
+
+`forceDecommissionDeployment()` stays a root-only, evidence-free, receipt-free last resort and refuses during an active bounded cleanup. On capable stores it releases the deployment's current ownership claims with the row, but it does not delete the ordinary Worker script or application R2 buckets, so a released name can precede residual physical resources. After a force, do not reprovision the same names until those residuals are confirmed removed: provisioning fails closed on ownership mismatch — the pre-existing-database refusal and the Worker ownership attestation — rather than adopting foreign resources.
+
 ### Deployment sentinel
 
 Provisioning writes the same stable tag to two independent locations:

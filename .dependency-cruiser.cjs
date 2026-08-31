@@ -236,6 +236,22 @@ module.exports = {
       },
     },
     {
+      name: 'fleet-control-cleanup-advance-is-transport-neutral',
+      severity: 'error',
+      comment:
+        'The bounded cleanup coordinator depends only on provider-neutral ports and state. Keeping provider clients, Wrangler, concrete export stores, root barrels, and unbounded lifecycle coordinators out of its reachable graph preserves the transport-neutral boundary.',
+      from: {
+        path: [
+          '^packages/fleet-control/src/cleanup-advance\\.ts$',
+          '^scripts/architecture-fixtures/cleanup-advance-imports-provider\\.ts$',
+        ],
+      },
+      to: {
+        path: '(?:^packages/fleet-control/src/(?:backend-switch|cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors|workers-for-platforms-backend-switch-provider|wrangler-plain-worker-provisioning-api|wrangler-loop-backend|wrangler-runner|export-file-name|export-store|r2-export-store|provision|fleet|index)\\.ts$|^packages/fleet-control/src/workers/|^cloudflare(?:/|$)|(?:^|/)node_modules/(?:\\.pnpm/)?cloudflare(?:@|/))',
+        reachable: true,
+      },
+    },
+    {
       name: 'fleet-control-decommission-database-is-provider-neutral',
       severity: 'error',
       comment:

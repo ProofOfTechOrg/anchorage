@@ -151,6 +151,9 @@ export function describePlainWorkerConformance(
         'application-resources-create-authorized',
         'application-resources-deployed',
         'worker-deployed',
+        // The invocation-authority flip commits on a dedicated put before
+        // the first maintenance request.
+        'worker-deployed',
         'maintenance-armed',
         'publishing',
         'ready',

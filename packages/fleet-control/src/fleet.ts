@@ -8,6 +8,7 @@ import {
 } from './application-bindings.js';
 import {
   assertBackendSwitchInactive,
+  commitInvocationAuthority,
   type FinalizedOrdinaryStateProvider,
   finalizedBridgeForRecord,
   reconcileFinalizedBackendSwitchState,
@@ -54,6 +55,7 @@ import type {
   ProvisioningBackend,
 } from './types.js';
 import {
+  assertNoActiveCleanup,
   assertNoActiveDecommission,
   effectiveLifecyclePhase,
 } from './types.js';
@@ -173,6 +175,47 @@ function pendingArtifactVersion(record: FleetRecord): string | undefined {
   return knownArtifactVersion(
     record.pendingRelease?.artifactVersion ?? record.pendingArtifactVersion,
   );
+}
+
+function hasActiveCleanup(record: FleetRecord): boolean {
+  return (
+    record.phase === 'cleanup-advancing' || record.cleanupIntent !== undefined
+  );
+}
+
+/**
+ * Script keys a deployment under active bounded cleanup may still own live.
+ * They feed the orphan suppressions only: the bounded engine, not the drift
+ * audit, is the reconciliation authority while its teardown runs.
+ */
+function cleanupKnownScriptKeys(record: FleetRecord): readonly string[] {
+  const keys = [
+    `${record.backend}:${record.scriptName}`,
+    ...[
+      record.activeRelease,
+      record.pendingRelease,
+      record.rollbackRelease,
+      record.retiringRelease,
+      record.migrationPriorRelease,
+    ]
+      .filter((release) => release !== undefined)
+      .map((release) => `${record.backend}:${release.physicalScriptName}`),
+  ];
+  if (record.platformResources) {
+    keys.push(
+      `${
+        record.platformResources.stateWorker.plane === 'dispatch'
+          ? 'workers-for-platforms'
+          : 'plain-worker'
+      }:${record.platformResources.stateWorker.scriptName}`,
+    );
+    if (record.platformResources.egressProxy) {
+      keys.push(
+        `plain-worker:${record.platformResources.egressProxy.scriptName}`,
+      );
+    }
+  }
+  return keys;
 }
 
 function expectsDatabase(record: FleetRecord): boolean {
@@ -529,8 +572,42 @@ export async function auditFleetDrift(options: {
   }
   const now = options.now ?? Date.now();
   const findings: DriftFinding[] = [...options.inventory.findings];
-  const recordsByScript = new Map<string, FleetRecord[]>();
+  // A deployment under active bounded cleanup is audit-suppressed in both
+  // directions: it feeds no expectations (no missing/duplicate findings) and
+  // its declared resource identities join the known sets below so its
+  // still-present resources never read as orphans. The bounded engine is the
+  // reconciliation authority; a long-blocked cleanup stays visible through
+  // the record itself, never through drift findings.
+  const auditedRecords = options.records.filter(
+    (record) => !hasActiveCleanup(record),
+  );
+  const knownScriptKeys = new Set<string>();
+  const knownRouteKeys = new Set<string>();
+  const knownDatabaseIds = new Set<string>();
+  const knownNamespaceIds = new Set<string>();
+  const knownBucketNames = new Set<string>();
   for (const record of options.records) {
+    if (!hasActiveCleanup(record)) continue;
+    const scriptKeys = cleanupKnownScriptKeys(record);
+    for (const key of scriptKeys) {
+      knownScriptKeys.add(key);
+      const scriptName = key.slice(key.indexOf(':') + 1);
+      knownRouteKeys.add(`${record.routeHostname}:${scriptName}`);
+    }
+    knownDatabaseIds.add(record.databaseId);
+    for (const binding of record.durableObjectBindings) {
+      knownNamespaceIds.add(binding.namespaceId);
+    }
+    for (const namespaceId of record.platformResources?.stateWorker
+      .namespaceIds ?? []) {
+      knownNamespaceIds.add(namespaceId);
+    }
+    for (const resource of record.applicationResources ?? []) {
+      knownBucketNames.add(resource.bucketName);
+    }
+  }
+  const recordsByScript = new Map<string, FleetRecord[]>();
+  for (const record of auditedRecords) {
     for (const expected of expectedDeploymentKeys(record)) {
       const key = `${expected.backend}:${expected.scriptName}`;
       const matches = recordsByScript.get(key) ?? [];
@@ -542,6 +619,7 @@ export async function auditFleetDrift(options: {
     const key = `workers-for-platforms:${registration.scriptName}`;
     if (
       !recordsByScript.has(key) &&
+      !knownScriptKeys.has(key) &&
       !options.inventory.deployments.some(
         (deployment) =>
           deployment.backend === 'workers-for-platforms' &&
@@ -565,7 +643,7 @@ export async function auditFleetDrift(options: {
     const matches = liveByScript.get(key) ?? [];
     matches.push(deployment);
     liveByScript.set(key, matches);
-    if (!recordsByScript.has(key)) {
+    if (!recordsByScript.has(key) && !knownScriptKeys.has(key)) {
       findings.push({
         tenantTag: deployment.tenantTag,
         environment: deployment.environment,
@@ -574,7 +652,7 @@ export async function auditFleetDrift(options: {
       });
     }
   }
-  for (const record of options.records) {
+  for (const record of auditedRecords) {
     for (const expected of expectedDeploymentKeys(record)) {
       const key = `${expected.backend}:${expected.scriptName}`;
       const liveMatches = liveByScript.get(key) ?? [];
@@ -609,10 +687,13 @@ export async function auditFleetDrift(options: {
     }
   }
   const registeredDatabaseIds = new Set(
-    options.records.filter(expectsDatabase).map((record) => record.databaseId),
+    auditedRecords.filter(expectsDatabase).map((record) => record.databaseId),
   );
   for (const databaseId of options.inventory.databaseIds) {
-    if (!registeredDatabaseIds.has(databaseId)) {
+    if (
+      !registeredDatabaseIds.has(databaseId) &&
+      !knownDatabaseIds.has(databaseId)
+    ) {
       findings.push({
         tenantTag: 'unknown',
         environment: 'unknown',
@@ -622,7 +703,7 @@ export async function auditFleetDrift(options: {
     }
   }
   const expectedRoutes = new Map(
-    options.records
+    auditedRecords
       .filter(expectsRoute)
       .map((record) => [
         record.routeHostname,
@@ -638,6 +719,7 @@ export async function auditFleetDrift(options: {
     routeMatches.push(route);
     liveRoutesByHostname.set(route.hostname, routeMatches);
     const expected = expectedRoutes.get(route.hostname);
+    if (knownRouteKeys.has(`${route.hostname}:${route.scriptName}`)) continue;
     if (
       !expected ||
       expected.record.backend !== route.backend ||
@@ -659,12 +741,15 @@ export async function auditFleetDrift(options: {
   const liveNamespaceOwners = new Map<string, FleetRecord>();
   const duplicateNamespaceIds = new Set<string>();
   const expectedNamespaceIds = new Set(
-    options.records
+    auditedRecords
       .filter(expectsNamespaces)
       .flatMap(expectedNamespaceIdsForRecord),
   );
   for (const namespaceId of options.inventory.namespaceIds) {
-    if (!expectedNamespaceIds.has(namespaceId)) {
+    if (
+      !expectedNamespaceIds.has(namespaceId) &&
+      !knownNamespaceIds.has(namespaceId)
+    ) {
       findings.push({
         tenantTag: 'unknown',
         environment: 'unknown',
@@ -673,7 +758,7 @@ export async function auditFleetDrift(options: {
       });
     }
   }
-  for (const record of options.records.filter(expectsNamespaces)) {
+  for (const record of auditedRecords.filter(expectsNamespaces)) {
     for (const namespaceId of expectedNamespaceIdsForRecord(record)) {
       const namespaceOwner = expectedNamespaceOwners.get(namespaceId);
       if (namespaceOwner) {
@@ -707,7 +792,7 @@ export async function auditFleetDrift(options: {
       >[number];
     }
   >();
-  for (const record of options.records) {
+  for (const record of auditedRecords) {
     const phase = effectiveLifecyclePhase(record);
     if (
       [
@@ -741,7 +826,10 @@ export async function auditFleetDrift(options: {
     ]),
   );
   for (const bucket of options.inventory.r2Buckets ?? []) {
-    if (!expectedBuckets.has(bucket.bucketName)) {
+    if (
+      !expectedBuckets.has(bucket.bucketName) &&
+      !knownBucketNames.has(bucket.bucketName)
+    ) {
       findings.push({
         tenantTag: 'unknown',
         environment: 'unknown',
@@ -773,6 +861,9 @@ export async function auditFleetDrift(options: {
   }
 
   for (const record of options.records) {
+    // A stale or blocked bounded cleanup must not read as
+    // incomplete-provisioning, version, binding, or route drift.
+    if (hasActiveCleanup(record)) continue;
     const phase = effectiveLifecyclePhase(record);
     const recordMatches =
       recordsByScript.get(`${record.backend}:${liveScriptName(record)}`) ?? [];
@@ -1284,6 +1375,11 @@ export async function auditFleetDrift(options: {
                 'deployment changed after audit inspection; maintenance re-arm aborted',
               );
             }
+            await commitInvocationAuthority(
+              lease,
+              current,
+              () => options.now ?? Date.now(),
+            );
             await lease.assertOwned();
             await backend.ensureMaintenance(
               spec,
@@ -1428,6 +1524,7 @@ export async function migrateFleet(options: {
         );
         if (!stored) throw new Error('fleet migration record disappeared');
         assertNoActiveDecommission(stored, 'migrateFleet');
+        assertNoActiveCleanup(stored, 'migrateFleet');
         assertBackendSwitchInactive(stored);
         const storedSchemaVersion = stored.schemaVersion;
         const backend = options.backendFor(stored);
@@ -1636,6 +1733,11 @@ export async function migrateFleet(options: {
           }
           let maintenance = live.maintenance;
           if (!maintenance.armed) {
+            stored = await commitInvocationAuthority(
+              lease,
+              stored,
+              options.clock ?? Date.now,
+            );
             await lease.assertOwned();
             maintenance = await backend.ensureMaintenance(
               spec,
@@ -1645,6 +1747,11 @@ export async function migrateFleet(options: {
             );
           }
           if (!maintenance.armed) throw new Error('maintenance did not re-arm');
+          stored = await commitInvocationAuthority(
+            lease,
+            stored,
+            options.clock ?? Date.now,
+          );
           await lease.assertOwned();
           await backend.promoteWorker(
             spec,
@@ -1856,6 +1963,11 @@ export async function migrateFleet(options: {
             platformMigrationRelease,
             'platform-only maintenance',
           );
+          migrationRecord = await commitInvocationAuthority(
+            lease,
+            migrationRecord,
+            options.clock ?? Date.now,
+          );
           await lease.assertOwned();
           const maintenance = await backend.ensureMaintenance(
             spec,
@@ -1891,6 +2003,8 @@ export async function migrateFleet(options: {
               platformMigrationRelease,
               'platform-only publication',
             );
+            // No flip here: the unconditional maintenance flip above already
+            // committed the carrier durably earlier in this same call.
             await lease.assertOwned();
             await backend.promoteWorker(
               spec,
@@ -2091,6 +2205,11 @@ export async function migrateFleet(options: {
           !live ||
           live.desiredSpecDigest !== targetDigest
         ) {
+          migrationRecord = await commitInvocationAuthority(
+            lease,
+            migrationRecord,
+            options.clock ?? Date.now,
+          );
           await lease.assertOwned();
           const deployed = await backend.deployWorker(
             spec,
@@ -2181,6 +2300,11 @@ export async function migrateFleet(options: {
           };
           await lease.put(migrationRecord);
         }
+        migrationRecord = await commitInvocationAuthority(
+          lease,
+          migrationRecord,
+          options.clock ?? Date.now,
+        );
         await lease.assertOwned();
         const maintenance = await backend.ensureMaintenance(
           spec,
@@ -2225,6 +2349,8 @@ export async function migrateFleet(options: {
             'migration publication',
           );
         }
+        // No flip here: the unconditional candidate-maintenance flip above
+        // already committed the carrier durably earlier in this same call.
         await lease.assertOwned();
         await backend.promoteWorker(
           spec,
@@ -2417,6 +2543,7 @@ export async function rollbackExternalRelease(options: {
       );
       if (!stored) throw new Error('rollback deployment is not registered');
       assertNoActiveDecommission(stored, 'rollbackExternalRelease');
+      assertNoActiveCleanup(stored, 'rollbackExternalRelease');
       assertBackendSwitchInactive(stored);
       const finalizedOrdinaryState =
         stored.backendSwitchIntent?.subphase === 'finalized' &&
@@ -2586,6 +2713,11 @@ export async function rollbackExternalRelease(options: {
         target,
         'rollback target',
       );
+      intent = await commitInvocationAuthority(
+        lease,
+        intent,
+        options.clock ?? Date.now,
+      );
       await lease.assertOwned();
       await backend.deployWorker(
         rollbackSpec,
@@ -2614,6 +2746,9 @@ export async function rollbackExternalRelease(options: {
         target.application,
       );
       assertExternalReleaseArtifactVersion(live, target, 'rollback target');
+      // No flip here or before the promotion below: the unconditional
+      // rollback-deploy flip above already committed the carrier durably
+      // earlier in this same call.
       await lease.assertOwned();
       const health = await backend.ensureMaintenance(
         rollbackSpec,

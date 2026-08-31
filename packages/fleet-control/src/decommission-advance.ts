@@ -50,7 +50,7 @@ import type {
   NormalDecommissionLifecyclePhase,
   ProvisioningBackend,
 } from './types.js';
-import { effectiveLifecyclePhase } from './types.js';
+import { assertNoActiveCleanup, effectiveLifecyclePhase } from './types.js';
 import { validateDeploymentSpec } from './validation.js';
 
 const ACTION_ERROR = 'decommission advance action is malformed';
@@ -1709,6 +1709,11 @@ async function advanceUnderLease(
     if (action.kind === 'start')
       throw new Error('deployment is not registered');
     throw new DecommissionAdvanceTokenOperationError();
+  }
+  // Admission-path guard only: continue/restart against a cleanup-advancing
+  // row already fails token classification (no decommission intent exists).
+  if (action.kind === 'start') {
+    assertNoActiveCleanup(record, 'advanceDecommissionDeployment');
   }
   const intent = record.decommissionIntent
     ? normalizeDecommissionAdvanceIntent(

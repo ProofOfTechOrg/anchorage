@@ -108,6 +108,8 @@ const controls = {
     'scripts/architecture-fixtures/cleanup-state-imports-provider.ts',
   'fleet-control-decommission-advance-is-transport-neutral':
     'scripts/architecture-fixtures/decommission-advance-imports-provider.ts',
+  'fleet-control-cleanup-advance-is-transport-neutral':
+    'scripts/architecture-fixtures/cleanup-advance-imports-provider.ts',
   'fleet-control-decommission-database-is-provider-neutral':
     'scripts/architecture-fixtures/decommission-database-imports-provider.ts',
   'fleet-control-backend-switch-does-not-reach-its-provider':
