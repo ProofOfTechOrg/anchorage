@@ -929,6 +929,11 @@ export interface CleanupReceiptEvidence {
   readonly platformResourcesAbsent: boolean;
   readonly applicationR2Settled: boolean;
   readonly databaseAbsentReadback: boolean;
+  /**
+   * Optional discover/verify attachment-scan digests. Receipts written by the
+   * bounded engine omit this pair (the scan gate is proven by the persisted
+   * database-deletion transition); the codec retains it for compatibility.
+   */
   readonly scan?: Readonly<{
     discover: Readonly<{ evidenceSha256: string; evidenceCount: number }>;
     verify: Readonly<{ evidenceSha256: string; evidenceCount: number }>;

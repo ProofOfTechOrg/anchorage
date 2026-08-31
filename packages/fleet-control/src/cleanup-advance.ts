@@ -471,8 +471,8 @@ function recheckEligibility(
   intent: CleanupAdvanceIntent,
 ): CleanupReceiptEvidence['eligibility'] {
   // Synthetic input: the live phase is 'cleanup-advancing', which the
-  // classifier would always refuse; the barrier re-check replays the persisted
-  // admitted phase and externalArtifact against the LIVE authority carrier.
+  // classifier would always refuse; the eligibility re-check replays the
+  // persisted admitted phase and externalArtifact against the LIVE carrier.
   const classification = classifyCleanupDatabaseEligibility({
     record: { ...omitIntent(record), phase: intent.identity.admittedPhase },
     externalArtifact: intent.identity.externalArtifact,
