@@ -10,12 +10,12 @@ import {
   FLEET_OPERATION_ITEM_BOUND,
   type FleetOperationProgress,
   type FleetOperationRunRecord,
-  FleetOperationStateError,
   fleetOperationFailureFromUnknown,
   fleetOperationPlainRecord,
   fleetOperationRunRecordFromUnknown,
   fleetOperationSafeInteger,
   fleetOperationSha256,
+  malformed,
 } from './fleet-operation-state.js';
 
 export const FLEET_MIGRATION_STEPS = Object.freeze([
@@ -69,10 +69,6 @@ export interface FleetMigrationProgress extends FleetOperationProgress {
   readonly itemCount: number;
   readonly activeItemOrdinal: number;
   readonly completedItemCount: number;
-}
-
-function malformed(): never {
-  throw new FleetOperationStateError();
 }
 
 export function fleetMigrationPlanEntryFromUnknown(

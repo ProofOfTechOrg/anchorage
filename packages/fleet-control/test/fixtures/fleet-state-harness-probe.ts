@@ -11,6 +11,7 @@ import { D1FleetInventoryRunStore } from '../../src/d1-fleet-inventory-run-store
 import { D1FleetOperationStore } from '../../src/d1-fleet-operation-store.js';
 import { D1FleetStateDatabase } from '../../src/d1-fleet-state-database.js';
 import { advanceDecommissionDeployment } from '../../src/decommission-advance.js';
+import type { FleetAuditProgress } from '../../src/fleet-audit-state.js';
 import {
   canonicalFleetInventoryRunOptions,
   emptyFleetInventoryRowCounts,
@@ -20,6 +21,7 @@ import {
   type FleetInventoryStagedRow,
   fleetInventoryOptionsDigest,
 } from '../../src/fleet-inventory-state.js';
+import type { FleetMigrationProgress } from '../../src/fleet-migration-state.js';
 import type {
   FleetOperationKind,
   FleetOperationRunRecord,
@@ -2594,7 +2596,7 @@ async function readyInventoryStore(
 }
 
 /** Drops the next batch's result rows, reproducing a lost D1 response. */
-function inventoryLostResponse(
+function lostResponseDatabase(
   delegate: FleetStateDatabase,
 ): FleetStateDatabase & Readonly<{ loseNextBatch(): void }> {
   let lose = false;
@@ -2877,7 +2879,7 @@ async function inventoryCommitConcurrency(db: D1Database): Promise<unknown> {
 
 async function inventoryFinalizeConvergence(db: D1Database): Promise<unknown> {
   await readyInventoryStore(db);
-  const database = inventoryLostResponse(new D1FleetStateDatabase(db));
+  const database = lostResponseDatabase(new D1FleetStateDatabase(db));
   const store = inventoryStore(database);
   const operationId = inventoryOperationId(2);
   const rows = inventoryRows('finalize');
@@ -3162,7 +3164,7 @@ function operationRun(
     state,
     progress:
       kind === 'audit'
-        ? {
+        ? ({
             kind,
             revision,
             stage: { step: 'provider-findings', rowOrdinal: 0 },
@@ -3175,8 +3177,8 @@ function operationRun(
             ...(state === 'failed'
               ? { failure: { reason: 'operator-abandoned' as const } }
               : {}),
-          }
-        : {
+          } as FleetAuditProgress)
+        : ({
             kind,
             revision,
             itemCount: 0,
@@ -3185,9 +3187,9 @@ function operationRun(
             ...(state === 'failed'
               ? { failure: { reason: 'operator-abandoned' as const } }
               : {}),
-          },
+          } as FleetMigrationProgress),
     updatedAt: '2026-09-01T00:00:00.000Z',
-  } as unknown as FleetOperationRunRecord;
+  };
 }
 
 function operationAdvanced(
@@ -3335,7 +3337,7 @@ async function operationCommitConcurrency(db: D1Database): Promise<unknown> {
 
 async function operationFinalizeConvergence(db: D1Database): Promise<unknown> {
   await readyOperationStore(db);
-  const database = inventoryLostResponse(new D1FleetStateDatabase(db));
+  const database = lostResponseDatabase(new D1FleetStateDatabase(db));
   const target = operationStore(database);
   const id = operationId(2);
   return target.withAccountOperationLease('migration', async (lease) => {
@@ -3522,7 +3524,7 @@ async function operationLeaseLifecycle(db: D1Database): Promise<unknown> {
     );
     const originalExpiresAt = Number(original[0]?.expires_at);
     if (!Number.isFinite(originalExpiresAt)) {
-      throw new Error('operation lease did not expose the original expiry');
+      throw new Error('operation lease did not expose its original expiry');
     }
     clock.advance(2_000);
     clock.allowHeartbeat();
@@ -3538,7 +3540,7 @@ async function operationLeaseLifecycle(db: D1Database): Promise<unknown> {
       contenderRejected = true;
     }
     if (clock.now() <= originalExpiresAt) {
-      throw new Error('controlled D1 time did not pass original expiry');
+      throw new Error('controlled D1 time did not pass the original expiry');
     }
   });
   const remaining = await db

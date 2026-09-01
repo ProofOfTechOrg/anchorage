@@ -4,8 +4,8 @@ import { describe, expect, it } from 'vitest';
 import type { DriftFinding } from '../src/fleet.js';
 import {
   driftFindingRowFromUnknown,
-  FLEET_AUDIT_FINDING_KINDS,
   FLEET_AUDIT_STAGE_ORDER,
+  type FleetAuditFindingKind,
   fleetAuditFactRowFromUnknown,
   fleetAuditOperationRecordFromUnknown,
   fleetAuditStageFromUnknown,
@@ -23,7 +23,11 @@ import {
   canonicalFleetOperationBytes,
   classifyFleetOperationToken,
   FLEET_MIGRATION_PLAN_BOUND,
+  FLEET_OPERATION_INTAKE_BYTE_BOUND,
   FLEET_OPERATION_RECORD_BYTE_BOUND,
+  FLEET_OPERATION_RECORD_ROW_BYTE_BOUND,
+  FLEET_OPERATION_ROW_PAYLOAD_BYTE_BOUND,
+  FLEET_OPERATION_STRING_BYTE_BOUND,
   FLEET_OPERATION_TOKEN_BYTE_BOUND,
   FleetOperationStateError,
   FleetOperationTokenError,
@@ -290,7 +294,10 @@ describe('fleet operation state', () => {
     expect(() =>
       fleetOperationRunRecordFromUnknown({
         ...auditRecord(),
-        progress: { ...auditProgress(), text: 'x'.repeat(4097) },
+        progress: {
+          ...auditProgress(),
+          text: 'x'.repeat(FLEET_OPERATION_STRING_BYTE_BOUND + 1),
+        },
       }),
     ).toThrow(FleetOperationStateError);
     expect(() =>
@@ -308,10 +315,17 @@ describe('fleet operation state', () => {
   });
 
   it('row payload 16 KiB bound + 96 KiB record-row allowance', () => {
+    const valueBytes = 3000;
+    const rowPayloadOverflowCount = Math.ceil(
+      FLEET_OPERATION_ROW_PAYLOAD_BYTE_BOUND / valueBytes,
+    );
+    const recordRowOverflowCount = Math.ceil(
+      FLEET_OPERATION_RECORD_ROW_BYTE_BOUND / valueBytes,
+    );
     const payload = Object.fromEntries(
-      Array.from({ length: 6 }, (_, index) => [
+      Array.from({ length: rowPayloadOverflowCount }, (_, index) => [
         `value${index}`,
-        'x'.repeat(3000),
+        'x'.repeat(valueBytes),
       ]),
     );
     expect(() =>
@@ -333,9 +347,9 @@ describe('fleet operation state', () => {
         rowKind: 'record',
         ordinal: 0,
         payload: Object.fromEntries(
-          Array.from({ length: 34 }, (_, index) => [
+          Array.from({ length: recordRowOverflowCount }, (_, index) => [
             `value${index}`,
-            'x'.repeat(3000),
+            'x'.repeat(valueBytes),
           ]),
         ),
       }),
@@ -346,6 +360,9 @@ describe('fleet operation state', () => {
     const atBound = Array.from({ length: 4096 }, (_, index) =>
       'x'.repeat(index === 0 ? 4092 : 4093),
     );
+    expect(canonicalFleetOperationBytes(atBound).length).toBe(
+      FLEET_OPERATION_INTAKE_BYTE_BOUND,
+    );
     expect(() => fleetOperationIntakeDigest(atBound)).not.toThrow();
     const aboveBound = [...atBound];
     aboveBound[0] = `${aboveBound[0]}x`;
@@ -355,29 +372,18 @@ describe('fleet operation state', () => {
   });
 
   it('structured-field validation accepts a provider-claimed finding tag and rejects unsafe bytes', () => {
-    expect(
-      driftFindingRowFromUnknown({
-        tenantTag: 'bearer',
-        environment: 'production',
-        kind: 'audit-error',
-        detail: 'safe detail',
-      }).tenantTag,
-    ).toBe('bearer');
-    expect(
-      driftFindingRowFromUnknown({
-        tenantTag: 'Prod-1',
-        environment: 'production',
-        kind: 'audit-error',
-        detail: 'safe detail',
-      }).tenantTag,
-    ).toBe('Prod-1');
+    const base = {
+      environment: 'production',
+      kind: 'audit-error',
+      detail: 'safe detail',
+    } as const;
+    for (const tenantTag of ['bearer', 'Prod-1']) {
+      expect(driftFindingRowFromUnknown({ ...base, tenantTag }).tenantTag).toBe(
+        tenantTag,
+      );
+    }
     expect(() =>
-      driftFindingRowFromUnknown({
-        tenantTag: 'Bad\nTag',
-        environment: 'production',
-        kind: 'audit-error',
-        detail: 'safe detail',
-      }),
+      driftFindingRowFromUnknown({ ...base, tenantTag: 'Bad\nTag' }),
     ).toThrow(FleetOperationStateError);
   });
 
@@ -512,42 +518,19 @@ describe('fleet operation state', () => {
 
   it("the audit kind vocabulary is set-equal to DriftFinding['kind']", () => {
     type DriftKind = DriftFinding['kind'];
-    const expected = [
-      'missing-deployment',
-      'duplicate-deployment',
-      'database-mismatch',
-      'duplicate-database',
-      'duplicate-namespace',
-      'binding-drift',
-      'route-drift',
-      'orphan-deployment',
-      'orphan-database',
-      'missing-namespace',
-      'orphan-namespace',
-      'orphan-route',
-      'missing-r2-bucket',
-      'orphan-r2-bucket',
-      'r2-bucket-drift',
-      'duplicate-route',
-      'incomplete-provisioning',
-      'version-drift',
-      'maintenance-stale',
-      'audit-error',
-      'malformed-script-registration',
-      'stale-script-registration',
-      'malformed-route',
-      'stale-route',
-      'incomplete-deployment',
-      'trusted-dispatch-namespace',
-      'unknown-dispatch-scripts',
-    ] as const satisfies readonly DriftKind[];
-    const exhaustive: Exclude<
+    const driftIsSubsetOfAudit: Exclude<
       DriftKind,
-      (typeof expected)[number]
+      FleetAuditFindingKind
     > extends never
       ? true
       : false = true;
-    expect(exhaustive).toBe(true);
-    expect(new Set(FLEET_AUDIT_FINDING_KINDS)).toEqual(new Set(expected));
+    const auditIsSubsetOfDrift: Exclude<
+      FleetAuditFindingKind,
+      DriftKind
+    > extends never
+      ? true
+      : false = true;
+    expect(driftIsSubsetOfAudit).toBe(true);
+    expect(auditIsSubsetOfDrift).toBe(true);
   });
 });

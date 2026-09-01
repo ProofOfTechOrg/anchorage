@@ -143,7 +143,7 @@ function parseJson(value: string): unknown {
   }
 }
 
-function rowPayloadFromUnknown(
+function stagedRowForKindFromUnknown(
   kind: FleetOperationKind,
   row: unknown,
 ): FleetOperationStagedRow {
@@ -264,7 +264,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
     }
   }
 
-  #leaseExists(_kind: FleetOperationKind): string {
+  #leaseExists(): string {
     return `EXISTS (SELECT 1 FROM ${LEASE_TABLE}
         WHERE account_id = ? AND operation_kind = ? AND owner_token = ?
           AND expires_at > ${DB_NOW_MS})`;
@@ -290,9 +290,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
     kind: FleetOperationKind,
     operation: (lease: FleetOperationLease) => Promise<T>,
   ): Promise<T> {
-    return this.#withAccountOperationLeaseInternal(kind, (lease) =>
-      operation(lease),
-    );
+    return this.#withAccountOperationLeaseInternal(kind, operation);
   }
 
   async #withAccountOperationLeaseInternal<T>(
@@ -374,6 +372,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
         renewalErrors.push(error);
       }
     }
+    let releaseFailed = false;
     let releaseError: unknown;
     try {
       const released = await this.#db.query(
@@ -386,12 +385,13 @@ export class D1FleetOperationStore implements FleetOperationStore {
         throw this.#leaseLost(kind);
       }
     } catch (error) {
+      releaseFailed = true;
       releaseError = error;
     }
     const errors: unknown[] = [];
     if (operationFailed) errors.push(operationError);
     errors.push(...renewalErrors);
-    if (releaseError !== undefined) errors.push(releaseError);
+    if (releaseFailed) errors.push(releaseError);
     if (errors.length === 1) throw errors[0];
     if (errors.length > 1) {
       throw new AggregateError(
@@ -474,7 +474,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
               OR (active_operation_id IS NULL
                 AND NOT EXISTS (SELECT 1 FROM ${OPERATION_TABLE}
                   WHERE account_id = ? AND operation_id = ?)))
-            AND ${this.#leaseExists(kind)}
+            AND ${this.#leaseExists()}
           RETURNING active_operation_id`,
         bindings: [
           operationId,
@@ -528,7 +528,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
     const record = fleetOperationRunRecordFromUnknown(
       parseJson(rowString(persisted, 'op_record')),
     );
-    const created = (result[2] ?? []).some(
+    const created = (result.at(-1) ?? []).some(
       (row) => row.operation_id === operationId,
     );
     return {
@@ -563,13 +563,13 @@ export class D1FleetOperationStore implements FleetOperationStore {
       : undefined;
   }
 
-  #operationGuard(kind: FleetOperationKind): string {
+  #operationGuard(): string {
     return `FROM ${OPERATION_TABLE} r
       WHERE r.account_id = ? AND r.operation_id = ?
         AND r.operation_kind = ?
         AND json_extract(r.op_record, '$.state') = 'running'
         AND json_extract(r.op_record, '$.progress.revision') = ?
-        AND ${this.#leaseExists(kind)}`;
+        AND ${this.#leaseExists()}`;
   }
 
   #operationGuardBindings(
@@ -587,6 +587,12 @@ export class D1FleetOperationStore implements FleetOperationStore {
     ];
   }
 
+  #rowsBelowOrdinalSql(): string {
+    return `FROM ${ROW_TABLE}
+          WHERE account_id = ? AND operation_id = ?
+            AND row_kind = ? AND ordinal < ?`;
+  }
+
   async #stageRows(
     kind: FleetOperationKind,
     token: string,
@@ -596,7 +602,9 @@ export class D1FleetOperationStore implements FleetOperationStore {
     if (!fleetOperationSafeInteger(expectedRevision)) {
       throw new FleetOperationStateError();
     }
-    const rows = input.rows.map((row) => rowPayloadFromUnknown(kind, row));
+    const rows = input.rows.map((row) =>
+      stagedRowForKindFromUnknown(kind, row),
+    );
     for (
       let offset = 0;
       offset < rows.length;
@@ -612,7 +620,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
             account_id, operation_id, row_kind, ordinal, payload
           )
           SELECT ?, ?, ?, ?, ?
-          ${this.#operationGuard(kind)}
+          ${this.#operationGuard()}
           ON CONFLICT (account_id, operation_id, row_kind, ordinal) DO NOTHING
           RETURNING row_kind, ordinal`,
           bindings: [
@@ -641,10 +649,10 @@ export class D1FleetOperationStore implements FleetOperationStore {
     const { operationId, expectedRevision } = input;
     const runRecord = fleetOperationRunRecordFromUnknown(input.runRecord);
     const rows = (input.rows ?? []).map((row) =>
-      rowPayloadFromUnknown(kind, row),
+      stagedRowForKindFromUnknown(kind, row),
     );
     const updateRows = (input.updateRows ?? []).map((row) =>
-      rowPayloadFromUnknown(kind, row),
+      stagedRowForKindFromUnknown(kind, row),
     );
     if (updateRows.some((row) => row.rowKind !== 'item')) {
       throw new FleetOperationStateError();
@@ -655,9 +663,12 @@ export class D1FleetOperationStore implements FleetOperationStore {
     if (new Set(mutationKeys).size !== mutationKeys.length) {
       throw new FleetOperationStateError();
     }
-    if (rows.length + updateRows.length + 1 > 100) {
+    if (
+      rows.length + updateRows.length + 1 >
+      FLEET_OPERATION_STAGE_BATCH_STATEMENTS
+    ) {
       throw new Error(
-        'commitProgress exceeds the operation batch budget of 100 statements',
+        `commitProgress exceeds the operation batch budget of ${FLEET_OPERATION_STAGE_BATCH_STATEMENTS} statements`,
       );
     }
     if (
@@ -696,11 +707,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
     // A retry may stage byte-identical later members before this transition;
     // later watermarks and finalize's totals cover those surplus ordinals.
     const watermarkSql = watermarks
-      .map(
-        () => `AND (SELECT COUNT(*) FROM ${ROW_TABLE}
-          WHERE account_id = ? AND operation_id = ?
-            AND row_kind = ? AND ordinal < ?) = ?`,
-      )
+      .map(() => `AND (SELECT COUNT(*) ${this.#rowsBelowOrdinalSql()}) = ?`)
       .join('\n');
     // Every row mutation carries the SAME lease, kind, state, and PRE-update
     // revision guard as the operation update, so stale or losing writers land
@@ -711,7 +718,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
           account_id, operation_id, row_kind, ordinal, payload
         )
         SELECT ?, ?, ?, ?, ?
-        ${this.#operationGuard(kind)}
+        ${this.#operationGuard()}
         ON CONFLICT (account_id, operation_id, row_kind, ordinal) DO NOTHING
         RETURNING row_kind, ordinal`,
         bindings: [
@@ -728,7 +735,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
           SET payload = ?
           WHERE account_id = ? AND operation_id = ?
             AND row_kind = ? AND ordinal = ?
-            AND EXISTS (SELECT 1 ${this.#operationGuard(kind)})
+            AND EXISTS (SELECT 1 ${this.#operationGuard()})
           RETURNING row_kind, ordinal`,
         bindings: [
           bytes,
@@ -746,7 +753,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
             AND operation_kind = ?
             AND json_extract(op_record, '$.state') = 'running'
             AND json_extract(op_record, '$.progress.revision') = ?
-            AND ${this.#leaseExists(kind)}
+            AND ${this.#leaseExists()}
             ${watermarkSql}
           RETURNING operation_id`,
         bindings: [
@@ -799,9 +806,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
     }
     for (const [rowKind, watermark] of watermarks) {
       const stored = await this.#db.query(
-        `SELECT COUNT(*) AS count FROM ${ROW_TABLE}
-          WHERE account_id = ? AND operation_id = ?
-            AND row_kind = ? AND ordinal < ?`,
+        `SELECT COUNT(*) AS count ${this.#rowsBelowOrdinalSql()}`,
         [this.#accountId, operationId, rowKind, watermark],
       );
       if (rowNumber(stored[0], 'count') !== watermark) {
@@ -871,7 +876,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
             AND operation_kind = ?
             AND json_extract(op_record, '$.state') = 'running'
             AND json_extract(op_record, '$.progress.revision') = ?
-            AND ${this.#leaseExists(kind)}
+            AND ${this.#leaseExists()}
             ${countSql}
             ${completeSql}
           RETURNING operation_id`,
@@ -898,7 +903,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
           SET active_operation_id = NULL
           WHERE account_id = ? AND operation_kind = ?
             AND active_operation_id = ?
-            AND ${this.#leaseExists(kind)}
+            AND ${this.#leaseExists()}
             AND EXISTS (SELECT 1 FROM ${OPERATION_TABLE}
               WHERE account_id = ? AND operation_id = ?
                 AND operation_kind = ?
@@ -937,12 +942,15 @@ export class D1FleetOperationStore implements FleetOperationStore {
     );
     if (head[0]?.active_operation_id === operationId) {
       // The only legal repair is the head release; operation data is immutable.
+      // The readback above already proved `persisted.state === 'finalized'`,
+      // which stands in for the in-batch finalized-state EXISTS guard R3's
+      // repair carries.
       await this.#db.query(
         `UPDATE ${HEAD_TABLE}
           SET active_operation_id = NULL
           WHERE account_id = ? AND operation_kind = ?
             AND active_operation_id = ?
-            AND ${this.#leaseExists(kind)}
+            AND ${this.#leaseExists()}
           RETURNING account_id`,
         [
           this.#accountId,
@@ -969,19 +977,19 @@ export class D1FleetOperationStore implements FleetOperationStore {
       );
     }
     const updateRows = (input.updateRows ?? []).map((row) =>
-      rowPayloadFromUnknown(kind, row),
+      stagedRowForKindFromUnknown(kind, row),
     );
     if (updateRows.some((row) => row.rowKind !== 'item')) {
+      throw new FleetOperationStateError();
+    }
+    const updateKeys = updateRows.map((row) => `${row.rowKind}:${row.ordinal}`);
+    if (new Set(updateKeys).size !== updateKeys.length) {
       throw new FleetOperationStateError();
     }
     const payloads = updateRows.map((row) => ({
       row,
       bytes: serializedPayload(row),
     }));
-    const updateKeys = updateRows.map((row) => `${row.rowKind}:${row.ordinal}`);
-    if (new Set(updateKeys).size !== updateKeys.length) {
-      throw new FleetOperationStateError();
-    }
     if (
       runRecord.operationId !== operationId ||
       runRecord.kind !== kind ||
@@ -1011,7 +1019,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
           SET payload = ?
           WHERE account_id = ? AND operation_id = ?
             AND row_kind = ? AND ordinal = ?
-            AND EXISTS (SELECT 1 ${this.#operationGuard(kind)})
+            AND EXISTS (SELECT 1 ${this.#operationGuard()})
           RETURNING row_kind, ordinal`,
         bindings: [
           bytes,
@@ -1030,7 +1038,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
             AND operation_kind = ?
             AND json_extract(op_record, '$.state') = 'running'
             AND json_extract(op_record, '$.progress.revision') = ?
-            AND ${this.#leaseExists(kind)}
+            AND ${this.#leaseExists()}
             ${exactRows}
           RETURNING operation_id`,
         bindings: [
@@ -1054,7 +1062,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
           SET active_operation_id = NULL
           WHERE account_id = ? AND operation_kind = ?
             AND active_operation_id = ?
-            AND ${this.#leaseExists(kind)}
+            AND ${this.#leaseExists()}
             AND EXISTS (SELECT 1 FROM ${OPERATION_TABLE}
               WHERE account_id = ? AND operation_id = ?
                 AND operation_kind = ?
@@ -1103,8 +1111,8 @@ export class D1FleetOperationStore implements FleetOperationStore {
   ): Promise<
     Readonly<{ rows: readonly FleetOperationStagedRow[]; done: boolean }>
   > {
-    await this.#ensureSchema();
     assertLimit(input.limit);
+    await this.#ensureSchema();
     if (
       !FLEET_OPERATION_ROW_KINDS.includes(input.rowKind) ||
       (input.afterOrdinal !== undefined &&
@@ -1116,6 +1124,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
     const operation = await this.#operationRow(input.operationId);
     if (!operation) throw unknownOperation(input.operationId);
     const kind = rowString(operation, 'operation_kind') as FleetOperationKind;
+    assertKind(kind);
     const stored = await this.#db.query(
       `SELECT row_kind, ordinal, payload FROM ${ROW_TABLE}
         WHERE account_id = ? AND operation_id = ? AND row_kind = ?
@@ -1131,7 +1140,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
       ],
     );
     const rows = stored.slice(0, input.limit).map((row) =>
-      rowPayloadFromUnknown(kind, {
+      stagedRowForKindFromUnknown(kind, {
         rowKind: rowString(row, 'row_kind'),
         ordinal: rowNumber(row, 'ordinal'),
         payload: parseJson(rowString(row, 'payload')),
@@ -1146,7 +1155,6 @@ export class D1FleetOperationStore implements FleetOperationStore {
       limit: number;
     }>,
   ): Promise<Readonly<{ deleted: number; releasedPins: number }>> {
-    assertKind(input.kind);
     assertLimit(input.limit);
     if (input.kind === 'audit' && !this.#inventoryStore) {
       throw new FleetOperationStoreCapabilityError();
@@ -1184,9 +1192,11 @@ export class D1FleetOperationStore implements FleetOperationStore {
             const record = fleetAuditOperationRecordFromUnknown(
               parseJson(rowString(candidate, 'op_record')),
             );
+            const inventoryStore = this
+              .#inventoryStore as FleetInventoryRunStore;
             // Lock order is operation KIND lease outer, inventory ACCOUNT lease
             // inner, and is never acquired in reverse by production callers.
-            await this.#inventoryStore?.releasePin({
+            await inventoryStore.releasePin({
               generation: record.progress.generation,
               pinnedBy: `fleet-audit:${operationId}`,
             });
@@ -1227,7 +1237,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
               AND latest.operation_kind = o.operation_kind
               AND json_extract(latest.op_record, '$.state') = 'finalized')
         ))
-      AND ${this.#leaseExists(kind)}`;
+      AND ${this.#leaseExists()}`;
     const guardBindings = [
       this.#accountId,
       operationId,

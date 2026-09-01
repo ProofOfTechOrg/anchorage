@@ -2,12 +2,14 @@
 
 import { describe, expect, it } from 'vitest';
 import { D1FleetOperationStore } from '../src/d1-fleet-operation-store.js';
+import type { FleetAuditProgress } from '../src/fleet-audit-state.js';
 import type {
   FleetInventoryGeneration,
   FleetInventoryGenerationRef,
   FleetInventoryRunRecord,
   FleetInventoryRunStore,
 } from '../src/fleet-inventory-state.js';
+import type { FleetMigrationProgress } from '../src/fleet-migration-state.js';
 import {
   classifyFleetOperationToken,
   type FleetOperationKind,
@@ -55,7 +57,7 @@ class MemoryD1 implements FleetStateDatabase {
   readonly batchSizes: number[] = [];
   /** Binding counts for every statement executed in batch order. */
   readonly bindingCounts: number[] = [];
-  /** Statements the next batch drops after committing, for lost responses. */
+  /** Makes the next committed batch drop its result rows, for lost responses. */
   hideBatchResults = false;
   /** Makes the next committed batch throw as if its response were lost. */
   failNextBatchAfterCommit = false;
@@ -128,7 +130,7 @@ function runRecord(
     state,
     progress:
       kind === 'audit'
-        ? {
+        ? ({
             kind,
             revision,
             stage: { step: 'provider-findings', rowOrdinal: 0 },
@@ -141,8 +143,8 @@ function runRecord(
             ...(state === 'failed'
               ? { failure: { reason: 'operator-abandoned' as const } }
               : {}),
-          }
-        : {
+          } as FleetAuditProgress)
+        : ({
             kind,
             revision,
             itemCount: 1,
@@ -156,9 +158,9 @@ function runRecord(
                   },
                 }
               : {}),
-          },
+          } as FleetMigrationProgress),
     updatedAt: NOW,
-  } as unknown as FleetOperationRunRecord;
+  };
 }
 
 function advanced(
@@ -295,6 +297,14 @@ async function rejection(operation: Promise<unknown>): Promise<Error> {
   throw new Error('operation unexpectedly resolved');
 }
 
+function rowCount(db: MemoryD1): number {
+  return Number(
+    db.sqlite
+      .prepare('SELECT COUNT(*) AS count FROM anchorage_fleet_operation_rows')
+      .all()[0]?.count,
+  );
+}
+
 class FakeInventoryStore implements FleetInventoryRunStore {
   readonly pins = new Set<string>();
   readonly releases: string[] = [];
@@ -368,7 +378,10 @@ describe('D1FleetOperationStore', () => {
     const result = await store(db).withAccountOperationLease('audit', (lease) =>
       start(lease),
     );
-    expect(result).toEqual({ outcome: 'created', record: auditRun(0) });
+    expect(result).toEqual({
+      outcome: 'created',
+      record: runRecord('audit', 0),
+    });
     expect(
       db.sqlite
         .prepare(
@@ -595,7 +608,7 @@ describe('D1FleetOperationStore', () => {
           ],
           expectedRowWatermarks: { record: 2 },
         } as const;
-        const mark = db.bindingCounts.length;
+        const bindingMark = db.bindingCounts.length;
         db.failNextBatchAfterCommit = true;
         await expect(lease.commitProgress(transition)).rejects.toThrow(
           'committed batch response lost',
@@ -606,7 +619,9 @@ describe('D1FleetOperationStore', () => {
           ...Array.from({ length: 12 }, () => 12),
           13,
         ];
-        expect(db.bindingCounts.slice(mark)).toEqual(commitBindingCounts);
+        expect(db.bindingCounts.slice(bindingMark)).toEqual(
+          commitBindingCounts,
+        );
         await expect(
           lease.commitProgress({
             ...transition,
@@ -616,7 +631,7 @@ describe('D1FleetOperationStore', () => {
           `fleet operation '${OPERATION_ID}' is no longer at the expected revision`,
         );
         const converged = await lease.commitProgress(transition);
-        expect(db.bindingCounts.slice(mark)).toEqual([
+        expect(db.bindingCounts.slice(bindingMark)).toEqual([
           ...commitBindingCounts,
           ...commitBindingCounts,
           ...commitBindingCounts,
@@ -776,8 +791,9 @@ describe('D1FleetOperationStore', () => {
       'audit',
       async (lease) => {
         const created = await start(lease);
-        const mark = acceptedDb.batchSizes.length;
-        const markB = acceptedDb.bindingCounts.length;
+        const batchMark = acceptedDb.batchSizes.length;
+        const bindingMark = acceptedDb.bindingCounts.length;
+        // 99 rows + 1 run-update statement = the 100-statement batch boundary.
         await lease.commitProgress({
           operationId: OPERATION_ID,
           expectedRevision: 0,
@@ -785,8 +801,11 @@ describe('D1FleetOperationStore', () => {
           rows: Array.from({ length: 99 }, (_, index) => recordRow(index)),
           expectedRowWatermarks: { record: 0 },
         });
-        expect(acceptedDb.batchSizes.slice(mark)).toEqual([100]);
-        expect(acceptedDb.bindingCounts.slice(markB)).toEqual([
+        expect(acceptedDb.batchSizes.slice(batchMark)).toEqual([100]);
+        // Per-statement binding counts: see the derivation comment on
+        // "watermark guards hold under a retry..." above (12 per row, 13 for
+        // the run update).
+        expect(acceptedDb.bindingCounts.slice(bindingMark)).toEqual([
           ...Array.from({ length: 99 }, () => 12),
           13,
         ]);
@@ -794,11 +813,14 @@ describe('D1FleetOperationStore', () => {
     );
 
     const db = new MemoryD1();
-    const error = await store(db).withAccountOperationLease(
+    const target = store(db);
+    const error = await target.withAccountOperationLease(
       'audit',
       async (lease) => {
         const created = await start(lease);
-        return rejection(
+        const batchMark = db.batchSizes.length;
+        // 100 rows + 1 run-update statement is one over the boundary.
+        const rejected = await rejection(
           lease.commitProgress({
             operationId: OPERATION_ID,
             expectedRevision: 0,
@@ -806,11 +828,16 @@ describe('D1FleetOperationStore', () => {
             rows: Array.from({ length: 100 }, (_, index) => recordRow(index)),
           }),
         );
+        expect(db.batchSizes.slice(batchMark)).toEqual([]);
+        return rejected;
       },
     );
     expect(error.message).toBe(
       'commitProgress exceeds the operation batch budget of 100 statements',
     );
+    const persisted = await target.readOperationById(OPERATION_ID);
+    expect(persisted?.state).toBe('running');
+    expect(persisted?.progress.revision).toBe(0);
   });
 
   it('finalize total-count guards (audit: finding + record + fact; migration: item)', async () => {
@@ -1370,8 +1397,6 @@ describe('D1FleetOperationStore', () => {
     const inventory = new FakeInventoryStore();
     const target = store(db, 'account-primary', inventory);
     await seedTerminal(target, 'audit', FOURTH_OPERATION_ID, 'failed');
-    // Lock order is operation KIND lease outer, inventory ACCOUNT lease inner,
-    // and is never acquired in reverse by production callers.
     await inventory.pinGeneration({
       generation: 1,
       pinnedBy: `fleet-audit:${FOURTH_OPERATION_ID}`,
@@ -1401,15 +1426,3 @@ describe('D1FleetOperationStore', () => {
     ).rejects.toThrow(FleetOperationStoreCapabilityError);
   });
 });
-
-function auditRun(revision: number): FleetOperationRunRecord {
-  return runRecord('audit', revision);
-}
-
-function rowCount(db: MemoryD1): number {
-  return Number(
-    db.sqlite
-      .prepare('SELECT COUNT(*) AS count FROM anchorage_fleet_operation_rows')
-      .all()[0]?.count,
-  );
-}

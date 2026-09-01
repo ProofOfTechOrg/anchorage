@@ -7,16 +7,15 @@ import {
 import {
   assertFleetOperationExactKeys,
   FLEET_OPERATION_ITEM_BOUND,
-  FLEET_OPERATION_STRING_BYTE_BOUND,
   type FleetOperationProgress,
   type FleetOperationRunRecord,
-  FleetOperationStateError,
   fleetOperationBoundedString,
   fleetOperationFailureFromUnknown,
   fleetOperationPlainRecord,
   fleetOperationRunRecordFromUnknown,
   fleetOperationSafeInteger,
   fleetOperationTextHasControlBytes,
+  malformed,
 } from './fleet-operation-state.js';
 
 export type FleetAuditStage =
@@ -132,10 +131,6 @@ export type FleetAuditFactPayload =
     }>
   | Readonly<{ factKind: 'duplicate-namespace'; key: string }>;
 
-function malformed(): never {
-  throw new FleetOperationStateError();
-}
-
 function structurallySafeText(value: unknown): value is string {
   return (
     fleetOperationBoundedString(value) &&
@@ -180,9 +175,10 @@ export function nextAuditStage(
 ): FleetAuditStage {
   const current = fleetAuditStageFromUnknown(stage);
   if (!exhausted || current.step === 'finalize') return current;
-  const next =
-    FLEET_AUDIT_STAGE_ORDER[FLEET_AUDIT_STAGE_ORDER.indexOf(current.step) + 1];
-  return stageEntry(next ?? 'finalize');
+  const next = FLEET_AUDIT_STAGE_ORDER[
+    FLEET_AUDIT_STAGE_ORDER.indexOf(current.step) + 1
+  ] as FleetAuditStage['step'];
+  return stageEntry(next);
 }
 
 export function fleetAuditProgressFromUnknown(
@@ -315,12 +311,5 @@ export function fleetAuditFactRowFromUnknown(
 }
 
 export function withheldAuditDetail(kind: FleetAuditFindingKind): string {
-  const detail = `finding detail withheld: unsafe bytes (kind '${kind}')`;
-  if (
-    new TextEncoder().encode(detail).byteLength >
-    FLEET_OPERATION_STRING_BYTE_BOUND
-  ) {
-    return malformed();
-  }
-  return detail;
+  return `finding detail withheld: unsafe bytes (kind '${kind}')`;
 }

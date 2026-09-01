@@ -36,10 +36,14 @@ export const FLEET_OPERATION_KINDS = Object.freeze([
   'migration',
 ] as const);
 export type FleetOperationKind = (typeof FLEET_OPERATION_KINDS)[number];
-export type FleetOperationRowKind = 'record' | 'finding' | 'item' | 'fact';
-
-export const FLEET_OPERATION_ROW_KINDS: readonly FleetOperationRowKind[] =
-  Object.freeze(['record', 'finding', 'item', 'fact']);
+/** Every staged row kind. */
+export const FLEET_OPERATION_ROW_KINDS = Object.freeze([
+  'record',
+  'finding',
+  'item',
+  'fact',
+] as const);
+export type FleetOperationRowKind = (typeof FLEET_OPERATION_ROW_KINDS)[number];
 
 export interface FleetOperationToken {
   readonly version: 1;
@@ -210,12 +214,14 @@ export interface FleetOperationLease {
   ): Promise<void>;
 }
 
-function malformed(): never {
+export function malformed(): never {
   throw new FleetOperationStateError();
 }
 
+const TEXT_ENCODER = new TextEncoder();
+
 function utf8Length(value: string): number {
-  return new TextEncoder().encode(value).byteLength;
+  return TEXT_ENCODER.encode(value).byteLength;
 }
 
 export function fleetOperationTextHasControlBytes(value: string): boolean {
@@ -281,10 +287,7 @@ function canonicalIso(value: unknown): value is string {
   );
 }
 
-export function fleetOperationBoundedPlain(
-  value: unknown,
-  maxBytes: number,
-): unknown {
+function fleetOperationBoundedPlain(value: unknown, maxBytes: number): unknown {
   try {
     const plain = cloneBoundedPlainData(value, {
       maxDepth: DEPTH_BOUND,
@@ -528,7 +531,7 @@ export function fleetOperationIntakeDigest(value: unknown): string {
 }
 
 /** Non-throwing write gate for composed audit finding details. */
-export function isDurableAuditDetailSafe(value: string): boolean {
+export function isDurableAuditDetailSafe(value: unknown): boolean {
   if (
     typeof value !== 'string' ||
     utf8Length(value) > FLEET_OPERATION_STRING_BYTE_BOUND ||
