@@ -29,6 +29,17 @@ Repository documentation, architecture, and publication checks. Markdown syntax 
   script is deliberately NOT part of CI: the in-suite equivalence title in
   `packages/fleet-control/test/cloudflare-client.test.ts` is the automatic
   behavioral gate, and `--check` is the re-recording aid an author runs by hand.
+- `record-audit-baseline.mjs` — records fleet control's `auditFleetDrift`
+  golden baseline (findings AND the store/backend/resolver op log) from the
+  hand-authored world in
+  `packages/fleet-control/test/fixtures/fleet-audit-world.ts` and writes only
+  `…/fixtures/fleet-audit-baseline.ts`, formatting it with the repository's
+  Biome. `--check` re-derives both values from the unchanged world, compares
+  them structurally against the committed module's exports, prints every
+  structural difference, and exits non-zero without writing. This script is
+  deliberately NOT part of CI: the in-suite equivalence title in
+  `packages/fleet-control/test/fleet-audit-golden.test.ts` is the automatic
+  behavioral gate, and `--check` is the re-recording aid an author runs by hand.
 - `workerd-server-lifecycle.mjs` — the one `wrangler dev` start/stop protocol
   shared by the FlowSafe workerd harnesses and the conformance harness.
 - `workerd-server-lifecycle.test.mjs` — its vitest suite, run through the root
