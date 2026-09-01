@@ -208,8 +208,9 @@ function cleanRoute(
   };
 }
 
+/** A live inventory deployment entry: empty bindings and routes unless the caller supplies them. */
 function bareDeployment(
-  overrides: Pick<
+  fields: Pick<
     FleetInventoryDeployment,
     'scriptName' | 'tenantTag' | 'artifactVersion'
   > &
@@ -224,12 +225,12 @@ function bareDeployment(
     plainTextBindings: {},
     routeHostnames: [],
     schemaVersion: 1,
-    ...overrides,
+    ...fields,
   };
 }
 
 // ---------------------------------------------------------------------------
-// Records. Each targeting record's comment cites the fleet.ts:line it targets.
+// Records. Every record but `control` cites the fleet.ts lines its story targets.
 // ---------------------------------------------------------------------------
 
 /** A fully healthy deployment: proves the audit does not false-positive. */
@@ -390,11 +391,14 @@ const routeDup = baseRecord('routedup');
  * `options.inventory.hostRoutingKvId` is never set in this world,
  * fleet.ts:1245's `!options.inventory.hostRoutingKvId` disjunct alone
  * guarantees fleet.ts:1256 `binding-drift` ("trusted egress Worker ... has
- * drifted policy or attribution bindings") ADDITIONALLY.
+ * drifted policy or attribution bindings") ADDITIONALLY. The record's OWN
+ * worker inspects clean; only the declared `platformResources.stateWorker`
+ * and `platformResources.egressProxy` (separate live deployment entries in
+ * `inventory.deployments`) carry the drift.
  *
  * This record ALSO carries the world's only multi-namespace-id story
  * (§8.6): a second `durableObjectBindings` entry reuses
- * `SHARED_EXPECTED_NAMESPACE` (already claimed by `dupexpnsa`/`dupexpnsb`
+ * `SHARED_EXPECTED_NAMESPACE` (already claimed by `namespaceDupA`/`namespaceDupB`
  * above), so this record's OWN pass through the fleet.ts:762 inner loop
  * lands the namespace's THIRD claimant, landing the world's second
  * `duplicate-namespace` finding; a populated
@@ -666,7 +670,7 @@ function fleetAuditWorldInventory(): FleetResourceInventory {
     }),
   );
 
-  // fleet.ts:871 — the second `recdupb` claimant of `shared-record-script`
+  // fleet.ts:871 — the second `recordDupB` claimant of `shared-record-script`
   // is deliberately NOT added here: `recordDupA`'s clean entry is the only live
   // deployment under that script name, which is what makes `recordDupB`'s own
   // `recordsByScript` lookup see two RECORDS behind one live entry.
@@ -761,7 +765,7 @@ function fleetAuditWorldInventory(): FleetResourceInventory {
   // fleet.ts:1146/:1224 — the one live deployment behind `platformDrift`'s
   // declared `stateWorker`, with wrong ownership metadata (no
   // `resourceRole`, wrong `resourceGroupId`/`artifactVersion`) and an empty
-  // `databaseIds` (fleet.ts:1224 expects exactly one matching entry).
+  // `databaseIds` (fleet.ts:1168 expects exactly one matching entry).
   deployments.push(
     bareDeployment({
       scriptName: PLATFORM_STATE_SCRIPT_NAME,
@@ -1100,9 +1104,11 @@ class RecordingBackend implements ProvisioningBackend {
  * Every record reached through `backend.inspect()` gets a clean, matching
  * live deployment EXCEPT the records whose story is specifically about
  * inspect-time drift (`inspectAbsent` returns `undefined`; `maintStale` and
- * `rearmFail` report unarmed maintenance). `missingDeploy` is absent from
- * this map too, but never reaches `inspect` at all: fleet.ts:966's
- * `if (!inventoryDeployment) continue;` exits its iteration before that.
+ * `rearmFail` report unarmed maintenance). `missingDeploy`, `recordDupB`,
+ * `staleNotReady`, and `wfpRelease` are absent from this map entirely:
+ * `missingDeploy` never reaches `inspect` at all, exiting at fleet.ts:966's
+ * `!inventoryDeployment` check, while the other three exit earlier still, at
+ * fleet.ts:965's `phase !== 'ready'` gate.
  */
 function inspectResultsByTenant(): Map<string, LiveDeployment | undefined> {
   const live = new Map<string, LiveDeployment | undefined>();
@@ -1121,14 +1127,11 @@ function inspectResultsByTenant(): Map<string, LiveDeployment | undefined> {
     bindingMismatch,
     routeBroken,
     routeDup,
+    platformDrift,
     channelDrift,
   ]) {
     live.set(record.tenantTag, cleanLiveDeployment(record));
   }
-  // The record's OWN worker inspects clean; only the declared
-  // `platformResources.stateWorker` (a separate live deployment entry
-  // in `inventory.deployments`) carries the drift.
-  live.set(platformDrift.tenantTag, cleanLiveDeployment(platformDrift));
   live.set(inspectAbsent.tenantTag, undefined);
   live.set(
     maintStale.tenantTag,
@@ -1147,6 +1150,7 @@ export async function runFleetAuditBaseline(): Promise<{
   readonly ops: readonly AuditOpLogEntry[];
 }> {
   const ops: AuditOpLogEntry[] = [];
+  // One array feeds the store's clock fence, the backend's credential pins, and the post-run throw.
   const fenceViolations: string[] = [];
   const store = new RecordingFleetStore(
     AUDIT_WORLD_RECORDS,
