@@ -1586,7 +1586,7 @@ async function atomicClaimBatch(db: D1Database): Promise<unknown> {
   await readyStore(db);
   const delegate = new D1FleetStateDatabase(db);
   let loseResponse = true;
-  const lostResponseDatabase: FleetStateDatabase = {
+  const failAfterCommitDatabase: FleetStateDatabase = {
     query: (sql, bindings) => delegate.query(sql, bindings),
     execute: (sql, bindings) => delegate.execute(sql, bindings),
     async batch(statements) {
@@ -1598,7 +1598,7 @@ async function atomicClaimBatch(db: D1Database): Promise<unknown> {
       return result;
     },
   };
-  const store = new D1FleetStateStore(lostResponseDatabase, {
+  const store = new D1FleetStateStore(failAfterCommitDatabase, {
     accountId: 'account-primary',
   });
   const applicationResources = Array.from({ length: 32 }, (_, index) => ({
@@ -2596,7 +2596,7 @@ async function readyInventoryStore(
 }
 
 /** Drops the next batch's result rows, reproducing a lost D1 response. */
-function lostResponseDatabase(
+function hideResultsDatabase(
   delegate: FleetStateDatabase,
 ): FleetStateDatabase & Readonly<{ loseNextBatch(): void }> {
   let lose = false;
@@ -2879,7 +2879,7 @@ async function inventoryCommitConcurrency(db: D1Database): Promise<unknown> {
 
 async function inventoryFinalizeConvergence(db: D1Database): Promise<unknown> {
   await readyInventoryStore(db);
-  const database = lostResponseDatabase(new D1FleetStateDatabase(db));
+  const database = hideResultsDatabase(new D1FleetStateDatabase(db));
   const store = inventoryStore(database);
   const operationId = inventoryOperationId(2);
   const rows = inventoryRows('finalize');
@@ -3337,7 +3337,7 @@ async function operationCommitConcurrency(db: D1Database): Promise<unknown> {
 
 async function operationFinalizeConvergence(db: D1Database): Promise<unknown> {
   await readyOperationStore(db);
-  const database = lostResponseDatabase(new D1FleetStateDatabase(db));
+  const database = hideResultsDatabase(new D1FleetStateDatabase(db));
   const target = operationStore(database);
   const id = operationId(2);
   return target.withAccountOperationLease('migration', async (lease) => {

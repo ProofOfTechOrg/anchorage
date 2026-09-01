@@ -33,22 +33,21 @@ export type FleetAuditStage =
   | Readonly<{ step: 'per-record'; recordOrdinal: number }>
   | Readonly<{ step: 'finalize' }>;
 
-export const FLEET_AUDIT_STAGE_ORDER: readonly FleetAuditStage['step'][] =
-  Object.freeze([
-    'provider-findings',
-    'registration-orphans',
-    'deployment-orphans',
-    'deployment-gaps',
-    'orphan-databases',
-    'orphan-routes',
-    'namespace-orphans',
-    'namespace-expectations',
-    'r2-expected',
-    'r2-orphans',
-    'r2-missing-identity',
-    'per-record',
-    'finalize',
-  ]);
+export const FLEET_AUDIT_STAGE_ORDER = Object.freeze([
+  'provider-findings',
+  'registration-orphans',
+  'deployment-orphans',
+  'deployment-gaps',
+  'orphan-databases',
+  'orphan-routes',
+  'namespace-orphans',
+  'namespace-expectations',
+  'r2-expected',
+  'r2-orphans',
+  'r2-missing-identity',
+  'per-record',
+  'finalize',
+] as const) satisfies readonly FleetAuditStage['step'][];
 
 const STAGE_ORDINAL = Object.freeze({
   'provider-findings': 'rowOrdinal',
@@ -175,6 +174,8 @@ export function nextAuditStage(
 ): FleetAuditStage {
   const current = fleetAuditStageFromUnknown(stage);
   if (!exhausted || current.step === 'finalize') return current;
+  // 'finalize' is last in FLEET_AUDIT_STAGE_ORDER, so the early return
+  // keeps this index in range.
   const next = FLEET_AUDIT_STAGE_ORDER[
     FLEET_AUDIT_STAGE_ORDER.indexOf(current.step) + 1
   ] as FleetAuditStage['step'];

@@ -214,6 +214,7 @@ export interface FleetOperationLease {
   ): Promise<void>;
 }
 
+/** Rejects malformed durable operation state with FleetOperationStateError. */
 export function malformed(): never {
   throw new FleetOperationStateError();
 }

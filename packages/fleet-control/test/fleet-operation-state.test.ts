@@ -316,12 +316,10 @@ describe('fleet operation state', () => {
 
   it('row payload 16 KiB bound + 96 KiB record-row allowance', () => {
     const valueBytes = 3000;
-    const rowPayloadOverflowCount = Math.ceil(
-      FLEET_OPERATION_ROW_PAYLOAD_BYTE_BOUND / valueBytes,
-    );
-    const recordRowOverflowCount = Math.ceil(
-      FLEET_OPERATION_RECORD_ROW_BYTE_BOUND / valueBytes,
-    );
+    const rowPayloadOverflowCount =
+      Math.floor(FLEET_OPERATION_ROW_PAYLOAD_BYTE_BOUND / valueBytes) + 1;
+    const recordRowOverflowCount =
+      Math.floor(FLEET_OPERATION_RECORD_ROW_BYTE_BOUND / valueBytes) + 1;
     const payload = Object.fromEntries(
       Array.from({ length: rowPayloadOverflowCount }, (_, index) => [
         `value${index}`,
@@ -401,7 +399,10 @@ describe('fleet operation state', () => {
     expect(withheldAuditDetail('maintenance-stale')).toBe(
       "finding detail withheld: unsafe bytes (kind 'maintenance-stale')",
     );
-    for (const detail of ['x'.repeat(4097), 'unsafe\u0000detail']) {
+    for (const detail of [
+      'x'.repeat(FLEET_OPERATION_STRING_BYTE_BOUND + 1),
+      'unsafe\u0000detail',
+    ]) {
       expect(isDurableAuditDetailSafe(detail)).toBe(false);
       expect(() =>
         driftFindingRowFromUnknown({
@@ -518,6 +519,8 @@ describe('fleet operation state', () => {
 
   it("the audit kind vocabulary is set-equal to DriftFinding['kind']", () => {
     type DriftKind = DriftFinding['kind'];
+    // The set-equality proof is compile-time; pnpm typecheck is the gate
+    // that enforces it.
     const driftIsSubsetOfAudit: Exclude<
       DriftKind,
       FleetAuditFindingKind

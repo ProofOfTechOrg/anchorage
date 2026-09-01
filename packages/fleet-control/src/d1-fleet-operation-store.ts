@@ -43,6 +43,18 @@ const KIND_CHECK = FLEET_OPERATION_KINDS.map((kind) => `'${kind}'`).join(',');
 const ROW_KIND_CHECK = FLEET_OPERATION_ROW_KINDS.map(
   (kind) => `'${kind}'`,
 ).join(',');
+const LEASE_EXISTS_SQL = `EXISTS (SELECT 1 FROM ${LEASE_TABLE}
+        WHERE account_id = ? AND operation_kind = ? AND owner_token = ?
+          AND expires_at > ${DB_NOW_MS})`;
+const OPERATION_GUARD_SQL = `FROM ${OPERATION_TABLE} r
+      WHERE r.account_id = ? AND r.operation_id = ?
+        AND r.operation_kind = ?
+        AND json_extract(r.op_record, '$.state') = 'running'
+        AND json_extract(r.op_record, '$.progress.revision') = ?
+        AND ${LEASE_EXISTS_SQL}`;
+const ROWS_BELOW_ORDINAL_SQL = `FROM ${ROW_TABLE}
+          WHERE account_id = ? AND operation_id = ?
+            AND row_kind = ? AND ordinal < ?`;
 
 type Row = Readonly<Record<string, unknown>>;
 
@@ -264,12 +276,6 @@ export class D1FleetOperationStore implements FleetOperationStore {
     }
   }
 
-  #leaseExists(): string {
-    return `EXISTS (SELECT 1 FROM ${LEASE_TABLE}
-        WHERE account_id = ? AND operation_kind = ? AND owner_token = ?
-          AND expires_at > ${DB_NOW_MS})`;
-  }
-
   #leaseBindings(kind: FleetOperationKind, token: string): readonly unknown[] {
     return [this.#accountId, kind, token];
   }
@@ -290,7 +296,11 @@ export class D1FleetOperationStore implements FleetOperationStore {
     kind: FleetOperationKind,
     operation: (lease: FleetOperationLease) => Promise<T>,
   ): Promise<T> {
-    return this.#withAccountOperationLeaseInternal(kind, operation);
+    // The wrapper keeps the internal lease owner token out of
+    // caller-supplied callbacks.
+    return this.#withAccountOperationLeaseInternal(kind, (lease) =>
+      operation(lease),
+    );
   }
 
   async #withAccountOperationLeaseInternal<T>(
@@ -474,7 +484,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
               OR (active_operation_id IS NULL
                 AND NOT EXISTS (SELECT 1 FROM ${OPERATION_TABLE}
                   WHERE account_id = ? AND operation_id = ?)))
-            AND ${this.#leaseExists()}
+            AND ${LEASE_EXISTS_SQL}
           RETURNING active_operation_id`,
         bindings: [
           operationId,
@@ -563,15 +573,6 @@ export class D1FleetOperationStore implements FleetOperationStore {
       : undefined;
   }
 
-  #operationGuard(): string {
-    return `FROM ${OPERATION_TABLE} r
-      WHERE r.account_id = ? AND r.operation_id = ?
-        AND r.operation_kind = ?
-        AND json_extract(r.op_record, '$.state') = 'running'
-        AND json_extract(r.op_record, '$.progress.revision') = ?
-        AND ${this.#leaseExists()}`;
-  }
-
   #operationGuardBindings(
     kind: FleetOperationKind,
     token: string,
@@ -585,12 +586,6 @@ export class D1FleetOperationStore implements FleetOperationStore {
       expectedRevision,
       ...this.#leaseBindings(kind, token),
     ];
-  }
-
-  #rowsBelowOrdinalSql(): string {
-    return `FROM ${ROW_TABLE}
-          WHERE account_id = ? AND operation_id = ?
-            AND row_kind = ? AND ordinal < ?`;
   }
 
   async #stageRows(
@@ -620,7 +615,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
             account_id, operation_id, row_kind, ordinal, payload
           )
           SELECT ?, ?, ?, ?, ?
-          ${this.#operationGuard()}
+          ${OPERATION_GUARD_SQL}
           ON CONFLICT (account_id, operation_id, row_kind, ordinal) DO NOTHING
           RETURNING row_kind, ordinal`,
           bindings: [
@@ -707,7 +702,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
     // A retry may stage byte-identical later members before this transition;
     // later watermarks and finalize's totals cover those surplus ordinals.
     const watermarkSql = watermarks
-      .map(() => `AND (SELECT COUNT(*) ${this.#rowsBelowOrdinalSql()}) = ?`)
+      .map(() => `AND (SELECT COUNT(*) ${ROWS_BELOW_ORDINAL_SQL}) = ?`)
       .join('\n');
     // Every row mutation carries the SAME lease, kind, state, and PRE-update
     // revision guard as the operation update, so stale or losing writers land
@@ -718,7 +713,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
           account_id, operation_id, row_kind, ordinal, payload
         )
         SELECT ?, ?, ?, ?, ?
-        ${this.#operationGuard()}
+        ${OPERATION_GUARD_SQL}
         ON CONFLICT (account_id, operation_id, row_kind, ordinal) DO NOTHING
         RETURNING row_kind, ordinal`,
         bindings: [
@@ -735,7 +730,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
           SET payload = ?
           WHERE account_id = ? AND operation_id = ?
             AND row_kind = ? AND ordinal = ?
-            AND EXISTS (SELECT 1 ${this.#operationGuard()})
+            AND EXISTS (SELECT 1 ${OPERATION_GUARD_SQL})
           RETURNING row_kind, ordinal`,
         bindings: [
           bytes,
@@ -753,7 +748,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
             AND operation_kind = ?
             AND json_extract(op_record, '$.state') = 'running'
             AND json_extract(op_record, '$.progress.revision') = ?
-            AND ${this.#leaseExists()}
+            AND ${LEASE_EXISTS_SQL}
             ${watermarkSql}
           RETURNING operation_id`,
         bindings: [
@@ -806,7 +801,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
     }
     for (const [rowKind, watermark] of watermarks) {
       const stored = await this.#db.query(
-        `SELECT COUNT(*) AS count ${this.#rowsBelowOrdinalSql()}`,
+        `SELECT COUNT(*) AS count ${ROWS_BELOW_ORDINAL_SQL}`,
         [this.#accountId, operationId, rowKind, watermark],
       );
       if (rowNumber(stored[0], 'count') !== watermark) {
@@ -876,7 +871,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
             AND operation_kind = ?
             AND json_extract(op_record, '$.state') = 'running'
             AND json_extract(op_record, '$.progress.revision') = ?
-            AND ${this.#leaseExists()}
+            AND ${LEASE_EXISTS_SQL}
             ${countSql}
             ${completeSql}
           RETURNING operation_id`,
@@ -903,7 +898,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
           SET active_operation_id = NULL
           WHERE account_id = ? AND operation_kind = ?
             AND active_operation_id = ?
-            AND ${this.#leaseExists()}
+            AND ${LEASE_EXISTS_SQL}
             AND EXISTS (SELECT 1 FROM ${OPERATION_TABLE}
               WHERE account_id = ? AND operation_id = ?
                 AND operation_kind = ?
@@ -941,16 +936,19 @@ export class D1FleetOperationStore implements FleetOperationStore {
       [this.#accountId, kind],
     );
     if (head[0]?.active_operation_id === operationId) {
-      // The only legal repair is the head release; operation data is immutable.
-      // The readback above already proved `persisted.state === 'finalized'`,
-      // which stands in for the in-batch finalized-state EXISTS guard R3's
-      // repair carries.
+      // Head release is the only legal repair. The repair UPDATE carries
+      // the lease guard (one writer per account+kind); every operation-
+      // record UPDATE guards state='running', so a terminal record cannot
+      // be updated, and prune — the only path that removes one — runs
+      // under this same lease; the head row is pinned by
+      // active_operation_id. The preceding readback proved state and
+      // revision.
       await this.#db.query(
         `UPDATE ${HEAD_TABLE}
           SET active_operation_id = NULL
           WHERE account_id = ? AND operation_kind = ?
             AND active_operation_id = ?
-            AND ${this.#leaseExists()}
+            AND ${LEASE_EXISTS_SQL}
           RETURNING account_id`,
         [
           this.#accountId,
@@ -1019,7 +1017,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
           SET payload = ?
           WHERE account_id = ? AND operation_id = ?
             AND row_kind = ? AND ordinal = ?
-            AND EXISTS (SELECT 1 ${this.#operationGuard()})
+            AND EXISTS (SELECT 1 ${OPERATION_GUARD_SQL})
           RETURNING row_kind, ordinal`,
         bindings: [
           bytes,
@@ -1038,7 +1036,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
             AND operation_kind = ?
             AND json_extract(op_record, '$.state') = 'running'
             AND json_extract(op_record, '$.progress.revision') = ?
-            AND ${this.#leaseExists()}
+            AND ${LEASE_EXISTS_SQL}
             ${exactRows}
           RETURNING operation_id`,
         bindings: [
@@ -1062,7 +1060,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
           SET active_operation_id = NULL
           WHERE account_id = ? AND operation_kind = ?
             AND active_operation_id = ?
-            AND ${this.#leaseExists()}
+            AND ${LEASE_EXISTS_SQL}
             AND EXISTS (SELECT 1 FROM ${OPERATION_TABLE}
               WHERE account_id = ? AND operation_id = ?
                 AND operation_kind = ?
@@ -1156,7 +1154,8 @@ export class D1FleetOperationStore implements FleetOperationStore {
     }>,
   ): Promise<Readonly<{ deleted: number; releasedPins: number }>> {
     assertLimit(input.limit);
-    if (input.kind === 'audit' && !this.#inventoryStore) {
+    const inventoryStore = this.#inventoryStore;
+    if (input.kind === 'audit' && inventoryStore === undefined) {
       throw new FleetOperationStoreCapabilityError();
     }
     return this.#withAccountOperationLeaseInternal(
@@ -1192,8 +1191,11 @@ export class D1FleetOperationStore implements FleetOperationStore {
             const record = fleetAuditOperationRecordFromUnknown(
               parseJson(rowString(candidate, 'op_record')),
             );
-            const inventoryStore = this
-              .#inventoryStore as FleetInventoryRunStore;
+            // tsc cannot narrow the captured store across the compound
+            // guard above, so this restates it rather than casting.
+            if (inventoryStore === undefined) {
+              throw new FleetOperationStoreCapabilityError();
+            }
             // Lock order is operation KIND lease outer, inventory ACCOUNT lease
             // inner, and is never acquired in reverse by production callers.
             await inventoryStore.releasePin({
@@ -1237,7 +1239,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
               AND latest.operation_kind = o.operation_kind
               AND json_extract(latest.op_record, '$.state') = 'finalized')
         ))
-      AND ${this.#leaseExists()}`;
+      AND ${LEASE_EXISTS_SQL}`;
     const guardBindings = [
       this.#accountId,
       operationId,
