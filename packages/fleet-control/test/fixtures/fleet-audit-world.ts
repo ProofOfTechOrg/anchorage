@@ -208,8 +208,28 @@ function cleanRoute(
   };
 }
 
+function bareDeployment(
+  overrides: Pick<
+    FleetInventoryDeployment,
+    'scriptName' | 'tenantTag' | 'artifactVersion'
+  > &
+    Partial<FleetInventoryDeployment>,
+): FleetInventoryDeployment {
+  return {
+    backend: 'plain-worker',
+    environment: ENVIRONMENT,
+    databaseIds: [],
+    durableObjectBindings: [],
+    secretNames: [],
+    plainTextBindings: {},
+    routeHostnames: [],
+    schemaVersion: 1,
+    ...overrides,
+  };
+}
+
 // ---------------------------------------------------------------------------
-// Records. Each comment cites the fleet.ts:line the record targets.
+// Records. Each targeting record's comment cites the fleet.ts:line it targets.
 // ---------------------------------------------------------------------------
 
 /** A fully healthy deployment: proves the audit does not false-positive. */
@@ -219,7 +239,7 @@ const control = baseRecord('control');
  * Two live `inventory.deployments` entries answer this record's one expected
  * script key -> fleet.ts:680 `duplicate-deployment` ("appears N times").
  */
-const livedup = baseRecord('livedup');
+const liveDup = baseRecord('livedup');
 
 /**
  * Two records share `scriptName` ("shared-record-script"), so both fall
@@ -228,8 +248,10 @@ const livedup = baseRecord('livedup');
  * phase `worker-deployed` (not `ready`) so it exits at the fleet.ts:965 gate
  * before any of the ready-only per-record checks can also fire.
  */
-const recdupA = baseRecord('recdupa', { scriptName: 'shared-record-script' });
-const recdupB = baseRecord('recdupb', {
+const recordDupA = baseRecord('recdupa', {
+  scriptName: 'shared-record-script',
+});
+const recordDupB = baseRecord('recdupb', {
   scriptName: 'shared-record-script',
   phase: 'worker-deployed',
 });
@@ -240,7 +262,7 @@ const recdupB = baseRecord('recdupb', {
  * one processed.
  */
 const SHARED_EXPECTED_NAMESPACE = 'ns-shared-expected';
-const dupexpnsA = baseRecord('dupexpnsa', {
+const namespaceDupA = baseRecord('dupexpnsa', {
   durableObjectBindings: [
     {
       name: 'RUNNER',
@@ -249,7 +271,7 @@ const dupexpnsA = baseRecord('dupexpnsa', {
     },
   ],
 });
-const dupexpnsB = baseRecord('dupexpnsb', {
+const namespaceDupB = baseRecord('dupexpnsb', {
   durableObjectBindings: [
     {
       name: 'RUNNER',
@@ -264,7 +286,7 @@ const dupexpnsB = baseRecord('dupexpnsb', {
  * `missing-namespace`.
  */
 const MISSING_EXPECTED_NAMESPACE = 'ns-missing-expected';
-const missingns = baseRecord('missingns', {
+const missingNamespace = baseRecord('missingns', {
   durableObjectBindings: [
     {
       name: 'RUNNER',
@@ -279,7 +301,7 @@ const missingns = baseRecord('missingns', {
  * ("claimed by more than one deployment"), for the second one processed.
  */
 const SHARED_BUCKET_CREATION_DATE = '2026-01-01T00:00:00.000Z';
-const r2dupA = baseRecord('r2dupa', {
+const bucketDupA = baseRecord('r2dupa', {
   applicationResources: [
     {
       name: 'EXPORTS',
@@ -291,7 +313,7 @@ const r2dupA = baseRecord('r2dupa', {
     },
   ],
 });
-const r2dupB = baseRecord('r2dupb', {
+const bucketDupB = baseRecord('r2dupb', {
   applicationResources: [
     {
       name: 'EXPORTS',
@@ -305,7 +327,7 @@ const r2dupB = baseRecord('r2dupb', {
 });
 
 /** Claims a bucket absent from `inventory.r2Buckets` -> fleet.ts:844 `missing-r2-bucket`. */
-const r2missing = baseRecord('r2missing', {
+const bucketMissing = baseRecord('r2missing', {
   applicationResources: [
     {
       name: 'EXPORTS',
@@ -323,7 +345,7 @@ const r2missing = baseRecord('r2missing', {
  * jurisdiction and creation date -> fleet.ts:854 `r2-bucket-drift` ("changed
  * its persisted creation identity").
  */
-const r2drift = baseRecord('r2drift', {
+const bucketDrift = baseRecord('r2drift', {
   applicationResources: [
     {
       name: 'EXPORTS',
@@ -473,7 +495,7 @@ const staleNotReady = baseRecord('stalenotready', {
  */
 const WFP_ACTIVE_PHYSICAL_NAME = 'wfp-release-active';
 const WFP_PENDING_PHYSICAL_NAME = 'wfp-release-pending';
-const wfpRelease: FleetRecord = baseRecord('wfprelease', {
+const wfpRelease = baseRecord('wfprelease', {
   backend: 'workers-for-platforms',
   scriptName: 'wfp-release-worker',
   phase: 'worker-deployed',
@@ -507,16 +529,16 @@ const wfpRelease: FleetRecord = baseRecord('wfprelease', {
 
 const AUDIT_WORLD_RECORDS: readonly FleetRecord[] = [
   control,
-  livedup,
-  recdupA,
-  recdupB,
-  dupexpnsA,
-  dupexpnsB,
-  missingns,
-  r2dupA,
-  r2dupB,
-  r2missing,
-  r2drift,
+  liveDup,
+  recordDupA,
+  recordDupB,
+  namespaceDupA,
+  namespaceDupB,
+  missingNamespace,
+  bucketDupA,
+  bucketDupB,
+  bucketMissing,
+  bucketDrift,
   missingDeploy,
   dbMismatch,
   bindingMismatch,
@@ -542,11 +564,11 @@ const AUDIT_WORLD_RECORDS: readonly FleetRecord[] = [
  * fixture, or a `platformResources` mismatch). This list ALSO governs the
  * namespace axis below: a member's own `durableObjectBindings` namespace ids
  * are folded into `fleetAuditWorldInventory()`'s `namespaceIds` (via the
- * flatMap in `fleetAuditWorldInventory`, minus `missingns` — see its
+ * flatMap in `fleetAuditWorldInventory`, minus `missingNamespace` — see its
  * exclusion there), so only a member's expected namespace stays "clean";
  * two further ids are whitelisted explicitly below.
  *
- * The seven non-members (`recdupB`, `missingDeploy`, `dbMismatch`,
+ * The seven non-members (`recordDupB`, `missingDeploy`, `dbMismatch`,
  * `bindingMismatch`, `routeBroken`, `staleNotReady`, `wfpRelease`) each
  * leak collateral on the axis their story doesn't isolate. Six of them
  * (all but `wfpRelease`, whose one expected namespace id is explicitly
@@ -559,15 +581,15 @@ const AUDIT_WORLD_RECORDS: readonly FleetRecord[] = [
  */
 const CLEANLY_INVENTORIED_RECORDS: readonly FleetRecord[] = [
   control,
-  livedup,
-  recdupA,
-  dupexpnsA,
-  dupexpnsB,
-  missingns,
-  r2dupA,
-  r2dupB,
-  r2missing,
-  r2drift,
+  liveDup,
+  recordDupA,
+  namespaceDupA,
+  namespaceDupB,
+  missingNamespace,
+  bucketDupA,
+  bucketDupB,
+  bucketMissing,
+  bucketDrift,
   routeDup,
   platformDrift,
   channelDrift,
@@ -593,14 +615,14 @@ function fleetAuditWorldInventory(): FleetResourceInventory {
   );
   const namespaceIds = [
     ...new Set([
-      // `missingns` is excluded here (but stays a CLEANLY_INVENTORIED_RECORDS
+      // `missingNamespace` is excluded here (but stays a CLEANLY_INVENTORIED_RECORDS
       // member for deployments/databaseIds/routes): its whole story is that
       // `MISSING_EXPECTED_NAMESPACE` is absent from fleet inventory
       // (fleet.ts:776), so folding its own expected namespace id into this
       // derivation — the opposite of its design — would silently launder it
       // into "present" and defeat the story.
       ...CLEANLY_INVENTORIED_RECORDS.filter(
-        (record) => record !== missingns,
+        (record) => record !== missingNamespace,
       ).flatMap((record) =>
         record.durableObjectBindings.map((binding) => binding.namespaceId),
       ),
@@ -622,35 +644,31 @@ function fleetAuditWorldInventory(): FleetResourceInventory {
   });
 
   // fleet.ts:647 — an unregistered live script with no owning record.
-  deployments.push({
-    backend: 'plain-worker',
-    scriptName: 'ghost-live-script',
-    tenantTag: 'ghost-live',
-    environment: ENVIRONMENT,
-    databaseIds: ['db-ghost-live'],
-    durableObjectBindings: [],
-    secretNames: [],
-    plainTextBindings: {},
-    routeHostnames: ['ghost-live.example.test'],
-    artifactVersion: 'v1',
-    schemaVersion: 1,
-  });
+  deployments.push(
+    bareDeployment({
+      scriptName: 'ghost-live-script',
+      tenantTag: 'ghost-live',
+      databaseIds: ['db-ghost-live'],
+      routeHostnames: ['ghost-live.example.test'],
+      artifactVersion: 'v1',
+    }),
+  );
 
-  // fleet.ts:680 — a second live entry answering `livedup`'s expected key.
+  // fleet.ts:680 — a second live entry answering `liveDup`'s expected key.
   // `routeHostnames: []` keeps this second entry from ALSO satisfying
   // fleet.ts:981-989's per-record route-ownership count, which only wants
   // exactly one owning live entry; two identical route claims would trip
   // fleet.ts:996 too.
   deployments.push(
-    cleanInventoryDeployment(livedup, {
+    cleanInventoryDeployment(liveDup, {
       tenantTag: 'livedup-ghost-owner',
       routeHostnames: [],
     }),
   );
 
   // fleet.ts:871 — the second `recdupb` claimant of `shared-record-script`
-  // is deliberately NOT added here: `recdupA`'s clean entry is the only live
-  // deployment under that script name, which is what makes `recdupB`'s own
+  // is deliberately NOT added here: `recordDupA`'s clean entry is the only live
+  // deployment under that script name, which is what makes `recordDupB`'s own
   // `recordsByScript` lookup see two RECORDS behind one live entry.
 
   // fleet.ts:697 — an unregistered database id.
@@ -672,7 +690,7 @@ function fleetAuditWorldInventory(): FleetResourceInventory {
   routes.push(cleanRoute(routeDup, { scriptName: 'route-dup-ghost-script' }));
 
   const r2Buckets: NonNullable<FleetResourceInventory['r2Buckets']> = [
-    // fleet.ts:811's second claimant (`r2dupB`) is deliberately NOT added
+    // fleet.ts:811's second claimant (`bucketDupB`) is deliberately NOT added
     // as its own live bucket: the single `shared-bucket` entry below is
     // what both records compete over.
     {
@@ -681,7 +699,7 @@ function fleetAuditWorldInventory(): FleetResourceInventory {
       creationDate: SHARED_BUCKET_CREATION_DATE,
     },
     // fleet.ts:854 — present, but under a different jurisdiction/creation
-    // date than `r2drift`'s persisted claim.
+    // date than `bucketDrift`'s persisted claim.
     {
       bucketName: 'bucket-drift',
       jurisdiction: 'eu',
@@ -742,23 +760,16 @@ function fleetAuditWorldInventory(): FleetResourceInventory {
 
   // fleet.ts:1146/:1224 — the one live deployment behind `platformDrift`'s
   // declared `stateWorker`, with wrong ownership metadata (no
-  // `resourceRole`, wrong `resourceGroupId`/`artifactVersion`) and a
-  // `databaseIds` count that can never equal 1's worth of the expected
-  // binding/database identity.
-  deployments.push({
-    backend: 'plain-worker',
-    scriptName: PLATFORM_STATE_SCRIPT_NAME,
-    tenantTag: platformDrift.tenantTag,
-    environment: ENVIRONMENT,
-    resourceGroupId: 'wrong-resource-group',
-    databaseIds: [],
-    durableObjectBindings: [],
-    secretNames: [],
-    plainTextBindings: {},
-    routeHostnames: [],
-    artifactVersion: 'state-v0-wrong',
-    schemaVersion: 1,
-  });
+  // `resourceRole`, wrong `resourceGroupId`/`artifactVersion`) and an empty
+  // `databaseIds` (fleet.ts:1224 expects exactly one matching entry).
+  deployments.push(
+    bareDeployment({
+      scriptName: PLATFORM_STATE_SCRIPT_NAME,
+      tenantTag: platformDrift.tenantTag,
+      resourceGroupId: 'wrong-resource-group',
+      artifactVersion: 'state-v0-wrong',
+    }),
+  );
   // No `scriptRegistrations` entry for the state-worker key: it is
   // `plain-worker`-backed, so fleet.ts:659-666's `registered` check is
   // unconditionally true for it regardless (`expected.backend !==
@@ -771,20 +782,14 @@ function fleetAuditWorldInventory(): FleetResourceInventory {
   // declared `egressProxy`. `options.inventory.hostRoutingKvId` is never
   // set in this world, so fleet.ts:1245's `!options.inventory.hostRoutingKvId`
   // disjunct alone guarantees the drift regardless of every other field.
-  deployments.push({
-    backend: 'plain-worker',
-    scriptName: PLATFORM_EGRESS_SCRIPT_NAME,
-    tenantTag: platformDrift.tenantTag,
-    environment: ENVIRONMENT,
-    resourceGroupId: 'wrong-resource-group',
-    databaseIds: [],
-    durableObjectBindings: [],
-    secretNames: [],
-    plainTextBindings: {},
-    routeHostnames: [],
-    artifactVersion: 'egress-v0-wrong',
-    schemaVersion: 1,
-  });
+  deployments.push(
+    bareDeployment({
+      scriptName: PLATFORM_EGRESS_SCRIPT_NAME,
+      tenantTag: platformDrift.tenantTag,
+      resourceGroupId: 'wrong-resource-group',
+      artifactVersion: 'egress-v0-wrong',
+    }),
+  );
 
   // fleet.ts:1091 — `channelDrift` is already in `CLEANLY_INVENTORIED_RECORDS`,
   // which gives it its ONE clean live deployment entry (`serviceBindings`
@@ -815,11 +820,10 @@ function fleetAuditWorldInventory(): FleetResourceInventory {
     },
   );
   deployments.push(
-    {
+    bareDeployment({
       backend: 'workers-for-platforms',
       scriptName: WFP_ACTIVE_PHYSICAL_NAME,
       tenantTag: wfpRelease.tenantTag,
-      environment: ENVIRONMENT,
       databaseIds: ['db-wfp-active-wrong'],
       durableObjectBindings: [
         {
@@ -828,25 +832,15 @@ function fleetAuditWorldInventory(): FleetResourceInventory {
           namespaceId: 'ns-wfp-active-live-wrong',
         },
       ],
-      secretNames: [],
-      plainTextBindings: {},
-      routeHostnames: [],
       artifactVersion: 'release-v1-wrong-live',
-      schemaVersion: 1,
-    },
-    {
+    }),
+    bareDeployment({
       backend: 'workers-for-platforms',
       scriptName: WFP_PENDING_PHYSICAL_NAME,
       tenantTag: wfpRelease.tenantTag,
-      environment: ENVIRONMENT,
       databaseIds: [wfpRelease.databaseId],
-      durableObjectBindings: [],
-      secretNames: [],
-      plainTextBindings: {},
-      routeHostnames: [],
       artifactVersion: 'release-v2-pending',
-      schemaVersion: 1,
-    },
+    }),
   );
 
   return {
@@ -894,16 +888,11 @@ export type AuditOpLogEntry =
 
 class RecordingFleetStore implements FleetStateStore {
   private readonly records = new Map<string, FleetRecord>();
-  /**
-   * Fence violations recorded across the write-path clock fence below and
-   * the `RecordingBackend` credential-delivery pins, which share this same
-   * array — see the post-run throw in `runFleetAuditBaseline`.
-   */
-  readonly fenceViolations: string[] = [];
 
   constructor(
     records: readonly FleetRecord[],
     private readonly ops: AuditOpLogEntry[],
+    private readonly fenceViolations: string[],
   ) {
     for (const record of records) {
       this.records.set(`${record.tenantTag}:${record.environment}`, record);
@@ -937,10 +926,10 @@ class RecordingFleetStore implements FleetStateStore {
         // `auditFleetDrift` (fleet.ts:1392-1399 swallows it — fail-soft by
         // design), same as the credential-delivery pins in
         // `RecordingBackend.ensureMaintenance`/`inspect` below, which record
-        // into this same `fenceViolations` array; `runFleetAuditBaseline`'s
-        // post-run throw — a fresh Error aggregating the recorded
-        // fence-violation messages — is what makes the recorder and golden
-        // test fail loudly instead.
+        // into `fenceViolations` too; `runFleetAuditBaseline`'s post-run
+        // throw — a fresh Error aggregating the recorded fence-violation
+        // messages — is what makes the recorder and golden test fail loudly
+        // instead.
         if (record.updatedAt !== new Date(AUDIT_NOW).toISOString()) {
           const message = `re-arm put payload updatedAt '${record.updatedAt}' does not match the authority clock`;
           this.fenceViolations.push(message);
@@ -985,10 +974,9 @@ class RecordingFleetStore implements FleetStateStore {
 }
 
 class RecordingBackend implements ProvisioningBackend {
-  readonly kind: ProvisioningBackendKind;
+  readonly kind: ProvisioningBackendKind = 'plain-worker';
 
   constructor(
-    kind: ProvisioningBackendKind,
     private readonly ops: AuditOpLogEntry[],
     private readonly liveByTenant: ReadonlyMap<
       string,
@@ -996,9 +984,7 @@ class RecordingBackend implements ProvisioningBackend {
     >,
     private readonly ensureMaintenanceThrowTenants: ReadonlySet<string>,
     private readonly fenceViolations: string[],
-  ) {
-    this.kind = kind;
-  }
+  ) {}
 
   async findDatabase(): Promise<DatabaseReference | undefined> {
     throw new Error('unused');
@@ -1114,21 +1100,23 @@ class RecordingBackend implements ProvisioningBackend {
  * Every record reached through `backend.inspect()` gets a clean, matching
  * live deployment EXCEPT the records whose story is specifically about
  * inspect-time drift (`inspectAbsent` returns `undefined`; `maintStale` and
- * `rearmFail` report unarmed maintenance).
+ * `rearmFail` report unarmed maintenance). `missingDeploy` is absent from
+ * this map too, but never reaches `inspect` at all: fleet.ts:966's
+ * `if (!inventoryDeployment) continue;` exits its iteration before that.
  */
 function inspectResultsByTenant(): Map<string, LiveDeployment | undefined> {
   const live = new Map<string, LiveDeployment | undefined>();
   for (const record of [
     control,
-    livedup,
-    recdupA,
-    dupexpnsA,
-    dupexpnsB,
-    missingns,
-    r2dupA,
-    r2dupB,
-    r2missing,
-    r2drift,
+    liveDup,
+    recordDupA,
+    namespaceDupA,
+    namespaceDupB,
+    missingNamespace,
+    bucketDupA,
+    bucketDupB,
+    bucketMissing,
+    bucketDrift,
     dbMismatch,
     bindingMismatch,
     routeBroken,
@@ -1137,14 +1125,10 @@ function inspectResultsByTenant(): Map<string, LiveDeployment | undefined> {
   ]) {
     live.set(record.tenantTag, cleanLiveDeployment(record));
   }
-  live.set(
-    platformDrift.tenantTag,
-    cleanLiveDeployment(platformDrift, {
-      // The record's OWN worker inspects clean; only the declared
-      // `platformResources.stateWorker` (a separate live deployment entry
-      // in `inventory.deployments`) carries the drift.
-    }),
-  );
+  // The record's OWN worker inspects clean; only the declared
+  // `platformResources.stateWorker` (a separate live deployment entry
+  // in `inventory.deployments`) carries the drift.
+  live.set(platformDrift.tenantTag, cleanLiveDeployment(platformDrift));
   live.set(inspectAbsent.tenantTag, undefined);
   live.set(
     maintStale.tenantTag,
@@ -1163,13 +1147,17 @@ export async function runFleetAuditBaseline(): Promise<{
   readonly ops: readonly AuditOpLogEntry[];
 }> {
   const ops: AuditOpLogEntry[] = [];
-  const store = new RecordingFleetStore(AUDIT_WORLD_RECORDS, ops);
+  const fenceViolations: string[] = [];
+  const store = new RecordingFleetStore(
+    AUDIT_WORLD_RECORDS,
+    ops,
+    fenceViolations,
+  );
   const backend = new RecordingBackend(
-    'plain-worker',
     ops,
     inspectResultsByTenant(),
     new Set([rearmFail.tenantTag]),
-    store.fenceViolations,
+    fenceViolations,
   );
   const specByTenant = new Map<string, DeploymentSpec>(
     AUDIT_WORLD_RECORDS.map((record) => [
@@ -1212,8 +1200,8 @@ export async function runFleetAuditBaseline(): Promise<{
     now: AUDIT_NOW,
   });
 
-  if (store.fenceViolations.length > 0) {
-    throw new Error(`fence violated: ${store.fenceViolations.join('; ')}`);
+  if (fenceViolations.length > 0) {
+    throw new Error(`fence violated: ${fenceViolations.join('; ')}`);
   }
 
   return { findings, ops };

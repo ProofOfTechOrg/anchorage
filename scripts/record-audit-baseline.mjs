@@ -264,12 +264,9 @@ function structuralDifferences(committed, derived, path, differences) {
 }
 
 function summary(baseline) {
-  const kindCounts = new Map();
-  for (const finding of baseline.findings) {
-    kindCounts.set(finding.kind, (kindCounts.get(finding.kind) ?? 0) + 1);
-  }
+  const distinctKinds = new Set(baseline.findings.map((f) => f.kind)).size;
   return (
-    `${baseline.findings.length} findings (${kindCounts.size} distinct kinds), ` +
+    `${baseline.findings.length} findings (${distinctKinds} distinct kinds), ` +
     `${baseline.ops.length} ops`
   );
 }
