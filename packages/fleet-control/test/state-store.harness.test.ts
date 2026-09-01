@@ -1524,4 +1524,168 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
     });
     expect(result.generation).toBe(1);
   });
+
+  it('operation-start atomicity', async () => {
+    await expect(
+      probe<{
+        started: number;
+        rejected: number;
+        activeOperationId: string | null;
+        operations: number;
+      }>('operation-start-atomicity'),
+    ).resolves.toEqual({
+      started: 1,
+      rejected: 15,
+      activeOperationId: '123e4567-e89b-42d3-a456-426614174300',
+      operations: 1,
+    });
+  });
+
+  it('commit concurrency (losers land zero rows; winner replay converges without a second revision advance)', async () => {
+    const result = await probe<{
+      winners: number;
+      losers: number;
+      rowOrdinals: number[];
+      replayRevision: number;
+      noSecondAdvance: boolean;
+    }>('operation-commit-concurrency');
+    expect(result.winners).toBe(1);
+    expect(result.losers).toBe(15);
+    expect(result.rowOrdinals).toHaveLength(1);
+    expect(result.replayRevision).toBe(1);
+    expect(result.noSecondAdvance).toBe(true);
+  });
+
+  it('finalize convergence', async () => {
+    await expect(
+      probe<{
+        identical: boolean;
+        revision: number;
+        terminalAtMs: number;
+        activeOperationId: string | null;
+      }>('operation-finalize-convergence'),
+    ).resolves.toEqual({
+      identical: true,
+      revision: 1,
+      terminalAtMs: expect.any(Number),
+      activeOperationId: null,
+    });
+  });
+
+  it('rows-page readback', async () => {
+    await expect(
+      probe<{
+        first: number[];
+        firstDone: boolean;
+        second: number[];
+        secondDone: boolean;
+      }>('operation-rows-readback'),
+    ).resolves.toEqual({
+      first: [0, 1],
+      firstDone: false,
+      second: [2],
+      secondDone: true,
+    });
+  });
+
+  it('corrupt payload unreadable', async () => {
+    await expect(
+      probe<ProbeError>('operation-corrupt-unreadable'),
+    ).resolves.toEqual({
+      name: 'FleetOperationStateError',
+      message: 'fleet operation state is malformed',
+    });
+  });
+
+  it('prune order + protected set', async () => {
+    const result = await probe<{
+      pruned: { deleted: number; releasedPins: number };
+      remaining: string[];
+    }>('operation-prune-order');
+    expect(result.pruned).toEqual({ deleted: 1, releasedPins: 0 });
+    expect(result.remaining).toEqual([
+      '123e4567-e89b-42d3-a456-426614174311',
+      '123e4567-e89b-42d3-a456-426614174312',
+      '123e4567-e89b-42d3-a456-426614174313',
+    ]);
+  });
+
+  it('per-kind lease independence + lifecycle at controlled times', async () => {
+    await expect(
+      probe<{
+        takeover: string;
+        heartbeatObserved: boolean;
+        contenderRejected: boolean;
+        leasesAfterRelease: number;
+      }>('operation-lease-lifecycle'),
+    ).resolves.toEqual({
+      takeover: 'independent',
+      heartbeatObserved: true,
+      contenderRejected: true,
+      leasesAfterRelease: 0,
+    });
+  }, 30_000);
+
+  it('four-table cold+concurrent schema init', async () => {
+    await server.reset();
+    worker = server.getWorker();
+    const result = await probe<{
+      absent: number;
+      columns: Record<string, string[]>;
+      tables: string[];
+    }>('operation-cold-concurrent-schema');
+    expect(result.absent).toBe(16);
+    expect(result.tables).toEqual([
+      'anchorage_fleet_operation_heads',
+      'anchorage_fleet_operation_leases',
+      'anchorage_fleet_operation_rows',
+      'anchorage_fleet_operations',
+    ]);
+    expect(result.columns).toEqual({
+      anchorage_fleet_operation_leases: [
+        'account_id:TEXT',
+        'operation_kind:TEXT',
+        'owner_token:TEXT',
+        'expires_at:INTEGER',
+      ],
+      anchorage_fleet_operation_heads: [
+        'account_id:TEXT',
+        'operation_kind:TEXT',
+        'active_operation_id:TEXT',
+      ],
+      anchorage_fleet_operations: [
+        'account_id:TEXT',
+        'operation_id:TEXT',
+        'operation_kind:TEXT',
+        'intake_digest:TEXT',
+        'op_record:TEXT',
+        'created_at_ms:INTEGER',
+        'terminal_at_ms:INTEGER',
+      ],
+      anchorage_fleet_operation_rows: [
+        'account_id:TEXT',
+        'operation_id:TEXT',
+        'row_kind:TEXT',
+        'ordinal:INTEGER',
+        'payload:TEXT',
+      ],
+    });
+  });
+
+  it('two-account same-UUID isolation', async () => {
+    await expect(
+      probe<Array<{ account_id: string; operation_id: string }>>(
+        'operation-two-account-isolation',
+      ),
+    ).resolves.toEqual([
+      {
+        account_id: 'operation-account-one',
+        operation_id: '123e4567-e89b-42d3-a456-426614174330',
+      },
+      {
+        account_id: 'operation-account-two',
+        operation_id: '123e4567-e89b-42d3-a456-426614174330',
+      },
+    ]);
+  });
 });
