@@ -65,6 +65,7 @@ export {
   CloudflareProvisioningClient,
   type ControlWorkerInspection,
   type ControlWorkerSpec,
+  cloudflareFleetInventoryContext,
   type DurableDatabaseExportStore,
   type OrdinaryWorkerFootprint,
   type PlainWorkerCloudflareClientOptions,
@@ -75,6 +76,7 @@ export {
   type D1CloudflareApiRateCoordinatorOptions,
   ProcessLocalCloudflareApiRateCoordinator,
 } from './cloudflare-rate-coordinator.js';
+export { D1FleetInventoryRunStore } from './d1-fleet-inventory-run-store.js';
 export {
   type AdvanceDecommissionDeploymentOptions,
   advanceDecommissionDeployment,
@@ -99,6 +101,27 @@ export {
   migrateFleet,
   rollbackExternalRelease,
 } from './fleet.js';
+export {
+  type AdvanceFleetInventoryOptions,
+  advanceFleetInventory,
+  type FleetInventoryAdvanceAction,
+  type FleetInventoryAdvanceCapability,
+  FleetInventoryAdvanceCapabilityError,
+  type FleetInventoryAdvanceResult,
+  readFleetInventoryGeneration,
+} from './fleet-inventory-advance.js';
+export {
+  type CollectFleetInventoryOptions,
+  type FleetInventoryGenerationRef,
+  type FleetInventoryLease,
+  type FleetInventoryProviderContext,
+  type FleetInventoryRunOptions,
+  type FleetInventoryRunStore,
+  type FleetInventoryRunToken,
+  FleetInventoryRunTokenError,
+  FleetInventoryRunTokenFutureError,
+  FleetInventoryRunTokenOperationError,
+} from './fleet-inventory-state.js';
 export type { HostRoutingTarget } from './host-routing.js';
 export {
   PlainWorkerBackend,

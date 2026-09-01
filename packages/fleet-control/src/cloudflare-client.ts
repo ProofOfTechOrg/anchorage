@@ -13,6 +13,12 @@ import {
   inventoryBoundExceeded,
 } from './cloudflare-client-config.js';
 import {
+  advanceCloudflareFleetInventoryStage,
+  type CloudflareFleetInventoryDeps,
+  type FleetInventoryOrdinaryScriptDetail,
+  type FleetInventoryProviderBinding,
+} from './cloudflare-fleet-inventory.js';
+import {
   attachCustomDomain,
   type CloudflareSdk,
   deleteOrdinaryWorkerScript,
@@ -49,7 +55,6 @@ import {
   advanceWorkerAttachmentScan,
   CloudflareAttachmentScanDriftError,
   type CloudflareWorkerAttachmentScanContext,
-  listAllDispatchScripts,
   listAllWorkerAttachments,
   type WorkerAttachmentScanChunk,
   type WorkerAttachmentScanInput,
@@ -62,11 +67,19 @@ import {
   isDatabaseExportReceiptError,
 } from './database-export-store.js';
 import {
-  type HostRoutingTarget,
-  parseHostRoutingTarget,
-} from './host-routing.js';
+  advanceFleetInventoryProgress,
+  type CollectFleetInventoryOptions,
+  canonicalFleetInventoryRunOptions,
+  type FleetInventoryProviderContext,
+  type FleetInventoryStagedFact,
+  type FleetInventoryStagedRow,
+  type FleetInventoryStageResult,
+  initialFleetInventoryProgress,
+  initialFleetInventoryStage,
+  materializeFleetInventoryGeneration,
+} from './fleet-inventory-state.js';
+import type { HostRoutingTarget } from './host-routing.js';
 import {
-  canonicalDeploymentEgressPolicy,
   externalPlatformResourceGroupId,
   externalStateScriptName,
   FLEET_AUDIT_PROXY_BINDING,
@@ -107,6 +120,16 @@ const AUDIT_CONSUMER_SETTINGS = Object.freeze({
   max_wait_time_ms: 5_000,
 });
 const SDK_TRANSPORT_TIMEOUT_MS = 2_147_483_647;
+/** The single in-memory drain reads one generation that is never persisted. */
+const DRAIN_GENERATION = 1;
+/**
+ * The in-memory drain runs each stage to completion, so it hands every chunk
+ * the largest budget the shared 9..1,000 provider-request contract allows.
+ */
+const DRAIN_PROVIDER_REQUEST_BUDGET = 1_000;
+const R2_INVENTORY_PAGE_SIZE = 1_000;
+const DRAIN_INSPECT_SUFFIX = ' could not be inspected';
+const DRAIN_INVENTORY_SUFFIX = ' could not be inventoried';
 const STRUCTURED_CLONE = structuredClone;
 const UTF8_ENCODER = new TextEncoder();
 const MAX_DURABLE_OBJECT_NAMESPACE_ID_BYTES = 4_096;
@@ -250,10 +273,6 @@ export type { OrdinaryWorkerFootprint } from './cloudflare-ordinary-worker-opera
 
 const SCRIPT_INVENTORY_PREFIX = '__anchorage_script__:';
 const FLEET_SCRIPT_TAG = 'fleet:anchorage';
-
-function tagValue(tags: readonly string[], prefix: string): string | undefined {
-  return tags.find((tag) => tag.startsWith(prefix))?.slice(prefix.length);
-}
 
 /** @inline */
 type PreparedOrdinaryWorkerUpload = OperationsPreparedOrdinaryWorkerUpload;
@@ -446,6 +465,44 @@ let scanProviderAttachments: (
   input: WorkerAttachmentScanInput,
 ) => Promise<WorkerAttachmentScanChunk>;
 
+let buildFleetInventoryContext: (
+  client: CloudflareProvisioningClient,
+) => FleetInventoryProviderContext;
+
+/**
+ * Restores the two provider-error details the durable engine deliberately
+ * sanitizes. The chunk's call-local diagnostics carry the transient text, so
+ * the in-memory drain composes today's exact bytes without the engine ever
+ * staging them.
+ */
+function drainFindingRows(
+  result: FleetInventoryStageResult,
+): readonly FleetInventoryStagedRow[] {
+  if (result.diagnostics.length === 0) return result.rows;
+  const remaining = [...result.diagnostics];
+  return result.rows.map((row) => {
+    const detail = row.payload.detail;
+    if (row.kind !== 'finding' || typeof detail !== 'string') return row;
+    const label = detail.endsWith(DRAIN_INSPECT_SUFFIX)
+      ? detail.slice(0, -DRAIN_INSPECT_SUFFIX.length)
+      : detail.endsWith(DRAIN_INVENTORY_SUFFIX)
+        ? detail.slice(0, -DRAIN_INVENTORY_SUFFIX.length)
+        : undefined;
+    if (label === undefined) return row;
+    const prefix = `${label}: `;
+    const index = remaining.findIndex((entry) => entry.startsWith(prefix));
+    const diagnostic = index < 0 ? undefined : remaining.splice(index, 1)[0];
+    if (diagnostic === undefined) return row;
+    return {
+      ...row,
+      payload: {
+        ...row.payload,
+        detail: `${detail}: ${diagnostic.slice(prefix.length)}`,
+      },
+    };
+  });
+}
+
 /**
  * Runs `operation`; rejects with
  * `CloudflareProviderRequestNotDispatchedError` (`cause` = the failure) when it
@@ -467,6 +524,17 @@ export function advanceCloudflareWorkerAttachmentScan(
   input: WorkerAttachmentScanInput,
 ): Promise<WorkerAttachmentScanChunk> {
   return scanProviderAttachments(client, input);
+}
+
+/**
+ * @internal Package-private provider seam for the bounded account inventory
+ * coordinator. Each context memoizes its provider listings, so one context
+ * serves one bounded run or one in-memory drain.
+ */
+export function cloudflareFleetInventoryContext(
+  client: CloudflareProvisioningClient,
+): FleetInventoryProviderContext {
+  return buildFleetInventoryContext(client);
 }
 
 /** @internal Package-private conversion for the bounded lifecycle provider. */
@@ -566,6 +634,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       client.#trackDispatch(operation);
     scanProviderAttachments = (client, input) =>
       advanceWorkerAttachmentScan(client.#attachmentScan, input);
+    buildFleetInventoryContext = (client) => client.#fleetInventoryContext();
   }
 
   constructor(
@@ -1053,12 +1122,6 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     return listOrdinaryWorkerSecretNames(this.#ordinary, scriptName);
   }
 
-  async #dispatchScripts(
-    dispatchNamespace: string,
-  ): Promise<readonly Readonly<{ id: string; tags: readonly string[] }>[]> {
-    return listAllDispatchScripts(this.#attachmentScan, dispatchNamespace);
-  }
-
   async listOrdinaryWorkerDatabases(
     filter?: Readonly<{ name?: string }>,
   ): Promise<readonly PlainWorkerDatabaseInventoryEntry[]> {
@@ -1383,741 +1446,280 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     });
   }
 
-  async collectFleetInventory(options: {
-    readonly hostRoutingKvId?: string;
-    readonly databaseNamePrefix: string;
-    readonly scriptNamePrefix: string;
-    readonly includeDispatchNamespace?: boolean;
-    readonly includeR2Buckets?: boolean;
-  }): Promise<FleetResourceInventory> {
+  /**
+   * Drains the bounded account inventory engine in memory: one stage chunk per
+   * iteration over a call-local accumulator, with no durable run, no
+   * continuation token, and no account lease. Observable behavior — provider
+   * encounter order, finding vocabulary, finding order, and result bytes — is
+   * unchanged and pinned by the frozen golden baseline.
+   */
+  async collectFleetInventory(
+    options: CollectFleetInventoryOptions,
+  ): Promise<FleetResourceInventory> {
     if (!options.databaseNamePrefix || !options.scriptNamePrefix) {
       throw new Error(
         'databaseNamePrefix and scriptNamePrefix are required for fleet inventory',
       );
     }
-    const findings: FleetResourceInventory['findings'][number][] = [];
-    const registrations: Array<
-      ScriptInventoryTarget & { readonly keyOwned: boolean }
-    > = [];
-    const routes: FleetResourceInventory['routes'][number][] = [];
-    if (options.hostRoutingKvId) {
-      for await (const key of this.#collectBounded(
-        this.#client.kv.namespaces.keys.list(options.hostRoutingKvId, {
-          account_id: this.#accountId,
+    const runOptions = canonicalFleetInventoryRunOptions(options);
+    const context = this.#fleetInventoryContext();
+    const rows: FleetInventoryStagedRow[] = [];
+    const facts: FleetInventoryStagedFact[] = [];
+    let progress = initialFleetInventoryProgress(
+      initialFleetInventoryStage(runOptions),
+      DRAIN_GENERATION,
+    );
+    while (progress.stage.step !== 'finalize') {
+      const executed = progress.stage;
+      const result = await context.advanceStage({
+        stage: executed,
+        options: runOptions,
+        progress,
+        maxProviderRequests: DRAIN_PROVIDER_REQUEST_BUDGET,
+      });
+      rows.push(...drainFindingRows(result));
+      facts.push(...result.facts);
+      progress = advanceFleetInventoryProgress(progress, executed, result);
+    }
+    return materializeFleetInventoryGeneration({
+      rows,
+      facts,
+      options: runOptions,
+    });
+  }
+
+  /**
+   * Builds the narrow provider seam the bounded inventory engine drives. Stages
+   * are stateless and re-read their prerequisites, so every listing is memoized
+   * for the lifetime of ONE context; without that the in-memory drain would
+   * repeat provider requests the frozen baseline pins.
+   */
+  #fleetInventoryDeps(): CloudflareFleetInventoryDeps {
+    const pending = new Map<string, Promise<unknown>>();
+    /** Caches one provider listing for the lifetime of a single context, which
+     * is one bounded run or one `collectFleetInventory` call. */
+    const memoizePerContext = <Value>(
+      key: string,
+      compute: () => Promise<Value>,
+    ): Promise<Value> => {
+      const existing = pending.get(key);
+      if (existing !== undefined) return existing as Promise<Value>;
+      const started = compute();
+      pending.set(key, started);
+      return started;
+    };
+    const dispatchPages = new Map<string, Response>();
+    const attachmentScan: CloudflareWorkerAttachmentScanContext = {
+      ...this.#attachmentScan,
+      requestDispatchScriptPage: async (input) => {
+        const key = `${input.namespace}\u0000${input.cursor ?? ''}\u0000${input.perPage}`;
+        const cached = dispatchPages.get(key);
+        if (cached !== undefined) return cached.clone();
+        const response =
+          await this.#attachmentScan.requestDispatchScriptPage(input);
+        // Only a successful page is reusable; a 429 or 5xx must still reach the
+        // provider again so the shared retry contract keeps its parity.
+        if (response.ok) dispatchPages.set(key, response.clone());
+        return response;
+      },
+    };
+    return {
+      attachmentScan,
+      dispatchNamespace: () =>
+        this.#requireDispatchNamespace('collectFleetInventory'),
+      isDispatchCapabilityError: (error) =>
+        error instanceof CloudflarePlaneCapabilityError,
+      listHostRoutingKeys: async ({ namespaceId }) =>
+        memoizePerContext(`kv-keys:${namespaceId}`, async () => {
+          const keys: { name?: string }[] = [];
+          for await (const key of this.#collectBounded(
+            this.#client.kv.namespaces.keys.list(namespaceId, {
+              account_id: this.#accountId,
+            }),
+            'host-routing KV key inventory',
+          )) {
+            keys.push({
+              ...(key.name === undefined ? {} : { name: key.name }),
+            });
+          }
+          return { keys };
         }),
-        'host-routing KV key inventory',
-      )) {
-        if (!key.name) continue;
-        const isRegistration = key.name.startsWith(SCRIPT_INVENTORY_PREFIX);
-        const registeredName = isRegistration
-          ? key.name.slice(SCRIPT_INVENTORY_PREFIX.length)
-          : undefined;
-        const serialized = await this.#readHostRouting(
-          options.hostRoutingKvId,
-          key.name,
-        );
-        if (serialized === undefined) {
-          findings.push({
-            tenantTag: 'unknown',
-            environment: 'unknown',
-            kind: isRegistration ? 'stale-script-registration' : 'stale-route',
-            detail: `fleet inventory key '${key.name}' disappeared while it was being read`,
-          });
-          continue;
-        }
-        let value: unknown;
-        try {
-          value = JSON.parse(serialized);
-        } catch {
-          findings.push({
-            tenantTag: 'unknown',
-            environment: 'unknown',
-            kind: isRegistration
-              ? 'malformed-script-registration'
-              : 'malformed-route',
-            detail: `fleet inventory key '${key.name}' is not valid JSON`,
-          });
-          continue;
-        }
-        if (!value || typeof value !== 'object') {
-          findings.push({
-            tenantTag: 'unknown',
-            environment: 'unknown',
-            kind: isRegistration
-              ? 'malformed-script-registration'
-              : 'malformed-route',
-            detail: `fleet inventory key '${key.name}' is not an object`,
-          });
-          continue;
-        }
-        const candidate = value as Record<string, unknown>;
-        if (isRegistration) {
-          if (
-            typeof candidate.scriptName !== 'string' ||
-            typeof candidate.tenantTag !== 'string' ||
-            typeof candidate.environment !== 'string' ||
-            typeof candidate.databaseId !== 'string' ||
-            typeof candidate.routeHostname !== 'string'
-          ) {
-            findings.push({
-              tenantTag:
-                typeof candidate.tenantTag === 'string'
-                  ? candidate.tenantTag
-                  : 'unknown',
-              environment:
-                typeof candidate.environment === 'string'
-                  ? candidate.environment
-                  : 'unknown',
-              kind: 'malformed-script-registration',
-              detail: `script inventory key '${key.name}' has incomplete ownership metadata`,
-            });
-            continue;
-          }
-          if (
-            !candidate.scriptName.startsWith(options.scriptNamePrefix) &&
-            !registeredName?.startsWith(options.scriptNamePrefix)
-          ) {
-            continue;
-          }
-          const keyOwned = registeredName === candidate.scriptName;
-          registrations.push({
-            scriptName: candidate.scriptName,
-            tenantTag: candidate.tenantTag,
-            environment: candidate.environment,
-            databaseId: candidate.databaseId,
-            routeHostname: candidate.routeHostname,
-            keyOwned,
-          });
-          if (!keyOwned) {
-            findings.push({
-              tenantTag: candidate.tenantTag,
-              environment: candidate.environment,
-              kind: 'stale-script-registration',
-              detail: `script inventory key '${key.name}' claims '${candidate.scriptName}'`,
-            });
-          }
-          continue;
-        }
-        if (
-          typeof candidate.scriptName !== 'string' ||
-          typeof candidate.tenantTag !== 'string' ||
-          typeof candidate.environment !== 'string' ||
-          typeof candidate.policyId !== 'string' ||
-          typeof candidate.policyDigest !== 'string' ||
-          !Array.isArray(candidate.policyHosts) ||
-          candidate.policyHosts.some((host) => typeof host !== 'string')
-        ) {
-          findings.push({
-            tenantTag:
-              typeof candidate.tenantTag === 'string'
-                ? candidate.tenantTag
-                : 'unknown',
-            environment:
-              typeof candidate.environment === 'string'
-                ? candidate.environment
-                : 'unknown',
-            kind: 'malformed-route',
-            detail: `host route '${key.name}' has incomplete ownership metadata`,
-          });
-          continue;
-        }
-        let policy: ReturnType<typeof canonicalDeploymentEgressPolicy>;
-        try {
-          policy = canonicalDeploymentEgressPolicy({
-            policyId: candidate.policyId,
-            tenantTag: candidate.tenantTag,
-            environment: candidate.environment,
-            allowedHosts: candidate.policyHosts as string[],
-          });
-        } catch {
-          findings.push({
-            tenantTag: candidate.tenantTag,
-            environment: candidate.environment,
-            kind: 'malformed-route',
-            detail: `host route '${key.name}' has invalid policy metadata`,
-          });
-          continue;
-        }
-        if (
-          candidate.policyDigest !== policy.policyDigest ||
-          JSON.stringify(candidate.policyHosts) !==
-            JSON.stringify(policy.policyHosts)
-        ) {
-          findings.push({
-            tenantTag: candidate.tenantTag,
-            environment: candidate.environment,
-            kind: 'malformed-route',
-            detail: `host route '${key.name}' has inconsistent policy metadata`,
-          });
-          continue;
-        }
-        let stateEgress: HostRoutingTarget['stateEgress'];
-        try {
-          stateEgress = (await parseHostRoutingTarget(serialized)).stateEgress;
-        } catch {
-          findings.push({
-            tenantTag: candidate.tenantTag,
-            environment: candidate.environment,
-            kind: 'malformed-route',
-            detail: `host route '${key.name}' has invalid state-egress metadata`,
-          });
-          continue;
-        }
-        if (!candidate.scriptName.startsWith(options.scriptNamePrefix))
-          continue;
-        routes.push({
-          backend: 'workers-for-platforms',
-          surface: 'host-registry',
-          hostname: key.name,
-          scriptName: candidate.scriptName,
-          tenantTag: candidate.tenantTag,
-          environment: candidate.environment,
-          ...policy,
-          ...(stateEgress ? { stateEgress } : {}),
-        });
-      }
-    }
-
-    const includeDispatchNamespace =
-      options.includeDispatchNamespace ?? options.hostRoutingKvId !== undefined;
-    const dispatchScripts = includeDispatchNamespace
-      ? await this.#dispatchScripts(
-          this.#requireDispatchNamespace('collectFleetInventory'),
-        )
-      : [];
-    const dispatchScriptsByName = new Map(
-      dispatchScripts.map((script) => [script.id, script]),
-    );
-    const deployments: FleetResourceInventory['deployments'][number][] = [];
-    for (const registration of registrations) {
-      const listed = dispatchScriptsByName.get(registration.scriptName);
-      if (includeDispatchNamespace && !listed) {
-        findings.push({
-          tenantTag: registration.tenantTag,
-          environment: registration.environment,
-          kind: 'stale-script-registration',
-          detail: `registered script '${registration.scriptName}' is absent from the dispatch namespace listing`,
-        });
-      }
-      if (
-        includeDispatchNamespace &&
-        listed &&
-        (!listed.tags.includes(FLEET_SCRIPT_TAG) ||
-          tagValue(listed.tags, 'tenant:') !== registration.tenantTag ||
-          tagValue(listed.tags, 'environment:') !== registration.environment)
-      ) {
-        findings.push({
-          tenantTag: registration.tenantTag,
-          environment: registration.environment,
-          kind: 'stale-script-registration',
-          detail: `registered script '${registration.scriptName}' does not match its live fleet tags`,
-        });
-      }
-      let live: Awaited<ReturnType<typeof this.inspectDispatchWorker>>;
-      try {
-        live = await this.inspectDispatchWorker(registration.scriptName);
-      } catch (error) {
-        if (error instanceof CloudflarePlaneCapabilityError) throw error;
-        findings.push({
-          tenantTag: registration.tenantTag,
-          environment: registration.environment,
-          kind: 'stale-script-registration',
-          detail: `registered script '${registration.scriptName}' could not be inspected: ${String(error)}`,
-        });
-        continue;
-      }
-      if (!live) {
-        findings.push({
-          tenantTag: registration.tenantTag,
-          environment: registration.environment,
-          kind: 'stale-script-registration',
-          detail: `registered script '${registration.scriptName}' is missing`,
-        });
-        continue;
-      }
-      deployments.push({
-        backend: 'workers-for-platforms',
-        scriptName: registration.scriptName,
-        tenantTag: live.tenantTag,
-        environment: live.environment,
-        databaseIds: live.databaseIds,
-        durableObjectBindings: live.durableObjectBindings,
-        serviceBindings: live.serviceBindings,
-        queueProducerBindings: live.queueProducerBindings,
-        r2BucketBindings: live.r2BucketBindings,
-        plainTextBindings: live.plainTextBindings,
-        secretNames: live.secretNames,
-        routeHostnames: routes
-          .filter(
-            (route) =>
-              route.backend === 'workers-for-platforms' &&
-              route.scriptName === registration.scriptName,
-          )
-          .map((route) => route.hostname),
-        artifactVersion: live.artifactVersion,
-        desiredSpecDigest: live.desiredSpecDigest,
-        schemaVersion: live.schemaVersion,
-      });
-      const ownerMatches =
-        registration.keyOwned &&
-        live.tenantTag === registration.tenantTag &&
-        live.environment === registration.environment &&
-        live.databaseIds.length === 1 &&
-        live.databaseIds[0] === registration.databaseId;
-      if (!ownerMatches && registration.keyOwned) {
-        findings.push({
-          tenantTag: registration.tenantTag,
-          environment: registration.environment,
-          kind: 'stale-script-registration',
-          detail: `registered script '${registration.scriptName}' does not match its live tenant, environment, or database ownership`,
-        });
-      }
-    }
-    const registrationByScript = new Map(
-      registrations.map((registration) => [
-        registration.scriptName,
-        registration,
-      ]),
-    );
-    for (const script of dispatchScripts) {
-      const registration = registrationByScript.get(script.id);
-      if (registration?.keyOwned) continue;
-      findings.push({
-        tenantTag: tagValue(script.tags, 'tenant:') ?? 'unknown',
-        environment: tagValue(script.tags, 'environment:') ?? 'unknown',
-        kind: 'unknown-dispatch-scripts',
-        detail: `dispatch script '${script.id}' has no valid owner-checked registry entry`,
-      });
-    }
-    for (const route of routes) {
-      if (route.backend !== 'workers-for-platforms') continue;
-      const registration = registrationByScript.get(route.scriptName);
-      if (
-        !registration?.keyOwned ||
-        registration.tenantTag !== route.tenantTag ||
-        registration.environment !== route.environment ||
-        registration.routeHostname !== route.hostname
-      ) {
-        findings.push({
-          tenantTag: route.tenantTag,
-          environment: route.environment,
-          kind: 'stale-route',
-          detail: `host route '${route.hostname}' does not match its script registration owner`,
-        });
-      }
-    }
-
-    let dispatchScriptCount: number | undefined;
-    let dispatchNamespaceInventory: FleetResourceInventory['dispatchNamespace'];
-    if (includeDispatchNamespace) {
-      const dispatchNamespace = this.#requireDispatchNamespace(
-        'collectFleetInventory',
-      );
-      const namespaceInventory =
-        await this.#client.workersForPlatforms.dispatch.namespaces.get(
-          dispatchNamespace,
-          { account_id: this.#accountId },
-        );
-      dispatchScriptCount = namespaceInventory.script_count;
-      if (
-        typeof dispatchScriptCount !== 'number' ||
-        !Number.isSafeInteger(dispatchScriptCount) ||
-        dispatchScriptCount < 0
-      ) {
-        throw new Error(
-          `dispatch namespace '${dispatchNamespace}' returned no valid script_count`,
-        );
-      }
-      dispatchNamespaceInventory = {
-        name: namespaceInventory.namespace_name ?? dispatchNamespace,
-        ...(namespaceInventory.namespace_id
-          ? { namespaceId: namespaceInventory.namespace_id }
-          : {}),
-        trustedWorkers: namespaceInventory.trusted_workers,
-        scriptCount: dispatchScriptCount,
-      };
-      if (
-        namespaceInventory.namespace_name !== dispatchNamespace ||
-        namespaceInventory.trusted_workers !== false
-      ) {
-        findings.push({
-          tenantTag: 'unknown',
-          environment: 'unknown',
-          kind: 'trusted-dispatch-namespace',
-          detail: `dispatch namespace '${dispatchNamespace}' does not attest trusted_workers=false`,
-        });
-      }
-      if (dispatchScriptCount > dispatchScripts.length) {
-        findings.push({
-          tenantTag: 'unknown',
-          environment: 'unknown',
-          kind: 'unknown-dispatch-scripts',
-          detail: `dispatch namespace '${dispatchNamespace}' reports ${dispatchScriptCount - dispatchScripts.length} script(s) missing from the paginated listing`,
-        });
-      }
-    }
-
-    const customDomains = [];
-    for await (const domain of this.#collectBounded(
-      this.#client.workers.domains.list({ account_id: this.#accountId }),
-      'custom domain inventory',
-    )) {
-      if (domain.service.startsWith(options.scriptNamePrefix)) {
-        customDomains.push(domain);
-      }
-    }
-    const zoneRoutes: Array<
-      import('./types.js').WorkerZoneRoute & { readonly scriptName: string }
-    > = [];
-    const workerRouteZoneIds = await this.#workerRouteZoneIds();
-    for (const zoneId of workerRouteZoneIds) {
-      for await (const route of this.#collectBounded(
-        this.#client.workers.routes.list({ zone_id: zoneId }),
-        'Worker zone-route inventory',
-      )) {
-        if (
-          route.script?.startsWith(options.scriptNamePrefix) &&
-          route.id &&
-          route.pattern
-        ) {
-          zoneRoutes.push({
-            zoneId,
-            routeId: route.id,
-            pattern: route.pattern,
-            scriptName: route.script,
-          });
-        }
-      }
-    }
-    const plainIdentities = new Map<
-      string,
-      { readonly tenantTag: string; readonly environment: string }
-    >();
-    for await (const script of this.#collectBounded(
-      this.#client.workers.scripts.list({ account_id: this.#accountId }),
-      'ordinary Worker script inventory',
-    )) {
-      const scriptName = script.id;
-      if (!scriptName?.startsWith(options.scriptNamePrefix)) continue;
-      try {
-        const deploymentList =
-          await this.#client.workers.scripts.deployments.list(scriptName, {
-            account_id: this.#accountId,
-          });
-        const activeDeployment = deploymentList.deployments[0];
-        const artifactVersion = exactActiveVersionId(
-          activeDeployment,
-          `ordinary Worker '${scriptName}'`,
-        );
-        const [activeVersion, subdomain, secretNames] = await Promise.all([
-          this.#client.workers.scripts.versions.get(artifactVersion, {
-            account_id: this.#accountId,
-            script_name: scriptName,
-          }),
-          this.#client.workers.scripts.subdomain.get(scriptName, {
+      readHostRoutingValue: async ({ namespaceId, keyName }) =>
+        memoizePerContext(`kv-value:${namespaceId}\u0000${keyName}`, () =>
+          this.#readHostRouting(namespaceId, keyName),
+        ),
+      inspectDispatchWorker: async ({ scriptName }) =>
+        memoizePerContext(`dispatch-worker:${scriptName}`, () =>
+          this.inspectDispatchWorker(scriptName),
+        ),
+      getDispatchNamespace: async ({ namespace }) =>
+        memoizePerContext(`dispatch-namespace:${namespace}`, () =>
+          this.#client.workersForPlatforms.dispatch.namespaces.get(namespace, {
             account_id: this.#accountId,
           }),
-          ordinaryWorkerSecretNames(this.#ordinary, scriptName),
-        ]);
-        const bindings = activeVersion.resources.bindings ?? [];
-        const databaseIds = bindings.flatMap((binding) =>
-          binding.type === 'd1' && binding.database_id
-            ? [binding.database_id]
-            : [],
-        );
-        const durableObjectBindings = bindings.flatMap((binding) => {
-          if (
-            binding.type !== 'durable_object_namespace' ||
-            !binding.namespace_id ||
-            !binding.name ||
-            !binding.class_name
-          ) {
-            return [];
+        ),
+      listCustomDomains: async () =>
+        memoizePerContext('custom-domains', async () => {
+          const domains: { hostname: string; service: string }[] = [];
+          for await (const domain of this.#collectBounded(
+            this.#client.workers.domains.list({ account_id: this.#accountId }),
+            'custom domain inventory',
+          )) {
+            domains.push({
+              hostname: domain.hostname,
+              service: domain.service,
+            });
           }
-          return [
-            {
-              name: binding.name,
-              className: binding.class_name,
-              namespaceId: binding.namespace_id,
-              ...(binding.script_name
-                ? { scriptName: binding.script_name }
-                : {}),
-              ...(binding.dispatch_namespace
-                ? { dispatchNamespace: binding.dispatch_namespace }
-                : {}),
-            },
-          ];
-        });
-        const serviceBindings = bindings.flatMap((binding) =>
-          binding.type === 'service' && binding.name && binding.service
-            ? [
-                {
-                  name: binding.name,
-                  service: binding.service,
-                  ...(binding.entrypoint
-                    ? { entrypoint: binding.entrypoint }
-                    : {}),
-                },
-              ]
-            : [],
-        );
-        const queueProducerBindings = bindings.flatMap((binding) =>
-          binding.type === 'queue' && binding.name && binding.queue_name
-            ? [{ name: binding.name, queueName: binding.queue_name }]
-            : [],
-        );
-        const kvNamespaceBindings = bindings.flatMap((binding) =>
-          binding.type === 'kv_namespace' &&
-          binding.name &&
-          binding.namespace_id
-            ? [{ name: binding.name, namespaceId: binding.namespace_id }]
-            : [],
-        );
-        const r2BucketBindings = bindings.flatMap((binding) =>
-          binding.type === 'r2_bucket' && binding.name && binding.bucket_name
-            ? [
-                {
-                  name: binding.name,
-                  bucketName: binding.bucket_name,
-                  jurisdiction: 'default' as const,
-                },
-              ]
-            : [],
-        );
-        const plainText = new Map(
-          bindings.flatMap((binding) =>
-            binding.type === 'plain_text'
-              ? [[binding.name, binding.text] as const]
-              : [],
-          ),
-        );
-        assertSupportedProviderBindings(
-          bindings,
-          new Set([
-            'd1',
-            'durable_object_namespace',
-            'service',
-            'queue',
-            'kv_namespace',
-            'dispatch_namespace',
-            'r2_bucket',
-            'plain_text',
-            'secret_text',
-          ]),
-          `plain Worker '${scriptName}'`,
-        );
-        const tenantTag = plainText.get('DEPLOYMENT_TENANT');
-        const environment = plainText.get('FLEET_ENVIRONMENT');
-        const resourceRole = plainText.get('FLEET_RESOURCE_ROLE');
-        const resourceGroupId = plainText.get('FLEET_RESOURCE_GROUP');
-        const schemaVersion = Number(plainText.get('FLEET_SCHEMA_VERSION'));
-        const scriptZoneRoutes = zoneRoutes.filter(
-          (route) => route.scriptName === scriptName,
-        );
-        if (
-          !tenantTag ||
-          !environment ||
-          !Number.isSafeInteger(schemaVersion)
-        ) {
-          throw new Error('active Worker identity settings are missing');
-        }
-        if (
-          (resourceRole === 'platform-state' ||
-            resourceRole === 'deployment-egress') &&
-          (subdomain.enabled ||
-            subdomain.previews_enabled ||
-            scriptZoneRoutes.length > 0)
-        ) {
-          findings.push({
-            tenantTag,
-            environment,
-            kind: 'incomplete-deployment',
-            detail: `trusted Worker '${scriptName}' is publicly reachable on workers.dev, a preview URL, or a zone route`,
-          });
-        }
-        plainIdentities.set(scriptName, { tenantTag, environment });
-        deployments.push({
-          backend: 'plain-worker',
-          ...(resourceRole === 'platform-state' ||
-          resourceRole === 'deployment-egress'
-            ? { resourceRole, resourceGroupId }
-            : {}),
-          scriptName,
-          tenantTag,
-          environment,
-          databaseIds,
-          durableObjectBindings,
-          serviceBindings,
-          queueProducerBindings,
-          kvNamespaceBindings,
-          r2BucketBindings,
-          secretNames,
-          plainTextBindings: Object.fromEntries(plainText),
-          routeHostnames: customDomains
-            .filter((domain) => domain.service === scriptName)
-            .map((domain) => domain.hostname),
-          zoneRoutes: scriptZoneRoutes.map(
-            ({ scriptName: _scriptName, ...route }) => route,
-          ),
-          artifactVersion,
-          ...(plainText.get('FLEET_SPEC_DIGEST')
-            ? { desiredSpecDigest: plainText.get('FLEET_SPEC_DIGEST') }
-            : {}),
-          schemaVersion,
-        });
-      } catch (error) {
-        findings.push({
-          tenantTag: 'unknown',
-          environment: 'unknown',
-          kind: 'incomplete-deployment',
-          detail: `plain Worker '${scriptName}' could not be inventoried: ${String(error)}`,
-        });
-      }
-    }
-    for (const domain of customDomains) {
-      const identity = plainIdentities.get(domain.service);
-      routes.push({
-        backend: 'plain-worker',
-        surface: 'custom-domain',
-        hostname: domain.hostname,
-        scriptName: domain.service,
-        tenantTag: identity?.tenantTag ?? 'unknown',
-        environment: identity?.environment ?? 'unknown',
-      });
-      if (!identity) {
-        findings.push({
-          tenantTag: 'unknown',
-          environment: 'unknown',
-          kind: 'stale-route',
-          detail: `custom domain '${domain.hostname}' points to a missing or incomplete plain Worker '${domain.service}'`,
-        });
-      }
-    }
-    for (const route of zoneRoutes) {
-      const identity = plainIdentities.get(route.scriptName);
-      routes.push({
-        backend: 'plain-worker',
-        surface: 'zone-route',
-        zoneId: route.zoneId,
-        routeId: route.routeId,
-        hostname: route.pattern,
-        scriptName: route.scriptName,
-        tenantTag: identity?.tenantTag ?? 'unknown',
-        environment: identity?.environment ?? 'unknown',
-      });
-      findings.push({
-        tenantTag: identity?.tenantTag ?? 'unknown',
-        environment: identity?.environment ?? 'unknown',
-        kind: 'stale-route',
-        detail: `zone route '${route.pattern}' exposes plain Worker '${route.scriptName}'`,
-      });
-    }
+          return { domains };
+        }),
+      listWorkerRouteZoneIds: async () =>
+        memoizePerContext('zone-ids', () => this.#workerRouteZoneIds()),
+      listZoneRoutes: async ({ zoneId }) =>
+        memoizePerContext(`zone-routes:${zoneId}`, async () => {
+          const routes: {
+            id?: string;
+            pattern?: string;
+            script?: string;
+          }[] = [];
+          for await (const route of this.#collectBounded(
+            this.#client.workers.routes.list({ zone_id: zoneId }),
+            'Worker zone-route inventory',
+          )) {
+            routes.push({
+              ...(route.id === undefined ? {} : { id: route.id }),
+              ...(route.pattern === undefined
+                ? {}
+                : { pattern: route.pattern }),
+              ...(route.script === undefined ? {} : { script: route.script }),
+            });
+          }
+          return { routes };
+        }),
+      listOrdinaryScripts: async () =>
+        memoizePerContext('ordinary-scripts', async () => {
+          const scripts: { id?: string }[] = [];
+          for await (const script of this.#collectBounded(
+            this.#client.workers.scripts.list({ account_id: this.#accountId }),
+            'ordinary Worker script inventory',
+          )) {
+            scripts.push({
+              ...(script.id === undefined ? {} : { id: script.id }),
+            });
+          }
+          return { scripts };
+        }),
+      readOrdinaryScriptDetail: async ({ scriptName }) =>
+        memoizePerContext(`ordinary-detail:${scriptName}`, () =>
+          this.#readOrdinaryScriptDetail(scriptName),
+        ),
+      listDatabases: async () =>
+        memoizePerContext('d1-databases', async () => {
+          const databases: { uuid?: string; name?: string }[] = [];
+          for await (const database of this.#collectBounded(
+            this.#client.d1.database.list({ account_id: this.#accountId }),
+            'D1 database inventory',
+            MAX_DATABASE_INVENTORY,
+          )) {
+            databases.push({
+              ...(database.uuid === undefined ? {} : { uuid: database.uuid }),
+              ...(database.name === undefined ? {} : { name: database.name }),
+            });
+          }
+          return { databases };
+        }),
+      listDurableObjectNamespaces: async () =>
+        memoizePerContext('do-namespaces', async () => {
+          const namespaces: { id?: string; script?: string }[] = [];
+          for await (const namespace of this.#collectBounded(
+            this.#client.durableObjects.namespaces.list({
+              account_id: this.#accountId,
+            }),
+            'Durable Object namespace inventory',
+          )) {
+            namespaces.push({
+              ...(namespace.id === undefined ? {} : { id: namespace.id }),
+              ...(namespace.script === undefined
+                ? {}
+                : { script: namespace.script }),
+            });
+          }
+          return { namespaces };
+        }),
+      listR2Buckets: async ({ jurisdiction, namePrefix, startAfter }) =>
+        memoizePerContext(
+          `r2:${jurisdiction}\u0000${startAfter ?? ''}\u0000${namePrefix}`,
+          async () => {
+            const page = await this.#client.r2.buckets.list({
+              account_id: this.#accountId,
+              jurisdiction,
+              name_contains: namePrefix,
+              order: 'name',
+              direction: 'asc',
+              per_page: R2_INVENTORY_PAGE_SIZE,
+              ...(startAfter ? { start_after: startAfter } : {}),
+            });
+            return { buckets: page.buckets ?? [] };
+          },
+        ),
+    };
+  }
 
-    const databaseIds: string[] = [];
-    for await (const database of this.#collectBounded(
-      this.#client.d1.database.list({ account_id: this.#accountId }),
-      'D1 database inventory',
-      MAX_DATABASE_INVENTORY,
-    )) {
-      if (
-        database.uuid &&
-        database.name?.startsWith(options.databaseNamePrefix)
-      ) {
-        databaseIds.push(database.uuid);
-      }
-    }
-    const namespaceIds: string[] = [];
-    const registeredScriptNames = new Set(
-      registrations.map((registration) => registration.scriptName),
+  /**
+   * Resolves one ordinary Worker's active artifact exactly as the single-pass
+   * drain did inside its per-script `try`, so an unsupported binding or a
+   * missing active version still becomes the `incomplete-deployment` finding.
+   */
+  async #readOrdinaryScriptDetail(
+    scriptName: string,
+  ): Promise<FleetInventoryOrdinaryScriptDetail> {
+    const deploymentList = await this.#client.workers.scripts.deployments.list(
+      scriptName,
+      { account_id: this.#accountId },
     );
-    for await (const namespace of this.#collectBounded(
-      this.#client.durableObjects.namespaces.list({
+    const artifactVersion = exactActiveVersionId(
+      deploymentList.deployments[0],
+      `ordinary Worker '${scriptName}'`,
+    );
+    const [activeVersion, subdomain, secretNames] = await Promise.all([
+      this.#client.workers.scripts.versions.get(artifactVersion, {
+        account_id: this.#accountId,
+        script_name: scriptName,
+      }),
+      this.#client.workers.scripts.subdomain.get(scriptName, {
         account_id: this.#accountId,
       }),
-      'Durable Object namespace inventory',
-    )) {
-      if (
-        namespace.id &&
-        namespace.script &&
-        (registeredScriptNames.has(namespace.script) ||
-          namespace.script.startsWith(options.scriptNamePrefix))
-      ) {
-        namespaceIds.push(namespace.id);
-      }
-    }
-    const r2Buckets: Array<
-      NonNullable<FleetResourceInventory['r2Buckets']>[number]
-    > = [];
-    for (const jurisdiction of options.includeR2Buckets
-      ? (['default', 'eu', 'fedramp'] as const)
-      : []) {
-      let startAfter: string | undefined;
-      for (;;) {
-        const page = await this.#client.r2.buckets.list({
-          account_id: this.#accountId,
-          jurisdiction,
-          name_contains: options.scriptNamePrefix,
-          order: 'name',
-          direction: 'asc',
-          per_page: 1000,
-          ...(startAfter ? { start_after: startAfter } : {}),
-        });
-        const buckets = page.buckets ?? [];
-        for (const bucket of buckets) {
-          if (!bucket.name?.startsWith(options.scriptNamePrefix)) continue;
-          if (
-            bucket.jurisdiction !== undefined &&
-            bucket.jurisdiction !== jurisdiction
-          ) {
-            throw new Error(`R2 bucket '${bucket.name}' changed jurisdiction`);
-          }
-          if (
-            !bucket.creation_date ||
-            !Number.isFinite(Date.parse(bucket.creation_date))
-          ) {
-            throw new Error(
-              `R2 bucket '${bucket.name}' has no valid creation date`,
-            );
-          }
-          if (r2Buckets.length >= CLOUDFLARE_INVENTORY_BOUND) {
-            // The bound counts only accepted fleet-owned buckets, not every
-            // provider item scanned while filtering by prefix.
-            throw inventoryBoundExceeded(
-              'R2 bucket inventory',
-              CLOUDFLARE_INVENTORY_BOUND,
-            );
-          }
-          r2Buckets.push({
-            bucketName: bucket.name,
-            jurisdiction,
-            creationDate: new Date(bucket.creation_date).toISOString(),
-          });
-        }
-        if (buckets.length < 1000) break;
-        const last = buckets.at(-1)?.name;
-        if (!last || last === startAfter) {
-          throw new Error('R2 bucket inventory pagination did not advance');
-        }
-        startAfter = last;
-      }
-    }
+      ordinaryWorkerSecretNames(this.#ordinary, scriptName),
+    ]);
+    const bindings = activeVersion.resources.bindings ?? [];
+    assertSupportedProviderBindings(
+      bindings,
+      new Set([
+        'd1',
+        'durable_object_namespace',
+        'service',
+        'queue',
+        'kv_namespace',
+        'dispatch_namespace',
+        'r2_bucket',
+        'plain_text',
+        'secret_text',
+      ]),
+      `plain Worker '${scriptName}'`,
+    );
     return {
-      findings,
-      ...(options.hostRoutingKvId
-        ? { hostRoutingKvId: options.hostRoutingKvId }
-        : {}),
-      dispatchScriptCount,
-      ...(dispatchNamespaceInventory
-        ? { dispatchNamespace: dispatchNamespaceInventory }
-        : {}),
-      scriptRegistrations: registrations.map(
-        ({ keyOwned: _keyOwned, ...registration }) => registration,
-      ),
-      deployments,
-      databaseIds,
-      namespaceIds,
-      r2Buckets,
-      routes,
+      artifactVersion,
+      bindings: bindings as readonly FleetInventoryProviderBinding[],
+      subdomainEnabled: Boolean(subdomain.enabled),
+      previewsEnabled: Boolean(subdomain.previews_enabled),
+      secretNames,
+    };
+  }
+
+  #fleetInventoryContext(): FleetInventoryProviderContext {
+    const deps = this.#fleetInventoryDeps();
+    return {
+      advanceStage: (input) =>
+        advanceCloudflareFleetInventoryStage(deps, input),
     };
   }
 

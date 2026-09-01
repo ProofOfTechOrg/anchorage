@@ -2,6 +2,16 @@
 
 import { createHash } from 'node:crypto';
 import { cloneBoundedPlainData } from './strict-plain-data.js';
+import type {
+  ApplicationR2Binding,
+  DurableObjectBindingInventory,
+  FleetInventoryDeployment,
+  FleetInventoryFinding,
+  FleetResourceInventory,
+  ProvisioningBackendKind,
+  R2Jurisdiction,
+  WorkerZoneRoute,
+} from './types.js';
 
 /** Byte bound for one persisted inventory run record. */
 export const FLEET_INVENTORY_RUN_RECORD_BYTE_BOUND = 96 * 1024;
@@ -362,23 +372,34 @@ export class FleetInventoryStateError extends Error {
   }
 }
 
+/**
+ * Frozen refusal text for every continuation-token classification failure, so
+ * the three token errors cannot drift apart from one another.
+ */
+const TOKEN_REFUSAL_MESSAGES = Object.freeze({
+  malformed: 'fleet inventory run token is malformed',
+  future: 'fleet inventory run token is ahead of the persisted run',
+  unknownOperation: (operationId: string) =>
+    `no fleet inventory run for operation '${operationId}'`,
+});
+
 export class FleetInventoryRunTokenError extends Error {
   constructor() {
-    super('fleet inventory run token is malformed');
+    super(TOKEN_REFUSAL_MESSAGES.malformed);
     this.name = 'FleetInventoryRunTokenError';
   }
 }
 
 export class FleetInventoryRunTokenOperationError extends Error {
   constructor(readonly operationId: string) {
-    super(`no fleet inventory run for operation '${operationId}'`);
+    super(TOKEN_REFUSAL_MESSAGES.unknownOperation(operationId));
     this.name = 'FleetInventoryRunTokenOperationError';
   }
 }
 
 export class FleetInventoryRunTokenFutureError extends Error {
   constructor() {
-    super('fleet inventory run token is ahead of the persisted run');
+    super(TOKEN_REFUSAL_MESSAGES.future);
     this.name = 'FleetInventoryRunTokenFutureError';
   }
 }
@@ -666,15 +687,19 @@ function stageEnabled(
   options: FleetInventoryRunOptions,
   counts: Readonly<Record<FleetInventoryRowKind, number>>,
 ): boolean {
-  // `includeDispatchNamespace` deliberately gates NO stage: it only skips the
-  // namespace attestation INSIDE `registration-postprocess`, which is the
-  // provider engine's work, so the stage itself is still entered.
   const hostRouting = options.hostRoutingKvId !== undefined;
   switch (step) {
     case 'host-kv-keys':
-    case 'dispatch-pages':
-    case 'registration-postprocess':
       return hostRouting;
+    // The single-pass drain lists the dispatch namespace whenever the caller
+    // asks for it, even with no host-routing registry to cross-check, so the
+    // listing stage follows `includeDispatchNamespace` alone.
+    case 'dispatch-pages':
+      return options.includeDispatchNamespace;
+    // Postprocess owns the unknown-dispatch-script findings, the host-route
+    // owner check, and the namespace attestation, so either input enables it.
+    case 'registration-postprocess':
+      return hostRouting || options.includeDispatchNamespace;
     case 'host-kv-values':
     case 'registration-checks':
       return hostRouting && counts.registration > 0;
@@ -1007,4 +1032,343 @@ export function classifyFleetInventoryRunToken(
     throw new FleetInventoryRunTokenFutureError();
   }
   return parsed.revision === run.progress.revision ? 'current' : 'stale';
+}
+
+/**
+ * Position identity for one stage: the stage's own keys in a stable order.
+ * Both the provider engine and the coordinator compare stage POSITIONS, not
+ * object identity, so the comparison lives once in this neutral leaf.
+ */
+export function fleetInventoryStageKey(stage: FleetInventoryStage): string {
+  return JSON.stringify(
+    Object.entries(stage).sort(([left], [right]) => (left < right ? -1 : 1)),
+  );
+}
+
+/**
+ * Successor progress for one committed chunk.
+ *
+ * `lastPageDigest` is POSITION-SCOPED: the provider engine compares it only
+ * when the persisted stage deep-equals the stage it is asked to execute, so it
+ * must be dropped as soon as the run moves to a different stage position.
+ */
+export function advanceFleetInventoryProgress(
+  progress: FleetInventoryRunProgress,
+  executed: FleetInventoryStage,
+  result: FleetInventoryStageResult,
+): FleetInventoryRunProgress {
+  const stagedCounts = { ...progress.stagedCounts };
+  for (const row of result.rows) {
+    stagedCounts[row.kind] += 1;
+  }
+  const samePosition =
+    fleetInventoryStageKey(result.nextStage) ===
+    fleetInventoryStageKey(executed);
+  return {
+    stage: result.nextStage,
+    generation: progress.generation,
+    revision: progress.revision + 1,
+    stagedCounts,
+    factCount: progress.factCount + result.facts.length,
+    ...(samePosition && result.pageDigest !== undefined
+      ? { lastPageDigest: result.pageDigest }
+      : {}),
+    providerRequests: progress.providerRequests + result.providerRequests,
+  };
+}
+
+/** The progress a freshly started run carries before its first chunk. */
+export function initialFleetInventoryProgress(
+  stage: FleetInventoryStage,
+  generation: number,
+): FleetInventoryRunProgress {
+  return {
+    stage,
+    generation,
+    revision: 0,
+    stagedCounts: emptyFleetInventoryRowCounts(),
+    factCount: 0,
+    providerRequests: 0,
+  };
+}
+
+function malformedGeneration(): never {
+  throw new Error('fleet inventory generation row payload is malformed');
+}
+
+function text(payload: Readonly<Record<string, unknown>>, key: string): string {
+  const value = payload[key];
+  return typeof value === 'string' ? value : malformedGeneration();
+}
+
+function optionalText(
+  payload: Readonly<Record<string, unknown>>,
+  key: string,
+): string | undefined {
+  const value = payload[key];
+  if (value === undefined) return undefined;
+  return typeof value === 'string' ? value : malformedGeneration();
+}
+
+function integer(
+  payload: Readonly<Record<string, unknown>>,
+  key: string,
+): number {
+  const value = payload[key];
+  return Number.isSafeInteger(value)
+    ? (value as number)
+    : malformedGeneration();
+}
+
+function withoutRecord(
+  payload: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+  const { record: _record, ...rest } = payload;
+  return rest;
+}
+
+type FactIndex = ReadonlyMap<
+  number,
+  ReadonlyMap<
+    FleetInventoryDeploymentFactKind,
+    readonly Readonly<Record<string, unknown>>[]
+  >
+>;
+
+function indexFacts(facts: readonly FleetInventoryStagedFact[]): FactIndex {
+  const index = new Map<
+    number,
+    Map<FleetInventoryDeploymentFactKind, FleetInventoryStagedFact[]>
+  >();
+  for (const fact of facts) {
+    const byKind =
+      index.get(fact.deploymentOrdinal) ??
+      new Map<FleetInventoryDeploymentFactKind, FleetInventoryStagedFact[]>();
+    index.set(fact.deploymentOrdinal, byKind);
+    const bucket = byKind.get(fact.factKind) ?? [];
+    byKind.set(fact.factKind, bucket);
+    bucket.push(fact);
+  }
+  const ordered = new Map<
+    number,
+    Map<
+      FleetInventoryDeploymentFactKind,
+      readonly Readonly<Record<string, unknown>>[]
+    >
+  >();
+  for (const [deploymentOrdinal, byKind] of index) {
+    const payloads = new Map<
+      FleetInventoryDeploymentFactKind,
+      readonly Readonly<Record<string, unknown>>[]
+    >();
+    for (const [factKind, bucket] of byKind) {
+      payloads.set(
+        factKind,
+        [...bucket]
+          .sort((left, right) => left.factOrdinal - right.factOrdinal)
+          .map((fact) => fact.payload),
+      );
+    }
+    ordered.set(deploymentOrdinal, payloads);
+  }
+  return ordered;
+}
+
+function factsOf(
+  index: FactIndex,
+  deploymentOrdinal: number,
+  factKind: FleetInventoryDeploymentFactKind,
+): readonly Readonly<Record<string, unknown>>[] {
+  return index.get(deploymentOrdinal)?.get(factKind) ?? [];
+}
+
+function materializeDeployment(
+  row: FleetInventoryStagedRow,
+  index: FactIndex,
+): FleetInventoryDeployment {
+  const payload = row.payload;
+  const value = text(payload, 'backend');
+  if (value !== 'workers-for-platforms' && value !== 'plain-worker') {
+    return malformedGeneration();
+  }
+  const backend: ProvisioningBackendKind = value;
+  const desiredSpecDigest = optionalText(payload, 'desiredSpecDigest');
+  const resourceRole = optionalText(payload, 'resourceRole');
+  const facts = (factKind: FleetInventoryDeploymentFactKind) =>
+    factsOf(index, row.ordinal, factKind);
+  const identity = {
+    backend,
+    ...(resourceRole === 'platform-state' ||
+    resourceRole === 'deployment-egress'
+      ? {
+          resourceRole: resourceRole as 'platform-state' | 'deployment-egress',
+          resourceGroupId: optionalText(payload, 'resourceGroupId'),
+        }
+      : {}),
+    scriptName: text(payload, 'scriptName'),
+    tenantTag: text(payload, 'tenantTag'),
+    environment: text(payload, 'environment'),
+    databaseIds: facts('database-id').map((fact) => text(fact, 'databaseId')),
+    durableObjectBindings: facts('durable-object-binding').map((fact) => {
+      const scriptName = optionalText(fact, 'scriptName');
+      const dispatchNamespace = optionalText(fact, 'dispatchNamespace');
+      return {
+        name: text(fact, 'name'),
+        className: text(fact, 'className'),
+        namespaceId: text(fact, 'namespaceId'),
+        ...(scriptName === undefined ? {} : { scriptName }),
+        ...(dispatchNamespace === undefined ? {} : { dispatchNamespace }),
+      } satisfies DurableObjectBindingInventory;
+    }),
+    serviceBindings: facts('service-binding').map((fact) => {
+      const entrypoint = optionalText(fact, 'entrypoint');
+      return {
+        name: text(fact, 'name'),
+        service: text(fact, 'service'),
+        ...(entrypoint === undefined ? {} : { entrypoint }),
+      };
+    }),
+    queueProducerBindings: facts('queue-producer-binding').map((fact) => ({
+      name: text(fact, 'name'),
+      queueName: text(fact, 'queueName'),
+    })),
+  };
+  const r2BucketBindings = facts('r2-binding').map(
+    (fact) =>
+      ({
+        name: text(fact, 'name'),
+        bucketName: text(fact, 'bucketName'),
+        jurisdiction: text(fact, 'jurisdiction') as R2Jurisdiction,
+      }) satisfies ApplicationR2Binding,
+  );
+  const secretNames = facts('secret-name').map((fact) =>
+    text(fact, 'secretName'),
+  );
+  const plainTextBindings = Object.fromEntries(
+    facts('plain-text-binding').map((fact) => [
+      text(fact, 'name'),
+      text(fact, 'text'),
+    ]),
+  );
+  const routeHostnames = facts('route-hostname').map((fact) =>
+    text(fact, 'hostname'),
+  );
+  const artifact = {
+    artifactVersion: text(payload, 'artifactVersion'),
+    ...(desiredSpecDigest === undefined ? {} : { desiredSpecDigest }),
+    schemaVersion: integer(payload, 'schemaVersion'),
+  };
+  // The two backends carry different keys in a different order, and the frozen
+  // golden baseline compares key order, so each shape is assembled explicitly.
+  if (backend === 'workers-for-platforms') {
+    return {
+      ...identity,
+      r2BucketBindings,
+      plainTextBindings,
+      secretNames,
+      routeHostnames,
+      ...artifact,
+    };
+  }
+  return {
+    ...identity,
+    kvNamespaceBindings: facts('kv-binding').map((fact) => ({
+      name: text(fact, 'name'),
+      namespaceId: text(fact, 'namespaceId'),
+    })),
+    r2BucketBindings,
+    secretNames,
+    plainTextBindings,
+    routeHostnames,
+    zoneRoutes: facts('zone-route').map(
+      (fact) =>
+        ({
+          zoneId: text(fact, 'zoneId'),
+          routeId: text(fact, 'routeId'),
+          pattern: text(fact, 'pattern'),
+        }) satisfies WorkerZoneRoute,
+    ),
+    ...artifact,
+  };
+}
+
+/**
+ * Rebuilds one account inventory from staged rows and deployment
+ * facts in ordinal order. Row payloads carry an explicit `record`
+ * discriminator because several stages share one row kind for their durable
+ * work lists, and only the materialized records may reach the result.
+ */
+export function materializeFleetInventoryGeneration(
+  input: Readonly<{
+    rows: readonly FleetInventoryStagedRow[];
+    facts: readonly FleetInventoryStagedFact[];
+    options: FleetInventoryRunOptions;
+  }>,
+): FleetResourceInventory {
+  const index = indexFacts(input.facts);
+  const of = (kind: FleetInventoryRowKind, record: string) =>
+    input.rows
+      .filter((row) => row.kind === kind && row.payload.record === record)
+      .sort((left, right) => left.ordinal - right.ordinal);
+  const dispatchInventory = of('meta', 'dispatch-inventory')[0]?.payload;
+  const dispatchScriptCount =
+    dispatchInventory === undefined
+      ? undefined
+      : integer(dispatchInventory, 'dispatchScriptCount');
+  const namespaceId =
+    dispatchInventory === undefined
+      ? undefined
+      : optionalText(dispatchInventory, 'namespaceId');
+  return {
+    findings: of('finding', 'finding').map(
+      (row) =>
+        ({
+          tenantTag: text(row.payload, 'tenantTag'),
+          environment: text(row.payload, 'environment'),
+          kind: text(row.payload, 'kind'),
+          detail: text(row.payload, 'detail'),
+        }) as FleetInventoryFinding,
+    ),
+    ...(input.options.hostRoutingKvId === undefined
+      ? {}
+      : { hostRoutingKvId: input.options.hostRoutingKvId }),
+    dispatchScriptCount,
+    ...(dispatchInventory === undefined || dispatchScriptCount === undefined
+      ? {}
+      : {
+          dispatchNamespace: {
+            name: text(dispatchInventory, 'name'),
+            ...(namespaceId === undefined ? {} : { namespaceId }),
+            trustedWorkers: dispatchInventory.trustedWorkers as
+              | boolean
+              | undefined,
+            scriptCount: integer(dispatchInventory, 'scriptCount'),
+          },
+        }),
+    scriptRegistrations: of('registration', 'registration').map((row) => ({
+      scriptName: text(row.payload, 'scriptName'),
+      tenantTag: text(row.payload, 'tenantTag'),
+      environment: text(row.payload, 'environment'),
+      databaseId: text(row.payload, 'databaseId'),
+      routeHostname: text(row.payload, 'routeHostname'),
+    })),
+    deployments: of('deployment', 'deployment').map((row) =>
+      materializeDeployment(row, index),
+    ),
+    databaseIds: of('database-id', 'database-id').map((row) =>
+      text(row.payload, 'databaseId'),
+    ),
+    namespaceIds: of('namespace-id', 'namespace-id').map((row) =>
+      text(row.payload, 'namespaceId'),
+    ),
+    r2Buckets: of('r2-bucket', 'r2-bucket').map((row) => ({
+      bucketName: text(row.payload, 'bucketName'),
+      jurisdiction: text(row.payload, 'jurisdiction') as R2Jurisdiction,
+      creationDate: text(row.payload, 'creationDate'),
+    })),
+    routes: of('route', 'route').map(
+      (row) =>
+        withoutRecord(row.payload) as FleetResourceInventory['routes'][number],
+    ),
+  };
 }
