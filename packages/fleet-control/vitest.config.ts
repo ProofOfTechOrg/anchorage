@@ -13,9 +13,10 @@ export default defineConfig({
     // in cross-backend-continuation.test.ts, runs about 2.8 s alone with real
     // scratch-directory work and timed out at 5 s only when the forks pool
     // shared the machine. Suites that drive real workerd set their own caps
-    // above this; the deliberately tight per-title caps say so where they
-    // stand. hookTimeout stays at vitest's 10 s: every workerd boot hook sets
-    // its own.
+    // above this; the deliberately tight per-title caps that sit below it say
+    // so where they stand. hookTimeout stays at vitest's 10 s: the hooks that
+    // boot or close workerd set their own, and the rest are per-test teardowns
+    // that never touch workerd.
     testTimeout: 20_000,
   },
 });

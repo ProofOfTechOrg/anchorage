@@ -124,10 +124,9 @@ function harnessOptions() {
 describe.sequential('D1FleetStateStore Wrangler harness', {
   // Real workerd + D1 through Wrangler: the two-pass R2 detach/deletion title
   // timed out at a 30 s cap inside the full package suite and has since needed
-  // as much as 45 s (in a six-file run with the 5-minute load average at 11.7
-  // on 12 cores); 150 s keeps a 3x margin over that. The hooks below repeat
-  // this value because hooks take vitest's hookTimeout, not this option; every
-  // title inherits it.
+  // as much as 45.2 s in a six-file run; 150 s keeps a 3x margin over that.
+  // The hooks below repeat this value because hooks take vitest's hookTimeout,
+  // not this option; every title inherits it.
   timeout: 150_000,
 }, () => {
   let server: TestHarness;
