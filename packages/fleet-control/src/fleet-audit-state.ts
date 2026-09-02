@@ -7,9 +7,9 @@ import {
 import {
   assertFleetOperationExactKeys,
   FLEET_OPERATION_ITEM_BOUND,
+  FLEET_OPERATION_STRING_BYTE_BOUND,
   type FleetOperationProgress,
   type FleetOperationRunRecord,
-  fleetOperationBoundedString,
   fleetOperationFailureFromUnknown,
   fleetOperationPlainRecord,
   fleetOperationRunRecordFromUnknown,
@@ -130,11 +130,16 @@ export type FleetAuditFactPayload =
     }>
   | Readonly<{ factKind: 'duplicate-namespace'; key: string }>;
 
-function structurallySafeText(value: unknown): value is string {
+function boundedString(value: unknown): value is string {
   return (
-    fleetOperationBoundedString(value) &&
-    !fleetOperationTextHasControlBytes(value)
+    typeof value === 'string' &&
+    new TextEncoder().encode(value).byteLength <=
+      FLEET_OPERATION_STRING_BYTE_BOUND
   );
+}
+
+function structurallySafeText(value: unknown): value is string {
+  return boundedString(value) && !fleetOperationTextHasControlBytes(value);
 }
 
 export function fleetAuditStageFromUnknown(value: unknown): FleetAuditStage {
@@ -160,12 +165,19 @@ export function fleetAuditStageFromUnknown(value: unknown): FleetAuditStage {
   } as FleetAuditStage;
 }
 
-function stageEntry(step: FleetAuditStage['step']): FleetAuditStage {
-  const ordinal = STAGE_ORDINAL[step];
+export function withAuditStageOrdinal(
+  step: FleetAuditStage['step'],
+  ordinal: number,
+): FleetAuditStage {
+  const ordinalField = STAGE_ORDINAL[step];
   return {
     step,
-    ...(ordinal === undefined ? {} : { [ordinal]: 0 }),
+    ...(ordinalField === undefined ? {} : { [ordinalField]: ordinal }),
   } as FleetAuditStage;
+}
+
+function stageEntry(step: FleetAuditStage['step']): FleetAuditStage {
+  return withAuditStageOrdinal(step, 0);
 }
 
 export function nextAuditStage(
@@ -206,7 +218,8 @@ export function fleetAuditProgressFromUnknown(
     !fleetOperationSafeInteger(candidate.revision) ||
     !fleetOperationSafeInteger(candidate.generation, 1) ||
     !fleetOperationSafeInteger(candidate.auditTimeMs) ||
-    !fleetOperationSafeInteger(candidate.staleAfterMs) ||
+    Number.isNaN(new Date(candidate.auditTimeMs).getTime()) ||
+    !fleetOperationSafeInteger(candidate.staleAfterMs, 1) ||
     !fleetOperationSafeInteger(candidate.recordCount) ||
     candidate.recordCount > FLEET_OPERATION_ITEM_BOUND ||
     !fleetOperationSafeInteger(candidate.findingCount) ||
@@ -255,8 +268,8 @@ export function driftFindingRowFromUnknown(
   ]);
   // These are provider-claimed observations that the drain emits verbatim.
   if (
-    !structurallySafeText(candidate.tenantTag) ||
-    !structurallySafeText(candidate.environment) ||
+    !boundedString(candidate.tenantTag) ||
+    !boundedString(candidate.environment) ||
     typeof candidate.kind !== 'string' ||
     !FLEET_AUDIT_FINDING_KINDS.includes(
       candidate.kind as FleetAuditFindingKind,
@@ -279,7 +292,7 @@ export function fleetAuditFactRowFromUnknown(
   const candidate = fleetOperationPlainRecord(value);
   if (candidate.factKind === 'duplicate-namespace') {
     assertFleetOperationExactKeys(candidate, ['factKind', 'key']);
-    if (!structurallySafeText(candidate.key)) return malformed();
+    if (!boundedString(candidate.key)) return malformed();
     return { factKind: 'duplicate-namespace', key: candidate.key };
   }
   if (
@@ -295,7 +308,7 @@ export function fleetAuditFactRowFromUnknown(
     'environment',
   ]);
   if (
-    !structurallySafeText(candidate.key) ||
+    !boundedString(candidate.key) ||
     typeof candidate.tenantTag !== 'string' ||
     !isDeploymentTenantTag(candidate.tenantTag) ||
     typeof candidate.environment !== 'string' ||

@@ -114,6 +114,10 @@ const controls = {
     'scripts/architecture-fixtures/decommission-advance-imports-provider.ts',
   'fleet-control-inventory-advance-is-transport-neutral':
     'scripts/architecture-fixtures/inventory-advance-imports-provider.ts',
+  'fleet-control-operation-advance-avoids-concrete-transports':
+    'scripts/architecture-fixtures/operation-advance-imports-provider.ts',
+  'fleet-control-runtime-sdk-stays-in-provider-modules':
+    'scripts/architecture-fixtures/runtime-sdk-import.ts',
   'fleet-control-cleanup-advance-is-transport-neutral':
     'scripts/architecture-fixtures/cleanup-advance-imports-provider.ts',
   'fleet-control-decommission-database-is-provider-neutral':

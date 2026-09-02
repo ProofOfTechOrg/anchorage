@@ -12,12 +12,17 @@ const DEPTH_BOUND = 64;
 const NODE_BOUND = 8192;
 export const FLEET_OPERATION_ITEM_BOUND = 10_000;
 /**
- * Total serialized intake bytes per operation. The operative per-call memory
- * envelope also includes the materialized inventory generation.
+ * Total canonical intake bytes per operation, measured as the sum of per-item
+ * canonical bytes. Item depth and node bounds apply per item; no aggregate
+ * node bound exists. The operative per-call memory envelope also includes the
+ * materialized inventory generation.
  */
 export const FLEET_OPERATION_INTAKE_BYTE_BOUND = 16 * 1024 * 1024;
 /** Statements per D1 batch used by the staging protocol. */
 export const FLEET_OPERATION_STAGE_BATCH_STATEMENTS = 100;
+/** At most 99 non-record rows per record times 10,000 records. */
+export const FLEET_OPERATION_ROW_READ_BOUND =
+  (FLEET_OPERATION_STAGE_BATCH_STATEMENTS - 1) * FLEET_OPERATION_ITEM_BOUND;
 /** Frozen plan length cap (fixed steps plus pending D1 versions). */
 export const FLEET_MIGRATION_PLAN_BOUND = 64;
 
@@ -83,6 +88,18 @@ export interface FleetOperationStagedRow {
   readonly payload: Readonly<Record<string, unknown>>;
 }
 
+export interface FleetOperationItemsIntake {
+  readonly envelope: Record<string, unknown>;
+  readonly items: readonly unknown[];
+  readonly itemByteBound: number;
+}
+
+export type FleetOperationIntakeRefusal =
+  | { readonly reason: 'item-count' }
+  | { readonly reason: 'item-structure'; readonly itemOrdinal: number }
+  | { readonly reason: 'item-bytes'; readonly itemOrdinal: number }
+  | { readonly reason: 'aggregate-bytes' };
+
 export class FleetOperationStateError extends Error {
   constructor() {
     super('fleet operation state is malformed');
@@ -135,6 +152,14 @@ export interface FleetOperationStore {
   readOperationById(
     operationId: string,
   ): Promise<FleetOperationRunRecord | undefined>;
+  /**
+   * Reads at most `limit` rows of the requested kind whose ordinal is strictly
+   * greater than the exclusive `afterOrdinal`; an absent cursor starts at the
+   * beginning. `done` means no matching rows remain beyond this page. Callers
+   * do not rely on the ordering of rows within a page. A page contains the
+   * smallest qualifying ordinals; omitting a row whose ordinal is below one
+   * the page returns is non-conforming.
+   */
   readOperationRowsPage(
     input: Readonly<{
       operationId: string;
@@ -217,6 +242,73 @@ export interface FleetOperationLease {
 /** Rejects malformed durable operation state with FleetOperationStateError. */
 export function malformed(): never {
   throw new FleetOperationStateError();
+}
+
+/**
+ * Reads and ordinal-sorts every contiguous-from-zero staged row of one kind.
+ * Fails closed on an empty unfinished page, any row at or below the requested
+ * exclusive cursor, a duplicate ordinal, or a gap. Record reads cap at
+ * `FLEET_OPERATION_ITEM_BOUND`; other kinds cap at
+ * `FLEET_OPERATION_ROW_READ_BOUND`.
+ */
+export async function readAllFleetOperationRows(
+  store: FleetOperationStore,
+  operationId: string,
+  rowKind: FleetOperationRowKind,
+): Promise<FleetOperationStagedRow[]> {
+  const rows: FleetOperationStagedRow[] = [];
+  const rowReadBound =
+    rowKind === 'record'
+      ? FLEET_OPERATION_ITEM_BOUND
+      : FLEET_OPERATION_ROW_READ_BOUND;
+  let afterOrdinal: number | undefined;
+  for (;;) {
+    const page = await store.readOperationRowsPage({
+      operationId,
+      rowKind,
+      limit: 1_000,
+      ...(afterOrdinal === undefined ? {} : { afterOrdinal }),
+    });
+    // A surviving row exceeds every ordinal collected from prior pages, so
+    // only duplicates within this page need an explicit set.
+    const pageOrdinals = new Set<number>();
+    let maximumOrdinal: number | undefined;
+    for (const row of page.rows) {
+      if (
+        (afterOrdinal !== undefined && row.ordinal <= afterOrdinal) ||
+        pageOrdinals.has(row.ordinal)
+      ) {
+        return malformed();
+      }
+      pageOrdinals.add(row.ordinal);
+      if (maximumOrdinal === undefined || row.ordinal > maximumOrdinal) {
+        maximumOrdinal = row.ordinal;
+      }
+    }
+    rows.push(...page.rows);
+    if (rows.length > rowReadBound) return malformed();
+    if (page.done) break;
+    if (maximumOrdinal === undefined) return malformed();
+    afterOrdinal = maximumOrdinal;
+  }
+  const sortedRows = [...rows].sort(
+    (left, right) => left.ordinal - right.ordinal,
+  );
+  for (const [index, row] of sortedRows.entries()) {
+    if (row.ordinal !== index) return malformed();
+  }
+  return sortedRows;
+}
+
+/** Constructs the public continuation token for one durable run record. */
+export function fleetOperationTokenOf(
+  run: FleetOperationRunRecord,
+): FleetOperationToken {
+  return {
+    version: 1,
+    operationId: run.operationId,
+    revision: run.progress.revision,
+  };
 }
 
 const TEXT_ENCODER = new TextEncoder();
@@ -323,6 +415,26 @@ function fleetOperationBoundedPlain(value: unknown, maxBytes: number): unknown {
   }
 }
 
+function stagedRowMaxBytes(rowKind: FleetOperationRowKind): number {
+  return rowKind === 'record'
+    ? FLEET_OPERATION_RECORD_ROW_BYTE_BOUND
+    : FLEET_OPERATION_ROW_PAYLOAD_BYTE_BOUND;
+}
+
+/** Tests a payload against the exact bounds enforced by the staged-row codec. */
+export function fleetOperationStagedRowPayloadFitsEnvelope(
+  rowKind: FleetOperationRowKind,
+  payload: unknown,
+): boolean {
+  try {
+    fleetOperationBoundedPlain(payload, stagedRowMaxBytes(rowKind));
+    return true;
+  } catch {
+    // fleetOperationBoundedPlain normalizes every violation to this false path.
+    return false;
+  }
+}
+
 export function fleetOperationFailureFromUnknown(
   value: unknown,
 ): FleetOperationFailure {
@@ -426,15 +538,12 @@ export function fleetOperationStagedRowFromUnknown(
   ) {
     return malformed();
   }
-  const maxBytes =
-    candidate.rowKind === 'record'
-      ? FLEET_OPERATION_RECORD_ROW_BYTE_BOUND
-      : FLEET_OPERATION_ROW_PAYLOAD_BYTE_BOUND;
+  const rowKind = candidate.rowKind as FleetOperationRowKind;
   const payload = fleetOperationPlainRecord(
-    fleetOperationBoundedPlain(candidate.payload, maxBytes),
+    fleetOperationBoundedPlain(candidate.payload, stagedRowMaxBytes(rowKind)),
   );
   return {
-    rowKind: candidate.rowKind as FleetOperationRowKind,
+    rowKind,
     ordinal: candidate.ordinal,
     payload: { ...payload },
   };
@@ -524,14 +633,70 @@ export function canonicalFleetOperationBytes(value: unknown): string {
   return JSON.stringify(canonicalValue(plain));
 }
 
-/** SHA-256 of canonical intake, refusing an operation above 16 MiB. */
+/**
+ * SHA-256 of one canonical value under the module's per-value structure bounds:
+ * depth 64, 8,192 nodes, and 4 KiB string values or object keys. Multi-item
+ * intakes must use `fleetOperationItemsIntake`.
+ */
 export function fleetOperationIntakeDigest(value: unknown): string {
   return createHash('sha256')
     .update(canonicalFleetOperationBytes(value))
     .digest('hex');
 }
 
-/** Non-throwing write gate for composed audit finding details. */
+/**
+ * Canonicalizes each item under the per-item depth and node bounds, then
+ * applies byte-only per-item and aggregate limits without cloning the intake
+ * as one tree. A successful result includes JSON-parsed canonical snapshots
+ * so later awaits cannot observe mutation through the caller's aliases.
+ */
+export function fleetOperationItemsIntake(
+  intake: FleetOperationItemsIntake,
+):
+  | { readonly digest: string; readonly items: readonly unknown[] }
+  | FleetOperationIntakeRefusal {
+  if (intake.items.length > FLEET_OPERATION_ITEM_BOUND) {
+    return { reason: 'item-count' };
+  }
+  const hash = createHash('sha256').update(
+    canonicalFleetOperationBytes(intake.envelope),
+  );
+  let aggregateBytes = 0;
+  const items: unknown[] = [];
+  for (const [itemOrdinal, item] of intake.items.entries()) {
+    let canonical: string;
+    try {
+      canonical = canonicalFleetOperationBytes(item);
+    } catch (error) {
+      if (!(error instanceof FleetOperationStateError)) throw error;
+      try {
+        const serialized = JSON.stringify(item);
+        if (
+          typeof serialized === 'string' &&
+          utf8Length(serialized) > intake.itemByteBound
+        ) {
+          return { reason: 'item-bytes', itemOrdinal };
+        }
+      } catch {
+        return { reason: 'item-structure', itemOrdinal };
+      }
+      return { reason: 'item-structure', itemOrdinal };
+    }
+    const itemBytes = utf8Length(canonical);
+    if (itemBytes > intake.itemByteBound) {
+      return { reason: 'item-bytes', itemOrdinal };
+    }
+    aggregateBytes += itemBytes;
+    if (aggregateBytes > FLEET_OPERATION_INTAKE_BYTE_BOUND) {
+      return { reason: 'aggregate-bytes' };
+    }
+    hash.update(String(itemBytes)).update(':').update(canonical);
+    items.push(JSON.parse(canonical) as unknown);
+  }
+  return { digest: hash.digest('hex'), items };
+}
+
+/** Non-throwing write gate for every durable audit finding detail. */
 export function isDurableAuditDetailSafe(value: unknown): boolean {
   if (
     typeof value !== 'string' ||

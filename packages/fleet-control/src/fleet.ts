@@ -44,6 +44,7 @@ import type {
   ExternalPlatformTargetDescription,
   ExternalReleaseSnapshot,
   ExternalReleaseTopology,
+  FleetInventoryDeployment,
   FleetInventoryFinding,
   FleetRecord,
   FleetResourceInventory,
@@ -534,59 +535,81 @@ function configuredDuties(health: MaintenanceHealth): readonly DutyHealth[] {
   ];
 }
 
-function staleDutyReason(
+interface DutySegment {
+  readonly template: string;
+  readonly diagnostic: string | null;
+}
+
+/**
+ * Splits `staleDutyReason`'s composition into a template plus an optional raw
+ * diagnostic segment (R4-B.2), so a caller can persist the template alone and
+ * separately compose the legacy byte-identical string with the diagnostic
+ * inlined.
+ */
+function staleDutySegment(
   duty: DutyHealth,
   deployedAt: number | undefined,
   now: number,
   staleAfterMs: number,
-): string | undefined {
+): DutySegment | undefined {
   if (duty.lastError !== undefined) {
-    return `${duty.name} last attempt failed${
-      duty.lastAttemptAt === undefined || duty.lastAttemptAt === null
-        ? ''
-        : ` at ${duty.lastAttemptAt}`
-    }: ${duty.lastError}`;
+    return {
+      template: `${duty.name} last attempt failed${
+        duty.lastAttemptAt === undefined || duty.lastAttemptAt === null
+          ? ''
+          : ` at ${duty.lastAttemptAt}`
+      }`,
+      diagnostic: duty.lastError,
+    };
   }
   const reference = duty.lastSuccessAt ?? deployedAt;
   if (reference === undefined) {
-    return `${duty.name} has no success or deployment freshness reference`;
+    return {
+      template: `${duty.name} has no success or deployment freshness reference`,
+      diagnostic: null,
+    };
   }
   if (now - reference <= staleAfterMs) return undefined;
-  return duty.lastSuccessAt === null
-    ? `${duty.name} has not succeeded within the deployment grace period`
-    : `${duty.name} last succeeded ${now - duty.lastSuccessAt}ms ago`;
+  return {
+    template:
+      duty.lastSuccessAt === null
+        ? `${duty.name} has not succeeded within the deployment grace period`
+        : `${duty.name} last succeeded ${now - duty.lastSuccessAt}ms ago`,
+    diagnostic: null,
+  };
 }
 
-export async function auditFleetDrift(options: {
-  readonly store: FleetStateStore;
-  readonly records: readonly FleetRecord[];
-  readonly inventory: FleetResourceInventory;
-  readonly backendFor: (record: FleetRecord) => ProvisioningBackend;
-  readonly specFor: (record: FleetRecord) => DeploymentSpec;
-  readonly maintenanceSecretFor: (record: FleetRecord) => string;
-  readonly staleAfterMs: number;
-  readonly now?: number;
-}): Promise<readonly DriftFinding[]> {
-  if (!Number.isSafeInteger(options.staleAfterMs) || options.staleAfterMs < 1) {
-    throw new Error('staleAfterMs must be a positive safe integer');
-  }
-  const now = options.now ?? Date.now();
-  const findings: DriftFinding[] = [...options.inventory.findings];
-  // A deployment under active bounded cleanup is audit-suppressed in both
-  // directions: it feeds no expectations (no missing/duplicate findings) and
-  // its declared resource identities join the known sets below so its
-  // still-present resources never read as orphans. The bounded engine is the
-  // reconciliation authority; a long-blocked cleanup stays visible through
-  // the record itself, never through drift findings.
-  const auditedRecords = options.records.filter(
-    (record) => !hasActiveCleanup(record),
-  );
+// ---------------------------------------------------------------------------
+// Audit set-builders (R4-B.2): pure derivations over `records`/`inventory`
+// that both the drain and the bounded coordinator's global stages consume.
+// Each mirrors one pre-decomposition accumulation exactly; none emits
+// findings.
+// ---------------------------------------------------------------------------
+
+export function fleetAuditAuditedRecords(
+  records: readonly FleetRecord[],
+): readonly FleetRecord[] {
+  return records.filter((record) => !hasActiveCleanup(record));
+}
+
+/** The five orphan-suppression sets seeded from records under active cleanup. */
+export interface FleetAuditKnownSets {
+  readonly knownScriptKeys: ReadonlySet<string>;
+  readonly knownRouteKeys: ReadonlySet<string>;
+  readonly knownDatabaseIds: ReadonlySet<string>;
+  readonly knownNamespaceIds: ReadonlySet<string>;
+  readonly knownBucketNames: ReadonlySet<string>;
+}
+
+export function fleetAuditKnownSets(
+  records: readonly FleetRecord[],
+): FleetAuditKnownSets {
   const knownScriptKeys = new Set<string>();
   const knownRouteKeys = new Set<string>();
   const knownDatabaseIds = new Set<string>();
   const knownNamespaceIds = new Set<string>();
   const knownBucketNames = new Set<string>();
-  for (const record of options.records) {
+  for (const record of records) {
     if (!hasActiveCleanup(record)) continue;
     const scriptKeys = cleanupKnownScriptKeys(record);
     for (const key of scriptKeys) {
@@ -606,6 +629,18 @@ export async function auditFleetDrift(options: {
       knownBucketNames.add(resource.bucketName);
     }
   }
+  return {
+    knownScriptKeys,
+    knownRouteKeys,
+    knownDatabaseIds,
+    knownNamespaceIds,
+    knownBucketNames,
+  };
+}
+
+export function fleetAuditRecordsByScript(
+  auditedRecords: readonly FleetRecord[],
+): ReadonlyMap<string, readonly FleetRecord[]> {
   const recordsByScript = new Map<string, FleetRecord[]>();
   for (const record of auditedRecords) {
     for (const expected of expectedDeploymentKeys(record)) {
@@ -615,12 +650,174 @@ export async function auditFleetDrift(options: {
       recordsByScript.set(key, matches);
     }
   }
-  for (const registration of options.inventory.scriptRegistrations) {
+  return recordsByScript;
+}
+
+export function fleetAuditLiveByScript(
+  deployments: readonly FleetInventoryDeployment[],
+): ReadonlyMap<string, readonly FleetInventoryDeployment[]> {
+  const liveByScript = new Map<string, FleetInventoryDeployment[]>();
+  for (const deployment of deployments) {
+    const key = `${deployment.backend}:${deployment.scriptName}`;
+    const matches = liveByScript.get(key) ?? [];
+    matches.push(deployment);
+    liveByScript.set(key, matches);
+  }
+  return liveByScript;
+}
+
+export function fleetAuditRegisteredDatabaseIds(
+  auditedRecords: readonly FleetRecord[],
+): ReadonlySet<string> {
+  return new Set(
+    auditedRecords.filter(expectsDatabase).map((record) => record.databaseId),
+  );
+}
+
+export function fleetAuditExpectedRoutes(
+  auditedRecords: readonly FleetRecord[],
+): ReadonlyMap<
+  string,
+  Readonly<{ record: FleetRecord; scriptNames: readonly string[] }>
+> {
+  return new Map(
+    auditedRecords
+      .filter(expectsRoute)
+      .map((record) => [
+        record.routeHostname,
+        { record, scriptNames: allowedRouteScriptNames(record) },
+      ]),
+  );
+}
+
+export function fleetAuditLiveRoutesByHostname(
+  routes: readonly FleetResourceInventory['routes'][number][],
+): ReadonlyMap<string, readonly FleetResourceInventory['routes'][number][]> {
+  const liveRoutesByHostname = new Map<
+    string,
+    FleetResourceInventory['routes'][number][]
+  >();
+  for (const route of routes) {
+    const routeMatches = liveRoutesByHostname.get(route.hostname) ?? [];
+    routeMatches.push(route);
+    liveRoutesByHostname.set(route.hostname, routeMatches);
+  }
+  return liveRoutesByHostname;
+}
+
+export function fleetAuditExpectedNamespaceIds(
+  auditedRecords: readonly FleetRecord[],
+): ReadonlySet<string> {
+  return new Set(
+    auditedRecords
+      .filter(expectsNamespaces)
+      .flatMap(expectedNamespaceIdsForRecord),
+  );
+}
+
+/**
+ * The one first-owner-wins walk over the namespace claims of every
+ * namespace-expecting record, in record then namespace order. The
+ * `namespace-expectations` stage (emission), its prefix/full seed (the map),
+ * and the records-derived duplicate set (the collisions) all run through it,
+ * so the claim rule exists once (R4-B.2 §6.4 SEED DERIVATION). `owners` is
+ * mutated in place; `onClaim` receives the prior owner, undefined when this
+ * record has just become the owner.
+ */
+function walkNamespaceClaims(
+  records: readonly FleetRecord[],
+  owners: Map<string, FleetRecord>,
+  onClaim: (
+    record: FleetRecord,
+    namespaceId: string,
+    priorOwner: FleetRecord | undefined,
+  ) => void,
+): void {
+  for (const record of records.filter(expectsNamespaces)) {
+    for (const namespaceId of expectedNamespaceIdsForRecord(record)) {
+      const priorOwner = owners.get(namespaceId);
+      if (!priorOwner) owners.set(namespaceId, record);
+      onClaim(record, namespaceId, priorOwner);
+    }
+  }
+}
+
+/**
+ * The records-derived expected-duplicate seed (R4-B.2 §6.1): the set of
+ * namespace ids more than one audited, namespace-expecting record claims.
+ * Pure over `auditedRecords`, independent of chunk position — equal to what
+ * the `namespace-expectations` stage's own first-owner loop accumulates by
+ * the time it completes.
+ */
+export function fleetAuditRecordsDerivedDuplicateNamespaceIds(
+  auditedRecords: readonly FleetRecord[],
+): ReadonlySet<string> {
+  const duplicates = new Set<string>();
+  walkNamespaceClaims(
+    auditedRecords,
+    new Map(),
+    (_record, namespaceId, priorOwner) => {
+      if (priorOwner) duplicates.add(namespaceId);
+    },
+  );
+  return duplicates;
+}
+
+/**
+ * First-owner-wins replay of the `namespace-expectations` claim loop with no
+ * emission, used both to seed a bounded chunk's prefix and (over the full
+ * audited-record list) to reconstruct the stage's finished map.
+ */
+export function fleetAuditExpectedNamespaceOwnersSeed(
+  records: readonly FleetRecord[],
+): Map<string, FleetRecord> {
+  const owners = new Map<string, FleetRecord>();
+  walkNamespaceClaims(records, owners, () => undefined);
+  return owners;
+}
+
+export type FleetAuditExpectedBucketEntry = Readonly<{
+  record: FleetRecord;
+  resource: NonNullable<FleetRecord['applicationResources']>[number];
+}>;
+
+/**
+ * First-claim-wins replay of the `r2-expected` claim loop with no emission,
+ * used both to seed a bounded chunk's prefix and (over the full audited-
+ * record list) to reconstruct the stage's finished map for
+ * `r2-orphans`/`r2-missing-identity`.
+ */
+export function fleetAuditExpectedBucketsSeed(
+  records: readonly FleetRecord[],
+): Map<string, FleetAuditExpectedBucketEntry> {
+  const expectedBuckets = new Map<string, FleetAuditExpectedBucketEntry>();
+  // The emitting stage over an EMPTY map is exactly the non-emitting
+  // rebuild; its findings are discarded (R4-B.2 §6.4 SEED DERIVATION).
+  auditR2ExpectedStage({ records, expectedBuckets });
+  return expectedBuckets;
+}
+
+// ---------------------------------------------------------------------------
+// Audit global stage functions (R4-B.2). Each takes an iteration slice plus
+// its derived sets and returns the findings for that slice, in the same
+// order `auditFleetDrift`'s pre-decomposition body pushed them.
+// ---------------------------------------------------------------------------
+
+export function auditRegistrationOrphansStage(
+  input: Readonly<{
+    scriptRegistrations: readonly FleetResourceInventory['scriptRegistrations'][number][];
+    deployments: readonly FleetInventoryDeployment[];
+    recordsByScript: ReadonlyMap<string, readonly FleetRecord[]>;
+    knownScriptKeys: ReadonlySet<string>;
+  }>,
+): readonly DriftFinding[] {
+  const findings: DriftFinding[] = [];
+  for (const registration of input.scriptRegistrations) {
     const key = `workers-for-platforms:${registration.scriptName}`;
     if (
-      !recordsByScript.has(key) &&
-      !knownScriptKeys.has(key) &&
-      !options.inventory.deployments.some(
+      !input.recordsByScript.has(key) &&
+      !input.knownScriptKeys.has(key) &&
+      !input.deployments.some(
         (deployment) =>
           deployment.backend === 'workers-for-platforms' &&
           deployment.scriptName === registration.scriptName,
@@ -634,16 +831,20 @@ export async function auditFleetDrift(options: {
       });
     }
   }
-  const liveByScript = new Map<
-    string,
-    FleetResourceInventory['deployments'][number][]
-  >();
-  for (const deployment of options.inventory.deployments) {
+  return findings;
+}
+
+export function auditDeploymentOrphansStage(
+  input: Readonly<{
+    deployments: readonly FleetInventoryDeployment[];
+    recordsByScript: ReadonlyMap<string, readonly FleetRecord[]>;
+    knownScriptKeys: ReadonlySet<string>;
+  }>,
+): readonly DriftFinding[] {
+  const findings: DriftFinding[] = [];
+  for (const deployment of input.deployments) {
     const key = `${deployment.backend}:${deployment.scriptName}`;
-    const matches = liveByScript.get(key) ?? [];
-    matches.push(deployment);
-    liveByScript.set(key, matches);
-    if (!recordsByScript.has(key) && !knownScriptKeys.has(key)) {
+    if (!input.recordsByScript.has(key) && !input.knownScriptKeys.has(key)) {
       findings.push({
         tenantTag: deployment.tenantTag,
         environment: deployment.environment,
@@ -652,13 +853,24 @@ export async function auditFleetDrift(options: {
       });
     }
   }
-  for (const record of auditedRecords) {
+  return findings;
+}
+
+export function auditDeploymentGapsStage(
+  input: Readonly<{
+    records: readonly FleetRecord[];
+    liveByScript: ReadonlyMap<string, readonly FleetInventoryDeployment[]>;
+    scriptRegistrations: readonly FleetResourceInventory['scriptRegistrations'][number][];
+  }>,
+): readonly DriftFinding[] {
+  const findings: DriftFinding[] = [];
+  for (const record of input.records) {
     for (const expected of expectedDeploymentKeys(record)) {
       const key = `${expected.backend}:${expected.scriptName}`;
-      const liveMatches = liveByScript.get(key) ?? [];
+      const liveMatches = input.liveByScript.get(key) ?? [];
       const registered =
         expected.backend !== 'workers-for-platforms' ||
-        options.inventory.scriptRegistrations.some(
+        input.scriptRegistrations.some(
           (registration) =>
             registration.scriptName === expected.scriptName &&
             registration.tenantTag === record.tenantTag &&
@@ -686,13 +898,21 @@ export async function auditFleetDrift(options: {
       }
     }
   }
-  const registeredDatabaseIds = new Set(
-    auditedRecords.filter(expectsDatabase).map((record) => record.databaseId),
-  );
-  for (const databaseId of options.inventory.databaseIds) {
+  return findings;
+}
+
+export function auditOrphanDatabasesStage(
+  input: Readonly<{
+    databaseIds: readonly string[];
+    registeredDatabaseIds: ReadonlySet<string>;
+    knownDatabaseIds: ReadonlySet<string>;
+  }>,
+): readonly DriftFinding[] {
+  const findings: DriftFinding[] = [];
+  for (const databaseId of input.databaseIds) {
     if (
-      !registeredDatabaseIds.has(databaseId) &&
-      !knownDatabaseIds.has(databaseId)
+      !input.registeredDatabaseIds.has(databaseId) &&
+      !input.knownDatabaseIds.has(databaseId)
     ) {
       findings.push({
         tenantTag: 'unknown',
@@ -702,24 +922,25 @@ export async function auditFleetDrift(options: {
       });
     }
   }
-  const expectedRoutes = new Map(
-    auditedRecords
-      .filter(expectsRoute)
-      .map((record) => [
-        record.routeHostname,
-        { record, scriptNames: allowedRouteScriptNames(record) },
-      ]),
-  );
-  const liveRoutesByHostname = new Map<
-    string,
-    FleetResourceInventory['routes'][number][]
-  >();
-  for (const route of options.inventory.routes) {
-    const routeMatches = liveRoutesByHostname.get(route.hostname) ?? [];
-    routeMatches.push(route);
-    liveRoutesByHostname.set(route.hostname, routeMatches);
-    const expected = expectedRoutes.get(route.hostname);
-    if (knownRouteKeys.has(`${route.hostname}:${route.scriptName}`)) continue;
+  return findings;
+}
+
+export function auditOrphanRoutesStage(
+  input: Readonly<{
+    routes: readonly FleetResourceInventory['routes'][number][];
+    expectedRoutes: ReadonlyMap<
+      string,
+      Readonly<{ record: FleetRecord; scriptNames: readonly string[] }>
+    >;
+    knownRouteKeys: ReadonlySet<string>;
+  }>,
+): readonly DriftFinding[] {
+  const findings: DriftFinding[] = [];
+  for (const route of input.routes) {
+    const expected = input.expectedRoutes.get(route.hostname);
+    if (input.knownRouteKeys.has(`${route.hostname}:${route.scriptName}`)) {
+      continue;
+    }
     if (
       !expected ||
       expected.record.backend !== route.backend ||
@@ -736,19 +957,21 @@ export async function auditFleetDrift(options: {
       });
     }
   }
-  const databases = new Map<string, FleetRecord>();
-  const expectedNamespaceOwners = new Map<string, FleetRecord>();
-  const liveNamespaceOwners = new Map<string, FleetRecord>();
-  const duplicateNamespaceIds = new Set<string>();
-  const expectedNamespaceIds = new Set(
-    auditedRecords
-      .filter(expectsNamespaces)
-      .flatMap(expectedNamespaceIdsForRecord),
-  );
-  for (const namespaceId of options.inventory.namespaceIds) {
+  return findings;
+}
+
+export function auditNamespaceOrphansStage(
+  input: Readonly<{
+    namespaceIds: readonly string[];
+    expectedNamespaceIds: ReadonlySet<string>;
+    knownNamespaceIds: ReadonlySet<string>;
+  }>,
+): readonly DriftFinding[] {
+  const findings: DriftFinding[] = [];
+  for (const namespaceId of input.namespaceIds) {
     if (
-      !expectedNamespaceIds.has(namespaceId) &&
-      !knownNamespaceIds.has(namespaceId)
+      !input.expectedNamespaceIds.has(namespaceId) &&
+      !input.knownNamespaceIds.has(namespaceId)
     ) {
       findings.push({
         tenantTag: 'unknown',
@@ -758,21 +981,32 @@ export async function auditFleetDrift(options: {
       });
     }
   }
-  for (const record of auditedRecords.filter(expectsNamespaces)) {
-    for (const namespaceId of expectedNamespaceIdsForRecord(record)) {
-      const namespaceOwner = expectedNamespaceOwners.get(namespaceId);
+  return findings;
+}
+
+export function auditNamespaceExpectationsStage(
+  input: Readonly<{
+    records: readonly FleetRecord[];
+    inventoryNamespaceIds: readonly string[];
+    /** Pre-seeded by the caller (empty for the drain's one full-array call; the
+     *  §6.1 prefix rebuild for a bounded chunk); mutated in place. */
+    expectedNamespaceOwners: Map<string, FleetRecord>;
+  }>,
+): readonly DriftFinding[] {
+  const findings: DriftFinding[] = [];
+  walkNamespaceClaims(
+    input.records,
+    input.expectedNamespaceOwners,
+    (record, namespaceId, namespaceOwner) => {
       if (namespaceOwner) {
-        duplicateNamespaceIds.add(namespaceId);
         findings.push({
           tenantTag: record.tenantTag,
           environment: record.environment,
           kind: 'duplicate-namespace',
           detail: `namespace '${namespaceId}' also bound to ${namespaceOwner.tenantTag}:${namespaceOwner.environment}`,
         });
-      } else {
-        expectedNamespaceOwners.set(namespaceId, record);
       }
-      if (!options.inventory.namespaceIds.includes(namespaceId)) {
+      if (!input.inventoryNamespaceIds.includes(namespaceId)) {
         findings.push({
           tenantTag: record.tenantTag,
           environment: record.environment,
@@ -780,19 +1014,21 @@ export async function auditFleetDrift(options: {
           detail: `expected Durable Object namespace '${namespaceId}' is absent from fleet inventory`,
         });
       }
-    }
-  }
+    },
+  );
+  return findings;
+}
 
-  const expectedBuckets = new Map<
-    string,
-    {
-      readonly record: FleetRecord;
-      readonly resource: NonNullable<
-        FleetRecord['applicationResources']
-      >[number];
-    }
-  >();
-  for (const record of auditedRecords) {
+export function auditR2ExpectedStage(
+  input: Readonly<{
+    records: readonly FleetRecord[];
+    /** Pre-seeded by the caller (empty for the drain's one full-array call; the
+     *  §6.1 prefix rebuild for a bounded chunk); mutated in place. */
+    expectedBuckets: Map<string, FleetAuditExpectedBucketEntry>;
+  }>,
+): readonly DriftFinding[] {
+  const findings: DriftFinding[] = [];
+  for (const record of input.records) {
     const phase = effectiveLifecyclePhase(record);
     if (
       [
@@ -806,7 +1042,7 @@ export async function auditFleetDrift(options: {
     }
     for (const resource of record.applicationResources ?? []) {
       if (resource.state !== 'created' || !resource.creationDate) continue;
-      const prior = expectedBuckets.get(resource.bucketName);
+      const prior = input.expectedBuckets.get(resource.bucketName);
       if (prior) {
         findings.push({
           tenantTag: record.tenantTag,
@@ -815,20 +1051,27 @@ export async function auditFleetDrift(options: {
           detail: `R2 bucket '${resource.bucketName}' is claimed by more than one deployment`,
         });
       } else {
-        expectedBuckets.set(resource.bucketName, { record, resource });
+        input.expectedBuckets.set(resource.bucketName, { record, resource });
       }
     }
   }
-  const liveBuckets = new Map(
-    (options.inventory.r2Buckets ?? []).map((bucket) => [
-      bucket.bucketName,
-      bucket,
-    ]),
-  );
-  for (const bucket of options.inventory.r2Buckets ?? []) {
+  return findings;
+}
+
+export function auditR2OrphansStage(
+  input: Readonly<{
+    r2Buckets: readonly NonNullable<
+      FleetResourceInventory['r2Buckets']
+    >[number][];
+    expectedBuckets: ReadonlyMap<string, unknown>;
+    knownBucketNames: ReadonlySet<string>;
+  }>,
+): readonly DriftFinding[] {
+  const findings: DriftFinding[] = [];
+  for (const bucket of input.r2Buckets) {
     if (
-      !expectedBuckets.has(bucket.bucketName) &&
-      !knownBucketNames.has(bucket.bucketName)
+      !input.expectedBuckets.has(bucket.bucketName) &&
+      !input.knownBucketNames.has(bucket.bucketName)
     ) {
       findings.push({
         tenantTag: 'unknown',
@@ -838,7 +1081,22 @@ export async function auditFleetDrift(options: {
       });
     }
   }
-  for (const { record, resource } of expectedBuckets.values()) {
+  return findings;
+}
+
+export function auditR2MissingIdentityStage(
+  input: Readonly<{
+    expectedBucketEntries: readonly FleetAuditExpectedBucketEntry[];
+    r2Buckets: readonly NonNullable<
+      FleetResourceInventory['r2Buckets']
+    >[number][];
+  }>,
+): readonly DriftFinding[] {
+  const liveBuckets = new Map(
+    input.r2Buckets.map((bucket) => [bucket.bucketName, bucket]),
+  );
+  const findings: DriftFinding[] = [];
+  for (const { record, resource } of input.expectedBucketEntries) {
     const live = liveBuckets.get(resource.bucketName);
     if (!live) {
       findings.push({
@@ -859,545 +1117,761 @@ export async function auditFleetDrift(options: {
       });
     }
   }
+  return findings;
+}
 
-  for (const record of options.records) {
-    // A stale or blocked bounded cleanup must not read as
-    // incomplete-provisioning, version, binding, or route drift.
-    if (hasActiveCleanup(record)) continue;
-    const phase = effectiveLifecyclePhase(record);
-    const recordMatches =
-      recordsByScript.get(`${record.backend}:${liveScriptName(record)}`) ?? [];
-    if (recordMatches.length > 1) {
-      findings.push({
+// ---------------------------------------------------------------------------
+// Per-record audit step (R4-B.2). Frozen result shape per §6.3: `findings`
+// carries the sanitized durable detail; `legacyDetails` is index-paired and
+// holds the exact legacy byte composition only where it differs (raw
+// diagnostic bytes), null where identical. The drain emits
+// `legacyDetails[i] ?? detail`; the bounded coordinator persists `detail`
+// alone.
+// ---------------------------------------------------------------------------
+
+export interface FleetAuditRecordStepResult {
+  readonly findings: readonly DriftFinding[];
+  readonly legacyDetails: readonly (string | null)[];
+}
+
+export interface FleetAuditRecordStepInput {
+  readonly record: FleetRecord;
+  readonly recordsByScript: ReadonlyMap<string, readonly FleetRecord[]>;
+  readonly liveByScript: ReadonlyMap<
+    string,
+    readonly FleetInventoryDeployment[]
+  >;
+  readonly liveRoutesByHostname: ReadonlyMap<
+    string,
+    readonly FleetResourceInventory['routes'][number][]
+  >;
+  readonly inventoryDatabaseIds: readonly string[];
+  readonly hostRoutingKvId: string | undefined;
+  /** Cross-record inspection facts; mutated in place across a caller's loop. */
+  readonly databases: Map<string, FleetRecord>;
+  readonly liveNamespaceOwners: Map<string, FleetRecord>;
+  readonly duplicateNamespaceIds: Set<string>;
+  readonly backendFor: (record: FleetRecord) => ProvisioningBackend;
+  readonly specFor: (record: FleetRecord) => DeploymentSpec;
+  readonly maintenanceSecretFor: (record: FleetRecord) => string;
+  readonly store: FleetStateStore;
+  readonly staleAfterMs: number;
+  /** Drives every staleness comparison (§6.1). */
+  readonly auditNow: number;
+  /** Feeds only the re-arm's `commitInvocationAuthority` clock (§6.1). */
+  readonly authorityNowProvider: () => number;
+}
+
+export async function auditRecordStep(
+  input: FleetAuditRecordStepInput,
+): Promise<FleetAuditRecordStepResult> {
+  const { record } = input;
+  const findings: DriftFinding[] = [];
+  const legacyDetails: (string | null)[] = [];
+  const push = (finding: DriftFinding, legacyDetail: string | null = null) => {
+    findings.push(finding);
+    legacyDetails.push(legacyDetail);
+  };
+  // A stale or blocked bounded cleanup must not read as incomplete-
+  // provisioning, version, binding, or route drift; an empty per-record
+  // ordinal advances with zero findings and zero provider work.
+  if (hasActiveCleanup(record)) return { findings, legacyDetails };
+  const phase = effectiveLifecyclePhase(record);
+  const recordMatches =
+    input.recordsByScript.get(`${record.backend}:${liveScriptName(record)}`) ??
+    [];
+  if (recordMatches.length > 1) {
+    push({
+      tenantTag: record.tenantTag,
+      environment: record.environment,
+      kind: 'duplicate-deployment',
+      detail: `script '${record.scriptName}' is registered ${recordMatches.length} times`,
+    });
+  }
+  const inventoryMatches =
+    input.liveByScript.get(`${record.backend}:${liveScriptName(record)}`) ?? [];
+  const inventoryDeployment = inventoryMatches[0];
+  const recordUpdatedAt = Date.parse(record.updatedAt);
+  if (
+    phase !== 'ready' &&
+    (!Number.isFinite(recordUpdatedAt) ||
+      input.auditNow - recordUpdatedAt > input.staleAfterMs)
+  ) {
+    push({
+      tenantTag: record.tenantTag,
+      environment: record.environment,
+      kind: 'incomplete-provisioning',
+      detail: `phase '${phase}' has not advanced`,
+    });
+  }
+  const expectedReleases = expectedReleaseSnapshots(record);
+  for (const release of expectedReleases) {
+    const matches =
+      input.liveByScript.get(
+        `${record.backend}:${release.physicalScriptName}`,
+      ) ?? [];
+    if (matches.length !== 1) continue;
+    const liveRelease = matches[0];
+    if (!liveRelease) continue;
+    if (
+      liveRelease.tenantTag !== record.tenantTag ||
+      liveRelease.environment !== record.environment ||
+      liveRelease.artifactVersion !== release.artifactVersion ||
+      liveRelease.schemaVersion !== release.releaseSchemaVersion ||
+      liveRelease.desiredSpecDigest !== release.specDigest
+    ) {
+      push({
         tenantTag: record.tenantTag,
         environment: record.environment,
-        kind: 'duplicate-deployment',
-        detail: `script '${record.scriptName}' is registered ${recordMatches.length} times`,
+        kind: 'version-drift',
+        detail: `lifecycle release '${release.physicalScriptName}' does not match its persisted identity, artifact, schema, and spec digest`,
       });
     }
-    const inventoryMatches =
-      liveByScript.get(`${record.backend}:${liveScriptName(record)}`) ?? [];
-    const inventoryDeployment = inventoryMatches[0];
-    const recordUpdatedAt = Date.parse(record.updatedAt);
     if (
-      phase !== 'ready' &&
-      (!Number.isFinite(recordUpdatedAt) ||
-        now - recordUpdatedAt > options.staleAfterMs)
+      liveRelease.databaseIds.length !== 1 ||
+      liveRelease.databaseIds[0] !== record.databaseId
     ) {
-      findings.push({
-        tenantTag: record.tenantTag,
-        environment: record.environment,
-        kind: 'incomplete-provisioning',
-        detail: `phase '${phase}' has not advanced`,
-      });
-    }
-    const expectedReleases = expectedReleaseSnapshots(record);
-    for (const release of expectedReleases) {
-      const matches =
-        liveByScript.get(`${record.backend}:${release.physicalScriptName}`) ??
-        [];
-      if (matches.length !== 1) continue;
-      const liveRelease = matches[0];
-      if (!liveRelease) continue;
-      if (
-        liveRelease.tenantTag !== record.tenantTag ||
-        liveRelease.environment !== record.environment ||
-        liveRelease.artifactVersion !== release.artifactVersion ||
-        liveRelease.schemaVersion !== release.releaseSchemaVersion ||
-        liveRelease.desiredSpecDigest !== release.specDigest
-      ) {
-        findings.push({
-          tenantTag: record.tenantTag,
-          environment: record.environment,
-          kind: 'version-drift',
-          detail: `lifecycle release '${release.physicalScriptName}' does not match its persisted identity, artifact, schema, and spec digest`,
-        });
-      }
-      if (
-        liveRelease.databaseIds.length !== 1 ||
-        liveRelease.databaseIds[0] !== record.databaseId
-      ) {
-        findings.push({
-          tenantTag: record.tenantTag,
-          environment: record.environment,
-          kind: 'database-mismatch',
-          detail: `lifecycle release '${release.physicalScriptName}' is not bound exactly to database '${record.databaseId}'`,
-        });
-      }
-      if (!release.topology) {
-        findings.push({
-          tenantTag: record.tenantTag,
-          environment: record.environment,
-          kind: 'audit-error',
-          detail: `lifecycle release '${release.physicalScriptName}' has no durable binding topology`,
-        });
-      } else if (
-        JSON.stringify(
-          liveRelease.durableObjectBindings.map(fullBindingKey).sort(),
-        ) !==
-          JSON.stringify(
-            release.topology.durableObjectBindings.map(fullBindingKey).sort(),
-          ) ||
-        JSON.stringify(namedTargetKeys(liveRelease.serviceBindings ?? [])) !==
-          JSON.stringify(namedTargetKeys(release.topology.serviceBindings)) ||
-        JSON.stringify(
-          namedTargetKeys(liveRelease.queueProducerBindings ?? []),
-        ) !==
-          JSON.stringify(
-            namedTargetKeys(release.topology.queueProducerBindings),
-          ) ||
-        JSON.stringify([...liveRelease.secretNames].sort()) !==
-          JSON.stringify([...release.topology.secretNames].sort()) ||
-        !liveApplicationTopologyMatches(
-          release.topology.application,
-          liveRelease,
-          DEPLOYMENT_PLATFORM_VARIABLE_NAMES,
-        )
-      ) {
-        findings.push({
-          tenantTag: record.tenantTag,
-          environment: record.environment,
-          kind: 'binding-drift',
-          detail: `lifecycle release '${release.physicalScriptName}' has drifted Durable Object, service, queue, application variable, R2, or secret topology`,
-        });
-      }
-    }
-    if (phase !== 'ready') continue;
-    if (!inventoryDeployment) {
-      continue;
-    }
-    if (
-      inventoryDeployment.databaseIds.length !== 1 ||
-      inventoryDeployment.databaseIds[0] !== record.databaseId ||
-      !options.inventory.databaseIds.includes(record.databaseId)
-    ) {
-      findings.push({
+      push({
         tenantTag: record.tenantTag,
         environment: record.environment,
         kind: 'database-mismatch',
-        detail: `fleet inventory does not contain exactly database '${record.databaseId}' for '${record.scriptName}'`,
+        detail: `lifecycle release '${release.physicalScriptName}' is not bound exactly to database '${record.databaseId}'`,
       });
     }
-    const routeOwnerDeployments = allowedRouteScriptNames(record).flatMap(
-      (scriptName) => liveByScript.get(`${record.backend}:${scriptName}`) ?? [],
-    );
-    if (
-      routeOwnerDeployments.filter(
-        (deployment) =>
-          deployment.routeHostnames.length === 1 &&
-          deployment.routeHostnames[0] === record.routeHostname,
-      ).length !== 1 ||
-      routeOwnerDeployments.some((deployment) =>
-        deployment.routeHostnames.some(
-          (hostname) => hostname !== record.routeHostname,
-        ),
-      )
-    ) {
-      findings.push({
+    if (!release.topology) {
+      push({
         tenantTag: record.tenantTag,
         environment: record.environment,
-        kind: 'route-drift',
-        detail: `deployment inventory does not contain exactly route '${record.routeHostname}'`,
+        kind: 'audit-error',
+        detail: `lifecycle release '${release.physicalScriptName}' has no durable binding topology`,
       });
-    }
-    const expectedBindingKeys = [...record.durableObjectBindings]
-      .map(bindingKey)
-      .sort();
-    const liveBindingKeys = [...inventoryDeployment.durableObjectBindings]
-      .map(bindingKey)
-      .sort();
-    if (
-      JSON.stringify(expectedBindingKeys) !== JSON.stringify(liveBindingKeys)
+    } else if (
+      JSON.stringify(
+        liveRelease.durableObjectBindings.map(fullBindingKey).sort(),
+      ) !==
+        JSON.stringify(
+          release.topology.durableObjectBindings.map(fullBindingKey).sort(),
+        ) ||
+      JSON.stringify(namedTargetKeys(liveRelease.serviceBindings ?? [])) !==
+        JSON.stringify(namedTargetKeys(release.topology.serviceBindings)) ||
+      JSON.stringify(
+        namedTargetKeys(liveRelease.queueProducerBindings ?? []),
+      ) !==
+        JSON.stringify(
+          namedTargetKeys(release.topology.queueProducerBindings),
+        ) ||
+      JSON.stringify([...liveRelease.secretNames].sort()) !==
+        JSON.stringify([...release.topology.secretNames].sort()) ||
+      !liveApplicationTopologyMatches(
+        release.topology.application,
+        liveRelease,
+        DEPLOYMENT_PLATFORM_VARIABLE_NAMES,
+      )
     ) {
-      findings.push({
+      push({
         tenantTag: record.tenantTag,
         environment: record.environment,
         kind: 'binding-drift',
-        detail: `expected ${expectedBindingKeys.join(',') || 'no bindings'}, found ${liveBindingKeys.join(',') || 'no bindings'}`,
+        detail: `lifecycle release '${release.physicalScriptName}' has drifted Durable Object, service, queue, application variable, R2, or secret topology`,
       });
     }
-    const routeMatches = liveRoutesByHostname.get(record.routeHostname) ?? [];
-    if (routeMatches.length > 1) {
-      findings.push({
-        tenantTag: record.tenantTag,
-        environment: record.environment,
-        kind: 'duplicate-route',
-        detail: `route '${record.routeHostname}' appears ${routeMatches.length} times`,
-      });
-    }
-    const route = routeMatches[0];
-    if (
-      !route ||
-      route.backend !== record.backend ||
-      route.tenantTag !== record.tenantTag ||
-      route.environment !== record.environment ||
-      !routeMatchesRecord(route, record)
-    ) {
-      findings.push({
-        tenantTag: record.tenantTag,
-        environment: record.environment,
-        kind: 'route-drift',
-        detail: `route '${record.routeHostname}' is missing or mismatched`,
-      });
-    }
-    let backend: ProvisioningBackend;
-    try {
-      backend = options.backendFor(record);
-    } catch (error) {
-      findings.push({
+  }
+  if (phase !== 'ready') return { findings, legacyDetails };
+  if (!inventoryDeployment) {
+    return { findings, legacyDetails };
+  }
+  if (
+    inventoryDeployment.databaseIds.length !== 1 ||
+    inventoryDeployment.databaseIds[0] !== record.databaseId ||
+    !input.inventoryDatabaseIds.includes(record.databaseId)
+  ) {
+    push({
+      tenantTag: record.tenantTag,
+      environment: record.environment,
+      kind: 'database-mismatch',
+      detail: `fleet inventory does not contain exactly database '${record.databaseId}' for '${record.scriptName}'`,
+    });
+  }
+  const routeOwnerDeployments = allowedRouteScriptNames(record).flatMap(
+    (scriptName) =>
+      input.liveByScript.get(`${record.backend}:${scriptName}`) ?? [],
+  );
+  if (
+    routeOwnerDeployments.filter(
+      (deployment) =>
+        deployment.routeHostnames.length === 1 &&
+        deployment.routeHostnames[0] === record.routeHostname,
+    ).length !== 1 ||
+    routeOwnerDeployments.some((deployment) =>
+      deployment.routeHostnames.some(
+        (hostname) => hostname !== record.routeHostname,
+      ),
+    )
+  ) {
+    push({
+      tenantTag: record.tenantTag,
+      environment: record.environment,
+      kind: 'route-drift',
+      detail: `deployment inventory does not contain exactly route '${record.routeHostname}'`,
+    });
+  }
+  const expectedBindingKeys = [...record.durableObjectBindings]
+    .map(bindingKey)
+    .sort();
+  const liveBindingKeys = [...inventoryDeployment.durableObjectBindings]
+    .map(bindingKey)
+    .sort();
+  if (JSON.stringify(expectedBindingKeys) !== JSON.stringify(liveBindingKeys)) {
+    push({
+      tenantTag: record.tenantTag,
+      environment: record.environment,
+      kind: 'binding-drift',
+      detail: `expected ${expectedBindingKeys.join(',') || 'no bindings'}, found ${liveBindingKeys.join(',') || 'no bindings'}`,
+    });
+  }
+  const routeMatches =
+    input.liveRoutesByHostname.get(record.routeHostname) ?? [];
+  if (routeMatches.length > 1) {
+    push({
+      tenantTag: record.tenantTag,
+      environment: record.environment,
+      kind: 'duplicate-route',
+      detail: `route '${record.routeHostname}' appears ${routeMatches.length} times`,
+    });
+  }
+  const route = routeMatches[0];
+  if (
+    !route ||
+    route.backend !== record.backend ||
+    route.tenantTag !== record.tenantTag ||
+    route.environment !== record.environment ||
+    !routeMatchesRecord(route, record)
+  ) {
+    push({
+      tenantTag: record.tenantTag,
+      environment: record.environment,
+      kind: 'route-drift',
+      detail: `route '${record.routeHostname}' is missing or mismatched`,
+    });
+  }
+  let backend: ProvisioningBackend;
+  try {
+    backend = input.backendFor(record);
+  } catch (error) {
+    push(
+      {
         tenantTag: record.tenantTag,
         environment: record.environment,
         kind: 'audit-error',
-        detail: `backend resolver failed: ${String(error)}`,
-      });
-      continue;
-    }
-    let spec: DeploymentSpec;
-    try {
-      spec = options.specFor(record);
-    } catch (error) {
-      findings.push({
+        detail: 'backend resolver failed',
+      },
+      `backend resolver failed: ${String(error)}`,
+    );
+    return { findings, legacyDetails };
+  }
+  let spec: DeploymentSpec;
+  try {
+    spec = input.specFor(record);
+  } catch (error) {
+    push(
+      {
         tenantTag: record.tenantTag,
         environment: record.environment,
         kind: 'audit-error',
-        detail: `spec resolver failed: ${String(error)}`,
-      });
-      continue;
-    }
-    if (inventoryDeployment) {
-      const expectedServiceBindings =
-        spec.authoredBy === 'external'
-          ? []
-          : spec.egressProxyService
-            ? [{ name: 'EGRESS_PROXY', service: spec.egressProxyService }]
-            : [];
-      const expectedQueueBindings =
-        spec.authoredBy === 'external'
-          ? []
-          : spec.queueProducer
-            ? [
-                {
-                  name: spec.queueProducer.binding,
-                  queueName: spec.queueProducer.queueName,
-                },
-              ]
-            : [];
-      if (
-        JSON.stringify(inventoryDeployment.serviceBindings ?? []) !==
-          JSON.stringify(expectedServiceBindings) ||
-        JSON.stringify(inventoryDeployment.queueProducerBindings ?? []) !==
-          JSON.stringify(expectedQueueBindings)
-      ) {
-        findings.push({
-          tenantTag: record.tenantTag,
-          environment: record.environment,
-          kind: 'binding-drift',
-          detail: `release '${inventoryDeployment.scriptName}' has drifted trusted channel bindings`,
-        });
-      }
-    }
-    let maintenanceSecret: string;
-    try {
-      maintenanceSecret = options.maintenanceSecretFor(record);
-    } catch (error) {
-      findings.push({
-        tenantTag: record.tenantTag,
-        environment: record.environment,
-        kind: 'audit-error',
-        detail: `maintenance secret resolver failed: ${String(error)}`,
-      });
-      continue;
-    }
-    if (record.platformResources) {
-      const groupId = externalPlatformResourceGroupId(spec);
-      const platformExpectations = [
-        {
-          role: 'platform-state' as const,
-          snapshot: record.platformResources.stateWorker,
-          backend:
-            record.platformResources.stateWorker.plane === 'dispatch'
-              ? ('workers-for-platforms' as const)
-              : ('plain-worker' as const),
-        },
-        ...(record.platformResources.egressProxy
+        detail: 'spec resolver failed',
+      },
+      `spec resolver failed: ${String(error)}`,
+    );
+    return { findings, legacyDetails };
+  }
+  if (inventoryDeployment) {
+    const expectedServiceBindings =
+      spec.authoredBy === 'external'
+        ? []
+        : spec.egressProxyService
+          ? [{ name: 'EGRESS_PROXY', service: spec.egressProxyService }]
+          : [];
+    const expectedQueueBindings =
+      spec.authoredBy === 'external'
+        ? []
+        : spec.queueProducer
           ? [
               {
-                role: 'deployment-egress' as const,
-                snapshot: record.platformResources.egressProxy,
-                backend: 'plain-worker' as const,
+                name: spec.queueProducer.binding,
+                queueName: spec.queueProducer.queueName,
               },
             ]
-          : []),
-      ];
-      for (const expected of platformExpectations) {
-        const matches =
-          liveByScript.get(
-            `${expected.backend}:${expected.snapshot.scriptName}`,
-          ) ?? [];
-        const resource = matches[0];
-        if (matches.length !== 1 || !resource) continue;
-        if (
-          resource.resourceRole !== expected.role ||
-          resource.resourceGroupId !== groupId ||
-          resource.tenantTag !== record.tenantTag ||
-          resource.environment !== record.environment ||
-          resource.artifactVersion !== expected.snapshot.artifactVersion
-        ) {
-          findings.push({
-            tenantTag: record.tenantTag,
-            environment: record.environment,
-            kind: 'version-drift',
-            detail: `trusted Worker '${expected.snapshot.scriptName}' has drifted ownership or artifact metadata`,
-          });
-        }
-        if (expected.role === 'platform-state') {
-          const expectedDoKeys =
-            record.platformResources.stateWorker.durableObjectBindings
-              .map(
-                (binding) =>
-                  `${binding.name}:${binding.className}:${binding.namespaceId}`,
-              )
-              .sort();
-          const liveDoKeys = resource.durableObjectBindings
+          : [];
+    if (
+      JSON.stringify(inventoryDeployment.serviceBindings ?? []) !==
+        JSON.stringify(expectedServiceBindings) ||
+      JSON.stringify(inventoryDeployment.queueProducerBindings ?? []) !==
+        JSON.stringify(expectedQueueBindings)
+    ) {
+      push({
+        tenantTag: record.tenantTag,
+        environment: record.environment,
+        kind: 'binding-drift',
+        detail: `release '${inventoryDeployment.scriptName}' has drifted trusted channel bindings`,
+      });
+    }
+  }
+  let maintenanceSecret: string;
+  try {
+    maintenanceSecret = input.maintenanceSecretFor(record);
+  } catch (error) {
+    push(
+      {
+        tenantTag: record.tenantTag,
+        environment: record.environment,
+        kind: 'audit-error',
+        detail: 'maintenance secret resolver failed',
+      },
+      `maintenance secret resolver failed: ${String(error)}`,
+    );
+    return { findings, legacyDetails };
+  }
+  if (record.platformResources) {
+    const groupId = externalPlatformResourceGroupId(spec);
+    const platformExpectations = [
+      {
+        role: 'platform-state' as const,
+        snapshot: record.platformResources.stateWorker,
+        backend:
+          record.platformResources.stateWorker.plane === 'dispatch'
+            ? ('workers-for-platforms' as const)
+            : ('plain-worker' as const),
+      },
+      ...(record.platformResources.egressProxy
+        ? [
+            {
+              role: 'deployment-egress' as const,
+              snapshot: record.platformResources.egressProxy,
+              backend: 'plain-worker' as const,
+            },
+          ]
+        : []),
+    ];
+    for (const expected of platformExpectations) {
+      const matches =
+        input.liveByScript.get(
+          `${expected.backend}:${expected.snapshot.scriptName}`,
+        ) ?? [];
+      const resource = matches[0];
+      if (matches.length !== 1 || !resource) continue;
+      if (
+        resource.resourceRole !== expected.role ||
+        resource.resourceGroupId !== groupId ||
+        resource.tenantTag !== record.tenantTag ||
+        resource.environment !== record.environment ||
+        resource.artifactVersion !== expected.snapshot.artifactVersion
+      ) {
+        push({
+          tenantTag: record.tenantTag,
+          environment: record.environment,
+          kind: 'version-drift',
+          detail: `trusted Worker '${expected.snapshot.scriptName}' has drifted ownership or artifact metadata`,
+        });
+      }
+      if (expected.role === 'platform-state') {
+        const expectedDoKeys =
+          record.platformResources.stateWorker.durableObjectBindings
             .map(
               (binding) =>
                 `${binding.name}:${binding.className}:${binding.namespaceId}`,
             )
             .sort();
-          if (
-            resource.databaseIds.length !== 1 ||
-            resource.databaseIds[0] !== record.databaseId ||
-            JSON.stringify(expectedDoKeys) !== JSON.stringify(liveDoKeys) ||
-            JSON.stringify(resource.serviceBindings ?? []) !==
-              JSON.stringify(
-                record.platformResources.sharedOutboundWorkerName
+        const liveDoKeys = resource.durableObjectBindings
+          .map(
+            (binding) =>
+              `${binding.name}:${binding.className}:${binding.namespaceId}`,
+          )
+          .sort();
+        if (
+          resource.databaseIds.length !== 1 ||
+          resource.databaseIds[0] !== record.databaseId ||
+          JSON.stringify(expectedDoKeys) !== JSON.stringify(liveDoKeys) ||
+          JSON.stringify(resource.serviceBindings ?? []) !==
+            JSON.stringify(
+              record.platformResources.sharedOutboundWorkerName
+                ? [
+                    {
+                      name: 'OUTBOUND_PROXY',
+                      service:
+                        record.platformResources.sharedOutboundWorkerName,
+                      entrypoint: 'StateEgress',
+                    },
+                  ]
+                : record.platformResources.egressProxy
                   ? [
                       {
-                        name: 'OUTBOUND_PROXY',
+                        name: 'EGRESS_PROXY',
                         service:
-                          record.platformResources.sharedOutboundWorkerName,
-                        entrypoint: 'StateEgress',
-                      },
-                    ]
-                  : record.platformResources.egressProxy
-                    ? [
-                        {
-                          name: 'EGRESS_PROXY',
-                          service:
-                            record.platformResources.egressProxy.scriptName,
-                        },
-                      ]
-                    : [],
-              ) ||
-            JSON.stringify(resource.queueProducerBindings ?? []) !==
-              JSON.stringify(
-                record.platformResources.auditQueueName
-                  ? [
-                      {
-                        name: 'AUDIT_QUEUE',
-                        queueName: record.platformResources.auditQueueName,
+                          record.platformResources.egressProxy.scriptName,
                       },
                     ]
                   : [],
-              ) ||
-            JSON.stringify(resource.secretNames) !==
-              JSON.stringify(
-                [
-                  'DEPLOYMENT_IDENTITY_SECRET',
-                  'MAINTENANCE_ADMIN_SECRET',
-                  ...(record.platformResources.sharedOutboundWorkerName
-                    ? ['OUTBOUND_PROXY_CREDENTIAL']
-                    : []),
-                ].sort(),
-              ) ||
-            resource.plainTextBindings?.FLEET_DEPLOYMENT_SCRIPT !==
-              spec.scriptName ||
-            resource.plainTextBindings?.FLEET_MAINTENANCE_CAPABILITIES !==
-              'required' ||
-            resource.plainTextBindings
-              ?.FLEET_MAINTENANCE_CAPABILITY_PUBLIC_KEY !==
-              record.platformResources.maintenanceCapabilityPublicKey ||
-            (resource.plainTextBindings?.FLEET_AUDIT_PROXY_INGRESS ??
-              undefined) !==
-              (record.platformResources.auditQueueName ? 'required' : undefined)
-          ) {
-            findings.push({
-              tenantTag: record.tenantTag,
-              environment: record.environment,
-              kind: 'binding-drift',
-              detail: `trusted state Worker '${expected.snapshot.scriptName}' has drifted database, Durable Object, or egress bindings`,
-            });
-          }
-        } else if (
-          resource.databaseIds.length !== 0 ||
-          resource.durableObjectBindings.length !== 0 ||
-          (resource.serviceBindings?.length ?? 0) !== 0 ||
-          resource.secretNames.length !== 0 ||
-          resource.plainTextBindings?.policyId !==
-            (
-              record.platformResources.outboundPolicy ??
-              record.platformResources.egressProxy
-            )?.policyId ||
-          resource.plainTextBindings?.routeHostname !==
-            record.routeHostname.toLowerCase() ||
-          resource.plainTextBindings?.scriptName !==
-            record.platformResources.stateWorker.scriptName ||
-          !options.inventory.hostRoutingKvId ||
-          resource.plainTextBindings?.hostRoutingKvId !==
-            options.inventory.hostRoutingKvId ||
-          JSON.stringify(resource.kvNamespaceBindings ?? []) !==
-            JSON.stringify([
-              {
-                name: 'HOSTS',
-                namespaceId: options.inventory.hostRoutingKvId,
-              },
-            ])
+            ) ||
+          JSON.stringify(resource.queueProducerBindings ?? []) !==
+            JSON.stringify(
+              record.platformResources.auditQueueName
+                ? [
+                    {
+                      name: 'AUDIT_QUEUE',
+                      queueName: record.platformResources.auditQueueName,
+                    },
+                  ]
+                : [],
+            ) ||
+          JSON.stringify(resource.secretNames) !==
+            JSON.stringify(
+              [
+                'DEPLOYMENT_IDENTITY_SECRET',
+                'MAINTENANCE_ADMIN_SECRET',
+                ...(record.platformResources.sharedOutboundWorkerName
+                  ? ['OUTBOUND_PROXY_CREDENTIAL']
+                  : []),
+              ].sort(),
+            ) ||
+          resource.plainTextBindings?.FLEET_DEPLOYMENT_SCRIPT !==
+            spec.scriptName ||
+          resource.plainTextBindings?.FLEET_MAINTENANCE_CAPABILITIES !==
+            'required' ||
+          resource.plainTextBindings
+            ?.FLEET_MAINTENANCE_CAPABILITY_PUBLIC_KEY !==
+            record.platformResources.maintenanceCapabilityPublicKey ||
+          (resource.plainTextBindings?.FLEET_AUDIT_PROXY_INGRESS ??
+            undefined) !==
+            (record.platformResources.auditQueueName ? 'required' : undefined)
         ) {
-          findings.push({
+          push({
             tenantTag: record.tenantTag,
             environment: record.environment,
             kind: 'binding-drift',
-            detail: `trusted egress Worker '${expected.snapshot.scriptName}' has drifted policy or attribution bindings`,
+            detail: `trusted state Worker '${expected.snapshot.scriptName}' has drifted database, Durable Object, or egress bindings`,
           });
         }
+      } else if (
+        resource.databaseIds.length !== 0 ||
+        resource.durableObjectBindings.length !== 0 ||
+        (resource.serviceBindings?.length ?? 0) !== 0 ||
+        resource.secretNames.length !== 0 ||
+        resource.plainTextBindings?.policyId !==
+          (
+            record.platformResources.outboundPolicy ??
+            record.platformResources.egressProxy
+          )?.policyId ||
+        resource.plainTextBindings?.routeHostname !==
+          record.routeHostname.toLowerCase() ||
+        resource.plainTextBindings?.scriptName !==
+          record.platformResources.stateWorker.scriptName ||
+        !input.hostRoutingKvId ||
+        resource.plainTextBindings?.hostRoutingKvId !== input.hostRoutingKvId ||
+        JSON.stringify(resource.kvNamespaceBindings ?? []) !==
+          JSON.stringify([
+            {
+              name: 'HOSTS',
+              namespaceId: input.hostRoutingKvId,
+            },
+          ])
+      ) {
+        push({
+          tenantTag: record.tenantTag,
+          environment: record.environment,
+          kind: 'binding-drift',
+          detail: `trusted egress Worker '${expected.snapshot.scriptName}' has drifted policy or attribution bindings`,
+        });
       }
     }
-    let live: Awaited<ReturnType<ProvisioningBackend['inspect']>>;
-    try {
-      live = await backend.inspect(
-        spec,
-        maintenanceSecret,
-        activeArtifactVersion(record),
-      );
-    } catch (error) {
-      findings.push({
+  }
+  let live: Awaited<ReturnType<ProvisioningBackend['inspect']>>;
+  try {
+    live = await backend.inspect(
+      spec,
+      maintenanceSecret,
+      activeArtifactVersion(record),
+    );
+  } catch (error) {
+    push(
+      {
         tenantTag: record.tenantTag,
         environment: record.environment,
         kind: 'audit-error',
-        detail: `inspection failed: ${String(error)}`,
-      });
-      continue;
-    }
-    if (!live) {
-      findings.push({
-        tenantTag: record.tenantTag,
-        environment: record.environment,
-        kind: 'missing-deployment',
-        detail: `script '${record.scriptName}' is absent`,
-      });
-      continue;
-    }
-    if (live.databaseId !== record.databaseId) {
-      findings.push({
-        tenantTag: record.tenantTag,
-        environment: record.environment,
-        kind: 'database-mismatch',
-        detail: `expected ${record.databaseId}, found ${live.databaseId}`,
-      });
-    }
-    const databaseOwner = databases.get(live.databaseId);
-    if (databaseOwner) {
-      findings.push({
-        tenantTag: record.tenantTag,
-        environment: record.environment,
-        kind: 'duplicate-database',
-        detail: `database also bound to ${databaseOwner.tenantTag}:${databaseOwner.environment}`,
-      });
-    } else {
-      databases.set(live.databaseId, record);
-    }
-    for (const binding of live.durableObjectBindings) {
-      const namespaceOwner = liveNamespaceOwners.get(binding.namespaceId);
-      if (namespaceOwner && !duplicateNamespaceIds.has(binding.namespaceId)) {
-        duplicateNamespaceIds.add(binding.namespaceId);
-        findings.push({
-          tenantTag: record.tenantTag,
-          environment: record.environment,
-          kind: 'duplicate-namespace',
-          detail: `namespace '${binding.namespaceId}' also bound to ${namespaceOwner.tenantTag}:${namespaceOwner.environment}`,
-        });
-      } else if (!namespaceOwner) {
-        liveNamespaceOwners.set(binding.namespaceId, record);
-      }
-    }
+        detail: 'inspection failed',
+      },
+      `inspection failed: ${String(error)}`,
+    );
+    return { findings, legacyDetails };
+  }
+  if (!live) {
+    push({
+      tenantTag: record.tenantTag,
+      environment: record.environment,
+      kind: 'missing-deployment',
+      detail: `script '${record.scriptName}' is absent`,
+    });
+    return { findings, legacyDetails };
+  }
+  if (live.databaseId !== record.databaseId) {
+    push({
+      tenantTag: record.tenantTag,
+      environment: record.environment,
+      kind: 'database-mismatch',
+      detail: `expected ${record.databaseId}, found ${live.databaseId}`,
+    });
+  }
+  const databaseOwner = input.databases.get(live.databaseId);
+  if (databaseOwner) {
+    push({
+      tenantTag: record.tenantTag,
+      environment: record.environment,
+      kind: 'duplicate-database',
+      detail: `database also bound to ${databaseOwner.tenantTag}:${databaseOwner.environment}`,
+    });
+  } else {
+    input.databases.set(live.databaseId, record);
+  }
+  for (const binding of live.durableObjectBindings) {
+    const namespaceOwner = input.liveNamespaceOwners.get(binding.namespaceId);
     if (
-      live.artifactVersion !== record.artifactVersion ||
-      live.schemaVersion !==
-        (record.activeRelease?.releaseSchemaVersion ?? record.schemaVersion)
+      namespaceOwner &&
+      !input.duplicateNamespaceIds.has(binding.namespaceId)
     ) {
-      findings.push({
+      input.duplicateNamespaceIds.add(binding.namespaceId);
+      push({
         tenantTag: record.tenantTag,
         environment: record.environment,
-        kind: 'version-drift',
-        detail: `expected artifact/schema ${record.artifactVersion}/${record.activeRelease?.releaseSchemaVersion ?? record.schemaVersion}, found ${live.artifactVersion}/${live.schemaVersion}`,
+        kind: 'duplicate-namespace',
+        detail: `namespace '${binding.namespaceId}' also bound to ${namespaceOwner.tenantTag}:${namespaceOwner.environment}`,
       });
+    } else if (!namespaceOwner) {
+      input.liveNamespaceOwners.set(binding.namespaceId, record);
     }
-    const deployedAt = Date.parse(record.updatedAt);
-    const dutyFailures = configuredDuties(live.maintenance)
-      .map((duty) =>
-        staleDutyReason(
-          duty,
-          Number.isFinite(deployedAt) ? deployedAt : undefined,
-          now,
-          options.staleAfterMs,
-        ),
+  }
+  if (
+    live.artifactVersion !== record.artifactVersion ||
+    live.schemaVersion !==
+      (record.activeRelease?.releaseSchemaVersion ?? record.schemaVersion)
+  ) {
+    push({
+      tenantTag: record.tenantTag,
+      environment: record.environment,
+      kind: 'version-drift',
+      detail: `expected artifact/schema ${record.artifactVersion}/${record.activeRelease?.releaseSchemaVersion ?? record.schemaVersion}, found ${live.artifactVersion}/${live.schemaVersion}`,
+    });
+  }
+  const deployedAt = Date.parse(record.updatedAt);
+  const dutySegments = configuredDuties(live.maintenance)
+    .map((duty) =>
+      staleDutySegment(
+        duty,
+        Number.isFinite(deployedAt) ? deployedAt : undefined,
+        input.auditNow,
+        input.staleAfterMs,
+      ),
+    )
+    .filter((segment): segment is DutySegment => segment !== undefined);
+  if (!live.maintenance.armed || dutySegments.length > 0) {
+    const segments = [
+      ...(!live.maintenance.armed
+        ? [{ template: 'maintenance scheduler is not armed', diagnostic: null }]
+        : []),
+      ...dutySegments,
+    ];
+    const detail = segments.map((segment) => segment.template).join('; ');
+    const legacyDetail = segments
+      .map(
+        (segment) =>
+          segment.template +
+          (segment.diagnostic !== null ? `: ${segment.diagnostic}` : ''),
       )
-      .filter((reason): reason is string => reason !== undefined);
-    if (!live.maintenance.armed || dutyFailures.length > 0) {
-      const reasons = [
-        ...(!live.maintenance.armed
-          ? ['maintenance scheduler is not armed']
-          : []),
-        ...dutyFailures,
-      ];
-      findings.push({
+      .join('; ');
+    push(
+      {
         tenantTag: record.tenantTag,
         environment: record.environment,
         kind: 'maintenance-stale',
-        detail: reasons.join('; '),
-      });
-      try {
-        await options.store.withDeploymentLease(
-          record.tenantTag,
-          record.environment,
-          async (lease) => {
-            const current = await options.store.get(
-              record.tenantTag,
-              record.environment,
+        detail,
+      },
+      segments.some((segment) => segment.diagnostic !== null)
+        ? legacyDetail
+        : null,
+    );
+    try {
+      await input.store.withDeploymentLease(
+        record.tenantTag,
+        record.environment,
+        async (lease) => {
+          const current = await input.store.get(
+            record.tenantTag,
+            record.environment,
+          );
+          if (
+            !current ||
+            current.phase !== record.phase ||
+            current.desiredSpecDigest !== record.desiredSpecDigest ||
+            current.updatedAt !== record.updatedAt
+          ) {
+            throw new Error(
+              'deployment changed after audit inspection; maintenance re-arm aborted',
             );
-            if (
-              !current ||
-              current.phase !== record.phase ||
-              current.desiredSpecDigest !== record.desiredSpecDigest ||
-              current.updatedAt !== record.updatedAt
-            ) {
-              throw new Error(
-                'deployment changed after audit inspection; maintenance re-arm aborted',
-              );
-            }
-            await commitInvocationAuthority(
-              lease,
-              current,
-              () => options.now ?? Date.now(),
-            );
-            await lease.assertOwned();
-            await backend.ensureMaintenance(
-              spec,
-              maintenanceSecret,
-              lease,
-              activeArtifactVersion(record),
-            );
-          },
-        );
-      } catch (error) {
-        findings.push({
+          }
+          await commitInvocationAuthority(
+            lease,
+            current,
+            input.authorityNowProvider,
+          );
+          await lease.assertOwned();
+          await backend.ensureMaintenance(
+            spec,
+            maintenanceSecret,
+            lease,
+            activeArtifactVersion(record),
+          );
+        },
+      );
+    } catch (error) {
+      push(
+        {
           tenantTag: record.tenantTag,
           environment: record.environment,
           kind: 'audit-error',
-          detail: `maintenance re-arm failed: ${String(error)}`,
-        });
-      }
+          detail: 'maintenance re-arm failed',
+        },
+        `maintenance re-arm failed: ${String(error)}`,
+      );
     }
+  }
+  return { findings, legacyDetails };
+}
+
+export async function auditFleetDrift(options: {
+  readonly store: FleetStateStore;
+  readonly records: readonly FleetRecord[];
+  readonly inventory: FleetResourceInventory;
+  readonly backendFor: (record: FleetRecord) => ProvisioningBackend;
+  readonly specFor: (record: FleetRecord) => DeploymentSpec;
+  readonly maintenanceSecretFor: (record: FleetRecord) => string;
+  readonly staleAfterMs: number;
+  readonly now?: number;
+}): Promise<readonly DriftFinding[]> {
+  if (!Number.isSafeInteger(options.staleAfterMs) || options.staleAfterMs < 1) {
+    throw new Error('staleAfterMs must be a positive safe integer');
+  }
+  const now = options.now ?? Date.now();
+  const findings: DriftFinding[] = [...options.inventory.findings];
+  // A deployment under active bounded cleanup is audit-suppressed in both
+  // directions: it feeds no expectations (no missing/duplicate findings) and
+  // its declared resource identities join the known sets below so its
+  // still-present resources never read as orphans. The bounded engine is the
+  // reconciliation authority; a long-blocked cleanup stays visible through
+  // the record itself, never through drift findings.
+  const auditedRecords = fleetAuditAuditedRecords(options.records);
+  const known = fleetAuditKnownSets(options.records);
+  const recordsByScript = fleetAuditRecordsByScript(auditedRecords);
+  findings.push(
+    ...auditRegistrationOrphansStage({
+      scriptRegistrations: options.inventory.scriptRegistrations,
+      deployments: options.inventory.deployments,
+      recordsByScript,
+      knownScriptKeys: known.knownScriptKeys,
+    }),
+  );
+  findings.push(
+    ...auditDeploymentOrphansStage({
+      deployments: options.inventory.deployments,
+      recordsByScript,
+      knownScriptKeys: known.knownScriptKeys,
+    }),
+  );
+  const liveByScript = fleetAuditLiveByScript(options.inventory.deployments);
+  findings.push(
+    ...auditDeploymentGapsStage({
+      records: auditedRecords,
+      liveByScript,
+      scriptRegistrations: options.inventory.scriptRegistrations,
+    }),
+  );
+  findings.push(
+    ...auditOrphanDatabasesStage({
+      databaseIds: options.inventory.databaseIds,
+      registeredDatabaseIds: fleetAuditRegisteredDatabaseIds(auditedRecords),
+      knownDatabaseIds: known.knownDatabaseIds,
+    }),
+  );
+  const expectedRoutes = fleetAuditExpectedRoutes(auditedRecords);
+  findings.push(
+    ...auditOrphanRoutesStage({
+      routes: options.inventory.routes,
+      expectedRoutes,
+      knownRouteKeys: known.knownRouteKeys,
+    }),
+  );
+  const liveRoutesByHostname = fleetAuditLiveRoutesByHostname(
+    options.inventory.routes,
+  );
+  findings.push(
+    ...auditNamespaceOrphansStage({
+      namespaceIds: options.inventory.namespaceIds,
+      expectedNamespaceIds: fleetAuditExpectedNamespaceIds(auditedRecords),
+      knownNamespaceIds: known.knownNamespaceIds,
+    }),
+  );
+  const expectedNamespaceOwners = new Map<string, FleetRecord>();
+  findings.push(
+    ...auditNamespaceExpectationsStage({
+      records: auditedRecords,
+      inventoryNamespaceIds: options.inventory.namespaceIds,
+      expectedNamespaceOwners,
+    }),
+  );
+  const expectedBuckets = new Map<string, FleetAuditExpectedBucketEntry>();
+  findings.push(
+    ...auditR2ExpectedStage({ records: auditedRecords, expectedBuckets }),
+  );
+  findings.push(
+    ...auditR2OrphansStage({
+      r2Buckets: options.inventory.r2Buckets ?? [],
+      expectedBuckets,
+      knownBucketNames: known.knownBucketNames,
+    }),
+  );
+  findings.push(
+    ...auditR2MissingIdentityStage({
+      expectedBucketEntries: [...expectedBuckets.values()],
+      r2Buckets: options.inventory.r2Buckets ?? [],
+    }),
+  );
+  const databases = new Map<string, FleetRecord>();
+  const liveNamespaceOwners = new Map<string, FleetRecord>();
+  const duplicateNamespaceIds = new Set(
+    fleetAuditRecordsDerivedDuplicateNamespaceIds(auditedRecords),
+  );
+  for (const record of options.records) {
+    const result = await auditRecordStep({
+      record,
+      recordsByScript,
+      liveByScript,
+      liveRoutesByHostname,
+      inventoryDatabaseIds: options.inventory.databaseIds,
+      hostRoutingKvId: options.inventory.hostRoutingKvId,
+      databases,
+      liveNamespaceOwners,
+      duplicateNamespaceIds,
+      backendFor: options.backendFor,
+      specFor: options.specFor,
+      maintenanceSecretFor: options.maintenanceSecretFor,
+      store: options.store,
+      staleAfterMs: options.staleAfterMs,
+      auditNow: now,
+      authorityNowProvider: () => options.now ?? Date.now(),
+    });
+    findings.push(
+      ...result.findings.map((finding, index) => ({
+        ...finding,
+        detail: result.legacyDetails[index] ?? finding.detail,
+      })),
+    );
   }
   return findings;
 }

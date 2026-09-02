@@ -77,6 +77,7 @@ export {
   ProcessLocalCloudflareApiRateCoordinator,
 } from './cloudflare-rate-coordinator.js';
 export { D1FleetInventoryRunStore } from './d1-fleet-inventory-run-store.js';
+export { D1FleetOperationStore } from './d1-fleet-operation-store.js';
 export {
   type AdvanceDecommissionDeploymentOptions,
   advanceDecommissionDeployment,
@@ -102,6 +103,21 @@ export {
   rollbackExternalRelease,
 } from './fleet.js';
 export {
+  type AdvanceFleetAuditOptions,
+  abandonFleetAuditOperation,
+  advanceFleetAudit,
+  type FleetAuditAdvanceAction,
+  type FleetAuditAdvanceCapability,
+  FleetAuditAdvanceCapabilityError,
+  type FleetAuditAdvanceResult,
+  type FleetAuditResultRef,
+  readFleetAuditFindingsPage,
+} from './fleet-audit-advance.js';
+export type {
+  FleetAuditProgress,
+  FleetAuditStage,
+} from './fleet-audit-state.js';
+export {
   type AdvanceFleetInventoryOptions,
   advanceFleetInventory,
   type FleetInventoryAdvanceAction,
@@ -122,6 +138,23 @@ export {
   FleetInventoryRunTokenFutureError,
   FleetInventoryRunTokenOperationError,
 } from './fleet-inventory-state.js';
+export {
+  type FleetOperationFailure,
+  type FleetOperationKind,
+  type FleetOperationLease,
+  type FleetOperationProgress,
+  type FleetOperationRowKind,
+  type FleetOperationRunRecord,
+  type FleetOperationStagedRow,
+  FleetOperationStateError,
+  type FleetOperationStore,
+  FleetOperationStoreCapabilityError,
+  type FleetOperationToken,
+  FleetOperationTokenError,
+  FleetOperationTokenFutureError,
+  FleetOperationTokenKindError,
+  FleetOperationTokenOperationError,
+} from './fleet-operation-state.js';
 export type { HostRoutingTarget } from './host-routing.js';
 export {
   PlainWorkerBackend,

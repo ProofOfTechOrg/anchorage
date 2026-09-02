@@ -284,6 +284,40 @@ module.exports = {
       },
     },
     {
+      name: 'fleet-control-operation-advance-avoids-concrete-transports',
+      severity: 'error',
+      comment:
+        'The bounded audit and migration coordinators depend only on provider-neutral ports, state, and the lifecycle engine they extract stage functions from. Unlike the other bounded coordinators, backend-switch.ts, provision.ts, and fleet.ts are NOT forbidden here: the coordinators legitimately reach fleet.ts for its extracted stage functions, and the two top-level npm-cloudflare patterns are dropped because fleet.ts carries a type-only SDK edge under tsPreCompilationDeps that dependencyTypesNot cannot exempt from a reachable to-restriction. Every concrete provider/transport module, Wrangler, export stores, root barrels, and workers/ remain forbidden.',
+      from: {
+        path: [
+          '^packages/fleet-control/src/(?:fleet-audit-advance|fleet-migration-advance)\\.ts$',
+          '^scripts/architecture-fixtures/operation-advance-imports-provider\\.ts$',
+        ],
+      },
+      to: {
+        path: '(?:^packages/fleet-control/src/(?:cloudflare-fleet-inventory|cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors|workers-for-platforms-backend-switch-provider|wrangler-plain-worker-provisioning-api|wrangler-loop-backend|wrangler-runner|export-file-name|export-store|r2-export-store|index)\\.ts$|^packages/fleet-control/src/workers/)',
+        reachable: true,
+      },
+    },
+    {
+      name: 'fleet-control-runtime-sdk-stays-in-provider-modules',
+      severity: 'error',
+      comment:
+        'Runtime Cloudflare SDK values may be imported only by the three modules that already hold that edge; a type-only import (the provider-binding-inventory.ts leaf) is exempt. Unlike the reachable rules above, this is a direct-edge check with no reachable restriction, mirroring the decommission-database provider-neutral precedent.',
+      from: {
+        path: [
+          '^packages/fleet-control/src/',
+          '^scripts/architecture-fixtures/runtime-sdk-import\\.ts$',
+        ],
+        pathNot:
+          '^packages/fleet-control/src/(?:cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors)\\.ts$',
+      },
+      to: {
+        path: '(?:^cloudflare(?:/|$)|(?:^|/)node_modules/(?:\\.pnpm/)?cloudflare(?:@|/))',
+        dependencyTypesNot: ['type-only', 'type-import'],
+      },
+    },
+    {
       name: 'fleet-control-cleanup-advance-is-transport-neutral',
       severity: 'error',
       comment:

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import type { DriftFinding } from '../src/fleet.js';
 import {
@@ -35,6 +36,7 @@ import {
   FleetOperationTokenKindError,
   FleetOperationTokenOperationError,
   fleetOperationIntakeDigest,
+  fleetOperationItemsIntake,
   fleetOperationRunRecordFromUnknown,
   fleetOperationStagedRowFromUnknown,
   isDurableAuditDetailSafe,
@@ -181,19 +183,23 @@ describe('fleet operation state', () => {
       auditRecord(),
     );
     expect(() =>
+      fleetAuditOperationRecordFromUnknown({
+        ...auditRecord(),
+        progress: { ...auditProgress(), auditTimeMs: 9e15 },
+      }),
+    ).toThrow(FleetOperationStateError);
+    expect(() =>
+      fleetAuditOperationRecordFromUnknown({
+        ...auditRecord(),
+        progress: { ...auditProgress(), staleAfterMs: 0 },
+      }),
+    ).toThrow(FleetOperationStateError);
+    expect(() =>
       driftFindingRowFromUnknown({
         tenantTag: 'tenant',
         environment: 'production',
         kind: 'not-a-finding',
         detail: 'safe',
-      }),
-    ).toThrow(FleetOperationStateError);
-    expect(() =>
-      fleetAuditFactRowFromUnknown({
-        factKind: 'database-owner',
-        key: 'database\nname',
-        tenantTag: 'tenant',
-        environment: 'production',
       }),
     ).toThrow(FleetOperationStateError);
     expect(() =>
@@ -369,19 +375,22 @@ describe('fleet operation state', () => {
     );
   });
 
-  it('structured-field validation accepts a provider-claimed finding tag and rejects unsafe bytes', () => {
+  it('structured-field validation accepts any bounded provider-claimed finding tag — empty and control-byte values included — and rejects an over-bound one', () => {
     const base = {
       environment: 'production',
       kind: 'audit-error',
       detail: 'safe detail',
     } as const;
-    for (const tenantTag of ['bearer', 'Prod-1']) {
+    for (const tenantTag of ['bearer', 'Prod-1', 'Bad\nTag', '']) {
       expect(driftFindingRowFromUnknown({ ...base, tenantTag }).tenantTag).toBe(
         tenantTag,
       );
     }
     expect(() =>
-      driftFindingRowFromUnknown({ ...base, tenantTag: 'Bad\nTag' }),
+      driftFindingRowFromUnknown({
+        ...base,
+        tenantTag: 'x'.repeat(FLEET_OPERATION_STRING_BYTE_BOUND + 1),
+      }),
     ).toThrow(FleetOperationStateError);
   });
 
@@ -391,6 +400,30 @@ describe('fleet operation state', () => {
       expect(isDurableAuditDetailSafe(`provider said ${marker}`)).toBe(false);
     }
     expect(isDurableAuditDetailSafe('safe words '.repeat(300))).toBe(true);
+    expect(
+      driftFindingRowFromUnknown({
+        tenantTag: 'tenant',
+        environment: 'production',
+        kind: 'audit-error',
+        detail: '',
+      }).detail,
+    ).toBe('');
+    expect(() =>
+      driftFindingRowFromUnknown({
+        tenantTag: 'tenant',
+        environment: 'production',
+        kind: 'audit-error',
+        detail: 'unsafe\u0000detail',
+      }),
+    ).toThrow(FleetOperationStateError);
+    for (const key of ['', 'database\nname']) {
+      expect(
+        fleetAuditFactRowFromUnknown({
+          factKind: 'duplicate-namespace',
+          key,
+        }).key,
+      ).toBe(key);
+    }
   });
 
   it('the withheld-detail fallback shape (a bearer-service detail is withheld, never thrown)', () => {
@@ -535,5 +568,47 @@ describe('fleet operation state', () => {
       : false = true;
     expect(driftIsSubsetOfAudit).toBe(true);
     expect(auditIsSubsetOfDrift).toBe(true);
+  });
+
+  it('fleetOperationItemsIntake digests are order-sensitive across items, key-order-stable within an item, and framed so two items never collide with one concatenated item', () => {
+    const envelope = { generation: 1 };
+    const a = 1;
+    const b = 2;
+    const ab = 12;
+    const digestFor = (
+      items: readonly unknown[],
+      candidateEnvelope: Record<string, unknown> = envelope,
+    ): string => {
+      const result = fleetOperationItemsIntake({
+        envelope: candidateEnvelope,
+        items,
+        itemByteBound: FLEET_OPERATION_RECORD_ROW_BYTE_BOUND,
+      });
+      expect('digest' in result).toBe(true);
+      if (!('digest' in result)) throw new Error('unreachable');
+      return result.digest;
+    };
+
+    expect(digestFor([a, b])).not.toBe(digestFor([b, a]));
+    expect(digestFor([{ b: 2, a: 1 }])).toBe(digestFor([{ a: 1, b: 2 }]));
+    expect(canonicalFleetOperationBytes(ab)).toBe(
+      canonicalFleetOperationBytes(a) + canonicalFleetOperationBytes(b),
+    );
+    expect(digestFor([a, b])).not.toBe(digestFor([ab]));
+    expect(digestFor([a, b])).not.toBe(digestFor([a]));
+    expect(digestFor([a, b], { generation: 2 })).not.toBe(digestFor([a, b]));
+
+    const oracle = createHash('sha256').update(
+      canonicalFleetOperationBytes(envelope),
+    );
+    const encoder = new TextEncoder();
+    for (const item of [a, b]) {
+      const canonical = canonicalFleetOperationBytes(item);
+      oracle
+        .update(String(encoder.encode(canonical).byteLength))
+        .update(':')
+        .update(canonical);
+    }
+    expect(digestFor([a, b])).toBe(oracle.digest('hex'));
   });
 });
