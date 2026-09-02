@@ -758,6 +758,7 @@ describe('R2DatabaseExportStore', () => {
   });
 
   it('refuses a locked body before starting a put', {
+    // Deliberately tight: a locked body must be refused, not waited on.
     timeout: 2_000,
   }, async () => {
     const bucket = new FakeR2Bucket();
@@ -972,6 +973,7 @@ describe('R2DatabaseExportStore', () => {
   });
 
   it('aborts a source when a conditional put returns null before reading', {
+    // Deliberately tight: a never-closing source is aborted, not waited on.
     timeout: 2_000,
   }, async () => {
     const bucket = new FakeR2Bucket();

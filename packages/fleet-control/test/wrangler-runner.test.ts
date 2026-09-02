@@ -144,7 +144,6 @@ setInterval(() => {}, 1000);
         await rm(directory, { recursive: true, force: true });
       }
     },
-    10_000,
   );
 });
 

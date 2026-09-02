@@ -935,6 +935,7 @@ export function describePlainWorkerConformance(
     });
 
     it('14. resumes every teardown phase and preserves export ordering and integrity', async () => {
+      // Eleven teardown phases each run a failed and a resumed decommission.
       const spec = buildPlainWorkerSpec();
       const baseline = makeHarness();
       const ready = await provisionReady(baseline, spec);
@@ -1052,8 +1053,7 @@ export function describePlainWorkerConformance(
         `delete-database:${ready.record.databaseId}`,
       );
       expect(integrityFailure.store.record?.phase).not.toBe('decommissioned');
-      // Eleven teardown phases each run a failed and a resumed decommission.
-    }, 15_000);
+    });
 
     it('15. force-decommissions a deployment wedged after traffic removal', async () => {
       const harness = makeHarness();

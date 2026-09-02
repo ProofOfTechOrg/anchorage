@@ -939,7 +939,7 @@ describe('CloudflareProvisioningClient plain-worker plane', () => {
     for (const operation of operations) {
       await expect(operation()).rejects.toMatchObject({ status });
     }
-  }, 15_000);
+  });
 
   it('paginates versions through a terminal empty page and reserves quota per request', async () => {
     const events: string[] = [];

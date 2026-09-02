@@ -122,7 +122,11 @@ function harnessOptions() {
 }
 
 describe.sequential('D1FleetStateStore Wrangler harness', {
-  timeout: 30_000,
+  // Real workerd + D1 through Wrangler: the two-pass R2 detach/deletion title
+  // timed out at a 30 s cap inside the full package suite and has needed as
+  // much as 29.9 s there since. The hooks below repeat this value because
+  // hooks take vitest's hookTimeout, not this option; every title inherits it.
+  timeout: 90_000,
 }, () => {
   let server: TestHarness;
   let worker: WorkerHandle;
@@ -131,11 +135,11 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
     server = createTestHarness(harnessOptions());
     await server.listen();
     worker = server.getWorker();
-  }, 30_000);
+  }, 90_000);
 
   afterAll(async () => {
     await server.close();
-  }, 30_000);
+  }, 90_000);
 
   async function probe<T>(action: string, input?: unknown): Promise<T> {
     const response = await worker.fetch('/fleet-state', {
@@ -174,7 +178,7 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
     expect(result.explicit.after).toBeGreaterThan(14 * 60_000);
     expect(result.heartbeatObserved).toBe(true);
     expect(result.contenderRejected).toBe(true);
-  }, 30_000);
+  });
 
   it('allows DB-expired takeover and fences every stale state mutation', async () => {
     const result = await probe<{
@@ -261,7 +265,7 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
         'platform-renewal',
       ),
     ).resolves.toEqual({ heartbeatObserved: true, contenderRejected: true });
-  }, 30_000);
+  });
 
   it('mutually excludes ordinary Worker claims in both durable claim directions', async () => {
     const result = await probe<{
@@ -1457,7 +1461,7 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
     expect(result.heartbeatObserved).toBe(true);
     expect(result.contenderRejected).toBe(true);
     expect(result.leasesAfterRelease).toBe(0);
-  }, 30_000);
+  });
 
   it('initializes the six inventory tables under concurrent first reads on fresh D1 storage', async () => {
     await server.reset();
@@ -1624,7 +1628,7 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
       contenderRejected: true,
       leasesAfterRelease: 0,
     });
-  }, 30_000);
+  });
 
   it('four-table cold+concurrent schema init', async () => {
     await server.reset();

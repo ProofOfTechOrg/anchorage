@@ -1844,7 +1844,7 @@ describe('advanceFleetAudit', () => {
     ).rejects.toThrow(
       'fleet audit start canonical intake exceeds the intake byte bound',
     );
-  }, 20_000);
+  });
 
   it("'operationId' validation refusal at start", async () => {
     const alice = baseRecord('alice');
@@ -2286,7 +2286,7 @@ describe('advanceFleetAudit', () => {
       ),
     ).toBe(true);
     expect(harness.operationStore.heads.has('audit')).toBe(false);
-  }, 30_000);
+  });
 
   it('abandonFleetAuditOperation: running → operator-abandoned + pin released; terminal → releases any surviving pin', async () => {
     const alice = baseRecord('alice');
@@ -3049,7 +3049,7 @@ describe('advanceFleetAudit', () => {
         rowOrdinal: 500,
       });
     }
-  }, 30_000);
+  });
 
   it('audit kind-lease loss at the dispatch boundary aborts with zero resolver, generation, and provider work', async () => {
     const alice = baseRecord('alice');
@@ -4313,7 +4313,7 @@ describe('advanceFleetAudit', () => {
     expect(
       (await harness.operationStore.readOperationById(operationId))?.state,
     ).toBe('running');
-  }, 20_000);
+  });
 
   it('a persisted global-stage cursor beyond its source length or a per-record cursor beyond the record count refuses as malformed with no provider work and no durable mutation instead of truncating the audit', async () => {
     const globalInventory = emptyInventory();
