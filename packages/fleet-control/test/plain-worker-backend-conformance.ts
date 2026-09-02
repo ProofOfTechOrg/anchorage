@@ -935,7 +935,8 @@ export function describePlainWorkerConformance(
     });
 
     it('14. resumes every teardown phase and preserves export ordering and integrity', async () => {
-      // Eleven teardown phases each run a failed and a resumed decommission.
+      // Eleven teardown phases each run a failed and a resumed decommission;
+      // an export-failure pass and an integrity-failure pass follow.
       const spec = buildPlainWorkerSpec();
       const baseline = makeHarness();
       const ready = await provisionReady(baseline, spec);

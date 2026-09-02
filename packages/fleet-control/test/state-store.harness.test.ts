@@ -123,10 +123,12 @@ function harnessOptions() {
 
 describe.sequential('D1FleetStateStore Wrangler harness', {
   // Real workerd + D1 through Wrangler: the two-pass R2 detach/deletion title
-  // timed out at a 30 s cap inside the full package suite and has needed as
-  // much as 29.9 s there since. The hooks below repeat this value because
-  // hooks take vitest's hookTimeout, not this option; every title inherits it.
-  timeout: 90_000,
+  // timed out at a 30 s cap inside the full package suite and has since needed
+  // as much as 45 s (in a six-file run with the 5-minute load average at 11.7
+  // on 12 cores); 150 s keeps a 3x margin over that. The hooks below repeat
+  // this value because hooks take vitest's hookTimeout, not this option; every
+  // title inherits it.
+  timeout: 150_000,
 }, () => {
   let server: TestHarness;
   let worker: WorkerHandle;
@@ -135,11 +137,11 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
     server = createTestHarness(harnessOptions());
     await server.listen();
     worker = server.getWorker();
-  }, 90_000);
+  }, 150_000);
 
   afterAll(async () => {
     await server.close();
-  }, 90_000);
+  }, 150_000);
 
   async function probe<T>(action: string, input?: unknown): Promise<T> {
     const response = await worker.fetch('/fleet-state', {

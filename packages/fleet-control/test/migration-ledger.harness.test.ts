@@ -42,6 +42,8 @@ function harnessOptions() {
 }
 
 describe.sequential('migration ledger real-D1 fidelity', {
+  // The hooks below repeat this value because hooks take vitest's
+  // hookTimeout, not this option; every title inherits it.
   timeout: 30_000,
 }, () => {
   let server: TestHarness;

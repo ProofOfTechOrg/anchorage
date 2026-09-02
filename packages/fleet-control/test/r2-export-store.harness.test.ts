@@ -40,6 +40,8 @@ function field(value: unknown, name: string): unknown {
 }
 
 describe.sequential('R2DatabaseExportStore Wrangler harness', {
+  // The hooks below repeat this value because hooks take vitest's
+  // hookTimeout, not this option; every title inherits it.
   timeout: 30_000,
 }, () => {
   let server: TestHarness;
