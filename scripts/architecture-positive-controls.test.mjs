@@ -29,22 +29,33 @@ const strictPlainData = 'packages/fleet-control/src/strict-plain-data.ts';
 const auditAdvance = 'packages/fleet-control/src/fleet-audit-advance.ts';
 const cloudflareClient = 'packages/fleet-control/src/cloudflare-client.ts';
 
-function runtimeAdjacency(report) {
+function adjacencyOf(report, keep) {
   return new Map(
     report.modules.map((module) => [
       module.source,
       module.dependencies
-        .filter(
-          (dependency) =>
-            !dependency.dependencyTypes.some((type) =>
-              erasedDependencyTypes.has(type),
-            ),
-        )
+        .filter(keep)
         .map((dependency) => dependency.resolved)
         .filter((resolved) => typeof resolved === 'string')
         .sort(),
     ]),
   );
+}
+
+/** Adjacency over runtime edges only; type-only edges are erased. */
+function runtimeAdjacency(report) {
+  return adjacencyOf(
+    report,
+    (dependency) =>
+      !dependency.dependencyTypes.some((type) =>
+        erasedDependencyTypes.has(type),
+      ),
+  );
+}
+
+/** Adjacency over every edge, which is the graph a reachable rule walks. */
+function fullAdjacency(report) {
+  return adjacencyOf(report, () => true);
 }
 
 function reaches(adjacency, source, target) {
@@ -138,6 +149,27 @@ const controls = {
     'scripts/architecture-fixtures/fleet-control-export-port-imports-adapter.ts',
 };
 
+/**
+ * Real modules cruised alongside a fixture, so a reachable rule is evaluated
+ * over the graph it guards rather than over the fixture alone.
+ */
+const extraEntries = {
+  'fleet-control-decommission-advance-is-transport-neutral': [
+    decommissionAdvance,
+  ],
+  'fleet-control-decommission-database-is-provider-neutral': [
+    decommissionAdvance,
+    decommissionDatabase,
+    backendSwitch,
+  ],
+  'fleet-control-backend-switch-does-not-reach-its-provider': [
+    decommissionAdvance,
+    decommissionDatabase,
+    backendSwitch,
+  ],
+  'fleet-control-operation-advance-avoids-concrete-transports': [auditAdvance],
+};
+
 test('every architecture rule has an executable positive control', () => {
   const ruleNames = [...config.forbidden, ...config.required]
     .map((rule) => rule.name)
@@ -145,42 +177,21 @@ test('every architecture rule has an executable positive control', () => {
   assert.deepEqual(Object.keys(controls).sort(), ruleNames);
 });
 
+test('every extra cruise entry is keyed by an architecture rule', () => {
+  const ruleNames = new Set(
+    [...config.forbidden, ...config.required].map((rule) => rule.name),
+  );
+  for (const ruleName of Object.keys(extraEntries)) {
+    assert.ok(
+      ruleNames.has(ruleName),
+      `extraEntries names '${ruleName}', which is not an architecture rule`,
+    );
+  }
+});
+
 for (const [ruleName, fixture] of Object.entries(controls)) {
   test(`${ruleName} rejects its positive control`, () => {
-    const entries = (() => {
-      if (
-        ruleName === 'fleet-control-decommission-advance-is-transport-neutral'
-      ) {
-        return [fixture, decommissionAdvance];
-      }
-      if (
-        ruleName === 'fleet-control-decommission-database-is-provider-neutral'
-      ) {
-        return [
-          fixture,
-          decommissionAdvance,
-          decommissionDatabase,
-          backendSwitch,
-        ];
-      }
-      if (
-        ruleName === 'fleet-control-backend-switch-does-not-reach-its-provider'
-      ) {
-        return [
-          fixture,
-          decommissionAdvance,
-          decommissionDatabase,
-          backendSwitch,
-        ];
-      }
-      if (
-        ruleName ===
-        'fleet-control-operation-advance-avoids-concrete-transports'
-      ) {
-        return [fixture, auditAdvance];
-      }
-      return [fixture];
-    })();
+    const entries = [fixture, ...(extraEntries[ruleName] ?? [])];
     const args = [
       cli,
       '--config',
@@ -231,7 +242,7 @@ for (const [ruleName, fixture] of Object.entries(controls)) {
     if (
       ruleName === 'fleet-control-decommission-advance-is-transport-neutral'
     ) {
-      assert.deepEqual([...new Set(violations)], [ruleName]);
+      assert.deepEqual([...new Set(violations)].sort(), [ruleName]);
       assert.ok(
         report.summary.violations.some(
           (violation) =>
@@ -306,7 +317,7 @@ for (const [ruleName, fixture] of Object.entries(controls)) {
     if (
       ruleName === 'fleet-control-operation-advance-avoids-concrete-transports'
     ) {
-      assert.deepEqual([...new Set(violations)], [ruleName]);
+      assert.deepEqual([...new Set(violations)].sort(), [ruleName]);
       assert.ok(
         report.summary.violations.some(
           (violation) =>
@@ -318,14 +329,16 @@ for (const [ruleName, fixture] of Object.entries(controls)) {
       const adjacency = runtimeAdjacency(report);
       // Exhaustive over the rule's own to-set rather than over one member, so
       // a real-module reach into any other forbidden target cannot hide behind
-      // this fixture's violations under the same rule name.
+      // this fixture's violations under the same rule name. The walk is over
+      // the unfiltered graph, type-only edges included, because that is the
+      // graph this reachable rule itself walks under tsPreCompilationDeps.
       const forbidden = new RegExp(
         [...config.forbidden, ...config.required].find(
           (rule) => rule.name === ruleName,
         ).to.path,
       );
       assert.deepEqual(
-        reachableFrom(adjacency, auditAdvance).filter((module) =>
+        reachableFrom(fullAdjacency(report), auditAdvance).filter((module) =>
           forbidden.test(module),
         ),
         [],

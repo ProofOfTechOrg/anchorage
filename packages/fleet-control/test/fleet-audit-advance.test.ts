@@ -1197,7 +1197,11 @@ function buildHarness(
   };
 }
 
-/** Drives `advanceFleetAudit` with `continue` until the status is not 'pending'. */
+/**
+ * Drives `advanceFleetAudit` with `continue` until the status is not
+ * 'pending'. Always advances once before it inspects a status, so it never
+ * returns the result its caller already holds.
+ */
 async function driveToTerminal(
   harness: Harness,
   firstToken: unknown,
@@ -1211,7 +1215,9 @@ async function driveToTerminal(
     if (result.status !== 'pending') return result;
     token = result.token;
   }
-  throw new Error('driveToTerminal exceeded its iteration cap');
+  throw new Error(
+    `driveToTerminal exceeded its ${cap}-iteration cap before a terminal result`,
+  );
 }
 
 type PendingFleetAuditAdvance = Extract<
@@ -1219,7 +1225,18 @@ type PendingFleetAuditAdvance = Extract<
   { status: 'pending' }
 >;
 
-/** Drives `advanceFleetAudit` with `continue` until `stage.step` is `step`. */
+/**
+ * Drives `advanceFleetAudit` with `continue` until `stage.step` is `step`.
+ * Always advances once before it compares the step, so a token already parked
+ * on `step` still costs one call.
+ *
+ * `cap` is slack rather than derived. The guide's aggregate for a whole
+ * operation is `1 + records` calls plus, summed over the eleven global stages,
+ * `max(1, ceil(items_i / maxItemsPerCall))` each, so the bound turns on
+ * `maxItemsPerCall` and the per-stage source sizes rather than on the stage
+ * count alone: a call site that lowers `maxItemsPerCall` against a large
+ * source has to pass its own cap.
+ */
 async function driveToStage(
   harness: Harness,
   firstToken: unknown,
@@ -1912,8 +1929,12 @@ describe('advanceFleetAudit', () => {
     );
     expect(started.status).toBe('pending');
     if (started.status !== 'pending') throw new Error('unreachable');
-    let token = (await driveToStage(harness, started.token, 'per-record'))
-      .token;
+    const atPerRecord = await driveToStage(
+      harness,
+      started.token,
+      'per-record',
+    );
+    let token = atPerRecord.token;
     for (const [tenant, expectedRearmCalls] of [
       ['alice', 1],
       ['bob', 0],
@@ -1980,9 +2001,9 @@ describe('advanceFleetAudit', () => {
       started.token,
       'per-record',
     );
-    // `authorityClockCalls` only ever increments, so zero once the global
-    // stages are behind us is exactly the per-iteration assertion the drive
-    // loop this call replaced made.
+    // `authorityClockCalls` only ever increments, so a zero once the global
+    // stages are behind us covers every call `driveToStage` just made, not
+    // only the last of them.
     expect(authorityClockCalls).toBe(0);
     const staleRecord = await advanceFleetAudit(
       harness.baseOptions({ kind: 'continue', token: atPerRecord.token }),
@@ -2473,26 +2494,38 @@ describe('advanceFleetAudit', () => {
     // Feeding `nextAfterOrdinal` straight back is the documented idiom, so the
     // cursor the reader publishes — not a formula this loop recomputes — is
     // what has to advance. A cursor that stops advancing would spin this loop
-    // forever, so the page count is capped: every non-final page carries at
-    // least one finding, so an honest read needs at most one page per finding.
-    // Exhausting the cap leaves `paged` holding repeats and fails the compare.
-    for (let page = 0; page <= ascending.findings.length; page += 1) {
+    // forever, so the page count is capped. Every non-final page carries at
+    // least one finding, so an honest read needs at most one page per finding,
+    // plus one more page for a store that reports `done` only on a following
+    // empty page: that extra slot is why the cap is `length + 1` rather than
+    // `length`, and a tightening to `length` would break a legal store.
+    const pageCap = ascending.findings.length + 1;
+    let reachedDone = false;
+    for (let page = 0; page < pageCap; page += 1) {
       const next = await readFleetAuditFindingsPage(reversedStore, {
         operationId: orderedOperationId,
         limit: 2,
         ...(afterOrdinal === undefined ? {} : { afterOrdinal }),
       });
       paged.push(...next.findings);
-      if (next.done) break;
+      if (next.done) {
+        reachedDone = true;
+        break;
+      }
       afterOrdinal = next.nextAfterOrdinal;
+    }
+    if (!reachedDone) {
+      throw new Error(
+        `findings paging exceeded its ${pageCap}-page cap before the reader reported done`,
+      );
     }
     expect(paged).toEqual(ascending.findings);
   });
 
   it('findings page: the reader verifies page conformance instead of trusting the store, and returns the next cursor off the page rows', async () => {
-    const control = baseRecord('controlnb1');
-    const missingA = baseRecord('missingnb1a');
-    const missingB = baseRecord('missingnb1b');
+    const control = baseRecord('control29');
+    const missingA = baseRecord('missing29a');
+    const missingB = baseRecord('missing29b');
     const records = [control, missingA, missingB];
     const harness = buildHarness(records, inventoryFor([control]));
     const operationId = uuidFor(90);
@@ -2506,7 +2539,10 @@ describe('advanceFleetAudit', () => {
     expect(conforming.done).toBe(true);
     expect(conforming.findings.length).toBeGreaterThanOrEqual(3);
     // The cursor is read off the page's own rows, so a caller never recomputes
-    // it from the prose formula. A full first page ends at length - 1.
+    // it from the prose formula. A full first page ends at length - 1. This
+    // pins one full page's value only; the paging loop at the end of the
+    // preceding test is what discriminates a published cursor from a
+    // recomputed formula.
     expect(conforming.nextAfterOrdinal).toBe(conforming.findings.length - 1);
 
     // Each case below returns a page the port forbids; every one must reach
@@ -2600,7 +2636,7 @@ describe('advanceFleetAudit', () => {
     );
     expect(emptyPage.findings).toEqual([]);
     expect(emptyPage.done).toBe(true);
-    expect(emptyPage.nextAfterOrdinal).toBeUndefined();
+    expect(emptyPage).not.toHaveProperty('nextAfterOrdinal');
   });
 
   it('second-world drain-vs-bounded equivalence modulo the §5.5 difference set', async () => {
