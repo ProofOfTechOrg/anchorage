@@ -19,6 +19,7 @@ import {
   auditRecordStep,
   auditRegistrationOrphansStage,
   type FleetAuditExpectedBucketEntry,
+  type FleetAuditKnownSets,
   fleetAuditAuditedRecords,
   fleetAuditExpectedBucketsSeed,
   fleetAuditExpectedNamespaceIds,
@@ -40,6 +41,7 @@ import {
   type FleetAuditStage,
   fleetAuditFactRowFromUnknown,
   fleetAuditProgressFromUnknown,
+  fleetAuditStageOrdinal,
   nextAuditStage,
   withAuditStageOrdinal,
   withheldAuditDetail,
@@ -56,10 +58,12 @@ import {
   type FleetOperationLease,
   type FleetOperationRunRecord,
   type FleetOperationStagedRow,
+  FleetOperationStateError,
   type FleetOperationStore,
   type FleetOperationToken,
   FleetOperationTokenOperationError,
   fleetOperationItemsIntake,
+  fleetOperationOtherKindMessage,
   fleetOperationSafeInteger,
   fleetOperationStagedRowPayloadFitsEnvelope,
   fleetOperationTokenOf,
@@ -80,8 +84,8 @@ import type {
 const DEFAULT_MAX_ITEMS_PER_CALL = 500;
 const MIN_MAX_ITEMS_PER_CALL = 1;
 const MAX_MAX_ITEMS_PER_CALL = 2_000;
-const OTHER_OPERATION_KIND_MESSAGE = (operationId: string): string =>
-  `fleet operation '${operationId}' belongs to the other operation kind`;
+/** Fixed refusal shared by the coordinator's own count check and the intake's. */
+const RECORD_COUNT_MESSAGE = `fleet audit start accepts at most ${FLEET_OPERATION_ITEM_BOUND} records`;
 
 /** One bounded audit step: begin an operation, or continue a persisted one. */
 export type FleetAuditAdvanceAction =
@@ -130,16 +134,31 @@ export interface FleetAuditResultRef {
 
 /** Authoritative durable outcome after at most one bounded stage chunk. */
 export type FleetAuditAdvanceResult =
+  /**
+   * The operation is still RUNNING. `stage` is the persisted stage the next
+   * call resumes from, and `token` carries the committed revision.
+   */
   | Readonly<{
       status: 'pending';
       token: FleetOperationToken;
       stage: FleetAuditStage;
     }>
+  /**
+   * The operation is FINALIZED. `result` summarizes the frozen run; the
+   * findings themselves are read separately with
+   * `readFleetAuditFindingsPage`.
+   */
   | Readonly<{
       status: 'complete';
       token: FleetOperationToken;
       result: FleetAuditResultRef;
     }>
+  /**
+   * The operation is FAILED, and the failing call released its generation pin.
+   * A pin that outlived a crash between the terminal commit and that release is
+   * cleared by `abandonFleetAuditOperation()`. `failure` carries the durable
+   * reason; failed operations are still readable.
+   */
   | Readonly<{
       status: 'failed';
       token: FleetOperationToken;
@@ -185,6 +204,14 @@ export class FleetAuditAdvanceCapabilityError extends Error {
   }
 }
 
+/**
+ * Probes one injected port for the members a capability names. `target` is
+ * `object` rather than a port type because this coordinator gates two
+ * unrelated ports (the operation store and the inventory store) through the
+ * same table, and it is deliberately named for the audit capability set
+ * rather than for one store — the R3 sibling's `assertStoreCapability` gates
+ * a single store and keeps the narrower name.
+ */
 function assertCapability(
   target: object,
   capability: FleetAuditAdvanceCapability,
@@ -206,7 +233,9 @@ function assertMaxItemsPerCall(value: number): void {
     value < MIN_MAX_ITEMS_PER_CALL ||
     value > MAX_MAX_ITEMS_PER_CALL
   ) {
-    throw new Error('maxItemsPerCall must be an integer from 1 to 2000');
+    throw new Error(
+      `maxItemsPerCall must be an integer from ${MIN_MAX_ITEMS_PER_CALL} to ${MAX_MAX_ITEMS_PER_CALL}`,
+    );
   }
 }
 
@@ -242,6 +271,21 @@ function pinnedBy(operationId: string): string {
   return `fleet-audit:${operationId}`;
 }
 
+/**
+ * The `pending` result for a run record the store has just committed. Every
+ * chunk that leaves the operation RUNNING reports the persisted stage read
+ * back through the codec, never the stage it computed.
+ */
+function pendingFromCommitted(
+  committed: FleetOperationRunRecord,
+): FleetAuditAdvanceResult {
+  return {
+    status: 'pending',
+    token: fleetOperationTokenOf(committed),
+    stage: fleetAuditProgressFromUnknown(committed.progress).stage,
+  };
+}
+
 type IsSubset<Left, Right> = [Left] extends [Right] ? true : false;
 const DRIFT_FINDING_KINDS_ARE_AUDIT_KINDS: IsSubset<
   DriftFinding['kind'],
@@ -251,17 +295,26 @@ const AUDIT_FINDING_KINDS_ARE_DRIFT_KINDS: IsSubset<
   FleetAuditFindingKind,
   DriftFinding['kind']
 > = true;
+// Both assertions are compile-time only; these module-scope references keep
+// them reachable so an unused-binding cleanup cannot delete the check.
+void DRIFT_FINDING_KINDS_ARE_AUDIT_KINDS;
+void AUDIT_FINDING_KINDS_ARE_DRIFT_KINDS;
 
 function fleetAuditFindingKind(
   kind: DriftFinding['kind'],
 ): FleetAuditFindingKind {
-  void DRIFT_FINDING_KINDS_ARE_AUDIT_KINDS;
-  void AUDIT_FINDING_KINDS_ARE_DRIFT_KINDS;
   return kind;
 }
 
-/** Non-throwing durable write gate (§5.1/§6.4): the bounded path gates; the drain never does. */
-function sanitizedFindingRow(finding: DriftFinding): DriftFindingRowPayload {
+/**
+ * Non-throwing durable write gate (§5.1/§6.4): the bounded path gates; the
+ * drain never does. Only `detail` is gated: `tenantTag` and `environment`
+ * reach the row verbatim, which is the round-3 adjudication, so the name says
+ * gated DETAIL rather than a sanitized row.
+ */
+function findingRowWithGatedDetail(
+  finding: DriftFinding,
+): DriftFindingRowPayload {
   const kind = fleetAuditFindingKind(finding.kind);
   return {
     tenantTag: finding.tenantTag,
@@ -274,8 +327,17 @@ function sanitizedFindingRow(finding: DriftFinding): DriftFindingRowPayload {
 }
 
 /**
- * Returns `undefined` when the payload exceeds the staged-row envelope; the
- * caller then fails the operation durably. Throws `malformed()` on corruption.
+ * Stages one durable row, overloading two distinct signals on one return so
+ * every call site can treat them uniformly:
+ *
+ * - `undefined` means the payload exceeds the staged-row envelope. That is a
+ *   caller-visible emission bound, so the site fails the operation durably
+ *   through `failEmission`.
+ * - a thrown `FleetOperationStateError` means the payload does not satisfy
+ *   the row codec at all, which is durable corruption and propagates.
+ *
+ * No site needs to tell the two apart, which is why a discriminated result
+ * would buy nothing here.
  */
 function stagedAuditRow(
   rowKind: 'finding' | 'fact',
@@ -293,9 +355,12 @@ function stagedAuditRow(
     return {
       rowKind,
       ordinal,
-      payload: validated as unknown as Record<string, unknown>,
+      payload: { ...validated },
     };
-  } catch {
+  } catch (error) {
+    // Only a codec refusal means the payload is malformed; a programming
+    // fault must not be laundered into durable-corruption identity.
+    if (!(error instanceof FleetOperationStateError)) throw error;
     return malformed();
   }
 }
@@ -310,12 +375,20 @@ type GlobalAuditStage = Exclude<
   { step: 'per-record' | 'finalize' }
 >;
 type GlobalAuditStep = GlobalAuditStage['step'];
+type PerRecordAuditStage = Extract<FleetAuditStage, { step: 'per-record' }>;
 
 interface GlobalStageContext {
   readonly inventory: FleetResourceInventory;
   readonly auditedRecords: readonly FleetRecord[];
-  readonly known: ReturnType<typeof fleetAuditKnownSets>;
+  readonly known: FleetAuditKnownSets;
   readonly recordsByScript: ReturnType<typeof fleetAuditRecordsByScript>;
+}
+
+/** The one accessor for the optional R2 inventory slice. */
+function inventoryR2Buckets(
+  context: GlobalStageContext,
+): readonly NonNullable<FleetResourceInventory['r2Buckets']>[number][] {
+  return context.inventory.r2Buckets ?? [];
 }
 
 function chunked<T>(
@@ -324,16 +397,11 @@ function chunked<T>(
   source: readonly T[],
   emit: (slice: readonly T[], ordinal: number) => readonly DriftFinding[],
 ): GlobalStageChunk {
-  const ordinal =
-    'rowOrdinal' in stage
-      ? stage.rowOrdinal
-      : 'auditedOrdinal' in stage
-        ? stage.auditedOrdinal
-        : stage.expectedOrdinal;
-  if (
-    ordinal > source.length ||
-    (source.length > 0 && ordinal === source.length)
-  ) {
+  const ordinal = fleetAuditStageOrdinal(stage);
+  if (ordinal === undefined) return malformed();
+  // A global stage never persists a cursor at the end of its own source, so
+  // the only admissible cursor for an empty source is zero.
+  if (source.length === 0 ? ordinal > 0 : ordinal >= source.length) {
     return malformed();
   }
   const slice = source.slice(ordinal, ordinal + maxItemsPerCall);
@@ -347,13 +415,11 @@ function chunked<T>(
   };
 }
 
-interface GlobalStageDescriptor {
-  readonly advance: (
-    stage: GlobalAuditStage,
-    maxItemsPerCall: number,
-    context: GlobalStageContext,
-  ) => GlobalStageChunk;
-}
+type GlobalStageDescriptor = (
+  stage: GlobalAuditStage,
+  maxItemsPerCall: number,
+  context: GlobalStageContext,
+) => GlobalStageChunk;
 
 function globalStageDescriptor<T>(
   source: (context: GlobalStageContext) => readonly T[],
@@ -363,12 +429,10 @@ function globalStageDescriptor<T>(
     ordinal: number,
   ) => readonly DriftFinding[],
 ): GlobalStageDescriptor {
-  return {
-    advance: (stage, maxItemsPerCall, context) =>
-      chunked(stage, maxItemsPerCall, source(context), (slice, ordinal) =>
-        emit(slice, context, ordinal),
-      ),
-  };
+  return (stage, maxItemsPerCall, context) =>
+    chunked(stage, maxItemsPerCall, source(context), (slice, ordinal) =>
+      emit(slice, context, ordinal),
+    );
 }
 
 const GLOBAL_STAGE_DESCRIPTORS = Object.freeze({
@@ -457,7 +521,7 @@ const GLOBAL_STAGE_DESCRIPTORS = Object.freeze({
       }),
   ),
   'r2-orphans': globalStageDescriptor(
-    (context) => context.inventory.r2Buckets ?? [],
+    (context) => inventoryR2Buckets(context),
     (slice, context) =>
       auditR2OrphansStage({
         r2Buckets: slice,
@@ -472,7 +536,7 @@ const GLOBAL_STAGE_DESCRIPTORS = Object.freeze({
     (slice, context) =>
       auditR2MissingIdentityStage({
         expectedBucketEntries: slice,
-        r2Buckets: context.inventory.r2Buckets ?? [],
+        r2Buckets: inventoryR2Buckets(context),
       }),
   ),
 } satisfies Readonly<Record<GlobalAuditStep, GlobalStageDescriptor>>);
@@ -481,17 +545,9 @@ const GLOBAL_STAGE_DESCRIPTORS = Object.freeze({
 function advanceGlobalStage(
   stage: GlobalAuditStage,
   maxItemsPerCall: number,
-  inventory: FleetResourceInventory,
-  auditedRecords: readonly FleetRecord[],
-  known: ReturnType<typeof fleetAuditKnownSets>,
-  recordsByScript: ReturnType<typeof fleetAuditRecordsByScript>,
+  context: GlobalStageContext,
 ): GlobalStageChunk {
-  return GLOBAL_STAGE_DESCRIPTORS[stage.step].advance(stage, maxItemsPerCall, {
-    inventory,
-    auditedRecords,
-    known,
-    recordsByScript,
-  });
+  return GLOBAL_STAGE_DESCRIPTORS[stage.step](stage, maxItemsPerCall, context);
 }
 
 function buildInitialAuditRunRecord(
@@ -557,6 +613,48 @@ async function failAudit(
   });
 }
 
+/** The one durable `emission-bound-exceeded` refusal every staging site takes. */
+function failEmission(
+  options: AdvanceFleetAuditOptions,
+  lease: FleetOperationLease,
+  run: FleetOperationRunRecord,
+  progress: FleetAuditProgress,
+  itemOrdinal?: number,
+): Promise<FleetAuditAdvanceResult> {
+  return failAudit(options, lease, run, progress, {
+    reason: 'emission-bound-exceeded',
+    ...(itemOrdinal === undefined ? {} : { itemOrdinal }),
+  });
+}
+
+/** Every owner claim the record step added, in map order. */
+function* ownedFactPayloads(
+  factKind: 'database-owner' | 'namespace-owner',
+  owners: ReadonlyMap<string, FleetRecord>,
+  before: ReadonlySet<string>,
+): Generator<FleetAuditFactPayload> {
+  for (const [key, owner] of owners) {
+    if (before.has(key)) continue;
+    yield {
+      factKind,
+      key,
+      tenantTag: owner.tenantTag,
+      environment: owner.environment,
+    };
+  }
+}
+
+/** Every duplicate-namespace collision the record step added, in set order. */
+function* duplicateNamespaceFactPayloads(
+  keys: ReadonlySet<string>,
+  before: ReadonlySet<string>,
+): Generator<FleetAuditFactPayload> {
+  for (const key of keys) {
+    if (before.has(key)) continue;
+    yield { factKind: 'duplicate-namespace', key };
+  }
+}
+
 async function finalizeAudit(
   lease: FleetOperationLease,
   run: FleetOperationRunRecord,
@@ -589,37 +687,11 @@ async function advancePerRecordChunk(
   lease: FleetOperationLease,
   run: FleetOperationRunRecord,
   progress: FleetAuditProgress,
+  stage: PerRecordAuditStage,
   inventory: FleetResourceInventory,
   records: readonly FleetRecord[],
   auditedRecords: readonly FleetRecord[],
 ): Promise<FleetAuditAdvanceResult> {
-  const stage = progress.stage as Extract<
-    FleetAuditStage,
-    { step: 'per-record' }
-  >;
-  if (stage.recordOrdinal > records.length) return malformed();
-  if (stage.recordOrdinal === records.length) {
-    const newProgress: FleetAuditProgress = {
-      ...progress,
-      revision: progress.revision + 1,
-      stage: nextAuditStage(stage, true),
-    };
-    const committed = await lease.commitProgress({
-      operationId: run.operationId,
-      expectedRevision: progress.revision,
-      runRecord: {
-        ...run,
-        progress: newProgress,
-        updatedAt: new Date().toISOString(),
-      },
-    });
-    const committedProgress = fleetAuditProgressFromUnknown(committed.progress);
-    return {
-      status: 'pending',
-      token: fleetOperationTokenOf(committed),
-      stage: committedProgress.stage,
-    };
-  }
   const record = records[stage.recordOrdinal] as FleetRecord;
   const recordsByScript = fleetAuditRecordsByScript(auditedRecords);
   const liveByScript = fleetAuditLiveByScript(inventory.deployments);
@@ -641,6 +713,16 @@ async function advancePerRecordChunk(
   const duplicateNamespaceIds = new Set(
     fleetAuditRecordsDerivedDuplicateNamespaceIds(auditedRecords),
   );
+  // A staged owner fact whose (tenantTag, environment) pair resolves to no
+  // record row is dropped rather than refused. Unreachability is the WHOLE
+  // safety argument: every owner fact this coordinator writes names a record
+  // it staged in the same operation, and both row sets are read back in full
+  // and contiguity-checked before this loop. Were it reachable it would
+  // SUPPRESS findings, not add them — a missing claimant leaves the database
+  // or namespace looking unclaimed, so `auditRecordStep` takes this record as
+  // the first owner and emits no duplicate finding. `malformed()` on the miss
+  // is the stricter alternative and was left out as a behavior change on a
+  // converged checkpoint.
   for (const fact of facts) {
     if (fact.factKind === 'database-owner') {
       const owner = recordByKey.get(`${fact.tenantTag}:${fact.environment}`);
@@ -656,7 +738,7 @@ async function advancePerRecordChunk(
   const namespaceOwnersBefore = new Set(liveNamespaceOwners.keys());
   const duplicatesBefore = new Set(duplicateNamespaceIds);
 
-  if (options.signal?.aborted) options.signal.throwIfAborted();
+  options.signal?.throwIfAborted();
   const result = await auditRecordStep({
     record,
     recordsByScript,
@@ -673,59 +755,27 @@ async function advancePerRecordChunk(
     store: options.fleetStore,
     staleAfterMs: progress.staleAfterMs,
     auditNow: progress.auditTimeMs,
-    authorityNowProvider: options.authorityClock ?? (() => Date.now()),
+    authorityNowProvider: options.authorityClock ?? Date.now,
   });
 
+  // The three fact kinds differ only in their source collection and payload
+  // shape, so each yields its newly claimed payloads and one loop stages them.
+  const newFactPayloads: readonly Iterable<FleetAuditFactPayload>[] = [
+    ownedFactPayloads('database-owner', databases, databasesBefore),
+    ownedFactPayloads(
+      'namespace-owner',
+      liveNamespaceOwners,
+      namespaceOwnersBefore,
+    ),
+    duplicateNamespaceFactPayloads(duplicateNamespaceIds, duplicatesBefore),
+  ];
   const newFacts: FleetOperationStagedRow[] = [];
   let factOrdinal = progress.factCount;
-  for (const [key, owner] of databases) {
-    if (!databasesBefore.has(key)) {
-      const payload: FleetAuditFactPayload = {
-        factKind: 'database-owner',
-        key,
-        tenantTag: owner.tenantTag,
-        environment: owner.environment,
-      };
+  for (const payloads of newFactPayloads) {
+    for (const payload of payloads) {
       const row = stagedAuditRow('fact', factOrdinal++, payload);
       if (!row) {
-        return failAudit(options, lease, run, progress, {
-          reason: 'emission-bound-exceeded',
-          itemOrdinal: stage.recordOrdinal,
-        });
-      }
-      newFacts.push(row);
-    }
-  }
-  for (const [key, owner] of liveNamespaceOwners) {
-    if (!namespaceOwnersBefore.has(key)) {
-      const payload: FleetAuditFactPayload = {
-        factKind: 'namespace-owner',
-        key,
-        tenantTag: owner.tenantTag,
-        environment: owner.environment,
-      };
-      const row = stagedAuditRow('fact', factOrdinal++, payload);
-      if (!row) {
-        return failAudit(options, lease, run, progress, {
-          reason: 'emission-bound-exceeded',
-          itemOrdinal: stage.recordOrdinal,
-        });
-      }
-      newFacts.push(row);
-    }
-  }
-  for (const key of duplicateNamespaceIds) {
-    if (!duplicatesBefore.has(key)) {
-      const payload: FleetAuditFactPayload = {
-        factKind: 'duplicate-namespace',
-        key,
-      };
-      const row = stagedAuditRow('fact', factOrdinal++, payload);
-      if (!row) {
-        return failAudit(options, lease, run, progress, {
-          reason: 'emission-bound-exceeded',
-          itemOrdinal: stage.recordOrdinal,
-        });
+        return failEmission(options, lease, run, progress, stage.recordOrdinal);
       }
       newFacts.push(row);
     }
@@ -736,15 +786,16 @@ async function advancePerRecordChunk(
     const row = stagedAuditRow(
       'finding',
       progress.findingCount + index,
-      sanitizedFindingRow(finding),
+      findingRowWithGatedDetail(finding),
     );
     if (!row) {
-      // Unreachable: sanitizedFindingRow caps every detail at 4 KiB and strips
-      // controls before measurement, while record identifiers are grammar-bounded.
-      return failAudit(options, lease, run, progress, {
-        reason: 'emission-bound-exceeded',
-        itemOrdinal: stage.recordOrdinal,
-      });
+      // Unreachable: the gate never shortens a detail, it SUBSTITUTES the
+      // fixed withheld fallback whenever `isDurableAuditDetailSafe` rejects
+      // one — which includes every detail over the 4 KiB string bound. What
+      // reaches the row is therefore either an already-bounded detail or a
+      // short fixed string, beside grammar-bounded identifiers, so the
+      // composed payload cannot exceed the staged-row envelope.
+      return failEmission(options, lease, run, progress, stage.recordOrdinal);
     }
     findingRows.push(row);
   }
@@ -755,10 +806,7 @@ async function advancePerRecordChunk(
     findingRows.length + newFacts.length + 1 >
     FLEET_OPERATION_STAGE_BATCH_STATEMENTS
   ) {
-    return failAudit(options, lease, run, progress, {
-      reason: 'emission-bound-exceeded',
-      itemOrdinal: stage.recordOrdinal,
-    });
+    return failEmission(options, lease, run, progress, stage.recordOrdinal);
   }
 
   const newProgress: FleetAuditProgress = {
@@ -782,12 +830,7 @@ async function advancePerRecordChunk(
       fact: newProgress.factCount,
     },
   });
-  const committedProgress = fleetAuditProgressFromUnknown(committed.progress);
-  return {
-    status: 'pending',
-    token: fleetOperationTokenOf(committed),
-    stage: committedProgress.stage,
-  };
+  return pendingFromCommitted(committed);
 }
 
 async function advanceOneChunk(
@@ -826,6 +869,32 @@ async function advanceOneChunk(
   } catch {
     return malformed();
   }
+  if (progress.stage.step === 'per-record') {
+    const perRecordStage = progress.stage;
+    if (perRecordStage.recordOrdinal > records.length) return malformed();
+    if (perRecordStage.recordOrdinal === records.length) {
+      // Unlike a global stage, `per-record` does persist a cursor equal to its
+      // source length and spends a whole extra stage-running call — a full
+      // generation re-read and a record-row re-page included — on the pure
+      // transition to `finalize`. That is deliberate: the call is the leading 1
+      // in the documented per-call cost formula.
+      const newProgress: FleetAuditProgress = {
+        ...progress,
+        revision: progress.revision + 1,
+        stage: nextAuditStage(perRecordStage, true),
+      };
+      const committed = await lease.commitProgress({
+        operationId: run.operationId,
+        expectedRevision: progress.revision,
+        runRecord: {
+          ...run,
+          progress: newProgress,
+          updatedAt: new Date().toISOString(),
+        },
+      });
+      return pendingFromCommitted(committed);
+    }
+  }
   const auditedRecords = fleetAuditAuditedRecords(records);
 
   if (progress.stage.step === 'per-record') {
@@ -834,35 +903,31 @@ async function advanceOneChunk(
       lease,
       run,
       progress,
+      progress.stage,
       inventory,
       records,
       auditedRecords,
     );
   }
 
-  const known = fleetAuditKnownSets(records);
-  const recordsByScript = fleetAuditRecordsByScript(auditedRecords);
-  const chunk = advanceGlobalStage(
-    progress.stage,
-    maxItemsPerCall,
+  const chunk = advanceGlobalStage(progress.stage, maxItemsPerCall, {
     inventory,
     auditedRecords,
-    known,
-    recordsByScript,
-  );
+    known: fleetAuditKnownSets(records),
+    recordsByScript: fleetAuditRecordsByScript(auditedRecords),
+  });
   const findingRows: FleetOperationStagedRow[] = [];
   for (const [index, finding] of chunk.findings.entries()) {
     const row = stagedAuditRow(
       'finding',
       progress.findingCount + index,
-      sanitizedFindingRow(finding),
+      findingRowWithGatedDetail(finding),
     );
     if (!row) {
       // A global finding ordinal can exceed FLEET_OPERATION_ITEM_BOUND, which
-      // fleetOperationFailureFromUnknown rejects as an itemOrdinal.
-      return failAudit(options, lease, run, progress, {
-        reason: 'emission-bound-exceeded',
-      });
+      // fleetOperationFailureFromUnknown rejects as an itemOrdinal, so this
+      // failure carries no ordinal.
+      return failEmission(options, lease, run, progress);
     }
     findingRows.push(row);
   }
@@ -888,12 +953,7 @@ async function advanceOneChunk(
     },
     expectedRowWatermarks: { finding: newFindingCount },
   });
-  const committedProgress = fleetAuditProgressFromUnknown(committed.progress);
-  return {
-    status: 'pending',
-    token: fleetOperationTokenOf(committed),
-    stage: committedProgress.stage,
-  };
+  return pendingFromCommitted(committed);
 }
 
 async function startAudit(
@@ -915,9 +975,7 @@ async function startAudit(
   }
   const inputRecords = action.records;
   if (inputRecords.length > FLEET_OPERATION_ITEM_BOUND) {
-    throw new Error(
-      `fleet audit start accepts at most ${FLEET_OPERATION_ITEM_BOUND} records`,
-    );
+    throw new Error(RECORD_COUNT_MESSAGE);
   }
   if (
     inputRecords.some((record) => record === null || typeof record !== 'object')
@@ -936,11 +994,9 @@ async function startAudit(
     const { reason } = intake;
     switch (reason) {
       case 'item-count':
-        // The coordinator count check precedes the grammar check, so this arm
-        // is unreachable here; the helper retains it for other callers.
-        throw new Error(
-          `fleet audit start accepts at most ${FLEET_OPERATION_ITEM_BOUND} records`,
-        );
+        // The coordinator count check precedes the intake, so this arm is
+        // unreachable here; the helper retains it for other callers.
+        throw new Error(RECORD_COUNT_MESSAGE);
       case 'item-structure':
         throw new Error(
           'fleet audit record exceeds the intake structure bounds',
@@ -953,12 +1009,20 @@ async function startAudit(
         );
       default: {
         const exhaustive: never = reason;
-        return exhaustive;
+        // A widened refusal union must fail closed here rather than let a
+        // bare string escape as this function's result.
+        throw new Error(
+          `unexpected fleet operation intake refusal '${String(exhaustive)}'`,
+        );
       }
     }
   }
   const intakeDigest = intake.digest;
   const records = intake.items;
+  // Narrows `unknown` intake items to `FleetRecord` on `tenantTag` and
+  // `environment` alone, so the array asserts more shape than is checked.
+  // Every entry is staged whole by the `payload` cast below, and fields
+  // beyond those two are re-read only by the `advanceOneChunk` decode.
   if (
     !records.every((record): record is FleetRecord => {
       if (record === null || typeof record !== 'object') return false;
@@ -984,7 +1048,7 @@ async function startAudit(
       let generation: number;
       if (probed) {
         if (probed.kind !== 'audit') {
-          throw new Error(OTHER_OPERATION_KIND_MESSAGE(operationId));
+          throw new Error(fleetOperationOtherKindMessage(operationId));
         }
         generation = fleetAuditProgressFromUnknown(probed.progress).generation;
       } else {
@@ -1055,8 +1119,7 @@ async function startAudit(
         rows,
       });
       const committedProgress: FleetAuditProgress = {
-        ...fleetAuditProgressFromUnknown(record.progress),
-        generation: pinGenerationValue,
+        ...recordProgress,
         revision: 1,
       };
       try {
@@ -1070,16 +1133,17 @@ async function startAudit(
           },
           expectedRowWatermarks: { record: records.length },
         });
-        const finalProgress = fleetAuditProgressFromUnknown(committed.progress);
-        return {
-          status: 'pending',
-          token: fleetOperationTokenOf(committed),
-          stage: finalProgress.stage,
-        };
+        return pendingFromCommitted(committed);
       } catch {
-        // A far-advanced running (or since-terminal) operation: the revision-1
-        // replay cannot converge, so the caller receives the current
-        // authoritative state exactly as a stale-token continue would (§5.5).
+        // Every throw from the revision-1 replay resolves to the same answer,
+        // and the catch is deliberately unnarrowed for that reason: for a
+        // far-advanced running (or since-terminal) operation the CAS cannot
+        // converge, and for a lost lease or a store fault the operation's
+        // current authoritative state is still the only truthful reply. The
+        // caller therefore receives exactly what a stale-token continue would
+        // return (§5.5) — which is a report of durable state, never a claim
+        // that this call succeeded. If no state can be read back at all, the
+        // reads below throw rather than invent one.
         const current = await lease.readOperation(operationId);
         if (current) return resultFromRun(current);
         const persisted =
@@ -1140,20 +1204,35 @@ export async function advanceFleetAudit(
   options.signal?.throwIfAborted();
   const maxItemsPerCall = options.maxItemsPerCall ?? DEFAULT_MAX_ITEMS_PER_CALL;
   assertMaxItemsPerCall(maxItemsPerCall);
-  if (options.action.kind === 'start') {
-    return startAudit(options, options.action);
+  const action = options.action;
+  if (action.kind === 'start') {
+    return startAudit(options, action);
   }
-  return continueAudit(options, options.action.token, maxItemsPerCall);
+  return continueAudit(options, action.token, maxItemsPerCall);
 }
 
 /**
  * Reads one page of an operation's parsed drift findings. Terminal-only
  * (failed operations included); never touches the inventory store. The
  * findings come back in ordinal order whatever order the store's page
- * arrived in (the port lets a page arrive unordered). Finding ordinals are
- * contiguous from zero and a page holds the smallest qualifying ordinals,
- * so a caller pages the whole set with
- * `afterOrdinal = (afterOrdinal ?? -1) + findings.length` until `done`.
+ * arrived in (the port lets a page arrive unordered).
+ *
+ * A caller pages the whole set with
+ * `afterOrdinal = (afterOrdinal ?? -1) + findings.length` until `done`. That
+ * idiom rests on the assumption `FleetOperationStore.readOperationRowsPage`
+ * states as a conformance requirement: finding ordinals are contiguous from
+ * zero, and a page holds the smallest qualifying ordinals. This reader
+ * checks the assumption instead of trusting it, so a non-conforming store
+ * cannot spin the loop forever.
+ *
+ * Refuses an unknown operation with `FleetOperationTokenOperationError`, an
+ * operation of the other kind and a still-running operation with fixed
+ * messages, and a non-conforming page — empty while unfinished, or not the
+ * contiguous ordinal run following the cursor — with `malformed()`. `limit`
+ * is deliberately NOT range-checked here: it is forwarded to the store, whose
+ * own read guard owns that range. `maxItemsPerCall` is validated in this
+ * module by contrast, because it drives this module's own chunking rather
+ * than a store call.
  */
 export async function readFleetAuditFindingsPage(
   store: FleetOperationStore,
@@ -1169,7 +1248,7 @@ export async function readFleetAuditFindingsPage(
     throw new FleetOperationTokenOperationError(operationId);
   }
   if (run.kind !== 'audit') {
-    throw new Error(OTHER_OPERATION_KIND_MESSAGE(operationId));
+    throw new Error(fleetOperationOtherKindMessage(operationId));
   }
   if (run.state === 'running') {
     throw new Error(`fleet audit operation '${operationId}' is not terminal`);
@@ -1180,13 +1259,16 @@ export async function readFleetAuditFindingsPage(
     limit,
     ...(afterOrdinal === undefined ? {} : { afterOrdinal }),
   });
+  if (page.rows.length === 0 && !page.done) return malformed();
+  const sortedRows = [...page.rows].sort(
+    (left, right) => left.ordinal - right.ordinal,
+  );
+  const firstOrdinal = (afterOrdinal ?? -1) + 1;
+  for (const [index, row] of sortedRows.entries()) {
+    if (row.ordinal !== firstOrdinal + index) return malformed();
+  }
   return {
-    findings: [...page.rows]
-      .sort((left, right) => left.ordinal - right.ordinal)
-      .map(
-        (row) =>
-          driftFindingRowFromUnknown(row.payload) as unknown as DriftFinding,
-      ),
+    findings: sortedRows.map((row) => driftFindingRowFromUnknown(row.payload)),
     done: page.done,
   };
 }
@@ -1207,7 +1289,7 @@ export async function abandonFleetAuditOperation(
     const run = await lease.readOperation(operationId);
     if (run && run.state === 'running') {
       if (run.kind !== 'audit') {
-        throw new Error(OTHER_OPERATION_KIND_MESSAGE(operationId));
+        throw new Error(fleetOperationOtherKindMessage(operationId));
       }
       const progress = fleetAuditProgressFromUnknown(run.progress);
       const newProgress: FleetAuditProgress = {
@@ -1237,7 +1319,7 @@ export async function abandonFleetAuditOperation(
       throw new FleetOperationTokenOperationError(operationId);
     }
     if (persisted.kind !== 'audit') {
-      throw new Error(OTHER_OPERATION_KIND_MESSAGE(operationId));
+      throw new Error(fleetOperationOtherKindMessage(operationId));
     }
     const progress = fleetAuditProgressFromUnknown(persisted.progress);
     await inventoryStore.releasePin({

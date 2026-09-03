@@ -3,13 +3,28 @@
 import { createHash } from 'node:crypto';
 import { cloneBoundedPlainData } from './strict-plain-data.js';
 
+/**
+ * Envelope bound for one operation RUN RECORD — the `{version, operationId,
+ * kind, state, progress, updatedAt}` document `fleetOperationRunRecordFromUnknown`
+ * parses. Not a staged-row bound.
+ */
 export const FLEET_OPERATION_RECORD_BYTE_BOUND = 96 * 1024;
 export const FLEET_OPERATION_TOKEN_BYTE_BOUND = 1024;
 export const FLEET_OPERATION_STRING_BYTE_BOUND = 4096;
+/** Envelope bound for a `finding`, `fact`, or `item` staged-row payload. */
 export const FLEET_OPERATION_ROW_PAYLOAD_BYTE_BOUND = 16 * 1024;
+/**
+ * Envelope bound for a `record` STAGED-ROW payload — one caller-supplied
+ * fleet record. It currently holds the same value as
+ * `FLEET_OPERATION_RECORD_BYTE_BOUND`, but neither is derived from the other:
+ * that one bounds the run-record document, this one bounds a staged row.
+ * Picking the wrong one type-checks and passes every test.
+ */
 export const FLEET_OPERATION_RECORD_ROW_BYTE_BOUND = 96 * 1024;
-const DEPTH_BOUND = 64;
-const NODE_BOUND = 8192;
+/** Maximum nesting depth of one bounded plain-data value. */
+export const FLEET_OPERATION_DEPTH_BOUND = 64;
+/** Maximum node count of one bounded plain-data value. */
+export const FLEET_OPERATION_NODE_BOUND = 8192;
 export const FLEET_OPERATION_ITEM_BOUND = 10_000;
 /**
  * Total canonical intake bytes per operation, measured as the sum of per-item
@@ -20,9 +35,23 @@ export const FLEET_OPERATION_ITEM_BOUND = 10_000;
 export const FLEET_OPERATION_INTAKE_BYTE_BOUND = 16 * 1024 * 1024;
 /** Statements per D1 batch used by the staging protocol. */
 export const FLEET_OPERATION_STAGE_BATCH_STATEMENTS = 100;
-/** At most 99 non-record rows per record times 10,000 records. */
+/**
+ * Aggregate cap on the non-`record` staged rows one operation may read back:
+ * at most 99 rows per record times 10,000 records. The 99 is the per-record
+ * batch ceiling the audit coordinator enforces over the `finding` and `fact`
+ * rows one record emits together, the remaining statement of the batch being
+ * the run record's own update. It derives no bound for a global stage's
+ * findings, nor for R4-C.2's `item` rows, where this constant is a plain
+ * ceiling rather than a derived bound.
+ */
 export const FLEET_OPERATION_ROW_READ_BOUND =
   (FLEET_OPERATION_STAGE_BATCH_STATEMENTS - 1) * FLEET_OPERATION_ITEM_BOUND;
+/**
+ * Rows requested per `readOperationRowsPage` call. The guide's documented
+ * O(records²/1,000) per-call re-page term is this divisor, so changing it
+ * changes that published cost figure.
+ */
+const FLEET_OPERATION_ROW_PAGE_LIMIT = 1_000;
 /** Frozen plan length cap (fixed steps plus pending D1 versions). */
 export const FLEET_MIGRATION_PLAN_BOUND = 64;
 
@@ -88,12 +117,19 @@ export interface FleetOperationStagedRow {
   readonly payload: Readonly<Record<string, unknown>>;
 }
 
-export interface FleetOperationItemsIntake {
-  readonly envelope: Record<string, unknown>;
+/** The argument bag `fleetOperationItemsIntake` takes; not its result. */
+export interface FleetOperationItemsIntakeInput {
+  readonly envelope: Readonly<Record<string, unknown>>;
   readonly items: readonly unknown[];
   readonly itemByteBound: number;
 }
 
+/**
+ * Why an intake was refused. `itemOrdinal` names the offending item for the
+ * per-item reasons; the audit coordinator maps every reason to a fixed
+ * message and does not read it, but it is carried so R4-C.2's migration
+ * intake — which refuses one item out of a batch — can report which.
+ */
 export type FleetOperationIntakeRefusal =
   | { readonly reason: 'item-count' }
   | { readonly reason: 'item-structure'; readonly itemOrdinal: number }
@@ -144,11 +180,32 @@ export class FleetOperationStoreCapabilityError extends Error {
   }
 }
 
+/**
+ * The fixed refusal message every coordinator raises when a persisted
+ * operation carries the other operation kind. It lives here so the audit and
+ * migration coordinators emit byte-identical text.
+ */
+export function fleetOperationOtherKindMessage(operationId: string): string {
+  return `fleet operation '${operationId}' belongs to the other operation kind`;
+}
+
 export interface FleetOperationStore {
+  /**
+   * Runs `operation` under an account-wide exclusive lease for one operation
+   * kind. The lease is acquired before the callback runs and released after
+   * the returned promise settles, whether it resolves or rejects. Contention
+   * is refused, not queued: a caller that cannot take the lease receives an
+   * error rather than waiting for the holder.
+   */
   withAccountOperationLease<T>(
     kind: FleetOperationKind,
     operation: (lease: FleetOperationLease) => Promise<T>,
   ): Promise<T>;
+  /**
+   * Reads the persisted run record outside any lease. A missing operation is
+   * reported as `undefined`, not as an error; a present but unparseable one
+   * still refuses through the run-record codec.
+   */
   readOperationById(
     operationId: string,
   ): Promise<FleetOperationRunRecord | undefined>;
@@ -173,6 +230,16 @@ export interface FleetOperationStore {
       done: boolean;
     }>
   >;
+  /**
+   * Deletes up to `limit` prunable terminal operations of one kind and reports
+   * the deletion count beside `releasedPins`, the number of pin-release CALLS
+   * the pass made. One such call is issued per audit candidate whether or not
+   * that operation still holds a pin, the release being a no-op when it does
+   * not, so the counter reports audit candidates rather than reclaimed pins and
+   * stays 0 for `kind: 'migration'`. Which terminal operations are prunable is
+   * the implementation's own retention policy — it must never delete one that
+   * is still an active head.
+   */
   pruneFleetOperations(
     input: Readonly<{
       kind: FleetOperationKind;
@@ -182,7 +249,20 @@ export interface FleetOperationStore {
 }
 
 export interface FleetOperationLease {
+  /**
+   * Throws unless this lease is still held, so a coordinator that is about to
+   * do durable work can fail closed on a lost lease instead of racing the new
+   * holder.
+   */
   assertOwned(): Promise<void>;
+  /**
+   * Creates the operation, or adopts an existing one of the same id. The
+   * outcome is `created` for a new operation, `adopted-running` when an
+   * operation with a matching `intakeDigest` is already RUNNING, and
+   * `adopted-terminal` when it has already finished; `record` is the
+   * authoritative run record in every case. A different `intakeDigest` for
+   * the same id is a conflict the implementation refuses.
+   */
   startOperation(
     input: Readonly<{
       operationId: string;
@@ -196,9 +276,20 @@ export interface FleetOperationLease {
       record: FleetOperationRunRecord;
     }>
   >;
+  /** The lease-scoped read of one run record; `undefined` when none exists. */
   readOperation(
     operationId: string,
   ): Promise<FleetOperationRunRecord | undefined>;
+  /**
+   * Appends staged rows without advancing the revision, refusing unless the
+   * persisted revision still equals `expectedRevision`.
+   *
+   * WRITER OBLIGATION: rows must be supplied in ascending ordinal order
+   * within each row kind, and the implementation must persist them in array
+   * order. `readAllFleetOperationRows`'s contiguity assertion is correct only
+   * because both halves hold — a batch persisted out of order can leave a gap
+   * visible to a reader that pages mid-write.
+   */
   stageRows(
     input: Readonly<{
       operationId: string;
@@ -206,6 +297,18 @@ export interface FleetOperationLease {
       rows: readonly FleetOperationStagedRow[];
     }>,
   ): Promise<void>;
+  /**
+   * Compare-and-set advance of one operation: refuses unless the persisted
+   * revision equals `expectedRevision`, then writes `runRecord`, appends
+   * `rows`, and replaces the payloads of `updateRows` — `item` rows only — in
+   * the same transaction. For each named kind `expectedRowWatermarks` asserts
+   * that the first N ordinals are all present after the write — a dense-prefix
+   * check rather than a total count — so a partially applied batch is refused
+   * while a retry that already staged byte-identical rows at higher ordinals
+   * still commits; `finalizeOperation`'s totals close those surplus ordinals
+   * out. Returns the persisted record, which is the only authoritative
+   * post-commit state.
+   */
   commitProgress(
     input: Readonly<{
       operationId: string;
@@ -218,6 +321,15 @@ export interface FleetOperationLease {
       >;
     }>,
   ): Promise<FleetOperationRunRecord>;
+  /**
+   * The same CAS as `commitProgress`, moving the operation to FINALIZED and
+   * stamping its terminal time. `expectedRowCounts` asserts the FINAL row
+   * count per kind, so a run that lost or double-wrote rows cannot finalize.
+   * `requireAllItemsComplete` additionally demands that the number of `item`
+   * rows in a complete state equals the progress item count — R4-C.2's
+   * per-item migration contract, unused by the audit coordinator. Returns the
+   * persisted terminal record.
+   */
   finalizeOperation(
     input: Readonly<{
       operationId: string;
@@ -229,6 +341,11 @@ export interface FleetOperationLease {
       requireAllItemsComplete?: boolean;
     }>,
   ): Promise<FleetOperationRunRecord>;
+  /**
+   * The same CAS, moving the operation to FAILED. Staged rows are kept so a
+   * failed operation stays readable; `updateRows` replaces individual `item`
+   * row payloads in the same transaction.
+   */
   failOperation(
     input: Readonly<{
       operationId: string;
@@ -244,76 +361,10 @@ export function malformed(): never {
   throw new FleetOperationStateError();
 }
 
-/**
- * Reads and ordinal-sorts every contiguous-from-zero staged row of one kind.
- * Fails closed on an empty unfinished page, any row at or below the requested
- * exclusive cursor, a duplicate ordinal, or a gap. Record reads cap at
- * `FLEET_OPERATION_ITEM_BOUND`; other kinds cap at
- * `FLEET_OPERATION_ROW_READ_BOUND`.
- */
-export async function readAllFleetOperationRows(
-  store: FleetOperationStore,
-  operationId: string,
-  rowKind: FleetOperationRowKind,
-): Promise<FleetOperationStagedRow[]> {
-  const rows: FleetOperationStagedRow[] = [];
-  const rowReadBound =
-    rowKind === 'record'
-      ? FLEET_OPERATION_ITEM_BOUND
-      : FLEET_OPERATION_ROW_READ_BOUND;
-  let afterOrdinal: number | undefined;
-  for (;;) {
-    const page = await store.readOperationRowsPage({
-      operationId,
-      rowKind,
-      limit: 1_000,
-      ...(afterOrdinal === undefined ? {} : { afterOrdinal }),
-    });
-    // A surviving row exceeds every ordinal collected from prior pages, so
-    // only duplicates within this page need an explicit set.
-    const pageOrdinals = new Set<number>();
-    let maximumOrdinal: number | undefined;
-    for (const row of page.rows) {
-      if (
-        (afterOrdinal !== undefined && row.ordinal <= afterOrdinal) ||
-        pageOrdinals.has(row.ordinal)
-      ) {
-        return malformed();
-      }
-      pageOrdinals.add(row.ordinal);
-      if (maximumOrdinal === undefined || row.ordinal > maximumOrdinal) {
-        maximumOrdinal = row.ordinal;
-      }
-    }
-    rows.push(...page.rows);
-    if (rows.length > rowReadBound) return malformed();
-    if (page.done) break;
-    if (maximumOrdinal === undefined) return malformed();
-    afterOrdinal = maximumOrdinal;
-  }
-  const sortedRows = [...rows].sort(
-    (left, right) => left.ordinal - right.ordinal,
-  );
-  for (const [index, row] of sortedRows.entries()) {
-    if (row.ordinal !== index) return malformed();
-  }
-  return sortedRows;
-}
-
-/** Constructs the public continuation token for one durable run record. */
-export function fleetOperationTokenOf(
-  run: FleetOperationRunRecord,
-): FleetOperationToken {
-  return {
-    version: 1,
-    operationId: run.operationId,
-    revision: run.progress.revision,
-  };
-}
-
 const TEXT_ENCODER = new TextEncoder();
 
-function utf8Length(value: string): number {
+/** UTF-8 byte length of one string, over a module-level encoder. */
+export function utf8Length(value: string): number {
   return TEXT_ENCODER.encode(value).byteLength;
 }
 
@@ -360,14 +411,6 @@ export function assertFleetOperationExactKeys(
   }
 }
 
-export function fleetOperationBoundedString(value: unknown): value is string {
-  return (
-    typeof value === 'string' &&
-    value.length > 0 &&
-    utf8Length(value) <= FLEET_OPERATION_STRING_BYTE_BOUND
-  );
-}
-
 export function fleetOperationSha256(value: unknown): value is string {
   return typeof value === 'string' && /^[0-9a-f]{64}$/u.test(value);
 }
@@ -381,38 +424,43 @@ function canonicalIso(value: unknown): value is string {
 }
 
 function fleetOperationBoundedPlain(value: unknown, maxBytes: number): unknown {
+  let plain: unknown;
   try {
-    const plain = cloneBoundedPlainData(value, {
-      maxDepth: DEPTH_BOUND,
-      maxNodes: NODE_BOUND,
+    plain = cloneBoundedPlainData(value, {
+      maxDepth: FLEET_OPERATION_DEPTH_BOUND,
+      maxNodes: FLEET_OPERATION_NODE_BOUND,
       maxScalarBytes: maxBytes,
       maxSerializedBytes: maxBytes,
       error: () => new FleetOperationStateError(),
     });
     Reflect.apply(STRUCTURED_CLONE, undefined, [value]);
-    const pending = [plain];
-    while (pending.length > 0) {
-      const current = pending.pop();
-      if (
-        typeof current === 'string' &&
-        utf8Length(current) > FLEET_OPERATION_STRING_BYTE_BOUND
-      ) {
-        return malformed();
-      }
-      if (Array.isArray(current)) pending.push(...current);
-      else if (current && typeof current === 'object') {
-        for (const [key, entry] of Object.entries(current)) {
-          if (utf8Length(key) > FLEET_OPERATION_STRING_BYTE_BOUND) {
-            return malformed();
-          }
-          pending.push(entry);
-        }
-      }
-    }
-    return plain;
   } catch {
     return malformed();
   }
+  // The string and key walk runs outside the try because it operates on the
+  // already-cloned plain tree — no getters, no cycles — and because its own
+  // `malformed()` calls would otherwise throw into a catch that only calls
+  // `malformed()` again.
+  const pending = [plain];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (
+      typeof current === 'string' &&
+      utf8Length(current) > FLEET_OPERATION_STRING_BYTE_BOUND
+    ) {
+      return malformed();
+    }
+    if (Array.isArray(current)) pending.push(...current);
+    else if (current && typeof current === 'object') {
+      for (const [key, entry] of Object.entries(current)) {
+        if (utf8Length(key) > FLEET_OPERATION_STRING_BYTE_BOUND) {
+          return malformed();
+        }
+        pending.push(entry);
+      }
+    }
+  }
+  return plain;
 }
 
 function stagedRowMaxBytes(rowKind: FleetOperationRowKind): number {
@@ -421,16 +469,22 @@ function stagedRowMaxBytes(rowKind: FleetOperationRowKind): number {
     : FLEET_OPERATION_ROW_PAYLOAD_BYTE_BOUND;
 }
 
-/** Tests a payload against the exact bounds enforced by the staged-row codec. */
+/**
+ * Tests a payload against the exact predicates the staged-row codec enforces:
+ * the bounded-plain walk AND the plain-record check, so a bounded plain array
+ * cannot pass this preflight and then fail `fleetOperationStagedRowFromUnknown`.
+ */
 export function fleetOperationStagedRowPayloadFitsEnvelope(
   rowKind: FleetOperationRowKind,
   payload: unknown,
 ): boolean {
   try {
-    fleetOperationBoundedPlain(payload, stagedRowMaxBytes(rowKind));
+    fleetOperationPlainRecord(
+      fleetOperationBoundedPlain(payload, stagedRowMaxBytes(rowKind)),
+    );
     return true;
   } catch {
-    // fleetOperationBoundedPlain normalizes every violation to this false path.
+    // Both helpers normalize every violation to this false path.
     return false;
   }
 }
@@ -596,20 +650,24 @@ export function assertFleetOperationId(value: unknown): void {
   }
 }
 
+/**
+ * Classifies an already-parsed token against the persisted run record. The
+ * caller parses untrusted input with `parseFleetOperationToken` first; this
+ * function trusts its typed parameter and never re-parses it.
+ */
 export function classifyFleetOperationToken(
   token: FleetOperationToken,
   run: FleetOperationRunRecord | undefined,
   expectedKind: FleetOperationKind,
 ): 'current' | 'stale' {
-  const parsed = parseFleetOperationToken(token);
-  if (!run || run.operationId !== parsed.operationId) {
-    throw new FleetOperationTokenOperationError(parsed.operationId);
+  if (!run || run.operationId !== token.operationId) {
+    throw new FleetOperationTokenOperationError(token.operationId);
   }
   if (run.kind !== expectedKind) throw new FleetOperationTokenKindError();
-  if (parsed.revision > run.progress.revision) {
+  if (token.revision > run.progress.revision) {
     throw new FleetOperationTokenFutureError();
   }
-  return parsed.revision === run.progress.revision ? 'current' : 'stale';
+  return token.revision === run.progress.revision ? 'current' : 'stale';
 }
 
 function canonicalValue(value: unknown): unknown {
@@ -651,13 +709,21 @@ export function fleetOperationIntakeDigest(value: unknown): string {
  * so later awaits cannot observe mutation through the caller's aliases.
  */
 export function fleetOperationItemsIntake(
-  intake: FleetOperationItemsIntake,
+  intake: FleetOperationItemsIntakeInput,
 ):
   | { readonly digest: string; readonly items: readonly unknown[] }
   | FleetOperationIntakeRefusal {
   if (intake.items.length > FLEET_OPERATION_ITEM_BOUND) {
     return { reason: 'item-count' };
   }
+  // The envelope is hashed without the `String(bytes) + ':'` frame every item
+  // carries, and that is deliberate. `envelope` is typed
+  // `Readonly<Record<string, unknown>>`, so its canonical text is always a
+  // JSON OBJECT, and no JSON object text is a proper prefix of another —
+  // the closing brace of one cannot fall inside another. The leading
+  // envelope is therefore already unambiguous ahead of the netstring-framed
+  // items. (The unqualified claim "canonical JSON is self-delimiting" would
+  // be false: JSON numbers are not prefix-free.)
   const hash = createHash('sha256').update(
     canonicalFleetOperationBytes(intake.envelope),
   );
@@ -669,6 +735,11 @@ export function fleetOperationItemsIntake(
       canonical = canonicalFleetOperationBytes(item);
     } catch (error) {
       if (!(error instanceof FleetOperationStateError)) throw error;
+      // First-true-predicate classification, not actual-cause: an item that
+      // trips several bounds is reported as `item-bytes` when a plain
+      // re-serialization is over the per-item bound and as `item-structure`
+      // otherwise. That re-serialization walks the RAW item a second time, so
+      // a caller getter runs twice on this refusal path.
       try {
         const serialized = JSON.stringify(item);
         if (
@@ -678,7 +749,8 @@ export function fleetOperationItemsIntake(
           return { reason: 'item-bytes', itemOrdinal };
         }
       } catch {
-        return { reason: 'item-structure', itemOrdinal };
+        // A throwing or circular item is a structure refusal, exactly like a
+        // serializable one that is not over the byte bound.
       }
       return { reason: 'item-structure', itemOrdinal };
     }
@@ -707,4 +779,82 @@ export function isDurableAuditDetailSafe(value: unknown): boolean {
   }
   const lowered = value.toLowerCase();
   return !CREDENTIAL_SUBSTRINGS.some((marker) => lowered.includes(marker));
+}
+
+// ---------------------------------------------------------------------------
+// Store-facing helpers. These sit below the pure codec primitives because
+// they reach the operation store, and the section above must stay free of
+// store IO.
+// ---------------------------------------------------------------------------
+
+/**
+ * Reads and ordinal-sorts every contiguous-from-zero staged row of one kind.
+ * Fails closed on a page larger than the requested limit, an empty unfinished
+ * page, any row at or below the requested exclusive cursor, a duplicate
+ * ordinal, or a gap. Record reads cap at `FLEET_OPERATION_ITEM_BOUND`; other
+ * kinds cap at `FLEET_OPERATION_ROW_READ_BOUND`.
+ */
+export async function readAllFleetOperationRows(
+  store: FleetOperationStore,
+  operationId: string,
+  rowKind: FleetOperationRowKind,
+): Promise<FleetOperationStagedRow[]> {
+  const rows: FleetOperationStagedRow[] = [];
+  const rowReadBound =
+    rowKind === 'record'
+      ? FLEET_OPERATION_ITEM_BOUND
+      : FLEET_OPERATION_ROW_READ_BOUND;
+  let afterOrdinal: number | undefined;
+  for (;;) {
+    const page = await store.readOperationRowsPage({
+      operationId,
+      rowKind,
+      limit: FLEET_OPERATION_ROW_PAGE_LIMIT,
+      ...(afterOrdinal === undefined ? {} : { afterOrdinal }),
+    });
+    // The port promises at most `limit` rows. An over-sized page is durable
+    // non-conformance in its own right, not something the row cap absorbs.
+    if (page.rows.length > FLEET_OPERATION_ROW_PAGE_LIMIT) return malformed();
+    // A surviving row exceeds every ordinal collected from prior pages, so
+    // only duplicates within this page need an explicit set.
+    const pageOrdinals = new Set<number>();
+    let maximumOrdinal: number | undefined;
+    for (const row of page.rows) {
+      if (
+        (afterOrdinal !== undefined && row.ordinal <= afterOrdinal) ||
+        pageOrdinals.has(row.ordinal)
+      ) {
+        return malformed();
+      }
+      pageOrdinals.add(row.ordinal);
+      if (maximumOrdinal === undefined || row.ordinal > maximumOrdinal) {
+        maximumOrdinal = row.ordinal;
+      }
+    }
+    for (const row of page.rows) rows.push(row);
+    // The cap is checked after the append, so the accumulator can reach
+    // `rowReadBound + FLEET_OPERATION_ROW_PAGE_LIMIT` before refusing. The
+    // overshoot is one page and it keeps the refusal on whole-page boundaries.
+    if (rows.length > rowReadBound) return malformed();
+    if (page.done) break;
+    if (maximumOrdinal === undefined) return malformed();
+    afterOrdinal = maximumOrdinal;
+  }
+  // Sorted in place: this array was built here and is never aliased.
+  rows.sort((left, right) => left.ordinal - right.ordinal);
+  for (const [index, row] of rows.entries()) {
+    if (row.ordinal !== index) return malformed();
+  }
+  return rows;
+}
+
+/** Constructs the public continuation token for one durable run record. */
+export function fleetOperationTokenOf(
+  run: FleetOperationRunRecord,
+): FleetOperationToken {
+  return {
+    version: 1,
+    operationId: run.operationId,
+    revision: run.progress.revision,
+  };
 }

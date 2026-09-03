@@ -541,8 +541,8 @@ interface DutySegment {
 }
 
 /**
- * Splits `staleDutyReason`'s composition into a template plus an optional raw
- * diagnostic segment (R4-B.2), so a caller can persist the template alone and
+ * Composes one stale-duty finding segment as a template plus an optional raw
+ * diagnostic (R4-B.2), so a caller can persist the template alone and
  * separately compose the legacy byte-identical string with the diagnostic
  * inlined.
  */
@@ -582,8 +582,19 @@ function staleDutySegment(
 // ---------------------------------------------------------------------------
 // Audit set-builders (R4-B.2): pure derivations over `records`/`inventory`
 // that both the drain and the bounded coordinator's global stages consume.
-// Each mirrors one pre-decomposition accumulation exactly; none emits
-// findings.
+// None emits findings.
+//
+// Two idioms satisfy that no-emission requirement, and the difference is
+// driven by the stages' inputs, not by taste. The default is to run the
+// emitting stage itself and discard its findings, which is what
+// `fleetAuditExpectedBucketsSeed` does with `auditR2ExpectedStage`: that stage
+// takes only `records` plus the map it fills, so seeding needs nothing the
+// caller does not already have. `auditNamespaceExpectationsStage` also takes
+// `inventoryNamespaceIds`, so calling it as a seed would mean fabricating an
+// inventory input; `fleetAuditExpectedNamespaceOwnersSeed` and
+// `fleetAuditRecordsDerivedDuplicateNamespaceIds` therefore drive the shared
+// private `walkNamespaceClaims` the stage drives instead, which keeps the
+// claim rule single-sourced either way.
 // ---------------------------------------------------------------------------
 
 export function fleetAuditAuditedRecords(
@@ -723,6 +734,9 @@ export function fleetAuditExpectedNamespaceIds(
  * so the claim rule exists once (R4-B.2 §6.4 SEED DERIVATION). `owners` is
  * mutated in place; `onClaim` receives the prior owner, undefined when this
  * record has just become the owner.
+ *
+ * Declared here with the other set-builders, ahead of its emitting caller
+ * `auditNamespaceExpectationsStage` in the stage section below.
  */
 function walkNamespaceClaims(
   records: readonly FleetRecord[],
@@ -745,9 +759,10 @@ function walkNamespaceClaims(
 /**
  * The records-derived expected-duplicate seed (R4-B.2 §6.1): the set of
  * namespace ids more than one audited, namespace-expecting record claims.
- * Pure over `auditedRecords`, independent of chunk position — equal to what
- * the `namespace-expectations` stage's own first-owner loop accumulates by
- * the time it completes.
+ * Pure over `auditedRecords`, independent of chunk position. It runs the very
+ * walker the `namespace-expectations` stage runs, so this is the same
+ * collision set that stage accumulates by the time it completes — not merely
+ * a second derivation that agrees with it.
  */
 export function fleetAuditRecordsDerivedDuplicateNamespaceIds(
   auditedRecords: readonly FleetRecord[],
@@ -764,15 +779,17 @@ export function fleetAuditRecordsDerivedDuplicateNamespaceIds(
 }
 
 /**
- * First-owner-wins replay of the `namespace-expectations` claim loop with no
- * emission, used both to seed a bounded chunk's prefix and (over the full
- * audited-record list) to reconstruct the stage's finished map.
+ * Delegates to the shared first-owner-wins walker with an empty claim
+ * callback, so it accumulates the owner map the `namespace-expectations`
+ * stage accumulates while emitting nothing. Used both to seed a bounded
+ * chunk's prefix and (over the full audited-record list) to reconstruct the
+ * stage's finished map.
  */
 export function fleetAuditExpectedNamespaceOwnersSeed(
   records: readonly FleetRecord[],
 ): Map<string, FleetRecord> {
   const owners = new Map<string, FleetRecord>();
-  walkNamespaceClaims(records, owners, () => undefined);
+  walkNamespaceClaims(records, owners, () => {});
   return owners;
 }
 
@@ -782,9 +799,11 @@ export type FleetAuditExpectedBucketEntry = Readonly<{
 }>;
 
 /**
- * First-claim-wins replay of the `r2-expected` claim loop with no emission,
- * used both to seed a bounded chunk's prefix and (over the full audited-
- * record list) to reconstruct the stage's finished map for
+ * Delegates to the emitting `r2-expected` stage — `auditR2ExpectedStage`,
+ * declared in the stage section below — and keeps only the map it fills, so
+ * the claim rule is the stage body itself rather than a second copy of it.
+ * Used both to seed a bounded chunk's prefix and (over the full
+ * audited-record list) to reconstruct the stage's finished map for
  * `r2-orphans`/`r2-missing-identity`.
  */
 export function fleetAuditExpectedBucketsSeed(
@@ -793,6 +812,11 @@ export function fleetAuditExpectedBucketsSeed(
   const expectedBuckets = new Map<string, FleetAuditExpectedBucketEntry>();
   // The emitting stage over an EMPTY map is exactly the non-emitting
   // rebuild; its findings are discarded (R4-B.2 §6.4 SEED DERIVATION).
+  // Discarding them allocates one `DriftFinding` per duplicate bucket claim
+  // on every call, including the two full-map rebuilds the bounded
+  // `r2-orphans`/`r2-missing-identity` stages run over every audited record.
+  // That garbage is per duplicate claim, not per record, so it stays far
+  // below the documented O(records²) record-row re-parse term.
   auditR2ExpectedStage({ records, expectedBuckets });
   return expectedBuckets;
 }
@@ -988,8 +1012,15 @@ export function auditNamespaceExpectationsStage(
   input: Readonly<{
     records: readonly FleetRecord[];
     inventoryNamespaceIds: readonly string[];
-    /** Pre-seeded by the caller (empty for the drain's one full-array call; the
-     *  §6.1 prefix rebuild for a bounded chunk); mutated in place. */
+    /**
+     * An INPUT the stage reads and also mutates: the caller supplies the
+     * claims already made (empty for the drain's one full-array call, the
+     * §6.1 prefix rebuild for a bounded chunk), and the stage adds this
+     * slice's claims to it as it walks. Reading it is load-bearing — it is
+     * what makes a `duplicate-namespace` collision visible across a chunk
+     * boundary. No caller reads the mutation back today; the map is passed in
+     * rather than built here so the prefix can be seeded.
+     */
     expectedNamespaceOwners: Map<string, FleetRecord>;
   }>,
 ): readonly DriftFinding[] {
@@ -1019,6 +1050,14 @@ export function auditNamespaceExpectationsStage(
   return findings;
 }
 
+/** Lifecycle phases whose records no longer expect their R2 buckets. */
+const R2_EXPECTATION_EXCLUDED_PHASES: readonly string[] = Object.freeze([
+  'application-resources-deleted',
+  'database-exported',
+  'database-deleting',
+  'decommissioned',
+]);
+
 export function auditR2ExpectedStage(
   input: Readonly<{
     records: readonly FleetRecord[];
@@ -1030,16 +1069,7 @@ export function auditR2ExpectedStage(
   const findings: DriftFinding[] = [];
   for (const record of input.records) {
     const phase = effectiveLifecyclePhase(record);
-    if (
-      [
-        'application-resources-deleted',
-        'database-exported',
-        'database-deleting',
-        'decommissioned',
-      ].includes(phase)
-    ) {
-      continue;
-    }
+    if (R2_EXPECTATION_EXCLUDED_PHASES.includes(phase)) continue;
     for (const resource of record.applicationResources ?? []) {
       if (resource.state !== 'created' || !resource.creationDate) continue;
       const prior = input.expectedBuckets.get(resource.bucketName);
@@ -1063,7 +1093,7 @@ export function auditR2OrphansStage(
     r2Buckets: readonly NonNullable<
       FleetResourceInventory['r2Buckets']
     >[number][];
-    expectedBuckets: ReadonlyMap<string, unknown>;
+    expectedBuckets: ReadonlyMap<string, FleetAuditExpectedBucketEntry>;
     knownBucketNames: ReadonlySet<string>;
   }>,
 ): readonly DriftFinding[] {
@@ -1384,37 +1414,35 @@ export async function auditRecordStep(
     );
     return { findings, legacyDetails };
   }
-  if (inventoryDeployment) {
-    const expectedServiceBindings =
-      spec.authoredBy === 'external'
-        ? []
-        : spec.egressProxyService
-          ? [{ name: 'EGRESS_PROXY', service: spec.egressProxyService }]
-          : [];
-    const expectedQueueBindings =
-      spec.authoredBy === 'external'
-        ? []
-        : spec.queueProducer
-          ? [
-              {
-                name: spec.queueProducer.binding,
-                queueName: spec.queueProducer.queueName,
-              },
-            ]
-          : [];
-    if (
-      JSON.stringify(inventoryDeployment.serviceBindings ?? []) !==
-        JSON.stringify(expectedServiceBindings) ||
-      JSON.stringify(inventoryDeployment.queueProducerBindings ?? []) !==
-        JSON.stringify(expectedQueueBindings)
-    ) {
-      push({
-        tenantTag: record.tenantTag,
-        environment: record.environment,
-        kind: 'binding-drift',
-        detail: `release '${inventoryDeployment.scriptName}' has drifted trusted channel bindings`,
-      });
-    }
+  const expectedServiceBindings =
+    spec.authoredBy === 'external'
+      ? []
+      : spec.egressProxyService
+        ? [{ name: 'EGRESS_PROXY', service: spec.egressProxyService }]
+        : [];
+  const expectedQueueBindings =
+    spec.authoredBy === 'external'
+      ? []
+      : spec.queueProducer
+        ? [
+            {
+              name: spec.queueProducer.binding,
+              queueName: spec.queueProducer.queueName,
+            },
+          ]
+        : [];
+  if (
+    JSON.stringify(inventoryDeployment.serviceBindings ?? []) !==
+      JSON.stringify(expectedServiceBindings) ||
+    JSON.stringify(inventoryDeployment.queueProducerBindings ?? []) !==
+      JSON.stringify(expectedQueueBindings)
+  ) {
+    push({
+      tenantTag: record.tenantTag,
+      environment: record.environment,
+      kind: 'binding-drift',
+      detail: `release '${inventoryDeployment.scriptName}' has drifted trusted channel bindings`,
+    });
   }
   let maintenanceSecret: string;
   try {
@@ -1674,7 +1702,12 @@ export async function auditRecordStep(
   if (!live.maintenance.armed || dutySegments.length > 0) {
     const segments = [
       ...(!live.maintenance.armed
-        ? [{ template: 'maintenance scheduler is not armed', diagnostic: null }]
+        ? [
+            {
+              template: 'maintenance scheduler is not armed',
+              diagnostic: null,
+            } satisfies DutySegment,
+          ]
         : []),
       ...dutySegments,
     ];
@@ -1799,16 +1832,12 @@ export async function auditFleetDrift(options: {
       knownDatabaseIds: known.knownDatabaseIds,
     }),
   );
-  const expectedRoutes = fleetAuditExpectedRoutes(auditedRecords);
   findings.push(
     ...auditOrphanRoutesStage({
       routes: options.inventory.routes,
-      expectedRoutes,
+      expectedRoutes: fleetAuditExpectedRoutes(auditedRecords),
       knownRouteKeys: known.knownRouteKeys,
     }),
-  );
-  const liveRoutesByHostname = fleetAuditLiveRoutesByHostname(
-    options.inventory.routes,
   );
   findings.push(
     ...auditNamespaceOrphansStage({
@@ -1842,8 +1871,16 @@ export async function auditFleetDrift(options: {
       r2Buckets: options.inventory.r2Buckets ?? [],
     }),
   );
+  const liveRoutesByHostname = fleetAuditLiveRoutesByHostname(
+    options.inventory.routes,
+  );
   const databases = new Map<string, FleetRecord>();
   const liveNamespaceOwners = new Map<string, FleetRecord>();
+  // A third full walk over every namespace claim, after the
+  // `namespace-expectations` stage above already visited each one. The walker
+  // made the collision rule single-sourced but not its execution; having the
+  // stage report its collisions instead would remove this pass. Recorded
+  // rather than changed: the drain is not the bounded path's hot loop.
   const duplicateNamespaceIds = new Set(
     fleetAuditRecordsDerivedDuplicateNamespaceIds(auditedRecords),
   );

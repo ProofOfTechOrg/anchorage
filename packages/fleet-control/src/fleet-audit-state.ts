@@ -16,6 +16,7 @@ import {
   fleetOperationSafeInteger,
   fleetOperationTextHasControlBytes,
   malformed,
+  utf8Length,
 } from './fleet-operation-state.js';
 
 export type FleetAuditStage =
@@ -63,7 +64,11 @@ const STAGE_ORDINAL = Object.freeze({
   'r2-missing-identity': 'expectedOrdinal',
   'per-record': 'recordOrdinal',
   finalize: undefined,
-} satisfies Readonly<Record<FleetAuditStage['step'], string | undefined>>);
+} satisfies Readonly<{
+  [K in FleetAuditStage['step']]:
+    | Exclude<keyof Extract<FleetAuditStage, { step: K }>, 'step'>
+    | undefined;
+}>);
 
 export const FLEET_AUDIT_FINDING_KINDS = Object.freeze([
   'missing-deployment',
@@ -130,16 +135,27 @@ export type FleetAuditFactPayload =
     }>
   | Readonly<{ factKind: 'duplicate-namespace'; key: string }>;
 
-function boundedString(value: unknown): value is string {
+/**
+ * Byte-bounded provider-claimed text: a string within the module's string
+ * byte bound, with NO non-empty requirement.
+ *
+ * Admitting the empty string is the deliberate §5.1 EXCEPTION round 3
+ * established, not an oversight — do not add a `value.length > 0` clause
+ * back. `fleetOperationBoundedString`, which still carried that superseded
+ * clause under a near-identical name, was deleted for exactly that reason;
+ * the name here says what the predicate is for rather than what it bounds.
+ */
+function boundedProviderText(value: unknown): value is string {
   return (
     typeof value === 'string' &&
-    new TextEncoder().encode(value).byteLength <=
-      FLEET_OPERATION_STRING_BYTE_BOUND
+    utf8Length(value) <= FLEET_OPERATION_STRING_BYTE_BOUND
   );
 }
 
 function structurallySafeText(value: unknown): value is string {
-  return boundedString(value) && !fleetOperationTextHasControlBytes(value);
+  return (
+    boundedProviderText(value) && !fleetOperationTextHasControlBytes(value)
+  );
 }
 
 export function fleetAuditStageFromUnknown(value: unknown): FleetAuditStage {
@@ -159,12 +175,21 @@ export function fleetAuditStageFromUnknown(value: unknown): FleetAuditStage {
   if (ordinal !== undefined && !fleetOperationSafeInteger(candidate[ordinal])) {
     return malformed();
   }
-  return {
+  return withAuditStageOrdinal(
     step,
-    ...(ordinal === undefined ? {} : { [ordinal]: candidate[ordinal] }),
-  } as FleetAuditStage;
+    ordinal === undefined ? 0 : (candidate[ordinal] as number),
+  );
 }
 
+/**
+ * Builds the stage whose cursor field `STAGE_ORDINAL` names for `step`,
+ * dropping the ordinal for the cursor-less `finalize` step.
+ *
+ * `step` is the full 13-step union because two in-module callers need it:
+ * `stageEntry`, which walks all of `FLEET_AUDIT_STAGE_ORDER`, and
+ * `fleetAuditStageFromUnknown`, which rebuilds any persisted stage. The only
+ * caller outside this module passes a global step.
+ */
 export function withAuditStageOrdinal(
   step: FleetAuditStage['step'],
   ordinal: number,
@@ -176,10 +201,35 @@ export function withAuditStageOrdinal(
   } as FleetAuditStage;
 }
 
+/**
+ * Read-side counterpart of `withAuditStageOrdinal`. Resolving the cursor
+ * through the same `STAGE_ORDINAL` table the write side uses keeps the
+ * step-to-field mapping in one place; `finalize` carries no cursor.
+ */
+export function fleetAuditStageOrdinal(
+  stage: FleetAuditStage,
+): number | undefined {
+  const ordinalField = STAGE_ORDINAL[stage.step];
+  if (ordinalField === undefined) return undefined;
+  const cursor: Readonly<Record<string, unknown>> = stage;
+  return cursor[ordinalField] as number;
+}
+
 function stageEntry(step: FleetAuditStage['step']): FleetAuditStage {
   return withAuditStageOrdinal(step, 0);
 }
 
+/**
+ * The successor of `stage` when its source is exhausted, or `stage` itself
+ * when it is not.
+ *
+ * Both production call sites pass `exhausted: true` — a coordinator only ever
+ * asks for the successor once it has drained the stage. The `false` case is
+ * kept because it makes the successor chain total, and it is exercised only
+ * by the codec's own `nextAuditStage` title. `stage` is re-parsed through
+ * `fleetAuditStageFromUnknown` even though it arrives typed, so a stage
+ * rebuilt from durable state is re-validated before it is advanced.
+ */
 export function nextAuditStage(
   stage: FleetAuditStage,
   exhausted: boolean,
@@ -268,8 +318,8 @@ export function driftFindingRowFromUnknown(
   ]);
   // These are provider-claimed observations that the drain emits verbatim.
   if (
-    !boundedString(candidate.tenantTag) ||
-    !boundedString(candidate.environment) ||
+    !boundedProviderText(candidate.tenantTag) ||
+    !boundedProviderText(candidate.environment) ||
     typeof candidate.kind !== 'string' ||
     !FLEET_AUDIT_FINDING_KINDS.includes(
       candidate.kind as FleetAuditFindingKind,
@@ -292,7 +342,7 @@ export function fleetAuditFactRowFromUnknown(
   const candidate = fleetOperationPlainRecord(value);
   if (candidate.factKind === 'duplicate-namespace') {
     assertFleetOperationExactKeys(candidate, ['factKind', 'key']);
-    if (!boundedString(candidate.key)) return malformed();
+    if (!boundedProviderText(candidate.key)) return malformed();
     return { factKind: 'duplicate-namespace', key: candidate.key };
   }
   if (
@@ -308,7 +358,7 @@ export function fleetAuditFactRowFromUnknown(
     'environment',
   ]);
   if (
-    !boundedString(candidate.key) ||
+    !boundedProviderText(candidate.key) ||
     typeof candidate.tenantTag !== 'string' ||
     !isDeploymentTenantTag(candidate.tenantTag) ||
     typeof candidate.environment !== 'string' ||
