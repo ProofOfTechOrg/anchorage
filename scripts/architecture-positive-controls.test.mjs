@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
 const config = require('../.dependency-cruiser.cjs');
+const architectureRules = [...config.forbidden, ...config.required];
 const cli = fileURLToPath(
   new URL(
     '../node_modules/dependency-cruiser/bin/dependency-cruise.mjs',
@@ -150,8 +151,12 @@ const controls = {
 };
 
 /**
- * Real modules cruised alongside a fixture, so a reachable rule is evaluated
- * over the graph it guards rather than over the fixture alone.
+ * Real modules cruised alongside a fixture, for two reasons. A reachable rule
+ * is evaluated over the graph it guards rather than over the fixture alone;
+ * and a block's own assertions get the modules they walk, which is why the
+ * decommission-database entry lists decommissionDatabase — that rule is a
+ * direct-edge rule, not a reachable one, so the module is there for the
+ * block's exact-set assertion rather than for the rule.
  */
 const extraEntries = {
   'fleet-control-decommission-advance-is-transport-neutral': [
@@ -171,16 +176,12 @@ const extraEntries = {
 };
 
 test('every architecture rule has an executable positive control', () => {
-  const ruleNames = [...config.forbidden, ...config.required]
-    .map((rule) => rule.name)
-    .sort();
+  const ruleNames = architectureRules.map((rule) => rule.name).sort();
   assert.deepEqual(Object.keys(controls).sort(), ruleNames);
 });
 
 test('every extra cruise entry is keyed by an architecture rule', () => {
-  const ruleNames = new Set(
-    [...config.forbidden, ...config.required].map((rule) => rule.name),
-  );
+  const ruleNames = new Set(architectureRules.map((rule) => rule.name));
   for (const ruleName of Object.keys(extraEntries)) {
     assert.ok(
       ruleNames.has(ruleName),
@@ -228,6 +229,15 @@ for (const [ruleName, fixture] of Object.entries(controls)) {
       violations.includes(ruleName),
       `${fixture} did not trigger ${ruleName}; got ${violations.join(', ')}`,
     );
+    // An extra entry the cruise report does not contain has an empty
+    // adjacency entry, which satisfies the negative reachability assertions
+    // below without proving anything.
+    for (const entry of extraEntries[ruleName] ?? []) {
+      assert.ok(
+        report.modules.some((module) => module.source === entry),
+        `extraEntries lists ${entry} for ${ruleName}, which the cruise report does not contain`,
+      );
+    }
     if (
       ruleName === 'fleet-control-decommission-state-does-not-reach-provider'
     ) {
@@ -250,7 +260,7 @@ for (const [ruleName, fixture] of Object.entries(controls)) {
         ),
         'decommission advance control did not reject the concrete switch provider',
       );
-      const adjacency = runtimeAdjacency(report);
+      const adjacency = fullAdjacency(report);
       assert.equal(
         reaches(adjacency, decommissionAdvance, backendSwitch),
         false,
@@ -299,8 +309,11 @@ for (const [ruleName, fixture] of Object.entries(controls)) {
         'fleet-control-backend-switch-does-not-reach-its-provider',
         'fleet-control-decommission-database-is-provider-neutral',
       ]);
+      assert.equal(
+        reaches(fullAdjacency(report), backendSwitch, switchProvider),
+        false,
+      );
       const adjacency = runtimeAdjacency(report);
-      assert.equal(reaches(adjacency, backendSwitch, switchProvider), false);
       for (const source of [
         decommissionAdvance,
         decommissionDatabase,
@@ -326,16 +339,13 @@ for (const [ruleName, fixture] of Object.entries(controls)) {
         ),
         'operation advance control did not reject the concrete provider client',
       );
-      const adjacency = runtimeAdjacency(report);
       // Exhaustive over the rule's own to-set rather than over one member, so
       // a real-module reach into any other forbidden target cannot hide behind
       // this fixture's violations under the same rule name. The walk is over
       // the unfiltered graph, type-only edges included, because that is the
       // graph this reachable rule itself walks under tsPreCompilationDeps.
       const forbidden = new RegExp(
-        [...config.forbidden, ...config.required].find(
-          (rule) => rule.name === ruleName,
-        ).to.path,
+        architectureRules.find((rule) => rule.name === ruleName).to.path,
       );
       assert.deepEqual(
         reachableFrom(fullAdjacency(report), auditAdvance).filter((module) =>
@@ -344,7 +354,10 @@ for (const [ruleName, fixture] of Object.entries(controls)) {
         [],
         'the real operation-advance coordinator reached a forbidden target',
       );
-      assert.equal(reaches(adjacency, fixture, cloudflareClient), true);
+      assert.equal(
+        reaches(runtimeAdjacency(report), fixture, cloudflareClient),
+        true,
+      );
     }
     if (ruleName === 'fleet-control-strict-plain-data-is-import-free') {
       for (const target of ['cloudflare', 'crypto']) {

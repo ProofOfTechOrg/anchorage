@@ -1201,6 +1201,13 @@ function buildHarness(
  * Drives `advanceFleetAudit` with `continue` until the status is not
  * 'pending'. Always advances once before it inspects a status, so it never
  * returns the result its caller already holds.
+ *
+ * `cap` is slack rather than derived. This loop runs to a terminal result, so
+ * the whole-operation aggregate the fleet control guide states (see its
+ * per-call cost paragraph, docs/fleet-control.md) bounds it in full: that
+ * aggregate turns on `maxItemsPerCall` and the per-stage source sizes rather
+ * than on the stage count alone, so a call site that lowers `maxItemsPerCall`
+ * against a large source has to pass its own cap.
  */
 async function driveToTerminal(
   harness: Harness,
@@ -1230,12 +1237,12 @@ type PendingFleetAuditAdvance = Extract<
  * Always advances once before it compares the step, so a token already parked
  * on `step` still costs one call.
  *
- * `cap` is slack rather than derived. The guide's aggregate for a whole
- * operation is `1 + records` calls plus, summed over the eleven global stages,
- * `max(1, ceil(items_i / maxItemsPerCall))` each, so the bound turns on
- * `maxItemsPerCall` and the per-stage source sizes rather than on the stage
- * count alone: a call site that lowers `maxItemsPerCall` against a large
- * source has to pass its own cap.
+ * `cap` is slack rather than derived. This loop stops at `step`, so a prefix
+ * of the whole-operation aggregate the fleet control guide states (see its
+ * per-call cost paragraph, docs/fleet-control.md) bounds it: that aggregate
+ * turns on `maxItemsPerCall` and the per-stage source sizes rather than on
+ * the stage count alone, so a call site that lowers `maxItemsPerCall` against
+ * a large source has to pass its own cap.
  */
 async function driveToStage(
   harness: Harness,

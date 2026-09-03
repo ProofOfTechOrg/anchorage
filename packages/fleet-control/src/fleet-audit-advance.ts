@@ -1224,6 +1224,29 @@ export async function advanceFleetAudit(
   return continueAudit(options, action.token, maxItemsPerCall);
 }
 
+/** @inline */
+type FleetAuditFindingsPage =
+  /**
+   * The store reported the final page. `nextAfterOrdinal` is the page's
+   * greatest ordinal, and is absent only when the page is empty — which this
+   * reader accepts only on a `done` page.
+   */
+  | Readonly<{
+      findings: readonly DriftFinding[];
+      done: true;
+      nextAfterOrdinal?: number;
+    }>
+  /**
+   * The store reported more rows. This reader refuses an empty page that is
+   * not `done`, so `nextAfterOrdinal` — the page's greatest ordinal — is
+   * always present here.
+   */
+  | Readonly<{
+      findings: readonly DriftFinding[];
+      done: false;
+      nextAfterOrdinal: number;
+    }>;
+
 /**
  * Reads one page of an operation's parsed drift findings. Terminal-only
  * (failed operations included); never touches the inventory store. The
@@ -1232,18 +1255,17 @@ export async function advanceFleetAudit(
  *
  * A caller pages the whole set by passing each result's `nextAfterOrdinal`
  * back as `afterOrdinal` until `done`. The result is `done`-discriminated: a
- * page that is not `done` always carries the cursor, and only the final page
- * may omit it. That field is the page's greatest ordinal, read off the
- * returned rows rather than recomputed by the caller from a prose formula, and
- * it is absent only on an empty page — which this reader accepts only when
- * `done` is set. The idiom rests on two guarantees
- * with two different owners. Finding ordinals are contiguous from zero because
- * the WRITE PATH enforces it, not because the read port promises it: this
- * coordinator numbers each finding row `findingCount + index`, and each
- * commit that advances `findingCount` passes `expectedRowWatermarks.finding`
- * at the new count — which `FleetOperationLease.commitProgress` defines as a
- * dense-prefix assertion over the first N ordinals, so it holds whatever
- * order the rows landed in.
+ * page that is not `done` always carries the cursor. `nextAfterOrdinal` is
+ * the page's greatest ordinal, read off the returned rows rather than
+ * recomputed by the caller from a prose formula, and it is absent only on an
+ * empty page — which this reader accepts only when `done` is set. The idiom
+ * rests on two guarantees with two different owners. Finding ordinals are
+ * contiguous from zero because the WRITE PATH enforces it, not because the
+ * read port promises it: this coordinator numbers each finding row
+ * `findingCount + index`, and each commit that advances `findingCount` passes
+ * `expectedRowWatermarks.finding` at the new count — which
+ * `FleetOperationLease.commitProgress` defines as a dense-prefix assertion
+ * over the first N ordinals, so it holds whatever order the rows landed in.
  * Both routes take it: the per-record chunk commits its finding rows inline,
  * the global stage pre-stages them through `stageRows` and commits the
  * watermark after. That a page holds the smallest qualifying ordinals IS the
@@ -1251,8 +1273,8 @@ export async function advanceFleetAudit(
  * This reader checks both instead of trusting them, so every accepted page
  * either reports `done` or advances the caller's cursor. That is strict
  * progress, not termination: unlike `readAllFleetOperationRows`, this reader
- * carries no row cap, so a store that keeps serving conforming non-final pages
- * keeps a caller's loop running.
+ * carries no row cap, so a store that keeps serving conforming non-final
+ * pages keeps a caller's loop running.
  *
  * A final page is trusted as final. The reader takes `done` from the store and
  * never compares the rows it returned against the operation's own
@@ -1275,18 +1297,7 @@ export async function readFleetAuditFindingsPage(
     afterOrdinal?: number;
     limit: number;
   }>,
-): Promise<
-  | Readonly<{
-      findings: readonly DriftFinding[];
-      done: true;
-      nextAfterOrdinal?: number;
-    }>
-  | Readonly<{
-      findings: readonly DriftFinding[];
-      done: false;
-      nextAfterOrdinal: number;
-    }>
-> {
+): Promise<FleetAuditFindingsPage> {
   const { operationId, afterOrdinal, limit } = input;
   const run = await store.readOperationById(operationId);
   if (!run) {
