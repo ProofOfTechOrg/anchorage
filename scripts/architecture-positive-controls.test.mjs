@@ -26,6 +26,8 @@ const switchProvider =
 const databaseExportStore =
   'packages/fleet-control/src/database-export-store.ts';
 const strictPlainData = 'packages/fleet-control/src/strict-plain-data.ts';
+const auditAdvance = 'packages/fleet-control/src/fleet-audit-advance.ts';
+const cloudflareClient = 'packages/fleet-control/src/cloudflare-client.ts';
 
 function runtimeAdjacency(report) {
   return new Map(
@@ -171,6 +173,12 @@ for (const [ruleName, fixture] of Object.entries(controls)) {
           backendSwitch,
         ];
       }
+      if (
+        ruleName ===
+        'fleet-control-operation-advance-avoids-concrete-transports'
+      ) {
+        return [fixture, auditAdvance];
+      }
       return [fixture];
     })();
     const args = [
@@ -294,6 +302,36 @@ for (const [ruleName, fixture] of Object.entries(controls)) {
           `${source} entered a runtime cycle`,
         );
       }
+    }
+    if (
+      ruleName === 'fleet-control-operation-advance-avoids-concrete-transports'
+    ) {
+      assert.deepEqual([...new Set(violations)], [ruleName]);
+      assert.ok(
+        report.summary.violations.some(
+          (violation) =>
+            violation.rule.name === ruleName &&
+            violation.to === cloudflareClient,
+        ),
+        'operation advance control did not reject the concrete provider client',
+      );
+      const adjacency = runtimeAdjacency(report);
+      // Exhaustive over the rule's own to-set rather than over one member, so
+      // a real-module reach into any other forbidden target cannot hide behind
+      // this fixture's violations under the same rule name.
+      const forbidden = new RegExp(
+        [...config.forbidden, ...config.required].find(
+          (rule) => rule.name === ruleName,
+        ).to.path,
+      );
+      assert.deepEqual(
+        reachableFrom(adjacency, auditAdvance).filter((module) =>
+          forbidden.test(module),
+        ),
+        [],
+        'the real operation-advance coordinator reached a forbidden target',
+      );
+      assert.equal(reaches(adjacency, fixture, cloudflareClient), true);
     }
     if (ruleName === 'fleet-control-strict-plain-data-is-import-free') {
       for (const target of ['cloudflare', 'crypto']) {

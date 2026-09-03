@@ -116,8 +116,10 @@ export interface AdvanceFleetAuditOptions {
    * Sampled at most once per start call, immediately before `startOperation`.
    * The sample must be a non-negative safe integer representable by `Date`.
    * Only a `created` outcome persists the sample as the frozen `auditTimeMs`;
-   * adopted outcomes discard it, and continue calls never sample it. Defaults
-   * to `Date.now`.
+   * adopted outcomes discard it, and continue calls never sample it. A
+   * `created` outcome also stamps that run record's `updatedAt` from this
+   * sample; it is the only durable write in this module that does not take
+   * `updatedAt` from wall clock. Defaults to `Date.now`.
    */
   readonly auditClock?: () => number;
   /** Feeds only the re-arm's authority clock (§6.1); default `Date.now`. */
@@ -1228,15 +1230,18 @@ export async function advanceFleetAudit(
  * findings come back in ordinal order whatever order the store's page
  * arrived in (the port lets a page arrive unordered).
  *
- * A caller pages the whole set with
- * `afterOrdinal = (afterOrdinal ?? -1) + findings.length` until `done`. That
- * idiom rests on two assumptions with two different owners. Finding ordinals
- * are contiguous from zero because the WRITE PATH enforces it, not because
- * the read port promises it: this coordinator numbers each finding row
- * `findingCount + index`, and each commit that advances `findingCount`
- * passes `expectedRowWatermarks.finding` at the new count — which
- * `FleetOperationLease.commitProgress` defines as a dense-prefix assertion
- * over the first N ordinals, so it holds whatever order the rows landed in.
+ * A caller pages the whole set by passing each result's `nextAfterOrdinal`
+ * back as `afterOrdinal` until `done`. That field is the page's greatest
+ * ordinal, read off the returned rows rather than recomputed by the caller
+ * from a prose formula, and it is absent only on an empty page — which this
+ * reader accepts only when `done` is set. The idiom rests on two guarantees
+ * with two different owners. Finding ordinals are contiguous from zero because
+ * the WRITE PATH enforces it, not because the read port promises it: this
+ * coordinator numbers each finding row `findingCount + index`, and each
+ * commit that advances `findingCount` passes `expectedRowWatermarks.finding`
+ * at the new count — which `FleetOperationLease.commitProgress` defines as a
+ * dense-prefix assertion over the first N ordinals, so it holds whatever
+ * order the rows landed in.
  * Both routes take it: the per-record chunk commits its finding rows inline,
  * the global stage pre-stages them through `stageRows` and commits the
  * watermark after. That a page holds the smallest qualifying ordinals IS the
@@ -1260,7 +1265,13 @@ export async function readFleetAuditFindingsPage(
     afterOrdinal?: number;
     limit: number;
   }>,
-): Promise<Readonly<{ findings: readonly DriftFinding[]; done: boolean }>> {
+): Promise<
+  Readonly<{
+    findings: readonly DriftFinding[];
+    done: boolean;
+    nextAfterOrdinal?: number;
+  }>
+> {
   const { operationId, afterOrdinal, limit } = input;
   const run = await store.readOperationById(operationId);
   if (!run) {
@@ -1286,9 +1297,11 @@ export async function readFleetAuditFindingsPage(
   for (const [index, row] of sortedRows.entries()) {
     if (row.ordinal !== firstOrdinal + index) return malformed();
   }
+  const nextAfterOrdinal = sortedRows.at(-1)?.ordinal;
   return {
     findings: sortedRows.map((row) => driftFindingRowFromUnknown(row.payload)),
     done: page.done,
+    ...(nextAfterOrdinal === undefined ? {} : { nextAfterOrdinal }),
   };
 }
 

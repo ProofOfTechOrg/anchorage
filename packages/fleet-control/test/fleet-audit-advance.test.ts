@@ -1214,6 +1214,36 @@ async function driveToTerminal(
   throw new Error('driveToTerminal exceeded its iteration cap');
 }
 
+type PendingFleetAuditAdvance = Extract<
+  FleetAuditAdvanceResult,
+  { status: 'pending' }
+>;
+
+/** Drives `advanceFleetAudit` with `continue` until `stage.step` is `step`. */
+async function driveToStage(
+  harness: Harness,
+  firstToken: unknown,
+  step: FleetAuditStage['step'],
+  cap = 200,
+): Promise<PendingFleetAuditAdvance> {
+  let token = firstToken;
+  for (let i = 0; i < cap; i++) {
+    const result = await advanceFleetAudit(
+      harness.baseOptions({ kind: 'continue', token }),
+    );
+    if (result.status !== 'pending') {
+      throw new Error(
+        `driveToStage reached ${result.status} before the ${step} stage`,
+      );
+    }
+    if (result.stage.step === step) return result;
+    token = result.token;
+  }
+  throw new Error(
+    `driveToStage exceeded its ${cap}-iteration cap before the ${step} stage`,
+  );
+}
+
 async function startAndDrive(
   harness: Harness,
   operationId: string,
@@ -1882,16 +1912,8 @@ describe('advanceFleetAudit', () => {
     );
     expect(started.status).toBe('pending');
     if (started.status !== 'pending') throw new Error('unreachable');
-    let token = started.token;
-    let stage: FleetAuditStage = started.stage;
-    while (stage.step !== 'per-record') {
-      const result = await advanceFleetAudit(
-        harness.baseOptions({ kind: 'continue', token }),
-      );
-      if (result.status !== 'pending') throw new Error('unexpected terminal');
-      token = result.token;
-      stage = result.stage;
-    }
+    let token = (await driveToStage(harness, started.token, 'per-record'))
+      .token;
     for (const [tenant, expectedRearmCalls] of [
       ['alice', 1],
       ['bob', 0],
@@ -1953,19 +1975,17 @@ describe('advanceFleetAudit', () => {
     if (started.status !== 'pending') throw new Error('unreachable');
     expect(authorityClockCalls).toBe(0);
     clock = laterClock;
-    let token = started.token;
-    let stage = started.stage;
-    while (stage.step !== 'per-record') {
-      const advanced = await advanceFleetAudit(
-        harness.baseOptions({ kind: 'continue', token }),
-      );
-      expect(authorityClockCalls).toBe(0);
-      if (advanced.status !== 'pending') throw new Error('unexpected terminal');
-      token = advanced.token;
-      stage = advanced.stage;
-    }
+    const atPerRecord = await driveToStage(
+      harness,
+      started.token,
+      'per-record',
+    );
+    // `authorityClockCalls` only ever increments, so zero once the global
+    // stages are behind us is exactly the per-iteration assertion the drive
+    // loop this call replaced made.
+    expect(authorityClockCalls).toBe(0);
     const staleRecord = await advanceFleetAudit(
-      harness.baseOptions({ kind: 'continue', token }),
+      harness.baseOptions({ kind: 'continue', token: atPerRecord.token }),
     );
     expect(authorityClockCalls).toBe(0);
     if (staleRecord.status !== 'pending')
@@ -2450,7 +2470,13 @@ describe('advanceFleetAudit', () => {
     ).resolves.toEqual(ascending);
     const paged: (typeof ascending.findings)[number][] = [];
     let afterOrdinal: number | undefined;
-    for (;;) {
+    // Feeding `nextAfterOrdinal` straight back is the documented idiom, so the
+    // cursor the reader publishes — not a formula this loop recomputes — is
+    // what has to advance. A cursor that stops advancing would spin this loop
+    // forever, so the page count is capped: every non-final page carries at
+    // least one finding, so an honest read needs at most one page per finding.
+    // Exhausting the cap leaves `paged` holding repeats and fails the compare.
+    for (let page = 0; page <= ascending.findings.length; page += 1) {
       const next = await readFleetAuditFindingsPage(reversedStore, {
         operationId: orderedOperationId,
         limit: 2,
@@ -2458,9 +2484,123 @@ describe('advanceFleetAudit', () => {
       });
       paged.push(...next.findings);
       if (next.done) break;
-      afterOrdinal = (afterOrdinal ?? -1) + next.findings.length;
+      afterOrdinal = next.nextAfterOrdinal;
     }
     expect(paged).toEqual(ascending.findings);
+  });
+
+  it('findings page: the reader verifies page conformance instead of trusting the store, and returns the next cursor off the page rows', async () => {
+    const control = baseRecord('controlnb1');
+    const missingA = baseRecord('missingnb1a');
+    const missingB = baseRecord('missingnb1b');
+    const records = [control, missingA, missingB];
+    const harness = buildHarness(records, inventoryFor([control]));
+    const operationId = uuidFor(90);
+    const complete = await startAndDrive(harness, operationId, records);
+    expect(complete.status).toBe('complete');
+
+    const conforming = await readFleetAuditFindingsPage(
+      harness.operationStore,
+      { operationId, limit: 1_000 },
+    );
+    expect(conforming.done).toBe(true);
+    expect(conforming.findings.length).toBeGreaterThanOrEqual(3);
+    // The cursor is read off the page's own rows, so a caller never recomputes
+    // it from the prose formula. A full first page ends at length - 1.
+    expect(conforming.nextAfterOrdinal).toBe(conforming.findings.length - 1);
+
+    // Each case below returns a page the port forbids; every one must reach
+    // `malformed()` rather than a truncated, duplicated, or non-terminating read.
+    const nonConforming = (
+      transform: (
+        rows: readonly FleetOperationStagedRow[],
+      ) => readonly FleetOperationStagedRow[],
+      done?: boolean,
+    ) =>
+      new Proxy(harness.operationStore, {
+        get(target, property, receiver) {
+          if (property === 'readOperationRowsPage') {
+            return async (
+              input: Parameters<
+                FleetOperationStore['readOperationRowsPage']
+              >[0],
+            ) => {
+              const rowsPage = await target.readOperationRowsPage(input);
+              return {
+                ...rowsPage,
+                rows: transform(rowsPage.rows),
+                done: done ?? rowsPage.done,
+              };
+            };
+          }
+          const value = Reflect.get(target, property, receiver);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+    const malformedMessage = 'fleet operation state is malformed';
+
+    // EMPTY-PAGE GUARD: an empty page while the store still claims more rows is
+    // the condition `readAllFleetOperationRows` already refuses. Without this
+    // guard the published next-cursor loop spins forever against such a store.
+    await expect(
+      readFleetAuditFindingsPage(
+        nonConforming(() => [], false),
+        {
+          operationId,
+          limit: 1_000,
+        },
+      ),
+    ).rejects.toThrow(malformedMessage);
+
+    // CONTIGUOUS-RUN GUARD, gap: ordinal 1 withheld.
+    await expect(
+      readFleetAuditFindingsPage(
+        nonConforming((rows) => rows.filter((row) => row.ordinal !== 1)),
+        { operationId, limit: 1_000 },
+      ),
+    ).rejects.toThrow(malformedMessage);
+
+    // CONTIGUOUS-RUN GUARD, duplicate: a repeated ordinal keeps the page length
+    // right, so only the run assertion catches it.
+    await expect(
+      readFleetAuditFindingsPage(
+        nonConforming((rows) => [...rows.slice(0, -1), ...rows.slice(0, 1)]),
+        { operationId, limit: 1_000 },
+      ),
+    ).rejects.toThrow(malformedMessage);
+
+    // CONTIGUOUS-RUN GUARD, not the smallest qualifying ordinals: the store
+    // skipped ordinal 0 instead of returning it first.
+    await expect(
+      readFleetAuditFindingsPage(
+        nonConforming((rows) => rows.filter((row) => row.ordinal !== 0)),
+        { operationId, limit: 1_000 },
+      ),
+    ).rejects.toThrow(malformedMessage);
+
+    // CONTIGUOUS-RUN GUARD, row at or below the exclusive cursor.
+    await expect(
+      readFleetAuditFindingsPage(
+        nonConforming((rows) =>
+          rows.map((row) => ({ ...row, ordinal: row.ordinal - 1 })),
+        ),
+        { operationId, afterOrdinal: 0, limit: 1_000 },
+      ),
+    ).rejects.toThrow(malformedMessage);
+
+    // A conforming empty page is legal only because it is terminal, and it
+    // carries no cursor: that absence is why the field must stay optional.
+    const emptyHarness = buildHarness([], emptyInventory());
+    const emptyOperationId = uuidFor(91);
+    const emptyRun = await startAndDrive(emptyHarness, emptyOperationId, []);
+    expect(emptyRun.status).toBe('complete');
+    const emptyPage = await readFleetAuditFindingsPage(
+      emptyHarness.operationStore,
+      { operationId: emptyOperationId, limit: 10 },
+    );
+    expect(emptyPage.findings).toEqual([]);
+    expect(emptyPage.done).toBe(true);
+    expect(emptyPage.nextAfterOrdinal).toBeUndefined();
   });
 
   it('second-world drain-vs-bounded equivalence modulo the §5.5 difference set', async () => {
@@ -4076,7 +4216,7 @@ describe('advanceFleetAudit', () => {
         expect(drainFindings.length).toBeGreaterThan(0);
       }
       const operationId = uuidFor(80 + index);
-      let result = await advanceFleetAudit(
+      const started = await advanceFleetAudit(
         harness.baseOptions({
           kind: 'start',
           operationId,
@@ -4084,16 +4224,9 @@ describe('advanceFleetAudit', () => {
           staleAfterMs: STALE_AFTER_MS,
         }),
       );
-      for (let call = 0; call < 50; call += 1) {
-        if (result.status !== 'pending' || result.stage.step === 'per-record') {
-          break;
-        }
-        result = await advanceFleetAudit(
-          harness.baseOptions({ kind: 'continue', token: result.token }),
-        );
-      }
-      expect(result.status).toBe('pending');
-      if (result.status !== 'pending') throw new Error('unreachable');
+      expect(started.status).toBe('pending');
+      if (started.status !== 'pending') throw new Error('unreachable');
+      const result = await driveToStage(harness, started.token, 'per-record');
       expect(result.stage).toEqual({ step: 'per-record', recordOrdinal: 0 });
 
       const codecCallsBefore = harness.operationStore.stagedRowCodecCalls;
