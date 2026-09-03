@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it } from 'vitest';
-import { auditFleetDrift } from '../src/fleet.js';
+import { auditFleetDrift, type DriftFinding } from '../src/fleet.js';
 import {
   type AdvanceFleetAuditOptions,
   abandonFleetAuditOperation,
@@ -33,9 +33,11 @@ import {
   canonicalFleetOperationBytes,
   FLEET_OPERATION_INTAKE_BYTE_BOUND,
   FLEET_OPERATION_ITEM_BOUND,
+  FLEET_OPERATION_NODE_BOUND,
   FLEET_OPERATION_RECORD_ROW_BYTE_BOUND,
   FLEET_OPERATION_ROW_PAYLOAD_BYTE_BOUND,
   FLEET_OPERATION_ROW_READ_BOUND,
+  FLEET_OPERATION_STAGE_BATCH_STATEMENTS,
   FLEET_OPERATION_STRING_BYTE_BOUND,
   type FleetOperationKind,
   type FleetOperationLease,
@@ -91,6 +93,39 @@ function withoutMethod<T extends object>(target: T, method: keyof T): T {
     has(obj, prop) {
       if (prop === method) return false;
       return Reflect.has(obj, prop);
+    },
+  });
+}
+
+type RowsPageInput = Parameters<
+  FleetOperationStore['readOperationRowsPage']
+>[0];
+type RowsPage = Awaited<
+  ReturnType<FleetOperationStore['readOperationRowsPage']>
+>;
+
+/**
+ * A view of `store` whose `readOperationRowsPage` answers `transform(page,
+ * input)` over the page `store` itself produced. Every other member behaves
+ * as `store`'s does, bound to it — the same Proxy idiom `withoutMethod` uses
+ * to shape a capability.
+ *
+ * `transform` may return a page unrelated to the one it was handed, which is
+ * how a case models a store that fabricates rows instead of reordering the
+ * ones it holds.
+ */
+function pageTransformingStore(
+  store: FleetOperationStore,
+  transform: (page: RowsPage, input: RowsPageInput) => RowsPage,
+): FleetOperationStore {
+  return new Proxy(store, {
+    get(target, property, receiver) {
+      if (property === 'readOperationRowsPage') {
+        return async (input: RowsPageInput) =>
+          transform(await target.readOperationRowsPage(input), input);
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === 'function' ? value.bind(target) : value;
     },
   });
 }
@@ -603,6 +638,18 @@ class FakeInventoryRunStore implements FleetInventoryRunStore {
   readRunByOperationCalls = 0;
   unreadableGenerations = new Set<number>();
   pinFailsForGeneration: number | undefined;
+  /**
+   * When set, `latestFinalizedGeneration` throws it instead of answering, so
+   * an unwanted call fails its title outright rather than being counted after
+   * the fact (§11's "instrumented to fail the test if invoked").
+   *
+   * Arming is the caller's job because this fake has no notion of "the replay
+   * path" and cannot detect one; a title arms it once its own legitimate call
+   * has returned. Arming it for every title would break the suite instead:
+   * `buildHarness` hands each title its own store, and EVERY implicit-generation
+   * start calls this method.
+   */
+  latestFinalizedGenerationError: Error | undefined;
 
   registerFinalizedGeneration(
     generation: number,
@@ -677,6 +724,9 @@ class FakeInventoryRunStore implements FleetInventoryRunStore {
     FleetInventoryGenerationRef | undefined
   > {
     this.latestFinalizedGenerationCalls += 1;
+    if (this.latestFinalizedGenerationError !== undefined) {
+      throw this.latestFinalizedGenerationError;
+    }
     return this.latestGeneration === undefined
       ? undefined
       : this.refs.get(this.latestGeneration);
@@ -720,6 +770,26 @@ class FakeInventoryRunStore implements FleetInventoryRunStore {
 // (stricter than the shipped D1 adapter) so the coordinator's probe-first
 // fallback to the head-independent `readOperationById` is genuinely
 // exercised, not merely accepted by coincidence.
+//
+// TWO DELIBERATE SOFTNESSES, stated rather than reproduced, because closing
+// either would change what this suite's worlds exercise rather than what the
+// coordinator does:
+//
+//  - ROW VALIDATION. `#validatedRows` runs `fleetOperationStagedRowFromUnknown`
+//    only. `d1-fleet-operation-store.ts`'s `stagedRowForKindFromUnknown`
+//    additionally rejects an `item` row under the audit kind and re-parses a
+//    `finding`/`fact` payload through `driftFindingRowFromUnknown` /
+//    `fleetAuditFactRowFromUnknown`. A payload this fake accepts can therefore
+//    be one the shipped store would refuse; the write-side gate that matters
+//    is pinned against the real codecs by the titles that read rows back.
+//  - STAGING REVISION. `#stageRows` ignores `expectedRevision` entirely, where
+//    D1 binds it into `OPERATION_GUARD_SQL` on every insert. The adopted-running
+//    start path stages under `expectedRevision: 0` against a possibly-advanced
+//    operation; on that guard miss the real store silently inserts nothing.
+//    The operation can only have advanced past revision 0 after this same
+//    staging ran, so under the pinned intake digest the rows are already
+//    present at the same ordinals and this fake's own ordinal check drops
+//    them too — an unmodelled guard, not a live divergence.
 // ---------------------------------------------------------------------------
 
 class FakeOperationStore implements FleetOperationStore {
@@ -734,6 +804,20 @@ class FakeOperationStore implements FleetOperationStore {
   readOperationByIdCalls = 0;
   readonly rowPageReadCounts = new Map<FleetOperationRowKind, number>();
   stagedRowCodecCalls = 0;
+  /**
+   * Runs on the NEXT `readOperationById` and disarms itself. One-shot on
+   * purpose: `readFleetAuditFindingsPage` and the start path's catch-all call
+   * the same method, so a hook armed for one coordinator call must not leak
+   * into either.
+   */
+  onNextReadOperationById: (() => void) | undefined;
+  /**
+   * When set, the NEXT `commitProgress` applies its write durably and then
+   * throws this instead of returning it — the lost-RESPONSE failure a
+   * transport cannot distinguish from a lost request. One-shot, so the retry
+   * that follows meets an ordinary store.
+   */
+  loseCommitProgressResponse: Error | undefined;
 
   #rowsKey(operationId: string, rowKind: FleetOperationRowKind): string {
     return `${operationId}:${rowKind}`;
@@ -766,7 +850,13 @@ class FakeOperationStore implements FleetOperationStore {
         return this.heads.get(op.kind) === operationId ? op : undefined;
       },
       stageRows: async (input) => this.#stageRows(input),
-      commitProgress: async (input) => this.#commitProgress(input),
+      commitProgress: async (input) => {
+        const committed = await this.#commitProgress(input);
+        const lost = this.loseCommitProgressResponse;
+        if (lost === undefined) return committed;
+        this.loseCommitProgressResponse = undefined;
+        throw lost;
+      },
       finalizeOperation: async (input) => this.#finalizeOperation(input),
       failOperation: async (input) => this.#failOperation(input),
     };
@@ -781,6 +871,11 @@ class FakeOperationStore implements FleetOperationStore {
     operationId: string,
   ): Promise<FleetOperationRunRecord | undefined> {
     this.readOperationByIdCalls += 1;
+    const hook = this.onNextReadOperationById;
+    if (hook !== undefined) {
+      this.onNextReadOperationById = undefined;
+      hook();
+    }
     if (this.probeMiss.has(operationId)) {
       this.probeMiss.delete(operationId);
       return undefined;
@@ -879,9 +974,12 @@ class FakeOperationStore implements FleetOperationStore {
     } = input;
     const rows = this.#validatedRows(inputRows);
     const updateRows = this.#validatedRows(inputUpdateRows);
-    if (rows.length + updateRows.length + 1 > 100) {
+    if (
+      rows.length + updateRows.length + 1 >
+      FLEET_OPERATION_STAGE_BATCH_STATEMENTS
+    ) {
       throw new Error(
-        'commitProgress exceeds the operation batch budget of 100 statements',
+        `commitProgress exceeds the operation batch budget of ${FLEET_OPERATION_STAGE_BATCH_STATEMENTS} statements`,
       );
     }
     const current = this.operations.get(operationId);
@@ -1281,6 +1379,70 @@ async function startAndDrive(
   return driveToTerminal(harness, started.token);
 }
 
+/** The token of a result the caller has already asserted is `pending`. */
+function expectPendingToken(
+  result: FleetAuditAdvanceResult,
+): PendingFleetAuditAdvance['token'] {
+  if (result.status !== 'pending') {
+    throw new Error(`expected a pending result, got '${result.status}'`);
+  }
+  return result.token;
+}
+
+/**
+ * Runs the whole-fleet drain over `harness`'s resolvers against a FRESH state
+ * store built from `records` — never the harness's own store, which a bounded
+ * run may already have re-armed.
+ *
+ * `staleAfterMs` and `now` are pinned here because every call site passed the
+ * same two values. That freezes the DRAIN's clock only: a title comparing the
+ * two paths under the §5.5 equivalence scope also has to freeze the bounded
+ * path's, which it does through `buildHarness`.
+ */
+function drainWith(
+  harness: Harness,
+  world: Readonly<{
+    records: readonly FleetRecord[];
+    inventory: FleetResourceInventory;
+  }>,
+): Promise<readonly DriftFinding[]> {
+  return auditFleetDrift({
+    store: new FakeFleetStateStore(world.records),
+    records: world.records,
+    inventory: world.inventory,
+    backendFor: () => harness.backend,
+    specFor: (record) =>
+      harness.specByTenant.get(record.tenantTag) as DeploymentSpec,
+    maintenanceSecretFor: (record) =>
+      harness.secretByTenant.get(record.tenantTag) as string,
+    staleAfterMs: STALE_AFTER_MS,
+    now: AUDIT_NOW,
+  });
+}
+
+/**
+ * One INTAKE PREFLIGHT refusal case. Every case drives a single `start` and
+ * asserts the same two things — the fixed refusal message, and that the
+ * harness did no work beyond `coordination` — so only the fixture, the
+ * injected clock, the message and the coordination vary.
+ *
+ * `records` BUILDS the fixture and pins whatever properties make the case's
+ * refusal the only one it can trip; it runs inside the test, so it may
+ * assert, and a fixture costing megabytes is never built during collection.
+ */
+interface PreflightRefusalCase {
+  readonly name: string;
+  /** The fleet the harness starts from; the inventory is derived from it. */
+  readonly fleet: readonly FleetRecord[];
+  readonly operationId: string;
+  readonly records: () => readonly FleetRecord[];
+  readonly generation?: number;
+  readonly auditClock?: () => number;
+  readonly message: string;
+  /** Omitted where the refusal precedes the lease entirely. */
+  readonly coordination?: Parameters<typeof expectZeroHarnessWork>[1];
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1296,9 +1458,6 @@ describe('advanceFleetAudit', () => {
       },
     });
     const events: string[] = [];
-    const originalStart = harness.operationStore.withAccountOperationLease.bind(
-      harness.operationStore,
-    );
     // Instrument: record when the row exists (created) vs when the pin lands.
     const originalPinGeneration = harness.inventoryStore.pinGeneration.bind(
       harness.inventoryStore,
@@ -1311,7 +1470,6 @@ describe('advanceFleetAudit', () => {
       );
       return originalPinGeneration(input);
     };
-    void originalStart;
     const operationId = uuidFor(1);
     const result = await advanceFleetAudit(
       harness.baseOptions({
@@ -1327,7 +1485,7 @@ describe('advanceFleetAudit', () => {
     const persisted =
       await harness.operationStore.readOperationById(operationId);
     expect(persisted).toBeDefined();
-    const progress = persisted?.progress as FleetAuditProgress;
+    const progress = fleetAuditProgressFromUnknown(persisted?.progress);
     expect(progress.auditTimeMs).toBe(AUDIT_NOW);
     expect(progress.staleAfterMs).toBe(STALE_AFTER_MS);
     if (result.status !== 'pending') throw new Error('unreachable');
@@ -1358,10 +1516,7 @@ describe('advanceFleetAudit', () => {
     expect(started.status).toBe('pending');
     // Real time moves far past staleAfterMs before the per-record stage runs.
     clock = AUDIT_NOW + 10 * STALE_AFTER_MS;
-    const result = await driveToTerminal(
-      harness,
-      started.status === 'pending' ? started.token : undefined,
-    );
+    const result = await driveToTerminal(harness, expectPendingToken(started));
     expect(result.status).toBe('complete');
     const page = await readFleetAuditFindingsPage(harness.operationStore, {
       operationId,
@@ -1387,15 +1542,27 @@ describe('advanceFleetAudit', () => {
     const first = await advanceFleetAudit(harness.baseOptions(action));
     expect(first.status).toBe('pending');
     expect(harness.inventoryStore.latestFinalizedGenerationCalls).toBe(1);
+    // §11 says `latestFinalizedGeneration` is "instrumented to fail the
+    // test if invoked". The store cannot recognise a replay by itself, so the
+    // trap is armed HERE — once this title's single legitimate call has
+    // returned — and stays armed for the rest of it. Every later call below
+    // (two continues, `driveToTerminal`, the terminal replay, the cross-kind
+    // refusal) resolves its generation from the PERSISTED record, so any hit
+    // on this seam is the re-read the title exists to forbid. The call-count
+    // assertions stay as belt-and-braces.
+    harness.inventoryStore.latestFinalizedGenerationError = new Error(
+      'latestFinalizedGeneration must not be called once the operation exists',
+    );
     const rowCountBefore = harness.operationStore.rows.get(
       `${operationId}:record`,
     )?.length;
     const second = await advanceFleetAudit(harness.baseOptions(action));
     expect(second.status).toBe('pending');
-    if (first.status === 'pending' && second.status === 'pending') {
-      expect(second.token).toEqual(first.token);
-      expect(second.stage).toEqual(first.stage);
+    if (first.status !== 'pending' || second.status !== 'pending') {
+      throw new Error('unreachable');
     }
+    expect(second.token).toEqual(first.token);
+    expect(second.stage).toEqual(first.stage);
     expect(harness.inventoryStore.latestFinalizedGenerationCalls).toBe(1);
     expect(
       harness.operationStore.rows.get(`${operationId}:record`)?.length,
@@ -1406,7 +1573,6 @@ describe('advanceFleetAudit', () => {
       ).length,
     ).toBe(2);
 
-    if (second.status !== 'pending') throw new Error('unreachable');
     const continuedOnce = await advanceFleetAudit(
       harness.baseOptions({ kind: 'continue', token: second.token }),
     );
@@ -1522,7 +1688,9 @@ describe('advanceFleetAudit', () => {
     expect(first.status).toBe('pending');
     const persisted1 =
       await harness.operationStore.readOperationById(operationId);
-    const generation1 = (persisted1?.progress as FleetAuditProgress).generation;
+    const generation1 = fleetAuditProgressFromUnknown(
+      persisted1?.progress,
+    ).generation;
     expect(generation1).toBe(1);
 
     // A newer generation finalizes.
@@ -1537,7 +1705,9 @@ describe('advanceFleetAudit', () => {
     expect(replay.status).toBe('pending');
     const persisted2 =
       await harness.operationStore.readOperationById(operationId);
-    expect((persisted2?.progress as FleetAuditProgress).generation).toBe(1);
+    expect(fleetAuditProgressFromUnknown(persisted2?.progress).generation).toBe(
+      1,
+    );
     expect(harness.inventoryStore.pins.slice(pinsBeforeReplay)).toEqual([
       { generation: 1, pinnedBy: `fleet-audit:${operationId}` },
     ]);
@@ -1865,7 +2035,9 @@ describe('advanceFleetAudit', () => {
           staleAfterMs: STALE_AFTER_MS,
         }),
       ),
-    ).rejects.toThrow(/at most 10000 records/);
+    ).rejects.toThrow(
+      `fleet audit start accepts at most ${FLEET_OPERATION_ITEM_BOUND} records`,
+    );
   });
 
   it('intake byte-bound refusal at start', async () => {
@@ -2213,17 +2385,9 @@ describe('advanceFleetAudit', () => {
       auditClock: () => AUDIT_NOW,
       authorityClock: () => AUDIT_NOW,
     });
-    const drainFindings = await auditFleetDrift({
-      store: new FakeFleetStateStore([first, second]),
+    const drainFindings = await drainWith(harness, {
       records: [first, second],
       inventory,
-      backendFor: () => harness.backend,
-      specFor: (record) =>
-        harness.specByTenant.get(record.tenantTag) as DeploymentSpec,
-      maintenanceSecretFor: (record) =>
-        harness.secretByTenant.get(record.tenantTag) as string,
-      staleAfterMs: STALE_AFTER_MS,
-      now: AUDIT_NOW,
     });
     const operationId = uuidFor(26);
     await startAndDrive(harness, operationId, [first, second]);
@@ -2267,10 +2431,7 @@ describe('advanceFleetAudit', () => {
     );
     expect(started.status).toBe('pending');
     harness.inventoryStore.unreadableGenerations.add(1);
-    const result = await driveToTerminal(
-      harness,
-      started.status === 'pending' ? started.token : undefined,
-    );
+    const result = await driveToTerminal(harness, expectPendingToken(started));
     expect(result.status).toBe('failed');
     if (result.status === 'failed') {
       expect(result.failure.reason).toBe('generation-unavailable');
@@ -2336,7 +2497,7 @@ describe('advanceFleetAudit', () => {
     expect(harness.operationStore.heads.has('audit')).toBe(false);
   });
 
-  it('abandonFleetAuditOperation: running → operator-abandoned + pin released; terminal → releases any surviving pin', async () => {
+  it('abandonFleetAuditOperation: running → operator-abandoned + pin released; terminal → releases any surviving pin with no state change', async () => {
     const alice = baseRecord('alice');
     const harness = buildHarness([alice], inventoryFor([alice]));
     const operationId = uuidFor(29);
@@ -2357,9 +2518,9 @@ describe('advanceFleetAudit', () => {
     const abandoned =
       await harness.operationStore.readOperationById(operationId);
     expect(abandoned?.state).toBe('failed');
-    expect((abandoned?.progress as FleetAuditProgress).failure?.reason).toBe(
-      'operator-abandoned',
-    );
+    expect(
+      fleetAuditProgressFromUnknown(abandoned?.progress).failure?.reason,
+    ).toBe('operator-abandoned');
     expect(
       harness.inventoryStore.releasedPins.some(
         (pin) => pin.pinnedBy === `fleet-audit:${operationId}`,
@@ -2395,10 +2556,7 @@ describe('advanceFleetAudit', () => {
     );
     expect(started.status).toBe('pending');
     harness.inventoryStore.unreadableGenerations.add(1);
-    const failed = await driveToTerminal(
-      harness,
-      started.status === 'pending' ? started.token : undefined,
-    );
+    const failed = await driveToTerminal(harness, expectPendingToken(started));
     expect(failed.status).toBe('failed');
     if (failed.status !== 'failed') throw new Error('unreachable');
     const opsBefore = harness.opsLog.length;
@@ -2409,7 +2567,7 @@ describe('advanceFleetAudit', () => {
     expect(harness.opsLog.length).toBe(opsBefore);
   });
 
-  it('findings page: running refusal; failed operation readable; no inventory-store interaction', async () => {
+  it('findings page: running refusal; failed operation readable; no inventory-store interaction; a reverse-ordinal page still yields the drain order, and the next-cursor idiom pages the whole set', async () => {
     const alice = baseRecord('alice');
     const harness = buildHarness([alice], inventoryFor([alice]));
     const operationId = uuidFor(31);
@@ -2430,10 +2588,7 @@ describe('advanceFleetAudit', () => {
     ).rejects.toThrow(`fleet audit operation '${operationId}' is not terminal`);
 
     harness.inventoryStore.unreadableGenerations.add(1);
-    const failed = await driveToTerminal(
-      harness,
-      started.status === 'pending' ? started.token : undefined,
-    );
+    const failed = await driveToTerminal(harness, expectPendingToken(started));
     expect(failed.status).toBe('failed');
     const page = await readFleetAuditFindingsPage(harness.operationStore, {
       operationId,
@@ -2475,21 +2630,19 @@ describe('advanceFleetAudit', () => {
       { operationId: orderedOperationId, limit: 1_000 },
     );
     expect(ascending.done).toBe(true);
-    expect(ascending.findings.length).toBeGreaterThanOrEqual(3);
-    const reversedStore = new Proxy(orderedHarness.operationStore, {
-      get(target, property, receiver) {
-        if (property === 'readOperationRowsPage') {
-          return async (
-            input: Parameters<FleetOperationStore['readOperationRowsPage']>[0],
-          ) => {
-            const rowsPage = await target.readOperationRowsPage(input);
-            return { ...rowsPage, rows: [...rowsPage.rows].reverse() };
-          };
-        }
-        const value = Reflect.get(target, property, receiver);
-        return typeof value === 'function' ? value.bind(target) : value;
-      },
-    });
+    // EXACT, not a floor: this world produces one `orphan-deployment` for
+    // the injected ghost, one `missing-deployment` and one
+    // `missing-namespace` for each of the two records absent from the
+    // inventory, and one `maintenance-stale` for `control28` (this title
+    // injects no clock, so `HEALTHY_MAINTENANCE`'s sweep timestamps are long
+    // past by wall-clock time). A floor would keep the reversed-store
+    // comparison below non-vacuous while letting the world drift underneath
+    // it; the count is what that comparison actually rests on.
+    expect(ascending.findings.length).toBe(6);
+    const reversedStore = pageTransformingStore(
+      orderedHarness.operationStore,
+      (rowsPage) => ({ ...rowsPage, rows: [...rowsPage.rows].reverse() }),
+    );
     await expect(
       readFleetAuditFindingsPage(reversedStore, {
         operationId: orderedOperationId,
@@ -2529,7 +2682,7 @@ describe('advanceFleetAudit', () => {
     expect(paged).toEqual(ascending.findings);
   });
 
-  it('findings page: the reader verifies page conformance instead of trusting the store, and returns the next cursor off the page rows', async () => {
+  it('findings page: the reader verifies page conformance instead of trusting the store, accepts the two other port-permitted shapes — a non-final page shorter than the limit, and an arbitrary permutation — and returns the next cursor off the page rows', async () => {
     const control = baseRecord('control29');
     const missingA = baseRecord('missing29a');
     const missingB = baseRecord('missing29b');
@@ -2544,7 +2697,12 @@ describe('advanceFleetAudit', () => {
       { operationId, limit: 1_000 },
     );
     expect(conforming.done).toBe(true);
-    expect(conforming.findings.length).toBeGreaterThanOrEqual(3);
+    // EXACT, not a floor: the same shape as the preceding title's world
+    // minus its injected ghost deployment — one `missing-deployment` and one
+    // `missing-namespace` per absent record, plus `control29`'s
+    // `maintenance-stale`. Every case below slices or reorders this page, so
+    // its length is the world they all rest on.
+    expect(conforming.findings.length).toBe(5);
     // The cursor is read off the page's own rows, so a caller never recomputes
     // it from the prose formula. A full first page ends at length - 1. This
     // pins one full page's value only; the paging loop at the end of the
@@ -2552,34 +2710,22 @@ describe('advanceFleetAudit', () => {
     // recomputed formula.
     expect(conforming.nextAfterOrdinal).toBe(conforming.findings.length - 1);
 
-    // Each case below returns a page the port forbids; every one must reach
-    // `malformed()` rather than a truncated, duplicated, or non-terminating read.
-    const nonConforming = (
+    // Shapes a page the store would not have produced. The refusal cases
+    // below return pages the port FORBIDS, and every one must reach
+    // `malformed()` rather than a truncated, duplicated, or non-terminating
+    // read; the two acceptance cases after them return pages the port PERMITS
+    // and nothing else pinned.
+    const shapedPage = (
       transform: (
         rows: readonly FleetOperationStagedRow[],
       ) => readonly FleetOperationStagedRow[],
       done?: boolean,
     ) =>
-      new Proxy(harness.operationStore, {
-        get(target, property, receiver) {
-          if (property === 'readOperationRowsPage') {
-            return async (
-              input: Parameters<
-                FleetOperationStore['readOperationRowsPage']
-              >[0],
-            ) => {
-              const rowsPage = await target.readOperationRowsPage(input);
-              return {
-                ...rowsPage,
-                rows: transform(rowsPage.rows),
-                done: done ?? rowsPage.done,
-              };
-            };
-          }
-          const value = Reflect.get(target, property, receiver);
-          return typeof value === 'function' ? value.bind(target) : value;
-        },
-      });
+      pageTransformingStore(harness.operationStore, (rowsPage) => ({
+        ...rowsPage,
+        rows: transform(rowsPage.rows),
+        done: done ?? rowsPage.done,
+      }));
     const malformedMessage = 'fleet operation state is malformed';
 
     // EMPTY-PAGE GUARD: an empty page while the store still claims more rows is
@@ -2587,7 +2733,7 @@ describe('advanceFleetAudit', () => {
     // guard the published next-cursor loop spins forever against such a store.
     await expect(
       readFleetAuditFindingsPage(
-        nonConforming(() => [], false),
+        shapedPage(() => [], false),
         {
           operationId,
           limit: 1_000,
@@ -2598,7 +2744,7 @@ describe('advanceFleetAudit', () => {
     // CONTIGUOUS-RUN GUARD, gap: ordinal 1 withheld.
     await expect(
       readFleetAuditFindingsPage(
-        nonConforming((rows) => rows.filter((row) => row.ordinal !== 1)),
+        shapedPage((rows) => rows.filter((row) => row.ordinal !== 1)),
         { operationId, limit: 1_000 },
       ),
     ).rejects.toThrow(malformedMessage);
@@ -2607,7 +2753,7 @@ describe('advanceFleetAudit', () => {
     // right, so only the run assertion catches it.
     await expect(
       readFleetAuditFindingsPage(
-        nonConforming((rows) => [...rows.slice(0, -1), ...rows.slice(0, 1)]),
+        shapedPage((rows) => [...rows.slice(0, -1), ...rows.slice(0, 1)]),
         { operationId, limit: 1_000 },
       ),
     ).rejects.toThrow(malformedMessage);
@@ -2616,7 +2762,7 @@ describe('advanceFleetAudit', () => {
     // skipped ordinal 0 instead of returning it first.
     await expect(
       readFleetAuditFindingsPage(
-        nonConforming((rows) => rows.filter((row) => row.ordinal !== 0)),
+        shapedPage((rows) => rows.filter((row) => row.ordinal !== 0)),
         { operationId, limit: 1_000 },
       ),
     ).rejects.toThrow(malformedMessage);
@@ -2624,12 +2770,37 @@ describe('advanceFleetAudit', () => {
     // CONTIGUOUS-RUN GUARD, row at or below the exclusive cursor.
     await expect(
       readFleetAuditFindingsPage(
-        nonConforming((rows) =>
+        shapedPage((rows) =>
           rows.map((row) => ({ ...row, ordinal: row.ordinal - 1 })),
         ),
         { operationId, afterOrdinal: 0, limit: 1_000 },
       ),
     ).rejects.toThrow(malformedMessage);
+
+    // PORT-PERMITTED SHAPE, a non-final page SHORTER than `limit`. The reader
+    // refuses only an EMPTY unfinished page, never a short one, so this page
+    // is legal and must come back with its cursor. The `done: false` ARM is
+    // already driven by the preceding title's `limit: 2` paging loop — but
+    // only ever by FULL pages; nothing until here accepts a short one, which
+    // is the shape the advance-by-length idiom most depends on.
+    const shortNonFinal = await readFleetAuditFindingsPage(
+      shapedPage((rows) => rows.slice(0, 1), false),
+      { operationId, limit: 1_000 },
+    );
+    expect(shortNonFinal.done).toBe(false);
+    expect(shortNonFinal.findings).toEqual(conforming.findings.slice(0, 1));
+    expect(shortNonFinal.nextAfterOrdinal).toBe(0);
+
+    // PORT-PERMITTED SHAPE, an ARBITRARY permutation. The reader sorts before
+    // it checks contiguity, so every order the port permits is accepted — not
+    // just the reversal the preceding title uses. A left rotation of the five
+    // findings this world holds is neither ascending nor descending.
+    await expect(
+      readFleetAuditFindingsPage(
+        shapedPage((rows) => [...rows.slice(1), ...rows.slice(0, 1)]),
+        { operationId, limit: 1_000 },
+      ),
+    ).resolves.toEqual(conforming);
 
     // A conforming empty page is legal only because it is terminal, and it
     // carries no cursor: that absence is why the field must stay optional.
@@ -2680,18 +2851,7 @@ describe('advanceFleetAudit', () => {
       authorityClock: () => AUDIT_NOW,
     });
 
-    const drainFindings = await auditFleetDrift({
-      store: new FakeFleetStateStore(records) as unknown as FleetStateStore,
-      records,
-      inventory,
-      backendFor: () => harness.backend,
-      specFor: (record) =>
-        harness.specByTenant.get(record.tenantTag) as DeploymentSpec,
-      maintenanceSecretFor: (record) =>
-        harness.secretByTenant.get(record.tenantTag) as string,
-      staleAfterMs: STALE_AFTER_MS,
-      now: AUDIT_NOW,
-    });
+    const drainFindings = await drainWith(harness, { records, inventory });
 
     const operationId = uuidFor(32);
     const result = await startAndDrive(harness, operationId, records);
@@ -2816,18 +2976,7 @@ describe('advanceFleetAudit', () => {
       auditClock: () => AUDIT_NOW,
       authorityClock: () => AUDIT_NOW,
     });
-    const drainFindings = await auditFleetDrift({
-      store: new FakeFleetStateStore(records) as unknown as FleetStateStore,
-      records,
-      inventory,
-      backendFor: () => harness.backend,
-      specFor: (record) =>
-        harness.specByTenant.get(record.tenantTag) as DeploymentSpec,
-      maintenanceSecretFor: (record) =>
-        harness.secretByTenant.get(record.tenantTag) as string,
-      staleAfterMs: STALE_AFTER_MS,
-      now: AUDIT_NOW,
-    });
+    const drainFindings = await drainWith(harness, { records, inventory });
     const operationId = uuidFor(34);
     await startAndDrive(harness, operationId, records);
     const page = await readFleetAuditFindingsPage(harness.operationStore, {
@@ -2868,7 +3017,7 @@ describe('advanceFleetAudit', () => {
       }),
     );
     expect(started.status).toBe('pending');
-    let token = started.status === 'pending' ? started.token : undefined;
+    let token = expectPendingToken(started);
     const stages: string[] = [];
     for (let i = 0; i < 20; i++) {
       const result = await advanceFleetAudit(
@@ -2901,22 +3050,72 @@ describe('advanceFleetAudit', () => {
     const alice = baseRecord('alice');
     const harness = buildHarness([alice], inventoryFor([alice]));
     const operationId = uuidFor(37);
-    const action: FleetAuditAdvanceAction = {
-      kind: 'start',
-      operationId,
-      records: [alice],
-      staleAfterMs: STALE_AFTER_MS,
-    };
-    const first = await advanceFleetAudit(harness.baseOptions(action));
-    expect(first.status).toBe('pending');
-    // Replay the exact same start call: its revision-1 commit has already
-    // landed, so the replay must converge via the byte-identical read
-    // rather than throwing a conflict.
-    const second = await advanceFleetAudit(harness.baseOptions(action));
-    expect(second.status).toBe('pending');
-    if (first.status === 'pending' && second.status === 'pending') {
-      expect(second.token).toEqual(first.token);
-    }
+    const started = await advanceFleetAudit(
+      harness.baseOptions({
+        kind: 'start',
+        operationId,
+        records: [alice],
+        staleAfterMs: STALE_AFTER_MS,
+      }),
+    );
+    expect(started.status).toBe('pending');
+    const startedToken = expectPendingToken(started);
+
+    // The loss has to land on a CONTINUE. On the START path the revision-1
+    // commit sits inside a catch-all that reads the operation back, so a
+    // durably-applied-then-thrown response there produces an ordinary
+    // `pending` and proves nothing about the discriminator; start-replay
+    // convergence (same token, no duplicate rows) is the start-replay
+    // title's own subject and stays pinned there. The continue-path commits
+    // carry no such catch, so the throw propagates while the write stands —
+    // exactly a lost response.
+    const lostResponse = new Error(
+      'fleet operation store lost the commitProgress response',
+    );
+    harness.operationStore.loseCommitProgressResponse = lostResponse;
+    const rowsBeforeLoss = structuredClone([...harness.operationStore.rows]);
+    await expect(
+      advanceFleetAudit(
+        harness.baseOptions({ kind: 'continue', token: startedToken }),
+      ),
+    ).rejects.toBe(lostResponse);
+
+    // The write LANDED: the operation is still running, its pin still held,
+    // and its persisted revision is one past the token the caller holds.
+    const persisted =
+      await harness.operationStore.readOperationById(operationId);
+    expect(persisted?.state).toBe('running');
+    const persistedProgress = fleetAuditProgressFromUnknown(
+      persisted?.progress,
+    );
+    expect(persistedProgress.revision).toBe(startedToken.revision + 1);
+    expect(
+      harness.inventoryStore.releasedPins.some(
+        (pin) => pin.pinnedBy === `fleet-audit:${operationId}`,
+      ),
+    ).toBe(false);
+
+    // The retry replays the SAME token. `classifyFleetOperationToken` reads it
+    // as `stale` against the advanced persisted revision — the revision
+    // discriminator — so the caller converges on the authoritative result
+    // instead of re-running the chunk.
+    const retried = await advanceFleetAudit(
+      harness.baseOptions({ kind: 'continue', token: startedToken }),
+    );
+    expect(retried.status).toBe('pending');
+    const retriedToken = expectPendingToken(retried);
+    expect(retriedToken).toEqual({
+      ...startedToken,
+      revision: persistedProgress.revision,
+    });
+    expect(retried).toEqual({
+      status: 'pending',
+      token: retriedToken,
+      stage: persistedProgress.stage,
+    });
+
+    // …and it staged nothing: convergence, not a second application.
+    expect([...harness.operationStore.rows]).toEqual(rowsBeforeLoss);
   });
 
   it('the abort signal is call-local and never persisted', async () => {
@@ -2936,11 +3135,23 @@ describe('advanceFleetAudit', () => {
     );
     const persisted =
       await harness.operationStore.readOperationById(operationId);
+    // A near-unfalsifiable assertion, kept deliberately. The first title in
+    // this file reads the persisted progress through
+    // `fleetAuditProgressFromUnknown`, whose exact-key assertion already
+    // rejects any extra field, so a `signal` landing in `progress` is caught
+    // there. This is a byte SCAN over the whole run record rather than a shape
+    // check on one field, which is the half no shape assertion makes: it also
+    // catches the option arriving under some other key, or nested inside a
+    // value. It is the load-bearing half of the call-local claim.
     expect(JSON.stringify(persisted)).not.toContain('signal');
     expect(result.status).toBe('pending');
 
+    // An explicit abort reason, so the refusal is pinned by IDENTITY rather
+    // than by "something threw": the coordinator must propagate the caller's
+    // own reason out of `signal.throwIfAborted()` untouched.
+    const abortReason = new Error('fleet audit aborted by the caller');
     const abortedController = new AbortController();
-    abortedController.abort();
+    abortedController.abort(abortReason);
     const abortedHarness = buildHarness([alice], inventoryFor([alice]), {
       signal: abortedController.signal,
     });
@@ -2953,8 +3164,77 @@ describe('advanceFleetAudit', () => {
           staleAfterMs: STALE_AFTER_MS,
         }),
       ),
-    ).rejects.toThrow();
+    ).rejects.toBe(abortReason);
     expectZeroHarnessWork(abortedHarness);
+  });
+
+  it("the abort signal is re-checked INSIDE a per-record call: an abort landing after the fact-row read refuses with the caller's own reason, does no provider work, and leaves the operation running at its revision", async () => {
+    const alice = baseRecord('midrecordabort');
+    const controller = new AbortController();
+    const harness = buildHarness([alice], inventoryFor([alice]), {
+      signal: controller.signal,
+    });
+    const operationId = uuidFor(92);
+    const started = await advanceFleetAudit(
+      harness.baseOptions({
+        kind: 'start',
+        operationId,
+        records: [alice],
+        staleAfterMs: STALE_AFTER_MS,
+      }),
+    );
+    expect(started.status).toBe('pending');
+    const atPerRecord = await driveToStage(
+      harness,
+      expectPendingToken(started),
+      'per-record',
+    );
+
+    // The coordinator re-checks the signal INSIDE the per-record chunk, after
+    // it has read the accumulated fact rows and before it calls the record
+    // step. Aborting from the fact read is what lands the abort in that
+    // window: the entry check has already passed, so a refusal here can only
+    // come from the mid-record checkpoint.
+    const abortReason = new Error('fleet audit aborted mid per-record call');
+    const readOperationRowsPage =
+      harness.operationStore.readOperationRowsPage.bind(harness.operationStore);
+    harness.operationStore.readOperationRowsPage = async (
+      input: RowsPageInput,
+    ) => {
+      const page = await readOperationRowsPage(input);
+      if (input.rowKind === 'fact') controller.abort(abortReason);
+      return page;
+    };
+
+    const opsBefore = harness.opsLog.length;
+    const factReadsBefore =
+      harness.operationStore.rowPageReadCounts.get('fact') ?? 0;
+    const rowsBefore = structuredClone([...harness.operationStore.rows]);
+    const persistedBefore = fleetAuditProgressFromUnknown(
+      (await harness.operationStore.readOperationById(operationId))?.progress,
+    );
+    await expect(
+      advanceFleetAudit(
+        harness.baseOptions({ kind: 'continue', token: atPerRecord.token }),
+      ),
+    ).rejects.toBe(abortReason);
+    harness.operationStore.readOperationRowsPage = readOperationRowsPage;
+
+    // The call got PAST the entry check — it read fact rows — and stopped
+    // before any resolver or provider work.
+    expect(
+      harness.operationStore.rowPageReadCounts.get('fact') ?? 0,
+    ).toBeGreaterThan(factReadsBefore);
+    expect(harness.opsLog.length).toBe(opsBefore);
+    expect(harness.fleetStore.ops).toEqual([]);
+    expect([...harness.operationStore.rows]).toEqual(rowsBefore);
+    const persistedAfter =
+      await harness.operationStore.readOperationById(operationId);
+    expect(persistedAfter?.state).toBe('running');
+    expect(fleetAuditProgressFromUnknown(persistedAfter?.progress)).toEqual(
+      persistedBefore,
+    );
+    expect(harness.inventoryStore.releasedPins).toEqual([]);
   });
 
   it('byte scan: no secret value, Authorization bytes, or bearer token outside record rows', async () => {
@@ -2966,13 +3246,43 @@ describe('advanceFleetAudit', () => {
       'bytescan',
       'Bearer super-secret-credential-value',
     );
+    // The `Authorization` half of the scan is vacuous unless some
+    // provider-sourced text actually carries those bytes into the call. This
+    // duty error does: the maintenance-stale template names the failed attempt
+    // and its timestamp and NEVER the provider's own error string, so the scan
+    // below has something real to refute.
+    const sweepError = 'Authorization: Bearer leaked-provider-header';
+    harness.liveByTenant.set(
+      'bytescan',
+      cleanLiveDeployment(alice, {
+        maintenance: {
+          ...HEALTHY_MAINTENANCE,
+          lastSweepAttemptAt: AUDIT_NOW - 1_000,
+          lastSweepError: sweepError,
+        },
+      }),
+    );
     const operationId = uuidFor(40);
     await startAndDrive(harness, operationId, records);
+    const page = await readFleetAuditFindingsPage(harness.operationStore, {
+      operationId,
+      limit: 100,
+    });
+    const maintenanceFinding = page.findings.find(
+      (finding) =>
+        finding.tenantTag === 'bytescan' &&
+        finding.kind === 'maintenance-stale',
+    );
+    expect(maintenanceFinding).toBeDefined();
+    expect(maintenanceFinding?.detail).toContain(
+      `sweep last attempt failed at ${AUDIT_NOW - 1_000}`,
+    );
     const expectNoSensitiveBytes = (value: unknown): void => {
       const text = JSON.stringify(value).toLowerCase();
       expect(text).not.toContain('bearer');
       expect(text).not.toContain('authorization');
       expect(text).not.toContain('super-secret-credential-value');
+      expect(text).not.toContain('leaked-provider-header');
     };
     for (const [key, rows] of harness.operationStore.rows) {
       const [, rowKind] = key.split(':');
@@ -3007,7 +3317,10 @@ describe('advanceFleetAudit', () => {
       artifactVersion: 'v1',
       schemaVersion: 1,
     });
-    const harness = buildHarness(records, inventory);
+    const harness = buildHarness(records, inventory, {
+      auditClock: () => AUDIT_NOW,
+      authorityClock: () => AUDIT_NOW,
+    });
     const operationId = uuidFor(41);
     await startAndDrive(harness, operationId, records);
     const page = await readFleetAuditFindingsPage(harness.operationStore, {
@@ -3023,18 +3336,7 @@ describe('advanceFleetAudit', () => {
       "finding detail withheld: unsafe bytes (kind 'orphan-deployment')",
     );
 
-    const drainFindings = await auditFleetDrift({
-      store: new FakeFleetStateStore(records) as unknown as FleetStateStore,
-      records,
-      inventory,
-      backendFor: () => harness.backend,
-      specFor: (record) =>
-        harness.specByTenant.get(record.tenantTag) as DeploymentSpec,
-      maintenanceSecretFor: (record) =>
-        harness.secretByTenant.get(record.tenantTag) as string,
-      staleAfterMs: STALE_AFTER_MS,
-      now: AUDIT_NOW,
-    });
+    const drainFindings = await drainWith(harness, { records, inventory });
     const drainOrphan = drainFindings.find(
       (finding) =>
         finding.kind === 'orphan-deployment' &&
@@ -3043,7 +3345,7 @@ describe('advanceFleetAudit', () => {
     expect(drainOrphan?.detail).toContain(hostileScriptName);
   });
 
-  it('concurrent-mutation drift (class (c), both halves)', async () => {
+  it('concurrent-mutation drift (class (c), both halves): a migration Fleet mutation trips the reread refusal while a Fleet-silent ready-path step does not; and a provider-truth mutation between audit start and the bounded per-record call yields the drifted inspection finding, asserted against what a start-time drain produced', async () => {
     const drifted = baseRecord('driftmaint');
     const silent = baseRecord('silentmaint');
     const providerDrifted = baseRecord('providerdrift');
@@ -3061,17 +3363,9 @@ describe('advanceFleetAudit', () => {
       'silentmaint',
       cleanLiveDeployment(silent, { maintenance: UNARMED_MAINTENANCE }),
     );
-    const startTimeDrainFindings = await auditFleetDrift({
-      store: new FakeFleetStateStore(records) as unknown as FleetStateStore,
+    const startTimeDrainFindings = await drainWith(harness, {
       records,
       inventory,
-      backendFor: () => harness.backend,
-      specFor: (record) =>
-        harness.specByTenant.get(record.tenantTag) as DeploymentSpec,
-      maintenanceSecretFor: (record) =>
-        harness.secretByTenant.get(record.tenantTag) as string,
-      staleAfterMs: STALE_AFTER_MS,
-      now: AUDIT_NOW,
     });
     const operationId = uuidFor(42);
     const started = await advanceFleetAudit(
@@ -3135,7 +3429,7 @@ describe('advanceFleetAudit', () => {
     ).toBe(false);
   });
 
-  it('maxItemsPerCall range refusal (0 and 2,001 refused; 1 and 2,000 accepted; default 500 observed)', async () => {
+  it('maxItemsPerCall range refusal (0 and 2,001 refused with the fixed message; 1 and 2,000 accepted; default 500 observed)', async () => {
     const alice = baseRecord('alice');
     const harness = buildHarness([alice], inventoryFor([alice]));
     await expect(
@@ -3299,11 +3593,14 @@ describe('advanceFleetAudit', () => {
     // R4-A: “prune releases the audit pin FIRST; the crash window leaves an unpinned terminal operation the next call deletes”.
   });
 
-  it('a multi-duty maintenance-stale finding persists the templates-only joined detail with no lastError bytes anywhere; the drain emits legacyDetails[i] byte-identically', async () => {
+  it("a multi-duty maintenance-stale finding (≥2 failing duties + the not-armed marker, raw bytes mid-string, including an empty-string lastError producing legacy's trailing ': ') persists the templates-only joined detail with no lastError bytes anywhere; the drain emits legacyDetails[i] byte-identically", async () => {
     const record = baseRecord('multiduty', { updatedAt: FRESH_UPDATED_AT });
     const records = [record];
     const inventory = inventoryFor(records);
-    const harness = buildHarness(records, inventory);
+    const harness = buildHarness(records, inventory, {
+      auditClock: () => AUDIT_NOW,
+      authorityClock: () => AUDIT_NOW,
+    });
     const liveMaintenance: MaintenanceHealth = {
       armed: false,
       nextAlarmAt: null,
@@ -3329,20 +3626,7 @@ describe('advanceFleetAudit', () => {
       `maintenance scheduler is not armed; sweep last attempt failed at ${AUDIT_NOW - 1_000}; purge last attempt failed at ${AUDIT_NOW - 2_000}`,
     );
 
-    const drainStore = new FakeFleetStateStore(
-      records,
-    ) as unknown as FleetStateStore;
-    const drainFindings = await auditFleetDrift({
-      store: drainStore,
-      records,
-      inventory,
-      backendFor: () => harness.backend,
-      specFor: (r) => harness.specByTenant.get(r.tenantTag) as DeploymentSpec,
-      maintenanceSecretFor: (r) =>
-        harness.secretByTenant.get(r.tenantTag) as string,
-      staleAfterMs: STALE_AFTER_MS,
-      now: AUDIT_NOW,
-    });
+    const drainFindings = await drainWith(harness, { records, inventory });
     const drainFinding = drainFindings.find(
       (f) => f.kind === 'maintenance-stale',
     );
@@ -3420,7 +3704,7 @@ describe('advanceFleetAudit', () => {
     expect(persisted.auditTimeMs).not.toBe(losingAuditTimeMs);
   });
 
-  it('readAllFleetOperationRows fails closed on a page with zero rows before done', async () => {
+  it('readAllFleetOperationRows fails closed on a page with zero rows before done, on a repeating page, on a duplicate ordinal within one page, on an overlapping row, and on a gapped page sequence; it caps the row read by kind and reads descending pages correctly', async () => {
     let mutationCalls = 0;
     const store: FleetOperationStore = {
       withAccountOperationLease: async () => {
@@ -3456,6 +3740,39 @@ describe('advanceFleetAudit', () => {
     ).rejects.toThrow('fleet operation state is malformed');
     expect(repeatingPageCalls).toBe(2);
 
+    // DUPLICATE ORDINAL WITHIN ONE PAGE. On a FIRST page `afterOrdinal` is
+    // `undefined`, so the `row.ordinal <= afterOrdinal` arm cannot fire and
+    // only the page-scoped `Set` can decide. The overlapping case further
+    // down never reaches that arm — its repeated row is rejected by the
+    // cursor comparison first — and the gapped case carries no duplicate at
+    // all, so this fixture is the `Set` arm's only falsifying case: the page
+    // is deliberately NOT `done`, so without the arm the reader would fetch
+    // a second page, and `duplicatePageCalls` pins that it does not.
+    let duplicatePageCalls = 0;
+    const duplicateOrdinalStore = pageTransformingStore(
+      new FakeOperationStore(),
+      (_page, input) => {
+        duplicatePageCalls += 1;
+        return {
+          rows: [
+            { rowKind: input.rowKind, ordinal: 0, payload: {} },
+            { rowKind: input.rowKind, ordinal: 0, payload: {} },
+          ],
+          done: false,
+        };
+      },
+    );
+    await expect(
+      readAllFleetOperationRows(duplicateOrdinalStore, uuidFor(533), 'record'),
+    ).rejects.toThrow('fleet operation state is malformed');
+    expect(duplicatePageCalls).toBe(1);
+
+    // ROW-READ CAP BY KIND. The cap case below runs on the `record` kind, so
+    // the `record` arm of `readAllFleetOperationRows`'s bound ternary is what
+    // it exercises; the 990,000 non-`record` arm is pinned here as a constant
+    // only. Driving a fixture through it would mean materializing ~990,001
+    // rows to exercise a two-value ternary over the same guard, which is not
+    // worth the suite time.
     expect(FLEET_OPERATION_ROW_READ_BOUND).toBe(990_000);
     let advancingPageCalls = 0;
     let advancingRows = 0;
@@ -3503,52 +3820,34 @@ describe('advanceFleetAudit', () => {
     expect(new Set(expectedRows.map((row) => row.ordinal)).size).toBe(
       expectedRows.length,
     );
-    const descendingStore = new Proxy(orderedStore, {
-      get(target, property, receiver) {
-        if (property === 'readOperationRowsPage') {
-          return async (
-            input: Parameters<FleetOperationStore['readOperationRowsPage']>[0],
-          ) => {
-            const page = await target.readOperationRowsPage(input);
-            return { ...page, rows: [...page.rows].reverse() };
-          };
-        }
-        const value = Reflect.get(target, property, receiver);
-        return typeof value === 'function' ? value.bind(target) : value;
-      },
-    });
+    const descendingStore = pageTransformingStore(orderedStore, (page) => ({
+      ...page,
+      rows: [...page.rows].reverse(),
+    }));
     await expect(
       readAllFleetOperationRows(descendingStore, orderedOperationId, 'record'),
     ).resolves.toEqual(expectedRows);
 
     let overlappingPageCalls = 0;
     const overlappingBaseStore = new FakeOperationStore();
-    const overlappingStore = new Proxy(overlappingBaseStore, {
-      get(target, property, receiver) {
-        if (property === 'readOperationRowsPage') {
-          return async (
-            input: Parameters<FleetOperationStore['readOperationRowsPage']>[0],
-          ) => {
-            overlappingPageCalls += 1;
-            if (input.afterOrdinal === undefined) {
-              return {
-                rows: [{ rowKind: input.rowKind, ordinal: 1, payload: {} }],
-                done: false,
-              };
+    const overlappingStore = pageTransformingStore(
+      overlappingBaseStore,
+      (_page, input) => {
+        overlappingPageCalls += 1;
+        return input.afterOrdinal === undefined
+          ? {
+              rows: [{ rowKind: input.rowKind, ordinal: 1, payload: {} }],
+              done: false,
             }
-            return {
+          : {
               rows: [
                 { rowKind: input.rowKind, ordinal: 2, payload: {} },
                 { rowKind: input.rowKind, ordinal: 1, payload: {} },
               ],
               done: true,
             };
-          };
-        }
-        const value = Reflect.get(target, property, receiver);
-        return typeof value === 'function' ? value.bind(target) : value;
       },
-    });
+    );
     await expect(
       readAllFleetOperationRows(overlappingStore, uuidFor(531), 'record'),
     ).rejects.toThrow('fleet operation state is malformed');
@@ -3557,29 +3856,41 @@ describe('advanceFleetAudit', () => {
     expect(overlappingBaseStore.rows.size).toBe(0);
     expect(overlappingBaseStore.heads.size).toBe(0);
 
-    let gappedPageCalls = 0;
-    const gappedStore: FleetOperationStore = {
-      ...store,
-      readOperationRowsPage: async (input) => {
-        gappedPageCalls += 1;
-        return input.afterOrdinal === undefined
-          ? {
-              rows: [
-                { rowKind: input.rowKind, ordinal: 5, payload: {} },
-                { rowKind: input.rowKind, ordinal: 1, payload: {} },
-              ],
-              done: false,
-            }
-          : {
-              rows: [{ rowKind: input.rowKind, ordinal: 6, payload: {} }],
-              done: true,
-            };
-      },
-    };
-    await expect(
-      readAllFleetOperationRows(gappedStore, uuidFor(532), 'record'),
-    ).rejects.toThrow('fleet operation state is malformed');
-    expect(gappedPageCalls).toBe(2);
+    // PAGE CONTIGUITY. `[5, 1]`,`[6]` refuses on the MISSING ZERO — the
+    // sorted run starts at 1, so the final index check fails on the very
+    // first row and the 2-4 skip is never reached. `[5, 0]`,`[6]` is the same
+    // sequence with that first-row objection removed, so only the interior
+    // gap can decide it. Both are kept: they refuse for different reasons.
+    const gappedFirstPages = [
+      [5, 1],
+      [5, 0],
+    ] as const;
+    for (const [index, firstPageOrdinals] of gappedFirstPages.entries()) {
+      let gappedPageCalls = 0;
+      const gappedStore: FleetOperationStore = {
+        ...store,
+        readOperationRowsPage: async (input) => {
+          gappedPageCalls += 1;
+          return input.afterOrdinal === undefined
+            ? {
+                rows: firstPageOrdinals.map((ordinal) => ({
+                  rowKind: input.rowKind,
+                  ordinal,
+                  payload: {},
+                })),
+                done: false,
+              }
+            : {
+                rows: [{ rowKind: input.rowKind, ordinal: 6, payload: {} }],
+                done: true,
+              };
+        },
+      };
+      await expect(
+        readAllFleetOperationRows(gappedStore, uuidFor(534 + index), 'record'),
+      ).rejects.toThrow('fleet operation state is malformed');
+      expect(gappedPageCalls).toBe(2);
+    }
     expect(mutationCalls).toBe(0);
   });
 
@@ -3651,7 +3962,7 @@ describe('advanceFleetAudit', () => {
     expect(next.status).toBe('pending');
   });
 
-  it('findings-page reads and abandonment refuse an unknown id and a foreign-kind id before any write', async () => {
+  it('findings-page reads and abandonment refuse an unknown id (FleetOperationTokenOperationError) and a foreign-kind id (the fixed cross-kind refusal) before any write, in both the running and terminal abandonment branches', async () => {
     const alice = baseRecord('foreignids');
     const harness = buildHarness([alice], inventoryFor([alice]));
     const unknownId = uuidFor(57);
@@ -3792,9 +4103,9 @@ describe('advanceFleetAudit', () => {
     const abandoned =
       await harness.operationStore.readOperationById(operationId);
     expect(abandoned?.state).toBe('failed');
-    expect((abandoned?.progress as FleetAuditProgress).failure?.reason).toBe(
-      'operator-abandoned',
-    );
+    expect(
+      fleetAuditProgressFromUnknown(abandoned?.progress).failure?.reason,
+    ).toBe('operator-abandoned');
     expect(harness.operationStore.heads.has('audit')).toBe(false);
     expect(harness.inventoryStore.releasedPins).toContainEqual({
       generation: 1,
@@ -3886,17 +4197,9 @@ describe('advanceFleetAudit', () => {
       tenantTag: observed.tenantTag,
       environment: observed.environment,
     });
-    const drainFindings = await auditFleetDrift({
-      store: observedHarness.fleetStore,
+    const drainFindings = await drainWith(observedHarness, {
       records: [observed],
       inventory: observedInventory,
-      backendFor: () => observedHarness.backend,
-      specFor: (record) =>
-        observedHarness.specByTenant.get(record.tenantTag) as DeploymentSpec,
-      maintenanceSecretFor: (record) =>
-        observedHarness.secretByTenant.get(record.tenantTag) as string,
-      staleAfterMs: STALE_AFTER_MS,
-      now: AUDIT_NOW,
     });
     expect(drainFindings.slice(0, observedFindings.length)).toStrictEqual(
       observedFindings,
@@ -3922,7 +4225,6 @@ describe('advanceFleetAudit', () => {
     ];
     for (const [index, record] of cases.entries()) {
       const harness = buildHarness([record], inventoryFor([record]));
-      const probeCallsBefore = harness.operationStore.readOperationByIdCalls;
       await expect(
         advanceFleetAudit(
           harness.baseOptions({
@@ -3935,270 +4237,245 @@ describe('advanceFleetAudit', () => {
       ).rejects.toThrow(
         'fleet audit record tenantTag and environment must satisfy the deployment identifier grammar',
       );
-      expect(harness.operationStore.readOperationByIdCalls).toBe(
-        probeCallsBefore,
-      );
       expectZeroHarnessWork(harness);
     }
   });
 
-  it('a start refuses a non-positive or non-integer explicit generation, a non-string tenant tag, a record over the staged row byte bound, and a non-integer or out-of-Date-range audit clock sample before any operation row, staged row, or pin', async () => {
-    const alice = baseRecord('preflight');
-    for (const [index, generation] of [0, 1.5].entries()) {
-      const harness = buildHarness([alice], inventoryFor([alice]));
-      const operationId = uuidFor(70 + index);
-      await expect(
-        advanceFleetAudit(
-          harness.baseOptions({
-            kind: 'start',
-            operationId,
-            records: [alice],
-            staleAfterMs: STALE_AFTER_MS,
-            generation,
-          }),
-        ),
-      ).rejects.toThrow('generation must be a positive safe integer');
-      expectZeroHarnessWork(harness);
-      expect(harness.operationStore.operations.has(operationId)).toBe(false);
-      expect(harness.operationStore.rows.size).toBe(0);
-      expect(harness.inventoryStore.pins).toEqual([]);
-    }
+  // INTAKE PREFLIGHT, re-cut here as a table. Eleven fixtures used to share
+  // one ~250-line body — nine `rejects.toThrow` blocks, two of them looping
+  // over two fixtures each — that repeated the same build /
+  // `rejects.toThrow` / `expectZeroHarnessWork` work; each fixture now
+  // reports under its own title, so a failure names the one that broke.
+  const preflightRecord = baseRecord('preflight');
+  const GRAMMAR_REFUSAL =
+    'fleet audit record tenantTag and environment must satisfy the deployment identifier grammar';
+  const STRUCTURE_REFUSAL =
+    'fleet audit record exceeds the intake structure bounds';
+  const ROW_BYTE_REFUSAL =
+    'fleet audit record exceeds the staged row byte bound';
+  const CLOCK_REFUSAL =
+    'fleet audit auditClock sample must be a non-negative safe integer representable by Date';
+  // The clock refusal is the one preflight case that follows the lease row:
+  // it is sampled inside the lease, after the probe and the generation read.
+  const AFTER_LEASE_AND_PROBE = {
+    leaseCount: 1,
+    readOperationByIdCalls: 1,
+    generationReads: { latest: 1, finalized: 0, runByOperation: 0 },
+  } as const;
 
-    const nonStringTenant = {
-      ...baseRecord('nonstringtenant'),
-      tenantTag: null as unknown as string,
-    };
-    const nonStringHarness = buildHarness([], emptyInventory());
-    const nonStringOperationId = uuidFor(72);
-    await expect(
-      advanceFleetAudit(
-        nonStringHarness.baseOptions({
-          kind: 'start',
-          operationId: nonStringOperationId,
-          records: [nonStringTenant],
-          staleAfterMs: STALE_AFTER_MS,
-        }),
-      ),
-    ).rejects.toThrow(
-      'fleet audit record tenantTag and environment must satisfy the deployment identifier grammar',
-    );
-    expectZeroHarnessWork(nonStringHarness);
-    expect(
-      nonStringHarness.operationStore.operations.has(nonStringOperationId),
-    ).toBe(false);
-    expect(nonStringHarness.operationStore.rows.size).toBe(0);
-    expect(nonStringHarness.inventoryStore.pins).toEqual([]);
-
-    const throwingTenant = baseRecord('throwingtenant');
-    Object.defineProperty(throwingTenant, 'tenantTag', {
-      get() {
-        throw new Error('boom');
+  const preflightRefusalCases: readonly PreflightRefusalCase[] = [
+    {
+      name: 'a non-positive explicit generation',
+      fleet: [preflightRecord],
+      operationId: uuidFor(70),
+      records: () => [preflightRecord],
+      generation: 0,
+      message: 'generation must be a positive safe integer',
+    },
+    {
+      name: 'a non-integer explicit generation',
+      fleet: [preflightRecord],
+      operationId: uuidFor(71),
+      records: () => [preflightRecord],
+      generation: 1.5,
+      message: 'generation must be a positive safe integer',
+    },
+    {
+      name: 'a non-string tenant tag',
+      fleet: [],
+      operationId: uuidFor(72),
+      records: () => [
+        {
+          ...baseRecord('nonstringtenant'),
+          tenantTag: null as unknown as string,
+        },
+      ],
+      message: GRAMMAR_REFUSAL,
+    },
+    {
+      name: 'a throwing tenantTag accessor',
+      fleet: [],
+      operationId: uuidFor(720),
+      records: () => {
+        const record = baseRecord('throwingtenant');
+        Object.defineProperty(record, 'tenantTag', {
+          get() {
+            throw new Error('boom');
+          },
+          enumerable: true,
+        });
+        return [record];
       },
-      enumerable: true,
-    });
-    const throwingTenantHarness = buildHarness([], emptyInventory());
-    await expect(
-      advanceFleetAudit(
-        throwingTenantHarness.baseOptions({
-          kind: 'start',
-          operationId: uuidFor(720),
-          records: [throwingTenant],
-          staleAfterMs: STALE_AFTER_MS,
-        }),
-      ),
-    ).rejects.toThrow('fleet audit record exceeds the intake structure bounds');
-    expectZeroHarnessWork(throwingTenantHarness);
-
-    const nullRecordHarness = buildHarness([], emptyInventory());
-    const nullRecordOperationId = uuidFor(79);
-    await expect(
-      advanceFleetAudit(
-        nullRecordHarness.baseOptions({
-          kind: 'start',
-          operationId: nullRecordOperationId,
-          records: [null as unknown as FleetRecord],
-          staleAfterMs: STALE_AFTER_MS,
-        }),
-      ),
-    ).rejects.toThrow('fleet audit record exceeds the intake structure bounds');
-    expectZeroHarnessWork(nullRecordHarness);
-
-    const padding = Object.fromEntries(
-      Array.from({ length: 25 }, (_, index) => [
-        `padding${index}`,
-        'x'.repeat(FLEET_OPERATION_STRING_BYTE_BOUND),
-      ]),
-    );
-    const oversizedRecord = Object.assign(baseRecord('oversized'), padding);
-    const pending: unknown[] = [oversizedRecord];
-    const strings: string[] = [];
-    let nodeCount = 0;
-    while (pending.length > 0) {
-      const current = pending.pop();
-      nodeCount += 1;
-      if (typeof current === 'string') strings.push(current);
-      else if (Array.isArray(current)) pending.push(...current);
-      else if (current && typeof current === 'object') {
-        pending.push(...Object.values(current));
-      }
-    }
-    const oversizedCanonical = canonicalFleetOperationBytes(oversizedRecord);
-    expect(
-      new TextEncoder().encode(oversizedCanonical).byteLength,
-    ).toBeGreaterThan(FLEET_OPERATION_RECORD_ROW_BYTE_BOUND);
-    expect(nodeCount).toBeLessThan(8_192);
-    expect(
-      Math.max(
-        ...strings.map((value) => new TextEncoder().encode(value).byteLength),
-      ),
-    ).toBeLessThanOrEqual(FLEET_OPERATION_STRING_BYTE_BOUND);
-    const oversizedHarness = buildHarness([], emptyInventory());
-    const oversizedOperationId = uuidFor(73);
-    await expect(
-      advanceFleetAudit(
-        oversizedHarness.baseOptions({
-          kind: 'start',
-          operationId: oversizedOperationId,
-          records: [oversizedRecord],
-          staleAfterMs: STALE_AFTER_MS,
-        }),
-      ),
-    ).rejects.toThrow('fleet audit record exceeds the staged row byte bound');
-    expectZeroHarnessWork(oversizedHarness);
-    expect(
-      oversizedHarness.operationStore.operations.has(oversizedOperationId),
-    ).toBe(false);
-    expect(oversizedHarness.operationStore.rows.size).toBe(0);
-    expect(oversizedHarness.inventoryStore.pins).toEqual([]);
-
-    const clockHarness = buildHarness([alice], inventoryFor([alice]), {
+      message: STRUCTURE_REFUSAL,
+    },
+    {
+      name: 'a null record element',
+      fleet: [],
+      operationId: uuidFor(79),
+      records: () => [null as unknown as FleetRecord],
+      message: STRUCTURE_REFUSAL,
+    },
+    {
+      name: 'a record over the staged row bound',
+      fleet: [],
+      operationId: uuidFor(73),
+      records: () => {
+        const record = Object.assign(
+          baseRecord('oversized'),
+          Object.fromEntries(
+            Array.from({ length: 25 }, (_, index) => [
+              `padding${index}`,
+              'x'.repeat(FLEET_OPERATION_STRING_BYTE_BOUND),
+            ]),
+          ),
+        );
+        // The walk survives for the max-string assertion alone; the node
+        // count comes from the file's own helper.
+        const strings: string[] = [];
+        const pending: unknown[] = [record];
+        while (pending.length > 0) {
+          const current = pending.pop();
+          if (typeof current === 'string') strings.push(current);
+          else if (Array.isArray(current)) pending.push(...current);
+          else if (current && typeof current === 'object') {
+            pending.push(...Object.values(current));
+          }
+        }
+        expect(
+          new TextEncoder().encode(canonicalFleetOperationBytes(record))
+            .byteLength,
+        ).toBeGreaterThan(FLEET_OPERATION_RECORD_ROW_BYTE_BOUND);
+        expect(countPlainDataNodes(record)).toBeLessThan(
+          FLEET_OPERATION_NODE_BOUND,
+        );
+        expect(
+          Math.max(
+            ...strings.map(
+              (value) => new TextEncoder().encode(value).byteLength,
+            ),
+          ),
+        ).toBeLessThanOrEqual(FLEET_OPERATION_STRING_BYTE_BOUND);
+        return [record];
+      },
+      message: ROW_BYTE_REFUSAL,
+    },
+    {
+      name: 'a non-integer audit clock sample',
+      fleet: [preflightRecord],
+      operationId: uuidFor(74),
+      records: () => [preflightRecord],
       auditClock: () => 1.5,
-    });
-    const clockOperationId = uuidFor(74);
+      message: CLOCK_REFUSAL,
+      coordination: AFTER_LEASE_AND_PROBE,
+    },
+    {
+      name: 'an out-of-range audit clock sample',
+      fleet: [preflightRecord],
+      operationId: uuidFor(75),
+      records: () => [preflightRecord],
+      auditClock: () => 9e15,
+      message: CLOCK_REFUSAL,
+      coordination: AFTER_LEASE_AND_PROBE,
+    },
+    {
+      name: 'a record over the intake node bound',
+      fleet: [],
+      operationId: uuidFor(76),
+      records: () => [
+        Object.assign(baseRecord('toomanynodes'), {
+          padding: Array.from({ length: 9_000 }, () => null),
+        }),
+      ],
+      message: STRUCTURE_REFUSAL,
+    },
+    {
+      name: 'a record over the intake string bound',
+      fleet: [],
+      operationId: uuidFor(77),
+      records: () => [
+        Object.assign(baseRecord('overlongstring'), {
+          padding: 'x'.repeat(5_000),
+        }),
+      ],
+      message: STRUCTURE_REFUSAL,
+    },
+    {
+      name: 'a record over row and intake bounds',
+      fleet: [],
+      operationId: uuidFor(78),
+      records: () => {
+        const padding = Object.fromEntries(
+          Array.from({ length: 8_000 }, (_, index) => [
+            `padding${index}`,
+            'x'.repeat(2_087),
+          ]),
+        );
+        const record = Object.assign(baseRecord('overlappingbounds'), padding);
+        expect(countPlainDataNodes(record)).toBeLessThan(
+          FLEET_OPERATION_NODE_BOUND,
+        );
+        // Both terms are derived from the fixture rather than restated. The
+        // fixture is ASCII, so string lengths equal UTF-8 byte lengths, and
+        // each padding entry adds to the record's JSON exactly: one ','
+        // separator, the key's two '"' quotes, the key itself, one ':'
+        // separator, the value's two '"' quotes, and the value itself.
+        let serializedByteCount = JSON.stringify(
+          baseRecord('overlappingbounds'),
+        ).length;
+        for (const [key, value] of Object.entries(padding)) {
+          serializedByteCount += 1 + 2 + key.length + 1 + 2 + value.length;
+        }
+        expect(serializedByteCount).toBeGreaterThan(
+          FLEET_OPERATION_INTAKE_BYTE_BOUND,
+        );
+        return [record];
+      },
+      message: ROW_BYTE_REFUSAL,
+    },
+  ];
+
+  // Named so the frozen title survives as a greppable literal: `it.each`
+  // resolves `$name` per case, so none of the eleven generated titles appears
+  // anywhere in this file.
+  const PREFLIGHT_TITLE =
+    'a start refuses $name before any operation row, staged row, or pin';
+
+  it.each(preflightRefusalCases)(PREFLIGHT_TITLE, async (testCase) => {
+    const harness = buildHarness(
+      testCase.fleet,
+      inventoryFor(testCase.fleet),
+      testCase.auditClock === undefined
+        ? {}
+        : { auditClock: testCase.auditClock },
+    );
     await expect(
       advanceFleetAudit(
-        clockHarness.baseOptions({
+        harness.baseOptions({
           kind: 'start',
-          operationId: clockOperationId,
-          records: [alice],
+          operationId: testCase.operationId,
+          records: testCase.records(),
           staleAfterMs: STALE_AFTER_MS,
+          ...(testCase.generation === undefined
+            ? {}
+            : { generation: testCase.generation }),
         }),
       ),
-    ).rejects.toThrow(
-      'fleet audit auditClock sample must be a non-negative safe integer representable by Date',
-    );
-    expectZeroHarnessWork(clockHarness, {
-      leaseCount: 1,
-      readOperationByIdCalls: 1,
-      generationReads: { latest: 1, finalized: 0, runByOperation: 0 },
-    });
-    expect(clockHarness.operationStore.operations.has(clockOperationId)).toBe(
-      false,
-    );
-    expect(clockHarness.operationStore.rows.size).toBe(0);
-    expect(clockHarness.inventoryStore.pins).toEqual([]);
-
-    const outOfRangeClockHarness = buildHarness(
-      [alice],
-      inventoryFor([alice]),
-      { auditClock: () => 9e15 },
-    );
-    const outOfRangeClockOperationId = uuidFor(75);
-    await expect(
-      advanceFleetAudit(
-        outOfRangeClockHarness.baseOptions({
-          kind: 'start',
-          operationId: outOfRangeClockOperationId,
-          records: [alice],
-          staleAfterMs: STALE_AFTER_MS,
-        }),
-      ),
-    ).rejects.toThrow(
-      'fleet audit auditClock sample must be a non-negative safe integer representable by Date',
-    );
-    expectZeroHarnessWork(outOfRangeClockHarness, {
-      leaseCount: 1,
-      readOperationByIdCalls: 1,
-      generationReads: { latest: 1, finalized: 0, runByOperation: 0 },
-    });
-
-    const structureBoundCases: readonly FleetRecord[] = [
-      Object.assign(baseRecord('toomanynodes'), {
-        padding: Array.from({ length: 9_000 }, () => null),
-      }),
-      Object.assign(baseRecord('overlongstring'), {
-        padding: 'x'.repeat(5_000),
-      }),
-    ];
-    for (const [index, record] of structureBoundCases.entries()) {
-      const harness = buildHarness([], emptyInventory());
-      const operationId = uuidFor(76 + index);
-      await expect(
-        advanceFleetAudit(
-          harness.baseOptions({
-            kind: 'start',
-            operationId,
-            records: [record],
-            staleAfterMs: STALE_AFTER_MS,
-          }),
-        ),
-      ).rejects.toThrow(
-        'fleet audit record exceeds the intake structure bounds',
-      );
-      expectZeroHarnessWork(harness);
-      expect(harness.operationStore.operations.has(operationId)).toBe(false);
-    }
-
-    const overlappingPadding = Object.fromEntries(
-      Array.from({ length: 8_000 }, (_, index) => [
-        `padding${index}`,
-        'x'.repeat(2_087),
-      ]),
-    );
-    const overlappingBaseRecord = baseRecord('overlappingbounds');
-    const overlappingRecord = Object.assign(
-      overlappingBaseRecord,
-      overlappingPadding,
-    );
-    expect(countPlainDataNodes(overlappingRecord)).toBeLessThan(8_192);
-    // This fixture is ASCII, so string lengths equal UTF-8 byte lengths.
-    let overlappingSerializedByteCount = JSON.stringify(
-      baseRecord('overlappingbounds'),
-    ).length;
-    for (let index = 0; index < 8_000; index += 1) {
-      overlappingSerializedByteCount +=
-        1 + 2 + `padding${index}`.length + 1 + 2 + 2_087;
-    }
-    expect(overlappingSerializedByteCount).toBeGreaterThan(
-      FLEET_OPERATION_INTAKE_BYTE_BOUND,
-    );
-    const overlappingHarness = buildHarness([], emptyInventory());
-    const overlappingOperationId = uuidFor(78);
-    await expect(
-      advanceFleetAudit(
-        overlappingHarness.baseOptions({
-          kind: 'start',
-          operationId: overlappingOperationId,
-          records: [overlappingRecord],
-          staleAfterMs: STALE_AFTER_MS,
-        }),
-      ),
-    ).rejects.toThrow('fleet audit record exceeds the staged row byte bound');
-    expectZeroHarnessWork(overlappingHarness);
-    expect(
-      overlappingHarness.operationStore.operations.has(overlappingOperationId),
-    ).toBe(false);
+    ).rejects.toThrow(testCase.message);
+    // `expectZeroHarnessWork` already asserts the empty operation, row,
+    // head, digest and pin maps, so no case repeats them.
+    expectZeroHarnessWork(harness, testCase.coordination);
   });
 
   it('an emitted finding or fact row whose serialized payload or any string exceeds the staged-row envelope fails the operation durably as emission-bound-exceeded with the pin released, before the store sees the row', async () => {
     const escapedNamespaceId = '\u0000'.repeat(3_000);
     const overlongDatabaseId = 'd'.repeat(5_000);
+    const escapedDriftedDatabaseId = 'db-escapedfact-drifted';
     const cases = [
       {
         tenantTag: 'escapedfact',
         live: (record: FleetRecord) =>
           cleanLiveDeployment(record, {
-            databaseId: 'db-escapedfact-drifted',
+            databaseId: escapedDriftedDatabaseId,
             durableObjectBindings: [
               {
                 name: 'RUNNER',
@@ -4244,19 +4521,22 @@ describe('advanceFleetAudit', () => {
       });
       harness.liveByTenant.set(record.tenantTag, testCase.live(record));
       if (index === 0) {
-        const drainFindings = await auditFleetDrift({
-          store: new FakeFleetStateStore([record]),
+        const drainFindings = await drainWith(harness, {
           records: [record],
           inventory: inventoryFor([record]),
-          backendFor: () => harness.backend,
-          specFor: (entry) =>
-            harness.specByTenant.get(entry.tenantTag) as DeploymentSpec,
-          maintenanceSecretFor: (entry) =>
-            harness.secretByTenant.get(entry.tenantTag) as string,
-          staleAfterMs: STALE_AFTER_MS,
-          now: AUDIT_NOW,
         });
-        expect(drainFindings.length).toBeGreaterThan(0);
+        // §5.5 class (d): the drain over the IDENTICAL world completes and
+        // returns its FULL finding array, where the bounded path refuses the
+        // first fact row. A length floor would pass on any finding at all, so
+        // the whole array is pinned.
+        expect(drainFindings).toEqual([
+          {
+            tenantTag: testCase.tenantTag,
+            environment: ENVIRONMENT,
+            kind: 'database-mismatch',
+            detail: `expected ${record.databaseId}, found ${escapedDriftedDatabaseId}`,
+          },
+        ]);
       }
       const operationId = uuidFor(80 + index);
       const started = await advanceFleetAudit(
@@ -4286,7 +4566,9 @@ describe('advanceFleetAudit', () => {
       const persisted =
         await harness.operationStore.readOperationById(operationId);
       expect(persisted?.state).toBe('failed');
-      expect((persisted?.progress as FleetAuditProgress).failure).toEqual({
+      expect(
+        fleetAuditProgressFromUnknown(persisted?.progress).failure,
+      ).toEqual({
         reason: 'emission-bound-exceeded',
         itemOrdinal: 0,
       });
@@ -4347,11 +4629,13 @@ describe('advanceFleetAudit', () => {
     });
   });
 
-  it("a start whose grammar-valid records' aggregate node count exceeds 8,192 creates the operation with recordCount equal to the input length, and its first per-record call reads the accumulated record rows across two pages", async () => {
+  it("a start whose grammar-valid records' aggregate node count exceeds 8,192 creates the operation with recordCount equal to the INTAKE SNAPSHOT — mid-start caller mutation of the records array, of record[0], and of the action's own operationId, staleAfterMs and generation notwithstanding — and its first per-record call reads the accumulated record rows across two pages", async () => {
     const records = Array.from({ length: 1_001 }, (_, index) =>
       baseRecord(`aggregate${index}`),
     );
-    expect(countPlainDataNodes(records)).toBeGreaterThan(8_192);
+    expect(countPlainDataNodes(records)).toBeGreaterThan(
+      FLEET_OPERATION_NODE_BOUND,
+    );
     expect(() =>
       fleetOperationIntakeDigest({
         records,
@@ -4361,6 +4645,7 @@ describe('advanceFleetAudit', () => {
     ).toThrow('fleet operation state is malformed');
 
     const operationId = uuidFor(83);
+    const probeMutationOperationId = uuidFor(829);
     const clockMutationOperationId = uuidFor(830);
     const pinMutationOperationId = uuidFor(831);
     const action = {
@@ -4368,6 +4653,7 @@ describe('advanceFleetAudit', () => {
       operationId,
       records,
       staleAfterMs: STALE_AFTER_MS,
+      generation: undefined as number | undefined,
     };
     const intakeCount = records.length;
     const intakeTenantTag = records[0]?.tenantTag;
@@ -4383,6 +4669,11 @@ describe('advanceFleetAudit', () => {
       });
       action.staleAfterMs = nextStaleAfterMs;
       action.operationId = nextOperationId;
+      // Generation 2 is never registered here, so an implementation that
+      // re-read `action.generation` instead of the value hoisted at the top
+      // of the start would pin generation 2 rather than the latest finalized
+      // 1 — and the pin assertion below would see it.
+      action.generation = 2;
     };
     const harness = buildHarness(records, inventoryFor(records), {
       auditClock: () => {
@@ -4397,6 +4688,14 @@ describe('advanceFleetAudit', () => {
       mutateCaller(pinMutationOperationId, STALE_AFTER_MS + 2);
       await pinGeneration(input);
     };
+    // The clock and pin hooks both fire AFTER the generation is resolved, so
+    // neither can falsify the hoisted `action.generation`. The probe —
+    // `readOperationById`, the single seam between the hoist and the use — is
+    // the only hook early enough, and it is one-shot so the direct reads
+    // further down cannot re-trigger it.
+    harness.operationStore.onNextReadOperationById = () => {
+      mutateCaller(probeMutationOperationId, STALE_AFTER_MS + 3);
+    };
     const started = await advanceFleetAudit(harness.baseOptions(action));
     expect(started.status).toBe('pending');
     if (started.status !== 'pending') throw new Error('unreachable');
@@ -4405,15 +4704,22 @@ describe('advanceFleetAudit', () => {
     expect(persisted).toBeDefined();
     if (!persisted) throw new Error('unreachable');
     expect(persisted.state).toBe('running');
-    const progress = persisted.progress as FleetAuditProgress;
+    const progress = fleetAuditProgressFromUnknown(persisted.progress);
     expect(progress.recordCount).toBe(intakeCount);
     expect(progress.staleAfterMs).toBe(STALE_AFTER_MS);
+    expect(
+      await harness.operationStore.readOperationById(probeMutationOperationId),
+    ).toBeUndefined();
     expect(
       await harness.operationStore.readOperationById(clockMutationOperationId),
     ).toBeUndefined();
     expect(
       await harness.operationStore.readOperationById(pinMutationOperationId),
     ).toBeUndefined();
+    // The mid-call `action.generation = 2` did not reach the resolution: the
+    // operation pins, and persists, the latest finalized generation 1.
+    expect(action.generation).toBe(2);
+    expect(progress.generation).toBe(1);
     expect(harness.inventoryStore.pins).toEqual([
       { generation: 1, pinnedBy: `fleet-audit:${operationId}` },
     ]);
@@ -4425,18 +4731,17 @@ describe('advanceFleetAudit', () => {
     expect(stagedRecords).toHaveLength(intakeCount);
     expect(stagedRecords[0]?.payload.tenantTag).toBe(intakeTenantTag);
 
+    // AFTER-START MUTATION. Only the array length is restored: the rest of
+    // this title drives `continue`, which never reads `action` again, and
+    // `records[0].tenantTag` is overwritten on the very next line.
     records.length = intakeCount;
-    Object.assign(records[0] as FleetRecord, { tenantTag: intakeTenantTag });
-    action.operationId = operationId;
-    action.staleAfterMs = STALE_AFTER_MS;
     Object.assign(records[0] as FleetRecord, {
       tenantTag: 'mutatedafterstart',
     });
     records.push(baseRecord('appendedafterstart'));
     expect(
-      (
-        (await harness.operationStore.readOperationById(operationId))
-          ?.progress as FleetAuditProgress
+      fleetAuditProgressFromUnknown(
+        (await harness.operationStore.readOperationById(operationId))?.progress,
       ).recordCount,
     ).toBe(intakeCount);
     expect(
@@ -4451,6 +4756,12 @@ describe('advanceFleetAudit', () => {
 
     // Skip the preceding global stages so this fixture pays for only the last
     // global-stage call and the first per-record call that it measures.
+    //
+    // A DELIBERATE raw cast, unlike every read above: the point is to write a
+    // fast-forwarded stage straight into the store. Routing it through
+    // `fleetAuditProgressFromUnknown` would only re-validate what this line
+    // just built, and the codec is what the coordinator must apply on the way
+    // back OUT.
     harness.operationStore.operations.set(operationId, {
       ...persisted,
       progress: {
@@ -4538,6 +4849,9 @@ describe('advanceFleetAudit', () => {
       expect(persisted).toBeDefined();
       if (!persisted) throw new Error('unreachable');
       const progress = fleetAuditProgressFromUnknown(persisted.progress);
+      // A DELIBERATE raw cast: this line CORRUPTS the persisted cursor on
+      // purpose, so it must bypass the codec the read above went through.
+      // Every read in this file goes the other way.
       const corrupted: FleetOperationRunRecord = {
         ...persisted,
         progress: { ...progress, stage: testCase.stage } as FleetAuditProgress,
@@ -4553,11 +4867,14 @@ describe('advanceFleetAudit', () => {
       expect(harness.opsLog).toEqual([]);
       expect(harness.fleetStore.ops).toEqual([]);
       expect([...harness.operationStore.rows]).toEqual(rowsBefore);
-      expect(
-        await harness.operationStore.readOperationById(operationId),
-      ).toEqual(corrupted);
+      const afterRefusal =
+        await harness.operationStore.readOperationById(operationId);
+      expect(afterRefusal).toEqual(corrupted);
       expect(harness.operationStore.heads.get('audit')).toBe(operationId);
-      expect(corrupted.state).toBe('running');
+      // Read back off the STORE, not off the local fixture: the claim is that
+      // the refusal left the durable operation running, which a property of
+      // `corrupted` could never falsify.
+      expect(afterRefusal?.state).toBe('running');
     }
   });
 });

@@ -400,6 +400,9 @@ describe('fleet operation state', () => {
       expect(isDurableAuditDetailSafe(`provider said ${marker}`)).toBe(false);
     }
     expect(isDurableAuditDetailSafe('safe words '.repeat(300))).toBe(true);
+  });
+
+  it('the row codecs accept an empty finding detail and an empty or control-byte fact key on every fact kind, and reject a control-byte detail', () => {
     expect(
       driftFindingRowFromUnknown({
         tenantTag: 'tenant',
@@ -423,6 +426,21 @@ describe('fleet operation state', () => {
           key,
         }).key,
       ).toBe(key);
+      // The owner kinds admit the same keys through the same bounded
+      // provider-text guard, but their arm asserts FOUR exact keys and
+      // validates `tenantTag`/`environment` against the deployment grammar,
+      // so the fixture has to carry grammar-valid values for those two or
+      // the very first iteration refuses for the wrong reason.
+      for (const factKind of ['database-owner', 'namespace-owner'] as const) {
+        expect(
+          fleetAuditFactRowFromUnknown({
+            factKind,
+            key,
+            tenantTag: 'tenant',
+            environment: 'production',
+          }).key,
+        ).toBe(key);
+      }
     }
   });
 
@@ -497,7 +515,17 @@ describe('fleet operation state', () => {
       step: 'provider-findings',
       rowOrdinal: 7,
     });
-    while (stage.step !== 'finalize') {
+    // Capped by the very array the next assertion compares against. This loop
+    // is SYNCHRONOUS, so a non-progressing successor chain would never reach
+    // vitest's test timeout — it would block the worker and grow `seen` until
+    // the process died. The cap is the stage count, which is one slot of slack
+    // over the 12 successors the chain actually needs.
+    for (let step = 0; stage.step !== 'finalize'; step += 1) {
+      if (step >= FLEET_AUDIT_STAGE_ORDER.length) {
+        throw new Error(
+          `nextAuditStage did not reach 'finalize' within ${FLEET_AUDIT_STAGE_ORDER.length} successors`,
+        );
+      }
       stage = nextAuditStage(stage, true);
       seen.push(stage.step);
     }
@@ -598,6 +626,11 @@ describe('fleet operation state', () => {
     expect(digestFor([a, b])).not.toBe(digestFor([a]));
     expect(digestFor([a, b], { generation: 2 })).not.toBe(digestFor([a, b]));
 
+    // A FRAMING oracle, not a canonicalization oracle: it reuses
+    // `canonicalFleetOperationBytes` from the module under test, so it pins
+    // the netstring framing and the hash composition and nothing about the
+    // canonicalizer itself. That is pinned independently by the key-reorder
+    // and concatenation assertions above.
     const oracle = createHash('sha256').update(
       canonicalFleetOperationBytes(envelope),
     );
