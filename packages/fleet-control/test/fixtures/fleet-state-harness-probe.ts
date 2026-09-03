@@ -3335,6 +3335,71 @@ async function operationCommitConcurrency(db: D1Database): Promise<unknown> {
   });
 }
 
+// The dense-prefix conjunct is aliased SQL that only `commitProgress`
+// emits, and it is the single guard that keeps a watermark-refused batch from
+// landing rows. Both of its paths run here so the real D1 planner, not only
+// `node:sqlite`, has executed the alias.
+async function operationCommitWatermark(db: D1Database): Promise<unknown> {
+  const target = await readyOperationStore(db);
+  const id = operationId(5);
+  const findingOrdinals = async (): Promise<number[]> => {
+    const rows = await db
+      .prepare(
+        `SELECT ordinal FROM anchorage_fleet_operation_rows
+          WHERE account_id = ? AND operation_id = ? AND row_kind = 'finding'
+          ORDER BY ordinal`,
+      )
+      .bind(OPERATION_ACCOUNT, id)
+      .all<{ ordinal: number }>();
+    return rows.results.map((row) => Number(row.ordinal));
+  };
+  return target.withAccountOperationLease('audit', async (lease) => {
+    const created = await operationStart(lease, 'audit', id);
+    // One insert at ordinal 1 under a watermark of 2 satisfies the
+    // contiguous-run precondition, so the refusal comes from the conjunct
+    // itself: the insert binds COUNT(< 1) = 1 against an empty table.
+    let refused: unknown;
+    try {
+      await lease.commitProgress({
+        operationId: id,
+        expectedRevision: 0,
+        runRecord: operationAdvanced(created.record),
+        rows: [operationFinding(1)],
+        expectedRowWatermarks: { finding: 2 },
+      });
+    } catch (error) {
+      refused = errorShape(error);
+    }
+    if (refused === undefined) {
+      throw new Error('unsatisfiable watermark unexpectedly committed');
+    }
+    const afterRefusal = await lease.readOperation(id);
+    const refusedOrdinals = await findingOrdinals();
+    await lease.stageRows({
+      operationId: id,
+      expectedRevision: 0,
+      rows: [operationFinding(0), operationFinding(1)],
+    });
+    // Rows at [2, 3) under watermark 3, the coordinator's own convention: the
+    // insert binds the PRE-state prefix COUNT(< 2) = 2 and the run update the
+    // post-state COUNT(< 3) = 3.
+    const accepted = await lease.commitProgress({
+      operationId: id,
+      expectedRevision: 0,
+      runRecord: operationAdvanced(created.record),
+      rows: [operationFinding(2)],
+      expectedRowWatermarks: { finding: 3 },
+    });
+    return {
+      refused,
+      revisionAfterRefusal: afterRefusal?.progress.revision,
+      findingsAfterRefusal: refusedOrdinals.length,
+      acceptedRevision: accepted.progress.revision,
+      rowOrdinals: await findingOrdinals(),
+    };
+  });
+}
+
 async function operationFinalizeConvergence(db: D1Database): Promise<unknown> {
   await readyOperationStore(db);
   const database = hideResultsDatabase(new D1FleetStateDatabase(db));
@@ -3751,6 +3816,8 @@ export default {
           return Response.json(await operationStartAtomicity(env.DB));
         case 'operation-commit-concurrency':
           return Response.json(await operationCommitConcurrency(env.DB));
+        case 'operation-commit-watermark':
+          return Response.json(await operationCommitWatermark(env.DB));
         case 'operation-finalize-convergence':
           return Response.json(await operationFinalizeConvergence(env.DB));
         case 'operation-rows-readback':

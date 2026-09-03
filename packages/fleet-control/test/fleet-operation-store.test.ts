@@ -14,6 +14,7 @@ import {
   classifyFleetOperationToken,
   type FleetOperationKind,
   type FleetOperationLease,
+  type FleetOperationRowKind,
   type FleetOperationRunRecord,
   type FleetOperationStagedRow,
   FleetOperationStoreCapabilityError,
@@ -199,6 +200,14 @@ function findingRow(ordinal = 0): FleetOperationStagedRow {
       detail: `safe finding ${ordinal}`,
     },
   };
+}
+
+function payloadFindingRow(
+  ordinal: number,
+  detail: string,
+): FleetOperationStagedRow {
+  const row = findingRow(ordinal);
+  return { ...row, payload: { ...row.payload, detail } };
 }
 
 function factRow(ordinal = 0): FleetOperationStagedRow {
@@ -613,10 +622,11 @@ describe('D1FleetOperationStore', () => {
         await expect(lease.commitProgress(transition)).rejects.toThrow(
           'committed batch response lost',
         );
-        // 12 finding/fact inserts at 12 bindings each (5 values + the 7-binding
-        // operation guard), then the run update at 5 + 3 lease + 5x1 watermark.
+        // 12 finding/fact inserts at 17 bindings each (5 values + the 7-binding
+        // operation guard + 5x1 dense-prefix watermark), then the run update at
+        // 5 + 3 lease + 5x1 watermark.
         const commitBindingCounts = [
-          ...Array.from({ length: 12 }, () => 12),
+          ...Array.from({ length: 12 }, () => 17),
           13,
         ];
         expect(db.bindingCounts.slice(bindingMark)).toEqual(
@@ -675,15 +685,21 @@ describe('D1FleetOperationStore', () => {
 
   it('commitProgress refuses a stale revision', async () => {
     const db = new MemoryD1();
-    const error = await store(db).withAccountOperationLease(
+    const target = store(db);
+    let batchMark = 0;
+    const error = await target.withAccountOperationLease(
       'audit',
       async (lease) => {
         const created = await start(lease);
+        batchMark = db.batchSizes.length;
+        // A well-formed revision-2 -> 3 transition against a persisted
+        // revision 0: the pre-SQL checks all pass, so the refusal comes from
+        // the run update's own revision guard.
         return rejection(
           lease.commitProgress({
             operationId: OPERATION_ID,
             expectedRevision: 2,
-            runRecord: advanced(created.record),
+            runRecord: advanced(advanced(advanced(created.record))),
           }),
         );
       },
@@ -691,6 +707,10 @@ describe('D1FleetOperationStore', () => {
     expect(error.message).toBe(
       `fleet operation '${OPERATION_ID}' is no longer at the expected revision`,
     );
+    expect(db.batchSizes.slice(batchMark)).toHaveLength(1);
+    expect(
+      (await target.readOperationById(OPERATION_ID))?.progress.revision,
+    ).toBe(0);
   });
 
   it('commitProgress converges on byte-identical replay', async () => {
@@ -739,6 +759,228 @@ describe('D1FleetOperationStore', () => {
     expect(error.message).toBe(
       `fleet operation '${OPERATION_ID}' staged rows diverge from the persisted operation`,
     );
+  });
+
+  it('a commitProgress refused on a watermark leaves no row a later commit can converge over', async () => {
+    const conflict = `fleet operation '${OPERATION_ID}' is no longer at the expected revision`;
+
+    // Leg A: the watermark is of a kind the batch does not insert, so the
+    // refusal comes from a claim the operation cannot satisfy yet.
+    const legA = new MemoryD1();
+    const legATarget = store(legA);
+    await legATarget.withAccountOperationLease('audit', async (lease) => {
+      const created = await start(lease);
+      await lease.stageRows({
+        operationId: OPERATION_ID,
+        expectedRevision: 0,
+        rows: [recordRow(0)],
+      });
+      const batchMark = legA.batchSizes.length;
+      await expect(
+        lease.commitProgress({
+          operationId: OPERATION_ID,
+          expectedRevision: 0,
+          runRecord: advanced(created.record),
+          rows: [payloadFindingRow(0, 'payload A')],
+          expectedRowWatermarks: { record: 2 },
+        }),
+      ).rejects.toThrow(conflict);
+      expect(legA.batchSizes.slice(batchMark)).toHaveLength(1);
+      expect(
+        (
+          await legATarget.readOperationRowsPage({
+            operationId: OPERATION_ID,
+            rowKind: 'finding',
+            limit: 10,
+          })
+        ).rows,
+      ).toEqual([]);
+      expect(
+        (await legATarget.readOperationById(OPERATION_ID))?.progress.revision,
+      ).toBe(0);
+      await lease.stageRows({
+        operationId: OPERATION_ID,
+        expectedRevision: 0,
+        rows: [recordRow(1)],
+      });
+      const committed = await lease.commitProgress({
+        operationId: OPERATION_ID,
+        expectedRevision: 0,
+        runRecord: advanced(created.record),
+        rows: [payloadFindingRow(0, 'payload B')],
+        expectedRowWatermarks: { record: 2 },
+      });
+      expect(committed.progress.revision).toBe(1);
+    });
+    expect(
+      (
+        await legATarget.readOperationRowsPage({
+          operationId: OPERATION_ID,
+          rowKind: 'finding',
+          limit: 10,
+        })
+      ).rows[0]?.payload.detail,
+    ).toBe('payload B');
+
+    // Leg B: the watermark is the inserted row's own kind, so only the
+    // pre-state dense prefix distinguishes the refusal from a commit that
+    // lands the row and refuses the run update.
+    const legB = new MemoryD1();
+    const legBTarget = store(legB);
+    await legBTarget.withAccountOperationLease('audit', async (lease) => {
+      const created = await start(lease);
+      const transition = {
+        operationId: OPERATION_ID,
+        expectedRevision: 0,
+        runRecord: advanced(created.record),
+        rows: [findingRow(1)],
+        expectedRowWatermarks: { finding: 2 },
+      } as const;
+      await expect(lease.commitProgress(transition)).rejects.toThrow(conflict);
+      expect(
+        (
+          await legBTarget.readOperationRowsPage({
+            operationId: OPERATION_ID,
+            rowKind: 'finding',
+            limit: 10,
+          })
+        ).rows,
+      ).toEqual([]);
+      await lease.stageRows({
+        operationId: OPERATION_ID,
+        expectedRevision: 0,
+        rows: [findingRow(0)],
+      });
+      expect((await lease.commitProgress(transition)).progress.revision).toBe(
+        1,
+      );
+    });
+    expect(
+      (
+        await legBTarget.readOperationRowsPage({
+          operationId: OPERATION_ID,
+          rowKind: 'finding',
+          limit: 10,
+        })
+      ).rows.map((row) => row.ordinal),
+    ).toEqual([0, 1]);
+
+    // Leg C is a regression guard, not coverage of the conjunct: it is green
+    // under an unguarded insert too, and red only under a scheme that counts
+    // the batch's own earlier inserts.
+    const legC = new MemoryD1();
+    const legCTarget = store(legC);
+    await legCTarget.withAccountOperationLease('audit', async (lease) => {
+      const created = await start(lease);
+      await lease.stageRows({
+        operationId: OPERATION_ID,
+        expectedRevision: 0,
+        rows: [findingRow(2)],
+      });
+      expect(
+        (
+          await lease.commitProgress({
+            operationId: OPERATION_ID,
+            expectedRevision: 0,
+            runRecord: advanced(created.record),
+            rows: [findingRow(0), findingRow(1), findingRow(2)],
+            expectedRowWatermarks: { finding: 3 },
+          })
+        ).progress.revision,
+      ).toBe(1);
+    });
+    expect(
+      (
+        await legCTarget.readOperationRowsPage({
+          operationId: OPERATION_ID,
+          rowKind: 'finding',
+          limit: 10,
+        })
+      ).rows.map((row) => row.ordinal),
+    ).toEqual([0, 1, 2]);
+
+    // Leg D: the contiguous-run PRECONDITION the dense prefix rests on. The
+    // batch's own finding inserts below the watermark are ordinals 0 and 2,
+    // which is not the run [1, 3), so the store refuses before it composes a
+    // statement. Delete the `below.some((row) => row.ordinal < prefix)` check
+    // and finding 2 lands through a commit whose run update still refuses.
+    const legD = new MemoryD1();
+    const legDTarget = store(legD);
+    await legDTarget.withAccountOperationLease('audit', async (lease) => {
+      const created = await start(lease);
+      await lease.stageRows({
+        operationId: OPERATION_ID,
+        expectedRevision: 0,
+        rows: [findingRow(0)],
+      });
+      const batchMark = legD.batchSizes.length;
+      const refused = await rejection(
+        lease.commitProgress({
+          operationId: OPERATION_ID,
+          expectedRevision: 0,
+          runRecord: advanced(created.record),
+          rows: [findingRow(0), findingRow(2)],
+          expectedRowWatermarks: { finding: 3 },
+        }),
+      );
+      expect(refused.message).toBe(
+        'commitProgress finding rows below the watermark must be the contiguous run ending at it',
+      );
+      expect(legD.batchSizes.slice(batchMark)).toEqual([]);
+    });
+    expect(
+      (
+        await legDTarget.readOperationRowsPage({
+          operationId: OPERATION_ID,
+          rowKind: 'finding',
+          limit: 10,
+        })
+      ).rows.map((row) => row.ordinal),
+    ).toEqual([0]);
+
+    // Leg E: the same conjunct on the row UPDATE, which no other title
+    // reaches — title 19's watermark carries no inserts, so its `prefix`
+    // equals the watermark and its UPDATE conjunct is indistinguishable from
+    // the run update's. Here the UPDATE's own conjunct is the only thing
+    // keeping the new payload out of the table; delete `${rowWatermarkSql}`
+    // from the UPDATE and the row reads 'active' through a refused commit.
+    const legE = new MemoryD1();
+    const legETarget = store(legE);
+    await legETarget.withAccountOperationLease('migration', async (lease) => {
+      const created = await start(lease, 'migration');
+      await lease.stageRows({
+        operationId: OPERATION_ID,
+        expectedRevision: 0,
+        rows: [itemRow('pending', 0)],
+      });
+      const batchMark = legE.batchSizes.length;
+      const refused = await rejection(
+        lease.commitProgress({
+          operationId: OPERATION_ID,
+          expectedRevision: 0,
+          runRecord: advanced(created.record),
+          updateRows: [itemRow('active', 0)],
+          expectedRowWatermarks: { item: 2 },
+        }),
+      );
+      // The convergence read compares payload bytes BEFORE watermarks, so a
+      // refused row UPDATE reports divergence rather than the conflict; with
+      // the UPDATE's conjunct deleted the bytes match and it reports the
+      // conflict instead.
+      expect(refused.message).toBe(
+        `fleet operation '${OPERATION_ID}' staged rows diverge from the persisted operation`,
+      );
+      expect(legE.batchSizes.slice(batchMark)).toHaveLength(1);
+    });
+    expect(
+      (
+        await legETarget.readOperationRowsPage({
+          operationId: OPERATION_ID,
+          rowKind: 'item',
+          limit: 10,
+        })
+      ).rows[0]?.payload.status,
+    ).toBe('pending');
   });
 
   it('a guarded item-row update stands or falls with the run update', async () => {
@@ -803,10 +1045,10 @@ describe('D1FleetOperationStore', () => {
         });
         expect(acceptedDb.batchSizes.slice(batchMark)).toEqual([100]);
         // Per-statement binding counts: see the derivation comment on
-        // "watermark guards hold under a retry..." above (12 per row, 13 for
-        // the run update).
+        // "watermark guards hold under a retry..." above (17 per row under one
+        // watermark, 13 for the run update).
         expect(acceptedDb.bindingCounts.slice(bindingMark)).toEqual([
-          ...Array.from({ length: 99 }, () => 12),
+          ...Array.from({ length: 99 }, () => 17),
           13,
         ]);
       },
@@ -853,6 +1095,7 @@ describe('D1FleetOperationStore', () => {
         });
         for (const expectedRowCounts of [
           { record: 0, finding: 1, fact: 1 },
+          { record: 1, finding: 0, fact: 1 },
           { record: 1, finding: 1, fact: 0 },
         ]) {
           await expect(
@@ -1100,49 +1343,7 @@ describe('D1FleetOperationStore', () => {
     ).toBe('running');
   });
 
-  it('failOperation updates three rows in ONE batch, all read back updated', async () => {
-    const db = new MemoryD1();
-    const target = store(db);
-    await target.withAccountOperationLease('migration', async (lease) => {
-      const created = await start(lease, 'migration');
-      await lease.stageRows({
-        operationId: OPERATION_ID,
-        expectedRevision: 0,
-        rows: [
-          itemRow('pending', 0),
-          itemRow('pending', 1),
-          itemRow('pending', 2),
-        ],
-      });
-      const mark = db.batchSizes.length;
-      await lease.failOperation({
-        operationId: OPERATION_ID,
-        expectedRevision: 0,
-        runRecord: advanced(created.record, 'failed'),
-        updateRows: [
-          itemRow('failed', 0),
-          itemRow('failed', 1),
-          itemRow('failed', 2),
-        ],
-      });
-      expect(db.batchSizes.slice(mark)).toEqual([5]);
-    });
-    const persisted = await target.readOperationById(OPERATION_ID);
-    expect(persisted?.state).toBe('failed');
-    expect(persisted?.progress.revision).toBe(1);
-    const page = await target.readOperationRowsPage({
-      operationId: OPERATION_ID,
-      rowKind: 'item',
-      limit: 10,
-    });
-    expect(page.rows.map((row) => row.payload.status)).toEqual([
-      'failed',
-      'failed',
-      'failed',
-    ]);
-  });
-
-  it('failOperation refuses more than 18 updateRows with its fixed message and leaves the operation running', async () => {
+  it('failOperation refuses more than one updateRow with its fixed message and leaves the operation running', async () => {
     const db = new MemoryD1();
     const target = store(db);
     const error = await target.withAccountOperationLease(
@@ -1155,18 +1356,14 @@ describe('D1FleetOperationStore', () => {
             operationId: OPERATION_ID,
             expectedRevision: 0,
             runRecord: advanced(created.record, 'failed'),
-            updateRows: Array.from({ length: 19 }, (_, index) =>
-              itemRow('failed', index),
-            ),
+            updateRows: [itemRow('failed', 0), itemRow('failed', 1)],
           }),
         );
         expect(db.batchSizes.length).toBe(mark);
         return rejected;
       },
     );
-    expect(error.message).toBe(
-      'failOperation exceeds the operation update budget of 18 rows',
-    );
+    expect(error.message).toBe('failOperation accepts at most one updateRow');
     expect((await target.readOperationById(OPERATION_ID))?.state).toBe(
       'running',
     );
@@ -1289,6 +1486,13 @@ describe('D1FleetOperationStore', () => {
         }),
       ).rejects.toThrow('limit must be an integer from 1 to 1000');
     }
+    await expect(
+      target.readOperationRowsPage({
+        operationId: OPERATION_ID,
+        rowKind: 'cursor' as FleetOperationRowKind,
+        limit: 1,
+      }),
+    ).rejects.toThrow('rowKind must be one of record, finding, item, fact');
     for (const afterOrdinal of [-1, 0.5, Number.MAX_SAFE_INTEGER]) {
       await expect(
         target.readOperationRowsPage({
@@ -1297,7 +1501,9 @@ describe('D1FleetOperationStore', () => {
           afterOrdinal,
           limit: 1,
         }),
-      ).rejects.toThrow('fleet operation state is malformed');
+      ).rejects.toThrow(
+        'afterOrdinal must be a non-negative safe integer below Number.MAX_SAFE_INTEGER',
+      );
     }
     const first = await target.readOperationRowsPage({
       operationId: OPERATION_ID,
@@ -1424,5 +1630,79 @@ describe('D1FleetOperationStore', () => {
     await expect(
       store(new MemoryD1()).pruneFleetOperations({ kind: 'audit', limit: 1 }),
     ).rejects.toThrow(FleetOperationStoreCapabilityError);
+  });
+
+  it('finalize and fail refuse a cross-kind operation id at the terminal probe', async () => {
+    const db = new MemoryD1();
+    const target = store(db);
+    const otherKind = `fleet operation '${OPERATION_ID}' belongs to the other operation kind`;
+    const secondOtherKind = `fleet operation '${SECOND_OPERATION_ID}' belongs to the other operation kind`;
+    await seedTerminal(target, 'migration', OPERATION_ID, 'finalized');
+    await seedTerminal(target, 'migration', SECOND_OPERATION_ID, 'failed');
+
+    await target.withAccountOperationLease('audit', async (lease) => {
+      // Without the kind check the finalize half returns the migration record
+      // as an audit success: its state is 'finalized' and its revision matches.
+      await expect(
+        lease.finalizeOperation({
+          operationId: OPERATION_ID,
+          expectedRevision: 0,
+          runRecord: runRecord('audit', 1, 'finalized'),
+          expectedRowCounts: {},
+        }),
+      ).rejects.toThrow(otherKind);
+      // Without it the fail half returns normally: state 'failed', revisions
+      // equal, so the audit caller believes it failed its own operation.
+      await expect(
+        lease.failOperation({
+          operationId: SECOND_OPERATION_ID,
+          expectedRevision: 0,
+          runRecord: runRecord('audit', 1, 'failed', SECOND_OPERATION_ID),
+        }),
+      ).rejects.toThrow(secondOtherKind);
+    });
+
+    for (const [operationId, state] of [
+      [OPERATION_ID, 'finalized'],
+      [SECOND_OPERATION_ID, 'failed'],
+    ] as const) {
+      expect(await target.readOperationById(operationId)).toMatchObject({
+        kind: 'migration',
+        state,
+        progress: { revision: 1 },
+      });
+    }
+    const started = await target.withAccountOperationLease(
+      'audit',
+      async (lease) => start(lease, 'audit', THIRD_OPERATION_ID),
+    );
+    expect(started.outcome).toBe('created');
+  });
+
+  it('withAccountOperationLease and pruneFleetOperations refuse an unknown kind with its fixed message', async () => {
+    const db = new MemoryD1();
+    const target = store(db);
+    const message = 'kind must be one of audit, migration';
+    await expect(
+      target.withAccountOperationLease(
+        'bogus' as FleetOperationKind,
+        async () => {
+          throw new Error('callback must not run');
+        },
+      ),
+    ).rejects.toThrow(message);
+    await expect(
+      target.pruneFleetOperations({
+        kind: 'bogus' as FleetOperationKind,
+        limit: 1,
+      }),
+    ).rejects.toThrow(message);
+    // The kind check precedes schema initialization, so the refusal did no I/O
+    // at all: not one table exists.
+    expect(
+      db.sqlite
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .all(),
+    ).toEqual([]);
   });
 });

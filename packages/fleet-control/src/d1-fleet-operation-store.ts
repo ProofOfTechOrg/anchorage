@@ -5,6 +5,7 @@ import {
   driftFindingRowFromUnknown,
   fleetAuditFactRowFromUnknown,
   fleetAuditOperationRecordFromUnknown,
+  fleetAuditPinOwner,
 } from './fleet-audit-state.js';
 import type { FleetInventoryRunStore } from './fleet-inventory-state.js';
 import { fleetMigrationItemFromUnknown } from './fleet-migration-state.js';
@@ -21,6 +22,7 @@ import {
   FleetOperationStateError,
   type FleetOperationStore,
   FleetOperationStoreCapabilityError,
+  fleetOperationOtherKindMessage,
   fleetOperationRunRecordFromUnknown,
   fleetOperationSafeInteger,
   fleetOperationSha256,
@@ -55,6 +57,11 @@ const OPERATION_GUARD_SQL = `FROM ${OPERATION_TABLE} r
 const ROWS_BELOW_ORDINAL_SQL = `FROM ${ROW_TABLE}
           WHERE account_id = ? AND operation_id = ?
             AND row_kind = ? AND ordinal < ?`;
+// The row statements of a commitProgress batch mutate this same table, so the
+// inner scan is aliased: the outer statement's columns cannot capture it.
+const ALIASED_ROWS_BELOW_ORDINAL_SQL = `FROM ${ROW_TABLE} w0
+          WHERE w0.account_id = ? AND w0.operation_id = ?
+            AND w0.row_kind = ? AND w0.ordinal < ?`;
 
 type Row = Readonly<Record<string, unknown>>;
 
@@ -189,6 +196,46 @@ function serializedPayload(row: FleetOperationStagedRow): string {
     : JSON.stringify(row.payload);
 }
 
+/**
+ * The watermark bindings of one `commitProgress` batch. Every row statement
+ * binds the PRE-state dense prefix `COUNT(kind k, ordinal < w - Bk) = w - Bk`,
+ * where `Bk` counts the batch's own kind-k inserts below the watermark `w`;
+ * those inserts all sit at ordinals at or above `w - Bk`, so no statement in
+ * the batch can move a count another statement reads, and on this conjunct
+ * the batch passes or refuses whole. The lease conjunct is still re-evaluated
+ * per statement, so this is not batch-level atomicity. The run update binds
+ * the post-state `COUNT(< w) = w`, which then holds exactly when every
+ * ordinal in `[w - Bk, w)` landed or already existed. The contiguous-run
+ * precondition is what makes the prefix invariant, so a caller that breaks it
+ * is refused here, before any SQL, rather than given a weaker guard.
+ */
+function commitWatermarkBindings(
+  watermarks: readonly [FleetOperationRowKind, number][],
+  insertRows: readonly FleetOperationStagedRow[],
+  accountId: string,
+  operationId: string,
+): Readonly<{
+  rowStatement: readonly unknown[];
+  runUpdate: readonly unknown[];
+}> {
+  const rowStatement: unknown[] = [];
+  const runUpdate: unknown[] = [];
+  for (const [rowKind, watermark] of watermarks) {
+    const below = insertRows.filter(
+      (row) => row.rowKind === rowKind && row.ordinal < watermark,
+    );
+    const prefix = watermark - below.length;
+    if (below.some((row) => row.ordinal < prefix)) {
+      throw new Error(
+        `commitProgress ${rowKind} rows below the watermark must be the contiguous run ending at it`,
+      );
+    }
+    rowStatement.push(accountId, operationId, rowKind, prefix, prefix);
+    runUpdate.push(accountId, operationId, rowKind, watermark, watermark);
+  }
+  return { rowStatement, runUpdate };
+}
+
 /** Provider-neutral D1 operation store over the fleet state database port. */
 export class D1FleetOperationStore implements FleetOperationStore {
   readonly #db: FleetStateDatabase;
@@ -307,7 +354,11 @@ export class D1FleetOperationStore implements FleetOperationStore {
     kind: FleetOperationKind,
     operation: (lease: FleetOperationLease, token: string) => Promise<T>,
   ): Promise<T> {
-    assertKind(kind);
+    if (!FLEET_OPERATION_KINDS.includes(kind)) {
+      throw new Error(
+        `kind must be one of ${FLEET_OPERATION_KINDS.join(', ')}`,
+      );
+    }
     await this.#ensureSchema();
     const token = randomUUID();
     const claimed = await this.#db.query(
@@ -357,6 +408,11 @@ export class D1FleetOperationStore implements FleetOperationStore {
     const lease: FleetOperationLease = {
       assertOwned,
       startOperation: (value) => this.#startOperation(kind, token, value),
+      // Deliberate delegation: the leased reader is the head-independent,
+      // kind-blind one, so it reaches a terminal row after head release and a
+      // row of the other kind. A coordinator's own `readOperationById` call on
+      // its continue path is defence in depth, not the only route to such a
+      // row.
       readOperation: (operationId) => this.readOperationById(operationId),
       stageRows: (value) => this.#stageRows(kind, token, value),
       commitProgress: (value) => this.#commitProgress(kind, token, value),
@@ -526,9 +582,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
       );
     }
     if (rowString(persisted, 'operation_kind') !== kind) {
-      throw new Error(
-        `fleet operation '${operationId}' belongs to the other operation kind`,
-      );
+      throw new Error(fleetOperationOtherKindMessage(operationId));
     }
     if (rowString(persisted, 'intake_digest') !== intakeDigest) {
       throw new Error(
@@ -687,6 +741,12 @@ export class D1FleetOperationStore implements FleetOperationStore {
         throw new FleetOperationStateError();
       }
     }
+    const watermarkBindings = commitWatermarkBindings(
+      watermarks,
+      rows,
+      this.#accountId,
+      operationId,
+    );
     const payloads = [...rows, ...updateRows].map((row) => ({
       row,
       bytes: serializedPayload(row),
@@ -704,9 +764,14 @@ export class D1FleetOperationStore implements FleetOperationStore {
     const watermarkSql = watermarks
       .map(() => `AND (SELECT COUNT(*) ${ROWS_BELOW_ORDINAL_SQL}) = ?`)
       .join('\n');
+    const rowWatermarkSql = watermarks
+      .map(() => `AND (SELECT COUNT(*) ${ALIASED_ROWS_BELOW_ORDINAL_SQL}) = ?`)
+      .join('\n');
     // Every row mutation carries the SAME lease, kind, state, and PRE-update
     // revision guard as the operation update, so stale or losing writers land
-    // no bytes that a later legitimate commit cannot replace.
+    // no bytes that a later legitimate commit cannot replace, and the
+    // dense-prefix count of every claimed watermark, so a watermark this
+    // transition cannot satisfy refuses every statement and persists nothing.
     const result = await this.#db.batch([
       ...insertPayloads.map(({ row, bytes }) => ({
         sql: `INSERT INTO ${ROW_TABLE} (
@@ -714,6 +779,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
         )
         SELECT ?, ?, ?, ?, ?
         ${OPERATION_GUARD_SQL}
+        ${rowWatermarkSql}
         ON CONFLICT (account_id, operation_id, row_kind, ordinal) DO NOTHING
         RETURNING row_kind, ordinal`,
         bindings: [
@@ -723,6 +789,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
           row.ordinal,
           bytes,
           ...guardBindings,
+          ...watermarkBindings.rowStatement,
         ],
       })),
       ...updatePayloads.map(({ row, bytes }) => ({
@@ -731,6 +798,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
           WHERE account_id = ? AND operation_id = ?
             AND row_kind = ? AND ordinal = ?
             AND EXISTS (SELECT 1 ${OPERATION_GUARD_SQL})
+            ${rowWatermarkSql}
           RETURNING row_kind, ordinal`,
         bindings: [
           bytes,
@@ -739,6 +807,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
           row.rowKind,
           row.ordinal,
           ...guardBindings,
+          ...watermarkBindings.rowStatement,
         ],
       })),
       {
@@ -758,13 +827,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
           kind,
           expectedRevision,
           ...this.#leaseBindings(kind, token),
-          ...watermarks.flatMap(([rowKind, watermark]) => [
-            this.#accountId,
-            operationId,
-            rowKind,
-            watermark,
-            watermark,
-          ]),
+          ...watermarkBindings.runUpdate,
         ],
       },
     ]);
@@ -921,6 +984,9 @@ export class D1FleetOperationStore implements FleetOperationStore {
     // the operation row and head are the only authority.
     const persisted = await this.readOperationById(operationId);
     if (!persisted) throw unknownOperation(operationId);
+    if (persisted.kind !== kind) {
+      throw new Error(fleetOperationOtherKindMessage(operationId));
+    }
     if (
       persisted.state !== 'finalized' ||
       persisted.progress.revision !== runRecord.progress.revision
@@ -968,11 +1034,11 @@ export class D1FleetOperationStore implements FleetOperationStore {
   ): Promise<void> {
     const { operationId, expectedRevision } = input;
     const runRecord = fleetOperationRunRecordFromUnknown(input.runRecord);
-    // The run update binds 8 + 5n parameters; D1 caps a statement at 100.
-    if ((input.updateRows?.length ?? 0) > 18) {
-      throw new Error(
-        'failOperation exceeds the operation update budget of 18 rows',
-      );
+    // The sanctioned caller fails exactly the active item, and at n = 1 the
+    // item update and the run update are atomic by construction: the run
+    // update's byte-exact EXISTS conjunct is true only if that one row landed.
+    if ((input.updateRows?.length ?? 0) > 1) {
+      throw new Error('failOperation accepts at most one updateRow');
     }
     const updateRows = (input.updateRows ?? []).map((row) =>
       stagedRowForKindFromUnknown(kind, row),
@@ -1080,8 +1146,12 @@ export class D1FleetOperationStore implements FleetOperationStore {
       },
     ]);
     const persisted = await this.readOperationById(operationId);
+    if (!persisted) throw unknownOperation(operationId);
+    if (persisted.kind !== kind) {
+      throw new Error(fleetOperationOtherKindMessage(operationId));
+    }
     if (
-      persisted?.state !== 'failed' ||
+      persisted.state !== 'failed' ||
       persisted.progress.revision !== runRecord.progress.revision
     ) {
       throw operationConflict(operationId);
@@ -1111,13 +1181,19 @@ export class D1FleetOperationStore implements FleetOperationStore {
   > {
     assertLimit(input.limit);
     await this.#ensureSchema();
+    if (!FLEET_OPERATION_ROW_KINDS.includes(input.rowKind)) {
+      throw new Error(
+        `rowKind must be one of ${FLEET_OPERATION_ROW_KINDS.join(', ')}`,
+      );
+    }
     if (
-      !FLEET_OPERATION_ROW_KINDS.includes(input.rowKind) ||
-      (input.afterOrdinal !== undefined &&
-        (!fleetOperationSafeInteger(input.afterOrdinal) ||
-          input.afterOrdinal >= Number.MAX_SAFE_INTEGER))
+      input.afterOrdinal !== undefined &&
+      (!fleetOperationSafeInteger(input.afterOrdinal) ||
+        input.afterOrdinal >= Number.MAX_SAFE_INTEGER)
     ) {
-      throw new FleetOperationStateError();
+      throw new Error(
+        'afterOrdinal must be a non-negative safe integer below Number.MAX_SAFE_INTEGER',
+      );
     }
     const operation = await this.#operationRow(input.operationId);
     if (!operation) throw unknownOperation(input.operationId);
@@ -1200,7 +1276,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
             // inner, and is never acquired in reverse by production callers.
             await inventoryStore.releasePin({
               generation: record.progress.generation,
-              pinnedBy: `fleet-audit:${operationId}`,
+              pinnedBy: fleetAuditPinOwner(operationId),
             });
             releasedPins += 1;
           }

@@ -274,12 +274,25 @@ describe('fleet operation state', () => {
   });
 
   it('record/token byte bounds fail closed', () => {
+    // The token bound cannot be discriminated by any black-box input: a token
+    // that passes the exact-key, version, UUIDv4 and safe-integer checks is
+    // about ninety bytes, so every oversized input trips one of those checks
+    // and raises the same error whether the bound is present or not.
+    expect(() =>
+      parseFleetOperationToken({
+        version: 1,
+        operationId:
+          OPERATION_ID + 'x'.repeat(FLEET_OPERATION_TOKEN_BYTE_BOUND),
+        revision: 0,
+      }),
+    ).toThrow(FleetOperationTokenError);
+    // A tiny forbidden value, so the exact-key check is what refuses it.
     expect(() =>
       parseFleetOperationToken({
         version: 1,
         operationId: OPERATION_ID,
         revision: 0,
-        padding: 'x'.repeat(FLEET_OPERATION_TOKEN_BYTE_BOUND),
+        padding: 'x',
       }),
     ).toThrow(FleetOperationTokenError);
     const padding = Object.fromEntries(
@@ -477,7 +490,7 @@ describe('fleet operation state', () => {
       OPERATION_ID.replace('-4', '-3'),
     ]) {
       expect(() => assertFleetOperationId(value)).toThrow(
-        FleetOperationStateError,
+        'operationId must be a lowercase UUIDv4',
       );
     }
   });

@@ -40,6 +40,7 @@ import {
   type FleetAuditProgress,
   type FleetAuditStage,
   fleetAuditFactRowFromUnknown,
+  fleetAuditPinOwner,
   fleetAuditProgressFromUnknown,
   fleetAuditStageOrdinal,
   nextAuditStage,
@@ -271,10 +272,6 @@ function resultFromRun(run: FleetOperationRunRecord): FleetAuditAdvanceResult {
     };
   }
   return { status: 'pending', token, stage: progress.stage };
-}
-
-function pinnedBy(operationId: string): string {
-  return `fleet-audit:${operationId}`;
 }
 
 /**
@@ -609,7 +606,7 @@ async function failAudit(
   });
   await options.inventoryStore.releasePin({
     generation: progress.generation,
-    pinnedBy: pinnedBy(run.operationId),
+    pinnedBy: fleetAuditPinOwner(run.operationId),
   });
   return resultFromRun({
     ...run,
@@ -1106,7 +1103,7 @@ async function startAudit(
       try {
         await options.inventoryStore.pinGeneration({
           generation: pinGenerationValue,
-          pinnedBy: pinnedBy(operationId),
+          pinnedBy: fleetAuditPinOwner(operationId),
         });
       } catch {
         return failAudit(options, lease, record, recordProgress, {
@@ -1371,7 +1368,7 @@ export async function abandonFleetAuditOperation(
       });
       await inventoryStore.releasePin({
         generation: progress.generation,
-        pinnedBy: pinnedBy(operationId),
+        pinnedBy: fleetAuditPinOwner(operationId),
       });
       return;
     }
@@ -1386,7 +1383,7 @@ export async function abandonFleetAuditOperation(
     const progress = fleetAuditProgressFromUnknown(persisted.progress);
     await inventoryStore.releasePin({
       generation: progress.generation,
-      pinnedBy: pinnedBy(operationId),
+      pinnedBy: fleetAuditPinOwner(operationId),
     });
   });
 }

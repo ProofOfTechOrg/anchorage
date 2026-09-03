@@ -377,3 +377,12 @@ export function fleetAuditFactRowFromUnknown(
 export function withheldAuditDetail(kind: FleetAuditFindingKind): string {
   return `finding detail withheld: unsafe bytes (kind '${kind}')`;
 }
+
+/**
+ * The pin-owner string an audit operation records on the inventory generation
+ * it pins; the coordinator and the store's prune path must agree on it byte
+ * for byte.
+ */
+export function fleetAuditPinOwner(operationId: string): string {
+  return `fleet-audit:${operationId}`;
+}

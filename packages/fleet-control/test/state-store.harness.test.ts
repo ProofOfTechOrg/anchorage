@@ -1561,6 +1561,28 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
     expect(result.noSecondAdvance).toBe(true);
   });
 
+  it('commitProgress watermark conjuncts against real D1 (an unsatisfiable claim lands no row and does not advance the revision; a dense prefix commits)', async () => {
+    await expect(
+      probe<{
+        refused: ProbeError;
+        revisionAfterRefusal: number;
+        findingsAfterRefusal: number;
+        acceptedRevision: number;
+        rowOrdinals: number[];
+      }>('operation-commit-watermark'),
+    ).resolves.toEqual({
+      refused: {
+        name: 'Error',
+        message:
+          "fleet operation '123e4567-e89b-42d3-a456-426614174305' is no longer at the expected revision",
+      },
+      revisionAfterRefusal: 0,
+      findingsAfterRefusal: 0,
+      acceptedRevision: 1,
+      rowOrdinals: [0, 1, 2],
+    });
+  });
+
   it('finalize convergence', async () => {
     await expect(
       probe<{

@@ -181,10 +181,10 @@ export class FleetOperationStoreCapabilityError extends Error {
 }
 
 /**
- * The fixed refusal message the audit coordinator raises when a persisted
- * operation carries the other operation kind. It lives here so that
- * coordinator's sites and R4-C.2's migration coordinator emit byte-identical
- * text; `D1FleetOperationStore` still carries its own copy of the literal.
+ * The fixed refusal message raised when a persisted operation carries the
+ * other operation kind. It lives here so that the audit coordinator's sites,
+ * `D1FleetOperationStore`'s start probe and its two terminal probes, and
+ * R4-C.2's migration coordinator all emit byte-identical text.
  */
 export function fleetOperationOtherKindMessage(operationId: string): string {
   return `fleet operation '${operationId}' belongs to the other operation kind`;
@@ -319,8 +319,14 @@ export interface FleetOperationLease {
    * check rather than a total count — so a partially applied batch is refused
    * while a retry that already staged rows at higher ordinals still commits;
    * a later call's higher watermark, or `finalizeOperation`'s totals, close
-   * those surplus ordinals out. Returns the persisted record, which is the
-   * only authoritative post-commit state.
+   * those surplus ordinals out.
+   *
+   * WRITER OBLIGATION: the `rows` this call inserts below a claimed watermark
+   * must be exactly the contiguous run ending at it; a batch that breaks it is
+   * refused before any statement runs.
+   *
+   * Returns the persisted record, which is the only authoritative post-commit
+   * state.
    */
   commitProgress(
     input: Readonly<{
@@ -356,8 +362,13 @@ export interface FleetOperationLease {
   ): Promise<FleetOperationRunRecord>;
   /**
    * The same CAS, moving the operation to FAILED. Staged rows are kept so a
-   * failed operation stays readable; `updateRows` replaces individual `item`
-   * row payloads in the same transaction.
+   * failed operation stays readable; `updateRows` replaces one `item` row's
+   * payload in the same transaction.
+   *
+   * WRITER OBLIGATION: at most one `updateRow`, the item the failure names.
+   * `D1FleetOperationStore` refuses more with `failOperation accepts at most
+   * one updateRow`: the run update's byte-exact `EXISTS` conjunct makes the
+   * item update and the run update stand or fall together only at n = 1.
    */
   failOperation(
     input: Readonly<{
@@ -663,7 +674,7 @@ export function parseFleetOperationToken(value: unknown): FleetOperationToken {
 /** Validates caller-chosen operation identity before any store mutation. */
 export function assertFleetOperationId(value: unknown): void {
   if (typeof value !== 'string' || !UUID_V4.test(value)) {
-    throw new FleetOperationStateError();
+    throw new Error('operationId must be a lowercase UUIDv4');
   }
 }
 

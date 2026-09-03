@@ -988,6 +988,48 @@ class FakeOperationStore implements FleetOperationStore {
       current.state === 'running' &&
       current.progress.revision === expectedRevision;
     if (matches) {
+      // D1 binds every claimed watermark into the same guarded batch, so a
+      // claim the post-insert row set cannot satisfy refuses the whole commit
+      // before anything persists. Evaluated BEFORE the mutations below, and on
+      // the matching branch as well as the convergence one: otherwise the
+      // coordinator's watermark claims run against no enforcing implementation
+      // on the path its titles actually take. Both obligations the port states
+      // are checked here before this branch mutates anything: the watermark
+      // count over the persisted ordinals plus this batch's own, and the
+      // contiguous-run precondition on the batch's inserts below the
+      // watermark, which `commitWatermarkBindings` refuses before any SQL.
+      for (const [rowKind, watermark] of Object.entries(
+        expectedRowWatermarks,
+      )) {
+        const below = rows.filter(
+          (row) =>
+            row.rowKind === rowKind && row.ordinal < (watermark as number),
+        );
+        const prefix = (watermark as number) - below.length;
+        if (below.some((row) => row.ordinal < prefix)) {
+          throw new Error(
+            `commitProgress ${rowKind} rows below the watermark must be the contiguous run ending at it`,
+          );
+        }
+        const key = this.#rowsKey(
+          operationId,
+          rowKind as FleetOperationRowKind,
+        );
+        const ordinals = new Set(
+          (this.rows.get(key) ?? []).map((existing) => existing.ordinal),
+        );
+        for (const row of rows) {
+          if (row.rowKind === rowKind) ordinals.add(row.ordinal);
+        }
+        const count = [...ordinals].filter(
+          (ordinal) => ordinal < (watermark as number),
+        ).length;
+        if (count !== watermark) {
+          throw new Error(
+            `fleet operation '${operationId}' is no longer at the expected revision`,
+          );
+        }
+      }
       for (const row of rows) {
         const key = this.#rowsKey(operationId, row.rowKind);
         const list = this.rows.get(key) ?? [];
@@ -2084,7 +2126,7 @@ describe('advanceFleetAudit', () => {
           staleAfterMs: STALE_AFTER_MS,
         }),
       ),
-    ).rejects.toThrow('fleet operation state is malformed');
+    ).rejects.toThrow('operationId must be a lowercase UUIDv4');
   });
 
   it('the per-record chunk performs exactly one inspect + at most one re-arm (instrumented)', async () => {
@@ -4876,5 +4918,83 @@ describe('advanceFleetAudit', () => {
       // `corrupted` could never falsify.
       expect(afterRefusal?.state).toBe('running');
     }
+  });
+
+  it('the per-record stage visits every staged record exactly once, in staged ordinal order, including a record that emits no finding', async () => {
+    const bob = baseRecord('bob');
+    const carol = baseRecord('carol');
+    const alice = baseRecord('alice');
+    const records = [bob, carol, alice];
+    const harness = buildHarness(records, inventoryFor(records));
+    // `carol` is the finding-free record: the same clean fixture as the
+    // other two, differing only in maintenance duties fresh against the
+    // harness's UNFROZEN audit clock, which is what leaves the other two
+    // stale. Staged in the MIDDLE, so a stage that visited only the
+    // emitting records would break the order read back below.
+    const liveNow = Date.now();
+    harness.liveByTenant.set(
+      carol.tenantTag,
+      cleanLiveDeployment(carol, {
+        maintenance: {
+          ...HEALTHY_MAINTENANCE,
+          nextAlarmAt: liveNow + 60_000,
+          lastSweepAt: liveNow,
+          lastPurgeAt: liveNow,
+        },
+      }),
+    );
+    const operationId = uuidFor(94);
+    const visited: string[] = [];
+    // `driveToTerminal` and `startAndDrive` call `baseOptions` themselves on
+    // every iteration, so the instrumentation has to sit on the harness rather
+    // than on one options object.
+    const instrumented: Harness = {
+      ...harness,
+      baseOptions: (action) => {
+        const options = harness.baseOptions(action);
+        return {
+          ...options,
+          specFor: (record) => {
+            visited.push(record.tenantTag);
+            return options.specFor(record);
+          },
+        };
+      },
+    };
+
+    const result = await startAndDrive(instrumented, operationId, records);
+    expect(result.status).toBe('complete');
+    const stagedTags = (
+      harness.operationStore.rows.get(`${operationId}:record`) ?? []
+    )
+      .slice()
+      .sort((left, right) => left.ordinal - right.ordinal)
+      .map((row) => row.payload.tenantTag);
+    expect(stagedTags).toEqual(['bob', 'carol', 'alice']);
+    expect(visited).toEqual(stagedTags);
+    for (const tag of stagedTags) {
+      expect(visited.filter((seen) => seen === tag)).toHaveLength(1);
+    }
+    const page = await readFleetAuditFindingsPage(harness.operationStore, {
+      operationId,
+      limit: 10,
+    });
+    expect(page.done).toBe(true);
+    // The added conjunct, asserted first so it is the one that names the
+    // record when it breaks: the middle record the stage visited emitted
+    // nothing.
+    expect(
+      page.findings.filter((finding) => finding.tenantTag === carol.tenantTag),
+    ).toEqual([]);
+    // `bob` and `alice` still emit one `maintenance-stale` finding each
+    // under this harness's unfrozen maintenance clock, so the page carries
+    // exactly one finding for each of them, in the order the stage visited
+    // them.
+    expect(
+      page.findings.map((finding) => [finding.tenantTag, finding.kind]),
+    ).toEqual([
+      ['bob', 'maintenance-stale'],
+      ['alice', 'maintenance-stale'],
+    ]);
   });
 });
