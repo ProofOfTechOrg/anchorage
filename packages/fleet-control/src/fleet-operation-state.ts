@@ -5,8 +5,8 @@ import { cloneBoundedPlainData } from './strict-plain-data.js';
 
 /**
  * Envelope bound for one operation RUN RECORD — the `{version, operationId,
- * kind, state, progress, updatedAt}` document `fleetOperationRunRecordFromUnknown`
- * parses. Not a staged-row bound.
+ * kind, state, progress, updatedAt, terminalAtMs?}` document
+ * `fleetOperationRunRecordFromUnknown` parses. Not a staged-row bound.
  */
 export const FLEET_OPERATION_RECORD_BYTE_BOUND = 96 * 1024;
 export const FLEET_OPERATION_TOKEN_BYTE_BOUND = 1024;
@@ -36,8 +36,8 @@ export const FLEET_OPERATION_INTAKE_BYTE_BOUND = 16 * 1024 * 1024;
 /** Statements per D1 batch used by the staging protocol. */
 export const FLEET_OPERATION_STAGE_BATCH_STATEMENTS = 100;
 /**
- * Aggregate cap on the non-`record` staged rows one operation may read back:
- * at most 99 rows per record times 10,000 records. The 99 is the per-record
+ * Per-kind cap on the non-`record` staged rows one read may return: at most
+ * 99 rows per record times 10,000 records. The 99 is the per-record
  * batch ceiling the audit coordinator enforces over the `finding` and `fact`
  * rows one record emits together, the remaining statement of the batch being
  * the run record's own update. It derives no bound for a global stage's
@@ -47,9 +47,9 @@ export const FLEET_OPERATION_STAGE_BATCH_STATEMENTS = 100;
 export const FLEET_OPERATION_ROW_READ_BOUND =
   (FLEET_OPERATION_STAGE_BATCH_STATEMENTS - 1) * FLEET_OPERATION_ITEM_BOUND;
 /**
- * Rows requested per `readOperationRowsPage` call. The guide's documented
- * O(records²/1,000) per-call re-page term is this divisor, so changing it
- * changes that published cost figure.
+ * Rows requested per page by `readAllFleetOperationRows`. The guide's
+ * documented aggregate O(records²/1,000) re-page term is this divisor, so
+ * changing it changes that published cost figure.
  */
 const FLEET_OPERATION_ROW_PAGE_LIMIT = 1_000;
 /** Frozen plan length cap (fixed steps plus pending D1 versions). */
@@ -181,9 +181,10 @@ export class FleetOperationStoreCapabilityError extends Error {
 }
 
 /**
- * The fixed refusal message every coordinator raises when a persisted
- * operation carries the other operation kind. It lives here so the audit and
- * migration coordinators emit byte-identical text.
+ * The fixed refusal message the audit coordinator raises when a persisted
+ * operation carries the other operation kind. It lives here so that
+ * coordinator's sites and R4-C.2's migration coordinator emit byte-identical
+ * text; `D1FleetOperationStore` still carries its own copy of the literal.
  */
 export function fleetOperationOtherKindMessage(operationId: string): string {
   return `fleet operation '${operationId}' belongs to the other operation kind`;
@@ -215,7 +216,15 @@ export interface FleetOperationStore {
    * beginning. `done` means no matching rows remain beyond this page. Callers
    * do not rely on the ordering of rows within a page. A page contains the
    * smallest qualifying ordinals; omitting a row whose ordinal is below one
-   * the page returns is non-conforming.
+   * the page returns is non-conforming. An implementation must accept any
+   * `limit` from 1 through 1,000, and refuses one outside the range it
+   * supports rather than clamping it, so an out-of-range `limit` fails closed
+   * at the store. The upper end is a hard requirement, not a preference:
+   * `readAllFleetOperationRows` passes this module's
+   * `FLEET_OPERATION_ROW_PAGE_LIMIT` — 1,000, and unexported, so the bound is
+   * restated here as a literal — as the `limit` on every page it requests,
+   * with no negotiation, so a store supporting a narrower range throws on
+   * every whole-set row read.
    */
   readOperationRowsPage(
     input: Readonly<{
@@ -276,7 +285,11 @@ export interface FleetOperationLease {
       record: FleetOperationRunRecord;
     }>
   >;
-  /** The lease-scoped read of one run record; `undefined` when none exists. */
+  /**
+   * The read available while holding the lease; `undefined` when no such
+   * operation exists. Implementations may serve it from the same unleased row
+   * read as `readOperationById`.
+   */
   readOperation(
     operationId: string,
   ): Promise<FleetOperationRunRecord | undefined>;
@@ -304,10 +317,10 @@ export interface FleetOperationLease {
    * the same transaction. For each named kind `expectedRowWatermarks` asserts
    * that the first N ordinals are all present after the write — a dense-prefix
    * check rather than a total count — so a partially applied batch is refused
-   * while a retry that already staged byte-identical rows at higher ordinals
-   * still commits; `finalizeOperation`'s totals close those surplus ordinals
-   * out. Returns the persisted record, which is the only authoritative
-   * post-commit state.
+   * while a retry that already staged rows at higher ordinals still commits;
+   * a later call's higher watermark, or `finalizeOperation`'s totals, close
+   * those surplus ordinals out. Returns the persisted record, which is the
+   * only authoritative post-commit state.
    */
   commitProgress(
     input: Readonly<{
@@ -450,6 +463,10 @@ function fleetOperationBoundedPlain(value: unknown, maxBytes: number): unknown {
     ) {
       return malformed();
     }
+    // The spread is bounded: `cloneBoundedPlainData` admits no array longer
+    // than `FLEET_OPERATION_NODE_BOUND`, so it stays far below the engine's
+    // argument limit and cannot raise the `RangeError` that would escape this
+    // walk unconverted.
     if (Array.isArray(current)) pending.push(...current);
     else if (current && typeof current === 'object') {
       for (const [key, entry] of Object.entries(current)) {
@@ -782,9 +799,8 @@ export function isDurableAuditDetailSafe(value: unknown): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Store-facing helpers. These sit below the pure codec primitives because
-// they reach the operation store, and the section above must stay free of
-// store IO.
+// Store-facing helpers. These sit below the pure codec primitives, and the
+// section above must stay free of store IO.
 // ---------------------------------------------------------------------------
 
 /**

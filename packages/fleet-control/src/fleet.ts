@@ -54,6 +54,7 @@ import type {
   LiveDeployment,
   MaintenanceHealth,
   ProvisioningBackend,
+  ProvisioningPhase,
 } from './types.js';
 import {
   assertNoActiveCleanup,
@@ -1051,25 +1052,35 @@ export function auditNamespaceExpectationsStage(
 }
 
 /** Lifecycle phases whose records no longer expect their R2 buckets. */
-const R2_EXPECTATION_EXCLUDED_PHASES: readonly string[] = Object.freeze([
+const R2_EXPECTATION_EXCLUDED_PHASES = Object.freeze([
   'application-resources-deleted',
   'database-exported',
   'database-deleting',
   'decommissioned',
-]);
+] as const satisfies readonly ProvisioningPhase[]);
 
 export function auditR2ExpectedStage(
   input: Readonly<{
     records: readonly FleetRecord[];
-    /** Pre-seeded by the caller (empty for the drain's one full-array call; the
-     *  §6.1 prefix rebuild for a bounded chunk); mutated in place. */
+    /**
+     * An INPUT the stage reads and also mutates: the caller supplies the
+     * claims already made (empty for the drain's one full-array call, the
+     * §6.1 prefix rebuild for a bounded chunk), and the stage adds this
+     * slice's claims to it as it walks. Reading it is load-bearing — a bucket
+     * already in the map is what makes an `r2-bucket-drift` collision visible
+     * across a chunk boundary. The drain reads the finished map back for its
+     * `r2-orphans` and `r2-missing-identity` stages; the bounded path rebuilds
+     * it with `fleetAuditExpectedBucketsSeed` instead.
+     */
     expectedBuckets: Map<string, FleetAuditExpectedBucketEntry>;
   }>,
 ): readonly DriftFinding[] {
   const findings: DriftFinding[] = [];
   for (const record of input.records) {
     const phase = effectiveLifecyclePhase(record);
-    if (R2_EXPECTATION_EXCLUDED_PHASES.includes(phase)) continue;
+    if (R2_EXPECTATION_EXCLUDED_PHASES.some((excluded) => excluded === phase)) {
+      continue;
+    }
     for (const resource of record.applicationResources ?? []) {
       if (resource.state !== 'created' || !resource.creationDate) continue;
       const prior = input.expectedBuckets.get(resource.bucketName);
@@ -1876,11 +1887,13 @@ export async function auditFleetDrift(options: {
   );
   const databases = new Map<string, FleetRecord>();
   const liveNamespaceOwners = new Map<string, FleetRecord>();
-  // A third full walk over every namespace claim, after the
-  // `namespace-expectations` stage above already visited each one. The walker
-  // made the collision rule single-sourced but not its execution; having the
-  // stage report its collisions instead would remove this pass. Recorded
-  // rather than changed: the drain is not the bounded path's hot loop.
+  // A third full walk over every namespace claim:
+  // `fleetAuditExpectedNamespaceIds` collected the claimed ids for
+  // `namespace-orphans` above, and the `namespace-expectations` stage then
+  // visited each claim again. The walker made the collision rule
+  // single-sourced but not its execution; having the stage report its
+  // collisions instead would remove this pass. Recorded rather than changed:
+  // the drain is not the bounded path's hot loop.
   const duplicateNamespaceIds = new Set(
     fleetAuditRecordsDerivedDuplicateNamespaceIds(auditedRecords),
   );

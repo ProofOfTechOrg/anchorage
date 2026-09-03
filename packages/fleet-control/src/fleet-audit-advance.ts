@@ -86,6 +86,9 @@ const MIN_MAX_ITEMS_PER_CALL = 1;
 const MAX_MAX_ITEMS_PER_CALL = 2_000;
 /** Fixed refusal shared by the coordinator's own count check and the intake's. */
 const RECORD_COUNT_MESSAGE = `fleet audit start accepts at most ${FLEET_OPERATION_ITEM_BOUND} records`;
+/** Fixed refusal shared by the coordinator's own shape check and the intake's. */
+const RECORD_STRUCTURE_MESSAGE =
+  'fleet audit record exceeds the intake structure bounds';
 
 /** One bounded audit step: begin an operation, or continue a persisted one. */
 export type FleetAuditAdvanceAction =
@@ -155,9 +158,10 @@ export type FleetAuditAdvanceResult =
     }>
   /**
    * The operation is FAILED, and the failing call released its generation pin.
-   * A pin that outlived a crash between the terminal commit and that release is
-   * cleared by `abandonFleetAuditOperation()`. `failure` carries the durable
-   * reason; failed operations are still readable.
+   * A pin that survives the terminal commit — because the process crashed
+   * before the release, or because the release itself failed — is cleared by
+   * `abandonFleetAuditOperation()`. `failure` carries the durable reason;
+   * failed operations are still readable.
    */
   | Readonly<{
       status: 'failed';
@@ -275,6 +279,10 @@ function pinnedBy(operationId: string): string {
  * The `pending` result for a run record the store has just committed. Every
  * chunk that leaves the operation RUNNING reports the persisted stage read
  * back through the codec, never the stage it computed.
+ *
+ * Kept beside `resultFromRun`'s running arm rather than folded into it on
+ * purpose: each of the four call sites has just committed a RUNNING record,
+ * and reporting only `pending` is the narrowing that states so.
  */
 function pendingFromCommitted(
   committed: FleetOperationRunRecord,
@@ -327,8 +335,8 @@ function findingRowWithGatedDetail(
 }
 
 /**
- * Stages one durable row, overloading two distinct signals on one return so
- * every call site can treat them uniformly:
+ * Stages one durable row, reporting two distinct refusals by two distinct
+ * routes:
  *
  * - `undefined` means the payload exceeds the staged-row envelope. That is a
  *   caller-visible emission bound, so the site fails the operation durably
@@ -336,8 +344,9 @@ function findingRowWithGatedDetail(
  * - a thrown `FleetOperationStateError` means the payload does not satisfy
  *   the row codec at all, which is durable corruption and propagates.
  *
- * No site needs to tell the two apart, which is why a discriminated result
- * would buy nothing here.
+ * No site needs to branch on the difference — only the envelope refusal
+ * arrives as a value — which is why a discriminated result would buy nothing
+ * here.
  */
 function stagedAuditRow(
   rowKind: 'finding' | 'fact',
@@ -381,7 +390,7 @@ interface GlobalStageContext {
   readonly inventory: FleetResourceInventory;
   readonly auditedRecords: readonly FleetRecord[];
   readonly known: FleetAuditKnownSets;
-  readonly recordsByScript: ReturnType<typeof fleetAuditRecordsByScript>;
+  readonly recordsByScript: ReadonlyMap<string, readonly FleetRecord[]>;
 }
 
 /** The one accessor for the optional R2 inventory slice. */
@@ -398,6 +407,9 @@ function chunked<T>(
   emit: (slice: readonly T[], ordinal: number) => readonly DriftFinding[],
 ): GlobalStageChunk {
   const ordinal = fleetAuditStageOrdinal(stage);
+  // Unreachable: `finalize` is the only cursor-less step, and
+  // `GlobalAuditStage` excludes it. The arm stays because the accessor is
+  // typed over the whole stage union and so returns `number | undefined`.
   if (ordinal === undefined) return malformed();
   // A global stage never persists a cursor at the end of its own source, so
   // the only admissible cursor for an empty source is zero.
@@ -541,15 +553,6 @@ const GLOBAL_STAGE_DESCRIPTORS = Object.freeze({
   ),
 } satisfies Readonly<Record<GlobalAuditStep, GlobalStageDescriptor>>);
 
-/** Advances one bounded chunk of the current global stage. */
-function advanceGlobalStage(
-  stage: GlobalAuditStage,
-  maxItemsPerCall: number,
-  context: GlobalStageContext,
-): GlobalStageChunk {
-  return GLOBAL_STAGE_DESCRIPTORS[stage.step](stage, maxItemsPerCall, context);
-}
-
 function buildInitialAuditRunRecord(
   input: Readonly<{
     operationId: string;
@@ -692,7 +695,8 @@ async function advancePerRecordChunk(
   records: readonly FleetRecord[],
   auditedRecords: readonly FleetRecord[],
 ): Promise<FleetAuditAdvanceResult> {
-  const record = records[stage.recordOrdinal] as FleetRecord;
+  const record = records[stage.recordOrdinal];
+  if (record === undefined) return malformed();
   const recordsByScript = fleetAuditRecordsByScript(auditedRecords);
   const liveByScript = fleetAuditLiveByScript(inventory.deployments);
   const liveRoutesByHostname = fleetAuditLiveRoutesByHostname(inventory.routes);
@@ -755,7 +759,7 @@ async function advancePerRecordChunk(
     store: options.fleetStore,
     staleAfterMs: progress.staleAfterMs,
     auditNow: progress.auditTimeMs,
-    authorityNowProvider: options.authorityClock ?? Date.now,
+    authorityNowProvider: () => (options.authorityClock ?? Date.now)(),
   });
 
   // The three fact kinds differ only in their source collection and payload
@@ -877,7 +881,7 @@ async function advanceOneChunk(
       // source length and spends a whole extra stage-running call — a full
       // generation re-read and a record-row re-page included — on the pure
       // transition to `finalize`. That is deliberate: the call is the leading 1
-      // in the documented per-call cost formula.
+      // in the documented aggregate stage-running-call count.
       const newProgress: FleetAuditProgress = {
         ...progress,
         revision: progress.revision + 1,
@@ -894,28 +898,28 @@ async function advanceOneChunk(
       });
       return pendingFromCommitted(committed);
     }
-  }
-  const auditedRecords = fleetAuditAuditedRecords(records);
-
-  if (progress.stage.step === 'per-record') {
     return advancePerRecordChunk(
       options,
       lease,
       run,
       progress,
-      progress.stage,
+      perRecordStage,
       inventory,
       records,
-      auditedRecords,
+      fleetAuditAuditedRecords(records),
     );
   }
-
-  const chunk = advanceGlobalStage(progress.stage, maxItemsPerCall, {
-    inventory,
-    auditedRecords,
-    known: fleetAuditKnownSets(records),
-    recordsByScript: fleetAuditRecordsByScript(auditedRecords),
-  });
+  const auditedRecords = fleetAuditAuditedRecords(records);
+  const chunk = GLOBAL_STAGE_DESCRIPTORS[progress.stage.step](
+    progress.stage,
+    maxItemsPerCall,
+    {
+      inventory,
+      auditedRecords,
+      known: fleetAuditKnownSets(records),
+      recordsByScript: fleetAuditRecordsByScript(auditedRecords),
+    },
+  );
   const findingRows: FleetOperationStagedRow[] = [];
   for (const [index, finding] of chunk.findings.entries()) {
     const row = stagedAuditRow(
@@ -980,7 +984,7 @@ async function startAudit(
   if (
     inputRecords.some((record) => record === null || typeof record !== 'object')
   ) {
-    throw new Error('fleet audit record exceeds the intake structure bounds');
+    throw new Error(RECORD_STRUCTURE_MESSAGE);
   }
   const intake = fleetOperationItemsIntake({
     envelope: {
@@ -998,9 +1002,7 @@ async function startAudit(
         // unreachable here; the helper retains it for other callers.
         throw new Error(RECORD_COUNT_MESSAGE);
       case 'item-structure':
-        throw new Error(
-          'fleet audit record exceeds the intake structure bounds',
-        );
+        throw new Error(RECORD_STRUCTURE_MESSAGE);
       case 'item-bytes':
         throw new Error('fleet audit record exceeds the staged row byte bound');
       case 'aggregate-bytes':
@@ -1019,10 +1021,11 @@ async function startAudit(
   }
   const intakeDigest = intake.digest;
   const records = intake.items;
-  // Narrows `unknown` intake items to `FleetRecord` on `tenantTag` and
-  // `environment` alone, so the array asserts more shape than is checked.
-  // Every entry is staged whole by the `payload` cast below, and fields
-  // beyond those two are re-read only by the `advanceOneChunk` decode.
+  // Narrows `unknown` intake items to `FleetRecord` on object-ness plus
+  // `tenantTag` and `environment` alone, so the array asserts more shape than
+  // is checked. Every entry is staged whole by the `payload` cast below, and
+  // fields beyond those two are re-read only from the staged rows in
+  // `advanceOneChunk`.
   if (
     !records.every((record): record is FleetRecord => {
       if (record === null || typeof record !== 'object') return false;
@@ -1120,6 +1123,14 @@ async function startAudit(
       });
       const committedProgress: FleetAuditProgress = {
         ...recordProgress,
+        // Forced, not spread: the pin was taken at `pinGenerationValue`,
+        // while `recordProgress` carries whatever generation the store
+        // echoed back. Every later `releasePin` reads `progress.generation`
+        // off the persisted record — `failAudit` unguarded, and
+        // `abandonFleetAuditOperation` on both arms — so a store echoing a
+        // different generation on the `created` outcome would otherwise
+        // release a pin that was never taken and leak the real one.
+        generation: pinGenerationValue,
         revision: 1,
       };
       try {
@@ -1219,10 +1230,18 @@ export async function advanceFleetAudit(
  *
  * A caller pages the whole set with
  * `afterOrdinal = (afterOrdinal ?? -1) + findings.length` until `done`. That
- * idiom rests on the assumption `FleetOperationStore.readOperationRowsPage`
- * states as a conformance requirement: finding ordinals are contiguous from
- * zero, and a page holds the smallest qualifying ordinals. This reader
- * checks the assumption instead of trusting it, so a non-conforming store
+ * idiom rests on two assumptions with two different owners. Finding ordinals
+ * are contiguous from zero because the WRITE PATH enforces it, not because
+ * the read port promises it: this coordinator numbers each finding row
+ * `findingCount + index`, and each commit that advances `findingCount`
+ * passes `expectedRowWatermarks.finding` at the new count — which
+ * `FleetOperationLease.commitProgress` defines as a dense-prefix assertion
+ * over the first N ordinals, so it holds whatever order the rows landed in.
+ * Both routes take it: the per-record chunk commits its finding rows inline,
+ * the global stage pre-stages them through `stageRows` and commits the
+ * watermark after. That a page holds the smallest qualifying ordinals IS the
+ * conformance requirement `FleetOperationStore.readOperationRowsPage` states.
+ * This reader checks both instead of trusting them, so a non-conforming store
  * cannot spin the loop forever.
  *
  * Refuses an unknown operation with `FleetOperationTokenOperationError`, an
