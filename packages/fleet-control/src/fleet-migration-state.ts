@@ -121,16 +121,19 @@ export function fleetMigrationItemFromUnknown(
   ) {
     return malformed();
   }
-  const pending = candidate.status === 'pending';
+  const admitted = candidate.targetSpecDigest !== undefined;
   if (
-    pending !== (candidate.targetSpecDigest === undefined) ||
-    pending !== (candidate.plan === undefined) ||
-    pending !== (candidate.planCursor === undefined)
+    (candidate.status === 'pending' && admitted) ||
+    (candidate.status !== 'pending' &&
+      candidate.status !== 'failed' &&
+      !admitted) ||
+    admitted !== (candidate.plan !== undefined) ||
+    admitted !== (candidate.planCursor !== undefined)
   ) {
     return malformed();
   }
   let plan: readonly FleetMigrationPlanEntry[] | undefined;
-  if (!pending) {
+  if (admitted) {
     if (
       !fleetOperationSha256(candidate.targetSpecDigest) ||
       !Array.isArray(candidate.plan) ||
@@ -157,13 +160,13 @@ export function fleetMigrationItemFromUnknown(
       ? {}
       : { canaryRank: candidate.canaryRank }),
     entryRecordDigest: candidate.entryRecordDigest,
-    ...(pending
-      ? {}
-      : {
+    ...(admitted
+      ? {
           targetSpecDigest: candidate.targetSpecDigest as string,
           plan: plan as readonly FleetMigrationPlanEntry[],
           planCursor: candidate.planCursor as number,
-        }),
+        }
+      : {}),
     status: candidate.status,
   };
 }

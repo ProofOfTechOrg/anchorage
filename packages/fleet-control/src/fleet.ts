@@ -13,7 +13,11 @@ import {
   finalizedBridgeForRecord,
   reconcileFinalizedBackendSwitchState,
 } from './backend-switch.js';
-import type { FleetMigrationPlanEntry } from './fleet-migration-state.js';
+import type {
+  FleetMigrationItem,
+  FleetMigrationPlanEntry,
+  FleetMigrationStep,
+} from './fleet-migration-state.js';
 import { FLEET_MIGRATION_PLAN_BOUND } from './fleet-operation-state.js';
 import {
   assertExternalPlatformTarget,
@@ -43,6 +47,7 @@ import type {
   DeploymentSecrets,
   DeploymentSpec,
   ExternalMigrationIntent,
+  ExternalMigrationSubphase,
   ExternalPlatformTargetDescription,
   ExternalReleaseSnapshot,
   ExternalReleaseTopology,
@@ -61,6 +66,7 @@ import type {
 import {
   assertNoActiveCleanup,
   assertNoActiveDecommission,
+  EXTERNAL_MIGRATION_SUBPHASES,
   effectiveLifecyclePhase,
 } from './types.js';
 import {
@@ -2201,11 +2207,13 @@ function platformOnlyChangeOf(
 function assertFleetMigrationNonReadyGuards(
   admitted: AdmittedFleetMigrationContext,
   stored: FleetRecord,
+  frozenPlanKind?: FleetMigrationPlanKind,
 ): void {
   const { spec, immutableExternal, targetRelease, targetPlatform } = admitted;
   const platformOnlyChange = platformOnlyChangeOf(stored, admitted);
   if (
     spec.schemaVersion < stored.schemaVersion &&
+    frozenPlanKind !== 'platform-only' &&
     !platformOnlyChange &&
     stored.migrationIntent?.platformOnly !== true
   ) {
@@ -2310,6 +2318,170 @@ export async function admitFleetMigrationItem(
     assertFleetMigrationNonReadyGuards(admitted, reread);
   }
   return { admitted, plan, reread };
+}
+
+export async function revalidateFleetMigrationAdmission(
+  deps: FleetMigrationDependencies,
+  plan: readonly FleetMigrationPlanEntry[],
+  targetSpecDigest: string,
+  tenantTag: string,
+  environment: string,
+): Promise<
+  | Readonly<{ admitted: AdmittedFleetMigrationContext; reread: FleetRecord }>
+  | Readonly<{ reason: 'target-drift' }>
+> {
+  const result = await runFleetMigrationPreamble(
+    deps,
+    tenantTag,
+    environment,
+    'resumption',
+  );
+  if (result.admitted.targetDigest !== targetSpecDigest) {
+    return { reason: 'target-drift' };
+  }
+  const planKind = fleetMigrationPlanKindOf(plan);
+  if (planKind !== 'ready') {
+    assertFleetMigrationNonReadyGuards(
+      result.admitted,
+      result.reread,
+      planKind,
+    );
+  }
+  return result;
+}
+
+const MIGRATION_STEP_SUBPHASE: Readonly<
+  Partial<Record<FleetMigrationStep, ExternalMigrationSubphase>>
+> = {
+  'admit-migrating': 'planned',
+  'platform-only-schema': 'schema-applied',
+  'platform-only-resources': 'platform-applied',
+  'platform-only-promote': 'route-published',
+  'migration-schema-applied': 'schema-applied',
+  'platform-resources': 'platform-applied',
+  'deploy-candidate': 'candidate-deployed',
+  'arm-maintenance': 'candidate-armed',
+  promote: 'route-published',
+};
+
+function refuseFleetMigrationPlan(): never {
+  throw new Error('fleet migration item no longer matches its frozen plan');
+}
+
+function assertFleetMigrationFloors(
+  admitted: AdmittedFleetMigrationContext,
+  plan: readonly FleetMigrationPlanEntry[],
+  planCursor: number,
+  current: FleetRecord,
+): void {
+  const reachable: ExternalMigrationSubphase[] = ['planned'];
+  let subphaseFloor: ExternalMigrationSubphase | undefined;
+  let schemaFloor = 0;
+  let candidateCompleted = false;
+  for (const [index, { step, targetSchemaVersion }] of plan.entries()) {
+    const subphase = MIGRATION_STEP_SUBPHASE[step];
+    if (subphase && step !== 'admit-migrating') reachable.push(subphase);
+    if (index >= planCursor) continue;
+    if (subphase) subphaseFloor = subphase;
+    if (step === 'apply-migrations') {
+      schemaFloor = Math.max(
+        schemaFloor,
+        targetSchemaVersion ?? admitted.spec.schemaVersion,
+      );
+    }
+    if (step === 'deploy-candidate') candidateCompleted = true;
+  }
+  if (current.schemaVersion < schemaFloor) refuseFleetMigrationPlan();
+  if (admitted.immutableExternal) {
+    let previous = -1;
+    for (const subphase of reachable) {
+      const index = EXTERNAL_MIGRATION_SUBPHASES.indexOf(subphase);
+      if (index <= previous) refuseFleetMigrationPlan();
+      previous = index;
+    }
+    const subphase = current.migrationIntent?.subphase;
+    if (
+      (subphase !== undefined && !reachable.includes(subphase)) ||
+      (subphaseFloor !== undefined &&
+        (subphase === undefined ||
+          reachable.indexOf(subphase) < reachable.indexOf(subphaseFloor)))
+    ) {
+      refuseFleetMigrationPlan();
+    }
+  } else if (
+    candidateCompleted &&
+    current.pendingArtifactVersion === undefined
+  ) {
+    refuseFleetMigrationPlan();
+  }
+}
+
+export async function assertFleetMigrationPlanCompatibility(
+  admitted: AdmittedFleetMigrationContext,
+  item: Required<Pick<FleetMigrationItem, 'plan' | 'planCursor'>>,
+  current: FleetRecord,
+): Promise<void> {
+  const { plan, planCursor } = item;
+  if (
+    !Number.isSafeInteger(planCursor) ||
+    planCursor < 0 ||
+    !plan[planCursor]
+  ) {
+    refuseFleetMigrationPlan();
+  }
+  const planKind = fleetMigrationPlanKindOf(plan);
+  if (planKind === 'ready') {
+    if (
+      current.phase !== 'ready' ||
+      current.desiredSpecDigest !== admitted.targetDigest ||
+      platformOnlyChangeOf(current, admitted) ||
+      (admitted.targetPlatform &&
+        planCursor >
+          plan.findIndex(({ step }) => step === 'ready-target-backfill') &&
+        !current.platformTarget)
+    ) {
+      refuseFleetMigrationPlan();
+    }
+    return;
+  }
+  const terminal = plan.findIndex(
+    ({ step }) =>
+      step ===
+      (planKind === 'platform-only' ? 'platform-only-ready' : 'settle-ready'),
+  );
+  if (terminal < 0) refuseFleetMigrationPlan();
+  if (planCursor >= terminal) {
+    if (isConvergedTerminalCommit(current, admitted, planKind)) return;
+    if (planCursor > terminal) refuseFleetMigrationPlan();
+  }
+  const admission = plan.findIndex(({ step }) => step === 'admit-migrating');
+  if (
+    admission >= 0 &&
+    (planCursor < admission ||
+      (planCursor === admission && current.phase === 'ready'))
+  ) {
+    const platformOnly = platformOnlyChangeOf(current, admitted);
+    if (
+      current.phase !== 'ready' ||
+      (current.desiredSpecDigest === admitted.targetDigest && !platformOnly) ||
+      platformOnly !== (planKind === 'platform-only')
+    ) {
+      refuseFleetMigrationPlan();
+    }
+    return;
+  }
+  if (
+    current.phase !== 'migrating' ||
+    (current.migrationIntent?.platformOnly === true) !==
+      (planKind === 'platform-only')
+  ) {
+    refuseFleetMigrationPlan();
+  }
+  assertFleetMigrationFloors(admitted, plan, planCursor, current);
+  const assertion = plan.findIndex(({ step }) => step === 'assert-migrating');
+  if (assertion >= 0 && planCursor > assertion) {
+    await assertMigratingCarrierState(admitted, current);
+  }
 }
 
 function isPlatformOnlyTerminalProjection(
@@ -3168,7 +3340,8 @@ async function migrationDeployCandidate(
     spec,
     targetDigest,
     current.migrationIntent?.targetRelease.application ??
-      current.pendingRelease?.application,
+      current.pendingRelease?.application ??
+      applicationBindingTopology(spec, current.applicationResources ?? []),
   );
   if (current.pendingRelease) {
     assertExternalReleaseArtifactVersion(
@@ -3276,7 +3449,8 @@ async function migrationPromote(
     spec,
     targetDigest,
     current.migrationIntent?.targetRelease.application ??
-      current.pendingRelease?.application,
+      current.pendingRelease?.application ??
+      applicationBindingTopology(spec, current.applicationResources ?? []),
   );
   if (current.pendingRelease) {
     assertExternalReleaseArtifactVersion(
@@ -3342,7 +3516,8 @@ async function migrationSettleReady(
     spec,
     targetDigest,
     current.migrationIntent?.targetRelease.application ??
-      current.pendingRelease?.application,
+      current.pendingRelease?.application ??
+      applicationBindingTopology(spec, current.applicationResources ?? []),
   );
   if (current.pendingRelease) {
     assertExternalReleaseArtifactVersion(

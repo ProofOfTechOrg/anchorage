@@ -44,6 +44,7 @@ import {
   type FleetOperationRowKind,
   type FleetOperationRunRecord,
   type FleetOperationStagedRow,
+  FleetOperationStateError,
   type FleetOperationStore,
   FleetOperationTokenFutureError,
   FleetOperationTokenKindError,
@@ -974,6 +975,15 @@ class FakeOperationStore implements FleetOperationStore {
     } = input;
     const rows = this.#validatedRows(inputRows);
     const updateRows = this.#validatedRows(inputUpdateRows);
+    const mutationKeys = [...rows, ...updateRows].map(
+      (row) => `${row.rowKind}:${row.ordinal}`,
+    );
+    if (
+      updateRows.some((row) => row.rowKind !== 'item') ||
+      new Set(mutationKeys).size !== mutationKeys.length
+    ) {
+      throw new FleetOperationStateError();
+    }
     if (
       rows.length + updateRows.length + 1 >
       FLEET_OPERATION_STAGE_BATCH_STATEMENTS
@@ -981,6 +991,17 @@ class FakeOperationStore implements FleetOperationStore {
       throw new Error(
         `commitProgress exceeds the operation batch budget of ${FLEET_OPERATION_STAGE_BATCH_STATEMENTS} statements`,
       );
+    }
+    for (const [rowKind, watermark] of Object.entries(expectedRowWatermarks)) {
+      const below = rows.filter(
+        (row) => row.rowKind === rowKind && row.ordinal < (watermark as number),
+      );
+      const prefix = (watermark as number) - below.length;
+      if (below.some((row) => row.ordinal < prefix)) {
+        throw new Error(
+          `commitProgress ${rowKind} rows below the watermark must be the contiguous run ending at it`,
+        );
+      }
     }
     const current = this.operations.get(operationId);
     const matches =
@@ -993,24 +1014,11 @@ class FakeOperationStore implements FleetOperationStore {
       // before anything persists. Evaluated BEFORE the mutations below, and on
       // the matching branch as well as the convergence one: otherwise the
       // coordinator's watermark claims run against no enforcing implementation
-      // on the path its titles actually take. Both obligations the port states
-      // are checked here before this branch mutates anything: the watermark
-      // count over the persisted ordinals plus this batch's own, and the
-      // contiguous-run precondition on the batch's inserts below the
-      // watermark, which `commitWatermarkBindings` refuses before any SQL.
+      // on the path its titles actually take. The input-prefix precondition
+      // above applies to both branches, as it does before the real D1 batch.
       for (const [rowKind, watermark] of Object.entries(
         expectedRowWatermarks,
       )) {
-        const below = rows.filter(
-          (row) =>
-            row.rowKind === rowKind && row.ordinal < (watermark as number),
-        );
-        const prefix = (watermark as number) - below.length;
-        if (below.some((row) => row.ordinal < prefix)) {
-          throw new Error(
-            `commitProgress ${rowKind} rows below the watermark must be the contiguous run ending at it`,
-          );
-        }
         const key = this.#rowsKey(
           operationId,
           rowKind as FleetOperationRowKind,
@@ -1049,18 +1057,8 @@ class FakeOperationStore implements FleetOperationStore {
       this.operations.set(operationId, runRecord);
       return Promise.resolve(runRecord);
     }
-    let complete = true;
-    for (const row of [...rows, ...updateRows]) {
-      const key = this.#rowsKey(operationId, row.rowKind);
-      const list = this.rows.get(key) ?? [];
-      const stored = list.find((existing) => existing.ordinal === row.ordinal);
-      if (!stored) complete = false;
-      else if (JSON.stringify(stored.payload) !== JSON.stringify(row.payload)) {
-        throw new Error(
-          `fleet operation '${operationId}' staged rows diverge from the persisted operation`,
-        );
-      }
-    }
+    const persisted = this.operations.get(operationId);
+    if (!persisted) throw new Error(`no fleet operation '${operationId}'`);
     for (const [rowKind, watermark] of Object.entries(expectedRowWatermarks)) {
       const list =
         this.rows.get(
@@ -1075,18 +1073,32 @@ class FakeOperationStore implements FleetOperationStore {
         );
       }
     }
-    const persisted = this.operations.get(operationId);
     if (
-      complete &&
-      persisted &&
-      persisted.progress.revision === runRecord.progress.revision &&
-      JSON.stringify(persisted) === JSON.stringify(runRecord)
+      persisted.progress.revision !== runRecord.progress.revision ||
+      JSON.stringify(persisted) !== JSON.stringify(runRecord)
     ) {
-      return Promise.resolve(persisted);
+      throw new Error(
+        `fleet operation '${operationId}' is no longer at the expected revision`,
+      );
     }
-    throw new Error(
-      `fleet operation '${operationId}' is no longer at the expected revision`,
-    );
+    let complete = true;
+    for (const row of [...rows, ...updateRows]) {
+      const key = this.#rowsKey(operationId, row.rowKind);
+      const list = this.rows.get(key) ?? [];
+      const stored = list.find((existing) => existing.ordinal === row.ordinal);
+      if (!stored) complete = false;
+      else if (JSON.stringify(stored.payload) !== JSON.stringify(row.payload)) {
+        throw new Error(
+          `fleet operation '${operationId}' staged rows diverge from the persisted operation`,
+        );
+      }
+    }
+    if (!complete) {
+      throw new Error(
+        `fleet operation '${operationId}' is no longer at the expected revision`,
+      );
+    }
+    return Promise.resolve(persisted);
   }
 
   #validatedRows(
@@ -1185,6 +1197,165 @@ class FakeOperationStore implements FleetOperationStore {
     return Promise.resolve();
   }
 }
+
+describe('operation fake guarded progress contract', () => {
+  it('orders convergence identities and enforces both watermark writer obligations', async () => {
+    const operationId = uuidFor(990);
+    const initial = {
+      version: 1,
+      operationId,
+      kind: 'migration',
+      state: 'running',
+      progress: {
+        kind: 'migration',
+        revision: 0,
+        itemCount: 1,
+        activeItemOrdinal: 0,
+        completedItemCount: 0,
+      },
+      updatedAt: '2026-09-05T00:00:00.000Z',
+    } as const;
+    const intended: FleetOperationRunRecord = {
+      ...initial,
+      progress: { ...initial.progress, revision: 1 },
+    };
+    const row: FleetOperationStagedRow = {
+      rowKind: 'item',
+      ordinal: 0,
+      payload: {
+        ordinal: 0,
+        tenantTag: 'fake',
+        environment: 'production',
+        entryRecordDigest: 'a'.repeat(64),
+        status: 'pending',
+      },
+    };
+    const different = {
+      ...row,
+      payload: { ...row.payload, tenantTag: 'other' },
+    };
+    for (const variant of [
+      'missing-operation',
+      'watermark',
+      'other-record',
+      'different-row',
+      'missing-row',
+      'converged',
+    ] as const) {
+      const store = new FakeOperationStore();
+      if (variant !== 'missing-operation') {
+        store.operations.set(
+          operationId,
+          variant === 'other-record'
+            ? { ...intended, state: 'failed' }
+            : intended,
+        );
+      }
+      store.rows.set(
+        `${operationId}:item`,
+        variant === 'missing-row'
+          ? []
+          : [variant === 'converged' ? row : different],
+      );
+      await store.withAccountOperationLease('migration', async (lease) => {
+        const commit = lease.commitProgress({
+          operationId,
+          expectedRevision: 0,
+          runRecord: intended,
+          updateRows: [row],
+          expectedRowWatermarks: {
+            item:
+              variant === 'watermark' ? 2 : variant === 'missing-row' ? 0 : 1,
+          },
+        });
+        if (variant === 'converged') {
+          await expect(commit).resolves.toEqual(intended);
+        } else {
+          const message =
+            variant === 'missing-operation'
+              ? `no fleet operation '${operationId}'`
+              : variant === 'different-row'
+                ? `fleet operation '${operationId}' staged rows diverge from the persisted operation`
+                : `fleet operation '${operationId}' is no longer at the expected revision`;
+          await expect(commit).rejects.toThrow(message);
+        }
+      });
+    }
+    for (const insert of [false, true]) {
+      const store = new FakeOperationStore();
+      store.operations.set(operationId, initial);
+      store.rows.set(`${operationId}:item`, [row]);
+      await store.withAccountOperationLease('migration', async (lease) => {
+        await expect(
+          lease.commitProgress({
+            operationId,
+            expectedRevision: 0,
+            runRecord: intended,
+            ...(insert ? { rows: [different] } : {}),
+            expectedRowWatermarks: { item: 2 },
+          }),
+        ).rejects.toThrow(
+          insert
+            ? 'commitProgress item rows below the watermark must be the contiguous run ending at it'
+            : `fleet operation '${operationId}' is no longer at the expected revision`,
+        );
+      });
+      expect(store.operations.get(operationId)).toEqual(initial);
+      expect(store.rows.get(`${operationId}:item`)).toEqual([row]);
+    }
+    const replay = new FakeOperationStore();
+    const secondRow: FleetOperationStagedRow = {
+      ...row,
+      ordinal: 1,
+      payload: { ...row.payload, ordinal: 1 },
+    };
+    const twoItems = {
+      ...intended,
+      progress: {
+        ...initial.progress,
+        revision: 1,
+        itemCount: 2,
+      },
+    };
+    replay.operations.set(operationId, twoItems);
+    replay.rows.set(`${operationId}:item`, [row, secondRow]);
+    await replay.withAccountOperationLease('migration', async (lease) => {
+      await expect(
+        lease.commitProgress({
+          operationId,
+          expectedRevision: 0,
+          runRecord: twoItems,
+          rows: [row],
+          expectedRowWatermarks: { item: 2 },
+        }),
+      ).rejects.toThrow(
+        'commitProgress item rows below the watermark must be the contiguous run ending at it',
+      );
+    });
+    expect(replay.operations.get(operationId)).toEqual(twoItems);
+    expect(replay.rows.get(`${operationId}:item`)).toEqual([row, secondRow]);
+    for (const mutations of [
+      { rows: [secondRow, secondRow] },
+      { rows: [secondRow], updateRows: [secondRow] },
+      { updateRows: [secondRow, secondRow] },
+      { updateRows: [{ ...row, rowKind: 'record' as const }] },
+    ]) {
+      await replay.withAccountOperationLease('migration', async (lease) => {
+        await expect(
+          lease.commitProgress({
+            operationId,
+            expectedRevision: 0,
+            runRecord: twoItems,
+            expectedRowWatermarks: { item: 2 },
+            ...mutations,
+          }),
+        ).rejects.toBeInstanceOf(FleetOperationStateError);
+      });
+      expect(replay.operations.get(operationId)).toEqual(twoItems);
+      expect(replay.rows.get(`${operationId}:item`)).toEqual([row, secondRow]);
+    }
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Shared drive helpers.

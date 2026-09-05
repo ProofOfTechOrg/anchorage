@@ -220,6 +220,35 @@ describe('fleet operation state', () => {
       expect(fleetMigrationItemFromUnknown(migrationItem(status)).status).toBe(
         status,
       );
+      for (let presence = 0; presence < 8; presence += 1) {
+        const admitted = migrationItem(
+          status === 'complete' ? 'complete' : 'active',
+        );
+        if (!('plan' in admitted))
+          throw new Error('missing admitted fixture fields');
+        const candidate = {
+          ...migrationItem('pending'),
+          status,
+          ...(presence & 1
+            ? { targetSpecDigest: admitted.targetSpecDigest }
+            : {}),
+          ...(presence & 2 ? { plan: admitted.plan } : {}),
+          ...(presence & 4 ? { planCursor: admitted.planCursor } : {}),
+        };
+        const accepted =
+          status === 'pending'
+            ? presence === 0
+            : status === 'failed'
+              ? presence === 0 || presence === 7
+              : presence === 7;
+        if (accepted) {
+          expect(fleetMigrationItemFromUnknown(candidate)).toEqual(candidate);
+        } else {
+          expect(() => fleetMigrationItemFromUnknown(candidate)).toThrow(
+            FleetOperationStateError,
+          );
+        }
+      }
     }
     expect(() =>
       fleetMigrationItemFromUnknown({
