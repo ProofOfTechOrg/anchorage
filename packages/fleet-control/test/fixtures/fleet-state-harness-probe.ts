@@ -3222,6 +3222,30 @@ function operationFinding(ordinal: number): FleetOperationStagedRow {
   };
 }
 
+function operationItem(
+  status: 'pending' | 'active',
+  ordinal: number,
+): FleetOperationStagedRow {
+  return {
+    rowKind: 'item',
+    ordinal,
+    payload: {
+      ordinal,
+      tenantTag: 'tenant',
+      environment: 'production',
+      entryRecordDigest: 'c'.repeat(64),
+      ...(status === 'pending'
+        ? {}
+        : {
+            targetSpecDigest: 'd'.repeat(64),
+            plan: [{ step: 'promote' }],
+            planCursor: 0,
+          }),
+      status,
+    },
+  };
+}
+
 function operationStore(
   database: FleetStateDatabase,
   accountId = OPERATION_ACCOUNT,
@@ -3396,6 +3420,44 @@ async function operationCommitWatermark(db: D1Database): Promise<unknown> {
       findingsAfterRefusal: refusedOrdinals.length,
       acceptedRevision: accepted.progress.revision,
       rowOrdinals: await findingOrdinals(),
+    };
+  });
+}
+
+// The row UPDATE carries the aliased dense-prefix conjunct too, and only a
+// migration `item` row can reach it: the audit-kind probe above cannot take
+// `updateRows` at all. This probe drives the ACCEPTED path of that statement,
+// so the real D1 planner has executed the alias inside an UPDATE and not only
+// inside an INSERT.
+async function operationCommitRowUpdate(db: D1Database): Promise<unknown> {
+  const target = await readyOperationStore(db);
+  const id = operationId(6);
+  return target.withAccountOperationLease('migration', async (lease) => {
+    const created = await operationStart(lease, 'migration', id);
+    await lease.stageRows({
+      operationId: id,
+      expectedRevision: 0,
+      rows: [operationItem('pending', 0)],
+    });
+    // The batch inserts nothing, so `prefix` equals the watermark on both the
+    // UPDATE and the run update, and the staged item 0 already satisfies
+    // COUNT(item, ordinal < 1) = 1: the claim holds by construction, and a
+    // refusal here would be a bug rather than the design.
+    const accepted = await lease.commitProgress({
+      operationId: id,
+      expectedRevision: 0,
+      runRecord: operationAdvanced(created.record),
+      updateRows: [operationItem('active', 0)],
+      expectedRowWatermarks: { item: 1 },
+    });
+    const page = await target.readOperationRowsPage({
+      operationId: id,
+      rowKind: 'item',
+      limit: 10,
+    });
+    return {
+      acceptedRevision: accepted.progress.revision,
+      itemStatus: page.rows[0]?.payload.status,
     };
   });
 }
@@ -3818,6 +3880,8 @@ export default {
           return Response.json(await operationCommitConcurrency(env.DB));
         case 'operation-commit-watermark':
           return Response.json(await operationCommitWatermark(env.DB));
+        case 'operation-commit-row-update':
+          return Response.json(await operationCommitRowUpdate(env.DB));
         case 'operation-finalize-convergence':
           return Response.json(await operationFinalizeConvergence(env.DB));
         case 'operation-rows-readback':

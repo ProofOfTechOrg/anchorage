@@ -840,6 +840,68 @@ export class D1FleetOperationStore implements FleetOperationStore {
     return this.#commitConverged(operationId, runRecord, payloads, watermarks);
   }
 
+  /**
+   * Classifies a `commitProgress` batch whose run update returned no rows,
+   * by re-querying every persisted authority. Every firing point, in the
+   * order it is reached here:
+   *
+   * 1. no operation row at all -> `unknownOperation`. Read FIRST, so a
+   *    PRUNED operation reports its own identity instead of whatever claim
+   *    happens to fail against its deleted rows: prune drops the rows and
+   *    the record in one batch, so every NON-ZERO watermark claim over a
+   *    pruned operation is unsatisfiable (a claim of zero is satisfied by
+   *    no rows at all);
+   * 2. a claimed `expectedRowWatermarks` entry the persisted rows do not
+   *    satisfy -> `operationConflict`: the persisted transition demonstrably
+   *    did not carry this call's precondition;
+   * 3. a persisted run record that is not this call's intended transition ->
+   *    `operationConflict`: a different transition landed (another actor's
+   *    abandonment, another step, a lost race). The revision alone does not
+   *    discriminate that, because abandonment targets the SAME revision a
+   *    stale in-flight commit intends; the run record does;
+   * 4. the intended run record persisted while a TARGET ROW carries other
+   *    bytes -> `operationDivergence`;
+   * 5. the intended run record persisted while a target row is MISSING ->
+   *    `operationConflict` at the `complete` guard: a guard-refused row
+   *    statement returns zero rows without throwing, and `batch()` rolls
+   *    back only on a THROWN statement, so the run update can land while a
+   *    row statement of the same batch does not.
+   *
+   * Reaching none of the five means the transition converged. The call
+   * whose OWN batch landed while its response was lost passes the
+   * run-record equality without replaying anything: `intended` IS the
+   * record that call just persisted, no rebuild involved. It converges
+   * when the persisted target rows are its own, and it halts on
+   * divergence when an earlier landed row at the same ordinal carries
+   * other bytes — the case the paragraph below walks. A replay of that
+   * identical composed object behaves the same way.
+   *
+   * A record recomposed with a fresh `updatedAt` never converges, because
+   * the equality is whole-record: that restamp is the shipped audit
+   * coordinator's convention (`fleet-audit-advance.ts`, at each of its
+   * four `commitProgress` records), and it is what makes a lost race
+   * between two drivers of the same audit transition read a CONFLICT. A
+   * recomposed retry of the SAME transition would read one too, but that
+   * coordinator never composes one: it re-derives the NEXT transition
+   * from the persisted record. A record recomposed DETERMINISTICALLY from
+   * the persisted record is byte-identical instead, so it passes the
+   * equality and converges, and a re-derived retry under that rule
+   * reaches divergence when its rows differ. The restamp is a convention
+   * no type or test enforces — the same file composes the START record's
+   * `updatedAt` deterministically from the audit clock.
+   *
+   * Identities 1-3 running ahead of the row bytes narrowed divergence but
+   * did NOT empty it. It means the persisted run record is exactly this
+   * call's intended transition while a target row carries other bytes,
+   * which out-of-band mutation of the row table reaches, and so does a
+   * sanctioned sequence: a lease expiring mid-batch lands an earlier row
+   * statement while the run update refuses, a later attempt composes other
+   * bytes for that ordinal, and that attempt's own batch lands (`DO NOTHING`
+   * keeps the earlier bytes) with its response lost. It stays a halt because
+   * the persisted rows are then not the persisted transition's rows. This
+   * was never a corruption DETECTOR in any case — it only ever cross-checked
+   * the rows one refused batch happened to target.
+   */
   async #commitConverged(
     operationId: string,
     intended: FleetOperationRunRecord,
@@ -849,6 +911,25 @@ export class D1FleetOperationStore implements FleetOperationStore {
     }>[],
     watermarks: readonly [FleetOperationRowKind, number][],
   ): Promise<FleetOperationRunRecord> {
+    const persisted = await this.readOperationById(operationId);
+    if (!persisted) throw unknownOperation(operationId);
+    for (const [rowKind, watermark] of watermarks) {
+      const stored = await this.#db.query(
+        `SELECT COUNT(*) AS count ${ROWS_BELOW_ORDINAL_SQL}`,
+        [this.#accountId, operationId, rowKind, watermark],
+      );
+      if (rowNumber(stored[0], 'count') !== watermark) {
+        throw operationConflict(operationId);
+      }
+    }
+    // Progress uses plain JSON equality; coordinators must build it in stable
+    // key order so a byte-identical replay can converge.
+    if (
+      persisted.progress.revision !== intended.progress.revision ||
+      JSON.stringify(persisted) !== JSON.stringify(intended)
+    ) {
+      throw operationConflict(operationId);
+    }
     let complete = true;
     for (const { row, bytes } of payloads) {
       const stored = await this.#db.query(
@@ -862,27 +943,8 @@ export class D1FleetOperationStore implements FleetOperationStore {
         throw operationDivergence(operationId);
       }
     }
-    for (const [rowKind, watermark] of watermarks) {
-      const stored = await this.#db.query(
-        `SELECT COUNT(*) AS count ${ROWS_BELOW_ORDINAL_SQL}`,
-        [this.#accountId, operationId, rowKind, watermark],
-      );
-      if (rowNumber(stored[0], 'count') !== watermark) {
-        throw operationConflict(operationId);
-      }
-    }
-    const persisted = await this.readOperationById(operationId);
-    if (!persisted) throw unknownOperation(operationId);
-    // Progress uses plain JSON equality; coordinators must build it in stable
-    // key order so a byte-identical replay can converge.
-    if (
-      complete &&
-      persisted.progress.revision === intended.progress.revision &&
-      JSON.stringify(persisted) === JSON.stringify(intended)
-    ) {
-      return persisted;
-    }
-    throw operationConflict(operationId);
+    if (!complete) throw operationConflict(operationId);
+    return persisted;
   }
 
   async #finalizeOperation(

@@ -942,8 +942,12 @@ describe('D1FleetOperationStore', () => {
     // reaches — title 19's watermark carries no inserts, so its `prefix`
     // equals the watermark and its UPDATE conjunct is indistinguishable from
     // the run update's. Here the UPDATE's own conjunct is the only thing
-    // keeping the new payload out of the table; delete `${rowWatermarkSql}`
-    // from the UPDATE and the row reads 'active' through a refused commit.
+    // keeping the new payload out of the table, and the persisted `pending`
+    // payload asserted after the lease is this leg's SOLE conjunct: delete
+    // `${rowWatermarkSql}` AND its `...watermarkBindings.rowStatement`
+    // bindings from the UPDATE and the row reads 'active' through a refused
+    // commit. Deleting the SQL alone leaves the bindings over-supplied and
+    // the statement raises `column index out of range` instead.
     const legE = new MemoryD1();
     const legETarget = store(legE);
     await legETarget.withAccountOperationLease('migration', async (lease) => {
@@ -963,13 +967,13 @@ describe('D1FleetOperationStore', () => {
           expectedRowWatermarks: { item: 2 },
         }),
       );
-      // The convergence read compares payload bytes BEFORE watermarks, so a
-      // refused row UPDATE reports divergence rather than the conflict; with
-      // the UPDATE's conjunct deleted the bytes match and it reports the
-      // conflict instead.
-      expect(refused.message).toBe(
-        `fleet operation '${OPERATION_ID}' staged rows diverge from the persisted operation`,
-      );
+      // The convergence read re-verifies the claimed watermarks BEFORE it
+      // compares the persisted record, so an unsatisfiable `{item: 2}`
+      // reports the conflict. That message does NOT discriminate the
+      // UPDATE's own conjunct: delete the conjunct and its bindings and the
+      // run update still refuses on its own watermark, and the convergence
+      // read still reports the conflict.
+      expect(refused.message).toBe(conflict);
       expect(legE.batchSizes.slice(batchMark)).toHaveLength(1);
     });
     expect(
@@ -1015,8 +1019,12 @@ describe('D1FleetOperationStore', () => {
         });
       },
     );
+    // The refused commit intends revision 2 against a persisted revision 0,
+    // so the convergence read's run-record comparison classifies it before
+    // it compares the item row's bytes at all: a stale replay is a conflict,
+    // not corruption.
     expect(error?.message).toBe(
-      `fleet operation '${OPERATION_ID}' staged rows diverge from the persisted operation`,
+      `fleet operation '${OPERATION_ID}' is no longer at the expected revision`,
     );
     expect(result.progress.revision).toBe(1);
     const page = await target.readOperationRowsPage({
@@ -1025,6 +1033,123 @@ describe('D1FleetOperationStore', () => {
       limit: 10,
     });
     expect(page.rows[0]?.payload.status).toBe('active');
+  });
+
+  it('a commitProgress losing the revision race to an abandon reports the conflict, not corruption', async () => {
+    const db = new MemoryD1();
+    const target = store(db);
+    const error = await target.withAccountOperationLease(
+      'migration',
+      async (lease) => {
+        const created = await start(lease, 'migration');
+        await lease.stageRows({
+          operationId: OPERATION_ID,
+          expectedRevision: 0,
+          rows: [itemRow('pending', 0)],
+        });
+        // Actor A abandons, composed exactly as `abandonFleetAuditOperation`
+        // composes it: the SAME revision 1 actor B's in-flight transition
+        // below intends, and no `updateRows`, so A writes no row at all.
+        const abandoned: FleetOperationRunRecord = {
+          ...created.record,
+          state: 'failed',
+          progress: {
+            ...created.record.progress,
+            revision: 1,
+            failure: { reason: 'operator-abandoned' },
+          },
+        };
+        await lease.failOperation({
+          operationId: OPERATION_ID,
+          expectedRevision: 0,
+          runRecord: abandoned,
+        });
+        const batchMark = db.batchSizes.length;
+        // B derived its transition before the abandon landed. Its batch is
+        // refused whole, the watermark still holds, and the target revision
+        // MATCHES — only the run record's bytes and the item row's differ.
+        // The run-record comparison is the sole conjunct: run the payload
+        // loop first and this same call reports corruption instead.
+        const refused = await rejection(
+          lease.commitProgress({
+            operationId: OPERATION_ID,
+            expectedRevision: 0,
+            runRecord: advanced(created.record),
+            updateRows: [itemRow('active', 0)],
+            expectedRowWatermarks: { item: 1 },
+          }),
+        );
+        expect(db.batchSizes.slice(batchMark)).toHaveLength(1);
+        return refused;
+      },
+    );
+    expect(error.message).toBe(
+      `fleet operation '${OPERATION_ID}' is no longer at the expected revision`,
+    );
+    // A's transition is the one that stands, and it wrote no row: the staged
+    // `pending` payload is untouched.
+    const persisted = await target.readOperationById(OPERATION_ID);
+    expect(persisted?.state).toBe('failed');
+    expect(persisted?.progress.revision).toBe(1);
+    expect(
+      (
+        await target.readOperationRowsPage({
+          operationId: OPERATION_ID,
+          rowKind: 'item',
+          limit: 10,
+        })
+      ).rows[0]?.payload.status,
+    ).toBe('pending');
+  });
+
+  it('a commitProgress after the operation is pruned reports the unknown operation, not a watermark conflict', async () => {
+    const db = new MemoryD1();
+    const target = store(db);
+    await target.withAccountOperationLease('migration', async (lease) => {
+      const created = await start(lease, 'migration');
+      await lease.stageRows({
+        operationId: OPERATION_ID,
+        expectedRevision: 0,
+        rows: [itemRow('pending', 0)],
+      });
+      // Terminal and head-released, which is what makes it a prune candidate.
+      await lease.failOperation({
+        operationId: OPERATION_ID,
+        expectedRevision: 0,
+        runRecord: advanced(created.record, 'failed'),
+      });
+    });
+    // The shipped prune path, not a hand-rolled delete: one batch drops the
+    // staged rows AND the operation record together.
+    expect(
+      await target.pruneFleetOperations({ kind: 'migration', limit: 10 }),
+    ).toEqual({ deleted: 1, releasedPins: 0 });
+    expect(await target.readOperationById(OPERATION_ID)).toBeUndefined();
+    expect(rowCount(db)).toBe(0);
+    const error = await target.withAccountOperationLease(
+      'migration',
+      async (lease) => {
+        const batchMark = db.batchSizes.length;
+        const refused = await rejection(
+          lease.commitProgress({
+            operationId: OPERATION_ID,
+            expectedRevision: 0,
+            runRecord: runRecord('migration', 1),
+            expectedRowWatermarks: { item: 1 },
+          }),
+        );
+        expect(db.batchSizes.slice(batchMark)).toHaveLength(1);
+        return refused;
+      },
+    );
+    // Sole conjunct: the operation-row read preceding the watermark loop.
+    // Move the read back below that loop and the same call reports the
+    // conflict, because every NON-ZERO watermark claim over a pruned
+    // operation is unsatisfiable. The `{item: 1}` claim above is non-zero
+    // ON PURPOSE: a claim of zero is satisfied by no rows at all, so under
+    // the mutation it would fall through the loop and still report the
+    // unknown operation, and this proof would show nothing.
+    expect(error.message).toBe(`no fleet operation '${OPERATION_ID}'`);
   });
 
   it('the batch-budget refusal fires with its fixed message (rows + updates + 1 > 100)', async () => {

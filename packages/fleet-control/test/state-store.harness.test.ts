@@ -1583,6 +1583,18 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
     });
   });
 
+  it("commitProgress row-UPDATE dense prefix against real D1 (a satisfiable item watermark commits the update the audit probe's kind cannot carry)", async () => {
+    await expect(
+      probe<{
+        acceptedRevision: number;
+        itemStatus: string;
+      }>('operation-commit-row-update'),
+    ).resolves.toEqual({
+      acceptedRevision: 1,
+      itemStatus: 'active',
+    });
+  });
+
   it('finalize convergence', async () => {
     await expect(
       probe<{
