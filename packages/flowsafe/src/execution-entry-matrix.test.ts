@@ -1125,21 +1125,35 @@ const FENCE_ERROR_AUTHORS: ReadonlyArray<{
   {
     file: 'do-runner/execution-fence.ts',
     error: 'ExecutionFenceUnreadableError',
-    anchor: 'function readingFromRow',
+    anchor: 'if (stored.schemaStage > stage)',
     beforeExecutionEffect:
       'Fence-row validation fails closed before any caller can admit execution.',
   },
   {
     file: 'do-runner/execution-fence.ts',
     error: 'ExecutionFenceUnreadableError',
-    anchor: 'async read(): Promise<ExecutionFenceReading>',
+    anchor: 'async #initialize(',
     beforeExecutionEffect:
-      'A failed fence read becomes unreadable before an admission predicate can run.',
+      'Initialization validates administrative metadata without admitting execution.',
   },
   {
     file: 'do-runner/execution-fence.ts',
     error: 'ExecutionFenceUnreadableError',
-    anchor: 'async recordProofRun(',
+    anchor: '#decodeReturned(result:',
+    beforeExecutionEffect:
+      'A malformed metadata-write result refuses before a caller can admit execution.',
+  },
+  {
+    file: 'do-runner/execution-fence.ts',
+    error: 'ExecutionFenceUnreadableError',
+    anchor: 'if (receipt !== null)',
+    beforeExecutionEffect:
+      'An uncertain administrative CAS does not execute a run or schedule.',
+  },
+  {
+    file: 'do-runner/execution-fence.ts',
+    error: 'ExecutionFenceUnreadableError',
+    anchor: "reading?.state === 'proof-only'",
     beforeExecutionEffect:
       'A failed proof-binding metadata write becomes unreadable before the runtime starts the run.',
   },

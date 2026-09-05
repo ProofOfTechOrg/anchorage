@@ -29,8 +29,45 @@ import {
   type FenceAssertionMode,
   PlainWorkerProvisioningApiFake,
 } from './fixtures/plain-worker-provisioning-api-fake.js';
+import { D1State } from './fixtures/provider-world.js';
 
 const RECEIPT_AUTHORITY = 'memory://fleet-exports/receipts/v1';
+
+it('seeds optional FS8 metadata through string-bound provider SQL', async () => {
+  const api = new PlainWorkerProvisioningApiFake('per-request');
+  const d1 = new D1State();
+  const query = api.queryDatabase.bind(api);
+  api.queryDatabase = async (databaseId, sql, bindings = []) => {
+    await query(databaseId, sql, bindings);
+    expect(databaseId).toBe(database.id);
+    const parameters = bindings.map((value) => {
+      if (typeof value !== 'string')
+        throw new Error('fence parameters must be strings');
+      return value;
+    });
+    return d1.queryDatabase(sql, parameters);
+  };
+  await backend(api).seedDeploymentIdentity(database, 'acme', api.fence(), {
+    initialExecutionFenceState: 'migration-locked',
+  });
+  expect(d1.queryDatabase('SELECT * FROM flowsafe_execution_fence')).toEqual([
+    {
+      id: 'deployment',
+      state: 'migration-locked',
+      proof_key: null,
+      proof_run_id: null,
+      updated_at: expect.any(Number),
+      last_transition_request: null,
+      transition_revision: 0,
+      mutation_epoch: 0,
+      require_mutation_epoch: 0,
+    },
+  ]);
+  expect(api.queries.length).toBeGreaterThan(0);
+  expect(api.events.filter((event) => event === 'port-assert')).toHaveLength(
+    api.queries.length,
+  );
+});
 const RECEIPT_IDENTITY: DatabaseExportReceiptIdentity = {
   version: 1,
   authority: RECEIPT_AUTHORITY,

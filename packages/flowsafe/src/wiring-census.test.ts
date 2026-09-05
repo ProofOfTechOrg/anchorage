@@ -289,6 +289,11 @@ describe('wiring census', () => {
     // #then — identical readings. This is the premise the whole census rests
     // on: requiring the field costs a database-less host nothing but the words.
     expect(written).toEqual(absent);
-    expect(written).toEqual({ state: 'open' });
+    expect(written).toEqual({
+      state: 'open',
+      mutationEpoch: 0,
+      requireMutationEpoch: false,
+      transitionRevision: 0,
+    });
   });
 });

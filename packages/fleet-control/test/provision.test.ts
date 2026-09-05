@@ -77,6 +77,7 @@ import {
   decommissionAdvancingRecordFixture,
 } from './fixtures/decommission-intent-fixture.js';
 import { memoryStore, routeApi } from './fixtures/plain-worker-port-probe.js';
+import { D1State } from './fixtures/provider-world.js';
 import {
   type PlainWorkerFsControl,
   registerScratchCleanup,
@@ -1051,19 +1052,37 @@ async function wranglerLoopHarness(deployment: DeploymentSpec) {
       throw new Error(`unexpected command ${arguments_.join(' ')}`);
     },
   };
+  const fenceState = new D1State();
   const plainRouteApi: PlainWorkerRouteApi = routeApi({
     async queryDatabase(_databaseId, sql, bindings = []) {
       if (
+        /^(?:CREATE TABLE IF NOT EXISTS|INSERT OR IGNORE INTO|ALTER TABLE) flowsafe_execution_fence\b/.test(
+          sql,
+        ) ||
+        sql.startsWith('SELECT * FROM flowsafe_execution_fence') ||
+        sql === 'PRAGMA table_xinfo(flowsafe_execution_fence)'
+      ) {
+        const parameters = bindings.map((value) => {
+          if (typeof value !== 'string')
+            throw new Error('fence parameters must be strings');
+          return value;
+        });
+        return fenceState.queryDatabase(sql, parameters);
+      }
+      if (
         sql.includes("FROM sqlite_schema WHERE type = 'table' ORDER BY name")
       ) {
-        return state.sentinelExists
-          ? [
-              {
-                name: 'flowsafe_deployment',
-                sql: 'CREATE TABLE IF NOT EXISTS flowsafe_deployment (id INTEGER PRIMARY KEY CHECK (id = 1), tenant_tag TEXT NOT NULL, provisioned_at TEXT NOT NULL)',
-              },
-            ]
-          : [];
+        return [
+          ...fenceState.queryDatabase(sql),
+          ...(state.sentinelExists
+            ? [
+                {
+                  name: 'flowsafe_deployment',
+                  sql: 'CREATE TABLE IF NOT EXISTS flowsafe_deployment (id INTEGER PRIMARY KEY CHECK (id = 1), tenant_tag TEXT NOT NULL, provisioned_at TEXT NOT NULL)',
+                },
+              ]
+            : []),
+        ];
       }
       if (
         sql.includes("FROM sqlite_schema WHERE type = 'table' AND name = ?")

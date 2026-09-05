@@ -5737,6 +5737,9 @@ describe('DurableObjectRunner — idempotent start plumbing', () => {
       state: 'proof-only',
       proofKey: 'proof-key-1',
       proofRunId: 'run-proof',
+      mutationEpoch: 0,
+      requireMutationEpoch: false,
+      transitionRevision: 1,
     });
 
     // #and a SECOND start under the same key is refused: the proof is one run,
@@ -5806,6 +5809,11 @@ describe('DurableObjectRunner — idempotent start plumbing', () => {
     // #then refused, and nothing ran: the deployment is no longer the one this
     // start read, so its admission is void.
     expect(response.status).toBe(503);
-    await expect(fence.read()).resolves.toEqual({ state: 'migration-locked' });
+    await expect(fence.read()).resolves.toEqual({
+      state: 'migration-locked',
+      mutationEpoch: 0,
+      requireMutationEpoch: false,
+      transitionRevision: 2,
+    });
   });
 });

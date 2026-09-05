@@ -15,6 +15,12 @@
 // depend on breakwater for their connectors) need to reach for. See module.ts.
 
 export {
+  type ExecutionFenceReading,
+  type ExecutionFenceTransition,
+  type ExecutionFenceVersionedReading,
+  executionFenceReadingPayload,
+} from '../do-runner/execution-fence.js';
+export {
   type BoundedBodyResult,
   readBoundedBody,
 } from '../http-body.js';

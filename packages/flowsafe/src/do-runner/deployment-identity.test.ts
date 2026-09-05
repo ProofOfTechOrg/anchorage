@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   DEPLOYMENT_SENTINEL_DDL,
+  EXECUTION_FENCE_DDL,
   EXECUTION_FENCE_ROW_ID,
   EXECUTION_FENCE_TABLE,
 } from '#deployment-identity-protocol';
@@ -24,6 +25,10 @@ import {
   verifyDurableObjectDeploymentIdentity,
   verifyDurableObjectDeploymentRequest,
 } from './deployment-identity.js';
+import {
+  type ExecutionFenceDatabase,
+  ExecutionFenceStore,
+} from './execution-fence.js';
 
 const DEPLOYMENT_IDENTITY_SECRET = 'test-deployment-identity-secret-0001';
 
@@ -57,6 +62,136 @@ function interceptSentinelRead(
 }
 
 describe('deployment identity provisioning', () => {
+  const legacyFenceDdl = `CREATE TABLE flowsafe_execution_fence (
+    id TEXT PRIMARY KEY CHECK (id = 'deployment'),
+    state TEXT NOT NULL CHECK (state IN ('open', 'draining', 'migration-locked', 'proof-only')),
+    proof_key TEXT, proof_run_id TEXT, updated_at INTEGER NOT NULL
+  )`;
+
+  it('migrates a legacy fence identically through runtime and CLI executors', async () => {
+    const { provisionDeploymentIdentity } = await vi.importActual<{
+      provisionDeploymentIdentity(
+        options: {
+          database: string;
+          tag: string;
+          target: string;
+          initialFenceState: string;
+        },
+        query: (sql: string) => Promise<unknown[]>,
+      ): Promise<void>;
+    }>('../../scripts/seed-deployment-identity.mjs');
+    const runtimeSqlite = openSqlite();
+    const cliSqlite = openSqlite();
+    for (const sqlite of [runtimeSqlite, cliSqlite]) {
+      sqlite.exec(legacyFenceDdl);
+      sqlite.exec(
+        `INSERT INTO ${EXECUTION_FENCE_TABLE} VALUES ('deployment', 'draining', 'legacy key', 'legacy run', 17)`,
+      );
+    }
+    await seedDeploymentIdentity(
+      sqliteUnitDatabase(runtimeSqlite) as DeploymentIdentityDatabase,
+      'acme',
+      'open',
+    );
+    await provisionDeploymentIdentity(
+      {
+        database: 'database',
+        tag: 'acme',
+        target: '--local',
+        initialFenceState: 'open',
+      },
+      async (sql: string) => cliSqlite.prepare(sql).all(),
+    );
+    expect(
+      runtimeSqlite
+        .prepare(`PRAGMA table_xinfo(${EXECUTION_FENCE_TABLE})`)
+        .all(),
+    ).toEqual(
+      cliSqlite.prepare(`PRAGMA table_xinfo(${EXECUTION_FENCE_TABLE})`).all(),
+    );
+    const expected = [
+      {
+        id: 'deployment',
+        state: 'draining',
+        proof_key: 'legacy key',
+        proof_run_id: 'legacy run',
+        updated_at: 17,
+        last_transition_request: null,
+        transition_revision: 0,
+        mutation_epoch: 0,
+        require_mutation_epoch: 0,
+      },
+    ];
+    expect(
+      runtimeSqlite.prepare(`SELECT * FROM ${EXECUTION_FENCE_TABLE}`).all(),
+    ).toEqual(expected);
+    expect(
+      cliSqlite.prepare(`SELECT * FROM ${EXECUTION_FENCE_TABLE}`).all(),
+    ).toEqual(expected);
+  });
+
+  it('does not seed a new-format row from a stale legacy-empty observation', async () => {
+    const sqlite = openSqlite();
+    sqlite.exec(legacyFenceDdl);
+    const original = sqliteUnitDatabase(sqlite) as DeploymentIdentityDatabase;
+    const db: DeploymentIdentityDatabase = {
+      prepare(sql) {
+        const prepared = original.prepare(sql);
+        if (!sql.startsWith(`INSERT OR IGNORE INTO ${EXECUTION_FENCE_TABLE}`))
+          return prepared;
+        let bound = prepared;
+        const statement: DeploymentIdentityStatement = {
+          bind(...values) {
+            bound = prepared.bind(...values);
+            return statement;
+          },
+          all: <T>() => bound.all<T>(),
+          async run() {
+            sqlite.exec(`DROP TABLE ${EXECUTION_FENCE_TABLE}`);
+            sqlite.exec(EXECUTION_FENCE_DDL);
+            return bound.run();
+          },
+        };
+        return statement;
+      },
+    };
+    await expect(
+      seedDeploymentIdentity(db, 'acme', 'open'),
+    ).rejects.toBeInstanceOf(DeploymentIdentityError);
+    expect(
+      sqlite.prepare(`SELECT * FROM ${EXECUTION_FENCE_TABLE}`).all(),
+    ).toEqual([]);
+  });
+
+  it('preserves the runtime seed vocabulary and the provisioning birth-state restriction', async () => {
+    for (const state of ['draining', 'proof-only'] as const) {
+      const sqlite = openSqlite();
+      const db = sqliteUnitDatabase(sqlite) as ExecutionFenceDatabase;
+      const fence = new ExecutionFenceStore(db);
+      await fence.seed(state);
+      await expect(fence.read()).resolves.toEqual({
+        state,
+        mutationEpoch: 0,
+        requireMutationEpoch: false,
+        transitionRevision: 0,
+      });
+      const statements: string[] = [];
+      const untouched: DeploymentIdentityDatabase = {
+        prepare(sql) {
+          statements.push(sql);
+          return db.prepare(sql);
+        },
+      };
+      await expect(
+        seedDeploymentIdentity(
+          untouched,
+          'acme',
+          state as InitialExecutionFenceState,
+        ),
+      ).rejects.toBeInstanceOf(DeploymentIdentityError);
+      expect(statements).toEqual([]);
+    }
+  });
   it.each([
     'abc',
     'a0z',
@@ -208,7 +343,7 @@ describe('deployment identity provisioning', () => {
     const fenceInsert = preparedQueries.find((query) =>
       query.startsWith(`INSERT OR IGNORE INTO ${EXECUTION_FENCE_TABLE}`),
     );
-    expect(fenceInsert).toContain('VALUES (?, ?, NULL, NULL, ?)');
+    expect(fenceInsert).toContain('SELECT ?, ?, NULL, NULL, ?');
     expect(fenceInsert).not.toContain("'migration-locked'");
     expect(fenceBindings).toHaveLength(1);
     expect(fenceBindings[0]?.[0]).toBe(EXECUTION_FENCE_ROW_ID);

@@ -106,6 +106,7 @@ export type {
   ExecutionFenceStatement,
   ExecutionFenceStoreOptions,
   ExecutionFenceTransition,
+  ExecutionFenceVersionedReading,
   ExecutionFenceWiring,
   // One arm of ExecutionFenceRefusal, published because that union is: a
   // consumer that catches a fence refusal on the far side of a Durable Object

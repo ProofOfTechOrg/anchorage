@@ -46,6 +46,7 @@ import {
   WorkersForPlatformsBackend,
 } from '../src/workers-for-platforms-backend.js';
 import { decommissionAdvancingRecordFixture } from './fixtures/decommission-intent-fixture.js';
+import { D1State } from './fixtures/provider-world.js';
 
 const deployment: DeploymentSpec = {
   tenantTag: 'acme',
@@ -248,6 +249,7 @@ function platformProfile(
 }
 
 class FakeApi implements WorkersForPlatformsApi {
+  readonly fenceState = new D1State();
   readonly calls: string[] = [];
   residualEvents: string[] | undefined;
   failSecrets = false;
@@ -419,8 +421,23 @@ class FakeApi implements WorkersForPlatformsApi {
     sql: string,
     bindings: readonly unknown[] = [],
   ): Promise<readonly Readonly<Record<string, unknown>>[]> {
+    if (
+      /^(?:CREATE TABLE IF NOT EXISTS|INSERT OR IGNORE INTO|ALTER TABLE) flowsafe_execution_fence\b/.test(
+        sql,
+      ) ||
+      sql.startsWith('SELECT * FROM flowsafe_execution_fence') ||
+      sql === 'PRAGMA table_xinfo(flowsafe_execution_fence)'
+    ) {
+      const parameters = bindings.map((value) => {
+        if (typeof value !== 'string')
+          throw new Error('fence parameters must be strings');
+        return value;
+      });
+      return this.fenceState.queryDatabase(sql, parameters);
+    }
     if (sql.includes("FROM sqlite_schema WHERE type = 'table' ORDER BY name")) {
       return [
+        ...this.fenceState.queryDatabase(sql),
         ...(this.deploymentSentinelPresent
           ? [{ name: 'flowsafe_deployment', sql: DEPLOYMENT_SENTINEL_DDL }]
           : []),
@@ -2730,6 +2747,37 @@ describe('WorkersForPlatformsBackend', () => {
       /owned by 'other-tenant'/,
     );
     expect(client.database).toMatchObject({ name: deployment.databaseName });
+  });
+
+  it('seeds optional FS8 metadata through string-bound provider SQL', async () => {
+    const client = new FakeApi();
+    const subject = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client,
+      hostRoutingKvId: 'host-routing',
+    });
+    await subject.seedDeploymentIdentity(
+      { id: 'db-persisted', name: deployment.databaseName, created: false },
+      'acme',
+      fence,
+      { initialExecutionFenceState: 'migration-locked' },
+    );
+    expect(
+      client.fenceState.queryDatabase('SELECT * FROM flowsafe_execution_fence'),
+    ).toEqual([
+      {
+        id: 'deployment',
+        state: 'migration-locked',
+        proof_key: null,
+        proof_run_id: null,
+        updated_at: expect.any(Number),
+        last_transition_request: null,
+        transition_revision: 0,
+        mutation_epoch: 0,
+        require_mutation_epoch: 0,
+      },
+    ]);
+    expect(client.mutationFenceEntries).toBe(1);
   });
 
   it('runs D1 ownership reads inside the provider mutation fence', async () => {

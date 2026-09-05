@@ -46,11 +46,32 @@ export const INITIAL_EXECUTION_FENCE_STATES: readonly [
   'migration-locked',
 ];
 /**
- * The fence table's schema. `do-runner/execution-fence.ts` issues this exact
- * string, so the store and the provisioning protocol cannot create differently
- * shaped tables.
+ * The current fence schema. Runtime and provisioning initialize the legacy
+ * singleton before adding its metadata columns through the shared protocol.
  */
 export const EXECUTION_FENCE_DDL: string;
+
+export type ExecutionFenceSchemaStage = 0 | 1 | 2 | 3 | 4;
+export interface ExecutionFenceMutationMetadata {
+  readonly mutationEpoch: number;
+  readonly requireMutationEpoch: boolean;
+  readonly transitionRevision: number;
+  readonly lastTransitionRequest: string | null;
+  readonly schemaStage: ExecutionFenceSchemaStage;
+}
+export function readExecutionFenceSchemaProtocol(
+  execute: DeploymentIdentityProtocolExecutor,
+): Promise<ExecutionFenceSchemaStage | undefined>;
+export function decodeExecutionFenceMutationMetadata(
+  row: DeploymentIdentityProtocolRow,
+): ExecutionFenceMutationMetadata;
+export function initializeExecutionFenceProtocol(
+  execute: DeploymentIdentityProtocolExecutor,
+  options: {
+    state: (typeof EXECUTION_FENCE_STATES)[number];
+    seededAt: number;
+  },
+): Promise<void>;
 
 /** The fence state a deployment is provisioned into. Required; no default. */
 export type InitialExecutionFenceState =

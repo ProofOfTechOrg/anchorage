@@ -1072,6 +1072,9 @@ describe('proof-only composition', () => {
       state: 'proof-only',
       proofKey: 'proof-key-1',
       proofRunId: 'proof-run',
+      mutationEpoch: 0,
+      requireMutationEpoch: false,
+      transitionRevision: 1,
     });
   });
 
@@ -1105,6 +1108,9 @@ describe('proof-only composition', () => {
     await expect(fence.read()).resolves.toEqual({
       state: 'proof-only',
       proofKey: 'proof-key-1',
+      mutationEpoch: 0,
+      requireMutationEpoch: false,
+      transitionRevision: 1,
     });
   });
 

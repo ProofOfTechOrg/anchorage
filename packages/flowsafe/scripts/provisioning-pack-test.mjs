@@ -71,8 +71,15 @@ if (typeof sql !== 'string') {
 const statePath = process.env.FAKE_WRANGLER_STATE;
 const state = existsSync(statePath)
   ? JSON.parse(readFileSync(statePath, 'utf8'))
-  : { created: false, tag: undefined, fence: false, fenceState: undefined };
+  : { created: false, tag: undefined, fence: false, fenceStage: 0, fenceState: undefined };
 const FENCE = 'flowsafe_execution_fence';
+const fenceColumns = [
+  ['id', 'TEXT', 0, 1, null], ['state', 'TEXT', 1, 0, null],
+  ['proof_key', 'TEXT', 0, 0, null], ['proof_run_id', 'TEXT', 0, 0, null],
+  ['updated_at', 'INTEGER', 1, 0, null], ['last_transition_request', 'TEXT', 0, 0, null],
+  ['transition_revision', 'INTEGER', 1, 0, '0'], ['mutation_epoch', 'INTEGER', 1, 0, '0'],
+  ['require_mutation_epoch', 'INTEGER', 1, 0, '0'],
+];
 const schema = \`CREATE TABLE flowsafe_deployment (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   tenant_tag TEXT NOT NULL,
@@ -94,13 +101,27 @@ if (sql.startsWith('SELECT name, sql')) {
 } else if (sql.startsWith('CREATE TABLE IF NOT EXISTS ' + FENCE)) {
   state.fence = true;
   results = [];
+} else if (sql === 'PRAGMA table_xinfo(' + FENCE + ')') {
+  results = state.fence ? fenceColumns.slice(0, 5 + state.fenceStage).map(([name, type, notnull, pk, dflt_value], cid) => ({ name, type, notnull, pk, dflt_value, cid, hidden: 0 })) : [];
+} else if (sql.startsWith('SELECT * FROM ' + FENCE)) {
+  results = state.fenceRow ? [state.fenceRow] : [];
+} else if (sql.startsWith('ALTER TABLE ' + FENCE + ' ADD COLUMN ')) {
+  const name = sql.slice(('ALTER TABLE ' + FENCE + ' ADD COLUMN ').length).split(' ')[0];
+  if (!state.fenceRow || name !== fenceColumns[5 + state.fenceStage]?.[0]) throw new Error('unexpected fence ALTER stage');
+  state.fenceRow[name] = state.fenceStage === 0 ? null : 0;
+  state.fenceStage += 1;
+  results = [];
 } else if (sql.startsWith('INSERT OR IGNORE INTO ' + FENCE)) {
   if (!state.fence) {
     process.stderr.write('fence row seeded before its table\\n');
     process.exit(5);
   }
-  state.fenceState =
-    state.fenceState ?? sql.match(/'deployment', '([^']+)'/)?.[1];
+  if (state.fenceStage === 0 && !state.fenceRow) {
+    const values = sql.match(/SELECT 'deployment', '([^']+)', NULL, NULL, '(\\d+)'/);
+    if (!values) throw new Error('invalid fence INSERT');
+    state.fenceState = values[1];
+    state.fenceRow = { id: 'deployment', state: values[1], proof_key: null, proof_run_id: null, updated_at: Number(values[2]) };
+  }
   results = [];
 } else if (sql.startsWith('CREATE TABLE')) {
   state.created = true;
@@ -280,7 +301,16 @@ assert.deepEqual(
 import {
   DEPLOYMENT_IDENTITY_HEADER as LEGACY_DEPLOYMENT_IDENTITY_HEADER,
   deploymentIdentityHeaders as legacyDeploymentIdentityHeaders,
+  ExecutionFenceStore,
+  type ExecutionFenceReading,
+  type ExecutionFenceVersionedReading,
 } from '@proofoftech/flowsafe/do-runner';
+import {
+  type ExecutionFenceReading as HostReading,
+  type ExecutionFenceVersionedReading as HostVersionedReading,
+  type ExecutionFenceTransition,
+  executionFenceReadingPayload,
+} from '@proofoftech/flowsafe/host-kit';
 
 const secret = 'x'.repeat(32);
 const headers: Record<string, string> = deploymentIdentityHeaders(secret);
@@ -293,6 +323,22 @@ void headers;
 void legacyHeaders;
 void header;
 void initialFenceState;
+const legacyReading: ExecutionFenceReading = { state: 'open' };
+const hostLegacyReading: HostReading = legacyReading;
+const command: ExecutionFenceTransition = {
+  expected: 'open', next: 'draining', expectedMutationEpoch: 0,
+  expectedRevision: 0, advanceMutationEpoch: true,
+};
+async function checkFenceTypes(store: ExecutionFenceStore) {
+  const versioned: ExecutionFenceVersionedReading = await store.read();
+  const hostVersioned: HostVersionedReading = executionFenceReadingPayload(versioned);
+  const epoch: number = hostVersioned.mutationEpoch;
+  await store.transition(command);
+  await store.recordProofRun('proof', 'run');
+  await store.recordProofRun('proof', 'run', versioned);
+  return { epoch, hostLegacyReading };
+}
+void checkFenceTypes;
 `,
   );
   writeFileSync(
@@ -533,13 +579,24 @@ void initialFenceState;
   );
   if (
     fenceDdlAt === -1 ||
-    fenceRowAt !== fenceDdlAt + 1 ||
+    fenceRowAt <= fenceDdlAt ||
     ownershipAt === -1 ||
     ownershipAt > fenceDdlAt
   ) {
     throw new Error(
       `packed provisioning CLI did not seed the fence after proving ownership: ${JSON.stringify(executedSql)}`,
     );
+  }
+  const fenceAlters = executedSql.flatMap((sql, index) =>
+    sql.startsWith('ALTER TABLE flowsafe_execution_fence ADD COLUMN')
+      ? [index]
+      : [],
+  );
+  if (
+    fenceAlters.length !== 4 ||
+    fenceAlters.some((index) => index <= fenceRowAt)
+  ) {
+    throw new Error('fence columns were not added after the initial row');
   }
   const seededState = JSON.parse(readFileSync(statePath, 'utf8')).fenceState;
   if (seededState !== 'migration-locked') {

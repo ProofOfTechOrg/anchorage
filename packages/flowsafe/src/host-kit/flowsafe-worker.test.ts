@@ -1980,7 +1980,7 @@ describe('createFlowsafeWorker execution-fence administration', () => {
     });
   }
 
-  it('reads and moves the fence for an authenticated control plane', async () => {
+  it('returns versioned readings for both admin methods', async () => {
     // #given
     const worker = makeWorker();
     const { env, ctx } = makeEnv();
@@ -1993,7 +1993,12 @@ describe('createFlowsafeWorker execution-fence administration', () => {
       ctx,
     );
     expect(initial.status).toBe(200);
-    expect(await initial.json()).toEqual({ state: 'open' });
+    expect(await initial.json()).toEqual({
+      state: 'open',
+      mutationEpoch: 0,
+      requireMutationEpoch: false,
+      transitionRevision: 0,
+    });
 
     // #when — the control plane drains, then locks.
     const drained = await worker.fetch(
@@ -2005,7 +2010,12 @@ describe('createFlowsafeWorker execution-fence administration', () => {
       ctx,
     );
     expect(drained.status).toBe(200);
-    expect(await drained.json()).toEqual({ state: 'draining' });
+    expect(await drained.json()).toEqual({
+      state: 'draining',
+      mutationEpoch: 0,
+      requireMutationEpoch: false,
+      transitionRevision: 1,
+    });
 
     // #then — a STALE expectation is a 409 carrying the current state, so the
     // loser of a control-plane race can re-plan without a second round trip.
@@ -2052,6 +2062,154 @@ describe('createFlowsafeWorker execution-fence administration', () => {
     expect(await observed.json()).toEqual({
       state: 'proof-only',
       proofKey: 'proof-1',
+      mutationEpoch: 0,
+      requireMutationEpoch: false,
+      transitionRevision: 3,
+    });
+  });
+
+  it('requires versioned expectations after activation', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = ADMIN_SECRET;
+    const command = {
+      expected: 'open',
+      next: 'draining',
+      expectedMutationEpoch: 0,
+      expectedRevision: 0,
+      advanceMutationEpoch: true,
+    };
+    const active = {
+      state: 'draining',
+      mutationEpoch: 1,
+      requireMutationEpoch: true,
+      transitionRevision: 1,
+    };
+    const activated = await worker.fetch(
+      fenceRequest({ method: 'POST', body: command }),
+      env,
+      ctx,
+    );
+    expect(activated.status).toBe(200);
+    expect(await activated.json()).toEqual(active);
+    for (const [body, conflict] of [
+      [
+        { expected: 'draining', next: 'open' },
+        'versioned-expectation-required',
+      ],
+      [{ ...command, next: 'open' }, 'expectation-mismatch'],
+    ]) {
+      const response = await worker.fetch(
+        fenceRequest({ method: 'POST', body }),
+        env,
+        ctx,
+      );
+      expect(response.status).toBe(409);
+      expect(await response.json()).toEqual({
+        error: 'execution fence transition conflicts with the current reading',
+        reason: { code: 'FENCE_CAS_CONFLICT', ...active, conflict },
+      });
+    }
+  });
+
+  it('keeps exact CAS response-loss retry identity through admin JSON', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = ADMIN_SECRET;
+    const db = env.DB;
+    const prepare = db.prepare.bind(db);
+    vi.spyOn(db, 'prepare').mockImplementation((sql) => {
+      const original = prepare(sql);
+      if (!sql.startsWith('UPDATE flowsafe_execution_fence')) return original;
+      const bind = original.bind.bind(original);
+      original.bind = (...values) => {
+        const bound = bind(...values);
+        const all = bound.all.bind(bound);
+        bound.all = async () => {
+          await all();
+          throw new Error('UPDATE response lost');
+        };
+        return bound;
+      };
+      return original;
+    });
+    const command = {
+      expected: 'open',
+      next: 'proof-only',
+      proofKey: 'proof-a',
+      expectedMutationEpoch: 0,
+      expectedRevision: 0,
+      advanceMutationEpoch: true,
+    };
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const response = await worker.fetch(
+        fenceRequest({ method: 'POST', body: command }),
+        env,
+        ctx,
+      );
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        state: 'proof-only',
+        proofKey: 'proof-a',
+        mutationEpoch: 1,
+        requireMutationEpoch: true,
+        transitionRevision: 1,
+      });
+    }
+    const changed = await worker.fetch(
+      fenceRequest({
+        method: 'POST',
+        body: { ...command, proofKey: 'proof-b' },
+      }),
+      env,
+      ctx,
+    );
+    expect(changed.status).toBe(503);
+    expect(await changed.json()).toEqual({
+      error: 'execution fence transition could not be recorded',
+      reason: { code: 'EXECUTION_FENCE_UNREADABLE' },
+    });
+  });
+
+  it('does not expose receipts or accept malformed epoch fields', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = ADMIN_SECRET;
+    const command = {
+      expected: 'open',
+      next: 'open',
+      expectedMutationEpoch: 0,
+      expectedRevision: 0,
+    };
+    for (const invalid of [
+      { expectedMutationEpoch: '0' },
+      { expectedMutationEpoch: null },
+      { expectedRevision: '0' },
+      { expectedRevision: -1 },
+      { expectedRevision: 0.5 },
+      { advanceMutationEpoch: 'true' },
+      { advanceMutationEpoch: null },
+    ]) {
+      const response = await worker.fetch(
+        fenceRequest({ method: 'POST', body: { ...command, ...invalid } }),
+        env,
+        ctx,
+      );
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({
+        reason: { code: 'INVALID_EXECUTION_FENCE_REQUEST' },
+      });
+    }
+    const response = await worker.fetch(
+      fenceRequest({ method: 'POST', body: command }),
+      env,
+      ctx,
+    );
+    expect(await response.json()).toEqual({
+      state: 'open',
+      mutationEpoch: 0,
+      requireMutationEpoch: false,
+      transitionRevision: 1,
     });
   });
 

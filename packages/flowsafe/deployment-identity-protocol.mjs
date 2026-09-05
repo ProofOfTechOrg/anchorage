@@ -71,12 +71,39 @@ export const INITIAL_EXECUTION_FENCE_STATES = Object.freeze([
   'migration-locked',
 ]);
 
-export const EXECUTION_FENCE_DDL = `CREATE TABLE IF NOT EXISTS ${EXECUTION_FENCE_TABLE} (
+const EXECUTION_FENCE_BASE_COLUMNS = `
     id TEXT PRIMARY KEY CHECK (id = '${EXECUTION_FENCE_ROW_ID}'),
     state TEXT NOT NULL CHECK (state IN (${EXECUTION_FENCE_STATES.map((state) => `'${state}'`).join(', ')})),
     proof_key TEXT,
     proof_run_id TEXT,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL`;
+const EXECUTION_FENCE_ADDITIONS = Object.freeze([
+  'last_transition_request TEXT',
+  `transition_revision INTEGER NOT NULL DEFAULT 0
+    CHECK (typeof(transition_revision) = 'integer'
+      AND transition_revision BETWEEN 0 AND 9007199254740991)`,
+  `mutation_epoch INTEGER NOT NULL DEFAULT 0
+    CHECK (typeof(mutation_epoch) = 'integer'
+      AND mutation_epoch BETWEEN 0 AND 9007199254740991)`,
+  `require_mutation_epoch INTEGER NOT NULL DEFAULT 0
+    CHECK (typeof(require_mutation_epoch) = 'integer'
+      AND require_mutation_epoch IN (0, 1))`,
+]);
+const EXECUTION_FENCE_COLUMNS = Object.freeze([
+  ['id', 'TEXT', 0, 1, null],
+  ['state', 'TEXT', 1, 0, null],
+  ['proof_key', 'TEXT', 0, 0, null],
+  ['proof_run_id', 'TEXT', 0, 0, null],
+  ['updated_at', 'INTEGER', 1, 0, null],
+  ['last_transition_request', 'TEXT', 0, 0, null],
+  ['transition_revision', 'INTEGER', 1, 0, '0'],
+  ['mutation_epoch', 'INTEGER', 1, 0, '0'],
+  ['require_mutation_epoch', 'INTEGER', 1, 0, '0'],
+]);
+const EXECUTION_FENCE_BOOTSTRAP_DDL = `CREATE TABLE IF NOT EXISTS ${EXECUTION_FENCE_TABLE} (${EXECUTION_FENCE_BASE_COLUMNS}
+  )`;
+export const EXECUTION_FENCE_DDL = `CREATE TABLE IF NOT EXISTS ${EXECUTION_FENCE_TABLE} (${EXECUTION_FENCE_BASE_COLUMNS},
+    ${EXECUTION_FENCE_ADDITIONS.join(',\n    ')}
   )`;
 
 const SENTINEL_SQL_PATTERN =
@@ -132,7 +159,7 @@ const CREATE_SENTINEL = Object.freeze({
 });
 const CREATE_EXECUTION_FENCE = Object.freeze({
   mode: 'write',
-  sql: EXECUTION_FENCE_DDL,
+  sql: EXECUTION_FENCE_BOOTSTRAP_DDL,
   bindings: Object.freeze([]),
 });
 
@@ -279,7 +306,12 @@ function seedExecutionFenceRow(state, seededAt) {
     mode: 'write',
     sql: `INSERT OR IGNORE INTO ${EXECUTION_FENCE_TABLE}
        (id, state, proof_key, proof_run_id, updated_at)
-     VALUES (?, ?, NULL, NULL, ?)`,
+     SELECT ?, ?, NULL, NULL, ?
+     WHERE NOT EXISTS (
+       SELECT 1 FROM pragma_table_xinfo('${EXECUTION_FENCE_TABLE}')
+       WHERE name IN ('last_transition_request', 'transition_revision',
+         'mutation_epoch', 'require_mutation_epoch')
+     )`,
     // INSERT OR IGNORE, never an upsert: seeding runs on every provisioning
     // pass, and a re-provision of a LIVE deployment must not silently reopen a
     // fence an operator closed.
@@ -293,20 +325,187 @@ function seedExecutionFenceRow(state, seededAt) {
   };
 }
 
-/**
- * Write the deployment's initial fence row, if it has none.
- *
- * Two statements rather than one request: every executor this protocol is
- * driven through — the runtime's `db.prepare()`, the CLI's
- * `wrangler d1 execute --command`, and both fleet-control backends' REST
- * `/query` with bound parameters — carries exactly ONE statement per call, so
- * there is no seam here through which a batch could be sent. The DDL therefore
- * runs first and the row second; a crash between them leaves an empty fence
- * table, which reads as `open` and is healed by the next invocation.
- */
-async function seedExecutionFence(execute, state, seededAt) {
-  await execute(CREATE_EXECUTION_FENCE);
-  await execute(seedExecutionFenceRow(state, seededAt));
+function malformedExecutionFence(reason) {
+  return new DeploymentIdentityError(
+    `${EXECUTION_FENCE_TABLE} has an invalid execution-fence schema (${reason})`,
+  );
+}
+
+export async function readExecutionFenceSchemaProtocol(execute) {
+  const columns = await execute({
+    mode: 'read',
+    sql: `PRAGMA table_xinfo(${EXECUTION_FENCE_TABLE})`,
+    bindings: [],
+  });
+  if (!Array.isArray(columns)) {
+    throw malformedExecutionFence('column metadata is not an array');
+  }
+  if (columns.length === 0) return undefined;
+  if (columns.length < 5 || columns.length > EXECUTION_FENCE_COLUMNS.length) {
+    throw malformedExecutionFence('unexpected columns');
+  }
+  for (let index = 0; index < columns.length; index += 1) {
+    const actual = columns[index];
+    const [name, type, notnull, pk, defaultValue] =
+      EXECUTION_FENCE_COLUMNS[index];
+    if (
+      rowField(actual, 'name') !== name ||
+      rowField(actual, 'type') !== type ||
+      rowField(actual, 'notnull') !== notnull ||
+      rowField(actual, 'pk') !== pk ||
+      rowField(actual, 'dflt_value') !== defaultValue ||
+      rowField(actual, 'hidden') !== 0
+    ) {
+      throw malformedExecutionFence(`column ${name} differs`);
+    }
+  }
+  return columns.length - 5;
+}
+
+export function decodeExecutionFenceMutationMetadata(row) {
+  if (row === null || typeof row !== 'object' || Array.isArray(row)) {
+    throw malformedExecutionFence('row is not an object');
+  }
+  let stage = 0;
+  let missing = false;
+  for (const [name] of EXECUTION_FENCE_COLUMNS.slice(5)) {
+    if (Object.hasOwn(row, name)) {
+      if (missing) throw malformedExecutionFence('metadata prefix has a hole');
+      stage += 1;
+    } else {
+      missing = true;
+    }
+  }
+  const receipt = row.last_transition_request;
+  const revision = row.transition_revision;
+  const epoch = row.mutation_epoch;
+  const required = row.require_mutation_epoch;
+  if (stage < 4) {
+    if (
+      (stage >= 1 && receipt !== null) ||
+      (stage >= 2 && revision !== 0) ||
+      (stage >= 3 && epoch !== 0)
+    ) {
+      throw malformedExecutionFence(
+        'partial metadata is not optional defaults',
+      );
+    }
+    return {
+      mutationEpoch: 0,
+      requireMutationEpoch: false,
+      transitionRevision: 0,
+      lastTransitionRequest: null,
+      schemaStage: stage,
+    };
+  }
+  if (
+    !Number.isSafeInteger(epoch) ||
+    epoch < 0 ||
+    !Number.isSafeInteger(revision) ||
+    revision < 0 ||
+    (required !== 0 && required !== 1) ||
+    (required === 1) !== epoch > 0 ||
+    (receipt !== null &&
+      (typeof receipt !== 'string' || receipt.length > 512)) ||
+    (revision === 0 && receipt !== null) ||
+    (required === 1 && (receipt === null || revision === 0))
+  ) {
+    throw malformedExecutionFence('mutation metadata is inconsistent');
+  }
+  return {
+    mutationEpoch: epoch,
+    requireMutationEpoch: required === 1,
+    transitionRevision: revision,
+    lastTransitionRequest: receipt,
+    schemaStage: stage,
+  };
+}
+
+async function observeExecutionFence(execute, allowLegacyEmpty) {
+  let minimumStage = 0;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const rows = await execute({
+      mode: 'read',
+      sql: `SELECT * FROM ${EXECUTION_FENCE_TABLE} LIMIT 2`,
+      bindings: [],
+    });
+    const stage = await readExecutionFenceSchemaProtocol(execute);
+    if (!Array.isArray(rows) || stage === undefined || stage < minimumStage) {
+      throw malformedExecutionFence('row observation has no compatible schema');
+    }
+    if (rows.length === 0 && attempt === 0) {
+      if (stage === 0 && allowLegacyEmpty) return { stage, empty: true };
+      if (stage > 0) {
+        minimumStage = stage;
+        continue;
+      }
+    }
+    if (
+      rows.length !== 1 ||
+      rowField(rows[0], 'id') !== EXECUTION_FENCE_ROW_ID ||
+      !EXECUTION_FENCE_STATES.includes(rowField(rows[0], 'state'))
+    ) {
+      throw malformedExecutionFence('fence row is not a recognized singleton');
+    }
+    const metadata = decodeExecutionFenceMutationMetadata(rows[0]);
+    if (metadata.schemaStage > stage) {
+      throw malformedExecutionFence('schema observation precedes row metadata');
+    }
+    return { stage, empty: false, rowStage: metadata.schemaStage };
+  }
+  throw malformedExecutionFence('fence row is missing');
+}
+
+export async function initializeExecutionFenceProtocol(
+  execute,
+  { state, seededAt },
+) {
+  if (!EXECUTION_FENCE_STATES.includes(state)) {
+    throw malformedExecutionFence('initial state is unrecognized');
+  }
+  if (!Number.isSafeInteger(seededAt) || seededAt < 0) {
+    throw malformedExecutionFence('seed timestamp is invalid');
+  }
+  if ((await readExecutionFenceSchemaProtocol(execute)) === undefined) {
+    await execute(CREATE_EXECUTION_FENCE);
+    if ((await readExecutionFenceSchemaProtocol(execute)) === undefined) {
+      throw malformedExecutionFence('bootstrap did not create the table');
+    }
+  }
+  let observation = await observeExecutionFence(execute, true);
+  if (observation.empty) {
+    await execute(seedExecutionFenceRow(state, seededAt));
+    observation = await observeExecutionFence(execute, false);
+  }
+  for (let index = observation.stage; index < 4; index += 1) {
+    const stage = await readExecutionFenceSchemaProtocol(execute);
+    if (stage === undefined || stage < index) {
+      throw malformedExecutionFence('schema regressed during initialization');
+    }
+    if (stage > index) continue;
+    try {
+      await execute({
+        mode: 'write',
+        sql: `ALTER TABLE ${EXECUTION_FENCE_TABLE} ADD COLUMN ${EXECUTION_FENCE_ADDITIONS[index]}`,
+        bindings: [],
+      });
+    } catch (error) {
+      let observedStage;
+      try {
+        observedStage = await readExecutionFenceSchemaProtocol(execute);
+      } catch (readError) {
+        if (readError instanceof DeploymentIdentityError) throw readError;
+        throw error;
+      }
+      if (observedStage === undefined || observedStage <= index) throw error;
+    }
+  }
+  const final = await observeExecutionFence(execute, false);
+  if (final.stage !== 4 || final.rowStage !== 4) {
+    throw malformedExecutionFence(
+      'initialization did not reach the current schema',
+    );
+  }
 }
 
 async function scanTables(execute) {
@@ -380,7 +579,10 @@ export async function provisionDeploymentIdentityProtocol(
     // residue, on the one deployment a migration most needs to be able to lock.
     // Seeding here is what heals it, and INSERT-if-absent is what makes
     // repeating it safe on a deployment whose fence has since been moved.
-    await seedExecutionFence(execute, fenceState, seededAt);
+    await initializeExecutionFenceProtocol(execute, {
+      state: fenceState,
+      seededAt,
+    });
     return;
   }
   if (applicationTables.length > 0) {
@@ -393,7 +595,10 @@ export async function provisionDeploymentIdentityProtocol(
     if (storedAfterCreate !== tag) {
       throw differentOwnerError(caller, storedAfterCreate, tag);
     }
-    await seedExecutionFence(execute, fenceState, seededAt);
+    await initializeExecutionFenceProtocol(execute, {
+      state: fenceState,
+      seededAt,
+    });
     return;
   }
 
@@ -423,5 +628,8 @@ export async function provisionDeploymentIdentityProtocol(
   // PROVEN keeps it out of the window where `unownedDatabaseError` and the
   // conditional ownership insert are still deciding whether this database is
   // ours to write to at all.
-  await seedExecutionFence(execute, fenceState, seededAt);
+  await initializeExecutionFenceProtocol(execute, {
+    state: fenceState,
+    seededAt,
+  });
 }

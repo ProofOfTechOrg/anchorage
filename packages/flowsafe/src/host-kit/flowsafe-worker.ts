@@ -972,13 +972,19 @@ async function executionFenceAdminResponse<Env extends FlowsafeWorkerEnv>(
       expected?: unknown;
       next?: unknown;
       proofKey?: unknown;
+      expectedMutationEpoch?: unknown;
+      expectedRevision?: unknown;
+      advanceMutationEpoch?: unknown;
     };
     const reading = await fence.transition({
       expected: assertExecutionFenceState(body.expected, 'expected'),
       next: assertExecutionFenceState(body.next, 'next'),
       ...(body.proofKey === undefined ? {} : { proofKey: body.proofKey }),
+      expectedMutationEpoch: body.expectedMutationEpoch,
+      expectedRevision: body.expectedRevision,
+      advanceMutationEpoch: body.advanceMutationEpoch,
     });
-    return json({ state: reading.state });
+    return json(executionFenceReadingPayload(reading));
   } catch (error) {
     if (error instanceof DoStatusError) {
       return json(

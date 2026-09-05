@@ -164,7 +164,13 @@ Flowsafe does not maintain a parallel custom workflow state object.
 
 ### Execution fence and start reservations
 
-`flowsafe_execution_fence` stores the deployment's singleton fence state, optional proof key, and optional bound proof run. State transitions compare the caller's `expected` state before they write. A database created by Flowsafe 0.19 has no row or table, which reads as `open`; provisioning from 0.20 onward writes an explicit initial row.
+`flowsafe_execution_fence` stores the deployment's singleton fence state, optional proof key, bound proof run, mutation epoch, sticky epoch requirement, and transition revision. The epoch identifies artifact authority; an explicit `advanceMutationEpoch: true` increments it once and enables the requirement in the same compare-and-set. Every newly applied administrative command increments the revision, including same-state and legacy commands. Ordinary lock, proof, and reopen commands preserve the epoch and requirement.
+
+A missing pre-0.20 table or empty five-column legacy table reads as optional `open`, with epoch and revision zero. Initialization seeds only that legacy shape, then adds four metadata columns in order. Interrupted additive upgrades resume without changing the state, proof fields, or timestamp. A missing row once any metadata column exists is unreadable, never implicitly open or refilled. Readers allow one bounded re-observation when an empty legacy row read races a concurrent schema upgrade. Deleting the whole table or restoring an old-format backup is indistinguishable from genuine legacy absence.
+
+Store reads are uncached and require an authoritative database binding, not an unconstrained read replica. Metadata versioning is administrative state, not a guarantee that every run or schedule writer enforces it. Activate the epoch requirement only after every writer supports final-write epoch checks; administrative support alone is insufficient.
+
+`recordProofRun(key, runId, admitted)` binds proof metadata only at the admitted epoch and revision. Two-argument legacy calls work only while the requirement is optional. Neither form changes the administrative revision or receipt, and a retry of the same binding preserves its timestamp. This metadata write is not itself atomic run admission.
 
 `flowsafe_start_idempotency` stores owner, target, server-minted run ID, reservation state, and timestamps. The claim from `reserved` to `started` is the cross-isolate serializer. Terminal run cleanup pairs snapshot and reservation retention so a spent key remains distinguishable from a fresh key until its configured horizon expires.
 
@@ -312,7 +318,11 @@ GET  /admin/inventory
 
 All three require a bearer token matching `MAINTENANCE_ADMIN_SECRET`, which must differ from `DEPLOYMENT_IDENTITY_SECRET`. The deployment-identity gate still runs first. A mis-provisioned deployment therefore returns `503` before an operator can read or move its fence.
 
-`GET /admin/execution-fence` returns `{ state, proofKey?, proofRunId? }`. `POST /admin/execution-fence` accepts `{ expected, next, proofKey? }`; a stale expectation returns `409` with `reason.code: 'FENCE_CAS_CONFLICT'` and the current state.
+`GET` and successful `POST /admin/execution-fence` both return `{ state, mutationEpoch, requireMutationEpoch, transitionRevision, proofKey?, proofRunId? }`. `POST` accepts `{ expected, next, proofKey?, expectedMutationEpoch?, expectedRevision?, advanceMutationEpoch? }`. Supply both expected counters together as nonnegative safe-integer numbers. The advance flag is boolean, defaults to false, and requires the expected pair when true. Invalid fields return `400`; counters never wrap. The host continues to own transition policy, and `proofKey` is required only when entering `proof-only`.
+
+An upgraded command compares state, epoch, and revision in one UPDATE. Its exact retry converges only while its canonical command remains the last applied upgraded command. A matching resulting state alone is insufficient. A successful retry preserves an already-bound proof run and the original timestamp; an intervening administrative command makes the old retry conflict. The internal receipt is never returned over HTTP.
+
+A valid conditional miss returns `409` with `reason.code: 'FENCE_CAS_CONFLICT'`, the full current reading, and `reason.conflict: 'expectation-mismatch'`. Legacy state-only requests remain compatible before activation, retain their state-only ABA limitation, and clear the last upgraded receipt. After activation they return `versioned-expectation-required`. An uncertain write returns `503` unless strict readback proves the exact last command; malformed state or an invalid write-result envelope always returns `EXECUTION_FENCE_UNREADABLE`.
 
 `GET /admin/inventory` returns an index or one keyset-paginated category selected with `?category&cursor&limit`. The work categories are `runs`, `approvals-waiting`, `schedule-deferred-dispatches`, `pending-notifications`, `background-tasks`, `resource-owners`, and `start-reservations`. The standing categories are `schedules` and `signal-subscriptions`; they are reported for reconciliation and never required to empty.
 

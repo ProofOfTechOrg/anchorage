@@ -26,6 +26,7 @@ import type {
 } from '../src/types.js';
 import { WranglerLoopBackend } from '../src/wrangler-loop-backend.js';
 import type { CommandResult, CommandRunner } from '../src/wrangler-runner.js';
+import { D1State } from './fixtures/provider-world.js';
 
 const deployment: DeploymentSpec = {
   tenantTag: 'acme',
@@ -1821,58 +1822,21 @@ export default {
     expect(runner.calls.map(operation)).toContain('versions upload');
   });
 
-  it('reads and seeds database ownership through fenced provider-native SQL', async () => {
-    const sentinelDdl = `CREATE TABLE IF NOT EXISTS flowsafe_deployment (
-  id INTEGER PRIMARY KEY CHECK (id = 1),
-  tenant_tag TEXT NOT NULL,
-  provisioned_at TEXT NOT NULL
-)`;
-    let sentinelExists = false;
-    let fenceExists = false;
-    let owner: string | undefined;
+  it('seeds optional FS8 metadata through string-bound provider SQL', async () => {
+    const d1 = new D1State();
     let fenceBindings: readonly unknown[] | undefined;
     const runner = new FakeRunner();
     const routeApi = new FakeRouteApi();
     routeApi.queryHandler = async (sql, bindings) => {
-      let results: readonly Readonly<Record<string, unknown>>[] = [];
-      if (sql.includes("sqlite_schema WHERE type = 'table' ORDER BY name")) {
-        results = [
-          ...(sentinelExists
-            ? [{ name: 'flowsafe_deployment', sql: sentinelDdl }]
-            : []),
-          ...(fenceExists
-            ? [{ name: 'flowsafe_execution_fence', sql: 'CREATE' }]
-            : []),
-        ];
-      } else if (
-        sql.includes('name = ?') &&
-        bindings[0] === 'flowsafe_deployment'
-      ) {
-        results = sentinelExists ? [{ sql: sentinelDdl }] : [];
-      } else if (sql.startsWith('PRAGMA table_info')) {
-        results = [
-          { name: 'id', type: 'INTEGER', notnull: 0, pk: 1 },
-          { name: 'tenant_tag', type: 'TEXT', notnull: 1, pk: 0 },
-          { name: 'provisioned_at', type: 'TEXT', notnull: 1, pk: 0 },
-        ];
-      } else if (sql.startsWith('SELECT id, tenant_tag')) {
-        results = owner ? [{ id: 1, tenant_tag: owner }] : [];
-      } else if (
-        // Matched on the TARGET table, ahead of the generic arms: the ownership
-        // insert names the fence table inside its exclusion list.
-        sql.startsWith('CREATE TABLE IF NOT EXISTS flowsafe_execution_fence')
-      ) {
-        fenceExists = true;
-      } else if (
-        sql.startsWith('INSERT OR IGNORE INTO flowsafe_execution_fence')
-      ) {
+      if (sql.startsWith('INSERT OR IGNORE INTO flowsafe_execution_fence')) {
         fenceBindings = bindings;
-      } else if (sql.startsWith('CREATE TABLE')) {
-        sentinelExists = true;
-      } else if (sql.startsWith('INSERT OR IGNORE')) {
-        owner = String(bindings[0]);
       }
-      return results;
+      const parameters = bindings.map((value) => {
+        if (typeof value !== 'string')
+          throw new Error('fence parameters must be strings');
+        return value;
+      });
+      return d1.queryDatabase(sql, parameters);
     };
     const subject = backend(runner, { routeApi });
 
@@ -1896,7 +1860,19 @@ export default {
     // reaches it as a STRING — the plain-Worker adapter rejects anything else
     // (restD1Bindings), which is why the seeded timestamp is bound as text and
     // left to SQLite's INTEGER affinity.
-    expect(fenceExists).toBe(true);
+    expect(d1.queryDatabase('SELECT * FROM flowsafe_execution_fence')).toEqual([
+      {
+        id: 'deployment',
+        state: 'migration-locked',
+        proof_key: null,
+        proof_run_id: null,
+        updated_at: expect.any(Number),
+        last_transition_request: null,
+        transition_revision: 0,
+        mutation_epoch: 0,
+        require_mutation_epoch: 0,
+      },
+    ]);
     expect(fenceBindings).toEqual([
       'deployment',
       'migration-locked',
