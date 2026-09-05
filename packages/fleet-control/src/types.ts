@@ -300,6 +300,15 @@ export interface ExternalPlatformTargetDescription {
   readonly outboundPolicy: DeploymentEgressPolicy;
 }
 
+export const EXTERNAL_MIGRATION_SUBPHASES = [
+  'planned',
+  'schema-applied',
+  'platform-applied',
+  'candidate-deployed',
+  'candidate-armed',
+  'route-published',
+] as const satisfies readonly ExternalMigrationSubphase[];
+
 export const BACKEND_SWITCH_SUBPHASES = [
   'planned',
   'bridge-upload-authorized',

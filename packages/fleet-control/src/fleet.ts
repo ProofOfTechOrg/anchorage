@@ -13,6 +13,8 @@ import {
   finalizedBridgeForRecord,
   reconcileFinalizedBackendSwitchState,
 } from './backend-switch.js';
+import type { FleetMigrationPlanEntry } from './fleet-migration-state.js';
+import { FLEET_MIGRATION_PLAN_BOUND } from './fleet-operation-state.js';
 import {
   assertExternalPlatformTarget,
   assertExternalPlatformTargetCompatibility,
@@ -1981,6 +1983,1586 @@ async function retireCommittedRelease(
   return cleared;
 }
 
+interface AdmittedFleetMigrationContext {
+  readonly lease: FleetStateLease;
+  readonly database: NonNullable<
+    Awaited<ReturnType<typeof reconcilePersistedDatabase>>
+  >;
+  readonly backend: ProvisioningBackend;
+  readonly spec: DeploymentSpec;
+  readonly secrets: DeploymentSecrets;
+  readonly targetDigest: string;
+  readonly finalizedStateProvider?: FinalizedOrdinaryStateProvider;
+  readonly settlementFor?: (
+    record: FleetRecord,
+  ) => FleetSettlementHost | undefined;
+  readonly attestationOptions: AttestConvergedActiveRouteOptions;
+  readonly clock: () => number;
+  readonly immutableExternal: boolean;
+  readonly targetRelease?: ExternalReleaseSnapshot;
+  readonly targetPlatform?: ExternalPlatformTargetDescription;
+  readonly platformOnlyTarget?: ExternalPlatformTargetDescription;
+  readonly targetPhysicalScriptName?: string;
+}
+
+type FleetMigrationDependencies = Pick<
+  Parameters<typeof migrateFleet>[0],
+  | 'store'
+  | 'backendFor'
+  | 'specFor'
+  | 'secretsFor'
+  | 'finalizedStateProviderFor'
+  | 'settlementFor'
+> &
+  Readonly<{
+    lease: FleetStateLease;
+    attestationOptions: AttestConvergedActiveRouteOptions;
+    clock: () => number;
+    ordinal: number;
+  }>;
+
+type FleetMigrationPlanKind = 'ready' | 'platform-only' | 'full';
+
+function fleetMigrationPlanKindOf(
+  plan: readonly FleetMigrationPlanEntry[],
+): FleetMigrationPlanKind {
+  if (plan.some(({ step }) => step.startsWith('platform-only-'))) {
+    return 'platform-only';
+  }
+  return plan.some(({ step }) => step === 'seed-identity') ? 'full' : 'ready';
+}
+
+async function runFleetMigrationPreamble(
+  deps: FleetMigrationDependencies,
+  tenantTag: string,
+  environment: string,
+  doBaseExpectation: 'strict' | 'resumption',
+): Promise<
+  Readonly<{ admitted: AdmittedFleetMigrationContext; reread: FleetRecord }>
+> {
+  const { lease } = deps;
+  const stored = await deps.store.get(tenantTag, environment);
+  if (!stored) throw new Error('fleet migration record disappeared');
+  assertNoActiveDecommission(stored, 'migrateFleet');
+  assertNoActiveCleanup(stored, 'migrateFleet');
+  assertBackendSwitchInactive(stored);
+  const storedSchemaVersion = stored.schemaVersion;
+  const backend = deps.backendFor(stored);
+  const spec = deps.specFor(stored);
+  const secrets = deps.secretsFor(stored);
+  const finalizedOrdinaryState =
+    stored.backendSwitchIntent?.subphase === 'finalized' &&
+    stored.platformResources?.stateWorker.plane === 'ordinary';
+  const finalizedStateProvider = finalizedOrdinaryState
+    ? deps.finalizedStateProviderFor?.(stored)
+    : undefined;
+  if (finalizedOrdinaryState) {
+    finalizedBridgeForRecord(stored);
+    if (!finalizedStateProvider) {
+      throw new Error(
+        'finalized ordinary state requires its backend-switch provider',
+      );
+    }
+  }
+  validateDeploymentSpec(spec);
+  validateDeploymentSecrets(spec, secrets);
+  assertImmutableDeploymentMapping(stored, backend, spec);
+  assertPlatformDurableObjectHistory(stored, spec);
+  if (stored.phase !== 'ready' && stored.phase !== 'migrating') {
+    throw new Error(`cannot migrate deployment in phase '${stored.phase}'`);
+  }
+  const targetDigest = deploymentSpecDigest(spec);
+  const immutableExternal =
+    backend.immutableExternalArtifacts === true &&
+    spec.authoredBy === 'external';
+  const targetPhysicalScriptName = immutableExternal
+    ? backend.releaseScriptName?.(spec)
+    : undefined;
+  if (immutableExternal && !targetPhysicalScriptName) {
+    throw new Error(
+      'immutable external backend did not provide a physical release name',
+    );
+  }
+  if (
+    spec.migrations.some(
+      (migration) =>
+        migration.version > storedSchemaVersion &&
+        migration.rollbackCompatible !== true,
+    )
+  ) {
+    throw new Error(
+      'staged D1 migrations must attest rollbackCompatible before candidate creation',
+    );
+  }
+  const targetRelease: ExternalReleaseSnapshot | undefined =
+    targetPhysicalScriptName
+      ? {
+          physicalScriptName: targetPhysicalScriptName,
+          specDigest: targetDigest,
+          artifactVersion: 'pending',
+          releaseSchemaVersion: spec.schemaVersion,
+          application: applicationBindingTopology(
+            spec,
+            stored.applicationResources ?? [],
+          ),
+        }
+      : undefined;
+  const targetPlatform = immutableExternal
+    ? finalizedStateProvider
+      ? finalizedStateProvider.describeFinalizedBridgeTarget(spec, stored)
+      : describeExternalPlatformTarget(backend, spec)
+    : undefined;
+  if (stored.platformTarget && targetPlatform) {
+    assertExternalPlatformTargetCompatibility(
+      stored.platformTarget,
+      targetPlatform,
+    );
+  }
+  const platformOnlyTarget = targetPlatform
+    ? effectiveAppliedPlatformTarget(stored, targetPlatform)
+    : undefined;
+  if (
+    stored.phase === 'migrating' &&
+    (immutableExternal
+      ? stored.migrationIntent?.platformOnly === true
+        ? stored.migrationIntent.targetSpecDigest !== targetDigest ||
+          JSON.stringify(stored.migrationIntent.target) !==
+            JSON.stringify(platformOnlyTarget)
+        : stored.pendingRelease?.specDigest !== targetDigest ||
+          stored.pendingRelease?.physicalScriptName !==
+            targetPhysicalScriptName ||
+          stored.pendingRelease.releaseSchemaVersion !== spec.schemaVersion ||
+          stored.migrationIntent?.targetSpecDigest !== targetDigest
+      : stored.pendingSpecDigest !== targetDigest)
+  ) {
+    throw new Error('migration retry uses a different desired specification');
+  }
+  if (
+    spec.previousDurableObjectTag !== stored.durableObjectTag &&
+    (doBaseExpectation === 'strict' ||
+      (stored.durableObjectTag !== targetDurableObjectTag(spec) &&
+        !(
+          spec.authoredBy === 'external' &&
+          stored.platformResources?.stateWorker.plane === 'ordinary' &&
+          stored.durableObjectTag ===
+            stored.platformResources.stateWorker.durableObjectTag
+        )))
+  ) {
+    throw new Error(
+      `Durable Object migration base mismatch for ${stored.tenantTag}:${stored.environment}: expected '${stored.durableObjectTag ?? 'none'}'`,
+    );
+  }
+  const database = await reconcilePersistedDatabase(
+    backend,
+    stored,
+    false,
+    lease,
+  );
+  if (!database) {
+    throw new Error(`persisted database '${stored.databaseId}' is absent`);
+  }
+  return {
+    reread: stored,
+    admitted: {
+      lease,
+      database,
+      backend,
+      spec,
+      secrets,
+      targetDigest,
+      finalizedStateProvider,
+      settlementFor: deps.settlementFor,
+      attestationOptions: deps.attestationOptions,
+      get clock() {
+        return deps.clock;
+      },
+      immutableExternal,
+      targetRelease,
+      targetPlatform,
+      platformOnlyTarget,
+      targetPhysicalScriptName,
+    },
+  };
+}
+
+function platformOnlyChangeOf(
+  current: FleetRecord,
+  admitted: AdmittedFleetMigrationContext,
+): boolean {
+  return (
+    current.desiredSpecDigest === admitted.targetDigest &&
+    admitted.platformOnlyTarget !== undefined &&
+    current.platformTarget !== undefined &&
+    JSON.stringify(current.platformTarget) !==
+      JSON.stringify(admitted.platformOnlyTarget)
+  );
+}
+
+function assertFleetMigrationNonReadyGuards(
+  admitted: AdmittedFleetMigrationContext,
+  stored: FleetRecord,
+): void {
+  const { spec, immutableExternal, targetRelease, targetPlatform } = admitted;
+  const platformOnlyChange = platformOnlyChangeOf(stored, admitted);
+  if (
+    spec.schemaVersion < stored.schemaVersion &&
+    !platformOnlyChange &&
+    stored.migrationIntent?.platformOnly !== true
+  ) {
+    throw new Error(
+      `schema downgrade refused for ${stored.tenantTag}:${stored.environment}`,
+    );
+  }
+  if (immutableExternal && !stored.activeRelease) {
+    throw new Error(
+      'immutable external migration has no durable active release metadata',
+    );
+  }
+  if (
+    immutableExternal &&
+    targetRelease &&
+    targetPlatform &&
+    (!stored.platformTarget || !stored.outboundPolicy)
+  ) {
+    throw new Error(
+      'immutable external migration has no durable prior platform target and policy',
+    );
+  }
+}
+
+export async function admitFleetMigrationItem(
+  deps: FleetMigrationDependencies,
+  tenantTag: string,
+  environment: string,
+): Promise<
+  Readonly<{
+    admitted: AdmittedFleetMigrationContext;
+    plan: readonly FleetMigrationPlanEntry[];
+    reread: FleetRecord;
+  }>
+> {
+  const { admitted, reread } = await runFleetMigrationPreamble(
+    deps,
+    tenantTag,
+    environment,
+    'strict',
+  );
+  const plan: FleetMigrationPlanEntry[] = [];
+  if (reread.phase === 'ready' && reread.retiringRelease) {
+    plan.push({ step: 'retire-pre' });
+  }
+  const platformOnlyChange = platformOnlyChangeOf(reread, admitted);
+  if (
+    reread.phase === 'ready' &&
+    reread.desiredSpecDigest === admitted.targetDigest &&
+    !platformOnlyChange
+  ) {
+    plan.push(
+      { step: 'ready-target-backfill' },
+      { step: 'ready-platform-resources' },
+      { step: 'ready-maintenance' },
+      { step: 'ready-promote' },
+      { step: 'ready-attest-settle' },
+      { step: 'ready-retire-post' },
+    );
+  } else {
+    if (reread.phase === 'ready') plan.push({ step: 'admit-migrating' });
+    plan.push({ step: 'assert-migrating' });
+    const platformOnly =
+      reread.phase === 'ready'
+        ? platformOnlyChange
+        : reread.migrationIntent?.platformOnly === true;
+    if (platformOnly) {
+      plan.push(
+        { step: 'platform-only-schema' },
+        { step: 'platform-only-resources' },
+        { step: 'platform-only-maintenance' },
+        { step: 'platform-only-promote' },
+        { step: 'platform-only-ready' },
+      );
+    } else {
+      plan.push({ step: 'seed-identity' });
+      const pending = admitted.spec.migrations.filter(
+        ({ version }) => version > reread.schemaVersion,
+      );
+      if (pending.length === 0) plan.push({ step: 'apply-migrations' });
+      for (const { version } of pending) {
+        plan.push({ step: 'apply-migrations', targetSchemaVersion: version });
+      }
+      plan.push(
+        { step: 'migration-schema-applied' },
+        { step: 'platform-resources' },
+        { step: 'pending-topology' },
+        { step: 'deploy-candidate' },
+        { step: 'arm-maintenance' },
+        { step: 'promote' },
+        { step: 'settle-ready' },
+        { step: 'retire-post' },
+      );
+    }
+  }
+  if (plan.length > FLEET_MIGRATION_PLAN_BOUND) {
+    throw new Error(
+      `fleet migration plan for item ${deps.ordinal} exceeds the plan bound of 64 steps`,
+    );
+  }
+  if (fleetMigrationPlanKindOf(plan) !== 'ready') {
+    assertFleetMigrationNonReadyGuards(admitted, reread);
+  }
+  return { admitted, plan, reread };
+}
+
+function isPlatformOnlyTerminalProjection(
+  current: FleetRecord,
+  admitted: AdmittedFleetMigrationContext,
+): boolean {
+  const { platformOnlyTarget } = admitted;
+  return (
+    platformOnlyTarget !== undefined &&
+    JSON.stringify(current.platformTarget) ===
+      JSON.stringify(platformOnlyTarget) &&
+    JSON.stringify(current.outboundPolicy) ===
+      JSON.stringify(platformOnlyTarget.outboundPolicy)
+  );
+}
+
+function isFullTerminalProjection(
+  current: FleetRecord,
+  admitted: AdmittedFleetMigrationContext,
+): boolean {
+  const { spec, targetPlatform, targetRelease } = admitted;
+  if (
+    current.schemaVersion !== spec.schemaVersion ||
+    current.pendingSpecDigest !== undefined ||
+    current.pendingArtifactVersion !== undefined ||
+    current.pendingRelease !== undefined ||
+    current.migrationPriorRelease !== undefined
+  )
+    return false;
+  if (
+    targetPlatform &&
+    (JSON.stringify(current.platformTarget) !==
+      JSON.stringify(targetPlatform) ||
+      JSON.stringify(current.outboundPolicy) !==
+        JSON.stringify(targetPlatform.outboundPolicy))
+  )
+    return false;
+  if (
+    targetRelease &&
+    (!current.activeRelease ||
+      current.activeRelease.physicalScriptName !==
+        targetRelease.physicalScriptName ||
+      current.activeRelease.releaseSchemaVersion !==
+        targetRelease.releaseSchemaVersion)
+  )
+    return false;
+  const expectedApplication = targetRelease
+    ? (current.activeRelease?.application ??
+      applicationBindingTopology(spec, current.applicationResources ?? []))
+    : applicationBindingTopology(spec, current.applicationResources ?? []);
+  return (
+    JSON.stringify(current.applicationBindings) ===
+    JSON.stringify(expectedApplication)
+  );
+}
+
+function isConvergedTerminalCommit(
+  current: FleetRecord,
+  admitted: AdmittedFleetMigrationContext,
+  planKind: 'platform-only' | 'full',
+): boolean {
+  return (
+    current.phase === 'ready' &&
+    current.migrationIntent === undefined &&
+    current.desiredSpecDigest === admitted.targetDigest &&
+    !platformOnlyChangeOf(current, admitted) &&
+    (planKind === 'platform-only'
+      ? isPlatformOnlyTerminalProjection(current, admitted)
+      : isFullTerminalProjection(current, admitted))
+  );
+}
+
+export async function assertMigratingCarrierState(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<void> {
+  const {
+    lease,
+    spec,
+    immutableExternal,
+    targetPlatform,
+    platformOnlyTarget,
+    finalizedStateProvider,
+  } = admitted;
+  if (
+    immutableExternal &&
+    (!current.migrationIntent ||
+      (current.migrationIntent.platformOnly !== true &&
+        (!current.migrationPriorRelease || !current.pendingRelease)))
+  ) {
+    throw new Error(
+      'immutable external migration lost its durable release intent',
+    );
+  }
+  if (targetPlatform && current.migrationIntent) {
+    assertExternalPlatformTarget(
+      current.migrationIntent.target,
+      current.migrationIntent.platformOnly === true
+        ? (platformOnlyTarget as ExternalPlatformTargetDescription)
+        : targetPlatform,
+      'migration retry',
+    );
+  }
+  if (finalizedStateProvider && targetPlatform) {
+    const finalizedPlan = finalizedStateProvider.describeFinalizedState({
+      targetSpec: spec,
+      currentRecord: current,
+      target: current.migrationIntent?.target ?? targetPlatform,
+    });
+    await finalizedStateProvider.assertFinalizedState({
+      targetSpec: spec,
+      currentRecord: current,
+      target: current.migrationIntent?.target ?? targetPlatform,
+      plan: finalizedPlan,
+      fence: lease,
+    });
+  }
+}
+
+async function migrationRetirePre(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const { lease, database, backend, spec } = admitted;
+  if (current.phase === 'ready' && current.retiringRelease) {
+    current = await retireCommittedRelease(
+      backend,
+      spec,
+      database,
+      current,
+      lease,
+      admitted.clock,
+    );
+  }
+  return current;
+}
+
+async function migrationReadyTargetBackfill(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const { lease, targetPlatform } = admitted;
+  if (targetPlatform) {
+    if (!current.platformTarget) {
+      if (!current.platformResources) {
+        throw new Error(
+          'ready external deployment has no trusted platform resources',
+        );
+      }
+      assertPlatformResourcesMatchTarget(
+        current.platformResources,
+        targetPlatform,
+      );
+      current = {
+        ...current,
+        platformTarget: targetPlatform,
+        outboundPolicy: targetPlatform.outboundPolicy,
+        updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+      };
+      await lease.put(current);
+    }
+  }
+  return current;
+}
+
+async function migrationReadyPlatformResources(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const {
+    lease,
+    database,
+    backend,
+    spec,
+    secrets,
+    finalizedStateProvider,
+    targetPlatform,
+    platformOnlyTarget,
+  } = admitted;
+  if (targetPlatform) {
+    const rollbackCompatibleTarget = platformOnlyTarget ?? targetPlatform;
+    assertExternalPlatformTarget(
+      current.platformTarget,
+      rollbackCompatibleTarget,
+      'ready deployment',
+    );
+    current = await convergeExternalPlatformResources(
+      backend,
+      spec,
+      database,
+      secrets,
+      rollbackCompatibleTarget,
+      current,
+      lease,
+      admitted.clock,
+      finalizedStateProvider,
+    );
+  }
+  return current;
+}
+
+async function migrationReadyMaintenance(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const {
+    lease,
+    backend,
+    spec,
+    secrets,
+    targetDigest,
+    immutableExternal,
+    targetRelease,
+  } = admitted;
+  const live = await backend.inspect(
+    spec,
+    secrets.maintenanceAdmin,
+    activeArtifactVersion(current),
+  );
+  if (!live) throw new Error('ready migration target is missing');
+  assertLiveDeploymentMatches(
+    live,
+    current,
+    spec,
+    targetDigest,
+    current.activeRelease?.application,
+  );
+  if (immutableExternal && current.activeRelease) {
+    assertExternalReleaseArtifactVersion(
+      live,
+      current.activeRelease,
+      'ready migration',
+    );
+  }
+  if (
+    targetRelease &&
+    (current.activeRelease?.physicalScriptName !==
+      targetRelease.physicalScriptName ||
+      current.activeRelease.releaseSchemaVersion !==
+        targetRelease.releaseSchemaVersion ||
+      current.activeRelease.artifactVersion !== live.artifactVersion)
+  ) {
+    throw new Error(
+      'ready immutable release metadata does not exactly match the target',
+    );
+  }
+  let maintenance = live.maintenance;
+  if (!maintenance.armed) {
+    current = await commitInvocationAuthority(lease, current, admitted.clock);
+    await lease.assertOwned();
+    maintenance = await backend.ensureMaintenance(
+      spec,
+      secrets.maintenanceAdmin,
+      lease,
+      activeArtifactVersion(current),
+    );
+  }
+  if (!maintenance.armed) throw new Error('maintenance did not re-arm');
+  return current;
+}
+
+async function migrationReadyPromote(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const { lease, backend, spec, targetPhysicalScriptName } = admitted;
+  current = await commitInvocationAuthority(lease, current, admitted.clock);
+  await lease.assertOwned();
+  await backend.promoteWorker(
+    spec,
+    buildPromotionGuard(current, targetPhysicalScriptName ?? spec.scriptName),
+    current.outboundPolicy,
+    lease,
+    activeArtifactVersion(current),
+  );
+  return current;
+}
+
+async function migrationReadyAttestSettle(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const {
+    lease,
+    backend,
+    spec,
+    targetDigest,
+    settlementFor,
+    attestationOptions,
+  } = admitted;
+  // The steady-state path: an unchanged deployment reconciled again.
+  // It re-promotes because a crash could have left the route behind,
+  // so it must re-attest — but it must not re-settle, or a fleet on a
+  // reconcile schedule would settle forever.
+  const convergence = await settlePromotedRoute({
+    backend,
+    spec,
+    record: current,
+    entry: 'ready-convergence',
+    target: current.activeRelease,
+    prior: current.rollbackRelease,
+    expectedSpecDigest: targetDigest,
+    expectedArtifactVersion: activeArtifactVersion(current),
+    settlementHost: settlementFor?.(current),
+    attestation: attestationOptions,
+    skipWhenAlreadySettled: true,
+  });
+  if (convergence.settled) {
+    current = {
+      ...current,
+      settledSettlementKey: convergence.settlementKey,
+      updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+    };
+    await lease.put(current);
+  }
+  return current;
+}
+
+async function migrationReadyRetirePost(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const { lease, database, backend, spec } = admitted;
+  return retireCommittedRelease(
+    backend,
+    spec,
+    database,
+    current,
+    lease,
+    admitted.clock,
+  );
+}
+
+async function migrationAdmitMigrating(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+  planKind: FleetMigrationPlanKind,
+): Promise<FleetRecord> {
+  const {
+    lease,
+    targetDigest,
+    immutableExternal,
+    targetRelease,
+    targetPlatform,
+    platformOnlyTarget,
+  } = admitted;
+  const externalIntent: ExternalMigrationIntent | undefined =
+    immutableExternal && targetRelease && targetPlatform
+      ? planKind === 'platform-only'
+        ? {
+            platformOnly: true,
+            targetSpecDigest: targetDigest,
+            priorRelease: current.activeRelease as ExternalReleaseSnapshot,
+            priorTarget:
+              current.platformTarget as ExternalPlatformTargetDescription,
+            priorOutboundPolicy:
+              current.outboundPolicy as DeploymentEgressPolicy,
+            targetRelease: current.activeRelease as ExternalReleaseSnapshot,
+            target: platformOnlyTarget as ExternalPlatformTargetDescription,
+            subphase: 'planned',
+          }
+        : {
+            targetSpecDigest: targetDigest,
+            priorRelease: current.activeRelease as ExternalReleaseSnapshot,
+            priorTarget:
+              current.platformTarget as ExternalPlatformTargetDescription,
+            priorOutboundPolicy:
+              current.outboundPolicy as DeploymentEgressPolicy,
+            targetRelease,
+            target: targetPlatform,
+            subphase: 'planned',
+          }
+      : undefined;
+  const migrationRecord: FleetRecord =
+    current.phase === 'ready'
+      ? {
+          ...current,
+          phase: 'migrating',
+          ...(externalIntent?.platformOnly
+            ? { migrationIntent: externalIntent }
+            : targetRelease
+              ? {
+                  pendingRelease: targetRelease,
+                  migrationPriorRelease: current.activeRelease,
+                  migrationIntent: externalIntent,
+                }
+              : {}),
+          ...(!targetRelease ? { pendingSpecDigest: targetDigest } : {}),
+          updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+        }
+      : current;
+  if (current.phase === 'ready') await lease.put(migrationRecord);
+  return migrationRecord;
+}
+
+async function migrationAssertMigrating(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  await assertMigratingCarrierState(admitted, current);
+  return current;
+}
+
+async function migrationPlatformOnlySchema(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const { lease } = admitted;
+  const intent = current.migrationIntent as ExternalMigrationIntent;
+  if (intent.subphase === 'planned') {
+    current = {
+      ...current,
+      migrationIntent: {
+        ...intent,
+        subphase: 'schema-applied',
+      },
+      updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+    };
+    await lease.put(current);
+  }
+  return current;
+}
+
+async function migrationPlatformOnlyResources(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const { lease, database, backend, spec, secrets, finalizedStateProvider } =
+    admitted;
+  const platformMigrationTarget = (
+    current.migrationIntent as ExternalMigrationIntent
+  ).target;
+  current = await convergeExternalPlatformResources(
+    backend,
+    spec,
+    database,
+    secrets,
+    platformMigrationTarget,
+    current,
+    lease,
+    admitted.clock,
+    finalizedStateProvider,
+  );
+  if (current.migrationIntent?.subphase === 'schema-applied') {
+    current = {
+      ...current,
+      migrationIntent: {
+        ...current.migrationIntent,
+        subphase: 'platform-applied',
+      },
+      updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+    };
+    await lease.put(current);
+  }
+  return current;
+}
+
+async function migrationPlatformOnlyMaintenance(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+  entry: FleetRecord,
+): Promise<FleetRecord> {
+  const { lease, backend, spec, secrets, targetDigest } = admitted;
+  const platformMigrationRelease = (
+    current.migrationIntent as ExternalMigrationIntent
+  ).targetRelease;
+  const maintenancePreflight = await backend.inspect(
+    spec,
+    secrets.maintenanceAdmin,
+    platformMigrationRelease.artifactVersion,
+  );
+  if (!maintenancePreflight) {
+    throw new Error('platform-only migration release is missing');
+  }
+  assertLiveDeploymentMatches(
+    maintenancePreflight,
+    entry,
+    spec,
+    targetDigest,
+    platformMigrationRelease.application,
+  );
+  assertExternalReleaseArtifactVersion(
+    maintenancePreflight,
+    platformMigrationRelease,
+    'platform-only maintenance',
+  );
+  current = await commitInvocationAuthority(lease, current, admitted.clock);
+  await lease.assertOwned();
+  const maintenance = await backend.ensureMaintenance(
+    spec,
+    secrets.maintenanceAdmin,
+    lease,
+    platformMigrationRelease.artifactVersion,
+  );
+  if (!maintenance.armed) {
+    throw new Error(
+      'platform-only migration maintenance is unarmed before route publication',
+    );
+  }
+  return current;
+}
+
+async function migrationPlatformOnlyPromote(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+  entry: FleetRecord,
+): Promise<FleetRecord> {
+  const {
+    lease,
+    backend,
+    spec,
+    secrets,
+    targetDigest,
+    targetPhysicalScriptName,
+  } = admitted;
+  const platformMigrationTarget = (
+    current.migrationIntent as ExternalMigrationIntent
+  ).target;
+  const platformMigrationRelease = (
+    current.migrationIntent as ExternalMigrationIntent
+  ).targetRelease;
+  if (current.migrationIntent?.subphase === 'platform-applied') {
+    const publicationPreflight = await backend.inspect(
+      spec,
+      secrets.maintenanceAdmin,
+      platformMigrationRelease.artifactVersion,
+    );
+    if (!publicationPreflight) {
+      throw new Error('platform-only migration release is missing');
+    }
+    assertLiveDeploymentMatches(
+      publicationPreflight,
+      entry,
+      spec,
+      targetDigest,
+      platformMigrationRelease.application,
+    );
+    assertExternalReleaseArtifactVersion(
+      publicationPreflight,
+      platformMigrationRelease,
+      'platform-only publication',
+    );
+    // The preceding maintenance step durably committed invocation authority.
+    await lease.assertOwned();
+    await backend.promoteWorker(
+      spec,
+      buildPromotionGuard(current, targetPhysicalScriptName ?? spec.scriptName),
+      platformMigrationTarget.outboundPolicy,
+      lease,
+      platformMigrationRelease.artifactVersion,
+    );
+    current = {
+      ...current,
+      migrationIntent: {
+        ...current.migrationIntent,
+        subphase: 'route-published',
+      },
+      updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+    };
+    await lease.put(current);
+  }
+  return current;
+}
+
+async function migrationPlatformOnlyReady(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+  entry: FleetRecord,
+): Promise<FleetRecord> {
+  const {
+    lease,
+    backend,
+    spec,
+    secrets,
+    targetDigest,
+    settlementFor,
+    attestationOptions,
+  } = admitted;
+  if (isConvergedTerminalCommit(current, admitted, 'platform-only'))
+    return current;
+  const platformMigrationTarget = (
+    current.migrationIntent as ExternalMigrationIntent
+  ).target;
+  const platformMigrationRelease = (
+    current.migrationIntent as ExternalMigrationIntent
+  ).targetRelease;
+  const live = await backend.inspect(
+    spec,
+    secrets.maintenanceAdmin,
+    platformMigrationRelease.artifactVersion,
+  );
+  if (!live) throw new Error('platform-only migration release is missing');
+  assertLiveDeploymentMatches(
+    live,
+    entry,
+    spec,
+    targetDigest,
+    platformMigrationRelease.application,
+  );
+  assertExternalReleaseArtifactVersion(
+    live,
+    platformMigrationRelease,
+    'platform-only settlement',
+  );
+  const platformSettlement = await settlePromotedRoute({
+    backend,
+    spec,
+    record: current,
+    entry: 'platform-only',
+    target: platformMigrationRelease,
+    prior: current.rollbackRelease,
+    expectedSpecDigest: targetDigest,
+    expectedArtifactVersion: platformMigrationRelease.artifactVersion,
+    settlementHost: settlementFor?.(current),
+    attestation: attestationOptions,
+  });
+  const settled = { ...current };
+  delete settled.migrationIntent;
+  const migrated: FleetRecord = {
+    ...settled,
+    phase: 'ready',
+    platformTarget: platformMigrationTarget,
+    outboundPolicy: platformMigrationTarget.outboundPolicy,
+    ...(platformSettlement.settled
+      ? { settledSettlementKey: platformSettlement.settlementKey }
+      : {}),
+    updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+  };
+  await lease.put(migrated);
+  return migrated;
+}
+
+async function migrationSeedIdentity(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+  entry: FleetRecord,
+): Promise<FleetRecord> {
+  const { lease, database, backend } = admitted;
+  await lease.assertOwned();
+  // Re-stamping a database this deployment already owns: the ownership
+  // sentinel short-circuits, and the only thing that can still happen is
+  // the fence row being CREATED where none exists.
+  //
+  // 'open' is hard-coded, and migrateFleet takes no fence option, for one
+  // reason: the deployment being migrated is `ready` or `migrating` — it
+  // is EXECUTING right now. A pre-0.20 database has no fence row and
+  // therefore reads as open; materializing that row must record what the
+  // deployment already IS, not impose something new. Seeding
+  // 'migration-locked' here would silently stop a live deployment in the
+  // middle of its own migration. Closing a fence is an operator action
+  // through POST /admin/execution-fence, never a side effect of a
+  // schema pass.
+  await backend.seedDeploymentIdentity(database, entry.tenantTag, lease, {
+    initialExecutionFenceState: 'open',
+  });
+  return current;
+}
+
+async function migrationApplyMigrations(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+  entry: FleetRecord,
+  planEntry: FleetMigrationPlanEntry,
+  finalOccurrence: boolean,
+): Promise<FleetRecord> {
+  const { backend, database, lease, spec } = admitted;
+  const { targetSchemaVersion } = planEntry;
+  if (
+    targetSchemaVersion === undefined ||
+    (current.schemaVersion >= targetSchemaVersion && finalOccurrence)
+  ) {
+    await lease.assertOwned();
+    await backend.applyMigrations(database, spec.migrations, lease);
+  } else if (current.schemaVersion < targetSchemaVersion) {
+    await lease.assertOwned();
+    await backend.applyMigrations(
+      database,
+      spec.migrations.slice(0, targetSchemaVersion),
+      lease,
+    );
+    current = {
+      ...current,
+      schemaVersion: targetSchemaVersion,
+      updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+    };
+    await lease.put(current);
+  }
+  if (finalOccurrence && current.schemaVersion !== spec.schemaVersion) {
+    throw new Error(
+      `missing D1 migration path from ${entry.schemaVersion} to ${spec.schemaVersion}`,
+    );
+  }
+  return current;
+}
+
+async function migrationSchemaApplied(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const { lease } = admitted;
+  if (current.migrationIntent?.subphase === 'planned') {
+    current = {
+      ...current,
+      migrationIntent: {
+        ...current.migrationIntent,
+        subphase: 'schema-applied',
+      },
+      updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+    };
+    await lease.put(current);
+  }
+  return current;
+}
+
+async function migrationPlatformResources(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const {
+    lease,
+    database,
+    backend,
+    spec,
+    secrets,
+    finalizedStateProvider,
+    targetPlatform,
+  } = admitted;
+  if (targetPlatform) {
+    current = await convergeExternalPlatformResources(
+      backend,
+      spec,
+      database,
+      secrets,
+      current.migrationIntent?.target ?? targetPlatform,
+      current,
+      lease,
+      admitted.clock,
+      finalizedStateProvider,
+    );
+    if (current.migrationIntent?.subphase === 'schema-applied') {
+      current = {
+        ...current,
+        migrationIntent: {
+          ...current.migrationIntent,
+          subphase: 'platform-applied',
+        },
+        updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+      };
+      await lease.put(current);
+    }
+  }
+  return current;
+}
+
+async function migrationPendingTopology(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const { lease, spec } = admitted;
+  if (current.pendingRelease && current.platformResources) {
+    const topology = externalReleaseTopology(
+      spec,
+      current.platformResources,
+      current.applicationResources,
+    );
+    current = {
+      ...current,
+      pendingRelease: { ...current.pendingRelease, topology },
+      ...(current.migrationIntent
+        ? {
+            migrationIntent: {
+              ...current.migrationIntent,
+              targetRelease: {
+                ...current.migrationIntent.targetRelease,
+                topology,
+              },
+            },
+          }
+        : {}),
+      updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+    };
+    await lease.put(current);
+  }
+  return current;
+}
+
+async function migrationDeployCandidate(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+  entry: FleetRecord,
+): Promise<FleetRecord> {
+  const {
+    lease,
+    database,
+    backend,
+    spec,
+    secrets,
+    targetDigest,
+    immutableExternal,
+    targetPhysicalScriptName,
+  } = admitted;
+  let live: LiveDeployment | undefined;
+  if (current.migrationIntent?.subphase !== 'platform-applied') {
+    live = await backend.inspect(
+      spec,
+      secrets.maintenanceAdmin,
+      pendingArtifactVersion(current),
+    );
+  }
+  if (
+    current.pendingRelease &&
+    current.pendingRelease.artifactVersion !== 'pending'
+  ) {
+    assertExternalReleaseArtifactVersion(
+      live,
+      current.pendingRelease,
+      'migration candidate',
+    );
+  }
+  if (
+    current.migrationIntent?.subphase === 'platform-applied' ||
+    !live ||
+    live.desiredSpecDigest !== targetDigest
+  ) {
+    current = await commitInvocationAuthority(lease, current, admitted.clock);
+    await lease.assertOwned();
+    const deployed = await backend.deployWorker(
+      spec,
+      database,
+      secrets,
+      current.platformResources,
+      lease,
+      current.pendingRelease?.artifactVersion ??
+        current.pendingArtifactVersion ??
+        (immutableExternal ? 'pending' : undefined),
+      current.migrationIntent?.targetRelease.application ??
+        current.pendingRelease?.application ??
+        applicationBindingTopology(spec, current.applicationResources ?? []),
+    );
+    if (
+      targetPhysicalScriptName &&
+      deployed.physicalScriptName !== targetPhysicalScriptName
+    ) {
+      throw new Error('backend deployed an unexpected physical release');
+    }
+  }
+  live = await backend.inspect(
+    spec,
+    secrets.maintenanceAdmin,
+    pendingArtifactVersion(current),
+  );
+  if (!live) throw new Error('migration candidate is missing');
+  assertLiveDeploymentMatches(
+    live,
+    entry,
+    spec,
+    targetDigest,
+    current.migrationIntent?.targetRelease.application ??
+      current.pendingRelease?.application,
+  );
+  if (current.pendingRelease) {
+    assertExternalReleaseArtifactVersion(
+      live,
+      current.pendingRelease,
+      'migration candidate',
+    );
+  }
+  if (
+    targetPhysicalScriptName &&
+    live.scriptName !== targetPhysicalScriptName
+  ) {
+    throw new Error('migration candidate has an unexpected physical name');
+  }
+  if (
+    current.migrationIntent &&
+    current.pendingRelease?.artifactVersion === 'pending'
+  ) {
+    const intendedTopology = current.pendingRelease.topology;
+    if (!intendedTopology) {
+      throw new Error('migration candidate has no intended binding topology');
+    }
+    const pendingRelease = {
+      ...current.migrationIntent.targetRelease,
+      artifactVersion: live.artifactVersion,
+      topology: externalReleaseTopologyFromLive(live, intendedTopology),
+    };
+    current = {
+      ...current,
+      pendingRelease,
+      migrationIntent: {
+        ...current.migrationIntent,
+        targetRelease: pendingRelease,
+        subphase: 'candidate-deployed',
+      },
+      updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+    };
+    await lease.put(current);
+  } else if (
+    !immutableExternal &&
+    current.pendingArtifactVersion === undefined
+  ) {
+    current = {
+      ...current,
+      pendingArtifactVersion: live.artifactVersion,
+      updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+    };
+    await lease.put(current);
+  }
+  return current;
+}
+
+async function migrationArmMaintenance(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const { lease, backend, spec, secrets } = admitted;
+  current = await commitInvocationAuthority(lease, current, admitted.clock);
+  await lease.assertOwned();
+  const maintenance = await backend.ensureMaintenance(
+    spec,
+    secrets.maintenanceAdmin,
+    lease,
+    pendingArtifactVersion(current),
+  );
+  if (!maintenance.armed) throw new Error('maintenance did not re-arm');
+  if (current.migrationIntent?.subphase === 'candidate-deployed') {
+    current = {
+      ...current,
+      migrationIntent: {
+        ...current.migrationIntent,
+        subphase: 'candidate-armed',
+      },
+      updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+    };
+    await lease.put(current);
+  }
+  return current;
+}
+
+async function migrationPromote(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+  entry: FleetRecord,
+): Promise<FleetRecord> {
+  const {
+    lease,
+    backend,
+    spec,
+    secrets,
+    targetDigest,
+    targetPhysicalScriptName,
+  } = admitted;
+  const publicationPreflight = await backend.inspect(
+    spec,
+    secrets.maintenanceAdmin,
+    pendingArtifactVersion(current),
+  );
+  if (!publicationPreflight) {
+    throw new Error('migration candidate is missing before publication');
+  }
+  assertLiveDeploymentMatches(
+    publicationPreflight,
+    entry,
+    spec,
+    targetDigest,
+    current.migrationIntent?.targetRelease.application ??
+      current.pendingRelease?.application,
+  );
+  if (current.pendingRelease) {
+    assertExternalReleaseArtifactVersion(
+      publicationPreflight,
+      current.pendingRelease,
+      'migration publication',
+    );
+  }
+  // The preceding maintenance step durably committed invocation authority.
+  await lease.assertOwned();
+  await backend.promoteWorker(
+    spec,
+    buildPromotionGuard(current, targetPhysicalScriptName ?? spec.scriptName),
+    current.migrationIntent?.target.outboundPolicy ?? current.outboundPolicy,
+    lease,
+    pendingArtifactVersion(current),
+  );
+  if (current.migrationIntent) {
+    current = {
+      ...current,
+      migrationIntent: {
+        ...current.migrationIntent,
+        subphase: 'route-published',
+      },
+      updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+    };
+    await lease.put(current);
+  }
+  return current;
+}
+
+async function migrationSettleReady(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+  entry: FleetRecord,
+): Promise<FleetRecord> {
+  const {
+    lease,
+    backend,
+    spec,
+    secrets,
+    targetDigest,
+    finalizedStateProvider,
+    settlementFor,
+    attestationOptions,
+    targetPlatform,
+    targetPhysicalScriptName,
+  } = admitted;
+  if (isConvergedTerminalCommit(current, admitted, 'full')) return current;
+  const live = await backend.inspect(
+    spec,
+    secrets.maintenanceAdmin,
+    pendingArtifactVersion(current),
+  );
+  if (!live) {
+    throw new Error(
+      `deployment did not converge after migration for ${entry.tenantTag}:${entry.environment}`,
+    );
+  }
+  assertLiveDeploymentMatches(
+    live,
+    entry,
+    spec,
+    targetDigest,
+    current.migrationIntent?.targetRelease.application ??
+      current.pendingRelease?.application,
+  );
+  if (current.pendingRelease) {
+    assertExternalReleaseArtifactVersion(
+      live,
+      current.pendingRelease,
+      'migration settlement',
+    );
+  }
+  if (
+    targetPhysicalScriptName &&
+    live.scriptName !== targetPhysicalScriptName
+  ) {
+    throw new Error('promoted release has an unexpected physical name');
+  }
+  const rollbackRelease = current.migrationPriorRelease;
+  const retiringRelease = targetPhysicalScriptName
+    ? entry.rollbackRelease
+    : undefined;
+  const committedTargetRelease = current.pendingRelease;
+  if (
+    targetPhysicalScriptName &&
+    (!committedTargetRelease ||
+      committedTargetRelease.physicalScriptName !== targetPhysicalScriptName ||
+      !committedTargetRelease.topology)
+  ) {
+    throw new Error('promoted release has no exact persisted binding topology');
+  }
+  const migrationSettlement = await settlePromotedRoute({
+    backend,
+    spec,
+    record: current,
+    entry: 'migration',
+    target: committedTargetRelease,
+    prior: rollbackRelease,
+    expectedSpecDigest: targetDigest,
+    expectedArtifactVersion: live.artifactVersion,
+    settlementHost: settlementFor?.(current),
+    attestation: attestationOptions,
+  });
+  const settled = { ...current };
+  delete settled.pendingRelease;
+  delete settled.migrationPriorRelease;
+  delete settled.pendingSpecDigest;
+  delete settled.pendingArtifactVersion;
+  delete settled.migrationIntent;
+  const migrated: FleetRecord = {
+    ...settled,
+    phase: 'ready',
+    desiredSpecDigest: targetDigest,
+    schemaVersion: spec.schemaVersion,
+    artifactVersion: live.artifactVersion,
+    ...(targetPhysicalScriptName
+      ? {
+          activeRelease: committedTargetRelease as ExternalReleaseSnapshot,
+          rollbackRelease,
+          ...(retiringRelease ? { retiringRelease } : {}),
+        }
+      : {}),
+    ...(targetPlatform
+      ? {
+          platformTarget: targetPlatform,
+          outboundPolicy: targetPlatform.outboundPolicy,
+        }
+      : {}),
+    durableObjectTag: finalizedStateProvider
+      ? current.durableObjectTag
+      : targetDurableObjectTag(spec),
+    ...(spec.authoredBy === 'platform'
+      ? {
+          durableObjectMigrationHistory: canonicalDurableObjectMigrationHistory(
+            spec.durableObjectMigrations,
+          ),
+          durableObjectMigrationHistoryDigest:
+            durableObjectMigrationHistoryDigest(spec.durableObjectMigrations),
+        }
+      : {}),
+    durableObjectBindings: live.durableObjectBindings,
+    applicationBindings:
+      committedTargetRelease?.application ??
+      applicationBindingTopology(spec, current.applicationResources ?? []),
+    ...(migrationSettlement.settled
+      ? { settledSettlementKey: migrationSettlement.settlementKey }
+      : {}),
+    updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+  };
+  await lease.put(migrated);
+  return migrated;
+}
+
+async function migrationRetirePost(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const { lease, database, backend, spec } = admitted;
+  return retireCommittedRelease(
+    backend,
+    spec,
+    database,
+    current,
+    lease,
+    admitted.clock,
+  );
+}
+
+type FleetMigrationStepResult =
+  | Readonly<{ done: false; record: FleetRecord; resultOnDone?: never }>
+  | Readonly<{ done: true; record: FleetRecord; resultOnDone: FleetRecord }>;
+
+export async function executeNextMigrationStep(
+  admitted: AdmittedFleetMigrationContext,
+  plan: readonly FleetMigrationPlanEntry[],
+  planCursor: number,
+  recordViews: Readonly<{ entry: FleetRecord; current: FleetRecord }>,
+): Promise<FleetMigrationStepResult> {
+  const planEntry = plan[planCursor];
+  if (!planEntry) {
+    throw new Error('fleet migration item no longer matches its frozen plan');
+  }
+  const { entry } = recordViews;
+  let { current } = recordViews;
+  switch (planEntry.step) {
+    case 'retire-pre':
+      current = await migrationRetirePre(admitted, current);
+      break;
+    case 'ready-target-backfill':
+      current = await migrationReadyTargetBackfill(admitted, current);
+      break;
+    case 'ready-platform-resources':
+      current = await migrationReadyPlatformResources(admitted, current);
+      break;
+    case 'ready-maintenance':
+      current = await migrationReadyMaintenance(admitted, current);
+      break;
+    case 'ready-promote':
+      current = await migrationReadyPromote(admitted, current);
+      break;
+    case 'ready-attest-settle':
+      current = await migrationReadyAttestSettle(admitted, current);
+      break;
+    case 'ready-retire-post':
+      current = await migrationReadyRetirePost(admitted, current);
+      break;
+    case 'admit-migrating':
+      current = await migrationAdmitMigrating(
+        admitted,
+        current,
+        fleetMigrationPlanKindOf(plan),
+      );
+      break;
+    case 'assert-migrating':
+      current = await migrationAssertMigrating(admitted, current);
+      break;
+    case 'platform-only-schema':
+      current = await migrationPlatformOnlySchema(admitted, current);
+      break;
+    case 'platform-only-resources':
+      current = await migrationPlatformOnlyResources(admitted, current);
+      break;
+    case 'platform-only-maintenance':
+      current = await migrationPlatformOnlyMaintenance(
+        admitted,
+        current,
+        entry,
+      );
+      break;
+    case 'platform-only-promote':
+      current = await migrationPlatformOnlyPromote(admitted, current, entry);
+      break;
+    case 'platform-only-ready':
+      current = await migrationPlatformOnlyReady(admitted, current, entry);
+      break;
+    case 'seed-identity':
+      current = await migrationSeedIdentity(admitted, current, entry);
+      break;
+    case 'apply-migrations':
+      current = await migrationApplyMigrations(
+        admitted,
+        current,
+        entry,
+        planEntry,
+        !plan
+          .slice(planCursor + 1)
+          .some(({ step }) => step === 'apply-migrations'),
+      );
+      break;
+    case 'migration-schema-applied':
+      current = await migrationSchemaApplied(admitted, current);
+      break;
+    case 'platform-resources':
+      current = await migrationPlatformResources(admitted, current);
+      break;
+    case 'pending-topology':
+      current = await migrationPendingTopology(admitted, current);
+      break;
+    case 'deploy-candidate':
+      current = await migrationDeployCandidate(admitted, current, entry);
+      break;
+    case 'arm-maintenance':
+      current = await migrationArmMaintenance(admitted, current);
+      break;
+    case 'promote':
+      current = await migrationPromote(admitted, current, entry);
+      break;
+    case 'settle-ready':
+      current = await migrationSettleReady(admitted, current, entry);
+      break;
+    case 'retire-post':
+      current = await migrationRetirePost(admitted, current);
+      break;
+  }
+  if (
+    planEntry.step === 'ready-retire-post' ||
+    planEntry.step === 'platform-only-ready' ||
+    planEntry.step === 'retire-post'
+  ) {
+    return { done: true, record: current, resultOnDone: current };
+  }
+  return { done: false, record: current };
+}
+
 export async function migrateFleet(options: {
   readonly store: FleetStateStore;
   readonly records: readonly FleetRecord[];
@@ -2037,988 +3619,43 @@ export async function migrateFleet(options: {
     ...options.routeAttestation,
   };
   const updated: FleetRecord[] = [];
-  for (const record of ordered) {
+  for (const [index, record] of ordered.entries()) {
     const next = await options.store.withDeploymentLease(
       record.tenantTag,
       record.environment,
       async (lease) => {
-        let stored = await options.store.get(
+        const { admitted, plan, reread } = await admitFleetMigrationItem(
+          {
+            store: options.store,
+            backendFor: (record) => options.backendFor(record),
+            specFor: (record) => options.specFor(record),
+            secretsFor: (record) => options.secretsFor(record),
+            finalizedStateProviderFor: (record) =>
+              options.finalizedStateProviderFor?.(record),
+            settlementFor: (record) => options.settlementFor?.(record),
+            lease,
+            attestationOptions,
+            // Read at each legacy site: helpers capture the clock function,
+            // while direct nullish calls keep its receiver unbound.
+            get clock() {
+              return options.clock ?? Date.now;
+            },
+            ordinal: index + 1,
+          },
           record.tenantTag,
           record.environment,
         );
-        if (!stored) throw new Error('fleet migration record disappeared');
-        assertNoActiveDecommission(stored, 'migrateFleet');
-        assertNoActiveCleanup(stored, 'migrateFleet');
-        assertBackendSwitchInactive(stored);
-        const storedSchemaVersion = stored.schemaVersion;
-        const backend = options.backendFor(stored);
-        const spec = options.specFor(stored);
-        const secrets = options.secretsFor(stored);
-        const finalizedOrdinaryState =
-          stored.backendSwitchIntent?.subphase === 'finalized' &&
-          stored.platformResources?.stateWorker.plane === 'ordinary';
-        const finalizedStateProvider = finalizedOrdinaryState
-          ? options.finalizedStateProviderFor?.(stored)
-          : undefined;
-        if (finalizedOrdinaryState) {
-          finalizedBridgeForRecord(stored);
-          if (!finalizedStateProvider) {
-            throw new Error(
-              'finalized ordinary state requires its backend-switch provider',
-            );
-          }
-        }
-        validateDeploymentSpec(spec);
-        validateDeploymentSecrets(spec, secrets);
-        assertImmutableDeploymentMapping(stored, backend, spec);
-        assertPlatformDurableObjectHistory(stored, spec);
-        if (stored.phase !== 'ready' && stored.phase !== 'migrating') {
-          throw new Error(
-            `cannot migrate deployment in phase '${stored.phase}'`,
-          );
-        }
-        const targetDigest = deploymentSpecDigest(spec);
-        const immutableExternal =
-          backend.immutableExternalArtifacts === true &&
-          spec.authoredBy === 'external';
-        const targetPhysicalScriptName = immutableExternal
-          ? backend.releaseScriptName?.(spec)
-          : undefined;
-        if (immutableExternal && !targetPhysicalScriptName) {
-          throw new Error(
-            'immutable external backend did not provide a physical release name',
-          );
-        }
-        if (
-          spec.migrations.some(
-            (migration) =>
-              migration.version > storedSchemaVersion &&
-              migration.rollbackCompatible !== true,
-          )
-        ) {
-          throw new Error(
-            'staged D1 migrations must attest rollbackCompatible before candidate creation',
-          );
-        }
-        const targetRelease: ExternalReleaseSnapshot | undefined =
-          targetPhysicalScriptName
-            ? {
-                physicalScriptName: targetPhysicalScriptName,
-                specDigest: targetDigest,
-                artifactVersion: 'pending',
-                releaseSchemaVersion: spec.schemaVersion,
-                application: applicationBindingTopology(
-                  spec,
-                  stored.applicationResources ?? [],
-                ),
-              }
-            : undefined;
-        const targetPlatform = immutableExternal
-          ? finalizedStateProvider
-            ? finalizedStateProvider.describeFinalizedBridgeTarget(spec, stored)
-            : describeExternalPlatformTarget(backend, spec)
-          : undefined;
-        if (stored.platformTarget && targetPlatform) {
-          assertExternalPlatformTargetCompatibility(
-            stored.platformTarget,
-            targetPlatform,
-          );
-        }
-        const platformOnlyTarget = targetPlatform
-          ? effectiveAppliedPlatformTarget(stored, targetPlatform)
-          : undefined;
-        const platformOnlyChange =
-          stored.desiredSpecDigest === targetDigest &&
-          platformOnlyTarget !== undefined &&
-          stored.platformTarget !== undefined &&
-          JSON.stringify(stored.platformTarget) !==
-            JSON.stringify(platformOnlyTarget);
-        if (
-          stored.phase === 'migrating' &&
-          (immutableExternal
-            ? stored.migrationIntent?.platformOnly === true
-              ? stored.migrationIntent.targetSpecDigest !== targetDigest ||
-                JSON.stringify(stored.migrationIntent.target) !==
-                  JSON.stringify(platformOnlyTarget)
-              : stored.pendingRelease?.specDigest !== targetDigest ||
-                stored.pendingRelease?.physicalScriptName !==
-                  targetPhysicalScriptName ||
-                stored.pendingRelease.releaseSchemaVersion !==
-                  spec.schemaVersion ||
-                stored.migrationIntent?.targetSpecDigest !== targetDigest
-            : stored.pendingSpecDigest !== targetDigest)
-        ) {
-          throw new Error(
-            'migration retry uses a different desired specification',
-          );
-        }
-        if (spec.previousDurableObjectTag !== stored.durableObjectTag) {
-          throw new Error(
-            `Durable Object migration base mismatch for ${stored.tenantTag}:${stored.environment}: expected '${stored.durableObjectTag ?? 'none'}'`,
-          );
-        }
-        const database = await reconcilePersistedDatabase(
-          backend,
-          stored,
-          false,
-          lease,
-        );
-        if (!database) {
-          throw new Error(
-            `persisted database '${stored.databaseId}' is absent`,
-          );
-        }
-        if (stored.phase === 'ready' && stored.retiringRelease) {
-          stored = await retireCommittedRelease(
-            backend,
-            spec,
-            database,
-            stored,
-            lease,
-            options.clock ?? Date.now,
-          );
-        }
-        if (
-          stored.phase === 'ready' &&
-          stored.desiredSpecDigest === targetDigest &&
-          !platformOnlyChange
-        ) {
-          if (targetPlatform) {
-            const rollbackCompatibleTarget =
-              platformOnlyTarget ?? targetPlatform;
-            if (!stored.platformTarget) {
-              if (!stored.platformResources) {
-                throw new Error(
-                  'ready external deployment has no trusted platform resources',
-                );
-              }
-              assertPlatformResourcesMatchTarget(
-                stored.platformResources,
-                targetPlatform,
-              );
-              stored = {
-                ...stored,
-                platformTarget: targetPlatform,
-                outboundPolicy: targetPlatform.outboundPolicy,
-                updatedAt: new Date(
-                  (options.clock ?? Date.now)(),
-                ).toISOString(),
-              };
-              await lease.put(stored);
-            }
-            assertExternalPlatformTarget(
-              stored.platformTarget,
-              rollbackCompatibleTarget,
-              'ready deployment',
-            );
-            stored = await convergeExternalPlatformResources(
-              backend,
-              spec,
-              database,
-              secrets,
-              rollbackCompatibleTarget,
-              stored,
-              lease,
-              options.clock ?? Date.now,
-              finalizedStateProvider,
-            );
-          }
-          const live = await backend.inspect(
-            spec,
-            secrets.maintenanceAdmin,
-            activeArtifactVersion(stored),
-          );
-          if (!live) throw new Error('ready migration target is missing');
-          assertLiveDeploymentMatches(
-            live,
-            stored,
-            spec,
-            targetDigest,
-            stored.activeRelease?.application,
-          );
-          if (immutableExternal && stored.activeRelease) {
-            assertExternalReleaseArtifactVersion(
-              live,
-              stored.activeRelease,
-              'ready migration',
-            );
-          }
-          if (
-            targetRelease &&
-            (stored.activeRelease?.physicalScriptName !==
-              targetRelease.physicalScriptName ||
-              stored.activeRelease.releaseSchemaVersion !==
-                targetRelease.releaseSchemaVersion ||
-              stored.activeRelease.artifactVersion !== live.artifactVersion)
-          ) {
-            throw new Error(
-              'ready immutable release metadata does not exactly match the target',
-            );
-          }
-          let maintenance = live.maintenance;
-          if (!maintenance.armed) {
-            stored = await commitInvocationAuthority(
-              lease,
-              stored,
-              options.clock ?? Date.now,
-            );
-            await lease.assertOwned();
-            maintenance = await backend.ensureMaintenance(
-              spec,
-              secrets.maintenanceAdmin,
-              lease,
-              activeArtifactVersion(stored),
-            );
-          }
-          if (!maintenance.armed) throw new Error('maintenance did not re-arm');
-          stored = await commitInvocationAuthority(
-            lease,
-            stored,
-            options.clock ?? Date.now,
-          );
-          await lease.assertOwned();
-          await backend.promoteWorker(
-            spec,
-            buildPromotionGuard(
-              stored,
-              targetPhysicalScriptName ?? spec.scriptName,
-            ),
-            stored.outboundPolicy,
-            lease,
-            activeArtifactVersion(stored),
-          );
-          // The steady-state path: an unchanged deployment reconciled again.
-          // It re-promotes because a crash could have left the route behind,
-          // so it must re-attest — but it must not re-settle, or a fleet on a
-          // reconcile schedule would settle forever.
-          const convergence = await settlePromotedRoute({
-            backend,
-            spec,
-            record: stored,
-            entry: 'ready-convergence',
-            target: stored.activeRelease,
-            prior: stored.rollbackRelease,
-            expectedSpecDigest: targetDigest,
-            expectedArtifactVersion: activeArtifactVersion(stored),
-            settlementHost: options.settlementFor?.(stored),
-            attestation: attestationOptions,
-            skipWhenAlreadySettled: true,
+        let entry = reread;
+        let current = reread;
+        for (let cursor = 0; ; cursor += 1) {
+          const step = await executeNextMigrationStep(admitted, plan, cursor, {
+            entry,
+            current,
           });
-          if (convergence.settled) {
-            stored = {
-              ...stored,
-              settledSettlementKey: convergence.settlementKey,
-              updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-            };
-            await lease.put(stored);
-          }
-          return retireCommittedRelease(
-            backend,
-            spec,
-            database,
-            stored,
-            lease,
-            options.clock ?? Date.now,
-          );
+          current = step.record;
+          if (plan[cursor]?.step === 'retire-pre') entry = current;
+          if (step.done) return step.resultOnDone;
         }
-        if (
-          spec.schemaVersion < stored.schemaVersion &&
-          !platformOnlyChange &&
-          stored.migrationIntent?.platformOnly !== true
-        ) {
-          throw new Error(
-            `schema downgrade refused for ${stored.tenantTag}:${stored.environment}`,
-          );
-        }
-        if (immutableExternal && !stored.activeRelease) {
-          throw new Error(
-            'immutable external migration has no durable active release metadata',
-          );
-        }
-        if (
-          immutableExternal &&
-          targetRelease &&
-          targetPlatform &&
-          (!stored.platformTarget || !stored.outboundPolicy)
-        ) {
-          throw new Error(
-            'immutable external migration has no durable prior platform target and policy',
-          );
-        }
-        const externalIntent: ExternalMigrationIntent | undefined =
-          immutableExternal && targetRelease && targetPlatform
-            ? platformOnlyChange
-              ? {
-                  platformOnly: true,
-                  targetSpecDigest: targetDigest,
-                  priorRelease: stored.activeRelease as ExternalReleaseSnapshot,
-                  priorTarget:
-                    stored.platformTarget as ExternalPlatformTargetDescription,
-                  priorOutboundPolicy:
-                    stored.outboundPolicy as DeploymentEgressPolicy,
-                  targetRelease:
-                    stored.activeRelease as ExternalReleaseSnapshot,
-                  target:
-                    platformOnlyTarget as ExternalPlatformTargetDescription,
-                  subphase: 'planned',
-                }
-              : {
-                  targetSpecDigest: targetDigest,
-                  priorRelease: stored.activeRelease as ExternalReleaseSnapshot,
-                  priorTarget:
-                    stored.platformTarget as ExternalPlatformTargetDescription,
-                  priorOutboundPolicy:
-                    stored.outboundPolicy as DeploymentEgressPolicy,
-                  targetRelease,
-                  target: targetPlatform,
-                  subphase: 'planned',
-                }
-            : undefined;
-        let migrationRecord: FleetRecord =
-          stored.phase === 'ready'
-            ? {
-                ...stored,
-                phase: 'migrating',
-                ...(externalIntent?.platformOnly
-                  ? { migrationIntent: externalIntent }
-                  : targetRelease
-                    ? {
-                        pendingRelease: targetRelease,
-                        migrationPriorRelease: stored.activeRelease,
-                        migrationIntent: externalIntent,
-                      }
-                    : {}),
-                ...(!targetRelease ? { pendingSpecDigest: targetDigest } : {}),
-                updatedAt: new Date(
-                  (options.clock ?? Date.now)(),
-                ).toISOString(),
-              }
-            : stored;
-        if (stored.phase === 'ready') await lease.put(migrationRecord);
-        if (
-          immutableExternal &&
-          (!migrationRecord.migrationIntent ||
-            (migrationRecord.migrationIntent.platformOnly !== true &&
-              (!migrationRecord.migrationPriorRelease ||
-                !migrationRecord.pendingRelease)))
-        ) {
-          throw new Error(
-            'immutable external migration lost its durable release intent',
-          );
-        }
-        if (targetPlatform && migrationRecord.migrationIntent) {
-          assertExternalPlatformTarget(
-            migrationRecord.migrationIntent.target,
-            migrationRecord.migrationIntent.platformOnly === true
-              ? (platformOnlyTarget as ExternalPlatformTargetDescription)
-              : targetPlatform,
-            'migration retry',
-          );
-        }
-        if (finalizedStateProvider && targetPlatform) {
-          const finalizedPlan = finalizedStateProvider.describeFinalizedState({
-            targetSpec: spec,
-            currentRecord: migrationRecord,
-            target: migrationRecord.migrationIntent?.target ?? targetPlatform,
-          });
-          await finalizedStateProvider.assertFinalizedState({
-            targetSpec: spec,
-            currentRecord: migrationRecord,
-            target: migrationRecord.migrationIntent?.target ?? targetPlatform,
-            plan: finalizedPlan,
-            fence: lease,
-          });
-        }
-        if (migrationRecord.migrationIntent?.platformOnly === true) {
-          const platformMigrationTarget =
-            migrationRecord.migrationIntent.target;
-          const platformMigrationRelease =
-            migrationRecord.migrationIntent.targetRelease;
-          if (migrationRecord.migrationIntent.subphase === 'planned') {
-            migrationRecord = {
-              ...migrationRecord,
-              migrationIntent: {
-                ...migrationRecord.migrationIntent,
-                subphase: 'schema-applied',
-              },
-              updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-            };
-            await lease.put(migrationRecord);
-          }
-          migrationRecord = await convergeExternalPlatformResources(
-            backend,
-            spec,
-            database,
-            secrets,
-            platformMigrationTarget,
-            migrationRecord,
-            lease,
-            options.clock ?? Date.now,
-            finalizedStateProvider,
-          );
-          if (migrationRecord.migrationIntent?.subphase === 'schema-applied') {
-            migrationRecord = {
-              ...migrationRecord,
-              migrationIntent: {
-                ...migrationRecord.migrationIntent,
-                subphase: 'platform-applied',
-              },
-              updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-            };
-            await lease.put(migrationRecord);
-          }
-          const maintenancePreflight = await backend.inspect(
-            spec,
-            secrets.maintenanceAdmin,
-            platformMigrationRelease.artifactVersion,
-          );
-          if (!maintenancePreflight) {
-            throw new Error('platform-only migration release is missing');
-          }
-          assertLiveDeploymentMatches(
-            maintenancePreflight,
-            stored,
-            spec,
-            targetDigest,
-            platformMigrationRelease.application,
-          );
-          assertExternalReleaseArtifactVersion(
-            maintenancePreflight,
-            platformMigrationRelease,
-            'platform-only maintenance',
-          );
-          migrationRecord = await commitInvocationAuthority(
-            lease,
-            migrationRecord,
-            options.clock ?? Date.now,
-          );
-          await lease.assertOwned();
-          const maintenance = await backend.ensureMaintenance(
-            spec,
-            secrets.maintenanceAdmin,
-            lease,
-            platformMigrationRelease.artifactVersion,
-          );
-          if (!maintenance.armed) {
-            throw new Error(
-              'platform-only migration maintenance is unarmed before route publication',
-            );
-          }
-          if (
-            migrationRecord.migrationIntent?.subphase === 'platform-applied'
-          ) {
-            const publicationPreflight = await backend.inspect(
-              spec,
-              secrets.maintenanceAdmin,
-              platformMigrationRelease.artifactVersion,
-            );
-            if (!publicationPreflight) {
-              throw new Error('platform-only migration release is missing');
-            }
-            assertLiveDeploymentMatches(
-              publicationPreflight,
-              stored,
-              spec,
-              targetDigest,
-              platformMigrationRelease.application,
-            );
-            assertExternalReleaseArtifactVersion(
-              publicationPreflight,
-              platformMigrationRelease,
-              'platform-only publication',
-            );
-            // No flip here: the unconditional maintenance flip above already
-            // committed the carrier durably earlier in this same call.
-            await lease.assertOwned();
-            await backend.promoteWorker(
-              spec,
-              buildPromotionGuard(
-                migrationRecord,
-                targetPhysicalScriptName ?? spec.scriptName,
-              ),
-              platformMigrationTarget.outboundPolicy,
-              lease,
-              platformMigrationRelease.artifactVersion,
-            );
-            migrationRecord = {
-              ...migrationRecord,
-              migrationIntent: {
-                ...migrationRecord.migrationIntent,
-                subphase: 'route-published',
-              },
-              updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-            };
-            await lease.put(migrationRecord);
-          }
-          const live = await backend.inspect(
-            spec,
-            secrets.maintenanceAdmin,
-            platformMigrationRelease.artifactVersion,
-          );
-          if (!live)
-            throw new Error('platform-only migration release is missing');
-          assertLiveDeploymentMatches(
-            live,
-            stored,
-            spec,
-            targetDigest,
-            platformMigrationRelease.application,
-          );
-          assertExternalReleaseArtifactVersion(
-            live,
-            platformMigrationRelease,
-            'platform-only settlement',
-          );
-          const platformSettlement = await settlePromotedRoute({
-            backend,
-            spec,
-            record: migrationRecord,
-            entry: 'platform-only',
-            target: platformMigrationRelease,
-            prior: migrationRecord.rollbackRelease,
-            expectedSpecDigest: targetDigest,
-            expectedArtifactVersion: platformMigrationRelease.artifactVersion,
-            settlementHost: options.settlementFor?.(migrationRecord),
-            attestation: attestationOptions,
-          });
-          const settled = { ...migrationRecord };
-          delete settled.migrationIntent;
-          const migrated: FleetRecord = {
-            ...settled,
-            phase: 'ready',
-            platformTarget: platformMigrationTarget,
-            outboundPolicy: platformMigrationTarget.outboundPolicy,
-            ...(platformSettlement.settled
-              ? { settledSettlementKey: platformSettlement.settlementKey }
-              : {}),
-            updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-          };
-          await lease.put(migrated);
-          return migrated;
-        }
-        await lease.assertOwned();
-        // Re-stamping a database this deployment already owns: the ownership
-        // sentinel short-circuits, and the only thing that can still happen is
-        // the fence row being CREATED where none exists.
-        //
-        // 'open' is hard-coded, and migrateFleet takes no fence option, for one
-        // reason: the deployment being migrated is `ready` or `migrating` — it
-        // is EXECUTING right now. A pre-0.20 database has no fence row and
-        // therefore reads as open; materializing that row must record what the
-        // deployment already IS, not impose something new. Seeding
-        // 'migration-locked' here would silently stop a live deployment in the
-        // middle of its own migration. Closing a fence is an operator action
-        // through POST /admin/execution-fence, never a side effect of a
-        // schema pass.
-        await backend.seedDeploymentIdentity(
-          database,
-          stored.tenantTag,
-          lease,
-          {
-            initialExecutionFenceState: 'open',
-          },
-        );
-        const pendingMigrations = spec.migrations.filter(
-          (candidate) => candidate.version > migrationRecord.schemaVersion,
-        );
-        if (pendingMigrations.length === 0) {
-          await lease.assertOwned();
-          await backend.applyMigrations(database, spec.migrations, lease);
-        }
-        for (const migration of pendingMigrations) {
-          await lease.assertOwned();
-          await backend.applyMigrations(
-            database,
-            spec.migrations.slice(0, migration.version),
-            lease,
-          );
-          migrationRecord = {
-            ...migrationRecord,
-            schemaVersion: migration.version,
-            updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-          };
-          await lease.put(migrationRecord);
-        }
-        if (migrationRecord.schemaVersion !== spec.schemaVersion) {
-          throw new Error(
-            `missing D1 migration path from ${stored.schemaVersion} to ${spec.schemaVersion}`,
-          );
-        }
-        if (migrationRecord.migrationIntent?.subphase === 'planned') {
-          migrationRecord = {
-            ...migrationRecord,
-            migrationIntent: {
-              ...migrationRecord.migrationIntent,
-              subphase: 'schema-applied',
-            },
-            updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-          };
-          await lease.put(migrationRecord);
-        }
-        if (targetPlatform) {
-          migrationRecord = await convergeExternalPlatformResources(
-            backend,
-            spec,
-            database,
-            secrets,
-            migrationRecord.migrationIntent?.target ?? targetPlatform,
-            migrationRecord,
-            lease,
-            options.clock ?? Date.now,
-            finalizedStateProvider,
-          );
-          if (migrationRecord.migrationIntent?.subphase === 'schema-applied') {
-            migrationRecord = {
-              ...migrationRecord,
-              migrationIntent: {
-                ...migrationRecord.migrationIntent,
-                subphase: 'platform-applied',
-              },
-              updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-            };
-            await lease.put(migrationRecord);
-          }
-        }
-        if (
-          migrationRecord.pendingRelease &&
-          migrationRecord.platformResources
-        ) {
-          const topology = externalReleaseTopology(
-            spec,
-            migrationRecord.platformResources,
-            migrationRecord.applicationResources,
-          );
-          migrationRecord = {
-            ...migrationRecord,
-            pendingRelease: { ...migrationRecord.pendingRelease, topology },
-            ...(migrationRecord.migrationIntent
-              ? {
-                  migrationIntent: {
-                    ...migrationRecord.migrationIntent,
-                    targetRelease: {
-                      ...migrationRecord.migrationIntent.targetRelease,
-                      topology,
-                    },
-                  },
-                }
-              : {}),
-            updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-          };
-          await lease.put(migrationRecord);
-        }
-        let live: LiveDeployment | undefined;
-        if (migrationRecord.migrationIntent?.subphase !== 'platform-applied') {
-          live = await backend.inspect(
-            spec,
-            secrets.maintenanceAdmin,
-            pendingArtifactVersion(migrationRecord),
-          );
-        }
-        if (
-          migrationRecord.pendingRelease &&
-          migrationRecord.pendingRelease.artifactVersion !== 'pending'
-        ) {
-          assertExternalReleaseArtifactVersion(
-            live,
-            migrationRecord.pendingRelease,
-            'migration candidate',
-          );
-        }
-        if (
-          migrationRecord.migrationIntent?.subphase === 'platform-applied' ||
-          !live ||
-          live.desiredSpecDigest !== targetDigest
-        ) {
-          migrationRecord = await commitInvocationAuthority(
-            lease,
-            migrationRecord,
-            options.clock ?? Date.now,
-          );
-          await lease.assertOwned();
-          const deployed = await backend.deployWorker(
-            spec,
-            database,
-            secrets,
-            migrationRecord.platformResources,
-            lease,
-            migrationRecord.pendingRelease?.artifactVersion ??
-              migrationRecord.pendingArtifactVersion ??
-              (immutableExternal ? 'pending' : undefined),
-            migrationRecord.migrationIntent?.targetRelease.application ??
-              migrationRecord.pendingRelease?.application ??
-              applicationBindingTopology(
-                spec,
-                migrationRecord.applicationResources ?? [],
-              ),
-          );
-          if (
-            targetPhysicalScriptName &&
-            deployed.physicalScriptName !== targetPhysicalScriptName
-          ) {
-            throw new Error('backend deployed an unexpected physical release');
-          }
-        }
-        live = await backend.inspect(
-          spec,
-          secrets.maintenanceAdmin,
-          pendingArtifactVersion(migrationRecord),
-        );
-        if (!live) throw new Error('migration candidate is missing');
-        assertLiveDeploymentMatches(
-          live,
-          stored,
-          spec,
-          targetDigest,
-          migrationRecord.migrationIntent?.targetRelease.application ??
-            migrationRecord.pendingRelease?.application,
-        );
-        if (migrationRecord.pendingRelease) {
-          assertExternalReleaseArtifactVersion(
-            live,
-            migrationRecord.pendingRelease,
-            'migration candidate',
-          );
-        }
-        if (
-          targetPhysicalScriptName &&
-          live.scriptName !== targetPhysicalScriptName
-        ) {
-          throw new Error(
-            'migration candidate has an unexpected physical name',
-          );
-        }
-        if (
-          migrationRecord.migrationIntent &&
-          migrationRecord.pendingRelease?.artifactVersion === 'pending'
-        ) {
-          const intendedTopology = migrationRecord.pendingRelease.topology;
-          if (!intendedTopology) {
-            throw new Error(
-              'migration candidate has no intended binding topology',
-            );
-          }
-          const pendingRelease = {
-            ...migrationRecord.migrationIntent.targetRelease,
-            artifactVersion: live.artifactVersion,
-            topology: externalReleaseTopologyFromLive(live, intendedTopology),
-          };
-          migrationRecord = {
-            ...migrationRecord,
-            pendingRelease,
-            migrationIntent: {
-              ...migrationRecord.migrationIntent,
-              targetRelease: pendingRelease,
-              subphase: 'candidate-deployed',
-            },
-            updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-          };
-          await lease.put(migrationRecord);
-        } else if (
-          !immutableExternal &&
-          migrationRecord.pendingArtifactVersion === undefined
-        ) {
-          migrationRecord = {
-            ...migrationRecord,
-            pendingArtifactVersion: live.artifactVersion,
-            updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-          };
-          await lease.put(migrationRecord);
-        }
-        migrationRecord = await commitInvocationAuthority(
-          lease,
-          migrationRecord,
-          options.clock ?? Date.now,
-        );
-        await lease.assertOwned();
-        const maintenance = await backend.ensureMaintenance(
-          spec,
-          secrets.maintenanceAdmin,
-          lease,
-          pendingArtifactVersion(migrationRecord),
-        );
-        if (!maintenance.armed) throw new Error('maintenance did not re-arm');
-        if (
-          migrationRecord.migrationIntent?.subphase === 'candidate-deployed'
-        ) {
-          migrationRecord = {
-            ...migrationRecord,
-            migrationIntent: {
-              ...migrationRecord.migrationIntent,
-              subphase: 'candidate-armed',
-            },
-            updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-          };
-          await lease.put(migrationRecord);
-        }
-        const publicationPreflight = await backend.inspect(
-          spec,
-          secrets.maintenanceAdmin,
-          pendingArtifactVersion(migrationRecord),
-        );
-        if (!publicationPreflight) {
-          throw new Error('migration candidate is missing before publication');
-        }
-        assertLiveDeploymentMatches(
-          publicationPreflight,
-          stored,
-          spec,
-          targetDigest,
-          migrationRecord.migrationIntent?.targetRelease.application ??
-            migrationRecord.pendingRelease?.application,
-        );
-        if (migrationRecord.pendingRelease) {
-          assertExternalReleaseArtifactVersion(
-            publicationPreflight,
-            migrationRecord.pendingRelease,
-            'migration publication',
-          );
-        }
-        // No flip here: the unconditional candidate-maintenance flip above
-        // already committed the carrier durably earlier in this same call.
-        await lease.assertOwned();
-        await backend.promoteWorker(
-          spec,
-          buildPromotionGuard(
-            migrationRecord,
-            targetPhysicalScriptName ?? spec.scriptName,
-          ),
-          migrationRecord.migrationIntent?.target.outboundPolicy ??
-            migrationRecord.outboundPolicy,
-          lease,
-          pendingArtifactVersion(migrationRecord),
-        );
-        if (migrationRecord.migrationIntent) {
-          migrationRecord = {
-            ...migrationRecord,
-            migrationIntent: {
-              ...migrationRecord.migrationIntent,
-              subphase: 'route-published',
-            },
-            updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-          };
-          await lease.put(migrationRecord);
-        }
-        live = await backend.inspect(
-          spec,
-          secrets.maintenanceAdmin,
-          pendingArtifactVersion(migrationRecord),
-        );
-        if (!live) {
-          throw new Error(
-            `deployment did not converge after migration for ${stored.tenantTag}:${stored.environment}`,
-          );
-        }
-        assertLiveDeploymentMatches(
-          live,
-          stored,
-          spec,
-          targetDigest,
-          migrationRecord.migrationIntent?.targetRelease.application ??
-            migrationRecord.pendingRelease?.application,
-        );
-        if (migrationRecord.pendingRelease) {
-          assertExternalReleaseArtifactVersion(
-            live,
-            migrationRecord.pendingRelease,
-            'migration settlement',
-          );
-        }
-        if (
-          targetPhysicalScriptName &&
-          live.scriptName !== targetPhysicalScriptName
-        ) {
-          throw new Error('promoted release has an unexpected physical name');
-        }
-        const rollbackRelease = migrationRecord.migrationPriorRelease;
-        const retiringRelease = targetPhysicalScriptName
-          ? stored.rollbackRelease
-          : undefined;
-        const committedTargetRelease = migrationRecord.pendingRelease;
-        if (
-          targetPhysicalScriptName &&
-          (!committedTargetRelease ||
-            committedTargetRelease.physicalScriptName !==
-              targetPhysicalScriptName ||
-            !committedTargetRelease.topology)
-        ) {
-          throw new Error(
-            'promoted release has no exact persisted binding topology',
-          );
-        }
-        const migrationSettlement = await settlePromotedRoute({
-          backend,
-          spec,
-          record: migrationRecord,
-          entry: 'migration',
-          target: committedTargetRelease,
-          prior: rollbackRelease,
-          expectedSpecDigest: targetDigest,
-          expectedArtifactVersion: live.artifactVersion,
-          settlementHost: options.settlementFor?.(migrationRecord),
-          attestation: attestationOptions,
-        });
-        const settled = { ...migrationRecord };
-        delete settled.pendingRelease;
-        delete settled.migrationPriorRelease;
-        delete settled.pendingSpecDigest;
-        delete settled.pendingArtifactVersion;
-        delete settled.migrationIntent;
-        const migrated: FleetRecord = {
-          ...settled,
-          phase: 'ready',
-          desiredSpecDigest: targetDigest,
-          schemaVersion: spec.schemaVersion,
-          artifactVersion: live.artifactVersion,
-          ...(targetPhysicalScriptName
-            ? {
-                activeRelease:
-                  committedTargetRelease as ExternalReleaseSnapshot,
-                rollbackRelease,
-                ...(retiringRelease ? { retiringRelease } : {}),
-              }
-            : {}),
-          ...(targetPlatform
-            ? {
-                platformTarget: targetPlatform,
-                outboundPolicy: targetPlatform.outboundPolicy,
-              }
-            : {}),
-          durableObjectTag: finalizedStateProvider
-            ? migrationRecord.durableObjectTag
-            : targetDurableObjectTag(spec),
-          ...(spec.authoredBy === 'platform'
-            ? {
-                durableObjectMigrationHistory:
-                  canonicalDurableObjectMigrationHistory(
-                    spec.durableObjectMigrations,
-                  ),
-                durableObjectMigrationHistoryDigest:
-                  durableObjectMigrationHistoryDigest(
-                    spec.durableObjectMigrations,
-                  ),
-              }
-            : {}),
-          durableObjectBindings: live.durableObjectBindings,
-          applicationBindings:
-            committedTargetRelease?.application ??
-            applicationBindingTopology(
-              spec,
-              migrationRecord.applicationResources ?? [],
-            ),
-          ...(migrationSettlement.settled
-            ? { settledSettlementKey: migrationSettlement.settlementKey }
-            : {}),
-          updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-        };
-        await lease.put(migrated);
-        return retireCommittedRelease(
-          backend,
-          spec,
-          database,
-          migrated,
-          lease,
-          options.clock ?? Date.now,
-        );
       },
     );
     updated.push(next);

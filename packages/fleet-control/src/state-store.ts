@@ -52,7 +52,11 @@ import type {
   PlatformPlaneStateStore,
   ProvisioningPhase,
 } from './types.js';
-import { effectiveLifecyclePhase, PROVISIONING_PHASES } from './types.js';
+import {
+  EXTERNAL_MIGRATION_SUBPHASES,
+  effectiveLifecyclePhase,
+  PROVISIONING_PHASES,
+} from './types.js';
 import { deploymentKey } from './validation.js';
 
 export interface FleetStateDatabase {
@@ -399,15 +403,6 @@ function optionalPlatformTarget(
     'platform_target',
   );
 }
-
-const EXTERNAL_MIGRATION_SUBPHASES = [
-  'planned',
-  'schema-applied',
-  'platform-applied',
-  'candidate-deployed',
-  'candidate-armed',
-  'route-published',
-] as const satisfies readonly ExternalMigrationSubphase[];
 
 function optionalMigrationIntent(
   value: unknown,
