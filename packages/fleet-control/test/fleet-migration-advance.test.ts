@@ -3,9 +3,11 @@
 import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { applicationBindingTopology } from '../src/application-bindings.js';
+import type { FinalizedOrdinaryStateProvider } from '../src/backend-switch.js';
 import {
   admitFleetMigrationItem,
   assertFleetMigrationPlanCompatibility,
+  assertMigratingCarrierState,
   executeNextMigrationStep,
   migrateFleet,
 } from '../src/fleet.js';
@@ -51,6 +53,8 @@ import { providerBindingIdentitiesForInspection } from '../src/provider-binding-
 import { deploymentSpecDigest } from '../src/spec-digest.js';
 import type {
   ApplicationBindingTopology,
+  BridgeMutationPlan,
+  BridgeSnapshot,
   DeploymentSecrets,
   DeploymentSpec,
   ExternalPlatformResources,
@@ -104,6 +108,7 @@ class MemoryOperationStore implements FleetOperationStore {
   readonly locked = new Set<FleetOperationKind>();
   readonly calls: string[] = [];
   readonly commits: Parameters<FleetOperationLease['commitProgress']>[0][] = [];
+  readonly failures: Parameters<FleetOperationLease['failOperation']>[0][] = [];
   loseLease = false;
   loseCommit: 'before' | 'after' | undefined;
   stageLimit: number | undefined;
@@ -112,6 +117,7 @@ class MemoryOperationStore implements FleetOperationStore {
     | ((input: Parameters<FleetOperationLease['commitProgress']>[0]) => void)
     | undefined;
   beforePage: (() => void) | undefined;
+  beforeFail: (() => void) | undefined;
   reversePages = false;
 
   async withAccountOperationLease<T>(
@@ -347,8 +353,10 @@ class MemoryOperationStore implements FleetOperationStore {
           return copy(finalized);
         },
         failOperation: async (input) => {
+          this.beforeFail?.();
           await assertOwned();
           this.calls.push('fail');
+          this.failures.push(copy(input));
           if ((input.updateRows?.length ?? 0) > 1)
             throw new Error('failOperation accepts at most one updateRow');
           const prior = this.operations.get(input.operationId);
@@ -599,16 +607,30 @@ function createWorld(
     tenant?: string;
     schemaVersion?: number;
     lagging?: boolean;
+    namespace?: boolean;
   } = {},
 ) {
   const path = input.path ?? 'full';
   const external = input.external ?? path === 'platform-only';
-  const priorSpec = deploymentSpec(input.tenant ?? 'cedar', 1, external);
+  const priorSpec = {
+    ...deploymentSpec(input.tenant ?? 'cedar', 1, external),
+    ...(input.namespace
+      ? { durableObjectBindings: [{ name: 'STATE', className: 'Runner' }] }
+      : {}),
+  };
   let spec =
     path === 'full'
-      ? deploymentSpec(priorSpec.tenantTag, input.schemaVersion ?? 3, external)
+      ? {
+          ...deploymentSpec(
+            priorSpec.tenantTag,
+            input.schemaVersion ?? 3,
+            external,
+          ),
+          durableObjectBindings: priorSpec.durableObjectBindings,
+        }
       : priorSpec;
   let stateDigest = 'a'.repeat(64);
+  let namespaceId = 'namespace-original';
   const ops: string[] = [];
   const releases = new Map<string, LiveDeployment>();
   const routed = new Map<string, string>();
@@ -638,8 +660,10 @@ function createWorld(
       scriptName: externalStateScriptName(targetSpec),
       artifactVersion: `state-${stateDigest[0]}`,
       artifactDigest: stateDigest,
-      durableObjectBindings: [],
-      namespaceIds: [],
+      durableObjectBindings: targetSpec.durableObjectBindings.map(
+        (binding) => ({ ...binding, namespaceId }),
+      ),
+      namespaceIds: input.namespace ? [namespaceId] : [],
     },
     egressProxy: {
       scriptName: externalEgressProxyScriptName(targetSpec),
@@ -660,7 +684,11 @@ function createWorld(
       environment: target.environment,
       scriptName: physicalName(target),
       databaseId: `db-${target.tenantTag}`,
-      durableObjectBindings: [],
+      durableObjectBindings: target.durableObjectBindings.map((binding) => ({
+        ...binding,
+        namespaceId,
+        scriptName: externalStateScriptName(target),
+      })),
       serviceBindings: [],
       queueProducerBindings: [],
       plainTextBindings: Object.fromEntries(
@@ -896,6 +924,9 @@ function createWorld(
     setMaintenance(next: MaintenanceHealth) {
       maintenance = next;
     },
+    setNamespace(next: string) {
+      namespaceId = next;
+    },
     fail(operation: string, error: unknown) {
       failure = { operation, error };
     },
@@ -920,6 +951,142 @@ function createWorld(
 }
 
 type World = ReturnType<typeof createWorld>;
+
+function finalizedWorld(path: 'ready' | 'platform-only' | 'full' = 'full') {
+  const world = createWorld({ path, external: true });
+  const history = [{ tag: 'state-v2', newClasses: ['StateV2'] }];
+  const target = {
+    ...world.targetFor(world.spec),
+    stateDurableObjectTag: 'state-v2',
+    stateDurableObjectHistoryDigest:
+      durableObjectMigrationHistoryDigest(history),
+  };
+  const bridge: BridgeSnapshot = {
+    scriptName: world.initial.scriptName,
+    artifactVersion: 'state-a',
+    artifactDigest: world.priorTarget.stateArtifactDigest,
+    databaseId: world.initial.databaseId,
+    durableObjectBindings: [],
+    namespaceIds: [],
+    secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
+    stateOnly: true,
+    publicRouteAttached: false,
+  };
+  const resources = world.initial.platformResources;
+  if (!resources) throw new Error('missing finalized resources');
+  const initial = {
+    ...world.initial,
+    durableObjectMigrationHistory: [],
+    durableObjectMigrationHistoryDigest: durableObjectMigrationHistoryDigest(
+      [],
+    ),
+    ...(path === 'ready' ? { platformTarget: target } : {}),
+    platformResources: {
+      ...resources,
+      stateWorker: {
+        ...resources.stateWorker,
+        scriptName: bridge.scriptName,
+        plane: 'ordinary' as const,
+      },
+    },
+    backendSwitchIntent: {
+      kind: 'backend-switch' as const,
+      tenantTag: world.initial.tenantTag,
+      environment: world.initial.environment,
+      prior: {
+        scriptName: world.initial.scriptName,
+        artifactVersion: 'plain-v1',
+        specDigest: world.initial.desiredSpecDigest,
+        databaseId: world.initial.databaseId,
+        databaseName: world.initial.databaseName,
+        durableObjectBindings: [],
+        namespaceIds: [],
+        secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
+        applicationResources: [],
+        customDomain: {
+          id: 'domain-cedar',
+          hostname: world.initial.routeHostname as string,
+        },
+      },
+      targetSpecDigest: world.initial.desiredSpecDigest,
+      targetApplication: EMPTY_APPLICATION,
+      target: world.priorTarget,
+      rollbackUntil: '2026-08-20T00:00:00.000Z',
+      subphase: 'finalized' as const,
+      bridge,
+    },
+  };
+  world.fleetStore.set(initial);
+  const plan: BridgeMutationPlan = {
+    artifactDigest: target.stateArtifactDigest,
+    durableObjectMigrations: history,
+    targetDurableObjectTag: target.stateDurableObjectTag,
+    secretNames: bridge.secretNames,
+    mutationDigest: 'e'.repeat(64),
+  };
+  const provider: FinalizedOrdinaryStateProvider = {
+    describeFinalizedBridgeTarget() {
+      world.ops.push('finalizedTarget');
+      return target;
+    },
+    describeFinalizedState() {
+      world.ops.push('finalizedPlan');
+      return plan;
+    },
+    async assertFinalizedState() {
+      world.ops.push('finalizedAssert');
+    },
+    async ensureFinalizedState() {
+      world.ops.push('finalizedEnsure');
+      return {
+        ...bridge,
+        artifactVersion: 'state-v2',
+        artifactDigest: target.stateArtifactDigest,
+      };
+    },
+    async commitFinalizedOwnership({
+      currentRecord,
+      bridge: nextBridge,
+      target: nextTarget,
+    }) {
+      world.ops.push('finalizedCommit');
+      const prior = currentRecord.platformResources;
+      if (!prior) throw new Error('missing finalized resources');
+      return {
+        ...currentRecord,
+        platformResources: {
+          ...prior,
+          stateWorker: {
+            ...prior.stateWorker,
+            artifactVersion: nextBridge.artifactVersion,
+            artifactDigest: nextBridge.artifactDigest,
+            durableObjectTag: nextTarget.stateDurableObjectTag,
+            durableObjectBindings: nextBridge.durableObjectBindings,
+            namespaceIds: nextBridge.namespaceIds,
+          },
+        },
+      };
+    },
+  };
+  const options = world.options;
+  world.options = (action) => ({
+    ...options(action),
+    finalizedStateProviderFor() {
+      world.ops.push('finalizedFor');
+      return provider;
+    },
+  });
+  const start = (id = uuid()) =>
+    advanceFleetMigration(
+      world.options({
+        kind: 'start',
+        operationId: id,
+        records: [world.current()],
+        canaryTenantTags: [],
+      }),
+    );
+  return { world, provider, target, plan, start };
+}
 
 async function continueWorld(
   world: World,
@@ -976,6 +1143,7 @@ async function withAdmitted<T>(
             backendFor: options.backendFor,
             specFor: options.specFor,
             secretsFor: options.secretsFor,
+            finalizedStateProviderFor: options.finalizedStateProviderFor,
             settlementFor: options.settlementFor,
             clock: () => NOW,
             ordinal: 1,
@@ -987,6 +1155,48 @@ async function withAdmitted<T>(
       );
     },
   );
+}
+
+function migrateWorld(world: World) {
+  const options = world.options({ kind: 'continue', token: {} });
+  return migrateFleet({
+    ...options,
+    store: world.fleetStore,
+    records: [world.current()],
+    canaryTenantTags: [],
+  });
+}
+
+function expectItemFailure(world: World, ordinal = 0) {
+  expect(world.operationStore.item(uuid(), ordinal).status).toBe('failed');
+  expect(world.operationStore.operations.get(uuid())).toMatchObject({
+    state: 'failed',
+    progress: { failure: { reason: 'item-failed', itemOrdinal: ordinal } },
+  });
+  expect(
+    world.operationStore.calls.filter((call) => call === 'fail'),
+  ).toHaveLength(1);
+}
+
+function providerMutations(world: World) {
+  return world.ops.filter((op) =>
+    /^(apply:|seed:|deploy$|maintenance$|promote$|platform$|settle$|retire:)/u.test(
+      op,
+    ),
+  );
+}
+
+async function loseStepResponse(
+  world: World,
+  result: FleetMigrationAdvanceResult,
+) {
+  const item = world.operationStore.item();
+  world.operationStore.loseCommit = 'before';
+  await expect(continueWorld(world, result)).rejects.toThrow(
+    'progress response lost',
+  );
+  expect(world.operationStore.item()).toEqual(item);
+  return item;
 }
 
 describe('bounded fleet migration', () => {
@@ -2275,5 +2485,1521 @@ describe('bounded fleet migration', () => {
     await expect(
       continueWorld(reordered, reorderedTerminal.token),
     ).rejects.toThrow('fleet migration item no longer matches its frozen plan');
+  });
+
+  it('crash window admit-migrating: no re-put from migrating', async () => {
+    for (const input of [
+      {},
+      { external: true },
+      { path: 'platform-only' as const },
+    ]) {
+      const world = createWorld(input);
+      const result = await advanceTo(world, 'admit-migrating');
+      const item = await loseStepResponse(world, result);
+      const admitted = copy(world.current());
+      expect(admitted.phase).toBe('migrating');
+      world.ops.length = 0;
+      const puts = world.fleetStore.puts.length;
+      await continueWorld(world, result);
+      expect(world.current()).toEqual(admitted);
+      expect(world.fleetStore.puts).toHaveLength(puts);
+      expect(providerMutations(world)).toEqual([]);
+      expect(world.operationStore.item().planCursor).toBe(
+        (item.planCursor ?? 0) + 1,
+      );
+    }
+  });
+
+  it('crash window apply-migrations: occurrence identity and ledger verification cover both sides of the schema put', async () => {
+    const intermediate = createWorld();
+    const result = await advanceTo(intermediate, 'apply-migrations');
+    await loseStepResponse(intermediate, result);
+    expect(intermediate.current().schemaVersion).toBe(2);
+    intermediate.ops.length = 0;
+    const puts = intermediate.fleetStore.puts.length;
+    const next = await continueWorld(intermediate, result);
+    expect(intermediate.ops.filter((op) => op.startsWith('apply:'))).toEqual(
+      [],
+    );
+    expect(intermediate.fleetStore.puts).toHaveLength(puts);
+    await continueWorld(intermediate, next);
+    expect(intermediate.ops.filter((op) => op.startsWith('apply:'))).toEqual([
+      'apply:3',
+    ]);
+
+    for (const missingLedger of [false, true]) {
+      const final = createWorld({ schemaVersion: 2 });
+      const token = await advanceTo(final, 'apply-migrations');
+      if (missingLedger)
+        final.fleetStore.set({ ...final.current(), schemaVersion: 2 });
+      else await loseStepResponse(final, token);
+      final.ops.length = 0;
+      const writes = final.fleetStore.puts.length;
+      if (missingLedger) {
+        await expect(continueWorld(final, token)).rejects.toThrow(
+          'migration ledger is incomplete',
+        );
+        expectItemFailure(final);
+      } else {
+        await continueWorld(final, token);
+      }
+      expect(final.ops.filter((op) => op.startsWith('apply:'))).toEqual([
+        'apply:verify',
+      ]);
+      expect(final.fleetStore.puts).toHaveLength(writes);
+    }
+
+    const beforePut = createWorld();
+    const token = await advanceTo(beforePut, 'apply-migrations');
+    const applied: number[] = [];
+    const apply = beforePut.backend.applyMigrations;
+    beforePut.backend.applyMigrations = async (...args) => {
+      for (const { version } of args[1])
+        if (!beforePut.ledger.has(version)) applied.push(version);
+      return apply(...args);
+    };
+    const interruption = new Error('process terminated before schema put');
+    beforePut.fleetStore.beforePut = (record) => {
+      if (record.schemaVersion === 2) throw interruption;
+    };
+    beforePut.operationStore.beforeFail = () => {
+      throw interruption;
+    };
+    await expect(continueWorld(beforePut, token)).rejects.toBe(interruption);
+    expect(beforePut.current().schemaVersion).toBe(1);
+    expect(beforePut.ledger.has(2)).toBe(true);
+    expect(beforePut.operationStore.item().status).toBe('active');
+    beforePut.fleetStore.beforePut = undefined;
+    beforePut.operationStore.beforeFail = undefined;
+    beforePut.ops.length = 0;
+    await continueWorld(beforePut, token);
+    expect(beforePut.ops.filter((op) => op.startsWith('apply:'))).toEqual([
+      'apply:2',
+    ]);
+    expect(applied).toEqual([2]);
+    expect(beforePut.current().schemaVersion).toBe(2);
+  });
+
+  it('crash window deploy-candidate: external re-deploys the same artifact; non-external adopts via inspect', async () => {
+    for (const external of [false, true]) {
+      const world = createWorld({ external });
+      const token = await advanceTo(world, 'deploy-candidate');
+      const deploys: Parameters<ProvisioningBackend['deployWorker']>[] = [];
+      const deploy = world.backend.deployWorker;
+      world.backend.deployWorker = async (...args) => {
+        deploys.push(args);
+        return deploy(...args);
+      };
+      const interruption = new Error('candidate commit interrupted');
+      world.fleetStore.beforePut = (record) => {
+        if (
+          record.pendingArtifactVersion ||
+          record.migrationIntent?.subphase === 'candidate-deployed'
+        )
+          throw interruption;
+      };
+      world.operationStore.beforeFail = () => {
+        throw interruption;
+      };
+      await expect(continueWorld(world, token)).rejects.toBe(interruption);
+      expect(deploys).toHaveLength(1);
+      world.fleetStore.beforePut = undefined;
+      world.operationStore.beforeFail = undefined;
+      world.ops.length = 0;
+      await continueWorld(world, token);
+      expect(deploys).toHaveLength(external ? 2 : 1);
+      if (external) {
+        expect(deploys[1]?.[0]).toBe(deploys[0]?.[0]);
+        expect(deploys[1]?.[1]).toEqual(deploys[0]?.[1]);
+        expect(deploys[1]?.[2]).toBe(deploys[0]?.[2]);
+        expect(deploys[1]?.[5]).toBe(deploys[0]?.[5]);
+        expect(world.ops).toContain('deploy');
+      } else {
+        expect(world.ops).toContain('inspect');
+        expect(world.ops).not.toContain('deploy');
+      }
+      expect(
+        external
+          ? world.current().pendingRelease?.artifactVersion
+          : world.current().pendingArtifactVersion,
+      ).toBe(`v${world.spec.schemaVersion}`);
+    }
+  });
+
+  it('crash window pending-topology: timestamp-only re-put', async () => {
+    const world = createWorld({ external: true });
+    const token = await advanceTo(world, 'pending-topology');
+    await loseStepResponse(world, token);
+    const prior = copy(world.current());
+    const puts = world.fleetStore.puts.length;
+    world.ops.length = 0;
+    await advanceFleetMigration({
+      ...world.options({ kind: 'continue', token: token.token }),
+      clock: () => NOW + 1000,
+    });
+    expect(world.fleetStore.puts).toHaveLength(puts + 1);
+    expect(world.current()).toEqual({
+      ...prior,
+      updatedAt: new Date(NOW + 1000).toISOString(),
+    });
+    expect(providerMutations(world)).toEqual([]);
+  });
+
+  it('crash window retire-post: cleared retiringRelease no-ops', async () => {
+    const world = createWorld({ external: true });
+    world.fleetStore.set({
+      ...world.initial,
+      rollbackRelease: {
+        ...world.priorRelease,
+        physicalScriptName: 'obsolete-release',
+      },
+    });
+    const token = await advanceTo(world, 'retire-post');
+    await loseStepResponse(world, token);
+    expect(world.ops).toContain('retire:obsolete-release');
+    expect(world.current().retiringRelease).toBeUndefined();
+    const prior = copy(world.current());
+    const puts = world.fleetStore.puts.length;
+    world.ops.length = 0;
+    await continueWorld(world, token);
+    expect(world.current()).toEqual(prior);
+    expect(world.fleetStore.puts).toHaveLength(puts);
+    expect(providerMutations(world)).toEqual([]);
+    expect(world.operationStore.item().status).toBe('complete');
+  });
+
+  it('first error: ONE failOperation batch and the original error rethrown; later ordinals never run', async () => {
+    const world = createWorld();
+    const later = baseRecord(deploymentSpec('later'));
+    world.fleetStore.set(later);
+    const result = await advanceTo(
+      world,
+      'seed-identity',
+      await world.start(uuid(), [world.initial, later]),
+    );
+    const original = new Error('Authorization: Bearer private-provider-error');
+    world.fail('seed:cedar', original);
+    await expect(continueWorld(world, result)).rejects.toBe(original);
+    expectItemFailure(world);
+    expect(world.operationStore.failures).toHaveLength(1);
+    expect(world.operationStore.failures[0]?.updateRows).toEqual([
+      {
+        rowKind: 'item',
+        ordinal: 0,
+        payload: { ...world.operationStore.item() },
+      },
+    ]);
+    expect(
+      world.operationStore.failures[0]?.runRecord.progress.failure,
+    ).toEqual({ reason: 'item-failed', itemOrdinal: 0 });
+    expect(world.operationStore.item(uuid(), 1)).toMatchObject({
+      status: 'pending',
+    });
+    expect(world.ops.some((op) => op.endsWith(':later'))).toBe(false);
+    expect(world.operationStore.heads.has('migration')).toBe(false);
+    expect(world.operationStore.operations.get(uuid())?.terminalAtMs).toBe(NOW);
+    expect(world.operationStore.operations.get(uuid())?.progress.revision).toBe(
+      result.token.revision + 1,
+    );
+    const bytes = JSON.stringify([
+      ...world.operationStore.operations.values(),
+      ...world.operationStore.rows.values(),
+    ]);
+    expect(bytes).not.toContain(original.message);
+    expect(bytes).not.toContain('Bearer');
+  });
+
+  it('continue on a failed operation returns the failed member with zero provider work', async () => {
+    const world = createWorld();
+    const token = await world.start();
+    const original = new Error('backend resolver failed');
+    await expect(
+      advanceFleetMigration({
+        ...world.options({ kind: 'continue', token: token.token }),
+        backendFor() {
+          throw original;
+        },
+      }),
+    ).rejects.toBe(original);
+    const run = world.operationStore.operations.get(uuid());
+    if (!run) throw new Error('missing failed run');
+    world.ops.length = 0;
+    world.fleetStore.ops.length = 0;
+    const calls = [...world.operationStore.calls];
+    const failed = await advanceFleetMigration(
+      world.options({
+        kind: 'continue',
+        token: { ...token.token, revision: run.progress.revision },
+      }),
+    );
+    expect(failed).toMatchObject({
+      status: 'failed',
+      failure: { reason: 'item-failed', itemOrdinal: 0 },
+    });
+    expect(world.ops).toEqual([]);
+    expect(world.fleetStore.ops).toEqual([]);
+    expect(world.operationStore.calls).toEqual(calls);
+  });
+
+  it('a disappeared record becomes the item failure', async () => {
+    for (const admitted of [false, true]) {
+      const world = createWorld();
+      let token = await world.start();
+      if (admitted) token = await continueWorld(world, token);
+      world.fleetStore.records.clear();
+      world.ops.length = 0;
+      await expect(continueWorld(world, token)).rejects.toThrow(
+        'fleet migration record disappeared',
+      );
+      expectItemFailure(world);
+      expect(world.ops).toEqual([]);
+      expect(world.fleetStore.puts).toEqual([]);
+    }
+  });
+
+  it('abandonFleetMigrationOperation: running becomes operator-abandoned with the active item failed; terminal is a no-op', async () => {
+    for (const admitted of [false, true]) {
+      const world = createWorld();
+      let token = await world.start();
+      if (admitted) token = await continueWorld(world, token);
+      const item = world.operationStore.item();
+      await abandonFleetMigrationOperation({
+        operationStore: world.operationStore,
+        operationId: uuid(),
+      });
+      expect(world.operationStore.item()).toEqual({
+        ...item,
+        status: 'failed',
+      });
+      expect(world.operationStore.operations.get(uuid())).toMatchObject({
+        state: 'failed',
+        terminalAtMs: NOW,
+        progress: {
+          revision: token.token.revision + 1,
+          failure: { reason: 'operator-abandoned', itemOrdinal: 0 },
+        },
+      });
+      expect(world.operationStore.heads.has('migration')).toBe(false);
+      const state = copy([...world.operationStore.operations.values()]);
+      const calls = [...world.operationStore.calls];
+      await abandonFleetMigrationOperation({
+        operationStore: world.operationStore,
+        operationId: uuid(),
+      });
+      expect([...world.operationStore.operations.values()]).toEqual(state);
+      expect(world.operationStore.calls).toEqual(calls);
+    }
+    const complete = createWorld({ path: 'ready' });
+    await drainWorld(complete);
+    const prior = copy([...complete.operationStore.operations.values()]);
+    const calls = [...complete.operationStore.calls];
+    await abandonFleetMigrationOperation({
+      operationStore: complete.operationStore,
+      operationId: uuid(),
+    });
+    expect([...complete.operationStore.operations.values()]).toEqual(prior);
+    expect(complete.operationStore.calls).toEqual(calls);
+  });
+
+  it('items page is readable while running', async () => {
+    const world = createWorld();
+    const records = [
+      world.initial,
+      baseRecord(deploymentSpec('elm')),
+      baseRecord(deploymentSpec('fir')),
+    ];
+    const token = await world.start(uuid(), records);
+    await continueWorld(world, token);
+    world.ops.length = 0;
+    const first = await readFleetMigrationItemsPage(world.operationStore, {
+      operationId: uuid(),
+      limit: 2,
+    });
+    expect(first.items.map((item) => item.ordinal)).toEqual([0, 1]);
+    expect(first.items.map((item) => item.status)).toEqual([
+      'active',
+      'pending',
+    ]);
+    expect(first.done).toBe(false);
+    const second = await readFleetMigrationItemsPage(world.operationStore, {
+      operationId: uuid(),
+      afterOrdinal: 1,
+      limit: 2,
+    });
+    expect(second.items.map((item) => item.ordinal)).toEqual([2]);
+    expect(second.done).toBe(true);
+    expect(world.ops).toEqual([]);
+    expect(world.operationStore.operations.get(uuid())?.state).toBe('running');
+    world.operationStore.reversePages = true;
+    expect(
+      (
+        await readFleetMigrationItemsPage(world.operationStore, {
+          operationId: uuid(),
+          limit: 3,
+        })
+      ).items.map((item) => item.ordinal),
+    ).toEqual([0, 1, 2]);
+  });
+
+  it('second-world drain-versus-bounded end states and sanitized rows retain callback and clock contracts', async () => {
+    for (const input of [
+      { path: 'ready' as const },
+      {},
+      { external: true },
+      { path: 'platform-only' as const, lagging: true },
+    ]) {
+      const bounded = createWorld(input);
+      const drain = createWorld(input);
+      await drainWorld(bounded);
+      const [legacy] = await migrateWorld(drain);
+      expect(bounded.current()).toEqual(legacy);
+      expect([...bounded.releases]).toEqual([...drain.releases]);
+      expect([...bounded.routed]).toEqual([...drain.routed]);
+      expect([...bounded.ledger]).toEqual([...drain.ledger]);
+      const items = bounded.operationStore.rows.get(uuid()) ?? [];
+      const bytes = JSON.stringify(items);
+      for (const forbidden of [
+        'databaseId',
+        'scriptName',
+        'platformResources',
+        'applicationBindings',
+        'maintenanceAdmin',
+        'deploymentIdentity',
+        SECRETS.maintenanceAdmin,
+        SECRETS.deploymentIdentity,
+        JSON.stringify(bounded.initial),
+      ])
+        expect(bytes).not.toContain(forbidden);
+      const failed = createWorld(input);
+      const token = await failed.start();
+      await expect(
+        advanceFleetMigration({
+          ...failed.options({ kind: 'continue', token: token.token }),
+          secretsFor() {
+            throw new Error(
+              `Authorization: Bearer ${SECRETS.maintenanceAdmin}`,
+            );
+          },
+        }),
+      ).rejects.toThrow('Authorization: Bearer');
+      expect(
+        failed.operationStore.operations.get(uuid())?.progress.failure,
+      ).toEqual({ reason: 'item-failed', itemOrdinal: 0 });
+      const failureBytes = JSON.stringify([
+        ...failed.operationStore.operations.values(),
+        ...failed.operationStore.rows.values(),
+      ]);
+      expect(failureBytes).not.toContain('Authorization');
+      expect(failureBytes).not.toContain('Bearer');
+      expect(failureBytes).not.toContain(SECRETS.maintenanceAdmin);
+    }
+
+    const resolverNames = [
+      'backendFor',
+      'specFor',
+      'secretsFor',
+      'finalizedStateProviderFor',
+      'settlementFor',
+    ] as const;
+    for (const mode of ['bounded', 'drain'] as const) {
+      for (const selected of resolverNames) {
+        const world =
+          selected === 'finalizedStateProviderFor'
+            ? finalizedWorld('ready').world
+            : createWorld({ path: 'ready' });
+        const token =
+          mode === 'bounded'
+            ? selected === 'settlementFor'
+              ? await advanceTo(world, 'ready-attest-settle')
+              : await world.start()
+            : undefined;
+        const options = {
+          ...world.options({ kind: 'continue', token: token?.token ?? {} }),
+          store: world.fleetStore,
+          records: [world.current()],
+          canaryTenantTags: [],
+        };
+        const calls: string[] = [];
+        const original = new Error(`selected ${selected}`);
+        const values = {
+          backendFor: world.backend,
+          specFor: world.spec,
+          secretsFor: SECRETS,
+        };
+        world.fleetStore.ops.length = 0;
+        for (const name of resolverNames)
+          Object.defineProperty(options, name, {
+            get() {
+              expect(this).toBe(options);
+              expect(world.fleetStore.ops).toContain('get');
+              calls.push(`get:${name}`);
+              return function (this: unknown, record: FleetRecord) {
+                expect(this).toBe(options);
+                expect(record.tenantTag).toBe(world.initial.tenantTag);
+                calls.push(`call:${name}`);
+                if (name === selected) throw original;
+                return name in values
+                  ? values[name as keyof typeof values]
+                  : undefined;
+              };
+            },
+          });
+        await expect(
+          mode === 'bounded'
+            ? advanceFleetMigration(options)
+            : migrateFleet(options),
+        ).rejects.toBe(original);
+        const expected = resolverNames
+          .slice(0, 3)
+          .slice(
+            0,
+            selected === 'backendFor' ? 1 : selected === 'specFor' ? 2 : 3,
+          );
+        const order =
+          selected === 'finalizedStateProviderFor' ||
+          selected === 'settlementFor'
+            ? [...expected, selected]
+            : expected;
+        expect(calls).toEqual(
+          order.flatMap((name) => [`get:${name}`, `call:${name}`]),
+        );
+      }
+      const vanished = createWorld();
+      const token = mode === 'bounded' ? await vanished.start() : undefined;
+      const options = {
+        ...vanished.options({ kind: 'continue', token: token?.token ?? {} }),
+        store: vanished.fleetStore,
+        records: [vanished.initial],
+        canaryTenantTags: [],
+      };
+      vanished.fleetStore.records.clear();
+      for (const name of resolverNames)
+        Object.defineProperty(options, name, {
+          get() {
+            throw new Error(`eager ${name}`);
+          },
+        });
+      let clockReads = 0;
+      Object.defineProperty(options, 'clock', {
+        get() {
+          clockReads += 1;
+          return () => NOW;
+        },
+      });
+      await expect(
+        mode === 'bounded'
+          ? advanceFleetMigration(options)
+          : migrateFleet(options),
+      ).rejects.toThrow('fleet migration record disappeared');
+      expect(clockReads).toBe(1);
+
+      const retirement = createWorld({ path: 'ready', external: true });
+      retirement.fleetStore.set({
+        ...retirement.current(),
+        retiringRelease: {
+          ...retirement.priorRelease,
+          physicalScriptName: 'expired-release',
+        },
+      });
+      const retiringToken =
+        mode === 'bounded'
+          ? await advanceTo(retirement, 'retire-pre')
+          : undefined;
+      const retiringOptions = {
+        ...retirement.options({
+          kind: 'continue',
+          token: retiringToken?.token ?? {},
+        }),
+        store: retirement.fleetStore,
+        records: [retirement.current()],
+        canaryTenantTags: [],
+      };
+      let deleted = false;
+      let reads = 0;
+      let selectedCalls = 0;
+      retirement.backend.deleteRetainedRelease = async () => {
+        await Promise.resolve();
+        deleted = true;
+      };
+      Object.defineProperty(retiringOptions, 'clock', {
+        get() {
+          reads += 1;
+          if (reads === 1) return () => NOW;
+          if (!deleted)
+            return function (this: unknown) {
+              expect(this).toBeUndefined();
+              expect(deleted).toBe(true);
+              selectedCalls += 1;
+              return NOW;
+            };
+          return () => NOW + 1000;
+        },
+      });
+      await (mode === 'bounded'
+        ? advanceFleetMigration(retiringOptions)
+        : migrateFleet(retiringOptions));
+      expect(selectedCalls).toBe(1);
+      expect(
+        retirement.fleetStore.puts.find((record) => !record.retiringRelease)
+          ?.updatedAt,
+      ).toBe(new Date(NOW).toISOString());
+
+      const schema = createWorld({ schemaVersion: 2 });
+      const schemaToken =
+        mode === 'bounded'
+          ? await advanceTo(schema, 'apply-migrations')
+          : undefined;
+      const schemaOptions = {
+        ...schema.options({
+          kind: 'continue',
+          token: schemaToken?.token ?? {},
+        }),
+        store: schema.fleetStore,
+        records: [schema.current()],
+        canaryTenantTags: [],
+      };
+      let providerDone = false;
+      const apply = schema.backend.applyMigrations;
+      schema.backend.applyMigrations = async (...args) => {
+        await apply(...args);
+        await Promise.resolve();
+        providerDone = true;
+      };
+      Object.defineProperty(schemaOptions, 'clock', {
+        get() {
+          const instant = providerDone ? NOW + 1000 : NOW;
+          return function (this: unknown) {
+            expect(this).toBeUndefined();
+            return instant;
+          };
+        },
+      });
+      await (mode === 'bounded'
+        ? advanceFleetMigration(schemaOptions)
+        : migrateFleet(schemaOptions));
+      expect(
+        schema.fleetStore.puts.find((record) => record.schemaVersion === 2)
+          ?.updatedAt,
+      ).toBe(new Date(NOW + 1000).toISOString());
+
+      const finalized = finalizedWorld('ready');
+      const ordinary = finalized.world;
+      const ordinaryToken =
+        mode === 'bounded'
+          ? await advanceTo(ordinary, 'ready-platform-resources')
+          : undefined;
+      const ordinaryOptions = {
+        ...ordinary.options({
+          kind: 'continue',
+          token: ordinaryToken?.token ?? {},
+        }),
+        store: ordinary.fleetStore,
+        records: [ordinary.current()],
+        canaryTenantTags: [],
+      };
+      let described = false;
+      let ordinaryReads = 0;
+      const describe = finalized.provider.describeFinalizedState;
+      finalized.provider.describeFinalizedState = (input) => {
+        described = true;
+        return describe(input);
+      };
+      const selected = function (this: {
+        provider: FinalizedOrdinaryStateProvider;
+        record: FleetRecord;
+        clock: () => number;
+      }) {
+        expect(this.provider).toBe(finalized.provider);
+        expect(this.clock).toBe(selected);
+        expect(this.record.tenantTag).toBe('cedar');
+        expect(described).toBe(true);
+        throw new Error('ordinary clock receiver verified');
+      };
+      Object.defineProperty(ordinaryOptions, 'clock', {
+        get() {
+          ordinaryReads += 1;
+          expect(described).toBe(false);
+          return ordinaryReads === 1 ? () => NOW : selected;
+        },
+      });
+      await expect(
+        mode === 'bounded'
+          ? advanceFleetMigration(ordinaryOptions)
+          : migrateFleet(ordinaryOptions),
+      ).rejects.toThrow('ordinary clock receiver verified');
+      expect(ordinaryReads).toBe(2);
+    }
+    for (const [step, expectedReads] of [
+      ['ready-target-backfill', 1],
+      ['ready-platform-resources', 1],
+      ['ready-maintenance', 1],
+      ['ready-promote', 2],
+      ['ready-retire-post', 2],
+    ] as const) {
+      const world = createWorld({ path: 'ready' });
+      world.fleetStore.set({
+        ...world.current(),
+        invocationAuthority: {
+          version: 1,
+          authorizedAt: new Date(NOW).toISOString(),
+        },
+      });
+      const token = await advanceTo(world, step);
+      const options = world.options({ kind: 'continue', token: token.token });
+      let reads = 0;
+      let calls = 0;
+      Object.defineProperty(options, 'clock', {
+        get() {
+          reads += 1;
+          return () => {
+            calls += 1;
+            return NOW;
+          };
+        },
+      });
+      await advanceFleetMigration(options);
+      expect(reads).toBe(expectedReads);
+      expect(calls).toBe(0);
+    }
+  });
+
+  it('ready-target-backfill trusted-resources refusal fails the item from inside the step', async () => {
+    const world = createWorld({ path: 'ready', external: true });
+    const current = { ...world.current() };
+    delete current.platformTarget;
+    delete current.platformResources;
+    world.fleetStore.set(current);
+    const token = await advanceTo(world, 'ready-target-backfill');
+    expect(world.operationStore.item().status).toBe('active');
+    await expect(continueWorld(world, token)).rejects.toThrow(
+      'ready external deployment has no trusted platform resources',
+    );
+    expectItemFailure(world);
+    expect(world.fleetStore.puts).toEqual([]);
+    expect(providerMutations(world)).toEqual([]);
+  });
+
+  it('ready-platform-resources preserves its exact platform-target refusal and the earlier coordinator fence', async () => {
+    const world = createWorld({ path: 'ready', external: true });
+    const token = await advanceTo(world, 'ready-platform-resources');
+    const divergent = {
+      ...world.current(),
+      platformTarget: {
+        ...world.priorTarget,
+        stateArtifactDigest: 'f'.repeat(64),
+      },
+    };
+    await withAdmitted(world, async ({ admitted }) => {
+      await expect(
+        executeNextMigrationStep(
+          admitted,
+          [{ step: 'ready-platform-resources' }],
+          0,
+          { entry: divergent, current: divergent },
+        ),
+      ).rejects.toThrow(
+        'ready deployment does not match the persisted platform target',
+      );
+    });
+    world.fleetStore.set(divergent);
+    world.ops.length = 0;
+    const puts = world.fleetStore.puts.length;
+    await expect(continueWorld(world, token)).rejects.toThrow(
+      'fleet migration item no longer matches its frozen plan',
+    );
+    expectItemFailure(world);
+    expect(world.fleetStore.puts).toHaveLength(puts);
+    expect(providerMutations(world)).toEqual([]);
+  });
+
+  it('platform-only-maintenance unarmed refusal fails the item from inside the step', async () => {
+    const world = createWorld({ path: 'platform-only' });
+    const token = await advanceTo(world, 'platform-only-maintenance');
+    world.setMaintenance({ ...HEALTHY, armed: false });
+    world.ops.length = 0;
+    await expect(continueWorld(world, token)).rejects.toThrow(
+      'platform-only migration maintenance is unarmed before route publication',
+    );
+    expectItemFailure(world);
+    expect(world.ops).toContain('maintenance');
+    expect(world.ops).not.toContain('promote');
+  });
+
+  it('last apply-migrations missing-path refusal uses the entry schema and fails the item', async () => {
+    const world = createWorld();
+    const token = await advanceTo(world, 'apply-migrations');
+    const item = world.operationStore.item();
+    world.operationStore.setItem({
+      ...item,
+      plan: item.plan?.filter(
+        (entry) =>
+          entry.step !== 'apply-migrations' || entry.targetSchemaVersion !== 3,
+      ),
+    });
+    await expect(continueWorld(world, token)).rejects.toThrow(
+      'missing D1 migration path from 1 to 3',
+    );
+    expect(world.current().schemaVersion).toBe(2);
+    expectItemFailure(world);
+    expect(world.ops.filter((op) => op.startsWith('apply:'))).toEqual([
+      'apply:2',
+    ]);
+    const invalid = createWorld();
+    invalid.spec = {
+      ...invalid.spec,
+      migrations: invalid.spec.migrations.slice(0, 2),
+    };
+    const start = await invalid.start();
+    await expect(continueWorld(invalid, start)).rejects.toThrow(
+      'D1 migration history must contain every version through schemaVersion',
+    );
+    expectItemFailure(invalid);
+    expect(invalid.fleetStore.puts).toEqual([]);
+    expect(providerMutations(invalid)).toEqual([]);
+  });
+
+  it('READY-plan reachability: trusted resources without platformTarget reach the backfill step', async () => {
+    const world = createWorld({ path: 'ready', external: true });
+    const current = { ...world.current() };
+    delete current.platformTarget;
+    world.fleetStore.set(current);
+    const token = await advanceTo(world, 'ready-target-backfill');
+    expect(world.operationStore.item().plan?.map(({ step }) => step)).toEqual([
+      'ready-target-backfill',
+      'ready-platform-resources',
+      'ready-maintenance',
+      'ready-promote',
+      'ready-attest-settle',
+      'ready-retire-post',
+    ]);
+    expect(world.fleetStore.puts).toEqual([]);
+    await continueWorld(world, token);
+    expect(world.current().platformTarget).toEqual(world.priorTarget);
+    expect(world.fleetStore.puts).toHaveLength(1);
+    expect(providerMutations(world)).toEqual([]);
+  });
+
+  it('assert-migrating lost-intent refusal fails the item from inside the step', async () => {
+    const world = createWorld({ external: true });
+    const token = await advanceTo(world, 'assert-migrating');
+    const current = { ...world.current() };
+    delete current.migrationPriorRelease;
+    world.fleetStore.set(current);
+    const puts = world.fleetStore.puts.length;
+    world.ops.length = 0;
+    await expect(continueWorld(world, token)).rejects.toThrow(
+      'immutable external migration lost its durable release intent',
+    );
+    expectItemFailure(world);
+    expect(world.fleetStore.puts).toHaveLength(puts);
+    expect(providerMutations(world)).toEqual([]);
+  });
+
+  it('plan-compatibility fence covers admission gaps, intent drift and premature foreign convergence', async () => {
+    const equal = createWorld({ path: 'ready' });
+    const equalToken = await advanceTo(equal, 'ready-target-backfill');
+    equal.fleetStore.set({
+      ...equal.current(),
+      updatedAt: new Date(NOW).toISOString(),
+    });
+    await continueWorld(equal, equalToken);
+    expect(equal.operationStore.item().status).toBe('active');
+    for (const opposite of [false, true]) {
+      const world = createWorld({ path: 'ready', external: true });
+      const token = await advanceTo(world, 'ready-target-backfill');
+      const donor = createWorld({
+        path: opposite ? 'platform-only' : 'full',
+        external: true,
+      });
+      donor.spec = world.spec;
+      if (!opposite)
+        donor.fleetStore.set({
+          ...donor.current(),
+          desiredSpecDigest: 'f'.repeat(64),
+        });
+      await advanceTo(donor, 'assert-migrating');
+      const carrier = donor.current();
+      if (!carrier.migrationIntent) throw new Error('missing donor intent');
+      world.fleetStore.set({
+        ...carrier,
+        migrationIntent: {
+          ...carrier.migrationIntent,
+          target: world.priorTarget,
+        },
+      });
+      world.ops.length = 0;
+      const puts = world.fleetStore.puts.length;
+      await expect(continueWorld(world, token)).rejects.toThrow(
+        'fleet migration item no longer matches its frozen plan',
+      );
+      expectItemFailure(world);
+      expect(world.fleetStore.puts).toHaveLength(puts);
+      expect(providerMutations(world)).toEqual([]);
+    }
+    const divergent = createWorld({ external: true });
+    const divergentToken = await advanceTo(divergent, 'seed-identity');
+    const carrier = divergent.current();
+    if (!carrier.migrationIntent) throw new Error('missing intent');
+    divergent.fleetStore.set({
+      ...carrier,
+      pendingRelease: {
+        ...(carrier.pendingRelease as ExternalReleaseSnapshot),
+        physicalScriptName: 'foreign-candidate',
+      },
+    });
+    await expect(continueWorld(divergent, divergentToken)).rejects.toThrow(
+      'migration retry uses a different desired specification',
+    );
+    expectItemFailure(divergent);
+    for (const path of ['full', 'platform-only'] as const) {
+      const admitted = createWorld({ path, external: true });
+      const admittedToken = await advanceTo(admitted, 'admit-migrating');
+      expect(admitted.current().phase).toBe('ready');
+      await continueWorld(admitted, admittedToken);
+      expect(admitted.current().phase).toBe('migrating');
+      const frozen = admitted.operationStore.item().plan;
+      const terminal = frozen?.findIndex(
+        ({ step }) =>
+          step === (path === 'full' ? 'settle-ready' : 'platform-only-ready'),
+      );
+      if (terminal === undefined || terminal < 1)
+        throw new Error('missing terminal entry');
+      const donor = createWorld({ path, external: true });
+      await drainWorld(donor);
+      for (let cursor = 0; cursor < terminal; cursor += 1) {
+        const world = createWorld({ path, external: true });
+        let token = await advanceTo(world, 'admit-migrating');
+        for (let completed = 0; completed < cursor; completed += 1)
+          token = await continueWorld(world, token);
+        expect(world.operationStore.item().planCursor).toBe(cursor);
+        world.fleetStore.set(donor.current());
+        const puts = world.fleetStore.puts.length;
+        world.ops.length = 0;
+        await expect(continueWorld(world, token)).rejects.toThrow(
+          'fleet migration item no longer matches its frozen plan',
+        );
+        expectItemFailure(world);
+        expect(world.fleetStore.puts).toHaveLength(puts);
+        expect(providerMutations(world)).toEqual([]);
+      }
+    }
+  });
+
+  it('carrier-fact drift past assert-migrating is caught by the next fence assertion re-run', async () => {
+    for (const field of [
+      'migrationPriorRelease',
+      'target',
+      'finalizedState',
+    ] as const) {
+      const finalized = finalizedWorld();
+      const world = finalized.world;
+      const token = await advanceTo(world, 'seed-identity');
+      const current = { ...world.current() };
+      if (!current.migrationIntent) throw new Error('missing intent');
+      const expected =
+        field === 'migrationPriorRelease'
+          ? 'immutable external migration lost its durable release intent'
+          : field === 'target'
+            ? 'migration retry does not match the persisted platform target'
+            : 'finalized provider state drifted';
+      if (field === 'migrationPriorRelease')
+        delete current.migrationPriorRelease;
+      if (field === 'target')
+        current.migrationIntent = {
+          ...current.migrationIntent,
+          target: {
+            ...current.migrationIntent.target,
+            stateArtifactDigest: 'f'.repeat(64),
+          },
+        };
+      if (field === 'finalizedState')
+        finalized.provider.assertFinalizedState = async () => {
+          throw new Error(expected);
+        };
+      world.fleetStore.set(current);
+      const puts = world.fleetStore.puts.length;
+      world.ops.length = 0;
+      await expect(continueWorld(world, token)).rejects.toThrow(expected);
+      expectItemFailure(world);
+      expect(world.fleetStore.puts).toHaveLength(puts);
+      expect(providerMutations(world)).toEqual([]);
+    }
+  });
+
+  it('all ten bounded entry bindings observe the leased retry snapshot rather than the admission snapshot', async () => {
+    for (const step of [
+      'platform-only-maintenance',
+      'platform-only-promote',
+      'platform-only-ready',
+      'deploy-candidate',
+      'promote',
+      'settle-ready',
+    ] as const) {
+      const path = step.startsWith('platform-only-') ? 'platform-only' : 'full';
+      const world = createWorld({ path, external: true, namespace: true });
+      let token = await advanceTo(
+        world,
+        path === 'platform-only'
+          ? 'platform-only-resources'
+          : 'platform-resources',
+      );
+      world.setNamespace('namespace-converged');
+      token = await continueWorld(world, token);
+      expect(
+        world.current().platformResources?.stateWorker.namespaceIds,
+      ).toEqual(['namespace-converged']);
+      if (path === 'platform-only')
+        world.releases.set(
+          world.priorRelease.physicalScriptName,
+          world.liveFor(world.spec, world.priorRelease.artifactVersion),
+        );
+      token = await advanceTo(world, step, token);
+      const before = copy(world.current());
+      const item = world.operationStore.item();
+      if (!item.plan || item.planCursor === undefined)
+        throw new Error('missing step cursor');
+      const plan = item.plan;
+      const planCursor = item.planCursor;
+      await withAdmitted(world, async ({ admitted, reread }) => {
+        const staleEntry = {
+          ...reread,
+          platformResources: world.initial.platformResources,
+        };
+        await expect(
+          executeNextMigrationStep(admitted, plan, planCursor, {
+            entry: staleEntry,
+            current: reread,
+          }),
+        ).rejects.toThrow(
+          "deployment 'cedar:production' live state does not exactly match the desired specification",
+        );
+      });
+      world.fleetStore.set(before);
+      const retry = createWorld({ path, external: true, namespace: true });
+      retry.setNamespace('namespace-converged');
+      retry.fleetStore.set(before);
+      retry.releases.clear();
+      for (const [name, live] of world.releases)
+        retry.releases.set(name, copy(live));
+      retry.routed.clear();
+      for (const [tenant, name] of world.routed) retry.routed.set(tenant, name);
+      for (const version of world.ledger) retry.ledger.add(version);
+      await continueWorld(world, token);
+      expect(world.operationStore.item().status).not.toBe('failed');
+      expect(world.operationStore.item().planCursor).toBe(planCursor + 1);
+      await expect(migrateWorld(retry)).resolves.toHaveLength(1);
+    }
+
+    const ownership = createWorld();
+    const ownershipToken = await advanceTo(ownership, 'seed-identity');
+    const seeded: unknown[][] = [];
+    ownership.backend.seedDeploymentIdentity = async (...args) => {
+      seeded.push(args);
+    };
+    await withAdmitted(ownership, async ({ admitted, reread }) => {
+      await executeNextMigrationStep(admitted, [{ step: 'seed-identity' }], 0, {
+        entry: { ...reread, tenantTag: 'entry-owner' },
+        current: { ...reread, tenantTag: 'current-owner' },
+      });
+      expect(seeded[0]).toEqual([
+        admitted.database,
+        'entry-owner',
+        admitted.lease,
+        { initialExecutionFenceState: 'open' },
+      ]);
+    });
+    seeded.length = 0;
+    await continueWorld(ownership, ownershipToken);
+    expect(seeded[0]?.[1]).toBe('cedar');
+    expect(seeded[0]?.[3]).toEqual({ initialExecutionFenceState: 'open' });
+
+    const missingPath = createWorld();
+    await withAdmitted(missingPath, async ({ admitted, reread }) => {
+      await expect(
+        executeNextMigrationStep(
+          admitted,
+          [{ step: 'apply-migrations', targetSchemaVersion: 2 }],
+          0,
+          { entry: { ...reread, schemaVersion: 17 }, current: reread },
+        ),
+      ).rejects.toThrow('missing D1 migration path from 17 to 3');
+      expect(missingPath.current().schemaVersion).toBe(2);
+    });
+
+    const absent = createWorld({ external: true });
+    const absentToken = await advanceTo(absent, 'settle-ready');
+    absent.backend.inspect = async () => undefined;
+    await withAdmitted(absent, async ({ admitted, reread }) => {
+      await expect(
+        executeNextMigrationStep(
+          admitted,
+          [{ step: 'settle-ready' }, { step: 'retire-post' }],
+          0,
+          {
+            entry: {
+              ...reread,
+              tenantTag: 'entry-tenant',
+              environment: 'entry-environment',
+            },
+            current: reread,
+          },
+        ),
+      ).rejects.toThrow(
+        'deployment did not converge after migration for entry-tenant:entry-environment',
+      );
+    });
+    await expect(continueWorld(absent, absentToken)).rejects.toThrow(
+      'deployment did not converge after migration for cedar:production',
+    );
+    expectItemFailure(absent);
+
+    const retirement = createWorld({ external: true });
+    const retiringToken = await advanceTo(retirement, 'settle-ready');
+    const entryRelease = {
+      ...retirement.priorRelease,
+      physicalScriptName: 'entry-rollback',
+    };
+    const currentRelease = {
+      ...retirement.priorRelease,
+      physicalScriptName: 'current-rollback',
+    };
+    const before = copy(retirement.current());
+    await withAdmitted(retirement, async ({ admitted, reread }) => {
+      const result = await executeNextMigrationStep(
+        admitted,
+        [{ step: 'settle-ready' }, { step: 'retire-post' }],
+        0,
+        {
+          entry: { ...reread, rollbackRelease: entryRelease },
+          current: { ...reread, rollbackRelease: currentRelease },
+        },
+      );
+      expect(result.record.retiringRelease).toEqual(entryRelease);
+    });
+    retirement.fleetStore.set({ ...before, rollbackRelease: currentRelease });
+    await continueWorld(retirement, retiringToken);
+    expect(retirement.current().retiringRelease).toEqual(currentRelease);
+    expect(retirement.initial.rollbackRelease).toBeUndefined();
+  });
+
+  it('migration kind-lease loss at dispatch aborts with zero provider work', async () => {
+    const world = createWorld();
+    const token = await advanceTo(world, 'seed-identity');
+    const item = world.operationStore.item();
+    const run = copy(world.operationStore.operations.get(uuid()));
+    world.operationStore.loseLease = true;
+    world.ops.length = 0;
+    world.fleetStore.ops.length = 0;
+    await expect(continueWorld(world, token)).rejects.toThrow(
+      'operation lease lost',
+    );
+    expect(world.ops).toEqual([]);
+    expect(world.fleetStore.ops).toEqual([]);
+    expect(world.operationStore.item()).toEqual(item);
+    expect(world.operationStore.operations.get(uuid())).toEqual(run);
+  });
+
+  it('fence and step observe the same shared migrating-carrier refusal', async () => {
+    for (const divergence of ['prior', 'target', 'provider'] as const) {
+      const finalized = finalizedWorld();
+      const world = finalized.world;
+      await advanceTo(world, 'seed-identity');
+      await withAdmitted(world, async ({ admitted, reread }) => {
+        const current = { ...reread };
+        if (!current.migrationIntent) throw new Error('missing intent');
+        const expected =
+          divergence === 'prior'
+            ? 'immutable external migration lost its durable release intent'
+            : divergence === 'target'
+              ? 'migration retry does not match the persisted platform target'
+              : 'async finalized assertion refused';
+        if (divergence === 'prior') delete current.migrationPriorRelease;
+        if (divergence === 'target')
+          current.migrationIntent = {
+            ...current.migrationIntent,
+            target: {
+              ...current.migrationIntent.target,
+              stateArtifactDigest: 'f'.repeat(64),
+            },
+          };
+        let completed = 0;
+        if (divergence === 'provider')
+          finalized.provider.assertFinalizedState = async (input) => {
+            await Promise.resolve();
+            expect(input.currentRecord).toBe(current);
+            expect(input.fence).toBe(admitted.lease);
+            completed += 1;
+            throw new Error(expected);
+          };
+        const item = world.operationStore.item();
+        if (!item.plan || item.planCursor === undefined)
+          throw new Error('missing plan');
+        const assertionCursor = item.plan.findIndex(
+          ({ step }) => step === 'assert-migrating',
+        );
+        for (const invoke of [
+          () => assertMigratingCarrierState(admitted, current),
+          () =>
+            executeNextMigrationStep(
+              admitted,
+              item.plan as NonNullable<FleetMigrationItem['plan']>,
+              assertionCursor,
+              { entry: current, current },
+            ),
+          () =>
+            assertFleetMigrationPlanCompatibility(
+              admitted,
+              {
+                plan: item.plan as NonNullable<FleetMigrationItem['plan']>,
+                planCursor: item.planCursor as number,
+              },
+              current,
+            ),
+        ])
+          await expect(invoke()).rejects.toThrow(expected);
+        expect(completed).toBe(divergence === 'provider' ? 3 : 0);
+      });
+    }
+  });
+
+  it('monotonic-floor regressions fail the item without mutation', async () => {
+    for (const scenario of [
+      'backward',
+      'unreachable',
+      'schema',
+      'zero-pending-schema',
+      'candidate',
+      'ready-target',
+    ] as const) {
+      const world = createWorld({
+        path:
+          scenario === 'unreachable'
+            ? 'platform-only'
+            : scenario === 'ready-target'
+              ? 'ready'
+              : 'full',
+        external: ['backward', 'unreachable', 'ready-target'].includes(
+          scenario,
+        ),
+      });
+      if (scenario === 'zero-pending-schema') {
+        world.fleetStore.set({ ...world.current(), schemaVersion: 3 });
+        world.ledger.add(2);
+        world.ledger.add(3);
+      }
+      const step =
+        scenario === 'backward'
+          ? 'pending-topology'
+          : scenario === 'unreachable'
+            ? 'platform-only-maintenance'
+            : scenario === 'candidate'
+              ? 'arm-maintenance'
+              : scenario === 'ready-target'
+                ? 'ready-platform-resources'
+                : 'migration-schema-applied';
+      const token = await advanceTo(world, step);
+      const current = { ...world.current() };
+      if (scenario === 'backward' || scenario === 'unreachable') {
+        if (!current.migrationIntent) throw new Error('missing intent');
+        current.migrationIntent = {
+          ...current.migrationIntent,
+          subphase:
+            scenario === 'backward' ? 'schema-applied' : 'candidate-armed',
+        };
+      } else if (scenario === 'schema' || scenario === 'zero-pending-schema')
+        current.schemaVersion = 2;
+      else if (scenario === 'candidate') delete current.pendingArtifactVersion;
+      else delete current.platformTarget;
+      world.fleetStore.set(current);
+      world.ops.length = 0;
+      const puts = world.fleetStore.puts.length;
+      await expect(continueWorld(world, token)).rejects.toThrow(
+        'fleet migration item no longer matches its frozen plan',
+      );
+      expectItemFailure(world);
+      expect(world.fleetStore.puts).toHaveLength(puts);
+      expect(providerMutations(world)).toEqual([]);
+    }
+  });
+
+  it('READY leave and re-enter continues at its cursor, converging or refusing remaining work', async () => {
+    for (const refuse of [false, true]) {
+      const world = createWorld({ path: 'ready', external: true });
+      const token = await advanceTo(world, 'ready-platform-resources');
+      const item = world.operationStore.item();
+      world.fleetStore.set({ ...world.current(), phase: 'migrating' });
+      const resources = world.current().platformResources;
+      if (!resources) throw new Error('missing resources');
+      world.fleetStore.set({
+        ...world.current(),
+        phase: 'ready',
+        platformResources: {
+          ...resources,
+          stateWorker: {
+            ...resources.stateWorker,
+            artifactVersion: 'foreign-provider-version',
+          },
+        },
+        updatedAt: new Date(NOW).toISOString(),
+      });
+      const release = world.releases.get(world.priorRelease.physicalScriptName);
+      if (!release) throw new Error('missing release');
+      world.releases.set(world.priorRelease.physicalScriptName, {
+        ...release,
+        maintenance: { ...HEALTHY, armed: false },
+      });
+      if (refuse) world.setMaintenance({ ...HEALTHY, armed: false });
+      const next = await continueWorld(world, token);
+      expect(world.operationStore.item().planCursor).toBe(
+        (item.planCursor ?? 0) + 1,
+      );
+      expect(world.current().platformResources).toEqual(
+        world.resourcesFor(world.spec),
+      );
+      if (refuse) {
+        await expect(continueWorld(world, next)).rejects.toThrow(
+          'maintenance did not re-arm',
+        );
+        expectItemFailure(world);
+      } else {
+        expect(await drainWorld(world, next)).toMatchObject({
+          status: 'complete',
+        });
+        expect(world.ops).toContain('maintenance');
+        expect(world.ops).toContain('promote');
+        expect(world.ops).toContain('settle');
+        expect(world.operationStore.item().planCursor).toBe(item.plan?.length);
+      }
+    }
+  });
+
+  it('platform-authored DO-tag-changing FULL migration resumes through terminal commit and refuses foreign tags and fresh-admission base drift', async () => {
+    const history = [
+      { tag: 'v1', newClasses: ['First'] },
+      { tag: 'v2', newClasses: ['Second'] },
+      { tag: 'v3', newClasses: ['Third'] },
+    ];
+    function tagged() {
+      const world = createWorld();
+      world.spec = {
+        ...world.spec,
+        previousDurableObjectTag: 'v1',
+        durableObjectMigrations: history,
+      };
+      world.fleetStore.set({
+        ...world.current(),
+        durableObjectTag: 'v1',
+        durableObjectMigrationHistory: history.slice(0, 1),
+        durableObjectMigrationHistoryDigest:
+          durableObjectMigrationHistoryDigest(history.slice(0, 1)),
+      });
+      return world;
+    }
+    const world = tagged();
+    const token = await advanceTo(world, 'settle-ready');
+    const item = await loseStepResponse(world, token);
+    expect(world.current()).toMatchObject({
+      phase: 'ready',
+      durableObjectTag: 'v3',
+      durableObjectMigrationHistory: history,
+      durableObjectMigrationHistoryDigest:
+        durableObjectMigrationHistoryDigest(history),
+    });
+    world.ops.length = 0;
+    const puts = world.fleetStore.puts.length;
+    const retired = await continueWorld(world, token);
+    expect(providerMutations(world)).toEqual([]);
+    expect(world.fleetStore.puts).toHaveLength(puts);
+    expect(
+      world.operationStore.item().plan?.[
+        world.operationStore.item().planCursor ?? -1
+      ]?.step,
+    ).toBe('retire-post');
+    expect(await drainWorld(world, retired)).toMatchObject({
+      status: 'complete',
+    });
+    expect(world.operationStore.item().planCursor).toBe(item.plan?.length);
+    for (const mode of ['bounded', 'drain'] as const) {
+      const error =
+        "Durable Object migration base mismatch for cedar:production: expected 'v3'";
+      if (mode === 'drain')
+        await expect(migrateWorld(world)).rejects.toThrow(error);
+      else {
+        const start = await world.start(uuid(2), [world.current()]);
+        await expect(continueWorld(world, start)).rejects.toThrow(error);
+        expect(world.operationStore.item(uuid(2)).status).toBe('failed');
+      }
+    }
+    for (const shape of [
+      'consistent-intermediate',
+      'bare-target',
+      'bare-foreign',
+      'no-history-target',
+    ] as const) {
+      const foreign = tagged();
+      const pending = await advanceTo(foreign, 'seed-identity');
+      const current = {
+        ...foreign.current(),
+        durableObjectTag:
+          shape === 'consistent-intermediate'
+            ? 'v2'
+            : shape === 'bare-foreign'
+              ? 'foreign'
+              : 'v3',
+      };
+      if (shape === 'consistent-intermediate') {
+        current.durableObjectMigrationHistory = history.slice(0, 2);
+        current.durableObjectMigrationHistoryDigest =
+          durableObjectMigrationHistoryDigest(history.slice(0, 2));
+      } else if (shape === 'no-history-target') {
+        delete current.durableObjectMigrationHistory;
+        delete current.durableObjectMigrationHistoryDigest;
+      }
+      foreign.fleetStore.set(current);
+      foreign.ops.length = 0;
+      const writes = foreign.fleetStore.puts.length;
+      const expected =
+        shape === 'consistent-intermediate'
+          ? "Durable Object migration base mismatch for cedar:production: expected 'v2'"
+          : shape === 'no-history-target'
+            ? 'platform-authored Durable Object state has no persisted migration history'
+            : 'platform-authored Durable Object migration history is internally inconsistent';
+      await expect(continueWorld(foreign, pending)).rejects.toThrow(expected);
+      expectItemFailure(foreign);
+      expect(foreign.fleetStore.puts).toHaveLength(writes);
+      expect(providerMutations(foreign)).toEqual([]);
+    }
+  });
+
+  it('external ordinary-plane DO-tag movement resumes FULL, PO and READY plans while preserving strict fresh-admission refusal', async () => {
+    for (const path of ['full', 'platform-only', 'ready'] as const) {
+      const { world, target } = finalizedWorld(path);
+      const step =
+        path === 'full'
+          ? 'platform-resources'
+          : path === 'platform-only'
+            ? 'platform-only-resources'
+            : 'ready-platform-resources';
+      const pending = await advanceTo(world, step);
+      world.ops.length = 0;
+      const moved = await continueWorld(world, pending);
+      expect(world.current()).toMatchObject({
+        durableObjectTag: 'state-v2',
+        platformResources: {
+          stateWorker: { plane: 'ordinary', durableObjectTag: 'state-v2' },
+        },
+      });
+      expect(world.current().durableObjectMigrationHistoryDigest).toBe(
+        target.stateDurableObjectHistoryDigest,
+      );
+      expect(world.ops.indexOf('finalizedFor')).toBeGreaterThan(
+        world.ops.indexOf('secrets:cedar'),
+      );
+      expect(world.ops.indexOf('finalizedTarget')).toBeGreaterThan(
+        world.ops.indexOf('finalizedFor'),
+      );
+      expect(world.ops.indexOf('finalizedEnsure')).toBeGreaterThan(
+        world.ops.lastIndexOf('finalizedPlan'),
+      );
+      expect(world.ops.indexOf('finalizedCommit')).toBeGreaterThan(
+        world.ops.indexOf('finalizedEnsure'),
+      );
+      expect(world.ops).not.toContain('platform');
+      if (path === 'full') {
+        const stillMigrating = copy(world.current());
+        const freshStore = new MemoryOperationStore();
+        const start = await advanceFleetMigration({
+          ...world.options({
+            kind: 'start',
+            operationId: uuid(2),
+            records: [stillMigrating],
+            canaryTenantTags: [],
+          }),
+          operationStore: freshStore,
+        });
+        await expect(
+          advanceFleetMigration({
+            ...world.options({ kind: 'continue', token: start.token }),
+            operationStore: freshStore,
+          }),
+        ).rejects.toThrow(
+          "Durable Object migration base mismatch for cedar:production: expected 'state-v2'",
+        );
+        await expect(migrateWorld(world)).rejects.toThrow(
+          "Durable Object migration base mismatch for cedar:production: expected 'state-v2'",
+        );
+        expect(freshStore.item(uuid(2)).status).toBe('failed');
+      }
+      const completed = await drainWorld(world, moved);
+      expect(completed).toMatchObject({ status: 'complete' });
+      const item = world.operationStore.item();
+      expect(item.planCursor).toBe(item.plan?.length);
+      expect(item.plan?.at(-1)?.step).toBe(
+        path === 'full'
+          ? 'retire-post'
+          : path === 'platform-only'
+            ? 'platform-only-ready'
+            : 'ready-retire-post',
+      );
+      expect(world.current().durableObjectTag).toBe('state-v2');
+      const fresh = await world.start(uuid(3), [world.current()]);
+      await expect(continueWorld(world, fresh)).rejects.toThrow(
+        "Durable Object migration base mismatch for cedar:production: expected 'state-v2'",
+      );
+      await expect(migrateWorld(world)).rejects.toThrow(
+        "Durable Object migration base mismatch for cedar:production: expected 'state-v2'",
+      );
+      expect(world.operationStore.item(uuid(3)).status).toBe('failed');
+    }
+    for (const afterReconcile of [false, true]) {
+      for (const consistent of [false, true]) {
+        const { world } = finalizedWorld();
+        let token = await advanceTo(world, 'platform-resources');
+        if (afterReconcile) token = await continueWorld(world, token);
+        const current = world.current();
+        if (!current.platformResources) throw new Error('missing resources');
+        world.fleetStore.set({
+          ...current,
+          durableObjectTag: 'foreign-tag',
+          ...(consistent
+            ? {
+                platformResources: {
+                  ...current.platformResources,
+                  stateWorker: {
+                    ...current.platformResources.stateWorker,
+                    durableObjectTag: 'foreign-tag',
+                  },
+                },
+              }
+            : {}),
+        });
+        world.ops.length = 0;
+        const puts = world.fleetStore.puts.length;
+        if (!consistent) {
+          await expect(continueWorld(world, token)).rejects.toThrow(
+            "Durable Object migration base mismatch for cedar:production: expected 'foreign-tag'",
+          );
+          expectItemFailure(world);
+          expect(world.fleetStore.puts).toHaveLength(puts);
+          expect(providerMutations(world)).toEqual([]);
+          expect(world.ops).not.toContain('finalizedEnsure');
+        } else {
+          const next = await continueWorld(world, token);
+          expect(world.current().durableObjectTag).toBe(
+            afterReconcile ? 'foreign-tag' : 'state-v2',
+          );
+          expect(await drainWorld(world, next)).toMatchObject({
+            status: 'complete',
+          });
+          expect(world.current().durableObjectTag).toBe(
+            afterReconcile ? 'foreign-tag' : 'state-v2',
+          );
+          const fresh = await world.start(uuid(2), [world.current()]);
+          await expect(continueWorld(world, fresh)).rejects.toThrow(
+            `Durable Object migration base mismatch for cedar:production: expected '${afterReconcile ? 'foreign-tag' : 'state-v2'}'`,
+          );
+        }
+      }
+    }
   });
 });

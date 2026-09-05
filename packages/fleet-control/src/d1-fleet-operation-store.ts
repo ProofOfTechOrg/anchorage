@@ -97,6 +97,7 @@ const EXPECTED_COLUMNS: Readonly<
   },
 });
 
+/** @inline */
 export interface D1FleetOperationStoreOptions {
   readonly accountId: string;
   readonly leaseTtlMs?: number;

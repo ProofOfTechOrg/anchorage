@@ -71,6 +71,7 @@ export interface FleetInventoryRunToken {
 /**
  * One bounded stage of an account inventory run, in provider encounter order.
  * Ordinals address items inside a stage; cursors are provider resumption text.
+ * @inline
  */
 export type FleetInventoryStage =
   | Readonly<{ step: 'host-kv-keys'; cursor?: string }>
@@ -96,6 +97,7 @@ export type FleetInventoryStage =
 /** The step discriminant of {@link FleetInventoryStage}. */
 export type FleetInventoryStageStep = FleetInventoryStage['step'];
 
+/** @inline */
 export type FleetInventoryRowKind =
   | 'registration'
   | 'deployment'
@@ -107,6 +109,7 @@ export type FleetInventoryRowKind =
   | 'dispatch-script'
   | 'meta';
 
+/** @inline */
 export type FleetInventoryDeploymentFactKind =
   | 'database-id'
   | 'durable-object-binding'
@@ -197,6 +200,7 @@ const STAGE_SHAPES: Readonly<Record<FleetInventoryStageStep, StageShape>> =
     finalize: {},
   });
 
+/** @inline */
 export interface FleetInventoryRunProgress {
   readonly stage: FleetInventoryStage;
   readonly generation: number;
@@ -207,6 +211,7 @@ export interface FleetInventoryRunProgress {
   readonly providerRequests: number;
 }
 
+/** @inline */
 export interface FleetInventoryRunRecord {
   readonly version: 1;
   readonly operationId: string;
@@ -225,12 +230,14 @@ export interface FleetInventoryGenerationRef {
   readonly factCount: number;
 }
 
+/** @inline */
 export interface FleetInventoryStagedRow {
   readonly kind: FleetInventoryRowKind;
   readonly ordinal: number;
   readonly payload: Readonly<Record<string, unknown>>;
 }
 
+/** @inline */
 export interface FleetInventoryStagedFact {
   readonly deploymentOrdinal: number;
   readonly factKind: FleetInventoryDeploymentFactKind;
@@ -238,7 +245,10 @@ export interface FleetInventoryStagedFact {
   readonly payload: Readonly<Record<string, unknown>>;
 }
 
-/** One bounded provider stage chunk request. */
+/**
+ * One bounded provider stage chunk request.
+ * @inline
+ */
 export interface FleetInventoryStageInput {
   readonly stage: FleetInventoryStage;
   readonly options: FleetInventoryRunOptions;
@@ -247,7 +257,10 @@ export interface FleetInventoryStageInput {
   readonly signal?: AbortSignal;
 }
 
-/** One bounded provider stage chunk result; it contains no D1 knowledge. */
+/**
+ * One bounded provider stage chunk result; it contains no D1 knowledge.
+ * @inline
+ */
 export interface FleetInventoryStageResult {
   readonly rows: readonly FleetInventoryStagedRow[];
   readonly facts: readonly FleetInventoryStagedFact[];
@@ -265,6 +278,7 @@ export interface FleetInventoryProviderContext {
   ): Promise<FleetInventoryStageResult>;
 }
 
+/** @inline */
 export type FleetInventoryFailureReason =
   | 'cursor-drift'
   | 'provider-bound-exceeded'
@@ -278,7 +292,10 @@ export const FLEET_INVENTORY_FAILURE_REASONS: readonly FleetInventoryFailureReas
     'operator-abandoned',
   ]);
 
-/** Materialization source for one finalized generation. */
+/**
+ * Materialization source for one finalized generation.
+ * @inline
+ */
 export interface FleetInventoryGeneration {
   readonly ref: FleetInventoryGenerationRef;
   readonly rows: readonly FleetInventoryStagedRow[];

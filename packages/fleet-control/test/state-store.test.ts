@@ -1298,6 +1298,44 @@ describe('D1FleetStateStore release state', () => {
     ).resolves.toBeUndefined();
   });
 
+  it('rejects persisted Durable Object history, digest, and tag divergence on read', async () => {
+    const db = new MemoryD1();
+    const store = new D1FleetStateStore(db, { accountId: 'account' });
+    const history = [{ tag: 'state-v1', newClasses: ['State'] }];
+    const base = reservedRecord('workers-for-platforms');
+    const record: FleetRecord = {
+      ...base,
+      outboundPolicy: externalPolicyAndTarget(base).outboundPolicy,
+      applicationResources: [],
+      applicationBindings: { vars: [], secrets: [], r2Buckets: [] },
+      durableObjectTag: 'state-v1',
+      durableObjectMigrationHistory: history,
+      durableObjectMigrationHistoryDigest:
+        durableObjectMigrationHistoryDigest(history),
+    };
+    await store.withDeploymentLease('acme', 'production', (lease) =>
+      lease.put(record),
+    );
+    await expect(store.get('acme', 'production')).resolves.toEqual(record);
+    const persisted = db.row;
+    if (!persisted) throw new Error('missing persisted record');
+    for (const corruption of [
+      { durable_object_tag: 'foreign-tag' },
+      { durable_object_migration_history_digest: 'f'.repeat(64) },
+      { durable_object_migration_history: null },
+      { durable_object_migration_history_digest: null },
+    ]) {
+      db.row = { ...persisted, ...corruption };
+      const corrupted = { ...db.row };
+      await expect(store.get('acme', 'production')).rejects.toThrow(
+        new Error(
+          'fleet state row has inconsistent Durable Object migration history',
+        ),
+      );
+      expect(db.row).toEqual(corrupted);
+    }
+  });
+
   it('round-trips active, pending, and retained immutable release metadata', async () => {
     const db = new MemoryD1();
     const store = new D1FleetStateStore(db, { accountId: 'account' });

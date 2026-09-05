@@ -194,6 +194,7 @@ try {
   DecommissionAdvanceTokenOperationError,
   D1CloudflareApiRateCoordinator,
   FileSystemDatabaseExportStore,
+  FleetMigrationAdvanceCapabilityError,
   PlainWorkerBackend,
   ProcessLocalCloudflareApiRateCoordinator,
   ProvisioningError,
@@ -205,6 +206,9 @@ try {
   auditFleetDrift,
   advanceBackendSwitchDecommission,
   advanceDecommissionDeployment,
+  abandonFleetMigrationOperation,
+  advanceFleetMigration,
+  readFleetMigrationItemsPage,
   decommissionDeployment,
   forceDecommissionDeployment,
   deploymentSpecDigest,
@@ -217,6 +221,7 @@ try {
   type AttestConvergedActiveRouteOptions,
   type AdvanceBackendSwitchDecommissionOptions,
   type AdvanceDecommissionDeploymentOptions,
+  type AdvanceFleetMigrationOptions,
   type BackendSwitchProvider,
   type CloudflareApiPlainWorkerBackendOptions,
   type CloudflareApiRateCoordinator,
@@ -244,6 +249,14 @@ try {
   type DurableDatabaseExportStore,
   type ExternalMutationFence,
   type FleetRecord,
+  type FleetMigrationAdvanceAction,
+  type FleetMigrationAdvanceCapability,
+  type FleetMigrationAdvanceResult,
+  type FleetMigrationItem,
+  type FleetMigrationPlanEntry,
+  type FleetMigrationProgress,
+  type FleetMigrationResultRef,
+  type FleetMigrationStep,
   type FleetStateStore,
   type FleetSettlementContext,
   type FleetSettlementEntry,
@@ -271,6 +284,16 @@ try {
   type SeedDeploymentIdentityOptions,
   type WorkersForPlatformsApi,
 } from '@proofoftech/fleet-control';
+// @ts-expect-error migration admission is package-private.
+import { admitFleetMigrationItem } from '@proofoftech/fleet-control';
+// @ts-expect-error migration revalidation is package-private.
+import { revalidateFleetMigrationAdmission } from '@proofoftech/fleet-control';
+// @ts-expect-error migration plan compatibility is package-private.
+import { assertFleetMigrationPlanCompatibility } from '@proofoftech/fleet-control';
+// @ts-expect-error migration carrier validation is package-private.
+import { assertMigratingCarrierState } from '@proofoftech/fleet-control';
+// @ts-expect-error the migration step executor is package-private.
+import { executeNextMigrationStep } from '@proofoftech/fleet-control';
 // @ts-expect-error R1's client friend is package-private, not a root API.
 import { advanceCloudflareWorkerAttachmentScan } from '@proofoftech/fleet-control';
 // @ts-expect-error R1 provider attachments stay behind decommission types.
@@ -735,6 +758,49 @@ const settlementHost: FleetSettlementHost = {
   },
 };
 
+declare const migrationOptions: AdvanceFleetMigrationOptions;
+declare const migrationResult: FleetMigrationAdvanceResult;
+const migrationAction: FleetMigrationAdvanceAction = {
+  kind: 'continue',
+  token: migrationResult.token,
+};
+const migrationAdvance: Promise<FleetMigrationAdvanceResult> =
+  advanceFleetMigration({ ...migrationOptions, action: migrationAction });
+const migrationCapability: FleetMigrationAdvanceCapability =
+  new FleetMigrationAdvanceCapabilityError().capability;
+const migrationStep: FleetMigrationStep = 'admit-migrating';
+const migrationPlan: readonly FleetMigrationPlanEntry[] = [
+  { step: migrationStep },
+];
+const migrationProgress: FleetMigrationProgress = {
+  kind: 'migration',
+  revision: 0,
+  itemCount: 0,
+  activeItemOrdinal: 0,
+  completedItemCount: 0,
+};
+const migrationPage: Promise<Readonly<{
+  items: readonly FleetMigrationItem[];
+  done: boolean;
+}>> = readFleetMigrationItemsPage(migrationOptions.operationStore, {
+  operationId: migrationResult.token.operationId,
+  limit: 1,
+});
+const migrationAbandon: Promise<void> = abandonFleetMigrationOperation({
+  operationStore: migrationOptions.operationStore,
+  operationId: migrationResult.token.operationId,
+});
+if (migrationResult.status === 'complete') {
+  const summary: FleetMigrationResultRef = migrationResult.result;
+  void summary;
+}
+void migrationAdvance;
+void migrationCapability;
+void migrationPlan;
+void migrationProgress;
+void migrationPage;
+void migrationAbandon;
+
 void ActiveRouteAttestationError;
 void CloudflareApiPlainWorkerBackend;
 void CloudflareProvisioningClient;
@@ -805,10 +871,14 @@ import {
   DecommissionAdvanceTokenOperationError,
   ProcessLocalCloudflareApiRateCoordinator,
   FileSystemDatabaseExportStore,
+  FleetMigrationAdvanceCapabilityError,
   ProvisioningError,
   WorkersForPlatformsBackend,
   advanceBackendSwitchDecommission,
   advanceDecommissionDeployment,
+  abandonFleetMigrationOperation,
+  advanceFleetMigration,
+  readFleetMigrationItemsPage,
   attestConvergedActiveRoute,
   attestFleetRecordActiveRoute,
   deploymentSpecDigest,
@@ -839,6 +909,29 @@ assert.equal(typeof attestFleetRecordActiveRoute, 'function');
 assert.equal(typeof fleetSettlementKey, 'function');
 assert.equal(typeof advanceBackendSwitchDecommission, 'function');
 assert.equal(typeof advanceDecommissionDeployment, 'function');
+assert.equal(typeof advanceFleetMigration, 'function');
+assert.equal(typeof readFleetMigrationItemsPage, 'function');
+assert.equal(typeof abandonFleetMigrationOperation, 'function');
+const migrationCapability = new FleetMigrationAdvanceCapabilityError();
+assert.ok(migrationCapability instanceof Error);
+assert.equal(migrationCapability.name, 'FleetMigrationAdvanceCapabilityError');
+assert.equal(migrationCapability.capability, 'operation-store');
+assert.equal(
+  migrationCapability.message,
+  'fleet migration advance requires an operation store',
+);
+await assert.rejects(
+  advanceFleetMigration({ operationStore: {} }),
+  FleetMigrationAdvanceCapabilityError,
+);
+const rootExports = await import('@proofoftech/fleet-control');
+for (const internal of [
+  'admitFleetMigrationItem',
+  'revalidateFleetMigrationAdmission',
+  'assertFleetMigrationPlanCompatibility',
+  'assertMigratingCarrierState',
+  'executeNextMigrationStep',
+]) assert.equal(internal in rootExports, false);
 const missingCapability = new DecommissionAdvanceCapabilityError(
   'attachment-scan',
 );

@@ -69,6 +69,7 @@ export const FLEET_OPERATION_KINDS = Object.freeze([
   'audit',
   'migration',
 ] as const);
+/** @useDeclaredType */
 export type FleetOperationKind = (typeof FLEET_OPERATION_KINDS)[number];
 /** Every staged row kind. */
 export const FLEET_OPERATION_ROW_KINDS = Object.freeze([
@@ -77,6 +78,7 @@ export const FLEET_OPERATION_ROW_KINDS = Object.freeze([
   'item',
   'fact',
 ] as const);
+/** @useDeclaredType */
 export type FleetOperationRowKind = (typeof FLEET_OPERATION_ROW_KINDS)[number];
 
 export interface FleetOperationToken {

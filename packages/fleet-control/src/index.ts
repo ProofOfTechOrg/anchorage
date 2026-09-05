@@ -139,6 +139,23 @@ export {
   FleetInventoryRunTokenOperationError,
 } from './fleet-inventory-state.js';
 export {
+  type AdvanceFleetMigrationOptions,
+  abandonFleetMigrationOperation,
+  advanceFleetMigration,
+  type FleetMigrationAdvanceAction,
+  type FleetMigrationAdvanceCapability,
+  FleetMigrationAdvanceCapabilityError,
+  type FleetMigrationAdvanceResult,
+  type FleetMigrationResultRef,
+  readFleetMigrationItemsPage,
+} from './fleet-migration-advance.js';
+export type {
+  FleetMigrationItem,
+  FleetMigrationPlanEntry,
+  FleetMigrationProgress,
+  FleetMigrationStep,
+} from './fleet-migration-state.js';
+export {
   type FleetOperationFailure,
   type FleetOperationKind,
   type FleetOperationLease,

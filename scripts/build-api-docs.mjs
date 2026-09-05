@@ -59,6 +59,7 @@ function convert(optionsFile, jsonFile, htmlDirectory, revision) {
     'typedoc',
     '--options',
     optionsFile,
+    '--treatWarningsAsErrors',
     '--json',
     jsonFile,
     '--out',

@@ -45,6 +45,7 @@ export const FLEET_MIGRATION_STEPS = Object.freeze([
   'retire-post',
 ] as const);
 
+/** @useDeclaredType */
 export type FleetMigrationStep = (typeof FLEET_MIGRATION_STEPS)[number];
 
 export type FleetMigrationPlanEntry = Readonly<{

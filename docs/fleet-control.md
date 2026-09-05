@@ -152,6 +152,69 @@ The 0.4 public surface has these breaking requirements:
 
 Fleet control 0.4 depends on exactly one matching Flowsafe 0.20 runtime copy. Upgrade a direct Flowsafe 0.19 dependency at the same time to avoid a second nominal runtime copy.
 
+## Upgrade a fleet in resumable steps
+
+Use `advanceFleetMigration()` when a driver must release execution between migration steps. It uses the same deployment mutation engine as `migrateFleet()`, with a separate durable operation record and frozen per-item plan. This is the ongoing upgrade path for durable deployments, not an import mechanism for a previous provisioner's state. The root package remains a trusted control-plane entry; this API alone does not make the root entry Worker-compatible.
+
+Construct `D1FleetOperationStore(database, { accountId })` over the Fleet database port, or supply a conforming `FleetOperationStore`. Keep the existing `FleetStateStore`, backend, specification and secret resolvers. The bounded options name the deployment store `fleetStore`; the one-call drain still names it `store`. Both paths accept the existing finalized-state, settlement, route-attestation and clock options.
+
+Persist a caller-minted lowercase UUIDv4 operation ID and the original start input before dispatch. In this example, `migrationOptions` contains the trusted stores and resolvers, and `records` is the caller's fleet snapshot:
+
+```typescript
+import { advanceFleetMigration } from '@proofoftech/fleet-control';
+
+const result = await advanceFleetMigration({
+  ...migrationOptions,
+  action: {
+    kind: 'start',
+    operationId,
+    records,
+    canaryTenantTags: ['canary'],
+  },
+});
+```
+
+A start snapshots its input before awaiting, preserves the drain's canary ordering, and stages only item keys, rank, provenance digest and pending status. Repeated canary tags use their last position; equal canary ranks remain stable. Start invokes no deployment resolver or provider. If staging stops at revision zero, replay the same start with its original input; a continue cannot reconstruct that input from a token.
+
+For a pending result, durably enqueue its token. The next delivery makes one call using the same trusted options:
+
+```typescript
+const result = await advanceFleetMigration({
+  ...migrationOptions,
+  action: { kind: 'continue', token },
+});
+```
+
+The first item call reads current Fleet state under its deployment lease and records the target specification digest, frozen plan and cursor zero without mutating the deployment. Later calls re-read Fleet state, re-resolve trusted inputs, validate the frozen target and plan, then execute one step. One step can include several provider requests; this API has no provider-request budget option. After the last item finishes, another call finalizes the operation. A complete result returns counts and finalization time, not a replacement fleet snapshot.
+
+Stale tokens return current durable authority without provider work. Future, unknown-operation and wrong-kind tokens fail closed. A replayed start must have the same intake digest: a progressed operation returns current authority rather than replacing its items. Treat tokens as continuation claims, never as authorization to select an account, backend, specification or credential.
+
+The limits apply together:
+
+- At most 10,000 records and 16 MiB summed across canonical record bytes
+- At most 96 KiB per input record; plain JSON within depth 64, 8,192 nodes, and 4 KiB per string or object key
+- Deployment identifier grammar for every record's tenant and environment
+- At most 64 frozen plan entries per item
+- Item page and explicit prune limits from 1 through 1,000
+
+The canary envelope is separately checked by the same plain-data and byte codec, then included in the intake digest. Its bytes do not count toward the record sum.
+
+An admission or step error invokes one failure commit for the item and operation. After that commit succeeds, the original error is rethrown to the trusted caller; later ordinals do not run. Durable failure data contains only the reason and optional item ordinal, never the original exception or secrets. `target-drift` means the frozen-digest check refused after the shared preamble succeeded; an earlier mapping or migration-intent refusal remains `item-failed`. Retrying a failed token returns the failed result. Remediate the cause and start a new operation only where strict admission accepts the persisted deployment state. Operation-store corruption or a failed progress/failure commit propagates rather than masquerading as a successful transition.
+
+Use `readFleetMigrationItemsPage(operationStore, { operationId, afterOrdinal, limit })` while running or after termination. Pages contain ordered item metadata; pass the last item's ordinal as the next exclusive cursor and stop at `done`. `abandonFleetMigrationOperation({ operationStore, operationId })` fails a running operation and its available active item as `operator-abandoned`, releases its active-operation slot, and does nothing to a terminal operation. Abandonment does not undo provider or Fleet mutations. `D1FleetOperationStore` retains terminal operations until explicit `pruneFleetOperations` and protects the latest finalized operation per kind. Custom stores choose their own terminal retention policy and must preserve active heads. Pruning never substitutes for abandoning a running operation.
+
+### Recovery and cost boundaries
+
+Each call holds the account's migration-kind lease and then one deployment lease. It releases the deployment lease before committing operation progress. Fleet and provider state remain mutation authority; the plan and cursor sequence work. A lost progress response can therefore repeat a step against its already-committed deployment state. Admission avoids a repeated migrating write, ledgered D1 work verifies or reuses applied migrations, ordinary candidate upload can adopt by inspection, and external candidate upload repeats the same artifact. A repeated pending-topology step can write only a new timestamp; terminal convergence does not skip the remaining retirement step. Settlement delivery retains its existing at-least-once contract.
+
+Operation progress uses wall-clock `updatedAt`, independently of the optional deployment clock. Recomposition conflicts when whole-record bytes differ; coincident timestamps can produce equal bytes and reach row comparison. A batch's own lost response or identical-object replay retains its intended bytes. Every new continue derives its transition from persisted authority rather than replaying an old update object.
+
+The bounded path reruns the admission preamble and applicable carrier assertions for each step, where the drain pays admission once per item. It also reads every item to choose work and again to render a pending result, except when no active item remains. Without retries or failures, N items and K successful admission/step transitions require 2K full item reads, each paging at 1,000 rows: O(KN) item payload processing, or O(N²P) for comparable plan lengths P. A stale or adopted-running pending result adds one full read. The D1 progress guards also count the complete item prefix. This is a per-step provider-work bound, not a constant CPU, latency or database-row-read guarantee; size the fleet for the execution host and measure its actual runtime.
+
+Per-call leases permit another lifecycle driver to act between steps. The frozen-target and plan fences reject incompatible phases, intent changes, backward progress and invalid carriers, but do not globally lock independent provider credentials. A READY plan can leave and re-enter the same ready discriminator between calls; later steps still converge or refuse against current state. Terminal projection checks deliberately share the drain's narrower comparison rather than revalidate every spread-through resource/history field. The [bounded migration threat boundary](security-threat-model.md#bounded-fleet-migration) describes those accepted classes and the operation-store residuals.
+
+Durable Object tag movement has an additional recovery limit. Continuations accept the recorded target tag or the consistent external finalized-state tag/resource pair. Fresh admission remains strict about the previous tag, just like the drain. A new operation over an external record whose tag already moved can therefore refuse on both the completed and interrupted paths. An operation that is still running after a lost progress response can resume with its continuation. A durably failed operation cannot: neither its failed token nor a new operation ID repairs the post-tag-move admission dead-end. This API provides no reset or repair operation for that state; abandonment does not supply one.
+
 ## Switch a plain deployment to Workers for Platforms
 
 Use `switchPlainDeploymentToWorkersForPlatforms()` only for an existing platform-authored deployment that must accept external releases without moving D1 data or Durable Object namespaces. The switch stores its intent in the canonical fleet row and holds the same `FleetStateLease` used by provision, migration, rollback, and decommission. Those lifecycle operations reject an active switch.

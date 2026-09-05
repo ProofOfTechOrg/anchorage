@@ -1584,7 +1584,7 @@ describe('backend switch provider teardown authority', () => {
 });
 
 describe('backend switch provider response-loss recovery', () => {
-  it('appends a platform profile after a disjoint persisted plain history without replaying platform tags', () => {
+  it('appends a platform profile without replaying tags and rejects inconsistent finalized history', () => {
     const externalSpec: DeploymentSpec = {
       ...targetSpec,
       durableObjectMigrations: [],
@@ -1683,6 +1683,34 @@ describe('backend switch provider response-loss recovery', () => {
       'v2',
       'v3',
     ]);
+    const resources = currentRecord.platformResources;
+    if (!resources) throw new Error('missing finalized resources');
+    for (const corruption of [
+      { durableObjectTag: 'foreign-tag' },
+      { durableObjectMigrationHistoryDigest: 'f'.repeat(64) },
+      { durableObjectMigrationHistoryDigest: undefined },
+      {
+        durableObjectTag: 'foreign-tag',
+        platformResources: {
+          ...resources,
+          stateWorker: {
+            ...resources.stateWorker,
+            durableObjectTag: 'foreign-tag',
+          },
+        },
+      },
+    ]) {
+      expect(() =>
+        subject.describeFinalizedBridgeTarget(externalSpec, {
+          ...currentRecord,
+          ...corruption,
+        }),
+      ).toThrow(
+        new Error(
+          'finalized ordinary state has inconsistent persisted migration history',
+        ),
+      );
+    }
   });
 
   it('appends finalized state migrations from the persisted live tag and adopts a committed upload response loss', async () => {
