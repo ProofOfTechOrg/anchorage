@@ -14,6 +14,7 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parse as parseYaml } from 'yaml';
 import { assertAttwEsmPackage } from './attw-pack-check.mjs';
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -133,6 +134,9 @@ try {
   const rootManifest = JSON.parse(
     readFileSync(join(repositoryRoot, 'package.json'), 'utf8'),
   );
+  const rootPackagePolicy = parseYaml(
+    readFileSync(join(repositoryRoot, 'pnpm-workspace.yaml'), 'utf8'),
+  );
   writeFileSync(
     join(consumer, 'package.json'),
     `${JSON.stringify(
@@ -158,7 +162,16 @@ try {
   );
   writeFileSync(
     join(consumer, 'pnpm-workspace.yaml'),
-    'packages:\n  - "."\nminimumReleaseAge: 10080\n',
+    `${JSON.stringify(
+      {
+        packages: ['.'],
+        minimumReleaseAge: 10080,
+        minimumReleaseAgeExclude:
+          rootPackagePolicy.minimumReleaseAgeExclude ?? [],
+      },
+      null,
+      2,
+    )}\n`,
   );
   writeFileSync(
     join(consumer, '.npmrc'),

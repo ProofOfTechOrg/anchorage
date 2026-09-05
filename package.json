@@ -51,7 +51,7 @@
     "@biomejs/biome": "^2.4.11",
     "@changesets/cli": "^2.31.0",
     "@cloudflare/vitest-pool-workers": "0.20.1",
-    "@cloudflare/workers-types": "5.20260730.1",
+    "@cloudflare/workers-types": "5.20260905.1",
     "@types/node": "22.20.0",
     "dependency-cruiser": "18.1.1",
     "github-slugger": "2.0.0",
@@ -65,7 +65,7 @@
     "unified": "11.0.5",
     "unist-util-visit": "5.1.0",
     "vitest": "^4.1.8",
-    "wrangler": "4.118.0",
+    "wrangler": "4.129.0",
     "yaml": "2.9.0"
   },
   "engines": {
