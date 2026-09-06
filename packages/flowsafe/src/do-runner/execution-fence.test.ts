@@ -24,6 +24,7 @@ import {
   admitsExistingRun,
   admitsRunStart,
   admitsWorkAuthoring,
+  decodeExecutionFenceAdmissionRow,
   type ExecutionFenceDatabase,
   ExecutionFencedError,
   type ExecutionFenceReading,
@@ -34,6 +35,7 @@ import {
   executionFenceReadingPayload,
   FenceTransitionConflictError,
   InvalidExecutionFenceRequestError,
+  validateExecutionFenceAdmissionSchema,
 } from './execution-fence.js';
 import { init } from './init.js';
 import type { RunnerRuntime } from './runtime.js';
@@ -83,6 +85,152 @@ const legacyFenceDdl = `CREATE TABLE flowsafe_execution_fence (
   state TEXT NOT NULL CHECK (state IN ('open', 'draining', 'migration-locked', 'proof-only')),
   proof_key TEXT, proof_run_id TEXT, updated_at INTEGER NOT NULL
 )`;
+
+describe('strict initial-admission fence observations', () => {
+  it.each([
+    'row',
+    'schema',
+  ])('rejects inherited slots in the fence %s observation', async (mode) => {
+    const { sqlite, db } = fenceFixture();
+    await new ExecutionFenceStore(db).seed('open');
+    const sparse = (rows: unknown[]) =>
+      Object.setPrototypeOf(
+        new Array(rows.length),
+        Object.assign(Object.create(Array.prototype), rows),
+      );
+    if (mode === 'schema') {
+      const columns = sqlite
+        .prepare('PRAGMA table_xinfo(flowsafe_execution_fence)')
+        .all();
+      await expect(
+        validateExecutionFenceAdmissionSchema({ results: sparse(columns) }),
+      ).rejects.toThrow('invalid row');
+    } else {
+      const wrapped = interceptedDatabase(db, async (sql, execute) => {
+        const result = (await execute()) as { results: unknown[] };
+        return sql.startsWith('SELECT * FROM flowsafe_execution_fence')
+          ? { results: sparse(result.results) }
+          : result;
+      });
+      await expect(
+        new ExecutionFenceStore(wrapped).readForAdmission(),
+      ).rejects.toBeInstanceOf(ExecutionFenceUnreadableError);
+    }
+  });
+  it('does not let a custom iterator hide a malformed admission row', async () => {
+    const { db } = fenceFixture();
+    await new ExecutionFenceStore(db).seed('open');
+    const wrapped = interceptedDatabase(db, async (sql, execute) => {
+      const result = (await execute()) as { results: unknown[] };
+      if (!sql.startsWith('SELECT * FROM flowsafe_execution_fence'))
+        return result;
+      const rows = [null];
+      Object.defineProperty(rows, Symbol.iterator, {
+        value: function* () {
+          yield* result.results;
+        },
+      });
+      return { results: rows };
+    });
+    await expect(
+      new ExecutionFenceStore(wrapped).readForAdmission(),
+    ).rejects.toBeInstanceOf(ExecutionFenceUnreadableError);
+  });
+  it('rejects the first malformed schema envelope even if its getter later returns real columns', async () => {
+    const { sqlite, db } = fenceFixture();
+    await new ExecutionFenceStore(db).seed('open');
+    const columns = sqlite
+      .prepare('PRAGMA table_xinfo(flowsafe_execution_fence)')
+      .all();
+    let reads = 0;
+    await expect(
+      validateExecutionFenceAdmissionSchema({
+        get results() {
+          return ++reads === 1 ? [null] : columns;
+        },
+      }),
+    ).rejects.toThrow('invalid row');
+    expect(reads).toBe(1);
+  });
+  it.each([
+    'envelope',
+    'element',
+  ])('captures one %s observation before admission decoding', async (mode) => {
+    const { db } = fenceFixture();
+    await new ExecutionFenceStore(db).seed('open');
+    let reads = 0;
+    const wrapped = interceptedDatabase(db, async (sql, execute) => {
+      const result = (await execute()) as { results: unknown[] };
+      if (!sql.startsWith('SELECT * FROM flowsafe_execution_fence'))
+        return result;
+      if (mode === 'envelope')
+        return {
+          get results() {
+            return ++reads === 1 ? result.results : new Array(1);
+          },
+        };
+      const rows: unknown[] = [];
+      Object.defineProperty(rows, 0, {
+        get() {
+          return ++reads === 1 ? result.results[0] : undefined;
+        },
+      });
+      return { results: rows };
+    });
+    expect(
+      (await new ExecutionFenceStore(wrapped).readForAdmission()).reading.state,
+    ).toBe('open');
+    expect(reads).toBe(1);
+  });
+  it('requires real current metadata and never initializes on read', async () => {
+    const { sqlite, db } = fenceFixture();
+    const fence = new ExecutionFenceStore(db);
+    expect(fence.usesDatabase(db)).toBe(true);
+    expect(fence.usesDatabase({ ...db })).toBe(false);
+    await expect(fence.readForAdmission()).rejects.toBeInstanceOf(
+      ExecutionFenceUnreadableError,
+    );
+    expect(
+      sqlite
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .all(),
+    ).toEqual([]);
+    sqlite.exec(legacyFenceDdl);
+    sqlite.exec(
+      "INSERT INTO flowsafe_execution_fence VALUES ('deployment', 'open', NULL, NULL, 100)",
+    );
+    await expect(fence.readForAdmission()).rejects.toBeInstanceOf(
+      ExecutionFenceUnreadableError,
+    );
+    expect(
+      sqlite.prepare('PRAGMA table_xinfo(flowsafe_execution_fence)').all(),
+    ).toHaveLength(5);
+    await fence.seed('open');
+    const observation = await fence.readForAdmission();
+    expect(observation.schemaStage).toBe(7);
+    expect(Object.isFrozen(observation.raw)).toBe(true);
+    const mutable = { ...observation.raw };
+    const copied = decodeExecutionFenceAdmissionRow(mutable);
+    mutable.state = 'draining';
+    expect(copied.raw.state).toBe('open');
+    const schema = sqlite
+      .prepare('PRAGMA table_xinfo(flowsafe_execution_fence)')
+      .all();
+    await expect(
+      validateExecutionFenceAdmissionSchema({ results: schema }),
+    ).resolves.toBeUndefined();
+    await expect(
+      validateExecutionFenceAdmissionSchema({ results: schema.slice(0, -1) }),
+    ).rejects.toThrow('current fence schema');
+    sqlite.exec('DELETE FROM flowsafe_execution_fence');
+    await expect(fence.readForAdmission()).rejects.toBeInstanceOf(
+      ExecutionFenceUnreadableError,
+    );
+    expect(
+      sqlite.prepare('SELECT * FROM flowsafe_execution_fence').all(),
+    ).toEqual([]);
+  });
+});
 
 function rawFence(sqlite: SqliteDatabase): Record<string, unknown> {
   return sqlite

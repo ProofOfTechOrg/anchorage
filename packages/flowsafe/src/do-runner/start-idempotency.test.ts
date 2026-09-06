@@ -23,6 +23,7 @@ import {
 } from './execution-fence.js';
 import {
   beginIdempotentStart,
+  decodeStartReservationAdmissionResult,
   IdempotentStartAlreadySettledError,
   IdempotentStartPendingError,
   type IdempotentStartSurface,
@@ -41,10 +42,219 @@ import {
   StartReservationOwnerMismatchError,
   StartReservationTargetMismatchError,
   StartReservationUnreadableError,
+  validateStartReservationAdmissionSchema,
 } from './start-idempotency.js';
 
 const OWNER = { kind: 'human', id: 'operator-1' } as const;
 const OTHER_OWNER = { kind: 'human', id: 'operator-2' } as const;
+
+describe('strict initial-admission reservation observations', () => {
+  it.each([
+    'row',
+    'schema',
+  ])('rejects inherited slots in the reservation %s observation', async (mode) => {
+    const { sqlite, binding } = schemaHarness(3);
+    const sparse = (rows: unknown[]) =>
+      Object.setPrototypeOf(
+        new Array(rows.length),
+        Object.assign(Object.create(Array.prototype), rows),
+      );
+    if (mode === 'schema') {
+      const columns = sqlite
+        .prepare('PRAGMA table_xinfo(flowsafe_start_idempotency)')
+        .all();
+      expect(() =>
+        validateStartReservationAdmissionSchema({ results: sparse(columns) }),
+      ).toThrow('invalid row');
+    } else {
+      const wrapped = interceptReservations(binding, async (sql, execute) => {
+        const result = (await execute()) as { results: unknown[] };
+        return sql.startsWith('SELECT * FROM flowsafe_start_idempotency')
+          ? { results: sparse(result.results) }
+          : result;
+      });
+      await expect(
+        new StartIdempotencyStore(wrapped).readForAdmission('key'),
+      ).rejects.toBeInstanceOf(StartReservationUnreadableError);
+    }
+  });
+  it('does not let a custom iterator hide a malformed admission row', async () => {
+    const { binding } = schemaHarness(3);
+    const wrapped = interceptReservations(binding, async (sql, execute) => {
+      const result = (await execute()) as { results: unknown[] };
+      if (!sql.startsWith('SELECT * FROM flowsafe_start_idempotency'))
+        return result;
+      const rows = [null];
+      Object.defineProperty(rows, Symbol.iterator, {
+        value: function* () {
+          yield* result.results;
+        },
+      });
+      return { results: rows };
+    });
+    await expect(
+      new StartIdempotencyStore(wrapped).readForAdmission('key'),
+    ).rejects.toBeInstanceOf(StartReservationUnreadableError);
+  });
+  it('rejects the first malformed schema envelope even if its getter later returns real columns', () => {
+    const { sqlite } = schemaHarness(3);
+    const columns = sqlite
+      .prepare('PRAGMA table_xinfo(flowsafe_start_idempotency)')
+      .all();
+    let reads = 0;
+    expect(() =>
+      validateStartReservationAdmissionSchema({
+        get results() {
+          return ++reads === 1 ? [null] : columns;
+        },
+      }),
+    ).toThrow('invalid row');
+    expect(reads).toBe(1);
+  });
+  it.each([
+    'envelope',
+    'element',
+  ])('captures one %s observation before admission decoding', async (mode) => {
+    const { binding, sqlite } = schemaHarness(3);
+    sqlite.exec("UPDATE flowsafe_start_idempotency SET start_token = ''");
+    let reads = 0;
+    const wrapped = interceptReservations(binding, async (sql, execute) => {
+      const result = (await execute()) as { results: unknown[] };
+      if (!sql.startsWith('SELECT * FROM flowsafe_start_idempotency'))
+        return result;
+      if (mode === 'envelope')
+        return {
+          get results() {
+            return ++reads === 1 ? result.results : new Array(1);
+          },
+        };
+      const rows: unknown[] = [];
+      Object.defineProperty(rows, 0, {
+        get() {
+          return ++reads === 1 ? result.results[0] : undefined;
+        },
+      });
+      return { results: rows };
+    });
+    expect(
+      (await new StartIdempotencyStore(wrapped).readForAdmission('key'))?.runId,
+    ).toBe('run');
+    expect(reads).toBe(1);
+  });
+  const raw = {
+    key: 'key',
+    owner_kind: 'human',
+    owner_id: 'owner',
+    target_kind: 'workflow',
+    target_id: 'workflow',
+    run_id: 'run',
+    thread_id: null,
+    state: 'started',
+    created_at: 100,
+    updated_at: 200,
+    start_token: '',
+    start_table_prefix: null,
+    start_workflow_id: null,
+  };
+
+  it.each([
+    ['workflow', 'thread', 'admission workflow thread must be null'],
+    ['workflow', 'bad/thread', 'admission workflow thread must be null'],
+    ['agent', null, 'admission agent thread is invalid'],
+    ['agent', undefined, 'admission agent thread is invalid'],
+    ['agent', 'bad/thread', 'admission agent thread is invalid'],
+  ])('validates raw %s thread %s before normalization', (target_kind, thread_id, cause) => {
+    expect(() =>
+      decodeStartReservationAdmissionResult({
+        results: [{ ...raw, target_kind, thread_id }],
+      }),
+    ).toThrow(cause);
+  });
+
+  it('validates every own current field and logical identifier with populated rows', () => {
+    for (const key of Object.keys(raw)) {
+      const row = Object.fromEntries(
+        Object.entries(raw).filter(([name]) => name !== key),
+      );
+      expect(() =>
+        decodeStartReservationAdmissionResult({ results: [row] }),
+      ).toThrow(`row is missing ${key}`);
+    }
+    for (const target_id of ['', 'bad/id'])
+      expect(() =>
+        decodeStartReservationAdmissionResult({
+          results: [{ ...raw, target_id }],
+        }),
+      ).toThrow('admission target id is invalid');
+    expect(() =>
+      decodeStartReservationAdmissionResult({
+        results: [{ ...raw, key: 'bad/key' }],
+      }),
+    ).toThrow('admission key is invalid');
+    expect(() =>
+      decodeStartReservationAdmissionResult({ results: new Array(1) }),
+    ).toThrow('invalid row');
+    expect(() =>
+      decodeStartReservationAdmissionResult({ results: [raw, raw] }),
+    ).toThrow('multiple rows');
+    expect(
+      decodeStartReservationAdmissionResult({ results: [raw] })?.threadId,
+    ).toBeUndefined();
+    expect(
+      decodeStartReservationAdmissionResult({
+        results: [{ ...raw, target_kind: 'agent', thread_id: 'thread' }],
+      })?.threadId,
+    ).toBe('thread');
+  });
+
+  it('requires a current schema without readiness writes and preserves ordinary compatibility', async () => {
+    const { sqlite, binding, store } = harness();
+    expect(store.usesDatabase(binding)).toBe(true);
+    expect(store.usesDatabase({ ...binding })).toBe(false);
+    await expect(store.readForAdmission('absent')).rejects.toBeInstanceOf(
+      StartReservationUnreadableError,
+    );
+    expect(
+      sqlite
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .all(),
+    ).toEqual([]);
+    sqlite.exec(START_IDEMPOTENCY_DDL);
+    const schema = sqlite
+      .prepare('PRAGMA table_xinfo(flowsafe_start_idempotency)')
+      .all();
+    for (let stage = 0; stage < 3; stage += 1)
+      expect(() =>
+        validateStartReservationAdmissionSchema({
+          results: schema.slice(0, 10 + stage),
+        }),
+      ).toThrow('admission requires current schema');
+    expect(() =>
+      validateStartReservationAdmissionSchema({ results: schema }),
+    ).not.toThrow();
+    await expect(store.readForAdmission('absent')).resolves.toBeUndefined();
+    sqlite
+      .prepare(
+        'INSERT INTO flowsafe_start_idempotency VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run(...Object.values({ ...raw, thread_id: 'bad/thread' }));
+    expect((await store.read('key'))?.threadId).toBeUndefined();
+    const error = await store
+      .readForAdmission('key')
+      .catch((error: unknown) => error);
+    expect(error).toMatchObject({
+      status: 503,
+      cause: {
+        message: expect.stringContaining(
+          'admission workflow thread must be null',
+        ),
+      },
+    });
+    expect(
+      sqlite.prepare('SELECT thread_id FROM flowsafe_start_idempotency').get(),
+    ).toEqual({ thread_id: 'bad/thread' });
+  });
+});
 
 function harness(now: () => number = () => 1_000) {
   const sqlite = openSqlite();

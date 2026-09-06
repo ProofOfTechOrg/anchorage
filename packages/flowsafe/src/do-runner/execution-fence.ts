@@ -399,7 +399,7 @@ const FENCE_REFUSAL_CODES: ReadonlySet<string> = new Set([
  *
  * The two codes are matched by name rather than by any structural sniff: only
  * refusals this package authors publish them, and both are declared as literals
- * on the classes above, so a code arriving over the wire came from one of them.
+ * on the corresponding error classes, so a code arriving over the wire came from one of them.
  */
 export function isExecutionFenceRefusal(
   error: unknown,
@@ -549,6 +549,14 @@ interface StoredExecutionFence {
   reading: ExecutionFenceVersionedReading;
   receipt: string | null;
   schemaStage: ExecutionFenceSchemaStage;
+  raw: DeploymentIdentityProtocolRow;
+}
+
+/** @internal Exact current-stage observation for initial admission. */
+export interface ExecutionFenceAdmissionObservation {
+  readonly reading: ExecutionFenceVersionedReading;
+  readonly schemaStage: 7;
+  readonly raw: DeploymentIdentityProtocolRow;
 }
 
 function isFenceCounter(value: unknown): value is number {
@@ -580,6 +588,11 @@ function decodeTransitionReceipt(text: string): FenceTransitionReceipt {
 function readingFromRow(
   row: DeploymentIdentityProtocolRow,
 ): StoredExecutionFence {
+  row = Object.freeze(
+    Object.fromEntries(
+      Object.getOwnPropertyNames(row).map((key) => [key, row[key]]),
+    ),
+  );
   const metadata = decodeExecutionFenceMutationMetadata(row);
   const { state } = row;
   if (row.id !== EXECUTION_FENCE_ROW_ID || !isExecutionFenceState(state)) {
@@ -635,6 +648,7 @@ function readingFromRow(
     },
     receipt: metadata.lastTransitionRequest,
     schemaStage: metadata.schemaStage,
+    raw: row,
   };
 }
 
@@ -643,17 +657,25 @@ function fenceResultRows(result: unknown): DeploymentIdentityProtocolRow[] {
     result === null ||
     typeof result !== 'object' ||
     ('success' in result && result.success !== true) ||
-    !('results' in result) ||
-    !Array.isArray(result.results)
+    !('results' in result)
   ) {
     throw new Error('execution fence statement returned an invalid result');
   }
-  for (const row of result.results) {
+  const rows: unknown = result.results;
+  if (!Array.isArray(rows))
+    throw new Error('execution fence statement returned an invalid result');
+  const length = rows.length;
+  if (!Number.isSafeInteger(length) || length < 0)
+    throw new Error('execution fence statement returned an invalid result');
+  return Array.from({ length }, (_, index) => {
+    if (!Object.hasOwn(rows, index))
+      throw new Error('execution fence statement returned an invalid row');
+    const row = rows[index];
     if (row === null || typeof row !== 'object' || Array.isArray(row)) {
       throw new Error('execution fence statement returned an invalid row');
     }
-  }
-  return result.results;
+    return row;
+  });
 }
 
 function returningFence(result: unknown): StoredExecutionFence | undefined {
@@ -666,6 +688,29 @@ function returningFence(result: unknown): StoredExecutionFence | undefined {
   if (stored.schemaStage !== EXECUTION_FENCE_CURRENT_SCHEMA_STAGE)
     throw new Error('execution fence UPDATE returned a legacy row');
   return stored;
+}
+
+/** @internal Validate an already-observed current-schema RETURNING row. */
+export function decodeExecutionFenceAdmissionRow(
+  row: DeploymentIdentityProtocolRow,
+): ExecutionFenceAdmissionObservation {
+  const stored = readingFromRow(row);
+  if (stored.schemaStage !== 7)
+    throw new Error('initial admission requires current fence metadata');
+  return Object.freeze({
+    reading: Object.freeze(stored.reading),
+    schemaStage: 7,
+    raw: stored.raw,
+  });
+}
+
+/** @internal Validate actual PRAGMA rows from a consistent readback batch. */
+export async function validateExecutionFenceAdmissionSchema(
+  result: unknown,
+): Promise<void> {
+  const columns = fenceResultRows(result);
+  if ((await readExecutionFenceSchemaProtocol(async () => columns)) !== 7)
+    throw new Error('initial admission requires the current fence schema');
 }
 
 /**
@@ -741,6 +786,36 @@ export class ExecutionFenceStore {
    */
   async read(): Promise<ExecutionFenceVersionedReading> {
     return (await this.#readStored())?.reading ?? OPEN_EXECUTION_FENCE;
+  }
+
+  usesDatabase(binding: object): boolean {
+    return this.#db === binding;
+  }
+
+  /** @internal Pure strict observation; seed only on the admission preparation path. */
+  async readForAdmission(): Promise<ExecutionFenceAdmissionObservation> {
+    try {
+      const rows = fenceResultRows(
+        await this.#db
+          .prepare(`SELECT * FROM ${EXECUTION_FENCE_TABLE} LIMIT 2`)
+          .all(),
+      );
+      const row = rows[0];
+      if (rows.length !== 1 || row === undefined)
+        throw new Error('initial admission requires an exact fence singleton');
+      const observation = decodeExecutionFenceAdmissionRow(row);
+      await validateExecutionFenceAdmissionSchema(
+        await this.#db
+          .prepare(`PRAGMA table_xinfo(${EXECUTION_FENCE_TABLE})`)
+          .all(),
+      );
+      return observation;
+    } catch (error) {
+      throw new ExecutionFenceUnreadableError(
+        'initial admission requires current fence metadata',
+        { cause: error },
+      );
+    }
   }
 
   /**

@@ -464,9 +464,8 @@ export type StartIdempotencyWiring = StartIdempotencyStore | 'none';
  * the D1 storage adapter (and @mastra/cloudflare-d1 with it) into its bundle.
  *
  * That bundle rule is why the imports at the top of this file are what they
- * are. Four are import-free leaves (principal-identity, cause-chain,
- * do-status-error, path-safe-id) and the fifth, execution-fence, imports only
- * leaves and the shared provisioning protocol. Nothing on that graph can cycle
+ * are: lightweight identity/error leaves and the execution-fence store, whose
+ * dependencies never reach the adapter. Nothing on that graph can cycle
  * back here, which matters more than usual: the eight DoStatusError subclasses
  * in this module are evaluated at module load, so an import edge that came
  * back around would meet a class expression still in its temporal dead zone.
@@ -588,17 +587,25 @@ function reservationResultRows(result: unknown): StartReservationRow[] {
     result === null ||
     typeof result !== 'object' ||
     ('success' in result && result.success !== true) ||
-    !('results' in result) ||
-    !Array.isArray(result.results)
+    !('results' in result)
   ) {
     throw new Error('reservation statement returned an invalid result');
   }
-  for (const row of result.results) {
+  const rows: unknown = result.results;
+  if (!Array.isArray(rows))
+    throw new Error('reservation statement returned an invalid result');
+  const length = rows.length;
+  if (!Number.isSafeInteger(length) || length < 0)
+    throw new Error('reservation statement returned an invalid result');
+  return Array.from({ length }, (_, index) => {
+    if (!Object.hasOwn(rows, index))
+      throw new Error('reservation statement returned an invalid row');
+    const row = rows[index];
     if (row === null || typeof row !== 'object' || Array.isArray(row)) {
       throw new Error('reservation statement returned an invalid row');
     }
-  }
-  return result.results;
+    return row;
+  });
 }
 
 function reservationBinding(
@@ -736,6 +743,87 @@ function reservationFromRow(
     updatedAt,
     binding: reservationBinding(row, schemaStage),
   };
+}
+
+function admissionReservationFromRow(
+  row: StartReservationRow,
+  stage: StartReservationSchemaStage,
+): StartReservationReading {
+  if (stage !== 3)
+    throw new ReservationSchemaError('admission requires current schema');
+  const captured: Record<string, unknown> = {};
+  for (const [name] of START_IDEMPOTENCY_COLUMNS) {
+    if (!Object.hasOwn(row, name))
+      throw new ReservationSchemaError(`row is missing ${name}`);
+    captured[name] = row[name];
+  }
+  if (!isPathSafeId(captured.key))
+    throw new ReservationSchemaError('admission key is invalid');
+  if (!isPathSafeId(captured.run_id))
+    throw new ReservationSchemaError('admission run id is invalid');
+  if (!isPathSafeId(captured.target_id))
+    throw new ReservationSchemaError('admission target id is invalid');
+  if (captured.target_kind === 'workflow' && captured.thread_id !== null)
+    throw new ReservationSchemaError('admission workflow thread must be null');
+  if (captured.target_kind === 'agent' && !isPathSafeId(captured.thread_id))
+    throw new ReservationSchemaError('admission agent thread is invalid');
+  normalizeStartIdentity({
+    owner: { kind: captured.owner_kind, id: captured.owner_id },
+    target: {
+      kind: captured.target_kind,
+      id: captured.target_id,
+      ...(captured.thread_id === null ? {} : { threadId: captured.thread_id }),
+    },
+  });
+  const reservation = reservationFromRow(captured, stage);
+  return Object.freeze({
+    ...reservation,
+    owner: Object.freeze(reservation.owner),
+    binding: Object.freeze(reservation.binding),
+  });
+}
+
+/** @internal Decode current-stage data before compatible thread normalization. */
+export function decodeStartReservationAdmissionResult(
+  result: unknown,
+): StartReservationReading | undefined {
+  const rows = reservationResultRows(result);
+  if (rows.length > 1)
+    throw new ReservationSchemaError('admission returned multiple rows');
+  return rows[0] === undefined
+    ? undefined
+    : admissionReservationFromRow(rows[0], 3);
+}
+
+function reservationSchemaStage(
+  result: unknown,
+): StartReservationSchemaStage | undefined {
+  const columns = reservationResultRows(result);
+  if (columns.length === 0) return undefined;
+  if (columns.length < 10 || columns.length > START_IDEMPOTENCY_COLUMNS.length)
+    throw new ReservationSchemaError('unexpected columns');
+  for (const [index, actual] of columns.entries()) {
+    const expected = START_IDEMPOTENCY_COLUMNS[index];
+    if (expected === undefined)
+      throw new ReservationSchemaError('unexpected columns');
+    const [name, type, notnull, pk] = expected;
+    if (
+      actual.name !== name ||
+      actual.type !== type ||
+      actual.notnull !== notnull ||
+      actual.pk !== pk ||
+      actual.dflt_value !== null ||
+      actual.hidden !== 0
+    )
+      throw new ReservationSchemaError(`column ${name} differs`);
+  }
+  return (columns.length - 10) as StartReservationSchemaStage;
+}
+
+/** @internal Validate already-observed PRAGMA data without another query. */
+export function validateStartReservationAdmissionSchema(result: unknown): void {
+  if (reservationSchemaStage(result) !== 3)
+    throw new ReservationSchemaError('admission requires current schema');
 }
 
 /**
@@ -1050,36 +1138,42 @@ export class StartIdempotencyStore {
     return row;
   }
 
+  usesDatabase(binding: object): boolean {
+    return this.#db === binding;
+  }
+
+  /** @internal Pure current-stage read, including for an absent key. */
+  async readForAdmission(
+    key: string,
+  ): Promise<StartReservationReading | undefined> {
+    const safeKey = assertKey(key);
+    try {
+      const result = await this.#db
+        .prepare(
+          `SELECT * FROM ${START_IDEMPOTENCY_TABLE} WHERE key = ? LIMIT 2`,
+        )
+        .bind(safeKey)
+        .all();
+      const row = decodeStartReservationAdmissionResult(result);
+      validateStartReservationAdmissionSchema(
+        await this.#db
+          .prepare(`PRAGMA table_xinfo(${START_IDEMPOTENCY_TABLE})`)
+          .all(),
+      );
+      if (row !== undefined && row.key !== safeKey)
+        throw new ReservationSchemaError('admission returned another key');
+      return row;
+    } catch (error) {
+      throw new StartReservationUnreadableError(safeKey, { cause: error });
+    }
+  }
+
   async #schemaStage(): Promise<StartReservationSchemaStage | undefined> {
-    const columns = reservationResultRows(
+    return reservationSchemaStage(
       await this.#db
         .prepare(`PRAGMA table_xinfo(${START_IDEMPOTENCY_TABLE})`)
         .all(),
     );
-    if (columns.length === 0) return undefined;
-    if (
-      columns.length < 10 ||
-      columns.length > START_IDEMPOTENCY_COLUMNS.length
-    ) {
-      throw new ReservationSchemaError('unexpected columns');
-    }
-    for (const [index, actual] of columns.entries()) {
-      const expected = START_IDEMPOTENCY_COLUMNS[index];
-      if (expected === undefined)
-        throw new ReservationSchemaError('unexpected columns');
-      const [name, type, notnull, pk] = expected;
-      if (
-        actual.name !== name ||
-        actual.type !== type ||
-        actual.notnull !== notnull ||
-        actual.pk !== pk ||
-        actual.dflt_value !== null ||
-        actual.hidden !== 0
-      ) {
-        throw new ReservationSchemaError(`column ${name} differs`);
-      }
-    }
-    return (columns.length - 10) as StartReservationSchemaStage;
   }
 
   async #readReservations(

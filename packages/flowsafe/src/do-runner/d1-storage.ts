@@ -13,9 +13,21 @@ import {
 } from '@mastra/core/storage';
 
 import type { D1DatabaseBinding } from './cf-types.js';
+import { FencedWorkflowsStorageD1 } from './fenced-workflows-d1.js';
 import { isPathSafeId } from './path-safe-id.js';
+import { RESOURCE_OWNER_TABLE } from './run-storage-tables.js';
 import { START_IDEMPOTENCY_TABLE } from './start-idempotency.js';
 import { validateTablePrefix } from './table-prefix.js';
+import type {
+  SnapshotDatabase,
+  SnapshotStatement,
+} from './workflow-snapshot-row.js';
+
+export { RESOURCE_OWNER_TABLE } from './run-storage-tables.js';
+export type {
+  SnapshotDatabase,
+  SnapshotStatement,
+} from './workflow-snapshot-row.js';
 
 export interface D1StorageOptions {
   /** D1 binding from the Worker/DO environment. */
@@ -29,8 +41,9 @@ export interface D1StorageOptions {
    * notifications and thread state, which @mastra/cloudflare-d1 does not ship, so
    * they are flowsafe-owned D1 impls). Injected rather than imported so this
    * lower layer never depends on `signals/` (which imports do-runner) — build
-   * them with `createSignalStorageDomains()` and pass them here. Absent ⇒ the
-   * bare D1Store, byte-identical to before this seam existed.
+   * them with `createSignalStorageDomains()` and pass them here. The default
+   * workflow domain supports explicit initial-admission scopes; false/custom
+   * workflow overrides retain precedence.
    */
   domains?: MastraStorageDomains;
 }
@@ -38,27 +51,60 @@ export interface D1StorageOptions {
 export function createD1Storage(
   options: D1StorageOptions,
 ): MastraCompositeStore {
-  const tablePrefix = validateTablePrefix(options.tablePrefix);
+  const {
+    binding,
+    id: suppliedId,
+    tablePrefix: suppliedPrefix,
+    domains: suppliedDomains,
+  } = options;
+  const domainSource = suppliedDomains ?? {};
+  const capturedDomains = {
+    workflows: domainSource.workflows,
+    scores: domainSource.scores,
+    memory: domainSource.memory,
+    channels: domainSource.channels,
+    notifications: domainSource.notifications,
+    observability: domainSource.observability,
+    agents: domainSource.agents,
+    datasets: domainSource.datasets,
+    experiments: domainSource.experiments,
+    promptBlocks: domainSource.promptBlocks,
+    scorerDefinitions: domainSource.scorerDefinitions,
+    mcpClients: domainSource.mcpClients,
+    mcpServers: domainSource.mcpServers,
+    workspaces: domainSource.workspaces,
+    skills: domainSource.skills,
+    favorites: domainSource.favorites,
+    blobs: domainSource.blobs,
+    backgroundTasks: domainSource.backgroundTasks,
+    schedules: domainSource.schedules,
+    harness: domainSource.harness,
+    toolProviderConnections: domainSource.toolProviderConnections,
+    threadState: domainSource.threadState,
+  } satisfies Record<keyof MastraStorageDomains, unknown>;
+  const { workflows: suppliedWorkflows, ...otherDomains } = capturedDomains;
+  const id = suppliedId ?? 'flowsafe';
+  const tablePrefix = validateTablePrefix(suppliedPrefix);
+  const domainConfig = {
+    binding: binding as unknown as D1Database,
+    ...(tablePrefix === undefined ? {} : { tablePrefix }),
+  };
   const d1 = new D1Store({
-    id: options.id ?? 'flowsafe',
+    id,
     // @mastra/cloudflare-d1's own D1Store signature wants the real
     // D1Database; D1DatabaseBinding is the structural subset this package
     // exposes instead, so consumers of its shipped types don't need
     // @cloudflare/workers-types installed.
-    binding: options.binding as unknown as D1Database,
-    ...(tablePrefix !== undefined ? { tablePrefix } : {}),
+    ...domainConfig,
   });
-  // No extra domains ⇒ return the D1Store itself (it IS a MastraCompositeStore),
-  // preserving byte-identical behavior for every host that does not opt into
-  // signals. With domains, compose them OVER d1 as the default: its own init()
-  // (all adapter tables, DDL ordering, coalesced callers) runs first via the
-  // parentDefault path, THEN each override domain's init() — the composite never
-  // double-inits a parent's domain (validated: chunk #runInit).
-  if (!options.domains) return d1;
+  const workflows =
+    suppliedWorkflows === undefined
+      ? new FencedWorkflowsStorageD1(domainConfig)
+      : suppliedWorkflows;
   return new MastraCompositeStore({
-    id: options.id ?? 'flowsafe',
+    id,
     default: d1,
-    domains: options.domains,
+    domains: { ...otherDomains, workflows },
   });
 }
 
@@ -303,22 +349,6 @@ export async function sweepExpiredRunDeadlines(
   return processed;
 }
 
-/**
- * Minimal structural D1 surface the purge uses — same posture as the
- * approval store: tests back it with node:sqlite, Workers pass env.DB.
- */
-export interface SnapshotDatabase {
-  prepare(query: string): SnapshotStatement;
-  /** D1 transactional batch, required when owner lifecycle cleanup is wired. */
-  batch?(statements: SnapshotStatement[]): Promise<unknown[]>;
-}
-
-export interface SnapshotStatement {
-  bind(...values: unknown[]): SnapshotStatement;
-  run(): Promise<unknown>;
-  all<T = unknown>(): Promise<{ results: T[] }>;
-}
-
 /** Structural: R2ArtifactStore.deleteRun, without importing the artifacts module. */
 export interface RunArtifactPurger {
   deleteRun(workflowId: string, runId: string): Promise<number>;
@@ -407,20 +437,6 @@ export interface PurgeExpiredRunsOptions {
 export const RUN_TTL_PURGE_TABLES: readonly string[] = [
   'mastra_workflow_snapshot',
 ];
-
-/**
- * The resource-ownership registry's table, named here rather than imported from
- * the store that creates it (approval-api/resource-ownership.ts).
- *
- * The layering forbids the import: do-runner may reach approval-api only
- * through its declared leaves, and the ownership store is not one — it is built
- * ON do-runner. So this file has always carried the name as a literal inside
- * RUN_TTL_FLOWSAFE_PURGE_TABLES; giving it a name adds no second home, it names
- * the one that was already here, and lets the drain inventory read the registry
- * without a third copy. The census test crosses it against
- * RESOURCE_OWNERSHIP_TABLE, which is the only place the two can be compared.
- */
-export const RESOURCE_OWNER_TABLE = 'flowsafe_resource_owners';
 
 /**
  * The FLOWSAFE-owned tables this purge also deletes from when the caller wires

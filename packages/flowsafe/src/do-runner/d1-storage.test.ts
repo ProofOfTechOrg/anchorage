@@ -3,7 +3,7 @@
 // ISO-cutoff comparisons execute in SQLite, while the Wrangler harness owns
 // D1 concurrency, transaction, and runtime fidelity.
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   openSqlite,
@@ -46,10 +46,13 @@ import {
   type SnapshotStatement,
   sweepExpiredRunDeadlines,
 } from './d1-storage.js';
+import { FENCED_WORKFLOW_STORAGE } from './fenced-workflow-capability.js';
+import { FencedWorkflowsStorageD1 } from './fenced-workflows-d1.js';
 import {
   START_IDEMPOTENCY_DDL,
   START_IDEMPOTENCY_TABLE,
 } from './start-idempotency.js';
+import { validateTablePrefix } from './table-prefix.js';
 
 // Domain-local result-envelope adapter for pure purge SQL units. It maps
 // node:sqlite's affected-row count to the structural SnapshotDatabase seam;
@@ -247,6 +250,11 @@ interface PublicStoragePrefixCase {
 }
 
 const PUBLIC_STORAGE_PREFIX_CASES = [
+  {
+    name: 'FencedWorkflowsStorageD1',
+    construct: (binding, tablePrefix) =>
+      new FencedWorkflowsStorageD1({ binding: binding as never, tablePrefix }),
+  },
   {
     name: 'D1NotificationsStorage',
     construct: (binding, tablePrefix) =>
@@ -592,6 +600,133 @@ describe('sweepExpiredRunDeadlines', () => {
 });
 
 describe('createD1Storage table prefix', () => {
+  it('rejects non-string prefixes without coercion', () => {
+    const coerce = vi.fn(() => 'safe_');
+    const object = {
+      toString: coerce,
+      [Symbol.toPrimitive]: coerce,
+      get length() {
+        coerce();
+        return 5;
+      },
+    };
+    for (const value of [
+      true,
+      false,
+      null,
+      1,
+      [],
+      new String('safe_'),
+      object,
+    ]) {
+      const prefix = value as unknown as string;
+      expect(() => validateTablePrefix(prefix)).toThrow(
+        'Invalid tablePrefix: use an empty prefix',
+      );
+      const prepare = vi.fn();
+      const binding = { prepare } as unknown as D1DatabaseBinding;
+      expect(() => createD1Storage({ binding, tablePrefix: prefix })).toThrow(
+        'Invalid tablePrefix: use an empty prefix',
+      );
+      for (const { construct } of PUBLIC_STORAGE_PREFIX_CASES)
+        expect(() => construct(binding, prefix)).toThrow(
+          'Invalid tablePrefix: use an empty prefix',
+        );
+      expect(prepare).not.toHaveBeenCalled();
+    }
+    expect(coerce).not.toHaveBeenCalled();
+    for (const value of [
+      undefined,
+      '',
+      '_tenant_01_',
+      'tenant_01_',
+      MAX_TABLE_PREFIX,
+    ])
+      expect(validateTablePrefix(value)).toBe(value);
+    expect(() => validateTablePrefix(OVERLONG_TABLE_PREFIX, 'custom')).toThrow(
+      'Invalid custom: must be at most 39 characters',
+    );
+  });
+
+  it('preserves inherited and non-enumerable disabled or custom domain overrides', async () => {
+    const binding = sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding;
+    const custom = new FencedWorkflowsStorageD1({ binding: binding as never });
+    for (const mode of ['inherited', 'non-enumerable']) {
+      for (const workflows of [false, custom]) {
+        const values = { workflows, threadState: false, notifications: false };
+        const domains =
+          mode === 'inherited'
+            ? Object.create(values)
+            : Object.defineProperties(
+                {},
+                Object.fromEntries(
+                  Object.entries(values).map(([key, value]) => [
+                    key,
+                    { value },
+                  ]),
+                ),
+              );
+        Object.defineProperty(domains, 'ignored', {
+          enumerable: true,
+          get() {
+            throw new Error('unknown getter');
+          },
+        });
+        const storage = createD1Storage({ binding, domains });
+        expect(await storage.getStore('workflows')).toBe(
+          workflows === false ? undefined : custom,
+        );
+        expect(await storage.getStore('threadState')).toBeUndefined();
+        expect(await storage.getStore('notifications')).toBeUndefined();
+      }
+    }
+  });
+
+  it('captures composition inputs before either storage constructor', async () => {
+    const first = sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding;
+    const second = sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding;
+    let bindingReads = 0;
+    let workflowReads = 0;
+    let domainReads = 0;
+    let prefixReads = 0;
+    let idReads = 0;
+    const domains = {
+      get workflows() {
+        workflowReads += 1;
+        return workflowReads === 1 ? undefined : (false as const);
+      },
+    };
+    const storage = createD1Storage({
+      get binding() {
+        return ++bindingReads === 1 ? first : second;
+      },
+      get id() {
+        idReads += 1;
+        return 'captured';
+      },
+      get tablePrefix() {
+        return ++prefixReads === 1 ? 'First_' : 'second_';
+      },
+      get domains() {
+        domainReads += 1;
+        return domains;
+      },
+    });
+    await storage.init();
+    const workflows = await storage.getStore('workflows');
+    expect(workflows).toBeInstanceOf(FencedWorkflowsStorageD1);
+    if (!(workflows instanceof FencedWorkflowsStorageD1))
+      throw new Error('missing owned workflow domain');
+    expect(workflows[FENCED_WORKFLOW_STORAGE]?.database).toBe(first);
+    expect(workflows[FENCED_WORKFLOW_STORAGE]?.tablePrefix).toBe('first_');
+    expect([
+      bindingReads,
+      workflowReads,
+      domainReads,
+      prefixReads,
+      idReads,
+    ]).toEqual([1, 1, 1, 1, 1]);
+  });
   it('uses the shared Mastra-compatible identifier rule', () => {
     const binding = sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding;
 

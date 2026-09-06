@@ -14,6 +14,7 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ModuleKind, ScriptTarget, transpile } from 'typescript';
 import { parse as parseYaml } from 'yaml';
 import { assertAttwEsmPackage } from './attw-pack-check.mjs';
 
@@ -86,6 +87,16 @@ try {
   const manifest = JSON.parse(
     readFileSync(join(packageDirectory, 'package.json'), 'utf8'),
   );
+  for (const leaf of ['fenced-workflows-d1', 'fenced-workflow-capability']) {
+    const declaration = readFileSync(
+      join(packageDirectory, 'dist', 'do-runner', `${leaf}.d.ts`),
+      'utf8',
+    );
+    assert.doesNotMatch(
+      declaration,
+      /node:async_hooks|AsyncLocalStorage|NodeJS|<reference\s+types=["']node["']/,
+    );
+  }
   // Compared against the SOURCE manifest, not a copy of its value: this script
   // is a CI-only step, so a hardcoded range silently goes stale the moment the
   // peer floor moves and only fails after the change is pushed. The regex
@@ -148,6 +159,7 @@ try {
         engines: rootManifest.engines,
         dependencies: {
           '@mastra/core': corePeer,
+          zod: sourceManifest.devDependencies.zod,
           '@proofoftech/breakwater': `file:${breakwaterArchive}`,
           '@proofoftech/flowsafe': `file:${archive}`,
         },
@@ -217,6 +229,10 @@ import type {
 } from '@proofoftech/flowsafe/approval-api';
 import {
   sweepExpiredRunDeadlines,
+  FENCED_WORKFLOW_STORAGE,
+  FencedWorkflowsStorageD1,
+  type InitialRunAdmission,
+  type FencedWorkflowAdmissionCapability,
   type DeploymentInventory,
   type DrainProofContract,
   type DurableObjectRunLifecycleHooks,
@@ -315,6 +331,14 @@ const worker = null as FlowsafeWorker<FlowsafeWorkerEnv> | null;
 const topologyOptions = null as AgentThreadTopologyOptions | null;
 const backgroundReads = null as BackgroundTaskReads | null;
 declare const bgHost: BackgroundTaskHost;
+declare const domainConfig: ConstructorParameters<typeof FencedWorkflowsStorageD1>[0];
+declare const admission: InitialRunAdmission;
+const owned = new FencedWorkflowsStorageD1(domainConfig);
+const capability: FencedWorkflowAdmissionCapability | undefined = owned[FENCED_WORKFLOW_STORAGE];
+if (capability) {
+  void capability.withInitialAdmission(admission, async () => ({ id: 'run' }));
+  void capability.readSnapshot({ workflowId: 'workflow', runId: 'run' });
+}
 void BREAKWATER_CONNECTOR_EXECUTION_KEY;
 void BREAKWATER_CONNECTOR_GRANTS_KEY;
 void connectorGrantsForLeg;
@@ -368,6 +392,21 @@ void createRunRouter;
   );
   run('pnpm', ['exec', 'tsc', '-p', 'tsconfig.json'], consumer);
   writeFileSync(
+    join(consumer, 'tsconfig.es2022.json'),
+    JSON.stringify({
+      extends: './tsconfig.json',
+      compilerOptions: { lib: ['ES2022'], types: [] },
+    }),
+  );
+  run('pnpm', ['exec', 'tsc', '-p', 'tsconfig.es2022.json'], consumer);
+  writeFileSync(
+    join(consumer, 'sqlite-fixture.mjs'),
+    transpile(
+      readFileSync(join(packageRoot, 'test-support', 'sqlite.ts'), 'utf8'),
+      { target: ScriptTarget.ES2022, module: ModuleKind.ESNext },
+    ),
+  );
+  writeFileSync(
     join(consumer, 'runtime.mjs'),
     `import assert from 'node:assert/strict';
 import * as host from '@proofoftech/flowsafe/agent-host';
@@ -376,8 +415,15 @@ import * as approvals from '@proofoftech/flowsafe/approval-api';
 import * as backgroundTasks from '@proofoftech/flowsafe/background-tasks';
 import * as doRunner from '@proofoftech/flowsafe/do-runner';
 import * as hostKit from '@proofoftech/flowsafe/host-kit';
+import { Mastra } from '@mastra/core/mastra';
+import { createStep, createWorkflow } from '@mastra/core/workflows';
+import { z } from 'zod';
+import { openSqlite, sqliteUnitDatabase } from './sqlite-fixture.mjs';
 for (const name of [
   'createD1Storage',
+  'FencedWorkflowsStorageD1',
+  'isDefinitiveInitialAdmissionRefusal',
+  'RunAdmissionConflictError',
   'sweepExpiredRunDeadlines',
   'ExecutionFenceStore',
   'executionFenceFor',
@@ -413,6 +459,32 @@ assert.equal(Array.isArray(doRunner.INVENTORY_DRAIN_PROOF.reachableFrom), true);
 assert.equal(typeof hostKit.createFlowsafeRunnerLifecycle, 'function');
 assert.equal(typeof hostKit.createRunRouter, 'function');
 assert.equal(typeof hostKit.createFlowsafeWorker, 'function');
+assert.equal(hostKit.FENCED_WORKFLOW_STORAGE, doRunner.FENCED_WORKFLOW_STORAGE);
+assert.equal('FencedWorkflowsStorageD1' in hostKit, false);
+const binding = sqliteUnitDatabase(openSqlite());
+const storage = doRunner.createD1Storage({ binding });
+let engineCalls = 0;
+const workflow = createWorkflow({ id: 'packed-initial', inputSchema: z.object({}), outputSchema: z.object({}) })
+  .then(createStep({ id: 'effect', inputSchema: z.object({}), outputSchema: z.object({}), execute: async () => { engineCalls += 1; return {}; } }))
+  .commit();
+new Mastra({ storage, workflows: { 'packed-initial': workflow } });
+await storage.init();
+const domain = await storage.getStore('workflows');
+assert.equal(domain instanceof doRunner.FencedWorkflowsStorageD1, true);
+const capability = domain[doRunner.FENCED_WORKFLOW_STORAGE];
+assert.equal(capability.database, binding);
+assert.equal(capability.tablePrefix, '');
+const execution = { tablePrefix: '', workflowId: workflow.id, runId: 'packed-run', startToken: 'packed-generation' };
+const admitted = await capability.withInitialAdmission({ execution, attemptToken: 'packed-correlation',
+  fence: new doRunner.ExecutionFenceStore(binding), onInitialWriteAttempt() {},
+  requestContext: { 'flowsafe.runProvenance': { version: 2, startToken: execution.startToken, attemptToken: 'packed-correlation', resumeCounts: [] } },
+}, () => workflow.createRun({ runId: execution.runId }));
+assert.deepEqual(admitted.witness.execution, execution);
+assert.deepEqual(await capability.readSnapshot(execution), admitted.witness.row);
+assert.equal(JSON.parse(admitted.witness.row.snapshot).status, 'pending');
+assert.equal(engineCalls, 0);
+await admitted.value.start({ inputData: {} });
+assert.equal(engineCalls, 1);
 assert.equal(
   backgroundTasks.EXECUTION_FENCE_SUSPEND_KEY,
   'flowsafe.executionFenced',

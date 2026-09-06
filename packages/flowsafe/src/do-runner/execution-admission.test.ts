@@ -16,6 +16,7 @@ import {
   normalizeRunExecutionIdentity,
   normalizeStartExecutionIdentity,
   normalizeStartIdentity,
+  RunAdmissionConflictError,
   stampMutationEpoch,
 } from './execution-admission.js';
 import { ExecutionFenceUnreadableError as LegacyUnreadableError } from './execution-fence.js';
@@ -33,6 +34,27 @@ const START = {
 };
 
 describe('execution identity and epoch helpers', () => {
+  it('uses fixed admission conflict and inconsistent-input errors without identity values', () => {
+    for (const classification of [
+      'run-owner-changed',
+      'reservation-changed',
+      'run-exists',
+      'fence-changed',
+      'admission-raced',
+    ] as const) {
+      const error = new RunAdmissionConflictError(classification);
+      expect(error).toMatchObject({
+        status: 409,
+        message: 'initial run admission conflicts with current durable state',
+        reason: { code: 'RUN_ADMISSION_CONFLICT', classification },
+      });
+    }
+    expect(new InvalidExecutionIdentityError('admission')).toMatchObject({
+      status: 400,
+      message: 'initial admission identity is inconsistent',
+      reason: { code: 'INVALID_EXECUTION_IDENTITY' },
+    });
+  });
   it('normalizes identity data without inventing a namespace or owner', () => {
     expect(normalizeRunExecutionIdentity(RUN)).toEqual({
       ...RUN,

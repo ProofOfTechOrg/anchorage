@@ -30,6 +30,9 @@ export {
   normalizeRunExecutionIdentity,
   normalizeStartExecutionIdentity,
   normalizeStartIdentity,
+  type ProofEntryExpectation,
+  type RunAdmissionConflictClassification,
+  RunAdmissionConflictError,
   type RunExecutionIdentity,
   type StartExecutionIdentity,
   type StartIdentity,
@@ -41,6 +44,18 @@ export {
   type ExecutionFenceVersionedReading,
   executionFenceReadingPayload,
 } from '../do-runner/execution-fence.js';
+export {
+  FENCED_WORKFLOW_STORAGE,
+  type FencedWorkflowAdmissionCapability,
+  type InitialAdmissionDatabase,
+  type InitialAdmissionWitness,
+  type InitialRunAdmission,
+} from '../do-runner/fenced-workflow-capability.js';
+export { isDefinitiveInitialAdmissionRefusal } from '../do-runner/initial-admission-refusal.js';
+export type {
+  D1RunAddress,
+  RawWorkflowSnapshot,
+} from '../do-runner/workflow-snapshot-row.js';
 export {
   type BoundedBodyResult,
   readBoundedBody,

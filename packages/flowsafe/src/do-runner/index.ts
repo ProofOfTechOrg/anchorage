@@ -94,6 +94,9 @@ export {
   normalizeRunExecutionIdentity,
   normalizeStartExecutionIdentity,
   normalizeStartIdentity,
+  type ProofEntryExpectation,
+  type RunAdmissionConflictClassification,
+  RunAdmissionConflictError,
   type RunExecutionIdentity,
   type StartExecutionIdentity,
   type StartIdentity,
@@ -158,6 +161,14 @@ export {
   readExecutionFence,
 } from './execution-fence.js';
 export { EXECUTION_PRINCIPAL_HEADER } from './execution-principal-header.js';
+export {
+  FENCED_WORKFLOW_STORAGE,
+  type FencedWorkflowAdmissionCapability,
+  type InitialAdmissionDatabase,
+  type InitialAdmissionWitness,
+  type InitialRunAdmission,
+} from './fenced-workflow-capability.js';
+export { FencedWorkflowsStorageD1 } from './fenced-workflows-d1.js';
 export type { HubStreamEvent, PresenceMember } from './hub-do.js';
 export { HUB_INSTANCE_NAME, HubDurableObject } from './hub-do.js';
 export type {
@@ -168,6 +179,7 @@ export type {
   StorageInitOptions,
 } from './init.js';
 export { init } from './init.js';
+export { isDefinitiveInitialAdmissionRefusal } from './initial-admission-refusal.js';
 // The drain inventory: the read-only surface an operator proves a deployment
 // empty with, and the table census that keeps that proof complete as new
 // tables arrive.
@@ -327,3 +339,7 @@ export {
 } from './suspension-deadline.js';
 export type { ThreadScope } from './thread-do.js';
 export { ThreadDurableObject, ThreadIdentityError } from './thread-do.js';
+export type {
+  D1RunAddress,
+  RawWorkflowSnapshot,
+} from './workflow-snapshot-row.js';

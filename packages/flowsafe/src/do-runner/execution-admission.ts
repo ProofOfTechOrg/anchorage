@@ -13,6 +13,33 @@ export interface MutationEpochContext {
   readonly mutationEpoch?: number;
 }
 
+export interface ProofEntryExpectation {
+  readonly key: string;
+  readonly mutationEpoch: number;
+  readonly transitionRevision: number;
+}
+
+export type RunAdmissionConflictClassification =
+  | 'run-owner-changed'
+  | 'reservation-changed'
+  | 'run-exists'
+  | 'fence-changed'
+  | 'admission-raced';
+
+export class RunAdmissionConflictError extends DoStatusError {
+  readonly status = 409;
+  readonly reason: {
+    readonly code: 'RUN_ADMISSION_CONFLICT';
+    readonly classification: RunAdmissionConflictClassification;
+  };
+
+  constructor(classification: RunAdmissionConflictClassification) {
+    super('initial run admission conflicts with current durable state');
+    this.name = 'RunAdmissionConflictError';
+    this.reason = { code: 'RUN_ADMISSION_CONFLICT', classification };
+  }
+}
+
 /** Identity data; null explicitly makes no D1 namespace assertion. */
 export interface RunExecutionIdentity {
   readonly tablePrefix: string | null;
@@ -47,6 +74,7 @@ export interface D1StartExecutionIdentity
     StartIdentity {}
 
 const IDENTITY_ERRORS = {
+  admission: 'initial admission identity is inconsistent',
   identity: 'execution identity must be an object',
   tablePrefix: 'tablePrefix is not valid for this execution identity',
   workflowId: 'workflowId must be a URL-path-safe identifier',

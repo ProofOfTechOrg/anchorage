@@ -12,7 +12,7 @@ import type { D1Database } from '@cloudflare/workers-types';
 import {
   BackgroundTasksStorageD1,
   type D1DomainConfig,
-  WorkflowsStorageD1,
+  type WorkflowsStorageD1,
 } from '@mastra/cloudflare-d1';
 import type { TaskFilter, TaskListResult } from '@mastra/core/background-tasks';
 import type { Mastra } from '@mastra/core/mastra';
@@ -23,7 +23,10 @@ import {
   type UpdateWorkflowStateOptions,
 } from '@mastra/core/storage';
 import type { StepResult, WorkflowRunState } from '@mastra/core/workflows';
-
+import {
+  captureD1DomainConfig,
+  FencedWorkflowsStorageD1,
+} from '../do-runner/fenced-workflows-d1.js';
 import type { D1DatabaseBinding } from '../do-runner/index.js';
 import { validateTablePrefix } from '../do-runner/table-prefix.js';
 
@@ -68,22 +71,10 @@ export const SERIALIZED_WORKFLOWS_D1: unique symbol = Symbol(
   'flowsafe.serializedWorkflowsD1',
 );
 
-function validatedDomainConfig(config: D1DomainConfig): D1DomainConfig {
-  const tablePrefix = validateTablePrefix(config.tablePrefix);
-  return {
-    ...config,
-    ...(tablePrefix !== undefined ? { tablePrefix } : {}),
-  };
-}
-
 /** Serialized D1 workflow updates for one Durable Object owner. */
-export class DurableObjectWorkflowsStorageD1 extends WorkflowsStorageD1 {
+export class DurableObjectWorkflowsStorageD1 extends FencedWorkflowsStorageD1 {
   readonly [SERIALIZED_WORKFLOWS_D1] = true as const;
   readonly #tails = new Map<string, Promise<unknown>>();
-
-  constructor(config: D1DomainConfig) {
-    super(validatedDomainConfig(config));
-  }
 
   override supportsConcurrentUpdates(): boolean {
     return true;
@@ -194,7 +185,7 @@ export class DurableObjectBackgroundTasksStorageD1 extends BackgroundTasksStorag
     config: D1DomainConfig,
     workflows: DurableObjectWorkflowsStorageD1,
   ) {
-    super(validatedDomainConfig(config));
+    super(captureD1DomainConfig(config));
     this.#workflows = workflows;
   }
 

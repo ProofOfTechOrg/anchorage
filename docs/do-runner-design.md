@@ -174,9 +174,13 @@ Store reads are uncached and require an authoritative database binding, not an u
 
 `flowsafe_start_idempotency` stores owner, target, server-minted run ID, reservation state, and timestamps. The claim from `reserved` to `started` is the cross-isolate serializer. Terminal run cleanup pairs snapshot and reservation retention so a spent key remains distinguishable from a fresh key until its configured horizon expires.
 
-Reservation reads also return a `binding`: `legacy` for an unassociated old-format row, `unbound` for a modern row awaiting association, or `bound` with an execution identity. A bound identity has `tablePrefix`, `workflowId`, `runId`, and `startToken`. A null prefix explicitly asserts no D1 namespace; it differs from the empty string, which identifies the default D1 tables. Schema upgrades preserve existing rows and add nullable binding columns. Current reservation writes still produce legacy bindings; automatic generation binding is not enabled.
+Reservation reads also return a `binding`: `legacy` for an unassociated old-format row, `unbound` for a modern row awaiting association, or `bound` with an execution identity. A bound identity has `tablePrefix`, `workflowId`, `runId`, and `startToken`. A null prefix explicitly asserts no D1 namespace; it differs from the empty string, which identifies the default D1 tables.
 
-The fence can retain a complete D1 proof identity alongside `proofRunId`. Store readings expose it as `proofExecution`; admin JSON excludes that identity and its token. Adding its nullable columns preserves active epochs, revisions, receipts, proof fields, and timestamps. Provisioning validates structural schema metadata; Runtime additionally validates proof identifiers and canonical prefixes. Provisioning does not repair corrupt identity or receipt bytes. These representations do not change the current run-ID-based execution predicates.
+Schema upgrades preserve existing rows and add nullable binding columns. Current reservation writes still produce legacy bindings; automatic generation binding is not enabled.
+
+The fence can retain a complete D1 proof identity alongside `proofRunId`. Store readings expose it as `proofExecution`; admin JSON excludes that identity and its token. Adding its nullable columns preserves active epochs, revisions, receipts, proof fields, and timestamps.
+
+Provisioning validates structural schema metadata; Runtime additionally validates proof identifiers and canonical prefixes. Provisioning does not repair corrupt identity or receipt bytes. These representations do not change the current run-ID-based execution predicates.
 
 ### Validate execution identity data
 
@@ -191,9 +195,25 @@ The `do-runner` and `host-kit` entry points export identity and mutation-epoch h
 | `normalizeMutationEpoch` | Accepts undefined or a nonnegative safe-integer number without string coercion |
 | `assertMutationEpoch` | Compares an already-observed fence reading to a supplied epoch; it does not make a later write atomic |
 
-Invalid identity or epoch input returns the corresponding `INVALID_EXECUTION_IDENTITY` or `INVALID_MUTATION_EPOCH` error with status 400. An active epoch mismatch returns `MUTATION_EPOCH_MISMATCH` with status 409 and a `missing`, `stale`, or `future` classification. Malformed reading metadata remains `EXECUTION_FENCE_UNREADABLE` with status 503.
+Invalid identity or epoch input throws the corresponding `INVALID_EXECUTION_IDENTITY` or `INVALID_MUTATION_EPOCH` error with status 400. An active epoch mismatch throws `MUTATION_EPOCH_MISMATCH` with status 409 and a `missing`, `stale`, or `future` classification. Malformed reading metadata remains `EXECUTION_FENCE_UNREADABLE` with status 503.
 
 `MUTATION_EPOCH_HEADER`, `mutationEpochFromHeader`, and `stampMutationEpoch` encode canonical decimal epochs for a trusted internal channel. Authenticate that channel before interpreting its header. The helpers do not add host forwarding or request enforcement; activation still requires final-write support from every writer.
+
+### Use explicit initial-admission scopes
+
+`createD1Storage()` composes `FencedWorkflowsStorageD1` as its default workflow domain. Explicit custom or disabled workflow domains retain precedence. The serialized background workflow domain extends the same class and retains its existing per-run update lock. Outside an explicit admission scope, both classes delegate persistence to the pinned D1 adapter.
+
+Advanced trusted integrations can obtain `FENCED_WORKFLOW_STORAGE` from the actual workflow domain. The capability exists only for a selected raw binding with transactional `batch()` support; standalone client and REST configurations retain ordinary adapter behavior without that capability. Fence and participating reservation stores must hold that exact binding. The capability reports its actual lowercase table prefix, with the empty string identifying the default namespace.
+
+Call `withInitialAdmission(admission, () => workflow.createRun(...))` around initial Core creation only. Supply a server-generated generation token, the original caller epoch and proof observation, and a coherent trusted v2 request context. A keyed call also requires an already-started modern-unbound reservation; current reservation creation does not emit that representation automatically. Both callbacks are invoked as plain functions; use a closure or bound function when you need a receiver.
+
+The initial conditional INSERT atomically chains its winning reservation and proof bindings. Only a positive exact witness permits the caller to invoke the returned Run’s `start()` after the scope ends. Suppressed pending persistence, a cached/existing Run, or another domain’s write does not supply that witness.
+
+Admission stamps `initialAdmission: true` into the stored provenance. Ordinary updates can preserve that stamp while changing the row’s bytes or status. The marker alone proves neither an unchanged initial row, lack of progress, nor absence of effects. Inspect the full authoritative row and its execution identity; this primitive does not activate marker-based Runtime recovery.
+
+A validated all-zero batch changes no participant. `isDefinitiveInitialAdmissionRefusal(error, execution)` recognizes only package-owned, in-process evidence for that exact execution, including bounded cause wrappers. It never authorizes deleting a durable snapshot. A thrown batch converges only on matching raw bytes and every required binding; malformed returned results and uncertain readbacks cannot grant a witness.
+
+`readSnapshot()` returns an immutable observation of the six stored fields without Core cache fallback or timestamp conversion. Built-in Runtime still emits v1 and does not enter these scopes. Host integration, exact recovery and final schedule enforcement remain prerequisites for activating artifact epochs; this low-level primitive does not complete that rollout.
 
 ### Snapshot provenance
 

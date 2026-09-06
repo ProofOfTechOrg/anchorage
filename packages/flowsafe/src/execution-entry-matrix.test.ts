@@ -52,11 +52,18 @@
 import { Mastra } from '@mastra/core';
 import type { Agent } from '@mastra/core/agent';
 import type { NotificationsStorage } from '@mastra/core/notifications';
+import { RequestContext } from '@mastra/core/request-context';
 import { InMemoryStore } from '@mastra/core/storage';
+import { createStep, createWorkflow } from '@mastra/core/workflows';
+import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 
-import { openSqlite, sqliteUnitDatabase } from '../test-support/sqlite.js';
+import {
+  openSqlite,
+  type SqliteDatabase,
+  sqliteUnitDatabase,
+} from '../test-support/sqlite.js';
 import type { ActorContext, ApprovalActor } from './approval-api/index.js';
 import {
   ApprovalService,
@@ -64,6 +71,7 @@ import {
   InMemoryResourceOwnershipStore,
 } from './approval-api/index.js';
 import { BackgroundTaskHost } from './background-tasks/index.js';
+import { RUN_PROVENANCE_CONTEXT_KEY } from './do-runner/execution-context.js';
 import type {
   DurableObjectRunOwnershipStore,
   ExecutionFenceDatabase,
@@ -77,11 +85,14 @@ import {
   admitsExistingRun,
   admitsRunStart,
   admitsWorkAuthoring,
+  createD1Storage,
   createHostPubSub,
   DEPLOYMENT_IDENTITY_HEADER,
   DurableObjectRunner,
   EXECUTION_PRINCIPAL_HEADER,
   ExecutionFenceStore,
+  FENCED_WORKFLOW_STORAGE,
+  type FencedWorkflowsStorageD1,
   init,
   StartIdempotencyStore,
 } from './do-runner/index.js';
@@ -182,16 +193,24 @@ interface Entry {
    * suspended run, a filed approval, a due schedule) is created the way
    * production creates it. The fence moves only after this returns.
    */
-  prepare(fence: ExecutionFenceStore): Promise<Prepared>;
+  prepare(
+    fence: ExecutionFenceStore,
+    database: ExecutionFenceDatabase,
+    sqlite: SqliteDatabase,
+  ): Promise<Prepared>;
 }
 
 /** A fresh fence store over its own in-memory database, seeded open. */
-async function openFence(): Promise<ExecutionFenceStore> {
-  const fence = new ExecutionFenceStore(
-    sqliteUnitDatabase(openSqlite()) as ExecutionFenceDatabase,
-  );
+async function openFence(): Promise<{
+  fence: ExecutionFenceStore;
+  database: ExecutionFenceDatabase;
+  sqlite: SqliteDatabase;
+}> {
+  const sqlite = openSqlite();
+  const database = sqliteUnitDatabase(sqlite) as ExecutionFenceDatabase;
+  const fence = new ExecutionFenceStore(database);
   await fence.seed('open');
-  return fence;
+  return { fence, database, sqlite };
 }
 
 /**
@@ -491,6 +510,190 @@ function objectiveStore(): ObjectiveStore {
 // ---------------------------------------------------------------------------
 
 const ENTRIES: readonly Entry[] = [
+  {
+    name: 'FencedWorkflowsStorageD1.withInitialAdmission',
+    module: 'do-runner/fenced-workflows-d1.ts — final initial INSERT guard',
+    predicate: 'admitsRunStart',
+    prepare: async (fence, database, sqlite) => {
+      const workflowId = 'matrix-owned-initial';
+      const runId = nextRunId();
+      const execution = {
+        tablePrefix: '',
+        workflowId,
+        runId,
+        startToken: crypto.randomUUID(),
+      };
+      const attemptToken = crypto.randomUUID();
+      const startIdentity = {
+        owner: { kind: 'human' as const, id: 'matrix-owner' },
+        target: { kind: 'workflow' as const, id: workflowId },
+      };
+      const storage = createD1Storage({ binding: database });
+      let engineCalls = 0;
+      const workflow = createWorkflow({
+        id: workflowId,
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+      })
+        .then(
+          createStep({
+            id: 'effect',
+            inputSchema: z.object({}),
+            outputSchema: z.object({}),
+            execute: async () => {
+              engineCalls += 1;
+              return {};
+            },
+          }),
+        )
+        .commit();
+      const mastra = new Mastra({
+        storage,
+        workflows: { [workflowId]: workflow },
+      });
+      await storage.init();
+      const domain = (await mastra.getStorage()?.getStore('workflows')) as
+        | FencedWorkflowsStorageD1
+        | undefined;
+      const capability = domain?.[FENCED_WORKFLOW_STORAGE];
+      if (!capability) throw new Error('composed owned capability is missing');
+      expect(capability.database).toBe(database);
+
+      const reservationStore = new StartIdempotencyStore(database);
+      await reservationStore.reserve({
+        key: PROOF_KEY,
+        owner: startIdentity.owner,
+        targetKind: 'workflow',
+        targetId: workflowId,
+        mintRunId: () => runId,
+      });
+      expect(await reservationStore.claim(PROOF_KEY, runId)).toBe(true);
+      // B1 does not activate modern reserve emission; this is its required
+      // already-modern unbound precondition, not a new production minter.
+      sqlite
+        .prepare(
+          "UPDATE flowsafe_start_idempotency SET start_token = '' WHERE key = ?",
+        )
+        .run(PROOF_KEY);
+      const reservation = await reservationStore.readForAdmission(PROOF_KEY);
+      if (!reservation) throw new Error('initial reservation is missing');
+
+      return {
+        nomination: PROOF_KEY,
+        invoke: async (carry) => {
+          const reading = await fence.read();
+          const expected = admitsRunStart(
+            reading,
+            carry ? PROOF_KEY : undefined,
+          );
+          const fenceBefore = sqlite
+            .prepare('SELECT * FROM flowsafe_execution_fence')
+            .get() as Record<string, unknown>;
+          const reservationBefore = sqlite
+            .prepare('SELECT * FROM flowsafe_start_idempotency WHERE key = ?')
+            .get(PROOF_KEY) as Record<string, unknown>;
+          const requestContext = {
+            [RUN_PROVENANCE_CONTEXT_KEY]: {
+              version: 2,
+              startToken: execution.startToken,
+              attemptToken,
+              startIdentity,
+              requestedBy: startIdentity.owner.id,
+              requestedByKind: startIdentity.owner.kind,
+              resumeCounts: [],
+            },
+          };
+          let attempts = 0;
+          try {
+            return await classify(async () => {
+              const { value, witness } = await capability.withInitialAdmission(
+                {
+                  execution,
+                  attemptToken,
+                  startIdentity,
+                  requestContext,
+                  fence,
+                  reservationStore,
+                  reservation,
+                  ...(carry
+                    ? {
+                        proof: {
+                          key: PROOF_KEY,
+                          mutationEpoch: reading.mutationEpoch,
+                          transitionRevision: reading.transitionRevision,
+                        },
+                      }
+                    : {}),
+                  onInitialWriteAttempt: () => {
+                    attempts += 1;
+                  },
+                },
+                () => workflow.createRun({ runId }),
+              );
+              expect(witness.execution).toEqual(execution);
+              expect(
+                JSON.parse(witness.row.snapshot).requestContext[
+                  RUN_PROVENANCE_CONTEXT_KEY
+                ].initialAdmission,
+              ).toBe(true);
+              expect(engineCalls).toBe(0);
+              const result = await value.start({
+                inputData: {},
+                requestContext: new RequestContext(
+                  Object.entries(requestContext),
+                ),
+              });
+              expect(result.status).toBe('success');
+            });
+          } finally {
+            // A post-INSERT decoder refusal must not hide an unauthorized row.
+            const snapshots = sqlite
+              .prepare(
+                'SELECT * FROM mastra_workflow_snapshot WHERE workflow_name = ? AND run_id = ?',
+              )
+              .all(workflowId, runId);
+            expect(snapshots, 'final SQL snapshot effects').toHaveLength(
+              expected ? 1 : 0,
+            );
+            expect(
+              sqlite
+                .prepare(
+                  'SELECT * FROM flowsafe_start_idempotency WHERE key = ?',
+                )
+                .get(PROOF_KEY),
+              'final SQL reservation effects',
+            ).toEqual(
+              expected
+                ? {
+                    ...reservationBefore,
+                    start_token: execution.startToken,
+                    start_table_prefix: execution.tablePrefix,
+                    start_workflow_id: workflowId,
+                  }
+                : reservationBefore,
+            );
+            expect(
+              sqlite.prepare('SELECT * FROM flowsafe_execution_fence').get(),
+              'final SQL proof effects',
+            ).toEqual(
+              expected && reading.state === 'proof-only'
+                ? {
+                    ...fenceBefore,
+                    proof_run_id: runId,
+                    proof_table_prefix: execution.tablePrefix,
+                    proof_workflow_id: workflowId,
+                    proof_start_token: execution.startToken,
+                    updated_at: expect.any(Number),
+                  }
+                : fenceBefore,
+            );
+            expect(attempts).toBe(1);
+            expect(engineCalls).toBe(expected ? 1 : 0);
+          }
+        },
+      };
+    },
+  },
   {
     name: 'RunnerRuntime.start',
     module: 'do-runner/runtime.ts — the closure guarantee for every mint',
@@ -875,13 +1078,13 @@ const ENTRIES: readonly Entry[] = [
 // ---------------------------------------------------------------------------
 
 /**
- * Every place in `src/` that consults an admission predicate, and how the four
- * fence states are exercised against it.
+ * Every place in `src/` that consults an admission predicate or guards an
+ * initial INSERT in SQL, and how the four fence states are exercised against it.
  *
  * THIS IS THE LIST'S ENFORCEMENT. The drives above prove that the gates we know
  * about behave correctly; they can say nothing about a gate nobody added and
  * nothing about a gate someone deleted. The census below reads the source, so a
- * new call site fails until it is written down here — with either the matrix
+ * new boundary fails until it is written down here — with either the matrix
  * entry that drives it, or the suite that already does.
  *
  * `drivenBy` names a matrix entry above wherever one exists. The three that
@@ -891,11 +1094,13 @@ const ENTRIES: readonly Entry[] = [
  * route whose other arm IS driven here. Each is exercised across all four
  * states in the file named.
  */
-const GATE_SITES: ReadonlyArray<{
+type GateSite = {
   file: string;
   predicate: PredicateName;
-  drivenBy: string;
-}> = [
+  sql?: 'initial-snapshot-insert';
+};
+
+const GATE_SITES: ReadonlyArray<GateSite & { drivenBy: string }> = [
   {
     file: 'approval-api/service.ts',
     predicate: 'admitsExistingRun',
@@ -928,6 +1133,18 @@ const GATE_SITES: ReadonlyArray<{
     file: 'do-runner/durable-object.ts',
     predicate: 'admitsExistingRun',
     drivenBy: 'run object POST /:workflow/:run/resume',
+  },
+  {
+    file: 'do-runner/fenced-workflows-d1.ts',
+    predicate: 'admitsRunStart',
+    sql: 'initial-snapshot-insert',
+    drivenBy: 'FencedWorkflowsStorageD1.withInitialAdmission',
+  },
+  {
+    file: 'do-runner/fenced-workflows-d1.ts',
+    predicate: 'admitsRunStart',
+    // Post-zero diagnosis, not the INSERT's final admission authority.
+    drivenBy: 'FencedWorkflowsStorageD1.withInitialAdmission',
   },
   {
     file: 'do-runner/runtime.ts',
@@ -1040,25 +1257,76 @@ function walkSourceFiles(
 }
 
 /**
- * Every `admits*(` call in the package's source, as (file, predicate) pairs.
+ * Every direct `admits*(` call, preserving the original lexical census and
+ * its declaration/barrel exclusions. SQL discovery has no such exclusions.
  *
- * `process.getBuiltinModule` rather than an import: this package's test
- * tsconfig is workers-typed and carries no `@types/node`, so a static `node:`
- * specifier does not type-check. This is the schema guard's idiom for reaching
- * `node:sqlite`.
+ * The filesystem reader keeps the schema guard's getBuiltinModule idiom,
+ * without adding a direct Node ambient-type requirement to this test.
  */
-function gateCallSites(): Array<{ file: string; predicate: PredicateName }> {
-  const found: Array<{ file: string; predicate: PredicateName }> = [];
+function predicateCallSites({ file, source }: SourceFile): GateSite[] {
+  const found: GateSite[] = [];
   const pattern =
     /\badmits(RunStart|ExistingRun|WorkAuthoring|DrainableExecution)\s*\(/g;
-  walkSourceFiles(sourceRoot(), ({ file, source }) => {
-    if (NOT_GATE_FILES.includes(file)) return;
-    for (const match of source.matchAll(pattern)) {
-      found.push({
-        file,
-        predicate: `admits${match[1] as string}` as PredicateName,
-      });
+  if (NOT_GATE_FILES.includes(file)) return found;
+  for (const match of source.matchAll(pattern)) {
+    found.push({
+      file,
+      predicate: `admits${match[1] as string}` as PredicateName,
+    });
+  }
+  return found;
+}
+
+/** Presence/deletion census of the actual inline initial INSERT guard. */
+function sqlAdmissionSites({ file, source }: SourceFile): GateSite[] {
+  const parsed = ts.createSourceFile(
+    file,
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const found: GateSite[] = [];
+  const visit = (node: ts.Node): void => {
+    if (
+      ts.isCallExpression(node) &&
+      ts.isPropertyAccessExpression(node.expression) &&
+      node.expression.name.text === 'prepare'
+    ) {
+      const argument = node.arguments[0];
+      if (
+        argument &&
+        (ts.isStringLiteral(argument) ||
+          ts.isNoSubstitutionTemplateLiteral(argument) ||
+          ts.isTemplateExpression(argument))
+      ) {
+        const sql = argument.getText(parsed).slice(1, -1);
+        if (
+          /^\s*INSERT\s+INTO\b/i.test(sql) &&
+          /\bWHERE\s+EXISTS\s*\(\s*SELECT\s+1\s+FROM\s+(?:flowsafe_execution_fence|\$\{EXECUTION_FENCE_TABLE\})\s+AS\s+f\b/i.test(
+            sql,
+          )
+        ) {
+          found.push({
+            file,
+            predicate: 'admitsRunStart',
+            sql: 'initial-snapshot-insert',
+          });
+        }
+      }
     }
+    ts.forEachChild(node, visit);
+  };
+  visit(parsed);
+  return found;
+}
+
+function gateCallSites(): GateSite[] {
+  const found: GateSite[] = [];
+  walkSourceFiles(sourceRoot(), (sourceFile) => {
+    found.push(
+      ...predicateCallSites(sourceFile),
+      ...sqlAdmissionSites(sourceFile),
+    );
   });
   return found;
 }
@@ -1067,9 +1335,10 @@ type FenceErrorName = 'ExecutionFencedError' | 'ExecutionFenceUnreadableError';
 
 /**
  * Every production site that AUTHORS a fence refusal or unreadable-store
- * failure. Each row states why the error is constructed before execution can
- * have an effect; the source scan below makes a new author fail until its
- * boundary is reviewed and recorded here. The census is deliberately lexical:
+ * failure. Each row states why the error prevents engine execution. Initial
+ * admission may already have persisted rows: those sites must say so, without
+ * claiming their refusal proves no durable write. The scan makes a new author
+ * fail until its boundary is reviewed and recorded here. It is lexical:
  * a constructor spelling in a comment or string fails loud and asks for review.
  * Aliased class names and namespace imports are forbidden so lexical coverage
  * cannot be bypassed without first changing this test.
@@ -1132,6 +1401,13 @@ const FENCE_ERROR_AUTHORS: ReadonlyArray<{
   {
     file: 'do-runner/execution-fence.ts',
     error: 'ExecutionFenceUnreadableError',
+    anchor: 'async readForAdmission():',
+    beforeExecutionEffect:
+      'The pure current-schema observation rejects missing or malformed metadata before engine entry; diagnostic/readback callers may follow a durable initial admission, so this error alone proves no absence.',
+  },
+  {
+    file: 'do-runner/execution-fence.ts',
+    error: 'ExecutionFenceUnreadableError',
     anchor: 'if (stored.schemaStage > stage)',
     beforeExecutionEffect:
       'Fence-row validation fails closed before any caller can admit execution.',
@@ -1163,6 +1439,62 @@ const FENCE_ERROR_AUTHORS: ReadonlyArray<{
     anchor: "reading?.state === 'proof-only'",
     beforeExecutionEffect:
       'A failed proof-binding metadata write becomes unreadable before the runtime starts the run.',
+  },
+  {
+    file: 'do-runner/fenced-workflows-d1.ts',
+    error: 'ExecutionFenceUnreadableError',
+    anchor: 'if (!scope.witness) {',
+    beforeExecutionEffect:
+      'A createRun callback without a positive persistence witness cannot enter the engine; another domain or swallowed failure may already have written, so missing witness gives no definitive-zero authority.',
+  },
+  {
+    file: 'do-runner/fenced-workflows-d1.ts',
+    error: 'ExecutionFenceUnreadableError',
+    anchor: 'if (await this.#converged(',
+    beforeExecutionEffect:
+      'A thrown batch with no exact converged readback blocks engine entry; the batch may already have committed durable admission and this uncertain refusal cannot authorize retry or journal clearing.',
+  },
+  {
+    file: 'do-runner/fenced-workflows-d1.ts',
+    error: 'ExecutionFenceUnreadableError',
+    anchor: '} else if (proofRows.length !== 0)',
+    beforeExecutionEffect:
+      'Malformed returned batch data blocks engine entry after a possible committed initial INSERT; no recovery read or missing-result assumption upgrades it to success or definitive zero.',
+  },
+  {
+    file: 'do-runner/fenced-workflows-d1.ts',
+    error: 'ExecutionFencedError',
+    anchor: 'const proofSlotUnbound =',
+    beforeExecutionEffect:
+      'After a validated all-zero chained batch, the current state/key/round diagnostic explains refusal before engine entry; the SQL result, not this JavaScript predicate, establishes no initial write.',
+  },
+  {
+    file: 'do-runner/fenced-workflows-d1.ts',
+    error: 'ExecutionFenceUnreadableError',
+    anchor: "error.reason?.code === 'MUTATION_EPOCH_MISMATCH'",
+    beforeExecutionEffect:
+      'An unreadable post-zero diagnostic blocks engine entry while preserving the already validated all-zero result; failed observation alone would not establish absence of durable admission.',
+  },
+  {
+    file: 'do-runner/workflow-snapshot-row.ts',
+    error: 'ExecutionFenceUnreadableError',
+    anchor: 'export async function readRawWorkflowSnapshot(',
+    beforeExecutionEffect:
+      'The exact reader performs no writes and refuses malformed or unavailable rows before its caller enters the engine; admission readback may follow an already committed initial row and does not prove no write.',
+  },
+  {
+    file: 'do-runner/run-provenance.ts',
+    error: 'ExecutionFenceUnreadableError',
+    anchor: 'export function decodeRunStartIdentity(',
+    beforeExecutionEffect:
+      'The role-neutral provenance decoder performs no storage or execution and rejects malformed owned identity before callers can use it to authorize engine entry.',
+  },
+  {
+    file: 'do-runner/run-provenance.ts',
+    error: 'ExecutionFenceUnreadableError',
+    anchor: 'resumeCounts: Object.freeze([]) as readonly [],',
+    beforeExecutionEffect:
+      'The initial provenance decoder validates before engine entry; callers can use it on a returned or read-back initial row, so decoder failure does not establish absence of durable admission.',
   },
   {
     file: 'do-runner/runtime.ts',
@@ -1281,11 +1613,113 @@ function anchorDistanceBeforeAuthor(
   return undefined;
 }
 
-function siteKey(site: { file: string; predicate: string }): string {
-  return `${site.file} :: ${site.predicate}`;
+function siteKey(site: GateSite): string {
+  return `${site.file} :: ${site.predicate} :: ${site.sql ?? 'predicate'}`;
 }
 
 describe('execution-entry matrix', () => {
+  describe('SQL admission source census', () => {
+    const fenceTable = `\${EXECUTION_FENCE_TABLE}`;
+    const insert = `INSERT INTO \${snapshotTable}`;
+    const guard = `WHERE EXISTS (SELECT 1 FROM ${fenceTable} AS f WHERE f.state = 'open')`;
+    const guardedPrepare = `database.prepare(\`${insert} SELECT 1 ${guard} \${optionalParticipantClauses}\`)`;
+    const sqlSite: GateSite = {
+      file: 'do-runner/fenced-workflows-d1.ts',
+      predicate: 'admitsRunStart',
+      sql: 'initial-snapshot-insert',
+    };
+
+    it.each([
+      ['template with participant interpolation', guardedPrepare],
+      [
+        'whitespace and a literal table name',
+        'database.prepare(`\n INSERT\n INTO snapshot SELECT 1\n' +
+          guard.replace(fenceTable, 'flowsafe_execution_fence') +
+          '`)',
+      ],
+      [
+        'quoted string argument',
+        `database.prepare("INSERT INTO snapshot SELECT 1 ${guard.replace(fenceTable, 'flowsafe_execution_fence')}")`,
+      ],
+    ])('finds an actual prepare argument: %s', (_name, source) => {
+      expect(sqlAdmissionSites({ file: sqlSite.file, source })).toEqual([
+        sqlSite,
+      ]);
+    });
+
+    it.each([
+      ['line comment', `// ${guardedPrepare}`],
+      ['block comment', `/* ${guardedPrepare} */`],
+      [
+        'unused template',
+        guardedPrepare.replace('database.prepare(', 'void ('),
+      ],
+      ['different method', guardedPrepare.replace('.prepare(', '.inspect(')],
+      [
+        'indirect argument',
+        `const sql = \`INSERT INTO snapshot SELECT 1 ${guard}\`; database.prepare(sql)`,
+      ],
+      [
+        'diagnostic SELECT',
+        guardedPrepare.replace(insert, 'SELECT * FROM snapshot'),
+      ],
+      [
+        'proof UPDATE',
+        guardedPrepare.replace(
+          `${insert} SELECT 1`,
+          'UPDATE flowsafe_execution_fence SET proof_run_id = 1',
+        ),
+      ],
+      ['unguarded INSERT', guardedPrepare.replace(guard, 'WHERE 1 = 1')],
+    ])('does not invent a SQL gate from %s', (_name, source) => {
+      expect(sqlAdmissionSites({ file: sqlSite.file, source })).toEqual([]);
+    });
+
+    it('counts every SQL occurrence and scans files excluded only from JavaScript discovery', () => {
+      const excluded = {
+        file: NOT_GATE_FILES[0] as string,
+        source: `${guardedPrepare}; admitsRunStart(reading, key);`,
+      };
+      expect(predicateCallSites(excluded)).toEqual([]);
+      expect(sqlAdmissionSites(excluded)).toEqual([
+        { ...sqlSite, file: excluded.file },
+      ]);
+      const sites = [
+        { file: sqlSite.file, source: `${guardedPrepare}; ${guardedPrepare};` },
+        { file: 'other/new-entry.ts', source: guardedPrepare },
+      ].flatMap(sqlAdmissionSites);
+      expect(sites.map(siteKey).sort()).toEqual(
+        [sqlSite, sqlSite, { ...sqlSite, file: 'other/new-entry.ts' }]
+          .map(siteKey)
+          .sort(),
+      );
+    });
+
+    it('loses the SQL site when its guard is removed despite unchanged diagnostic calls', () => {
+      const original = {
+        file: sqlSite.file,
+        source: `${guardedPrepare}; admitsRunStart(reading, key);`,
+      };
+      const mutated = {
+        ...original,
+        source: original.source.replace(guard, 'WHERE 1 = 1'),
+      };
+      const calls = predicateCallSites(original);
+      expect(predicateCallSites(mutated)).toEqual(calls);
+      expect(sqlAdmissionSites(original)).toEqual([sqlSite]);
+      expect(sqlAdmissionSites(mutated)).toEqual([]);
+      const declared = [...calls, sqlSite].map(siteKey).sort();
+      const observed = [
+        ...predicateCallSites(mutated),
+        ...sqlAdmissionSites(mutated),
+      ]
+        .map(siteKey)
+        .sort();
+      expect(observed).not.toEqual(declared);
+      expect(siteKey(sqlSite)).not.toBe(siteKey(calls[0] as GateSite));
+    });
+  });
+
   it('rejects aliases, qualified construction, and subclassing census escapes', () => {
     const escapes = [
       "import { ExecutionFencedError as HiddenFenceError } from './do-runner/index.js';",
@@ -1407,8 +1841,8 @@ describe('execution-entry matrix', () => {
       it(`${entry.name} behaves as ${entry.predicate} under '${state}'`, async () => {
         // #given — the surface built while the fence is still open, so its
         // prerequisites are created the way production creates them.
-        const fence = await openFence();
-        const prepared = await entry.prepare(fence);
+        const { fence, database, sqlite } = await openFence();
+        const prepared = await entry.prepare(fence, database, sqlite);
 
         // #when — the fence moves to the state under test.
         if (state !== 'open') {
@@ -1436,8 +1870,8 @@ describe('execution-entry matrix', () => {
       // from admitsWorkAuthoring and admitsExistingRun from
       // admitsDrainableExecution; only the nominated proof-only case tells them
       // apart.
-      const fence = await openFence();
-      const prepared = await entry.prepare(fence);
+      const { fence, database, sqlite } = await openFence();
+      const prepared = await entry.prepare(fence, database, sqlite);
       await fence.transition({
         expected: 'open',
         next: 'proof-only',

@@ -56,7 +56,17 @@ export function sqliteUnitDatabase(db: SqliteDatabase): unknown {
         return column !== undefined ? (row[column] ?? null) : row;
       },
       run: async () => execute(),
-      [runSync]: execute,
+      [runSync]: () => {
+        const results = db.prepare(sql).all(...params);
+        const count = db.prepare('SELECT changes() AS count').get() as {
+          count: number | bigint;
+        };
+        return {
+          success: true,
+          results,
+          meta: { changes: Number(count.count) },
+        };
+      },
       all: async () => ({
         success: true,
         results: db.prepare(sql).all(...params),
