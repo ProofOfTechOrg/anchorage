@@ -6,6 +6,7 @@ import type {
   StartIdentity,
 } from './execution-admission.js';
 import type { ExecutionFenceStore } from './execution-fence.js';
+import type { RunTerminalCleanup } from './run-lifecycle.js';
 import type {
   StartIdempotencyStore,
   StartReservationReading,
@@ -47,6 +48,23 @@ export interface InitialAdmissionWitness {
   readonly row: RawWorkflowSnapshot;
 }
 
+/** Exact admitted observation; the stored intent, not the caller, chooses disposition. */
+export interface InitialTerminalizationRequest {
+  readonly expected: RawWorkflowSnapshot;
+  readonly execution: D1RunExecutionIdentity;
+  readonly attemptToken: string;
+  readonly nowMs: number;
+}
+
+/** A terminal-write observation, never admission or no-insert authority. */
+export type InitialTerminalizationResult =
+  | {
+      readonly kind: 'terminalized' | 'already-terminalized' | 'progressed';
+      readonly row: RawWorkflowSnapshot;
+      readonly cleanup?: RunTerminalCleanup;
+    }
+  | { readonly kind: 'conflict'; readonly row?: RawWorkflowSnapshot };
+
 /** Explicit trusted primitive; built-in Runtime does not yet consume it. */
 export interface FencedWorkflowAdmissionCapability {
   readonly database: InitialAdmissionDatabase;
@@ -60,4 +78,8 @@ export interface FencedWorkflowAdmissionCapability {
     workflowId: string;
     runId: string;
   }): Promise<RawWorkflowSnapshot | undefined>;
+  /** Compare the expected initial row once, without engine execution or cleanup. */
+  terminalizeInitialAdmission(
+    request: InitialTerminalizationRequest,
+  ): Promise<InitialTerminalizationResult>;
 }

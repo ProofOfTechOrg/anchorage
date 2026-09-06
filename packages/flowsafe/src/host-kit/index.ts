@@ -50,8 +50,11 @@ export {
   type InitialAdmissionDatabase,
   type InitialAdmissionWitness,
   type InitialRunAdmission,
+  type InitialTerminalizationRequest,
+  type InitialTerminalizationResult,
 } from '../do-runner/fenced-workflow-capability.js';
 export { isDefinitiveInitialAdmissionRefusal } from '../do-runner/initial-admission-refusal.js';
+export type { RunTerminalCleanup } from '../do-runner/run-lifecycle.js';
 export type {
   D1RunAddress,
   RawWorkflowSnapshot,

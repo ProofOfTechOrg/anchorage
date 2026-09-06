@@ -18,6 +18,7 @@ import {
   FENCED_WORKFLOW_STORAGE,
   FencedWorkflowsStorageD1,
   type InitialAdmissionDatabase,
+  type InitialTerminalizationRequest,
 } from '../do-runner/index.js';
 import {
   backgroundTasksStore,
@@ -25,6 +26,550 @@ import {
   DurableObjectBackgroundTasksStorageD1,
   DurableObjectWorkflowsStorageD1,
 } from './d1-storage.js';
+
+async function queuedInitial(withIntent = true) {
+  const sql = openSqlite();
+  const binding = sqliteUnitDatabase(sql) as InitialAdmissionDatabase;
+  const workflows = new DurableObjectWorkflowsStorageD1({
+    binding: binding as never,
+  });
+  await workflows.init();
+  const capability = workflows[FENCED_WORKFLOW_STORAGE];
+  if (!capability) throw new Error('queued capability missing');
+  const execution = {
+    tablePrefix: '',
+    workflowId: 'workflow',
+    runId: 'run',
+    startToken: 'generation',
+  };
+  const fence = new ExecutionFenceStore(binding);
+  const { witness } = await capability.withInitialAdmission(
+    {
+      execution,
+      attemptToken: 'correlation',
+      fence,
+      requestContext: {
+        app: { keep: 'λ' },
+        'flowsafe.runProvenance': {
+          version: 2,
+          startToken: 'generation',
+          attemptToken: 'correlation',
+          resumeCounts: [],
+        },
+        'flowsafe.runLifecycle': {
+          version: 1,
+          revision: 2,
+          scheduleDispatch: { scheduleId: 'schedule', dispatchId: 'dispatch' },
+          ...(withIntent
+            ? {
+                transitionIntent: {
+                  status: 'cancelled',
+                  requestedAt: 1,
+                  replayPrincipals: [{ kind: 'human', id: 'original' }],
+                },
+              }
+            : {}),
+        },
+      },
+      onInitialWriteAttempt: () => undefined,
+    },
+    () =>
+      workflows.persistWorkflowSnapshot({
+        workflowName: 'workflow',
+        runId: 'run',
+        snapshot: createEmptyWorkflowSnapshot('run'),
+      }),
+  );
+  return {
+    sql,
+    binding,
+    workflows,
+    capability,
+    execution,
+    expected: witness.row,
+  };
+}
+
+describe('initial terminalization in the real background queue', () => {
+  const callerFields = [
+    'request.expected',
+    'request.execution',
+    'request.attemptToken',
+    'request.nowMs',
+    'expected.tablePrefix',
+    'expected.workflowId',
+    'expected.runId',
+    'expected.resourceId',
+    'expected.snapshot',
+    'expected.createdAt',
+    'expected.updatedAt',
+    'execution.tablePrefix',
+    'execution.workflowId',
+    'execution.runId',
+    'execution.startToken',
+  ] as const;
+
+  function holdStatement(
+    h: Awaited<ReturnType<typeof queuedInitial>>,
+    pattern: RegExp,
+  ) {
+    let release = () => {};
+    let entered = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const ready = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const prepare = h.binding.prepare.bind(h.binding);
+    let holdNext = true;
+    const boundCalls: Array<{ sql: string; values: unknown[] }> = [];
+    const calls = vi.spyOn(h.binding, 'prepare').mockImplementation((sql) => {
+      const statement = prepare(sql);
+      const bind = statement.bind.bind(statement);
+      vi.spyOn(statement, 'bind').mockImplementation((...values) => {
+        boundCalls.push({ sql, values });
+        const bound = bind(...values);
+        if (holdNext && pattern.test(sql)) {
+          holdNext = false;
+          const all = bound.all.bind(bound);
+          vi.spyOn(bound, 'all').mockImplementation(async () => {
+            entered();
+            await held;
+            return all();
+          });
+        }
+        return bound;
+      });
+      return statement;
+    });
+    return { release, ready, calls, boundCalls };
+  }
+
+  it.each(
+    callerFields,
+  )('preserves the first %s getter fault before the held queue is released', async (field) => {
+    const h = await queuedInitial();
+    const barrier = holdStatement(h, /^INSERT INTO/i);
+    const inflight: Promise<unknown>[] = [];
+    try {
+      const holder = h.workflows.persistWorkflowSnapshot({
+        workflowName: 'workflow',
+        runId: 'run',
+        snapshot: JSON.parse(h.expected.snapshot),
+        updatedAt: new Date(h.expected.updatedAt),
+      });
+      inflight.push(holder);
+      await barrier.ready;
+      barrier.calls.mockClear();
+      const request: InitialTerminalizationRequest = {
+        expected: { ...h.expected },
+        execution: { ...h.execution },
+        attemptToken: 'correlation',
+        nowMs: 1_700_000_000_123,
+      };
+      const [part, key] = field.split('.');
+      if (!key) throw new Error('getter key missing');
+      const target =
+        part === 'request'
+          ? request
+          : part === 'expected'
+            ? request.expected
+            : request.execution;
+      const fault = new Error(`first caller getter: ${field}`);
+      const getter = vi.fn(() => {
+        throw fault;
+      });
+      Object.defineProperty(target, key, { enumerable: true, get: getter });
+      let outcome: unknown;
+      const operation = h.capability.terminalizeInitialAdmission(request).then(
+        (result) => {
+          outcome = result;
+        },
+        (error: unknown) => {
+          outcome = error;
+        },
+      );
+      inflight.push(operation);
+      await Promise.resolve();
+      expect(outcome).toBe(fault);
+      expect(getter).toHaveBeenCalledTimes(1);
+      expect(barrier.calls).not.toHaveBeenCalled();
+      expect(
+        h.sql
+          .prepare(
+            "SELECT snapshot FROM mastra_workflow_snapshot WHERE run_id = 'run'",
+          )
+          .all(),
+      ).toEqual([{ snapshot: h.expected.snapshot }]);
+    } finally {
+      barrier.release();
+      await Promise.allSettled(inflight);
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('keeps changed pending bytes after a held partial writer instead of refreshing repair', async () => {
+    const h = await queuedInitial();
+    const barrier = holdStatement(h, /^INSERT INTO/i);
+    const inflight: Promise<unknown>[] = [];
+    try {
+      const holder = h.workflows.updateWorkflowState({
+        workflowName: 'workflow',
+        runId: 'run',
+        opts: {
+          status: 'pending',
+          tracingContext: { traceId: 'changed-pending', spanId: 'partial' },
+        },
+      });
+      inflight.push(holder);
+      await barrier.ready;
+      const operation = h.capability.terminalizeInitialAdmission({
+        expected: h.expected,
+        execution: h.execution,
+        attemptToken: 'correlation',
+        nowMs: 1_700_000_000_123,
+      });
+      inflight.push(operation);
+      void operation.catch(() => undefined);
+      await h.workflows.persistWorkflowSnapshot({
+        workflowName: 'workflow',
+        runId: 'unrelated',
+        snapshot: createEmptyWorkflowSnapshot('unrelated'),
+      });
+      expect(
+        barrier.calls.mock.calls.filter(([sql]) => sql.startsWith('UPDATE "')),
+      ).toEqual([]);
+      barrier.release();
+      await holder;
+      const result = await operation;
+      expect(result.kind).toBe('conflict');
+      expect(result).not.toHaveProperty('cleanup');
+      expect(
+        barrier.calls.mock.calls.filter(([sql]) => sql.startsWith('UPDATE "')),
+      ).toHaveLength(1);
+      const row = await h.capability.readSnapshot(h.execution);
+      expect(result.row).toEqual(row);
+      const snapshot = JSON.parse(row?.snapshot ?? '');
+      expect(snapshot.status).toBe('pending');
+      expect(snapshot.tracingContext).toEqual({
+        traceId: 'changed-pending',
+        spanId: 'partial',
+      });
+      expect(
+        snapshot.requestContext['flowsafe.runProvenance'].initialAdmission,
+      ).toBe(true);
+      expect(snapshot.requestContext['flowsafe.runLifecycle'].revision).toBe(2);
+    } finally {
+      barrier.release();
+      await Promise.allSettled(inflight);
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('holds a later partial update behind repair and preserves the terminal projection', async () => {
+    const h = await queuedInitial(false);
+    const barrier = holdStatement(h, /^UPDATE "/);
+    const inflight: Promise<unknown>[] = [];
+    try {
+      const operation = h.capability.terminalizeInitialAdmission({
+        expected: h.expected,
+        execution: h.execution,
+        attemptToken: 'correlation',
+        nowMs: 1_700_000_000_123,
+      });
+      inflight.push(operation);
+      void operation.catch(() => undefined);
+      await barrier.ready;
+      let updated = false;
+      const partial = h.workflows
+        .updateWorkflowState({
+          workflowName: 'workflow',
+          runId: 'run',
+          opts: {
+            status: 'failed',
+            tracingContext: {
+              traceId: 'retained-after-repair',
+              spanId: 'partial',
+            },
+          },
+        })
+        .finally(() => {
+          updated = true;
+        });
+      inflight.push(partial);
+      void partial.catch(() => undefined);
+      await h.workflows.persistWorkflowSnapshot({
+        workflowName: 'workflow',
+        runId: 'unrelated',
+        snapshot: createEmptyWorkflowSnapshot('unrelated'),
+      });
+      expect(updated).toBe(false);
+      expect(
+        barrier.boundCalls.filter(
+          ({ sql, values }) => /^SELECT/i.test(sql) && values.includes('run'),
+        ),
+      ).toEqual([]);
+      barrier.release();
+      const result = await operation;
+      expect(result.kind).toBe('terminalized');
+      const state = await partial;
+      expect(state).toMatchObject({
+        status: 'failed',
+        tracingContext: { traceId: 'retained-after-repair', spanId: 'partial' },
+        error: { name: 'StartOutcomeUnknown' },
+        requestContext: {
+          app: { keep: 'λ' },
+          'flowsafe.runLifecycle': { revision: 2 },
+        },
+      });
+      const row = await h.capability.readSnapshot(h.execution);
+      const snapshot = JSON.parse(row?.snapshot ?? '');
+      expect(snapshot).toEqual(state);
+      expect(
+        Object.hasOwn(
+          snapshot.requestContext['flowsafe.runProvenance'],
+          'initialAdmission',
+        ),
+      ).toBe(false);
+      expect(
+        barrier.calls.mock.calls.filter(([sql]) => sql.startsWith('UPDATE "')),
+      ).toHaveLength(1);
+    } finally {
+      barrier.release();
+      await Promise.allSettled(inflight);
+      vi.restoreAllMocks();
+    }
+  });
+
+  it.each([
+    ...callerFields,
+    'capability-before',
+    'capability-during',
+    'late-getters',
+  ])('captures %s before an ordinary persist holder yields the run lock', async (variant) => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(1_700_000_000_000);
+    let release = () => {};
+    const inflight: Promise<unknown>[] = [];
+    try {
+      const h = await queuedInitial();
+      const foreign = await queuedInitial();
+      const foreignBefore = foreign.sql
+        .prepare('SELECT * FROM mastra_workflow_snapshot')
+        .all();
+      const saved = h.capability;
+      if (variant === 'capability-before')
+        Object.defineProperty(h.workflows, FENCED_WORKFLOW_STORAGE, {
+          value: foreign.capability,
+        });
+      let entered = () => {};
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const enteredPromise = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const prepare = h.binding.prepare.bind(h.binding);
+      let holdNext = true;
+      const casValues: unknown[][] = [];
+      const calls = vi.spyOn(h.binding, 'prepare').mockImplementation((sql) => {
+        const statement = prepare(sql);
+        const bind = statement.bind.bind(statement);
+        vi.spyOn(statement, 'bind').mockImplementation((...values) => {
+          const bound = bind(...values);
+          if (sql.startsWith('UPDATE "')) casValues.push(values);
+          if (/^INSERT INTO/i.test(sql) && holdNext) {
+            holdNext = false;
+            const all = bound.all.bind(bound);
+            vi.spyOn(bound, 'all').mockImplementation(async () => {
+              entered();
+              await held;
+              return all();
+            });
+          }
+          return bound;
+        });
+        return statement;
+      });
+      const holder = h.workflows.persistWorkflowSnapshot({
+        workflowName: 'workflow',
+        runId: 'run',
+        snapshot: JSON.parse(h.expected.snapshot),
+        updatedAt: new Date(h.expected.updatedAt),
+      });
+      inflight.push(holder);
+      await enteredPromise;
+      const reads = new Map<string, number>();
+      function observed<T extends object>(source: T, label: string): T {
+        const copy = { ...source };
+        for (const key of Object.keys(source))
+          Object.defineProperty(copy, key, {
+            enumerable: true,
+            configurable: true,
+            get() {
+              const name = `${label}.${key}`;
+              const count = (reads.get(name) ?? 0) + 1;
+              reads.set(name, count);
+              if (variant === 'late-getters' && count > 1)
+                throw new Error(`late caller getter: ${name}`);
+              return source[key as keyof T];
+            },
+          });
+        return copy;
+      }
+      const raw = { ...h.expected };
+      const execution = { ...h.execution };
+      const request = {
+        expected: observed(raw, 'expected'),
+        execution: observed(execution, 'execution'),
+        attemptToken: 'correlation',
+        nowMs: 1_700_000_000_123,
+      };
+      let done = false;
+      const operation = saved
+        .terminalizeInitialAdmission(observed(request, 'request'))
+        .finally(() => {
+          done = true;
+        });
+      inflight.push(operation);
+      void operation.catch(() => undefined);
+      expect(reads.size).toBe(15);
+      expect([...reads.values()]).toEqual(new Array(15).fill(1));
+      if (variant === 'capability-during')
+        Object.defineProperty(h.workflows, FENCED_WORKFLOW_STORAGE, {
+          value: foreign.capability,
+        });
+      else if (
+        !variant.startsWith('capability') &&
+        variant !== 'late-getters'
+      ) {
+        const [part, key] = variant.split('.');
+        const target =
+          part === 'request' ? request : part === 'expected' ? raw : execution;
+        if (!key) throw new Error('mutation key missing');
+        Object.defineProperty(target, key, {
+          value: null,
+          configurable: true,
+          enumerable: true,
+        });
+      }
+      await h.workflows.persistWorkflowSnapshot({
+        workflowName: 'workflow',
+        runId: 'unrelated',
+        snapshot: createEmptyWorkflowSnapshot('unrelated'),
+      });
+      expect(done).toBe(false);
+      expect(casValues).toEqual([]);
+      expect(
+        calls.mock.calls.filter(([sql]) => sql.startsWith('UPDATE "')),
+      ).toEqual([]);
+      release();
+      await holder;
+      const result = await operation;
+      expect(result.kind).toBe('terminalized');
+      if (result.kind === 'conflict') throw new Error('unexpected conflict');
+      expect(result.row.updatedAt).toBe('2023-11-14T22:13:20.123Z');
+      expect(casValues).toEqual([
+        [
+          result.row.snapshot,
+          result.row.updatedAt,
+          'workflow',
+          'run',
+          h.expected.snapshot,
+          h.expected.createdAt,
+          h.expected.updatedAt,
+          h.expected.resourceId,
+        ],
+      ]);
+      expect(result.cleanup).toEqual({
+        revision: 3,
+        status: 'cancelled',
+        cleanupCompleted: false,
+        scheduleDispatch: { scheduleId: 'schedule', dispatchId: 'dispatch' },
+      });
+      const snapshot = JSON.parse(result.row.snapshot);
+      expect(snapshot.timestamp).toBe(1_700_000_000_123);
+      expect(snapshot.requestContext.app).toEqual({ keep: 'λ' });
+      expect(snapshot.requestContext['flowsafe.runProvenance']).toEqual({
+        version: 2,
+        startToken: 'generation',
+        attemptToken: 'correlation',
+        resumeCounts: [],
+      });
+      expect([...reads.values()]).toEqual(new Array(15).fill(1));
+      expect(
+        foreign.sql.prepare('SELECT * FROM mastra_workflow_snapshot').all(),
+      ).toEqual(foreignBefore);
+    } finally {
+      release();
+      await Promise.allSettled(inflight);
+      vi.restoreAllMocks();
+      vi.useRealTimers();
+    }
+  });
+
+  it('waits for a real partial update and preserves its resulting progress', async () => {
+    const h = await queuedInitial();
+    const prepare = h.binding.prepare.bind(h.binding);
+    let entered = () => {};
+    let release = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const enteredPromise = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let holdNext = true;
+    vi.spyOn(h.binding, 'prepare').mockImplementation((sql) => {
+      const statement = prepare(sql);
+      const bind = statement.bind.bind(statement);
+      vi.spyOn(statement, 'bind').mockImplementation((...values) => {
+        const bound = bind(...values);
+        if (/^INSERT INTO/i.test(sql) && holdNext) {
+          holdNext = false;
+          const all = bound.all.bind(bound);
+          vi.spyOn(bound, 'all').mockImplementation(async () => {
+            entered();
+            await held;
+            return all();
+          });
+        }
+        return bound;
+      });
+      return statement;
+    });
+    try {
+      const holder = h.workflows.updateWorkflowState({
+        workflowName: 'workflow',
+        runId: 'run',
+        opts: { status: 'running' },
+      });
+      await enteredPromise;
+      const request: InitialTerminalizationRequest = {
+        expected: h.expected,
+        execution: h.execution,
+        attemptToken: 'correlation',
+        nowMs: 123,
+      };
+      const operation = h.capability.terminalizeInitialAdmission(request);
+      release();
+      await holder;
+      const result = await operation;
+      expect(result.kind).toBe('progressed');
+      const row = await h.capability.readSnapshot(h.execution);
+      expect(row).toEqual(result.row);
+      expect(JSON.parse(row?.snapshot ?? '').status).toBe('running');
+      expect(
+        JSON.parse(row?.snapshot ?? '').requestContext['flowsafe.runProvenance']
+          .initialAdmission,
+      ).toBe(true);
+    } finally {
+      release();
+      vi.restoreAllMocks();
+    }
+  });
+});
 
 describe('backgroundTasksStore — fail-closed accessor', () => {
   it('throws a clear message when the hosting Mastra has no storage', async () => {

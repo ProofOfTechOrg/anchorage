@@ -1443,6 +1443,20 @@ const FENCE_ERROR_AUTHORS: ReadonlyArray<{
   {
     file: 'do-runner/fenced-workflows-d1.ts',
     error: 'ExecutionFenceUnreadableError',
+    anchor: 'function terminalizationUnreadable(',
+    beforeExecutionEffect:
+      'Explicit initial-row terminalization never enters an engine or grants no-insert authority; malformed input observations or uncertain terminal writes refuse through this fixed operation boundary without replay.',
+  },
+  {
+    file: 'do-runner/run-provenance.ts',
+    error: 'ExecutionFenceUnreadableError',
+    anchor: 'const counts = decodeResumeCounts(resumeCounts);',
+    beforeExecutionEffect:
+      'The progress decoder validates only owned metadata and performs no I/O or execution. A retained admission stamp never proves unchanged bytes or no effects, and decoding failures cannot grant definitive-zero evidence.',
+  },
+  {
+    file: 'do-runner/fenced-workflows-d1.ts',
+    error: 'ExecutionFenceUnreadableError',
     anchor: 'if (!scope.witness) {',
     beforeExecutionEffect:
       'A createRun callback without a positive persistence witness cannot enter the engine; another domain or swallowed failure may already have written, so missing witness gives no definitive-zero authority.',

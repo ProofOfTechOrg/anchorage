@@ -4,7 +4,7 @@ import {
   type ExecutionPrincipalKind,
   isExecutionPrincipalId,
   isExecutionPrincipalKind,
-} from '../approval-api/principal.js';
+} from '../approval-api/principal-identity.js';
 import { isPathSafeId } from './path-safe-id.js';
 
 /** Runtime-owned request-context key for durable run lifecycle metadata. */
@@ -15,6 +15,28 @@ export type RunTerminalStatus = 'cancelled' | 'timed_out';
 export interface RunTerminalErrorEnvelope {
   code: 'CANCELLED' | 'TIMED_OUT';
   message: string;
+}
+
+export interface RunLifecycleBlockedReason {
+  code: 'DISPUTED_SETTLEMENT';
+  message: string;
+}
+
+export class RunLifecycleBlockedError extends Error {
+  readonly reason: RunLifecycleBlockedReason;
+
+  constructor(reason: RunLifecycleBlockedReason) {
+    super(reason.message);
+    this.name = 'RunLifecycleBlockedError';
+    this.reason = reason;
+  }
+}
+
+export interface RunTerminalCleanup {
+  revision: number;
+  status: RunTerminalStatus;
+  cleanupCompleted: boolean;
+  scheduleDispatch?: RunScheduleDispatch;
 }
 
 /**
@@ -59,6 +81,61 @@ export interface RunLifecycleState {
     replayPrincipals: RunLifecyclePrincipal[];
     /** Set only after approval/dispatch/ownership cleanup has completed. */
     cleanupCompletedAt?: number;
+  };
+}
+
+export function nextLifecycleRevision(current: number): number {
+  if (
+    !Number.isSafeInteger(current) ||
+    current < 0 ||
+    current === Number.MAX_SAFE_INTEGER
+  )
+    throw new Error('run lifecycle revision cannot advance');
+  return current + 1;
+}
+
+export function terminalCleanupFor(
+  lifecycle: RunLifecycleState | undefined,
+): RunTerminalCleanup | undefined {
+  const terminal = lifecycle?.terminal;
+  if (!lifecycle || !terminal) return undefined;
+  return {
+    revision: lifecycle.revision,
+    status: terminal.status,
+    cleanupCompleted: terminal.cleanupCompletedAt !== undefined,
+    ...(lifecycle.scheduleDispatch
+      ? { scheduleDispatch: lifecycle.scheduleDispatch }
+      : {}),
+  };
+}
+
+export function projectTerminalLifecycle(
+  lifecycle: RunLifecycleState | undefined,
+  status: RunTerminalStatus,
+  nowMs: number,
+  replayPrincipals: RunLifecyclePrincipal[],
+): RunLifecycleState & {
+  terminal: NonNullable<RunLifecycleState['terminal']>;
+} {
+  const base = lifecycle
+    ? Object.fromEntries(
+        Object.entries(lifecycle).filter(([key]) => key !== 'transitionIntent'),
+      )
+    : { version: 1 as const, revision: 0 };
+  return {
+    ...base,
+    version: 1,
+    revision: nextLifecycleRevision(lifecycle?.revision ?? 0),
+    terminal: {
+      status,
+      error: {
+        code: status === 'cancelled' ? 'CANCELLED' : 'TIMED_OUT',
+        message:
+          status === 'cancelled' ? 'run was cancelled' : 'run deadline expired',
+      },
+      transitionedAt: nowMs,
+      replayPrincipals,
+    },
   };
 }
 

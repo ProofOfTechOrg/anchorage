@@ -167,6 +167,8 @@ export {
   type InitialAdmissionDatabase,
   type InitialAdmissionWitness,
   type InitialRunAdmission,
+  type InitialTerminalizationRequest,
+  type InitialTerminalizationResult,
 } from './fenced-workflow-capability.js';
 export { FencedWorkflowsStorageD1 } from './fenced-workflows-d1.js';
 export type { HubStreamEvent, PresenceMember } from './hub-do.js';
@@ -222,6 +224,7 @@ export type {
   RunEconomicOperation,
   RunLifecyclePrincipal,
   RunScheduleDispatch,
+  RunTerminalCleanup,
   RunTerminalErrorEnvelope,
   RunTerminalStatus,
 } from './run-lifecycle.js';

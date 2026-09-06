@@ -23,10 +23,7 @@ import type { Agent, ToolsInput } from '@mastra/core/agent';
 import type { IMastraLogger } from '@mastra/core/logger';
 import { Mastra } from '@mastra/core/mastra';
 import { RequestContext } from '@mastra/core/request-context';
-import type {
-  MastraCompositeStore,
-  UpdateWorkflowStateOptions,
-} from '@mastra/core/storage';
+import type { MastraCompositeStore } from '@mastra/core/storage';
 import type {
   AnyWorkflow,
   WorkflowRunState,
@@ -66,14 +63,33 @@ import {
   canonicalScheduleDispatch,
   hasDisputedSettlement,
   lifecycleFromRequestContext,
+  nextLifecycleRevision,
+  projectTerminalLifecycle,
   RUN_LIFECYCLE_CONTEXT_KEY,
   type RunEconomicOperation,
+  RunLifecycleBlockedError,
   type RunLifecyclePrincipal,
   type RunLifecycleState,
   type RunScheduleDispatch,
+  type RunTerminalCleanup,
   type RunTerminalErrorEnvelope,
   type RunTerminalStatus,
 } from './run-lifecycle.js';
+import { decodeResumeCounts, nextResumeCount } from './run-provenance.js';
+import {
+  type CoreRunResult,
+  errorText,
+  type RunStatus,
+  terminalStateFields,
+  terminalStateUpdate,
+} from './run-terminal-state.js';
+
+export {
+  RunLifecycleBlockedError,
+  type RunLifecycleBlockedReason,
+} from './run-lifecycle.js';
+export type { RunStatus } from './run-terminal-state.js';
+
 import type { StartIdempotencyStore } from './start-idempotency.js';
 
 export class UnknownWorkflowError extends Error {
@@ -138,21 +154,6 @@ export class RunTerminalConflictError extends Error {
   }
 }
 
-export interface RunLifecycleBlockedReason {
-  code: 'DISPUTED_SETTLEMENT';
-  message: string;
-}
-
-export class RunLifecycleBlockedError extends Error {
-  readonly reason: RunLifecycleBlockedReason;
-
-  constructor(reason: RunLifecycleBlockedReason) {
-    super(reason.message);
-    this.name = 'RunLifecycleBlockedError';
-    this.reason = reason;
-  }
-}
-
 /** A request the caller can fix: bad input/resume data or step selection. */
 export class InvalidRunRequestError extends Error {
   constructor(message: string) {
@@ -183,13 +184,6 @@ function asClientError(error: unknown): InvalidRunRequestError | undefined {
     ? new InvalidRunRequestError(error.message)
     : undefined;
 }
-
-export type RunStatus =
-  | WorkflowRunStatus
-  | 'waiting_callback'
-  | 'waiting_signal'
-  | 'retry_wait'
-  | RunTerminalStatus;
 
 /** JSON-safe projection of a workflow run outcome for HTTP transport. */
 export interface RunSummary {
@@ -288,19 +282,7 @@ function runProvenance(
   ) {
     throw new Error('stored run provenance is malformed');
   }
-  const counts: Array<[string, number]> = [];
-  for (const entry of candidate.resumeCounts) {
-    if (
-      !Array.isArray(entry) ||
-      entry.length !== 2 ||
-      typeof entry[0] !== 'string' ||
-      !Number.isSafeInteger(entry[1]) ||
-      entry[1] < 1
-    ) {
-      throw new Error('stored run provenance is malformed');
-    }
-    counts.push([entry[0], entry[1]]);
-  }
+  const counts = decodeResumeCounts(candidate.resumeCounts);
   return {
     version: 1,
     ...(candidate.requestedBy === undefined
@@ -315,109 +297,10 @@ function runProvenance(
   };
 }
 
-// Structural view of core's WorkflowResult union — only the fields the
-// summary transports. AnyWorkflow erases the generics, so narrowing happens
-// here on the status discriminant.
-type CoreRunResult =
-  | { status: 'success'; result: unknown }
-  | { status: 'failed'; error: unknown }
-  | {
-      status: 'suspended';
-      suspended: [string[], ...string[][]];
-      suspendPayload?: unknown;
-      /** Per-step state incl. suspendedAt (workflows/types, suspended arm). */
-      steps?: WorkflowState['steps'];
-    }
-  | { status: 'tripwire'; tripwire: { reason: string } }
-  | {
-      status: Exclude<
-        WorkflowRunStatus,
-        'success' | 'failed' | 'suspended' | 'tripwire'
-      >;
-    };
-
-const NONTERMINAL_RUN_STATUSES = new Set<WorkflowRunStatus>([
-  'running',
-  'suspended',
-  'waiting',
-  'pending',
-  'paused',
-]);
-
 // Registered agents may carry incompatible tool/output generics. The public
 // method preserves each concrete type; this erased form is only for handing
 // the heterogeneous registry to Mastra.
 type ErasedRuntimeAgent = Agent<string, ToolsInput, unknown>;
-
-function terminalStateUpdate(
-  result: CoreRunResult,
-): UpdateWorkflowStateOptions | undefined {
-  if (NONTERMINAL_RUN_STATUSES.has(result.status)) return undefined;
-  const common = {
-    status: result.status,
-    result: undefined,
-    error: undefined,
-    suspendedPaths: {},
-    waitingPaths: {},
-    resumeLabels: {},
-    activePaths: [],
-    activeStepsPath: {},
-  };
-  if (result.status === 'success') {
-    return {
-      ...common,
-      result: result.result as UpdateWorkflowStateOptions['result'],
-    };
-  }
-  if (result.status === 'failed') {
-    const error = result.error;
-    const name =
-      error instanceof Error
-        ? error.name
-        : error !== null &&
-            typeof error === 'object' &&
-            'name' in error &&
-            typeof (error as { name: unknown }).name === 'string'
-          ? (error as { name: string }).name
-          : 'Error';
-    const stack =
-      error instanceof Error
-        ? error.stack
-        : error !== null &&
-            typeof error === 'object' &&
-            'stack' in error &&
-            typeof (error as { stack: unknown }).stack === 'string'
-          ? (error as { stack: string }).stack
-          : undefined;
-    return {
-      ...common,
-      error: {
-        name,
-        message: errorText(error),
-        ...(stack !== undefined ? { stack } : {}),
-      },
-    };
-  }
-  return common;
-}
-
-// Failed runs carry the step's thrown error as an Error instance, a string,
-// or — once it crossed an engine/persistence boundary — a serialized
-// { name, message, stack } object; String() on the last reads
-// '[object Object]', so extract the message wherever it lives.
-function errorText(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  if (typeof error === 'string') return error;
-  if (
-    error !== null &&
-    typeof error === 'object' &&
-    'message' in error &&
-    typeof (error as { message: unknown }).message === 'string'
-  ) {
-    return (error as { message: string }).message;
-  }
-  return String(error);
-}
 
 function summarize(
   runId: string,
@@ -860,12 +743,7 @@ export interface RunLifecycleTransitionResult {
   summary: RunSummary;
   transitioned: boolean;
   casMatched: boolean;
-  cleanup: {
-    revision: number;
-    status: RunTerminalStatus;
-    cleanupCompleted: boolean;
-    scheduleDispatch?: RunScheduleDispatch;
-  };
+  cleanup: RunTerminalCleanup;
 }
 
 const TERMINABLE_RUN_STATUSES = new Set<RunStatus>([
@@ -1506,7 +1384,7 @@ export class RunnerRuntime {
         const principals = canonicalReplayPrincipals(replayPrincipals);
         const intent: RunLifecycleState = {
           ...(lifecycle ?? { version: 1 as const, revision: 0 }),
-          revision: (lifecycle?.revision ?? 0) + 1,
+          revision: nextLifecycleRevision(lifecycle?.revision ?? 0),
           transitionIntent: {
             status: intendedStatus,
             requestedAt: now,
@@ -1693,10 +1571,6 @@ export class RunnerRuntime {
       ) {
         throw new RunTerminalConflictError(workflowId, runId, currentStatus);
       }
-      const error: RunTerminalErrorEnvelope =
-        status === 'cancelled'
-          ? { code: 'CANCELLED', message: 'run was cancelled' }
-          : { code: 'TIMED_OUT', message: 'run deadline expired' };
       const provenance = runProvenance(state);
       const fallbackPrincipal: RunLifecyclePrincipal =
         provenance?.requestedBy && provenance.requestedByKind
@@ -1709,41 +1583,18 @@ export class RunnerRuntime {
         replayPrincipals ??
           transitionIntent?.replayPrincipals ?? [fallbackPrincipal],
       );
-      const lifecycleBase = lifecycle
-        ? Object.fromEntries(
-            Object.entries(lifecycle).filter(
-              ([key]) => key !== 'transitionIntent',
-            ),
-          )
-        : { version: 1 as const, revision: 0 };
-      const next: RunLifecycleState = {
-        ...lifecycleBase,
-        version: 1,
-        revision: (lifecycle?.revision ?? 0) + 1,
-        terminal: {
-          status,
-          error,
-          transitionedAt: now,
-          replayPrincipals: principals,
-        },
-      };
+      const next = projectTerminalLifecycle(lifecycle, status, now, principals);
       await this.#persistLifecycle(
         workflowId,
         runId,
         {
           ...state,
-          status: status as WorkflowRunStatus,
-          result: undefined,
+          ...terminalStateFields(status),
           error: {
             name:
               status === 'cancelled' ? 'RunCancelledError' : 'RunTimedOutError',
-            message: error.message,
+            message: next.terminal.error.message,
           },
-          suspendedPaths: {},
-          waitingPaths: {},
-          resumeLabels: {},
-          activePaths: [],
-          activeStepsPath: {},
           timestamp: now,
         },
         next,
@@ -1798,7 +1649,7 @@ export class RunnerRuntime {
       }
       const next: RunLifecycleState = {
         ...lifecycle,
-        revision: lifecycle.revision + 1,
+        revision: nextLifecycleRevision(lifecycle.revision),
         terminal: {
           ...lifecycle.terminal,
           cleanupCompletedAt: now,
@@ -2023,7 +1874,7 @@ export class RunnerRuntime {
     const priorCounts = new Map(storedProvenance?.resumeCounts ?? []);
     const nextCounts = new Map(priorCounts);
     if (stepKey !== undefined) {
-      nextCounts.set(stepKey, (nextCounts.get(stepKey) ?? 0) + 1);
+      nextCounts.set(stepKey, nextResumeCount(nextCounts.get(stepKey) ?? 0));
     }
     const provenance: RunProvenance = {
       version: 1,
@@ -2043,7 +1894,7 @@ export class RunnerRuntime {
         ? storedLifecycle
         : {
             ...(storedLifecycle ?? { version: 1 as const, revision: 0 }),
-            revision: (storedLifecycle?.revision ?? 0) + 1,
+            revision: nextLifecycleRevision(storedLifecycle?.revision ?? 0),
             ...(replacementDeadline === undefined
               ? {}
               : { deadlineAt: replacementDeadline }),

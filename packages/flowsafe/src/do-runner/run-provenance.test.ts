@@ -4,7 +4,10 @@ import { describe, expect, it } from 'vitest';
 import { ExecutionFenceUnreadableError } from './execution-admission.js';
 import {
   decodeInitialRunProvenance,
+  decodeProgressRunProvenance,
+  decodeResumeCounts,
   decodeRunStartIdentity,
+  nextResumeCount,
   runExecutionIdentityFor,
 } from './run-provenance.js';
 
@@ -23,6 +26,64 @@ const INITIAL = {
 };
 
 describe('run provenance', () => {
+  it('reads genuine progress without confusing a retained marker with unchanged initial state', () => {
+    const progressed = {
+      ...INITIAL,
+      initialAdmission: true,
+      requestedBy: 'Bob',
+      attemptToken: 'resume',
+      resumeCounts: [['gate', Number.MAX_SAFE_INTEGER]],
+      mutationEpoch: 0,
+    };
+    expect(decodeProgressRunProvenance(progressed)).toEqual(progressed);
+    expect(() => decodeInitialRunProvenance(progressed, 'present')).toThrow(
+      ExecutionFenceUnreadableError,
+    );
+    expect(decodeProgressRunProvenance(INITIAL)).toEqual(INITIAL);
+    expect(decodeResumeCounts([['', Number.MAX_SAFE_INTEGER]])).toEqual([
+      ['', Number.MAX_SAFE_INTEGER],
+    ]);
+  });
+  it.each([
+    0,
+    1,
+    Number.MAX_SAFE_INTEGER - 1,
+  ])('advances resume count %s exactly once', (value) => {
+    expect(nextResumeCount(value)).toBe(value + 1);
+  });
+  it.each([
+    Number.MAX_SAFE_INTEGER,
+    Number.MAX_SAFE_INTEGER + 1,
+    -1,
+    NaN,
+    Infinity,
+    0.5,
+  ])('refuses exhausted or invalid resume count %s', (value) => {
+    expect(() => nextResumeCount(value)).toThrow(
+      'run resume count cannot advance',
+    );
+  });
+  it.each([
+    undefined,
+    null,
+    [],
+    [['gate', 0]],
+    [['gate', -1]],
+    [['gate', Infinity]],
+    [['gate', 1.5]],
+    [['gate', Number.MAX_SAFE_INTEGER + 1]],
+    [['gate']],
+    [[1, 1]],
+  ])('keeps progress counts strict %#', (resumeCounts) => {
+    if (Array.isArray(resumeCounts) && resumeCounts.length === 0) {
+      expect(
+        decodeProgressRunProvenance({ ...INITIAL, resumeCounts }).resumeCounts,
+      ).toEqual([]);
+    } else
+      expect(() =>
+        decodeProgressRunProvenance({ ...INITIAL, resumeCounts }),
+      ).toThrow(ExecutionFenceUnreadableError);
+  });
   it('reads inherited and pruned provenance without inventing root authority', () => {
     const decoded = decodeRunStartIdentity(INITIAL);
     expect(decoded).toEqual({

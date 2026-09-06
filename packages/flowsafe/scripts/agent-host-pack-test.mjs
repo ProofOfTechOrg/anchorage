@@ -87,7 +87,13 @@ try {
   const manifest = JSON.parse(
     readFileSync(join(packageDirectory, 'package.json'), 'utf8'),
   );
-  for (const leaf of ['fenced-workflows-d1', 'fenced-workflow-capability']) {
+  for (const leaf of [
+    'fenced-workflows-d1',
+    'fenced-workflow-capability',
+    'run-terminal-state',
+    'run-lifecycle',
+    'run-provenance',
+  ]) {
     const declaration = readFileSync(
       join(packageDirectory, 'dist', 'do-runner', `${leaf}.d.ts`),
       'utf8',
@@ -222,6 +228,9 @@ try {
   BREAKWATER_CONNECTOR_GRANTS_KEY,
   connectorGrantsForLeg,
   type ConnectorApprovalGrant,
+  type InitialTerminalizationRequest as RootTerminalizationRequest,
+  type InitialTerminalizationResult as RootTerminalizationResult,
+  type RunTerminalCleanup as RootTerminalCleanup,
 } from '@proofoftech/flowsafe';
 import type {
   ApprovalGrantScope,
@@ -232,6 +241,9 @@ import {
   FENCED_WORKFLOW_STORAGE,
   FencedWorkflowsStorageD1,
   type InitialRunAdmission,
+  type InitialTerminalizationRequest,
+  type InitialTerminalizationResult,
+  type RunTerminalCleanup,
   type FencedWorkflowAdmissionCapability,
   type DeploymentInventory,
   type DrainProofContract,
@@ -249,6 +261,9 @@ import {
   type FlowsafeWorkerEnv,
   type RunRouterOptions,
   type RunRouterStartIdempotency,
+  type InitialTerminalizationRequest as HostTerminalizationRequest,
+  type InitialTerminalizationResult as HostTerminalizationResult,
+  type RunTerminalCleanup as HostTerminalCleanup,
 } from '@proofoftech/flowsafe/host-kit';
 import {
   createAgentCatalog,
@@ -333,11 +348,33 @@ const backgroundReads = null as BackgroundTaskReads | null;
 declare const bgHost: BackgroundTaskHost;
 declare const domainConfig: ConstructorParameters<typeof FencedWorkflowsStorageD1>[0];
 declare const admission: InitialRunAdmission;
+declare const terminalRequest: InitialTerminalizationRequest;
+const hostTerminalRequest: HostTerminalizationRequest = terminalRequest;
+const terminalResult = null as InitialTerminalizationResult | null;
+const hostTerminalResult: HostTerminalizationResult | null = terminalResult;
+const cleanup = null as RunTerminalCleanup | null;
+const hostCleanup: HostTerminalCleanup | null = cleanup;
+const rootTerminalRequest: RootTerminalizationRequest = terminalRequest;
+const rootTerminalResult: RootTerminalizationResult | null = terminalResult;
+const rootCleanup: RootTerminalCleanup | null = cleanup;
+const rejectsNullNamespace: null extends InitialTerminalizationRequest['execution']['tablePrefix'] ? false : true = true;
+void hostTerminalRequest;
+void hostTerminalResult;
+void hostCleanup;
+void rootTerminalRequest;
+void rootTerminalResult;
+void rootCleanup;
+void rejectsNullNamespace;
 const owned = new FencedWorkflowsStorageD1(domainConfig);
 const capability: FencedWorkflowAdmissionCapability | undefined = owned[FENCED_WORKFLOW_STORAGE];
 if (capability) {
   void capability.withInitialAdmission(admission, async () => ({ id: 'run' }));
   void capability.readSnapshot({ workflowId: 'workflow', runId: 'run' });
+  void capability.terminalizeInitialAdmission(terminalRequest);
+  // @ts-expect-error callers cannot choose the disposition
+  void capability.terminalizeInitialAdmission({ ...terminalRequest, requestedStatus: 'failed' });
+  // @ts-expect-error callers cannot supply a replacement snapshot
+  void capability.terminalizeInitialAdmission({ ...terminalRequest, failedSnapshot: {} });
 }
 void BREAKWATER_CONNECTOR_EXECUTION_KEY;
 void BREAKWATER_CONNECTOR_GRANTS_KEY;
@@ -461,6 +498,13 @@ assert.equal(typeof hostKit.createRunRouter, 'function');
 assert.equal(typeof hostKit.createFlowsafeWorker, 'function');
 assert.equal(hostKit.FENCED_WORKFLOW_STORAGE, doRunner.FENCED_WORKFLOW_STORAGE);
 assert.equal('FencedWorkflowsStorageD1' in hostKit, false);
+assert.equal(typeof doRunner.RunLifecycleBlockedError, 'function');
+assert.equal(doRunner.RunLifecycleBlockedError, flowsafe.RunLifecycleBlockedError);
+assert.equal('RunLifecycleBlockedError' in hostKit, false);
+const blocked = new doRunner.RunLifecycleBlockedError({ code: 'DISPUTED_SETTLEMENT', message: 'run termination is blocked while an economic operation is disputed' });
+assert.equal(blocked instanceof flowsafe.RunLifecycleBlockedError, true);
+assert.equal(blocked.name, 'RunLifecycleBlockedError');
+assert.equal(blocked.reason.code, 'DISPUTED_SETTLEMENT');
 const binding = sqliteUnitDatabase(openSqlite());
 const storage = doRunner.createD1Storage({ binding });
 let engineCalls = 0;
@@ -485,6 +529,28 @@ assert.equal(JSON.parse(admitted.witness.row.snapshot).status, 'pending');
 assert.equal(engineCalls, 0);
 await admitted.value.start({ inputData: {} });
 assert.equal(engineCalls, 1);
+const repairExecution = { ...execution, runId: 'packed-repair', startToken: 'repair-generation' };
+const repair = await capability.withInitialAdmission({ execution: repairExecution, attemptToken: 'repair-correlation',
+  fence: new doRunner.ExecutionFenceStore(binding), onInitialWriteAttempt() {},
+  requestContext: { app: 'retained', 'flowsafe.runProvenance': { version: 2, startToken: repairExecution.startToken, attemptToken: 'repair-correlation', resumeCounts: [] } },
+}, () => workflow.createRun({ runId: repairExecution.runId }));
+const repairRequest = { expected: repair.witness.row, execution: repairExecution, attemptToken: 'repair-correlation', nowMs: 1700000000123 };
+const repaired = await capability.terminalizeInitialAdmission(repairRequest);
+assert.equal(repaired.kind, 'terminalized');
+const repairedSnapshot = JSON.parse(repaired.row.snapshot);
+assert.equal(repairedSnapshot.status, 'failed');
+assert.equal(repairedSnapshot.error.name, 'StartOutcomeUnknown');
+assert.equal('initialAdmission' in repairedSnapshot.requestContext['flowsafe.runProvenance'], false);
+assert.equal(repairedSnapshot.requestContext.app, 'retained');
+assert.equal(repaired.row.createdAt, repair.witness.row.createdAt);
+assert.equal(repaired.row.updatedAt, '2023-11-14T22:13:20.123Z');
+assert.deepEqual(await capability.readSnapshot(repairExecution), repaired.row);
+assert.equal((await capability.terminalizeInitialAdmission(repairRequest)).kind, 'already-terminalized');
+assert.equal(engineCalls, 1);
+for (const name of ['nextLifecycleRevision', 'nextResumeCount', 'terminalStateFields', 'decodeProgressRunProvenance']) {
+  assert.equal(name in doRunner, false, name);
+  assert.equal(name in hostKit, false, name);
+}
 assert.equal(
   backgroundTasks.EXECUTION_FENCE_SUSPEND_KEY,
   'flowsafe.executionFenced',

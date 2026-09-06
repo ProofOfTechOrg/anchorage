@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { WorkflowsStorageD1 } from '@mastra/cloudflare-d1';
 import { Mastra } from '@mastra/core/mastra';
 import { RequestContext } from '@mastra/core/request-context';
 import {
@@ -28,10 +29,16 @@ import {
   FENCED_WORKFLOW_STORAGE,
   type InitialAdmissionDatabase,
   type InitialRunAdmission,
+  type InitialTerminalizationRequest,
 } from './fenced-workflow-capability.js';
 import { FencedWorkflowsStorageD1 } from './fenced-workflows-d1.js';
 import { isDefinitiveInitialAdmissionRefusal } from './initial-admission-refusal.js';
+import {
+  RUN_LIFECYCLE_CONTEXT_KEY,
+  RunLifecycleBlockedError,
+} from './run-lifecycle.js';
 import { StartIdempotencyStore } from './start-idempotency.js';
+import type { RawWorkflowSnapshot } from './workflow-snapshot-row.js';
 
 const PROVENANCE = 'flowsafe.runProvenance';
 const OWNER = { kind: 'human' as const, id: 'Alice' };
@@ -42,6 +49,7 @@ async function fixture(
     state?: ExecutionFenceState;
     prefix?: string;
     persist?: boolean;
+    shouldPersist?: () => boolean;
     prune?: (args: { snapshot: WorkflowRunState }) => WorkflowRunState;
   } = {},
 ) {
@@ -56,7 +64,8 @@ async function fixture(
     inputSchema: z.object({}),
     outputSchema: z.object({}),
     options: {
-      shouldPersistSnapshot: () => options.persist !== false,
+      shouldPersistSnapshot:
+        options.shouldPersist ?? (() => options.persist !== false),
       ...(options.prune ? { pruneSnapshot: options.prune } : {}),
     },
   })
@@ -202,6 +211,1633 @@ async function direct(
 }
 
 afterEach(() => vi.restoreAllMocks());
+
+async function terminalFixture() {
+  const h = await fixture({ keyed: true, state: 'proof-only' });
+  await direct(h, { resourceId: 'resource' });
+  const expected = await h.capability.readSnapshot(h.input.execution);
+  if (!expected) throw new Error('initial row missing');
+  const request: InitialTerminalizationRequest = {
+    expected,
+    execution: h.input.execution,
+    attemptToken: h.input.attemptToken,
+    nowMs: 1_700_000_000_123,
+  };
+  const replace = (
+    edit: (
+      snapshot: Record<string, unknown> & {
+        requestContext: Record<string, unknown> & {
+          [PROVENANCE]: Record<string, unknown> & {
+            startIdentity: {
+              owner: { id: string; kind: string };
+              target: { id: string; kind: string; threadId?: string };
+            };
+          };
+        };
+      },
+    ) => void,
+  ) => {
+    const value = JSON.parse(request.expected.snapshot);
+    edit(value);
+    const row = { ...request.expected, snapshot: JSON.stringify(value) };
+    h.sql
+      .prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?')
+      .run(row.snapshot);
+    return { ...request, expected: row };
+  };
+  return { ...h, request, replace };
+}
+
+function terminalResponse(
+  h: Awaited<ReturnType<typeof terminalFixture>>,
+  change: (result: unknown) => unknown | Promise<unknown>,
+) {
+  const prepare = h.db.prepare.bind(h.db);
+  return vi.spyOn(h.db, 'prepare').mockImplementation((sql) => {
+    const statement = prepare(sql);
+    if (sql.startsWith('UPDATE "')) {
+      const bind = statement.bind.bind(statement);
+      vi.spyOn(statement, 'bind').mockImplementation((...values) => {
+        const bound = bind(...values);
+        const all = bound.all.bind(bound);
+        vi.spyOn(bound, 'all').mockImplementation(
+          async () => change(await all()) as never,
+        );
+        return bound;
+      });
+    }
+    return statement;
+  });
+}
+
+describe('owned initial terminalization', () => {
+  describe('terminalization readback and caller capture', () => {
+    it.each([
+      'matching',
+      'changed thread',
+      'changed mode',
+    ])('classifies %s agent readback without rewriting its raw row', async (variant) => {
+      const h = await terminalFixture();
+      const request = h.replace((snapshot) => {
+        snapshot.requestContext[PROVENANCE].startIdentity = {
+          owner: OWNER,
+          target: { kind: 'agent', id: 'agent', threadId: 'thread' },
+        };
+        snapshot.requestContext[PROVENANCE].agentStart = { threaded: false };
+        snapshot.requestContext[PROVENANCE].mutationEpoch = 7;
+      });
+      const observed = h.replace((snapshot) => {
+        snapshot.status = 'running';
+        snapshot.requestContext[PROVENANCE].startIdentity = {
+          owner: OWNER,
+          target: {
+            kind: 'agent',
+            id: 'agent',
+            threadId: variant === 'changed thread' ? 'other-thread' : 'thread',
+          },
+        };
+        snapshot.requestContext[PROVENANCE].agentStart = {
+          threaded: variant === 'changed mode',
+        };
+        snapshot.requestContext[PROVENANCE].mutationEpoch = 7;
+        snapshot.requestContext[PROVENANCE].attemptToken = 'resume';
+        snapshot.requestContext[PROVENANCE].requestedBy = 'Bob';
+        snapshot.requestContext[PROVENANCE].resumeCounts = [['gate', 1]];
+        delete snapshot.requestContext[PROVENANCE].initialAdmission;
+      }).expected;
+      const before = h.rows();
+      const calls = vi.spyOn(h.db, 'prepare');
+      const result = await h.capability.terminalizeInitialAdmission(request);
+      expect(result.kind).toBe(
+        variant === 'matching' ? 'progressed' : 'conflict',
+      );
+      expect(result).toEqual({
+        kind: variant === 'matching' ? 'progressed' : 'conflict',
+        row: observed,
+      });
+      expect(h.rows()).toEqual(before);
+      expect(calls).toHaveBeenCalledTimes(2);
+      expect(calls.mock.calls[0]?.[0]).toMatch(/^UPDATE /);
+      expect(calls.mock.calls[1]?.[0]).toMatch(/^SELECT /);
+      expect(h.effects()).toBe(0);
+    });
+
+    it.each([
+      ['zero', 'cancelled', false],
+      ['zero', 'cancelled', true],
+      ['zero', 'timed_out', false],
+      ['zero', 'timed_out', true],
+      ['throw', 'cancelled', false],
+      ['throw', 'cancelled', true],
+      ['throw', 'timed_out', false],
+      ['throw', 'timed_out', true],
+    ] as const)('returns actual %s %s completed=%s readback cleanup without retry', async (response, status, complete) => {
+      const h = await terminalFixture();
+      const request = h.replace((snapshot) => {
+        snapshot.requestContext[RUN_LIFECYCLE_CONTEXT_KEY] = {
+          version: 1,
+          revision: 2,
+          scheduleDispatch: {
+            scheduleId: 'old-schedule',
+            dispatchId: 'old-dispatch',
+          },
+          transitionIntent: {
+            status: 'cancelled',
+            requestedAt: 1,
+            replayPrincipals: [OWNER],
+          },
+        };
+      });
+      const observed = h.replace((snapshot) => {
+        snapshot.status = status;
+        snapshot.timestamp = 456;
+        delete snapshot.requestContext[PROVENANCE].initialAdmission;
+        snapshot.requestContext[PROVENANCE].attemptToken = 'resume';
+        snapshot.requestContext[PROVENANCE].requestedBy = 'Bob';
+        snapshot.requestContext[PROVENANCE].resumeCounts = [['gate', 2]];
+        snapshot.requestContext[RUN_LIFECYCLE_CONTEXT_KEY] = {
+          version: 1,
+          revision: 9,
+          scheduleDispatch: {
+            scheduleId: 'current-schedule',
+            dispatchId: 'current-dispatch',
+          },
+          terminal: {
+            status,
+            error: {
+              code: status === 'cancelled' ? 'CANCELLED' : 'TIMED_OUT',
+              message:
+                status === 'cancelled'
+                  ? 'run was cancelled'
+                  : 'run deadline expired',
+            },
+            transitionedAt: 456,
+            replayPrincipals: [{ kind: 'service', id: 'current-replay' }],
+            ...(complete ? { cleanupCompletedAt: 0 } : {}),
+          },
+        };
+      }).expected;
+      const before = h.rows();
+      const participants = () => [
+        h.sql.prepare('SELECT * FROM flowsafe_execution_fence').all(),
+        h.sql.prepare('SELECT * FROM flowsafe_start_idempotency').all(),
+      ];
+      const participantsBefore = participants();
+      const fault = new Error('UPDATE response lost before progress readback');
+      const calls = terminalResponse(h, (result) => {
+        if (response === 'throw') throw fault;
+        return result;
+      });
+      const outcome = await h.capability
+        .terminalizeInitialAdmission(request)
+        .catch((error: unknown) => error);
+      expect(outcome).toEqual({
+        kind: 'progressed',
+        row: observed,
+        cleanup: {
+          revision: 9,
+          status,
+          cleanupCompleted: complete,
+          scheduleDispatch: {
+            scheduleId: 'current-schedule',
+            dispatchId: 'current-dispatch',
+          },
+        },
+      });
+      expect(h.rows()).toEqual(before);
+      expect(participants()).toEqual(participantsBefore);
+      expect(calls).toHaveBeenCalledTimes(2);
+      expect(calls.mock.calls[0]?.[0]).toMatch(/^UPDATE /);
+      expect(calls.mock.calls[1]?.[0]).toMatch(/^SELECT /);
+      expect(h.effects()).toBe(0);
+    });
+
+    it.each([
+      'pending',
+      'other generation',
+    ])('retains the original fault for %s thrown readback', async (variant) => {
+      const h = await terminalFixture();
+      h.replace((snapshot) => {
+        snapshot.changed = true;
+        delete snapshot.requestContext[PROVENANCE].initialAdmission;
+        if (variant === 'other generation') {
+          snapshot.status = 'running';
+          snapshot.requestContext[PROVENANCE].startToken = 'other-generation';
+        }
+      });
+      const before = h.rows();
+      const fault = new Error('original nonconvergent UPDATE fault');
+      const calls = terminalResponse(h, () => {
+        throw fault;
+      });
+      const outcome = await h.capability
+        .terminalizeInitialAdmission(h.request)
+        .catch((error: unknown) => error);
+      expect(outcome).toBeInstanceOf(ExecutionFenceUnreadableError);
+      if (!(outcome instanceof ExecutionFenceUnreadableError))
+        throw new Error('expected original operation uncertainty');
+      expect(outcome).toMatchObject({
+        status: 503,
+        message: 'initial admission cannot be terminalized',
+      });
+      expect(outcome.cause).toBe(fault);
+      expect(h.rows()).toEqual(before);
+      expect(calls).toHaveBeenCalledTimes(2);
+      expect(calls.mock.calls[0]?.[0]).toMatch(/^UPDATE /);
+      expect(calls.mock.calls[1]?.[0]).toMatch(/^SELECT /);
+    });
+
+    it.each([
+      'changed intent',
+      'terminal lifecycle',
+    ])('keeps %s pending lifecycle observations as conflict', async (variant) => {
+      const h = await terminalFixture();
+      const request = h.replace((snapshot) => {
+        snapshot.requestContext[RUN_LIFECYCLE_CONTEXT_KEY] = {
+          version: 1,
+          revision: 2,
+          transitionIntent: {
+            status: 'cancelled',
+            requestedAt: 1,
+            replayPrincipals: [OWNER],
+          },
+        };
+      });
+      const observed = h.replace((snapshot) => {
+        snapshot.requestContext[RUN_LIFECYCLE_CONTEXT_KEY] = {
+          version: 1,
+          revision: 4,
+          ...(variant === 'changed intent'
+            ? {
+                transitionIntent: {
+                  status: 'timed_out',
+                  requestedAt: 2,
+                  replayPrincipals: [{ kind: 'service', id: 'later' }],
+                },
+              }
+            : {
+                terminal: {
+                  status: 'cancelled',
+                  error: { code: 'CANCELLED', message: 'run was cancelled' },
+                  transitionedAt: 2,
+                  replayPrincipals: [OWNER],
+                },
+              }),
+        };
+      }).expected;
+      const before = h.rows();
+      const calls = vi.spyOn(h.db, 'prepare');
+      const result = await h.capability.terminalizeInitialAdmission(request);
+      expect(result).toEqual({ kind: 'conflict', row: observed });
+      expect(h.rows()).toEqual(before);
+      expect(calls).toHaveBeenCalledTimes(2);
+      expect(calls.mock.calls[0]?.[0]).toMatch(/^UPDATE /);
+      expect(calls.mock.calls[1]?.[0]).toMatch(/^SELECT /);
+    });
+
+    it.each([
+      false,
+      null,
+      'true',
+      0,
+    ])('refuses malformed admission marker %j in nonpending readback', async (marker) => {
+      const h = await terminalFixture();
+      h.replace((snapshot) => {
+        snapshot.status = 'success';
+        snapshot.requestContext[PROVENANCE].initialAdmission = marker;
+      });
+      const before = h.rows();
+      const calls = vi.spyOn(h.db, 'prepare');
+      const outcome = await h.capability
+        .terminalizeInitialAdmission(h.request)
+        .catch((error: unknown) => error);
+      expect(outcome).toBeInstanceOf(ExecutionFenceUnreadableError);
+      expect(outcome).toMatchObject({
+        status: 503,
+        message: 'initial admission cannot be terminalized',
+        cause: expect.any(Error),
+      });
+      expect(h.rows()).toEqual(before);
+      expect(calls).toHaveBeenCalledTimes(2);
+      expect(calls.mock.calls[0]?.[0]).toMatch(/^UPDATE /);
+      expect(calls.mock.calls[1]?.[0]).toMatch(/^SELECT /);
+    });
+
+    it('ignores SELECT changes metadata when returning an unmarked raw progress row', async () => {
+      const h = await terminalFixture();
+      const observed = h.replace((snapshot) => {
+        snapshot.status = 'running';
+        delete snapshot.requestContext[PROVENANCE].initialAdmission;
+      }).expected;
+      const before = h.rows();
+      let selectResponses = 0;
+      const prepare = h.db.prepare.bind(h.db);
+      const calls = vi.spyOn(h.db, 'prepare').mockImplementation((sql) => {
+        const statement = prepare(sql);
+        if (sql.startsWith('SELECT ')) {
+          const bind = statement.bind.bind(statement);
+          vi.spyOn(statement, 'bind').mockImplementation((...values) => {
+            const bound = bind(...values);
+            const all = bound.all.bind(bound);
+            vi.spyOn(bound, 'all').mockImplementation(async () => {
+              const result = await all();
+              selectResponses += 1;
+              return { ...result, meta: { changes: 77 } } as never;
+            });
+            return bound;
+          });
+        }
+        return statement;
+      });
+      const result = await h.capability.terminalizeInitialAdmission(h.request);
+      expect(result).toEqual({ kind: 'progressed', row: observed });
+      expect(selectResponses).toBe(1);
+      expect(h.rows()).toEqual(before);
+      expect(calls).toHaveBeenCalledTimes(2);
+      expect(calls.mock.calls[0]?.[0]).toMatch(/^UPDATE /);
+      expect(calls.mock.calls[1]?.[0]).toMatch(/^SELECT /);
+    });
+
+    it.each([
+      'request.expected',
+      'request.execution',
+      'request.attemptToken',
+      'request.nowMs',
+      'expected.tablePrefix',
+      'expected.workflowId',
+      'expected.runId',
+      'expected.resourceId',
+      'expected.snapshot',
+      'expected.createdAt',
+      'expected.updatedAt',
+      'execution.tablePrefix',
+      'execution.workflowId',
+      'execution.runId',
+      'execution.startToken',
+    ])('preserves first throwing %s getter on the default domain without SQL', async (field) => {
+      const h = await terminalFixture();
+      const request = {
+        ...h.request,
+        expected: { ...h.request.expected },
+        execution: { ...h.request.execution },
+      };
+      const fault = new Error(`caller fault at ${field}`);
+      const getter = vi.fn(() => {
+        throw fault;
+      });
+      const [part, key] = field.split('.');
+      if (!key) throw new Error('caller field missing');
+      const target =
+        part === 'request'
+          ? request
+          : part === 'expected'
+            ? request.expected
+            : request.execution;
+      Object.defineProperty(target, key, { enumerable: true, get: getter });
+      const before = h.rows();
+      const prepare = vi.spyOn(h.db, 'prepare');
+      const batch = vi.spyOn(h.db, 'batch');
+      const outcome = await h.capability
+        .terminalizeInitialAdmission(request)
+        .catch((error: unknown) => error);
+      expect(outcome).toBe(fault);
+      expect(getter).toHaveBeenCalledTimes(1);
+      expect(prepare).not.toHaveBeenCalled();
+      expect(batch).not.toHaveBeenCalled();
+      expect(h.rows()).toEqual(before);
+      expect(h.effects()).toBe(0);
+    });
+
+    it('captures every default-domain caller getter once before a held UPDATE and ignores later faults', async () => {
+      const h = await terminalFixture();
+      const reads = new Map<string, number>();
+      const fault = new Error('caller reread after capture');
+      let late = false;
+      function observed<T extends object>(source: T, label: string): T {
+        const copy = { ...source };
+        for (const key of Object.keys(source))
+          Object.defineProperty(copy, key, {
+            enumerable: true,
+            get() {
+              const name = `${label}.${key}`;
+              reads.set(name, (reads.get(name) ?? 0) + 1);
+              if (late) throw fault;
+              return source[key as keyof T];
+            },
+          });
+        return copy;
+      }
+      const request = observed(
+        {
+          ...h.request,
+          expected: observed({ ...h.request.expected }, 'expected'),
+          execution: observed({ ...h.request.execution }, 'execution'),
+        },
+        'request',
+      );
+      let enter = () => {};
+      let release = () => {};
+      const entered = new Promise<void>((resolve) => {
+        enter = resolve;
+      });
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const calls = terminalResponse(h, async (result) => {
+        enter();
+        await held;
+        return result;
+      });
+      const operation = h.capability.terminalizeInitialAdmission(request);
+      try {
+        await Promise.race([
+          entered,
+          operation.then(() => {
+            throw new Error('UPDATE did not remain held');
+          }),
+        ]);
+        expect(reads.size).toBe(15);
+        expect([...reads.values()]).toEqual(new Array(15).fill(1));
+        late = true;
+        release();
+        const result = await operation;
+        expect(result.kind).toBe('terminalized');
+        if (result.kind === 'conflict') throw new Error('unexpected conflict');
+        const snapshot = JSON.parse(result.row.snapshot);
+        const original = JSON.parse(h.request.expected.snapshot);
+        const provenance = { ...original.requestContext[PROVENANCE] };
+        delete provenance.initialAdmission;
+        expect(snapshot).toEqual({
+          ...original,
+          status: 'failed',
+          error: {
+            name: 'StartOutcomeUnknown',
+            message:
+              'Start interrupted before a durable execution outcome was recorded; external effects may have occurred. This run will not be automatically re-executed.',
+          },
+          requestContext: {
+            ...original.requestContext,
+            [PROVENANCE]: provenance,
+          },
+          timestamp: h.request.nowMs,
+        });
+        expect(result.row).toEqual({
+          ...h.request.expected,
+          snapshot: result.row.snapshot,
+          updatedAt: new Date(h.request.nowMs).toISOString(),
+        });
+        expect(result).not.toHaveProperty('cleanup');
+        expect(calls).toHaveBeenCalledTimes(1);
+        expect(calls.mock.calls[0]?.[0]).toMatch(/^UPDATE /);
+        expect(calls.mock.results[0]?.value.bind).toHaveBeenCalledWith(
+          result.row.snapshot,
+          result.row.updatedAt,
+          h.request.expected.workflowId,
+          h.request.expected.runId,
+          h.request.expected.snapshot,
+          h.request.expected.createdAt,
+          h.request.expected.updatedAt,
+          h.request.expected.resourceId,
+        );
+        expect(h.rows()).toEqual([
+          expect.objectContaining({
+            workflow_name: h.request.expected.workflowId,
+            run_id: h.request.expected.runId,
+            resourceId: h.request.expected.resourceId,
+            createdAt: h.request.expected.createdAt,
+            updatedAt: result.row.updatedAt,
+            snapshot: result.row.snapshot,
+          }),
+        ]);
+        expect([...reads.values()]).toEqual(new Array(15).fill(1));
+        expect(h.effects()).toBe(0);
+      } finally {
+        release();
+        await Promise.allSettled([operation]);
+      }
+    });
+  });
+
+  it.each([
+    ['identity', null, 'execution identity must be an object'],
+    ['identity', [], 'execution identity must be an object'],
+    [
+      'tablePrefix',
+      null,
+      'tablePrefix is not valid for this execution identity',
+    ],
+    [
+      'tablePrefix',
+      'bad-prefix',
+      'tablePrefix is not valid for this execution identity',
+    ],
+    ['tablePrefix', 42, 'tablePrefix is not valid for this execution identity'],
+    ['workflowId', '', 'workflowId must be a URL-path-safe identifier'],
+    ['runId', 'bad/run', 'runId must be a URL-path-safe identifier'],
+    ['startToken', '', 'startToken must be a URL-path-safe identifier'],
+  ] as const)('preserves the field-specific %s identity400 for %j before stored-data validation', async (field, value, message) => {
+    const h = await terminalFixture();
+    const before = h.rows();
+    const prepare = vi.spyOn(h.db, 'prepare');
+    const batch = vi.spyOn(h.db, 'batch');
+    const error = await h.capability
+      .terminalizeInitialAdmission({
+        ...h.request,
+        expected: { ...h.request.expected, snapshot: '{' },
+        execution:
+          field === 'identity'
+            ? value
+            : { ...h.request.execution, [field]: value },
+      } as InitialTerminalizationRequest)
+      .catch((error: unknown) => error);
+    expect(error).toBeInstanceOf(InvalidExecutionIdentityError);
+    if (!(error instanceof InvalidExecutionIdentityError))
+      throw new Error('expected input error');
+    expect(error.constructor).toBe(InvalidExecutionIdentityError);
+    expect(error.reason).toEqual({ code: 'INVALID_EXECUTION_IDENTITY' });
+    expect(error).toMatchObject({
+      name: 'InvalidExecutionIdentityError',
+      status: 400,
+      reason: { code: 'INVALID_EXECUTION_IDENTITY' },
+      message,
+    });
+    expect(isDefinitiveInitialAdmissionRefusal(error, h.input.execution)).toBe(
+      false,
+    );
+    expect(prepare).not.toHaveBeenCalled();
+    expect(batch).not.toHaveBeenCalled();
+    expect(h.rows()).toEqual(before);
+    expect(h.effects()).toBe(0);
+  });
+
+  it.each([
+    ['pending', false],
+    ['pending', null],
+    ['pending', 'true'],
+    ['pending', 0],
+    ['success', false],
+    ['success', null],
+    ['success', 'true'],
+    ['success', 0],
+  ] as const)('refuses malformed admission marker in expected %s observation: %j', async (status, marker) => {
+    const h = await terminalFixture();
+    const request = h.replace((snapshot) => {
+      snapshot.status = status;
+      snapshot.requestContext[PROVENANCE].initialAdmission = marker;
+    });
+    const before = h.rows();
+    const prepare = vi.spyOn(h.db, 'prepare');
+    const batch = vi.spyOn(h.db, 'batch');
+    const error = await h.capability
+      .terminalizeInitialAdmission(request)
+      .catch((error: unknown) => error);
+    expect(error).toBeInstanceOf(ExecutionFenceUnreadableError);
+    expect(error).toMatchObject({
+      name: 'ExecutionFenceUnreadableError',
+      status: 503,
+      reason: { code: 'EXECUTION_FENCE_UNREADABLE' },
+      message: 'initial admission cannot be terminalized',
+      cause: expect.any(Error),
+    });
+    expect(isDefinitiveInitialAdmissionRefusal(error, h.input.execution)).toBe(
+      false,
+    );
+    expect(prepare).not.toHaveBeenCalled();
+    expect(batch).not.toHaveBeenCalled();
+    expect(h.rows()).toEqual(before);
+    expect(h.effects()).toBe(0);
+  });
+
+  it.each([
+    'before',
+    'after',
+  ] as const)('recovers later progress after throwing %s actual UPDATE commit', async (phase) => {
+    const h = await terminalFixture();
+    const initial = h.rows();
+    const fault = new Error(`${phase} actual commit response loss`);
+    let observed: RawWorkflowSnapshot | undefined;
+    let laterRows: unknown[] = [];
+    let committed = 0;
+    const prepare = h.db.prepare.bind(h.db);
+    const calls = vi.spyOn(h.db, 'prepare').mockImplementation((sql) => {
+      const statement = prepare(sql);
+      if (sql.startsWith('UPDATE "')) {
+        const bind = statement.bind.bind(statement);
+        vi.spyOn(statement, 'bind').mockImplementation((...values) => {
+          const bound = bind(...values);
+          const all = bound.all.bind(bound);
+          vi.spyOn(bound, 'all').mockImplementation(async () => {
+            if (phase === 'after') {
+              const response = await all();
+              expect(response.results).toHaveLength(1);
+              expect(h.rows()).toEqual([
+                expect.objectContaining({
+                  snapshot: values[0],
+                  updatedAt: values[1],
+                }),
+              ]);
+              committed += 1;
+            } else {
+              expect(h.rows()).toEqual(initial);
+            }
+            const row = h.replace((snapshot) => {
+              snapshot.status = 'running';
+              snapshot.timestamp = 456;
+              snapshot.requestContext[PROVENANCE].attemptToken = 'resume';
+              snapshot.requestContext[PROVENANCE].requestedBy = 'Bob';
+              snapshot.requestContext[PROVENANCE].resumeCounts = [['gate', 1]];
+              delete snapshot.requestContext[PROVENANCE].initialAdmission;
+            }).expected;
+            observed = { ...row, updatedAt: new Date(456).toISOString() };
+            h.sql
+              .prepare('UPDATE mastra_workflow_snapshot SET updatedAt = ?')
+              .run(observed.updatedAt);
+            laterRows = h.rows();
+            throw fault;
+          });
+          return bound;
+        });
+      }
+      return statement;
+    });
+    const result = await h.capability
+      .terminalizeInitialAdmission(h.request)
+      .catch((error: unknown) => error);
+    expect(result).toEqual({ kind: 'progressed', row: observed });
+    expect(committed).toBe(phase === 'after' ? 1 : 0);
+    expect(observed).toBeDefined();
+    expect(h.rows()).toEqual(laterRows);
+    expect(calls).toHaveBeenCalledTimes(2);
+    expect(calls.mock.calls[0]?.[0]).toMatch(/^UPDATE /);
+    expect(calls.mock.calls[1]?.[0]).toMatch(/^SELECT /);
+    expect(h.effects()).toBe(0);
+  });
+
+  it.each([
+    ['cancelled', 'throw'],
+    ['cancelled', 'zero'],
+    ['cancelled', 'returned'],
+    ['timed_out', 'throw'],
+    ['timed_out', 'zero'],
+    ['timed_out', 'returned'],
+  ] as const)('converges exact stored %s intent after %s response and explicit retry with incomplete cleanup', async (status, response) => {
+    const h = await terminalFixture();
+    const principals = [{ kind: 'service', id: 'original-replay' }];
+    const scheduleDispatch = {
+      scheduleId: 'intent-schedule',
+      dispatchId: 'intent-dispatch',
+    };
+    const economicOperations = [{ id: 'economic', settlementState: 'settled' }];
+    const request = h.replace((snapshot) => {
+      snapshot.requestContext[RUN_LIFECYCLE_CONTEXT_KEY] = {
+        version: 1,
+        revision: 4,
+        deadlineAt: 123,
+        scheduleDispatch,
+        economicOperations,
+        transitionIntent: {
+          status,
+          requestedAt: 1,
+          replayPrincipals: principals,
+        },
+      };
+    });
+    const participants = () => [
+      h.sql.prepare('SELECT * FROM flowsafe_execution_fence').all(),
+      h.sql.prepare('SELECT * FROM flowsafe_start_idempotency').all(),
+    ];
+    const before = participants();
+    const cardinalities: number[] = [];
+    const fault = new Error('stored intent response lost after commit');
+    const calls = terminalResponse(h, (raw) => {
+      const result = raw as { results: unknown[] };
+      cardinalities.push(result.results.length);
+      if (cardinalities.length === 1) {
+        expect(result.results).toHaveLength(1);
+        if (response === 'throw') throw fault;
+        if (response === 'zero') return { results: [], meta: { changes: 0 } };
+      }
+      return raw;
+    });
+    const result = await h.capability.terminalizeInitialAdmission(request);
+    expect(result.kind).toBe(
+      response === 'returned' ? 'terminalized' : 'already-terminalized',
+    );
+    if (result.kind === 'conflict') throw new Error('unexpected conflict');
+    const original = JSON.parse(request.expected.snapshot);
+    const provenance = { ...original.requestContext[PROVENANCE] };
+    delete provenance.initialAdmission;
+    expect(JSON.parse(result.row.snapshot)).toEqual({
+      ...original,
+      status,
+      error: {
+        name: status === 'cancelled' ? 'RunCancelledError' : 'RunTimedOutError',
+        message:
+          status === 'cancelled' ? 'run was cancelled' : 'run deadline expired',
+      },
+      requestContext: {
+        ...original.requestContext,
+        [PROVENANCE]: provenance,
+        [RUN_LIFECYCLE_CONTEXT_KEY]: {
+          version: 1,
+          revision: 5,
+          deadlineAt: 123,
+          scheduleDispatch,
+          economicOperations,
+          terminal: {
+            status,
+            error: {
+              code: status === 'cancelled' ? 'CANCELLED' : 'TIMED_OUT',
+              message:
+                status === 'cancelled'
+                  ? 'run was cancelled'
+                  : 'run deadline expired',
+            },
+            transitionedAt: request.nowMs,
+            replayPrincipals: principals,
+          },
+        },
+      },
+      timestamp: request.nowMs,
+    });
+    expect(result.row).toEqual({
+      ...request.expected,
+      snapshot: result.row.snapshot,
+      updatedAt: new Date(request.nowMs).toISOString(),
+    });
+    expect(result.cleanup).toEqual({
+      revision: 5,
+      status,
+      cleanupCompleted: false,
+      scheduleDispatch,
+    });
+    expect(calls).toHaveBeenCalledTimes(response === 'returned' ? 1 : 2);
+    expect(calls.mock.calls[0]?.[0]).toMatch(/^UPDATE /);
+    if (response !== 'returned')
+      expect(calls.mock.calls[1]?.[0]).toMatch(/^SELECT /);
+    const committedRows = h.rows();
+    expect(committedRows).toEqual([
+      {
+        workflow_name: result.row.workflowId,
+        run_id: result.row.runId,
+        snapshot: result.row.snapshot,
+        resourceId: result.row.resourceId,
+        createdAt: result.row.createdAt,
+        updatedAt: result.row.updatedAt,
+      },
+    ]);
+    calls.mockClear();
+    const retry = await h.capability.terminalizeInitialAdmission(request);
+    expect(retry).toEqual({ ...result, kind: 'already-terminalized' });
+    expect(cardinalities).toEqual([1, 0]);
+    expect(calls).toHaveBeenCalledTimes(2);
+    expect(calls.mock.calls[0]?.[0]).toMatch(/^UPDATE /);
+    expect(calls.mock.calls[1]?.[0]).toMatch(/^SELECT /);
+    expect(h.rows()).toEqual(committedRows);
+    expect(participants()).toEqual(before);
+    expect(h.effects()).toBe(0);
+  });
+
+  it.each([
+    'unknown',
+    'cancelled',
+    'timed_out',
+    'progressed',
+    'conflict',
+    'invalid',
+    'unreadable',
+  ] as const)('never enters engine, adapter upsert/delete, side tables or snapshot callbacks for %s terminalization', async (variant) => {
+    const shouldPersist = vi.fn(() => true);
+    const prune = vi.fn(
+      ({ snapshot }: { snapshot: WorkflowRunState }) => snapshot,
+    );
+    const h = await fixture({
+      keyed: true,
+      state: 'proof-only',
+      shouldPersist,
+      prune,
+    });
+    const { value: run, witness } = await h.admit();
+    expect(shouldPersist).toHaveBeenCalled();
+    expect(prune).toHaveBeenCalled();
+    const snapshot = JSON.parse(witness.row.snapshot);
+    if (variant === 'cancelled' || variant === 'timed_out') {
+      snapshot.requestContext[RUN_LIFECYCLE_CONTEXT_KEY] = {
+        version: 1,
+        revision: 1,
+        transitionIntent: {
+          status: variant,
+          requestedAt: 1,
+          replayPrincipals: [OWNER],
+        },
+      };
+    }
+    const expected = { ...witness.row, snapshot: JSON.stringify(snapshot) };
+    if (variant === 'progressed') snapshot.status = 'running';
+    if (variant === 'conflict') snapshot.changed = true;
+    h.sql
+      .prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?')
+      .run(JSON.stringify(snapshot));
+    const request: InitialTerminalizationRequest = {
+      expected:
+        variant === 'unreadable' ? { ...expected, snapshot: '{' } : expected,
+      execution: h.input.execution,
+      attemptToken: variant === 'invalid' ? '' : h.input.attemptToken,
+      nowMs: 1_700_000_000_123,
+    };
+    const before = h.rows();
+    const participants = () => [
+      h.sql.prepare('SELECT * FROM flowsafe_execution_fence').all(),
+      h.sql.prepare('SELECT * FROM flowsafe_start_idempotency').all(),
+    ];
+    const participantsBefore = participants();
+    const forbidden = vi.fn(() => {
+      throw new Error('forbidden terminalization entry');
+    });
+    shouldPersist.mockClear().mockImplementation(forbidden);
+    prune.mockClear().mockImplementation(forbidden);
+    const sentinels = [
+      forbidden,
+      vi.spyOn(h.workflow, 'createRun').mockImplementation(forbidden),
+      vi.spyOn(run, 'start').mockImplementation(forbidden),
+      vi.spyOn(run, 'resume').mockImplementation(forbidden),
+      vi
+        .spyOn(h.domain, 'persistWorkflowSnapshot')
+        .mockImplementation(forbidden),
+      vi
+        .spyOn(WorkflowsStorageD1.prototype, 'persistWorkflowSnapshot')
+        .mockImplementation(forbidden),
+      vi.spyOn(h.domain, 'deleteWorkflowRunById').mockImplementation(forbidden),
+      vi
+        .spyOn(WorkflowsStorageD1.prototype, 'deleteWorkflowRunById')
+        .mockImplementation(forbidden),
+      vi.spyOn(h.db, 'batch').mockImplementation(forbidden),
+      shouldPersist,
+      prune,
+    ];
+    const prepare = h.db.prepare.bind(h.db);
+    const calls = vi.spyOn(h.db, 'prepare').mockImplementation((sql) => {
+      if (
+        !/^(UPDATE|SELECT) /.test(sql) ||
+        !sql.includes('"mastra_workflow_snapshot"') ||
+        /flowsafe_|ON CONFLICT|PRAGMA/.test(sql)
+      )
+        forbidden();
+      return prepare(sql);
+    });
+    const result = await h.capability
+      .terminalizeInitialAdmission(request)
+      .catch((error: unknown) => error);
+    for (const sentinel of sentinels) expect(sentinel).not.toHaveBeenCalled();
+    expect(participants()).toEqual(participantsBefore);
+    expect(h.effects()).toBe(0);
+    expect(isDefinitiveInitialAdmissionRefusal(result, h.input.execution)).toBe(
+      false,
+    );
+    if (variant === 'invalid' || variant === 'unreadable') {
+      expect(result).toBeInstanceOf(
+        variant === 'invalid'
+          ? InvalidExecutionIdentityError
+          : ExecutionFenceUnreadableError,
+      );
+      expect(calls).not.toHaveBeenCalled();
+      expect(h.rows()).toEqual(before);
+    } else if (variant === 'progressed' || variant === 'conflict') {
+      expect(result).toMatchObject({ kind: variant });
+      expect(calls).toHaveBeenCalledTimes(2);
+      expect(h.rows()).toEqual(before);
+    } else {
+      expect(result).toMatchObject({ kind: 'terminalized' });
+      expect(calls).toHaveBeenCalledTimes(1);
+      expect(h.rows()).toEqual([
+        expect.objectContaining({
+          snapshot: expect.stringContaining(
+            `"status":"${variant === 'unknown' ? 'failed' : variant}"`,
+          ),
+        }),
+      ]);
+    }
+  });
+
+  it('preserves the initiating agent mode, identity and original epoch', async () => {
+    const h = await terminalFixture();
+    const request = h.replace((snapshot) => {
+      snapshot.requestContext[PROVENANCE].startIdentity = {
+        owner: OWNER,
+        target: { kind: 'agent', id: 'agent', threadId: 'thread' },
+      };
+      snapshot.requestContext[PROVENANCE].agentStart = { threaded: false };
+      snapshot.requestContext[PROVENANCE].mutationEpoch = 7;
+    });
+    const result = await h.capability.terminalizeInitialAdmission(request);
+    if (result.kind === 'conflict') throw new Error('unexpected conflict');
+    expect(
+      JSON.parse(result.row.snapshot).requestContext[PROVENANCE],
+    ).toMatchObject({
+      startIdentity: {
+        owner: OWNER,
+        target: { kind: 'agent', id: 'agent', threadId: 'thread' },
+      },
+      agentStart: { threaded: false },
+      mutationEpoch: 7,
+    });
+  });
+  it('preserves current lifecycle-terminal precedence and cleanup on progress readback', async () => {
+    const h = await terminalFixture();
+    h.replace((snapshot) => {
+      snapshot.status = 'success';
+      snapshot.requestContext[RUN_LIFECYCLE_CONTEXT_KEY] = {
+        version: 1,
+        revision: 9,
+        scheduleDispatch: { scheduleId: 'schedule', dispatchId: 'dispatch' },
+        terminal: {
+          status: 'timed_out',
+          error: { code: 'TIMED_OUT', message: 'run deadline expired' },
+          transitionedAt: 1,
+          replayPrincipals: [OWNER],
+          cleanupCompletedAt: 0,
+        },
+      };
+    });
+    expect(
+      await h.capability.terminalizeInitialAdmission(h.request),
+    ).toMatchObject({
+      kind: 'progressed',
+      cleanup: {
+        revision: 9,
+        status: 'timed_out',
+        cleanupCompleted: true,
+        scheduleDispatch: { scheduleId: 'schedule', dispatchId: 'dispatch' },
+      },
+    });
+  });
+  it.each([
+    'zero',
+    'throw',
+  ] as const)('keeps malformed %s readback unreadable with the original operation cause', async (mode) => {
+    const h = await terminalFixture();
+    const fault = new Error('original write fault');
+    terminalResponse(h, () => {
+      h.sql
+        .prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?')
+        .run('{');
+      if (mode === 'throw') throw fault;
+      return { results: [], meta: { changes: 0 } };
+    });
+    const error = await h.capability
+      .terminalizeInitialAdmission(h.request)
+      .catch((error: unknown) => error);
+    expect(error).toMatchObject({
+      status: 503,
+      message: 'initial admission cannot be terminalized',
+      cause: mode === 'throw' ? fault : expect.any(Error),
+    });
+    expect(isDefinitiveInitialAdmissionRefusal(error, h.input.execution)).toBe(
+      false,
+    );
+  });
+  it('derives unknown-effects failure solely from the expected initial row', async () => {
+    const h = await terminalFixture();
+    const request = h.replace((snapshot) => {
+      snapshot.result = { stale: true };
+      snapshot.error = { message: 'stale' };
+      snapshot.steps = { retained: { output: 'λ' } };
+      snapshot.requestContext[PROVENANCE].unknown = { keep: true };
+      snapshot.requestContext[RUN_LIFECYCLE_CONTEXT_KEY] = {
+        version: 1,
+        revision: Number.MAX_SAFE_INTEGER,
+        economicOperations: [{ id: 'economic', settlementState: 'disputed' }],
+      };
+    });
+    const participants = () => [
+      h.sql.prepare('SELECT * FROM flowsafe_execution_fence').all(),
+      h.sql.prepare('SELECT * FROM flowsafe_start_idempotency').all(),
+    ];
+    const before = participants();
+    const prepare = vi.spyOn(h.db, 'prepare');
+    const batch = vi.spyOn(h.db, 'batch');
+    const result = await h.capability.terminalizeInitialAdmission({
+      ...request,
+      requestedStatus: 'cancelled',
+      failedSnapshot: { status: 'success' },
+    } as InitialTerminalizationRequest);
+    expect(result.kind).toBe('terminalized');
+    if (result.kind === 'conflict') throw new Error('unexpected conflict');
+    const snapshot = JSON.parse(result.row.snapshot);
+    expect(snapshot).toMatchObject({
+      status: 'failed',
+      runId: 'run',
+      error: {
+        name: 'StartOutcomeUnknown',
+        message:
+          'Start interrupted before a durable execution outcome was recorded; external effects may have occurred. This run will not be automatically re-executed.',
+      },
+      activePaths: [],
+      activeStepsPath: {},
+      suspendedPaths: {},
+      waitingPaths: {},
+      resumeLabels: {},
+      steps: { retained: { output: 'λ' } },
+      timestamp: request.nowMs,
+    });
+    expect(snapshot).not.toHaveProperty('result');
+    expect(snapshot.error).not.toHaveProperty('stack');
+    const original = JSON.parse(request.expected.snapshot).requestContext;
+    const expectedContext = {
+      ...original,
+      [PROVENANCE]: { ...original[PROVENANCE] },
+    };
+    delete expectedContext[PROVENANCE].initialAdmission;
+    expect(snapshot.requestContext).toEqual(expectedContext);
+    expect(result).not.toHaveProperty('cleanup');
+    expect(result.row).toMatchObject({
+      resourceId: request.expected.resourceId,
+      createdAt: request.expected.createdAt,
+      updatedAt: new Date(request.nowMs).toISOString(),
+    });
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(prepare.mock.calls[0]?.[0]).toMatch(/^UPDATE /);
+    expect(batch).not.toHaveBeenCalled();
+    expect(participants()).toEqual(before);
+    expect(h.effects()).toBe(0);
+  });
+
+  it.each([
+    'cancelled',
+    'timed_out',
+  ] as const)('honors stored %s intent without new caller authority', async (status) => {
+    const h = await terminalFixture();
+    const principals = [{ kind: 'service', id: 'original' }];
+    const request = h.replace((snapshot) => {
+      snapshot.requestContext[RUN_LIFECYCLE_CONTEXT_KEY] = {
+        version: 1,
+        revision: Number.MAX_SAFE_INTEGER - 1,
+        deadlineAt: 123,
+        scheduleDispatch: { scheduleId: 'schedule', dispatchId: 'dispatch' },
+        economicOperations: [{ id: 'economic', settlementState: 'settled' }],
+        transitionIntent: {
+          status,
+          requestedAt: 1,
+          replayPrincipals: principals,
+        },
+      };
+    });
+    const result = await h.capability.terminalizeInitialAdmission(request);
+    expect(result.kind).toBe('terminalized');
+    if (result.kind === 'conflict') throw new Error('unexpected conflict');
+    const snapshot = JSON.parse(result.row.snapshot);
+    expect(snapshot.status).toBe(status);
+    expect(snapshot.error).toEqual({
+      name: status === 'cancelled' ? 'RunCancelledError' : 'RunTimedOutError',
+      message:
+        status === 'cancelled' ? 'run was cancelled' : 'run deadline expired',
+    });
+    expect(snapshot.requestContext[PROVENANCE]).not.toHaveProperty(
+      'initialAdmission',
+    );
+    const lifecycle = snapshot.requestContext[RUN_LIFECYCLE_CONTEXT_KEY];
+    expect(lifecycle).not.toHaveProperty('transitionIntent');
+    expect(lifecycle).toMatchObject({
+      revision: Number.MAX_SAFE_INTEGER,
+      deadlineAt: 123,
+      economicOperations: [{ id: 'economic', settlementState: 'settled' }],
+      terminal: {
+        status,
+        transitionedAt: request.nowMs,
+        replayPrincipals: principals,
+      },
+    });
+    expect(lifecycle.terminal).not.toHaveProperty('cleanupCompletedAt');
+    expect(result.cleanup).toEqual({
+      revision: Number.MAX_SAFE_INTEGER,
+      status,
+      cleanupCompleted: false,
+      scheduleDispatch: { scheduleId: 'schedule', dispatchId: 'dispatch' },
+    });
+  });
+
+  it.each([
+    'disputed',
+    'exhausted',
+  ])('retains %s lifecycle state without a write', async (variant) => {
+    const h = await terminalFixture();
+    const request = h.replace((snapshot) => {
+      snapshot.requestContext[RUN_LIFECYCLE_CONTEXT_KEY] = {
+        version: 1,
+        revision: variant === 'exhausted' ? Number.MAX_SAFE_INTEGER : 1,
+        economicOperations: [{ id: 'operation', settlementState: variant }],
+        transitionIntent: {
+          status: 'cancelled',
+          requestedAt: 1,
+          replayPrincipals: [OWNER],
+        },
+      };
+    });
+    const before = h.rows();
+    const prepare = vi.spyOn(h.db, 'prepare');
+    const error = await h.capability
+      .terminalizeInitialAdmission(request)
+      .catch((error: unknown) => error);
+    expect(h.rows()).toEqual(before);
+    expect(prepare).not.toHaveBeenCalled();
+    if (variant === 'disputed')
+      expect(error).toBeInstanceOf(RunLifecycleBlockedError);
+    else
+      expect(error).toMatchObject({
+        message: 'initial admission cannot be terminalized',
+        cause: { message: 'run lifecycle revision cannot advance' },
+      });
+    expect(isDefinitiveInitialAdmissionRefusal(error, request.execution)).toBe(
+      false,
+    );
+  });
+
+  it.each([
+    ['invalid JSON', 503],
+    ['array root', 503],
+    ['unknown status', 503],
+    ['missing run', 503],
+    ['wrong body run', 503],
+    ['array context', 503],
+    ['null provenance', 503],
+    ['unknown version', 503],
+    ['malformed counts nonpending', 503],
+    ['malformed lifecycle nonpending', 503],
+    ['malformed epoch', 503],
+    ['legacy', 400],
+    ['absent provenance', 400],
+    ['nonpending', 400],
+    ['unmarked', 400],
+    ['other S', 400],
+    ['other H', 400],
+    ['progressed requester', 400],
+    ['progressed count', 400],
+    ['terminal lifecycle', 400],
+    ['active path', 400],
+    ['missing control', 400],
+    ['wrong aux run', 400],
+    ['wrong aux workflow', 400],
+    ['inherited workflow target', 400],
+  ] as const)('distinguishes %s observations with status %i before SQL', async (variant, status) => {
+    const h = await terminalFixture();
+    const value = JSON.parse(h.request.expected.snapshot);
+    const context = value.requestContext;
+    const provenance = context[PROVENANCE];
+    if (variant === 'unknown status') value.status = 'invented';
+    if (variant === 'missing run') delete value.runId;
+    if (variant === 'wrong body run') value.runId = 'other';
+    if (variant === 'array context') value.requestContext = [];
+    if (variant === 'null provenance') context[PROVENANCE] = null;
+    if (variant === 'unknown version') provenance.version = 3;
+    if (variant === 'legacy') provenance.version = 1;
+    if (variant === 'absent provenance') delete context[PROVENANCE];
+    if (variant.includes('nonpending')) value.status = 'success';
+    if (variant === 'malformed counts nonpending')
+      provenance.resumeCounts = [['step', -1]];
+    if (variant === 'malformed lifecycle nonpending')
+      context[RUN_LIFECYCLE_CONTEXT_KEY] = { version: 1, revision: 0 };
+    if (variant === 'malformed epoch') provenance.mutationEpoch = '0';
+    if (variant === 'unmarked') delete provenance.initialAdmission;
+    if (variant === 'other S') provenance.startToken = 'other';
+    if (variant === 'other H') provenance.attemptToken = 'other';
+    if (variant === 'progressed requester') provenance.requestedBy = 'Bob';
+    if (variant === 'progressed count') provenance.resumeCounts = [['step', 1]];
+    if (variant === 'terminal lifecycle')
+      context[RUN_LIFECYCLE_CONTEXT_KEY] = {
+        version: 1,
+        revision: 1,
+        terminal: {
+          status: 'cancelled',
+          error: { code: 'CANCELLED', message: 'run was cancelled' },
+          transitionedAt: 1,
+          replayPrincipals: [OWNER],
+        },
+      };
+    if (variant === 'active path') value.activePaths = ['step'];
+    if (variant === 'missing control') delete value.waitingPaths;
+    if (variant === 'wrong aux run') context.runId = 'other';
+    if (variant === 'wrong aux workflow')
+      context['breakwater.workflowScope'] = 'other';
+    if (variant === 'inherited workflow target')
+      provenance.startIdentity.target.id = 'parent';
+    const snapshot =
+      variant === 'invalid JSON'
+        ? '{'
+        : variant === 'array root'
+          ? '[]'
+          : JSON.stringify(value);
+    const before = h.rows();
+    const prepare = vi.spyOn(h.db, 'prepare');
+    const error = await h.capability
+      .terminalizeInitialAdmission({
+        ...h.request,
+        expected: { ...h.request.expected, snapshot },
+      })
+      .catch((error: unknown) => error);
+    expect(h.rows()).toEqual(before);
+    expect(prepare).not.toHaveBeenCalled();
+    expect(error).toMatchObject({ status });
+    if (status === 503) {
+      expect(error).toBeInstanceOf(ExecutionFenceUnreadableError);
+      expect(error).toMatchObject({
+        name: 'ExecutionFenceUnreadableError',
+        reason: { code: 'EXECUTION_FENCE_UNREADABLE' },
+        message: 'initial admission cannot be terminalized',
+        cause: expect.any(Error),
+      });
+    } else {
+      expect(error).toBeInstanceOf(InvalidExecutionIdentityError);
+      if (!(error instanceof InvalidExecutionIdentityError))
+        throw new Error('expected input error');
+      expect(error.constructor).toBe(InvalidExecutionIdentityError);
+      expect(error.reason).toEqual({ code: 'INVALID_EXECUTION_IDENTITY' });
+      expect(error).toMatchObject({
+        name: 'InvalidExecutionIdentityError',
+        reason: { code: 'INVALID_EXECUTION_IDENTITY' },
+        message: 'initial admission identity is inconsistent',
+      });
+    }
+    expect(isDefinitiveInitialAdmissionRefusal(error, h.input.execution)).toBe(
+      false,
+    );
+  });
+
+  it('rejects incoherent caller frames and preserves original getter faults before SQL', async () => {
+    const h = await terminalFixture();
+    const admissionMessage = 'initial admission identity is inconsistent';
+    const invalid: Array<[unknown, string]> = [
+      [null, admissionMessage],
+      [[], admissionMessage],
+      [{}, 'execution identity must be an object'],
+      ...[NaN, Infinity, -1, 1.5, Number.MAX_SAFE_INTEGER].map(
+        (nowMs): [unknown, string] => [
+          { ...h.request, nowMs },
+          admissionMessage,
+        ],
+      ),
+      [{ ...h.request, attemptToken: '' }, admissionMessage],
+      [
+        {
+          ...h.request,
+          execution: { ...h.request.execution, tablePrefix: null },
+        },
+        'tablePrefix is not valid for this execution identity',
+      ],
+    ];
+    for (const [field, value] of Object.entries({
+      tablePrefix: 'other_',
+      workflowId: 'other',
+      runId: 'other',
+      snapshot: null,
+      resourceId: 1,
+      createdAt: null,
+      updatedAt: null,
+    }))
+      invalid.push([
+        {
+          ...h.request,
+          expected: { ...h.request.expected, [field]: value },
+        },
+        admissionMessage,
+      ]);
+    const prepare = vi.spyOn(h.db, 'prepare');
+    const batch = vi.spyOn(h.db, 'batch');
+    const before = h.rows();
+    for (const [request, message] of invalid) {
+      const error = await h.capability
+        .terminalizeInitialAdmission(request as InitialTerminalizationRequest)
+        .catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(InvalidExecutionIdentityError);
+      if (!(error instanceof InvalidExecutionIdentityError))
+        throw new Error('expected input error');
+      expect(error.constructor).toBe(InvalidExecutionIdentityError);
+      expect(error.reason).toEqual({ code: 'INVALID_EXECUTION_IDENTITY' });
+      expect(error).toMatchObject({
+        status: 400,
+        name: 'InvalidExecutionIdentityError',
+        reason: { code: 'INVALID_EXECUTION_IDENTITY' },
+        message,
+      });
+      expect(
+        isDefinitiveInitialAdmissionRefusal(error, h.input.execution),
+      ).toBe(false);
+      expect(prepare).not.toHaveBeenCalled();
+      expect(batch).not.toHaveBeenCalled();
+      expect(h.rows()).toEqual(before);
+    }
+    const fault = new Error('caller accessor');
+    await expect(
+      h.capability.terminalizeInitialAdmission({
+        ...h.request,
+        get expected(): RawWorkflowSnapshot {
+          throw fault;
+        },
+      }),
+    ).rejects.toBe(fault);
+    expect(prepare).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'workflow_name',
+    'run_id',
+    'snapshot',
+    'createdAt',
+    'updatedAt',
+    'resourceId',
+  ])('compares the original raw %s field without retry', async (field) => {
+    const h = await terminalFixture();
+    const value =
+      field === 'snapshot'
+        ? JSON.stringify({
+            ...JSON.parse(h.request.expected.snapshot),
+            changed: true,
+          })
+        : 'other';
+    h.sql
+      .prepare(`UPDATE mastra_workflow_snapshot SET ${field} = ?`)
+      .run(value);
+    const before = h.rows();
+    const prepare = vi.spyOn(h.db, 'prepare');
+    const result = await h.capability
+      .terminalizeInitialAdmission(h.request)
+      .catch((error: unknown) => error);
+    expect(h.rows()).toEqual(before);
+    expect(result).toMatchObject({ kind: 'conflict' });
+    expect(prepare).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    'committed',
+    'zero',
+    'throw-before',
+    'missing-table',
+  ])('classifies %s response loss without automatic replay', async (variant) => {
+    const h = await terminalFixture();
+    const fault = new Error('write response lost');
+    if (variant === 'missing-table')
+      h.sql.exec('DROP TABLE mastra_workflow_snapshot');
+    const prepare = h.db.prepare.bind(h.db);
+    const calls = vi.spyOn(h.db, 'prepare').mockImplementation((sql) => {
+      const statement = prepare(sql);
+      if (sql.startsWith('UPDATE "')) {
+        const bind = statement.bind.bind(statement);
+        vi.spyOn(statement, 'bind').mockImplementation((...values) => {
+          const bound = bind(...values);
+          const all = bound.all.bind(bound);
+          vi.spyOn(bound, 'all').mockImplementation(async () => {
+            if (variant !== 'throw-before' && variant !== 'missing-table')
+              await all();
+            if (variant === 'zero')
+              return { results: [], meta: { changes: 0 } };
+            throw fault;
+          });
+          return bound;
+        });
+      }
+      return statement;
+    });
+    const outcome = await h.capability
+      .terminalizeInitialAdmission(h.request)
+      .catch((error: unknown) => error);
+    expect(calls).toHaveBeenCalledTimes(2);
+    if (variant === 'committed' || variant === 'zero')
+      expect(outcome).toMatchObject({ kind: 'already-terminalized' });
+    else
+      expect(outcome).toMatchObject({
+        message: 'initial admission cannot be terminalized',
+        cause: fault,
+      });
+    expect(
+      isDefinitiveInitialAdmissionRefusal(outcome, h.input.execution),
+    ).toBe(false);
+    expect(h.effects()).toBe(0);
+  });
+
+  it.each([
+    'running',
+    'success',
+    'failed',
+    'suspended',
+    'waiting',
+    'paused',
+    'canceled',
+    'bailed',
+    'skipped',
+    'tripwire',
+    'waiting_callback',
+    'waiting_signal',
+    'retry_wait',
+    'cancelled',
+    'timed_out',
+  ])('recognizes same-generation %s progress with a retained admission stamp', async (status) => {
+    const h = await terminalFixture();
+    h.replace((snapshot) => {
+      snapshot.status = status;
+      snapshot.requestContext[PROVENANCE].requestedBy = 'Bob';
+      snapshot.requestContext[PROVENANCE].attemptToken = 'resume';
+      snapshot.requestContext[PROVENANCE].resumeCounts = [
+        ['gate', Number.MAX_SAFE_INTEGER],
+      ];
+    });
+    const before = h.rows();
+    const result = await h.capability.terminalizeInitialAdmission(h.request);
+    expect(h.rows()).toEqual(before);
+    expect(result.kind).toBe('progressed');
+    expect(result).not.toHaveProperty('cleanup');
+  });
+
+  it.each([
+    'pending marked',
+    'pending unmarked',
+    'other generation',
+    'other owner',
+    'other target',
+    'other epoch',
+    'legacy',
+  ])('does not call %s convergence progress', async (variant) => {
+    const h = await terminalFixture();
+    h.replace((snapshot) => {
+      snapshot.changed = true;
+      snapshot.status = variant.startsWith('pending') ? 'pending' : 'success';
+      const provenance = snapshot.requestContext[PROVENANCE];
+      if (variant === 'pending unmarked') delete provenance.initialAdmission;
+      if (variant === 'other generation') provenance.startToken = 'other';
+      if (variant === 'other owner') provenance.startIdentity.owner.id = 'Bob';
+      if (variant === 'other target')
+        provenance.startIdentity.target.id = 'other';
+      if (variant === 'other epoch') provenance.mutationEpoch = 1;
+      if (variant === 'legacy') provenance.version = 1;
+    });
+    const before = h.rows();
+    expect(
+      await h.capability.terminalizeInitialAdmission(h.request),
+    ).toMatchObject({ kind: 'conflict' });
+    expect(h.rows()).toEqual(before);
+  });
+
+  it.each([
+    'workflow_name',
+    'run_id',
+    'resourceId',
+    'snapshot',
+    'createdAt',
+    'updatedAt',
+  ] as const)('rejects changed returned %s after an actual commit without readback', async (field) => {
+    const h = await terminalFixture();
+    const committed: Record<string, unknown>[] = [];
+    const calls = terminalResponse(h, (raw) => {
+      const response = raw as { results: Record<string, unknown>[] };
+      expect(response.results).toHaveLength(1);
+      const row = response.results[0];
+      if (!row) throw new Error('committed returned row required');
+      committed.push({ ...row });
+      const value =
+        field === 'snapshot'
+          ? JSON.stringify({
+              ...JSON.parse(row.snapshot as string),
+              changedReturn: true,
+            })
+          : field === 'createdAt' || field === 'updatedAt'
+            ? '2000-01-01T00:00:00.000Z'
+            : 'different-returned-value';
+      expect(value).not.toEqual(row[field]);
+      return { ...response, results: [{ ...row, [field]: value }] };
+    });
+    const outcome = await h.capability
+      .terminalizeInitialAdmission(h.request)
+      .catch((error: unknown) => error);
+    expect(outcome).toBeInstanceOf(ExecutionFenceUnreadableError);
+    expect(outcome).toMatchObject({
+      status: 503,
+      message: 'initial admission cannot be terminalized',
+      reason: { code: 'EXECUTION_FENCE_UNREADABLE' },
+      cause: expect.any(Error),
+    });
+    expect(calls).toHaveBeenCalledTimes(1);
+    expect(calls.mock.calls[0]?.[0]).toMatch(/^UPDATE /);
+    expect(committed).toHaveLength(1);
+    expect(h.rows()).toEqual(committed);
+    expect(
+      isDefinitiveInitialAdmissionRefusal(outcome, h.input.execution),
+    ).toBe(false);
+    expect(h.effects()).toBe(0);
+  });
+
+  it.each([
+    'false success',
+    'missing results',
+    'multiple rows',
+    'wrong row',
+    'inconsistent changes',
+    'negative changes',
+    'sparse results',
+    'inherited result',
+    'shrinking results',
+  ])('refuses %s RETURNING without a recovery read or definitive-zero evidence', async (variant) => {
+    const h = await terminalFixture();
+    const calls = terminalResponse(h, (raw) => {
+      const response = raw as {
+        results: Record<string, unknown>[];
+        meta: { changes: number };
+      };
+      const row = response.results[0];
+      if (!row) throw new Error('fixture requires committed returned row');
+      if (variant === 'false success') return { ...response, success: false };
+      if (variant === 'missing results') return {};
+      if (variant === 'multiple rows')
+        return { ...response, results: [row, row] };
+      if (variant === 'wrong row')
+        return { ...response, results: [{ ...row, snapshot: '{}' }] };
+      if (variant === 'inconsistent changes')
+        return { ...response, meta: { changes: 0 } };
+      if (variant === 'negative changes')
+        return { ...response, meta: { changes: -1 } };
+      if (variant === 'sparse results')
+        return { ...response, results: new Array(1) };
+      if (variant === 'inherited result') {
+        const rows = new Array(1);
+        Object.setPrototypeOf(
+          rows,
+          Object.assign(Object.create(Array.prototype), { 0: row }),
+        );
+        return { ...response, results: rows };
+      }
+      const rows = [row, row];
+      Object.defineProperty(rows, 0, {
+        get() {
+          rows.length = 1;
+          return row;
+        },
+      });
+      return { ...response, results: rows };
+    });
+    const error = await h.capability
+      .terminalizeInitialAdmission(h.request)
+      .catch((error: unknown) => error);
+    expect(calls).toHaveBeenCalledTimes(1);
+    expect(error).toMatchObject({
+      message: 'initial admission cannot be terminalized',
+      status: 503,
+    });
+    expect(isDefinitiveInitialAdmissionRefusal(error, h.input.execution)).toBe(
+      false,
+    );
+    expect(h.rows()).toEqual([
+      expect.objectContaining({
+        snapshot: expect.stringContaining('"status":"failed"'),
+      }),
+    ]);
+  });
+
+  it('captures returned envelope, row fields and changes once without consulting custom iterators', async () => {
+    const h = await terminalFixture();
+    const reads: string[] = [];
+    terminalResponse(h, (raw) => {
+      const response = raw as {
+        results: Record<string, unknown>[];
+        meta: { changes: number };
+      };
+      const original = response.results[0];
+      if (!original) throw new Error('committed row required');
+      const row = Object.fromEntries(
+        Object.keys(original).map((key) => [key, original[key]]),
+      );
+      for (const key of Object.keys(row))
+        Object.defineProperty(row, key, {
+          get() {
+            reads.push(key);
+            if (reads.filter((value) => value === key).length > 1)
+              throw new Error('row reread');
+            return original[key];
+          },
+        });
+      const rows = [row];
+      rows[Symbol.iterator] = () => {
+        throw new Error('custom iterator');
+      };
+      return {
+        get results() {
+          reads.push('results');
+          return rows;
+        },
+        get meta() {
+          reads.push('meta');
+          return {
+            get changes() {
+              reads.push('changes');
+              return 1;
+            },
+          };
+        },
+      };
+    });
+    expect(
+      await h.capability.terminalizeInitialAdmission(h.request),
+    ).toMatchObject({ kind: 'terminalized' });
+    expect(reads.length).toBe(9);
+    expect(new Set(reads).size).toBe(9);
+  });
+});
 
 function claim(input: InitialRunAdmission) {
   if (!input.reservation) throw new Error('test requires a keyed fixture');

@@ -104,6 +104,14 @@ export class DurableObjectWorkflowsStorageD1 extends FencedWorkflowsStorageD1 {
     return super.persistWorkflowSnapshot(args);
   }
 
+  protected override withInitialTerminalizationLock<T>(
+    workflowName: string,
+    runId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    return this.#locked(workflowName, runId, operation);
+  }
+
   override persistWorkflowSnapshot(
     args: Parameters<WorkflowsStorageD1['persistWorkflowSnapshot']>[0],
   ): Promise<void> {

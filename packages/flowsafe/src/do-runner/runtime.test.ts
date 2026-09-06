@@ -1,17 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Agent } from '@mastra/core/agent';
+import type { RequestContext } from '@mastra/core/request-context';
 import { InMemoryStore } from '@mastra/core/storage';
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
-
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
+import type { D1DatabaseBinding } from './cf-types.js';
 import { RunStateUnreadableError as BarrelRunStateUnreadableError } from './index.js';
 import { init } from './init.js';
 import { createHostPubSub } from './pubsub.js';
+import {
+  RunLifecycleBlockedError as LeafRunLifecycleBlockedError,
+  parseRunLifecycle,
+} from './run-lifecycle.js';
 import {
   InvalidRunRequestError,
   type RequestContextProvider,
   RunAlreadyExistsError,
   type RunLeg,
+  RunLifecycleBlockedError,
   RunNotSuspendedError,
   type RunnerRuntime,
   RunStateUnreadableError,
@@ -116,6 +123,15 @@ function buildRuntime(storage: InMemoryStore): {
 }
 
 describe('RunnerRuntime host pubsub identity', () => {
+  it('preserves the moved lifecycle error constructor identity', () => {
+    expect(RunLifecycleBlockedError).toBe(LeafRunLifecycleBlockedError);
+    expect(
+      new LeafRunLifecycleBlockedError({
+        code: 'DISPUTED_SETTLEMENT',
+        message: 'blocked',
+      }),
+    ).toBeInstanceOf(RunLifecycleBlockedError);
+  });
   it('threads the pubsub instance from init() through to runtime.pubsub', () => {
     // #given — a host builds ONE pubsub identity for its DO
     const pubsub = createHostPubSub();
@@ -142,6 +158,429 @@ describe('RunnerRuntime host pubsub identity', () => {
 
     // #then — undefined, the polling-fallback posture existing hosts keep
     expect(runtime.pubsub).toBeUndefined();
+  });
+});
+
+describe('Runtime checked durable counters', () => {
+  const MAX = Number.MAX_SAFE_INTEGER;
+  const owner = { kind: 'human' as const, id: 'owner' };
+  it('rejects an exhausted live cancellation before context publication or cancel invocation', async () => {
+    const sql = openSqlite();
+    const db = sqliteUnitDatabase(sql) as D1DatabaseBinding;
+    const app = init({ DB: db });
+    let entered = () => {};
+    let release = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const enteredPromise = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let context: RequestContext | undefined;
+    const workflow = app
+      .createWorkflow({
+        id: 'live-counter',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+      })
+      .then(
+        app.createStep({
+          id: 'held',
+          inputSchema: z.object({}),
+          outputSchema: z.object({}),
+          execute: async ({ requestContext }) => {
+            context = requestContext;
+            entered();
+            await held;
+            return {};
+          },
+        }),
+      )
+      .commit();
+    const create = workflow.createRun.bind(workflow);
+    const cancel = vi.fn();
+    vi.spyOn(workflow, 'createRun').mockImplementation(async (...args) => {
+      const run = await create(...args);
+      const originalCancel = run.cancel.bind(run);
+      vi.spyOn(run, 'cancel').mockImplementation(async () => {
+        cancel();
+        await originalCancel();
+      });
+      return run;
+    });
+    const running = app.runtime.start('live-counter', {
+      runId: 'live-run',
+      inputData: {},
+      requestedBy: owner.id,
+      requestedByKind: owner.kind,
+    });
+    try {
+      await enteredPromise;
+      const read = () =>
+        sql.prepare('SELECT * FROM mastra_workflow_snapshot').get() as {
+          snapshot: string;
+        };
+      const snapshot = JSON.parse(read().snapshot);
+      snapshot.requestContext = {
+        ...snapshot.requestContext,
+        'flowsafe.runLifecycle': { version: 1, revision: MAX },
+      };
+      sql
+        .prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?')
+        .run(JSON.stringify(snapshot));
+      if (!context) throw new Error('live request context missing');
+      const beforeContext = [...context.entries()];
+      const before = read();
+      const outcome = await app.runtime
+        .cancelActiveExecution(
+          'live-counter',
+          'live-run',
+          'cancelled',
+          [owner],
+          undefined,
+          200,
+        )
+        .catch((error: unknown) => error);
+      expect(read()).toEqual(before);
+      expect([...context.entries()]).toEqual(beforeContext);
+      expect(cancel).not.toHaveBeenCalled();
+      expect(outcome).toMatchObject({
+        message: 'run lifecycle revision cannot advance',
+      });
+    } finally {
+      release();
+      await running;
+    }
+  });
+  async function counterFixture() {
+    const sql = openSqlite();
+    const db = sqliteUnitDatabase(sql) as D1DatabaseBinding;
+    const provider = vi.fn(() => ({}));
+    const prepareExecution = vi.fn(async () => undefined);
+    const effects = vi.fn();
+    function makeRuntime() {
+      const app = init({ DB: db }, { requestContextForRun: provider });
+      app
+        .createWorkflow({
+          id: 'counter',
+          inputSchema: z.object({}),
+          outputSchema: z.object({}),
+        })
+        .then(
+          app.createStep({
+            id: 'gate',
+            inputSchema: z.object({}),
+            outputSchema: z.object({}),
+            execute: async ({ resumeData, suspend }) => {
+              if (!resumeData) return suspend({ reason: 'counter test' });
+              effects();
+              return {};
+            },
+          }),
+        )
+        .commit();
+      return app.runtime;
+    }
+    await makeRuntime().start('counter', {
+      runId: 'counter-run',
+      inputData: {},
+      requestedBy: owner.id,
+      requestedByKind: owner.kind,
+    });
+    const read = () =>
+      sql.prepare('SELECT * FROM mastra_workflow_snapshot').get() as {
+        snapshot: string;
+      };
+    const seed = (
+      edit: (state: {
+        status: string;
+        requestContext: Record<string, unknown> & {
+          'flowsafe.runProvenance': { resumeCounts: Array<[string, number]> };
+        };
+      }) => void,
+    ) => {
+      const state = JSON.parse(read().snapshot);
+      edit(state);
+      sql
+        .prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?')
+        .run(JSON.stringify(state));
+    };
+    const resume = {
+      step: 'gate',
+      resumeData: { go: true },
+      requestedBy: owner.id,
+      requestedByKind: owner.kind,
+      prepareExecution,
+    };
+    return {
+      sql,
+      db,
+      makeRuntime,
+      read,
+      seed,
+      provider,
+      prepareExecution,
+      effects,
+      resume,
+    };
+  }
+
+  it.each([
+    'cancel-intent',
+    'terminate',
+    'timeout',
+    'cleanup',
+    'resume-count',
+    'resume-deadline',
+    'resume-economic',
+  ])('rejects exhausted %s before durable or execution effects', async (variant) => {
+    const h = await counterFixture();
+    h.seed((state) => {
+      state.requestContext['flowsafe.runLifecycle'] = {
+        version: 1,
+        revision: MAX,
+        ...(variant === 'timeout' ? { deadlineAt: 100 } : {}),
+      };
+      if (variant === 'resume-count')
+        state.requestContext['flowsafe.runProvenance'].resumeCounts = [
+          ['gate', MAX],
+        ];
+      if (variant === 'cleanup') {
+        state.status = 'cancelled';
+        state.requestContext['flowsafe.runLifecycle'] = {
+          version: 1,
+          revision: MAX,
+          terminal: {
+            status: 'cancelled',
+            error: { code: 'CANCELLED', message: 'run was cancelled' },
+            transitionedAt: 100,
+            replayPrincipals: [owner],
+          },
+        };
+      }
+    });
+    const runtime = h.makeRuntime();
+    await expect(
+      runtime.authoritativeStatus('counter', 'counter-run'),
+    ).resolves.toHaveProperty('runId', 'counter-run');
+    h.provider.mockClear();
+    const before = h.read();
+    const prepare = vi.spyOn(h.db, 'prepare');
+    const operation =
+      variant === 'cancel-intent'
+        ? runtime.cancelActiveExecution(
+            'counter',
+            'counter-run',
+            'cancelled',
+            [owner],
+            undefined,
+            200,
+          )
+        : variant === 'terminate'
+          ? runtime.terminateAsPrincipal(
+              'counter',
+              'counter-run',
+              owner,
+              owner,
+              200,
+            )
+          : variant === 'timeout'
+            ? runtime.timeOutAsPrincipal(
+                'counter',
+                'counter-run',
+                { expectedRevision: MAX, expectedDeadlineAt: 100 },
+                owner,
+                owner,
+                200,
+              )
+            : variant === 'cleanup'
+              ? runtime.completeTerminalCleanup(
+                  'counter',
+                  'counter-run',
+                  MAX,
+                  200,
+                )
+              : runtime.resume('counter', 'counter-run', {
+                  ...h.resume,
+                  ...(variant === 'resume-deadline'
+                    ? { deadlineMs: 60_000 }
+                    : {}),
+                  ...(variant === 'resume-economic'
+                    ? { economicOperations: [] }
+                    : {}),
+                });
+    const outcome = await operation.catch((error: unknown) => error);
+    expect(h.read()).toEqual(before);
+    expect(
+      prepare.mock.calls.filter(([sql]) =>
+        /^(?:UPDATE|INSERT|DELETE|REPLACE)\b/i.test(sql.trim()),
+      ),
+    ).toEqual([]);
+    expect(h.effects).not.toHaveBeenCalled();
+    expect(h.provider).not.toHaveBeenCalled();
+    expect(h.prepareExecution).not.toHaveBeenCalled();
+    expect(outcome).toBeInstanceOf(Error);
+    expect(outcome).toMatchObject({
+      message:
+        variant === 'resume-count'
+          ? 'run resume count cannot advance'
+          : 'run lifecycle revision cannot advance',
+    });
+    await expect(
+      h.makeRuntime().authoritativeStatus('counter', 'counter-run'),
+    ).resolves.toHaveProperty('runId', 'counter-run');
+  });
+
+  it.each([
+    'resume-no-replacement',
+    'matching-intent',
+    'already-terminal',
+    'completed-cleanup',
+  ])('preserves maximum counters on %s nonincrementing paths', async (variant) => {
+    const h = await counterFixture();
+    h.seed((state) => {
+      const terminal = {
+        status: 'cancelled',
+        error: { code: 'CANCELLED', message: 'run was cancelled' },
+        transitionedAt: 100,
+        replayPrincipals: [owner],
+        ...(variant === 'completed-cleanup' ? { cleanupCompletedAt: 0 } : {}),
+      };
+      state.requestContext['flowsafe.runLifecycle'] = {
+        version: 1,
+        revision: MAX,
+        ...(variant === 'matching-intent'
+          ? {
+              transitionIntent: {
+                status: 'cancelled',
+                requestedAt: 100,
+                replayPrincipals: [owner],
+              },
+            }
+          : {}),
+        ...(variant === 'already-terminal' || variant === 'completed-cleanup'
+          ? { terminal }
+          : {}),
+      };
+      state.requestContext['flowsafe.runProvenance'].resumeCounts = [
+        ['unselected', MAX],
+      ];
+      if (variant === 'already-terminal' || variant === 'completed-cleanup')
+        state.status = 'cancelled';
+    });
+    const runtime = h.makeRuntime();
+    const before = h.read();
+    if (variant === 'resume-no-replacement')
+      await expect(
+        runtime.resume('counter', 'counter-run', h.resume),
+      ).resolves.toMatchObject({ status: 'success' });
+    else if (variant === 'matching-intent')
+      await expect(
+        runtime.cancelActiveExecution(
+          'counter',
+          'counter-run',
+          'cancelled',
+          [owner],
+          undefined,
+          200,
+        ),
+      ).resolves.toBe(false);
+    else if (variant === 'already-terminal')
+      await runtime.terminateAsPrincipal(
+        'counter',
+        'counter-run',
+        owner,
+        owner,
+        200,
+      );
+    else
+      await runtime.completeTerminalCleanup('counter', 'counter-run', MAX, 200);
+    const state = JSON.parse(h.read().snapshot);
+    expect(
+      parseRunLifecycle(state.requestContext['flowsafe.runLifecycle'])
+        ?.revision,
+    ).toBe(MAX);
+    if (variant !== 'resume-no-replacement') expect(h.read()).toEqual(before);
+    await expect(
+      h.makeRuntime().authoritativeStatus('counter', 'counter-run'),
+    ).resolves.toHaveProperty('runId', 'counter-run');
+  });
+
+  it.each([
+    'cancel-intent',
+    'terminate',
+    'cleanup',
+    'resume-count',
+    'resume-revision',
+  ])('advances MAX minus one %s exactly once without losing readability', async (variant) => {
+    const h = await counterFixture();
+    h.seed((state) => {
+      state.requestContext['flowsafe.runLifecycle'] = {
+        version: 1,
+        revision: MAX - 1,
+      };
+      if (variant === 'resume-count')
+        state.requestContext['flowsafe.runProvenance'].resumeCounts = [
+          ['gate', MAX - 1],
+        ];
+      if (variant === 'cleanup') {
+        state.status = 'cancelled';
+        state.requestContext['flowsafe.runLifecycle'] = {
+          version: 1,
+          revision: MAX - 1,
+          terminal: {
+            status: 'cancelled',
+            error: { code: 'CANCELLED', message: 'run was cancelled' },
+            transitionedAt: 100,
+            replayPrincipals: [owner],
+          },
+        };
+      }
+    });
+    const runtime = h.makeRuntime();
+    if (variant === 'cancel-intent')
+      await runtime.cancelActiveExecution(
+        'counter',
+        'counter-run',
+        'cancelled',
+        [owner],
+        undefined,
+        200,
+      );
+    else if (variant === 'terminate')
+      await runtime.terminateAsPrincipal(
+        'counter',
+        'counter-run',
+        owner,
+        owner,
+        200,
+      );
+    else if (variant === 'cleanup')
+      await runtime.completeTerminalCleanup(
+        'counter',
+        'counter-run',
+        MAX - 1,
+        200,
+      );
+    else
+      await runtime.resume('counter', 'counter-run', {
+        ...h.resume,
+        ...(variant === 'resume-revision' ? { economicOperations: [] } : {}),
+      });
+    const state = JSON.parse(h.read().snapshot);
+    if (variant === 'resume-count')
+      expect(
+        state.requestContext['flowsafe.runProvenance'].resumeCounts,
+      ).toContainEqual(['gate', MAX]);
+    else
+      expect(
+        parseRunLifecycle(state.requestContext['flowsafe.runLifecycle'])
+          ?.revision,
+      ).toBe(MAX);
+    expect(state.requestContext['flowsafe.runProvenance'].version).toBe(1);
+    await expect(
+      h.makeRuntime().authoritativeStatus('counter', 'counter-run'),
+    ).resolves.toHaveProperty('runId', 'counter-run');
   });
 });
 

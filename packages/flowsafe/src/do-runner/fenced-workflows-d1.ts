@@ -33,11 +33,30 @@ import {
   type InitialAdmissionDatabase,
   type InitialAdmissionWitness,
   type InitialRunAdmission,
+  type InitialTerminalizationRequest,
+  type InitialTerminalizationResult,
 } from './fenced-workflow-capability.js';
 import { definitiveInitialAdmissionRefusal } from './initial-admission-refusal.js';
 import { isPathSafeId } from './path-safe-id.js';
-import { decodeInitialRunProvenance } from './run-provenance.js';
+import {
+  hasDisputedSettlement,
+  parseRunLifecycle,
+  projectTerminalLifecycle,
+  RUN_LIFECYCLE_CONTEXT_KEY,
+  RunLifecycleBlockedError,
+  terminalCleanupFor,
+} from './run-lifecycle.js';
+import {
+  decodeInitialRunProvenance,
+  decodeProgressRunProvenance,
+  type ProgressRunProvenance,
+} from './run-provenance.js';
 import { RESOURCE_OWNER_TABLE } from './run-storage-tables.js';
+import {
+  isRunStatus,
+  terminalStateFields,
+  terminalStateUpdate,
+} from './run-terminal-state.js';
 import {
   decodeStartReservationAdmissionResult,
   START_IDEMPOTENCY_TABLE,
@@ -414,24 +433,215 @@ function captureBatchResults(value: unknown, length: number) {
   return Array.from({ length }, (_, index) => {
     if (!Object.hasOwn(value, index))
       throw new Error('initial batch is missing a result');
-    const result = value[index];
-    const results = snapshotResultRows(result).map((row) =>
-      Object.freeze(
-        Object.fromEntries(
-          Object.getOwnPropertyNames(row).map((key) => [key, row[key]]),
-        ),
-      ),
-    );
-    const meta = record(result).meta;
-    const hasChanges = meta !== undefined && 'changes' in record(meta);
-    return {
-      results,
-      ...(hasChanges ? { meta: { changes: record(meta).changes } } : {}),
-    };
+    return captureStatementResult(value[index]);
   });
 }
 
-/** Owned initial INSERT only; all unscoped persistence delegates to the adapter. */
+function captureStatementResult(result: unknown) {
+  const results = snapshotResultRows(result).map((row) =>
+    Object.freeze(
+      Object.fromEntries(
+        Object.getOwnPropertyNames(row).map((key) => [key, row[key]]),
+      ),
+    ),
+  );
+  const meta = record(result).meta;
+  const hasChanges = meta !== undefined && 'changes' in record(meta);
+  return {
+    results,
+    ...(hasChanges ? { meta: { changes: record(meta).changes } } : {}),
+  };
+}
+
+function terminalizationUnreadable(
+  cause: unknown,
+): ExecutionFenceUnreadableError {
+  return new ExecutionFenceUnreadableError(
+    'initial admission cannot be terminalized',
+    { cause },
+  );
+}
+
+function terminalizationSnapshot(row: RawWorkflowSnapshot) {
+  const snapshot = record(JSON.parse(row.snapshot));
+  if (
+    !isRunStatus(snapshot.status) ||
+    typeof snapshot.runId !== 'string' ||
+    snapshot.runId !== row.runId
+  )
+    throw new Error('stored workflow snapshot is malformed');
+  const context =
+    snapshot.requestContext === undefined
+      ? {}
+      : record(snapshot.requestContext);
+  const rawProvenance = context[PROVENANCE];
+  if (rawProvenance === undefined || record(rawProvenance).version === 1)
+    return { snapshot, context, provenance: undefined, lifecycle: undefined };
+  const provenance = decodeProgressRunProvenance(rawProvenance);
+  const lifecycle = parseRunLifecycle(context[RUN_LIFECYCLE_CONTEXT_KEY]);
+  return { snapshot, context, provenance, lifecycle };
+}
+
+function sameStart(
+  actual: ProgressRunProvenance,
+  expected: ProgressRunProvenance,
+): boolean {
+  return (
+    actual.startToken === expected.startToken &&
+    actual.mutationEpoch === expected.mutationEpoch &&
+    actual.agentStart?.threaded === expected.agentStart?.threaded &&
+    actual.startIdentity?.owner.kind === expected.startIdentity?.owner.kind &&
+    actual.startIdentity?.owner.id === expected.startIdentity?.owner.id &&
+    actual.startIdentity?.target.kind === expected.startIdentity?.target.kind &&
+    actual.startIdentity?.target.id === expected.startIdentity?.target.id &&
+    (actual.startIdentity?.target.kind === 'agent'
+      ? actual.startIdentity.target.threadId
+      : undefined) ===
+      (expected.startIdentity?.target.kind === 'agent'
+        ? expected.startIdentity.target.threadId
+        : undefined)
+  );
+}
+
+function prepareTerminalization(
+  source: InitialTerminalizationRequest,
+  tablePrefix: string,
+) {
+  const {
+    expected: rawExpected,
+    execution: rawExecution,
+    attemptToken,
+    nowMs,
+  } = record(source);
+  const execution = normalizeD1RunExecutionIdentity(rawExecution);
+  const {
+    tablePrefix: expectedPrefix,
+    workflowId,
+    runId,
+    resourceId,
+    snapshot,
+    createdAt,
+    updatedAt,
+  } = record(rawExpected);
+  if (
+    expectedPrefix !== tablePrefix ||
+    execution.tablePrefix !== tablePrefix ||
+    workflowId !== execution.workflowId ||
+    runId !== execution.runId ||
+    (resourceId !== null && typeof resourceId !== 'string') ||
+    typeof snapshot !== 'string' ||
+    typeof createdAt !== 'string' ||
+    typeof updatedAt !== 'string' ||
+    !isPathSafeId(attemptToken) ||
+    typeof nowMs !== 'number' ||
+    !Number.isSafeInteger(nowMs) ||
+    nowMs < 0
+  )
+    throw new InvalidExecutionIdentityError('admission');
+  let nowIso: string;
+  try {
+    nowIso = new Date(nowMs).toISOString();
+  } catch {
+    throw new InvalidExecutionIdentityError('admission');
+  }
+  const expected: RawWorkflowSnapshot = Object.freeze({
+    tablePrefix,
+    workflowId,
+    runId,
+    resourceId,
+    snapshot,
+    createdAt,
+    updatedAt,
+  });
+  let parsed: ReturnType<typeof terminalizationSnapshot>;
+  try {
+    parsed = terminalizationSnapshot(expected);
+  } catch (error) {
+    throw terminalizationUnreadable(error);
+  }
+  const { provenance, lifecycle, context } = parsed;
+  if (
+    !provenance ||
+    provenance.startToken !== execution.startToken ||
+    provenance.attemptToken !== attemptToken ||
+    provenance.initialAdmission !== true ||
+    provenance.resumeCounts.length !== 0 ||
+    lifecycle?.terminal ||
+    provenance.requestedBy !== provenance.startIdentity?.owner.id ||
+    provenance.requestedByKind !== provenance.startIdentity?.owner.kind ||
+    (context.runId !== undefined && context.runId !== runId) ||
+    (context['breakwater.workflowScope'] !== undefined &&
+      context['breakwater.workflowScope'] !== workflowId) ||
+    (provenance.startIdentity?.target.kind === 'workflow' &&
+      provenance.startIdentity.target.id !== workflowId)
+  )
+    throw new InvalidExecutionIdentityError('admission');
+  assertInitialSnapshot(parsed.snapshot, runId);
+  try {
+    decodeInitialRunProvenance(context[PROVENANCE], 'present');
+  } catch (error) {
+    throw terminalizationUnreadable(error);
+  }
+  const nextProvenance = { ...record(context[PROVENANCE]) };
+  delete nextProvenance.initialAdmission;
+  const nextContext: Record<string, unknown> = {
+    ...context,
+    [PROVENANCE]: nextProvenance,
+  };
+  let fields = terminalStateUpdate({
+    status: 'failed',
+    error: {
+      name: 'StartOutcomeUnknown',
+      message:
+        'Start interrupted before a durable execution outcome was recorded; external effects may have occurred. This run will not be automatically re-executed.',
+    },
+  });
+  let cleanup: ReturnType<typeof terminalCleanupFor>;
+  const intent = lifecycle?.transitionIntent;
+  if (intent) {
+    if (hasDisputedSettlement(lifecycle))
+      throw new RunLifecycleBlockedError({
+        code: 'DISPUTED_SETTLEMENT',
+        message:
+          'run termination is blocked while an economic operation is disputed',
+      });
+    try {
+      const next = projectTerminalLifecycle(
+        lifecycle,
+        intent.status,
+        nowMs,
+        intent.replayPrincipals,
+      );
+      nextContext[RUN_LIFECYCLE_CONTEXT_KEY] = next;
+      fields = {
+        ...terminalStateFields(intent.status),
+        error: {
+          name:
+            intent.status === 'cancelled'
+              ? 'RunCancelledError'
+              : 'RunTimedOutError',
+          message: next.terminal.error.message,
+        },
+      };
+      cleanup = terminalCleanupFor(next);
+    } catch (error) {
+      throw terminalizationUnreadable(error);
+    }
+  }
+  const replacement = Object.freeze({
+    ...expected,
+    updatedAt: nowIso,
+    snapshot: JSON.stringify({
+      ...parsed.snapshot,
+      ...fields,
+      requestContext: nextContext,
+      timestamp: nowMs,
+    }),
+  });
+  return { expected, replacement, provenance, cleanup };
+}
+
+/** Owned initial admission and repair; unscoped persistence delegates to the adapter. */
 export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
   readonly [FENCED_WORKFLOW_STORAGE]?: FencedWorkflowAdmissionCapability;
   readonly #admission?: FencedWorkflowAdmissionCapability;
@@ -460,9 +670,109 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
             },
             { missingTable: 'empty' },
           ),
+        terminalizeInitialAdmission: (request: InitialTerminalizationRequest) =>
+          this.#terminalizeInitialAdmission(request),
       });
       this[FENCED_WORKFLOW_STORAGE] = this.#admission;
     }
+  }
+
+  protected withInitialTerminalizationLock<T>(
+    _workflowName: string,
+    _runId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    return operation();
+  }
+
+  async #terminalizeInitialAdmission(
+    source: InitialTerminalizationRequest,
+  ): Promise<InitialTerminalizationResult> {
+    const capability = this.#admission;
+    if (!capability) throw new InvalidExecutionIdentityError('admission');
+    const frame = prepareTerminalization(source, capability.tablePrefix);
+    const { expected, replacement, cleanup, provenance } = frame;
+    const { database } = capability;
+    return this.withInitialTerminalizationLock(
+      expected.workflowId,
+      expected.runId,
+      async () => {
+        const readback = async (): Promise<InitialTerminalizationResult> => {
+          const row = await readRawWorkflowSnapshot(database, expected, {
+            missingTable: 'error',
+          });
+          if (!row) return { kind: 'conflict' };
+          if (sameFields({ ...row }, { ...replacement }))
+            return {
+              kind: 'already-terminalized',
+              row,
+              ...(cleanup ? { cleanup } : {}),
+            };
+          const current = terminalizationSnapshot(row);
+          if (
+            current.provenance &&
+            sameStart(current.provenance, provenance) &&
+            current.snapshot.status !== 'pending'
+          ) {
+            const currentCleanup = terminalCleanupFor(current.lifecycle);
+            return {
+              kind: 'progressed',
+              row,
+              ...(currentCleanup ? { cleanup: currentCleanup } : {}),
+            };
+          }
+          return { kind: 'conflict', row };
+        };
+        let result: unknown;
+        try {
+          result = await database
+            .prepare(`UPDATE "${expected.tablePrefix}mastra_workflow_snapshot"
+          SET snapshot = ?1, updatedAt = ?2
+          WHERE workflow_name = ?3 AND run_id = ?4
+            AND snapshot = ?5 AND createdAt IS ?6 AND updatedAt IS ?7
+            AND resourceId IS ?8
+          RETURNING workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt`)
+            .bind(
+              replacement.snapshot,
+              replacement.updatedAt,
+              expected.workflowId,
+              expected.runId,
+              expected.snapshot,
+              expected.createdAt,
+              expected.updatedAt,
+              expected.resourceId,
+            )
+            .all();
+        } catch (error) {
+          try {
+            const recovered = await readback();
+            if (recovered.kind !== 'conflict') return recovered;
+          } catch {
+            /* The write's original uncertainty remains authoritative. */
+          }
+          throw terminalizationUnreadable(error);
+        }
+        try {
+          const captured = captureStatementResult(result);
+          const row = decodeRawWorkflowSnapshotResult(captured, expected);
+          const changes = captured.meta?.changes;
+          if (
+            captured.meta &&
+            (!Number.isSafeInteger(changes) ||
+              changes !== captured.results.length)
+          )
+            throw new Error(
+              'terminalization changes disagree with returned rows',
+            );
+          if (!row) return await readback();
+          if (!sameFields({ ...row }, { ...replacement }))
+            throw new Error('terminalization returned a different row');
+          return { kind: 'terminalized', row, ...(cleanup ? { cleanup } : {}) };
+        } catch (error) {
+          throw terminalizationUnreadable(error);
+        }
+      },
+    );
   }
 
   async #withInitialAdmission<T>(
@@ -567,11 +877,7 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
     const bytes = JSON.stringify(snapshot);
     const serialized = record(JSON.parse(bytes));
     assertInitialSnapshot(serialized, input.execution.runId);
-    if (
-      serialized.status !== 'pending' ||
-      serialized.runId !== input.execution.runId ||
-      JSON.stringify(serialized.requestContext) !== contextBytes
-    )
+    if (JSON.stringify(serialized.requestContext) !== contextBytes)
       throw new InvalidExecutionIdentityError('admission');
     const serializedContext = record(serialized.requestContext);
     decodeInitialRunProvenance(serializedContext[PROVENANCE], 'present');

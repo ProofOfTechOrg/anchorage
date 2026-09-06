@@ -31,6 +31,89 @@ export interface InitialRunProvenance extends DecodedRunStartIdentity {
   readonly initialAdmission?: true;
 }
 
+export interface ProgressRunProvenance extends DecodedRunStartIdentity {
+  readonly attemptToken: string;
+  readonly requestedBy?: string;
+  readonly requestedByKind?: ExecutionPrincipalKind;
+  readonly resumeCounts: Array<[string, number]>;
+  readonly mutationEpoch?: number;
+  readonly initialAdmission?: true;
+}
+
+export function nextResumeCount(current: number): number {
+  if (
+    !Number.isSafeInteger(current) ||
+    current < 0 ||
+    current === Number.MAX_SAFE_INTEGER
+  )
+    throw new Error('run resume count cannot advance');
+  return current + 1;
+}
+
+export function decodeResumeCounts(value: unknown): Array<[string, number]> {
+  if (!Array.isArray(value))
+    throw new Error('stored run provenance is malformed');
+  const counts: Array<[string, number]> = [];
+  for (const entry of value) {
+    if (
+      !Array.isArray(entry) ||
+      entry.length !== 2 ||
+      typeof entry[0] !== 'string' ||
+      !Number.isSafeInteger(entry[1]) ||
+      entry[1] < 1
+    )
+      throw new Error('stored run provenance is malformed');
+    counts.push([entry[0], entry[1]]);
+  }
+  return counts;
+}
+
+export function decodeProgressRunProvenance(
+  value: unknown,
+): ProgressRunProvenance {
+  try {
+    const row = provenanceObject(value);
+    const {
+      version,
+      attemptToken,
+      requestedBy,
+      requestedByKind,
+      resumeCounts,
+      mutationEpoch: rawEpoch,
+      initialAdmission,
+    } = row;
+    if (
+      version !== 2 ||
+      !isPathSafeId(attemptToken) ||
+      (initialAdmission !== undefined && initialAdmission !== true) ||
+      ((requestedBy !== undefined || requestedByKind !== undefined) &&
+        (!isExecutionPrincipalId(requestedBy) ||
+          !isExecutionPrincipalKind(requestedByKind)))
+    )
+      throw new Error('run provenance is malformed');
+    const start = startIdentityFromObject(row);
+    const counts = decodeResumeCounts(resumeCounts);
+    const mutationEpoch = normalizeMutationEpoch(rawEpoch);
+    return {
+      ...start,
+      attemptToken,
+      ...(requestedBy === undefined
+        ? {}
+        : {
+            requestedBy: requestedBy as string,
+            requestedByKind: requestedByKind as ExecutionPrincipalKind,
+          }),
+      resumeCounts: counts,
+      ...(mutationEpoch === undefined ? {} : { mutationEpoch }),
+      ...(initialAdmission === undefined ? {} : { initialAdmission: true }),
+    };
+  } catch (error) {
+    throw new ExecutionFenceUnreadableError('run provenance is not readable', {
+      cause: error,
+    });
+  }
+}
+
 function provenanceObject(value: unknown): Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value))
     throw new Error('run provenance must be an object');
