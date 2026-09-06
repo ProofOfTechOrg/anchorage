@@ -43,6 +43,7 @@ import {
   type DeploymentIdentityProtocolExecutor,
   type DeploymentIdentityProtocolRow,
   decodeExecutionFenceMutationMetadata,
+  EXECUTION_FENCE_CURRENT_SCHEMA_STAGE,
   EXECUTION_FENCE_ROW_ID,
   EXECUTION_FENCE_STATES,
   EXECUTION_FENCE_TABLE,
@@ -52,7 +53,14 @@ import {
 } from '#deployment-identity-protocol';
 import { missingTableReadsEmpty } from './cause-chain.js';
 import { DoStatusError } from './do-status-error.js';
+import {
+  type D1RunExecutionIdentity,
+  ExecutionFenceUnreadableError,
+  normalizeD1RunExecutionIdentity,
+} from './execution-admission.js';
 import { isPathSafeId } from './path-safe-id.js';
+
+export { ExecutionFenceUnreadableError } from './execution-admission.js';
 
 /**
  * The state vocabulary, the table, that table's fixed row key, and the DDL
@@ -117,6 +125,8 @@ export interface ExecutionFenceReading {
   readonly mutationEpoch?: number;
   readonly requireMutationEpoch?: boolean;
   readonly transitionRevision?: number;
+  /** Server-side proof identity; omitted from the admin JSON projection. */
+  readonly proofExecution?: D1RunExecutionIdentity;
 }
 
 /** An authoritative store reading, including durable administrative versioning. */
@@ -277,23 +287,6 @@ export class FenceTransitionConflictError extends DoStatusError {
             ...executionFenceReadingPayload(details.reading),
             conflict: details.conflict,
           };
-  }
-}
-
-/**
- * The fence could not be READ. Deliberately distinct from
- * ExecutionFencedError: no state was observed, so nothing may conclude the
- * deployment is open — which is why this carries the same 503 a refusal does
- * and every request-path caller lets it propagate.
- */
-export class ExecutionFenceUnreadableError extends DoStatusError {
-  readonly status = 503;
-  readonly reason: { readonly code: 'EXECUTION_FENCE_UNREADABLE' };
-
-  constructor(message: string, options?: ErrorOptions) {
-    super(message, options);
-    this.name = 'ExecutionFenceUnreadableError';
-    this.reason = { code: 'EXECUTION_FENCE_UNREADABLE' };
   }
 }
 
@@ -594,6 +587,21 @@ function readingFromRow(
   }
   const proofKey = row.proof_key;
   const proofRunId = row.proof_run_id;
+  let proofExecution: D1RunExecutionIdentity | undefined;
+  if (metadata.proofStartToken !== null) {
+    proofExecution = normalizeD1RunExecutionIdentity({
+      tablePrefix: metadata.proofTablePrefix,
+      workflowId: metadata.proofWorkflowId,
+      runId: proofRunId,
+      startToken: metadata.proofStartToken,
+    });
+    if (
+      proofExecution.tablePrefix !== metadata.proofTablePrefix ||
+      !isPathSafeId(proofKey)
+    ) {
+      throw new Error('execution fence proof identity is not canonical');
+    }
+  }
   if (metadata.lastTransitionRequest !== null) {
     const [, , next, key, epoch, revision, advance] = decodeTransitionReceipt(
       metadata.lastTransitionRequest,
@@ -617,6 +625,7 @@ function readingFromRow(
       mutationEpoch: metadata.mutationEpoch,
       requireMutationEpoch: metadata.requireMutationEpoch,
       transitionRevision: metadata.transitionRevision,
+      ...(proofExecution === undefined ? {} : { proofExecution }),
       ...(typeof proofKey === 'string' && proofKey.length > 0
         ? { proofKey }
         : {}),
@@ -654,7 +663,7 @@ function returningFence(result: unknown): StoredExecutionFence | undefined {
   const row = rows[0];
   if (row === undefined) return undefined;
   const stored = readingFromRow(row);
-  if (stored.schemaStage !== 4)
+  if (stored.schemaStage !== EXECUTION_FENCE_CURRENT_SCHEMA_STAGE)
     throw new Error('execution fence UPDATE returned a legacy row');
   return stored;
 }
@@ -727,7 +736,7 @@ export class ExecutionFenceStore {
    * question, and would turn a read-only replica or a revoked-write incident
    * into an outage instead of a degrade.
    *
-   * A missing table or legacy row reads as `open`. A missing modern row is
+   * A missing table or missing legacy row reads as `open`. A missing modern row is
    * unreadable and is never silently recreated.
    */
   async read(): Promise<ExecutionFenceVersionedReading> {
@@ -809,6 +818,7 @@ export class ExecutionFenceStore {
             .prepare(
               `UPDATE ${EXECUTION_FENCE_TABLE}
            SET state = ?1, proof_key = ?2, proof_run_id = NULL,
+               proof_table_prefix = NULL, proof_workflow_id = NULL, proof_start_token = NULL,
                mutation_epoch = mutation_epoch + ?3,
                require_mutation_epoch = CASE WHEN ?3 = 1 THEN 1 ELSE require_mutation_epoch END,
                transition_revision = transition_revision + 1,
@@ -835,6 +845,7 @@ export class ExecutionFenceStore {
             .prepare(
               `UPDATE ${EXECUTION_FENCE_TABLE}
            SET state = ?, proof_key = ?, proof_run_id = NULL,
+               proof_table_prefix = NULL, proof_workflow_id = NULL, proof_start_token = NULL,
                transition_revision = transition_revision + 1,
                last_transition_request = NULL, updated_at = ?
            WHERE id = ? AND state = ? AND require_mutation_epoch = 0
@@ -916,7 +927,7 @@ export class ExecutionFenceStore {
     }
     const observed = await this.#readStored();
     if (observed === undefined) return false;
-    if (observed.schemaStage < 4) {
+    if (observed.schemaStage < EXECUTION_FENCE_CURRENT_SCHEMA_STAGE) {
       await this.#initialize(observed.reading.state);
       await this.#readStored();
     }

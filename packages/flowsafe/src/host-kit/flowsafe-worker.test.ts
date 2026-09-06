@@ -1980,6 +1980,108 @@ describe('createFlowsafeWorker execution-fence administration', () => {
     });
   }
 
+  it('keeps complete proof identity out of admin success and conflict payloads', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = ADMIN_SECRET;
+    const command = {
+      expected: 'open',
+      next: 'proof-only',
+      proofKey: 'key',
+      expectedMutationEpoch: 0,
+      expectedRevision: 0,
+    };
+    expect(
+      (
+        await worker.fetch(
+          fenceRequest({ method: 'POST', body: command }),
+          env,
+          ctx,
+        )
+      ).status,
+    ).toBe(200);
+    await env.DB.prepare(
+      "UPDATE flowsafe_execution_fence SET proof_run_id = 'run', proof_table_prefix = 'tenant_', proof_workflow_id = 'workflow', proof_start_token = 'private-generation'",
+    ).run();
+    const before = (
+      await env.DB.prepare('SELECT * FROM flowsafe_execution_fence').all()
+    ).results;
+    const expected = {
+      state: 'proof-only',
+      mutationEpoch: 0,
+      requireMutationEpoch: false,
+      transitionRevision: 1,
+      proofKey: 'key',
+      proofRunId: 'run',
+    };
+    for (const request of [
+      fenceRequest({ method: 'GET' }),
+      fenceRequest({ method: 'POST', body: command }),
+    ]) {
+      const response = await worker.fetch(request, env, ctx);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual(expected);
+    }
+    expect(
+      (await env.DB.prepare('SELECT * FROM flowsafe_execution_fence').all())
+        .results,
+    ).toEqual(before);
+    const conflict = await worker.fetch(
+      fenceRequest({
+        method: 'POST',
+        body: { ...command, expectedRevision: 2 },
+      }),
+      env,
+      ctx,
+    );
+    expect(conflict.status).toBe(409);
+    expect(await conflict.json()).toEqual({
+      error: 'execution fence transition conflicts with the current reading',
+      reason: {
+        code: 'FENCE_CAS_CONFLICT',
+        ...expected,
+        conflict: 'expectation-mismatch',
+      },
+    });
+    const reset = await worker.fetch(
+      fenceRequest({
+        method: 'POST',
+        body: {
+          expected: 'proof-only',
+          next: 'proof-only',
+          proofKey: 'key',
+          expectedMutationEpoch: 0,
+          expectedRevision: 1,
+          proofExecution: { startToken: 'forged' },
+        },
+      }),
+      env,
+      ctx,
+    );
+    expect(reset.status).toBe(200);
+    expect(await reset.json()).toEqual({
+      state: 'proof-only',
+      mutationEpoch: 0,
+      requireMutationEpoch: false,
+      transitionRevision: 2,
+      proofKey: 'key',
+    });
+    expect(
+      (
+        await env.DB.prepare(
+          'SELECT proof_run_id, proof_table_prefix, proof_workflow_id, proof_start_token FROM flowsafe_execution_fence',
+        ).all()
+      ).results,
+    ).toEqual([
+      {
+        proof_run_id: null,
+        proof_table_prefix: null,
+        proof_workflow_id: null,
+        proof_start_token: null,
+      },
+    ]);
+  });
+
   it('returns versioned readings for both admin methods', async () => {
     // #given
     const worker = makeWorker();

@@ -33,6 +33,7 @@ export const DEPLOYMENT_SENTINEL_COLUMNS: readonly Readonly<{
 export const EXECUTION_FENCE_TABLE: 'flowsafe_execution_fence';
 /** The fence row's fixed primary key — one deployment, one database, one row. */
 export const EXECUTION_FENCE_ROW_ID: 'deployment';
+export const EXECUTION_FENCE_CURRENT_SCHEMA_STAGE: 7;
 /** Every fence state, ordered from most to least permissive. */
 export const EXECUTION_FENCE_STATES: readonly [
   'open',
@@ -51,13 +52,16 @@ export const INITIAL_EXECUTION_FENCE_STATES: readonly [
  */
 export const EXECUTION_FENCE_DDL: string;
 
-export type ExecutionFenceSchemaStage = 0 | 1 | 2 | 3 | 4;
+export type ExecutionFenceSchemaStage = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7;
 export interface ExecutionFenceMutationMetadata {
   readonly mutationEpoch: number;
   readonly requireMutationEpoch: boolean;
   readonly transitionRevision: number;
   readonly lastTransitionRequest: string | null;
   readonly schemaStage: ExecutionFenceSchemaStage;
+  readonly proofTablePrefix: string | null;
+  readonly proofWorkflowId: string | null;
+  readonly proofStartToken: string | null;
 }
 export function readExecutionFenceSchemaProtocol(
   execute: DeploymentIdentityProtocolExecutor,

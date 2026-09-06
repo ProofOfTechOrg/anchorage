@@ -51,6 +51,7 @@ export const EXECUTION_FENCE_TABLE = 'flowsafe_execution_fence';
  * a constant.
  */
 export const EXECUTION_FENCE_ROW_ID = 'deployment';
+export const EXECUTION_FENCE_CURRENT_SCHEMA_STAGE = 7;
 
 /** Every fence state, ordered from most to least permissive. */
 export const EXECUTION_FENCE_STATES = Object.freeze([
@@ -88,6 +89,9 @@ const EXECUTION_FENCE_ADDITIONS = Object.freeze([
   `require_mutation_epoch INTEGER NOT NULL DEFAULT 0
     CHECK (typeof(require_mutation_epoch) = 'integer'
       AND require_mutation_epoch IN (0, 1))`,
+  'proof_table_prefix TEXT',
+  'proof_workflow_id TEXT',
+  'proof_start_token TEXT',
 ]);
 const EXECUTION_FENCE_COLUMNS = Object.freeze([
   ['id', 'TEXT', 0, 1, null],
@@ -99,6 +103,9 @@ const EXECUTION_FENCE_COLUMNS = Object.freeze([
   ['transition_revision', 'INTEGER', 1, 0, '0'],
   ['mutation_epoch', 'INTEGER', 1, 0, '0'],
   ['require_mutation_epoch', 'INTEGER', 1, 0, '0'],
+  ['proof_table_prefix', 'TEXT', 0, 0, null],
+  ['proof_workflow_id', 'TEXT', 0, 0, null],
+  ['proof_start_token', 'TEXT', 0, 0, null],
 ]);
 const EXECUTION_FENCE_BOOTSTRAP_DDL = `CREATE TABLE IF NOT EXISTS ${EXECUTION_FENCE_TABLE} (${EXECUTION_FENCE_BASE_COLUMNS}
   )`;
@@ -380,6 +387,36 @@ export function decodeExecutionFenceMutationMetadata(row) {
   const revision = row.transition_revision;
   const epoch = row.mutation_epoch;
   const required = row.require_mutation_epoch;
+  const proofNames = [
+    'proof_table_prefix',
+    'proof_workflow_id',
+    'proof_start_token',
+  ];
+  const proofValues = proofNames.map((name) =>
+    Object.hasOwn(row, name) ? row[name] : null,
+  );
+  if (
+    stage < EXECUTION_FENCE_CURRENT_SCHEMA_STAGE &&
+    proofValues.some((value) => value !== null)
+  ) {
+    throw malformedExecutionFence('partial proof identity is not null');
+  }
+  if (
+    proofValues.some((value) => value !== null) &&
+    (proofValues.some((value) => typeof value !== 'string') ||
+      row.state !== 'proof-only' ||
+      typeof row.proof_key !== 'string' ||
+      row.proof_key.length === 0 ||
+      typeof row.proof_run_id !== 'string' ||
+      row.proof_run_id.length === 0)
+  ) {
+    throw malformedExecutionFence('proof identity is inconsistent');
+  }
+  const proofMetadata = {
+    proofTablePrefix: proofValues[0],
+    proofWorkflowId: proofValues[1],
+    proofStartToken: proofValues[2],
+  };
   if (stage < 4) {
     if (
       (stage >= 1 && receipt !== null) ||
@@ -396,6 +433,7 @@ export function decodeExecutionFenceMutationMetadata(row) {
       transitionRevision: 0,
       lastTransitionRequest: null,
       schemaStage: stage,
+      ...proofMetadata,
     };
   }
   if (
@@ -418,6 +456,7 @@ export function decodeExecutionFenceMutationMetadata(row) {
     transitionRevision: revision,
     lastTransitionRequest: receipt,
     schemaStage: stage,
+    ...proofMetadata,
   };
 }
 
@@ -477,7 +516,11 @@ export async function initializeExecutionFenceProtocol(
     await execute(seedExecutionFenceRow(state, seededAt));
     observation = await observeExecutionFence(execute, false);
   }
-  for (let index = observation.stage; index < 4; index += 1) {
+  for (
+    let index = observation.stage;
+    index < EXECUTION_FENCE_CURRENT_SCHEMA_STAGE;
+    index += 1
+  ) {
     const stage = await readExecutionFenceSchemaProtocol(execute);
     if (stage === undefined || stage < index) {
       throw malformedExecutionFence('schema regressed during initialization');
@@ -501,7 +544,10 @@ export async function initializeExecutionFenceProtocol(
     }
   }
   const final = await observeExecutionFence(execute, false);
-  if (final.stage !== 4 || final.rowStage !== 4) {
+  if (
+    final.stage !== EXECUTION_FENCE_CURRENT_SCHEMA_STAGE ||
+    final.rowStage !== EXECUTION_FENCE_CURRENT_SCHEMA_STAGE
+  ) {
     throw malformedExecutionFence(
       'initialization did not reach the current schema',
     );

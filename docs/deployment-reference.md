@@ -169,6 +169,8 @@ Legacy `{ expected, next, proofKey? }` requests remain valid only before activat
 
 Administrative metadata does not establish final-write run or schedule protection. Do not activate the requirement until every writer supports final-write epoch checks. Use an authoritative D1 binding for administration and ordinary reads; an unconstrained replica facade cannot satisfy the store's freshness contract. The [runner design](do-runner-design.md#execution-fence-and-start-reservations) describes schema recovery, proof binding, and the legacy-absence limitation.
 
+Additive proof-identity columns preserve an active fence's epoch, revision, receipt, state, and timestamps. A complete stored proof identity includes its D1 prefix, workflow, run, and token. Admin reads and conflicts expose neither this identity nor its token; a newly applied admin command clears it with the proof-run binding, while an exact retry preserves it. These schema/read fields do not enable generation-aware execution checks. The [identity-data helpers](do-runner-design.md#validate-execution-identity-data) validate representations without changing caller authority.
+
 `GET /admin/inventory` returns the category index. Add `?category=<category>&cursor=<cursor>&limit=<limit>` to page one category. Prove a drain only from `draining`: sweep every work category to empty twice, at least 60 seconds apart. Standing categories remain present by design, and persisted idle signals deliberately carry across the migration.
 
 ### Advanced routes

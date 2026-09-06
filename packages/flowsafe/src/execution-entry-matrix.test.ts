@@ -1081,6 +1081,13 @@ const FENCE_ERROR_AUTHORS: ReadonlyArray<{
   beforeExecutionEffect: string;
 }> = [
   {
+    file: 'do-runner/execution-admission.ts',
+    error: 'ExecutionFenceUnreadableError',
+    anchor: 'const current = candidate?.mutationEpoch;',
+    beforeExecutionEffect:
+      'The public epoch helper rejects malformed reading metadata before returning an admission comparison; it performs no execution.',
+  },
+  {
     file: 'approval-api/service.ts',
     error: 'ExecutionFencedError',
     anchor: 'async #assertDecidable',

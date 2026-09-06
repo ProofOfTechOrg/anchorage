@@ -31,8 +31,10 @@ import {
   isStartReservationRefusal,
   requireStartIdempotency,
   rollbackFencedStart,
+  START_IDEMPOTENCY_DDL,
   START_IDEMPOTENCY_TABLE,
   type StartIdempotencyDatabase,
+  type StartIdempotencyStatement,
   StartIdempotencyStore,
   StartIdempotencyUnsupportedError,
   type StartReservation,
@@ -58,6 +60,59 @@ function rows(sqlite: SqliteDatabase): Array<Record<string, unknown>> {
   return sqlite
     .prepare(`SELECT * FROM ${START_IDEMPOTENCY_TABLE}`)
     .all() as Array<Record<string, unknown>>;
+}
+
+const bindingColumns = [
+  'start_token',
+  'start_table_prefix',
+  'start_workflow_id',
+];
+const legacyBinding = {
+  start_token: null,
+  start_table_prefix: null,
+  start_workflow_id: null,
+};
+
+function schemaHarness(stage: number) {
+  const fixture = harness();
+  fixture.sqlite.exec(START_IDEMPOTENCY_DDL);
+  for (const column of bindingColumns.slice(stage).reverse())
+    fixture.sqlite.exec(
+      `ALTER TABLE ${START_IDEMPOTENCY_TABLE} DROP COLUMN ${column}`,
+    );
+  fixture.sqlite
+    .prepare(
+      `INSERT INTO ${START_IDEMPOTENCY_TABLE} (key, owner_kind, owner_id, target_kind, target_id, run_id, thread_id, state, created_at, updated_at) VALUES ('key', 'human', 'operator-1', 'workflow', 'payout', 'run', NULL, 'started', 10, 20)`,
+    )
+    .run();
+  return fixture;
+}
+
+function interceptReservations(
+  db: StartIdempotencyDatabase,
+  intercept: (sql: string, execute: () => Promise<unknown>) => Promise<unknown>,
+): StartIdempotencyDatabase {
+  const statement = (
+    sql: string,
+    values: unknown[],
+  ): StartIdempotencyStatement => ({
+    bind: (...bound) => statement(sql, bound),
+    run: () =>
+      intercept(sql, () =>
+        db
+          .prepare(sql)
+          .bind(...values)
+          .run(),
+      ),
+    all: async <T>() =>
+      (await intercept(sql, () =>
+        db
+          .prepare(sql)
+          .bind(...values)
+          .all(),
+      )) as { results: T[] },
+  });
+  return { prepare: (sql) => statement(sql, []) };
 }
 
 function workflowRequest(key: string, runId: string, workflowId = 'payout') {
@@ -125,6 +180,578 @@ describe('isStartReservationRefusal', () => {
     expect(
       isStartReservationRefusal(new StartReservationUnreadableError('key-1')),
     ).toBe(false);
+  });
+});
+
+describe('reservation binding representation', () => {
+  it('reads legacy and supported partial reservation schemas without DDL', async () => {
+    for (const stage of [0, 1, 2, 3]) {
+      const { sqlite, binding } = schemaHarness(stage);
+      const statements: string[] = [];
+      const store = new StartIdempotencyStore(
+        interceptReservations(binding, async (sql, execute) => {
+          statements.push(sql);
+          return execute();
+        }),
+      );
+      expect(await store.read('key')).toMatchObject({
+        key: 'key',
+        binding: { kind: 'legacy' },
+      });
+      expect(await store.reservationsForRuns(['run'])).toHaveLength(1);
+      expect(await store.read('missing')).toBeUndefined();
+      sqlite.exec(`DELETE FROM ${START_IDEMPOTENCY_TABLE}`);
+      expect(await store.read('key')).toBeUndefined();
+      expect(await store.reservationsForRuns(['run'])).toEqual([]);
+      expect(statements.every((sql) => /^(SELECT|PRAGMA)/.test(sql))).toBe(
+        true,
+      );
+      expect(
+        sqlite.prepare(`PRAGMA table_xinfo(${START_IDEMPOTENCY_TABLE})`).all(),
+      ).toHaveLength(10 + stage);
+    }
+    const { sqlite, binding, store } = schemaHarness(0);
+    expect((await store.read('key'))?.binding).toEqual({ kind: 'legacy' });
+    let advanced = false;
+    const reader = new StartIdempotencyStore(
+      interceptReservations(binding, async (sql, execute) => {
+        const result = await execute();
+        if (!advanced && sql.startsWith('SELECT *')) {
+          advanced = true;
+          for (const column of bindingColumns)
+            sqlite.exec(
+              `ALTER TABLE ${START_IDEMPOTENCY_TABLE} ADD COLUMN ${column} TEXT`,
+            );
+          sqlite.exec(
+            `UPDATE ${START_IDEMPOTENCY_TABLE} SET start_token = 'generation', start_table_prefix = '', start_workflow_id = 'payout'`,
+          );
+        }
+        return result;
+      }),
+    );
+    expect((await reader.read('key'))?.binding).toEqual({ kind: 'legacy' });
+    expect((await store.read('key'))?.binding).toEqual({
+      kind: 'bound',
+      execution: {
+        tablePrefix: '',
+        workflowId: 'payout',
+        runId: 'run',
+        startToken: 'generation',
+      },
+    });
+  });
+
+  it('resumes concurrent reservation schema upgrades without changing rows', async () => {
+    for (const stopAfter of [1, 2, 3]) {
+      const { sqlite, binding } = schemaHarness(0);
+      const before = rows(sqlite)[0];
+      let additions = 0;
+      let stopped = false;
+      const crashed = new StartIdempotencyStore(
+        interceptReservations(binding, async (sql, execute) => {
+          if (stopped) throw new Error('process interrupted');
+          const result = await execute();
+          if (sql.startsWith('ALTER TABLE') && ++additions === stopAfter)
+            stopped = true;
+          return result;
+        }),
+      );
+      await expect(
+        crashed.reserve(workflowRequest('new', 'new-run')),
+      ).rejects.toBeInstanceOf(StartReservationUnreadableError);
+      expect(
+        sqlite.prepare(`PRAGMA table_xinfo(${START_IDEMPOTENCY_TABLE})`).all(),
+      ).toHaveLength(10 + stopAfter);
+      const recovered = new StartIdempotencyStore(binding);
+      await recovered.reserve(workflowRequest('new', 'new-run'));
+      expect(
+        sqlite
+          .prepare(`SELECT * FROM ${START_IDEMPOTENCY_TABLE} WHERE key = 'key'`)
+          .get(),
+      ).toEqual({ ...before, ...legacyBinding });
+    }
+    for (const outcome of ['before', 'after', 'incompatible'] as const) {
+      const { sqlite, binding } = schemaHarness(0);
+      const failure = new Error('ALTER response lost');
+      let injected = false;
+      const store = new StartIdempotencyStore(
+        interceptReservations(binding, async (sql, execute) => {
+          if (injected || !sql.startsWith('ALTER TABLE')) return execute();
+          injected = true;
+          if (outcome === 'after') await execute();
+          if (outcome === 'incompatible')
+            sqlite.exec(
+              `ALTER TABLE ${START_IDEMPOTENCY_TABLE} ADD COLUMN start_token INTEGER`,
+            );
+          throw failure;
+        }),
+      );
+      if (outcome === 'after')
+        await expect(
+          store.reserve(workflowRequest('new', 'new-run')),
+        ).resolves.toMatchObject({
+          reservation: { binding: { kind: 'legacy' } },
+        });
+      else {
+        const error = await store
+          .reserve(workflowRequest('new', 'new-run'))
+          .catch((error: unknown) => error);
+        expect(error).toBeInstanceOf(StartReservationUnreadableError);
+        if (outcome === 'before') {
+          expect((error as Error).cause).toBe(failure);
+          await expect(
+            store.reserve(workflowRequest('retry', 'retry-run')),
+          ).resolves.toMatchObject({ created: true });
+        } else
+          expect(String((error as Error).cause)).toContain(
+            'column start_token differs',
+          );
+      }
+    }
+    const { sqlite, binding, store: competing } = schemaHarness(0);
+    let raced = false;
+    const first = new StartIdempotencyStore(
+      interceptReservations(binding, async (sql, execute) => {
+        if (!raced && sql.startsWith('ALTER TABLE')) {
+          raced = true;
+          await competing.reserve(workflowRequest('other', 'other-run'));
+        }
+        return execute();
+      }),
+    );
+    await first.reserve(workflowRequest('first', 'first-run'));
+    expect(rows(sqlite)).toHaveLength(3);
+    expect(
+      sqlite.prepare(`PRAGMA table_xinfo(${START_IDEMPOTENCY_TABLE})`).all(),
+    ).toHaveLength(13);
+    const empty = harness();
+    const hostReady = new StartIdempotencyStore(empty.binding, {
+      ready: async () => {
+        empty.sqlite.exec(START_IDEMPOTENCY_DDL);
+      },
+    });
+    await expect(
+      hostReady.reserve(workflowRequest('new', 'run')),
+    ).resolves.toMatchObject({ created: true });
+    const legacy = schemaHarness(0);
+    const noMigration = new StartIdempotencyStore(legacy.binding, {
+      ready: async () => {},
+    });
+    await expect(
+      noMigration.reserve(workflowRequest('new', 'run')),
+    ).rejects.toMatchObject({
+      cause: {
+        message: `${START_IDEMPOTENCY_TABLE} has an invalid reservation schema (host readiness did not reach the current schema)`,
+      },
+    });
+    expect(
+      legacy.sqlite
+        .prepare(`PRAGMA table_xinfo(${START_IDEMPOTENCY_TABLE})`)
+        .all(),
+    ).toHaveLength(10);
+  });
+
+  it('distinguishes legacy unbound D1-bound and unfenced-bound reservations', async () => {
+    const { sqlite, store, binding } = schemaHarness(3);
+    for (const [token, prefix, workflow, expected] of [
+      [null, null, null, { kind: 'legacy' }],
+      ['', null, null, { kind: 'unbound' }],
+      [
+        'generation',
+        '',
+        'payout',
+        {
+          kind: 'bound',
+          execution: {
+            tablePrefix: '',
+            workflowId: 'payout',
+            runId: 'run',
+            startToken: 'generation',
+          },
+        },
+      ],
+      [
+        'generation',
+        null,
+        'payout',
+        {
+          kind: 'bound',
+          execution: {
+            tablePrefix: null,
+            workflowId: 'payout',
+            runId: 'run',
+            startToken: 'generation',
+          },
+        },
+      ],
+    ] as const) {
+      sqlite
+        .prepare(
+          `UPDATE ${START_IDEMPOTENCY_TABLE} SET start_token = ?, start_table_prefix = ?, start_workflow_id = ?`,
+        )
+        .run(token, prefix, workflow);
+      expect((await store.read('key'))?.binding).toEqual(expected);
+    }
+    for (const values of [
+      [null, '', null],
+      ['', '', null],
+      ['generation', null, null],
+      ['generation', 'Mixed_', 'payout'],
+      ['bad token', '', 'payout'],
+      ['generation', '', 'bad/workflow'],
+    ]) {
+      sqlite
+        .prepare(
+          `UPDATE ${START_IDEMPOTENCY_TABLE} SET start_token = ?, start_table_prefix = ?, start_workflow_id = ?`,
+        )
+        .run(...values);
+      await expect(store.read('key')).rejects.toBeInstanceOf(
+        StartReservationUnreadableError,
+      );
+    }
+    sqlite.exec(
+      `UPDATE ${START_IDEMPOTENCY_TABLE} SET start_token = 'generation', start_table_prefix = '', start_workflow_id = 'payout', target_kind = 'agent'`,
+    );
+    await expect(store.read('key')).rejects.toBeInstanceOf(
+      StartReservationUnreadableError,
+    );
+    sqlite.exec(
+      `UPDATE ${START_IDEMPOTENCY_TABLE} SET target_kind = 'workflow', start_token = NULL, start_table_prefix = NULL, start_workflow_id = NULL`,
+    );
+    for (const result of [
+      null,
+      {},
+      { results: null },
+      { results: [undefined] },
+      { results: new Array(1) },
+      { results: [], success: false },
+    ]) {
+      const corrupt = new StartIdempotencyStore(
+        interceptReservations(binding, async (sql, execute) =>
+          sql.startsWith('SELECT *') ? result : execute(),
+        ),
+      );
+      await expect(corrupt.read('key')).rejects.toBeInstanceOf(
+        StartReservationUnreadableError,
+      );
+    }
+    for (const stage of [1, 2]) {
+      const partial = schemaHarness(stage);
+      partial.sqlite.exec(
+        `UPDATE ${START_IDEMPOTENCY_TABLE} SET start_token = ''`,
+      );
+      await expect(partial.store.read('key')).rejects.toMatchObject({
+        cause: {
+          message: `${START_IDEMPOTENCY_TABLE} has an invalid reservation schema (partial binding is not legacy defaults)`,
+        },
+      });
+      await expect(
+        partial.store.reserve(workflowRequest('new', 'new-run')),
+      ).rejects.toBeInstanceOf(StartReservationUnreadableError);
+      expect(
+        partial.sqlite
+          .prepare(`PRAGMA table_xinfo(${START_IDEMPOTENCY_TABLE})`)
+          .all(),
+      ).toHaveLength(10 + stage);
+    }
+    for (const [schema, field] of [
+      [
+        START_IDEMPOTENCY_DDL.replace(
+          'start_token TEXT',
+          'start_token INTEGER',
+        ),
+        'start_token',
+      ],
+      [
+        START_IDEMPOTENCY_DDL.replace(
+          'start_table_prefix TEXT',
+          'start_table_prefix TEXT DEFAULT NULL',
+        ),
+        'start_table_prefix',
+      ],
+      [
+        START_IDEMPOTENCY_DDL.replace(
+          'owner_id TEXT NOT NULL,\n    target_kind',
+          'target_id_alias TEXT NOT NULL,\n    target_kind',
+        ),
+        'owner_id',
+      ],
+    ] as const) {
+      const malformed = harness();
+      malformed.sqlite.exec(schema);
+      const ownerColumn = schema.includes('target_id_alias')
+        ? 'target_id_alias'
+        : 'owner_id';
+      malformed.sqlite.exec(
+        `INSERT INTO ${START_IDEMPOTENCY_TABLE} (key,owner_kind,${ownerColumn},target_kind,target_id,run_id,state,created_at,updated_at) VALUES ('key','human','operator-1','workflow','payout','run','started',10,20)`,
+      );
+      await expect(malformed.store.read('key')).rejects.toMatchObject({
+        cause: {
+          message: `${START_IDEMPOTENCY_TABLE} has an invalid reservation schema (column ${field} differs)`,
+        },
+      });
+    }
+  });
+
+  it('keeps reserve claim release and settle on legacy-null rows in A', async () => {
+    const { store, sqlite } = harness();
+    const created = await store.reserve(workflowRequest('key', 'run'));
+    expect(created.reservation.binding).toEqual({ kind: 'legacy' });
+    expect(await store.claim('key', 'run')).toBe(true);
+    expect(await store.release('key', 'run')).toBe(true);
+    expect(await store.claim('key', 'run')).toBe(true);
+    expect(await store.settleRun('run')).toBe(1);
+    expect(rows(sqlite)).toEqual([
+      expect.objectContaining({ ...legacyBinding, state: 'terminal' }),
+    ]);
+  });
+
+  it('captures the first ready getter result with the store receiver', async () => {
+    const { sqlite, binding } = harness();
+    let getterReads = 0;
+    const calls: number[] = [];
+    const receivers: StartIdempotencyStore[] = [];
+    const store = new StartIdempotencyStore(binding, {
+      get ready() {
+        const selected = ++getterReads;
+        return async function (this: StartIdempotencyStore) {
+          calls.push(selected);
+          receivers.push(this);
+          sqlite.exec(START_IDEMPOTENCY_DDL);
+        };
+      },
+    });
+    await store.reserve(workflowRequest('first', 'first-run'));
+    await store.reserve(workflowRequest('second', 'second-run'));
+    expect(getterReads).toBe(1);
+    expect(calls).toEqual([1, 1]);
+    expect(receivers).toEqual([store, store]);
+  });
+
+  it('captures reserve authority and mint callback before readiness waits', async () => {
+    const { sqlite, binding } = harness();
+    let calls = 0;
+    const request = {
+      key: 'key',
+      owner: { ...OWNER, id: 'operator-1' },
+      targetKind: 'agent' as 'agent' | 'workflow',
+      targetId: 'agent',
+      threadId: 'thread',
+      marker: 'receiver',
+      mintRunId() {
+        expect(this.marker).toBe('receiver');
+        calls += 1;
+        this.targetId = 'mint-mutated';
+        return 'run';
+      },
+    };
+    const store = new StartIdempotencyStore(binding, {
+      ready: async () => {
+        sqlite.exec(START_IDEMPOTENCY_DDL);
+        request.owner.id = 'other';
+        request.targetKind = 'workflow';
+        request.targetId = 'changed';
+        request.threadId = 'changed';
+        request.mintRunId = () => {
+          throw new Error('replacement mint');
+        };
+      },
+    });
+    const created = await store.reserve(request);
+    expect(calls).toBe(1);
+    expect(created.reservation).toMatchObject({
+      owner: OWNER,
+      targetKind: 'agent',
+      targetId: 'agent',
+      threadId: 'thread',
+      runId: 'run',
+      binding: { kind: 'legacy' },
+    });
+    const counts = new Map<string, number>();
+    const data = workflowRequest('getter-key', 'getter-run');
+    const getters = Object.defineProperties(
+      {},
+      Object.fromEntries(
+        Object.entries(data).map(([field, value]) => [
+          field,
+          {
+            get() {
+              const count = (counts.get(field) ?? 0) + 1;
+              counts.set(field, count);
+              return count === 1 ? value : 'changed';
+            },
+          },
+        ]),
+      ),
+    );
+    await expect(
+      new StartIdempotencyStore(binding).reserve(getters as typeof data),
+    ).resolves.toMatchObject({
+      created: true,
+      reservation: { targetId: 'payout' },
+    });
+    expect([...counts.values()].every((count) => count === 1)).toBe(true);
+    const invalid = harness();
+    await expect(
+      invalid.store.reserve({
+        ...workflowRequest('key', 'run'),
+        mintRunId: false as never,
+      }),
+    ).rejects.toBeInstanceOf(InvalidStartIdempotencyRequestError);
+    expect(
+      invalid.sqlite
+        .prepare('SELECT name FROM sqlite_schema WHERE type = ?')
+        .all('table'),
+    ).toEqual([]);
+    const shadowed = harness();
+    let readyCalls = 0;
+    let mintCalls = 0;
+    const mint = () => {
+      mintCalls += 1;
+      return 'captured-run';
+    };
+    const ready = async () => {
+      readyCalls += 1;
+      shadowed.sqlite.exec(START_IDEMPOTENCY_DDL);
+      Object.defineProperty(mint, 'call', { value: () => 'replacement-run' });
+    };
+    Object.defineProperty(ready, 'call', {
+      value: () => {
+        throw new Error('shadowed call invoked');
+      },
+    });
+    await expect(
+      new StartIdempotencyStore(shadowed.binding, { ready }).reserve({
+        ...workflowRequest('shadowed', 'unused'),
+        mintRunId: mint,
+      }),
+    ).resolves.toMatchObject({ reservation: { runId: 'captured-run' } });
+    expect([readyCalls, mintCalls]).toEqual([1, 1]);
+  });
+
+  it.each([
+    {
+      name: 'a binding tail hole',
+      missingToken: true,
+      schemaStage: 3,
+      cause: 'binding prefix has a hole',
+    },
+    {
+      name: 'a row binding ahead of the schema',
+      missingToken: false,
+      schemaStage: 2,
+      cause: 'schema observation precedes row binding',
+    },
+  ])('rejects $name without writes', async (scenario) => {
+    const { sqlite, binding } = schemaHarness(3);
+    const before = rows(sqlite);
+    const observed = before.map((row) => ({ ...row }));
+    if (scenario.missingToken) {
+      for (const row of observed) delete row.start_token;
+    }
+    const schema = sqlite
+      .prepare(`PRAGMA table_xinfo(${START_IDEMPOTENCY_TABLE})`)
+      .all();
+    const statements: string[] = [];
+    const store = new StartIdempotencyStore(
+      interceptReservations(binding, async (sql, execute) => {
+        statements.push(sql);
+        if (sql.startsWith('SELECT *')) return { results: observed };
+        if (sql.startsWith('PRAGMA'))
+          return { results: schema.slice(0, 10 + scenario.schemaStage) };
+        return execute();
+      }),
+    );
+    for (const read of [
+      () => store.read('key'),
+      () => store.reservationsForRuns(['run']),
+    ]) {
+      const error = await read().catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(StartReservationUnreadableError);
+      expect((error as StartReservationUnreadableError).status).toBe(503);
+      expect(String((error as Error).cause)).toContain(scenario.cause);
+    }
+    expect(statements.every((sql) => /^(SELECT|PRAGMA)/.test(sql))).toBe(true);
+    expect(rows(sqlite)).toEqual(before);
+    expect(
+      sqlite.prepare(`PRAGMA table_xinfo(${START_IDEMPOTENCY_TABLE})`).all(),
+    ).toEqual(schema);
+  });
+
+  it('rejects invalid reservation observations without absence fallback', async () => {
+    const { sqlite, binding } = schemaHarness(3);
+    const valid = rows(sqlite)[0];
+    if (valid === undefined) throw new Error('fixture reservation is missing');
+    const cases = [
+      {
+        name: 'wrong key',
+        rows: [{ ...valid, key: 'other-key' }],
+        lookup: false,
+        schemaMissing: false,
+        cause: 'requested singleton key',
+      },
+      {
+        name: 'multiple rows',
+        rows: [valid, valid],
+        lookup: false,
+        schemaMissing: false,
+        cause: 'requested singleton key',
+      },
+      {
+        name: 'foreign run',
+        rows: [{ ...valid, run_id: 'other-run' }],
+        lookup: true,
+        schemaMissing: false,
+        cause: 'unrequested run',
+      },
+      ...Object.keys(valid)
+        .slice(0, 10)
+        .map((field) => {
+          const copy = { ...valid };
+          delete copy[field];
+          return {
+            name: `missing ${field}`,
+            rows: [copy],
+            lookup: false,
+            schemaMissing: false,
+            cause: `row is missing ${field}`,
+          };
+        }),
+      ...[[], [valid]].map((result) => ({
+        name: 'schema disappeared',
+        rows: result,
+        lookup: false,
+        schemaMissing: true,
+        cause: 'row observation has no schema',
+      })),
+    ];
+    for (const scenario of cases) {
+      const statements: string[] = [];
+      const store = new StartIdempotencyStore(
+        interceptReservations(binding, async (sql, execute) => {
+          statements.push(sql);
+          if (sql.startsWith('SELECT *')) return { results: scenario.rows };
+          if (scenario.schemaMissing && sql.startsWith('PRAGMA'))
+            return { results: [] };
+          return execute();
+        }),
+      );
+      const error = await (scenario.lookup
+        ? store.reservationsForRuns(['run'])
+        : store.read('key')
+      ).catch((error: unknown) => error);
+      expect(error, scenario.name).toBeInstanceOf(
+        StartReservationUnreadableError,
+      );
+      expect((error as StartReservationUnreadableError).status).toBe(503);
+      expect(String((error as Error).cause), scenario.name).toContain(
+        scenario.cause,
+      );
+      expect(statements.every((sql) => /^(SELECT|PRAGMA)/.test(sql))).toBe(
+        true,
+      );
+      expect(rows(sqlite)).toEqual([valid]);
+    }
   });
 });
 

@@ -120,6 +120,9 @@ describe('deployment identity provisioning', () => {
         transition_revision: 0,
         mutation_epoch: 0,
         require_mutation_epoch: 0,
+        proof_table_prefix: null,
+        proof_workflow_id: null,
+        proof_start_token: null,
       },
     ];
     expect(
@@ -161,6 +164,59 @@ describe('deployment identity provisioning', () => {
     expect(
       sqlite.prepare(`SELECT * FROM ${EXECUTION_FENCE_TABLE}`).all(),
     ).toEqual([]);
+  });
+
+  it('preserves active fence metadata while provisioning proof schema prefixes', async () => {
+    const proofColumns = [
+      'proof_table_prefix',
+      'proof_workflow_id',
+      'proof_start_token',
+    ];
+    for (const stage of [4, 5, 6]) {
+      const sqlite = openSqlite();
+      const db = sqliteUnitDatabase(sqlite) as DeploymentIdentityDatabase;
+      const fence = new ExecutionFenceStore(db, { now: () => 17 });
+      const reading = await fence.transition({
+        expected: 'open',
+        next: 'proof-only',
+        proofKey: 'key',
+        expectedMutationEpoch: 0,
+        expectedRevision: 0,
+        advanceMutationEpoch: true,
+      });
+      await fence.recordProofRun('key', 'run', reading);
+      for (const name of proofColumns.slice(stage - 4).reverse())
+        sqlite.exec(`ALTER TABLE ${EXECUTION_FENCE_TABLE} DROP COLUMN ${name}`);
+      const before = (
+        await db
+          .prepare(`SELECT * FROM ${EXECUTION_FENCE_TABLE}`)
+          .all<Record<string, unknown>>()
+      ).results[0];
+      expect(before).toBeDefined();
+      await seedDeploymentIdentity(db, 'acme', 'open');
+      expect(
+        sqlite.prepare(`SELECT * FROM ${EXECUTION_FENCE_TABLE}`).get(),
+      ).toEqual({
+        ...before,
+        proof_table_prefix: null,
+        proof_workflow_id: null,
+        proof_start_token: null,
+      });
+      expect(
+        sqlite.prepare(`PRAGMA table_xinfo(${EXECUTION_FENCE_TABLE})`).all(),
+      ).toHaveLength(12);
+      await expect(fence.read()).resolves.toEqual({
+        ...reading,
+        proofRunId: 'run',
+      });
+      const after = sqlite
+        .prepare(`SELECT * FROM ${EXECUTION_FENCE_TABLE}`)
+        .get();
+      await seedDeploymentIdentity(db, 'acme', 'migration-locked');
+      expect(
+        sqlite.prepare(`SELECT * FROM ${EXECUTION_FENCE_TABLE}`).get(),
+      ).toEqual(after);
+    }
   });
 
   it('preserves the runtime seed vocabulary and the provisioning birth-state restriction', async () => {

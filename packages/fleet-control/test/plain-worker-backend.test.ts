@@ -61,6 +61,9 @@ it('seeds optional FS8 metadata through string-bound provider SQL', async () => 
       transition_revision: 0,
       mutation_epoch: 0,
       require_mutation_epoch: 0,
+      proof_table_prefix: null,
+      proof_workflow_id: null,
+      proof_start_token: null,
     },
   ]);
   expect(api.queries.length).toBeGreaterThan(0);

@@ -92,6 +92,11 @@ import {
 } from '../approval-api/principal-identity.js';
 import { missingTableReadsEmpty } from './cause-chain.js';
 import { DoStatusError } from './do-status-error.js';
+import {
+  normalizeRunExecutionIdentity,
+  normalizeStartIdentity,
+  type RunExecutionIdentity,
+} from './execution-admission.js';
 import type { ExecutionFenceWiring } from './execution-fence.js';
 import { isExecutionFenceRefusal } from './execution-fence.js';
 import { isPathSafeId } from './path-safe-id.js';
@@ -169,6 +174,16 @@ export interface StartReservation {
    * column the purge horizon is measured from once the row is terminal.
    */
   readonly updatedAt: number;
+  readonly binding?: StartReservationBinding;
+}
+
+export type StartReservationBinding =
+  | { readonly kind: 'legacy' }
+  | { readonly kind: 'unbound' }
+  | { readonly kind: 'bound'; readonly execution: RunExecutionIdentity };
+
+export interface StartReservationReading extends StartReservation {
+  readonly binding: StartReservationBinding;
 }
 
 export interface StartReservationRequest {
@@ -203,7 +218,7 @@ export interface StartReservationRequest {
 
 export interface StartReservationOutcome {
   /** The authoritative reservation — this caller's, or the winner's. */
-  reservation: StartReservation;
+  reservation: StartReservationReading;
   /**
    * Whether THIS call created the row. Only a creator may go straight to the
    * claim; everyone else takes the replay path, which is where the "what
@@ -507,7 +522,7 @@ const OWNER_KIND_CHECK = EXECUTION_PRINCIPAL_KINDS.map(
  * an unknown state would otherwise be a reservation no CAS can advance and no
  * purge can reap — a permanently wedged key.
  */
-export const START_IDEMPOTENCY_DDL = `CREATE TABLE IF NOT EXISTS ${START_IDEMPOTENCY_TABLE} (
+const START_IDEMPOTENCY_BASE_COLUMNS = `
     key TEXT PRIMARY KEY,
     owner_kind TEXT NOT NULL CHECK (owner_kind IN (${OWNER_KIND_CHECK})),
     owner_id TEXT NOT NULL,
@@ -517,7 +532,31 @@ export const START_IDEMPOTENCY_DDL = `CREATE TABLE IF NOT EXISTS ${START_IDEMPOT
     thread_id TEXT,
     state TEXT NOT NULL CHECK (state IN (${STATE_CHECK})),
     created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL`;
+const START_IDEMPOTENCY_ADDITIONS = [
+  'start_token TEXT',
+  'start_table_prefix TEXT',
+  'start_workflow_id TEXT',
+] as const;
+const START_IDEMPOTENCY_COLUMNS = [
+  ['key', 'TEXT', 0, 1],
+  ['owner_kind', 'TEXT', 1, 0],
+  ['owner_id', 'TEXT', 1, 0],
+  ['target_kind', 'TEXT', 1, 0],
+  ['target_id', 'TEXT', 1, 0],
+  ['run_id', 'TEXT', 1, 0],
+  ['thread_id', 'TEXT', 0, 0],
+  ['state', 'TEXT', 1, 0],
+  ['created_at', 'INTEGER', 1, 0],
+  ['updated_at', 'INTEGER', 1, 0],
+  ['start_token', 'TEXT', 0, 0],
+  ['start_table_prefix', 'TEXT', 0, 0],
+  ['start_workflow_id', 'TEXT', 0, 0],
+] as const;
+type StartReservationSchemaStage = 0 | 1 | 2 | 3;
+
+export const START_IDEMPOTENCY_DDL = `CREATE TABLE IF NOT EXISTS ${START_IDEMPOTENCY_TABLE} (${START_IDEMPOTENCY_BASE_COLUMNS},
+    ${START_IDEMPOTENCY_ADDITIONS.join(',\n    ')}
   )`;
 
 /**
@@ -533,17 +572,85 @@ export const START_IDEMPOTENCY_RUN_INDEX_DDL = `CREATE INDEX IF NOT EXISTS ${STA
 export const START_IDEMPOTENCY_STATE_INDEX_DDL = `CREATE INDEX IF NOT EXISTS ${START_IDEMPOTENCY_TABLE}_state
     ON ${START_IDEMPOTENCY_TABLE} (state, updated_at)`;
 
-interface StartReservationRow {
-  key?: unknown;
-  owner_kind?: unknown;
-  owner_id?: unknown;
-  target_kind?: unknown;
-  target_id?: unknown;
-  run_id?: unknown;
-  thread_id?: unknown;
-  state?: unknown;
-  created_at?: unknown;
-  updated_at?: unknown;
+type StartReservationRow = Readonly<Record<string, unknown>>;
+
+class ReservationSchemaError extends Error {
+  constructor(reason: string) {
+    super(
+      `${START_IDEMPOTENCY_TABLE} has an invalid reservation schema (${reason})`,
+    );
+    this.name = 'ReservationSchemaError';
+  }
+}
+
+function reservationResultRows(result: unknown): StartReservationRow[] {
+  if (
+    result === null ||
+    typeof result !== 'object' ||
+    ('success' in result && result.success !== true) ||
+    !('results' in result) ||
+    !Array.isArray(result.results)
+  ) {
+    throw new Error('reservation statement returned an invalid result');
+  }
+  for (const row of result.results) {
+    if (row === null || typeof row !== 'object' || Array.isArray(row)) {
+      throw new Error('reservation statement returned an invalid row');
+    }
+  }
+  return result.results;
+}
+
+function reservationBinding(
+  row: StartReservationRow,
+  schemaStage: StartReservationSchemaStage,
+): StartReservationBinding {
+  let stage = 0;
+  let missing = false;
+  for (const [name] of START_IDEMPOTENCY_COLUMNS.slice(10)) {
+    if (Object.hasOwn(row, name)) {
+      if (missing)
+        throw new ReservationSchemaError('binding prefix has a hole');
+      stage += 1;
+    } else missing = true;
+  }
+  if (stage > schemaStage)
+    throw new ReservationSchemaError('schema observation precedes row binding');
+  if (stage < 3) {
+    for (const [name] of START_IDEMPOTENCY_COLUMNS.slice(10, 10 + stage)) {
+      if (row[name] !== null)
+        throw new ReservationSchemaError(
+          'partial binding is not legacy defaults',
+        );
+    }
+    return { kind: 'legacy' };
+  }
+  const {
+    start_token: token,
+    start_table_prefix: prefix,
+    start_workflow_id: workflowId,
+  } = row;
+  if (prefix === null && workflowId === null) {
+    if (token === null) return { kind: 'legacy' };
+    if (token === '') return { kind: 'unbound' };
+  }
+  const execution = normalizeRunExecutionIdentity({
+    tablePrefix: prefix,
+    workflowId,
+    runId: row.run_id,
+    startToken: token,
+  });
+  if (execution.tablePrefix !== prefix)
+    throw new ReservationSchemaError('binding prefix is not canonical');
+  normalizeStartIdentity({
+    owner: { kind: row.owner_kind, id: row.owner_id },
+    target: {
+      kind: row.target_kind,
+      id: row.target_id,
+      ...(row.thread_id === null ? {} : { threadId: row.thread_id }),
+    },
+  });
+  return { kind: 'bound', execution };
 }
 
 function isStartReservationState(
@@ -584,7 +691,14 @@ function isEpochMs(value: unknown): value is number {
  * starting since 1970. Refusing the row keeps both faults visible as the 503
  * they are.
  */
-function reservationFromRow(row: StartReservationRow): StartReservation {
+function reservationFromRow(
+  row: StartReservationRow,
+  schemaStage: StartReservationSchemaStage,
+): StartReservationReading {
+  for (const [name] of START_IDEMPOTENCY_COLUMNS.slice(0, 10)) {
+    if (!Object.hasOwn(row, name))
+      throw new ReservationSchemaError(`row is missing ${name}`);
+  }
   const {
     key,
     owner_kind: ownerKind,
@@ -608,9 +722,7 @@ function reservationFromRow(row: StartReservationRow): StartReservation {
     !isEpochMs(createdAt) ||
     !isEpochMs(updatedAt)
   ) {
-    throw new StartReservationUnreadableError(
-      typeof key === 'string' ? key : '(unknown)',
-    );
+    throw new Error('start reservation row is malformed');
   }
   return {
     key,
@@ -622,6 +734,7 @@ function reservationFromRow(row: StartReservationRow): StartReservation {
     state,
     createdAt,
     updatedAt,
+    binding: reservationBinding(row, schemaStage),
   };
 }
 
@@ -708,8 +821,15 @@ export class StartIdempotencyStore {
   ) {
     this.#db = db;
     this.#now = options.now ?? Date.now;
-    if (options.ready) {
-      this.#ready = options.ready;
+    const ready = options.ready;
+    if (ready) {
+      this.#ready = async () => {
+        await Reflect.apply(ready, this, []);
+        if ((await this.#schemaStage()) !== 3)
+          throw new ReservationSchemaError(
+            'host readiness did not reach the current schema',
+          );
+      };
     } else {
       let ready: Promise<void> | undefined;
       this.#ready = () => {
@@ -742,12 +862,13 @@ export class StartIdempotencyStore {
   ): Promise<StartReservationOutcome> {
     const key = assertKey(request.key);
     const owner = assertOwner(request.owner);
-    if (!isStartTargetKind(request.targetKind)) {
+    const { targetKind, targetId, threadId, mintRunId } = request;
+    if (!isStartTargetKind(targetKind)) {
       throw new InvalidStartIdempotencyRequestError(
         `target kind must be one of ${START_TARGET_KINDS.join(', ')}`,
       );
     }
-    if (!isPathSafeId(request.targetId)) {
+    if (!isPathSafeId(targetId)) {
       throw new InvalidStartIdempotencyRequestError(
         'target id must be a URL-path-safe identifier',
       );
@@ -757,19 +878,28 @@ export class StartIdempotencyStore {
     // one is a run a retry can never reach, and a workflow reservation WITH one
     // is a second, silently divergent copy of an address that is already
     // derivable from (workflowId, runId).
-    if (request.targetKind === 'agent') {
-      if (!isPathSafeId(request.threadId)) {
+    if (targetKind === 'agent') {
+      if (!isPathSafeId(threadId)) {
         throw new InvalidStartIdempotencyRequestError(
           'an agent start reservation requires a URL-path-safe threadId',
         );
       }
-    } else if (request.threadId !== undefined) {
+    } else if (threadId !== undefined) {
       throw new InvalidStartIdempotencyRequestError(
         'threadId applies only to agent start reservations',
       );
     }
-    await this.#ready();
-    const candidateRunId = request.mintRunId();
+    if (typeof mintRunId !== 'function') {
+      throw new InvalidStartIdempotencyRequestError(
+        'mintRunId must be a function',
+      );
+    }
+    try {
+      await this.#ready();
+    } catch (error) {
+      throw new StartReservationUnreadableError(key, { cause: error });
+    }
+    const candidateRunId = Reflect.apply(mintRunId, request, []);
     if (!isPathSafeId(candidateRunId)) {
       throw new InvalidStartIdempotencyRequestError(
         'the host minted a runId that is not URL-path-safe',
@@ -788,10 +918,10 @@ export class StartIdempotencyStore {
           key,
           owner.kind,
           owner.id,
-          request.targetKind,
-          request.targetId,
+          targetKind,
+          targetId,
           candidateRunId,
-          request.threadId ?? null,
+          threadId ?? null,
           now,
           now,
         )
@@ -809,10 +939,7 @@ export class StartIdempotencyStore {
     if (stored.owner.kind !== owner.kind || stored.owner.id !== owner.id) {
       throw new StartReservationOwnerMismatchError(key);
     }
-    if (
-      stored.targetKind !== request.targetKind ||
-      stored.targetId !== request.targetId
-    ) {
+    if (stored.targetKind !== targetKind || stored.targetId !== targetId) {
       throw new StartReservationTargetMismatchError(key, stored);
     }
     // Both signals must agree before this caller believes it created the row.
@@ -905,31 +1032,149 @@ export class StartIdempotencyStore {
    * An absent TABLE reads as an absent reservation, because on a deployment
    * where no key has ever been used those are the same fact.
    */
-  async read(key: string): Promise<StartReservation | undefined> {
+  async read(key: string): Promise<StartReservationReading | undefined> {
     const safeKey = assertKey(key);
-    let rows: StartReservationRow[];
-    try {
-      rows = (
-        await this.#db
-          .prepare(
-            `SELECT key, owner_kind, owner_id, target_kind, target_id, run_id,
-                    thread_id, state, created_at, updated_at
-             FROM ${START_IDEMPOTENCY_TABLE} WHERE key = ?`,
-          )
-          .bind(safeKey)
-          .all<StartReservationRow>()
-      ).results;
-    } catch (error) {
-      if (isMissingReservationTable(error)) return undefined;
-      throw new StartReservationUnreadableError(safeKey, { cause: error });
+    const rows = await this.#readReservations(
+      `SELECT * FROM ${START_IDEMPOTENCY_TABLE} WHERE key = ? LIMIT 2`,
+      [safeKey],
+      safeKey,
+    );
+    if (rows.length > 1 || (rows[0] !== undefined && rows[0].key !== safeKey)) {
+      throw new StartReservationUnreadableError(safeKey, {
+        cause: new Error(
+          'reservation query did not return the requested singleton key',
+        ),
+      });
     }
     const row = rows[0];
-    return row === undefined ? undefined : reservationFromRow(row);
+    return row;
+  }
+
+  async #schemaStage(): Promise<StartReservationSchemaStage | undefined> {
+    const columns = reservationResultRows(
+      await this.#db
+        .prepare(`PRAGMA table_xinfo(${START_IDEMPOTENCY_TABLE})`)
+        .all(),
+    );
+    if (columns.length === 0) return undefined;
+    if (
+      columns.length < 10 ||
+      columns.length > START_IDEMPOTENCY_COLUMNS.length
+    ) {
+      throw new ReservationSchemaError('unexpected columns');
+    }
+    for (const [index, actual] of columns.entries()) {
+      const expected = START_IDEMPOTENCY_COLUMNS[index];
+      if (expected === undefined)
+        throw new ReservationSchemaError('unexpected columns');
+      const [name, type, notnull, pk] = expected;
+      if (
+        actual.name !== name ||
+        actual.type !== type ||
+        actual.notnull !== notnull ||
+        actual.pk !== pk ||
+        actual.dflt_value !== null ||
+        actual.hidden !== 0
+      ) {
+        throw new ReservationSchemaError(`column ${name} differs`);
+      }
+    }
+    return (columns.length - 10) as StartReservationSchemaStage;
+  }
+
+  async #readReservations(
+    sql: string,
+    bindings: readonly unknown[],
+    key: string,
+  ): Promise<StartReservationReading[]> {
+    try {
+      let result: unknown;
+      try {
+        result = await this.#db
+          .prepare(sql)
+          .bind(...bindings)
+          .all();
+      } catch (error) {
+        if (isMissingReservationTable(error)) return [];
+        throw error;
+      }
+      const rows = reservationResultRows(result);
+      const stage = await this.#schemaStage();
+      if (stage === undefined)
+        throw new ReservationSchemaError('row observation has no schema');
+      return rows.map((row) => reservationFromRow(row, stage));
+    } catch (error) {
+      throw new StartReservationUnreadableError(key, { cause: error });
+    }
+  }
+
+  async #migrationStage(): Promise<StartReservationSchemaStage> {
+    const stage = await this.#schemaStage();
+    if (stage === undefined)
+      throw new ReservationSchemaError(
+        'table is missing during initialization',
+      );
+    if (stage === 0 || stage === 3) return stage;
+    const predicate = START_IDEMPOTENCY_COLUMNS.slice(10, 10 + stage)
+      .map(([name]) => `${name} IS NOT NULL`)
+      .join(' OR ');
+    const rows = reservationResultRows(
+      await this.#db
+        .prepare(
+          `SELECT * FROM ${START_IDEMPOTENCY_TABLE} WHERE ${predicate} LIMIT 1`,
+        )
+        .all(),
+    );
+    const observed = await this.#schemaStage();
+    if (observed === undefined || observed < stage)
+      throw new ReservationSchemaError(
+        'schema regressed during initialization',
+      );
+    if (rows.length > 1)
+      throw new ReservationSchemaError(
+        'partial binding query returned multiple rows',
+      );
+    for (const row of rows) reservationFromRow(row, observed);
+    return observed;
   }
 
   /** Create the table and its two access paths. Only `reserve()` reaches this. */
   async #createSchema(): Promise<void> {
-    await this.#db.prepare(START_IDEMPOTENCY_DDL).run();
+    if ((await this.#schemaStage()) === undefined) {
+      await this.#db.prepare(START_IDEMPOTENCY_DDL).run();
+    }
+    for (
+      let index: number = await this.#migrationStage();
+      index < START_IDEMPOTENCY_ADDITIONS.length;
+      index += 1
+    ) {
+      const stage = await this.#migrationStage();
+      if (stage < index)
+        throw new ReservationSchemaError(
+          'schema regressed during initialization',
+        );
+      if (stage > index) continue;
+      try {
+        await this.#db
+          .prepare(
+            `ALTER TABLE ${START_IDEMPOTENCY_TABLE} ADD COLUMN ${START_IDEMPOTENCY_ADDITIONS[index]}`,
+          )
+          .run();
+      } catch (error) {
+        let observed: StartReservationSchemaStage | undefined;
+        try {
+          observed = await this.#schemaStage();
+        } catch (readError) {
+          if (readError instanceof ReservationSchemaError) throw readError;
+          throw error;
+        }
+        if (observed === undefined || observed <= index) throw error;
+      }
+    }
+    if ((await this.#schemaStage()) !== 3)
+      throw new ReservationSchemaError(
+        'initialization did not reach the current schema',
+      );
     await this.#db.prepare(START_IDEMPOTENCY_RUN_INDEX_DDL).run();
     await this.#db.prepare(START_IDEMPOTENCY_STATE_INDEX_DDL).run();
   }
@@ -941,29 +1186,22 @@ export class StartIdempotencyStore {
    */
   async reservationsForRuns(
     runIds: readonly string[],
-  ): Promise<StartReservation[]> {
+  ): Promise<StartReservationReading[]> {
     const safeRunIds = runIds.filter((runId) => isPathSafeId(runId));
     if (safeRunIds.length === 0) return [];
     const placeholders = safeRunIds.map(() => '?').join(', ');
-    let rows: StartReservationRow[];
-    try {
-      rows = (
-        await this.#db
-          .prepare(
-            `SELECT key, owner_kind, owner_id, target_kind, target_id, run_id,
-                    thread_id, state, created_at, updated_at
-             FROM ${START_IDEMPOTENCY_TABLE} WHERE run_id IN (${placeholders})`,
-          )
-          .bind(...safeRunIds)
-          .all<StartReservationRow>()
-      ).results;
-    } catch (error) {
-      if (isMissingReservationTable(error)) return [];
+    const rows = await this.#readReservations(
+      `SELECT * FROM ${START_IDEMPOTENCY_TABLE} WHERE run_id IN (${placeholders})`,
+      safeRunIds,
+      '(run lookup)',
+    );
+    const requested = new Set(safeRunIds);
+    if (rows.some((row) => !requested.has(row.runId))) {
       throw new StartReservationUnreadableError('(run lookup)', {
-        cause: error,
+        cause: new Error('reservation lookup returned an unrequested run'),
       });
     }
-    return rows.map((row) => reservationFromRow(row));
+    return rows;
   }
 
   async #casState(

@@ -166,13 +166,34 @@ Flowsafe does not maintain a parallel custom workflow state object.
 
 `flowsafe_execution_fence` stores the deployment's singleton fence state, optional proof key, bound proof run, mutation epoch, sticky epoch requirement, and transition revision. The epoch identifies artifact authority; an explicit `advanceMutationEpoch: true` increments it once and enables the requirement in the same compare-and-set. Every newly applied administrative command increments the revision, including same-state and legacy commands. Ordinary lock, proof, and reopen commands preserve the epoch and requirement.
 
-A missing pre-0.20 table or empty five-column legacy table reads as optional `open`, with epoch and revision zero. Initialization seeds only that legacy shape, then adds four metadata columns in order. Interrupted additive upgrades resume without changing the state, proof fields, or timestamp. A missing row once any metadata column exists is unreadable, never implicitly open or refilled. Readers allow one bounded re-observation when an empty legacy row read races a concurrent schema upgrade. Deleting the whole table or restoring an old-format backup is indistinguishable from genuine legacy absence.
+A missing pre-0.20 table or empty five-column legacy table reads as optional `open`, with epoch and revision zero. Initialization seeds only that legacy shape, then adds mutation and proof metadata columns in order. Interrupted additive upgrades resume without changing the state, proof fields, or timestamp. A missing row once any metadata column exists is unreadable, never implicitly open or refilled. Readers allow one bounded re-observation when an empty legacy row read races a concurrent schema upgrade. Deleting the whole table or restoring an old-format backup is indistinguishable from genuine legacy absence.
 
 Store reads are uncached and require an authoritative database binding, not an unconstrained read replica. Metadata versioning is administrative state, not a guarantee that every run or schedule writer enforces it. Activate the epoch requirement only after every writer supports final-write epoch checks; administrative support alone is insufficient.
 
 `recordProofRun(key, runId, admitted)` binds proof metadata only at the admitted epoch and revision. Two-argument legacy calls work only while the requirement is optional. Neither form changes the administrative revision or receipt, and a retry of the same binding preserves its timestamp. This metadata write is not itself atomic run admission.
 
 `flowsafe_start_idempotency` stores owner, target, server-minted run ID, reservation state, and timestamps. The claim from `reserved` to `started` is the cross-isolate serializer. Terminal run cleanup pairs snapshot and reservation retention so a spent key remains distinguishable from a fresh key until its configured horizon expires.
+
+Reservation reads also return a `binding`: `legacy` for an unassociated old-format row, `unbound` for a modern row awaiting association, or `bound` with an execution identity. A bound identity has `tablePrefix`, `workflowId`, `runId`, and `startToken`. A null prefix explicitly asserts no D1 namespace; it differs from the empty string, which identifies the default D1 tables. Schema upgrades preserve existing rows and add nullable binding columns. Current reservation writes still produce legacy bindings; automatic generation binding is not enabled.
+
+The fence can retain a complete D1 proof identity alongside `proofRunId`. Store readings expose it as `proofExecution`; admin JSON excludes that identity and its token. Adding its nullable columns preserves active epochs, revisions, receipts, proof fields, and timestamps. Provisioning validates structural schema metadata; Runtime additionally validates proof identifiers and canonical prefixes. Provisioning does not repair corrupt identity or receipt bytes. These representations do not change the current run-ID-based execution predicates.
+
+### Validate execution identity data
+
+The `do-runner` and `host-kit` entry points export identity and mutation-epoch helpers. The normalizers copy and freeze validated data; they do not authenticate a caller or establish execution authority:
+
+| Helper | Result |
+| --- | --- |
+| `normalizeRunExecutionIdentity` | Validates workflow/run/token fields and normalizes a string prefix to lowercase, preserving explicit null |
+| `normalizeD1RunExecutionIdentity` | Requires a string D1 prefix, including the empty default prefix |
+| `normalizeStartIdentity` | Validates the original principal and a workflow or agent target; agent targets require a thread |
+| `normalizeStartExecutionIdentity` | Validates both identity shapes without inferring an owner or root/child relationship |
+| `normalizeMutationEpoch` | Accepts undefined or a nonnegative safe-integer number without string coercion |
+| `assertMutationEpoch` | Compares an already-observed fence reading to a supplied epoch; it does not make a later write atomic |
+
+Invalid identity or epoch input returns the corresponding `INVALID_EXECUTION_IDENTITY` or `INVALID_MUTATION_EPOCH` error with status 400. An active epoch mismatch returns `MUTATION_EPOCH_MISMATCH` with status 409 and a `missing`, `stale`, or `future` classification. Malformed reading metadata remains `EXECUTION_FENCE_UNREADABLE` with status 503.
+
+`MUTATION_EPOCH_HEADER`, `mutationEpochFromHeader`, and `stampMutationEpoch` encode canonical decimal epochs for a trusted internal channel. Authenticate that channel before interpreting its header. The helpers do not add host forwarding or request enforcement; activation still requires final-write support from every writer.
 
 ### Snapshot provenance
 

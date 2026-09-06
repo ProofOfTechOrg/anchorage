@@ -79,6 +79,8 @@ const fenceColumns = [
   ['updated_at', 'INTEGER', 1, 0, null], ['last_transition_request', 'TEXT', 0, 0, null],
   ['transition_revision', 'INTEGER', 1, 0, '0'], ['mutation_epoch', 'INTEGER', 1, 0, '0'],
   ['require_mutation_epoch', 'INTEGER', 1, 0, '0'],
+  ['proof_table_prefix', 'TEXT', 0, 0, null], ['proof_workflow_id', 'TEXT', 0, 0, null],
+  ['proof_start_token', 'TEXT', 0, 0, null],
 ];
 const schema = \`CREATE TABLE flowsafe_deployment (
   id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -108,7 +110,7 @@ if (sql.startsWith('SELECT name, sql')) {
 } else if (sql.startsWith('ALTER TABLE ' + FENCE + ' ADD COLUMN ')) {
   const name = sql.slice(('ALTER TABLE ' + FENCE + ' ADD COLUMN ').length).split(' ')[0];
   if (!state.fenceRow || name !== fenceColumns[5 + state.fenceStage]?.[0]) throw new Error('unexpected fence ALTER stage');
-  state.fenceRow[name] = state.fenceStage === 0 ? null : 0;
+  state.fenceRow[name] = fenceColumns[5 + state.fenceStage][4] === null ? null : 0;
   state.fenceStage += 1;
   results = [];
 } else if (sql.startsWith('INSERT OR IGNORE INTO ' + FENCE)) {
@@ -264,8 +266,13 @@ import {
   INITIAL_EXECUTION_FENCE_STATES,
   deploymentIdentityHeaders,
 } from '@proofoftech/flowsafe/deployment-identity-protocol';
+const { ExecutionFenceUnreadableError: LegacyUnreadable } = await import(new URL('./node_modules/@proofoftech/flowsafe/dist/do-runner/execution-fence.js', import.meta.url));
+const { ExecutionFenceUnreadableError: HelperUnreadable, normalizeD1RunExecutionIdentity } = await import(new URL('./node_modules/@proofoftech/flowsafe/dist/do-runner/execution-admission.js', import.meta.url));
 
 const secret = 'x'.repeat(32);
+assert.equal(LegacyUnreadable, HelperUnreadable);
+assert.ok(new LegacyUnreadable('test') instanceof HelperUnreadable);
+assert.deepEqual(normalizeD1RunExecutionIdentity({ tablePrefix: 'Tenant_', workflowId: 'workflow', runId: 'run', startToken: 'generation' }), { tablePrefix: 'tenant_', workflowId: 'workflow', runId: 'run', startToken: 'generation' });
 assert.equal(typeof EXECUTION_FENCE_DDL, 'string');
 assert.equal(EXECUTION_FENCE_ROW_ID, 'deployment');
 assert.deepEqual(EXECUTION_FENCE_STATES, [
@@ -311,6 +318,8 @@ import {
   type ExecutionFenceTransition,
   executionFenceReadingPayload,
 } from '@proofoftech/flowsafe/host-kit';
+import * as RunnerAdmission from '@proofoftech/flowsafe/do-runner';
+import * as HostAdmission from '@proofoftech/flowsafe/host-kit';
 
 const secret = 'x'.repeat(32);
 const headers: Record<string, string> = deploymentIdentityHeaders(secret);
@@ -339,6 +348,50 @@ async function checkFenceTypes(store: ExecutionFenceStore) {
   return { epoch, hostLegacyReading };
 }
 void checkFenceTypes;
+const physical = { tablePrefix: '', workflowId: 'workflow', runId: 'run', startToken: 'generation' };
+const logical = { owner: { kind: 'human', id: 'owner' }, target: { kind: 'workflow', id: 'workflow' } };
+const runIdentity: RunnerAdmission.RunExecutionIdentity = RunnerAdmission.normalizeRunExecutionIdentity(physical);
+const hostRunIdentity: HostAdmission.RunExecutionIdentity = runIdentity;
+const d1Identity: RunnerAdmission.D1RunExecutionIdentity = RunnerAdmission.normalizeD1RunExecutionIdentity(physical);
+const hostD1Identity: HostAdmission.D1RunExecutionIdentity = d1Identity;
+const startIdentity: RunnerAdmission.StartIdentity = RunnerAdmission.normalizeStartIdentity(logical);
+const hostStartIdentity: HostAdmission.StartIdentity = startIdentity;
+const executionIdentity: RunnerAdmission.StartExecutionIdentity = RunnerAdmission.normalizeStartExecutionIdentity({ ...physical, ...logical });
+const hostExecutionIdentity: HostAdmission.StartExecutionIdentity = executionIdentity;
+const d1StartIdentity: RunnerAdmission.D1StartExecutionIdentity = { ...d1Identity, ...startIdentity };
+const hostD1StartIdentity: HostAdmission.D1StartExecutionIdentity = d1StartIdentity;
+const epochContext: RunnerAdmission.MutationEpochContext = { mutationEpoch: 0 };
+const hostEpochContext: HostAdmission.MutationEpochContext = epochContext;
+for (const api of [RunnerAdmission, HostAdmission]) {
+  api.normalizeRunExecutionIdentity(physical);
+  api.normalizeD1RunExecutionIdentity(physical);
+  api.normalizeStartIdentity(logical);
+  api.normalizeStartExecutionIdentity({ ...physical, ...logical });
+  api.assertMutationEpoch({ mutationEpoch: 0, requireMutationEpoch: false }, api.normalizeMutationEpoch(0));
+  const wire = new Headers();
+  api.stampMutationEpoch(wire, 0);
+  api.mutationEpochFromHeader(wire.get(api.MUTATION_EPOCH_HEADER));
+  new api.InvalidExecutionIdentityError('runId');
+  new api.InvalidMutationEpochError();
+  new api.MutationEpochMismatchError('missing', 1);
+  new api.ExecutionFenceUnreadableError('test');
+}
+const legacyReservation: RunnerAdmission.StartReservation = {
+  key: 'key', owner: { kind: 'human', id: 'owner' }, targetKind: 'workflow',
+  targetId: 'workflow', runId: 'run', state: 'reserved', createdAt: 0, updatedAt: 0,
+};
+async function checkReservationTypes(store: RunnerAdmission.StartIdempotencyStore) {
+  const observed: RunnerAdmission.StartReservationReading | undefined = await store.read('key');
+  const binding: RunnerAdmission.StartReservationBinding | undefined = observed?.binding;
+  const reserved = await store.reserve({ key: 'key', owner: legacyReservation.owner, targetKind: 'workflow', targetId: 'workflow', mintRunId: () => 'run' });
+  const kind: 'legacy' | 'unbound' | 'bound' = reserved.reservation.binding.kind;
+  await store.claim('key', 'run');
+  await store.release('key', 'run');
+  await store.settleRun('run');
+  RunnerAdmission.admitsExistingRun({ state: 'proof-only', proofRunId: 'run' }, 'run');
+  return { binding, kind };
+}
+void [hostRunIdentity, hostD1Identity, hostStartIdentity, hostExecutionIdentity, hostD1StartIdentity, hostEpochContext, checkReservationTypes];
 `,
   );
   writeFileSync(
@@ -593,12 +646,23 @@ void checkFenceTypes;
       : [],
   );
   if (
-    fenceAlters.length !== 4 ||
+    fenceAlters.length !== 7 ||
     fenceAlters.some((index) => index <= fenceRowAt)
   ) {
     throw new Error('fence columns were not added after the initial row');
   }
   const seededState = JSON.parse(readFileSync(statePath, 'utf8')).fenceState;
+  const seededFence = JSON.parse(readFileSync(statePath, 'utf8'));
+  if (
+    seededFence.fenceStage !== 7 ||
+    ['proof_table_prefix', 'proof_workflow_id', 'proof_start_token'].some(
+      (name) => seededFence.fenceRow[name] !== null,
+    )
+  ) {
+    throw new Error(
+      'packed provisioning did not initialize null proof identity',
+    );
+  }
   if (seededState !== 'migration-locked') {
     throw new Error(
       `packed provisioning CLI seeded fence state '${seededState}', expected 'migration-locked'`,

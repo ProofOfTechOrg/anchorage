@@ -15,6 +15,27 @@
 // depend on breakwater for their connectors) need to reach for. See module.ts.
 
 export {
+  assertMutationEpoch,
+  type D1RunExecutionIdentity,
+  type D1StartExecutionIdentity,
+  ExecutionFenceUnreadableError,
+  InvalidExecutionIdentityError,
+  InvalidMutationEpochError,
+  MUTATION_EPOCH_HEADER,
+  type MutationEpochContext,
+  MutationEpochMismatchError,
+  mutationEpochFromHeader,
+  normalizeD1RunExecutionIdentity,
+  normalizeMutationEpoch,
+  normalizeRunExecutionIdentity,
+  normalizeStartExecutionIdentity,
+  normalizeStartIdentity,
+  type RunExecutionIdentity,
+  type StartExecutionIdentity,
+  type StartIdentity,
+  stampMutationEpoch,
+} from '../do-runner/execution-admission.js';
+export {
   type ExecutionFenceReading,
   type ExecutionFenceTransition,
   type ExecutionFenceVersionedReading,
