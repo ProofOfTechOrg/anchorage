@@ -52,6 +52,618 @@ import {
   suspensionTimeoutResumeData,
 } from './suspension-deadline.js';
 
+interface D0Snapshot {
+  status: RunSummary['status'];
+  result?: unknown;
+  error?: unknown;
+  context: Record<string, D0Step | D0Step[]>;
+  suspendedPaths?: Record<string, number[]>;
+  requestContext?: Record<string, unknown> & {
+    'flowsafe.runProvenance'?: {
+      version: number;
+      startToken: string;
+      requestedBy?: string;
+      requestedByKind?: 'human' | 'service' | 'system';
+      resumeCounts: Array<[string, number]>;
+    };
+  };
+}
+
+interface D0Step {
+  suspendPayload?: unknown;
+  suspendedAt?: number;
+  resumedAt?: number;
+}
+
+function d0Fixture(requestContextForRun?: RequestContextProvider) {
+  const sqlite = openSqlite() as ReturnType<typeof openSqlite> & {
+    close(): void;
+  };
+  const prepare = sqlite.prepare.bind(sqlite);
+  const reads: unknown[][] = [];
+  const tracked = vi.spyOn(sqlite, 'prepare').mockImplementation((sql) => {
+    const statement = prepare(sql);
+    if (/^\s*SELECT\b/i.test(sql) && sql.includes('mastra_workflow_snapshot')) {
+      const get = statement.get.bind(statement);
+      const all = statement.all.bind(statement);
+      statement.get = (...args) => {
+        reads.push(args);
+        return get(...args);
+      };
+      statement.all = (...args) => {
+        reads.push(args);
+        return all(...args);
+      };
+    }
+    return statement;
+  });
+  const host = init(
+    { DB: sqliteUnitDatabase(sqlite) as D1DatabaseBinding },
+    { executionFence: 'none', startIdempotency: 'none', requestContextForRun },
+  );
+  const effects = vi.fn();
+  const schema = z.looseObject({});
+  const gate = (id: string, reason: string) =>
+    host.createStep({
+      id,
+      inputSchema: schema,
+      outputSchema: schema,
+      execute: async ({ inputData, resumeData, suspend, requestContext }) => {
+        effects(id, requestContext);
+        return resumeData
+          ? inputData
+          : suspend({ reason, [SUSPENSION_DEADLINE_PAYLOAD_KEY]: 900_000 });
+      },
+    });
+  const row = (workflowId = 'd0-root', runId = 'd0-run') =>
+    prepare(
+      'SELECT * FROM mastra_workflow_snapshot WHERE workflow_name = ? AND run_id = ?',
+    ).get(workflowId, runId) as {
+      snapshot: string;
+      createdAt: string;
+      updatedAt: string;
+      [key: string]: unknown;
+    };
+  return {
+    ...host,
+    effects,
+    schema,
+    gate,
+    row,
+    reads,
+    snapshot: (workflowId = 'd0-root', runId = 'd0-run') =>
+      JSON.parse(row(workflowId, runId).snapshot) as D0Snapshot,
+    changeChild(workflowId: string, runId: string, step: string, time: number) {
+      const snapshot = JSON.parse(
+        row(workflowId, runId).snapshot,
+      ) as D0Snapshot;
+      const entry = snapshot.context[step] as D0Step;
+      entry.suspendedAt = time;
+      entry.suspendPayload = { reason: 'CHILD ONLY CHANGE' };
+      prepare(
+        'UPDATE mastra_workflow_snapshot SET snapshot = ? WHERE workflow_name = ? AND run_id = ?',
+      ).run(JSON.stringify(snapshot), workflowId, runId);
+    },
+    close() {
+      tracked.mockRestore();
+      sqlite.close();
+    },
+  };
+}
+
+function d0Collision(f: ReturnType<typeof d0Fixture>) {
+  const child = f
+    .createWorkflow({
+      id: 'a',
+      inputSchema: f.schema,
+      outputSchema: f.schema,
+    })
+    .then(f.gate('b', 'nested b'))
+    .commit();
+  return f
+    .createWorkflow({
+      id: 'd0-root',
+      inputSchema: f.schema,
+      outputSchema: f.schema,
+    })
+    .parallel([f.gate('a.b', 'root a.b'), child])
+    .commit();
+}
+
+function d0AssertRootSummary(
+  summary: RunSummary | null,
+  row: ReturnType<ReturnType<typeof d0Fixture>['row']>,
+) {
+  const snapshot = JSON.parse(row.snapshot) as D0Snapshot;
+  const keys = Object.keys(snapshot.suspendedPaths ?? {});
+  const entry = (key: string) => {
+    const value = snapshot.context[key];
+    return Array.isArray(value) ? value[value.length - 1] : value;
+  };
+  const project = <T>(read: (key: string) => T | undefined) => {
+    const pairs = keys
+      .map((key) => [key, read(key)] as const)
+      .filter(([, value]) => value !== undefined);
+    return pairs.length ? Object.fromEntries(pairs) : undefined;
+  };
+  const provenance = snapshot.requestContext?.['flowsafe.runProvenance'];
+  expect(summary).toMatchObject({
+    status: snapshot.status,
+    createdAt: new Date(row.createdAt).toISOString(),
+    updatedAt: new Date(row.updatedAt).toISOString(),
+  });
+  expect(summary?.requestedBy).toBe(provenance?.requestedBy);
+  expect(summary?.requestedByKind).toBe(provenance?.requestedByKind);
+  if (snapshot.status === 'suspended') {
+    expect(summary?.suspended).toEqual(keys.map((key) => key.split('.')));
+    expect(summary?.suspendPayload).toEqual(
+      project((key) => entry(key)?.suspendPayload),
+    );
+    expect(summary?.suspendedAt).toEqual(
+      project((key) => entry(key)?.suspendedAt),
+    );
+    expect(summary?.resumedAt).toEqual(project((key) => entry(key)?.resumedAt));
+    expect(summary?.resumeCount).toEqual(
+      project((key) => new Map(provenance?.resumeCounts).get(key)),
+    );
+  }
+  if (snapshot.status === 'success')
+    expect(summary?.result).toEqual(snapshot.result);
+  expect(summary).not.toHaveProperty('requestContext');
+  expect(summary).not.toHaveProperty('startToken');
+  expect(summary).not.toHaveProperty('attemptToken');
+}
+
+const d0Start = {
+  runId: 'd0-run',
+  inputData: {},
+  attemptToken: 'd0-attempt',
+  requestedBy: 'owner',
+  requestedByKind: 'human',
+} as const;
+
+const d0DeadlineRefusal = {
+  entries: [],
+  rejected: [
+    { step: 'a.b', reason: 'ambiguous suspended step path' },
+    { step: 'a', reason: 'nested suspension paths are not supported' },
+  ],
+};
+
+describe('D0 root-local stored summaries', () => {
+  it.each([
+    'status',
+    'authoritativeStatus',
+    'recoverStartAttempt',
+  ] as const)('D0 projects the selected root for summary reads: %s', async (method) => {
+    const f = d0Fixture();
+    d0Collision(f);
+    try {
+      await f.runtime.start('d0-root', d0Start);
+      const parent = f.row();
+      const read = () =>
+        method === 'recoverStartAttempt'
+          ? f.runtime.recoverStartAttempt('d0-root', 'd0-run', 'd0-attempt')
+          : f.runtime[method]('d0-root', 'd0-run');
+      f.reads.length = 0;
+      const first = await read();
+      d0AssertRootSummary(first, parent);
+      expect(f.reads).toEqual([['d0-run', 'd0-root']]);
+      expect(suspensionDeadlinesOf(first as RunSummary)).toEqual(
+        d0DeadlineRefusal,
+      );
+      const rootTime = (f.snapshot().context['a.b'] as D0Step)
+        .suspendedAt as number;
+      f.changeChild('a', 'd0-run', 'b', rootTime + 1234);
+      expect(f.row()).toEqual(parent);
+      f.reads.length = 0;
+      const second = await read();
+      expect(second).toEqual(first);
+      expect(f.reads).toEqual([['d0-run', 'd0-root']]);
+      expect(f.effects).toHaveBeenCalledTimes(2);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('D0 recovers a stored start result without child projection', async () => {
+    const f = d0Fixture();
+    const flow = d0Collision(f);
+    const create = flow.createRun.bind(flow);
+    const spy = vi
+      .spyOn(flow, 'createRun')
+      .mockImplementation(async (options) => {
+        const run = await create(options);
+        const start = run.start.bind(run);
+        run.start = async (input) => {
+          try {
+            await start(input);
+            f.reads.length = 0;
+            throw new Error('D0 lost native start receipt');
+          } finally {
+            run.start = start;
+          }
+        };
+        return run;
+      });
+    try {
+      const result = await f.runtime.start('d0-root', d0Start);
+      d0AssertRootSummary(result, f.row());
+      expect(f.reads).toEqual([['d0-run', 'd0-root']]);
+      expect(f.effects).toHaveBeenCalledTimes(2);
+      expect(
+        f.snapshot().requestContext?.['flowsafe.runProvenance'],
+      ).toMatchObject({
+        version: 1,
+        startToken: 'd0-attempt',
+        resumeCounts: [],
+      });
+    } finally {
+      spy.mockRestore();
+      f.close();
+    }
+  });
+
+  it('D0 projects lifecycle completion from one root read', async () => {
+    const f = d0Fixture();
+    const flow = d0Collision(f);
+    const nativeRead = flow.getWorkflowRunById.bind(flow);
+    const windows: unknown[][][] = [];
+    const spy = vi
+      .spyOn(flow, 'getWorkflowRunById')
+      .mockImplementation(async (runId, options) => {
+        const start = f.reads.length;
+        const result = await nativeRead(runId, options);
+        if (options?.fields?.includes('requestContext'))
+          windows.push(f.reads.slice(start));
+        return result;
+      });
+    try {
+      await f.runtime.start('d0-root', d0Start);
+      const parent = f.row();
+      const principal = { kind: 'human', id: 'owner' } as const;
+      const missed = await f.runtime.timeOut(
+        'd0-root',
+        'd0-run',
+        { expectedRevision: 1 },
+        100,
+      );
+      expect(missed).toMatchObject({ transitioned: false, casMatched: false });
+      d0AssertRootSummary(missed.summary, parent);
+      const terminal = await f.runtime.terminateAsPrincipal(
+        'd0-root',
+        'd0-run',
+        principal,
+        principal,
+        101,
+      );
+      expect(terminal).toMatchObject({
+        transitioned: true,
+        casMatched: true,
+        summary: { status: 'cancelled' },
+        cleanup: { cleanupCompleted: false, revision: 1 },
+      });
+      const retry = await f.runtime.terminateAsPrincipal(
+        'd0-root',
+        'd0-run',
+        principal,
+        principal,
+        102,
+      );
+      expect(retry).toMatchObject({
+        transitioned: false,
+        summary: { status: 'cancelled' },
+        cleanup: terminal.cleanup,
+      });
+      const completed = await f.runtime.completeTerminalCleanup(
+        'd0-root',
+        'd0-run',
+        terminal.cleanup.revision,
+        103,
+      );
+      expect(completed.status).toBe('cancelled');
+      await expect(
+        f.runtime.completeTerminalCleanup(
+          'd0-root',
+          'd0-run',
+          terminal.cleanup.revision,
+          104,
+        ),
+      ).resolves.toEqual(completed);
+      expect(windows).toEqual(
+        Array.from({ length: 5 }, () => [['d0-run', 'd0-root']]),
+      );
+      expect(f.effects).toHaveBeenCalledTimes(2);
+    } finally {
+      spy.mockRestore();
+      f.close();
+    }
+  });
+
+  it('D0 preserves detailed nested resume preparation', async () => {
+    const legs: RunLeg[] = [];
+    const f = d0Fixture((_workflowId, _runId, leg) => {
+      legs.push(leg);
+      return { d0Provider: true };
+    });
+    const child = f
+      .createWorkflow({
+        id: 'nested',
+        inputSchema: f.schema,
+        outputSchema: f.schema,
+      })
+      .then(f.gate('approval', 'nested approval'))
+      .commit();
+    const flow = f
+      .createWorkflow({
+        id: 'd0-root',
+        inputSchema: f.schema,
+        outputSchema: f.schema,
+      })
+      .then(child)
+      .commit();
+    const spy = vi.spyOn(flow, 'getWorkflowRunById');
+    try {
+      await f.runtime.start('d0-root', d0Start);
+      f.changeChild('nested', 'd0-run', 'approval', 12345);
+      legs.length = 0;
+      spy.mockClear();
+      const result = await f.runtime.resume('d0-root', 'd0-run', {
+        step: ['nested', 'approval'],
+        resumeData: { approve: true },
+        requestedBy: 'reviewer',
+        requestedByKind: 'human',
+      });
+      expect(result.status).toBe('success');
+      expect(legs).toEqual([
+        {
+          kind: 'resume',
+          step: ['nested', 'approval'],
+          suspendedAt: 12345,
+          resumeCount: undefined,
+        },
+      ]);
+      const preparation = spy.mock.calls.filter(([, options]) =>
+        options?.fields?.includes('requestContext'),
+      );
+      expect(preparation).toHaveLength(1);
+      expect(preparation[0]?.[1]?.withNestedWorkflows ?? true).toBe(true);
+      expect(f.effects).toHaveBeenCalledTimes(2);
+      const context = f.effects.mock.calls[1]?.[1] as RequestContext;
+      expect(context.get('breakwater.connectorExecution')).toMatchObject({
+        suspension: { stepPath: ['nested', 'approval'], suspendedAt: 12345 },
+      });
+      expect(context.get('d0Provider')).toBe(true);
+      expect(
+        f.snapshot().requestContext?.['flowsafe.runProvenance'],
+      ).toMatchObject({
+        version: 1,
+        startToken: 'd0-attempt',
+        requestedBy: 'reviewer',
+        requestedByKind: 'human',
+        resumeCounts: [['nested.approval', 1]],
+      });
+    } finally {
+      spy.mockRestore();
+      f.close();
+    }
+  });
+});
+
+describe('D0 summary compatibility', () => {
+  it.each([
+    'success',
+    'failure',
+    'suspension',
+    'resuspension',
+    'parallel',
+    'foreach-1',
+    'foreach-3',
+    'nested-1',
+    'nested-2',
+    'plain-dots',
+    'unattributed',
+  ] as const)('D0 preserves root summary fields: %s', async (mode) => {
+    const f = d0Fixture();
+    const root = () =>
+      f.createWorkflow({
+        id: 'd0-root',
+        inputSchema: f.schema,
+        outputSchema: f.schema,
+      });
+    let inputData: unknown = {};
+    if (mode === 'success' || mode === 'failure') {
+      root()
+        .then(
+          f.createStep({
+            id: 'result',
+            inputSchema: f.schema,
+            outputSchema: f.schema,
+            execute: async ({ inputData: input }) => {
+              if (mode === 'failure') throw new Error('D0 expected failure');
+              return input;
+            },
+          }),
+        )
+        .commit();
+      inputData = { value: 'root result' };
+    } else if (mode === 'foreach-1' || mode === 'foreach-3') {
+      f.createWorkflow({
+        id: 'd0-root',
+        inputSchema: z.array(f.schema),
+        outputSchema: z.array(f.schema),
+      })
+        .foreach(f.gate('gate', 'iteration'), {
+          concurrency: mode === 'foreach-1' ? 1 : 3,
+        })
+        .commit();
+      inputData = [{ n: 1 }, { n: 2 }, { n: 3 }];
+    } else if (mode === 'nested-1' || mode === 'nested-2') {
+      const inner = f
+        .createWorkflow({
+          id: 'inner',
+          inputSchema: f.schema,
+          outputSchema: f.schema,
+        })
+        .then(f.gate('gate', 'nested'))
+        .commit();
+      const nested =
+        mode === 'nested-1'
+          ? inner
+          : f
+              .createWorkflow({
+                id: 'middle',
+                inputSchema: f.schema,
+                outputSchema: f.schema,
+              })
+              .then(inner)
+              .commit();
+      root().then(nested).commit();
+    } else if (mode === 'parallel' || mode === 'plain-dots') {
+      root()
+        .parallel(
+          mode === 'parallel'
+            ? [f.gate('left', 'left'), f.gate('right', 'right')]
+            : [f.gate('a', 'plain a'), f.gate('a.b', 'plain a.b')],
+        )
+        .commit();
+    } else if (mode === 'resuspension') {
+      root()
+        .then(
+          f.createStep({
+            id: 'gate',
+            inputSchema: f.schema,
+            outputSchema: f.schema,
+            execute: async ({ resumeData, suspend }) =>
+              suspend({ reason: resumeData ? 'again' : 'first' }),
+          }),
+        )
+        .commit();
+    } else root().then(f.gate('gate', 'first')).commit();
+    try {
+      await f.runtime.start(
+        'd0-root',
+        mode === 'unattributed'
+          ? { runId: 'd0-run', inputData }
+          : { ...d0Start, inputData },
+      );
+      if (mode === 'resuspension')
+        await f.runtime.resume('d0-root', 'd0-run', {
+          step: 'gate',
+          resumeData: { again: true },
+          requestedBy: 'reviewer',
+          requestedByKind: 'human',
+        });
+      const before = f.row();
+      for (const method of ['status', 'authoritativeStatus'] as const) {
+        f.reads.length = 0;
+        const summary = await f.runtime[method]('d0-root', 'd0-run');
+        d0AssertRootSummary(summary, before);
+        expect(f.reads).toEqual([['d0-run', 'd0-root']]);
+        if (mode === 'failure')
+          expect(summary?.error).toContain('D0 expected failure');
+        if (mode === 'resuspension')
+          expect(summary?.resumeCount).toEqual({ gate: 1 });
+        if (mode === 'plain-dots')
+          expect(suspensionDeadlinesOf(summary as RunSummary)).toMatchObject({
+            entries: [{ step: 'a' }, { step: 'a.b' }],
+            rejected: [],
+          });
+        if (mode === 'nested-1' || mode === 'nested-2') {
+          const deadlines = suspensionDeadlinesOf(summary as RunSummary);
+          expect(deadlines.entries).toEqual([]);
+          expect(deadlines.rejected).toEqual([
+            {
+              step: mode === 'nested-1' ? 'inner' : 'middle',
+              reason: 'nested suspension paths are not supported',
+            },
+          ]);
+        }
+      }
+      expect(f.row()).toEqual(before);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('D0 preserves genuine missing-run and recovery mismatch behavior', async () => {
+    const f = d0Fixture();
+    d0Collision(f);
+    try {
+      await expect(f.runtime.status('d0-root', 'absent')).resolves.toBeNull();
+      await expect(
+        f.runtime.authoritativeStatus('d0-root', 'absent'),
+      ).resolves.toBeNull();
+      await expect(
+        f.runtime.recoverStartAttempt('d0-root', 'absent', 'd0-attempt'),
+      ).resolves.toBeNull();
+      await f.runtime.start('d0-root', d0Start);
+      const before = f.row();
+      await expect(
+        f.runtime.recoverStartAttempt('d0-root', 'd0-run', 'wrong'),
+      ).rejects.toThrow('snapshot belongs to another start attempt');
+      expect(f.row()).toEqual(before);
+      expect(f.effects).toHaveBeenCalledTimes(2);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('D0 preserves fallback refusal before recovery deletion', async () => {
+    const storage = new InMemoryStore();
+    const { runtime, createStep, createWorkflow } = init(
+      { storage },
+      {
+        executionFence: 'none',
+        startIdempotency: 'none',
+      },
+    );
+    const workflow = createWorkflow({
+      id: 'd0-fallback',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    })
+      .then(
+        createStep({
+          id: 'gate',
+          inputSchema: z.object({}),
+          outputSchema: z.object({}),
+          execute: async ({ suspend }) => suspend({ reason: 'waiting' }),
+        }),
+      )
+      .commit();
+    const started = await runtime.start('d0-fallback', {
+      runId: 'd0-run',
+      inputData: {},
+    });
+    const remove = vi.spyOn(workflow, 'deleteWorkflowRunById');
+    const domain = await storage.getStore('workflows');
+    if (!domain) throw new Error('D0 workflows domain missing');
+    const blind = vi
+      .spyOn(domain, 'getWorkflowRunById')
+      .mockResolvedValue(null);
+    const restore = () => blind.mockRestore();
+    try {
+      await expect(
+        runtime.status('d0-fallback', started.runId),
+      ).resolves.toMatchObject({ status: 'pending' });
+      await expect(
+        runtime.authoritativeStatus('d0-fallback', started.runId),
+      ).rejects.toBeInstanceOf(RunStateUnreadableError);
+      await expect(
+        runtime.recoverStartAttempt('d0-fallback', started.runId, 'valid'),
+      ).rejects.toBeInstanceOf(RunStateUnreadableError);
+      expect(remove).not.toHaveBeenCalled();
+    } finally {
+      restore();
+      remove.mockRestore();
+    }
+    await expect(
+      runtime.authoritativeStatus('d0-fallback', started.runId),
+    ).resolves.toHaveProperty('status', 'suspended');
+  });
+});
+
 interface Counters {
   /** Times the approval step's post-approval body ran (the gated action). */
   approvalResumes: number;

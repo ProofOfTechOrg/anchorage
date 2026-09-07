@@ -1346,7 +1346,7 @@ export class RunnerRuntime {
     // block here, and proof-only admits its one nominated run.
     await this.#assertResumeFence(runId);
     return this.#withRunLock(workflowId, runId, async () => {
-      const state = await this.#workflowState(workflow, runId);
+      const state = await this.#workflowState(workflow, runId, true);
       if (!state) throw new UnknownRunError(workflowId, runId);
       if (state.status !== 'suspended') {
         throw new RunNotSuspendedError(workflowId, runId, state.status);
@@ -2101,8 +2101,12 @@ export class RunnerRuntime {
   #workflowState(
     workflow: AnyWorkflow,
     runId: string,
+    withNestedWorkflows = false,
   ): Promise<WorkflowState | null> {
-    return workflow.getWorkflowRunById(runId, { fields: RUN_STATE_FIELDS });
+    return workflow.getWorkflowRunById(runId, {
+      fields: RUN_STATE_FIELDS,
+      withNestedWorkflows,
+    });
   }
 
   async #loadSnapshot(

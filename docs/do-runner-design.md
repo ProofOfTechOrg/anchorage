@@ -109,6 +109,12 @@ Terminate:
 
 A repeated request reads the terminal snapshot and returns the same summary. After ownership release, the public router delegates replay authorization to the owner object. The object accepts only a principal recorded by the original transition.
 
+### Read stored run summaries
+
+Stored summaries use the selected workflow's direct step records, without recursively merging child workflow rows. A nested `a` workflow's `b` step therefore cannot overwrite the payload or suspension timestamp of a direct `a.b` step. The same root-local projection applies to status, authoritative status, recovered execution outcomes and lifecycle completion summaries.
+
+Detailed resume preparation still reads nested steps so the selected child's suspension timestamp and prior resume count reach grant derivation. Nested-workflow metadata and deadline refusals remain intact; the naming constraints below still apply to ambiguous approval paths. This read correction does not activate generation-bound admission or the private replay protocol.
+
 ### Fence execution during a deployment migration
 
 The execution fence controls one physical deployment, which is also one tenant boundary. It is never scoped to an actor or run. Each admission reads the current row without memoization, and storage failures fail closed.
