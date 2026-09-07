@@ -3,7 +3,9 @@
 import type { MastraCompositeStore } from '@mastra/core/storage';
 import type { GuardedAgentHandle } from '@proofoftech/breakwater/agent';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
+import type { FlowsafeDurableAgent } from '../agent-runner/durable-agent-runner.js';
 import {
   type ApprovalAuditEvent,
   type ApprovalRecord,
@@ -12,6 +14,11 @@ import {
   InMemoryResourceOwnershipStore,
   type RecoverableResourceOwnershipStore,
 } from '../approval-api/index.js';
+import {
+  FENCED_WORKFLOW_STORAGE,
+  type FencedWorkflowAdmissionCapability,
+} from '../do-runner/fenced-workflow-capability.js';
+import type { FencedWorkflowsStorageD1 } from '../do-runner/fenced-workflows-d1.js';
 import type {
   InitResult,
   RequestContextProvider,
@@ -21,7 +28,11 @@ import type {
   ThreadScope,
 } from '../do-runner/index.js';
 import {
+  createD1Storage,
   doErrorResponse,
+  type ExecutionFenceDatabase,
+  ExecutionFenceStore,
+  init,
   RunStateUnreadableError,
   resourceIdFromKey,
   SUSPENSION_TIMEOUT_RESUME_KEY,
@@ -36,10 +47,12 @@ import {
   type AutomatedEntryAuthorizer,
   createThreadAgentHost,
   type PrincipalPermissionResolver,
+  type ThreadAgentStartInput,
 } from './thread-host.js';
 import type { AgentAutomationRule, Permission } from './types.js';
 
 const mocked = vi.hoisted(() => ({
+  mastra: vi.fn(),
   stream: vi.fn(),
   resumeViaRuntime: vi.fn(),
   observe: vi.fn(),
@@ -57,8 +70,8 @@ vi.mock('@proofoftech/breakwater/agent', () => ({
     (value as { guarded?: unknown }).guarded === true,
 }));
 
-vi.mock('@mastra/core/mastra', () => ({
-  Mastra: class {
+vi.mock('@mastra/core/mastra', () => {
+  class Mastra {
     readonly agentThreadStreamRuntime = {};
     readonly agents: Record<string, unknown>;
 
@@ -71,8 +84,15 @@ vi.mock('@mastra/core/mastra', () => ({
         (agent) => agent.id === id,
       );
     }
-  },
-}));
+  }
+  return {
+    Mastra: vi.fn(function MastraConstructor(options: {
+      agents: Record<string, unknown>;
+    }) {
+      return mocked.mastra(options) ?? new Mastra(options);
+    }),
+  };
+});
 
 vi.mock('../agent-runner/index.js', async (importOriginal) => {
   const original =
@@ -162,6 +182,8 @@ function harness(
     approvalService?: ApprovalService;
     resourceAccess?: RecoverableResourceOwnershipStore;
     runtime?: Partial<RunnerRuntime>;
+    init?: InitResult;
+    storage?: MastraCompositeStore;
     discardScheduleDispatch?: (
       scheduleId: string,
       dispatchId: string,
@@ -228,11 +250,13 @@ function harness(
     };
   };
   setSnapshot();
-  const storage = {
-    getStore: async () => ({
-      loadWorkflowSnapshot: async () => snapshot,
-    }),
-  } as unknown as MastraCompositeStore;
+  const storage =
+    options.storage ??
+    ({
+      getStore: async () => ({
+        loadWorkflowSnapshot: async () => snapshot,
+      }),
+    } as unknown as MastraCompositeStore);
   const runtime = {
     status: vi.fn(async (_workflowId: string, runId: string) => {
       const started = mocked.stream.mock.calls.some(
@@ -257,10 +281,12 @@ function harness(
       id: 'operator-1',
       role: 'operator',
     },
-    init: {
-      runtime,
-      pubsub: undefined,
-    } as unknown as InitResult,
+    init:
+      options.init ??
+      ({
+        runtime,
+        pubsub: undefined,
+      } as unknown as InitResult),
   } satisfies ThreadScope;
   const moduleScopes: AgentThreadInstanceScope[] = [];
   const storageScopes: AgentThreadInstanceScope[] = [];
@@ -490,6 +516,7 @@ async function seedThreadlessSchedule(
 }
 
 beforeEach(() => {
+  mocked.mastra.mockReset();
   mocked.stream.mockReset().mockResolvedValue({});
   mocked.resumeViaRuntime.mockReset();
   mocked.observe.mockReset();
@@ -541,6 +568,647 @@ function seedRecoveryState(
     });
   }
 }
+
+function cDeferred() {
+  let resolve = () => {};
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+const C_START_INPUT: ThreadAgentStartInput = {
+  agentId: 'writer',
+  threadId: 'acme_thread',
+  resourceId: RESOURCE_ID,
+  runId: 'acme_run',
+  prompt: 'original',
+  entryPath: 'http.start',
+};
+
+function cObserved<T extends object>(
+  values: T,
+  mode: 'alternate' | 'second-throw' = 'second-throw',
+) {
+  const counts = new Map<keyof T, number>();
+  const source = {} as T;
+  for (const key of Object.keys(values) as Array<keyof T>) {
+    Object.defineProperty(source, key, {
+      enumerable: true,
+      configurable: true,
+      get() {
+        const count = (counts.get(key) ?? 0) + 1;
+        counts.set(key, count);
+        if (count > 1) {
+          if (mode === 'second-throw')
+            throw new Error(`second read: ${String(key)}`);
+          return 'replacement';
+        }
+        return values[key];
+      },
+    });
+  }
+  return { source, counts, values };
+}
+
+describe('C direct thread host capture', () => {
+  it.each(
+    [
+      'mutationEpoch',
+      'startIdentity',
+      'agentStart',
+      'execution',
+      'tablePrefix',
+      'startToken',
+      'attemptToken',
+      'runOwnerGuard',
+      'onPreparedStartIdentity',
+    ].flatMap((field) => [null, 2].map((value) => ({ field, value }))),
+  )('C thread host refuses internal JSON authority before effects ($field, $value)', async ({
+    field,
+    value,
+  }) => {
+    const fixture = harness();
+    const reserve = vi.spyOn(fixture.resourceAccess, 'reserveAll');
+    const error = await fixture.host
+      .route(
+        new Request('https://thread/_flowsafe/agent-host/start', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ ...C_START_INPUT, [field]: value }),
+        }),
+        fixture.scope,
+      )
+      .catch((cause: unknown) => cause);
+    expect(error).toBeInstanceOf(Error);
+    const response = doErrorResponse(error);
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      error: 'start owner and requester are derived from trusted provenance',
+    });
+    expect(reserve).not.toHaveBeenCalled();
+    expect(mocked.stream).not.toHaveBeenCalled();
+    expect(fixture.state.size).toBe(0);
+    expect(fixture.moduleScopes).toEqual([]);
+    expect(fixture.storageScopes).toEqual([]);
+    expect(
+      (
+        await fixture.host.route(
+          new Request('https://thread/_flowsafe/agent-host/start', {
+            method: 'POST',
+            body: JSON.stringify(C_START_INPUT),
+          }),
+          fixture.scope,
+        )
+      )?.status,
+    ).toBe(200);
+    expect(mocked.stream).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    'normal',
+    'failure',
+    'recovery',
+  ] as const)('C thread host preserves v1 owner recovery without automatic activation: %s', async (phase) => {
+    const core = await vi.importActual<typeof import('@mastra/core/mastra')>(
+      '@mastra/core/mastra',
+    );
+    mocked.mastra.mockImplementation(
+      (config: ConstructorParameters<typeof core.Mastra>[0]) =>
+        config?.workflows ? new core.Mastra(config) : undefined,
+    );
+    const sql = openSqlite() as ReturnType<typeof openSqlite> & {
+      close(): void;
+    };
+    const binding = sqliteUnitDatabase(sql) as ExecutionFenceDatabase;
+    const storage = createD1Storage({ binding });
+    await storage.init();
+    const fence = new ExecutionFenceStore(binding);
+    await fence.seed('open');
+    for (let index = 0; index < 2; index++) {
+      const before = await fence.read();
+      const draining = await fence.transition({
+        expected: 'open',
+        next: 'draining',
+        expectedMutationEpoch: before.mutationEpoch,
+        expectedRevision: before.transitionRevision,
+        advanceMutationEpoch: true,
+      });
+      await fence.transition({
+        expected: 'draining',
+        next: 'open',
+        expectedMutationEpoch: draining.mutationEpoch,
+        expectedRevision: draining.transitionRevision,
+      });
+    }
+    expect(await fence.read()).toMatchObject({
+      state: 'open',
+      mutationEpoch: 2,
+      requireMutationEpoch: true,
+    });
+    const failure = new Error('C thread provider failed');
+    const app = init(
+      { storage },
+      {
+        executionFence: fence,
+        startIdempotency: 'none',
+        requestContextForRun: () => {
+          if (phase === 'failure') throw failure;
+          return {};
+        },
+      },
+    );
+    const schema = z.object({
+      agentId: z.string(),
+      runId: z.string(),
+      messageListState: z.object({ memoryInfo: z.null() }),
+    });
+    app
+      .createWorkflow({
+        id: 'durable-agentic-loop',
+        inputSchema: schema,
+        outputSchema: schema,
+      })
+      .then(
+        app.createStep({
+          id: 'c-host-step',
+          inputSchema: schema,
+          outputSchema: schema,
+          execute: async ({ inputData }) => inputData,
+        }),
+      )
+      .commit();
+    const workflows = (await storage.getStore(
+      'workflows',
+    )) as FencedWorkflowsStorageD1;
+    const native = workflows[FENCED_WORKFLOW_STORAGE];
+    if (!native) throw new Error('missing managed owned workflow capability');
+    const counts = { admission: 0, terminalization: 0 };
+    const capability: FencedWorkflowAdmissionCapability = {
+      ...native,
+      withInitialAdmission: (input, create) => {
+        counts.admission++;
+        return native.withInitialAdmission(input, create);
+      },
+      terminalizeInitialAdmission: (input) => {
+        counts.terminalization++;
+        return native.terminalizeInitialAdmission(input);
+      },
+    };
+    Object.defineProperty(workflows, FENCED_WORKFLOW_STORAGE, {
+      value: capability,
+      configurable: true,
+    });
+    const fixture = harness(['writer'], { init: app, storage });
+    Object.assign(fixture.scope, { mutationEpoch: 2 });
+    expect(fixture.scope.init.runtime).toBe(app.runtime);
+    const writes: Array<[string, unknown]> = [];
+    const put = fixture.stateStorage.put.bind(fixture.stateStorage);
+    vi.spyOn(fixture.stateStorage, 'put').mockImplementation(
+      async (key, value) => {
+        writes.push([key, structuredClone(value)]);
+        await put(key, value);
+      },
+    );
+    const settle = fixture.resourceAccess.settleReservation.bind(
+      fixture.resourceAccess,
+    );
+    if (phase === 'recovery')
+      vi.spyOn(
+        fixture.resourceAccess,
+        'settleReservation',
+      ).mockImplementationOnce(async (...args) => {
+        await settle(...args);
+        throw new Error('C lost thread settlement receipt');
+      });
+    mocked.stream.mockImplementation(
+      async (
+        ...args: Parameters<FlowsafeDurableAgent['streamUntilPersisted']>
+      ) => {
+        const [
+          ,
+          options,
+          requestedBy,
+          requestedByKind,
+          attemptToken,
+          scheduleDispatch,
+          idempotencyKey,
+          authority,
+        ] = args;
+        const runId = options.runId;
+        if (typeof runId !== 'string')
+          throw new Error('host omitted its runId');
+        await app.runtime.start('durable-agentic-loop', {
+          runId,
+          inputData: {
+            agentId: 'writer',
+            runId,
+            messageListState: { memoryInfo: null },
+          },
+          storedRequestContext: Object.fromEntries(
+            options.requestContext?.entries() ?? [],
+          ),
+          requestedBy,
+          requestedByKind,
+          attemptToken,
+          scheduleDispatch,
+          idempotencyKey,
+          mutationEpoch: authority.mutationEpoch,
+          startIdentity: authority.startIdentity,
+          agentStart: authority.agentStart,
+          onPreparedStartIdentity: authority.onPreparedStartIdentity,
+          runOwnerGuard: authority.runOwnerGuard,
+        });
+        return {};
+      },
+    );
+    try {
+      const pending = fixture.host.start(fixture.scope, {
+        ...C_START_INPUT,
+        threaded: false,
+      });
+      if (phase === 'failure') await expect(pending).rejects.toBe(failure);
+      else
+        expect(await pending).toMatchObject({ summary: { status: 'success' } });
+      expect(mocked.stream).toHaveBeenCalledOnce();
+      const args = mocked.stream.mock.calls[0];
+      expect(args).toHaveLength(8);
+      expect(args?.[7]).toHaveProperty('onPreparedStartIdentity', undefined);
+      expect(Object.hasOwn(args?.[7], 'onPreparedStartIdentity')).toBe(true);
+      const journals = writes.filter(([key]) =>
+        key.startsWith('flowsafe:agent-owner-recovery'),
+      );
+      expect(journals).toEqual([
+        [
+          TEST_OWNER_RECOVERY_KEY,
+          {
+            version: 1,
+            agentId: 'writer',
+            threadId: 'acme_thread',
+            resourceId: RESOURCE_ID,
+            runId: 'acme_run',
+            owner: HUMAN_OWNER,
+            token: args?.[4],
+            threaded: false,
+            bindingPreexisting: false,
+          },
+        ],
+      ]);
+      const snapshot = await workflows.loadWorkflowSnapshot({
+        workflowName: 'durable-agentic-loop',
+        runId: 'acme_run',
+      });
+      if (phase === 'failure') expect(snapshot).toBeNull();
+      else {
+        expect(snapshot?.requestContext?.['flowsafe.runProvenance']).toEqual({
+          version: 1,
+          requestedBy: 'operator-1',
+          requestedByKind: 'human',
+          startToken: args?.[4],
+          attemptToken: args?.[4],
+          resumeCounts: [],
+        });
+        for (const key of [
+          'mutationEpoch',
+          'startIdentity',
+          'agentStart',
+          'execution',
+          'flowsafe.initialAdmission',
+        ])
+          expect(snapshot?.requestContext).not.toHaveProperty(key);
+        expect(writes).toContainEqual([
+          TEST_RUN_RECORD_KEY,
+          {
+            version: 2,
+            agentId: 'writer',
+            principal: fixture.scope.principal,
+            originEntryPath: 'http.start',
+          },
+        ]);
+      }
+      if (phase === 'recovery')
+        expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(true);
+      await fixture.host.recoverOwnership(app.runtime, fixture.scope.threadId);
+      expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+      expect(
+        writes.filter(([key]) =>
+          key.startsWith('flowsafe:agent-owner-recovery'),
+        ),
+      ).toEqual(journals);
+    } finally {
+      mocked.mastra.mockReset();
+      sql.close();
+      expect(counts).toEqual({ admission: 0, terminalization: 0 });
+    }
+  });
+
+  it.each([
+    ['human', true, 'authorize'],
+    ['human', false, 'authorize'],
+    ['service', false, 'source'],
+    ['system', false, 'source'],
+    ['service', true, 'authorize'],
+    ['system', true, 'authorize'],
+  ] as const)('C direct host keeps scope selectors and separate owners: %s threaded=%s at %s', async (kind, threaded, boundary) => {
+    const entered = cDeferred();
+    const release = cDeferred();
+    const principal: ExecutionPrincipal =
+      kind === 'human'
+        ? { kind, id: 'operator-1', role: 'operator' }
+        : { kind, id: `${kind}-starter`, purpose: 'schedule execution' };
+    const scheduled = kind !== 'human';
+    const entryPath = scheduled ? 'schedule.fire' : 'http.start';
+    const authorize = vi.fn(async () => {
+      if (boundary === 'authorize') {
+        entered.resolve();
+        await release.promise;
+      }
+      return { permissions: [], policyVersion: 'original' };
+    });
+    const fixture = harness(['writer'], {
+      principal,
+      allowedAutomation:
+        kind !== 'human'
+          ? [{ kind, entryPaths: ['schedule.fire'] }]
+          : undefined,
+      resolvePrincipalPermissions: authorize,
+    });
+    if (scheduled) {
+      if (threaded) {
+        await seedThreadedSchedule(
+          fixture,
+          HUMAN_OWNER,
+          SCHEDULE_ID,
+          DISPATCH_ID,
+          'acme_run',
+        );
+        fixture.state.set(THREAD_BINDING_KEY, {
+          version: 1,
+          agentId: 'writer',
+          resourceId: RESOURCE_ID,
+        });
+      } else await seedThreadlessSchedule(fixture);
+    }
+    const owner = { ...HUMAN_OWNER };
+    const nativeOwner = fixture.resourceAccess.owner.bind(
+      fixture.resourceAccess,
+    );
+    vi.spyOn(fixture.resourceAccess, 'owner').mockImplementation(
+      async (resourceKind, id) => {
+        if (resourceKind === 'schedule') {
+          if (boundary === 'source') {
+            entered.resolve();
+            await release.promise;
+          }
+          return owner;
+        }
+        return nativeOwner(resourceKind, id);
+      },
+    );
+    const ownerCopied = cDeferred();
+    const ownerRelease = cDeferred();
+    const nativeGet = fixture.stateStorage.get.bind(fixture.stateStorage);
+    vi.spyOn(fixture.stateStorage, 'get').mockImplementation(
+      async <T>(key: string) => {
+        if (key === TEST_OWNER_RECOVERY_KEY) {
+          ownerCopied.resolve();
+          await ownerRelease.promise;
+        }
+        return nativeGet<T>(key);
+      },
+    );
+    const scope = { ...fixture.scope, mutationEpoch: 2, deploymentTag: 'acme' };
+    const originalInit = scope.init;
+    const input: ThreadAgentStartInput = {
+      ...C_START_INPUT,
+      entryPath,
+      threaded,
+      idempotencyKey: 'original-key',
+      scheduleId: scheduled ? SCHEDULE_ID : undefined,
+      dispatchId: scheduled ? DISPATCH_ID : undefined,
+      scheduleDispatchLease: scheduled ? 'executing' : undefined,
+      safeContext: { note: 'original' },
+      providerOptions: undefined,
+    };
+    const writes: Array<[string, unknown]> = [];
+    const nativePut = fixture.stateStorage.put.bind(fixture.stateStorage);
+    vi.spyOn(fixture.stateStorage, 'put').mockImplementation(
+      async (key, value) => {
+        writes.push([key, structuredClone(value)]);
+        await nativePut(key, value);
+      },
+    );
+    const reserve = vi.spyOn(fixture.resourceAccess, 'reserveAll');
+    const pending = fixture.host.start(scope, input);
+    const outcome = pending.then(
+      (result) => ({ result }),
+      (error: unknown) => ({ error }),
+    );
+    try {
+      await entered.promise;
+      Object.assign(scope, {
+        principal: { kind: 'human', id: 'replacement', role: 'admin' },
+        mutationEpoch: 3,
+        threadId: 'replacement',
+        deploymentTag: 'replacement',
+        init: {},
+      });
+      Object.assign(input, {
+        agentId: 'replacement',
+        threadId: 'replacement',
+        resourceId: 'replacement',
+        runId: 'replacement',
+        prompt: 'replacement',
+        messages: ['replacement'],
+        entryPath: 'signal.resume',
+        threaded: !threaded,
+        scheduleId: 'replacement',
+        dispatchId: 'replacement',
+        scheduleDispatchLease: undefined,
+        idempotencyKey: 'replacement',
+        safeContext: { note: 'replacement' },
+        providerOptions: { replacement: true },
+      });
+      release.resolve();
+      const reached = await Promise.race([
+        ownerCopied.promise.then(() => true),
+        outcome.then(() => false),
+      ]);
+      expect(
+        reached,
+        'captured scope reaches storage after authorization',
+      ).toBe(true);
+      owner.id = 'replacement-owner';
+    } finally {
+      release.resolve();
+      ownerRelease.resolve();
+      await outcome;
+    }
+    const result = await pending;
+    expect(mocked.stream).toHaveBeenCalledOnce();
+    const args = mocked.stream.mock.calls[0];
+    expect(args).toHaveLength(8);
+    const authority = args?.[7];
+    expect(args?.[0]).toBe(scheduled ? 'scheduled' : 'original');
+    expect(args?.[1]).toMatchObject({
+      runId: 'acme_run',
+      disableBackgroundTasks: true,
+      maxSteps: 1,
+    });
+    expect(args?.[1].memory).toEqual(
+      threaded ? { thread: 'acme_thread', resource: RESOURCE_ID } : undefined,
+    );
+    expect(args?.slice(2, 4)).toEqual([principal.id, principal.kind]);
+    expect(args?.[4]).toEqual(expect.any(String));
+    expect(args?.[5]).toEqual(
+      scheduled
+        ? { scheduleId: SCHEDULE_ID, dispatchId: DISPATCH_ID }
+        : undefined,
+    );
+    expect(args?.[6]).toBe('original-key');
+    expect(authority).toEqual({
+      mutationEpoch: 2,
+      startIdentity: {
+        owner: { kind: principal.kind, id: principal.id },
+        target: { kind: 'agent', id: 'writer', threadId: 'acme_thread' },
+      },
+      agentStart: { threaded },
+      onPreparedStartIdentity: undefined,
+      runOwnerGuard: { owner: HUMAN_OWNER, reservationToken: args?.[4] },
+    });
+    expect(Object.hasOwn(authority, 'onPreparedStartIdentity')).toBe(true);
+    expect(reserve.mock.calls[0]).toEqual([
+      [
+        { kind: 'thread', resourceId: 'acme_thread' },
+        { kind: 'resource', resourceId: RESOURCE_ID },
+        { kind: 'run', resourceId: 'acme_run' },
+      ],
+      HUMAN_OWNER,
+      args?.[4],
+    ]);
+    expect(
+      writes.filter(([key]) => key.startsWith(OWNER_RECOVERY_PREFIX)),
+    ).toEqual([
+      [
+        TEST_OWNER_RECOVERY_KEY,
+        {
+          version: 1,
+          agentId: 'writer',
+          threadId: 'acme_thread',
+          resourceId: RESOURCE_ID,
+          runId: 'acme_run',
+          owner: HUMAN_OWNER,
+          token: args?.[4],
+          threaded,
+          bindingPreexisting: scheduled && threaded,
+        },
+      ],
+    ]);
+    expect(writes).toContainEqual([
+      TEST_RUN_RECORD_KEY,
+      { version: 2, agentId: 'writer', principal, originEntryPath: entryPath },
+    ]);
+    expect(result).toMatchObject({
+      agentId: 'writer',
+      threadId: 'acme_thread',
+      resourceId: RESOURCE_ID,
+    });
+    expect(fixture.moduleScopes[0]).toMatchObject({
+      threadId: 'acme_thread',
+      deploymentTag: 'acme',
+      init: originalInit,
+    });
+    expect(Object.isFrozen(scope)).toBe(false);
+    expect(Object.isFrozen(input)).toBe(false);
+    expect(Object.isFrozen(owner)).toBe(false);
+  });
+
+  it.each([
+    'alternate',
+    'second-throw',
+  ] as const)('C direct host captures every declared scope and input getter once: %s', async (mode) => {
+    const fixture = harness();
+    const scope = cObserved(
+      { ...fixture.scope, mutationEpoch: 2, deploymentTag: 'acme' },
+      mode,
+    );
+    const input = cObserved<ThreadAgentStartInput>(
+      {
+        ...C_START_INPUT,
+        messages: undefined,
+        threaded: false,
+        scheduleId: undefined,
+        dispatchId: undefined,
+        scheduleDispatchLease: undefined,
+        safeContext: { note: 'original' },
+        providerOptions: undefined,
+        idempotencyKey: 'original-key',
+      },
+      mode,
+    );
+    await fixture.host.start(scope.source, input.source);
+    expect([...scope.counts.values()]).toEqual(
+      Object.keys(scope.values).map(() => 1),
+    );
+    expect([...input.counts.values()]).toEqual(
+      Object.keys(input.values).map(() => 1),
+    );
+    expect(mocked.stream.mock.calls[0]).toHaveLength(8);
+    expect(mocked.stream.mock.calls[0]?.[7].mutationEpoch).toBe(2);
+    expect(mocked.stream.mock.calls[0]?.[7].agentStart).toEqual({
+      threaded: false,
+    });
+  });
+
+  it.each([
+    'principal',
+    'mutationEpoch',
+    'threadId',
+    'deploymentTag',
+    'init',
+    'agentId',
+    'runId',
+    'resourceId',
+    'prompt',
+    'messages',
+    'entryPath',
+    'threaded',
+    'scheduleId',
+    'dispatchId',
+    'scheduleDispatchLease',
+    'safeContext',
+    'providerOptions',
+    'idempotencyKey',
+  ])('C direct host preserves first capture fault without effects: %s', async (key) => {
+    const fixture = harness();
+    const scope = { ...fixture.scope, mutationEpoch: 2, deploymentTag: 'acme' };
+    const input = { ...C_START_INPUT };
+    const fault = new Error(`first fault ${key}`);
+    Object.defineProperty(
+      [
+        'principal',
+        'mutationEpoch',
+        'threadId',
+        'deploymentTag',
+        'init',
+      ].includes(key)
+        ? scope
+        : input,
+      key,
+      {
+        get() {
+          throw fault;
+        },
+      },
+    );
+    const reserve = vi.spyOn(fixture.resourceAccess, 'reserveAll');
+    await expect(fixture.host.start(scope, input)).rejects.toBe(fault);
+    expect(mocked.stream).not.toHaveBeenCalled();
+    expect(reserve).not.toHaveBeenCalled();
+    expect(fixture.state.size).toBe(0);
+    expect(fixture.moduleScopes).toEqual([]);
+  });
+});
 
 describe('createThreadAgentHost owner recovery', () => {
   it('persists and arms the recovery journal before reserving ownership', async () => {
@@ -1694,6 +2362,18 @@ describe('createThreadAgentHost', () => {
       // positionally on every start, and undefined on one that has neither.
       undefined,
       undefined,
+      {
+        startIdentity: {
+          owner: HUMAN_OWNER,
+          target: { kind: 'agent', id: 'writer', threadId: 'acme_thread' },
+        },
+        agentStart: { threaded: false },
+        onPreparedStartIdentity: undefined,
+        runOwnerGuard: {
+          owner: HUMAN_OWNER,
+          reservationToken: expect.any(String),
+        },
+      },
     );
   });
 
@@ -1751,9 +2431,9 @@ describe('createThreadAgentHost', () => {
     );
 
     expect(response?.status).toBe(200);
-    // Five host arguments plus the two trailing optionals (schedule dispatch,
-    // reserved idempotency key), both undefined for this start.
-    expect(mocked.stream.mock.calls.at(-1)).toHaveLength(7);
+    // Five host arguments, two undefined optionals (schedule dispatch and
+    // reserved idempotency key), then the required captured authority.
+    expect(mocked.stream.mock.calls.at(-1)).toHaveLength(8);
     expect(discardScheduleDispatch).not.toHaveBeenCalled();
     await expect(
       fixture.resources.owner('run', 'acme_run'),
@@ -2004,6 +2684,18 @@ describe('createThreadAgentHost', () => {
       expect.any(String),
       undefined,
       undefined,
+      {
+        startIdentity: {
+          owner: { kind: 'service', id: 'webhook-dispatcher' },
+          target: { kind: 'agent', id: 'writer', threadId: 'acme_thread' },
+        },
+        agentStart: { threaded: true },
+        onPreparedStartIdentity: undefined,
+        runOwnerGuard: {
+          owner: { kind: 'service', id: 'webhook-dispatcher' },
+          reservationToken: expect.any(String),
+        },
+      },
     );
     await expect(
       fixture.resources.owner('run', 'acme_service_run'),
@@ -2237,6 +2929,18 @@ describe('createThreadAgentHost', () => {
       expect.any(String),
       undefined,
       undefined,
+      {
+        startIdentity: {
+          owner: { kind: 'system', id: 'signal-dispatcher' },
+          target: { kind: 'agent', id: 'writer', threadId: 'acme_thread' },
+        },
+        agentStart: { threaded: true },
+        onPreparedStartIdentity: undefined,
+        runOwnerGuard: {
+          owner: HUMAN_OWNER,
+          reservationToken: expect.any(String),
+        },
+      },
     );
     await expect(
       fixture.resources.owner('run', 'acme_signal_wake'),

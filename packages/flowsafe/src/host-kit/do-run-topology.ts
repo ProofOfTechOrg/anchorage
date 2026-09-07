@@ -21,6 +21,7 @@ import {
   EXECUTION_PRINCIPAL_HEADER,
   type RunLifecycleCas,
   type RunSummary,
+  stampMutationEpoch,
 } from '../do-runner/index.js';
 import { type DoResponseLike, doSummary } from './do-response.js';
 import type { RunStartInput } from './run-router.js';
@@ -155,6 +156,7 @@ export function createDoRunTopology<Id>(
       inputData,
       initialState,
       principal,
+      mutationEpoch,
       scheduleId,
       dispatchId,
       deadlineMs,
@@ -165,13 +167,15 @@ export function createDoRunTopology<Id>(
           'scheduled run starts require both scheduleId and dispatchId',
         );
       }
+      const headers = new Headers({
+        'content-type': 'application/json',
+        [EXECUTION_PRINCIPAL_HEADER]: encodeExecutionPrincipal(principal),
+      });
+      stampMutationEpoch(headers, mutationEpoch);
       return doSummary(
         await stub(workflowId, runId).fetch('http://do/runs', {
           method: 'POST',
-          headers: deploymentIdentityHeaders(deploymentIdentitySecret, {
-            'content-type': 'application/json',
-            [EXECUTION_PRINCIPAL_HEADER]: encodeExecutionPrincipal(principal),
-          }),
+          headers: deploymentIdentityHeaders(deploymentIdentitySecret, headers),
           body: JSON.stringify({
             workflowId,
             runId,

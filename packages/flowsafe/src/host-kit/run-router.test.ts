@@ -12,19 +12,25 @@
 
 import { describe, expect, it, vi } from 'vitest';
 
+import { TEST_DEPLOYMENT_IDENTITY_SECRET } from '../../test-support/deployment-identity.js';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
+  type ActorContext,
   type ApprovalActor,
   ApprovalService,
   type ApprovalStore,
   createActorResolver,
+  humanPrincipal,
   InMemoryApprovalStoreFactory,
   type SelfDecisionPolicy,
 } from '../approval-api/index.js';
 import {
+  doErrorResponse,
   ExecutionFencedError,
   type ExecutionFenceWiring,
+  InvalidMutationEpochError,
   InvalidRunRequestError,
+  MutationEpochMismatchError,
   RunLifecycleBlockedError,
   RunNotSuspendedError,
   type RunSummary,
@@ -34,6 +40,7 @@ import {
   UnknownRunError,
 } from '../do-runner/index.js';
 import { reconcileApprovalsOnStatus } from './approval-bridge.js';
+import { createDoRunTopology } from './do-run-topology.js';
 import { RunRouteError } from './run-route-error.js';
 import { createRunRouter, type RunRouterOptions } from './run-router.js';
 import type { WorkflowMeta } from './workflow-meta.js';
@@ -83,6 +90,8 @@ function suspendedSummary(runId: string): RunSummary {
 }
 
 interface HarnessOptions {
+  transformContext?: (context: ActorContext) => ActorContext;
+  beforeStart?: RunRouterOptions['beforeStart'];
   start?: RunRouterOptions['start'];
   status?: (
     workflowId: string,
@@ -159,7 +168,13 @@ function makeHarness(options: HarnessOptions = {}) {
   });
   const handle = createRunRouter({
     workflows: WORKFLOWS,
-    resolve,
+    resolve: async (request) => {
+      const context = await resolve(request);
+      return context && options.transformContext
+        ? options.transformContext(context)
+        : context;
+    },
+    beforeStart: options.beforeStart,
     systemPrincipalId: SYSTEM.id,
     startIdempotency: options.startIdempotency ?? 'none',
     start: async (input) => {
@@ -221,6 +236,462 @@ function req(path: string, options: ReqOptions = {}): Request {
     body,
   });
 }
+
+function cDeferred() {
+  let resolve = () => {};
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+function cStartStore() {
+  return new StartIdempotencyStore(
+    sqliteUnitDatabase(openSqlite()) as StartIdempotencyDatabase,
+  );
+}
+
+function cHeldBody(body: unknown) {
+  const entered = cDeferred();
+  const release = cDeferred();
+  const bytes = new TextEncoder().encode(JSON.stringify(body));
+  const stream = new ReadableStream<Uint8Array>(
+    {
+      async pull(controller) {
+        entered.resolve();
+        await release.promise;
+        controller.enqueue(bytes);
+        controller.close();
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  const request = new Request('http://host.test/runs', {
+    method: 'POST',
+    headers: {
+      'x-actor-id': OPERATOR.id,
+      'x-actor-role': OPERATOR.role,
+      'content-type': 'application/json',
+    },
+    body: stream,
+    duplex: 'half',
+  } as RequestInit & { duplex: 'half' });
+  return { request, entered, release };
+}
+
+describe('C workflow router capture', () => {
+  it('C keyed replay keeps the captured policy view through persisted lookup and reconciliation', async () => {
+    const store = cStartStore();
+    await store.reserve({
+      key: 'original-key',
+      owner: { kind: 'human', id: OPERATOR.id },
+      targetKind: 'workflow',
+      targetId: OPEN_FLOW.id,
+      mintRunId: () => 'r1',
+    });
+    const actor: ApprovalActor = { id: OPERATOR.id, role: 'operator' };
+    let source: ActorContext | undefined;
+    const entered = cDeferred();
+    const release = cDeferred();
+    const policy = vi.fn<NonNullable<RunRouterOptions['beforeStart']>>(
+      async () => {},
+    );
+    const reconcile = vi.fn<
+      NonNullable<RunRouterOptions['reconcileApprovals']>
+    >(async () => {});
+    const start = vi.fn<RunRouterOptions['start']>(async (input) =>
+      suspendedSummary(input.runId),
+    );
+    const fixture = makeHarness({
+      transformContext: (context) => {
+        source = { ...context, actor, mutationEpoch: 2 };
+        return source;
+      },
+      startIdempotency: {
+        store,
+        executionFence: 'none',
+        live: async () => false,
+      },
+      beforeStart: policy,
+      reconcileApprovals: reconcile,
+      start,
+      status: async (_workflowId, runId) => {
+        entered.resolve();
+        await release.promise;
+        return suspendedSummary(runId);
+      },
+    });
+    const pending = fixture.handle(
+      req('/runs', {
+        body: { workflowId: OPEN_FLOW.id, idempotencyKey: 'original-key' },
+      }),
+    );
+    const outcome = pending.then(
+      () => false,
+      () => false,
+    );
+    try {
+      expect(
+        await Promise.race([entered.promise.then(() => true), outcome]),
+      ).toBe(true);
+      Object.assign(actor, { id: 'replacement', role: 'viewer' });
+      Object.assign(source ?? {}, {
+        principal: humanPrincipal({ id: 'replacement', role: 'viewer' }),
+        mutationEpoch: 3,
+      });
+    } finally {
+      release.resolve();
+      await outcome;
+    }
+    expect((await pending)?.status).toBe(200);
+    expect(start).not.toHaveBeenCalled();
+    expect(reconcile).toHaveBeenCalledOnce();
+    const captured = reconcile.mock.calls[0]?.[0];
+    expect(captured).toBe(policy.mock.calls[0]?.[0]);
+    expect(captured).toMatchObject({
+      actor: { id: OPERATOR.id, role: 'operator' },
+      principal: { id: OPERATOR.id },
+      mutationEpoch: 2,
+    });
+    expect(reconcile.mock.calls[0]?.[1]).toBe(OPEN_FLOW.id);
+    expect(reconcile.mock.calls[0]?.[2]).toMatchObject({
+      runId: 'r1',
+      status: 'suspended',
+    });
+  });
+
+  it.each([
+    'mutationEpoch',
+    'startIdentity',
+    'agentStart',
+    'execution',
+    'tablePrefix',
+    'startToken',
+    'attemptToken',
+    'runOwnerGuard',
+    'onPreparedStartIdentity',
+  ])('C workflow route refuses public authority field %s', async (field) => {
+    const start = vi.fn<RunRouterOptions['start']>(async (input) => ({
+      runId: input.runId,
+      status: 'success',
+    }));
+    const fixture = makeHarness({ start });
+    const response = await fixture.handle(
+      req('/runs', { body: { workflowId: OPEN_FLOW.id, [field]: 2 } }),
+    );
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({
+      error: `field '${field}' is not allowed`,
+    });
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it('C workflow route retains direct invalid-epoch error data', async () => {
+    const start = vi.fn<RunRouterOptions['start']>(async (input) => ({
+      runId: input.runId,
+      status: 'success',
+    }));
+    const fixture = makeHarness({
+      transformContext: (context) => ({ ...context, mutationEpoch: -1 }),
+      start,
+    });
+    const response = await fixture.handle(
+      req('/runs', { body: { workflowId: OPEN_FLOW.id } }),
+    );
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({
+      error: 'mutationEpoch must be a nonnegative safe integer or undefined',
+      reason: { code: 'INVALID_MUTATION_EPOCH' },
+    });
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'missing',
+    'stale',
+    'future',
+    'invalid',
+  ] as const)('C workflow route retains complete encoded epoch refusals: %s', async (classification) => {
+    const error =
+      classification === 'invalid'
+        ? new InvalidMutationEpochError()
+        : new MutationEpochMismatchError(classification, 2);
+    const fetch = vi.fn(async () => doErrorResponse(error));
+    const topology = createDoRunTopology(
+      { idFromName: (name) => name, get: () => ({ fetch }) },
+      TEST_DEPLOYMENT_IDENTITY_SECRET,
+    );
+    const fixture = makeHarness({ start: topology.start });
+    const response = await fixture.handle(
+      req('/runs', { body: { workflowId: OPEN_FLOW.id } }),
+    );
+    expect(response?.status).toBe(classification === 'invalid' ? 400 : 409);
+    expect(await response?.json()).toEqual(
+      classification === 'invalid'
+        ? {
+            error:
+              'mutationEpoch must be a nonnegative safe integer or undefined',
+            reason: { code: 'INVALID_MUTATION_EPOCH' },
+          }
+        : {
+            error: 'mutation epoch does not match the active deployment',
+            reason: {
+              code: 'MUTATION_EPOCH_MISMATCH',
+              classification,
+              mutationEpoch: 2,
+            },
+          },
+    );
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    [false, 'operator', 'admin', 403],
+    [true, 'operator', 'admin', 403],
+    [false, 'admin', 'operator', 200],
+    [true, 'admin', 'operator', 200],
+  ] as const)('C workflow start keeps the original actor role across body reads: keyed=%s %s to %s', async (keyed, initialRole, laterRole, status) => {
+    const values = {
+      id: 'original-actor',
+      role: initialRole as ApprovalActor['role'],
+    };
+    const id = vi.fn(() => values.id);
+    const role = vi.fn(() => values.role);
+    const actor: ApprovalActor = {
+      get id() {
+        return id();
+      },
+      get role() {
+        return role();
+      },
+    };
+    let source: ActorContext | undefined;
+    const store = cStartStore();
+    const reserve = vi.spyOn(store, 'reserve');
+    const policy = vi.fn<NonNullable<RunRouterOptions['beforeStart']>>(
+      async () => {},
+    );
+    const start = vi.fn<RunRouterOptions['start']>(async (input) => ({
+      runId: input.runId,
+      status: 'success',
+    }));
+    const fixture = makeHarness({
+      transformContext: (context) => {
+        source = { ...context, actor, mutationEpoch: 2 };
+        return source;
+      },
+      beforeStart: policy,
+      start,
+      status: async () => undefined,
+      startIdempotency: keyed
+        ? { store, live: async () => false, executionFence: 'none' }
+        : 'none',
+    });
+    const body = cHeldBody({
+      workflowId: RESTRICTED_FLOW.id,
+      ...(keyed ? { idempotencyKey: 'original-key' } : {}),
+    });
+    const pending = fixture.handle(body.request);
+    void pending.catch(() => undefined);
+    try {
+      await body.entered.promise;
+      expect(id).toHaveBeenCalledTimes(1);
+      expect(role).toHaveBeenCalledTimes(1);
+      expect(policy).not.toHaveBeenCalled();
+      expect(reserve).not.toHaveBeenCalled();
+      values.id = 'replacement-actor';
+      values.role = laterRole;
+      Object.assign(source ?? {}, {
+        principal: humanPrincipal({
+          id: 'replacement-principal',
+          role: 'admin',
+        }),
+        mutationEpoch: 3,
+      });
+    } finally {
+      body.release.resolve();
+      await pending;
+    }
+    const response = await pending;
+    expect(response?.status).toBe(status);
+    if (status === 403) {
+      expect(await response?.json()).toEqual({
+        error: "role 'operator' may not start 'restricted-flow'",
+      });
+      expect(policy).not.toHaveBeenCalled();
+      expect(reserve).not.toHaveBeenCalled();
+      expect(start).not.toHaveBeenCalled();
+    } else {
+      expect(policy.mock.calls[0]?.[0]).toMatchObject({
+        actor: { id: 'original-actor', role: initialRole },
+        principal: { id: OPERATOR.id },
+        mutationEpoch: 2,
+      });
+      expect(start.mock.calls[0]?.[0]).toMatchObject({
+        workflowId: RESTRICTED_FLOW.id,
+        principal: { id: OPERATOR.id },
+        mutationEpoch: 2,
+      });
+      expect(start).toHaveBeenCalledOnce();
+      expect(reserve).toHaveBeenCalledTimes(keyed ? 1 : 0);
+    }
+    expect(id).toHaveBeenCalledTimes(1);
+    expect(role).toHaveBeenCalledTimes(1);
+    expect(Object.isFrozen(actor)).toBe(false);
+    expect(Object.isFrozen(source)).toBe(false);
+  });
+
+  it.each([
+    'unkeyed',
+    'reserve',
+    'claim',
+  ] as const)('C suspended start keeps original approval requester and workflow: %s', async (boundary) => {
+    const keyed = boundary !== 'unkeyed';
+    const actor: ApprovalActor = { id: OPERATOR.id, role: 'operator' };
+    let source: ActorContext | undefined;
+    const policyEntered = cDeferred();
+    const policyRelease = cDeferred();
+    const f3Entered = cDeferred();
+    const f3Release = cDeferred();
+    const startEntered = cDeferred();
+    const startRelease = cDeferred();
+    const store = cStartStore();
+    const reserve = store.reserve.bind(store);
+    const claim = store.claim.bind(store);
+    const reserveSpy = vi
+      .spyOn(store, 'reserve')
+      .mockImplementation(async (...args) => {
+        if (boundary === 'reserve') {
+          f3Entered.resolve();
+          await f3Release.promise;
+        }
+        return reserve(...args);
+      });
+    vi.spyOn(store, 'claim').mockImplementation(async (...args) => {
+      if (boundary === 'claim') {
+        f3Entered.resolve();
+        await f3Release.promise;
+      }
+      return claim(...args);
+    });
+    const policy = vi.fn<NonNullable<RunRouterOptions['beforeStart']>>(
+      async () => {
+        policyEntered.resolve();
+        await policyRelease.promise;
+      },
+    );
+    const start = vi.fn<RunRouterOptions['start']>(async (input) => {
+      startEntered.resolve();
+      await startRelease.promise;
+      return {
+        ...suspendedSummary(input.runId),
+        requestedBy: OPERATOR.id,
+        requestedByKind: 'human',
+      };
+    });
+    const fixture = makeHarness({
+      transformContext: (context) => {
+        source = { ...context, actor, mutationEpoch: 2 };
+        return source;
+      },
+      beforeStart: policy,
+      start,
+      status: async () => undefined,
+      startIdempotency: keyed
+        ? { store, live: async () => false, executionFence: 'none' }
+        : 'none',
+    });
+    const body = {
+      workflowId: OPEN_FLOW.id,
+      inputData: { original: true },
+      deadlineMs: 60,
+      idempotencyKey: keyed ? 'original-key' : undefined,
+    };
+    const originalInput = body.inputData;
+    const raw = JSON.stringify(body);
+    const parse = JSON.parse;
+    const parser = vi
+      .spyOn(JSON, 'parse')
+      .mockImplementation((text, reviver) =>
+        text === raw ? body : parse(text, reviver),
+      );
+    const pending = fixture.handle(req('/runs', { body: raw }));
+    const outcome = pending.then(
+      () => false,
+      () => false,
+    );
+    try {
+      expect(
+        await Promise.race([policyEntered.promise.then(() => true), outcome]),
+      ).toBe(true);
+      Object.assign(actor, { id: 'replacement', role: 'admin' });
+      Object.assign(source ?? {}, {
+        principal: humanPrincipal({ id: 'replacement', role: 'admin' }),
+        mutationEpoch: 3,
+      });
+      Object.assign(body, {
+        workflowId: RESTRICTED_FLOW.id,
+        idempotencyKey: 'replacement',
+        deadlineMs: 999,
+        inputData: { replaced: true },
+      });
+      policyRelease.resolve();
+      if (keyed) {
+        expect(
+          await Promise.race([
+            f3Entered.promise.then(() => true),
+            startEntered.promise.then(() => false),
+            outcome,
+          ]),
+        ).toBe(true);
+        Object.assign(actor, { id: 'after-f3', role: 'viewer' });
+        Object.assign(source ?? {}, { mutationEpoch: 4 });
+        f3Release.resolve();
+      }
+      expect(
+        await Promise.race([startEntered.promise.then(() => true), outcome]),
+      ).toBe(true);
+      Object.assign(actor, { id: 'after-execution', role: 'viewer' });
+      body.workflowId = 'after-execution';
+    } finally {
+      policyRelease.resolve();
+      f3Release.resolve();
+      startRelease.resolve();
+      await outcome;
+      parser.mockRestore();
+    }
+    const response = await pending;
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toMatchObject({
+      approval: { requestedBy: OPERATOR.id, workflowId: OPEN_FLOW.id },
+    });
+    expect(policy.mock.calls[0]?.[0]).toMatchObject({
+      actor: { id: OPERATOR.id, role: 'operator' },
+      principal: { id: OPERATOR.id },
+      mutationEpoch: 2,
+    });
+    expect(policy.mock.calls[0]?.slice(1)).toEqual([
+      OPEN_FLOW.id,
+      originalInput,
+    ]);
+    expect(start.mock.calls[0]?.[0]).toMatchObject({
+      workflowId: OPEN_FLOW.id,
+      inputData: originalInput,
+      deadlineMs: 60,
+      principal: { id: OPERATOR.id },
+      mutationEpoch: 2,
+    });
+    if (keyed) {
+      expect(start.mock.calls[0]?.[0].idempotencyKey).toBe('original-key');
+      expect(reserveSpy.mock.calls[0]?.[0]).toMatchObject({
+        key: 'original-key',
+        targetId: OPEN_FLOW.id,
+        owner: { kind: 'human', id: OPERATOR.id },
+      });
+    }
+    expect(start).toHaveBeenCalledOnce();
+  });
+});
 
 describe('createRunRouter — composition and auth', () => {
   it('returns null for paths it does not own', async () => {

@@ -155,22 +155,27 @@ function economicOperations(
   if (value === undefined) return undefined;
   if (!Array.isArray(value))
     throw new Error('stored run lifecycle is malformed');
-  return value.map((entry) => {
-    const operation = record(entry);
+  const length = value.length;
+  if (!Number.isSafeInteger(length) || length < 0 || length > 0xffff_ffff) {
+    throw new Error('stored run lifecycle is malformed');
+  }
+  const operations: RunEconomicOperation[] = [];
+  for (let index = 0; index < length; index++) {
+    if (!(index in value)) throw new Error('stored run lifecycle is malformed');
+    const operation = record(value[index]);
+    if (!operation) throw new Error('stored run lifecycle is malformed');
+    const { id, settlementState } = operation;
     if (
-      !operation ||
-      !isPathSafeId(operation.id) ||
-      typeof operation.settlementState !== 'string' ||
-      operation.settlementState.length === 0 ||
-      operation.settlementState.length > 100
+      !isPathSafeId(id) ||
+      typeof settlementState !== 'string' ||
+      settlementState.length === 0 ||
+      settlementState.length > 100
     ) {
       throw new Error('stored run lifecycle is malformed');
     }
-    return {
-      id: operation.id,
-      settlementState: operation.settlementState,
-    };
-  });
+    operations.push({ id, settlementState });
+  }
+  return operations;
 }
 
 function scheduleDispatch(value: unknown): RunScheduleDispatch | undefined {

@@ -28,6 +28,11 @@ import {
 } from './deployment-identity.js';
 import { DoStatusError, doErrorResponse } from './do-error-response.js';
 import {
+  MUTATION_EPOCH_HEADER,
+  mutationEpochFromHeader,
+  normalizeStartIdentity,
+} from './execution-admission.js';
+import {
   admitsExistingRun,
   admitsRunStart,
   ExecutionFencedError,
@@ -282,13 +287,16 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
 
   async fetch(request: Request): Promise<Response> {
     try {
+      const encodedPrincipal = request.headers.get(EXECUTION_PRINCIPAL_HEADER);
+      const encodedEpoch = request.headers.get(MUTATION_EPOCH_HEADER);
       // Deployment-identity check BEFORE any routing or storage work: under
       // workerd this instance refuses to serve until its env tag matches the
       // database sentinel (fail closed on a mis-provisioned binding); off
       // workerd (node tests, state undefined) it is a no-op. Memoized after
       // the first success, so steady-state requests pay nothing.
       await verifyDurableObjectDeploymentRequest(request, this.state, this.env);
-      return await this.#route(request);
+      const mutationEpoch = mutationEpochFromHeader(encodedEpoch);
+      return await this.#route(request, encodedPrincipal, mutationEpoch);
     } catch (error) {
       return doErrorResponse(error);
     }
@@ -409,8 +417,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     return value;
   }
 
-  #trustedExecutionPrincipal(request: Request): ExecutionPrincipal {
-    const encoded = request.headers.get(EXECUTION_PRINCIPAL_HEADER);
+  #trustedExecutionPrincipal(encoded: string | null): ExecutionPrincipal {
     const principal = encoded ? decodeExecutionPrincipal(encoded) : undefined;
     if (!principal) {
       throw new DurableObjectRunIdentityError(
@@ -1458,29 +1465,59 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     });
   }
 
-  async #route(request: Request): Promise<Response> {
+  async #route(
+    request: Request,
+    encodedPrincipal: string | null,
+    mutationEpoch: number | undefined,
+  ): Promise<Response> {
     const segments = new URL(request.url).pathname.split('/').filter(Boolean);
     if (segments[0] !== 'runs') return json({ error: 'not found' }, 404);
     const [, workflowId, runId, action] = segments;
 
     if (request.method === 'POST' && segments.length === 1) {
+      const principal = this.#trustedExecutionPrincipal(encodedPrincipal);
       return this.#withOperationLock(async () => {
-        const principal = this.#trustedExecutionPrincipal(request);
         const body = await readJson<StartBody>(request);
-        if (!body || typeof body.workflowId !== 'string') {
+        if (
+          body &&
+          [
+            'mutationEpoch',
+            'startIdentity',
+            'agentStart',
+            'execution',
+            'tablePrefix',
+            'startToken',
+            'attemptToken',
+            'runOwnerGuard',
+            'onPreparedStartIdentity',
+          ].some((key) => Object.hasOwn(body, key))
+        ) {
+          throw new InvalidRunRequestError(
+            'start authority is derived from trusted provenance',
+          );
+        }
+        const {
+          workflowId,
+          runId,
+          inputData,
+          initialState,
+          scheduleId,
+          dispatchId,
+          deadlineMs,
+          idempotencyKey: rawIdempotencyKey,
+        } = body ?? {};
+        if (typeof workflowId !== 'string') {
           return json({ error: 'workflowId is required' }, 400);
         }
         // The DO never generates a runId: the trusted Worker mints the id and
         // addresses this instance with it. A start without one is a caller bug,
         // not a request for generation.
-        if (typeof body.runId !== 'string') {
+        if (typeof runId !== 'string') {
           return json(
             { error: 'runId is required (server-minted by the run router)' },
             400,
           );
         }
-        const workflowId = body.workflowId;
-        const runId = body.runId;
         if (!isPathSafeId(workflowId) || !isPathSafeId(runId)) {
           throw new InvalidRunRequestError(
             'workflowId and runId must be URL-path-safe identifiers',
@@ -1491,7 +1528,11 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         // rather than trusted because this body is JSON: an unvalidated value
         // would reach the fence's proof-only comparison and the runtime's
         // reservation as whatever the parser produced.
-        const idempotencyKey = this.#startIdempotencyKey(body.idempotencyKey);
+        const idempotencyKey = this.#startIdempotencyKey(rawIdempotencyKey);
+        const startIdentity = normalizeStartIdentity({
+          owner: { kind: principal.kind, id: principal.id },
+          target: { kind: 'workflow', id: workflowId },
+        });
         // The fence BEFORE any of this object's own reads or writes: the
         // schedule-source lookup below, the recovery pass, the journal at
         // #armRunOwnerRecovery, and the owner reservation all touch storage,
@@ -1515,9 +1556,15 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
           principal,
           workflowId,
           runId,
-          body.scheduleId,
-          body.dispatchId,
+          scheduleId,
+          dispatchId,
         );
+        const rawOwner = source.owner;
+        const owner = Object.freeze({ kind: rawOwner.kind, id: rawOwner.id });
+        const target = source.target;
+        const resolvedInput = target ? target.inputData : inputData;
+        const resolvedState = target ? target.initialState : initialState;
+        const storedRequestContext = target?.requestContext;
         const runtime = this.#ensureRuntime();
         await this.#recoverPendingRunOwner();
         // Stays on status(), and NOT because failing open would be safer: the
@@ -1533,8 +1580,8 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
           );
           if (
             !registered ||
-            registered.kind !== source.owner.kind ||
-            registered.id !== source.owner.id
+            registered.kind !== owner.kind ||
+            registered.id !== owner.id
           ) {
             throw new Error(
               `existing run '${runId}' has no matching committed owner`,
@@ -1560,27 +1607,27 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         // window where nothing else can see the run — is covered too.
         this.#startsInFlight.add(this.#inFlightKey(workflowId, runId));
         try {
-          await this.#reserveRunOwner(runId, source.owner, recovery.token);
+          await this.#reserveRunOwner(runId, owner, recovery.token);
           let summary: RunSummary;
           try {
             summary = await runtime.start(workflowId, {
               runId,
-              inputData: source.target
-                ? source.target.inputData
-                : body.inputData,
-              initialState: source.target
-                ? source.target.initialState
-                : body.initialState,
-              ...(source.target?.requestContext !== undefined
-                ? { storedRequestContext: source.target.requestContext }
+              inputData: resolvedInput,
+              initialState: resolvedState,
+              ...(storedRequestContext !== undefined
+                ? { storedRequestContext }
                 : {}),
               requestedBy: principal.id,
               requestedByKind: principal.kind,
               attemptToken: recovery.token,
+              ...(mutationEpoch === undefined ? {} : { mutationEpoch }),
+              startIdentity,
+              runOwnerGuard: { owner, reservationToken: recovery.token },
+              onPreparedStartIdentity: undefined,
               ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
-              ...(body.deadlineMs === undefined
+              ...(deadlineMs === undefined
                 ? {}
-                : { deadlineMs: body.deadlineMs as number }),
+                : { deadlineMs: deadlineMs as number }),
             });
           } catch (error) {
             let persisted: RunSummary | null | undefined;
@@ -1784,7 +1831,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       runId
     ) {
       this.#assertRunIdentity(workflowId, runId);
-      const principal = this.#trustedExecutionPrincipal(request);
+      const principal = this.#trustedExecutionPrincipal(encodedPrincipal);
       const runtime = this.#ensureRuntime();
       const preflightOwner = await this.runOwnership(this.env).owner(
         'run',
@@ -1841,7 +1888,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       runId
     ) {
       this.#assertRunIdentity(workflowId, runId);
-      const principal = this.#trustedExecutionPrincipal(request);
+      const principal = this.#trustedExecutionPrincipal(encodedPrincipal);
       const body = (await readJson<DeadlineBody>(request)) ?? {};
       const cas: RunLifecycleCas = {
         expectedRevision: body.expectedRevision as number,

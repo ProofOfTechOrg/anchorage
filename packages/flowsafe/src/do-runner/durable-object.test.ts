@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { DurableObjectState } from '@cloudflare/workers-types';
-import { InMemoryStore } from '@mastra/core/storage';
+import { InMemoryStore, type MastraCompositeStore } from '@mastra/core/storage';
 import type {
   DefaultEngineType,
   ExecuteFunction,
@@ -27,6 +27,7 @@ import {
 } from '../host-kit/do-run-topology.js';
 import type { DurableKeyValueStorage } from './cf-types.js';
 import {
+  createD1Storage,
   type SnapshotDatabase,
   sweepExpiredRunDeadlines,
 } from './d1-storage.js';
@@ -38,11 +39,18 @@ import {
   type DurableObjectRunOwnershipStore,
   nextDutyAlarmAt,
 } from './durable-object.js';
+import { MUTATION_EPOCH_HEADER } from './execution-admission.js';
 import type { ExecutionFenceDatabase } from './execution-fence.js';
 import { ExecutionFenceStore } from './execution-fence.js';
 import { EXECUTION_PRINCIPAL_HEADER } from './execution-principal-header.js';
+import {
+  FENCED_WORKFLOW_STORAGE,
+  type FencedWorkflowAdmissionCapability,
+} from './fenced-workflow-capability.js';
+import type { FencedWorkflowsStorageD1 } from './fenced-workflows-d1.js';
 import { init } from './init.js';
 import {
+  type RequestContextProvider,
   type RunnerRuntime,
   RunStateUnreadableError,
   type RunSummary,
@@ -176,12 +184,17 @@ function newTestStartIdempotency(): StartIdempotencyStore {
 }
 
 function gatedRuntime(
-  storage: InMemoryStore,
+  storage: MastraCompositeStore,
   executionFence: ExecutionFenceStore = newTestExecutionFence(),
+  requestContextForRun?: RequestContextProvider,
 ): RunnerRuntime {
   const { createWorkflow, createStep, runtime } = init(
     { storage },
-    { executionFence, startIdempotency: newTestStartIdempotency() },
+    {
+      executionFence,
+      startIdempotency: newTestStartIdempotency(),
+      requestContextForRun,
+    },
   );
   const gate = createStep({
     id: 'gate',
@@ -334,6 +347,791 @@ async function startGated(runner: TestRunner): Promise<RunSummary> {
   );
   return (await response.json()) as RunSummary;
 }
+
+function cDeferred() {
+  let resolve = () => {};
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+function cWorkflowFixture(owned = false, provider?: RequestContextProvider) {
+  const events: string[] = [];
+  const journal = recoveryStorage(events);
+  const env = makeProductionEnv();
+  const binding = env.DB;
+  if (!binding) throw new Error('missing managed test database');
+  const storage = owned ? createD1Storage({ binding }) : env.storage;
+  const runtime = gatedRuntime(storage, env.fence, provider);
+  env.runtime = runtime;
+  const runner = new TestRunner(journal.state, env);
+  const start = vi.spyOn(runtime, 'start');
+  const reserve = vi.spyOn(env.owners, 'reserveAll');
+  return { events, journal, env, storage, runtime, runner, start, reserve };
+}
+
+function cHoldWorkflowVerification(env: TestEnv) {
+  const entered = cDeferred();
+  const release = cDeferred();
+  const identity = deploymentIdentityDatabase();
+  env.DB = {
+    prepare(query) {
+      const statement = identity.prepare(query);
+      return {
+        ...statement,
+        async all<T>() {
+          const result = await statement.all<T>();
+          entered.resolve();
+          await release.promise;
+          return result;
+        },
+      };
+    },
+  };
+  return { entered, release };
+}
+
+const C_WORKFLOW_BODY = {
+  workflowId: 'gated',
+  runId: 'c-run',
+  inputData: { topic: 'original' },
+};
+const C_REPLACEMENT_PRINCIPAL: ExecutionPrincipal = {
+  kind: 'service',
+  id: 'replacement',
+  purpose: 'replacement start',
+};
+
+async function cWorkflowBarrier(runner: TestRunner) {
+  const response = await runner.fetch(
+    deploymentIdentityRequest('http://do/runs/gated/c-run/start-liveness'),
+  );
+  expect(response.status).toBe(200);
+}
+
+async function cHoldWorkflowFifo(fixture: ReturnType<typeof cWorkflowFixture>) {
+  const entered = cDeferred();
+  const release = cDeferred();
+  const nativeStatus = fixture.runtime.status.bind(fixture.runtime);
+  const status = vi
+    .spyOn(fixture.runtime, 'status')
+    .mockImplementationOnce(async (...args) => {
+      entered.resolve();
+      await release.promise;
+      return nativeStatus(...args);
+    });
+  const holder = fixture.runner.fetch(
+    deploymentIdentityRequest('http://do/runs/gated/c-run/dispatch-status'),
+  );
+  await entered.promise;
+  return { release, holder, status };
+}
+
+function cObserveFifo() {
+  const NativePromise = Promise;
+  const signal = cDeferred();
+  let count = 0;
+  const Observed = new Proxy(NativePromise, {
+    construct(target, args) {
+      const stack = new Error().stack ?? '';
+      const value = Reflect.construct(target, args, target);
+      if (stack.includes('#withOperationLock')) {
+        count++;
+        signal.resolve();
+      }
+      return value;
+    },
+  });
+  vi.stubGlobal('Promise', Observed);
+  return {
+    enqueued: signal.promise,
+    count: () => count,
+    restore: () => vi.stubGlobal('Promise', NativePromise),
+  };
+}
+
+async function cRequireEpoch2(fence: ExecutionFenceStore | undefined) {
+  if (!fence) throw new Error('missing managed execution fence');
+  await fence.seed('open');
+  for (let index = 0; index < 2; index++) {
+    const before = await fence.read();
+    const draining = await fence.transition({
+      expected: 'open',
+      next: 'draining',
+      expectedMutationEpoch: before.mutationEpoch,
+      expectedRevision: before.transitionRevision,
+      advanceMutationEpoch: true,
+    });
+    await fence.transition({
+      expected: 'draining',
+      next: 'open',
+      expectedMutationEpoch: draining.mutationEpoch,
+      expectedRevision: draining.transitionRevision,
+    });
+  }
+  expect(await fence.read()).toMatchObject({
+    state: 'open',
+    mutationEpoch: 2,
+    requireMutationEpoch: true,
+  });
+}
+
+describe('C workflow ingress capture', () => {
+  it.each(
+    (['human', 'service', 'system'] as const).flatMap((kind) =>
+      (['alternate', 'second-throw'] as const).flatMap((mode) =>
+        (kind === 'human' ? [false, true] : [true]).map((scheduled) => ({
+          kind,
+          mode,
+          scheduled,
+        })),
+      ),
+    ),
+  )('C workflow DO captures body and distinct source owner before waits ($kind, $mode, scheduled=$scheduled)', async ({
+    kind,
+    mode,
+    scheduled,
+  }) => {
+    const fixture = cWorkflowFixture();
+    const principal: ExecutionPrincipal =
+      kind === 'human'
+        ? { kind, id: 'initiator', role: 'operator' }
+        : { kind, id: `${kind}-initiator`, purpose: 'schedule execution' };
+    const fence = fixture.env.fence;
+    if (!fence) throw new Error('missing workflow test fence');
+    const fenceEntered = cDeferred();
+    const fenceRelease = cDeferred();
+    const sourceEntered = cDeferred();
+    const sourceRelease = cDeferred();
+    const copied = cDeferred();
+    const copyRelease = cDeferred();
+    const readFence = fence.read.bind(fence);
+    vi.spyOn(fence, 'read').mockImplementationOnce(async () => {
+      fenceEntered.resolve();
+      await fenceRelease.promise;
+      return readFence();
+    });
+    const targetInput = { topic: 'scheduled-original' };
+    const targetState = {};
+    const targetContext = { 'test.source': 'original' };
+    const target = {
+      type: 'workflow' as const,
+      workflowId: 'gated',
+      inputData: targetInput,
+      initialState: targetState,
+      requestContext: targetContext,
+    };
+    const resolveTarget = vi.fn<ScheduleSourceStore['resolveScheduleTarget']>(
+      async () => {
+        sourceEntered.resolve();
+        await sourceRelease.promise;
+        return target;
+      },
+    );
+    fixture.env.schedules = { resolveScheduleTarget: resolveTarget };
+    const ownerValues: DurableObjectRunOwner = {
+      kind: 'human',
+      id: 'schedule-owner',
+    };
+    const ownerReads = {
+      kind: vi.fn(() => ownerValues.kind),
+      id: vi.fn(() => ownerValues.id),
+    };
+    const owner: DurableObjectRunOwner = {
+      get kind() {
+        return ownerReads.kind();
+      },
+      get id() {
+        return ownerReads.id();
+      },
+    };
+    const nativeOwner = fixture.env.owners.owner.bind(fixture.env.owners);
+    vi.spyOn(fixture.env.owners, 'owner').mockImplementation(
+      async (resourceKind, id) =>
+        resourceKind === 'schedule' ? owner : nativeOwner(resourceKind, id),
+    );
+    const nativeGet = fixture.journal.storage.get.bind(fixture.journal.storage);
+    let held = false;
+    vi.spyOn(fixture.journal.storage, 'get').mockImplementation(
+      async <T>(key: string) => {
+        if (!held && key === 'flowsafe:run-owner-recovery:v1') {
+          held = true;
+          copied.resolve();
+          await copyRelease.promise;
+        }
+        return nativeGet<T>(key);
+      },
+    );
+    const bodyInput = { topic: 'body-original' };
+    const bodyState = {};
+    const expectedOwner = scheduled
+      ? { kind: 'human', id: 'schedule-owner' }
+      : { kind: principal.kind, id: principal.id };
+    const values = {
+      workflowId: 'gated',
+      runId: 'c-run',
+      inputData: bodyInput,
+      initialState: bodyState,
+      scheduleId: scheduled ? 'original-schedule' : undefined,
+      dispatchId: scheduled ? 'original-dispatch' : undefined,
+      deadlineMs: 1000,
+      idempotencyKey: 'original-key',
+    };
+    const reads = new Map<string, number>();
+    const body = {};
+    for (const key of Object.keys(values) as Array<keyof typeof values>)
+      Object.defineProperty(body, key, {
+        enumerable: true,
+        configurable: true,
+        get() {
+          const count = (reads.get(key) ?? 0) + 1;
+          reads.set(key, count);
+          if (count > 1 && mode === 'second-throw')
+            throw new Error(`second body read: ${key}`);
+          return values[key];
+        },
+      });
+    const request = post('/runs', C_WORKFLOW_BODY, principal);
+    request.headers.set(MUTATION_EPOCH_HEADER, '2');
+    vi.spyOn(request, 'json').mockResolvedValue(body);
+    const writes: Array<[string, unknown]> = [];
+    const nativePut = fixture.journal.storage.put.bind(fixture.journal.storage);
+    vi.spyOn(fixture.journal.storage, 'put').mockImplementation(
+      async (key, value) => {
+        writes.push([key, structuredClone(value)]);
+        await nativePut(key, value);
+      },
+    );
+    const pending = fixture.runner.fetch(request);
+    const outcome = pending.then(
+      () => false,
+      () => false,
+    );
+    try {
+      expect(
+        await Promise.race([fenceEntered.promise.then(() => true), outcome]),
+      ).toBe(true);
+      expect([...reads.keys()].sort()).toEqual(Object.keys(values).sort());
+      for (const count of reads.values()) expect(count).toBe(1);
+      Object.assign(values, {
+        workflowId: 'replacement',
+        runId: 'replacement',
+        inputData: { topic: 'replacement' },
+        initialState: { replaced: true },
+        scheduleId: 'replacement',
+        dispatchId: 'replacement',
+        deadlineMs: 9000,
+        idempotencyKey: 'replacement',
+      });
+      fenceRelease.resolve();
+      if (scheduled) {
+        expect(
+          await Promise.race([sourceEntered.promise.then(() => true), outcome]),
+        ).toBe(true);
+        expect(resolveTarget).toHaveBeenCalledWith(
+          'original-schedule',
+          'original-dispatch',
+          'c-run',
+        );
+        sourceRelease.resolve();
+      }
+      expect(
+        await Promise.race([copied.promise.then(() => true), outcome]),
+      ).toBe(true);
+      if (!scheduled) expect(resolveTarget).not.toHaveBeenCalled();
+      expect(ownerReads.kind).toHaveBeenCalledTimes(scheduled ? 1 : 0);
+      expect(ownerReads.id).toHaveBeenCalledTimes(scheduled ? 1 : 0);
+      Object.assign(ownerValues, { kind: 'service', id: 'replacement-owner' });
+      Object.assign(target, {
+        workflowId: 'replacement',
+        inputData: { topic: 'replacement-target' },
+        initialState: { replaced: true },
+        requestContext: { replaced: true },
+      });
+    } finally {
+      fenceRelease.resolve();
+      sourceRelease.resolve();
+      copyRelease.resolve();
+      await outcome;
+    }
+    const response = await pending;
+    expect(response.status).toBe(200);
+    expect(fixture.start).toHaveBeenCalledOnce();
+    expect(fixture.start.mock.calls[0]?.[0]).toBe('gated');
+    const options = fixture.start.mock.calls[0]?.[1];
+    expect(options).toMatchObject({
+      runId: 'c-run',
+      deadlineMs: 1000,
+      idempotencyKey: 'original-key',
+      mutationEpoch: 2,
+      requestedBy: principal.id,
+      requestedByKind: principal.kind,
+      startIdentity: {
+        owner: { kind: principal.kind, id: principal.id },
+        target: { kind: 'workflow', id: 'gated' },
+      },
+      runOwnerGuard: { owner: expectedOwner },
+    });
+    expect(options?.inputData).toBe(scheduled ? targetInput : bodyInput);
+    expect(options?.initialState).toBe(scheduled ? targetState : bodyState);
+    expect(options?.storedRequestContext).toBe(
+      scheduled ? targetContext : undefined,
+    );
+    expect(options?.runOwnerGuard?.reservationToken).toBe(
+      options?.attemptToken,
+    );
+    expect(Object.hasOwn(options ?? {}, 'onPreparedStartIdentity')).toBe(true);
+    expect(options?.onPreparedStartIdentity).toBeUndefined();
+    expect(fixture.reserve.mock.calls[0]).toEqual([
+      [{ kind: 'run', resourceId: 'c-run' }],
+      expectedOwner,
+      options?.attemptToken,
+    ]);
+    expect(
+      writes.filter(([key]) => key.startsWith('flowsafe:run-owner-recovery')),
+    ).toEqual([
+      [
+        'flowsafe:run-owner-recovery:v1',
+        {
+          version: 1,
+          workflowId: 'gated',
+          runId: 'c-run',
+          token: options?.attemptToken,
+        },
+      ],
+    ]);
+    for (const count of reads.values()) expect(count).toBe(1);
+    expect(ownerReads.kind).toHaveBeenCalledTimes(scheduled ? 1 : 0);
+    expect(ownerReads.id).toHaveBeenCalledTimes(scheduled ? 1 : 0);
+    expect(Object.isFrozen(body)).toBe(false);
+    expect(Object.isFrozen(owner)).toBe(false);
+  });
+
+  it.each(
+    [
+      'mutationEpoch',
+      'startIdentity',
+      'agentStart',
+      'execution',
+      'tablePrefix',
+      'startToken',
+      'attemptToken',
+      'runOwnerGuard',
+      'onPreparedStartIdentity',
+    ].flatMap((field) => [null, 2].map((value) => ({ field, value }))),
+  )('C workflow DO refuses internal JSON authority before effects ($field, $value)', async ({
+    field,
+    value,
+  }) => {
+    const fixture = cWorkflowFixture();
+    const build = vi.spyOn(
+      fixture.runner as unknown as { build: () => RunnerRuntime },
+      'build',
+    );
+    const response = await fixture.runner.fetch(
+      post('/runs', { ...C_WORKFLOW_BODY, [field]: value }),
+    );
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      error: 'start authority is derived from trusted provenance',
+    });
+    expect(build).not.toHaveBeenCalled();
+    expect(fixture.start).not.toHaveBeenCalled();
+    expect(fixture.reserve).not.toHaveBeenCalled();
+    expect(fixture.events).toEqual([]);
+    expect(fixture.journal.values.size).toBe(0);
+    expect(
+      (await fixture.runner.fetch(post('/runs', C_WORKFLOW_BODY))).status,
+    ).toBe(200);
+    expect(fixture.start).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    'normal',
+    'failure',
+    'recovery',
+  ] as const)('C workflow host preserves v1 owner recovery without automatic activation: %s', async (phase) => {
+    const failure = new Error('C managed provider failed');
+    const fixture = cWorkflowFixture(
+      true,
+      phase === 'failure'
+        ? () => {
+            throw failure;
+          }
+        : undefined,
+    );
+    await fixture.storage.init();
+    await cRequireEpoch2(fixture.env.fence);
+    const workflows = (await fixture.storage.getStore(
+      'workflows',
+    )) as FencedWorkflowsStorageD1;
+    const native = workflows[FENCED_WORKFLOW_STORAGE];
+    if (!native) throw new Error('missing managed owned workflow capability');
+    const counts = { admission: 0, terminalization: 0 };
+    const capability: FencedWorkflowAdmissionCapability = {
+      ...native,
+      withInitialAdmission: (input, create) => {
+        counts.admission++;
+        return native.withInitialAdmission(input, create);
+      },
+      terminalizeInitialAdmission: (input) => {
+        counts.terminalization++;
+        return native.terminalizeInitialAdmission(input);
+      },
+    };
+    Object.defineProperty(workflows, FENCED_WORKFLOW_STORAGE, {
+      value: capability,
+      configurable: true,
+    });
+    const writes: Array<[string, unknown]> = [];
+    const put = fixture.journal.storage.put.bind(fixture.journal.storage);
+    vi.spyOn(fixture.journal.storage, 'put').mockImplementation(
+      async (key, value) => {
+        writes.push([key, structuredClone(value)]);
+        await put(key, value);
+      },
+    );
+    const settle = fixture.env.owners.settleReservation.bind(
+      fixture.env.owners,
+    );
+    if (phase === 'recovery')
+      vi.spyOn(fixture.env.owners, 'settleReservation').mockImplementationOnce(
+        async (...args) => {
+          await settle(...args);
+          throw new Error('C lost settlement receipt');
+        },
+      );
+    const request = post('/runs', C_WORKFLOW_BODY);
+    request.headers.set(MUTATION_EPOCH_HEADER, '2');
+    try {
+      const response = await fixture.runner.fetch(request);
+      expect(response.status).toBe(phase === 'failure' ? 500 : 200);
+      expect(fixture.start).toHaveBeenCalledOnce();
+      const options = fixture.start.mock.calls[0]?.[1];
+      expect(options).toHaveProperty('onPreparedStartIdentity', undefined);
+      expect(Object.hasOwn(options ?? {}, 'onPreparedStartIdentity')).toBe(
+        true,
+      );
+      const journals = writes.filter(([key]) =>
+        key.startsWith('flowsafe:run-owner-recovery'),
+      );
+      expect(journals).toEqual([
+        [
+          'flowsafe:run-owner-recovery:v1',
+          {
+            version: 1,
+            workflowId: 'gated',
+            runId: 'c-run',
+            token: options?.attemptToken,
+          },
+        ],
+      ]);
+      const snapshot = await workflows.loadWorkflowSnapshot({
+        workflowName: 'gated',
+        runId: 'c-run',
+      });
+      if (phase === 'failure') expect(snapshot).toBeNull();
+      else {
+        expect(snapshot?.requestContext?.['flowsafe.runProvenance']).toEqual({
+          version: 1,
+          requestedBy: OWNER_PRINCIPAL.id,
+          requestedByKind: OWNER_PRINCIPAL.kind,
+          startToken: options?.attemptToken,
+          attemptToken: options?.attemptToken,
+          resumeCounts: [],
+        });
+        for (const key of [
+          'mutationEpoch',
+          'startIdentity',
+          'agentStart',
+          'execution',
+          'flowsafe.initialAdmission',
+        ])
+          expect(snapshot?.requestContext).not.toHaveProperty(key);
+      }
+      if (phase === 'recovery')
+        expect(
+          fixture.journal.values.has('flowsafe:run-owner-recovery:v1'),
+        ).toBe(true);
+      await fixture.runner.alarm();
+      expect(fixture.journal.values.has('flowsafe:run-owner-recovery:v1')).toBe(
+        false,
+      );
+      if (phase !== 'failure') {
+        const resumed = await fixture.runner.fetch(
+          post('/runs/gated/c-run/resume', {
+            step: 'gate',
+            resumeData: { approvedBy: 'reviewer-1' },
+          }),
+        );
+        expect(resumed.status).toBe(200);
+        expect(await resumed.json()).toMatchObject({ status: 'success' });
+        await fixture.runner.alarm();
+      }
+      expect(
+        writes.filter(([key]) => key.startsWith('flowsafe:run-owner-recovery')),
+      ).toEqual(journals);
+    } finally {
+      expect(counts).toEqual({ admission: 0, terminalization: 0 });
+    }
+  });
+
+  it.each([
+    undefined,
+    1,
+    2,
+    3,
+  ])('C does not enforce active mutation epoch at workflow DO start: %s', async (epoch) => {
+    const fixture = cWorkflowFixture(true);
+    await fixture.storage.init();
+    await cRequireEpoch2(fixture.env.fence);
+    const request = post('/runs', C_WORKFLOW_BODY);
+    if (epoch !== undefined)
+      request.headers.set(MUTATION_EPOCH_HEADER, String(epoch));
+    const response = await fixture.runner.fetch(request);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      runId: 'c-run',
+      status: 'suspended',
+    });
+    expect(fixture.start).toHaveBeenCalledOnce();
+    const options = fixture.start.mock.calls[0]?.[1];
+    expect(options?.mutationEpoch).toBe(epoch);
+    expect(options).toHaveProperty('onPreparedStartIdentity', undefined);
+    expect(options?.startIdentity).toEqual({
+      owner: { kind: OWNER_PRINCIPAL.kind, id: OWNER_PRINCIPAL.id },
+      target: { kind: 'workflow', id: 'gated' },
+    });
+    const workflows = await fixture.storage.getStore('workflows');
+    const snapshot = await workflows?.loadWorkflowSnapshot({
+      workflowName: 'gated',
+      runId: 'c-run',
+    });
+    expect(snapshot?.requestContext?.['flowsafe.runProvenance']).toEqual({
+      version: 1,
+      requestedBy: OWNER_PRINCIPAL.id,
+      requestedByKind: OWNER_PRINCIPAL.kind,
+      startToken: options?.attemptToken,
+      attemptToken: options?.attemptToken,
+      resumeCounts: [],
+    });
+    expect(snapshot?.requestContext).not.toHaveProperty(
+      'flowsafe.initialAdmission',
+    );
+    await cWorkflowBarrier(fixture.runner);
+  });
+
+  it.each([
+    undefined,
+    0,
+    2,
+    Number.MAX_SAFE_INTEGER,
+  ])('C captures workflow headers before deployment verification: %s', async (epoch) => {
+    const fixture = cWorkflowFixture();
+    const hold = cHoldWorkflowVerification(fixture.env);
+    const request = post('/runs', C_WORKFLOW_BODY);
+    if (epoch !== undefined)
+      request.headers.set(MUTATION_EPOCH_HEADER, String(epoch));
+    const pending = fixture.runner.fetch(request);
+    try {
+      await hold.entered.promise;
+      expect(fixture.start).not.toHaveBeenCalled();
+      expect(fixture.events).toEqual([]);
+      request.headers.set(
+        EXECUTION_PRINCIPAL_HEADER,
+        encodeExecutionPrincipal(C_REPLACEMENT_PRINCIPAL),
+      );
+      request.headers.set(MUTATION_EPOCH_HEADER, '3');
+    } finally {
+      hold.release.resolve();
+      await pending;
+    }
+    expect((await pending).status).toBe(200);
+    expect(fixture.start).toHaveBeenCalledTimes(1);
+    const options = fixture.start.mock.calls[0]?.[1];
+    expect(options).toMatchObject({
+      requestedBy: OWNER_PRINCIPAL.id,
+      requestedByKind: OWNER_PRINCIPAL.kind,
+      startIdentity: {
+        owner: { kind: 'human', id: 'owner-1' },
+        target: { kind: 'workflow', id: 'gated' },
+      },
+      runOwnerGuard: {
+        owner: { kind: 'human', id: 'owner-1' },
+        reservationToken: options?.attemptToken,
+      },
+    });
+    expect(options?.mutationEpoch).toBe(epoch);
+    expect(Object.hasOwn(options ?? {}, 'onPreparedStartIdentity')).toBe(true);
+    expect(options?.onPreparedStartIdentity).toBeUndefined();
+  });
+
+  it.each([
+    undefined,
+    2,
+  ])('C preserves queued workflow authority through the operation FIFO: %s', async (epoch) => {
+    const fixture = cWorkflowFixture();
+    const hold = await cHoldWorkflowFifo(fixture);
+    const request = post('/runs', C_WORKFLOW_BODY);
+    if (epoch !== undefined)
+      request.headers.set(MUTATION_EPOCH_HEADER, String(epoch));
+    const body = vi.spyOn(request, 'json');
+    const observation = cObserveFifo();
+    const pending = fixture.runner.fetch(request);
+    try {
+      expect(
+        await Promise.race([
+          observation.enqueued.then(() => 'queued'),
+          pending.then(() => 'response'),
+        ]),
+      ).toBe('queued');
+      expect(observation.count()).toBe(1);
+      expect(body).not.toHaveBeenCalled();
+      expect(fixture.start).not.toHaveBeenCalled();
+      request.headers.set(
+        EXECUTION_PRINCIPAL_HEADER,
+        encodeExecutionPrincipal(C_REPLACEMENT_PRINCIPAL),
+      );
+      request.headers.set(MUTATION_EPOCH_HEADER, '3');
+    } finally {
+      observation.restore();
+      hold.release.resolve();
+      await Promise.allSettled([hold.holder, pending]);
+    }
+    expect((await pending).status).toBe(200);
+    expect(fixture.start.mock.calls[0]?.[1]).toMatchObject({
+      requestedBy: 'owner-1',
+      requestedByKind: 'human',
+    });
+    expect(fixture.start.mock.calls[0]?.[1].mutationEpoch).toBe(epoch);
+    expect(body).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    null,
+    'invalid',
+  ])('C refuses invalid workflow principal before joining the FIFO: %s', async (principal) => {
+    const fixture = cWorkflowFixture();
+    const hold = await cHoldWorkflowFifo(fixture);
+    const request = post('/runs', C_WORKFLOW_BODY);
+    if (principal === null) request.headers.delete(EXECUTION_PRINCIPAL_HEADER);
+    else request.headers.set(EXECUTION_PRINCIPAL_HEADER, principal);
+    const body = vi.spyOn(request, 'json');
+    const observation = cObserveFifo();
+    const pending = fixture.runner.fetch(request);
+    try {
+      expect(
+        await Promise.race([
+          pending.then(() => 'response'),
+          observation.enqueued.then(() => 'queued'),
+        ]),
+        'refusal completes without joining the held FIFO',
+      ).toBe('response');
+      expect(observation.count()).toBe(0);
+      expect(body).not.toHaveBeenCalled();
+      expect(fixture.start).not.toHaveBeenCalled();
+      expect(fixture.reserve).not.toHaveBeenCalled();
+    } finally {
+      observation.restore();
+      hold.release.resolve();
+      await Promise.allSettled([hold.holder, pending]);
+    }
+    expect((await pending).status).toBe(403);
+    expect(await (await pending).json()).toEqual({
+      error: 'run request carries no valid trusted execution principal',
+    });
+  });
+
+  it.each([
+    ['credential', 'wrong-secret', 'globex', 503, 'credential'],
+    [
+      'deployment',
+      TEST_DEPLOYMENT_IDENTITY_SECRET,
+      'globex',
+      503,
+      "belongs to 'globex'",
+    ],
+    [
+      'epoch',
+      TEST_DEPLOYMENT_IDENTITY_SECRET,
+      'acme',
+      400,
+      'mutationEpoch must be a nonnegative safe integer or undefined',
+    ],
+  ] as const)('C workflow ingress refuses combined invalid authority before route: %s', async (_label, secret, tag, status, error) => {
+    const fixture = cWorkflowFixture();
+    fixture.env.DB = deploymentIdentityDatabase(tag);
+    const request = deploymentIdentityRequest(
+      'http://do/runs',
+      { method: 'POST', body: JSON.stringify(C_WORKFLOW_BODY) },
+      secret,
+    );
+    request.headers.set(MUTATION_EPOCH_HEADER, '01');
+    request.headers.set(EXECUTION_PRINCIPAL_HEADER, 'invalid');
+    const build = vi.spyOn(
+      fixture.runner as unknown as { build: () => RunnerRuntime },
+      'build',
+    );
+    const response = await fixture.runner.fetch(request);
+    expect(response.status).toBe(status);
+    const result = (await response.json()) as { error: string };
+    expect(result.error).toContain(error);
+    if (status === 400)
+      expect(result).toEqual({
+        error,
+        reason: { code: 'INVALID_MUTATION_EPOCH' },
+      });
+    expect(build).not.toHaveBeenCalled();
+    expect(fixture.events).toEqual([]);
+    expect(fixture.start).not.toHaveBeenCalled();
+    expect(fixture.reserve).not.toHaveBeenCalled();
+  });
+
+  it('C workflow status and liveness remain principal-free', async () => {
+    const fixture = cWorkflowFixture();
+    const started = await fixture.runner.fetch(post('/runs', C_WORKFLOW_BODY));
+    expect(started.status).toBe(200);
+    const response = await fixture.runner.fetch(
+      deploymentIdentityRequest('http://do/runs/gated/c-run'),
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      runId: 'c-run',
+      status: 'suspended',
+    });
+    await cWorkflowBarrier(fixture.runner);
+  });
+
+  it.each([
+    'terminate',
+    'deadline',
+  ] as const)('C workflow %s uses the pre-verifier principal string', async (action) => {
+    const fixture = cWorkflowFixture();
+    const hold = cHoldWorkflowVerification(fixture.env);
+    const cancel = vi
+      .spyOn(fixture.runtime, 'cancelActiveExecution')
+      .mockResolvedValue(false);
+    const request = post(`/runs/gated/c-run/${action}`, {
+      expectedRevision: 0,
+      expectedDeadlineAt: null,
+    });
+    const pending = fixture.runner.fetch(request);
+    try {
+      await hold.entered.promise;
+      request.headers.set(
+        EXECUTION_PRINCIPAL_HEADER,
+        'invalid-after-verification',
+      );
+    } finally {
+      hold.release.resolve();
+      await pending;
+    }
+    expect((await pending).status).not.toBe(403);
+    if (action === 'terminate')
+      expect(cancel.mock.calls[0]?.[3]?.[0]).toEqual(OWNER_PRINCIPAL);
+  });
+});
 
 describe('DurableObjectRunner.fetch', () => {
   it('rejects a start without a trusted execution principal before runtime or ownership work', async () => {

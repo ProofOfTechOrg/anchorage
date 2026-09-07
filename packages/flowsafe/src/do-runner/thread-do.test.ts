@@ -9,6 +9,7 @@ import {
   TEST_DEPLOYMENT_IDENTITY_SECRET,
 } from '../../test-support/deployment-identity.js';
 import { encodeExecutionPrincipal } from '../approval-api/index.js';
+import { MUTATION_EPOCH_HEADER } from './execution-admission.js';
 import { EXECUTION_PRINCIPAL_HEADER } from './execution-principal-header.js';
 import { type InitResult, init } from './init.js';
 import { RunStateUnreadableError } from './runtime.js';
@@ -16,6 +17,7 @@ import { ThreadDurableObject, type ThreadScope } from './thread-do.js';
 
 class TestThread extends ThreadDurableObject {
   builds = 0;
+  scopes: ThreadScope[] = [];
   events?: string[];
   buildError?: Error;
   alarmError?: Error;
@@ -31,6 +33,7 @@ class TestThread extends ThreadDurableObject {
   }
 
   protected route(_request: Request, scope: ThreadScope): Promise<Response> {
+    this.scopes.push(scope);
     return Promise.resolve(
       Response.json({
         threadId: scope.threadId,
@@ -113,7 +116,161 @@ function request(
   );
 }
 
+function cDeferred() {
+  let resolve = () => {};
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 describe('ThreadDurableObject identity boundary', () => {
+  it.each([
+    undefined,
+    0,
+    2,
+    Number.MAX_SAFE_INTEGER,
+  ])('C captures thread headers before deployment verification: %s', async (epoch) => {
+    const entered = cDeferred();
+    const release = cDeferred();
+    const identity = deploymentIdentityDatabase();
+    const thread = new TestThread(
+      {
+        id: { name: 'thread-1' },
+        storage: {},
+      } as unknown as DurableObjectState,
+      {
+        DEPLOYMENT_TENANT: 'acme',
+        DEPLOYMENT_IDENTITY_SECRET: TEST_DEPLOYMENT_IDENTITY_SECRET,
+        DB: {
+          prepare(query: string) {
+            const statement = identity.prepare(query);
+            return {
+              ...statement,
+              async all<T>() {
+                const result = await statement.all<T>();
+                entered.resolve();
+                await release.promise;
+                return result;
+              },
+            };
+          },
+        },
+      },
+    );
+    const input = request();
+    if (epoch !== undefined)
+      input.headers.set(MUTATION_EPOCH_HEADER, String(epoch));
+    const pending = thread.fetch(input);
+    try {
+      await entered.promise;
+      expect(thread.builds).toBe(0);
+      expect(thread.scopes).toEqual([]);
+      input.headers.set(
+        EXECUTION_PRINCIPAL_HEADER,
+        encodeExecutionPrincipal({
+          kind: 'service',
+          id: 'replacement',
+          purpose: 'replacement start',
+        }),
+      );
+      input.headers.set(MUTATION_EPOCH_HEADER, '3');
+    } finally {
+      release.resolve();
+      await pending;
+    }
+    expect((await pending).status).toBe(200);
+    expect(thread.scopes).toHaveLength(1);
+    const scope = thread.scopes[0];
+    expect(scope).toMatchObject({
+      threadId: 'thread-1',
+      deploymentTag: 'acme',
+      principal: { kind: 'human', id: 'operator', role: 'operator' },
+    });
+    expect(scope?.mutationEpoch).toBe(epoch);
+    expect(Object.isFrozen(scope)).toBe(true);
+    expect(Object.isFrozen(scope?.init)).toBe(false);
+    expect(Object.isFrozen(scope?.init.runtime)).toBe(false);
+    expect(Object.isFrozen(input)).toBe(false);
+  });
+
+  it.each([
+    [
+      'credential',
+      'thread/invalid',
+      false,
+      'acme',
+      'wrong-secret',
+      503,
+      'credential',
+    ],
+    [
+      'deployment',
+      'thread/invalid',
+      false,
+      'globex',
+      TEST_DEPLOYMENT_IDENTITY_SECRET,
+      503,
+      "belongs to 'globex'",
+    ],
+    [
+      'object',
+      'thread/invalid',
+      false,
+      'acme',
+      TEST_DEPLOYMENT_IDENTITY_SECRET,
+      403,
+      'path-safe id.name',
+    ],
+    [
+      'missing principal',
+      'thread-1',
+      false,
+      'acme',
+      TEST_DEPLOYMENT_IDENTITY_SECRET,
+      403,
+      'no trusted execution principal',
+    ],
+    [
+      'invalid principal',
+      'thread-1',
+      'malformed',
+      'acme',
+      TEST_DEPLOYMENT_IDENTITY_SECRET,
+      403,
+      'invalid execution principal',
+    ],
+    [
+      'epoch',
+      'thread-1',
+      true,
+      'acme',
+      TEST_DEPLOYMENT_IDENTITY_SECRET,
+      400,
+      'mutationEpoch must be a nonnegative safe integer or undefined',
+    ],
+  ] as const)('C thread ingress preserves combined-invalid precedence: %s', async (_label, name, principal, storedTag, secret, status, message) => {
+    const events: string[] = [];
+    const thread = threadWith(name, { storedTag, events });
+    const input = request(principal === true, secret);
+    if (principal === 'malformed')
+      input.headers.set(EXECUTION_PRINCIPAL_HEADER, 'malformed');
+    input.headers.set(MUTATION_EPOCH_HEADER, '01');
+    const response = await thread.fetch(input);
+    expect(response.status).toBe(status);
+    const body = (await response.json()) as { error: string; reason?: unknown };
+    expect(body.error).toContain(message);
+    if (status === 400)
+      expect(body).toEqual({
+        error: message,
+        reason: { code: 'INVALID_MUTATION_EPOCH' },
+      });
+    expect(thread.builds).toBe(0);
+    expect(thread.scopes).toEqual([]);
+    expect(events).not.toContain('setAlarm');
+    if (_label === 'credential') expect(events).toEqual([]);
+  });
+
   it('validates its local name before pre-arming alarm storage', async () => {
     const events: string[] = [];
     const thread = threadWith('thread/invalid', { events });

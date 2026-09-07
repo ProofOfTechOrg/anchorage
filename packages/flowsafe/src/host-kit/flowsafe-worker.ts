@@ -38,6 +38,10 @@ import {
 } from '../audit-export/index.js';
 import { credentialsMatch } from '../do-runner/deployment-identity.js';
 import type { DurableObjectRunLifecycleHooks } from '../do-runner/durable-object.js';
+import {
+  InvalidMutationEpochError,
+  normalizeMutationEpoch,
+} from '../do-runner/execution-admission.js';
 import type {
   DeploymentIdentityDatabase,
   ExecutionFenceStore,
@@ -333,6 +337,7 @@ export interface FlowsafeRunnerLifecycleConfig<Env extends FlowsafeWorkerEnv> {
 
 export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv>
   extends FlowsafeRunnerLifecycleConfig<Env> {
+  mutationEpoch?: number | ((env: Env) => unknown);
   /** The catalog createRunRouter serves and gates (hosts pass their metas). */
   workflows: ReadonlyArray<WorkflowMeta>;
   /**
@@ -1120,6 +1125,8 @@ async function inventoryAdminResponse<Env extends FlowsafeWorkerEnv>(
 export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
   config: FlowsafeWorkerConfig<Env>,
 ): FlowsafeWorker<Env> {
+  const epochSource = config.mutationEpoch;
+  if (typeof epochSource !== 'function') normalizeMutationEpoch(epochSource);
   const storageTablePrefix = validateTablePrefix(
     config.storageTablePrefix,
     'storageTablePrefix',
@@ -1132,8 +1139,10 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
     notify: ApprovalNotificationSink | undefined,
     selfDecision: SelfDecisionPolicy,
     stream: ApprovalStreamSink | undefined,
+    mutationEpoch: number | undefined,
   ): ActorResolver => {
     const base = createActorResolver({
+      mutationEpoch,
       authenticate: bearerActorAuthenticator(config.buildVerifier(env)),
       storeFactory: approvalStoreFactoryFor(env.DB, storageTablePrefix),
       deploymentTag: env.DEPLOYMENT_TENANT,
@@ -1486,6 +1495,9 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
   return {
     async fetch(request, env, ctx) {
       try {
+        const mutationEpoch = normalizeMutationEpoch(
+          typeof epochSource === 'function' ? epochSource(env) : epochSource,
+        );
         await ensureDeploymentIdentityBindings(env);
         await validateFleetChannelTopology(env);
         const url = new URL(request.url);
@@ -1552,6 +1564,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
           notify,
           selfDecision,
           streamSink,
+          mutationEpoch,
         );
 
         if (config.preRoutes) {
@@ -1665,6 +1678,12 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
             }),
           );
           return json({ error: 'deployment unavailable' }, 503);
+        }
+        if (error instanceof InvalidMutationEpochError) {
+          return json(
+            { error: error.message, reason: error.reason },
+            error.status,
+          );
         }
         // Backstop: a mounted router (or any handler fault) that THROWS before
         // returning a Response — e.g. a future unguarded path decode — is

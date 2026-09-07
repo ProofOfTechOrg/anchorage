@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   canonicalEconomicOperations,
   canonicalReplayPrincipals,
@@ -17,6 +17,162 @@ import {
   type RunTerminalStatus,
   terminalCleanupFor,
 } from './run-lifecycle.js';
+
+describe('C dense economic-operation format', () => {
+  const entries = [
+    { id: 'first', settlementState: 'settled' },
+    { id: 'second', settlementState: 'held' },
+    { id: 'third', settlementState: 'disputed' },
+  ];
+
+  it.each([
+    'leading',
+    'interior',
+    'trailing',
+    'all-hole',
+  ] as const)('C rejects sparse economic operations in the shared lifecycle parser: %s', (shape) => {
+    const operations = shape === 'all-hole' ? new Array(3) : [...entries];
+    if (shape !== 'all-hole')
+      delete operations[{ leading: 0, interior: 1, trailing: 2 }[shape]];
+    for (const read of [
+      () => canonicalEconomicOperations(operations),
+      () =>
+        parseRunLifecycle({
+          version: 1,
+          revision: 1,
+          economicOperations: operations,
+        }),
+    ]) {
+      let error: unknown;
+      try {
+        read();
+      } catch (cause) {
+        error = cause;
+      }
+      expect(error).toBeInstanceOf(Error);
+      expect(Object.getPrototypeOf(error)).toBe(Error.prototype);
+      expect(error).toEqual(new Error('stored run lifecycle is malformed'));
+    }
+  });
+
+  it.each([
+    'dense',
+    'inherited',
+    'empty',
+  ] as const)('C keeps dense and inherited economic data readable: %s', (shape) => {
+    const operations = shape === 'empty' ? [] : [...entries];
+    if (shape === 'inherited') {
+      const prototype = Object.create(Array.prototype);
+      Object.defineProperty(prototype, '1', { value: entries[1] });
+      Object.setPrototypeOf(operations, prototype);
+      delete operations[1];
+    }
+    const expected = shape === 'empty' ? [] : entries;
+    const captured = canonicalEconomicOperations(operations);
+    expect(captured).toEqual(expected);
+    expect(captured).not.toBe(operations);
+    expect(Object.getPrototypeOf(captured)).toBe(Array.prototype);
+    const lifecycle = { version: 1, revision: 1, economicOperations: captured };
+    expect(parseRunLifecycle(JSON.parse(JSON.stringify(lifecycle)))).toEqual(
+      lifecycle,
+    );
+    expect(Object.isFrozen(operations)).toBe(false);
+  });
+
+  it('C shared economic parsing ignores caller methods and reads primitives once', () => {
+    const id = vi
+      .fn()
+      .mockReturnValueOnce('first')
+      .mockImplementation(() => {
+        throw new Error('second id read');
+      });
+    const settlementState = vi
+      .fn()
+      .mockReturnValueOnce('settled')
+      .mockImplementation(() => {
+        throw new Error('second state read');
+      });
+    const operations = [
+      {
+        get id() {
+          return id();
+        },
+        get settlementState() {
+          return settlementState();
+        },
+      },
+    ];
+    const map = vi.fn(() => []);
+    const iterator = vi.fn(() => {
+      throw new Error('caller iterator');
+    });
+    Object.defineProperty(operations, 'map', { value: map });
+    Object.defineProperty(operations, Symbol.iterator, { value: iterator });
+    expect(canonicalEconomicOperations(operations)).toEqual([
+      { id: 'first', settlementState: 'settled' },
+    ]);
+    expect(id).toHaveBeenCalledTimes(1);
+    expect(settlementState).toHaveBeenCalledTimes(1);
+    expect(map).not.toHaveBeenCalled();
+    expect(iterator).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    null,
+    '1',
+    true,
+    -1,
+    1.5,
+    NaN,
+    Infinity,
+    Number.MAX_SAFE_INTEGER,
+  ])('C shared economic parsing refuses malformed array length: %s', (length) => {
+    const operations = new Proxy([...entries], {
+      get(target, key, receiver) {
+        return key === 'length' ? length : Reflect.get(target, key, receiver);
+      },
+    });
+    let error: unknown;
+    try {
+      canonicalEconomicOperations(operations);
+    } catch (cause) {
+      error = cause;
+    }
+    expect(error).toBeInstanceOf(Error);
+    expect(Object.getPrototypeOf(error)).toBe(Error.prototype);
+    expect(error).toEqual(new Error('stored run lifecycle is malformed'));
+  });
+
+  it('C shared economic parsing preserves first getter faults and avoids array species', () => {
+    const fault = new Error('first economic id read');
+    const operations = [
+      {
+        get id(): string {
+          throw fault;
+        },
+        settlementState: 'held',
+      },
+    ];
+    let error: unknown;
+    try {
+      canonicalEconomicOperations(operations);
+    } catch (cause) {
+      error = cause;
+    }
+    expect(error).toBe(fault);
+    const species = vi.fn();
+    class Operations extends Array<(typeof entries)[number]> {
+      static get [Symbol.species]() {
+        species();
+        return Array;
+      }
+    }
+    expect(canonicalEconomicOperations(new Operations(...entries))).toEqual(
+      entries,
+    );
+    expect(species).not.toHaveBeenCalled();
+  });
+});
 
 const MAX_REVISION = Number.MAX_SAFE_INTEGER;
 

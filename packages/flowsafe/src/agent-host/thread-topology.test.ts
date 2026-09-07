@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import type { ActorContext, ApprovalRecord } from '../approval-api/index.js';
 import {
@@ -417,11 +417,13 @@ function keyedHarness(options: { now?: () => number } = {}) {
   const runsByThread = new Map<string, string>();
   const starts: Array<{ threadId: string; runId: string; key?: string }> = [];
   const inFlight = new Set<string>();
+  const hits: Hit[] = [];
   const namespace: ThreadNamespaceLike<string> = {
     idFromName: (name) => name,
     get: (threadId) => ({
       fetch: (async (request: Request | string, init?: ThreadRequestInit) => {
         const url = typeof request === 'string' ? request : request.url;
+        hits.push({ threadId, url, init });
         if (url.includes('/start-liveness')) {
           const runId = url.split('/runs/')[1]?.split('/')[1] ?? '';
           return Response.json({
@@ -476,12 +478,264 @@ function keyedHarness(options: { now?: () => number } = {}) {
     starts,
     runsByThread,
     inFlight,
+    hits,
     topology: createAgentThreadTopology(namespace, DEPLOYMENT_IDENTITY_SECRET, {
       startIdempotency: store,
       executionFence: 'none',
     }),
   };
 }
+
+function cDeferred() {
+  let resolve = () => {};
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+describe('C agent topology capture', () => {
+  it.each([
+    'persisted',
+    'live',
+    'unclaimed',
+  ] as const)('C topology keeps captured authority and methods on the winning reservation: %s', async (state) => {
+    const fixture = keyedHarness();
+    const scoped = context();
+    Object.assign(scoped.value, { mutationEpoch: 2 });
+    const principal = scoped.value.principal;
+    const resourceIdFromKey = scoped.value.resourceIdFromKey;
+    Object.defineProperty(scoped.value, 'resourceIdFromKey', {
+      configurable: true,
+      writable: true,
+      enumerable: false,
+      value: function (this: ActorContext, key: string) {
+        expect(this).toBe(scoped.value);
+        return resourceIdFromKey(key);
+      },
+    });
+    await fixture.store.reserve({
+      key: 'original-key',
+      owner: { kind: principal.kind, id: principal.id },
+      targetKind: 'agent',
+      targetId: 'writer',
+      threadId: 'winner-thread',
+      mintRunId: () => 'winner-run',
+    });
+    if (state !== 'unclaimed') {
+      await fixture.store.claim('original-key', 'winner-run');
+      fixture.runsByThread.set('winner-run', 'winner-thread');
+    }
+    if (state === 'live') fixture.inFlight.add('winner-run');
+    const entered = cDeferred();
+    const release = cDeferred();
+    const reserve = fixture.store.reserve.bind(fixture.store);
+    vi.spyOn(fixture.store, 'reserve').mockImplementationOnce(
+      async (...args) => {
+        entered.resolve();
+        await release.promise;
+        return reserve(...args);
+      },
+    );
+    const input: Parameters<AgentThreadDispatchTopology['start']>[1] = {
+      agentId: 'writer',
+      prompt: 'original',
+      entryPath: 'http.start',
+      threaded: false,
+      topologyThreadId: 'candidate-thread',
+      runId: 'candidate-run',
+      idempotencyKey: 'original-key',
+    };
+    const replacement = vi.fn(() => 'replacement-resource');
+    const pending = fixture.topology.start(scoped.value, input);
+    const outcome = pending.then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    );
+    try {
+      expect(
+        await Promise.race([
+          entered.promise.then(() => true),
+          outcome.then(() => false),
+        ]),
+      ).toBe(true);
+      Object.assign(scoped.value, {
+        principal: { kind: 'human', id: 'replacement', role: 'admin' },
+        mutationEpoch: 3,
+        resourceIdFromKey: replacement,
+      });
+      Object.assign(input, {
+        agentId: 'replacement-agent',
+        runId: 'replacement-run',
+        topologyThreadId: 'replacement-thread',
+        idempotencyKey: 'replacement-key',
+      });
+    } finally {
+      release.resolve();
+      await outcome;
+    }
+    const result = await outcome;
+    if (state === 'live')
+      expect(result).toMatchObject({
+        error: {
+          status: 503,
+          reason: { code: 'IDEMPOTENT_START_PENDING', runId: 'winner-run' },
+        },
+      });
+    else
+      expect(result).toMatchObject({
+        value: {
+          agentId: 'writer',
+          threadId: 'winner-thread',
+          runId: 'winner-run',
+        },
+      });
+    expect(fixture.hits.length).toBeGreaterThan(0);
+    for (const hit of fixture.hits) {
+      expect(hit.threadId).toBe('winner-thread');
+      expect(hit.init?.headers).toMatchObject({
+        'x-flowsafe-mutation-epoch': '2',
+        'x-flowsafe-principal': JSON.stringify(principal),
+      });
+      expect(hit.url).not.toContain('replacement-agent');
+    }
+    expect(fixture.starts).toEqual(
+      state === 'unclaimed'
+        ? [
+            {
+              threadId: 'winner-thread',
+              runId: 'winner-run',
+              key: 'original-key',
+            },
+          ]
+        : [],
+    );
+    expect(scoped.runMints()).toBe(0);
+    expect(replacement).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['access', false],
+    ['access', true],
+    ['F3', false],
+    ['F3', true],
+  ] as const)('C topology captures absent and supplied run IDs before F3: %s supplied=%s', async (boundary, supplied) => {
+    const fixture = keyedHarness();
+    const scoped = context();
+    Object.assign(scoped.value, { mutationEpoch: 2 });
+    const principal = scoped.value.principal;
+    const entered = cDeferred();
+    const release = cDeferred();
+    vi.spyOn(scoped.value, 'canAccessResource').mockImplementationOnce(
+      async () => {
+        if (boundary === 'access') {
+          entered.resolve();
+          await release.promise;
+        }
+        return true;
+      },
+    );
+    const reserve = fixture.store.reserve.bind(fixture.store);
+    const reserved = vi
+      .spyOn(fixture.store, 'reserve')
+      .mockImplementationOnce(async (...args) => {
+        if (boundary === 'F3') {
+          entered.resolve();
+          await release.promise;
+        }
+        return reserve(...args);
+      });
+    let runId = supplied ? 'original-run' : undefined;
+    const readRunId = vi.fn(() => runId);
+    const input: Parameters<AgentThreadDispatchTopology['start']>[1] = {
+      agentId: 'writer',
+      entryPath: 'schedule.fire',
+      scheduleId: 'original-schedule',
+      dispatchId: 'original-dispatch',
+      threadId: 'acme_original',
+      resourceId: 'acme_resource_acme_original',
+      topologyThreadId: 'acme_original',
+      idempotencyKey: 'original-key',
+      threaded: true,
+      prompt: 'original',
+      get runId() {
+        return readRunId();
+      },
+    };
+    const replacementMint = vi.fn(() => 'replacement-run');
+    const replacementResource = vi.fn(() => 'replacement-resource');
+    const pending = fixture.topology.start(scoped.value, input);
+    const outcome = pending.then(
+      () => false,
+      () => false,
+    );
+    try {
+      expect(
+        await Promise.race([entered.promise.then(() => true), outcome]),
+      ).toBe(true);
+      expect(readRunId).toHaveBeenCalledTimes(1);
+      expect(scoped.runMints()).toBe(0);
+      runId = 'replacement-run';
+      Object.assign(input, {
+        agentId: 'replacement-agent',
+        entryPath: 'signal.wake',
+        scheduleId: 'replacement-schedule',
+        dispatchId: 'replacement-dispatch',
+        threadId: 'replacement-thread',
+        resourceId: 'replacement-resource',
+        topologyThreadId: 'replacement-topology',
+        idempotencyKey: 'replacement-key',
+        threaded: false,
+        prompt: 'replacement',
+      });
+      Object.assign(scoped.value, {
+        principal: { kind: 'human', id: 'replacement', role: 'admin' },
+        mutationEpoch: 3,
+        newRunId: replacementMint,
+        resourceIdFromKey: replacementResource,
+      });
+    } finally {
+      release.resolve();
+      await outcome;
+    }
+    const expectedRun = supplied ? 'original-run' : 'acme_run_1';
+    expect(await pending).toMatchObject({
+      agentId: 'writer',
+      runId: expectedRun,
+      threadId: 'acme_original',
+    });
+    expect(fixture.starts).toEqual([
+      { threadId: 'acme_original', runId: expectedRun, key: 'original-key' },
+    ]);
+    expect(reserved.mock.calls[0]?.[0]).toMatchObject({
+      owner: { kind: principal.kind, id: principal.id },
+      targetId: 'writer',
+      threadId: 'acme_original',
+      key: 'original-key',
+    });
+    const sent = fixture.hits.find((hit) => hit.url.endsWith('/start'));
+    expect(sent?.init?.headers).toMatchObject({
+      'x-flowsafe-mutation-epoch': '2',
+      'x-flowsafe-principal': JSON.stringify(principal),
+    });
+    expect(JSON.parse(sent?.init?.body ?? '{}')).toMatchObject({
+      agentId: 'writer',
+      entryPath: 'schedule.fire',
+      threaded: true,
+      runId: expectedRun,
+      threadId: 'acme_original',
+      resourceId: 'acme_resource_acme_original',
+      idempotencyKey: 'original-key',
+      scheduleId: 'original-schedule',
+      dispatchId: 'original-dispatch',
+      prompt: 'original',
+    });
+    expect(readRunId).toHaveBeenCalledTimes(1);
+    expect(scoped.runMints()).toBe(supplied ? 0 : 1);
+    expect(replacementMint).not.toHaveBeenCalled();
+    expect(replacementResource).not.toHaveBeenCalled();
+  });
+});
 
 describe('createAgentThreadTopology — idempotent start', () => {
   it('refuses a key when the topology wired no reservation store', async () => {

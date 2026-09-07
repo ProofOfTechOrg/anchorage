@@ -320,6 +320,10 @@ import {
 } from '@proofoftech/flowsafe/host-kit';
 import * as RunnerAdmission from '@proofoftech/flowsafe/do-runner';
 import * as HostAdmission from '@proofoftech/flowsafe/host-kit';
+import {
+  type ActorContext, ApprovalService, createActorResolver,
+  createPrincipalActorContext, humanPrincipal, InMemoryApprovalStoreFactory,
+} from '@proofoftech/flowsafe/approval-api';
 
 const secret = 'x'.repeat(32);
 const headers: Record<string, string> = deploymentIdentityHeaders(secret);
@@ -392,6 +396,32 @@ async function checkReservationTypes(store: RunnerAdmission.StartIdempotencyStor
   return { binding, kind };
 }
 void [hostRunIdentity, hostD1Identity, hostStartIdentity, hostExecutionIdentity, hostD1StartIdentity, hostEpochContext, checkReservationTypes];
+const actor = { id: 'owner', role: 'operator' } as const;
+const principal = humanPrincipal(actor);
+const factory = new InMemoryApprovalStoreFactory();
+const contextOptions = {
+  principal, storeFactory: factory,
+  buildService: (store: ReturnType<typeof factory.store>) => new ApprovalService({ store, executionFence: 'none' }),
+};
+const legacyContext: ActorContext = createPrincipalActorContext(contextOptions);
+const scopedContext: ActorContext = createPrincipalActorContext({ ...contextOptions, mutationEpoch: 2 });
+createActorResolver({ ...contextOptions, authenticate: () => actor, mutationEpoch: 2 });
+declare const hostInit: RunnerAdmission.InitResult;
+const legacyScope: RunnerAdmission.ThreadScope = { threadId: 'thread', principal, init: hostInit };
+const epochScope: RunnerAdmission.ThreadScope = { ...legacyScope, mutationEpoch: 2 };
+const legacyStart: HostAdmission.RunStartInput = { workflowId: 'workflow', runId: 'run', inputData: {}, principal };
+const epochStart: HostAdmission.RunStartInput = { ...legacyStart, mutationEpoch: 2 };
+const runtimeStart: RunnerAdmission.StartRunOptions = { runId: 'run', mutationEpoch: 2, requestedBy: actor.id, requestedByKind: 'human' };
+type EpochEnv = HostAdmission.FlowsafeWorkerEnv & { artifactEpoch: number };
+const workerConfig: HostAdmission.FlowsafeWorkerConfig<EpochEnv> = {
+  systemPrincipalId: 'system', workflows: [],
+  buildVerifier: () => ({ verify: async () => actor }),
+  maintenance: { sweepIntervalMs: 1000, purgeIntervalMs: 1000 },
+  mutationEpoch: env => env.artifactEpoch,
+};
+HostAdmission.createFlowsafeWorker(workerConfig);
+HostAdmission.createFlowsafeWorker({ ...workerConfig, mutationEpoch: 0 });
+void [legacyContext, scopedContext, legacyScope, epochScope, legacyStart, epochStart, runtimeStart];
 `,
   );
   writeFileSync(

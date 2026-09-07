@@ -585,6 +585,17 @@ describe('thread signal routes with a real durable agent', () => {
           },
           'operator',
           'human',
+          undefined,
+          undefined,
+          undefined,
+          {
+            startIdentity: {
+              owner: { kind: 'human', id: 'operator' },
+              target: { kind: 'agent', id: 'writer', threadId: directThreadId },
+            },
+            agentStart: { threaded: false },
+            onPreparedStartIdentity: undefined,
+          },
         ),
         'untilIdle refusal',
       ),
@@ -608,6 +619,17 @@ describe('thread signal routes with a real durable agent', () => {
       { runId: hostId, requestContext: actorContext() },
       'operator',
       'human',
+      undefined,
+      undefined,
+      undefined,
+      {
+        startIdentity: {
+          owner: { kind: 'human', id: 'operator' },
+          target: { kind: 'agent', id: 'writer', threadId: hostId },
+        },
+        agentStart: { threaded: false },
+        onPreparedStartIdentity: undefined,
+      },
     );
     await vi.waitFor(() => expect(harness.start).toHaveBeenCalledOnce());
     await expect(
@@ -646,6 +668,17 @@ describe('thread signal routes with a real durable agent', () => {
         { runId: hostId, requestContext: actorContext() },
         'operator',
         'human',
+        undefined,
+        undefined,
+        undefined,
+        {
+          startIdentity: {
+            owner: { kind: 'human', id: 'operator' },
+            target: { kind: 'agent', id: 'writer', threadId: hostId },
+          },
+          agentStart: { threaded: false },
+          onPreparedStartIdentity: undefined,
+        },
       ),
       'suspended host stream persistence',
     );
@@ -665,6 +698,17 @@ describe('thread signal routes with a real durable agent', () => {
         { runId: hostId, requestContext: actorContext() },
         'operator',
         'human',
+        undefined,
+        undefined,
+        undefined,
+        {
+          startIdentity: {
+            owner: { kind: 'human', id: 'operator' },
+            target: { kind: 'agent', id: 'writer', threadId: hostId },
+          },
+          agentStart: { threaded: false },
+          onPreparedStartIdentity: undefined,
+        },
       ),
     ).rejects.toBeInstanceOf(InvalidRunRequestError);
     expect(globalRunRegistry.get(hostId)).toBe(liveEntry);

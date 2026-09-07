@@ -44,6 +44,12 @@ import {
   BREAKWATER_WORKFLOW_SCOPE_KEY,
 } from './breakwater-keys.js';
 import {
+  normalizeMutationEpoch,
+  normalizeStartIdentity,
+  type RunExecutionIdentity,
+  type StartIdentity,
+} from './execution-admission.js';
+import {
   isReservedExecutionContextKey,
   RUN_PROVENANCE_CONTEXT_KEY,
   stripReservedExecutionContext,
@@ -716,6 +722,16 @@ export type StartRunOptions = {
    * @internal
    */
   idempotencyKey?: string;
+  readonly mutationEpoch?: number;
+  readonly startIdentity?: StartIdentity;
+  readonly agentStart?: { readonly threaded: boolean };
+  readonly onPreparedStartIdentity?: (
+    execution: RunExecutionIdentity,
+  ) => void | Promise<void>;
+  readonly runOwnerGuard?: {
+    readonly owner: StartIdentity['owner'];
+    readonly reservationToken: string;
+  };
 } & OptionalRunRequester;
 
 export type ResumeRunOptions = {
@@ -772,6 +788,172 @@ function relativeDeadline(
     throw new InvalidRunRequestError('deadlineMs exceeds the supported range');
   }
   return deadlineAt;
+}
+
+function captureStartRunOptions(source: StartRunOptions): StartRunOptions {
+  const {
+    runId,
+    inputData,
+    initialState,
+    storedRequestContext,
+    attemptToken,
+    deadlineMs,
+    economicOperations: rawOperations,
+    scheduleDispatch: rawDispatch,
+    idempotencyKey,
+    requestedBy,
+    requestedByKind,
+    mutationEpoch: rawEpoch,
+    startIdentity: rawIdentity,
+    agentStart: rawAgentStart,
+    onPreparedStartIdentity,
+    runOwnerGuard: rawGuard,
+  } = source;
+  if (requestedBy !== undefined && !isExecutionPrincipalId(requestedBy)) {
+    throw new InvalidRunRequestError('requestedBy is malformed');
+  }
+  if (
+    requestedByKind !== undefined &&
+    !isExecutionPrincipalKind(requestedByKind)
+  ) {
+    throw new InvalidRunRequestError('requestedByKind is malformed');
+  }
+  if ((requestedBy === undefined) !== (requestedByKind === undefined)) {
+    throw new InvalidRunRequestError(
+      'requestedBy and requestedByKind must be provided together',
+    );
+  }
+  const mutationEpoch = normalizeMutationEpoch(rawEpoch);
+  const startIdentity =
+    rawIdentity === undefined ? undefined : normalizeStartIdentity(rawIdentity);
+  let agentStart: StartRunOptions['agentStart'];
+  if (rawAgentStart !== undefined) {
+    if (
+      rawAgentStart === null ||
+      typeof rawAgentStart !== 'object' ||
+      Array.isArray(rawAgentStart)
+    ) {
+      throw new InvalidRunRequestError('agentStart is malformed');
+    }
+    const { threaded } = rawAgentStart;
+    if (typeof threaded !== 'boolean') {
+      throw new InvalidRunRequestError('agentStart is malformed');
+    }
+    agentStart = Object.freeze({ threaded });
+  }
+  if (startIdentity?.target.kind === 'agent' && agentStart === undefined) {
+    throw new InvalidRunRequestError(
+      'agentStart is required for an agent target',
+    );
+  }
+  if (
+    startIdentity &&
+    requestedBy !== undefined &&
+    (startIdentity.owner.id !== requestedBy ||
+      startIdentity.owner.kind !== requestedByKind)
+  ) {
+    throw new InvalidRunRequestError(
+      'startIdentity owner does not match requester',
+    );
+  }
+  if (
+    onPreparedStartIdentity !== undefined &&
+    typeof onPreparedStartIdentity !== 'function'
+  ) {
+    throw new InvalidRunRequestError('onPreparedStartIdentity is malformed');
+  }
+  let runOwnerGuard: StartRunOptions['runOwnerGuard'];
+  if (rawGuard !== undefined) {
+    if (
+      rawGuard === null ||
+      typeof rawGuard !== 'object' ||
+      Array.isArray(rawGuard)
+    ) {
+      throw new InvalidRunRequestError('runOwnerGuard is malformed');
+    }
+    const { owner: rawOwner, reservationToken } = rawGuard;
+    if (
+      rawOwner === null ||
+      typeof rawOwner !== 'object' ||
+      Array.isArray(rawOwner)
+    ) {
+      throw new InvalidRunRequestError('runOwnerGuard is malformed');
+    }
+    const { kind, id } = rawOwner;
+    if (
+      !isExecutionPrincipalKind(kind) ||
+      !isExecutionPrincipalId(id) ||
+      !isPathSafeId(reservationToken)
+    ) {
+      throw new InvalidRunRequestError('runOwnerGuard is malformed');
+    }
+    runOwnerGuard = Object.freeze({
+      owner: Object.freeze({ kind, id }),
+      reservationToken,
+    });
+  }
+  if (
+    deadlineMs !== undefined &&
+    (!Number.isSafeInteger(deadlineMs) || deadlineMs < 0)
+  ) {
+    throw new InvalidRunRequestError(
+      'deadlineMs must be a nonnegative safe integer',
+    );
+  }
+  let dispatch: RunScheduleDispatch | undefined;
+  if (rawDispatch !== undefined) {
+    if (
+      rawDispatch === null ||
+      typeof rawDispatch !== 'object' ||
+      Array.isArray(rawDispatch)
+    ) {
+      throw new Error('stored run lifecycle is malformed');
+    }
+    const { scheduleId, dispatchId } = rawDispatch;
+    dispatch = { scheduleId, dispatchId };
+  }
+  let operations: RunEconomicOperation[] | undefined;
+  if (rawOperations !== undefined) {
+    if (!Array.isArray(rawOperations)) {
+      throw new Error('stored run lifecycle is malformed');
+    }
+    const length = rawOperations.length;
+    if (!Number.isSafeInteger(length) || length < 0 || length > 0xffff_ffff) {
+      throw new Error('stored run lifecycle is malformed');
+    }
+    operations = new Array<RunEconomicOperation>(length);
+    for (let index = 0; index < length; index++) {
+      if (!(index in rawOperations))
+        throw new Error('stored run lifecycle is malformed');
+      const entry = rawOperations[index];
+      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+        throw new Error('stored run lifecycle is malformed');
+      }
+      const { id, settlementState } = entry;
+      operations[index] = { id, settlementState };
+    }
+  }
+  const captured = {
+    runId,
+    inputData,
+    initialState,
+    storedRequestContext,
+    attemptToken,
+    deadlineMs,
+    economicOperations: canonicalEconomicOperations(operations),
+    scheduleDispatch: canonicalScheduleDispatch(dispatch),
+    idempotencyKey,
+    mutationEpoch,
+    startIdentity,
+    agentStart,
+    onPreparedStartIdentity,
+    runOwnerGuard,
+  };
+  return Object.freeze(
+    requestedBy !== undefined && requestedByKind !== undefined
+      ? { ...captured, requestedBy, requestedByKind }
+      : captured,
+  );
 }
 
 function lifecycleForStart(
@@ -1016,9 +1198,18 @@ export class RunnerRuntime {
 
   async start(
     workflowId: string,
-    options: StartRunOptions,
+    sourceOptions: StartRunOptions,
   ): Promise<RunSummary> {
+    const options = captureStartRunOptions(sourceOptions);
     const workflow = this.#getWorkflow(workflowId);
+    if (
+      options.startIdentity?.target.kind === 'workflow' &&
+      options.startIdentity.target.id !== workflow.id
+    ) {
+      throw new InvalidRunRequestError(
+        'startIdentity target does not match workflow',
+      );
+    }
     // Reject non-path-safe ids at the mint boundary so the runId is unambiguous
     // everywhere it addresses the run (D1 key, DO name, URL path) — see
     // PATH_SAFE_ID_PATTERN. Fail fast, before the lock and any createRun work.
@@ -1035,26 +1226,6 @@ export class RunnerRuntime {
       );
     }
     const runId = options.runId;
-    if (
-      options.requestedBy !== undefined &&
-      !isExecutionPrincipalId(options.requestedBy)
-    ) {
-      throw new InvalidRunRequestError('requestedBy is malformed');
-    }
-    if (
-      options.requestedByKind !== undefined &&
-      !isExecutionPrincipalKind(options.requestedByKind)
-    ) {
-      throw new InvalidRunRequestError('requestedByKind is malformed');
-    }
-    if (
-      (options.requestedBy === undefined) !==
-      (options.requestedByKind === undefined)
-    ) {
-      throw new InvalidRunRequestError(
-        'requestedBy and requestedByKind must be provided together',
-      );
-    }
     if (
       options.attemptToken !== undefined &&
       !isPathSafeId(options.attemptToken)

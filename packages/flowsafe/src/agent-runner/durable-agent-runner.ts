@@ -253,11 +253,34 @@ import {
   isExecutionPrincipalKind,
 } from '../approval-api/principal.js';
 import {
+  normalizeMutationEpoch,
+  normalizeStartIdentity,
+  type RunExecutionIdentity,
+  type StartIdentity,
+} from '../do-runner/execution-admission.js';
+import {
   InvalidRunRequestError,
   isPathSafeId,
   type RunnerRuntime,
   type RunSummary,
+  type StartRunOptions,
 } from '../do-runner/index.js';
+
+export interface AgentStartAuthority {
+  readonly mutationEpoch?: number;
+  readonly startIdentity: StartIdentity & {
+    readonly target: {
+      readonly kind: 'agent';
+      readonly id: string;
+      readonly threadId: string;
+    };
+  };
+  readonly agentStart: { readonly threaded: boolean };
+  readonly onPreparedStartIdentity:
+    | ((execution: RunExecutionIdentity) => void | Promise<void>)
+    | undefined;
+  readonly runOwnerGuard?: StartRunOptions['runOwnerGuard'];
+}
 
 /**
  * The shared workflow id every durable-agent loop compiles to (core's
@@ -284,6 +307,102 @@ const BREAKWATER_GUARDED_AGENT_HOST_PROTOCOL = Symbol.for(
 interface BreakwaterGuardedAgentHostProtocol {
   readonly version: 1;
   readonly supportsDurableStructuredOutput: false;
+}
+
+function captureAgentStartAuthority(
+  source: AgentStartAuthority,
+  requestedBy: string,
+  requestedByKind: ExecutionPrincipalKind,
+): AgentStartAuthority {
+  if (source === null || typeof source !== 'object' || Array.isArray(source)) {
+    throw new InvalidRunRequestError('agent start authority is required');
+  }
+  const {
+    mutationEpoch: rawEpoch,
+    startIdentity: rawIdentity,
+    agentStart: rawAgentStart,
+    onPreparedStartIdentity,
+    runOwnerGuard: rawGuard,
+  } = source;
+  if (
+    rawIdentity === undefined ||
+    rawAgentStart === undefined ||
+    !Object.hasOwn(source, 'onPreparedStartIdentity')
+  ) {
+    throw new InvalidRunRequestError('agent start authority is incomplete');
+  }
+  const mutationEpoch = normalizeMutationEpoch(rawEpoch);
+  const identity = normalizeStartIdentity(rawIdentity);
+  if (identity.target.kind !== 'agent') {
+    throw new InvalidRunRequestError(
+      'agent start authority requires an agent target',
+    );
+  }
+  if (
+    identity.owner.id !== requestedBy ||
+    identity.owner.kind !== requestedByKind
+  ) {
+    throw new InvalidRunRequestError(
+      'startIdentity owner does not match requester',
+    );
+  }
+  if (
+    rawAgentStart === null ||
+    typeof rawAgentStart !== 'object' ||
+    Array.isArray(rawAgentStart)
+  ) {
+    throw new InvalidRunRequestError('agentStart is malformed');
+  }
+  const { threaded } = rawAgentStart;
+  if (typeof threaded !== 'boolean') {
+    throw new InvalidRunRequestError('agentStart is malformed');
+  }
+  if (
+    onPreparedStartIdentity !== undefined &&
+    typeof onPreparedStartIdentity !== 'function'
+  ) {
+    throw new InvalidRunRequestError('onPreparedStartIdentity is malformed');
+  }
+  let runOwnerGuard: AgentStartAuthority['runOwnerGuard'];
+  if (rawGuard !== undefined) {
+    if (
+      rawGuard === null ||
+      typeof rawGuard !== 'object' ||
+      Array.isArray(rawGuard)
+    ) {
+      throw new InvalidRunRequestError('runOwnerGuard is malformed');
+    }
+    const { owner: rawOwner, reservationToken } = rawGuard;
+    if (
+      rawOwner === null ||
+      typeof rawOwner !== 'object' ||
+      Array.isArray(rawOwner)
+    ) {
+      throw new InvalidRunRequestError('runOwnerGuard is malformed');
+    }
+    const { kind, id } = rawOwner;
+    if (
+      !isExecutionPrincipalKind(kind) ||
+      !isExecutionPrincipalId(id) ||
+      !isPathSafeId(reservationToken)
+    ) {
+      throw new InvalidRunRequestError('runOwnerGuard is malformed');
+    }
+    runOwnerGuard = Object.freeze({
+      owner: Object.freeze({ kind, id }),
+      reservationToken,
+    });
+  }
+  return Object.freeze({
+    mutationEpoch,
+    startIdentity: Object.freeze({
+      owner: identity.owner,
+      target: identity.target,
+    }),
+    agentStart: Object.freeze({ threaded }),
+    onPreparedStartIdentity,
+    runOwnerGuard,
+  });
 }
 
 function snapshotDurableCallOptions<T extends object>(options: T): T;
@@ -582,6 +701,7 @@ export class FlowsafeDurableAgent<
    * `finally`, so nothing outlives the start it belongs to.
    */
   readonly #startIdempotencyKeys = new Map<string, string>();
+  readonly #startAuthorities = new Map<string, AgentStartAuthority>();
   readonly #startScheduleDispatches = new Map<
     string,
     { scheduleId: string; dispatchId: string }
@@ -730,7 +850,7 @@ export class FlowsafeDurableAgent<
     requestedBy: string,
     requestedByKind: ExecutionPrincipalKind,
     attemptToken = crypto.randomUUID(),
-    scheduleDispatch?: { scheduleId: string; dispatchId: string },
+    scheduleDispatch: { scheduleId: string; dispatchId: string } | undefined,
     /**
      * The idempotency key the thread topology already RESERVED for this run.
      *
@@ -745,7 +865,8 @@ export class FlowsafeDurableAgent<
      * core, because core owns the call between `stream()` and
      * `executeWorkflow()` and carries no field this could ride in.
      */
-    idempotencyKey?: string,
+    idempotencyKey: string | undefined,
+    authority: AgentStartAuthority,
   ): Promise<
     Awaited<ReturnType<DurableAgent<TAgentId, TTools, TOutput>['stream']>>
   > {
@@ -763,6 +884,26 @@ export class FlowsafeDurableAgent<
     if (!isExecutionPrincipalKind(requestedByKind)) {
       throw new InvalidRunRequestError('requestedByKind is malformed');
     }
+    const capturedAuthority = captureAgentStartAuthority(
+      authority,
+      requestedBy,
+      requestedByKind,
+    );
+    let capturedScheduleDispatch: typeof scheduleDispatch;
+    if (scheduleDispatch !== undefined) {
+      if (
+        scheduleDispatch === null ||
+        typeof scheduleDispatch !== 'object' ||
+        Array.isArray(scheduleDispatch)
+      ) {
+        throw new Error('stored run lifecycle is malformed');
+      }
+      const { scheduleId, dispatchId } = scheduleDispatch;
+      if (!isPathSafeId(scheduleId) || !isPathSafeId(dispatchId)) {
+        throw new Error('stored run lifecycle is malformed');
+      }
+      capturedScheduleDispatch = Object.freeze({ scheduleId, dispatchId });
+    }
     const runId = callOptions.runId;
     this.#assertRunIdNotLive(runId);
     let resolve!: () => void;
@@ -776,8 +917,9 @@ export class FlowsafeDurableAgent<
     this.#startRequesters.set(runId, requestedBy);
     this.#startRequesterKinds.set(runId, requestedByKind);
     this.#startAttemptTokens.set(runId, attemptToken);
-    if (scheduleDispatch) {
-      this.#startScheduleDispatches.set(runId, scheduleDispatch);
+    this.#startAuthorities.set(runId, capturedAuthority);
+    if (capturedScheduleDispatch) {
+      this.#startScheduleDispatches.set(runId, capturedScheduleDispatch);
     }
     if (idempotencyKey !== undefined) {
       this.#startIdempotencyKeys.set(runId, idempotencyKey);
@@ -806,6 +948,7 @@ export class FlowsafeDurableAgent<
       this.#startAttemptTokens.delete(runId);
       this.#startScheduleDispatches.delete(runId);
       this.#startIdempotencyKeys.delete(runId);
+      this.#startAuthorities.delete(runId);
     }
   }
 
@@ -1505,13 +1648,7 @@ export class FlowsafeDurableAgent<
       const attemptToken = this.#startAttemptTokens.get(runId);
       const scheduleDispatch = this.#startScheduleDispatches.get(runId);
       const idempotencyKey = this.#startIdempotencyKeys.get(runId);
-      const startOptions = {
-        runId,
-        inputData: workflowInput,
-        ...(attemptToken === undefined ? {} : { attemptToken }),
-        ...(scheduleDispatch === undefined ? {} : { scheduleDispatch }),
-        ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
-      };
+      const authority = this.#startAuthorities.get(runId);
       if (requestedBy === undefined || requestedByKind === undefined) {
         if (requestedBy !== undefined || requestedByKind !== undefined) {
           throw new InvalidRunRequestError(
@@ -1539,10 +1676,39 @@ export class FlowsafeDurableAgent<
         if (!published) throw refusal;
         return;
       }
-      summary = await this.#runtime.start(this.getWorkflow().id, {
-        ...startOptions,
+      const {
+        runId: coreRunId,
+        agentId: coreAgentId,
+        ...payload
+      } = workflowInput;
+      if (!authority) {
+        throw new InvalidRunRequestError(
+          'registered run is missing agent start authority',
+        );
+      }
+      if (
+        coreRunId !== runId ||
+        authority.startIdentity.target.id !== this.#wrappedAgent.id ||
+        coreAgentId !== authority.startIdentity.target.id
+      ) {
+        throw new InvalidRunRequestError(
+          'Core input does not match agent start authority',
+        );
+      }
+      const workflow = this.getWorkflow();
+      summary = await this.#runtime.start(workflow.id, {
+        runId,
+        inputData: { ...payload, runId: coreRunId, agentId: coreAgentId },
+        ...(attemptToken === undefined ? {} : { attemptToken }),
+        ...(scheduleDispatch === undefined ? {} : { scheduleDispatch }),
+        ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
         requestedBy,
         requestedByKind,
+        mutationEpoch: authority.mutationEpoch,
+        startIdentity: authority.startIdentity,
+        agentStart: authority.agentStart,
+        onPreparedStartIdentity: authority.onPreparedStartIdentity,
+        runOwnerGuard: authority.runOwnerGuard,
       });
       waiter?.resolve();
     } catch (error) {

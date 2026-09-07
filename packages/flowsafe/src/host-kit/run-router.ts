@@ -23,6 +23,7 @@
 // grant the runtime mints per leg (approval-api/grants.ts), so a side-effecting
 // step re-checks and fails closed. Approve through the queue, not this route.
 
+import { captureActorContext } from '../approval-api/actor-context.js';
 import {
   type ActorContext,
   ActorResolutionError,
@@ -192,6 +193,7 @@ export type RunRouterStartIdempotency =
     };
 
 export interface RunStartInput {
+  readonly mutationEpoch?: number;
   workflowId: string;
   runId: string;
   inputData: unknown;
@@ -347,6 +349,8 @@ interface IdempotentStartResult {
 async function startIdempotently(
   options: RunRouterOptions,
   context: ActorContext,
+  principal: ExecutionPrincipal,
+  mutationEpoch: number | undefined,
   workflowId: string,
   body: StartBody,
   rawKey: unknown,
@@ -367,8 +371,8 @@ async function startIdempotently(
       // the check as whatever the JSON parser actually produced.
       key: rawKey,
       owner: {
-        kind: context.principal.kind,
-        id: context.principal.id,
+        kind: principal.kind,
+        id: principal.id,
       },
       targetKind: 'workflow',
       targetId: workflowId,
@@ -392,7 +396,8 @@ async function startIdempotently(
         workflowId,
         runId,
         inputData: body.inputData,
-        principal: context.principal,
+        principal,
+        mutationEpoch,
         idempotencyKey: key,
         ...(body.deadlineMs === undefined
           ? {}
@@ -425,8 +430,14 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
     if (url.pathname !== '/workflows' && segments[0] !== 'runs') return null;
 
     try {
-      const context = await resolve(request);
-      if (!context) return json({ error: 'authentication required' }, 401);
+      const resolved = await resolve(request);
+      if (!resolved) return json({ error: 'authentication required' }, 401);
+      const context =
+        request.method === 'POST' &&
+        segments[0] === 'runs' &&
+        segments.length === 1
+          ? captureActorContext(resolved)
+          : resolved;
       const actor = context.actor;
 
       if (request.method === 'GET' && url.pathname === '/workflows') {
@@ -458,8 +469,38 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
         if (!RUN_START_ROLES.includes(actor.role)) {
           return json({ error: 'forbidden' }, 403);
         }
-        const body = (await readJson(request)) as StartBody | null;
-        if (!body || typeof body.workflowId !== 'string') {
+        const { principal, mutationEpoch } = context;
+        const parsed = (await readJson(request)) as StartBody | null;
+        if (!parsed) return json({ error: 'workflowId is required' }, 400);
+        const forbidden = [
+          'mutationEpoch',
+          'startIdentity',
+          'agentStart',
+          'execution',
+          'tablePrefix',
+          'startToken',
+          'attemptToken',
+          'runOwnerGuard',
+          'onPreparedStartIdentity',
+        ].find((field) => Object.hasOwn(parsed, field));
+        if (forbidden !== undefined) {
+          return json({ error: `field '${forbidden}' is not allowed` }, 400);
+        }
+        const {
+          workflowId: startTarget,
+          idempotencyKey,
+          deadlineMs,
+          inputData,
+          runId: suppliedRunId,
+        } = parsed;
+        const body: StartBody = {
+          workflowId: startTarget,
+          idempotencyKey,
+          deadlineMs,
+          inputData,
+          runId: suppliedRunId,
+        };
+        if (typeof startTarget !== 'string') {
           return json({ error: 'workflowId is required' }, 400);
         }
         // A client may never choose the runId. 400 (not silent override) so a
@@ -467,9 +508,9 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
         if (body.runId !== undefined) {
           return json({ error: 'runId is server-assigned' }, 400);
         }
-        const meta = metaFor(body.workflowId);
+        const meta = metaFor(startTarget);
         if (!meta) {
-          return json({ error: `unknown workflow '${body.workflowId}'` }, 404);
+          return json({ error: `unknown workflow '${startTarget}'` }, 404);
         }
         // Per-workflow RBAC: a workflow may restrict who can START it — a finer
         // gate than the coarse "can start any run" check above.
@@ -477,13 +518,12 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
         if (allowedRoles && !allowedRoles.includes(actor.role)) {
           return json(
             {
-              error: `role '${actor.role}' may not start '${body.workflowId}'`,
+              error: `role '${actor.role}' may not start '${startTarget}'`,
             },
             403,
           );
         }
-        await options.beforeStart?.(context, body.workflowId, body.inputData);
-        const startTarget = body.workflowId;
+        await options.beforeStart?.(context, startTarget, inputData);
         // Unkeyed starts take the path they always took: mint, start, answer.
         // Keyed starts route through the reservation, which decides whether
         // this request starts a run or reports one that already exists.
@@ -494,7 +534,8 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
                   workflowId: startTarget,
                   runId: context.newRunId(),
                   inputData: body.inputData,
-                  principal: context.principal,
+                  principal,
+                  mutationEpoch,
                   ...(body.deadlineMs === undefined
                     ? {}
                     : { deadlineMs: body.deadlineMs as number }),
@@ -504,6 +545,8 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
             : await startIdempotently(
                 options,
                 context,
+                principal,
+                mutationEpoch,
                 startTarget,
                 body,
                 body.idempotencyKey,
@@ -539,7 +582,7 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
         try {
           approvals = await queueApprovalForSuspension(
             context.service(),
-            body.workflowId,
+            startTarget,
             summary,
             actor.id,
             systemPrincipalId,
@@ -548,7 +591,7 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
           console.error(
             JSON.stringify({
               type: 'approval-filing-error',
-              workflowId: body.workflowId,
+              workflowId: startTarget,
               runId: summary.runId,
               error: error instanceof Error ? error.message : String(error),
             }),

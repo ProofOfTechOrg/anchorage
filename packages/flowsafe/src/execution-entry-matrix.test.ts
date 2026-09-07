@@ -1632,6 +1632,46 @@ function siteKey(site: GateSite): string {
 }
 
 describe('execution-entry matrix', () => {
+  it.each([
+    'do-runner/runtime.ts',
+    'do-runner/durable-object.ts',
+    'do-runner/thread-do.ts',
+    'agent-host/thread-host.ts',
+    'agent-runner/durable-agent-runner.ts',
+  ])('C transport entry keeps activation APIs dormant: %s', (file) => {
+    const source = sourceFileSystem().readFileSync(
+      `${sourceRoot()}/${file}`,
+      'utf8',
+    );
+    const parsed = ts.createSourceFile(
+      file,
+      source,
+      ts.ScriptTarget.Latest,
+      true,
+    );
+    const calls: string[] = [];
+    const forbidden = new Set([
+      'assertMutationEpoch',
+      'withInitialAdmission',
+      'terminalizeInitialAdmission',
+      'onPreparedStartIdentity',
+    ]);
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node)) {
+        const expression = node.expression;
+        const name = ts.isIdentifier(expression)
+          ? expression.text
+          : ts.isPropertyAccessExpression(expression)
+            ? expression.name.text
+            : undefined;
+        if (name && forbidden.has(name)) calls.push(name);
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(parsed);
+    expect(calls).toEqual([]);
+  });
+
   describe('SQL admission source census', () => {
     const fenceTable = `\${EXECUTION_FENCE_TABLE}`;
     const insert = `INSERT INTO \${snapshotTable}`;

@@ -5,7 +5,22 @@ import { InMemoryStore } from '@mastra/core/storage';
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
+import { createBackgroundTaskD1Domains } from '../background-tasks/d1-storage.js';
 import type { D1DatabaseBinding } from './cf-types.js';
+import { createD1Storage } from './d1-storage.js';
+import {
+  InvalidExecutionIdentityError,
+  InvalidMutationEpochError,
+} from './execution-admission.js';
+import {
+  type ExecutionFenceDatabase,
+  ExecutionFenceStore,
+} from './execution-fence.js';
+import {
+  FENCED_WORKFLOW_STORAGE,
+  type FencedWorkflowAdmissionCapability,
+} from './fenced-workflow-capability.js';
+import type { FencedWorkflowsStorageD1 } from './fenced-workflows-d1.js';
 import { RunStateUnreadableError as BarrelRunStateUnreadableError } from './index.js';
 import { init } from './init.js';
 import { createHostPubSub } from './pubsub.js';
@@ -23,6 +38,7 @@ import {
   type RunnerRuntime,
   RunStateUnreadableError,
   type RunSummary,
+  type StartRunOptions,
   UnknownWorkflowError,
 } from './runtime.js';
 import {
@@ -121,6 +137,997 @@ function buildRuntime(storage: InMemoryStore): {
 
   return { runtime, counters };
 }
+
+function cDeferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+async function cOwnedRuntime(
+  domain: 'default' | 'background' = 'default',
+  provider?: RequestContextProvider,
+) {
+  const sql = openSqlite() as ReturnType<typeof openSqlite> & { close(): void };
+  const binding = sqliteUnitDatabase(sql) as ExecutionFenceDatabase;
+  const db = binding as D1DatabaseBinding;
+  const storage = createD1Storage({
+    binding: db,
+    ...(domain === 'background'
+      ? { domains: createBackgroundTaskD1Domains({ binding: db }) }
+      : {}),
+  });
+  await storage.init();
+  const fence = new ExecutionFenceStore(binding);
+  await fence.seed('open');
+  for (let index = 0; index < 2; index++) {
+    const before = await fence.read();
+    const draining = await fence.transition({
+      expected: 'open',
+      next: 'draining',
+      expectedMutationEpoch: before.mutationEpoch,
+      expectedRevision: before.transitionRevision,
+      advanceMutationEpoch: true,
+    });
+    await fence.transition({
+      expected: 'draining',
+      next: 'open',
+      expectedMutationEpoch: draining.mutationEpoch,
+      expectedRevision: draining.transitionRevision,
+    });
+  }
+  const workflows = (await storage.getStore(
+    'workflows',
+  )) as FencedWorkflowsStorageD1;
+  const native = workflows[FENCED_WORKFLOW_STORAGE];
+  if (!native) throw new Error('missing owned capability');
+  const counts = { admission: 0, terminalization: 0, callback: 0 };
+  const capability: FencedWorkflowAdmissionCapability = {
+    ...native,
+    withInitialAdmission: (input, create) => {
+      counts.admission++;
+      return native.withInitialAdmission(input, create);
+    },
+    terminalizeInitialAdmission: (input) => {
+      counts.terminalization++;
+      return native.terminalizeInitialAdmission(input);
+    },
+  };
+  Object.defineProperty(workflows, FENCED_WORKFLOW_STORAGE, {
+    value: capability,
+    configurable: true,
+  });
+  const app = init(
+    { storage },
+    {
+      startIdempotency: 'none',
+      executionFence: fence,
+      requestContextForRun: provider,
+    },
+  );
+  const execute = vi.fn(
+    async ({ inputData }: { inputData: { value: string } }) => inputData,
+  );
+  const workflow = app
+    .createWorkflow({
+      id: 'c-workflow',
+      inputSchema: z.object({ value: z.string() }),
+      outputSchema: z.object({ value: z.string() }),
+      stateSchema: z.object({ flag: z.string().optional() }),
+    })
+    .then(
+      app.createStep({
+        id: 'c-step',
+        inputSchema: z.object({ value: z.string() }),
+        outputSchema: z.object({ value: z.string() }),
+        execute,
+      }),
+    )
+    .commit();
+  const callback = () => {
+    counts.callback++;
+  };
+  return {
+    ...app,
+    sql,
+    storage,
+    workflows,
+    fence,
+    counts,
+    workflow,
+    execute,
+    callback,
+  };
+}
+
+function cOptions(runId = 'c-run'): StartRunOptions {
+  return {
+    runId,
+    inputData: { value: 'original' },
+    initialState: { flag: 'original' },
+    storedRequestContext: { 'test.c': 'original' },
+    attemptToken: 'attempt-original',
+    deadlineMs: 50,
+    economicOperations: [
+      { id: 'operation-original', settlementState: 'settled' },
+    ],
+    scheduleDispatch: {
+      scheduleId: 'schedule-original',
+      dispatchId: 'dispatch-original',
+    },
+    idempotencyKey: 'key-original',
+    requestedBy: 'operator-1',
+    requestedByKind: 'human',
+    mutationEpoch: 2,
+    startIdentity: {
+      owner: { kind: 'human', id: 'operator-1' },
+      target: { kind: 'workflow', id: 'c-workflow' },
+    },
+    agentStart: { threaded: false },
+    onPreparedStartIdentity: vi.fn(),
+    runOwnerGuard: {
+      owner: { kind: 'service', id: 'resource-owner' },
+      reservationToken: 'reservation-original',
+    },
+  };
+}
+
+function cPrimitive(
+  value: string,
+  mode: 'stable' | 'alternating' | 'second-throw',
+) {
+  return vi
+    .fn<() => string>()
+    .mockReturnValueOnce(value)
+    .mockImplementation(() => {
+      if (mode === 'second-throw') throw new Error('second primitive read');
+      return mode === 'alternating' ? '' : value;
+    });
+}
+
+function cObservedOptions(values: StartRunOptions) {
+  const getters = Object.fromEntries(
+    Object.entries(values).map(([key, value]) => [key, vi.fn(() => value)]),
+  );
+  const source = {} as StartRunOptions;
+  for (const [key, get] of Object.entries(getters))
+    Object.defineProperty(source, key, {
+      get,
+      configurable: true,
+      enumerable: false,
+    });
+  return { source, getters };
+}
+
+type CEconomicShape =
+  | 'leading'
+  | 'interior'
+  | 'trailing'
+  | 'all-hole'
+  | 'dense'
+  | 'inherited'
+  | 'empty';
+
+function cEconomicArray(shape: CEconomicShape) {
+  const operations: Array<{ id: string; settlementState: string }> =
+    shape === 'all-hole'
+      ? new Array(3)
+      : shape === 'empty'
+        ? []
+        : [
+            { id: 'first', settlementState: 'settled' },
+            { id: 'second', settlementState: 'held' },
+            { id: 'third', settlementState: 'disputed' },
+          ];
+  if (shape === 'inherited') {
+    const prototype = Object.create(Array.prototype);
+    Object.defineProperty(prototype, '1', { value: operations[1] });
+    Object.setPrototypeOf(operations, prototype);
+    delete operations[1];
+  } else if (
+    shape === 'leading' ||
+    shape === 'interior' ||
+    shape === 'trailing'
+  ) {
+    delete operations[{ leading: 0, interior: 1, trailing: 2 }[shape]];
+  }
+  return operations;
+}
+
+describe('C economic format safety', () => {
+  it.each(
+    (['default', 'background'] as const).flatMap((domain) =>
+      (['leading', 'interior', 'trailing', 'all-hole'] as const).map(
+        (shape) => ({ domain, shape }),
+      ),
+    ),
+  )('C refuses sparse economic operations before start effects ($domain, $shape)', async ({
+    domain,
+    shape,
+  }) => {
+    const provider = vi.fn(() => ({}));
+    const f = await cOwnedRuntime(domain, provider);
+    const read = vi.spyOn(f.fence, 'read');
+    const create = vi.spyOn(f.workflow, 'createRun');
+    const persist = vi.spyOn(f.workflows, 'persistWorkflowSnapshot');
+    try {
+      const error = await f.runtime
+        .start('c-workflow', {
+          ...cOptions(),
+          economicOperations: cEconomicArray(shape),
+        })
+        .catch((cause: unknown) => cause);
+      expect(error).toBeInstanceOf(Error);
+      expect(Object.getPrototypeOf(error)).toBe(Error.prototype);
+      expect(error).toEqual(new Error('stored run lifecycle is malformed'));
+      expect(read).not.toHaveBeenCalled();
+      expect(provider).not.toHaveBeenCalled();
+      expect(create).not.toHaveBeenCalled();
+      expect(persist).not.toHaveBeenCalled();
+      expect(f.execute).not.toHaveBeenCalled();
+      expect(
+        await f.workflows.loadWorkflowSnapshot({
+          workflowName: 'c-workflow',
+          runId: 'c-run',
+        }),
+      ).toBeNull();
+    } finally {
+      f.sql.close();
+    }
+  });
+
+  it('C refuses sparse capture before reading later economic entries', async () => {
+    const f = await cOwnedRuntime();
+    const later = vi.fn(() => {
+      throw new Error('later entry must not be read');
+    });
+    const operations = new Array(2);
+    operations[1] = {
+      get id() {
+        return later();
+      },
+      settlementState: 'held',
+    };
+    try {
+      const error = await f.runtime
+        .start('c-workflow', { ...cOptions(), economicOperations: operations })
+        .catch((cause: unknown) => cause);
+      expect(error).toEqual(new Error('stored run lifecycle is malformed'));
+      expect(later).not.toHaveBeenCalled();
+      expect(f.execute).not.toHaveBeenCalled();
+    } finally {
+      f.sql.close();
+    }
+  });
+
+  it.each(
+    (['default', 'background'] as const).flatMap((domain) =>
+      (['dense', 'inherited', 'empty'] as const).map((shape) => ({
+        domain,
+        shape,
+      })),
+    ),
+  )('C round-trips dense economic arrays on owned storage ($domain, $shape)', async ({
+    domain,
+    shape,
+  }) => {
+    const f = await cOwnedRuntime(domain);
+    const operations = cEconomicArray(shape);
+    const expected = JSON.parse(JSON.stringify(operations));
+    try {
+      await expect(
+        f.runtime.start('c-workflow', {
+          ...cOptions(),
+          economicOperations: operations,
+        }),
+      ).resolves.toMatchObject({ status: 'success' });
+      const snapshot = await f.workflows.loadWorkflowSnapshot({
+        workflowName: 'c-workflow',
+        runId: 'c-run',
+      });
+      expect(snapshot?.requestContext?.['flowsafe.runLifecycle']).toMatchObject(
+        { economicOperations: expected },
+      );
+      expect((await f.runtime.status('c-workflow', 'c-run'))?.status).toBe(
+        'success',
+      );
+      expect(f.execute).toHaveBeenCalledOnce();
+    } finally {
+      f.sql.close();
+    }
+  });
+
+  it.each(
+    (['default', 'background'] as const).flatMap((domain) =>
+      (['leading', 'interior', 'trailing', 'all-hole'] as const).map(
+        (shape) => ({ domain, shape }),
+      ),
+    ),
+  )('C sparse resume preserves the readable suspended snapshot ($domain, $shape)', async ({
+    domain,
+    shape,
+  }) => {
+    const provider = vi.fn(() => ({}));
+    const f = await cOwnedRuntime(domain, provider);
+    const resumed = vi.fn();
+    const schema = z.object({ value: z.string() });
+    const workflow = f
+      .createWorkflow({
+        id: 'c-sparse-resume',
+        inputSchema: schema,
+        outputSchema: schema,
+      })
+      .then(
+        f.createStep({
+          id: 'gate',
+          inputSchema: schema,
+          outputSchema: schema,
+          suspendSchema: z.object({}),
+          resumeSchema: z.object({ ok: z.boolean() }),
+          execute: async ({ inputData, resumeData, suspend }) => {
+            if (!resumeData) return suspend({});
+            resumed();
+            return inputData;
+          },
+        }),
+      )
+      .commit();
+    try {
+      expect(
+        (
+          await f.runtime.start(workflow.id, {
+            runId: 'resume-run',
+            inputData: { value: 'original' },
+          })
+        ).status,
+      ).toBe('suspended');
+      const before = await f.workflows.loadWorkflowSnapshot({
+        workflowName: workflow.id,
+        runId: 'resume-run',
+      });
+      const create = vi.spyOn(workflow, 'createRun');
+      const persist = vi.spyOn(f.workflows, 'persistWorkflowSnapshot');
+      provider.mockClear();
+      const error = await f.runtime
+        .resume(workflow.id, 'resume-run', {
+          step: 'gate',
+          resumeData: { ok: true },
+          economicOperations: cEconomicArray(shape),
+        })
+        .catch((cause: unknown) => cause);
+      expect(error).toBeInstanceOf(Error);
+      expect(Object.getPrototypeOf(error)).toBe(Error.prototype);
+      expect(error).toEqual(new Error('stored run lifecycle is malformed'));
+      expect(provider).not.toHaveBeenCalled();
+      expect(create).not.toHaveBeenCalled();
+      expect(persist).not.toHaveBeenCalled();
+      expect(resumed).not.toHaveBeenCalled();
+      expect(
+        await f.workflows.loadWorkflowSnapshot({
+          workflowName: workflow.id,
+          runId: 'resume-run',
+        }),
+      ).toEqual(before);
+      expect((await f.runtime.status(workflow.id, 'resume-run'))?.status).toBe(
+        'suspended',
+      );
+      expect(
+        (
+          await f.runtime.resume(workflow.id, 'resume-run', {
+            step: 'gate',
+            resumeData: { ok: true },
+            economicOperations: cEconomicArray('dense'),
+          })
+        ).status,
+      ).toBe('success');
+    } finally {
+      f.sql.close();
+    }
+  });
+});
+
+describe('C Runtime capture', () => {
+  it.each(
+    (['default', 'background'] as const).flatMap((domain) =>
+      [undefined, 1, 2, 3].map((epoch) => ({ domain, epoch })),
+    ),
+  )('C does not enforce active mutation epoch at Runtime start ($domain, $epoch)', async ({
+    domain,
+    epoch,
+  }) => {
+    const f = await cOwnedRuntime(domain);
+    try {
+      expect(await f.fence.read()).toMatchObject({
+        state: 'open',
+        mutationEpoch: 2,
+        requireMutationEpoch: true,
+      });
+      const runId = `epoch-${epoch ?? 'missing'}`;
+      const options = {
+        ...cOptions(runId),
+        onPreparedStartIdentity: f.callback,
+      };
+      if (epoch === undefined)
+        delete (options as { mutationEpoch?: number }).mutationEpoch;
+      else Object.assign(options, { mutationEpoch: epoch });
+      await expect(
+        f.runtime.start('c-workflow', options),
+      ).resolves.toMatchObject({ status: 'success' });
+      const snapshot = await f.workflows.loadWorkflowSnapshot({
+        workflowName: 'c-workflow',
+        runId,
+      });
+      expect(snapshot?.requestContext?.['flowsafe.runProvenance']).toEqual({
+        version: 1,
+        requestedBy: 'operator-1',
+        requestedByKind: 'human',
+        startToken: 'attempt-original',
+        attemptToken: 'attempt-original',
+        resumeCounts: [],
+      });
+      for (const key of [
+        'mutationEpoch',
+        'startIdentity',
+        'agentStart',
+        'execution',
+        'onPreparedStartIdentity',
+        'runOwnerGuard',
+        'flowsafe.initialAdmission',
+      ])
+        expect(snapshot?.requestContext).not.toHaveProperty(key);
+      expect(f.execute).toHaveBeenCalledOnce();
+      expect(f.counts).toEqual({
+        callback: 0,
+        admission: 0,
+        terminalization: 0,
+      });
+    } finally {
+      f.sql.close();
+    }
+  });
+
+  for (const [title, counter] of [
+    [
+      'C never invokes the prepared callback in normal failure or recovery paths',
+      'callback',
+    ],
+    ['C never automatically admits through the owned capability', 'admission'],
+    ['C never automatically terminalizes initial admission', 'terminalization'],
+  ] as const) {
+    it.each([
+      'default',
+      'background',
+    ] as const)(`${title} (%s)`, async (domain) => {
+      let failProvider = false;
+      const failure = new Error('C provider failure');
+      const f = await cOwnedRuntime(domain, () => {
+        if (failProvider) throw failure;
+        return {};
+      });
+      try {
+        for (const phase of [
+          'normal',
+          'failure',
+          'recovery',
+          'failed-step',
+        ] as const) {
+          const create = f.workflow.createRun.bind(f.workflow);
+          let restore = () => {};
+          if (phase === 'recovery') {
+            const spy = vi
+              .spyOn(f.workflow, 'createRun')
+              .mockImplementation(async (...args) => {
+                const run = await create(...args);
+                const start = run.start.bind(run);
+                vi.spyOn(run, 'start').mockImplementation(
+                  async (...startArgs) => {
+                    await start(...startArgs);
+                    throw new Error('lost start result');
+                  },
+                );
+                return run;
+              });
+            restore = () => spy.mockRestore();
+          }
+          if (phase === 'failed-step')
+            f.execute.mockRejectedValueOnce(new Error('step failed'));
+          failProvider = phase === 'failure';
+          const runId = `c-${phase}`;
+          let outcome: RunSummary | undefined;
+          try {
+            const pending = f.runtime.start('c-workflow', {
+              ...cOptions(runId),
+              onPreparedStartIdentity: f.callback,
+            });
+            if (phase === 'failure')
+              await expect(pending).rejects.toBe(failure);
+            else outcome = await pending;
+          } finally {
+            restore();
+            expect(f.counts[counter]).toBe(0);
+            expect(f.counts).toEqual({
+              callback: 0,
+              admission: 0,
+              terminalization: 0,
+            });
+          }
+          const snapshot = await f.workflows.loadWorkflowSnapshot({
+            workflowName: 'c-workflow',
+            runId,
+          });
+          if (phase === 'failure') expect(snapshot).toBeNull();
+          else {
+            expect(outcome?.status).toBe(
+              phase === 'failed-step' ? 'failed' : 'success',
+            );
+            expect(
+              snapshot?.requestContext?.['flowsafe.runProvenance'],
+            ).toEqual({
+              version: 1,
+              requestedBy: 'operator-1',
+              requestedByKind: 'human',
+              startToken: 'attempt-original',
+              attemptToken: 'attempt-original',
+              resumeCounts: [],
+            });
+            expect(snapshot?.requestContext).not.toHaveProperty(
+              'flowsafe.initialAdmission',
+            );
+            expect((await f.runtime.status('c-workflow', runId))?.status).toBe(
+              outcome?.status,
+            );
+          }
+        }
+      } finally {
+        f.sql.close();
+      }
+    });
+  }
+
+  it('C captures Runtime options before the fence wait', async () => {
+    const providerEntered = cDeferred();
+    const providerRelease = cDeferred();
+    const f = await cOwnedRuntime('default', async () => {
+      providerEntered.resolve();
+      await providerRelease.promise;
+      return {};
+    });
+    const entered = cDeferred();
+    const release = cDeferred();
+    const read = f.fence.read.bind(f.fence);
+    const fenceRead = vi
+      .spyOn(f.fence, 'read')
+      .mockImplementationOnce(async () => {
+        entered.resolve();
+        await release.promise;
+        return read();
+      });
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(1000);
+    const { source, getters } = cObservedOptions(cOptions());
+    const pending = f.runtime.start('c-workflow', source);
+    void pending.catch(() => undefined);
+    try {
+      await entered.promise;
+      for (const getter of Object.values(getters))
+        expect(getter).toHaveBeenCalledTimes(1);
+      expect(f.execute).not.toHaveBeenCalled();
+      for (const getter of Object.values(getters))
+        getter.mockImplementation(() => {
+          throw new Error('late Runtime option read');
+        });
+      clock.mockReturnValue(2000);
+      release.resolve();
+      await providerEntered.promise;
+      clock.mockReturnValue(3000);
+      providerRelease.resolve();
+      expect(await pending).toMatchObject({
+        runId: 'c-run',
+        status: 'success',
+        requestedBy: 'operator-1',
+        deadlineAt: 2050,
+      });
+      const snapshot = await f.workflows.loadWorkflowSnapshot({
+        workflowName: 'c-workflow',
+        runId: 'c-run',
+      });
+      expect(snapshot?.requestContext).toMatchObject({
+        'test.c': 'original',
+        'flowsafe.runLifecycle': {
+          deadlineAt: 2050,
+          scheduleDispatch: {
+            scheduleId: 'schedule-original',
+            dispatchId: 'dispatch-original',
+          },
+          economicOperations: [
+            { id: 'operation-original', settlementState: 'settled' },
+          ],
+        },
+      });
+      expect(f.execute.mock.calls[0]?.[0].inputData).toEqual({
+        value: 'original',
+      });
+      for (const getter of Object.values(getters))
+        expect(getter).toHaveBeenCalledTimes(1);
+      expect(Object.isFrozen(source)).toBe(false);
+    } finally {
+      release.resolve();
+      providerRelease.resolve();
+      await pending.catch(() => undefined);
+      clock.mockRestore();
+      fenceRead.mockRestore();
+      f.sql.close();
+    }
+  });
+
+  it('C captures Runtime options before waiting for the run lock', async () => {
+    const entered = cDeferred();
+    const release = cDeferred();
+    const f = await cOwnedRuntime('default', async () => {
+      entered.resolve();
+      await release.promise;
+      return {};
+    });
+    const first = f.runtime.start('c-workflow', cOptions());
+    void first.catch(() => undefined);
+    await entered.promise;
+    const queued = cDeferred();
+    const nativeSet = Map.prototype.set;
+    const set = vi.spyOn(Map.prototype, 'set').mockImplementation(function (
+      this: Map<unknown, unknown>,
+      key,
+      value,
+    ) {
+      if (key === 'c-workflow:c-run' && value instanceof Promise)
+        queued.resolve();
+      return nativeSet.call(this, key, value);
+    });
+    const { source, getters } = cObservedOptions(cOptions());
+    const second = f.runtime.start('c-workflow', source);
+    void second.catch(() => undefined);
+    try {
+      await queued.promise;
+      for (const getter of Object.values(getters))
+        expect(getter).toHaveBeenCalledTimes(1);
+      for (const getter of Object.values(getters))
+        getter.mockImplementation(() => {
+          throw new Error('late lock option read');
+        });
+      expect(f.execute).not.toHaveBeenCalled();
+      release.resolve();
+      expect((await first).status).toBe('success');
+      await expect(second).rejects.toBeInstanceOf(RunAlreadyExistsError);
+      for (const getter of Object.values(getters))
+        expect(getter).toHaveBeenCalledTimes(1);
+    } finally {
+      release.resolve();
+      await Promise.allSettled([first, second]);
+      set.mockRestore();
+      f.sql.close();
+    }
+  });
+
+  it.each([
+    ['epoch', { mutationEpoch: -1 }, InvalidMutationEpochError],
+    ['identity', { startIdentity: null }, InvalidExecutionIdentityError],
+    [
+      'target',
+      {
+        startIdentity: {
+          owner: { kind: 'human', id: 'operator-1' },
+          target: { kind: 'workflow', id: 'other' },
+        },
+      },
+      InvalidRunRequestError,
+    ],
+    [
+      'owner',
+      {
+        startIdentity: {
+          owner: { kind: 'service', id: 'other' },
+          target: { kind: 'workflow', id: 'c-workflow' },
+        },
+      },
+      InvalidRunRequestError,
+    ],
+    ['mode', { agentStart: { threaded: 'yes' } }, InvalidRunRequestError],
+    [
+      'agent-mode',
+      {
+        startIdentity: {
+          owner: { kind: 'human', id: 'operator-1' },
+          target: { kind: 'agent', id: 'writer', threadId: 'thread' },
+        },
+        agentStart: undefined,
+      },
+      InvalidRunRequestError,
+    ],
+    ['callback', { onPreparedStartIdentity: null }, InvalidRunRequestError],
+    [
+      'guard',
+      {
+        runOwnerGuard: {
+          owner: { kind: 'other', id: 'owner' },
+          reservationToken: 'token',
+        },
+      },
+      InvalidRunRequestError,
+    ],
+    ['requester', { requestedByKind: undefined }, InvalidRunRequestError],
+    ['deadline', { deadlineMs: -1 }, InvalidRunRequestError],
+    ['dispatch', { scheduleDispatch: [] }, Error],
+    ['operations', { economicOperations: [null] }, Error],
+  ] as const)('C validates supplied fields before fence and storage (%s)', async (_label, changes, errorType) => {
+    const f = await cOwnedRuntime();
+    const read = vi.spyOn(f.fence, 'read');
+    const create = vi.spyOn(f.workflow, 'createRun');
+    try {
+      const error = await f.runtime
+        .start('c-workflow', {
+          ...cOptions(),
+          ...changes,
+        } as StartRunOptions)
+        .catch((cause: unknown) => cause);
+      expect(error).toBeInstanceOf(errorType);
+      expect(Object.getPrototypeOf(error)).toBe(errorType.prototype);
+      if (errorType === Error)
+        expect(error).toEqual(new Error('stored run lifecycle is malformed'));
+      expect(read).not.toHaveBeenCalled();
+      expect(create).not.toHaveBeenCalled();
+      expect(f.execute).not.toHaveBeenCalled();
+    } finally {
+      read.mockRestore();
+      create.mockRestore();
+      f.sql.close();
+    }
+  });
+
+  it.each([
+    ['dispatch-null', { scheduleDispatch: null }],
+    ['dispatch-array', { scheduleDispatch: [] }],
+    [
+      'schedule-empty',
+      { scheduleDispatch: { scheduleId: '', dispatchId: 'dispatch' } },
+    ],
+    [
+      'schedule-number',
+      { scheduleDispatch: { scheduleId: 2, dispatchId: 'dispatch' } },
+    ],
+    [
+      'dispatch-null-id',
+      { scheduleDispatch: { scheduleId: 'schedule', dispatchId: null } },
+    ],
+    [
+      'dispatch-path',
+      { scheduleDispatch: { scheduleId: 'schedule', dispatchId: 'bad/path' } },
+    ],
+    ['operations-object', { economicOperations: {} }],
+    ['operation-null', { economicOperations: [null] }],
+    ['operation-array', { economicOperations: [[]] }],
+    [
+      'operation-empty-id',
+      { economicOperations: [{ id: '', settlementState: 'held' }] },
+    ],
+    [
+      'operation-number-id',
+      { economicOperations: [{ id: 2, settlementState: 'held' }] },
+    ],
+    [
+      'operation-path-id',
+      { economicOperations: [{ id: 'bad/path', settlementState: 'held' }] },
+    ],
+    [
+      'state-null',
+      { economicOperations: [{ id: 'operation', settlementState: null }] },
+    ],
+    [
+      'state-boolean',
+      { economicOperations: [{ id: 'operation', settlementState: true }] },
+    ],
+    [
+      'state-empty',
+      { economicOperations: [{ id: 'operation', settlementState: '' }] },
+    ],
+    [
+      'state-long',
+      {
+        economicOperations: [
+          { id: 'operation', settlementState: 'x'.repeat(101) },
+        ],
+      },
+    ],
+  ] as const)('C rejects malformed lifecycle input with the exact legacy error before effects: %s', async (_label, changes) => {
+    const provider = vi.fn(() => ({}));
+    const f = await cOwnedRuntime('default', provider);
+    const read = vi.spyOn(f.fence, 'read');
+    const create = vi.spyOn(f.workflow, 'createRun');
+    const persist = vi.spyOn(f.workflows, 'persistWorkflowSnapshot');
+    try {
+      const error = await f.runtime
+        .start('c-workflow', { ...cOptions(), ...changes } as StartRunOptions)
+        .catch((cause: unknown) => cause);
+      expect(error).toBeInstanceOf(Error);
+      expect(Object.getPrototypeOf(error)).toBe(Error.prototype);
+      expect(error).toEqual(new Error('stored run lifecycle is malformed'));
+      expect(read).not.toHaveBeenCalled();
+      expect(provider).not.toHaveBeenCalled();
+      expect(create).not.toHaveBeenCalled();
+      expect(persist).not.toHaveBeenCalled();
+      expect(f.execute).not.toHaveBeenCalled();
+    } finally {
+      f.sql.close();
+    }
+  });
+
+  it.each([
+    null,
+    '1',
+    true,
+    -1,
+    1.5,
+    NaN,
+    Infinity,
+    Number.MAX_SAFE_INTEGER,
+  ])('C rejects malformed economic array length before effects: %s', async (length) => {
+    const provider = vi.fn(() => ({}));
+    const f = await cOwnedRuntime('default', provider);
+    const read = vi.spyOn(f.fence, 'read');
+    const create = vi.spyOn(f.workflow, 'createRun');
+    const operations = new Proxy(cEconomicArray('dense'), {
+      get(target, key, receiver) {
+        return key === 'length' ? length : Reflect.get(target, key, receiver);
+      },
+    });
+    try {
+      const error = await f.runtime
+        .start('c-workflow', { ...cOptions(), economicOperations: operations })
+        .catch((cause: unknown) => cause);
+      expect(error).toBeInstanceOf(Error);
+      expect(Object.getPrototypeOf(error)).toBe(Error.prototype);
+      expect(error).toEqual(new Error('stored run lifecycle is malformed'));
+      expect(read).not.toHaveBeenCalled();
+      expect(provider).not.toHaveBeenCalled();
+      expect(create).not.toHaveBeenCalled();
+      expect(f.execute).not.toHaveBeenCalled();
+    } finally {
+      f.sql.close();
+    }
+  });
+
+  it('C keeps unattributed unkeyed starts and first getter faults without effects', async () => {
+    const f = await cOwnedRuntime();
+    const read = vi.spyOn(f.fence, 'read');
+    const fault = new Error('first Runtime read');
+    try {
+      await expect(
+        f.runtime.start('c-workflow', {
+          get runId(): string {
+            throw fault;
+          },
+        }),
+      ).rejects.toBe(fault);
+      for (const changes of [
+        {
+          scheduleDispatch: {
+            get scheduleId(): string {
+              throw fault;
+            },
+            dispatchId: 'dispatch',
+          },
+        },
+        {
+          economicOperations: [
+            {
+              get id(): string {
+                throw fault;
+              },
+              settlementState: 'settled',
+            },
+          ],
+        },
+      ])
+        await expect(
+          f.runtime.start('c-workflow', { ...cOptions(), ...changes }),
+        ).rejects.toBe(fault);
+      expect(read).not.toHaveBeenCalled();
+      expect(
+        (
+          await f.runtime.start('c-workflow', {
+            runId: 'unattributed',
+            inputData: { value: 'plain' },
+          })
+        ).status,
+      ).toBe('success');
+    } finally {
+      read.mockRestore();
+      f.sql.close();
+    }
+  });
+
+  it.each([
+    'stable',
+    'alternating',
+    'second-throw',
+  ] as const)('C captures each schedule dispatch primitive once before canonicalization: %s', async (mode) => {
+    const { runtime } = buildRuntime(new InMemoryStore());
+    const scheduleId = cPrimitive('schedule-original', mode);
+    const dispatchId = cPrimitive('dispatch-original', mode);
+    const pending = runtime.start('echo', {
+      runId: 'capture-dispatch',
+      inputData: { value: 'original' },
+      scheduleDispatch: {
+        get scheduleId() {
+          return scheduleId();
+        },
+        get dispatchId() {
+          return dispatchId();
+        },
+      },
+    });
+    await expect(pending).resolves.toMatchObject({ status: 'success' });
+    expect(scheduleId).toHaveBeenCalledTimes(1);
+    expect(dispatchId).toHaveBeenCalledTimes(1);
+  });
+
+  it('C captures economic entries without invoking caller array methods', async () => {
+    const { runtime } = buildRuntime(new InMemoryStore());
+    const id = vi.fn(() => 'operation-original');
+    const settlementState = vi.fn(() => 'settled');
+    const operations = [
+      {
+        get id() {
+          return id();
+        },
+        get settlementState() {
+          return settlementState();
+        },
+      },
+    ];
+    const map = vi.fn(() => operations);
+    Object.defineProperty(operations, 'map', { value: map });
+    try {
+      await expect(
+        runtime.start('echo', {
+          runId: 'caller-array',
+          inputData: { value: 'original' },
+          economicOperations: operations,
+        }),
+      ).resolves.toMatchObject({ status: 'success' });
+      expect(id).toHaveBeenCalledTimes(1);
+      expect(settlementState).toHaveBeenCalledTimes(1);
+    } finally {
+      expect(map).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each([
+    'stable',
+    'alternating',
+    'second-throw',
+  ] as const)('C captures each economic operation primitive once before canonicalization: %s', async (mode) => {
+    const { runtime } = buildRuntime(new InMemoryStore());
+    const id = cPrimitive('operation-original', mode);
+    const settlementState = cPrimitive('settled', mode);
+    const pending = runtime.start('echo', {
+      runId: 'capture-operations',
+      inputData: { value: 'original' },
+      economicOperations: [
+        {
+          get id() {
+            return id();
+          },
+          get settlementState() {
+            return settlementState();
+          },
+        },
+      ],
+    });
+    await expect(pending).resolves.toMatchObject({ status: 'success' });
+    expect(id).toHaveBeenCalledTimes(1);
+    expect(settlementState).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe('RunnerRuntime host pubsub identity', () => {
   it('preserves the moved lifecycle error constructor identity', () => {

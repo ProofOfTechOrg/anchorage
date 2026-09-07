@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it, vi } from 'vitest';
+import { TEST_DEPLOYMENT_IDENTITY_SECRET } from '../../test-support/deployment-identity.js';
 import type {
   ActorContext,
   ApprovalActor,
@@ -16,10 +17,20 @@ import {
   doErrorResponse,
   type ExecutionFenceDatabase,
   ExecutionFenceStore,
+  InvalidMutationEpochError,
+  MutationEpochMismatchError,
 } from '../do-runner/index.js';
-import { doSummary, RunRouteError } from '../host-kit/index.js';
+import {
+  doSummary,
+  RunRouteError,
+  type ThreadNamespaceLike,
+  type ThreadRequestInit,
+} from '../host-kit/index.js';
 import { createAgentRouter } from './router.js';
-import type { AgentThreadTopology } from './thread-topology.js';
+import {
+  type AgentThreadTopology,
+  createAgentThreadTopology,
+} from './thread-topology.js';
 import type { AgentRunEnvelope } from './types.js';
 
 const agents = [
@@ -106,6 +117,279 @@ function topology() {
 async function payload(response: Response): Promise<Record<string, unknown>> {
   return (await response.json()) as Record<string, unknown>;
 }
+
+class CReceiverContext implements ActorContext {
+  #base = context();
+  actor = this.#base.actor;
+  principal = this.#base.principal;
+  resourceOwner = this.#base.resourceOwner;
+  mutationEpoch = 2;
+  service() {
+    return this.#base.service();
+  }
+  newRunId() {
+    return this.#base.newRunId();
+  }
+  newThreadId() {
+    return this.#base.newThreadId();
+  }
+  resourceIdFromKey(key: string) {
+    return this.#base.resourceIdFromKey(key);
+  }
+  claimResource(...args: Parameters<ActorContext['claimResource']>) {
+    return this.#base.claimResource(...args);
+  }
+  releaseResource(...args: Parameters<ActorContext['releaseResource']>) {
+    return this.#base.releaseResource(...args);
+  }
+  resourceOwnerFor(...args: Parameters<ActorContext['resourceOwnerFor']>) {
+    return this.#base.resourceOwnerFor(...args);
+  }
+  canAccessResource(...args: Parameters<ActorContext['canAccessResource']>) {
+    return this.#base.canAccessResource(...args);
+  }
+  canSelfDecide(role: ApprovalRole) {
+    return this.#base.canSelfDecide(role);
+  }
+}
+
+function cAgentTopology(response?: Response) {
+  const hits: Array<{ threadId: string; init: ThreadRequestInit | undefined }> =
+    [];
+  const namespace: ThreadNamespaceLike<string> = {
+    idFromName: (name) => name,
+    get: (threadId) => ({
+      fetch: (async (_request: Request | string, init?: ThreadRequestInit) => {
+        hits.push({ threadId, init });
+        return response ?? Response.json(envelope());
+      }) as ReturnType<ThreadNamespaceLike<string>['get']>['fetch'],
+    }),
+  };
+  return {
+    hits,
+    host: createAgentThreadTopology(
+      namespace,
+      TEST_DEPLOYMENT_IDENTITY_SECRET,
+      { executionFence: 'none', startIdempotency: 'none' },
+    ),
+  };
+}
+
+describe('C public agent transport', () => {
+  it.each([
+    'class',
+    'non-enumerable',
+    'own',
+  ] as const)('C agent router retains original authority and method receivers through the real topology: %s', async (layout) => {
+    const source = new CReceiverContext();
+    const methods = [
+      'service',
+      'newRunId',
+      'newThreadId',
+      'resourceIdFromKey',
+      'claimResource',
+      'releaseResource',
+      'resourceOwnerFor',
+      'canAccessResource',
+      'canSelfDecide',
+    ] as const;
+    if (layout !== 'class') {
+      for (const name of methods)
+        Object.defineProperty(source, name, {
+          value: source[name],
+          configurable: true,
+          writable: true,
+          enumerable: layout === 'own',
+        });
+      if (layout === 'non-enumerable') {
+        for (const name of [
+          'actor',
+          'principal',
+          'resourceOwner',
+          'mutationEpoch',
+        ])
+          Object.defineProperty(source, name, { enumerable: false });
+      }
+    }
+    const originalPrincipal = source.principal;
+    const fixture = cAgentTopology();
+    const start = vi.spyOn(fixture.host, 'start');
+    const router = createAgentRouter({
+      agents,
+      resolve: async () => source,
+      topology: fixture.host,
+    });
+    let enter = () => {};
+    let release = () => {};
+    const entered = new Promise<void>((resolve) => {
+      enter = resolve;
+    });
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const body = new ReadableStream<Uint8Array>(
+      {
+        async pull(controller) {
+          enter();
+          await held;
+          controller.enqueue(new TextEncoder().encode('{"prompt":"original"}'));
+          controller.close();
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const request = new Request('https://host/agents/writer/runs', {
+      method: 'POST',
+      body,
+      duplex: 'half',
+    } as RequestInit & { duplex: 'half' });
+    const pending = router(request);
+    const outcome = pending.then(
+      () => false,
+      () => false,
+    );
+    const replacement = vi.fn(() => 'replacement');
+    try {
+      expect(await Promise.race([entered.then(() => true), outcome])).toBe(
+        true,
+      );
+      expect(start).not.toHaveBeenCalled();
+      Object.assign(source.actor, { id: 'replacement', role: 'viewer' });
+      Object.assign(source, {
+        principal: humanPrincipal({ id: 'replacement', role: 'viewer' }),
+        mutationEpoch: 3,
+        newRunId: replacement,
+        newThreadId: replacement,
+        resourceIdFromKey: replacement,
+      });
+    } finally {
+      release();
+      await outcome;
+    }
+    expect((await pending)?.status).toBe(200);
+    expect(start).toHaveBeenCalledOnce();
+    const captured = start.mock.calls[0]?.[0];
+    expect(captured).toMatchObject({
+      actor: { id: 'operator-1', role: 'operator' },
+      principal: originalPrincipal,
+      mutationEpoch: 2,
+    });
+    for (const name of methods)
+      expect(typeof captured?.[name]).toBe('function');
+    expect(fixture.hits).toHaveLength(1);
+    expect(fixture.hits[0]?.init?.headers).toMatchObject({
+      'x-flowsafe-mutation-epoch': '2',
+      'x-flowsafe-principal': JSON.stringify(originalPrincipal),
+    });
+    expect(JSON.parse(fixture.hits[0]?.init?.body ?? '{}')).toMatchObject({
+      runId: 'acme_run',
+      threadId: 'acme_thread',
+      resourceId: 'acme_resource',
+      agentId: 'writer',
+      prompt: 'original',
+    });
+    expect(replacement).not.toHaveBeenCalled();
+    expect(Object.isFrozen(source)).toBe(false);
+    expect(Object.isFrozen(source.actor)).toBe(false);
+  });
+
+  it.each([
+    'mutationEpoch',
+    'startIdentity',
+    'agentStart',
+    'execution',
+    'tablePrefix',
+    'startToken',
+    'attemptToken',
+    'runOwnerGuard',
+    'onPreparedStartIdentity',
+  ])('C agent route refuses public authority field %s', async (field) => {
+    const host = topology();
+    const router = createAgentRouter({
+      agents,
+      resolve: async () => context(),
+      topology: host,
+    });
+    const response = await router(
+      new Request('https://host/agents/writer/runs', {
+        method: 'POST',
+        body: JSON.stringify({ prompt: 'go', [field]: 2 }),
+      }),
+    );
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({
+      error: `field '${field}' is not allowed`,
+    });
+    expect(host.start).not.toHaveBeenCalled();
+  });
+
+  it('C agent route retains direct invalid-epoch error data', async () => {
+    const host = topology();
+    const source = { ...context(), mutationEpoch: -1 };
+    const router = createAgentRouter({
+      agents,
+      resolve: async () => source,
+      topology: host,
+    });
+    const response = await router(
+      new Request('https://host/agents/writer/runs', {
+        method: 'POST',
+        body: '{"prompt":"go"}',
+      }),
+    );
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({
+      error: 'mutationEpoch must be a nonnegative safe integer or undefined',
+      reason: { code: 'INVALID_MUTATION_EPOCH' },
+    });
+    expect(host.start).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'missing',
+    'stale',
+    'future',
+    'invalid',
+  ] as const)('C agent route retains complete encoded epoch refusals: %s', async (classification) => {
+    const error =
+      classification === 'invalid'
+        ? new InvalidMutationEpochError()
+        : new MutationEpochMismatchError(classification, 2);
+    const fixture = cAgentTopology(doErrorResponse(error));
+    const router = createAgentRouter({
+      agents,
+      resolve: async () => context(),
+      topology: fixture.host,
+    });
+    const response = await router(
+      new Request('https://host/agents/writer/runs', {
+        method: 'POST',
+        body: '{"prompt":"go"}',
+      }),
+    );
+    expect(response?.status).toBe(classification === 'invalid' ? 400 : 409);
+    expect(await response?.json()).toEqual(
+      classification === 'invalid'
+        ? {
+            error:
+              'mutationEpoch must be a nonnegative safe integer or undefined',
+            reason: { code: 'INVALID_MUTATION_EPOCH' },
+          }
+        : {
+            error: 'mutation epoch does not match the active deployment',
+            reason: {
+              code: 'MUTATION_EPOCH_MISMATCH',
+              classification,
+              mutationEpoch: 2,
+            },
+          },
+    );
+    expect(fixture.hits).toHaveLength(1);
+    expect(fixture.hits[0]?.init?.headers).not.toHaveProperty(
+      'x-flowsafe-mutation-epoch',
+    );
+  });
+});
 
 describe('createAgentRouter', () => {
   it('lists metadata and the authenticated actor for every role', async () => {

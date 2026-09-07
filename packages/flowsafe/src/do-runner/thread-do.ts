@@ -34,6 +34,10 @@ import {
   verifyDurableObjectDeploymentRequest,
 } from './deployment-identity.js';
 import { DoStatusError, doErrorResponse } from './do-error-response.js';
+import {
+  MUTATION_EPOCH_HEADER,
+  mutationEpochFromHeader,
+} from './execution-admission.js';
 import { EXECUTION_PRINCIPAL_HEADER } from './execution-principal-header.js';
 import type { InitResult } from './init.js';
 import { isPathSafeId } from './path-safe-id.js';
@@ -72,6 +76,7 @@ export interface ThreadScope {
    * principals must have been declared by the target agent.
    */
   readonly principal: ExecutionPrincipal;
+  readonly mutationEpoch?: number;
   /** This DO's storage/runtime/pubsub wiring, built once per instance. */
   readonly init: InitResult;
 }
@@ -143,6 +148,8 @@ export abstract class ThreadDurableObject<TEnv = unknown> {
 
   async fetch(request: Request): Promise<Response> {
     try {
+      const encodedPrincipal = request.headers.get(EXECUTION_PRINCIPAL_HEADER);
+      const encodedEpoch = request.headers.get(MUTATION_EPOCH_HEADER);
       // Deployment identity BEFORE request identity: a mis-provisioned
       // namespace (env tag vs D1 sentinel) refuses every request outright.
       // No-op off workerd (state undefined), memoized after first success.
@@ -153,12 +160,17 @@ export abstract class ThreadDurableObject<TEnv = unknown> {
       );
       // Assert BEFORE building: a refused caller never reaches storage, and the
       // ordering is visible here rather than buried inside the assertion.
-      const identity = this.#assertIdentity(request);
-      return await this.route(request, {
-        ...identity,
-        ...(deploymentTag !== undefined ? { deploymentTag } : {}),
-        init: this.#ensureInit(),
-      });
+      const identity = this.#assertIdentity(encodedPrincipal);
+      const mutationEpoch = mutationEpochFromHeader(encodedEpoch);
+      return await this.route(
+        request,
+        Object.freeze({
+          ...identity,
+          ...(mutationEpoch === undefined ? {} : { mutationEpoch }),
+          ...(deploymentTag !== undefined ? { deploymentTag } : {}),
+          init: this.#ensureInit(),
+        }),
+      );
     } catch (error) {
       // The SAME taxonomy DurableObjectRunner answers with: route() drives runs
       // through scope.init.runtime, so its typed errors (unknown run -> 404, not
@@ -207,9 +219,9 @@ export abstract class ThreadDurableObject<TEnv = unknown> {
    * The chokepoint: every request must carry the trusted execution principal.
    * `route()` receives the asserted scope, never the raw request identity.
    */
-  #assertIdentity(request: Request): Omit<ThreadScope, 'init'> {
+  #assertIdentity(encodedPrincipal: string | null): Omit<ThreadScope, 'init'> {
     const threadId = this.threadId;
-    const principal = this.#principalFrom(request);
+    const principal = this.#principalFrom(encodedPrincipal);
     return {
       threadId,
       principal,
@@ -227,8 +239,7 @@ export abstract class ThreadDurableObject<TEnv = unknown> {
    * This is the SOLE identity channel: every route consumes `scope.principal`,
    * so no parallel actor/requester representation can disagree with it.
    */
-  #principalFrom(request: Request): ExecutionPrincipal {
-    const header = request.headers.get(EXECUTION_PRINCIPAL_HEADER);
+  #principalFrom(header: string | null): ExecutionPrincipal {
     if (header === null) {
       throw new ThreadIdentityError(
         `thread identity mismatch: request for '${this.threadId}' carries no trusted execution principal`,

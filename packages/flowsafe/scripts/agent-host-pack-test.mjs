@@ -87,6 +87,29 @@ try {
   const manifest = JSON.parse(
     readFileSync(join(packageDirectory, 'package.json'), 'utf8'),
   );
+  assert.deepEqual(
+    Object.keys(manifest.exports).sort(),
+    [
+      '.',
+      './agent-host',
+      './agent-runner',
+      './approval-api',
+      './approval-ui',
+      './artifacts',
+      './audit-export',
+      './background-tasks',
+      './deployment-identity-protocol',
+      './do-runner',
+      './goals',
+      './host-kit',
+      './host-kit/module',
+      './package.json',
+      './schedules',
+      './signal-providers',
+      './signals',
+      './signals/client',
+    ].sort(),
+  );
   for (const leaf of [
     'fenced-workflows-d1',
     'fenced-workflow-capability',
@@ -414,6 +437,115 @@ void createRunRouter;
 `,
   );
   writeFileSync(
+    join(consumer, 'transport-consumer.ts'),
+    `import {
+  type ActorContext, ApprovalService, createActorResolver,
+  createPrincipalActorContext, humanPrincipal, InMemoryApprovalStoreFactory,
+} from '@proofoftech/flowsafe/approval-api';
+import {
+  type RunnerRuntime, type RunExecutionIdentity, type StartRunOptions,
+  type ThreadScope,
+} from '@proofoftech/flowsafe/do-runner';
+import {
+  createFlowsafeWorker, type FlowsafeWorkerConfig, type FlowsafeWorkerEnv,
+  type RunStartInput,
+} from '@proofoftech/flowsafe/host-kit';
+import {
+  type AgentStartAuthority, type FlowsafeDurableAgent,
+} from '@proofoftech/flowsafe/agent-runner';
+// @ts-expect-error internal context capture is not a root export
+import type { captureActorContext as RootCapture } from '@proofoftech/flowsafe';
+// @ts-expect-error internal context capture is not an approval export
+import type { captureActorContext as ApprovalCapture } from '@proofoftech/flowsafe/approval-api';
+// @ts-expect-error internal context capture is not a host-kit export
+import type { captureActorContext as HostCapture } from '@proofoftech/flowsafe/host-kit';
+// @ts-expect-error internal context capture is not an agent-host export
+import type { captureActorContext as AgentCapture } from '@proofoftech/flowsafe/agent-host';
+// @ts-expect-error internal context capture is not an agent-runner export
+import type { captureActorContext as AgentRunnerCapture } from '@proofoftech/flowsafe/agent-runner';
+// @ts-expect-error internal context capture is not a do-runner export
+import type { captureActorContext as RunnerCapture } from '@proofoftech/flowsafe/do-runner';
+// @ts-expect-error agent authority belongs only to agent-runner
+import type { AgentStartAuthority as RootAuthority } from '@proofoftech/flowsafe';
+// @ts-expect-error agent authority belongs only to agent-runner
+import type { AgentStartAuthority as ApprovalAuthority } from '@proofoftech/flowsafe/approval-api';
+// @ts-expect-error agent authority belongs only to agent-runner
+import type { AgentStartAuthority as HostAuthority } from '@proofoftech/flowsafe/host-kit';
+// @ts-expect-error agent authority belongs only to agent-runner
+import type { AgentStartAuthority as AgentAuthority } from '@proofoftech/flowsafe/agent-host';
+// @ts-expect-error agent authority belongs only to agent-runner
+import type { AgentStartAuthority as RunnerAuthority } from '@proofoftech/flowsafe/do-runner';
+
+const actor = { id: 'owner', role: 'operator' } as const;
+const principal = humanPrincipal(actor);
+const factory = new InMemoryApprovalStoreFactory();
+const service = new ApprovalService({ store: factory.store(), executionFence: 'none' });
+const legacyContext: ActorContext = {
+  actor, principal, resourceOwner: { kind: 'human', id: actor.id },
+  service: () => service, newRunId: () => 'run', newThreadId: () => 'thread',
+  resourceIdFromKey: key => key, claimResource: async () => {},
+  releaseResource: async () => {}, resourceOwnerFor: async () => undefined,
+  canAccessResource: async () => true, canSelfDecide: () => false,
+};
+const epochContext: ActorContext = { ...legacyContext, mutationEpoch: 2 };
+createActorResolver({
+  authenticate: () => actor, storeFactory: factory,
+  buildService: () => service, mutationEpoch: 2,
+});
+createPrincipalActorContext({
+  principal, storeFactory: factory, buildService: () => service, mutationEpoch: 2,
+});
+declare const hostInit: ThreadScope['init'];
+const legacyScope: ThreadScope = { threadId: 'thread', principal, init: hostInit };
+const epochScope: ThreadScope = { ...legacyScope, mutationEpoch: 2 };
+const legacyInput: RunStartInput = { workflowId: 'workflow', runId: 'run', inputData: {}, principal };
+const epochInput: RunStartInput = { ...legacyInput, mutationEpoch: 2 };
+type EpochEnv = FlowsafeWorkerEnv & { artifactEpoch: number };
+const workerConfig: FlowsafeWorkerConfig<EpochEnv> = {
+  systemPrincipalId: 'system', workflows: [],
+  buildVerifier: () => ({ verify: async () => actor }),
+  maintenance: { sweepIntervalMs: 1000, purgeIntervalMs: 1000 },
+  mutationEpoch: env => env.artifactEpoch,
+};
+createFlowsafeWorker(workerConfig);
+createFlowsafeWorker({ ...workerConfig, mutationEpoch: 0 });
+const onPrepared = (execution: RunExecutionIdentity): void => { void execution.startToken; };
+const legacyOptions: StartRunOptions = { runId: 'legacy' };
+const options: StartRunOptions = {
+  runId: 'run', requestedBy: actor.id, requestedByKind: 'human',
+  attemptToken: 'attempt', mutationEpoch: 2,
+  startIdentity: { owner: { kind: 'human', id: actor.id }, target: { kind: 'workflow', id: 'workflow' } },
+  onPreparedStartIdentity: onPrepared,
+  runOwnerGuard: { owner: { kind: 'service', id: 'resource-owner' }, reservationToken: 'attempt' },
+};
+// @ts-expect-error requester identity is an all-or-neither pair
+const partialRequester: StartRunOptions = { runId: 'run', requestedBy: actor.id };
+// @ts-expect-error direct Runtime epoch is numeric
+const stringEpoch: StartRunOptions = { runId: 'run', mutationEpoch: '2' };
+declare const runtime: RunnerRuntime;
+void runtime.start('workflow', options);
+const authority: AgentStartAuthority = {
+  mutationEpoch: 2,
+  startIdentity: { owner: { kind: 'human', id: actor.id }, target: { kind: 'agent', id: 'agent', threadId: 'thread' } },
+  agentStart: { threaded: true }, onPreparedStartIdentity: undefined,
+};
+const callbackAuthority: AgentStartAuthority = { ...authority, onPreparedStartIdentity: onPrepared };
+declare const durable: FlowsafeDurableAgent;
+void durable.streamUntilPersisted('input', { runId: 'run' }, actor.id, 'human', 'attempt', undefined, undefined, authority);
+void durable.streamUntilPersisted('input', { runId: 'run' }, actor.id, 'human', 'attempt', undefined, undefined, callbackAuthority);
+// @ts-expect-error the eighth trusted authority argument is required
+void durable.streamUntilPersisted('input', { runId: 'run' }, actor.id, 'human', 'attempt', undefined, undefined);
+const { onPreparedStartIdentity: omitted, ...withoutCallback } = authority;
+// @ts-expect-error the callback property is required even when undefined
+void durable.streamUntilPersisted('input', { runId: 'run' }, actor.id, 'human', 'attempt', undefined, undefined, withoutCallback);
+// @ts-expect-error callback must be a function or undefined
+void durable.streamUntilPersisted('input', { runId: 'run' }, actor.id, 'human', 'attempt', undefined, undefined, { ...authority, onPreparedStartIdentity: 'invalid' });
+// @ts-expect-error the bridge requires an agent target
+void durable.streamUntilPersisted('input', { runId: 'run' }, actor.id, 'human', 'attempt', undefined, undefined, { ...authority, startIdentity: { owner: authority.startIdentity.owner, target: { kind: 'workflow', id: 'workflow' } } });
+void [legacyContext, epochContext, legacyScope, epochScope, legacyInput, epochInput, legacyOptions, partialRequester, stringEpoch, omitted];
+`,
+  );
+  writeFileSync(
     join(consumer, 'tsconfig.json'),
     JSON.stringify({
       compilerOptions: {
@@ -424,7 +556,7 @@ void createRunRouter;
         noEmit: true,
         skipLibCheck: true,
       },
-      files: ['consumer.ts'],
+      files: ['consumer.ts', 'transport-consumer.ts'],
     }),
   );
   run('pnpm', ['exec', 'tsc', '-p', 'tsconfig.json'], consumer);
@@ -452,6 +584,7 @@ import * as approvals from '@proofoftech/flowsafe/approval-api';
 import * as backgroundTasks from '@proofoftech/flowsafe/background-tasks';
 import * as doRunner from '@proofoftech/flowsafe/do-runner';
 import * as hostKit from '@proofoftech/flowsafe/host-kit';
+import * as agentRunner from '@proofoftech/flowsafe/agent-runner';
 import { Mastra } from '@mastra/core/mastra';
 import { createStep, createWorkflow } from '@mastra/core/workflows';
 import { z } from 'zod';
@@ -498,6 +631,16 @@ assert.equal(typeof hostKit.createRunRouter, 'function');
 assert.equal(typeof hostKit.createFlowsafeWorker, 'function');
 assert.equal(hostKit.FENCED_WORKFLOW_STORAGE, doRunner.FENCED_WORKFLOW_STORAGE);
 assert.equal('FencedWorkflowsStorageD1' in hostKit, false);
+assert.equal(typeof agentRunner.FlowsafeDurableAgent, 'function');
+for (const api of [flowsafe, approvals, doRunner, hostKit, host, agentRunner]) {
+  for (const name of ['captureActorContext', 'captureAgentStartAuthority', 'captureStartRunOptions', 'startAuthorities', 'AgentStartAuthority']) {
+    assert.equal(name in api, false, name);
+  }
+}
+for (const name of ['normalizeMutationEpoch', 'stampMutationEpoch', 'mutationEpochFromHeader', 'InvalidMutationEpochError', 'MutationEpochMismatchError']) {
+  assert.equal(doRunner[name], hostKit[name], name);
+  assert.equal(doRunner[name], flowsafe[name], name);
+}
 assert.equal(typeof doRunner.RunLifecycleBlockedError, 'function');
 assert.equal(doRunner.RunLifecycleBlockedError, flowsafe.RunLifecycleBlockedError);
 assert.equal('RunLifecycleBlockedError' in hostKit, false);

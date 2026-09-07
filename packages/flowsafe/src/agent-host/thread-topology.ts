@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { captureActorContext } from '../approval-api/actor-context.js';
 import {
   type ActorContext,
   type ApprovalDecision,
@@ -353,8 +354,40 @@ export function createAgentThreadTopology<Id>(
       );
       if (!response.ok) throw await errorFrom(response);
     },
-    start: async (context, input) => {
-      const threaded = input.threaded !== false;
+    start: async (sourceContext, sourceInput) => {
+      const context = captureActorContext(sourceContext);
+      const { principal, mutationEpoch } = context;
+      const {
+        agentId,
+        entryPath,
+        runId: suppliedRunId,
+        threadId: suppliedThreadId,
+        resourceId: suppliedResourceId,
+        topologyThreadId,
+        threaded: suppliedThreaded,
+        scheduleId,
+        dispatchId,
+        idempotencyKey,
+        prompt,
+        requestContext,
+        streamRequestContext,
+        providerOptions,
+      } = sourceInput;
+      const input = {
+        agentId,
+        entryPath,
+        threadId: suppliedThreadId,
+        resourceId: suppliedResourceId,
+        topologyThreadId,
+        scheduleId,
+        dispatchId,
+        idempotencyKey,
+        prompt,
+        requestContext,
+        streamRequestContext,
+        providerOptions,
+      };
+      const threaded = suppliedThreaded !== false;
       if (
         (input.entryPath === 'schedule.fire') !==
           (input.scheduleId !== undefined) ||
@@ -388,10 +421,10 @@ export function createAgentThreadTopology<Id>(
       // its own, which is what makes two same-key starts converge instead of
       // becoming two runs.
       const mintRunId = (): string =>
-        input.runId === undefined
+        suppliedRunId === undefined
           ? context.newRunId()
-          : isPathSafeId(input.runId)
-            ? input.runId
+          : isPathSafeId(suppliedRunId)
+            ? suppliedRunId
             : (() => {
                 throw new RunRouteError(404, 'run not found');
               })();
@@ -422,7 +455,7 @@ export function createAgentThreadTopology<Id>(
       ): Promise<AgentRunEnvelope> =>
         envelope(
           await threads.send(
-            context,
+            { principal, mutationEpoch },
             targetThreadId,
             `${AGENT_HOST_ROUTE_PREFIX}/start`,
             {
@@ -462,8 +495,8 @@ export function createAgentThreadTopology<Id>(
         {
           key: input.idempotencyKey,
           owner: {
-            kind: context.principal.kind,
-            id: context.principal.id,
+            kind: principal.kind,
+            id: principal.id,
           },
           targetKind: 'agent',
           targetId: input.agentId,

@@ -169,9 +169,21 @@ Legacy `{ expected, next, proofKey? }` requests remain valid only before activat
 
 Administrative metadata does not establish final-write run or schedule protection. Do not activate the requirement until every writer supports final-write epoch checks. Use an authoritative D1 binding for administration and ordinary reads; an unconstrained replica facade cannot satisfy the store's freshness contract. The [runner design](do-runner-design.md#execution-fence-and-start-reservations) describes schema recovery, proof binding, and the legacy-absence limitation.
 
-Additive proof-identity columns preserve an active fence's epoch, revision, receipt, state, and timestamps. A complete stored proof identity includes its D1 prefix, workflow, run, and token. Admin reads and conflicts expose neither this identity nor its token; a newly applied admin command clears it with the proof-run binding, while an exact retry preserves it. These schema/read fields do not enable generation-aware execution checks. The [identity-data helpers](do-runner-design.md#validate-execution-identity-data) validate representations without changing caller authority.
+Additive proof-identity columns preserve an active fence's epoch, revision, receipt, state, and timestamps. A complete stored proof identity includes its D1 prefix, workflow, run, and token. Admin reads and conflicts expose neither this identity nor its token; a newly applied admin command clears it with the proof-run binding, while an exact retry preserves it.
+
+These schema/read fields do not enable generation-aware execution checks. The [identity-data helpers](do-runner-design.md#validate-execution-identity-data) validate representations without changing caller authority.
 
 `GET /admin/inventory` returns the category index. Add `?category=<category>&cursor=<cursor>&limit=<limit>` to page one category. Prove a drain only from `draining`: sweep every work category to empty twice, at least 60 seconds apart. Standing categories remain present by design, and persisted idle signals deliberately carry across the migration.
+
+### Configure the trusted caller epoch
+
+Set `mutationEpoch` on `createFlowsafeWorker()` to a nonnegative safe-integer number or a synchronous callback of the deployment environment. The factory captures the configured source once; each fetch captures its value before the first deployment-verification await. A callback must return a number or `undefined`, not a string, Promise or thenable. Invalid values return `400` before authentication or route work; invalid scalar configuration fails at construction.
+
+`createActorResolver()` and `createPrincipalActorContext()` also accept a scalar epoch. Custom resolvers must derive it from trusted host or verified credential data, never a client-selected field.
+
+The topologies stamp `x-flowsafe-mutation-epoch` for internal calls, replacing or removing incoming values. `createActorResolver()` refuses that header on public requests. Both Durable Object shells capture it before deployment verification and decode the captured value only afterward.
+
+This configuration establishes transport, not final-write enforcement. Runtime still emits v1 provenance and uses the existing fence-state predicate, even if the stored epoch requirement is active. Keep activation disabled until the coordinated run writer, recovery and schedule mutation integration is complete.
 
 ### Advanced routes
 

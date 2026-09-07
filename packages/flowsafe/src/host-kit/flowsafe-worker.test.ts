@@ -22,6 +22,7 @@ import {
 } from '../audit-export/index.js';
 import {
   EXECUTION_PRINCIPAL_HEADER,
+  InvalidMutationEpochError,
   type RunDeadlineCursor,
   type RunSummary,
 } from '../do-runner/index.js';
@@ -166,6 +167,223 @@ function makeWorker(
     ...overrides,
   });
 }
+
+function cWorkerDeferred() {
+  let release!: () => void;
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { promise, release };
+}
+
+describe('C Worker epoch capture', () => {
+  it.each([
+    '/runs',
+    '/healthz',
+    '/admin/maintenance-status',
+  ])('C captures Worker epoch before identity SQL', async (path) => {
+    type EpochEnv = FlowsafeWorkerEnv & { epoch: number };
+    const order: string[] = [];
+    const observed: Array<number | undefined> = [];
+    let sourceReads = 0;
+    const source = vi.fn((env: EpochEnv) => {
+      order.push('epoch');
+      return env.epoch;
+    });
+    const config: FlowsafeWorkerConfig<EpochEnv> = {
+      systemPrincipalId: 'test-system',
+      workflows: WORKFLOWS,
+      maintenance: { sweepIntervalMs: 1, purgeIntervalMs: 1 },
+      get mutationEpoch() {
+        sourceReads++;
+        return source;
+      },
+      buildVerifier: () => staticTokenVerifier(ACTORS),
+      beforeStart: async (context) => {
+        observed.push(context.mutationEpoch);
+      },
+    };
+    const worker = createFlowsafeWorker(config);
+    expect(sourceReads).toBe(1);
+    expect(source).not.toHaveBeenCalled();
+    Object.defineProperty(config, 'mutationEpoch', { value: () => 99 });
+    for (const epoch of [0, Number.MAX_SAFE_INTEGER]) {
+      const h = makeEnv();
+      const env: EpochEnv = { ...h.env, epoch };
+      const entered = cWorkerDeferred();
+      const hold = cWorkerDeferred();
+      const nativePrepare = env.DB.prepare.bind(env.DB);
+      let held = false;
+      const prepare = vi.spyOn(env.DB, 'prepare').mockImplementation((sql) => {
+        const statement = nativePrepare(sql);
+        if (!held && sql.includes('sqlite_schema')) {
+          const bind = statement.bind.bind(statement);
+          statement.bind = (...values: unknown[]) => {
+            const bound = bind(...values);
+            const all = bound.all.bind(bound);
+            bound.all = async <T>() => {
+              const result = await all<T>();
+              held = true;
+              order.push('sql');
+              entered.release();
+              await hold.promise;
+              return result;
+            };
+            return bound;
+          };
+        }
+        return statement;
+      });
+      const pending = worker.fetch(
+        authed(
+          `http://host${path}`,
+          path === '/runs'
+            ? {
+                method: 'POST',
+                body: JSON.stringify({ workflowId: 'wf', inputData: {} }),
+              }
+            : {},
+        ),
+        env,
+        h.ctx,
+      );
+      try {
+        await entered.promise;
+        expect(order.slice(-2)).toEqual(['epoch', 'sql']);
+        env.epoch = 3;
+        hold.release();
+        const response = await pending;
+        expect(response.status).toBe(
+          path === '/admin/maintenance-status' ? 503 : 200,
+        );
+        if (path === '/runs') expect(observed.at(-1)).toBe(epoch);
+      } finally {
+        hold.release();
+        await pending;
+        await h.flush();
+        prepare.mockRestore();
+      }
+    }
+    expect(sourceReads).toBe(1);
+    expect(source).toHaveBeenCalledTimes(2);
+  });
+
+  it('C Worker epoch remains captured through authentication', async () => {
+    const h = makeEnv();
+    const entered = cWorkerDeferred();
+    const hold = cWorkerDeferred();
+    let epoch = 2;
+    const seen: unknown[] = [];
+    const worker = makeWorker({
+      mutationEpoch: () => epoch,
+      buildVerifier: () => ({
+        verify: async () => {
+          entered.release();
+          await hold.promise;
+          return { id: 'ada', role: 'admin' };
+        },
+      }),
+      beforeStart: async (context) => {
+        seen.push(context.mutationEpoch);
+      },
+    });
+    const pending = worker.fetch(
+      authed('http://host/runs', {
+        method: 'POST',
+        body: '{"workflowId":"wf"}',
+      }),
+      h.env,
+      h.ctx,
+    );
+    try {
+      await entered.promise;
+      epoch = 9;
+      hold.release();
+      expect((await pending).status).toBe(200);
+      expect(seen).toEqual([2]);
+    } finally {
+      hold.release();
+      await pending;
+      await h.flush();
+    }
+  });
+
+  it.each([
+    null,
+    '2',
+    true,
+    -1,
+    0.5,
+    NaN,
+    Infinity,
+    Number.MAX_SAFE_INTEGER + 1,
+  ])('C Worker rejects invalid scalar setup and callback without effects (%s)', async (value) => {
+    expect(() => makeWorker({ mutationEpoch: value as number })).toThrow(
+      InvalidMutationEpochError,
+    );
+    const h = makeEnv();
+    const prepare = vi.spyOn(h.env.DB, 'prepare');
+    const auth = vi.fn(() => staticTokenVerifier(ACTORS));
+    const route = vi.fn();
+    const response = await makeWorker({
+      mutationEpoch: () => value,
+      buildVerifier: auth,
+      preRoutes: route,
+    }).fetch(authed('http://host/workflows'), h.env, h.ctx);
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      error: new InvalidMutationEpochError().message,
+      reason: { code: 'INVALID_MUTATION_EPOCH' },
+    });
+    expect(prepare).not.toHaveBeenCalled();
+    expect(auth).not.toHaveBeenCalled();
+    expect(route).not.toHaveBeenCalled();
+    expect(h.doCalls).toEqual([]);
+    await h.flush();
+  });
+
+  it.each([
+    'promise',
+    'thenable',
+  ] as const)('C Worker never awaits an epoch callback result (%s)', async (kind) => {
+    const then = vi.fn();
+    const value = kind === 'promise' ? Promise.resolve(2) : { then };
+    const h = makeEnv();
+    const prepare = vi.spyOn(h.env.DB, 'prepare');
+    const response = await makeWorker({ mutationEpoch: () => value }).fetch(
+      authed('http://host/healthz'),
+      h.env,
+      h.ctx,
+    );
+    expect(response.status).toBe(400);
+    expect(then).not.toHaveBeenCalled();
+    expect(prepare).not.toHaveBeenCalled();
+    await h.flush();
+  });
+
+  it.each([
+    new Error('private sentinel'),
+    {
+      name: 'InvalidMutationEpochError',
+      status: 400,
+      reason: { code: 'INVALID_MUTATION_EPOCH' },
+      message: 'private sentinel',
+    },
+  ])('C Worker keeps generic callback errors redacted', async (error) => {
+    capturedLogs();
+    const h = makeEnv();
+    const prepare = vi.spyOn(h.env.DB, 'prepare');
+    const response = await makeWorker({
+      mutationEpoch: () => {
+        throw error;
+      },
+    }).fetch(authed('http://host/healthz'), h.env, h.ctx);
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: 'internal error' });
+    expect(prepare).not.toHaveBeenCalled();
+    await h.flush();
+  });
+});
 
 function authed(url: string, init: RequestInit = {}): Request {
   return new Request(url, {

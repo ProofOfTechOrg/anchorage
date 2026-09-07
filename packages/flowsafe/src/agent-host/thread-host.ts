@@ -11,6 +11,7 @@ import {
   AGENT_RUN_STORAGE_KEY_PREFIX,
   type AgentEntryPath,
   type AgentRunRecord,
+  type AgentStartAuthority,
   type AgentThreadBinding,
   bindAgentThread,
   createFlowsafeDurableAgent,
@@ -39,8 +40,10 @@ import {
 } from '../approval-api/index.js';
 import {
   type AutomatedExecutionPrincipal,
+  assertExecutionPrincipal,
   isExecutionPrincipalId,
 } from '../approval-api/principal.js';
+import { normalizeMutationEpoch } from '../do-runner/execution-admission.js';
 import {
   DoStatusError,
   isPathSafeId,
@@ -1361,8 +1364,55 @@ export function createThreadAgentHost(
           throw error;
         }
       }),
-    start: async (scope, input) => {
-      const ref = runRef(scope, input as unknown as Record<string, unknown>);
+    start: async (sourceScope, sourceInput) => {
+      const principal = assertExecutionPrincipal(
+        sourceScope.principal,
+        'thread start principal',
+      );
+      const mutationEpoch = normalizeMutationEpoch(sourceScope.mutationEpoch);
+      const { threadId, deploymentTag, init } = sourceScope;
+      const scope: ThreadScope = Object.freeze({
+        principal,
+        mutationEpoch,
+        threadId,
+        deploymentTag,
+        init,
+      });
+      const {
+        agentId,
+        threadId: inputThreadId,
+        resourceId,
+        runId,
+        prompt,
+        messages: inputMessages,
+        entryPath: inputEntryPath,
+        threaded: inputThreaded,
+        scheduleId,
+        dispatchId,
+        scheduleDispatchLease,
+        safeContext: inputSafeContext,
+        providerOptions: inputProviderOptions,
+        idempotencyKey,
+      } = sourceInput;
+      const input: ThreadAgentStartInput = {
+        agentId,
+        threadId: inputThreadId,
+        resourceId,
+        runId,
+        prompt,
+        messages: inputMessages,
+        entryPath: inputEntryPath,
+        threaded: inputThreaded,
+        scheduleId,
+        dispatchId,
+        scheduleDispatchLease,
+        safeContext: inputSafeContext,
+        providerOptions: inputProviderOptions,
+        idempotencyKey,
+      };
+      const ref = Object.freeze(
+        runRef(scope, input as unknown as Record<string, unknown>),
+      );
       const entry = entryPath(input.entryPath);
       const threaded = input.threaded !== false;
       const source = await resolveStartSource(
@@ -1372,6 +1422,21 @@ export function createThreadAgentHost(
         threaded,
         input.scheduleId,
         input.dispatchId,
+      );
+      const rawOwner = source.owner;
+      const owner = canonicalResourceOwner({
+        kind: rawOwner.kind,
+        id: rawOwner.id,
+      });
+      const startIdentity: AgentStartAuthority['startIdentity'] = Object.freeze(
+        {
+          owner: principalOwner(principal),
+          target: Object.freeze({
+            kind: 'agent',
+            id: ref.agentId,
+            threadId: ref.threadId,
+          }),
+        },
       );
       const hasPrompt =
         source.target === undefined && input.prompt !== undefined;
@@ -1400,7 +1465,6 @@ export function createThreadAgentHost(
       const resolvedProviderOptions = source.target
         ? source.target.providerOptions
         : input.providerOptions;
-      const owner = source.owner;
       const { current, module, principalPermissions } = await authorize(
         scope,
         ref.agentId,
@@ -1546,7 +1610,7 @@ export function createThreadAgentHost(
           const streamOptions = {
             runId: ref.runId,
             requestContext: createTrustedAgentRequestContext(execution),
-            ...(input.threaded !== false
+            ...(threaded
               ? {
                   memory: {
                     thread: scope.threadId,
@@ -1570,11 +1634,18 @@ export function createThreadAgentHost(
           await durable.streamUntilPersisted(
             messages,
             streamOptions,
-            scope.principal.id,
-            scope.principal.kind,
+            principal.id,
+            principal.kind,
             recovery.token,
             scheduleDispatch,
-            input.idempotencyKey,
+            idempotencyKey,
+            {
+              ...(mutationEpoch === undefined ? {} : { mutationEpoch }),
+              startIdentity,
+              agentStart: { threaded },
+              onPreparedStartIdentity: undefined,
+              runOwnerGuard: { owner, reservationToken: recovery.token },
+            },
           );
           const summary = await scope.init.runtime.status(
             DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
@@ -1763,7 +1834,21 @@ export function createThreadAgentHost(
           url.pathname === `${AGENT_HOST_ROUTE_PREFIX}/start`
         ) {
           const body = await objectBody(request);
-          if ('resourceOwner' in body || 'requestedBy' in body) {
+          if (
+            'resourceOwner' in body ||
+            'requestedBy' in body ||
+            [
+              'mutationEpoch',
+              'startIdentity',
+              'agentStart',
+              'execution',
+              'tablePrefix',
+              'startToken',
+              'attemptToken',
+              'runOwnerGuard',
+              'onPreparedStartIdentity',
+            ].some((key) => Object.hasOwn(body, key))
+          ) {
             throw new AgentHostRequestError(
               400,
               'start owner and requester are derived from trusted provenance',

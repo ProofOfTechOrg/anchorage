@@ -197,7 +197,15 @@ The `do-runner` and `host-kit` entry points export identity and mutation-epoch h
 
 Invalid identity or epoch input throws the corresponding `INVALID_EXECUTION_IDENTITY` or `INVALID_MUTATION_EPOCH` error with status 400. An active epoch mismatch throws `MUTATION_EPOCH_MISMATCH` with status 409 and a `missing`, `stale`, or `future` classification. Malformed reading metadata remains `EXECUTION_FENCE_UNREADABLE` with status 503.
 
-`MUTATION_EPOCH_HEADER`, `mutationEpochFromHeader`, and `stampMutationEpoch` encode canonical decimal epochs for a trusted internal channel. Authenticate that channel before interpreting its header. The helpers do not add host forwarding or request enforcement; activation still requires final-write support from every writer.
+`MUTATION_EPOCH_HEADER`, `mutationEpochFromHeader`, and `stampMutationEpoch` encode canonical decimal epochs for a trusted internal channel. Authenticate that channel before interpreting its header. Host composition now forwards the captured epoch through the protected internal header and trusted agent bridge. This transport does not enforce the current epoch at a write; activation still requires final-write support from every writer.
+
+`createFlowsafeWorker()` accepts a numeric `mutationEpoch` or a synchronous environment callback. It captures the configuration source at construction and evaluates the callback once at fetch entry, before deployment checks, authentication, or body reads. Resolver and principal-context constructors accept a scalar epoch. Public requests cannot supply the protected header or start-authority fields in JSON.
+
+Workflow and agent starts retain the original actor, principal, epoch and selectors across body, policy and ownership waits. Context snapshots preserve declared host methods on their original receiver, including class-backed methods. Both Durable Object shells capture header strings before asynchronous deployment verification and interpret only those captured strings afterward.
+
+`RunnerRuntime.start()` accepts the trusted epoch, logical start identity, agent mode, prepared-identity callback and resource-owner guard. It captures their declared fields before waits but continues using v1 provenance and the existing state-only start predicate. It does not invoke the callback or automatically enter admission or repair scopes; the coordinated writer/recovery integration remains required.
+
+Economic-operation lists must contain an entry at every index. Start, resume and shared lifecycle parsing reject sparse lists with the existing lifecycle-format error instead of persisting null placeholders or silently dropping operations. Valid dense lists retain their existing validation and settlement behavior.
 
 ### Use explicit initial-admission scopes
 
