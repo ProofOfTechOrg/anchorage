@@ -8,7 +8,7 @@
 // row whose run is still readable — and each one asserts the EXPENSIVE
 // direction: that exactly one caller was told to start.
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   openSqlite,
@@ -16,6 +16,11 @@ import {
   sqliteUnitDatabase,
 } from '../../test-support/sqlite.js';
 import { doErrorResponse } from './do-error-response.js';
+import {
+  InvalidExecutionIdentityError,
+  RunAdmissionConflictError,
+  type StartExecutionIdentity,
+} from './execution-admission.js';
 import type { ExecutionFenceDatabase } from './execution-fence.js';
 import {
   ExecutionFencedError,
@@ -40,6 +45,7 @@ import {
   StartIdempotencyUnsupportedError,
   type StartReservation,
   StartReservationOwnerMismatchError,
+  type StartReservationReading,
   StartReservationTargetMismatchError,
   StartReservationUnreadableError,
   validateStartReservationAdmissionSchema,
@@ -47,6 +53,1115 @@ import {
 
 const OWNER = { kind: 'human', id: 'operator-1' } as const;
 const OTHER_OWNER = { kind: 'human', id: 'operator-2' } as const;
+
+describe('FS8 D2 dormant reservation primitives', () => {
+  const execution: StartExecutionIdentity = {
+    tablePrefix: '',
+    workflowId: 'payout',
+    runId: 'run',
+    startToken: 'generation',
+    owner: OWNER,
+    target: { kind: 'workflow', id: 'payout' },
+  };
+  const methods = [
+    'claimReservation',
+    'releaseReservation',
+    'associateReservation',
+    'bindPreparedStart',
+  ] as const;
+  type Method = (typeof methods)[number];
+
+  async function modern(state: 'reserved' | 'started' = 'reserved') {
+    const h = harness();
+    const reserved = await h.store.reserve(workflowRequest('key', 'run'));
+    expect(reserved.reservation.binding).toEqual({ kind: 'legacy' });
+    expect(rows(h.sqlite)[0]).toMatchObject(legacyBinding);
+    h.sqlite
+      .prepare(
+        "UPDATE flowsafe_start_idempotency SET state = ?, start_token = ''",
+      )
+      .run(state);
+    const observed = await h.store.readForAdmission('key');
+    if (!observed) throw new Error('modern fixture is missing');
+    return { ...h, observed };
+  }
+
+  function invoke(
+    store: StartIdempotencyStore,
+    method: Method,
+    observed: StartReservationReading,
+    identity = execution,
+  ) {
+    return method === 'claimReservation' || method === 'releaseReservation'
+      ? store[method](observed)
+      : store[method](observed, identity);
+  }
+
+  const stateFor = (method: Method) =>
+    method === 'claimReservation' ? 'reserved' : 'started';
+  const bindingFor = (identity = execution) => ({
+    kind: 'bound' as const,
+    execution: {
+      tablePrefix: identity.tablePrefix,
+      workflowId: identity.workflowId,
+      runId: identity.runId,
+      startToken: identity.startToken,
+    },
+  });
+
+  it('returns exactly one own claim receipt for simultaneous equal-stamp contenders', async () => {
+    const h = await modern();
+    const claims = await Promise.all([
+      h.store.claimReservation(h.observed),
+      new StartIdempotencyStore(h.binding, {
+        now: () => 1_000,
+      }).claimReservation(h.observed),
+    ]);
+    expect(claims.filter(Boolean)).toHaveLength(1);
+    const winner = claims.find(Boolean);
+    if (!winner) throw new Error('winning claim is missing');
+    expect(winner).toEqual({
+      ...h.observed,
+      state: 'started',
+      updatedAt: 1_001,
+    });
+    expect(Object.isFrozen(winner)).toBe(true);
+    expect(Object.isFrozen(winner?.owner)).toBe(true);
+    expect(Object.isFrozen(winner?.binding)).toBe(true);
+    expect(await h.store.releaseReservation(winner)).toBe(true);
+    expect(rows(h.sqlite)[0]).toMatchObject({
+      state: 'reserved',
+      updated_at: 1_002,
+    });
+  });
+
+  it('returns one successful release for simultaneous callers holding the same claim', async () => {
+    const h = await modern('started');
+    await expect(
+      Promise.all([
+        h.store.releaseReservation(h.observed),
+        h.store.releaseReservation(h.observed),
+      ]),
+    ).resolves.toEqual([true, false]);
+    expect(rows(h.sqlite)[0]).toMatchObject({
+      state: 'reserved',
+      updated_at: 1_001,
+    });
+  });
+
+  it.each([
+    1_000, 100,
+  ])('rejects stale release and claim observations through an ABA cycle at clock %s', async (clock) => {
+    const h = await modern();
+    const store = new StartIdempotencyStore(h.binding, { now: () => clock });
+    const first = await store.claimReservation(h.observed);
+    if (!first) throw new Error('first claim is missing');
+    expect(await store.releaseReservation(first)).toBe(true);
+    const released = await store.readForAdmission('key');
+    if (!released) throw new Error('released row is missing');
+    const second = await store.claimReservation(released);
+    if (!second) throw new Error('second claim is missing');
+    const before = rows(h.sqlite);
+    const staleRelease = await store
+      .releaseReservation(first)
+      .catch((error: unknown) => error);
+    expect(rows(h.sqlite)).toEqual(before);
+    expect(staleRelease).toBe(false);
+    expect(first.updatedAt).toBe(1_001);
+    expect(released.updatedAt).toBe(1_002);
+    expect(second.updatedAt).toBe(1_003);
+    expect(await store.claimReservation(h.observed)).toBeUndefined();
+    expect(await store.releaseReservation(second)).toBe(true);
+    const staleClaim = await store
+      .claimReservation(released)
+      .catch((error: unknown) => error);
+    expect(rows(h.sqlite)[0]).toMatchObject({
+      state: 'reserved',
+      updated_at: 1_004,
+    });
+    expect(staleClaim).toBeUndefined();
+  });
+
+  it.each([
+    'claimReservation',
+    'releaseReservation',
+  ] as const)('%s refuses invalid or exhausted clocks before preparing SQL', async (method) => {
+    const h = await modern(stateFor(method));
+    for (const [clock, updatedAt] of [
+      [Number.NaN, 1_000],
+      [Number.POSITIVE_INFINITY, 1_000],
+      [Number.NEGATIVE_INFINITY, 1_000],
+      [1_000, Number.MAX_VALUE],
+      [1_000, 2 ** 54],
+    ] as const) {
+      const prepare = vi.fn(h.binding.prepare.bind(h.binding));
+      const now = vi.fn(() => clock);
+      const store = new StartIdempotencyStore({ prepare }, { now });
+      await expect(
+        store[method]({ ...h.observed, updatedAt }),
+      ).rejects.toBeInstanceOf(StartReservationUnreadableError);
+      expect(now).toHaveBeenCalledTimes(1);
+      expect(prepare).not.toHaveBeenCalled();
+    }
+    const store = new StartIdempotencyStore(h.binding, { now: () => 1e100 });
+    h.sqlite
+      .prepare('UPDATE flowsafe_start_idempotency SET updated_at = ?')
+      .run(2 ** 54);
+    const outcome = await store[method]({ ...h.observed, updatedAt: 2 ** 54 });
+    expect(outcome).toBeTruthy();
+    expect(rows(h.sqlite)[0]?.updated_at).toBe(1e100);
+  });
+
+  it.each(
+    methods,
+  )('%s preserves every rewritten observation field before reporting a miss', async (method) => {
+    for (const change of [
+      "key = 'replacement'",
+      "run_id = 'replacement'",
+      "owner_kind = 'service'",
+      "owner_id = 'replacement'",
+      "target_kind = 'agent', thread_id = 'thread'",
+      "target_id = 'replacement'",
+      "thread_id = 'replacement'",
+      'created_at = created_at + 1',
+      'updated_at = updated_at + 1',
+      "state = 'terminal'",
+    ]) {
+      const h = await modern(stateFor(method));
+      h.sqlite.exec(`UPDATE flowsafe_start_idempotency SET ${change}`);
+      const before = rows(h.sqlite);
+      const outcome = await invoke(h.store, method, h.observed).catch(
+        (error: unknown) => error,
+      );
+      expect(rows(h.sqlite), change).toEqual(before);
+      if (method === 'claimReservation')
+        expect(outcome, change).toBeUndefined();
+      else if (method === 'releaseReservation')
+        expect(outcome, change).toBe(false);
+      else if (
+        method === 'associateReservation' &&
+        change.startsWith('thread_id')
+      )
+        expect(outcome).toBeInstanceOf(StartReservationUnreadableError);
+      else expect(outcome, change).toBeInstanceOf(RunAdmissionConflictError);
+    }
+  });
+
+  it.each(
+    methods,
+  )('%s preserves each independently changed unbound column before reporting failure', async (method) => {
+    for (const change of [
+      "start_token = 'other'",
+      "start_table_prefix = ''",
+      "start_workflow_id = 'payout'",
+      'start_token = NULL',
+    ]) {
+      const h = await modern(stateFor(method));
+      h.sqlite.exec(`UPDATE flowsafe_start_idempotency SET ${change}`);
+      const before = rows(h.sqlite);
+      const outcome = await invoke(h.store, method, h.observed).catch(
+        (error: unknown) => error,
+      );
+      expect(rows(h.sqlite), change).toEqual(before);
+      if (method === 'claimReservation') expect(outcome).toBeUndefined();
+      else if (method === 'releaseReservation') expect(outcome).toBe(false);
+      else
+        expect(outcome).toBeInstanceOf(
+          method === 'associateReservation' && change !== 'start_token = NULL'
+            ? StartReservationUnreadableError
+            : RunAdmissionConflictError,
+        );
+    }
+  });
+
+  it.each(
+    methods,
+  )('%s refuses legacy, bound, terminal and wrong-state observations before I/O', async (method) => {
+    const h = await modern(stateFor(method));
+    const prepare = vi.fn(h.binding.prepare.bind(h.binding));
+    const store = new StartIdempotencyStore({ prepare });
+    const invalid: StartReservationReading[] = [
+      { ...h.observed, binding: { kind: 'legacy' } },
+      {
+        ...h.observed,
+        binding: bindingFor(),
+      },
+      { ...h.observed, state: 'terminal' },
+      { ...h.observed, key: 'bad/key' },
+      { ...h.observed, targetId: 'bad/target' },
+      { ...h.observed, createdAt: Number.NaN },
+      { ...h.observed, updatedAt: Number.POSITIVE_INFINITY },
+    ];
+    if (method !== 'associateReservation')
+      invalid.push({
+        ...h.observed,
+        state: method === 'claimReservation' ? 'started' : 'reserved',
+      });
+    for (const observed of invalid)
+      await expect(invoke(store, method, observed)).rejects.toBeInstanceOf(
+        InvalidExecutionIdentityError,
+      );
+    expect(prepare).not.toHaveBeenCalled();
+  });
+
+  it.each(
+    methods,
+  )('%s captures caller getters, nested identities and clock before held schema I/O', async (method) => {
+    const h = await modern(stateFor(method));
+    let resume!: () => void;
+    const held = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    const original = structuredClone(h.observed);
+    const identity = structuredClone(execution);
+    const counts = new Map<string, number>();
+    function getters<T extends object>(source: T, prefix: string): T {
+      return Object.defineProperties(
+        {},
+        Object.fromEntries(
+          Object.keys(source).map((key) => [
+            key,
+            {
+              enumerable: true,
+              get() {
+                const name = `${prefix}.${key}`;
+                counts.set(name, (counts.get(name) ?? 0) + 1);
+                return source[key as keyof T];
+              },
+            },
+          ]),
+        ),
+      ) as T;
+    }
+    const observationSource = {
+      ...original,
+      owner: getters(original.owner, 'owner'),
+      binding: getters(original.binding, 'binding'),
+    };
+    const observation = getters(observationSource, 'reservation');
+    const executionSource = {
+      ...identity,
+      owner: getters(identity.owner, 'execution.owner'),
+      target: getters(identity.target, 'execution.target'),
+    };
+    const supplied = getters(executionSource, 'execution');
+    let clock = 2_000;
+    const now = vi.fn(() => clock);
+    const store = new StartIdempotencyStore(
+      interceptReservations(h.binding, async (sql, execute) => {
+        if (sql.startsWith('PRAGMA')) await held;
+        return execute();
+      }),
+      { now },
+    );
+    const operation = invoke(store, method, observation, supplied);
+    Object.assign(original.owner, { kind: 'service', id: 'changed' });
+    Object.assign(original.binding, { kind: 'legacy' });
+    Object.assign(identity.owner, { kind: 'service', id: 'changed' });
+    Object.assign(identity.target, {
+      kind: 'agent',
+      id: 'changed',
+      threadId: 'changed',
+    });
+    Object.assign(observationSource, {
+      key: 'changed',
+      runId: 'changed',
+      targetKind: 'agent',
+      targetId: 'changed',
+      threadId: 'changed',
+      state: 'terminal',
+      createdAt: 77,
+      updatedAt: 88,
+    });
+    Object.assign(executionSource, {
+      workflowId: 'changed',
+      runId: 'changed',
+      startToken: 'changed',
+      tablePrefix: 'changed_',
+    });
+    clock = 9_000;
+    resume();
+    await expect(operation).resolves.toBeTruthy();
+    expect(rows(h.sqlite)[0]).toMatchObject({
+      owner_id: OWNER.id,
+      target_id: 'payout',
+      updated_at:
+        method === 'claimReservation' || method === 'releaseReservation'
+          ? 2_000
+          : 1_000,
+      start_token:
+        method === 'claimReservation' || method === 'releaseReservation'
+          ? ''
+          : 'generation',
+    });
+    expect([...counts.values()].every((count) => count === 1)).toBe(true);
+    expect(now).toHaveBeenCalledTimes(
+      method === 'claimReservation' || method === 'releaseReservation' ? 1 : 0,
+    );
+  });
+
+  it.each([
+    'claimReservation',
+    'releaseReservation',
+  ] as const)('%s never recovers or retries a thrown UPDATE', async (method) => {
+    for (const executeFirst of [false, true]) {
+      const h = await modern(stateFor(method));
+      const sqlSeen: string[] = [];
+      const cause = new Error('lost response');
+      const store = new StartIdempotencyStore(
+        interceptReservations(h.binding, async (sql, execute) => {
+          sqlSeen.push(sql);
+          if (sql.startsWith('UPDATE')) {
+            if (executeFirst) await execute();
+            else if (method === 'claimReservation')
+              await h.store.claimReservation(h.observed);
+            throw cause;
+          }
+          return execute();
+        }),
+        { now: () => 1_000 },
+      );
+      await expect(store[method](h.observed)).rejects.toMatchObject({ cause });
+      expect(sqlSeen.filter((sql) => sql.startsWith('UPDATE'))).toHaveLength(1);
+      expect(sqlSeen.some((sql) => sql.startsWith('SELECT'))).toBe(false);
+      expect(rows(h.sqlite)[0]).toMatchObject({
+        state:
+          executeFirst && method === 'releaseReservation'
+            ? 'reserved'
+            : 'started',
+        updated_at:
+          executeFirst || method === 'claimReservation' ? 1_001 : 1_000,
+      });
+    }
+  });
+
+  it('preserves a bound row when a delayed old release arrives', async () => {
+    const h = await modern('started');
+    await h.store.bindPreparedStart(h.observed, execution);
+    const before = rows(h.sqlite);
+    const outcome = await h.store
+      .releaseReservation(h.observed)
+      .catch((error: unknown) => error);
+    expect(rows(h.sqlite)).toEqual(before);
+    expect(outcome).toBe(false);
+  });
+
+  it.each([
+    'associateReservation',
+    'bindPreparedStart',
+  ] as const)('%s binds canonical D1 and explicit custom namespaces without clock or snapshot access', async (method) => {
+    for (const tablePrefix of ['', 'APP_', null]) {
+      const h = await modern('started');
+      const now = vi.fn(() => {
+        throw new Error('binding must not read a clock');
+      });
+      const queries: string[] = [];
+      const store = new StartIdempotencyStore(
+        interceptReservations(h.binding, async (sql, execute) => {
+          queries.push(sql);
+          return execute();
+        }),
+        { now },
+      );
+      await expect(
+        store[method](h.observed, { ...execution, tablePrefix }),
+      ).resolves.toEqual({
+        ...h.observed,
+        binding: bindingFor({
+          ...execution,
+          tablePrefix: tablePrefix?.toLowerCase() ?? null,
+        }),
+      });
+      expect(now).not.toHaveBeenCalled();
+      expect(queries).toHaveLength(2);
+      expect(queries[0]).toContain(
+        'PRAGMA table_xinfo(flowsafe_start_idempotency)',
+      );
+      expect(queries[1]).toContain('UPDATE flowsafe_start_idempotency');
+    }
+  });
+
+  it.each([
+    'associateReservation',
+    'bindPreparedStart',
+  ] as const)('%s validates root introduction in owner-first order while permitting agent wrappers', async (method) => {
+    const h = await modern('started');
+    const prepare = vi.fn(h.binding.prepare.bind(h.binding));
+    const store = new StartIdempotencyStore({ prepare });
+    const cases: Array<
+      [
+        StartExecutionIdentity,
+        (
+          | typeof StartReservationOwnerMismatchError
+          | typeof StartReservationTargetMismatchError
+          | typeof InvalidExecutionIdentityError
+        ),
+      ]
+    > = [
+      [
+        {
+          ...execution,
+          owner: OTHER_OWNER,
+          target: { kind: 'workflow', id: 'other' },
+        },
+        StartReservationOwnerMismatchError,
+      ],
+      [
+        { ...execution, target: { kind: 'workflow', id: 'other' } },
+        StartReservationTargetMismatchError,
+      ],
+      [
+        {
+          ...execution,
+          target: { kind: 'agent', id: 'payout', threadId: 'thread' },
+        },
+        StartReservationTargetMismatchError,
+      ],
+      [{ ...execution, runId: 'other' }, InvalidExecutionIdentityError],
+      [{ ...execution, workflowId: 'child' }, InvalidExecutionIdentityError],
+    ];
+    for (const [identity, error] of cases)
+      await expect(store[method](h.observed, identity)).rejects.toBeInstanceOf(
+        error,
+      );
+    expect(prepare).not.toHaveBeenCalled();
+    h.sqlite.exec(
+      "UPDATE flowsafe_start_idempotency SET target_kind = 'agent', thread_id = 'thread'",
+    );
+    const observed = await h.store.readForAdmission('key');
+    if (!observed) throw new Error('agent reservation is missing');
+    const agent: StartExecutionIdentity = {
+      ...execution,
+      workflowId: 'trusted-wrapper',
+      target: { kind: 'agent', id: 'payout', threadId: 'thread' },
+    };
+    await expect(
+      store[method](observed, {
+        ...agent,
+        target: { ...agent.target, threadId: 'other' },
+      } as StartExecutionIdentity),
+    ).rejects.toBeInstanceOf(InvalidExecutionIdentityError);
+    expect(prepare).not.toHaveBeenCalled();
+    await expect(store[method](observed, agent)).resolves.toMatchObject({
+      binding: bindingFor(agent),
+    });
+  });
+
+  it.each([
+    'reserved',
+    'started',
+    'terminal',
+  ] as const)('alias lost-receipt convergence accepts S1 %s advancement without restamping', async (state) => {
+    const h = await modern();
+    const queries: string[] = [];
+    const store = new StartIdempotencyStore(
+      interceptReservations(h.binding, async (sql, execute) => {
+        queries.push(sql);
+        const result = await execute();
+        if (sql.startsWith('UPDATE')) {
+          h.sqlite
+            .prepare(
+              'UPDATE flowsafe_start_idempotency SET state = ?, updated_at = ?',
+            )
+            .run(state, 4_000);
+          throw new Error('lost alias receipt');
+        }
+        return result;
+      }),
+      { now: () => 9_000 },
+    );
+    await expect(
+      store.associateReservation(h.observed, execution),
+    ).resolves.toEqual({
+      ...h.observed,
+      state,
+      updatedAt: 4_000,
+      binding: bindingFor(),
+    });
+    expect(rows(h.sqlite)[0]?.updated_at).toBe(4_000);
+    expect(queries.filter((sql) => sql.startsWith('UPDATE'))).toHaveLength(1);
+    expect(queries.filter((sql) => sql.startsWith('SELECT'))).toHaveLength(1);
+  });
+
+  it('associates the same S1 result after its snapshot disappears without reading a replacement result', async () => {
+    const h = await modern();
+    h.sqlite.exec('CREATE TABLE result_fixture (token TEXT, result TEXT)');
+    h.sqlite
+      .prepare('INSERT INTO result_fixture VALUES (?, ?)')
+      .run('generation', 'original-result');
+    const readResult = vi.fn(() =>
+      h.sqlite.prepare('SELECT * FROM result_fixture').get(),
+    );
+    const found = readResult();
+    h.sqlite.exec(
+      "DELETE FROM result_fixture; INSERT INTO result_fixture VALUES ('replacement', 'replacement-result')",
+    );
+    const queries: string[] = [];
+    const store = new StartIdempotencyStore(
+      interceptReservations(h.binding, async (sql, execute) => {
+        queries.push(sql);
+        return execute();
+      }),
+    );
+    await expect(
+      store.associateReservation(h.observed, execution),
+    ).resolves.toMatchObject({ binding: bindingFor() });
+    expect(found).toEqual({ token: 'generation', result: 'original-result' });
+    expect(readResult).toHaveBeenCalledTimes(1);
+    expect(queries).toHaveLength(2);
+    expect(rows(h.sqlite)[0]?.updated_at).toBe(h.observed.updatedAt);
+  });
+
+  it.each([
+    'known-zero',
+    'lost-receipt',
+  ] as const)('alias %s converges only the same immutable identity and complete binding', async (mode) => {
+    for (const change of [
+      '',
+      "start_token = 'replacement'",
+      "start_table_prefix = 'other_'",
+      "start_workflow_id = 'other'",
+      "owner_id = 'other'",
+      'created_at = created_at + 1',
+      "start_token = '', start_table_prefix = NULL, start_workflow_id = NULL",
+      'start_token = NULL, start_table_prefix = NULL, start_workflow_id = NULL',
+      'DELETE',
+      'DROP',
+      "thread_id = 'bad/thread'",
+    ]) {
+      const h = await modern('started');
+      const cause = new Error('lost alias write');
+      let reads = 0;
+      const store = new StartIdempotencyStore(
+        interceptReservations(h.binding, async (sql, execute) => {
+          if (sql.startsWith('SELECT')) reads += 1;
+          if (!sql.startsWith('UPDATE')) return execute();
+          await execute();
+          if (change === 'DELETE')
+            h.sqlite.exec('DELETE FROM flowsafe_start_idempotency');
+          else if (change === 'DROP')
+            h.sqlite.exec('DROP TABLE flowsafe_start_idempotency');
+          else if (change)
+            h.sqlite.exec(`UPDATE flowsafe_start_idempotency SET ${change}`);
+          if (mode === 'lost-receipt') throw cause;
+          return { results: [] };
+        }),
+      );
+      if (!change)
+        await expect(
+          store.associateReservation(h.observed, execution),
+        ).resolves.toMatchObject({ binding: bindingFor() });
+      else if (mode === 'lost-receipt')
+        await expect(
+          store.associateReservation(h.observed, execution),
+        ).rejects.toMatchObject({ cause });
+      else
+        await expect(
+          store.associateReservation(h.observed, execution),
+        ).rejects.toBeInstanceOf(
+          change === 'DROP' || change.startsWith('thread_id')
+            ? StartReservationUnreadableError
+            : RunAdmissionConflictError,
+        );
+      expect(reads).toBe(1);
+    }
+  });
+
+  it('prepared known-zero never reads back another caller claim', async () => {
+    const h = await modern('started');
+    await h.store.bindPreparedStart(h.observed, execution);
+    const queries: string[] = [];
+    const store = new StartIdempotencyStore(
+      interceptReservations(h.binding, async (sql, execute) => {
+        queries.push(sql);
+        return execute();
+      }),
+    );
+    await expect(
+      store.bindPreparedStart(h.observed, execution),
+    ).rejects.toBeInstanceOf(RunAdmissionConflictError);
+    expect(queries.some((sql) => sql.startsWith('SELECT'))).toBe(false);
+    expect(queries.filter((sql) => sql.startsWith('UPDATE'))).toHaveLength(1);
+  });
+
+  it.each([
+    '',
+    "state = 'terminal'",
+    "state = 'reserved'",
+    'updated_at = updated_at + 1',
+    'created_at = created_at + 1',
+    "start_token = 'other'",
+    "start_table_prefix = 'other_'",
+    "start_workflow_id = 'other'",
+    "owner_id = 'other'",
+    "target_id = 'other'",
+    "run_id = 'other'",
+  ])('prepared lost-receipt readback requires the exact original claim: %s', async (change) => {
+    const h = await modern('started');
+    const cause = new Error('lost prepared receipt');
+    const store = new StartIdempotencyStore(
+      interceptReservations(h.binding, async (sql, execute) => {
+        const result = await execute();
+        if (sql.startsWith('UPDATE')) {
+          if (change)
+            h.sqlite.exec(`UPDATE flowsafe_start_idempotency SET ${change}`);
+          throw cause;
+        }
+        return result;
+      }),
+    );
+    if (change)
+      await expect(
+        store.bindPreparedStart(h.observed, execution),
+      ).rejects.toMatchObject({ cause });
+    else
+      await expect(
+        store.bindPreparedStart(h.observed, execution),
+      ).resolves.toEqual({ ...h.observed, binding: bindingFor() });
+  });
+
+  it.each(
+    methods,
+  )('%s rejects malformed RETURNING envelopes without readback', async (method) => {
+    const corruptions: Array<
+      [string, (row: Record<string, unknown>) => unknown]
+    > = [
+      ['failed', (row) => ({ success: false, results: [row] })],
+      ['missing results', () => ({ meta: { changes: 1 } })],
+      ['nonarray', (row) => ({ results: { 0: row, length: 1 } })],
+      ['sparse', () => ({ results: new Array(1) })],
+      [
+        'inherited',
+        (row) => ({
+          results: Object.setPrototypeOf(
+            new Array(1),
+            Object.assign(Object.create(Array.prototype), { 0: row }),
+          ),
+        }),
+      ],
+      [
+        'iterator',
+        (row) => ({
+          results: Object.assign([null], {
+            *[Symbol.iterator]() {
+              yield row;
+            },
+          }),
+        }),
+      ],
+      ['multiple', (row) => ({ results: [row, row] })],
+      [
+        'missing column',
+        (row) => ({
+          results: [
+            Object.fromEntries(
+              Object.entries(row).filter(([key]) => key !== 'created_at'),
+            ),
+          ],
+        }),
+      ],
+      ...Object.entries({
+        key: 'other',
+        run_id: 'other',
+        owner_id: 'other',
+        target_id: 'other',
+        created_at: 2,
+        updated_at: 2,
+        state: 'terminal',
+        start_token: 'other',
+        target_kind: 'unknown',
+        thread_id: 'bad/thread',
+      }).map(
+        ([key, value]) =>
+          [
+            key,
+            (row: Record<string, unknown>) => ({
+              results: [{ ...row, [key]: value }],
+            }),
+          ] as [string, (row: Record<string, unknown>) => unknown],
+      ),
+    ];
+    for (const [name, corrupt] of corruptions) {
+      const h = await modern(stateFor(method));
+      let reads = 0;
+      const store = new StartIdempotencyStore(
+        interceptReservations(h.binding, async (sql, execute) => {
+          if (sql.startsWith('SELECT')) reads += 1;
+          const result = (await execute()) as {
+            results: Array<Record<string, unknown>>;
+          };
+          if (!sql.startsWith('UPDATE')) return result;
+          const row = result.results[0];
+          if (!row) throw new Error('successful mutation row is missing');
+          return corrupt(row);
+        }),
+        { now: () => 1_000 },
+      );
+      await expect(
+        invoke(store, method, h.observed),
+        name,
+      ).rejects.toBeInstanceOf(StartReservationUnreadableError);
+      expect(reads, name).toBe(0);
+    }
+  });
+
+  it.each(
+    methods,
+  )('%s captures each successful RETURNING field once', async (method) => {
+    const h = await modern(stateFor(method));
+    const counts = new Map<string, number>();
+    const once = (key: string, value: unknown) => ({
+      get() {
+        const count = (counts.get(key) ?? 0) + 1;
+        counts.set(key, count);
+        if (count > 1) throw new Error(`reread ${key}`);
+        return value;
+      },
+      enumerable: true,
+    });
+    const store = new StartIdempotencyStore(
+      interceptReservations(h.binding, async (sql, execute) => {
+        const result = (await execute()) as {
+          results: Array<Record<string, unknown>>;
+        };
+        if (!sql.startsWith('UPDATE')) return result;
+        const returnedRow = result.results[0];
+        if (!returnedRow) throw new Error('successful mutation row is missing');
+        const row = Object.defineProperties(
+          {},
+          Object.fromEntries(
+            Object.entries(returnedRow).map(([key, value]) => [
+              key,
+              once(key, value),
+            ]),
+          ),
+        );
+        const returned: unknown[] = [];
+        Object.defineProperty(returned, 0, once('slot', row));
+        return Object.defineProperties(
+          {},
+          {
+            success: once('success', true),
+            results: once('results', returned),
+          },
+        );
+      }),
+      { now: () => 1_000 },
+    );
+    await expect(invoke(store, method, h.observed)).resolves.toBeTruthy();
+    expect(counts.size).toBe(16);
+    expect([...counts.values()].every((count) => count === 1)).toBe(true);
+  });
+
+  it.each(
+    methods,
+  )('%s requires the current schema without running readiness', async (method) => {
+    for (const stage of [0, 1, 2, 3, -1]) {
+      const h = await modern(stateFor(method));
+      if (stage === -1) h.sqlite.exec('DROP TABLE flowsafe_start_idempotency');
+      else if (stage < 3)
+        for (const column of bindingColumns.slice(stage).reverse())
+          h.sqlite.exec(
+            `ALTER TABLE flowsafe_start_idempotency DROP COLUMN ${column}`,
+          );
+      else
+        h.sqlite.exec(
+          'ALTER TABLE flowsafe_start_idempotency ADD COLUMN unexpected TEXT',
+        );
+      const ready = vi.fn(async () => {});
+      const queries: string[] = [];
+      const store = new StartIdempotencyStore(
+        interceptReservations(h.binding, async (sql, execute) => {
+          queries.push(sql);
+          return execute();
+        }),
+        { ready, now: () => 1_000 },
+      );
+      await expect(invoke(store, method, h.observed)).rejects.toBeInstanceOf(
+        StartReservationUnreadableError,
+      );
+      expect(ready).not.toHaveBeenCalled();
+      expect(queries).toHaveLength(1);
+      expect(queries[0]).toMatch(/^PRAGMA/);
+    }
+  });
+
+  it('settles both aliases of one full execution and preserves every neighboring execution before checking outcome', async () => {
+    const h = await modern('started');
+    await h.store.bindPreparedStart(h.observed, execution);
+    const insert = h.sqlite.prepare(
+      `INSERT INTO flowsafe_start_idempotency SELECT ?, owner_kind, owner_id, target_kind, target_id, run_id, thread_id, state, created_at, updated_at, start_token, start_table_prefix, start_workflow_id FROM flowsafe_start_idempotency WHERE key = 'key'`,
+    );
+    insert.run('alias');
+    const neighbors = [
+      "run_id = 'other'",
+      "start_token = 'other'",
+      "start_table_prefix = 'other_'",
+      'start_table_prefix = NULL',
+      "start_workflow_id = 'other'",
+      "owner_kind = 'service'",
+      "owner_id = 'other'",
+      "target_kind = 'agent', thread_id = 'thread'",
+      "target_id = 'other'",
+      "thread_id = 'other'",
+      "start_token = '', start_table_prefix = NULL, start_workflow_id = NULL",
+      'start_token = NULL, start_table_prefix = NULL, start_workflow_id = NULL',
+    ];
+    for (const [index, change] of neighbors.entries()) {
+      insert.run(`neighbor-${index}`);
+      h.sqlite.exec(
+        `UPDATE flowsafe_start_idempotency SET ${change} WHERE key = 'neighbor-${index}'`,
+      );
+    }
+    const before = rows(h.sqlite).filter((row) =>
+      String(row.key).startsWith('neighbor-'),
+    );
+    const store = new StartIdempotencyStore(h.binding, { now: () => 500 });
+    const outcome = await store
+      .settleExecution(execution)
+      .catch((error: unknown) => error);
+    expect(
+      rows(h.sqlite).filter((row) => String(row.key).startsWith('neighbor-')),
+    ).toEqual(before);
+    expect(outcome).toBe(2);
+    expect(
+      rows(h.sqlite).filter((row) => row.key === 'key' || row.key === 'alias'),
+    ).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          key: 'key',
+          state: 'terminal',
+          updated_at: 500,
+        }),
+        expect.objectContaining({
+          key: 'alias',
+          state: 'terminal',
+          updated_at: 500,
+        }),
+      ]),
+    );
+    expect(
+      await new StartIdempotencyStore(h.binding, {
+        now: () => 9_000,
+      }).settleExecution(execution),
+    ).toBe(0);
+    expect(rows(h.sqlite)[0]?.updated_at).toBe(500);
+  });
+
+  it('settles explicit null and inherited child identities without a root classifier', async () => {
+    const h = await modern('started');
+    h.sqlite.exec(
+      "UPDATE flowsafe_start_idempotency SET start_token = 'generation', start_workflow_id = 'child'",
+    );
+    const inherited = { ...execution, workflowId: 'child', tablePrefix: null };
+    expect(
+      await h.store.settleExecution({ ...inherited, tablePrefix: '' }),
+    ).toBe(0);
+    expect(await h.store.settleExecution(inherited)).toBe(1);
+    expect(rows(h.sqlite)[0]).toMatchObject({
+      state: 'terminal',
+      start_table_prefix: null,
+      start_workflow_id: 'child',
+    });
+  });
+
+  it('settlement captures its execution and finite clock before I/O and permits only genuine table absence', async () => {
+    const h = await modern('started');
+    await h.store.bindPreparedStart(h.observed, execution);
+    let resume!: () => void;
+    const held = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    const identity = structuredClone(execution);
+    let clock = 3_000;
+    const store = new StartIdempotencyStore(
+      interceptReservations(h.binding, async (sql, execute) => {
+        if (sql.startsWith('PRAGMA')) await held;
+        return execute();
+      }),
+      { now: () => clock },
+    );
+    const settling = store.settleExecution(identity);
+    Object.assign(identity, { workflowId: 'other', startToken: 'other' });
+    Object.assign(identity.owner, { id: 'other' });
+    Object.assign(identity.target, { id: 'other' });
+    clock = 9_000;
+    resume();
+    await expect(settling).resolves.toBe(1);
+    expect(rows(h.sqlite)[0]?.updated_at).toBe(3_000);
+    const prepare = vi.fn(h.binding.prepare.bind(h.binding));
+    await expect(
+      new StartIdempotencyStore(
+        { prepare },
+        { now: () => Number.NaN },
+      ).settleExecution(execution),
+    ).rejects.toBeInstanceOf(StartReservationUnreadableError);
+    expect(prepare).not.toHaveBeenCalled();
+    for (const stage of [0, 1, 2])
+      await expect(
+        schemaHarness(stage).store.settleExecution(execution),
+      ).rejects.toBeInstanceOf(StartReservationUnreadableError);
+    expect(await harness().store.settleExecution(execution)).toBe(0);
+    for (const root of [true, false]) {
+      const missing = new Error('no such table: flowsafe_start_idempotency');
+      const cause = root
+        ? new Error('wrapper', { cause: missing })
+        : new Error(missing.message, { cause: new Error('transport') });
+      const broken = new StartIdempotencyStore(
+        interceptReservations(h.binding, async () => {
+          throw cause;
+        }),
+      );
+      if (root)
+        await expect(broken.settleExecution(execution)).resolves.toBe(0);
+      else
+        await expect(broken.settleExecution(execution)).rejects.toMatchObject({
+          cause,
+        });
+    }
+  });
+
+  it.each([
+    'associateReservation',
+    'bindPreparedStart',
+  ] as const)('%s retains the original thrown write cause when its row is absent or readback fails', async (method) => {
+    for (const mode of ['unbound', 'absent', 'dropped', 'read-error']) {
+      const h = await modern('started');
+      const cause = new Error('write response unavailable');
+      let reads = 0;
+      let updates = 0;
+      const store = new StartIdempotencyStore(
+        interceptReservations(h.binding, async (sql, execute) => {
+          if (sql.startsWith('UPDATE')) {
+            updates += 1;
+            if (mode === 'absent')
+              h.sqlite.exec('DELETE FROM flowsafe_start_idempotency');
+            if (mode === 'dropped')
+              h.sqlite.exec('DROP TABLE flowsafe_start_idempotency');
+            throw cause;
+          }
+          if (sql.startsWith('SELECT')) {
+            reads += 1;
+            if (mode === 'read-error') throw new Error('readback failed');
+          }
+          return execute();
+        }),
+      );
+      await expect(store[method](h.observed, execution)).rejects.toMatchObject({
+        cause,
+      });
+      expect(updates).toBe(1);
+      expect(reads).toBe(1);
+    }
+  });
+
+  it.each([
+    ...methods,
+    'settleExecution' as const,
+  ])('%s handles a table disappearing after schema validation without recreating it', async (method) => {
+    const h = await modern(
+      method === 'claimReservation' ? 'reserved' : 'started',
+    );
+    const store = new StartIdempotencyStore(
+      interceptReservations(h.binding, async (sql, execute) => {
+        if (sql.startsWith('UPDATE'))
+          h.sqlite.exec('DROP TABLE flowsafe_start_idempotency');
+        return execute();
+      }),
+    );
+    const operation =
+      method === 'settleExecution'
+        ? store.settleExecution(execution)
+        : invoke(store, method, h.observed);
+    if (method === 'settleExecution') await expect(operation).resolves.toBe(0);
+    else
+      await expect(operation).rejects.toBeInstanceOf(
+        StartReservationUnreadableError,
+      );
+    expect(
+      h.sqlite
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .all(),
+    ).toEqual([]);
+  });
+
+  it.each([
+    'duplicate',
+    'foreign',
+    'timestamp',
+    'sparse',
+    'failed',
+    'throw',
+  ] as const)('settlement rejects %s responses without recovery or restamping on retry', async (mode) => {
+    const h = await modern('started');
+    await h.store.bindPreparedStart(h.observed, execution);
+    const queries: string[] = [];
+    const store = new StartIdempotencyStore(
+      interceptReservations(h.binding, async (sql, execute) => {
+        queries.push(sql);
+        const result = (await execute()) as {
+          results: Array<Record<string, unknown>>;
+        };
+        if (!sql.startsWith('UPDATE')) return result;
+        const row = result.results[0];
+        if (!row) throw new Error('settlement row is missing');
+        if (mode === 'throw') throw new Error('lost settlement response');
+        if (mode === 'failed') return { success: false, results: [row] };
+        if (mode === 'sparse') return { results: new Array(1) };
+        return {
+          results:
+            mode === 'duplicate'
+              ? [row, row]
+              : [
+                  {
+                    ...row,
+                    [mode === 'foreign' ? 'start_token' : 'updated_at']:
+                      mode === 'foreign' ? 'other' : 99,
+                  },
+                ],
+        };
+      }),
+      { now: () => 2_000 },
+    );
+    await expect(store.settleExecution(execution)).rejects.toBeInstanceOf(
+      StartReservationUnreadableError,
+    );
+    expect(queries.some((sql) => sql.startsWith('SELECT'))).toBe(false);
+    expect(await h.store.settleExecution(execution)).toBe(0);
+    expect(rows(h.sqlite)[0]?.updated_at).toBe(2_000);
+  });
+
+  it('keeps modern primitives dormant during ordinary start replay rollback and terminal flows', async () => {
+    const h = harness();
+    const spies = [...methods, 'settleExecution' as const].map((method) =>
+      vi.spyOn(h.store, method),
+    );
+    const request = workflowRequest('key', 'run');
+    await expect(
+      beginIdempotentStart(h.store, request, EMPTY_SURFACE),
+    ).resolves.toMatchObject({ kind: 'start' });
+    expect(await h.store.release('key', 'run')).toBe(true);
+    await expect(
+      beginIdempotentStart(h.store, request, EMPTY_SURFACE),
+    ).resolves.toMatchObject({ kind: 'start' });
+    await expect(
+      beginIdempotentStart(h.store, request, {
+        ...EMPTY_SURFACE,
+        persisted: async () => 'done',
+      }),
+    ).resolves.toMatchObject({ kind: 'replay', persisted: 'done' });
+    expect(await h.store.settleRun('run')).toBe(1);
+    h.sqlite.exec(
+      'UPDATE flowsafe_start_idempotency SET created_at = 100, updated_at = -0.5',
+    );
+    expect((await h.store.read('key'))?.updatedAt).toBe(-0.5);
+    expect(rows(h.sqlite)[0]).toMatchObject(legacyBinding);
+    for (const spy of spies) {
+      expect(spy).not.toHaveBeenCalled();
+      spy.mockRestore();
+    }
+  });
+});
 
 describe('strict initial-admission reservation observations', () => {
   it.each([

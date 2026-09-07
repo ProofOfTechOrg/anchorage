@@ -86,20 +86,45 @@
 
 import {
   EXECUTION_PRINCIPAL_KINDS,
-  type ExecutionPrincipalKind,
   isExecutionPrincipalId,
   isExecutionPrincipalKind,
 } from '../approval-api/principal-identity.js';
 import { missingTableReadsEmpty } from './cause-chain.js';
 import { DoStatusError } from './do-status-error.js';
 import {
+  InvalidExecutionIdentityError,
   normalizeRunExecutionIdentity,
+  normalizeStartExecutionIdentity,
   normalizeStartIdentity,
-  type RunExecutionIdentity,
+  RunAdmissionConflictError,
+  type StartExecutionIdentity,
 } from './execution-admission.js';
 import type { ExecutionFenceWiring } from './execution-fence.js';
 import { isExecutionFenceRefusal } from './execution-fence.js';
 import { isPathSafeId } from './path-safe-id.js';
+import {
+  captureReservation,
+  START_RESERVATION_STATES,
+  START_TARGET_KINDS,
+  type StartReservation,
+  type StartReservationBinding,
+  type StartReservationOwner,
+  type StartReservationReading,
+  type StartReservationState,
+  type StartTargetKind,
+  sameReservationIdentity,
+} from './start-reservation-contract.js';
+
+export {
+  START_RESERVATION_STATES,
+  START_TARGET_KINDS,
+  type StartReservation,
+  type StartReservationBinding,
+  type StartReservationOwner,
+  type StartReservationReading,
+  type StartReservationState,
+  type StartTargetKind,
+} from './start-reservation-contract.js';
 
 /**
  * The reservation table — flowsafe-owned, so outside the `mastra_%` schema
@@ -110,81 +135,6 @@ import { isPathSafeId } from './path-safe-id.js';
  * indistinguishable from an empty one.
  */
 export const START_IDEMPOTENCY_TABLE = 'flowsafe_start_idempotency';
-
-export const START_RESERVATION_STATES = [
-  'reserved',
-  'started',
-  'terminal',
-] as const;
-
-/**
- * Where a reservation is in its life:
- *
- *   reserved  the key means this runId, and nobody has started it yet
- *   started   one caller won the claim and is (or was) executing
- *   terminal  the run reached a terminal state; the key is spent
- *
- * The states only ever move forward, with ONE exception: a start refused by the
- * execution fence rolls `started` back to `reserved` (see `release`), because a
- * fence refusal is the one failure that provably executed nothing.
- */
-export type StartReservationState = (typeof START_RESERVATION_STATES)[number];
-
-export const START_TARGET_KINDS = ['workflow', 'agent'] as const;
-
-/** Which execution family a key names — a workflow run, or an agent run. */
-export type StartTargetKind = (typeof START_TARGET_KINDS)[number];
-
-/**
- * WHO a key belongs to. An execution principal, projected to the same two
- * fields `ResourceOwner` carries, and for the same reason: a key is a
- * capability to converge on somebody's run, so it must be scoped to whoever
- * created it and unforgeable from tenant traffic.
- */
-export interface StartReservationOwner {
-  readonly kind: ExecutionPrincipalKind;
-  readonly id: string;
-}
-
-/** One reservation row, as every surface reads it. */
-export interface StartReservation {
-  readonly key: string;
-  readonly owner: StartReservationOwner;
-  readonly targetKind: StartTargetKind;
-  readonly targetId: string;
-  readonly runId: string;
-  /**
-   * The agent run's thread, when the target is an agent. It is the run's
-   * ADDRESS: a workflow run is reachable from (workflowId, runId) alone, but an
-   * agent run lives in a thread object and a retry that minted a fresh thread
-   * would otherwise have no way back to the original. Absent for workflows,
-   * where storing a derivable address would be a second source of truth.
-   */
-  readonly threadId?: string;
-  readonly state: StartReservationState;
-  /**
-   * Epoch ms of the reserve that created this row. Provenance only: the purge
-   * horizon is measured from `updatedAt`, so that a key's validity runs from
-   * the moment it was SPENT rather than from the moment it was first used —
-   * a long run must not age its own reservation out while it is still running.
-   */
-  readonly createdAt: number;
-  /**
-   * Epoch ms of the last state change — `pendingSince` on a live claim, and the
-   * column the purge horizon is measured from once the row is terminal.
-   */
-  readonly updatedAt: number;
-  readonly binding?: StartReservationBinding;
-}
-
-export type StartReservationBinding =
-  | { readonly kind: 'legacy' }
-  | { readonly kind: 'unbound' }
-  | { readonly kind: 'bound'; readonly execution: RunExecutionIdentity };
-
-export interface StartReservationReading extends StartReservation {
-  readonly binding: StartReservationBinding;
-}
 
 export interface StartReservationRequest {
   /**
@@ -886,6 +836,75 @@ function assertOwner(owner: unknown): StartReservationOwner {
   return { kind, id };
 }
 
+function assertReservationStartIdentity(
+  reservation: StartReservationReading,
+  execution: StartExecutionIdentity,
+): void {
+  if (
+    reservation.owner.kind !== execution.owner.kind ||
+    reservation.owner.id !== execution.owner.id
+  )
+    throw new StartReservationOwnerMismatchError(reservation.key);
+  if (
+    reservation.targetKind !== execution.target.kind ||
+    reservation.targetId !== execution.target.id
+  )
+    throw new StartReservationTargetMismatchError(reservation.key, reservation);
+  if (
+    reservation.runId !== execution.runId ||
+    reservation.threadId !==
+      (execution.target.kind === 'agent'
+        ? execution.target.threadId
+        : undefined) ||
+    (execution.target.kind === 'workflow' &&
+      execution.workflowId !== execution.target.id)
+  )
+    throw new InvalidExecutionIdentityError('admission');
+}
+
+function sameReservationExecution(
+  reservation: StartReservationReading,
+  execution: StartExecutionIdentity,
+): boolean {
+  return (
+    reservation.runId === execution.runId &&
+    reservation.owner.kind === execution.owner.kind &&
+    reservation.owner.id === execution.owner.id &&
+    reservation.targetKind === execution.target.kind &&
+    reservation.targetId === execution.target.id &&
+    reservation.threadId ===
+      (execution.target.kind === 'agent'
+        ? execution.target.threadId
+        : undefined) &&
+    reservation.binding.kind === 'bound' &&
+    reservation.binding.execution.runId === execution.runId &&
+    reservation.binding.execution.startToken === execution.startToken &&
+    reservation.binding.execution.tablePrefix === execution.tablePrefix &&
+    reservation.binding.execution.workflowId === execution.workflowId
+  );
+}
+
+function reservationMutationResult(
+  result: unknown,
+  observed: StartReservationReading,
+  state: StartReservationState,
+  updatedAt: number,
+  execution?: StartExecutionIdentity,
+): StartReservationReading | undefined {
+  const row = decodeStartReservationAdmissionResult(result);
+  if (
+    row !== undefined &&
+    (!sameReservationIdentity(row, observed) ||
+      row.state !== state ||
+      row.updatedAt !== updatedAt ||
+      (execution === undefined
+        ? row.binding.kind !== 'unbound'
+        : !sameReservationExecution(row, execution)))
+  )
+    throw new Error('reservation mutation returned an unexpected row');
+  return row;
+}
+
 export interface StartIdempotencyStoreOptions {
   /** Injectable clock for `created_at`/`updated_at` (tests, fixtures). */
   now?: () => number;
@@ -1075,6 +1094,349 @@ export class StartIdempotencyStore {
    */
   async release(key: string, runId: string): Promise<boolean> {
     return this.#casState(key, runId, 'started', 'reserved');
+  }
+
+  /** @internal Claim only this observed modern-unbound reservation. */
+  async claimReservation(
+    observed: StartReservationReading,
+  ): Promise<StartReservationReading | undefined> {
+    const reservation = captureReservation(observed, 'reserved');
+    const next = this.#nextReservationStamp(reservation);
+    await this.#requireReservationSchema(reservation.key);
+    let result: unknown;
+    try {
+      result = await this.#db
+        .prepare(
+          `UPDATE ${START_IDEMPOTENCY_TABLE} SET state = 'started', updated_at = ?
+         WHERE key = ? AND run_id = ?
+           AND owner_kind = ? AND owner_id = ?
+           AND target_kind = ? AND target_id = ? AND thread_id IS ?
+           AND created_at = ? AND updated_at = ? AND state = ?
+           AND state = 'reserved'
+           AND start_token = '' AND start_table_prefix IS NULL AND start_workflow_id IS NULL
+         RETURNING *`,
+        )
+        .bind(
+          next,
+          reservation.key,
+          reservation.runId,
+          reservation.owner.kind,
+          reservation.owner.id,
+          reservation.targetKind,
+          reservation.targetId,
+          reservation.threadId ?? null,
+          reservation.createdAt,
+          reservation.updatedAt,
+          reservation.state,
+        )
+        .all();
+    } catch (error) {
+      throw new StartReservationUnreadableError(reservation.key, {
+        cause: error,
+      });
+    }
+    try {
+      return reservationMutationResult(result, reservation, 'started', next);
+    } catch (error) {
+      throw new StartReservationUnreadableError(reservation.key, {
+        cause: error,
+      });
+    }
+  }
+
+  /** @internal Release only the exact unbound claim, without readback recovery. */
+  async releaseReservation(
+    observed: StartReservationReading,
+  ): Promise<boolean> {
+    const reservation = captureReservation(observed, 'started');
+    const next = this.#nextReservationStamp(reservation);
+    await this.#requireReservationSchema(reservation.key);
+    let result: unknown;
+    try {
+      result = await this.#db
+        .prepare(
+          `UPDATE ${START_IDEMPOTENCY_TABLE} SET state = 'reserved', updated_at = ?
+         WHERE key = ? AND run_id = ?
+           AND owner_kind = ? AND owner_id = ?
+           AND target_kind = ? AND target_id = ? AND thread_id IS ?
+           AND created_at = ? AND updated_at = ? AND state = ?
+           AND state = 'started'
+           AND start_token = '' AND start_table_prefix IS NULL AND start_workflow_id IS NULL
+         RETURNING *`,
+        )
+        .bind(
+          next,
+          reservation.key,
+          reservation.runId,
+          reservation.owner.kind,
+          reservation.owner.id,
+          reservation.targetKind,
+          reservation.targetId,
+          reservation.threadId ?? null,
+          reservation.createdAt,
+          reservation.updatedAt,
+          reservation.state,
+        )
+        .all();
+    } catch (error) {
+      throw new StartReservationUnreadableError(reservation.key, {
+        cause: error,
+      });
+    }
+    try {
+      return (
+        reservationMutationResult(result, reservation, 'reserved', next) !==
+        undefined
+      );
+    } catch (error) {
+      throw new StartReservationUnreadableError(reservation.key, {
+        cause: error,
+      });
+    }
+  }
+
+  /** @internal Associate an alias with an already-observed nonpending execution. */
+  async associateReservation(
+    observed: StartReservationReading,
+    execution: StartExecutionIdentity,
+  ): Promise<StartReservationReading> {
+    const reservation = captureReservation(observed, 'nonterminal');
+    const identity = normalizeStartExecutionIdentity(execution);
+    assertReservationStartIdentity(reservation, identity);
+    await this.#requireReservationSchema(reservation.key);
+    let result: unknown;
+    let failed = false;
+    let writeCause: unknown;
+    try {
+      result = await this.#db
+        .prepare(
+          `UPDATE ${START_IDEMPOTENCY_TABLE}
+         SET start_token = ?, start_table_prefix = ?, start_workflow_id = ?
+         WHERE key = ? AND run_id = ?
+           AND owner_kind = ? AND owner_id = ?
+           AND target_kind = ? AND target_id = ? AND thread_id IS ?
+           AND created_at = ? AND updated_at = ? AND state = ?
+           AND state <> 'terminal'
+           AND start_token = '' AND start_table_prefix IS NULL AND start_workflow_id IS NULL
+         RETURNING *`,
+        )
+        .bind(
+          identity.startToken,
+          identity.tablePrefix,
+          identity.workflowId,
+          reservation.key,
+          reservation.runId,
+          reservation.owner.kind,
+          reservation.owner.id,
+          reservation.targetKind,
+          reservation.targetId,
+          reservation.threadId ?? null,
+          reservation.createdAt,
+          reservation.updatedAt,
+          reservation.state,
+        )
+        .all();
+    } catch (error) {
+      failed = true;
+      writeCause = error;
+    }
+    if (!failed) {
+      try {
+        const row = reservationMutationResult(
+          result,
+          reservation,
+          reservation.state,
+          reservation.updatedAt,
+          identity,
+        );
+        if (row) return row;
+      } catch (error) {
+        throw new StartReservationUnreadableError(reservation.key, {
+          cause: error,
+        });
+      }
+    }
+    let current: StartReservationReading | undefined;
+    try {
+      current = await this.readForAdmission(reservation.key);
+    } catch (error) {
+      if (!failed) throw error;
+    }
+    if (
+      current &&
+      sameReservationIdentity(current, reservation) &&
+      sameReservationExecution(current, identity)
+    )
+      return current;
+    if (failed)
+      throw new StartReservationUnreadableError(reservation.key, {
+        cause: writeCause,
+      });
+    throw new RunAdmissionConflictError('reservation-changed');
+  }
+
+  /** @internal Bind a prepared start; only exact lost-write readback can recover. */
+  async bindPreparedStart(
+    observed: StartReservationReading,
+    execution: StartExecutionIdentity,
+  ): Promise<StartReservationReading> {
+    const reservation = captureReservation(observed, 'started');
+    const identity = normalizeStartExecutionIdentity(execution);
+    assertReservationStartIdentity(reservation, identity);
+    await this.#requireReservationSchema(reservation.key);
+    let result: unknown;
+    try {
+      result = await this.#db
+        .prepare(
+          `UPDATE ${START_IDEMPOTENCY_TABLE}
+         SET start_token = ?, start_table_prefix = ?, start_workflow_id = ?
+         WHERE key = ? AND run_id = ?
+           AND owner_kind = ? AND owner_id = ?
+           AND target_kind = ? AND target_id = ? AND thread_id IS ?
+           AND created_at = ? AND updated_at = ? AND state = ?
+           AND state = 'started'
+           AND start_token = '' AND start_table_prefix IS NULL AND start_workflow_id IS NULL
+         RETURNING *`,
+        )
+        .bind(
+          identity.startToken,
+          identity.tablePrefix,
+          identity.workflowId,
+          reservation.key,
+          reservation.runId,
+          reservation.owner.kind,
+          reservation.owner.id,
+          reservation.targetKind,
+          reservation.targetId,
+          reservation.threadId ?? null,
+          reservation.createdAt,
+          reservation.updatedAt,
+          reservation.state,
+        )
+        .all();
+    } catch (error) {
+      let current: StartReservationReading | undefined;
+      try {
+        current = await this.readForAdmission(reservation.key);
+      } catch {
+        // Preserve the write uncertainty even when its one readback also fails.
+      }
+      if (
+        current &&
+        sameReservationIdentity(current, reservation) &&
+        current.state === reservation.state &&
+        current.updatedAt === reservation.updatedAt &&
+        sameReservationExecution(current, identity)
+      )
+        return current;
+      throw new StartReservationUnreadableError(reservation.key, {
+        cause: error,
+      });
+    }
+    let row: StartReservationReading | undefined;
+    try {
+      row = reservationMutationResult(
+        result,
+        reservation,
+        reservation.state,
+        reservation.updatedAt,
+        identity,
+      );
+    } catch (error) {
+      throw new StartReservationUnreadableError(reservation.key, {
+        cause: error,
+      });
+    }
+    if (row) return row;
+    throw new RunAdmissionConflictError('reservation-changed');
+  }
+
+  /** @internal Settle every alias of this complete physical/logical execution. */
+  async settleExecution(execution: StartExecutionIdentity): Promise<number> {
+    const identity = normalizeStartExecutionIdentity(execution);
+    const clock = this.#reservationClock(identity.runId);
+    let result: unknown;
+    try {
+      const stage = await this.#schemaStage();
+      if (stage === undefined) return 0;
+      if (stage !== 3)
+        throw new ReservationSchemaError('settlement requires current schema');
+      result = await this.#db
+        .prepare(
+          `UPDATE ${START_IDEMPOTENCY_TABLE} SET state = 'terminal', updated_at = ?
+         WHERE run_id = ? AND start_token = ? AND start_table_prefix IS ?
+           AND start_workflow_id = ? AND owner_kind = ? AND owner_id = ?
+           AND target_kind = ? AND target_id = ? AND thread_id IS ?
+           AND state <> 'terminal' RETURNING *`,
+        )
+        .bind(
+          clock,
+          identity.runId,
+          identity.startToken,
+          identity.tablePrefix,
+          identity.workflowId,
+          identity.owner.kind,
+          identity.owner.id,
+          identity.target.kind,
+          identity.target.id,
+          identity.target.kind === 'agent' ? identity.target.threadId : null,
+        )
+        .all();
+    } catch (error) {
+      if (isMissingReservationTable(error)) return 0;
+      throw new StartReservationUnreadableError(identity.runId, {
+        cause: error,
+      });
+    }
+    try {
+      const keys = new Set<string>();
+      for (const raw of reservationResultRows(result)) {
+        const row = admissionReservationFromRow(raw, 3);
+        if (
+          keys.has(row.key) ||
+          row.state !== 'terminal' ||
+          row.updatedAt !== clock ||
+          !sameReservationExecution(row, identity)
+        )
+          throw new Error('settlement returned an unexpected reservation');
+        keys.add(row.key);
+      }
+      return keys.size;
+    } catch (error) {
+      throw new StartReservationUnreadableError(identity.runId, {
+        cause: error,
+      });
+    }
+  }
+
+  #reservationClock(key: string): number {
+    try {
+      const clock = this.#now();
+      if (!Number.isFinite(clock))
+        throw new Error('reservation clock is not finite');
+      return clock;
+    } catch (error) {
+      throw new StartReservationUnreadableError(key, { cause: error });
+    }
+  }
+
+  #nextReservationStamp(reservation: StartReservationReading): number {
+    const clock = this.#reservationClock(reservation.key);
+    const next = Math.max(clock, reservation.updatedAt + 1);
+    if (!Number.isFinite(next) || next <= reservation.updatedAt)
+      throw new StartReservationUnreadableError(reservation.key, {
+        cause: new Error('reservation update stamp is exhausted'),
+      });
+    return next;
+  }
+
+  async #requireReservationSchema(key: string): Promise<void> {
+    try {
+      if ((await this.#schemaStage()) !== 3)
+        throw new ReservationSchemaError('mutation requires current schema');
+    } catch (error) {
+      throw new StartReservationUnreadableError(key, { cause: error });
+    }
   }
 
   /**

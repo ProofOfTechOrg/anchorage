@@ -65,6 +65,10 @@ import {
   StartReservationTargetMismatchError,
   validateStartReservationAdmissionSchema,
 } from './start-idempotency.js';
+import {
+  captureReservation,
+  sameReservationIdentity,
+} from './start-reservation-contract.js';
 import { validateTablePrefix } from './table-prefix.js';
 import {
   decodeRawWorkflowSnapshotResult,
@@ -144,52 +148,6 @@ function assertInitialSnapshot(value: unknown, runId: string): void {
     if (Object.keys(record(snapshot[field])).length !== 0)
       throw new InvalidExecutionIdentityError('admission');
   }
-}
-
-function captureReservation(
-  value: StartReservationReading,
-): StartReservationReading {
-  const {
-    key,
-    owner,
-    targetKind,
-    targetId,
-    runId,
-    threadId,
-    state,
-    createdAt,
-    updatedAt,
-    binding,
-  } = record(value);
-  const identity = normalizeStartIdentity({
-    owner,
-    target: { kind: targetKind, id: targetId, threadId },
-  });
-  if (
-    record(binding).kind !== 'unbound' ||
-    state !== 'started' ||
-    !isPathSafeId(key) ||
-    !isPathSafeId(runId) ||
-    typeof createdAt !== 'number' ||
-    !Number.isFinite(createdAt) ||
-    typeof updatedAt !== 'number' ||
-    !Number.isFinite(updatedAt)
-  )
-    throw new InvalidExecutionIdentityError('admission');
-  return Object.freeze({
-    key,
-    runId,
-    owner: identity.owner,
-    targetKind: identity.target.kind,
-    targetId: identity.target.id,
-    ...(identity.target.kind === 'agent'
-      ? { threadId: identity.target.threadId }
-      : {}),
-    state,
-    createdAt,
-    updatedAt,
-    binding: Object.freeze({ kind: 'unbound' as const }),
-  });
 }
 
 function captureInitialProvenance(value: unknown) {
@@ -280,7 +238,7 @@ function captureAdmission(source: InitialRunAdmission): InitialRunAdmission {
   const reservation =
     rawReservation === undefined
       ? undefined
-      : captureReservation(rawReservation);
+      : captureReservation(rawReservation, 'started');
   if (reservation) {
     if (!startIdentity) throw new InvalidExecutionIdentityError('admission');
     if (
@@ -388,15 +346,8 @@ function sameReservation(
 ): boolean {
   return (
     actual !== undefined &&
-    actual.key === expected.key &&
-    actual.runId === expected.runId &&
-    actual.owner.kind === expected.owner.kind &&
-    actual.owner.id === expected.owner.id &&
-    actual.targetKind === expected.targetKind &&
-    actual.targetId === expected.targetId &&
-    actual.threadId === expected.threadId &&
+    sameReservationIdentity(actual, expected) &&
     actual.state === expected.state &&
-    actual.createdAt === expected.createdAt &&
     actual.updatedAt === expected.updatedAt &&
     (execution === undefined
       ? actual.binding.kind === expected.binding.kind

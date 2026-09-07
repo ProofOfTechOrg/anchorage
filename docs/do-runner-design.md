@@ -184,6 +184,20 @@ Reservation reads also return a `binding`: `legacy` for an unassociated old-form
 
 Schema upgrades preserve existing rows and add nullable binding columns. Current reservation writes still produce legacy bindings; automatic generation binding is not enabled.
 
+The internal `StartIdempotencyStore` methods stage exact reservation operations for coordinated writer integration:
+
+| Method | Required observation and result |
+| --- | --- |
+| `claimReservation` | Claims an exact modern-unbound reserved row and returns this caller’s successful `RETURNING` observation, or undefined on a known miss |
+| `releaseReservation` | Releases an exact modern-unbound started row; a lost write response remains unreadable without a reread |
+| `associateReservation` | Binds an alias to an already-observed nonpending execution without reading its snapshot again; one readback may converge on that exact binding after a miss or lost response |
+| `bindPreparedStart` | Binds a newly prepared execution to the exact started claim; only a lost response permits readback, which must preserve the original claim state and timestamps |
+| `settleExecution` | Settles all aliases matching the complete physical execution, owner, logical target and thread, preserving neighboring generations and already-terminal timestamps |
+
+Claim and release compare every observed field and strictly advance `updatedAt` using the captured clock or the previous stamp plus one. This optimistic concurrency control stamp is neither an execution generation nor a host correlation token. A stopped or backward clock can make `pendingSince` lead wall time; an exhausted nonadvancing stamp refuses before database access. Only a successful claim response establishes that caller’s claim, because simultaneous contenders can propose the same stamp.
+
+Binding preserves both timestamps. Alias readback can accept later state changes, including terminal settlement, while prepared-start readback must preserve the exact original claim. Settlement uses one finite captured clock even when it precedes the previous timestamp. These operations require the current schema without creating or upgrading tables; settlement alone treats a genuinely absent table as empty. Built-in writers and callers retain the existing legacy methods until coordinated activation.
+
 The fence can retain a complete D1 proof identity alongside `proofRunId`. Store readings expose it as `proofExecution`; admin JSON excludes that identity and its token. Adding its nullable columns preserves active epochs, revisions, receipts, proof fields, and timestamps.
 
 Provisioning validates structural schema metadata; Runtime additionally validates proof identifiers and canonical prefixes. Provisioning does not repair corrupt identity or receipt bytes. These representations do not change the current run-ID-based execution predicates.

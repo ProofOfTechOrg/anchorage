@@ -1844,6 +1844,70 @@ function claim(input: InitialRunAdmission) {
   return input.reservation;
 }
 
+describe('FS8 D2 dormant reservation primitives', () => {
+  async function modernClaim() {
+    const h = await fixture({ keyed: true, state: 'proof-only' });
+    const store = h.input.reservationStore;
+    if (!store) throw new Error('reservation store is missing');
+    h.sql.exec("UPDATE flowsafe_start_idempotency SET state = 'reserved'");
+    const reserved = await store.readForAdmission('key');
+    if (!reserved) throw new Error('reserved row is missing');
+    const claimed = await store.claimReservation(reserved);
+    if (!claimed) throw new Error('claimed row is missing');
+    expect(claimed.state).toBe('started');
+    expect(claimed.updatedAt).toBeGreaterThan(reserved.updatedAt);
+    return { ...h, store, reserved, claimed };
+  }
+
+  it('binds a real exact claim through atomic initial admission and returns its witness', async () => {
+    const h = await modernClaim();
+    const admitted = await h.admit({ ...h.input, reservation: h.claimed });
+    expect(admitted.witness.execution).toEqual(h.input.execution);
+    expect(h.rows()).toHaveLength(1);
+    expect((await h.store.readForAdmission('key'))?.binding).toEqual({
+      kind: 'bound',
+      execution: h.input.execution,
+    });
+    expect((await h.fence.read()).proofExecution).toEqual(h.input.execution);
+    expect(h.effects()).toBe(0);
+  });
+
+  it.each([
+    'reserved',
+    'stale',
+    'owner',
+    'target',
+    'thread',
+  ] as const)('refuses a %s observation without an initial row or binding', async (mode) => {
+    const h = await modernClaim();
+    let reservation = h.claimed;
+    if (mode === 'reserved') reservation = h.reserved;
+    if (mode === 'stale') {
+      expect(await h.store.releaseReservation(h.claimed)).toBe(true);
+      const released = await h.store.readForAdmission('key');
+      if (!released) throw new Error('released row is missing');
+      expect(await h.store.claimReservation(released)).toBeDefined();
+    }
+    if (mode === 'owner')
+      reservation = { ...reservation, owner: { ...OWNER, id: 'other' } };
+    if (mode === 'target') reservation = { ...reservation, targetId: 'other' };
+    if (mode === 'thread') reservation = { ...reservation, threadId: 'other' };
+    const before = h.sql
+      .prepare('SELECT * FROM flowsafe_start_idempotency')
+      .all();
+    const outcome = await h
+      .admit({ ...h.input, reservation })
+      .catch((error: unknown) => error);
+    expect(
+      h.sql.prepare('SELECT * FROM flowsafe_start_idempotency').all(),
+    ).toEqual(before);
+    expect(h.rows()).toEqual([]);
+    expect(outcome).toBeInstanceOf(Error);
+    expect((await h.fence.read()).proofExecution).toBeUndefined();
+    expect(h.effects()).toBe(0);
+  });
+});
+
 describe('owned initial workflow admission', () => {
   it.each([
     'foreign fence binding',
