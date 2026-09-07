@@ -24,12 +24,13 @@ import type { IMastraLogger } from '@mastra/core/logger';
 import { Mastra } from '@mastra/core/mastra';
 import { RequestContext } from '@mastra/core/request-context';
 import type { MastraCompositeStore } from '@mastra/core/storage';
-import type {
-  AnyWorkflow,
-  WorkflowRunState,
-  WorkflowRunStatus,
-  WorkflowState,
-  WorkflowStateField,
+import {
+  type AnyWorkflow,
+  cleanStepResult,
+  type WorkflowRunState,
+  type WorkflowRunStatus,
+  type WorkflowState,
+  type WorkflowStateField,
 } from '@mastra/core/workflows';
 import {
   type ExecutionPrincipalKind,
@@ -44,6 +45,7 @@ import {
   BREAKWATER_WORKFLOW_SCOPE_KEY,
 } from './breakwater-keys.js';
 import {
+  type D1RunExecutionIdentity,
   normalizeMutationEpoch,
   normalizeStartIdentity,
   type RunExecutionIdentity,
@@ -60,6 +62,10 @@ import {
   ExecutionFencedError,
   type ExecutionFenceStore,
 } from './execution-fence.js';
+import {
+  FENCED_WORKFLOW_STORAGE,
+  type FencedWorkflowAdmissionCapability,
+} from './fenced-workflow-capability.js';
 import { mastraRegistryEntries } from './mastra-registry.js';
 import { isPathSafeId } from './path-safe-id.js';
 import type { HostPubSub } from './pubsub.js';
@@ -81,14 +87,23 @@ import {
   type RunTerminalErrorEnvelope,
   type RunTerminalStatus,
 } from './run-lifecycle.js';
-import { decodeResumeCounts, nextResumeCount } from './run-provenance.js';
+import {
+  decodeProgressRunProvenance,
+  decodeResumeCounts,
+  nextResumeCount,
+  type ProgressRunProvenance,
+  runExecutionIdentityFor,
+} from './run-provenance.js';
 import {
   type CoreRunResult,
   errorText,
+  isRunStatus,
   type RunStatus,
   terminalStateFields,
   terminalStateUpdate,
 } from './run-terminal-state.js';
+import { validateTablePrefix } from './table-prefix.js';
+import type { RawWorkflowSnapshot } from './workflow-snapshot-row.js';
 
 export {
   RunLifecycleBlockedError,
@@ -250,6 +265,27 @@ const RUN_STATE_FIELDS: WorkflowStateField[] = [
   'suspendedPaths',
   'requestContext',
 ];
+
+/** @internal One physical observation; this does not certify a logical root. */
+type AuthoritativeStartState = {
+  readonly provenance: ProgressRunProvenance;
+  readonly snapshot: WorkflowRunState;
+} & (
+  | {
+      readonly storage: 'd1';
+      readonly execution: D1RunExecutionIdentity;
+      readonly raw: RawWorkflowSnapshot;
+    }
+  | {
+      readonly storage: 'unfenced';
+      readonly execution: RunExecutionIdentity & { readonly tablePrefix: null };
+      readonly raw?: never;
+    }
+) &
+  (
+    | { readonly kind: 'initial'; readonly summary?: never }
+    | { readonly kind: 'result'; readonly summary: RunSummary }
+  );
 
 interface RunProvenance {
   version: 1;
@@ -458,9 +494,14 @@ function byStep<T>(
 // (isFromInMemory), steps are empty and timestamps are current-time; the
 // projection truthfully degrades to status-only rather than fabricating
 // detail.
+type SummaryState = Pick<
+  WorkflowState,
+  'status' | 'result' | 'error' | 'steps' | 'requestContext' | 'suspendedPaths'
+> & { createdAt: Date | string; updatedAt: Date | string };
+
 function summarizeState(
   runId: string,
-  state: WorkflowState,
+  state: SummaryState,
   counts?: ReadonlyMap<string, number>,
   requestedBy?: string,
   requestedByKind?: ExecutionPrincipalKind,
@@ -506,6 +547,34 @@ function summarizeState(
     if (resumeCount !== undefined) summary.resumeCount = resumeCount;
   }
   return summary;
+}
+
+function summaryFromSelectedSnapshot(
+  runId: string,
+  snapshot: WorkflowRunState,
+  timestamps: { createdAt: string; updatedAt: string },
+  provenance: ProgressRunProvenance,
+): RunSummary {
+  const steps = Object.fromEntries(
+    Object.entries(snapshot.context ?? {})
+      .filter(([key]) => key !== 'input' && key !== '__state')
+      .map(([key, value]) => [key, cleanStepResult(value)]),
+  ) as WorkflowState['steps'];
+  return summarizeState(
+    runId,
+    {
+      status: snapshot.status,
+      result: snapshot.result,
+      error: snapshot.error,
+      requestContext: snapshot.requestContext,
+      suspendedPaths: snapshot.suspendedPaths,
+      steps,
+      ...timestamps,
+    },
+    new Map(provenance.resumeCounts),
+    provenance.requestedBy,
+    provenance.requestedByKind,
+  );
 }
 
 function summaryWithRequester(
@@ -1877,6 +1946,195 @@ export class RunnerRuntime {
       throw new RunStateUnreadableError(workflowId, runId);
     }
     return this.#summaryFromState(runId, state);
+  }
+
+  /** @internal Read generation and root-local value from one stored observation. */
+  async authoritativeStartState(
+    workflowId: string,
+    runId: string,
+  ): Promise<AuthoritativeStartState | null> {
+    if (!isPathSafeId(workflowId))
+      throw new InvalidRunRequestError('workflowId is malformed');
+    if (!isPathSafeId(runId))
+      throw new InvalidRunRequestError('runId is malformed');
+    const workflow = this.#getWorkflow(workflowId);
+    try {
+      const storage = workflow.mastra?.getStorage();
+      const workflows = await storage?.getStore('workflows');
+      if (!workflows) throw new Error('workflow storage is unavailable');
+      const capability = (
+        workflows as typeof workflows & {
+          [FENCED_WORKFLOW_STORAGE]?: FencedWorkflowAdmissionCapability;
+        }
+      )[FENCED_WORKFLOW_STORAGE];
+      let source:
+        | { storage: 'd1'; tablePrefix: string; raw: RawWorkflowSnapshot }
+        | { storage: 'unfenced'; tablePrefix: null };
+      let decoded: unknown;
+      let createdAt: Date | string;
+      let updatedAt: Date | string;
+      if (capability !== undefined) {
+        const {
+          database,
+          tablePrefix: suppliedPrefix,
+          readSnapshot,
+        } = capability;
+        if (typeof suppliedPrefix !== 'string')
+          throw new Error('workflow storage namespace is malformed');
+        validateTablePrefix(suppliedPrefix);
+        const tablePrefix = suppliedPrefix.toLowerCase();
+        if (
+          (this.#executionFence &&
+            !this.#executionFence.usesDatabase(database)) ||
+          (this.#startIdempotency &&
+            !this.#startIdempotency.usesDatabase(database))
+        )
+          throw new Error(
+            'workflow storage binding disagrees with runtime stores',
+          );
+        const observed = await readSnapshot.call(capability, {
+          workflowId,
+          runId,
+        });
+        if (observed === undefined) return null;
+        for (const key of [
+          'tablePrefix',
+          'workflowId',
+          'runId',
+          'resourceId',
+          'snapshot',
+          'createdAt',
+          'updatedAt',
+        ]) {
+          if (!Object.hasOwn(observed, key))
+            throw new Error('workflow snapshot field is missing');
+        }
+        const {
+          tablePrefix: rawPrefix,
+          workflowId: rawWorkflow,
+          runId: rawRun,
+          resourceId,
+          snapshot,
+          createdAt: rawCreated,
+          updatedAt: rawUpdated,
+        } = observed;
+        if (
+          rawPrefix !== tablePrefix ||
+          rawWorkflow !== workflowId ||
+          rawRun !== runId ||
+          (resourceId !== null && typeof resourceId !== 'string') ||
+          typeof snapshot !== 'string' ||
+          typeof rawCreated !== 'string' ||
+          typeof rawUpdated !== 'string'
+        )
+          throw new Error('workflow snapshot fields are malformed');
+        const raw = Object.freeze({
+          tablePrefix,
+          workflowId,
+          runId,
+          resourceId,
+          snapshot,
+          createdAt: rawCreated,
+          updatedAt: rawUpdated,
+        });
+        source = { storage: 'd1', tablePrefix, raw };
+        decoded = JSON.parse(snapshot);
+        createdAt = rawCreated;
+        updatedAt = rawUpdated;
+      } else {
+        if (this.#executionFence)
+          throw new Error('fenced workflow storage capability is unavailable');
+        const read = workflows.getWorkflowRunById;
+        const row = await read.call(workflows, {
+          workflowName: workflowId,
+          runId,
+        });
+        if (row === null) return null;
+        const {
+          workflowName,
+          runId: storedRun,
+          snapshot,
+          createdAt: storedCreated,
+          updatedAt: storedUpdated,
+        } = row;
+        if (workflowName !== workflowId || storedRun !== runId)
+          throw new Error(
+            'workflow snapshot selector disagrees with the request',
+          );
+        createdAt = storedCreated;
+        updatedAt = storedUpdated;
+        decoded =
+          typeof snapshot === 'string'
+            ? JSON.parse(snapshot)
+            : structuredClone(snapshot);
+        source = { storage: 'unfenced', tablePrefix: null };
+      }
+      if (
+        decoded === null ||
+        typeof decoded !== 'object' ||
+        Array.isArray(decoded)
+      )
+        throw new Error('workflow snapshot is malformed');
+      const snapshot = decoded as WorkflowRunState;
+      if (snapshot.runId !== runId || !isRunStatus(snapshot.status))
+        throw new Error('workflow snapshot identity or status is malformed');
+      for (const value of [
+        snapshot.requestContext,
+        snapshot.context,
+        snapshot.suspendedPaths,
+      ]) {
+        if (
+          value !== undefined &&
+          (value === null || typeof value !== 'object' || Array.isArray(value))
+        )
+          throw new Error('workflow snapshot container is malformed');
+      }
+      const provenance = decodeProgressRunProvenance(
+        snapshot.requestContext?.[RUN_PROVENANCE_CONTEXT_KEY],
+      );
+      lifecycleFromRequestContext(snapshot.requestContext);
+      for (const value of [createdAt, updatedAt]) {
+        if (!(value instanceof Date) && typeof value !== 'string')
+          throw new Error('workflow snapshot timestamp is malformed');
+        if (!Number.isFinite(new Date(value).getTime()))
+          throw new Error('workflow snapshot timestamp is malformed');
+      }
+      const execution = runExecutionIdentityFor(
+        { tablePrefix: source.tablePrefix, workflowId, runId },
+        provenance,
+      );
+      const state =
+        snapshot.status === 'pending'
+          ? { kind: 'initial' as const, snapshot, provenance }
+          : {
+              kind: 'result' as const,
+              snapshot,
+              provenance,
+              summary: summaryFromSelectedSnapshot(
+                runId,
+                snapshot,
+                { createdAt: toIso(createdAt), updatedAt: toIso(updatedAt) },
+                provenance,
+              ),
+            };
+      return source.storage === 'd1'
+        ? {
+            ...state,
+            storage: 'd1',
+            execution: Object.freeze({
+              ...execution,
+              tablePrefix: source.tablePrefix,
+            }),
+            raw: source.raw,
+          }
+        : {
+            ...state,
+            storage: 'unfenced',
+            execution: Object.freeze({ ...execution, tablePrefix: null }),
+          };
+    } catch (cause) {
+      throw new RunStateUnreadableError(workflowId, runId, { cause });
+    }
   }
 
   /**

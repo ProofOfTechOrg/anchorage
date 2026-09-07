@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Agent } from '@mastra/core/agent';
+import { Mastra } from '@mastra/core/mastra';
 import type { RequestContext } from '@mastra/core/request-context';
 import { InMemoryStore } from '@mastra/core/storage';
-import { describe, expect, it, vi } from 'vitest';
+import type { WorkflowRunState } from '@mastra/core/workflows';
+import { assert, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import { createBackgroundTaskD1Domains } from '../background-tasks/d1-storage.js';
@@ -41,6 +43,7 @@ import {
   type StartRunOptions,
   UnknownWorkflowError,
 } from './runtime.js';
+import { StartIdempotencyStore } from './start-idempotency.js';
 import {
   isReadableRunSummary,
   isSuspensionTimeoutResumeData,
@@ -51,6 +54,965 @@ import {
   suspensionDeadlinesOf,
   suspensionTimeoutResumeData,
 } from './suspension-deadline.js';
+
+function d1Snapshot(
+  status: RunSummary['status'] = 'success',
+): WorkflowRunState & {
+  requestContext: NonNullable<WorkflowRunState['requestContext']>;
+} {
+  return {
+    runId: 'd1-run',
+    status: status as WorkflowRunState['status'],
+    result: { source: 'S1' },
+    error: { name: 'Error', message: 'S1 failure' },
+    context: {
+      gate: {
+        status: 'suspended',
+        payload: {},
+        startedAt: 50,
+        suspendPayload: { source: 'S1' },
+        suspendedAt: 100,
+        ...{ resumedAt: 90 },
+      },
+    },
+    requestContext: {
+      'flowsafe.runProvenance': {
+        version: 2,
+        startToken: 'S1',
+        attemptToken: 'attempt-1',
+        startIdentity: {
+          owner: { kind: 'human', id: 'owner' },
+          target: { kind: 'workflow', id: 'd1-workflow' },
+        },
+        requestedBy: 'owner',
+        requestedByKind: 'human',
+        resumeCounts: [['gate', 2]],
+      },
+    },
+    value: {},
+    serializedStepGraph: [],
+    activePaths: [],
+    activeStepsPath: {},
+    suspendedPaths: { gate: [0] },
+    resumeLabels: {},
+    waitingPaths: {},
+    timestamp: 100,
+  };
+}
+
+async function d1Fixture(
+  kind: 'default' | 'prefixed' | 'background' | 'unfenced' = 'default',
+  bound: 'none' | 'fence' | 'start' = 'none',
+) {
+  const sql = openSqlite() as ReturnType<typeof openSqlite> & { close(): void };
+  const binding = sqliteUnitDatabase(sql) as D1DatabaseBinding;
+  const storage =
+    kind === 'unfenced'
+      ? new InMemoryStore()
+      : createD1Storage({
+          binding,
+          ...(kind === 'prefixed' ? { tablePrefix: 'D1_' } : {}),
+          ...(kind === 'background'
+            ? { domains: createBackgroundTaskD1Domains({ binding }) }
+            : {}),
+        });
+  await storage.init();
+  const app = init(
+    { storage },
+    {
+      executionFence:
+        bound === 'fence'
+          ? new ExecutionFenceStore(binding as ExecutionFenceDatabase)
+          : 'none',
+      startIdempotency:
+        bound === 'start'
+          ? new StartIdempotencyStore(binding as ExecutionFenceDatabase)
+          : 'none',
+    },
+  );
+  const schema = z.looseObject({});
+  const workflow = app
+    .createWorkflow({
+      id: 'd1-workflow',
+      inputSchema: schema,
+      outputSchema: schema,
+    })
+    .then(
+      app.createStep({
+        id: 'gate',
+        inputSchema: schema,
+        outputSchema: schema,
+        execute: async ({ inputData }) => inputData,
+      }),
+    )
+    .commit();
+  await app.runtime.status('d1-workflow', 'd1-run');
+  const workflows = (await storage.getStore(
+    'workflows',
+  )) as FencedWorkflowsStorageD1;
+  const native = workflows[FENCED_WORKFLOW_STORAGE];
+  const capability = native ? { ...native } : undefined;
+  Object.defineProperty(workflows, FENCED_WORKFLOW_STORAGE, {
+    value: capability,
+    writable: true,
+    configurable: true,
+  });
+  const seed = (snapshot: WorkflowRunState = d1Snapshot()) =>
+    workflows.persistWorkflowSnapshot({
+      workflowName: 'd1-workflow',
+      runId: 'd1-run',
+      snapshot,
+    });
+  return {
+    ...app,
+    sql,
+    storage,
+    workflow,
+    workflows,
+    get capability() {
+      if (!capability) throw new Error('D1 fixture capability is missing');
+      return capability;
+    },
+    seed,
+    close: () => sql.close(),
+  };
+}
+
+describe('FS8 D1 authoritative start state', () => {
+  it.each([
+    'default',
+    'prefixed',
+    'background',
+  ] as const)('selects one raw %s snapshot for physical identity and S1 payload', async (kind) => {
+    const f = await d1Fixture(kind);
+    try {
+      for (const status of ['success', 'failed', 'suspended'] as const) {
+        const snapshot = d1Snapshot(status);
+        await f.seed(snapshot);
+        const capability = f.capability;
+        const originalRead = capability.readSnapshot.bind(capability);
+        const read = vi
+          .spyOn(capability, 'readSnapshot')
+          .mockImplementation(async (address) => {
+            const row = await originalRead(address);
+            const replacement = d1Snapshot(status);
+            replacement.requestContext['flowsafe.runProvenance'].startToken =
+              'S2';
+            replacement.result = { source: 'S2' };
+            replacement.error = { name: 'Error', message: 'S2 failure' };
+            assert(replacement.context.gate);
+            replacement.context.gate.suspendPayload = { source: 'S2' };
+            await f.seed(replacement);
+            return row;
+          });
+        const publicRead = vi.spyOn(f.workflow, 'getWorkflowRunById');
+        const ordinaryRead = vi.spyOn(f.workflows, 'getWorkflowRunById');
+        const load = vi.spyOn(f.workflows, 'loadWorkflowSnapshot');
+        const selected = await f.runtime.authoritativeStartState(
+          'd1-workflow',
+          'd1-run',
+        );
+        expect(selected).toMatchObject({
+          storage: 'd1',
+          kind: 'result',
+          execution: {
+            tablePrefix: kind === 'prefixed' ? 'd1_' : '',
+            workflowId: 'd1-workflow',
+            runId: 'd1-run',
+            startToken: 'S1',
+          },
+        });
+        expect(selected?.summary).toMatchObject(
+          status === 'success'
+            ? { result: { source: 'S1' } }
+            : status === 'failed'
+              ? { error: 'S1 failure' }
+              : {
+                  suspendPayload: { gate: { source: 'S1' } },
+                  suspendedAt: { gate: 100 },
+                  resumedAt: { gate: 90 },
+                  resumeCount: { gate: 2 },
+                },
+        );
+        expect(selected?.snapshot).toEqual(snapshot);
+        expect(read).toHaveBeenCalledTimes(1);
+        expect(publicRead).not.toHaveBeenCalled();
+        expect(ordinaryRead).not.toHaveBeenCalled();
+        expect(load).not.toHaveBeenCalled();
+        expect(
+          selected?.storage === 'd1' && Object.isFrozen(selected.raw),
+        ).toBe(true);
+        if (selected?.storage === 'd1')
+          expect(JSON.parse(selected.raw.snapshot)).toEqual(snapshot);
+        read.mockRestore();
+        publicRead.mockRestore();
+        ordinaryRead.mockRestore();
+        load.mockRestore();
+      }
+    } finally {
+      f.close();
+    }
+  });
+
+  it('copies all exact raw fields without reserializing snapshot bytes', async () => {
+    const f = await d1Fixture();
+    try {
+      await f.seed();
+      const bytes = `${JSON.stringify(d1Snapshot(), null, 2)}\n`;
+      f.sql
+        .prepare(
+          'UPDATE mastra_workflow_snapshot SET snapshot = ?, resourceId = ?, createdAt = ?, updatedAt = ?',
+        )
+        .run(
+          bytes,
+          'resource-1',
+          '2026-01-01T04:00:00+04:00',
+          '2026-01-02T04:00:00+04:00',
+        );
+      const row = await f.capability.readSnapshot({
+        workflowId: 'd1-workflow',
+        runId: 'd1-run',
+      });
+      assert(row);
+      const observed = { ...row };
+      vi.spyOn(f.capability, 'readSnapshot').mockResolvedValue(observed);
+      const selected = await f.runtime.authoritativeStartState(
+        'd1-workflow',
+        'd1-run',
+      );
+      assert(selected?.storage === 'd1');
+      expect(selected.raw).toEqual(row);
+      expect(selected.raw).not.toBe(observed);
+      observed.snapshot = '{}';
+      observed.resourceId = 'changed';
+      expect(selected.raw.snapshot).toBe(bytes);
+      expect(selected.raw.resourceId).toBe('resource-1');
+      expect(selected.summary).toMatchObject({
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-02T00:00:00.000Z',
+      });
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    'default',
+    'unfenced',
+  ] as const)('returns %s absence despite a cached Run', async (kind) => {
+    const f = await d1Fixture(kind);
+    try {
+      await f.workflow.createRun({ runId: 'd1-run' });
+      await f.workflows.deleteWorkflowRunById({
+        workflowName: 'd1-workflow',
+        runId: 'd1-run',
+      });
+      expect(await f.runtime.status('d1-workflow', 'd1-run')).not.toBeNull();
+      expect(
+        await f.runtime.authoritativeStartState('d1-workflow', 'd1-run'),
+      ).toBeNull();
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    'string',
+    'object',
+  ] as const)('detaches one unfenced %s record with an explicit null namespace', async (shape) => {
+    const f = await d1Fixture('unfenced');
+    try {
+      const snapshot = d1Snapshot('suspended');
+      const date = new Date('2026-01-01T00:00:00Z');
+      const record = {
+        workflowName: 'd1-workflow',
+        runId: 'd1-run',
+        snapshot: shape === 'string' ? JSON.stringify(snapshot) : snapshot,
+        createdAt:
+          shape === 'string'
+            ? ('2026-01-01T00:00:00Z' as unknown as Date)
+            : date,
+        updatedAt: date,
+      };
+      const read = vi
+        .spyOn(f.workflows, 'getWorkflowRunById')
+        .mockResolvedValue(record);
+      const selected = await f.runtime.authoritativeStartState(
+        'd1-workflow',
+        'd1-run',
+      );
+      assert(snapshot.context.gate);
+      snapshot.context.gate.suspendPayload = { source: 'S2' };
+      snapshot.requestContext['flowsafe.runProvenance'].startToken = 'S2';
+      date.setTime(0);
+      expect(selected).toMatchObject({
+        storage: 'unfenced',
+        execution: { tablePrefix: null, startToken: 'S1' },
+        summary: {
+          suspendPayload: { gate: { source: 'S1' } },
+          createdAt: '2026-01-01T00:00:00.000Z',
+        },
+      });
+      expect(selected).not.toHaveProperty('raw');
+      expect(selected?.snapshot.context.gate?.suspendPayload).toEqual({
+        source: 'S1',
+      });
+      expect(read).toHaveBeenCalledTimes(1);
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    'pending',
+    'success',
+    'suspended',
+  ] as const)('classifies raw %s independently of retained marker and lifecycle', async (status) => {
+    const f = await d1Fixture();
+    try {
+      for (const marker of [undefined, true])
+        for (const terminal of [false, true]) {
+          const snapshot = d1Snapshot(status);
+          snapshot.requestContext['flowsafe.runProvenance'].initialAdmission =
+            marker;
+          if (terminal)
+            snapshot.requestContext['flowsafe.runLifecycle'] = {
+              version: 1,
+              revision: 2,
+              deadlineAt: 50,
+              terminal: {
+                status: 'timed_out',
+                error: { code: 'TIMED_OUT', message: 'run timed out' },
+                transitionedAt: 100,
+                replayPrincipals: [{ kind: 'human', id: 'owner' }],
+              },
+            };
+          await f.seed(snapshot);
+          const selected = await f.runtime.authoritativeStartState(
+            'd1-workflow',
+            'd1-run',
+          );
+          expect(selected?.kind).toBe(
+            status === 'pending' ? 'initial' : 'result',
+          );
+          if (status === 'pending')
+            expect(selected).not.toHaveProperty('summary');
+          else
+            expect(selected?.summary?.status).toBe(
+              terminal ? 'timed_out' : status,
+            );
+        }
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    'unattributed',
+    'inherited child',
+    'agent',
+  ] as const)('reads role-neutral %s v2 provenance without auxiliary context', async (mode) => {
+    const f = await d1Fixture();
+    try {
+      const snapshot = d1Snapshot();
+      const provenance = snapshot.requestContext['flowsafe.runProvenance'];
+      if (mode === 'unattributed') {
+        delete provenance.startIdentity;
+        delete provenance.requestedBy;
+        delete provenance.requestedByKind;
+      }
+      if (mode === 'inherited child')
+        provenance.startIdentity.target.id = 'parent-workflow';
+      if (mode === 'agent') {
+        provenance.startIdentity.target = {
+          kind: 'agent',
+          id: 'logical-agent',
+          threadId: 'thread-1',
+        };
+        provenance.agentStart = { threaded: true };
+      }
+      await f.seed(snapshot);
+      const selected = await f.runtime.authoritativeStartState(
+        'd1-workflow',
+        'd1-run',
+      );
+      expect(selected?.provenance).toEqual(provenance);
+      expect(selected?.execution).toEqual({
+        tablePrefix: '',
+        workflowId: 'd1-workflow',
+        runId: 'd1-run',
+        startToken: 'S1',
+      });
+      expect(selected?.summary?.requestedBy).toBe(
+        mode === 'unattributed' ? undefined : 'owner',
+      );
+      expect(selected).not.toHaveProperty('startIdentity');
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    ['absent', undefined],
+    ['v1', { version: 1 }],
+    ['unknown version', { version: 3 }],
+    ['marker', { initialAdmission: false }],
+    ['start token', { startToken: 'bad/token' }],
+    ['attempt token', { attemptToken: '' }],
+    ['requester', { requestedByKind: 'robot' }],
+    ['counts', { resumeCounts: [['gate', 0]] }],
+    ['epoch', { mutationEpoch: -1 }],
+    ['agent mode', { agentStart: { threaded: 'true' } }],
+  ])('refuses modern association with malformed provenance: %s', async (label, corruption) => {
+    const f = await d1Fixture();
+    try {
+      const snapshot = d1Snapshot();
+      if (label === 'agent mode')
+        snapshot.requestContext['flowsafe.runProvenance'].startIdentity.target =
+          { kind: 'agent', id: 'logical-agent', threadId: 'thread-1' };
+      snapshot.requestContext['flowsafe.runProvenance'] =
+        label === 'absent'
+          ? undefined
+          : {
+              ...snapshot.requestContext['flowsafe.runProvenance'],
+              ...corruption,
+            };
+      await f.seed(snapshot);
+      await expect(
+        f.runtime.authoritativeStartState('d1-workflow', 'd1-run'),
+      ).rejects.toThrow(RunStateUnreadableError);
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    ['runId', 'other-run'],
+    ['status', 'invented'],
+    ['requestContext', []],
+    ['context', null],
+    ['suspendedPaths', []],
+    ['requestContext', { 'flowsafe.runLifecycle': { version: 99 } }],
+  ])('refuses malformed consumed snapshot field %s', async (key, value) => {
+    const f = await d1Fixture();
+    try {
+      const snapshot = d1Snapshot();
+      const replacement =
+        key === 'requestContext' && !Array.isArray(value)
+          ? { ...snapshot.requestContext, ...(value as object) }
+          : value;
+      await f.seed({ ...snapshot, [key]: replacement } as WorkflowRunState);
+      await expect(
+        f.runtime.authoritativeStartState('d1-workflow', 'd1-run'),
+      ).rejects.toThrow(RunStateUnreadableError);
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    ['tablePrefix', 'other_'],
+    ['workflowId', 'other-workflow'],
+    ['runId', 'other-run'],
+    ['resourceId', 12],
+    ['snapshot', '{'],
+    ['snapshot', 'null'],
+    ['snapshot', '[]'],
+    ['createdAt', 'invalid'],
+    ['updatedAt', 'invalid'],
+  ])('refuses a wrong or malformed raw field: %s', async (key, value) => {
+    const f = await d1Fixture();
+    try {
+      await f.seed();
+      const row = await f.capability.readSnapshot({
+        workflowId: 'd1-workflow',
+        runId: 'd1-run',
+      });
+      vi.spyOn(f.capability, 'readSnapshot').mockResolvedValue({
+        ...row,
+        [key]: value,
+      } as NonNullable<typeof row>);
+      await expect(
+        f.runtime.authoritativeStartState('d1-workflow', 'd1-run'),
+      ).rejects.toThrow(RunStateUnreadableError);
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    'workflowName',
+    'runId',
+    'timestamp',
+    'noncloneable',
+  ] as const)('refuses malformed custom record: %s', async (field) => {
+    const f = await d1Fixture('unfenced');
+    try {
+      const snapshot = d1Snapshot();
+      if (field === 'noncloneable')
+        snapshot.result = { callback: () => undefined };
+      vi.spyOn(f.workflows, 'getWorkflowRunById').mockResolvedValue({
+        workflowName: field === 'workflowName' ? 'other' : 'd1-workflow',
+        runId: field === 'runId' ? 'other' : 'd1-run',
+        snapshot,
+        createdAt: field === 'timestamp' ? new Date(Number.NaN) : new Date(100),
+        updatedAt: new Date(100),
+      });
+      await expect(
+        f.runtime.authoritativeStartState('d1-workflow', 'd1-run'),
+      ).rejects.toThrow(RunStateUnreadableError);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('retains input taxonomy and fixed unreadable messages for source failures', async () => {
+    const f = await d1Fixture();
+    try {
+      await expect(
+        f.runtime.authoritativeStartState('bad/workflow', 'd1-run'),
+      ).rejects.toThrow(InvalidRunRequestError);
+      await expect(
+        f.runtime.authoritativeStartState('d1-workflow', 'bad/run'),
+      ).rejects.toThrow(InvalidRunRequestError);
+      await expect(
+        f.runtime.authoritativeStartState('unknown', 'd1-run'),
+      ).rejects.toThrow(UnknownWorkflowError);
+      const cause = new Error('secret-token-storage-failure');
+      vi.spyOn(f.capability, 'readSnapshot').mockRejectedValue(cause);
+      await expect(
+        f.runtime.authoritativeStartState('d1-workflow', 'd1-run'),
+      ).rejects.toMatchObject({
+        name: 'RunStateUnreadableError',
+        message: "run 'd1-run' of workflow 'd1-workflow' state is not readable",
+        cause,
+      });
+      vi.spyOn(f.storage, 'getStore').mockResolvedValue(undefined);
+      await expect(
+        f.runtime.authoritativeStartState('d1-workflow', 'd1-run'),
+      ).rejects.toThrow(RunStateUnreadableError);
+      const missingStorage = new Mastra({ logger: false });
+      vi.spyOn(missingStorage, 'getStorage').mockReturnValue(undefined);
+      vi.spyOn(f.workflow, 'mastra', 'get').mockReturnValue(missingStorage);
+      await expect(
+        f.runtime.authoritativeStartState('d1-workflow', 'd1-run'),
+      ).rejects.toThrow(RunStateUnreadableError);
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    'undefined',
+    'storage failure',
+  ] as const)('refuses custom %s instead of reporting absence', async (mode) => {
+    const f = await d1Fixture('unfenced');
+    try {
+      const read = vi.spyOn(f.workflows, 'getWorkflowRunById');
+      if (mode === 'undefined') read.mockResolvedValue(undefined as never);
+      else read.mockRejectedValue(new Error('secret-storage-token'));
+      await expect(
+        f.runtime.authoritativeStartState('d1-workflow', 'd1-run'),
+      ).rejects.toMatchObject({
+        name: 'RunStateUnreadableError',
+        message: "run 'd1-run' of workflow 'd1-workflow' state is not readable",
+      });
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    'fence',
+    'start',
+  ] as const)('checks matching %s binding without reading or seeding its state', async (bound) => {
+    const f = await d1Fixture('default', bound);
+    try {
+      await f.seed();
+      const store =
+        bound === 'fence'
+          ? f.runtime.executionFence
+          : f.runtime.startIdempotency;
+      assert(store);
+      const admission = vi.spyOn(store, 'readForAdmission');
+      const prepare = vi.spyOn(f.sql, 'prepare');
+      expect(
+        await f.runtime.authoritativeStartState('d1-workflow', 'd1-run'),
+      ).toMatchObject({ execution: { startToken: 'S1' } });
+      expect(admission).not.toHaveBeenCalled();
+      expect(
+        prepare.mock.calls.every(
+          ([sql]) =>
+            /^\s*SELECT\b/i.test(sql) &&
+            sql.includes('mastra_workflow_snapshot'),
+        ),
+      ).toBe(true);
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    'fence',
+    'start',
+  ] as const)('rejects mismatched %s binding before reading a snapshot', async (bound) => {
+    const f = await d1Fixture('default', bound);
+    try {
+      const store =
+        bound === 'fence'
+          ? f.runtime.executionFence
+          : f.runtime.startIdempotency;
+      assert(store);
+      vi.spyOn(store, 'usesDatabase').mockReturnValue(false);
+      const read = vi.spyOn(f.capability, 'readSnapshot');
+      await expect(
+        f.runtime.authoritativeStartState('d1-workflow', 'd1-run'),
+      ).rejects.toThrow(RunStateUnreadableError);
+      expect(read).not.toHaveBeenCalled();
+    } finally {
+      f.close();
+    }
+  });
+
+  it('refuses a fenced custom domain instead of granting a fallback identity', async () => {
+    const f = await d1Fixture('unfenced', 'fence');
+    try {
+      const read = vi.spyOn(f.workflows, 'getWorkflowRunById');
+      await expect(
+        f.runtime.authoritativeStartState('d1-workflow', 'd1-run'),
+      ).rejects.toThrow(RunStateUnreadableError);
+      expect(read).not.toHaveBeenCalled();
+    } finally {
+      f.close();
+    }
+  });
+
+  it('uses the registered workflow storage instead of nominal Runtime storage', async () => {
+    const f = await d1Fixture();
+    const actual = await d1Fixture('prefixed');
+    try {
+      await actual.seed();
+      vi.spyOn(f.workflow, 'mastra', 'get').mockReturnValue(
+        new Mastra({ storage: actual.storage, logger: false }),
+      );
+      const nominal = vi.spyOn(f.capability, 'readSnapshot');
+      expect(
+        await f.runtime.authoritativeStartState('d1-workflow', 'd1-run'),
+      ).toMatchObject({
+        storage: 'd1',
+        execution: { tablePrefix: 'd1_', startToken: 'S1' },
+      });
+      expect(nominal).not.toHaveBeenCalled();
+    } finally {
+      f.close();
+      actual.close();
+    }
+  });
+
+  it.each([
+    'capability',
+    'workflow storage',
+  ] as const)('captures the original D1 source across held-read %s replacement', async (replacement) => {
+    const f = await d1Fixture();
+    const other = await d1Fixture('prefixed');
+    const held = cDeferred();
+    const release = cDeferred();
+    try {
+      await f.seed();
+      await other.seed();
+      const capability = f.capability;
+      const read = capability.readSnapshot;
+      const original = await read.call(capability, {
+        workflowId: 'd1-workflow',
+        runId: 'd1-run',
+      });
+      const receivers: unknown[] = [];
+      const selectedRead = vi.fn(async function (
+        this: FencedWorkflowAdmissionCapability,
+        address: { workflowId: string; runId: string },
+      ) {
+        receivers.push(this);
+        const row = await read.call(this, address);
+        held.resolve();
+        await release.promise;
+        return row;
+      });
+      capability.readSnapshot = selectedRead;
+      const pending = f.runtime.authoritativeStartState(
+        'd1-workflow',
+        'd1-run',
+      );
+      await held.promise;
+      const otherRead = vi.spyOn(other.capability, 'readSnapshot');
+      if (replacement === 'capability') {
+        Object.assign(capability, other.capability);
+        Object.defineProperty(f.workflows, FENCED_WORKFLOW_STORAGE, {
+          value: other.capability,
+        });
+      } else
+        vi.spyOn(f.workflow, 'mastra', 'get').mockReturnValue(
+          new Mastra({ storage: other.storage, logger: false }),
+        );
+      release.resolve();
+      const selected = await pending;
+      expect(selected).toMatchObject({
+        storage: 'd1',
+        execution: {
+          tablePrefix: '',
+          workflowId: 'd1-workflow',
+          runId: 'd1-run',
+          startToken: 'S1',
+        },
+        raw: original,
+      });
+      expect(receivers).toEqual([capability]);
+      expect(selectedRead).toHaveBeenCalledTimes(1);
+      expect(otherRead).not.toHaveBeenCalled();
+    } finally {
+      release.resolve();
+      f.close();
+      other.close();
+    }
+  });
+
+  it('captures the custom domain method and receiver before a held read', async () => {
+    const f = await d1Fixture('unfenced');
+    const held = cDeferred();
+    const release = cDeferred();
+    try {
+      await f.seed();
+      const read = f.workflows.getWorkflowRunById;
+      const receivers: unknown[] = [];
+      const selectedRead = vi
+        .spyOn(f.workflows, 'getWorkflowRunById')
+        .mockImplementation(async function (this: typeof f.workflows, input) {
+          receivers.push(this);
+          const row = await read.call(this, input);
+          held.resolve();
+          await release.promise;
+          return row;
+        });
+      const pending = f.runtime.authoritativeStartState(
+        'd1-workflow',
+        'd1-run',
+      );
+      await held.promise;
+      const replacement = vi.fn(read.bind(f.workflows));
+      f.workflows.getWorkflowRunById = replacement;
+      release.resolve();
+      expect(await pending).toMatchObject({
+        execution: { tablePrefix: null, startToken: 'S1' },
+      });
+      expect(receivers).toEqual([f.workflows]);
+      expect(selectedRead).toHaveBeenCalledTimes(1);
+      expect(replacement).not.toHaveBeenCalled();
+    } finally {
+      release.resolve();
+      f.close();
+    }
+  });
+
+  it.each([
+    'success',
+    'failed',
+    'suspended',
+    'foreach',
+    'lifecycle',
+  ] as const)('matches a frozen v1 summary twin for %s', async (mode) => {
+    const f = await d1Fixture();
+    try {
+      const snapshot = d1Snapshot(
+        mode === 'foreach' || mode === 'lifecycle' ? 'suspended' : mode,
+      );
+      if (mode === 'foreach')
+        snapshot.context.gate = [
+          {
+            status: 'suspended',
+            suspendPayload: { source: 'old' },
+            suspendedAt: 50,
+          },
+          snapshot.context.gate,
+        ] as unknown as WorkflowRunState['context'][string];
+      if (mode === 'lifecycle')
+        snapshot.requestContext['flowsafe.runLifecycle'] = {
+          version: 1,
+          revision: 1,
+          deadlineAt: 50,
+          terminal: {
+            status: 'timed_out',
+            error: { code: 'TIMED_OUT', message: 'run timed out' },
+            transitionedAt: 100,
+            replayPrincipals: [{ kind: 'human', id: 'owner' }],
+          },
+        };
+      snapshot.requestContext['flowsafe.runProvenance'].version = 1;
+      await f.seed(snapshot);
+      const twin = structuredClone(
+        await f.runtime.status('d1-workflow', 'd1-run'),
+      );
+      const before = await f.capability.readSnapshot({
+        workflowId: 'd1-workflow',
+        runId: 'd1-run',
+      });
+      assert(before);
+      snapshot.requestContext['flowsafe.runProvenance'].version = 2;
+      f.sql
+        .prepare(
+          'UPDATE mastra_workflow_snapshot SET snapshot = ? WHERE workflow_name = ? AND run_id = ?',
+        )
+        .run(JSON.stringify(snapshot), 'd1-workflow', 'd1-run');
+      const selected = await f.runtime.authoritativeStartState(
+        'd1-workflow',
+        'd1-run',
+      );
+      expect(selected?.summary).toEqual(twin);
+      expect(selected?.snapshot).toEqual(snapshot);
+      expect(selected?.summary).toMatchObject({
+        createdAt: new Date(before.createdAt).toISOString(),
+        updatedAt: new Date(before.updatedAt).toISOString(),
+        requestedBy: 'owner',
+        requestedByKind: 'human',
+      });
+      if (mode === 'success')
+        expect(selected?.summary?.result).toEqual({ source: 'S1' });
+      if (mode === 'failed')
+        expect(selected?.summary?.error).toBe('S1 failure');
+      if (mode === 'suspended' || mode === 'foreach')
+        expect(selected?.summary).toMatchObject({
+          suspendPayload: { gate: { source: 'S1' } },
+          suspendedAt: { gate: 100 },
+          resumedAt: { gate: 90 },
+          resumeCount: { gate: 2 },
+        });
+      for (const key of [
+        'provenance',
+        'requestContext',
+        'startToken',
+        'attemptToken',
+        'raw',
+        'snapshot',
+      ])
+        expect(selected?.summary).not.toHaveProperty(key);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('keeps nested collisions root-local against a frozen v1 twin and raw payload', async () => {
+    const f = d0Fixture();
+    d0Collision(f);
+    try {
+      await f.runtime.start('d0-root', d0Start);
+      const twin = structuredClone(await f.runtime.status('d0-root', 'd0-run'));
+      const row = f.row();
+      const snapshot = JSON.parse(row.snapshot) as WorkflowRunState;
+      assert(snapshot.requestContext);
+      snapshot.requestContext['flowsafe.runProvenance'].version = 2;
+      f.replaceSnapshot(snapshot);
+      const selectedRow = f.row();
+      f.changeChild('a', 'd0-run', 'b', 123456);
+      f.reads.length = 0;
+      const selected = await f.runtime.authoritativeStartState(
+        'd0-root',
+        'd0-run',
+      );
+      expect(selected?.summary).toEqual(twin);
+      d0AssertRootSummary(selected?.summary ?? null, selectedRow);
+      expect(selected?.summary?.suspendPayload).toHaveProperty('a.b', {
+        reason: 'root a.b',
+        [SUSPENSION_DEADLINE_PAYLOAD_KEY]: 900_000,
+      });
+      expect(f.reads).toHaveLength(1);
+      assert(selected?.summary);
+      expect(suspensionDeadlinesOf(selected.summary)).toEqual(
+        d0DeadlineRefusal,
+      );
+    } finally {
+      f.close();
+    }
+  });
+
+  it('preserves magic own step keys and excludes Core control entries', async () => {
+    const f = await d1Fixture();
+    try {
+      const snapshot = d1Snapshot('suspended');
+      const keys = ['__proto__', 'constructor', 'toString'];
+      snapshot.context = Object.fromEntries(
+        [...keys, 'input', '__state'].map((key, index) => [
+          key,
+          {
+            status: 'suspended',
+            payload: {},
+            startedAt: 50,
+            suspendPayload: { key },
+            suspendedAt: 100 + index,
+            resumedAt: 90 + index,
+          },
+        ]),
+      );
+      snapshot.suspendedPaths = Object.fromEntries(
+        [...keys, 'input', '__state'].map((key) => [key, [0]]),
+      );
+      snapshot.requestContext['flowsafe.runProvenance'].resumeCounts = keys.map(
+        (key, index) => [key, index + 1],
+      );
+      await f.seed(snapshot);
+      const selected = await f.runtime.authoritativeStartState(
+        'd1-workflow',
+        'd1-run',
+      );
+      assert(selected?.summary);
+      const summary = selected.summary;
+      for (const field of [
+        'suspendPayload',
+        'suspendedAt',
+        'resumedAt',
+        'resumeCount',
+      ] as const) {
+        const map = summary[field] as Record<string, unknown>;
+        expect(Object.getPrototypeOf(map)).toBeNull();
+        expect(Object.keys(map)).toEqual(keys);
+        keys.forEach((key, index) => {
+          expect(Object.hasOwn(map, key)).toBe(true);
+          expect(map[key]).toEqual(
+            field === 'suspendPayload'
+              ? { key }
+              : field === 'suspendedAt'
+                ? 100 + index
+                : field === 'resumedAt'
+                  ? 90 + index
+                  : index + 1,
+          );
+        });
+      }
+    } finally {
+      f.close();
+    }
+  });
+
+  it('leaves existing starts on v1 without invoking the dormant reader', async () => {
+    const f = await d1Fixture();
+    try {
+      const read = vi.spyOn(f.runtime, 'authoritativeStartState');
+      await f.runtime.start('d1-workflow', {
+        runId: 'd1-run',
+        inputData: {},
+        attemptToken: 'ordinary',
+      });
+      expect(read).not.toHaveBeenCalled();
+      const row = await f.capability.readSnapshot({
+        workflowId: 'd1-workflow',
+        runId: 'd1-run',
+      });
+      assert(row);
+      expect(
+        JSON.parse(row.snapshot).requestContext['flowsafe.runProvenance'],
+      ).toMatchObject({ version: 1, startToken: 'ordinary' });
+    } finally {
+      f.close();
+    }
+  });
+});
 
 interface D0Snapshot {
   status: RunSummary['status'];
@@ -133,6 +1095,11 @@ function d0Fixture(requestContextForRun?: RequestContextProvider) {
     reads,
     snapshot: (workflowId = 'd0-root', runId = 'd0-run') =>
       JSON.parse(row(workflowId, runId).snapshot) as D0Snapshot,
+    replaceSnapshot(snapshot: WorkflowRunState) {
+      prepare(
+        'UPDATE mastra_workflow_snapshot SET snapshot = ? WHERE workflow_name = ? AND run_id = ?',
+      ).run(JSON.stringify(snapshot), 'd0-root', 'd0-run');
+    },
     changeChild(workflowId: string, runId: string, step: string, time: number) {
       const snapshot = JSON.parse(
         row(workflowId, runId).snapshot,
