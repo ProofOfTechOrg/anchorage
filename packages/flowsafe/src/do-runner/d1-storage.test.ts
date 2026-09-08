@@ -2418,7 +2418,7 @@ function reservationRows(
 }
 
 describe('purgeExpiredWorkflowRuns — start reservations', () => {
-  it('deletes a spent reservation in the SAME batch as its run’s snapshot', async () => {
+  it('removes an expired snapshot and legacy reservation', async () => {
     const sqlite = openSqlite();
     createSnapshotTable(sqlite);
     createReservationTable(sqlite);
@@ -2646,7 +2646,7 @@ describe('purgeExpiredWorkflowRuns — start reservations', () => {
     expect(remainingRunIds(sqlite)).toEqual([]);
   });
 
-  it('pairs reservations on the artifact path too', async () => {
+  it('removes an expired snapshot and legacy reservation with an artifact store', async () => {
     const sqlite = openSqlite();
     createSnapshotTable(sqlite);
     createReservationTable(sqlite);
@@ -2803,7 +2803,6 @@ function retentionIntercept(
   ): SnapshotStatement {
     return {
       ...statement,
-      bind: (...bound) => wrap(sql, statement.bind(...bound), bound),
       all: async <T>() => {
         hooks.statement?.(sql, values);
         const result = await statement.all<T>();
@@ -3960,7 +3959,7 @@ describe('run retention SQL boundaries', () => {
     );
   });
 
-  it('does not delete a case-changed physical address or raw legacy value', async () => {
+  it('preserves a snapshot when its workflow name changes case', async () => {
     const { sqlite, db, cycle } = retentionWorld();
     retentionSnapshot(sqlite, 'run');
     const intercepted = retentionIntercept(db, {
