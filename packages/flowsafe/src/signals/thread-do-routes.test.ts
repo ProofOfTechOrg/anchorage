@@ -4188,7 +4188,7 @@ describe('createThreadSignalRoutes and the deployment execution fence', () => {
     expect(calls).toEqual([]);
   });
 
-  it('admits proof-only delivery to the nominated run and nothing else', async () => {
+  it('refuses legacy run-only proof delivery before all signal effects', async () => {
     // #given — a proof state already bound to 'active-run'.
     const fence = await fenceAt('migration-locked');
     await fence.transition({
@@ -4211,7 +4211,7 @@ describe('createThreadSignalRoutes and the deployment execution fence', () => {
       post('/signal', { contents: 'hi' }),
       scopeWith(undefined, fence),
     );
-    expect(admitted?.status).toBe(200);
+    expect(admitted?.status).toBe(503);
 
     // #and — a thread whose active run is NOT the proof run does not.
     (
@@ -4258,5 +4258,745 @@ describe('createThreadSignalRoutes and the deployment execution fence', () => {
     expect(await res?.json()).toMatchObject({
       reason: { code: 'EXECUTION_FENCE_UNREADABLE' },
     });
+  });
+});
+
+describe('FS8 D3 proof activation signal boundaries', () => {
+  async function modern() {
+    const sqlite = openSqlite();
+    const db = sqliteUnitDatabase(sqlite) as ExecutionFenceDatabase;
+    const fence = new ExecutionFenceStore(db);
+    await fence.seed('migration-locked');
+    await fence.transition({
+      expected: 'migration-locked',
+      next: 'proof-only',
+      proofKey: 'proof',
+    });
+    sqlite.exec(
+      "UPDATE flowsafe_execution_fence SET proof_run_id = 'active-run', proof_table_prefix = 'proof_', proof_workflow_id = 'actual-agent-workflow', proof_start_token = 'generation'",
+    );
+    sqlite.exec(
+      'CREATE TABLE proof_mastra_workflow_snapshot (workflow_name TEXT, run_id TEXT, resourceId TEXT, snapshot TEXT, createdAt TEXT, updatedAt TEXT)',
+    );
+    const source = {
+      version: 2,
+      startToken: 'generation',
+      attemptToken: 'attempt',
+      resumeCounts: [],
+    };
+    const write = () => {
+      sqlite.exec('DELETE FROM proof_mastra_workflow_snapshot');
+      sqlite
+        .prepare(
+          'INSERT INTO proof_mastra_workflow_snapshot VALUES (?,?,?,?,?,?)',
+        )
+        .run(
+          'actual-agent-workflow',
+          'active-run',
+          'acme_res',
+          JSON.stringify({
+            runId: 'active-run',
+            status: 'suspended',
+            requestContext: { 'flowsafe.runProvenance': source },
+          }),
+          'created',
+          'updated',
+        );
+    };
+    write();
+    const mock = mockAgent();
+    let active: string | undefined = 'active-run';
+    const runtime = { executionFence: fence };
+    Object.assign(mock.agent, {
+      getActiveThreadRunId: () => active,
+      proofExecutionFor: async (
+        expected: unknown,
+        _thread: string,
+        runId: string,
+      ) => {
+        if (expected !== runtime) throw new Error('runtime mismatch');
+        return fence.readCurrentRunExecution({
+          tablePrefix: 'proof_',
+          workflowId: 'actual-agent-workflow',
+          runId,
+        });
+      },
+    });
+    const scope = {
+      ...scopeWith(undefined, fence),
+      init: { runtime, executionFence: fence },
+    } as unknown as ThreadScope;
+    const replace = () => {
+      source.startToken = 'replacement';
+      write();
+    };
+    return {
+      ...mock,
+      sqlite,
+      fence,
+      scope,
+      replace,
+      setActive: (value: string | undefined) => {
+        active = value;
+      },
+    };
+  }
+
+  const routes = [
+    ['/signal/message', { contents: 'hello', ifIdle: 'persist' }],
+    ['/signal/queue', { contents: 'hello' }],
+    ['/signal', { contents: 'hello', ifIdle: 'persist' }],
+    [
+      '/signal/state',
+      { id: 'state', cacheKey: 'key', contents: 'hello', value: 'one' },
+    ],
+    [
+      '/signal/notification',
+      { source: 'test', kind: 'update', summary: 'hello' },
+    ],
+  ] as const;
+  it.each(
+    routes,
+  )('preserves the original generation at the final Core boundary %s route', async (path, body) => {
+    const h = await modern();
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      contentPolicy: async () => {
+        h.replace();
+        return { allowed: true };
+      },
+    });
+    const response = await route(post(path, body), h.scope);
+    expect(h.calls).toEqual([]);
+    expect(response?.status).toBe(503);
+    expect(await response?.json()).toMatchObject({
+      reason: { code: 'EXECUTION_FENCED' },
+    });
+  });
+
+  function activeIdRace(h: Awaited<ReturnType<typeof modern>>) {
+    let armed = false;
+    const read = h.fence.readCurrentRunExecution.bind(h.fence);
+    const raced: Awaited<ReturnType<typeof read>>[] = [];
+    const proofRead = vi
+      .spyOn(h.fence, 'readCurrentRunExecution')
+      .mockImplementation(async (address) => {
+        const execution = await read(address);
+        if (armed) {
+          armed = false;
+          h.setActive('other');
+          raced.push(execution);
+        }
+        return execution;
+      });
+    return {
+      arm: () => {
+        armed = true;
+      },
+      raced,
+      proofRead,
+    };
+  }
+
+  const originalProof = {
+    tablePrefix: 'proof_',
+    workflowId: 'actual-agent-workflow',
+    runId: 'active-run',
+    startToken: 'generation',
+  };
+
+  it.each(
+    routes,
+  )('refuses an active ID changed during the final proof read at %s route', async (path, body) => {
+    const h = await modern();
+    const race = activeIdRace(h);
+    let policyCalls = 0;
+    const contentPolicy = vi.fn(async () => {
+      policyCalls++;
+      if (path === '/signal/notification' && policyCalls === 2) race.arm();
+      return { allowed: true as const };
+    });
+    const getMemory = h.agent.getMemory.bind(h.agent);
+    const memory = vi
+      .spyOn(h.agent, 'getMemory')
+      .mockImplementation(async () => {
+        const available = await getMemory();
+        race.arm();
+        return available;
+      });
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      contentPolicy,
+    });
+    const response = await route(post(path, body), h.scope);
+    expect(h.calls).toEqual([]);
+    expect(race.raced).toEqual([originalProof]);
+    expect(race.proofRead).toHaveBeenCalledTimes(2);
+    expect(contentPolicy).toHaveBeenCalledTimes(
+      path === '/signal/notification' ? 2 : 1,
+    );
+    expect(memory).toHaveBeenCalledTimes(
+      path === '/signal/notification' ? 0 : 1,
+    );
+    expect(response?.status).toBe(503);
+    expect(await response?.json()).toMatchObject({
+      reason: { code: 'EXECUTION_FENCED' },
+    });
+  });
+
+  it('refuses an active ID changed during the final proof read at active-only signal', async () => {
+    const h = await modern();
+    const race = activeIdRace(h);
+    const contentPolicy = vi.fn(async () => {
+      race.arm();
+      return { allowed: true as const };
+    });
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      contentPolicy,
+    });
+    const response = await route(
+      post('/signal', { contents: 'hello' }),
+      h.scope,
+    );
+    expect(h.calls).toEqual([]);
+    expect(race.raced).toEqual([originalProof]);
+    expect(race.proofRead).toHaveBeenCalledTimes(2);
+    expect(contentPolicy).toHaveBeenCalledTimes(1);
+    expect(response?.status).toBe(503);
+    expect(await response?.json()).toMatchObject({
+      reason: { code: 'EXECUTION_FENCED' },
+    });
+  });
+
+  it('refuses an active ID changed during the final proof read at schedule Core', async () => {
+    const h = await modern();
+    const race = activeIdRace(h);
+    const begin = vi.fn(async () => ({ state: 'ready' as const }));
+    const settle = vi.fn(async () => undefined);
+    const contentPolicy = vi.fn(async () => {
+      race.arm();
+      return { allowed: true as const };
+    });
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      resolveScheduleTarget: async () =>
+        scheduleTarget({
+          resourceId: 'acme_res',
+          ifIdle: { behavior: 'persist' },
+        }),
+      resolveScheduleDispatchStore: () => ({ begin, settle }),
+      contentPolicy,
+    });
+    const response = await route(
+      post('/signal/schedule', {
+        scheduleId: 'schedule_1',
+        dispatchId: 'dispatch_1',
+        runId: 'run_1',
+      }),
+      h.scope,
+    );
+    expect(h.calls).toEqual([]);
+    expect(begin).toHaveBeenCalledExactlyOnceWith('schedule_1', 'dispatch_1');
+    expect(settle).not.toHaveBeenCalled();
+    expect(race.raced).toEqual([originalProof]);
+    expect(race.proofRead).toHaveBeenCalledTimes(3);
+    expect(contentPolicy).toHaveBeenCalledTimes(1);
+    expect(response?.status).toBe(503);
+    expect(await response?.json()).toMatchObject({
+      reason: { code: 'EXECUTION_FENCED' },
+    });
+  });
+
+  it('refuses an active ID changed during the final proof read at notification persistence', async () => {
+    const h = await modern();
+    const race = activeIdRace(h);
+    const storage = new InMemoryNotificationsStorage();
+    const create = vi.spyOn(storage, 'createNotification');
+    const update = vi.spyOn(storage, 'updateNotification');
+    const record = await storage.createNotification({
+      threadId: 'acme_t1',
+      resourceId: 'acme_res',
+      agentId: 'agent',
+      source: 'test',
+      kind: 'update',
+      summary: 'hello',
+      priority: 'low',
+      deliverAt: new Date(0),
+      summaryAt: new Date(0),
+    });
+    const before = await storage.getNotification({
+      threadId: 'acme_t1',
+      id: record.id,
+    });
+    const getMemory = h.agent.getMemory.bind(h.agent);
+    const memory = vi
+      .spyOn(h.agent, 'getMemory')
+      .mockImplementation(async () => {
+        const available = await getMemory();
+        race.arm();
+        return available;
+      });
+    const contentPolicy = vi.fn(async () => ({ allowed: true as const }));
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      resolveNotificationsStorage: () => storage,
+      contentPolicy,
+    });
+    const response = await route(
+      post('/signal/notifications/dispatch', {
+        agentId: 'agent',
+        resourceId: 'acme_res',
+        notificationIds: [record.id],
+      }),
+      h.scope,
+    );
+    expect(h.calls).toEqual([]);
+    expect(
+      await storage.getNotification({ threadId: 'acme_t1', id: record.id }),
+    ).toEqual(before);
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(update).not.toHaveBeenCalled();
+    expect(race.raced).toEqual([originalProof]);
+    expect(race.proofRead).toHaveBeenCalledTimes(2);
+    expect(memory).toHaveBeenCalledTimes(1);
+    expect(contentPolicy).toHaveBeenCalledTimes(1);
+    expect(response?.status).toBe(503);
+    expect(await response?.json()).toMatchObject({
+      reason: { code: 'EXECUTION_FENCED' },
+    });
+  });
+
+  it('refuses an active ID changed during the final proof read at wake delivery', async () => {
+    const h = await modern();
+    const race = activeIdRace(h);
+    const getMemory = h.agent.getMemory.bind(h.agent);
+    const memory = vi
+      .spyOn(h.agent, 'getMemory')
+      .mockImplementation(async () => {
+        const available = await getMemory();
+        race.arm();
+        return available;
+      });
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      serializeDispatch: async (_scope, operation) => operation(),
+    });
+    const response = await route(
+      post('/signal/message', { contents: 'hello', ifIdle: 'wake' }),
+      h.scope,
+    );
+    expect(h.calls).toEqual([]);
+    expect(race.raced).toEqual([originalProof]);
+    expect(race.proofRead).toHaveBeenCalledTimes(3);
+    expect(memory).toHaveBeenCalledTimes(1);
+    expect(response?.status).toBe(503);
+    expect(await response?.json()).toMatchObject({
+      reason: { code: 'EXECUTION_FENCED' },
+    });
+  });
+
+  it.each([
+    'serialized-selection',
+    'memory',
+    'active-id',
+  ] as const)('preserves wake generation through %s before delivering', async (boundary) => {
+    const h = await modern();
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      serializeDispatch: async (_scope, operation) => operation(),
+      resolveBlockingRun:
+        boundary === 'serialized-selection'
+          ? async () => {
+              h.replace();
+              return undefined;
+            }
+          : undefined,
+    });
+    if (boundary !== 'serialized-selection')
+      Object.assign(h.agent, {
+        getMemory: async () => {
+          if (boundary === 'memory') h.replace();
+          else h.setActive('other');
+          return {};
+        },
+      });
+    const response = await route(
+      post('/signal/message', { contents: 'hello', ifIdle: 'wake' }),
+      h.scope,
+    );
+    expect(h.calls).toEqual([]);
+    expect(response?.status).toBe(503);
+  });
+
+  it('admits current proof delivery and refuses an idle thread at the all-route gate', async () => {
+    const h = await modern();
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+    });
+    const delivered = await route(
+      post('/signal', { contents: 'hello' }),
+      h.scope,
+    );
+    expect(h.calls).toHaveLength(1);
+    expect(delivered?.status).toBe(200);
+    h.calls.length = 0;
+    h.setActive(undefined);
+    const refused = await route(
+      post('/signal', { contents: 'hello' }),
+      h.scope,
+    );
+    expect(h.calls).toEqual([]);
+    expect(refused?.status).toBe(503);
+  });
+
+  it.each([
+    'brand',
+    'method',
+    'runtime-fence',
+  ] as const)('requires trusted wrapper %s at the all-route gate', async (missing) => {
+    const h = await modern();
+    if (missing === 'brand')
+      delete (h.agent as unknown as Record<symbol, unknown>)[
+        RUNTIME_DRIVEN_AGENT
+      ];
+    if (missing === 'method')
+      delete (h.agent as unknown as { proofExecutionFor?: unknown })
+        .proofExecutionFor;
+    if (missing === 'runtime-fence')
+      Object.assign(h.scope.init.runtime, { executionFence: 'none' });
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+    });
+    const response = await route(
+      post('/signal', { contents: 'hello' }),
+      h.scope,
+    );
+    expect(h.calls).toEqual([]);
+    expect(response?.status).toBe(503);
+  });
+
+  it.each([
+    'begin',
+    'recovered-receipt',
+    'blocked-receipt',
+    'discard-receipt',
+    'core',
+  ] as const)('preserves schedule effects at the final %s boundary', async (boundary) => {
+    const h = await modern();
+    const begin = vi.fn(async () => ({ state: 'ready' as const }));
+    const settle = vi.fn(async () => undefined);
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      resolveScheduleTarget: async () =>
+        scheduleTarget({
+          resourceId: 'acme_res',
+          ifIdle: { behavior: 'persist' },
+        }),
+      resolveScheduleDispatchStore: async () => {
+        if (boundary === 'begin') h.replace();
+        return { begin, settle };
+      },
+      resolveScheduleRunStatus:
+        boundary === 'recovered-receipt'
+          ? async () => {
+              h.replace();
+              return { runId: 'active-run', status: 'success' };
+            }
+          : undefined,
+      serializeDispatch: async (_scope, operation) => operation(),
+      resolveBlockingRun:
+        boundary === 'blocked-receipt'
+          ? async () => {
+              h.replace();
+              return {
+                runId: 'active-run',
+                principal: { kind: 'human', id: 'other', role: 'operator' },
+              };
+            }
+          : undefined,
+      contentPolicy:
+        boundary === 'discard-receipt' || boundary === 'core'
+          ? async () => {
+              h.replace();
+              return boundary === 'discard-receipt'
+                ? { allowed: false, outcome: 'denied' }
+                : { allowed: true };
+            }
+          : undefined,
+    });
+    const response = await route(
+      post('/signal/schedule', {
+        scheduleId: 'schedule_1',
+        dispatchId: 'dispatch_1',
+        runId: 'run_1',
+      }),
+      h.scope,
+    );
+    expect(h.calls).toEqual([]);
+    expect(settle).not.toHaveBeenCalled();
+    expect(begin).toHaveBeenCalledTimes(boundary === 'begin' ? 0 : 1);
+    expect(response?.status).toBe(503);
+  });
+
+  it('checks notification storage creation after resolving its store', async () => {
+    const h = await modern();
+    const storage = new InMemoryNotificationsStorage();
+    const create = vi.spyOn(storage, 'createNotification');
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      canPersist: () => false,
+      resolveNotificationsStorage: async () => {
+        h.replace();
+        return storage;
+      },
+    });
+    const response = await route(
+      post('/signal/notification', {
+        source: 'test',
+        kind: 'update',
+        summary: 'hello',
+      }),
+      h.scope,
+    );
+    expect(create).not.toHaveBeenCalled();
+    expect(h.calls).toEqual([]);
+    expect(response?.status).toBe(503);
+  });
+
+  it.each([
+    'denial',
+    'failure',
+    'persist',
+    'wake',
+  ] as const)('does not mutate notification receipts after a %s proof refusal', async (boundary) => {
+    const h = await modern();
+    const storage = new InMemoryNotificationsStorage();
+    const record = await storage.createNotification({
+      threadId: 'acme_t1',
+      resourceId: 'acme_res',
+      agentId: 'agent',
+      source: 'test',
+      kind: 'update',
+      summary: 'hello',
+      priority: boundary === 'persist' ? 'low' : 'urgent',
+      deliverAt: new Date(0),
+      summaryAt: boundary === 'persist' ? new Date(0) : undefined,
+    });
+    const before = await storage.getNotification({
+      threadId: 'acme_t1',
+      id: record.id,
+    });
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      resolveNotificationsStorage: () => storage,
+      contentPolicy: async () => {
+        h.replace();
+        return boundary === 'denial'
+          ? { allowed: false, outcome: 'denied' }
+          : boundary === 'failure'
+            ? { allowed: false, outcome: 'error' }
+            : { allowed: true };
+      },
+    });
+    const response = await route(
+      post('/signal/notifications/dispatch', {
+        agentId: 'agent',
+        resourceId: 'acme_res',
+        notificationIds: [record.id],
+      }),
+      h.scope,
+    );
+    expect(
+      await storage.getNotification({ threadId: 'acme_t1', id: record.id }),
+    ).toEqual(before);
+    expect(h.calls).toEqual([]);
+    expect(response?.status).toBe(503);
+  });
+  it('refuses a foreign initial proof generation before content-policy effects', async () => {
+    const h = await modern();
+    h.replace();
+    const contentPolicy = vi.fn(async () => ({ allowed: true as const }));
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      contentPolicy,
+    });
+    const response = await route(
+      post('/signal', { contents: 'hello' }),
+      h.scope,
+    );
+    expect(contentPolicy).not.toHaveBeenCalled();
+    expect(h.calls).toEqual([]);
+    expect(response?.status).toBe(503);
+  });
+
+  it('refuses a serialized wake replacement before resolving memory', async () => {
+    const h = await modern();
+    const memory = vi.spyOn(h.agent, 'getMemory');
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      serializeDispatch: async (_scope, operation) => operation(),
+      resolveBlockingRun: async () => {
+        h.replace();
+        return undefined;
+      },
+    });
+    const response = await route(
+      post('/signal', { contents: 'hello', ifIdle: 'wake' }),
+      h.scope,
+    );
+    expect(memory).not.toHaveBeenCalled();
+    expect(h.calls).toEqual([]);
+    expect(response?.status).toBe(503);
+  });
+
+  it('checks the active-only signal Core boundary after content inspection', async () => {
+    const h = await modern();
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      contentPolicy: async () => {
+        h.replace();
+        return { allowed: true };
+      },
+    });
+    const response = await route(
+      post('/signal', { contents: 'hello' }),
+      h.scope,
+    );
+    expect(h.calls).toEqual([]);
+    expect(response?.status).toBe(503);
+  });
+
+  it('checks a retained completed schedule receipt after its store await', async () => {
+    const h = await modern();
+    let second = false;
+    const settle = vi.fn(async () => {
+      if (!second) throw new Error('receipt transport failed');
+    });
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      resolveScheduleTarget: async () =>
+        scheduleTarget({
+          resourceId: 'acme_res',
+          ifIdle: { behavior: 'persist' },
+        }),
+      resolveScheduleDispatchStore: async () => {
+        if (second) h.replace();
+        return { begin: async () => ({ state: 'ready' as const }), settle };
+      },
+    });
+    const body = {
+      scheduleId: 'schedule_1',
+      dispatchId: 'dispatch_1',
+      runId: 'run_1',
+    };
+    const first = await route(post('/signal/schedule', body), h.scope);
+    expect(h.calls).toHaveLength(1);
+    expect(first?.status).toBe(502);
+    second = true;
+    const response = await route(post('/signal/schedule', body), h.scope);
+    expect(h.calls).toHaveLength(1);
+    expect(settle).toHaveBeenCalledTimes(1);
+    expect(response?.status).toBe(503);
+  });
+
+  it('preserves the completed Core effect but refuses a changed final schedule receipt', async () => {
+    const h = await modern();
+    const send = h.agent.sendSignal.bind(h.agent);
+    Object.assign(h.agent, {
+      sendSignal: (...args: Parameters<Agent['sendSignal']>) => {
+        const result = send(...args);
+        h.replace();
+        return result;
+      },
+    });
+    const settle = vi.fn(async () => undefined);
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      resolveScheduleTarget: async () =>
+        scheduleTarget({
+          resourceId: 'acme_res',
+          ifIdle: { behavior: 'persist' },
+        }),
+      resolveScheduleDispatchStore: () => ({
+        begin: async () => ({ state: 'ready' as const }),
+        settle,
+      }),
+    });
+    const response = await route(
+      post('/signal/schedule', {
+        scheduleId: 'schedule_1',
+        dispatchId: 'dispatch_1',
+        runId: 'run_1',
+      }),
+      h.scope,
+    );
+    expect(h.calls).toHaveLength(1);
+    expect(settle).not.toHaveBeenCalled();
+    expect(response?.status).toBe(503);
+  });
+
+  it.each([
+    'individual',
+    'summary',
+  ] as const)('does not convert a final %s notification delivery receipt refusal into failure bookkeeping', async (mode) => {
+    const h = await modern();
+    const storage = new InMemoryNotificationsStorage();
+    const record = await storage.createNotification({
+      threadId: 'acme_t1',
+      resourceId: 'acme_res',
+      agentId: 'agent',
+      source: 'test',
+      kind: 'update',
+      summary: 'hello',
+      priority: mode === 'summary' ? 'low' : 'urgent',
+      summaryAt: mode === 'summary' ? new Date(0) : undefined,
+      deliverAt: new Date(0),
+    });
+    const before = await storage.getNotification({
+      threadId: 'acme_t1',
+      id: record.id,
+    });
+    const send = h.agent.sendSignal.bind(h.agent);
+    Object.assign(h.agent, {
+      sendSignal: (...args: Parameters<Agent['sendSignal']>) => {
+        const result = send(...args);
+        h.replace();
+        return result;
+      },
+    });
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      resolveNotificationsStorage: () => storage,
+    });
+    const response = await route(
+      post('/signal/notifications/dispatch', {
+        agentId: 'agent',
+        resourceId: 'acme_res',
+        notificationIds: [record.id],
+      }),
+      h.scope,
+    );
+    expect(
+      await storage.getNotification({ threadId: 'acme_t1', id: record.id }),
+    ).toEqual(before);
+    expect(h.calls).toHaveLength(1);
+    expect(response?.status).toBe(503);
   });
 });

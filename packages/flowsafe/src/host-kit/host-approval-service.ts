@@ -193,6 +193,7 @@ export interface HostApprovalServiceOptions {
    * the wiring can happen, so the type has to make it name one.
    */
   executionFence: ExecutionFenceWiring;
+  workflowTablePrefix?: string;
 }
 
 /**
@@ -228,6 +229,7 @@ export function buildHostApprovalService(
     // erased, one layer above the gate, the distinction between a host that
     // named the opt-out and one that never held a fence at all.
     executionFence: options.executionFence,
+    workflowTablePrefix: options.workflowTablePrefix,
     resumeRun: resumeRunWithRequeue(
       options.resumeRun,
       () => service,

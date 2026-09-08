@@ -51,6 +51,19 @@ export function isRunStatus(value: unknown): value is RunStatus {
   return typeof value === 'string' && Object.hasOwn(RUN_STATUSES, value);
 }
 
+export function isTerminalRunStatus(value: unknown): boolean {
+  return (
+    value === 'success' ||
+    value === 'failed' ||
+    value === 'tripwire' ||
+    value === 'canceled' ||
+    value === 'bailed' ||
+    value === 'skipped' ||
+    value === 'cancelled' ||
+    value === 'timed_out'
+  );
+}
+
 const NONTERMINAL_RUN_STATUSES = new Set<WorkflowRunStatus>([
   'running',
   'suspended',

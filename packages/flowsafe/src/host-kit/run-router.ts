@@ -38,15 +38,16 @@ import {
   DoStatusError,
   type ExecutionFenceWiring,
   InvalidRunRequestError,
+  type PersistedStartResult,
   RunAlreadyExistsError,
   RunLifecycleBlockedError,
   RunNotSuspendedError,
   type RunSummary,
   RunTerminalConflictError,
   requireStartIdempotency,
-  rollbackFencedStart,
   type StartIdempotencyWiring,
   type StartReservation,
+  type StartReservationReading,
   UnknownRunError,
   UnknownWorkflowError,
 } from '../do-runner/index.js';
@@ -175,6 +176,10 @@ export type RunRouterStartIdempotency =
        * runtime's own `isRunActive`.
        */
       live: (workflowId: string, runId: string) => Promise<boolean>;
+      persistedStart: (
+        workflowId: string,
+        runId: string,
+      ) => Promise<PersistedStartResult<RunSummary> | undefined>;
       /**
        * The deployment execution fence, so a REPLAY can re-assert a proof-only
        * fence's binding to the run this key already made.
@@ -193,6 +198,7 @@ export type RunRouterStartIdempotency =
     };
 
 export interface RunStartInput {
+  readonly startReservation?: StartReservationReading;
   readonly mutationEpoch?: number;
   workflowId: string;
   runId: string;
@@ -380,39 +386,34 @@ async function startIdempotently(
     },
     {
       persisted: async (reservation: StartReservation) =>
-        options.status(workflowId, reservation.runId),
+        wiring === 'none'
+          ? undefined
+          : wiring.persistedStart(workflowId, reservation.runId),
       live: async (reservation: StartReservation) =>
         live ? live(workflowId, reservation.runId) : false,
     },
     wiring === 'none' ? undefined : wiring.executionFence,
+    mutationEpoch,
   );
   if (decision.kind === 'replay') {
     return { summary: decision.persisted, replayed: true };
   }
   const { runId, key } = decision.reservation;
-  try {
-    return {
-      summary: await options.start({
-        workflowId,
-        runId,
-        inputData: body.inputData,
-        principal,
-        mutationEpoch,
-        idempotencyKey: key,
-        ...(body.deadlineMs === undefined
-          ? {}
-          : { deadlineMs: body.deadlineMs as number }),
-      }),
-      replayed: false,
-    };
-  } catch (error) {
-    // Only a fence refusal gives the claim back — see rollbackFencedStart. A
-    // deployment that closed its fence between the claim and the start executed
-    // nothing, so holding the claim would turn an operator's drain into a
-    // permanently poisoned key; anything else may have executed, and giving the
-    // claim back there would hand the next retry a second run.
-    return rollbackFencedStart(store, key, runId, error);
-  }
+  return {
+    summary: await options.start({
+      workflowId,
+      runId,
+      inputData: body.inputData,
+      principal,
+      mutationEpoch,
+      idempotencyKey: key,
+      startReservation: decision.reservation,
+      ...(body.deadlineMs === undefined
+        ? {}
+        : { deadlineMs: body.deadlineMs as number }),
+    }),
+    replayed: false,
+  };
 }
 
 export function createRunRouter(options: RunRouterOptions): RunRouter {
@@ -473,6 +474,7 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
         const parsed = (await readJson(request)) as StartBody | null;
         if (!parsed) return json({ error: 'workflowId is required' }, 400);
         const forbidden = [
+          'startReservation',
           'mutationEpoch',
           'startIdentity',
           'agentStart',

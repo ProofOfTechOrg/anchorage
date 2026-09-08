@@ -10,10 +10,18 @@
 // it — which is why the assertion below is on the schedule ROW, not on the
 // tally the pass returned.
 
-import { ExecutionFenceStore } from '@proofoftech/flowsafe/do-runner';
+import type { WorkflowRunState } from '@mastra/core/workflows';
+import { humanPrincipal } from '@proofoftech/flowsafe/approval-api';
+import {
+  createD1Storage,
+  ExecutionFenceStore,
+  StartIdempotencyStore,
+} from '@proofoftech/flowsafe/do-runner';
+import { approvalStoreFactoryFor } from '@proofoftech/flowsafe/host-kit';
 import { describe, expect, it } from 'vitest';
 
 import { starterMaintenanceTick } from '../src/maintenance.js';
+import { contextForPrincipal } from '../src/principal-context.js';
 import { schedulesStore } from '../src/storage.js';
 
 interface SqliteStatement {
@@ -168,5 +176,128 @@ describe('starter maintenance tick and the deployment execution fence', () => {
     await expect(store.getSchedule(due.id)).resolves.toEqual(before);
     await expect(store.listDueSchedules(NOW, 10)).resolves.toHaveLength(1);
     await expect(store.listTriggers(due.id)).resolves.toEqual([]);
+  });
+});
+
+describe('FS8 D3 proof activation in the starter', () => {
+  it.each([
+    '',
+    'other_',
+  ])('decides only the configured default workflow namespace when proof is %s', async (proofPrefix) => {
+    const db = sqliteUnitDatabase(openSqlite()) as Env['DB'];
+    const env = { DB: db, DEPLOYMENT_TENANT: 'acme' } as Env;
+    const fence = new ExecutionFenceStore(db);
+    const owner = { kind: 'human' as const, id: 'requester' };
+    const workflowId = 'starter-proof';
+    const runId = 'starter-proof-run';
+    for (const prefix of new Set(['', proofPrefix])) {
+      const storage = createD1Storage({ binding: db, tablePrefix: prefix });
+      await storage.init();
+      const workflows = await storage.getStore('workflows');
+      if (!workflows) throw new Error('workflow fixture storage is missing');
+      const snapshot: WorkflowRunState = {
+        runId,
+        status: 'suspended',
+        value: {},
+        context: {},
+        serializedStepGraph: [],
+        activePaths: [],
+        activeStepsPath: {},
+        suspendedPaths: {},
+        resumeLabels: {},
+        waitingPaths: {},
+        timestamp: 1_700_000_000_000,
+        requestContext: {
+          'flowsafe.runProvenance': {
+            version: 2,
+            startToken: `generation-${prefix || 'default'}`,
+            attemptToken: 'leg',
+            resumeCounts: [],
+            startIdentity: {
+              owner,
+              target: { kind: 'workflow', id: workflowId },
+            },
+          },
+        },
+      };
+      await workflows.persistWorkflowSnapshot({
+        workflowName: workflowId,
+        runId,
+        snapshot,
+      });
+    }
+    const current = await fence.readCurrentRunExecution({
+      tablePrefix: proofPrefix,
+      workflowId,
+      runId,
+    });
+    if (!current) throw new Error('proof fixture generation is missing');
+    const execution = {
+      ...current,
+      owner,
+      target: { kind: 'workflow' as const, id: workflowId },
+    };
+    const reservations = new StartIdempotencyStore(db);
+    const reserved = await reservations.reserve({
+      key: 'starter-proof-key',
+      owner,
+      targetKind: 'workflow',
+      targetId: workflowId,
+      mintRunId: () => runId,
+    });
+    const bound = await reservations.associateReservation(
+      reserved.reservation,
+      execution,
+    );
+    await fence.transition({
+      expected: 'open',
+      next: 'proof-only',
+      proofKey: reserved.reservation.key,
+    });
+    const reading = await fence.read();
+    expect(
+      await fence.rebindProofRun({
+        reservation: bound,
+        execution,
+        proof: {
+          key: bound.key,
+          mutationEpoch: reading.mutationEpoch,
+          transitionRevision: reading.transitionRevision,
+        },
+        reservationStore: reservations,
+      }),
+    ).toBe(true);
+    const store = approvalStoreFactoryFor(db).store();
+    const at = new Date(1_700_000_000_000).toISOString();
+    await store.create({
+      id: 'starter-proof-approval',
+      workflowId,
+      runId,
+      title: 'Approve the selected generation',
+      connectors: [],
+      priority: 'normal',
+      status: 'pending',
+      requestedBy: owner.id,
+      requestedByKind: owner.kind,
+      createdAt: at,
+      updatedAt: at,
+    });
+    const reviewer = { id: 'reviewer', role: 'reviewer' as const };
+    const context = contextForPrincipal(env, humanPrincipal(reviewer));
+    const decision = context
+      .service()
+      .decide('starter-proof-approval', { decision: 'approve' }, reviewer);
+    if (proofPrefix === '') {
+      await expect(decision).resolves.toMatchObject({
+        record: { status: 'approved' },
+      });
+    } else {
+      await expect(decision).rejects.toMatchObject({
+        reason: { code: 'EXECUTION_FENCED' },
+      });
+    }
+    expect((await store.get('starter-proof-approval'))?.status).toBe(
+      proofPrefix === '' ? 'approved' : 'pending',
+    );
   });
 });

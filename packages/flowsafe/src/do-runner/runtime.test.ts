@@ -4,15 +4,19 @@ import { Mastra } from '@mastra/core/mastra';
 import type { RequestContext } from '@mastra/core/request-context';
 import { InMemoryStore } from '@mastra/core/storage';
 import type { WorkflowRunState } from '@mastra/core/workflows';
-import { assert, describe, expect, it, vi } from 'vitest';
+import { assert, describe, expect, expectTypeOf, it, vi } from 'vitest';
 import { z } from 'zod';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import { createBackgroundTaskD1Domains } from '../background-tasks/d1-storage.js';
 import type { D1DatabaseBinding } from './cf-types.js';
 import { createD1Storage } from './d1-storage.js';
 import {
+  type D1RunExecutionIdentity,
+  ExecutionFenceUnreadableError,
   InvalidExecutionIdentityError,
   InvalidMutationEpochError,
+  normalizeD1RunExecutionIdentity,
+  RunStartPendingError,
 } from './execution-admission.js';
 import {
   type ExecutionFenceDatabase,
@@ -31,7 +35,9 @@ import {
   parseRunLifecycle,
 } from './run-lifecycle.js';
 import {
+  type AuthoritativeStartState,
   InvalidRunRequestError,
+  type LegacyRunState,
   type RequestContextProvider,
   RunAlreadyExistsError,
   type RunLeg,
@@ -990,7 +996,7 @@ describe('FS8 D1 authoritative start state', () => {
     }
   });
 
-  it('leaves existing starts on v1 without invoking the dormant reader', async () => {
+  it('writes v2 starts through its captured private reader', async () => {
     const f = await d1Fixture();
     try {
       const read = vi.spyOn(f.runtime, 'authoritativeStartState');
@@ -1007,7 +1013,11 @@ describe('FS8 D1 authoritative start state', () => {
       assert(row);
       expect(
         JSON.parse(row.snapshot).requestContext['flowsafe.runProvenance'],
-      ).toMatchObject({ version: 1, startToken: 'ordinary' });
+      ).toMatchObject({
+        version: 2,
+        startToken: expect.any(String),
+        attemptToken: 'ordinary',
+      });
     } finally {
       f.close();
     }
@@ -1210,12 +1220,32 @@ describe('D0 root-local stored summaries', () => {
       const parent = f.row();
       const read = () =>
         method === 'recoverStartAttempt'
-          ? f.runtime.recoverStartAttempt('d0-root', 'd0-run', 'd0-attempt')
+          ? f.runtime
+              .recoverStartAttempt(
+                {
+                  tablePrefix: '',
+                  workflowId: 'd0-root',
+                  runId: 'd0-run',
+                  startToken: f.snapshot().requestContext?.[
+                    'flowsafe.runProvenance'
+                  ]?.startToken as string,
+                },
+                { attemptToken: 'd0-attempt', isOwnerQuiescent: () => true },
+              )
+              .then((value) =>
+                value?.kind === 'ordinary'
+                  ? value.summary
+                  : (value?.transition.summary ?? null),
+              )
           : f.runtime[method]('d0-root', 'd0-run');
       f.reads.length = 0;
       const first = await read();
       d0AssertRootSummary(first, parent);
-      expect(f.reads).toEqual([['d0-run', 'd0-root']]);
+      expect(f.reads).toEqual([
+        method === 'recoverStartAttempt'
+          ? ['d0-root', 'd0-run']
+          : ['d0-run', 'd0-root'],
+      ]);
       expect(suspensionDeadlinesOf(first as RunSummary)).toEqual(
         d0DeadlineRefusal,
       );
@@ -1226,7 +1256,11 @@ describe('D0 root-local stored summaries', () => {
       f.reads.length = 0;
       const second = await read();
       expect(second).toEqual(first);
-      expect(f.reads).toEqual([['d0-run', 'd0-root']]);
+      expect(f.reads).toEqual([
+        method === 'recoverStartAttempt'
+          ? ['d0-root', 'd0-run']
+          : ['d0-run', 'd0-root'],
+      ]);
       expect(f.effects).toHaveBeenCalledTimes(2);
     } finally {
       f.close();
@@ -1256,13 +1290,13 @@ describe('D0 root-local stored summaries', () => {
     try {
       const result = await f.runtime.start('d0-root', d0Start);
       d0AssertRootSummary(result, f.row());
-      expect(f.reads).toEqual([['d0-run', 'd0-root']]);
+      expect(f.reads).toEqual([['d0-root', 'd0-run']]);
       expect(f.effects).toHaveBeenCalledTimes(2);
       expect(
         f.snapshot().requestContext?.['flowsafe.runProvenance'],
       ).toMatchObject({
-        version: 1,
-        startToken: 'd0-attempt',
+        version: 2,
+        startToken: expect.any(String),
         resumeCounts: [],
       });
     } finally {
@@ -1274,19 +1308,29 @@ describe('D0 root-local stored summaries', () => {
   it('D0 projects lifecycle completion from one root read', async () => {
     const f = d0Fixture();
     const flow = d0Collision(f);
-    const nativeRead = flow.getWorkflowRunById.bind(flow);
     const windows: unknown[][][] = [];
-    const spy = vi
-      .spyOn(flow, 'getWorkflowRunById')
-      .mockImplementation(async (runId, options) => {
-        const start = f.reads.length;
-        const result = await nativeRead(runId, options);
-        if (options?.fields?.includes('requestContext'))
-          windows.push(f.reads.slice(start));
-        return result;
-      });
+    let spy: { mockRestore(): void } | undefined;
     try {
       await f.runtime.start('d0-root', d0Start);
+      const domain = (await flow.mastra
+        ?.getStorage()
+        ?.getStore('workflows')) as FencedWorkflowsStorageD1;
+      const native = domain[FENCED_WORKFLOW_STORAGE];
+      assert(native);
+      const capability = { ...native };
+      Object.defineProperty(domain, FENCED_WORKFLOW_STORAGE, {
+        value: capability,
+        configurable: true,
+      });
+      const nativeRead = capability.readSnapshot;
+      spy = vi
+        .spyOn(capability, 'readSnapshot')
+        .mockImplementation(async (address) => {
+          const start = f.reads.length;
+          const selected = await nativeRead(address);
+          windows.push(f.reads.slice(start));
+          return selected;
+        });
       const parent = f.row();
       const principal = { kind: 'human', id: 'owner' } as const;
       const missed = await f.runtime.timeOut(
@@ -1338,11 +1382,11 @@ describe('D0 root-local stored summaries', () => {
         ),
       ).resolves.toEqual(completed);
       expect(windows).toEqual(
-        Array.from({ length: 5 }, () => [['d0-run', 'd0-root']]),
+        Array.from({ length: 5 }, () => [['d0-root', 'd0-run']]),
       );
       expect(f.effects).toHaveBeenCalledTimes(2);
     } finally {
-      spy.mockRestore();
+      spy?.mockRestore();
       f.close();
     }
   });
@@ -1404,8 +1448,8 @@ describe('D0 root-local stored summaries', () => {
       expect(
         f.snapshot().requestContext?.['flowsafe.runProvenance'],
       ).toMatchObject({
-        version: 1,
-        startToken: 'd0-attempt',
+        version: 2,
+        startToken: expect.any(String),
         requestedBy: 'reviewer',
         requestedByKind: 'human',
         resumeCounts: [['nested.approval', 1]],
@@ -1562,13 +1606,29 @@ describe('D0 summary compatibility', () => {
         f.runtime.authoritativeStatus('d0-root', 'absent'),
       ).resolves.toBeNull();
       await expect(
-        f.runtime.recoverStartAttempt('d0-root', 'absent', 'd0-attempt'),
+        f.runtime.recoverStartAttempt(
+          {
+            tablePrefix: '',
+            workflowId: 'd0-root',
+            runId: 'absent',
+            startToken: 'absent',
+          },
+          { attemptToken: 'd0-attempt', isOwnerQuiescent: () => true },
+        ),
       ).resolves.toBeNull();
       await f.runtime.start('d0-root', d0Start);
       const before = f.row();
       await expect(
-        f.runtime.recoverStartAttempt('d0-root', 'd0-run', 'wrong'),
-      ).rejects.toThrow('snapshot belongs to another start attempt');
+        f.runtime.recoverStartAttempt(
+          {
+            tablePrefix: '',
+            workflowId: 'd0-root',
+            runId: 'd0-run',
+            startToken: 'wrong',
+          },
+          { attemptToken: 'd0-attempt', isOwnerQuiescent: () => true },
+        ),
+      ).rejects.toThrow('run start recovery is unresolved');
       expect(f.row()).toEqual(before);
       expect(f.effects).toHaveBeenCalledTimes(2);
     } finally {
@@ -1618,8 +1678,16 @@ describe('D0 summary compatibility', () => {
         runtime.authoritativeStatus('d0-fallback', started.runId),
       ).rejects.toBeInstanceOf(RunStateUnreadableError);
       await expect(
-        runtime.recoverStartAttempt('d0-fallback', started.runId, 'valid'),
-      ).rejects.toBeInstanceOf(RunStateUnreadableError);
+        runtime.recoverStartAttempt(
+          {
+            tablePrefix: '',
+            workflowId: 'd0-fallback',
+            runId: started.runId,
+            startToken: 'valid',
+          },
+          { attemptToken: 'valid', isOwnerQuiescent: () => true },
+        ),
+      ).rejects.toBeInstanceOf(ExecutionFenceUnreadableError);
       expect(remove).not.toHaveBeenCalled();
     } finally {
       restore();
@@ -1844,12 +1912,7 @@ function cOptions(runId = 'c-run'): StartRunOptions {
       owner: { kind: 'human', id: 'operator-1' },
       target: { kind: 'workflow', id: 'c-workflow' },
     },
-    agentStart: { threaded: false },
     onPreparedStartIdentity: vi.fn(),
-    runOwnerGuard: {
-      owner: { kind: 'service', id: 'resource-owner' },
-      reservationToken: 'reservation-original',
-    },
   };
 }
 
@@ -2058,6 +2121,7 @@ describe('C economic format safety', () => {
         (
           await f.runtime.start(workflow.id, {
             runId: 'resume-run',
+            mutationEpoch: 2,
             inputData: { value: 'original' },
           })
         ).status,
@@ -2112,7 +2176,7 @@ describe('C Runtime capture', () => {
     (['default', 'background'] as const).flatMap((domain) =>
       [undefined, 1, 2, 3].map((epoch) => ({ domain, epoch })),
     ),
-  )('C does not enforce active mutation epoch at Runtime start ($domain, $epoch)', async ({
+  )('C enforces active mutation epoch at Runtime start ($domain, $epoch)', async ({
     domain,
     epoch,
   }) => {
@@ -2131,6 +2195,18 @@ describe('C Runtime capture', () => {
       if (epoch === undefined)
         delete (options as { mutationEpoch?: number }).mutationEpoch;
       else Object.assign(options, { mutationEpoch: epoch });
+      if (epoch !== 2) {
+        await expect(f.runtime.start('c-workflow', options)).rejects.toThrow(
+          'mutation epoch does not match',
+        );
+        expect(f.execute).not.toHaveBeenCalled();
+        expect(f.counts).toEqual({
+          callback: 0,
+          admission: 0,
+          terminalization: 0,
+        });
+        return;
+      }
       await expect(
         f.runtime.start('c-workflow', options),
       ).resolves.toMatchObject({ status: 'success' });
@@ -2139,10 +2215,12 @@ describe('C Runtime capture', () => {
         runId,
       });
       expect(snapshot?.requestContext?.['flowsafe.runProvenance']).toEqual({
-        version: 1,
+        version: 2,
         requestedBy: 'operator-1',
         requestedByKind: 'human',
-        startToken: 'attempt-original',
+        startToken: expect.any(String),
+        mutationEpoch: 2,
+        startIdentity: cOptions().startIdentity,
         attemptToken: 'attempt-original',
         resumeCounts: [],
       });
@@ -2158,8 +2236,8 @@ describe('C Runtime capture', () => {
         expect(snapshot?.requestContext).not.toHaveProperty(key);
       expect(f.execute).toHaveBeenCalledOnce();
       expect(f.counts).toEqual({
-        callback: 0,
-        admission: 0,
+        callback: 1,
+        admission: 1,
         terminalization: 0,
       });
     } finally {
@@ -2168,12 +2246,12 @@ describe('C Runtime capture', () => {
   });
 
   for (const [title, counter] of [
+    ['C invokes preparation only after provider success', 'callback'],
+    ['C admits each prepared start through the owned capability', 'admission'],
     [
-      'C never invokes the prepared callback in normal failure or recovery paths',
-      'callback',
+      'C keeps terminalization exclusively in owning recovery',
+      'terminalization',
     ],
-    ['C never automatically admits through the owned capability', 'admission'],
-    ['C never automatically terminalizes initial admission', 'terminalization'],
   ] as const) {
     it.each([
       'default',
@@ -2186,6 +2264,7 @@ describe('C Runtime capture', () => {
         return {};
       });
       try {
+        let admitted = 0;
         for (const phase of [
           'normal',
           'failure',
@@ -2225,10 +2304,13 @@ describe('C Runtime capture', () => {
             else outcome = await pending;
           } finally {
             restore();
-            expect(f.counts[counter]).toBe(0);
+            if (phase !== 'failure') admitted++;
+            expect(f.counts[counter]).toBe(
+              counter === 'terminalization' ? 0 : admitted,
+            );
             expect(f.counts).toEqual({
-              callback: 0,
-              admission: 0,
+              callback: admitted,
+              admission: admitted,
               terminalization: 0,
             });
           }
@@ -2244,10 +2326,12 @@ describe('C Runtime capture', () => {
             expect(
               snapshot?.requestContext?.['flowsafe.runProvenance'],
             ).toEqual({
-              version: 1,
+              version: 2,
               requestedBy: 'operator-1',
               requestedByKind: 'human',
-              startToken: 'attempt-original',
+              startToken: expect.any(String),
+              mutationEpoch: 2,
+              startIdentity: cOptions().startIdentity,
               attemptToken: 'attempt-original',
               resumeCounts: [],
             });
@@ -2614,6 +2698,7 @@ describe('C Runtime capture', () => {
         (
           await f.runtime.start('c-workflow', {
             runId: 'unattributed',
+            mutationEpoch: 2,
             inputData: { value: 'plain' },
           })
         ).status,
@@ -3163,7 +3248,7 @@ describe('Runtime checked durable counters', () => {
         parseRunLifecycle(state.requestContext['flowsafe.runLifecycle'])
           ?.revision,
       ).toBe(MAX);
-    expect(state.requestContext['flowsafe.runProvenance'].version).toBe(1);
+    expect(state.requestContext['flowsafe.runProvenance'].version).toBe(2);
     await expect(
       h.makeRuntime().authoritativeStatus('counter', 'counter-run'),
     ).resolves.toHaveProperty('runId', 'counter-run');
@@ -3375,8 +3460,19 @@ describe('RunnerRuntime', () => {
     const { runtime } = buildRuntime(new InMemoryStore());
 
     await expect(
-      runtime.recoverStartAttempt('echo', 'run-1', 123 as unknown as string),
-    ).rejects.toThrow('attemptToken is malformed');
+      runtime.recoverStartAttempt(
+        {
+          tablePrefix: '',
+          workflowId: 'echo',
+          runId: 'run-1',
+          startToken: 'S',
+        },
+        {
+          attemptToken: 123 as unknown as string,
+          isOwnerQuiescent: () => true,
+        },
+      ),
+    ).rejects.toThrow('start recovery authority is malformed');
   });
 
   it('runs a workflow to suspension and resumes it to success', async () => {
@@ -6120,7 +6216,7 @@ describe('RunnerRuntime snapshot provenance durability', () => {
 
     await expect(
       buildDurable(storage).status('durable-gate', started.runId),
-    ).rejects.toThrow('stored run provenance is malformed');
+    ).rejects.toThrow('run provenance is not readable');
   });
 
   it('reads legacy id-only provenance but requires a new complete pair before resume writes', async () => {
@@ -6145,6 +6241,7 @@ describe('RunnerRuntime snapshot provenance durability', () => {
         unknown
       >),
     };
+    legacyProvenance.version = 1;
     delete legacyProvenance.requestedByKind;
     await workflows.persistWorkflowSnapshot({
       workflowName: 'durable-gate',
@@ -6548,12 +6645,12 @@ describe('per-suspension deadline contract', () => {
       inputData: {},
     });
 
-    expect(started.suspended).toEqual([['nested', 'approval']]);
+    expect(started.suspended).toEqual([['nested']]);
     expect(suspensionDeadlinesOf(started)).toEqual({
       entries: [],
       rejected: [
         {
-          step: 'nested.approval',
+          step: 'nested',
           reason: 'nested suspension paths are not supported',
         },
       ],
@@ -6720,6 +6817,2698 @@ describe('per-suspension deadline contract', () => {
       ).rejects.toBeInstanceOf(BarrelRunStateUnreadableError);
     } finally {
       restore();
+    }
+  });
+});
+
+async function d3RuntimeFixture(
+  mode: 'fenced' | 'prefixed' | 'custom' = 'fenced',
+  provider?: RequestContextProvider,
+) {
+  const sql = openSqlite() as ReturnType<typeof openSqlite> & { close(): void };
+  const binding = sqliteUnitDatabase(sql) as D1DatabaseBinding;
+  const storage =
+    mode === 'custom'
+      ? new InMemoryStore()
+      : createD1Storage({ binding, tablePrefix: 'd3_' });
+  await storage.init();
+  const fence = new ExecutionFenceStore(binding as ExecutionFenceDatabase);
+  await fence.seed('open');
+  const reservations = new StartIdempotencyStore(
+    binding as ExecutionFenceDatabase,
+  );
+  const app = init(
+    { storage },
+    {
+      executionFence: mode === 'fenced' ? fence : 'none',
+      startIdempotency: reservations,
+      requestContextForRun: provider,
+    },
+  );
+  const effects = vi.fn();
+  const schema = z.looseObject({});
+  const workflow = app
+    .createWorkflow({
+      id: 'd3-workflow',
+      inputSchema: schema,
+      outputSchema: schema,
+    })
+    .then(
+      app.createStep({
+        id: 'gate',
+        inputSchema: schema,
+        outputSchema: schema,
+        resumeSchema: schema,
+        execute: async ({ inputData, resumeData, suspend }) => {
+          effects();
+          return inputData.suspend && !resumeData
+            ? suspend({ waiting: true })
+            : { done: true };
+        },
+      }),
+    )
+    .commit();
+  await app.runtime.status(workflow.id, 'initialize');
+  const workflows = (await storage.getStore(
+    'workflows',
+  )) as FencedWorkflowsStorageD1;
+  const native = workflows[FENCED_WORKFLOW_STORAGE];
+  const capability: FencedWorkflowAdmissionCapability | undefined =
+    mode === 'custom' || !native ? undefined : { ...native };
+  if (capability)
+    Object.defineProperty(workflows, FENCED_WORKFLOW_STORAGE, {
+      value: capability,
+      writable: true,
+      configurable: true,
+    });
+  const options = (runId = 'd3-run'): StartRunOptions => ({
+    runId,
+    inputData: {},
+    attemptToken: 'H',
+    requestedBy: 'owner',
+    requestedByKind: 'human',
+  });
+  const claim = async (runId = 'd3-run', key = 'd3-key') => {
+    const reserved = await reservations.reserve({
+      key,
+      owner: { kind: 'human', id: 'owner' },
+      targetKind: 'workflow',
+      targetId: workflow.id,
+      mintRunId: () => runId,
+    });
+    const claimed = await reservations.claimReservation(
+      reserved.reservation as import('./start-idempotency.js').StartReservationReading,
+    );
+    assert(claimed);
+    return claimed;
+  };
+  const row = (runId = 'd3-run') =>
+    workflows.loadWorkflowSnapshot({ workflowName: workflow.id, runId });
+  return {
+    ...app,
+    sql,
+    storage,
+    fence,
+    reservations,
+    workflow,
+    workflows,
+    capability,
+    effects,
+    options,
+    claim,
+    row,
+    close: () => sql.close(),
+  };
+}
+
+describe('FS8 D3 Runtime activation', () => {
+  it('R01 independently mints S when H repeats and retains immutable owner and epoch on resume', async () => {
+    const f = await d3RuntimeFixture('fenced', () => ({
+      'flowsafe.runProvenance': { version: 2, startToken: 'forged' },
+    }));
+    try {
+      await f.runtime.start(f.workflow.id, {
+        ...f.options(),
+        inputData: { suspend: true },
+        mutationEpoch: 0,
+      });
+      const first = await f.runtime.authoritativeStartState(
+        f.workflow.id,
+        'd3-run',
+      );
+      assert(first);
+      await f.runtime.start(f.workflow.id, f.options('second'));
+      const second = await f.runtime.authoritativeStartState(
+        f.workflow.id,
+        'second',
+      );
+      expect(second?.execution.startToken).not.toBe(first.execution.startToken);
+      expect(first.execution.startToken).not.toBe('H');
+      await expect(
+        f.runtime.resume(f.workflow.id, 'd3-run', {
+          resumeData: { go: true },
+          requestedBy: 'reviewer',
+          requestedByKind: 'service',
+        }),
+      ).resolves.toMatchObject({ status: 'success', requestedBy: 'reviewer' });
+      const resumed = await f.runtime.authoritativeStartState(
+        f.workflow.id,
+        'd3-run',
+      );
+      expect(resumed?.provenance).toMatchObject({
+        version: 2,
+        startToken: first.execution.startToken,
+        mutationEpoch: 0,
+        startIdentity: { owner: { kind: 'human', id: 'owner' } },
+        resumeCounts: [['gate', 1]],
+      });
+      expect(resumed?.provenance.attemptToken).not.toBe('H');
+      expect(f.effects).toHaveBeenCalledTimes(3);
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    'prefixed',
+    'custom',
+  ] as const)('R05 binds the original claim before ordinary create with the actual %s namespace', async (mode) => {
+    const f = await d3RuntimeFixture(mode);
+    try {
+      const claim = await f.claim();
+      const create = f.workflow.createRun.bind(f.workflow);
+      let beforeCreate: unknown;
+      vi.spyOn(f.workflow, 'createRun').mockImplementation(async (...args) => {
+        beforeCreate = await f.reservations.readForAdmission(claim.key);
+        return create(...args);
+      });
+      await expect(
+        f.runtime.start(f.workflow.id, {
+          ...f.options(),
+          startReservation: claim,
+          idempotencyKey: claim.key,
+        }),
+      ).resolves.toMatchObject({ status: 'success' });
+      expect(beforeCreate).toMatchObject({
+        binding: {
+          kind: 'bound',
+          execution: { tablePrefix: mode === 'custom' ? null : 'd3_' },
+        },
+      });
+      expect((await f.reservations.readForAdmission(claim.key))?.state).toBe(
+        'terminal',
+      );
+      expect(f.effects).toHaveBeenCalledOnce();
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    'missing',
+    'foreign',
+  ] as const)('R03 requires its positive witness before engine entry: %s', async (mode) => {
+    const f = await d3RuntimeFixture();
+    assert(f.capability);
+    const original = f.capability.withInitialAdmission;
+    let prepared: D1RunExecutionIdentity | undefined;
+    try {
+      f.capability.withInitialAdmission = async (input, create) => {
+        const result = await original(input, create);
+        return mode === 'missing'
+          ? ({ ...result, witness: undefined } as never)
+          : {
+              ...result,
+              witness: {
+                ...result.witness,
+                execution: {
+                  ...result.witness.execution,
+                  startToken: 'foreign',
+                },
+              },
+            };
+      };
+      const claim = await f.claim();
+      const outcome = await f.runtime
+        .start(f.workflow.id, {
+          ...f.options(),
+          startReservation: claim,
+          idempotencyKey: claim.key,
+          onPreparedStartIdentity: (identity) => {
+            prepared = normalizeD1RunExecutionIdentity(identity);
+          },
+        })
+        .catch((error) => error);
+      expect((await f.row())?.status).toBe('pending');
+      expect(
+        (await f.reservations.readForAdmission(claim.key))?.binding,
+      ).toMatchObject({ kind: 'bound', execution: prepared });
+      expect(f.effects).not.toHaveBeenCalled();
+      expect(outcome).toBeInstanceOf(RunStateUnreadableError);
+      expect(f.workflow.runs.has('d3-run')).toBe(true);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('R03 clears only its captured new cache entry after a definitive same-S refusal', async () => {
+    const f = await d3RuntimeFixture();
+    try {
+      const claim = await f.claim();
+      const result = await f.runtime
+        .start(f.workflow.id, {
+          ...f.options(),
+          startReservation: claim,
+          idempotencyKey: claim.key,
+          onPreparedStartIdentity: async () => {
+            await f.fence.transition({ expected: 'open', next: 'draining' });
+          },
+        })
+        .catch((error) => error);
+      expect(await f.row()).toBeNull();
+      expect(f.workflow.runs.has('d3-run')).toBe(false);
+      expect((await f.reservations.readForAdmission(claim.key))?.state).toBe(
+        'reserved',
+      );
+      expect(f.effects).not.toHaveBeenCalled();
+      expect(result).toBeInstanceOf(Error);
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    'provider',
+    'prepared',
+    'engine',
+    'terminal',
+    'terminal-repair',
+  ] as const)('R04 retains its active frame during the %s wait', async (phase) => {
+    const entered = cDeferred(),
+      release = cDeferred();
+    const f = await d3RuntimeFixture(
+      'fenced',
+      phase === 'provider'
+        ? async () => {
+            entered.resolve();
+            await release.promise;
+            return {};
+          }
+        : undefined,
+    );
+    let waiting: Promise<RunSummary> | undefined;
+    try {
+      if (phase === 'engine') f.effects.mockImplementationOnce(async () => {});
+      const create = f.workflow.createRun.bind(f.workflow);
+      if (phase === 'engine')
+        vi.spyOn(f.workflow, 'createRun').mockImplementation(
+          async (...args) => {
+            const run = await create(...args);
+            const start = run.start.bind(run);
+            vi.spyOn(run, 'start').mockImplementation(async (...input) => {
+              entered.resolve();
+              await release.promise;
+              return start(...input);
+            });
+            return run;
+          },
+        );
+      if (phase === 'terminal-repair')
+        f.workflow.options.shouldPersistSnapshot = ({ workflowStatus }) =>
+          workflowStatus === 'pending';
+      if (phase === 'terminal' || phase === 'terminal-repair') {
+        const persist = f.workflows.persistWorkflowSnapshot.bind(f.workflows);
+        vi.spyOn(f.workflows, 'persistWorkflowSnapshot').mockImplementation(
+          async (input) => {
+            if (input.snapshot.status === 'success') {
+              entered.resolve();
+              await release.promise;
+            }
+            await persist(input);
+          },
+        );
+      }
+      waiting = f.runtime.start(f.workflow.id, {
+        ...f.options(),
+        onPreparedStartIdentity:
+          phase === 'prepared'
+            ? async () => {
+                entered.resolve();
+                await release.promise;
+              }
+            : undefined,
+      });
+      await entered.promise;
+      expect(f.runtime.isRunActive(f.workflow.id, 'd3-run')).toBe(true);
+      release.resolve();
+      await expect(waiting).resolves.toMatchObject({ status: 'success' });
+      expect(f.runtime.isRunActive(f.workflow.id, 'd3-run')).toBe(false);
+    } finally {
+      release.resolve();
+      await waiting?.catch(() => undefined);
+      f.close();
+    }
+  });
+
+  it.each([
+    'preflight',
+    'callback',
+    'unknown-create',
+  ] as const)('R06 releases only local preflight with the original claim: %s', async (phase) => {
+    const f = await d3RuntimeFixture(
+      phase === 'unknown-create' ? 'prefixed' : 'fenced',
+    );
+    try {
+      const claim = await f.claim();
+      if (phase === 'preflight')
+        await f.fence.transition({ expected: 'open', next: 'draining' });
+      if (phase === 'unknown-create')
+        vi.spyOn(f.workflow, 'createRun').mockRejectedValue(
+          new Error('unknown persistence'),
+        );
+      const result = await f.runtime
+        .start(f.workflow.id, {
+          ...f.options(),
+          startReservation: claim,
+          idempotencyKey: claim.key,
+          onPreparedStartIdentity:
+            phase === 'callback'
+              ? () => {
+                  throw { status: 503, reason: { code: 'RUN_START_PENDING' } };
+                }
+              : undefined,
+        })
+        .catch((error) => error);
+      expect((await f.reservations.readForAdmission(claim.key))?.state).toBe(
+        phase === 'preflight' ? 'reserved' : 'started',
+      );
+      expect(
+        (await f.reservations.readForAdmission(claim.key))?.binding.kind,
+      ).toBe(phase === 'unknown-create' ? 'bound' : 'unbound');
+      expect(f.effects).not.toHaveBeenCalled();
+      expect(result).toBeDefined();
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    'S2',
+    'v1',
+    'tokenless',
+    'pending',
+  ] as const)('R07 does not recover a replacement %s after a lost engine result with repeated H', async (replacement) => {
+    const f = await d3RuntimeFixture();
+    const fault = new Error('lost original result');
+    try {
+      const create = f.workflow.createRun.bind(f.workflow);
+      vi.spyOn(f.workflow, 'createRun').mockImplementation(async (...args) => {
+        const run = await create(...args),
+          start = run.start.bind(run);
+        vi.spyOn(run, 'start').mockImplementation(async (...input) => {
+          await start(...input);
+          const snapshot = await f.row();
+          assert(snapshot);
+          const provenance =
+            snapshot.requestContext?.['flowsafe.runProvenance'];
+          assert(provenance);
+          if (replacement === 'S2') provenance.startToken = 'S2';
+          if (replacement === 'v1') provenance.version = 1;
+          if (replacement === 'tokenless')
+            delete snapshot.requestContext?.['flowsafe.runProvenance'];
+          if (replacement === 'pending') snapshot.status = 'pending';
+          await f.workflows.persistWorkflowSnapshot({
+            workflowName: f.workflow.id,
+            runId: 'd3-run',
+            snapshot,
+          });
+          throw fault;
+        });
+        return run;
+      });
+      const result = await f.runtime
+        .start(f.workflow.id, f.options())
+        .catch((error) => error);
+      const row = await f.row();
+      expect(row?.status).toBe(
+        replacement === 'pending' ? 'pending' : 'success',
+      );
+      if (replacement === 'S2')
+        expect(row?.requestContext?.['flowsafe.runProvenance'].startToken).toBe(
+          'S2',
+        );
+      expect(f.effects).toHaveBeenCalledOnce();
+      expect(result).toBe(fault);
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    false,
+    undefined,
+    1,
+    'yes',
+  ])('R08 requires awaited literal true owning quiescence: %s', async (quiescent) => {
+    const f = await d3RuntimeFixture();
+    try {
+      await f.runtime.start(f.workflow.id, f.options());
+      const state = await f.runtime.authoritativeStartState(
+        f.workflow.id,
+        'd3-run',
+      );
+      assert(state?.storage === 'd1');
+      const before = await f.row();
+      const result = await f.runtime
+        .recoverStartAttempt(state.execution, {
+          attemptToken: 'H',
+          isOwnerQuiescent: async () => quiescent as boolean,
+        })
+        .catch((error) => error);
+      expect(await f.row()).toEqual(before);
+      expect(f.effects).toHaveBeenCalledOnce();
+      expect(result).toBeInstanceOf(ExecutionFenceUnreadableError);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('R08 recovers a progressed same-S resume with its new leg H', async () => {
+    const f = await d3RuntimeFixture();
+    try {
+      await f.runtime.start(f.workflow.id, {
+        ...f.options(),
+        inputData: { suspend: true },
+      });
+      const initial = await f.runtime.authoritativeStartState(
+        f.workflow.id,
+        'd3-run',
+      );
+      assert(initial?.storage === 'd1');
+      await f.runtime.resume(f.workflow.id, 'd3-run', {
+        resumeData: { go: true },
+      });
+      await expect(
+        f.runtime.recoverStartAttempt(initial.execution, {
+          attemptToken: 'H',
+          isOwnerQuiescent: async () => true,
+        }),
+      ).resolves.toMatchObject({
+        kind: 'ordinary',
+        summary: { status: 'success' },
+      });
+      expect(f.effects).toHaveBeenCalledTimes(2);
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    'fenced',
+    'prefixed',
+    'custom',
+  ] as const)('R13 rejects normal start pending from captured %s storage before settlement', async (mode) => {
+    const f = await d3RuntimeFixture(mode);
+    let prepared: D1RunExecutionIdentity | undefined;
+    try {
+      const claim = await f.claim();
+      const persist = f.workflows.persistWorkflowSnapshot.bind(f.workflows);
+      vi.spyOn(f.workflows, 'persistWorkflowSnapshot').mockImplementation(
+        async (input) => {
+          if (input.snapshot.status === 'pending') return persist(input);
+          const pending = { ...input.snapshot, status: 'pending' as const };
+          return persist({ ...input, snapshot: pending });
+        },
+      );
+      const result = await f.runtime
+        .start(f.workflow.id, {
+          ...f.options(),
+          inputData: { suspend: true },
+          startReservation: claim,
+          idempotencyKey: claim.key,
+          onPreparedStartIdentity: (identity) => {
+            if (identity.tablePrefix !== null)
+              prepared = normalizeD1RunExecutionIdentity(identity);
+          },
+        })
+        .catch((error) => error);
+      expect((await f.row())?.status).toBe('pending');
+      expect((await f.reservations.readForAdmission(claim.key))?.state).toBe(
+        'started',
+      );
+      expect(f.effects).toHaveBeenCalledOnce();
+      expect(result).toBeInstanceOf(RunStartPendingError);
+      expect(f.runtime.isRunActive(f.workflow.id, 'd3-run')).toBe(false);
+      if (prepared)
+        expect(
+          (await f.reservations.readForAdmission(claim.key))?.binding,
+        ).toMatchObject({ execution: prepared });
+    } finally {
+      f.close();
+    }
+  });
+
+  it('R13 rejects normal resume pending even when terminal repair acknowledges the write', async () => {
+    const f = await d3RuntimeFixture();
+    try {
+      await f.runtime.start(f.workflow.id, {
+        ...f.options(),
+        inputData: { suspend: true },
+      });
+      const persist = f.workflows.persistWorkflowSnapshot.bind(f.workflows);
+      vi.spyOn(f.workflows, 'persistWorkflowSnapshot').mockImplementation(
+        (input) =>
+          persist({
+            ...input,
+            snapshot: { ...input.snapshot, status: 'pending' as const },
+          }),
+      );
+      const result = await f.runtime
+        .resume(f.workflow.id, 'd3-run', { resumeData: { go: true } })
+        .catch((error) => error);
+      expect((await f.row())?.status).toBe('pending');
+      expect(f.effects).toHaveBeenCalledTimes(2);
+      expect(result).toBeInstanceOf(RunStartPendingError);
+    } finally {
+      f.close();
+    }
+  });
+});
+
+async function d3PreparedPending(
+  f: Awaited<ReturnType<typeof d3RuntimeFixture>>,
+) {
+  assert(f.capability);
+  const admit = f.capability.withInitialAdmission;
+  let execution: D1RunExecutionIdentity | undefined;
+  const claim = await f.claim();
+  f.capability.withInitialAdmission = async (input, create) => {
+    const result = await admit(input, create);
+    return { ...result, witness: undefined } as never;
+  };
+  try {
+    await expect(
+      f.runtime.start(f.workflow.id, {
+        ...f.options(),
+        startReservation: claim,
+        idempotencyKey: claim.key,
+        onPreparedStartIdentity: (value) => {
+          execution = normalizeD1RunExecutionIdentity(value);
+        },
+      }),
+    ).rejects.toBeInstanceOf(RunStateUnreadableError);
+    assert(execution);
+    return { execution, claim };
+  } finally {
+    f.capability.withInitialAdmission = admit;
+  }
+}
+
+describe('FS8 D3 Runtime activation', () => {
+  it('R02 captures the actual alternate prefixed domain and method receivers through preparation', async () => {
+    const nominal = await d3RuntimeFixture('prefixed'),
+      actual = await d3RuntimeFixture('prefixed');
+    const entered = cDeferred(),
+      release = cDeferred();
+    let pending: Promise<RunSummary> | undefined;
+    try {
+      vi.spyOn(nominal.workflow, 'mastra', 'get').mockReturnValue(
+        new Mastra({ storage: actual.storage, logger: false }),
+      );
+      // A participating reservation store must match the selected D1 binding.
+      const refused = await nominal.runtime
+        .start(nominal.workflow.id, nominal.options())
+        .catch((error) => error);
+      expect(await actual.row()).toBeNull();
+      expect(await nominal.row()).toBeNull();
+      expect(nominal.effects).not.toHaveBeenCalled();
+      expect(refused).toBeInstanceOf(Error);
+      const standalone = init(
+        { storage: nominal.storage },
+        { executionFence: 'none', startIdempotency: 'none' },
+      ).runtime;
+      standalone.register(nominal.workflow);
+      await standalone.status(nominal.workflow.id, 'initialize-actual');
+      nominal.workflow.__registerMastra(
+        new Mastra({ storage: actual.storage, logger: false }),
+      );
+      const source = actual.capability;
+      assert(source);
+      const receivers: unknown[] = [];
+      const read = source.readSnapshot;
+      source.readSnapshot = async function (address) {
+        receivers.push(this);
+        return read.call(this, address);
+      };
+      pending = standalone.start(nominal.workflow.id, {
+        ...nominal.options(),
+        onPreparedStartIdentity: async (identity) => {
+          expect(identity.tablePrefix).toBe('d3_');
+          entered.resolve();
+          await release.promise;
+        },
+      });
+      await entered.promise;
+      const late = vi
+        .fn()
+        .mockRejectedValue(new Error('late replacement read'));
+      source.readSnapshot = late;
+      release.resolve();
+      await expect(pending).resolves.toMatchObject({ status: 'success' });
+      expect(await nominal.row()).toBeNull();
+      expect((await actual.row())?.status).toBe('success');
+      expect(late).not.toHaveBeenCalled();
+      expect(receivers).toEqual([actual.capability]);
+    } finally {
+      release.resolve();
+      await pending?.catch(() => undefined);
+      nominal.close();
+      actual.close();
+    }
+  });
+
+  it('R08 terminalizes the original selected pending bytes and returns B2 S1 after a later S2 write', async () => {
+    const f = await d3RuntimeFixture();
+    try {
+      const { execution, claim } = await d3PreparedPending(f);
+      assert(f.capability);
+      const original = f.capability.terminalizeInitialAdmission;
+      const read = vi.spyOn(f.capability, 'readSnapshot');
+      f.capability.terminalizeInitialAdmission = async (input) => {
+        const outcome = await original(input);
+        if (outcome.kind !== 'conflict') {
+          const later = JSON.parse(outcome.row.snapshot);
+          later.requestContext['flowsafe.runProvenance'].startToken = 'S2';
+          later.result = { foreign: true };
+          await f.workflows.persistWorkflowSnapshot({
+            workflowName: f.workflow.id,
+            runId: 'd3-run',
+            snapshot: later,
+          });
+        }
+        return outcome;
+      };
+      const result = await f.runtime
+        .recoverStartAttempt(execution, {
+          attemptToken: 'H',
+          isOwnerQuiescent: async () => true,
+          startReservation: claim,
+        })
+        .catch((error) => error);
+      expect(
+        (await f.row())?.requestContext?.['flowsafe.runProvenance'].startToken,
+      ).toBe('S2');
+      expect((await f.reservations.readForAdmission(claim.key))?.state).toBe(
+        'terminal',
+      );
+      expect(f.effects).not.toHaveBeenCalled();
+      expect(read).toHaveBeenCalledOnce();
+      expect(result).toMatchObject({
+        kind: 'ordinary',
+        summary: { status: 'failed' },
+      });
+    } finally {
+      f.close();
+    }
+  });
+
+  it('R08 preserves the captured source across owning quiescence and read replacement', async () => {
+    const f = await d3RuntimeFixture(),
+      other = await d3RuntimeFixture();
+    try {
+      const { execution, claim } = await d3PreparedPending(f);
+      assert(f.capability);
+      assert(other.capability);
+      const foreign = vi.spyOn(other.capability, 'terminalizeInitialAdmission');
+      const own = vi.spyOn(f.capability, 'terminalizeInitialAdmission');
+      const result = await f.runtime
+        .recoverStartAttempt(execution, {
+          attemptToken: 'H',
+          startReservation: claim,
+          isOwnerQuiescent: async () => {
+            Object.defineProperty(f.workflows, FENCED_WORKFLOW_STORAGE, {
+              value: other.capability,
+            });
+            return true;
+          },
+        })
+        .catch((error) => error);
+      expect((await f.row())?.status).toBe('failed');
+      expect(await other.row()).toBeNull();
+      expect(f.effects).not.toHaveBeenCalled();
+      expect(own).toHaveBeenCalledOnce();
+      expect(foreign).not.toHaveBeenCalled();
+      expect(result).toMatchObject({
+        kind: 'ordinary',
+        summary: { status: 'failed' },
+      });
+    } finally {
+      f.close();
+      other.close();
+    }
+  });
+
+  it.each([
+    'unmarked',
+    'resumed',
+    'different-H',
+    'conflict',
+  ] as const)('R10 keeps uncertain initial %s nonreplayable', async (mode) => {
+    const f = await d3RuntimeFixture();
+    try {
+      const { execution, claim } = await d3PreparedPending(f);
+      assert(f.capability);
+      const snapshot = await f.row();
+      assert(snapshot);
+      const provenance = snapshot.requestContext?.['flowsafe.runProvenance'];
+      assert(provenance);
+      if (mode === 'unmarked') delete provenance.initialAdmission;
+      if (mode === 'resumed') provenance.resumeCounts = [['gate', 1]];
+      if (mode === 'different-H') provenance.attemptToken = 'other';
+      await f.workflows.persistWorkflowSnapshot({
+        workflowName: f.workflow.id,
+        runId: 'd3-run',
+        snapshot,
+      });
+      if (mode === 'conflict')
+        f.capability.terminalizeInitialAdmission = async () => ({
+          kind: 'conflict',
+        });
+      const before = await f.row();
+      const result = await f.runtime
+        .recoverStartAttempt(execution, {
+          attemptToken: 'H',
+          startReservation: claim,
+          isOwnerQuiescent: () => true,
+        })
+        .catch((error) => error);
+      expect(await f.row()).toEqual(before);
+      expect((await f.reservations.readForAdmission(claim.key))?.state).toBe(
+        'started',
+      );
+      expect(f.effects).not.toHaveBeenCalled();
+      expect(result).toBeInstanceOf(
+        mode === 'conflict'
+          ? ExecutionFenceUnreadableError
+          : RunStartPendingError,
+      );
+    } finally {
+      f.close();
+    }
+  });
+
+  it('R09 blocks keyed terminal recovery when exact settlement fails and retries that settlement', async () => {
+    const f = await d3RuntimeFixture();
+    try {
+      const { execution, claim } = await d3PreparedPending(f);
+      const settle = vi
+        .spyOn(f.reservations, 'settleExecution')
+        .mockRejectedValueOnce(new Error('settle unavailable'));
+      const refused = await f.runtime
+        .recoverStartAttempt(execution, {
+          attemptToken: 'H',
+          startReservation: claim,
+          isOwnerQuiescent: () => true,
+        })
+        .catch((error) => error);
+      expect((await f.row())?.status).toBe('failed');
+      expect((await f.reservations.readForAdmission(claim.key))?.state).toBe(
+        'started',
+      );
+      expect(f.effects).not.toHaveBeenCalled();
+      expect(refused).toBeInstanceOf(ExecutionFenceUnreadableError);
+      await expect(
+        f.runtime.recoverStartAttempt(execution, {
+          attemptToken: 'H',
+          startReservation: claim,
+          isOwnerQuiescent: () => true,
+        }),
+      ).resolves.toMatchObject({
+        kind: 'ordinary',
+        summary: { status: 'failed' },
+      });
+      expect(settle).toHaveBeenCalledTimes(2);
+      expect((await f.reservations.readForAdmission(claim.key))?.state).toBe(
+        'terminal',
+      );
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    'wrong-owner',
+    'wrong-target',
+    'missing-store',
+  ] as const)('R09 refuses keyed recovery with %s authority', async (mode) => {
+    const f = await d3RuntimeFixture();
+    try {
+      const { execution, claim } = await d3PreparedPending(f);
+      const runtime =
+        mode === 'missing-store'
+          ? init(
+              { storage: f.storage },
+              { executionFence: f.fence, startIdempotency: 'none' },
+            ).runtime
+          : f.runtime;
+      if (runtime !== f.runtime) runtime.register(f.workflow);
+      const original =
+        mode === 'wrong-owner'
+          ? { ...claim, owner: { kind: 'human' as const, id: 'other' } }
+          : mode === 'wrong-target'
+            ? { ...claim, targetId: 'other' }
+            : claim;
+      const before = await f.row();
+      const result = await runtime
+        .recoverStartAttempt(execution, {
+          attemptToken: 'H',
+          startReservation: original,
+          isOwnerQuiescent: () => true,
+        })
+        .catch((error) => error);
+      expect(await f.row()).toEqual(before);
+      expect((await f.reservations.readForAdmission(claim.key))?.state).toBe(
+        'started',
+      );
+      expect(f.effects).not.toHaveBeenCalled();
+      expect(result).toBeInstanceOf(ExecutionFenceUnreadableError);
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    'provider',
+    'preparation',
+    'create',
+    'fence-wait',
+  ] as const)('R12 retains the originally admitted proof S through the %s wait', async (phase) => {
+    const entered = cDeferred(),
+      release = cDeferred();
+    let resumePhase = false;
+    const f = await d3RuntimeFixture(
+      'fenced',
+      phase === 'provider'
+        ? async () => {
+            if (resumePhase) {
+              entered.resolve();
+              await release.promise;
+            }
+            return {};
+          }
+        : undefined,
+    );
+    let pending: Promise<RunSummary> | undefined;
+    try {
+      const claim = await f.claim();
+      await f.fence.transition({
+        expected: 'open',
+        next: 'proof-only',
+        proofKey: claim.key,
+      });
+      await f.runtime.start(f.workflow.id, {
+        ...f.options(),
+        inputData: { suspend: true },
+        idempotencyKey: claim.key,
+        startReservation: claim,
+      });
+      const before = await f.row();
+      assert(before);
+      resumePhase = true;
+      if (phase === 'create') {
+        const create = f.workflow.createRun.bind(f.workflow);
+        vi.spyOn(f.workflow, 'createRun').mockImplementation(
+          async (...args) => {
+            const run = await create(...args);
+            entered.resolve();
+            await release.promise;
+            return run;
+          },
+        );
+      }
+      if (phase === 'fence-wait') {
+        const read = f.fence.read.bind(f.fence);
+        let count = 0;
+        vi.spyOn(f.fence, 'read').mockImplementation(async () => {
+          const result = await read();
+          if (++count === 2) {
+            entered.resolve();
+            await release.promise;
+          }
+          return result;
+        });
+      }
+      pending = f.runtime.resume(f.workflow.id, 'd3-run', {
+        resumeData: { go: true },
+        prepareExecution:
+          phase === 'preparation'
+            ? async () => {
+                entered.resolve();
+                await release.promise;
+              }
+            : undefined,
+      });
+      void pending.catch(() => undefined);
+      await entered.promise;
+      assert(before.requestContext);
+      before.requestContext['flowsafe.runProvenance'].startToken = 'S2';
+      await f.workflows.persistWorkflowSnapshot({
+        workflowName: f.workflow.id,
+        runId: 'd3-run',
+        snapshot: before,
+      });
+      release.resolve();
+      const result = await pending.catch((error) => error);
+      expect(
+        (await f.row())?.requestContext?.['flowsafe.runProvenance'].startToken,
+      ).toBe('S2');
+      expect(f.effects).toHaveBeenCalledOnce();
+      expect(result).toBeInstanceOf(RunStateUnreadableError);
+    } finally {
+      release.resolve();
+      await pending?.catch(() => undefined);
+      f.close();
+    }
+  });
+});
+
+describe('FS8 D3 Runtime activation', () => {
+  it.each([
+    'cancelled',
+    'timed_out',
+  ] as const)('R10 recovers saved %s intent as a lifecycle descriptor and preserves completed cleanup', async (status) => {
+    const f = await d3RuntimeFixture();
+    try {
+      const { execution, claim } = await d3PreparedPending(f);
+      const snapshot = await f.row();
+      assert(snapshot?.requestContext);
+      snapshot.requestContext['flowsafe.runLifecycle'] = {
+        version: 1,
+        revision: 1,
+        transitionIntent: {
+          status,
+          requestedAt: 1,
+          replayPrincipals: [{ kind: 'service', id: 'source-owner' }],
+        },
+      };
+      await f.workflows.persistWorkflowSnapshot({
+        workflowName: f.workflow.id,
+        runId: 'd3-run',
+        snapshot,
+      });
+      const result = await f.runtime.recoverStartAttempt(execution, {
+        attemptToken: 'H',
+        startReservation: claim,
+        isOwnerQuiescent: () => true,
+      });
+      expect((await f.row())?.status).toBe(status);
+      expect((await f.reservations.readForAdmission(claim.key))?.state).toBe(
+        'terminal',
+      );
+      expect(f.effects).not.toHaveBeenCalled();
+      expect(result).toMatchObject({
+        kind: 'lifecycle',
+        transition: {
+          transitioned: true,
+          casMatched: true,
+          summary: { status },
+          cleanup: { cleanupCompleted: false, status },
+        },
+      });
+      assert(result?.kind === 'lifecycle');
+      await f.runtime.completeTerminalCleanup(
+        f.workflow.id,
+        'd3-run',
+        result.transition.cleanup.revision,
+      );
+      await expect(
+        f.runtime.recoverStartAttempt(execution, {
+          attemptToken: 'H',
+          startReservation: claim,
+          isOwnerQuiescent: () => true,
+        }),
+      ).resolves.toMatchObject({
+        kind: 'lifecycle',
+        transition: {
+          transitioned: false,
+          cleanup: { cleanupCompleted: true },
+        },
+      });
+    } finally {
+      f.close();
+    }
+  });
+
+  it('R10 preserves a raw pending row with terminal-looking metadata on public status reads', async () => {
+    const f = await d3RuntimeFixture();
+    try {
+      await d3PreparedPending(f);
+      const snapshot = await f.row();
+      assert(snapshot?.requestContext);
+      snapshot.requestContext['flowsafe.runLifecycle'] = {
+        version: 1,
+        revision: 1,
+        terminal: {
+          status: 'cancelled',
+          transitionedAt: 1,
+          error: { code: 'CANCELLED', message: 'run was cancelled' },
+          replayPrincipals: [{ kind: 'human', id: 'owner' }],
+        },
+      };
+      await f.workflows.persistWorkflowSnapshot({
+        workflowName: f.workflow.id,
+        runId: 'd3-run',
+        snapshot,
+      });
+      const before = await f.row();
+      for (const method of ['status', 'authoritativeStatus'] as const)
+        await expect(
+          f.runtime[method](f.workflow.id, 'd3-run'),
+        ).rejects.toBeInstanceOf(RunStartPendingError);
+      const observation = await f.runtime.authoritativeStartState(
+        f.workflow.id,
+        'd3-run',
+      );
+      expect(await f.row()).toEqual(before);
+      expect(f.effects).not.toHaveBeenCalled();
+      expect(observation).toMatchObject({ kind: 'initial' });
+      expect(observation).not.toHaveProperty('summary');
+    } finally {
+      f.close();
+    }
+  });
+
+  it('R13 permits capable no-fence initial pending omission followed by a real nonpending result', async () => {
+    const f = await d3RuntimeFixture('prefixed');
+    try {
+      f.workflow.options.shouldPersistSnapshot = ({ workflowStatus }) =>
+        workflowStatus !== 'pending';
+      const persist = vi.spyOn(f.workflows, 'persistWorkflowSnapshot');
+      await expect(
+        f.runtime.start(f.workflow.id, f.options()),
+      ).resolves.toMatchObject({ status: 'success' });
+      expect((await f.row())?.status).toBe('success');
+      expect(
+        persist.mock.calls.some(
+          ([input]) => input.snapshot.status === 'pending',
+        ),
+      ).toBe(false);
+      expect(f.effects).toHaveBeenCalledOnce();
+    } finally {
+      f.close();
+    }
+  });
+});
+
+describe('FS8 D3 Runtime activation', () => {
+  it.each([
+    'start',
+    'resume',
+  ] as const)('R13 does not replace a selected pending normal %s observation with a later readable result', async (leg) => {
+    const f = await d3RuntimeFixture();
+    try {
+      if (leg === 'resume')
+        await f.runtime.start(f.workflow.id, {
+          ...f.options(),
+          inputData: { suspend: true },
+        });
+      assert(f.capability);
+      const read = f.capability.readSnapshot;
+      const selected = vi
+        .spyOn(f.capability, 'readSnapshot')
+        .mockImplementationOnce(async (address) => {
+          const row = await read(address);
+          assert(row);
+          const snapshot = JSON.parse(row.snapshot);
+          snapshot.status = 'pending';
+          return { ...row, snapshot: JSON.stringify(snapshot) };
+        });
+      const result = await (leg === 'start'
+        ? f.runtime.start(f.workflow.id, f.options())
+        : f.runtime.resume(f.workflow.id, 'd3-run', {
+            resumeData: { go: true },
+          })
+      ).catch((error) => error);
+      expect((await f.row())?.status).toBe('success');
+      expect(f.effects).toHaveBeenCalledTimes(leg === 'start' ? 1 : 2);
+      expect(selected).toHaveBeenCalledOnce();
+      expect(result).toBeInstanceOf(RunStartPendingError);
+    } finally {
+      f.close();
+    }
+  });
+});
+
+describe('FS8 D3 Runtime activation', () => {
+  it.each([
+    'skip',
+    'swallow',
+    'reject',
+    'response-loss',
+  ] as const)('R03 prevents unwitnessed engine entry and preserves response-loss evidence: %s', async (mode) => {
+    const f = await d3RuntimeFixture();
+    try {
+      const claim = await f.claim();
+      assert(f.capability);
+      if (mode === 'skip')
+        f.workflow.options.shouldPersistSnapshot = () => false;
+      if (mode === 'swallow')
+        vi.spyOn(f.workflows, 'persistWorkflowSnapshot').mockResolvedValueOnce(
+          undefined,
+        );
+      if (mode === 'reject')
+        vi.spyOn(f.capability.database, 'batch').mockRejectedValueOnce(
+          new Error('initial SQL unavailable'),
+        );
+      if (mode === 'response-loss') {
+        const batch = f.capability.database.batch.bind(f.capability.database);
+        vi.spyOn(f.capability.database, 'batch').mockImplementationOnce(
+          async (statements) => {
+            await batch(statements);
+            throw new Error('lost SQL response');
+          },
+        );
+      }
+      const result = await f.runtime
+        .start(f.workflow.id, {
+          ...f.options(),
+          startReservation: claim,
+          idempotencyKey: claim.key,
+        })
+        .catch((error) => error);
+      expect((await f.row())?.status ?? null).toBe(
+        mode === 'response-loss' ? 'success' : null,
+      );
+      expect(f.effects).toHaveBeenCalledTimes(mode === 'response-loss' ? 1 : 0);
+      expect((await f.reservations.readForAdmission(claim.key))?.state).toBe(
+        mode === 'response-loss' ? 'terminal' : 'started',
+      );
+      if (mode === 'response-loss')
+        expect(result).toMatchObject({ status: 'success' });
+      else expect(result).toBeInstanceOf(Error);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('R03 preserves a replacement cache and tokenless row after its own no-insert refusal', async () => {
+    const f = await d3RuntimeFixture(),
+      other = await d3RuntimeFixture('prefixed');
+    try {
+      const replacement = await other.workflow.createRun({ runId: 'd3-run' });
+      assert(f.capability);
+      const native = f.capability.withInitialAdmission;
+      f.capability.withInitialAdmission = async (input, create) => {
+        try {
+          return await native(input, create);
+        } catch (error) {
+          const tokenless = await other.row();
+          assert(tokenless);
+          await f.workflows.persistWorkflowSnapshot({
+            workflowName: f.workflow.id,
+            runId: 'd3-run',
+            snapshot: tokenless,
+          });
+          f.workflow.runs.set('d3-run', replacement);
+          throw error;
+        }
+      };
+      const claim = await f.claim();
+      const result = await f.runtime
+        .start(f.workflow.id, {
+          ...f.options(),
+          startReservation: claim,
+          idempotencyKey: claim.key,
+          onPreparedStartIdentity: async () => {
+            await f.fence.transition({ expected: 'open', next: 'draining' });
+          },
+        })
+        .catch((error) => error);
+      expect((await f.row())?.status).toBe('pending');
+      expect((await f.row())?.requestContext).toBeUndefined();
+      expect(f.workflow.runs.get('d3-run')).toBe(replacement);
+      expect(f.effects).not.toHaveBeenCalled();
+      expect(result).toBeInstanceOf(Error);
+    } finally {
+      f.close();
+      other.close();
+    }
+  });
+
+  it('R04 installs the frame before the existence read and keeps it during result recovery', async () => {
+    const entered = cDeferred(),
+      release = cDeferred(),
+      reading = cDeferred(),
+      readRelease = cDeferred();
+    const f = await d3RuntimeFixture();
+    let pending: Promise<RunSummary> | undefined;
+    try {
+      const existing = f.workflow.getWorkflowRunById.bind(f.workflow);
+      vi.spyOn(f.workflow, 'getWorkflowRunById').mockImplementationOnce(
+        async (...args) => {
+          entered.resolve();
+          await release.promise;
+          return existing(...args);
+        },
+      );
+      const create = f.workflow.createRun.bind(f.workflow);
+      vi.spyOn(f.workflow, 'createRun').mockImplementation(async (...args) => {
+        const run = await create(...args),
+          start = run.start.bind(run);
+        vi.spyOn(run, 'start').mockImplementation(async (...input) => {
+          await start(...input);
+          throw new Error('lost engine result');
+        });
+        return run;
+      });
+      assert(f.capability);
+      const read = f.capability.readSnapshot;
+      f.capability.readSnapshot = async (address) => {
+        reading.resolve();
+        await readRelease.promise;
+        return read(address);
+      };
+      pending = f.runtime.start(f.workflow.id, f.options());
+      await entered.promise;
+      expect(f.runtime.isRunActive(f.workflow.id, 'd3-run')).toBe(true);
+      release.resolve();
+      await reading.promise;
+      expect(f.runtime.isRunActive(f.workflow.id, 'd3-run')).toBe(true);
+      readRelease.resolve();
+      await expect(pending).resolves.toMatchObject({ status: 'success' });
+      expect(f.runtime.isRunActive(f.workflow.id, 'd3-run')).toBe(false);
+    } finally {
+      release.resolve();
+      readRelease.resolve();
+      await pending?.catch(() => undefined);
+      f.close();
+    }
+  });
+
+  it('R12 refuses a replacement after early proof selection before invoking the resume provider', async () => {
+    const provider = vi.fn(() => ({}));
+    const f = await d3RuntimeFixture('fenced', provider);
+    try {
+      const claim = await f.claim();
+      await f.fence.transition({
+        expected: 'open',
+        next: 'proof-only',
+        proofKey: claim.key,
+      });
+      await f.runtime.start(f.workflow.id, {
+        ...f.options(),
+        inputData: { suspend: true },
+        startReservation: claim,
+        idempotencyKey: claim.key,
+      });
+      provider.mockClear();
+      assert(f.capability);
+      const read = f.capability.readSnapshot;
+      vi.spyOn(f.capability, 'readSnapshot').mockImplementationOnce(
+        async (address) => {
+          const original = await read(address);
+          const snapshot = await f.row();
+          assert(snapshot?.requestContext);
+          snapshot.requestContext['flowsafe.runProvenance'].startToken = 'S2';
+          await f.workflows.persistWorkflowSnapshot({
+            workflowName: f.workflow.id,
+            runId: 'd3-run',
+            snapshot,
+          });
+          return original;
+        },
+      );
+      const result = await f.runtime
+        .resume(f.workflow.id, 'd3-run', { resumeData: { go: true } })
+        .catch((error) => error);
+      expect(
+        (await f.row())?.requestContext?.['flowsafe.runProvenance'].startToken,
+      ).toBe('S2');
+      expect(provider).not.toHaveBeenCalled();
+      expect(f.effects).toHaveBeenCalledOnce();
+      expect(result).toBeInstanceOf(RunStateUnreadableError);
+    } finally {
+      f.close();
+    }
+  });
+});
+
+describe('FS8 D3 Runtime activation', () => {
+  it('R09 keeps lifecycle terminal persistence and settlement on the selected source across load replacement', async () => {
+    const f = await d3RuntimeFixture(),
+      other = await d3RuntimeFixture();
+    try {
+      await f.runtime.start(f.workflow.id, {
+        ...f.options(),
+        inputData: { suspend: true },
+      });
+      await other.runtime.start(other.workflow.id, {
+        ...other.options(),
+        inputData: { suspend: true },
+      });
+      const foreignBefore = await other.row();
+      const load = f.workflows.loadWorkflowSnapshot.bind(f.workflows);
+      vi.spyOn(f.workflows, 'loadWorkflowSnapshot').mockImplementationOnce(
+        async (input) => {
+          const selected = await load(input);
+          vi.spyOn(f.workflow, 'mastra', 'get').mockReturnValue(
+            new Mastra({ storage: other.storage, logger: false }),
+          );
+          return selected;
+        },
+      );
+      const result = await f.runtime.terminate(f.workflow.id, 'd3-run');
+      expect((await f.row())?.status).toBe('cancelled');
+      expect(await other.row()).toEqual(foreignBefore);
+      expect(f.effects).toHaveBeenCalledOnce();
+      expect(result.summary.status).toBe('cancelled');
+    } finally {
+      f.close();
+      other.close();
+    }
+  });
+});
+
+describe('FS8 D3 Runtime activation', () => {
+  it('R13 refuses a Core pending result after a real positive initial admission witness', async () => {
+    const f = await d3RuntimeFixture();
+    try {
+      const claim = await f.claim();
+      const create = f.workflow.createRun.bind(f.workflow);
+      const starts = vi.fn();
+      vi.spyOn(f.workflow, 'createRun').mockImplementation(async (...args) => {
+        const run = await create(...args);
+        vi.spyOn(run, 'start').mockImplementation(async () => {
+          starts();
+          return { status: 'pending' } as never;
+        });
+        return run;
+      });
+      const result = await f.runtime
+        .start(f.workflow.id, {
+          ...f.options(),
+          startReservation: claim,
+          idempotencyKey: claim.key,
+        })
+        .catch((error) => error);
+      expect((await f.row())?.status).toBe('pending');
+      expect(
+        (await f.row())?.requestContext?.['flowsafe.runProvenance']
+          .initialAdmission,
+      ).toBe(true);
+      expect((await f.reservations.readForAdmission(claim.key))?.state).toBe(
+        'started',
+      );
+      expect(f.effects).not.toHaveBeenCalled();
+      expect(starts).toHaveBeenCalledOnce();
+      expect(result).toBeInstanceOf(RunStartPendingError);
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    'fenced',
+    'prefixed',
+    'custom',
+  ] as const)('R07 permits missing-provenance terminal repair only for no-fence %s execution', async (mode) => {
+    const f = await d3RuntimeFixture(mode);
+    try {
+      const persist = f.workflows.persistWorkflowSnapshot.bind(f.workflows);
+      let stripped = false;
+      vi.spyOn(f.workflows, 'persistWorkflowSnapshot').mockImplementation(
+        async (input) => {
+          if (input.snapshot.status === 'success' && !stripped) {
+            stripped = true;
+            const snapshot = structuredClone(input.snapshot);
+            delete snapshot.requestContext;
+            return persist({ ...input, snapshot });
+          }
+          return persist(input);
+        },
+      );
+      const result = await f.runtime
+        .start(f.workflow.id, f.options())
+        .catch((error) => error);
+      expect((await f.row())?.status).toBe('success');
+      expect(f.effects).toHaveBeenCalledOnce();
+      if (mode === 'fenced') {
+        expect((await f.row())?.requestContext).toBeUndefined();
+        expect(result).toBeInstanceOf(RunStateUnreadableError);
+      } else {
+        expect(
+          (await f.row())?.requestContext?.['flowsafe.runProvenance'].version,
+        ).toBe(2);
+        expect(result).toMatchObject({ status: 'success' });
+      }
+    } finally {
+      f.close();
+    }
+  });
+});
+
+describe('FS8 D3 Runtime activation', () => {
+  it('R04 invokes the engine synchronously before a cancellation queued during initial persistence enters the lifecycle lock', async () => {
+    const f = await d3RuntimeFixture();
+    let cancellation: Promise<unknown> | undefined;
+    let engineEntered = false;
+    let readBeforeEngine = false;
+    try {
+      const load = f.workflows.loadWorkflowSnapshot.bind(f.workflows);
+      vi.spyOn(f.workflows, 'loadWorkflowSnapshot').mockImplementation(
+        async (input) => {
+          if (cancellation && !engineEntered) readBeforeEngine = true;
+          return load(input);
+        },
+      );
+      const create = f.workflow.createRun.bind(f.workflow);
+      vi.spyOn(f.workflow, 'createRun').mockImplementation(async (...args) => {
+        const run = await create(...args),
+          start = run.start.bind(run);
+        vi.spyOn(run, 'start').mockImplementation((...input) => {
+          engineEntered = true;
+          return start(...input);
+        });
+        return run;
+      });
+      assert(f.capability);
+      const admit = f.capability.withInitialAdmission;
+      f.capability.withInitialAdmission = (input, createRun) =>
+        admit(
+          {
+            ...input,
+            onInitialWriteAttempt: () => {
+              input.onInitialWriteAttempt();
+              cancellation = f.runtime
+                .cancelActiveExecution(f.workflow.id, 'd3-run', 'cancelled', [
+                  { kind: 'human', id: 'owner' },
+                ])
+                .catch((error) => error);
+            },
+          },
+          createRun,
+        );
+      await f.runtime.start(f.workflow.id, f.options()).catch((error) => error);
+      await cancellation;
+      expect(readBeforeEngine).toBe(false);
+      expect(engineEntered).toBe(true);
+      expect(
+        (await f.row())?.requestContext?.['flowsafe.runProvenance'].version,
+      ).toBe(2);
+    } finally {
+      await cancellation;
+      f.close();
+    }
+  });
+});
+
+describe('FS8 D3 Runtime activation', () => {
+  it.each([
+    'cancel',
+    'terminate',
+    'cleanup',
+    'resume',
+    'repair',
+  ] as const)('R09 preserves the selected row when its internal run id contradicts the %s address', async (operation) => {
+    const f = await d3RuntimeFixture();
+    try {
+      await f.runtime.start(f.workflow.id, {
+        ...f.options(),
+        inputData: { suspend: true },
+      });
+      let cleanupRevision = 1;
+      if (operation === 'cleanup')
+        cleanupRevision = (await f.runtime.terminate(f.workflow.id, 'd3-run'))
+          .cleanup.revision;
+      if (operation === 'repair') {
+        const persist = f.workflows.persistWorkflowSnapshot.bind(f.workflows);
+        vi.spyOn(f.workflows, 'persistWorkflowSnapshot').mockImplementation(
+          (input) =>
+            persist({
+              ...input,
+              snapshot: {
+                ...input.snapshot,
+                runId: 'foreign-run',
+                ...(input.snapshot.status === 'success'
+                  ? { status: 'pending' as const }
+                  : {}),
+              },
+            }),
+        );
+      } else {
+        const snapshot = await f.row();
+        assert(snapshot);
+        snapshot.runId = 'foreign-run';
+        await f.workflows.persistWorkflowSnapshot({
+          workflowName: f.workflow.id,
+          runId: 'd3-run',
+          snapshot,
+        });
+      }
+      const before = await f.row();
+      const persist = vi.spyOn(f.workflows, 'persistWorkflowSnapshot');
+      persist.mockClear();
+      const pending =
+        operation === 'cancel'
+          ? f.runtime.cancelActiveExecution(
+              f.workflow.id,
+              'd3-run',
+              'cancelled',
+              [{ kind: 'human', id: 'owner' }],
+            )
+          : operation === 'terminate'
+            ? f.runtime.terminate(f.workflow.id, 'd3-run')
+            : operation === 'cleanup'
+              ? f.runtime.completeTerminalCleanup(
+                  f.workflow.id,
+                  'd3-run',
+                  cleanupRevision,
+                )
+              : f.runtime.resume(f.workflow.id, 'd3-run', {
+                  resumeData: { go: true },
+                });
+      const result = await pending.catch((error) => error);
+      if (operation !== 'repair') {
+        expect(await f.row()).toEqual(before);
+        expect(persist).not.toHaveBeenCalled();
+        expect(f.effects).toHaveBeenCalledOnce();
+      } else {
+        expect((await f.row())?.runId).toBe('foreign-run');
+        expect(
+          persist.mock.calls.filter(
+            ([input]) => input.snapshot.status === 'success',
+          ),
+        ).toHaveLength(1);
+      }
+      expect(result).toBeInstanceOf(RunStateUnreadableError);
+    } finally {
+      f.close();
+    }
+  });
+});
+
+async function d3UnkeyedTargetPending(
+  f: Awaited<ReturnType<typeof d3RuntimeFixture>>,
+  kind: 'agent' | 'workflow' = 'agent',
+) {
+  assert(f.capability);
+  const admit = f.capability.withInitialAdmission;
+  let execution: D1RunExecutionIdentity | undefined;
+  f.capability.withInitialAdmission = async (input, create) => {
+    const result = await admit(input, create);
+    return { ...result, witness: undefined } as never;
+  };
+  try {
+    await expect(
+      f.runtime.start(f.workflow.id, {
+        ...f.options(),
+        ...(kind === 'agent'
+          ? {
+              startIdentity: {
+                owner: { kind: 'human', id: 'owner' },
+                target: { kind: 'agent', id: 'writer', threadId: 'thread' },
+              },
+              agentStart: { threaded: false },
+            }
+          : {}),
+        onPreparedStartIdentity: (identity) => {
+          execution = normalizeD1RunExecutionIdentity(identity);
+        },
+      }),
+    ).rejects.toBeInstanceOf(RunStateUnreadableError);
+    assert(execution);
+    return execution;
+  } finally {
+    f.capability.withInitialAdmission = admit;
+  }
+}
+
+function d3ExpectedAgentTarget() {
+  return {
+    kind: 'agent' as const,
+    id: 'writer',
+    threadId: 'thread',
+    owner: { kind: 'human' as const, id: 'owner' },
+    threaded: false,
+  };
+}
+
+function d3ReplaceRecoveryTarget(
+  provenance: NonNullable<WorkflowRunState['requestContext']>[string],
+  mismatch: string,
+) {
+  if (mismatch === 'owner-id') {
+    provenance.startIdentity.owner.id = 'other-owner';
+    provenance.requestedBy = 'other-owner';
+  } else if (mismatch === 'owner-kind') {
+    provenance.startIdentity.owner.kind = 'service';
+    provenance.requestedByKind = 'service';
+  } else if (mismatch === 'agent')
+    provenance.startIdentity.target.id = 'other-agent';
+  else if (mismatch === 'thread')
+    provenance.startIdentity.target.threadId = 'other-thread';
+  else if (mismatch === 'mode') provenance.agentStart.threaded = true;
+  else if (mismatch === 'workflow-role') {
+    provenance.startIdentity.target = { kind: 'workflow', id: 'd3-workflow' };
+    delete provenance.agentStart;
+  } else if (mismatch === 'missing-identity') {
+    delete provenance.startIdentity;
+    delete provenance.agentStart;
+    delete provenance.requestedBy;
+    delete provenance.requestedByKind;
+  }
+}
+
+describe('FS8 D3 Runtime activation', () => {
+  it.each(
+    (['initial', 'result'] as const).flatMap((phase) =>
+      [
+        'owner-id',
+        'owner-kind',
+        'agent',
+        'thread',
+        'mode',
+        'workflow-role',
+        'missing-identity',
+      ].map((mismatch) => ({ phase, mismatch })),
+    ),
+  )('R09 managed agent recovery validates its single $phase observation before mutation: $mismatch', async ({
+    phase,
+    mismatch,
+  }) => {
+    const f = await d3RuntimeFixture();
+    try {
+      const execution = await d3UnkeyedTargetPending(f);
+      const snapshot = await f.row();
+      assert(snapshot?.requestContext);
+      d3ReplaceRecoveryTarget(
+        snapshot.requestContext['flowsafe.runProvenance'],
+        mismatch,
+      );
+      if (phase === 'result')
+        Object.assign(snapshot, {
+          status: 'success',
+          result: { selected: true },
+        });
+      await f.workflows.persistWorkflowSnapshot({
+        workflowName: f.workflow.id,
+        runId: 'd3-run',
+        snapshot,
+      });
+      assert(f.capability);
+      const rawRead = f.capability.readSnapshot;
+      const before = await rawRead({
+        workflowId: f.workflow.id,
+        runId: 'd3-run',
+      });
+      const read = vi.spyOn(f.capability, 'readSnapshot');
+      const terminalize = vi.spyOn(f.capability, 'terminalizeInitialAdmission');
+      const settle = vi.spyOn(f.reservations, 'settleExecution');
+      const result = await f.runtime
+        .recoverStartAttempt(execution, {
+          attemptToken: 'H',
+          isOwnerQuiescent: () => true,
+          expectedTarget: d3ExpectedAgentTarget(),
+        })
+        .catch((error) => error);
+      expect(
+        await rawRead({ workflowId: f.workflow.id, runId: 'd3-run' }),
+      ).toEqual(before);
+      expect(read).toHaveBeenCalledOnce();
+      expect(terminalize).not.toHaveBeenCalled();
+      expect(settle).not.toHaveBeenCalled();
+      expect(f.effects).not.toHaveBeenCalled();
+      expect(result).toBeInstanceOf(ExecutionFenceUnreadableError);
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    'agent-role',
+    'foreign-workflow',
+    'missing-identity',
+  ] as const)('R09 managed workflow recovery refuses a same-S %s before B2', async (mismatch) => {
+    const f = await d3RuntimeFixture();
+    try {
+      const execution = await d3UnkeyedTargetPending(
+        f,
+        mismatch === 'agent-role' ? 'agent' : 'workflow',
+      );
+      const snapshot = await f.row();
+      assert(snapshot?.requestContext);
+      if (mismatch === 'foreign-workflow')
+        snapshot.requestContext[
+          'flowsafe.runProvenance'
+        ].startIdentity.target.id = 'other-workflow';
+      if (mismatch === 'missing-identity')
+        d3ReplaceRecoveryTarget(
+          snapshot.requestContext['flowsafe.runProvenance'],
+          mismatch,
+        );
+      await f.workflows.persistWorkflowSnapshot({
+        workflowName: f.workflow.id,
+        runId: 'd3-run',
+        snapshot,
+      });
+      const before = await f.row();
+      assert(f.capability);
+      const read = vi.spyOn(f.capability, 'readSnapshot'),
+        terminalize = vi.spyOn(f.capability, 'terminalizeInitialAdmission'),
+        settle = vi.spyOn(f.reservations, 'settleExecution');
+      const result = await f.runtime
+        .recoverStartAttempt(execution, {
+          attemptToken: 'H',
+          isOwnerQuiescent: () => true,
+          expectedTarget: { kind: 'workflow' },
+        })
+        .catch((error) => error);
+      expect(await f.row()).toEqual(before);
+      expect(read).toHaveBeenCalledOnce();
+      expect(terminalize).not.toHaveBeenCalled();
+      expect(settle).not.toHaveBeenCalled();
+      expect(f.effects).not.toHaveBeenCalled();
+      expect(result).toBeInstanceOf(ExecutionFenceUnreadableError);
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    'quiescence',
+    'read',
+  ] as const)('R08 freezes recovery expectation values and owner before the %s wait', async (phase) => {
+    const entered = cDeferred(),
+      release = cDeferred();
+    const f = await d3RuntimeFixture();
+    let pending: Promise<unknown> | undefined;
+    try {
+      const execution = await d3UnkeyedTargetPending(f);
+      assert(f.capability);
+      const expectedTarget = d3ExpectedAgentTarget();
+      const originalRead = f.capability.readSnapshot;
+      const read = vi
+        .spyOn(f.capability, 'readSnapshot')
+        .mockImplementation(async (address) => {
+          const row = await originalRead(address);
+          if (phase === 'read') {
+            entered.resolve();
+            await release.promise;
+          }
+          return row;
+        });
+      pending = f.runtime
+        .recoverStartAttempt(execution, {
+          attemptToken: 'H',
+          expectedTarget,
+          isOwnerQuiescent: async () => {
+            if (phase === 'quiescence') {
+              entered.resolve();
+              await release.promise;
+            }
+            return true;
+          },
+        })
+        .catch((error) => error);
+      await entered.promise;
+      expect(Object.isFrozen(expectedTarget)).toBe(false);
+      expect(Object.isFrozen(expectedTarget.owner)).toBe(false);
+      Object.assign(expectedTarget, {
+        kind: 'workflow',
+        id: 'other-agent',
+        threadId: 'other-thread',
+        threaded: true,
+      });
+      Object.assign(expectedTarget.owner, {
+        kind: 'service',
+        id: 'other-owner',
+      });
+      release.resolve();
+      const result = await pending;
+      expect((await f.row())?.status).toBe('failed');
+      expect(
+        (await f.row())?.requestContext?.['flowsafe.runProvenance']
+          .startIdentity,
+      ).toEqual({
+        owner: { kind: 'human', id: 'owner' },
+        target: { kind: 'agent', id: 'writer', threadId: 'thread' },
+      });
+      expect(read).toHaveBeenCalledOnce();
+      expect(f.effects).not.toHaveBeenCalled();
+      expect(result).toMatchObject({
+        kind: 'ordinary',
+        summary: { status: 'failed' },
+      });
+    } finally {
+      release.resolve();
+      await pending;
+      f.close();
+    }
+  });
+
+  it.each(
+    (['terminalized', 'progressed'] as const).flatMap((kind) =>
+      [
+        'owner-id',
+        'owner-kind',
+        'agent',
+        'thread',
+        'mode',
+        'workflow-role',
+        'missing-identity',
+      ].map((mismatch) => ({ kind, mismatch })),
+    ),
+  )('R09 rejects a contradictory B2 $kind returned target before settlement: $mismatch', async ({
+    kind,
+    mismatch,
+  }) => {
+    const f = await d3RuntimeFixture();
+    try {
+      const execution = await d3UnkeyedTargetPending(f);
+      assert(f.capability);
+      const native = f.capability.terminalizeInitialAdmission;
+      const terminalize = vi
+        .spyOn(f.capability, 'terminalizeInitialAdmission')
+        .mockImplementation(async (input) => {
+          const result = await native(input);
+          assert(result.kind !== 'conflict');
+          const snapshot = JSON.parse(result.row.snapshot);
+          d3ReplaceRecoveryTarget(
+            snapshot.requestContext['flowsafe.runProvenance'],
+            mismatch,
+          );
+          return {
+            ...result,
+            kind,
+            row: { ...result.row, snapshot: JSON.stringify(snapshot) },
+          };
+        });
+      const read = vi.spyOn(f.capability, 'readSnapshot'),
+        settle = vi.spyOn(f.reservations, 'settleExecution');
+      const result = await f.runtime
+        .recoverStartAttempt(execution, {
+          attemptToken: 'H',
+          isOwnerQuiescent: () => true,
+          expectedTarget: d3ExpectedAgentTarget(),
+        })
+        .catch((error) => error);
+      expect((await f.row())?.status).toBe('failed');
+      expect(
+        (await f.row())?.requestContext?.['flowsafe.runProvenance']
+          .startIdentity,
+      ).toEqual({
+        owner: { kind: 'human', id: 'owner' },
+        target: { kind: 'agent', id: 'writer', threadId: 'thread' },
+      });
+      expect(
+        (await f.row())?.requestContext?.['flowsafe.runProvenance'].agentStart,
+      ).toEqual({ threaded: false });
+      expect(read).toHaveBeenCalledOnce();
+      expect(terminalize).toHaveBeenCalledOnce();
+      expect(settle).not.toHaveBeenCalled();
+      expect(f.effects).not.toHaveBeenCalled();
+      expect(result).toBeInstanceOf(ExecutionFenceUnreadableError);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('R08 accepts a managed agent progressed result with a changed current-leg H and requester', async () => {
+    const f = await d3RuntimeFixture();
+    try {
+      await f.runtime.start(f.workflow.id, {
+        ...f.options(),
+        inputData: { suspend: true },
+        startIdentity: {
+          owner: { kind: 'human', id: 'owner' },
+          target: { kind: 'agent', id: 'writer', threadId: 'thread' },
+        },
+        agentStart: { threaded: false },
+      });
+      const original = await f.runtime.authoritativeStartState(
+        f.workflow.id,
+        'd3-run',
+      );
+      assert(original?.storage === 'd1');
+      await f.runtime.resume(f.workflow.id, 'd3-run', {
+        resumeData: { go: true },
+        requestedBy: 'reviewer',
+        requestedByKind: 'service',
+      });
+      assert(f.capability);
+      const read = vi.spyOn(f.capability, 'readSnapshot');
+      const result = await f.runtime.recoverStartAttempt(original.execution, {
+        attemptToken: 'H',
+        isOwnerQuiescent: () => true,
+        expectedTarget: d3ExpectedAgentTarget(),
+      });
+      expect(
+        (await f.row())?.requestContext?.['flowsafe.runProvenance']
+          .attemptToken,
+      ).not.toBe('H');
+      expect(read).toHaveBeenCalledOnce();
+      expect(f.effects).toHaveBeenCalledTimes(2);
+      expect(result).toMatchObject({
+        kind: 'ordinary',
+        summary: {
+          status: 'success',
+          requestedBy: 'reviewer',
+          requestedByKind: 'service',
+        },
+      });
+    } finally {
+      f.close();
+    }
+  });
+
+  it('R09 workflow expectation preserves the initiating owner without a source-owner assertion', async () => {
+    const f = await d3RuntimeFixture();
+    try {
+      const execution = await d3UnkeyedTargetPending(f, 'workflow');
+      await expect(
+        f.runtime.recoverStartAttempt(execution, {
+          attemptToken: 'H',
+          isOwnerQuiescent: () => true,
+          expectedTarget: { kind: 'workflow' },
+        }),
+      ).resolves.toMatchObject({
+        kind: 'ordinary',
+        summary: { status: 'failed', requestedBy: 'owner' },
+      });
+      expect(
+        (await f.row())?.requestContext?.['flowsafe.runProvenance']
+          .startIdentity.owner,
+      ).toEqual({ kind: 'human', id: 'owner' });
+      expect(f.effects).not.toHaveBeenCalled();
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    'inherited',
+    'unattributed',
+  ] as const)('R08 direct generic recovery stays role-neutral for %s results', async (kind) => {
+    const f = await d1Fixture();
+    try {
+      const snapshot = d1Snapshot();
+      if (kind === 'inherited')
+        snapshot.requestContext[
+          'flowsafe.runProvenance'
+        ].startIdentity.target.id = 'another-root';
+      else {
+        delete snapshot.requestContext['flowsafe.runProvenance'].startIdentity;
+        delete snapshot.requestContext['flowsafe.runProvenance'].requestedBy;
+        delete snapshot.requestContext['flowsafe.runProvenance']
+          .requestedByKind;
+      }
+      await f.seed(snapshot);
+      await expect(
+        f.runtime.recoverStartAttempt(
+          {
+            tablePrefix: '',
+            workflowId: 'd1-workflow',
+            runId: 'd1-run',
+            startToken: 'S1',
+          },
+          { attemptToken: 'initial-H', isOwnerQuiescent: () => true },
+        ),
+      ).resolves.toMatchObject({
+        kind: 'ordinary',
+        summary: { status: 'success', result: { source: 'S1' } },
+      });
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    null,
+    [],
+    1,
+    'workflow',
+    { kind: 'wrong' },
+    {
+      kind: 'agent',
+      id: 'writer',
+      threadId: 'thread',
+      owner: { kind: 'human', id: 'owner' },
+      threaded: 'false',
+    },
+  ])('R09 rejects malformed recovery expectation %j before I/O', async (expectedTarget) => {
+    const f = await d3RuntimeFixture();
+    try {
+      assert(f.capability);
+      const read = vi.spyOn(f.capability, 'readSnapshot'),
+        quiescent = vi.fn(() => true);
+      const result = await f.runtime
+        .recoverStartAttempt(
+          {
+            tablePrefix: 'd3_',
+            workflowId: f.workflow.id,
+            runId: 'd3-run',
+            startToken: 'S',
+          },
+          {
+            attemptToken: 'H',
+            isOwnerQuiescent: quiescent,
+            expectedTarget: expectedTarget as never,
+          },
+        )
+        .catch((error) => error);
+      expect(read).not.toHaveBeenCalled();
+      expect(quiescent).not.toHaveBeenCalled();
+      expect(await f.row()).toBeNull();
+      expect(f.effects).not.toHaveBeenCalled();
+      expect(result).toBeInstanceOf(InvalidRunRequestError);
+    } finally {
+      f.close();
+    }
+  });
+});
+
+describe('FS8 D3 Runtime activation', () => {
+  it.each([
+    'agent-role',
+    'foreign-workflow',
+    'missing-identity',
+  ] as const)('R09 rejects B2 returned workflow expectation mismatch %s before settlement', async (mismatch) => {
+    const f = await d3RuntimeFixture();
+    try {
+      const execution = await d3UnkeyedTargetPending(f, 'workflow');
+      assert(f.capability);
+      const native = f.capability.terminalizeInitialAdmission;
+      vi.spyOn(f.capability, 'terminalizeInitialAdmission').mockImplementation(
+        async (input) => {
+          const result = await native(input);
+          assert(result.kind !== 'conflict');
+          const snapshot = JSON.parse(result.row.snapshot);
+          const provenance = snapshot.requestContext['flowsafe.runProvenance'];
+          if (mismatch === 'agent-role') {
+            provenance.startIdentity.target = {
+              kind: 'agent',
+              id: 'writer',
+              threadId: 'thread',
+            };
+            provenance.agentStart = { threaded: false };
+          } else if (mismatch === 'foreign-workflow')
+            provenance.startIdentity.target.id = 'other-workflow';
+          else d3ReplaceRecoveryTarget(provenance, 'missing-identity');
+          return {
+            ...result,
+            kind: 'progressed',
+            row: { ...result.row, snapshot: JSON.stringify(snapshot) },
+          };
+        },
+      );
+      const read = vi.spyOn(f.capability, 'readSnapshot'),
+        settle = vi.spyOn(f.reservations, 'settleExecution');
+      const result = await f.runtime
+        .recoverStartAttempt(execution, {
+          attemptToken: 'H',
+          isOwnerQuiescent: () => true,
+          expectedTarget: { kind: 'workflow' },
+        })
+        .catch((error) => error);
+      expect((await f.row())?.status).toBe('failed');
+      expect(
+        (await f.row())?.requestContext?.['flowsafe.runProvenance']
+          .startIdentity.target,
+      ).toEqual({ kind: 'workflow', id: f.workflow.id });
+      expect(read).toHaveBeenCalledOnce();
+      expect(settle).not.toHaveBeenCalled();
+      expect(f.effects).not.toHaveBeenCalled();
+      expect(result).toBeInstanceOf(ExecutionFenceUnreadableError);
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    { owner: { kind: 'operator', id: 'owner' } },
+    { owner: { kind: 'human', id: '' } },
+    { owner: null },
+    { id: 'bad/agent' },
+    { threadId: 'bad/thread' },
+  ])('R09 uses the existing identity normalizer for invalid managed recovery target %j', async (invalid) => {
+    const f = await d3RuntimeFixture();
+    try {
+      assert(f.capability);
+      const read = vi.spyOn(f.capability, 'readSnapshot'),
+        quiescent = vi.fn(() => true);
+      const result = await f.runtime
+        .recoverStartAttempt(
+          {
+            tablePrefix: 'd3_',
+            workflowId: f.workflow.id,
+            runId: 'd3-run',
+            startToken: 'S',
+          },
+          {
+            attemptToken: 'H',
+            isOwnerQuiescent: quiescent,
+            expectedTarget: { ...d3ExpectedAgentTarget(), ...invalid } as never,
+          },
+        )
+        .catch((error) => error);
+      expect(read).not.toHaveBeenCalled();
+      expect(quiescent).not.toHaveBeenCalled();
+      expect(await f.row()).toBeNull();
+      expect(f.effects).not.toHaveBeenCalled();
+      expect(result).toBeInstanceOf(InvalidExecutionIdentityError);
+    } finally {
+      f.close();
+    }
+  });
+});
+
+describe('FS8 D3 Runtime activation', () => {
+  it('R08 freezes workflow recovery kind before owning quiescence', async () => {
+    const f = await d3RuntimeFixture(),
+      entered = cDeferred(),
+      release = cDeferred();
+    let pending: Promise<unknown> | undefined;
+    try {
+      const execution = await d3UnkeyedTargetPending(f, 'workflow');
+      const expectedTarget = { kind: 'workflow' as const };
+      pending = f.runtime
+        .recoverStartAttempt(execution, {
+          attemptToken: 'H',
+          expectedTarget,
+          isOwnerQuiescent: async () => {
+            entered.resolve();
+            await release.promise;
+            return true;
+          },
+        })
+        .catch((error) => error);
+      await entered.promise;
+      expect(Object.isFrozen(expectedTarget)).toBe(false);
+      Object.assign(expectedTarget, d3ExpectedAgentTarget());
+      release.resolve();
+      const result = await pending;
+      expect((await f.row())?.status).toBe('failed');
+      expect(
+        (await f.row())?.requestContext?.['flowsafe.runProvenance']
+          .startIdentity.target,
+      ).toEqual({ kind: 'workflow', id: f.workflow.id });
+      expect(f.effects).not.toHaveBeenCalled();
+      expect(result).toMatchObject({
+        kind: 'ordinary',
+        summary: { status: 'failed' },
+      });
+    } finally {
+      release.resolve();
+      await pending;
+      f.close();
+    }
+  });
+});
+
+function d3LegacySnapshot(
+  version: 'v1' | 'absent',
+  status: RunSummary['status'] = 'success',
+) {
+  const snapshot = d1Snapshot(status);
+  if (version === 'v1')
+    snapshot.requestContext['flowsafe.runProvenance'] = {
+      version: 1,
+      attemptToken: 'legacy-H',
+      requestedBy: 'legacy-requester',
+      resumeCounts: [['gate', 2]],
+    };
+  else delete snapshot.requestContext['flowsafe.runProvenance'];
+  return snapshot;
+}
+
+describe('FS8 D3 fix R1 legacy Runtime observations', () => {
+  it.each(
+    (['default', 'prefixed', 'unfenced'] as const).flatMap((storage) =>
+      (['v1', 'absent'] as const).flatMap((version) =>
+        (['pending', 'suspended', 'success'] as const).map((status) => ({
+          storage,
+          version,
+          status,
+        })),
+      ),
+    ),
+  )('selects $storage $version $status once only with explicit legacy opt-in', async ({
+    storage,
+    version,
+    status,
+  }) => {
+    const f = await d1Fixture(storage);
+    try {
+      const snapshot = d3LegacySnapshot(version, status);
+      await f.seed(snapshot);
+      const read =
+        storage === 'unfenced'
+          ? vi.spyOn(f.workflows, 'getWorkflowRunById')
+          : vi.spyOn(f.capability, 'readSnapshot');
+      const mint = vi.spyOn(crypto, 'randomUUID');
+      const result = await f.runtime.authoritativeStartState(
+        'd1-workflow',
+        'd1-run',
+        { includeLegacy: true },
+      );
+      expect(result).toMatchObject({
+        kind: 'legacy',
+        provenanceVersion: version === 'v1' ? 1 : undefined,
+        address: {
+          tablePrefix:
+            storage === 'unfenced' ? null : storage === 'prefixed' ? 'd1_' : '',
+          workflowId: 'd1-workflow',
+          runId: 'd1-run',
+        },
+        snapshot,
+        summary: { runId: 'd1-run', status },
+      });
+      expect(result).not.toHaveProperty('execution');
+      expect(result?.kind === 'legacy' && result.address).not.toHaveProperty(
+        'startToken',
+      );
+      expect(read).toHaveBeenCalledOnce();
+      expect(mint).not.toHaveBeenCalled();
+      if (version === 'v1')
+        expect(result?.summary?.requestedBy).toBe('legacy-requester');
+      else expect(result?.summary).not.toHaveProperty('requestedBy');
+      if (status === 'suspended')
+        expect(result?.summary?.resumeCount).toEqual(
+          version === 'v1' ? { gate: 2 } : undefined,
+        );
+      mint.mockRestore();
+      read.mockRestore();
+      const before = await f.workflows.loadWorkflowSnapshot({
+        workflowName: 'd1-workflow',
+        runId: 'd1-run',
+      });
+      const refused = await f.runtime
+        .authoritativeStartState('d1-workflow', 'd1-run')
+        .catch((error) => error);
+      expect(
+        await f.workflows.loadWorkflowSnapshot({
+          workflowName: 'd1-workflow',
+          runId: 'd1-run',
+        }),
+      ).toEqual(before);
+      expect(refused).toBeInstanceOf(RunStateUnreadableError);
+    } finally {
+      vi.restoreAllMocks();
+      f.close();
+    }
+  });
+
+  it.each([
+    null,
+    'legacy',
+    3,
+    [[]],
+    { version: 3 },
+    { version: 1 },
+    { version: 1, attemptToken: 'bad/token', resumeCounts: [] },
+    { version: 1, attemptToken: 'H', requestedBy: ' ', resumeCounts: [] },
+    {
+      version: 1,
+      attemptToken: 'H',
+      requestedByKind: 'human',
+      resumeCounts: [],
+    },
+    { version: 1, attemptToken: 'H', resumeCounts: [['gate', 0]] },
+    { version: 2, startToken: 'S1', attemptToken: 'H', resumeCounts: 'wrong' },
+  ])('does not reclassify malformed provenance as legacy (%j)', async (provenance) => {
+    const f = await d1Fixture();
+    try {
+      const snapshot = d1Snapshot();
+      snapshot.requestContext['flowsafe.runProvenance'] = provenance;
+      await f.seed(snapshot);
+      const before = await f.workflows.loadWorkflowSnapshot({
+        workflowName: 'd1-workflow',
+        runId: 'd1-run',
+      });
+      const read = vi.spyOn(f.capability, 'readSnapshot');
+      const result = await f.runtime
+        .authoritativeStartState('d1-workflow', 'd1-run', {
+          includeLegacy: true,
+        })
+        .catch((error) => error);
+      expect(
+        await f.workflows.loadWorkflowSnapshot({
+          workflowName: 'd1-workflow',
+          runId: 'd1-run',
+        }),
+      ).toEqual(before);
+      expect(read).toHaveBeenCalledOnce();
+      expect(result).toBeInstanceOf(RunStateUnreadableError);
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    'read failure',
+    'JSON',
+    'selector',
+    'timestamp',
+    'container',
+  ] as const)('retains authoritative unreadability instead of a legacy fallback after %s', async (fault) => {
+    const f = await d1Fixture();
+    try {
+      await f.seed(d3LegacySnapshot('v1'));
+      const native = f.capability.readSnapshot;
+      const read = vi
+        .spyOn(f.capability, 'readSnapshot')
+        .mockImplementation(async (address) => {
+          if (fault === 'read failure') throw new Error('selected read failed');
+          const row = await native(address);
+          assert(row);
+          if (fault === 'JSON') return { ...row, snapshot: '{' };
+          if (fault === 'selector') return { ...row, workflowId: 'other' };
+          if (fault === 'timestamp') return { ...row, updatedAt: 'invalid' };
+          const snapshot = JSON.parse(row.snapshot);
+          snapshot.context = [];
+          return { ...row, snapshot: JSON.stringify(snapshot) };
+        });
+      const ordinary = vi.spyOn(f.workflows, 'getWorkflowRunById');
+      const result = await f.runtime
+        .authoritativeStartState('d1-workflow', 'd1-run', {
+          includeLegacy: true,
+        })
+        .catch((error) => error);
+      expect(read).toHaveBeenCalledOnce();
+      expect(ordinary).not.toHaveBeenCalled();
+      expect(result).toBeInstanceOf(RunStateUnreadableError);
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    'prefixed',
+    'unfenced',
+  ] as const)('captures actual %s source, method and legacy option before the selected read waits', async (storage) => {
+    const nominal = await d1Fixture(),
+      actual = await d1Fixture(storage),
+      entered = cDeferred(),
+      release = cDeferred();
+    let pending: Promise<unknown> | undefined;
+    try {
+      await nominal.seed(d1Snapshot());
+      await actual.seed(d3LegacySnapshot('v1'));
+      vi.spyOn(nominal.workflow, 'mastra', 'get').mockReturnValue(
+        new Mastra({ storage: actual.storage, logger: false }),
+      );
+      const options = { includeLegacy: true as const };
+      const receivers: unknown[] = [];
+      if (storage === 'prefixed') {
+        const native = actual.capability.readSnapshot;
+        actual.capability.readSnapshot = async function (address) {
+          receivers.push(this);
+          const row = await native.call(this, address);
+          entered.resolve();
+          await release.promise;
+          return row;
+        };
+      } else {
+        const native = actual.workflows.getWorkflowRunById;
+        actual.workflows.getWorkflowRunById = async function (address) {
+          receivers.push(this);
+          const row = await native.call(this, address);
+          entered.resolve();
+          await release.promise;
+          return row;
+        };
+      }
+      const nominalRead = vi.spyOn(nominal.capability, 'readSnapshot');
+      pending = nominal.runtime
+        .authoritativeStartState('d1-workflow', 'd1-run', options)
+        .catch((error) => error);
+      const actualReadEntered = await Promise.race([
+        entered.promise.then(() => true),
+        pending.then(() => false),
+      ]);
+      expect(actualReadEntered).toBe(true);
+      Object.assign(options, { includeLegacy: false });
+      const replacement = vi
+        .fn()
+        .mockRejectedValue(new Error('replacement read must not run'));
+      if (storage === 'prefixed') actual.capability.readSnapshot = replacement;
+      else actual.workflows.getWorkflowRunById = replacement;
+      release.resolve();
+      const result = await pending;
+      expect(result).toMatchObject({
+        kind: 'legacy',
+        address: { tablePrefix: storage === 'prefixed' ? 'd1_' : null },
+        summary: { requestedBy: 'legacy-requester' },
+      });
+      expect(receivers).toEqual([
+        storage === 'prefixed' ? actual.capability : actual.workflows,
+      ]);
+      expect(nominalRead).not.toHaveBeenCalled();
+      expect(replacement).not.toHaveBeenCalled();
+    } finally {
+      release.resolve();
+      await pending;
+      nominal.close();
+      actual.close();
+    }
+  });
+
+  it('does not use a cached Core run when the selected legacy-capable row is absent', async () => {
+    const f = await d1Fixture();
+    try {
+      await f.workflow.createRun({ runId: 'd1-run' });
+      await f.seed(d3LegacySnapshot('v1'));
+      f.sql
+        .prepare(
+          'DELETE FROM mastra_workflow_snapshot WHERE workflow_name = ? AND run_id = ?',
+        )
+        .run('d1-workflow', 'd1-run');
+      const before = f.workflow.runs.get('d1-run');
+      expect(before).toBeDefined();
+      const read = vi.spyOn(f.capability, 'readSnapshot');
+      await expect(
+        f.runtime.authoritativeStartState('d1-workflow', 'd1-run', {
+          includeLegacy: true,
+        }),
+      ).resolves.toBeNull();
+      expect(f.workflow.runs.get('d1-run')).toBe(before);
+      expect(read).toHaveBeenCalledOnce();
+    } finally {
+      f.close();
+    }
+  });
+
+  it('keeps raw legacy pending visible even when lifecycle projection looks terminal', async () => {
+    const f = await d1Fixture();
+    try {
+      const snapshot = d3LegacySnapshot('v1', 'pending');
+      snapshot.requestContext['flowsafe.runLifecycle'] = {
+        version: 1,
+        revision: 1,
+        terminal: {
+          status: 'cancelled',
+          transitionedAt: 1,
+          error: { code: 'CANCELLED', message: 'run was cancelled' },
+          replayPrincipals: [{ kind: 'human', id: 'owner' }],
+        },
+      };
+      await f.seed(snapshot);
+      const result = await f.runtime.authoritativeStartState(
+        'd1-workflow',
+        'd1-run',
+        { includeLegacy: true },
+      );
+      expect(result).toMatchObject({
+        kind: 'legacy',
+        snapshot: { status: 'pending' },
+        summary: { status: 'cancelled' },
+      });
+      expect(result).not.toHaveProperty('execution');
+    } finally {
+      f.close();
+    }
+  });
+
+  it('preserves changed v1 current requester during native authorized resume without creating v2 identity', async () => {
+    const f = await d3RuntimeFixture();
+    try {
+      await f.runtime.start(f.workflow.id, {
+        ...f.options(),
+        inputData: { suspend: true },
+      });
+      const snapshot = await f.row();
+      assert(snapshot?.requestContext);
+      snapshot.requestContext['flowsafe.runProvenance'] = {
+        version: 1,
+        attemptToken: 'legacy-H',
+        requestedBy: 'initial-owner',
+        requestedByKind: 'human',
+        resumeCounts: [],
+      };
+      await f.workflows.persistWorkflowSnapshot({
+        workflowName: f.workflow.id,
+        runId: 'd3-run',
+        snapshot,
+      });
+      await expect(
+        f.runtime.resume(f.workflow.id, 'd3-run', {
+          resumeData: { go: true },
+          requestedBy: 'reviewer',
+          requestedByKind: 'service',
+        }),
+      ).resolves.toMatchObject({ status: 'success', requestedBy: 'reviewer' });
+      const result = await f.runtime.authoritativeStartState(
+        f.workflow.id,
+        'd3-run',
+        { includeLegacy: true },
+      );
+      expect(result).toMatchObject({
+        kind: 'legacy',
+        provenanceVersion: 1,
+        summary: {
+          status: 'success',
+          requestedBy: 'reviewer',
+          requestedByKind: 'service',
+        },
+      });
+      expect(
+        (await f.row())?.requestContext?.['flowsafe.runProvenance'],
+      ).toMatchObject({
+        version: 1,
+        startToken: 'legacy-H',
+        resumeCounts: [['gate', 1]],
+      });
+      expect(result).not.toHaveProperty('execution');
+      expect(f.effects).toHaveBeenCalledTimes(2);
+      await expect(
+        f.runtime.authoritativeStartState(f.workflow.id, 'd3-run'),
+      ).rejects.toBeInstanceOf(RunStateUnreadableError);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('preserves strict ReturnType and Parameters while typing explicit legacy reads', () => {
+    expectTypeOf<
+      ReturnType<RunnerRuntime['authoritativeStartState']>
+    >().toEqualTypeOf<Promise<AuthoritativeStartState | null>>();
+    expectTypeOf<
+      Parameters<RunnerRuntime['authoritativeStartState']>
+    >().toEqualTypeOf<[string, string]>();
+    const readLegacy = (runtime: RunnerRuntime) =>
+      runtime.authoritativeStartState('workflow', 'run', {
+        includeLegacy: true,
+      });
+    expectTypeOf(readLegacy).returns.toEqualTypeOf<
+      Promise<AuthoritativeStartState | LegacyRunState | null>
+    >();
+    expectTypeOf<
+      Extract<keyof LegacyRunState, 'execution' | 'startToken' | 'attemptToken'>
+    >().toEqualTypeOf<never>();
+  });
+});
+
+describe('FS8 D3 fix R1 legacy Runtime observations', () => {
+  it.each([
+    'v1',
+    'absent',
+  ] as const)('does not admit %s to private recovery or proof through the opt-in capability', async (version) => {
+    const f = await d1Fixture('default', 'fence');
+    try {
+      await f.seed(d3LegacySnapshot(version));
+      const fence = f.runtime.executionFence;
+      assert(fence);
+      await fence.seed('open');
+      await fence.transition({
+        expected: 'open',
+        next: 'proof-only',
+        proofKey: 'proof-key',
+      });
+      const before = await f.workflows.loadWorkflowSnapshot({
+        workflowName: 'd1-workflow',
+        runId: 'd1-run',
+      });
+      const terminalize = vi.spyOn(f.capability, 'terminalizeInitialAdmission');
+      const settle = vi.spyOn(f.runtime, 'settleStartExecution');
+      await expect(
+        f.runtime.authoritativeStartState('d1-workflow', 'd1-run', {
+          includeLegacy: true,
+        }),
+      ).resolves.toMatchObject({ kind: 'legacy' });
+      const recovery = await f.runtime
+        .recoverStartAttempt(
+          {
+            tablePrefix: '',
+            workflowId: 'd1-workflow',
+            runId: 'd1-run',
+            startToken: 'legacy-H',
+          },
+          { attemptToken: 'legacy-H', isOwnerQuiescent: () => true },
+        )
+        .catch((error) => error);
+      const proof = await f.runtime
+        .assertExistingRunAllowed('d1-workflow', 'd1-run')
+        .catch((error) => error);
+      expect(
+        await f.workflows.loadWorkflowSnapshot({
+          workflowName: 'd1-workflow',
+          runId: 'd1-run',
+        }),
+      ).toEqual(before);
+      expect(terminalize).not.toHaveBeenCalled();
+      expect(settle).not.toHaveBeenCalled();
+      expect(recovery).toBeInstanceOf(RunStateUnreadableError);
+      expect(proof).toBeInstanceOf(RunStateUnreadableError);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('refuses a legacy-shaped initial witness without losing the actual modern pending row', async () => {
+    const f = await d3RuntimeFixture();
+    try {
+      assert(f.capability);
+      const native = f.capability.withInitialAdmission;
+      f.capability.withInitialAdmission = async (input, create) => {
+        const result = await native(input, create);
+        const snapshot = JSON.parse(result.witness.row.snapshot);
+        snapshot.requestContext['flowsafe.runProvenance'].version = 1;
+        return {
+          ...result,
+          witness: {
+            ...result.witness,
+            row: { ...result.witness.row, snapshot: JSON.stringify(snapshot) },
+          },
+        };
+      };
+      const result = await f.runtime
+        .start(f.workflow.id, f.options())
+        .catch((error) => error);
+      expect((await f.row())?.status).toBe('pending');
+      expect(
+        (await f.row())?.requestContext?.['flowsafe.runProvenance'].version,
+      ).toBe(2);
+      expect(f.effects).not.toHaveBeenCalled();
+      expect(result).toBeInstanceOf(RunStateUnreadableError);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('refuses a legacy-shaped B2 returned row before modern reservation settlement', async () => {
+    const f = await d3RuntimeFixture();
+    try {
+      const { execution, claim } = await d3PreparedPending(f);
+      assert(f.capability);
+      const native = f.capability.terminalizeInitialAdmission;
+      f.capability.terminalizeInitialAdmission = async (input) => {
+        const result = await native(input);
+        assert(result.kind !== 'conflict');
+        const snapshot = JSON.parse(result.row.snapshot);
+        snapshot.requestContext['flowsafe.runProvenance'].version = 1;
+        return {
+          ...result,
+          row: { ...result.row, snapshot: JSON.stringify(snapshot) },
+        };
+      };
+      const result = await f.runtime
+        .recoverStartAttempt(execution, {
+          attemptToken: 'H',
+          isOwnerQuiescent: () => true,
+          startReservation: claim,
+        })
+        .catch((error) => error);
+      expect((await f.row())?.status).toBe('failed');
+      expect(
+        (await f.row())?.requestContext?.['flowsafe.runProvenance'].version,
+      ).toBe(2);
+      expect((await f.reservations.readForAdmission(claim.key))?.state).toBe(
+        'started',
+      );
+      expect(f.effects).not.toHaveBeenCalled();
+      expect(result).toBeInstanceOf(ExecutionFenceUnreadableError);
+    } finally {
+      f.close();
     }
   });
 });

@@ -82,6 +82,7 @@ export function contextForPrincipal(
         // decide() COMMITS before it resumes.
         store,
         executionFence: executionFence(env.DB),
+        workflowTablePrefix: '',
       }),
   });
 }

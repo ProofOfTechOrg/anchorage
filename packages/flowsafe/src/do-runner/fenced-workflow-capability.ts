@@ -65,7 +65,7 @@ export type InitialTerminalizationResult =
     }
   | { readonly kind: 'conflict'; readonly row?: RawWorkflowSnapshot };
 
-/** Explicit trusted primitive; built-in Runtime does not yet consume it. */
+/** Trusted storage primitives used by Runtime admission and owning recovery. */
 export interface FencedWorkflowAdmissionCapability {
   readonly database: InitialAdmissionDatabase;
   readonly tablePrefix: string;

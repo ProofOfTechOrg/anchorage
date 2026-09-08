@@ -72,7 +72,7 @@
 // only ever approximating.
 //
 // THE CLAIM IS THE SERIALIZER. `reserve()` decides which runId a key means;
-// `claim()` decides who gets to START it. The claim is one conditional UPDATE,
+// `claimReservation()` decides who gets to START it. The claim is one conditional UPDATE,
 // so exactly one caller changes a row and every other caller reads the outcome
 // instead of racing it. That matters most where Durable Object serialization
 // cannot help: agent runs live in thread objects keyed by threadId, so two
@@ -85,7 +85,6 @@
 // authority, and the whole rule is that there is exactly one.
 
 import {
-  EXECUTION_PRINCIPAL_KINDS,
   isExecutionPrincipalId,
   isExecutionPrincipalKind,
 } from '../approval-api/principal-identity.js';
@@ -93,29 +92,46 @@ import { missingTableReadsEmpty } from './cause-chain.js';
 import { DoStatusError } from './do-status-error.js';
 import {
   InvalidExecutionIdentityError,
-  normalizeRunExecutionIdentity,
+  normalizeMutationEpoch,
   normalizeStartExecutionIdentity,
-  normalizeStartIdentity,
+  type ProofEntryExpectation,
   RunAdmissionConflictError,
   type StartExecutionIdentity,
 } from './execution-admission.js';
 import type { ExecutionFenceWiring } from './execution-fence.js';
-import { isExecutionFenceRefusal } from './execution-fence.js';
 import { isPathSafeId } from './path-safe-id.js';
 import {
+  admissionReservationFromRow,
   captureReservation,
-  START_RESERVATION_STATES,
+  decodeStartReservationAdmissionResult,
+  isStartTargetKind,
+  ReservationSchemaError,
+  reservationFromRow,
+  reservationResultRows,
+  reservationSchemaStage,
+  START_IDEMPOTENCY_ADDITIONS,
+  START_IDEMPOTENCY_COLUMNS,
+  START_IDEMPOTENCY_DDL,
+  START_IDEMPOTENCY_RUN_INDEX_DDL,
+  START_IDEMPOTENCY_STATE_INDEX_DDL,
+  START_IDEMPOTENCY_TABLE,
   START_TARGET_KINDS,
   type StartReservation,
-  type StartReservationBinding,
   type StartReservationOwner,
   type StartReservationReading,
+  type StartReservationSchemaStage,
   type StartReservationState,
   type StartTargetKind,
   sameReservationIdentity,
+  validateStartReservationAdmissionSchema,
 } from './start-reservation-contract.js';
 
 export {
+  decodeStartReservationAdmissionResult,
+  START_IDEMPOTENCY_DDL,
+  START_IDEMPOTENCY_RUN_INDEX_DDL,
+  START_IDEMPOTENCY_STATE_INDEX_DDL,
+  START_IDEMPOTENCY_TABLE,
   START_RESERVATION_STATES,
   START_TARGET_KINDS,
   type StartReservation,
@@ -124,6 +140,7 @@ export {
   type StartReservationReading,
   type StartReservationState,
   type StartTargetKind,
+  validateStartReservationAdmissionSchema,
 } from './start-reservation-contract.js';
 
 /**
@@ -134,7 +151,6 @@ export {
  * table simply means no key has ever been used on this deployment, which is
  * indistinguishable from an empty one.
  */
-export const START_IDEMPOTENCY_TABLE = 'flowsafe_start_idempotency';
 
 export interface StartReservationRequest {
   /**
@@ -164,6 +180,53 @@ export interface StartReservationRequest {
   mintRunId: () => string;
   /** Required for `targetKind: 'agent'`, rejected for 'workflow'. */
   threadId?: string;
+}
+
+function captureStartRequest(
+  request: StartReservationRequest,
+): StartReservationRequest & { key: string } {
+  const key = assertKey(request.key);
+  const owner = assertOwner(request.owner);
+  const { targetKind, targetId, threadId, mintRunId } = request;
+  if (!isStartTargetKind(targetKind)) {
+    throw new InvalidStartIdempotencyRequestError(
+      `target kind must be one of ${START_TARGET_KINDS.join(', ')}`,
+    );
+  }
+  if (!isPathSafeId(targetId)) {
+    throw new InvalidStartIdempotencyRequestError(
+      'target id must be a URL-path-safe identifier',
+    );
+  }
+  // The thread is the agent run's ADDRESS, so requiring it for agents and
+  // rejecting it for workflows is not tidiness: an agent reservation without
+  // one is a run a retry can never reach, and a workflow reservation WITH one
+  // is a second, silently divergent copy of an address that is already
+  // derivable from (workflowId, runId).
+  if (targetKind === 'agent') {
+    if (!isPathSafeId(threadId)) {
+      throw new InvalidStartIdempotencyRequestError(
+        'an agent start reservation requires a URL-path-safe threadId',
+      );
+    }
+  } else if (threadId !== undefined) {
+    throw new InvalidStartIdempotencyRequestError(
+      'threadId applies only to agent start reservations',
+    );
+  }
+  if (typeof mintRunId !== 'function') {
+    throw new InvalidStartIdempotencyRequestError(
+      'mintRunId must be a function',
+    );
+  }
+  return Object.freeze({
+    key,
+    owner,
+    targetKind,
+    targetId,
+    threadId,
+    mintRunId: () => Reflect.apply(mintRunId, request, []),
+  });
 }
 
 export interface StartReservationOutcome {
@@ -445,337 +508,6 @@ export function startIdempotencyFor(
   return store;
 }
 
-const STATE_CHECK = START_RESERVATION_STATES.map((state) => `'${state}'`).join(
-  ', ',
-);
-const TARGET_CHECK = START_TARGET_KINDS.map((kind) => `'${kind}'`).join(', ');
-/**
- * Built from the principal vocabulary rather than hand-written, so a kind added
- * to `EXECUTION_PRINCIPAL_KINDS` cannot leave this constraint behind. The
- * failure a stale literal would cause is not a compile error and not a rejected
- * write on an existing deployment: `CREATE TABLE IF NOT EXISTS` is a no-op
- * against a table that already exists, so the drift would show up only as an
- * INSERT refused on whichever database happened to be created after the new
- * kind shipped.
- */
-const OWNER_KIND_CHECK = EXECUTION_PRINCIPAL_KINDS.map(
-  (kind) => `'${kind}'`,
-).join(', ');
-
-/**
- * The reservation schema.
- *
- * The CHECK constraints are load-bearing, not decoration: every compare-and-set
- * below is stated as `WHERE ... AND state = '<literal>'`, which is only a TOTAL
- * decision while the column cannot hold a fourth value. A row hand-edited into
- * an unknown state would otherwise be a reservation no CAS can advance and no
- * purge can reap — a permanently wedged key.
- */
-const START_IDEMPOTENCY_BASE_COLUMNS = `
-    key TEXT PRIMARY KEY,
-    owner_kind TEXT NOT NULL CHECK (owner_kind IN (${OWNER_KIND_CHECK})),
-    owner_id TEXT NOT NULL,
-    target_kind TEXT NOT NULL CHECK (target_kind IN (${TARGET_CHECK})),
-    target_id TEXT NOT NULL,
-    run_id TEXT NOT NULL,
-    thread_id TEXT,
-    state TEXT NOT NULL CHECK (state IN (${STATE_CHECK})),
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL`;
-const START_IDEMPOTENCY_ADDITIONS = [
-  'start_token TEXT',
-  'start_table_prefix TEXT',
-  'start_workflow_id TEXT',
-] as const;
-const START_IDEMPOTENCY_COLUMNS = [
-  ['key', 'TEXT', 0, 1],
-  ['owner_kind', 'TEXT', 1, 0],
-  ['owner_id', 'TEXT', 1, 0],
-  ['target_kind', 'TEXT', 1, 0],
-  ['target_id', 'TEXT', 1, 0],
-  ['run_id', 'TEXT', 1, 0],
-  ['thread_id', 'TEXT', 0, 0],
-  ['state', 'TEXT', 1, 0],
-  ['created_at', 'INTEGER', 1, 0],
-  ['updated_at', 'INTEGER', 1, 0],
-  ['start_token', 'TEXT', 0, 0],
-  ['start_table_prefix', 'TEXT', 0, 0],
-  ['start_workflow_id', 'TEXT', 0, 0],
-] as const;
-type StartReservationSchemaStage = 0 | 1 | 2 | 3;
-
-export const START_IDEMPOTENCY_DDL = `CREATE TABLE IF NOT EXISTS ${START_IDEMPOTENCY_TABLE} (${START_IDEMPOTENCY_BASE_COLUMNS},
-    ${START_IDEMPOTENCY_ADDITIONS.join(',\n    ')}
-  )`;
-
-/**
- * `run_id` is how the RUNTIME finds a reservation (terminal reconcile knows the
- * run, never the key) and how the purge pairs a reservation with the snapshot
- * it outlived. Without the index both degrade to a table scan on every terminal
- * run.
- */
-export const START_IDEMPOTENCY_RUN_INDEX_DDL = `CREATE INDEX IF NOT EXISTS ${START_IDEMPOTENCY_TABLE}_run
-    ON ${START_IDEMPOTENCY_TABLE} (run_id)`;
-
-/** The purge's own access path: terminal rows past the key-validity horizon. */
-export const START_IDEMPOTENCY_STATE_INDEX_DDL = `CREATE INDEX IF NOT EXISTS ${START_IDEMPOTENCY_TABLE}_state
-    ON ${START_IDEMPOTENCY_TABLE} (state, updated_at)`;
-
-type StartReservationRow = Readonly<Record<string, unknown>>;
-
-class ReservationSchemaError extends Error {
-  constructor(reason: string) {
-    super(
-      `${START_IDEMPOTENCY_TABLE} has an invalid reservation schema (${reason})`,
-    );
-    this.name = 'ReservationSchemaError';
-  }
-}
-
-function reservationResultRows(result: unknown): StartReservationRow[] {
-  if (
-    result === null ||
-    typeof result !== 'object' ||
-    ('success' in result && result.success !== true) ||
-    !('results' in result)
-  ) {
-    throw new Error('reservation statement returned an invalid result');
-  }
-  const rows: unknown = result.results;
-  if (!Array.isArray(rows))
-    throw new Error('reservation statement returned an invalid result');
-  const length = rows.length;
-  if (!Number.isSafeInteger(length) || length < 0)
-    throw new Error('reservation statement returned an invalid result');
-  return Array.from({ length }, (_, index) => {
-    if (!Object.hasOwn(rows, index))
-      throw new Error('reservation statement returned an invalid row');
-    const row = rows[index];
-    if (row === null || typeof row !== 'object' || Array.isArray(row)) {
-      throw new Error('reservation statement returned an invalid row');
-    }
-    return row;
-  });
-}
-
-function reservationBinding(
-  row: StartReservationRow,
-  schemaStage: StartReservationSchemaStage,
-): StartReservationBinding {
-  let stage = 0;
-  let missing = false;
-  for (const [name] of START_IDEMPOTENCY_COLUMNS.slice(10)) {
-    if (Object.hasOwn(row, name)) {
-      if (missing)
-        throw new ReservationSchemaError('binding prefix has a hole');
-      stage += 1;
-    } else missing = true;
-  }
-  if (stage > schemaStage)
-    throw new ReservationSchemaError('schema observation precedes row binding');
-  if (stage < 3) {
-    for (const [name] of START_IDEMPOTENCY_COLUMNS.slice(10, 10 + stage)) {
-      if (row[name] !== null)
-        throw new ReservationSchemaError(
-          'partial binding is not legacy defaults',
-        );
-    }
-    return { kind: 'legacy' };
-  }
-  const {
-    start_token: token,
-    start_table_prefix: prefix,
-    start_workflow_id: workflowId,
-  } = row;
-  if (prefix === null && workflowId === null) {
-    if (token === null) return { kind: 'legacy' };
-    if (token === '') return { kind: 'unbound' };
-  }
-  const execution = normalizeRunExecutionIdentity({
-    tablePrefix: prefix,
-    workflowId,
-    runId: row.run_id,
-    startToken: token,
-  });
-  if (execution.tablePrefix !== prefix)
-    throw new ReservationSchemaError('binding prefix is not canonical');
-  normalizeStartIdentity({
-    owner: { kind: row.owner_kind, id: row.owner_id },
-    target: {
-      kind: row.target_kind,
-      id: row.target_id,
-      ...(row.thread_id === null ? {} : { threadId: row.thread_id }),
-    },
-  });
-  return { kind: 'bound', execution };
-}
-
-function isStartReservationState(
-  value: unknown,
-): value is StartReservationState {
-  return (
-    typeof value === 'string' &&
-    (START_RESERVATION_STATES as readonly string[]).includes(value)
-  );
-}
-
-function isStartTargetKind(value: unknown): value is StartTargetKind {
-  return (
-    typeof value === 'string' &&
-    (START_TARGET_KINDS as readonly string[]).includes(value)
-  );
-}
-
-function isEpochMs(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value);
-}
-
-/**
- * Project a stored row, or refuse it.
- *
- * A malformed row throws rather than reading as absent, and that direction is
- * deliberate: "there is no reservation" is the answer that STARTS A RUN, so it
- * must never be reachable from a row this build cannot parse. The CHECK
- * constraints make this unreachable on a database this package created; it
- * exists for the one that was hand-edited.
- *
- * The TIMESTAMPS are in that strict set too, rather than coerced to 0 as an
- * unparseable number once was. Neither column is decoration: `updated_at` is
- * the horizon the purge measures from, so a corrupt one on a terminal row reads
- * as epoch 0 and makes the reservation immediately reapable — which deletes a
- * spent key early and turns the next retry of it into a fresh start. It is also
- * `pendingSince` on a live claim, where 0 tells an operator a run has been
- * starting since 1970. Refusing the row keeps both faults visible as the 503
- * they are.
- */
-function reservationFromRow(
-  row: StartReservationRow,
-  schemaStage: StartReservationSchemaStage,
-): StartReservationReading {
-  for (const [name] of START_IDEMPOTENCY_COLUMNS.slice(0, 10)) {
-    if (!Object.hasOwn(row, name))
-      throw new ReservationSchemaError(`row is missing ${name}`);
-  }
-  const {
-    key,
-    owner_kind: ownerKind,
-    owner_id: ownerId,
-    target_kind: targetKind,
-    target_id: targetId,
-    run_id: runId,
-    thread_id: threadId,
-    state,
-    created_at: createdAt,
-    updated_at: updatedAt,
-  } = row;
-  if (
-    typeof key !== 'string' ||
-    !isExecutionPrincipalKind(ownerKind) ||
-    !isExecutionPrincipalId(ownerId) ||
-    !isStartTargetKind(targetKind) ||
-    typeof targetId !== 'string' ||
-    !isPathSafeId(runId) ||
-    !isStartReservationState(state) ||
-    !isEpochMs(createdAt) ||
-    !isEpochMs(updatedAt)
-  ) {
-    throw new Error('start reservation row is malformed');
-  }
-  return {
-    key,
-    owner: { kind: ownerKind, id: ownerId },
-    targetKind,
-    targetId,
-    runId,
-    ...(isPathSafeId(threadId) ? { threadId } : {}),
-    state,
-    createdAt,
-    updatedAt,
-    binding: reservationBinding(row, schemaStage),
-  };
-}
-
-function admissionReservationFromRow(
-  row: StartReservationRow,
-  stage: StartReservationSchemaStage,
-): StartReservationReading {
-  if (stage !== 3)
-    throw new ReservationSchemaError('admission requires current schema');
-  const captured: Record<string, unknown> = {};
-  for (const [name] of START_IDEMPOTENCY_COLUMNS) {
-    if (!Object.hasOwn(row, name))
-      throw new ReservationSchemaError(`row is missing ${name}`);
-    captured[name] = row[name];
-  }
-  if (!isPathSafeId(captured.key))
-    throw new ReservationSchemaError('admission key is invalid');
-  if (!isPathSafeId(captured.run_id))
-    throw new ReservationSchemaError('admission run id is invalid');
-  if (!isPathSafeId(captured.target_id))
-    throw new ReservationSchemaError('admission target id is invalid');
-  if (captured.target_kind === 'workflow' && captured.thread_id !== null)
-    throw new ReservationSchemaError('admission workflow thread must be null');
-  if (captured.target_kind === 'agent' && !isPathSafeId(captured.thread_id))
-    throw new ReservationSchemaError('admission agent thread is invalid');
-  normalizeStartIdentity({
-    owner: { kind: captured.owner_kind, id: captured.owner_id },
-    target: {
-      kind: captured.target_kind,
-      id: captured.target_id,
-      ...(captured.thread_id === null ? {} : { threadId: captured.thread_id }),
-    },
-  });
-  const reservation = reservationFromRow(captured, stage);
-  return Object.freeze({
-    ...reservation,
-    owner: Object.freeze(reservation.owner),
-    binding: Object.freeze(reservation.binding),
-  });
-}
-
-/** @internal Decode current-stage data before compatible thread normalization. */
-export function decodeStartReservationAdmissionResult(
-  result: unknown,
-): StartReservationReading | undefined {
-  const rows = reservationResultRows(result);
-  if (rows.length > 1)
-    throw new ReservationSchemaError('admission returned multiple rows');
-  return rows[0] === undefined
-    ? undefined
-    : admissionReservationFromRow(rows[0], 3);
-}
-
-function reservationSchemaStage(
-  result: unknown,
-): StartReservationSchemaStage | undefined {
-  const columns = reservationResultRows(result);
-  if (columns.length === 0) return undefined;
-  if (columns.length < 10 || columns.length > START_IDEMPOTENCY_COLUMNS.length)
-    throw new ReservationSchemaError('unexpected columns');
-  for (const [index, actual] of columns.entries()) {
-    const expected = START_IDEMPOTENCY_COLUMNS[index];
-    if (expected === undefined)
-      throw new ReservationSchemaError('unexpected columns');
-    const [name, type, notnull, pk] = expected;
-    if (
-      actual.name !== name ||
-      actual.type !== type ||
-      actual.notnull !== notnull ||
-      actual.pk !== pk ||
-      actual.dflt_value !== null ||
-      actual.hidden !== 0
-    )
-      throw new ReservationSchemaError(`column ${name} differs`);
-  }
-  return (columns.length - 10) as StartReservationSchemaStage;
-}
-
-/** @internal Validate already-observed PRAGMA data without another query. */
-export function validateStartReservationAdmissionSchema(result: unknown): void {
-  if (reservationSchemaStage(result) !== 3)
-    throw new ReservationSchemaError('admission requires current schema');
-}
-
 /**
  * A reservation exists but cannot be understood, or the table could not be
  * read. 503 and never "no reservation": the absent answer is the one that
@@ -967,40 +699,8 @@ export class StartIdempotencyStore {
   async reserve(
     request: StartReservationRequest,
   ): Promise<StartReservationOutcome> {
-    const key = assertKey(request.key);
-    const owner = assertOwner(request.owner);
-    const { targetKind, targetId, threadId, mintRunId } = request;
-    if (!isStartTargetKind(targetKind)) {
-      throw new InvalidStartIdempotencyRequestError(
-        `target kind must be one of ${START_TARGET_KINDS.join(', ')}`,
-      );
-    }
-    if (!isPathSafeId(targetId)) {
-      throw new InvalidStartIdempotencyRequestError(
-        'target id must be a URL-path-safe identifier',
-      );
-    }
-    // The thread is the agent run's ADDRESS, so requiring it for agents and
-    // rejecting it for workflows is not tidiness: an agent reservation without
-    // one is a run a retry can never reach, and a workflow reservation WITH one
-    // is a second, silently divergent copy of an address that is already
-    // derivable from (workflowId, runId).
-    if (targetKind === 'agent') {
-      if (!isPathSafeId(threadId)) {
-        throw new InvalidStartIdempotencyRequestError(
-          'an agent start reservation requires a URL-path-safe threadId',
-        );
-      }
-    } else if (threadId !== undefined) {
-      throw new InvalidStartIdempotencyRequestError(
-        'threadId applies only to agent start reservations',
-      );
-    }
-    if (typeof mintRunId !== 'function') {
-      throw new InvalidStartIdempotencyRequestError(
-        'mintRunId must be a function',
-      );
-    }
+    const { key, owner, targetKind, targetId, threadId, mintRunId } =
+      captureStartRequest(request);
     try {
       await this.#ready();
     } catch (error) {
@@ -1018,8 +718,8 @@ export class StartIdempotencyStore {
         .prepare(
           `INSERT OR IGNORE INTO ${START_IDEMPOTENCY_TABLE}
              (key, owner_kind, owner_id, target_kind, target_id, run_id,
-              thread_id, state, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?)`,
+              thread_id, state, created_at, updated_at, start_token, start_table_prefix, start_workflow_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?, '', NULL, NULL)`,
         )
         .bind(
           key,
@@ -1060,43 +760,7 @@ export class StartIdempotencyStore {
     };
   }
 
-  /**
-   * Take the claim: `reserved` -> `started`, for this exact run.
-   *
-   * ONE conditional UPDATE, and the whole cross-isolate serialization of the
-   * feature. Exactly one caller changes a row; every other caller sees zero
-   * changes and must go and find out what the winner did rather than starting
-   * anything. The `run_id` predicate rides along so a claim can never land on a
-   * row that was rewritten underneath it.
-   *
-   * Never creates the table: a claim can only ever follow a reserve, which did.
-   */
-  async claim(key: string, runId: string): Promise<boolean> {
-    return this.#casState(key, runId, 'reserved', 'started');
-  }
-
-  /**
-   * Give the claim back: `started` -> `reserved`, for this exact run.
-   *
-   * The ONLY backwards transition, and it exists for exactly one caller: a
-   * start the EXECUTION FENCE refused. That refusal is special because it is
-   * provably pre-execution — the fence is read before the run lock and before
-   * any storage write — so the claim it consumed bought nothing and holding on
-   * to it would manufacture an UNRESOLVABLE reservation out of an operator
-   * action. Leaving the claim taken would mean a deployment that drained,
-   * migrated, and reopened had permanently poisoned every key that happened to
-   * be in flight.
-   *
-   * It is deliberately NOT used for other start failures. Anything that reached
-   * the runtime's execution path may have taken effect, and a rollback there
-   * would hand the next retry a fresh run — the exact double-charge this whole
-   * module exists to prevent.
-   */
-  async release(key: string, runId: string): Promise<boolean> {
-    return this.#casState(key, runId, 'started', 'reserved');
-  }
-
-  /** @internal Claim only this observed modern-unbound reservation. */
+  /** Claim only this observed modern-unbound reservation. */
   async claimReservation(
     observed: StartReservationReading,
   ): Promise<StartReservationReading | undefined> {
@@ -1144,7 +808,7 @@ export class StartIdempotencyStore {
     }
   }
 
-  /** @internal Release only the exact unbound claim, without readback recovery. */
+  /** Release only the exact unbound claim, without readback recovery. */
   async releaseReservation(
     observed: StartReservationReading,
   ): Promise<boolean> {
@@ -1195,7 +859,7 @@ export class StartIdempotencyStore {
     }
   }
 
-  /** @internal Associate an alias with an already-observed nonpending execution. */
+  /** Associate an alias with an already-observed nonpending execution. */
   async associateReservation(
     observed: StartReservationReading,
     execution: StartExecutionIdentity,
@@ -1275,7 +939,7 @@ export class StartIdempotencyStore {
     throw new RunAdmissionConflictError('reservation-changed');
   }
 
-  /** @internal Bind a prepared start; only exact lost-write readback can recover. */
+  /** Bind a prepared start; only exact lost-write readback can recover. */
   async bindPreparedStart(
     observed: StartReservationReading,
     execution: StartExecutionIdentity,
@@ -1351,7 +1015,7 @@ export class StartIdempotencyStore {
     throw new RunAdmissionConflictError('reservation-changed');
   }
 
-  /** @internal Settle every alias of this complete physical/logical execution. */
+  /** Settle every alias of this complete physical/logical execution. */
   async settleExecution(execution: StartExecutionIdentity): Promise<number> {
     const identity = normalizeStartExecutionIdentity(execution);
     const clock = this.#reservationClock(identity.runId);
@@ -1436,39 +1100,6 @@ export class StartIdempotencyStore {
         throw new ReservationSchemaError('mutation requires current schema');
     } catch (error) {
       throw new StartReservationUnreadableError(key, { cause: error });
-    }
-  }
-
-  /**
-   * Terminal reconcile, keyed by RUN rather than by key: the runtime observes a
-   * run reaching a terminal state and has no idea which key (if any) named it.
-   *
-   * Idempotent by construction (`state <> 'terminal'`), so the several places a
-   * run can reach terminal — completing, failing, being cancelled, timing out —
-   * can all call it without coordinating, and a re-entry after a crash is a
-   * no-op rather than a conflict.
-   *
-   * Returns the number of reservations settled, which is 0 for the overwhelming
-   * majority of runs (nobody used a key) and 1 for the rest.
-   */
-  async settleRun(runId: string): Promise<number> {
-    if (!isPathSafeId(runId)) return 0;
-    try {
-      return changesOf(
-        await this.#db
-          .prepare(
-            `UPDATE ${START_IDEMPOTENCY_TABLE}
-               SET state = 'terminal', updated_at = ?
-             WHERE run_id = ? AND state <> 'terminal'`,
-          )
-          .bind(this.#now(), runId)
-          .run(),
-      );
-    } catch (error) {
-      // A database with no reservation table has no reservation to settle. Any
-      // other fault is real and must not be mistaken for "nothing to do".
-      if (isMissingReservationTable(error)) return 0;
-      throw new StartReservationUnreadableError(runId, { cause: error });
     }
   }
 
@@ -1659,39 +1290,6 @@ export class StartIdempotencyStore {
     }
     return rows;
   }
-
-  async #casState(
-    key: string,
-    runId: string,
-    from: StartReservationState,
-    to: StartReservationState,
-  ): Promise<boolean> {
-    const safeKey = assertKey(key);
-    if (!isPathSafeId(runId)) {
-      throw new InvalidStartIdempotencyRequestError(
-        'reservation runId must be a URL-path-safe identifier',
-      );
-    }
-    try {
-      return (
-        changesOf(
-          await this.#db
-            .prepare(
-              `UPDATE ${START_IDEMPOTENCY_TABLE}
-                 SET state = ?, updated_at = ?
-               WHERE key = ? AND run_id = ? AND state = ?`,
-            )
-            .bind(to, this.#now(), safeKey, runId, from)
-            .run(),
-        ) > 0
-      );
-    } catch (error) {
-      // No table means no reservation, so no transition happened — which is
-      // exactly what `false` says, and the caller's replay path handles it.
-      if (isMissingReservationTable(error)) return false;
-      throw new StartReservationUnreadableError(safeKey, { cause: error });
-    }
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1706,252 +1304,228 @@ export class StartIdempotencyStore {
 // its liveness are read from, which is exactly what the injected surface says.
 // ---------------------------------------------------------------------------
 
-/** The two surface-specific reads the replay decision needs. */
-export interface IdempotentStartSurface<TPersisted> {
-  /**
-   * The reserved run's persisted state, or undefined when nothing has been
-   * persisted yet. This is the FIRST question asked on every replay, because a
-   * persisted run makes every other branch moot: the work happened, its outcome
-   * is readable, and the honest answer to the retry is that outcome.
-   */
-  persisted(reservation: StartReservation): Promise<TPersisted | undefined>;
-  /**
-   * Whether the reserved run is executing RIGHT NOW — asked only when nothing
-   * is persisted, and only to separate "still working" from "died holding the
-   * claim". Never a timer (see the module header).
-   *
-   * KNOWN WINDOW — the claim-to-dispatch gap. The winning CAS lands on the
-   * Worker, and the object that would report the run live only learns about it
-   * one dispatch later. A concurrent retry probing inside that gap is told
-   * UNRESOLVABLE for a run that is about to execute perfectly well.
-   *
-   * That is a FALSE ALARM, never a lost or duplicated run: the claim still
-   * stands, the winner still executes, and the caller's next retry replays the
-   * persisted summary. Closing it would take moving the claim into the target
-   * object itself, so that `started` becomes observable only from inside the
-   * body that is already executing. It is deliberately NOT closed with a grace
-   * period: a bound short enough to cover a dispatch is indistinguishable from
-   * the timer this design rejected, and once a timer exists somebody will grow
-   * it to cover a slow run and re-open the double-charge it was rejected for.
-   */
-  live(reservation: StartReservation): Promise<boolean>;
-}
-
-/** What a surface must do next, once the reservation has been resolved. */
-export type IdempotentStartDecision<TPersisted> =
+export type PersistedStartResult<T> =
+  | { readonly kind: 'initial'; readonly execution: StartExecutionIdentity }
   | {
-      /** Nobody has started this key's run: proceed, using THIS runId. */
-      kind: 'start';
-      reservation: StartReservation;
-    }
-  | {
-      /** The run already exists: answer with its persisted state, unchanged. */
-      kind: 'replay';
-      reservation: StartReservation;
-      persisted: TPersisted;
+      readonly kind: 'result';
+      readonly value: T;
+      readonly execution: StartExecutionIdentity;
     };
 
-/**
- * Resolve an idempotency key into "start this run" or "replay that one".
- *
- * The order of the checks below IS the semantics:
- *
- *  1. Reserve. A brand-new key that also wins the claim is the only path that
- *     starts anything.
- *  2. Persisted state, BEFORE the reservation's own state. A run that persisted
- *     is answerable whatever the reservation says, and reading the row's state
- *     first would let a stale `started` refuse a retry whose run is sitting
- *     right there, finished.
- *  3. `reserved` with nothing persisted means the first caller died between the
- *     insert and the claim, having executed nothing — so this caller may take
- *     the claim and proceed with the SAME runId. That convergence is what makes
- *     a crashed reservation self-healing instead of a wedged key.
- *  4. `started` with nothing persisted is the only ambiguous state in the
- *     system, and the liveness probe is what resolves it.
- *  5. `terminal` with nothing persisted is a completed run whose summary aged
- *     out. Spent, never re-run.
- *
- * Throws the applicable structured taxonomy errors; a surface renders them
- * through `doErrorResponse` (or its router's equivalent) with no re-mapping.
- * Across the public keyed-start surface the eight codes are the five decision
- * refusals — IDEMPOTENT_START_OWNER_MISMATCH (403),
- * IDEMPOTENT_START_TARGET_MISMATCH (409), IDEMPOTENT_START_PENDING
- * (503), IDEMPOTENT_START_UNRESOLVABLE (409), and
- * IDEMPOTENT_START_ALREADY_SETTLED (409) — plus IDEMPOTENT_START_UNSUPPORTED
- * (503), INVALID_START_IDEMPOTENCY_REQUEST (400), and
- * IDEMPOTENT_START_UNREADABLE (503).
- */
-export async function beginIdempotentStart<TPersisted>(
+export interface IdempotentStartSurface<T> {
+  persisted(
+    reservation: StartReservationReading,
+  ): Promise<PersistedStartResult<T> | undefined>;
+  live(reservation: StartReservationReading): Promise<boolean>;
+}
+
+export type IdempotentStartDecision<T> =
+  | { kind: 'start'; reservation: StartReservationReading }
+  | { kind: 'replay'; reservation: StartReservationReading; persisted: T };
+
+export async function beginIdempotentStart<T>(
   store: StartIdempotencyStore,
   request: StartReservationRequest,
-  surface: IdempotentStartSurface<TPersisted>,
+  surface: IdempotentStartSurface<T>,
   fence?: ExecutionFenceWiring,
-): Promise<IdempotentStartDecision<TPersisted>> {
-  const { reservation, created } = await store.reserve(request);
-  if (created && (await store.claim(reservation.key, reservation.runId))) {
-    return { kind: 'start', reservation };
+  mutationEpoch?: number,
+): Promise<IdempotentStartDecision<T>> {
+  const capturedRequest = captureStartRequest(request);
+  const epoch = normalizeMutationEpoch(mutationEpoch);
+  const { persisted, live } = surface;
+  const capturedSurface: IdempotentStartSurface<T> = {
+    persisted: (row) => Reflect.apply(persisted, surface, [row]),
+    live: (row) => Reflect.apply(live, surface, [row]),
+  };
+  let proof: ProofEntryExpectation | undefined;
+  if (fence !== undefined && fence !== 'none') {
+    try {
+      const reading = await fence.read();
+      if (
+        reading.state === 'proof-only' &&
+        reading.proofKey === capturedRequest.key
+      )
+        proof = Object.freeze({
+          key: capturedRequest.key,
+          mutationEpoch: reading.mutationEpoch,
+          transitionRevision: reading.transitionRevision,
+        });
+    } catch {
+      /* A failed observation cannot authorize nomination. */
+    }
   }
-  const decision = await resolveExistingReservation(
-    store,
-    reservation,
-    surface,
-  );
-  if (decision.kind === 'replay') {
-    await rebindProofRun(fence, decision.reservation);
+  const { reservation, created } = await store.reserve(capturedRequest);
+  let decision: IdempotentStartDecision<T>;
+  // A creator can read back another caller's released reservation.
+  if (
+    created &&
+    reservation.binding.kind === 'unbound' &&
+    reservation.state === 'reserved' &&
+    reservation.updatedAt === reservation.createdAt
+  ) {
+    const claimed = await store.claimReservation(reservation);
+    if (claimed !== undefined) return { kind: 'start', reservation: claimed };
+    decision = await resolveLostClaim(store, reservation, capturedSurface);
+  } else
+    decision = await resolveExistingReservation(
+      store,
+      reservation,
+      capturedSurface,
+      true,
+    );
+  if (
+    decision.kind === 'replay' &&
+    proof !== undefined &&
+    fence !== undefined &&
+    fence !== 'none'
+  ) {
+    const row = decision.reservation;
+    if (
+      row.binding.kind === 'bound' &&
+      row.binding.execution.tablePrefix !== null
+    ) {
+      try {
+        if (row.targetKind === 'agent' && row.threadId === undefined)
+          throw new InvalidExecutionIdentityError('admission');
+        await fence.rebindProofRun({
+          reservation: row,
+          execution: {
+            ...row.binding.execution,
+            tablePrefix: row.binding.execution.tablePrefix,
+            owner: row.owner,
+            target:
+              row.targetKind === 'agent'
+                ? {
+                    kind: 'agent',
+                    id: row.targetId,
+                    threadId: row.threadId as string,
+                  }
+                : { kind: 'workflow', id: row.targetId },
+          },
+          proof,
+          mutationEpoch: epoch,
+          reservationStore: store,
+        });
+      } catch (error) {
+        console.error(
+          JSON.stringify({
+            type: 'start-reservation-proof-rebind-failed',
+            key: row.key,
+            runId: row.runId,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      }
+    }
   }
   return decision;
 }
 
-/**
- * Re-assert a proof-only fence's binding to the run this key already made.
- *
- * The binding is written by `RunnerRuntime.start`, which a REPLAY never
- * reaches — so without this, a proof run whose fence lost its `proof_run_id`
- * (the fence was moved away and back onto the same key while its run survived)
- * would be a run the deployment can read but can no longer RESUME: proof-only
- * admits existing work only for `proof_run_id`, and there would be none.
- *
- * Every guard lives in `recordProofRun`'s own CAS, which is why this can be
- * unconditional and best-effort: it changes nothing unless the fence is in
- * proof-only under EXACTLY this key with the slot empty or already holding this
- * run. A different key, a different state, a different proof run — all are zero
- * rows and no harm. A failure is swallowed rather than raised, because the
- * caller is being handed the persisted state of a run that already happened,
- * and refusing that read would answer a successful retry with an error while
- * changing nothing about the run.
- */
-async function rebindProofRun(
-  fence: ExecutionFenceWiring | undefined,
-  reservation: StartReservation,
-): Promise<void> {
-  if (fence === undefined || fence === 'none') return;
+function decodePersistedStart<T>(
+  value: PersistedStartResult<T>,
+  row: StartReservationReading,
+): PersistedStartResult<T> {
   try {
-    // The reservation KEY is passed as the fence's PROOF KEY: proof-only
-    // nominates one idempotency key, and `admitsRunStart` admits the start
-    // carrying it — so the two identifiers are the same string by construction,
-    // and a rebind for any other key is the zero-row no-op described above.
-    await fence.recordProofRun(reservation.key, reservation.runId);
-  } catch (error) {
-    console.error(
-      JSON.stringify({
-        type: 'start-reservation-proof-rebind-failed',
-        key: reservation.key,
-        runId: reservation.runId,
-        error: error instanceof Error ? error.message : String(error),
-      }),
-    );
+    if (
+      value === null ||
+      typeof value !== 'object' ||
+      Array.isArray(value) ||
+      !Object.hasOwn(value, 'kind') ||
+      !Object.hasOwn(value, 'execution')
+    )
+      throw new Error('persisted start result is malformed');
+    const { kind, execution: raw } = value;
+    if (
+      (kind !== 'initial' && kind !== 'result') ||
+      (kind === 'initial'
+        ? Object.hasOwn(value, 'value')
+        : !Object.hasOwn(value, 'value'))
+    )
+      throw new Error('persisted start result is malformed');
+    const { tablePrefix, workflowId, runId, startToken, owner, target } = raw;
+    const execution = normalizeStartExecutionIdentity({
+      tablePrefix,
+      workflowId,
+      runId,
+      startToken,
+      owner,
+      target,
+    });
+    if (execution.tablePrefix !== tablePrefix)
+      throw new Error('persisted start prefix is not canonical');
+    assertReservationStartIdentity(row, execution);
+    return kind === 'initial'
+      ? { kind, execution }
+      : { kind, execution, value: value.value };
+  } catch (cause) {
+    throw new StartReservationUnreadableError(row.key, { cause });
   }
 }
 
-async function resolveExistingReservation<TPersisted>(
+async function resolveExistingReservation<T>(
   store: StartIdempotencyStore,
-  observed: StartReservation,
-  surface: IdempotentStartSurface<TPersisted>,
-): Promise<IdempotentStartDecision<TPersisted>> {
-  const persisted = await surface.persisted(observed);
-  if (persisted !== undefined) {
-    return { kind: 'replay', reservation: observed, persisted };
+  observed: StartReservationReading,
+  surface: IdempotentStartSurface<T>,
+  mayClaim: boolean,
+): Promise<IdempotentStartDecision<T>> {
+  if (observed.binding.kind === 'legacy') {
+    if (observed.state === 'terminal')
+      throw new IdempotentStartAlreadySettledError(observed);
+    throw new IdempotentStartUnresolvableError(observed);
   }
-  if (observed.state === 'reserved') {
-    if (await store.claim(observed.key, observed.runId)) {
-      return { kind: 'start', reservation: observed };
+  const value = await surface.persisted(observed);
+  if (value !== undefined) {
+    const persisted = decodePersistedStart(value, observed);
+    if (
+      observed.binding.kind === 'bound' &&
+      !sameReservationExecution(observed, persisted.execution)
+    ) {
+      if (observed.state === 'terminal')
+        throw new IdempotentStartAlreadySettledError(observed);
+      throw new IdempotentStartUnresolvableError(observed);
     }
-    // The claim was taken between the read and here. Re-read rather than
-    // assuming: the winner may already have persisted, in which case the right
-    // answer is its outcome and not a refusal.
-    const current = await store.read(observed.key);
-    if (current === undefined || current.runId !== observed.runId) {
-      // The reservation vanished or was replaced under us. Refusing is the only
-      // safe answer — a caller that retries gets a clean reserve, while
-      // silently starting here would start a run under an id nothing reserved.
-      throw new StartReservationUnreadableError(observed.key);
-    }
-    return resolveClaimedReservation(current, surface);
-  }
-  return resolveClaimedReservation(observed, surface);
-}
-
-async function resolveClaimedReservation<TPersisted>(
-  reservation: StartReservation,
-  surface: IdempotentStartSurface<TPersisted>,
-): Promise<IdempotentStartDecision<TPersisted>> {
-  if (reservation.state === 'terminal') {
-    throw new IdempotentStartAlreadySettledError(reservation);
-  }
-  if (await surface.live(reservation)) {
-    throw new IdempotentStartPendingError(reservation);
-  }
-  throw new IdempotentStartUnresolvableError(reservation);
-}
-
-/**
- * Give back a claim that the EXECUTION FENCE refused, then re-throw.
- *
- * Homed here, beside the state machine, rather than written out at each start
- * site: the rollback is only correct for this one error family, and a copy that
- * widened its catch — to "any start failure", say — would hand the next retry a
- * fresh run after a start that may well have executed. Keeping the predicate
- * and the CAS in one function is what stops that widening from being a one-line
- * edit somebody makes in a hurry.
- *
- * THE CLASS INVARIANT THIS RELIES ON. Giving a claim back is only sound for a
- * failure that provably executed NOTHING, and that is a property of the two
- * fence refusal codes rather than of the JavaScript class carrying them:
- *
- *   EXECUTION_FENCED           is authored at a gate — the run object's start
- *                              route, before any of its own reads or writes,
- *                              and `RunnerRuntime.#assertStartFence`, before
- *                              the run lock and before core mints anything.
- *   EXECUTION_FENCE_UNREADABLE is authored by the fence READ that fronts those
- *                              same gates, which is even earlier.
- *
- * Neither code is reachable from anywhere past the point of execution, so a
- * refusal carrying one is pre-execution wherever it was observed.
- *
- * Which is why the predicate is `isExecutionFenceRefusal` — the widened one,
- * which admits the wire rebuild — and NOT `instanceof ExecutionFencedError`.
- * Both of this function's callers sit on the far side of a Durable Object
- * boundary in every DO-backed host: the run object throws, `doErrorResponse`
- * renders, and `doSummary` (or the agent topology's `errorFrom`) rebuilds a
- * `RunRouteError` carrying the same status and the same structured reason but
- * not the same class. An instanceof-only test would answer "not a fence
- * refusal" for exactly the deployments this rollback exists to protect, and a
- * drained-then-reopened deployment would find every key that was in flight
- * permanently stuck at UNRESOLVABLE. In-process hosts (a `{ storage }` runtime
- * wired straight into the router) do throw the class, so both shapes are live
- * and one predicate has to cover them.
- *
- * The rollback itself is best-effort: it runs while the deployment is already
- * refusing to execute, so its own failure must not replace the fence's refusal
- * with a storage error the caller cannot act on. A rollback that does not land
- * leaves an UNRESOLVABLE reservation — recoverable by investigation — while a
- * swallowed fence refusal would leave the caller believing the deployment is
- * broken rather than fenced.
- */
-export async function rollbackFencedStart(
-  store: StartIdempotencyStore,
-  key: string,
-  runId: string,
-  error: unknown,
-): Promise<never> {
-  if (isExecutionFenceRefusal(error)) {
-    try {
-      await store.release(key, runId);
-    } catch (rollbackError) {
-      console.error(
-        JSON.stringify({
-          type: 'start-reservation-rollback-failed',
-          key,
-          runId,
-          error:
-            rollbackError instanceof Error
-              ? rollbackError.message
-              : String(rollbackError),
-        }),
+    if (persisted.kind === 'result') {
+      if (observed.binding.kind === 'bound')
+        return {
+          kind: 'replay',
+          reservation: observed,
+          persisted: persisted.value,
+        };
+      if (observed.state === 'terminal')
+        throw new IdempotentStartAlreadySettledError(observed);
+      const reservation = await store.associateReservation(
+        observed,
+        persisted.execution,
       );
+      return { kind: 'replay', reservation, persisted: persisted.value };
     }
+  } else if (
+    mayClaim &&
+    observed.state === 'reserved' &&
+    observed.binding.kind === 'unbound'
+  ) {
+    if (await surface.live(observed))
+      throw new IdempotentStartPendingError(observed);
+    const claimed = await store.claimReservation(observed);
+    if (claimed !== undefined) return { kind: 'start', reservation: claimed };
+    return resolveLostClaim(store, observed, surface);
   }
-  throw error;
+  if (observed.state === 'terminal')
+    throw new IdempotentStartAlreadySettledError(observed);
+  if (await surface.live(observed))
+    throw new IdempotentStartPendingError(observed);
+  throw new IdempotentStartUnresolvableError(observed);
+}
+
+async function resolveLostClaim<T>(
+  store: StartIdempotencyStore,
+  observed: StartReservationReading,
+  surface: IdempotentStartSurface<T>,
+): Promise<IdempotentStartDecision<T>> {
+  const current = await store.readForAdmission(observed.key);
+  if (current === undefined || !sameReservationIdentity(current, observed))
+    throw new StartReservationUnreadableError(observed.key);
+  return resolveExistingReservation(store, current, surface, false);
 }
 
 /**

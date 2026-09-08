@@ -171,7 +171,7 @@ Administrative metadata does not establish final-write run or schedule protectio
 
 Additive proof-identity columns preserve an active fence's epoch, revision, receipt, state, and timestamps. A complete stored proof identity includes its D1 prefix, workflow, run, and token. Admin reads and conflicts expose neither this identity nor its token; a newly applied admin command clears it with the proof-run binding, while an exact retry preserves it.
 
-These schema/read fields do not enable generation-aware execution checks. The [identity-data helpers](do-runner-design.md#validate-execution-identity-data) validate representations without changing caller authority.
+Runtime, approval and signal proof gates compare the complete stored generation. The [identity-data helpers](do-runner-design.md#validate-execution-identity-data) validate representations without changing caller authority; an admin reading or validated identity alone cannot authorize execution or establish owning quiescence.
 
 `GET /admin/inventory` returns the category index. Add `?category=<category>&cursor=<cursor>&limit=<limit>` to page one category. Prove a drain only from `draining`: sweep every work category to empty twice, at least 60 seconds apart. Standing categories remain present by design, and persisted idle signals deliberately carry across the migration.
 
@@ -183,7 +183,11 @@ Set `mutationEpoch` on `createFlowsafeWorker()` to a nonnegative safe-integer nu
 
 The topologies stamp `x-flowsafe-mutation-epoch` for internal calls, replacing or removing incoming values. `createActorResolver()` refuses that header on public requests. Both Durable Object shells capture it before deployment verification and decode the captured value only afterward.
 
-This configuration establishes transport, not final-write enforcement. Runtime still emits v1 provenance and uses the existing fence-state predicate, even if the stored epoch requirement is active. Keep activation disabled until the coordinated run writer, recovery and schedule mutation integration is complete.
+Fenced Runtime starts enforce the captured caller epoch at the initial D1 write and bind their generated execution identity with the winning claim and proof. Both hosts journal preparation and recover only exact owned generations. Final schedule-write protection and generation-aware retention still require implementation and acceptance before enabling artifact epochs across the deployment. An explicitly unfenced Runtime retains ordinary persistence and supplies no atomic fence guarantee.
+
+Custom run-router idempotency wiring must supply the topology's private `persistedStart(workflowId, runId)` callback alongside its store, fence and liveness probe. It carries one observed identity/result internally; ordinary public status is not a substitute. Use `claimReservation`, `releaseReservation`, `associateReservation`, `bindPreparedStart` and `settleExecution` with their exact observations. The old run-only methods and HTTP rollback helper are removed.
+
+The liveness callback must observe the owning execution surface and reject when that observation is unavailable. Returning `false` permits reclaiming an existing reserved key with no persisted result. The built-in topologies require a valid boolean response, and the agent host includes Core's retained stream registrations.
 
 ### Advanced routes
 

@@ -272,3 +272,34 @@ describe('errorText', () => {
     ).toThrow(fault);
   });
 });
+
+describe('FS8 D3 Runtime activation', () => {
+  it('shares the eight terminal statuses while retaining extended waiting states', async () => {
+    const { isTerminalRunStatus } = await import('./run-terminal-state.js');
+    for (const status of [
+      'success',
+      'failed',
+      'tripwire',
+      'canceled',
+      'bailed',
+      'skipped',
+      'cancelled',
+      'timed_out',
+    ])
+      expect(isTerminalRunStatus(status)).toBe(true);
+    for (const status of [
+      'running',
+      'suspended',
+      'waiting',
+      'pending',
+      'paused',
+      'waiting_callback',
+      'waiting_signal',
+      'retry_wait',
+      undefined,
+      null,
+      'unknown',
+    ])
+      expect(isTerminalRunStatus(status)).toBe(false);
+  });
+});

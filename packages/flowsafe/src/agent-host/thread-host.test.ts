@@ -2,7 +2,7 @@
 
 import type { MastraCompositeStore } from '@mastra/core/storage';
 import type { GuardedAgentHandle } from '@proofoftech/breakwater/agent';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { z } from 'zod';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import type { FlowsafeDurableAgent } from '../agent-runner/durable-agent-runner.js';
@@ -10,9 +10,11 @@ import {
   type ApprovalAuditEvent,
   type ApprovalRecord,
   type ApprovalService,
+  D1ResourceOwnershipStore,
   type ExecutionPrincipal,
   InMemoryResourceOwnershipStore,
   type RecoverableResourceOwnershipStore,
+  type ResourceOwnershipDatabase,
 } from '../approval-api/index.js';
 import {
   FENCED_WORKFLOW_STORAGE,
@@ -57,18 +59,27 @@ const mocked = vi.hoisted(() => ({
   resumeViaRuntime: vi.fn(),
   observe: vi.fn(),
   getHistory: vi.fn(),
+  isRunLive: vi.fn(),
+  actualFactory: false,
+  actualAgent: undefined as unknown,
 }));
 const RESOURCE_ID = resourceIdFromKey('acme_thread');
 const GUARDED_AGENT_HOST_PROTOCOL = Symbol.for(
   '@proofoftech/breakwater/guarded-agent-host/v1',
 );
 
-vi.mock('@proofoftech/breakwater/agent', () => ({
-  isGuardedAgentHandle: (value: unknown) =>
-    typeof value === 'object' &&
-    value !== null &&
-    (value as { guarded?: unknown }).guarded === true,
-}));
+vi.mock('@proofoftech/breakwater/agent', async (importOriginal) => {
+  const original =
+    await importOriginal<typeof import('@proofoftech/breakwater/agent')>();
+  return {
+    ...original,
+    isGuardedAgentHandle: (value: unknown) =>
+      typeof value === 'object' &&
+      value !== null &&
+      ((value as { guarded?: unknown }).guarded === true ||
+        original.isGuardedAgentHandle(value)),
+  };
+});
 
 vi.mock('@mastra/core/mastra', () => {
   class Mastra {
@@ -99,12 +110,56 @@ vi.mock('../agent-runner/index.js', async (importOriginal) => {
     await importOriginal<typeof import('../agent-runner/index.js')>();
   return {
     ...original,
-    createFlowsafeDurableAgent: () => {
+    createFlowsafeDurableAgent: (
+      configuration: Parameters<typeof original.createFlowsafeDurableAgent>[0],
+    ) => {
+      if (mocked.actualFactory)
+        return original.createFlowsafeDurableAgent(configuration);
       const runIds = new Set<string>();
       return {
+        getWorkflow: () => ({ id: 'durable-agentic-loop' }),
+        isRunLive: (runId: string) =>
+          mocked.isRunLive(configuration.agent.id, runId),
+        authoritativeAgentStartState: async (
+          expected: RunnerRuntime,
+          threadId: string,
+          runId: string,
+        ) => {
+          if (expected !== configuration.runtime)
+            throw new Error('runtime mismatch');
+          const state = await expected.authoritativeStartState(
+            'durable-agentic-loop',
+            runId,
+          );
+          if (!state) return null;
+          const identity = state.provenance.startIdentity;
+          if (
+            identity?.target.kind !== 'agent' ||
+            identity.target.id !== configuration.agent.id ||
+            identity.target.threadId !== threadId
+          )
+            throw Object.assign(new Error('agent selectors mismatch'), {
+              status: 404,
+            });
+          return {
+            ...state,
+            execution: { ...state.execution, ...identity },
+            threaded: state.provenance.agentStart?.threaded,
+          };
+        },
         streamUntilPersisted: async (...args: unknown[]) => {
           const options = args[1] as { runId?: string } | undefined;
           if (options?.runId) runIds.add(options.runId);
+          const authority = args[7] as
+            | import('../agent-runner/durable-agent-runner.js').AgentStartAuthority
+            | undefined;
+          if (configuration.runtime.constructor.name !== 'RunnerRuntime')
+            await authority?.onPreparedStartIdentity?.({
+              tablePrefix: null,
+              workflowId: 'durable-agentic-loop',
+              runId: options?.runId ?? '',
+              startToken: 'test-generation',
+            });
           return mocked.stream(...args);
         },
         resumeViaRuntime: async (...args: unknown[]) => {
@@ -158,6 +213,8 @@ function guarded(
   id = 'writer',
   automationKinds: readonly string[] = [],
 ): GuardedAgentHandle {
+  if (mocked.actualAgent && id === 'writer')
+    return mocked.actualAgent as GuardedAgentHandle;
   return {
     guarded: true,
     [GUARDED_AGENT_HOST_PROTOCOL]: {
@@ -265,12 +322,127 @@ function harness(
       if (!statusVisible && !started) return null;
       return summary ? { ...summary, runId } : null;
     }),
-    recoverStartAttempt: vi.fn(async (_workflowId: string, runId: string) => {
+    isRunActive: vi.fn(() => false),
+    workflowIds: vi.fn(() => []),
+    settleStartExecution: vi.fn(async () => {}),
+    authoritativeStartState: vi.fn(
+      async (_workflowId: string, runId: string) => {
+        const call = mocked.stream.mock.calls.find(
+          (call) => call[1]?.runId === runId,
+        );
+        if (options.runtime?.status) {
+          const override = await options.runtime.status(_workflowId, runId);
+          if (!override) return null;
+          summary = override;
+        }
+        const resumed = mocked.resumeViaRuntime.mock.settledResults.at(-1);
+        if (resumed?.type === 'fulfilled' && resumed.value?.runId === runId)
+          summary = resumed.value;
+        const terminated = vi.isMockFunction(
+          options.runtime?.terminateAsPrincipal,
+        )
+          ? options.runtime.terminateAsPrincipal.mock.settledResults.at(-1)
+          : undefined;
+        if (terminated?.type === 'fulfilled')
+          summary = terminated.value.summary;
+        if (!statusVisible && !call && !terminated) return null;
+        if (!summary) return null;
+        const authority = call?.[7] as
+          | import('../agent-runner/durable-agent-runner.js').AgentStartAuthority
+          | undefined;
+        const identity = authority?.startIdentity ?? {
+          owner: {
+            kind: options.principal?.kind ?? 'human',
+            id: options.principal?.id ?? 'operator-1',
+          },
+          target: { kind: 'agent', id: 'writer', threadId: 'acme_thread' },
+        };
+        const current = snapshot as {
+          requestContext: Record<string, unknown>;
+          context: {
+            input: {
+              agentId: string;
+              messageListState: { memoryInfo: unknown };
+            };
+          };
+        };
+        if (
+          (!call && current.context.input.agentId !== identity.target.id) ||
+          current.requestContext.threadId !== 'acme_thread' ||
+          current.requestContext.resourceId !== RESOURCE_ID
+        )
+          throw Object.assign(new Error('agent selectors mismatch'), {
+            status: 404,
+          });
+        const threaded =
+          authority?.agentStart.threaded ??
+          current.context.input.messageListState.memoryInfo !== null;
+        const provenance = {
+          version: 2,
+          startToken: 'test-generation',
+          attemptToken: call?.[4] ?? `token-${runId}`,
+          resumeCounts: [],
+          startIdentity: identity,
+          agentStart: { threaded },
+        };
+        const lifecycle =
+          terminated?.type === 'fulfilled'
+            ? {
+                version: 1,
+                revision: terminated.value.cleanup.revision,
+                terminal: {
+                  status: terminated.value.cleanup.status,
+                  error: summary.errorEnvelope,
+                  transitionedAt: 1,
+                  replayPrincipals: [{ kind: 'human', id: 'operator-1' }],
+                  ...(terminated.value.cleanup.cleanupCompleted
+                    ? { cleanupCompletedAt: 2 }
+                    : {}),
+                },
+                ...(terminated.value.cleanup.scheduleDispatch
+                  ? {
+                      scheduleDispatch:
+                        terminated.value.cleanup.scheduleDispatch,
+                    }
+                  : {}),
+              }
+            : undefined;
+        return {
+          kind: summary.status === 'pending' ? 'initial' : 'result',
+          storage: 'unfenced',
+          execution: (
+            state.get(OWNER_RECOVERY_PREFIX + runId) as
+              | { execution?: unknown }
+              | undefined
+          )?.execution ?? {
+            tablePrefix: null,
+            workflowId: 'durable-agentic-loop',
+            runId,
+            startToken: 'test-generation',
+          },
+          provenance,
+          snapshot: {
+            ...current,
+            requestContext: {
+              ...current.requestContext,
+              'flowsafe.runProvenance': provenance,
+              ...(lifecycle ? { 'flowsafe.runLifecycle': lifecycle } : {}),
+            },
+          },
+          ...(summary.status === 'pending'
+            ? {}
+            : { summary: { ...summary, runId } }),
+        };
+      },
+    ),
+    recoverStartAttempt: vi.fn(async (execution: { runId: string }) => {
       const started = mocked.stream.mock.calls.some(
-        (call) => call[1]?.runId === runId,
+        (call) => call[1]?.runId === execution.runId,
       );
       if (!statusVisible && !started) return null;
-      return summary ? { ...summary, runId } : null;
+      return summary
+        ? { kind: 'ordinary', summary: { ...summary, runId: execution.runId } }
+        : null;
     }),
     ...options.runtime,
   } as unknown as RunnerRuntime;
@@ -517,10 +689,13 @@ async function seedThreadlessSchedule(
 
 beforeEach(() => {
   mocked.mastra.mockReset();
+  mocked.actualFactory = false;
+  mocked.actualAgent = undefined;
   mocked.stream.mockReset().mockResolvedValue({});
   mocked.resumeViaRuntime.mockReset();
   mocked.observe.mockReset();
   mocked.getHistory.mockReset().mockResolvedValue([]);
+  mocked.isRunLive.mockReset().mockReturnValue(false);
 });
 
 const OWNER_RECOVERY_PREFIX = 'flowsafe:agent-owner-recovery:v1:';
@@ -534,7 +709,20 @@ function ownerRecovery(
   overrides: Record<string, unknown> = {},
 ): Record<string, unknown> {
   return {
-    version: 1,
+    version: 2,
+    phase: 'prepared',
+    execution: {
+      tablePrefix: '',
+      workflowId: 'durable-agentic-loop',
+      runId,
+      startToken: 'test-generation',
+    },
+    runRecord: {
+      version: 2,
+      agentId: 'writer',
+      principal: { kind: 'human', id: 'operator-1', role: 'operator' },
+      originEntryPath: 'http.start',
+    },
     agentId: 'writer',
     threadId: 'acme_thread',
     resourceId: RESOURCE_ID,
@@ -669,7 +857,7 @@ describe('C direct thread host capture', () => {
     'normal',
     'failure',
     'recovery',
-  ] as const)('C thread host preserves v1 owner recovery without automatic activation: %s', async (phase) => {
+  ] as const)('FS8 D3 host activation agent preparation and ownership: %s', async (phase) => {
     const core = await vi.importActual<typeof import('@mastra/core/mastra')>(
       '@mastra/core/mastra',
     );
@@ -680,7 +868,8 @@ describe('C direct thread host capture', () => {
     const sql = openSqlite() as ReturnType<typeof openSqlite> & {
       close(): void;
     };
-    const binding = sqliteUnitDatabase(sql) as ExecutionFenceDatabase;
+    const binding = sqliteUnitDatabase(sql) as ExecutionFenceDatabase &
+      ResourceOwnershipDatabase;
     const storage = createD1Storage({ binding });
     await storage.init();
     const fence = new ExecutionFenceStore(binding);
@@ -759,7 +948,13 @@ describe('C direct thread host capture', () => {
       value: capability,
       configurable: true,
     });
-    const fixture = harness(['writer'], { init: app, storage });
+    const fixture = harness(['writer'], {
+      init: app,
+      storage,
+      resourceAccess: new D1ResourceOwnershipStore(
+        binding as ResourceOwnershipDatabase,
+      ),
+    });
     Object.assign(fixture.scope, { mutationEpoch: 2 });
     expect(fixture.scope.init.runtime).toBe(app.runtime);
     const writes: Array<[string, unknown]> = [];
@@ -833,38 +1028,39 @@ describe('C direct thread host capture', () => {
       expect(mocked.stream).toHaveBeenCalledOnce();
       const args = mocked.stream.mock.calls[0];
       expect(args).toHaveLength(8);
-      expect(args?.[7]).toHaveProperty('onPreparedStartIdentity', undefined);
+      expect(args?.[7]).toHaveProperty(
+        'onPreparedStartIdentity',
+        expect.any(Function),
+      );
       expect(Object.hasOwn(args?.[7], 'onPreparedStartIdentity')).toBe(true);
       const journals = writes.filter(([key]) =>
         key.startsWith('flowsafe:agent-owner-recovery'),
       );
-      expect(journals).toEqual([
-        [
-          TEST_OWNER_RECOVERY_KEY,
-          {
-            version: 1,
-            agentId: 'writer',
-            threadId: 'acme_thread',
-            resourceId: RESOURCE_ID,
-            runId: 'acme_run',
-            owner: HUMAN_OWNER,
-            token: args?.[4],
-            threaded: false,
-            bindingPreexisting: false,
-          },
-        ],
-      ]);
+      expect(journals).toHaveLength(phase === 'failure' ? 1 : 2);
+      expect(journals[0]?.[1]).toMatchObject({
+        version: 2,
+        phase: 'preparing',
+        token: args?.[4],
+        runRecord: { version: 2, principal: fixture.scope.principal },
+      });
+      if (phase !== 'failure')
+        expect(journals[1]?.[1]).toMatchObject({
+          phase: 'prepared',
+          execution: { startToken: expect.any(String) },
+        });
       const snapshot = await workflows.loadWorkflowSnapshot({
         workflowName: 'durable-agentic-loop',
         runId: 'acme_run',
       });
       if (phase === 'failure') expect(snapshot).toBeNull();
       else {
-        expect(snapshot?.requestContext?.['flowsafe.runProvenance']).toEqual({
-          version: 1,
+        expect(
+          snapshot?.requestContext?.['flowsafe.runProvenance'],
+        ).toMatchObject({
+          version: 2,
           requestedBy: 'operator-1',
           requestedByKind: 'human',
-          startToken: args?.[4],
+          startToken: expect.any(String),
           attemptToken: args?.[4],
           resumeCounts: [],
         });
@@ -887,8 +1083,8 @@ describe('C direct thread host capture', () => {
         ]);
       }
       if (phase === 'recovery')
-        expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(true);
-      await fixture.host.recoverOwnership(app.runtime, fixture.scope.threadId);
+        expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+      await fixture.host.recoverOwnership(fixture.scope);
       expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
       expect(
         writes.filter(([key]) =>
@@ -898,7 +1094,10 @@ describe('C direct thread host capture', () => {
     } finally {
       mocked.mastra.mockReset();
       sql.close();
-      expect(counts).toEqual({ admission: 0, terminalization: 0 });
+      expect(counts).toEqual({
+        admission: phase === 'failure' ? 0 : 1,
+        terminalization: 0,
+      });
     }
   });
 
@@ -1073,7 +1272,7 @@ describe('C direct thread host capture', () => {
         target: { kind: 'agent', id: 'writer', threadId: 'acme_thread' },
       },
       agentStart: { threaded },
-      onPreparedStartIdentity: undefined,
+      onPreparedStartIdentity: expect.any(Function),
       runOwnerGuard: { owner: HUMAN_OWNER, reservationToken: args?.[4] },
     });
     expect(Object.hasOwn(authority, 'onPreparedStartIdentity')).toBe(true);
@@ -1086,24 +1285,32 @@ describe('C direct thread host capture', () => {
       HUMAN_OWNER,
       args?.[4],
     ]);
-    expect(
-      writes.filter(([key]) => key.startsWith(OWNER_RECOVERY_PREFIX)),
-    ).toEqual([
-      [
-        TEST_OWNER_RECOVERY_KEY,
-        {
-          version: 1,
-          agentId: 'writer',
-          threadId: 'acme_thread',
-          resourceId: RESOURCE_ID,
-          runId: 'acme_run',
-          owner: HUMAN_OWNER,
-          token: args?.[4],
-          threaded,
-          bindingPreexisting: scheduled && threaded,
-        },
-      ],
-    ]);
+    const journals = writes.filter(([key]) =>
+      key.startsWith(OWNER_RECOVERY_PREFIX),
+    );
+    expect(journals).toHaveLength(2);
+    expect(journals[0]?.[1]).toMatchObject({
+      version: 2,
+      phase: 'preparing',
+      agentId: 'writer',
+      threadId: 'acme_thread',
+      resourceId: RESOURCE_ID,
+      runId: 'acme_run',
+      owner: HUMAN_OWNER,
+      token: args?.[4],
+      threaded,
+      bindingPreexisting: scheduled && threaded,
+      runRecord: {
+        version: 2,
+        agentId: 'writer',
+        principal,
+        originEntryPath: entryPath,
+      },
+    });
+    expect(journals[1]?.[1]).toMatchObject({
+      phase: 'prepared-unfenced',
+      execution: { tablePrefix: null, startToken: 'test-generation' },
+    });
     expect(writes).toContainEqual([
       TEST_RUN_RECORD_KEY,
       { version: 2, agentId: 'writer', principal, originEntryPath: entryPath },
@@ -1246,9 +1453,9 @@ describe('createThreadAgentHost owner recovery', () => {
     const recover = vi.spyOn(scope.init.runtime, 'recoverStartAttempt');
     const settle = vi.spyOn(resourceAccess, 'settleReservation');
 
-    await expect(
-      host.recoverOwnership(scope.init.runtime, scope.threadId),
-    ).rejects.toThrow('stored agent owner recovery is malformed');
+    await expect(host.recoverOwnership(scope)).rejects.toThrow(
+      'stored agent owner recovery is malformed',
+    );
 
     expect(recover).not.toHaveBeenCalled();
     expect(settle).not.toHaveBeenCalled();
@@ -1267,7 +1474,9 @@ describe('createThreadAgentHost owner recovery', () => {
     const recover = vi.spyOn(scope.init.runtime, 'recoverStartAttempt');
     const settle = vi.spyOn(resourceAccess, 'settleReservation');
 
-    await host.recoverOwnership(scope.init.runtime, scope.threadId);
+    await expect(host.recoverOwnership(scope)).rejects.toThrow(
+      'agent owner recovery changed',
+    );
 
     expect(recover).not.toHaveBeenCalled();
     expect(settle).not.toHaveBeenCalled();
@@ -1277,7 +1486,8 @@ describe('createThreadAgentHost owner recovery', () => {
 
   it('rolls back a pre-snapshot attempt and its attempt-created metadata', async () => {
     const { host, scope, state, resources, alarmAt } = harness();
-    const recovery = ownerRecovery('acme_run');
+    const recovery = ownerRecovery('acme_run', { phase: 'preparing' });
+    delete recovery.execution;
     seedRecoveryState(state, 'acme_run', recovery);
     await resources.reserveAll(
       [
@@ -1289,7 +1499,7 @@ describe('createThreadAgentHost owner recovery', () => {
       'token-acme_run',
     );
 
-    await host.recoverOwnership(scope.init.runtime, scope.threadId);
+    await host.recoverOwnership(scope);
 
     expect(state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
     expect(state.has(TEST_RUN_RECORD_KEY)).toBe(false);
@@ -1307,7 +1517,9 @@ describe('createThreadAgentHost owner recovery', () => {
     await resources.claim('resource', RESOURCE_ID, owner);
     const recovery = ownerRecovery('acme_run', {
       bindingPreexisting: true,
+      phase: 'preparing',
     });
+    delete recovery.execution;
     seedRecoveryState(state, 'acme_run', recovery);
     await resources.reserveAll(
       [
@@ -1319,7 +1531,7 @@ describe('createThreadAgentHost owner recovery', () => {
       'token-acme_run',
     );
 
-    await host.recoverOwnership(scope.init.runtime, scope.threadId);
+    await host.recoverOwnership(scope);
 
     expect(state.has(THREAD_BINDING_KEY)).toBe(true);
     expect(state.has(TEST_RUN_RECORD_KEY)).toBe(false);
@@ -1345,7 +1557,7 @@ describe('createThreadAgentHost owner recovery', () => {
       'token-acme_run',
     );
 
-    await host.recoverOwnership(scope.init.runtime, scope.threadId);
+    await host.recoverOwnership(scope);
 
     expect(state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
     expect(state.has(TEST_RUN_RECORD_KEY)).toBe(true);
@@ -1384,9 +1596,9 @@ describe('createThreadAgentHost owner recovery', () => {
       'token-acme_run',
     );
 
-    await expect(
-      host.recoverOwnership(scope.init.runtime, scope.threadId),
-    ).rejects.toBeInstanceOf(RunStateUnreadableError);
+    await expect(host.recoverOwnership(scope)).rejects.toBeInstanceOf(
+      RunStateUnreadableError,
+    );
 
     // #then — fail closed: an unreadable read is not evidence the attempt was
     // abandoned, so nothing is deleted, nothing is settled, and the journal
@@ -1399,7 +1611,9 @@ describe('createThreadAgentHost owner recovery', () => {
   });
 
   it('keeps an unthreaded nonterminal journal armed, then releases ephemeral claims at terminal state', async () => {
-    const { host, scope, state, resources, alarmAt, setSummary } = harness();
+    const { host, scope, state, resources, alarmAt, setSummary, setSnapshot } =
+      harness();
+    setSnapshot({ memory: false });
     const owner = { kind: 'human' as const, id: 'operator-1' };
     const recovery = ownerRecovery('acme_run', { threaded: false });
     seedRecoveryState(state, 'acme_run', recovery, false);
@@ -1414,7 +1628,7 @@ describe('createThreadAgentHost owner recovery', () => {
     );
     setSummary({ runId: 'acme_run', status: 'suspended' });
 
-    await host.recoverOwnership(scope.init.runtime, scope.threadId);
+    await host.recoverOwnership(scope);
 
     expect(state.has(TEST_OWNER_RECOVERY_KEY)).toBe(true);
     expect(alarmAt()).toBeDefined();
@@ -1422,7 +1636,7 @@ describe('createThreadAgentHost owner recovery', () => {
     expect(await resources.owner('resource', RESOURCE_ID)).toEqual(owner);
 
     setSummary({ runId: 'acme_run', status: 'success' });
-    await host.recoverOwnership(scope.init.runtime, scope.threadId);
+    await host.recoverOwnership(scope);
 
     expect(state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
     expect(state.has(TEST_RUN_RECORD_KEY)).toBe(false);
@@ -1467,14 +1681,14 @@ describe('createThreadAgentHost owner recovery', () => {
           entryPath: 'http.start',
         }),
       ).resolves.toMatchObject({ runId: 'acme_run' });
-      expect(state.has(TEST_OWNER_RECOVERY_KEY)).toBe(true);
+      expect(state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
       expect(alarmAt()).toBeDefined();
       expect(await committed.owner('run', 'acme_run')).toEqual({
         kind: 'human',
         id: 'operator-1',
       });
 
-      await host.recoverOwnership(scope.init.runtime, scope.threadId);
+      await host.recoverOwnership(scope);
 
       expect(state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
       expect(alarmAt()).toBeUndefined();
@@ -1524,7 +1738,7 @@ describe('createThreadAgentHost owner recovery', () => {
       if (key.startsWith(OWNER_RECOVERY_PREFIX)) journalWritten();
     });
 
-    const recovery = host.recoverOwnership(scope.init.runtime, scope.threadId);
+    const recovery = host.recoverOwnership(scope);
     await finalStarted;
     const start = host.start(scope, {
       agentId: 'writer',
@@ -1587,6 +1801,7 @@ describe('createThreadAgentHost', () => {
       discardScheduleDispatch: (scheduleId, dispatchId, runId) =>
         schedules.discardAgentScheduleDispatch(scheduleId, dispatchId, runId),
     });
+    fixture.setSummary(summary);
     fixture.state.set(TEST_RUN_RECORD_KEY, {
       version: 2,
       agentId: 'writer',
@@ -1679,6 +1894,7 @@ describe('createThreadAgentHost', () => {
       },
       discardScheduleDispatch,
     });
+    fixture.setSummary(summary);
     fixture.state.set(TEST_RUN_RECORD_KEY, {
       version: 2,
       agentId: 'writer',
@@ -1764,17 +1980,11 @@ describe('createThreadAgentHost', () => {
         fixture.scope,
       ),
     ).rejects.toThrow('cleanup marker response lost');
-    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(true);
     await expect(
       fixture.resources.owner('run', 'acme_run'),
     ).resolves.toBeUndefined();
 
-    fixture.state.set(TEST_RUN_RECORD_KEY, {
-      version: 2,
-      agentId: 'writer',
-      principal: fixture.scope.principal,
-      originEntryPath: 'http.start',
-    });
     const replay = await fixture.host.route(
       new Request(`${terminateUrl}&replay=1`, { method: 'POST' }),
       fixture.scope,
@@ -1813,6 +2023,7 @@ describe('createThreadAgentHost', () => {
         completeTerminalCleanup,
       },
     });
+    fixture.setSummary(summary);
     seedRecoveryState(
       fixture.state,
       'acme_run',
@@ -1834,8 +2045,7 @@ describe('createThreadAgentHost', () => {
     ).rejects.toThrow('stored agent owner recovery is malformed');
 
     expect(settleReservation).not.toHaveBeenCalled();
-    expect(release).toHaveBeenCalledOnce();
-    expect(release).toHaveBeenCalledWith('run', 'acme_run', HUMAN_OWNER);
+    expect(release).not.toHaveBeenCalled();
     await expect(
       resourceAccess.owner('thread', 'acme_thread'),
     ).resolves.toEqual(HUMAN_OWNER);
@@ -2034,7 +2244,7 @@ describe('createThreadAgentHost', () => {
       principal: { kind: 'human', id: 'operator-2', role: 'operator' },
     };
     await expect(host.start(secondScope, input)).rejects.toMatchObject({
-      status: 409,
+      status: 503,
     });
     expect(state.get('flowsafe:agent-run:v1:acme_run')).toMatchObject({
       principal: { id: 'operator-1' },
@@ -2068,9 +2278,8 @@ describe('createThreadAgentHost', () => {
       results.filter((result) => result.status === 'fulfilled'),
     ).toHaveLength(1);
     const rejected = results.find((result) => result.status === 'rejected');
-    expect(rejected).toMatchObject({
-      reason: { status: 409, message: 'thread is bound to another agent' },
-    });
+    expect(mocked.stream).toHaveBeenCalledOnce();
+    expect(rejected).toMatchObject({ reason: { status: 409 } });
     const binding = structuredClone(
       state.get('flowsafe:agent-thread-binding:v1'),
     ) as { agentId: string };
@@ -2273,7 +2482,7 @@ describe('createThreadAgentHost', () => {
     expect(approvalScopes).toHaveLength(1);
   });
 
-  it('removes run metadata when start fails and authoritative state is absent', async () => {
+  it('retains prepared-unfenced metadata when failed start has no durable outcome', async () => {
     const { host, scope, state, setSummary } = harness();
     setSummary(null);
     mocked.stream.mockRejectedValue(new Error('model unavailable'));
@@ -2287,7 +2496,7 @@ describe('createThreadAgentHost', () => {
         entryPath: 'http.start',
       }),
     ).rejects.toThrow('model unavailable');
-    expect(state.has('flowsafe:agent-run:v1:acme_run')).toBe(false);
+    expect(state.has('flowsafe:agent-run:v1:acme_run')).toBe(true);
   });
 
   it('keeps run metadata and names the failure when a failed start cannot read authoritative state', async () => {
@@ -2296,7 +2505,7 @@ describe('createThreadAgentHost', () => {
     // it could not reach.
     const { host, scope, state, alarmAt } = harness(['writer'], {
       runtime: {
-        recoverStartAttempt: vi.fn(async () => {
+        authoritativeStartState: vi.fn(async () => {
           throw new RunStateUnreadableError('durable-agentic-loop', 'acme_run');
         }),
       },
@@ -2329,9 +2538,7 @@ describe('createThreadAgentHost', () => {
 
     // #then — and the failure is named rather than swallowed, because it is
     // the reason the metadata above survives and a wake is left to retry it.
-    expect(logged).toContain(
-      'interrupted start could not read authoritative state',
-    );
+    expect(logged).toContain('agent owner recovery failed');
     expect(state.has('flowsafe:agent-run:v1:acme_run')).toBe(true);
     expect(alarmAt()).toBeDefined();
   });
@@ -2368,7 +2575,7 @@ describe('createThreadAgentHost', () => {
           target: { kind: 'agent', id: 'writer', threadId: 'acme_thread' },
         },
         agentStart: { threaded: false },
-        onPreparedStartIdentity: undefined,
+        onPreparedStartIdentity: expect.any(Function),
         runOwnerGuard: {
           owner: HUMAN_OWNER,
           reservationToken: expect.any(String),
@@ -2690,7 +2897,7 @@ describe('createThreadAgentHost', () => {
           target: { kind: 'agent', id: 'writer', threadId: 'acme_thread' },
         },
         agentStart: { threaded: true },
-        onPreparedStartIdentity: undefined,
+        onPreparedStartIdentity: expect.any(Function),
         runOwnerGuard: {
           owner: { kind: 'service', id: 'webhook-dispatcher' },
           reservationToken: expect.any(String),
@@ -2935,7 +3142,7 @@ describe('createThreadAgentHost', () => {
           target: { kind: 'agent', id: 'writer', threadId: 'acme_thread' },
         },
         agentStart: { threaded: true },
-        onPreparedStartIdentity: undefined,
+        onPreparedStartIdentity: expect.any(Function),
         runOwnerGuard: {
           owner: HUMAN_OWNER,
           reservationToken: expect.any(String),
@@ -4147,5 +4354,3014 @@ describe('createThreadAgentHost automated entry', () => {
         entryPath: 'schedule.fire',
       }),
     );
+  });
+});
+
+describe('createThreadAgentHost saved owner journal presence', () => {
+  it.each(
+    ['start', 'schedule status', 'dispatch status'].flatMap((entry) =>
+      [null, false, 0, ''].map((journal) => ({ entry, journal })),
+    ),
+  )('retains a malformed journal before $entry ($journal)', async ({
+    entry,
+    journal,
+  }) => {
+    const fixture = harness();
+    if (entry !== 'start') {
+      fixture.setSummary({ runId: 'acme_run', status: 'suspended' });
+      fixture.state.set(THREAD_BINDING_KEY, {
+        version: 1,
+        agentId: 'writer',
+        resourceId: RESOURCE_ID,
+      });
+      fixture.state.set(TEST_RUN_RECORD_KEY, {
+        version: 2,
+        agentId: 'writer',
+        principal: fixture.scope.principal,
+        originEntryPath: 'http.start',
+      });
+    }
+    fixture.state.set(TEST_OWNER_RECOVERY_KEY, journal);
+    const before = structuredClone(fixture.state);
+    const reserve = vi.spyOn(fixture.resourceAccess, 'reserveAll');
+    const observation = vi.spyOn(
+      fixture.scope.init.runtime,
+      'authoritativeStartState',
+    );
+    const operation =
+      entry === 'start'
+        ? fixture.host.start(fixture.scope, C_START_INPUT)
+        : entry === 'schedule status'
+          ? fixture.host.scheduleDispatchStatus(fixture.scope, {
+              agentId: 'writer',
+              resourceId: RESOURCE_ID,
+              runId: 'acme_run',
+            })
+          : fixture.host.route(
+              new Request(
+                `https://thread/_flowsafe/agent-host/runs/writer/acme_run?resourceId=${RESOURCE_ID}&dispatch=1`,
+              ),
+              fixture.scope,
+            );
+    const outcome = await operation.catch((error: unknown) => error);
+    expect(fixture.state).toEqual(before);
+    expect(reserve).not.toHaveBeenCalled();
+    expect(mocked.stream).not.toHaveBeenCalled();
+    expect(observation).not.toHaveBeenCalled();
+    expect(outcome).toBeInstanceOf(Error);
+  });
+
+  it('starts when the owner journal is absent', async () => {
+    const fixture = harness();
+    await expect(
+      fixture.host.start(fixture.scope, C_START_INPUT),
+    ).resolves.toMatchObject({ summary: { status: 'success' } });
+    expect(mocked.stream).toHaveBeenCalledOnce();
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+  });
+});
+
+describe('FS8 D3 host shares cold wrapper initialization', () => {
+  async function coldInitializationFixture() {
+    const core = await vi.importActual<typeof import('@mastra/core/mastra')>(
+      '@mastra/core/mastra',
+    );
+    const breakwater = await vi.importActual<
+      typeof import('@proofoftech/breakwater')
+    >('@proofoftech/breakwater');
+    mocked.actualFactory = true;
+    mocked.actualAgent = breakwater.createGuardedAgent({
+      id: 'writer',
+      name: 'Writer',
+      instructions: 'Unused cold initialization agent.',
+      model: 'openai/gpt-4o-mini',
+      allowedRoles: ['operator'],
+      policies: [],
+      audit: new breakwater.AuditLogger(),
+      maxSteps: 1,
+      toolChoice: 'auto',
+    });
+    mocked.mastra.mockImplementation(
+      (configuration) => new core.Mastra(configuration),
+    );
+    const sql = openSqlite() as ReturnType<typeof openSqlite> & {
+      close(): void;
+    };
+    onTestFinished(() => sql.close());
+    const binding = sqliteUnitDatabase(sql) as ExecutionFenceDatabase &
+      ResourceOwnershipDatabase;
+    const storage = createD1Storage({ binding });
+    await storage.init();
+    const fence = new ExecutionFenceStore(binding);
+    await fence.seed('draining');
+    const { StartIdempotencyStore, beginIdempotentStart } = await import(
+      '../do-runner/start-idempotency.js'
+    );
+    const reservations = new StartIdempotencyStore(binding);
+    const provider = vi.fn(() => {
+      throw new Error('unexpected request-context provider entry');
+    });
+    const app = init(
+      { storage },
+      {
+        executionFence: fence,
+        startIdempotency: reservations,
+        requestContextForRun: provider,
+      },
+    );
+    const resources = new D1ResourceOwnershipStore(binding);
+    const fixture = harness(['writer'], {
+      init: app,
+      storage,
+      resourceAccess: resources,
+    });
+    const catalogGate = cDeferred();
+    const buildModules = vi.fn(async () => {
+      await catalogGate.promise;
+      return [
+        {
+          meta: {
+            id: 'writer',
+            title: 'Writer',
+            description: 'Writes records',
+            allowedRoles: ['operator'] as const,
+          },
+          agent: guarded(),
+        },
+      ];
+    });
+    const hostStorage = vi.fn(() => storage);
+    const createHost = () =>
+      createThreadAgentHost({
+        buildModules,
+        storage: hostStorage,
+        stateStorage: () => fixture.stateStorage,
+        resourceAccess: () => resources,
+        approvalService: () =>
+          ({
+            list: async () => [],
+            createAsPrincipal: async () => {
+              throw new Error('unexpected approval creation');
+            },
+          }) as unknown as ApprovalService,
+      });
+    const host = createHost();
+    const replay = (scope = fixture.scope) =>
+      host.route(
+        new Request(
+          `https://thread/_flowsafe/agent-host/runs/writer/acme_run?resourceId=${RESOURCE_ID}&replay=1`,
+        ),
+        scope,
+      );
+    const liveness = (agentId = 'writer', scope = fixture.scope) =>
+      host.route(
+        new Request(
+          `https://thread/_flowsafe/agent-host/runs/${agentId}/acme_run/start-liveness`,
+        ),
+        scope,
+      );
+    return {
+      ...fixture,
+      host,
+      app,
+      createHost,
+      fence,
+      resources,
+      storage,
+      reservations,
+      beginIdempotentStart,
+      provider,
+      catalogGate,
+      buildModules,
+      hostStorage,
+      replay,
+      liveness,
+      registerAgent: vi.spyOn(app.runtime, 'registerAgent'),
+      start: vi.spyOn(app.runtime, 'start'),
+    };
+  }
+
+  it('queries the addressed cached wrapper for liveness without reading storage', async () => {
+    const fixture = harness(['writer', 'reviewer']);
+    fixture.state.set(THREAD_BINDING_KEY, {
+      version: 1,
+      agentId: 'writer',
+      resourceId: RESOURCE_ID,
+    });
+    await fixture.host.resolveBoundAgent(fixture.scope, {
+      agentId: 'writer',
+      entryPath: 'http.start',
+    });
+    const get = vi.spyOn(fixture.stateStorage, 'get');
+    const list = vi.spyOn(fixture.stateStorage, 'list');
+    mocked.isRunLive.mockImplementation((agentId) => agentId === 'writer');
+    for (const agentId of ['writer', 'reviewer']) {
+      const response = await fixture.host.route(
+        new Request(
+          `https://thread/_flowsafe/agent-host/runs/${agentId}/acme_live/start-liveness`,
+        ),
+        fixture.scope,
+      );
+      expect(await response?.json()).toEqual({ live: agentId === 'writer' });
+    }
+    expect(mocked.isRunLive.mock.calls).toEqual([
+      ['writer', 'acme_live'],
+      ['reviewer', 'acme_live'],
+    ]);
+    expect(get).not.toHaveBeenCalled();
+    expect(list).not.toHaveBeenCalled();
+    expect(fixture.moduleScopes).toHaveLength(1);
+    expect(fixture.storageScopes).toHaveLength(1);
+  });
+
+  it('answers cold liveness without waiting for a held catalog or reading storage', async () => {
+    const fixture = await coldInitializationFixture();
+    const get = vi.spyOn(fixture.stateStorage, 'get');
+    const list = vi.spyOn(fixture.stateStorage, 'list');
+    const before = new Map(fixture.state);
+    const cold = await fixture.liveness();
+    expect(await cold?.json()).toEqual({ live: false });
+    expect(fixture.buildModules).not.toHaveBeenCalled();
+    const replay = fixture.replay();
+    try {
+      const response = await Promise.race([
+        fixture.liveness(),
+        new Promise<undefined>((resolve) => setTimeout(resolve, 0)),
+      ]);
+      expect(fixture.hostStorage).not.toHaveBeenCalled();
+      expect(fixture.registerAgent).not.toHaveBeenCalled();
+      expect(get).not.toHaveBeenCalled();
+      expect(list).not.toHaveBeenCalled();
+      expect(response).toBeInstanceOf(Response);
+      expect(await response?.json()).toEqual({ live: false });
+      await expect(
+        fixture.liveness('writer', {
+          ...fixture.scope,
+          init: { ...fixture.app },
+        }),
+      ).rejects.toThrow(
+        'thread agent host cannot be shared across DO instances',
+      );
+      expect(fixture.state).toEqual(before);
+    } finally {
+      fixture.catalogGate.resolve();
+      await replay;
+    }
+  });
+
+  it.each([
+    'private replay',
+    'bound-agent lookup',
+  ])('shares a held catalog between a private replay and %s', async (consumer) => {
+    const fixture = await coldInitializationFixture();
+    if (consumer === 'bound-agent lookup')
+      fixture.state.set(THREAD_BINDING_KEY, {
+        version: 1,
+        agentId: 'writer',
+        resourceId: RESOURCE_ID,
+      });
+    const before = new Map(fixture.state);
+    const replay = fixture.replay();
+    const concurrent =
+      consumer === 'private replay'
+        ? fixture.replay()
+        : fixture.host.resolveBoundAgent(fixture.scope, {
+            agentId: 'writer',
+            entryPath: 'http.start',
+          });
+    const outcomes = Promise.allSettled([replay, concurrent]);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(fixture.buildModules).toHaveBeenCalledOnce();
+    expect(fixture.hostStorage).not.toHaveBeenCalled();
+    expect(fixture.app.runtime.workflowIds()).toEqual([]);
+    fixture.catalogGate.resolve();
+    const [first, second] = await outcomes;
+    expect(fixture.hostStorage).toHaveBeenCalledOnce();
+    expect(fixture.registerAgent).toHaveBeenCalledOnce();
+    expect(first).toMatchObject({
+      status: 'fulfilled',
+      value: { status: 404 },
+    });
+    expect(second).toMatchObject({
+      status: 'fulfilled',
+      value:
+        consumer === 'private replay'
+          ? { status: 404 }
+          : { agentId: 'writer', resourceId: RESOURCE_ID },
+    });
+    expect(fixture.app.runtime.workflowIds()).toEqual(['durable-agentic-loop']);
+    expect(fixture.state).toEqual(before);
+    expect(fixture.start).not.toHaveBeenCalled();
+    expect(fixture.provider).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'cached',
+    'reconstructed',
+  ] as const)('releases and reclaims a keyed start overlapping a cold private replay (%s host)', async (hostKind) => {
+    const fixture = await coldInitializationFixture();
+    const { globalRunRegistry } = await vi.importActual<
+      typeof import('@mastra/core/agent/durable')
+    >('@mastra/core/agent/durable');
+    const request = {
+      key: 'cold-key',
+      owner: HUMAN_OWNER,
+      targetKind: 'agent' as const,
+      targetId: 'writer',
+      threadId: fixture.scope.threadId,
+      mintRunId: () => 'acme_run',
+    };
+    let retryHost = fixture.host;
+    let retryScope = fixture.scope;
+    let retryStart = fixture.start;
+    let retryRegisterAgent = fixture.registerAgent;
+    const surface = {
+      persisted: async () => undefined,
+      live: async () => {
+        const response = await retryHost.route(
+          new Request(
+            'https://thread/_flowsafe/agent-host/runs/writer/acme_run/start-liveness',
+          ),
+          retryScope,
+        );
+        expect(response?.status).toBe(200);
+        const result = (await response?.json()) as { live: boolean };
+        expect(typeof result.live).toBe('boolean');
+        return result.live;
+      },
+    };
+    const first = await fixture.beginIdempotentStart(
+      fixture.reservations,
+      request,
+      surface,
+      'none',
+    );
+    expect(first.kind).toBe('start');
+    expect(await fixture.reservations.readForAdmission(request.key)).toEqual(
+      first.reservation,
+    );
+    expect(first.reservation).toMatchObject({
+      state: 'started',
+      binding: { kind: 'unbound' },
+    });
+    const writes = vi.spyOn(fixture.stateStorage, 'put');
+    const replay = fixture.replay();
+    const started = fixture.host.start(fixture.scope, {
+      ...C_START_INPUT,
+      idempotencyKey: request.key,
+      startReservation: first.reservation,
+    });
+    const outcomes = Promise.allSettled([replay, started]);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(fixture.buildModules).toHaveBeenCalledOnce();
+    expect(fixture.hostStorage).not.toHaveBeenCalled();
+    expect(fixture.state.size).toBe(0);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    fixture.catalogGate.resolve();
+    const [read, refused] = await outcomes;
+    expect(
+      await fixture.reservations.readForAdmission(request.key),
+    ).toMatchObject({
+      state: 'reserved',
+      binding: { kind: 'unbound' },
+    });
+    expect(fixture.state.size).toBe(0);
+    expect(writes).toHaveBeenCalledWith(
+      TEST_OWNER_RECOVERY_KEY,
+      expect.objectContaining({
+        phase: 'preparing',
+        startReservation: first.reservation,
+      }),
+    );
+    expect(read).toMatchObject({ status: 'fulfilled', value: { status: 404 } });
+    expect(refused).toMatchObject({
+      status: 'rejected',
+      reason: {
+        status: 503,
+        reason: { code: 'EXECUTION_FENCED', state: 'draining' },
+      },
+    });
+    expect(fixture.hostStorage).toHaveBeenCalledOnce();
+    expect(fixture.registerAgent).toHaveBeenCalledOnce();
+    expect(fixture.start).toHaveBeenCalledOnce();
+    const released = await fixture.reservations.readForAdmission(request.key);
+    if (hostKind === 'reconstructed') {
+      const app = init(
+        { storage: fixture.storage },
+        {
+          executionFence: fixture.fence,
+          startIdempotency: fixture.reservations,
+          requestContextForRun: fixture.provider,
+        },
+      );
+      retryHost = fixture.createHost();
+      retryScope = { ...fixture.scope, init: app };
+      retryStart = vi.spyOn(app.runtime, 'start');
+      retryRegisterAgent = vi.spyOn(app.runtime, 'registerAgent');
+    }
+    const claim = vi.spyOn(fixture.reservations, 'claimReservation');
+    const writesBeforeRetry = writes.mock.calls.length;
+    expect(globalRunRegistry.has('acme_run')).toBe(true);
+    const immediateRetry = await fixture
+      .beginIdempotentStart(fixture.reservations, request, surface, 'none')
+      .catch((error: unknown) => error);
+    expect(await fixture.reservations.readForAdmission(request.key)).toEqual(
+      released,
+    );
+    expect(claim).not.toHaveBeenCalled();
+    expect(writes).toHaveBeenCalledTimes(writesBeforeRetry);
+    expect(fixture.state.size).toBe(0);
+    expect(fixture.start).toHaveBeenCalledOnce();
+    expect(fixture.hostStorage).toHaveBeenCalledOnce();
+    expect(fixture.buildModules).toHaveBeenCalledOnce();
+    if (hostKind === 'reconstructed') {
+      expect(retryStart).not.toHaveBeenCalled();
+      expect(retryRegisterAgent).not.toHaveBeenCalled();
+    }
+    expect(immediateRetry).toMatchObject({
+      status: 503,
+      reason: { code: 'IDEMPOTENT_START_PENDING' },
+    });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(globalRunRegistry.has('acme_run')).toBe(false);
+    const retry = await fixture.beginIdempotentStart(
+      fixture.reservations,
+      request,
+      surface,
+      'none',
+    );
+    expect(retry.kind).toBe('start');
+    expect(claim).toHaveBeenCalledOnce();
+    expect(retry.reservation.runId).toBe(first.reservation.runId);
+    expect(retry.reservation.updatedAt).toBeGreaterThan(
+      first.reservation.updatedAt,
+    );
+    expect(released?.updatedAt).toBeLessThan(retry.reservation.updatedAt);
+    await expect(
+      retryHost.start(retryScope, {
+        ...C_START_INPUT,
+        idempotencyKey: request.key,
+        startReservation: retry.reservation,
+      }),
+    ).rejects.toMatchObject({
+      status: 503,
+      reason: { code: 'EXECUTION_FENCED', state: 'draining' },
+    });
+    expect(retryStart).toHaveBeenCalledTimes(
+      hostKind === 'reconstructed' ? 1 : 2,
+    );
+    expect(fixture.hostStorage).toHaveBeenCalledTimes(
+      hostKind === 'reconstructed' ? 2 : 1,
+    );
+    expect(fixture.registerAgent).toHaveBeenCalledOnce();
+    expect(retryRegisterAgent).toHaveBeenCalledOnce();
+    expect(fixture.state.size).toBe(0);
+    expect(
+      await fixture.reservations.readForAdmission(request.key),
+    ).toMatchObject({
+      state: 'reserved',
+      binding: { kind: 'unbound' },
+    });
+    expect(await fixture.resources.owner('run', 'acme_run')).toBeUndefined();
+    expect(
+      await fixture.resources.owner('thread', fixture.scope.threadId),
+    ).toBeUndefined();
+    expect(
+      await fixture.resources.owner('resource', RESOURCE_ID),
+    ).toBeUndefined();
+    const workflows = await fixture.storage.getStore('workflows');
+    expect(
+      await workflows?.loadWorkflowSnapshot({
+        workflowName: 'durable-agentic-loop',
+        runId: 'acme_run',
+      }),
+    ).toBeNull();
+    expect(fixture.provider).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(globalRunRegistry.has('acme_run')).toBe(false);
+  });
+
+  it('retries a failed catalog and retains the instance boundary', async () => {
+    const fixture = await coldInitializationFixture();
+    const failure = new Error('catalog unavailable');
+    fixture.buildModules.mockRejectedValueOnce(failure);
+    await expect(fixture.replay()).rejects.toBe(failure);
+    expect(fixture.hostStorage).not.toHaveBeenCalled();
+    expect(fixture.registerAgent).not.toHaveBeenCalled();
+    const outcomes = Promise.allSettled([fixture.replay(), fixture.replay()]);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(fixture.buildModules).toHaveBeenCalledTimes(2);
+    fixture.catalogGate.resolve();
+    const results = await outcomes;
+    expect(fixture.hostStorage).toHaveBeenCalledOnce();
+    expect(fixture.registerAgent).toHaveBeenCalledOnce();
+    expect(results).toMatchObject([
+      { status: 'fulfilled', value: { status: 404 } },
+      { status: 'fulfilled', value: { status: 404 } },
+    ]);
+    await expect(
+      fixture.replay({ ...fixture.scope, init: { ...fixture.app } }),
+    ).rejects.toThrow('thread agent host cannot be shared across DO instances');
+    expect(fixture.buildModules).toHaveBeenCalledTimes(2);
+    expect(fixture.hostStorage).toHaveBeenCalledOnce();
+    expect(fixture.registerAgent).toHaveBeenCalledOnce();
+    expect(fixture.state.size).toBe(0);
+    expect(fixture.start).not.toHaveBeenCalled();
+    expect(fixture.provider).not.toHaveBeenCalled();
+  });
+});
+
+describe('FS8 D3 host activation cold agent recovery', () => {
+  async function coldFixture(
+    threaded: boolean,
+    mode: 'fenced' | 'unfenced',
+    status: 'pending' | 'success' | 'suspended' = 'success',
+    keyed = false,
+  ) {
+    const core = await vi.importActual<typeof import('@mastra/core/mastra')>(
+      '@mastra/core/mastra',
+    );
+    const breakwater = await vi.importActual<
+      typeof import('@proofoftech/breakwater')
+    >('@proofoftech/breakwater');
+    mocked.actualFactory = true;
+    mocked.actualAgent = breakwater.createGuardedAgent({
+      id: 'writer',
+      name: 'Writer',
+      instructions: 'Unused cold recovery agent.',
+      model: 'openai/gpt-4o-mini',
+      allowedRoles: ['operator'],
+      policies: [],
+      audit: new breakwater.AuditLogger(),
+      maxSteps: 1,
+      toolChoice: 'auto',
+    });
+    mocked.mastra.mockImplementation(
+      (configuration) => new core.Mastra(configuration),
+    );
+    const sql = openSqlite();
+    const binding = sqliteUnitDatabase(sql) as ExecutionFenceDatabase &
+      ResourceOwnershipDatabase;
+    const storage = createD1Storage({ binding, tablePrefix: 'cold_' });
+    await storage.init();
+    const fence = new ExecutionFenceStore(binding);
+    await fence.seed('open');
+    const { StartIdempotencyStore } = await import(
+      '../do-runner/start-idempotency.js'
+    );
+    const reservations = keyed ? new StartIdempotencyStore(binding) : undefined;
+    const app = init(
+      { storage },
+      {
+        executionFence: mode === 'fenced' ? fence : 'none',
+        startIdempotency: reservations ?? 'none',
+      },
+    );
+    const resources = new D1ResourceOwnershipStore(
+      binding as ResourceOwnershipDatabase,
+    );
+    const fixture = harness(['writer'], {
+      init: app,
+      storage,
+      resourceAccess: resources,
+    });
+    const token = 'cold-host-attempt';
+    const execution = {
+      tablePrefix: 'cold_',
+      workflowId: 'durable-agentic-loop',
+      runId: 'acme_run',
+      startToken: 'cold-generation',
+    };
+    let claim:
+      | import('../do-runner/start-reservation-contract.js').StartReservationReading
+      | undefined;
+    if (reservations) {
+      const reserved = await reservations.reserve({
+        key: 'cold-key',
+        owner: HUMAN_OWNER,
+        targetKind: 'agent',
+        targetId: 'writer',
+        threadId: 'acme_thread',
+        mintRunId: () => 'acme_run',
+      });
+      claim = await reservations.claimReservation(reserved.reservation);
+      if (!claim) throw new Error('missing cold claim');
+      await reservations.bindPreparedStart(claim, {
+        ...execution,
+        owner: HUMAN_OWNER,
+        target: { kind: 'agent', id: 'writer', threadId: 'acme_thread' },
+      });
+    }
+    const provenance = {
+      version: 2,
+      startToken: execution.startToken,
+      attemptToken: status === 'pending' ? token : 'resumed-leg',
+      requestedBy: 'operator-1',
+      requestedByKind: 'human',
+      resumeCounts: [],
+      startIdentity: {
+        owner: { kind: 'human', id: 'operator-1' },
+        target: { kind: 'agent', id: 'writer', threadId: 'acme_thread' },
+      },
+      agentStart: { threaded },
+      ...(status === 'pending' ? { initialAdmission: true } : {}),
+    };
+    const workflows = (await storage.getStore(
+      'workflows',
+    )) as FencedWorkflowsStorageD1;
+    await workflows.persistWorkflowSnapshot({
+      workflowName: execution.workflowId,
+      runId: execution.runId,
+      snapshot: {
+        runId: execution.runId,
+        status,
+        value: {},
+        context: {},
+        serializedStepGraph: [],
+        activePaths: [],
+        activeStepsPath: {},
+        suspendedPaths: {},
+        resumeLabels: {},
+        waitingPaths: {},
+        timestamp: 123,
+        requestContext: { 'flowsafe.runProvenance': provenance },
+      },
+    });
+    const recovery = ownerRecovery('acme_run', {
+      phase: mode === 'fenced' ? 'prepared' : 'prepared-unfenced',
+      execution,
+      token,
+      threaded,
+      ...(claim ? { startReservation: claim } : {}),
+    });
+    seedRecoveryState(fixture.state, 'acme_run', recovery, threaded);
+    await resources.reserveAll(
+      [
+        { kind: 'run', resourceId: 'acme_run' },
+        { kind: 'thread', resourceId: 'acme_thread' },
+        { kind: 'resource', resourceId: RESOURCE_ID },
+      ],
+      HUMAN_OWNER,
+      token,
+    );
+    const nativeCapability = workflows[FENCED_WORKFLOW_STORAGE];
+    if (!nativeCapability) throw new Error('missing cold capability');
+    const rawReads = vi.fn(
+      nativeCapability.readSnapshot.bind(nativeCapability),
+    );
+    const terminalization = vi.fn(
+      nativeCapability.terminalizeInitialAdmission.bind(nativeCapability),
+    );
+    Object.defineProperty(workflows, FENCED_WORKFLOW_STORAGE, {
+      value: {
+        ...nativeCapability,
+        readSnapshot: rawReads,
+        terminalizeInitialAdmission: terminalization,
+      },
+      configurable: true,
+    });
+    return {
+      ...fixture,
+      sql,
+      reservations,
+      claim,
+      app,
+      workflows,
+      execution,
+      recovery,
+      resources,
+      nativeCapability,
+      rawReads,
+      terminalization,
+    };
+  }
+
+  it.each([
+    true,
+    false,
+  ])('initializes a fresh actual wrapper before fenced pending recovery (threaded=%s)', async (threaded) => {
+    const fixture = await coldFixture(threaded, 'fenced', 'pending');
+    expect(fixture.app.runtime.workflowIds()).toEqual([]);
+    const before = await fixture.workflows.loadWorkflowSnapshot({
+      workflowName: fixture.execution.workflowId,
+      runId: fixture.execution.runId,
+    });
+    expect(before?.status).toBe('pending');
+    const start = vi.spyOn(fixture.app.runtime, 'start');
+    await expect(
+      fixture.host.recoverOwnership(fixture.scope),
+    ).resolves.toBeUndefined();
+    const after = await fixture.workflows.loadWorkflowSnapshot({
+      workflowName: fixture.execution.workflowId,
+      runId: fixture.execution.runId,
+    });
+    expect(after?.status).toBe('failed');
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+    expect(fixture.app.runtime.workflowIds()).toContain(
+      fixture.execution.workflowId,
+    );
+    expect(start).not.toHaveBeenCalled();
+    expect(mocked.stream).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    true,
+    false,
+  ])('initializes a fresh actual wrapper for progressed unfenced recovery (threaded=%s)', async (threaded) => {
+    const fixture = await coldFixture(threaded, 'unfenced');
+    expect(fixture.app.runtime.workflowIds()).toEqual([]);
+    const b2 = vi.spyOn(fixture.app.runtime, 'recoverStartAttempt');
+    await expect(
+      fixture.host.recoverOwnership(fixture.scope),
+    ).resolves.toBeUndefined();
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+    expect(await fixture.resources.owner('run', 'acme_run')).toEqual(
+      HUMAN_OWNER,
+    );
+    expect(b2).not.toHaveBeenCalled();
+    expect(mocked.stream).not.toHaveBeenCalled();
+  });
+
+  it('initializes the cold blocking-run entry before selecting a terminal no-journal record', async () => {
+    const fixture = await coldFixture(true, 'fenced');
+    fixture.state.delete(TEST_OWNER_RECOVERY_KEY);
+    expect(fixture.app.runtime.workflowIds()).toEqual([]);
+    await expect(
+      fixture.host.blockingRun(fixture.scope),
+    ).resolves.toBeUndefined();
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+    expect(mocked.stream).not.toHaveBeenCalled();
+  });
+
+  it('initializes the cold dispatch-status entry before selecting its actual workflow', async () => {
+    const fixture = await coldFixture(true, 'fenced');
+    fixture.state.delete(TEST_OWNER_RECOVERY_KEY);
+    expect(fixture.app.runtime.workflowIds()).toEqual([]);
+    await expect(
+      fixture.host.scheduleDispatchStatus(fixture.scope, {
+        agentId: 'writer',
+        resourceId: RESOURCE_ID,
+        runId: 'acme_run',
+      }),
+    ).resolves.toMatchObject({ runId: 'acme_run', status: 'success' });
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+    expect(mocked.stream).not.toHaveBeenCalled();
+  });
+
+  it('keeps empty recovery and blocking scans lazy', async () => {
+    const fixture = harness();
+    await expect(
+      fixture.host.recoverOwnership(fixture.scope),
+    ).resolves.toBeUndefined();
+    await expect(
+      fixture.host.blockingRun(fixture.scope),
+    ).resolves.toBeUndefined();
+    expect(fixture.moduleScopes).toEqual([]);
+    expect(fixture.storageScopes).toEqual([]);
+  });
+
+  it('retains a cold journal for an unknown catalog module without engine entry', async () => {
+    const fixture = await coldFixture(true, 'fenced');
+    const foreign = ownerRecovery('acme_run', {
+      ...fixture.recovery,
+      agentId: 'unknown',
+      runRecord: {
+        version: 2,
+        agentId: 'unknown',
+        principal: fixture.scope.principal,
+        originEntryPath: 'http.start',
+      },
+    });
+    fixture.state.set(TEST_OWNER_RECOVERY_KEY, foreign);
+    const outcome = await fixture.host
+      .recoverOwnership(fixture.scope)
+      .catch((error: unknown) => error);
+    expect(fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toEqual(foreign);
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(true);
+    expect(fixture.alarmAt()).toBeDefined();
+    expect(mocked.stream).not.toHaveBeenCalled();
+    expect(outcome).toBeInstanceOf(Error);
+  });
+  it.each([
+    true,
+    false,
+  ])('uses one authoritative recovery observation for the actual cold agent (threaded=%s)', async (threaded) => {
+    const fixture = await coldFixture(threaded, 'fenced', 'pending');
+    await expect(
+      fixture.host.recoverOwnership(fixture.scope),
+    ).resolves.toBeUndefined();
+    const raw = await fixture.nativeCapability.readSnapshot({
+      workflowId: fixture.execution.workflowId,
+      runId: fixture.execution.runId,
+    });
+    expect(JSON.parse(raw?.snapshot ?? '{}').status).toBe('failed');
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+    expect(fixture.rawReads).toHaveBeenCalledOnce();
+    expect(fixture.terminalization).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    'agent',
+    'owner',
+    'thread',
+    'mode',
+    'workflow role',
+    'missing identity',
+  ] as const)('retains same-S foreign managed metadata before B2 from one selected row: %s', async (field) => {
+    const fixture = await coldFixture(true, 'fenced', 'pending');
+    const snapshot = await fixture.workflows.loadWorkflowSnapshot({
+      workflowName: fixture.execution.workflowId,
+      runId: fixture.execution.runId,
+    });
+    if (!snapshot?.requestContext) throw new Error('missing cold snapshot');
+    const provenance = snapshot.requestContext[
+      'flowsafe.runProvenance'
+    ] as Record<string, unknown>;
+    const identity = provenance.startIdentity as {
+      owner: { kind: string; id: string };
+      target: { kind: string; id: string; threadId?: string };
+    };
+    if (field === 'agent') identity.target.id = 'foreign-agent';
+    if (field === 'owner') {
+      identity.owner.id = 'foreign-owner';
+      provenance.requestedBy = 'foreign-owner';
+    }
+    if (field === 'thread') identity.target.threadId = 'foreign-thread';
+    if (field === 'mode') provenance.agentStart = { threaded: false };
+    if (field === 'workflow role') {
+      identity.target = { kind: 'workflow', id: fixture.execution.workflowId };
+      delete provenance.agentStart;
+    }
+    if (field === 'missing identity') {
+      delete provenance.startIdentity;
+      delete provenance.agentStart;
+    }
+    await fixture.workflows.persistWorkflowSnapshot({
+      workflowName: fixture.execution.workflowId,
+      runId: fixture.execution.runId,
+      snapshot,
+    });
+    const rawBefore = await fixture.nativeCapability.readSnapshot({
+      workflowId: fixture.execution.workflowId,
+      runId: fixture.execution.runId,
+    });
+    const settle = vi.spyOn(fixture.app.runtime, 'settleStartExecution');
+    const outcome = await fixture.host
+      .recoverOwnership(fixture.scope)
+      .catch((error: unknown) => error);
+    expect(
+      await fixture.nativeCapability.readSnapshot({
+        workflowId: fixture.execution.workflowId,
+        runId: fixture.execution.runId,
+      }),
+    ).toEqual(rawBefore);
+    expect(fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toEqual(
+      fixture.recovery,
+    );
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(true);
+    expect(fixture.terminalization).not.toHaveBeenCalled();
+    expect(settle).not.toHaveBeenCalled();
+    expect(fixture.rawReads).toHaveBeenCalledOnce();
+    expect(outcome).toMatchObject({
+      status: 503,
+      reason: { code: 'EXECUTION_FENCE_UNREADABLE' },
+    });
+  });
+  it.each([
+    [true, true],
+    [true, false],
+    [false, true],
+    [false, false],
+  ] as const)('retains cold prepared absence across repeated same-ID starts (threaded=%s keyed=%s)', async (threaded, keyed) => {
+    const fixture = await coldFixture(threaded, 'fenced', 'pending', keyed);
+    const beforeClaim =
+      await fixture.reservations?.readForAdmission('cold-key');
+    fixture.sql
+      .prepare(
+        'DELETE FROM cold_mastra_workflow_snapshot WHERE workflow_name = ? AND run_id = ?',
+      )
+      .run(fixture.execution.workflowId, fixture.execution.runId);
+    const enter = vi
+      .spyOn(fixture.app.runtime, 'start')
+      .mockRejectedValue(new Error('unexpected new engine entry'));
+    const recoveryError = await fixture.host
+      .recoverOwnership(fixture.scope)
+      .catch((error: unknown) => error);
+    expect(
+      await fixture.nativeCapability.readSnapshot({
+        workflowId: fixture.execution.workflowId,
+        runId: fixture.execution.runId,
+      }),
+    ).toBeUndefined();
+    expect(fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toEqual(
+      fixture.recovery,
+    );
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(true);
+    expect(fixture.state.has(THREAD_BINDING_KEY)).toBe(threaded);
+    expect(await fixture.reservations?.readForAdmission('cold-key')).toEqual(
+      beforeClaim,
+    );
+    expect(recoveryError).toMatchObject({ status: 503 });
+    for (let retry = 0; retry < 2; retry++) {
+      const outcome = await fixture.host
+        .start(fixture.scope, {
+          ...C_START_INPUT,
+          threaded,
+          ...(fixture.claim
+            ? {
+                idempotencyKey: fixture.claim.key,
+                startReservation: fixture.claim,
+              }
+            : {}),
+        })
+        .catch((error: unknown) => error);
+      expect(fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toEqual(
+        fixture.recovery,
+      );
+      expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(true);
+      expect(enter).not.toHaveBeenCalled();
+      expect(outcome).toMatchObject({ status: 503 });
+    }
+    expect(await fixture.host.blockingRun(fixture.scope)).toMatchObject({
+      runId: 'acme_run',
+    });
+    expect(fixture.terminalization).not.toHaveBeenCalled();
+  });
+
+  it('retains a no-journal terminal record when its selected immutable owner differs', async () => {
+    const fixture = await coldFixture(true, 'fenced');
+    fixture.state.delete(TEST_OWNER_RECOVERY_KEY);
+    const snapshot = await fixture.workflows.loadWorkflowSnapshot({
+      workflowName: fixture.execution.workflowId,
+      runId: fixture.execution.runId,
+    });
+    if (!snapshot?.requestContext) throw new Error('missing cold result');
+    const provenance = snapshot.requestContext['flowsafe.runProvenance'] as {
+      requestedBy: string;
+      startIdentity: { owner: { id: string } };
+    };
+    provenance.startIdentity.owner.id = 'foreign-owner';
+    provenance.requestedBy = 'foreign-owner';
+    await fixture.workflows.persistWorkflowSnapshot({
+      workflowName: fixture.execution.workflowId,
+      runId: fixture.execution.runId,
+      snapshot,
+    });
+    const settle = vi.spyOn(fixture.app.runtime, 'settleStartExecution');
+    const outcome = await fixture.host
+      .blockingRun(fixture.scope)
+      .catch((error: unknown) => error);
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(true);
+    expect(fixture.state.has(THREAD_BINDING_KEY)).toBe(true);
+    expect(settle).not.toHaveBeenCalled();
+    expect(outcome).toMatchObject({ status: 503 });
+  });
+});
+
+describe('FS8 D3 host activation exact agent journals', () => {
+  it.each([
+    [
+      'phase',
+      {
+        phase: 'prepared-unfenced',
+        execution: {
+          tablePrefix: '',
+          workflowId: 'durable-agentic-loop',
+          runId: 'acme_run',
+          startToken: 'test-generation',
+        },
+      },
+    ],
+    [
+      'generation',
+      {
+        execution: {
+          tablePrefix: '',
+          workflowId: 'durable-agentic-loop',
+          runId: 'acme_run',
+          startToken: 'replacement-generation',
+        },
+      },
+    ],
+    [
+      'principal',
+      {
+        runRecord: {
+          version: 2,
+          agentId: 'writer',
+          principal: { kind: 'human', id: 'operator-1', role: 'admin' },
+          originEntryPath: 'http.start',
+        },
+      },
+    ],
+    [
+      'origin',
+      {
+        runRecord: {
+          version: 2,
+          agentId: 'writer',
+          principal: { kind: 'human', id: 'operator-1', role: 'operator' },
+          originEntryPath: 'signal.wake',
+        },
+      },
+    ],
+  ])('preserves a replacement with repeated H when the listed journal differs in %s', async (_field, replacement) => {
+    const fixture = harness();
+    fixture.setSummary({ runId: 'acme_run', status: 'success' });
+    const original = ownerRecovery('acme_run');
+    const current = ownerRecovery('acme_run', replacement);
+    seedRecoveryState(fixture.state, 'acme_run', current);
+    vi.spyOn(fixture.stateStorage, 'list').mockResolvedValueOnce(
+      new Map([[TEST_OWNER_RECOVERY_KEY, original]]),
+    );
+    const settle = vi.spyOn(fixture.resourceAccess, 'settleReservation');
+    const recover = vi.spyOn(fixture.scope.init.runtime, 'recoverStartAttempt');
+    const outcome = await fixture.host
+      .recoverOwnership(fixture.scope)
+      .catch((error: unknown) => error);
+    expect(fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toEqual(current);
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(true);
+    expect(settle).not.toHaveBeenCalled();
+    expect(recover).not.toHaveBeenCalled();
+    expect(outcome).toBeInstanceOf(Error);
+  });
+
+  it.each([
+    'principal',
+    'origin',
+  ] as const)('preserves a replacement run record during preparing rollback: %s', async (field) => {
+    const fixture = harness();
+    const recovery = ownerRecovery('acme_run', { phase: 'preparing' });
+    delete recovery.execution;
+    seedRecoveryState(fixture.state, 'acme_run', recovery);
+    const record = {
+      version: 2,
+      agentId: 'writer',
+      principal: {
+        kind: 'human',
+        id: 'operator-1',
+        role: field === 'principal' ? 'admin' : 'operator',
+      },
+      originEntryPath: field === 'origin' ? 'signal.wake' : 'http.start',
+    };
+    fixture.state.set(TEST_RUN_RECORD_KEY, record);
+    const outcome = await fixture.host
+      .recoverOwnership(fixture.scope)
+      .catch((error: unknown) => error);
+    expect(fixture.state.get(TEST_RUN_RECORD_KEY)).toEqual(record);
+    expect(fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toEqual(recovery);
+    expect(fixture.state.has(THREAD_BINDING_KEY)).toBe(true);
+    expect(outcome).toBeInstanceOf(Error);
+  });
+
+  it.each([
+    null,
+    'actual_',
+  ] as const)('never invokes B2 or absence rollback for missing prepared-unfenced state (prefix=%s)', async (tablePrefix) => {
+    const fixture = harness();
+    fixture.setSummary(null, true);
+    const recovery = ownerRecovery('acme_run', {
+      phase: 'prepared-unfenced',
+      execution: {
+        tablePrefix,
+        workflowId: 'durable-agentic-loop',
+        runId: 'acme_run',
+        startToken: 'test-generation',
+      },
+    });
+    seedRecoveryState(fixture.state, 'acme_run', recovery);
+    const b2 = vi.spyOn(fixture.scope.init.runtime, 'recoverStartAttempt');
+    const outcome = await fixture.host
+      .recoverOwnership(fixture.scope)
+      .catch((error: unknown) => error);
+    expect(fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toEqual(recovery);
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(true);
+    expect(fixture.alarmAt()).toBeDefined();
+    expect(b2).not.toHaveBeenCalled();
+    expect(outcome).toBeInstanceOf(Error);
+  });
+
+  it.each([
+    true,
+    false,
+  ])('retains managed bookkeeping after strict terminal settlement failure (threaded=%s)', async (threaded) => {
+    const failure = new Error('strict settlement failed');
+    const settle = vi.fn(async () => {
+      throw failure;
+    });
+    const fixture = harness(['writer'], {
+      runtime: { settleStartExecution: settle },
+    });
+    const outcome = await fixture.host
+      .start(fixture.scope, { ...C_START_INPUT, threaded })
+      .catch((error: unknown) => error);
+    expect(fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toMatchObject({
+      phase: 'prepared-unfenced',
+      threaded,
+    });
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(true);
+    expect(
+      await fixture.resourceAccess.reserveAll(
+        [{ kind: 'run', resourceId: 'acme_run' }],
+        { kind: 'human', id: 'replacement-owner' },
+        'replacement-attempt',
+      ),
+    ).toBe(false);
+    expect(fixture.alarmAt()).toBeDefined();
+    expect(outcome).toBe(failure);
+  });
+
+  it.each([
+    true,
+    false,
+  ])('does not publish normal completion from a pending durable start (threaded=%s)', async (threaded) => {
+    const fixture = harness();
+    fixture.setSummary({ runId: 'acme_run', status: 'pending' }, false);
+    const outcome = await fixture.host
+      .start(fixture.scope, { ...C_START_INPUT, threaded })
+      .catch((error: unknown) => error);
+    expect(fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toMatchObject({
+      phase: 'prepared-unfenced',
+      threaded,
+    });
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(true);
+    expect(
+      await fixture.resourceAccess.reserveAll(
+        [{ kind: 'run', resourceId: 'acme_run' }],
+        { kind: 'human', id: 'replacement-owner' },
+        'replacement-attempt',
+      ),
+    ).toBe(false);
+    expect(fixture.alarmAt()).toBeDefined();
+    expect(outcome).toMatchObject({
+      status: 503,
+      reason: { code: 'RUN_START_PENDING' },
+    });
+  });
+});
+
+describe('FS8 D3 host activation owning quiescence', () => {
+  it('refuses recovery while the exact start frame is still awaiting the engine', async () => {
+    const fixture = harness();
+    const entered = cDeferred(),
+      release = cDeferred();
+    mocked.stream.mockImplementation(async () => {
+      entered.resolve();
+      await release.promise;
+      return {};
+    });
+    const start = fixture.host.start(fixture.scope, C_START_INPUT);
+    const outcome = start.catch((error: unknown) => error);
+    await entered.promise;
+    const journal = structuredClone(fixture.state.get(TEST_OWNER_RECOVERY_KEY));
+    try {
+      const recovery = await fixture.host
+        .recoverOwnership(fixture.scope)
+        .catch((error: unknown) => error);
+      expect(fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toEqual(journal);
+      expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(true);
+      expect(recovery).toMatchObject({
+        status: 503,
+        reason: { code: 'RUN_START_PENDING' },
+      });
+    } finally {
+      release.resolve();
+      await outcome;
+    }
+    await expect(start).resolves.toMatchObject({ runId: 'acme_run' });
+  });
+
+  it('recovers the previous preparing attempt before installing the next execution frame', async () => {
+    const fixture = harness();
+    const previous = ownerRecovery('acme_run', { phase: 'preparing' });
+    delete previous.execution;
+    seedRecoveryState(fixture.state, 'acme_run', previous);
+    await fixture.resources.reserveAll(
+      [
+        { kind: 'run', resourceId: 'acme_run' },
+        { kind: 'thread', resourceId: 'acme_thread' },
+        { kind: 'resource', resourceId: RESOURCE_ID },
+      ],
+      HUMAN_OWNER,
+      previous.token as string,
+    );
+    const start = fixture.host.start(fixture.scope, C_START_INPUT);
+    await expect(start).resolves.toMatchObject({ runId: 'acme_run' });
+    const result = await start;
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+    expect(await fixture.resources.owner('run', 'acme_run')).toEqual(
+      HUMAN_OWNER,
+    );
+    expect(mocked.stream).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({
+      runId: 'acme_run',
+      summary: { status: 'success' },
+    });
+  });
+});
+
+describe('FS8 D3 host activation captured original claim', () => {
+  it('forwards the captured successful claim through the eighth argument after an authorization wait', async () => {
+    const { StartIdempotencyStore } = await import(
+      '../do-runner/start-idempotency.js'
+    );
+    const store = new StartIdempotencyStore(
+      sqliteUnitDatabase(
+        openSqlite(),
+      ) as import('../do-runner/start-idempotency.js').StartIdempotencyDatabase,
+    );
+    const reserved = await store.reserve({
+      key: 'captured-key',
+      owner: { kind: 'human', id: 'operator-1' },
+      targetKind: 'agent',
+      targetId: 'writer',
+      threadId: 'acme_thread',
+      mintRunId: () => 'acme_run',
+    });
+    const claim = await store.claimReservation(reserved.reservation);
+    if (!claim) throw new Error('missing successful claim');
+    const mutable = {
+      ...claim,
+      owner: { ...claim.owner },
+      binding: { ...claim.binding },
+    };
+    const entered = cDeferred(),
+      release = cDeferred();
+    const fixture = harness(['writer'], {
+      runtime: { startIdempotency: store },
+      resolvePrincipalPermissions: async () => {
+        entered.resolve();
+        await release.promise;
+        return { permissions: [], policyVersion: 'test-v1' };
+      },
+    });
+    const pending = fixture.host.start(fixture.scope, {
+      ...C_START_INPUT,
+      idempotencyKey: claim.key,
+      startReservation: mutable,
+    });
+    const outcome = pending.catch((error: unknown) => error);
+    await entered.promise;
+    Object.assign(mutable, {
+      key: 'replacement-key',
+      targetId: 'replacement-agent',
+      runId: 'replacement-run',
+      updatedAt: claim.updatedAt + 10,
+    });
+    mutable.owner.id = 'replacement-owner';
+    release.resolve();
+    await outcome;
+    expect(await store.readForAdmission(claim.key)).toEqual(claim);
+    expect(mocked.stream.mock.calls[0]?.[7].startReservation).toEqual(claim);
+    await expect(pending).resolves.toMatchObject({ runId: 'acme_run' });
+  });
+});
+
+describe('FS8 D3 host activation custom storage cold recovery', () => {
+  it.each([
+    true,
+    false,
+  ])('recovers a real custom-null result without B2 after lazy factory initialization (threaded=%s)', async (threaded) => {
+    const core = await vi.importActual<typeof import('@mastra/core/mastra')>(
+      '@mastra/core/mastra',
+    );
+    const { InMemoryStore } = await import('@mastra/core/storage');
+    const breakwater = await vi.importActual<
+      typeof import('@proofoftech/breakwater')
+    >('@proofoftech/breakwater');
+    mocked.actualFactory = true;
+    mocked.actualAgent = breakwater.createGuardedAgent({
+      id: 'writer',
+      name: 'Writer',
+      instructions: 'Unused custom recovery agent.',
+      model: 'openai/gpt-4o-mini',
+      allowedRoles: ['operator'],
+      policies: [],
+      audit: new breakwater.AuditLogger(),
+      maxSteps: 1,
+      toolChoice: 'auto',
+    });
+    mocked.mastra.mockImplementation(
+      (configuration) => new core.Mastra(configuration),
+    );
+    const storage = new InMemoryStore();
+    await storage.init();
+    const app = init(
+      { storage },
+      { executionFence: 'none', startIdempotency: 'none' },
+    );
+    const fixture = harness(['writer'], { init: app, storage });
+    const execution = {
+      tablePrefix: null,
+      workflowId: 'durable-agentic-loop',
+      runId: 'acme_run',
+      startToken: 'custom-generation',
+    };
+    const recovery = ownerRecovery('acme_run', {
+      phase: 'prepared-unfenced',
+      execution,
+      threaded,
+    });
+    seedRecoveryState(fixture.state, 'acme_run', recovery, threaded);
+    await fixture.resources.reserveAll(
+      [
+        { kind: 'run', resourceId: 'acme_run' },
+        { kind: 'thread', resourceId: 'acme_thread' },
+        { kind: 'resource', resourceId: RESOURCE_ID },
+      ],
+      HUMAN_OWNER,
+      recovery.token as string,
+    );
+    const workflows = await storage.getStore('workflows');
+    await workflows?.persistWorkflowSnapshot({
+      workflowName: execution.workflowId,
+      runId: execution.runId,
+      snapshot: {
+        runId: execution.runId,
+        status: 'success',
+        result: { value: 'custom' },
+        value: {},
+        context: {},
+        serializedStepGraph: [],
+        activePaths: [],
+        activeStepsPath: {},
+        suspendedPaths: {},
+        resumeLabels: {},
+        waitingPaths: {},
+        timestamp: 123,
+        requestContext: {
+          'flowsafe.runProvenance': {
+            version: 2,
+            startToken: execution.startToken,
+            attemptToken: 'resumed-custom-leg',
+            resumeCounts: [],
+            requestedBy: 'operator-1',
+            requestedByKind: 'human',
+            startIdentity: {
+              owner: HUMAN_OWNER,
+              target: { kind: 'agent', id: 'writer', threadId: 'acme_thread' },
+            },
+            agentStart: { threaded },
+          },
+        },
+      },
+    });
+    const b2 = vi.spyOn(app.runtime, 'recoverStartAttempt');
+    expect(app.runtime.workflowIds()).toEqual([]);
+    await expect(
+      fixture.host.recoverOwnership(fixture.scope),
+    ).resolves.toBeUndefined();
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+    expect(await fixture.resources.owner('run', 'acme_run')).toEqual(
+      HUMAN_OWNER,
+    );
+    expect(b2).not.toHaveBeenCalled();
+    expect(mocked.stream).not.toHaveBeenCalled();
+  });
+});
+
+describe('FS8 D3 host activation native agent zero admission', () => {
+  async function nativeZeroFixture() {
+    const core = await vi.importActual<typeof import('@mastra/core/mastra')>(
+      '@mastra/core/mastra',
+    );
+    mocked.mastra.mockImplementation((configuration) =>
+      configuration?.workflows ? new core.Mastra(configuration) : undefined,
+    );
+    const sql = openSqlite();
+    const binding = sqliteUnitDatabase(sql) as ExecutionFenceDatabase &
+      ResourceOwnershipDatabase;
+    const storage = createD1Storage({ binding });
+    await storage.init();
+    const fence = new ExecutionFenceStore(binding);
+    await fence.seed('open');
+    const { StartIdempotencyStore } = await import(
+      '../do-runner/start-idempotency.js'
+    );
+    const reservations = new StartIdempotencyStore(binding);
+    const app = init(
+      { storage },
+      { executionFence: fence, startIdempotency: reservations },
+    );
+    let effects = 0;
+    app
+      .createWorkflow({
+        id: 'durable-agentic-loop',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+      })
+      .then(
+        app.createStep({
+          id: 'effect',
+          inputSchema: z.object({}),
+          outputSchema: z.object({}),
+          execute: async () => {
+            effects++;
+            return {};
+          },
+        }),
+      )
+      .commit();
+    const domain = (await storage.getStore(
+      'workflows',
+    )) as FencedWorkflowsStorageD1;
+    const native = domain[FENCED_WORKFLOW_STORAGE];
+    if (!native) throw new Error('missing native capability');
+    let closeOnce = true;
+    Object.defineProperty(domain, FENCED_WORKFLOW_STORAGE, {
+      value: {
+        ...native,
+        withInitialAdmission: async (
+          input: Parameters<typeof native.withInitialAdmission>[0],
+          create: Parameters<typeof native.withInitialAdmission>[1],
+        ) => {
+          if (closeOnce) {
+            closeOnce = false;
+            await fence.transition({ expected: 'open', next: 'draining' });
+          }
+          return native.withInitialAdmission(input, create);
+        },
+      },
+      configurable: true,
+    });
+    const fixture = harness(['writer'], {
+      init: app,
+      storage,
+      resourceAccess: new D1ResourceOwnershipStore(binding),
+    });
+    mocked.stream.mockImplementation(
+      async (
+        ...args: Parameters<FlowsafeDurableAgent['streamUntilPersisted']>
+      ) => {
+        const [
+          ,
+          options,
+          requestedBy,
+          requestedByKind,
+          attemptToken,
+          scheduleDispatch,
+          idempotencyKey,
+          authority,
+        ] = args;
+        const runId = options.runId;
+        if (typeof runId !== 'string')
+          throw new Error('host omitted its runId');
+        await app.runtime.start('durable-agentic-loop', {
+          runId,
+          inputData: {},
+          storedRequestContext: Object.fromEntries(
+            options.requestContext?.entries() ?? [],
+          ),
+          requestedBy,
+          requestedByKind,
+          attemptToken,
+          scheduleDispatch,
+          idempotencyKey,
+          mutationEpoch: authority.mutationEpoch,
+          startIdentity: authority.startIdentity,
+          agentStart: authority.agentStart,
+          onPreparedStartIdentity: authority.onPreparedStartIdentity,
+          runOwnerGuard: authority.runOwnerGuard,
+          startReservation: authority.startReservation,
+        });
+        return {};
+      },
+    );
+    const claim = async () => {
+      const reserved = await reservations.reserve({
+        key: 'agent-zero-key',
+        owner: HUMAN_OWNER,
+        targetKind: 'agent',
+        targetId: 'writer',
+        threadId: 'acme_thread',
+        mintRunId: () => 'acme_run',
+      });
+      const result = await reservations.claimReservation(reserved.reservation);
+      if (!result) throw new Error('missing agent claim');
+      return result;
+    };
+    return {
+      fixture,
+      app,
+      storage,
+      sql,
+      domain,
+      native,
+      fence,
+      reservations,
+      claim,
+      effects: () => effects,
+      refuseNext: () => {
+        closeOnce = true;
+      },
+    };
+  }
+
+  it('preserves H rows when non-owning recovery races a held native zero frame', async () => {
+    const fixture = await nativeZeroFixture();
+    const nativeStart = fixture.app.runtime.start.bind(fixture.app.runtime);
+    const entered = cDeferred();
+    const release = cDeferred();
+    vi.spyOn(fixture.app.runtime, 'start').mockImplementationOnce(
+      async (...args) => {
+        try {
+          return await nativeStart(...args);
+        } catch (error) {
+          entered.resolve();
+          await release.promise;
+          throw error;
+        }
+      },
+    );
+    const starting = fixture.fixture.host.start(
+      fixture.fixture.scope,
+      C_START_INPUT,
+    );
+    const settled = starting.catch((error: unknown) => error);
+    await entered.promise;
+    const owners = fixture.sql
+      .prepare(
+        'SELECT * FROM flowsafe_resource_owners ORDER BY resource_kind, resource_id',
+      )
+      .all();
+    const state = structuredClone(fixture.fixture.state);
+    try {
+      const outcome = await fixture.fixture.host
+        .recoverOwnership(fixture.fixture.scope)
+        .catch((error: unknown) => error);
+      expect(
+        fixture.sql
+          .prepare(
+            'SELECT * FROM flowsafe_resource_owners ORDER BY resource_kind, resource_id',
+          )
+          .all(),
+      ).toEqual(owners);
+      expect(fixture.fixture.state).toEqual(state);
+      expect(fixture.effects()).toBe(0);
+      expect(outcome).toMatchObject({
+        status: 503,
+        reason: { code: 'RUN_START_PENDING' },
+      });
+    } finally {
+      release.resolve();
+      await settled;
+    }
+  });
+
+  it.each([
+    'lookalike',
+    'serialized',
+    'foreign generation',
+    'evicted frame',
+  ] as const)('retains agent prepared absence without native local zero authority (%s)', async (mode) => {
+    const fixture = await nativeZeroFixture();
+    const nativeStart = fixture.app.runtime.start.bind(fixture.app.runtime);
+    let originalFailure: unknown;
+    let foreignExecution:
+      | import('../do-runner/execution-admission.js').RunExecutionIdentity
+      | undefined;
+    let prepared: unknown;
+    const put = fixture.fixture.stateStorage.put.bind(
+      fixture.fixture.stateStorage,
+    );
+    vi.spyOn(fixture.fixture.stateStorage, 'put').mockImplementation(
+      async (key, value) => {
+        await put(key, value);
+        if (
+          key === TEST_OWNER_RECOVERY_KEY &&
+          (value as { phase?: string }).phase === 'prepared'
+        )
+          prepared = structuredClone(value);
+      },
+    );
+    vi.spyOn(fixture.app.runtime, 'start').mockImplementationOnce(
+      async (...args) => {
+        try {
+          return await nativeStart(...args);
+        } catch (error) {
+          originalFailure = error;
+          if (mode === 'foreign generation') {
+            await fixture.fence.transition({
+              expected: 'draining',
+              next: 'open',
+            });
+            fixture.refuseNext();
+            await nativeStart('durable-agentic-loop', {
+              runId: 'acme_run',
+              onPreparedStartIdentity: (identity) => {
+                foreignExecution = identity;
+              },
+              inputData: {},
+              requestedBy: 'operator-1',
+              requestedByKind: 'human',
+            });
+            throw new Error('foreign native zero unexpectedly succeeded');
+          }
+          if (mode === 'lookalike') {
+            const { ExecutionFencedError } = await import(
+              '../do-runner/execution-fence.js'
+            );
+            throw new ExecutionFencedError('draining', 'run start');
+          }
+          throw Object.assign(
+            new Error('serialized zero receipt'),
+            JSON.parse(
+              JSON.stringify({
+                status: (error as { status?: number }).status,
+                reason: (error as { reason?: unknown }).reason,
+              }),
+            ),
+          );
+        }
+      },
+    );
+    const claim = await fixture.claim();
+    const first = await fixture.fixture.host
+      .start(fixture.fixture.scope, {
+        ...C_START_INPUT,
+        idempotencyKey: claim.key,
+        startReservation: claim,
+      })
+      .catch((error: unknown) => error);
+    expect(fixture.fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toEqual(
+      prepared,
+    );
+    expect(fixture.fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(true);
+    expect(fixture.fixture.state.has(THREAD_BINDING_KEY)).toBe(true);
+    expect(
+      await fixture.native.readSnapshot({
+        workflowId: 'durable-agentic-loop',
+        runId: 'acme_run',
+      }),
+    ).toBeUndefined();
+    expect(fixture.effects()).toBe(0);
+    if (mode === 'foreign generation') {
+      expect(foreignExecution).toMatchObject({
+        workflowId: 'durable-agentic-loop',
+        runId: 'acme_run',
+      });
+      expect(foreignExecution?.startToken).not.toBe(
+        (prepared as { execution: { startToken: string } }).execution
+          .startToken,
+      );
+    }
+    expect(first).toBeInstanceOf(Error);
+    if (mode === 'evicted frame') {
+      const { isDefinitiveInitialAdmissionRefusal } = await import(
+        '../do-runner/initial-admission-refusal.js'
+      );
+      expect(
+        isDefinitiveInitialAdmissionRefusal(
+          originalFailure,
+          (
+            prepared as {
+              execution: import('../do-runner/execution-admission.js').D1RunExecutionIdentity;
+            }
+          ).execution,
+        ),
+      ).toBe(true);
+      const coldHost = createThreadAgentHost({
+        buildModules: () => [
+          {
+            meta: {
+              id: 'writer',
+              title: 'Writer',
+              description: 'Cold zero fixture',
+              allowedRoles: ['operator'],
+            },
+            agent: guarded(),
+          },
+        ],
+        storage: () => fixture.storage,
+        stateStorage: () => fixture.fixture.stateStorage,
+        resourceAccess: () => fixture.fixture.resourceAccess,
+        approvalService: () => {
+          throw new Error('unexpected cold approval');
+        },
+      });
+      const cold = await coldHost
+        .recoverOwnership(fixture.fixture.scope)
+        .catch((error: unknown) => error);
+      expect(fixture.fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toEqual(
+        prepared,
+      );
+      expect(fixture.fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(true);
+      expect(fixture.fixture.state.has(THREAD_BINDING_KEY)).toBe(true);
+      expect(cold).toMatchObject({ status: 503 });
+    }
+    const beforeClaim = await fixture.reservations.readForAdmission(claim.key);
+    await fixture.fence.transition({ expected: 'draining', next: 'open' });
+    const retry = await fixture.fixture.host
+      .start(fixture.fixture.scope, {
+        ...C_START_INPUT,
+        idempotencyKey: claim.key,
+        startReservation: claim,
+      })
+      .catch((error: unknown) => error);
+    expect(fixture.fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toEqual(
+      prepared,
+    );
+    expect(fixture.fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(true);
+    expect(await fixture.reservations.readForAdmission(claim.key)).toEqual(
+      beforeClaim,
+    );
+    expect(fixture.effects()).toBe(0);
+    expect(retry).toMatchObject({ status: 503 });
+  });
+
+  it.each([
+    true,
+    false,
+  ])('clears local agent bookkeeping only after native zero proof and executes one retry (threaded=%s)', async (threaded) => {
+    const { fixture, native, fence, reservations, claim, effects } =
+      await nativeZeroFixture();
+    const firstClaim = await claim();
+    const outcome = await fixture.host
+      .start(fixture.scope, {
+        ...C_START_INPUT,
+        threaded,
+        idempotencyKey: firstClaim.key,
+        startReservation: firstClaim,
+      })
+      .catch((error: unknown) => error);
+    expect(
+      await native.readSnapshot({
+        workflowId: 'durable-agentic-loop',
+        runId: 'acme_run',
+      }),
+    ).toBeUndefined();
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+    expect(fixture.state.has(THREAD_BINDING_KEY)).toBe(false);
+    expect(await reservations.readForAdmission('agent-zero-key')).toMatchObject(
+      { state: 'reserved', binding: { kind: 'unbound' } },
+    );
+    expect(effects()).toBe(0);
+    expect(outcome).toMatchObject({ status: 503 });
+    await fence.transition({ expected: 'draining', next: 'open' });
+    const nextClaim = await claim();
+    await expect(
+      fixture.host.start(fixture.scope, {
+        ...C_START_INPUT,
+        threaded,
+        idempotencyKey: nextClaim.key,
+        startReservation: nextClaim,
+      }),
+    ).resolves.toMatchObject({
+      runId: 'acme_run',
+      summary: { status: 'success' },
+    });
+    expect(effects()).toBe(1);
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+  });
+});
+
+describe('FS8 D3 host activation explicit legacy observation', () => {
+  it.each([
+    null,
+    3,
+    [],
+  ])('refuses present malformed provenance before public legacy fallback (%j)', async (provenance) => {
+    const fixture = harness(['writer'], {
+      runtime: {
+        authoritativeStartState: vi.fn(async () => {
+          throw new RunStateUnreadableError('durable-agentic-loop', 'acme_run');
+        }),
+      },
+    });
+    fixture.setSnapshot({
+      requestContext: { 'flowsafe.runProvenance': provenance },
+    });
+    fixture.setSummary({ runId: 'acme_run', status: 'success' });
+    const record = {
+      version: 2,
+      agentId: 'writer',
+      principal: fixture.scope.principal,
+      originEntryPath: 'http.start',
+    };
+    fixture.state.set(TEST_RUN_RECORD_KEY, record);
+    const outcome = await fixture.host
+      .route(
+        new Request(
+          `https://thread/_flowsafe/agent-host/runs/writer/acme_run?resourceId=${RESOURCE_ID}`,
+        ),
+        fixture.scope,
+      )
+      .catch((error: unknown) => error);
+    expect(fixture.state.get(TEST_RUN_RECORD_KEY)).toEqual(record);
+    expect(outcome).toBeInstanceOf(RunStateUnreadableError);
+    expect(doErrorResponse(outcome).status).toBe(503);
+  });
+});
+
+async function hostR1AgentFixture(
+  input: {
+    mode?: 'custom-null' | 'actual-prefix' | 'fenced';
+    provenance?: 'v1' | 'absent' | 'modern';
+    status?: 'pending' | 'suspended' | 'success' | 'cancelled';
+    threaded?: boolean;
+    keyed?: boolean;
+    wired?: boolean;
+    journal?: boolean;
+    lifecycle?: boolean;
+  } = {},
+) {
+  const core = await vi.importActual<typeof import('@mastra/core/mastra')>(
+    '@mastra/core/mastra',
+  );
+  const { InMemoryStore } = await import('@mastra/core/storage');
+  const breakwater = await vi.importActual<
+    typeof import('@proofoftech/breakwater')
+  >('@proofoftech/breakwater');
+  mocked.actualFactory = true;
+  mocked.actualAgent = breakwater.createGuardedAgent({
+    id: 'writer',
+    name: 'Writer',
+    instructions: 'Unused host regression agent.',
+    model: 'openai/gpt-4o-mini',
+    allowedRoles: ['operator'],
+    policies: [],
+    audit: new breakwater.AuditLogger(),
+    maxSteps: 1,
+    toolChoice: 'auto',
+  });
+  mocked.mastra.mockImplementation(
+    (configuration) => new core.Mastra(configuration),
+  );
+  const mode = input.mode ?? 'actual-prefix';
+  const threaded = input.threaded ?? true;
+  const status = input.status ?? 'suspended';
+  const version = input.provenance ?? 'v1';
+  const sql = openSqlite();
+  const binding = sqliteUnitDatabase(sql) as ExecutionFenceDatabase &
+    ResourceOwnershipDatabase;
+  const storage =
+    mode === 'custom-null'
+      ? new InMemoryStore()
+      : createD1Storage({ binding, tablePrefix: 'host_r1_' });
+  await storage.init();
+  const { StartIdempotencyStore } = await import(
+    '../do-runner/start-idempotency.js'
+  );
+  const reservations = new StartIdempotencyStore(binding);
+  const fence = new ExecutionFenceStore(binding);
+  await fence.seed('open');
+  const app = init(
+    { storage },
+    {
+      executionFence: mode === 'fenced' ? fence : 'none',
+      startIdempotency: input.wired === false ? 'none' : reservations,
+    },
+  );
+  const resources = new D1ResourceOwnershipStore(binding);
+  const approvals = {
+    list: vi.fn(async () => [] as ApprovalRecord[]),
+    createAsPrincipal: vi.fn(async () => {
+      throw new Error('unexpected approval creation');
+    }),
+    supersedeStaleAsPrincipal: vi.fn<
+      ApprovalService['supersedeStaleAsPrincipal']
+    >(async () => null),
+  };
+  const dispatch = vi.fn(async () => {});
+  const fixture = harness(['writer'], {
+    storage,
+    init: app,
+    resourceAccess: resources,
+    approvalService: approvals as unknown as ApprovalService,
+    discardScheduleDispatch: dispatch,
+  });
+  const execution = {
+    tablePrefix: mode === 'custom-null' ? null : 'host_r1_',
+    workflowId: 'durable-agentic-loop',
+    runId: 'acme_run',
+    startToken: 'host-r1-generation',
+  };
+  let claim:
+    | import('../do-runner/start-reservation-contract.js').StartReservationReading
+    | undefined;
+  if (input.keyed) {
+    const reserved = await reservations.reserve({
+      key: 'host-r1-key',
+      owner: HUMAN_OWNER,
+      targetKind: 'agent',
+      targetId: 'writer',
+      threadId: 'acme_thread',
+      mintRunId: () => 'acme_run',
+    });
+    claim = await reservations.claimReservation(reserved.reservation);
+    if (!claim) throw new Error('missing host claim');
+    await reservations.bindPreparedStart(claim, {
+      ...execution,
+      owner: HUMAN_OWNER,
+      target: { kind: 'agent', id: 'writer', threadId: 'acme_thread' },
+    });
+  }
+  const recovery = ownerRecovery('acme_run', {
+    phase: mode === 'fenced' ? 'prepared' : 'prepared-unfenced',
+    token: 'host-r1-attempt',
+    execution,
+    threaded,
+    ...(claim ? { startReservation: claim } : {}),
+  });
+  seedRecoveryState(fixture.state, 'acme_run', recovery, threaded);
+  if (!input.journal) fixture.state.delete(TEST_OWNER_RECOVERY_KEY);
+  await resources.reserveAll(
+    [
+      { kind: 'run', resourceId: 'acme_run' },
+      { kind: 'thread', resourceId: 'acme_thread' },
+      { kind: 'resource', resourceId: RESOURCE_ID },
+    ],
+    HUMAN_OWNER,
+    recovery.token as string,
+  );
+  if (!input.journal)
+    await resources.settleReservation(recovery.token as string, []);
+  const workflows = await storage.getStore('workflows');
+  if (!workflows) throw new Error('missing host workflow domain');
+  const snapshot: import('@mastra/core/workflows').WorkflowRunState = {
+    runId: 'acme_run',
+    status:
+      status as import('@mastra/core/workflows').WorkflowRunState['status'],
+    value: {},
+    context: {
+      input: {
+        agentId: 'writer',
+        messageListState: {
+          memoryInfo: threaded
+            ? { threadId: 'acme_thread', resourceId: RESOURCE_ID }
+            : null,
+        },
+      },
+    } as unknown as import('@mastra/core/workflows').WorkflowRunState['context'],
+    serializedStepGraph: [],
+    activePaths: [],
+    activeStepsPath: {},
+    suspendedPaths: {},
+    resumeLabels: {},
+    waitingPaths: {},
+    timestamp: 123,
+    requestContext: {
+      runId: 'acme_run',
+      threadId: 'acme_thread',
+      resourceId: RESOURCE_ID,
+      'breakwater.auditContext': {
+        agentId: 'writer',
+        threadId: 'acme_thread',
+        resourceId: RESOURCE_ID,
+      },
+      ...(version === 'absent'
+        ? {}
+        : {
+            'flowsafe.runProvenance':
+              version === 'v1'
+                ? {
+                    version: 1,
+                    attemptToken: 'host-r1-legacy-leg',
+                    requestedBy: 'operator-1',
+                    requestedByKind: 'human',
+                    resumeCounts: [],
+                  }
+                : {
+                    version: 2,
+                    startToken: execution.startToken,
+                    attemptToken: recovery.token,
+                    requestedBy: 'operator-1',
+                    requestedByKind: 'human',
+                    resumeCounts: [],
+                    startIdentity: {
+                      owner: HUMAN_OWNER,
+                      target: {
+                        kind: 'agent',
+                        id: 'writer',
+                        threadId: 'acme_thread',
+                      },
+                    },
+                    agentStart: { threaded },
+                  },
+          }),
+      ...(input.lifecycle
+        ? {
+            'flowsafe.runLifecycle': {
+              version: 1,
+              revision: 2,
+              terminal: {
+                status: 'cancelled',
+                error: { code: 'CANCELLED', message: 'run was cancelled' },
+                transitionedAt: 10,
+                replayPrincipals: [HUMAN_OWNER],
+              },
+              scheduleDispatch: {
+                scheduleId: SCHEDULE_ID,
+                dispatchId: DISPATCH_ID,
+              },
+            },
+          }
+        : {}),
+    },
+  };
+  const persist = async (value = snapshot) =>
+    workflows.persistWorkflowSnapshot({
+      workflowName: execution.workflowId,
+      runId: execution.runId,
+      snapshot: value,
+    });
+  await persist();
+  const read = () =>
+    workflows.loadWorkflowSnapshot({
+      workflowName: execution.workflowId,
+      runId: execution.runId,
+    });
+  const owners = () =>
+    sql
+      .prepare(
+        'SELECT * FROM flowsafe_resource_owners ORDER BY resource_kind, resource_id',
+      )
+      .all();
+  return {
+    ...fixture,
+    storage,
+    app,
+    sql,
+    workflows,
+    resources,
+    reservations,
+    claim,
+    fence,
+    execution,
+    recovery,
+    snapshot,
+    persist,
+    read,
+    owners,
+    approvals,
+    dispatch,
+  };
+}
+
+function hostR1AgentRequest(suffix = '', query = '') {
+  return new Request(
+    `https://thread/_flowsafe/agent-host/runs/writer/acme_run${suffix}?resourceId=${RESOURCE_ID}${query}`,
+    suffix ? { method: 'POST' } : undefined,
+  );
+}
+
+describe('FS8 D3 host R1 agent legacy status guards', () => {
+  it.each([
+    ['missing binding', true, 404],
+    ['wrong binding', true, 404],
+    ['unthreaded binding', false, 404],
+    ['wrong record agent', true, 404],
+    ['missing principal', true, 409],
+  ] as const)('refuses before approval effects (%s)', async (guard, threaded, status) => {
+    const fixture = await hostR1AgentFixture({ threaded });
+    if (guard === 'missing binding') fixture.state.delete(THREAD_BINDING_KEY);
+    if (guard === 'wrong binding' || guard === 'unthreaded binding')
+      fixture.state.set(THREAD_BINDING_KEY, {
+        version: 1,
+        agentId: guard === 'wrong binding' ? 'foreign' : 'writer',
+        resourceId: RESOURCE_ID,
+      });
+    if (guard === 'wrong record agent')
+      fixture.state.set(TEST_RUN_RECORD_KEY, {
+        ...(fixture.state.get(TEST_RUN_RECORD_KEY) as object),
+        agentId: 'foreign',
+      });
+    if (guard === 'missing principal')
+      fixture.state.delete(TEST_RUN_RECORD_KEY);
+    const before = structuredClone(fixture.state);
+    const outcome = await fixture.host
+      .route(hostR1AgentRequest(), fixture.scope)
+      .catch((error: unknown) => error);
+    expect(fixture.approvals.list).not.toHaveBeenCalled();
+    expect(fixture.approvals.createAsPrincipal).not.toHaveBeenCalled();
+    expect(fixture.state).toEqual(before);
+    expect(outcome).toMatchObject({ status });
+  });
+
+  it.each([
+    'v1',
+    'absent',
+  ] as const)('retains raw pending with terminal projection (%s)', async (provenance) => {
+    const fixture = await hostR1AgentFixture({
+      provenance,
+      status: 'pending',
+      lifecycle: true,
+    });
+    const before = fixture.owners();
+    const outcome = await fixture.host
+      .blockingRun(fixture.scope)
+      .catch((error: unknown) => error);
+    expect(fixture.owners()).toEqual(before);
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(true);
+    expect(fixture.approvals.list).not.toHaveBeenCalled();
+    expect(fixture.dispatch).not.toHaveBeenCalled();
+    expect(outcome).toMatchObject({ runId: 'acme_run' });
+  });
+
+  it.each([
+    'malformed provenance',
+    'source error',
+  ] as const)('never falls back after actual selected read failure (%s)', async (failure) => {
+    const fixture = await hostR1AgentFixture();
+    if (failure === 'malformed provenance') {
+      fixture.snapshot.requestContext = {
+        ...fixture.snapshot.requestContext,
+        'flowsafe.runProvenance': { version: 2 },
+      };
+      await fixture.persist();
+    } else {
+      const domain = fixture.workflows as FencedWorkflowsStorageD1;
+      const native = domain[FENCED_WORKFLOW_STORAGE];
+      if (!native) throw new Error('missing capability');
+      Object.defineProperty(domain, FENCED_WORKFLOW_STORAGE, {
+        value: {
+          ...native,
+          readSnapshot: async () => {
+            throw new Error('actual source failed');
+          },
+        },
+        configurable: true,
+      });
+    }
+    const nominal = vi.spyOn(fixture.workflows, 'loadWorkflowSnapshot');
+    const before = structuredClone(fixture.state);
+    const outcome = await fixture.host
+      .route(hostR1AgentRequest(), fixture.scope)
+      .catch((error: unknown) => error);
+    expect(fixture.state).toEqual(before);
+    expect(fixture.approvals.list).not.toHaveBeenCalled();
+    expect(nominal).not.toHaveBeenCalled();
+    expect(outcome).toBeInstanceOf(RunStateUnreadableError);
+    expect(doErrorResponse(outcome).status).toBe(503);
+  });
+});
+
+describe('FS8 D3 host R1 agent recovery barriers', () => {
+  it.each([
+    ['custom-null', 'missing'],
+    ['custom-null', 'pending'],
+    ['custom-null', 'suspended'],
+    ['actual-prefix', 'missing'],
+    ['actual-prefix', 'pending'],
+    ['actual-prefix', 'suspended'],
+  ] as const)('retains keyed nonterminal authority before missing-store refusal (%s %s)', async (mode, status) => {
+    const fixture = await hostR1AgentFixture({
+      mode,
+      status: status === 'missing' ? 'pending' : status,
+      provenance: 'modern',
+      keyed: true,
+      wired: false,
+      journal: true,
+    });
+    if (status === 'missing')
+      await fixture.workflows.deleteWorkflowRunById({
+        workflowName: fixture.execution.workflowId,
+        runId: 'acme_run',
+      });
+    const before = fixture.owners();
+    const bound = await fixture.reservations.readForAdmission('host-r1-key');
+    const row = await fixture.read();
+    const b2 = vi.spyOn(fixture.app.runtime, 'recoverStartAttempt');
+    const settle = vi.spyOn(fixture.resources, 'settleReservation');
+    const outcome = await fixture.host
+      .recoverOwnership(fixture.scope)
+      .catch((error: unknown) => error);
+    expect(fixture.owners()).toEqual(before);
+    expect(settle).not.toHaveBeenCalled();
+    expect(fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toEqual(
+      fixture.recovery,
+    );
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(true);
+    expect(fixture.state.has(THREAD_BINDING_KEY)).toBe(true);
+    expect(await fixture.reservations.readForAdmission('host-r1-key')).toEqual(
+      bound,
+    );
+    expect(await fixture.read()).toEqual(row);
+    expect(fixture.alarmAt()).toBeDefined();
+    expect(b2).not.toHaveBeenCalled();
+    expect(outcome).toMatchObject({ status: 503 });
+  });
+
+  it.each([
+    ['custom-null', true],
+    ['custom-null', false],
+    ['actual-prefix', true],
+    ['actual-prefix', false],
+  ] as const)('finishes wired or unkeyed suspended recovery (%s keyed=%s)', async (mode, keyed) => {
+    const fixture = await hostR1AgentFixture({
+      mode,
+      provenance: 'modern',
+      keyed,
+      journal: true,
+      status: 'suspended',
+    });
+    const before = keyed
+      ? await fixture.reservations.readForAdmission('host-r1-key')
+      : undefined;
+    await fixture.host.recoverOwnership(fixture.scope);
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(true);
+    expect(await fixture.resources.owner('run', 'acme_run')).toEqual(
+      HUMAN_OWNER,
+    );
+    expect(
+      keyed
+        ? await fixture.reservations.readForAdmission('host-r1-key')
+        : undefined,
+    ).toEqual(before);
+    expect(mocked.stream).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'generation',
+    'phase',
+  ] as const)('preserves all H ownership when the journal changes inside actual absence read (%s)', async (change) => {
+    const fixture = await hostR1AgentFixture({
+      mode: 'fenced',
+      provenance: 'modern',
+      journal: true,
+    });
+    await fixture.workflows.deleteWorkflowRunById({
+      workflowName: fixture.execution.workflowId,
+      runId: 'acme_run',
+    });
+    const before = fixture.owners();
+    const record = structuredClone(fixture.state.get(TEST_RUN_RECORD_KEY));
+    const binding = structuredClone(fixture.state.get(THREAD_BINDING_KEY));
+    const replacement = structuredClone(fixture.recovery);
+    if (change === 'generation')
+      (replacement.execution as { startToken: string }).startToken =
+        'replacement-generation';
+    else replacement.phase = 'prepared-unfenced';
+    const domain = fixture.workflows as FencedWorkflowsStorageD1;
+    const native = domain[FENCED_WORKFLOW_STORAGE];
+    if (!native) throw new Error('missing capability');
+    const read = vi.fn(
+      async (...args: Parameters<typeof native.readSnapshot>) => {
+        const row = await native.readSnapshot(...args);
+        expect(row).toBeUndefined();
+        fixture.state.set(TEST_OWNER_RECOVERY_KEY, replacement);
+        return row;
+      },
+    );
+    Object.defineProperty(domain, FENCED_WORKFLOW_STORAGE, {
+      value: { ...native, readSnapshot: read },
+      configurable: true,
+    });
+    const outcome = await fixture.host
+      .recoverOwnership(fixture.scope)
+      .catch((error: unknown) => error);
+    expect(fixture.owners()).toEqual(before);
+    expect(fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toEqual(replacement);
+    expect(fixture.state.get(TEST_RUN_RECORD_KEY)).toEqual(record);
+    expect(fixture.state.get(THREAD_BINDING_KEY)).toEqual(binding);
+    expect(read).toHaveBeenCalledOnce();
+    expect(outcome).toBeInstanceOf(Error);
+  });
+
+  it.each([
+    ['approvals', 'failure'],
+    ['approvals', 'response loss'],
+    ['dispatch', 'failure'],
+    ['dispatch', 'response loss'],
+    ['run owner', 'failure'],
+    ['run owner', 'response loss'],
+    ['H bookkeeping', 'failure'],
+    ['H bookkeeping', 'response loss'],
+    ['completion', 'failure'],
+    ['completion', 'response loss'],
+  ] as const)('retains journal through ordered lifecycle retry (%s %s)', async (boundary, failureMode) => {
+    const fixture = await hostR1AgentFixture({
+      mode: 'fenced',
+      provenance: 'modern',
+      status: 'cancelled',
+      journal: true,
+      lifecycle: true,
+    });
+    fixture.sql
+      .prepare(
+        "UPDATE flowsafe_resource_owners SET reservation_token = NULL WHERE resource_kind = 'run' AND resource_id = 'acme_run'",
+      )
+      .run();
+    const failure = new Error('host lifecycle boundary failed');
+    const events: string[] = [];
+    let armed = true;
+    const enter = async <T>(
+      name: string,
+      action: () => Promise<T>,
+    ): Promise<T> => {
+      events.push(name);
+      if (armed && name === boundary && failureMode === 'failure')
+        throw failure;
+      const result = await action();
+      if (armed && name === boundary) throw failure;
+      return result;
+    };
+    let approval: ApprovalRecord = {
+      id: 'host-r1-approval',
+      workflowId: fixture.execution.workflowId,
+      runId: 'acme_run',
+      title: 'Held approval',
+      connectors: [],
+      priority: 'normal',
+      status: 'pending',
+      createdAt: '2026-09-08T00:00:00.000Z',
+      updatedAt: '2026-09-08T00:00:00.000Z',
+    };
+    fixture.approvals.list.mockImplementation(async () => [
+      structuredClone(approval),
+    ]);
+    fixture.approvals.supersedeStaleAsPrincipal.mockImplementation(() =>
+      enter('approvals', async () => {
+        approval = { ...approval, status: 'rejected' };
+        return approval;
+      }),
+    );
+    fixture.dispatch.mockImplementation(() =>
+      enter('dispatch', async () => {}),
+    );
+    const release = fixture.resources.release.bind(fixture.resources);
+    vi.spyOn(fixture.resources, 'release').mockImplementation((...args) =>
+      enter('run owner', () => release(...args)),
+    );
+    const settle = fixture.resources.settleReservation.bind(fixture.resources);
+    vi.spyOn(fixture.resources, 'settleReservation').mockImplementation(
+      (...args) => enter('H bookkeeping', () => settle(...args)),
+    );
+    const complete = fixture.app.runtime.completeTerminalCleanup.bind(
+      fixture.app.runtime,
+    );
+    vi.spyOn(fixture.app.runtime, 'completeTerminalCleanup').mockImplementation(
+      (...args) => enter('completion', () => complete(...args)),
+    );
+    const order = [
+      'H bookkeeping',
+      'approvals',
+      'dispatch',
+      'run owner',
+      'completion',
+    ];
+    const outcome = await fixture.host
+      .recoverOwnership(fixture.scope)
+      .catch((error: unknown) => error);
+    const reached = order.indexOf(boundary);
+    expect(approval.status).toBe(
+      boundary === 'H bookkeeping' ||
+        (boundary === 'approvals' && failureMode === 'failure')
+        ? 'pending'
+        : 'rejected',
+    );
+    expect(events, String(outcome)).toEqual(order.slice(0, reached + 1));
+    expect(fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toEqual(
+      fixture.recovery,
+    );
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(
+      boundary !== 'completion',
+    );
+    expect(await fixture.resources.owner('run', 'acme_run')).toEqual(
+      reached < order.indexOf('run owner') ||
+        (boundary === 'run owner' && failureMode === 'failure')
+        ? HUMAN_OWNER
+        : undefined,
+    );
+    expect(fixture.alarmAt()).toBeDefined();
+    expect(outcome).toBe(failure);
+    armed = false;
+    events.length = 0;
+    await fixture.host.recoverOwnership(fixture.scope);
+    expect(events).toEqual(
+      boundary === 'completion' && failureMode === 'response loss'
+        ? ['H bookkeeping']
+        : boundary === 'H bookkeeping' ||
+            (boundary === 'approvals' && failureMode === 'failure')
+          ? order
+          : order.filter((step) => step !== 'approvals'),
+    );
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+    expect(await fixture.resources.owner('run', 'acme_run')).toBeUndefined();
+    expect(await fixture.read()).toMatchObject({
+      requestContext: {
+        'flowsafe.runLifecycle': {
+          terminal: { cleanupCompletedAt: expect.any(Number) },
+        },
+      },
+    });
+    expect(mocked.stream).not.toHaveBeenCalled();
+  });
+});
+
+describe('FS8 D3 host R1 atomic agent admission', () => {
+  it('admits one different run ID on a prebound thread with committed same-owner claims', async () => {
+    const fixture = harness();
+    fixture.state.set(THREAD_BINDING_KEY, {
+      version: 1,
+      agentId: 'writer',
+      resourceId: RESOURCE_ID,
+    });
+    await fixture.resources.claim('thread', 'acme_thread', HUMAN_OWNER);
+    await fixture.resources.claim('resource', RESOURCE_ID, HUMAN_OWNER);
+    fixture.setSummary({ runId: 'acme_run', status: 'suspended' }, false);
+    const release = cDeferred();
+    mocked.stream.mockImplementation(async () => {
+      await release.promise;
+      return {};
+    });
+    const first = fixture.host.start(fixture.scope, C_START_INPUT);
+    const second = fixture.host.start(fixture.scope, {
+      ...C_START_INPUT,
+      runId: 'other-run',
+    });
+    const settled = Promise.allSettled([first, second]);
+    try {
+      await vi.waitFor(() => expect(mocked.stream).toHaveBeenCalled());
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      expect(mocked.stream).toHaveBeenCalledOnce();
+      expect(
+        [...fixture.state.keys()].filter((key) =>
+          key.startsWith(RUN_RECORD_PREFIX),
+        ),
+      ).toHaveLength(1);
+    } finally {
+      release.resolve();
+    }
+    const results = await settled;
+    expect(
+      results.filter((result) => result.status === 'fulfilled'),
+    ).toHaveLength(1);
+    expect(
+      results.filter((result) => result.status === 'rejected'),
+    ).toHaveLength(1);
+  });
+});
+
+describe('FS8 D3 host R1 ordinary legacy agent lifecycle', () => {
+  it.each([
+    ['v1', true],
+    ['v1', false],
+    ['absent', true],
+    ['absent', false],
+  ] as const)('terminates and replays the actual selected legacy row without settling retained key (%s threaded=%s)', async (provenance, threaded) => {
+    const fixture = await hostR1AgentFixture({
+      provenance,
+      threaded,
+      keyed: true,
+    });
+    const bound = await fixture.reservations.readForAdmission('host-r1-key');
+    const settle = vi.spyOn(fixture.app.runtime, 'settleStartExecution');
+    const b2 = vi.spyOn(fixture.app.runtime, 'recoverStartAttempt');
+    const complete = vi.spyOn(fixture.app.runtime, 'completeTerminalCleanup');
+    const terminate = vi.spyOn(fixture.app.runtime, 'terminateAsPrincipal');
+    const response = await fixture.host
+      .route(hostR1AgentRequest('/terminate'), fixture.scope)
+      .catch((error: unknown) => error);
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+    expect(await fixture.resources.owner('run', 'acme_run')).toBeUndefined();
+    expect(await fixture.reservations.readForAdmission('host-r1-key')).toEqual(
+      bound,
+    );
+    expect(settle).not.toHaveBeenCalled();
+    expect(b2).not.toHaveBeenCalled();
+    expect(complete).toHaveBeenCalledOnce();
+    expect(response).toMatchObject({ status: 200 });
+    const bytes = JSON.stringify(await fixture.read());
+    const replay = await fixture.host
+      .route(hostR1AgentRequest('/terminate', '&replay=1'), fixture.scope)
+      .catch((error: unknown) => error);
+    expect(JSON.stringify(await fixture.read())).toBe(bytes);
+    expect(await fixture.reservations.readForAdmission('host-r1-key')).toEqual(
+      bound,
+    );
+    expect(complete).toHaveBeenCalledOnce();
+    expect(terminate).toHaveBeenCalledTimes(2);
+    expect(replay).toMatchObject({ status: 200 });
+    expect(mocked.stream).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['v1', true],
+    ['v1', false],
+    ['absent', true],
+    ['absent', false],
+  ] as const)('retires terminal resume using canonical principal and actual owner despite changed requester (%s threaded=%s)', async (provenance, threaded) => {
+    const fixture = await hostR1AgentFixture({ provenance, threaded });
+    const { FlowsafeDurableAgent } = await import(
+      '../agent-runner/durable-agent-runner.js'
+    );
+    const resume = vi
+      .spyOn(FlowsafeDurableAgent.prototype, 'resumeViaRuntime')
+      .mockImplementation(async () => {
+        fixture.snapshot.status = 'success';
+        fixture.snapshot.result = { result: 'resumed' };
+        if (provenance === 'v1')
+          fixture.snapshot.requestContext = {
+            ...fixture.snapshot.requestContext,
+            'flowsafe.runProvenance': {
+              version: 1,
+              attemptToken: 'host-r1-legacy-leg',
+              requestedBy: 'reviewer-2',
+              requestedByKind: 'human',
+              resumeCounts: [],
+            },
+          };
+        await fixture.persist();
+        return {
+          runId: 'acme_run',
+          status: 'success',
+          result: fixture.snapshot.result,
+          requestedBy: provenance === 'v1' ? 'reviewer-2' : undefined,
+        };
+      });
+    const settle = vi.spyOn(fixture.app.runtime, 'settleStartExecution');
+    try {
+      const response = await fixture.host
+        .route(
+          new Request('https://thread/_flowsafe/agent-host/resume', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              agentId: 'writer',
+              threadId: 'acme_thread',
+              resourceId: RESOURCE_ID,
+              runId: 'acme_run',
+              requestedBy: 'reviewer-2',
+              entryPath: 'approval.resume',
+              resumeData: {},
+            }),
+          }),
+          fixture.scope,
+        )
+        .catch((error: unknown) => error);
+      expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+      expect(await fixture.resources.owner('run', 'acme_run')).toEqual(
+        HUMAN_OWNER,
+      );
+      expect(settle).not.toHaveBeenCalled();
+      expect(resume).toHaveBeenCalledOnce();
+      expect(response).toMatchObject({ status: 200 });
+      const bytes = JSON.stringify(await fixture.read());
+      await expect(
+        fixture.host.blockingRun(fixture.scope),
+      ).resolves.toBeUndefined();
+      expect(JSON.stringify(await fixture.read())).toBe(bytes);
+      expect(resume).toHaveBeenCalledOnce();
+    } finally {
+      resume.mockRestore();
+    }
+  });
+
+  it.each([
+    ['v1', 'blocker', 'success'],
+    ['absent', 'blocker', 'success'],
+    ['v1', 'blocker', 'suspended'],
+    ['absent', 'blocker', 'suspended'],
+    ['v1', 'dispatch', 'success'],
+    ['absent', 'dispatch', 'success'],
+    ['v1', 'status', 'success'],
+    ['absent', 'status', 'success'],
+    ['v1', 'protected dispatch', 'success'],
+    ['absent', 'protected dispatch', 'success'],
+  ] as const)('selects cold actual legacy state (%s %s %s)', async (provenance, path, status) => {
+    const fixture = await hostR1AgentFixture({
+      provenance,
+      status,
+      keyed: true,
+    });
+    const bytes = JSON.stringify(await fixture.read());
+    const bound = await fixture.reservations.readForAdmission('host-r1-key');
+    expect(fixture.app.runtime.workflowIds()).toEqual([]);
+    const operation = (async () => {
+      if (path === 'blocker') return fixture.host.blockingRun(fixture.scope);
+      if (path === 'dispatch')
+        return fixture.host.scheduleDispatchStatus(fixture.scope, {
+          agentId: 'writer',
+          resourceId: RESOURCE_ID,
+          runId: 'acme_run',
+        });
+      return fixture.host.route(
+        hostR1AgentRequest(
+          '',
+          path === 'protected dispatch' ? '&dispatch=1' : '',
+        ),
+        fixture.scope,
+      );
+    })();
+    const outcome = await operation.catch((error: unknown) => error);
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(status === 'suspended');
+    expect(JSON.stringify(await fixture.read())).toBe(bytes);
+    expect(await fixture.reservations.readForAdmission('host-r1-key')).toEqual(
+      bound,
+    );
+    expect(fixture.app.runtime.workflowIds()).toContain('durable-agentic-loop');
+    expect(mocked.stream).not.toHaveBeenCalled();
+    if (path === 'blocker')
+      expect(outcome).toEqual(
+        status === 'suspended'
+          ? expect.objectContaining({ runId: 'acme_run' })
+          : undefined,
+      );
+    else if (path === 'dispatch')
+      expect(outcome).toMatchObject({ runId: 'acme_run', status });
+    else expect(outcome).toMatchObject({ status: 200 });
+  });
+
+  it.each([
+    'v1',
+    'absent',
+  ] as const)('retries legacy hook failure without repeated engine execution (%s)', async (provenance) => {
+    const fixture = await hostR1AgentFixture({ provenance });
+    const failure = new Error('approval observation failed');
+    fixture.approvals.list.mockRejectedValueOnce(failure);
+    const complete = vi.spyOn(fixture.app.runtime, 'completeTerminalCleanup');
+    const result = await fixture.host
+      .route(hostR1AgentRequest('/terminate'), fixture.scope)
+      .catch((error: unknown) => error);
+    expect(await fixture.resources.owner('run', 'acme_run')).toEqual(
+      HUMAN_OWNER,
+    );
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(true);
+    expect(complete).not.toHaveBeenCalled();
+    expect(result).toBe(failure);
+    const retry = await fixture.host.route(
+      hostR1AgentRequest('/terminate', '&replay=1'),
+      fixture.scope,
+    );
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+    expect(await fixture.resources.owner('run', 'acme_run')).toBeUndefined();
+    expect(complete).toHaveBeenCalledOnce();
+    expect(retry?.status).toBe(200);
+    expect(mocked.stream).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'old journal',
+    'modern journal',
+    'malformed journal',
+    'active execution',
+  ] as const)('retains legacy terminal bookkeeping without cleanup authority (%s)', async (condition) => {
+    const fixture = await hostR1AgentFixture({
+      provenance: 'absent',
+      status: 'cancelled',
+      lifecycle: true,
+    });
+    if (condition === 'old journal')
+      fixture.state.set(TEST_OWNER_RECOVERY_KEY, { version: 1 });
+    if (condition === 'modern journal')
+      fixture.state.set(TEST_OWNER_RECOVERY_KEY, fixture.recovery);
+    if (condition === 'malformed journal')
+      fixture.state.set(TEST_OWNER_RECOVERY_KEY, null);
+    if (condition === 'active execution')
+      vi.spyOn(fixture.app.runtime, 'isRunActive').mockReturnValue(true);
+    const state = structuredClone(fixture.state);
+    const before = fixture.owners();
+    const outcome = await fixture.host
+      .blockingRun(fixture.scope)
+      .catch((error: unknown) => error);
+    expect(fixture.owners()).toEqual(before);
+    expect(fixture.state).toEqual(state);
+    expect(fixture.approvals.list).not.toHaveBeenCalled();
+    expect(fixture.dispatch).not.toHaveBeenCalled();
+    expect(outcome).toBeDefined();
+  });
+
+  it.each([
+    'record',
+    'binding',
+    'journal',
+  ] as const)('preserves replacement after legacy cleanup observation waits (%s)', async (replacement) => {
+    const fixture = await hostR1AgentFixture({
+      status: 'cancelled',
+      lifecycle: true,
+    });
+    const native = fixture.app.runtime.authoritativeStartState.bind(
+      fixture.app.runtime,
+    );
+    async function replaceDuringRead(
+      workflowId: string,
+      runId: string,
+      options: { readonly includeLegacy: true },
+    ): Promise<
+      | import('../do-runner/runtime.js').AuthoritativeStartState
+      | import('../do-runner/runtime.js').LegacyRunState
+      | null
+    >;
+    async function replaceDuringRead(
+      workflowId: string,
+      runId: string,
+    ): Promise<
+      import('../do-runner/runtime.js').AuthoritativeStartState | null
+    >;
+    async function replaceDuringRead(
+      workflowId: string,
+      runId: string,
+      options?: { readonly includeLegacy: true },
+    ): Promise<
+      | import('../do-runner/runtime.js').AuthoritativeStartState
+      | import('../do-runner/runtime.js').LegacyRunState
+      | null
+    > {
+      const selected = options
+        ? await native(workflowId, runId, options)
+        : await native(workflowId, runId);
+      if (replacement === 'record')
+        fixture.state.set(TEST_RUN_RECORD_KEY, {
+          ...(fixture.state.get(TEST_RUN_RECORD_KEY) as object),
+          principal: { ...fixture.scope.principal, role: 'admin' },
+        });
+      if (replacement === 'binding')
+        fixture.state.set(THREAD_BINDING_KEY, {
+          version: 1,
+          agentId: 'foreign',
+          resourceId: RESOURCE_ID,
+        });
+      if (replacement === 'journal')
+        fixture.state.set(TEST_OWNER_RECOVERY_KEY, { version: 1 });
+      return selected;
+    }
+    vi.spyOn(fixture.app.runtime, 'authoritativeStartState').mockImplementation(
+      replaceDuringRead,
+    );
+    const before = fixture.owners();
+    const outcome = await fixture.host
+      .blockingRun(fixture.scope)
+      .catch((error: unknown) => error);
+    expect(fixture.owners()).toEqual(before);
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(true);
+    expect(fixture.approvals.list).not.toHaveBeenCalled();
+    expect(fixture.dispatch).not.toHaveBeenCalled();
+    expect(outcome).toBeDefined();
+  });
+});
+
+describe('FS8 D3 host R1 reserved lifecycle owner', () => {
+  it('preserves the replacement journal before lifecycle effects after H settlement', async () => {
+    const fixture = await hostR1AgentFixture({
+      mode: 'fenced',
+      provenance: 'modern',
+      status: 'cancelled',
+      journal: true,
+      lifecycle: true,
+    });
+    const replacement = structuredClone(fixture.recovery);
+    (replacement.execution as { startToken: string }).startToken =
+      'replacement-after-settlement';
+    const native = fixture.resources.settleReservation.bind(fixture.resources);
+    vi.spyOn(fixture.resources, 'settleReservation').mockImplementation(
+      async (...args) => {
+        await native(...args);
+        fixture.state.set(TEST_OWNER_RECOVERY_KEY, replacement);
+      },
+    );
+    const release = vi.spyOn(fixture.resources, 'release');
+    const complete = vi.spyOn(fixture.app.runtime, 'completeTerminalCleanup');
+    const outcome = await fixture.host
+      .recoverOwnership(fixture.scope)
+      .catch((error: unknown) => error);
+    expect(fixture.approvals.list).not.toHaveBeenCalled();
+    expect(fixture.dispatch).not.toHaveBeenCalled();
+    expect(release).not.toHaveBeenCalled();
+    expect(complete).not.toHaveBeenCalled();
+    expect(fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toEqual(replacement);
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(true);
+    expect(await fixture.resources.owner('run', 'acme_run')).toEqual(
+      HUMAN_OWNER,
+    );
+    expect(outcome).toBeInstanceOf(Error);
+  });
+
+  it.each([
+    true,
+    false,
+  ])('retires the H-reserved run owner before journal lifecycle completion (threaded=%s)', async (threaded) => {
+    const fixture = await hostR1AgentFixture({
+      mode: 'fenced',
+      threaded,
+      provenance: 'modern',
+      status: 'cancelled',
+      journal: true,
+      lifecycle: true,
+    });
+    await fixture.host.recoverOwnership(fixture.scope);
+    expect(
+      fixture.sql
+        .prepare(
+          "SELECT * FROM flowsafe_resource_owners WHERE resource_kind = 'run'",
+        )
+        .all(),
+    ).toEqual([]);
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+    expect(await fixture.read()).toMatchObject({
+      requestContext: {
+        'flowsafe.runLifecycle': {
+          terminal: { cleanupCompletedAt: expect.any(Number) },
+        },
+      },
+    });
+  });
+});
+
+describe('FS8 D3 host R1 keyed finalization preflight', () => {
+  it.each([
+    true,
+    false,
+  ])('retains the prepared nonterminal start when the reservation store disappears at the bridge (threaded=%s)', async (threaded) => {
+    const { StartIdempotencyStore } = await import(
+      '../do-runner/start-idempotency.js'
+    );
+    const reservations = new StartIdempotencyStore(
+      sqliteUnitDatabase(
+        openSqlite(),
+      ) as import('../do-runner/start-idempotency.js').StartIdempotencyDatabase,
+    );
+    const reserved = await reservations.reserve({
+      key: 'finalizer-key',
+      owner: HUMAN_OWNER,
+      targetKind: 'agent',
+      targetId: 'writer',
+      threadId: 'acme_thread',
+      mintRunId: () => 'acme_run',
+    });
+    const claim = await reservations.claimReservation(reserved.reservation);
+    if (!claim) throw new Error('missing finalizer claim');
+    const fixture = harness(['writer'], {
+      runtime: { startIdempotency: reservations },
+    });
+    fixture.setSummary(
+      {
+        runId: 'acme_run',
+        status: 'suspended',
+        requestedBy: 'operator-1',
+        requestedByKind: 'human',
+      },
+      false,
+    );
+    mocked.stream.mockImplementation(async () => {
+      Object.defineProperty(fixture.scope.init.runtime, 'startIdempotency', {
+        value: undefined,
+        configurable: true,
+      });
+      return {};
+    });
+    const settle = vi.spyOn(fixture.resources, 'settleReservation');
+    const outcome = await fixture.host
+      .start(fixture.scope, {
+        ...C_START_INPUT,
+        threaded,
+        idempotencyKey: claim.key,
+        startReservation: claim,
+      })
+      .catch((error: unknown) => error);
+    expect(settle).not.toHaveBeenCalled();
+    expect(fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toMatchObject({
+      phase: 'prepared-unfenced',
+      startReservation: claim,
+    });
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(true);
+    expect(fixture.alarmAt()).toBeDefined();
+    expect(await reservations.readForAdmission(claim.key)).toEqual(claim);
+    expect(outcome).toMatchObject({ status: 503 });
+  });
+});
+
+describe('FS8 D3 host R1 legacy requester and source owner', () => {
+  it('releases the actual owner while retiring the captured canonical record after a v1 requester change', async () => {
+    const fixture = await hostR1AgentFixture({ provenance: 'v1' });
+    fixture.snapshot.requestContext = {
+      ...fixture.snapshot.requestContext,
+      'flowsafe.runProvenance': {
+        version: 1,
+        attemptToken: 'resumed-legacy-leg',
+        requestedBy: 'reviewer-3',
+        requestedByKind: 'human',
+        resumeCounts: [],
+      },
+    };
+    await fixture.persist();
+    const owner = { kind: 'human' as const, id: 'source-owner' };
+    await fixture.resources.release('run', 'acme_run', HUMAN_OWNER);
+    await fixture.resources.claim('run', 'acme_run', owner);
+    const release = vi.spyOn(fixture.resources, 'release');
+    const response = await fixture.host.route(
+      hostR1AgentRequest('/terminate'),
+      { ...fixture.scope, principal: { ...owner, role: 'operator' } },
+    );
+    expect(await fixture.resources.owner('run', 'acme_run')).toBeUndefined();
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+    expect(release).toHaveBeenCalledWith('run', 'acme_run', owner);
+    expect(response?.status).toBe(200);
+  });
+});
+
+describe('FS8 D3 host R1 legacy cleanup wait guards', () => {
+  it.each([
+    'dispatch',
+    'owner release',
+    'completion',
+  ] as const)('retains the canonical record when a journal appears during legacy %s', async (boundary) => {
+    const fixture = await hostR1AgentFixture({
+      provenance: 'absent',
+      status: 'cancelled',
+      lifecycle: true,
+    });
+    const record = structuredClone(fixture.state.get(TEST_RUN_RECORD_KEY));
+    const journal = { version: 1 };
+    const replace = () => fixture.state.set(TEST_OWNER_RECOVERY_KEY, journal);
+    fixture.dispatch.mockImplementation(async () => {
+      if (boundary === 'dispatch') replace();
+    });
+    const nativeRelease = fixture.resources.release.bind(fixture.resources);
+    const release = vi
+      .spyOn(fixture.resources, 'release')
+      .mockImplementation(async (...args) => {
+        const result = await nativeRelease(...args);
+        if (boundary === 'owner release') replace();
+        return result;
+      });
+    const nativeComplete = fixture.app.runtime.completeTerminalCleanup.bind(
+      fixture.app.runtime,
+    );
+    const complete = vi
+      .spyOn(fixture.app.runtime, 'completeTerminalCleanup')
+      .mockImplementation(async (...args) => {
+        const result = await nativeComplete(...args);
+        if (boundary === 'completion') replace();
+        return result;
+      });
+    const outcome = await fixture.host
+      .route(hostR1AgentRequest('/terminate'), fixture.scope)
+      .catch((error: unknown) => error);
+    expect(fixture.state.get(TEST_RUN_RECORD_KEY)).toEqual(record);
+    expect(fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toEqual(journal);
+    expect(await fixture.resources.owner('run', 'acme_run')).toEqual(
+      boundary === 'dispatch' ? HUMAN_OWNER : undefined,
+    );
+    expect(fixture.dispatch).toHaveBeenCalledOnce();
+    expect(release).toHaveBeenCalledTimes(boundary === 'dispatch' ? 0 : 1);
+    expect(complete).toHaveBeenCalledTimes(boundary === 'completion' ? 1 : 0);
+    expect(outcome).toBeInstanceOf(Error);
+    expect(doErrorResponse(outcome).status).toBe(503);
+  });
+
+  it.each([
+    'journal',
+    'record',
+    'binding',
+    'active execution',
+  ] as const)('preserves ownership after approval wait changes cleanup authority (%s)', async (change) => {
+    const fixture = await hostR1AgentFixture({ provenance: 'absent' });
+    let replacement: unknown;
+    fixture.approvals.list.mockImplementationOnce(async () => {
+      if (change === 'journal') {
+        replacement = { version: 1 };
+        fixture.state.set(TEST_OWNER_RECOVERY_KEY, replacement);
+      }
+      if (change === 'record') {
+        replacement = {
+          ...(fixture.state.get(TEST_RUN_RECORD_KEY) as object),
+          principal: { ...fixture.scope.principal, role: 'admin' },
+        };
+        fixture.state.set(TEST_RUN_RECORD_KEY, replacement);
+      }
+      if (change === 'binding') {
+        replacement = {
+          version: 1,
+          agentId: 'foreign',
+          resourceId: RESOURCE_ID,
+        };
+        fixture.state.set(THREAD_BINDING_KEY, replacement);
+      }
+      if (change === 'active execution')
+        vi.spyOn(fixture.app.runtime, 'isRunActive').mockReturnValue(true);
+      return [];
+    });
+    const release = vi.spyOn(fixture.resources, 'release');
+    const complete = vi.spyOn(fixture.app.runtime, 'completeTerminalCleanup');
+    const outcome = await fixture.host
+      .route(hostR1AgentRequest('/terminate'), fixture.scope)
+      .catch((error: unknown) => error);
+    expect(await fixture.resources.owner('run', 'acme_run')).toEqual(
+      HUMAN_OWNER,
+    );
+    expect(release).not.toHaveBeenCalled();
+    expect(complete).not.toHaveBeenCalled();
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(true);
+    if (change === 'journal')
+      expect(fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toEqual(replacement);
+    if (change === 'record')
+      expect(fixture.state.get(TEST_RUN_RECORD_KEY)).toEqual(replacement);
+    if (change === 'binding')
+      expect(fixture.state.get(THREAD_BINDING_KEY)).toEqual(replacement);
+    expect(fixture.approvals.list).toHaveBeenCalledOnce();
+    expect(outcome).toBeInstanceOf(Error);
   });
 });

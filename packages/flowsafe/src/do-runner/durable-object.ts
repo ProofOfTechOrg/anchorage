@@ -28,12 +28,19 @@ import {
 } from './deployment-identity.js';
 import { DoStatusError, doErrorResponse } from './do-error-response.js';
 import {
+  type D1RunExecutionIdentity,
+  ExecutionFenceUnreadableError,
+  isRunStartPendingError,
   MUTATION_EPOCH_HEADER,
   mutationEpochFromHeader,
+  normalizeD1RunExecutionIdentity,
+  normalizeRunExecutionIdentity,
+  normalizeStartExecutionIdentity,
   normalizeStartIdentity,
+  type RunExecutionIdentity,
+  RunStartPendingError,
 } from './execution-admission.js';
 import {
-  admitsExistingRun,
   admitsRunStart,
   ExecutionFencedError,
   type ExecutionFenceReading,
@@ -41,9 +48,17 @@ import {
   readExecutionFence,
 } from './execution-fence.js';
 import { EXECUTION_PRINCIPAL_HEADER } from './execution-principal-header.js';
+import { isDefinitiveInitialAdmissionRefusal } from './initial-admission-refusal.js';
 import { isPathSafeId } from './path-safe-id.js';
 import {
+  lifecycleFromRequestContext,
+  terminalCleanupFor,
+} from './run-lifecycle.js';
+import { isTerminalRunStatus } from './run-terminal-state.js';
+import {
+  type AuthoritativeStartState,
   InvalidRunRequestError,
+  type RecoveredStart,
   RunAlreadyExistsError,
   type RunLifecycleCas,
   type RunLifecycleTransitionResult,
@@ -57,6 +72,11 @@ import {
   type ScheduleSourceStore,
   type ScheduleSourceWorkflowTarget,
 } from './schedule-source.js';
+import {
+  captureReservation,
+  type StartReservationReading,
+  sameReservationIdentity,
+} from './start-reservation-contract.js';
 import {
   dueSuspensionDeadline,
   isReadableRunSummary,
@@ -150,14 +170,68 @@ const SUSPENSION_DEADLINE_UNREADABLE_LIMIT_MS = 86_400_000;
 // lasts.
 const SUSPENSION_DEADLINE_ARM_FLOOR_MS = 1_000;
 
-interface RunOwnerRecovery {
-  version: 1;
+type RunOwnerRecovery = {
+  version: 2;
   workflowId: string;
   runId: string;
   token: string;
+  owner: DurableObjectRunOwner;
+  startReservation?: StartReservationReading;
+} & (
+  | { phase: 'preparing'; execution?: never }
+  | { phase: 'prepared'; execution: D1RunExecutionIdentity }
+  | { phase: 'prepared-unfenced'; execution: RunExecutionIdentity }
+);
+
+interface RunStartFrame {
+  token: string;
+  unwound: boolean;
+}
+
+function recoveryObject(value: unknown): Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value))
+    throw new Error('stored run owner recovery is malformed');
+  const copy: Record<string, unknown> = Object.create(null);
+  for (const [key, descriptor] of Object.entries(
+    Object.getOwnPropertyDescriptors(value),
+  )) {
+    if (!('value' in descriptor))
+      throw new Error('stored run owner recovery is malformed');
+    copy[key] = descriptor.value;
+  }
+  return copy;
+}
+
+function sameRunRecovery(
+  actual: RunOwnerRecovery,
+  expected: RunOwnerRecovery,
+): boolean {
+  const claim = actual.startReservation;
+  const wantedClaim = expected.startReservation;
+  return (
+    actual.version === expected.version &&
+    actual.phase === expected.phase &&
+    actual.token === expected.token &&
+    actual.workflowId === expected.workflowId &&
+    actual.runId === expected.runId &&
+    actual.owner.kind === expected.owner.kind &&
+    actual.owner.id === expected.owner.id &&
+    actual.execution?.tablePrefix === expected.execution?.tablePrefix &&
+    actual.execution?.workflowId === expected.execution?.workflowId &&
+    actual.execution?.runId === expected.execution?.runId &&
+    actual.execution?.startToken === expected.execution?.startToken &&
+    (claim === undefined
+      ? wantedClaim === undefined
+      : wantedClaim !== undefined &&
+        sameReservationIdentity(claim, wantedClaim) &&
+        claim.state === wantedClaim.state &&
+        claim.updatedAt === wantedClaim.updatedAt &&
+        claim.binding.kind === wantedClaim.binding.kind)
+  );
 }
 
 interface StartBody {
+  startReservation?: unknown;
   workflowId?: string;
   runId?: string;
   inputData?: unknown;
@@ -260,7 +334,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
    * after an eviction is no. Anything written to storage would survive the
    * isolate that wrote it and keep saying yes.
    */
-  readonly #startsInFlight = new Set<string>();
+  readonly #startsInFlight = new Map<string, RunStartFrame>();
 
   constructor(state: DurableObjectRunnerState | undefined, env: TEnv) {
     this.state = state;
@@ -433,13 +507,100 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     runId: string,
     owner: DurableObjectRunOwner,
     result: RunLifecycleTransitionResult,
+    selected?: AuthoritativeStartState,
+    originalClaim?: StartReservationReading,
   ): Promise<RunSummary> {
+    const claim =
+      originalClaim === undefined
+        ? undefined
+        : captureReservation(originalClaim, 'started');
+    const assertQuiescent = (): void => {
+      if (
+        this.#startsInFlight.has(this.#inFlightKey(workflowId, runId)) ||
+        runtime.isRunActive(workflowId, runId)
+      )
+        throw new RunStartPendingError();
+    };
+    assertQuiescent();
+    const state =
+      selected ??
+      (await runtime.authoritativeStartState(workflowId, runId, {
+        includeLegacy: true,
+      }));
+    if (
+      !state ||
+      state.kind === 'initial' ||
+      !isTerminalRunStatus(state.snapshot.status) ||
+      !isTerminalRunStatus(state.summary.status)
+    )
+      throw new RunStateUnreadableError(workflowId, runId);
+    const cleanup = terminalCleanupFor(
+      lifecycleFromRequestContext(state.snapshot.requestContext),
+    );
+    if (
+      !cleanup ||
+      state.summary.runId !== result.summary.runId ||
+      state.summary.status !== result.summary.status ||
+      cleanup.status !== result.cleanup.status ||
+      cleanup.revision !== result.cleanup.revision ||
+      cleanup.scheduleDispatch?.scheduleId !==
+        result.cleanup.scheduleDispatch?.scheduleId ||
+      cleanup.scheduleDispatch?.dispatchId !==
+        result.cleanup.scheduleDispatch?.dispatchId ||
+      (result.cleanup.cleanupCompleted && !cleanup.cleanupCompleted)
+    )
+      throw new RunStateUnreadableError(workflowId, runId);
+    const stored = await this.state?.storage?.get(RUN_OWNER_RECOVERY_KEY);
+    assertQuiescent();
+    if (state.kind === 'legacy') {
+      if (stored !== undefined || claim !== undefined)
+        throw new RunStateUnreadableError(workflowId, runId);
+    } else if (stored !== undefined) {
+      const recovery = this.#runOwnerRecovery(stored);
+      this.#assertRunIdentity(recovery.workflowId, recovery.runId);
+      if (
+        claim &&
+        !sameRunRecovery(recovery, { ...recovery, startReservation: claim })
+      )
+        throw new RunStateUnreadableError(workflowId, runId);
+      return this.#finishRunOwner(recovery, state.summary, state);
+    } else {
+      await runtime.settleStartExecution(state, claim);
+    }
+    const assertNoJournal = async (): Promise<void> => {
+      assertQuiescent();
+      if (
+        (await this.state?.storage?.get(RUN_OWNER_RECOVERY_KEY)) !== undefined
+      )
+        throw new RunStateUnreadableError(workflowId, runId);
+      assertQuiescent();
+    };
+    return this.#completeTerminalEffects(
+      runtime,
+      workflowId,
+      runId,
+      owner,
+      { ...result, summary: state.summary, cleanup },
+      assertNoJournal,
+    );
+  }
+
+  async #completeTerminalEffects(
+    runtime: RunnerRuntime,
+    workflowId: string,
+    runId: string,
+    owner: DurableObjectRunOwner,
+    result: RunLifecycleTransitionResult,
+    validate?: () => Promise<void>,
+  ): Promise<RunSummary> {
+    if (validate) await validate();
     if (result.cleanup.cleanupCompleted) return result.summary;
     const hooks = this.runLifecycle(this.env);
     if (!hooks) {
       throw new Error('run termination requires lifecycle cleanup hooks');
     }
     await hooks.abandonApprovals(workflowId, runId, result.cleanup.status);
+    if (validate) await validate();
     if (result.cleanup.scheduleDispatch) {
       if (!hooks?.discardScheduleDispatch) {
         throw new Error(
@@ -451,23 +612,28 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         result.cleanup.scheduleDispatch.dispatchId,
         runId,
       );
+      if (validate) await validate();
     }
     const ownership = this.runOwnership(this.env);
     if (!ownership.release) {
       throw new Error('run termination requires ownership release support');
     }
     const released = await ownership.release('run', runId, owner);
+    if (validate) await validate();
     if (!released) {
       const current = await ownership.owner('run', runId);
+      if (validate) await validate();
       if (current) {
         throw new Error(`run '${runId}' ownership could not be released`);
       }
     }
-    return runtime.completeTerminalCleanup(
+    const summary = await runtime.completeTerminalCleanup(
       workflowId,
       runId,
       result.cleanup.revision,
     );
+    if (validate) await validate();
+    return summary;
   }
 
   async #startSource(
@@ -645,9 +811,24 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
    * journal and DELETE it. Keeping the recovery cadence instead costs one
    * spurious wake and cannot lose a deadline.
    */
-  async #clearRunOwnerRecovery(keepWake: boolean): Promise<void> {
+  async #assertRunOwnerRecoveryCurrent(
+    recovery: RunOwnerRecovery,
+  ): Promise<void> {
+    const current = await this.state?.storage?.get(RUN_OWNER_RECOVERY_KEY);
+    if (
+      current === undefined ||
+      !sameRunRecovery(this.#runOwnerRecovery(current), recovery)
+    )
+      throw new Error('run owner recovery changed');
+  }
+
+  async #clearRunOwnerRecovery(
+    recovery: RunOwnerRecovery,
+    keepWake: boolean,
+  ): Promise<void> {
     const storage = this.state?.storage;
     if (!storage) return;
+    await this.#assertRunOwnerRecoveryCurrent(recovery);
     await storage.delete(RUN_OWNER_RECOVERY_KEY);
     if (keepWake) {
       await this.#armAlarmWatchdog();
@@ -656,33 +837,123 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     await this.#armNextAlarm();
   }
 
-  async #clearRunOwnerRecoveryBestEffort(keepWake: boolean): Promise<void> {
+  async #prepareRunOwner(
+    recovery: RunOwnerRecovery,
+    execution: RunExecutionIdentity,
+  ): Promise<RunOwnerRecovery> {
+    const identity = normalizeRunExecutionIdentity(execution);
+    if (
+      identity.runId !== recovery.runId ||
+      identity.workflowId !== recovery.workflowId
+    )
+      throw new Error('prepared run identity mismatch');
+    const prepared: RunOwnerRecovery = this.#ensureRuntime().executionFence
+      ? {
+          ...recovery,
+          phase: 'prepared',
+          execution: normalizeD1RunExecutionIdentity(identity),
+        }
+      : { ...recovery, phase: 'prepared-unfenced', execution: identity };
+    const storage = this.state?.storage;
+    if (!storage)
+      throw new Error('run owner recovery requires durable storage');
+    const current = this.#runOwnerRecovery(
+      await storage.get(RUN_OWNER_RECOVERY_KEY),
+    );
+    if (sameRunRecovery(current, prepared)) return prepared;
+    if (current.phase !== 'preparing' || !sameRunRecovery(current, recovery))
+      throw new Error('run owner recovery changed');
     try {
-      await this.#clearRunOwnerRecovery(keepWake);
+      await storage.put(RUN_OWNER_RECOVERY_KEY, prepared);
     } catch (error) {
-      console.error('run owner recovery cleanup failed', error);
+      const reread = await storage.get(RUN_OWNER_RECOVERY_KEY);
+      if (
+        reread === undefined ||
+        !sameRunRecovery(this.#runOwnerRecovery(reread), prepared)
+      )
+        throw error;
     }
+    return prepared;
   }
 
-  async #settleRunOwnerBestEffort(
+  #matchingRunState(
     recovery: RunOwnerRecovery,
-    release: boolean,
-    keepWake = false,
-  ): Promise<void> {
-    try {
-      await this.runOwnership(this.env).settleReservation(
-        recovery.token,
-        release ? [{ kind: 'run', resourceId: recovery.runId }] : [],
+    state: AuthoritativeStartState | null,
+  ): AuthoritativeStartState {
+    const execution = recovery.execution;
+    if (
+      !state ||
+      !execution ||
+      state.execution.tablePrefix !== execution.tablePrefix ||
+      state.execution.workflowId !== execution.workflowId ||
+      state.execution.runId !== execution.runId ||
+      state.execution.startToken !== execution.startToken
+    )
+      throw new RunStateUnreadableError(recovery.workflowId, recovery.runId);
+    const identity = state.provenance.startIdentity;
+    if (
+      identity?.target.kind !== 'workflow' ||
+      identity.target.id !== recovery.workflowId ||
+      state.provenance.agentStart !== undefined
+    )
+      throw new RunStateUnreadableError(recovery.workflowId, recovery.runId);
+    const claim = recovery.startReservation;
+    if (
+      claim &&
+      (identity.owner.kind !== claim.owner.kind ||
+        identity.owner.id !== claim.owner.id)
+    )
+      throw new RunStateUnreadableError(recovery.workflowId, recovery.runId);
+    return state;
+  }
+
+  async #finishRunOwner(
+    recovery: RunOwnerRecovery,
+    summary: RunSummary,
+    selected?: AuthoritativeStartState,
+  ): Promise<RunSummary> {
+    const runtime = this.#ensureRuntime();
+    if (recovery.startReservation && !runtime.startIdempotency)
+      throw new ExecutionFenceUnreadableError(
+        'run start recovery is unresolved',
       );
-      await this.#clearRunOwnerRecoveryBestEffort(keepWake);
-    } catch (error) {
-      console.error('run owner recovery settlement failed', error);
-      try {
-        await this.#rearmRunOwnerRecovery();
-      } catch (alarmError) {
-        console.error('run owner recovery rearm failed', alarmError);
-      }
-    }
+    await this.#assertRunOwnerRecoveryCurrent(recovery);
+    const state = this.#matchingRunState(
+      recovery,
+      selected ??
+        (await runtime.authoritativeStartState(
+          recovery.workflowId,
+          recovery.runId,
+        )),
+    );
+    if (state.kind === 'initial') throw new RunStartPendingError();
+    await this.#assertRunOwnerRecoveryCurrent(recovery);
+    if (isTerminalRunStatus(state.summary.status))
+      await runtime.settleStartExecution(state, recovery.startReservation);
+    await this.runOwnership(this.env).settleReservation(recovery.token, []);
+    const cleanup = terminalCleanupFor(
+      lifecycleFromRequestContext(state.snapshot.requestContext),
+    );
+    if (cleanup)
+      summary = await this.#completeTerminalEffects(
+        runtime,
+        recovery.workflowId,
+        recovery.runId,
+        recovery.owner,
+        {
+          summary: state.summary,
+          transitioned: false,
+          casMatched: true,
+          cleanup,
+        },
+      );
+    const reconciled = await this.#reconcileSuspensionDeadlinesBestEffort(
+      recovery.workflowId,
+      recovery.runId,
+      summary,
+    );
+    await this.#clearRunOwnerRecovery(recovery, !reconciled);
+    return summary;
   }
 
   async #rearmRunOwnerRecovery(): Promise<void> {
@@ -1052,6 +1323,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     try {
       return await runtime.authoritativeStatus(workflowId, runId);
     } catch (error) {
+      if (isRunStartPendingError(error)) throw error;
       throw error instanceof RunStateUnreadableError
         ? error
         : new RunStateUnreadableError(workflowId, runId, { cause: error });
@@ -1295,6 +1567,26 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       await this.#resumeDueSuspensionDeadline(runtime, stored, entry, now);
       return true;
     } catch (error) {
+      if (isRunStartPendingError(error)) {
+        if (
+          stored?.entries.some((entry) => entry.unreadableSince !== undefined)
+        ) {
+          try {
+            await this.state?.storage?.put(SUSPENSION_DEADLINE_STORAGE_KEY, {
+              ...stored,
+              entries: stored.entries.map(
+                ({ unreadableSince: _unreadableSince, ...entry }) => entry,
+              ),
+            });
+          } catch (resetError) {
+            console.error(
+              'suspension deadline pending stamp reset failed',
+              resetError,
+            );
+          }
+        }
+        return false;
+      }
       // The deployment is fenced (or its fence could not be read). Classified
       // with the same THREE outcomes as an unreadable read — uncharged,
       // unconverged, watchdog cadence — because a wake refused by an
@@ -1356,56 +1648,173 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     }
   }
 
-  async #recoverRunOwner(recovery: RunOwnerRecovery): Promise<void> {
-    const summary = await this.#ensureRuntime().recoverStartAttempt(
-      recovery.workflowId,
-      recovery.runId,
-      recovery.token,
-    );
-    await this.runOwnership(this.env).settleReservation(
-      recovery.token,
-      summary ? [] : [{ kind: 'run', resourceId: recovery.runId }],
-    );
-    // A start interrupted AFTER Mastra persisted a suspension is the one case
-    // where no other boundary is coming: the route that would have reconciled
-    // died with its isolate, and clearing the journal below re-arms the alarm
-    // from a record nothing ever wrote. This summary is the authoritative one
-    // recoverStartAttempt read back, so derive from it here or the run stays
-    // suspended with no wake at all. It needs no readability guard of its own:
-    // recoverStartAttempt now throws RunStateUnreadableError on Mastra's
-    // in-memory fallback BEFORE it concludes anything from it, so a degraded
-    // read never reaches this line. That throw leaves the journal and the
-    // reservation intact and propagates to alarm(), which classifies it and
-    // keeps the 60 s recovery cadence until the read heals.
-    const reconciled = summary
-      ? await this.#reconcileSuspensionDeadlinesBestEffort(
+  async #recoverRunOwner(
+    recovery: RunOwnerRecovery,
+    ownFrame?: RunStartFrame,
+    ownFailure?: unknown,
+  ): Promise<RunSummary | null> {
+    this.#assertRunIdentity(recovery.workflowId, recovery.runId);
+    const runtime = this.#ensureRuntime();
+    if (recovery.startReservation && !runtime.startIdempotency)
+      throw new ExecutionFenceUnreadableError(
+        'run start recovery is unresolved',
+      );
+    const key = this.#inFlightKey(recovery.workflowId, recovery.runId);
+    const quiescent = (): boolean => {
+      const active = this.#startsInFlight.get(key);
+      return (
+        active === undefined ||
+        (active === ownFrame &&
+          ownFrame.unwound &&
+          ownFrame.token === recovery.token)
+      );
+    };
+    if (
+      !quiescent() ||
+      runtime.isRunActive(recovery.workflowId, recovery.runId)
+    )
+      throw new RunStartPendingError();
+    await this.#assertRunOwnerRecoveryCurrent(recovery);
+    let recovered: RecoveredStart | null = null;
+    if (recovery.phase === 'prepared') {
+      recovered = await runtime.recoverStartAttempt(recovery.execution, {
+        attemptToken: recovery.token,
+        isOwnerQuiescent: quiescent,
+        startReservation: recovery.startReservation,
+        expectedTarget: { kind: 'workflow' },
+      });
+    } else if (recovery.phase === 'prepared-unfenced') {
+      const state = this.#matchingRunState(
+        recovery,
+        await runtime.authoritativeStartState(
           recovery.workflowId,
           recovery.runId,
-          summary,
-        )
-      : true;
-    await this.#clearRunOwnerRecovery(!reconciled);
+        ),
+      );
+      if (state.kind === 'initial') throw new RunStartPendingError();
+      return this.#finishRunOwner(recovery, state.summary, state);
+    }
+    await this.#assertRunOwnerRecoveryCurrent(recovery);
+    if (recovered) {
+      const summary =
+        recovered.kind === 'ordinary'
+          ? recovered.summary
+          : recovered.transition.summary;
+      if (recovered.kind === 'lifecycle') {
+        // Runtime already strictly settled the single selected recovery observation.
+        await this.runOwnership(this.env).settleReservation(recovery.token, []);
+        const completed = recovered.transition.cleanup.cleanupCompleted
+          ? summary
+          : await this.#completeTerminalEffects(
+              runtime,
+              recovery.workflowId,
+              recovery.runId,
+              recovery.owner,
+              recovered.transition,
+            );
+        const reconciled = await this.#reconcileSuspensionDeadlinesBestEffort(
+          recovery.workflowId,
+          recovery.runId,
+          completed,
+        );
+        await this.#clearRunOwnerRecovery(recovery, !reconciled);
+        return completed;
+      }
+      await this.runOwnership(this.env).settleReservation(recovery.token, []);
+      const reconciled = await this.#reconcileSuspensionDeadlinesBestEffort(
+        recovery.workflowId,
+        recovery.runId,
+        summary,
+      );
+      await this.#clearRunOwnerRecovery(recovery, !reconciled);
+      return summary;
+    }
+    const localZero = (): boolean =>
+      recovery.phase === 'prepared' &&
+      ownFrame !== undefined &&
+      this.#startsInFlight.get(key) === ownFrame &&
+      ownFrame.unwound &&
+      ownFrame.token === recovery.token &&
+      isDefinitiveInitialAdmissionRefusal(ownFailure, recovery.execution);
+    await this.runOwnership(this.env).settleReservation(recovery.token, [
+      { kind: 'run', resourceId: recovery.runId },
+    ]);
+    if (recovery.phase === 'prepared' && !localZero()) {
+      await this.#rearmRunOwnerRecovery();
+      throw new ExecutionFenceUnreadableError(
+        'run start recovery is unresolved',
+      );
+    }
+    await this.#assertRunOwnerRecoveryCurrent(recovery);
+    await this.#clearRunOwnerRecovery(recovery, false);
+    return null;
   }
 
   #runOwnerRecovery(value: unknown): RunOwnerRecovery {
-    if (value === null || typeof value !== 'object') {
-      throw new Error('stored run owner recovery is malformed');
-    }
-    const stored = value as Partial<RunOwnerRecovery>;
+    const stored = recoveryObject(value);
+    const owner = recoveryObject(stored.owner);
     if (
-      stored.version !== 1 ||
+      stored.version !== 2 ||
       !isPathSafeId(stored.workflowId) ||
       !isPathSafeId(stored.runId) ||
-      !isPathSafeId(stored.token)
-    ) {
+      !isPathSafeId(stored.token) ||
+      !isExecutionPrincipalKind(owner.kind) ||
+      !isExecutionPrincipalId(owner.id)
+    )
       throw new Error('stored run owner recovery is malformed');
-    }
-    return {
-      version: 1,
+    const rawClaim =
+      stored.startReservation === undefined
+        ? undefined
+        : recoveryObject(stored.startReservation);
+    const claim =
+      rawClaim === undefined
+        ? undefined
+        : captureReservation(
+            {
+              ...rawClaim,
+              owner: recoveryObject(rawClaim.owner),
+              binding: recoveryObject(rawClaim.binding),
+            } as unknown as StartReservationReading,
+            'started',
+          );
+    if (
+      claim &&
+      (claim.targetKind !== 'workflow' ||
+        claim.targetId !== stored.workflowId ||
+        claim.runId !== stored.runId ||
+        claim.threadId !== undefined)
+    )
+      throw new Error('stored run owner recovery is malformed');
+    const base = {
+      version: 2 as const,
       workflowId: stored.workflowId,
       runId: stored.runId,
       token: stored.token,
+      owner: { kind: owner.kind, id: owner.id },
+      ...(claim ? { startReservation: claim } : {}),
     };
+    if (stored.phase === 'preparing' && !Object.hasOwn(stored, 'execution'))
+      return { ...base, phase: 'preparing' };
+    if (stored.phase !== 'prepared' && stored.phase !== 'prepared-unfenced')
+      throw new Error('stored run owner recovery is malformed');
+    const raw = recoveryObject(stored.execution);
+    const execution =
+      stored.phase === 'prepared'
+        ? normalizeD1RunExecutionIdentity(raw)
+        : normalizeRunExecutionIdentity(raw);
+    if (
+      execution.tablePrefix !== raw.tablePrefix ||
+      execution.workflowId !== base.workflowId ||
+      execution.runId !== base.runId
+    )
+      throw new Error('stored run owner recovery is malformed');
+    return stored.phase === 'prepared'
+      ? {
+          ...base,
+          phase: 'prepared',
+          execution: normalizeD1RunExecutionIdentity(execution),
+        }
+      : { ...base, phase: 'prepared-unfenced', execution };
   }
 
   async #recoverPendingRunOwner(): Promise<void> {
@@ -1505,6 +1914,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
           dispatchId,
           deadlineMs,
           idempotencyKey: rawIdempotencyKey,
+          startReservation: suppliedReservation,
         } = body ?? {};
         if (typeof workflowId !== 'string') {
           return json({ error: 'workflowId is required' }, 400);
@@ -1529,28 +1939,51 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         // would reach the fence's proof-only comparison and the runtime's
         // reservation as whatever the parser produced.
         const idempotencyKey = this.#startIdempotencyKey(rawIdempotencyKey);
+        const startReservation =
+          suppliedReservation === undefined
+            ? undefined
+            : captureReservation(
+                suppliedReservation as StartReservationReading,
+                'started',
+              );
+        if (
+          startReservation &&
+          (startReservation.key !== idempotencyKey ||
+            startReservation.runId !== runId ||
+            startReservation.targetKind !== 'workflow' ||
+            startReservation.targetId !== workflowId ||
+            startReservation.threadId !== undefined ||
+            startReservation.owner.kind !== principal.kind ||
+            startReservation.owner.id !== principal.id ||
+            !this.#ensureRuntime().startIdempotency)
+        )
+          throw new InvalidRunRequestError(
+            'start reservation does not match the trusted start',
+          );
         const startIdentity = normalizeStartIdentity({
           owner: { kind: principal.kind, id: principal.id },
           target: { kind: 'workflow', id: workflowId },
         });
-        // The fence BEFORE any of this object's own reads or writes: the
-        // schedule-source lookup below, the recovery pass, the journal at
-        // #armRunOwnerRecovery, and the owner reservation all touch storage,
-        // and a deployment that is refusing to execute must not leave a run
-        // half-claimed on its way to saying no. The runtime's own check inside
-        // start() stays the backstop for every other caller.
-        //
-        // The KEY is what admits a proof-only start: in that state the fence
-        // nominates exactly one key, and a start carrying it is the proof run.
-        // This check reads the fence but does NOT bind the proof to the run —
-        // `recordProofRun` belongs to the runtime's own assert, which is the
-        // last gate before execution and the only one every caller passes.
-        // Binding here as well would let a start that this route later refused
-        // (an existing run, a schedule-source mismatch) consume the deployment's
-        // one proof slot.
-        const startFence = await this.#readExecutionFence();
-        if (!admitsRunStart(startFence, idempotencyKey)) {
-          throw new ExecutionFencedError(startFence.state, 'run start');
+        // Only this local preflight can release the captured claim. Admission
+        // and proof binding belong to Runtime after durable preparation.
+        try {
+          const startFence = await this.#readExecutionFence();
+          if (!admitsRunStart(startFence, idempotencyKey))
+            throw new ExecutionFencedError(startFence.state, 'run start');
+        } catch (error) {
+          if (startReservation) {
+            try {
+              await this.#ensureRuntime().startIdempotency?.releaseReservation(
+                startReservation,
+              );
+            } catch (releaseError) {
+              console.error(
+                'start reservation preflight release failed',
+                releaseError,
+              );
+            }
+          }
+          throw error;
         }
         const source = await this.#startSource(
           principal,
@@ -1567,11 +2000,6 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         const storedRequestContext = target?.requestContext;
         const runtime = this.#ensureRuntime();
         await this.#recoverPendingRunOwner();
-        // Stays on status(), and NOT because failing open would be safer: the
-        // dangerous shape here is a row miss with no in-memory Run, which
-        // carries no marker at all, so authoritativeStatus could not tell it
-        // from an absent run either. The recovery above is what covers the
-        // interrupted-start case, and it fails closed on an unreadable read.
         const existing = await runtime.status(workflowId, runId);
         if (existing) {
           const registered = await this.runOwnership(this.env).owner(
@@ -1589,24 +2017,20 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
           }
           throw new RunAlreadyExistsError(workflowId, runId, existing.status);
         }
-        const recovery: RunOwnerRecovery = {
-          version: 1,
+        let recovery: RunOwnerRecovery = {
+          version: 2,
+          phase: 'preparing',
           workflowId,
           runId,
           token: crypto.randomUUID(),
+          owner,
+          ...(startReservation ? { startReservation } : {}),
         };
-        await this.#armRunOwnerRecovery(recovery);
-        // From here to the finally below, this object IS the run's execution:
-        // everything past the journal either persists a snapshot or leaves the
-        // recovery pass to settle it. That window is exactly what a replaying
-        // start's liveness probe is asking about, and it is tracked in memory
-        // on purpose — an evicted isolate loses the entry, which is the true
-        // answer for a run that is no longer executing anywhere. Registered
-        // BEFORE the reservation and the runtime's own #activeRuns entry so the
-        // gap between the claim and core's first persisted snapshot — the one
-        // window where nothing else can see the run — is covered too.
-        this.#startsInFlight.add(this.#inFlightKey(workflowId, runId));
+        const frame: RunStartFrame = { token: recovery.token, unwound: false };
+        const frameKey = this.#inFlightKey(workflowId, runId);
+        this.#startsInFlight.set(frameKey, frame);
         try {
+          await this.#armRunOwnerRecovery(recovery);
           await this.#reserveRunOwner(runId, owner, recovery.token);
           let summary: RunSummary;
           try {
@@ -1622,80 +2046,47 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
               attemptToken: recovery.token,
               ...(mutationEpoch === undefined ? {} : { mutationEpoch }),
               startIdentity,
+              startReservation,
               runOwnerGuard: { owner, reservationToken: recovery.token },
-              onPreparedStartIdentity: undefined,
+              onPreparedStartIdentity: async (execution) => {
+                recovery = await this.#prepareRunOwner(recovery, execution);
+              },
               ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
               ...(deadlineMs === undefined
                 ? {}
                 : { deadlineMs: deadlineMs as number }),
             });
-          } catch (error) {
-            let persisted: RunSummary | null | undefined;
-            try {
-              persisted = await runtime.recoverStartAttempt(
-                workflowId,
-                runId,
-                recovery.token,
-              );
-            } catch (recoverError) {
-              // Logged, never swallowed silently: this read is the only thing
-              // that could tell an interrupted start apart from a failed one,
-              // and its own failure is the reason the journal is being left
-              // armed for the alarm to retry.
-              console.error(
-                'interrupted start could not read authoritative state',
-                recoverError,
-              );
-              await this.#rearmRunOwnerRecovery();
-              throw error;
-            }
-            if (persisted) {
-              const reconciled =
-                await this.#reconcileSuspensionDeadlinesBestEffort(
-                  workflowId,
-                  runId,
-                  persisted,
-                );
-              await this.#settleRunOwnerBestEffort(
-                recovery,
-                false,
-                !reconciled,
-              );
-              return json(persisted);
-            }
-            await this.#settleRunOwnerBestEffort(recovery, true);
-            throw error;
+          } finally {
+            frame.unwound = true;
           }
-          // Reconcile BEFORE settling, never after: settling clears the
-          // recovery journal, and clearing it re-arms from storage — which, on
-          // a run whose FIRST deadline write has not happened yet, finds no
-          // record and no journal and deletes the alarm. With the journal
-          // still stored the write's own arm takes the min of the two due
-          // times, so no interleaving leaves this object without a wake.
-          const reconciled = await this.#reconcileSuspensionDeadlinesBestEffort(
-            workflowId,
-            runId,
-            summary,
-          );
-          await this.#settleRunOwnerBestEffort(recovery, false, !reconciled);
-          // The authoritative RunSummary is the run-progress frame; push it
-          // to any subscribed run-channel socket at this lifecycle boundary.
+          summary = await this.#finishRunOwner(recovery, summary);
           this.#broadcastRunSummary(summary);
           return json(summary);
         } catch (error) {
-          const stored = await this.state?.storage?.get<unknown>(
-            RUN_OWNER_RECOVERY_KEY,
-          );
-          if (stored !== undefined) {
+          frame.unwound = true;
+          try {
+            const stored = await this.state?.storage?.get(
+              RUN_OWNER_RECOVERY_KEY,
+            );
+            if (stored !== undefined) {
+              const current = this.#runOwnerRecovery(stored);
+              if (!sameRunRecovery(current, recovery))
+                throw new Error('run owner recovery changed');
+              const recovered = await this.#recoverRunOwner(
+                current,
+                frame,
+                error,
+              );
+              if (recovered) return json(recovered);
+            }
+          } catch (recoveryError) {
+            console.error('interrupted start recovery failed', recoveryError);
             await this.#rearmRunOwnerRecovery();
           }
           throw error;
         } finally {
-          // Whatever happened, this object is no longer starting the run. The
-          // delete must be unconditional: an entry left behind would answer
-          // every later probe "live" for the lifetime of the isolate, turning a
-          // crashed start's honest UNRESOLVABLE into an endless PENDING.
-          this.#startsInFlight.delete(this.#inFlightKey(workflowId, runId));
+          if (this.#startsInFlight.get(frameKey) === frame)
+            this.#startsInFlight.delete(frameKey);
         }
       });
     }
@@ -1721,6 +2112,25 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     ) {
       this.#assertRunIdentity(workflowId, runId);
       const runtime = this.#ensureRuntime();
+      if (new URL(request.url).searchParams.get('replay') === '1') {
+        const state = await runtime.authoritativeStartState(workflowId, runId);
+        if (!state) return json({ error: 'run not found' }, 404);
+        const identity = state.provenance.startIdentity;
+        if (
+          identity?.target.kind !== 'workflow' ||
+          identity.target.id !== workflowId
+        )
+          throw new RunStateUnreadableError(workflowId, runId);
+        const execution = normalizeStartExecutionIdentity({
+          ...state.execution,
+          ...identity,
+        });
+        return json(
+          state.kind === 'initial'
+            ? { kind: 'initial', execution }
+            : { kind: 'result', execution, value: state.summary },
+        );
+      }
       const summary = await runtime.status(workflowId, runId);
       if (!summary) return json({ error: 'run not found' }, 404);
       return json(summary);
@@ -1800,10 +2210,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         // answers before it takes the per-run lock. A drain still admits
         // resumes — the suspended runs it is draining are waiting for exactly
         // these — and proof-only admits its one nominated run.
-        const resumeFence = await this.#readExecutionFence();
-        if (!admitsExistingRun(resumeFence, runId)) {
-          throw new ExecutionFencedError(resumeFence.state, 'run resume');
-        }
+        await runtime.assertExistingRunAllowed(workflowId, runId);
         const summary = await runtime.resume(workflowId, runId, {
           step: body.step,
           resumeData,

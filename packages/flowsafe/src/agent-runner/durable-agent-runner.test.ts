@@ -40,7 +40,15 @@ import {
   denyPatterns,
   type Role,
 } from '@proofoftech/breakwater';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  afterEach,
+  assert,
+  describe,
+  expect,
+  expectTypeOf,
+  it,
+  vi,
+} from 'vitest';
 import { z } from 'zod';
 
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
@@ -64,12 +72,15 @@ import {
   type StartRunOptions,
 } from '../do-runner/index.js';
 import { init } from '../do-runner/init.js';
+import { RunStateUnreadableError } from '../do-runner/runtime.js';
 import {
   type AgentStartAuthority,
+  type AuthoritativeAgentStartState,
   createFlowsafeDurableAgent,
   DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
   type FlowsafeDurableAgent,
   isRuntimeDrivenAgent,
+  type LegacyAgentRunState,
 } from './durable-agent-runner.js';
 
 // A fake runtime that records register() and start() and models the shared-id
@@ -422,6 +433,7 @@ function cLocalModel(onCall: () => void): MastraModelConfig {
 async function cRealBridge(
   provider?: RequestContextProvider,
   modelFault?: Error,
+  threaded = false,
 ) {
   const sql = openSqlite() as ReturnType<typeof openSqlite> & { close(): void };
   const binding = sqliteUnitDatabase(sql) as ExecutionFenceDatabase;
@@ -480,6 +492,7 @@ async function cRealBridge(
       id: 'writer',
       name: 'Writer',
       instructions: 'Return done.',
+      ...(threaded ? { memory: new MockMemory() } : {}),
       model: cLocalModel(() => {
         counts.model++;
         if (modelFault) throw modelFault;
@@ -690,7 +703,7 @@ describe('C agent bridge capture', () => {
     1,
     2,
     3,
-  ])('C real agent bridge preserves active epoch compatibility at Runtime: %s', async (epoch) => {
+  ])('C real agent bridge enforces active mutation epoch at Runtime: %s', async (epoch) => {
     const { sql, fence, workflows, counts, runtime, agent, start } =
       await cRealBridge();
     const runId = `real-epoch-${epoch ?? 'missing'}`;
@@ -713,7 +726,7 @@ describe('C agent bridge capture', () => {
         mutationEpoch: 2,
         requireMutationEpoch: true,
       });
-      result = await agent.streamUntilPersisted(
+      const pending = agent.streamUntilPersisted(
         'Return done.',
         { runId, maxSteps: 1, disableBackgroundTasks: true },
         'operator-1',
@@ -723,6 +736,12 @@ describe('C agent bridge capture', () => {
         undefined,
         authority,
       );
+      if (epoch !== 2) {
+        await expect(pending).rejects.toThrow('mutation epoch does not match');
+        expect(counts.model).toBe(0);
+        return;
+      }
+      result = await pending;
       expect(await result.output.text).toBe('done');
       await globalRunRegistry.get(runId)?.workflowExecution;
       expect(
@@ -738,10 +757,13 @@ describe('C agent bridge capture', () => {
         runId,
       });
       expect(snapshot?.requestContext?.['flowsafe.runProvenance']).toEqual({
-        version: 1,
+        version: 2,
         requestedBy: 'operator-1',
         requestedByKind: 'human',
-        startToken: attemptToken,
+        startToken: expect.any(String),
+        mutationEpoch: 2,
+        startIdentity: authority.startIdentity,
+        agentStart: authority.agentStart,
         attemptToken,
         resumeCounts: [],
       });
@@ -757,8 +779,8 @@ describe('C agent bridge capture', () => {
         expect(snapshot?.requestContext).not.toHaveProperty(key);
       expect(counts).toEqual({
         model: 1,
-        callback: 0,
-        admission: 0,
+        callback: 1,
+        admission: 1,
         terminalization: 0,
       });
     } finally {
@@ -769,8 +791,8 @@ describe('C agent bridge capture', () => {
       globalRunRegistry.delete(runId);
       start.mockRestore();
       sql.close();
-      expect(counts.callback).toBe(0);
-      expect(counts.admission).toBe(0);
+      expect(counts.callback).toBe(epoch === 2 ? 1 : 0);
+      expect(counts.admission).toBe(epoch === 2 ? 1 : 0);
       expect(counts.terminalization).toBe(0);
     }
   });
@@ -779,7 +801,7 @@ describe('C agent bridge capture', () => {
     'provider-failure',
     'model-failure',
     'lost-receipt',
-  ] as const)('C real agent failure and terminal recovery keep v1 without automatic activation: %s', async (phase) => {
+  ] as const)('C real agent failure and terminal recovery keep the verified v2 generation: %s', async (phase) => {
     const fault = new Error(`C real ${phase}`);
     const f = await cRealBridge(
       phase === 'provider-failure'
@@ -876,10 +898,13 @@ describe('C agent bridge capture', () => {
           'success',
         );
         expect(snapshot?.requestContext?.['flowsafe.runProvenance']).toEqual({
-          version: 1,
+          version: 2,
           requestedBy: 'operator-1',
           requestedByKind: 'human',
-          startToken: attemptToken,
+          startToken: expect.any(String),
+          mutationEpoch: 2,
+          startIdentity: authority.startIdentity,
+          agentStart: authority.agentStart,
           attemptToken,
           resumeCounts: [],
         });
@@ -906,8 +931,8 @@ describe('C agent bridge capture', () => {
       persistence.mockRestore();
       f.start.mockRestore();
       f.sql.close();
-      expect(f.counts.callback).toBe(0);
-      expect(f.counts.admission).toBe(0);
+      expect(f.counts.callback).toBe(phase === 'provider-failure' ? 0 : 1);
+      expect(f.counts.admission).toBe(phase === 'provider-failure' ? 0 : 1);
       expect(f.counts.terminalization).toBe(0);
     }
   });
@@ -1790,6 +1815,89 @@ describe('FlowsafeDurableAgent.executeWorkflow', () => {
       InvalidRunRequestError,
     );
     expect(start).not.toHaveBeenCalled();
+  });
+});
+
+describe('FlowsafeDurableAgent.isRunLive', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    'global',
+    'internal',
+  ] as const)('shares the refusal predicate for an isolated %s registry entry', async (source) => {
+    const { runtime, start } = fakeRuntime();
+    const agent = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
+    const seedRunId = `live-seed-${source}`;
+    const runId = `live-${source}`;
+    try {
+      const prepared = await agent.prepare('hello', { runId: seedRunId });
+      if (source === 'global')
+        globalRunRegistry.set(runId, prepared.registryEntry);
+      else registryFor(agent).register(runId, prepared.registryEntry);
+      const stream = vi.spyOn(DurableAgent.prototype, 'stream');
+      expect(globalRunRegistry.has(runId)).toBe(source === 'global');
+      expect(registryFor(agent).has(runId)).toBe(source === 'internal');
+      expect(agent.isRunLive(runId)).toBe(true);
+      expect(agent.isRunLive('live-absent')).toBe(false);
+      await expect(agent.stream('duplicate', { runId })).rejects.toThrow(
+        'run id is live in the run registry — a registered run cannot be re-entered',
+      );
+      expect(stream).not.toHaveBeenCalled();
+      expect(start).not.toHaveBeenCalled();
+    } finally {
+      for (const fixtureRunId of [runId, seedRunId]) {
+        registryFor(agent).cleanup(fixtureRunId);
+        globalRunRegistry.delete(fixtureRunId);
+      }
+    }
+    expect(agent.isRunLive(runId)).toBe(false);
+  });
+
+  it('shares the refusal predicate while a host stream awaits Core registration', async () => {
+    const { runtime, start } = fakeRuntime();
+    const agent = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
+    const runId = 'live-starting';
+    const entered = bridgeDeferred();
+    const release = bridgeDeferred();
+    const failure = new Error('fixture stream refusal');
+    const stream = vi
+      .spyOn(DurableAgent.prototype, 'stream')
+      .mockImplementation(async () => {
+        entered.resolve();
+        await release.promise;
+        throw failure;
+      });
+    const pending = agent
+      .streamUntilPersisted(
+        'first',
+        { runId },
+        'operator-1',
+        'human',
+        undefined,
+        undefined,
+        undefined,
+        startAuthority(),
+      )
+      .catch((error: unknown) => error);
+    try {
+      await entered.promise;
+      expect(globalRunRegistry.has(runId)).toBe(false);
+      expect(registryFor(agent).has(runId)).toBe(false);
+      expect(agent.isRunLive(runId)).toBe(true);
+      expect(agent.isRunLive('live-absent')).toBe(false);
+      await expect(agent.stream('duplicate', { runId })).rejects.toThrow(
+        'run id is live in the run registry — a registered run cannot be re-entered',
+      );
+      expect(stream).toHaveBeenCalledOnce();
+      expect(start).not.toHaveBeenCalled();
+    } finally {
+      release.resolve();
+      await pending;
+    }
+    expect(await pending).toBe(failure);
+    expect(agent.isRunLive(runId)).toBe(false);
   });
 });
 
@@ -2709,5 +2817,545 @@ describe('FlowsafeDurableAgent.executeWorkflow failed run', () => {
     // #then the failed status is surfaced to observe()/onError via emitError
     expect(emitError).toHaveBeenCalledWith('run-1', expect.any(Error));
     expect(emitError.mock.calls[0]?.[1]?.message).toBe('boom');
+  });
+});
+
+async function d3AgentObservationFixture(threaded: boolean, customIds = false) {
+  const f = await cRealBridge();
+  const workflow = f.agent.getWorkflow();
+  if (customIds) {
+    Object.defineProperty(f.agent, 'id', { value: 'display-agent' });
+    Object.defineProperty(workflow, 'id', { value: 'actual-agent-loop' });
+    f.runtime.register(
+      workflow as unknown as import('@mastra/core/workflows').AnyWorkflow,
+    );
+  }
+  await f.runtime.status(workflow.id, 'd3-agent');
+  const snapshot = {
+    runId: 'd3-agent',
+    status: 'pending',
+    context: {},
+    requestContext: {
+      'flowsafe.runProvenance': {
+        version: 2,
+        startToken: 'S1',
+        attemptToken: 'H',
+        requestedBy: 'operator-1',
+        requestedByKind: 'human',
+        resumeCounts: [],
+        startIdentity: {
+          owner: { kind: 'human', id: 'operator-1' },
+          target: { kind: 'agent', id: 'writer', threadId: 'thread-1' },
+        },
+        agentStart: { threaded },
+      },
+    },
+    value: {},
+    serializedStepGraph: [],
+    activePaths: [],
+    activeStepsPath: {},
+    suspendedPaths: {},
+    resumeLabels: {},
+    waitingPaths: {},
+    timestamp: 100,
+  };
+  const seed = () =>
+    f.workflows.persistWorkflowSnapshot({
+      workflowName: workflow.id,
+      runId: 'd3-agent',
+      snapshot:
+        snapshot as unknown as import('@mastra/core/workflows').WorkflowRunState,
+    });
+  await seed();
+  return { ...f, workflow, snapshot, seed };
+}
+
+describe('FS8 D3 agent observation', () => {
+  it.each([
+    false,
+    true,
+  ])('R11 reads initial mode %s without input or optional pruned context', async (threaded) => {
+    const f = await d3AgentObservationFixture(threaded, true);
+    try {
+      const capability = f.workflows[FENCED_WORKFLOW_STORAGE];
+      assert(capability);
+      const read = vi.spyOn(capability, 'readSnapshot');
+      const state = await f.agent
+        .authoritativeAgentStartState(f.runtime, 'thread-1', 'd3-agent')
+        .catch((error) => error);
+      expect(state).toMatchObject({
+        kind: 'initial',
+        threaded,
+        execution: {
+          workflowId: 'actual-agent-loop',
+          startToken: 'S1',
+          owner: { id: 'operator-1' },
+          target: { id: 'writer', threadId: 'thread-1' },
+        },
+      });
+      expect(state).not.toHaveProperty('summary');
+      expect(read).toHaveBeenCalledOnce();
+      expect(f.counts.model).toBe(0);
+      await expect(
+        f.agent.proofExecutionFor(f.runtime, 'thread-1', 'd3-agent'),
+      ).resolves.toEqual({
+        tablePrefix: '',
+        workflowId: 'actual-agent-loop',
+        runId: 'd3-agent',
+        startToken: 'S1',
+      });
+    } finally {
+      f.start.mockRestore();
+      f.sql.close();
+    }
+  });
+
+  it.each([
+    'runtime',
+    'thread',
+    'agent',
+    'input',
+    'memory',
+    'audit',
+  ] as const)('R11 refuses present %s contradictions without engine work', async (corruption) => {
+    const f = await d3AgentObservationFixture(true);
+    try {
+      if (corruption === 'agent')
+        f.snapshot.requestContext[
+          'flowsafe.runProvenance'
+        ].startIdentity.target.id = 'wrong';
+      if (corruption === 'input')
+        Object.assign(f.snapshot.context, { input: { agentId: 'wrong' } });
+      if (corruption === 'memory')
+        Object.assign(f.snapshot.context, {
+          input: { agentId: 'writer', messageListState: { memoryInfo: null } },
+        });
+      if (corruption === 'audit')
+        Object.assign(f.snapshot.requestContext, {
+          'breakwater.auditContext': { threadId: 'wrong' },
+        });
+      await f.seed();
+      const capability = f.workflows[FENCED_WORKFLOW_STORAGE];
+      assert(capability);
+      const read = vi.spyOn(capability, 'readSnapshot');
+      const { RunStateUnreadableError } = await import(
+        '../do-runner/runtime.js'
+      );
+      const outcome = await f.agent
+        .authoritativeAgentStartState(
+          corruption === 'runtime' ? ({} as RunnerRuntime) : f.runtime,
+          corruption === 'thread' ? 'wrong' : 'thread-1',
+          'd3-agent',
+        )
+        .catch((error) => error);
+      expect(f.counts.model).toBe(0);
+      if (corruption === 'runtime') expect(read).not.toHaveBeenCalled();
+      else expect(read).toHaveBeenCalledOnce();
+      expect(outcome).toBeInstanceOf(RunStateUnreadableError);
+    } finally {
+      f.start.mockRestore();
+      f.sql.close();
+    }
+  });
+
+  it('R11 returns S1 and its selected value when S2 replaces storage after the read', async () => {
+    const f = await d3AgentObservationFixture(false);
+    try {
+      Object.assign(f.snapshot, {
+        status: 'success',
+        result: { generation: 'S1' },
+      });
+      await f.seed();
+      const capability = f.workflows[FENCED_WORKFLOW_STORAGE];
+      assert(capability);
+      const read = capability.readSnapshot;
+      const selected = vi
+        .spyOn(capability, 'readSnapshot')
+        .mockImplementation(async (address) => {
+          const row = await read(address);
+          f.snapshot.requestContext['flowsafe.runProvenance'].startToken = 'S2';
+          Object.assign(f.snapshot, { result: { generation: 'S2' } });
+          await f.seed();
+          return row;
+        });
+      const state = await f.agent.authoritativeAgentStartState(
+        f.runtime,
+        'thread-1',
+        'd3-agent',
+      );
+      expect(state).toMatchObject({
+        kind: 'result',
+        execution: { startToken: 'S1' },
+        summary: { status: 'success', result: { generation: 'S1' } },
+      });
+      expect(selected).toHaveBeenCalledOnce();
+      expect(f.counts.model).toBe(0);
+    } finally {
+      f.start.mockRestore();
+      f.sql.close();
+    }
+  });
+
+  it.each([
+    false,
+    true,
+  ])('R13 rejects the agent persistence waiter when mode %s only persists pending after engine completion', async (threaded) => {
+    const f = await cRealBridge(undefined, undefined, threaded);
+    const runId = `agent-pending-${threaded}`;
+    const streams: Array<Awaited<ReturnType<typeof f.agent.stream>>> = [];
+    const stream = f.agent.stream.bind(f.agent);
+    vi.spyOn(f.agent, 'stream').mockImplementation(async (...args) => {
+      const value = await stream(...args);
+      streams.push(value);
+      return value;
+    });
+    try {
+      const persist = f.workflows.persistWorkflowSnapshot.bind(f.workflows);
+      vi.spyOn(f.workflows, 'persistWorkflowSnapshot').mockImplementation(
+        (input) =>
+          persist(
+            input.snapshot.status === 'pending'
+              ? input
+              : {
+                  ...input,
+                  snapshot: { ...input.snapshot, status: 'pending' as const },
+                },
+          ),
+      );
+      const authority = { ...startAuthority(), agentStart: { threaded } };
+      const result = await f.agent
+        .streamUntilPersisted(
+          'Return done.',
+          {
+            runId,
+            maxSteps: 1,
+            disableBackgroundTasks: true,
+            ...(threaded
+              ? { memory: { thread: 'thread-1', resource: 'thread-1' } }
+              : {}),
+          },
+          'operator-1',
+          'human',
+          'H',
+          undefined,
+          undefined,
+          authority,
+        )
+        .catch((error) => error);
+      const row = await f.workflows.loadWorkflowSnapshot({
+        workflowName: f.agent.getWorkflow().id,
+        runId,
+      });
+      expect(row?.status).toBe('pending');
+      expect(f.counts.model).toBe(1);
+      const { RunStartPendingError } = await import(
+        '../do-runner/execution-admission.js'
+      );
+      expect(result).toBeInstanceOf(RunStartPendingError);
+    } finally {
+      await globalRunRegistry
+        .get(runId)
+        ?.workflowExecution?.catch(() => undefined);
+      for (const value of streams) value.cleanup();
+      globalRunRegistry.delete(runId);
+      f.start.mockRestore();
+      f.sql.close();
+    }
+  });
+});
+
+async function d3LegacyAgentFixture(
+  version: 'v1' | 'absent',
+  threaded: boolean,
+) {
+  const f = await d3AgentObservationFixture(threaded, true);
+  const snapshot = structuredClone(
+    f.snapshot,
+  ) as unknown as import('@mastra/core/workflows').WorkflowRunState;
+  snapshot.status = 'success';
+  snapshot.result = { legacy: true };
+  snapshot.context.input = {
+    agentId: 'writer',
+    runId: 'd3-agent',
+    messageListState: {
+      memoryInfo: threaded
+        ? { threadId: 'thread-1', resourceId: 'thread-1' }
+        : null,
+    },
+  };
+  snapshot.requestContext = {
+    runId: 'd3-agent',
+    threadId: 'thread-1',
+    resourceId: 'thread-1',
+    'breakwater.auditContext': {
+      agentId: 'writer',
+      threadId: 'thread-1',
+      resourceId: 'thread-1',
+    },
+  };
+  if (version === 'v1')
+    snapshot.requestContext['flowsafe.runProvenance'] = {
+      version: 1,
+      attemptToken: 'legacy-H',
+      requestedBy: 'current-reviewer',
+      requestedByKind: 'service',
+      resumeCounts: [],
+    };
+  const seed = () =>
+    f.workflows.persistWorkflowSnapshot({
+      workflowName: f.workflow.id,
+      runId: 'd3-agent',
+      snapshot,
+    });
+  await seed();
+  return { ...f, snapshot, seed };
+}
+
+describe('FS8 D3 fix R1 legacy agent observations', () => {
+  it.each(
+    (['v1', 'absent'] as const).flatMap((version) =>
+      [false, true].map((threaded) => ({ version, threaded })),
+    ),
+  )('reads $version mode $threaded from the actual wrapper source once without generation authority', async ({
+    version,
+    threaded,
+  }) => {
+    const f = await d3LegacyAgentFixture(version, threaded);
+    try {
+      const capability = f.workflows[FENCED_WORKFLOW_STORAGE];
+      assert(capability);
+      const read = vi.spyOn(capability, 'readSnapshot');
+      const ordinary = vi.spyOn(f.workflows, 'loadWorkflowSnapshot');
+      const pending = f.agent.authoritativeAgentStartState(
+        f.runtime,
+        'thread-1',
+        'd3-agent',
+        { includeLegacy: true },
+      );
+      await expect(pending).resolves.toMatchObject({
+        kind: 'legacy',
+        provenanceVersion: version === 'v1' ? 1 : undefined,
+        address: {
+          tablePrefix: '',
+          workflowId: 'actual-agent-loop',
+          runId: 'd3-agent',
+        },
+        threaded,
+        summary: { status: 'success', result: { legacy: true } },
+      });
+      const result = await pending;
+      expect(result).not.toHaveProperty('execution');
+      expect(read).toHaveBeenCalledOnce();
+      expect(ordinary).not.toHaveBeenCalled();
+      expect(f.counts.model).toBe(0);
+      if (version === 'v1')
+        expect(result?.summary).toMatchObject({
+          requestedBy: 'current-reviewer',
+          requestedByKind: 'service',
+        });
+      await expect(
+        f.agent.authoritativeAgentStartState(f.runtime, 'thread-1', 'd3-agent'),
+      ).rejects.toBeInstanceOf(RunStateUnreadableError);
+      await expect(
+        f.agent.proofExecutionFor(f.runtime, 'thread-1', 'd3-agent'),
+      ).rejects.toBeInstanceOf(RunStateUnreadableError);
+    } finally {
+      f.start.mockRestore();
+      f.sql.close();
+    }
+  });
+
+  it.each([
+    'input-agent',
+    'input-run',
+    'context-run',
+    'context-thread',
+    'context-resource',
+    'audit-agent',
+    'audit-thread',
+    'audit-resource',
+    'memory-thread',
+    'missing-input',
+  ] as const)('rejects legacy %s contradictions in its one selected snapshot', async (field) => {
+    const f = await d3LegacyAgentFixture('v1', true);
+    try {
+      const context = f.snapshot.requestContext;
+      assert(context);
+      const input = f.snapshot.context.input as unknown as {
+        agentId: string;
+        runId: string;
+        messageListState: {
+          memoryInfo: { threadId: string; resourceId: string };
+        };
+      };
+      if (field === 'input-agent') input.agentId = 'wrong';
+      else if (field === 'input-run') input.runId = 'wrong';
+      else if (field === 'context-run') context.runId = 'wrong';
+      else if (field === 'context-thread') context.threadId = 'wrong';
+      else if (field === 'context-resource') context.resourceId = 'wrong';
+      else if (field === 'audit-agent')
+        context['breakwater.auditContext'].agentId = 'wrong';
+      else if (field === 'audit-thread')
+        context['breakwater.auditContext'].threadId = 'wrong';
+      else if (field === 'audit-resource')
+        context['breakwater.auditContext'].resourceId = 'wrong';
+      else if (field === 'memory-thread')
+        input.messageListState.memoryInfo.threadId = 'wrong';
+      else delete f.snapshot.context.input;
+      await f.seed();
+      const capability = f.workflows[FENCED_WORKFLOW_STORAGE];
+      assert(capability);
+      const read = vi.spyOn(capability, 'readSnapshot');
+      const result = await f.agent
+        .authoritativeAgentStartState(f.runtime, 'thread-1', 'd3-agent', {
+          includeLegacy: true,
+        })
+        .catch((error) => error);
+      expect(read).toHaveBeenCalledOnce();
+      expect(f.counts.model).toBe(0);
+      expect(result).toBeInstanceOf(RunStateUnreadableError);
+    } finally {
+      f.start.mockRestore();
+      f.sql.close();
+    }
+  });
+
+  it('captures the legacy option and keeps the selected S1-era value when storage advances during a read', async () => {
+    const f = await d3LegacyAgentFixture('v1', false),
+      entered = bridgeDeferred(),
+      release = bridgeDeferred();
+    let pending: Promise<unknown> | undefined;
+    try {
+      const capability = f.workflows[FENCED_WORKFLOW_STORAGE];
+      assert(capability);
+      const native = capability.readSnapshot;
+      const read = vi
+        .spyOn(capability, 'readSnapshot')
+        .mockImplementation(async (address) => {
+          const row = await native(address);
+          entered.resolve();
+          await release.promise;
+          return row;
+        });
+      const options = { includeLegacy: true as const };
+      pending = f.agent
+        .authoritativeAgentStartState(
+          f.runtime,
+          'thread-1',
+          'd3-agent',
+          options,
+        )
+        .catch((error) => error);
+      await entered.promise;
+      Object.assign(options, { includeLegacy: false });
+      f.snapshot.result = { replacement: true };
+      await f.seed();
+      release.resolve();
+      const result = await pending;
+      expect(result).toMatchObject({
+        kind: 'legacy',
+        summary: { result: { legacy: true } },
+      });
+      expect(read).toHaveBeenCalledOnce();
+      expect(f.counts.model).toBe(0);
+    } finally {
+      release.resolve();
+      await pending;
+      f.start.mockRestore();
+      f.sql.close();
+    }
+  });
+
+  it('rejects a different expected Runtime before legacy source I/O', async () => {
+    const f = await d3LegacyAgentFixture('absent', false);
+    try {
+      const capability = f.workflows[FENCED_WORKFLOW_STORAGE];
+      assert(capability);
+      const read = vi.spyOn(capability, 'readSnapshot');
+      const result = await f.agent
+        .authoritativeAgentStartState(
+          {} as RunnerRuntime,
+          'thread-1',
+          'd3-agent',
+          { includeLegacy: true },
+        )
+        .catch((error) => error);
+      expect(read).not.toHaveBeenCalled();
+      expect(f.counts.model).toBe(0);
+      expect(result).toBeInstanceOf(RunStateUnreadableError);
+    } finally {
+      f.start.mockRestore();
+      f.sql.close();
+    }
+  });
+
+  it('does not fall back to another snapshot when the selected legacy-capable read fails', async () => {
+    const f = await d3LegacyAgentFixture('v1', false);
+    try {
+      const capability = f.workflows[FENCED_WORKFLOW_STORAGE];
+      assert(capability);
+      const read = vi
+        .spyOn(capability, 'readSnapshot')
+        .mockRejectedValue(new Error('source failed'));
+      const ordinary = vi.spyOn(f.workflows, 'loadWorkflowSnapshot');
+      const result = await f.agent
+        .authoritativeAgentStartState(f.runtime, 'thread-1', 'd3-agent', {
+          includeLegacy: true,
+        })
+        .catch((error) => error);
+      expect(read).toHaveBeenCalledOnce();
+      expect(ordinary).not.toHaveBeenCalled();
+      expect(f.counts.model).toBe(0);
+      expect(result).toBeInstanceOf(RunStateUnreadableError);
+    } finally {
+      f.start.mockRestore();
+      f.sql.close();
+    }
+  });
+
+  it('keeps its default strict even if a Runtime override returns a legacy arm without opt-in', async () => {
+    const f = await d3LegacyAgentFixture('v1', false);
+    try {
+      const legacy = await f.runtime.authoritativeStartState(
+        f.workflow.id,
+        'd3-agent',
+        { includeLegacy: true },
+      );
+      assert(legacy?.kind === 'legacy');
+      const read = vi
+        .spyOn(f.runtime, 'authoritativeStartState')
+        .mockResolvedValue(legacy as never);
+      const result = await f.agent
+        .authoritativeAgentStartState(f.runtime, 'thread-1', 'd3-agent')
+        .catch((error) => error);
+      expect(read).toHaveBeenCalledOnce();
+      expect(f.counts.model).toBe(0);
+      expect(result).toBeInstanceOf(RunStateUnreadableError);
+    } finally {
+      f.start.mockRestore();
+      f.sql.close();
+    }
+  });
+
+  it('retains strict wrapper inference and exposes no execution identity on the legacy type', () => {
+    expectTypeOf<
+      ReturnType<FlowsafeDurableAgent['authoritativeAgentStartState']>
+    >().toEqualTypeOf<Promise<AuthoritativeAgentStartState | null>>();
+    expectTypeOf<
+      Parameters<FlowsafeDurableAgent['authoritativeAgentStartState']>
+    >().toEqualTypeOf<[RunnerRuntime, string, string]>();
+    const readLegacy = (agent: FlowsafeDurableAgent, runtime: RunnerRuntime) =>
+      agent.authoritativeAgentStartState(runtime, 'thread', 'run', {
+        includeLegacy: true,
+      });
+    expectTypeOf(readLegacy).returns.toEqualTypeOf<
+      Promise<AuthoritativeAgentStartState | LegacyAgentRunState | null>
+    >();
+    expectTypeOf<
+      Extract<
+        keyof LegacyAgentRunState,
+        'execution' | 'startToken' | 'attemptToken'
+      >
+    >().toEqualTypeOf<never>();
   });
 });

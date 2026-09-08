@@ -85,6 +85,7 @@ export {
   type D1StartExecutionIdentity,
   InvalidExecutionIdentityError,
   InvalidMutationEpochError,
+  isRunStartPendingError,
   MUTATION_EPOCH_HEADER,
   type MutationEpochContext,
   MutationEpochMismatchError,
@@ -98,6 +99,7 @@ export {
   type RunAdmissionConflictClassification,
   RunAdmissionConflictError,
   type RunExecutionIdentity,
+  RunStartPendingError,
   type StartExecutionIdentity,
   type StartIdentity,
   stampMutationEpoch,
@@ -229,6 +231,8 @@ export type {
   RunTerminalStatus,
 } from './run-lifecycle.js';
 export type {
+  AuthoritativeStartState,
+  RecoveredStart,
   RequestContextProvider,
   ResumeRunOptions,
   RunLeg,
@@ -278,6 +282,7 @@ export { resolveScheduleStartOwner } from './schedule-source.js';
 export type {
   IdempotentStartDecision,
   IdempotentStartSurface,
+  PersistedStartResult,
   StartIdempotencyDatabase,
   StartIdempotencyStatement,
   StartIdempotencyStoreOptions,
@@ -300,7 +305,6 @@ export {
   InvalidStartIdempotencyRequestError,
   isStartReservationRefusal,
   requireStartIdempotency,
-  rollbackFencedStart,
   START_IDEMPOTENCY_DDL,
   START_IDEMPOTENCY_RUN_INDEX_DDL,
   START_IDEMPOTENCY_STATE_INDEX_DDL,

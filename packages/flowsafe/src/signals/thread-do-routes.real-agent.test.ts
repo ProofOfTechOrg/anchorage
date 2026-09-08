@@ -14,12 +14,14 @@ import {
   createGuardedAgent,
 } from '@proofoftech/breakwater';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import { FLOWSAFE_PERSISTENCE_FORBIDDEN } from '../agent-runner/durable-agent-runner.js';
 import {
   createFlowsafeDurableAgent,
   type FlowsafeDurableAgent,
 } from '../agent-runner/index.js';
 import { humanPrincipal } from '../approval-api/index.js';
+import type { ExecutionFenceDatabase } from '../do-runner/execution-fence.js';
 import {
   createHostPubSub,
   InvalidRunRequestError,
@@ -734,4 +736,100 @@ describe('thread signal routes with a real durable agent', () => {
     ).emitError(hostId, new Error('test cleanup'));
     await within(first.output.consumeStream(), 'suspended stream cleanup');
   }, 15_000);
+});
+
+describe('FS8 D3 proof activation actual agent authority', () => {
+  it('uses the actual wrapper workflow and refuses a replaced generation after content inspection', async () => {
+    const sqlite = openSqlite();
+    const db = sqliteUnitDatabase(sqlite) as ExecutionFenceDatabase;
+    const pubsub = createHostPubSub();
+    const runner = init({ DB: db }, { pubsub, tablePrefix: 'proof_' });
+    const fence = runner.executionFence;
+    if (!fence) throw new Error('fixture fence missing');
+    const memory = new MockMemory();
+    const agent = createFlowsafeDurableAgent({
+      agent: guardedTestAgent(memory),
+      runtime: runner.runtime,
+      pubsub,
+      cache: false,
+    });
+    const workflowId = agent.getWorkflow().id;
+    const threadId = 'thread-real-proof';
+    const runId = 'run-real-proof';
+    const source = {
+      version: 2,
+      startToken: 'generation',
+      attemptToken: 'attempt',
+      resumeCounts: [],
+      startIdentity: {
+        owner: { kind: 'human', id: 'operator' },
+        target: { kind: 'agent', id: 'writer', threadId },
+      },
+      agentStart: { threaded: true },
+    };
+    sqlite.exec(
+      'CREATE TABLE proof_mastra_workflow_snapshot (workflow_name TEXT, run_id TEXT, resourceId TEXT, snapshot TEXT, createdAt TEXT, updatedAt TEXT, PRIMARY KEY (workflow_name,run_id))',
+    );
+    const write = () =>
+      sqlite
+        .prepare(
+          'INSERT OR REPLACE INTO proof_mastra_workflow_snapshot VALUES (?,?,?,?,?,?)',
+        )
+        .run(
+          workflowId,
+          runId,
+          threadId,
+          JSON.stringify({
+            runId,
+            status: 'suspended',
+            requestContext: { 'flowsafe.runProvenance': source },
+            steps: {},
+            suspendedPaths: {},
+          }),
+          '2026-09-07T00:00:00Z',
+          '2026-09-07T00:00:00Z',
+        );
+    write();
+    await fence.seed('migration-locked');
+    await fence.transition({
+      expected: 'migration-locked',
+      next: 'proof-only',
+      proofKey: 'proof',
+    });
+    sqlite
+      .prepare(
+        'UPDATE flowsafe_execution_fence SET proof_run_id = ?, proof_table_prefix = ?, proof_workflow_id = ?, proof_start_token = ?',
+      )
+      .run(runId, 'proof_', workflowId, 'generation');
+    vi.spyOn(agent, 'getActiveThreadRunId').mockReturnValue(runId);
+    const send = vi.spyOn(agent, 'sendMessage');
+    const saves = vi.spyOn(memory, 'saveMessages');
+    expect(
+      await agent.proofExecutionFor(runner.runtime, threadId, runId),
+    ).toMatchObject({
+      workflowId,
+      startToken: 'generation',
+      tablePrefix: 'proof_',
+    });
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => agent as unknown as Agent,
+      resolveResourceId: () => threadId,
+      contentPolicy: async () => {
+        source.startToken = 'replacement';
+        write();
+        return { allowed: true };
+      },
+    });
+    const response = await route(
+      post('/signal/queue', { contents: 'held content' }),
+      {
+        threadId,
+        principal: humanPrincipal({ id: 'operator', role: 'operator' }),
+        init: runner,
+      },
+    );
+    expect(send).not.toHaveBeenCalled();
+    expect(saves).not.toHaveBeenCalled();
+    expect(response?.status).toBe(503);
+  });
 });

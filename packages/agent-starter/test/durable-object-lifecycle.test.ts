@@ -1,12 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it } from 'vitest';
+import type { DurableObjectState } from '@cloudflare/workers-types';
+import {
+  type AgentThreadInstanceScope,
+  createThreadAgentHost,
+} from '@proofoftech/flowsafe/agent-host';
+import { seedDeploymentIdentity } from '@proofoftech/flowsafe/do-runner';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   discardStarterScheduleDispatch,
   idleRunScheduleDispatch,
+  StarterThread,
 } from '../src/durable-objects.js';
-import { schedulesStore } from '../src/storage.js';
+import { executionFence, schedulesStore } from '../src/storage.js';
+
+vi.mock('@proofoftech/flowsafe/agent-host', async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import('@proofoftech/flowsafe/agent-host')>();
+  return {
+    ...actual,
+    createThreadAgentHost: vi.fn(actual.createThreadAgentHost),
+  };
+});
 
 interface SqliteStatement {
   get(...params: unknown[]): unknown;
@@ -93,6 +109,71 @@ function sqliteUnitDatabase(db: SqliteDatabase): unknown {
 }
 
 describe('starter run lifecycle wiring', () => {
+  it('FS8 D3 host activation passes the verified instance to cold alarm recovery', async () => {
+    const db = sqliteUnitDatabase(openSqlite()) as Env['DB'];
+    await seedDeploymentIdentity(db, 'acme', 'open');
+    const values = new Map<string, unknown>();
+    let alarm: number | null = null;
+    const state = {
+      id: { name: 'starter-cold-thread' },
+      storage: {
+        async get<T>(key: string): Promise<T | undefined> {
+          return values.get(key) as T | undefined;
+        },
+        async put(key: string, value: unknown) {
+          values.set(key, structuredClone(value));
+        },
+        async delete(key: string) {
+          return values.delete(key);
+        },
+        async list({ prefix }: { prefix: string }) {
+          return new Map([...values].filter(([key]) => key.startsWith(prefix)));
+        },
+        async getAlarm() {
+          return alarm;
+        },
+        async setAlarm(at: number | Date) {
+          alarm = at instanceof Date ? at.getTime() : at;
+        },
+        async deleteAlarm() {
+          alarm = null;
+        },
+      },
+    } as unknown as DurableObjectState;
+    const env = {
+      DB: db,
+      DEPLOYMENT_TENANT: 'acme',
+      DEPLOYMENT_IDENTITY_SECRET: 'starter-alarm-identity-secret-0001',
+    } as Env;
+    const createHost = vi.mocked(createThreadAgentHost);
+    const actualCreate = createHost.getMockImplementation();
+    if (!actualCreate) throw new Error('actual host factory is missing');
+    const scopes: AgentThreadInstanceScope[] = [];
+    createHost.mockImplementation((options) => {
+      const host = actualCreate(options);
+      const recover = host.recoverOwnership;
+      vi.spyOn(host, 'recoverOwnership').mockImplementation((scope) => {
+        scopes.push(scope);
+        return recover.call(host, scope);
+      });
+      return host;
+    });
+    try {
+      await new StarterThread(state, env).alarm();
+      expect(scopes).toHaveLength(1);
+      expect(scopes[0]).toMatchObject({
+        threadId: 'starter-cold-thread',
+        deploymentTag: 'acme',
+      });
+      expect(scopes[0]?.init.runtime.executionFence).toBe(executionFence(db));
+      expect(scopes[0]).not.toHaveProperty('principal');
+      expect(values.size).toBe(0);
+      expect(alarm).toBeNull();
+    } finally {
+      createHost.mockImplementation(actualCreate);
+    }
+  });
+
   it('marks only a fully identified idle-run dispatch as lease-held', () => {
     expect(
       idleRunScheduleDispatch({

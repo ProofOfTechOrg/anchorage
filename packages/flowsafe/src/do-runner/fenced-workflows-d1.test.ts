@@ -37,7 +37,10 @@ import {
   RUN_LIFECYCLE_CONTEXT_KEY,
   RunLifecycleBlockedError,
 } from './run-lifecycle.js';
-import { StartIdempotencyStore } from './start-idempotency.js';
+import {
+  StartIdempotencyStore,
+  type StartReservationReading,
+} from './start-idempotency.js';
 import type { RawWorkflowSnapshot } from './workflow-snapshot-row.js';
 
 const PROVENANCE = 'flowsafe.runProvenance';
@@ -111,18 +114,18 @@ async function fixture(
   const reservationStore = options.keyed
     ? new StartIdempotencyStore(db)
     : undefined;
+  let reservation: StartReservationReading | undefined;
   if (reservationStore) {
-    await reservationStore.reserve({
+    const reserved = await reservationStore.reserve({
       key: 'key',
       owner: OWNER,
       targetKind: 'workflow',
       targetId: 'workflow',
       mintRunId: () => execution.runId,
     });
-    expect(await reservationStore.claim('key', execution.runId)).toBe(true);
-    sql.exec("UPDATE flowsafe_start_idempotency SET start_token = ''");
+    reservation = await reservationStore.claimReservation(reserved.reservation);
+    if (!reservation) throw new Error('initial reservation claim was lost');
   }
-  const reservation = await reservationStore?.readForAdmission('key');
   const reading = await fence.read();
   const onInitialWriteAttempt = vi.fn();
   const input: InitialRunAdmission = {

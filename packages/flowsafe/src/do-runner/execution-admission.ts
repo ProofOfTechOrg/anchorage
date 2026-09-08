@@ -9,6 +9,30 @@ import { DoStatusError } from './do-status-error.js';
 import { isPathSafeId } from './path-safe-id.js';
 import { validateTablePrefix } from './table-prefix.js';
 
+export class RunStartPendingError extends DoStatusError {
+  readonly status = 503;
+  readonly reason = { code: 'RUN_START_PENDING' } as const;
+  constructor() {
+    super('run start has no durable execution outcome');
+    this.name = 'RunStartPendingError';
+  }
+}
+
+export function isRunStartPendingError(error: unknown): boolean {
+  try {
+    if (error === null || typeof error !== 'object') return false;
+    const candidate = error as {
+      status?: unknown;
+      reason?: { code?: unknown };
+    };
+    return (
+      candidate.status === 503 && candidate.reason?.code === 'RUN_START_PENDING'
+    );
+  } catch {
+    return false;
+  }
+}
+
 export interface MutationEpochContext {
   readonly mutationEpoch?: number;
 }

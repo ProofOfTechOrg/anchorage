@@ -21,11 +21,7 @@ import {
   RunAdmissionConflictError,
   type StartExecutionIdentity,
 } from './execution-admission.js';
-import type { ExecutionFenceDatabase } from './execution-fence.js';
-import {
-  ExecutionFencedError,
-  ExecutionFenceStore,
-} from './execution-fence.js';
+import { ExecutionFenceStore } from './execution-fence.js';
 import {
   beginIdempotentStart,
   decodeStartReservationAdmissionResult,
@@ -36,7 +32,6 @@ import {
   InvalidStartIdempotencyRequestError,
   isStartReservationRefusal,
   requireStartIdempotency,
-  rollbackFencedStart,
   START_IDEMPOTENCY_DDL,
   START_IDEMPOTENCY_TABLE,
   type StartIdempotencyDatabase,
@@ -46,6 +41,7 @@ import {
   type StartReservation,
   StartReservationOwnerMismatchError,
   type StartReservationReading,
+  type StartReservationRequest,
   StartReservationTargetMismatchError,
   StartReservationUnreadableError,
   validateStartReservationAdmissionSchema,
@@ -54,7 +50,7 @@ import {
 const OWNER = { kind: 'human', id: 'operator-1' } as const;
 const OTHER_OWNER = { kind: 'human', id: 'operator-2' } as const;
 
-describe('FS8 D2 dormant reservation primitives', () => {
+describe('FS8 D2 exact reservation primitives', () => {
   const execution: StartExecutionIdentity = {
     tablePrefix: '',
     workflowId: 'payout',
@@ -74,8 +70,7 @@ describe('FS8 D2 dormant reservation primitives', () => {
   async function modern(state: 'reserved' | 'started' = 'reserved') {
     const h = harness();
     const reserved = await h.store.reserve(workflowRequest('key', 'run'));
-    expect(reserved.reservation.binding).toEqual({ kind: 'legacy' });
-    expect(rows(h.sqlite)[0]).toMatchObject(legacyBinding);
+    expect(reserved.reservation.binding).toEqual({ kind: 'unbound' });
     h.sqlite
       .prepare(
         "UPDATE flowsafe_start_idempotency SET state = ?, start_token = ''",
@@ -1130,37 +1125,6 @@ describe('FS8 D2 dormant reservation primitives', () => {
     expect(await h.store.settleExecution(execution)).toBe(0);
     expect(rows(h.sqlite)[0]?.updated_at).toBe(2_000);
   });
-
-  it('keeps modern primitives dormant during ordinary start replay rollback and terminal flows', async () => {
-    const h = harness();
-    const spies = [...methods, 'settleExecution' as const].map((method) =>
-      vi.spyOn(h.store, method),
-    );
-    const request = workflowRequest('key', 'run');
-    await expect(
-      beginIdempotentStart(h.store, request, EMPTY_SURFACE),
-    ).resolves.toMatchObject({ kind: 'start' });
-    expect(await h.store.release('key', 'run')).toBe(true);
-    await expect(
-      beginIdempotentStart(h.store, request, EMPTY_SURFACE),
-    ).resolves.toMatchObject({ kind: 'start' });
-    await expect(
-      beginIdempotentStart(h.store, request, {
-        ...EMPTY_SURFACE,
-        persisted: async () => 'done',
-      }),
-    ).resolves.toMatchObject({ kind: 'replay', persisted: 'done' });
-    expect(await h.store.settleRun('run')).toBe(1);
-    h.sqlite.exec(
-      'UPDATE flowsafe_start_idempotency SET created_at = 100, updated_at = -0.5',
-    );
-    expect((await h.store.read('key'))?.updatedAt).toBe(-0.5);
-    expect(rows(h.sqlite)[0]).toMatchObject(legacyBinding);
-    for (const spy of spies) {
-      expect(spy).not.toHaveBeenCalled();
-      spy.mockRestore();
-    }
-  });
 });
 
 describe('strict initial-admission reservation observations', () => {
@@ -1615,7 +1579,7 @@ describe('reservation binding representation', () => {
         await expect(
           store.reserve(workflowRequest('new', 'new-run')),
         ).resolves.toMatchObject({
-          reservation: { binding: { kind: 'legacy' } },
+          reservation: { binding: { kind: 'unbound' } },
         });
       else {
         const error = await store
@@ -1818,19 +1782,6 @@ describe('reservation binding representation', () => {
     }
   });
 
-  it('keeps reserve claim release and settle on legacy-null rows in A', async () => {
-    const { store, sqlite } = harness();
-    const created = await store.reserve(workflowRequest('key', 'run'));
-    expect(created.reservation.binding).toEqual({ kind: 'legacy' });
-    expect(await store.claim('key', 'run')).toBe(true);
-    expect(await store.release('key', 'run')).toBe(true);
-    expect(await store.claim('key', 'run')).toBe(true);
-    expect(await store.settleRun('run')).toBe(1);
-    expect(rows(sqlite)).toEqual([
-      expect.objectContaining({ ...legacyBinding, state: 'terminal' }),
-    ]);
-  });
-
   it('captures the first ready getter result with the store receiver', async () => {
     const { sqlite, binding } = harness();
     let getterReads = 0;
@@ -1890,7 +1841,7 @@ describe('reservation binding representation', () => {
       targetId: 'agent',
       threadId: 'thread',
       runId: 'run',
-      binding: { kind: 'legacy' },
+      binding: { kind: 'unbound' },
     });
     const counts = new Map<string, number>();
     const data = workflowRequest('getter-key', 'getter-run');
@@ -2263,116 +2214,6 @@ describe('StartIdempotencyStore.reserve', () => {
   });
 });
 
-describe('StartIdempotencyStore.claim', () => {
-  it('lets exactly one of many concurrent callers through', async () => {
-    // #given one reservation and five callers racing its claim — the
-    // cross-isolate race the agent surface cannot serialize any other way
-    const { store } = harness();
-    const { reservation } = await store.reserve(
-      workflowRequest('key-1', 'run-1'),
-    );
-
-    // #when
-    const outcomes = await Promise.all(
-      Array.from({ length: 5 }, () =>
-        store.claim(reservation.key, reservation.runId),
-      ),
-    );
-
-    // #then exactly one winner. Not "at most one", not "usually one".
-    expect(outcomes.filter(Boolean)).toHaveLength(1);
-  });
-
-  it('refuses a claim naming a different run than the reservation holds', async () => {
-    // #given
-    const { store } = harness();
-    await store.reserve(workflowRequest('key-1', 'run-1'));
-
-    // #when / #then a claim can never land on a row rewritten underneath it
-    expect(await store.claim('key-1', 'run-other')).toBe(false);
-  });
-
-  it('cannot re-claim a reservation that is already started', async () => {
-    // #given a claimed reservation
-    const { store } = harness();
-    await store.reserve(workflowRequest('key-1', 'run-1'));
-    expect(await store.claim('key-1', 'run-1')).toBe(true);
-
-    // #when / #then
-    expect(await store.claim('key-1', 'run-1')).toBe(false);
-  });
-});
-
-describe('StartIdempotencyStore.release', () => {
-  it('returns a claim to reserved so a retry after the fence reopens converges', async () => {
-    // #given a claim taken and then refused by the fence
-    const { store } = harness();
-    await store.reserve(workflowRequest('key-1', 'run-1'));
-    await store.claim('key-1', 'run-1');
-
-    // #when
-    expect(await store.release('key-1', 'run-1')).toBe(true);
-
-    // #then the SAME run id is claimable again — a fence transition mid-start
-    // must not manufacture an unresolvable reservation out of an operator
-    // action, nor hand the retry a second run.
-    expect((await store.read('key-1'))?.state).toBe('reserved');
-    expect(await store.claim('key-1', 'run-1')).toBe(true);
-    expect((await store.read('key-1'))?.runId).toBe('run-1');
-  });
-
-  it('cannot release a reservation that already settled', async () => {
-    // #given a terminal reservation
-    const { store } = harness();
-    await store.reserve(workflowRequest('key-1', 'run-1'));
-    await store.claim('key-1', 'run-1');
-    await store.settleRun('run-1');
-
-    // #when / #then a spent key never becomes startable again
-    expect(await store.release('key-1', 'run-1')).toBe(false);
-    expect((await store.read('key-1'))?.state).toBe('terminal');
-  });
-});
-
-describe('StartIdempotencyStore.settleRun', () => {
-  it('marks the run’s reservation terminal and stamps the horizon from that moment', async () => {
-    // #given a claimed reservation, and a clock that moves
-    let now = 1_000;
-    const { store } = harness(() => now);
-    await store.reserve(workflowRequest('key-1', 'run-1'));
-    await store.claim('key-1', 'run-1');
-    now = 5_000;
-
-    // #when
-    expect(await store.settleRun('run-1')).toBe(1);
-
-    // #then
-    const stored = await store.read('key-1');
-    expect(stored?.state).toBe('terminal');
-    expect(stored?.updatedAt).toBe(5_000);
-  });
-
-  it('is a no-op the second time, so every terminal path may call it', async () => {
-    // #given — a run can reach terminal by completing, failing, being cancelled
-    // or timing out, and those paths do not coordinate.
-    const { store } = harness();
-    await store.reserve(workflowRequest('key-1', 'run-1'));
-    await store.settleRun('run-1');
-
-    // #when / #then
-    expect(await store.settleRun('run-1')).toBe(0);
-  });
-
-  it('settles nothing for a run nobody reserved', async () => {
-    // #given the overwhelmingly common case: a run started without a key
-    const { store } = harness();
-    await store.reserve(workflowRequest('key-1', 'run-1'));
-
-    // #when / #then
-    expect(await store.settleRun('run-unrelated')).toBe(0);
-  });
-});
-
 describe('StartIdempotencyStore against a missing table', () => {
   it('reads as absent, and neither claims nor settles', async () => {
     // #given a database on which no key has ever been used, so the lazy DDL
@@ -2382,9 +2223,7 @@ describe('StartIdempotencyStore against a missing table', () => {
     // #when / #then absence is not a fault — it is an empty table by another
     // name — but it must also never look like a successful transition.
     expect(await store.read('key-1')).toBeUndefined();
-    expect(await store.claim('key-1', 'run-1')).toBe(false);
-    expect(await store.release('key-1', 'run-1')).toBe(false);
-    expect(await store.settleRun('run-1')).toBe(0);
+
     expect(await store.reservationsForRuns(['run-1'])).toEqual([]);
   });
 
@@ -2435,7 +2274,12 @@ describe('beginIdempotentStart', () => {
     const { store } = harness();
     const persisted = new Map<string, string>();
     const surface: IdempotentStartSurface<string> = {
-      persisted: async (reservation) => persisted.get(reservation.runId),
+      persisted: async (reservation) => {
+        const value = persisted.get(reservation.runId);
+        return value === undefined
+          ? undefined
+          : { kind: 'result', value, execution: executionFor(reservation) };
+      },
       live: async () => false,
     };
 
@@ -2466,13 +2310,20 @@ describe('beginIdempotentStart', () => {
     // whose run persisted
     const { store } = harness();
     await store.reserve(workflowRequest('key-1', 'run-1'));
-    await store.claim('key-1', 'run-1');
+    await claimObserved(store, 'key-1');
 
     // #when
     const decision = await beginIdempotentStart(
       store,
       workflowRequest('key-1', 'run-2'),
-      { persisted: async () => 'summary', live: async () => false },
+      {
+        persisted: async (row) => ({
+          kind: 'result',
+          value: 'summary',
+          execution: executionFor(row),
+        }),
+        live: async () => false,
+      },
     );
 
     // #then the persisted state wins over the row's state: a stale `started`
@@ -2498,7 +2349,7 @@ describe('beginIdempotentStart', () => {
     // that can never be used again.
     expect(decision).toMatchObject({
       kind: 'start',
-      reservation: { runId: 'run-1', state: 'reserved' },
+      reservation: { runId: 'run-1', state: 'started' },
     });
   });
 
@@ -2510,7 +2361,7 @@ describe('beginIdempotentStart', () => {
     const { store } = harness(() => now);
     await store.reserve(workflowRequest('key-1', 'run-1'));
     now = 2_500;
-    await store.claim('key-1', 'run-1');
+    await claimObserved(store, 'key-1');
 
     // #when
     const refusal = await beginIdempotentStart(
@@ -2536,7 +2387,7 @@ describe('beginIdempotentStart', () => {
     // persisted, and the host that took it is gone
     const { store } = harness();
     await store.reserve(workflowRequest('key-1', 'run-1'));
-    await store.claim('key-1', 'run-1');
+    await claimObserved(store, 'key-1');
 
     // #when
     const refusal = await beginIdempotentStart(
@@ -2560,8 +2411,8 @@ describe('beginIdempotentStart', () => {
     // #given a completed run whose snapshot the retention purge removed
     const { store } = harness();
     await store.reserve(workflowRequest('key-1', 'run-1'));
-    await store.claim('key-1', 'run-1');
-    await store.settleRun('run-1');
+    await claimObserved(store, 'key-1');
+    await settleObserved(store, 'key-1');
 
     // #when
     const refusal = await beginIdempotentStart(
@@ -2625,17 +2476,16 @@ describe('beginIdempotentStart', () => {
     // creating the row entitles A to start it, and if both ever believed they
     // could, the key would have bought nothing.
     const { store } = harness();
+    let winnerLive = false;
     const live: IdempotentStartSurface<string> = {
       persisted: async () => undefined,
-      // The winner IS executing — the realistic state of the world at the
-      // moment the loser asks.
-      live: async () => true,
+      live: async () => winnerLive,
     };
     const decisions: string[] = [];
     let loserDecision: unknown;
-    const realClaim = store.claim.bind(store);
+    const realClaim = store.claimReservation.bind(store);
     let interleaved = false;
-    store.claim = async (key: string, runId: string) => {
+    store.claimReservation = async (row) => {
       if (!interleaved) {
         // B arrives in the window between A's insert and A's claim.
         interleaved = true;
@@ -2644,8 +2494,9 @@ describe('beginIdempotentStart', () => {
           workflowRequest('key-1', 'run-B'),
           live,
         );
+        winnerLive = true;
       }
-      return realClaim(key, runId);
+      return realClaim(row);
     };
 
     // #when A (the creator) races its own claim against B's
@@ -2790,162 +2641,6 @@ describe('beginIdempotentStart', () => {
   });
 });
 
-describe('rollbackFencedStart', () => {
-  it('gives the claim back for a fence refusal and re-throws it unchanged', async () => {
-    // #given a claim consumed by a start the fence refused — provably
-    // pre-execution, because the fence is read before the run lock
-    const { store } = harness();
-    await store.reserve(workflowRequest('key-1', 'run-1'));
-    await store.claim('key-1', 'run-1');
-    const fenced = new ExecutionFencedError('migration-locked', 'run start');
-
-    // #when
-    const thrown = await rollbackFencedStart(
-      store,
-      'key-1',
-      'run-1',
-      fenced,
-    ).catch((error: unknown) => error);
-
-    // #then the caller still sees the fence's own refusal, and the key is
-    // usable again once the operator reopens.
-    expect(thrown).toBe(fenced);
-    expect((await store.read('key-1'))?.state).toBe('reserved');
-  });
-
-  it('recognizes a fence refusal that crossed a Durable Object boundary', async () => {
-    // #given the shape a fenced run-DO start takes on the Worker side: the
-    // class is gone, the status and structured reason survive
-    const { store } = harness();
-    await store.reserve(workflowRequest('key-1', 'run-1'));
-    await store.claim('key-1', 'run-1');
-    const wire = Object.assign(new Error('deployment execution is fenced'), {
-      status: 503,
-      reason: { code: 'EXECUTION_FENCED', state: 'migration-locked' },
-    });
-
-    // #when
-    await rollbackFencedStart(store, 'key-1', 'run-1', wire).catch(
-      () => undefined,
-    );
-
-    // #then rolled back all the same — an instanceof-only test would answer
-    // "not a fence refusal" for every caller on the far side of the boundary,
-    // which is where the run router actually sits.
-    expect((await store.read('key-1'))?.state).toBe('reserved');
-  });
-
-  it('KEEPS the claim for any other start failure', async () => {
-    // #given a start that failed for a reason that may well have executed
-    const { store } = harness();
-    await store.reserve(workflowRequest('key-1', 'run-1'));
-    await store.claim('key-1', 'run-1');
-
-    // #when
-    await rollbackFencedStart(
-      store,
-      'key-1',
-      'run-1',
-      new Error('step exploded'),
-    ).catch(() => undefined);
-
-    // #then still claimed: releasing here would hand the next retry a second
-    // run after a start that may already have charged somebody.
-    expect((await store.read('key-1'))?.state).toBe('started');
-  });
-
-  it('completes the whole round trip: claim, fence refusal, release, reopen, and ONE execution of the same run', async () => {
-    // #given a real fence and a real reservation over one database, and a host
-    // whose start executes paid work — the shape the round trip has to be
-    // proved in, because each half of it is only correct given the other.
-    const sqlite = openSqlite();
-    const binding = sqliteUnitDatabase(sqlite);
-    const store = new StartIdempotencyStore(
-      binding as StartIdempotencyDatabase,
-    );
-    const fence = new ExecutionFenceStore(binding as ExecutionFenceDatabase);
-    await fence.seed('open');
-    await fence.transition({ expected: 'open', next: 'migration-locked' });
-    let executions = 0;
-    const startRun = async (): Promise<void> => {
-      const reading = await fence.read();
-      if (reading.state !== 'open') {
-        throw new ExecutionFencedError(reading.state, 'run start');
-      }
-      executions += 1;
-    };
-    const attempt = async (candidate: string): Promise<StartReservation> => {
-      const decision = await beginIdempotentStart(
-        store,
-        workflowRequest('key-1', candidate),
-        EMPTY_SURFACE,
-      );
-      if (decision.kind !== 'start') throw new Error('expected a start');
-      const { key, runId } = decision.reservation;
-      try {
-        await startRun();
-      } catch (error) {
-        return rollbackFencedStart(store, key, runId, error);
-      }
-      return decision.reservation;
-    };
-
-    // #when the fenced attempt is refused, the operator reopens, and the client
-    // retries with the same key
-    const refused = await attempt('run-1').catch((error: unknown) => error);
-    expect(refused).toBeInstanceOf(ExecutionFencedError);
-    expect((await store.read('key-1'))?.state).toBe('reserved');
-    await fence.transition({ expected: 'migration-locked', next: 'open' });
-    const started = await attempt('run-ignored');
-
-    // #then the retry ran the SAME run the fenced attempt reserved, exactly
-    // once. A rollback that did not land would have left the key UNRESOLVABLE
-    // forever; a rollback that handed back a fresh run id would have made an
-    // operator's drain the cause of a second charge.
-    expect(started.runId).toBe('run-1');
-    expect(executions).toBe(1);
-    expect((await store.read('key-1'))?.state).toBe('started');
-  });
-
-  it('still re-throws the fence refusal when the release itself fails', async () => {
-    // #given a claimed reservation and a store whose release cannot be written
-    // — a storage incident arriving during a deployment that is already
-    // refusing to execute
-    const { store } = harness();
-    await store.reserve(workflowRequest('key-1', 'run-1'));
-    await store.claim('key-1', 'run-1');
-    store.release = async () => {
-      throw new Error('D1_ERROR: network');
-    };
-    const fenced = new ExecutionFencedError('migration-locked', 'run start');
-
-    // #when
-    const thrown = await rollbackFencedStart(
-      store,
-      'key-1',
-      'run-1',
-      fenced,
-    ).catch((error: unknown) => error);
-
-    // #then the caller sees the FENCE's refusal, not the storage error:
-    // swallowing it would leave the caller believing the deployment is broken
-    // rather than fenced, and the rollback's own failure is not something the
-    // caller can act on.
-    expect(thrown).toBe(fenced);
-    // The claim stayed taken, so the key is now UNRESOLVABLE rather than
-    // startable — recoverable by investigation, which is the direction this
-    // best-effort rollback deliberately fails in.
-    expect((await store.read('key-1'))?.state).toBe('started');
-    await expect(
-      beginIdempotentStart(
-        store,
-        workflowRequest('key-1', 'run-2'),
-        EMPTY_SURFACE,
-      ),
-    ).rejects.toBeInstanceOf(IdempotentStartUnresolvableError);
-  });
-});
-
 describe('requireStartIdempotency', () => {
   it('refuses a key on a host that wired no store', () => {
     // #given / #when / #then honouring the key silently would answer an
@@ -2985,108 +2680,681 @@ describe('reservationsForRuns', () => {
   });
 });
 
-describe('proof-only composition', () => {
-  it('re-asserts the proof binding on a REPLAY, so a run whose binding was lost stays resumable', async () => {
-    // #given a proof-only deployment whose proof run already exists and
-    // persisted, but whose fence has lost its proof_run_id — the shape left by
-    // a fence moved away and back onto the same key while the run survived.
-    // Without the binding, proof-only admits no resume for it at all.
-    const sqlite = openSqlite();
-    const binding = sqliteUnitDatabase(sqlite);
-    const store = new StartIdempotencyStore(
-      binding as StartIdempotencyDatabase,
-    );
-    const fence = new ExecutionFenceStore(binding as ExecutionFenceDatabase);
-    await fence.seed('migration-locked');
-    await fence.transition({
-      expected: 'migration-locked',
-      next: 'proof-only',
-      proofKey: 'proof-key-1',
-    });
-    await store.reserve({
-      ...workflowRequest('proof-key-1', 'proof-run'),
-      key: 'proof-key-1',
-    });
-    await store.claim('proof-key-1', 'proof-run');
-    expect((await fence.read()).proofRunId).toBeUndefined();
+function executionFor(row: StartReservationReading): StartExecutionIdentity {
+  return {
+    tablePrefix: '',
+    workflowId: row.targetKind === 'workflow' ? row.targetId : 'agent-loop',
+    runId: row.runId,
+    startToken: 'generation',
+    owner: row.owner,
+    target:
+      row.targetKind === 'workflow'
+        ? { kind: 'workflow', id: row.targetId }
+        : { kind: 'agent', id: row.targetId, threadId: row.threadId as string },
+  };
+}
+async function claimObserved(store: StartIdempotencyStore, key: string) {
+  const row = await store.readForAdmission(key);
+  if (!row) throw new Error('fixture reservation missing');
+  const claim = await store.claimReservation(row);
+  if (!claim) throw new Error('fixture claim missing');
+  return claim;
+}
+async function settleObserved(store: StartIdempotencyStore, key: string) {
+  const row = await store.readForAdmission(key);
+  if (!row) throw new Error('fixture reservation missing');
+  const execution = executionFor(row);
+  await store.associateReservation(row, execution);
+  return store.settleExecution(execution);
+}
 
-    // #when a retry carrying the same key finds the run persisted
-    const decision = await beginIdempotentStart(
-      store,
-      workflowRequest('proof-key-1', 'ignored'),
-      { persisted: async () => 'summary', live: async () => false },
-      fence,
-    );
-
-    // #then the replay answered with the run's state AND put the binding back
-    expect(decision.kind).toBe('replay');
-    await expect(fence.read()).resolves.toEqual({
-      state: 'proof-only',
-      proofKey: 'proof-key-1',
-      proofRunId: 'proof-run',
-      mutationEpoch: 0,
-      requireMutationEpoch: false,
-      transitionRevision: 1,
+describe('FS8 D3 F3 activation', () => {
+  it.each([
+    ['same-tick clock', 1_000],
+    ['backward clock', 900],
+  ] as const)('keeps a delayed creator pending after another caller releases its claim (%s)', async (_scenario, laterClock) => {
+    let clock = 1_000;
+    const h = harness(() => clock);
+    const other = new StartIdempotencyStore(h.binding, { now: () => clock });
+    let entered!: () => void;
+    let release!: () => void;
+    const waiting = new Promise<void>((resolve) => {
+      entered = resolve;
     });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const read = h.store.read.bind(h.store);
+    vi.spyOn(h.store, 'read').mockImplementationOnce(async (key) => {
+      entered();
+      await gate;
+      return read(key);
+    });
+    const live = vi.fn(async () => true);
+    const surface = { persisted: async () => undefined, live };
+    const claim = vi.spyOn(h.store, 'claimReservation');
+    const pending = beginIdempotentStart(
+      h.store,
+      workflowRequest('key', 'run'),
+      surface,
+    ).catch((error: unknown) => error);
+    try {
+      await waiting;
+      clock = laterClock;
+      const winner = await beginIdempotentStart(
+        other,
+        workflowRequest('key', 'discarded-run'),
+        EMPTY_SURFACE,
+      );
+      expect(winner.kind).toBe('start');
+      await other.releaseReservation(winner.reservation);
+      const released = await other.readForAdmission('key');
+      const before = rows(h.sqlite);
+      expect(released).toMatchObject({
+        state: 'reserved',
+        createdAt: 1_000,
+        updatedAt: 1_002,
+        binding: { kind: 'unbound' },
+      });
+      release();
+      const outcome = await pending;
+      expect(rows(h.sqlite)).toEqual(before);
+      expect(claim).not.toHaveBeenCalled();
+      expect(live).toHaveBeenCalledExactlyOnceWith(released);
+      expect(outcome).toBeInstanceOf(IdempotentStartPendingError);
+
+      live.mockResolvedValue(false);
+      const retry = await beginIdempotentStart(
+        h.store,
+        workflowRequest('key', 'discarded-retry-run'),
+        surface,
+      );
+      expect(retry).toEqual({
+        kind: 'start',
+        reservation: { ...released, state: 'started', updatedAt: 1_003 },
+      });
+      expect(claim).toHaveBeenCalledExactlyOnceWith(released);
+    } finally {
+      release();
+      await pending;
+    }
   });
 
-  it('changes nothing on a replay whose key is not the nominated proof key', async () => {
-    // #given a proof-only fence nominating a DIFFERENT key
-    const sqlite = openSqlite();
-    const binding = sqliteUnitDatabase(sqlite);
-    const store = new StartIdempotencyStore(
-      binding as StartIdempotencyDatabase,
-    );
-    const fence = new ExecutionFenceStore(binding as ExecutionFenceDatabase);
-    await fence.seed('migration-locked');
-    await fence.transition({
-      expected: 'migration-locked',
-      next: 'proof-only',
-      proofKey: 'proof-key-1',
-    });
-    await store.reserve(workflowRequest('other-key', 'other-run'));
-    await store.claim('other-key', 'other-run');
-
-    // #when
-    await beginIdempotentStart(
-      store,
-      workflowRequest('other-key', 'ignored'),
-      { persisted: async () => 'summary', live: async () => false },
-      fence,
-    );
-
-    // #then the proof slot is untouched: every guard lives in recordProofRun's
-    // own CAS, so an unrelated key is zero rows and no harm.
-    await expect(fence.read()).resolves.toEqual({
-      state: 'proof-only',
-      proofKey: 'proof-key-1',
-      mutationEpoch: 0,
-      requireMutationEpoch: false,
-      transitionRevision: 1,
-    });
-  });
-
-  it('does not fail a replay when the proof re-bind cannot be written', async () => {
-    // #given a fence whose write-back throws — a storage incident during a
-    // replay of a run that already happened
-    const { store } = harness();
-    await store.reserve(workflowRequest('key-1', 'run-1'));
-    await store.claim('key-1', 'run-1');
-    const failing = {
-      recordProofRun: async () => {
-        throw new Error('D1_ERROR: network');
+  it('retains a reserved row while its previous wrapper remains live, then reclaims after cleanup', async () => {
+    const h = harness();
+    await h.store.reserve(workflowRequest('key', 'run'));
+    const firstClaim = await claimObserved(h.store, 'key');
+    await h.store.releaseReservation(firstClaim);
+    const before = rows(h.sqlite);
+    const retained = await h.store.readForAdmission('key');
+    const claim = vi.spyOn(h.store, 'claimReservation');
+    const live = vi.fn(async () => true);
+    const surface = { persisted: async () => undefined, live };
+    await expect(
+      beginIdempotentStart(h.store, workflowRequest('key', 'other'), surface),
+    ).rejects.toMatchObject({
+      reason: {
+        code: 'IDEMPOTENT_START_PENDING',
+        runId: 'run',
+        pendingSince: retained?.updatedAt,
       },
-    } as unknown as ExecutionFenceStore;
+    });
+    expect(claim).not.toHaveBeenCalled();
+    expect(rows(h.sqlite)).toEqual(before);
+    expect(live).toHaveBeenCalledWith(retained);
+    expect(live.mock.contexts).toEqual([surface]);
 
-    // #when / #then the caller still gets the run's persisted state: refusing
-    // the read would answer a successful retry with an error while changing
-    // nothing about the run.
+    live.mockResolvedValue(false);
     const decision = await beginIdempotentStart(
-      store,
-      workflowRequest('key-1', 'run-2'),
-      { persisted: async () => 'summary', live: async () => false },
-      failing,
+      h.store,
+      workflowRequest('key', 'other'),
+      surface,
     );
-    expect(decision.kind).toBe('replay');
+    expect(decision).toEqual({
+      kind: 'start',
+      reservation: { ...retained, state: 'started', updatedAt: 1_003 },
+    });
+    expect(claim).toHaveBeenCalledExactlyOnceWith(retained);
+    expect(await h.store.readForAdmission('key')).toEqual(decision.reservation);
+  });
+
+  it('leaves a retained reserved row unchanged when its liveness probe throws', async () => {
+    const h = harness();
+    await h.store.reserve(workflowRequest('key', 'run'));
+    await h.store.releaseReservation(await claimObserved(h.store, 'key'));
+    const before = rows(h.sqlite);
+    const claim = vi.spyOn(h.store, 'claimReservation');
+    const failure = new Error('liveness unavailable');
+    await expect(
+      beginIdempotentStart(h.store, workflowRequest('key', 'other'), {
+        persisted: async () => undefined,
+        live: async () => {
+          throw failure;
+        },
+      }),
+    ).rejects.toBe(failure);
+    expect(claim).not.toHaveBeenCalled();
+    expect(rows(h.sqlite)).toEqual(before);
+  });
+
+  it.each([
+    'claim',
+    'release',
+    'release-reclaim',
+  ] as const)('loses the exact reclaim CAS after another caller completes %s during the probe', async (race) => {
+    const h = harness();
+    await h.store.reserve(workflowRequest('key', 'run'));
+    await h.store.releaseReservation(await claimObserved(h.store, 'key'));
+    const retained = await h.store.readForAdmission('key');
+    const other = new StartIdempotencyStore(h.binding, { now: () => 1_000 });
+    const claim = vi.spyOn(h.store, 'claimReservation');
+    let current: StartReservationReading | undefined;
+    let afterWinner: Array<Record<string, unknown>> = [];
+    const live = vi.fn(async () => {
+      if (current !== undefined) return current.state === 'started';
+      const winner = await claimObserved(other, 'key');
+      if (race !== 'claim') {
+        await other.releaseReservation(winner);
+        if (race === 'release-reclaim') await claimObserved(other, 'key');
+      }
+      current = await other.readForAdmission('key');
+      afterWinner = rows(h.sqlite);
+      return false;
+    });
+    await expect(
+      beginIdempotentStart(h.store, workflowRequest('key', 'other'), {
+        persisted: async () => undefined,
+        live,
+      }),
+    ).rejects.toBeInstanceOf(
+      race === 'release'
+        ? IdempotentStartUnresolvableError
+        : IdempotentStartPendingError,
+    );
+    expect(claim).toHaveBeenCalledExactlyOnceWith(retained);
+    expect(live).toHaveBeenCalledTimes(2);
+    expect(rows(h.sqlite)).toEqual(afterWinner);
+    expect(await h.store.readForAdmission('key')).toEqual(current);
+    expect(current?.updatedAt).toBe(
+      race === 'claim' ? 1_003 : race === 'release' ? 1_004 : 1_005,
+    );
+  });
+
+  it('replays a persisted retained reservation without probing or claiming', async () => {
+    const h = harness();
+    const { reservation } = await h.store.reserve(
+      workflowRequest('key', 'run'),
+    );
+    const live = vi.fn(async () => {
+      throw new Error('liveness unavailable');
+    });
+    const claim = vi.spyOn(h.store, 'claimReservation');
+    const decision = await beginIdempotentStart(
+      h.store,
+      workflowRequest('key', 'other'),
+      {
+        persisted: async () => ({
+          kind: 'result',
+          value: 'done',
+          execution: executionFor(reservation),
+        }),
+        live,
+      },
+    );
+    expect(decision).toMatchObject({ kind: 'replay', persisted: 'done' });
+    expect(claim).not.toHaveBeenCalled();
+    expect(live).not.toHaveBeenCalled();
+  });
+
+  it('claims a newly created key without consulting liveness or persistence', async () => {
+    const h = harness();
+    const unavailable = vi.fn(async () => {
+      throw new Error('no existing run');
+    });
+    await expect(
+      beginIdempotentStart(h.store, workflowRequest('key', 'run'), {
+        persisted: unavailable,
+        live: unavailable,
+      }),
+    ).resolves.toMatchObject({ kind: 'start' });
+    expect(unavailable).not.toHaveBeenCalled();
+  });
+
+  it('returns the exact winning started row with modern unbound binding', async () => {
+    const h = harness();
+    const decision = await beginIdempotentStart(
+      h.store,
+      workflowRequest('key', 'run'),
+      EMPTY_SURFACE,
+    ).catch((error) => error);
+    expect(rows(h.sqlite)[0]).toMatchObject({
+      state: 'started',
+      start_token: '',
+      updated_at: 1001,
+    });
+    expect(decision.reservation).toEqual(await h.store.readForAdmission('key'));
+    expect(decision.reservation.state).toBe('started');
+  });
+
+  it.each([
+    'reserved',
+    'started',
+    'terminal',
+  ] as const)('refuses a legacy %s reservation before consulting its producer', async (state) => {
+    const h = harness();
+    const { reservation } = await h.store.reserve(
+      workflowRequest('key', 'run'),
+    );
+    h.sqlite
+      .prepare(
+        'UPDATE flowsafe_start_idempotency SET state = ?, start_token = NULL',
+      )
+      .run(state);
+    const before = rows(h.sqlite);
+    const persisted = vi.fn(async () => ({
+      kind: 'result' as const,
+      value: 'done',
+      execution: executionFor(reservation),
+    }));
+    const outcome = await beginIdempotentStart(
+      h.store,
+      workflowRequest('key', 'other'),
+      { persisted, live: async () => true },
+    ).catch((error) => error);
+    expect(rows(h.sqlite)).toEqual(before);
+    expect(persisted).not.toHaveBeenCalled();
+    expect(outcome).toBeInstanceOf(
+      state === 'terminal'
+        ? IdempotentStartAlreadySettledError
+        : IdempotentStartUnresolvableError,
+    );
+  });
+
+  it.each([
+    'bound',
+    'legacy',
+  ] as const)('never attempts to reclaim an absent %s reserved reservation', async (binding) => {
+    const h = harness();
+    const { reservation } = await h.store.reserve(
+      workflowRequest('key', 'run'),
+    );
+    if (binding === 'bound')
+      await h.store.associateReservation(
+        reservation,
+        executionFor(reservation),
+      );
+    else
+      h.sqlite.exec('UPDATE flowsafe_start_idempotency SET start_token = NULL');
+    const before = rows(h.sqlite);
+    const claim = vi.spyOn(h.store, 'claimReservation');
+    const outcome = await beginIdempotentStart(
+      h.store,
+      workflowRequest('key', 'other'),
+      EMPTY_SURFACE,
+    ).catch((error) => error);
+    expect(rows(h.sqlite)).toEqual(before);
+    expect(claim).not.toHaveBeenCalled();
+    expect(outcome).toBeInstanceOf(IdempotentStartUnresolvableError);
+  });
+
+  it.each([
+    'startToken',
+    'tablePrefix',
+    'workflowId',
+  ] as const)('compares bound %s before classifying a replacement initial snapshot', async (field) => {
+    const h = harness();
+    const reserved = await h.store.reserve({
+      key: 'key',
+      owner: OWNER,
+      targetKind: 'agent',
+      targetId: 'agent',
+      threadId: 'thread',
+      mintRunId: () => 'run',
+    });
+    const execution = executionFor(reserved.reservation);
+    await h.store.associateReservation(reserved.reservation, execution);
+    const before = rows(h.sqlite);
+    const live = vi.fn(async () => true);
+    const outcome = await beginIdempotentStart(
+      h.store,
+      {
+        key: 'key',
+        owner: OWNER,
+        targetKind: 'agent',
+        targetId: 'agent',
+        threadId: 'candidate',
+        mintRunId: () => 'other',
+      },
+      {
+        persisted: async () => ({
+          kind: 'initial',
+          execution: {
+            ...execution,
+            [field]: field === 'tablePrefix' ? 'other_' : 'replacement',
+          },
+        }),
+        live,
+      },
+    ).catch((error) => error);
+    expect(rows(h.sqlite)).toEqual(before);
+    expect(live).not.toHaveBeenCalled();
+    expect(outcome).toBeInstanceOf(IdempotentStartUnresolvableError);
+  });
+
+  it.each([
+    'reserved',
+    'started',
+    'terminal',
+  ] as const)('never associates or replays a matching initial snapshot from %s', async (state) => {
+    const h = harness();
+    const { reservation } = await h.store.reserve(
+      workflowRequest('key', 'run'),
+    );
+    h.sqlite
+      .prepare('UPDATE flowsafe_start_idempotency SET state = ?')
+      .run(state);
+    const before = rows(h.sqlite);
+    const outcome = await beginIdempotentStart(
+      h.store,
+      workflowRequest('key', 'other'),
+      {
+        persisted: async () => ({
+          kind: 'initial',
+          execution: executionFor(reservation),
+        }),
+        live: async () => true,
+      },
+    ).catch((error) => error);
+    expect(rows(h.sqlite)).toEqual(before);
+    expect(outcome).toBeInstanceOf(
+      state === 'terminal'
+        ? IdempotentStartAlreadySettledError
+        : IdempotentStartPendingError,
+    );
+  });
+
+  it('associates the same observed value after its snapshot disappears and preserves generic undefined results', async () => {
+    for (const value of [{ status: 'success' }, undefined]) {
+      const h = harness();
+      const { reservation } = await h.store.reserve(
+        workflowRequest('key', 'run'),
+      );
+      h.sqlite.exec(
+        'CREATE TABLE mastra_workflow_snapshot (run_id TEXT, snapshot TEXT)',
+      );
+      h.sqlite
+        .prepare('INSERT INTO mastra_workflow_snapshot VALUES (?,?)')
+        .run('run', JSON.stringify(value ?? null));
+      let observedValue = value;
+      const persisted = vi.fn(async () => {
+        const snapshot = h.sqlite
+          .prepare(
+            'SELECT snapshot FROM mastra_workflow_snapshot WHERE run_id = ?',
+          )
+          .get('run') as { snapshot: string } | undefined;
+        if (snapshot === undefined) return undefined;
+        observedValue =
+          value === undefined ? undefined : JSON.parse(snapshot.snapshot);
+        const result = {
+          kind: 'result' as const,
+          value: observedValue,
+          execution: executionFor(reservation),
+        };
+        h.sqlite.exec('DELETE FROM mastra_workflow_snapshot');
+        return result;
+      });
+      const associate = vi.spyOn(h.store, 'associateReservation');
+      const result = await beginIdempotentStart(
+        h.store,
+        workflowRequest('key', 'other'),
+        { persisted, live: async () => false },
+      );
+      expect(rows(h.sqlite)[0]).toMatchObject({
+        start_token: 'generation',
+        state: 'reserved',
+      });
+      expect(
+        h.sqlite.prepare('SELECT * FROM mastra_workflow_snapshot').all(),
+      ).toEqual([]);
+      expect(persisted).toHaveBeenCalledTimes(1);
+      expect(associate).toHaveBeenCalledTimes(1);
+      expect(result.kind).toBe('replay');
+      if (result.kind === 'replay')
+        expect(result.persisted).toBe(observedValue);
+    }
+  });
+
+  it('captures request, receiver, original proof round and caller epoch before any waits', async () => {
+    const h = harness();
+    const fence = new ExecutionFenceStore(h.binding);
+    await fence.seed('migration-locked');
+    for (let revision = 0; revision < 8; revision++)
+      await fence.transition({
+        expected: 'migration-locked',
+        next: 'migration-locked',
+        expectedMutationEpoch: revision,
+        expectedRevision: revision,
+        advanceMutationEpoch: revision < 7,
+      });
+    await fence.transition({
+      expected: 'migration-locked',
+      next: 'proof-only',
+      proofKey: 'key',
+      expectedMutationEpoch: 7,
+      expectedRevision: 8,
+    });
+    const request: StartReservationRequest = workflowRequest('key', 'run');
+    await h.store.reserve(request);
+    let mintReceiver: unknown;
+    request.mintRunId = function () {
+      mintReceiver = this;
+      return 'other';
+    };
+    const persisted = vi.fn(async (row: StartReservationReading) => {
+      await fence.transition({
+        expected: 'proof-only',
+        next: 'migration-locked',
+        expectedMutationEpoch: 7,
+        expectedRevision: 9,
+      });
+      await fence.transition({
+        expected: 'migration-locked',
+        next: 'proof-only',
+        proofKey: 'key',
+        expectedMutationEpoch: 7,
+        expectedRevision: 10,
+      });
+      return {
+        kind: 'result' as const,
+        value: 'done',
+        execution: executionFor(row),
+      };
+    });
+    const surface = {
+      persisted,
+      live: async () => false,
+    };
+    const nominated = vi.spyOn(fence, 'rebindProofRun').mockResolvedValue(true);
+    const read = fence.read.bind(fence);
+    vi.spyOn(fence, 'read').mockImplementationOnce(async () => {
+      const frame = await read();
+      request.key = 'changed';
+      request.owner = OTHER_OWNER;
+      request.targetId = 'changed';
+      request.mintRunId = () => {
+        throw new Error('mutated mint');
+      };
+      surface.persisted = vi.fn(async () => {
+        throw new Error('mutated callback');
+      });
+      return frame;
+    });
+    const decision = await beginIdempotentStart(
+      h.store,
+      request,
+      surface,
+      fence,
+      7,
+    );
+    expect(rows(h.sqlite)).toHaveLength(1);
+    expect(await read()).toMatchObject({
+      state: 'proof-only',
+      proofKey: 'key',
+      mutationEpoch: 7,
+      transitionRevision: 11,
+    });
+    expect(decision).toMatchObject({ kind: 'replay', persisted: 'done' });
+    expect(mintReceiver).toBe(request);
+    expect(persisted.mock.contexts).toEqual([surface]);
+    expect(nominated).toHaveBeenCalledWith(
+      expect.objectContaining({
+        proof: { key: 'key', mutationEpoch: 7, transitionRevision: 9 },
+        mutationEpoch: 7,
+        reservationStore: h.store,
+      }),
+    );
+  });
+
+  it.each([
+    'missing-value',
+    'inherited-value',
+    'initial-value',
+    'bad-prefix',
+    'bad-owner',
+    'bad-discriminator',
+  ] as const)('refuses malformed producer data %s without mutating the reservation', async (mode) => {
+    const h = harness();
+    const { reservation } = await h.store.reserve(
+      workflowRequest('key', 'run'),
+    );
+    const execution = executionFor(reservation);
+    let value: unknown = { kind: 'result', value: 'done', execution };
+    if (mode === 'missing-value') value = { kind: 'result', execution };
+    if (mode === 'inherited-value')
+      value = Object.assign(Object.create({ value: 'done' }), {
+        kind: 'result',
+        execution,
+      });
+    if (mode === 'initial-value')
+      value = { kind: 'initial', value: 'done', execution };
+    if (mode === 'bad-prefix')
+      value = {
+        kind: 'result',
+        value: 'done',
+        execution: { ...execution, tablePrefix: 'ACME_' },
+      };
+    if (mode === 'bad-owner')
+      value = {
+        kind: 'result',
+        value: 'done',
+        execution: { ...execution, owner: OTHER_OWNER },
+      };
+    if (mode === 'bad-discriminator')
+      value = { kind: 'unknown', value: 'done', execution };
+    const before = rows(h.sqlite);
+    const outcome = await beginIdempotentStart(
+      h.store,
+      workflowRequest('key', 'other'),
+      { persisted: async () => value as never, live: async () => true },
+    ).catch((error) => error);
+    expect(rows(h.sqlite)).toEqual(before);
+    expect(outcome).toBeInstanceOf(StartReservationUnreadableError);
+  });
+
+  it('preserves unrelated callback errors', async () => {
+    const h = harness();
+    await h.store.reserve(workflowRequest('key', 'run'));
+    const failure = new Error('callback transport');
+    await expect(
+      beginIdempotentStart(h.store, workflowRequest('key', 'other'), {
+        persisted: async () => {
+          throw failure;
+        },
+        live: async () => false,
+      }),
+    ).rejects.toBe(failure);
+  });
+
+  it.each([
+    ['created', 'own'],
+    ['created', 'other'],
+    ['existing', 'own'],
+    ['existing', 'other'],
+  ] as const)('cannot manufacture a %s-branch winner after the %s claim response is lost', async (branch, winner) => {
+    const h = harness();
+    if (branch === 'existing')
+      await h.store.reserve(workflowRequest('key', 'run'));
+    const failure = new Error('claim response lost');
+    let claimAttempts = 0;
+    let ownClaimWrites = 0;
+    let otherClaim: StartReservationReading | undefined;
+    const store = new StartIdempotencyStore(
+      interceptReservations(h.binding, async (sql, execute) => {
+        if (
+          sql.startsWith('UPDATE flowsafe_start_idempotency') &&
+          sql.includes("SET state = 'started'")
+        ) {
+          claimAttempts++;
+          if (winner === 'own') {
+            await execute();
+            ownClaimWrites++;
+          } else {
+            const observed = await h.store.readForAdmission('key');
+            if (!observed) throw new Error('contended reservation missing');
+            otherClaim = await h.store.claimReservation(observed);
+            if (!otherClaim) throw new Error('other caller did not win');
+          }
+          throw failure;
+        }
+        return execute();
+      }),
+      { now: () => 1_000 },
+    );
+    const outcome = await beginIdempotentStart(
+      store,
+      workflowRequest('key', branch === 'created' ? 'run' : 'other'),
+      EMPTY_SURFACE,
+    ).catch((error) => error);
+    expect(rows(h.sqlite)[0]).toMatchObject({
+      state: 'started',
+      start_token: '',
+      run_id: 'run',
+      updated_at: 1_001,
+    });
+    expect(claimAttempts).toBe(1);
+    expect(ownClaimWrites).toBe(winner === 'own' ? 1 : 0);
+    if (winner === 'other')
+      expect(await h.store.readForAdmission('key')).toEqual(otherClaim);
+    expect(outcome).toBeInstanceOf(StartReservationUnreadableError);
+    expect(outcome.cause).toBe(failure);
+  });
+
+  it('replays a matching bound terminal value and keeps an unbound terminal key spent', async () => {
+    const h = harness();
+    const { reservation } = await h.store.reserve(
+      workflowRequest('key', 'run'),
+    );
+    const execution = executionFor(reservation);
+    await h.store.associateReservation(reservation, execution);
+    await h.store.settleExecution(execution);
+    const before = rows(h.sqlite);
+    const surface = {
+      persisted: async () => ({
+        kind: 'result' as const,
+        value: 'done',
+        execution,
+      }),
+      live: async () => false,
+    };
+    await expect(
+      beginIdempotentStart(h.store, workflowRequest('key', 'other'), surface),
+    ).resolves.toMatchObject({ kind: 'replay', persisted: 'done' });
+    expect(rows(h.sqlite)).toEqual(before);
+    h.sqlite.exec(
+      "UPDATE flowsafe_start_idempotency SET start_token = '', start_table_prefix = NULL, start_workflow_id = NULL",
+    );
+    await expect(
+      beginIdempotentStart(h.store, workflowRequest('key', 'other'), surface),
+    ).rejects.toBeInstanceOf(IdempotentStartAlreadySettledError);
   });
 });

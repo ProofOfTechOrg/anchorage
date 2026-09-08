@@ -110,7 +110,18 @@ interface HarnessOptions {
    * which is what every earlier unkeyed-start case in this file wants: unkeyed
    * starts are unaffected; keyed starts on an unwired host refuse.
    */
-  startIdempotency?: RunRouterOptions['startIdempotency'];
+  startIdempotency?:
+    | 'none'
+    | (Omit<
+        Exclude<RunRouterOptions['startIdempotency'], 'none'>,
+        'persistedStart'
+      > &
+        Partial<
+          Pick<
+            Exclude<RunRouterOptions['startIdempotency'], 'none'>,
+            'persistedStart'
+          >
+        >);
 }
 
 function makeHarness(options: HarnessOptions = {}) {
@@ -176,7 +187,32 @@ function makeHarness(options: HarnessOptions = {}) {
     },
     beforeStart: options.beforeStart,
     systemPrincipalId: SYSTEM.id,
-    startIdempotency: options.startIdempotency ?? 'none',
+    startIdempotency:
+      options.startIdempotency === undefined ||
+      options.startIdempotency === 'none'
+        ? 'none'
+        : {
+            ...options.startIdempotency,
+            persistedStart:
+              options.startIdempotency.persistedStart ??
+              (async (workflowId, runId) => {
+                const value = await options.status?.(workflowId, runId);
+                return value === undefined
+                  ? undefined
+                  : {
+                      kind: 'result',
+                      value,
+                      execution: {
+                        tablePrefix: '',
+                        workflowId,
+                        runId,
+                        startToken: 'test-generation',
+                        owner: { kind: 'human', id: OPERATOR.id },
+                        target: { kind: 'workflow', id: workflowId },
+                      },
+                    };
+              }),
+          },
     start: async (input) => {
       await backend.resources().claim('run', input.runId, {
         kind: input.principal.kind,
@@ -363,6 +399,7 @@ describe('C workflow router capture', () => {
   it.each([
     'mutationEpoch',
     'startIdentity',
+    'startReservation',
     'agentStart',
     'execution',
     'tablePrefix',
@@ -557,7 +594,7 @@ describe('C workflow router capture', () => {
     const startRelease = cDeferred();
     const store = cStartStore();
     const reserve = store.reserve.bind(store);
-    const claim = store.claim.bind(store);
+    const claim = store.claimReservation.bind(store);
     const reserveSpy = vi
       .spyOn(store, 'reserve')
       .mockImplementation(async (...args) => {
@@ -567,7 +604,7 @@ describe('C workflow router capture', () => {
         }
         return reserve(...args);
       });
-    vi.spyOn(store, 'claim').mockImplementation(async (...args) => {
+    vi.spyOn(store, 'claimReservation').mockImplementation(async (...args) => {
       if (boundary === 'claim') {
         f3Entered.resolve();
         await f3Release.promise;
@@ -1776,7 +1813,9 @@ describe('createRunRouter — idempotent start', () => {
       targetId: 'open-flow',
       mintRunId: () => 'inflight_run',
     });
-    await store.claim('key-1', 'inflight_run');
+    const unclaimedReservation = await store.readForAdmission('key-1');
+    if (!unclaimedReservation) throw new Error('missing reservation');
+    await store.claimReservation(unclaimedReservation);
 
     // #when
     const response = await handle(
@@ -1804,7 +1843,9 @@ describe('createRunRouter — idempotent start', () => {
       targetId: 'open-flow',
       mintRunId: () => 'orphan_run',
     });
-    await store.claim('key-1', 'orphan_run');
+    const unclaimedReservation = await store.readForAdmission('key-1');
+    if (!unclaimedReservation) throw new Error('missing reservation');
+    await store.claimReservation(unclaimedReservation);
 
     // #when
     const response = await handle(
@@ -1832,8 +1873,21 @@ describe('createRunRouter — idempotent start', () => {
       targetId: 'open-flow',
       mintRunId: () => 'settled_run',
     });
-    await store.claim('key-1', 'settled_run');
-    await store.settleRun('settled_run');
+    const unclaimedReservation = await store.readForAdmission('key-1');
+    if (!unclaimedReservation) throw new Error('missing reservation');
+    await store.claimReservation(unclaimedReservation);
+    const terminalExecution = {
+      tablePrefix: '',
+      workflowId: 'open-flow',
+      runId: 'settled_run',
+      startToken: 'settled-generation',
+      owner: { kind: 'human' as const, id: OPERATOR.id },
+      target: { kind: 'workflow' as const, id: 'open-flow' },
+    };
+    const startedReservation = await store.readForAdmission('key-1');
+    if (!startedReservation) throw new Error('missing started reservation');
+    await store.bindPreparedStart(startedReservation, terminalExecution);
+    await store.settleExecution(terminalExecution);
 
     // #when
     const response = await handle(
@@ -1876,7 +1930,7 @@ describe('createRunRouter — idempotent start', () => {
     });
   });
 
-  it('gives the claim back when the execution fence refuses, and converges on retry after it reopens', async () => {
+  it('retains the claim after an outer fence error and refuses another engine entry', async () => {
     // #given a deployment whose fence closes between the claim and the start
     let fenced = true;
     const executions: string[] = [];
@@ -1898,6 +1952,7 @@ describe('createRunRouter — idempotent start', () => {
       }),
     );
     const reservedRunId = (await store.read('key-1'))?.runId;
+    expect((await store.read('key-1'))?.state).toBe('started');
     fenced = false;
     const retry = await handle(
       req('/runs', {
@@ -1905,15 +1960,15 @@ describe('createRunRouter — idempotent start', () => {
       }),
     );
 
-    // #then the fence's own refusal reached the caller, the claim went back,
-    // and the retry ran the SAME run — a fence transition mid-start must not
-    // manufacture an unresolvable reservation, nor a second run.
+    // The outer error proves no absence of effects, so the exact claim remains spent.
     expect(refused?.status).toBe(503);
     expect(await refused?.json()).toMatchObject({
       reason: { code: 'EXECUTION_FENCED' },
     });
-    expect(retry?.status).toBe(200);
-    expect(executions).toEqual([reservedRunId]);
+    expect(retry?.status).toBe(409);
+    expect((await store.read('key-1'))?.state).toBe('started');
+    expect((await store.read('key-1'))?.runId).toBe(reservedRunId);
+    expect(executions).toEqual([]);
   });
 
   it('keeps the claim when a start fails for any other reason', async () => {

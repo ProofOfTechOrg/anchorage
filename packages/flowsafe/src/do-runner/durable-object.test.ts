@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { DurableObjectState } from '@cloudflare/workers-types';
-import { InMemoryStore, type MastraCompositeStore } from '@mastra/core/storage';
+import type { MastraCompositeStore } from '@mastra/core/storage';
 import type {
   DefaultEngineType,
   ExecuteFunction,
+  WorkflowRunState,
 } from '@mastra/core/workflows';
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
@@ -15,10 +16,12 @@ import {
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
   ApprovalService,
+  D1ResourceOwnershipStore,
   type ExecutionPrincipal,
   encodeExecutionPrincipal,
   InMemoryApprovalStore,
   InMemoryResourceOwnershipStore,
+  type ResourceOwnershipDatabase,
 } from '../approval-api/index.js';
 import { reconcileApprovalsForSummary } from '../host-kit/approval-bridge.js';
 import {
@@ -56,7 +59,6 @@ import {
   type RunSummary,
 } from './runtime.js';
 import type { ScheduleSourceStore } from './schedule-source.js';
-import type { StartIdempotencyDatabase } from './start-idempotency.js';
 import { StartIdempotencyStore } from './start-idempotency.js';
 import {
   isSuspensionTimeoutResumeData,
@@ -71,8 +73,27 @@ import {
   type SuspensionDeadlineRecord,
 } from './suspension-deadline.js';
 
+const testStorageDatabases = new WeakMap<
+  MastraCompositeStore,
+  ExecutionFenceDatabase & ResourceOwnershipDatabase
+>();
+function testStorage(): MastraCompositeStore {
+  const binding = deploymentIdentityDatabase() as ExecutionFenceDatabase &
+    ResourceOwnershipDatabase;
+  const storage = createD1Storage({ binding });
+  testStorageDatabases.set(storage, binding);
+  return storage;
+}
+function testDatabase(
+  storage: MastraCompositeStore,
+): ExecutionFenceDatabase & ResourceOwnershipDatabase {
+  const binding = testStorageDatabases.get(storage);
+  if (!binding) throw new Error('test storage database was not registered');
+  return binding;
+}
+
 interface TestEnv extends DeploymentIdentityEnv {
-  storage: InMemoryStore;
+  storage: MastraCompositeStore;
   runtime?: RunnerRuntime;
   /**
    * The deployment execution fence the built runtime is wired to. Always
@@ -98,10 +119,12 @@ interface OwnerHooks {
 }
 
 function makeProductionEnv(
-  storage = new InMemoryStore(),
+  storage = testStorage(),
   hooks?: OwnerHooks,
 ): TestEnv {
-  const registry = new InMemoryResourceOwnershipStore();
+  const registry = new D1ResourceOwnershipStore(
+    testDatabase(storage) as ResourceOwnershipDatabase,
+  );
   const attempts = new Map<string, string>();
   const customOwner = hooks?.owner;
   const owners: DurableObjectRunOwnershipStore = hooks
@@ -129,7 +152,7 @@ function makeProductionEnv(
         },
       }
     : registry;
-  const db = deploymentIdentityDatabase();
+  const db = testDatabase(storage);
   return {
     storage,
     owners,
@@ -153,8 +176,102 @@ function makeProductionEnv(
  * path made: a wake reads `authoritativeStatus`, an HTTP route reads
  * `status`.
  */
+async function durableOwnerRecovery(
+  runtime: RunnerRuntime,
+  workflowId: string,
+  runId: string,
+  token: string,
+) {
+  const state = await runtime.authoritativeStartState(workflowId, runId);
+  if (!state) throw new Error('missing durable execution for journal fixture');
+  return {
+    version: 2,
+    phase: 'prepared',
+    owner: { kind: 'human', id: 'owner-1' },
+    workflowId,
+    runId,
+    token,
+    execution: state.execution,
+  };
+}
+
 function statusStub(read: RunnerRuntime['status']) {
-  return { status: vi.fn(read), authoritativeStatus: vi.fn(read) };
+  return {
+    status: vi.fn(read),
+    authoritativeStatus: vi.fn(read),
+    isRunActive: vi.fn(() => false),
+    assertExistingRunAllowed: vi.fn(async () => undefined),
+  };
+}
+
+async function hostR1WorkflowFixture(
+  mode: 'custom-null' | 'actual-prefix',
+  wired = true,
+) {
+  const { InMemoryStore } = await import('@mastra/core/storage');
+  const sql = openSqlite();
+  const binding = sqliteUnitDatabase(sql) as ExecutionFenceDatabase &
+    ResourceOwnershipDatabase;
+  const storage =
+    mode === 'custom-null'
+      ? new InMemoryStore()
+      : createD1Storage({ binding, tablePrefix: 'host_r1_' });
+  await storage.init();
+  const reservations = new StartIdempotencyStore(binding);
+  const app = init(
+    { storage },
+    { executionFence: 'none', startIdempotency: wired ? reservations : 'none' },
+  );
+  let effects = 0;
+  app
+    .createWorkflow({
+      id: 'host-r1',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    })
+    .then(
+      app.createStep({
+        id: 'gate',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        execute: async ({ suspend }) => {
+          effects++;
+          return suspend({ reason: 'held' });
+        },
+      }),
+    )
+    .commit();
+  const owners = new D1ResourceOwnershipStore(binding);
+  const hostRuntime = new Proxy({} as RunnerRuntime, {
+    get: (_target, property) => {
+      const value: unknown = Reflect.get(app.runtime, property, app.runtime);
+      return typeof value === 'function' ? value.bind(app.runtime) : value;
+    },
+  });
+  const env: TestEnv = {
+    storage,
+    owners,
+    runtime: hostRuntime,
+    DB: deploymentIdentityDatabase(),
+    DEPLOYMENT_TENANT: 'acme',
+    DEPLOYMENT_IDENTITY_SECRET: TEST_DEPLOYMENT_IDENTITY_SECRET,
+  };
+  const journal = recoveryStorage();
+  const runner = new TestRunner(journal.state, env);
+  const workflows = await storage.getStore('workflows');
+  if (!workflows) throw new Error('missing workflow domain');
+  return {
+    app,
+    storage,
+    workflows,
+    reservations,
+    owners,
+    env,
+    journal,
+    runner,
+    sql,
+    effects: () => effects,
+  };
 }
 
 /**
@@ -164,35 +281,27 @@ function statusStub(read: RunnerRuntime['status']) {
  * it buys is that they are FENCED runtimes, which is what DurableObjectRunner
  * asserts of anything it serves from while a DB binding is bound.
  */
-function newTestExecutionFence(): ExecutionFenceStore {
-  return new ExecutionFenceStore(
-    sqliteUnitDatabase(openSqlite()) as ExecutionFenceDatabase,
-  );
+function newTestExecutionFence(
+  storage: MastraCompositeStore,
+): ExecutionFenceStore {
+  return new ExecutionFenceStore(testDatabase(storage));
 }
-
-/**
- * A start-reservation store over its own throwaway database, for the same
- * reason as the fence above: DurableObjectRunner refuses to serve from a
- * runtime that has none while a DB binding is bound, and every runner in this
- * file carries one. No key is ever used against it, so the table is never even
- * created and every runner behaves exactly as it did before reservations.
- */
-function newTestStartIdempotency(): StartIdempotencyStore {
-  return new StartIdempotencyStore(
-    sqliteUnitDatabase(openSqlite()) as StartIdempotencyDatabase,
-  );
+function newTestStartIdempotency(
+  storage: MastraCompositeStore,
+): StartIdempotencyStore {
+  return new StartIdempotencyStore(testDatabase(storage));
 }
 
 function gatedRuntime(
   storage: MastraCompositeStore,
-  executionFence: ExecutionFenceStore = newTestExecutionFence(),
+  executionFence: ExecutionFenceStore = newTestExecutionFence(storage),
   requestContextForRun?: RequestContextProvider,
 ): RunnerRuntime {
   const { createWorkflow, createStep, runtime } = init(
     { storage },
     {
       executionFence,
-      startIdempotency: newTestStartIdempotency(),
+      startIdempotency: newTestStartIdempotency(storage),
       requestContextForRun,
     },
   );
@@ -218,6 +327,21 @@ function gatedRuntime(
 }
 
 class TestRunner extends DurableObjectRunner<TestEnv> {
+  constructor(
+    state: DurableObjectState | undefined,
+    env: TestEnv,
+    withStorage = true,
+  ) {
+    super(
+      withStorage
+        ? ({
+            ...state,
+            storage: state?.storage ?? recoveryStorage().state.storage,
+          } as DurableObjectState)
+        : state,
+      env,
+    );
+  }
   protected runOwnership(env: TestEnv): DurableObjectRunOwnershipStore {
     return env.owners;
   }
@@ -231,7 +355,65 @@ class TestRunner extends DurableObjectRunner<TestEnv> {
   }
 
   protected build(env: TestEnv): RunnerRuntime {
-    if (env.runtime) return env.runtime;
+    if (env.runtime) {
+      if (
+        env.runtime.constructor.name !== 'RunnerRuntime' &&
+        !env.runtime.authoritativeStartState
+      ) {
+        const selected = new Map<
+          string,
+          import('./runtime.js').AuthoritativeStartState
+        >();
+        const nativeStart = env.runtime.start?.bind(env.runtime);
+        env.runtime.authoritativeStartState = vi.fn(
+          async (_workflow, runId) => selected.get(runId) ?? null,
+        );
+        env.runtime.settleStartExecution = vi.fn(async () => {});
+        env.runtime.isRunActive ??= vi.fn(() => false);
+        env.runtime.assertExistingRunAllowed ??= vi.fn(async () => undefined);
+        if (nativeStart)
+          env.runtime.start = vi.fn(async (workflowId, options) => {
+            const summary = await nativeStart(workflowId, options);
+            const execution = {
+              tablePrefix: null,
+              workflowId,
+              runId: summary.runId,
+              startToken: 'stub-generation',
+            } as const;
+            await options?.onPreparedStartIdentity?.(execution);
+            const provenance = {
+              version: 2 as const,
+              startToken: execution.startToken,
+              attemptToken: options?.attemptToken ?? 'stub-attempt',
+              resumeCounts: [],
+              startIdentity: options?.startIdentity,
+            };
+            selected.set(summary.runId, {
+              kind: 'result',
+              storage: 'unfenced',
+              execution,
+              provenance,
+              summary,
+              snapshot: {
+                runId: summary.runId,
+                status: summary.status,
+                context: {},
+                value: {},
+                serializedStepGraph: [],
+                activePaths: [],
+                activeStepsPath: {},
+                suspendedPaths: {},
+                resumeLabels: {},
+                waitingPaths: {},
+                timestamp: 1,
+                requestContext: {},
+              },
+            } as import('./runtime.js').AuthoritativeStartState);
+            return summary;
+          });
+      }
+      return env.runtime;
+    }
     return gatedRuntime(env.storage, env.fence);
   }
 }
@@ -363,6 +545,10 @@ function cWorkflowFixture(owned = false, provider?: RequestContextProvider) {
   const binding = env.DB;
   if (!binding) throw new Error('missing managed test database');
   const storage = owned ? createD1Storage({ binding }) : env.storage;
+  testStorageDatabases.set(
+    storage,
+    binding as ExecutionFenceDatabase & ResourceOwnershipDatabase,
+  );
   const runtime = gatedRuntime(storage, env.fence, provider);
   env.runtime = runtime;
   const runner = new TestRunner(journal.state, env);
@@ -682,25 +868,34 @@ describe('C workflow ingress capture', () => {
       options?.attemptToken,
     );
     expect(Object.hasOwn(options ?? {}, 'onPreparedStartIdentity')).toBe(true);
-    expect(options?.onPreparedStartIdentity).toBeUndefined();
+    expect(options?.onPreparedStartIdentity).toBeTypeOf('function');
     expect(fixture.reserve.mock.calls[0]).toEqual([
       [{ kind: 'run', resourceId: 'c-run' }],
       expectedOwner,
       options?.attemptToken,
     ]);
-    expect(
-      writes.filter(([key]) => key.startsWith('flowsafe:run-owner-recovery')),
-    ).toEqual([
-      [
-        'flowsafe:run-owner-recovery:v1',
-        {
-          version: 1,
-          workflowId: 'gated',
-          runId: 'c-run',
-          token: options?.attemptToken,
-        },
-      ],
-    ]);
+    const journals = writes.filter(([key]) =>
+      key.startsWith('flowsafe:run-owner-recovery'),
+    );
+    expect(journals).toHaveLength(2);
+    expect(journals[0]?.[1]).toMatchObject({
+      version: 2,
+      phase: 'preparing',
+      workflowId: 'gated',
+      runId: 'c-run',
+      token: options?.attemptToken,
+      owner: expectedOwner,
+    });
+    expect(journals[1]?.[1]).toMatchObject({
+      version: 2,
+      phase: 'prepared',
+      execution: {
+        tablePrefix: '',
+        workflowId: 'gated',
+        runId: 'c-run',
+        startToken: expect.any(String),
+      },
+    });
     for (const count of reads.values()) expect(count).toBe(1);
     expect(ownerReads.kind).toHaveBeenCalledTimes(scheduled ? 1 : 0);
     expect(ownerReads.id).toHaveBeenCalledTimes(scheduled ? 1 : 0);
@@ -751,7 +946,7 @@ describe('C workflow ingress capture', () => {
     'normal',
     'failure',
     'recovery',
-  ] as const)('C workflow host preserves v1 owner recovery without automatic activation: %s', async (phase) => {
+  ] as const)('FS8 D3 host activation workflow preparation and ownership: %s', async (phase) => {
     const failure = new Error('C managed provider failed');
     const fixture = cWorkflowFixture(
       true,
@@ -809,35 +1004,40 @@ describe('C workflow ingress capture', () => {
       expect(response.status).toBe(phase === 'failure' ? 500 : 200);
       expect(fixture.start).toHaveBeenCalledOnce();
       const options = fixture.start.mock.calls[0]?.[1];
-      expect(options).toHaveProperty('onPreparedStartIdentity', undefined);
+      expect(options).toHaveProperty(
+        'onPreparedStartIdentity',
+        expect.any(Function),
+      );
       expect(Object.hasOwn(options ?? {}, 'onPreparedStartIdentity')).toBe(
         true,
       );
       const journals = writes.filter(([key]) =>
         key.startsWith('flowsafe:run-owner-recovery'),
       );
-      expect(journals).toEqual([
-        [
-          'flowsafe:run-owner-recovery:v1',
-          {
-            version: 1,
-            workflowId: 'gated',
-            runId: 'c-run',
-            token: options?.attemptToken,
-          },
-        ],
-      ]);
+      expect(journals).toHaveLength(phase === 'failure' ? 1 : 2);
+      expect(journals[0]?.[1]).toMatchObject({
+        version: 2,
+        phase: 'preparing',
+        token: options?.attemptToken,
+      });
+      if (phase !== 'failure')
+        expect(journals[1]?.[1]).toMatchObject({
+          phase: 'prepared',
+          execution: { startToken: expect.any(String) },
+        });
       const snapshot = await workflows.loadWorkflowSnapshot({
         workflowName: 'gated',
         runId: 'c-run',
       });
       if (phase === 'failure') expect(snapshot).toBeNull();
       else {
-        expect(snapshot?.requestContext?.['flowsafe.runProvenance']).toEqual({
-          version: 1,
+        expect(
+          snapshot?.requestContext?.['flowsafe.runProvenance'],
+        ).toMatchObject({
+          version: 2,
           requestedBy: OWNER_PRINCIPAL.id,
           requestedByKind: OWNER_PRINCIPAL.kind,
-          startToken: options?.attemptToken,
+          startToken: expect.any(String),
           attemptToken: options?.attemptToken,
           resumeCounts: [],
         });
@@ -853,7 +1053,7 @@ describe('C workflow ingress capture', () => {
       if (phase === 'recovery')
         expect(
           fixture.journal.values.has('flowsafe:run-owner-recovery:v1'),
-        ).toBe(true);
+        ).toBe(false);
       await fixture.runner.alarm();
       expect(fixture.journal.values.has('flowsafe:run-owner-recovery:v1')).toBe(
         false,
@@ -873,7 +1073,10 @@ describe('C workflow ingress capture', () => {
         writes.filter(([key]) => key.startsWith('flowsafe:run-owner-recovery')),
       ).toEqual(journals);
     } finally {
-      expect(counts).toEqual({ admission: 0, terminalization: 0 });
+      expect(counts).toEqual({
+        admission: phase === 'failure' ? 0 : 1,
+        terminalization: 0,
+      });
     }
   });
 
@@ -882,7 +1085,7 @@ describe('C workflow ingress capture', () => {
     1,
     2,
     3,
-  ])('C does not enforce active mutation epoch at workflow DO start: %s', async (epoch) => {
+  ])('FS8 D3 host activation enforces active mutation epoch at workflow start: %s', async (epoch) => {
     const fixture = cWorkflowFixture(true);
     await fixture.storage.init();
     await cRequireEpoch2(fixture.env.fence);
@@ -890,7 +1093,13 @@ describe('C workflow ingress capture', () => {
     if (epoch !== undefined)
       request.headers.set(MUTATION_EPOCH_HEADER, String(epoch));
     const response = await fixture.runner.fetch(request);
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(epoch === 2 ? 200 : 409);
+    if (epoch !== 2) {
+      expect(await response.json()).toMatchObject({
+        reason: { code: 'MUTATION_EPOCH_MISMATCH' },
+      });
+      return;
+    }
     expect(await response.json()).toMatchObject({
       runId: 'c-run',
       status: 'suspended',
@@ -898,7 +1107,10 @@ describe('C workflow ingress capture', () => {
     expect(fixture.start).toHaveBeenCalledOnce();
     const options = fixture.start.mock.calls[0]?.[1];
     expect(options?.mutationEpoch).toBe(epoch);
-    expect(options).toHaveProperty('onPreparedStartIdentity', undefined);
+    expect(options).toHaveProperty(
+      'onPreparedStartIdentity',
+      expect.any(Function),
+    );
     expect(options?.startIdentity).toEqual({
       owner: { kind: OWNER_PRINCIPAL.kind, id: OWNER_PRINCIPAL.id },
       target: { kind: 'workflow', id: 'gated' },
@@ -908,11 +1120,11 @@ describe('C workflow ingress capture', () => {
       workflowName: 'gated',
       runId: 'c-run',
     });
-    expect(snapshot?.requestContext?.['flowsafe.runProvenance']).toEqual({
-      version: 1,
+    expect(snapshot?.requestContext?.['flowsafe.runProvenance']).toMatchObject({
+      version: 2,
       requestedBy: OWNER_PRINCIPAL.id,
       requestedByKind: OWNER_PRINCIPAL.kind,
-      startToken: options?.attemptToken,
+      startToken: expect.any(String),
       attemptToken: options?.attemptToken,
       resumeCounts: [],
     });
@@ -964,7 +1176,7 @@ describe('C workflow ingress capture', () => {
     });
     expect(options?.mutationEpoch).toBe(epoch);
     expect(Object.hasOwn(options ?? {}, 'onPreparedStartIdentity')).toBe(true);
-    expect(options?.onPreparedStartIdentity).toBeUndefined();
+    expect(options?.onPreparedStartIdentity).toBeTypeOf('function');
   });
 
   it.each([
@@ -1141,7 +1353,7 @@ describe('DurableObjectRunner.fetch', () => {
       start: vi.fn(),
     } as unknown as RunnerRuntime;
     const runner = new TestRunner(undefined, {
-      ...makeProductionEnv(new InMemoryStore(), {
+      ...makeProductionEnv(testStorage(), {
         reserve,
         settle: vi.fn(async () => undefined),
       }),
@@ -1348,10 +1560,12 @@ describe('DurableObjectRunner.fetch', () => {
   });
 
   it('binds a scheduled workflow run to the committed schedule owner and the header requester', async () => {
-    const owners = new InMemoryResourceOwnershipStore();
+    const env = makeProductionEnv();
+    const owners = new D1ResourceOwnershipStore(
+      testDatabase(env.storage) as ResourceOwnershipDatabase,
+    );
     const scheduleOwner = { kind: 'human' as const, id: 'schedule-owner' };
     await owners.claim('schedule', 'schedule-gated', scheduleOwner);
-    const env = makeProductionEnv();
     env.owners = owners;
     env.schedules = preparedScheduleSource({
       scheduleId: 'schedule-gated',
@@ -1623,7 +1837,7 @@ describe('DurableObjectRunner.fetch', () => {
     });
     const runner = new TestRunner(
       state,
-      makeProductionEnv(new InMemoryStore(), { reserve, settle }),
+      makeProductionEnv(testStorage(), { reserve, settle }),
     );
 
     const response = await runner.fetch(
@@ -1660,7 +1874,10 @@ describe('DurableObjectRunner.fetch', () => {
   it('returns a persisted start after a lost settlement receipt and clears recovery on retry', async () => {
     const events: string[] = [];
     const { state, values } = recoveryStorage(events);
-    const committed = new InMemoryResourceOwnershipStore();
+    const env = makeProductionEnv();
+    const committed = new D1ResourceOwnershipStore(
+      testDatabase(env.storage) as ResourceOwnershipDatabase,
+    );
     let loseReceipt = true;
     const owners: DurableObjectRunOwnershipStore = {
       owner: (kind, resourceId) => committed.owner(kind, resourceId),
@@ -1674,7 +1891,6 @@ describe('DurableObjectRunner.fetch', () => {
         }
       },
     };
-    const env = makeProductionEnv();
     env.owners = owners;
     const runner = new TestRunner(state, env);
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -1689,7 +1905,7 @@ describe('DurableObjectRunner.fetch', () => {
       );
 
       expect(response.status).toBe(200);
-      expect(values.has('flowsafe:run-owner-recovery:v1')).toBe(true);
+      expect(values.has('flowsafe:run-owner-recovery:v1')).toBe(false);
       expect(
         await committed.owner('run', 'run-lost-settlement-receipt'),
       ).toEqual({ kind: 'human', id: 'owner-1' });
@@ -1718,7 +1934,7 @@ describe('DurableObjectRunner.fetch', () => {
       recoverStartAttempt: vi.fn(async () => null),
     } as unknown as RunnerRuntime;
     const runner = new TestRunner(state, {
-      ...makeProductionEnv(new InMemoryStore(), { reserve, settle }),
+      ...makeProductionEnv(testStorage(), { reserve, settle }),
       runtime,
     });
 
@@ -1739,7 +1955,7 @@ describe('DurableObjectRunner.fetch', () => {
     );
   });
 
-  it('keeps the journal and names the failure when an interrupted start cannot read authoritative state', async () => {
+  it('rolls back preparing bookkeeping without querying a failed Runtime reader', async () => {
     // #given — the same failed start, with the read that would tell an
     // interrupted start apart from a failed one refusing to answer from state
     // it could not reach.
@@ -1756,7 +1972,7 @@ describe('DurableObjectRunner.fetch', () => {
       }),
     } as unknown as RunnerRuntime;
     const runner = new TestRunner(state, {
-      ...makeProductionEnv(new InMemoryStore(), { reserve, settle }),
+      ...makeProductionEnv(testStorage(), { reserve, settle }),
       runtime,
     });
     const logged: string[] = [];
@@ -1787,11 +2003,13 @@ describe('DurableObjectRunner.fetch', () => {
     // #then — and the failure is named rather than swallowed, because it is
     // the reason the attempt is left unsettled with its journal armed for a
     // wake that can read.
-    expect(logged).toContain(
-      'interrupted start could not read authoritative state',
+    expect(logged).toEqual([]);
+    expect(settle).toHaveBeenCalledWith(
+      expect.any(String),
+      'run-blind-start',
+      true,
     );
-    expect(settle).not.toHaveBeenCalled();
-    expect(values.has('flowsafe:run-owner-recovery:v1')).toBe(true);
+    expect(values.has('flowsafe:run-owner-recovery:v1')).toBe(false);
     expect(alarms.at(-1)).toBeGreaterThanOrEqual(before + 60_000);
   });
 
@@ -1799,7 +2017,7 @@ describe('DurableObjectRunner.fetch', () => {
     const { state, values } = recoveryStorage();
     const reserve = vi.fn(async () => false);
     const settle = vi.fn(async () => undefined);
-    const env = makeProductionEnv(new InMemoryStore(), { reserve, settle });
+    const env = makeProductionEnv(testStorage(), { reserve, settle });
     const runner = new TestRunner(state, env);
 
     const response = await runner.fetch(
@@ -1818,7 +2036,7 @@ describe('DurableObjectRunner.fetch', () => {
         )
       ).status,
     ).toBe(404);
-    expect(values.has('flowsafe:run-owner-recovery:v1')).toBe(true);
+    expect(values.has('flowsafe:run-owner-recovery:v1')).toBe(false);
     await runner.alarm();
     expect(settle).toHaveBeenCalledWith(
       expect.any(String),
@@ -1832,14 +2050,16 @@ describe('DurableObjectRunner.fetch', () => {
     const { state, values } = recoveryStorage();
     const settle = vi.fn(async () => undefined);
     values.set('flowsafe:run-owner-recovery:v1', {
-      version: 1,
+      version: 2,
+      phase: 'preparing',
+      owner: { kind: 'human', id: 'owner-1' },
       workflowId: 'gated/forged',
       runId: 'run-recovery',
       token: 'attempt-token',
     });
     const runner = new TestRunner(
       state,
-      makeProductionEnv(new InMemoryStore(), {
+      makeProductionEnv(testStorage(), {
         reserve: vi.fn(async () => true),
         settle,
       }),
@@ -2123,7 +2343,7 @@ describe('DurableObjectRunner.fetch', () => {
     const settle = vi.fn(async () => undefined);
     const runner = new TestRunner(
       undefined,
-      makeProductionEnv(new InMemoryStore(), {
+      makeProductionEnv(testStorage(), {
         reserve,
         settle,
         owner: async () => undefined,
@@ -2309,8 +2529,8 @@ describe('DurableObjectRunner.fetch', () => {
         const { createWorkflow, createStep, runtime } = init(
           { storage: env.storage },
           {
-            executionFence: env.fence ?? newTestExecutionFence(),
-            startIdempotency: newTestStartIdempotency(),
+            executionFence: env.fence ?? newTestExecutionFence(env.storage),
+            startIdempotency: newTestStartIdempotency(env.storage),
           },
         );
         const gate = createStep({
@@ -2426,7 +2646,7 @@ describe('DurableObjectRunner.fetch', () => {
   });
 
   it('persists cancellation before cleanup and authorizes only the original principal on replay', async () => {
-    const storage = new InMemoryStore();
+    const storage = testStorage();
     const abandonApprovals = vi.fn(async () => undefined);
     const env = makeProductionEnv(storage);
     env.lifecycle = { abandonApprovals };
@@ -2493,7 +2713,7 @@ describe('DurableObjectRunner.fetch', () => {
   });
 
   it('returns a structured 409 and retains ownership for a persisted disputed settlement', async () => {
-    const storage = new InMemoryStore();
+    const storage = testStorage();
     const env = makeProductionEnv(storage);
     const runner = new TestRunner(undefined, env);
     await runner.fetch(
@@ -2547,7 +2767,7 @@ describe('DurableObjectRunner.fetch', () => {
   });
 
   it('re-drives deadline cleanup after a crash between ownership release and cleanup completion', async () => {
-    const storage = new InMemoryStore();
+    const storage = testStorage();
     const runtime = gatedRuntime(storage);
     const complete = runtime.completeTerminalCleanup.bind(runtime);
     let wedge = true;
@@ -2636,7 +2856,7 @@ describe('DurableObjectRunner.fetch', () => {
   });
 
   it('replays a post-intent core-canceled deadline from the scanner through a fresh owner object', async () => {
-    const storage = new InMemoryStore();
+    const storage = testStorage();
     const env = makeProductionEnv(storage);
     const original = new TestRunner(undefined, env);
     const started = await original.fetch(
@@ -2858,13 +3078,13 @@ type TimedStepExecute = ExecuteFunction<
 // the step rather than only that a resume happened. `onSettle` counts the
 // settling gates' post-suspension executions for countedTimedRuntime.
 function timedRuntime(
-  storage: InMemoryStore,
+  storage: MastraCompositeStore,
   onSettle?: () => void,
-  executionFence: ExecutionFenceStore = newTestExecutionFence(),
+  executionFence: ExecutionFenceStore = newTestExecutionFence(storage),
 ): RunnerRuntime {
   const { createWorkflow, createStep, runtime } = init(
     { storage },
-    { executionFence, startIdempotency: newTestStartIdempotency() },
+    { executionFence, startIdempotency: newTestStartIdempotency(storage) },
   );
   const timedStep = (id: string, execute: TimedStepExecute) =>
     createStep({
@@ -2968,7 +3188,7 @@ function timedRuntime(
 // path. Mastra keys its snapshot namespace by that joined path, so the two
 // suspensions are indistinguishable there, and an entry armed for one of them
 // could resume the other.
-function collidingRuntime(storage: InMemoryStore): {
+function collidingRuntime(storage: MastraCompositeStore): {
   runtime: RunnerRuntime;
   settled: () => string[];
 } {
@@ -2976,8 +3196,8 @@ function collidingRuntime(storage: InMemoryStore): {
   const { createWorkflow, createStep, runtime } = init(
     { storage },
     {
-      executionFence: newTestExecutionFence(),
-      startIdempotency: newTestStartIdempotency(),
+      executionFence: newTestExecutionFence(storage),
+      startIdempotency: newTestStartIdempotency(storage),
     },
   );
   const suspending = (id: string, label: string) =>
@@ -3018,7 +3238,7 @@ function collidingRuntime(storage: InMemoryStore): {
 // suspended path with one fence, so bounded work per wake has to be judged on
 // the iterations rather than on the path.
 function foreachRuntime(
-  storage: InMemoryStore,
+  storage: MastraCompositeStore,
   workflowId: string,
   options?: { concurrency: number },
 ): { runtime: RunnerRuntime; timedOut: () => number[] } {
@@ -3026,8 +3246,8 @@ function foreachRuntime(
   const { createWorkflow, createStep, runtime } = init(
     { storage },
     {
-      executionFence: newTestExecutionFence(),
-      startIdempotency: newTestStartIdempotency(),
+      executionFence: newTestExecutionFence(storage),
+      startIdempotency: newTestStartIdempotency(storage),
     },
   );
   const gate = createStep({
@@ -3072,7 +3292,7 @@ function timedEnv(): TestEnv {
 // The same `timed` gate, counting how often its post-suspension body ran, so a
 // race between a wake and a real signal can be judged on the one thing that
 // matters: the gated action must not execute twice.
-function countedTimedRuntime(storage: InMemoryStore): {
+function countedTimedRuntime(storage: MastraCompositeStore): {
   runtime: RunnerRuntime;
   settled: () => number;
 } {
@@ -3215,20 +3435,39 @@ function deadlineWriteFailures(
  * rather than shared: runtime.test.ts keeps its own copy beside its own
  * fixtures, which is cheaper than a shared module for eight lines.
  */
-async function blindWorkflowRow(storage: InMemoryStore): Promise<() => void> {
+async function blindWorkflowRow(
+  storage: MastraCompositeStore,
+): Promise<() => void> {
   const store = (await storage.getStore('workflows')) as unknown as {
     getWorkflowRunById: (args: unknown) => Promise<unknown>;
   };
+  const domain = store as unknown as FencedWorkflowsStorageD1;
+  const capability = domain[FENCED_WORKFLOW_STORAGE];
+  if (capability)
+    Object.defineProperty(domain, FENCED_WORKFLOW_STORAGE, {
+      value: {
+        ...capability,
+        readSnapshot: async () => {
+          throw new Error('selected workflow row unavailable');
+        },
+      },
+      configurable: true,
+    });
   const original = store.getWorkflowRunById;
   store.getWorkflowRunById = async () => null;
   return () => {
     store.getWorkflowRunById = original;
+    if (capability)
+      Object.defineProperty(domain, FENCED_WORKFLOW_STORAGE, {
+        value: capability,
+        configurable: true,
+      });
   };
 }
 
 /** Count the real row deletions a wake performs, and restore the store. */
 async function countRowDeletes(
-  storage: InMemoryStore,
+  storage: MastraCompositeStore,
 ): Promise<{ calls: () => number; restore: () => void }> {
   const store = (await storage.getStore('workflows')) as unknown as {
     deleteWorkflowRunById: (args: unknown) => Promise<unknown>;
@@ -3325,7 +3564,9 @@ describe('DurableObjectRunner suspension deadlines', () => {
       { ...armedEntry('gate', 1), deadlineAt: dueAt },
     ]);
     values.set('flowsafe:run-owner-recovery:v1', {
-      version: 1,
+      version: 2,
+      phase: 'preparing',
+      owner: { kind: 'human', id: 'owner-1' },
       workflowId: 'timed',
       runId: 'run-cleared',
       token: 'attempt-token',
@@ -3884,7 +4125,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
       storage: doStorage,
     } as unknown as DurableObjectState;
     const settle = vi.fn(async () => undefined);
-    const env = makeProductionEnv(new InMemoryStore(), {
+    const env = makeProductionEnv(testStorage(), {
       reserve: async () => true,
       settle,
     });
@@ -3904,12 +4145,15 @@ describe('DurableObjectRunner suspension deadlines', () => {
       requestedByKind: OWNER_PRINCIPAL.kind,
       attemptToken: token,
     });
-    values.set('flowsafe:run-owner-recovery:v1', {
-      version: 1,
-      workflowId: 'timed',
-      runId: 'run-blinded-recovery',
-      token,
-    });
+    values.set(
+      'flowsafe:run-owner-recovery:v1',
+      await durableOwnerRecovery(
+        env.runtime as RunnerRuntime,
+        'timed',
+        'run-blinded-recovery',
+        token,
+      ),
+    );
     const runner = new TestRunner(state, env);
     const deletes = await countRowDeletes(env.storage);
     const restore = await blindWorkflowRow(env.storage);
@@ -3971,7 +4215,15 @@ describe('DurableObjectRunner suspension deadlines', () => {
     // The interrupted start this route settles, with the read that would
     // settle it refusing to answer from state it could not reach.
     values.set('flowsafe:run-owner-recovery:v1', {
-      version: 1,
+      version: 2,
+      phase: 'prepared',
+      owner: { kind: 'human', id: 'owner-1' },
+      execution: {
+        tablePrefix: '',
+        workflowId: 'timed',
+        runId: 'run-unreadable-route',
+        startToken: 'test-generation',
+      },
       workflowId: 'timed',
       runId: 'run-unreadable-route',
       token: 'attempt-token',
@@ -4010,7 +4262,15 @@ describe('DurableObjectRunner suspension deadlines', () => {
       }),
     } as unknown as RunnerRuntime;
     values.set('flowsafe:run-owner-recovery:v1', {
-      version: 1,
+      version: 2,
+      phase: 'prepared',
+      owner: { kind: 'human', id: 'owner-1' },
+      execution: {
+        tablePrefix: '',
+        workflowId: 'timed',
+        runId: 'run-start-unreadable',
+        startToken: 'test-generation',
+      },
       workflowId: 'timed',
       runId: 'run-start-unreadable',
       token: 'attempt-token',
@@ -5029,7 +5289,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
 
     // #then — the live summary reports the id whole, and the entry is keyed by
     // the same joined path the payload and the fence are keyed by.
-    expect(started.suspended).toEqual([[DOTTED_STEP]]);
+    expect(started.suspended).toEqual([DOTTED_STEP.split('.')]);
     expect(storedDeadlines(values)?.entries).toEqual([
       armedEntry(DOTTED_STEP, suspendedAt),
     ]);
@@ -5091,12 +5351,15 @@ describe('DurableObjectRunner suspension deadlines', () => {
       attemptToken: token,
     });
     expect(started.status).toBe('suspended');
-    values.set('flowsafe:run-owner-recovery:v1', {
-      version: 1,
-      workflowId: 'timed',
-      runId: 'run-interrupted',
-      token,
-    });
+    values.set(
+      'flowsafe:run-owner-recovery:v1',
+      await durableOwnerRecovery(
+        env.runtime as RunnerRuntime,
+        'timed',
+        'run-interrupted',
+        token,
+      ),
+    );
     const runner = new TestRunner(state, env);
 
     await runner.alarm();
@@ -5413,12 +5676,15 @@ describe('DurableObjectRunner suspension deadlines', () => {
       requestedByKind: OWNER_PRINCIPAL.kind,
       attemptToken: token,
     });
-    values.set('flowsafe:run-owner-recovery:v1', {
-      version: 1,
-      workflowId: 'timed',
-      runId: 'run-recovery-arm',
-      token,
-    });
+    values.set(
+      'flowsafe:run-owner-recovery:v1',
+      await durableOwnerRecovery(
+        env.runtime as RunnerRuntime,
+        'timed',
+        'run-recovery-arm',
+        token,
+      ),
+    );
     const runner = new TestRunner(state, env);
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
     const before = Date.now();
@@ -6182,7 +6448,7 @@ describe('DurableObjectRunner and the deployment execution fence', () => {
     const events: string[] = [];
     const { state } = recoveryStorage(events);
     const reserve = vi.fn(async () => true);
-    const env = makeProductionEnv(new InMemoryStore(), {
+    const env = makeProductionEnv(testStorage(), {
       reserve,
       settle: vi.fn(async () => undefined),
     });
@@ -6363,15 +6629,16 @@ describe('DurableObjectRunner and the deployment execution fence', () => {
       { storage: env.storage },
       { startIdempotency: 'none', executionFence: 'none' },
     ).runtime;
-    const runner = new TestRunner(undefined, env);
+    const runner = new TestRunner(undefined, env, false);
 
     // #then — past the guard. 404 is this bare runtime answering for a workflow
     // it was never given; what matters is that it ANSWERED, where the D1-shaped
     // binding above produced the guard's 500.
     const response = await runner.fetch(
-      post('/runs', { workflowId: 'gated', runId: 'rpc-db' }),
+      deploymentIdentityRequest('http://do/runs/gated/rpc-db/start-liveness'),
     );
-    expect(response.status).toBe(404);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ live: false });
   });
 });
 
@@ -6403,12 +6670,12 @@ describe('DurableObjectRunner — idempotent start plumbing', () => {
     // This is the whole point of the route: the start holds the operation lock
     // for its entire first leg, so a probe that took that lock would block for
     // exactly as long as the run it was trying to describe.
-    const storage = new InMemoryStore();
+    const storage = testStorage();
     const { createWorkflow, createStep, runtime } = init(
       { storage },
       {
-        executionFence: newTestExecutionFence(),
-        startIdempotency: newTestStartIdempotency(),
+        executionFence: newTestExecutionFence(storage),
+        startIdempotency: newTestStartIdempotency(storage),
       },
     );
     let probed!: (value: unknown) => void;
@@ -6485,7 +6752,7 @@ describe('DurableObjectRunner — idempotent start plumbing', () => {
   it('admits exactly the proof-only start that carries the nominated key, end to end', async () => {
     // #given a deployment fenced into proof-only, addressed through the route
     // a trusted Worker actually uses
-    const storage = new InMemoryStore();
+    const storage = testStorage();
     const env = makeProductionEnv(storage);
     const fence = env.fence as ExecutionFenceStore;
     await fence.seed('migration-locked');
@@ -6531,8 +6798,14 @@ describe('DurableObjectRunner — idempotent start plumbing', () => {
       }),
     );
     expect(admitted.status).toBe(200);
-    await expect(fence.read()).resolves.toEqual({
+    await expect(fence.read()).resolves.toMatchObject({
       state: 'proof-only',
+      proofExecution: {
+        tablePrefix: '',
+        workflowId: 'gated',
+        runId: 'run-proof',
+        startToken: expect.any(String),
+      },
       proofKey: 'proof-key-1',
       proofRunId: 'run-proof',
       mutationEpoch: 0,
@@ -6557,7 +6830,7 @@ describe('DurableObjectRunner — idempotent start plumbing', () => {
     // #given a fence that reads proof-only and then, between the admitting
     // read and the write-back, has been transitioned away — the 0-row case
     // recordProofRun's CAS exists for
-    const storage = new InMemoryStore();
+    const storage = testStorage();
     const env = makeProductionEnv(storage);
     const fence = env.fence as ExecutionFenceStore;
     await fence.seed('migration-locked');
@@ -6613,5 +6886,1779 @@ describe('DurableObjectRunner — idempotent start plumbing', () => {
       requireMutationEpoch: false,
       transitionRevision: 2,
     });
+  });
+});
+
+describe('FS8 D3 host activation workflow recovery barriers', () => {
+  async function preparedFixture() {
+    const fixture = cWorkflowFixture(true);
+    const writes: unknown[] = [];
+    const put = fixture.journal.storage.put.bind(fixture.journal.storage);
+    vi.spyOn(fixture.journal.storage, 'put').mockImplementation(
+      async (key, value) => {
+        if (key === 'flowsafe:run-owner-recovery:v1')
+          writes.push(structuredClone(value));
+        await put(key, value);
+      },
+    );
+    const response = await fixture.runner.fetch(post('/runs', C_WORKFLOW_BODY));
+    expect(response.status).toBe(200);
+    const journal = writes.at(-1) as Record<string, unknown>;
+    expect(journal).toMatchObject({
+      version: 2,
+      phase: 'prepared',
+      owner: { kind: 'human', id: 'owner-1' },
+    });
+    fixture.journal.values.set(
+      'flowsafe:run-owner-recovery:v1',
+      structuredClone(journal),
+    );
+    return { ...fixture, journalValue: journal };
+  }
+
+  it.each([
+    'phase',
+    'generation',
+    'owner',
+  ] as const)('preserves a replacement journal with repeated H after recovery read: %s', async (field) => {
+    const fixture = await preparedFixture();
+    const replacement = structuredClone(fixture.journalValue);
+    if (field === 'phase') replacement.phase = 'prepared-unfenced';
+    if (field === 'generation')
+      (replacement.execution as { startToken: string }).startToken =
+        'replacement-generation';
+    if (field === 'owner')
+      replacement.owner = { kind: 'human', id: 'replacement-owner' };
+    const nativeRecover = fixture.runtime.recoverStartAttempt.bind(
+      fixture.runtime,
+    );
+    vi.spyOn(fixture.runtime, 'recoverStartAttempt').mockImplementation(
+      async (...args) => {
+        const result = await nativeRecover(...args);
+        fixture.journal.values.set(
+          'flowsafe:run-owner-recovery:v1',
+          replacement,
+        );
+        return result;
+      },
+    );
+    const outcome = await fixture.runner
+      .alarm()
+      .catch((error: unknown) => error);
+    expect(
+      fixture.journal.values.get('flowsafe:run-owner-recovery:v1'),
+    ).toEqual(replacement);
+    expect(await fixture.env.owners.owner('run', 'c-run')).toEqual({
+      kind: 'human',
+      id: 'owner-1',
+    });
+    expect(fixture.journal.alarms.at(-1)).toBeGreaterThan(Date.now());
+    expect(outcome).toBeInstanceOf(Error);
+  });
+
+  it.each([
+    'strict settlement',
+    'approval hook',
+    'dispatch discard',
+    'ownership settlement',
+    'ownership release',
+    'completion',
+    'journal delete',
+  ] as const)('retains a terminal journal until the ordered cleanup confirms: %s', async (boundary) => {
+    const fixture = await preparedFixture();
+    const terminal = await fixture.runtime.terminateAsPrincipal(
+      'gated',
+      'c-run',
+      OWNER_PRINCIPAL,
+      OWNER_PRINCIPAL,
+    );
+    expect(terminal.summary.status).toBe('cancelled');
+    const failure = new Error('held cleanup boundary');
+    const hooks = {
+      abandonApprovals: vi.fn(async () => {}),
+      discardScheduleDispatch: vi.fn(async () => {}),
+    };
+    fixture.env.lifecycle = hooks;
+    if (boundary === 'dispatch discard') {
+      const workflows = await fixture.storage.getStore('workflows');
+      const snapshot = await workflows?.loadWorkflowSnapshot({
+        workflowName: 'gated',
+        runId: 'c-run',
+      });
+      if (!snapshot?.requestContext)
+        throw new Error('missing terminal snapshot');
+      const lifecycle = snapshot.requestContext[
+        'flowsafe.runLifecycle'
+      ] as Record<string, unknown>;
+      lifecycle.scheduleDispatch = {
+        scheduleId: 'barrier-schedule',
+        dispatchId: 'barrier-dispatch',
+      };
+      await workflows?.persistWorkflowSnapshot({
+        workflowName: 'gated',
+        runId: 'c-run',
+        snapshot,
+      });
+    }
+    const completion = vi.spyOn(fixture.runtime, 'completeTerminalCleanup');
+    const releaseOwner = vi.spyOn(fixture.env.owners, 'release');
+    let restore = () => {};
+    if (boundary === 'strict settlement') {
+      const spy = vi
+        .spyOn(fixture.runtime, 'settleStartExecution')
+        .mockRejectedValue(failure);
+      restore = () => spy.mockRestore();
+    }
+    if (boundary === 'approval hook') {
+      hooks.abandonApprovals.mockRejectedValue(failure);
+      restore = () => {
+        hooks.abandonApprovals.mockResolvedValue();
+      };
+    }
+    if (boundary === 'dispatch discard') {
+      hooks.discardScheduleDispatch.mockRejectedValue(failure);
+      restore = () => {
+        hooks.discardScheduleDispatch.mockResolvedValue();
+      };
+    }
+    if (boundary === 'ownership settlement') {
+      const spy = vi
+        .spyOn(fixture.env.owners, 'settleReservation')
+        .mockRejectedValue(failure);
+      restore = () => spy.mockRestore();
+    }
+    if (boundary === 'ownership release') {
+      releaseOwner.mockRejectedValue(failure);
+      restore = () => releaseOwner.mockRestore();
+    }
+    if (boundary === 'completion') {
+      const spy = vi
+        .spyOn(fixture.runtime, 'completeTerminalCleanup')
+        .mockRejectedValue(failure);
+      restore = () => spy.mockRestore();
+    }
+    if (boundary === 'journal delete') {
+      const native = fixture.journal.storage.delete.bind(
+        fixture.journal.storage,
+      );
+      const spy = vi
+        .spyOn(fixture.journal.storage, 'delete')
+        .mockImplementation(async (key) => {
+          if (key === 'flowsafe:run-owner-recovery:v1') throw failure;
+          return native(key);
+        });
+      restore = () => spy.mockRestore();
+    }
+    const outcome = await fixture.runner
+      .alarm()
+      .catch((error: unknown) => error);
+    if (
+      boundary === 'dispatch discard' ||
+      boundary === 'ownership settlement' ||
+      boundary === 'ownership release'
+    ) {
+      expect(await fixture.env.owners.owner('run', 'c-run')).toEqual({
+        kind: 'human',
+        id: 'owner-1',
+      });
+      expect(completion).not.toHaveBeenCalled();
+      if (boundary === 'ownership settlement')
+        expect(hooks.abandonApprovals).not.toHaveBeenCalled();
+      if (boundary === 'dispatch discard')
+        expect(releaseOwner).not.toHaveBeenCalled();
+    }
+    const durable = await fixture.runtime.authoritativeStartState(
+      'gated',
+      'c-run',
+    );
+    expect(durable).toMatchObject({
+      kind: 'result',
+      summary: { status: 'cancelled' },
+    });
+    expect(
+      fixture.journal.values.get('flowsafe:run-owner-recovery:v1'),
+    ).toEqual(fixture.journalValue);
+    expect(fixture.journal.alarms.at(-1)).toBeGreaterThan(Date.now());
+    if (boundary === 'strict settlement')
+      expect(hooks.abandonApprovals).not.toHaveBeenCalled();
+    if (boundary === 'strict settlement')
+      expect(outcome).toMatchObject({ status: 503, cause: failure });
+    else expect(outcome).toBe(failure);
+    restore();
+    await fixture.runner.alarm();
+    expect(fixture.journal.values.has('flowsafe:run-owner-recovery:v1')).toBe(
+      false,
+    );
+  });
+
+  it('converges a prepared journal put whose response was lost before admission', async () => {
+    const fixture = cWorkflowFixture(true);
+    const put = fixture.journal.storage.put.bind(fixture.journal.storage);
+    vi.spyOn(fixture.journal.storage, 'put').mockImplementation(
+      async (key, value) => {
+        await put(key, value);
+        if (
+          key === 'flowsafe:run-owner-recovery:v1' &&
+          (value as { phase?: string }).phase === 'prepared'
+        )
+          throw new Error('preparation receipt lost');
+      },
+    );
+    const response = await fixture.runner.fetch(post('/runs', C_WORKFLOW_BODY));
+    const state = await fixture.runtime.authoritativeStartState(
+      'gated',
+      'c-run',
+    );
+    expect(state).toMatchObject({
+      kind: 'result',
+      summary: { status: 'suspended' },
+    });
+    expect(fixture.journal.values.has('flowsafe:run-owner-recovery:v1')).toBe(
+      false,
+    );
+    expect(response.status).toBe(200);
+  });
+
+  it('resets only unreadability stamps when a due deadline observes known pending', async () => {
+    const fixture = await preparedFixture();
+    const snapshot = await fixture.storage.getStore('workflows');
+    const selected = await fixture.runtime.authoritativeStartState(
+      'gated',
+      'c-run',
+    );
+    if (!selected) throw new Error('missing selected state');
+    const pending = {
+      ...selected.snapshot,
+      status: 'pending' as const,
+      requestContext: { ...selected.snapshot.requestContext },
+    };
+    await snapshot?.persistWorkflowSnapshot({
+      workflowName: 'gated',
+      runId: 'c-run',
+      snapshot: pending,
+    });
+    const record: SuspensionDeadlineRecord = {
+      version: 1,
+      workflowId: 'gated',
+      runId: 'c-run',
+      entries: [
+        {
+          step: 'gate',
+          suspendedAt: 1,
+          resumeCount: 0,
+          deadlineAt: 1,
+          attempts: 2,
+          nextAttemptAt: 2,
+          unreadableSince: 1,
+        },
+        {
+          step: 'future',
+          suspendedAt: 3,
+          resumeCount: 0,
+          deadlineAt: Date.now() + 1_000_000,
+          attempts: 1,
+          nextAttemptAt: Date.now() + 1_000_000,
+          unreadableSince: 2,
+        },
+      ],
+    };
+    fixture.journal.values.delete('flowsafe:run-owner-recovery:v1');
+    fixture.journal.values.set(SUSPENSION_DEADLINE_STORAGE_KEY, record);
+    const resume = vi.spyOn(fixture.runtime, 'resume');
+    await fixture.runner.alarm();
+    expect(fixture.journal.values.get(SUSPENSION_DEADLINE_STORAGE_KEY)).toEqual(
+      {
+        ...record,
+        entries: record.entries.map(
+          ({ unreadableSince: _stamp, ...entry }) => entry,
+        ),
+      },
+    );
+    expect(
+      (await fixture.runtime.authoritativeStartState('gated', 'c-run'))?.kind,
+    ).toBe('initial');
+    expect(resume).not.toHaveBeenCalled();
+  });
+});
+
+describe('FS8 D3 protected replay selected workflow value', () => {
+  it('pairs the original selected generation with its value after durable replacement', async () => {
+    const fixture = cWorkflowFixture(true);
+    expect(
+      (await fixture.runner.fetch(post('/runs', C_WORKFLOW_BODY))).status,
+    ).toBe(200);
+    const workflows = await fixture.storage.getStore('workflows');
+    const snapshot = await workflows?.loadWorkflowSnapshot({
+      workflowName: 'gated',
+      runId: 'c-run',
+    });
+    if (!workflows || !snapshot) throw new Error('missing real snapshot');
+    await workflows.persistWorkflowSnapshot({
+      workflowName: 'gated',
+      runId: 'c-run',
+      // The upstream snapshot type narrows results to records; persisted JSON can carry scalars.
+      snapshot: {
+        ...snapshot,
+        status: 'success',
+        result: 'first-value',
+      } as unknown as WorkflowRunState,
+    });
+    const originalRead = fixture.runtime.authoritativeStartState.bind(
+      fixture.runtime,
+    );
+    const first = await originalRead('gated', 'c-run');
+    if (!first) throw new Error('missing original generation');
+    const read = vi
+      .spyOn(fixture.runtime, 'authoritativeStartState')
+      .mockImplementation(async (...args) => {
+        const selected = await originalRead(...args);
+        await workflows.persistWorkflowSnapshot({
+          workflowName: 'gated',
+          runId: 'c-run',
+          snapshot: {
+            ...snapshot,
+            status: 'success',
+            result: 'replacement-value',
+            requestContext: {
+              ...snapshot.requestContext,
+              'flowsafe.runProvenance': {
+                ...(snapshot.requestContext?.[
+                  'flowsafe.runProvenance'
+                ] as object),
+                startToken: 'replacement-generation',
+              },
+            },
+          } as unknown as WorkflowRunState,
+        });
+        return selected;
+      });
+    const response = await fixture.runner.fetch(
+      deploymentIdentityRequest('http://do/runs/gated/c-run?replay=1'),
+    );
+    expect(
+      (
+        await workflows.loadWorkflowSnapshot({
+          workflowName: 'gated',
+          runId: 'c-run',
+        })
+      )?.result,
+    ).toBe('replacement-value');
+    expect(await response.json()).toMatchObject({
+      kind: 'result',
+      execution: { startToken: first.execution.startToken },
+      value: { result: 'first-value' },
+    });
+    expect(read).toHaveBeenCalledOnce();
+  });
+});
+
+describe('FS8 D3 host activation original claim preflight', () => {
+  it.each([
+    false,
+    true,
+  ])('releases only its exact captured claim on a local fence refusal (replacement=%s)', async (replacement) => {
+    const fixture = cWorkflowFixture(true);
+    const store = fixture.runtime.startIdempotency;
+    if (!store || !fixture.env.fence)
+      throw new Error('missing test authority wiring');
+    await fixture.env.fence.seed('open');
+    const reserved = await store.reserve({
+      key: 'host-key',
+      owner: { kind: 'human', id: OWNER_PRINCIPAL.id },
+      targetKind: 'workflow',
+      targetId: 'gated',
+      mintRunId: () => 'c-run',
+    });
+    const claim = await store.claimReservation(reserved.reservation);
+    if (!claim) throw new Error('test did not win its reservation');
+    await fixture.env.fence.transition({ expected: 'open', next: 'draining' });
+    if (replacement) {
+      const native = fixture.env.fence.read.bind(fixture.env.fence);
+      vi.spyOn(fixture.env.fence, 'read').mockImplementationOnce(async () => {
+        const reading = await native();
+        await store.releaseReservation(claim);
+        const released = await store.readForAdmission('host-key');
+        if (!released) throw new Error('missing released reservation');
+        expect(await store.claimReservation(released)).toBeDefined();
+        return reading;
+      });
+    }
+    const response = await fixture.runner.fetch(
+      post('/runs', {
+        ...C_WORKFLOW_BODY,
+        idempotencyKey: 'host-key',
+        startReservation: claim,
+      }),
+    );
+    const current = await store.readForAdmission('host-key');
+    expect(current?.state).toBe(replacement ? 'started' : 'reserved');
+    expect(current?.binding).toEqual({ kind: 'unbound' });
+    expect(current?.updatedAt).toBeGreaterThan(claim.updatedAt);
+    expect(fixture.journal.values.has('flowsafe:run-owner-recovery:v1')).toBe(
+      false,
+    );
+    expect(fixture.reserve).not.toHaveBeenCalled();
+    expect(fixture.start).not.toHaveBeenCalled();
+    expect(response.status).toBe(503);
+  });
+});
+
+describe('FS8 D3 host activation managed workflow expectation', () => {
+  it('rejects an agent role at the same physical workflow generation before B2 or cleanup', async () => {
+    const fixture = cWorkflowFixture(true);
+    const put = fixture.journal.storage.put.bind(fixture.journal.storage);
+    let journal: unknown;
+    vi.spyOn(fixture.journal.storage, 'put').mockImplementation(
+      async (key, value) => {
+        if (
+          key === 'flowsafe:run-owner-recovery:v1' &&
+          (value as { phase?: string }).phase === 'prepared'
+        )
+          journal = structuredClone(value);
+        await put(key, value);
+      },
+    );
+    expect(
+      (await fixture.runner.fetch(post('/runs', C_WORKFLOW_BODY))).status,
+    ).toBe(200);
+    const domain = (await fixture.storage.getStore(
+      'workflows',
+    )) as FencedWorkflowsStorageD1;
+    const original = await domain.loadWorkflowSnapshot({
+      workflowName: 'gated',
+      runId: 'c-run',
+    });
+    if (!original?.requestContext || !journal)
+      throw new Error('missing actual prepared workflow');
+    const prior = original.requestContext['flowsafe.runProvenance'] as Record<
+      string,
+      unknown
+    >;
+    const snapshot = {
+      runId: 'c-run',
+      status: 'pending' as const,
+      value: {},
+      context: {},
+      serializedStepGraph: [],
+      activePaths: [],
+      activeStepsPath: {},
+      suspendedPaths: {},
+      resumeLabels: {},
+      waitingPaths: {},
+      timestamp: 123,
+      requestContext: {
+        'flowsafe.runProvenance': {
+          ...prior,
+          initialAdmission: true,
+          resumeCounts: [],
+          startIdentity: {
+            owner: { kind: 'human', id: OWNER_PRINCIPAL.id },
+            target: {
+              kind: 'agent',
+              id: 'foreign-agent',
+              threadId: 'foreign-thread',
+            },
+          },
+          agentStart: { threaded: true },
+        },
+      },
+    };
+    await domain.persistWorkflowSnapshot({
+      workflowName: 'gated',
+      runId: 'c-run',
+      snapshot,
+    });
+    fixture.journal.values.set('flowsafe:run-owner-recovery:v1', journal);
+    const native = domain[FENCED_WORKFLOW_STORAGE];
+    if (!native) throw new Error('missing actual capability');
+    const rawReads = vi.fn(native.readSnapshot.bind(native));
+    const terminalize = vi.fn(native.terminalizeInitialAdmission.bind(native));
+    Object.defineProperty(domain, FENCED_WORKFLOW_STORAGE, {
+      value: {
+        ...native,
+        readSnapshot: rawReads,
+        terminalizeInitialAdmission: terminalize,
+      },
+      configurable: true,
+    });
+    const before = await native.readSnapshot({
+      workflowId: 'gated',
+      runId: 'c-run',
+    });
+    const settle = vi.spyOn(fixture.runtime, 'settleStartExecution');
+    const response = await fixture.runner.fetch(
+      deploymentIdentityRequest('http://do/runs/gated/c-run/dispatch-status'),
+    );
+    expect(
+      await native.readSnapshot({ workflowId: 'gated', runId: 'c-run' }),
+    ).toEqual(before);
+    expect(
+      fixture.journal.values.get('flowsafe:run-owner-recovery:v1'),
+    ).toEqual(journal);
+    expect(terminalize).not.toHaveBeenCalled();
+    expect(settle).not.toHaveBeenCalled();
+    expect(rawReads).toHaveBeenCalledOnce();
+    expect(response.status).toBe(503);
+  });
+});
+
+describe('FS8 D3 host activation prepared absence and local zero', () => {
+  it.each([
+    true,
+    false,
+  ])('retains a cold prepared workflow journal across same-ID retries after absence (keyed=%s)', async (keyed) => {
+    const fixture = cWorkflowFixture(true);
+    const reservations = fixture.runtime.startIdempotency;
+    if (!reservations) throw new Error('missing reservations');
+    let claim:
+      | import('./start-reservation-contract.js').StartReservationReading
+      | undefined;
+    if (keyed) {
+      const reserved = await reservations.reserve({
+        key: 'absent-key',
+        owner: { kind: 'human', id: OWNER_PRINCIPAL.id },
+        targetKind: 'workflow',
+        targetId: 'gated',
+        mintRunId: () => 'c-run',
+      });
+      claim = await reservations.claimReservation(reserved.reservation);
+      if (!claim) throw new Error('missing winning claim');
+    }
+    let journal: unknown;
+    const put = fixture.journal.storage.put.bind(fixture.journal.storage);
+    vi.spyOn(fixture.journal.storage, 'put').mockImplementation(
+      async (key, value) => {
+        if (
+          key === 'flowsafe:run-owner-recovery:v1' &&
+          (value as { phase?: string }).phase === 'prepared'
+        )
+          journal = structuredClone(value);
+        await put(key, value);
+      },
+    );
+    expect(
+      (
+        await fixture.runner.fetch(
+          post('/runs', {
+            ...C_WORKFLOW_BODY,
+            ...(claim
+              ? { idempotencyKey: claim.key, startReservation: claim }
+              : {}),
+          }),
+        )
+      ).status,
+    ).toBe(200);
+    const claimed = keyed
+      ? await reservations.readForAdmission('absent-key')
+      : undefined;
+    fixture.journal.values.set('flowsafe:run-owner-recovery:v1', journal);
+    await testDatabase(fixture.storage)
+      .prepare(
+        'DELETE FROM mastra_workflow_snapshot WHERE workflow_name = ? AND run_id = ?',
+      )
+      .bind('gated', 'c-run')
+      .run();
+    fixture.env.runtime = gatedRuntime(fixture.storage, fixture.env.fence);
+    const enter = vi
+      .spyOn(fixture.env.runtime, 'start')
+      .mockRejectedValue(new Error('unexpected new engine entry'));
+    const evicted = new TestRunner(fixture.journal.state, fixture.env);
+    const error = await evicted.alarm().catch((cause: unknown) => cause);
+    expect(
+      fixture.journal.values.get('flowsafe:run-owner-recovery:v1'),
+    ).toEqual(journal);
+    expect(
+      await fixture.env.runtime.authoritativeStartState('gated', 'c-run'),
+    ).toBeNull();
+    expect(
+      keyed ? await reservations.readForAdmission('absent-key') : undefined,
+    ).toEqual(claimed);
+    expect(error).toMatchObject({ status: 503 });
+    for (let retry = 0; retry < 2; retry++) {
+      const response = await evicted.fetch(
+        post('/runs', {
+          ...C_WORKFLOW_BODY,
+          ...(claim
+            ? { idempotencyKey: claim.key, startReservation: claim }
+            : {}),
+        }),
+      );
+      expect(
+        fixture.journal.values.get('flowsafe:run-owner-recovery:v1'),
+      ).toEqual(journal);
+      expect(enter).not.toHaveBeenCalled();
+      expect(response.status).toBe(503);
+    }
+  });
+
+  async function zeroFixture() {
+    const env = makeProductionEnv();
+    const reservations = newTestStartIdempotency(env.storage);
+    const app = init(
+      { storage: env.storage },
+      { executionFence: env.fence ?? 'none', startIdempotency: reservations },
+    );
+    let effects = 0;
+    app
+      .createWorkflow({
+        id: 'zero',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+      })
+      .then(
+        app.createStep({
+          id: 'effect',
+          inputSchema: z.object({}),
+          outputSchema: z.object({}),
+          execute: async () => {
+            effects++;
+            return {};
+          },
+        }),
+      )
+      .commit();
+    env.runtime = app.runtime;
+    if (!env.fence) throw new Error('missing native fence');
+    await env.fence.seed('open');
+    const domain = (await env.storage.getStore(
+      'workflows',
+    )) as FencedWorkflowsStorageD1;
+    const native = domain[FENCED_WORKFLOW_STORAGE];
+    if (!native) throw new Error('missing native capability');
+    let closeOnce = true;
+    Object.defineProperty(domain, FENCED_WORKFLOW_STORAGE, {
+      value: {
+        ...native,
+        withInitialAdmission: async (
+          input: Parameters<typeof native.withInitialAdmission>[0],
+          create: Parameters<typeof native.withInitialAdmission>[1],
+        ) => {
+          if (closeOnce) {
+            closeOnce = false;
+            await env.fence?.transition({ expected: 'open', next: 'draining' });
+          }
+          return native.withInitialAdmission(input, create);
+        },
+      },
+      configurable: true,
+    });
+    const journal = recoveryStorage();
+    const runner = new TestRunner(journal.state, env);
+    const makeClaim = async () => {
+      const reserved = await reservations.reserve({
+        key: 'zero-key',
+        owner: { kind: 'human', id: OWNER_PRINCIPAL.id },
+        targetKind: 'workflow',
+        targetId: 'zero',
+        mintRunId: () => 'zero-run',
+      });
+      const claim = await reservations.claimReservation(reserved.reservation);
+      if (!claim) throw new Error('missing winning claim');
+      return claim;
+    };
+    return {
+      env,
+      reservations,
+      app,
+      domain,
+      native,
+      journal,
+      runner,
+      makeClaim,
+      effects: () => effects,
+      allowNext: () => {
+        closeOnce = false;
+      },
+      refuseNext: () => {
+        closeOnce = true;
+      },
+    };
+  }
+
+  it.each([
+    true,
+    false,
+  ])('clears only a local native validated-zero admission and retries once (keyed=%s)', async (keyed) => {
+    const { env, reservations, native, journal, runner, makeClaim, effects } =
+      await zeroFixture();
+    if (!env.fence) throw new Error('missing native fence');
+    const firstClaim = keyed ? await makeClaim() : undefined;
+    const first = await runner.fetch(
+      post('/runs', {
+        workflowId: 'zero',
+        runId: 'zero-run',
+        inputData: {},
+        ...(firstClaim
+          ? { idempotencyKey: firstClaim.key, startReservation: firstClaim }
+          : {}),
+      }),
+    );
+    expect(
+      await native.readSnapshot({ workflowId: 'zero', runId: 'zero-run' }),
+    ).toBeUndefined();
+    expect(journal.values.has('flowsafe:run-owner-recovery:v1')).toBe(false);
+    expect(await env.owners.owner('run', 'zero-run')).toBeUndefined();
+    expect(effects()).toBe(0);
+    if (keyed)
+      expect(await reservations.readForAdmission('zero-key')).toMatchObject({
+        state: 'reserved',
+        binding: { kind: 'unbound' },
+      });
+    expect(first.status).toBe(503);
+    await env.fence.transition({ expected: 'draining', next: 'open' });
+    const nextClaim = keyed ? await makeClaim() : undefined;
+    const retry = await runner.fetch(
+      post('/runs', {
+        workflowId: 'zero',
+        runId: 'zero-run',
+        inputData: {},
+        ...(nextClaim
+          ? { idempotencyKey: nextClaim.key, startReservation: nextClaim }
+          : {}),
+      }),
+    );
+    expect(effects()).toBe(1);
+    expect(journal.values.has('flowsafe:run-owner-recovery:v1')).toBe(false);
+    expect(retry.status).toBe(200);
+  });
+  it.each([
+    'lookalike',
+    'serialized',
+    'other generation',
+    'foreign row',
+    'evicted frame',
+  ] as const)('retains prepared absence without its exact local zero authority: %s', async (mode) => {
+    const fixture = await zeroFixture();
+    const nativeStart = fixture.app.runtime.start.bind(fixture.app.runtime);
+    let originalFailure: unknown;
+    let replacementRaw: unknown;
+    vi.spyOn(fixture.app.runtime, 'start').mockImplementationOnce(
+      async (...args) => {
+        try {
+          return await nativeStart(...args);
+        } catch (error) {
+          originalFailure = error;
+          if (mode === 'other generation') {
+            await fixture.env.fence?.transition({
+              expected: 'draining',
+              next: 'open',
+            });
+            fixture.refuseNext();
+            await nativeStart('zero', {
+              runId: 'other-zero-run',
+              inputData: {},
+              requestedBy: OWNER_PRINCIPAL.id,
+              requestedByKind: 'human',
+            });
+            throw new Error('second native zero did not refuse');
+          }
+          if (mode === 'foreign row') {
+            await fixture.domain.persistWorkflowSnapshot({
+              workflowName: 'zero',
+              runId: 'zero-run',
+              snapshot: {
+                runId: 'zero-run',
+                status: 'success',
+                result: {},
+                value: {},
+                context: {},
+                serializedStepGraph: [],
+                activePaths: [],
+                activeStepsPath: {},
+                suspendedPaths: {},
+                resumeLabels: {},
+                waitingPaths: {},
+                timestamp: 1,
+                requestContext: {
+                  'flowsafe.runProvenance': {
+                    version: 2,
+                    startToken: 'replacement-generation',
+                    attemptToken: 'replacement-attempt',
+                    resumeCounts: [],
+                    requestedBy: OWNER_PRINCIPAL.id,
+                    requestedByKind: 'human',
+                    startIdentity: {
+                      owner: { kind: 'human', id: OWNER_PRINCIPAL.id },
+                      target: { kind: 'workflow', id: 'zero' },
+                    },
+                  },
+                },
+              },
+            });
+            replacementRaw = await fixture.native.readSnapshot({
+              workflowId: 'zero',
+              runId: 'zero-run',
+            });
+            throw error;
+          }
+          if (mode === 'lookalike') {
+            const { ExecutionFencedError } = await import(
+              './execution-fence.js'
+            );
+            throw new ExecutionFencedError('draining', 'run start');
+          }
+          throw Object.assign(
+            new Error('serialized refusal'),
+            JSON.parse(
+              JSON.stringify({
+                status: (error as { status?: number }).status,
+                reason: (error as { reason?: unknown }).reason,
+              }),
+            ),
+          );
+        }
+      },
+    );
+    const first = await fixture.runner.fetch(
+      post('/runs', { workflowId: 'zero', runId: 'zero-run', inputData: {} }),
+    );
+    const journal = structuredClone(
+      fixture.journal.values.get('flowsafe:run-owner-recovery:v1'),
+    );
+    expect(journal).toMatchObject({
+      phase: 'prepared',
+      execution: { workflowId: 'zero', runId: 'zero-run' },
+    });
+    expect(fixture.effects()).toBe(0);
+    if (mode === 'foreign row')
+      expect(
+        await fixture.native.readSnapshot({
+          workflowId: 'zero',
+          runId: 'zero-run',
+        }),
+      ).toEqual(replacementRaw);
+    else
+      expect(
+        await fixture.native.readSnapshot({
+          workflowId: 'zero',
+          runId: 'zero-run',
+        }),
+      ).toBeUndefined();
+    expect(first.status).toBe(
+      mode === 'serialized' || mode === 'evicted frame' ? 500 : 503,
+    );
+    if (mode === 'evicted frame') {
+      const { isDefinitiveInitialAdmissionRefusal } = await import(
+        './initial-admission-refusal.js'
+      );
+      expect(
+        isDefinitiveInitialAdmissionRefusal(
+          originalFailure,
+          (
+            journal as {
+              execution: import('./execution-admission.js').D1RunExecutionIdentity;
+            }
+          ).execution,
+        ),
+      ).toBe(true);
+      const error = await fixture.runner
+        .alarm()
+        .catch((cause: unknown) => cause);
+      expect(
+        fixture.journal.values.get('flowsafe:run-owner-recovery:v1'),
+      ).toEqual(journal);
+      expect(error).toMatchObject({ status: 503 });
+    }
+    await fixture.env.fence?.transition({ expected: 'draining', next: 'open' });
+    const retry = await fixture.runner.fetch(
+      post('/runs', { workflowId: 'zero', runId: 'zero-run', inputData: {} }),
+    );
+    expect(
+      fixture.journal.values.get('flowsafe:run-owner-recovery:v1'),
+    ).toEqual(journal);
+    expect(fixture.effects()).toBe(0);
+    expect(retry.status).toBe(503);
+  });
+  it('retains a paid unknown outcome when a fence lookalike follows real engine entry', async () => {
+    const fixture = await zeroFixture();
+    fixture.allowNext();
+    const nativeStart = fixture.app.runtime.start.bind(fixture.app.runtime);
+    vi.spyOn(fixture.app.runtime, 'start').mockImplementationOnce(
+      async (...args) => {
+        await nativeStart(...args);
+        await testDatabase(fixture.env.storage)
+          .prepare(
+            'DELETE FROM mastra_workflow_snapshot WHERE workflow_name = ? AND run_id = ?',
+          )
+          .bind('zero', 'zero-run')
+          .run();
+        const { ExecutionFencedError } = await import('./execution-fence.js');
+        throw new ExecutionFencedError('draining', 'run start');
+      },
+    );
+    const response = await fixture.runner.fetch(
+      post('/runs', { workflowId: 'zero', runId: 'zero-run', inputData: {} }),
+    );
+    expect(fixture.effects()).toBe(1);
+    expect(
+      await fixture.native.readSnapshot({
+        workflowId: 'zero',
+        runId: 'zero-run',
+      }),
+    ).toBeUndefined();
+    expect(
+      fixture.journal.values.get('flowsafe:run-owner-recovery:v1'),
+    ).toMatchObject({
+      phase: 'prepared',
+      execution: { workflowId: 'zero', runId: 'zero-run' },
+    });
+    expect(response.status).toBe(503);
+  });
+});
+
+describe('FS8 D3 host R1 ordinary legacy workflow lifecycle', () => {
+  it.each([
+    ['v1', 'terminate'],
+    ['absent', 'terminate'],
+    ['v1', 'deadline'],
+    ['absent', 'deadline'],
+  ] as const)('converges actual Core cleanup and replay with retained key (%s %s)', async (version, operation) => {
+    const fixture = await hostR1WorkflowFixture('custom-null');
+    const runId = 'legacy-run';
+    const reserved = await fixture.reservations.reserve({
+      key: 'retained-legacy-key',
+      owner: { kind: 'human', id: OWNER_PRINCIPAL.id },
+      targetKind: 'workflow',
+      targetId: 'host-r1',
+      mintRunId: () => runId,
+    });
+    const claim = await fixture.reservations.claimReservation(
+      reserved.reservation,
+    );
+    if (!claim) throw new Error('missing retained claim');
+    expect(
+      (
+        await fixture.runner.fetch(
+          post('/runs', {
+            workflowId: 'host-r1',
+            runId,
+            inputData: {},
+            deadlineMs: 0,
+            idempotencyKey: claim.key,
+            startReservation: claim,
+          }),
+        )
+      ).status,
+    ).toBe(200);
+    const snapshot = await fixture.workflows.loadWorkflowSnapshot({
+      workflowName: 'host-r1',
+      runId,
+    });
+    if (!snapshot?.requestContext)
+      throw new Error('missing actual Core snapshot');
+    if (version === 'v1')
+      snapshot.requestContext['flowsafe.runProvenance'] = {
+        version: 1,
+        attemptToken: 'host-r1-legacy-leg',
+        requestedBy: OWNER_PRINCIPAL.id,
+        requestedByKind: 'human',
+        resumeCounts: [],
+      };
+    else delete snapshot.requestContext['flowsafe.runProvenance'];
+    await fixture.workflows.persistWorkflowSnapshot({
+      workflowName: 'host-r1',
+      runId,
+      snapshot,
+    });
+    const bound = await fixture.reservations.readForAdmission(claim.key);
+    const lifecycle = snapshot.requestContext['flowsafe.runLifecycle'] as {
+      revision: number;
+      deadlineAt: number;
+    };
+    const events: string[] = [];
+    const approvals = vi.fn(async () => {
+      events.push('approvals');
+    });
+    fixture.env.lifecycle = { abandonApprovals: approvals };
+    const release = fixture.owners.release.bind(fixture.owners);
+    vi.spyOn(fixture.owners, 'release').mockImplementation(async (...args) => {
+      events.push('owner');
+      return release(...args);
+    });
+    const complete = fixture.app.runtime.completeTerminalCleanup.bind(
+      fixture.app.runtime,
+    );
+    vi.spyOn(fixture.app.runtime, 'completeTerminalCleanup').mockImplementation(
+      async (...args) => {
+        events.push('completion');
+        return complete(...args);
+      },
+    );
+    const settle = vi.spyOn(fixture.app.runtime, 'settleStartExecution');
+    const b2 = vi.spyOn(fixture.app.runtime, 'recoverStartAttempt');
+    const body =
+      operation === 'deadline'
+        ? {
+            expectedRevision: lifecycle.revision,
+            expectedDeadlineAt: lifecycle.deadlineAt,
+          }
+        : {};
+    const principal: ExecutionPrincipal =
+      operation === 'deadline'
+        ? {
+            kind: 'system',
+            id: 'maintenance',
+            purpose: 'run-deadline-maintenance',
+          }
+        : OWNER_PRINCIPAL;
+    const first = await fixture.runner.fetch(
+      post(`/runs/host-r1/${runId}/${operation}`, body, principal),
+    );
+    expect(await fixture.owners.owner('run', runId)).toBeUndefined();
+    expect(await fixture.reservations.readForAdmission(claim.key)).toEqual(
+      bound,
+    );
+    expect(events).toEqual(['approvals', 'owner', 'completion']);
+    expect(settle).not.toHaveBeenCalled();
+    expect(b2).not.toHaveBeenCalled();
+    expect(first.status).toBe(200);
+    const terminal = await fixture.workflows.loadWorkflowSnapshot({
+      workflowName: 'host-r1',
+      runId,
+    });
+    expect(terminal).toMatchObject({
+      status: operation === 'deadline' ? 'timed_out' : 'cancelled',
+      requestContext: {
+        'flowsafe.runLifecycle': {
+          terminal: { cleanupCompletedAt: expect.any(Number) },
+        },
+      },
+    });
+    const bytes = JSON.stringify(terminal);
+    const replay = await fixture.runner.fetch(
+      post(
+        `/runs/host-r1/${runId}/${operation === 'deadline' ? 'deadline' : 'terminate-replay'}`,
+        body,
+        principal,
+      ),
+    );
+    expect(
+      JSON.stringify(
+        await fixture.workflows.loadWorkflowSnapshot({
+          workflowName: 'host-r1',
+          runId,
+        }),
+      ),
+    ).toBe(bytes);
+    expect(await fixture.reservations.readForAdmission(claim.key)).toEqual(
+      bound,
+    );
+    expect(events).toEqual(['approvals', 'owner', 'completion']);
+    expect(fixture.effects()).toBe(1);
+    expect(replay.status).toBe(200);
+  });
+
+  it.each([
+    'v1',
+    'absent',
+  ] as const)('retains actual legacy ownership after hook failure and completes one retry (%s)', async (version) => {
+    const fixture = await hostR1WorkflowFixture('custom-null');
+    expect(
+      (
+        await fixture.runner.fetch(
+          post('/runs', {
+            workflowId: 'host-r1',
+            runId: 'legacy-retry',
+            inputData: {},
+          }),
+        )
+      ).status,
+    ).toBe(200);
+    const snapshot = await fixture.workflows.loadWorkflowSnapshot({
+      workflowName: 'host-r1',
+      runId: 'legacy-retry',
+    });
+    if (!snapshot?.requestContext) throw new Error('missing Core snapshot');
+    if (version === 'v1')
+      snapshot.requestContext['flowsafe.runProvenance'] = {
+        version: 1,
+        attemptToken: 'host-r1-legacy-leg',
+        requestedBy: OWNER_PRINCIPAL.id,
+        requestedByKind: 'human',
+        resumeCounts: [],
+      };
+    else delete snapshot.requestContext['flowsafe.runProvenance'];
+    await fixture.workflows.persistWorkflowSnapshot({
+      workflowName: 'host-r1',
+      runId: 'legacy-retry',
+      snapshot,
+    });
+    const approvals = vi
+      .fn(async () => {})
+      .mockRejectedValueOnce(new Error('approval receipt lost'));
+    fixture.env.lifecycle = { abandonApprovals: approvals };
+    const complete = vi.spyOn(fixture.app.runtime, 'completeTerminalCleanup');
+    const first = await fixture.runner.fetch(
+      post('/runs/host-r1/legacy-retry/terminate', {}),
+    );
+    expect(await fixture.owners.owner('run', 'legacy-retry')).toEqual({
+      kind: 'human',
+      id: OWNER_PRINCIPAL.id,
+    });
+    expect(complete).not.toHaveBeenCalled();
+    expect(
+      (
+        await fixture.workflows.loadWorkflowSnapshot({
+          workflowName: 'host-r1',
+          runId: 'legacy-retry',
+        })
+      )?.status,
+    ).toBe('cancelled');
+    expect(first.status).toBe(500);
+    const retry = await fixture.runner.fetch(
+      post('/runs/host-r1/legacy-retry/terminate-replay', {}),
+    );
+    expect(await fixture.owners.owner('run', 'legacy-retry')).toBeUndefined();
+    expect(approvals).toHaveBeenCalledTimes(2);
+    expect(complete).toHaveBeenCalledOnce();
+    expect(fixture.effects()).toBe(1);
+    expect(retry.status).toBe(200);
+  });
+});
+
+describe('FS8 D3 host R1 workflow unfenced recovery', () => {
+  it.each([
+    ['custom-null', 'missing'],
+    ['custom-null', 'pending'],
+    ['custom-null', 'suspended'],
+    ['actual-prefix', 'missing'],
+    ['actual-prefix', 'pending'],
+    ['actual-prefix', 'suspended'],
+  ] as const)('retains keyed journal and ownership before missing-store refusal (%s %s)', async (mode, status) => {
+    const fixture = await hostR1WorkflowFixture(mode, false);
+    const runId = 'unfenced-run';
+    const execution = {
+      tablePrefix: mode === 'custom-null' ? null : 'host_r1_',
+      workflowId: 'host-r1',
+      runId,
+      startToken: 'unfenced-generation',
+    };
+    const reserved = await fixture.reservations.reserve({
+      key: 'unfenced-key',
+      owner: { kind: 'human' as const, id: OWNER_PRINCIPAL.id },
+      targetKind: 'workflow',
+      targetId: 'host-r1',
+      mintRunId: () => runId,
+    });
+    const claim = await fixture.reservations.claimReservation(
+      reserved.reservation,
+    );
+    if (!claim) throw new Error('missing claim');
+    await fixture.reservations.bindPreparedStart(claim, {
+      ...execution,
+      owner: { kind: 'human' as const, id: OWNER_PRINCIPAL.id },
+      target: { kind: 'workflow', id: 'host-r1' },
+    });
+    const journal = {
+      version: 2,
+      phase: 'prepared-unfenced',
+      workflowId: 'host-r1',
+      runId,
+      token: 'unfenced-attempt',
+      owner: { kind: 'human' as const, id: OWNER_PRINCIPAL.id },
+      execution,
+      startReservation: claim,
+    };
+    fixture.journal.values.set('flowsafe:run-owner-recovery:v1', journal);
+    await fixture.owners.reserveAll(
+      [{ kind: 'run', resourceId: runId }],
+      journal.owner,
+      journal.token,
+    );
+    if (status !== 'missing')
+      await fixture.workflows.persistWorkflowSnapshot({
+        workflowName: 'host-r1',
+        runId,
+        snapshot: {
+          runId,
+          status,
+          value: {},
+          context: {},
+          serializedStepGraph: [],
+          activePaths: [],
+          activeStepsPath: {},
+          suspendedPaths: {},
+          resumeLabels: {},
+          waitingPaths: {},
+          timestamp: 1,
+          requestContext: {
+            'flowsafe.runProvenance': {
+              version: 2,
+              startToken: execution.startToken,
+              attemptToken: journal.token,
+              resumeCounts: [],
+              startIdentity: {
+                owner: journal.owner,
+                target: { kind: 'workflow', id: 'host-r1' },
+              },
+            },
+          },
+        },
+      });
+    const before = await fixture.workflows.loadWorkflowSnapshot({
+      workflowName: 'host-r1',
+      runId,
+    });
+    const bound = await fixture.reservations.readForAdmission('unfenced-key');
+    const settle = vi.spyOn(fixture.owners, 'settleReservation');
+    const b2 = vi.spyOn(fixture.app.runtime, 'recoverStartAttempt');
+    const outcome = await fixture.runner
+      .alarm()
+      .catch((error: unknown) => error);
+    expect(settle).not.toHaveBeenCalled();
+    expect(
+      await fixture.owners.reserveAll(
+        [{ kind: 'run', resourceId: runId }],
+        { kind: 'human', id: 'foreign' },
+        'foreign-attempt',
+      ),
+    ).toBe(false);
+    expect(
+      fixture.journal.values.get('flowsafe:run-owner-recovery:v1'),
+    ).toEqual(journal);
+    expect(await fixture.reservations.readForAdmission('unfenced-key')).toEqual(
+      bound,
+    );
+    expect(
+      await fixture.workflows.loadWorkflowSnapshot({
+        workflowName: 'host-r1',
+        runId,
+      }),
+    ).toEqual(before);
+    expect(fixture.journal.alarms.at(-1)).toBeGreaterThan(Date.now());
+    expect(b2).not.toHaveBeenCalled();
+    expect(outcome).toMatchObject({ status: 503 });
+  });
+
+  it.each([
+    ['custom-null', 'missing'],
+    ['custom-null', 'pending'],
+    ['actual-prefix', 'missing'],
+    ['actual-prefix', 'pending'],
+  ] as const)('retains actual unkeyed unfenced absence or pending without B2 (%s %s)', async (mode, status) => {
+    const fixture = await hostR1WorkflowFixture(mode);
+    const runId = 'unkeyed-unfenced';
+    const execution = {
+      tablePrefix: mode === 'custom-null' ? null : 'host_r1_',
+      workflowId: 'host-r1',
+      runId,
+      startToken: 'unkeyed-generation',
+    };
+    const journal = {
+      version: 2,
+      phase: 'prepared-unfenced',
+      workflowId: 'host-r1',
+      runId,
+      token: 'unkeyed-attempt',
+      owner: { kind: 'human' as const, id: OWNER_PRINCIPAL.id },
+      execution,
+    };
+    fixture.journal.values.set('flowsafe:run-owner-recovery:v1', journal);
+    await fixture.owners.reserveAll(
+      [{ kind: 'run', resourceId: runId }],
+      journal.owner,
+      journal.token,
+    );
+    if (status === 'pending')
+      await fixture.workflows.persistWorkflowSnapshot({
+        workflowName: 'host-r1',
+        runId,
+        snapshot: {
+          runId,
+          status,
+          value: {},
+          context: {},
+          serializedStepGraph: [],
+          activePaths: [],
+          activeStepsPath: {},
+          suspendedPaths: {},
+          resumeLabels: {},
+          waitingPaths: {},
+          timestamp: 1,
+          requestContext: {
+            'flowsafe.runProvenance': {
+              version: 2,
+              startToken: execution.startToken,
+              attemptToken: journal.token,
+              resumeCounts: [],
+              startIdentity: {
+                owner: journal.owner,
+                target: { kind: 'workflow', id: 'host-r1' },
+              },
+            },
+          },
+        },
+      });
+    const b2 = vi.spyOn(fixture.app.runtime, 'recoverStartAttempt');
+    const settle = vi.spyOn(fixture.owners, 'settleReservation');
+    const outcome = await fixture.runner
+      .alarm()
+      .catch((error: unknown) => error);
+    expect(settle).not.toHaveBeenCalled();
+    expect(
+      fixture.journal.values.get('flowsafe:run-owner-recovery:v1'),
+    ).toEqual(journal);
+    expect(fixture.journal.alarms.at(-1)).toBeGreaterThan(Date.now());
+    expect(b2).not.toHaveBeenCalled();
+    if (status === 'pending') expect(outcome).toMatchObject({ status: 503 });
+    else expect(outcome).toBeUndefined();
+  });
+});
+
+describe('FS8 D3 host R1 workflow recovery object address', () => {
+  it.each([
+    ['preparing', 'workflow'],
+    ['preparing', 'run'],
+    ['prepared', 'workflow'],
+    ['prepared', 'run'],
+    ['prepared-unfenced', 'workflow'],
+    ['prepared-unfenced', 'run'],
+  ] as const)('preserves valid foreign address before Runtime and ownership (%s %s)', async (phase, mismatch) => {
+    const fixture = cWorkflowFixture(true);
+    const reservations = fixture.runtime.startIdempotency;
+    if (!reservations) throw new Error('missing foreign reservation store');
+    const reserved = await reservations.reserve({
+      key: 'foreign-address-key',
+      owner: { kind: 'human', id: OWNER_PRINCIPAL.id },
+      targetKind: 'workflow',
+      targetId: 'gated',
+      mintRunId: () => 'c-run',
+    });
+    const claim = await reservations.claimReservation(reserved.reservation);
+    if (!claim) throw new Error('missing foreign claim');
+    expect(
+      (
+        await fixture.runner.fetch(
+          post('/runs', {
+            ...C_WORKFLOW_BODY,
+            idempotencyKey: claim.key,
+            startReservation: claim,
+          }),
+        )
+      ).status,
+    ).toBe(200);
+    const bound = await reservations.readForAdmission(claim.key);
+    const selected = await fixture.runtime.authoritativeStartState(
+      'gated',
+      'c-run',
+    );
+    if (!selected) throw new Error('missing selected foreign row');
+    const workflowId = 'gated';
+    const runId = 'c-run';
+    const token = selected.provenance.attemptToken;
+    const snapshot = { ...selected.snapshot, status: 'pending' as const };
+    const workflows = await fixture.storage.getStore('workflows');
+    await workflows?.persistWorkflowSnapshot({
+      workflowName: workflowId,
+      runId,
+      snapshot,
+    });
+    const journal = {
+      version: 2,
+      phase,
+      workflowId,
+      runId,
+      owner: { kind: 'human' as const, id: OWNER_PRINCIPAL.id },
+      token,
+      startReservation: claim,
+      ...(phase === 'preparing' ? {} : { execution: selected.execution }),
+    };
+    fixture.journal.values.set('flowsafe:run-owner-recovery:v1', journal);
+    await testDatabase(fixture.storage)
+      .prepare(
+        'UPDATE flowsafe_resource_owners SET reservation_token = ? WHERE resource_kind = ? AND resource_id = ?',
+      )
+      .bind(token, 'run', runId)
+      .run();
+    const rows = await testDatabase(fixture.storage)
+      .prepare('SELECT * FROM flowsafe_resource_owners')
+      .all();
+    const recover = vi.spyOn(fixture.runtime, 'recoverStartAttempt');
+    const observe = vi.spyOn(fixture.runtime, 'authoritativeStartState');
+    const settle = vi.spyOn(fixture.env.owners, 'settleReservation');
+    const release = vi.spyOn(fixture.env.owners, 'release');
+    const hooks = { abandonApprovals: vi.fn(async () => {}) };
+    fixture.env.lifecycle = hooks;
+    const state = {
+      ...fixture.journal.state,
+      id: {
+        name:
+          mismatch === 'workflow' ? 'other-workflow:c-run' : 'gated:other-run',
+      },
+    } as DurableObjectState;
+    const foreign = new TestRunner(state, fixture.env);
+    const outcome = await foreign.alarm().catch((error: unknown) => error);
+    expect(
+      await testDatabase(fixture.storage)
+        .prepare('SELECT * FROM flowsafe_resource_owners')
+        .all(),
+    ).toEqual(rows);
+    expect(
+      await workflows?.loadWorkflowSnapshot({
+        workflowName: workflowId,
+        runId,
+      }),
+    ).toEqual(snapshot);
+    expect(
+      fixture.journal.values.get('flowsafe:run-owner-recovery:v1'),
+    ).toEqual(journal);
+    expect(await reservations.readForAdmission(claim.key)).toEqual(bound);
+    expect(recover).not.toHaveBeenCalled();
+    expect(observe).not.toHaveBeenCalled();
+    expect(settle).not.toHaveBeenCalled();
+    expect(release).not.toHaveBeenCalled();
+    expect(hooks.abandonApprovals).not.toHaveBeenCalled();
+    expect(outcome).toBeInstanceOf(Error);
+  });
+
+  it.each([
+    'own',
+    'undefined',
+  ] as const)('keeps supported workflow object name recovery (%s)', async (name) => {
+    const fixture = cWorkflowFixture(true);
+    expect(
+      (await fixture.runner.fetch(post('/runs', C_WORKFLOW_BODY))).status,
+    ).toBe(200);
+    const selected = await fixture.runtime.authoritativeStartState(
+      'gated',
+      'c-run',
+    );
+    if (!selected) throw new Error('missing own row');
+    const journal = await durableOwnerRecovery(
+      fixture.runtime,
+      'gated',
+      'c-run',
+      selected.provenance.attemptToken,
+    );
+    fixture.journal.values.set('flowsafe:run-owner-recovery:v1', journal);
+    const state = {
+      ...fixture.journal.state,
+      ...(name === 'own' ? { id: { name: 'gated:c-run' } } : {}),
+    } as DurableObjectState;
+    await new TestRunner(state, fixture.env).alarm();
+    expect(fixture.journal.values.has('flowsafe:run-owner-recovery:v1')).toBe(
+      false,
+    );
+    expect(await fixture.env.owners.owner('run', 'c-run')).toEqual({
+      kind: 'human',
+      id: OWNER_PRINCIPAL.id,
+    });
+  });
+});
+
+describe('FS8 D3 host R1 workflow keyed finalization preflight', () => {
+  it('retains the original journal claim during cold normal termination and replay without its store', async () => {
+    const fixture = await hostR1WorkflowFixture('custom-null');
+    const runId = 'cold-terminate';
+    const reserved = await fixture.reservations.reserve({
+      key: 'cold-terminate-key',
+      owner: { kind: 'human', id: OWNER_PRINCIPAL.id },
+      targetKind: 'workflow',
+      targetId: 'host-r1',
+      mintRunId: () => runId,
+    });
+    const claim = await fixture.reservations.claimReservation(
+      reserved.reservation,
+    );
+    if (!claim) throw new Error('missing original claim');
+    let prepared: unknown;
+    const put = fixture.journal.values.set.bind(fixture.journal.values);
+    const writes = vi
+      .spyOn(fixture.journal.values, 'set')
+      .mockImplementation((key, value) => {
+        if (
+          key === 'flowsafe:run-owner-recovery:v1' &&
+          value &&
+          typeof value === 'object' &&
+          (value as { phase?: unknown }).phase === 'prepared-unfenced'
+        )
+          prepared = structuredClone(value);
+        return put(key, value);
+      });
+    expect(
+      (
+        await fixture.runner.fetch(
+          post('/runs', {
+            workflowId: 'host-r1',
+            runId,
+            inputData: {},
+            idempotencyKey: claim.key,
+            startReservation: claim,
+          }),
+        )
+      ).status,
+    ).toBe(200);
+    writes.mockRestore();
+    expect(prepared).toMatchObject({
+      phase: 'prepared-unfenced',
+      startReservation: claim,
+    });
+    fixture.journal.values.set('flowsafe:run-owner-recovery:v1', prepared);
+    const cold = init(
+      { storage: fixture.storage },
+      {
+        executionFence: 'none',
+        startIdempotency: 'none',
+      },
+    );
+    const effects = vi.fn(async () => ({}));
+    cold
+      .createWorkflow({
+        id: 'host-r1',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+      })
+      .then(
+        cold.createStep({
+          id: 'gate',
+          inputSchema: z.object({}),
+          outputSchema: z.object({}),
+          execute: effects,
+        }),
+      )
+      .commit();
+    const hostRuntime = new Proxy({} as RunnerRuntime, {
+      get: (_target, property) => {
+        const value: unknown = Reflect.get(
+          cold.runtime,
+          property,
+          cold.runtime,
+        );
+        return typeof value === 'function' ? value.bind(cold.runtime) : value;
+      },
+    });
+    const approvals = vi.fn(async () => {});
+    const runner = new TestRunner(fixture.journal.state, {
+      ...fixture.env,
+      runtime: hostRuntime,
+      lifecycle: { abandonApprovals: approvals },
+    });
+    const before = await fixture.reservations.readForAdmission(claim.key);
+    const settle = vi.spyOn(fixture.owners, 'settleReservation');
+    const release = vi.spyOn(fixture.owners, 'release');
+    const completion = vi.spyOn(cold.runtime, 'completeTerminalCleanup');
+    for (const action of ['terminate', 'terminate-replay']) {
+      const response = await runner.fetch(
+        post(`/runs/host-r1/${runId}/${action}`, {}),
+      );
+      expect(await fixture.owners.owner('run', runId)).toEqual({
+        kind: 'human',
+        id: OWNER_PRINCIPAL.id,
+      });
+      expect(
+        fixture.journal.values.get('flowsafe:run-owner-recovery:v1'),
+      ).toEqual(prepared);
+      expect(await fixture.reservations.readForAdmission(claim.key)).toEqual(
+        before,
+      );
+      expect(settle).not.toHaveBeenCalled();
+      expect(release).not.toHaveBeenCalled();
+      expect(approvals).not.toHaveBeenCalled();
+      expect(completion).not.toHaveBeenCalled();
+      expect(effects).not.toHaveBeenCalled();
+      expect(response.status).toBe(503);
+    }
+    expect(
+      (
+        await fixture.workflows.loadWorkflowSnapshot({
+          workflowName: 'host-r1',
+          runId,
+        })
+      )?.status,
+    ).toBe('cancelled');
+    expect(fixture.effects()).toBe(1);
+  });
+
+  it('retains prepared nonterminal ownership when the store disappears after native persistence', async () => {
+    const fixture = await hostR1WorkflowFixture('custom-null');
+    const reserved = await fixture.reservations.reserve({
+      key: 'workflow-finalizer-key',
+      owner: { kind: 'human', id: OWNER_PRINCIPAL.id },
+      targetKind: 'workflow',
+      targetId: 'host-r1',
+      mintRunId: () => 'finalizer-run',
+    });
+    const claim = await fixture.reservations.claimReservation(
+      reserved.reservation,
+    );
+    if (!claim) throw new Error('missing finalizer claim');
+    const native = fixture.app.runtime.start.bind(fixture.app.runtime);
+    vi.spyOn(fixture.app.runtime, 'start').mockImplementation(
+      async (...args) => {
+        const summary = await native(...args);
+        vi.spyOn(
+          fixture.app.runtime,
+          'startIdempotency',
+          'get',
+        ).mockReturnValue(undefined);
+        return summary;
+      },
+    );
+    const settle = vi.spyOn(fixture.owners, 'settleReservation');
+    const response = await fixture.runner.fetch(
+      post('/runs', {
+        workflowId: 'host-r1',
+        runId: 'finalizer-run',
+        inputData: {},
+        idempotencyKey: claim.key,
+        startReservation: claim,
+      }),
+    );
+    expect(settle).not.toHaveBeenCalled();
+    expect(
+      fixture.journal.values.get('flowsafe:run-owner-recovery:v1'),
+    ).toMatchObject({ phase: 'prepared-unfenced', startReservation: claim });
+    expect(
+      (
+        await fixture.workflows.loadWorkflowSnapshot({
+          workflowName: 'host-r1',
+          runId: 'finalizer-run',
+        })
+      )?.status,
+    ).toBe('suspended');
+    expect(
+      await fixture.reservations.readForAdmission(claim.key),
+    ).toMatchObject({ state: 'started', binding: { kind: 'bound' } });
+    expect(fixture.journal.alarms.at(-1)).toBeGreaterThan(Date.now());
+    expect(response.status).toBe(503);
+  });
+});
+
+describe('FS8 D3 host R1 workflow legacy cleanup wait guards', () => {
+  it.each([
+    'dispatch',
+    'owner release',
+    'completion',
+  ] as const)('retains a journal appearing during the final legacy %s wait', async (boundary) => {
+    const fixture = await hostR1WorkflowFixture('custom-null');
+    const runId = 'late-journal';
+    expect(
+      (
+        await fixture.runner.fetch(
+          post('/runs', {
+            workflowId: 'host-r1',
+            runId,
+            inputData: {},
+          }),
+        )
+      ).status,
+    ).toBe(200);
+    const snapshot = await fixture.workflows.loadWorkflowSnapshot({
+      workflowName: 'host-r1',
+      runId,
+    });
+    if (!snapshot?.requestContext) throw new Error('missing stored run');
+    delete snapshot.requestContext['flowsafe.runProvenance'];
+    snapshot.requestContext['flowsafe.runLifecycle'] = {
+      version: 1,
+      revision: 1,
+      scheduleDispatch: {
+        scheduleId: 'late-schedule',
+        dispatchId: 'late-dispatch',
+      },
+    };
+    await fixture.workflows.persistWorkflowSnapshot({
+      workflowName: 'host-r1',
+      runId,
+      snapshot,
+    });
+    const journal = { version: 1 };
+    const replace = () =>
+      fixture.journal.values.set('flowsafe:run-owner-recovery:v1', journal);
+    const dispatch = vi.fn(async () => {
+      if (boundary === 'dispatch') replace();
+    });
+    fixture.env.lifecycle = {
+      abandonApprovals: async () => {},
+      discardScheduleDispatch: dispatch,
+    };
+    const nativeRelease = fixture.owners.release.bind(fixture.owners);
+    const release = vi
+      .spyOn(fixture.owners, 'release')
+      .mockImplementation(async (...args) => {
+        const result = await nativeRelease(...args);
+        if (boundary === 'owner release') replace();
+        return result;
+      });
+    const nativeComplete = fixture.app.runtime.completeTerminalCleanup.bind(
+      fixture.app.runtime,
+    );
+    const complete = vi
+      .spyOn(fixture.app.runtime, 'completeTerminalCleanup')
+      .mockImplementation(async (...args) => {
+        const result = await nativeComplete(...args);
+        if (boundary === 'completion') replace();
+        return result;
+      });
+    const response = await fixture.runner.fetch(
+      post(`/runs/host-r1/${runId}/terminate`, {}),
+    );
+    expect(
+      fixture.journal.values.get('flowsafe:run-owner-recovery:v1'),
+      await response.clone().text(),
+    ).toEqual(journal);
+    expect(await fixture.owners.owner('run', runId)).toEqual(
+      boundary === 'dispatch'
+        ? { kind: 'human', id: OWNER_PRINCIPAL.id }
+        : undefined,
+    );
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(release).toHaveBeenCalledTimes(boundary === 'dispatch' ? 0 : 1);
+    expect(complete).toHaveBeenCalledTimes(boundary === 'completion' ? 1 : 0);
+    expect(response.status).toBe(503);
+  });
+
+  it.each([
+    'journal',
+    'active execution',
+  ] as const)('retains owner after approval wait changes legacy authority (%s)', async (change) => {
+    const fixture = await hostR1WorkflowFixture('custom-null');
+    expect(
+      (
+        await fixture.runner.fetch(
+          post('/runs', {
+            workflowId: 'host-r1',
+            runId: 'legacy-wait',
+            inputData: {},
+          }),
+        )
+      ).status,
+    ).toBe(200);
+    const snapshot = await fixture.workflows.loadWorkflowSnapshot({
+      workflowName: 'host-r1',
+      runId: 'legacy-wait',
+    });
+    if (!snapshot?.requestContext) throw new Error('missing Core row');
+    delete snapshot.requestContext['flowsafe.runProvenance'];
+    await fixture.workflows.persistWorkflowSnapshot({
+      workflowName: 'host-r1',
+      runId: 'legacy-wait',
+      snapshot,
+    });
+    fixture.env.lifecycle = {
+      abandonApprovals: async () => {
+        if (change === 'journal')
+          fixture.journal.values.set('flowsafe:run-owner-recovery:v1', {
+            version: 1,
+          });
+        else vi.spyOn(fixture.app.runtime, 'isRunActive').mockReturnValue(true);
+      },
+    };
+    const release = vi.spyOn(fixture.owners, 'release');
+    const complete = vi.spyOn(fixture.app.runtime, 'completeTerminalCleanup');
+    const response = await fixture.runner.fetch(
+      post('/runs/host-r1/legacy-wait/terminate', {}),
+    );
+    expect(await fixture.owners.owner('run', 'legacy-wait')).toEqual({
+      kind: 'human',
+      id: OWNER_PRINCIPAL.id,
+    });
+    expect(release).not.toHaveBeenCalled();
+    expect(complete).not.toHaveBeenCalled();
+    if (change === 'journal')
+      expect(
+        fixture.journal.values.get('flowsafe:run-owner-recovery:v1'),
+      ).toEqual({ version: 1 });
+    expect(response.status).toBe(503);
   });
 });

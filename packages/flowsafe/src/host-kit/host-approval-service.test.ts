@@ -9,6 +9,7 @@ import {
   ApprovalAuthzError,
   InMemoryApprovalStoreFactory,
 } from '../approval-api/index.js';
+import type { ExecutionFenceStore } from '../do-runner/execution-fence.js';
 import {
   buildHostApprovalService,
   runApprovalRetentionPurge,
@@ -136,5 +137,53 @@ describe('buildHostApprovalService allowSelfDecision passthrough', () => {
     await expect(
       service.decide(id, { decision: 'approve' }, ADMIN),
     ).rejects.toBeInstanceOf(ApprovalAuthzError);
+  });
+});
+
+describe('FS8 D3 proof activation host approval namespace', () => {
+  it('forwards the explicit namespace to the deciding service without inferring an omitted prefix', async () => {
+    const execution = {
+      tablePrefix: 'proof_',
+      workflowId: 'wf',
+      runId: 'run',
+      startToken: 'generation',
+    };
+    const readCurrentRunExecution = vi.fn(async () => execution);
+    const fence = {
+      read: async () => ({
+        state: 'proof-only',
+        proofKey: 'key',
+        proofRunId: 'run',
+        proofExecution: execution,
+      }),
+      readCurrentRunExecution,
+    } as unknown as ExecutionFenceStore;
+    for (const workflowTablePrefix of [undefined, 'PROOF_']) {
+      const store = new InMemoryApprovalStoreFactory().store();
+      const service = buildHostApprovalService(store, {
+        systemPrincipalId: 'system',
+        executionFence: fence,
+        workflowTablePrefix,
+        resumeRun: async () => ({ runId: 'run', status: 'success' }),
+      });
+      const { record } = await service.create(
+        { workflowId: 'wf', runId: 'run', title: 'proof' },
+        OPERATOR,
+      );
+      const result = await service
+        .decide(record.id, { decision: 'approve' }, ADMIN)
+        .catch((error) => error);
+      expect((await store.get(record.id))?.status).toBe(
+        workflowTablePrefix === undefined ? 'pending' : 'approved',
+      );
+      if (workflowTablePrefix !== undefined) {
+        expect(result).toMatchObject({ record: { status: 'approved' } });
+        expect(readCurrentRunExecution).toHaveBeenCalledWith({
+          tablePrefix: 'proof_',
+          workflowId: 'wf',
+          runId: 'run',
+        });
+      }
+    }
   });
 });

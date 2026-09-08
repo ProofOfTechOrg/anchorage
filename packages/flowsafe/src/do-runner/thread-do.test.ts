@@ -18,6 +18,11 @@ import { ThreadDurableObject, type ThreadScope } from './thread-do.js';
 class TestThread extends ThreadDurableObject {
   builds = 0;
   scopes: ThreadScope[] = [];
+  alarmScopes: Array<{
+    threadId: string;
+    init: InitResult;
+    deploymentTag?: string;
+  }> = [];
   events?: string[];
   buildError?: Error;
   alarmError?: Error;
@@ -43,7 +48,13 @@ class TestThread extends ThreadDurableObject {
     );
   }
 
-  protected async onAlarm(): Promise<void> {
+  protected async onAlarm(
+    _env: unknown,
+    threadId: string,
+    initResult: InitResult,
+    deploymentTag?: string,
+  ): Promise<void> {
+    this.alarmScopes.push({ threadId, init: initResult, deploymentTag });
     this.events?.push('onAlarm');
     if (this.alarmError) throw this.alarmError;
   }
@@ -123,6 +134,62 @@ function cDeferred() {
   });
   return { promise, resolve };
 }
+
+describe('FS8 D3 host activation', () => {
+  it.each([
+    'replacement',
+    undefined,
+  ])('passes the verified alarm tag after the environment changes to %s', async (replacement) => {
+    const entered = cDeferred();
+    const release = cDeferred();
+    const identity = deploymentIdentityDatabase();
+    const setAlarm = vi.fn(async () => {});
+    const env = {
+      DEPLOYMENT_TENANT: 'acme' as string | undefined,
+      DEPLOYMENT_IDENTITY_SECRET: TEST_DEPLOYMENT_IDENTITY_SECRET,
+      DB: {
+        prepare(query: string) {
+          const statement = identity.prepare(query);
+          return {
+            ...statement,
+            async all<T>() {
+              const result = await statement.all<T>();
+              entered.resolve();
+              await release.promise;
+              return result;
+            },
+          };
+        },
+      },
+    };
+    const thread = new TestThread(
+      {
+        id: { name: 'thread-alarm' },
+        storage: { setAlarm },
+      } as unknown as DurableObjectState,
+      env,
+    );
+    const pending = thread.alarm();
+    try {
+      await entered.promise;
+      expect(thread.builds).toBe(0);
+      expect(thread.alarmScopes).toEqual([]);
+      expect(setAlarm).toHaveBeenCalledOnce();
+      env.DEPLOYMENT_TENANT = replacement;
+    } finally {
+      release.resolve();
+      await pending;
+    }
+    expect(thread.builds).toBe(1);
+    expect(thread.alarmScopes).toHaveLength(1);
+    expect(thread.alarmScopes[0]).toMatchObject({
+      threadId: 'thread-alarm',
+      deploymentTag: 'acme',
+    });
+    expect(thread.alarmScopes[0]?.init.runtime).toBeDefined();
+    expect(setAlarm).toHaveBeenCalledOnce();
+  });
+});
 
 describe('ThreadDurableObject identity boundary', () => {
   it.each([

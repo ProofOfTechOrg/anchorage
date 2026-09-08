@@ -389,10 +389,23 @@ async function checkReservationTypes(store: RunnerAdmission.StartIdempotencyStor
   const binding: RunnerAdmission.StartReservationBinding | undefined = observed?.binding;
   const reserved = await store.reserve({ key: 'key', owner: legacyReservation.owner, targetKind: 'workflow', targetId: 'workflow', mintRunId: () => 'run' });
   const kind: 'legacy' | 'unbound' | 'bound' = reserved.reservation.binding.kind;
+  const claimed = await store.claimReservation(reserved.reservation);
+  if (claimed) {
+    await store.bindPreparedStart(claimed, executionIdentity);
+  }
+  await store.settleExecution(executionIdentity);
+  const alias = await store.reserve({ key: 'alias', owner: legacyReservation.owner, targetKind: 'workflow', targetId: 'workflow', mintRunId: () => 'run' });
+  await store.associateReservation(alias.reservation, executionIdentity);
+  const releasable = await store.reserve({ key: 'release', owner: legacyReservation.owner, targetKind: 'workflow', targetId: 'workflow', mintRunId: () => 'release-run' });
+  const releaseClaim = await store.claimReservation(releasable.reservation);
+  if (releaseClaim) await store.releaseReservation(releaseClaim);
+  // @ts-expect-error run-only claims are removed
   await store.claim('key', 'run');
+  // @ts-expect-error run-only releases are removed
   await store.release('key', 'run');
+  // @ts-expect-error run-only settlement is removed
   await store.settleRun('run');
-  RunnerAdmission.admitsExistingRun({ state: 'proof-only', proofRunId: 'run' }, 'run');
+  RunnerAdmission.admitsExistingRun({ state: 'proof-only', proofExecution: d1Identity }, d1Identity);
   return { binding, kind };
 }
 void [hostRunIdentity, hostD1Identity, hostStartIdentity, hostExecutionIdentity, hostD1StartIdentity, hostEpochContext, checkReservationTypes];
@@ -681,8 +694,8 @@ void [legacyContext, scopedContext, legacyScope, epochScope, legacyStart, epochS
   ) {
     throw new Error('fence columns were not added after the initial row');
   }
-  const seededState = JSON.parse(readFileSync(statePath, 'utf8')).fenceState;
   const seededFence = JSON.parse(readFileSync(statePath, 'utf8'));
+  const seededState = seededFence.fenceState;
   if (
     seededFence.fenceStage !== 7 ||
     ['proof_table_prefix', 'proof_workflow_id', 'proof_start_token'].some(

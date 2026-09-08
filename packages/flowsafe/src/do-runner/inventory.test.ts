@@ -9,6 +9,7 @@
 // this surface must not have: an empty category is what an operator reads as
 // permission to migrate.
 
+import type { DurableObjectState } from '@cloudflare/workers-types';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 
@@ -234,14 +235,25 @@ async function seeded(): Promise<Fixture> {
     targetId: 'gated',
     mintRunId: () => 'abc_r2',
   });
-  await reservations.reserve({
+  const settled = await reservations.reserve({
     key: 'key-settled',
     owner: { kind: 'human', id: 'ada' },
     targetKind: 'workflow',
     targetId: 'gated',
     mintRunId: () => 'abc_r3',
   });
-  await reservations.settleRun('abc_r3');
+  const claimed = await reservations.claimReservation(settled.reservation);
+  if (!claimed) throw new Error('terminal inventory claim was lost');
+  const execution = {
+    tablePrefix: '',
+    workflowId: 'gated',
+    runId: 'abc_r3',
+    startToken: 'inventory-terminal-generation',
+    owner: claimed.owner,
+    target: { kind: 'workflow' as const, id: 'gated' },
+  };
+  await reservations.bindPreparedStart(claimed, execution);
+  await reservations.settleExecution(execution);
 
   // --- signal-subscriptions -------------------------------------------------
   await new D1SubscriptionStoreFactory(binding as never, {
@@ -883,6 +895,7 @@ describe('deployment drain inventory', () => {
     const sqlite = openSqlite();
     const binding = sqliteUnitDatabase(sqlite);
     const storage = createD1Storage({ binding: binding as never });
+    await storage.init();
     await createResourceOwnershipSchema(binding as never);
     sqlite.exec(
       `CREATE TABLE flowsafe_deployment (
@@ -908,6 +921,14 @@ describe('deployment drain inventory', () => {
     const held = new Promise<void>((resolve) => {
       releaseStep = resolve;
     });
+    let announcePreparing: () => void = () => undefined;
+    const preparing = new Promise<void>((resolve) => {
+      announcePreparing = resolve;
+    });
+    let releasePreparation: () => void = () => undefined;
+    const prepared = new Promise<void>((resolve) => {
+      releasePreparation = resolve;
+    });
 
     const fence = new ExecutionFenceStore(binding as never);
     await fence.seed('open');
@@ -915,7 +936,17 @@ describe('deployment drain inventory', () => {
     const buildRuntime = (): RunnerRuntime => {
       const { createWorkflow, createStep, runtime } = init(
         { storage },
-        { executionFence: fence, startIdempotency: reservations },
+        {
+          executionFence: fence,
+          startIdempotency: reservations,
+          requestContextForRun: async (_workflowId, _runId, leg) => {
+            if (leg.kind === 'start') {
+              announcePreparing();
+              await prepared;
+            }
+            return {};
+          },
+        },
       );
       const gate = createStep({
         id: 'gate',
@@ -958,13 +989,38 @@ describe('deployment drain inventory', () => {
       }
     }
     const secret = 'inventory-ownership-pin-secret-00001';
-    const runner = new OwnerRunner(undefined, {
+    const runId = 'abc_inflight';
+    const values = new Map<string, unknown>();
+    let alarm: number | null = null;
+    const state = {
+      id: { name: `gated:${runId}` },
+      storage: {
+        async get<T>(key: string): Promise<T | undefined> {
+          return values.get(key) as T | undefined;
+        },
+        async put(key: string, value: unknown) {
+          values.set(key, structuredClone(value));
+        },
+        async delete(key: string) {
+          return values.delete(key);
+        },
+        async getAlarm() {
+          return alarm;
+        },
+        async setAlarm(at: number | Date) {
+          alarm = at instanceof Date ? at.getTime() : at;
+        },
+        async deleteAlarm() {
+          alarm = null;
+        },
+      },
+    } as unknown as DurableObjectState;
+    const runner = new OwnerRunner(state, {
       owners: new D1ResourceOwnershipStore(binding as never),
       DEPLOYMENT_TENANT: 'acme',
       DEPLOYMENT_IDENTITY_SECRET: secret,
       DB: binding,
     });
-    const runId = 'abc_inflight';
     const post = (path: string, body: unknown): Request =>
       new Request(`http://do${path}`, {
         method: 'POST',
@@ -983,39 +1039,66 @@ describe('deployment drain inventory', () => {
       now: () => NOW,
     });
 
-    // #when — the start is IN FLIGHT: ownership reserved, step executing, and
-    // nothing persisted yet.
+    // #when — ownership is reserved before any snapshot; the held step then
+    // exposes the overlap between the running row and that reservation.
     const start = runner.fetch(
       post('/runs', { workflowId: 'gated', runId, inputData: {} }),
     );
-    await started;
+    try {
+      await Promise.race([
+        preparing,
+        start.then(async (response) => {
+          throw new Error(
+            `start returned before preparation: ${JSON.stringify(await response.clone().json())}`,
+          );
+        }),
+      ]);
+      expect((await inventory.read('runs')).entries).toEqual([]);
+      expect((await inventory.read('resource-owners')).entries).toEqual([
+        {
+          key: ['run', runId],
+          detail: { owner_kind: 'human', owner_id: 'ada' },
+        },
+      ]);
+      releasePreparation();
+      await Promise.race([
+        started,
+        start.then(async (response) => {
+          throw new Error(
+            `start returned before its held step: ${JSON.stringify(await response.clone().json())}`,
+          );
+        }),
+      ]);
 
-    // #then — the reservation is UNSETTLED while the start is in flight. This
-    // is the assertion the invariant lives in: it fails if settlement moves
-    // ahead of the persisted summary.
-    const inFlight = await inventory.read('resource-owners');
-    expect(inFlight.entries).toEqual([
-      {
-        key: ['run', runId],
-        detail: { owner_kind: 'human', owner_id: 'ada' },
-      },
-    ]);
-    expect(inFlight.count).toBe(1);
+      // #then — the reservation is UNSETTLED while the start is in flight. This
+      // is the assertion the invariant lives in: it fails if settlement moves
+      // ahead of the persisted summary.
+      const inFlight = await inventory.read('resource-owners');
+      expect(inFlight.entries).toEqual([
+        {
+          key: ['run', runId],
+          detail: { owner_kind: 'human', owner_id: 'ada' },
+        },
+      ]);
+      expect(inFlight.count).toBe(1);
 
-    // #then — and the executing run is not hidden from `runs` either: the
-    // engine's own `running` snapshot is already there. Recorded because the
-    // two categories overlap DURING execution and diverge only at settlement,
-    // which is what the next step asserts.
-    expect(
-      (await inventory.read('runs')).entries.map((entry) => [
-        entry.key[1],
-        entry.detail.status,
-      ]),
-    ).toEqual([[runId, 'running']]);
+      // #then — and the executing run is not hidden from `runs` either: the
+      // engine's own `running` snapshot is already there. Recorded because the
+      // two categories overlap DURING execution and diverge only at settlement,
+      // which is what the next step asserts.
+      expect(
+        (await inventory.read('runs')).entries.map((entry) => [
+          entry.key[1],
+          entry.detail.status,
+        ]),
+      ).toEqual([[runId, 'running']]);
 
-    // #when — the step reaches its first suspend, so a summary persists and the
-    // reservation settles.
-    releaseStep();
+      // #when — the step reaches its first suspend, so a summary persists and the
+      // reservation settles.
+    } finally {
+      releasePreparation();
+      releaseStep();
+    }
     const summary = (await (await start).json()) as { status: string };
     expect(summary.status).toBe('suspended');
 

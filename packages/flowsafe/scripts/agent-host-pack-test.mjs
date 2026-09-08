@@ -444,11 +444,13 @@ void createRunRouter;
 } from '@proofoftech/flowsafe/approval-api';
 import {
   type RunnerRuntime, type RunExecutionIdentity, type StartRunOptions,
-  type ThreadScope,
+  type ThreadScope, type StartReservationReading, type PersistedStartResult,
+  type RunSummary,
 } from '@proofoftech/flowsafe/do-runner';
 import {
   createFlowsafeWorker, type FlowsafeWorkerConfig, type FlowsafeWorkerEnv,
   type RunStartInput,
+  type RunRouterStartIdempotency,
 } from '@proofoftech/flowsafe/host-kit';
 import {
   type AgentStartAuthority, type FlowsafeDurableAgent,
@@ -524,12 +526,26 @@ const partialRequester: StartRunOptions = { runId: 'run', requestedBy: actor.id 
 const stringEpoch: StartRunOptions = { runId: 'run', mutationEpoch: '2' };
 declare const runtime: RunnerRuntime;
 void runtime.start('workflow', options);
+declare const winningClaim: StartReservationReading;
+const keyedOptions: StartRunOptions = { ...options, startReservation: winningClaim };
+const keyedInput: RunStartInput = { ...epochInput, startReservation: winningClaim };
+const persistedResult: PersistedStartResult<RunSummary> = {
+  kind: 'result', value: { runId: 'run', status: 'success' },
+  execution: { tablePrefix: null, workflowId: 'workflow', runId: 'run', startToken: 'generation',
+    owner: { kind: 'human', id: actor.id }, target: { kind: 'workflow', id: 'workflow' } },
+};
+const privateStart: Exclude<RunRouterStartIdempotency, 'none'>['persistedStart'] = async () => persistedResult;
+// @ts-expect-error ordinary status does not provide execution identity
+const invalidPrivateStart: typeof privateStart = async () => ({ runId: 'run', status: 'success' });
+// @ts-expect-error token-only recovery is removed
+void runtime.recoverStartAttempt('workflow', 'run', 'attempt');
 const authority: AgentStartAuthority = {
   mutationEpoch: 2,
   startIdentity: { owner: { kind: 'human', id: actor.id }, target: { kind: 'agent', id: 'agent', threadId: 'thread' } },
   agentStart: { threaded: true }, onPreparedStartIdentity: undefined,
 };
 const callbackAuthority: AgentStartAuthority = { ...authority, onPreparedStartIdentity: onPrepared };
+const keyedAuthority: AgentStartAuthority = { ...callbackAuthority, startReservation: winningClaim };
 declare const durable: FlowsafeDurableAgent;
 void durable.streamUntilPersisted('input', { runId: 'run' }, actor.id, 'human', 'attempt', undefined, undefined, authority);
 void durable.streamUntilPersisted('input', { runId: 'run' }, actor.id, 'human', 'attempt', undefined, undefined, callbackAuthority);
@@ -542,7 +558,7 @@ void durable.streamUntilPersisted('input', { runId: 'run' }, actor.id, 'human', 
 void durable.streamUntilPersisted('input', { runId: 'run' }, actor.id, 'human', 'attempt', undefined, undefined, { ...authority, onPreparedStartIdentity: 'invalid' });
 // @ts-expect-error the bridge requires an agent target
 void durable.streamUntilPersisted('input', { runId: 'run' }, actor.id, 'human', 'attempt', undefined, undefined, { ...authority, startIdentity: { owner: authority.startIdentity.owner, target: { kind: 'workflow', id: 'workflow' } } });
-void [legacyContext, epochContext, legacyScope, epochScope, legacyInput, epochInput, legacyOptions, partialRequester, stringEpoch, omitted];
+void [legacyContext, epochContext, legacyScope, epochScope, legacyInput, epochInput, legacyOptions, partialRequester, stringEpoch, omitted, keyedOptions, keyedInput, privateStart, invalidPrivateStart, keyedAuthority];
 `,
   );
   writeFileSync(
@@ -586,6 +602,7 @@ import * as doRunner from '@proofoftech/flowsafe/do-runner';
 import * as hostKit from '@proofoftech/flowsafe/host-kit';
 import * as agentRunner from '@proofoftech/flowsafe/agent-runner';
 import { Mastra } from '@mastra/core/mastra';
+import { InMemoryStore } from '@mastra/core/storage';
 import { createStep, createWorkflow } from '@mastra/core/workflows';
 import { z } from 'zod';
 import { openSqlite, sqliteUnitDatabase } from './sqlite-fixture.mjs';
@@ -612,6 +629,8 @@ for (const name of [
   'IdempotentStartPendingError',
   'IdempotentStartUnresolvableError',
   'IdempotentStartAlreadySettledError',
+  'RunStartPendingError',
+  'isRunStartPendingError',
   'DeploymentInventory',
 ]) {
   assert.equal(typeof doRunner[name], 'function', name);
@@ -632,6 +651,10 @@ assert.equal(typeof hostKit.createFlowsafeWorker, 'function');
 assert.equal(hostKit.FENCED_WORKFLOW_STORAGE, doRunner.FENCED_WORKFLOW_STORAGE);
 assert.equal('FencedWorkflowsStorageD1' in hostKit, false);
 assert.equal(typeof agentRunner.FlowsafeDurableAgent, 'function');
+for (const name of ['claim', 'release', 'settleRun']) {
+  assert.equal(name in doRunner.StartIdempotencyStore.prototype, false, name);
+}
+for (const api of [flowsafe, doRunner, hostKit]) assert.equal('rollbackFencedStart' in api, false);
 for (const api of [flowsafe, approvals, doRunner, hostKit, host, agentRunner]) {
   for (const name of ['captureActorContext', 'captureAgentStartAuthority', 'captureStartRunOptions', 'startAuthorities', 'AgentStartAuthority']) {
     assert.equal(name in api, false, name);
@@ -678,6 +701,12 @@ const repair = await capability.withInitialAdmission({ execution: repairExecutio
   requestContext: { app: 'retained', 'flowsafe.runProvenance': { version: 2, startToken: repairExecution.startToken, attemptToken: 'repair-correlation', resumeCounts: [] } },
 }, () => workflow.createRun({ runId: repairExecution.runId }));
 const repairRequest = { expected: repair.witness.row, execution: repairExecution, attemptToken: 'repair-correlation', nowMs: 1700000000123 };
+const observer = doRunner.init({ storage }, { executionFence: new doRunner.ExecutionFenceStore(binding), startIdempotency: 'none' }).runtime;
+observer.register(workflow);
+const initial = await observer.authoritativeStartState(workflow.id, repairExecution.runId);
+assert.equal(initial.kind, 'initial');
+assert.equal('summary' in initial, false);
+await assert.rejects(() => observer.status(workflow.id, repairExecution.runId), doRunner.isRunStartPendingError);
 const repaired = await capability.terminalizeInitialAdmission(repairRequest);
 assert.equal(repaired.kind, 'terminalized');
 const repairedSnapshot = JSON.parse(repaired.row.snapshot);
@@ -690,6 +719,65 @@ assert.equal(repaired.row.updatedAt, '2023-11-14T22:13:20.123Z');
 assert.deepEqual(await capability.readSnapshot(repairExecution), repaired.row);
 assert.equal((await capability.terminalizeInitialAdmission(repairRequest)).kind, 'already-terminalized');
 assert.equal(engineCalls, 1);
+const reservations = new doRunner.StartIdempotencyStore(binding);
+const generations = new Set();
+let modernEffects = 0;
+for (const mode of [
+  { name: 'fenced', storage: doRunner.createD1Storage({ binding }), fence: new doRunner.ExecutionFenceStore(binding), prefix: '' },
+  { name: 'optional', storage: doRunner.createD1Storage({ binding, tablePrefix: 'packed_opt_' }), fence: 'none', prefix: 'packed_opt_' },
+  { name: 'custom', storage: new InMemoryStore(), fence: 'none', prefix: null },
+]) {
+  await mode.storage.init();
+  const app = doRunner.init({ storage: mode.storage }, { executionFence: mode.fence, startIdempotency: reservations });
+  const workflowId = 'packed-runtime-' + mode.name;
+  const runId = 'packed-run-' + mode.name;
+  const owner = { kind: 'human', id: 'packed-owner' };
+  const startIdentity = { owner, target: { kind: 'workflow', id: workflowId } };
+  app.createWorkflow({
+    id: workflowId, inputSchema: z.object({}), outputSchema: z.object({ value: z.string() }),
+    ...(mode.name === 'optional' ? { options: { shouldPersistSnapshot: ({ workflowStatus }) => workflowStatus !== 'pending' } } : {}),
+  }).then(app.createStep({
+    id: 'effect', inputSchema: z.object({}), outputSchema: z.object({ value: z.string() }),
+    execute: async () => { modernEffects += 1; return { value: mode.name }; },
+  })).commit();
+  const request = { key: 'packed-key-' + mode.name, owner, targetKind: 'workflow', targetId: workflowId, mintRunId: () => runId };
+  const reserved = await reservations.reserve(request);
+  assert.equal(reserved.reservation.binding.kind, 'unbound');
+  const claimed = await reservations.claimReservation(reserved.reservation);
+  assert.equal(claimed.state, 'started');
+  const summary = await app.runtime.start(workflowId, {
+    runId, inputData: {}, requestedBy: owner.id, requestedByKind: owner.kind,
+    attemptToken: 'packed-shared-H', startIdentity, idempotencyKey: request.key, startReservation: claimed,
+  });
+  const selected = await app.runtime.authoritativeStartState(workflowId, runId);
+  assert.equal(selected.kind, 'result');
+  assert.equal(selected.execution.tablePrefix, mode.prefix);
+  assert.notEqual(selected.execution.startToken, 'packed-shared-H');
+  generations.add(selected.execution.startToken);
+  assert.deepEqual(summary.result, { value: mode.name });
+  const complete = { ...selected.execution, ...startIdentity };
+  const storedClaim = await reservations.read(request.key);
+  assert.equal(storedClaim.state, 'terminal');
+  assert.deepEqual(storedClaim.binding, { kind: 'bound', execution: selected.execution });
+  let reads = 0;
+  const surface = {
+    persisted: async () => { reads += 1; return { kind: 'result', execution: complete, value: selected.summary }; },
+    live: async () => { throw new Error('a nonpending replay must not probe liveness'); },
+  };
+  const replay = await doRunner.beginIdempotentStart(reservations, request, surface, mode.fence);
+  assert.equal(replay.kind, 'replay');
+  assert.equal(replay.persisted, selected.summary);
+  assert.equal(reads, 1);
+  const aliasRequest = { ...request, key: 'packed-alias-' + mode.name };
+  await reservations.reserve(aliasRequest);
+  const alias = await doRunner.beginIdempotentStart(reservations, aliasRequest, surface, mode.fence);
+  assert.equal(alias.kind, 'replay');
+  assert.equal(alias.persisted, selected.summary);
+  assert.deepEqual(alias.reservation.binding.execution, selected.execution);
+  assert.equal(await reservations.settleExecution(complete), 1);
+}
+assert.equal(generations.size, 3);
+assert.equal(modernEffects, 3);
 for (const name of ['nextLifecycleRevision', 'nextResumeCount', 'terminalStateFields', 'decodeProgressRunProvenance']) {
   assert.equal(name in doRunner, false, name);
   assert.equal(name in hostKit, false, name);

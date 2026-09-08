@@ -144,13 +144,17 @@ The key is accepted by `POST /runs`, trusted `AgentThreadStartInput` calls, and 
 
 Retries use these outcomes:
 
-- A persisted snapshot returns the same run and state without executing again
-- A `reserved` row with no snapshot reclaims the same reserved run ID
-- A live `started` row with no snapshot returns `IDEMPOTENT_START_PENDING` and `pendingSince`
+- A matching nonpending generation returns its observed result without executing again
+- A modern-unbound `reserved` row with no snapshot can claim the same reserved run ID after the owning liveness probe confirms it is not live
+- A live `reserved` or `started` row with no snapshot returns `IDEMPOTENT_START_PENDING` and `pendingSince`
 - A non-live `started` row with no snapshot returns `IDEMPOTENT_START_UNRESOLVABLE`
 - A `terminal` row whose snapshot expired returns `IDEMPOTENT_START_ALREADY_SETTLED`
 
+Bound reservations compare namespace, workflow, run and execution token before classifying a snapshot as pending or a result. A replacement generation never supplies a replay or liveness answer for the original one. Valid pending snapshots are nonreplayable. Legacy nonterminal reservations remain unresolved; legacy terminal reservations stay spent. An unbound alias can bind a result observed in one authoritative read even if that snapshot disappears afterward; it returns that original value.
+
 `IDEMPOTENT_START_UNRESOLVABLE` is a point-in-time probe. A read can occur between the Worker-side claim and the run object learning that execution started, so re-probe before investigating or choosing a fresh key. Flowsafe never starts another run automatically. A replayed suspended start returns the persisted `RunSummary` without the start response's `approval` and `approvals` fields; read `GET /runs/:workflowId/:runId` to reconcile approval state.
+
+An agent stream can remain registered while Core finishes cleanup after a refused start. During that interval, retrying a released key returns pending without claiming it again. An unreadable liveness response returns `503` and leaves the reservation unchanged; it does not establish that the run is absent.
 
 The reservation remains valid for its retention horizon. Once the terminal reservation is purged, the same key is fresh and can start another run. Keep the horizon at least as long as callers can retry.
 
@@ -176,15 +180,15 @@ A missing pre-0.20 table or empty five-column legacy table reads as optional `op
 
 Store reads are uncached and require an authoritative database binding, not an unconstrained read replica. Metadata versioning is administrative state, not a guarantee that every run or schedule writer enforces it. Activate the epoch requirement only after every writer supports final-write epoch checks; administrative support alone is insufficient.
 
-`recordProofRun(key, runId, admitted)` binds proof metadata only at the admitted epoch and revision. Two-argument legacy calls work only while the requirement is optional. Neither form changes the administrative revision or receipt, and a retry of the same binding preserves its timestamp. This metadata write is not itself atomic run admission.
+`recordProofRun(key, runId, admitted)` retains legacy metadata compatibility at the admitted epoch and revision. Two-argument calls work only while the requirement is optional, and neither form can overwrite or acknowledge a modern proof identity. Initial admission binds modern proof identity atomically. Replay nomination separately checks its original proof round and caller epoch against the current exact snapshot and bound reservation at the final SQL write. It preserves the administrative revision, receipt and existing nomination timestamp.
 
 `flowsafe_start_idempotency` stores owner, target, server-minted run ID, reservation state, and timestamps. The claim from `reserved` to `started` is the cross-isolate serializer. Terminal run cleanup pairs snapshot and reservation retention so a spent key remains distinguishable from a fresh key until its configured horizon expires.
 
 Reservation reads also return a `binding`: `legacy` for an unassociated old-format row, `unbound` for a modern row awaiting association, or `bound` with an execution identity. A bound identity has `tablePrefix`, `workflowId`, `runId`, and `startToken`. A null prefix explicitly asserts no D1 namespace; it differs from the empty string, which identifies the default D1 tables.
 
-Schema upgrades preserve existing rows and add nullable binding columns. Current reservation writes still produce legacy bindings; automatic generation binding is not enabled.
+Schema upgrades preserve existing rows and add nullable binding columns. New reservations explicitly use the modern-unbound representation. An exact claimed row travels through protected host channels to Runtime; public bodies and application context cannot supply one.
 
-The internal `StartIdempotencyStore` methods stage exact reservation operations for coordinated writer integration:
+`StartIdempotencyStore` provides these exact reservation operations:
 
 | Method | Required observation and result |
 | --- | --- |
@@ -196,11 +200,11 @@ The internal `StartIdempotencyStore` methods stage exact reservation operations 
 
 Claim and release compare every observed field and strictly advance `updatedAt` using the captured clock or the previous stamp plus one. This optimistic concurrency control stamp is neither an execution generation nor a host correlation token. A stopped or backward clock can make `pendingSince` lead wall time; an exhausted nonadvancing stamp refuses before database access. Only a successful claim response establishes that caller’s claim, because simultaneous contenders can propose the same stamp.
 
-Binding preserves both timestamps. Alias readback can accept later state changes, including terminal settlement, while prepared-start readback must preserve the exact original claim. Settlement uses one finite captured clock even when it precedes the previous timestamp. These operations require the current schema without creating or upgrading tables; settlement alone treats a genuinely absent table as empty. Built-in writers and callers retain the existing legacy methods until coordinated activation.
+Binding preserves both timestamps. Alias readback can accept later state changes, including terminal settlement, while prepared-start readback must preserve the exact original claim. Settlement uses one finite captured clock even when it precedes the previous timestamp. These operations require the current schema without creating or upgrading tables; settlement alone treats a genuinely absent table as empty. The old run-only `claim`, `release`, `settleRun` methods and `rollbackFencedStart` helper are removed. Use the exact observation APIs and let Runtime or the owning host perform locally evidenced rollback; a generic HTTP 409/503 cannot establish that nothing executed.
 
 The fence can retain a complete D1 proof identity alongside `proofRunId`. Store readings expose it as `proofExecution`; admin JSON excludes that identity and its token. Adding its nullable columns preserves active epochs, revisions, receipts, proof fields, and timestamps.
 
-Provisioning validates structural schema metadata; Runtime additionally validates proof identifiers and canonical prefixes. Provisioning does not repair corrupt identity or receipt bytes. These representations do not change the current run-ID-based execution predicates.
+Provisioning validates structural schema metadata; Runtime additionally validates proof identifiers and canonical prefixes. Provisioning does not repair corrupt identity or receipt bytes. Proof-only existing-work gates require the complete D1 namespace/workflow/run/generation tuple. They retain the admitted generation across preparation and policy waits, including a final active-run check before agent delivery. They do not make external effects transactional with fence state.
 
 ### Validate execution identity data
 
@@ -223,7 +227,7 @@ Invalid identity or epoch input throws the corresponding `INVALID_EXECUTION_IDEN
 
 Workflow and agent starts retain the original actor, principal, epoch and selectors across body, policy and ownership waits. Context snapshots preserve declared host methods on their original receiver, including class-backed methods. Both Durable Object shells capture header strings before asynchronous deployment verification and interpret only those captured strings afterward.
 
-`RunnerRuntime.start()` accepts the trusted epoch, logical start identity, agent mode, prepared-identity callback and resource-owner guard. It captures their declared fields before waits but continues using v1 provenance and the existing state-only start predicate. It does not invoke the callback or automatically enter admission or repair scopes; the coordinated writer/recovery integration remains required.
+`RunnerRuntime.start()` captures the trusted epoch, original logical identity, agent mode, prepared callback, exact winning claim and resource-owner guard before waits. New starts write v2 with an independently generated execution token. Resumes preserve that token and original identity/epoch/mode while assigning a new current-leg token. Managed hosts supply real awaited preparation callbacks; direct callers may omit one. Before a modern start or resume resolves, Runtime requires the expected generation/current leg and a nonpending durable result from its captured storage source. `RUN_START_PENDING` is a fixed status 503 refusal; it supplies no rollback authority.
 
 Economic-operation lists must contain an entry at every index. Start, resume and shared lifecycle parsing reject sparse lists with the existing lifecycle-format error instead of persisting null placeholders or silently dropping operations. Valid dense lists retain their existing validation and settlement behavior.
 
@@ -233,13 +237,19 @@ Economic-operation lists must contain an entry at every index. Start, resume and
 
 Advanced trusted integrations can obtain `FENCED_WORKFLOW_STORAGE` from the actual workflow domain. The capability exists only for a selected raw binding with transactional `batch()` support; standalone client and REST configurations retain ordinary adapter behavior without that capability. Fence and participating reservation stores must hold that exact binding. The capability reports its actual lowercase table prefix, with the empty string identifying the default namespace.
 
-An internal Runtime reader now derives physical execution identity and a root-local summary from one stored v2 observation. It captures the registered workflow's actual storage source before reading; D1 results retain exact raw bytes, while custom storage results explicitly have no D1 namespace. Raw pending state remains initial regardless of lifecycle metadata or an admission stamp. The reader grants no logical-root, replay or proof authority, and existing start, status, recovery and host paths do not yet call it.
+Runtime derives physical execution identity and a root-local summary from one stored v2 observation. It captures the registered workflow's actual storage source before reading; D1 results retain exact raw bytes, while custom storage results explicitly have no D1 namespace. Raw pending state remains initial regardless of lifecycle metadata or an admission stamp. Protected replay validates the actual workflow or agent wrapper's logical selectors and projects its public value from that same observation. Internal identity, raw rows and journals are not included in public responses.
 
-Call `withInitialAdmission(admission, () => workflow.createRun(...))` around initial Core creation only. Supply a server-generated generation token, the original caller epoch and proof observation, and a coherent trusted v2 request context. A keyed call also requires an already-started modern-unbound reservation; current reservation creation does not emit that representation automatically. Both callbacks are invoked as plain functions; use a closure or bound function when you need a receiver.
+| Runtime configuration | Admission and interrupted-start behavior |
+| --- | --- |
+| Configured fence | Require the actual capable D1 domain, matching database bindings and a positive initial-write witness; owning recovery may use exact initial-row repair |
+| Capable D1 without a fence | Keep the actual string namespace and ordinary persistence options; bind a keyed prepared identity before creation, retaining uncertain outcomes |
+| Custom storage without the capability or a fence | Use explicit null namespace and the same conservative prepared binding; missing or pending state supplies no initial-repair or rollback proof |
+
+The fenced Runtime calls `withInitialAdmission(admission, () => workflow.createRun(...))` around initial Core creation only. Advanced trusted callers use the same boundary with a server-generated generation token, original caller epoch/proof observation and coherent v2 context. A keyed call requires its own successful modern-unbound started claim. Both callbacks are invoked as plain functions; use a closure or bound function when you need a receiver.
 
 The initial conditional INSERT atomically chains its winning reservation and proof bindings. Only a positive exact witness permits the caller to invoke the returned Run’s `start()` after the scope ends. Suppressed pending persistence, a cached/existing Run, or another domain’s write does not supply that witness.
 
-Admission stamps `initialAdmission: true` into the stored provenance. Ordinary updates can preserve that stamp while changing the row’s bytes or status. The marker alone proves neither an unchanged initial row, lack of progress, nor absence of effects. Inspect the full authoritative row and its execution identity; this primitive does not activate marker-based Runtime recovery.
+Admission stamps `initialAdmission: true` into the stored provenance. Ordinary updates can preserve that stamp while changing the row’s bytes or status. The marker alone proves neither an unchanged initial row, lack of progress, nor absence of effects. Recovery checks the full authoritative row and its execution identity.
 
 The same capability exposes `terminalizeInitialAdmission({ expected, execution, attemptToken, nowMs })` for explicit repair of an already-admitted initial row. It accepts the exact raw observation and generation/correlation tokens, not a caller-selected status or replacement snapshot. An eligible row is pending, admission-stamped, and still has the strict initial control and provenance fields. Legacy observations and valid but ineligible rows return an input error; malformed consumed snapshot or owned metadata returns `EXECUTION_FENCE_UNREADABLE`.
 
@@ -247,13 +257,23 @@ Before repair, the trusted owning host must establish exclusive quiescence for t
 
 Without a recorded cancellation or timeout intent, repair writes a fixed `StartOutcomeUnknown` failure: effects may have occurred, and the run must not be automatically re-executed. A stored intent supplies its own disposition and replay principals. Repair preserves economic metadata, refuses forced termination during a dispute, and returns any required terminal cleanup without performing it. Both outcomes clear active/suspension fields and remove the admission stamp from the replacement only.
 
-The write compares all six original raw-row fields in one UPDATE and joins the serialized background domain’s existing per-run queue. An exact result is `terminalized`; one readback can establish `already-terminalized` or same-generation, known nonpending `progressed` state. A pending readback is never progress, even without the stamp. A known conditional miss can return `conflict`; an uncertain write remains unreadable unless exact replacement or progress is observed. Malformed returned data does not trigger recovery. This operation supplies no no-insert evidence, does not run an engine or cleanup, and is not yet wired into Runtime or host recovery.
+The write compares all six original raw-row fields in one UPDATE and joins the serialized background domain’s existing per-run queue. An exact result is `terminalized`; one readback can establish `already-terminalized` or same-generation, known nonpending `progressed` state. A pending readback is never progress, even without the stamp.
 
-Lifecycle revisions and resume ordinals remain readable at `Number.MAX_SAFE_INTEGER`, but an operation that would increment an exhausted counter now refuses before persistence or execution. Existing no-increment paths keep their behavior. Runtime continues writing v1 provenance, and reservation writes remain legacy-null.
+A known conditional miss can return `conflict`; an uncertain write remains unreadable unless exact replacement or progress is observed. Malformed returned data does not trigger recovery. This operation supplies no no-insert evidence and runs neither an engine nor cleanup. Runtime projects the returned row directly, then strictly settles its terminal execution before handing required cleanup to the owning host.
+
+Lifecycle revisions and resume ordinals remain readable at `Number.MAX_SAFE_INTEGER`, but an operation that would increment an exhausted counter refuses before persistence or execution. Existing no-increment paths keep their behavior. Legacy provenance remains explicitly readable/resumable under its compatibility rules; it never acquires a manufactured v2 generation.
+
+Normal hosts also validate v1 and absent-provenance observations from the actual selected storage source. With no recovery journal, a known raw terminal outcome and unchanged canonical owner, record and binding permit ordinary lifecycle completion and record cleanup. Legacy requester metadata may change during an authorized resume; it does not replace the saved run-record principal or actual resource owner. Legacy cleanup cannot infer a generation or change a start reservation. Termination and completion retain their existing lifecycle compare-and-swap writes.
 
 A validated all-zero batch changes no participant. `isDefinitiveInitialAdmissionRefusal(error, execution)` recognizes only package-owned, in-process evidence for that exact execution, including bounded cause wrappers. It never authorizes deleting a durable snapshot. A thrown batch converges only on matching raw bytes and every required binding; malformed returned results and uncertain readbacks cannot grant a witness.
 
-`readSnapshot()` returns an immutable observation of the six stored fields without Core cache fallback or timestamp conversion. Built-in Runtime still emits v1 and does not enter these scopes. Host integration, exact recovery and final schedule enforcement remain prerequisites for activating artifact epochs; this low-level primitive does not complete that rollout.
+`readSnapshot()` returns an immutable observation of the six stored fields without Core cache fallback or timestamp conversion. Both managed hosts persist v2 `preparing`, `prepared` or `prepared-unfenced` journals at their existing recovery keys. They retain the original keyed claim and actual source owner, which may differ from the initiating principal. Preparation response loss converges only on the exact durable phase/identity. V1 journals stay unresolved.
+
+Recovery requires awaited owning quiescence equal to true and exact journal/frame matching. A new Runtime's empty map proves no inactivity. Cold agent alarms reconstruct the actual registered wrapper from a principal-free instance scope before reading a workflow; the alarm passes its captured verified deployment tag. Runtime checks the host's expected target and agent mode against the same row it recovers, including any returned repair observation.
+
+A workflow journal must match its named Durable Object before recovery can use that object's quiescence. Agent recovery rechecks the complete journal after the authoritative read and before rolling back H-owned reservations. Both hosts require a keyed journal's configured reservation store before bookkeeping, even when its selected outcome is nonterminal.
+
+Strict terminal reservation settlement precedes managed approval, dispatch, owner and completion cleanup, with exact journal clearing last. Failures retain the journal and watchdog. A missing snapshot after fenced preparation also retains the journal and agent record/binding, preventing an unkeyed same-ID retry from executing again. Only an actual local, matching zero-insert receipt with an unwound owning frame and an absent row permits complete rollback. Prepared-unfenced absence/pending never enters initial repair or unspends a bound key. Final schedule enforcement and generation-aware retention acceptance remain required before enabling artifact epochs across the deployment.
 
 ### Snapshot provenance
 

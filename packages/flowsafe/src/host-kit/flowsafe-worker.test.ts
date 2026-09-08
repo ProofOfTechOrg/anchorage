@@ -22,9 +22,11 @@ import {
 } from '../audit-export/index.js';
 import {
   EXECUTION_PRINCIPAL_HEADER,
+  executionFenceFor,
   InvalidMutationEpochError,
   type RunDeadlineCursor,
   type RunSummary,
+  startIdempotencyFor,
 } from '../do-runner/index.js';
 import type { ResumeRunFn } from './approval-bridge.js';
 import {
@@ -181,7 +183,7 @@ describe('C Worker epoch capture', () => {
     '/runs',
     '/healthz',
     '/admin/maintenance-status',
-  ])('C captures Worker epoch before identity SQL', async (path) => {
+  ])('C captures Worker epoch before identity SQL for %s', async (path) => {
     type EpochEnv = FlowsafeWorkerEnv & { epoch: number };
     const order: string[] = [];
     const observed: Array<number | undefined> = [];
@@ -2750,5 +2752,149 @@ describe('createFlowsafeWorker drain inventory', () => {
       ctx,
     );
     expect(response.status).toBe(405);
+  });
+});
+
+describe('FS8 D3 proof activation Worker composition', () => {
+  it.each([
+    '',
+    'PROOF_',
+  ])('passes its captured trusted namespace %s into actual approval decisions', async (configuredPrefix) => {
+    const h = makeEnv();
+    const prefix = configuredPrefix.toLowerCase();
+    const runId = 'acme_run-proof';
+    const fence = executionFenceFor(h.env.DB);
+    await fence.seed('migration-locked');
+    await fence.transition({
+      expected: 'migration-locked',
+      next: 'proof-only',
+      proofKey: 'key',
+    });
+    await h.env.DB.prepare(
+      'UPDATE flowsafe_execution_fence SET proof_run_id = ?, proof_table_prefix = ?, proof_workflow_id = ?, proof_start_token = ?',
+    )
+      .bind(runId, prefix, 'wf', 'generation')
+      .run();
+    await h.env.DB.prepare(
+      `CREATE TABLE ${prefix}mastra_workflow_snapshot (workflow_name TEXT, run_id TEXT, resourceId TEXT, snapshot TEXT, createdAt TEXT, updatedAt TEXT)`,
+    ).run();
+    await h.env.DB.prepare(
+      `INSERT INTO ${prefix}mastra_workflow_snapshot VALUES (?,?,?,?,?,?)`,
+    )
+      .bind(
+        'wf',
+        runId,
+        null,
+        JSON.stringify({
+          runId,
+          status: 'suspended',
+          requestContext: {
+            'flowsafe.runProvenance': {
+              version: 2,
+              startToken: 'generation',
+              attemptToken: 'attempt',
+              resumeCounts: [],
+            },
+          },
+        }),
+        'created',
+        'updated',
+      )
+      .run();
+    const store = approvalStoreFactoryFor(h.env.DB, prefix).store();
+    const now = new Date().toISOString();
+    const { record } = await store.create({
+      id: 'approval-proof',
+      workflowId: 'wf',
+      runId,
+      title: 'proof',
+      connectors: [],
+      priority: 'normal',
+      status: 'pending',
+      requestedBy: 'other',
+      requestedByKind: 'human',
+      createdAt: now,
+      updatedAt: now,
+    });
+    const overrides: Partial<FlowsafeWorkerConfig<FlowsafeWorkerEnv>> = {
+      storageTablePrefix: configuredPrefix,
+      buildResumeRun: () => async () => successSummary(runId),
+    };
+    const worker = makeWorker(overrides);
+    overrides.storageTablePrefix = 'changed_';
+    const response = await worker.fetch(
+      authed(`http://host/api/approvals/${record.id}/decide`, {
+        method: 'POST',
+        body: JSON.stringify({ decision: 'approve' }),
+      }),
+      h.env,
+      h.ctx,
+    );
+    expect((await store.get(record.id))?.status).toBe('approved');
+    expect(response.status).toBe(200);
+    await h.flush();
+  });
+
+  it.each([
+    'initial',
+    'result',
+  ] as const)('uses the private persistedStart %s callback through the actual Worker router', async (kind) => {
+    const h = makeEnv();
+    const store = startIdempotencyFor(h.env.DB);
+    await store.reserve({
+      key: 'key',
+      owner: { kind: 'human', id: 'ada' },
+      targetKind: 'workflow',
+      targetId: 'wf',
+      mintRunId: () => 'acme_run-proof',
+    });
+    const requests: string[] = [];
+    const summary = successSummary('acme_run-proof');
+    h.env.RUNNER = {
+      idFromName: (name) => name,
+      get: () => ({
+        fetch: async (url: string) => {
+          requests.push(url);
+          if (url.includes('?replay=1'))
+            return new Response(
+              JSON.stringify({
+                kind,
+                execution: {
+                  tablePrefix: '',
+                  workflowId: 'wf',
+                  runId: 'acme_run-proof',
+                  startToken: 'generation',
+                  owner: { kind: 'human', id: 'ada' },
+                  target: { kind: 'workflow', id: 'wf' },
+                },
+                ...(kind === 'result' ? { value: summary } : {}),
+              }),
+            );
+          if (url.includes('start-liveness'))
+            return new Response(JSON.stringify({ live: true }));
+          throw new Error('public status or start was unexpectedly used');
+        },
+      }),
+    };
+    const response = await makeWorker().fetch(
+      authed('http://host/runs', {
+        method: 'POST',
+        body: JSON.stringify({ workflowId: 'wf', idempotencyKey: 'key' }),
+      }),
+      h.env,
+      h.ctx,
+    );
+    const reservation = await store.read('key');
+    expect(reservation?.binding.kind).toBe(
+      kind === 'result' ? 'bound' : 'unbound',
+    );
+    expect(requests[0]).toContain('?replay=1');
+    expect(response.status).toBe(kind === 'result' ? 200 : 503);
+    if (kind === 'result') expect(await response.json()).toMatchObject(summary);
+    else
+      expect(await response.json()).toMatchObject({
+        reason: { code: 'IDEMPOTENT_START_PENDING' },
+      });
+    await h.flush();
   });
 });

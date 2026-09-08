@@ -253,20 +253,45 @@ import {
   isExecutionPrincipalKind,
 } from '../approval-api/principal.js';
 import {
+  type D1RunExecutionIdentity,
   normalizeMutationEpoch,
   normalizeStartIdentity,
   type RunExecutionIdentity,
+  type StartExecutionIdentity,
   type StartIdentity,
 } from '../do-runner/execution-admission.js';
 import {
   InvalidRunRequestError,
   isPathSafeId,
-  type RunnerRuntime,
-  type RunSummary,
-  type StartRunOptions,
+  RunStateUnreadableError,
 } from '../do-runner/index.js';
+import { resourceIdFromKey } from '../do-runner/memory-id.js';
+import type {
+  AuthoritativeStartState,
+  LegacyRunState,
+  RunnerRuntime,
+  RunSummary,
+  StartRunOptions,
+} from '../do-runner/runtime.js';
+import {
+  captureReservation,
+  type StartReservationReading,
+} from '../do-runner/start-reservation-contract.js';
 
+/** @internal One owned snapshot observation; pending never carries a summary. */
+export type AuthoritativeAgentStartState = AuthoritativeStartState & {
+  readonly execution: StartExecutionIdentity;
+  readonly threaded: boolean;
+};
+
+/** @internal Selected ordinary agent data without generation authority. */
+export type LegacyAgentRunState = LegacyRunState & {
+  readonly threaded: boolean;
+};
+
+/** @internal Host-owned start authority captured before streaming. */
 export interface AgentStartAuthority {
+  readonly startReservation?: StartReservationReading;
   readonly mutationEpoch?: number;
   readonly startIdentity: StartIdentity & {
     readonly target: {
@@ -323,6 +348,7 @@ function captureAgentStartAuthority(
     agentStart: rawAgentStart,
     onPreparedStartIdentity,
     runOwnerGuard: rawGuard,
+    startReservation: rawReservation,
   } = source;
   if (
     rawIdentity === undefined ||
@@ -331,6 +357,10 @@ function captureAgentStartAuthority(
   ) {
     throw new InvalidRunRequestError('agent start authority is incomplete');
   }
+  const startReservation =
+    rawReservation === undefined
+      ? undefined
+      : captureReservation(rawReservation, 'started');
   const mutationEpoch = normalizeMutationEpoch(rawEpoch);
   const identity = normalizeStartIdentity(rawIdentity);
   if (identity.target.kind !== 'agent') {
@@ -402,6 +432,7 @@ function captureAgentStartAuthority(
     agentStart: Object.freeze({ threaded }),
     onPreparedStartIdentity,
     runOwnerGuard,
+    startReservation,
   });
 }
 
@@ -767,16 +798,21 @@ export class FlowsafeDurableAgent<
    * consumption make that exemption unavailable to callers.
    */
   #assertRunIdNotLive(runId: string): void {
-    if (
-      this.#startRequesters.has(runId) ||
-      this.#persistenceWaiters.has(runId) ||
-      globalRunRegistry.has(runId) ||
-      this.runRegistryInternal.has(runId)
-    ) {
+    if (this.isRunLive(runId)) {
       throw new InvalidRunRequestError(
         'run id is live in the run registry — a registered run cannot be re-entered',
       );
     }
+  }
+
+  /** @internal */
+  isRunLive(runId: string): boolean {
+    return (
+      this.#startRequesters.has(runId) ||
+      this.#persistenceWaiters.has(runId) ||
+      globalRunRegistry.has(runId) ||
+      this.runRegistryInternal.has(runId)
+    );
   }
 
   #assertGuardedStructuredOutput(options: unknown): void {
@@ -1623,6 +1659,163 @@ export class FlowsafeDurableAgent<
     }
   }
 
+  /** @internal Include validated legacy agent data for ordinary host operations. */
+  authoritativeAgentStartState(
+    expectedRuntime: RunnerRuntime,
+    threadId: string,
+    runId: string,
+    options: { readonly includeLegacy: true },
+  ): Promise<AuthoritativeAgentStartState | LegacyAgentRunState | null>;
+  /** @internal Select the actual private Runtime/workflow and immutable agent owner once. */
+  authoritativeAgentStartState(
+    expectedRuntime: RunnerRuntime,
+    threadId: string,
+    runId: string,
+  ): Promise<AuthoritativeAgentStartState | null>;
+  async authoritativeAgentStartState(
+    expectedRuntime: RunnerRuntime,
+    threadId: string,
+    runId: string,
+    options?: { readonly includeLegacy: true },
+  ): Promise<AuthoritativeAgentStartState | LegacyAgentRunState | null> {
+    const includeLegacy = options?.includeLegacy === true;
+    const runtime = this.#runtime;
+    const workflowId = this.getWorkflow().id;
+    const agentId = this.#wrappedAgent.id;
+    try {
+      if (
+        expectedRuntime !== runtime ||
+        !isPathSafeId(threadId) ||
+        !isPathSafeId(runId)
+      )
+        throw new Error('agent observation selector is invalid');
+      const resourceId = resourceIdFromKey(threadId);
+      const state = includeLegacy
+        ? await runtime.authoritativeStartState(workflowId, runId, {
+            includeLegacy: true,
+          })
+        : await runtime.authoritativeStartState(workflowId, runId);
+      if (state === null) return null;
+      if (state.kind === 'legacy') {
+        if (!includeLegacy)
+          throw new Error('legacy agent observation requires explicit opt-in');
+        const context = state.snapshot.requestContext;
+        const input = state.snapshot.context?.input as
+          | {
+              agentId?: unknown;
+              runId?: unknown;
+              messageListState?: {
+                memoryInfo?: {
+                  threadId?: unknown;
+                  resourceId?: unknown;
+                } | null;
+              };
+            }
+          | undefined;
+        const correlation = context?.['breakwater.auditContext'] as
+          | Record<string, unknown>
+          | undefined;
+        const memory = input?.messageListState?.memoryInfo;
+        if (
+          state.address.workflowId !== workflowId ||
+          state.address.runId !== runId ||
+          input?.agentId !== agentId ||
+          (input.runId !== undefined && input.runId !== runId) ||
+          context?.runId !== runId ||
+          context.threadId !== threadId ||
+          context.resourceId !== resourceId ||
+          correlation?.agentId !== agentId ||
+          correlation.threadId !== threadId ||
+          correlation.resourceId !== resourceId ||
+          (memory !== null &&
+            (memory?.threadId !== threadId || memory.resourceId !== resourceId))
+        )
+          throw new Error('legacy agent observation contradicts its selectors');
+        return { ...state, threaded: memory !== null };
+      }
+      const identity = state.provenance.startIdentity;
+      const threaded = state.provenance.agentStart?.threaded;
+      if (
+        identity?.target.kind !== 'agent' ||
+        identity.target.id !== agentId ||
+        identity.target.threadId !== threadId ||
+        typeof threaded !== 'boolean' ||
+        state.execution.workflowId !== workflowId ||
+        state.execution.runId !== runId
+      )
+        throw new Error('agent observation identity disagrees with selector');
+      const context = state.snapshot.requestContext;
+      const record = (value: unknown): Record<string, unknown> => {
+        if (value === null || typeof value !== 'object' || Array.isArray(value))
+          throw new Error('agent observation context is malformed');
+        return value as Record<string, unknown>;
+      };
+      const check = (value: unknown, selectors: Record<string, string>) => {
+        if (value === undefined) return;
+        const values = record(value);
+        for (const [key, expected] of Object.entries(selectors))
+          if (Object.hasOwn(values, key) && values[key] !== expected)
+            throw new Error('agent observation context contradicts identity');
+      };
+      check(context, { runId, threadId, resourceId });
+      check(context?.['breakwater.auditContext'], {
+        agentId,
+        threadId,
+        resourceId,
+      });
+      const input = state.snapshot.context?.input;
+      if (input !== undefined) {
+        check(input, { agentId, runId });
+        const messageList = record(input).messageListState;
+        if (messageList !== undefined) {
+          const values = record(messageList);
+          if (Object.hasOwn(values, 'memoryInfo')) {
+            const memory = values.memoryInfo;
+            if (memory === null) {
+              if (threaded) throw new Error('agent mode contradicts memory');
+            } else {
+              const selected = record(memory);
+              if (
+                !threaded ||
+                selected.threadId !== threadId ||
+                selected.resourceId !== resourceId
+              )
+                throw new Error('agent mode contradicts memory');
+            }
+          }
+        }
+      }
+      return {
+        ...state,
+        execution: { ...state.execution, ...identity },
+        threaded,
+      } as AuthoritativeAgentStartState;
+    } catch (cause) {
+      if (cause instanceof RunStateUnreadableError) throw cause;
+      throw new RunStateUnreadableError(workflowId, runId, { cause });
+    }
+  }
+
+  /** @internal Initial identity can correlate proof without granting replay success. */
+  async proofExecutionFor(
+    expectedRuntime: RunnerRuntime,
+    threadId: string,
+    runId: string,
+  ): Promise<D1RunExecutionIdentity | undefined> {
+    const state = await this.authoritativeAgentStartState(
+      expectedRuntime,
+      threadId,
+      runId,
+    );
+    if (state?.storage !== 'd1') return undefined;
+    return {
+      tablePrefix: state.execution.tablePrefix,
+      workflowId: state.execution.workflowId,
+      runId: state.execution.runId,
+      startToken: state.execution.startToken,
+    };
+  }
+
   /**
    * Drive the durable-agentic-loop through RunnerRuntime instead of the base
    * `createRun + run.start`. stream()/generate() have already parked the
@@ -1709,6 +1902,7 @@ export class FlowsafeDurableAgent<
         agentStart: authority.agentStart,
         onPreparedStartIdentity: authority.onPreparedStartIdentity,
         runOwnerGuard: authority.runOwnerGuard,
+        startReservation: authority.startReservation,
       });
       waiter?.resolve();
     } catch (error) {

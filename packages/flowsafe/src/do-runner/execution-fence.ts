@@ -55,10 +55,36 @@ import { missingTableReadsEmpty } from './cause-chain.js';
 import { DoStatusError } from './do-status-error.js';
 import {
   type D1RunExecutionIdentity,
+  type D1StartExecutionIdentity,
   ExecutionFenceUnreadableError,
+  InvalidExecutionIdentityError,
   normalizeD1RunExecutionIdentity,
+  normalizeMutationEpoch,
+  normalizeStartExecutionIdentity,
+  type ProofEntryExpectation,
+  type RunExecutionIdentity,
 } from './execution-admission.js';
+import { RUN_PROVENANCE_CONTEXT_KEY } from './execution-context.js';
 import { isPathSafeId } from './path-safe-id.js';
+import {
+  decodeProgressRunProvenance,
+  decodeRunStartIdentity,
+} from './run-provenance.js';
+import { isRunStatus } from './run-terminal-state.js';
+import {
+  captureBoundReservation,
+  decodeStartReservationAdmissionResult,
+  START_IDEMPOTENCY_TABLE,
+  type StartReservationReading,
+  sameReservationIdentity,
+  validateStartReservationAdmissionSchema,
+} from './start-reservation-contract.js';
+import {
+  type D1RunAddress,
+  decodeRawWorkflowSnapshotResult,
+  prepareRawWorkflowSnapshotRead,
+  type RawWorkflowSnapshot,
+} from './workflow-snapshot-row.js';
 
 export { ExecutionFenceUnreadableError } from './execution-admission.js';
 
@@ -502,15 +528,30 @@ export function admitsRunStart(
  */
 export function admitsExistingRun(
   reading: ExecutionFenceReading,
-  runId?: string,
+  candidate?: string | RunExecutionIdentity,
 ): boolean {
   if (reading.state === 'open' || reading.state === 'draining') return true;
-  if (reading.state !== 'proof-only') return false;
-  return (
-    reading.proofRunId !== undefined &&
-    runId !== undefined &&
-    runId === reading.proofRunId
-  );
+  if (
+    reading.state !== 'proof-only' ||
+    typeof candidate !== 'object' ||
+    candidate === null ||
+    candidate.tablePrefix === null
+  )
+    return false;
+  try {
+    const execution = normalizeD1RunExecutionIdentity(candidate);
+    const proof = reading.proofExecution;
+    return (
+      execution.tablePrefix === candidate.tablePrefix &&
+      proof !== undefined &&
+      proof.tablePrefix === execution.tablePrefix &&
+      proof.workflowId === execution.workflowId &&
+      proof.runId === execution.runId &&
+      proof.startToken === execution.startToken
+    );
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -727,6 +768,73 @@ export async function validateExecutionFenceAdmissionSchema(
  */
 function isMissingFenceTable(error: unknown): boolean {
   return missingTableReadsEmpty(error, EXECUTION_FENCE_TABLE);
+}
+
+async function selectedProofObservation(
+  db: ExecutionFenceDatabase,
+  address: D1RunAddress,
+) {
+  try {
+    const prepared = prepareRawWorkflowSnapshotRead(db, address);
+    const raw = decodeRawWorkflowSnapshotResult(
+      await prepared.statement.all(),
+      prepared.address,
+    );
+    if (raw === undefined) return undefined;
+    const snapshot: unknown = JSON.parse(raw.snapshot);
+    if (
+      snapshot === null ||
+      typeof snapshot !== 'object' ||
+      Array.isArray(snapshot)
+    )
+      throw new Error('proof snapshot is malformed');
+    const state = snapshot as Record<string, unknown>;
+    if (state.runId !== raw.runId || !isRunStatus(state.status))
+      throw new Error('proof snapshot identity or status is malformed');
+    for (const key of ['requestContext', 'context', 'steps']) {
+      const value = state[key];
+      if (
+        value !== undefined &&
+        (value === null || typeof value !== 'object' || Array.isArray(value))
+      )
+        throw new Error('proof snapshot container is malformed');
+    }
+    const source = (
+      state.requestContext as Record<string, unknown> | undefined
+    )?.[RUN_PROVENANCE_CONTEXT_KEY];
+    const start = decodeRunStartIdentity(source);
+    if (start === undefined) return { raw, status: state.status };
+    const provenance = decodeProgressRunProvenance(source);
+    const execution = normalizeD1RunExecutionIdentity({
+      ...prepared.address,
+      startToken: provenance.startToken,
+    });
+    return { raw, status: state.status, execution, provenance };
+  } catch (cause) {
+    throw new ExecutionFenceUnreadableError('proof snapshot is not readable', {
+      cause,
+    });
+  }
+}
+
+function reservationValues(row: StartReservationReading): unknown[] {
+  if (row.binding.kind !== 'bound')
+    throw new InvalidExecutionIdentityError('admission');
+  return [
+    row.key,
+    row.owner.kind,
+    row.owner.id,
+    row.targetKind,
+    row.targetId,
+    row.runId,
+    row.threadId ?? null,
+    row.state,
+    row.createdAt,
+    row.updatedAt,
+    row.binding.execution.startToken,
+    row.binding.execution.tablePrefix,
+    row.binding.execution.workflowId,
+  ];
 }
 
 export interface ExecutionFenceStoreOptions {
@@ -1015,6 +1123,7 @@ export class ExecutionFenceStore {
            proof_run_id = ?
        WHERE id = ? AND state = 'proof-only' AND proof_key = ?
          AND (proof_run_id IS NULL OR proof_run_id = ?)
+         AND proof_table_prefix IS NULL AND proof_workflow_id IS NULL AND proof_start_token IS NULL
          AND ${
            admitted === undefined
              ? 'require_mutation_epoch = 0 AND mutation_epoch = 0'
@@ -1038,8 +1147,12 @@ export class ExecutionFenceStore {
         reading?.state === 'proof-only' &&
         reading.proofKey === proofKey &&
         reading.proofRunId === runId &&
+        reading.proofExecution === undefined &&
+        stored?.raw.proof_table_prefix === null &&
+        stored.raw.proof_workflow_id === null &&
+        stored.raw.proof_start_token === null &&
         (admitted === undefined
-          ? !reading.requireMutationEpoch
+          ? !reading.requireMutationEpoch && reading.mutationEpoch === 0
           : reading.mutationEpoch === epoch &&
             reading.transitionRevision === revision)
       ) {
@@ -1050,9 +1163,239 @@ export class ExecutionFenceStore {
         { cause: error },
       );
     }
-    if (this.#decodeReturned(result) !== undefined) return true;
+    const returned = this.#decodeReturned(result);
+    if (returned !== undefined) {
+      if (
+        returned.reading.proofExecution !== undefined ||
+        returned.raw.proof_table_prefix !== null ||
+        returned.raw.proof_workflow_id !== null ||
+        returned.raw.proof_start_token !== null
+      )
+        throw new ExecutionFenceUnreadableError(
+          'legacy proof write returned a modern binding',
+        );
+      return true;
+    }
     await this.#readStored();
     return false;
+  }
+
+  async readCurrentRunExecution(
+    address: D1RunAddress,
+  ): Promise<D1RunExecutionIdentity | undefined> {
+    return (await selectedProofObservation(this.#db, address))?.execution;
+  }
+
+  async rebindProofRun(options: {
+    reservation: StartReservationReading;
+    execution: D1StartExecutionIdentity;
+    proof: ProofEntryExpectation;
+    mutationEpoch?: number;
+    reservationStore: { usesDatabase(binding: object): boolean };
+  }): Promise<boolean> {
+    const {
+      reservation: input,
+      execution: rawExecution,
+      proof: rawProof,
+      mutationEpoch,
+      reservationStore,
+    } = options;
+    const reservation = captureBoundReservation(input);
+    const { tablePrefix, workflowId, runId, startToken, owner, target } =
+      rawExecution;
+    const normalized = normalizeStartExecutionIdentity({
+      tablePrefix,
+      workflowId,
+      runId,
+      startToken,
+      owner,
+      target,
+    });
+    const execution = normalizeD1RunExecutionIdentity(normalized);
+    const {
+      key,
+      mutationEpoch: epoch,
+      transitionRevision: revision,
+    } = rawProof;
+    const callerEpoch = normalizeMutationEpoch(mutationEpoch);
+    const usesDatabase = reservationStore.usesDatabase;
+    const now = this.#now();
+    if (
+      tablePrefix !== execution.tablePrefix ||
+      key !== reservation.key ||
+      !isFenceCounter(epoch) ||
+      !isFenceCounter(revision) ||
+      typeof now !== 'number' ||
+      !Number.isFinite(now) ||
+      typeof usesDatabase !== 'function' ||
+      !Reflect.apply(usesDatabase, reservationStore, [this.#db]) ||
+      reservation.binding.kind !== 'bound' ||
+      normalized.owner.kind !== reservation.owner.kind ||
+      normalized.owner.id !== reservation.owner.id ||
+      normalized.target.kind !== reservation.targetKind ||
+      normalized.target.id !== reservation.targetId ||
+      (normalized.target.kind === 'agent'
+        ? normalized.target.threadId
+        : undefined) !== reservation.threadId ||
+      !admitsExistingRun(
+        { state: 'proof-only', proofExecution: execution },
+        reservation.binding.execution,
+      )
+    )
+      throw new InvalidExecutionIdentityError('admission');
+    try {
+      const observed = await this.readForAdmission();
+      const requireSchemas = async () => {
+        await validateExecutionFenceAdmissionSchema(
+          await this.#db
+            .prepare(`PRAGMA table_xinfo(${EXECUTION_FENCE_TABLE})`)
+            .all(),
+        );
+        validateStartReservationAdmissionSchema(
+          await this.#db
+            .prepare(`PRAGMA table_xinfo(${START_IDEMPOTENCY_TABLE})`)
+            .all(),
+        );
+      };
+      await requireSchemas();
+      const current = decodeStartReservationAdmissionResult(
+        await this.#db
+          .prepare(
+            `SELECT * FROM ${START_IDEMPOTENCY_TABLE} WHERE key = ? LIMIT 2`,
+          )
+          .bind(key)
+          .all(),
+      );
+      const selected = await selectedProofObservation(this.#db, execution);
+      const reading = observed.reading;
+      if (
+        current === undefined ||
+        current.binding.kind !== 'bound' ||
+        !sameReservationIdentity(current, reservation) ||
+        JSON.stringify(reservationValues(current)) !==
+          JSON.stringify(reservationValues(reservation)) ||
+        selected?.execution === undefined ||
+        selected.status === 'pending' ||
+        !admitsExistingRun(
+          { state: 'proof-only', proofExecution: execution },
+          selected.execution,
+        ) ||
+        selected.provenance?.startIdentity?.owner.kind !==
+          reservation.owner.kind ||
+        selected.provenance.startIdentity.owner.id !== reservation.owner.id ||
+        selected.provenance.startIdentity.target.kind !==
+          reservation.targetKind ||
+        selected.provenance.startIdentity.target.id !== reservation.targetId ||
+        (selected.provenance.startIdentity.target.kind === 'agent'
+          ? selected.provenance.startIdentity.target.threadId
+          : undefined) !== reservation.threadId ||
+        reading.state !== 'proof-only' ||
+        reading.proofKey !== key ||
+        reading.mutationEpoch !== epoch ||
+        reading.transitionRevision !== revision ||
+        (reading.requireMutationEpoch && callerEpoch !== epoch) ||
+        (reading.proofRunId !== undefined &&
+          !admitsExistingRun(reading, execution))
+      )
+        return false;
+      const raw: RawWorkflowSnapshot = selected.raw;
+      const snapshotPredicate = `EXISTS (SELECT 1 FROM "${execution.tablePrefix}mastra_workflow_snapshot"
+        WHERE workflow_name = ? AND run_id = ? AND resourceId IS ? AND snapshot = ? AND createdAt = ? AND updatedAt = ?)`;
+      const reservationPredicate = `EXISTS (SELECT 1 FROM ${START_IDEMPOTENCY_TABLE}
+        WHERE key = ? AND owner_kind = ? AND owner_id = ? AND target_kind = ? AND target_id = ? AND run_id = ?
+        AND thread_id IS ? AND state = ? AND created_at = ? AND updated_at = ?
+        AND start_token = ? AND start_table_prefix IS ? AND start_workflow_id = ?)`;
+      const framePredicate = `id = 'deployment' AND state = 'proof-only' AND proof_key = ?
+        AND mutation_epoch = ? AND transition_revision = ? AND require_mutation_epoch = ? AND last_transition_request IS ?
+        AND (require_mutation_epoch = 0 OR mutation_epoch = ?)`;
+      const exactTuple =
+        'proof_run_id = ? AND proof_table_prefix = ? AND proof_workflow_id = ? AND proof_start_token = ?';
+      const emptyTuple =
+        'proof_run_id IS NULL AND proof_table_prefix IS NULL AND proof_workflow_id IS NULL AND proof_start_token IS NULL';
+      const tuple = [
+        execution.runId,
+        execution.tablePrefix,
+        execution.workflowId,
+        execution.startToken,
+      ];
+      const frame = [
+        key,
+        epoch,
+        revision,
+        Number(reading.requireMutationEpoch),
+        observed.raw.last_transition_request,
+        callerEpoch ?? null,
+      ];
+      const rowValues = [
+        raw.workflowId,
+        raw.runId,
+        raw.resourceId,
+        raw.snapshot,
+        raw.createdAt,
+        raw.updatedAt,
+        ...reservationValues(reservation),
+      ];
+      const expectedTime =
+        reading.proofRunId === undefined ? now : observed.raw.updated_at;
+      const validateReturned = (result: unknown): boolean => {
+        const returned = this.#decodeReturned(result);
+        if (returned === undefined) return false;
+        const next = returned.reading;
+        if (
+          next.state !== 'proof-only' ||
+          next.proofKey !== key ||
+          next.mutationEpoch !== epoch ||
+          next.transitionRevision !== revision ||
+          next.requireMutationEpoch !== reading.requireMutationEpoch ||
+          returned.receipt !== observed.raw.last_transition_request ||
+          !admitsExistingRun(next, execution) ||
+          returned.raw.updated_at !== expectedTime
+        )
+          throw new ExecutionFenceUnreadableError(
+            'proof nomination returned an unexpected fence',
+          );
+        return true;
+      };
+      let result: unknown;
+      try {
+        result = await this.#db
+          .prepare(`UPDATE ${EXECUTION_FENCE_TABLE}
+          SET updated_at = CASE WHEN proof_run_id IS NULL THEN ? ELSE updated_at END,
+            proof_run_id = ?, proof_table_prefix = ?, proof_workflow_id = ?, proof_start_token = ?
+          WHERE ${framePredicate} AND ((${emptyTuple}) OR (${exactTuple}))
+            AND ${snapshotPredicate} AND ${reservationPredicate} RETURNING *`)
+          .bind(now, ...tuple, ...frame, ...tuple, ...rowValues)
+          .all();
+      } catch (cause) {
+        try {
+          const converged = await this.#db
+            .prepare(`SELECT * FROM ${EXECUTION_FENCE_TABLE}
+            WHERE ${framePredicate} AND ${exactTuple} AND ${snapshotPredicate} AND ${reservationPredicate} LIMIT 2`)
+            .bind(...frame, ...tuple, ...rowValues)
+            .all();
+          await requireSchemas();
+          if (validateReturned(converged)) return true;
+        } catch {
+          /* Preserve the failed write's cause. */
+        }
+        throw new ExecutionFenceUnreadableError(
+          'proof nomination could not be recorded',
+          { cause },
+        );
+      }
+      const nominated = validateReturned(result);
+      if (!nominated) {
+        await requireSchemas();
+        await this.readForAdmission();
+      }
+      return nominated;
+    } catch (cause) {
+      if (cause instanceof ExecutionFenceUnreadableError) throw cause;
+      throw new ExecutionFenceUnreadableError(
+        'proof nomination is not readable',
+        { cause },
+      );
+    }
   }
 
   #proofKeyFor(

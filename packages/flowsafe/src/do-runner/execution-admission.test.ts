@@ -349,3 +349,36 @@ describe('execution identity and epoch helpers', () => {
     });
   });
 });
+
+describe('FS8 D3 Runtime activation', () => {
+  it('recognizes pending structurally and safely without granting generic HTTP errors authority', async () => {
+    const { RunStartPendingError, isRunStartPendingError } = await import(
+      './execution-admission.js'
+    );
+    const pending = new RunStartPendingError();
+    expect(pending).toMatchObject({
+      status: 503,
+      reason: { code: 'RUN_START_PENDING' },
+      name: 'RunStartPendingError',
+      message: 'run start has no durable execution outcome',
+    });
+    expect(isRunStartPendingError(JSON.parse(JSON.stringify(pending)))).toBe(
+      true,
+    );
+    for (const value of [
+      null,
+      undefined,
+      {},
+      503,
+      { status: 503 },
+      { status: 409, reason: { code: 'RUN_START_PENDING' } },
+      { status: 503, reason: null },
+      {
+        get status() {
+          throw new Error('getter');
+        },
+      },
+    ])
+      expect(isRunStartPendingError(value)).toBe(false);
+  });
+});

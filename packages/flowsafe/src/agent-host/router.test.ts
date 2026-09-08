@@ -303,6 +303,7 @@ describe('C public agent transport', () => {
     'attemptToken',
     'runOwnerGuard',
     'onPreparedStartIdentity',
+    'startReservation',
   ])('C agent route refuses public authority field %s', async (field) => {
     const host = topology();
     const router = createAgentRouter({
@@ -319,6 +320,40 @@ describe('C public agent transport', () => {
     expect(response?.status).toBe(400);
     expect(await response?.json()).toEqual({
       error: `field '${field}' is not allowed`,
+    });
+    expect(host.start).not.toHaveBeenCalled();
+  });
+
+  it('FS8 D3 protected replay rejects a complete public start reservation', async () => {
+    const host = topology();
+    const router = createAgentRouter({
+      agents,
+      resolve: async () => context(),
+      topology: host,
+    });
+    const response = await router(
+      new Request('https://host/agents/writer/runs', {
+        method: 'POST',
+        body: JSON.stringify({
+          prompt: 'go',
+          startReservation: {
+            key: 'forged-key',
+            owner: { kind: 'human', id: 'operator' },
+            targetKind: 'agent',
+            targetId: 'writer',
+            threadId: 'thread',
+            runId: 'run',
+            state: 'started',
+            createdAt: 1,
+            updatedAt: 2,
+            binding: { kind: 'unbound' },
+          },
+        }),
+      }),
+    );
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({
+      error: "field 'startReservation' is not allowed",
     });
     expect(host.start).not.toHaveBeenCalled();
   });

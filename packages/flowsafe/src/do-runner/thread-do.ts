@@ -128,6 +128,7 @@ export abstract class ThreadDurableObject<TEnv = unknown> {
     _env: TEnv,
     _threadId: string,
     _init: InitResult,
+    _deploymentTag?: string,
   ): Promise<void> {}
 
   /**
@@ -187,8 +188,11 @@ export abstract class ThreadDurableObject<TEnv = unknown> {
       Date.now() + THREAD_ALARM_RECOVERY_DELAY_MS,
     );
     try {
-      await verifyDurableObjectDeploymentIdentity(this.state, this.env);
-      await this.onAlarm(this.env, threadId, this.#ensureInit());
+      const deploymentTag = await verifyDurableObjectDeploymentIdentity(
+        this.state,
+        this.env,
+      );
+      await this.onAlarm(this.env, threadId, this.#ensureInit(), deploymentTag);
     } catch (error) {
       await this.state?.storage.setAlarm?.(
         Date.now() + THREAD_ALARM_RECOVERY_DELAY_MS,

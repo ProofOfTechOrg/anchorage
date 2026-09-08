@@ -1313,6 +1313,7 @@ export class DemoThread extends ThreadDurableObject<Env> {
           // COMMITS before it resumes, so it gates on the same store as the
           // thread runtime beside it.
           executionFence: executionFenceForEnv(env),
+          workflowTablePrefix: '',
           stream: (event) =>
             createHubTopology(
               this.env.HUB,
@@ -1351,11 +1352,16 @@ export class DemoThread extends ThreadDurableObject<Env> {
     _env: Env,
     threadId: string,
     initResult: InitResult,
+    deploymentTag?: string,
   ): Promise<void> {
     if (!this.#agentHost) {
       throw new Error('thread agent host is unavailable');
     }
-    await this.#agentHost.recoverOwnership(initResult.runtime, threadId);
+    await this.#agentHost.recoverOwnership({
+      threadId,
+      init: initResult,
+      deploymentTag,
+    });
   }
 
   #host(): ThreadAgentHost {
@@ -1839,6 +1845,7 @@ function actorContextForPrincipal(
         // reason: these contexts decide approvals, and decide() COMMITS before
         // it resumes. Same database, same store.
         executionFence: executionFenceForEnv(env),
+        workflowTablePrefix: '',
       }),
   });
 }
@@ -1933,6 +1940,7 @@ function buildApprovalService(
     // decision that committed against a locked deployment would be durable with
     // nothing behind it. Same database as the runs it gates.
     executionFence: executionFenceForEnv(env),
+    workflowTablePrefix: '',
   });
 }
 
@@ -3047,6 +3055,7 @@ const handler: ExportedHandler<Env> = {
       startIdempotency: {
         store: startIdempotencyForEnv(env),
         live: runTopology.startLiveness,
+        persistedStart: runTopology.persistedStart,
         executionFence: executionFenceForEnv(env),
       },
     })(routed);

@@ -337,6 +337,7 @@ export interface FlowsafeRunnerLifecycleConfig<Env extends FlowsafeWorkerEnv> {
 
 export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv>
   extends FlowsafeRunnerLifecycleConfig<Env> {
+  /** Trusted host epoch, captured before request authentication and storage waits. Client headers cannot supply this authority. */
   mutationEpoch?: number | ((env: Env) => unknown);
   /** The catalog createRunRouter serves and gates (hosts pass their metas). */
   workflows: ReadonlyArray<WorkflowMeta>;
@@ -489,16 +490,9 @@ interface ConfiguredApprovalServiceOptions {
   notify?: ApprovalNotificationSink;
   allowSelfDecision: SelfDecisionPolicy;
   stream?: ApprovalStreamSink;
-  /**
-   * REQUIRED, unlike its optional counterpart on HostApprovalServiceOptions:
-   * this interface is internal to the composer, both of its call sites are in
-   * this file, and every service the composer builds sits on a database whose
-   * fence it can name. Making it required is what keeps a third call site from
-   * being added later that silently builds an unfenced service — which would
-   * let a decision commit durably on a migration-locked deployment and then
-   * fail to resume.
-   */
+  /** Every composed service uses the captured database fence and namespace. */
   executionFence: ExecutionFenceStore;
+  workflowTablePrefix: string;
 }
 
 function buildConfiguredApprovalService<Env extends FlowsafeWorkerEnv>(
@@ -524,6 +518,7 @@ function buildConfiguredApprovalService<Env extends FlowsafeWorkerEnv>(
     allowSelfDecision: options.allowSelfDecision,
     stream: options.stream,
     executionFence: options.executionFence,
+    workflowTablePrefix: options.workflowTablePrefix,
   });
 }
 
@@ -556,6 +551,7 @@ export function createFlowsafeRunnerLifecycle<Env extends FlowsafeWorkerEnv>(
   const service = buildConfiguredApprovalService(config, env, topology, {
     store: approvalStoreFactoryFor(env.DB, storageTablePrefix).store(),
     executionFence: executionFenceForEnv(env),
+    workflowTablePrefix: (storageTablePrefix ?? '').toLowerCase(),
     waitUntil: options.waitUntil,
     notify: config.notify?.(env),
     allowSelfDecision,
@@ -1150,6 +1146,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         buildConfiguredApprovalService(config, env, topology, {
           store,
           executionFence: executionFenceForEnv(env),
+          workflowTablePrefix: (storageTablePrefix ?? '').toLowerCase(),
           waitUntil,
           notify,
           stream,
@@ -1649,6 +1646,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
           startIdempotency: {
             store: startIdempotencyForEnv(env),
             live: topology.startLiveness,
+            persistedStart: topology.persistedStart,
             executionFence: executionFenceForEnv(env),
           },
           beforeStart: beforeStart

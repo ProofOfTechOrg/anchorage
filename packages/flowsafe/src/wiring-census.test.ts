@@ -43,7 +43,9 @@ import type {
   ExecutionFenceStore,
   ExecutionFenceWiring,
   InitOptions,
+  PersistedStartResult,
   RunnerRuntimeOptions,
+  RunSummary,
   StartIdempotencyStore,
   StartIdempotencyWiring,
   StorageInitOptions,
@@ -234,6 +236,15 @@ export type RunRouterStartIdempotencyOk = [
     >
   >,
   Assert<Equals<Extract<RunRouterStartIdempotency, 'none'>, 'none'>>,
+  Assert<
+    Equals<
+      Exclude<RunRouterStartIdempotency, 'none'>['persistedStart'],
+      (
+        workflowId: string,
+        runId: string,
+      ) => Promise<PersistedStartResult<RunSummary> | undefined>
+    >
+  >,
 ];
 
 /**

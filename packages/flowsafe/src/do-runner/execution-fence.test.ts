@@ -39,6 +39,12 @@ import {
 } from './execution-fence.js';
 import { init } from './init.js';
 import type { RunnerRuntime } from './runtime.js';
+import { StartIdempotencyStore } from './start-idempotency.js';
+
+const fenceDatabases = new WeakMap<
+  ExecutionFenceStore,
+  ExecutionFenceDatabase
+>();
 
 function fenceFixture(): {
   sqlite: SqliteDatabase;
@@ -47,8 +53,16 @@ function fenceFixture(): {
 } {
   const sqlite = openSqlite();
   const backing = sqliteUnitDatabase(sqlite) as ExecutionFenceDatabase;
-  const db = { prepare: (sql: string) => backing.prepare(sql) };
-  return { sqlite, db, fence: new ExecutionFenceStore(db) };
+  const db = backing;
+  const fence = new ExecutionFenceStore(db);
+  fenceDatabases.set(fence, db);
+  return { sqlite, db, fence };
+}
+
+function databaseForFence(fence: ExecutionFenceStore): ExecutionFenceDatabase {
+  const db = fenceDatabases.get(fence);
+  if (!db) throw new Error('fixture fence database missing');
+  return db;
 }
 
 /** The schema as SQLite records it — the evidence a read wrote no DDL. */
@@ -2054,7 +2068,8 @@ describe('versioned execution fence persistence', () => {
   });
 
   it('runs all persistence operations on a database without batch', async () => {
-    const { db } = fenceFixture();
+    const { db: backing } = fenceFixture();
+    const db = { prepare: (sql: string) => backing.prepare(sql) };
     const fence = new ExecutionFenceStore(
       interceptedDatabase(db, async (_sql, execute) => {
         const result = await execute();
@@ -2103,7 +2118,7 @@ describe('execution fence admission predicates', () => {
       proofKey: 'proof-1',
       proofRunId: 'run-1',
     });
-    expect(admitsExistingRun(proof, 'run-1')).toBe(true);
+    expect(admitsExistingRun(proof, 'run-1')).toBe(false);
     expect(admitsExistingRun(proof, 'run-2')).toBe(false);
     expect(admitsExistingRun(proof)).toBe(false);
     expect(admitsExistingRun(reading('proof-only'), 'run-1')).toBe(false);
@@ -2218,8 +2233,8 @@ describe('init() fence wiring', () => {
   it('takes a shared store for a { storage } source', async () => {
     const { fence } = fenceFixture();
     const { runtime } = init(
-      { storage: new InMemoryStore() },
-      { startIdempotency: 'none', executionFence: fence },
+      { DB: databaseForFence(fence) },
+      { executionFence: fence },
     );
 
     expect(runtime.executionFence).toBe(fence);
@@ -2242,7 +2257,9 @@ describe('init() fence wiring', () => {
 // is resumed, so a single fixture covers both start and resume.
 function fencedRuntime(fence: ExecutionFenceStore): RunnerRuntime {
   const { createWorkflow, createStep, runtime } = init(
-    { storage: new InMemoryStore() },
+    fenceDatabases.has(fence)
+      ? { DB: databaseForFence(fence) }
+      : { storage: new InMemoryStore() },
     { startIdempotency: 'none', executionFence: fence },
   );
   const gate = createStep({
@@ -2265,7 +2282,7 @@ function fencedRuntime(fence: ExecutionFenceStore): RunnerRuntime {
 }
 
 describe('RunnerRuntime enforcement', () => {
-  it('keeps current Runtime provenance and string-only fence behavior in this prerequisite', async () => {
+  it('FS8 D3 proof activation binds current Runtime provenance and refuses string-only proof', async () => {
     const { sqlite, db } = fenceFixture();
     const {
       createStep,
@@ -2288,20 +2305,23 @@ describe('RunnerRuntime enforcement', () => {
     })
       .then(step)
       .commit();
-    await startIdempotency?.reserve({
+    if (!startIdempotency) throw new Error('fixture reservation store missing');
+    const reserved = await startIdempotency.reserve({
       key: 'key',
       owner: { kind: 'human', id: 'owner' },
       targetKind: 'workflow',
       targetId: 'unchanged',
       mintRunId: () => 'run',
     });
-    await startIdempotency?.claim('key', 'run');
+    const claim = await startIdempotency.claimReservation(reserved.reservation);
+    if (!claim) throw new Error('claim missing');
     const result = await runtime.start('unchanged', {
       runId: 'run',
       inputData: {},
       requestedBy: 'owner',
       requestedByKind: 'human',
       idempotencyKey: 'key',
+      startReservation: claim,
     });
     expect(result.status).toBe('success');
     const row = sqlite
@@ -2311,10 +2331,10 @@ describe('RunnerRuntime enforcement', () => {
       .get('unchanged', 'run') as { snapshot: string };
     expect(
       JSON.parse(row.snapshot).requestContext['flowsafe.runProvenance'].version,
-    ).toBe(1);
+    ).toBe(2);
     expect(await startIdempotency?.read('key')).toMatchObject({
       state: 'terminal',
-      binding: { kind: 'legacy' },
+      binding: { kind: 'bound' },
     });
     expect(
       admitsExistingRun(
@@ -2330,7 +2350,7 @@ describe('RunnerRuntime enforcement', () => {
         },
         'run',
       ),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it('starts and resumes freely while open', async () => {
@@ -2414,13 +2434,26 @@ describe('RunnerRuntime enforcement', () => {
     ).rejects.toBeInstanceOf(ExecutionFencedError);
 
     // #and — the nominated start is admitted, and BINDS the proof run.
+    const store = new StartIdempotencyStore(databaseForFence(fence));
+    const reserved = await store.reserve({
+      key: 'proof-key-1',
+      owner: { kind: 'human', id: 'owner' },
+      targetKind: 'workflow',
+      targetId: 'gated',
+      mintRunId: () => 'proof-run',
+    });
+    const claim = await store.claimReservation(reserved.reservation);
+    if (!claim) throw new Error('claim missing');
     const started = await runtime.start('gated', {
       runId: 'proof-run',
       idempotencyKey: 'proof-key-1',
+      requestedBy: 'owner',
+      requestedByKind: 'human',
+      startReservation: claim,
       inputData: {},
     });
     expect(started.status).toBe('suspended');
-    await expect(fence.read()).resolves.toEqual({
+    await expect(fence.read()).resolves.toMatchObject({
       state: 'proof-only',
       proofKey: 'proof-key-1',
       proofRunId: 'proof-run',
@@ -2436,7 +2469,7 @@ describe('RunnerRuntime enforcement', () => {
         idempotencyKey: 'proof-key-1',
         inputData: {},
       }),
-    ).rejects.toBeInstanceOf(ExecutionFencedError);
+    ).rejects.toMatchObject({ reason: { code: 'EXECUTION_FENCED' } });
 
     // #and — only the proof run may be resumed.
     await expect(
@@ -2454,7 +2487,7 @@ describe('RunnerRuntime enforcement', () => {
     const { fence } = fenceFixture();
     await fence.seed('open');
     const { createWorkflow, createStep, runtime } = init(
-      { storage: new InMemoryStore() },
+      { DB: databaseForFence(fence) },
       { startIdempotency: 'none', executionFence: fence },
     );
     const drainMidRun = createStep({
@@ -2516,5 +2549,551 @@ describe('RunnerRuntime enforcement', () => {
       .catch((thrown: unknown) => thrown);
     expect(error).toBeInstanceOf(ExecutionFenceUnreadableError);
     expect(doErrorResponse(error).status).toBe(503);
+  });
+});
+
+describe('FS8 D3 proof activation', () => {
+  const execution = {
+    tablePrefix: 'proof_',
+    workflowId: 'workflow',
+    runId: 'run',
+    startToken: 'generation',
+    owner: { kind: 'human' as const, id: 'owner' },
+    target: { kind: 'workflow' as const, id: 'workflow' },
+  };
+  async function fixture(
+    intercept?: (
+      sql: string,
+      execute: () => Promise<unknown>,
+    ) => Promise<unknown>,
+  ) {
+    const sqlite = openSqlite();
+    const backing = sqliteUnitDatabase(sqlite) as ExecutionFenceDatabase;
+    const db = intercept ? interceptedDatabase(backing, intercept) : backing;
+    const fence = new ExecutionFenceStore(db, { now: () => 50 });
+    const store = new StartIdempotencyStore(db, { now: () => 10 });
+    await fence.seed('migration-locked');
+    await fence.transition({
+      expected: 'migration-locked',
+      next: 'proof-only',
+      proofKey: 'key',
+      expectedMutationEpoch: 0,
+      expectedRevision: 0,
+    });
+    const { reservation } = await store.reserve({
+      key: 'key',
+      owner: execution.owner,
+      targetKind: 'workflow',
+      targetId: 'workflow',
+      mintRunId: () => 'run',
+    });
+    const bound = await store.associateReservation(reservation, execution);
+    sqlite.exec(
+      'CREATE TABLE proof_mastra_workflow_snapshot (workflow_name TEXT, run_id TEXT, resourceId TEXT, snapshot TEXT, createdAt TEXT, updatedAt TEXT, PRIMARY KEY(workflow_name,run_id))',
+    );
+    const snapshot = {
+      runId: 'run',
+      status: 'suspended',
+      requestContext: {
+        'flowsafe.runProvenance': {
+          version: 2,
+          startToken: 'generation',
+          attemptToken: 'attempt',
+          requestedBy: 'owner',
+          requestedByKind: 'human',
+          startIdentity: { owner: execution.owner, target: execution.target },
+          resumeCounts: [],
+          initialAdmission: true,
+        },
+      },
+    };
+    const writeSnapshot = (value: unknown = snapshot) =>
+      sqlite
+        .prepare(
+          'INSERT OR REPLACE INTO proof_mastra_workflow_snapshot VALUES (?,?,?,?,?,?)',
+        )
+        .run(
+          'workflow',
+          'run',
+          'resource',
+          JSON.stringify(value),
+          'created',
+          'updated',
+        );
+    writeSnapshot();
+    const frame = await fence.read();
+    const options = {
+      reservation: bound,
+      execution,
+      proof: {
+        key: 'key',
+        mutationEpoch: frame.mutationEpoch,
+        transitionRevision: frame.transitionRevision,
+      },
+      mutationEpoch: 0,
+      reservationStore: store,
+    };
+    const row = () =>
+      sqlite.prepare('SELECT * FROM flowsafe_execution_fence').get() as Record<
+        string,
+        unknown
+      >;
+    return { sqlite, db, fence, store, snapshot, writeSnapshot, options, row };
+  }
+
+  it('reads and nominates an exact current nonpending owned generation while preserving the receipt', async () => {
+    const h = await fixture();
+    const before = h.row();
+    expect(await h.fence.readCurrentRunExecution(execution)).toEqual({
+      tablePrefix: 'proof_',
+      workflowId: 'workflow',
+      runId: 'run',
+      startToken: 'generation',
+    });
+    expect(await h.fence.rebindProofRun(h.options)).toBe(true);
+    expect(h.row()).toMatchObject({
+      proof_run_id: 'run',
+      proof_table_prefix: 'proof_',
+      proof_workflow_id: 'workflow',
+      proof_start_token: 'generation',
+      updated_at: 50,
+      last_transition_request: before.last_transition_request,
+      transition_revision: before.transition_revision,
+    });
+    expect(await h.fence.rebindProofRun(h.options)).toBe(true);
+    expect(h.row().updated_at).toBe(50);
+  });
+
+  it.each([
+    'tablePrefix',
+    'workflowId',
+    'runId',
+    'startToken',
+  ] as const)('requires matching canonical physical field %s at the proof predicate', (field) => {
+    const proof = {
+      tablePrefix: 'proof_',
+      workflowId: 'workflow',
+      runId: 'run',
+      startToken: 'generation',
+    };
+    expect(
+      admitsExistingRun(
+        { state: 'proof-only', proofExecution: proof },
+        { ...proof },
+      ),
+    ).toBe(true);
+    expect(
+      admitsExistingRun(
+        { state: 'proof-only', proofExecution: proof },
+        { ...proof, [field]: field === 'tablePrefix' ? 'other_' : 'other' },
+      ),
+    ).toBe(false);
+    expect(
+      admitsExistingRun(
+        { state: 'proof-only', proofExecution: proof },
+        { ...proof, tablePrefix: 'PROOF_' },
+      ),
+    ).toBe(false);
+    expect(
+      admitsExistingRun({ state: 'proof-only', proofRunId: 'run' }, proof),
+    ).toBe(false);
+  });
+
+  it.each([
+    'missing',
+    'legacy',
+    'unowned',
+    'pending',
+    'replacement',
+  ] as const)('does not nominate a %s current snapshot', async (mode) => {
+    const h = await fixture();
+    if (mode === 'missing')
+      h.sqlite.exec('DELETE FROM proof_mastra_workflow_snapshot');
+    else {
+      const source = h.snapshot.requestContext['flowsafe.runProvenance'];
+      if (mode === 'legacy') source.version = 1;
+      if (mode === 'unowned')
+        delete (source as { startIdentity?: unknown }).startIdentity;
+      if (mode === 'pending') h.snapshot.status = 'pending';
+      if (mode === 'replacement') source.startToken = 'replacement';
+      h.writeSnapshot();
+    }
+    const before = h.row();
+    const result = await h.fence.rebindProofRun(h.options);
+    expect(h.row()).toEqual(before);
+    expect(result).toBe(false);
+  });
+
+  it.each([
+    'runId',
+    'status',
+    'container',
+    'provenance',
+  ] as const)('refuses malformed current snapshot %s as unreadable', async (field) => {
+    const h = await fixture();
+    const state: Record<string, unknown> = h.snapshot;
+    if (field === 'runId') state.runId = 'other';
+    if (field === 'status') state.status = 'unknown';
+    if (field === 'container') state.steps = [];
+    if (field === 'provenance')
+      state.requestContext = { 'flowsafe.runProvenance': { version: 2 } };
+    h.writeSnapshot(state);
+    const before = h.row();
+    const outcome = await h.fence
+      .rebindProofRun(h.options)
+      .catch((error) => error);
+    expect(h.row()).toEqual(before);
+    expect(outcome).toBeInstanceOf(ExecutionFenceUnreadableError);
+  });
+
+  const rowMutations = [
+    [
+      'snapshot-workflow',
+      "UPDATE proof_mastra_workflow_snapshot SET workflow_name = 'other'",
+    ],
+    [
+      'snapshot-run',
+      "UPDATE proof_mastra_workflow_snapshot SET run_id = 'other'",
+    ],
+    [
+      'snapshot-resource',
+      "UPDATE proof_mastra_workflow_snapshot SET resourceId = 'other'",
+    ],
+    [
+      'snapshot-bytes',
+      "UPDATE proof_mastra_workflow_snapshot SET snapshot = snapshot || ' '",
+    ],
+    [
+      'snapshot-created',
+      "UPDATE proof_mastra_workflow_snapshot SET createdAt = 'other'",
+    ],
+    [
+      'snapshot-updated',
+      "UPDATE proof_mastra_workflow_snapshot SET updatedAt = 'other'",
+    ],
+    ['reservation-key', "UPDATE flowsafe_start_idempotency SET key = 'other'"],
+    [
+      'reservation-owner-kind',
+      "UPDATE flowsafe_start_idempotency SET owner_kind = 'service'",
+    ],
+    [
+      'reservation-owner-id',
+      "UPDATE flowsafe_start_idempotency SET owner_id = 'other'",
+    ],
+    [
+      'reservation-target-kind',
+      "UPDATE flowsafe_start_idempotency SET target_kind = 'agent'",
+    ],
+    [
+      'reservation-target-id',
+      "UPDATE flowsafe_start_idempotency SET target_id = 'other'",
+    ],
+    [
+      'reservation-run',
+      "UPDATE flowsafe_start_idempotency SET run_id = 'other'",
+    ],
+    [
+      'reservation-thread',
+      "UPDATE flowsafe_start_idempotency SET thread_id = 'thread'",
+    ],
+    [
+      'reservation-state',
+      "UPDATE flowsafe_start_idempotency SET state = 'terminal'",
+    ],
+    [
+      'reservation-created',
+      'UPDATE flowsafe_start_idempotency SET created_at = 11',
+    ],
+    [
+      'reservation-updated',
+      'UPDATE flowsafe_start_idempotency SET updated_at = 11',
+    ],
+    [
+      'reservation-token',
+      "UPDATE flowsafe_start_idempotency SET start_token = 'other'",
+    ],
+    [
+      'reservation-prefix',
+      "UPDATE flowsafe_start_idempotency SET start_table_prefix = 'other_'",
+    ],
+    [
+      'reservation-workflow',
+      "UPDATE flowsafe_start_idempotency SET start_workflow_id = 'other'",
+    ],
+    [
+      'proof-state',
+      "UPDATE flowsafe_execution_fence SET state = 'migration-locked'",
+    ],
+    ['proof-key', "UPDATE flowsafe_execution_fence SET proof_key = 'other'"],
+    ['proof-epoch', 'UPDATE flowsafe_execution_fence SET mutation_epoch = 1'],
+    [
+      'proof-revision',
+      'UPDATE flowsafe_execution_fence SET transition_revision = 2',
+    ],
+    [
+      'proof-required',
+      'UPDATE flowsafe_execution_fence SET require_mutation_epoch = 1',
+    ],
+    [
+      'proof-receipt',
+      'UPDATE flowsafe_execution_fence SET last_transition_request = NULL',
+    ],
+  ] as const;
+  it.each(
+    rowMutations,
+  )('retains exact final SQL guard for %s', async (_label, mutation) => {
+    let mutate: (() => void) | undefined;
+    const h = await fixture(async (sql, execute) => {
+      if (
+        sql.startsWith('UPDATE flowsafe_execution_fence') &&
+        sql.includes('EXISTS')
+      ) {
+        mutate?.();
+        mutate = undefined;
+      }
+      return execute();
+    });
+    mutate = () => h.sqlite.exec(mutation);
+    const result = await h.fence
+      .rebindProofRun(h.options)
+      .catch((error) => error);
+    expect(h.row().proof_run_id).toBeNull();
+    expect(result).not.toBe(true);
+  });
+
+  it.each([
+    'converges',
+    'snapshot-changed',
+    'reservation-changed',
+    'round-changed',
+  ] as const)('uses one coherent response-loss query that %s', async (mode) => {
+    let afterWrite: (() => void) | undefined;
+    let convergenceReads = 0;
+    const h = await fixture(async (sql, execute) => {
+      if (
+        sql.startsWith('SELECT * FROM flowsafe_execution_fence') &&
+        sql.includes('EXISTS')
+      )
+        convergenceReads++;
+      if (
+        sql.startsWith('UPDATE flowsafe_execution_fence') &&
+        sql.includes('EXISTS')
+      ) {
+        await execute();
+        afterWrite?.();
+        throw new Error('response lost');
+      }
+      return execute();
+    });
+    afterWrite = () => {
+      if (mode === 'snapshot-changed')
+        h.sqlite.exec(
+          "UPDATE proof_mastra_workflow_snapshot SET snapshot = snapshot || ' '",
+        );
+      if (mode === 'reservation-changed')
+        h.sqlite.exec('UPDATE flowsafe_start_idempotency SET updated_at = 11');
+      if (mode === 'round-changed')
+        h.sqlite.exec(
+          'UPDATE flowsafe_execution_fence SET transition_revision = 2, last_transition_request = NULL',
+        );
+    };
+    const outcome = await h.fence
+      .rebindProofRun(h.options)
+      .catch((error) => error);
+    expect(h.row().proof_start_token).toBe('generation');
+    expect(convergenceReads).toBe(1);
+    if (mode === 'converges') expect(outcome).toBe(true);
+    else expect(outcome).toBeInstanceOf(ExecutionFenceUnreadableError);
+  });
+
+  it('preserves a late foreign fence row when the accepted schema lacks the singleton CHECK', async () => {
+    let inject: (() => void) | undefined;
+    const h = await fixture(async (sql, execute) => {
+      if (
+        sql.startsWith('UPDATE flowsafe_execution_fence') &&
+        sql.includes('EXISTS')
+      )
+        inject?.();
+      return execute();
+    });
+    const schema = h.sqlite
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE name = 'flowsafe_execution_fence'",
+      )
+      .get() as { sql: string };
+    const withoutIdCheck = schema.sql.replace("CHECK (id = 'deployment')", '');
+    expect(withoutIdCheck).not.toBe(schema.sql);
+    h.sqlite.exec(
+      'ALTER TABLE flowsafe_execution_fence RENAME TO previous_execution_fence',
+    );
+    h.sqlite.exec(withoutIdCheck);
+    h.sqlite.exec(
+      'INSERT INTO flowsafe_execution_fence SELECT * FROM previous_execution_fence',
+    );
+    h.sqlite.exec('DROP TABLE previous_execution_fence');
+    const foreignRow = () =>
+      h.sqlite
+        .prepare("SELECT * FROM flowsafe_execution_fence WHERE id = 'foreign'")
+        .get();
+    let before: unknown;
+    inject = () => {
+      h.sqlite.exec(
+        `INSERT INTO flowsafe_execution_fence
+          SELECT 'foreign', state, proof_key, proof_run_id, updated_at,
+            last_transition_request, transition_revision, mutation_epoch,
+            require_mutation_epoch, proof_table_prefix, proof_workflow_id, proof_start_token
+          FROM flowsafe_execution_fence WHERE id = 'deployment'`,
+      );
+      before = foreignRow();
+    };
+    const outcome = await h.fence
+      .rebindProofRun(h.options)
+      .catch((error) => error);
+    expect(foreignRow()).toEqual(before);
+    expect(outcome).toBe(true);
+    expect(
+      h.sqlite
+        .prepare(
+          "SELECT proof_start_token FROM flowsafe_execution_fence WHERE id = 'deployment'",
+        )
+        .get(),
+    ).toEqual({ proof_start_token: 'generation' });
+  });
+
+  it('does not converge after malformed RETURNING or known zero', async () => {
+    for (const mode of ['malformed', 'zero']) {
+      let enabled = false;
+      let reads = 0;
+      const h = await fixture(async (sql, execute) => {
+        if (enabled && sql.startsWith('SELECT') && sql.includes('EXISTS'))
+          reads++;
+        if (
+          enabled &&
+          sql.startsWith('UPDATE flowsafe_execution_fence') &&
+          sql.includes('EXISTS')
+        ) {
+          await execute();
+          return mode === 'zero'
+            ? { results: [] }
+            : { results: [{ bad: true }] };
+        }
+        return execute();
+      });
+      enabled = true;
+      const result = await h.fence
+        .rebindProofRun(h.options)
+        .catch((error) => error);
+      expect(h.row().proof_start_token).toBe('generation');
+      expect(reads).toBe(0);
+      if (mode === 'zero') expect(result).toBe(false);
+      else expect(result).toBeInstanceOf(ExecutionFenceUnreadableError);
+    }
+  });
+
+  it('refuses mismatched database ports before I/O and never lets the legacy setter alter or acknowledge a modern tuple', async () => {
+    const h = await fixture();
+    let prepares = 0;
+    const fence = new ExecutionFenceStore({
+      prepare: (sql) => {
+        prepares++;
+        return h.db.prepare(sql);
+      },
+    });
+    const bad = await fence.rebindProofRun(h.options).catch((error) => error);
+    expect(prepares).toBe(0);
+    expect((bad as { reason?: { code?: string } }).reason?.code).toBe(
+      'INVALID_EXECUTION_IDENTITY',
+    );
+    expect(await h.fence.rebindProofRun(h.options)).toBe(true);
+    const before = h.row();
+    const legacyOutcome = await h.fence
+      .recordProofRun('key', 'run', h.options.proof)
+      .catch((error) => error);
+    expect(h.row()).toEqual(before);
+    expect(legacyOutcome).toBe(false);
+    const lost = new ExecutionFenceStore(
+      interceptedDatabase(h.db, async (sql, execute) => {
+        if (sql.startsWith('UPDATE flowsafe_execution_fence'))
+          throw new Error('legacy response lost');
+        return execute();
+      }),
+    );
+    const outcome = await lost
+      .recordProofRun('key', 'run', h.options.proof)
+      .catch((error) => error);
+    expect(h.row()).toEqual(before);
+    expect(outcome).toBeInstanceOf(ExecutionFenceUnreadableError);
+  });
+  it.each([
+    'proof_run_id',
+    'proof_table_prefix',
+    'proof_workflow_id',
+    'proof_start_token',
+  ] as const)('preserves a late partial nomination when empty proof tuple %s is nonnull', async (column) => {
+    let inject: (() => void) | undefined;
+    const h = await fixture(async (sql, execute) => {
+      if (
+        sql.startsWith('UPDATE flowsafe_execution_fence') &&
+        sql.includes('EXISTS')
+      )
+        inject?.();
+      return execute();
+    });
+    let before: Record<string, unknown> | undefined;
+    inject = () => {
+      h.sqlite.exec(`UPDATE flowsafe_execution_fence SET ${column} = 'other'`);
+      before = h.row();
+    };
+    const outcome = await h.fence
+      .rebindProofRun(h.options)
+      .catch((error) => error);
+    expect(h.row()).toEqual(before);
+    expect(outcome).not.toBe(true);
+  });
+
+  it.each([
+    'proof_run_id',
+    'proof_table_prefix',
+    'proof_workflow_id',
+    'proof_start_token',
+  ] as const)('preserves a competing nomination when final proof tuple %s differs', async (column) => {
+    let inject: (() => void) | undefined;
+    const h = await fixture(async (sql, execute) => {
+      if (
+        sql.startsWith('UPDATE flowsafe_execution_fence') &&
+        sql.includes('EXISTS')
+      )
+        inject?.();
+      return execute();
+    });
+    let before: Record<string, unknown> | undefined;
+    inject = () => {
+      h.sqlite
+        .prepare(
+          'UPDATE flowsafe_execution_fence SET proof_run_id = ?, proof_table_prefix = ?, proof_workflow_id = ?, proof_start_token = ?',
+        )
+        .run(
+          column === 'proof_run_id' ? 'other' : 'run',
+          column === 'proof_table_prefix' ? 'other_' : 'proof_',
+          column === 'proof_workflow_id' ? 'other' : 'workflow',
+          column === 'proof_start_token' ? 'other' : 'generation',
+        );
+      before = h.row();
+    };
+    const outcome = await h.fence
+      .rebindProofRun(h.options)
+      .catch((error) => error);
+    expect(h.row()).toEqual(before);
+    expect(outcome).not.toBe(true);
+  });
+
+  it('retains the original source owner when a later initiator differs', async () => {
+    const h = await fixture();
+    h.snapshot.requestContext['flowsafe.runProvenance'].requestedBy =
+      'later-initiator';
+    h.writeSnapshot();
+    expect(await h.fence.rebindProofRun(h.options)).toBe(true);
+    expect(h.row().proof_start_token).toBe('generation');
+    expect((await h.store.read('key'))?.owner).toEqual(execution.owner);
   });
 });
