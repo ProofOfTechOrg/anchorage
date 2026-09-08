@@ -18,4 +18,4 @@ The operation store rejects invalid row-page selectors before schema work. Inval
 
 `failOperation` accepts at most one item update. Terminal transitions refuse operation IDs belonging to another operation kind. Row-watermark refusals preserve sibling rows, and noncontiguous caller inserts below a claimed watermark refuse before SQL. See `FleetOperationLease` for the operation-store contract.
 
-The new `readFleetAuditFindingsPage()` resolves to a `done`-discriminated result: `{findings, done: true, nextAfterOrdinal?}` or `{findings, done: false, nextAfterOrdinal}`. No existing public export changes shape, and the Worker subpath is unchanged.
+The new `readFleetAuditFindingsPage()` resolves to the exported `FleetAuditFindingsPage` type, a `done`-discriminated result: `{findings, done: true, nextAfterOrdinal?}` or `{findings, done: false, nextAfterOrdinal}`. No existing public export changes shape, and the Worker subpath is unchanged.

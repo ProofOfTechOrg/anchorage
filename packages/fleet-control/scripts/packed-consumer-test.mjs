@@ -248,6 +248,7 @@ try {
   type DatabaseExportReceiptIdentity,
   type DurableDatabaseExportStore,
   type ExternalMutationFence,
+  type FleetAuditFindingsPage,
   type FleetRecord,
   type FleetMigrationAdvanceAction,
   type FleetMigrationAdvanceCapability,
@@ -411,6 +412,16 @@ declare const database: FleetStateDatabase;
 declare const api: WorkersForPlatformsApi;
 declare const policy: DeploymentEgressPolicy;
 declare const coordinator: CloudflareApiRateCoordinator;
+export const emptyAuditPage: FleetAuditFindingsPage = { findings: [], done: true };
+// @ts-expect-error An unfinished page requires its continuation cursor.
+export const unfinishedAuditPage: FleetAuditFindingsPage = { findings: [], done: false };
+
+export function auditPageCursor(page: FleetAuditFindingsPage): number | undefined {
+  if (page.done) return page.nextAfterOrdinal;
+  const requiredCursor: number = page.nextAfterOrdinal;
+  return requiredCursor;
+}
+
 declare const deploymentSpec: DeploymentSpec;
 declare const provisioningBackend: ProvisioningBackend;
 declare const backendSwitchProvider: BackendSwitchProvider;

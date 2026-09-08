@@ -1,7 +1,6 @@
 packages:
   - "packages/*"
 
-# Supply-chain guard: only install package versions >= 7 days old (minutes)
 minimumReleaseAge: 10080
 # Mastra ships in lockstep with @mastra/core (audited, version-locked here);
 # quarantining it just forces stale mismatched subtrees.
@@ -21,16 +20,5 @@ minimumReleaseAgeExclude:
   # Forced by wrangler → miniflare → sharp; already lockfile-pinned — the gate
   # only re-fires because any lockfile update re-resolves the whole graph.
   - "@emnapi/runtime"
-  # react-doctor (run via `pnpm dlx github:gcharang/react-doctor#<sha>`, never a
-  # dependency) depends on deslop-js with a floating range; every fresh
-  # deslop-js publish would otherwise trip the 7-day buffer inside the dlx
-  # install and fail the react-doctor gate.
-  # RUNBOOK — this is a CLASS, deslop-js was just the first instance: the age
-  # gate applies to a dlx target's transitive registry deps too, picking the
-  # newest version ≥7 days old and failing ONLY when a range's entire recent
-  # history is younger than the buffer. react-doctor has ~18 other floating
-  # deps (@sentry/node, oxc-parser, jiti, ...); if the doctor gate ever fails
-  # on one of them, the fix is one line — add that package name here. They are
-  # deliberately NOT pre-excluded: excludes are global, and would weaken the
-  # buffer for the whole workspace.
+  # Future release-age exceptions require explicit user approval.
   - "deslop-js"

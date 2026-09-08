@@ -1,13 +1,7 @@
 const FLOWSAFE_PUBLIC_ENTRY =
   '^packages/flowsafe/src/(?:index|host-kit/index|agent-runner/index|signals/client)\\.ts$';
-// `principal-identity` is the import-free half of `principal` (the kind list
-// and the two identity predicates). It is admitted here for the same reason the
-// others are, and is strictly leafier than any of them: it imports nothing at
-// all, so it cannot widen what do-runner reaches through approval-api.
 const ALLOWED_APPROVAL_API_LEAVES =
   '^packages/flowsafe/src/approval-api/(?:principal-identity|principal|contract|types)\\.ts$';
-// NOT extended with `principal-identity`: this is the exception list for the
-// one tolerated import cycle, and a module with no imports can never be in one.
 const KNOWN_APPROVAL_API_CYCLE =
   '^packages/flowsafe/src/approval-api/(?:principal|contract|types)\\.ts$';
 
@@ -17,8 +11,6 @@ module.exports = {
     {
       name: 'flowsafe-public-entry-no-agent-host',
       severity: 'error',
-      comment:
-        'Public, host-kit, runner, and signals-client entrypoints must stay independent of the optional agent host.',
       from: {
         path: [
           FLOWSAFE_PUBLIC_ENTRY,
@@ -33,8 +25,6 @@ module.exports = {
     {
       name: 'flowsafe-public-entry-no-breakwater',
       severity: 'error',
-      comment:
-        'The same entrypoints must not transitively acquire the optional Breakwater peer.',
       from: {
         path: [
           FLOWSAFE_PUBLIC_ENTRY,
@@ -49,8 +39,6 @@ module.exports = {
     {
       name: 'do-runner-approval-api-leaves-only',
       severity: 'error',
-      comment:
-        'do-runner may reach approval-api only through principal.ts, its import-free principal-identity.ts half, contract.ts, and their type-only types.ts leaf.',
       from: {
         path: [
           '^packages/flowsafe/src/do-runner/index\\.ts$',
@@ -66,8 +54,7 @@ module.exports = {
     {
       name: 'host-kit-no-durable-agent',
       severity: 'error',
-      comment:
-        'The host-kit barrel uses the pure approval-shapes leaf and must not pull Mastra durable Agent Node built-ins.',
+      comment: 'Mastra durable Agent dependencies require Node built-ins.',
       from: {
         path: [
           '^packages/flowsafe/src/host-kit/index\\.ts$',
@@ -82,8 +69,7 @@ module.exports = {
     {
       name: 'host-kit-no-breakwater',
       severity: 'error',
-      comment:
-        'Breakwater belongs to the separate host-kit/module authoring subpath, not the route-hosting barrel.',
+      comment: 'Breakwater belongs to the separate module-authoring subpath.',
       from: {
         path: [
           '^packages/flowsafe/src/host-kit/index\\.ts$',
@@ -111,8 +97,6 @@ module.exports = {
     {
       name: 'agent-starter-no-private-bare-entrypoints',
       severity: 'error',
-      comment:
-        'Starter code imports documented package exports, never src/dist entrypoints or repository-root source paths.',
       from: {
         path: [
           '^packages/agent-starter/(?:src|test|scripts)/',
@@ -126,8 +110,6 @@ module.exports = {
     {
       name: 'agent-starter-no-relative-package-reaches',
       severity: 'error',
-      comment:
-        'Starter code must not bypass package exports with a relative edge into a sibling package.',
       from: {
         path: [
           '^packages/agent-starter/(?:src|test|scripts)/',
@@ -143,7 +125,7 @@ module.exports = {
       name: 'fleet-control-is-control-plane-only',
       severity: 'error',
       comment:
-        'Fleet control holds account credentials, routing ownership, and tenant lifecycle. Publishing it removed the registry barrier, so no other package may reach it, by bare name or by any subpath. Stated as everything-except rather than an allowlist of today packages, and architecture:check:rules cruises packages as ONE root, so a new package or source directory is covered the day it lands. Showcase and the flowsafe deploy template alias imports through bundler config this file does not resolve, so coverage is per-module direct-import rather than transitive.',
+        'Fleet control holds account credentials, routing ownership, and tenant lifecycle authority. Showcase and the Flowsafe deploy template use bundler aliases that this resolver cannot follow.',
       from: {
         path: [
           '^packages/',
@@ -159,8 +141,6 @@ module.exports = {
     {
       name: 'no-new-architecture-cycles',
       severity: 'error',
-      comment:
-        'The principal-contract-types type cycle is the sole existing exception; any cycle involving another module fails.',
       from: {
         path: '^(?:packages/flowsafe/src|packages/fleet-control/src|packages/agent-starter/(?:src|test|scripts)|scripts/architecture-fixtures)/',
       },
@@ -172,8 +152,6 @@ module.exports = {
     {
       name: 'fleet-control-client-layers-are-one-way',
       severity: 'error',
-      comment:
-        'These fleet-control modules must not reach the Cloudflare client; a back-import would restore the coupling the extraction removed. The general cycle rule also covers Fleet Control, and tsPreCompilationDeps keeps type-only imports in the graph.',
       from: {
         path: [
           '^packages/fleet-control/src/',
@@ -191,7 +169,7 @@ module.exports = {
       name: 'fleet-control-decommission-state-does-not-reach-provider',
       severity: 'error',
       comment:
-        'Persisted decommission state is a provider-free authority boundary. Keeping provider clients, operations, and error classification out of its reachable graph prevents the Fleet D1 codec from acquiring credential or transport dependencies.',
+        'Persisted state codecs must not acquire credentials or transport dependencies.',
       from: {
         path: [
           '^packages/fleet-control/src/(?:strict-plain-data|cloudflare-worker-attachment-scan-state|decommission-intent|decommission-advance|state-store)\\.ts$',
@@ -206,8 +184,6 @@ module.exports = {
     {
       name: 'fleet-control-cleanup-state-does-not-reach-provider',
       severity: 'error',
-      comment:
-        'Persisted cleanup state is a provider-free authority boundary. Keeping provider clients, operations, and error classification out of its reachable graph prevents the cleanup codec and eligibility classifier from acquiring credential or transport dependencies.',
       from: {
         path: [
           '^packages/fleet-control/src/cleanup-intent\\.ts$',
@@ -222,8 +198,6 @@ module.exports = {
     {
       name: 'fleet-control-inventory-state-does-not-reach-provider',
       severity: 'error',
-      comment:
-        'Persisted account inventory state and its D1 run store are a provider-free authority boundary. Keeping provider clients, operations, and error classification out of their reachable graph prevents the inventory codecs and guarded batches from acquiring credential or transport dependencies.',
       from: {
         path: [
           '^packages/fleet-control/src/(?:fleet-inventory-state|d1-fleet-inventory-run-store)\\.ts$',
@@ -238,8 +212,6 @@ module.exports = {
     {
       name: 'fleet-control-operation-state-does-not-reach-provider',
       severity: 'error',
-      comment:
-        'Persisted fleet operation state and its D1 store are a provider-free authority boundary. Keeping provider clients, operations, and error classification out of their reachable graph prevents the operation codecs and guarded batches from acquiring credential or transport dependencies.',
       from: {
         path: [
           '^packages/fleet-control/src/(?:fleet-operation-state|fleet-audit-state|fleet-migration-state|d1-fleet-operation-store)\\.ts$',
@@ -254,8 +226,6 @@ module.exports = {
     {
       name: 'fleet-control-decommission-advance-is-transport-neutral',
       severity: 'error',
-      comment:
-        'The bounded decommission coordinator depends only on provider-neutral ports and state, including the provider-neutral database receipt port. Keeping provider clients, Wrangler, concrete export stores, root barrels, and unbounded lifecycle coordinators out of its reachable graph preserves the Worker-safe transport boundary.',
       from: {
         path: [
           '^packages/fleet-control/src/decommission-advance\\.ts$',
@@ -263,15 +233,13 @@ module.exports = {
         ],
       },
       to: {
-        path: '(?:^packages/fleet-control/src/(?:backend-switch|cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors|workers-for-platforms-backend-switch-provider|wrangler-plain-worker-provisioning-api|wrangler-loop-backend|wrangler-runner|export-file-name|export-store|r2-export-store|provision|fleet|index)\\.ts$|^packages/fleet-control/src/workers/|^cloudflare(?:/|$)|(?:^|/)node_modules/(?:\\.pnpm/)?cloudflare(?:@|/))',
+        path: '(?:^packages/fleet-control/src/(?:backend-switch|cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors|workers-for-platforms-backend-switch-provider|wrangler-plain-worker-provisioning-api|wrangler-loop-backend|wrangler-runner|export-file-name|export-store|r2-export-store|d1-fleet-state-database|provision|fleet|index)\\.ts$|^packages/fleet-control/src/workers/|^cloudflare(?:/|$)|(?:^|/)node_modules/(?:\\.pnpm/)?cloudflare(?:@|/))',
         reachable: true,
       },
     },
     {
       name: 'fleet-control-inventory-advance-is-transport-neutral',
       severity: 'error',
-      comment:
-        'The bounded account inventory coordinator depends only on provider-neutral ports and state. Keeping provider clients, the Cloudflare inventory stage engine, Wrangler, concrete export stores, root barrels, and unbounded lifecycle coordinators out of its reachable graph preserves the transport-neutral boundary.',
       from: {
         path: [
           '^packages/fleet-control/src/fleet-inventory-advance\\.ts$',
@@ -279,7 +247,7 @@ module.exports = {
         ],
       },
       to: {
-        path: '(?:^packages/fleet-control/src/(?:backend-switch|cloudflare-fleet-inventory|cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors|workers-for-platforms-backend-switch-provider|wrangler-plain-worker-provisioning-api|wrangler-loop-backend|wrangler-runner|export-file-name|export-store|r2-export-store|provision|fleet|index)\\.ts$|^packages/fleet-control/src/workers/|^cloudflare(?:/|$)|(?:^|/)node_modules/(?:\\.pnpm/)?cloudflare(?:@|/))',
+        path: '(?:^packages/fleet-control/src/(?:backend-switch|cloudflare-fleet-inventory|cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors|workers-for-platforms-backend-switch-provider|wrangler-plain-worker-provisioning-api|wrangler-loop-backend|wrangler-runner|export-file-name|export-store|r2-export-store|d1-fleet-state-database|provision|fleet|index)\\.ts$|^packages/fleet-control/src/workers/|^cloudflare(?:/|$)|(?:^|/)node_modules/(?:\\.pnpm/)?cloudflare(?:@|/))',
         reachable: true,
       },
     },
@@ -287,7 +255,7 @@ module.exports = {
       name: 'fleet-control-operation-advance-avoids-concrete-transports',
       severity: 'error',
       comment:
-        'The bounded audit coordinator imports eight modules directly, all provider-neutral. Six at runtime: operation state, audit state, the deployment context, the sibling bounded inventory coordinator, the root switch coordinator (for the structural FleetRecord ingress it re-parses staged rows through), and the lifecycle engine (for the stage functions it extracts). Two type-only, which tsPreCompilationDeps keeps in the graph this rule walks: the inventory run-store port, and the shared record and port types. This rule keeps every concrete transport its to-set names out of the whole graph reachable behind those eight. A module belongs in that to-set when it is a concrete transport rather than a port or a coordinator over one: the Cloudflare SDK client and the Cloudflare-specific modules it imports for provider errors, ordinary-Worker operations, fleet inventory, attachment scanning, and API-quota coordination; every ProvisioningBackend, PlainWorkerProvisioningApi, and BackendSwitchProvider implementation, together with the Wrangler command runner the Wrangler-backed ones take; every DurableDatabaseExportStore implementation; and the deployed Workers under workers/. The root barrel is listed because it re-exports transports, and the export file-name guard because only the export stores import it, so a path to it runs through one. fleet-migration-advance.ts is pre-registered in the from-set for the migration coordinator R4-C.2 will add; it does not exist yet, so only the audit half is exercised today. Four of the reachable modules a reader might expect in the to-set are deliberately absent, each for its own reason: backend-switch.ts and fleet.ts are two of the eight direct imports above; provision.ts is reachable only through fleet.ts, so forbidding it would forbid fleet.ts by proxy; and database-export-store.ts, reachable under backend-switch.ts through the decommission coordinators, declares the DurableDatabaseExportStore port that export-store.ts and r2-export-store.ts implement, so forbidding it would invert the principle this rule rests on as well as fail by that same proxy argument. The two top-level npm-cloudflare patterns the sibling transport-neutral rules carry are dropped for a reason unrelated to those four: the reachable provider-binding-inventory.ts leaf holds a type-only SDK edge under tsPreCompilationDeps that dependencyTypesNot cannot exempt from a reachable to-restriction.',
+        'The reachable graph includes SDK types used by provider-neutral ports. Runtime SDK imports need a separate direct-edge rule because reachable restrictions cannot exempt erased edges.',
       from: {
         path: [
           '^packages/fleet-control/src/(?:fleet-audit-advance|fleet-migration-advance)\\.ts$',
@@ -295,7 +263,7 @@ module.exports = {
         ],
       },
       to: {
-        path: '(?:^packages/fleet-control/src/(?:cloudflare-fleet-inventory|cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors|cloudflare-rate-coordinator|workers-for-platforms-backend-switch-provider|workers-for-platforms-backend|plain-worker-backend|cloudflare-api-plain-worker-backend|wrangler-plain-worker-provisioning-api|cloudflare-api-plain-worker-provisioning-api|wrangler-loop-backend|wrangler-runner|export-file-name|export-store|r2-export-store|index)\\.ts$|^packages/fleet-control/src/workers/)',
+        path: '(?:^packages/fleet-control/src/(?:cloudflare-fleet-inventory|cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors|cloudflare-rate-coordinator|workers-for-platforms-backend-switch-provider|workers-for-platforms-backend|plain-worker-backend|cloudflare-api-plain-worker-backend|wrangler-plain-worker-provisioning-api|cloudflare-api-plain-worker-provisioning-api|wrangler-loop-backend|wrangler-runner|export-file-name|export-store|r2-export-store|d1-fleet-state-database|index)\\.ts$|^packages/fleet-control/src/workers/)',
         reachable: true,
       },
     },
@@ -303,7 +271,7 @@ module.exports = {
       name: 'fleet-control-runtime-sdk-stays-in-provider-modules',
       severity: 'error',
       comment:
-        'Runtime Cloudflare SDK values may be imported only by the three modules that already hold that edge; a type-only import (the provider-binding-inventory.ts leaf) is exempt. Unlike the reachable rules above, this is a direct-edge check with no reachable restriction, mirroring the decommission-database provider-neutral precedent.',
+        'A direct-edge restriction can exempt erased SDK types without allowing runtime SDK values through the type-inclusive reachable graph.',
       from: {
         path: [
           '^packages/fleet-control/src/',
@@ -320,8 +288,6 @@ module.exports = {
     {
       name: 'fleet-control-cleanup-advance-is-transport-neutral',
       severity: 'error',
-      comment:
-        'The bounded cleanup coordinator depends only on provider-neutral ports and state. Keeping provider clients, Wrangler, concrete export stores, root barrels, and unbounded lifecycle coordinators out of its reachable graph preserves the transport-neutral boundary.',
       from: {
         path: [
           '^packages/fleet-control/src/cleanup-advance\\.ts$',
@@ -329,15 +295,13 @@ module.exports = {
         ],
       },
       to: {
-        path: '(?:^packages/fleet-control/src/(?:backend-switch|cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors|workers-for-platforms-backend-switch-provider|wrangler-plain-worker-provisioning-api|wrangler-loop-backend|wrangler-runner|export-file-name|export-store|r2-export-store|provision|fleet|index)\\.ts$|^packages/fleet-control/src/workers/|^cloudflare(?:/|$)|(?:^|/)node_modules/(?:\\.pnpm/)?cloudflare(?:@|/))',
+        path: '(?:^packages/fleet-control/src/(?:backend-switch|cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors|workers-for-platforms-backend-switch-provider|wrangler-plain-worker-provisioning-api|wrangler-loop-backend|wrangler-runner|export-file-name|export-store|r2-export-store|d1-fleet-state-database|provision|fleet|index)\\.ts$|^packages/fleet-control/src/workers/|^cloudflare(?:/|$)|(?:^|/)node_modules/(?:\\.pnpm/)?cloudflare(?:@|/))',
         reachable: true,
       },
     },
     {
       name: 'fleet-control-decommission-database-is-provider-neutral',
       severity: 'error',
-      comment:
-        'The shared bounded-D1 choreography is a provider-neutral runtime leaf. It may import only the database receipt port and strict plain-data guard at runtime; provider shapes remain type-only callback contracts.',
       from: {
         path: [
           '^packages/fleet-control/src/decommission-database\\.ts$',
@@ -355,7 +319,7 @@ module.exports = {
       name: 'fleet-control-backend-switch-does-not-reach-its-provider',
       severity: 'error',
       comment:
-        'The root switch coordinator depends on provider-neutral ports. It must not reach the concrete Workers for Platforms switch provider, which implements those ports over Cloudflare transports.',
+        'The concrete provider implements the coordinator ports; reverse reach couples coordination to its transport.',
       from: {
         path: [
           '^packages/fleet-control/src/backend-switch\\.ts$',
@@ -371,7 +335,7 @@ module.exports = {
       name: 'fleet-control-strict-plain-data-is-import-free',
       severity: 'error',
       comment:
-        'The descriptor-safe plain-data guard is shared by persisted codecs and must remain an import-free leaf so validation cannot execute package code before it rejects hostile input.',
+        'Validation must not execute package code before rejecting hostile input.',
       from: {
         path: [
           '^packages/fleet-control/src/strict-plain-data\\.ts$',
@@ -387,7 +351,7 @@ module.exports = {
       name: 'fleet-control-ports-do-not-reach-d1-adapter',
       severity: 'error',
       comment:
-        'The D1 adapter implements ports that state-store.ts and migration-ledger.ts declare and imports state-store.ts, which reaches migration-ledger.ts through backend-switch.ts, so a port module reaching the adapter would close a cycle. d1-fleet-inventory-run-store.ts and d1-fleet-operation-store.ts consume the same port and must stay binding-agnostic for the same reason.',
+        'Binding adapters depend on the ports; store implementations accept injected databases.',
       from: {
         path: [
           '^packages/fleet-control/src/(?:state-store|migration-ledger|d1-fleet-inventory-run-store|d1-fleet-operation-store)\\.ts$',
@@ -403,7 +367,7 @@ module.exports = {
       name: 'fleet-control-worker-reachable-modules-avoid-node-builtins',
       severity: 'error',
       comment:
-        'These modules are Worker entry points or are reached from one in the import graph, where a Node builtin needs nodejs_compat. The two D1 harnesses set nodejs_compat, so a builtin import in the D1 adapter fails this rule rather than a harness; the R2 export harness runs without the flag.',
+        'Node built-ins require nodejs_compat. A harness with that flag can mask an incompatible import for consumers without it.',
       from: {
         path: [
           '^packages/fleet-control/src/(?:d1-fleet-state-database|database-export-store|export-file-name|r2-export-store)\\.ts$',
@@ -416,8 +380,6 @@ module.exports = {
     {
       name: 'fleet-control-client-does-not-reach-its-consumers',
       severity: 'error',
-      comment:
-        'index.ts, cloudflare-api-plain-worker-backend.ts, and cloudflare-api-plain-worker-provisioning-api.ts import the Cloudflare client, so the client reaching one of them would close a cycle. The one-way rule and the general Fleet Control cycle rule both reject that reverse reach.',
       from: {
         path: [
           '^packages/fleet-control/src/cloudflare-client\\.ts$',
@@ -433,7 +395,7 @@ module.exports = {
       name: 'fleet-control-export-port-does-not-reach-adapters',
       severity: 'error',
       comment:
-        'export-store.ts and r2-export-store.ts import DurableDatabaseExportStore from database-export-store.ts to implement it, so the port reaching either store would close a cycle. Those two imports are type-only, and tsPreCompilationDeps keeps a type-only edge in the graph.',
+        'Adapters implement the port; reverse reach introduces a dependency cycle, including through type imports.',
       from: {
         path: [
           '^packages/fleet-control/src/database-export-store\\.ts$',
@@ -466,8 +428,6 @@ module.exports = {
     {
       name: 'host-kit-reaches-approval-shapes',
       severity: 'error',
-      comment:
-        'The barrel must continue reaching the pure approval-shapes leaf instead of the durable agent barrel.',
       module: {
         path: [
           '^packages/flowsafe/src/host-kit/index\\.ts$',

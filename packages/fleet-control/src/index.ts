@@ -110,6 +110,7 @@ export {
   type FleetAuditAdvanceCapability,
   FleetAuditAdvanceCapabilityError,
   type FleetAuditAdvanceResult,
+  type FleetAuditFindingsPage,
   type FleetAuditResultRef,
   readFleetAuditFindingsPage,
 } from './fleet-audit-advance.js';

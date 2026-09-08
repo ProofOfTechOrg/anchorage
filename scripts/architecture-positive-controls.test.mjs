@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { relative } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
@@ -28,7 +29,11 @@ const databaseExportStore =
   'packages/fleet-control/src/database-export-store.ts';
 const strictPlainData = 'packages/fleet-control/src/strict-plain-data.ts';
 const auditAdvance = 'packages/fleet-control/src/fleet-audit-advance.ts';
+const migrationAdvance =
+  'packages/fleet-control/src/fleet-migration-advance.ts';
+const fleet = 'packages/fleet-control/src/fleet.ts';
 const cloudflareClient = 'packages/fleet-control/src/cloudflare-client.ts';
+const d1Database = 'packages/fleet-control/src/d1-fleet-state-database.ts';
 
 function adjacencyOf(report, keep) {
   return new Map(
@@ -43,7 +48,6 @@ function adjacencyOf(report, keep) {
   );
 }
 
-/** Adjacency over runtime edges only; type-only edges are erased. */
 function runtimeAdjacency(report) {
   return adjacencyOf(
     report,
@@ -54,7 +58,6 @@ function runtimeAdjacency(report) {
   );
 }
 
-/** Adjacency over every edge, which is the graph a reachable rule walks. */
 function fullAdjacency(report) {
   return adjacencyOf(report, () => true);
 }
@@ -150,14 +153,6 @@ const controls = {
     'scripts/architecture-fixtures/fleet-control-export-port-imports-adapter.ts',
 };
 
-/**
- * Real modules cruised alongside a fixture, for two reasons. A reachable rule
- * is evaluated over the graph it guards rather than over the fixture alone;
- * and a block's own assertions get the modules they walk, which is why the
- * decommission-database entry lists decommissionDatabase — that rule is a
- * direct-edge rule, not a reachable one, so the module is there for the
- * block's exact-set assertion rather than for the rule.
- */
 const extraEntries = {
   'fleet-control-decommission-advance-is-transport-neutral': [
     decommissionAdvance,
@@ -172,8 +167,149 @@ const extraEntries = {
     decommissionDatabase,
     backendSwitch,
   ],
-  'fleet-control-operation-advance-avoids-concrete-transports': [auditAdvance],
+  'fleet-control-operation-advance-avoids-concrete-transports': [
+    auditAdvance,
+    migrationAdvance,
+  ],
 };
+
+const followedImports = new Map([
+  [decommissionAdvance, decommissionDatabase],
+  [decommissionDatabase, databaseExportStore],
+  [backendSwitch, decommissionAdvance],
+  [switchProvider, backendSwitch],
+  [auditAdvance, fleet],
+  [migrationAdvance, fleet],
+]);
+
+function assertFollowedImports(adjacency, sources) {
+  for (const source of sources) {
+    const target = followedImports.get(source);
+    assert.ok(target, `no followed-import control for ${source}`);
+    assert.ok(
+      adjacency.get(source)?.includes(target),
+      `${source} did not follow its import of ${target}`,
+    );
+    assert.ok(
+      adjacency.get(target)?.length > 0,
+      `${target}, imported by ${source}, has no followed dependencies`,
+    );
+  }
+}
+
+test('production transport class implementations are forbidden operation targets', () => {
+  const fleetRequire = createRequire(
+    new URL('../packages/fleet-control/package.json', import.meta.url),
+  );
+  const ts = fleetRequire('typescript');
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const sourceRoot = fileURLToPath(
+    new URL('../packages/fleet-control/src/', import.meta.url),
+  );
+  const parsed = ts.getParsedCommandLineOfConfigFile(
+    fileURLToPath(
+      new URL('../packages/fleet-control/tsconfig.build.json', import.meta.url),
+    ),
+    { noEmit: true },
+    {
+      ...ts.sys,
+      onUnRecoverableConfigFileDiagnostic(diagnostic) {
+        assert.fail(
+          ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'),
+        );
+      },
+    },
+  );
+  assert.deepEqual(parsed.errors, []);
+  const program = ts.createProgram(parsed.fileNames, parsed.options);
+  const checker = program.getTypeChecker();
+  const portSources = {
+    ProvisioningBackend: 'types.ts',
+    PlainWorkerProvisioningApi: 'types.ts',
+    BackendSwitchProvider: 'backend-switch.ts',
+    DurableDatabaseExportStore: 'database-export-store.ts',
+    FleetStateDatabase: 'state-store.ts',
+  };
+  const ports = Object.entries(portSources).map(([name, file]) => {
+    const source = program.getSourceFile(`${sourceRoot}${file}`);
+    assert.ok(source, `missing port source ${file}`);
+    const module = checker.getSymbolAtLocation(source);
+    assert.ok(module, `missing module symbol for ${file}`);
+    const exported = checker
+      .getExportsOfModule(module)
+      .find((symbol) => symbol.name === name);
+    assert.ok(exported, `missing port ${name} in ${file}`);
+    const symbol =
+      exported.flags & ts.SymbolFlags.Alias
+        ? checker.getAliasedSymbol(exported)
+        : exported;
+    const type = checker.getDeclaredTypeOfSymbol(symbol);
+    assert.ok(
+      type.getProperties().length > 0,
+      `${name} has no resolved members`,
+    );
+    return { name, type };
+  });
+  const implementations = [];
+  for (const source of program.getSourceFiles()) {
+    if (source.isDeclarationFile || !source.fileName.startsWith(sourceRoot))
+      continue;
+    function visit(node) {
+      if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
+        const symbol = checker.getTypeAtLocation(node).getSymbol();
+        assert.ok(symbol, `unresolved class symbol in ${source.fileName}`);
+        const type = checker.getDeclaredTypeOfSymbol(symbol);
+        const implemented = ports.filter((port) =>
+          checker.isTypeAssignableTo(type, port.type),
+        );
+        if (implemented.length > 0) {
+          implementations.push({
+            file: relative(root, source.fileName).split('\\').join('/'),
+            class: node.name?.text ?? '<anonymous>',
+            ports: implemented.map((port) => port.name),
+          });
+        }
+      }
+      ts.forEachChild(node, visit);
+    }
+    visit(source);
+  }
+  for (const { name } of ports) {
+    assert.ok(
+      implementations.some((implementation) =>
+        implementation.ports.includes(name),
+      ),
+      `no production class implementation found for ${name}`,
+    );
+  }
+  for (const name of [
+    'CloudflareApiPlainWorkerBackend',
+    'WranglerLoopBackend',
+  ]) {
+    assert.ok(
+      implementations.some(
+        (implementation) =>
+          implementation.class === name &&
+          implementation.ports.includes('ProvisioningBackend'),
+      ),
+      `inherited backend ${name} was not classified`,
+    );
+  }
+  const forbidden = new RegExp(
+    architectureRules.find(
+      (rule) =>
+        rule.name ===
+        'fleet-control-operation-advance-avoids-concrete-transports',
+    ).to.path,
+  );
+  assert.deepEqual(
+    implementations.filter(
+      (implementation) => !forbidden.test(implementation.file),
+    ),
+    [],
+    'production transport class implementations missing from the operation rule',
+  );
+});
 
 test('every architecture rule has an executable positive control', () => {
   const ruleNames = architectureRules.map((rule) => rule.name).sort();
@@ -229,14 +365,26 @@ for (const [ruleName, fixture] of Object.entries(controls)) {
       violations.includes(ruleName),
       `${fixture} did not trigger ${ruleName}; got ${violations.join(', ')}`,
     );
-    // An extra entry the cruise report does not contain has an empty
-    // adjacency entry, which satisfies the negative reachability assertions
-    // below without proving anything.
-    for (const entry of extraEntries[ruleName] ?? []) {
+    const adjacency = fullAdjacency(report);
+    assertFollowedImports(adjacency, extraEntries[ruleName] ?? []);
+    if (
+      [
+        'fleet-control-decommission-advance-is-transport-neutral',
+        'fleet-control-inventory-advance-is-transport-neutral',
+        'fleet-control-operation-advance-avoids-concrete-transports',
+        'fleet-control-cleanup-advance-is-transport-neutral',
+      ].includes(ruleName)
+    ) {
       assert.ok(
-        report.modules.some((module) => module.source === entry),
-        `extraEntries lists ${entry} for ${ruleName}, which the cruise report does not contain`,
+        report.summary.violations.some(
+          (violation) =>
+            violation.rule.name === ruleName &&
+            violation.from === fixture &&
+            violation.to === d1Database,
+        ),
+        `${fixture} did not reject the concrete D1 database adapter`,
       );
+      assert.equal(reaches(adjacency, fixture, d1Database), true);
     }
     if (
       ruleName === 'fleet-control-decommission-state-does-not-reach-provider'
@@ -260,7 +408,9 @@ for (const [ruleName, fixture] of Object.entries(controls)) {
         ),
         'decommission advance control did not reject the concrete switch provider',
       );
-      const adjacency = fullAdjacency(report);
+      assert.equal(reaches(adjacency, fixture, backendSwitch), true);
+      assert.equal(reaches(adjacency, fixture, switchProvider), true);
+      assertFollowedImports(adjacency, [backendSwitch, switchProvider]);
       assert.equal(
         reaches(adjacency, decommissionAdvance, backendSwitch),
         false,
@@ -269,8 +419,6 @@ for (const [ruleName, fixture] of Object.entries(controls)) {
         reaches(adjacency, decommissionAdvance, switchProvider),
         false,
       );
-      assert.equal(reaches(adjacency, fixture, backendSwitch), true);
-      assert.equal(reaches(adjacency, fixture, switchProvider), true);
     }
     if (
       ruleName === 'fleet-control-decommission-database-is-provider-neutral'
@@ -291,13 +439,14 @@ for (const [ruleName, fixture] of Object.entries(controls)) {
           `decommission database control did not reject ${target}`,
         );
       }
-      const adjacency = runtimeAdjacency(report);
-      assert.deepEqual(reachableFrom(adjacency, decommissionDatabase), [
+      assert.equal(adjacency.get(fixture)?.includes(backendSwitch), true);
+      const runtime = runtimeAdjacency(report);
+      assert.deepEqual(reachableFrom(runtime, decommissionDatabase), [
         databaseExportStore,
         strictPlainData,
       ]);
       assert.equal(
-        adjacency.get(fixture)?.includes(backendSwitch) ?? false,
+        runtime.get(fixture)?.includes(backendSwitch) ?? false,
         false,
         'erased fixture edge entered the runtime adjacency map',
       );
@@ -309,11 +458,10 @@ for (const [ruleName, fixture] of Object.entries(controls)) {
         'fleet-control-backend-switch-does-not-reach-its-provider',
         'fleet-control-decommission-database-is-provider-neutral',
       ]);
-      assert.equal(
-        reaches(fullAdjacency(report), backendSwitch, switchProvider),
-        false,
-      );
-      const adjacency = runtimeAdjacency(report);
+      assert.equal(reaches(adjacency, fixture, backendSwitch), true);
+      assert.equal(reaches(adjacency, fixture, switchProvider), true);
+      assertFollowedImports(adjacency, [switchProvider]);
+      assert.equal(reaches(adjacency, backendSwitch, switchProvider), false);
       for (const source of [
         decommissionAdvance,
         decommissionDatabase,
@@ -323,7 +471,7 @@ for (const [ruleName, fixture] of Object.entries(controls)) {
         assert.equal(
           hasCycleThrough(adjacency, source),
           false,
-          `${source} entered a runtime cycle`,
+          `${source} entered a type-inclusive dependency cycle`,
         );
       }
     }
@@ -339,25 +487,19 @@ for (const [ruleName, fixture] of Object.entries(controls)) {
         ),
         'operation advance control did not reject the concrete provider client',
       );
-      // Exhaustive over the rule's own to-set rather than over one member, so
-      // a real-module reach into any other forbidden target cannot hide behind
-      // this fixture's violations under the same rule name. The walk is over
-      // the unfiltered graph, type-only edges included, because that is the
-      // graph this reachable rule itself walks under tsPreCompilationDeps.
+      assert.equal(reaches(adjacency, fixture, cloudflareClient), true);
       const forbidden = new RegExp(
         architectureRules.find((rule) => rule.name === ruleName).to.path,
       );
-      assert.deepEqual(
-        reachableFrom(fullAdjacency(report), auditAdvance).filter((module) =>
-          forbidden.test(module),
-        ),
-        [],
-        'the real operation-advance coordinator reached a forbidden target',
-      );
-      assert.equal(
-        reaches(runtimeAdjacency(report), fixture, cloudflareClient),
-        true,
-      );
+      for (const source of [auditAdvance, migrationAdvance]) {
+        assert.deepEqual(
+          reachableFrom(adjacency, source).filter((module) =>
+            forbidden.test(module),
+          ),
+          [],
+          `${source} reached a forbidden target`,
+        );
+      }
     }
     if (ruleName === 'fleet-control-strict-plain-data-is-import-free') {
       for (const target of ['cloudflare', 'crypto']) {
