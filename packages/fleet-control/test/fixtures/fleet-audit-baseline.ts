@@ -1,20 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * GENERATED FILE — DO NOT EDIT BY HAND.
- *
- * Written by `scripts/record-audit-baseline.mjs` from the hand-authored world
- * in `fleet-audit-world.ts`. It freezes the observable behavior of
- * `auditFleetDrift()` (src/fleet.ts) before it is decomposed into bounded
- * stages, so the decomposition can be proven byte-equivalent. Verify with
- * `node scripts/record-audit-baseline.mjs --check`; any required change to
- * these literals is a compatibility break, not a fixture update.
+ * GENERATED FILE. DO NOT EDIT BY HAND.
  */
 
 import type { DriftFinding } from '../../src/fleet.js';
 import type { AuditOpLogEntry } from './fleet-audit-world.js';
 
-/** Every finding `auditFleetDrift()` returned, in order. */
 export const AUDIT_BASELINE_FINDINGS = [
   {
     tenantTag: 'seed-provider',
@@ -327,13 +319,6 @@ export const AUDIT_BASELINE_FINDINGS = [
   },
 ] as const satisfies readonly DriftFinding[];
 
-/**
- * Every `withDeploymentLease`/`get`/`put`/`inspect`/`ensureMaintenance`
- * call, every `resolver:<kind>` invocation, and every `lease.assertOwned()`
- * call `auditFleetDrift()` made, in order. `list`/`renew`/`delete` are in
- * `AuditOpLogEntry`'s vocabulary but never appear here (defensive, unused by
- * this pre-decomposition world).
- */
 export const AUDIT_BASELINE_OPS = [
   'resolver:backendFor',
   'resolver:specFor',

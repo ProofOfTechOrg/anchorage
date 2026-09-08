@@ -1,65 +1,68 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// The write/`--check` machinery every golden-baseline recorder shares.
-//
-// A golden baseline freezes the observable behavior of one function — the value
-// it returns and the exact sequence of calls it makes onto its collaborators —
-// as TypeScript literals recorded from a hand-authored deterministic world, so
-// a later rewrite of that function can be proven behavior-equivalent. The
-// mechanics are identical for every such baseline: parse `--check`, re-execute
-// under Node's type transform, import the world, run it, and then either render
-// the literals into exactly one generated file or compare the committed file
-// against a fresh re-derivation. Only the DOMAIN differs, and each recorder
-// supplies its domain as the config object documented on `runBaselineRecorder`.
-//
-// `--check` compares STRUCTURALLY — ordered arrays, ordered object keys, exact
-// leaf values — so the compatibility gate never depends on formatter behavior,
-// prints every difference, and exits non-zero without writing.
-//
-// This module is machinery, not a gate: each recorder's in-suite equivalence
-// title is the automatic behavioral gate, and `--check` is the re-recording aid
-// an author runs by hand.
-
 import { spawnSync } from 'node:child_process';
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { register } from 'node:module';
-import { dirname, join, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import process from 'node:process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { isMainThread } from 'node:worker_threads';
 
 const REPOSITORY_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 // `pnpm exec` rather than a hard-coded node_modules/.bin path, matching
 // build-api-docs.mjs; the .bin shim location is a pnpm implementation detail.
 const PNPM = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm';
 
-// Every path a recorder names is repository-relative, resolved here against the
-// one `REPOSITORY_ROOT` this module already computes for itself. A recorder
-// therefore carries no path machinery, and — because the string it configures
-// is BOTH what gets resolved and what gets printed — no message can ever name a
-// file the run did not touch.
-function repositoryPath(relativePath) {
-  return join(REPOSITORY_ROOT, relativePath);
+function repositoryPath(relativePath, field) {
+  if (
+    typeof relativePath !== 'string' ||
+    relativePath.length === 0 ||
+    relativePath.includes('\0') ||
+    isAbsolute(relativePath) ||
+    /^[A-Za-z][A-Za-z0-9+.-]*:/u.test(relativePath)
+  ) {
+    throw new Error(`${field} must be a repository-relative filesystem path`);
+  }
+  const filePath = resolve(REPOSITORY_ROOT, relativePath);
+  const fromRoot = relative(REPOSITORY_ROOT, filePath);
+  if (
+    fromRoot === '' ||
+    fromRoot === '..' ||
+    fromRoot.startsWith(`..${sep}`) ||
+    isAbsolute(fromRoot)
+  ) {
+    throw new Error(`${field} must resolve to a path inside the repository`);
+  }
+  return filePath;
 }
 
-/** The recorder's own repository-relative path, as its messages print it. */
 function scriptPath(config) {
-  return relative(REPOSITORY_ROOT, fileURLToPath(config.scriptUrl));
+  return relative(REPOSITORY_ROOT, fileURLToPath(config.scriptUrl))
+    .split(sep)
+    .join('/');
 }
 
 function usage(config, message) {
   process.stderr.write(
-    `${message}\nusage: node ${scriptPath(config)} [--check]\n`,
+    `${message}\nusage: node ${scriptPath(config)} --check | --write\n`,
   );
-  process.exit(2);
 }
 
 function parseArguments(config, argv) {
-  let check = false;
+  let mode;
   for (const argument of argv) {
-    if (argument === '--check') check = true;
-    else usage(config, `unknown argument '${argument}'`);
+    if (argument !== '--check' && argument !== '--write') {
+      usage(config, `unknown argument '${argument}'`);
+      return undefined;
+    }
+    if (mode && mode !== argument) {
+      usage(config, 'conflicting modes: choose --check or --write');
+      return undefined;
+    }
+    mode = argument;
   }
-  return { check };
+  if (!mode) usage(config, 'missing mode: choose --check or --write');
+  return mode;
 }
 
 // The fixture chain (and the function it drives) is TypeScript with parameter
@@ -77,7 +80,7 @@ function reexecuteWithTypeTransform(config, argv) {
     { stdio: 'inherit' },
   );
   if (result.error) throw result.error;
-  process.exit(result.status ?? 1);
+  return result.status ?? 1;
 }
 
 // Test sources import sibling modules with `.js` specifiers, which Node does
@@ -104,12 +107,10 @@ function registerTypeScriptResolution() {
 }
 
 function quoted(value) {
-  const escaped = value
-    .replaceAll('\\', '\\\\')
-    .replaceAll("'", "\\'")
-    .replaceAll('\n', '\\n')
-    .replaceAll('\r', '\\r')
-    .replaceAll('\t', '\\t');
+  const escaped = JSON.stringify(value)
+    .slice(1, -1)
+    .replaceAll('\\"', '"')
+    .replaceAll("'", "\\'");
   return `'${escaped}'`;
 }
 
@@ -117,6 +118,7 @@ function primitive(value) {
   if (value === undefined) return 'undefined';
   if (value === null) return 'null';
   if (typeof value === 'string') return quoted(value);
+  if (Object.is(value, -0)) return '-0';
   if (typeof value === 'number' || typeof value === 'boolean') {
     return String(value);
   }
@@ -127,7 +129,70 @@ function isComposite(value) {
   return typeof value === 'object' && value !== null;
 }
 
+function validateValue(value, path, ancestors = new Set()) {
+  if (!isComposite(value)) {
+    if (
+      value === null ||
+      value === undefined ||
+      typeof value === 'string' ||
+      typeof value === 'boolean' ||
+      typeof value === 'number'
+    )
+      return;
+    throw new Error(
+      `${path}: unsupported baseline value type '${typeof value}'`,
+    );
+  }
+  const array = Array.isArray(value);
+  const prototype = Object.getPrototypeOf(value);
+  if (
+    array
+      ? prototype !== Array.prototype
+      : prototype !== Object.prototype && prototype !== null
+  ) {
+    throw new Error(`${path}: expected a plain map or ordinary array`);
+  }
+  if (ancestors.has(value)) throw new Error(`${path}: cyclic baseline value`);
+  ancestors.add(value);
+  const keys = Reflect.ownKeys(value).filter(
+    (key) => !array || key !== 'length',
+  );
+  if (array && keys.length !== value.length) {
+    throw new Error(`${path}: expected a dense array without extra properties`);
+  }
+  for (const [index, key] of keys.entries()) {
+    if (typeof key !== 'string') {
+      throw new Error(`${path}: symbol properties are unsupported`);
+    }
+    if (array && key !== String(index)) {
+      throw new Error(
+        `${path}: expected a dense array without extra properties`,
+      );
+    }
+    const propertyPath = `${path}[${array ? key : JSON.stringify(key)}]`;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) {
+      throw new Error(`${propertyPath}: expected an enumerable data property`);
+    }
+    validateValue(descriptor.value, propertyPath, ancestors);
+  }
+  ancestors.delete(value);
+}
+
+function configuredValue(values, key, path) {
+  if (!isComposite(values) || !Object.hasOwn(values, key)) {
+    throw new Error(`${path}: missing own property`);
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(values, key);
+  if (!descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) {
+    throw new Error(`${path}: expected an enumerable data property`);
+  }
+  validateValue(descriptor.value, path);
+  return descriptor.value;
+}
+
 function propertyKey(key) {
+  if (key === '__proto__') return "['__proto__']";
   return /^[A-Za-z_$][A-Za-z0-9_$]*$/u.test(key) ? key : quoted(key);
 }
 
@@ -146,15 +211,20 @@ function render(value) {
 }
 
 function baselineSource(config, baseline) {
-  const declarations = config.exports.map(
-    (declaration) =>
-      `${declaration.jsDoc}\nexport const ${declaration.name} = ${render(
-        baseline[declaration.key],
-      )} as const satisfies ${declaration.satisfies};`,
-  );
+  const declarations = config.exports.map((declaration) => {
+    const value = baseline[declaration.key];
+    // TypeScript restricts const assertions to literal expressions.
+    const assertion =
+      value == null || (typeof value === 'number' && !Number.isFinite(value))
+        ? ''
+        : ' as const';
+    return `${declaration.jsDoc ? `${declaration.jsDoc}\n` : ''}export const ${declaration.name} = ${render(value)}${assertion} satisfies ${declaration.satisfies};`;
+  });
   return `// SPDX-License-Identifier: Apache-2.0
 
-${config.header}
+/**
+ * GENERATED FILE. DO NOT EDIT BY HAND.
+ */
 
 ${config.imports}
 
@@ -162,10 +232,10 @@ ${declarations.join('\n\n')}
 `;
 }
 
-function formatGeneratedFile(baselineFile) {
+function formatGeneratedFile(baselineFilePath) {
   const result = spawnSync(
     PNPM,
-    ['exec', 'biome', 'check', '--write', baselineFile],
+    ['exec', 'biome', 'check', '--write', baselineFilePath],
     { cwd: REPOSITORY_ROOT, stdio: ['ignore', 'ignore', 'inherit'] },
   );
   if (result.error) throw result.error;
@@ -183,10 +253,6 @@ function describeValue(value) {
   return primitive(value);
 }
 
-/**
- * Structural comparison: ordered arrays, ordered object keys, exact leaf
- * values. Formatting and quoting are deliberately outside the comparison.
- */
 function structuralDifferences(committed, derived, path, differences) {
   if (isComposite(committed) !== isComposite(derived)) {
     differences.push(
@@ -195,7 +261,7 @@ function structuralDifferences(committed, derived, path, differences) {
     return differences;
   }
   if (!isComposite(committed)) {
-    if (committed !== derived) {
+    if (!Object.is(committed, derived)) {
       differences.push(
         `${path}: committed ${primitive(committed)} / derived ${primitive(derived)}`,
       );
@@ -234,12 +300,22 @@ function structuralDifferences(committed, derived, path, differences) {
   }
   const committedKeys = Object.keys(committed);
   const derivedKeys = Object.keys(derived);
-  if (committedKeys.join(',') !== derivedKeys.join(',')) {
+  if (
+    committedKeys.length !== derivedKeys.length ||
+    committedKeys.some((key, index) => key !== derivedKeys[index])
+  ) {
     differences.push(
-      `${path}: committed keys [${committedKeys.join(', ')}] / derived keys [${derivedKeys.join(', ')}]`,
+      `${path}: committed keys ${JSON.stringify(committedKeys)} / derived keys ${JSON.stringify(derivedKeys)}`,
     );
   }
   for (const key of new Set([...committedKeys, ...derivedKeys])) {
+    if (!Object.hasOwn(committed, key) || !Object.hasOwn(derived, key)) {
+      const onlyDerived = !Object.hasOwn(committed, key);
+      const side = onlyDerived ? 'derived only' : 'committed only';
+      const value = onlyDerived ? derived[key] : committed[key];
+      differences.push(`${path}.${key}: ${side} ${describeValue(value)}`);
+      continue;
+    }
     structuralDifferences(
       committed[key],
       derived[key],
@@ -251,36 +327,54 @@ function structuralDifferences(committed, derived, path, differences) {
 }
 
 async function main(config, argv) {
-  const { check } = parseArguments(config, argv);
+  const mode = parseArguments(config, argv);
+  if (!mode) return 2;
   if (process.features.typescript !== 'transform') {
-    reexecuteWithTypeTransform(config, argv);
+    return reexecuteWithTypeTransform(config, argv);
   }
   registerTypeScriptResolution();
-  const baselineFile = repositoryPath(config.baselineFile);
-  const baseline = await config.run(
-    await import(repositoryPath(config.worldModule)),
-  );
+  const baselineFilePath = repositoryPath(config.baselineFile, 'baselineFile');
+  const worldModulePath = repositoryPath(config.worldModule, 'worldModule');
+  if (!existsSync(worldModulePath)) {
+    process.stderr.write(
+      `${config.noun} world is missing: ${config.worldModule}\n`,
+    );
+    return 1;
+  }
+  const world = await import(pathToFileURL(worldModulePath).href);
+  const baseline = await config.run(world);
+  for (const declaration of config.exports) {
+    configuredValue(
+      baseline,
+      declaration.key,
+      `derived key '${declaration.key}'`,
+    );
+  }
 
-  if (!check) {
-    writeFileSync(baselineFile, baselineSource(config, baseline));
-    formatGeneratedFile(baselineFile);
+  if (mode === '--write') {
+    writeFileSync(baselineFilePath, baselineSource(config, baseline));
+    formatGeneratedFile(baselineFilePath);
     process.stdout.write(
       `wrote ${config.baselineFile}: ${config.summary(baseline)}\n`,
     );
     return 0;
   }
 
-  if (!existsSync(baselineFile)) {
+  if (!existsSync(baselineFilePath)) {
     process.stderr.write(
       `${config.noun} baseline is missing: ${config.baselineFile}\n` +
-        `run \`node ${scriptPath(config)}\` on the pre-rewrite tree\n`,
+        `run \`node ${scriptPath(config)} --write\` to record the baseline\n`,
     );
     return 1;
   }
-  const committed = await import(baselineFile);
+  const committed = await import(pathToFileURL(baselineFilePath).href);
   const differences = config.exports.flatMap((declaration) =>
     structuralDifferences(
-      committed[declaration.name],
+      configuredValue(
+        committed,
+        declaration.name,
+        `committed export '${declaration.name}'`,
+      ),
       baseline[declaration.key],
       declaration.key,
       [],
@@ -301,34 +395,51 @@ async function main(config, argv) {
 }
 
 /**
- * Runs one golden-baseline recorder, when its own file is the invoked entry.
+ * Runs a recorder entry with explicit `--check` or `--write`.
  *
- * The config is the recorder's whole domain, and nothing else — no path
- * machinery, and no message-only path string that could drift out of step with
- * the file the run actually reads or writes:
- * - `scriptUrl` — the recorder's `import.meta.url`, which gates this call, names
- *   the file the type-transform re-execution re-runs, and yields the
- *   repository-relative path the usage line and the re-recording hint print.
- * - `noun` — the domain noun the `--check` messages read as
- *   "<noun> baseline is missing/matches/drifted from".
- * - `worldModule` — the hand-authored world, repository-relative.
- * - `baselineFile` — the one file write mode writes, repository-relative. The
- *   same string is resolved for every read and write AND printed in every
- *   message, so the two can never disagree.
- * - `run(worldModule)` — drives the world(s) and returns the baseline object
- *   the `exports` keys index.
- * - `header` / `imports` — the generated file's leading comment block and its
- *   import lines, verbatim.
- * - `exports` — one entry per generated export: `name`, the baseline `key` it
- *   renders (which also names it in `--check` differences), its `jsDoc` block,
- *   and the `satisfies` type expression that gates the literals.
- * - `summary(baseline)` — the one-line count the write and match messages
- *   report.
+ * Configure `scriptUrl: import.meta.url`, repository-relative `worldModule`
+ * and `baselineFile` paths, `run(world)`, `noun`, `summary(baseline)`, and
+ * generated `imports`. Each `exports` declaration supplies `name`, a derived
+ * `key`, a `satisfies` type expression, and optional `jsDoc`.
+ *
+ * Selected values support undefined, null, strings, booleans, numbers, dense
+ * ordinary arrays, and plain or null-prototype maps with enumerable string
+ * data properties. Map prototypes and shared references are not preserved;
+ * key order and undefined-valued key presence are significant.
  */
 export async function runBaselineRecorder(config) {
-  const invokedPath = process.argv[1]
-    ? pathToFileURL(resolve(process.argv[1])).href
-    : undefined;
-  if (invokedPath !== config.scriptUrl) return;
-  process.exit(await main(config, process.argv.slice(2)));
+  const entry = process.argv[1];
+  if (!entry) return;
+  let scriptUrl;
+  try {
+    scriptUrl = new URL(config.scriptUrl);
+  } catch {
+    throw new Error('recorder scriptUrl must be a file URL');
+  }
+  if (scriptUrl.protocol !== 'file:') {
+    throw new Error('recorder scriptUrl must be a file URL');
+  }
+  const recorderFilePath = realpathSync(fileURLToPath(scriptUrl));
+  if (!statSync(recorderFilePath).isFile()) {
+    throw new Error('recorder scriptUrl must name a file');
+  }
+  // Worker files inherit the parent process's eval flags.
+  if (
+    entry === '-' ||
+    (!isMainThread && !isAbsolute(entry)) ||
+    (isMainThread &&
+      process.execArgv.some((argument) =>
+        /^(?:-[ep]|--(?:eval|print)(?:=|$))/u.test(argument),
+      ))
+  )
+    return;
+  let invokedFilePath;
+  try {
+    invokedFilePath = realpathSync(resolve(entry));
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return;
+    throw error;
+  }
+  if (invokedFilePath !== recorderFilePath) return;
+  process.exitCode = await main(config, process.argv.slice(2));
 }

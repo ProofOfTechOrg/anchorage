@@ -1,21 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * GENERATED FILE — DO NOT EDIT BY HAND.
- *
- * Written by `scripts/record-migration-baseline.mjs` from the hand-authored
- * worlds in `fleet-migration-worlds.ts`. It freezes the observable behavior of
- * `migrateFleet()` (src/fleet.ts) before it is decomposed into a bounded
- * frozen-plan executor, so the decomposition can be proven byte-equivalent.
- * Verify with `node scripts/record-migration-baseline.mjs --check`; any
- * required change to these literals is a compatibility break, not a fixture
- * update.
+ * GENERATED FILE. DO NOT EDIT BY HAND.
  */
 
 import type { FleetRecord } from '../../src/types.js';
 import type { MigrationOpLogEntry } from './fleet-migration-worlds.js';
 
-/** Every record `migrateFleet()` returned for the success world, in order. */
+/**
+ * An absent `durableObjectTag` key differs from a present key whose value
+ * is `undefined`.
+ */
 export const MIGRATION_SUCCESS_BASELINE_RESULT = [
   {
     tenantTag: 'extfull',
@@ -321,13 +316,8 @@ export const MIGRATION_SUCCESS_BASELINE_RESULT = [
 ] as const satisfies readonly FleetRecord[];
 
 /**
- * Every collaborator call `migrateFleet()` made for the success world, in
- * order: the store's `withDeploymentLease`/`get`/`put:<phase-or-subphase>`
- * and `lease.assertOwned()`, every `resolver:<kind>:<key>` invocation, every
- * backend call, and every settlement. The finalized-state provider's six
- * tokens and the state reconcile's `put:upload-authorized`/`put:uploaded` are
- * in `MigrationOpLogEntry`'s vocabulary but never appear here: no world holds
- * a finalized-ordinary-plane record.
+ * `applyMigrations:verify` depends on the spec array's reference identity;
+ * a per-version slice can contain the same migrations.
  */
 export const MIGRATION_SUCCESS_BASELINE_OPS = [
   'withDeploymentLease',
@@ -454,17 +444,9 @@ export const MIGRATION_SUCCESS_BASELINE_OPS = [
   'attestActiveRoute',
 ] as const satisfies readonly MigrationOpLogEntry[];
 
-/** The exact refusal `migrateFleet()` rejected the stop world with. */
 export const MIGRATION_STOP_BASELINE_ERROR =
   "deployment 'bravo:production' has active backend switch 'candidate-deployed'" as const satisfies string;
 
-/**
- * Every collaborator call `migrateFleet()` made for the stop world before it
- * rejected, in order. First-error stop parity is the SHAPE of this log: the
- * first record's whole body, then the refused record's `withDeploymentLease`
- * and `get` — the two calls its refusal fires after — and then nothing, because
- * the drain never reaches the third record.
- */
 export const MIGRATION_STOP_BASELINE_OPS = [
   'withDeploymentLease',
   'get',

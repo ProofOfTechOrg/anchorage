@@ -1,20 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * GENERATED FILE — DO NOT EDIT BY HAND.
- *
- * Written by `scripts/record-drain-baseline.mjs` from the hand-authored world
- * in `fleet-inventory-drain-world.ts`. It freezes the observable behavior of
- * `CloudflareProvisioningClient.collectFleetInventory()` before its internals
- * are rewritten, so the rewrite can be proven byte-equivalent. Verify with
- * `node scripts/record-drain-baseline.mjs --check`; any required change to
- * these literals is a compatibility break, not a fixture update.
+ * GENERATED FILE. DO NOT EDIT BY HAND.
  */
 
 import type { FleetResourceInventory } from '../../src/types.js';
 import type { DrainRequestRecord } from './fleet-inventory-drain-world.js';
 
-/** Every provider request the drain issued, in order. */
 export const DRAIN_BASELINE_REQUESTS = [
   {
     method: 'GET',
@@ -286,7 +278,6 @@ export const DRAIN_BASELINE_REQUESTS = [
   },
 ] as const satisfies readonly DrainRequestRecord[];
 
-/** The exact inventory the drain returned. */
 export const DRAIN_BASELINE_INVENTORY = {
   findings: [
     {
