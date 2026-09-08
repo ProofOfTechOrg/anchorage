@@ -3222,6 +3222,14 @@ function operationFinding(ordinal: number): FleetOperationStagedRow {
   };
 }
 
+function operationFact(ordinal: number): FleetOperationStagedRow {
+  return {
+    rowKind: 'fact',
+    ordinal,
+    payload: { factKind: 'duplicate-namespace', key: `namespace-${ordinal}` },
+  };
+}
+
 function operationItem(
   status: 'pending' | 'active',
   ordinal: number,
@@ -3277,6 +3285,29 @@ function operationStart(
     runRecord: operationRun(kind, id),
     intakeDigest: 'a'.repeat(64),
   });
+}
+
+async function operationSnapshot(db: D1Database, id: string) {
+  const run = await db
+    .prepare(
+      `SELECT op_record, json_extract(op_record, '$.progress.revision') AS revision
+        FROM anchorage_fleet_operations
+        WHERE account_id = ? AND operation_id = ?`,
+    )
+    .bind(OPERATION_ACCOUNT, id)
+    .first<{ op_record: string; revision: number }>();
+  const rows = await db
+    .prepare(
+      `SELECT row_kind, ordinal, payload FROM anchorage_fleet_operation_rows
+        WHERE account_id = ? AND operation_id = ? ORDER BY row_kind, ordinal`,
+    )
+    .bind(OPERATION_ACCOUNT, id)
+    .all<{ row_kind: string; ordinal: number; payload: string }>();
+  return {
+    revision: run?.revision ?? null,
+    record: run?.op_record ?? null,
+    rows: rows.results,
+  };
 }
 
 async function operationStartAtomicity(db: D1Database): Promise<unknown> {
@@ -3359,30 +3390,13 @@ async function operationCommitConcurrency(db: D1Database): Promise<unknown> {
   });
 }
 
-// The dense-prefix conjunct is aliased SQL that only `commitProgress`
-// emits, and it is the single guard that keeps a watermark-refused batch from
-// landing rows. Both of its paths run here so the real D1 planner, not only
-// `node:sqlite`, has executed the alias.
 async function operationCommitWatermark(db: D1Database): Promise<unknown> {
   const target = await readyOperationStore(db);
   const id = operationId(5);
-  const findingOrdinals = async (): Promise<number[]> => {
-    const rows = await db
-      .prepare(
-        `SELECT ordinal FROM anchorage_fleet_operation_rows
-          WHERE account_id = ? AND operation_id = ? AND row_kind = 'finding'
-          ORDER BY ordinal`,
-      )
-      .bind(OPERATION_ACCOUNT, id)
-      .all<{ ordinal: number }>();
-    return rows.results.map((row) => Number(row.ordinal));
-  };
   return target.withAccountOperationLease('audit', async (lease) => {
     const created = await operationStart(lease, 'audit', id);
-    // One insert at ordinal 1 under a watermark of 2 satisfies the
-    // contiguous-run precondition, so the refusal comes from the conjunct
-    // itself: the insert binds COUNT(< 1) = 1 against an empty table.
-    let refused: unknown;
+    const beforeFindingRefusal = await operationSnapshot(db, id);
+    let findingRefused: unknown = null;
     try {
       await lease.commitProgress({
         operationId: id,
@@ -3392,43 +3406,58 @@ async function operationCommitWatermark(db: D1Database): Promise<unknown> {
         expectedRowWatermarks: { finding: 2 },
       });
     } catch (error) {
-      refused = errorShape(error);
+      findingRefused = errorShape(error);
     }
-    if (refused === undefined) {
-      throw new Error('unsatisfiable watermark unexpectedly committed');
-    }
-    const afterRefusal = await lease.readOperation(id);
-    const refusedOrdinals = await findingOrdinals();
+    const afterFindingRefusal = await operationSnapshot(db, id);
     await lease.stageRows({
       operationId: id,
       expectedRevision: 0,
-      rows: [operationFinding(0), operationFinding(1)],
+      rows: [operationFinding(0), operationFact(1)],
     });
-    // Rows at [2, 3) under watermark 3, the coordinator's own convention: the
-    // insert binds the PRE-state prefix COUNT(< 2) = 2 and the run update the
-    // post-state COUNT(< 3) = 3.
-    const accepted = await lease.commitProgress({
+    const before = await operationSnapshot(db, id);
+    let refused: unknown = null;
+    try {
+      await lease.commitProgress({
+        operationId: id,
+        expectedRevision: 0,
+        runRecord: operationAdvanced(created.record),
+        rows: [operationFinding(1)],
+        expectedRowWatermarks: { finding: 2, fact: 1 },
+      });
+    } catch (error) {
+      refused = errorShape(error);
+    }
+    const afterRefusal = await operationSnapshot(db, id);
+    await lease.stageRows({
+      operationId: id,
+      expectedRevision: 0,
+      rows: [operationFinding(1), operationFact(0)],
+    });
+    const input = {
       operationId: id,
       expectedRevision: 0,
       runRecord: operationAdvanced(created.record),
-      rows: [operationFinding(2)],
-      expectedRowWatermarks: { finding: 3 },
-    });
+      rows: [operationFinding(2), operationFact(2)],
+      expectedRowWatermarks: { finding: 3, fact: 2 },
+    };
+    const accepted = await lease.commitProgress(input);
+    const afterAcceptance = await operationSnapshot(db, id);
+    const replay = await lease.commitProgress(input);
     return {
+      beforeFindingRefusal,
+      afterFindingRefusal,
+      findingRefused,
+      before,
+      afterRefusal,
       refused,
-      revisionAfterRefusal: afterRefusal?.progress.revision,
-      findingsAfterRefusal: refusedOrdinals.length,
-      acceptedRevision: accepted.progress.revision,
-      rowOrdinals: await findingOrdinals(),
+      accepted,
+      afterAcceptance,
+      replay,
+      afterReplay: await operationSnapshot(db, id),
     };
   });
 }
 
-// The row UPDATE carries the aliased dense-prefix conjunct too, and only a
-// migration `item` row can reach it: the audit-kind probe above cannot take
-// `updateRows` at all. This probe drives the ACCEPTED path of that statement,
-// so the real D1 planner has executed the alias inside an UPDATE and not only
-// inside an INSERT.
 async function operationCommitRowUpdate(db: D1Database): Promise<unknown> {
   const target = await readyOperationStore(db);
   const id = operationId(6);
@@ -3437,18 +3466,15 @@ async function operationCommitRowUpdate(db: D1Database): Promise<unknown> {
     await lease.stageRows({
       operationId: id,
       expectedRevision: 0,
-      rows: [operationItem('pending', 0)],
+      rows: [operationItem('pending', 0), operationItem('pending', 1)],
     });
-    // The batch inserts nothing, so `prefix` equals the watermark on both the
-    // UPDATE and the run update, and the staged item 0 already satisfies
-    // COUNT(item, ordinal < 1) = 1: the claim holds by construction, and a
-    // refusal here would be a bug rather than the design.
+    const before = await operationSnapshot(db, id);
     const accepted = await lease.commitProgress({
       operationId: id,
       expectedRevision: 0,
       runRecord: operationAdvanced(created.record),
-      updateRows: [operationItem('active', 0)],
-      expectedRowWatermarks: { item: 1 },
+      updateRows: [operationItem('active', 1)],
+      expectedRowWatermarks: { item: 2 },
     });
     const page = await target.readOperationRowsPage({
       operationId: id,
@@ -3456,8 +3482,121 @@ async function operationCommitRowUpdate(db: D1Database): Promise<unknown> {
       limit: 10,
     });
     return {
+      before,
+      afterAcceptance: await operationSnapshot(db, id),
       acceptedRevision: accepted.progress.revision,
-      itemStatus: page.rows[0]?.payload.status,
+      items: page.rows,
+    };
+  });
+}
+
+async function operationCommitImmutableConflict(
+  db: D1Database,
+  hideResults: boolean,
+  viaStage: boolean,
+): Promise<unknown> {
+  await readyOperationStore(db);
+  const database = hideResultsDatabase(new D1FleetStateDatabase(db));
+  const target = operationStore(database);
+  const id = operationId(7);
+  return target.withAccountOperationLease('audit', async (lease) => {
+    const created = await operationStart(lease, 'audit', id);
+    const staged = operationFinding(1);
+    await lease.stageRows({
+      operationId: id,
+      expectedRevision: 0,
+      rows: [staged],
+    });
+    const before = await operationSnapshot(db, id);
+    const input = {
+      operationId: id,
+      expectedRevision: 0,
+      runRecord: operationAdvanced(created.record),
+      rows: [operationFinding(0), staged],
+    };
+    let refused: unknown = null;
+    if (hideResults) database.loseNextBatch();
+    try {
+      const conflicting = {
+        ...input,
+        rows: [
+          operationFinding(0),
+          { ...staged, payload: { ...staged.payload, detail: 'different' } },
+        ],
+      };
+      if (viaStage) await lease.stageRows(conflicting);
+      else await lease.commitProgress(conflicting);
+    } catch (error) {
+      refused = errorShape(error);
+    }
+    const afterRefusal = await operationSnapshot(db, id);
+    if (viaStage) await lease.stageRows(input);
+    if (hideResults) database.loseNextBatch();
+    const accepted = await lease.commitProgress(input);
+    const afterAcceptance = await operationSnapshot(db, id);
+    if (hideResults) database.loseNextBatch();
+    const replay = await lease.commitProgress(input);
+    return {
+      before,
+      afterRefusal,
+      refused,
+      accepted,
+      afterAcceptance,
+      replay,
+      afterReplay: await operationSnapshot(db, id),
+    };
+  });
+}
+
+async function operationCommitMissingUpdate(
+  db: D1Database,
+  hideResults: boolean,
+): Promise<unknown> {
+  await readyOperationStore(db);
+  const database = hideResultsDatabase(new D1FleetStateDatabase(db));
+  const target = operationStore(database);
+  const id = operationId(8);
+  return target.withAccountOperationLease('migration', async (lease) => {
+    const created = await operationStart(lease, 'migration', id);
+    await lease.stageRows({
+      operationId: id,
+      expectedRevision: 0,
+      rows: [operationItem('pending', 0)],
+    });
+    const before = await operationSnapshot(db, id);
+    const input = {
+      operationId: id,
+      expectedRevision: 0,
+      runRecord: operationAdvanced(created.record),
+      rows: [operationItem('pending', 2)],
+      updateRows: [operationItem('active', 0), operationItem('active', 1)],
+    };
+    let refused: unknown = null;
+    if (hideResults) database.loseNextBatch();
+    try {
+      await lease.commitProgress(input);
+    } catch (error) {
+      refused = errorShape(error);
+    }
+    const afterRefusal = await operationSnapshot(db, id);
+    await lease.stageRows({
+      operationId: id,
+      expectedRevision: 0,
+      rows: [operationItem('pending', 1)],
+    });
+    if (hideResults) database.loseNextBatch();
+    const accepted = await lease.commitProgress(input);
+    const afterAcceptance = await operationSnapshot(db, id);
+    if (hideResults) database.loseNextBatch();
+    const replay = await lease.commitProgress(input);
+    return {
+      before,
+      afterRefusal,
+      refused,
+      accepted,
+      afterAcceptance,
+      replay,
+      afterReplay: await operationSnapshot(db, id),
     };
   });
 }
@@ -3882,6 +4021,21 @@ export default {
           return Response.json(await operationCommitWatermark(env.DB));
         case 'operation-commit-row-update':
           return Response.json(await operationCommitRowUpdate(env.DB));
+        case 'operation-commit-immutable-conflict':
+          return Response.json(
+            await operationCommitImmutableConflict(
+              env.DB,
+              (body.input as { hideResults: boolean }).hideResults,
+              (body.input as { viaStage: boolean }).viaStage,
+            ),
+          );
+        case 'operation-commit-missing-update':
+          return Response.json(
+            await operationCommitMissingUpdate(
+              env.DB,
+              (body.input as { hideResults: boolean }).hideResults,
+            ),
+          );
         case 'operation-finalize-convergence':
           return Response.json(await operationFinalizeConvergence(env.DB));
         case 'operation-rows-readback':

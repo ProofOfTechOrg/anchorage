@@ -36,9 +36,6 @@ const OPERATION_TABLE = 'anchorage_fleet_operations';
 const ROW_TABLE = 'anchorage_fleet_operation_rows';
 const LEASE_TTL_MS = 15 * 60_000;
 const LEASE_RENEWAL_INTERVAL_MS = 5 * 60_000;
-// Byte-identical to state-store.ts:134. The Wrangler harness lease clock
-// rewrites exactly this substring, so every SQL string in this module must
-// express database time with this token and no other time expression.
 const DB_NOW_MS = "CAST(unixepoch('subsec') * 1000 AS INTEGER)";
 const LIMIT_MAX = 1_000;
 const KIND_CHECK = FLEET_OPERATION_KINDS.map((kind) => `'${kind}'`).join(',');
@@ -54,12 +51,22 @@ const OPERATION_GUARD_SQL = `FROM ${OPERATION_TABLE} r
         AND json_extract(r.op_record, '$.state') = 'running'
         AND json_extract(r.op_record, '$.progress.revision') = ?
         AND ${LEASE_EXISTS_SQL}`;
-const ROWS_BELOW_ORDINAL_SQL = `FROM ${ROW_TABLE}
-          WHERE account_id = ? AND operation_id = ?
-            AND row_kind = ? AND ordinal < ?`;
-// The row statements of a commitProgress batch mutate this same table, so the
-// inner scan is aliased: the outer statement's columns cannot capture it.
-const ALIASED_ROWS_BELOW_ORDINAL_SQL = `FROM ${ROW_TABLE} w0
+// Exact restaging skips the insert. A different payload retains the
+// unique-key failure so the database rolls back sibling writes.
+const INSERT_STAGED_ROW_SQL = `WITH proposed(account_id, operation_id, row_kind, ordinal, payload)
+          AS (VALUES (?, ?, ?, ?, ?))
+        INSERT INTO ${ROW_TABLE} (
+          account_id, operation_id, row_kind, ordinal, payload
+        )
+        SELECT p.account_id, p.operation_id, p.row_kind, p.ordinal, p.payload
+        FROM proposed p
+        WHERE EXISTS (SELECT 1 ${OPERATION_GUARD_SQL})
+        AND NOT EXISTS (SELECT 1 FROM ${ROW_TABLE} staged
+          WHERE staged.account_id = p.account_id
+            AND staged.operation_id = p.operation_id
+            AND staged.row_kind = p.row_kind AND staged.ordinal = p.ordinal
+            AND staged.payload = p.payload)`;
+const ROWS_BELOW_ORDINAL_SQL = `FROM ${ROW_TABLE} w0
           WHERE w0.account_id = ? AND w0.operation_id = ?
             AND w0.row_kind = ? AND w0.ordinal < ?`;
 
@@ -127,7 +134,7 @@ function assertLimit(limit: number): void {
   }
 }
 
-function assertKind(kind: FleetOperationKind): void {
+function assertPersistedKind(kind: FleetOperationKind): void {
   if (!FLEET_OPERATION_KINDS.includes(kind)) {
     throw new FleetOperationStateError();
   }
@@ -197,20 +204,9 @@ function serializedPayload(row: FleetOperationStagedRow): string {
     : JSON.stringify(row.payload);
 }
 
-/**
- * The watermark bindings of one `commitProgress` batch. Every row statement
- * binds the PRE-state dense prefix `COUNT(kind k, ordinal < w - Bk) = w - Bk`,
- * where `Bk` counts the batch's own kind-k inserts below the watermark `w`;
- * those inserts all sit at ordinals at or above `w - Bk`, so no statement in
- * the batch can move a count another statement reads, and on this conjunct
- * the batch passes or refuses whole. The lease conjunct is still re-evaluated
- * per statement, so this is not batch-level atomicity. The run update binds
- * the post-state `COUNT(< w) = w`, which then holds exactly when every
- * ordinal in `[w - Bk, w)` landed or already existed. The contiguous-run
- * precondition is what makes the prefix invariant, so a caller that breaks it
- * is refused here, before any SQL, rather than given a weaker guard.
- */
-function commitWatermarkBindings(
+// The pre-state prefix excludes this batch's inserts so sibling statements
+// cannot change one another's watermark precondition.
+function validateCommitWatermarks(
   watermarks: readonly [FleetOperationRowKind, number][],
   insertRows: readonly FleetOperationStagedRow[],
   accountId: string,
@@ -409,11 +405,6 @@ export class D1FleetOperationStore implements FleetOperationStore {
     const lease: FleetOperationLease = {
       assertOwned,
       startOperation: (value) => this.#startOperation(kind, token, value),
-      // Deliberate delegation: the leased reader is the head-independent,
-      // kind-blind one, so it reaches a terminal row after head release and a
-      // row of the other kind. A coordinator's own `readOperationById` call on
-      // its continue path is defence in depth, not the only route to such a
-      // row.
       readOperation: (operationId) => this.readOperationById(operationId),
       stageRows: (value) => this.#stageRows(kind, token, value),
       commitProgress: (value) => this.#commitProgress(kind, token, value),
@@ -666,13 +657,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
       );
       await this.#db.batch(
         batch.map((row) => ({
-          sql: `INSERT INTO ${ROW_TABLE} (
-            account_id, operation_id, row_kind, ordinal, payload
-          )
-          SELECT ?, ?, ?, ?, ?
-          ${OPERATION_GUARD_SQL}
-          ON CONFLICT (account_id, operation_id, row_kind, ordinal) DO NOTHING
-          RETURNING row_kind, ordinal`,
+          sql: `${INSERT_STAGED_ROW_SQL} RETURNING row_kind, ordinal`,
           bindings: [
             this.#accountId,
             operationId,
@@ -742,7 +727,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
         throw new FleetOperationStateError();
       }
     }
-    const watermarkBindings = commitWatermarkBindings(
+    const watermarkBindings = validateCommitWatermarks(
       watermarks,
       rows,
       this.#accountId,
@@ -760,29 +745,32 @@ export class D1FleetOperationStore implements FleetOperationStore {
       operationId,
       expectedRevision,
     );
-    // A retry may stage byte-identical later members before this transition;
-    // later watermarks and finalize's totals cover those surplus ordinals.
     const watermarkSql = watermarks
       .map(() => `AND (SELECT COUNT(*) ${ROWS_BELOW_ORDINAL_SQL}) = ?`)
       .join('\n');
-    const rowWatermarkSql = watermarks
-      .map(() => `AND (SELECT COUNT(*) ${ALIASED_ROWS_BELOW_ORDINAL_SQL}) = ?`)
-      .join('\n');
-    // Every row mutation carries the SAME lease, kind, state, and PRE-update
-    // revision guard as the operation update, so stale or losing writers land
-    // no bytes that a later legitimate commit cannot replace, and the
-    // dense-prefix count of every claimed watermark, so a watermark this
-    // transition cannot satisfy refuses every statement and persists nothing.
+    // Insert and update keys are disjoint, so this batch cannot create a
+    // missing update target after a sibling statement has refused it.
+    const updateTargetsSql = updateRows.length
+      ? `AND NOT EXISTS (
+          SELECT 1 FROM json_each(?) required
+          WHERE NOT EXISTS (SELECT 1 FROM ${ROW_TABLE} target
+            WHERE target.account_id = ? AND target.operation_id = ?
+              AND target.row_kind = 'item' AND target.ordinal = required.value)
+        )`
+      : '';
+    const updateTargetBindings = updateRows.length
+      ? [
+          JSON.stringify(updateRows.map((row) => row.ordinal)),
+          this.#accountId,
+          operationId,
+        ]
+      : [];
     const result = await this.#db.batch([
       ...insertPayloads.map(({ row, bytes }) => ({
-        sql: `INSERT INTO ${ROW_TABLE} (
-          account_id, operation_id, row_kind, ordinal, payload
-        )
-        SELECT ?, ?, ?, ?, ?
-        ${OPERATION_GUARD_SQL}
-        ${rowWatermarkSql}
-        ON CONFLICT (account_id, operation_id, row_kind, ordinal) DO NOTHING
-        RETURNING row_kind, ordinal`,
+        sql: `${INSERT_STAGED_ROW_SQL}
+          ${watermarkSql}
+          ${updateTargetsSql}
+          RETURNING row_kind, ordinal`,
         bindings: [
           this.#accountId,
           operationId,
@@ -791,6 +779,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
           bytes,
           ...guardBindings,
           ...watermarkBindings.rowStatement,
+          ...updateTargetBindings,
         ],
       })),
       ...updatePayloads.map(({ row, bytes }) => ({
@@ -799,7 +788,8 @@ export class D1FleetOperationStore implements FleetOperationStore {
           WHERE account_id = ? AND operation_id = ?
             AND row_kind = ? AND ordinal = ?
             AND EXISTS (SELECT 1 ${OPERATION_GUARD_SQL})
-            ${rowWatermarkSql}
+            ${watermarkSql}
+            ${updateTargetsSql}
           RETURNING row_kind, ordinal`,
         bindings: [
           bytes,
@@ -809,6 +799,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
           row.ordinal,
           ...guardBindings,
           ...watermarkBindings.rowStatement,
+          ...updateTargetBindings,
         ],
       })),
       {
@@ -820,6 +811,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
             AND json_extract(op_record, '$.progress.revision') = ?
             AND ${LEASE_EXISTS_SQL}
             ${watermarkSql}
+            ${updateTargetsSql}
           RETURNING operation_id`,
         bindings: [
           JSON.stringify(runRecord),
@@ -829,6 +821,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
           expectedRevision,
           ...this.#leaseBindings(kind, token),
           ...watermarkBindings.runUpdate,
+          ...updateTargetBindings,
         ],
       },
     ]);
@@ -836,73 +829,9 @@ export class D1FleetOperationStore implements FleetOperationStore {
     if (written.length === 1 && written[0]?.operation_id === operationId) {
       return runRecord;
     }
-    // Insert RETURNING proves nothing either way: DO NOTHING and guard misses
-    // both return no rows, so convergence must re-query every authority.
     return this.#commitConverged(operationId, runRecord, payloads, watermarks);
   }
 
-  /**
-   * Classifies a `commitProgress` batch whose run update returned no rows,
-   * by re-querying every persisted authority. Every firing point, in the
-   * order it is reached here:
-   *
-   * 1. no operation row at all -> `unknownOperation`. Read FIRST, so a
-   *    PRUNED operation reports its own identity instead of whatever claim
-   *    happens to fail against its deleted rows: prune drops the rows and
-   *    the record in one batch, so every NON-ZERO watermark claim over a
-   *    pruned operation is unsatisfiable (a claim of zero is satisfied by
-   *    no rows at all);
-   * 2. a claimed `expectedRowWatermarks` entry the persisted rows do not
-   *    satisfy -> `operationConflict`: the persisted transition demonstrably
-   *    did not carry this call's precondition;
-   * 3. a persisted run record that is not this call's intended transition ->
-   *    `operationConflict`: a different transition landed (another actor's
-   *    abandonment, another step, a lost race). The revision alone does not
-   *    discriminate that, because abandonment targets the SAME revision a
-   *    stale in-flight commit intends; the run record does;
-   * 4. the intended run record persisted while a TARGET ROW carries other
-   *    bytes -> `operationDivergence`;
-   * 5. the intended run record persisted while a target row is MISSING ->
-   *    `operationConflict` at the `complete` guard: a guard-refused row
-   *    statement returns zero rows without throwing, and `batch()` rolls
-   *    back only on a THROWN statement, so the run update can land while a
-   *    row statement of the same batch does not.
-   *
-   * Reaching none of the five means the transition converged. The call
-   * whose OWN batch landed while its response was lost passes the
-   * run-record equality without replaying anything: `intended` IS the
-   * record that call just persisted, no rebuild involved. It converges
-   * when the persisted target rows are its own, and it halts on
-   * divergence when an earlier landed row at the same ordinal carries
-   * other bytes — the case the paragraph below walks. A replay of that
-   * identical composed object behaves the same way.
-   *
-   * A record recomposed with a fresh `updatedAt` never converges, because
-   * the equality is whole-record: that restamp is the shipped audit
-   * coordinator's convention (`fleet-audit-advance.ts`, at each of its
-   * four `commitProgress` records), and it is what makes a lost race
-   * between two drivers of the same audit transition read a CONFLICT. A
-   * recomposed retry of the SAME transition would read one too, but that
-   * coordinator never composes one: it re-derives the NEXT transition
-   * from the persisted record. A record recomposed DETERMINISTICALLY from
-   * the persisted record is byte-identical instead, so it passes the
-   * equality and converges, and a re-derived retry under that rule
-   * reaches divergence when its rows differ. The restamp is a convention
-   * no type or test enforces — the same file composes the START record's
-   * `updatedAt` deterministically from the audit clock.
-   *
-   * Identities 1-3 running ahead of the row bytes narrowed divergence but
-   * did NOT empty it. It means the persisted run record is exactly this
-   * call's intended transition while a target row carries other bytes,
-   * which out-of-band mutation of the row table reaches, and so does a
-   * sanctioned sequence: a lease expiring mid-batch lands an earlier row
-   * statement while the run update refuses, a later attempt composes other
-   * bytes for that ordinal, and that attempt's own batch lands (`DO NOTHING`
-   * keeps the earlier bytes) with its response lost. It stays a halt because
-   * the persisted rows are then not the persisted transition's rows. This
-   * was never a corruption DETECTOR in any case — it only ever cross-checked
-   * the rows one refused batch happened to target.
-   */
   async #commitConverged(
     operationId: string,
     intended: FleetOperationRunRecord,
@@ -925,10 +854,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
     }
     // Progress uses plain JSON equality; coordinators must build it in stable
     // key order so a byte-identical replay can converge.
-    if (
-      persisted.progress.revision !== intended.progress.revision ||
-      JSON.stringify(persisted) !== JSON.stringify(intended)
-    ) {
+    if (JSON.stringify(persisted) !== JSON.stringify(intended)) {
       throw operationConflict(operationId);
     }
     let complete = true;
@@ -1097,9 +1023,6 @@ export class D1FleetOperationStore implements FleetOperationStore {
   ): Promise<void> {
     const { operationId, expectedRevision } = input;
     const runRecord = fleetOperationRunRecordFromUnknown(input.runRecord);
-    // The sanctioned caller fails exactly the active item, and at n = 1 the
-    // item update and the run update are atomic by construction: the run
-    // update's byte-exact EXISTS conjunct is true only if that one row landed.
     if ((input.updateRows?.length ?? 0) > 1) {
       throw new Error('failOperation accepts at most one updateRow');
     }
@@ -1243,7 +1166,6 @@ export class D1FleetOperationStore implements FleetOperationStore {
     Readonly<{ rows: readonly FleetOperationStagedRow[]; done: boolean }>
   > {
     assertLimit(input.limit);
-    await this.#ensureSchema();
     if (!FLEET_OPERATION_ROW_KINDS.includes(input.rowKind)) {
       throw new Error(
         `rowKind must be one of ${FLEET_OPERATION_ROW_KINDS.join(', ')}`,
@@ -1258,10 +1180,11 @@ export class D1FleetOperationStore implements FleetOperationStore {
         'afterOrdinal must be a non-negative safe integer below Number.MAX_SAFE_INTEGER',
       );
     }
+    await this.#ensureSchema();
     const operation = await this.#operationRow(input.operationId);
     if (!operation) throw unknownOperation(input.operationId);
     const kind = rowString(operation, 'operation_kind') as FleetOperationKind;
-    assertKind(kind);
+    assertPersistedKind(kind);
     const stored = await this.#db.query(
       `SELECT row_kind, ordinal, payload FROM ${ROW_TABLE}
         WHERE account_id = ? AND operation_id = ? AND row_kind = ?

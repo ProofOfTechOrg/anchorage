@@ -19,6 +19,22 @@ interface ProbeError {
   readonly errors?: readonly ProbeError[];
 }
 
+interface OperationSnapshot {
+  revision: number | null;
+  record: string | null;
+  rows: Array<{ row_kind: string; ordinal: number; payload: string }>;
+}
+
+interface OperationCommitProbe {
+  before: OperationSnapshot;
+  afterRefusal: OperationSnapshot;
+  refused: ProbeError | null;
+  accepted: { progress: { revision: number } };
+  afterAcceptance: OperationSnapshot;
+  replay: { progress: { revision: number } };
+  afterReplay: OperationSnapshot;
+}
+
 interface CleanupTerminalProbe {
   stale: ProbeError | undefined;
   rowPhaseAfterStale: string | null;
@@ -122,11 +138,6 @@ function harnessOptions() {
 }
 
 describe.sequential('D1FleetStateStore Wrangler harness', {
-  // Real workerd + D1 through Wrangler: the two-pass R2 detach/deletion title
-  // timed out at a 30 s cap inside the full package suite and has since needed
-  // as much as 45.2 s in a six-file run; 150 s keeps a 3x margin over that.
-  // The hooks below repeat this value because hooks take vitest's hookTimeout,
-  // not this option; every title inherits it.
   timeout: 150_000,
 }, () => {
   let server: TestHarness;
@@ -1172,9 +1183,6 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
     ).resolves.toEqual({ blocked: true, count: 1_100 });
   });
 
-  // Resetting the server recreates storage and rebinds `worker`,
-  // so this case stays last.
-
   it('completes a cleanup terminal atomically with a receipt, claims release, and row delete', async () => {
     const result = await probe<CleanupTerminalProbe>(
       'cleanup-terminal-receipt',
@@ -1358,8 +1366,6 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
       revision: 2,
       staleReplay: 'conflict',
     });
-    // The guarded staging inserts fence every loser out, so only the winner's
-    // own meta ordinal and the later trailing chunk's row exist.
     expect(result.rowCounts).toEqual([
       { kind: 'deployment', count: 1 },
       { kind: 'finding', count: 1 },
@@ -1561,38 +1567,209 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
     expect(result.noSecondAdvance).toBe(true);
   });
 
-  it('commitProgress watermark conjuncts against real D1 (an unsatisfiable claim lands no row and does not advance the revision; a dense prefix commits)', async () => {
-    await expect(
-      probe<{
-        refused: ProbeError;
-        revisionAfterRefusal: number;
-        findingsAfterRefusal: number;
-        acceptedRevision: number;
-        rowOrdinals: number[];
-      }>('operation-commit-watermark'),
-    ).resolves.toEqual({
-      refused: {
-        name: 'Error',
-        message:
-          "fleet operation '123e4567-e89b-42d3-a456-426614174305' is no longer at the expected revision",
-      },
-      revisionAfterRefusal: 0,
-      findingsAfterRefusal: 0,
-      acceptedRevision: 1,
-      rowOrdinals: [0, 1, 2],
-    });
+  it('commitProgress watermark conjuncts (an unsatisfiable claim lands no row and does not advance the revision; a dense prefix commits)', async () => {
+    const result = await probe<
+      OperationCommitProbe & {
+        beforeFindingRefusal: OperationSnapshot;
+        afterFindingRefusal: OperationSnapshot;
+        findingRefused: ProbeError | null;
+      }
+    >('operation-commit-watermark');
+    expect(result.beforeFindingRefusal.revision).toBe(0);
+    expect(result.beforeFindingRefusal.rows).toEqual([]);
+    expect(result.afterFindingRefusal).toEqual(result.beforeFindingRefusal);
+    expect(result.before.revision).toBe(0);
+    expect(result.before.rows).toEqual([
+      { row_kind: 'fact', ordinal: 1, payload: expect.any(String) },
+      { row_kind: 'finding', ordinal: 0, payload: expect.any(String) },
+    ]);
+    expect(result.afterRefusal).toEqual(result.before);
+    const conflict = {
+      name: 'Error',
+      message:
+        "fleet operation '123e4567-e89b-42d3-a456-426614174305' is no longer at the expected revision",
+    };
+    expect(result.findingRefused).toEqual(conflict);
+    expect(result.refused).toEqual(conflict);
+    expect(result.accepted.progress.revision).toBe(1);
+    expect(result.afterAcceptance.revision).toBe(1);
+    expect(result.afterAcceptance.rows).toEqual([
+      { row_kind: 'fact', ordinal: 0, payload: expect.any(String) },
+      result.before.rows[0],
+      { row_kind: 'fact', ordinal: 2, payload: expect.any(String) },
+      result.before.rows[1],
+      { row_kind: 'finding', ordinal: 1, payload: expect.any(String) },
+      { row_kind: 'finding', ordinal: 2, payload: expect.any(String) },
+    ]);
+    expect(result.replay).toEqual(result.accepted);
+    expect(result.afterReplay).toEqual(result.afterAcceptance);
   });
 
-  it("commitProgress row-UPDATE dense prefix against real D1 (a satisfiable item watermark commits the update the audit probe's kind cannot carry)", async () => {
-    await expect(
-      probe<{
-        acceptedRevision: number;
-        itemStatus: string;
-      }>('operation-commit-row-update'),
-    ).resolves.toEqual({
-      acceptedRevision: 1,
-      itemStatus: 'active',
+  it('commitProgress row-UPDATE dense prefix (updates ordinal 1 while preserving ordinal 0 under an item watermark of 2)', async () => {
+    const result = await probe<{
+      before: OperationSnapshot;
+      afterAcceptance: OperationSnapshot;
+      acceptedRevision: number;
+      items: Array<{
+        rowKind: string;
+        ordinal: number;
+        payload: Record<string, unknown>;
+      }>;
+    }>('operation-commit-row-update');
+    expect(result.before.revision).toBe(0);
+    expect(result.before.rows).toEqual([
+      { row_kind: 'item', ordinal: 0, payload: expect.any(String) },
+      { row_kind: 'item', ordinal: 1, payload: expect.any(String) },
+    ]);
+    expect(result.acceptedRevision).toBe(1);
+    expect(result.afterAcceptance.revision).toBe(1);
+    expect(result.afterAcceptance.rows).toEqual([
+      result.before.rows[0],
+      { row_kind: 'item', ordinal: 1, payload: expect.any(String) },
+    ]);
+    expect(result.items).toEqual([
+      {
+        rowKind: 'item',
+        ordinal: 0,
+        payload: {
+          ordinal: 0,
+          tenantTag: 'tenant',
+          environment: 'production',
+          entryRecordDigest: 'c'.repeat(64),
+          status: 'pending',
+        },
+      },
+      {
+        rowKind: 'item',
+        ordinal: 1,
+        payload: {
+          ordinal: 1,
+          tenantTag: 'tenant',
+          environment: 'production',
+          entryRecordDigest: 'c'.repeat(64),
+          targetSpecDigest: 'd'.repeat(64),
+          plan: [{ step: 'promote' }],
+          planCursor: 0,
+          status: 'active',
+        },
+      },
+    ]);
+  });
+
+  it.each([
+    { delivery: 'ordinary', viaStage: false },
+    { delivery: 'hidden', viaStage: false },
+    { delivery: 'ordinary', viaStage: true },
+    { delivery: 'hidden', viaStage: true },
+  ] as const)('commitProgress immutable conflict rolls back an earlier insert and accepts exact staged bytes with $delivery results (stageRows $viaStage)', async ({
+    delivery,
+    viaStage,
+  }) => {
+    const result = await probe<OperationCommitProbe>(
+      'operation-commit-immutable-conflict',
+      { hideResults: delivery === 'hidden', viaStage },
+    );
+    expect(result.before.revision).toBe(0);
+    expect(result.before.rows).toEqual([
+      {
+        row_kind: 'finding',
+        ordinal: 1,
+        payload: JSON.stringify({
+          tenantTag: 'tenant',
+          environment: 'production',
+          kind: 'audit-error',
+          detail: 'safe finding 1',
+        }),
+      },
+    ]);
+    expect(result.afterRefusal).toEqual(result.before);
+    expect(result.refused).toMatchObject({
+      message: expect.stringContaining('UNIQUE constraint failed'),
     });
+    expect(result.accepted.progress.revision).toBe(1);
+    expect(result.afterAcceptance.revision).toBe(1);
+    expect(result.afterAcceptance.rows).toEqual([
+      {
+        row_kind: 'finding',
+        ordinal: 0,
+        payload: JSON.stringify({
+          tenantTag: 'tenant',
+          environment: 'production',
+          kind: 'audit-error',
+          detail: 'safe finding 0',
+        }),
+      },
+      result.before.rows[0],
+    ]);
+    expect(result.accepted).toEqual(
+      JSON.parse(result.afterAcceptance.record ?? 'null'),
+    );
+    expect(result.replay).toEqual(result.accepted);
+    expect(result.afterReplay).toEqual(result.afterAcceptance);
+  });
+
+  it.each([
+    'ordinary',
+    'hidden',
+  ] as const)('commitProgress missing update target preserves the batch and permits repaired update/insert replay with %s results', async (delivery) => {
+    const result = await probe<OperationCommitProbe>(
+      'operation-commit-missing-update',
+      { hideResults: delivery === 'hidden' },
+    );
+    expect(result.before.revision).toBe(0);
+    expect(result.before.rows).toEqual([
+      {
+        row_kind: 'item',
+        ordinal: 0,
+        payload: JSON.stringify({
+          ordinal: 0,
+          tenantTag: 'tenant',
+          environment: 'production',
+          entryRecordDigest: 'c'.repeat(64),
+          status: 'pending',
+        }),
+      },
+    ]);
+    expect(result.afterRefusal).toEqual(result.before);
+    expect(result.refused).toEqual({
+      name: 'Error',
+      message:
+        "fleet operation '123e4567-e89b-42d3-a456-426614174308' is no longer at the expected revision",
+    });
+    expect(result.accepted.progress.revision).toBe(1);
+    expect(result.afterAcceptance.revision).toBe(1);
+    expect(result.afterAcceptance.rows).toEqual([
+      ...[0, 1].map((ordinal) => ({
+        row_kind: 'item',
+        ordinal,
+        payload: JSON.stringify({
+          ordinal,
+          tenantTag: 'tenant',
+          environment: 'production',
+          entryRecordDigest: 'c'.repeat(64),
+          targetSpecDigest: 'd'.repeat(64),
+          plan: [{ step: 'promote' }],
+          planCursor: 0,
+          status: 'active',
+        }),
+      })),
+      {
+        row_kind: 'item',
+        ordinal: 2,
+        payload: JSON.stringify({
+          ordinal: 2,
+          tenantTag: 'tenant',
+          environment: 'production',
+          entryRecordDigest: 'c'.repeat(64),
+          status: 'pending',
+        }),
+      },
+    ]);
+    expect(result.accepted).toEqual(
+      JSON.parse(result.afterAcceptance.record ?? 'null'),
+    );
+    expect(result.replay).toEqual(result.accepted);
+    expect(result.afterReplay).toEqual(result.afterAcceptance);
   });
 
   it('finalize convergence', async () => {

@@ -297,7 +297,9 @@ export interface FleetOperationLease {
   ): Promise<FleetOperationRunRecord | undefined>;
   /**
    * Appends staged rows without advancing the revision, refusing unless the
-   * persisted revision still equals `expectedRevision`.
+   * persisted revision still equals `expectedRevision`. Existing keys must
+   * retain byte-identical payloads. A conflicting key rolls back its batch;
+   * earlier completed batches remain staged.
    *
    * WRITER OBLIGATION: rows must be supplied in ascending ordinal order
    * within each row kind, and the implementation must persist them in array
@@ -313,22 +315,18 @@ export interface FleetOperationLease {
     }>,
   ): Promise<void>;
   /**
-   * Compare-and-set advance of one operation: refuses unless the persisted
-   * revision equals `expectedRevision`, then writes `runRecord`, appends
-   * `rows`, and replaces the payloads of `updateRows` — `item` rows only — in
-   * the same transaction. For each named kind `expectedRowWatermarks` asserts
-   * that the first N ordinals are all present after the write — a dense-prefix
-   * check rather than a total count — so a partially applied batch is refused
-   * while a retry that already staged rows at higher ordinals still commits;
-   * a later call's higher watermark, or `finalizeOperation`'s totals, close
-   * those surplus ordinals out.
+   * Advances `expectedRevision` to `runRecord` with staged row mutations.
+   * Existing `rows` keys must have byte-identical payloads; `updateRows`
+   * requires existing `item` targets. A mismatching insert or missing update
+   * target refuses progress and sibling row mutations.
    *
-   * WRITER OBLIGATION: the `rows` this call inserts below a claimed watermark
-   * must be exactly the contiguous run ending at it; a batch that breaks it is
-   * refused before any statement runs.
+   * For each `expectedRowWatermarks` kind, the first N ordinals must be
+   * present after the write. Supplied inserts below that watermark must form
+   * the contiguous run ending at it; higher staged ordinals remain available
+   * to a later transition.
    *
-   * Returns the persisted record, which is the only authoritative post-commit
-   * state.
+   * Returns the persisted intended record. A replay must retain stable JSON
+   * key order to converge after an uncertain response.
    */
   commitProgress(
     input: Readonly<{
@@ -367,10 +365,7 @@ export interface FleetOperationLease {
    * failed operation stays readable; `updateRows` replaces one `item` row's
    * payload in the same transaction.
    *
-   * WRITER OBLIGATION: at most one `updateRow`, the item the failure names.
-   * `D1FleetOperationStore` refuses more with `failOperation accepts at most
-   * one updateRow`: the run update's byte-exact `EXISTS` conjunct makes the
-   * item update and the run update stand or fall together only at n = 1.
+   * Supply at most one update row: the item named by the failure.
    */
   failOperation(
     input: Readonly<{

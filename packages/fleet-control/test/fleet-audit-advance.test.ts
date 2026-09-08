@@ -762,37 +762,13 @@ class FakeInventoryRunStore implements FleetInventoryRunStore {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Fake FleetOperationStore/FleetOperationLease: an in-memory, deliberately
-// faithful reimplementation of the R4-A guarded-batch contract (head/lease
-// exclusivity, DO-NOTHING staging, revision-guarded commit with a
-// byte-identical convergence read, watermark verification, probe-first
-// start classification). `lease.readOperation` is deliberately HEAD-SCOPED
-// (stricter than the shipped D1 adapter) so the coordinator's probe-first
-// fallback to the head-independent `readOperationById` is genuinely
-// exercised, not merely accepted by coincidence.
-//
-// TWO DELIBERATE SOFTNESSES, stated rather than reproduced, because closing
-// either would change what this suite's worlds exercise rather than what the
-// coordinator does:
-//
-//  - ROW VALIDATION. `#validatedRows` runs `fleetOperationStagedRowFromUnknown`
-//    only. `d1-fleet-operation-store.ts`'s `stagedRowForKindFromUnknown`
-//    additionally rejects an `item` row under the audit kind and re-parses a
-//    `finding`/`fact` payload through `driftFindingRowFromUnknown` /
-//    `fleetAuditFactRowFromUnknown`. A payload this fake accepts can therefore
-//    be one the shipped store would refuse; the write-side gate that matters
-//    is pinned against the real codecs by the titles that read rows back.
-//  - STAGING REVISION. `#stageRows` ignores `expectedRevision` entirely, where
-//    D1 binds it into `OPERATION_GUARD_SQL` on every insert. The adopted-running
-//    start path stages under `expectedRevision: 0` against a possibly-advanced
-//    operation; on that guard miss the real store silently inserts nothing.
-//    The operation can only have advanced past revision 0 after this same
-//    staging ran, so under the pinned intake digest the rows are already
-//    present at the same ordinals and this fake's own ordinal check drops
-//    them too — an unmodelled guard, not a live divergence.
-// ---------------------------------------------------------------------------
+function payloadBytes(row: FleetOperationStagedRow): string {
+  return row.rowKind === 'record'
+    ? canonicalFleetOperationBytes(row.payload)
+    : JSON.stringify(row.payload);
+}
 
+// Head-scoped lease reads exercise the coordinator's head-independent fallback.
 class FakeOperationStore implements FleetOperationStore {
   readonly heads = new Map<FleetOperationKind, string>();
   readonly operations = new Map<string, FleetOperationRunRecord>();
@@ -952,13 +928,26 @@ class FakeOperationStore implements FleetOperationStore {
   #stageRows(input: Parameters<FleetOperationLease['stageRows']>[0]): void {
     const { operationId } = input;
     const rows = this.#validatedRows(input.rows);
-    for (const row of rows) {
-      const key = this.#rowsKey(operationId, row.rowKind);
-      const list = this.rows.get(key) ?? [];
-      if (!list.some((existing) => existing.ordinal === row.ordinal)) {
-        list.push(row);
-        this.rows.set(key, list);
+    for (
+      let offset = 0;
+      offset < rows.length;
+      offset += FLEET_OPERATION_STAGE_BATCH_STATEMENTS
+    ) {
+      const staged = new Map<string, FleetOperationStagedRow[]>();
+      for (const row of rows.slice(
+        offset,
+        offset + FLEET_OPERATION_STAGE_BATCH_STATEMENTS,
+      )) {
+        const key = this.#rowsKey(operationId, row.rowKind);
+        const list = staged.get(key) ?? [...(this.rows.get(key) ?? [])];
+        const existing = list.find((prior) => prior.ordinal === row.ordinal);
+        if (existing && payloadBytes(existing) !== payloadBytes(row)) {
+          throw new Error('immutable operation row payload differs');
+        }
+        if (!existing) list.push(row);
+        staged.set(key, list);
       }
+      for (const [key, list] of staged) this.rows.set(key, list);
     }
   }
 
@@ -1009,13 +998,6 @@ class FakeOperationStore implements FleetOperationStore {
       current.state === 'running' &&
       current.progress.revision === expectedRevision;
     if (matches) {
-      // D1 binds every claimed watermark into the same guarded batch, so a
-      // claim the post-insert row set cannot satisfy refuses the whole commit
-      // before anything persists. Evaluated BEFORE the mutations below, and on
-      // the matching branch as well as the convergence one: otherwise the
-      // coordinator's watermark claims run against no enforcing implementation
-      // on the path its titles actually take. The input-prefix precondition
-      // above applies to both branches, as it does before the real D1 batch.
       for (const [rowKind, watermark] of Object.entries(
         expectedRowWatermarks,
       )) {
@@ -1036,6 +1018,22 @@ class FakeOperationStore implements FleetOperationStore {
           throw new Error(
             `fleet operation '${operationId}' is no longer at the expected revision`,
           );
+        }
+      }
+      for (const row of updateRows) {
+        const list = this.rows.get(this.#rowsKey(operationId, row.rowKind));
+        if (!list?.some((existing) => existing.ordinal === row.ordinal)) {
+          throw new Error(
+            `fleet operation '${operationId}' is no longer at the expected revision`,
+          );
+        }
+      }
+      for (const row of rows) {
+        const stored = this.rows
+          .get(this.#rowsKey(operationId, row.rowKind))
+          ?.find((existing) => existing.ordinal === row.ordinal);
+        if (stored && payloadBytes(stored) !== payloadBytes(row)) {
+          throw new Error('immutable operation row payload differs');
         }
       }
       for (const row of rows) {
@@ -1087,7 +1085,7 @@ class FakeOperationStore implements FleetOperationStore {
       const list = this.rows.get(key) ?? [];
       const stored = list.find((existing) => existing.ordinal === row.ordinal);
       if (!stored) complete = false;
-      else if (JSON.stringify(stored.payload) !== JSON.stringify(row.payload)) {
+      else if (payloadBytes(stored) !== payloadBytes(row)) {
         throw new Error(
           `fleet operation '${operationId}' staged rows diverge from the persisted operation`,
         );
@@ -1169,6 +1167,9 @@ class FakeOperationStore implements FleetOperationStore {
     input: Parameters<FleetOperationLease['failOperation']>[0],
   ): Promise<void> {
     const { operationId, expectedRevision, runRecord, updateRows = [] } = input;
+    if (updateRows.length > 1) {
+      throw new Error('failOperation accepts at most one updateRow');
+    }
     const current = this.operations.get(operationId);
     if (
       current?.state !== 'running' ||
@@ -1199,41 +1200,42 @@ class FakeOperationStore implements FleetOperationStore {
 }
 
 describe('operation fake guarded progress contract', () => {
-  it('orders convergence identities and enforces both watermark writer obligations', async () => {
-    const operationId = uuidFor(990);
-    const initial = {
-      version: 1,
-      operationId,
+  const operationId = uuidFor(990);
+  const initial = {
+    version: 1,
+    operationId,
+    kind: 'migration',
+    state: 'running',
+    progress: {
       kind: 'migration',
-      state: 'running',
-      progress: {
-        kind: 'migration',
-        revision: 0,
-        itemCount: 1,
-        activeItemOrdinal: 0,
-        completedItemCount: 0,
-      },
-      updatedAt: '2026-09-05T00:00:00.000Z',
-    } as const;
-    const intended: FleetOperationRunRecord = {
-      ...initial,
-      progress: { ...initial.progress, revision: 1 },
-    };
-    const row: FleetOperationStagedRow = {
-      rowKind: 'item',
+      revision: 0,
+      itemCount: 1,
+      activeItemOrdinal: 0,
+      completedItemCount: 0,
+    },
+    updatedAt: '2026-09-05T00:00:00.000Z',
+  } as const;
+  const intended: FleetOperationRunRecord = {
+    ...initial,
+    progress: { ...initial.progress, revision: 1 },
+  };
+  const row: FleetOperationStagedRow = {
+    rowKind: 'item',
+    ordinal: 0,
+    payload: {
       ordinal: 0,
-      payload: {
-        ordinal: 0,
-        tenantTag: 'fake',
-        environment: 'production',
-        entryRecordDigest: 'a'.repeat(64),
-        status: 'pending',
-      },
-    };
-    const different = {
-      ...row,
-      payload: { ...row.payload, tenantTag: 'other' },
-    };
+      tenantTag: 'fake',
+      environment: 'production',
+      entryRecordDigest: 'a'.repeat(64),
+      status: 'pending',
+    },
+  };
+  const different = {
+    ...row,
+    payload: { ...row.payload, tenantTag: 'other' },
+  };
+
+  it('orders convergence identities and enforces both watermark writer obligations', async () => {
     for (const variant of [
       'missing-operation',
       'watermark',
@@ -1354,6 +1356,171 @@ describe('operation fake guarded progress contract', () => {
       expect(replay.operations.get(operationId)).toEqual(twoItems);
       expect(replay.rows.get(`${operationId}:item`)).toEqual([row, secondRow]);
     }
+  });
+
+  it('refuses missing updates and different immutable bytes before sibling writes, and accepts exact retries', async () => {
+    const secondRow = {
+      ...row,
+      ordinal: 1,
+      payload: { ...row.payload, ordinal: 1 },
+    };
+    const updated = {
+      ...secondRow,
+      payload: { ...secondRow.payload, tenantTag: 'updated' },
+    };
+    const sibling = {
+      ...row,
+      ordinal: 2,
+      payload: { ...row.payload, ordinal: 2 },
+    };
+    const missing = {
+      ...row,
+      ordinal: 3,
+      payload: { ...row.payload, ordinal: 3 },
+    };
+    for (const variant of ['missing-update', 'different-insert', 'exact']) {
+      const store = new FakeOperationStore();
+      store.operations.set(operationId, initial);
+      store.heads.set('migration', operationId);
+      store.rows.set(`${operationId}:item`, [row, secondRow]);
+      const input = {
+        operationId,
+        expectedRevision: 0,
+        runRecord: intended,
+        rows: [sibling, variant === 'different-insert' ? different : row],
+        updateRows:
+          variant === 'missing-update' ? [updated, missing] : [updated],
+        expectedRowWatermarks: { item: 1 },
+      };
+      await store.withAccountOperationLease('migration', async (lease) => {
+        const result = await lease
+          .commitProgress(input)
+          .catch((error: unknown) => error);
+        if (variant === 'exact') {
+          expect(store.operations.get(operationId)).toEqual(intended);
+          expect(store.rows.get(`${operationId}:item`)).toEqual([
+            row,
+            updated,
+            sibling,
+          ]);
+          expect(result).toEqual(intended);
+          expect(await lease.commitProgress(input)).toEqual(intended);
+          expect(store.operations.get(operationId)).toEqual(intended);
+          expect(store.rows.get(`${operationId}:item`)).toEqual([
+            row,
+            updated,
+            sibling,
+          ]);
+        } else {
+          expect(store.operations.get(operationId)).toEqual(initial);
+          expect(store.rows.get(`${operationId}:item`)).toEqual([
+            row,
+            secondRow,
+          ]);
+          expect(store.heads.get('migration')).toBe(operationId);
+          expect(result).toBeInstanceOf(Error);
+          if (variant === 'missing-update') {
+            expect(result).toHaveProperty(
+              'message',
+              `fleet operation '${operationId}' is no longer at the expected revision`,
+            );
+          }
+        }
+      });
+    }
+  });
+
+  it('compares record payloads canonically for fresh commits and convergence', async () => {
+    const record = baseRecord('canonical');
+    const stored: FleetOperationStagedRow = {
+      rowKind: 'record',
+      ordinal: 0,
+      payload: { ...record },
+    };
+    const reordered = {
+      ...stored,
+      payload: Object.fromEntries(Object.entries(record).reverse()),
+    };
+    expect(JSON.stringify(stored.payload)).not.toBe(
+      JSON.stringify(reordered.payload),
+    );
+    const auditInitial = {
+      ...initial,
+      kind: 'audit' as const,
+      progress: { kind: 'audit' as const, revision: 0 },
+    };
+    const auditIntended = {
+      ...auditInitial,
+      progress: { ...auditInitial.progress, revision: 1 },
+    };
+    const store = new FakeOperationStore();
+    store.operations.set(operationId, auditInitial);
+    store.rows.set(`${operationId}:record`, [stored]);
+    await store.withAccountOperationLease('audit', async (lease) => {
+      const input = {
+        operationId,
+        expectedRevision: 0,
+        runRecord: auditIntended,
+        rows: [reordered],
+        expectedRowWatermarks: { record: 1 },
+      };
+      const error = await lease
+        .commitProgress({
+          ...input,
+          rows: [
+            { ...stored, ordinal: 1 },
+            { ...stored, payload: { ...stored.payload, tenantTag: 'other' } },
+          ],
+        })
+        .catch((error: unknown) => error);
+      expect(store.operations.get(operationId)).toEqual(auditInitial);
+      expect(store.rows.get(`${operationId}:record`)).toEqual([stored]);
+      expect(error).toBeInstanceOf(Error);
+      for (let retry = 0; retry < 2; retry += 1) {
+        expect(await lease.commitProgress(input)).toEqual(auditIntended);
+        expect(store.operations.get(operationId)).toEqual(auditIntended);
+        expect(store.rows.get(`${operationId}:record`)).toEqual([stored]);
+        expect(JSON.stringify(store.rows.get(`${operationId}:record`))).toBe(
+          JSON.stringify([stored]),
+        );
+      }
+    });
+  });
+
+  it('refuses multiple failure updates before changing rows or releasing the head', async () => {
+    const secondRow = {
+      ...row,
+      ordinal: 1,
+      payload: { ...row.payload, ordinal: 1 },
+    };
+    const store = new FakeOperationStore();
+    store.operations.set(operationId, initial);
+    store.heads.set('migration', operationId);
+    store.rows.set(`${operationId}:item`, [row, secondRow]);
+    await store.withAccountOperationLease('migration', async (lease) => {
+      let error: unknown;
+      try {
+        await lease.failOperation({
+          operationId,
+          expectedRevision: 0,
+          runRecord: { ...intended, state: 'failed' },
+          updateRows: [row, secondRow].map((item) => ({
+            ...item,
+            payload: { ...item.payload, status: 'failed' },
+          })),
+        });
+      } catch (caught) {
+        error = caught;
+      }
+      expect(store.operations.get(operationId)).toEqual(initial);
+      expect(store.rows.get(`${operationId}:item`)).toEqual([row, secondRow]);
+      expect(store.heads.get('migration')).toBe(operationId);
+      expect(error).toBeInstanceOf(Error);
+      expect(error).toHaveProperty(
+        'message',
+        'failOperation accepts at most one updateRow',
+      );
+    });
   });
 });
 

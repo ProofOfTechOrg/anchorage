@@ -26,9 +26,11 @@ import {
   fleetMigrationItemFromUnknown,
 } from '../src/fleet-migration-state.js';
 import {
+  canonicalFleetOperationBytes,
   FLEET_OPERATION_INTAKE_BYTE_BOUND,
   FLEET_OPERATION_ITEM_BOUND,
   FLEET_OPERATION_RECORD_ROW_BYTE_BOUND,
+  FLEET_OPERATION_STAGE_BATCH_STATEMENTS,
   type FleetOperationKind,
   type FleetOperationLease,
   type FleetOperationRowKind,
@@ -99,6 +101,12 @@ const divergence = (id: string) =>
   new Error(
     `fleet operation '${id}' staged rows diverge from the persisted operation`,
   );
+
+function payloadBytes(row: FleetOperationStagedRow): string {
+  return row.rowKind === 'record'
+    ? canonicalFleetOperationBytes(row.payload)
+    : JSON.stringify(row.payload);
+}
 
 class MemoryOperationStore implements FleetOperationStore {
   readonly operations = new Map<string, FleetOperationRunRecord>();
@@ -174,7 +182,11 @@ class MemoryOperationStore implements FleetOperationStore {
           )
             return;
           const previous = new Map<FleetOperationRowKind, number>();
+          let batchBefore: FleetOperationStagedRow[] = [];
           for (const [index, row] of input.rows.entries()) {
+            if (index % FLEET_OPERATION_STAGE_BATCH_STATEMENTS === 0) {
+              batchBefore = [...(this.rows.get(input.operationId) ?? [])];
+            }
             if (index === this.stageLimit) {
               this.stageLimit = undefined;
               throw new Error('staging interrupted');
@@ -184,14 +196,18 @@ class MemoryOperationStore implements FleetOperationStore {
             previous.set(row.rowKind, row.ordinal);
             const validated = this.validateRow(row);
             const rows = this.rows.get(input.operationId) ?? [];
+            const existing = rows.find(
+              (prior) =>
+                prior.rowKind === row.rowKind && prior.ordinal === row.ordinal,
+            );
             if (
-              !rows.some(
-                (prior) =>
-                  prior.rowKind === row.rowKind &&
-                  prior.ordinal === row.ordinal,
-              )
-            )
-              rows.push(validated);
+              existing &&
+              payloadBytes(existing) !== payloadBytes(validated)
+            ) {
+              this.rows.set(input.operationId, batchBefore);
+              throw new Error('immutable operation row payload differs');
+            }
+            if (!existing) rows.push(validated);
             this.rows.set(input.operationId, rows);
           }
         },
@@ -259,6 +275,25 @@ class MemoryOperationStore implements FleetOperationStore {
               if (ordinals.size !== watermark)
                 throw conflict(input.operationId);
             }
+            for (const row of updates) {
+              if (
+                !persistedRows.some(
+                  (prior) =>
+                    prior.rowKind === row.rowKind &&
+                    prior.ordinal === row.ordinal,
+                )
+              )
+                throw conflict(input.operationId);
+            }
+            for (const row of rows) {
+              const persisted = persistedRows.find(
+                (prior) =>
+                  prior.rowKind === row.rowKind &&
+                  prior.ordinal === row.ordinal,
+              );
+              if (persisted && payloadBytes(persisted) !== payloadBytes(row))
+                throw new Error('immutable operation row payload differs');
+            }
             for (const row of rows) {
               if (
                 !persistedRows.some(
@@ -302,10 +337,7 @@ class MemoryOperationStore implements FleetOperationStore {
                   prior.ordinal === row.ordinal,
               );
               if (!persisted) complete = false;
-              else if (
-                JSON.stringify(persisted.payload) !==
-                JSON.stringify(row.payload)
-              )
+              else if (payloadBytes(persisted) !== payloadBytes(row))
                 throw divergence(input.operationId);
             }
             if (!complete) throw conflict(input.operationId);
@@ -1198,6 +1230,201 @@ async function loseStepResponse(
   expect(world.operationStore.item()).toEqual(item);
   return item;
 }
+
+describe('migration operation fake guarded progress contract', () => {
+  it('refuses missing updates and different immutable bytes before sibling writes, and accepts exact retries', async () => {
+    const world = createWorld();
+    await world.start(uuid(), [world.initial, world.initial]);
+    const initial = copy(world.operationStore.operations.get(uuid()));
+    const staged = copy(world.operationStore.rows.get(uuid()));
+    const row = staged?.[0];
+    const secondRow = staged?.[1];
+    if (!initial || !row || !secondRow)
+      throw new Error('missing commit fixture');
+    const intended = {
+      ...initial,
+      progress: {
+        ...initial.progress,
+        revision: initial.progress.revision + 1,
+      },
+    };
+    const different = {
+      ...row,
+      payload: { ...row.payload, tenantTag: 'other' },
+    };
+    const updated = {
+      ...secondRow,
+      payload: { ...secondRow.payload, tenantTag: 'updated' },
+    };
+    const sibling = {
+      ...row,
+      ordinal: 2,
+      payload: { ...row.payload, ordinal: 2 },
+    };
+    const missing = {
+      ...row,
+      ordinal: 3,
+      payload: { ...row.payload, ordinal: 3 },
+    };
+    for (const variant of ['missing-update', 'different-insert', 'exact']) {
+      const store = new MemoryOperationStore();
+      store.operations.set(uuid(), copy(initial));
+      store.heads.set('migration', uuid());
+      store.rows.set(uuid(), copy([row, secondRow]));
+      const input = {
+        operationId: uuid(),
+        expectedRevision: initial.progress.revision,
+        runRecord: intended,
+        rows: [sibling, variant === 'different-insert' ? different : row],
+        updateRows:
+          variant === 'missing-update' ? [updated, missing] : [updated],
+        expectedRowWatermarks: { item: 1 },
+      };
+      await store.withAccountOperationLease('migration', async (lease) => {
+        const result = await lease
+          .commitProgress(input)
+          .catch((error: unknown) => error);
+        if (variant === 'exact') {
+          expect(store.operations.get(uuid())).toEqual(intended);
+          expect(store.rows.get(uuid())).toEqual([row, updated, sibling]);
+          expect(result).toEqual(intended);
+          expect(await lease.commitProgress(copy(input))).toEqual(intended);
+          expect(store.operations.get(uuid())).toEqual(intended);
+          expect(store.rows.get(uuid())).toEqual([row, updated, sibling]);
+        } else {
+          expect(store.operations.get(uuid())).toEqual(initial);
+          expect(store.rows.get(uuid())).toEqual([row, secondRow]);
+          expect(store.heads.get('migration')).toBe(uuid());
+          expect(result).toBeInstanceOf(Error);
+          if (variant === 'missing-update') {
+            expect(result).toHaveProperty('message', conflict(uuid()).message);
+          }
+        }
+      });
+    }
+    for (const state of ['running', 'failed'] as const) {
+      const store = new MemoryOperationStore();
+      const persisted = { ...intended, state };
+      store.operations.set(uuid(), copy(persisted));
+      store.rows.set(uuid(), copy([row, secondRow]));
+      await store.withAccountOperationLease('migration', async (lease) => {
+        const error = await lease
+          .commitProgress({
+            operationId: uuid(),
+            expectedRevision: initial.progress.revision,
+            runRecord: intended,
+            rows: [sibling, different],
+            updateRows: [updated, missing],
+            expectedRowWatermarks: { item: 1 },
+          })
+          .catch((error: unknown) => error);
+        expect(store.operations.get(uuid())).toEqual(persisted);
+        expect(store.rows.get(uuid())).toEqual([row, secondRow]);
+        expect(error).toHaveProperty(
+          'message',
+          state === 'failed'
+            ? conflict(uuid()).message
+            : divergence(uuid()).message,
+        );
+      });
+    }
+  });
+
+  it('compares record payloads canonically for fresh commits and convergence', async () => {
+    const record = baseRecord(deploymentSpec('canonical'));
+    const stored: FleetOperationStagedRow = {
+      rowKind: 'record',
+      ordinal: 0,
+      payload: { ...record },
+    };
+    const reordered = {
+      ...stored,
+      payload: Object.fromEntries(Object.entries(record).reverse()),
+    };
+    expect(JSON.stringify(stored.payload)).not.toBe(
+      JSON.stringify(reordered.payload),
+    );
+    const initial: FleetOperationRunRecord = {
+      version: 1,
+      operationId: uuid(),
+      kind: 'audit',
+      state: 'running',
+      progress: { kind: 'audit', revision: 0 },
+      updatedAt: new Date(NOW).toISOString(),
+    };
+    const intended = {
+      ...initial,
+      progress: { ...initial.progress, revision: 1 },
+    };
+    const store = new MemoryOperationStore();
+    store.operations.set(uuid(), copy(initial));
+    store.rows.set(uuid(), copy([stored]));
+    await store.withAccountOperationLease('audit', async (lease) => {
+      const input = {
+        operationId: uuid(),
+        expectedRevision: 0,
+        runRecord: intended,
+        rows: [reordered],
+        expectedRowWatermarks: { record: 1 },
+      };
+      const error = await lease
+        .commitProgress({
+          ...input,
+          rows: [
+            { ...stored, ordinal: 1 },
+            { ...stored, payload: { ...stored.payload, tenantTag: 'other' } },
+          ],
+        })
+        .catch((error: unknown) => error);
+      expect(store.operations.get(uuid())).toEqual(initial);
+      expect(store.rows.get(uuid())).toEqual([stored]);
+      expect(error).toBeInstanceOf(Error);
+      for (let retry = 0; retry < 2; retry += 1) {
+        expect(await lease.commitProgress(copy(input))).toEqual(intended);
+        expect(store.operations.get(uuid())).toEqual(intended);
+        expect(JSON.stringify(store.rows.get(uuid()))).toBe(
+          JSON.stringify([stored]),
+        );
+      }
+    });
+  });
+
+  it('refuses multiple failure updates before changing rows or releasing the head', async () => {
+    const world = createWorld();
+    await world.start(uuid(), [world.initial, world.initial]);
+    const store = world.operationStore;
+    const initial = copy(store.operations.get(uuid()));
+    const rows = copy(store.rows.get(uuid()));
+    if (!initial || !rows) throw new Error('missing failure fixture');
+    await store.withAccountOperationLease('migration', async (lease) => {
+      const error = await lease
+        .failOperation({
+          operationId: uuid(),
+          expectedRevision: initial.progress.revision,
+          runRecord: {
+            ...initial,
+            state: 'failed',
+            progress: {
+              ...initial.progress,
+              revision: initial.progress.revision + 1,
+            },
+          },
+          updateRows: rows.map((row) => ({
+            ...row,
+            payload: { ...row.payload, status: 'failed' },
+          })),
+        })
+        .catch((error: unknown) => error);
+      expect(store.operations.get(uuid())).toEqual(initial);
+      expect(store.rows.get(uuid())).toEqual(rows);
+      expect(store.heads.get('migration')).toBe(uuid());
+      expect(error).toHaveProperty(
+        'message',
+        'failOperation accepts at most one updateRow',
+      );
+    });
+  });
+});
 
 describe('bounded fleet migration', () => {
   it('start freezes the exact legacy order (dup-canary last-wins, stable equal rank, localeCompare)', async () => {
