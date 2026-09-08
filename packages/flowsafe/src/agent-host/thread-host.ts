@@ -578,19 +578,7 @@ export function createThreadAgentHost(
   const withBindingLock = createFifoLock();
   const withDispatchLock = createFifoLock();
   const withRecoveryLock = createFifoLock();
-  /**
-   * Run ids this object is currently starting — the liveness half of the
-   * idempotent-start replay decision, and the reason a retried agent start can
-   * tell "the first one is still working" from "the first one died holding the
-   * claim" without a timer.
-   *
-   * In memory, never stored: liveness is a property of an isolate that is
-   * running code, so the honest answer after an eviction is `false`, and any
-   * durable proxy would keep saying `true` for a run nothing is executing.
-   * Scoped to this host instance, which `instanceScopeFor` already pins to one
-   * Durable Object — the same object an agent run is bound to for its whole
-   * life, so this object's answer is the only one there is.
-   */
+  /** Claim durability does not establish current run liveness. */
   const startsInFlight = new Set<string>();
   const unwoundExecutions = new WeakSet<TrustedAgentExecution>();
 
@@ -2296,16 +2284,7 @@ export function createThreadAgentHost(
         ? preflightUrl.pathname.slice(AGENT_HOST_ROUTE_PREFIX.length)
         : '';
       const preflightSegments = preflightSuffix.split('/').filter(Boolean);
-      // The liveness probe, answered BEFORE withDispatchLock on purpose: the
-      // start it is asking about holds that lock for its whole first leg, so a
-      // probe that queued behind it would block for exactly as long as the run
-      // it was trying to describe — and time out reporting nothing.
-      //
-      // It reads no storage and reveals only whether this object is currently
-      // executing a run id the caller already had to know. Authorization is the
-      // deployment-identity header every request to this object carries: the
-      // probe travels the internal Worker-to-DO channel, and the reservation on
-      // the far side already proved the caller owns the key that names this run.
+      // The start holds the dispatch lock while its liveness probe must remain responsive.
       if (
         request.method === 'GET' &&
         preflightSegments.length === 4 &&

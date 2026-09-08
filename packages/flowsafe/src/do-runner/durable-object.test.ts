@@ -166,16 +166,6 @@ function makeProductionEnv(
   };
 }
 
-/**
- * The two run-state reads a RunnerRuntime stub has to answer, over one
- * implementation. Every stub in this file goes in through
- * `as unknown as RunnerRuntime`, so TypeScript sees nothing when a method is
- * missing: a stub carrying only `status` would send each alarm-driven test
- * down the unreadable-state path — no resume, no charge, watchdog cadence —
- * and pass anyway. Two spies rather than one so a test can pin WHICH read a
- * path made: a wake reads `authoritativeStatus`, an HTTP route reads
- * `status`.
- */
 async function durableOwnerRecovery(
   runtime: RunnerRuntime,
   workflowId: string,
@@ -195,6 +185,7 @@ async function durableOwnerRecovery(
   };
 }
 
+/** Distinct spies keep public-status and authoritative-read assertions independent. */
 function statusStub(read: RunnerRuntime['status']) {
   return {
     status: vi.fn(read),
@@ -1956,9 +1947,6 @@ describe('DurableObjectRunner.fetch', () => {
   });
 
   it('rolls back preparing bookkeeping without querying a failed Runtime reader', async () => {
-    // #given — the same failed start, with the read that would tell an
-    // interrupted start apart from a failed one refusing to answer from state
-    // it could not reach.
     const { state, values, alarms } = recoveryStorage();
     const reserve = vi.fn(async () => true);
     const settle = vi.fn(async () => undefined);
@@ -1983,7 +1971,6 @@ describe('DurableObjectRunner.fetch', () => {
       });
     const before = Date.now();
 
-    // #when
     const response = await runner
       .fetch(
         post('/runs', {
@@ -1994,15 +1981,10 @@ describe('DurableObjectRunner.fetch', () => {
       )
       .finally(() => log.mockRestore());
 
-    // #then — the caller still sees the ORIGINAL start failure, never the
-    // read's: a read that concluded nothing cannot reclassify one.
     expect(response.status).toBe(500);
     await expect(response.json()).resolves.toMatchObject({
       error: 'injected pre-snapshot failure',
     });
-    // #then — and the failure is named rather than swallowed, because it is
-    // the reason the attempt is left unsettled with its journal armed for a
-    // wake that can read.
     expect(logged).toEqual([]);
     expect(settle).toHaveBeenCalledWith(
       expect.any(String),

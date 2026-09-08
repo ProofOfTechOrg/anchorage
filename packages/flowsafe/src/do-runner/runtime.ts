@@ -2987,9 +2987,6 @@ export class RunnerRuntime {
     source: CapturedWorkflowStorage,
   ): Promise<WorkflowRunState> {
     const workflows = source.workflows;
-    if (!workflows) {
-      throw new Error('RunnerRuntime: workflows storage is unavailable');
-    }
     const persisted: WorkflowRunState = {
       ...state,
       requestContext: {
@@ -3108,11 +3105,6 @@ export class RunnerRuntime {
     if (!opts) return;
     await this.#withLifecycleLock(workflowId, runId, async () => {
       const workflows = source.workflows;
-      if (!workflows) {
-        throw new Error(
-          'RunnerRuntime: workflows storage is unavailable while persisting terminal state',
-        );
-      }
       const snapshot = await source.load.call(workflows, {
         workflowName: workflowId,
         runId,

@@ -177,15 +177,6 @@ const OWNER_KIND_CHECK = EXECUTION_PRINCIPAL_KINDS.map(
   (kind) => `'${kind}'`,
 ).join(', ');
 
-/**
- * The reservation schema.
- *
- * The CHECK constraints are load-bearing, not decoration: every compare-and-set
- * below is stated as `WHERE ... AND state = '<literal>'`, which is only a TOTAL
- * decision while the column cannot hold a fourth value. A row hand-edited into
- * an unknown state would otherwise be a reservation no CAS can advance and no
- * purge can reap — a permanently wedged key.
- */
 const START_IDEMPOTENCY_BASE_COLUMNS = `
     key TEXT PRIMARY KEY,
     owner_kind TEXT NOT NULL CHECK (owner_kind IN (${OWNER_KIND_CHECK})),
@@ -346,22 +337,8 @@ function isEpochMs(value: unknown): value is number {
 }
 
 /**
- * Project a stored row, or refuse it.
- *
- * A malformed row throws rather than reading as absent, and that direction is
- * deliberate: "there is no reservation" is the answer that STARTS A RUN, so it
- * must never be reachable from a row this build cannot parse. The CHECK
- * constraints make this unreachable on a database this package created; it
- * exists for the one that was hand-edited.
- *
- * The TIMESTAMPS are in that strict set too, rather than coerced to 0 as an
- * unparseable number once was. Neither column is decoration: `updated_at` is
- * the horizon the purge measures from, so a corrupt one on a terminal row reads
- * as epoch 0 and makes the reservation immediately reapable — which deletes a
- * spent key early and turns the next retry of it into a fresh start. It is also
- * `pendingSince` on a live claim, where 0 tells an operator a run has been
- * starting since 1970. Refusing the row keeps both faults visible as the 503
- * they are.
+ * Treating malformed rows as absent could start another run.
+ * Coercing corrupt timestamps can expire a spent key and admit it again.
  */
 export function reservationFromRow(
   row: StartReservationRow,

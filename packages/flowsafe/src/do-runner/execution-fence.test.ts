@@ -2230,7 +2230,7 @@ describe('init() fence wiring', () => {
     expect(runtime.executionFence).toBeUndefined();
   });
 
-  it('takes a shared store for a { storage } source', async () => {
+  it('takes a shared store for a { DB } source', async () => {
     const { fence } = fenceFixture();
     const { runtime } = init(
       { DB: databaseForFence(fence) },

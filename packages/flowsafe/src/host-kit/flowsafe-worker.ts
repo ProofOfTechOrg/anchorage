@@ -337,7 +337,10 @@ export interface FlowsafeRunnerLifecycleConfig<Env extends FlowsafeWorkerEnv> {
 
 export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv>
   extends FlowsafeRunnerLifecycleConfig<Env> {
-  /** Trusted host epoch, captured before request authentication and storage waits. Client headers cannot supply this authority. */
+  /**
+   * Trusted host epoch, captured before request authentication and storage waits.
+   * Callbacks return a number or undefined synchronously; client headers cannot supply it.
+   */
   mutationEpoch?: number | ((env: Env) => unknown);
   /** The catalog createRunRouter serves and gates (hosts pass their metas). */
   workflows: ReadonlyArray<WorkflowMeta>;

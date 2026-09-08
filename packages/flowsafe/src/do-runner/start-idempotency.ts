@@ -1,88 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Owner-bound idempotent start — the reservation that makes "start this once"
-// mean once, across retries, isolates, and deployments.
-//
-// WHY it exists: a run start is the moment a deployment commits to spending
-// money. The first step of a workflow can wire funds, file an order, or call a
-// paid API, and every layer between a caller and that step is allowed to lose a
-// RESPONSE without losing the WORK — a Worker eviction, a client timeout, a
-// load balancer retry, an operator re-running a script. Without a reservation
-// the only honest answer to "did my start land?" is "retry and find out", and
-// that answer charges the card twice.
-//
-// The reservation is what a key BUYS: a durable row, written before anything
-// executes, that says which run this key already means. A retry carrying the
-// same key does not start a second run — it finds the first one and is told
-// what happened to it.
-//
-// THE TAXONOMY IS THE CONTRACT. Eight structured reason codes say what flowsafe
-// KNOWS, because the caller's next action differs for each and a collapsed code
-// would make them all "retry". Five are reservation-decision refusals:
-//
-//   IDEMPOTENT_START_OWNER_MISMATCH (403) this key is somebody else's. Keys are
-//                                   owner-scoped, so one tenant principal
-//                                   cannot probe, hijack, or collide with
-//                                   another's — and never learns more than
-//                                   "not yours".
-//   IDEMPOTENT_START_TARGET_MISMATCH (409) the key is yours but names a
-//                                   different workflow/agent than last time.
-//                                   Reusing a key across targets is a caller
-//                                   bug, and silently honouring it would make
-//                                   one key mean two different charges.
-//   IDEMPOTENT_START_PENDING (503)   the run this key names is RUNNING right
-//                                   now. Retryable, and legitimately unbounded:
-//                                   the first persisted summary lands at the
-//                                   first suspend or terminal state, so a long
-//                                   live run has no summary yet and is not lost.
-//                                   `pendingSince` lets a caller reason about
-//                                   how long, without this package pretending a
-//                                   timeout would be safe.
-//   IDEMPOTENT_START_UNRESOLVABLE (409) the claim was taken, nothing persisted,
-//                                   and nothing is running. Whether a side
-//                                   effect fired before the crash is UNKNOWABLE
-//                                   to flowsafe. So it refuses, and says so, and
-//                                   never re-executes on its own. A host that
-//                                   investigates and decides to re-run does it
-//                                   with a FRESH key — a deliberate second
-//                                   charge, not one this package invented.
-//   IDEMPOTENT_START_ALREADY_SETTLED (409) the run finished and its summary has
-//                                   aged out. The reservation deliberately
-//                                   OUTLIVES the snapshot so this answer exists
-//                                   at all; the alternative is a purged run
-//                                   looking exactly like a fresh key.
-//
-// Three complete the public keyed-start taxonomy:
-//
-//   IDEMPOTENT_START_UNSUPPORTED (503) a keyed start reached a deployment whose
-//                                   host did not wire a reservation store.
-//   INVALID_START_IDEMPOTENCY_REQUEST (400) the keyed input was malformed.
-//   IDEMPOTENT_START_UNREADABLE (503) the reservation store could not be read
-//                                   or contained a row this build cannot parse.
-//
-// The seven-member `StartReservationRefusal` union recognized by
-// `isStartReservationRefusal` includes everything above except UNREADABLE,
-// which propagates separately as an integrity or availability failure.
-//
-// NO TIMER ANYWHERE. Two of those branches are separated by a LIVENESS PROBE,
-// never by elapsed time. A timer would have to guess a bound on legitimate
-// in-flight work, and every guess is wrong in the expensive direction: too
-// short and a long live run is declared dead, inviting a fresh key and a second
-// charge; too long and a genuinely crashed start wedges its key. The probe asks
-// the run's own host whether it is executing, which is the question a timer was
-// only ever approximating.
-//
-// THE CLAIM IS THE SERIALIZER. `reserve()` decides which runId a key means;
-// `claimReservation()` decides who gets to START it. The claim is one conditional UPDATE,
-// so exactly one caller changes a row and every other caller reads the outcome
-// instead of racing it. That matters most where Durable Object serialization
-// cannot help: agent runs live in thread objects keyed by threadId, so two
-// same-key starts naming different threads are two different objects with no
-// shared lock at all. This CAS is the only thing between them.
-//
-// RUN IDS ARE NEVER MINTED HERE. Run ids are server-minted, at the host's own
-// existing mint sites; the reservation STORES one and hands the same id back to
-// every later caller. A store that generated ids would be a second minting
-// authority, and the whole rule is that there is exactly one.
+// A missing result cannot establish whether a claimed start had effects.
 
 import {
   isExecutionPrincipalId,
@@ -143,25 +60,7 @@ export {
   validateStartReservationAdmissionSchema,
 } from './start-reservation-contract.js';
 
-/**
- * The reservation table — flowsafe-owned, so outside the `mastra_%` schema
- * guard, and created lazily by the first `reserve()` rather than by the
- * provisioning protocol. Unlike the execution fence (whose ABSENCE has to read
- * as a state, so provisioning writes an explicit row), an absent reservation
- * table simply means no key has ever been used on this deployment, which is
- * indistinguishable from an empty one.
- */
-
 export interface StartReservationRequest {
-  /**
-   * `unknown` rather than `string`, the same posture (and for the same reason)
-   * as `ExecutionFenceTransition.proofKey`: every caller is a route holding a
-   * parsed JSON body, `assertKey` already validates this against
-   * PATH_SAFE_ID_PATTERN and throws on anything else, and typing it `string`
-   * only made callers write `body.idempotencyKey as string` — an assertion that
-   * is false exactly when the caller sent the wrong thing, so the one input
-   * this field exists to police would arrive pre-blessed at the type level.
-   */
   key: unknown;
   owner: StartReservationOwner;
   targetKind: StartTargetKind;
@@ -289,18 +188,11 @@ export class StartReservationTargetMismatchError extends DoStatusError {
   }
 }
 
-/**
- * The key's run is executing right now. 503 for the same reason every
- * operator-transient refusal in this package is: the condition is real, it is
- * nobody's mistake, and it clears on its own — so a client that honours
- * retry semantics converges instead of giving up.
- */
 export class IdempotentStartPendingError extends DoStatusError {
   readonly status = 503;
   readonly reason: {
     readonly code: 'IDEMPOTENT_START_PENDING';
     readonly runId: string;
-    /** Epoch ms of the claim, so a caller can reason about how long. */
     readonly pendingSince: number;
   };
 

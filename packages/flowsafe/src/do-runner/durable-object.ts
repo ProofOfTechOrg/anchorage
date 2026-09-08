@@ -325,15 +325,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
   #operationTail = Promise.resolve();
   /** `step\0reason` of every suspension deadline this object has reported. */
   #reportedSuspensionRejections = new Set<string>();
-  /**
-   * `workflowId:runId` of every start this object is currently executing — the
-   * liveness half of the idempotent-start replay decision.
-   *
-   * A SET rather than a stored key, because liveness is not durable state: the
-   * question is "is code running for this run right now", and the honest answer
-   * after an eviction is no. Anything written to storage would survive the
-   * isolate that wrote it and keep saying yes.
-   */
+  /** Persisted claims outlive an isolate and cannot establish run liveness. */
   readonly #startsInFlight = new Map<string, RunStartFrame>();
 
   constructor(state: DurableObjectRunnerState | undefined, env: TEnv) {
@@ -804,13 +796,6 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     await storage.put(RUN_OWNER_RECOVERY_KEY, recovery);
   }
 
-  /**
-   * `keepWake` is set by a caller whose reconciliation failed with something
-   * to arm: the retry wake it left is the only thing that will re-derive that
-   * deadline, and re-arming from storage here would find no record and no
-   * journal and DELETE it. Keeping the recovery cadence instead costs one
-   * spurious wake and cannot lose a deadline.
-   */
   async #assertRunOwnerRecoveryCurrent(
     recovery: RunOwnerRecovery,
   ): Promise<void> {
@@ -822,6 +807,10 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       throw new Error('run owner recovery changed');
   }
 
+  /**
+   * Failed reconciliation can leave a retry wake without a stored deadline.
+   * Keeping that wake avoids losing it when alarms are rebuilt from storage.
+   */
   async #clearRunOwnerRecovery(
     recovery: RunOwnerRecovery,
     keepWake: boolean,

@@ -392,7 +392,7 @@ describe('C context capture', () => {
     'prototype',
     'non-enumerable',
     'own-enumerable',
-  ] as const)('C captures all declared ActorContext methods without enumeration', async (shape) => {
+  ] as const)('C captures all declared ActorContext methods without enumeration (%s)', async (shape) => {
     const source = new ReceiverContext();
     const reads = new Map<string, number>();
     if (shape !== 'prototype') {
@@ -429,7 +429,7 @@ describe('C context capture', () => {
   it.each([
     'prototype',
     'own-enumerable',
-  ] as const)('C preserves the original receiver of captured ActorContext methods', async (shape) => {
+  ] as const)('C preserves the original receiver of captured ActorContext methods (%s)', async (shape) => {
     const source = new ReceiverContext();
     if (shape === 'own-enumerable') {
       for (const method of contextMethods)

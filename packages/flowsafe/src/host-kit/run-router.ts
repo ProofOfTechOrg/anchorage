@@ -1,27 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// HTTP surface for the run catalog + run lifecycle, shared by every host.
-//
-// Mirrors createApprovalRouter's contract — plain fetch routing, an injected
-// `authenticate`, and `null` for paths outside its ownership so a host Worker
-// can compose it after the approval router. (Its two paths are fixed rather
-// than configurable: unlike the approval surface, a host mounts exactly one run
-// surface.) What it owns that the hosts used to triplicate is the route-specific
-// AUTHORIZATION order:
-//
-//   start:   authenticate -> coarse role -> workflow role -> host policy
-//   resume:    authenticate -> catalog -> ownership -> coarse role -> workflow
-//              role -> host policy
-//   terminate: authenticate -> catalog -> ownership -> coarse role -> workflow
-//              role
-//
-// and the suspension bridge: a start that suspends queues its approval
-// attributed to the STARTING actor, so that actor cannot later decide their own
-// run (separation of duties).
-//
-// The resume route deliberately carries NO grants. A forged `resumeData.approved`
-// can flip a workflow boolean, but capability comes only from the server-derived
-// grant the runtime mints per leg (approval-api/grants.ts), so a side-effecting
-// step re-checks and fails closed. Approve through the queue, not this route.
+// Connector approval comes from stored decisions, not client resume data.
 
 import { captureActorContext } from '../approval-api/actor-context.js';
 import {
@@ -45,6 +23,7 @@ import {
   type RunSummary,
   RunTerminalConflictError,
   requireStartIdempotency,
+  StartIdempotencyUnsupportedError,
   type StartIdempotencyWiring,
   type StartReservation,
   type StartReservationReading,
@@ -362,13 +341,9 @@ async function startIdempotently(
   rawKey: unknown,
 ): Promise<IdempotentStartResult> {
   const wiring = options.startIdempotency;
-  // `requireStartIdempotency` turns the opt-out into the published refusal. A
-  // key on an unwired host is never ignored: honouring it silently would be an
-  // exactly-once promise this deployment cannot keep.
-  const store = requireStartIdempotency(
-    wiring === 'none' ? 'none' : wiring.store,
-  );
-  const live = wiring === 'none' ? undefined : wiring.live;
+  if (wiring === 'none') throw new StartIdempotencyUnsupportedError();
+  const store = requireStartIdempotency(wiring.store);
+  const live = wiring.live;
   const decision = await beginIdempotentStart<RunSummary>(
     store,
     {
@@ -386,13 +361,11 @@ async function startIdempotently(
     },
     {
       persisted: async (reservation: StartReservation) =>
-        wiring === 'none'
-          ? undefined
-          : wiring.persistedStart(workflowId, reservation.runId),
+        wiring.persistedStart(workflowId, reservation.runId),
       live: async (reservation: StartReservation) =>
-        live ? live(workflowId, reservation.runId) : false,
+        live(workflowId, reservation.runId),
     },
-    wiring === 'none' ? undefined : wiring.executionFence,
+    wiring.executionFence,
     mutationEpoch,
   );
   if (decision.kind === 'replay') {

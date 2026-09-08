@@ -2559,7 +2559,6 @@ describe('ApprovalService.decide and the deployment execution fence', () => {
   });
 
   it('refuses legacy run-only proof metadata without committing decisions', async () => {
-    // #given — a proof state bound to one run.
     const fence = await fenceAt('migration-locked');
     await fence.transition({
       expected: 'migration-locked',
@@ -2578,13 +2577,10 @@ describe('ApprovalService.decide and the deployment execution fence', () => {
       stepPath: ['approval'],
     });
 
-    // #then — an approval that gates a different run is refused...
     await expect(
       harness.service.decide(other.id, { decision: 'approve' }, REVIEWER),
     ).rejects.toBeInstanceOf(ExecutionFencedError);
 
-    // #and — the proof run's gate is decided, which is what makes the proof
-    // able to reach a suspension and come back.
     const result = await harness.service
       .decide(proof.id, { decision: 'approve' }, REVIEWER)
       .catch((error) => error);

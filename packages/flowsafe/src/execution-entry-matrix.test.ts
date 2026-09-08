@@ -514,7 +514,6 @@ async function nominateExistingExecution(
   });
 }
 
-/** Actual wrapper, private Runtime and workflow domain; only delivery is spied. */
 async function matrixAgent(
   fence: ExecutionFenceStore,
   database: ExecutionFenceDatabase,
