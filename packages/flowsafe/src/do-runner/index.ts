@@ -24,6 +24,8 @@ export type {
   RunArtifactPurger,
   RunDeadlineCandidate,
   RunDeadlineCursor,
+  RunRetentionCursor,
+  RunRetentionScanPosition,
   SnapshotDatabase,
   SnapshotStatement,
   SweepExpiredRunDeadlinesOptions,

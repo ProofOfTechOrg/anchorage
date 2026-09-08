@@ -1,9 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-// Host-agnostic approval bridge: the glue that turns a workflow suspension into
-// an approval request and re-queues the next gate on a multi-gate run. Promoted
-// out of gtm-app/worker.ts so every host (the showcase Worker, the dev backend)
-// shares one implementation instead of re-deriving the (suspendedAt, resumeCount)
-// capture and the SoD-across-gates re-queue.
 
 import { agentGateGrantRequest } from '../agent-runner/approval-shapes.js';
 import {
@@ -24,6 +19,14 @@ import {
   trustAutomationPrincipal,
 } from '../approval-api/index.js';
 import type { RunSummary } from '../do-runner/index.js';
+
+function errorMessage(error: unknown): string {
+  try {
+    return String(error instanceof Error ? error.message : error);
+  } catch {
+    return 'unreadable error';
+  }
+}
 
 /**
  * Resumes a run after a decision. The showcase Worker fetches the run's DO stub;
@@ -192,7 +195,7 @@ export async function queueApprovalForSuspension(
       // decision's re-queue re-files any gate still missing.
       failures.push({
         stepKey,
-        message: error instanceof Error ? error.message : String(error),
+        message: errorMessage(error),
       });
     }
   }
@@ -279,7 +282,7 @@ export function resumeRunWithRequeue(
             action: 'approval.requeue',
             resource: `approval:${record.id}`,
             decision: 'error',
-            reason: error instanceof Error ? error.message : String(error),
+            reason: errorMessage(error),
             detail: {
               workflowId: record.workflowId,
               runId: record.runId,

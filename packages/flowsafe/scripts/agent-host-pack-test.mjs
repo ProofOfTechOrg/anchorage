@@ -261,6 +261,7 @@ import type {
 } from '@proofoftech/flowsafe/approval-api';
 import {
   sweepExpiredRunDeadlines,
+  purgeExpiredWorkflowRuns,
   FENCED_WORKFLOW_STORAGE,
   FencedWorkflowsStorageD1,
   type InitialRunAdmission,
@@ -274,6 +275,9 @@ import {
   type ExecutionFenceState,
   type ExecutionFenceWiring,
   type RunTerminalErrorEnvelope,
+  type RunRetentionCursor,
+  type RunRetentionScanPosition,
+  type SnapshotDatabase,
   type StartIdempotencyWiring,
 } from '@proofoftech/flowsafe/do-runner';
 import {
@@ -432,6 +436,20 @@ void bgHost.getTask;
 void bgHost.listTasks;
 void bgHost.stream;
 void sweepExpiredRunDeadlines;
+declare const retentionDatabase: SnapshotDatabase & Required<Pick<SnapshotDatabase, 'batch'>>;
+declare const snapshotReader: SnapshotDatabase;
+const retentionPosition: RunRetentionScanPosition = { afterRowId: -1, highWaterRowId: 12 };
+let retentionCursor: RunRetentionCursor | undefined = {
+  version: 1, tablePrefix: '', snapshots: retentionPosition,
+};
+const persistRetentionCursor = async (next: RunRetentionCursor): Promise<void> => { retentionCursor = next; };
+void purgeExpiredWorkflowRuns(retentionDatabase, {
+  ttlMs: 1000, cursor: retentionCursor, advanceCursor: persistRetentionCursor,
+});
+// @ts-expect-error retention requires a cursor persistence callback
+void purgeExpiredWorkflowRuns(retentionDatabase, { ttlMs: 1000 });
+// @ts-expect-error a reader with optional batch cannot guarantee a transaction
+void purgeExpiredWorkflowRuns(snapshotReader, { ttlMs: 1000, advanceCursor: persistRetentionCursor });
 void createFlowsafeRunnerLifecycle;
 void createRunRouter;
 `,
@@ -672,6 +690,22 @@ assert.equal(blocked instanceof flowsafe.RunLifecycleBlockedError, true);
 assert.equal(blocked.name, 'RunLifecycleBlockedError');
 assert.equal(blocked.reason.code, 'DISPUTED_SETTLEMENT');
 const binding = sqliteUnitDatabase(openSqlite());
+const retentionBinding = sqliteUnitDatabase(openSqlite());
+await retentionBinding.prepare('CREATE TABLE mastra_workflow_snapshot (workflow_name TEXT NOT NULL, run_id TEXT NOT NULL, resourceId TEXT, snapshot TEXT NOT NULL, createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL, UNIQUE(workflow_name, run_id))').run();
+for (const [runId, provenance] of [
+  ['malformed-retention', { version: 2, startToken: 42 }],
+  ['eligible-retention', { version: 2, startToken: 'packed-retention-generation', attemptToken: 'packed-retention-attempt', resumeCounts: [] }],
+]) {
+  await retentionBinding.prepare('INSERT INTO mastra_workflow_snapshot (workflow_name, run_id, snapshot, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?)')
+    .bind('packed-retention', runId, JSON.stringify({ status: 'success', requestContext: { 'flowsafe.runProvenance': provenance } }), '2020-01-01T00:00:00.000Z', '2020-01-01T00:00:00.000Z').run();
+}
+let retainedCursor;
+const retentionOptions = { ttlMs: 1000, limit: 1, now: () => Date.parse('2026-09-08T00:00:00.000Z'), advanceCursor: async next => { retainedCursor = structuredClone(next); } };
+assert.equal(await doRunner.purgeExpiredWorkflowRuns(retentionBinding, retentionOptions), 0);
+assert.ok(retainedCursor.snapshots);
+assert.equal(await doRunner.purgeExpiredWorkflowRuns(retentionBinding, { ...retentionOptions, cursor: retainedCursor }), 1);
+assert.equal(retainedCursor.snapshots, undefined);
+assert.deepEqual((await retentionBinding.prepare('SELECT run_id FROM mastra_workflow_snapshot').all()).results.map(row => row.run_id), ['malformed-retention']);
 const storage = doRunner.createD1Storage({ binding });
 let engineCalls = 0;
 const workflow = createWorkflow({ id: 'packed-initial', inputSchema: z.object({}), outputSchema: z.object({}) })

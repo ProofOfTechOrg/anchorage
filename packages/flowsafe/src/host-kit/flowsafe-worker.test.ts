@@ -1,12 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-// Unit proof for the composed Worker skeleton: the fetch pipeline order, the
-// hook seams (preRoutes/beforeStart/beforeResume/notify/extra
-// duties), and failure-isolated deadline, sweep, purge, and optional schedule
-// tick dispatch. The HEAVYWEIGHT behavior proof stays the two host e2e suites
-// (deploy/worker.e2e.test.ts and the showcase worker e2e set), which drive
-// the real hosts through this same composer — this file covers the composer's
-// own contract over fakes: node:sqlite behind a narrow SQL unit facade, a stub DO
-// namespace, and a static verifier.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -21,6 +13,7 @@ import {
   FlowsafeFleetAuditProxy,
 } from '../audit-export/index.js';
 import {
+  DeploymentIdentityError,
   EXECUTION_PRINCIPAL_HEADER,
   executionFenceFor,
   InvalidMutationEpochError,
@@ -34,6 +27,7 @@ import {
   type FlowsafeWorkerConfig,
   type FlowsafeWorkerEnv,
   MAINTENANCE_INSTANCE_NAME,
+  type MaintenanceDutyContext,
   type MaintenanceHealth,
 } from './flowsafe-worker.js';
 import { approvalStoreFactoryFor } from './host-approval-service.js';
@@ -168,6 +162,15 @@ function makeWorker(
     },
     ...overrides,
   });
+}
+
+function retentionContext(): MaintenanceDutyContext {
+  const context: MaintenanceDutyContext = {
+    advanceRetentionCursor: async (cursor) => {
+      context.retentionCursor = structuredClone(cursor);
+    },
+  };
+  return context;
 }
 
 function cWorkerDeferred() {
@@ -383,6 +386,91 @@ describe('C Worker epoch capture', () => {
     expect(response.status).toBe(500);
     expect(await response.json()).toEqual({ error: 'internal error' });
     expect(prepare).not.toHaveBeenCalled();
+    await h.flush();
+  });
+
+  it.each([
+    {
+      name: 'throwing message getter',
+      failure: () =>
+        Object.defineProperty(new Error(), 'message', {
+          get() {
+            throw new Error('message getter failed');
+          },
+        }),
+      diagnostic: 'unreadable error',
+    },
+    {
+      name: 'BigInt message',
+      failure: () =>
+        Object.defineProperty(new Error(), 'message', { value: 1n }),
+      diagnostic: '1',
+    },
+    {
+      name: 'null-prototype rejection',
+      failure: () => Object.create(null),
+      diagnostic: 'unreadable error',
+    },
+  ])('contains a callback failure with $name while logging the failure', async ({
+    failure,
+    diagnostic,
+  }) => {
+    const logs = capturedLogs();
+    const h = makeEnv();
+    const response = await makeWorker({
+      mutationEpoch: () => {
+        throw failure();
+      },
+    }).fetch(authed('http://host/healthz'), h.env, h.ctx);
+
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: 'internal error' });
+    expect(logs.errors().map((line) => JSON.parse(line))).toContainEqual({
+      type: 'worker-fetch-error',
+      reason: diagnostic,
+    });
+    await h.flush();
+  });
+
+  it.each([
+    {
+      name: 'throwing message getter',
+      descriptor: {
+        get() {
+          throw new Error('message getter failed');
+        },
+      },
+      diagnostic: 'unreadable error',
+    },
+    {
+      name: 'BigInt message',
+      descriptor: { value: 1n },
+      diagnostic: '1',
+    },
+  ])('contains deployment identity failures with $name', async ({
+    descriptor,
+    diagnostic,
+  }) => {
+    const logs = capturedLogs();
+    const h = makeEnv();
+    const failure = Object.defineProperty(
+      new DeploymentIdentityError('unavailable'),
+      'message',
+      descriptor,
+    );
+
+    const response = await makeWorker({
+      mutationEpoch: () => {
+        throw failure;
+      },
+    }).fetch(authed('http://host/healthz'), h.env, h.ctx);
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: 'deployment unavailable' });
+    expect(logs.errors().map((line) => JSON.parse(line))).toContainEqual({
+      type: 'deployment-identity-error',
+      reason: diagnostic,
+    });
     await h.flush();
   });
 });
@@ -1093,7 +1181,8 @@ describe('createFlowsafeWorker maintenance duties', () => {
           resourceId TEXT,
           snapshot TEXT NOT NULL,
           createdAt TEXT NOT NULL,
-          updatedAt TEXT NOT NULL
+          updatedAt TEXT NOT NULL,
+          UNIQUE(workflow_name, run_id)
         )`,
       )
       .run();
@@ -1261,13 +1350,265 @@ describe('createFlowsafeWorker maintenance duties', () => {
     const { env } = makeEnv();
 
     // #when
-    await worker.runMaintenanceDuty('purge', env);
+    await worker.runMaintenanceDuty('purge', env, retentionContext());
 
     // #then
     const lines = maintenanceLines(logs.lines());
     expect(lines).toHaveLength(1);
     expect(lines[0]).toMatchObject({ purged: 0, approvalsPurged: 0 });
     expect(lines[0]).not.toHaveProperty('escalated');
+  });
+
+  it.each([
+    undefined,
+    null,
+    false,
+  ])('refuses a missing or non-callable retention callback before factories and schema work: %j', async (advanceRetentionCursor) => {
+    const logs = capturedLogs();
+    const artifactStore = vi.fn(() => ({ deleteRun: async () => 0 }));
+    const extraPurgeDuties = vi.fn(async () => ({ extraDuty: 'ran' }));
+    const worker = makeWorker({ artifactStore, extraPurgeDuties });
+    const { env } = makeEnv();
+    await seedIdleThread(env);
+
+    const outcome = await worker.runMaintenanceDuty(
+      'purge',
+      {
+        ...env,
+        THREAD_RETENTION_DAYS: '30',
+      },
+      advanceRetentionCursor === undefined
+        ? undefined
+        : ({ advanceRetentionCursor } as unknown as MaintenanceDutyContext),
+    );
+
+    expect(outcome).toEqual({
+      ok: false,
+      error: expect.stringContaining('advanceRetentionCursor'),
+    });
+    expect(artifactStore).not.toHaveBeenCalled();
+    expect(extraPurgeDuties).toHaveBeenCalledOnce();
+    expect(await threadIds(env)).toEqual([]);
+    expect(maintenanceLines(logs.lines())[0]).toMatchObject({
+      approvalsPurged: 0,
+      threadsPurged: 1,
+      extraDuty: 'ran',
+    });
+    expect(
+      await env.DB.prepare(
+        "SELECT name FROM sqlite_schema WHERE name = 'flowsafe_resource_owners'",
+      ).all(),
+    ).toMatchObject({ results: [] });
+  });
+
+  it.each([
+    undefined,
+    null,
+    false,
+    {},
+  ])('requires a callable batch for retention without changing the optional environment contract: %j', async (batch) => {
+    const logs = capturedLogs();
+    const artifactStore = vi.fn(() => ({ deleteRun: async () => 0 }));
+    const extraPurgeDuties = vi.fn(async () => ({ extraDuty: 'ran' }));
+    const worker = makeWorker({ artifactStore, extraPurgeDuties });
+    const { env } = makeEnv();
+    const dbWithoutBatch: FlowsafeWorkerEnv['DB'] = {
+      prepare: env.DB.prepare.bind(env.DB),
+    };
+    env.DB =
+      batch === undefined
+        ? dbWithoutBatch
+        : ({ ...dbWithoutBatch, batch } as FlowsafeWorkerEnv['DB']);
+    const context = retentionContext();
+
+    const outcome = await worker.runMaintenanceDuty('purge', env, context);
+
+    expect(outcome).toEqual({
+      ok: false,
+      error: expect.stringContaining('database.prepare() and batch()'),
+    });
+    expect(context.retentionCursor).toBeUndefined();
+    expect(artifactStore).not.toHaveBeenCalled();
+    expect(extraPurgeDuties).toHaveBeenCalledOnce();
+    expect(maintenanceLines(logs.lines())[0]).toMatchObject({
+      approvalsPurged: 0,
+      extraDuty: 'ran',
+    });
+    expect(
+      await env.DB.prepare(
+        "SELECT name FROM sqlite_schema WHERE name = 'flowsafe_resource_owners'",
+      ).all(),
+    ).toMatchObject({ results: [] });
+    expect(await worker.runMaintenanceDuty('sweep', env)).toMatchObject({
+      ok: true,
+    });
+  });
+
+  it('uses captured DB receivers and cursor values when the artifact factory changes their source', async () => {
+    capturedLogs();
+    const { env } = makeEnv();
+    const realDb = env.DB;
+    await realDb
+      .prepare(`CREATE TABLE mastra_workflow_snapshot (
+      workflow_name TEXT NOT NULL, run_id TEXT NOT NULL, resourceId TEXT,
+      snapshot TEXT NOT NULL, createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL,
+      UNIQUE(workflow_name, run_id)
+    )`)
+      .run();
+    const old = new Date(Date.now() - 90 * 86_400_000).toISOString();
+    for (const runId of ['already-scanned', 'eligible']) {
+      await realDb
+        .prepare(`INSERT INTO mastra_workflow_snapshot
+        VALUES ('wf', ?, NULL, ?, ?, ?)`)
+        .bind(
+          runId,
+          JSON.stringify({
+            status: 'success',
+            requestContext: {
+              'flowsafe.runProvenance': {
+                version: 2,
+                startToken: `start-${runId}`,
+              },
+            },
+          }),
+          old,
+          old,
+        )
+        .run();
+    }
+    const context = retentionContext();
+    const input = {
+      version: 1 as const,
+      tablePrefix: '',
+      startIdempotencyTable: 'flowsafe_start_idempotency',
+      snapshots: { afterRowId: 1, highWaterRowId: 2 },
+    };
+    context.retentionCursor = input;
+    let batchCalls = 0;
+    const batch = realDb.batch?.bind(realDb);
+    if (!batch) throw new Error('SQLite fixture requires batch');
+    const receiverDb: FlowsafeWorkerEnv['DB'] = {
+      prepare(query) {
+        expect(this).toBe(receiverDb);
+        return realDb.prepare(query);
+      },
+      async batch(statements) {
+        expect(this).toBe(receiverDb);
+        batchCalls += 1;
+        return batch(statements);
+      },
+    };
+    env.DB = receiverDb;
+    const artifactCalls: string[] = [];
+    const worker = makeWorker({
+      artifactStore: () => {
+        receiverDb.prepare = (query) => {
+          if (
+            query.includes('mastra_workflow_snapshot') ||
+            query.includes('flowsafe_resource_owners')
+          ) {
+            throw new Error('replacement prepare');
+          }
+          return realDb.prepare(query);
+        };
+        receiverDb.batch = async () => {
+          throw new Error('replacement batch');
+        };
+        input.snapshots.afterRowId = 0;
+        context.advanceRetentionCursor = async () => {
+          throw new Error('replacement callback');
+        };
+        return {
+          deleteRun: async (_workflowId, runId) => {
+            artifactCalls.push(runId);
+            return 0;
+          },
+        };
+      },
+    });
+
+    const outcome = await worker.runMaintenanceDuty('purge', env, context);
+
+    expect(outcome).toMatchObject({ ok: true });
+    expect(batchCalls).toBeGreaterThan(0);
+    expect(artifactCalls).toEqual(['eligible']);
+    expect(
+      await realDb.prepare('SELECT run_id FROM mastra_workflow_snapshot').all(),
+    ).toMatchObject({
+      results: [{ run_id: 'already-scanned' }],
+    });
+    expect(context.retentionCursor).toEqual({
+      version: 1,
+      tablePrefix: '',
+      startIdempotencyTable: 'flowsafe_start_idempotency',
+    });
+  });
+
+  it('contains an unprintable persistence rejection without starving sibling purges', async () => {
+    const logs = capturedLogs();
+    const extraPurgeDuties = vi.fn(async () => ({ extraDuty: 'ran' }));
+    const worker = makeWorker({ extraPurgeDuties });
+    const { env } = makeEnv();
+    await seedIdleThread(env);
+
+    const outcome = await worker.runMaintenanceDuty(
+      'purge',
+      {
+        ...env,
+        THREAD_RETENTION_DAYS: '30',
+      },
+      {
+        advanceRetentionCursor: async () => {
+          throw Object.create(null);
+        },
+      },
+    );
+
+    expect(outcome).toEqual({
+      ok: false,
+      error: expect.stringContaining('retention-purge'),
+    });
+    expect(extraPurgeDuties).toHaveBeenCalledOnce();
+    expect(await threadIds(env)).toEqual([]);
+    expect(maintenanceLines(logs.lines())[0]).toMatchObject({
+      approvalsPurged: 0,
+      threadsPurged: 1,
+      extraDuty: 'ran',
+    });
+  });
+
+  it('contains an unprintable approval rejection without starving sibling purges', async () => {
+    const logs = capturedLogs();
+    const extraPurgeDuties = vi.fn(async () => ({ extraDuty: 'ran' }));
+    const worker = makeWorker({ extraPurgeDuties });
+    const { env } = makeEnv();
+    await seedIdleThread(env);
+    vi.spyOn(
+      approvalStoreFactoryFor(env.DB).store(),
+      'purgeExpired',
+    ).mockRejectedValue(Object.create(null));
+
+    const outcome = await worker.runMaintenanceDuty(
+      'purge',
+      {
+        ...env,
+        THREAD_RETENTION_DAYS: '30',
+      },
+      retentionContext(),
+    );
+
+    expect(outcome).toEqual({
+      ok: false,
+      error: expect.stringContaining(
+        'approval-retention-purge: unreadable error',
+      ),
+    });
+    expect(extraPurgeDuties).toHaveBeenCalledOnce();
+    expect(await threadIds(env)).toEqual([]);
+    expect(maintenanceLines(logs.lines())[0]).toMatchObject({
+      threadsPurged: 1,
+      extraDuty: 'ran',
+    });
   });
 
   it('isolates purge-duty failures: a broken snapshot purge stops neither the approval purge nor extra duties', async () => {
@@ -1289,7 +1630,11 @@ describe('createFlowsafeWorker maintenance duties', () => {
     });
 
     // #when
-    await worker.runMaintenanceDuty('purge', { ...env, DB: throwingDb });
+    await worker.runMaintenanceDuty(
+      'purge',
+      { ...env, DB: throwingDb },
+      retentionContext(),
+    );
 
     // #then — the failure is on record and the OTHER duties still folded
     // into the one combined maintenance line
@@ -1308,11 +1653,6 @@ describe('createFlowsafeWorker maintenance duties', () => {
     expect(lines[0]?.purged).toBeUndefined();
   });
 
-  // The agent-memory thread TTL (docs/agent-memory-isolation.md#thread-retention) as the
-  // purge alarm's third duty. Seeds the two memory tables the real
-  // @mastra/cloudflare-d1 schema creates (mastra-schema-guard.test.ts pins the
-  // column names); a fresh test DB has neither, which is itself the
-  // memory-less-deployment case the first test below rides.
   async function seedIdleThread(env: FlowsafeWorkerEnv): Promise<void> {
     await env.DB.prepare(
       'CREATE TABLE mastra_threads (id TEXT PRIMARY KEY, updatedAt TEXT NOT NULL)',
@@ -1349,7 +1689,7 @@ describe('createFlowsafeWorker maintenance duties', () => {
     await seedIdleThread(env);
 
     // #when
-    await worker.runMaintenanceDuty('purge', env);
+    await worker.runMaintenanceDuty('purge', env, retentionContext());
 
     // #then — the duty never ran: nothing in the log, nothing deleted
     const lines = maintenanceLines(logs.lines());
@@ -1365,10 +1705,14 @@ describe('createFlowsafeWorker maintenance duties', () => {
     await seedIdleThread(env);
 
     // #when
-    await worker.runMaintenanceDuty('purge', {
-      ...env,
-      THREAD_RETENTION_DAYS: '30',
-    });
+    await worker.runMaintenanceDuty(
+      'purge',
+      {
+        ...env,
+        THREAD_RETENTION_DAYS: '30',
+      },
+      retentionContext(),
+    );
 
     // #then — reaped WITH its messages, reported in the combined line
     const lines = maintenanceLines(logs.lines());
@@ -1380,7 +1724,6 @@ describe('createFlowsafeWorker maintenance duties', () => {
     });
   });
 
-  // Background-task TTL cleanup as the purge alarm's opt-in duty.
   async function seedOldCompletedTask(env: FlowsafeWorkerEnv): Promise<void> {
     await env.DB.prepare(
       `CREATE TABLE mastra_background_tasks (
@@ -1403,7 +1746,7 @@ describe('createFlowsafeWorker maintenance duties', () => {
     await seedOldCompletedTask(env);
 
     // #when
-    await worker.runMaintenanceDuty('purge', env);
+    await worker.runMaintenanceDuty('purge', env, retentionContext());
 
     // #then — the duty never ran when the feature was absent
     const lines = maintenanceLines(logs.lines());
@@ -1419,7 +1762,7 @@ describe('createFlowsafeWorker maintenance duties', () => {
     await seedOldCompletedTask(env);
 
     // #when
-    await worker.runMaintenanceDuty('purge', env);
+    await worker.runMaintenanceDuty('purge', env, retentionContext());
 
     // #then — reaped, reported in the combined maintenance line
     const lines = maintenanceLines(logs.lines());
@@ -1470,9 +1813,6 @@ describe('createFlowsafeWorker maintenance duties', () => {
   });
 
   it('isolates a THROWING thread purge: neither the snapshot purge, the approval purge, nor extra duties are starved', async () => {
-    // #given — a DB whose mastra_threads statements THROW (not merely missing).
-    // Isolating one duty while a sibling shares its failure is a defect class
-    // this codebase has already shipped once.
     const logs = capturedLogs();
     const { env } = makeEnv();
     const realDb = env.DB;
@@ -1490,11 +1830,15 @@ describe('createFlowsafeWorker maintenance duties', () => {
     });
 
     // #when
-    await worker.runMaintenanceDuty('purge', {
-      ...env,
-      DB: throwingDb,
-      THREAD_RETENTION_DAYS: '30',
-    });
+    await worker.runMaintenanceDuty(
+      'purge',
+      {
+        ...env,
+        DB: throwingDb,
+        THREAD_RETENTION_DAYS: '30',
+      },
+      retentionContext(),
+    );
 
     // #then — its own error surface, and every sibling duty still folded into
     // the one combined line
@@ -1535,11 +1879,15 @@ describe('createFlowsafeWorker maintenance duties', () => {
     const worker = makeWorker();
 
     // #when
-    await worker.runMaintenanceDuty('purge', {
-      ...env,
-      DB: throwingDb,
-      THREAD_RETENTION_DAYS: '30',
-    });
+    await worker.runMaintenanceDuty(
+      'purge',
+      {
+        ...env,
+        DB: throwingDb,
+        THREAD_RETENTION_DAYS: '30',
+      },
+      retentionContext(),
+    );
 
     // #then — the thread TTL ran anyway
     const lines = maintenanceLines(logs.lines());
@@ -1557,10 +1905,14 @@ describe('createFlowsafeWorker maintenance duties', () => {
     await seedIdleThread(env);
 
     // #when
-    await worker.runMaintenanceDuty('purge', {
-      ...env,
-      THREAD_RETENTION_DAYS: '',
-    });
+    await worker.runMaintenanceDuty(
+      'purge',
+      {
+        ...env,
+        THREAD_RETENTION_DAYS: '',
+      },
+      retentionContext(),
+    );
 
     // #then — inert, exactly as if unset
     expect(maintenanceLines(logs.lines())[0]).not.toHaveProperty(
@@ -1581,10 +1933,14 @@ describe('createFlowsafeWorker maintenance duties', () => {
     await seedIdleThread(env);
 
     // #when
-    await worker.runMaintenanceDuty('purge', {
-      ...env,
-      THREAD_RETENTION_DAYS: '-5',
-    });
+    await worker.runMaintenanceDuty(
+      'purge',
+      {
+        ...env,
+        THREAD_RETENTION_DAYS: '-5',
+      },
+      retentionContext(),
+    );
 
     // #then — the operator's tripwire fires and NOTHING was deleted
     expect(
@@ -1613,7 +1969,11 @@ describe('createFlowsafeWorker maintenance duties', () => {
     const { env } = makeEnv();
 
     // #when
-    const outcome = await worker.runMaintenanceDuty('purge', env);
+    const outcome = await worker.runMaintenanceDuty(
+      'purge',
+      env,
+      retentionContext(),
+    );
 
     // #then — belt containment: the combined line still lands
     expect(
@@ -1689,7 +2049,8 @@ describe('createFlowsafeWorker storage table prefix', () => {
         resourceId TEXT,
         snapshot TEXT NOT NULL,
         createdAt TEXT NOT NULL,
-        updatedAt TEXT NOT NULL
+        updatedAt TEXT NOT NULL,
+        UNIQUE(workflow_name, run_id)
       )`,
     ).run();
     await env.DB.prepare(
@@ -1803,13 +2164,17 @@ describe('createFlowsafeWorker storage table prefix', () => {
       storageTablePrefix,
       backgroundTasks: {},
     });
-    await worker.runMaintenanceDuty('purge', {
-      ...env,
-      THREAD_RETENTION_DAYS: '30',
-      NOTIFICATION_RETENTION_DAYS: '30',
-      THREAD_STATE_RETENTION_DAYS: '30',
-      SCHEDULE_TRIGGER_RETENTION_DAYS: '30',
-    });
+    await worker.runMaintenanceDuty(
+      'purge',
+      {
+        ...env,
+        THREAD_RETENTION_DAYS: '30',
+        NOTIFICATION_RETENTION_DAYS: '30',
+        THREAD_STATE_RETENTION_DAYS: '30',
+        SCHEDULE_TRIGGER_RETENTION_DAYS: '30',
+      },
+      retentionContext(),
+    );
   }
 
   async function expectDomains(
@@ -1987,7 +2352,7 @@ describe('createFlowsafeWorker schedule tick duty', () => {
     const { env } = makeEnv();
 
     // #when the purge duty runs while the tick builder is present
-    await worker.runMaintenanceDuty('purge', env);
+    await worker.runMaintenanceDuty('purge', env, retentionContext());
 
     // #then the tick was never invoked; the purge ran as before
     expect(tickFn).not.toHaveBeenCalled();

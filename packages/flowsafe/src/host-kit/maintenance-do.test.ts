@@ -2,7 +2,14 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
-import { deploymentIdentityHeaders } from '../do-runner/index.js';
+import {
+  deploymentIdentityHeaders,
+  type RunRetentionCursor,
+} from '../do-runner/index.js';
+import {
+  START_IDEMPOTENCY_DDL,
+  START_IDEMPOTENCY_TABLE,
+} from '../do-runner/start-reservation-contract.js';
 import {
   createFlowsafeMaintenanceDurableObject,
   type FlowsafeWorkerConfig,
@@ -22,6 +29,7 @@ import { staticTokenVerifier } from './verifier.js';
 const NOW = Date.parse('2026-08-10T12:00:00.000Z');
 const DEPLOYMENT_SECRET = 'test-deployment-identity-secret-0001';
 const MAINTENANCE_SECRET = 'test-maintenance-capability-secret-0001';
+const RETENTION_CURSOR_KEY = 'flowsafe:maintenance-run-retention-cursor:v1';
 const CAPABILITY_PRIVATE_KEY = {
   kty: 'OKP',
   crv: 'Ed25519',
@@ -72,6 +80,8 @@ class FakeStorage {
   readonly values = new Map<string, unknown>();
   alarmAt: number | null = null;
   failTransactionNumber?: number;
+  failPutKey?: string;
+  losePutResponseKey?: string;
   transactionCount = 0;
 
   async get<T>(key: string): Promise<T | undefined> {
@@ -116,11 +126,20 @@ class FakeStorage {
         nextAlarm = Number(value);
       },
     });
-    if (this.failTransactionNumber === transactionNumber) {
+    if (
+      this.failTransactionNumber === transactionNumber ||
+      (this.failPutKey !== undefined && writes.has(this.failPutKey))
+    ) {
       throw new Error('simulated crash after duty');
     }
     for (const [key, value] of writes) this.values.set(key, value);
     this.alarmAt = nextAlarm;
+    if (
+      this.losePutResponseKey !== undefined &&
+      writes.has(this.losePutResponseKey)
+    ) {
+      throw new Error('simulated storage response loss');
+    }
     return result;
   }
 }
@@ -132,6 +151,7 @@ function harness(
     withTick?: boolean;
     throwTick?: boolean;
     deadlineLimit?: number;
+    config?: Partial<FlowsafeWorkerConfig<TestEnv>>;
   } = {},
 ) {
   const env = environment();
@@ -171,6 +191,7 @@ function harness(
           },
         }
       : {}),
+    ...options.config,
   } satisfies FlowsafeWorkerConfig<TestEnv>;
   const Maintenance = createFlowsafeMaintenanceDurableObject(config);
   const state = {
@@ -183,7 +204,111 @@ function harness(
       method,
       headers: deploymentIdentityHeaders(DEPLOYMENT_SECRET),
     });
-  return { env, instance, storage, internalRequest };
+  const reconstruct = (
+    overrides: Partial<FlowsafeWorkerConfig<TestEnv>> = {},
+  ) => {
+    const Reconstructed = createFlowsafeMaintenanceDurableObject({
+      ...config,
+      ...overrides,
+    });
+    return new Reconstructed(state, env);
+  };
+  return { env, instance, storage, internalRequest, reconstruct };
+}
+
+async function createRetentionSnapshots(
+  env: TestEnv,
+  prefix = '',
+): Promise<void> {
+  await env.DB.prepare(
+    `CREATE TABLE ${prefix}mastra_workflow_snapshot (
+      workflow_name TEXT NOT NULL,
+      run_id TEXT NOT NULL,
+      resourceId TEXT,
+      snapshot TEXT NOT NULL,
+      createdAt TEXT NOT NULL,
+      updatedAt TEXT NOT NULL,
+      UNIQUE(workflow_name, run_id)
+    )`,
+  ).run();
+}
+
+async function insertRetentionSnapshot(
+  env: TestEnv,
+  runId: string,
+  prefix = '',
+): Promise<void> {
+  const old = new Date(NOW - 90 * 86_400_000).toISOString();
+  await env.DB.prepare(
+    `INSERT INTO ${prefix}mastra_workflow_snapshot
+     (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
+     VALUES ('wf', ?, NULL, ?, ?, ?)`,
+  )
+    .bind(
+      runId,
+      JSON.stringify({
+        status: 'success',
+        requestContext: {
+          'flowsafe.runProvenance': {
+            version: 2,
+            startToken: `start-${runId}`,
+          },
+        },
+      }),
+      old,
+      old,
+    )
+    .run();
+}
+
+async function insertRetentionReservation(
+  env: TestEnv,
+  key: string,
+  state = 'terminal',
+): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO ${START_IDEMPOTENCY_TABLE}
+     (key, owner_kind, owner_id, target_kind, target_id, run_id,
+      thread_id, state, created_at, updated_at,
+      start_token, start_table_prefix, start_workflow_id)
+     VALUES (?, 'human', 'ada', 'workflow', 'wf', ?, NULL, ?, ?, ?, NULL, NULL, NULL)`,
+  )
+    .bind(
+      key,
+      `run-${key}`,
+      state,
+      NOW - 90 * 86_400_000,
+      NOW - 90 * 86_400_000,
+    )
+    .run();
+}
+
+async function snapshotIds(env: TestEnv, prefix = ''): Promise<string[]> {
+  const { results } = await env.DB.prepare(
+    `SELECT run_id FROM ${prefix}mastra_workflow_snapshot ORDER BY rowid`,
+  ).all<{ run_id: string }>();
+  return results.map((row) => row.run_id);
+}
+
+async function reservationKeys(env: TestEnv): Promise<string[]> {
+  const { results } = await env.DB.prepare(
+    `SELECT key FROM ${START_IDEMPOTENCY_TABLE} ORDER BY rowid`,
+  ).all<{ key: string }>();
+  return results.map((row) => row.key);
+}
+
+async function nextPurge(
+  instance: ReturnType<typeof harness>['instance'],
+  internalRequest: ReturnType<typeof harness>['internalRequest'],
+): Promise<MaintenanceHealth & { alarmAt: number | null }> {
+  const before = await healthOf(instance, internalRequest('/status', 'GET'));
+  vi.setSystemTime(before.nextPurgeAt);
+  await instance.alarm();
+  await instance.alarm();
+  await instance.alarm();
+  const after = await healthOf(instance, internalRequest('/status', 'GET'));
+  expect(after.lastPurgeAttemptAt).toBe(before.nextPurgeAt);
+  return after;
 }
 
 async function healthOf(
@@ -203,6 +328,342 @@ afterEach(() => {
 });
 
 describe('alarm-driven deployment maintenance', () => {
+  it('reconstructs independent retention positions and finishes a finite cycle past artifact failures', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const artifactCalls: string[] = [];
+    const { env, instance, storage, internalRequest, reconstruct } = harness({
+      config: {
+        artifactStore: () => ({
+          deleteRun: async (_workflowId, runId) => {
+            artifactCalls.push(runId);
+            if (runId.startsWith('poison-'))
+              throw new Error('artifact unavailable');
+            return 0;
+          },
+        }),
+      },
+    });
+    await createRetentionSnapshots(env);
+    await env.DB.prepare(START_IDEMPOTENCY_DDL).run();
+    const poisonIds = Array.from(
+      { length: 91 },
+      (_, index) => `poison-${index}`,
+    );
+    for (const runId of poisonIds) {
+      await insertRetentionSnapshot(env, runId);
+    }
+    const heldKeys = poisonIds.slice(0, 90);
+    for (const runId of heldKeys) {
+      await insertRetentionReservation(env, runId, 'started');
+    }
+    await insertRetentionSnapshot(env, 'eligible');
+    await insertRetentionReservation(env, 'eligible-orphan');
+    await instance.fetch(internalRequest('/ensure', 'POST'));
+
+    await nextPurge(instance, internalRequest);
+
+    expect(await storage.get(RETENTION_CURSOR_KEY)).toEqual({
+      version: 1,
+      tablePrefix: '',
+      startIdempotencyTable: START_IDEMPOTENCY_TABLE,
+      snapshots: { afterRowId: 90, highWaterRowId: 92 },
+      reservations: { afterRowId: 90, highWaterRowId: 91 },
+    });
+    expect(artifactCalls).toEqual(poisonIds.slice(0, 90));
+    expect(await snapshotIds(env)).toEqual([...poisonIds, 'eligible']);
+    expect(await reservationKeys(env)).toContain('eligible-orphan');
+
+    await insertRetentionSnapshot(env, 'late');
+    await insertRetentionReservation(env, 'late-orphan');
+    artifactCalls.length = 0;
+    const second = reconstruct();
+    const secondHealth = await nextPurge(second, internalRequest);
+
+    expect(artifactCalls).toEqual(['poison-90', 'eligible']);
+    expect(await snapshotIds(env)).toEqual([...poisonIds, 'late']);
+    expect(await reservationKeys(env)).toEqual([...heldKeys, 'late-orphan']);
+    expect(await storage.get(RETENTION_CURSOR_KEY)).toEqual({
+      version: 1,
+      tablePrefix: '',
+      startIdempotencyTable: START_IDEMPOTENCY_TABLE,
+    });
+    expect(secondHealth.alarmAt).toBeGreaterThan(
+      secondHealth.lastPurgeAttemptAt ?? 0,
+    );
+
+    const recoveredArtifacts: string[] = [];
+    const third = reconstruct({
+      artifactStore: () => ({
+        deleteRun: async (_workflowId, runId) => {
+          recoveredArtifacts.push(runId);
+          return 0;
+        },
+      }),
+    });
+    await nextPurge(third, internalRequest);
+    expect(recoveredArtifacts).toEqual(poisonIds.slice(0, 90));
+    const fourth = reconstruct({
+      artifactStore: () => ({ deleteRun: async () => 0 }),
+    });
+    await nextPurge(fourth, internalRequest);
+    expect(await snapshotIds(env)).toEqual([]);
+    expect(await reservationKeys(env)).toEqual(heldKeys);
+  });
+
+  it.each([
+    { tablePrefix: 'retired_', startIdempotencyTable: START_IDEMPOTENCY_TABLE },
+    { tablePrefix: 'tenant_', startIdempotencyTable: 'retired_reservations' },
+    { tablePrefix: 'tenant_' },
+  ])('resets a valid stored scope when configuration changes: %j', async (scope) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { env, instance, storage, internalRequest, reconstruct } = harness();
+    await createRetentionSnapshots(env, 'tenant_');
+    await createRetentionSnapshots(env, 'retired_');
+    await insertRetentionSnapshot(env, 'eligible', 'tenant_');
+    await insertRetentionSnapshot(env, 'other-scope', 'retired_');
+    await instance.fetch(internalRequest('/ensure', 'POST'));
+    await storage.put(RETENTION_CURSOR_KEY, {
+      version: 1,
+      ...scope,
+      snapshots: { afterRowId: 100, highWaterRowId: 200 },
+    });
+
+    const changed = reconstruct({ storageTablePrefix: 'TeNaNt_' });
+    const health = await nextPurge(changed, internalRequest);
+
+    expect(health.lastPurgeError).toBeUndefined();
+    expect(await snapshotIds(env, 'tenant_')).toEqual([]);
+    expect(await snapshotIds(env, 'retired_')).toEqual(['other-scope']);
+    expect(await storage.get(RETENTION_CURSOR_KEY)).toEqual({
+      version: 1,
+      tablePrefix: 'tenant_',
+      startIdempotencyTable: START_IDEMPOTENCY_TABLE,
+    });
+  });
+
+  it('preserves a matching canonical scope across reconstruction', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { env, instance, storage, internalRequest, reconstruct } = harness();
+    await createRetentionSnapshots(env, 'tenant_');
+    await insertRetentionSnapshot(env, 'already-scanned', 'tenant_');
+    await insertRetentionSnapshot(env, 'eligible', 'tenant_');
+    await instance.fetch(internalRequest('/ensure', 'POST'));
+    await storage.put(RETENTION_CURSOR_KEY, {
+      version: 1,
+      tablePrefix: 'tenant_',
+      startIdempotencyTable: START_IDEMPOTENCY_TABLE,
+      snapshots: { afterRowId: 1, highWaterRowId: 2 },
+    });
+
+    await nextPurge(
+      reconstruct({ storageTablePrefix: 'TeNaNt_' }),
+      internalRequest,
+    );
+
+    expect(await snapshotIds(env, 'tenant_')).toEqual(['already-scanned']);
+    expect(
+      await storage.get<RunRetentionCursor>(RETENTION_CURSOR_KEY),
+    ).not.toHaveProperty('snapshots');
+  });
+
+  it.each([
+    null,
+    false,
+    0,
+    '',
+    [],
+    {},
+    { version: 2, tablePrefix: '' },
+    { version: 1, tablePrefix: '', snapshots: null },
+    {
+      version: 1,
+      tablePrefix: '',
+      snapshots: { afterRowId: 2, highWaterRowId: 1 },
+    },
+    {
+      version: 1,
+      tablePrefix: 'retired_',
+      snapshots: { afterRowId: 0.5, highWaterRowId: 2 },
+    },
+    {
+      version: 1,
+      tablePrefix: '',
+      reservations: { afterRowId: 1, highWaterRowId: 2 },
+    },
+  ])('refuses malformed stored retention state while preserving sibling duties: %j', async (stored) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const artifactStore = vi.fn(() => ({ deleteRun: async () => 0 }));
+    const extraPurgeDuties = vi.fn(async () => ({ extra: true }));
+    const { env, instance, storage, internalRequest } = harness({
+      config: { artifactStore, extraPurgeDuties },
+    });
+    await createRetentionSnapshots(env);
+    await insertRetentionSnapshot(env, 'eligible');
+    await instance.fetch(internalRequest('/ensure', 'POST'));
+    await storage.put(RETENTION_CURSOR_KEY, stored);
+
+    const health = await nextPurge(instance, internalRequest);
+
+    expect(health.lastPurgeAt).toBeUndefined();
+    expect(health.lastPurgeError).toContain('retention-purge');
+    expect(health.lastSweepAt).toBe(NOW);
+    expect(health.lastDeadlineAt).toBe(NOW);
+    expect(health.alarmAt).toBeGreaterThan(NOW);
+    expect(artifactStore).not.toHaveBeenCalled();
+    expect(extraPurgeDuties).toHaveBeenCalledOnce();
+    expect(await snapshotIds(env)).toEqual(['eligible']);
+    expect(await storage.get(RETENTION_CURSOR_KEY)).toEqual(stored);
+    expect(
+      await env.DB.prepare(
+        "SELECT name FROM sqlite_schema WHERE name = 'flowsafe_resource_owners'",
+      ).all(),
+    ).toMatchObject({ results: [] });
+  });
+
+  it.each([
+    'rollback',
+    'response loss',
+  ] as const)('stops orphan retention after cursor persistence %s and safely resumes in a new instance', async (failure) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const artifactCalls: string[] = [];
+    const extraPurgeDuties = vi.fn(async () => ({ extra: true }));
+    const { env, instance, storage, internalRequest, reconstruct } = harness({
+      config: {
+        extraPurgeDuties,
+        artifactStore: () => ({
+          deleteRun: async (_workflowId, runId) => {
+            artifactCalls.push(runId);
+            expect(storage.events.slice(-2)).toEqual([
+              'transaction-put',
+              'transaction-alarm',
+            ]);
+            expect(storage.alarmAt).toBeGreaterThan(NOW);
+            return 0;
+          },
+        }),
+      },
+    });
+    await createRetentionSnapshots(env);
+    await insertRetentionSnapshot(env, 'eligible');
+    await env.DB.prepare(START_IDEMPOTENCY_DDL).run();
+    await insertRetentionReservation(env, 'orphan');
+    const deadlineCursor = {
+      workflowId: 'wf',
+      runId: 'previous',
+      deadlineAt: NOW - 1,
+    };
+    await storage.put(
+      'flowsafe:maintenance-deadline-cursor:v1',
+      deadlineCursor,
+    );
+    await instance.fetch(internalRequest('/ensure', 'POST'));
+    if (failure === 'rollback') storage.failPutKey = RETENTION_CURSOR_KEY;
+    else storage.losePutResponseKey = RETENTION_CURSOR_KEY;
+
+    const health = await nextPurge(instance, internalRequest);
+
+    expect(health.lastPurgeError).toContain('retention-purge');
+    expect(health.lastPurgeAt).toBeUndefined();
+    expect(health.alarmAt).toBeGreaterThan(NOW);
+    expect(artifactCalls).toEqual(['eligible']);
+    expect(await snapshotIds(env)).toEqual([]);
+    expect(await reservationKeys(env)).toEqual(['orphan']);
+    expect(extraPurgeDuties).toHaveBeenCalledOnce();
+    expect(
+      await storage.get('flowsafe:maintenance-deadline-cursor:v1'),
+    ).toEqual(deadlineCursor);
+    const cursor = await storage.get(RETENTION_CURSOR_KEY);
+    if (failure === 'rollback') expect(cursor).toBeUndefined();
+    else
+      expect(cursor).toEqual({
+        version: 1,
+        tablePrefix: '',
+        startIdempotencyTable: START_IDEMPOTENCY_TABLE,
+      });
+
+    storage.failPutKey = undefined;
+    storage.losePutResponseKey = undefined;
+    const recovered = await nextPurge(reconstruct(), internalRequest);
+    expect(recovered.lastPurgeError).toBeUndefined();
+    expect(recovered.lastPurgeAt).toBe(NOW + 60 * 60 * 1_000);
+    expect(await reservationKeys(env)).toEqual([]);
+    expect(artifactCalls).toEqual(['eligible']);
+    expect(extraPurgeDuties).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not checkpoint a committed D1 mutation with a lost response and retries safely after reconstruction', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    let retentionBatch = false;
+    const extraPurgeDuties = vi.fn(async () => ({ extra: true }));
+    const { env, instance, storage, internalRequest, reconstruct } = harness({
+      config: {
+        extraPurgeDuties,
+        artifactStore: () => ({
+          deleteRun: async () => {
+            retentionBatch = true;
+            return 0;
+          },
+        }),
+      },
+    });
+    await createRetentionSnapshots(env);
+    await insertRetentionSnapshot(env, 'eligible');
+    await env.DB.prepare(START_IDEMPOTENCY_DDL).run();
+    await insertRetentionReservation(env, 'orphan');
+    const db = env.DB;
+    const batch = db.batch?.bind(db);
+    if (!batch) throw new Error('SQLite fixture requires batch');
+    env.DB = {
+      prepare: db.prepare.bind(db),
+      batch: async (statements) => {
+        const results = await batch(statements);
+        if (retentionBatch) {
+          retentionBatch = false;
+          throw new Error('D1 response lost after commit');
+        }
+        return results;
+      },
+    };
+    await instance.fetch(internalRequest('/ensure', 'POST'));
+
+    const health = await nextPurge(instance, internalRequest);
+
+    expect(health.lastPurgeError).toContain('D1 response lost after commit');
+    expect(health.lastPurgeAt).toBeUndefined();
+    expect(await storage.get(RETENTION_CURSOR_KEY)).toBeUndefined();
+    expect(await snapshotIds(env)).toEqual([]);
+    expect(await reservationKeys(env)).toEqual(['orphan']);
+    expect(extraPurgeDuties).toHaveBeenCalledOnce();
+    expect(health.alarmAt).toBeGreaterThan(NOW);
+
+    const recovered = await nextPurge(reconstruct(), internalRequest);
+    expect(recovered.lastPurgeError).toBeUndefined();
+    expect(await reservationKeys(env)).toEqual([]);
+    expect(await storage.get(RETENTION_CURSOR_KEY)).toEqual({
+      version: 1,
+      tablePrefix: '',
+      startIdempotencyTable: START_IDEMPOTENCY_TABLE,
+    });
+  });
+
   it('consumes one-shot capabilities and signs a nonce-bound result', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(NOW);
@@ -387,7 +848,8 @@ describe('alarm-driven deployment maintenance', () => {
           resourceId TEXT,
           snapshot TEXT NOT NULL,
           createdAt TEXT NOT NULL,
-          updatedAt TEXT NOT NULL
+          updatedAt TEXT NOT NULL,
+          UNIQUE(workflow_name, run_id)
         )`,
       )
       .run();

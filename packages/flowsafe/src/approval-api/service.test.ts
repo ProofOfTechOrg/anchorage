@@ -1708,6 +1708,101 @@ describe('ApprovalService.delegate concurrency', () => {
   });
 });
 
+describe('ApprovalService sink failure diagnostics', () => {
+  const failures = [
+    {
+      name: 'ordinary Error',
+      create: () => new Error('transport unavailable'),
+      diagnostic: 'transport unavailable',
+    },
+    {
+      name: 'throwing message getter',
+      create: () =>
+        Object.defineProperty(new Error(), 'message', {
+          get() {
+            throw new Error('message getter failed');
+          },
+        }),
+      diagnostic: 'unreadable error',
+    },
+    {
+      name: 'BigInt message',
+      create: () =>
+        Object.defineProperty(new Error(), 'message', { value: 1n }),
+      diagnostic: '1',
+    },
+    {
+      name: 'null-prototype rejection',
+      create: () => Object.create(null),
+      diagnostic: 'unreadable error',
+    },
+  ];
+
+  for (const sink of ['notify', 'stream'] as const) {
+    for (const mode of ['threw', 'rejected'] as const) {
+      it.each(
+        failures,
+      )(`${sink} ${mode} with $name preserves the approval and audit`, async ({
+        create,
+        diagnostic,
+      }) => {
+        const harness = makeHarness({
+          [sink]: () => {
+            if (mode === 'threw') throw create();
+            return Promise.reject(create());
+          },
+        });
+
+        const record = await seedPending(harness);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+
+        expect((await harness.store.get(record.id))?.status).toBe('pending');
+        expect(harness.events).toContainEqual(
+          expect.objectContaining({
+            action: `approval.${sink}`,
+            decision: 'error',
+            reason: `${sink === 'notify' ? 'notification' : 'stream'} sink ${mode}: ${diagnostic}`,
+          }),
+        );
+      });
+    }
+  }
+
+  it.each(
+    failures,
+  )('continues the SLA sweep when escalation hooks throw with $name', async ({
+    create,
+    diagnostic,
+  }) => {
+    const harness = makeHarness();
+    const first = await seedPending(harness, { slaSeconds: 60 });
+    const second = await seedPending(harness, {
+      slaSeconds: 60,
+      runId: 'acme_run-2',
+    });
+    harness.advance(61_000);
+
+    const escalated = await runSweep(harness, {
+      onEscalation: () => {
+        throw create();
+      },
+    });
+
+    expect(escalated.map(({ id }) => id).sort()).toEqual(
+      [first.id, second.id].sort(),
+    );
+    expect(
+      harness.events.filter(
+        (event) =>
+          event.action === 'approval.escalate' && event.decision === 'error',
+      ),
+    ).toEqual([
+      expect.objectContaining({ reason: `onEscalation threw: ${diagnostic}` }),
+      expect.objectContaining({ reason: `onEscalation threw: ${diagnostic}` }),
+    ]);
+  });
+});
+
 describe('ApprovalService notification seam', () => {
   it('notifies once per actually-created record, with the record', async () => {
     // #given

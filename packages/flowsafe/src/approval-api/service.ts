@@ -1286,7 +1286,11 @@ export class ApprovalService {
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  try {
+    return String(error instanceof Error ? error.message : error);
+  } catch {
+    return 'unreadable error';
+  }
 }
 
 // Maps a per-record decide() failure to BatchDecideItem.code — the same

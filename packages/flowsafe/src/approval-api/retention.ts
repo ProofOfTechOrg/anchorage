@@ -66,8 +66,7 @@ export interface PurgeExpiredApprovalsOptions {
   now?: () => number;
   /**
    * Records deleted per call — one LIMIT-batched DELETE per firing; the
-   * shrinking eligible set is the cursor across firings (same convention as
-   * purgeExpiredWorkflowRuns' row-only path). Default 1000.
+   * shrinking eligible set is the cursor across firings. Default 1000.
    */
   limit?: number;
 }

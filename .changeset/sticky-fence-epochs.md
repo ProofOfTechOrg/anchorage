@@ -22,4 +22,8 @@ Guard replay proof nomination with its original proof round/caller epoch, curren
 
 Capture trusted authority before asynchronous work across Worker configuration, protected JSON/header transport and the eighth agent-start authority argument. Keep public bodies and application context from supplying a winning claim. Preserve source-owner versus initiating-principal attribution, exact lifecycle counter exhaustion checks and rejection of sparse economic-operation lists.
 
-Final schedule-write protection, generation-aware retention and actual workerd/D1 acceptance remain required before enabling artifact-epoch enforcement across a deployment. Administrative support and explicitly unfenced execution do not supply those guarantees.
+Make workflow retention generation-aware, protect run owners across supported snapshot namespaces, and pair reservation cleanup with the complete bound execution. Preserve reserved owners, uncertain generations and legacy keys that cannot be safely associated. Recheck schema and selected identity at the mutation; keep artifact deletion ahead of D1 cleanup.
+
+Custom `purgeExpiredWorkflowRuns` callers must now provide transactional `database.batch()` and an `advanceCursor` callback, retain its exported `RunRetentionCursor`, and supply that cursor on the next call. Composed maintenance persists the cursor across alarms and restarts. Finite scan cycles revisit skipped candidates without letting continuous inserts extend the current cycle; unproved D1 outcomes and failed cursor writes do not advance progress.
+
+Final schedule-write protection and accumulated workerd/D1 acceptance remain required before enabling artifact-epoch enforcement across a deployment. Administrative support and explicitly unfenced execution do not supply those guarantees.

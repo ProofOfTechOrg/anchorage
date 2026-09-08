@@ -273,7 +273,7 @@ Recovery requires awaited owning quiescence equal to true and exact journal/fram
 
 A workflow journal must match its named Durable Object before recovery can use that object's quiescence. Agent recovery rechecks the complete journal after the authoritative read and before rolling back H-owned reservations. Both hosts require a keyed journal's configured reservation store before bookkeeping, even when its selected outcome is nonterminal.
 
-Strict terminal reservation settlement precedes managed approval, dispatch, owner and completion cleanup, with exact journal clearing last. Failures retain the journal and watchdog. A missing snapshot after fenced preparation also retains the journal and agent record/binding, preventing an unkeyed same-ID retry from executing again. Only an actual local, matching zero-insert receipt with an unwound owning frame and an absent row permits complete rollback. Prepared-unfenced absence/pending never enters initial repair or unspends a bound key. Final schedule enforcement and generation-aware retention acceptance remain required before enabling artifact epochs across the deployment.
+Strict terminal reservation settlement precedes managed approval, dispatch, owner and completion cleanup, with exact journal clearing last. Failures retain the journal and watchdog. A missing snapshot after fenced preparation also retains the journal and agent record/binding, preventing an unkeyed same-ID retry from executing again. Only an actual local, matching zero-insert receipt with an unwound owning frame and an absent row permits complete rollback. Prepared-unfenced absence/pending never enters initial repair or unspends a bound key. Final schedule enforcement and deployment-wide acceptance remain required before enabling artifact epochs across the deployment.
 
 ### Snapshot provenance
 
@@ -495,20 +495,32 @@ The runner does not provide an administrative “reset to last good state” API
 
 ## Retention
 
-`purgeExpiredWorkflowRuns(db, options)`:
+`purgeExpiredWorkflowRuns(db, options)` processes bounded pages of terminal snapshots and spent start reservations. It requires a transactional `db.batch()` and an `advanceCursor` callback. Persist the callback's `RunRetentionCursor` and pass it as `cursor` on the next invocation. The maintenance Durable Object handles this persistence for composed Workers.
 
-- selects only terminal statuses;
-- uses a bounded batch;
-- deletes paired R2 artifacts before the snapshot row;
-- keeps a failed row as a retry anchor while allowing later rows to proceed;
-- aggregates per-run failures after the pass;
-- treats a not-yet-created snapshot table as empty.
+For a lower-level caller with a D1 binding and Durable Object storage:
 
-The composed Worker resolves its optional artifact purger from the current maintenance invocation's environment inside this failure boundary. A factory or deletion failure keeps the enumerable snapshot row and does not stop approval or other domain purges.
+```typescript
+import {
+  purgeExpiredWorkflowRuns,
+  type RunRetentionCursor,
+} from '@proofoftech/flowsafe/do-runner';
 
-When runtime storage uses `tablePrefix`, configure the same `storageTablePrefix` on `createFlowsafeWorker()`. It threads that validated prefix through every prefix-aware built-in purge. Direct callers of any exported low-level purge receive the same fail-fast validation before D1 preparation. Fixed-schema Flowsafe tables remain unprefixed.
+const cursorKey = 'workflow-retention-cursor';
+const cursor = await state.storage.get<RunRetentionCursor>(cursorKey);
+await purgeExpiredWorkflowRuns(env.DB, {
+  ttlMs: 30 * 24 * 60 * 60 * 1000,
+  cursor,
+  advanceCursor: (next) => state.storage.put(cursorKey, next),
+});
+```
 
-Running and suspended rows are never age-purged. Retention treats `cancelled` and `timed_out` as terminal after lifecycle cleanup releases ownership.
+Serialize calls that share a cursor. A scan finishes against its captured high-water mark; a subsequent cycle revisits earlier skipped rows even while new rows arrive. A failed artifact deletion leaves its snapshot and permits progress to later candidates. A failed cursor write or uncertain D1 outcome stops that phase without recording unproved progress.
+
+Modern cleanup rechecks the physical address, execution token and owned provenance fields before deleting. Legacy cleanup rechecks its observed raw row. Run owners remain protected by reserved ownership or a matching run ID in another supported snapshot namespace. Bound reservations pair with the selected execution; an unreadable current generation is not evidence that an orphaned key can expire. Existing terminal timestamps remain unchanged; key expiry respects the configured retention horizon. Running and suspended rows remain; `cancelled` and `timed_out` require completed lifecycle cleanup.
+
+Configure `storageTablePrefix` on `createFlowsafeWorker()` to match runtime storage. Direct purge cursors must match their configured namespace and reservation table. Managed maintenance starts a fresh scan when a valid stored cursor belongs to a changed configuration; malformed stored cursors fail retention. Approval and other domain purges retain their separate failure handling.
+
+The composed Worker resolves its optional artifact purger from the current maintenance invocation's environment. Artifacts delete before D1 cleanup; use the runtime's bucket and matching `R2ArtifactStore.keyPrefix`. The artifact API addresses workflow/run pairs, so a D1 generation check cannot restore artifacts deleted during an uncoordinated replacement. Atomic owner-admission protection depends on fenced admission's owner guard; ordinary unfenced starts do not supply that transaction.
 
 Decommissioning deletes the bound storage after credentials and traffic are revoked. There is no in-database tenant purge in the single-organization data plane.
 

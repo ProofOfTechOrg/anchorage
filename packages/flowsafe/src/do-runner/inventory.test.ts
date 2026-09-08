@@ -583,7 +583,7 @@ describe('deployment drain inventory', () => {
     // means on the same deployment.
     const { sqlite, inventory } = await seeded();
     const iso = new Date(NOW).toISOString();
-    const snapshot = (cleanup: string | null): string =>
+    const snapshot = (cleanup: number | null): string =>
       JSON.stringify({
         status: 'timed_out',
         requestContext: {
@@ -606,7 +606,7 @@ describe('deployment drain inventory', () => {
            (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
          VALUES (?, ?, NULL, ?, ?, ?)`,
       )
-      .run('gated', 'abc_cleaned', snapshot(iso), iso, iso);
+      .run('gated', 'abc_cleaned', snapshot(NOW), iso, iso);
 
     // #when
     const runs = await inventory.read('runs');
@@ -616,6 +616,69 @@ describe('deployment drain inventory', () => {
       'abc_cleaning',
       'abc_r1',
     ]);
+  });
+
+  it.each([
+    ['status', '{"status":"success","status":"running"}'],
+    ['escaped status', '{"status":"success","sta\\u0074us":"running"}'],
+    [
+      'requestContext',
+      '{"status":"cancelled","requestContext":{"flowsafe.runLifecycle":{"terminal":{"cleanupCompletedAt":1}}},"requestContext":{}}',
+    ],
+    [
+      'flowsafe.runLifecycle',
+      '{"status":"cancelled","requestContext":{"flowsafe.runLifecycle":{"terminal":{"cleanupCompletedAt":1}},"flowsafe.runLifecycle":{}}}',
+    ],
+    [
+      'terminal',
+      '{"status":"cancelled","requestContext":{"flowsafe.runLifecycle":{"terminal":{"cleanupCompletedAt":1},"terminal":{}}}}',
+    ],
+    [
+      'cleanupCompletedAt',
+      '{"status":"cancelled","requestContext":{"flowsafe.runLifecycle":{"terminal":{"cleanupCompletedAt":1,"cleanupCompletedAt":null}}}}',
+    ],
+  ])('counts a duplicate eligibility path %s as live work', async (_path, snapshot) => {
+    const { sqlite, inventory } = await seeded();
+    const update = sqlite.prepare(
+      'UPDATE mastra_workflow_snapshot SET snapshot=? WHERE workflow_name=? AND run_id=?',
+    );
+    update.run(snapshot, 'gated', 'abc_r1');
+    const runs = await inventory.read('runs');
+    expect(runs.entries.map((entry) => entry.key[1])).toEqual(['abc_r1']);
+    update.run('{"status":"success"}', 'gated', 'abc_r1');
+    expect((await inventory.read('runs')).entries).toEqual([]);
+  });
+
+  it.each([
+    ['null', false],
+    ['false', false],
+    ['true', false],
+    ['"done"', false],
+    ['{}', false],
+    ['[]', false],
+    ['-1', false],
+    ['0.5', false],
+    ['9007199254740992', false],
+    ['1e309', false],
+    ['-1e309', false],
+    ['0', true],
+    ['1.0', true],
+    ['1e0', true],
+    ['9007199254740991', true],
+  ] as const)('classifies cleanup timestamp %s in the public run inventory', async (marker, complete) => {
+    const { sqlite, inventory } = await seeded();
+    sqlite
+      .prepare(
+        'UPDATE mastra_workflow_snapshot SET snapshot=? WHERE workflow_name=? AND run_id=?',
+      )
+      .run(
+        `{"status":"timed_out","requestContext":{"flowsafe.runLifecycle":{"terminal":{"cleanupCompletedAt":${marker}}}}}`,
+        'gated',
+        'abc_r1',
+      );
+    expect(
+      (await inventory.read('runs')).entries.map((entry) => entry.key[1]),
+    ).toEqual(complete ? [] : ['abc_r1']);
   });
 
   it('reads a table that was never created as an EMPTY category, not a fault', async () => {
