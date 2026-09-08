@@ -6,6 +6,13 @@ import {
   type TestHarness,
   type WorkerHandle,
 } from 'wrangler';
+import type { FleetInventoryAdvanceResult } from '../src/fleet-inventory-advance.js';
+import {
+  type FleetInventoryRunRecord,
+  type FleetInventoryStagedFact,
+  type FleetInventoryStagedRow,
+  fleetInventoryOptionsDigest,
+} from '../src/fleet-inventory-state.js';
 
 const ROOT = new URL('..', import.meta.url).pathname;
 const PROBE = new URL(
@@ -17,6 +24,57 @@ interface ProbeError {
   readonly name: string;
   readonly message: string;
   readonly errors?: readonly ProbeError[];
+}
+
+interface InventorySnapshot {
+  heads: Array<{
+    account_id: string;
+    active_operation_id: string | null;
+    latest_finalized_generation: number | null;
+    next_generation: number;
+  }>;
+  runs: Array<{
+    account_id: string;
+    operation_id: string;
+    generation: number;
+    options_digest: string;
+    run_record: string;
+    created_at_ms: number;
+    finalized_at_ms: number | null;
+  }>;
+  rows: Array<{
+    account_id: string;
+    generation: number;
+    kind: string;
+    ordinal: number;
+    payload: string;
+  }>;
+  facts: Array<{
+    account_id: string;
+    generation: number;
+    deployment_ordinal: number;
+    fact_kind: string;
+    fact_ordinal: number;
+    payload: string;
+  }>;
+}
+
+interface InventoryCommitRefusalProbe {
+  prior: FleetInventoryRunRecord;
+  intended: FleetInventoryRunRecord;
+  attempted: {
+    runRecord: FleetInventoryRunRecord;
+    rows: FleetInventoryStagedRow[];
+    facts: FleetInventoryStagedFact[];
+  };
+  before: InventorySnapshot;
+  afterRefusal: InventorySnapshot;
+  refused: ProbeError | null;
+  accepted: FleetInventoryRunRecord | null;
+  acceptanceError: ProbeError | null;
+  afterAcceptance: InventorySnapshot;
+  replay: FleetInventoryRunRecord | null;
+  afterReplay: InventorySnapshot;
 }
 
 interface OperationSnapshot {
@@ -113,6 +171,87 @@ interface BoundedDecommissionProbe {
 }
 
 const INVENTORY_OPERATION_ID = '123e4567-e89b-42d3-a456-426614174200';
+
+function expectInventorySeed(
+  snapshot: InventorySnapshot,
+  record: FleetInventoryRunRecord,
+) {
+  expect(record).toMatchObject({
+    state: 'staging',
+    options: { scriptNamePrefix: 'anchorage' },
+    progress: { generation: 1, revision: 1, factCount: 1 },
+  });
+  expect(snapshot.runs).toEqual([
+    {
+      account_id: 'account-inventory',
+      operation_id: record.operationId,
+      generation: 1,
+      options_digest: fleetInventoryOptionsDigest(record.options),
+      run_record: JSON.stringify(record),
+      created_at_ms: expect.any(Number),
+      finalized_at_ms: null,
+    },
+  ]);
+  expect(snapshot.rows).toEqual(
+    ['deployment', 'finding', 'registration'].map((kind) => ({
+      account_id: 'account-inventory',
+      generation: 1,
+      kind,
+      ordinal: 0,
+      payload: JSON.stringify(
+        kind === 'finding'
+          ? { detail: 'stale route prior' }
+          : { scriptName: 'prior' },
+      ),
+    })),
+  );
+  expect(snapshot.facts).toEqual([
+    {
+      account_id: 'account-inventory',
+      generation: 1,
+      deployment_ordinal: 0,
+      fact_kind: 'secret-name',
+      fact_ordinal: 0,
+      payload: JSON.stringify({ name: 'ANCHORAGE_NAME_0' }),
+    },
+  ]);
+}
+
+function expectInventoryRefusalAndReplay(result: InventoryCommitRefusalProbe) {
+  expectInventorySeed(result.before, result.prior);
+  expect(result.afterRefusal).toEqual(result.before);
+  expect(result.intended.progress.revision).toBe(2);
+  expect(result.afterAcceptance.runs).toEqual([
+    { ...result.before.runs[0], run_record: JSON.stringify(result.intended) },
+  ]);
+  expect(result.afterAcceptance.rows).toEqual([
+    result.before.rows[0],
+    result.before.rows[1],
+    {
+      account_id: 'account-inventory',
+      generation: 1,
+      kind: 'meta',
+      ordinal: 0,
+      payload: JSON.stringify({ marker: 'earlier-sibling' }),
+    },
+    result.before.rows[2],
+  ]);
+  expect(result.afterAcceptance.facts).toEqual([
+    ...result.before.facts,
+    {
+      account_id: 'account-inventory',
+      generation: 1,
+      deployment_ordinal: 0,
+      fact_kind: 'secret-name',
+      fact_ordinal: 1,
+      payload: JSON.stringify({ name: 'ANCHORAGE_NAME_1' }),
+    },
+  ]);
+  expect(result.afterReplay).toEqual(result.afterAcceptance);
+  expect(result.acceptanceError).toBeNull();
+  expect(result.accepted).toEqual(result.intended);
+  expect(result.replay).toEqual(result.intended);
+}
 
 function harnessOptions() {
   return {
@@ -1307,6 +1446,33 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
     });
   });
 
+  it('inventory maximum mixed chunk retains exact rows and facts through replay and finalization', async () => {
+    const result = await probe<{
+      acceptedRevision: number;
+      replayEqual: boolean;
+      rowsEqual: boolean;
+      factsEqual: boolean;
+      rowCount: number;
+      factCount: number;
+      maxStatements: number;
+      maxBindings: number;
+      maxSqlBytes: number;
+      maxBindingBytes: number;
+    }>('inventory-maximum-chunk');
+    expect(result).toMatchObject({
+      acceptedRevision: 1,
+      replayEqual: true,
+      rowsEqual: true,
+      factsEqual: true,
+      rowCount: 1000,
+      factCount: 1000,
+      maxStatements: 2001,
+    });
+    expect(result.maxBindings).toBeLessThanOrEqual(100);
+    expect(result.maxSqlBytes).toBeLessThanOrEqual(100_000);
+    expect(result.maxBindingBytes).toBeLessThanOrEqual(2_000_000);
+  });
+
   it('applies the inventory start batch atomically under concurrent stores', async () => {
     const result = await probe<{
       started: number;
@@ -1343,6 +1509,570 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
     expect(result.generation).toBe(1);
   });
 
+  it.each([
+    false,
+    true,
+  ])('rolls back cross-account inventory ID collisions (concurrent=%s)', async (concurrent) => {
+    const result = await probe<{
+      operationId: string;
+      nextOperationId: string;
+      winnerAccount: string;
+      loserAccount: string;
+      attempts: Array<
+        | { status: 'fulfilled'; run: FleetInventoryRunRecord }
+        | { status: 'rejected'; error: ProbeError }
+      >;
+      before: InventorySnapshot;
+      afterCollision: InventorySnapshot;
+      refused: ProbeError | null;
+      replay: FleetInventoryRunRecord;
+      busy: ProbeError | null;
+      afterRefusals: InventorySnapshot;
+      next: FleetInventoryRunRecord | null;
+      nextError: ProbeError | null;
+      afterNext: InventorySnapshot;
+    }>('inventory-cross-account-start', { concurrent });
+    expect(result.before.heads).toEqual(
+      ['account-inventory', 'account-inventory-other'].map((account_id) => ({
+        account_id,
+        active_operation_id: null,
+        latest_finalized_generation: 1,
+        next_generation: 2,
+      })),
+    );
+    expect(result.afterCollision.heads).toEqual(
+      result.before.heads.map((head) =>
+        head.account_id === result.winnerAccount
+          ? {
+              ...head,
+              active_operation_id: result.operationId,
+              next_generation: 3,
+            }
+          : head,
+      ),
+    );
+    expect(
+      result.afterCollision.runs.filter(
+        (run) => run.operation_id !== result.operationId,
+      ),
+    ).toEqual(result.before.runs);
+    expect(
+      result.afterCollision.runs.filter(
+        (run) => run.operation_id === result.operationId,
+      ),
+    ).toEqual([
+      {
+        account_id: result.winnerAccount,
+        operation_id: result.operationId,
+        generation: 2,
+        options_digest: result.replay.optionsDigest,
+        run_record: JSON.stringify(result.replay),
+        created_at_ms: expect.any(Number),
+        finalized_at_ms: null,
+      },
+    ]);
+    expect(result.afterCollision.rows).toEqual(result.before.rows);
+    expect(result.afterCollision.facts).toEqual(result.before.facts);
+    expect(result.afterRefusals).toEqual(result.afterCollision);
+    expect(result.next).toMatchObject({
+      operationId: result.nextOperationId,
+      state: 'staging',
+      progress: { generation: 2, revision: 0 },
+    });
+    expect(result.afterNext.heads).toEqual(
+      result.afterCollision.heads.map((head) =>
+        head.account_id === result.loserAccount
+          ? {
+              ...head,
+              active_operation_id: result.nextOperationId,
+              next_generation: 3,
+            }
+          : head,
+      ),
+    );
+    expect(
+      result.afterNext.runs.filter(
+        (run) => run.operation_id !== result.nextOperationId,
+      ),
+    ).toEqual(result.afterCollision.runs);
+    expect(
+      result.afterNext.runs.filter(
+        (run) => run.operation_id === result.nextOperationId,
+      ),
+    ).toEqual([
+      {
+        account_id: result.loserAccount,
+        operation_id: result.nextOperationId,
+        generation: 2,
+        options_digest: result.replay.optionsDigest,
+        run_record: JSON.stringify(result.next),
+        created_at_ms: expect.any(Number),
+        finalized_at_ms: null,
+      },
+    ]);
+    expect(result.afterNext.rows).toEqual(result.before.rows);
+    expect(result.afterNext.facts).toEqual(result.before.facts);
+    expect(
+      result.attempts.filter((entry) => entry.status === 'fulfilled'),
+    ).toEqual([{ status: 'fulfilled', run: result.replay }]);
+    const uniqueError = {
+      message: expect.stringContaining(
+        'UNIQUE constraint failed: anchorage_fleet_inventory_runs.operation_id',
+      ),
+    };
+    expect(
+      result.attempts.filter((entry) => entry.status === 'rejected'),
+    ).toEqual([
+      { status: 'rejected', error: expect.objectContaining(uniqueError) },
+    ]);
+    expect(result.refused).toMatchObject(uniqueError);
+    expect(result.busy).toEqual({
+      name: 'Error',
+      message: `fleet inventory for account '${result.winnerAccount}' has an active operation other than '${result.nextOperationId}'`,
+    });
+    expect(result.nextError).toBeNull();
+  });
+
+  it.each([
+    'rows',
+    'both',
+    'empty',
+  ] as const)('inventory pin availability handles interrupted %s reclamation and cleanup recovery', async (mode) => {
+    const result = await probe<{
+      before: InventorySnapshot;
+      interrupted: ProbeError | null;
+      partial: InventorySnapshot;
+      pin: ProbeError | null;
+      afterPin: InventorySnapshot;
+      pins: Array<{
+        account_id: string;
+        generation: number;
+        pinned_by: string;
+      }>;
+      read: {
+        generation: { rows: unknown[]; facts: unknown[] } | null;
+        error: ProbeError | null;
+      };
+      retried: { deleted: number };
+      afterRetry: InventorySnapshot;
+    }>('inventory-partial-prune', { mode });
+    expect(result.before.runs).toHaveLength(2);
+    expect(
+      result.before.rows.filter((row) => row.generation === 1),
+    ).toHaveLength(mode === 'empty' ? 0 : 3);
+    expect(
+      result.before.facts.filter((row) => row.generation === 1),
+    ).toHaveLength(mode === 'empty' ? 0 : 1);
+    expect(result.partial).toEqual({
+      ...result.before,
+      rows: result.before.rows.filter((row) => row.generation !== 1),
+      facts:
+        mode === 'rows'
+          ? result.before.facts
+          : result.before.facts.filter((row) => row.generation !== 1),
+    });
+    expect(result.afterPin).toEqual(result.partial);
+    expect(result.interrupted).toEqual({
+      name: 'Error',
+      message:
+        "fleet inventory for account 'account-inventory' lease is no longer owned by this operation",
+    });
+    if (mode === 'empty') {
+      expect(result.pin).toBeNull();
+      expect(result.pins).toEqual([
+        { account_id: 'account-inventory', generation: 1, pinned_by: 'reader' },
+      ]);
+      expect(result.read.generation?.rows).toEqual([]);
+      expect(result.read.generation?.facts).toEqual([]);
+      expect(result.read.error).toBeNull();
+    } else {
+      expect(result.pins).toEqual([]);
+      expect(result.pin).toEqual({
+        name: 'Error',
+        message: 'fleet inventory generation 1 is corrupt',
+      });
+      expect(result.read.generation).toBeNull();
+    }
+    expect(result.retried).toEqual({ deleted: 1 });
+    expect(result.afterRetry).toEqual({
+      ...result.before,
+      runs: result.before.runs.filter((row) => row.generation !== 1),
+      rows: result.before.rows.filter((row) => row.generation !== 1),
+      facts: result.before.facts.filter((row) => row.generation !== 1),
+    });
+  });
+
+  it('inventory finalization requires a dense manifest and accepts gap repair', async () => {
+    const result = await probe<{
+      operationId: string;
+      before: InventorySnapshot;
+      afterRefusal: InventorySnapshot;
+      refused: ProbeError | null;
+      final: { rows: Array<{ ordinal: number }>; facts: unknown[] };
+    }>('inventory-dense-finalization');
+    expect(result.afterRefusal).toEqual(result.before);
+    expect(result.refused).toEqual({
+      name: 'Error',
+      message: `fleet inventory run '${result.operationId}' does not match its finalize manifest`,
+    });
+    expect(result.final.rows.map((row) => row.ordinal)).toEqual([0, 1, 2]);
+    expect(result.final.facts).toEqual([]);
+  });
+
+  it.each([
+    'pin',
+    'prune',
+  ] as const)('inventory pin admission preserves the %s winner without orphan protection', async (winner) => {
+    const result = await probe<{
+      before: InventorySnapshot;
+      after: InventorySnapshot;
+      pins: Array<{
+        account_id: string;
+        generation: number;
+        pinned_by: string;
+      }>;
+      pinOutcome: { ok: boolean; error: ProbeError | null };
+      pruneOutcome: { deleted: number | null; error: ProbeError | null };
+      read: {
+        generation: {
+          ref: { generation: number };
+          rows: Array<{ kind: string; ordinal: number; payload: unknown }>;
+          facts: unknown[];
+        } | null;
+        error: ProbeError | null;
+      };
+    }>('inventory-pin-prune-race', { winner });
+    expect(result.before.runs).toHaveLength(2);
+    expect(result.before.rows).toHaveLength(6);
+    expect(result.before.facts).toHaveLength(2);
+    if (winner === 'prune') {
+      expect(result.after).toEqual({
+        ...result.before,
+        runs: result.before.runs.filter((row) => row.generation !== 1),
+        rows: result.before.rows.filter((row) => row.generation !== 1),
+        facts: result.before.facts.filter((row) => row.generation !== 1),
+      });
+      expect(result.pins).toEqual([]);
+      expect(result.pinOutcome).toEqual({
+        ok: false,
+        error: {
+          name: 'Error',
+          message: 'fleet inventory generation 1 is not finalized',
+        },
+      });
+      expect(result.pruneOutcome).toEqual({ deleted: 1, error: null });
+      expect(result.read.generation).toBeNull();
+      expect(result.read.error).not.toBeNull();
+    } else {
+      expect(result.after).toEqual(result.before);
+      expect(result.pins).toEqual([
+        {
+          account_id: 'account-inventory',
+          generation: 1,
+          pinned_by: 'race-reader',
+        },
+      ]);
+      expect(result.pinOutcome).toEqual({ ok: true, error: null });
+      expect(result.pruneOutcome).toEqual({ deleted: 0, error: null });
+      expect(result.read.error).toBeNull();
+      expect(result.read.generation?.ref.generation).toBe(1);
+      expect(result.read.generation?.rows).toEqual(
+        result.before.rows
+          .filter((row) => row.generation === 1)
+          .map((row) => ({
+            kind: row.kind,
+            ordinal: row.ordinal,
+            payload: JSON.parse(row.payload),
+          })),
+      );
+      expect(result.read.generation?.facts).toHaveLength(1);
+    }
+  });
+
+  it('inventory pruning rechecks a late active owner before deleting rows, facts or the run', async () => {
+    const result = await probe<{
+      operationId: string;
+      before: InventorySnapshot;
+      afterPromotion: InventorySnapshot;
+      pruned: { deleted: number };
+      afterPrune: InventorySnapshot;
+    }>('inventory-prune-active-race');
+    expect(result.before.rows).toHaveLength(3);
+    expect(result.before.facts).toHaveLength(1);
+    expect(result.before.runs).toHaveLength(1);
+    expect(JSON.parse(result.before.runs[0]?.run_record ?? 'null').state).toBe(
+      'failed',
+    );
+    expect(result.before.heads).toEqual([
+      {
+        account_id: 'account-inventory',
+        active_operation_id: null,
+        latest_finalized_generation: null,
+        next_generation: 2,
+      },
+    ]);
+    expect(result.afterPromotion).toEqual({
+      ...result.before,
+      heads: [
+        { ...result.before.heads[0], active_operation_id: result.operationId },
+      ],
+    });
+    expect(result.afterPrune).toEqual(result.afterPromotion);
+    expect(result.pruned).toEqual({ deleted: 0 });
+  });
+
+  it('repairs an interrupted inventory failure under a fresh lease without clearing a newer head', async () => {
+    const result = await probe<{
+      staged: FleetInventoryRunRecord;
+      nextOperationId: string;
+      before: InventorySnapshot;
+      interrupted: ProbeError | null;
+      afterInterrupted: InventorySnapshot;
+      pruningBeforeRepair: { deleted: number };
+      afterPruningBeforeRepair: InventorySnapshot;
+      wrongRevision: ProbeError | null;
+      afterWrongRevision: InventorySnapshot;
+      recoveryError: ProbeError | null;
+      afterRecovery: InventorySnapshot;
+      leaseOwners: Array<{ owner_token: string; expires_at: number }>;
+      now: number;
+      next: FleetInventoryRunRecord | null;
+      nextError: ProbeError | null;
+      beforeNewHeadReplay: InventorySnapshot;
+      newHeadReplayError: ProbeError | null;
+      afterNewHeadReplay: InventorySnapshot;
+      prunedInactive: { deleted: number };
+      afterInactivePrune: InventorySnapshot;
+    }>('inventory-failure-recovery');
+    expect(result.staged).toMatchObject({
+      state: 'staging',
+      progress: { generation: 2, revision: 1 },
+    });
+    expect(result.before.heads).toEqual([
+      {
+        account_id: 'account-inventory',
+        active_operation_id: result.staged.operationId,
+        latest_finalized_generation: 1,
+        next_generation: 3,
+      },
+    ]);
+    expect(result.afterInterrupted).toEqual({
+      ...result.before,
+      runs: result.before.runs.map((run) =>
+        run.operation_id === result.staged.operationId
+          ? {
+              ...run,
+              run_record: JSON.stringify({ ...result.staged, state: 'failed' }),
+            }
+          : run,
+      ),
+    });
+    expect(result.afterPruningBeforeRepair).toEqual(result.afterInterrupted);
+    expect(result.pruningBeforeRepair).toEqual({ deleted: 0 });
+    expect(result.afterWrongRevision).toEqual(result.afterInterrupted);
+    expect(result.afterRecovery).toEqual({
+      ...result.afterInterrupted,
+      heads: result.before.heads.map((head) => ({
+        ...head,
+        active_operation_id: null,
+      })),
+    });
+    expect(result.next).toMatchObject({
+      operationId: result.nextOperationId,
+      state: 'staging',
+      progress: { generation: 3, revision: 0 },
+    });
+    expect(result.beforeNewHeadReplay.heads).toEqual([
+      {
+        account_id: 'account-inventory',
+        active_operation_id: result.nextOperationId,
+        latest_finalized_generation: 1,
+        next_generation: 4,
+      },
+    ]);
+    expect(
+      result.beforeNewHeadReplay.runs.filter(
+        (run) => run.operation_id !== result.nextOperationId,
+      ),
+    ).toEqual(result.afterRecovery.runs);
+    expect(
+      result.beforeNewHeadReplay.runs.filter(
+        (run) => run.operation_id === result.nextOperationId,
+      ),
+    ).toEqual([
+      {
+        account_id: 'account-inventory',
+        operation_id: result.nextOperationId,
+        generation: 3,
+        options_digest: result.staged.optionsDigest,
+        run_record: JSON.stringify(result.next),
+        created_at_ms: expect.any(Number),
+        finalized_at_ms: null,
+      },
+    ]);
+    expect(result.beforeNewHeadReplay.rows).toEqual(result.before.rows);
+    expect(result.beforeNewHeadReplay.facts).toEqual(result.before.facts);
+    expect(result.afterNewHeadReplay).toEqual(result.beforeNewHeadReplay);
+    expect(result.afterInactivePrune).toEqual({
+      ...result.afterNewHeadReplay,
+      runs: result.afterNewHeadReplay.runs.filter(
+        (row) => row.generation !== 2,
+      ),
+      rows: result.afterNewHeadReplay.rows.filter(
+        (row) => row.generation !== 2,
+      ),
+      facts: result.afterNewHeadReplay.facts.filter(
+        (row) => row.generation !== 2,
+      ),
+    });
+    expect(result.prunedInactive).toEqual({ deleted: 1 });
+    expect(result.leaseOwners).toHaveLength(2);
+    const [expired, fresh] = result.leaseOwners;
+    expect(expired?.owner_token).toEqual(expect.any(String));
+    expect(fresh?.owner_token).toEqual(expect.any(String));
+    expect(fresh?.owner_token).not.toBe(expired?.owner_token);
+    expect(result.now).toBe(1_060_001);
+    expect(expired?.expires_at).toBeLessThan(result.now);
+    expect(fresh?.expires_at).toBeGreaterThan(result.now);
+    expect(result.interrupted).toEqual({
+      name: 'Error',
+      message:
+        "fleet inventory for account 'account-inventory' lease is no longer owned by this operation",
+    });
+    expect(result.wrongRevision).toEqual({
+      name: 'Error',
+      message: `fleet inventory run '${result.staged.operationId}' is no longer at the expected revision`,
+    });
+    expect(result.recoveryError).toBeNull();
+    expect(result.nextError).toBeNull();
+    expect(result.newHeadReplayError).toBeNull();
+  });
+
+  it.each([
+    'normal',
+    'stale',
+    'fallback',
+  ] as const)('repairs %s finalized inventory continuation without provider replay or weakening historical pins', async (mode) => {
+    const result = await probe<{
+      staged: FleetInventoryRunRecord;
+      before: InventorySnapshot;
+      interrupted: ProbeError | null;
+      afterInterrupted: InventorySnapshot;
+      pruningBeforeRepair: { deleted: number };
+      afterPruningBeforeRepair: InventorySnapshot;
+      recovery: {
+        result: FleetInventoryAdvanceResult | null;
+        error: ProbeError | null;
+      };
+      afterRecovery: InventorySnapshot;
+      recoveryTrace: string[];
+      recoveryRepairs: unknown[];
+      providerCalls: number;
+      historical: null | {
+        newer: FleetInventoryRunRecord;
+        before: InventorySnapshot;
+        unpinned: ProbeError | null;
+        afterUnpinned: InventorySnapshot;
+        pinned: FleetInventoryAdvanceResult;
+        afterPinned: InventorySnapshot;
+        released: ProbeError | null;
+        afterReleased: InventorySnapshot;
+      };
+    }>('inventory-finalized-continuation-recovery', { mode });
+    expect(result.staged).toMatchObject({
+      state: 'staging',
+      progress: { generation: 1, revision: 1, stage: { step: 'finalize' } },
+    });
+    expect(result.before.heads).toEqual([
+      {
+        account_id: 'account-inventory',
+        active_operation_id: result.staged.operationId,
+        latest_finalized_generation: null,
+        next_generation: 2,
+      },
+    ]);
+    expect(result.afterInterrupted).toEqual({
+      ...result.before,
+      runs: result.before.runs.map((run) => ({
+        ...run,
+        run_record: JSON.stringify({ ...result.staged, state: 'finalized' }),
+        finalized_at_ms: 1_000_000,
+      })),
+    });
+    expect(result.afterPruningBeforeRepair).toEqual(result.afterInterrupted);
+    expect(result.pruningBeforeRepair).toEqual({ deleted: 0 });
+    expect(result.afterRecovery).toEqual({
+      ...result.afterInterrupted,
+      heads: result.before.heads.map((head) => ({
+        ...head,
+        active_operation_id: null,
+        latest_finalized_generation: 1,
+      })),
+    });
+    expect(result.recovery.result).toEqual({
+      status: 'complete',
+      token: {
+        version: 1,
+        operationId: result.staged.operationId,
+        revision: 1,
+      },
+      generation: {
+        generation: 1,
+        operationId: result.staged.operationId,
+        finalizedAtMs: 1_000_000,
+        rowManifest: result.staged.progress.stagedCounts,
+        factCount: result.staged.progress.factCount,
+      },
+    });
+    expect(result.recoveryTrace).toEqual([
+      'lease-read',
+      ...(mode === 'fallback' ? ['fallback-read'] : []),
+      'finalize',
+      'generation-read',
+    ]);
+    expect(result.recoveryRepairs).toEqual([
+      {
+        operationId: result.staged.operationId,
+        expectedRevision: 1,
+        manifest: result.staged.progress.stagedCounts,
+        factCount: result.staged.progress.factCount,
+      },
+    ]);
+    expect(result.historical).not.toBeNull();
+    if (!result.historical)
+      throw new Error('historical continuation probe missing');
+    expect(result.historical.newer).toMatchObject({
+      state: 'staging',
+      progress: { generation: 3 },
+    });
+    expect(result.historical.before.heads).toEqual([
+      {
+        account_id: 'account-inventory',
+        active_operation_id: result.historical.newer.operationId,
+        latest_finalized_generation: 2,
+        next_generation: 4,
+      },
+    ]);
+    expect(result.historical.afterUnpinned).toEqual(result.historical.before);
+    expect(result.historical.afterPinned).toEqual(result.historical.before);
+    expect(result.historical.afterReleased).toEqual(result.historical.before);
+    expect(result.historical.pinned).toEqual(result.recovery.result);
+    expect(result.providerCalls).toBe(0);
+    expect(result.interrupted).toEqual({
+      name: 'Error',
+      message:
+        "fleet inventory for account 'account-inventory' lease is no longer owned by this operation",
+    });
+    expect(result.recovery.error).toBeNull();
+    const requiresPin = {
+      name: 'Error',
+      message:
+        'fleet inventory generation 1 requires a pin before it can be read',
+    };
+    expect(result.historical.unpinned).toEqual(requiresPin);
+    expect(result.historical.released).toEqual(requiresPin);
+  });
+
   it('admits one commit writer and converges the rest under concurrent batches', async () => {
     const result = await probe<{
       committed: number;
@@ -1372,6 +2102,180 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
       { kind: 'meta', count: 2 },
       { kind: 'registration', count: 1 },
     ]);
+  });
+
+  describe.each([
+    'ordinary',
+    'hidden',
+  ] as const)('inventory chunk with %s results', (delivery) => {
+    it.each([
+      'account',
+      'generation',
+      'options',
+    ] as const)('rejects a different %s before durable mutation', async (fault) => {
+      const result = await probe<InventoryCommitRefusalProbe>(
+        'inventory-commit-refusal',
+        { fault, hideResults: delivery === 'hidden' },
+      );
+      expectInventoryRefusalAndReplay(result);
+      if (fault === 'generation') {
+        expect(result.attempted.runRecord.progress.generation).toBe(99);
+      } else if (fault === 'options') {
+        expect(result.attempted.runRecord.options).toEqual({
+          ...result.prior.options,
+          scriptNamePrefix: 'alternate',
+        });
+        expect(result.attempted.runRecord.optionsDigest).toBe(
+          fleetInventoryOptionsDigest(result.attempted.runRecord.options),
+        );
+        expect(result.attempted.runRecord.optionsDigest).not.toBe(
+          result.before.runs[0]?.options_digest,
+        );
+      }
+      expect(result.refused).toEqual({
+        name: 'Error',
+        message:
+          fault === 'account'
+            ? `no fleet inventory run for operation '${result.prior.operationId}'`
+            : `fleet inventory run '${result.prior.operationId}' is no longer at the expected revision`,
+      });
+    });
+
+    it.each([
+      'row',
+      'fact',
+    ] as const)('rolls back earlier siblings on an immutable %s conflict', async (kind) => {
+      const result = await probe<InventoryCommitRefusalProbe>(
+        'inventory-commit-refusal',
+        { fault: `${kind}-conflict`, hideResults: delivery === 'hidden' },
+      );
+      expectInventoryRefusalAndReplay(result);
+      expect(result.attempted.rows[0]).toEqual({
+        kind: 'meta',
+        ordinal: 0,
+        payload: { marker: 'earlier-sibling' },
+      });
+      if (kind === 'row') {
+        expect(result.attempted.rows[1]).toEqual({
+          kind: 'registration',
+          ordinal: 0,
+          payload: { scriptName: 'different' },
+        });
+      } else {
+        expect(result.attempted.facts).toEqual([
+          {
+            deploymentOrdinal: 0,
+            factKind: 'secret-name',
+            factOrdinal: 1,
+            payload: { name: 'ANCHORAGE_NAME_1' },
+          },
+          {
+            deploymentOrdinal: 0,
+            factKind: 'secret-name',
+            factOrdinal: 0,
+            payload: { name: 'DIFFERENT_NAME' },
+          },
+        ]);
+      }
+      expect(result.refused).toMatchObject({
+        name: 'Error',
+        message: expect.stringContaining(
+          `UNIQUE constraint failed: anchorage_fleet_inventory_${kind === 'row' ? 'rows' : 'deployment_facts'}.account_id`,
+        ),
+      });
+    });
+
+    it.each([
+      { fault: 'duplicate-row', duplicatePayload: 'same' },
+      { fault: 'duplicate-row', duplicatePayload: 'different' },
+      { fault: 'duplicate-fact', duplicatePayload: 'same' },
+      { fault: 'duplicate-fact', duplicatePayload: 'different' },
+    ] as const)('rejects $fault keys with $duplicatePayload payloads without effects', async ({
+      fault,
+      duplicatePayload,
+    }) => {
+      const result = await probe<InventoryCommitRefusalProbe>(
+        'inventory-commit-refusal',
+        { fault, duplicatePayload, hideResults: delivery === 'hidden' },
+      );
+      expectInventoryRefusalAndReplay(result);
+      const duplicates =
+        fault === 'duplicate-row'
+          ? result.attempted.rows
+          : result.attempted.facts;
+      expect(duplicates).toHaveLength(2);
+      expect(duplicates[1]).toEqual({
+        ...duplicates[0],
+        payload:
+          duplicatePayload === 'same'
+            ? duplicates[0]?.payload
+            : fault === 'duplicate-row'
+              ? { marker: 'different' }
+              : { name: 'DIFFERENT_NAME' },
+      });
+      expect(result.refused).toEqual({
+        name: 'FleetInventoryStateError',
+        message: 'fleet inventory state is malformed',
+      });
+    });
+
+    it.each([
+      'failed',
+      'stage',
+      'provider-requests',
+      'updated-at',
+    ] as const)('refuses same-revision %s convergence after an exact replay', async (change) => {
+      const result = await probe<{
+        intended: FleetInventoryRunRecord;
+        attempted: FleetInventoryRunRecord;
+        accepted: FleetInventoryRunRecord;
+        afterAcceptance: InventorySnapshot;
+        replay: FleetInventoryRunRecord;
+        afterReplay: InventorySnapshot;
+        beforeRefusal: InventorySnapshot;
+        afterRefusal: InventorySnapshot;
+        refused: ProbeError | null;
+      }>('inventory-commit-replay', {
+        change,
+        hideResults: delivery === 'hidden',
+      });
+      expectInventorySeed(result.afterAcceptance, result.intended);
+      expect(result.afterReplay).toEqual(result.afterAcceptance);
+      expect(result.beforeRefusal).toEqual({
+        ...result.afterReplay,
+        heads:
+          change === 'failed'
+            ? [
+                {
+                  ...result.afterReplay.heads[0],
+                  active_operation_id: null,
+                },
+              ]
+            : result.afterReplay.heads,
+        runs: [
+          {
+            ...result.afterReplay.runs[0],
+            run_record: JSON.stringify({
+              ...result.intended,
+              state: change === 'failed' ? 'failed' : 'staging',
+            }),
+          },
+        ],
+      });
+      expect(result.afterRefusal).toEqual(result.beforeRefusal);
+      expect(result.accepted).toEqual(result.intended);
+      expect(result.replay).toEqual(result.intended);
+      expect(result.attempted.progress.revision).toBe(1);
+      if (change === 'failed') {
+        expect(result.attempted).toEqual(result.intended);
+      } else {
+        expect(result.attempted).not.toEqual(result.intended);
+      }
+      expect(result.refused).toEqual({
+        name: 'Error',
+        message: `fleet inventory run '${result.intended.operationId}' is no longer at the expected revision`,
+      });
+    });
   });
 
   it('converges a lost finalize response through the run and head readback', async () => {

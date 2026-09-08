@@ -7,6 +7,7 @@ import {
   canonicalFleetInventoryRunOptions,
   classifyFleetInventoryRunToken,
   emptyFleetInventoryRowCounts,
+  FLEET_INVENTORY_STAGE_ORDER,
   FleetInventoryFindingValueError,
   type FleetInventoryRunOptions,
   type FleetInventoryRunRecord,
@@ -415,7 +416,12 @@ describe('fleet inventory state', () => {
     });
     const visited: string[] = [];
     let stage = initialFleetInventoryStage(withoutKv);
-    while (stage.step !== 'finalize') {
+    for (let step = 0; stage.step !== 'finalize'; step += 1) {
+      if (step >= FLEET_INVENTORY_STAGE_ORDER.length) {
+        throw new Error(
+          `nextStage did not reach 'finalize' within ${FLEET_INVENTORY_STAGE_ORDER.length} successors: stage=${JSON.stringify(stage)}, visited=${JSON.stringify(visited)}`,
+        );
+      }
       visited.push(stage.step);
       stage = nextStage(stage, withoutKv, counts);
     }

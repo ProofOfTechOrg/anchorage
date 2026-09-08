@@ -139,8 +139,16 @@ function runToken(run: FleetInventoryRunRecord): FleetInventoryRunToken {
 
 async function completeFromRun(
   store: FleetInventoryRunStore,
+  lease: FleetInventoryLease,
   run: FleetInventoryRunRecord,
 ): Promise<FleetInventoryAdvanceResult> {
+  // A finalized row can survive an interrupted head update.
+  await lease.finalizeRun({
+    operationId: run.operationId,
+    expectedRevision: run.progress.revision,
+    manifest: run.progress.stagedCounts,
+    factCount: run.progress.factCount,
+  });
   const generation = await store.readFinalizedGeneration(
     run.progress.generation,
   );
@@ -158,7 +166,7 @@ async function advanceChunk(
   maxStagedRowsPerChunk: number,
 ): Promise<FleetInventoryAdvanceResult> {
   if (run.state === 'finalized') {
-    return completeFromRun(options.store, run);
+    return completeFromRun(options.store, lease, run);
   }
   if (run.state === 'failed') {
     throw new Error(
@@ -247,7 +255,8 @@ export async function advanceFleetInventory(
         token.operationId,
       );
       if (persisted?.state === 'finalized') {
-        return completeFromRun(options.store, persisted);
+        classifyFleetInventoryRunToken(token, persisted);
+        return completeFromRun(options.store, lease, persisted);
       }
       throw new FleetInventoryRunTokenOperationError(token.operationId);
     }
@@ -255,7 +264,7 @@ export async function advanceFleetInventory(
       // The caller is behind the persisted run, so the authoritative current
       // result is returned without touching the provider.
       return run.state === 'finalized'
-        ? completeFromRun(options.store, run)
+        ? completeFromRun(options.store, lease, run)
         : { status: 'pending', token: runToken(run) };
     }
     return advanceChunk(options, lease, run, maxStagedRowsPerChunk);

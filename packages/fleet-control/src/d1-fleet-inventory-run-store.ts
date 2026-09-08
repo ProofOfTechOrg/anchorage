@@ -15,6 +15,7 @@ import {
   type FleetInventoryRunStore,
   type FleetInventoryStagedFact,
   type FleetInventoryStagedRow,
+  FleetInventoryStateError,
   fleetInventoryRunRecordFromUnknown,
   fleetInventoryStagedFactFromUnknown,
   fleetInventoryStagedRowFromUnknown,
@@ -145,6 +146,21 @@ function corruptGeneration(generation: number): Error {
   return new Error(`fleet inventory generation ${generation} is corrupt`);
 }
 
+function runRecordFromRow(row: Row): FleetInventoryRunRecord {
+  const record = fleetInventoryRunRecordFromUnknown(
+    JSON.parse(rowString(row, 'run_record')),
+  );
+  const generation = rowNumber(row, 'generation');
+  if (
+    record.operationId !== rowString(row, 'operation_id') ||
+    record.progress.generation !== generation ||
+    record.optionsDigest !== rowString(row, 'options_digest')
+  ) {
+    throw corruptGeneration(generation);
+  }
+  return record;
+}
+
 function unknownRun(operationId: string): Error {
   return new Error(`no fleet inventory run for operation '${operationId}'`);
 }
@@ -188,9 +204,7 @@ function sameCounts(
 
 /**
  * Durable account inventory run store over the fleet state database port. The
- * account is trusted configuration, never a per-call argument, and every
- * multi-statement mutation is one guarded batch whose guards make a partial
- * application impossible.
+ * account is trusted configuration, never a per-call argument.
  */
 export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
   readonly #db: FleetStateDatabase;
@@ -498,9 +512,7 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
     }>,
   ): Promise<FleetInventoryRunRecord> {
     const { operationId, options, optionsDigest } = input;
-    // progress.generation is only known inside the batch, so it is seeded here
-    // and set from SQL by statement 3.
-    const seeded: FleetInventoryRunRecord = {
+    const seeded = fleetInventoryRunRecordFromUnknown({
       version: 1,
       operationId,
       optionsDigest,
@@ -514,11 +526,9 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
         factCount: 0,
         providerRequests: 0,
       },
-      // The store invents no wall-clock time: database time is the only clock
-      // it may read, and the epoch stamp is replaced by the first commit whose
-      // record the coordinator supplies.
+      // The coordinator supplies timestamps; the store's clock is database time.
       updatedAt: new Date(0).toISOString(),
-    };
+    });
     const claimed = await this.#db.batch([
       {
         sql: `INSERT INTO ${HEAD_TABLE} (
@@ -556,9 +566,10 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
         SELECT ?, ?, h.next_generation - 1, ?,
                json_set(?, '$.progress.generation', h.next_generation - 1),
                ${DB_NOW_MS}
-          FROM ${HEAD_TABLE} h
+         FROM ${HEAD_TABLE} h
          WHERE h.account_id = ? AND h.active_operation_id = ?
-        ON CONFLICT (operation_id) DO NOTHING
+           AND NOT EXISTS (SELECT 1 FROM ${RUN_TABLE} existing
+                 WHERE existing.account_id = ? AND existing.operation_id = ?)
         RETURNING operation_id, generation`,
         bindings: [
           operationId,
@@ -567,17 +578,16 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
           JSON.stringify(seeded),
           this.#accountId,
           operationId,
+          this.#accountId,
+          operationId,
         ],
       },
     ]);
-    // Statement 2's zero-row result IS asserted. Statement 3's is NOT, because a
-    // replayed start legitimately returns no rows from its DO NOTHING; the
-    // readback below adjudicates instead.
     const head = claimed[1] ?? [];
     const claimedHead =
       head.length === 1 && head[0]?.active_operation_id === operationId;
     const persisted = await this.#db.query(
-      `SELECT operation_id, options_digest, run_record
+      `SELECT operation_id, generation, options_digest, run_record
          FROM ${RUN_TABLE}
         WHERE operation_id = ? AND account_id = ?`,
       [operationId, this.#accountId],
@@ -588,13 +598,7 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
     if (rowString(row, 'options_digest') !== optionsDigest) {
       throw runOptionsConflict(operationId);
     }
-    const record = fleetInventoryRunRecordFromUnknown(
-      JSON.parse(rowString(row, 'run_record')),
-    );
-    // Statement 2 wrote nothing while this operation's run exists: either the
-    // run already completed, in which case the replay is idempotent and must not
-    // re-reserve the head or burn a generation, or a foreign operation owns the
-    // head while this run is still unfinished, which is contention.
+    const record = runRecordFromRow(row);
     if (!claimedHead && record.state === 'staging') {
       throw this.#headContention(operationId);
     }
@@ -606,15 +610,13 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
   ): Promise<FleetInventoryRunRecord | undefined> {
     await this.#ensureSchema();
     const rows = await this.#db.query(
-      `SELECT run_record FROM ${RUN_TABLE}
+      `SELECT operation_id, generation, options_digest, run_record FROM ${RUN_TABLE}
         WHERE operation_id = ? AND account_id = ?`,
       [operationId, this.#accountId],
     );
     const row = rows[0];
     if (!row) return undefined;
-    return fleetInventoryRunRecordFromUnknown(
-      JSON.parse(rowString(row, 'run_record')),
-    );
+    return runRecordFromRow(row);
   }
 
   async #commitChunk(
@@ -651,29 +653,42 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
         JSON.stringify(fact.payload),
       ]),
     );
-    // Every staging insert carries the SAME lease, state, and PRE-update
-    // revision guard as the run update, so all statements stand or fall
-    // together. An unguarded insert would let a stale-lease or losing writer
-    // land bytes that a later legitimate commit cannot overwrite (DO NOTHING),
-    // poisoning payloads while the per-kind counts still match the manifest.
+    if (
+      rowPayloads.size !== rows.length ||
+      factPayloads.size !== facts.length
+    ) {
+      throw new FleetInventoryStateError();
+    }
     const stagingGuard = `FROM ${RUN_TABLE} r
-         WHERE r.operation_id = ?
+         WHERE r.account_id = ? AND r.operation_id = ?
+           AND r.generation = ? AND r.options_digest = ?
            AND json_extract(r.run_record, '$.state') = 'staging'
            AND json_extract(r.run_record, '$.progress.revision') = ?
            AND ${this.#leaseExists()}`;
     const stagingGuardBindings = [
+      this.#accountId,
       operationId,
+      generation,
+      runRecord.optionsDigest,
       expectedRevision,
       ...this.#leaseBindings(token),
     ];
     const updated = await this.#db.batch([
       ...rows.map((row) => ({
-        sql: `INSERT INTO ${ROW_TABLE} (
+        // Different bytes retain the unique-key failure, which rolls back siblings.
+        sql: `WITH proposed(account_id, generation, kind, ordinal, payload)
+          AS (VALUES (?, ?, ?, ?, ?))
+        INSERT INTO ${ROW_TABLE} (
           account_id, generation, kind, ordinal, payload
         )
-        SELECT ?, ?, ?, ?, ?
-        ${stagingGuard}
-        ON CONFLICT (account_id, generation, kind, ordinal) DO NOTHING
+        SELECT p.account_id, p.generation, p.kind, p.ordinal, p.payload
+          FROM proposed p
+         WHERE EXISTS (SELECT 1 ${stagingGuard})
+           AND NOT EXISTS (SELECT 1 FROM ${ROW_TABLE} staged
+                 WHERE staged.account_id = p.account_id
+                   AND staged.generation = p.generation
+                   AND staged.kind = p.kind AND staged.ordinal = p.ordinal
+                   AND staged.payload = p.payload)
         RETURNING kind, ordinal`,
         bindings: [
           this.#accountId,
@@ -685,14 +700,21 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
         ],
       })),
       ...facts.map((fact) => ({
-        sql: `INSERT INTO ${FACT_TABLE} (
+        sql: `WITH proposed(account_id, generation, deployment_ordinal, fact_kind, fact_ordinal, payload)
+          AS (VALUES (?, ?, ?, ?, ?, ?))
+        INSERT INTO ${FACT_TABLE} (
           account_id, generation, deployment_ordinal, fact_kind, fact_ordinal, payload
         )
-        SELECT ?, ?, ?, ?, ?, ?
-        ${stagingGuard}
-        ON CONFLICT (
-          account_id, generation, deployment_ordinal, fact_kind, fact_ordinal
-        ) DO NOTHING
+        SELECT p.account_id, p.generation, p.deployment_ordinal, p.fact_kind, p.fact_ordinal, p.payload
+          FROM proposed p
+         WHERE EXISTS (SELECT 1 ${stagingGuard})
+           AND NOT EXISTS (SELECT 1 FROM ${FACT_TABLE} staged
+                 WHERE staged.account_id = p.account_id
+                   AND staged.generation = p.generation
+                   AND staged.deployment_ordinal = p.deployment_ordinal
+                   AND staged.fact_kind = p.fact_kind
+                   AND staged.fact_ordinal = p.fact_ordinal
+                   AND staged.payload = p.payload)
         RETURNING fact_kind, fact_ordinal`,
         bindings: [
           this.#accountId,
@@ -709,31 +731,21 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
       {
         sql: `UPDATE ${RUN_TABLE}
            SET run_record = ?
-         WHERE operation_id = ?
+         WHERE account_id = ? AND operation_id = ?
+           AND generation = ? AND options_digest = ?
            AND json_extract(run_record, '$.state') = 'staging'
            AND json_extract(run_record, '$.progress.revision') = ?
            AND ${this.#leaseExists()}
         RETURNING operation_id`,
-        bindings: [
-          JSON.stringify(runRecord),
-          operationId,
-          expectedRevision,
-          ...this.#leaseBindings(token),
-        ],
+        bindings: [JSON.stringify(runRecord), ...stagingGuardBindings],
       },
     ]);
     const written = updated.at(-1) ?? [];
     if (written.length === 1 && written[0]?.operation_id === operationId) {
       return runRecord;
     }
-    // Convergence must re-query the persisted record and the stored bytes. The
-    // inserts' RETURNING output proves nothing either way: a DO NOTHING insert
-    // whose row already exists returns no rows, and a guard miss returns no rows
-    // without failing the batch.
     return this.#commitConverged({
-      operationId,
-      generation,
-      revision: runRecord.progress.revision,
+      runRecord,
       rowPayloads,
       factPayloads,
     });
@@ -741,14 +753,18 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
 
   async #commitConverged(
     input: Readonly<{
-      operationId: string;
-      generation: number;
-      revision: number;
+      runRecord: FleetInventoryRunRecord;
       rowPayloads: ReadonlyMap<string, string | undefined>;
       factPayloads: ReadonlyMap<string, string | undefined>;
     }>,
   ): Promise<FleetInventoryRunRecord> {
-    const { operationId, generation } = input;
+    const { operationId } = input.runRecord;
+    const generation = input.runRecord.progress.generation;
+    const persisted = await this.readRunByOperation(operationId);
+    if (!persisted) throw unknownRun(operationId);
+    if (JSON.stringify(persisted) !== JSON.stringify(input.runRecord)) {
+      throw runConflict(operationId);
+    }
     const storedRows = await this.#db.query(
       `SELECT kind, ordinal, payload FROM ${ROW_TABLE}
         WHERE account_id = ? AND generation = ?`,
@@ -783,11 +799,7 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
       if (stored === undefined) complete = false;
       else if (stored !== payload) throw stagedDivergence(operationId);
     }
-    const persisted = await this.readRunByOperation(operationId);
-    if (!persisted) throw unknownRun(operationId);
-    if (complete && persisted.progress.revision === input.revision) {
-      return persisted;
-    }
+    if (complete) return persisted;
     throw runConflict(operationId);
   }
 
@@ -804,59 +816,44 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
     const persisted = await this.readRunByOperation(operationId);
     if (!persisted) throw unknownRun(operationId);
     const generation = persisted.progress.generation;
-    if (persisted.state === 'failed') throw runConflict(operationId);
+    if (
+      persisted.state === 'failed' ||
+      persisted.progress.revision !== expectedRevision
+    ) {
+      throw runConflict(operationId);
+    }
+    if (
+      !sameCounts(manifest, persisted.progress.stagedCounts) ||
+      factCount !== persisted.progress.factCount
+    ) {
+      throw manifestDisagreement(operationId);
+    }
     if (persisted.state === 'staging') {
-      // The counts the guard compares are the PERSISTED record's own, so a
-      // caller cannot finalize a generation whose run record describes different
-      // counts than its rows; the caller's arguments only have to agree.
-      const stagedCounts = persisted.progress.stagedCounts;
-      if (
-        !sameCounts(manifest, stagedCounts) ||
-        factCount !== persisted.progress.factCount
-      ) {
-        throw manifestDisagreement(operationId);
-      }
       const finalized: FleetInventoryRunRecord = {
         ...persisted,
         state: 'finalized',
       };
-      const total = FLEET_INVENTORY_ROW_KINDS.reduce(
-        (sum, kind) => sum + stagedCounts[kind],
-        0,
-      );
+      const manifestGuard = this.#generationManifestGuard(persisted);
       await this.#db.batch([
         {
           sql: `UPDATE ${RUN_TABLE}
              SET run_record = ?, finalized_at_ms = ${DB_NOW_MS}
-           WHERE operation_id = ?
+           WHERE account_id = ? AND operation_id = ?
+             AND generation = ? AND options_digest = ?
              AND json_extract(run_record, '$.progress.revision') = ?
              AND json_extract(run_record, '$.state') = 'staging'
              AND ${this.#leaseExists()}
-             AND (SELECT COUNT(*) FROM ${FACT_TABLE}
-                   WHERE account_id = ? AND generation = ?) = ?
-             AND (SELECT COUNT(*) FROM ${ROW_TABLE}
-                   WHERE account_id = ? AND generation = ?) = ?
-             ${FLEET_INVENTORY_ROW_KINDS.map(
-               (kind) => `AND (SELECT COUNT(*) FROM ${ROW_TABLE}
-                   WHERE account_id = ? AND generation = ? AND kind = '${kind}') = ?`,
-             ).join('\n             ')}
+             ${manifestGuard.sql}
           RETURNING generation, finalized_at_ms`,
           bindings: [
             JSON.stringify(finalized),
+            this.#accountId,
             operationId,
+            generation,
+            persisted.optionsDigest,
             expectedRevision,
             ...this.#leaseBindings(token),
-            this.#accountId,
-            generation,
-            persisted.progress.factCount,
-            this.#accountId,
-            generation,
-            total,
-            ...FLEET_INVENTORY_ROW_KINDS.flatMap((kind) => [
-              this.#accountId,
-              generation,
-              stagedCounts[kind],
-            ]),
+            ...manifestGuard.bindings,
           ],
         },
         {
@@ -865,7 +862,9 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
            WHERE account_id = ? AND active_operation_id = ?
              AND ${this.#leaseExists()}
              AND EXISTS (SELECT 1 FROM ${RUN_TABLE}
-                   WHERE operation_id = ? AND finalized_at_ms IS NOT NULL
+                   WHERE account_id = ? AND operation_id = ?
+                     AND generation = ? AND options_digest = ?
+                     AND finalized_at_ms IS NOT NULL
                      AND json_extract(run_record, '$.state') = 'finalized')
           RETURNING latest_finalized_generation`,
           bindings: [
@@ -873,23 +872,22 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
             this.#accountId,
             operationId,
             ...this.#leaseBindings(token),
+            this.#accountId,
             operationId,
+            generation,
+            persisted.optionsDigest,
           ],
         },
       ]);
     }
-    // The batch is a PROBE: a lost-response replay returns zero rows from both
-    // statements, so the run row and the head are the only authority.
     const run = await this.#db.query(
-      `SELECT run_record, finalized_at_ms FROM ${RUN_TABLE}
+      `SELECT operation_id, generation, options_digest, run_record, finalized_at_ms FROM ${RUN_TABLE}
         WHERE operation_id = ? AND account_id = ?`,
       [operationId, this.#accountId],
     );
     const runRow = run[0];
     if (!runRow) throw unknownRun(operationId);
-    const record = fleetInventoryRunRecordFromUnknown(
-      JSON.parse(rowString(runRow, 'run_record')),
-    );
+    const record = runRecordFromRow(runRow);
     const finalizedAtMs = optionalNumber(runRow, 'finalized_at_ms');
     if (record.state !== 'finalized' || finalizedAtMs === undefined) {
       if (record.progress.revision !== expectedRevision) {
@@ -897,24 +895,37 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
       }
       throw manifestMismatch(operationId);
     }
+    if (
+      JSON.stringify(record) !==
+      JSON.stringify({ ...persisted, state: 'finalized' })
+    ) {
+      throw runConflict(operationId);
+    }
     const head = await this.#headRow();
     if (optionalNumber(head, 'latest_finalized_generation') !== generation) {
-      // The only legal repair: statement 2 alone is idempotent and writes no
-      // generation data.
       await this.#db.query(
         `UPDATE ${HEAD_TABLE}
            SET latest_finalized_generation = ?, active_operation_id = NULL
          WHERE account_id = ?
+           AND (active_operation_id IS NULL OR active_operation_id = ?)
+           AND (latest_finalized_generation IS NULL OR latest_finalized_generation < ?)
            AND ${this.#leaseExists()}
            AND EXISTS (SELECT 1 FROM ${RUN_TABLE}
-                 WHERE operation_id = ? AND finalized_at_ms IS NOT NULL
+                 WHERE account_id = ? AND operation_id = ?
+                   AND generation = ? AND options_digest = ?
+                   AND finalized_at_ms IS NOT NULL
                    AND json_extract(run_record, '$.state') = 'finalized')
         RETURNING latest_finalized_generation`,
         [
           generation,
           this.#accountId,
-          ...this.#leaseBindings(token),
           operationId,
+          generation,
+          ...this.#leaseBindings(token),
+          this.#accountId,
+          operationId,
+          generation,
+          persisted.optionsDigest,
         ],
       );
     }
@@ -941,47 +952,69 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
     }
     const persisted = await this.readRunByOperation(operationId);
     if (!persisted) throw unknownRun(operationId);
-    if (persisted.state === 'staging') {
-      const failed: FleetInventoryRunRecord = {
-        ...persisted,
-        state: 'failed',
-      };
-      await this.#db.batch([
-        {
-          sql: `UPDATE ${RUN_TABLE}
+    if (
+      persisted.progress.revision !== expectedRevision ||
+      persisted.state === 'finalized'
+    ) {
+      throw runConflict(operationId);
+    }
+    const failed: FleetInventoryRunRecord = {
+      ...persisted,
+      state: 'failed',
+    };
+    await this.#db.batch([
+      ...(persisted.state === 'staging'
+        ? [
+            {
+              sql: `UPDATE ${RUN_TABLE}
              SET run_record = ?
-           WHERE operation_id = ?
+           WHERE account_id = ? AND operation_id = ?
+             AND generation = ? AND options_digest = ?
              AND json_extract(run_record, '$.state') = 'staging'
              AND json_extract(run_record, '$.progress.revision') = ?
              AND ${this.#leaseExists()}
           RETURNING operation_id`,
-          bindings: [
-            JSON.stringify(failed),
-            operationId,
-            expectedRevision,
-            ...this.#leaseBindings(token),
-          ],
-        },
-        {
-          sql: `UPDATE ${HEAD_TABLE}
+              bindings: [
+                JSON.stringify(failed),
+                this.#accountId,
+                operationId,
+                persisted.progress.generation,
+                persisted.optionsDigest,
+                expectedRevision,
+                ...this.#leaseBindings(token),
+              ],
+            },
+          ]
+        : []),
+      {
+        sql: `UPDATE ${HEAD_TABLE}
              SET active_operation_id = NULL
            WHERE account_id = ? AND active_operation_id = ?
              AND ${this.#leaseExists()}
              AND EXISTS (SELECT 1 FROM ${RUN_TABLE}
-                   WHERE operation_id = ?
+                   WHERE account_id = ? AND operation_id = ?
+                     AND generation = ? AND options_digest = ?
                      AND json_extract(run_record, '$.state') = 'failed')
           RETURNING account_id`,
-          bindings: [
-            this.#accountId,
-            operationId,
-            ...this.#leaseBindings(token),
-            operationId,
-          ],
-        },
-      ]);
-    }
+        bindings: [
+          this.#accountId,
+          operationId,
+          ...this.#leaseBindings(token),
+          this.#accountId,
+          operationId,
+          persisted.progress.generation,
+          persisted.optionsDigest,
+        ],
+      },
+    ]);
     const readback = await this.readRunByOperation(operationId);
-    if (readback?.state !== 'failed') throw runConflict(operationId);
+    if (!readback) throw unknownRun(operationId);
+    if (
+      JSON.stringify(readback) !==
+      JSON.stringify({ ...persisted, state: 'failed' })
+    ) {
+      throw runConflict(operationId);
+    }
   }
 
   async #headRow(): Promise<Row | undefined> {
@@ -993,6 +1026,61 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
     return rows[0];
   }
 
+  #generationManifestGuard(record: FleetInventoryRunRecord): Readonly<{
+    sql: string;
+    bindings: readonly unknown[];
+  }> {
+    const { generation, stagedCounts, factCount } = record.progress;
+    const total = FLEET_INVENTORY_ROW_KINDS.reduce(
+      (sum, kind) => sum + stagedCounts[kind],
+      0,
+    );
+    return {
+      sql: `AND (SELECT COUNT(*) FROM ${FACT_TABLE}
+              WHERE account_id = ? AND generation = ?) = ?
+            AND (SELECT COUNT(*) FROM ${ROW_TABLE}
+              WHERE account_id = ? AND generation = ?) = ?
+            ${FLEET_INVENTORY_ROW_KINDS.map(
+              (kind) => `AND (SELECT COUNT(*) FROM ${ROW_TABLE}
+              WHERE account_id = ? AND generation = ? AND kind = '${kind}'
+                AND typeof(ordinal) = 'integer' AND ordinal >= 0 AND ordinal < ?) = ?`,
+            ).join('\n')}`,
+      bindings: [
+        this.#accountId,
+        generation,
+        factCount,
+        this.#accountId,
+        generation,
+        total,
+        ...FLEET_INVENTORY_ROW_KINDS.flatMap((kind) => [
+          this.#accountId,
+          generation,
+          stagedCounts[kind],
+          stagedCounts[kind],
+        ]),
+      ],
+    };
+  }
+
+  async #pinTarget(generation: number): Promise<
+    Readonly<{
+      ref: FleetInventoryGenerationRef;
+      record: FleetInventoryRunRecord;
+    }>
+  > {
+    const target = await this.#finalizedRef(generation);
+    const guard = this.#generationManifestGuard(target.record);
+    const available = await this.#db.query(
+      `SELECT 1 AS available WHERE 1 = 1 ${guard.sql}`,
+      guard.bindings,
+    );
+    if (available.length !== 1 || available[0]?.available !== 1) {
+      await this.#finalizedRef(generation);
+      throw corruptGeneration(generation);
+    }
+    return target;
+  }
+
   async #pinGeneration(
     token: string,
     input: Readonly<{ generation: number; pinnedBy: string }>,
@@ -1000,7 +1088,8 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
     const { generation, pinnedBy } = input;
     assertGeneration(generation);
     assertPinnedBy(pinnedBy);
-    await this.#assertFinalized(generation);
+    const { ref, record } = await this.#pinTarget(generation);
+    const manifestGuard = this.#generationManifestGuard(record);
     await this.#db.batch([
       {
         sql: `INSERT INTO ${PIN_TABLE} (
@@ -1008,6 +1097,12 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
         )
         SELECT ?, ?, ?, ${DB_NOW_MS}
          WHERE ${this.#leaseExists()}
+           AND EXISTS (SELECT 1 FROM ${RUN_TABLE} r
+             WHERE r.account_id = ? AND r.generation = ?
+               AND r.operation_id = ? AND r.options_digest = ?
+               AND r.finalized_at_ms = ?
+               AND json_extract(r.run_record, '$.state') = 'finalized')
+           ${manifestGuard.sql}
         ON CONFLICT (account_id, generation, pinned_by) DO NOTHING
         RETURNING generation`,
         bindings: [
@@ -1015,10 +1110,19 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
           generation,
           pinnedBy,
           ...this.#leaseBindings(token),
+          this.#accountId,
+          generation,
+          record.operationId,
+          record.optionsDigest,
+          ref.finalizedAtMs,
+          ...manifestGuard.bindings,
         ],
       },
     ]);
-    if (!(await this.#pinned(generation, pinnedBy))) throw this.#leaseLost();
+    if (!(await this.#pinned(generation, pinnedBy))) {
+      await this.#pinTarget(generation);
+      throw this.#leaseLost();
+    }
   }
 
   async #releasePin(
@@ -1054,17 +1158,6 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
     return rows.length > 0;
   }
 
-  async #assertFinalized(generation: number): Promise<void> {
-    const rows = await this.#db.query(
-      `SELECT operation_id FROM ${RUN_TABLE}
-        WHERE account_id = ? AND generation = ?
-          AND finalized_at_ms IS NOT NULL
-          AND json_extract(run_record, '$.state') = 'finalized'`,
-      [this.#accountId, generation],
-    );
-    if (rows.length !== 1) throw notFinalized(generation);
-  }
-
   async #pruneGenerations(
     token: string,
     input: Readonly<{ limit: number }>,
@@ -1080,7 +1173,8 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
                OR json_extract(r.run_record, '$.state') = 'failed')
           AND NOT EXISTS (SELECT 1 FROM ${HEAD_TABLE}
                 WHERE account_id = r.account_id
-                  AND latest_finalized_generation = r.generation)
+                  AND (latest_finalized_generation = r.generation
+                       OR active_operation_id = r.operation_id))
           AND NOT EXISTS (SELECT 1 FROM ${PIN_TABLE}
                 WHERE account_id = r.account_id AND generation = r.generation)
         ORDER BY r.generation ASC
@@ -1090,17 +1184,21 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
     let deleted = 0;
     for (const candidate of candidates) {
       const generation = rowNumber(candidate, 'generation');
-      // The pin and latest re-checks live inside the delete batch, so a pin
-      // committed after candidate selection still wins.
       const guard = `AND NOT EXISTS (SELECT 1 FROM ${PIN_TABLE}
              WHERE account_id = ? AND generation = ?)
-           AND NOT EXISTS (SELECT 1 FROM ${HEAD_TABLE}
-             WHERE account_id = ? AND latest_finalized_generation = ?)
+           AND NOT EXISTS (SELECT 1 FROM ${HEAD_TABLE} h
+             WHERE h.account_id = ?
+               AND (h.latest_finalized_generation = ?
+                 OR EXISTS (SELECT 1 FROM ${RUN_TABLE} active_run
+                   WHERE active_run.account_id = h.account_id
+                     AND active_run.operation_id = h.active_operation_id
+                     AND active_run.generation = ?)))
            AND ${this.#leaseExists()}`;
       const guardBindings = [
         this.#accountId,
         generation,
         this.#accountId,
+        generation,
         generation,
         ...this.#leaseBindings(token),
       ];
@@ -1195,9 +1293,6 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
         payload: JSON.parse(rowString(row, 'payload')),
       }),
     );
-    // Defense in depth behind the in-SQL finalize guard: the live per-kind
-    // counts, their ordinal contiguity, and the fact count must still match the
-    // manifest the finalized run persisted.
     const live = emptyFleetInventoryRowCounts() as Record<
       FleetInventoryRowKind,
       number
@@ -1229,16 +1324,14 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
     }>
   > {
     const rows = await this.#db.query(
-      `SELECT operation_id, run_record, finalized_at_ms FROM ${RUN_TABLE}
+      `SELECT operation_id, generation, options_digest, run_record, finalized_at_ms FROM ${RUN_TABLE}
         WHERE account_id = ? AND generation = ?`,
       [this.#accountId, generation],
     );
     const row = rows[0];
     if (!row) throw notFinalized(generation);
     const finalizedAtMs = optionalNumber(row, 'finalized_at_ms');
-    const record = fleetInventoryRunRecordFromUnknown(
-      JSON.parse(rowString(row, 'run_record')),
-    );
+    const record = runRecordFromRow(row);
     if (record.state !== 'finalized' || finalizedAtMs === undefined) {
       throw notFinalized(generation);
     }

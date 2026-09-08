@@ -303,8 +303,7 @@ export interface FleetInventoryGeneration {
 }
 
 /**
- * Lease-scoped inventory mutations. Every member serializes under the one
- * account lease that produced it, including pin, release, and prune.
+ * Await dependent mutations; calls through this lease handle can overlap.
  */
 export interface FleetInventoryLease {
   assertOwned(): Promise<void>;
@@ -316,6 +315,13 @@ export interface FleetInventoryLease {
     }>,
   ): Promise<FleetInventoryRunRecord>;
   readRun(operationId: string): Promise<FleetInventoryRunRecord | undefined>;
+  /**
+   * Bind writes to the account, operation, physical generation and options
+   * digest. Reject duplicate input keys and conflicting immutable payload
+   * bytes before advancing progress; a payload conflict rolls back siblings.
+   * Replay requires the full intended run record and exact staged bytes.
+   * Lease expiry between statements may retain inserts without progress.
+   */
   commitChunk(
     input: Readonly<{
       operationId: string;

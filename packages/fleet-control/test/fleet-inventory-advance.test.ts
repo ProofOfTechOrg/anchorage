@@ -31,7 +31,11 @@ import {
   type FleetInventoryStagedFact,
   type FleetInventoryStagedRow,
   type FleetInventoryStageInput,
+  FleetInventoryStateError,
   fleetInventoryOptionsDigest,
+  fleetInventoryRunRecordFromUnknown,
+  fleetInventoryStagedFactFromUnknown,
+  fleetInventoryStagedRowFromUnknown,
   initialFleetInventoryStage,
 } from '../src/fleet-inventory-state.js';
 import { canonicalDeploymentEgressPolicy } from '../src/platform-resources.js';
@@ -60,6 +64,7 @@ import {
 const OPERATION_ID = '123e4567-e89b-42d3-a456-426614174000';
 const FOREIGN_OPERATION_ID = '123e4567-e89b-42d3-a456-4266141740ff';
 const MAX_PROVIDER_REQUESTS = 1_000;
+const MAX_FIXTURE_CONTINUATIONS = 200;
 
 const STUB_OPTIONS: CollectFleetInventoryOptions = {
   hostRoutingKvId: 'hosts',
@@ -219,28 +224,90 @@ class FakeInventoryRunStore implements FleetInventoryRunStore {
           : store.runs.get(operationId);
       },
       async commitChunk(input) {
+        const intended = fleetInventoryRunRecordFromUnknown(input.runRecord);
+        const rows = input.rows.map(fleetInventoryStagedRowFromUnknown);
+        const facts = input.facts.map(fleetInventoryStagedFactFromUnknown);
+        const conflict = () =>
+          new Error('fleet inventory chunk lost its revision guard');
+        if (
+          intended.operationId !== input.operationId ||
+          intended.state !== 'staging' ||
+          intended.progress.revision !== input.expectedRevision + 1
+        ) {
+          throw conflict();
+        }
+        const rowKey = (row: FleetInventoryStagedRow) =>
+          `${row.kind}:${row.ordinal}`;
+        const factKey = (fact: FleetInventoryStagedFact) =>
+          `${fact.deploymentOrdinal}:${fact.factKind}:${fact.factOrdinal}`;
+        if (
+          new Set(rows.map(rowKey)).size !== rows.length ||
+          new Set(facts.map(factKey)).size !== facts.length
+        ) {
+          throw new FleetInventoryStateError();
+        }
         const run = store.runs.get(input.operationId);
-        if (!run || run.progress.revision !== input.expectedRevision) {
-          throw new Error('fleet inventory chunk lost its revision guard');
+        if (!run) {
+          throw new Error(
+            `no fleet inventory run for operation '${input.operationId}'`,
+          );
         }
         const generation = run.progress.generation;
-        store.rows.set(generation, [
-          ...(store.rows.get(generation) ?? []),
-          ...input.rows,
-        ]);
-        store.facts.set(generation, [
-          ...(store.facts.get(generation) ?? []),
-          ...input.facts,
-        ]);
-        store.runs.set(input.operationId, input.runRecord);
-        return input.runRecord;
+        const canWrite =
+          !store.leaseLost &&
+          run.state === 'staging' &&
+          run.progress.revision === input.expectedRevision &&
+          generation === intended.progress.generation &&
+          run.optionsDigest === intended.optionsDigest;
+        if (!canWrite && JSON.stringify(run) !== JSON.stringify(intended)) {
+          throw conflict();
+        }
+        const storedRows = new Map(
+          (store.rows.get(generation) ?? []).map((row) => [rowKey(row), row]),
+        );
+        const storedFacts = new Map(
+          (store.facts.get(generation) ?? []).map((fact) => [
+            factKey(fact),
+            fact,
+          ]),
+        );
+        for (const row of rows) {
+          const stored = storedRows.get(rowKey(row));
+          if (!stored && !canWrite) throw conflict();
+          if (
+            stored &&
+            JSON.stringify(stored.payload) !== JSON.stringify(row.payload)
+          ) {
+            throw new Error('fleet inventory staged payload is immutable');
+          }
+          storedRows.set(rowKey(row), row);
+        }
+        for (const fact of facts) {
+          const stored = storedFacts.get(factKey(fact));
+          if (!stored && !canWrite) throw conflict();
+          if (
+            stored &&
+            JSON.stringify(stored.payload) !== JSON.stringify(fact.payload)
+          ) {
+            throw new Error('fleet inventory staged payload is immutable');
+          }
+          storedFacts.set(factKey(fact), fact);
+        }
+        if (canWrite) {
+          store.rows.set(generation, [...storedRows.values()]);
+          store.facts.set(generation, [...storedFacts.values()]);
+          store.runs.set(input.operationId, intended);
+        }
+        return canWrite ? intended : run;
       },
       async finalizeRun(input) {
         const run = store.runs.get(input.operationId);
         if (!run || run.progress.revision !== input.expectedRevision) {
           throw new Error('fleet inventory finalize lost its revision guard');
         }
-        const ref: FleetInventoryGenerationRef = {
+        const ref: FleetInventoryGenerationRef = store.refs.get(
+          run.progress.generation,
+        ) ?? {
           generation: run.progress.generation,
           operationId: run.operationId,
           finalizedAtMs: 1_700_000_000_000,
@@ -249,8 +316,15 @@ class FakeInventoryRunStore implements FleetInventoryRunStore {
         };
         store.runs.set(input.operationId, { ...run, state: 'finalized' });
         store.refs.set(ref.generation, ref);
-        store.latestGeneration = ref.generation;
-        store.activeOperationId = undefined;
+        if (
+          (store.activeOperationId === undefined ||
+            store.activeOperationId === input.operationId) &&
+          (store.latestGeneration === undefined ||
+            store.latestGeneration < ref.generation)
+        ) {
+          store.latestGeneration = ref.generation;
+          store.activeOperationId = undefined;
+        }
         return ref;
       },
       async failRun(input) {
@@ -323,7 +397,13 @@ async function runToCompletion(
       options: options.runOptions ?? STUB_OPTIONS,
     },
   });
-  while (result.status === 'pending') {
+  for (let chunk = 0; result.status === 'pending'; chunk += 1) {
+    if (chunk >= MAX_FIXTURE_CONTINUATIONS) {
+      const persisted = await options.store.readRunByOperation(operationId);
+      throw new Error(
+        `runToCompletion exceeded ${MAX_FIXTURE_CONTINUATIONS} continuations: token=${JSON.stringify(result.token)}, progress=${JSON.stringify(persisted?.progress)}`,
+      );
+    }
     result = await advanceFleetInventory({
       ...options,
       action: { kind: 'continue', token: result.token },
@@ -382,9 +462,13 @@ async function boundedWithClient(
     maxProviderRequests,
     maxStagedRowsPerChunk: 2_000,
   });
-  while (result.status === 'pending') {
-    chunks += 1;
+  for (; result.status === 'pending'; chunks += 1) {
     const persisted = store.runs.get(OPERATION_ID);
+    if (chunks >= MAX_FIXTURE_CONTINUATIONS) {
+      throw new Error(
+        `boundedWithClient exceeded ${MAX_FIXTURE_CONTINUATIONS} continuations: token=${JSON.stringify(result.token)}, progress=${JSON.stringify(persisted?.progress)}`,
+      );
+    }
     if (persisted) executed.push(persisted.progress.stage);
     result = await advanceFleetInventory({
       context,
@@ -893,6 +977,39 @@ describe('bounded fleet inventory advance', () => {
     ).rejects.toBeInstanceOf(FleetInventoryRunTokenFutureError);
   });
 
+  it('rejects a future token before finalized fallback head repair', async () => {
+    const store = new FakeInventoryRunStore();
+    const context = stubContext();
+    const completed = await runToCompletion({
+      context,
+      store,
+      maxProviderRequests: MAX_PROVIDER_REQUESTS,
+    });
+    store.hiddenFromLease.add(OPERATION_ID);
+    store.activeOperationId = OPERATION_ID;
+    store.latestGeneration = undefined;
+    const before = {
+      activeOperationId: store.activeOperationId,
+      latestGeneration: store.latestGeneration,
+    };
+    const providerCalls = context.inputs.length;
+    const outcome = await advanceFleetInventory({
+      context,
+      store,
+      action: {
+        kind: 'continue',
+        token: { ...completed.token, revision: completed.token.revision + 1 },
+      },
+      maxProviderRequests: MAX_PROVIDER_REQUESTS,
+    }).catch((error: unknown) => error);
+    expect({
+      activeOperationId: store.activeOperationId,
+      latestGeneration: store.latestGeneration,
+    }).toEqual(before);
+    expect(context.inputs).toHaveLength(providerCalls);
+    expect(outcome).toBeInstanceOf(FleetInventoryRunTokenFutureError);
+  });
+
   it('completes an unknown lease operation whose persisted run is finalized', async () => {
     const store = new FakeInventoryRunStore();
     const completed = await runToCompletion({
@@ -911,6 +1028,76 @@ describe('bounded fleet inventory advance', () => {
 
     expect(replay.status).toBe('complete');
     expect(replay).toEqual(completed);
+  });
+
+  it.each([
+    'original',
+    'stale',
+    'fallback',
+    'start',
+  ] as const)('preserves the fixture latest generation and newer head through the %s finalized retry', async (retry) => {
+    const store = new FakeInventoryRunStore();
+    const completed = await runToCompletion({
+      context: stubContext(),
+      store,
+      maxProviderRequests: MAX_PROVIDER_REQUESTS,
+    });
+    await runToCompletion({
+      context: stubContext(),
+      store,
+      operationId: FOREIGN_OPERATION_ID,
+      maxProviderRequests: MAX_PROVIDER_REQUESTS,
+    });
+    const newerOperationId = '123e4567-e89b-42d3-a456-426614174002';
+    const context = stubContext();
+    await advanceFleetInventory({
+      context,
+      store,
+      action: {
+        kind: 'start',
+        operationId: newerOperationId,
+        options: STUB_OPTIONS,
+      },
+      maxProviderRequests: MAX_PROVIDER_REQUESTS,
+    });
+    if (retry === 'fallback') store.hiddenFromLease.add(OPERATION_ID);
+    const before = structuredClone({
+      runs: store.runs,
+      rows: store.rows,
+      facts: store.facts,
+      refs: store.refs,
+      latestGeneration: store.latestGeneration,
+      activeOperationId: store.activeOperationId,
+      nextGeneration: store.nextGeneration,
+    });
+    expect(before.latestGeneration).toBe(2);
+    expect(before.activeOperationId).toBe(newerOperationId);
+    const replay = await advanceFleetInventory({
+      context,
+      store,
+      action:
+        retry === 'start'
+          ? { kind: 'start', operationId: OPERATION_ID, options: STUB_OPTIONS }
+          : {
+              kind: 'continue',
+              token: {
+                ...completed.token,
+                revision: retry === 'stale' ? 0 : completed.token.revision,
+              },
+            },
+      maxProviderRequests: MAX_PROVIDER_REQUESTS,
+    });
+    expect({
+      runs: store.runs,
+      rows: store.rows,
+      facts: store.facts,
+      refs: store.refs,
+      latestGeneration: store.latestGeneration,
+      activeOperationId: store.activeOperationId,
+      nextGeneration: store.nextGeneration,
+    }).toEqual(before);
+    expect(replay).toEqual(completed);
+    expect(context.inputs).toHaveLength(1);
   });
 
   it('refuses a token for an operation the store has never seen', async () => {
@@ -1218,5 +1405,271 @@ describe('bounded fleet inventory advance', () => {
     }
     // Secret NAMES are durable by design; a secret VALUE never is.
     expect(staged).toContain('MAINTENANCE_ADMIN');
+  });
+});
+
+describe('inventory commit fixture acceptance', () => {
+  it.each([
+    'row',
+    'fact',
+  ] as const)('keeps immutable %s conflicts and duplicate keys from advancing fixture state', async (kind) => {
+    const store = new FakeInventoryRunStore();
+    const options = canonicalFleetInventoryRunOptions(STUB_OPTIONS);
+    await store.withAccountInventoryLease(async (lease) => {
+      const run = await lease.startRun({
+        operationId: OPERATION_ID,
+        options,
+        optionsDigest: fleetInventoryOptionsDigest(options),
+      });
+      const row: FleetInventoryStagedRow = {
+        kind: 'meta',
+        ordinal: 0,
+        payload: { name: 'first' },
+      };
+      const fact: FleetInventoryStagedFact = {
+        deploymentOrdinal: 0,
+        factKind: 'secret-name',
+        factOrdinal: 0,
+        payload: { name: 'first' },
+      };
+      const rows = [row];
+      const facts = [fact];
+      const intended: FleetInventoryRunRecord = {
+        ...run,
+        progress: {
+          ...run.progress,
+          revision: 1,
+          stagedCounts: { ...run.progress.stagedCounts, meta: 1 },
+          factCount: 1,
+        },
+      };
+      const input = {
+        operationId: OPERATION_ID,
+        expectedRevision: 0,
+        runRecord: intended,
+        rows,
+        facts,
+      };
+      await lease.commitChunk(input);
+      const next = {
+        ...intended,
+        progress: { ...intended.progress, revision: 2 },
+      };
+      const before = structuredClone({
+        runs: store.runs,
+        rows: store.rows,
+        facts: store.facts,
+      });
+      const conflicting = await lease
+        .commitChunk({
+          ...input,
+          expectedRevision: 1,
+          runRecord: next,
+          rows:
+            kind === 'row'
+              ? [
+                  { kind: 'meta', ordinal: 1, payload: {} },
+                  { ...row, payload: { name: 'different' } },
+                ]
+              : rows,
+          facts:
+            kind === 'fact'
+              ? [
+                  { ...fact, factOrdinal: 1 },
+                  { ...fact, payload: { name: 'different' } },
+                ]
+              : facts,
+        })
+        .catch((error: unknown) => error);
+      expect({
+        runs: store.runs,
+        rows: store.rows,
+        facts: store.facts,
+      }).toEqual(before);
+      expect(conflicting).toBeInstanceOf(Error);
+      const duplicate = await lease
+        .commitChunk({
+          ...input,
+          expectedRevision: 1,
+          runRecord: next,
+          rows: kind === 'row' ? [...rows, ...rows] : rows,
+          facts: kind === 'fact' ? [...facts, ...facts] : facts,
+        })
+        .catch((error: unknown) => error);
+      expect({
+        runs: store.runs,
+        rows: store.rows,
+        facts: store.facts,
+      }).toEqual(before);
+      expect(duplicate).toMatchObject({
+        name: 'FleetInventoryStateError',
+        message: 'fleet inventory state is malformed',
+      });
+    });
+  });
+
+  it('supports exact fixture replay and restaging but rejects a different intended record', async () => {
+    const store = new FakeInventoryRunStore();
+    const options = canonicalFleetInventoryRunOptions(STUB_OPTIONS);
+    await store.withAccountInventoryLease(async (lease) => {
+      const run = await lease.startRun({
+        operationId: OPERATION_ID,
+        options,
+        optionsDigest: fleetInventoryOptionsDigest(options),
+      });
+      const rows: FleetInventoryStagedRow[] = [
+        { kind: 'meta', ordinal: 0, payload: { name: 'first' } },
+      ];
+      const facts: FleetInventoryStagedFact[] = [
+        {
+          deploymentOrdinal: 0,
+          factKind: 'secret-name',
+          factOrdinal: 0,
+          payload: { name: 'first' },
+        },
+      ];
+      const intended: FleetInventoryRunRecord = {
+        ...run,
+        progress: {
+          ...run.progress,
+          revision: 1,
+          stagedCounts: { ...run.progress.stagedCounts, meta: 1 },
+          factCount: 1,
+        },
+      };
+      const input = {
+        operationId: OPERATION_ID,
+        expectedRevision: 0,
+        runRecord: intended,
+        rows,
+        facts,
+      };
+      await lease.commitChunk(input);
+      const before = structuredClone({
+        runs: store.runs,
+        rows: store.rows,
+        facts: store.facts,
+      });
+      const replay = await lease
+        .commitChunk(input)
+        .catch((error: unknown) => error);
+      expect({
+        runs: store.runs,
+        rows: store.rows,
+        facts: store.facts,
+      }).toEqual(before);
+      expect(replay).toEqual(intended);
+      const different = await lease
+        .commitChunk({
+          ...input,
+          runRecord: { ...intended, updatedAt: '2026-09-08T00:00:00.000Z' },
+        })
+        .catch((error: unknown) => error);
+      expect({
+        runs: store.runs,
+        rows: store.rows,
+        facts: store.facts,
+      }).toEqual(before);
+      expect(different).toBeInstanceOf(Error);
+      const next = {
+        ...intended,
+        progress: { ...intended.progress, revision: 2 },
+      };
+      await lease.commitChunk({
+        ...input,
+        runRecord: next,
+        expectedRevision: 1,
+      });
+      expect(store.rows.get(1)).toEqual(rows);
+      expect(store.facts.get(1)).toEqual(facts);
+      expect(store.runs.get(OPERATION_ID)).toEqual(next);
+    });
+  });
+
+  it('refuses provider output if the run fails before the chunk commit', async () => {
+    const store = new FakeInventoryRunStore();
+    let failed: FleetInventoryRunRecord | undefined;
+    const context: FleetInventoryProviderContext = {
+      async advanceStage(input) {
+        await store.withAccountInventoryLease((lease) =>
+          lease.failRun({
+            operationId: OPERATION_ID,
+            expectedRevision: input.progress.revision,
+            reason: 'operator-abandoned',
+          }),
+        );
+        failed = structuredClone(store.runs.get(OPERATION_ID));
+        return {
+          rows: [{ kind: 'meta', ordinal: 0, payload: {} }],
+          facts: [],
+          nextStage: { step: 'finalize' },
+          providerRequests: 1,
+          diagnostics: [],
+        };
+      },
+    };
+    const result = await advanceFleetInventory({
+      store,
+      context,
+      action: {
+        kind: 'start',
+        operationId: OPERATION_ID,
+        options: STUB_OPTIONS,
+      },
+      maxProviderRequests: MAX_PROVIDER_REQUESTS,
+    }).catch((error: unknown) => error);
+    expect(failed?.state).toBe('failed');
+    expect(store.runs.get(OPERATION_ID)).toEqual(failed);
+    expect(store.rows.size).toBe(0);
+    expect(store.facts.size).toBe(0);
+    expect(result).toBeInstanceOf(Error);
+  });
+});
+
+describe('inventory coordinator duplicate emissions', () => {
+  it.each([
+    'row',
+    'fact',
+  ] as const)('refuses duplicate %s emissions before progress', async (kind) => {
+    const store = new FakeInventoryRunStore();
+    let initial: FleetInventoryRunRecord | undefined;
+    const row: FleetInventoryStagedRow = {
+      kind: 'meta',
+      ordinal: 0,
+      payload: {},
+    };
+    const fact: FleetInventoryStagedFact = {
+      deploymentOrdinal: 0,
+      factKind: 'secret-name',
+      factOrdinal: 0,
+      payload: { name: 'first' },
+    };
+    const context: FleetInventoryProviderContext = {
+      async advanceStage() {
+        initial = structuredClone(store.runs.get(OPERATION_ID));
+        return {
+          rows: kind === 'row' ? [row, row] : [row],
+          facts: kind === 'fact' ? [fact, fact] : [fact],
+          nextStage: { step: 'finalize' },
+          providerRequests: 1,
+          diagnostics: [],
+        };
+      },
+    };
+    const result = await advanceFleetInventory({
+      store,
+      context,
+      action: {
+        kind: 'start',
+        operationId: OPERATION_ID,
+        options: STUB_OPTIONS,
+      },
+      maxProviderRequests: MAX_PROVIDER_REQUESTS,
+    }).catch((error: unknown) => error);
+    expect(initial?.state).toBe('staging');
+    expect(store.runs.get(OPERATION_ID)).toEqual(initial);
+    expect(store.rows.size).toBe(0);
+    expect(store.facts.size).toBe(0);
+    expect(result).toBeInstanceOf(FleetInventoryStateError);
   });
 });
