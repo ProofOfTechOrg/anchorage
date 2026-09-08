@@ -1116,16 +1116,7 @@ function finalizedWorld(path: 'ready' | 'platform-only' | 'full' = 'full') {
       return provider;
     },
   });
-  const start = (id = uuid()) =>
-    advanceFleetMigration(
-      world.options({
-        kind: 'start',
-        operationId: id,
-        records: [world.current()],
-        canaryTenantTags: [],
-      }),
-    );
-  return { world, provider, target, plan, start };
+  return { world, provider, target };
 }
 
 async function continueWorld(

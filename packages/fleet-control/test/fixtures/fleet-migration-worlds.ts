@@ -1,76 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-/**
- * Hand-authored deterministic worlds for the `migrateFleet` golden baselines.
- * `scripts/record-migration-baseline.mjs` and
- * `test/fleet-migration-golden.test.ts` both import this file; the recorder
- * NEVER writes it, so the recorded literals can never rewrite their own input.
- *
- * The worlds freeze the SHIPPED behavior of `migrateFleet` in `src/fleet.ts`
- * before its internals are decomposed into a bounded frozen-plan executor
- * (R4-C.2), so the decomposition can be proven behavior-equivalent. Each world
- * records the value `migrateFleet` produced AND the exact sequence of calls it
- * made onto its `store`, `backendFor`, `specFor`, `secretsFor`, and
- * `settlementFor` collaborators (the "op log").
- *
- * TWO worlds, because the drain has two observable contracts:
- *   - the SUCCESS world (`runFleetMigrationSuccessBaseline`) drives four
- *     records — one immutable-external full migration, one non-external
- *     platform-authored full migration over several D1 versions, one
- *     platform-only change, and one ready steady-state reconcile — and freezes
- *     the returned `readonly FleetRecord[]` beside the op log.
- *   - the STOP world (`runFleetMigrationStopBaseline`) drives three records in
- *     the frozen scheduler order and freezes FIRST-ERROR STOP PARITY: the
- *     first record completes, the second is refused in the admit preamble, and
- *     the third contributes no op at all. `migrateFleet` rejects, so the world
- *     freezes the refusal message beside the op log.
- *
- * OP-LOG VOCABULARY (`MigrationOpLogEntry`, below) is derived from the calls
- * the migration BODY actually makes, not from the collaborator port's member
- * list. Four token compositions carry a key:
- *   - `resolver:<kind>:<tenantTag>:<environment>` — the resolver invocation,
- *     keyed by the record it resolved for.
- *   - `put:<phase-or-subphase>` — the value of the field THAT put advances:
- *     the record `phase` when it moves (including the admission put, which
- *     moves `phase` AND the external `migrationIntent.subphase`), otherwise
- *     the advanced `migrationIntent.subphase`, otherwise the record's current
- *     `phase` for a put that advances neither.
- *   - `applyMigrations:<versions-or-verify>` — `verify` for the zero-pending
- *     ledger-verification call, which passes `spec.migrations` itself, and the
- *     sliced array's length for each per-version call. The two are told apart
- *     by REFERENCE identity against the spec object `specFor` returned, never
- *     by comparing contents: the last per-version slice is content-equal to
- *     `spec.migrations`.
- *   - `settle:<settlementKey>` — the settlement the host was handed, keyed by
- *     the key the promotion settled under.
- *
- * SEAMS. Every collaborator member these two worlds never reach THROWS, so a
- * bounded decomposition that starts calling one fails loudly instead of
- * silently no-opping. The four FEATURE-DETECTED optional backend members —
- * `releaseScriptName`, `ensurePlatformResources`, `deleteRetainedRelease`, and
- * `describeExternalPlatformTarget` — are REAL on the immutable-external
- * backend, because a present-but-throwing member is observably different from
- * an absent one at a feature-detection site; the non-external backend declares
- * none of them, which is what makes its records take the non-external path.
- *
- * CLOCK FENCE. `migrateFleet` stamps every write it performs from
- * `options.clock`, so the recording lease refuses any put whose `updatedAt` is
- * not the frozen instant. A mis-wired clock therefore fails the recorder and
- * the golden test loudly rather than writing a plausible baseline: the success
- * runner lets the violation propagate, and the stop runner inspects the
- * violations BEFORE it reports the caught refusal, so a clock fault can never
- * render as a plausible stop.
- *
- * WHAT IS DELIBERATELY ABSENT. Neither world holds a finalized-ordinary-plane
- * external record, so the finalized-state provider is never resolved and the
- * state-reconcile route is never entered: `describeFinalizedState`,
- * `describeFinalizedBridgeTarget`, `assertFinalizedState`,
- * `ensureFinalizedState`, `commitFinalizedOwnership`,
- * `resolver:finalizedStateProviderFor:<key>`, and the reconcile's
- * `put:upload-authorized`/`put:uploaded` are vocabulary-only here. Their drain
- * behavior stays pinned by `test/fleet.test.ts:3703`.
- */
-
+import type { AttestConvergedActiveRouteOptions } from '../../src/active-route.js';
 import { migrateFleet } from '../../src/fleet.js';
 import {
   canonicalDeploymentEgressPolicy,
@@ -85,7 +15,6 @@ import type {
   ActiveRouteAttestation,
   ApplicationBindingTopology,
   D1Migration,
-  DatabaseExport,
   DatabaseReference,
   DeploymentEgressPolicy,
   DeploymentSecrets,
@@ -109,21 +38,15 @@ import { externalReleaseScriptName } from '../../src/workers-for-platforms-backe
 
 const ENVIRONMENT = 'production';
 
-/**
- * Frozen clock: the only time source `migrateFleet` reads (`options.clock`,
- * src/fleet.ts:2018), so every `updatedAt` it writes is this instant.
- */
 const MIGRATION_NOW = Date.parse('2026-06-01T00:00:00.000Z');
 const FROZEN_UPDATED_AT = new Date(MIGRATION_NOW).toISOString();
 const MIGRATION_CLOCK = () => MIGRATION_NOW;
 
-/** Every seeded record's pre-migration stamp, distinct from the frozen one. */
 const ORIGIN_UPDATED_AT = '2026-05-01T00:00:00.000Z';
 
 const MAINTENANCE_PUBLIC_KEY =
   '{"kty":"OKP","crv":"Ed25519","alg":"EdDSA","kid":"fleet-maintenance-v1","x":"Lhp1XFeTJJx8FLOCKpn4nkO-tWuZZxXX8ziw0LEvUZo"}';
 
-/** 64-hex platform-target digests: `describeExternalPlatformTarget` validates their shape. */
 const STATE_ARTIFACT_DIGEST = 'a'.repeat(64);
 const MOVED_STATE_ARTIFACT_DIGEST = 'd'.repeat(64);
 const EGRESS_ARTIFACT_DIGEST = 'b'.repeat(64);
@@ -164,11 +87,6 @@ const D1_MIGRATIONS: readonly D1Migration[] = [
   },
 ];
 
-/**
- * The op log's frozen vocabulary. Bare tokens name a call whose relative
- * position identifies it against these single-pass worlds; the four keyed
- * families carry the one field that distinguishes otherwise identical calls.
- */
 export type MigrationOpLogEntry =
   | 'withDeploymentLease'
   | 'get'
@@ -209,12 +127,6 @@ function secretsForTenant(tenantTag: string): DeploymentSecrets {
   };
 }
 
-/**
- * The token a put carries: the value of the field THIS put advances. `phase`
- * wins where a put moves more than one (the admission put moves `phase` to
- * `migrating` AND the external intent to `planned`); a put advancing neither
- * a phase nor a subphase carries the record's current `phase`.
- */
 function putToken(
   previous: FleetRecord | undefined,
   next: FleetRecord,
@@ -228,6 +140,7 @@ function putToken(
   ) {
     return migrationSubphase;
   }
+  // Distinct reconcile tokens expose an unexpected reconciliation path.
   const reconcileSubphase =
     next.backendSwitchIntent?.stateReconcileIntent?.subphase;
   if (
@@ -263,7 +176,7 @@ class RecordingFleetStore implements FleetStateStore {
     operation: (lease: FleetStateLease) => Promise<T>,
   ): Promise<T> {
     this.#ops.push('withDeploymentLease');
-    const key = `${tenantTag}:${environment}`;
+    const key = deploymentKey({ tenantTag, environment });
     return operation({
       tenantTag,
       environment,
@@ -275,11 +188,8 @@ class RecordingFleetStore implements FleetStateStore {
         throw new Error('unused');
       },
       put: async (record) => {
-        // Clock fence: `migrateFleet` stamps every write it performs from
-        // `options.clock`, so a put carrying any other instant means the
-        // injected clock stopped reaching a write site. Recording the message
-        // before throwing lets the stop runner see the fault even though the
-        // migration's own rejection is what the world would otherwise freeze.
+        // Recording the fault keeps the stop runner from accepting it as a
+        // migration refusal.
         if (record.updatedAt !== FROZEN_UPDATED_AT) {
           const message = `put payload updatedAt '${record.updatedAt}' for '${key}' does not match the frozen migration clock`;
           this.#fenceViolations.push(message);
@@ -310,10 +220,10 @@ class RecordingFleetStore implements FleetStateStore {
     environment: string,
   ): Promise<FleetRecord | undefined> {
     this.#ops.push('get');
-    return this.#records.get(`${tenantTag}:${environment}`);
+    return this.#records.get(deploymentKey({ tenantTag, environment }));
   }
 
-  async list(): Promise<readonly FleetRecord[]> {
+  async list(): Promise<never> {
     throw new Error('unused');
   }
 
@@ -326,10 +236,6 @@ class RecordingFleetStore implements FleetStateStore {
   }
 }
 
-/**
- * The non-external backend: no `immutableExternalArtifacts`, and none of the
- * four feature-detected external members, so its records take the plain path.
- */
 class RecordingPlainBackend implements ProvisioningBackend {
   readonly kind: ProvisioningBackendKind = 'plain-worker';
   protected readonly ops: MigrationOpLogEntry[];
@@ -348,11 +254,18 @@ class RecordingPlainBackend implements ProvisioningBackend {
     this.fenceViolations = fenceViolations;
   }
 
-  /** Refuses a credential that belongs to another record. */
-  protected assertOwnCredential(spec: DeploymentSpec, secret: string): void {
-    const expected = secretsForTenant(spec.tenantTag).maintenanceAdmin;
+  protected assertOwnCredential(
+    spec: DeploymentSpec,
+    secret: string,
+    credential: 'maintenanceAdmin' | 'deploymentIdentity' = 'maintenanceAdmin',
+  ): void {
+    const expected = secretsForTenant(spec.tenantTag)[credential];
     if (secret !== expected) {
-      const message = `maintenance credential for '${deploymentKey(spec)}' reached a call for another deployment`;
+      const label =
+        credential === 'maintenanceAdmin'
+          ? 'maintenance'
+          : 'deployment identity';
+      const message = `${label} credential for '${deploymentKey(spec)}' reached a call for another deployment`;
       this.fenceViolations.push(message);
       throw new Error(message);
     }
@@ -395,10 +308,12 @@ class RecordingPlainBackend implements ProvisioningBackend {
     migrations: readonly D1Migration[],
   ): Promise<void> {
     const spec = this.specsByDatabaseId.get(database.id);
-    // Reference identity, never contents: the LAST per-version slice is
-    // content-equal to the zero-pending call's `spec.migrations`.
+    if (!spec) {
+      throw new Error(`no spec fixture for database '${database.id}'`);
+    }
+    // The final per-version slice can equal spec.migrations by content.
     this.ops.push(
-      migrations === spec?.migrations
+      migrations === spec.migrations
         ? 'applyMigrations:verify'
         : `applyMigrations:${migrations.length}`,
     );
@@ -407,13 +322,19 @@ class RecordingPlainBackend implements ProvisioningBackend {
   async deployWorker(
     spec: DeploymentSpec,
     database: DatabaseReference,
-    _secrets: DeploymentSecrets,
+    secrets: DeploymentSecrets,
     _platformResources: ExternalPlatformResources | undefined,
     _fence: ExternalMutationFence,
     _expectedArtifactVersion: string | undefined,
     application?: ApplicationBindingTopology,
   ): Promise<Readonly<{ artifactVersion: string; created: boolean }>> {
     this.ops.push('deployWorker');
+    this.assertOwnCredential(
+      spec,
+      secrets.deploymentIdentity,
+      'deploymentIdentity',
+    );
+    this.assertOwnCredential(spec, secrets.maintenanceAdmin);
     const artifactVersion = `v${spec.schemaVersion}`;
     this.live.set(
       spec.tenantTag,
@@ -516,7 +437,7 @@ class RecordingPlainBackend implements ProvisioningBackend {
     throw new Error('unused');
   }
 
-  async exportDatabase(): Promise<DatabaseExport> {
+  async exportDatabase(): Promise<never> {
     throw new Error('unused');
   }
 
@@ -525,20 +446,31 @@ class RecordingPlainBackend implements ProvisioningBackend {
   }
 }
 
-/**
- * The immutable-external backend. All four feature-detected members are REAL,
- * because a present-but-throwing member is observably different from an absent
- * one everywhere `migrateFleet` feature-detects.
- */
+// Feature detection distinguishes absent capabilities from methods that throw.
 class RecordingImmutableBackend extends RecordingPlainBackend {
   override readonly kind: ProvisioningBackendKind = 'workers-for-platforms';
   readonly immutableExternalArtifacts = true as const;
-  readonly retiredScriptNames: string[] = [];
   readonly releases = new Map<string, LiveDeployment>();
-  /** The release each deployment's own host route names, written by promotion. */
   readonly routedScriptNames = new Map<string, string>();
-  stateArtifactDigest = STATE_ARTIFACT_DIGEST;
-  policyHosts: readonly string[] = ['api.example.test'];
+  readonly stateArtifactDigest: string;
+  readonly policyHosts: readonly string[];
+
+  constructor(
+    ops: MigrationOpLogEntry[],
+    specsByDatabaseId: ReadonlyMap<string, DeploymentSpec>,
+    fenceViolations: string[],
+    profile: Readonly<{
+      stateArtifactDigest: string;
+      policyHosts: readonly string[];
+    }> = {
+      stateArtifactDigest: STATE_ARTIFACT_DIGEST,
+      policyHosts: ['api.example.test'],
+    },
+  ) {
+    super(ops, specsByDatabaseId, fenceViolations);
+    this.stateArtifactDigest = profile.stateArtifactDigest;
+    this.policyHosts = [...profile.policyHosts];
+  }
 
   releaseScriptName(spec: DeploymentSpec): string {
     this.ops.push('releaseScriptName');
@@ -552,7 +484,6 @@ class RecordingImmutableBackend extends RecordingPlainBackend {
     return this.platformTargetFor(spec);
   }
 
-  /** The pure derivation behind `describeExternalPlatformTarget`, unrecorded. */
   platformTargetFor(spec: DeploymentSpec): ExternalPlatformTargetDescription {
     return {
       maintenanceCapabilityPublicKey: MAINTENANCE_PUBLIC_KEY,
@@ -606,7 +537,7 @@ class RecordingImmutableBackend extends RecordingPlainBackend {
   override async deployWorker(
     spec: DeploymentSpec,
     database: DatabaseReference,
-    _secrets: DeploymentSecrets,
+    secrets: DeploymentSecrets,
     _platformResources: ExternalPlatformResources | undefined,
     _fence: ExternalMutationFence,
     _expectedArtifactVersion: string | undefined,
@@ -619,6 +550,12 @@ class RecordingImmutableBackend extends RecordingPlainBackend {
     }>
   > {
     this.ops.push('deployWorker');
+    this.assertOwnCredential(
+      spec,
+      secrets.deploymentIdentity,
+      'deploymentIdentity',
+    );
+    this.assertOwnCredential(spec, secrets.maintenanceAdmin);
     const physicalScriptName = externalReleaseScriptName(spec);
     const existing = this.releases.get(physicalScriptName);
     if (!existing) {
@@ -717,7 +654,6 @@ class RecordingImmutableBackend extends RecordingPlainBackend {
     release: ExternalReleaseSnapshot,
   ): Promise<void> {
     this.ops.push('deleteRetainedRelease');
-    this.retiredScriptNames.push(release.physicalScriptName);
     this.releases.delete(release.physicalScriptName);
   }
 }
@@ -808,7 +744,6 @@ function externalRelease(
   };
 }
 
-/** The live release an immutable backend already serves for `spec`. */
 function seededRelease(
   spec: DeploymentSpec,
   record: FleetRecord,
@@ -840,7 +775,6 @@ interface WorldRun {
   readonly fenceViolations: string[];
 }
 
-/** Drives `migrateFleet` over one assembled world through recording resolvers. */
 async function runWorld(world: WorldRun): Promise<readonly FleetRecord[]> {
   const store = new RecordingFleetStore(
     world.records,
@@ -876,38 +810,18 @@ async function runWorld(world: WorldRun): Promise<readonly FleetRecord[]> {
       return settlementHost;
     },
     clock: MIGRATION_CLOCK,
-    // The body spreads `routeAttestation` AFTER its own `clock`
-    // (`fleet.ts:2035-2038`), so this object must never carry a `clock` key: one
-    // here would silently override the frozen clock for the attestation, and the
-    // put fence could not notice, because that clock is read only for the
-    // convergence budget and never stamps an `updatedAt`. The no-op sleep keeps
-    // a frozen clock from turning that budget's break condition
-    // (`active-route.ts:289-292`) into real waiting. Every world converges on
-    // the first attestation attempt, so no delay is ever scheduled.
-    routeAttestation: { sleep: async () => {} },
+    routeAttestation: {
+      sleep: async () => {},
+    } satisfies Omit<AttestConvergedActiveRouteOptions, 'clock'>,
   });
 }
 
-// ---------------------------------------------------------------------------
-// SUCCESS WORLD
-// ---------------------------------------------------------------------------
-
-/**
- * Assembles the success world. Four records, visited in the scheduler's frozen
- * `localeCompare` order over `<tenantTag>:<environment>` because no canary tag
- * is declared: `extfull`, `plainmulti`, `platformonly`, `readysteady`.
- */
 function successWorld(): WorldRun {
   const ops: MigrationOpLogEntry[] = [];
   const fenceViolations: string[] = [];
   const specs = new Map<string, DeploymentSpec>();
   const backends = new Map<string, ProvisioningBackend>();
   const specsByDatabaseId = new Map<string, DeploymentSpec>();
-  // Two immutable-external backends, because a deployment's trusted platform
-  // profile is a property of the backend that describes it: `steady` still
-  // describes the profile its records already carry, while `moved` describes a
-  // new state artifact and a narrower egress policy — which is exactly what
-  // makes `platformonly` a platform-only change and nothing else.
   const steady = new RecordingImmutableBackend(
     ops,
     specsByDatabaseId,
@@ -917,19 +831,17 @@ function successWorld(): WorldRun {
     ops,
     specsByDatabaseId,
     fenceViolations,
+    {
+      stateArtifactDigest: MOVED_STATE_ARTIFACT_DIGEST,
+      policyHosts: ['narrow.example.test'],
+    },
   );
-  moved.stateArtifactDigest = MOVED_STATE_ARTIFACT_DIGEST;
-  moved.policyHosts = ['narrow.example.test'];
   const plain = new RecordingPlainBackend(
     ops,
     specsByDatabaseId,
     fenceViolations,
   );
 
-  // -- extfull: an immutable-external FULL migration whose D1 ledger is already
-  // at the target schema, so its single `applyMigrations` call is the
-  // zero-pending ledger VERIFICATION. Its entry `rollbackRelease` becomes the
-  // committed record's `retiringRelease`, which is what drives `retire-post`.
   const extfullOrigin = baseSpec('extfull');
   const extfullSpec = baseSpec('extfull', {
     modules: [{ name: 'worker.js', content: 'export default { release: 2 }' }],
@@ -955,14 +867,8 @@ function successWorld(): WorldRun {
     applicationResources: [],
   });
 
-  // -- plainmulti: the NON-EXTERNAL record. Its backend declares no
-  // `immutableExternalArtifacts`, so `immutableExternal` is false and the
-  // migration takes the plain path; its platform-authored spec declares three
-  // D1 versions against a record at version 1, so the per-version loop runs
-  // twice and emits `applyMigrations:2` then `applyMigrations:3`.
   const plainmultiOrigin = baseSpec('plainmulti', {
     authoredBy: 'platform',
-    egressProxyService: undefined,
   });
   const plainmultiSpec = baseSpec('plainmulti', {
     authoredBy: 'platform',
@@ -990,11 +896,7 @@ function successWorld(): WorldRun {
     }),
   );
 
-  // -- platformonly: the specification is unchanged, but the backend's trusted
-  // platform profile has moved (a new state artifact digest and a narrower
-  // egress policy), so `platformOnlyChange` selects the platform-only path.
-  // Its active release lags the record's schema version, which is what makes
-  // `effectiveAppliedPlatformTarget` pin the prior D1 columns.
+  // Platform-only changes preserve the applied D1 history.
   const platformonlySpec = baseSpec('platformonly');
   const platformonlyActive = externalRelease(platformonlySpec);
   const platformonlyPriorTarget: ExternalPlatformTargetDescription = {
@@ -1029,13 +931,6 @@ function successWorld(): WorldRun {
     applicationResources: [],
   });
 
-  // -- readysteady: an unchanged deployment reconciled again. It carries a
-  // `retiringRelease`, so the pre-dispatch retirement runs; its live
-  // maintenance is unarmed, so the ready path's re-arm runs; and its
-  // `settledSettlementKey` already names the release it serves, so
-  // `skipWhenAlreadySettled` SKIPS — which is what pins that flag, since a
-  // steady-state reconcile that settled every pass would bill a fleet for
-  // standing still.
   const readysteadySpec = baseSpec('readysteady');
   const readysteadyActive = externalRelease(readysteadySpec);
   const readysteadyRollback = externalRelease(
@@ -1109,10 +1004,6 @@ function successWorld(): WorldRun {
   return { records, specs, backends, ops, fenceViolations };
 }
 
-/**
- * Runs the success world and returns the records `migrateFleet` produced
- * beside the op log it made getting there.
- */
 export async function runFleetMigrationSuccessBaseline(): Promise<{
   readonly result: readonly FleetRecord[];
   readonly ops: readonly MigrationOpLogEntry[];
@@ -1125,19 +1016,9 @@ export async function runFleetMigrationSuccessBaseline(): Promise<{
   return { result, ops: world.ops };
 }
 
-// ---------------------------------------------------------------------------
-// STOP WORLD
-// ---------------------------------------------------------------------------
-
-/** The refusal the stop world's second record is guaranteed to produce. */
 const STOP_REFUSAL =
   "deployment 'bravo:production' has active backend switch 'candidate-deployed'";
 
-/**
- * Assembles the stop world. Three records whose keys sort so that the record
- * that COMPLETES is visited first, the record that is REFUSED second, and the
- * record that stays UNTOUCHED third.
- */
 function stopWorld(): WorldRun {
   const ops: MigrationOpLogEntry[] = [];
   const fenceViolations: string[] = [];
@@ -1150,9 +1031,6 @@ function stopWorld(): WorldRun {
     fenceViolations,
   );
 
-  // -- alpha completes: a plain-path full migration over one pending D1
-  // version, so the frozen log proves the drain really did the first record's
-  // whole body before it reached the refusal.
   const alphaOrigin = baseSpec('alpha', { authoredBy: 'platform' });
   const alphaSpec = baseSpec('alpha', {
     authoredBy: 'platform',
@@ -1180,13 +1058,8 @@ function stopWorld(): WorldRun {
     }),
   );
 
-  // -- bravo is refused. Its backend switch is mid-flight, so
-  // `assertBackendSwitchInactive` throws in the admit preamble — AFTER the
-  // lease and the leased reread, which is why the frozen log carries exactly
-  // that two-token prefix for this record and nothing more. The subphase is
-  // deliberately one of the literals the external-migration namespace also
-  // uses: the body emits no `backendSwitchIntent.subphase` token at all, so
-  // the shared literal cannot collide in the op log.
+  // A backend-switch refusal must stay distinguishable from migration progress
+  // even when their subphase literals match.
   const bravoSpec = baseSpec('bravo');
   const bravo = baseRecord('bravo', 'plain-worker', {
     desiredSpecDigest: deploymentSpecDigest(bravoSpec),
@@ -1230,8 +1103,6 @@ function stopWorld(): WorldRun {
     },
   });
 
-  // -- charlie is never visited: the refusal above ends the drain, so this
-  // record contributes NO op at all. That absence is the observable stop.
   const charlieSpec = baseSpec('charlie', { authoredBy: 'platform' });
   const charlie = baseRecord('charlie', 'plain-worker', {
     desiredSpecDigest: deploymentSpecDigest(charlieSpec),
@@ -1251,16 +1122,6 @@ function stopWorld(): WorldRun {
   return { records, specs, backends, ops, fenceViolations };
 }
 
-/**
- * Runs the stop world and returns the refusal `migrateFleet` rejected with
- * beside the op log it made getting there.
- *
- * The clock fence is checked BEFORE the caught error is reported, so a
- * mis-wired clock surfaces as a fence failure rather than masquerading as a
- * plausible stop; and the caught value must be exactly the chosen refusal, so
- * a collaborator fault or a different validation refusal can never be frozen
- * in its place.
- */
 export async function runFleetMigrationStopBaseline(): Promise<{
   readonly error: string;
   readonly ops: readonly MigrationOpLogEntry[];
