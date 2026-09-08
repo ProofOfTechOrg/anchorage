@@ -42,6 +42,8 @@ import {
   FleetOperationTokenKindError,
   FleetOperationTokenOperationError,
   fleetOperationIntakeDigest,
+  fleetOperationOtherKindMessage,
+  fleetOperationRunRecordFromUnknown,
   fleetOperationStagedRowFromUnknown,
 } from '../src/fleet-operation-state.js';
 import {
@@ -356,6 +358,9 @@ class MemoryOperationStore implements FleetOperationStore {
           const prior = this.operations.get(input.operationId);
           if (!prior)
             throw new Error(`no fleet operation '${input.operationId}'`);
+          if (prior.kind !== kind) {
+            throw new Error(fleetOperationOtherKindMessage(input.operationId));
+          }
           if (
             prior.state === 'finalized' &&
             prior.progress.revision === input.runRecord.progress.revision
@@ -394,6 +399,9 @@ class MemoryOperationStore implements FleetOperationStore {
           const prior = this.operations.get(input.operationId);
           if (!prior)
             throw new Error(`no fleet operation '${input.operationId}'`);
+          if (prior.kind !== kind) {
+            throw new Error(fleetOperationOtherKindMessage(input.operationId));
+          }
           const rows = this.rows.get(input.operationId) ?? [];
           if (
             prior.state === 'failed' &&
@@ -1232,6 +1240,165 @@ async function loseStepResponse(
 }
 
 describe('migration operation fake guarded progress contract', () => {
+  it.each([
+    'missing-operation',
+    'watermark',
+    'other-record',
+    'different-row',
+    'missing-row',
+    'converged',
+  ] as const)('orders the %s convergence identity', async (variant) => {
+    const world = createWorld();
+    await world.start();
+    const initial = copy(world.operationStore.operations.get(uuid()));
+    const row = copy(world.operationStore.rows.get(uuid())?.[0]);
+    if (!initial || !row) throw new Error('missing convergence fixture');
+    const intended = {
+      ...initial,
+      progress: {
+        ...initial.progress,
+        revision: initial.progress.revision + 1,
+      },
+    };
+    const different = {
+      ...row,
+      payload: { ...row.payload, tenantTag: 'other' },
+    };
+    const store = new MemoryOperationStore();
+    if (variant !== 'missing-operation') {
+      store.operations.set(
+        uuid(),
+        variant === 'other-record'
+          ? { ...intended, state: 'failed' }
+          : intended,
+      );
+    }
+    store.rows.set(
+      uuid(),
+      variant === 'missing-row'
+        ? []
+        : [variant === 'converged' ? row : different],
+    );
+    const operationsBefore = structuredClone([...store.operations]);
+    const rowsBefore = structuredClone([...store.rows]);
+    await store.withAccountOperationLease('migration', async (lease) => {
+      const commit = lease.commitProgress({
+        operationId: uuid(),
+        expectedRevision: initial.progress.revision,
+        runRecord: intended,
+        updateRows:
+          variant === 'different-row'
+            ? [
+                { ...row, ordinal: 1, payload: { ...row.payload, ordinal: 1 } },
+                row,
+              ]
+            : [row],
+        expectedRowWatermarks: {
+          item: variant === 'watermark' ? 2 : variant === 'missing-row' ? 0 : 1,
+        },
+      });
+      if (variant === 'converged') {
+        await expect(commit).resolves.toEqual(intended);
+      } else {
+        const message =
+          variant === 'missing-operation'
+            ? `no fleet operation '${uuid()}'`
+            : variant === 'different-row'
+              ? divergence(uuid()).message
+              : conflict(uuid()).message;
+        await expect(commit).rejects.toBeInstanceOf(Error);
+        await expect(commit).rejects.toHaveProperty('message', message);
+      }
+    });
+    expect([...store.operations]).toEqual(operationsBefore);
+    expect([...store.rows]).toEqual(rowsBefore);
+  });
+
+  it.each([
+    { method: 'finalizeOperation', state: 'running' },
+    { method: 'finalizeOperation', state: 'finalized' },
+    { method: 'finalizeOperation', state: 'failed' },
+    { method: 'failOperation', state: 'running' },
+    { method: 'failOperation', state: 'finalized' },
+    { method: 'failOperation', state: 'failed' },
+  ] as const)('$method refuses a foreign-kind $state record using the captured lease', async ({
+    method,
+    state,
+  }) => {
+    const world = createWorld();
+    await world.start();
+    const store = world.operationStore;
+    const initial = copy(store.operations.get(uuid()));
+    if (!initial) throw new Error('missing terminal fixture');
+    const operationId = uuid();
+    const source =
+      state === 'running'
+        ? initial
+        : {
+            ...initial,
+            progress: {
+              ...initial.progress,
+              revision: initial.progress.revision + 1,
+            },
+          };
+    store.heads.set('audit', uuid(991));
+    store.operations.set(
+      operationId,
+      fleetOperationRunRecordFromUnknown({
+        ...source,
+        state,
+        progress: {
+          ...source.progress,
+          ...(state === 'failed'
+            ? { failure: { reason: 'operator-abandoned' } }
+            : {}),
+          ...(state === 'finalized' ? { completedItemCount: 1 } : {}),
+        },
+      }),
+    );
+    const operationsBefore = structuredClone([...store.operations]);
+    const rowsBefore = structuredClone([...store.rows]);
+    const headsBefore = [...store.heads];
+    await store.withAccountOperationLease('audit', async (lease) => {
+      const runRecord = fleetOperationRunRecordFromUnknown({
+        ...source,
+        kind: 'audit',
+        state: method === 'finalizeOperation' ? 'finalized' : 'failed',
+        progress: {
+          kind: 'audit',
+          revision: initial.progress.revision + 1,
+          stage: { step: 'finalize' },
+          generation: 1,
+          auditTimeMs: 0,
+          staleAfterMs: 60_000,
+          recordCount: 0,
+          findingCount: 0,
+          factCount: 0,
+          ...(method === 'failOperation'
+            ? { failure: { reason: 'operator-abandoned' } }
+            : {}),
+        },
+      });
+      const input = {
+        operationId,
+        expectedRevision: initial.progress.revision,
+        runRecord,
+      };
+      const result =
+        method === 'finalizeOperation'
+          ? lease.finalizeOperation({ ...input, expectedRowCounts: {} })
+          : lease.failOperation(input);
+      await expect(result).rejects.toBeInstanceOf(Error);
+      await expect(result).rejects.toHaveProperty(
+        'message',
+        fleetOperationOtherKindMessage(operationId),
+      );
+      expect([...store.operations]).toEqual(operationsBefore);
+      expect([...store.rows]).toEqual(rowsBefore);
+      expect([...store.heads]).toEqual(headsBefore);
+    });
+  });
+
   it('refuses missing updates and different immutable bytes before sibling writes, and accepts exact retries', async () => {
     const world = createWorld();
     await world.start(uuid(), [world.initial, world.initial]);

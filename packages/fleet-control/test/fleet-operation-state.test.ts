@@ -302,11 +302,7 @@ describe('fleet operation state', () => {
     ).toThrow(FleetOperationStateError);
   });
 
-  it('record/token byte bounds fail closed', () => {
-    // The token bound cannot be discriminated by any black-box input: a token
-    // that passes the exact-key, version, UUIDv4 and safe-integer checks is
-    // about ninety bytes, so every oversized input trips one of those checks
-    // and raises the same error whether the bound is present or not.
+  it('record byte bound fails closed; the token codec refuses oversized and unknown-key input', () => {
     expect(() =>
       parseFleetOperationToken({
         version: 1,
