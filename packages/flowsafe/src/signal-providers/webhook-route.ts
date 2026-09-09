@@ -542,7 +542,7 @@ export interface SubscriptionRouterOptions {
   subscriptions: SubscriptionStoreFactory;
   /** Prove subscriptions target durable bound memory, not ephemeral run ids. */
   validateThreadTarget: BoundThreadTargetValidator;
-  /** Who may manage subscriptions. Default RUN_START_ROLES (operator/admin). */
+  /** Who may manage subscriptions. Default RUN_START_ROLES. */
   roles?: readonly ApprovalRole[];
   /** The provider ids a subscription may name. Absent ⇒ any PROVIDER_ID_PATTERN slug. */
   knownProviders?: readonly string[];

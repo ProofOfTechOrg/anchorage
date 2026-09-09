@@ -149,11 +149,7 @@ export interface ObjectiveRouterOptions {
   store: ObjectiveStore;
   /** Prove mutations target durable bound memory, not an ephemeral run id. */
   validateThreadTarget: BoundThreadTargetValidator;
-  /**
-   * Who may SET/UPDATE/CLEAR an objective. Default RUN_START_ROLES
-   * (operator/admin) — reviewers/viewers cannot author standing instructions.
-   * Reads (GET) are not role-gated beyond ownership.
-   */
+  /** Roles allowed to mutate objectives. Defaults to RUN_START_ROLES. */
   roles?: readonly ApprovalRole[];
   /** Every mutation (and denied read) is audited through this. Absent ⇒ no audit. */
   audit?: ObjectiveAuditSink;
@@ -471,8 +467,6 @@ export function createObjectiveRouter(
         'thread',
       );
 
-      // 3. Coarse role on mutations: authoring a standing instruction is an
-      // operator/admin act.
       if (isMutation && !roles.includes(context.actor.role)) {
         await audit('rejected', 'forbidden-role');
         return json({ error: 'forbidden' }, 403);
