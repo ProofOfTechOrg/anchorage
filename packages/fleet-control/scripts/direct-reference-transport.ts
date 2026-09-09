@@ -105,7 +105,11 @@ export class DirectReferenceTransport {
     init: Parameters<typeof fetch>[1],
   ): Promise<Response> {
     this.assertWithinBudget();
-    const requestInit = { ...init, duplex: 'half' as const };
+    const requestInit = {
+      ...init,
+      redirect: 'manual' as const,
+      duplex: 'half' as const,
+    };
     const request = new Request(input, requestInit);
     request.signal.throwIfAborted();
     if (request.url === 'data:,') return this.#nativeFetch(request);
@@ -139,6 +143,14 @@ export class DirectReferenceTransport {
     signal.throwIfAborted();
     if (kind === 'provider') this.#providerAttempts++;
     else this.#maintenanceAttempts++;
-    return this.#nativeFetch(request, { signal, redirect: 'error' });
+    const response = await this.#nativeFetch(request, {
+      signal,
+      redirect: 'manual',
+    });
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      void response.body?.cancel().catch(() => undefined);
+      throw new DirectReferenceExecutionError();
+    }
+    return response;
   }
 }

@@ -120,7 +120,7 @@ describe('direct reference transport', () => {
       expect(normalized.headers.get('authorization')).toBe(
         'Bearer fixture-token',
       );
-      expect(normalized.redirect).toBe('error');
+      expect(normalized.redirect).toBe('manual');
       expect(await normalized.text()).toBe('fixture-body');
       return new Response('done');
     });
@@ -148,6 +148,33 @@ describe('direct reference transport', () => {
     } finally {
       now.mockRestore();
     }
+  });
+
+  it.each([
+    301, 302, 303, 307, 308,
+  ])('refuses redirect status %s without another delegation', async (status) => {
+    const { transport, nativeFetch } = fixture();
+    const canceled = vi.fn(() => new Promise<void>(() => {}));
+    nativeFetch.mockImplementation(
+      async () =>
+        new Response(new ReadableStream({ cancel: canceled }), {
+          status,
+          headers: { location: 'https://unvisited.example.test' },
+        }),
+    );
+    await expect(
+      transport.providerFetch('https://fixture.test'),
+    ).rejects.toMatchObject({ code: 'operation-refused' });
+    expect(nativeFetch).toHaveBeenCalledTimes(1);
+    expect(canceled).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves a nonredirect 304 response', async () => {
+    const { transport, nativeFetch } = fixture();
+    nativeFetch.mockResolvedValue(new Response(null, { status: 304 }));
+    expect((await transport.providerFetch('https://fixture.test')).status).toBe(
+      304,
+    );
   });
 
   it('rechecks time after preparing the native request signal', async () => {
@@ -323,6 +350,8 @@ describe('direct reference transport inside workerd', () => {
     export default {async fetch(request){
       const mode=new URL(request.url).searchParams.get('mode');let calls=0,aborted=false;
       const transport=new DirectReferenceTransport({runtime:{requestTimeoutMs:25,invocationTimeoutMs:5000,maxProviderRequests:9},startedAt:performance.now(),signal:request.signal,fetch:async(_input,init)=>{
+        const normalized=new Request(_input,init);
+        if(normalized.redirect!=='manual')throw new Error('unexpected redirect mode');
         calls++;
         return mode==='body'?new Response(new ReadableStream({start(c){init.signal.addEventListener('abort',()=>{aborted=true;c.error(new Error('fixture-abort'));},{once:true});}})):new Response('fixture');
       }});

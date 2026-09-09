@@ -10,7 +10,9 @@
     "direct-credentialed-spec.ts",
     "direct-reference-journal.ts",
     "direct-reference-http.ts",
-    "direct-reference-transport.ts"
+    "direct-reference-transport.ts",
+    "direct-reference-context.ts",
+    "direct-reference-worker.ts"
   ],
   "include": []
 }

@@ -3137,10 +3137,13 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
             fail('export returned a non-HTTPS download URL');
           }
           const download = await this.#request(signedUrl, {
-            redirect: 'error',
+            redirect: 'manual',
           });
           httpStatus = download.status;
-          if (!download.ok) fail();
+          if (!download.ok) {
+            cancelBodyWithoutAwait(download.body, 'D1 export download refused');
+            fail();
+          }
           const downloadBody = download.body;
           if (!downloadBody) fail();
           const [storeBody, hashBody] = downloadBody.tee();

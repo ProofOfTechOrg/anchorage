@@ -37,6 +37,7 @@ export interface DirectReferenceHttpOptions {
   readonly invokeSecret: string | undefined;
   readonly configSha256: string;
   readonly invocationTimeoutMs: number;
+  readonly startedAt?: number;
   readonly dispatch: (
     action: DirectReferenceAction,
     signal: AbortSignal,
@@ -53,6 +54,7 @@ const journalStatus = {
   'journal-state': 500,
   'run-binding-mismatch': 409,
   'operation-mismatch': 409,
+  'prerequisite-unavailable': 409,
   'missing-start': 409,
 } satisfies Record<DirectJournalErrorCode, number>;
 const executionStatus = {
@@ -139,9 +141,22 @@ export async function handleDirectReferenceHttpRequest(
       options.invocationTimeoutMs > 2_147_483_647
     )
       return failure('operation-refused', 500);
-    const expiresAt = performance.now() + options.invocationTimeoutMs;
+    const startedAt = options.startedAt ?? performance.now();
+    if (
+      !Number.isFinite(startedAt) ||
+      startedAt < 0 ||
+      startedAt > performance.now()
+    )
+      return failure('operation-refused', 500);
+    const expiresAt = startedAt + options.invocationTimeoutMs;
     deadlineAt = expiresAt;
-    timer = setTimeout(() => deadline.abort(), options.invocationTimeoutMs);
+    timer = setTimeout(
+      () => deadline.abort(),
+      Math.min(
+        options.invocationTimeoutMs,
+        Math.max(1, Math.ceil(expiresAt - performance.now())),
+      ),
+    );
     const signal = AbortSignal.any([request.signal, deadline.signal]);
     const assertActive = () => {
       if (performance.now() >= expiresAt) deadline.abort();

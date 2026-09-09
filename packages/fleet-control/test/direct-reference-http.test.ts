@@ -47,6 +47,30 @@ function fixture(overrides: Partial<DirectReferenceHttpOptions> = {}) {
 }
 
 describe('direct reference HTTP boundary', () => {
+  it('uses a trusted shared start time through response serialization', async () => {
+    const now = vi.spyOn(performance, 'now').mockReturnValue(10);
+    try {
+      const { handle, dispatch } = fixture({
+        invocationTimeoutMs: 1000,
+        startedAt: 0,
+      });
+      dispatch.mockResolvedValue({
+        toJSON() {
+          now.mockReturnValue(1001);
+          return { status: 'complete' };
+        },
+      });
+      const response = await handle(request());
+      expect(response.status).toBe(504);
+      expect(await response.json()).toMatchObject({
+        ok: false,
+        error: { code: 'invocation-timeout' },
+      });
+    } finally {
+      now.mockRestore();
+    }
+  });
+
   it.each([
     'revoked',
     'prototype-trap',

@@ -2203,7 +2203,7 @@ describe('CloudflareProvisioningClient plain-worker plane', () => {
     const fixture = recordingFetch(async ({ url, headers, redirect }) => {
       if (url.startsWith('https://download.example.test/')) {
         expect(headers.has('authorization')).toBe(false);
-        expect(redirect).toBe('error');
+        expect(redirect).toBe('manual');
         const error = new Error(signedUrl);
         error.name = signedUrl;
         throw error;

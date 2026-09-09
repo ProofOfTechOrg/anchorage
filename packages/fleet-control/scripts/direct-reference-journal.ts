@@ -26,6 +26,7 @@ export type DirectJournalErrorCode =
   | 'journal-state'
   | 'run-binding-mismatch'
   | 'operation-mismatch'
+  | 'prerequisite-unavailable'
   | 'missing-start';
 
 export class DirectReferenceJournalError extends Error {
@@ -197,6 +198,7 @@ export class DirectReferenceJournal {
             candidate === 'journal-state' ||
             candidate === 'run-binding-mismatch' ||
             candidate === 'operation-mismatch' ||
+            candidate === 'prerequisite-unavailable' ||
             candidate === 'missing-start'
           )
             code = candidate;
