@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
-// The goal objective HTTP surface (createObjectiveRouter): bounded ingestion
-// gate order (401 -> ownership -> role -> size/body/field/cap -> audit ->
-// persist). Each fails closed. The suite also covers the set/get/update/clear
-// round-trip, byte-identical to core's Agent goal methods, the maxRuns host
-// cap, and the GOAL_REQUEST_CONTEXT_KEY no-collision reservation over mock
-// resolver and store seams.
 
 import { describe, expect, it, vi } from 'vitest';
 
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 
-import type { ActorContext, ApprovalActor } from '../approval-api/index.js';
+import {
+  type ActorContext,
+  ActorResolutionError,
+  type ApprovalActor,
+} from '../approval-api/index.js';
 import {
   BREAKWATER_ACTOR_KEY,
   BREAKWATER_CONNECTOR_EXECUTION_KEY,
@@ -129,6 +127,39 @@ interface GoalRecord {
 }
 
 describe('createObjectiveRouter — bounded ingestion gate', () => {
+  it.each([
+    'constructor',
+    'toString',
+    '__proto__',
+    'hasOwnProperty',
+  ])('rejects inherited operation %s before authentication or storage', async (method) => {
+    const { store, raw } = memoryStore();
+    const resolve = vi.fn(async () => actorContext('operator'));
+    const read = vi.spyOn(store, 'getState');
+    const write = vi.spyOn(store, 'setState');
+    const clear = vi.spyOn(store, 'deleteState');
+    const validateThreadTarget = vi.fn(async () => undefined);
+    const audit = vi.fn();
+    const router = createObjectiveRouter({
+      resolve,
+      store,
+      validateThreadTarget,
+      audit,
+    });
+
+    const response = await router(req(method, OWNED_THREAD, {}));
+
+    expect(response?.status).toBe(405);
+    expect(await response?.json()).toEqual({ error: 'method not allowed' });
+    expect(resolve).not.toHaveBeenCalled();
+    expect(read).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+    expect(clear).not.toHaveBeenCalled();
+    expect(validateThreadTarget).not.toHaveBeenCalled();
+    expect(audit).not.toHaveBeenCalled();
+    expect(raw.size).toBe(0);
+  });
+
   it.each([
     { maxRunsCap: 0 },
     { maxRunsCap: 1.5 },
@@ -743,6 +774,50 @@ describe('createObjectiveRouter and the deployment execution fence', () => {
     } as unknown as ExecutionFenceDatabase);
   }
 
+  it.each([
+    'draining',
+    'unreadable',
+  ] as const)('preserves the %s fence refusal when audit and diagnostics fail', async (state) => {
+    const { store, raw } = memoryStore();
+    const audit = vi.fn(() => {
+      throw new ActorResolutionError('audit failed');
+    });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {
+      throw new Error('logger failed');
+    });
+    const router = createObjectiveRouter({
+      resolve: async () => actorContext('operator'),
+      store,
+      audit,
+      executionFence:
+        state === 'unreadable' ? unreadableFence() : await fenceAt(state),
+    });
+    try {
+      const response = await router(
+        req('PUT', OWNED_THREAD, { objective: 'ship it' }),
+      );
+      expect(response?.status).toBe(503);
+      expect(await response?.json()).toMatchObject({
+        reason:
+          state === 'unreadable'
+            ? { code: 'EXECUTION_FENCE_UNREADABLE' }
+            : { code: 'EXECUTION_FENCED', state: 'draining' },
+      });
+      expect(audit).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          outcome: 'rejected',
+          reason:
+            state === 'unreadable'
+              ? 'execution-fence-unreadable'
+              : 'execution-fenced',
+        }),
+      );
+      expect(raw.size).toBe(0);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
   it('degrades a mutation closed with 503 when the fence cannot be read', async () => {
     // #given
     const { store, raw } = memoryStore();
@@ -845,5 +920,179 @@ describe('createObjectiveRouter and the deployment execution fence', () => {
     const res = await router(req('GET', OWNED_THREAD));
     expect(res?.status).toBe(200);
     expect(await res?.json()).toEqual({ objective: null });
+  });
+});
+
+describe('createObjectiveRouter audit isolation', () => {
+  it.each([
+    ['role', 'viewer', OWNED_THREAD, {}, 403, 'forbidden', 'forbidden-role'],
+    [
+      'owner',
+      'operator',
+      'foreign',
+      {},
+      404,
+      'thread not found',
+      'invalid-thread',
+    ],
+    [
+      'array body',
+      'operator',
+      OWNED_THREAD,
+      [],
+      400,
+      'a JSON object body is required',
+      'malformed-body',
+    ],
+    [
+      'invalid JSON',
+      'operator',
+      OWNED_THREAD,
+      '{',
+      400,
+      'a JSON object body is required',
+      'malformed-body',
+    ],
+    [
+      'memory id',
+      'operator',
+      OWNED_THREAD,
+      { threadId: 'forged' },
+      400,
+      'threadId is server-assigned (agent-memory ids are minted by the host)',
+      'client-memory-id',
+    ],
+    [
+      'typed refusal',
+      'operator',
+      OWNED_THREAD,
+      { objective: 'ship it' },
+      422,
+      'host refused objective',
+      'route-error-422',
+    ],
+  ] as const)('preserves the %s refusal when audit throws a route error and diagnostics throw', async (_label, role, threadId, body, status, message, reason) => {
+    const { store, raw } = memoryStore();
+    const audit = vi.fn(() => {
+      throw new RunRouteError(409, 'audit failed');
+    });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {
+      throw new ActorResolutionError('logger failed');
+    });
+    const router = createObjectiveRouter({
+      resolve: async () => ({ ...actorContext(role), deploymentTag: 'acme' }),
+      store,
+      audit,
+      validateThreadTarget: async () => {
+        throw new RunRouteError(422, 'host refused objective');
+      },
+    });
+    try {
+      const response = await router(req('PUT', threadId, body));
+      expect(response?.status).toBe(status);
+      expect(await response?.json()).toEqual({ error: message });
+      expect(response?.headers.get('cache-control')).toBe('no-store');
+      expect(audit).toHaveBeenCalledExactlyOnceWith({
+        type: 'goal.objective',
+        deploymentTag: 'acme',
+        actorId: 'opal',
+        threadId,
+        operation: 'set',
+        outcome: 'rejected',
+        reason,
+        timestamp: expect.any(String),
+      });
+      expect(logged).toHaveBeenCalledTimes(1);
+      expect(raw.size).toBe(0);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it.each([
+    'actor error',
+    'message getter',
+    'toString',
+  ])('preserves committed mutations when the audit sink throws %s', async (failure) => {
+    const error =
+      failure === 'actor error'
+        ? new ActorResolutionError('audit failed')
+        : failure === 'message getter'
+          ? Object.defineProperty(new Error(), 'message', {
+              get() {
+                throw new Error('message failed');
+              },
+            })
+          : {
+              toString() {
+                throw new Error('coercion failed');
+              },
+            };
+    const { store, raw } = memoryStore();
+    const audit = vi.fn(async () => {
+      throw error;
+    });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {
+      throw new Error('logger failed');
+    });
+    const router = createObjectiveRouter({
+      resolve: async () => actorContext('operator'),
+      store,
+      audit,
+    });
+    try {
+      const set = await router(
+        req('PUT', OWNED_THREAD, { objective: 'ship it' }),
+      );
+      expect(set?.status).toBe(200);
+      expect(await set?.json()).toMatchObject({
+        objective: { objective: 'ship it', status: 'active' },
+      });
+      expect(raw.size).toBe(1);
+      const update = await router(
+        req('PATCH', OWNED_THREAD, { status: 'paused' }),
+      );
+      expect(update?.status).toBe(200);
+      expect(await update?.json()).toMatchObject({
+        objective: { objective: 'ship it', status: 'paused' },
+      });
+      expect(raw.get(`${OWNED_THREAD}::goal`)).toMatchObject({
+        status: 'paused',
+      });
+      const clear = await router(req('DELETE', OWNED_THREAD));
+      expect(clear?.status).toBe(200);
+      expect(await clear?.json()).toEqual({ ok: true });
+      expect(raw.size).toBe(0);
+      expect(audit.mock.calls).toEqual(
+        ['set', 'update', 'clear'].map((operation) => [
+          expect.objectContaining({ operation, outcome: 'accepted' }),
+        ]),
+      );
+      expect(logged).toHaveBeenCalledTimes(3);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it('captures the audit callback and preserves its options receiver', async () => {
+    const { store } = memoryStore();
+    let receiver: ObjectiveRouterOptions | undefined;
+    const audit = vi.fn(function (this: ObjectiveRouterOptions) {
+      receiver = this;
+    });
+    const replacement = vi.fn();
+    const options: ObjectiveRouterOptions = {
+      resolve: async () => actorContext('operator'),
+      store,
+      validateThreadTarget: async () => undefined,
+      executionFence: 'none',
+      audit,
+    };
+    const router = createObjectiveRouterImpl(options);
+    options.audit = replacement;
+    expect((await router(req('DELETE', OWNED_THREAD)))?.status).toBe(200);
+    expect(audit).toHaveBeenCalledTimes(1);
+    expect(receiver).toBe(options);
+    expect(replacement).not.toHaveBeenCalled();
   });
 });

@@ -273,7 +273,9 @@ Mount `createSignalRouter()` through `createFlowsafeWorker({ buildSignalRouter }
 
 Without agent memory, persist outcomes return `memory-unavailable`, except that a default or `ifIdle: 'persist'` message or signal still delivers into an active run (an active persist that no memory could write still answers `memory-unavailable`), a persist-behavior agent-schedule fire settles a canonical `discard` receipt, and an owner notification keeps its inbox row while the model-visible memory write remains best-effort.
 
-The Worker applies this order: authentication, coarse role, thread lookup, byte cap, JSON parse, client-memory-id rejection, attribute-key allowlist, the configured rate-limit seam, audit, then topology forwarding. The starter's limiter is isolate-local example protection; use shared durable state when the limit is contractual across the deployment.
+Configure `SignalRouterOptions.validateThreadTarget` with the existing `BoundThreadTargetValidator` type to apply host-specific restrictions before body parsing or signal forwarding. `createAgentThreadTopology().requireBoundThread` verifies a durable binding. For strict ownership, compare the captured principal's `kind` and `id` with the owner returned by `await context.resourceOwnerFor('thread', target.threadId)`, and throw `RunRouteError` with status 404 on refusal. Omitting the callback retains the router's existing resource-access policy, including its administrator access.
+
+The router records acceptance after the downstream response succeeds and normalizes thread-not-found refusals from registry access, the validator and the receiving Durable Object. Audit-sink and diagnostic failures retain the selected response. The starter's limiter is isolate-local example protection; use shared durable state when the limit is contractual across the deployment.
 
 Signals are untrusted model input. Core escapes the XML representation, while the route validates tag and attribute names and caps payload size. A receiving agent's ordinary `processInput` policy is not a complete signal boundary: Mastra can drain queued signals after the initiating input processor has run. Configure `createThreadSignalRoutes({ contentPolicy })` to inspect Mastra's canonical escaped XML inside the Thread Durable Object before delivery, persistence, wake, or run start. The same boundary covers direct routes, providers, schedules, and notification dispatch.
 
@@ -290,7 +292,7 @@ PATCH  /api/threads/:threadId/goal
 DELETE /api/threads/:threadId/goal
 ```
 
-Objectives are standing instructions injected into future turns. The router therefore uses the signal-ingestion trust posture for writes: authenticate, authorize, ownership-check, reject client memory ids, cap size and `maxRuns`, then audit every accepted or post-auth rejected mutation.
+Objectives are standing instructions injected into future turns. Mutations require authenticated thread access. Audit-sink failures retain the selected mutation result.
 
 The router writes through Mastra's objective helpers into the goal lane of `mastra_thread_state`, so the durable goal step reads the identical shape. Updates are deployment-local last-write-wins rather than a serialized thread lease.
 

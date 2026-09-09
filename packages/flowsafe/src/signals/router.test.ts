@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
-// The P6 ingestion trust boundary (createSignalRouter): the gate ORDER (401 →
-// ownership → role → memory-id → allowlist/size/rate → audit → forward), each
-// fail-closed, over mock resolve + topology seams.
 
 import { describe, expect, it, vi } from 'vitest';
 
-import type { ActorContext, ApprovalActor } from '../approval-api/index.js';
-import type { ThreadTopology } from '../host-kit/index.js';
+import {
+  type ActorContext,
+  ActorResolutionError,
+  type ApprovalActor,
+} from '../approval-api/index.js';
+import { RunRouteError, type ThreadTopology } from '../host-kit/index.js';
 import {
   createInMemorySignalRateLimiter,
   createSignalRouter,
   type SignalIngestAuditEvent,
+  type SignalRouterOptions,
 } from './router.js';
 
 const OWNED_THREAD = 'acme_t1';
@@ -68,6 +70,14 @@ function post(path: string, body: unknown): Request {
     headers: { 'content-type': 'application/json' },
     body: typeof body === 'string' ? body : JSON.stringify(body),
   });
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 }
 
 describe('createSignalRouter — the P6 ingestion gate', () => {
@@ -412,6 +422,523 @@ describe('createSignalRouter — the P6 ingestion gate', () => {
       }),
     );
     expect(res?.status).toBe(405);
+  });
+
+  it.each([
+    'constructor',
+    'toString',
+    '__proto__',
+    'hasOwnProperty',
+  ])('does not resolve an inherited channel: %s', async (channel) => {
+    const { topology, calls } = recordingTopology();
+    const resolve = vi.fn(async () => actorContext('operator'));
+    const audit = vi.fn();
+    const router = createSignalRouter({ resolve, topology, audit });
+
+    expect(
+      await router(post(`/api/threads/${OWNED_THREAD}/${channel}`, {})),
+    ).toBeNull();
+    expect(resolve).not.toHaveBeenCalled();
+    expect(audit).not.toHaveBeenCalled();
+    expect(calls).toEqual([]);
+  });
+
+  it.each([
+    ['signal', '/signal'],
+    ['message', '/signal/message'],
+    ['queue', '/signal/queue'],
+    ['state', '/signal/state'],
+    ['notification', '/signal/notification'],
+  ])('forwards the own channel %s to %s', async (channel, path) => {
+    const { topology, calls } = recordingTopology();
+    const router = createSignalRouter({
+      resolve: async () => actorContext('operator'),
+      topology,
+    });
+    expect(
+      (await router(post(`/api/threads/${OWNED_THREAD}/${channel}`, {})))
+        ?.status,
+    ).toBe(200);
+    expect(calls).toEqual([{ threadId: OWNED_THREAD, path, body: '{}' }]);
+  });
+
+  it.each([
+    'admin',
+    'viewer',
+  ] as const)('makes strict foreign and missing threads indistinguishable for %s before body or rate work', async (role) => {
+    const context = actorContext(role);
+    context.canAccessResource = vi.fn(async (_kind, id) => id !== 'missing');
+    const validateThreadTarget = vi.fn(async () => {
+      throw new RunRouteError(404, 'private binding ownership detail');
+    });
+    const { topology, calls } = recordingTopology();
+    const rateLimit = vi.fn(() => true);
+    const audit = vi.fn();
+    const router = createSignalRouter({
+      resolve: async () => context,
+      topology,
+      validateThreadTarget,
+      rateLimit,
+      audit,
+    });
+    const responses = [];
+    for (const threadId of ['foreign', 'missing']) {
+      const request = post(`/api/threads/${threadId}/message`, '{');
+      const response = await router(request);
+      expect(request.bodyUsed).toBe(false);
+      responses.push({
+        status: response?.status,
+        headers: [...(response?.headers ?? [])],
+        body: await response?.text(),
+      });
+    }
+    expect(responses[0]).toEqual(responses[1]);
+    expect(responses[0]).toEqual({
+      status: 404,
+      headers: [
+        ['cache-control', 'no-store'],
+        ['content-type', 'application/json'],
+      ],
+      body: '{"error":"thread not found"}',
+    });
+    expect(validateThreadTarget).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ actor: { id: 'opal', role } }),
+      { threadId: 'foreign' },
+    );
+    expect(rateLimit).not.toHaveBeenCalled();
+    expect(calls).toEqual([]);
+    expect(audit.mock.calls.map(([event]) => event)).toEqual(
+      ['foreign', 'missing'].map((threadId) =>
+        expect.objectContaining({
+          threadId,
+          outcome: 'rejected',
+          reason: 'invalid-thread',
+          contentBytes: 0,
+        }),
+      ),
+    );
+  });
+
+  it('preserves an admin-permissive registry policy when the validator is omitted', async () => {
+    const context = actorContext('admin');
+    context.canAccessResource = async () => true;
+    const { topology, calls } = recordingTopology();
+    const router = createSignalRouter({
+      resolve: async () => context,
+      topology,
+    });
+
+    const response = await router(post('/api/threads/foreign/message', {}));
+
+    expect(response?.status).toBe(200);
+    expect(calls).toEqual([
+      { threadId: 'foreign', path: '/signal/message', body: '{}' },
+    ]);
+  });
+
+  it('captures validator and audit callbacks while preserving their options receiver', async () => {
+    const { topology } = recordingTopology();
+    const validateThreadTarget = vi.fn(async function (
+      this: SignalRouterOptions,
+    ) {
+      expect(this).toBe(options);
+    });
+    let auditReceiver: SignalRouterOptions | undefined;
+    const audit = vi.fn(function (this: SignalRouterOptions) {
+      auditReceiver = this;
+    });
+    const options: SignalRouterOptions = {
+      resolve: async () => actorContext('operator'),
+      topology,
+      validateThreadTarget,
+      audit,
+    };
+    const router = createSignalRouter(options);
+    const replacementValidator = vi.fn();
+    const replacementAudit = vi.fn();
+    options.validateThreadTarget = replacementValidator;
+    options.audit = replacementAudit;
+
+    expect(
+      (await router(post(`/api/threads/${OWNED_THREAD}/message`, {})))?.status,
+    ).toBe(200);
+    expect(validateThreadTarget).toHaveBeenCalledOnce();
+    expect(audit).toHaveBeenCalledOnce();
+    expect(auditReceiver).toBe(options);
+    expect(replacementValidator).not.toHaveBeenCalled();
+    expect(replacementAudit).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'ownership',
+    'validator',
+  ] as const)('captures actor, principal, deployment and mutation epoch before the %s await', async (boundary) => {
+    const entered = deferred<void>();
+    const held = deferred<void>();
+    const actor = { id: 'opal', role: 'operator' as ApprovalActor['role'] };
+    const principal = { kind: 'human' as const, ...actor };
+    const context = {
+      ...actorContext('operator'),
+      actor,
+      principal,
+      mutationEpoch: 7,
+      deploymentTag: 'acme',
+      async canAccessResource() {
+        expect(this).toBe(context);
+        if (boundary === 'ownership') {
+          entered.resolve();
+          await held.promise;
+        }
+        return true;
+      },
+      newThreadId() {
+        expect(this).toBe(context);
+        return OWNED_THREAD;
+      },
+    };
+    const validateThreadTarget = vi.fn(async (captured: ActorContext) => {
+      if (boundary === 'validator') {
+        entered.resolve();
+        await held.promise;
+      }
+      expect(captured).not.toBe(context);
+      expect(captured.actor).toEqual({ id: 'opal', role: 'operator' });
+      expect(captured.principal).toEqual({
+        kind: 'human',
+        id: 'opal',
+        role: 'operator',
+      });
+      expect(captured.mutationEpoch).toBe(7);
+      expect(captured.newThreadId()).toBe(OWNED_THREAD);
+    });
+    const { topology } = recordingTopology();
+    const send = vi.spyOn(topology, 'send');
+    const audit = vi.fn();
+    const router = createSignalRouter({
+      resolve: async () => context,
+      topology,
+      validateThreadTarget,
+      audit,
+    });
+    const request = post(`/api/threads/${OWNED_THREAD}/message`, {});
+    const result = router(request);
+    await entered.promise;
+    expect(request.bodyUsed).toBe(false);
+    expect(send).not.toHaveBeenCalled();
+    expect(audit).not.toHaveBeenCalled();
+    actor.id = 'mallory';
+    actor.role = 'viewer';
+    principal.id = 'mallory';
+    principal.role = 'admin';
+    context.mutationEpoch = 8;
+    context.deploymentTag = 'other-deployment';
+    context.newThreadId = () => 'other-thread';
+    held.resolve();
+
+    expect((await result)?.status).toBe(200);
+    expect(send).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        actor: { id: 'opal', role: 'operator' },
+        principal: { kind: 'human', id: 'opal', role: 'operator' },
+        mutationEpoch: 7,
+        deploymentTag: 'acme',
+      }),
+      OWNED_THREAD,
+      '/signal/message',
+      expect.any(Object),
+    );
+    expect(audit).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        actorId: 'opal',
+        deploymentTag: 'acme',
+        outcome: 'accepted',
+      }),
+    );
+  });
+
+  it('waits for the downstream decision before auditing acceptance', async () => {
+    const decision = deferred<Response>();
+    const entered = deferred<void>();
+    const { topology } = recordingTopology();
+    vi.spyOn(topology, 'send').mockImplementation(async () => {
+      entered.resolve();
+      return decision.promise;
+    });
+    const audit = vi.fn();
+    const router = createSignalRouter({
+      resolve: async () => actorContext('operator'),
+      topology,
+      audit,
+    });
+    const pending = router(post(`/api/threads/${OWNED_THREAD}/message`, {}));
+    await entered.promise;
+    expect(audit).not.toHaveBeenCalled();
+    const response = new Response('delivered', {
+      status: 202,
+      headers: { 'x-delivery': 'accepted' },
+    });
+    decision.resolve(response);
+    expect(await pending).toBe(response);
+    expect(audit).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ outcome: 'accepted', contentBytes: 2 }),
+    );
+  });
+
+  it('retains a completed delivery while its pending audit rejects', async () => {
+    const entered = deferred<void>();
+    const held = deferred<void>();
+    const { topology } = recordingTopology();
+    const response = new Response('delivered', { status: 202 });
+    const send = vi.spyOn(topology, 'send').mockResolvedValue(response);
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {
+      throw new Error('logger unavailable');
+    });
+    const audit = vi.fn(async () => {
+      entered.resolve();
+      await held.promise;
+      throw new ActorResolutionError('audit refused');
+    });
+    const router = createSignalRouter({
+      resolve: async () => actorContext('operator'),
+      topology,
+      audit,
+    });
+    try {
+      const pending = router(post(`/api/threads/${OWNED_THREAD}/message`, {}));
+      await entered.promise;
+      expect(send).toHaveBeenCalledOnce();
+      expect(audit).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ outcome: 'accepted' }),
+      );
+      held.resolve();
+      expect(await pending).toBe(response);
+      expect(audit).toHaveBeenCalledOnce();
+      expect(send).toHaveBeenCalledOnce();
+    } finally {
+      held.resolve();
+      log.mockRestore();
+    }
+  });
+
+  it.each([
+    403, 404, 422, 503,
+  ])('audits one downstream %s rejection and preserves its public response', async (status) => {
+    const { topology } = recordingTopology();
+    const response = new Response('private downstream refusal', {
+      status,
+      headers: {
+        'content-type': 'text/plain',
+        'retry-after': '5',
+        'x-owner': 'foreign-owner',
+      },
+    });
+    vi.spyOn(topology, 'send').mockResolvedValue(response);
+    const audit = vi.fn();
+    const router = createSignalRouter({
+      resolve: async () => actorContext('operator'),
+      topology,
+      audit,
+    });
+    const result = await router(
+      post(`/api/threads/${OWNED_THREAD}/message`, {}),
+    );
+    expect(result?.status).toBe(status);
+    expect(audit).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        outcome: 'rejected',
+        reason: status === 404 ? 'invalid-thread' : `downstream-${status}`,
+      }),
+    );
+    expect(response.bodyUsed).toBe(false);
+    if (status === 404) {
+      expect(await result?.text()).toBe('{"error":"thread not found"}');
+      expect([...(result?.headers ?? [])]).toEqual([
+        ['cache-control', 'no-store'],
+        ['content-type', 'application/json'],
+      ]);
+    } else {
+      expect(result).toBe(response);
+      expect(await result?.text()).toBe('private downstream refusal');
+    }
+  });
+
+  it.each([
+    [
+      new RunRouteError(404, 'private missing binding'),
+      404,
+      'invalid-thread',
+      'thread not found',
+    ],
+    [
+      new RunRouteError(503, 'temporarily unavailable'),
+      503,
+      'route-error-503',
+      'temporarily unavailable',
+    ],
+    [
+      new ActorResolutionError('private principal detail'),
+      403,
+      'forbidden',
+      'forbidden',
+    ],
+    [
+      new Error('private backend detail'),
+      500,
+      'internal-error',
+      'internal error',
+    ],
+  ] as const)('audits one final outcome when forwarding throws %s', async (error, status, reason, message) => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const { topology } = recordingTopology();
+    vi.spyOn(topology, 'send').mockRejectedValue(error);
+    const audit = vi.fn();
+    const router = createSignalRouter({
+      resolve: async () => actorContext('operator'),
+      topology,
+      audit,
+    });
+    try {
+      const response = await router(
+        post(`/api/threads/${OWNED_THREAD}/message`, {}),
+      );
+      expect(response?.status).toBe(status);
+      expect(await response?.json()).toEqual({ error: message });
+      expect(audit).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ outcome: 'rejected', reason }),
+      );
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it.each([
+    new ActorResolutionError('invalid claims'),
+    new Error('authentication backend unavailable'),
+  ])('does not audit a resolver exception: %s', async (error) => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const { topology, calls } = recordingTopology();
+    const audit = vi.fn();
+    const router = createSignalRouter({
+      resolve: async () => {
+        throw error;
+      },
+      topology,
+      audit,
+    });
+    try {
+      const response = await router(
+        post(`/api/threads/${OWNED_THREAD}/message`, {}),
+      );
+      expect(response?.status).toBe(
+        error instanceof ActorResolutionError ? 403 : 500,
+      );
+      expect(audit).not.toHaveBeenCalled();
+      expect(calls).toEqual([]);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it.each([
+    ['accepted', '{}', 'operator', 200, undefined],
+    ['role rejection', '{}', 'viewer', 403, 'forbidden-role'],
+    ['parse refusal', '{', 'operator', 400, 'malformed-body'],
+    ['non-object refusal', 'null', 'operator', 400, 'malformed-body'],
+    [
+      'memory-id refusal',
+      '{"threadId":"foreign"}',
+      'operator',
+      400,
+      'client-memory-id',
+    ],
+  ] as const)('preserves %s when the audit sink throws a typed error', async (_label, body, role, status, reason) => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {
+      throw new Error('logger unavailable');
+    });
+    const { topology, calls } = recordingTopology();
+    const audit = vi.fn(() => {
+      throw new RunRouteError(503, 'sink unavailable');
+    });
+    const router = createSignalRouter({
+      resolve: async () => actorContext(role),
+      topology,
+      audit,
+    });
+    try {
+      const response = await router(
+        post(`/api/threads/${OWNED_THREAD}/message`, body),
+      );
+      expect(response?.status).toBe(status);
+      expect(audit).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          outcome: status === 200 ? 'accepted' : 'rejected',
+          ...(reason === undefined ? {} : { reason }),
+        }),
+      );
+      expect(calls).toHaveLength(status === 200 ? 1 : 0);
+      if (status === 403)
+        expect(await response?.json()).toEqual({ error: 'forbidden' });
+      if (reason === 'malformed-body')
+        expect(await response?.json()).toEqual({
+          error: 'a JSON object body is required',
+        });
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it.each([
+    'actor-error',
+    'message-getter',
+    'toString',
+  ] as const)('contains an audit %s failure without changing the downstream response', async (failure) => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const error =
+      failure === 'actor-error'
+        ? new ActorResolutionError('sink refused')
+        : failure === 'message-getter'
+          ? Object.defineProperty(new Error(), 'message', {
+              get() {
+                throw new Error('unreadable message');
+              },
+            })
+          : {
+              toString() {
+                throw new Error('unreadable value');
+              },
+            };
+    const { topology } = recordingTopology();
+    const response = new Response('unavailable', {
+      status: 503,
+      headers: { 'retry-after': '9' },
+    });
+    vi.spyOn(topology, 'send').mockResolvedValue(response);
+    const audit = vi.fn(async () => {
+      throw error;
+    });
+    const router = createSignalRouter({
+      resolve: async () => actorContext('operator'),
+      topology,
+      audit,
+    });
+    try {
+      expect(
+        await router(post(`/api/threads/${OWNED_THREAD}/message`, {})),
+      ).toBe(response);
+      expect(audit).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          outcome: 'rejected',
+          reason: 'downstream-503',
+        }),
+      );
+      expect(log).toHaveBeenCalledOnce();
+      expect(JSON.parse(log.mock.calls[0]?.[0])).toMatchObject({
+        type: 'signal.ingest-audit-error',
+        reason: failure === 'actor-error' ? 'sink refused' : 'unreadable error',
+      });
+    } finally {
+      log.mockRestore();
+    }
   });
 
   it('returns a generic 500 while retaining internal detail in structured logs', async () => {

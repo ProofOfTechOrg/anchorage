@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, it, vi } from 'vitest';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
+import { ActorResolutionError } from '../approval-api/index.js';
 import {
   EXECUTION_PRINCIPAL_HEADER,
   type ExecutionFenceDatabase,
@@ -489,6 +490,80 @@ describe('createWebhookRouter — verify before parse', () => {
 });
 
 describe('createWebhookRouter — robustness', () => {
+  it.each([
+    'constructor',
+    'toString',
+    '__proto__',
+    'hasOwnProperty',
+    'test',
+  ])('ignores inherited provider %s before secret or signature effects', async (providerId) => {
+    const verify = vi.fn(() => true);
+    const extract = vi.fn(() => ['res:1']);
+    const build = vi.fn(() => ({ source: 'test', kind: 'k', summary: 's' }));
+    const providers = Object.create({
+      test: testProvider({
+        verifyWebhookSignature: verify,
+        extractResourceIds: extract,
+        buildNotification: build,
+      }),
+    }) as Record<string, SignalProviderAdapter>;
+    const secretForProvider = vi.fn(() => 'secret');
+    const store = new InMemorySubscriptionStoreFactory().store();
+    const lookup = vi.spyOn(store, 'listByResource');
+    const threads = stubThreads();
+    const audit = vi.fn();
+    const run = createWebhookRouter({
+      providers,
+      subscriptions: store,
+      topology: createThreadTopology(threads.namespace),
+      secretForProvider,
+      audit,
+    });
+    const request = new Request(
+      `http://host/api/signal-providers/${providerId}/webhook`,
+      { method: 'POST', body: '{}' },
+    );
+
+    expect(await run(request)).toBeNull();
+    expect(request.bodyUsed).toBe(false);
+    expect(secretForProvider).not.toHaveBeenCalled();
+    expect(verify).not.toHaveBeenCalled();
+    expect(extract).not.toHaveBeenCalled();
+    expect(build).not.toHaveBeenCalled();
+    expect(lookup).not.toHaveBeenCalled();
+    expect(threads.addressed).toEqual([]);
+    expect(audit).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'constructor',
+    'test',
+  ])('accepts an explicitly registered own provider %s', async (providerId) => {
+    const verify = vi.fn(() => true);
+    const providers = Object.fromEntries([
+      [providerId, testProvider({ verifyWebhookSignature: verify })],
+    ]);
+    const secretForProvider = vi.fn(() => 'secret');
+    const run = createWebhookRouter({
+      providers,
+      subscriptions: new InMemorySubscriptionStoreFactory().store(),
+      topology: createThreadTopology(stubThreads().namespace),
+      secretForProvider,
+    });
+
+    const response = await run(
+      new Request(`http://host/api/signal-providers/${providerId}/webhook`, {
+        method: 'POST',
+        body: '{}',
+      }),
+    );
+
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toEqual({ matched: 0, delivered: 0 });
+    expect(secretForProvider).toHaveBeenCalledExactlyOnceWith(providerId);
+    expect(verify).toHaveBeenCalledTimes(1);
+  });
+
   function router(secret: string | undefined, provider = testProvider()) {
     const factory = new InMemorySubscriptionStoreFactory();
     return {
@@ -902,6 +977,43 @@ describe('createWebhookRouter and the deployment execution fence', () => {
     );
   });
 
+  it('preserves a locked fence refusal when audit and diagnostics fail', async () => {
+    const audit = vi.fn(async () => {
+      throw new ActorResolutionError('audit failed');
+    });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {
+      throw new Error('logger failed');
+    });
+    const extract = vi.fn(() => ['res:1']);
+    const threads = stubThreads();
+    const router = createWebhookRouter({
+      providers: { test: testProvider({ extractResourceIds: extract }) },
+      subscriptions: new InMemorySubscriptionStoreFactory().store(),
+      topology: createThreadTopology(threads.namespace),
+      secretForProvider: () => 'secret',
+      executionFence: await fenceAt('migration-locked'),
+      audit,
+    });
+    try {
+      const response = await router(webhookRequest('good', {}));
+      expect(response?.status).toBe(503);
+      expect(await response?.json()).toMatchObject({
+        reason: { code: 'EXECUTION_FENCED', state: 'migration-locked' },
+      });
+      expect(audit).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          outcome: 'rejected',
+          reason: 'execution-fenced',
+          contentBytes: 2,
+        }),
+      );
+      expect(extract).not.toHaveBeenCalled();
+      expect(threads.addressed).toEqual([]);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
   it('still rejects a FORGED signature with 401 while locked', async () => {
     // #given — the verify stays first, so a forgery never learns the fence
     // state and never spends the delivery path.
@@ -940,5 +1052,231 @@ describe('createWebhookRouter and the deployment execution fence', () => {
     // #then
     const response = await router(webhookRequest('good', { id: 'evt-1' }));
     expect(response?.status).toBe(200);
+  });
+});
+
+describe('createWebhookRouter audit isolation', () => {
+  it.each([
+    ['forged', 'bad', '{}', 1024, 401, 'invalid signature', 'forged-signature'],
+    [
+      'oversized',
+      'good',
+      '{}',
+      0,
+      413,
+      'payload too large',
+      'payload-too-large',
+    ],
+    [
+      'malformed',
+      'good',
+      '{',
+      1024,
+      400,
+      'a JSON body is required',
+      'malformed-body',
+    ],
+  ] as const)('preserves the %s refusal when the audit sink and diagnostic logger throw', async (_label, signature, body, maxBodyBytes, status, message, reason) => {
+    const audit = vi.fn(async () => {
+      throw new RunRouteError(409, 'audit failed');
+    });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {
+      throw new Error('logger failed');
+    });
+    const threads = stubThreads();
+    const extract = vi.fn(() => ['res:1']);
+    const store = new InMemorySubscriptionStoreFactory().store();
+    const lookup = vi.spyOn(store, 'listByResource');
+    const router = createWebhookRouter({
+      providers: { test: testProvider({ extractResourceIds: extract }) },
+      subscriptions: store,
+      topology: createThreadTopology(threads.namespace),
+      secretForProvider: () => 'secret',
+      deploymentTag: 'acme',
+      maxBodyBytes,
+      audit,
+    });
+    try {
+      const response = await router(
+        new Request('http://host/api/signal-providers/test/webhook', {
+          method: 'POST',
+          headers: { 'x-sig': signature },
+          body,
+        }),
+      );
+      expect(response?.status).toBe(status);
+      expect(await response?.json()).toEqual({ error: message });
+      expect(response?.headers.get('cache-control')).toBe('no-store');
+      expect(audit).toHaveBeenCalledExactlyOnceWith({
+        type: 'signal-provider.webhook',
+        providerId: 'test',
+        deploymentTag: 'acme',
+        outcome: 'rejected',
+        reason,
+        contentBytes: body.length,
+        timestamp: expect.any(String),
+      });
+      expect(logged).toHaveBeenCalledTimes(1);
+      expect(extract).not.toHaveBeenCalled();
+      expect(lookup).not.toHaveBeenCalled();
+      expect(threads.addressed).toEqual([]);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it('retains the forgery audit budget when audit and error coercion fail', async () => {
+    const audit = vi.fn(() => {
+      throw {
+        toString() {
+          throw new Error('coercion failed');
+        },
+      };
+    });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {
+      throw new Error('logger failed');
+    });
+    let now = 1000;
+    const router = createWebhookRouter({
+      providers: { test: testProvider() },
+      subscriptions: new InMemorySubscriptionStoreFactory().store(),
+      topology: createThreadTopology(stubThreads().namespace),
+      secretForProvider: () => 'secret',
+      audit,
+      maxForgeryAuditsPerWindow: 2,
+      forgeryAuditWindowMs: 1000,
+      now: () => now,
+    });
+    try {
+      for (let i = 0; i < 4; i += 1) {
+        const response = await router(webhookRequest('bad', {}));
+        expect(response?.status).toBe(401);
+        expect(await response?.json()).toEqual({ error: 'invalid signature' });
+      }
+      expect(audit).toHaveBeenCalledTimes(2);
+      now = 2000;
+      expect((await router(webhookRequest('bad', {})))?.status).toBe(401);
+      expect(audit).toHaveBeenCalledTimes(3);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it.each([
+    ['delivered', 200, 200, { matched: 1, delivered: 1 }],
+    ['content denial', 422, 200, { matched: 1, delivered: 0, denied: 1 }],
+    ['address refusal', 404, 200, { matched: 1, delivered: 0, failed: 1 }],
+    ['deferred', 503, 503, { matched: 1, delivered: 0, deferred: 1 }],
+  ] as const)('retains the %s delivery outcome when audit and diagnostic logger throw', async (_label, downstreamStatus, status, payload) => {
+    const audit = vi.fn(async () => {
+      throw new ActorResolutionError('audit failed');
+    });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {
+      throw new Error('logger failed');
+    });
+    const factory = new InMemorySubscriptionStoreFactory();
+    await seed(factory, 'acme', 'acme_t1');
+    const threads = stubThreadsWith(downstreamStatus);
+    const router = createWebhookRouter({
+      providers: { test: testProvider() },
+      subscriptions: factory.store(),
+      topology: createThreadTopology(threads.namespace),
+      secretForProvider: () => 'secret',
+      audit,
+    });
+    try {
+      const response = await router(webhookRequest('good', {}));
+      expect(response?.status).toBe(status);
+      expect(await response?.json()).toEqual(payload);
+      expect(audit).toHaveBeenCalledExactlyOnceWith({
+        type: 'signal-provider.webhook',
+        providerId: 'test',
+        outcome: 'accepted',
+        ...payload,
+        ...(downstreamStatus === 503 ? { reason: 'delivery-deferred' } : {}),
+        contentBytes: 2,
+        timestamp: expect.any(String),
+      });
+      expect(threads.addressed).toEqual(['acme_t1']);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it.each([
+    'builder',
+    'delivery',
+  ])('contains unreadable %s errors and continues subsequent delivery with a throwing logger', async (source) => {
+    const failure = Object.defineProperty(new Error(), 'message', {
+      get() {
+        throw new Error('message failed');
+      },
+    });
+    const factory = new InMemorySubscriptionStoreFactory();
+    await seed(factory, 'acme', 'acme_t1');
+    await seed(factory, 'globex', 'globex_t1');
+    const threads = stubThreads();
+    const topology = createThreadTopology(threads.namespace);
+    const deliver = vi.spyOn(topology, 'send');
+    if (source === 'delivery') deliver.mockRejectedValueOnce(failure);
+    const audit = vi.fn(async () => {
+      throw failure;
+    });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {
+      throw new Error('logger failed');
+    });
+    const router = createWebhookRouter({
+      providers: {
+        test: testProvider({
+          buildNotification: (_payload, row) => {
+            if (source === 'builder' && row.threadId === 'acme_t1')
+              throw failure;
+            return { source: 'test', kind: 'k', summary: 's' };
+          },
+        }),
+      },
+      subscriptions: factory.store(),
+      topology,
+      secretForProvider: () => 'secret',
+      audit,
+    });
+    try {
+      const response = await router(webhookRequest('good', {}));
+      const payload = {
+        matched: 2,
+        delivered: 1,
+        ...(source === 'builder' ? { failed: 1 } : { deferred: 1 }),
+      };
+      expect(response?.status).toBe(source === 'builder' ? 200 : 503);
+      expect(await response?.json()).toEqual(payload);
+      expect(audit).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ outcome: 'accepted', ...payload }),
+      );
+      expect(threads.addressed).toEqual(['globex_t1']);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it('captures the audit callback and preserves its options receiver', async () => {
+    let receiver: WebhookRouterOptions | undefined;
+    const audit = vi.fn(function (this: WebhookRouterOptions) {
+      receiver = this;
+    });
+    const replacement = vi.fn();
+    const options: WebhookRouterOptions = {
+      providers: { test: testProvider() },
+      subscriptions: new InMemorySubscriptionStoreFactory().store(),
+      topology: createThreadTopology(stubThreads().namespace),
+      secretForProvider: () => 'secret',
+      executionFence: 'none',
+      audit,
+    };
+    const router = createWebhookRouterImpl(options);
+    options.audit = replacement;
+    expect((await router(webhookRequest('good', {})))?.status).toBe(200);
+    expect(audit).toHaveBeenCalledTimes(1);
+    expect(receiver).toBe(options);
+    expect(replacement).not.toHaveBeenCalled();
   });
 });

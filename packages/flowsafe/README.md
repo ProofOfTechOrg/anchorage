@@ -433,7 +433,9 @@ Agent event replay lasts only as long as the configured Mastra cache. The defaul
 
 ### Signals and notifications
 
-`createThreadSignalRoutes()` hosts message, queue, signal, state, and notification delivery in the thread Durable Object. `createSignalRouter()` is the Worker trust boundary: authenticate, authorize, ownership-check, cap, parse, reject memory ids, allowlist attributes, rate-limit, audit, then forward.
+`createThreadSignalRoutes()` hosts message, queue, signal, state, and notification delivery in the thread Durable Object. `createSignalRouter()` authenticates Worker requests before reaching those routes. Its optional `validateThreadTarget` uses the existing `BoundThreadTargetValidator` type for host-specific binding or ownership restrictions. See the [signal-ingress guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/durable-agents.md#expose-signal-ingestion) for strict-owner composition.
+
+Signal acceptance is audited after the downstream response succeeds. Thread refusals with status 404 use a consistent public response across registry, validator and downstream checks. An audit-sink failure retains the selected response.
 
 The thread routes reject a signal whose `tagName` is not an XML name, and drop an attributes object carrying a value Mastra cannot render or a key that is not an XML name. Both are what core would otherwise throw on while rendering the signal inside the agent turn.
 

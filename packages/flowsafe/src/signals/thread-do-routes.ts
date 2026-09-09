@@ -689,12 +689,16 @@ export function createThreadSignalRoutes(
               Boolean(await agent.getMemory())
             );
           } catch {
-            console.error(
-              JSON.stringify({
-                type: 'signal-memory-resolution-failed',
-                threadId,
-              }),
-            );
+            try {
+              console.error(
+                JSON.stringify({
+                  type: 'signal-memory-resolution-failed',
+                  threadId,
+                }),
+              );
+            } catch {
+              // Diagnostics cannot change the memory fallback.
+            }
             return false;
           }
         })();
@@ -1794,14 +1798,18 @@ async function handleScheduleSignal(options: {
   ) {
     // The operator has to be able to find the broken schedule; the offending
     // name itself stays out of the log.
-    console.error(
-      JSON.stringify({
-        type: 'schedule-target-unrenderable',
-        scheduleId,
-        dispatchId,
-        agentId: target.agentId,
-      }),
-    );
+    try {
+      console.error(
+        JSON.stringify({
+          type: 'schedule-target-unrenderable',
+          scheduleId,
+          dispatchId,
+          agentId: target.agentId,
+        }),
+      );
+    } catch {
+      // Diagnostics cannot prevent terminal settlement.
+    }
     return await settleDiscard();
   }
 

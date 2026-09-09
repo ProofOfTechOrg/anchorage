@@ -822,7 +822,10 @@ describe('createThreadSignalRoutes', () => {
     expect(calls).toHaveLength(0);
   });
 
-  it('resolves throwing memory lazily and fails closed only at persist gates', async () => {
+  it.each([
+    'returns',
+    'throws',
+  ])('resolves throwing memory lazily and fails closed only at persist gates when the logger %s', async (logger) => {
     const throwingMemoryAgent = () => {
       const mocked = mockAgent();
       const getMemory = vi.fn(() => {
@@ -880,7 +883,9 @@ describe('createThreadSignalRoutes', () => {
     expect(notifying.getMemory).not.toHaveBeenCalled();
 
     const persisting = throwingMemoryAgent();
-    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {
+      if (logger === 'throws') throw new Error('logger failed');
+    });
     try {
       const persistingRoutes = createThreadSignalRoutes({
         resolveAgent: () => persisting.agent,
@@ -890,10 +895,12 @@ describe('createThreadSignalRoutes', () => {
         post('/signal/queue', { contents: 'persist' }),
         scopeWith(undefined),
       );
+      expect(queueResponse?.status).toBe(200);
       expect(await queueResponse?.json()).toEqual({
         decision: { action: 'discard', reason: 'memory-unavailable' },
       });
       expect(persisting.getMemory).toHaveBeenCalledOnce();
+      expect(persisting.calls).toHaveLength(0);
       expect(log).toHaveBeenCalledWith(
         JSON.stringify({
           type: 'signal-memory-resolution-failed',
@@ -3845,33 +3852,40 @@ describe('createThreadSignalRoutes — signal content policy', () => {
     expect(inputs[0]?.runId).toBe('run_1');
   });
 
-  it.each([
-    { case: 'tag name', overrides: { tagName: 'not a name' } },
-    {
-      case: 'target attributes',
-      overrides: { attributes: { 'not a name': 'x' } },
-    },
-    {
-      case: 'active branch attributes',
-      overrides: {
-        ifActive: { behavior: 'deliver', attributes: { 'not a name': 'x' } },
+  it.each(
+    [
+      { case: 'tag name', overrides: { tagName: 'not a name' } },
+      {
+        case: 'target attributes',
+        overrides: { attributes: { 'not a name': 'x' } },
       },
-    },
-    {
-      case: 'idle branch attributes',
-      overrides: {
-        ifIdle: { behavior: 'wake', attributes: { 'not a name': 'x' } },
+      {
+        case: 'active branch attributes',
+        overrides: {
+          ifActive: { behavior: 'deliver', attributes: { 'not a name': 'x' } },
+        },
       },
-    },
-  ])('settles a schedule whose $case cannot be rendered as a terminal discard', async ({
+      {
+        case: 'idle branch attributes',
+        overrides: {
+          ifIdle: { behavior: 'wake', attributes: { 'not a name': 'x' } },
+        },
+      },
+    ].flatMap((testCase) =>
+      ['returns', 'throws'].map((logger) => ({ ...testCase, logger })),
+    ),
+  )('settles a schedule whose $case cannot be rendered as a terminal discard when the logger $logger', async ({
     overrides,
+    logger,
   }) => {
     // #given — core's assertXmlName would throw on this name at render time,
     // and no later tick could ever render it either
     const { agent, calls } = mockAgent();
     const settle = vi.fn(async () => undefined);
     const { policy, inputs } = recordingPolicy();
-    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {
+      if (logger === 'throws') throw new Error('logger failed');
+    });
 
     try {
       // #when

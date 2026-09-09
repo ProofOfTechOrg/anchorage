@@ -558,8 +558,9 @@ import {
 import {
   createFlowsafeWorker, type FlowsafeWorkerConfig, type FlowsafeWorkerEnv,
   type RunStartInput, type DoRunStartInput, type RunRouterOptions,
-  type RunRouterStartIdempotency,
+  type RunRouterStartIdempotency, type BoundThreadTargetValidator, type ThreadTopology,
 } from '@proofoftech/flowsafe/host-kit';
+import { createSignalRouter, type SignalRouterOptions } from '@proofoftech/flowsafe/signals';
 import {
   type AgentStartAuthority, type FlowsafeDurableAgent,
 } from '@proofoftech/flowsafe/agent-runner';
@@ -607,6 +608,17 @@ createPrincipalActorContext({
 });
 declare const hostInit: ThreadScope['init'];
 const legacyScope: ThreadScope = { threadId: 'thread', principal, init: hostInit };
+declare const signalTopology: ThreadTopology;
+declare const validateBoundThread: BoundThreadTargetValidator;
+const signalOptions: SignalRouterOptions = {
+  resolve: async () => legacyContext,
+  topology: signalTopology,
+  validateThreadTarget: validateBoundThread,
+};
+createSignalRouter(signalOptions);
+createSignalRouter({ resolve: signalOptions.resolve, topology: signalTopology });
+const signalTargetResult: Promise<void> = validateBoundThread(legacyContext, { threadId: 'thread' });
+void signalTargetResult;
 const epochScope: ThreadScope = { ...legacyScope, mutationEpoch: 2 };
 const legacyInput: RunStartInput = { workflowId: 'workflow', runId: 'run', inputData: {}, principal };
 const epochInput: RunStartInput = { ...legacyInput, mutationEpoch: 2 };
@@ -730,6 +742,7 @@ import * as doRunner from '@proofoftech/flowsafe/do-runner';
 import * as hostKit from '@proofoftech/flowsafe/host-kit';
 import * as agentRunner from '@proofoftech/flowsafe/agent-runner';
 import * as schedules from '@proofoftech/flowsafe/schedules';
+import * as signals from '@proofoftech/flowsafe/signals';
 import { Mastra } from '@mastra/core/mastra';
 import { InMemoryStore } from '@mastra/core/storage';
 import { createStep, createWorkflow } from '@mastra/core/workflows';
@@ -1115,6 +1128,63 @@ assert.equal(typeof host.createAgentRouter, 'function');
 assert.equal(typeof host.createAgentThreadTopology, 'function');
 assert.equal(typeof host.createThreadAgentHost, 'function');
 assert.equal(typeof host.createAgentApprovalResumer, 'function');
+const signalFactory = new approvals.InMemoryApprovalStoreFactory();
+const signalPrincipal = { kind: 'human', id: 'signal-owner', role: 'operator' };
+await signalFactory.resources().claim('thread', 'signal-thread', signalPrincipal);
+const signalContext = approvals.createPrincipalActorContext({
+  principal: signalPrincipal,
+  storeFactory: signalFactory,
+  buildService: () => { throw new Error('signal probe does not build an approval service'); },
+});
+const savedSignalLogger = console.error;
+console.error = () => {};
+try {
+  for (const mode of ['strict-refusal', 'downstream-refusal', 'success', 'default']) {
+    let sends = 0;
+    let validations = 0;
+    const events = [];
+    const router = signals.createSignalRouter({
+      resolve: async () => signalContext,
+      topology: {
+        send: async () => {
+          sends += 1;
+          assert.equal(events.length, 0);
+          return new Response(JSON.stringify(mode === 'downstream-refusal'
+            ? { error: 'private target detail' }
+            : { decision: { action: 'deliver' }, signalId: 'packed-signal' }), {
+            status: mode === 'downstream-refusal' ? 404 : 200,
+          });
+        },
+        forward: async () => { throw new Error('unexpected forwarding seam'); },
+      },
+      ...(mode === 'default' ? {} : {
+        validateThreadTarget: async (context, target) => {
+          validations += 1;
+          assert.deepEqual(context.principal, signalPrincipal);
+          assert.deepEqual(target, { threadId: 'signal-thread' });
+          if (mode === 'strict-refusal') throw new hostKit.RunRouteError(404, 'private validator detail');
+        },
+      }),
+      audit: event => {
+        events.push(event);
+        throw new hostKit.RunRouteError(404, 'audit sink detail');
+      },
+    });
+    const response = await router(new Request('https://packed.test/api/threads/signal-thread/message', {
+      method: 'POST', body: JSON.stringify({ contents: 'hello' }),
+    }));
+    const refused = mode === 'strict-refusal' || mode === 'downstream-refusal';
+    assert.equal(response.status, refused ? 404 : 200);
+    if (refused) assert.deepEqual(await response.json(), { error: 'thread not found' });
+    else assert.deepEqual(await response.json(), { decision: { action: 'deliver' }, signalId: 'packed-signal' });
+    assert.equal(sends, mode === 'strict-refusal' ? 0 : 1);
+    assert.equal(validations, mode === 'default' ? 0 : 1);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].outcome, refused ? 'rejected' : 'accepted');
+  }
+} finally {
+  console.error = savedSignalLogger;
+}
 assert.equal(typeof host.isPermissionIdentifier, 'function');
 assert.equal(host.isPermissionIdentifier('reports.read'), true);
 assert.equal(host.isPermissionIdentifier('Reports.read'), false);
