@@ -441,16 +441,7 @@ export function parseSuspensionDeadlineRecord(
   };
 }
 
-/**
- * A spent entry, kept for the suspension it was armed against: the ledger at
- * the budget, and every field that only means something while it is still
- * being retried — the backoff floor, the unreadable-state clock — dropped,
- * because a tombstone is never selected, never armed and never read again.
- * Lives beside its two recognizers, `abandoned()` and `storedEntry`'s ledger
- * rule, so the shape they accept and the shape written here cannot drift.
- * Exported from this module for the run object that writes it; deliberately
- * NOT from the package barrel, which exposes no part of the stored record.
- */
+/** Retains the suspension fence so reconciliation cannot give it a fresh retry budget. */
 export function tombstoned(
   entry: SuspensionDeadlineEntry,
 ): SuspensionDeadlineEntry {

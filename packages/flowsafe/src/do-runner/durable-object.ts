@@ -463,14 +463,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     return value;
   }
 
-  /**
-   * The reserved timeout envelope is minted by the alarm and by nothing else.
-   * A caller allowed to resume could otherwise drive a step's timeout branch
-   * while provenance still names them as the requester, which would make the
-   * one contract this feature sells — a timeout resume is distinguishable from
-   * a real signal — untrue. The KEY is refused, not just a well-formed
-   * envelope, so a step that reads the key directly cannot be fooled either.
-   */
+  /** Caller-supplied timeout data would select the timeout branch with caller provenance. */
   #resumeData(value: unknown): unknown {
     if (
       value !== null &&
