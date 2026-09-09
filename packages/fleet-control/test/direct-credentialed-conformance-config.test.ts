@@ -8,6 +8,7 @@ import {
   deriveDirectConformanceNames,
   validateDirectConformanceConfig,
 } from '../scripts/direct-credentialed-conformance-config.mjs';
+import { reserveApplicationR2Resources } from '../src/application-bindings.js';
 import { isDeploymentScriptName } from '../src/deployment-context.js';
 import { validateDeploymentSpec } from '../src/validation.js';
 import { buildPlainWorkerSpec } from './fixtures/plain-worker-harnesses.js';
@@ -106,7 +107,7 @@ describe('direct conformance configuration', () => {
       expect(Object.isFrozen(values)).toBe(true);
       expect(isDeploymentScriptName(values.scriptName)).toBe(true);
       expect(values.routeHostname).toBe(
-        `${config.resourcePrefix}-${role}.${config.ownedHostname}`,
+        `${config.resourcePrefix}-tenant-${role}.${config.ownedHostname}`,
       );
       expect(() =>
         validateDeploymentSpec(
@@ -117,7 +118,29 @@ describe('direct conformance configuration', () => {
         ),
       ).not.toThrow();
       scripts.add(values.scriptName);
+      const resources = reserveApplicationR2Resources(
+        buildPlainWorkerSpec({
+          ...values,
+          environment: config.environment,
+          application: {
+            vars: [],
+            secrets: [],
+            r2Buckets: [{ name: 'PROBE_BUCKET' }],
+          },
+        }),
+      );
+      expect(
+        resources[0]?.bucketName.startsWith(`${config.resourcePrefix}-tenant-`),
+      ).toBe(true);
+      expect(resources[0]?.bucketName.length).toBeLessThanOrEqual(63);
     }
+    for (const name of [
+      names.referenceWorker,
+      names.fleetDatabase,
+      names.quotaDatabase,
+      names.exportBucket,
+    ])
+      expect(name.startsWith(`${config.resourcePrefix}-tenant-`)).toBe(false);
     expect(scripts.size).toBe(3);
     expect(Object.isFrozen(names.roles)).toBe(true);
   });

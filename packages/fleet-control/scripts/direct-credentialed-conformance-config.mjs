@@ -177,7 +177,7 @@ export function deriveDirectConformanceNames(config) {
     const tenantTag = `${prefix}${suffix}`;
     if (!DEPLOYMENT_TAG_PATTERN.test(tenantTag))
       throw invalid('derived tenant tag');
-    const name = `${prefix}-${role}`;
+    const name = `${prefix}-tenant-${role}`;
     roles[role] = Object.freeze({
       tenantTag,
       scriptName: name,
