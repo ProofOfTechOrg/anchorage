@@ -48,6 +48,15 @@ export const MIN_SUSPENSION_DEADLINE_MS = 1_000;
 /** Longest armable deadline (365 days), so week-scale waits still fit. */
 export const MAX_SUSPENSION_DEADLINE_MS = 31_536_000_000;
 
+/** Checks the duration accepted by suspension deadline arming. */
+export function isArmableSuspensionDeadlineMs(value: unknown): value is number {
+  return (
+    Number.isSafeInteger(value) &&
+    (value as number) >= MIN_SUSPENSION_DEADLINE_MS &&
+    (value as number) <= MAX_SUSPENSION_DEADLINE_MS
+  );
+}
+
 /** Per-run entry cap; a run cannot grow its object's storage without bound. */
 export const MAX_SUSPENSION_DEADLINES_PER_RUN = 32;
 
@@ -338,10 +347,7 @@ export function suspensionDeadlinesOf(summary: RunSummary): {
       });
       continue;
     }
-    if (
-      (deadlineMs as number) < MIN_SUSPENSION_DEADLINE_MS ||
-      (deadlineMs as number) > MAX_SUSPENSION_DEADLINE_MS
-    ) {
+    if (!isArmableSuspensionDeadlineMs(deadlineMs)) {
       rejected.push({
         step,
         reason: `${SUSPENSION_DEADLINE_PAYLOAD_KEY} must be between ${MIN_SUSPENSION_DEADLINE_MS} and ${MAX_SUSPENSION_DEADLINE_MS} ms`,
@@ -511,7 +517,7 @@ export function dueSuspensionDeadline(
 
 /** The resume data a timeout resume delivers to the expired step. */
 export function suspensionTimeoutResumeData(
-  entry: SuspensionDeadlineEntry,
+  entry: Pick<SuspensionDeadlineEntry, 'step' | 'deadlineAt'>,
   expiredAt: number,
 ): SuspensionTimeoutResumeData {
   return {

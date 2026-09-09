@@ -9,6 +9,8 @@
     "src/artifacts/index.ts",
     "src/audit-export/index.ts",
     "src/do-runner/index.ts",
+    "src/do-runner/constants.ts",
+    "src/do-runner/testing.ts",
     "src/deployment-identity-protocol.ts",
     "src/goals/index.ts",
     "src/host-kit/index.ts",

@@ -306,7 +306,7 @@ A step arms one by adding the reserved key to the payload it hands Mastra's `sus
 import {
   isSuspensionTimeoutResumeData,
   SUSPENSION_DEADLINE_PAYLOAD_KEY,
-} from '@proofoftech/flowsafe/do-runner';
+} from '@proofoftech/flowsafe/do-runner/constants';
 import { z } from 'zod';
 
 const gate = createStep({
@@ -348,7 +348,34 @@ The expiring resume delivers one flowsafe-defined envelope as its resume data:
 }
 ```
 
-Branch on `isSuspensionTimeoutResumeData()` rather than the literal key. A step that declares a `resumeSchema` must accept this shape as well as its signal shape: Mastra validates resume data before the engine runs, so a schema that rejects the envelope makes every timeout resume throw, and the deadline is dropped once the retry budget is spent. The envelope is the runner's to mint — a resume request that carries the reserved key is refused with a 400, so a caller cannot drive a step's timeout branch while provenance still names them as the requester.
+Branch on `isSuspensionTimeoutResumeData()` rather than the literal key. A step that declares a `resumeSchema` must accept this shape as well as its signal shape: Mastra validates resume data before the engine runs, so a schema that rejects the envelope makes every timeout resume throw, and the deadline is dropped once the retry budget is spent. The detector checks structure, not provenance. Public resume requests containing the reserved key return HTTP 400; the alarm supplies the system provenance for an actual timeout resume.
+
+### Inspect and test suspension deadlines
+
+The `@proofoftech/flowsafe/do-runner/constants` entry exports `isArmableSuspensionDeadlineMs` with the deadline values and timeout detector. It uses the same duration predicate as deadline arming. The constants and testing entries load without the runner, Core, D1 adapter or jose runtime modules.
+
+Use `suspensionDeadlinesOf(summary)` from `@proofoftech/flowsafe/do-runner` to inspect a `RunSummary`. It returns `{ entries, rejected }` without changing the summary or scheduling an alarm. The entries use suspension time and resume ordinal from that summary; obtaining an entry does not authorize a resume. The runner still checks authoritative state before acting.
+
+A duration accepted by the predicate is insufficient to arm a deadline by itself. Derivation also requires a suspended run, an unambiguous top-level step and a usable suspension fence. Nested or ambiguous paths are refused as described above. Missing requests produce no entry, while invalid requests appear in `rejected` with their step and reason. `MAX_SUSPENSION_DEADLINES_PER_RUN` bounds the result. Use `SuspensionDeadlineEntry` and `RejectedSuspensionDeadline` from the main runner entry for these projections; the record parser and retry operations remain internal.
+
+Build a timeout fixture with the same function the alarm uses:
+
+```typescript
+import { isSuspensionTimeoutResumeData } from
+  '@proofoftech/flowsafe/do-runner/constants';
+import { suspensionTimeoutResumeData } from
+  '@proofoftech/flowsafe/do-runner/testing';
+
+const resumeData = suspensionTimeoutResumeData(
+  { step: 'gate', deadlineAt: 1_751_883_300_000 },
+  1_751_883_300_123,
+);
+const isTimeout = isSuspensionTimeoutResumeData(resumeData);
+```
+
+The minter accepts the step, deadline and expiry time without validating or authorizing them. The testing entry also exports `SuspensionTimeoutEnvelope` and `SuspensionTimeoutResumeData` types. A fixture does not schedule a wake, establish system identity or grant approval.
+
+### Suspension wake behavior
 
 Behavior worth knowing before relying on it:
 
