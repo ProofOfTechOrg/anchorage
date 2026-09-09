@@ -284,7 +284,7 @@ await invokeConnector(connector, input, {
 });
 ```
 
-Do not store this value in `RequestContext` or build a partial Mastra agent context. Concurrent calls can share a `RequestContext` while carrying different tool-call identities. A validation failure throws `ConnectorValidationError` with only the connector ID and the safe phase, `input` or `output`. It never exposes Mastra's message, schema issue text, invalid value, or cause.
+Do not store this value in `RequestContext` or build a partial Mastra agent context. Concurrent calls can share a `RequestContext` while carrying different tool-call identities. A validation failure throws `ConnectorValidationError` with a stable kind/code, connector ID and phase, `input` or `output`. It never exposes Mastra's message, schema issue text, invalid value, or cause.
 
 To request simulation:
 
@@ -476,9 +476,13 @@ outside this seam must also be denied.
 
 ## Handle errors and audit safely
 
-Policy denials throw `ConnectorPolicyError` with `connector`, `policy`, and
-`reason`. Standalone `egressFetch()` throws `EgressDeniedError` by default or
-uses the caller's `denied()` mapper.
+Use `ConnectorPolicyError.code` for machine handling and keep `policy`/`reason` for diagnostics. The error also exposes a stable kind, canonical `policyKind`, retryability and code-specific safe details. Custom policy names and the three-string constructor remain supported. The legacy constructor uses `EVALUATOR_DENIED`; it does not infer a code from the name.
+
+Read the [decision-code catalogue](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/connector-interface.md#connector-decision-codes) for coverage and retry semantics. `CONNECTOR_DECISIONS`, `isConnectorDecisionCode` and `connectorDecisionRetryable` are exported from the SDK and root entries. SDK audit records carry matching `decisionCode`, `policyKind` and `retryable` fields.
+
+Before execution, rate-limit and idempotency store failures throw `ConnectorStoreError` with `STORE_UNAVAILABLE`, the actual operation, and the original exception on native `cause`. Post-effect commit and best-effort release failures remain audited and suppressed; their codes are non-retryable. Evaluator failures use `ConnectorEvaluatorError`. The Agent CLI adapter preserves these classifications while omitting raw causes.
+
+Standalone `egressFetch()` emits coded `EgressDeniedError` and redirect `EgressGuardError` values. A custom `denied()` mapper receives the code and owns the error it returns.
 
 The connector wrapper rethrows errors from your `execute()` implementation so
 your caller can handle the original failure. It does not copy arbitrary thrown

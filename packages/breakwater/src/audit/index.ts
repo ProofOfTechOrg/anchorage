@@ -10,6 +10,10 @@
 
 import type { RequestContext } from '@mastra/core/request-context';
 
+import type {
+  ConnectorDecisionCode,
+  ConnectorPolicyName,
+} from '../connector-decision.js';
 import type { Actor } from '../rbac/index.js';
 
 /** Request-context key for trusted agent and run correlation fields. */
@@ -125,6 +129,9 @@ export interface AuditEvent {
   resource: string;
   /** 'error' = the gate itself failed (evaluator/getActor threw), not a denial. */
   decision: 'allowed' | 'denied' | 'error';
+  decisionCode?: ConnectorDecisionCode;
+  retryable?: boolean;
+  policyKind?: ConnectorPolicyName;
   /** Human-readable decision or failure reason. */
   reason?: string;
   /** Additional structured fields supplied by the emitting boundary. */
@@ -168,19 +175,21 @@ export class AuditLogger {
       this.#buffer.splice(0, this.#buffer.length - this.#maxBuffered);
     }
     if (this.#sink) {
-      // Availability over export reliability: a failing sink must not abort
-      // the agent run. The buffer keeps the event; the error goes to
-      // onSinkError.
       try {
-        const result = this.#sink(stamped);
-        if (result instanceof Promise) {
-          result.catch((error: unknown) => this.#onSinkError?.(error, stamped));
-        }
+        Promise.resolve(this.#sink(stamped)).catch((error: unknown) => {
+          this.#reportSinkError(error, stamped);
+        });
       } catch (error) {
-        this.#onSinkError?.(error, stamped);
+        this.#reportSinkError(error, stamped);
       }
     }
     return stamped;
+  }
+
+  #reportSinkError(error: unknown, event: AuditEvent): void {
+    try {
+      Promise.resolve(this.#onSinkError?.(error, event)).catch(() => {});
+    } catch {}
   }
 
   /** Return a snapshot of the currently buffered events. */

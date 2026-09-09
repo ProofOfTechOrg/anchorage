@@ -252,7 +252,7 @@ const account = await invokeConnector(accountLookup, {
 });
 ```
 
-Pass a trusted `RequestContext` when the connector uses grants, identity, dry-run, idempotency, or isolation keys. `invokeConnector()` preserves Mastra schema validation and every Breakwater gate. It rejects plain tools and connectors whose ID, execution function, or schema surface changed after construction. Validation failures throw a redacted `ConnectorValidationError` with the connector ID and `input` or `output` phase.
+Pass a trusted `RequestContext` when the connector uses grants, identity, dry-run, idempotency, or isolation keys. `invokeConnector()` preserves Mastra schema validation and every Breakwater gate. It rejects plain tools and connectors whose ID, execution function, or schema surface changed after construction. Validation failures throw a redacted `ConnectorValidationError` with a stable kind/code, connector ID and `input` or `output` phase.
 
 The permission manifest is enforced:
 
@@ -521,17 +521,20 @@ for compatibility.
 
 ### Connector SDK exports
 
+Use the [connector decision-code guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/connector-interface.md#connector-decision-codes) to classify failures and audit events. The exported `ConnectorDecisionCode` and `ConnectorPolicyName` types support machine handling while diagnostic policy names remain open strings. Retryability preserves the same operation identity; it does not add automatic retries.
+
 | Runtime exports | Purpose |
 | --- | --- |
 | `createConnector`, `connectorManifest` | Build an enforced Mastra connector and inspect its immutable manifest |
 | `invokeConnector` | Invoke an unmodified connector from trusted host or workflow code without fabricating a Mastra tool context |
 | `singleTenantConnectorPolicies` | Build the validated connector-policy baseline for one physically isolated deployment |
-| `ConnectorPolicyError`, `ConnectorValidationError` | Structured policy denial and redacted direct-invocation validation failure |
+| `ConnectorPolicyError`, `ConnectorStoreError`, `ConnectorEvaluatorError`, `ConnectorValidationError`, `ConnectorInvocationError` | Stable classification for authored connector failures |
+| `CONNECTOR_DECISIONS`, `isConnectorDecisionCode`, `connectorDecisionRetryable` | Decision catalogue and retryability without parsing diagnostic prose |
 | `CONNECTOR_GRANTS_CONTEXT_KEY`, `CONNECTOR_EXECUTION_CONTEXT_KEY`, `DRY_RUN_CONTEXT_KEY`, `IDEMPOTENCY_KEY_CONTEXT_KEY` | Stable connector request-context keys |
 | `InMemoryIdempotencyStore`, `D1IdempotencyStore` | Development and durable replay stores |
 | `inspectLegacyConnectorIdempotency`, `migrateLegacyConnectorIdempotency` | Inventory and atomically migrate one externally proven ambiguous legacy D1 row without exposing storage keys |
 | `InMemoryRateLimitStore`, `D1RateLimitStore` | Development and durable fixed-window stores |
-| `egressFetch`, `EgressDeniedError` | Standalone fetch guard and its default denial |
+| `egressFetch`, `EgressDeniedError`, `EgressGuardError` | Standalone fetch guard and coded request/redirect refusals |
 
 Type exports: `Connector`, `ConnectorInvocationOptions`, `PermissionManifest`, `ConnectorConfig`, `ConnectorPolicies`,
 `SingleTenantConnectorPolicies`, `SingleTenantConnectorPoliciesOptions`,
