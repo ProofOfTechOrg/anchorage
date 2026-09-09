@@ -73,6 +73,24 @@ afterEach(async () => {
 });
 
 describe('direct artifact preflight', () => {
+  it('accepts literal-template compatibility imports through the ordinary dependency check', async () => {
+    const f = await fixture(
+      `${REFERENCE}\nimport(\`node:buffer\`);`,
+      `${TENANT}\nimport(\`node:crypto\`);`,
+    );
+    await expect(prepare(f.configPath)).resolves.toBeDefined();
+  });
+
+  it.each([
+    './missing.js',
+    'undeclared-package',
+  ])('rejects a literal template tenant dependency %s', async (dependency) => {
+    const f = await fixture(REFERENCE, `${TENANT}\nimport(\`${dependency}\`);`);
+    await expect(prepare(f.configPath)).rejects.toThrow(
+      /tenant artifact module inspection/,
+    );
+  });
+
   it.each([
     'reference',
     'tenant',
@@ -137,14 +155,17 @@ describe('direct artifact preflight', () => {
       'worker.js',
       DIRECT_MANIFEST_MODULE,
     ]);
-    const moduleTable = result.referenceModules.map(
-      ({ name, source, byteLength, sha256 }) => {
-        expect(byteLength).toBe(Buffer.byteLength(source));
-        expect(sha256).toBe(digest(source));
-        expect(Object.isFrozen(result.referenceModules)).toBe(true);
-        return { name, byteLength, sha256 };
-      },
-    );
+    const moduleTable = result.referenceModules.map((module) => {
+      const { name, contentType, byteLength, sha256 } = module;
+      const bytes =
+        'source' in module
+          ? Buffer.from(module.source)
+          : Buffer.from(module.base64, 'base64');
+      expect(byteLength).toBe(bytes.byteLength);
+      expect(sha256).toBe(digest(bytes));
+      expect(Object.isFrozen(result.referenceModules)).toBe(true);
+      return { name, contentType, byteLength, sha256 };
+    });
     expect(result.referenceModuleSetSha256).toBe(
       digest(JSON.stringify(moduleTable)),
     );
@@ -167,6 +188,114 @@ describe('direct artifact preflight', () => {
     await writeFile(f.tenantPath, 'changed');
     expect(result.referenceModules[0].source).toBe(REFERENCE);
     expect(result.manifest.tenantModule.source).toBe(tenant);
+  });
+
+  it('retains checked auxiliary Wasm bytes for both uploads and their manifest identities', async () => {
+    const binary = Buffer.from([0, 97, 115, 109, 1, 0, 0, 0]);
+    const dependency = "import binary from './fixture.wasm';\n";
+    const f = await fixture(dependency + REFERENCE, dependency + TENANT);
+    await writeFile(join(f.directory, 'fixture.wasm'), binary);
+    for (const role of ['referenceWorker', 'deployment'])
+      f.config[role].artifact.auxiliaryWasm = [
+        {
+          file: './fixture.wasm',
+          name: 'fixture.wasm',
+          sha256: digest(binary),
+        },
+      ];
+    await f.save();
+    const result = await prepare(f.configPath);
+    const expected = {
+      name: 'fixture.wasm',
+      base64: binary.toString('base64'),
+      contentType: 'application/wasm',
+      byteLength: 8,
+      sha256: digest(binary),
+    };
+    expect(result.referenceModules[2]).toEqual(expected);
+    expect(result.manifest.tenantWasm).toEqual([expected]);
+    expect(Object.isFrozen(result.manifest.tenantWasm)).toBe(true);
+    expect(Object.isFrozen(result.referenceModules[2])).toBe(true);
+    const table = result.referenceModules.map(
+      ({ name, contentType, byteLength, sha256 }) => ({
+        name,
+        contentType,
+        byteLength,
+        sha256,
+      }),
+    );
+    expect(result.referenceModuleSetSha256).toBe(digest(JSON.stringify(table)));
+    expect(result.referenceUploadBytes).toBe(
+      table.reduce((sum, module) => sum + module.byteLength, 0),
+    );
+    await writeFile(join(f.directory, 'fixture.wasm'), 'changed');
+    expect(
+      Buffer.from(result.manifest.tenantWasm[0]?.base64 ?? '', 'base64'),
+    ).toEqual(binary);
+  });
+
+  it.each([
+    'missing',
+    'digest',
+    'format',
+    'aggregate-size',
+  ] as const)('rejects %s auxiliary Wasm', async (kind) => {
+    const f = await fixture();
+    const binary = Buffer.from(
+      kind === 'format' ? 'not a module' : [0, 97, 115, 109, 1, 0, 0, 0],
+    );
+    const path = join(f.directory, 'fixture.wasm');
+    if (kind !== 'missing') await writeFile(path, binary);
+    if (kind === 'aggregate-size') {
+      const handle = await open(path, 'w');
+      try {
+        await handle.truncate(DIRECT_MAX_UPLOAD_BYTES);
+      } finally {
+        await handle.close();
+      }
+    }
+    f.config.deployment.artifact.auxiliaryWasm = [
+      {
+        file: './fixture.wasm',
+        name: 'fixture.wasm',
+        sha256: kind === 'digest' ? '0'.repeat(64) : digest(binary),
+      },
+    ];
+    await f.save();
+    await expect(prepare(f.configPath)).rejects.toThrow(/tenant artifact Wasm/);
+  });
+
+  it('rejects an unrecorded Wasm dependency', async () => {
+    const f = await fixture(
+      REFERENCE,
+      `import binary from './fixture.wasm';\n${TENANT}`,
+    );
+    await expect(prepare(f.configPath)).rejects.toThrow(
+      /tenant artifact module inspection/,
+    );
+  });
+
+  it('keeps reference and tenant Node dependency contracts separate', async () => {
+    const tenant = await fixture(
+      REFERENCE,
+      `import 'node:fs'; import 'stream/web';\n${TENANT}`,
+    );
+    await expect(prepare(tenant.configPath)).resolves.toBeDefined();
+    const reference = await fixture(`import 'node:fs';\n${REFERENCE}`, TENANT);
+    await expect(prepare(reference.configPath)).rejects.toThrow(
+      /reference artifact module inspection/,
+    );
+  });
+
+  it('leaves optional computed tenant imports to runtime acceptance while retaining the reference contract', async () => {
+    const optional =
+      "async function optionalDependency(){try{const name='optional-package';return await import(name)}catch{return null}}";
+    const tenant = await fixture(REFERENCE, `${TENANT}\n${optional}`);
+    await expect(prepare(tenant.configPath)).resolves.toBeDefined();
+    const reference = await fixture(`${REFERENCE}\n${optional}`, TENANT);
+    await expect(prepare(reference.configPath)).rejects.toThrow(
+      /reference artifact module inspection/,
+    );
   });
 
   it('accepts symlinked regular input files and config-relative paths with spaces', async () => {

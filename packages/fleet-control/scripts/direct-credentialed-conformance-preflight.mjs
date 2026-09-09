@@ -10,14 +10,28 @@ import {
   deriveDirectConformanceNames,
   validateDirectConformanceConfig,
 } from './direct-credentialed-conformance-config.mjs';
+import { DIRECT_MAX_UPLOAD_BYTES } from './direct-credentialed-conformance-limits.mjs';
+
+export { DIRECT_MAX_UPLOAD_BYTES } from './direct-credentialed-conformance-limits.mjs';
 
 export const DIRECT_MANIFEST_MODULE = 'direct-run-manifest.js';
-export const DIRECT_MAX_UPLOAD_BYTES = 64 * 1024 * 1024;
 
-const EXTERNAL_MODULES = new Set([
-  'node:crypto',
-  'node:async_hooks',
-  'cloudflare:workers',
+const REFERENCE_CORE_MODULES = new Set(['crypto', 'async_hooks', 'buffer']);
+const TENANT_CORE_MODULES = new Set([
+  'stream',
+  'child_process',
+  'fs',
+  'path',
+  'crypto',
+  'os',
+  'fs/promises',
+  'module',
+  'stream/web',
+  'events',
+  'async_hooks',
+  'url',
+  'path/posix',
+  'string_decoder',
 ]);
 
 function invalid(field) {
@@ -68,7 +82,7 @@ function utf8(bytes, field) {
   }
 }
 
-function inspectModule(text, reference, field) {
+function inspectModule(text, reference, field, wasm) {
   const syntax = spawnSync(
     process.execPath,
     ['--input-type=module', '--check'],
@@ -81,13 +95,13 @@ function inspectModule(text, reference, field) {
   );
   if (syntax.status !== 0) throw invalid(`${field} JavaScript`);
   try {
-    inspectModuleStructure(text, reference, field);
+    inspectModuleStructure(text, reference, field, wasm);
   } catch {
     throw invalid(`${field} module inspection`);
   }
 }
 
-function inspectModuleStructure(text, reference, field) {
+function inspectModuleStructure(text, reference, field, wasm) {
   const fileName = '/direct-artifact.js';
   const source = ts.createSourceFile(
     fileName,
@@ -130,8 +144,10 @@ function inspectModuleStructure(text, reference, field) {
     throw invalid(`${field} exports`);
 
   let manifests = 0;
+  const wasmPaths = new Set(wasm.map(({ name }) => `./${name}`));
+  const coreModules = reference ? REFERENCE_CORE_MODULES : TENANT_CORE_MODULES;
   const inspectImport = (specifier, declaration) => {
-    if (!specifier || !ts.isStringLiteral(specifier))
+    if (!specifier || !ts.isStringLiteralLike(specifier))
       throw invalid(`${field} module dependency`);
     if (reference && specifier.text === `./${DIRECT_MANIFEST_MODULE}`) {
       if (
@@ -143,7 +159,19 @@ function inspectModuleStructure(text, reference, field) {
       )
         throw invalid(`${field} manifest import`);
       manifests += 1;
-    } else if (!EXTERNAL_MODULES.has(specifier.text)) {
+    } else if (wasmPaths.has(specifier.text)) {
+      if (
+        !declaration ||
+        !ts.isImportDeclaration(declaration) ||
+        !declaration.importClause?.name ||
+        declaration.importClause.namedBindings ||
+        declaration.attributes
+      )
+        throw invalid(`${field} Wasm import`);
+    } else if (
+      specifier.text !== 'cloudflare:workers' &&
+      !coreModules.has(specifier.text.replace(/^node:/, ''))
+    ) {
       throw invalid(`${field} module dependency`);
     }
   };
@@ -159,7 +187,8 @@ function inspectModuleStructure(text, reference, field) {
     ) {
       if (node.arguments.length !== 1)
         throw invalid(`${field} module dependency`);
-      inspectImport(node.arguments[0]);
+      if (ts.isStringLiteralLike(node.arguments[0]) || reference)
+        inspectImport(node.arguments[0]);
     }
     ts.forEachChild(node, (child) => {
       pending.push(child);
@@ -172,6 +201,7 @@ function moduleSnapshot(name, source) {
   return Object.freeze({
     name,
     source,
+    contentType: 'application/javascript+module',
     byteLength: Buffer.byteLength(source),
     sha256: sha256(source),
   });
@@ -185,8 +215,33 @@ async function readArtifact(configDirectory, intent, reference, field) {
   );
   if (sha256(bytes) !== intent.sha256) throw invalid(`${field} digest`);
   const source = utf8(bytes, field);
-  inspectModule(source, reference, field);
-  return moduleSnapshot(intent.mainModule, source);
+  const wasm = [];
+  let byteLength = bytes.byteLength;
+  for (const descriptor of intent.auxiliaryWasm ?? []) {
+    const binary = await readBoundedFile(
+      resolve(configDirectory, descriptor.file),
+      DIRECT_MAX_UPLOAD_BYTES - byteLength,
+      `${field} Wasm`,
+    );
+    if (sha256(binary) !== descriptor.sha256)
+      throw invalid(`${field} Wasm digest`);
+    if (!WebAssembly.validate(binary)) throw invalid(`${field} Wasm format`);
+    byteLength += binary.byteLength;
+    wasm.push(
+      Object.freeze({
+        name: descriptor.name,
+        base64: binary.toString('base64'),
+        contentType: 'application/wasm',
+        byteLength: binary.byteLength,
+        sha256: descriptor.sha256,
+      }),
+    );
+  }
+  inspectModule(source, reference, field, wasm);
+  return Object.freeze({
+    main: moduleSnapshot(intent.mainModule, source),
+    wasm: Object.freeze(wasm),
+  });
 }
 
 function runtimeFields(runtime) {
@@ -221,7 +276,7 @@ export async function preflightDirectConformance(input) {
     true,
     'reference artifact',
   );
-  const tenantModule = await readArtifact(
+  const tenant = await readArtifact(
     configDirectory,
     config.deployment.artifact,
     false,
@@ -242,7 +297,8 @@ export async function preflightDirectConformance(input) {
       maxInvocations: config.referenceWorker.maxInvocations,
     }),
     deploymentRuntime: Object.freeze(runtimeFields(config.deployment)),
-    tenantModule,
+    tenantModule: tenant.main,
+    tenantWasm: tenant.wasm,
     fixtureVersion: config.deployment.spec.fixtureVersion,
     interruption: config.interruption,
   });
@@ -250,15 +306,25 @@ export async function preflightDirectConformance(input) {
     DIRECT_MANIFEST_MODULE,
     `export default ${JSON.stringify(manifest)};\n`,
   );
-  const referenceModules = Object.freeze([reference, manifestModule]);
-  const referenceUploadBytes = reference.byteLength + manifestModule.byteLength;
+  const referenceModules = Object.freeze([
+    reference.main,
+    manifestModule,
+    ...reference.wasm,
+  ]);
+  const referenceUploadBytes = referenceModules.reduce(
+    (sum, module) => sum + module.byteLength,
+    0,
+  );
   if (referenceUploadBytes > DIRECT_MAX_UPLOAD_BYTES)
     throw invalid('reference upload size');
-  const moduleTable = referenceModules.map(({ name, byteLength, sha256 }) => ({
-    name,
-    byteLength,
-    sha256,
-  }));
+  const moduleTable = referenceModules.map(
+    ({ name, contentType, byteLength, sha256 }) => ({
+      name,
+      contentType,
+      byteLength,
+      sha256,
+    }),
+  );
   return Object.freeze({
     config,
     names,

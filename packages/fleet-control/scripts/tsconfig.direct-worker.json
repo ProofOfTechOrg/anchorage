@@ -1,0 +1,10 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["@cloudflare/workers-types", "node"],
+    "customConditions": ["workerd", "worker", "browser"]
+  },
+  "files": ["direct-credentialed-tenant.ts", "direct-credentialed-spec.ts"],
+  "include": []
+}

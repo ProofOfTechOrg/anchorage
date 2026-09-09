@@ -12,6 +12,15 @@ export const DIRECT_MAX_UPLOAD_BYTES: number;
 export interface DirectModuleSnapshot {
   readonly name: string;
   readonly source: string;
+  readonly contentType: 'application/javascript+module';
+  readonly byteLength: number;
+  readonly sha256: string;
+}
+
+export interface DirectWasmSnapshot {
+  readonly name: string;
+  readonly base64: string;
+  readonly contentType: 'application/wasm';
   readonly byteLength: number;
   readonly sha256: string;
 }
@@ -28,6 +37,7 @@ export interface DirectRunManifest {
   >;
   readonly deploymentRuntime: Omit<DirectRuntimeIntent, 'artifact'>;
   readonly tenantModule: DirectModuleSnapshot;
+  readonly tenantWasm: readonly DirectWasmSnapshot[];
   readonly fixtureVersion: 1;
   readonly interruption: 'after-migration-admission';
 }
@@ -40,6 +50,7 @@ export interface PreparedDirectConformance {
   readonly referenceModules: readonly [
     DirectModuleSnapshot,
     DirectModuleSnapshot,
+    ...DirectWasmSnapshot[],
   ];
   readonly referenceUploadBytes: number;
   readonly referenceModuleSetSha256: string;

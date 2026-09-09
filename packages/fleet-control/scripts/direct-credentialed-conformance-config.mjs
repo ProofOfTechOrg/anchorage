@@ -70,7 +70,14 @@ function hostname(value, field) {
 }
 
 function artifact(value, field) {
-  const input = object(value, ['bundle', 'mainModule', 'sha256'], field);
+  const keys = ['bundle', 'mainModule', 'sha256'];
+  if (
+    value &&
+    typeof value === 'object' &&
+    Object.hasOwn(value, 'auxiliaryWasm')
+  )
+    keys.push('auxiliaryWasm');
+  const input = object(value, keys, field);
   const bundle = string(input.bundle, `${field}.bundle`);
   const mainModule = string(input.mainModule, `${field}.mainModule`);
   if (
@@ -81,7 +88,43 @@ function artifact(value, field) {
     throw invalid(`${field}.mainModule`);
   if (typeof input.sha256 !== 'string' || !DIGEST.test(input.sha256))
     throw invalid(`${field}.sha256`);
-  return Object.freeze({ bundle, mainModule, sha256: input.sha256 });
+  let auxiliaryWasm;
+  if (Object.hasOwn(input, 'auxiliaryWasm')) {
+    if (!Array.isArray(input.auxiliaryWasm))
+      throw invalid(`${field}.auxiliaryWasm`);
+    const names = new Set([mainModule]);
+    auxiliaryWasm = Object.freeze(
+      input.auxiliaryWasm.map((value) => {
+        const descriptor = object(
+          value,
+          ['file', 'name', 'sha256'],
+          `${field}.auxiliaryWasm`,
+        );
+        const file = string(descriptor.file, `${field}.auxiliaryWasm.file`);
+        const name = string(descriptor.name, `${field}.auxiliaryWasm.name`);
+        if (
+          name.length > 255 ||
+          !isPortablePathSegment(name) ||
+          !name.endsWith('.wasm') ||
+          names.has(name)
+        )
+          throw invalid(`${field}.auxiliaryWasm.name`);
+        if (
+          typeof descriptor.sha256 !== 'string' ||
+          !DIGEST.test(descriptor.sha256)
+        )
+          throw invalid(`${field}.auxiliaryWasm.sha256`);
+        names.add(name);
+        return Object.freeze({ file, name, sha256: descriptor.sha256 });
+      }),
+    );
+  }
+  return Object.freeze({
+    bundle,
+    mainModule,
+    sha256: input.sha256,
+    ...(auxiliaryWasm === undefined ? {} : { auxiliaryWasm }),
+  });
 }
 
 function runtime(input, field, today) {

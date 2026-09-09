@@ -2,10 +2,17 @@
 
 export const DIRECT_CONFORMANCE_CONTRACT_VERSION: 1;
 
+export interface DirectAuxiliaryWasmIntent {
+  readonly file: string;
+  readonly name: string;
+  readonly sha256: string;
+}
+
 export interface DirectArtifactIntent {
   readonly bundle: string;
   readonly mainModule: string;
   readonly sha256: string;
+  readonly auxiliaryWasm?: readonly DirectAuxiliaryWasmIntent[];
 }
 
 export interface DirectRuntimeIntent {

@@ -245,6 +245,7 @@ try {
   deriveStateEgressCredential,
   fleetSettlementKey,
   provisionDeployment,
+  plainWorkerIngressModule,
   validateDeploymentSpec,
   type ActiveRouteAttestation,
   type ActiveRouteExpectation,
@@ -453,6 +454,9 @@ export function auditPageCursor(page: FleetAuditFindingsPage): number | undefine
 }
 
 declare const deploymentSpec: DeploymentSpec;
+const inspectedIngress: Readonly<{ name: string; content: string }> =
+  plainWorkerIngressModule(deploymentSpec);
+void inspectedIngress;
 declare const provisioningBackend: ProvisioningBackend;
 declare const backendSwitchProvider: BackendSwitchProvider;
 declare const fleetRecord: FleetRecord;
@@ -924,11 +928,9 @@ import {
   attestFleetRecordActiveRoute,
   deploymentSpecDigest,
   fleetSettlementKey,
+  plainWorkerIngressModule,
 } from '@proofoftech/fleet-control';
 
-// Every export entry must load. The three Workers entries are default-export
-// module objects that no in-repo consumer imports across the package boundary,
-// so this is the only place a broken exports key surfaces before the registry.
 const [dispatch, outbound, auditConsumer] = await Promise.all([
   import('@proofoftech/fleet-control/workers/dispatch'),
   import('@proofoftech/fleet-control/workers/outbound'),
@@ -941,6 +943,25 @@ assert.equal(typeof outbound.StateEgress, 'function');
 assert.equal(typeof auditConsumer.default.queue, 'function');
 
 assert.equal(typeof deploymentSpecDigest, 'function');
+const inspectionSpec = {
+  tenantTag: 'packed', environment: 'test', scriptName: 'packed-inspection',
+  databaseName: 'packed-inspection', compatibilityDate: '2026-08-06',
+  authoredBy: 'platform', schemaVersion: 1,
+  migrations: [{ version: 1, sql: 'CREATE TABLE example (id TEXT)' }],
+  mainModule: 'worker.js',
+  modules: [{ name: 'worker.js', content: 'export class Maintenance {} export default {fetch(){return new Response()}};' }],
+  durableObjectMigrations: [{ tag: 'v1', newSqliteClasses: ['Maintenance'] }],
+  durableObjectBindings: [{ name: 'MAINTENANCE', className: 'Maintenance' }],
+  routeHostname: 'app.example.test', maintenanceBaseUrl: 'https://control.example.test',
+};
+const inspectedIngress = plainWorkerIngressModule(inspectionSpec);
+assert.equal(typeof inspectedIngress.name, 'string');
+assert.ok(inspectedIngress.content.length > 0);
+assert.notEqual(inspectedIngress.name, inspectionSpec.mainModule);
+assert.throws(
+  () => plainWorkerIngressModule({ ...inspectionSpec, modules: [...inspectionSpec.modules, inspectedIngress] }),
+  /reserve/,
+);
 assert.equal(typeof ProcessLocalCloudflareApiRateCoordinator, 'function');
 assert.ok(new ProvisioningError('probe') instanceof Error);
 assert.equal(typeof ActiveRouteAttestationError, 'function');

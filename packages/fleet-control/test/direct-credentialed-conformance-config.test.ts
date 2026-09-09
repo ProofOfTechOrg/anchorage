@@ -41,6 +41,39 @@ function validate(value: unknown) {
 }
 
 describe('direct conformance configuration', () => {
+  it.each([
+    'referenceWorker',
+    'deployment',
+  ])('validates and freezes optional %s auxiliary Wasm descriptors', (role) => {
+    const descriptor = {
+      file: './my artifacts/fixture.wasm',
+      name: 'fixture.wasm',
+      sha256: 'a'.repeat(64),
+    };
+    const raw = changed([role, 'artifact', 'auxiliaryWasm'], [descriptor]);
+    const result = validate(raw);
+    const modules =
+      result[role as 'referenceWorker' | 'deployment'].artifact.auxiliaryWasm;
+    expect(modules).toEqual([descriptor]);
+    expect(Object.isFrozen(modules)).toBe(true);
+    expect(Object.isFrozen(modules?.[0])).toBe(true);
+    descriptor.file = 'changed';
+    expect(modules?.[0]?.file).toBe('./my artifacts/fixture.wasm');
+    for (const value of [
+      null,
+      {},
+      [{}],
+      [{ ...descriptor, name: '../fixture.wasm' }],
+      [{ ...descriptor, name: 'fixture.js' }],
+      [{ ...descriptor, sha256: 'bad' }],
+      [{ ...descriptor, secret: 'sentinel' }],
+      [descriptor, descriptor],
+    ])
+      expect(() =>
+        validate(changed([role, 'artifact', 'auxiliaryWasm'], value)),
+      ).toThrow(/auxiliaryWasm/);
+  });
+
   it('validates the nonsecret example and keeps copied intent immutable', () => {
     const raw = input();
     const result = validate(raw);
