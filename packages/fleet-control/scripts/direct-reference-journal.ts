@@ -1,0 +1,367 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import { Buffer } from 'node:buffer';
+import { createHash } from 'node:crypto';
+import type { D1Database } from '@cloudflare/workers-types';
+import { D1FleetStateDatabase } from '@proofoftech/fleet-control/cloudflare-control-plane';
+import type { DirectFixtureRole } from './direct-credentialed-spec.js';
+import type {
+  DirectAuditSlot,
+  DirectInventorySlot,
+} from './direct-reference-contract.mjs';
+
+export type DirectOperationSlot =
+  | DirectInventorySlot
+  | DirectAuditSlot
+  | 'migration-next'
+  | `cleanup-${DirectFixtureRole}`
+  | `decommission-${DirectFixtureRole}`;
+export type DirectOperationKind =
+  | 'inventory'
+  | 'audit'
+  | 'migration'
+  | 'cleanup'
+  | 'decommission';
+export type DirectJournalErrorCode =
+  | 'journal-state'
+  | 'run-binding-mismatch'
+  | 'operation-mismatch'
+  | 'missing-start';
+
+export class DirectReferenceJournalError extends Error {
+  readonly code: DirectJournalErrorCode;
+  constructor(code: DirectJournalErrorCode = 'journal-state') {
+    super(code);
+    this.name = 'DirectReferenceJournalError';
+    this.code = code;
+  }
+}
+
+export interface DirectStartCandidate {
+  readonly operationId: string | null;
+  readonly inputJson: string;
+}
+
+export interface DirectStoredOperation extends DirectStartCandidate {
+  readonly slot: DirectOperationSlot;
+  readonly kind: DirectOperationKind;
+  readonly tokenJson: string | null;
+  readonly tokenRevision: number | null;
+}
+
+const MAX_JSON_BYTES = 256 * 1024;
+const schema = [
+  `CREATE TABLE IF NOT EXISTS direct_reference_run (
+    run_key TEXT PRIMARY KEY,
+    binding_json TEXT NOT NULL,
+    binding_sha256 TEXT NOT NULL,
+    interruption_json TEXT,
+    interruption_sha256 TEXT,
+    CHECK ((interruption_json IS NULL) = (interruption_sha256 IS NULL))
+  )`,
+  `CREATE TABLE IF NOT EXISTS direct_reference_operations (
+    run_key TEXT NOT NULL REFERENCES direct_reference_run(run_key),
+    slot TEXT NOT NULL,
+    operation_kind TEXT NOT NULL,
+    operation_id TEXT,
+    start_json TEXT NOT NULL,
+    start_sha256 TEXT NOT NULL,
+    token_json TEXT,
+    token_sha256 TEXT,
+    token_revision INTEGER,
+    PRIMARY KEY (run_key, slot),
+    CHECK ((token_json IS NULL AND token_sha256 IS NULL AND token_revision IS NULL)
+      OR (token_json IS NOT NULL AND token_sha256 IS NOT NULL AND token_revision IS NOT NULL))
+  )`,
+];
+
+function stateError(): never {
+  throw new DirectReferenceJournalError();
+}
+
+function text(value: unknown): string {
+  if (typeof value !== 'string' || !value || value.length > 128) stateError();
+  return value;
+}
+
+function kindFor(slot: string): DirectOperationKind {
+  if (slot === 'inventory-before' || slot === 'inventory-after')
+    return 'inventory';
+  if (slot === 'audit-before' || slot === 'audit-after') return 'audit';
+  if (slot === 'migration-next') return 'migration';
+  for (const kind of ['cleanup', 'decommission'] as const)
+    if (['a', 'b', 'recovery'].some((role) => slot === `${kind}-${role}`))
+      return kind;
+  return stateError();
+}
+
+function jsonObject(value: unknown): {
+  text: string;
+  value: Record<string, unknown>;
+} {
+  if (typeof value !== 'string' || Buffer.byteLength(value) > MAX_JSON_BYTES)
+    stateError();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    stateError();
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
+    stateError();
+  return {
+    text: value,
+    value: parsed as Record<string, unknown>,
+  };
+}
+
+function boundHash(context: readonly unknown[], value: string): string {
+  return createHash('sha256')
+    .update(JSON.stringify([...context, value]))
+    .digest('hex');
+}
+
+function storedJson(
+  value: unknown,
+  hash: unknown,
+  context: readonly unknown[],
+) {
+  const parsed = jsonObject(value);
+  if (boundHash(context, parsed.text) !== hash) stateError();
+  return parsed;
+}
+
+function tokenFields(token: Record<string, unknown>) {
+  const operationId = text(token.operationId);
+  const revision = token.revision;
+  if (
+    typeof revision !== 'number' ||
+    !Number.isSafeInteger(revision) ||
+    revision < 0
+  )
+    stateError();
+  return { operationId, revision };
+}
+
+export class DirectReferenceJournal {
+  readonly #database: D1FleetStateDatabase;
+  readonly #runKey: string;
+  readonly #binding: ReturnType<typeof jsonObject>;
+  readonly #bindingHash: string;
+  #ready?: Promise<void>;
+
+  constructor(database: D1Database, runKey: string, bindingJson: string) {
+    this.#database = new D1FleetStateDatabase(database);
+    this.#runKey = text(runKey);
+    this.#binding = jsonObject(bindingJson);
+    this.#bindingHash = boundHash(
+      ['binding', this.#runKey],
+      this.#binding.text,
+    );
+  }
+
+  async #initialize(): Promise<void> {
+    await this.#database.batch(schema.map((sql) => ({ sql })));
+    await this.#database.execute(
+      'INSERT INTO direct_reference_run (run_key,binding_json,binding_sha256) VALUES (?,?,?) ON CONFLICT DO NOTHING',
+      [this.#runKey, this.#binding.text, this.#bindingHash],
+    );
+    const rows = await this.#database.query(
+      'SELECT * FROM direct_reference_run WHERE run_key=?',
+      [this.#runKey],
+    );
+    const row = rows[0];
+    if (rows.length !== 1 || !row) stateError();
+    storedJson(row.binding_json, row.binding_sha256, ['binding', this.#runKey]);
+    if (
+      row.binding_json !== this.#binding.text ||
+      row.binding_sha256 !== this.#bindingHash
+    )
+      throw new DirectReferenceJournalError('run-binding-mismatch');
+  }
+
+  async #withState<T>(operation: () => Promise<T>): Promise<T> {
+    try {
+      this.#ready ??= this.#initialize().catch((error) => {
+        this.#ready = undefined;
+        throw error;
+      });
+      await this.#ready;
+      return await operation();
+    } catch (error) {
+      if (error instanceof DirectReferenceJournalError) throw error;
+      return stateError();
+    }
+  }
+
+  async #operation(
+    slot: DirectOperationSlot,
+  ): Promise<DirectStoredOperation | undefined> {
+    const kind = kindFor(slot);
+    const rows = await this.#database.query(
+      'SELECT * FROM direct_reference_operations WHERE run_key=? AND slot=?',
+      [this.#runKey, slot],
+    );
+    if (rows.length > 1) stateError();
+    const row = rows[0];
+    if (!row) return undefined;
+    if (row.operation_kind !== kind) stateError();
+    const operationId =
+      row.operation_id === null ? null : text(row.operation_id);
+    const assignedByFleet = kind === 'cleanup' || kind === 'decommission';
+    if (operationId === null && !assignedByFleet) stateError();
+    if (assignedByFleet && operationId !== null && row.token_json === null)
+      stateError();
+    const start = storedJson(row.start_json, row.start_sha256, [
+      'start',
+      this.#runKey,
+      slot,
+      kind,
+      assignedByFleet ? null : operationId,
+    ]);
+    let tokenJson: string | null = null;
+    let tokenRevision: number | null = null;
+    if (row.token_json !== null) {
+      const token = storedJson(row.token_json, row.token_sha256, [
+        'token',
+        this.#runKey,
+        slot,
+      ]);
+      const fields = tokenFields(token.value);
+      if (
+        fields.operationId !== operationId ||
+        fields.revision !== row.token_revision
+      )
+        stateError();
+      tokenJson = token.text;
+      tokenRevision = fields.revision;
+    } else if (row.token_sha256 !== null || row.token_revision !== null)
+      stateError();
+    return Object.freeze({
+      slot,
+      kind,
+      operationId,
+      inputJson: start.text,
+      tokenJson,
+      tokenRevision,
+    });
+  }
+
+  readOperation(
+    slot: DirectOperationSlot,
+  ): Promise<DirectStoredOperation | undefined> {
+    return this.#withState(() => this.#operation(slot));
+  }
+
+  freezeStart(
+    slot: DirectOperationSlot,
+    create: () => Promise<DirectStartCandidate>,
+  ): Promise<DirectStoredOperation> {
+    return this.#withState(async () => {
+      const prior = await this.#operation(slot);
+      if (prior) return prior;
+      const candidate = await create();
+      const kind = kindFor(slot);
+      const operationId =
+        candidate.operationId === null ? null : text(candidate.operationId);
+      const assignedByFleet = kind === 'cleanup' || kind === 'decommission';
+      if ((operationId === null) !== assignedByFleet) stateError();
+      const input = jsonObject(candidate.inputJson);
+      await this.#database.execute(
+        'INSERT INTO direct_reference_operations (run_key,slot,operation_kind,operation_id,start_json,start_sha256) VALUES (?,?,?,?,?,?) ON CONFLICT DO NOTHING',
+        [
+          this.#runKey,
+          slot,
+          kind,
+          operationId,
+          input.text,
+          boundHash(
+            ['start', this.#runKey, slot, kind, operationId],
+            input.text,
+          ),
+        ],
+      );
+      const winner = await this.#operation(slot);
+      if (!winner) stateError();
+      return winner;
+    });
+  }
+
+  rememberToken(slot: DirectOperationSlot, tokenJson: string): Promise<void> {
+    return this.#withState(async () => {
+      const before = await this.#operation(slot);
+      if (!before) throw new DirectReferenceJournalError('missing-start');
+      const token = jsonObject(tokenJson);
+      const { operationId, revision } = tokenFields(token.value);
+      const updated = await this.#database.query(
+        `UPDATE direct_reference_operations
+         SET operation_id=COALESCE(operation_id,?),token_json=?,token_sha256=?,token_revision=?
+         WHERE run_key=? AND slot=? AND (operation_id IS NULL OR operation_id=?)
+           AND (token_revision IS NULL OR token_revision<?) RETURNING slot`,
+        [
+          operationId,
+          token.text,
+          boundHash(['token', this.#runKey, slot], token.text),
+          revision,
+          this.#runKey,
+          slot,
+          operationId,
+          revision,
+        ],
+      );
+      if (updated.length > 1) stateError();
+      const after = await this.#operation(slot);
+      if (!after) stateError();
+      if (after.operationId !== operationId)
+        throw new DirectReferenceJournalError('operation-mismatch');
+      if (after.tokenRevision === null || after.tokenRevision < revision)
+        stateError();
+      if (
+        updated.length === 1 &&
+        after.tokenRevision === revision &&
+        after.tokenJson !== token.text
+      )
+        stateError();
+    });
+  }
+
+  recordInterruption(witnessJson: string): Promise<boolean> {
+    return this.#withState(async () => {
+      const witness = jsonObject(witnessJson);
+      const rows = await this.#database.query(
+        'UPDATE direct_reference_run SET interruption_json=?,interruption_sha256=? WHERE run_key=? AND interruption_json IS NULL RETURNING run_key',
+        [
+          witness.text,
+          boundHash(['interruption', this.#runKey], witness.text),
+          this.#runKey,
+        ],
+      );
+      if (rows.length > 1) stateError();
+      const recorded = await this.#interruption();
+      if (recorded === null || (rows.length === 1 && recorded !== witness.text))
+        stateError();
+      return rows.length === 1;
+    });
+  }
+
+  async #interruption(): Promise<string | null> {
+    const rows = await this.#database.query(
+      'SELECT interruption_json,interruption_sha256 FROM direct_reference_run WHERE run_key=?',
+      [this.#runKey],
+    );
+    const row = rows[0];
+    if (rows.length !== 1 || !row) stateError();
+    if (row.interruption_json === null) {
+      if (row.interruption_sha256 !== null) stateError();
+      return null;
+    }
+    return storedJson(row.interruption_json, row.interruption_sha256, [
+      'interruption',
+      this.#runKey,
+    ]).text;
+  }
+
+  readInterruption(): Promise<string | null> {
+    return this.#withState(() => this.#interruption());
+  }
+}

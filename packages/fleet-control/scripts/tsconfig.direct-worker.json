@@ -5,6 +5,10 @@
     "types": ["@cloudflare/workers-types", "node"],
     "customConditions": ["workerd", "worker", "browser"]
   },
-  "files": ["direct-credentialed-tenant.ts", "direct-credentialed-spec.ts"],
+  "files": [
+    "direct-credentialed-tenant.ts",
+    "direct-credentialed-spec.ts",
+    "direct-reference-journal.ts"
+  ],
   "include": []
 }
