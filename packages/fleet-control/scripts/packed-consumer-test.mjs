@@ -1,15 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//
-// Publishing gate for @proofoftech/fleet-control, matching the breakwater and
-// flowsafe packed-consumer tests. This package has four export entries, three
-// of which are Workers entry points that no in-repo consumer imports through
-// the package boundary, so `pnpm build` proves nothing about whether the
-// published export map resolves. This packs the real tarball and consumes it.
-//
-// It runs publint --strict and attw --profile esm-only over the tarball, then
-// typechecks and executes a consumer that reaches every export entry, so a
-// missing dist file, a stale exports key, or a workspace: specifier that
-// survived packing fails here rather than on the registry.
+
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import {
@@ -25,12 +15,17 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { verifyControlPlanePackedBundle } from './control-plane-packed-bundle.mjs';
+import { verifyControlPlanePackedRuntime } from './control-plane-packed-runtime.mjs';
+import { verifyControlPlanePackedSurface } from './control-plane-packed-surface.mjs';
+import { verifyControlPlanePackedWorkload } from './control-plane-packed-workload.mjs';
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const workspaceRoot = resolve(packageRoot, '../..');
 const temporaryRoot = await mkdtemp(
   join(tmpdir(), 'fleet-control-packed-consumer-'),
 );
+const lockfileBefore = await readFile(join(workspaceRoot, 'pnpm-lock.yaml'));
 
 function run(command, args, options = {}) {
   execFileSync(command, args, {
@@ -96,6 +91,37 @@ try {
   const manifest = JSON.parse(
     await readFile(join(packedPackageRoot, 'package.json'), 'utf8'),
   );
+  assert.deepEqual(manifest.exports, {
+    '.': { types: './dist/index.d.ts', default: './dist/index.js' },
+    './cloudflare-control-plane': {
+      types: './dist/cloudflare-control-plane.d.ts',
+      default: './dist/cloudflare-control-plane.js',
+    },
+    './workers/dispatch': {
+      types: './dist/workers/dispatch.d.ts',
+      default: './dist/workers/dispatch.js',
+    },
+    './workers/outbound': {
+      types: './dist/workers/outbound.d.ts',
+      default: './dist/workers/outbound.js',
+    },
+    './workers/audit-consumer': {
+      types: './dist/workers/audit-consumer.d.ts',
+      default: './dist/workers/audit-consumer.js',
+    },
+    './package.json': './package.json',
+  });
+  assert.deepEqual(manifest.peerDependencies, {
+    '@cloudflare/workers-types': '>=5.20260730.1 <6',
+  });
+  assert.equal(
+    manifest.peerDependenciesMeta?.['@cloudflare/workers-types']?.optional,
+    undefined,
+  );
+  assert.equal(
+    manifest.devDependencies['@cloudflare/workers-types'],
+    '5.20260905.1',
+  );
 
   // Unscoped, this name would be squattable, and a granular token scoped to
   // @proofoftech would 403 at publish time.
@@ -144,6 +170,10 @@ try {
           '@proofoftech/fleet-control': `file:${tarball}`,
           '@proofoftech/flowsafe': `link:${flowsafeDirectory}`,
         },
+        devDependencies: {
+          '@cloudflare/workers-types':
+            manifest.devDependencies['@cloudflare/workers-types'],
+        },
       },
       null,
       2,
@@ -156,7 +186,7 @@ try {
   // whole window between the version bump and the release publishing.
   await writeFile(
     join(consumerDirectory, 'pnpm-workspace.yaml'),
-    `minimumReleaseAge: 10080\npackages:\n  - "."\noverrides:\n  "@proofoftech/flowsafe": ${JSON.stringify(
+    `minimumReleaseAge: 10080\nminimumReleaseAgeExclude:\n  - "@cloudflare/workers-types@5.20260905.1"\npackages:\n  - "."\noverrides:\n  "@proofoftech/flowsafe": ${JSON.stringify(
       `link:${flowsafeDirectory}`,
     )}\n`,
   );
@@ -1151,9 +1181,23 @@ assert.ok(new WorkersForPlatformsBackend(complete));
     cwd: consumerDirectory,
   });
   run(process.execPath, ['runtime.mjs'], { cwd: consumerDirectory });
+  await verifyControlPlanePackedSurface({ consumerDirectory, packageRoot });
+  run(process.execPath, [
+    '--test',
+    join(packageRoot, 'scripts/control-plane-packed-surface.test.mjs'),
+    join(packageRoot, 'scripts/control-plane-packed-bundle.test.mjs'),
+  ]);
+  await verifyControlPlanePackedBundle({ consumerDirectory, packageRoot });
+  await verifyControlPlanePackedRuntime({ consumerDirectory, packageRoot });
+  await verifyControlPlanePackedWorkload({ consumerDirectory, packageRoot });
+  assert.deepEqual(
+    await readFile(join(workspaceRoot, 'pnpm-lock.yaml')),
+    lockfileBefore,
+    'packed consumer verification must preserve the workspace resolution',
+  );
 
   process.stdout.write(
-    'fleet-control packed consumer: manifest, all four export entries, types, and the fail-closed constructor passed\n',
+    'fleet-control packed consumer: package exports, strict Worker types, bundle checks and Worker runtime probes passed\n',
   );
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });

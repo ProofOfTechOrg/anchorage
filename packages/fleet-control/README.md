@@ -16,7 +16,7 @@ Install it only in the one service that owns provisioning. Read [Import it only 
 pnpm add @proofoftech/fleet-control
 ```
 
-The package is ESM only and requires Node `>=22.22.0`. It depends on `@proofoftech/flowsafe`, which supplies the deployment identity protocol, the maintenance capability, and the audit export contract that fleet control provisions against.
+The package is ESM only. Node hosts require Node `>=22.22.0`; a Cloudflare Worker control plane imports `@proofoftech/fleet-control/cloudflare-control-plane`. The required type peer is `@cloudflare/workers-types >=5.20260730.1 <6`; this repository verifies `5.20260905.1`. It depends on `@proofoftech/flowsafe`, which supplies the deployment identity protocol, the maintenance capability, and the audit export contract that fleet control provisions against.
 
 That dependency is pinned to one exact FlowSafe release, deliberately. If you also depend on FlowSafe directly, pin it to the same release rather than letting a range resolve a second copy: FlowSafe's Durable Object classes are nominal and its maintenance receipt audience is fixed on both the minting and verifying side, so two copies fail closed at the maintenance boundary with no local signal.
 
@@ -37,11 +37,16 @@ Fleet Control does not install a runtime Wrangler dependency. Keep the selected 
 | Export | Contents |
 | --- | --- |
 | `@proofoftech/fleet-control` | Provisioning, migration, promotion, rollback, decommission, inventory, fleet state, and the Cloudflare client and rate coordinator. |
+| `@proofoftech/fleet-control/cloudflare-control-plane` | Trusted ordinary-Worker control-plane factory, bounded lifecycle operations, D1 adapter and shared quota coordinator, R2 export store, and their data and error types. |
 | `@proofoftech/fleet-control/workers/dispatch` | Platform dispatch Worker that routes to a deployment's user script under a verified maintenance capability. |
 | `@proofoftech/fleet-control/workers/outbound` | Shared outbound Worker: the declared-egress proxy and the named `StateEgress` entrypoint. |
 | `@proofoftech/fleet-control/workers/audit-consumer` | Control-plane queue consumer for backend-owned deployment audit events. |
 
-The three Worker exports are deployment artifacts for the platform's own Workers, not helpers to import into an application Worker.
+The `workers/*` entries are deployment artifacts for the platform's own Workers.
+
+Import `createCloudflareControlPlane` from `cloudflare-control-plane` in a dedicated trusted control-plane Worker. Supply direct Fleet and quota D1 bindings, a private export R2 binding, and a host-owned Cloudflare token. Authorize incoming operations before calling the factory's methods. Never expose the token, bindings, or factory to a tenant-serving Worker. Queue delivery tokens identify requested work; durable Fleet state determines whether it can advance.
+
+Size inventory and audit workloads for the [documented memory and read-cost envelope](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/fleet-control.md#audit-an-account-under-a-request-budget). A provider-request budget does not establish a memory or CPU bound.
 
 Choose a backend from the artifact trust boundary and the provider integration available to your control plane:
 
