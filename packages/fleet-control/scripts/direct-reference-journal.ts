@@ -189,8 +189,22 @@ export class DirectReferenceJournal {
       await this.#ready;
       return await operation();
     } catch (error) {
-      if (error instanceof DirectReferenceJournalError) throw error;
-      return stateError();
+      let code: DirectJournalErrorCode = 'journal-state';
+      try {
+        if (error instanceof DirectReferenceJournalError) {
+          const candidate = error.code;
+          if (
+            candidate === 'journal-state' ||
+            candidate === 'run-binding-mismatch' ||
+            candidate === 'operation-mismatch' ||
+            candidate === 'missing-start'
+          )
+            code = candidate;
+        }
+      } catch {
+        // Class and code inspection can invoke traps on a foreign rejection.
+      }
+      throw new DirectReferenceJournalError(code);
     }
   }
 

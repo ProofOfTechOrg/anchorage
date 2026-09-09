@@ -81,6 +81,62 @@ describe.sequential('direct reference journal in native D1', {
     return { runKey, journal: new DirectReferenceJournal(db, runKey, binding) };
   }
 
+  it.each([
+    'revoked',
+    'prototype-trap',
+    'code-getter',
+    'unknown-code',
+    'message',
+  ] as const)('normalizes hostile database rejection: %s', async (kind) => {
+    let rejection: unknown;
+    if (kind === 'revoked') {
+      const { proxy, revoke } = Proxy.revocable({}, {});
+      revoke();
+      rejection = proxy;
+    } else if (kind === 'prototype-trap')
+      rejection = new Proxy(
+        {},
+        {
+          getPrototypeOf() {
+            throw new Error('prototype-secret-sentinel');
+          },
+        },
+      );
+    else {
+      rejection = new DirectReferenceJournalError('missing-start');
+      Object.defineProperty(
+        rejection,
+        kind === 'message' ? 'message' : 'code',
+        kind === 'code-getter'
+          ? {
+              get() {
+                throw new Error('code-secret-sentinel');
+              },
+            }
+          : { value: 'unrecognized-secret-sentinel' },
+      );
+    }
+    const wrapped = new Proxy(db, {
+      get(target, key) {
+        if (key === 'batch')
+          return async () => {
+            throw rejection;
+          };
+        const value = Reflect.get(target, key);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const journal = new DirectReferenceJournal(wrapped, randomUUID(), binding);
+    const code = kind === 'message' ? 'missing-start' : 'journal-state';
+    await expect(
+      journal.readOperation('inventory-before'),
+    ).rejects.toMatchObject({
+      name: 'DirectReferenceJournalError',
+      code,
+      message: code,
+    });
+  });
+
   it('executes the journal inside workerd and reloads its records', async () => {
     const { runKey, journal } = fixture();
     const url = `https://journal.test/?run=${runKey}`;
