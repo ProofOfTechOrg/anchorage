@@ -12,6 +12,7 @@
     "direct-reference-http.ts",
     "direct-reference-transport.ts",
     "direct-reference-context.ts",
+    "direct-reference-observations.ts",
     "direct-reference-worker.ts"
   ],
   "include": []

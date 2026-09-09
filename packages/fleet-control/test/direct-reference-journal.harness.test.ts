@@ -81,6 +81,170 @@ describe.sequential('direct reference journal in native D1', {
     return { runKey, journal: new DirectReferenceJournal(db, runKey, binding) };
   }
 
+  it('retains first resource provenance and distinct incarnations across reload', async () => {
+    const { runKey, journal } = fixture();
+    const first = await journal.recordResource(
+      'a',
+      '{"databaseId":"one"}',
+      '{"phase":"ready"}',
+    );
+    const repeated = await journal.recordResource(
+      'a',
+      first.identityJson,
+      '{"phase":"decommissioning"}',
+    );
+    expect(repeated).toEqual(first);
+    const second = await journal.recordResource(
+      'a',
+      '{"databaseId":"two"}',
+      '{}',
+    );
+    expect(second.identitySha256).not.toBe(first.identitySha256);
+    const reloaded = new DirectReferenceJournal(db, runKey, binding);
+    expect(await reloaded.readResource('a', first.identitySha256)).toEqual(
+      first,
+    );
+    expect(await reloaded.readResource('a', second.identitySha256)).toEqual(
+      second,
+    );
+    expect(
+      await reloaded.readResource('b', first.identitySha256),
+    ).toBeUndefined();
+  });
+
+  it('deduplicates concurrent settlement delivery while retaining first provenance', async () => {
+    const { runKey, journal } = fixture();
+    const key = createHash('sha256').update(randomUUID()).digest('hex');
+    const identity = '{"target":"v1"}';
+    const deliveries = await Promise.all([
+      journal.recordSettlement(
+        key,
+        identity,
+        '{"entry":"migration","alreadySettled":false}',
+      ),
+      journal.recordSettlement(
+        key,
+        identity,
+        '{"entry":"ready-convergence","alreadySettled":true}',
+      ),
+    ]);
+    expect(deliveries[0]).toEqual(deliveries[1]);
+    expect(
+      await new DirectReferenceJournal(db, runKey, binding).readSettlement(key),
+    ).toEqual(deliveries[0]);
+    const rows = await db
+      .prepare('SELECT * FROM direct_reference_observations WHERE run_key=?')
+      .bind(runKey)
+      .all();
+    expect(rows.results).toHaveLength(1);
+    await expect(
+      journal.recordSettlement(key, '{"target":"v2"}', '{}'),
+    ).rejects.toMatchObject({ code: 'journal-state' });
+    expect(await journal.readSettlement(key)).toEqual(deliveries[0]);
+  });
+
+  it.each([
+    'identity',
+    'provenance',
+    'kind',
+    'key',
+    'run',
+    'role',
+  ] as const)('detects observation corruption in %s', async (field) => {
+    const { runKey, journal } = fixture();
+    const resource = await journal.recordResource(
+      'a',
+      '{"databaseId":"one"}',
+      '{}',
+    );
+    let reader = journal;
+    let read: () => Promise<unknown> = () =>
+      reader.readResource('a', resource.identitySha256);
+    if (field === 'identity' || field === 'provenance') {
+      const column = field === 'identity' ? 'identity_json' : 'provenance_json';
+      await db
+        .prepare(
+          `UPDATE direct_reference_observations SET ${column}=? WHERE run_key=?`,
+        )
+        .bind('{"tampered":true}', runKey)
+        .run();
+    } else if (field === 'kind' || field === 'key') {
+      const key = 'a'.repeat(64);
+      await db
+        .prepare(
+          'UPDATE direct_reference_observations SET observation_kind=?,observation_key=? WHERE run_key=?',
+        )
+        .bind(
+          field === 'kind' ? 'settlement' : 'resource',
+          field === 'kind' ? key : `a:${key}`,
+          runKey,
+        )
+        .run();
+      read = () =>
+        field === 'kind'
+          ? reader.readSettlement(key)
+          : reader.readResource('a', key);
+    } else if (field === 'role') {
+      await db
+        .prepare(
+          'UPDATE direct_reference_observations SET observation_key=? WHERE run_key=?',
+        )
+        .bind(`b:${resource.identitySha256}`, runKey)
+        .run();
+      read = () => reader.readResource('b', resource.identitySha256);
+    } else {
+      const other = fixture();
+      await other.journal.readInterruption();
+      await db
+        .prepare(
+          'UPDATE direct_reference_observations SET run_key=? WHERE run_key=?',
+        )
+        .bind(other.runKey, runKey)
+        .run();
+      reader = other.journal;
+    }
+    await expect(read()).rejects.toMatchObject({ code: 'journal-state' });
+  });
+
+  it('does not acknowledge a suppressed observation insert', async () => {
+    const { runKey, journal } = fixture();
+    await journal.readInterruption();
+    const trigger = `ignore_observation_${runKey.replaceAll('-', '')}`;
+    await db.exec(
+      `CREATE TRIGGER ${trigger} BEFORE INSERT ON direct_reference_observations WHEN NEW.run_key='${runKey}' BEGIN SELECT RAISE(IGNORE); END`,
+    );
+    try {
+      await expect(
+        journal.recordResource('a', '{}', '{}'),
+      ).rejects.toMatchObject({ code: 'journal-state' });
+      await expect(
+        journal.recordSettlement('b'.repeat(64), '{}', '{}'),
+      ).rejects.toMatchObject({ code: 'journal-state' });
+    } finally {
+      await db.exec(`DROP TRIGGER ${trigger}`);
+    }
+  });
+
+  it('validates observation identities and bounded JSON before storage', async () => {
+    const { journal } = fixture();
+    await expect(
+      journal.recordResource('foreign' as 'a', '{}', '{}'),
+    ).rejects.toMatchObject({ code: 'journal-state' });
+    await expect(journal.recordResource('a', '[]', '{}')).rejects.toMatchObject(
+      { code: 'journal-state' },
+    );
+    await expect(
+      journal.recordSettlement('not-a-key', '{}', '{}'),
+    ).rejects.toMatchObject({ code: 'journal-state' });
+    await expect(
+      journal.recordSettlement(
+        'b'.repeat(64),
+        '{}',
+        JSON.stringify({ value: 'x'.repeat(256 * 1024) }),
+      ),
+    ).rejects.toMatchObject({ code: 'journal-state' });
+  });
+
   it.each([
     'revoked',
     'prototype-trap',

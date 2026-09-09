@@ -51,6 +51,8 @@ describe.sequential('real direct reference context and inventory', {
 import {createDirectReferenceWorker} from ${source('../scripts/direct-reference-worker.ts')};
 import {createDirectReferenceContext} from ${source('../scripts/direct-reference-context.ts')};
 import {DirectReferenceTransport} from ${source('../scripts/direct-reference-transport.ts')};
+import {recordDirectResource,directSettlementHost} from ${source('../scripts/direct-reference-observations.ts')};
+import {fleetSettlementKey} from ${source('../src/settlement.ts')};
 import {deploymentSpecDigest} from ${source('../src/spec-digest.ts')};
 const manifest=${JSON.stringify(manifest)};
 const binding=${JSON.stringify(binding)};
@@ -91,6 +93,31 @@ export default {async fetch(request,env){
     DirectReferenceTransport.prototype.snapshot=function(){ended=true;const value=oldSnapshot.call(this);observedFailure=value.failure;return value;};
     try{const worker=createDirectReferenceWorker({...manifest,referenceRuntime:{...manifest.referenceRuntime,invocationTimeoutMs:1000}},{fetch:provider});const response=await worker.fetch(request,current);return Response.json({status:response.status,observedFailure,body:await response.json(),providerCalls:calls.length});}
     finally{Object.defineProperty(performance,'now',{configurable:true,value:oldNow});DirectReferenceTransport.prototype.snapshot=oldSnapshot;}
+  }
+  if(mode==='observations'){
+    const context=await createDirectReferenceContext(manifest,current,{startedAt:performance.now(),signal:request.signal,fetch:provider});
+    const spec=context.spec('a','initial'),digest=deploymentSpecDigest(spec);
+    const record={tenantTag:spec.tenantTag,environment:spec.environment,backend:'plain-worker',scriptName:spec.scriptName,databaseId:'resource-db-one',databaseName:spec.databaseName,schemaVersion:1,artifactVersion:'resource-version-one',desiredSpecDigest:digest,routeHostname:spec.routeHostname,phase:'ready',updatedAt:'2026-09-10T00:00:00Z',durableObjectBindings:[{name:'Runner',className:'Runner',namespaceId:'namespace-runner'},{name:'Maintenance',className:'Maintenance',namespaceId:'namespace-maintenance'}],applicationResources:[{name:'B',bucketName:'fixture-b',jurisdiction:'default',reservationNonce:'nonce-b',creationDate:'2026-09-10T00:00:00Z',state:'created'},{name:'A',bucketName:'fixture-a',jurisdiction:'eu',reservationNonce:'nonce-a',state:'reserved'}],applicationBindings:{vars:[{name:'PRIVATE_VALUE',value:secretMap.a.application.APP_PROBE_TOKEN}],secrets:[],r2Buckets:[]}};
+    const resource=await recordDirectResource(context,record,'provision-read');
+    const repeated=await recordDirectResource(context,{...record,phase:'decommissioning',updatedAt:'2026-09-11T00:00:00Z',durableObjectBindings:[...record.durableObjectBindings].reverse(),applicationResources:[...record.applicationResources].reverse().map(r=>({...r,state:'detached'}))},'migration-read');
+    const second=await recordDirectResource(context,{...record,databaseId:'resource-db-two'},'provision-read');
+    const reserved=await recordDirectResource(context,{...record,phase:'database-create-authorized',databaseId:'reserved-'+digest.slice(0,48),artifactVersion:'pending',durableObjectBindings:[],applicationResources:[]},'provision-read');
+    const target={physicalScriptName:record.scriptName,specDigest:digest,artifactVersion:record.artifactVersion,releaseSchemaVersion:1,application:record.applicationBindings};
+    const attestation={physicalScriptName:target.physicalScriptName,specDigest:digest,artifactVersion:target.artifactVersion,source:'workers-deployments',observedAt:'2026-09-10T00:00:00Z'};
+    const key=fleetSettlementKey({...record,specDigest:digest});
+    const settlement={tenantTag:record.tenantTag,environment:record.environment,target,attestation,settlementKey:key,entry:'migration',alreadySettled:true};
+    const host=directSettlementHost(context,record);
+    await host.settle(settlement);
+    await host.settle({...settlement,entry:'rollback',alreadySettled:false,attestation:{...attestation,observedAt:'2026-09-11T00:00:00Z'}});
+    const rejected=[];
+    for(const change of [{tenantTag:'foreign'},{environment:'foreign'},{settlementKey:'f'.repeat(64)},{target:{...target,physicalScriptName:'foreign'}},{target:{...target,specDigest:'f'.repeat(64)}},{target:{...target,artifactVersion:'pending'}},{attestation:{...attestation,artifactVersion:'foreign'}}]){
+      try{await host.settle({...settlement,...change});rejected.push(false);}catch{rejected.push(true);}
+    }
+    let writeFailure=false;const remember=context.journal.recordSettlement;
+    context.journal.recordSettlement=async()=>{throw new Error('injected native producer write failure');};
+    try{await host.settle(settlement);}catch{writeFailure=true;}finally{context.journal.recordSettlement=remember;}
+    const reloaded=await createDirectReferenceContext(manifest,current,{startedAt:performance.now(),signal:request.signal,fetch:provider});
+    return Response.json({resource,repeated,second,reserved,settlement:await reloaded.journal.readSettlement(key),reloadedResource:await reloaded.journal.readResource('a',resource.identitySha256),rejected,writeFailure,providerCalls:calls.length});
   }
   if(mode==='recipes'||mode==='release-pin'||mode==='prune'){
     const context=await createDirectReferenceContext(manifest,current,{startedAt:performance.now(),signal:request.signal,fetch:provider});
@@ -186,6 +213,55 @@ export default {async fetch(request,env){
     );
     expect(response.status).toBe(401);
     expect(response.headers.get('X-Fixture-Calls')).toBe('[]');
+  });
+
+  it('retains resource and settlement identities through real context producers', async () => {
+    const response = await call({ kind: 'control-read' }, 'observations');
+    expect(response.status).toBe(200);
+    const body = await response.text();
+    const value = JSON.parse(body);
+    expect(value.repeated).toEqual(value.resource);
+    expect(value.reloadedResource).toEqual(value.resource);
+    expect(value.second.identitySha256).not.toBe(value.resource.identitySha256);
+    const identity = JSON.parse(value.resource.identityJson);
+    expect(identity.database).toEqual({
+      name: manifest.names.roles.a.databaseName,
+      id: 'resource-db-one',
+    });
+    expect(identity.knownVersionIds).toEqual(['resource-version-one']);
+    expect(
+      identity.localNamespaces.map((item: { name: string }) => item.name),
+    ).toEqual(['Maintenance', 'Runner']);
+    expect(
+      identity.applicationBuckets.map((item: { name: string }) => item.name),
+    ).toEqual(['A', 'B']);
+    expect(identity.applicationBuckets[0].creationDate).toBeNull();
+    expect(JSON.parse(value.reserved.identityJson)).toMatchObject({
+      database: { id: null },
+      knownVersionIds: [],
+    });
+    expect(JSON.parse(value.reserved.provenanceJson).databaseState).toBe(
+      'create-outcome-unresolved',
+    );
+    expect(JSON.parse(value.settlement.provenanceJson)).toEqual({
+      entry: 'migration',
+      alreadySettled: true,
+      observedAt: '2026-09-10T00:00:00Z',
+    });
+    expect(value.rejected).toEqual(Array(7).fill(true));
+    expect(value.writeFailure).toBe(true);
+    expect(value.providerCalls).toBe(0);
+    for (const role of Object.values(secrets)) {
+      for (const secret of [
+        role.deploymentIdentity,
+        role.maintenanceAdmin,
+        role.application.APP_PROBE_TOKEN,
+      ])
+        expect(body).not.toContain(secret);
+    }
+    expect(JSON.parse(value.settlement.identityJson).target).not.toHaveProperty(
+      'application',
+    );
   });
 
   it('refuses success after the final metrics observe deadline expiry', async () => {

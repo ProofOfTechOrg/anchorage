@@ -50,6 +50,17 @@ export interface DirectStoredOperation extends DirectStartCandidate {
   readonly tokenRevision: number | null;
 }
 
+export interface DirectStoredObservation {
+  readonly identityJson: string;
+  readonly provenanceJson: string;
+}
+
+export interface DirectStoredResource extends DirectStoredObservation {
+  readonly identitySha256: string;
+}
+
+type ObservationKind = 'resource' | 'settlement';
+
 const MAX_JSON_BYTES = 256 * 1024;
 const schema = [
   `CREATE TABLE IF NOT EXISTS direct_reference_run (
@@ -74,6 +85,16 @@ const schema = [
     CHECK ((token_json IS NULL AND token_sha256 IS NULL AND token_revision IS NULL)
       OR (token_json IS NOT NULL AND token_sha256 IS NOT NULL AND token_revision IS NOT NULL))
   )`,
+  `CREATE TABLE IF NOT EXISTS direct_reference_observations (
+    run_key TEXT NOT NULL REFERENCES direct_reference_run(run_key),
+    observation_kind TEXT NOT NULL,
+    observation_key TEXT NOT NULL,
+    identity_json TEXT NOT NULL,
+    identity_sha256 TEXT NOT NULL,
+    provenance_json TEXT NOT NULL,
+    provenance_sha256 TEXT NOT NULL,
+    PRIMARY KEY (run_key, observation_kind, observation_key)
+  )`,
 ];
 
 function stateError(): never {
@@ -82,6 +103,16 @@ function stateError(): never {
 
 function text(value: unknown): string {
   if (typeof value !== 'string' || !value || value.length > 128) stateError();
+  return value;
+}
+
+function role(value: DirectFixtureRole): DirectFixtureRole {
+  if (value !== 'a' && value !== 'b' && value !== 'recovery') stateError();
+  return value;
+}
+
+function sha256(value: string): string {
+  if (typeof value !== 'string' || !/^[a-f0-9]{64}$/u.test(value)) stateError();
   return value;
 }
 
@@ -379,5 +410,120 @@ export class DirectReferenceJournal {
 
   readInterruption(): Promise<string | null> {
     return this.#withState(() => this.#interruption());
+  }
+
+  async #observation(
+    kind: ObservationKind,
+    key: string,
+  ): Promise<DirectStoredObservation | undefined> {
+    const rows = await this.#database.query(
+      'SELECT * FROM direct_reference_observations WHERE run_key=? AND observation_kind=? AND observation_key=?',
+      [this.#runKey, kind, key],
+    );
+    if (rows.length > 1) stateError();
+    const row = rows[0];
+    if (!row) return undefined;
+    const context = ['observation', this.#runKey, kind, key];
+    return Object.freeze({
+      identityJson: storedJson(row.identity_json, row.identity_sha256, [
+        ...context,
+        'identity',
+      ]).text,
+      provenanceJson: storedJson(row.provenance_json, row.provenance_sha256, [
+        ...context,
+        'provenance',
+      ]).text,
+    });
+  }
+
+  async #recordObservation(
+    kind: ObservationKind,
+    key: string,
+    identityJson: string,
+    provenanceJson: string,
+  ): Promise<DirectStoredObservation> {
+    const identity = jsonObject(identityJson);
+    const provenance = jsonObject(provenanceJson);
+    const context = ['observation', this.#runKey, kind, key];
+    await this.#database.execute(
+      'INSERT INTO direct_reference_observations (run_key,observation_kind,observation_key,identity_json,identity_sha256,provenance_json,provenance_sha256) VALUES (?,?,?,?,?,?,?) ON CONFLICT DO NOTHING',
+      [
+        this.#runKey,
+        kind,
+        key,
+        identity.text,
+        boundHash([...context, 'identity'], identity.text),
+        provenance.text,
+        boundHash([...context, 'provenance'], provenance.text),
+      ],
+    );
+    const stored = await this.#observation(kind, key);
+    if (!stored || stored.identityJson !== identity.text) stateError();
+    return stored;
+  }
+
+  recordResource(
+    fixtureRole: DirectFixtureRole,
+    identityJson: string,
+    provenanceJson: string,
+  ): Promise<DirectStoredResource> {
+    return this.#withState(async () => {
+      const identity = jsonObject(identityJson);
+      const identitySha256 = boundHash(
+        ['resource', this.#runKey, role(fixtureRole)],
+        identity.text,
+      );
+      const stored = await this.#recordObservation(
+        'resource',
+        `${fixtureRole}:${identitySha256}`,
+        identity.text,
+        provenanceJson,
+      );
+      return Object.freeze({ ...stored, identitySha256 });
+    });
+  }
+
+  readResource(
+    fixtureRole: DirectFixtureRole,
+    identitySha256: string,
+  ): Promise<DirectStoredResource | undefined> {
+    return this.#withState(async () => {
+      const stored = await this.#observation(
+        'resource',
+        `${role(fixtureRole)}:${sha256(identitySha256)}`,
+      );
+      if (!stored) return undefined;
+      if (
+        boundHash(
+          ['resource', this.#runKey, fixtureRole],
+          stored.identityJson,
+        ) !== identitySha256
+      )
+        stateError();
+      return Object.freeze({ ...stored, identitySha256 });
+    });
+  }
+
+  recordSettlement(
+    settlementKey: string,
+    identityJson: string,
+    provenanceJson: string,
+  ): Promise<DirectStoredObservation> {
+    return this.#withState(() =>
+      this.#recordObservation(
+        'settlement',
+        sha256(settlementKey),
+        identityJson,
+        provenanceJson,
+      ),
+    );
+  }
+
+  readSettlement(
+    settlementKey: string,
+  ): Promise<DirectStoredObservation | undefined> {
+    return this.#withState(() =>
+      this.#observation('settlement', sha256(settlementKey)),
+    );
   }
 }
