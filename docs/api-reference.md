@@ -47,7 +47,7 @@ New host-side and React features remain subpath-only so importing the root does 
 | `@proofoftech/flowsafe/goals` | Objective HTTP router and goal request-context contract |
 | `@proofoftech/flowsafe/host-kit` | Authenticator and verifier seams, run/thread/hub/provider topologies, routes, approval bridges, tickets, composed Worker, and execution-fence and inventory admin routes |
 | `@proofoftech/flowsafe/host-kit/module` | Workflow-module interface for import-safe host registration |
-| `@proofoftech/flowsafe/schedules` | D1 schedule domain, deployment router, reserved-context guard, and CAS tick |
+| `@proofoftech/flowsafe/schedules` | D1 schedule domain, atomic mutation capability and outcomes, deployment router, reserved-context guard, and CAS tick |
 | `@proofoftech/flowsafe/signal-providers` | Provider adapters, host Durable Object, topology, subscriptions, verified webhooks, and GitHub provider |
 | `@proofoftech/flowsafe/signals` | D1 signal domains, thread routes, canonical content-policy seam, ingress router, notification dispatch, and client |
 | `@proofoftech/flowsafe/signals/client` | DOM-free `SignalClient` without host-side signal code |

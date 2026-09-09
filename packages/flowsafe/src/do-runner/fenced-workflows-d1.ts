@@ -22,9 +22,12 @@ import {
 } from './execution-admission.js';
 import {
   admitsRunStart,
+  captureExecutionFenceAdmissionSchema,
   decodeExecutionFenceAdmissionRow,
   type ExecutionFenceAdmissionObservation,
   ExecutionFencedError,
+  executionFenceAdmissionSql,
+  executionFenceAdmissionValues,
   validateExecutionFenceAdmissionSchema,
 } from './execution-fence.js';
 import {
@@ -866,6 +869,20 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
     const { database } = capability;
     await input.fence.seed('open');
     const observed = await input.fence.readForAdmission();
+    const semanticValues = executionFenceAdmissionValues(observed);
+    let schema: string;
+    try {
+      schema = await captureExecutionFenceAdmissionSchema(
+        await database
+          .prepare(`PRAGMA table_xinfo(${EXECUTION_FENCE_TABLE})`)
+          .all(),
+      );
+    } catch (cause) {
+      throw new ExecutionFenceUnreadableError(
+        'initial admission requires current fence schema',
+        { cause },
+      );
+    }
     if (
       input.reservation &&
       !sameReservation(
@@ -888,19 +905,8 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
       row.updatedAt,
     ].map(bind);
     const epoch = bind(input.mutationEpoch ?? null);
-    const fence = observed.raw;
-    const semantic = [
-      'state',
-      'mutation_epoch',
-      'require_mutation_epoch',
-      'transition_revision',
-      'last_transition_request',
-      'proof_key',
-      'proof_run_id',
-      'proof_table_prefix',
-      'proof_workflow_id',
-      'proof_start_token',
-    ].map((key) => bind(fence[key]));
+    const semantic = semanticValues.map(bind);
+    const schemaParameter = bind(schema);
     const proofRevision = bind(input.proof?.transitionRevision ?? null);
     const proofKey = bind(input.proof?.key ?? null);
     const reservation = input.reservation
@@ -912,23 +918,22 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
       AND o.owner_kind = ${bind(input.runOwnerGuard.owner.kind)} AND o.owner_id = ${bind(input.runOwnerGuard.owner.id)}
       AND (o.reservation_token IS NULL OR o.reservation_token = ${bind(input.runOwnerGuard.reservationToken)}))`
       : '';
+    const fencePredicate = executionFenceAdmissionSql({
+      callerEpoch: epoch,
+      semantic,
+      schema: schemaParameter,
+      statePredicate: `f.state COLLATE BINARY = 'open' OR
+        (f.state COLLATE BINARY = 'proof-only' AND f.proof_key COLLATE BINARY = ${proofKey}
+          AND f.transition_revision = ${proofRevision} AND f.mutation_epoch = ${proofEpoch}
+          AND f.proof_run_id IS NULL AND f.proof_table_prefix IS NULL
+          AND f.proof_workflow_id IS NULL AND f.proof_start_token IS NULL)`,
+    });
     const statements = [
       database
         .prepare(`INSERT INTO "${row.tablePrefix}mastra_workflow_snapshot"
       (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
       SELECT ${fields.join(', ')}
-      WHERE EXISTS (
-        SELECT 1 FROM ${EXECUTION_FENCE_TABLE} AS f
-        WHERE f.id = 'deployment' AND f.state = ${semantic[0]}
-          AND f.mutation_epoch = ${semantic[1]} AND f.require_mutation_epoch = ${semantic[2]}
-          AND f.transition_revision = ${semantic[3]} AND f.last_transition_request IS ${semantic[4]}
-          AND f.proof_key IS ${semantic[5]} AND f.proof_run_id IS ${semantic[6]}
-          AND f.proof_table_prefix IS ${semantic[7]} AND f.proof_workflow_id IS ${semantic[8]} AND f.proof_start_token IS ${semantic[9]}
-          AND (f.require_mutation_epoch = 0 OR f.mutation_epoch = ${epoch})
-          AND (f.state = 'open' OR (f.state = 'proof-only' AND f.proof_key = ${proofKey}
-            AND f.transition_revision = ${proofRevision} AND f.mutation_epoch = ${proofEpoch}
-            AND f.proof_run_id IS NULL AND f.proof_table_prefix IS NULL AND f.proof_workflow_id IS NULL AND f.proof_start_token IS NULL))
-      ) ${reservation} ${owner}
+      WHERE ${fencePredicate} ${reservation} ${owner}
       ON CONFLICT (workflow_name, run_id) DO NOTHING
       RETURNING workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt`)
         .bind(...values),

@@ -1,11 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
-import { createEmptyWorkflowSnapshot } from '@mastra/core/storage';
 
+import { createEmptyWorkflowSnapshot } from '@mastra/core/storage';
+import { z } from 'zod';
+import { EXECUTION_FENCE_TABLE } from '#deployment-identity-protocol';
+
+import {
+  type ActorContext,
+  createActorResolver,
+} from '../src/approval-api/actor-context.js';
 import { D1ApprovalStore } from '../src/approval-api/d1-store.js';
 import {
   D1ResourceOwnershipStore,
   RESOURCE_OWNERSHIP_TABLE,
 } from '../src/approval-api/resource-ownership.js';
+import { D1ApprovalStoreFactory } from '../src/approval-api/store-factory.js';
 import type { ApprovalRecord } from '../src/approval-api/types.js';
 import { createBackgroundTaskD1Domains } from '../src/background-tasks/d1-storage.js';
 import {
@@ -15,14 +23,18 @@ import {
   type RunRetentionCursor,
 } from '../src/do-runner/d1-storage.js';
 import { seedDeploymentIdentity } from '../src/do-runner/deployment-identity.js';
+import { MUTATION_EPOCH_HEADER } from '../src/do-runner/execution-admission.js';
 import { ExecutionFenceStore } from '../src/do-runner/execution-fence.js';
 import { FENCED_WORKFLOW_STORAGE } from '../src/do-runner/fenced-workflow-capability.js';
 import { FencedWorkflowsStorageD1 } from '../src/do-runner/fenced-workflows-d1.js';
+import { init } from '../src/do-runner/init.js';
 import { isDefinitiveInitialAdmissionRefusal } from '../src/do-runner/initial-admission-refusal.js';
 import {
   parseRunLifecycle,
   projectTerminalLifecycle,
 } from '../src/do-runner/run-lifecycle.js';
+import type { StartRunOptions } from '../src/do-runner/runtime.js';
+import { StartIdempotencyStore } from '../src/do-runner/start-idempotency.js';
 import {
   START_IDEMPOTENCY_ADDITIONS,
   START_IDEMPOTENCY_DDL,
@@ -33,8 +45,14 @@ import type {
   SnapshotDatabase,
   SnapshotStatement,
 } from '../src/do-runner/workflow-snapshot-row.js';
+import { createRunRouter } from '../src/host-kit/run-router.js';
+import { ScheduleMutationOutcomeUnknownError } from '../src/schedules/mutation-contract.js';
+import { createScheduleRouter } from '../src/schedules/router.js';
 import { D1SchedulesStorage } from '../src/schedules/schedules-d1.js';
-import { scheduleWithCreatorRole } from '../src/schedules/target-policy.js';
+import {
+  createScheduleTargetPolicy,
+  scheduleWithCreatorRole,
+} from '../src/schedules/target-policy.js';
 import { D1NotificationsStorage } from '../src/signals/notifications-d1.js';
 
 interface Env {
@@ -111,6 +129,11 @@ async function approvalProbe(db: D1Database): Promise<unknown> {
   };
 }
 
+function scheduleMutationFailure(error: unknown) {
+  if (!(error instanceof ScheduleMutationOutcomeUnknownError)) throw error;
+  return { reason: error.reason, cause: String(error.cause) };
+}
+
 async function scheduleProbe(db: D1Database): Promise<unknown> {
   const store = new D1SchedulesStorage(db);
   const resources = new D1ResourceOwnershipStore(db);
@@ -166,11 +189,11 @@ async function scheduleProbe(db: D1Database): Promise<unknown> {
        BEGIN SELECT RAISE(ABORT, 'injected owner delete failure'); END`,
     )
     .run();
-  let rollbackError = '';
+  let rollbackError: ReturnType<typeof scheduleMutationFailure> | undefined;
   try {
     await store.deleteOwnedSchedule(rollback.id);
   } catch (error) {
-    rollbackError = String(error);
+    rollbackError = scheduleMutationFailure(error);
   }
 
   const successfulDelete = schedule('schedule-delete');
@@ -195,11 +218,11 @@ async function scheduleProbe(db: D1Database): Promise<unknown> {
        BEGIN SELECT RAISE(ABORT, 'injected owner insert failure'); END`,
     )
     .run();
-  let ownerInsertError = '';
+  let ownerInsertError: ReturnType<typeof scheduleMutationFailure> | undefined;
   try {
     await store.createOwnedSchedule(ownerFailure, owner, 10);
   } catch (error) {
-    ownerInsertError = String(error);
+    ownerInsertError = scheduleMutationFailure(error);
   }
 
   return {
@@ -2052,6 +2075,1064 @@ async function eRetentionProbe(
   }
 }
 
+const P3_PREFIX = 'p3_';
+const P3_SCHEDULES = `${P3_PREFIX}mastra_schedules`;
+const P3_TRIGGERS = `${P3_PREFIX}mastra_schedule_triggers`;
+const P3_SNAPSHOTS = `${P3_PREFIX}mastra_workflow_snapshot`;
+const P3_ID = 'schedule-p3-existing';
+const P3_WORKFLOW = 'workflow-schedule';
+const P3_TOKEN = 'p3-local-operator';
+const P3_OWNER = { kind: 'human' as const, id: 'p3-owner' };
+
+async function p3Cleanup(db: D1Database) {
+  const shared = [
+    EXECUTION_FENCE_TABLE,
+    RESOURCE_OWNERSHIP_TABLE,
+    START_IDEMPOTENCY_TABLE,
+  ];
+  const selected = () =>
+    db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND (name GLOB 'p3_*' OR name IN (?, ?, ?)) ORDER BY name LIMIT 129",
+      )
+      .bind(...shared)
+      .all<{ name: string }>();
+  const tables = (await selected()).results;
+  if (tables.length > 128) throw new Error('P3 cleanup table bound exceeded');
+  if (tables.length)
+    await db.batch(
+      tables.map(({ name }) => {
+        if (!name.startsWith(P3_PREFIX) && !shared.includes(name))
+          throw new Error('P3 cleanup selected a foreign table');
+        return db.prepare(`DROP TABLE "${name.replaceAll('"', '""')}"`);
+      }),
+    );
+  const remaining = (await selected()).results;
+  if (remaining.length) throw new Error('P3 cleanup left fixture tables');
+  return { remaining };
+}
+
+type P3Phase = 'none' | 'auth' | 'final' | 'provider';
+type P3Action =
+  | 'none'
+  | 'activate'
+  | 'advance'
+  | 'cycle'
+  | 'capture'
+  | 'resume-race';
+type P3Operation =
+  | 'create'
+  | 'update'
+  | 'pause'
+  | 'resume'
+  | 'delete'
+  | 'pause-noop'
+  | 'resume-noop';
+
+function p3Choice<T extends string>(
+  params: URLSearchParams,
+  key: string,
+  values: readonly T[],
+  fallback: T,
+): T {
+  const value = params.get(key) ?? fallback;
+  if (!values.includes(value as T)) throw new Error(`invalid P3 ${key}`);
+  return value as T;
+}
+
+function p3Options(url: URL) {
+  const epoch = p3Choice(
+    url.searchParams,
+    'epoch',
+    ['missing', 'stale', 'future', 'current', 'invalid'],
+    'current',
+  );
+  return {
+    phase: p3Choice<P3Phase>(
+      url.searchParams,
+      'phase',
+      ['none', 'auth', 'final', 'provider'],
+      'none',
+    ),
+    action: p3Choice<P3Action>(
+      url.searchParams,
+      'action',
+      ['none', 'activate', 'advance', 'cycle', 'capture', 'resume-race'],
+      'none',
+    ),
+    epoch:
+      epoch === 'missing'
+        ? undefined
+        : epoch === 'stale'
+          ? 0
+          : epoch === 'future'
+            ? 3
+            : epoch === 'invalid'
+              ? -1
+              : 2,
+    closed: url.searchParams.get('closed') === 'true',
+  };
+}
+
+function p3Metrics() {
+  return {
+    statements: 0,
+    batches: 0,
+    maxBatchStatements: 0,
+    maxSqlBytes: 0,
+    maxBindings: 0,
+    maxBoundStringBytes: 0,
+    maxResultBytes: 0,
+    rowsRead: 0,
+    rowsWritten: 0,
+  };
+}
+
+interface P3Statement {
+  native: D1PreparedStatement;
+  sql: string;
+  values: unknown[];
+}
+
+function p3Database(
+  db: D1Database,
+  hooks: {
+    beforeBatch?: (statements: P3Statement[]) => Promise<void>;
+    afterBatch?: (
+      statements: P3Statement[],
+      results: D1Result[],
+    ) => Promise<void>;
+    afterStatement?: (sql: string, method: string) => void;
+  } = {},
+) {
+  let metrics = p3Metrics();
+  const entries = new WeakMap<D1PreparedStatement, P3Statement>();
+  const recordStatement = ({ sql, values }: P3Statement) => {
+    metrics.statements++;
+    metrics.maxSqlBytes = Math.max(
+      metrics.maxSqlBytes,
+      encoder.encode(sql).length,
+    );
+    metrics.maxBindings = Math.max(metrics.maxBindings, values.length);
+    for (const value of values) {
+      if (typeof value === 'string')
+        metrics.maxBoundStringBytes = Math.max(
+          metrics.maxBoundStringBytes,
+          encoder.encode(value).length,
+        );
+    }
+  };
+  const recordResult = (result: unknown) => {
+    const envelope = result as {
+      results?: unknown;
+      meta?: { rows_read?: number; rows_written?: number };
+    } | null;
+    metrics.maxResultBytes = Math.max(
+      metrics.maxResultBytes,
+      encoder.encode(JSON.stringify(envelope?.results ?? result) ?? '').length,
+    );
+    metrics.rowsRead += envelope?.meta?.rows_read ?? 0;
+    metrics.rowsWritten += envelope?.meta?.rows_written ?? 0;
+  };
+  const wrap = (entry: P3Statement): D1PreparedStatement => {
+    const statement = new Proxy(entry.native, {
+      get(target, key) {
+        if (key === 'bind')
+          return (...values: unknown[]) =>
+            wrap({ native: target.bind(...values), sql: entry.sql, values });
+        const member = Reflect.get(target, key, target);
+        if (typeof member !== 'function') return member;
+        if (['first', 'all', 'run', 'raw'].includes(String(key)))
+          return async (...args: unknown[]) => {
+            recordStatement(entry);
+            const outcome = await Reflect.apply(member, target, args);
+            recordResult(outcome);
+            hooks.afterStatement?.(entry.sql, String(key));
+            return outcome;
+          };
+        return member.bind(target);
+      },
+    });
+    entries.set(statement, entry);
+    return statement;
+  };
+  const database = new Proxy(db, {
+    get(target, key) {
+      if (key === 'prepare')
+        return (sql: string) =>
+          wrap({ native: target.prepare(sql), sql, values: [] });
+      if (key === 'batch')
+        return async (statements: D1PreparedStatement[]) => {
+          const selected = statements.map((statement) => {
+            const entry = entries.get(statement);
+            if (!entry) throw new Error('foreign P3 prepared statement');
+            return entry;
+          });
+          await hooks.beforeBatch?.(selected);
+          metrics.batches++;
+          metrics.maxBatchStatements = Math.max(
+            metrics.maxBatchStatements,
+            selected.length,
+          );
+          selected.forEach(recordStatement);
+          const result = await target.batch(
+            selected.map(({ native }) => native),
+          );
+          result.forEach(recordResult);
+          if (hooks.afterBatch) await hooks.afterBatch(selected, result);
+          return result;
+        };
+      const member = Reflect.get(target, key, target);
+      return typeof member === 'function' ? member.bind(target) : member;
+    },
+  });
+  return {
+    database,
+    get metrics() {
+      return metrics;
+    },
+    reset() {
+      const previous = metrics;
+      metrics = p3Metrics();
+      return previous;
+    },
+  };
+}
+
+function p3Deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+function p3Gate() {
+  const entered = p3Deferred();
+  const release = p3Deferred();
+  let hits = 0;
+  return {
+    entered: entered.promise,
+    release: release.resolve,
+    get hits() {
+      return hits;
+    },
+    async wait() {
+      hits++;
+      if (hits !== 1) throw new Error('P3 gate entered more than once');
+      entered.resolve();
+      await release.promise;
+    },
+  };
+}
+
+async function p3Deadline<T>(pending: Promise<T>, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      pending,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`P3 ${label} exceeded 8000ms`)),
+          8_000,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function p3Held<T>(
+  gate: ReturnType<typeof p3Gate>,
+  work: () => Promise<T>,
+  intervene: () => Promise<void>,
+): Promise<T> {
+  const pending = work();
+  const observed = pending.then(
+    (value) => ({ value }),
+    (error: unknown) => ({ error }),
+  );
+  try {
+    await p3Deadline(
+      Promise.race([
+        gate.entered,
+        observed.then(() => {
+          throw new Error('P3 request finished before the selected boundary');
+        }),
+      ]),
+      'boundary wait',
+    );
+    await p3Deadline(intervene(), 'intervention');
+  } finally {
+    gate.release();
+    await p3Deadline(observed, 'request cleanup');
+  }
+  const outcome = await observed;
+  if ('error' in outcome) throw outcome.error;
+  return outcome.value;
+}
+
+async function p3Transition(
+  fence: ExecutionFenceStore,
+  next: 'open' | 'draining',
+  advanceMutationEpoch = false,
+) {
+  const reading = await fence.read();
+  return fence.transition({
+    expected: reading.state,
+    next,
+    expectedMutationEpoch: reading.mutationEpoch,
+    expectedRevision: reading.transitionRevision,
+    ...(advanceMutationEpoch ? { advanceMutationEpoch } : {}),
+  });
+}
+
+async function p3Activate(fence: ExecutionFenceStore) {
+  await p3Transition(fence, 'draining', true);
+  await p3Transition(fence, 'open');
+}
+
+function p3Resolver(
+  db: D1Database,
+  epoch: number | undefined,
+  gate?: ReturnType<typeof p3Gate>,
+) {
+  let source: ActorContext | undefined;
+  const resolve = createActorResolver({
+    authenticate: (request) =>
+      request.headers.get('authorization') === `Bearer ${P3_TOKEN}`
+        ? { id: P3_OWNER.id, role: 'operator' }
+        : undefined,
+    storeFactory: new D1ApprovalStoreFactory(db),
+    mutationEpoch: epoch === -1 ? undefined : epoch,
+    newRunId: () => 'p3-run',
+    buildService: () => {
+      throw new Error('P3 workflow does not request approval');
+    },
+  });
+  return {
+    async resolve(request: Request) {
+      const context = await resolve(request);
+      if (!context) return undefined;
+      source = {
+        ...context,
+        ...(epoch === -1 ? { mutationEpoch: -1 } : {}),
+        canAccessResource: async (...args) => {
+          const allowed = await context.canAccessResource(...args);
+          if (gate && gate.hits === 0) await gate.wait();
+          return allowed;
+        },
+      };
+      return source;
+    },
+    replace() {
+      if (!source) throw new Error('P3 actor has not authenticated');
+      Object.assign(source, {
+        mutationEpoch: epoch === 2 ? 3 : 2,
+        actor: { id: 'replacement', role: 'viewer' },
+        principal: { kind: 'human', id: 'replacement', role: 'viewer' },
+        resourceOwner: { kind: 'human', id: 'replacement' },
+      });
+    },
+  };
+}
+
+function p3Request(
+  path: string,
+  method: string,
+  body?: string,
+  gate?: ReturnType<typeof p3Gate>,
+) {
+  const headers = {
+    authorization: `Bearer ${P3_TOKEN}`,
+    'content-type': 'application/json',
+  };
+  if (body === undefined)
+    return new Request(`http://p3.test${path}`, { method, headers });
+  const bytes = encoder.encode(body);
+  const stream = gate
+    ? new ReadableStream<Uint8Array>(
+        {
+          async pull(controller) {
+            await gate.wait();
+            controller.enqueue(bytes);
+            controller.close();
+          },
+        },
+        { highWaterMark: 0 },
+      )
+    : body;
+  return new Request(`http://p3.test${path}`, {
+    method,
+    headers,
+    body: stream,
+  });
+}
+
+async function p3Response(response: Response | null) {
+  if (!response) throw new Error('P3 router did not match request');
+  return { status: response.status, body: await response.json() };
+}
+
+async function p3RawSchedules(db: D1Database) {
+  const [schedules, triggers, owners] = await Promise.all([
+    db.prepare(`SELECT * FROM ${P3_SCHEDULES} ORDER BY id`).all(),
+    db.prepare(`SELECT * FROM ${P3_TRIGGERS} ORDER BY id`).all(),
+    db
+      .prepare(
+        `SELECT * FROM ${RESOURCE_OWNERSHIP_TABLE} ORDER BY resource_kind, resource_id`,
+      )
+      .all(),
+  ]);
+  return {
+    schedules: schedules.results,
+    triggers: triggers.results,
+    owners: owners.results,
+  };
+}
+
+async function p3ScheduleProbe(db: D1Database, url: URL) {
+  const options = p3Options(url);
+  const operation = p3Choice<P3Operation>(
+    url.searchParams,
+    'operation',
+    [
+      'create',
+      'update',
+      'pause',
+      'resume',
+      'delete',
+      'pause-noop',
+      'resume-noop',
+    ],
+    'create',
+  );
+  const gate = p3Gate();
+  let armed = false;
+  let finalBatches = 0;
+  const measured = p3Database(db, {
+    beforeBatch: async (statements) => {
+      if (
+        !armed ||
+        !statements.some(
+          ({ sql }) =>
+            sql.includes(P3_SCHEDULES) && sql.includes(EXECUTION_FENCE_TABLE),
+        )
+      )
+        return;
+      finalBatches++;
+      if (options.phase === 'final' && gate.hits === 0) await gate.wait();
+    },
+  });
+  const administration = p3Database(db);
+  const evidence = p3Database(db);
+  const fence = new ExecutionFenceStore(measured.database);
+  const adminFence = new ExecutionFenceStore(administration.database);
+  const store = new D1SchedulesStorage(measured.database, P3_PREFIX);
+  const adminStore = new D1SchedulesStorage(administration.database, P3_PREFIX);
+  await fence.seed('open');
+  await store.createOwnedSchedule(
+    {
+      ...schedule(P3_ID),
+      status:
+        operation === 'resume' || operation === 'pause-noop'
+          ? 'paused'
+          : 'active',
+    },
+    P3_OWNER,
+    10,
+  );
+  await db
+    .prepare(`UPDATE ${P3_SCHEDULES} SET metadata = ?, target = ? WHERE id = ?`)
+    .bind(
+      '{ "seed": "original" }',
+      '{ "type": "workflow", "workflowId": "workflow-schedule", "inputData": {} }',
+      P3_ID,
+    )
+    .run();
+  const deferred = url.searchParams.get('deferred') === 'true';
+  const triggerCount = url.searchParams.get('history') === 'true' ? 120 : 2;
+  for (let index = 0; index < triggerCount; index++) {
+    await store.recordTrigger({
+      id: `p3-trigger-${String(index).padStart(3, '0')}`,
+      scheduleId: P3_ID,
+      runId: `p3-prior-${index}`,
+      scheduledFireAt: NOW,
+      actualFireAt: NOW,
+      outcome: deferred && index === 0 ? 'deferred' : 'published',
+      metadata: { original: true },
+    });
+  }
+  if (options.action !== 'activate') {
+    await p3Activate(adminFence);
+    await p3Activate(adminFence);
+  }
+  if (options.closed) await p3Transition(adminFence, 'draining');
+  const resolver = p3Resolver(
+    measured.database,
+    options.epoch,
+    options.phase === 'auth' && operation !== 'create' && operation !== 'update'
+      ? gate
+      : undefined,
+  );
+  const audit: unknown[] = [];
+  const router = createScheduleRouter({
+    resolve: resolver.resolve,
+    store,
+    executionFence: fence,
+    targetPolicy: createScheduleTargetPolicy({
+      workflows: [{ id: P3_WORKFLOW }],
+      agents: [],
+    }),
+    validateThreadTarget: async () => {
+      throw new Error('P3 workflow target cannot require a thread');
+    },
+    maxSchedules: url.searchParams.get('cap') === 'true' ? 1 : 10,
+    audit: (event) => {
+      audit.push(event);
+    },
+  });
+  const method =
+    operation === 'update'
+      ? 'PATCH'
+      : operation === 'delete'
+        ? 'DELETE'
+        : 'POST';
+  const path =
+    operation === 'create'
+      ? '/api/schedules'
+      : operation === 'update' || operation === 'delete'
+        ? `/api/schedules/${P3_ID}`
+        : `/api/schedules/${P3_ID}/${operation.startsWith('pause') ? 'pause' : 'resume'}`;
+  const body: Record<string, unknown> =
+    operation === 'create'
+      ? {
+          workflowId: P3_WORKFLOW,
+          cron: '* * * * *',
+          metadata: { edited: true },
+        }
+      : { metadata: { edited: true } };
+  if (url.searchParams.get('patchPaused') === 'true') {
+    delete body.metadata;
+    body.status = 'paused';
+  }
+  const injected = url.searchParams.get('injection');
+  if (injected === 'body') body.mutationEpoch = 2;
+  if (injected === 'stored')
+    body.requestContext = { mutationEpoch: 2, 'flowsafe.mutationEpoch': 2 };
+  const bytes = url.searchParams.get('bytes');
+  if (bytes === '16384' || bytes === '16385') {
+    body.metadata = { unicode: 'é', pad: '' };
+    const metadata = body.metadata as { unicode: string; pad: string };
+    metadata.pad = 'x'.repeat(
+      Number(bytes) - encoder.encode(JSON.stringify(body)).length,
+    );
+  }
+  const rawBody =
+    operation === 'create' || operation === 'update'
+      ? JSON.stringify(body)
+      : undefined;
+  const request = p3Request(
+    path,
+    method,
+    rawBody,
+    options.phase === 'auth' &&
+      (operation === 'create' || operation === 'update')
+      ? gate
+      : undefined,
+  );
+  if (injected === 'header') request.headers.set(MUTATION_EPOCH_HEADER, '2');
+  const before = await p3RawSchedules(evidence.database);
+  const setupMetrics = measured.reset();
+  let intervened = before;
+  let fenceBeforeRelease = await adminFence.read();
+  armed = true;
+  const intervene = async () => {
+    if (options.action === 'activate' || options.action === 'advance')
+      await p3Activate(adminFence);
+    if (options.action === 'cycle') {
+      await p3Transition(adminFence, 'draining');
+      await p3Transition(adminFence, 'open');
+    }
+    if (options.action === 'capture') resolver.replace();
+    if (options.action === 'resume-race')
+      await adminStore.updateSchedule(
+        P3_ID,
+        { cron: '*/5 * * * *', timezone: 'UTC' },
+        { mutationEpoch: 2 },
+      );
+    fenceBeforeRelease = await adminFence.read();
+    intervened = await p3RawSchedules(evidence.database);
+  };
+  const call = () => router(request);
+  const response = await p3Response(
+    options.phase === 'none'
+      ? await call()
+      : await p3Held(gate, call, intervene),
+  );
+  armed = false;
+  const mutationMetrics = measured.reset();
+  const after = await p3RawSchedules(evidence.database);
+  const reads = options.closed
+    ? {
+        list: await p3Response(
+          await router(p3Request('/api/schedules', 'GET')),
+        ),
+        get: await p3Response(
+          await router(p3Request(`/api/schedules/${P3_ID}`, 'GET')),
+        ),
+        history: await p3Response(
+          await router(p3Request(`/api/schedules/${P3_ID}/triggers`, 'GET')),
+        ),
+      }
+    : undefined;
+  const readMetrics = measured.reset();
+  let positive: Awaited<ReturnType<typeof p3Response>> | undefined;
+  let positiveState: Awaited<ReturnType<typeof p3RawSchedules>> | undefined;
+  if (options.action === 'resume-race') {
+    positive = await p3Response(
+      await router(p3Request(`/api/schedules/${P3_ID}/resume`, 'POST')),
+    );
+    positiveState = await p3RawSchedules(evidence.database);
+  }
+  let settled: Awaited<ReturnType<typeof p3RawSchedules>> | undefined;
+  if (deferred && response.status === 202) {
+    if ((await adminFence.read()).state === 'draining')
+      await p3Transition(adminFence, 'open');
+    await p3Activate(adminFence);
+    await p3Transition(adminFence, 'draining');
+    await store.recordTrigger({
+      id: 'p3-trigger-000',
+      scheduleId: P3_ID,
+      runId: 'p3-prior-0',
+      scheduledFireAt: NOW,
+      actualFireAt: NOW + 1,
+      outcome: 'published',
+    });
+    settled = await p3RawSchedules(evidence.database);
+  }
+  return {
+    operation,
+    quiescent: true,
+    response,
+    gateHits: gate.hits,
+    finalBatches,
+    before,
+    intervened,
+    after,
+    reads,
+    positive,
+    positiveState,
+    settled,
+    audit,
+    fenceBeforeRelease,
+    fenceAfter: await adminFence.read(),
+    bodyBytes: rawBody === undefined ? 0 : encoder.encode(rawBody).length,
+    metrics: {
+      setup: setupMetrics,
+      mutation: mutationMetrics,
+      reads: readMetrics,
+      settlement: measured.metrics,
+      administration: administration.metrics,
+      evidence: evidence.metrics,
+    },
+  };
+}
+
+async function p3RawRuns(db: D1Database) {
+  const [snapshots, keys, owners] = await Promise.all([
+    db
+      .prepare(`SELECT * FROM ${P3_SNAPSHOTS} ORDER BY workflow_name, run_id`)
+      .all(),
+    db.prepare(`SELECT * FROM ${START_IDEMPOTENCY_TABLE} ORDER BY key`).all(),
+    db
+      .prepare(
+        `SELECT * FROM ${RESOURCE_OWNERSHIP_TABLE} ORDER BY resource_kind, resource_id`,
+      )
+      .all(),
+  ]);
+  return {
+    snapshots: snapshots.results,
+    keys: keys.results,
+    owners: owners.results,
+  };
+}
+
+async function p3RawFence(db: D1Database) {
+  const [rows, schema] = await Promise.all([
+    db.prepare(`SELECT * FROM ${EXECUTION_FENCE_TABLE} ORDER BY id`).all(),
+    db.prepare(`PRAGMA table_xinfo(${EXECUTION_FENCE_TABLE})`).all(),
+  ]);
+  return { rows: rows.results, schema: schema.results };
+}
+
+async function p3RunProbe(db: D1Database, url: URL) {
+  const options = p3Options(url);
+  const structural = url.searchParams.has('structure');
+  const structure = p3Choice(
+    url.searchParams,
+    'structure',
+    ['none', 'schema-extension', 'null-singleton'],
+    'none',
+  );
+  const proof = url.searchParams.get('proof') === 'true';
+  const loseResponse = url.searchParams.get('loss') === 'true';
+  const advanceAfterAdmission =
+    url.searchParams.get('afterAdmission') === 'advance';
+  if (structural && options.phase !== 'final')
+    throw new Error(
+      'P3 structural fixture requires the final Runtime boundary',
+    );
+  const gate = p3Gate();
+  let armed = false;
+  let initialBatches = 0;
+  let responseLosses = 0;
+  let initialBatchRows: number[] | undefined;
+  const isInitialBatch = (statements: P3Statement[]) =>
+    statements.some(
+      ({ sql }) =>
+        sql.includes(`INSERT INTO "${P3_SNAPSHOTS}"`) &&
+        sql.includes(EXECUTION_FENCE_TABLE),
+    );
+  const measured = p3Database(db, {
+    beforeBatch: async (statements) => {
+      if (!armed || !isInitialBatch(statements)) return;
+      initialBatches++;
+      if (options.phase === 'final' && gate.hits === 0) await gate.wait();
+    },
+    afterBatch: structural
+      ? async (statements, results) => {
+          if (!armed || !isInitialBatch(statements)) return;
+          initialBatchRows = results.map((result) => result.results.length);
+          if (advanceAfterAdmission) {
+            if ((await adminFence.read()).state !== 'open')
+              await p3Transition(adminFence, 'open');
+            await p3Activate(adminFence);
+          }
+          if (loseResponse && responseLosses === 0) {
+            responseLosses++;
+            throw new Error('P3 initial admission response was lost');
+          }
+        }
+      : undefined,
+  });
+  const administration = p3Database(db);
+  const evidence = p3Database(db);
+  const fence = new ExecutionFenceStore(measured.database);
+  const adminFence = new ExecutionFenceStore(administration.database);
+  await fence.seed('open');
+  const storage = createD1Storage({
+    binding: measured.database,
+    tablePrefix: P3_PREFIX,
+  });
+  await storage.init();
+  const reservations = new StartIdempotencyStore(measured.database);
+  await reservations.reserve({
+    key: 'p3-unrelated-key',
+    owner: P3_OWNER,
+    targetKind: 'workflow',
+    targetId: P3_WORKFLOW,
+    mintRunId: () => 'p3-unrelated',
+  });
+  await new D1ResourceOwnershipStore(measured.database).claim(
+    'run',
+    'p3-unrelated',
+    P3_OWNER,
+  );
+  let effects = 0;
+  const app = init(
+    { storage },
+    {
+      executionFence: fence,
+      startIdempotency: reservations,
+      requestContextForRun: async () => {
+        if (armed && options.phase === 'provider' && gate.hits === 0)
+          await gate.wait();
+        return {};
+      },
+    },
+  );
+  const schema = z.object({ value: z.string() });
+  const workflow = app
+    .createWorkflow({
+      id: P3_WORKFLOW,
+      inputSchema: schema,
+      outputSchema: schema,
+    })
+    .then(
+      app.createStep({
+        id: 'p3-count',
+        inputSchema: schema,
+        outputSchema: schema,
+        execute: async ({ inputData }) => {
+          effects++;
+          return inputData;
+        },
+      }),
+    )
+    .commit();
+  await app.runtime.status(P3_WORKFLOW, 'initialize');
+  if (options.action !== 'activate') {
+    await p3Activate(adminFence);
+    await p3Activate(adminFence);
+  }
+  if (options.closed) await p3Transition(adminFence, 'draining');
+  const keyed = url.searchParams.get('keyed') === 'true' || proof;
+  if (proof) {
+    const reading = await adminFence.read();
+    await adminFence.transition({
+      expected: reading.state,
+      next: 'proof-only',
+      proofKey: 'p3-key',
+      expectedMutationEpoch: reading.mutationEpoch,
+      expectedRevision: reading.transitionRevision,
+    });
+  }
+  const resolver = p3Resolver(measured.database, options.epoch);
+  let runtimeOptions: StartRunOptions | undefined;
+  let capturedEpoch: number | undefined;
+  const router = createRunRouter({
+    resolve: resolver.resolve,
+    workflows: [
+      {
+        id: P3_WORKFLOW,
+        title: 'P3 counted workflow',
+        description: 'Local epoch acceptance',
+        sampleInput: { value: 'original' },
+      },
+    ],
+    startIdempotency: {
+      store: reservations,
+      executionFence: fence,
+      live: async (workflowId, runId) =>
+        app.runtime.isRunActive(workflowId, runId),
+      persistedStart: async (workflowId, runId) => {
+        const state = await app.runtime.authoritativeStartState(
+          workflowId,
+          runId,
+        );
+        if (!state) return undefined;
+        const identity = state.provenance.startIdentity;
+        if (!identity)
+          throw new Error('P3 stored start lacks its original identity');
+        const execution = { ...state.execution, ...identity };
+        return state.kind === 'initial'
+          ? { kind: 'initial', execution }
+          : { kind: 'result', execution, value: state.summary };
+      },
+    },
+    beforeStart: async () => {
+      if (options.phase === 'auth') await gate.wait();
+    },
+    start: (input) => {
+      if (input.workflowId !== workflow.id || input.runId !== 'p3-run')
+        throw new Error('P3 Runtime start tuple changed');
+      capturedEpoch = input.mutationEpoch;
+      runtimeOptions = {
+        runId: input.runId,
+        inputData: input.inputData,
+        requestedBy: input.principal.id,
+        requestedByKind: input.principal.kind,
+        mutationEpoch: input.mutationEpoch,
+        startReservation: input.startReservation,
+        idempotencyKey: input.idempotencyKey,
+      };
+      return app.runtime.start(input.workflowId, runtimeOptions);
+    },
+    status: async (workflowId, runId) =>
+      (await app.runtime.status(workflowId, runId)) ?? undefined,
+    resume: async () => {
+      throw new Error('P3 counted workflow cannot suspend');
+    },
+  });
+  const before = await p3RawRuns(evidence.database);
+  const fenceStructureBefore = structural
+    ? await p3RawFence(evidence.database)
+    : undefined;
+  const setupMetrics = measured.reset();
+  let fenceBeforeRelease = await adminFence.read();
+  let intervened = before;
+  let fenceStructureIntervened = fenceStructureBefore;
+  armed = true;
+  const intervene = async () => {
+    if (options.action === 'activate' || options.action === 'advance')
+      await p3Activate(adminFence);
+    if (options.action === 'cycle') {
+      await p3Transition(adminFence, 'draining');
+      await p3Transition(adminFence, 'open');
+    }
+    if (options.action === 'capture') {
+      resolver.replace();
+      if (runtimeOptions)
+        Object.assign(runtimeOptions, {
+          mutationEpoch: 3,
+          requestedBy: 'replacement',
+          inputData: { value: 'replacement' },
+        });
+    }
+    fenceBeforeRelease = await adminFence.read();
+    if (structure === 'schema-extension') {
+      await administration.database
+        .prepare(
+          `ALTER TABLE ${EXECUTION_FENCE_TABLE} ADD COLUMN p3_shape TEXT`,
+        )
+        .run();
+    }
+    if (structure === 'null-singleton') {
+      await administration.database
+        .prepare(
+          `INSERT INTO ${EXECUTION_FENCE_TABLE} (id, state, updated_at) VALUES (NULL, 'open', 0)`,
+        )
+        .run();
+    }
+    if (structural)
+      fenceStructureIntervened = await p3RawFence(evidence.database);
+    intervened = await p3RawRuns(evidence.database);
+  };
+  const body = {
+    workflowId: P3_WORKFLOW,
+    inputData: { value: 'original' },
+    ...(keyed ? { idempotencyKey: 'p3-key' } : {}),
+  };
+  const call = () => router(p3Request('/runs', 'POST', JSON.stringify(body)));
+  const response = await p3Response(
+    options.phase === 'none'
+      ? await call()
+      : await p3Held(gate, call, intervene),
+  );
+  armed = false;
+  const mutationMetrics = measured.reset();
+  const after = await p3RawRuns(evidence.database);
+  const effectsAfterRequest = effects;
+  const cachedAfterRequest = workflow.runs.has('p3-run');
+  const activeAfterRequest = app.runtime.isRunActive(P3_WORKFLOW, 'p3-run');
+  let positive: unknown;
+  if (response.status === 409 && !keyed && !structural) {
+    const current = await adminFence.read();
+    positive = await app.runtime.start(P3_WORKFLOW, {
+      runId: 'p3-run',
+      inputData: { value: 'positive' },
+      requestedBy: P3_OWNER.id,
+      requestedByKind: 'human',
+      mutationEpoch: current.mutationEpoch,
+    });
+  }
+  const positiveRows = await p3RawRuns(evidence.database);
+  const fenceStructureAfter = structural
+    ? await p3RawFence(evidence.database)
+    : undefined;
+  const finalFence = structure === 'none' ? await adminFence.read() : undefined;
+  const checkedRun = {
+    workflowId: workflow.id,
+    runId: runtimeOptions?.runId ?? 'p3-run',
+  };
+  if (checkedRun.workflowId !== P3_WORKFLOW || checkedRun.runId !== 'p3-run')
+    throw new Error('P3 Runtime quiescence tuple changed');
+  if (app.runtime.isRunActive(checkedRun.workflowId, checkedRun.runId))
+    throw new Error('P3 Runtime remains active after its response');
+  return {
+    quiescent: true,
+    checkedRun,
+    response,
+    capturedEpoch: capturedEpoch ?? null,
+    gateHits: gate.hits,
+    initialBatches,
+    ...(structural
+      ? {
+          structural: {
+            fixture: structure,
+            proof,
+            responseLosses,
+            initialBatchRows,
+            before: fenceStructureBefore,
+            intervened: fenceStructureIntervened,
+            after: fenceStructureAfter,
+          },
+        }
+      : {}),
+    before,
+    intervened,
+    after,
+    effectsAfterRequest,
+    effects,
+    cachedAfterRequest,
+    activeAfterRequest,
+    positive,
+    positiveRows,
+    fenceBeforeRelease,
+    fenceAfter: finalFence,
+    metrics: {
+      setup: setupMetrics,
+      mutation: mutationMetrics,
+      positive: measured.metrics,
+      administration: administration.metrics,
+      evidence: evidence.metrics,
+    },
+  };
+}
+
+async function p3CasLossProbe(db: D1Database) {
+  let armed = false;
+  let losses = 0;
+  const measured = p3Database(db, {
+    afterStatement: (sql) => {
+      if (
+        armed &&
+        losses === 0 &&
+        sql.trimStart().startsWith(`UPDATE ${EXECUTION_FENCE_TABLE}\n`)
+      ) {
+        losses++;
+        throw new Error('P3 lost committed CAS response');
+      }
+    },
+  });
+  const fence = new ExecutionFenceStore(measured.database);
+  const independent = new ExecutionFenceStore(db);
+  await fence.seed('open');
+  const before = await fence.read();
+  const request = {
+    expected: 'open' as const,
+    next: 'draining' as const,
+    expectedMutationEpoch: before.mutationEpoch,
+    expectedRevision: before.transitionRevision,
+    advanceMutationEpoch: true,
+  };
+  armed = true;
+  let firstError: string | undefined;
+  try {
+    await fence.transition(request);
+  } catch (error) {
+    firstError = String(error);
+  }
+  const afterCommit = await independent.read();
+  const rawAfterCommit = (
+    await db.prepare(`SELECT * FROM ${EXECUTION_FENCE_TABLE}`).all()
+  ).results;
+  const retry = await fence.transition(request);
+  const rawAfterRetry = (
+    await db.prepare(`SELECT * FROM ${EXECUTION_FENCE_TABLE}`).all()
+  ).results;
+  let conflict: unknown;
+  try {
+    await fence.transition({ ...request, advanceMutationEpoch: false });
+  } catch (error) {
+    conflict = (error as { reason?: unknown }).reason;
+  }
+  return {
+    quiescent: true,
+    losses,
+    firstError,
+    before,
+    afterCommit,
+    retry,
+    rawAfterCommit,
+    rawAfterRetry,
+    conflict,
+    metrics: measured.metrics,
+  };
+}
+
 const handler = {
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
@@ -2063,6 +3144,17 @@ const handler = {
         await seedDeploymentIdentity(env.DB, 'spike', 'open');
         return Response.json({ ok: true });
       }
+      if (path === '/p3-cleanup') return Response.json(await p3Cleanup(env.DB));
+      if (path === '/epoch-p3/isolation-missing-witness')
+        return Response.json({ metrics: { diagnostic: p3Metrics() } });
+      if (path === '/epoch-p3/schedule')
+        return Response.json(
+          await p3ScheduleProbe(env.DB, new URL(request.url)),
+        );
+      if (path === '/epoch-p3/run')
+        return Response.json(await p3RunProbe(env.DB, new URL(request.url)));
+      if (path === '/epoch-p3/cas-loss')
+        return Response.json(await p3CasLossProbe(env.DB));
       if (path.startsWith('/retention-e/')) {
         const [, , scenario, action] = path.split('/');
         return Response.json(

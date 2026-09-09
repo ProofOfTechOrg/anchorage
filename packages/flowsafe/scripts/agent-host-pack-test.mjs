@@ -274,6 +274,7 @@ import {
   type DurableObjectRunLifecycleHooks,
   type ExecutionFenceState,
   type ExecutionFenceWiring,
+  type MutationEpochContext,
   type RunTerminalErrorEnvelope,
   type RunRetentionCursor,
   type RunRetentionScanPosition,
@@ -314,6 +315,24 @@ import type {
   BackgroundTaskHost,
   BackgroundTaskReads,
 } from '@proofoftech/flowsafe/background-tasks';
+import {
+  createScheduleRouter,
+  createScheduleStorageDomains,
+  D1SchedulesStorage,
+  FENCED_SCHEDULE_STORAGE,
+  ScheduleMutationConflictError,
+  ScheduleMutationOutcomeUnknownError,
+  type AuthorizedSchedule,
+  type FencedScheduleMutationCapability,
+  type Schedule,
+  type ScheduleDatabase,
+  type ScheduleFacadeStore,
+  type ScheduleResumeMutation,
+  type ScheduleRouter,
+  type ScheduleRouterOptions,
+} from '@proofoftech/flowsafe/schedules';
+// @ts-expect-error internal context capture is not a schedules export
+import type { captureActorContext as ScheduleCapture } from '@proofoftech/flowsafe/schedules';
 
 const automation: AgentAutomationRule = {
   kind: 'system',
@@ -403,6 +422,77 @@ if (capability) {
   // @ts-expect-error callers cannot supply a replacement snapshot
   void capability.terminalizeInitialAdmission({ ...terminalRequest, failedSnapshot: {} });
 }
+declare const scheduleDatabase: ScheduleDatabase;
+declare const scheduleRow: Schedule;
+declare const authorizedSchedule: AuthorizedSchedule;
+declare const scheduleRouterOptions: Omit<ScheduleRouterOptions, 'store' | 'executionFence'>;
+const scheduleOwner = { kind: 'human', id: 'schedule-owner' } as const;
+const scheduleMutation: MutationEpochContext = { mutationEpoch: 1 };
+const scheduleResume: ScheduleResumeMutation = {
+  expectedCron: scheduleRow.cron,
+  expectedTimezone: undefined,
+  nextFireAt: scheduleRow.nextFireAt,
+};
+const scheduleStore = new D1SchedulesStorage(scheduleDatabase);
+void createScheduleStorageDomains(scheduleDatabase);
+void scheduleStore.createSchedule(scheduleRow);
+void scheduleStore.createSchedule(scheduleRow, scheduleMutation);
+void scheduleStore.createOwnedSchedule(authorizedSchedule, scheduleOwner, 10);
+void scheduleStore.createOwnedSchedule(authorizedSchedule, scheduleOwner, 10, scheduleMutation);
+void scheduleStore.updateSchedule(scheduleRow.id, { metadata: {} });
+void scheduleStore.updateSchedule(scheduleRow.id, { metadata: {} }, scheduleMutation);
+void scheduleStore.pauseSchedule(scheduleRow.id);
+void scheduleStore.pauseSchedule(scheduleRow.id, scheduleMutation);
+void scheduleStore.resumeSchedule(scheduleRow.id, scheduleResume);
+void scheduleStore.resumeSchedule(scheduleRow.id, scheduleResume, scheduleMutation);
+void scheduleStore.deleteSchedule(scheduleRow.id);
+void scheduleStore.deleteSchedule(scheduleRow.id, scheduleMutation);
+void scheduleStore.deleteOwnedSchedule(scheduleRow.id);
+void scheduleStore.deleteOwnedSchedule(scheduleRow.id, scheduleMutation);
+const scheduleCapability: FencedScheduleMutationCapability | undefined = scheduleStore[FENCED_SCHEDULE_STORAGE];
+if (scheduleCapability) {
+  void scheduleCapability.createOwnedSchedule(authorizedSchedule, scheduleOwner, 10, scheduleMutation);
+  void scheduleCapability.updateSchedule(scheduleRow.id, { metadata: {} }, scheduleMutation);
+  void scheduleCapability.pauseSchedule(scheduleRow.id, scheduleMutation);
+  void scheduleCapability.resumeSchedule(scheduleRow.id, scheduleResume, scheduleMutation);
+  void scheduleCapability.deleteOwnedSchedule(scheduleRow.id, scheduleMutation);
+  void scheduleCapability.observeScheduleMutation(scheduleRow.id, 'pause', scheduleMutation);
+  void scheduleCapability.observeScheduleMutation(scheduleRow.id, 'resume', scheduleMutation);
+  // @ts-expect-error owned creation requires the captured context argument
+  void scheduleCapability.createOwnedSchedule(authorizedSchedule, scheduleOwner, 10);
+  // @ts-expect-error update requires the captured context argument
+  void scheduleCapability.updateSchedule(scheduleRow.id, { metadata: {} });
+  // @ts-expect-error pause requires the captured context argument
+  void scheduleCapability.pauseSchedule(scheduleRow.id);
+  // @ts-expect-error resume requires the captured context argument
+  void scheduleCapability.resumeSchedule(scheduleRow.id, scheduleResume);
+  // @ts-expect-error deletion requires the captured context argument
+  void scheduleCapability.deleteOwnedSchedule(scheduleRow.id);
+  // @ts-expect-error observation requires the captured context argument
+  void scheduleCapability.observeScheduleMutation(scheduleRow.id, 'pause');
+  // @ts-expect-error observation cannot select an authoring operation
+  void scheduleCapability.observeScheduleMutation(scheduleRow.id, 'update', scheduleMutation);
+}
+// @ts-expect-error fixed pause accepts no caller patch
+void scheduleStore.pauseSchedule(scheduleRow.id, { status: 'paused' });
+// @ts-expect-error resume requires the observed cron
+void scheduleStore.resumeSchedule(scheduleRow.id, { expectedTimezone: undefined, nextFireAt: scheduleRow.nextFireAt });
+// @ts-expect-error an omitted expectedTimezone is not an undefined observation
+void scheduleStore.resumeSchedule(scheduleRow.id, { expectedCron: scheduleRow.cron, nextFireAt: scheduleRow.nextFireAt });
+// @ts-expect-error the epoch is numeric trusted context
+void scheduleStore.updateSchedule(scheduleRow.id, { metadata: {} }, { mutationEpoch: '1' });
+const legacyScheduleFacade: ScheduleFacadeStore = {
+  createOwnedSchedule: async () => scheduleRow,
+  getSchedule: async () => scheduleRow,
+  listSchedules: async () => [scheduleRow],
+  updateSchedule: async () => scheduleRow,
+  deleteOwnedSchedule: async () => 'deleted',
+  listTriggers: async () => [],
+};
+const legacyScheduleRouter: ScheduleRouter = createScheduleRouter({ ...scheduleRouterOptions, store: legacyScheduleFacade, executionFence: 'none' });
+void legacyScheduleRouter;
+void new ScheduleMutationConflictError('schedule-changed');
+void new ScheduleMutationOutcomeUnknownError({ cause: new Error('private cause') });
 void BREAKWATER_CONNECTOR_EXECUTION_KEY;
 void BREAKWATER_CONNECTOR_GRANTS_KEY;
 void connectorGrantsForLeg;
@@ -619,6 +709,7 @@ import * as backgroundTasks from '@proofoftech/flowsafe/background-tasks';
 import * as doRunner from '@proofoftech/flowsafe/do-runner';
 import * as hostKit from '@proofoftech/flowsafe/host-kit';
 import * as agentRunner from '@proofoftech/flowsafe/agent-runner';
+import * as schedules from '@proofoftech/flowsafe/schedules';
 import { Mastra } from '@mastra/core/mastra';
 import { InMemoryStore } from '@mastra/core/storage';
 import { createStep, createWorkflow } from '@mastra/core/workflows';
@@ -673,8 +764,13 @@ for (const name of ['claim', 'release', 'settleRun']) {
   assert.equal(name in doRunner.StartIdempotencyStore.prototype, false, name);
 }
 for (const api of [flowsafe, doRunner, hostKit]) assert.equal('rollbackFencedStart' in api, false);
-for (const api of [flowsafe, approvals, doRunner, hostKit, host, agentRunner]) {
-  for (const name of ['captureActorContext', 'captureAgentStartAuthority', 'captureStartRunOptions', 'startAuthorities', 'AgentStartAuthority']) {
+for (const api of [flowsafe, approvals, doRunner, hostKit, host, agentRunner, schedules]) {
+  for (const name of ['captureActorContext', 'captureAgentStartAuthority', 'captureStartRunOptions', 'startAuthorities', 'AgentStartAuthority', 'executionFenceAdmissionValues', 'captureExecutionFenceAdmissionSchema', 'executionFenceAdmissionSql']) {
+    assert.equal(name in api, false, name);
+  }
+}
+for (const api of [flowsafe, doRunner, hostKit]) {
+  for (const name of ['FENCED_SCHEDULE_STORAGE', 'ScheduleMutationConflictError', 'ScheduleMutationOutcomeUnknownError']) {
     assert.equal(name in api, false, name);
   }
 }
@@ -689,6 +785,126 @@ const blocked = new doRunner.RunLifecycleBlockedError({ code: 'DISPUTED_SETTLEME
 assert.equal(blocked instanceof flowsafe.RunLifecycleBlockedError, true);
 assert.equal(blocked.name, 'RunLifecycleBlockedError');
 assert.equal(blocked.reason.code, 'DISPUTED_SETTLEMENT');
+assert.equal(typeof schedules.FENCED_SCHEDULE_STORAGE, 'symbol');
+assert.equal(typeof schedules.ScheduleMutationConflictError, 'function');
+assert.equal(typeof schedules.ScheduleMutationOutcomeUnknownError, 'function');
+const scheduleNative = sqliteUnitDatabase(openSqlite());
+const lostScheduleResponse = new Error('packed schedule batch response lost');
+let loseScheduleResponse = false;
+let scheduleBatches = 0;
+const scheduleBinding = {
+  prepare(sql) { return scheduleNative.prepare(sql); },
+  async batch(statements) {
+    scheduleBatches += 1;
+    const result = await scheduleNative.batch(statements);
+    if (loseScheduleResponse) {
+      loseScheduleResponse = false;
+      throw lostScheduleResponse;
+    }
+    return result;
+  },
+};
+const scheduleStore = new schedules.D1SchedulesStorage(scheduleBinding);
+const scheduleCapability = scheduleStore[schedules.FENCED_SCHEDULE_STORAGE];
+assert.ok(scheduleCapability);
+assert.equal(scheduleCapability.database, scheduleBinding);
+const scheduleStorage = doRunner.createD1Storage({
+  binding: scheduleBinding,
+  domains: schedules.createScheduleStorageDomains(scheduleBinding),
+});
+await scheduleStorage.init();
+const scheduleDomain = await scheduleStorage.getStore('schedules');
+assert.ok(scheduleDomain instanceof schedules.D1SchedulesStorage);
+const scheduleDomainCapability = scheduleDomain[schedules.FENCED_SCHEDULE_STORAGE];
+assert.ok(scheduleDomainCapability);
+assert.equal(scheduleDomainCapability.database, scheduleBinding);
+const scheduleRow = schedules.scheduleWithCreatorRole({
+  id: 'packed-schedule',
+  target: { type: 'workflow', workflowId: 'packed-schedule-workflow', inputData: {} },
+  cron: '*/5 * * * *', status: 'active',
+  nextFireAt: 1700000300000, createdAt: 1700000000000, updatedAt: 1700000000000,
+  metadata: { source: 'packed' },
+}, 'operator');
+const scheduleOwner = { kind: 'human', id: 'packed-schedule-owner' };
+const createdSchedule = await scheduleCapability.createOwnedSchedule(scheduleRow, scheduleOwner, 10, {});
+assert.equal(createdSchedule.id, scheduleRow.id);
+assert.equal(createdSchedule.status, 'active');
+assert.deepEqual(createdSchedule.metadata, scheduleRow.metadata);
+const storedScheduleOwner = await scheduleBinding.prepare("SELECT owner_kind, owner_id FROM flowsafe_resource_owners WHERE resource_kind = 'schedule' AND resource_id = ?")
+  .bind(scheduleRow.id).first();
+assert.equal(storedScheduleOwner.owner_kind, scheduleOwner.kind);
+assert.equal(storedScheduleOwner.owner_id, scheduleOwner.id);
+const scheduleFence = new doRunner.ExecutionFenceStore(scheduleBinding);
+const scheduleRouterOptions = {
+  store: scheduleStore, executionFence: scheduleFence,
+  resolve: async () => undefined,
+  targetPolicy: schedules.createScheduleTargetPolicy({ workflows: [{ id: 'packed-schedule-workflow' }], agents: [] }),
+  validateThreadTarget: async () => undefined,
+};
+assert.equal(typeof schedules.createScheduleRouter(scheduleRouterOptions), 'function');
+assert.throws(() => schedules.createScheduleRouter({
+  ...scheduleRouterOptions,
+  executionFence: new doRunner.ExecutionFenceStore(sqliteUnitDatabase(openSqlite())),
+}), /schedule storage binding disagrees with execution fence/);
+const legacyScheduleFacade = {
+  createOwnedSchedule: async (schedule) => schedule,
+  getSchedule: async () => null,
+  listSchedules: async () => [],
+  updateSchedule: async () => scheduleRow,
+  deleteOwnedSchedule: async () => 'deleted',
+  listTriggers: async () => [],
+};
+assert.equal(schedules.FENCED_SCHEDULE_STORAGE in legacyScheduleFacade, false);
+assert.equal(typeof schedules.createScheduleRouter({
+  ...scheduleRouterOptions, store: legacyScheduleFacade, executionFence: 'none',
+}), 'function');
+await scheduleFence.transition({
+  expected: 'open', next: 'draining', expectedMutationEpoch: 0,
+  expectedRevision: 0, advanceMutationEpoch: true,
+});
+await scheduleFence.transition({
+  expected: 'draining', next: 'open', expectedMutationEpoch: 1,
+  expectedRevision: 1,
+});
+await assert.rejects(() => scheduleStore.updateSchedule(scheduleRow.id, { metadata: { unauthorized: true } }), (error) => {
+  assert.ok(error instanceof doRunner.MutationEpochMismatchError);
+  assert.equal(error.status, 409);
+  assert.deepEqual(error.reason, { code: 'MUTATION_EPOCH_MISMATCH', classification: 'missing', mutationEpoch: 1 });
+  return true;
+});
+assert.deepEqual((await scheduleStore.getSchedule(scheduleRow.id)).metadata, scheduleRow.metadata);
+const scheduleMutation = { mutationEpoch: 1 };
+const pausedSchedule = await scheduleCapability.pauseSchedule(scheduleRow.id, scheduleMutation);
+await scheduleCapability.updateSchedule(scheduleRow.id, { cron: '*/10 * * * *' }, scheduleMutation);
+await assert.rejects(() => scheduleCapability.resumeSchedule(scheduleRow.id, {
+  expectedCron: pausedSchedule.cron, expectedTimezone: pausedSchedule.timezone,
+  nextFireAt: pausedSchedule.nextFireAt + 60000,
+}, scheduleMutation), (error) => {
+  assert.ok(error instanceof schedules.ScheduleMutationConflictError);
+  assert.equal(error.status, 409);
+  assert.deepEqual(error.reason, { code: 'SCHEDULE_MUTATION_CONFLICT', classification: 'schedule-changed' });
+  return true;
+});
+const conflictedSchedule = await scheduleStore.getSchedule(scheduleRow.id);
+assert.equal(conflictedSchedule.status, 'paused');
+assert.equal(conflictedSchedule.cron, '*/10 * * * *');
+assert.equal(conflictedSchedule.nextFireAt, pausedSchedule.nextFireAt);
+const committedScheduleMetadata = { source: 'committed-response-loss' };
+const batchesBeforeLoss = scheduleBatches;
+loseScheduleResponse = true;
+await assert.rejects(() => scheduleCapability.updateSchedule(scheduleRow.id, {
+  metadata: committedScheduleMetadata,
+}, scheduleMutation), (error) => {
+  assert.ok(error instanceof schedules.ScheduleMutationOutcomeUnknownError);
+  assert.equal(error.status, 503);
+  assert.deepEqual(error.reason, { code: 'SCHEDULE_MUTATION_OUTCOME_UNKNOWN' });
+  assert.equal(error.cause, lostScheduleResponse);
+  return true;
+});
+assert.equal(scheduleBatches, batchesBeforeLoss + 1);
+assert.equal(loseScheduleResponse, false);
+const committedSchedule = await scheduleBinding.prepare('SELECT metadata FROM mastra_schedules WHERE id = ?').bind(scheduleRow.id).first();
+assert.deepEqual(JSON.parse(committedSchedule.metadata), committedScheduleMetadata);
 const binding = sqliteUnitDatabase(openSqlite());
 const retentionBinding = sqliteUnitDatabase(openSqlite());
 await retentionBinding.prepare('CREATE TABLE mastra_workflow_snapshot (workflow_name TEXT NOT NULL, run_id TEXT NOT NULL, resourceId TEXT, snapshot TEXT NOT NULL, createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL, UNIQUE(workflow_name, run_id))').run();

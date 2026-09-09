@@ -600,6 +600,68 @@ export interface ExecutionFenceAdmissionObservation {
   readonly raw: DeploymentIdentityProtocolRow;
 }
 
+const FENCE_ADMISSION_FIELDS = [
+  'state',
+  'mutation_epoch',
+  'require_mutation_epoch',
+  'transition_revision',
+  'last_transition_request',
+  'proof_key',
+  'proof_run_id',
+  'proof_table_prefix',
+  'proof_workflow_id',
+  'proof_start_token',
+] as const;
+
+/** @internal */
+export function executionFenceAdmissionValues(
+  observation: ExecutionFenceAdmissionObservation,
+): readonly unknown[] {
+  const values = FENCE_ADMISSION_FIELDS.map((key) => observation.raw[key]);
+  for (const value of values.slice(4)) {
+    if (value !== null && typeof value !== 'string') {
+      throw new ExecutionFenceUnreadableError(
+        'execution fence semantic fields are not readable',
+      );
+    }
+  }
+  return Object.freeze(values);
+}
+
+/** @internal */
+export function executionFenceAdmissionSql(input: {
+  readonly callerEpoch: string;
+  readonly semantic: readonly string[];
+  readonly schema: string;
+  readonly statePredicate: string;
+}): string {
+  const { callerEpoch, semantic, schema, statePredicate } = input;
+  if (semantic.length !== FENCE_ADMISSION_FIELDS.length) {
+    throw new Error('execution fence admission parameter frame is invalid');
+  }
+  const nullable = FENCE_ADMISSION_FIELDS.slice(4)
+    .map((key, index) => {
+      const parameter = semantic[index + 4];
+      return `typeof(f.${key}) IN ('null', 'text')
+      AND typeof(f.${key}) = typeof(${parameter})
+      AND f.${key} COLLATE BINARY IS ${parameter}`;
+    })
+    .join(' AND ');
+  return `(SELECT json_group_array(json_array(name, type, "notnull", dflt_value, pk, hidden))
+    FROM (SELECT name, type, "notnull", dflt_value, pk, hidden
+      FROM pragma_table_xinfo('${EXECUTION_FENCE_TABLE}') ORDER BY cid)) COLLATE BINARY = ${schema}
+    AND (SELECT COUNT(*) FROM ${EXECUTION_FENCE_TABLE}) = 1
+    AND EXISTS (SELECT 1 FROM ${EXECUTION_FENCE_TABLE} AS f
+      WHERE typeof(f.id) = 'text' AND f.id COLLATE BINARY = 'deployment'
+        AND typeof(f.state) = 'text' AND f.state COLLATE BINARY IS ${semantic[0]}
+        AND typeof(f.mutation_epoch) = 'integer' AND f.mutation_epoch IS ${semantic[1]}
+        AND typeof(f.require_mutation_epoch) = 'integer' AND f.require_mutation_epoch IS ${semantic[2]}
+        AND typeof(f.transition_revision) = 'integer' AND f.transition_revision IS ${semantic[3]}
+        AND ${nullable}
+        AND (f.require_mutation_epoch = 0 OR f.mutation_epoch = ${callerEpoch})
+        AND (${statePredicate}))`;
+}
+
 function isFenceCounter(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
@@ -752,6 +814,30 @@ export async function validateExecutionFenceAdmissionSchema(
   const columns = fenceResultRows(result);
   if ((await readExecutionFenceSchemaProtocol(async () => columns)) !== 7)
     throw new Error('initial admission requires the current fence schema');
+}
+
+/** @internal */
+export async function captureExecutionFenceAdmissionSchema(
+  result: unknown,
+): Promise<string> {
+  const rows = fenceResultRows(result).map((row) =>
+    Object.freeze(
+      Object.fromEntries(
+        Object.getOwnPropertyNames(row).map((key) => [key, row[key]]),
+      ),
+    ),
+  );
+  await validateExecutionFenceAdmissionSchema({ results: rows });
+  return JSON.stringify(
+    rows.map(({ name, type, notnull, dflt_value, pk, hidden }) => [
+      name,
+      type,
+      notnull,
+      dflt_value,
+      pk,
+      hidden,
+    ]),
+  );
 }
 
 /**

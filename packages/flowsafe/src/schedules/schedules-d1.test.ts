@@ -3,13 +3,29 @@
 // harness owns real-D1 CAS, concurrency, ownership, and rollback evidence.
 
 import type { Schedule } from '@mastra/core/storage';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
   D1ResourceOwnershipStore,
   type ResourceOwnershipDatabase,
 } from '../approval-api/index.js';
+import {
+  InvalidMutationEpochError,
+  type MutationEpochContext,
+  MutationEpochMismatchError,
+} from '../do-runner/execution-admission.js';
+import {
+  ExecutionFencedError,
+  type ExecutionFenceState,
+  ExecutionFenceStore,
+  ExecutionFenceUnreadableError,
+} from '../do-runner/execution-fence.js';
+import {
+  FENCED_SCHEDULE_STORAGE,
+  ScheduleMutationConflictError,
+  ScheduleMutationOutcomeUnknownError,
+} from './mutation-contract.js';
 import {
   D1SchedulesStorage,
   parseScheduleAgentDispatchReceipt,
@@ -43,6 +59,169 @@ function workflowSchedule(overrides: Partial<Schedule> = {}): Schedule {
     ...overrides,
   };
 }
+
+async function mutationFixture() {
+  const sqlite = openSqlite();
+  const native = sqliteUnitDatabase(sqlite) as ScheduleDatabase &
+    Required<Pick<ScheduleDatabase, 'batch'>>;
+  const hooks: {
+    beforeBatch?: () => void | Promise<void>;
+    afterBatch?: (results: unknown[]) => unknown[];
+  } = {};
+  const sql: string[] = [];
+  let batches = 0;
+  const binding: ScheduleDatabase = {
+    prepare(query) {
+      expect(this).toBe(binding);
+      sql.push(query);
+      return native.prepare(query);
+    },
+    async batch(statements) {
+      expect(this).toBe(binding);
+      batches += 1;
+      const before = hooks.beforeBatch;
+      hooks.beforeBatch = undefined;
+      await before?.();
+      const results = await native.batch(statements);
+      return hooks.afterBatch ? hooks.afterBatch(results) : results;
+    },
+  };
+  const store = new D1SchedulesStorage(binding);
+  const fence = new ExecutionFenceStore(binding);
+  await store.createOwnedSchedule(
+    scheduleWithCreatorRole(workflowSchedule(), 'operator'),
+    { kind: 'human', id: 'opal' },
+    100,
+  );
+  return {
+    sqlite,
+    store,
+    fence,
+    binding,
+    native,
+    hooks,
+    sql,
+    batches: () => batches,
+  };
+}
+
+type MutationFixture = Awaited<ReturnType<typeof mutationFixture>>;
+
+async function moveFence(
+  fence: ExecutionFenceStore,
+  next: ExecutionFenceState,
+  advanceMutationEpoch = false,
+) {
+  const current = await fence.read();
+  return fence.transition({
+    expected: current.state,
+    next,
+    expectedMutationEpoch: current.mutationEpoch,
+    expectedRevision: current.transitionRevision,
+    advanceMutationEpoch,
+    ...(next === 'proof-only' ? { proofKey: 'schedule-proof' } : {}),
+  });
+}
+
+async function activateFence(fence: ExecutionFenceStore) {
+  await moveFence(fence, 'draining', true);
+  await moveFence(fence, 'open');
+}
+
+function rawScheduleState(fixture: MutationFixture) {
+  return [
+    fixture.sqlite.prepare('SELECT * FROM mastra_schedules ORDER BY id').all(),
+    fixture.sqlite
+      .prepare('SELECT * FROM mastra_schedule_triggers ORDER BY id')
+      .all(),
+    fixture.sqlite
+      .prepare(
+        'SELECT * FROM flowsafe_resource_owners ORDER BY resource_kind, resource_id',
+      )
+      .all(),
+  ];
+}
+
+const mutationCases: Array<{
+  name: string;
+  operation: 'author' | 'drain';
+  run: (
+    fixture: MutationFixture,
+    context?: MutationEpochContext,
+  ) => Promise<unknown>;
+}> = [
+  {
+    name: 'create',
+    operation: 'author',
+    run: (f, context) =>
+      f.store.createSchedule(workflowSchedule({ id: 'created' }), context),
+  },
+  {
+    name: 'owned create',
+    operation: 'author',
+    run: (f, context) =>
+      f.store.createOwnedSchedule(
+        scheduleWithCreatorRole(
+          workflowSchedule({ id: 'created' }),
+          'operator',
+        ),
+        { kind: 'human', id: 'opal' },
+        100,
+        context,
+      ),
+  },
+  {
+    name: 'update',
+    operation: 'author',
+    run: (f, context) =>
+      f.store.updateSchedule(
+        'schedule_a',
+        { metadata: { changed: true } },
+        context,
+      ),
+  },
+  {
+    name: 'pause',
+    operation: 'drain',
+    run: (f, context) => f.store.pauseSchedule('schedule_a', context),
+  },
+  {
+    name: 'resume',
+    operation: 'author',
+    run: (f, context) =>
+      f.store.resumeSchedule(
+        'schedule_a',
+        {
+          expectedCron: '* * * * *',
+          expectedTimezone: undefined,
+          nextFireAt: NOW + 60_000,
+        },
+        context,
+      ),
+  },
+  {
+    name: 'delete',
+    operation: 'drain',
+    run: (f, context) => f.store.deleteSchedule('schedule_a', context),
+  },
+  {
+    name: 'owned delete',
+    operation: 'drain',
+    run: (f, context) => f.store.deleteOwnedSchedule('schedule_a', context),
+  },
+  {
+    name: 'pause observation',
+    operation: 'drain',
+    run: (f, context) =>
+      f.store.observeScheduleMutation('schedule_a', 'pause', context ?? {}),
+  },
+  {
+    name: 'resume observation',
+    operation: 'author',
+    run: (f, context) =>
+      f.store.observeScheduleMutation('schedule_a', 'resume', context ?? {}),
+  },
+];
 
 describe('schedule agent dispatch receipts', () => {
   it.each([
@@ -223,7 +402,12 @@ describe('D1SchedulesStorage', () => {
 
     await expect(
       store.createOwnedSchedule(schedule, { kind: 'human', id: 'opal' }, 100),
-    ).rejects.toThrow(/injected owner failure/);
+    ).rejects.toMatchObject({
+      name: 'ScheduleMutationOutcomeUnknownError',
+      cause: expect.objectContaining({
+        message: expect.stringMatching(/injected owner failure/),
+      }),
+    });
 
     expect(await store.getSchedule(schedule.id)).toBeNull();
   });
@@ -828,9 +1012,12 @@ describe('D1SchedulesStorage', () => {
       WHEN OLD.resource_kind = 'schedule'
       BEGIN SELECT RAISE(ABORT, 'injected owner delete failure'); END`);
 
-    await expect(store.deleteOwnedSchedule(schedule.id)).rejects.toThrow(
-      /injected owner delete failure/,
-    );
+    await expect(store.deleteOwnedSchedule(schedule.id)).rejects.toMatchObject({
+      name: 'ScheduleMutationOutcomeUnknownError',
+      cause: expect.objectContaining({
+        message: expect.stringMatching(/injected owner delete failure/),
+      }),
+    });
 
     expect(await store.getSchedule(schedule.id)).toEqual(schedule);
     expect(await resources.owner('schedule', schedule.id)).toEqual(owner);
@@ -851,9 +1038,12 @@ describe('D1SchedulesStorage', () => {
       BEFORE DELETE ON mastra_schedules
       BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END`);
 
-    await expect(store.deleteSchedule('schedule_a')).rejects.toThrow(
-      /injected delete failure/,
-    );
+    await expect(store.deleteSchedule('schedule_a')).rejects.toMatchObject({
+      name: 'ScheduleMutationOutcomeUnknownError',
+      cause: expect.objectContaining({
+        message: expect.stringMatching(/injected delete failure/),
+      }),
+    });
     expect(await store.getSchedule('schedule_a')).not.toBeNull();
     expect(await store.listTriggers('schedule_a')).toHaveLength(1);
   });
@@ -947,5 +1137,839 @@ describe('D1SchedulesStorage', () => {
     // does not fire one last time; nothing advanced
     expect(claimed).toBe(false);
     expect((await store.getSchedule('schedule_a'))?.nextFireAt).toBe(NOW);
+  });
+});
+
+describe('schedule mutation epochs', () => {
+  for (const testCase of mutationCases) {
+    it(`${testCase.name} retains optional-epoch compatibility`, async () => {
+      const f = await mutationFixture();
+      await expect(testCase.run(f)).resolves.not.toBeNull();
+    });
+
+    it(`${testCase.name} accepts the active epoch`, async () => {
+      const f = await mutationFixture();
+      await activateFence(f.fence);
+      await expect(
+        testCase.run(f, { mutationEpoch: 1 }),
+      ).resolves.not.toBeNull();
+    });
+
+    it.each([
+      [undefined, 'missing'],
+      [0, 'stale'],
+      [2, 'future'],
+    ] as const)(`${testCase.name} refuses %s with %s classification`, async (mutationEpoch, classification) => {
+      const f = await mutationFixture();
+      await activateFence(f.fence);
+      const before = rawScheduleState(f);
+      await expect(testCase.run(f, { mutationEpoch })).rejects.toMatchObject({
+        status: 409,
+        reason: {
+          code: 'MUTATION_EPOCH_MISMATCH',
+          classification,
+          mutationEpoch: 1,
+        },
+      });
+      expect(rawScheduleState(f)).toEqual(before);
+    });
+
+    it.each([
+      -1,
+      0.5,
+      Number.NaN,
+      Infinity,
+      '1',
+      null,
+    ])(`${testCase.name} rejects malformed epoch %s before SQL`, async (mutationEpoch) => {
+      const f = await mutationFixture();
+      f.sql.length = 0;
+      await expect(
+        testCase.run(f, { mutationEpoch: mutationEpoch as number }),
+      ).rejects.toBeInstanceOf(InvalidMutationEpochError);
+      expect(f.sql).toEqual([]);
+    });
+
+    it(`${testCase.name} rejects a held legacy caller after activation and reopen`, async () => {
+      const f = await mutationFixture();
+      const before = rawScheduleState(f);
+      f.hooks.beforeBatch = () => activateFence(f.fence);
+      await expect(testCase.run(f)).rejects.toBeInstanceOf(
+        MutationEpochMismatchError,
+      );
+      expect(rawScheduleState(f)).toEqual(before);
+    });
+
+    it(`${testCase.name} rejects an unchanged epoch after the observed frame changes`, async () => {
+      const f = await mutationFixture();
+      await activateFence(f.fence);
+      const before = rawScheduleState(f);
+      f.hooks.beforeBatch = async () => {
+        await moveFence(f.fence, 'draining');
+        await moveFence(f.fence, 'open');
+      };
+      await expect(testCase.run(f, { mutationEpoch: 1 })).rejects.toMatchObject(
+        {
+          reason: {
+            code: 'SCHEDULE_MUTATION_CONFLICT',
+            classification: 'fence-changed',
+          },
+        },
+      );
+      expect(rawScheduleState(f)).toEqual(before);
+    });
+
+    for (const state of [
+      'draining',
+      'migration-locked',
+      'proof-only',
+    ] as const) {
+      it(`${testCase.name} applies its state policy in ${state}`, async () => {
+        const f = await mutationFixture();
+        await activateFence(f.fence);
+        await moveFence(f.fence, state);
+        const before = rawScheduleState(f);
+        if (testCase.operation === 'author') {
+          await expect(
+            testCase.run(f, { mutationEpoch: 1 }),
+          ).rejects.toBeInstanceOf(ExecutionFencedError);
+          expect(rawScheduleState(f)).toEqual(before);
+        } else {
+          await expect(
+            testCase.run(f, { mutationEpoch: 1 }),
+          ).resolves.not.toBeNull();
+        }
+      });
+    }
+  }
+
+  it('generic paused-status update remains authoring', async () => {
+    const f = await mutationFixture();
+    await activateFence(f.fence);
+    await moveFence(f.fence, 'draining');
+    const before = rawScheduleState(f);
+    await expect(
+      f.store.updateSchedule(
+        'schedule_a',
+        { status: 'paused' },
+        { mutationEpoch: 1 },
+      ),
+    ).rejects.toBeInstanceOf(ExecutionFencedError);
+    expect(rawScheduleState(f)).toEqual(before);
+  });
+
+  it.each([
+    'create',
+    'update',
+    'delete',
+    'pause observation',
+  ])('a %s final write refuses missing modern singleton state', async (name) => {
+    const f = await mutationFixture();
+    const before = rawScheduleState(f);
+    f.hooks.beforeBatch = () =>
+      f.sqlite.exec('DELETE FROM flowsafe_execution_fence');
+    const testCase = mutationCases.find((entry) => entry.name === name);
+    expect(testCase).toBeDefined();
+    if (!testCase) throw new Error('mutation fixture is missing');
+    await expect(testCase.run(f)).rejects.toBeInstanceOf(
+      ExecutionFenceUnreadableError,
+    );
+    expect(rawScheduleState(f)).toEqual(before);
+  });
+
+  it.each([
+    [
+      'extra schema column',
+      'ALTER TABLE flowsafe_execution_fence ADD COLUMN unrelated TEXT',
+    ],
+    [
+      'counter type',
+      "PRAGMA ignore_check_constraints=ON; UPDATE flowsafe_execution_fence SET mutation_epoch=x'30'",
+    ],
+    [
+      'receipt mismatch',
+      "UPDATE flowsafe_execution_fence SET last_transition_request='[]'",
+    ],
+    [
+      'proof binding type',
+      "UPDATE flowsafe_execution_fence SET proof_key=x'4142'",
+    ],
+    [
+      'singleton identity case',
+      "PRAGMA ignore_check_constraints=ON; UPDATE flowsafe_execution_fence SET id='DEPLOYMENT'",
+    ],
+    [
+      'extra singleton',
+      "PRAGMA ignore_check_constraints=ON; INSERT INTO flowsafe_execution_fence SELECT 'extra',state,proof_key,proof_run_id,updated_at,last_transition_request,transition_revision,mutation_epoch,require_mutation_epoch,proof_table_prefix,proof_workflow_id,proof_start_token FROM flowsafe_execution_fence",
+    ],
+  ])('refuses %s introduced at the final batch', async (_name, sql) => {
+    const f = await mutationFixture();
+    const before = rawScheduleState(f);
+    f.hooks.beforeBatch = () => f.sqlite.exec(sql);
+    await expect(
+      f.store.deleteOwnedSchedule('schedule_a'),
+    ).rejects.toBeInstanceOf(ExecutionFenceUnreadableError);
+    expect(rawScheduleState(f)).toEqual(before);
+  });
+
+  it('refuses unsupported nullable semantic bindings before preparing a mutation', async () => {
+    const f = await mutationFixture();
+    f.sqlite.exec("UPDATE flowsafe_execution_fence SET proof_key=x'4142'");
+    f.sql.length = 0;
+    await expect(f.store.pauseSchedule('schedule_a')).rejects.toBeInstanceOf(
+      ExecutionFenceUnreadableError,
+    );
+    expect(f.sql.some((sql) => /UPDATE mastra_schedules/.test(sql))).toBe(
+      false,
+    );
+  });
+
+  it('compares semantic strings with binary equality', async () => {
+    const f = await mutationFixture();
+    f.sqlite.exec("UPDATE flowsafe_execution_fence SET proof_key='ProofKey'");
+    const before = rawScheduleState(f);
+    f.hooks.beforeBatch = () =>
+      f.sqlite.exec("UPDATE flowsafe_execution_fence SET proof_key='proofkey'");
+    await expect(f.store.pauseSchedule('schedule_a')).rejects.toBeInstanceOf(
+      ScheduleMutationConflictError,
+    );
+    expect(rawScheduleState(f)).toEqual(before);
+  });
+
+  it('timestamp-only fence changes do not invalidate the semantic frame', async () => {
+    const f = await mutationFixture();
+    f.hooks.beforeBatch = () =>
+      f.sqlite.exec(
+        'UPDATE flowsafe_execution_fence SET updated_at=updated_at+1',
+      );
+    await expect(f.store.pauseSchedule('schedule_a')).resolves.toMatchObject({
+      status: 'paused',
+    });
+  });
+});
+
+describe('schedule authoring capture and observations', () => {
+  it('captures epoch, row JSON, owner getters and batch receiver before waits', async () => {
+    const f = await mutationFixture();
+    const schedule = scheduleWithCreatorRole(
+      workflowSchedule({ id: 'captured' }),
+      'operator',
+    );
+    const epoch = vi.fn(() => 0);
+    const ownerKind = vi.fn(() => 'human' as const);
+    const ownerId = vi.fn(() => 'opal');
+    const owner = {
+      get kind() {
+        return ownerKind();
+      },
+      get id() {
+        return ownerId();
+      },
+    };
+    f.hooks.beforeBatch = () => {
+      schedule.id = 'changed';
+      schedule.target = { type: 'workflow', workflowId: 'changed' };
+      schedule.metadata = { changed: true };
+      ownerId.mockReturnValue('changed');
+      epoch.mockReturnValue(100);
+    };
+    f.binding.batch = () => {
+      throw new Error('replacement receiver');
+    };
+    const result = await f.store.createOwnedSchedule(schedule, owner, 100, {
+      get mutationEpoch() {
+        return epoch();
+      },
+    });
+    expect(result).toMatchObject({
+      id: 'captured',
+      target: { workflowId: 'wf' },
+      metadata: {},
+    });
+    expect(epoch).toHaveBeenCalledTimes(1);
+    expect(ownerKind).toHaveBeenCalledTimes(1);
+    expect(ownerId).toHaveBeenCalledTimes(1);
+    expect(
+      f.sqlite
+        .prepare(
+          "SELECT owner_id FROM flowsafe_resource_owners WHERE resource_id='captured'",
+        )
+        .get(),
+    ).toEqual({ owner_id: 'opal' });
+  });
+
+  it('captures a mutable context even when a later getter would supply the active epoch', async () => {
+    const f = await mutationFixture();
+    const epoch = vi.fn().mockReturnValueOnce(0).mockReturnValue(1);
+    const before = rawScheduleState(f);
+    f.hooks.beforeBatch = () => activateFence(f.fence);
+    await expect(
+      f.store.pauseSchedule('schedule_a', {
+        get mutationEpoch() {
+          return epoch();
+        },
+      }),
+    ).rejects.toMatchObject({ reason: { classification: 'stale' } });
+    expect(epoch).toHaveBeenCalledTimes(1);
+    expect(rawScheduleState(f)).toEqual(before);
+  });
+
+  it('captures update fields once and serializes nested metadata before waiting', async () => {
+    const f = await mutationFixture();
+    const metadata = { note: 'original' };
+    const readMetadata = vi.fn(() => metadata);
+    f.hooks.beforeBatch = () => {
+      metadata.note = 'changed';
+    };
+    const updated = await f.store.updateSchedule('schedule_a', {
+      get metadata() {
+        return readMetadata();
+      },
+    });
+    expect(updated.metadata).toEqual({ note: 'original' });
+    expect(readMetadata).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["cron='*/5 * * * *'", 'cron'],
+    ["timezone='UTC'", 'timezone'],
+  ])('resume refuses a concurrent %s change', async (sql) => {
+    const f = await mutationFixture();
+    await f.store.pauseSchedule('schedule_a');
+    f.hooks.beforeBatch = () =>
+      f.sqlite.exec(`UPDATE mastra_schedules SET ${sql}`);
+    await expect(
+      f.store.resumeSchedule('schedule_a', {
+        expectedCron: '* * * * *',
+        expectedTimezone: undefined,
+        nextFireAt: NOW + 60_000,
+      }),
+    ).rejects.toMatchObject({
+      reason: {
+        code: 'SCHEDULE_MUTATION_CONFLICT',
+        classification: 'schedule-changed',
+      },
+    });
+    expect(await f.store.getSchedule('schedule_a')).toMatchObject({
+      status: 'paused',
+      nextFireAt: NOW,
+    });
+  });
+
+  it('resume captures its expected timezone and computed timestamp before waiting', async () => {
+    const f = await mutationFixture();
+    await f.store.pauseSchedule('schedule_a');
+    const mutation = {
+      expectedCron: '* * * * *',
+      expectedTimezone: undefined as string | undefined,
+      nextFireAt: NOW + 60_000,
+    };
+    f.hooks.beforeBatch = () => {
+      mutation.expectedTimezone = 'UTC';
+      mutation.nextFireAt = NOW + 120_000;
+    };
+    await expect(
+      f.store.resumeSchedule('schedule_a', mutation),
+    ).resolves.toMatchObject({ status: 'active', nextFireAt: NOW + 60_000 });
+  });
+
+  it('no-op observations preserve row timestamps and return current status', async () => {
+    const f = await mutationFixture();
+    const before = rawScheduleState(f);
+    await expect(
+      f.store.observeScheduleMutation('schedule_a', 'resume', {}),
+    ).resolves.toMatchObject({ status: 'active', updatedAt: NOW });
+    expect(rawScheduleState(f)).toEqual(before);
+    await f.store.pauseSchedule('schedule_a');
+    const paused = rawScheduleState(f);
+    await expect(
+      f.store.observeScheduleMutation('schedule_a', 'pause', {}),
+    ).resolves.toMatchObject({ status: 'paused' });
+    expect(rawScheduleState(f)).toEqual(paused);
+    await expect(
+      f.store.observeScheduleMutation('absent', 'pause', {}),
+    ).resolves.toBeNull();
+  });
+
+  it('returns the post-race status from a guarded observation', async () => {
+    const f = await mutationFixture();
+    f.hooks.beforeBatch = () =>
+      f.sqlite.exec("UPDATE mastra_schedules SET status='paused'");
+    await expect(
+      f.store.observeScheduleMutation('schedule_a', 'resume', {}),
+    ).resolves.toMatchObject({ status: 'paused' });
+  });
+
+  it('rejects an invalid observer selector before SQL', async () => {
+    const f = await mutationFixture();
+    f.sql.length = 0;
+    await expect(
+      f.store.observeScheduleMutation('schedule_a', 'delete' as 'pause', {}),
+    ).rejects.toThrow('observation is invalid');
+    expect(f.sql).toEqual([]);
+  });
+});
+
+describe('schedule transaction evidence', () => {
+  it.each([
+    [
+      'missing batch slot',
+      (results: unknown[]) => {
+        delete results[1];
+      },
+    ],
+    [
+      'extra batch slot',
+      (results: unknown[]) => {
+        results.push(results[0]);
+      },
+    ],
+    [
+      'missing RETURNING',
+      (results: unknown[]) => {
+        delete (results[3] as Record<string, unknown>).results;
+      },
+    ],
+    [
+      'sparse RETURNING',
+      (results: unknown[]) => {
+        (results[3] as Record<string, unknown>).results = new Array(1);
+      },
+    ],
+    [
+      'false success',
+      (results: unknown[]) => {
+        (results[3] as Record<string, unknown>).success = false;
+      },
+    ],
+    [
+      'null metadata',
+      (results: unknown[]) => {
+        (results[3] as Record<string, unknown>).meta = null;
+      },
+    ],
+    [
+      'contradictory changes',
+      (results: unknown[]) => {
+        (results[3] as Record<string, unknown>).meta = { changes: 0 };
+      },
+    ],
+    [
+      'undefined changes',
+      (results: unknown[]) => {
+        (results[3] as Record<string, unknown>).meta = { changes: undefined };
+      },
+    ],
+    [
+      'missing owner witness',
+      (results: unknown[]) => {
+        results[4] = { results: [], meta: { changes: 0 } };
+      },
+    ],
+  ] as const)('classifies %s as unknown without compensating', async (_name, corrupt) => {
+    const f = await mutationFixture();
+    f.hooks.afterBatch = (results) => {
+      corrupt(results);
+      return results;
+    };
+    const calls = f.batches();
+    await expect(
+      f.store.createOwnedSchedule(
+        scheduleWithCreatorRole(
+          workflowSchedule({ id: 'uncertain' }),
+          'operator',
+        ),
+        { kind: 'human', id: 'opal' },
+        100,
+      ),
+    ).rejects.toBeInstanceOf(ScheduleMutationOutcomeUnknownError);
+    expect(f.batches()).toBe(calls + 1);
+    expect(await f.store.getSchedule('uncertain')).not.toBeNull();
+    expect(
+      f.sqlite
+        .prepare(
+          "SELECT owner_id FROM flowsafe_resource_owners WHERE resource_id='uncertain'",
+        )
+        .get(),
+    ).toEqual({ owner_id: 'opal' });
+  });
+
+  it('accepts complete bounded RETURNING without metadata and ignores SELECT change counts', async () => {
+    const f = await mutationFixture();
+    f.hooks.afterBatch = (results) => {
+      delete (results[3] as Record<string, unknown>).meta;
+      (results[2] as Record<string, unknown>).meta = { changes: 987 };
+      return results;
+    };
+    await expect(f.store.pauseSchedule('schedule_a')).resolves.toMatchObject({
+      status: 'paused',
+    });
+  });
+
+  it.each([
+    'before',
+    'after',
+  ] as const)('does not retry a thrown %s-batch response', async (when) => {
+    const f = await mutationFixture();
+    const cause = new Error('transport lost');
+    if (when === 'before')
+      f.hooks.beforeBatch = () => {
+        throw cause;
+      };
+    else
+      f.hooks.afterBatch = () => {
+        throw cause;
+      };
+    const calls = f.batches();
+    await expect(
+      f.store.createSchedule(workflowSchedule({ id: 'uncertain' })),
+    ).rejects.toMatchObject({
+      name: 'ScheduleMutationOutcomeUnknownError',
+      cause,
+    });
+    expect(f.batches()).toBe(calls + 1);
+    expect(await f.store.getSchedule('uncertain')).toEqual(
+      when === 'before' ? null : workflowSchedule({ id: 'uncertain' }),
+    );
+  });
+
+  it('malformed responses take precedence over a diagnosable fence refusal', async () => {
+    const f = await mutationFixture();
+    f.hooks.beforeBatch = () => activateFence(f.fence);
+    f.hooks.afterBatch = (results) => {
+      delete results[3];
+      return results;
+    };
+    await expect(f.store.pauseSchedule('schedule_a')).rejects.toBeInstanceOf(
+      ScheduleMutationOutcomeUnknownError,
+    );
+  });
+
+  it('a zero UPDATE cannot claim success from an unchanged row', async () => {
+    const f = await mutationFixture();
+    f.hooks.afterBatch = (results) => {
+      results[3] = { results: [], meta: { changes: 0 } };
+      return results;
+    };
+    await expect(
+      f.store.updateSchedule('schedule_a', { metadata: {} }),
+    ).rejects.toBeInstanceOf(ScheduleMutationOutcomeUnknownError);
+  });
+
+  it.each([
+    'update',
+    'observation',
+  ])('refuses matching truncated %s rows', async (operation) => {
+    const f = await mutationFixture();
+    f.hooks.afterBatch = (results) => {
+      for (const index of [2, 3]) {
+        const result = results[index] as { results: Record<string, unknown>[] };
+        const row = result.results[0];
+        if (!row) throw new Error('fixture row missing');
+        delete row.createdAt;
+      }
+      return results;
+    };
+    await expect(
+      operation === 'update'
+        ? f.store.updateSchedule('schedule_a', { metadata: {} })
+        : f.store.observeScheduleMutation('schedule_a', 'pause', {}),
+    ).rejects.toBeInstanceOf(ScheduleMutationOutcomeUnknownError);
+  });
+
+  it('preserves direct not-found errors after authoritative absence', async () => {
+    const f = await mutationFixture();
+    await expect(f.store.updateSchedule('absent', {})).rejects.toThrow(
+      'schedule absent not found',
+    );
+    await expect(f.store.pauseSchedule('absent')).rejects.toThrow(
+      'schedule absent not found',
+    );
+  });
+});
+
+describe('schedule deletion, preparation and compatibility', () => {
+  it('pending deletions consume the original deployment cap', async () => {
+    const f = await mutationFixture();
+    await f.store.recordTrigger({
+      id: 'deferred',
+      scheduleId: 'schedule_a',
+      runId: 'run-a',
+      scheduledFireAt: NOW,
+      actualFireAt: NOW,
+      outcome: 'deferred',
+    });
+    await expect(f.store.deleteOwnedSchedule('schedule_a')).resolves.toBe(
+      'pending',
+    );
+    expect(await f.store.listSchedules()).toEqual([]);
+    await activateFence(f.fence);
+    await expect(
+      f.store.createOwnedSchedule(
+        scheduleWithCreatorRole(workflowSchedule({ id: 'capped' }), 'operator'),
+        { kind: 'human', id: 'opal' },
+        1,
+        { mutationEpoch: 1 },
+      ),
+    ).resolves.toBeNull();
+    expect(
+      f.sqlite
+        .prepare(
+          "SELECT COUNT(*) AS count FROM flowsafe_resource_owners WHERE resource_id='capped'",
+        )
+        .get(),
+    ).toEqual({ count: 0 });
+  });
+
+  it('a stale cap-zero create reports epoch refusal', async () => {
+    const f = await mutationFixture();
+    f.hooks.beforeBatch = () => activateFence(f.fence);
+    await expect(
+      f.store.createOwnedSchedule(
+        scheduleWithCreatorRole(workflowSchedule({ id: 'capped' }), 'operator'),
+        { kind: 'human', id: 'opal' },
+        0,
+      ),
+    ).rejects.toBeInstanceOf(MutationEpochMismatchError);
+  });
+
+  it('keeps admitted trigger settlement independent of later epoch and state', async () => {
+    const f = await mutationFixture();
+    const trigger = {
+      id: 'deferred',
+      scheduleId: 'schedule_a',
+      runId: 'run-a',
+      scheduledFireAt: NOW,
+      actualFireAt: NOW,
+      outcome: 'deferred' as const,
+    };
+    await f.store.recordTrigger(trigger);
+    await activateFence(f.fence);
+    await expect(
+      f.store.deleteOwnedSchedule('schedule_a', { mutationEpoch: 1 }),
+    ).resolves.toBe('pending');
+    const marker = f.sqlite
+      .prepare(
+        "SELECT deletionRequestedAt FROM mastra_schedules WHERE id='schedule_a'",
+      )
+      .get();
+    await expect(
+      f.store.deleteOwnedSchedule('schedule_a', { mutationEpoch: 1 }),
+    ).resolves.toBe('pending');
+    expect(
+      f.sqlite
+        .prepare(
+          "SELECT deletionRequestedAt FROM mastra_schedules WHERE id='schedule_a'",
+        )
+        .get(),
+    ).toEqual(marker);
+    await moveFence(f.fence, 'draining', true);
+    await f.store.recordTrigger({
+      ...trigger,
+      outcome: 'failed',
+      error: 'settled',
+    });
+    expect(rawScheduleState(f)).toEqual([[], [], []]);
+    await f.store.recordTrigger({ ...trigger, outcome: 'failed' });
+    expect(rawScheduleState(f)).toEqual([[], [], []]);
+  });
+
+  it('a held stale deletion preserves deferred triggers and owner bytes', async () => {
+    const f = await mutationFixture();
+    await f.store.recordTrigger({
+      id: 'deferred',
+      scheduleId: 'schedule_a',
+      runId: 'run-a',
+      scheduledFireAt: NOW,
+      actualFireAt: NOW,
+      outcome: 'deferred',
+      metadata: { opaque: 'retain' },
+    });
+    const before = rawScheduleState(f);
+    f.hooks.beforeBatch = () => activateFence(f.fence);
+    await expect(
+      f.store.deleteOwnedSchedule('schedule_a'),
+    ).rejects.toBeInstanceOf(MutationEpochMismatchError);
+    expect(rawScheduleState(f)).toEqual(before);
+  });
+
+  it('guards orphan cleanup independently when the first deletion UPDATE matches no schedule', async () => {
+    const f = await mutationFixture();
+    await f.store.recordTrigger({
+      id: 'orphan',
+      scheduleId: 'schedule_a',
+      runId: null,
+      scheduledFireAt: NOW,
+      actualFireAt: NOW,
+      outcome: 'deferred',
+    });
+    f.sqlite.exec('DELETE FROM mastra_schedules');
+    const before = rawScheduleState(f);
+    f.hooks.beforeBatch = () => activateFence(f.fence);
+    await expect(
+      f.store.deleteOwnedSchedule('schedule_a'),
+    ).rejects.toBeInstanceOf(MutationEpochMismatchError);
+    expect(rawScheduleState(f)).toEqual(before);
+    await expect(
+      f.store.deleteOwnedSchedule('schedule_a', { mutationEpoch: 1 }),
+    ).resolves.toBe('deleted');
+    expect(rawScheduleState(f)).toEqual([[], [], []]);
+  });
+
+  it('deletes populated history with bounded returned rows and strict trigger changes', async () => {
+    const f = await mutationFixture();
+    const insert = f.sqlite.prepare(
+      "INSERT INTO mastra_schedule_triggers (id,scheduleId,runId,scheduledFireAt,actualFireAt,outcome) VALUES (?,'schedule_a',NULL,?,?,'published')",
+    );
+    for (let index = 0; index < 300; index += 1)
+      insert.run(`history-${index}`, NOW, NOW + index);
+    let captured: unknown[] | undefined;
+    f.hooks.afterBatch = (results) => {
+      captured = results;
+      return results;
+    };
+    await expect(f.store.deleteOwnedSchedule('schedule_a')).resolves.toBe(
+      'deleted',
+    );
+    expect(captured?.[4]).toMatchObject({
+      results: [],
+      meta: { changes: 300 },
+    });
+    expect(JSON.stringify(captured).length).toBeLessThan(10_000);
+    expect(rawScheduleState(f)).toEqual([[], [], []]);
+  });
+
+  it.each([
+    undefined,
+    { changes: 0 },
+    { changes: 1.5 },
+    { changes: undefined },
+  ])('requires exact trigger DML metadata: %j', async (meta) => {
+    const f = await mutationFixture();
+    await f.store.recordTrigger({
+      id: 'history',
+      scheduleId: 'schedule_a',
+      runId: null,
+      scheduledFireAt: NOW,
+      actualFireAt: NOW,
+      outcome: 'published',
+    });
+    f.hooks.afterBatch = (results) => {
+      if (meta === undefined)
+        delete (results[4] as Record<string, unknown>).meta;
+      else (results[4] as Record<string, unknown>).meta = meta;
+      return results;
+    };
+    const calls = f.batches();
+    await expect(
+      f.store.deleteOwnedSchedule('schedule_a'),
+    ).rejects.toBeInstanceOf(ScheduleMutationOutcomeUnknownError);
+    expect(f.batches()).toBe(calls + 1);
+    expect(rawScheduleState(f)).toEqual([[], [], []]);
+  });
+
+  it('advertises the original binding and captures facade method receivers', async () => {
+    const f = await mutationFixture();
+    const capability = f.store[FENCED_SCHEDULE_STORAGE];
+    expect(capability?.database).toBe(f.binding);
+    expect(f.fence.usesDatabase(capability?.database as object)).toBe(true);
+    if (!capability) throw new Error('schedule capability is missing');
+    f.store.pauseSchedule = () => {
+      throw new Error('replacement method');
+    };
+    const pause = capability.pauseSchedule;
+    await expect(pause('schedule_a', {})).resolves.toMatchObject({
+      status: 'paused',
+    });
+  });
+
+  it('reads on a prepare-only binding without seeding the fence and refuses authoring', async () => {
+    const sqlite = openSqlite();
+    const native = sqliteUnitDatabase(sqlite) as ScheduleDatabase;
+    const store = new D1SchedulesStorage({
+      prepare: native.prepare.bind(native),
+    });
+    expect(store[FENCED_SCHEDULE_STORAGE]).toBeUndefined();
+    await store.init();
+    await expect(store.getSchedule('absent')).resolves.toBeNull();
+    await expect(store.listSchedules()).resolves.toEqual([]);
+    expect(
+      sqlite
+        .prepare(
+          "SELECT name FROM sqlite_schema WHERE name='flowsafe_execution_fence'",
+        )
+        .all(),
+    ).toEqual([]);
+    await expect(store.createSchedule(workflowSchedule())).rejects.toThrow(
+      'requires database.batch()',
+    );
+    expect(
+      sqlite
+        .prepare(
+          "SELECT name FROM sqlite_schema WHERE name='flowsafe_execution_fence'",
+        )
+        .all(),
+    ).toEqual([]);
+  });
+
+  it('migrates a legacy empty fence on authoring and does not recreate a deleted modern singleton', async () => {
+    const sqlite = openSqlite();
+    sqlite.exec(
+      "CREATE TABLE flowsafe_execution_fence (id TEXT PRIMARY KEY CHECK(id='deployment'),state TEXT NOT NULL,proof_key TEXT,proof_run_id TEXT,updated_at INTEGER NOT NULL)",
+    );
+    const binding = sqliteUnitDatabase(sqlite) as ScheduleDatabase;
+    const store = new D1SchedulesStorage(binding);
+    await store.createSchedule(workflowSchedule());
+    expect(
+      await new ExecutionFenceStore(binding).readForAdmission(),
+    ).toMatchObject({
+      schemaStage: 7,
+      reading: { state: 'open', requireMutationEpoch: false },
+    });
+    sqlite.exec('DELETE FROM flowsafe_execution_fence');
+    await expect(store.pauseSchedule('schedule_a')).rejects.toBeInstanceOf(
+      ExecutionFenceUnreadableError,
+    );
+    expect(
+      sqlite.prepare('SELECT * FROM flowsafe_execution_fence').all(),
+    ).toEqual([]);
+  });
+
+  it('retries failed authoring preparation without seeding on read paths', async () => {
+    const sqlite = openSqlite();
+    const native = sqliteUnitDatabase(sqlite) as ScheduleDatabase;
+    let fail = true;
+    let fencePreparations = 0;
+    const binding: ScheduleDatabase = {
+      prepare(query) {
+        if (query.includes('flowsafe_execution_fence')) {
+          fencePreparations += 1;
+          if (fail) {
+            fail = false;
+            throw new Error('seed unavailable');
+          }
+        }
+        return native.prepare(query);
+      },
+      batch: native.batch?.bind(native),
+    };
+    const store = new D1SchedulesStorage(binding);
+    await store.init();
+    await store.listSchedules();
+    expect(fencePreparations).toBe(0);
+    await expect(
+      store.createSchedule(workflowSchedule()),
+    ).rejects.toBeInstanceOf(ExecutionFenceUnreadableError);
+    await expect(
+      store.createSchedule(workflowSchedule()),
+    ).resolves.toMatchObject({ id: 'schedule_a' });
+    const seed = vi.spyOn(ExecutionFenceStore.prototype, 'seed');
+    try {
+      await store.pauseSchedule('schedule_a');
+      await store.updateSchedule('schedule_a', { metadata: { ready: true } });
+      expect(seed).not.toHaveBeenCalled();
+    } finally {
+      seed.mockRestore();
+    }
   });
 });

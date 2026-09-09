@@ -298,6 +298,14 @@ The router writes through Mastra's objective helpers into the goal lane of `mast
 
 Create a `D1SchedulesStorage`, expose `createScheduleRouter()`, and pass `createScheduleTick()` to the maintenance singleton with a dedicated tick interval.
 
+Use the same database object for the schedule store and its `ExecutionFenceStore`. A fenced custom facade must advertise `FENCED_SCHEDULE_STORAGE` before serving requests, including before epoch activation. `D1SchedulesStorage` and `createScheduleStorageDomains()` provide that capability. An explicit `executionFence: 'none'` supports a custom facade without the atomic storage contract.
+
+Supply the artifact epoch through trusted resolver configuration or the composed Worker's `mutationEpoch` option. The router retains that authenticated value through asynchronous work. Direct D1 authoring methods accept a trailing `MutationEpochContext` and require transactional `batch()`. Context-free calls through Core refuse once the epoch requirement is active. Request bodies and external headers cannot supply this authority.
+
+Create, update and resume require an open fence. Pause and delete retain their state allowance but require the current epoch after activation. The router checks the epoch even when the requested pause/resume status matches the row. Direct `pauseSchedule` accepts no patch; `resumeSchedule` takes the observed cron/timezone with the computed next fire and rejects a concurrent configuration change. Admitted trigger settlement can finish a pending deletion after the fence changes.
+
+`SCHEDULE_MUTATION_CONFLICT` is a 409 for a changed fence frame or resume configuration. `SCHEDULE_MUTATION_OUTCOME_UNKNOWN` is a 503 when the write cannot be confirmed; it can follow a committed write and supplies no rollback authority. A later matching row is not an invocation receipt. See the [API reference](api-reference.md#flowsafe-subpath-exports) for the schedules entry.
+
 The router:
 
 - mints schedule ids server-side;

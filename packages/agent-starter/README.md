@@ -272,6 +272,8 @@ The route verifies `X-Hub-Signature-256` over raw bytes before parsing or subscr
 
 ## Schedules and unattended work
 
+Schedule routes use the composed Worker's captured artifact epoch and the concrete D1 store's `FENCED_SCHEDULE_STORAGE` capability on the same database. After activation, missing, stale and future epochs refuse mutations, including pause/delete and already-matching pause/resume requests. Configure the epoch through the trusted host configuration; request data cannot supply it. Admitted trigger settlement can finish a pending deletion after an epoch change.
+
 The one-minute tick claims due schedules with D1 CAS, starts generic workflows or the same runtime-driven thread agent, and dispatches due notifications through the owning thread Durable Object.
 
 Agent schedules must name `agentId: "anchorage-agent"`. A threaded schedule uses a `threadId` and `resourceId` returned by the start route. Stored request context cannot contain Breakwater grant keys or runtime-reserved keys. Every fire gets a fresh opaque run id.

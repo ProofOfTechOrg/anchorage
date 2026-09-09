@@ -8,7 +8,7 @@ import type {
   ScheduleTrigger,
   ScheduleUpdate,
 } from '@mastra/core/storage';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 
@@ -17,21 +17,40 @@ import {
   ActorResolutionError,
   type ActorResolver,
   type ApprovalRole,
+  createActorResolver,
+  D1ApprovalStoreFactory,
   type ResourceOwner,
 } from '../approval-api/index.js';
 import {
   type ExecutionFenceDatabase,
+  ExecutionFencedError,
   ExecutionFenceStore,
+  ExecutionFenceUnreadableError,
+  InvalidMutationEpochError,
+  MutationEpochMismatchError,
 } from '../do-runner/index.js';
 import { RunRouteError } from '../host-kit/index.js';
+import {
+  FENCED_SCHEDULE_STORAGE,
+  type FencedScheduleMutationCapability,
+  ScheduleMutationConflictError,
+  ScheduleMutationOutcomeUnknownError,
+} from './mutation-contract.js';
 import {
   createScheduleRouter as createScheduleRouterImpl,
   type ScheduleFacadeStore,
   type ScheduleRouteAuditEvent,
+  type ScheduleRouter,
   type ScheduleRouterOptions,
 } from './router.js';
+import { D1SchedulesStorage, type ScheduleDatabase } from './schedules-d1.js';
 import type { ScheduleTargetPolicy } from './target-policy.js';
-import { createScheduleTargetPolicy } from './target-policy.js';
+import {
+  createScheduleTargetPolicy,
+  scheduleWithCreatorRole,
+} from './target-policy.js';
+
+afterEach(() => vi.restoreAllMocks());
 
 const TARGET_POLICY = createScheduleTargetPolicy({
   workflows: [{ id: 'wf' }],
@@ -167,6 +186,27 @@ interface Harness {
   ) => Promise<{ status: number; body: Record<string, unknown> }>;
 }
 
+function routerCaller(router: ScheduleRouter): Harness['call'] {
+  return async (method, path, body) => {
+    const res = await router(
+      new Request(`http://host${path}`, {
+        method,
+        ...(body !== undefined
+          ? {
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify(body),
+            }
+          : {}),
+      }),
+    );
+    if (!res) throw new Error(`router returned null for ${method} ${path}`);
+    return {
+      status: res.status,
+      body: (await res.json()) as Record<string, unknown>,
+    };
+  };
+}
+
 function harness(
   context: ActorContext | undefined,
   overrides: {
@@ -177,7 +217,6 @@ function harness(
     targetPolicy?: ScheduleTargetPolicy;
     audit?: ScheduleRouterOptions['audit'];
     validateThreadTarget?: ScheduleRouterOptions['validateThreadTarget'];
-    executionFence?: ScheduleRouterOptions['executionFence'];
   } = {},
 ): Harness {
   const store = new MemStore();
@@ -205,26 +244,9 @@ function harness(
     ...(overrides.validateThreadTarget !== undefined
       ? { validateThreadTarget: overrides.validateThreadTarget }
       : {}),
-    // 'none' is the honest wiring for MemStore — no database, nothing to fence.
-    // The fence cases below pass a real store.
-    executionFence: overrides.executionFence ?? 'none',
+    executionFence: 'none',
   });
-  const call = async (method: string, path: string, body?: unknown) => {
-    const res = await router(
-      new Request(`http://host${path}`, {
-        method,
-        ...(body !== undefined
-          ? {
-              headers: { 'content-type': 'application/json' },
-              body: JSON.stringify(body),
-            }
-          : {}),
-      }),
-    );
-    if (!res) throw new Error(`router returned null for ${method} ${path}`);
-    const parsed = (await res.json()) as Record<string, unknown>;
-    return { status: res.status, body: parsed };
-  };
+  const call = routerCaller(router);
   return { store, events, call };
 }
 
@@ -332,6 +354,7 @@ describe('createScheduleRouter — create', () => {
     expect(store.owners.has(schedule.id)).toBe(true);
     expect(logged).toHaveBeenCalledWith(
       expect.stringContaining('schedule.route-audit-error'),
+      expect.objectContaining({ message: 'audit unavailable' }),
     );
     logged.mockRestore();
   });
@@ -1022,65 +1045,19 @@ describe('createScheduleRouter and the deployment execution fence', () => {
     expect(build).toBeTypeOf('function');
   });
 
-  async function drainingFence(): Promise<ExecutionFenceStore> {
-    const fence = new ExecutionFenceStore(
-      sqliteUnitDatabase(openSqlite()) as ExecutionFenceDatabase,
-    );
-    await fence.seed('draining');
-    return fence;
-  }
-
-  function unreadableFence(): ExecutionFenceStore {
-    // Storage that faults on every query — NOT the "no such table" a pre-0.20
-    // database answers with, which legitimately reads as open.
-    return new ExecutionFenceStore({
-      prepare: () => ({
-        bind: () => ({
-          bind: () => {
-            throw new Error('unreachable');
-          },
-          run: () => Promise.reject(new Error('D1_ERROR: network')),
-          all: () => Promise.reject(new Error('D1_ERROR: network')),
-        }),
-        run: () => Promise.reject(new Error('D1_ERROR: network')),
-        all: () => Promise.reject(new Error('D1_ERROR: network')),
-      }),
-    } as unknown as ExecutionFenceDatabase);
-  }
-
   it('degrades a mutation closed with 503 when the fence cannot be read', async () => {
-    // #given
-    const { store, call } = harness(ctx('acme', 'operator'), {
-      executionFence: unreadableFence(),
-    });
-
-    // #then — never the generic 500: an operator must be able to tell a
-    // deployment being migrated from a broken one, and the write did not land.
-    const res = await call('POST', '/api/schedules', WORKFLOW_CREATE);
+    const h = await fencedHarness();
+    h.sqlite.exec('DELETE FROM flowsafe_execution_fence');
+    const res = await h.call('POST', '/api/schedules', WORKFLOW_CREATE);
     expect(res.status).toBe(503);
     expect(res.body.reason).toEqual({ code: 'EXECUTION_FENCE_UNREADABLE' });
-    expect(store.m.size).toBe(0);
+    await expect(h.store.listSchedules()).resolves.toEqual([]);
   });
 
   it('refuses create, update, and resume once the deployment is draining', async () => {
-    // #given
-    const executionFence = await drainingFence();
-    const { store, events, call } = harness(ctx('acme', 'operator'), {
-      executionFence,
-    });
-    store.m.set('s1', {
-      id: 's1',
-      target: { type: 'workflow', workflowId: 'wf', inputData: {} },
-      cron: '*/5 * * * *',
-      status: 'paused',
-      nextFireAt: 0,
-      createdAt: 0,
-      updatedAt: 0,
-      metadata: {},
-    } as Schedule);
-
-    // #when / #then — every operation that ARMS a future fire is refused with
-    // the taxonomy's retryable status and code.
+    const { store, events, call, fence } = await fencedHarness();
+    await store.createSchedule(scheduleRow('paused'));
+    await fence.transition({ expected: 'open', next: 'draining' });
     for (const [method, path, body] of [
       ['POST', '/api/schedules', WORKFLOW_CREATE],
       ['PATCH', '/api/schedules/s1', { cron: '*/10 * * * *' }],
@@ -1093,35 +1070,1055 @@ describe('createScheduleRouter and the deployment execution fence', () => {
         state: 'draining',
       });
     }
-    expect(store.m.size).toBe(1);
+    await expect(store.listSchedules()).resolves.toHaveLength(1);
     expect(
       events.filter((event) => event.reason === 'execution-fenced'),
     ).toHaveLength(3);
   });
 
   it('keeps pause, delete, and every read available while draining', async () => {
-    // #given — pause and delete TAKE WORK AWAY, which is the direction a drain
-    // is going, and a read moves nothing.
-    const executionFence = await drainingFence();
-    const { store, call } = harness(ctx('acme', 'operator'), {
-      executionFence,
-    });
-    store.m.set('s1', {
-      id: 's1',
-      target: { type: 'workflow', workflowId: 'wf', inputData: {} },
-      cron: '*/5 * * * *',
-      status: 'active',
-      nextFireAt: 0,
-      createdAt: 0,
-      updatedAt: 0,
-      metadata: {},
-    } as Schedule);
-
-    // #then
+    const { store, call, fence } = await fencedHarness();
+    await store.createSchedule(scheduleRow());
+    await fence.transition({ expected: 'open', next: 'draining' });
     expect((await call('GET', '/api/schedules')).status).toBe(200);
     expect((await call('GET', '/api/schedules/s1')).status).toBe(200);
     expect((await call('POST', '/api/schedules/s1/pause')).status).toBe(200);
     expect((await call('DELETE', '/api/schedules/s1')).status).toBe(200);
+    await expect(store.listSchedules()).resolves.toEqual([]);
+  });
+});
+
+function scheduleRow(status: Schedule['status'] = 'active'): Schedule {
+  return {
+    id: 's1',
+    target: { type: 'workflow', workflowId: 'wf', inputData: {} },
+    cron: '*/5 * * * *',
+    status,
+    nextFireAt: 300_000,
+    createdAt: 10,
+    updatedAt: 20,
+    metadata: {},
+  };
+}
+
+async function fencedHarness(context: ActorContext = ctx('acme', 'operator')) {
+  const sqlite = openSqlite();
+  const database = sqliteUnitDatabase(sqlite) as ScheduleDatabase;
+  const fence = new ExecutionFenceStore(database as ExecutionFenceDatabase);
+  await fence.seed('open');
+  const store = new D1SchedulesStorage(database);
+  await store.init();
+  const events: ScheduleRouteAuditEvent[] = [];
+  const options = {
+    store,
+    executionFence: fence,
+    resolve: resolveAs(context),
+    audit: (event: ScheduleRouteAuditEvent) => {
+      events.push(event);
+    },
+  };
+  return {
+    sqlite,
+    database,
+    store,
+    fence,
+    events,
+    options,
+    call: routerCaller(createScheduleRouter(options)),
+  };
+}
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+async function activateAndReopen(fence: ExecutionFenceStore) {
+  await fence.transition({
+    expected: 'open',
+    next: 'draining',
+    expectedMutationEpoch: 0,
+    expectedRevision: 0,
+    advanceMutationEpoch: true,
+  });
+  await fence.transition({
+    expected: 'draining',
+    next: 'migration-locked',
+    expectedMutationEpoch: 1,
+    expectedRevision: 1,
+  });
+  await fence.transition({
+    expected: 'migration-locked',
+    next: 'open',
+    expectedMutationEpoch: 1,
+    expectedRevision: 2,
+  });
+}
+
+function customFacade() {
+  const store = new MemStore();
+  const database = sqliteUnitDatabase(
+    openSqlite(),
+  ) as FencedScheduleMutationCapability['database'];
+  const capability: FencedScheduleMutationCapability = {
+    database,
+    createOwnedSchedule: vi.fn(function (
+      this: FencedScheduleMutationCapability,
+      schedule,
+      owner,
+      cap,
+      _context,
+    ) {
+      expect(this).toBe(capability);
+      return MemStore.prototype.createOwnedSchedule.call(
+        store,
+        schedule,
+        owner,
+        cap,
+      );
+    }),
+    updateSchedule: vi.fn(function (
+      this: FencedScheduleMutationCapability,
+      id,
+      patch,
+      _context,
+    ) {
+      expect(this).toBe(capability);
+      return MemStore.prototype.updateSchedule.call(store, id, patch);
+    }),
+    pauseSchedule: vi.fn(function (
+      this: FencedScheduleMutationCapability,
+      id,
+      _context,
+    ) {
+      expect(this).toBe(capability);
+      return MemStore.prototype.updateSchedule.call(store, id, {
+        status: 'paused',
+      });
+    }),
+    resumeSchedule: vi.fn(function (
+      this: FencedScheduleMutationCapability,
+      id,
+      resume,
+      _context,
+    ) {
+      expect(this).toBe(capability);
+      return MemStore.prototype.updateSchedule.call(store, id, {
+        status: 'active',
+        nextFireAt: resume.nextFireAt,
+      });
+    }),
+    deleteOwnedSchedule: vi.fn(function (
+      this: FencedScheduleMutationCapability,
+      id,
+      _context,
+    ) {
+      expect(this).toBe(capability);
+      return MemStore.prototype.deleteOwnedSchedule.call(store, id);
+    }),
+    observeScheduleMutation: vi.fn(function (
+      this: FencedScheduleMutationCapability,
+      id,
+      _operation,
+      _context,
+    ) {
+      expect(this).toBe(capability);
+      return store.getSchedule(id);
+    }),
+  };
+  Object.defineProperty(store, FENCED_SCHEDULE_STORAGE, {
+    configurable: true,
+    value: capability,
+  });
+  const options = {
+    store,
+    executionFence: 'none' as const,
+    resolve: resolveAs({ ...ctx('acme', 'operator'), mutationEpoch: 7 }),
+  };
+  return { store, capability, database, options };
+}
+
+describe('schedule mutation capability construction', () => {
+  it('requires a capability before an epoch-optional fenced router authenticates', async () => {
+    const h = await fencedHarness();
+    const resolve = vi.fn(resolveAs(ctx('acme', 'operator')));
+    expect(() =>
+      createScheduleRouter({
+        ...h.options,
+        store: new MemStore(),
+        resolve,
+      }),
+    ).toThrow('fenced schedule storage capability is unavailable');
+    expect(resolve).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'none',
+    'fenced',
+  ] as const)('rejects malformed advertised capabilities with %s wiring', async (wiring) => {
+    const h = await fencedHarness();
+    const { capability } = customFacade();
+    const malformed: unknown[] = [
+      null,
+      [],
+      1,
+      {},
+      { ...capability, database: null },
+      { ...capability, database: Object.assign([], capability.database) },
+    ];
+    for (const method of [
+      'createOwnedSchedule',
+      'updateSchedule',
+      'pauseSchedule',
+      'resumeSchedule',
+      'deleteOwnedSchedule',
+      'observeScheduleMutation',
+    ])
+      malformed.push({ ...capability, [method]: undefined });
+    for (const method of ['prepare', 'batch']) {
+      malformed.push({
+        ...capability,
+        database: { ...h.database, [method]: undefined },
+      });
+    }
+    for (const value of malformed) {
+      const store = Object.assign(new MemStore(), {
+        [FENCED_SCHEDULE_STORAGE]: value,
+      });
+      expect(() =>
+        createScheduleRouter({
+          ...h.options,
+          store: store as ScheduleFacadeStore,
+          executionFence: wiring === 'none' ? 'none' : h.fence,
+        }),
+      ).toThrow('schedule mutation capability is malformed');
+    }
+  });
+
+  it('rejects a concrete store over a different binding before activation', async () => {
+    const h = await fencedHarness();
+    const other = await fencedHarness();
+    expect(() =>
+      createScheduleRouter({
+        ...h.options,
+        store: other.store,
+      }),
+    ).toThrow('schedule storage binding disagrees with execution fence');
+  });
+
+  it('captures the capability and receiver before mutable properties change', async () => {
+    const { store, capability, options } = customFacade();
+    const selected = capability.createOwnedSchedule;
+    const readMethod = vi.fn(() => selected);
+    Object.defineProperty(capability, 'createOwnedSchedule', {
+      configurable: true,
+      get: readMethod,
+    });
+    const readCapability = vi.fn(() => capability);
+    Object.defineProperty(store, FENCED_SCHEDULE_STORAGE, {
+      configurable: true,
+      get: readCapability,
+    });
+    const waiting = deferred();
+    const entered = deferred();
+    const context = ctx('acme', 'operator');
+    context.resourceOwnerFor = async () => {
+      entered.resolve();
+      await waiting.promise;
+      return context.resourceOwner;
+    };
+    const call = routerCaller(
+      createScheduleRouter({
+        ...options,
+        resolve: resolveAs(context),
+      }),
+    );
+    store.createOwnedSchedule = vi.fn(async () => {
+      throw new Error('legacy write');
+    });
+    const pending = call('POST', '/api/schedules', {
+      agentId: 'a1',
+      prompt: 'go',
+      cron: '*/5 * * * *',
+      threadId: 'acme_thread',
+      resourceId: 'acme_resource',
+    });
+    await entered.promise;
+    Object.defineProperty(store, FENCED_SCHEDULE_STORAGE, { value: undefined });
+    Object.defineProperty(capability, 'createOwnedSchedule', {
+      value: async () => {
+        throw new Error('replacement write');
+      },
+    });
+    waiting.resolve();
+    expect((await pending).status).toBe(201);
+    expect(readCapability).toHaveBeenCalledTimes(1);
+    expect(readMethod).toHaveBeenCalledTimes(1);
+    expect(selected).toHaveBeenCalledTimes(1);
+    expect(store.createOwnedSchedule).not.toHaveBeenCalled();
+  });
+});
+
+describe('captured schedule request authority', () => {
+  it('retains actor, owner, epoch, and service receiver through a body wait', async () => {
+    const { store, capability, options } = customFacade();
+    const context = {
+      ...ctx('acme', 'operator'),
+      actor: { id: 'operator-acme', role: 'operator' as ApprovalRole },
+      deploymentTag: 'original',
+      mutationEpoch: 7,
+    };
+    const epoch = vi.fn(() => 7);
+    Object.defineProperty(context, 'mutationEpoch', {
+      configurable: true,
+      get: epoch,
+    });
+    const audit = vi.fn();
+    const entered = deferred();
+    const release = deferred();
+    const request = new Request('http://host/api/schedules', {
+      method: 'POST',
+      body: JSON.stringify(WORKFLOW_CREATE),
+    });
+    const body = request.body;
+    if (!body) throw new Error('missing test body');
+    const getReader = body.getReader.bind(body);
+    Object.defineProperty(body, 'getReader', {
+      value: () => {
+        const reader = getReader();
+        const read = reader.read.bind(reader);
+        reader.read = async () => {
+          entered.resolve();
+          await release.promise;
+          return read();
+        };
+        return reader;
+      },
+    });
+    const router = createScheduleRouter({
+      ...options,
+      resolve: resolveAs(context),
+      audit,
+    });
+    const response = router(request);
+    await entered.promise;
+    context.actor.id = 'changed';
+    context.actor.role = 'viewer';
+    context.resourceOwner = { kind: 'human', id: 'changed' };
+    context.deploymentTag = 'changed';
+    Object.defineProperty(context, 'mutationEpoch', { value: 99 });
+    release.resolve();
+    expect((await response)?.status).toBe(201);
+    expect(epoch).toHaveBeenCalledTimes(1);
+    expect(capability.createOwnedSchedule).toHaveBeenCalledWith(
+      expect.any(Object),
+      { kind: 'human', id: 'operator-acme' },
+      100,
+      { mutationEpoch: 7 },
+    );
+    expect([...store.owners.values()]).toEqual([
+      { kind: 'human', id: 'operator-acme' },
+    ]);
+    expect(audit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        actorId: 'operator-acme',
+        deploymentTag: 'original',
+        outcome: 'accepted',
+      }),
+    );
+    const passed = vi.mocked(capability.createOwnedSchedule).mock.calls[0]?.[3];
+    expect(Object.isFrozen(passed)).toBe(true);
+  });
+
+  it('retains bound ownership methods and the original role during an access wait', async () => {
+    const { store, capability, options } = customFacade();
+    store.m.set('s1', scheduleRow());
+    const context = {
+      ...ctx('acme', 'operator'),
+      mutationEpoch: 7,
+      actor: { id: 'operator-acme', role: 'operator' as ApprovalRole },
+    };
+    const entered = deferred();
+    const release = deferred();
+    context.canAccessResource = async function () {
+      expect(this).toBe(context);
+      entered.resolve();
+      await release.promise;
+      return true;
+    };
+    const call = routerCaller(
+      createScheduleRouter({ ...options, resolve: resolveAs(context) }),
+    );
+    const pending = call('POST', '/api/schedules/s1/pause');
+    await entered.promise;
+    context.actor.role = 'viewer';
+    context.mutationEpoch = 99;
+    context.canAccessResource = async () => false;
+    release.resolve();
+    expect((await pending).status).toBe(200);
+    expect(capability.pauseSchedule).toHaveBeenCalledWith('s1', {
+      mutationEpoch: 7,
+    });
+  });
+
+  it.each([
+    NaN,
+    -1,
+    1.5,
+    null,
+    '7',
+  ])('rejects malformed resolved epoch %s before storage or audit', async (mutationEpoch) => {
+    const { capability, options } = customFacade();
+    const audit = vi.fn();
+    const call = routerCaller(
+      createScheduleRouter({
+        ...options,
+        audit,
+        resolve: resolveAs({
+          ...ctx('acme', 'operator'),
+          mutationEpoch,
+        } as ActorContext),
+      }),
+    );
+    const result = await call('POST', '/api/schedules', WORKFLOW_CREATE);
+    expect(result.status).toBe(400);
+    expect(result.body.reason).toEqual({ code: 'INVALID_MUTATION_EPOCH' });
+    expect(capability.createOwnedSchedule).not.toHaveBeenCalled();
+    expect(audit).not.toHaveBeenCalled();
+  });
+
+  it('rejects tenant epoch headers through the real resolver', async () => {
+    const h = await fencedHarness();
+    const authenticate = vi.fn(() => ({
+      id: 'actor',
+      role: 'operator' as const,
+    }));
+    const router = createScheduleRouter({
+      ...h.options,
+      resolve: createActorResolver({
+        authenticate,
+        storeFactory: new D1ApprovalStoreFactory(h.database),
+        mutationEpoch: 7,
+        buildService: () => {
+          throw new Error('unused');
+        },
+      }),
+    });
+    const response = await router(
+      new Request('http://host/api/schedules', {
+        method: 'POST',
+        headers: { 'x-flowsafe-mutation-epoch': '7' },
+        body: JSON.stringify(WORKFLOW_CREATE),
+      }),
+    );
+    expect(response?.status).toBe(403);
+    expect(authenticate).not.toHaveBeenCalled();
+    await expect(h.store.listSchedules()).resolves.toEqual([]);
+  });
+
+  it('does not accept a body epoch as authority', async () => {
+    const { capability, options } = customFacade();
+    const call = routerCaller(createScheduleRouter(options));
+    expect(
+      (
+        await call('POST', '/api/schedules', {
+          ...WORKFLOW_CREATE,
+          mutationEpoch: 7,
+        })
+      ).status,
+    ).toBe(400);
+    expect(capability.createOwnedSchedule).not.toHaveBeenCalled();
+  });
+});
+
+describe('schedule capability mutation dispatch', () => {
+  it.each([
+    'pause',
+    'resume',
+  ] as const)('observes an already-%s row without changing timestamps', async (operation) => {
+    const { store, capability, options } = customFacade();
+    const status = operation === 'pause' ? 'paused' : 'active';
+    store.m.set('s1', scheduleRow(status));
+    const observed = {
+      ...scheduleRow(status),
+      cron: '*/10 * * * *',
+      updatedAt: 99,
+    };
+    vi.mocked(capability.observeScheduleMutation).mockResolvedValue(observed);
+    const call = routerCaller(createScheduleRouter(options));
+    const result = await call('POST', `/api/schedules/s1/${operation}`);
+    expect(result.status).toBe(200);
+    expect(result.body.schedule).toMatchObject({
+      cron: observed.cron,
+      updatedAt: observed.updatedAt,
+    });
+    expect(capability.observeScheduleMutation).toHaveBeenCalledWith(
+      's1',
+      operation,
+      { mutationEpoch: 7 },
+    );
+    expect(capability.pauseSchedule).not.toHaveBeenCalled();
+    expect(capability.resumeSchedule).not.toHaveBeenCalled();
+    expect(capability.updateSchedule).not.toHaveBeenCalled();
+    expect(store.m.get('s1')).toEqual(scheduleRow(status));
+  });
+
+  it.each([
+    'pause',
+    'resume',
+  ] as const)('returns 404 if a %s no-op observation finds no row', async (operation) => {
+    const { store, capability, options } = customFacade();
+    store.m.set('s1', scheduleRow(operation === 'pause' ? 'paused' : 'active'));
+    vi.mocked(capability.observeScheduleMutation).mockResolvedValue(null);
+    const audit = vi.fn();
+    const call = routerCaller(createScheduleRouter({ ...options, audit }));
+    expect(await call('POST', `/api/schedules/s1/${operation}`)).toEqual({
+      status: 404,
+      body: { error: 'not found' },
+    });
+    expect(audit).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: 'not-found' }),
+    );
+    expect(capability.pauseSchedule).not.toHaveBeenCalled();
+    expect(capability.resumeSchedule).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'pause',
+    'resume',
+  ] as const)('uses the observed row when a %s no-op races another status change', async (operation) => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
+    const { store, capability, options } = customFacade();
+    store.m.set('s1', scheduleRow(operation === 'pause' ? 'paused' : 'active'));
+    const observed = {
+      ...scheduleRow(operation === 'pause' ? 'active' : 'paused'),
+      cron: '15 * * * *',
+      timezone: 'UTC',
+    };
+    vi.mocked(capability.observeScheduleMutation).mockResolvedValue(observed);
+    const call = routerCaller(createScheduleRouter(options));
+    expect((await call('POST', `/api/schedules/s1/${operation}`)).status).toBe(
+      200,
+    );
+    if (operation === 'pause') {
+      expect(capability.pauseSchedule).toHaveBeenCalledWith('s1', {
+        mutationEpoch: 7,
+      });
+    } else {
+      expect(capability.resumeSchedule).toHaveBeenCalledWith(
+        's1',
+        {
+          expectedCron: observed.cron,
+          expectedTimezone: 'UTC',
+          nextFireAt: 1_800_000_900_000,
+        },
+        { mutationEpoch: 7 },
+      );
+    }
+    expect(capability.updateSchedule).not.toHaveBeenCalled();
+  });
+
+  it('passes an explicit undefined expected timezone when resuming', async () => {
+    const { store, capability, options } = customFacade();
+    store.m.set('s1', scheduleRow('paused'));
+    const call = routerCaller(createScheduleRouter(options));
+    expect((await call('POST', '/api/schedules/s1/resume')).status).toBe(200);
+    const input = vi.mocked(capability.resumeSchedule).mock.calls[0]?.[1];
+    expect(input).toHaveProperty('expectedTimezone', undefined);
+    expect(input?.expectedCron).toBe('*/5 * * * *');
+    expect(input?.nextFireAt).toBeGreaterThan(Date.now());
+  });
+
+  it('uses generic authoring for PATCH status paused and the owned deletion capability', async () => {
+    const { store, capability, options } = customFacade();
+    store.m.set('s1', scheduleRow());
+    const call = routerCaller(createScheduleRouter(options));
+    expect(
+      (await call('PATCH', '/api/schedules/s1', { status: 'paused' })).status,
+    ).toBe(200);
+    expect(capability.updateSchedule).toHaveBeenCalledWith(
+      's1',
+      { status: 'paused' },
+      { mutationEpoch: 7 },
+    );
+    expect(capability.pauseSchedule).not.toHaveBeenCalled();
+    expect((await call('DELETE', '/api/schedules/s1')).status).toBe(200);
+    expect(capability.deleteOwnedSchedule).toHaveBeenCalledWith('s1', {
+      mutationEpoch: 7,
+    });
+  });
+});
+
+const MUTATION_ROUTES = [
+  [
+    'create',
+    'POST',
+    '/api/schedules',
+    WORKFLOW_CREATE,
+    'active',
+    'createOwnedSchedule',
+  ],
+  [
+    'update',
+    'PATCH',
+    '/api/schedules/s1',
+    { cron: '*/10 * * * *' },
+    'active',
+    'updateSchedule',
+  ],
+  [
+    'pause',
+    'POST',
+    '/api/schedules/s1/pause',
+    undefined,
+    'active',
+    'pauseSchedule',
+  ],
+  [
+    'resume',
+    'POST',
+    '/api/schedules/s1/resume',
+    undefined,
+    'paused',
+    'resumeSchedule',
+  ],
+  [
+    'delete',
+    'DELETE',
+    '/api/schedules/s1',
+    undefined,
+    'active',
+    'deleteOwnedSchedule',
+  ],
+  [
+    'pause no-op',
+    'POST',
+    '/api/schedules/s1/pause',
+    undefined,
+    'paused',
+    'observeScheduleMutation',
+  ],
+  [
+    'resume no-op',
+    'POST',
+    '/api/schedules/s1/resume',
+    undefined,
+    'active',
+    'observeScheduleMutation',
+  ],
+] as const;
+
+describe('schedule router final D1 epoch enforcement', () => {
+  it.each([
+    'cron',
+    'timezone',
+  ] as const)('refuses resume when its observed %s changes before mutation', async (field) => {
+    const h = await fencedHarness();
+    await h.store.createSchedule(scheduleRow('paused'));
+    const capability = h.store[FENCED_SCHEDULE_STORAGE];
+    if (!capability) throw new Error('missing D1 capability');
+    const patch =
+      field === 'cron' ? { cron: '15 * * * *' } : { timezone: 'Asia/Dubai' };
+    Object.defineProperty(h.store, FENCED_SCHEDULE_STORAGE, {
+      value: {
+        ...capability,
+        resumeSchedule: async (
+          ...args: Parameters<
+            FencedScheduleMutationCapability['resumeSchedule']
+          >
+        ) => {
+          await h.store.updateSchedule('s1', patch);
+          return capability.resumeSchedule(...args);
+        },
+      },
+    });
+    const call = routerCaller(createScheduleRouter(h.options));
+    const result = await call('POST', '/api/schedules/s1/resume');
+    expect(result.status).toBe(409);
+    expect(result.body.reason).toEqual({
+      code: 'SCHEDULE_MUTATION_CONFLICT',
+      classification: 'schedule-changed',
+    });
+    await expect(h.store.getSchedule('s1')).resolves.toMatchObject({
+      ...patch,
+      status: 'paused',
+      nextFireAt: scheduleRow().nextFireAt,
+    });
+  });
+
+  it('uses a present D1 capability under none wiring and leaves reads epoch-optional', async () => {
+    const h = await fencedHarness();
+    await h.store.createSchedule(scheduleRow());
+    await activateAndReopen(h.fence);
+    const call = routerCaller(
+      createScheduleRouter({ ...h.options, executionFence: 'none' }),
+    );
+    expect((await call('POST', '/api/schedules/s1/pause')).body.reason).toEqual(
+      {
+        code: 'MUTATION_EPOCH_MISMATCH',
+        classification: 'missing',
+        mutationEpoch: 1,
+      },
+    );
+    expect((await call('GET', '/api/schedules')).status).toBe(200);
+    expect((await call('GET', '/api/schedules/s1')).status).toBe(200);
+    expect((await call('GET', '/api/schedules/s1/triggers')).status).toBe(200);
+  });
+
+  it.each(
+    MUTATION_ROUTES,
+  )('rejects an old held %s after activation and reopen', async (_name, method, path, body, status, selected) => {
+    const context = { ...ctx('acme', 'operator'), mutationEpoch: 0 };
+    const h = await fencedHarness(context);
+    await h.store.createOwnedSchedule(
+      scheduleWithCreatorRole(scheduleRow(status), 'operator'),
+      context.resourceOwner,
+      100,
+    );
+    await h.store.recordTrigger({
+      id: 'trigger-s1',
+      scheduleId: 's1',
+      runId: 'run-s1',
+      scheduledFireAt: 1,
+      actualFireAt: 2,
+      outcome: 'succeeded',
+    });
+    const snapshot = () =>
+      JSON.stringify([
+        h.sqlite.prepare('SELECT * FROM mastra_schedules').all(),
+        h.sqlite.prepare('SELECT * FROM mastra_schedule_triggers').all(),
+        h.sqlite.prepare('SELECT * FROM flowsafe_resource_owners').all(),
+      ]);
+    const before = snapshot();
+    const capability = h.store[FENCED_SCHEDULE_STORAGE];
+    if (!capability) throw new Error('missing D1 capability');
+    const entered = deferred();
+    const release = deferred();
+    const selectedMethod = capability[selected];
+    const held = vi.fn(async (...args: unknown[]) => {
+      entered.resolve();
+      await release.promise;
+      return Reflect.apply(selectedMethod, capability, args);
+    });
+    Object.defineProperty(h.store, FENCED_SCHEDULE_STORAGE, {
+      value: { ...capability, [selected]: held },
+    });
+    const call = routerCaller(createScheduleRouter(h.options));
+    const pending = call(method, path, body);
+    await entered.promise;
+    try {
+      await activateAndReopen(h.fence);
+      context.mutationEpoch = 1;
+    } finally {
+      release.resolve();
+    }
+    const result = await pending;
+    expect(result.status).toBe(409);
+    expect(result.body.reason).toEqual({
+      code: 'MUTATION_EPOCH_MISMATCH',
+      classification: 'stale',
+      mutationEpoch: 1,
+    });
+    expect(held).toHaveBeenCalledTimes(1);
+    expect(snapshot()).toBe(before);
+    expect(h.events).toContainEqual(
+      expect.objectContaining({
+        outcome: 'rejected',
+        reason: 'MUTATION_EPOCH_MISMATCH:stale',
+      }),
+    );
+  });
+
+  it.each(
+    MUTATION_ROUTES,
+  )('accepts exact current epoch for %s and refuses missing/future epochs', async (_name, method, path, body, status) => {
+    for (const mutationEpoch of [undefined, 2, 1]) {
+      const h = await fencedHarness({
+        ...ctx('acme', 'operator'),
+        mutationEpoch,
+      });
+      await h.store.createOwnedSchedule(
+        scheduleWithCreatorRole(scheduleRow(status), 'operator'),
+        { kind: 'human', id: 'operator-acme' },
+        100,
+      );
+      await activateAndReopen(h.fence);
+      const before = await h.store.getSchedule('s1');
+      const result = await h.call(method, path, body);
+      if (mutationEpoch === 1) {
+        expect(result.status).toBe(
+          method === 'POST' && path === '/api/schedules' ? 201 : 200,
+        );
+        if (_name.endsWith('no-op'))
+          await expect(h.store.getSchedule('s1')).resolves.toEqual(before);
+      } else {
+        expect(result.status).toBe(409);
+        expect(result.body.reason).toEqual({
+          code: 'MUTATION_EPOCH_MISMATCH',
+          classification: mutationEpoch === undefined ? 'missing' : 'future',
+          mutationEpoch: 1,
+        });
+        await expect(h.store.getSchedule('s1')).resolves.toEqual(before);
+      }
+    }
+  });
+
+  it.each([
+    'draining',
+    'migration-locked',
+    'proof-only',
+  ] as const)('allows exact-epoch pause/delete in %s while PATCH remains authoring', async (state) => {
+    const h = await fencedHarness({
+      ...ctx('acme', 'operator'),
+      mutationEpoch: 1,
+    });
+    await h.store.createSchedule(scheduleRow());
+    await activateAndReopen(h.fence);
+    await h.fence.transition({
+      expected: 'open',
+      next: state,
+      expectedMutationEpoch: 1,
+      expectedRevision: 3,
+      ...(state === 'proof-only' ? { proofKey: 'proof-schedule' } : {}),
+    });
+    expect(
+      (await h.call('PATCH', '/api/schedules/s1', { status: 'paused' })).status,
+    ).toBe(503);
+    expect((await h.call('POST', '/api/schedules/s1/pause')).status).toBe(200);
+    expect((await h.call('POST', '/api/schedules/s1/pause')).status).toBe(200);
+    expect((await h.call('DELETE', '/api/schedules/s1')).status).toBe(200);
+  });
+});
+
+describe('schedule route refusal responses', () => {
+  const failures = [
+    [
+      'invalid epoch',
+      () => new InvalidMutationEpochError(),
+      'INVALID_MUTATION_EPOCH',
+    ],
+    [
+      'missing epoch',
+      () => new MutationEpochMismatchError('missing', 7),
+      'MUTATION_EPOCH_MISMATCH:missing',
+    ],
+    [
+      'stale epoch',
+      () => new MutationEpochMismatchError('stale', 7),
+      'MUTATION_EPOCH_MISMATCH:stale',
+    ],
+    [
+      'future epoch',
+      () => new MutationEpochMismatchError('future', 7),
+      'MUTATION_EPOCH_MISMATCH:future',
+    ],
+    [
+      'closed fence',
+      () => new ExecutionFencedError('draining'),
+      'execution-fenced',
+    ],
+    [
+      'unreadable fence',
+      () => new ExecutionFenceUnreadableError('fence unreadable'),
+      'execution-fence-unreadable',
+    ],
+    [
+      'changed fence',
+      () => new ScheduleMutationConflictError('fence-changed'),
+      'SCHEDULE_MUTATION_CONFLICT:fence-changed',
+    ],
+    [
+      'changed schedule',
+      () => new ScheduleMutationConflictError('schedule-changed'),
+      'SCHEDULE_MUTATION_CONFLICT:schedule-changed',
+    ],
+    [
+      'unknown outcome',
+      () =>
+        new ScheduleMutationOutcomeUnknownError({
+          cause: new Error('private SQL detail'),
+        }),
+      'SCHEDULE_MUTATION_OUTCOME_UNKNOWN',
+    ],
+  ] as const;
+
+  it.each(
+    failures,
+  )('retains the typed %s refusal when its audit fails', async (_label, build, reason) => {
+    const error = build();
+    const callbackError = new RunRouteError(418, 'private audit detail');
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { store, capability, options } = customFacade();
+    vi.mocked(capability.createOwnedSchedule).mockRejectedValue(error);
+    const audit = vi.fn(async () => {
+      throw callbackError;
+    });
+    const call = routerCaller(createScheduleRouter({ ...options, audit }));
+    const result = await call('POST', '/api/schedules', WORKFLOW_CREATE);
+    expect(result).toEqual({
+      status: error.status,
+      body: { error: error.message, reason: error.reason },
+    });
+    expect(JSON.stringify(result.body)).not.toMatch(
+      /private SQL|private audit/,
+    );
+    expect(audit).toHaveBeenCalledTimes(1);
+    expect(audit).toHaveBeenCalledWith(
+      expect.objectContaining({ outcome: 'rejected', reason }),
+    );
+    expect(logged).toHaveBeenCalledWith(
+      expect.stringContaining('schedule.route-audit-error'),
+      callbackError,
+    );
+    if (error instanceof ScheduleMutationOutcomeUnknownError) {
+      expect(logged).toHaveBeenCalledWith(
+        expect.stringContaining('schedule.route-mutation-error'),
+        error,
+      );
+      expect(error.cause).toEqual(new Error('private SQL detail'));
+    }
+    expect(capability.createOwnedSchedule).toHaveBeenCalledTimes(1);
+    expect(capability.deleteOwnedSchedule).not.toHaveBeenCalled();
     expect(store.m.size).toBe(0);
+  });
+
+  it('preserves a generic final-storage notfound error as a generic 500', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { store, capability, options } = customFacade();
+    store.m.set('s1', scheduleRow());
+    vi.mocked(capability.updateSchedule).mockRejectedValue(
+      new Error('schedule s1 not found'),
+    );
+    const call = routerCaller(createScheduleRouter(options));
+    expect(
+      await call('PATCH', '/api/schedules/s1', { cron: '*/10 * * * *' }),
+    ).toEqual({
+      status: 500,
+      body: { error: 'internal error' },
+    });
+  });
+});
+
+describe('contained schedule audits', () => {
+  it('does not reclassify a rejected route when audit throws a route error', async () => {
+    const error = new RunRouteError(404, 'audit private detail');
+    const audit = vi.fn(() => {
+      throw error;
+    });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const h = harness(ctx('acme', 'viewer'), { audit });
+    await expect(
+      h.call('POST', '/api/schedules', WORKFLOW_CREATE),
+    ).resolves.toEqual({
+      status: 403,
+      body: { error: 'forbidden' },
+    });
+    expect(audit).toHaveBeenCalledTimes(1);
+    expect(logged).toHaveBeenCalledWith(
+      expect.stringContaining('schedule.route-audit-error'),
+      error,
+    );
+  });
+
+  const failures = [
+    ['ordinary', () => new Error('audit unavailable'), 'audit unavailable'],
+    [
+      'throwing message',
+      () =>
+        Object.defineProperty(new Error(), 'message', {
+          get() {
+            throw new Error('message getter failed');
+          },
+        }),
+      'unreadable error',
+    ],
+    [
+      'throwing coercion',
+      () => ({
+        [Symbol.toPrimitive]() {
+          throw new Error('coercion failed');
+        },
+      }),
+      'unreadable error',
+    ],
+    [
+      'non-string message',
+      () => Object.defineProperty(new Error(), 'message', { value: 1n }),
+      '1',
+    ],
+  ] as const;
+
+  it.each(
+    failures,
+  )('contains %s audit failures for accepted and rejected outcomes', async (_label, build, diagnostic) => {
+    for (const asyncFailure of [false, true]) {
+      for (const scenario of [
+        'create',
+        'delete',
+        'pending',
+        'no-op',
+        'role',
+        'ownership',
+      ] as const) {
+        const error = build();
+        const audit = vi.fn(() => {
+          if (asyncFailure) return Promise.reject(error);
+          throw error;
+        });
+        const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const context = ctx(
+          'acme',
+          scenario === 'role' ? 'viewer' : 'operator',
+          async () => scenario !== 'ownership',
+        );
+        const h = harness(context, { audit });
+        h.store.m.set('s1', scheduleRow('paused'));
+        if (scenario === 'pending')
+          h.store.deleteOwnedSchedule = async () => 'pending';
+        const result =
+          scenario === 'create' || scenario === 'role'
+            ? await h.call('POST', '/api/schedules', WORKFLOW_CREATE)
+            : scenario === 'no-op'
+              ? await h.call('POST', '/api/schedules/s1/pause')
+              : await h.call('DELETE', '/api/schedules/s1');
+        const status = {
+          create: 201,
+          delete: 200,
+          pending: 202,
+          'no-op': 200,
+          role: 403,
+          ownership: 404,
+        }[scenario];
+        expect(result.status).toBe(status);
+        expect(audit).toHaveBeenCalledTimes(1);
+        const message = logged.mock.calls[0]?.[0];
+        expect(JSON.parse(String(message))).toMatchObject({
+          type: 'schedule.route-audit-error',
+          reason: diagnostic,
+        });
+        expect(logged.mock.calls[0]?.[1]).toBe(error);
+        expect(h.store.m.has('s1')).toBe(scenario !== 'delete');
+        if (scenario === 'create') expect(h.store.m.size).toBe(2);
+        logged.mockRestore();
+      }
+    }
+  });
+
+  it('preserves the selected response when audit diagnostic reporting throws', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {
+      throw new Error('logger unavailable');
+    });
+    const audit = vi.fn(async () => {
+      throw new RunRouteError(404, 'sink unavailable');
+    });
+    const h = harness(ctx('acme', 'viewer'), { audit });
+    expect(await h.call('POST', '/api/schedules', WORKFLOW_CREATE)).toEqual({
+      status: 403,
+      body: { error: 'forbidden' },
+    });
+    expect(audit).toHaveBeenCalledTimes(1);
   });
 });

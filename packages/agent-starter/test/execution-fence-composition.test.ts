@@ -1,14 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-// The composition proof the unit tests cannot make. flowsafe pins what a fenced
-// tick DOES; this pins that THIS HOST wired one — the failure the required
-// `executionFence` option exists to prevent is a deployment where the runtime is
-// fenced and the tick is not, and every flowsafe test would still pass.
-//
-// The loss is silent and total: an unfenced tick claims a due fire through the
-// schedules CAS, which advances `nextFireAt`, and the fenced runtime then
-// refuses the start. The fire is consumed and never runs, and nothing reports
-// it — which is why the assertion below is on the schedule ROW, not on the
-// tally the pass returned.
 
 import type { WorkflowRunState } from '@mastra/core/workflows';
 import { humanPrincipal } from '@proofoftech/flowsafe/approval-api';
@@ -18,11 +8,15 @@ import {
   StartIdempotencyStore,
 } from '@proofoftech/flowsafe/do-runner';
 import { approvalStoreFactoryFor } from '@proofoftech/flowsafe/host-kit';
+import {
+  D1SchedulesStorage,
+  FENCED_SCHEDULE_STORAGE,
+} from '@proofoftech/flowsafe/schedules';
 import { describe, expect, it } from 'vitest';
 
 import { starterMaintenanceTick } from '../src/maintenance.js';
 import { contextForPrincipal } from '../src/principal-context.js';
-import { schedulesStore } from '../src/storage.js';
+import { createComposedStorage, schedulesStore } from '../src/storage.js';
 
 interface SqliteStatement {
   get(...params: unknown[]): unknown;
@@ -55,12 +49,14 @@ function sqliteUnitDatabase(db: SqliteDatabase): unknown {
 
   function statement(sql: string, params: unknown[]): Record<string, unknown> {
     const execute = () => {
-      const outcome = db.prepare(sql).run(...params) as {
-        changes?: number | bigint;
+      const results = db.prepare(sql).all(...params);
+      const outcome = db.prepare('SELECT changes() AS count').get() as {
+        count: number | bigint;
       };
       return {
         success: true,
-        meta: { changes: Number(outcome?.changes ?? 0) },
+        results,
+        meta: { changes: Number(outcome.count) },
       };
     };
     return {
@@ -139,15 +135,24 @@ function starterEnv(db: Env['DB']): Env {
 }
 
 describe('starter maintenance tick and the deployment execution fence', () => {
+  it('uses the original database for direct and composed schedule capabilities', async () => {
+    const db = sqliteUnitDatabase(openSqlite()) as Env['DB'];
+    const direct = schedulesStore(db);
+    expect(direct[FENCED_SCHEDULE_STORAGE]?.database).toBe(db);
+    const storage = createComposedStorage(db);
+    await storage.init();
+    const domain = await storage.getStore('schedules');
+    expect(domain).toBeInstanceOf(D1SchedulesStorage);
+    if (!(domain instanceof D1SchedulesStorage))
+      throw new Error('composed schedule domain is missing');
+    expect(domain[FENCED_SCHEDULE_STORAGE]?.database).toBe(db);
+  });
+
   it('leaves a due schedule row untouched while the deployment is migration-locked', async () => {
-    // #given — this host's own tick over a database whose fence is locked. The
-    // fence store is built from the SAME binding the tick's own
-    // `executionFence(env.DB)` resolves, which is the wiring under test: a tick
-    // pointed at another database would read `open` here and claim.
     const db = sqliteUnitDatabase(openSqlite()) as Env['DB'];
     const env = starterEnv(db);
     const fence = new ExecutionFenceStore(db);
-    await fence.seed('migration-locked');
+    await fence.seed('open');
 
     const store = schedulesStore(db);
     const due = {
@@ -165,14 +170,15 @@ describe('starter maintenance tick and the deployment execution fence', () => {
       metadata: {},
     };
     await store.createSchedule(due);
+    await fence.transition({ expected: 'open', next: 'draining' });
+    await fence.transition({
+      expected: 'draining',
+      next: 'migration-locked',
+    });
     const before = await store.getSchedule(due.id);
 
-    // #when — the cron duty runs, exactly as the maintenance Durable Object
-    // invokes it.
     await starterMaintenanceTick(env)();
 
-    // #then — the row is byte-identical. Nothing was claimed, so the fire is
-    // still due and the deployment taking over will run it.
     await expect(store.getSchedule(due.id)).resolves.toEqual(before);
     await expect(store.listDueSchedules(NOW, 10)).resolves.toHaveLength(1);
     await expect(store.listTriggers(due.id)).resolves.toEqual([]);

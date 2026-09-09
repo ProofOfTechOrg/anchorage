@@ -446,10 +446,11 @@ function stubTopology(): ReturnType<typeof createThreadTopology> {
   return createThreadTopology(stubThreadNamespace(), TEST_IDENTITY_SECRET);
 }
 
-/** The real D1 schedules domain over node:sqlite, with its schema created. */
-async function schedulesDomain(): Promise<D1SchedulesStorage> {
+async function schedulesDomain(
+  database?: ExecutionFenceDatabase,
+): Promise<D1SchedulesStorage> {
   const store = new D1SchedulesStorage(
-    sqliteUnitDatabase(openSqlite()) as ScheduleDatabase,
+    (database ?? sqliteUnitDatabase(openSqlite())) as ScheduleDatabase,
   );
   await store.init();
   return store;
@@ -1049,10 +1050,10 @@ const ENTRIES: readonly Entry[] = [
     name: 'schedule router create',
     module: 'schedules/router.ts — authoring a standing fire',
     predicate: 'admitsWorkAuthoring',
-    prepare: async (fence) => {
+    prepare: async (fence, database) => {
       const router = createScheduleRouter({
         resolve: async () => actorContext(),
-        store: await schedulesDomain(),
+        store: await schedulesDomain(database),
         targetPolicy: TARGET_POLICY,
         validateThreadTarget: async () => undefined,
         executionFence: fence,
@@ -1408,6 +1409,16 @@ const GATE_SITES: ReadonlyArray<GateSite & { drivenBy: string }> = [
     drivenBy: 'schedule router create',
   },
   {
+    file: 'schedules/schedules-d1.ts',
+    predicate: 'admitsWorkAuthoring',
+    drivenBy: './schedules/schedules-d1.test.ts',
+  },
+  {
+    file: 'schedules/schedules-d1.ts',
+    predicate: 'admitsWorkAuthoring',
+    drivenBy: './schedules/schedules-d1.test.ts',
+  },
+  {
     file: 'schedules/tick.ts',
     predicate: 'admitsWorkAuthoring',
     drivenBy: 'schedule tick claim',
@@ -1549,7 +1560,6 @@ function predicateCallSites({ file, source }: SourceFile): GateSite[] {
   return found;
 }
 
-/** Presence/deletion census of the actual inline initial INSERT guard. */
 function sqlAdmissionSites({ file, source }: SourceFile): GateSite[] {
   const parsed = ts.createSourceFile(
     file,
@@ -1558,6 +1568,21 @@ function sqlAdmissionSites({ file, source }: SourceFile): GateSite[] {
     true,
   );
   const found: GateSite[] = [];
+  const admissionBindings = new Set<string>();
+  const collectBindings = (node: ts.Node): void => {
+    if (
+      ts.isVariableDeclaration(node) &&
+      ts.isIdentifier(node.name) &&
+      node.initializer &&
+      ts.isCallExpression(node.initializer) &&
+      ts.isIdentifier(node.initializer.expression) &&
+      node.initializer.expression.text === 'executionFenceAdmissionSql'
+    ) {
+      admissionBindings.add(node.name.text);
+    }
+    ts.forEachChild(node, collectBindings);
+  };
+  collectBindings(parsed);
   const visit = (node: ts.Node): void => {
     if (
       ts.isCallExpression(node) &&
@@ -1572,11 +1597,13 @@ function sqlAdmissionSites({ file, source }: SourceFile): GateSite[] {
           ts.isTemplateExpression(argument))
       ) {
         const sql = argument.getText(parsed).slice(1, -1);
+        const sharedGuard = /\bWHERE\s+\$\{\s*([\w$]+)\s*\}/i.exec(sql)?.[1];
         if (
           /^\s*INSERT\s+INTO\b/i.test(sql) &&
-          /\bWHERE\s+EXISTS\s*\(\s*SELECT\s+1\s+FROM\s+(?:flowsafe_execution_fence|\$\{EXECUTION_FENCE_TABLE\})\s+AS\s+f\b/i.test(
+          (/\bWHERE\s+EXISTS\s*\(\s*SELECT\s+1\s+FROM\s+(?:flowsafe_execution_fence|\$\{EXECUTION_FENCE_TABLE\})\s+AS\s+f\b/i.test(
             sql,
-          )
+          ) ||
+            (sharedGuard !== undefined && admissionBindings.has(sharedGuard)))
         ) {
           found.push({
             file,
@@ -2024,6 +2051,49 @@ const FENCE_ERROR_AUTHORS: ReadonlyArray<{
     effectBoundary:
       'The poll admission check refuses before any provider is polled or notification is delivered.',
   },
+  {
+    file: 'do-runner/execution-fence.ts',
+    error: 'ExecutionFenceUnreadableError',
+    anchor:
+      'const values = FENCE_ADMISSION_FIELDS.map((key) => observation.raw[key]);',
+    effectBoundary:
+      'Semantic field types are checked before initial admission and schedule binding; schedule transaction diagnosis preserves unknown outcomes after a positive mutation witness.',
+  },
+  {
+    file: 'do-runner/fenced-workflows-d1.ts',
+    error: 'ExecutionFenceUnreadableError',
+    anchor: 'schema = await captureExecutionFenceAdmissionSchema(',
+    effectBoundary:
+      'Unreadable current schema refuses initial admission before its snapshot and dependent reservation or proof writes.',
+  },
+  {
+    file: 'schedules/schedules-d1.ts',
+    error: 'ExecutionFencedError',
+    anchor: '!admitsWorkAuthoring(observation.reading)',
+    effectBoundary:
+      'Closed authoring state refuses schedule preparation before the mutation batch; the final SQL predicate independently checks the captured frame.',
+  },
+  {
+    file: 'schedules/schedules-d1.ts',
+    error: 'ExecutionFenceUnreadableError',
+    anchor: 'results: captured.rows,',
+    effectBoundary:
+      'Unreadable schema evidence refuses preparation before authoring SQL; the captured valid schema is compared again by the mutation predicate.',
+  },
+  {
+    file: 'schedules/schedules-d1.ts',
+    error: 'ExecutionFenceUnreadableError',
+    anchor: 'results: schemaResult.rows,',
+    effectBoundary:
+      'Invalid transactional authority is a refusal with zero write evidence; a positive mutation witness instead reports an unknown outcome without compensation.',
+  },
+  {
+    file: 'schedules/schedules-d1.ts',
+    error: 'ExecutionFencedError',
+    anchor: '!admitsWorkAuthoring(current.reading)',
+    effectBoundary:
+      'The transaction observation diagnoses final state refusal when the guarded writes have no witness; contradictory positive writes become an unknown outcome.',
+  },
 ];
 
 function fenceErrorAuthorSites(): Array<{
@@ -2194,6 +2264,7 @@ describe('execution-entry matrix', () => {
     const insert = `INSERT INTO \${snapshotTable}`;
     const guard = `WHERE EXISTS (SELECT 1 FROM ${fenceTable} AS f WHERE f.state = 'open')`;
     const guardedPrepare = `database.prepare(\`${insert} SELECT 1 ${guard} \${optionalParticipantClauses}\`)`;
+    const sharedPrepare = `const finalFence = executionFenceAdmissionSql(input); database.prepare(\`${insert} SELECT 1 WHERE \${finalFence} \${optionalParticipantClauses}\`)`;
     const sqlSite: GateSite = {
       file: 'do-runner/fenced-workflows-d1.ts',
       predicate: 'admitsRunStart',
@@ -2202,6 +2273,7 @@ describe('execution-entry matrix', () => {
 
     it.each([
       ['template with participant interpolation', guardedPrepare],
+      ['shared admission predicate', sharedPrepare],
       [
         'whitespace and a literal table name',
         'database.prepare(`\n INSERT\n INTO snapshot SELECT 1\n' +
@@ -2242,6 +2314,14 @@ describe('execution-entry matrix', () => {
         ),
       ],
       ['unguarded INSERT', guardedPrepare.replace(guard, 'WHERE 1 = 1')],
+      [
+        'unused shared predicate',
+        sharedPrepare.replace(`WHERE \${finalFence}`, 'WHERE 1 = 1'),
+      ],
+      [
+        'unrecognized predicate binding',
+        sharedPrepare.replace('executionFenceAdmissionSql', 'otherSql'),
+      ],
     ])('does not invent a SQL gate from %s', (_name, source) => {
       expect(sqlAdmissionSites({ file: sqlSite.file, source })).toEqual([]);
     });

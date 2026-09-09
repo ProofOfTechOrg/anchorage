@@ -17,10 +17,17 @@ import {
   EXECUTION_PRINCIPAL_HEADER,
   executionFenceFor,
   InvalidMutationEpochError,
+  MUTATION_EPOCH_HEADER,
   type RunDeadlineCursor,
   type RunSummary,
   startIdempotencyFor,
 } from '../do-runner/index.js';
+import {
+  createScheduleRouter,
+  createScheduleTargetPolicy,
+  D1SchedulesStorage,
+  type ScheduleDatabase,
+} from '../schedules/index.js';
 import type { ResumeRunFn } from './approval-bridge.js';
 import {
   createFlowsafeWorker,
@@ -1091,6 +1098,91 @@ describe('createFlowsafeWorker fetch pipeline', () => {
     );
     // #then — no schedule handling, as before the seam existed
     expect(unmounted.status).toBe(404);
+  });
+
+  it('carries the configured epoch through authentication into the schedule store', async () => {
+    const h = makeEnv();
+    const store = new D1SchedulesStorage(h.env.DB as ScheduleDatabase);
+    const fence = executionFenceFor(h.env.DB);
+    await fence.seed('open');
+    const initial = await fence.read();
+    const draining = await fence.transition({
+      expected: 'open',
+      next: 'draining',
+      expectedMutationEpoch: initial.mutationEpoch,
+      expectedRevision: initial.transitionRevision,
+      advanceMutationEpoch: true,
+    });
+    await fence.transition({
+      expected: 'draining',
+      next: 'open',
+      expectedMutationEpoch: draining.mutationEpoch,
+      expectedRevision: draining.transitionRevision,
+    });
+    const entered = cWorkerDeferred();
+    const hold = cWorkerDeferred();
+    let epoch = 1;
+    const verify = vi.fn(async () => {
+      entered.release();
+      await hold.promise;
+      return { id: 'ada', role: 'admin' as const };
+    });
+    const worker = makeWorker({
+      mutationEpoch: () => epoch,
+      buildVerifier: () => ({ verify }),
+      buildScheduleRouter: (resolve) =>
+        createScheduleRouter({
+          resolve,
+          store,
+          executionFence: fence,
+          targetPolicy: createScheduleTargetPolicy({
+            workflows: WORKFLOWS,
+            agents: [],
+          }),
+          validateThreadTarget: async () => undefined,
+        }),
+    });
+    const request = () =>
+      authed('http://host/api/schedules', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ workflowId: 'wf', cron: '*/5 * * * *' }),
+      });
+    const pending = worker.fetch(request(), h.env, h.ctx);
+    try {
+      expect(
+        await Promise.race([
+          entered.promise.then(() => true),
+          pending.then(() => false),
+        ]),
+      ).toBe(true);
+      epoch = 2;
+      hold.release();
+      const response = await pending;
+      expect(response.status).toBe(201);
+      const created = (await response.json()) as { schedule: { id: string } };
+      expect((await store.listSchedules()).map((row) => row.id)).toEqual([
+        created.schedule.id,
+      ]);
+    } finally {
+      hold.release();
+      await pending;
+    }
+    const future = await worker.fetch(request(), h.env, h.ctx);
+    expect(future.status).toBe(409);
+    expect(await future.json()).toMatchObject({
+      reason: {
+        code: 'MUTATION_EPOCH_MISMATCH',
+        classification: 'future',
+        mutationEpoch: 1,
+      },
+    });
+    const forged = request();
+    forged.headers.set(MUTATION_EPOCH_HEADER, '1');
+    const rejected = await worker.fetch(forged, h.env, h.ctx);
+    expect(rejected.status).toBe(403);
+    expect(verify).toHaveBeenCalledTimes(2);
+    expect(await store.listSchedules()).toHaveLength(1);
   });
 });
 

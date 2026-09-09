@@ -1913,6 +1913,175 @@ describe('FS8 D2 dormant reservation primitives', () => {
 
 describe('owned initial workflow admission', () => {
   it.each([
+    [
+      'unsupported column',
+      'ALTER TABLE flowsafe_execution_fence ADD COLUMN admission_extension TEXT',
+    ],
+    [
+      'nullable-id second row',
+      "INSERT INTO flowsafe_execution_fence (id, state, updated_at) VALUES (NULL, 'open', 0)",
+    ],
+  ])('refuses a final %s without changing keyed proof participants', async (_condition, change) => {
+    const h = await fixture({ keyed: true, state: 'proof-only' });
+    const resources = new D1ResourceOwnershipStore(
+      h.db as unknown as ResourceOwnershipDatabase,
+    );
+    expect(
+      await resources.reserveAll(
+        [{ kind: 'run', resourceId: 'run' }],
+        OWNER,
+        'correlation',
+      ),
+    ).toBe(true);
+    const input = {
+      ...h.input,
+      runOwnerGuard: { owner: OWNER, reservationToken: 'correlation' },
+    };
+    const participants = () => ({
+      reservations: h.sql
+        .prepare('SELECT * FROM flowsafe_start_idempotency')
+        .all(),
+      owners: h.sql.prepare('SELECT * FROM flowsafe_resource_owners').all(),
+    });
+    const before = participants();
+    const batch = h.db.batch.bind(h.db);
+    let changedFence: unknown;
+    const write = vi
+      .spyOn(h.db, 'batch')
+      .mockImplementationOnce(async (statements) => {
+        expect(h.rows()).toEqual([]);
+        expect(
+          h.sql.prepare('PRAGMA ignore_check_constraints').get(),
+        ).toMatchObject({
+          ignore_check_constraints: 0,
+        });
+        h.sql.exec(change);
+        changedFence = h.sql
+          .prepare('SELECT * FROM flowsafe_execution_fence')
+          .all();
+        const result = await batch(statements);
+        expect(h.rows()).toEqual([]);
+        expect(participants()).toEqual(before);
+        expect(
+          h.sql.prepare('SELECT * FROM flowsafe_execution_fence').all(),
+        ).toEqual(changedFence);
+        return result;
+      });
+    const outcome = await h.admit(input).catch((error: unknown) => error);
+    expect(outcome).toMatchObject({
+      status: 503,
+      reason: { code: 'EXECUTION_FENCE_UNREADABLE' },
+    });
+    expect(isDefinitiveInitialAdmissionRefusal(outcome, input.execution)).toBe(
+      true,
+    );
+    expect(write).toHaveBeenCalledOnce();
+    expect(h.onInitialWriteAttempt).toHaveBeenCalledOnce();
+    expect(h.rows()).toEqual([]);
+    expect(participants()).toEqual(before);
+    expect(
+      h.sql.prepare('SELECT * FROM flowsafe_execution_fence').all(),
+    ).toEqual(changedFence);
+    expect(h.effects()).toBe(0);
+    await expect(h.fence.readForAdmission()).rejects.toBeInstanceOf(
+      ExecutionFenceUnreadableError,
+    );
+  });
+
+  it('admits exact active-epoch proof and reservation participants under the supported schema', async () => {
+    const h = await fixture({ keyed: true });
+    const reading = await h.fence.transition({
+      expected: 'open',
+      next: 'proof-only',
+      proofKey: 'key',
+      expectedMutationEpoch: 0,
+      expectedRevision: 0,
+      advanceMutationEpoch: true,
+    });
+    const input = {
+      ...h.input,
+      mutationEpoch: reading.mutationEpoch,
+      proof: {
+        key: 'key',
+        mutationEpoch: reading.mutationEpoch,
+        transitionRevision: reading.transitionRevision,
+      },
+      requestContext: {
+        ...h.input.requestContext,
+        [PROVENANCE]: {
+          ...(h.input.requestContext[PROVENANCE] as object),
+          mutationEpoch: reading.mutationEpoch,
+        },
+      },
+    };
+    expect((await h.admit(input)).witness.execution).toEqual(input.execution);
+    expect(h.rows()).toHaveLength(1);
+    expect(
+      (await h.input.reservationStore?.readForAdmission('key'))?.binding,
+    ).toEqual({
+      kind: 'bound',
+      execution: input.execution,
+    });
+    expect((await h.fence.readForAdmission()).reading.proofExecution).toEqual(
+      input.execution,
+    );
+    expect(h.effects()).toBe(0);
+  });
+
+  it.each([
+    'before insert',
+    'after insert',
+  ] as const)('classifies response loss when the fence schema changes %s', async (phase) => {
+    const h = await fixture({ keyed: true });
+    const before = h.sql
+      .prepare('SELECT * FROM flowsafe_start_idempotency')
+      .all();
+    const batch = h.db.batch.bind(h.db);
+    const lost = new Error('initial admission response lost');
+    const change = () =>
+      h.sql.exec(
+        'ALTER TABLE flowsafe_execution_fence ADD COLUMN admission_extension TEXT',
+      );
+    const write = vi
+      .spyOn(h.db, 'batch')
+      .mockImplementationOnce(async (statements) => {
+        if (phase === 'before insert') change();
+        await batch(statements);
+        if (phase === 'after insert') change();
+        throw lost;
+      });
+    const outcome = await h.admit().catch((error: unknown) => error);
+    expect(write).toHaveBeenCalledTimes(2);
+    expect(h.onInitialWriteAttempt).toHaveBeenCalledOnce();
+    expect(h.effects()).toBe(0);
+    if (phase === 'before insert') {
+      expect(outcome).toBeInstanceOf(ExecutionFenceUnreadableError);
+      expect(outcome).toMatchObject({ cause: lost });
+      expect(
+        isDefinitiveInitialAdmissionRefusal(outcome, h.input.execution),
+      ).toBe(false);
+      expect(h.rows()).toEqual([]);
+      expect(
+        h.sql.prepare('SELECT * FROM flowsafe_start_idempotency').all(),
+      ).toEqual(before);
+    } else {
+      expect(outcome).toMatchObject({
+        witness: { execution: h.input.execution },
+      });
+      expect(h.rows()).toHaveLength(1);
+      expect(
+        (await h.input.reservationStore?.readForAdmission('key'))?.binding,
+      ).toEqual({
+        kind: 'bound',
+        execution: h.input.execution,
+      });
+    }
+    await expect(h.fence.readForAdmission()).rejects.toBeInstanceOf(
+      ExecutionFenceUnreadableError,
+    );
+  });
+
+  it.each([
     'foreign fence binding',
     'foreign reservation binding',
     'wrapped fence binding',
@@ -2372,7 +2541,7 @@ describe('owned initial workflow admission', () => {
       });
       const result = await h.admit(input).catch((error: unknown) => error);
       expect(h.rows()).toHaveLength(disposition === 'keep' ? 1 : 0);
-      expect(parameters).toBe(31);
+      expect(parameters).toBe(32);
       if (disposition !== 'keep') {
         expect(result).toMatchObject({
           reason: {

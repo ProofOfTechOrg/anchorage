@@ -85,10 +85,23 @@ function harnessOptions() {
 }
 
 async function result<T>(worker: WorkerHandle, path: string): Promise<T> {
+  const p3 = path.startsWith('/epoch-p3/');
+  if (p3) p3Isolation.reusable = false;
   const response = await worker.fetch(path, { method: 'POST' });
   const body = await response.text();
   expect(response.status, body).toBe(200);
-  return JSON.parse(body) as T;
+  const parsed = JSON.parse(body);
+  if (p3) {
+    expect(parsed.quiescent, path).toBe(true);
+    if (path.startsWith('/epoch-p3/run'))
+      expect(parsed.checkedRun).toEqual({
+        workflowId: 'workflow-schedule',
+        runId: 'p3-run',
+      });
+    recordP3Measurements(path, parsed.metrics);
+    p3Isolation.reusable = true;
+  }
+  return parsed as T;
 }
 
 interface RetentionCursor {
@@ -140,6 +153,245 @@ const RETENTION_SCOPE = {
   startIdempotencyTable: 'e_retention_start_requests',
 };
 
+interface P3Response {
+  status: number;
+  body: {
+    reason?: { code: string; classification?: string; mutationEpoch?: number };
+    schedule?: { id: string; status: string };
+    result?: { value: string };
+  };
+}
+
+interface P3Metrics {
+  statements: number;
+  batches: number;
+  maxBatchStatements: number;
+  maxSqlBytes: number;
+  maxBindings: number;
+  maxBoundStringBytes: number;
+  maxResultBytes: number;
+  rowsRead: number;
+  rowsWritten: number;
+}
+
+const p3Measurements = new Map<
+  string,
+  {
+    samples: number;
+    minStatements: number;
+    maxStatementScenario: string;
+    maxima: P3Metrics;
+  }
+>();
+
+const p3Isolation = { entered: false, reusable: false, resets: 0, cleanups: 0 };
+
+function recordP3Measurements(
+  path: string,
+  value: P3Metrics | Record<string, P3Metrics>,
+) {
+  const stages =
+    typeof value.statements === 'number'
+      ? { cas: value as P3Metrics }
+      : (value as Record<string, P3Metrics>);
+  for (const [stage, metrics] of Object.entries(stages)) {
+    const previous = p3Measurements.get(stage);
+    if (!previous) {
+      p3Measurements.set(stage, {
+        samples: 1,
+        minStatements: metrics.statements,
+        maxStatementScenario: path,
+        maxima: { ...metrics },
+      });
+      continue;
+    }
+    previous.samples++;
+    previous.minStatements = Math.min(
+      previous.minStatements,
+      metrics.statements,
+    );
+    if (metrics.statements > previous.maxima.statements)
+      previous.maxStatementScenario = path;
+    for (const key of Object.keys(metrics) as Array<keyof P3Metrics>)
+      previous.maxima[key] = Math.max(previous.maxima[key], metrics[key]);
+  }
+}
+
+interface P3Fence {
+  state: string;
+  mutationEpoch: number;
+  requireMutationEpoch: boolean;
+  transitionRevision: number;
+}
+
+interface P3ScheduleState {
+  schedules: Array<Record<string, unknown>>;
+  triggers: Array<Record<string, unknown>>;
+  owners: Array<Record<string, unknown>>;
+}
+
+interface P3ScheduleResult {
+  operation: string;
+  response: P3Response;
+  gateHits: number;
+  finalBatches: number;
+  before: P3ScheduleState;
+  intervened: P3ScheduleState;
+  after: P3ScheduleState;
+  reads?: { list: P3Response; get: P3Response; history: P3Response };
+  positive?: P3Response;
+  positiveState?: P3ScheduleState;
+  settled?: P3ScheduleState;
+  audit: Array<{ actorId: string; operation: string; outcome: string }>;
+  fenceBeforeRelease: P3Fence;
+  fenceAfter: P3Fence;
+  bodyBytes: number;
+  metrics: Record<string, P3Metrics>;
+}
+
+interface P3RunState {
+  snapshots: Array<Record<string, unknown>>;
+  keys: Array<Record<string, unknown>>;
+  owners: Array<Record<string, unknown>>;
+}
+
+interface P3RunResult {
+  response: P3Response;
+  capturedEpoch: number | null;
+  gateHits: number;
+  initialBatches: number;
+  before: P3RunState;
+  intervened: P3RunState;
+  after: P3RunState;
+  positiveRows: P3RunState;
+  effectsAfterRequest: number;
+  effects: number;
+  cachedAfterRequest: boolean;
+  activeAfterRequest: boolean;
+  positive?: { status: string; result: { value: string } };
+  fenceBeforeRelease: P3Fence;
+  fenceAfter: P3Fence;
+  metrics: Record<string, P3Metrics>;
+}
+
+interface P3StructuralFence {
+  rows: Array<Record<string, unknown>>;
+  schema: Array<Record<string, unknown>>;
+}
+
+interface P3StructuralRunResult extends Omit<P3RunResult, 'fenceAfter'> {
+  fenceAfter?: P3Fence;
+  structural: {
+    fixture: string;
+    proof: boolean;
+    responseLosses: number;
+    initialBatchRows: number[];
+    before: P3StructuralFence;
+    intervened: P3StructuralFence;
+    after: P3StructuralFence;
+  };
+}
+
+function expectP3StructuralRefusal(
+  outcome: P3StructuralRunResult,
+  keyed: boolean,
+  lostResponse = false,
+) {
+  expect(outcome.response.status, JSON.stringify(outcome.response.body)).toBe(
+    503,
+  );
+  expect(outcome.response.body.reason).toEqual({
+    code: 'EXECUTION_FENCE_UNREADABLE',
+  });
+  expect(outcome.gateHits).toBe(1);
+  expect(outcome.initialBatches).toBe(1);
+  expect(outcome.capturedEpoch).toBe(2);
+  expect(outcome.effectsAfterRequest).toBe(0);
+  expect(outcome.effects).toBe(0);
+  expect(outcome.activeAfterRequest).toBe(false);
+  expect(outcome.after.snapshots).toEqual([]);
+  expect(outcome.after.owners).toEqual(outcome.before.owners);
+  expect(JSON.stringify(outcome.structural.after)).toBe(
+    JSON.stringify(outcome.structural.intervened),
+  );
+  expect(outcome.structural.initialBatchRows).toEqual(
+    keyed ? [0, 0, 0] : [0, 0],
+  );
+  if (!lostResponse) expect(outcome.cachedAfterRequest).toBe(false);
+  if (keyed) {
+    expect(
+      outcome.after.keys.find((row) => row.key === 'p3-key'),
+    ).toMatchObject({
+      owner_id: 'p3-owner',
+      target_id: 'workflow-schedule',
+      run_id: 'p3-run',
+      state: lostResponse ? 'started' : 'reserved',
+      start_token: '',
+      start_table_prefix: null,
+      start_workflow_id: null,
+    });
+    expect(outcome.after.keys.filter((row) => row.key !== 'p3-key')).toEqual(
+      outcome.before.keys,
+    );
+  } else expect(outcome.after).toEqual(outcome.before);
+  if (lostResponse) expect(outcome.after).toEqual(outcome.intervened);
+  expectP3Metrics(outcome.metrics);
+}
+
+const P3_OPERATIONS = [
+  'create',
+  'update',
+  'pause',
+  'resume',
+  'delete',
+  'pause-noop',
+  'resume-noop',
+] as const;
+
+function expectP3Metrics(metrics: Record<string, P3Metrics>) {
+  for (const measured of Object.values(metrics)) {
+    expect(measured.statements).toBeLessThanOrEqual(1000);
+    expect(measured.maxSqlBytes).toBeLessThanOrEqual(90_000);
+    expect(measured.maxBindings).toBeLessThanOrEqual(100);
+    expect(measured.maxBoundStringBytes).toBeLessThanOrEqual(2_000_000);
+  }
+}
+
+function expectP3EpochRefusal(
+  response: P3Response,
+  classification: string,
+  epoch: number,
+) {
+  expect(response.status, JSON.stringify(response.body)).toBe(409);
+  expect(response.body.reason).toEqual({
+    code: 'MUTATION_EPOCH_MISMATCH',
+    classification,
+    mutationEpoch: epoch,
+  });
+}
+
+function expectP3Preserved(result: P3ScheduleResult) {
+  expect(JSON.stringify(result.after)).toBe(JSON.stringify(result.intervened));
+  expect(result.fenceAfter).toEqual(result.fenceBeforeRelease);
+  expectP3Metrics(result.metrics);
+}
+
+function expectP3RunRefused(result: P3RunResult) {
+  expect(JSON.stringify(result.after)).toBe(JSON.stringify(result.before));
+  expect(result.effectsAfterRequest).toBe(0);
+  expect(result.cachedAfterRequest).toBe(false);
+  expect(result.activeAfterRequest).toBe(false);
+  expect(result.after.snapshots).toEqual([]);
+  expect(result.positive).toMatchObject({
+    status: 'success',
+    result: { value: 'positive' },
+  });
+  expect(result.effects).toBe(1);
+  expect(result.positiveRows.snapshots).toHaveLength(1);
+  expect(result.fenceAfter).toEqual(result.fenceBeforeRelease);
+  expectP3Metrics(result.metrics);
+}
+
 describe.sequential('FlowSafe Wrangler test harness', () => {
   let server: TestHarness;
   let spike: WorkerHandle;
@@ -152,8 +404,35 @@ describe.sequential('FlowSafe Wrangler test harness', () => {
     await server.listen();
   });
 
+  async function prepareP3() {
+    const reusable = p3Isolation.entered && p3Isolation.reusable;
+    p3Isolation.reusable = false;
+    if (reusable) {
+      probe = server.getWorker('flowsafe-harness-probe');
+      expect(await result(probe, '/p3-cleanup')).toEqual({ remaining: [] });
+      p3Isolation.cleanups++;
+    } else {
+      await server.reset();
+      p3Isolation.resets++;
+    }
+    p3Isolation.entered = true;
+    probe = server.getWorker('flowsafe-harness-probe');
+    await result(probe, '/seed');
+  }
+
   beforeEach(async ({ task }) => {
+    if (task.name.startsWith('FS8 P3')) {
+      await prepareP3();
+      return;
+    }
+    const leavingP3 = p3Isolation.entered;
+    p3Isolation.entered = false;
+    p3Isolation.reusable = false;
     if (task.name.startsWith('FS8 E retention')) {
+      if (leavingP3) {
+        await server.reset();
+        p3Isolation.resets++;
+      }
       // Scenario cleanup preserves the surrounding namespace census across requests.
       probe = server.getWorker('flowsafe-harness-probe');
       await result(probe, '/seed');
@@ -161,6 +440,7 @@ describe.sequential('FlowSafe Wrangler test harness', () => {
       return;
     }
     await server.reset();
+    if (leavingP3) p3Isolation.resets++;
     spike = server.getWorker('flowsafe-do-runner-demo');
     deploy = server.getWorker('anchorage-flowsafe-replace-me');
     alarmHarness = server.getWorker('flowsafe-maintenance-alarm-harness');
@@ -185,7 +465,706 @@ describe.sequential('FlowSafe Wrangler test harness', () => {
   });
 
   afterAll(async () => {
-    await server.close();
+    try {
+      if (p3Measurements.size)
+        console.info(
+          'FS8 P3 D1 metrics',
+          JSON.stringify(Object.fromEntries(p3Measurements)),
+        );
+      if (p3Isolation.resets)
+        console.info('FS8 P3 fixture isolation', JSON.stringify(p3Isolation));
+    } finally {
+      await server.close();
+    }
+  });
+
+  it.each([
+    'isolation-missing-witness',
+    'unmatched',
+  ])('FS8 P3 resets the fixture after %s and reuses a settled request', async (scenario) => {
+    await expect(result(probe, `/epoch-p3/${scenario}`)).rejects.toThrow();
+    expect(p3Isolation.reusable).toBe(false);
+    const resets = p3Isolation.resets;
+    await prepareP3();
+    expect(p3Isolation.resets).toBe(resets + 1);
+    const first = await result<{ before: P3Fence }>(
+      probe,
+      '/epoch-p3/cas-loss',
+    );
+    expect(first.before).toMatchObject({
+      state: 'open',
+      mutationEpoch: 0,
+      transitionRevision: 0,
+    });
+    const cleanups = p3Isolation.cleanups;
+    await prepareP3();
+    expect(p3Isolation.cleanups).toBe(cleanups + 1);
+    const second = await result<{ before: P3Fence }>(
+      probe,
+      '/epoch-p3/cas-loss',
+    );
+    expect(second.before).toEqual(first.before);
+  });
+
+  it.each(
+    P3_OPERATIONS.flatMap((operation) =>
+      ['auth', 'final'].flatMap((phase) =>
+        ['missing', 'stale'].map((epoch) => ({ operation, phase, epoch })),
+      ),
+    ),
+  )('FS8 P3 holds $operation at $phase across activation with $epoch epoch', async ({
+    operation,
+    phase,
+    epoch,
+  }) => {
+    const outcome = await result<P3ScheduleResult>(
+      probe,
+      `/epoch-p3/schedule?operation=${operation}&phase=${phase}&epoch=${epoch}&action=activate`,
+    );
+    expectP3EpochRefusal(outcome.response, epoch, 1);
+    expect(outcome.gateHits).toBe(1);
+    expect(outcome.finalBatches).toBeGreaterThanOrEqual(
+      phase === 'final' ? 1 : 0,
+    );
+    expect(outcome.fenceAfter).toMatchObject({
+      state: 'open',
+      mutationEpoch: 1,
+      requireMutationEpoch: true,
+    });
+    expect(outcome.audit).toMatchObject([
+      { actorId: 'p3-owner', outcome: 'rejected' },
+    ]);
+    expectP3Preserved(outcome);
+  });
+
+  it.each(
+    P3_OPERATIONS.flatMap((operation) =>
+      ['missing', 'stale', 'future', 'current'].map((epoch) => ({
+        operation,
+        epoch,
+      })),
+    ),
+  )('FS8 P3 enforces activated $epoch epoch on HTTP $operation', async ({
+    operation,
+    epoch,
+  }) => {
+    const outcome = await result<P3ScheduleResult>(
+      probe,
+      `/epoch-p3/schedule?operation=${operation}&epoch=${epoch}`,
+    );
+    if (epoch !== 'current') {
+      expectP3EpochRefusal(outcome.response, epoch, 2);
+      expectP3Preserved(outcome);
+    } else {
+      expect(
+        outcome.response.status,
+        JSON.stringify(outcome.response.body),
+      ).toBe(operation === 'create' ? 201 : 200);
+      expect(outcome.audit).toMatchObject([
+        { actorId: 'p3-owner', outcome: 'accepted' },
+      ]);
+      if (operation.endsWith('-noop')) expectP3Preserved(outcome);
+      else
+        expect(JSON.stringify(outcome.after)).not.toBe(
+          JSON.stringify(outcome.before),
+        );
+      if (operation === 'create') {
+        expect(outcome.after.schedules).toHaveLength(2);
+        expect(outcome.after.owners).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              resource_id: outcome.response.body.schedule?.id,
+              owner_id: 'p3-owner',
+            }),
+          ]),
+        );
+      }
+      if (operation === 'delete')
+        expect(outcome.after).toEqual({
+          schedules: [],
+          triggers: [],
+          owners: [],
+        });
+    }
+    expectP3Metrics(outcome.metrics);
+  });
+
+  it.each(
+    P3_OPERATIONS,
+  )('FS8 P3 preserves draining policy for exact HTTP %s', async (operation) => {
+    const outcome = await result<P3ScheduleResult>(
+      probe,
+      `/epoch-p3/schedule?operation=${operation}&closed=true`,
+    );
+    expect(outcome.reads?.list.status).toBe(200);
+    expect(outcome.reads?.get.status).toBe(operation === 'delete' ? 404 : 200);
+    expect(outcome.reads?.history.status).toBe(
+      operation === 'delete' ? 404 : 200,
+    );
+    if (
+      operation === 'pause' ||
+      operation === 'pause-noop' ||
+      operation === 'delete'
+    ) {
+      expect(
+        outcome.response.status,
+        JSON.stringify(outcome.response.body),
+      ).toBe(200);
+    } else {
+      expect(outcome.response.status).toBe(503);
+      expect(outcome.response.body.reason?.code).toBe('EXECUTION_FENCED');
+      expectP3Preserved(outcome);
+    }
+  });
+
+  it.each(
+    P3_OPERATIONS,
+  )('FS8 P3 admits exact %s through the final gate without a transition', async (operation) => {
+    const outcome = await result<P3ScheduleResult>(
+      probe,
+      `/epoch-p3/schedule?operation=${operation}&phase=final`,
+    );
+    expect(outcome.gateHits).toBe(1);
+    expect(outcome.finalBatches).toBe(1);
+    expect(outcome.response.status, JSON.stringify(outcome.response.body)).toBe(
+      operation === 'create' ? 201 : 200,
+    );
+    if (operation.endsWith('-noop')) expectP3Preserved(outcome);
+    expectP3Metrics(outcome.metrics);
+  });
+
+  it.each(
+    P3_OPERATIONS,
+  )('FS8 P3 refuses exact %s after a same-epoch final-frame cycle', async (operation) => {
+    const outcome = await result<P3ScheduleResult>(
+      probe,
+      `/epoch-p3/schedule?operation=${operation}&phase=final&action=cycle`,
+    );
+    expect(outcome.gateHits).toBe(1);
+    expect(outcome.response.status).toBe(409);
+    expect(outcome.response.body.reason).toEqual({
+      code: 'SCHEDULE_MUTATION_CONFLICT',
+      classification: 'fence-changed',
+    });
+    expectP3Preserved(outcome);
+  });
+
+  it.each(
+    P3_OPERATIONS,
+  )('FS8 P3 refuses formerly exact %s after the next artifact activates', async (operation) => {
+    const outcome = await result<P3ScheduleResult>(
+      probe,
+      `/epoch-p3/schedule?operation=${operation}&phase=final&action=advance`,
+    );
+    expectP3EpochRefusal(outcome.response, 'stale', 3);
+    expect(outcome.gateHits).toBe(1);
+    expectP3Preserved(outcome);
+  });
+
+  it.each([
+    'create',
+    'pause',
+    'resume-noop',
+  ])('FS8 P3 keeps the original missing actor epoch while %s waits', async (operation) => {
+    const outcome = await result<P3ScheduleResult>(
+      probe,
+      `/epoch-p3/schedule?operation=${operation}&phase=auth&epoch=missing&action=capture`,
+    );
+    expectP3EpochRefusal(outcome.response, 'missing', 2);
+    expect(outcome.gateHits).toBe(1);
+    expect(outcome.audit).toMatchObject([
+      { actorId: 'p3-owner', outcome: 'rejected' },
+    ]);
+    expectP3Preserved(outcome);
+  });
+
+  it('FS8 P3 keeps a captured current actor while the resolver result changes', async () => {
+    const captured = await result<P3ScheduleResult>(
+      probe,
+      '/epoch-p3/schedule?operation=create&phase=auth&action=capture',
+    );
+    expect(
+      captured.response.status,
+      JSON.stringify(captured.response.body),
+    ).toBe(201);
+    expect(captured.audit).toMatchObject([
+      { actorId: 'p3-owner', outcome: 'accepted' },
+    ]);
+    expect(captured.after.owners).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          resource_id: captured.response.body.schedule?.id,
+          owner_id: 'p3-owner',
+        }),
+      ]),
+    );
+  });
+
+  it.each(
+    P3_OPERATIONS,
+  )('FS8 P3 refuses an invalid trusted epoch on %s', async (operation) => {
+    const outcome = await result<P3ScheduleResult>(
+      probe,
+      `/epoch-p3/schedule?operation=${operation}&epoch=invalid`,
+    );
+    expect(outcome.response.status).toBe(400);
+    expect(outcome.response.body.reason?.code).toBe('INVALID_MUTATION_EPOCH');
+    expectP3Preserved(outcome);
+  });
+
+  it.each([
+    'body',
+    'header',
+    'stored',
+  ])('FS8 P3 does not obtain schedule authority from %s input', async (injection) => {
+    const outcome = await result<P3ScheduleResult>(
+      probe,
+      `/epoch-p3/schedule?operation=create&epoch=missing&injection=${injection}`,
+    );
+    if (injection === 'stored')
+      expectP3EpochRefusal(outcome.response, 'missing', 2);
+    else
+      expect(outcome.response.status).toBe(injection === 'header' ? 403 : 400);
+    expectP3Preserved(outcome);
+  });
+
+  it.each([
+    16384, 16385,
+  ])('FS8 P3 applies the HTTP UTF-8 body bound at %i bytes', async (bytes) => {
+    const outcome = await result<P3ScheduleResult>(
+      probe,
+      `/epoch-p3/schedule?operation=create&bytes=${bytes}`,
+    );
+    expect(outcome.bodyBytes).toBe(bytes);
+    expect(outcome.response.status, JSON.stringify(outcome.response.body)).toBe(
+      bytes === 16384 ? 201 : 413,
+    );
+    if (bytes > 16384) {
+      expect(outcome.finalBatches).toBe(0);
+      expectP3Preserved(outcome);
+    }
+    expectP3Metrics(outcome.metrics);
+  });
+
+  it('FS8 P3 does not grant draining authoring through a paused PATCH', async () => {
+    const outcome = await result<P3ScheduleResult>(
+      probe,
+      '/epoch-p3/schedule?operation=update&closed=true&patchPaused=true',
+    );
+    expect(outcome.response.status).toBe(503);
+    expect(outcome.response.body.reason?.code).toBe('EXECUTION_FENCED');
+    expectP3Preserved(outcome);
+  });
+
+  it('FS8 P3 distinguishes a current cap refusal from epoch refusal', async () => {
+    const outcome = await result<P3ScheduleResult>(
+      probe,
+      '/epoch-p3/schedule?operation=create&cap=true',
+    );
+    expect(outcome.response.status).toBe(400);
+    expect(outcome.audit).toMatchObject([{ outcome: 'rejected' }]);
+    expectP3Preserved(outcome);
+  });
+
+  it('FS8 P3 rejects a held resume after its cron configuration changes', async () => {
+    const outcome = await result<P3ScheduleResult>(
+      probe,
+      '/epoch-p3/schedule?operation=resume&phase=final&action=resume-race',
+    );
+    expect(outcome.response.status).toBe(409);
+    expect(outcome.response.body.reason).toEqual({
+      code: 'SCHEDULE_MUTATION_CONFLICT',
+      classification: 'schedule-changed',
+    });
+    expect(outcome.intervened.schedules[0]).toMatchObject({
+      cron: '*/5 * * * *',
+      timezone: 'UTC',
+      status: 'paused',
+    });
+    expectP3Preserved(outcome);
+    expect(outcome.positive?.status).toBe(200);
+    expect(outcome.positiveState?.schedules[0]).toMatchObject({
+      cron: '*/5 * * * *',
+      timezone: 'UTC',
+      status: 'active',
+    });
+  });
+
+  it('FS8 P3 preserves a held deferred deletion and its raw history across activation', async () => {
+    const outcome = await result<P3ScheduleResult>(
+      probe,
+      '/epoch-p3/schedule?operation=delete&phase=final&epoch=missing&action=activate&deferred=true',
+    );
+    expectP3EpochRefusal(outcome.response, 'missing', 1);
+    expect(outcome.after.schedules[0]?.deletionRequestedAt).toBeNull();
+    expect(outcome.after.triggers[0]?.outcome).toBe('deferred');
+    expect(outcome.after.owners).toHaveLength(1);
+    expectP3Preserved(outcome);
+  });
+
+  it('FS8 P3 settles an admitted deferred deletion after another epoch closes', async () => {
+    const outcome = await result<P3ScheduleResult>(
+      probe,
+      '/epoch-p3/schedule?operation=delete&closed=true&deferred=true',
+    );
+    expect(outcome.response.status).toBe(202);
+    expect(outcome.after.schedules[0]).toMatchObject({
+      status: 'paused',
+      deletionRequestedAt: expect.any(Number),
+    });
+    expect(outcome.after.owners).toHaveLength(1);
+    expect(outcome.settled).toEqual({
+      schedules: [],
+      triggers: [],
+      owners: [],
+    });
+    expect(outcome.fenceAfter).toMatchObject({
+      state: 'draining',
+      mutationEpoch: 3,
+      requireMutationEpoch: true,
+    });
+    expectP3Metrics(outcome.metrics);
+  });
+
+  it('FS8 P3 deletes populated trigger history with a bounded mutation result', async () => {
+    const outcome = await result<P3ScheduleResult>(
+      probe,
+      '/epoch-p3/schedule?operation=delete&history=true',
+    );
+    expect(outcome.before.triggers).toHaveLength(120);
+    expect(outcome.response.status).toBe(200);
+    expect(outcome.after).toEqual({ schedules: [], triggers: [], owners: [] });
+    expect(outcome.metrics.mutation?.maxResultBytes).toBeLessThan(10_000);
+    expectP3Metrics(outcome.metrics);
+  });
+
+  it.each(
+    ['auth', 'final'].flatMap((phase) =>
+      ['missing', 'stale'].map((epoch) => ({ phase, epoch })),
+    ),
+  )('FS8 P3 holds real Runtime at $phase across activation with $epoch epoch', async ({
+    phase,
+    epoch,
+  }) => {
+    const outcome = await result<P3RunResult>(
+      probe,
+      `/epoch-p3/run?phase=${phase}&epoch=${epoch}&action=activate`,
+    );
+    expectP3EpochRefusal(outcome.response, epoch, 1);
+    expect(outcome.gateHits).toBe(1);
+    expect(outcome.initialBatches).toBe(phase === 'final' ? 1 : 0);
+    expect(outcome.capturedEpoch).toBe(epoch === 'missing' ? null : 0);
+    expectP3RunRefused(outcome);
+  });
+
+  it.each([
+    'missing',
+    'stale',
+    'future',
+    'current',
+    'invalid',
+  ])('FS8 P3 checks %s epoch through real Runtime and D1', async (epoch) => {
+    const outcome = await result<P3RunResult>(
+      probe,
+      `/epoch-p3/run?epoch=${epoch}`,
+    );
+    if (epoch === 'current') {
+      expect(
+        outcome.response.status,
+        JSON.stringify(outcome.response.body),
+      ).toBe(200);
+      expect(outcome.response.body.result).toEqual({ value: 'original' });
+      expect(outcome.effectsAfterRequest).toBe(1);
+      expect(outcome.after.snapshots).toHaveLength(1);
+    } else if (epoch === 'invalid') {
+      expect(outcome.response.status).toBe(400);
+      expect(outcome.response.body.reason?.code).toBe('INVALID_MUTATION_EPOCH');
+      expect(outcome.effects).toBe(0);
+      expect(outcome.after).toEqual(outcome.before);
+    } else {
+      expectP3EpochRefusal(outcome.response, epoch, 2);
+      expectP3RunRefused(outcome);
+    }
+    expectP3Metrics(outcome.metrics);
+  });
+
+  it.each([
+    'auth',
+    'final',
+    'provider',
+  ])('FS8 P3 executes the current Runtime through its %s gate', async (phase) => {
+    const outcome = await result<P3RunResult>(
+      probe,
+      `/epoch-p3/run?phase=${phase}`,
+    );
+    expect(outcome.response.status, JSON.stringify(outcome.response.body)).toBe(
+      200,
+    );
+    expect(outcome.gateHits).toBe(1);
+    expect(outcome.initialBatches).toBe(1);
+    expect(outcome.effectsAfterRequest).toBe(1);
+    expect(outcome.response.body.result).toEqual({ value: 'original' });
+    expectP3Metrics(outcome.metrics);
+  });
+
+  it('FS8 P3 prevents engine entry after a same-epoch final-frame cycle', async () => {
+    const outcome = await result<P3RunResult>(
+      probe,
+      '/epoch-p3/run?phase=final&action=cycle',
+    );
+    expect(outcome.response.status).toBe(409);
+    expect(outcome.response.body.reason).toEqual({
+      code: 'RUN_ADMISSION_CONFLICT',
+      classification: 'fence-changed',
+    });
+    expectP3RunRefused(outcome);
+  });
+
+  it.each(
+    ['schema-extension', 'null-singleton'].flatMap((structure) =>
+      [false, true].map((proof) => ({ structure, proof })),
+    ),
+  )('FS8 P3 structural Runtime refuses $structure at final D1 with proof $proof', async ({
+    structure,
+    proof,
+  }) => {
+    const outcome = await result<P3StructuralRunResult>(
+      probe,
+      `/epoch-p3/run?phase=final&structure=${structure}&proof=${proof}`,
+    );
+    expectP3StructuralRefusal(outcome, proof);
+    const prior = outcome.structural.before;
+    const changed = outcome.structural.intervened;
+    if (structure === 'schema-extension') {
+      expect(changed.schema).toHaveLength(prior.schema.length + 1);
+      expect(changed.schema.at(-1)).toMatchObject({
+        name: 'p3_shape',
+        type: 'TEXT',
+      });
+      expect(changed.rows).toHaveLength(1);
+    } else {
+      expect(changed.schema).toEqual(prior.schema);
+      expect(
+        changed.schema.find((column) => column.name === 'id'),
+      ).toMatchObject({ type: 'TEXT', notnull: 0, pk: 1 });
+      expect(changed.rows).toHaveLength(2);
+      expect(changed.rows.filter((row) => row.id === null)).toHaveLength(1);
+    }
+    const deployment = changed.rows.find((row) => row.id === 'deployment');
+    expect(deployment).toMatchObject({
+      mutation_epoch: 2,
+      require_mutation_epoch: 1,
+      proof_run_id: null,
+      proof_start_token: null,
+    });
+    expect(outcome.structural.responseLosses).toBe(0);
+  });
+
+  it('FS8 P3 structural Runtime keeps refused batch participants unchanged after response loss', async () => {
+    const outcome = await result<P3StructuralRunResult>(
+      probe,
+      '/epoch-p3/run?phase=final&structure=schema-extension&keyed=true&loss=true',
+    );
+    expectP3StructuralRefusal(outcome, true, true);
+    expect(outcome.structural.responseLosses).toBe(1);
+  });
+
+  it.each([
+    { proof: false, loss: false, afterAdmission: 'none' },
+    { proof: true, loss: false, afterAdmission: 'none' },
+    { proof: false, loss: true, afterAdmission: 'advance' },
+    { proof: true, loss: true, afterAdmission: 'none' },
+    { proof: true, loss: false, afterAdmission: 'advance' },
+  ])('FS8 P3 structural Runtime admits valid current proof $proof loss $loss after $afterAdmission', async ({
+    proof,
+    loss,
+    afterAdmission,
+  }) => {
+    const outcome = await result<P3StructuralRunResult>(
+      probe,
+      `/epoch-p3/run?phase=final&structure=none&proof=${proof}&loss=${loss}&afterAdmission=${afterAdmission}`,
+    );
+    expect(outcome.response.status, JSON.stringify(outcome.response.body)).toBe(
+      200,
+    );
+    expect(outcome.response.body.result).toEqual({ value: 'original' });
+    expect(outcome.gateHits).toBe(1);
+    expect(outcome.initialBatches).toBe(1);
+    expect(outcome.capturedEpoch).toBe(2);
+    expect(outcome.effectsAfterRequest).toBe(1);
+    expect(outcome.effects).toBe(1);
+    expect(outcome.activeAfterRequest).toBe(false);
+    expect(outcome.after.snapshots).toHaveLength(1);
+    expect(outcome.structural.initialBatchRows).toEqual(
+      proof ? [1, 1, 1] : [1, 0],
+    );
+    expect(outcome.structural.responseLosses).toBe(loss ? 1 : 0);
+    const snapshot = JSON.parse(String(outcome.after.snapshots[0]?.snapshot));
+    const provenance = snapshot.requestContext['flowsafe.runProvenance'];
+    expect(provenance).toMatchObject({
+      mutationEpoch: 2,
+      requestedBy: 'p3-owner',
+      startToken: expect.any(String),
+    });
+    if (proof) {
+      expect(
+        outcome.after.keys.find((row) => row.key === 'p3-key'),
+      ).toMatchObject({
+        state: 'terminal',
+        start_token: provenance.startToken,
+        start_table_prefix: 'p3_',
+        start_workflow_id: 'workflow-schedule',
+      });
+      expect(outcome.after.keys.filter((row) => row.key !== 'p3-key')).toEqual(
+        outcome.before.keys,
+      );
+    } else expect(outcome.after.keys).toEqual(outcome.before.keys);
+    expect(outcome.after.owners).toEqual(outcome.before.owners);
+    if (afterAdmission === 'advance') {
+      expect(outcome.fenceAfter).toMatchObject({
+        state: 'open',
+        mutationEpoch: 3,
+        requireMutationEpoch: true,
+      });
+    } else {
+      expect(outcome.fenceAfter).toMatchObject({
+        state: proof ? 'proof-only' : 'open',
+        mutationEpoch: 2,
+        requireMutationEpoch: true,
+      });
+      if (proof)
+        expect(outcome.structural.after.rows[0]).toMatchObject({
+          proof_run_id: 'p3-run',
+          proof_start_token: provenance.startToken,
+          proof_table_prefix: 'p3_',
+          proof_workflow_id: 'workflow-schedule',
+        });
+    }
+    expectP3Metrics(outcome.metrics);
+  });
+
+  it('FS8 P3 refuses a formerly exact Runtime after the next artifact activates', async () => {
+    const outcome = await result<P3RunResult>(
+      probe,
+      '/epoch-p3/run?phase=final&action=advance',
+    );
+    expectP3EpochRefusal(outcome.response, 'stale', 3);
+    expectP3RunRefused(outcome);
+  });
+
+  it('FS8 P3 keeps the missing Runtime epoch captured before host policy awaits', async () => {
+    const outcome = await result<P3RunResult>(
+      probe,
+      '/epoch-p3/run?phase=auth&epoch=missing&action=capture',
+    );
+    expectP3EpochRefusal(outcome.response, 'missing', 2);
+    expect(outcome.capturedEpoch).toBeNull();
+    expectP3RunRefused(outcome);
+  });
+
+  it('FS8 P3 keeps captured Runtime options while the provider waits', async () => {
+    const outcome = await result<P3RunResult>(
+      probe,
+      '/epoch-p3/run?phase=provider&action=capture',
+    );
+    expect(outcome.response.status, JSON.stringify(outcome.response.body)).toBe(
+      200,
+    );
+    expect(outcome.capturedEpoch).toBe(2);
+    expect(outcome.response.body.result).toEqual({ value: 'original' });
+    expect(outcome.effectsAfterRequest).toBe(1);
+    const snapshot = JSON.parse(String(outcome.after.snapshots[0]?.snapshot));
+    expect(snapshot.requestContext['flowsafe.runProvenance']).toMatchObject({
+      mutationEpoch: 2,
+      requestedBy: 'p3-owner',
+    });
+  });
+
+  it('FS8 P3 refuses a current Runtime start while draining', async () => {
+    const outcome = await result<P3RunResult>(
+      probe,
+      '/epoch-p3/run?closed=true',
+    );
+    expect(outcome.response.status).toBe(503);
+    expect(outcome.response.body.reason?.code).toBe('EXECUTION_FENCED');
+    expect(outcome.effects).toBe(0);
+    expect(outcome.after).toEqual(outcome.before);
+  });
+
+  it('FS8 P3 releases the original keyed claim after final-D1 epoch refusal', async () => {
+    const outcome = await result<P3RunResult>(
+      probe,
+      '/epoch-p3/run?phase=final&epoch=missing&action=activate&keyed=true',
+    );
+    expectP3EpochRefusal(outcome.response, 'missing', 1);
+    expect(outcome.effects).toBe(0);
+    expect(outcome.after.snapshots).toEqual([]);
+    expect(outcome.after.owners).toEqual(outcome.before.owners);
+    expect(
+      outcome.after.keys.find((row) => row.key === 'p3-key'),
+    ).toMatchObject({
+      key: 'p3-key',
+      state: 'reserved',
+      owner_id: 'p3-owner',
+      run_id: 'p3-run',
+      start_token: '',
+    });
+    expect(outcome.after.keys.filter((row) => row.key !== 'p3-key')).toEqual(
+      outcome.before.keys,
+    );
+    expect(outcome.activeAfterRequest).toBe(false);
+    expect(outcome.cachedAfterRequest).toBe(false);
+    expectP3Metrics(outcome.metrics);
+  });
+
+  it('FS8 P3 settles a current keyed Runtime execution', async () => {
+    const outcome = await result<P3RunResult>(
+      probe,
+      '/epoch-p3/run?keyed=true',
+    );
+    expect(outcome.response.status, JSON.stringify(outcome.response.body)).toBe(
+      200,
+    );
+    expect(outcome.effects).toBe(1);
+    expect(
+      outcome.after.keys.find((row) => row.key === 'p3-key'),
+    ).toMatchObject({
+      key: 'p3-key',
+      state: 'terminal',
+      owner_id: 'p3-owner',
+      run_id: 'p3-run',
+      start_token: expect.any(String),
+    });
+    expect(outcome.after.keys.filter((row) => row.key !== 'p3-key')).toEqual(
+      outcome.before.keys,
+    );
+    expectP3Metrics(outcome.metrics);
+  });
+
+  it('FS8 P3 converges a committed D1 CAS after response loss', async () => {
+    const outcome = await result<{
+      losses: number;
+      before: P3Fence;
+      afterCommit: P3Fence;
+      retry: P3Fence;
+      rawAfterCommit: unknown;
+      rawAfterRetry: unknown;
+      conflict: { code: string };
+      metrics: P3Metrics;
+    }>(probe, '/epoch-p3/cas-loss');
+    expect(outcome.losses).toBe(1);
+    expect(outcome.afterCommit).toMatchObject({
+      state: 'draining',
+      mutationEpoch: outcome.before.mutationEpoch + 1,
+      transitionRevision: outcome.before.transitionRevision + 1,
+      requireMutationEpoch: true,
+    });
+    expect(outcome.retry).toEqual(outcome.afterCommit);
+    expect(JSON.stringify(outcome.rawAfterRetry)).toBe(
+      JSON.stringify(outcome.rawAfterCommit),
+    );
+    expect(outcome.conflict.code).toBe('FENCE_CAS_CONFLICT');
+    expectP3Metrics({ cas: outcome.metrics });
   });
 
   it('boots the full spike and initializes D1ApprovalStore', async () => {
@@ -370,7 +1349,7 @@ describe.sequential('FlowSafe Wrangler test harness', () => {
       loserOwner?: unknown;
       claimWinners: number;
       claimTriggers: unknown[];
-      rollbackError: string;
+      rollbackError: { reason: { code: string }; cause: string };
       rollbackSchedule: { id: string };
       rollbackTriggers: unknown[];
       rollbackOwner: { kind: string; id: string };
@@ -378,7 +1357,7 @@ describe.sequential('FlowSafe Wrangler test harness', () => {
       deletedSchedule: null;
       deletedTriggers: unknown[];
       deletedOwner?: unknown;
-      ownerInsertError: string;
+      ownerInsertError: { reason: { code: string }; cause: string };
       ownerFailureSchedule: null;
       ownerFailureOwner?: unknown;
     }>(probe, '/schedule');
@@ -389,7 +1368,12 @@ describe.sequential('FlowSafe Wrangler test harness', () => {
     expect(outcome.loserOwner).toBeUndefined();
     expect(outcome.claimWinners).toBe(1);
     expect(outcome.claimTriggers).toHaveLength(1);
-    expect(outcome.rollbackError).toMatch(/injected owner delete failure/);
+    expect(outcome.rollbackError.reason).toEqual({
+      code: 'SCHEDULE_MUTATION_OUTCOME_UNKNOWN',
+    });
+    expect(outcome.rollbackError.cause).toMatch(
+      /injected owner delete failure/,
+    );
     expect(outcome.rollbackSchedule.id).toBe('schedule-rollback');
     expect(outcome.rollbackTriggers).toHaveLength(1);
     expect(outcome.rollbackOwner).toEqual({ kind: 'human', id: 'opal' });
@@ -397,7 +1381,12 @@ describe.sequential('FlowSafe Wrangler test harness', () => {
     expect(outcome.deletedSchedule).toBeNull();
     expect(outcome.deletedTriggers).toEqual([]);
     expect(outcome.deletedOwner).toBeUndefined();
-    expect(outcome.ownerInsertError).toMatch(/injected owner insert failure/);
+    expect(outcome.ownerInsertError.reason).toEqual({
+      code: 'SCHEDULE_MUTATION_OUTCOME_UNKNOWN',
+    });
+    expect(outcome.ownerInsertError.cause).toMatch(
+      /injected owner insert failure/,
+    );
     expect(outcome.ownerFailureSchedule).toBeNull();
     expect(outcome.ownerFailureOwner).toBeUndefined();
   });

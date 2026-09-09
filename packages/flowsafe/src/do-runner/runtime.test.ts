@@ -7,6 +7,10 @@ import type { WorkflowRunState } from '@mastra/core/workflows';
 import { assert, describe, expect, expectTypeOf, it, vi } from 'vitest';
 import { z } from 'zod';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
+import {
+  D1ResourceOwnershipStore,
+  type ResourceOwnershipDatabase,
+} from '../approval-api/resource-ownership.js';
 import { createBackgroundTaskD1Domains } from '../background-tasks/d1-storage.js';
 import type { D1DatabaseBinding } from './cf-types.js';
 import { createD1Storage } from './d1-storage.js';
@@ -6920,6 +6924,206 @@ async function d3RuntimeFixture(
     close: () => sql.close(),
   };
 }
+
+describe('Runtime final fence structural admission', () => {
+  async function structuralFixture(proof: boolean) {
+    const f = await d3RuntimeFixture();
+    assert(f.capability);
+    const owner = { kind: 'human' as const, id: 'owner' };
+    const resources = new D1ResourceOwnershipStore(
+      f.capability.database as unknown as ResourceOwnershipDatabase,
+    );
+    expect(
+      await resources.reserveAll(
+        [{ kind: 'run', resourceId: 'd3-run' }],
+        owner,
+        'H',
+      ),
+    ).toBe(true);
+    const claim = proof ? await f.claim() : undefined;
+    const reading = await f.fence.transition({
+      expected: 'open',
+      next: proof ? 'proof-only' : 'open',
+      ...(claim ? { proofKey: claim.key } : {}),
+      expectedMutationEpoch: 0,
+      expectedRevision: 0,
+      advanceMutationEpoch: true,
+    });
+    const startOptions: StartRunOptions = {
+      ...f.options(),
+      mutationEpoch: reading.mutationEpoch,
+      runOwnerGuard: { owner, reservationToken: 'H' },
+      ...(claim ? { idempotencyKey: claim.key, startReservation: claim } : {}),
+    };
+    return {
+      ...f,
+      claim,
+      startOptions,
+      database: f.capability.database,
+      snapshots: () =>
+        f.sql.prepare('SELECT * FROM d3_mastra_workflow_snapshot').all(),
+      owners: () =>
+        f.sql.prepare('SELECT * FROM flowsafe_resource_owners').all(),
+      proofRows: () =>
+        f.sql.prepare('SELECT * FROM flowsafe_execution_fence').all(),
+    };
+  }
+
+  it.each([
+    [
+      'unkeyed unsupported column',
+      false,
+      'ALTER TABLE flowsafe_execution_fence ADD COLUMN admission_extension TEXT',
+    ],
+    [
+      'keyed proof nullable-id second row',
+      true,
+      "INSERT INTO flowsafe_execution_fence (id, state, updated_at) VALUES (NULL, 'open', 0)",
+    ],
+  ] as const)('refuses the original Runtime initial batch for %s', async (_condition, proof, change) => {
+    const f = await structuralFixture(proof);
+    try {
+      const ownersBefore = f.owners();
+      const reservationBefore = f.claim
+        ? await f.reservations.readForAdmission(f.claim.key)
+        : undefined;
+      const batch = f.database.batch.bind(f.database);
+      let changedFence: unknown;
+      const write = vi
+        .spyOn(f.database, 'batch')
+        .mockImplementationOnce(async (statements) => {
+          expect(f.snapshots()).toEqual([]);
+          expect(
+            f.sql.prepare('PRAGMA ignore_check_constraints').get(),
+          ).toMatchObject({
+            ignore_check_constraints: 0,
+          });
+          f.sql.exec(change);
+          changedFence = f.proofRows();
+          const result = await batch(statements);
+          expect(
+            (result as Array<{ results: unknown[] }>).map(
+              ({ results }) => results,
+            ),
+          ).toEqual(statements.map(() => []));
+          expect(f.snapshots()).toEqual([]);
+          expect(f.owners()).toEqual(ownersBefore);
+          expect(f.proofRows()).toEqual(changedFence);
+          if (f.claim)
+            expect(await f.reservations.readForAdmission(f.claim.key)).toEqual(
+              reservationBefore,
+            );
+          return result;
+        });
+      await expect(
+        f.runtime.start(f.workflow.id, f.startOptions),
+      ).rejects.toMatchObject({
+        status: 503,
+        reason: { code: 'EXECUTION_FENCE_UNREADABLE' },
+      });
+      expect(write).toHaveBeenCalledOnce();
+      expect(f.snapshots()).toEqual([]);
+      expect(f.effects).not.toHaveBeenCalled();
+      expect(f.owners()).toEqual(ownersBefore);
+      expect(f.proofRows()).toEqual(changedFence);
+      expect(f.runtime.isRunActive(f.workflow.id, 'd3-run')).toBe(false);
+      expect(f.workflow.runs.has('d3-run')).toBe(false);
+      if (f.claim)
+        expect(
+          await f.reservations.readForAdmission(f.claim.key),
+        ).toMatchObject({
+          state: 'reserved',
+          binding: { kind: 'unbound' },
+        });
+      await expect(f.fence.readForAdmission()).rejects.toBeInstanceOf(
+        ExecutionFenceUnreadableError,
+      );
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each([
+    false,
+    true,
+  ])('executes the original Runtime with exact active authority (proof=%s)', async (proof) => {
+    const f = await structuralFixture(proof);
+    try {
+      const ownersBefore = f.owners();
+      expect(f.startOptions.mutationEpoch).toBe(1);
+      await expect(
+        f.runtime.start(f.workflow.id, f.startOptions),
+      ).resolves.toMatchObject({ status: 'success' });
+      expect(f.effects).toHaveBeenCalledOnce();
+      expect(f.snapshots()).toHaveLength(1);
+      expect(f.owners()).toEqual(ownersBefore);
+      const reading = await f.fence.readForAdmission();
+      expect(reading.reading).toMatchObject({
+        mutationEpoch: 1,
+        requireMutationEpoch: true,
+      });
+      if (f.claim) {
+        const reservation = await f.reservations.readForAdmission(f.claim.key);
+        expect(reservation).toMatchObject({
+          state: 'terminal',
+          binding: { kind: 'bound' },
+        });
+        if (reservation?.binding.kind !== 'bound')
+          throw new Error('missing admitted execution');
+        expect(reading.reading.proofExecution).toEqual(
+          reservation.binding.execution,
+        );
+      } else expect(reading.reading.proofExecution).toBeUndefined();
+      expect(f.runtime.isRunActive(f.workflow.id, 'd3-run')).toBe(false);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('rejects a lost response after structural refusal without entering the engine', async () => {
+    const f = await structuralFixture(true);
+    assert(f.claim);
+    try {
+      const before = await f.reservations.readForAdmission(f.claim.key);
+      const ownersBefore = f.owners();
+      const lost = new Error('refused initial batch response lost');
+      const batch = f.database.batch.bind(f.database);
+      const write = vi
+        .spyOn(f.database, 'batch')
+        .mockImplementationOnce(async (statements) => {
+          f.sql.exec(
+            'ALTER TABLE flowsafe_execution_fence ADD COLUMN admission_extension TEXT',
+          );
+          await batch(statements);
+          expect(f.snapshots()).toEqual([]);
+          throw lost;
+        });
+      await expect(
+        f.runtime.start(f.workflow.id, f.startOptions),
+      ).rejects.toMatchObject({
+        status: 503,
+        reason: { code: 'EXECUTION_FENCE_UNREADABLE' },
+        cause: lost,
+      });
+      expect(write).toHaveBeenCalledTimes(2);
+      expect(f.snapshots()).toEqual([]);
+      expect(f.effects).not.toHaveBeenCalled();
+      expect(f.owners()).toEqual(ownersBefore);
+      expect(await f.reservations.readForAdmission(f.claim.key)).toEqual(
+        before,
+      );
+      expect(f.proofRows()).toEqual([
+        expect.objectContaining({
+          proof_run_id: null,
+          proof_start_token: null,
+        }),
+      ]);
+      expect(f.runtime.isRunActive(f.workflow.id, 'd3-run')).toBe(false);
+    } finally {
+      f.close();
+    }
+  });
+});
 
 describe('FS8 D3 Runtime activation', () => {
   it('R01 independently mints S when H repeats and retains immutable owner and epoch on resume', async () => {
