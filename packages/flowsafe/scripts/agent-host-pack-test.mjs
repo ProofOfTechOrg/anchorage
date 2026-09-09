@@ -557,7 +557,7 @@ import {
 } from '@proofoftech/flowsafe/do-runner';
 import {
   createFlowsafeWorker, type FlowsafeWorkerConfig, type FlowsafeWorkerEnv,
-  type RunStartInput,
+  type RunStartInput, type DoRunStartInput, type RunRouterOptions,
   type RunRouterStartIdempotency,
 } from '@proofoftech/flowsafe/host-kit';
 import {
@@ -610,15 +610,35 @@ const legacyScope: ThreadScope = { threadId: 'thread', principal, init: hostInit
 const epochScope: ThreadScope = { ...legacyScope, mutationEpoch: 2 };
 const legacyInput: RunStartInput = { workflowId: 'workflow', runId: 'run', inputData: {}, principal };
 const epochInput: RunStartInput = { ...legacyInput, mutationEpoch: 2 };
+const applicationContext: Record<string, unknown> = { 'app.attribution': 'accepted', nested: { value: 1 } };
+const contextInput: RunStartInput = { ...legacyInput, requestContext: applicationContext };
+const doContextInput: DoRunStartInput = { ...contextInput, initialState: {} };
+const legacyDoInput: DoRunStartInput = { ...legacyInput, initialState: {} };
+const routerHook: NonNullable<RunRouterOptions['beforeStart']> = async (context, workflowId, inputData, requestContext) => {
+  const application: Record<string, unknown> | undefined = requestContext;
+  void [context.actor, workflowId, inputData, application];
+};
+const legacyRouterHook: NonNullable<RunRouterOptions['beforeStart']> = async (_context, _workflowId, _inputData) => {};
+const routerPolicyResult: Promise<void> = routerHook(legacyContext, 'workflow', {}, applicationContext);
 type EpochEnv = FlowsafeWorkerEnv & { artifactEpoch: number };
+const workerHook: NonNullable<FlowsafeWorkerConfig<EpochEnv>['beforeStart']> = async (context, env, workflowId, inputData, requestContext) => {
+  const application: Record<string, unknown> | undefined = requestContext;
+  void [context.actor, env.artifactEpoch, workflowId, inputData, application];
+};
+const legacyWorkerHook: NonNullable<FlowsafeWorkerConfig<EpochEnv>['beforeStart']> = async (_context, _env, _workflowId, _inputData) => {};
+declare const workerEnv: EpochEnv;
+const workerPolicyResult: Promise<void> = workerHook(legacyContext, workerEnv, 'workflow', {}, applicationContext);
 const workerConfig: FlowsafeWorkerConfig<EpochEnv> = {
   systemPrincipalId: 'system', workflows: [],
   buildVerifier: () => ({ verify: async () => actor }),
   maintenance: { sweepIntervalMs: 1000, purgeIntervalMs: 1000 },
   mutationEpoch: env => env.artifactEpoch,
+  beforeStart: workerHook,
 };
 createFlowsafeWorker(workerConfig);
 createFlowsafeWorker({ ...workerConfig, mutationEpoch: 0 });
+createFlowsafeWorker({ ...workerConfig, beforeStart: legacyWorkerHook });
+void [contextInput, doContextInput, legacyDoInput, legacyRouterHook, routerPolicyResult, workerPolicyResult];
 const onPrepared = (execution: RunExecutionIdentity): void => { void execution.startToken; };
 const legacyOptions: StartRunOptions = { runId: 'legacy' };
 const options: StartRunOptions = {
@@ -757,6 +777,60 @@ assert.equal(Array.isArray(doRunner.INVENTORY_DRAIN_PROOF.reachableFrom), true);
 assert.equal(typeof hostKit.createFlowsafeRunnerLifecycle, 'function');
 assert.equal(typeof hostKit.createRunRouter, 'function');
 assert.equal(typeof hostKit.createFlowsafeWorker, 'function');
+const contextTransports = [];
+const contextPolicies = [];
+const contextPrincipal = { kind: 'human', id: 'context-owner', role: 'operator' };
+const contextTopology = hostKit.createDoRunTopology({
+  idFromName: name => name,
+  get: name => ({ fetch: async (url, init) => {
+    const body = JSON.parse(init.body);
+    contextTransports.push({ name, url, body, headers: init.headers });
+    return Response.json({ runId: body.runId, status: 'success' });
+  } }),
+}, 'packed-context-deployment-identity-secret');
+const contextFactory = new approvals.InMemoryApprovalStoreFactory();
+const contextRouter = hostKit.createRunRouter({
+  workflows: [{ id: 'context-workflow', title: 'Context', description: 'Packed transport', sampleInput: {} }],
+  resolve: approvals.createActorResolver({
+    authenticate: () => ({ id: contextPrincipal.id, role: contextPrincipal.role }),
+    storeFactory: contextFactory,
+    buildService: () => new approvals.ApprovalService({ store: contextFactory.store(), executionFence: 'none' }),
+    newRunId: () => 'context-run',
+    mutationEpoch: 2,
+  }),
+  startIdempotency: 'none',
+  start: contextTopology.start,
+  status: contextTopology.status,
+  resume: contextTopology.resume,
+  beforeStart: async (context, workflowId, inputData, requestContext) => {
+    contextPolicies.push({ principal: context.principal, workflowId, inputData, requestContext });
+    return { 'app.attribution': 'ignored-hook-return' };
+  },
+});
+const packedApplicationContext = { 'app.attribution': 'accepted', nested: { values: [1, true] } };
+const contextResponse = await contextRouter(new Request('https://packed.test/runs', {
+  method: 'POST',
+  body: JSON.stringify({ workflowId: 'context-workflow', inputData: { topic: 'launch' }, requestContext: packedApplicationContext }),
+}));
+assert.equal(contextResponse.status, 200);
+assert.deepEqual(contextPolicies, [{
+  principal: contextPrincipal, workflowId: 'context-workflow', inputData: { topic: 'launch' }, requestContext: packedApplicationContext,
+}]);
+assert.deepEqual(contextTransports[0].body, {
+  workflowId: 'context-workflow', runId: 'context-run', inputData: { topic: 'launch' }, requestContext: packedApplicationContext,
+});
+assert.equal(contextTransports[0].name, 'context-workflow:context-run');
+assert.equal(new Headers(contextTransports[0].headers).get(doRunner.MUTATION_EPOCH_HEADER), '2');
+assert.deepEqual(JSON.parse(new Headers(contextTransports[0].headers).get(doRunner.EXECUTION_PRINCIPAL_HEADER)), contextPrincipal);
+await contextTopology.start({
+  workflowId: 'context-workflow', runId: 'context-scheduled-run', inputData: { forged: true },
+  initialState: { forged: true }, requestContext: { 'app.attribution': 'forged' },
+  principal: contextPrincipal, scheduleId: 'context-schedule', dispatchId: 'context-dispatch', deadlineMs: 60000,
+});
+assert.deepEqual(contextTransports[1].body, {
+  workflowId: 'context-workflow', runId: 'context-scheduled-run',
+  scheduleId: 'context-schedule', dispatchId: 'context-dispatch', deadlineMs: 60000,
+});
 assert.equal(hostKit.FENCED_WORKFLOW_STORAGE, doRunner.FENCED_WORKFLOW_STORAGE);
 assert.equal('FencedWorkflowsStorageD1' in hostKit, false);
 assert.equal(typeof agentRunner.FlowsafeDurableAgent, 'function');
@@ -765,7 +839,7 @@ for (const name of ['claim', 'release', 'settleRun']) {
 }
 for (const api of [flowsafe, doRunner, hostKit]) assert.equal('rollbackFencedStart' in api, false);
 for (const api of [flowsafe, approvals, doRunner, hostKit, host, agentRunner, schedules]) {
-  for (const name of ['captureActorContext', 'captureAgentStartAuthority', 'captureStartRunOptions', 'startAuthorities', 'AgentStartAuthority', 'executionFenceAdmissionValues', 'captureExecutionFenceAdmissionSchema', 'executionFenceAdmissionSql']) {
+  for (const name of ['captureActorContext', 'captureAgentStartAuthority', 'captureStartRunOptions', 'startAuthorities', 'AgentStartAuthority', 'executionFenceAdmissionValues', 'captureExecutionFenceAdmissionSchema', 'executionFenceAdmissionSql', 'AgentRunSelectorMismatchError']) {
     assert.equal(name in api, false, name);
   }
 }

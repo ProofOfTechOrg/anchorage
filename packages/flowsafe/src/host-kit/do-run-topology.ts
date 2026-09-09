@@ -147,6 +147,7 @@ export function createDoRunTopology<Id>(
       workflowId,
       runId,
       inputData,
+      requestContext,
       initialState,
       principal,
       mutationEpoch,
@@ -197,7 +198,7 @@ export function createDoRunTopology<Id>(
             ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
             ...(startReservation === undefined ? {} : { startReservation }),
             ...(scheduleId === undefined
-              ? { inputData, initialState, deadlineMs }
+              ? { inputData, initialState, deadlineMs, requestContext }
               : { scheduleId, dispatchId, deadlineMs }),
           }),
         }),

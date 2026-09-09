@@ -635,6 +635,7 @@ const SPIKE_ACTORS = new Map<string, ApprovalActor>([
 // workflow's first step writes a durable D1 row instead, so the spike can count
 // executions directly across a process death and across a concurrent burst.
 const COUNTED_WORKFLOW_ID = 'demo-idempotent';
+const APPLICATION_CONTEXT_KEY = 'spike.attribution';
 const EXECUTION_COUNT_TABLE = 'spike_execution_count';
 const EXECUTION_COUNT_DDL = `CREATE TABLE IF NOT EXISTS ${EXECUTION_COUNT_TABLE} (
     id TEXT PRIMARY KEY,
@@ -670,9 +671,15 @@ const WORKFLOWS: ReadonlyArray<WorkflowMeta> = [
       'demo-approval with a counting first step, so an idempotent start can be proved by EXECUTIONS rather than by run ids',
     sampleInput: { topic: 'launch', counterId: 'probe' },
   },
+  {
+    id: 'sched-echo',
+    title: 'Schedule context probe',
+    description: 'Reads application context from API and scheduled starts',
+    sampleInput: {},
+  },
 ];
 const scheduleTargetPolicy = createScheduleTargetPolicy({
-  workflows: [...WORKFLOWS, { id: 'sched-echo' }],
+  workflows: WORKFLOWS,
   agents: [SPIKE_AGENT_META],
 });
 
@@ -700,13 +707,25 @@ function defineWorkflows(env: Env): RunnerRuntime {
     // capabilities without any grant crossing a request body.
     requestContextForRun: approvalGrantProvider(approvals),
   });
-  const publisher = createConnector<{ topic: string }, { published: boolean }>({
+  const publisher = createConnector<
+    { topic: string },
+    { published: boolean; applicationValue?: string }
+  >({
     id: PUBLISH_CONNECTOR,
     description: 'Publishes the approved workerd probe',
     inputSchema: z.object({ topic: z.string() }),
-    outputSchema: z.object({ published: z.boolean() }),
+    outputSchema: z.object({
+      published: z.boolean(),
+      applicationValue: z.string().optional(),
+    }),
     permissions: { sideEffect: 'write', requiresApproval: true },
-    execute: async () => ({ published: true }),
+    execute: async (_input, context) => ({
+      published: true,
+      applicationValue: z
+        .string()
+        .optional()
+        .parse(context.requestContext?.get(APPLICATION_CONTEXT_KEY)),
+    }),
   });
 
   const research = createStep({
@@ -768,6 +787,7 @@ function defineWorkflows(env: Env): RunnerRuntime {
       topic: z.string(),
       published: z.boolean(),
       approvedBy: z.string().optional(),
+      applicationValue: z.string().optional(),
     }),
     execute: async ({ inputData, requestContext }) => {
       if (!inputData.approved) {
@@ -782,6 +802,7 @@ function defineWorkflows(env: Env): RunnerRuntime {
         topic: inputData.topic,
         published: result.published,
         approvedBy: inputData.decidedBy,
+        applicationValue: result.applicationValue,
       };
     },
   });
@@ -793,6 +814,7 @@ function defineWorkflows(env: Env): RunnerRuntime {
       topic: z.string(),
       published: z.boolean(),
       approvedBy: z.string().optional(),
+      applicationValue: z.string().optional(),
     }),
   })
     .then(research)
@@ -833,6 +855,7 @@ function defineWorkflows(env: Env): RunnerRuntime {
       topic: z.string(),
       published: z.boolean(),
       approvedBy: z.string().optional(),
+      applicationValue: z.string().optional(),
     }),
   })
     .then(countedResearch)
@@ -927,6 +950,7 @@ function defineWorkflows(env: Env): RunnerRuntime {
       isolationScopePresent: z.boolean(),
       customPresent: z.boolean(),
       initialStatePresent: z.boolean(),
+      applicationValue: z.string().optional(),
     }),
     execute: async ({ requestContext, state }) => {
       const grants = requestContext.get(BREAKWATER_CONNECTOR_GRANTS_KEY);
@@ -939,6 +963,10 @@ function defineWorkflows(env: Env): RunnerRuntime {
           requestContext.get('breakwater.isolationScope') !== undefined,
         customPresent: requestContext.get('sched.note') !== undefined,
         initialStatePresent: state.fromSchedule === true,
+        applicationValue: z
+          .string()
+          .optional()
+          .parse(requestContext.get(APPLICATION_CONTEXT_KEY)),
       };
     },
   });
@@ -952,6 +980,7 @@ function defineWorkflows(env: Env): RunnerRuntime {
       isolationScopePresent: z.boolean(),
       customPresent: z.boolean(),
       initialStatePresent: z.boolean(),
+      applicationValue: z.string().optional(),
     }),
   })
     .then(schedEcho)
@@ -2426,6 +2455,7 @@ async function handleScheduleProbe(
                 },
               ],
               'sched.note': 'benign',
+              [APPLICATION_CONTEXT_KEY]: 'accepted-application-value',
             },
           },
           cron: '* * * * *',

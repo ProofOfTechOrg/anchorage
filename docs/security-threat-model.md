@@ -63,9 +63,13 @@ breakwater.isolationScope
 
 Only trusted host/runtime code may populate actor, grant, principal-permission, or workflow values. Idempotency keys and dry-run selection may originate from authorized application logic, but must not overwrite the other keys. `breakwater.isolationScope` remains an opaque Breakwater policy input; Flowsafe does not mint it for the single-organization data plane.
 
-Flowsafe's shared execution-context boundary reserves every `breakwater.*` key, `mastra:goal`, `runId`, `threadId`, `resourceId`, `__proto__`, `constructor`, and `prototype`. External HTTP bodies reject these fields. Persisted compatibility paths strip them before trusted derivation.
+[`isReservedExecutionContextKey()`](../packages/flowsafe/src/do-runner/execution-context.ts) defines the reserved namespace. API-start and schedule `requestContext` records reject those keys at ingestion. Persisted compatibility paths strip reserved entries before trusted derivation.
+
+An API start may carry non-reserved application context after authentication, start-role checks and workflow authorization. The validated value is visible to the host's `beforeStart` policy and travels on the existing authenticated Worker-to-Durable-Object channel into the stored application tier. Host policy must verify any business meaning attributed to those values. They cannot supply execution identity or connector grants; `inputData` is not a context transport.
 
 Trusted merges apply sanitized external or stored context first, then workflow, run, current execution identity, structured connector grants, and trusted actor/audit correlation. Provider-supplied isolation scope is dropped. An empty grant array overwrites any stale value, and the agent host projects the principal-permission resolution or an explicit `null` on every leg so a stale persisted projection cannot survive a resume.
+
+For an API start, provider application values override matching stored values. A verified schedule target controls its context even when it supplies none. Persisted application values survive resume, while trusted providers refresh capability state. Keyed replay revalidates input and host policy but preserves the winning run's context.
 
 ### Worker to Durable Object
 

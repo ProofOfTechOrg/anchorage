@@ -5,7 +5,10 @@ import type { GuardedAgentHandle } from '@proofoftech/breakwater/agent';
 import { beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { z } from 'zod';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
-import type { FlowsafeDurableAgent } from '../agent-runner/durable-agent-runner.js';
+import {
+  AgentRunSelectorMismatchError,
+  FlowsafeDurableAgent,
+} from '../agent-runner/durable-agent-runner.js';
 import {
   type ApprovalAuditEvent,
   type ApprovalRecord,
@@ -51,6 +54,7 @@ import {
   type PrincipalPermissionResolver,
   type ThreadAgentStartInput,
 } from './thread-host.js';
+import { createAgentThreadTopology } from './thread-topology.js';
 import type { AgentAutomationRule, Permission } from './types.js';
 
 const mocked = vi.hoisted(() => ({
@@ -133,14 +137,16 @@ vi.mock('../agent-runner/index.js', async (importOriginal) => {
           );
           if (!state) return null;
           const identity = state.provenance.startIdentity;
+          if (identity?.target.kind !== 'agent')
+            throw new RunStateUnreadableError('durable-agentic-loop', runId);
           if (
-            identity?.target.kind !== 'agent' ||
             identity.target.id !== configuration.agent.id ||
             identity.target.threadId !== threadId
           )
-            throw Object.assign(new Error('agent selectors mismatch'), {
-              status: 404,
-            });
+            throw new AgentRunSelectorMismatchError(
+              'durable-agentic-loop',
+              runId,
+            );
           return {
             ...state,
             execution: { ...state.execution, ...identity },
@@ -371,9 +377,7 @@ function harness(
           current.requestContext.threadId !== 'acme_thread' ||
           current.requestContext.resourceId !== RESOURCE_ID
         )
-          throw Object.assign(new Error('agent selectors mismatch'), {
-            status: 404,
-          });
+          throw new RunStateUnreadableError('durable-agentic-loop', runId);
         const threaded =
           authority?.agentStart.threaded ??
           current.context.input.messageListState.memoryInfo !== null;
@@ -3288,7 +3292,7 @@ describe('createThreadAgentHost', () => {
     expect(await resources.owner('run', 'acme_run')).toBeUndefined();
   });
 
-  it('rejects a snapshot whose thread correlation does not match the addressed DO', async () => {
+  it('keeps contradictory snapshot correlation unreadable', async () => {
     const { host, scope, setSnapshot } = harness();
     await host.start(scope, {
       agentId: 'writer',
@@ -3309,7 +3313,7 @@ describe('createThreadAgentHost', () => {
         ),
         scope,
       ),
-    ).rejects.toMatchObject({ status: 404 });
+    ).rejects.toBeInstanceOf(RunStateUnreadableError);
   });
 
   it('rehydrates a threaded approval resume with the validated memory binding', async () => {
@@ -6172,6 +6176,7 @@ async function hostR1AgentFixture(
     wired?: boolean;
     journal?: boolean;
     lifecycle?: boolean;
+    snapshotTarget?: { agentId: string; threadId: string };
   } = {},
 ) {
   const core = await vi.importActual<typeof import('@mastra/core/mastra')>(
@@ -6200,7 +6205,7 @@ async function hostR1AgentFixture(
   const threaded = input.threaded ?? true;
   const status = input.status ?? 'suspended';
   const version = input.provenance ?? 'v1';
-  const sql = openSqlite();
+  const sql = openSqlite() as ReturnType<typeof openSqlite> & { close(): void };
   const binding = sqliteUnitDatabase(sql) as ExecutionFenceDatabase &
     ResourceOwnershipDatabase;
   const storage =
@@ -6287,6 +6292,9 @@ async function hostR1AgentFixture(
     await resources.settleReservation(recovery.token as string, []);
   const workflows = await storage.getStore('workflows');
   if (!workflows) throw new Error('missing host workflow domain');
+  const snapshotAgentId = input.snapshotTarget?.agentId ?? 'writer';
+  const snapshotThreadId = input.snapshotTarget?.threadId ?? 'acme_thread';
+  const snapshotResourceId = resourceIdFromKey(snapshotThreadId);
   const snapshot: import('@mastra/core/workflows').WorkflowRunState = {
     runId: 'acme_run',
     status:
@@ -6294,10 +6302,10 @@ async function hostR1AgentFixture(
     value: {},
     context: {
       input: {
-        agentId: 'writer',
+        agentId: snapshotAgentId,
         messageListState: {
           memoryInfo: threaded
-            ? { threadId: 'acme_thread', resourceId: RESOURCE_ID }
+            ? { threadId: snapshotThreadId, resourceId: snapshotResourceId }
             : null,
         },
       },
@@ -6311,12 +6319,12 @@ async function hostR1AgentFixture(
     timestamp: 123,
     requestContext: {
       runId: 'acme_run',
-      threadId: 'acme_thread',
-      resourceId: RESOURCE_ID,
+      threadId: snapshotThreadId,
+      resourceId: snapshotResourceId,
       'breakwater.auditContext': {
-        agentId: 'writer',
-        threadId: 'acme_thread',
-        resourceId: RESOURCE_ID,
+        agentId: snapshotAgentId,
+        threadId: snapshotThreadId,
+        resourceId: snapshotResourceId,
       },
       ...(version === 'absent'
         ? {}
@@ -6341,8 +6349,8 @@ async function hostR1AgentFixture(
                       owner: HUMAN_OWNER,
                       target: {
                         kind: 'agent',
-                        id: 'writer',
-                        threadId: 'acme_thread',
+                        id: snapshotAgentId,
+                        threadId: snapshotThreadId,
                       },
                     },
                     agentStart: { threaded },
@@ -6413,6 +6421,363 @@ function hostR1AgentRequest(suffix = '', query = '') {
     suffix ? { method: 'POST' } : undefined,
   );
 }
+
+describe('agent host selector lookup isolation', () => {
+  it.each([
+    ['modern', true, 'status'],
+    ['modern', false, 'stream'],
+    ['modern', true, 'terminate'],
+    ['v1', false, 'status'],
+    ['v1', true, 'stream'],
+    ['v1', false, 'terminate'],
+    ['absent', true, 'status'],
+    ['absent', false, 'stream'],
+    ['absent', true, 'terminate'],
+  ] as const)('maps a coherent foreign snapshot to public 404 without effects (%s threaded=%s %s)', async (provenance, threaded, route) => {
+    const f = await hostR1AgentFixture({
+      provenance,
+      threaded,
+      keyed: true,
+      snapshotTarget: { agentId: 'other-agent', threadId: 'other-thread' },
+    });
+    onTestFinished(() => {
+      vi.restoreAllMocks();
+      f.sql.close();
+    });
+    const capability = (f.workflows as FencedWorkflowsStorageD1)[
+      FENCED_WORKFLOW_STORAGE
+    ];
+    if (!capability) throw new Error('missing native observation');
+    const read = vi.fn(capability.readSnapshot.bind(capability));
+    Object.defineProperty(f.workflows, FENCED_WORKFLOW_STORAGE, {
+      value: { ...capability, readSnapshot: read },
+      configurable: true,
+    });
+    const cancel = vi.spyOn(f.app.runtime, 'cancelActiveExecution');
+    const terminate = vi.spyOn(f.app.runtime, 'terminateAsPrincipal');
+    const cleanup = vi.spyOn(f.app.runtime, 'completeTerminalCleanup');
+    const settle = vi.spyOn(f.resources, 'settleReservation');
+    const resume = vi.spyOn(FlowsafeDurableAgent.prototype, 'resumeViaRuntime');
+    const observe = vi.spyOn(FlowsafeDurableAgent.prototype, 'observe');
+    const owners = f.owners();
+    const state = structuredClone(f.state);
+    const claim = await f.reservations.readForAdmission('host-r1-key');
+    const suffix = route === 'status' ? '' : `/${route}`;
+    const request = new Request(
+      `https://thread/_flowsafe/agent-host/runs/writer/acme_run${suffix}?resourceId=${RESOURCE_ID}`,
+      {
+        method: route === 'terminate' ? 'POST' : 'GET',
+      },
+    );
+    const outcome = await f.host
+      .route(request, f.scope)
+      .catch((error) => error);
+    expect(outcome).toMatchObject({ status: 404, message: 'run not found' });
+    expect(doErrorResponse(outcome).status).toBe(404);
+    expect(read).toHaveBeenCalledOnce();
+    expect(cancel).not.toHaveBeenCalled();
+    expect(terminate).not.toHaveBeenCalled();
+    expect(cleanup).not.toHaveBeenCalled();
+    expect(settle).not.toHaveBeenCalled();
+    expect(resume).not.toHaveBeenCalled();
+    expect(observe).not.toHaveBeenCalled();
+    expect(f.approvals.list).not.toHaveBeenCalled();
+    expect(f.approvals.createAsPrincipal).not.toHaveBeenCalled();
+    expect(f.dispatch).not.toHaveBeenCalled();
+    expect(f.owners()).toEqual(owners);
+    expect(f.state).toEqual(state);
+    expect(await f.reservations.readForAdmission('host-r1-key')).toEqual(claim);
+  });
+
+  it.each([
+    'modern',
+    'v1',
+    'absent',
+  ] as const)('keeps a corrupt foreign public lookup unreadable: %s', async (provenance) => {
+    const f = await hostR1AgentFixture({
+      provenance,
+      snapshotTarget: { agentId: 'other-agent', threadId: 'other-thread' },
+    });
+    onTestFinished(() => {
+      vi.restoreAllMocks();
+      f.sql.close();
+    });
+    Object.assign(f.snapshot.requestContext ?? {}, {
+      'breakwater.auditContext': { agentId: 'contradiction' },
+    });
+    await f.persist();
+    const selected = vi.spyOn(f.app.runtime, 'authoritativeStartState');
+    const before = structuredClone(f.state);
+    const outcome = await f.host
+      .route(hostR1AgentRequest(), f.scope)
+      .catch((error) => error);
+    expect(outcome).toBeInstanceOf(RunStateUnreadableError);
+    expect(outcome).not.toBeInstanceOf(AgentRunSelectorMismatchError);
+    expect(doErrorResponse(outcome).status).toBe(503);
+    expect(selected).toHaveBeenCalledOnce();
+    expect(f.state).toEqual(before);
+    expect(f.approvals.list).not.toHaveBeenCalled();
+    expect(f.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('checks ordinary termination again inside its dispatch lock after storage changes', async () => {
+    const f = await hostR1AgentFixture({ provenance: 'modern' });
+    onTestFinished(() => {
+      vi.restoreAllMocks();
+      f.sql.close();
+    });
+    const selected = vi.spyOn(f.app.runtime, 'authoritativeStartState');
+    const cancel = vi
+      .spyOn(f.app.runtime, 'cancelActiveExecution')
+      .mockImplementation(async () => {
+        const context = f.snapshot.requestContext;
+        if (!context) throw new Error('missing snapshot context');
+        context['flowsafe.runProvenance'].startIdentity.target.threadId =
+          'other-thread';
+        Object.assign(context, {
+          threadId: 'other-thread',
+          resourceId: 'other-thread',
+        });
+        Object.assign(context['breakwater.auditContext'], {
+          threadId: 'other-thread',
+          resourceId: 'other-thread',
+        });
+        const input = f.snapshot.context.input as unknown as {
+          messageListState: { memoryInfo: object };
+        };
+        Object.assign(input.messageListState.memoryInfo, {
+          threadId: 'other-thread',
+          resourceId: 'other-thread',
+        });
+        await f.persist();
+        return false;
+      });
+    const terminate = vi.spyOn(f.app.runtime, 'terminateAsPrincipal');
+    const before = structuredClone(f.state);
+    const outcome = await f.host
+      .route(hostR1AgentRequest('/terminate'), f.scope)
+      .catch((error) => error);
+    expect(outcome).toMatchObject({ status: 404 });
+    expect(selected).toHaveBeenCalledTimes(2);
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(terminate).not.toHaveBeenCalled();
+    expect(f.state).toEqual(before);
+    expect(f.approvals.list).not.toHaveBeenCalled();
+    expect(f.dispatch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'status',
+    'stream',
+    'terminate',
+  ] as const)('does not reread a selected absent row for public %s', async (route) => {
+    const f = await hostR1AgentFixture({ provenance: 'modern' });
+    onTestFinished(() => {
+      vi.restoreAllMocks();
+      f.sql.close();
+    });
+    await f.workflows.deleteWorkflowRunById({
+      workflowName: f.execution.workflowId,
+      runId: f.execution.runId,
+    });
+    const selected = vi.spyOn(f.app.runtime, 'authoritativeStartState');
+    const request = new Request(
+      `https://thread/_flowsafe/agent-host/runs/writer/acme_run${route === 'status' ? '' : `/${route}`}?resourceId=${RESOURCE_ID}`,
+      { method: route === 'terminate' ? 'POST' : 'GET' },
+    );
+    const outcome = await f.host
+      .route(request, f.scope)
+      .catch((error) => error);
+    expect(outcome).toMatchObject({ status: 404 });
+    expect(selected).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    'replay',
+    'dispatch',
+    'terminate replay',
+    'resume',
+    'schedule dispatch',
+    'blocking',
+    'proof',
+  ] as const)('keeps a coherent foreign row present on the strict %s path', async (route) => {
+    const f = await hostR1AgentFixture({
+      provenance: 'modern',
+      keyed: true,
+      snapshotTarget: { agentId: 'writer', threadId: 'other-thread' },
+    });
+    onTestFinished(() => {
+      vi.restoreAllMocks();
+      f.sql.close();
+    });
+    const state = structuredClone(f.state);
+    const owners = f.owners();
+    const claim = await f.reservations.readForAdmission('host-r1-key');
+    const terminate = vi.spyOn(f.app.runtime, 'terminateAsPrincipal');
+    const resume = vi.spyOn(FlowsafeDurableAgent.prototype, 'resumeViaRuntime');
+    const selected = vi.spyOn(f.app.runtime, 'authoritativeStartState');
+    const operation = async () => {
+      if (route === 'blocking') return f.host.blockingRun(f.scope);
+      if (route === 'schedule dispatch')
+        return f.host.scheduleDispatchStatus(f.scope, {
+          agentId: 'writer',
+          resourceId: RESOURCE_ID,
+          runId: 'acme_run',
+        });
+      if (route === 'proof') {
+        const bound = await f.host.resolveBoundAgent(f.scope, {
+          agentId: 'writer',
+          entryPath: 'http.start',
+        });
+        return bound.durableAgent.proofExecutionFor(
+          f.app.runtime,
+          'acme_thread',
+          'acme_run',
+        );
+      }
+      if (route === 'resume')
+        return f.host.route(
+          new Request('https://thread/_flowsafe/agent-host/resume', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              agentId: 'writer',
+              threadId: 'acme_thread',
+              resourceId: RESOURCE_ID,
+              runId: 'acme_run',
+              requestedBy: 'reviewer-2',
+              entryPath: 'approval.resume',
+              resumeData: {},
+            }),
+          }),
+          f.scope,
+        );
+      return f.host.route(
+        hostR1AgentRequest(
+          route === 'terminate replay' ? '/terminate' : '',
+          route === 'dispatch' ? '&dispatch=1' : '&dispatch=1&replay=1',
+        ),
+        f.scope,
+      );
+    };
+    const outcome = await operation().catch((error) => error);
+    expect(outcome).toBeInstanceOf(AgentRunSelectorMismatchError);
+    expect(doErrorResponse(outcome).status).toBe(503);
+    expect(selected).toHaveBeenCalledOnce();
+    expect(terminate).not.toHaveBeenCalled();
+    expect(resume).not.toHaveBeenCalled();
+    expect(f.state).toEqual(state);
+    expect(f.owners()).toEqual(owners);
+    expect(await f.reservations.readForAdmission('host-r1-key')).toEqual(claim);
+    expect(f.approvals.list).not.toHaveBeenCalled();
+    expect(f.dispatch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'prepared',
+    'prepared-unfenced',
+  ] as const)('retains a %s keyed journal and rearms recovery for a coherent foreign row', async (phase) => {
+    const f = await hostR1AgentFixture({
+      mode: phase === 'prepared' ? 'fenced' : 'actual-prefix',
+      provenance: 'modern',
+      journal: true,
+      keyed: true,
+      snapshotTarget: { agentId: 'writer', threadId: 'other-thread' },
+    });
+    onTestFinished(() => {
+      vi.restoreAllMocks();
+      f.sql.close();
+    });
+    const state = structuredClone(f.state);
+    const owners = f.owners();
+    const row = await f.read();
+    const claim = await f.reservations.readForAdmission('host-r1-key');
+    const settle = vi.spyOn(f.resources, 'settleReservation');
+    const settleStart = vi.spyOn(f.app.runtime, 'settleStartExecution');
+    const recover = vi.spyOn(f.app.runtime, 'recoverStartAttempt');
+    const outcome = await f.host
+      .recoverOwnership(f.scope)
+      .catch((error) => error);
+    expect(doErrorResponse(outcome).status).toBe(503);
+    if (phase === 'prepared-unfenced')
+      expect(outcome).toBeInstanceOf(AgentRunSelectorMismatchError);
+    expect(f.state).toEqual(state);
+    expect(f.owners()).toEqual(owners);
+    expect(await f.read()).toEqual(row);
+    expect(await f.reservations.readForAdmission('host-r1-key')).toEqual(claim);
+    expect(f.alarmAt()).toBeDefined();
+    expect(settle).not.toHaveBeenCalled();
+    expect(settleStart).not.toHaveBeenCalled();
+    expect(recover).toHaveBeenCalledTimes(phase === 'prepared' ? 1 : 0);
+    expect(f.approvals.list).not.toHaveBeenCalled();
+    expect(f.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('preserves a reserved start when actual host replay observes another thread', async () => {
+    const f = await hostR1AgentFixture({
+      provenance: 'modern',
+      keyed: true,
+      snapshotTarget: { agentId: 'writer', threadId: 'other-thread' },
+    });
+    onTestFinished(() => {
+      vi.restoreAllMocks();
+      f.sql.close();
+    });
+    const { createPrincipalActorContext, InMemoryApprovalStoreFactory } =
+      await import('../approval-api/index.js');
+    const context = createPrincipalActorContext({
+      principal: f.scope.principal,
+      storeFactory: new InMemoryApprovalStoreFactory(),
+      buildService: () => f.approvals as unknown as ApprovalService,
+    });
+    const hits: string[] = [];
+    const topology = createAgentThreadTopology(
+      {
+        idFromName: (name: string) => name,
+        get: () => ({
+          fetch: (async (
+            request: Request | string,
+            init?: import('../host-kit/thread-topology.js').ThreadRequestInit,
+          ) => {
+            const url = typeof request === 'string' ? request : request.url;
+            hits.push(url);
+            try {
+              return (
+                (await f.host.route(new Request(url, init), f.scope)) ??
+                new Response(null, { status: 404 })
+              );
+            } catch (error) {
+              return doErrorResponse(error);
+            }
+          }) as import('../host-kit/thread-topology.js').ThreadStubLike['fetch'],
+        }),
+      },
+      'test-deployment-identity-secret-0001',
+      { startIdempotency: f.reservations, executionFence: 'none' },
+    );
+    const before = await f.reservations.readForAdmission('host-r1-key');
+    const outcome = await topology
+      .start(context, {
+        agentId: 'writer',
+        prompt: 'retry',
+        entryPath: 'http.start',
+        idempotencyKey: 'host-r1-key',
+      })
+      .catch((error) => error);
+    expect(outcome).toMatchObject({
+      status: 503,
+      message:
+        "run 'acme_run' of workflow 'durable-agentic-loop' state is not readable",
+    });
+    expect(hits).toHaveLength(1);
+    expect(hits[0]).toContain('dispatch=1&replay=1');
+    expect(await f.reservations.readForAdmission('host-r1-key')).toEqual(
+      before,
+    );
+    expect(mocked.stream).not.toHaveBeenCalled();
+    expect(f.approvals.list).not.toHaveBeenCalled();
+  });
+});
 
 describe('FS8 D3 host R1 agent legacy status guards', () => {
   it.each([

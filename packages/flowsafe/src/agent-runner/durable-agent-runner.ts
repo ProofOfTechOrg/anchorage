@@ -289,6 +289,14 @@ export type LegacyAgentRunState = LegacyRunState & {
   readonly threaded: boolean;
 };
 
+/** @internal A coherent snapshot belongs to another agent or thread. */
+export class AgentRunSelectorMismatchError extends RunStateUnreadableError {
+  constructor(workflowId: string, runId: string) {
+    super(workflowId, runId);
+    this.name = 'AgentRunSelectorMismatchError';
+  }
+}
+
 /** @internal Host-owned start authority captured before streaming. */
 export interface AgentStartAuthority {
   readonly startReservation?: StartReservationReading;
@@ -1689,7 +1697,6 @@ export class FlowsafeDurableAgent<
         !isPathSafeId(runId)
       )
         throw new Error('agent observation selector is invalid');
-      const resourceId = resourceIdFromKey(threadId);
       const state = includeLegacy
         ? await runtime.authoritativeStartState(workflowId, runId, {
             includeLegacy: true,
@@ -1716,34 +1723,43 @@ export class FlowsafeDurableAgent<
           | Record<string, unknown>
           | undefined;
         const memory = input?.messageListState?.memoryInfo;
+        const observedAgentId = input?.agentId;
+        const observedThreadId = context?.threadId;
+        if (!isPathSafeId(observedAgentId) || !isPathSafeId(observedThreadId))
+          throw new Error('legacy agent observation identity is malformed');
+        const observedResourceId = resourceIdFromKey(observedThreadId);
         if (
           state.address.workflowId !== workflowId ||
           state.address.runId !== runId ||
-          input?.agentId !== agentId ||
-          (input.runId !== undefined && input.runId !== runId) ||
+          (input?.runId !== undefined && input.runId !== runId) ||
           context?.runId !== runId ||
-          context.threadId !== threadId ||
-          context.resourceId !== resourceId ||
-          correlation?.agentId !== agentId ||
-          correlation.threadId !== threadId ||
-          correlation.resourceId !== resourceId ||
+          context.resourceId !== observedResourceId ||
+          correlation?.agentId !== observedAgentId ||
+          correlation.threadId !== observedThreadId ||
+          correlation.resourceId !== observedResourceId ||
           (memory !== null &&
-            (memory?.threadId !== threadId || memory.resourceId !== resourceId))
+            (memory?.threadId !== observedThreadId ||
+              memory.resourceId !== observedResourceId))
         )
-          throw new Error('legacy agent observation contradicts its selectors');
+          throw new Error(
+            'legacy agent observation context contradicts identity',
+          );
+        if (observedAgentId !== agentId || observedThreadId !== threadId)
+          throw new AgentRunSelectorMismatchError(workflowId, runId);
         return { ...state, threaded: memory !== null };
       }
       const identity = state.provenance.startIdentity;
       const threaded = state.provenance.agentStart?.threaded;
       if (
         identity?.target.kind !== 'agent' ||
-        identity.target.id !== agentId ||
-        identity.target.threadId !== threadId ||
         typeof threaded !== 'boolean' ||
         state.execution.workflowId !== workflowId ||
         state.execution.runId !== runId
       )
-        throw new Error('agent observation identity disagrees with selector');
+        throw new Error('agent observation identity is malformed');
+      const observedAgentId = identity.target.id;
+      const observedThreadId = identity.target.threadId;
+      const observedResourceId = resourceIdFromKey(observedThreadId);
       const context = state.snapshot.requestContext;
       const record = (value: unknown): Record<string, unknown> => {
         if (value === null || typeof value !== 'object' || Array.isArray(value))
@@ -1757,15 +1773,19 @@ export class FlowsafeDurableAgent<
           if (Object.hasOwn(values, key) && values[key] !== expected)
             throw new Error('agent observation context contradicts identity');
       };
-      check(context, { runId, threadId, resourceId });
+      check(context, {
+        runId,
+        threadId: observedThreadId,
+        resourceId: observedResourceId,
+      });
       check(context?.['breakwater.auditContext'], {
-        agentId,
-        threadId,
-        resourceId,
+        agentId: observedAgentId,
+        threadId: observedThreadId,
+        resourceId: observedResourceId,
       });
       const input = state.snapshot.context?.input;
       if (input !== undefined) {
-        check(input, { agentId, runId });
+        check(input, { agentId: observedAgentId, runId });
         const messageList = record(input).messageListState;
         if (messageList !== undefined) {
           const values = record(messageList);
@@ -1777,14 +1797,16 @@ export class FlowsafeDurableAgent<
               const selected = record(memory);
               if (
                 !threaded ||
-                selected.threadId !== threadId ||
-                selected.resourceId !== resourceId
+                selected.threadId !== observedThreadId ||
+                selected.resourceId !== observedResourceId
               )
                 throw new Error('agent mode contradicts memory');
             }
           }
         }
       }
+      if (observedAgentId !== agentId || observedThreadId !== threadId)
+        throw new AgentRunSelectorMismatchError(workflowId, runId);
       return {
         ...state,
         execution: { ...state.execution, ...identity },

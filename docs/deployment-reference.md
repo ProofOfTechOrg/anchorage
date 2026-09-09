@@ -141,6 +141,10 @@ GET  /api/stream/run/:workflowId/:runId
 
 The stream routes mount only when streaming is configured. The approval create route is off unless the host explicitly enables its capability-free form.
 
+`POST /runs` accepts optional `requestContext`, a JSON object for non-reserved application values. A malformed shape or reserved key returns HTTP 400 with `reason: "reserved-context-key"`; the existing request-body bound still applies. Validation follows authentication and workflow authorization. The value reaches the run through the protected ordinary-start topology. Schedule starts use their verified stored target instead, including when that target omits context.
+
+Keyed retries validate context and execute host policy again. A valid divergent value does not replace the winning run's stored context or start another run. See [request-context precedence and persistence](do-runner-design.md#request-context).
+
 ### Control-plane routes
 
 The composed Worker mounts operational routes before tenant routers:
@@ -238,6 +242,15 @@ Other route factories accept a `basePath` when the exact public prefix is host-s
 - `extraPurgeDuties` for deployment-owned domains
 
 Use the exported router and topology factories rather than recreating their gate order.
+
+The start policy receives the validated application context:
+
+| Composition | Hook signature |
+| --- | --- |
+| Direct router | `beforeStart(context, workflowId, inputData, requestContext)` |
+| Composed Worker | `beforeStart(context, env, workflowId, inputData, requestContext)` |
+
+Omitted context arrives as `undefined`. Existing hooks with fewer parameters remain compatible. The hook returns `Promise<void>`; reject a start by throwing a caller-safe `RunRouteError`. Its return value does not supply context. Apply business attribution rules here before the router chooses a new start or keyed replay.
 
 ## Alarm-driven maintenance
 

@@ -646,21 +646,18 @@ export type RunLeg =
     };
 
 /**
- * Server-side requestContext source, consulted on EVERY start and resume.
- * This is the trusted-computing-base seam (security-threat-model.md, trust
- * boundary 6): the DO HTTP boundary never maps requestContext from request
- * bodies, so capability keys — e.g. breakwater's approval grants
- * ('breakwater.connectorGrants') — can only enter a run through this
- * provider. Wire it to derive values from trusted server-side state (the
- * flowsafe approval store), never from client input, model output, or tool
- * results.
+ * Server-side requestContext supplied during start and resume preparation.
+ * Trusted host starts and verified schedule targets may supply non-reserved
+ * application context through storedRequestContext. Capability values,
+ * including approval grants, derive from trusted server-side state through
+ * this provider (security-threat-model.md, trust boundary 6). Use trusted
+ * sources such as the flowsafe approval store; never derive capabilities
+ * from client input, model output, or tool results.
  *
- * Merge semantics are pinned by tests against the installed Mastra core: the context provided
- * at resume merges OVER the run's persisted context — provided keys win,
- * persisted start-time keys survive. Omitting a key therefore does not
- * revoke it; a provider that scopes a capability per leg must return the key
- * on EVERY leg (an empty value when nothing applies) so the overwrite
- * retires stale grants.
+ * Resume values overwrite matching persisted keys. Omitting a key retains
+ * its persisted value. A provider that scopes a capability per leg must
+ * return its key for each leg, using an empty grant list to revoke persisted
+ * connector grants.
  */
 export type RequestContextProvider = (
   workflowId: string,
@@ -793,11 +790,11 @@ export type StartRunOptions = {
    */
   runId: string;
   inputData?: unknown;
-  /** Initial workflow state from an infrastructure-verified schedule target. */
+  /** Schedule-target or ordinary trusted-start state. */
   initialState?: unknown;
   /**
-   * Non-reserved application context from an infrastructure-verified schedule
-   * target. Runtime-owned keys are stripped again before execution.
+   * Non-reserved context supplied by a trusted host start or a verified
+   * schedule target.
    */
   storedRequestContext?: Record<string, unknown>;
   /** Host correlation token for this execution leg. */

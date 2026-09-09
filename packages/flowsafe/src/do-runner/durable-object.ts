@@ -236,6 +236,7 @@ interface StartBody {
   runId?: string;
   inputData?: unknown;
   initialState?: unknown;
+  requestContext?: Record<string, unknown>;
   scheduleId?: unknown;
   dispatchId?: unknown;
   deadlineMs?: unknown;
@@ -1899,6 +1900,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
           runId,
           inputData,
           initialState,
+          requestContext,
           scheduleId,
           dispatchId,
           deadlineMs,
@@ -1986,7 +1988,9 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         const target = source.target;
         const resolvedInput = target ? target.inputData : inputData;
         const resolvedState = target ? target.initialState : initialState;
-        const storedRequestContext = target?.requestContext;
+        const storedRequestContext = target
+          ? target.requestContext
+          : requestContext;
         const runtime = this.#ensureRuntime();
         await this.#recoverPendingRunOwner();
         const existing = await runtime.status(workflowId, runId);

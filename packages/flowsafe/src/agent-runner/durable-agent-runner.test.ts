@@ -64,6 +64,7 @@ import {
 import type { FencedWorkflowsStorageD1 } from '../do-runner/fenced-workflows-d1.js';
 import {
   createHostPubSub,
+  doErrorResponse,
   InvalidExecutionIdentityError,
   InvalidMutationEpochError,
   InvalidRunRequestError,
@@ -72,8 +73,12 @@ import {
   type StartRunOptions,
 } from '../do-runner/index.js';
 import { init } from '../do-runner/init.js';
-import { RunStateUnreadableError } from '../do-runner/runtime.js';
 import {
+  RunStateUnreadableError,
+  UnknownRunError,
+} from '../do-runner/runtime.js';
+import {
+  AgentRunSelectorMismatchError,
   type AgentStartAuthority,
   type AuthoritativeAgentStartState,
   createFlowsafeDurableAgent,
@@ -2917,7 +2922,7 @@ describe('FS8 D3 agent observation', () => {
     'input',
     'memory',
     'audit',
-  ] as const)('R11 refuses present %s contradictions without engine work', async (corruption) => {
+  ] as const)('R11 refuses present %s disagreements without engine work', async (corruption) => {
     const f = await d3AgentObservationFixture(true);
     try {
       if (corruption === 'agent')
@@ -2952,6 +2957,9 @@ describe('FS8 D3 agent observation', () => {
       if (corruption === 'runtime') expect(read).not.toHaveBeenCalled();
       else expect(read).toHaveBeenCalledOnce();
       expect(outcome).toBeInstanceOf(RunStateUnreadableError);
+      if (corruption === 'thread' || corruption === 'agent')
+        expect(outcome).toBeInstanceOf(AgentRunSelectorMismatchError);
+      else expect(outcome).not.toBeInstanceOf(AgentRunSelectorMismatchError);
     } finally {
       f.start.mockRestore();
       f.sql.close();
@@ -3111,6 +3119,226 @@ async function d3LegacyAgentFixture(
   return { ...f, snapshot, seed };
 }
 
+describe('agent selector mismatch classification', () => {
+  it.each([
+    ['pending', true, false, 'agent'],
+    ['success', false, false, 'thread'],
+    ['pending', false, true, 'both'],
+    ['success', true, true, 'agent'],
+    ['success', false, true, 'thread'],
+    ['pending', true, true, 'both'],
+  ] as const)('classifies a coherent foreign modern tuple from one row (%s threaded=%s metadata=%s %s)', async (status, threaded, metadata, foreign) => {
+    const f = await d3AgentObservationFixture(threaded);
+    try {
+      const agentId = foreign === 'thread' ? 'writer' : 'other-agent';
+      const threadId = foreign === 'agent' ? 'thread-1' : 'other-thread';
+      Object.assign(f.snapshot, { status, result: { selected: 'S1' } });
+      Object.assign(
+        f.snapshot.requestContext['flowsafe.runProvenance'].startIdentity
+          .target,
+        { id: agentId, threadId },
+      );
+      if (metadata) {
+        Object.assign(f.snapshot.requestContext, {
+          runId: 'd3-agent',
+          threadId,
+          resourceId: threadId,
+          'breakwater.auditContext': {
+            agentId,
+            threadId,
+            resourceId: threadId,
+          },
+        });
+        Object.assign(f.snapshot.context, {
+          input: {
+            agentId,
+            runId: 'd3-agent',
+            messageListState: {
+              memoryInfo: threaded ? { threadId, resourceId: threadId } : null,
+            },
+          },
+        });
+      }
+      await f.seed();
+      const capability = f.workflows[FENCED_WORKFLOW_STORAGE];
+      assert(capability);
+      const read = vi.spyOn(capability, 'readSnapshot');
+      const ordinary = vi.spyOn(f.workflows, 'loadWorkflowSnapshot');
+      const outcome = await f.agent
+        .authoritativeAgentStartState(f.runtime, 'thread-1', 'd3-agent')
+        .catch((error) => error);
+      expect(outcome).toBeInstanceOf(AgentRunSelectorMismatchError);
+      expect(outcome).toBeInstanceOf(RunStateUnreadableError);
+      expect(doErrorResponse(outcome).status).toBe(503);
+      expect(read).toHaveBeenCalledOnce();
+      expect(ordinary).not.toHaveBeenCalled();
+      read.mockClear();
+      await expect(
+        f.agent.proofExecutionFor(f.runtime, 'thread-1', 'd3-agent'),
+      ).rejects.toBeInstanceOf(AgentRunSelectorMismatchError);
+      expect(read).toHaveBeenCalledOnce();
+      expect(f.counts.model).toBe(0);
+    } finally {
+      f.start.mockRestore();
+      f.sql.close();
+    }
+  });
+
+  it.each([
+    ['v1', true, 'agent'],
+    ['v1', false, 'thread'],
+    ['absent', true, 'both'],
+    ['absent', false, 'agent'],
+  ] as const)('classifies a coherent foreign legacy tuple (%s threaded=%s %s)', async (version, threaded, foreign) => {
+    const f = await d3LegacyAgentFixture(version, threaded);
+    try {
+      const agentId = foreign === 'thread' ? 'writer' : 'other-agent';
+      const threadId = foreign === 'agent' ? 'thread-1' : 'other-thread';
+      Object.assign(f.snapshot.requestContext ?? {}, {
+        threadId,
+        resourceId: threadId,
+        'breakwater.auditContext': { agentId, threadId, resourceId: threadId },
+      });
+      Object.assign(f.snapshot.context.input ?? {}, {
+        agentId,
+        messageListState: {
+          memoryInfo: threaded ? { threadId, resourceId: threadId } : null,
+        },
+      });
+      await f.seed();
+      const capability = f.workflows[FENCED_WORKFLOW_STORAGE];
+      assert(capability);
+      const read = vi.spyOn(capability, 'readSnapshot');
+      const outcome = await f.agent
+        .authoritativeAgentStartState(f.runtime, 'thread-1', 'd3-agent', {
+          includeLegacy: true,
+        })
+        .catch((error) => error);
+      expect(outcome).toBeInstanceOf(AgentRunSelectorMismatchError);
+      expect(outcome).toBeInstanceOf(RunStateUnreadableError);
+      expect(outcome).not.toHaveProperty('execution');
+      expect(read).toHaveBeenCalledOnce();
+      expect(f.counts.model).toBe(0);
+    } finally {
+      f.start.mockRestore();
+      f.sql.close();
+    }
+  });
+
+  it.each([
+    'modern',
+    'v1',
+    'absent',
+  ] as const)('checks internal coherence before foreign lookup classification: %s', async (version) => {
+    const f =
+      version === 'modern'
+        ? await d3AgentObservationFixture(true)
+        : await d3LegacyAgentFixture(version, true);
+    try {
+      Object.assign(f.snapshot.requestContext ?? {}, {
+        'breakwater.auditContext': { agentId: 'contradiction' },
+      });
+      await f.seed();
+      const capability = f.workflows[FENCED_WORKFLOW_STORAGE];
+      assert(capability);
+      const read = vi.spyOn(capability, 'readSnapshot');
+      const outcome = await f.agent
+        .authoritativeAgentStartState(f.runtime, 'other-thread', 'd3-agent', {
+          includeLegacy: true,
+        })
+        .catch((error) => error);
+      expect(outcome).toBeInstanceOf(RunStateUnreadableError);
+      expect(outcome).not.toBeInstanceOf(AgentRunSelectorMismatchError);
+      expect(read).toHaveBeenCalledOnce();
+      expect(f.counts.model).toBe(0);
+    } finally {
+      f.start.mockRestore();
+      f.sql.close();
+    }
+  });
+
+  it.each([
+    'modern',
+    'v1',
+  ] as const)('classifies the selected foreign row when replacement storage matches the selector: %s', async (version) => {
+    const f =
+      version === 'modern'
+        ? await d3AgentObservationFixture(false)
+        : await d3LegacyAgentFixture(version, false);
+    try {
+      const capability = f.workflows[FENCED_WORKFLOW_STORAGE];
+      assert(capability);
+      const native = capability.readSnapshot;
+      const read = vi
+        .spyOn(capability, 'readSnapshot')
+        .mockImplementation(async (address) => {
+          const row = await native(address);
+          if (version === 'modern') {
+            const provenance =
+              f.snapshot.requestContext?.['flowsafe.runProvenance'];
+            provenance.startIdentity.target.threadId = 'replacement-thread';
+          } else {
+            Object.assign(f.snapshot.requestContext ?? {}, {
+              threadId: 'replacement-thread',
+              resourceId: 'replacement-thread',
+              'breakwater.auditContext': {
+                agentId: 'writer',
+                threadId: 'replacement-thread',
+                resourceId: 'replacement-thread',
+              },
+            });
+          }
+          await f.seed();
+          return row;
+        });
+      const outcome = await f.agent
+        .authoritativeAgentStartState(
+          f.runtime,
+          'replacement-thread',
+          'd3-agent',
+          { includeLegacy: true },
+        )
+        .catch((error) => error);
+      expect(outcome).toBeInstanceOf(AgentRunSelectorMismatchError);
+      expect(read).toHaveBeenCalledOnce();
+      expect(f.counts.model).toBe(0);
+    } finally {
+      f.start.mockRestore();
+      f.sql.close();
+    }
+  });
+
+  it.each([
+    'undefined',
+    'error',
+    'unknown run',
+  ] as const)('keeps failed selected sources unreadable rather than classifying a lookup miss: %s', async (failure) => {
+    const f = await d3AgentObservationFixture(false);
+    try {
+      const source = vi.spyOn(f.runtime, 'authoritativeStartState');
+      if (failure === 'undefined') source.mockResolvedValue(undefined as never);
+      else
+        source.mockRejectedValue(
+          failure === 'error'
+            ? new Error('source failed')
+            : new UnknownRunError(f.workflow.id, 'd3-agent'),
+        );
+      const outcome = await f.agent
+        .authoritativeAgentStartState(f.runtime, 'other-thread', 'd3-agent', {
+          includeLegacy: true,
+        })
+        .catch((error) => error);
+      expect(outcome).toBeInstanceOf(RunStateUnreadableError);
+      expect(outcome).not.toBeInstanceOf(AgentRunSelectorMismatchError);
+      expect(source).toHaveBeenCalledOnce();
+      expect(f.counts.model).toBe(0);
+    } finally {
+      f.start.mockRestore();
+      f.sql.close();
+    }
+  });
+});
+
 describe('FS8 D3 fix R1 legacy agent observations', () => {
   it.each(
     (['v1', 'absent'] as const).flatMap((version) =>
@@ -3214,6 +3442,7 @@ describe('FS8 D3 fix R1 legacy agent observations', () => {
       expect(read).toHaveBeenCalledOnce();
       expect(f.counts.model).toBe(0);
       expect(result).toBeInstanceOf(RunStateUnreadableError);
+      expect(result).not.toBeInstanceOf(AgentRunSelectorMismatchError);
     } finally {
       f.start.mockRestore();
       f.sql.close();

@@ -376,6 +376,7 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv>
     env: Env,
     workflowId: string,
     inputData: unknown,
+    requestContext: Record<string, unknown> | undefined,
   ) => Promise<void>;
   /** Host policy immediately before a validated raw resume reaches the run DO. */
   beforeResume?: (
@@ -1644,8 +1645,8 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
             executionFence: executionFenceForEnv(env),
           },
           beforeStart: beforeStart
-            ? (context, workflowId, inputData) =>
-                beforeStart(context, env, workflowId, inputData)
+            ? (context, workflowId, inputData, requestContext) =>
+                beforeStart(context, env, workflowId, inputData, requestContext)
             : undefined,
           beforeResume: beforeResume
             ? (context, workflowId, runId, body) =>

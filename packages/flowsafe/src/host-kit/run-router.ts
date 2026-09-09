@@ -12,6 +12,10 @@ import {
   RUN_START_ROLES,
 } from '../approval-api/index.js';
 import {
+  assertNoReservedExecutionContext,
+  ReservedExecutionContextError,
+} from '../do-runner/execution-context.js';
+import {
   beginIdempotentStart,
   DoStatusError,
   type ExecutionFenceWiring,
@@ -103,6 +107,7 @@ export interface RunRouterOptions {
     context: ActorContext,
     workflowId: string,
     inputData: unknown,
+    requestContext: Record<string, unknown> | undefined,
   ) => Promise<void>;
   /** Host policy that must pass immediately before a validated raw resume. */
   beforeResume?: (
@@ -183,6 +188,7 @@ export interface RunStartInput {
   workflowId: string;
   runId: string;
   inputData: unknown;
+  requestContext?: Record<string, unknown>;
   /** Full trusted identity stamped onto the target Durable Object request. */
   principal: ExecutionPrincipal;
   /** Present only for a target-verifiable schedule fire. */
@@ -205,6 +211,7 @@ interface StartBody {
   workflowId?: string;
   runId?: string;
   inputData?: unknown;
+  requestContext?: Record<string, unknown>;
   deadlineMs?: unknown;
   /**
    * A caller-chosen key that makes this start exactly-once for this caller.
@@ -232,6 +239,9 @@ function json(payload: unknown, status = 200): Response {
 }
 
 function errorResponse(error: unknown): Response {
+  if (error instanceof ReservedExecutionContextError) {
+    return json({ error: error.message, reason: 'reserved-context-key' }, 400);
+  }
   if (error instanceof RunRouteError) {
     return json(
       {
@@ -370,6 +380,9 @@ async function startIdempotently(
       workflowId,
       runId,
       inputData: body.inputData,
+      ...(body.requestContext === undefined
+        ? {}
+        : { requestContext: body.requestContext }),
       principal,
       mutationEpoch,
       idempotencyKey: key,
@@ -459,6 +472,7 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
           idempotencyKey,
           deadlineMs,
           inputData,
+          requestContext,
           runId: suppliedRunId,
         } = parsed;
         const body: StartBody = {
@@ -491,10 +505,27 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
             403,
           );
         }
-        await options.beforeStart?.(context, startTarget, inputData);
-        // Unkeyed starts take the path they always took: mint, start, answer.
-        // Keyed starts route through the reservation, which decides whether
-        // this request starts a run or reports one that already exists.
+        if (requestContext !== undefined) {
+          if (
+            typeof requestContext !== 'object' ||
+            requestContext === null ||
+            Array.isArray(requestContext)
+          ) {
+            throw new RunRouteError(
+              400,
+              'requestContext must be an object',
+              'reserved-context-key',
+            );
+          }
+          assertNoReservedExecutionContext(requestContext);
+        }
+        body.requestContext = requestContext;
+        await options.beforeStart?.(
+          context,
+          startTarget,
+          inputData,
+          requestContext,
+        );
         const { summary, replayed } =
           body.idempotencyKey === undefined
             ? {
@@ -502,6 +533,9 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
                   workflowId: startTarget,
                   runId: context.newRunId(),
                   inputData: body.inputData,
+                  ...(body.requestContext === undefined
+                    ? {}
+                    : { requestContext: body.requestContext }),
                   principal,
                   mutationEpoch,
                   ...(body.deadlineMs === undefined

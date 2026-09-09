@@ -8,9 +8,10 @@ import {
 import { Mastra } from '@mastra/core/mastra';
 import type { MastraCompositeStore } from '@mastra/core/storage';
 import { isPrincipalPermissions } from '@proofoftech/breakwater/rbac';
-import type {
-  AuthoritativeAgentStartState,
-  LegacyAgentRunState,
+import {
+  AgentRunSelectorMismatchError,
+  type AuthoritativeAgentStartState,
+  type LegacyAgentRunState,
 } from '../agent-runner/durable-agent-runner.js';
 import {
   AGENT_ENTRY_PATHS,
@@ -1171,6 +1172,19 @@ export function createThreadAgentHost(
     );
   }
 
+  const publicAgentState = async (
+    scope: AgentThreadInstanceScope,
+    ref: { agentId: string; resourceId: string; runId: string },
+  ): Promise<NormalAgentRunState | null> => {
+    try {
+      return await selectedAgentState(scope, ref, { includeLegacy: true });
+    } catch (error) {
+      if (error instanceof AgentRunSelectorMismatchError)
+        throw new AgentHostRequestError(404, 'run not found');
+      throw error;
+    }
+  };
+
   const matchRecoveryState = (
     recovery: AgentOwnerRecovery,
     state: AuthoritativeAgentStartState | null,
@@ -1603,8 +1617,12 @@ export function createThreadAgentHost(
   const snapshotExecutionFor = async (
     scope: ThreadScope,
     ref: { agentId: string; resourceId: string; runId: string },
+    knownState?: NormalAgentRunState | null,
   ) => {
-    const state = await selectedAgentState(scope, ref, { includeLegacy: true });
+    const state =
+      knownState === undefined
+        ? await selectedAgentState(scope, ref, { includeLegacy: true })
+        : knownState;
     if (!state) throw new AgentHostRequestError(404, 'run not found');
     if (state.kind === 'initial') throw new RunStartPendingError();
     return {
@@ -2348,7 +2366,13 @@ export function createThreadAgentHost(
         if (storedRun && storedRun.agentId !== ref.agentId) {
           throw new AgentHostRequestError(404, 'run not found');
         }
-        await snapshotExecutionFor(scope, ref);
+        await snapshotExecutionFor(
+          scope,
+          ref,
+          preflightUrl.searchParams.get('replay') === '1'
+            ? undefined
+            : await publicAgentState(scope, ref),
+        );
         const owner = await options.resourceAccess().owner('run', ref.runId);
         if (preflightUrl.searchParams.get('replay') !== '1') {
           await scope.init.runtime.cancelActiveExecution(
@@ -2596,7 +2620,9 @@ export function createThreadAgentHost(
             }
             return json(await statusFor(scope, ref));
           }
-          return json(await statusFor(scope, ref));
+          return json(
+            await statusFor(scope, ref, await publicAgentState(scope, ref)),
+          );
         }
 
         if (
@@ -2610,7 +2636,11 @@ export function createThreadAgentHost(
           if (storedRun && storedRun.agentId !== ref.agentId) {
             throw new AgentHostRequestError(404, 'run not found');
           }
-          await snapshotExecutionFor(scope, ref);
+          await snapshotExecutionFor(
+            scope,
+            ref,
+            replayOnly ? undefined : await publicAgentState(scope, ref),
+          );
           const preflightOwner = await options
             .resourceAccess()
             .owner('run', ref.runId);
@@ -2782,7 +2812,11 @@ export function createThreadAgentHost(
           segments[3] === 'stream' &&
           request.method === 'GET'
         ) {
-          const run = await statusFor(scope, ref);
+          const run = await statusFor(
+            scope,
+            ref,
+            await publicAgentState(scope, ref),
+          );
           const offset = Number(url.searchParams.get('offset') ?? '0');
           if (!Number.isSafeInteger(offset) || offset < 0) {
             throw new AgentHostRequestError(400, 'invalid stream offset');

@@ -2,8 +2,10 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
+import { AgentRunSelectorMismatchError } from '../agent-runner/durable-agent-runner.js';
 import type { ActorContext, ApprovalRecord } from '../approval-api/index.js';
 import {
+  doErrorResponse,
   type StartIdempotencyDatabase,
   StartIdempotencyStore,
 } from '../do-runner/index.js';
@@ -1370,6 +1372,21 @@ describe('FS8 D3 protected replay agent wire', () => {
     ).toMatchObject({
       kind: 'bound',
       execution: { startToken: 'wire-generation' },
+    });
+  });
+
+  it('keeps the encoded selector mismatch non-absent without claiming or probing liveness', async () => {
+    const response = doErrorResponse(
+      new AgentRunSelectorMismatchError(execution.workflowId, execution.runId),
+    );
+    expect(response.status).toBe(503);
+    const result = await replay(await response.json(), response.status);
+    expect(result.outcome).toMatchObject({ error: { status: 503 } });
+    expect(result.hits).toHaveLength(1);
+    expect(result.hits[0]).toContain('dispatch=1&replay=1');
+    expect(await result.store.readForAdmission('wire-key')).toMatchObject({
+      state: 'reserved',
+      binding: { kind: 'unbound' },
     });
   });
 

@@ -742,6 +742,7 @@ describe('C workflow ingress capture', () => {
     );
     const bodyInput = { topic: 'body-original' };
     const bodyState = {};
+    const bodyContext = { 'test.source': 'body-original' };
     const expectedOwner = scheduled
       ? { kind: 'human', id: 'schedule-owner' }
       : { kind: principal.kind, id: principal.id };
@@ -750,6 +751,7 @@ describe('C workflow ingress capture', () => {
       runId: 'c-run',
       inputData: bodyInput,
       initialState: bodyState,
+      requestContext: bodyContext,
       scheduleId: scheduled ? 'original-schedule' : undefined,
       dispatchId: scheduled ? 'original-dispatch' : undefined,
       deadlineMs: 1000,
@@ -796,6 +798,7 @@ describe('C workflow ingress capture', () => {
         runId: 'replacement',
         inputData: { topic: 'replacement' },
         initialState: { replaced: true },
+        requestContext: { replaced: true },
         scheduleId: 'replacement',
         dispatchId: 'replacement',
         deadlineMs: 9000,
@@ -853,7 +856,7 @@ describe('C workflow ingress capture', () => {
     expect(options?.inputData).toBe(scheduled ? targetInput : bodyInput);
     expect(options?.initialState).toBe(scheduled ? targetState : bodyState);
     expect(options?.storedRequestContext).toBe(
-      scheduled ? targetContext : undefined,
+      scheduled ? targetContext : bodyContext,
     );
     expect(options?.runOwnerGuard?.reservationToken).toBe(
       options?.attemptToken,
@@ -1337,6 +1340,34 @@ describe('C workflow ingress capture', () => {
 });
 
 describe('DurableObjectRunner.fetch', () => {
+  it.each([
+    undefined,
+    {},
+    { 'app.attribution': { workspaceId: 'workspace-1', origin: 'api' } },
+  ])('forwards ordinary start context to Runtime: %j', async (requestContext) => {
+    const fixture = cWorkflowFixture();
+    const response = await fixture.runner.fetch(
+      post('/runs', { ...C_WORKFLOW_BODY, requestContext }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(fixture.start).toHaveBeenCalledOnce();
+    const options = fixture.start.mock.calls[0]?.[1];
+    if (requestContext === undefined) {
+      expect(options).not.toHaveProperty('storedRequestContext');
+    } else {
+      expect(options?.storedRequestContext).toEqual(requestContext);
+    }
+    expect(options).toMatchObject({
+      requestedBy: OWNER_PRINCIPAL.id,
+      requestedByKind: OWNER_PRINCIPAL.kind,
+      startIdentity: {
+        owner: { kind: OWNER_PRINCIPAL.kind, id: OWNER_PRINCIPAL.id },
+        target: { kind: 'workflow', id: 'gated' },
+      },
+    });
+  });
+
   it('rejects a start without a trusted execution principal before runtime or ownership work', async () => {
     const reserve = vi.fn(async () => true);
     const runtime = {
@@ -1598,7 +1629,10 @@ describe('DurableObjectRunner.fetch', () => {
     );
   });
 
-  it('executes the prepared schedule target payload instead of forged start-body payload', async () => {
+  it.each([
+    undefined,
+    { source: 'stored-context' },
+  ])('executes the prepared schedule target payload with context %j', async (requestContext) => {
     const owners = new InMemoryResourceOwnershipStore();
     await owners.claim('schedule', 'schedule-payload', {
       kind: 'human',
@@ -1631,7 +1665,7 @@ describe('DurableObjectRunner.fetch', () => {
         workflowId: 'gated',
         inputData: { topic: 'stored-input' },
         initialState: { phase: 'stored-state' },
-        requestContext: { source: 'stored-context' },
+        ...(requestContext === undefined ? {} : { requestContext }),
       },
     });
     const runner = new TestRunner(undefined, env);
@@ -1663,11 +1697,16 @@ describe('DurableObjectRunner.fetch', () => {
         runId: 'run-schedule-payload',
         inputData: { topic: 'stored-input' },
         initialState: { phase: 'stored-state' },
-        storedRequestContext: { source: 'stored-context' },
         requestedBy: 'schedule-runner',
         requestedByKind: 'system',
       }),
     );
+    const options = start.mock.calls[0]?.[1];
+    if (requestContext === undefined) {
+      expect(options).not.toHaveProperty('storedRequestContext');
+    } else {
+      expect(options?.storedRequestContext).toEqual(requestContext);
+    }
   });
 
   it.each([

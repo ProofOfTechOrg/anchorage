@@ -2,8 +2,12 @@
 import { Agent } from '@mastra/core/agent';
 import { Mastra } from '@mastra/core/mastra';
 import type { RequestContext } from '@mastra/core/request-context';
-import { InMemoryStore } from '@mastra/core/storage';
+import { InMemoryStore, type MastraCompositeStore } from '@mastra/core/storage';
 import type { WorkflowRunState } from '@mastra/core/workflows';
+import {
+  createConnector,
+  invokeConnector,
+} from '@proofoftech/breakwater/connector-sdk';
 import { assert, describe, expect, expectTypeOf, it, vi } from 'vitest';
 import { z } from 'zod';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
@@ -5137,33 +5141,44 @@ describe('RunnerRuntime requestContextForRun', () => {
     b: unknown;
   }
 
-  // probe: first (records context) -> gate (suspends; records context on the
-  // resumed execution). Proves what each execution leg actually observes.
-  function buildContextProbe(provider: RequestContextProvider): {
+  function buildContextProbe(
+    provider: RequestContextProvider,
+    storage: MastraCompositeStore = new InMemoryStore(),
+  ): {
     runtime: RunnerRuntime;
     seen: Observation[];
   } {
     const seen: Observation[] = [];
     const { createWorkflow, createStep, runtime } = init(
-      { storage: new InMemoryStore() },
+      { storage },
       {
         startIdempotency: 'none',
         requestContextForRun: provider,
         executionFence: 'none',
       },
     );
-    const first = createStep({
-      id: 'first',
-      inputSchema: z.object({}),
+    const inspect = createConnector({
+      id: 'inspect-context',
+      description: 'Inspect application context at the connector boundary',
+      inputSchema: z.object({ leg: z.enum(['start', 'resume']) }),
       outputSchema: z.object({}),
-      execute: async ({ requestContext }) => {
+      permissions: { sideEffect: 'read' },
+      execute: async ({ leg }, { requestContext }) => {
+        assert(requestContext);
         seen.push({
-          leg: 'start',
+          leg,
           a: requestContext.get('test.a'),
           b: requestContext.get('test.b'),
         });
         return {};
       },
+    });
+    const first = createStep({
+      id: 'first',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      execute: async ({ requestContext }) =>
+        invokeConnector(inspect, { leg: 'start' as const }, { requestContext }),
     });
     const gate = createStep({
       id: 'gate',
@@ -5173,12 +5188,11 @@ describe('RunnerRuntime requestContextForRun', () => {
       resumeSchema: z.object({ go: z.boolean() }),
       execute: async ({ resumeData, suspend, requestContext }) => {
         if (!resumeData) return suspend({ reason: 'wait' });
-        seen.push({
-          leg: 'resume',
-          a: requestContext.get('test.a'),
-          b: requestContext.get('test.b'),
-        });
-        return {};
+        return invokeConnector(
+          inspect,
+          { leg: 'resume' as const },
+          { requestContext },
+        );
       },
     });
     createWorkflow({
@@ -5192,50 +5206,295 @@ describe('RunnerRuntime requestContextForRun', () => {
     return { runtime, seen };
   }
 
-  it('merges stored schedule context below trusted provider and runtime values', async () => {
+  it('merges stored application context below provider and Runtime authority in a connector', async () => {
     const seen: Record<string, unknown> = {};
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
       {
         startIdempotency: 'none',
-        requestContextForRun: () => ({ 'test.a': 'provider' }),
+        requestContextForRun: () => ({
+          'test.a': 'provider',
+          'breakwater.actor': { id: 'trusted-operator', role: 'operator' },
+          threadId: 'trusted-thread',
+          'breakwater.workflowScope': 'provider-forged-scope',
+          runId: 'provider-forged-run',
+        }),
         executionFence: 'none',
       },
     );
-    const inspect = createStep({
-      id: 'inspect-scheduled-context',
+    const connector = createConnector({
+      id: 'inspect-application-context',
+      description: 'Inspect stored context and execution authority',
       inputSchema: z.object({}),
       outputSchema: z.object({}),
-      execute: async ({ requestContext }) => {
+      permissions: { sideEffect: 'read' },
+      execute: async (_input, { requestContext }) => {
+        assert(requestContext);
         seen.a = requestContext.get('test.a');
         seen.b = requestContext.get('test.b');
         seen.workflowScope = requestContext.get('breakwater.workflowScope');
+        seen.actor = requestContext.get('breakwater.actor');
+        seen.threadId = requestContext.get('threadId');
+        seen.runId = requestContext.get('runId');
+        seen.execution = requestContext.get('breakwater.connectorExecution');
+        seen.isolation = requestContext.get('breakwater.isolationScope');
+        seen.grants = requestContext.get('breakwater.connectorGrants');
+        seen.customCapability = requestContext.get('breakwater.customGrant');
         return {};
       },
     });
+    const inspect = createStep({
+      id: 'inspect-context',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      execute: async ({ requestContext }) =>
+        invokeConnector(connector, {}, { requestContext }),
+    });
     createWorkflow({
-      id: 'scheduled-context',
+      id: 'application-context',
       inputSchema: z.object({}),
       outputSchema: z.object({}),
     })
       .then(inspect)
       .commit();
 
-    await runtime.start('scheduled-context', {
-      runId: 'scheduled-context-run',
+    const result = await runtime.start('application-context', {
+      runId: 'application-context-run',
       inputData: {},
       storedRequestContext: {
         'test.a': 'stored',
         'test.b': 'stored-only',
         'breakwater.workflowScope': 'forged',
+        'breakwater.actor': { id: 'forged-admin', role: 'admin' },
+        'breakwater.isolationScope': 'forged-isolation',
+        'breakwater.connectorGrants': ['forged-grant'],
+        'breakwater.customGrant': 'forged-capability',
+        'breakwater.connectorExecution': { kind: 'resume' },
+        threadId: 'forged-thread',
+        runId: 'forged-run',
       },
     });
 
+    expect(result.status).toBe('success');
     expect(seen).toEqual({
       a: 'provider',
       b: 'stored-only',
-      workflowScope: 'scheduled-context',
+      workflowScope: 'application-context',
+      actor: { id: 'trusted-operator', role: 'operator' },
+      threadId: 'trusted-thread',
+      runId: 'application-context-run',
+      execution: {
+        kind: 'start',
+        workflowId: 'application-context',
+        runId: 'application-context-run',
+      },
+      isolation: undefined,
+      grants: undefined,
+      customCapability: undefined,
     });
+  });
+
+  it('restores stored application context through a fresh Runtime and D1 storage adapter', async () => {
+    const binding = sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding;
+    const provider = vi.fn<RequestContextProvider>(
+      (_workflowId, _runId, leg) => ({
+        'test.a': `provider-${leg.kind}`,
+      }),
+    );
+    const stored = { workspaceId: 'workspace-1', tags: ['persisted', 'api'] };
+    const before = buildContextProbe(provider, createD1Storage({ binding }));
+    const started = await before.runtime.start('probe', {
+      runId: 'stored-context-resume',
+      inputData: {},
+      storedRequestContext: { 'test.a': 'stored', 'test.b': stored },
+    });
+    expect(started.status).toBe('suspended');
+    expect(before.seen).toEqual([
+      { leg: 'start', a: 'provider-start', b: stored },
+    ]);
+
+    const after = buildContextProbe(provider, createD1Storage({ binding }));
+    const resumed = await after.runtime.resume('probe', started.runId, {
+      step: 'gate',
+      resumeData: { go: true },
+    });
+
+    expect(resumed.status).toBe('success');
+    expect(after.seen).toEqual([
+      { leg: 'resume', a: 'provider-resume', b: stored },
+    ]);
+    expect(
+      provider.mock.calls.map(([_workflowId, _runId, leg]) => leg.kind),
+    ).toEqual(['start', 'resume']);
+  });
+
+  it.each([
+    'stored-grants',
+    'provider-refresh',
+    'provider-revocation',
+  ] as const)('enforces connector capability provenance across fresh Runtime legs: %s', async (mode) => {
+    const storage = new InMemoryStore();
+    const seen: Record<string, unknown>[] = [];
+    const storedGrant = {
+      scope: 'run',
+      connectorId: 'context-writer',
+      workflowId: 'context-grants',
+      runId: 'context-grants-run',
+    };
+    const provider = vi.fn<RequestContextProvider>(
+      (workflowId, runId, leg) => ({
+        'test.source': `provider-${leg.kind}`,
+        ...(mode === 'stored-grants'
+          ? {}
+          : {
+              'breakwater.connectorGrants':
+                leg.kind === 'resume' && mode === 'provider-revocation'
+                  ? []
+                  : [
+                      leg.kind === 'start'
+                        ? storedGrant
+                        : {
+                            scope: 'suspension',
+                            connectorId: 'context-writer',
+                            workflowId,
+                            runId,
+                            suspension: {
+                              stepPath: leg.step,
+                              suspendedAt: leg.suspendedAt,
+                            },
+                          },
+                    ],
+            }),
+      }),
+    );
+    const build = () => {
+      const app = init(
+        { storage },
+        {
+          startIdempotency: 'none',
+          executionFence: 'none',
+          requestContextForRun: provider,
+        },
+      );
+      const writer = createConnector({
+        id: 'context-writer',
+        description: 'Exercise application context and provider-derived grants',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        permissions: { sideEffect: 'write', requiresApproval: true },
+        execute: async (_input, { requestContext }) => {
+          assert(requestContext);
+          seen.push({
+            source: requestContext.get('test.source'),
+            attribution: requestContext.get('app.attribution'),
+            mutationEpoch: requestContext.get('mutationEpoch'),
+            startToken: requestContext.get('startToken'),
+            grants: requestContext.get('breakwater.connectorGrants'),
+          });
+          return {};
+        },
+      });
+      app
+        .createWorkflow({
+          id: 'context-grants',
+          inputSchema: z.object({}),
+          outputSchema: z.object({}),
+        })
+        .then(
+          app.createStep({
+            id: 'first',
+            inputSchema: z.object({}),
+            outputSchema: z.object({}),
+            execute: async ({ requestContext }) =>
+              invokeConnector(writer, {}, { requestContext }),
+          }),
+        )
+        .then(
+          app.createStep({
+            id: 'gate',
+            inputSchema: z.object({}),
+            outputSchema: z.object({}),
+            suspendSchema: z.object({ reason: z.string() }),
+            resumeSchema: z.object({ go: z.boolean() }),
+            execute: async ({ resumeData, suspend, requestContext }) => {
+              if (!resumeData) return suspend({ reason: 'wait' });
+              return invokeConnector(writer, {}, { requestContext });
+            },
+          }),
+        )
+        .commit();
+      return app.runtime;
+    };
+    const before = build();
+    const started = await before.start('context-grants', {
+      runId: 'context-grants-run',
+      inputData: {},
+      requestedBy: 'trusted-requester',
+      requestedByKind: 'human',
+      storedRequestContext: {
+        'test.source': 'stored',
+        'app.attribution': { workspaceId: 'workspace-1' },
+        mutationEpoch: 'application-value',
+        startToken: 'application-token',
+        connectorGrants: [storedGrant],
+        approved: true,
+        'breakwater.connectorGrants': [storedGrant],
+        'flowsafe.runProvenance': { requestedBy: 'forged-requester' },
+      },
+    });
+    expect(started.requestedBy).toBe('trusted-requester');
+    if (mode === 'stored-grants') {
+      expect(started.status).toBe('failed');
+      expect(started.error).toContain(
+        'approval required and no matching structured grant was found',
+      );
+      expect(seen).toEqual([]);
+      expect(provider).toHaveBeenCalledOnce();
+      return;
+    }
+    expect(started.status).toBe('suspended');
+    expect(seen).toEqual([
+      {
+        source: 'provider-start',
+        attribution: { workspaceId: 'workspace-1' },
+        mutationEpoch: 'application-value',
+        startToken: 'application-token',
+        grants: [storedGrant],
+      },
+    ]);
+    const resumed = await build().resume('context-grants', started.runId, {
+      step: 'gate',
+      resumeData: { go: true },
+    });
+    expect(
+      provider.mock.calls.map(([_workflowId, _runId, leg]) => leg.kind),
+    ).toEqual(['start', 'resume']);
+    if (mode === 'provider-revocation') {
+      expect(resumed.status).toBe('failed');
+      expect(resumed.error).toContain(
+        'approval required and no matching structured grant was found',
+      );
+      expect(seen).toHaveLength(1);
+    } else {
+      expect(resumed.status).toBe('success');
+      expect(seen).toHaveLength(2);
+      expect(seen[1]).toEqual({
+        ...seen[0],
+        source: 'provider-resume',
+        grants: [
+          {
+            scope: 'suspension',
+            connectorId: 'context-writer',
+            workflowId: 'context-grants',
+            runId: 'context-grants-run',
+            suspension: {
+              stepPath: ['gate'],
+              suspendedAt: expect.any(Number),
+            },
+          },
+        ],
+      });
+    }
   });
 
   it('consults the provider on every start and resume leg', async () => {

@@ -447,16 +447,15 @@ The maintenance Durable Object persists a rotating tuple cursor after every sele
 
 ## Request context
 
-Before every create or resume, the runtime sets:
+`POST /runs` accepts an optional `requestContext` object after authenticated start authorization. The router rejects invalid shapes and keys identified by [`isReservedExecutionContextKey()`](../packages/flowsafe/src/do-runner/execution-context.ts) with HTTP 400 and `reason: "reserved-context-key"`. The validated record reaches `beforeStart` before reservation or execution; hosts enforce stricter application attribution policy there.
 
-- run id;
-- workflow id;
-- `breakwater.workflowScope`;
-- values returned by the host's `requestContextForRun` provider.
+`RunStartInput.requestContext` crosses the authenticated Worker-to-Durable-Object channel and becomes `StartRunOptions.storedRequestContext`. A verified schedule target supplies its own context even when that value is absent; an ordinary-start body cannot fill that absence. `inputData` remains workflow input and does not populate request context.
 
-Runtime-derived base keys win over stored or client-provided context. `breakwater.isolationScope` remains reserved and is dropped from provider values because connector keys are deployment-wide. Schedules additionally reject these reserved namespaces when data is written.
+Stored non-reserved application values have the lowest precedence. Application values from `requestContextForRun` override matching stored keys. Runtime-derived execution metadata and trusted provider capabilities/identity are applied after application values. `breakwater.isolationScope` remains reserved and is dropped from provider values because connector keys are deployment-wide.
 
-`approvalGrantProvider()` is the normal provider. A provider failure happens before `createRun()` or resume, so a failed start leaves its run id retryable.
+Application context persists with the run and survives resume in a fresh Runtime or Durable Object. The provider runs again for each execution leg. A provider that revokes a capability must return an explicit empty value for that key; omission leaves a persisted value available to the context merge. A keyed replay revalidates the supplied context and executes host policy, then retains the winning run's context without comparing or overwriting it.
+
+`approvalGrantProvider()` derives approval capabilities from persisted decisions. A provider failure aborts the execution leg before `createRun()` or resume.
 
 ## Import-safe workflow modules
 

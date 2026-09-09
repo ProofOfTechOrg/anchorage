@@ -29,6 +29,7 @@ import {
   type ScheduleDatabase,
 } from '../schedules/index.js';
 import type { ResumeRunFn } from './approval-bridge.js';
+import type { RunnerStubLike } from './do-run-topology.js';
 import {
   createFlowsafeWorker,
   type FlowsafeWorkerConfig,
@@ -39,6 +40,7 @@ import {
 } from './flowsafe-worker.js';
 import { approvalStoreFactoryFor } from './host-approval-service.js';
 import { MAINTENANCE_RECEIPT_HEADER } from './maintenance-capability.js';
+import { RunRouteError } from './run-route-error.js';
 import { staticTokenVerifier } from './verifier.js';
 import type { WorkflowMeta } from './workflow-meta.js';
 
@@ -952,6 +954,79 @@ describe('createFlowsafeWorker fetch pipeline', () => {
     expect(response.status).toBe(200);
     expect(buildResumeRun).toHaveBeenCalledOnce();
     expect(buildResumeRun.mock.calls[0]?.[1]).toBe(env);
+  });
+
+  it.each([
+    undefined,
+    { 'app.attribution': 'ada', nested: { value: 1 } },
+  ])('passes context as the fifth policy argument and serializes it to the run DO: %j', async (requestContext) => {
+    const beforeStart = vi.fn<
+      NonNullable<FlowsafeWorkerConfig<FlowsafeWorkerEnv>['beforeStart']>
+    >(async () => {});
+    const worker = makeWorker({ beforeStart });
+    const h = makeEnv();
+    const transport = vi.fn<RunnerStubLike['fetch']>(async (_url, init) => {
+      const body = JSON.parse(init?.body ?? '{}') as { runId: string };
+      return Response.json(successSummary(body.runId));
+    });
+    h.env.RUNNER = {
+      idFromName: (name) => name,
+      get: () => ({ fetch: transport }),
+    };
+    const inputData = { topic: 'launch' };
+    const response = await worker.fetch(
+      authed('http://host/runs', {
+        method: 'POST',
+        body: JSON.stringify({ workflowId: 'wf', inputData, requestContext }),
+      }),
+      h.env,
+      h.ctx,
+    );
+    await h.flush();
+
+    expect(response.status).toBe(200);
+    expect(beforeStart).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ actor: { id: 'ada', role: 'admin' } }),
+      h.env,
+      'wf',
+      inputData,
+      requestContext,
+    );
+    expect(transport).toHaveBeenCalledOnce();
+    const forwarded = JSON.parse(transport.mock.calls[0]?.[1]?.body ?? '{}');
+    expect(forwarded.requestContext).toEqual(requestContext);
+    expect(Object.hasOwn(forwarded, 'requestContext')).toBe(
+      requestContext !== undefined,
+    );
+  });
+
+  it('rejects application attribution in host policy before contacting the run DO', async () => {
+    const beforeStart = vi.fn<
+      NonNullable<FlowsafeWorkerConfig<FlowsafeWorkerEnv>['beforeStart']>
+    >(async (_context, _env, _workflowId, _inputData, requestContext) => {
+      expect(requestContext).toEqual({ 'app.attribution': 'forbidden' });
+      throw new RunRouteError(403, 'attribution is not allowed');
+    });
+    const worker = makeWorker({ beforeStart });
+    const h = makeEnv();
+    const response = await worker.fetch(
+      authed('http://host/runs', {
+        method: 'POST',
+        body: JSON.stringify({
+          workflowId: 'wf',
+          requestContext: { 'app.attribution': 'forbidden' },
+        }),
+      }),
+      h.env,
+      h.ctx,
+    );
+    await h.flush();
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({
+      error: 'attribution is not allowed',
+    });
+    expect(beforeStart).toHaveBeenCalledOnce();
+    expect(h.doCalls).toEqual([]);
   });
 
   it('runs the context-aware start and resume policies before the topology thunks', async () => {

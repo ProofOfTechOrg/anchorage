@@ -322,6 +322,23 @@ The host mints opaque, path-safe run and thread ids. `RunnerRuntime.start()` req
 
 Callers that need exactly-once start behavior supply an `idempotencyKey`, never a run ID. The key is available on `POST /runs`, trusted agent-host starts, and `streamUntilPersisted()`. A retry returns the same persisted run. `IDEMPOTENT_START_PENDING` includes `pendingSince`; re-probe the point-in-time `IDEMPOTENT_START_UNRESOLVABLE` result before acting. A key remains valid until its reservation-retention horizon expires.
 
+### Pass application context at start
+
+An authenticated `POST /runs` can supply a non-reserved application context:
+
+```json
+{
+  "workflowId": "publish",
+  "inputData": { "topic": "release notes" },
+  "idempotencyKey": "publish-request-123",
+  "requestContext": { "app.agentId": "agent_123" }
+}
+```
+
+`requestContext` must be an object when present. Invalid shapes and reserved keys return HTTP 400 with `reason: "reserved-context-key"`. The router validates it after authentication and workflow authorization, then passes it to the host's `beforeStart` policy. Use that hook for application-specific attribution rules; possession of a run token does not establish an arbitrary context value's business meaning.
+
+The protected topology carries this value into `storedRequestContext`. Provider application values override stored values, while trusted execution identity and capabilities retain their authority. Verified schedule targets supply their own context, including an omitted value. Persisted application values survive resume; a keyed replay retains the winning run's context and still performs validation and host policy checks. See the [request-context guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/do-runner-design.md#request-context) and [host policy signatures](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/deployment-reference.md#host-composition).
+
 ### Stores are deployment-wide
 
 `D1ApprovalStoreFactory.store()` and `D1SubscriptionStoreFactory.store()` return the store for the bound database. Tables and indexes contain no tenant column. Legacy pooled schemas require a fresh database.

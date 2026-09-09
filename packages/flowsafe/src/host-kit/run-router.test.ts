@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Showcase modules depend on host-kit, so these fixtures remain independent.
 
+import { InMemoryStore } from '@mastra/core/storage';
+import {
+  type ConnectorConfig,
+  createConnector,
+  invokeConnector,
+} from '@proofoftech/breakwater';
 import { describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 
 import { TEST_DEPLOYMENT_IDENTITY_SECRET } from '../../test-support/deployment-identity.js';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
@@ -15,12 +22,14 @@ import {
   InMemoryApprovalStoreFactory,
   type SelfDecisionPolicy,
 } from '../approval-api/index.js';
+import { RESERVED_EXECUTION_CONTEXT_KEYS } from '../do-runner/execution-context.js';
 import {
   doErrorResponse,
   ExecutionFencedError,
   type ExecutionFenceWiring,
   InvalidMutationEpochError,
   InvalidRunRequestError,
+  init,
   MutationEpochMismatchError,
   RunLifecycleBlockedError,
   RunNotSuspendedError,
@@ -518,6 +527,7 @@ describe('C workflow router capture', () => {
     });
     const body = cHeldBody({
       workflowId: RESTRICTED_FLOW.id,
+      requestContext: { 'app.attribution': 'original' },
       ...(keyed ? { idempotencyKey: 'original-key' } : {}),
     });
     const pending = fixture.handle(body.request);
@@ -558,6 +568,7 @@ describe('C workflow router capture', () => {
       });
       expect(start.mock.calls[0]?.[0]).toMatchObject({
         workflowId: RESTRICTED_FLOW.id,
+        requestContext: { 'app.attribution': 'original' },
         principal: { id: OPERATOR.id },
         mutationEpoch: 2,
       });
@@ -630,14 +641,24 @@ describe('C workflow router capture', () => {
         ? { store, live: async () => false, executionFence: 'none' }
         : 'none',
     });
+    let applicationContext = { 'app.attribution': 'original' };
+    const contextRead = vi.fn(() => applicationContext);
     const body = {
       workflowId: OPEN_FLOW.id,
       inputData: { original: true },
+      get requestContext() {
+        return contextRead();
+      },
+      set requestContext(value) {
+        applicationContext = value;
+      },
       deadlineMs: 60,
       idempotencyKey: keyed ? 'original-key' : undefined,
     };
     const originalInput = body.inputData;
+    const originalContext = applicationContext;
     const raw = JSON.stringify(body);
+    contextRead.mockClear();
     const parse = JSON.parse;
     const parser = vi
       .spyOn(JSON, 'parse')
@@ -663,6 +684,7 @@ describe('C workflow router capture', () => {
         idempotencyKey: 'replacement',
         deadlineMs: 999,
         inputData: { replaced: true },
+        requestContext: { 'app.attribution': 'replacement' },
       });
       policyRelease.resolve();
       if (keyed) {
@@ -702,10 +724,12 @@ describe('C workflow router capture', () => {
     expect(policy.mock.calls[0]?.slice(1)).toEqual([
       OPEN_FLOW.id,
       originalInput,
+      originalContext,
     ]);
     expect(start.mock.calls[0]?.[0]).toMatchObject({
       workflowId: OPEN_FLOW.id,
       inputData: originalInput,
+      requestContext: originalContext,
       deadlineMs: 60,
       principal: { id: OPERATOR.id },
       mutationEpoch: 2,
@@ -719,6 +743,7 @@ describe('C workflow router capture', () => {
       });
     }
     expect(start).toHaveBeenCalledOnce();
+    expect(contextRead).toHaveBeenCalledOnce();
   });
 });
 
@@ -1016,6 +1041,214 @@ describe('createRunRouter — per-workflow allowedRoles', () => {
 
     // #then
     expect(response?.status).toBe(404);
+  });
+});
+
+describe('createRunRouter — run-start application context', () => {
+  it.each([
+    undefined,
+    {},
+    { 'app.attribution': 'operator', nested: { tags: [1, true, null] } },
+  ])('forwards an accepted context to policy and both start branches: %j', async (requestContext) => {
+    for (const keyed of [false, true]) {
+      const beforeStart = vi.fn<NonNullable<RunRouterOptions['beforeStart']>>(
+        async () => {},
+      );
+      const start = vi.fn<RunRouterOptions['start']>(async ({ runId }) => ({
+        runId,
+        status: 'success',
+      }));
+      const { handle } = keyed
+        ? keyedHarness({ beforeStart, start })
+        : makeHarness({ beforeStart, start });
+      const inputData = { topic: 'launch' };
+      const response = await handle(
+        req('/runs', {
+          body: {
+            workflowId: OPEN_FLOW.id,
+            inputData,
+            requestContext,
+            ...(keyed ? { idempotencyKey: 'context-key' } : {}),
+          },
+        }),
+      );
+
+      expect(response?.status).toBe(200);
+      expect(beforeStart).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          principal: expect.objectContaining({ id: OPERATOR.id }),
+        }),
+        OPEN_FLOW.id,
+        inputData,
+        requestContext,
+      );
+      expect(start).toHaveBeenCalledOnce();
+      expect(start.mock.calls[0]?.[0].requestContext).toEqual(requestContext);
+      expect(
+        Object.hasOwn(start.mock.calls[0]?.[0] ?? {}, 'requestContext'),
+      ).toBe(requestContext !== undefined);
+    }
+  });
+
+  it.each([
+    null,
+    [],
+    ['value'],
+    true,
+    false,
+    0,
+    1,
+    '',
+    'value',
+  ])('refuses a non-record context before policy: %j', async (requestContext) => {
+    const beforeStart = vi.fn<NonNullable<RunRouterOptions['beforeStart']>>(
+      async () => {},
+    );
+    const { handle, started } = makeHarness({ beforeStart });
+    const response = await handle(
+      req('/runs', {
+        body: { workflowId: OPEN_FLOW.id, requestContext },
+      }),
+    );
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({
+      error: 'requestContext must be an object',
+      reason: 'reserved-context-key',
+    });
+    expect(beforeStart).not.toHaveBeenCalled();
+    expect(started).toEqual([]);
+  });
+
+  it.each([
+    ...RESERVED_EXECUTION_CONTEXT_KEYS,
+    'breakwater.futureCapability',
+  ])('refuses reserved application-context key %s before policy', async (key) => {
+    const beforeStart = vi.fn<NonNullable<RunRouterOptions['beforeStart']>>(
+      async () => {},
+    );
+    const { handle, started } = makeHarness({ beforeStart });
+    const response = await handle(
+      req('/runs', {
+        body: {
+          workflowId: OPEN_FLOW.id,
+          requestContext: Object.fromEntries([[key, 'forged']]),
+        },
+      }),
+    );
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({
+      error: `requestContext may not carry the reserved key '${key}'`,
+      reason: 'reserved-context-key',
+    });
+    expect(beforeStart).not.toHaveBeenCalled();
+    expect(started).toEqual([]);
+  });
+
+  it.each([
+    { actor: null, workflowId: OPEN_FLOW.id, status: 401 },
+    { actor: REVIEWER, workflowId: OPEN_FLOW.id, status: 403 },
+    { actor: VIEWER, workflowId: OPEN_FLOW.id, status: 403 },
+    { actor: OPERATOR, workflowId: RESTRICTED_FLOW.id, status: 403 },
+  ])('authenticates and authorizes before context validation: $actor $workflowId', async ({
+    actor,
+    workflowId,
+    status,
+  }) => {
+    const beforeStart = vi.fn<NonNullable<RunRouterOptions['beforeStart']>>(
+      async () => {},
+    );
+    const { handle, started } = makeHarness({ beforeStart });
+    for (const requestContext of [null, { runId: 'forged' }]) {
+      const response = await handle(
+        req('/runs', {
+          actor,
+          body: { workflowId, requestContext },
+        }),
+      );
+      expect(response?.status).toBe(status);
+      expect(await response?.json()).not.toHaveProperty('reason');
+    }
+    expect(beforeStart).not.toHaveBeenCalled();
+    expect(started).toEqual([]);
+  });
+
+  it.each([
+    undefined,
+    { 'app.attribution': 'accepted' },
+  ])('delivers application context to an actual connector without input-data attribution: %j', async (requestContext) => {
+    const execute = vi.fn<
+      ConnectorConfig<
+        Record<string, unknown>,
+        { attribution: unknown }
+      >['execute']
+    >(async (_input, context) => ({
+      attribution: context.requestContext?.get('app.attribution') ?? null,
+    }));
+    const connector = createConnector({
+      id: 'inspect-attribution',
+      description: 'Reads run attribution',
+      inputSchema: z.record(z.string(), z.unknown()),
+      outputSchema: z.object({ attribution: z.unknown() }),
+      permissions: { sideEffect: 'read' },
+      execute,
+    });
+    const host = init(
+      { storage: new InMemoryStore() },
+      { executionFence: 'none', startIdempotency: 'none' },
+    );
+    const inputSchema = z.record(z.string(), z.unknown());
+    host
+      .createWorkflow({
+        id: OPEN_FLOW.id,
+        inputSchema,
+        outputSchema: z.object({ attribution: z.unknown() }),
+      })
+      .then(
+        host.createStep({
+          id: 'inspect',
+          inputSchema,
+          outputSchema: z.object({ attribution: z.unknown() }),
+          execute: async ({ inputData, requestContext: stepContext }) =>
+            invokeConnector(connector, inputData, {
+              requestContext: stepContext,
+            }),
+        }),
+      )
+      .commit();
+    const { handle } = makeHarness({
+      start: ({
+        workflowId,
+        runId,
+        inputData,
+        requestContext: context,
+        principal,
+      }) =>
+        host.runtime.start(workflowId, {
+          runId,
+          inputData,
+          storedRequestContext: context,
+          requestedBy: principal.id,
+          requestedByKind: principal.kind,
+        }),
+    });
+    const response = await handle(
+      req('/runs', {
+        body: {
+          workflowId: OPEN_FLOW.id,
+          requestContext,
+          inputData: {
+            'app.attribution': 'forged-top-level',
+            requestContext: { 'app.attribution': 'forged-nested' },
+          },
+        },
+      }),
+    );
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toMatchObject({
+      status: 'success',
+      result: { attribution: requestContext?.['app.attribution'] ?? null },
+    });
+    expect(execute).toHaveBeenCalledOnce();
   });
 });
 
@@ -1729,6 +1962,73 @@ function keyedHarness(
 }
 
 describe('createRunRouter — idempotent start', () => {
+  it('revalidates context and host policy on replay while retaining the first accepted context', async () => {
+    let persisted: RunSummary | undefined;
+    const beforeStart = vi.fn<NonNullable<RunRouterOptions['beforeStart']>>(
+      async (_context, _workflowId, _inputData, requestContext) => {
+        if (requestContext?.['app.attribution'] === 'denied') {
+          throw new RunRouteError(403, 'attribution is not allowed');
+        }
+      },
+    );
+    const start = vi.fn<RunRouterOptions['start']>(
+      async ({ runId, requestContext }) => {
+        persisted = {
+          runId,
+          status: 'success',
+          result: { attribution: requestContext?.['app.attribution'] },
+        };
+        return persisted;
+      },
+    );
+    const { handle } = keyedHarness({
+      beforeStart,
+      start,
+      status: async () => persisted,
+    });
+    const request = (requestContext: unknown) =>
+      req('/runs', {
+        body: {
+          workflowId: OPEN_FLOW.id,
+          idempotencyKey: 'context-key',
+          requestContext,
+        },
+      });
+    const first = await handle(request({ 'app.attribution': 'winner' }));
+    const winningBody = await first?.json();
+    expect(first?.status).toBe(200);
+    expect(winningBody).toMatchObject({ result: { attribution: 'winner' } });
+
+    const divergent = await handle(request({ 'app.attribution': 'retry' }));
+    expect(divergent?.status).toBe(200);
+    expect(await divergent?.json()).toEqual(winningBody);
+    expect(beforeStart).toHaveBeenCalledTimes(2);
+    expect(beforeStart.mock.calls[1]?.[3]).toEqual({
+      'app.attribution': 'retry',
+    });
+
+    for (const invalid of [null, { runId: 'forged' }]) {
+      const response = await handle(request(invalid));
+      expect(response?.status).toBe(400);
+      expect(await response?.json()).toMatchObject({
+        reason: 'reserved-context-key',
+      });
+    }
+    expect(beforeStart).toHaveBeenCalledTimes(2);
+
+    const denied = await handle(request({ 'app.attribution': 'denied' }));
+    expect(denied?.status).toBe(403);
+    expect(await denied?.json()).toEqual({
+      error: 'attribution is not allowed',
+    });
+    expect(beforeStart).toHaveBeenCalledTimes(3);
+    expect(start).toHaveBeenCalledOnce();
+    expect(start.mock.calls[0]?.[0].requestContext).toEqual({
+      'app.attribution': 'winner',
+    });
+    expect(persisted).toEqual(winningBody);
+  });
+
   it('refuses a key on a host that wired no reservation store', async () => {
     // #given the typed opt-out — the default in this file
     const { handle } = makeHarness();

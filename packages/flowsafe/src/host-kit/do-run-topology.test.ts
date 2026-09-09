@@ -177,6 +177,7 @@ describe('createDoRunTopology', () => {
       runId: 'run-1',
       inputData: { value: 'ordinary-input' },
       initialState: { checkpoint: true },
+      requestContext: { 'app.attribution': 'ordinary', nested: { value: 1 } },
       principal: {
         kind: 'agent',
         id: 'agent-1',
@@ -197,6 +198,7 @@ describe('createDoRunTopology', () => {
       runId: 'run-1',
       inputData: { value: 'ordinary-input' },
       initialState: { checkpoint: true },
+      requestContext: { 'app.attribution': 'ordinary', nested: { value: 1 } },
     });
   });
 
@@ -208,6 +210,7 @@ describe('createDoRunTopology', () => {
       runId: 'run-1',
       inputData: { forged: true },
       initialState: { forged: true },
+      requestContext: { 'app.attribution': 'forged' },
       principal: {
         kind: 'service',
         id: 'scheduler',
@@ -215,6 +218,7 @@ describe('createDoRunTopology', () => {
       },
       scheduleId: 'schedule-1',
       dispatchId: 'dispatch-1',
+      deadlineMs: 60_000,
     });
 
     expect(JSON.parse(requests[0]?.init?.body ?? '')).toEqual({
@@ -222,6 +226,7 @@ describe('createDoRunTopology', () => {
       runId: 'run-1',
       scheduleId: 'schedule-1',
       dispatchId: 'dispatch-1',
+      deadlineMs: 60_000,
     });
   });
 
