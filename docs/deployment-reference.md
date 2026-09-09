@@ -2,6 +2,8 @@
 
 Anchorage is a library, not a hosted control plane. Deploy one uniquely named Worker, D1 database, and set of Durable Object namespaces for each organization. The Worker script name is the Durable Object namespace boundary: replace the template's `replace-me` segment with the deployment tag and never reuse that script name for another organization. You also own optional R2 and Queue resources, the identity verifier, policies, maintenance schedules, and the provisioning system that keeps every resource set one-to-one.
 
+This reference configures the tenant application Worker. Run account-level Fleet operations in a separate [trusted control-plane Worker](fleet-control.md#run-the-trusted-control-plane-in-a-worker). Keep its provider token, Fleet/quota databases, and export bucket out of these tenant bindings.
+
 Choose one starting point:
 
 | Starting point | Use it for |
@@ -13,7 +15,7 @@ The baseline is intentionally smaller. Advanced features are supported and opt-i
 
 ## Cloudflare compatibility
 
-Use the Worker runtime with `nodejs_compat`, D1, and SQLite-backed Durable Objects. Treat Durable Object migration tags as append-only. Add a new migration tag when introducing the hub, thread, or provider-host class; never edit an already deployed tag.
+Use the Worker runtime with `nodejs_compat`, D1, and SQLite-backed Durable Objects. These settings belong to the tenant templates; the [Fleet host has its own runtime configuration](fleet-control.md#size-the-worker-for-its-workload). Treat Durable Object migration tags as append-only. Add a new migration tag when introducing the hub, thread, or provider-host class; never edit an already deployed tag.
 
 The checked-in configurations pin a compatibility date that the repository verifies. Review Cloudflare release notes before changing it.
 

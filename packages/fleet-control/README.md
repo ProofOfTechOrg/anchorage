@@ -44,7 +44,7 @@ Fleet Control does not install a runtime Wrangler dependency. Keep the selected 
 
 The `workers/*` entries are deployment artifacts for the platform's own Workers.
 
-Import `createCloudflareControlPlane` from `cloudflare-control-plane` in a dedicated trusted control-plane Worker. Supply direct Fleet and quota D1 bindings, a private export R2 binding, and a host-owned Cloudflare token. Authorize incoming operations before calling the factory's methods. Never expose the token, bindings, or factory to a tenant-serving Worker. Queue delivery tokens identify requested work; durable Fleet state determines whether it can advance.
+Import `createCloudflareControlPlane` from `cloudflare-control-plane` in a [dedicated trusted control-plane Worker](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/fleet-control.md#run-the-trusted-control-plane-in-a-worker). Supply direct Fleet and quota D1 bindings, a private export R2 binding, and a host-owned Cloudflare token. Authorize incoming operations before calling the factory's methods. Never expose the token, bindings, or factory to a tenant-serving Worker. Queue delivery tokens identify requested work; durable Fleet state determines whether it can advance.
 
 Size inventory and audit workloads for the [documented memory and read-cost envelope](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/fleet-control.md#audit-an-account-under-a-request-budget). A provider-request budget does not establish a memory or CPU bound.
 

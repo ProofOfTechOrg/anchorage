@@ -22,9 +22,124 @@ All backends implement the same ordered `ProvisioningBackend` contract:
 
 The plain backend rejects external artifacts before creating a resource. Switch to Workers for Platforms before you run the first customer-authored artifact. Set `routeHostname` to the customer-facing custom domain. For plain Workers, set `maintenanceBaseUrl` to the distinct Workers control origin; for Workers for Platforms, set it to the control-plane dispatcher origin. Fleet state reserves the route before any Worker can publish it.
 
+## Run the trusted control plane in a Worker
+
+Import `createCloudflareControlPlane` from `@proofoftech/fleet-control/cloudflare-control-plane` in a dedicated trusted Worker. The factory constructs the ordinary backend and durable stores from your bindings. Your host authorizes requested operations and resolves their specifications and credentials. Keep this Worker separate from tenant application Workers.
+
+### Bind durable state and provider credentials
+
+Use native D1 bindings for Fleet state and shared provider-quota reservations, plus a private R2 bucket for database exports. Replicas sharing a provider quota must use the same quota database and nonsecret scope. Preserve export bucket identity and receipt authority while operations remain active.
+
+These example environment names belong to the host:
+
+| Host value | Factory input |
+| --- | --- |
+| `FLEET_DB` D1 binding | `fleetDatabase` |
+| `QUOTA_DB` D1 binding | `quotaDatabase` |
+| `EXPORTS` R2 binding | `databaseExports.bucket` |
+| `CLOUDFLARE_ACCOUNT_ID` variable | `accountId` |
+| `CLOUDFLARE_API_TOKEN` secret | `apiToken` |
+| `CLOUDFLARE_QUOTA_SCOPE` variable | `quotaScope` |
+| `EXPORT_BUCKET_NAME` variable | `databaseExports.bucketName` |
+
+Set the nonsecret variables in your Worker configuration. Configure the provider token through [Workers secrets](https://developers.cloudflare.com/workers/configuration/secrets/), using the permissions in the [direct backend threat model](security-threat-model.md#direct-cloudflare-api-backend). Never put the token in checked-in variables, Queue messages, or tenant bindings. Keep the export bucket private through its R2 access configuration.
+
+This configuration fragment binds a Queue consumer and its continuation producer. Replace the resource identifiers with your dedicated control-plane resources:
+
+```jsonc
+{
+  "name": "fleet-control",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-06",
+  "workers_dev": false,
+  "preview_urls": false,
+  "d1_databases": [
+    { "binding": "FLEET_DB", "database_id": "your_fleet_database_id" },
+    { "binding": "QUOTA_DB", "database_id": "your_quota_database_id" }
+  ],
+  "r2_buckets": [
+    { "binding": "EXPORTS", "bucket_name": "fleet-exports" }
+  ],
+  "queues": {
+    "producers": [{ "binding": "CONTROL_QUEUE", "queue": "fleet-jobs" }],
+    "consumers": [{ "queue": "fleet-jobs", "max_batch_size": 1 }]
+  }
+}
+```
+
+`max_batch_size: 1` is an example scheduling choice. Set retry, concurrency, and dead-letter handling for your workload; see the [Wrangler configuration reference](https://developers.cloudflare.com/workers/wrangler/configuration/). Disabling workers.dev and preview URLs does not authenticate a management endpoint. If you expose one, authenticate and authorize its callers before invoking Fleet.
+
+The required type peer is `@cloudflare/workers-types >=5.20260730.1 <6`; this repository verifies `5.20260905.1`. Import the factory at module scope:
+
+```typescript
+import { createCloudflareControlPlane } from
+  '@proofoftech/fleet-control/cloudflare-control-plane';
+```
+
+Inside the event handler, construct it from the host's typed `env`:
+
+```typescript
+const control = createCloudflareControlPlane({
+  accountId: env.CLOUDFLARE_ACCOUNT_ID,
+  apiToken: env.CLOUDFLARE_API_TOKEN,
+  fleetDatabase: env.FLEET_DB,
+  quotaDatabase: env.QUOTA_DB,
+  quotaScope: env.CLOUDFLARE_QUOTA_SCOPE,
+  databaseExports: {
+    bucket: env.EXPORTS,
+    bucketName: env.EXPORT_BUCKET_NAME,
+    streams: { DigestStream: crypto.DigestStream, FixedLengthStream },
+    randomUUID: () => crypto.randomUUID(),
+  },
+});
+```
+
+The Queue binding and any management authentication secret belong to your handler. They are not factory options. Continuation tokens identify work to compare against Fleet D1; the factory has no token-signing secret.
+
+### Advance work before acknowledging delivery
+
+Cloudflare Queues can deliver messages more than once and out of order. Keep specifications, secrets, account selection, and provider configuration in trusted host state. Queue payloads carry operation claims and returned continuation tokens. See [delivery guarantees](https://developers.cloudflare.com/queues/reference/delivery-guarantees/) and [Queue ordering](https://developers.cloudflare.com/queues/reference/how-queues-works/).
+
+For a consumer-owned continuation handler:
+
+1. Authorize the job and resolve its trusted inputs. Invoke the appropriate factory advance using the existing action and token types.
+2. For `pending`, await sending the returned continuation claim before acknowledging the input message. If sending fails, retry the input. A crash after send and before acknowledgement can produce duplicate claims.
+3. For `complete`, handle the durable result before acknowledging. Retain receipt-backed results according to their lifecycle.
+4. For `blocked`, record the cleanup or decommission result for remediation and retain its returned token before acknowledging. After remediation, submit an authorized `restart-blocked` action with the current token. Do not automatically continue or restart blocked work.
+5. For terminal `failed`, report the durable failure through your job-status or failure policy before acknowledging or dead-lettering. A resolved call does not imply success. Do not endlessly enqueue the same failed token.
+6. Retry thrown transient failures and lease contention under your consumer policy. An exception does not prove an earlier provider or database effect failed to commit. Do not synthesize a newer token.
+
+Use the per-message [`ack()` and `retry()` APIs](https://developers.cloudflare.com/queues/configuration/javascript-apis/). Unacknowledged batch failures can redeliver other messages; see [batching and retries](https://developers.cloudflare.com/queues/configuration/batching-retries/). Sending a continuation and committing Fleet progress are separate operations. Queue acknowledgement does not replace the database commit or make provider effects exactly once.
+
+### Move a future executor between Node and Workers
+
+An executor cutover preserves the deployment resources and durable authority it already manages. It differs from the [tenant physical-isolation cutover](deployment-reference.md#cloudflare-compatibility). Check state and receipt compatibility before moving future operations:
+
+1. Verify that the destination version can read the existing Fleet schema, records, tokens, and receipts. Preserve the account, Fleet database, immutable resource mappings, trusted specifications, and credential source.
+2. Preserve the shared quota database/scope and active export receipt authority. Finish filesystem-backed export operations under their original authority before moving them to a Worker that cannot supply it.
+3. Stop new work submission to the source executor and let active calls finish or reach durable outcomes. Confirm lease ownership; a guessed lease timeout is not a drain. Stop the old scheduler and other authorized writers too.
+4. Deploy and verify the destination without tenant traffic routes, then enable its job intake. Resume supported claims against Fleet D1. Do not import process-local cursors or rewrite operation state from memory.
+5. For rollback, stop Worker intake first. Resume Node execution only with a version that understands the states and receipts already written. Otherwise roll forward with a compatible executor. Never restore an old Fleet snapshot over newer provider effects.
+
+You can [pause and resume Queue delivery](https://developers.cloudflare.com/queues/configuration/pause-purge/) during the transition. Pausing still allows messages to arrive and expire; it does not terminate an invocation already running.
+
+### Size the Worker for its workload
+
+The supported packed configuration is `2026-08-06` without explicit compatibility flags. Cloudflare enables Node compatibility by date from [2026-08-04](https://developers.cloudflare.com/changelog/post/2026-08-04-nodejs-compat-default/). The historical comparison uses `2026-08-03` with `nodejs_compat,no_nodejs_compat_v2`, and with `nodejs_compat`.
+
+Use Workers Paid for the direct control plane. The operation-specific request bounds below remain distinct from Cloudflare's platform allowance. Check the current [Workers limits](https://developers.cloudflare.com/workers/platform/limits/) and [D1 limits](https://developers.cloudflare.com/d1/platform/limits/) before sizing the host. As checked on 2026-09-09, the Worker bundle limit is 64 MiB uncompressed, memory is 128 MB per isolate, and startup has a one-second limit. Gzip has no platform size limit. Concurrent invocations share isolate memory.
+
+Inventory reads and audit continuations materialize stored data. Follow the [audit memory/read-cost envelope](#audit-an-account-under-a-request-budget) and [migration recovery and cost boundaries](#recovery-and-cost-boundaries). Provider request budgets and input validation ceilings do not guarantee that a workload fits memory, CPU, or database query limits.
+
+At commit `308bd39`, the unminified namespace-import fixture measured 3,292,290 raw bytes and 448,465 gzip bytes in the supported and historical configurations, with zero size delta. Its repository regression budgets are 4,128,768 raw bytes and 589,824 gzip bytes: 25% headroom rounded upward to 64 KiB. Reproduce the package checks with `pnpm test:packed-fleet-control`.
+
+The supported configuration's local startup profile sampled 21.690 ms of active CPU within a 102.108 ms profile window. The workload fixtures completed a 32-record audit, selected late continuations for 1,001 and 10,000 records, and a selected continuation after exact 16 MiB intake. Larger cases seed prior observations and cursors; they do not execute the preceding provider calls. These are dated local observations, not production latency or capacity guarantees.
+
+The harness does not expose CPU or peak isolate-memory counters. [Local Wrangler does not enforce production runtime limits](https://developers.cloudflare.com/workers/wrangler/configuration/#limits). Its 1,001-record intake made 46 Fleet-binding calls containing 1,038 SQL statements; the 10,000-record intake made 135 calls containing 10,037 statements. Binding calls and SQL statements are different counters. The published D1 query limit and Workers subrequest allowance do not establish how those batch contents are counted here; production query-budget compliance remains unverified.
+
 ## Provision a deployment
 
-Create a backend, durable `FleetStateStore`, validated `DeploymentSpec`, and distinct credentials. `provisionDeployment()` applies this order:
+Use the [factory above](#run-the-trusted-control-plane-in-a-worker) in a Worker. For an explicitly composed host, create a backend, durable `FleetStateStore`, validated `DeploymentSpec`, and distinct credentials. `provisionDeployment()` applies this order:
 
 1. Create or resolve the uniquely named D1 database
 2. Seed and verify the shared deployment-identity sentinel
@@ -355,7 +470,7 @@ An export failure, empty export, size mismatch, or missing integrity metadata pr
 
 ## Force decommission when retained inputs are lost
 
-`forceDecommissionDeployment()` removes an ordinary deployment when the host can no longer reconstruct its `DeploymentSpec`. Call it with the persisted tenant and environment key:
+The named root export `forceDecommissionDeployment()` removes an ordinary deployment when the trusted host cannot reconstruct its `DeploymentSpec`. It is separate from the curated Worker factory. Call the existing API with the persisted tenant and environment key:
 
 ```typescript
 await forceDecommissionDeployment({

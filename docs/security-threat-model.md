@@ -142,6 +142,20 @@ Unset `CLOUDFLARE_CUSTOM_HEADERS` in the provisioning host unless every configur
 
 Hardening of the provisioning host itself does not weaken the token, log, pagination, or destructive-scan requirements above.
 
+### Dedicated control-plane Worker
+
+The dedicated Fleet Worker holds account-level credentials, Fleet and quota D1 bindings, and a private export R2 binding. Never add them to tenant-serving Workers. The curated factory fixes its provider and storage dependencies; it does not authenticate a public handler or authorize a submitted job.
+
+Restrict job submission and management access to trusted platform principals. Resolve account selection, specifications, credentials, bindings, and provider transports from trusted configuration. A Queue payload must not select those capabilities or a cleanup policy.
+
+Queue messages carry work claims; Fleet D1 retains operation revisions, leases, resource ownership, and receipts. Duplicate delivery grants no new authority. Use returned continuation tokens without exposing private provider cursors or secrets. A resolved advance can represent a terminal failure; the host must classify that result before reporting success or acknowledging delivery. Queue acknowledgement does not make provider effects exactly once.
+
+Preserve shared quota scope and export receipt authority across executor changes. Protect provider credentials and host diagnostics independently of durable sanitized results. Another authorized account token can race provider observations; a Fleet lease does not lock out those writers. Destructive attachment checks still need account-wide dispatch-namespace evidence when ordinary provisioning is selected.
+
+Inventory and audit memory is shared with concurrent invocations in the isolate. Bounded provider work does not bound materialized state or database reads. Follow the [Worker host resource guidance](fleet-control.md#size-the-worker-for-its-workload); local success does not attest production resource-limit compliance.
+
+The existing root-only force API remains a separate recovery operation. It preserves its Worker/R2 residuals and historical receipts. The reference force consumer needs its own verified runtime/request envelope; the curated publication probe does not prove that broader root consumer. Recover residual resources by their recorded identities after verifying the intermediate force result.
+
 ### One organization per resource set
 
 A data-plane Worker serves one organization. Its D1 database, Durable Object namespaces, fleet-owned application R2 buckets, and secrets must not be shared with another organization. A shared audit queue is allowed only behind trusted infrastructure that derives attribution from static deployment bindings; externally authored code receives neither its producer binding nor reusable control-plane credentials.
