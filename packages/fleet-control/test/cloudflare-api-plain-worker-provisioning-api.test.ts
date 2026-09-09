@@ -146,6 +146,60 @@ function outcomeOperations(
 }
 
 describe('CloudflareApiPlainWorkerProvisioningApi', () => {
+  it.each(
+    (['initial', 'staged'] as const).flatMap((mode) =>
+      [
+        {
+          label: 'neither limit',
+          limits: { cpuMs: undefined },
+          wireLimits: undefined,
+        },
+        {
+          label: 'CPU only',
+          limits: { cpuMs: 30_000 },
+          wireLimits: { cpu_ms: 30_000 },
+        },
+        {
+          label: 'subrequests only',
+          limits: { cpuMs: undefined, subrequests: 500 },
+          wireLimits: { subrequests: 500 },
+        },
+        {
+          label: 'both limits',
+          limits: { cpuMs: 30_000, subrequests: 500 },
+          wireLimits: { cpu_ms: 30_000, subrequests: 500 },
+        },
+      ].map((limits) => ({ mode, ...limits })),
+    ),
+  )('serializes $label in $mode upload metadata', async ({
+    mode,
+    limits,
+    wireLimits,
+  }) => {
+    const world = emptyScriptWorld({ enabled: true, previewsEnabled: false });
+    const { api, fixture } = subject(restProjection(world));
+
+    await expect(
+      api.uploadCandidate({ ...uploadIntent(mode), limits }, ownedFence()),
+    ).resolves.toEqual({
+      status: 'succeeded',
+      cleanup: { status: 'succeeded' },
+    });
+    const uploads = fixture.requests.filter(
+      ({ method, url }) =>
+        method === (mode === 'initial' ? 'PUT' : 'POST') &&
+        new URL(url).pathname ===
+          `/client/v4/accounts/account/workers/scripts/acme-production${mode === 'initial' ? '' : '/versions'}`,
+    );
+    expect(uploads).toHaveLength(1);
+    expect(uploads[0]?.body).toHaveProperty('metadata');
+    if (wireLimits === undefined) {
+      expect(uploads[0]?.body).not.toHaveProperty('metadata.limits');
+    } else {
+      expect(uploads[0]?.body).toHaveProperty('metadata.limits', wireLimits);
+    }
+  });
+
   it('projects the REST world through the provider-neutral read port', async () => {
     const world = providerWorld();
     world.seedDatabase('acme-production', { databaseId: 'database-1' });

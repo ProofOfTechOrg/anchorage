@@ -1320,7 +1320,12 @@ export class PlainWorkerBackend implements ProvisioningBackend {
               bucketName: binding.bucketName,
             })),
           },
-          limits: { cpuMs: spec.cpuLimitMs },
+          limits: {
+            cpuMs: spec.cpuLimitMs,
+            ...(spec.subrequestLimit !== undefined
+              ? { subrequests: spec.subrequestLimit }
+              : {}),
+          },
           publicAccess,
           ...(mode === 'initial'
             ? {

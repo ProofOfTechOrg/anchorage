@@ -711,10 +711,36 @@ describe('WranglerPlainWorkerProvisioningApi parsing', () => {
 });
 
 describe('WranglerPlainWorkerProvisioningApi mutations', () => {
-  it.each([
-    'initial',
-    'staged',
-  ] as const)('writes the exact %s config, secret mode, and argv', async (mode) => {
+  it.each(
+    (['initial', 'staged'] as const).flatMap((mode) =>
+      [
+        {
+          label: 'neither limit',
+          limits: { cpuMs: undefined },
+          wireLimits: undefined,
+        },
+        {
+          label: 'CPU only',
+          limits: { cpuMs: 25 },
+          wireLimits: { cpu_ms: 25 },
+        },
+        {
+          label: 'subrequests only',
+          limits: { cpuMs: undefined, subrequests: 500 },
+          wireLimits: { subrequests: 500 },
+        },
+        {
+          label: 'both limits',
+          limits: { cpuMs: 25, subrequests: 500 },
+          wireLimits: { cpu_ms: 25, subrequests: 500 },
+        },
+      ].map((limits) => ({ mode, ...limits })),
+    ),
+  )('writes the exact $mode config with $label, secret mode, and argv', async ({
+    mode,
+    limits,
+    wireLimits,
+  }) => {
     let config: unknown;
     let secretMode: number | undefined;
     const runner = new FakeRunner(async (arguments_) => {
@@ -738,7 +764,7 @@ describe('WranglerPlainWorkerProvisioningApi mutations', () => {
       return { stdout: '', stderr: '' };
     });
     const outcome = await (await api(runner)).uploadCandidate(
-      uploadIntent(mode),
+      { ...uploadIntent(mode), limits },
       mutationFence(),
     );
     expect(outcome).toEqual({
@@ -773,7 +799,7 @@ describe('WranglerPlainWorkerProvisioningApi mutations', () => {
           }
         : {}),
       r2_buckets: [{ binding: 'BUCKET', bucket_name: 'bucket-name' }],
-      limits: { cpu_ms: 25 },
+      ...(wireLimits === undefined ? {} : { limits: wireLimits }),
     });
     await expectUploadScratchRemoved();
   });

@@ -58,6 +58,8 @@ Choose a backend from the artifact trust boundary and the provider integration a
 
 Construct `CloudflareApiPlainWorkerBackend` with a `CloudflareProvisioningClient` whose options include `plane: 'plain-worker'`, a shared rate coordinator, and a durable `exportStore`. Plain-only clients reject any `dispatchNamespace` key.
 
+Set `cpuLimitMs` and `subrequestLimit` in `DeploymentSpec` to request ordinary-Worker runtime budgets. The direct and Wrangler adapters forward configured values in initial and staged uploads.
+
 Construct `WorkersForPlatformsBackend` with a dispatch namespace, one named shared outbound Worker, and a state-egress root secret. All three values are mandatory. The constructor rejects an incomplete dispatch-native configuration before it can call a provider.
 
 `PlainWorkerBackend` is the shared ordinary-Worker core that both built-in ordinary-Worker backends wrap. It is not intended for subclassing outside Fleet Control.

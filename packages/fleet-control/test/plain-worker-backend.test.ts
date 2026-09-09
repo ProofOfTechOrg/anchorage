@@ -167,11 +167,14 @@ function ownedVersion(id: string, deployment = spec): PlainWorkerVersionDetail {
   };
 }
 
-function installOnUpload(api: PlainWorkerProvisioningApiFake): void {
+function installOnUpload(
+  api: PlainWorkerProvisioningApiFake,
+  deployment = spec,
+): void {
   api.onUploadCandidate = (intent) => {
     api.versions.set(intent.scriptName, [
       ...(api.versions.get(intent.scriptName) ?? []),
-      ownedVersion('candidate'),
+      ownedVersion('candidate', deployment),
     ]);
     if (intent.mode === 'initial') {
       api.deployments.set(intent.scriptName, {
@@ -842,6 +845,66 @@ describe('PlainWorkerBackend core policy', () => {
       ),
     ).rejects.toBe(denied);
     expect(api.events).toEqual(['port-assert']);
+  });
+
+  it.each(
+    (['initial', 'staged'] as const).flatMap((mode) =>
+      [
+        {
+          label: 'neither limit',
+          specLimits: {},
+          intentLimits: { cpuMs: undefined },
+        },
+        {
+          label: 'CPU only',
+          specLimits: { cpuLimitMs: 30_000 },
+          intentLimits: { cpuMs: 30_000 },
+        },
+        {
+          label: 'subrequests only',
+          specLimits: { subrequestLimit: 500 },
+          intentLimits: { cpuMs: undefined, subrequests: 500 },
+        },
+        {
+          label: 'both limits',
+          specLimits: { cpuLimitMs: 30_000, subrequestLimit: 500 },
+          intentLimits: { cpuMs: 30_000, subrequests: 500 },
+        },
+      ].map((limits) => ({ mode, ...limits })),
+    ),
+  )('forwards $label to the shared $mode upload intent', async ({
+    mode,
+    specLimits,
+    intentLimits,
+  }) => {
+    const deployment = { ...spec, ...specLimits } satisfies DeploymentSpec;
+    const api = new PlainWorkerProvisioningApiFake();
+    if (mode === 'staged') {
+      api.versions.set(deployment.scriptName, [
+        ownedVersion('current', deployment),
+      ]);
+      api.deployments.set(deployment.scriptName, {
+        versions: [{ versionId: 'current', percentage: 100 }],
+      });
+    }
+    installOnUpload(api, deployment);
+    const upload = vi.spyOn(api, 'uploadCandidate');
+
+    await expect(
+      backend(api).deployWorker(
+        deployment,
+        database,
+        secrets,
+        undefined,
+        mutationFence(),
+      ),
+    ).resolves.toEqual({
+      artifactVersion: 'candidate',
+      created: mode === 'initial',
+    });
+    expect(upload).toHaveBeenCalledOnce();
+    expect(upload.mock.calls[0]?.[0].mode).toBe(mode);
+    expect(upload.mock.calls[0]?.[0].limits).toStrictEqual(intentLimits);
   });
 
   it('separates initial and staged upload intents and refuses staged migrations', async () => {

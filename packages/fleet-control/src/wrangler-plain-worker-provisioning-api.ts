@@ -517,9 +517,14 @@ export class WranglerPlainWorkerProvisioningApi
             binding: binding.name,
             bucket_name: binding.bucketName,
           })),
-          limits: intent.limits.cpuMs
-            ? { cpu_ms: intent.limits.cpuMs }
-            : undefined,
+          limits:
+            intent.limits.cpuMs === undefined &&
+            intent.limits.subrequests === undefined
+              ? undefined
+              : {
+                  cpu_ms: intent.limits.cpuMs,
+                  subrequests: intent.limits.subrequests,
+                },
         }),
       );
       const secretsPath = join(directory, 'wrangler.secrets.json');

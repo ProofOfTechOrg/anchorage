@@ -53,11 +53,17 @@ export interface OrdinaryWorkerFootprint {
 
 export type CloudflareSdk = InstanceType<typeof Cloudflare>;
 type StagedOrdinaryWorkerUploadMetadata = VersionCreateParams.Metadata & {
-  readonly limits?: { readonly cpu_ms: number };
+  readonly limits?: {
+    readonly cpu_ms?: number;
+    readonly subrequests?: number;
+  };
 };
 type OrdinaryWorkerUploadMetadata =
   | (ScriptUpdateParams.Metadata & {
-      readonly limits?: { readonly cpu_ms: number };
+      readonly limits?: {
+        readonly cpu_ms?: number;
+        readonly subrequests?: number;
+      };
     })
   | StagedOrdinaryWorkerUploadMetadata;
 const PREPARED_ORDINARY_WORKER_UPLOAD: unique symbol = Symbol(
@@ -355,9 +361,13 @@ export async function prepareOrdinaryWorkerUpload(
       ? [...intent.compatibilityFlags]
       : undefined,
     limits:
-      intent.limits.cpuMs === undefined
+      intent.limits.cpuMs === undefined &&
+      intent.limits.subrequests === undefined
         ? undefined
-        : { cpu_ms: intent.limits.cpuMs },
+        : {
+            cpu_ms: intent.limits.cpuMs,
+            subrequests: intent.limits.subrequests,
+          },
     annotations: { 'workers/tag': intent.candidateTag },
   };
   const metadata: OrdinaryWorkerUploadMetadata =

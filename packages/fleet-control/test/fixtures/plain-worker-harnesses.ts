@@ -177,7 +177,12 @@ export function uploadIntentForSpec(
         : [],
       r2Buckets: [],
     },
-    limits: { cpuMs: spec.cpuLimitMs },
+    limits: {
+      cpuMs: spec.cpuLimitMs,
+      ...(spec.subrequestLimit !== undefined
+        ? { subrequests: spec.subrequestLimit }
+        : {}),
+    },
     publicAccess: {
       workersDevEnabled: true,
       previewUrlsEnabled: false,

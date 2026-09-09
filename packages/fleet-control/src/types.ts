@@ -1454,7 +1454,10 @@ export interface PlainWorkerUploadIntentBase {
     }[];
   };
   /** Desired Worker resource limits. */
-  readonly limits: { readonly cpuMs: number | undefined };
+  readonly limits: {
+    readonly cpuMs: number | undefined;
+    readonly subrequests?: number;
+  };
   /** Ordinary Worker public-access mechanics applied by this upload. */
   readonly publicAccess: {
     readonly workersDevEnabled: boolean;
