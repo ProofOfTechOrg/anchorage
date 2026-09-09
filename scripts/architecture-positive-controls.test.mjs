@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { createRequire } from 'node:module';
+import { builtinModules, createRequire, isBuiltin } from 'node:module';
 import { relative } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -94,6 +94,10 @@ function hasCycleThrough(adjacency, source) {
 }
 
 const controls = {
+  'fleet-control-worker-entry-avoids-node-host-adapters':
+    'scripts/architecture-fixtures/control-plane-imports-node-host.ts',
+  'fleet-control-worker-entry-limits-core-imports':
+    'scripts/architecture-fixtures/control-plane-imports-forbidden-core.ts',
   'flowsafe-public-entry-no-agent-host':
     'scripts/architecture-fixtures/public-entry-imports-agent-host.ts',
   'flowsafe-public-entry-no-breakwater':
@@ -311,6 +315,56 @@ test('production transport class implementations are forbidden operation targets
   );
 });
 
+test('Worker control-plane core policy admits crypto and async_hooks', () => {
+  const rule = architectureRules.find(
+    (rule) => rule.name === 'fleet-control-worker-entry-limits-core-imports',
+  );
+  assert.ok(rule);
+  const entry = 'packages/fleet-control/src/cloudflare-control-plane.ts';
+  for (const name of [
+    'fleet-control-worker-entry-limits-core-imports',
+    'fleet-control-worker-entry-avoids-node-host-adapters',
+  ]) {
+    const entryRule = architectureRules.find(
+      (candidate) => candidate.name === name,
+    );
+    assert.ok(
+      entryRule.from.path.some((pattern) => new RegExp(pattern).test(entry)),
+      name,
+    );
+  }
+  const layer = architectureRules.find(
+    (candidate) => candidate.name === 'fleet-control-client-layers-are-one-way',
+  );
+  const reverse = architectureRules.find(
+    (candidate) =>
+      candidate.name === 'fleet-control-client-does-not-reach-its-consumers',
+  );
+  assert.equal(new RegExp(layer.from.pathNot).test(entry), true);
+  assert.equal(new RegExp(reverse.to.path).test(entry), true);
+  const forbidden = new RegExp(rule.to.path);
+  for (const name of [
+    'node:test',
+    'node:test/reporters',
+    'node:sea',
+    'node:sqlite',
+  ]) {
+    assert.equal(isBuiltin(name), true, name);
+    assert.equal(forbidden.test(name), true, name);
+  }
+  for (const name of ['node:crypto', 'node:async_hooks']) {
+    assert.equal(forbidden.test(name), false, name);
+  }
+  for (const raw of builtinModules) {
+    const name = raw.replace(/^node:/, '');
+    assert.equal(
+      forbidden.test(name),
+      !['crypto', 'async_hooks'].includes(name),
+      name,
+    );
+  }
+});
+
 test('every architecture rule has an executable positive control', () => {
   const ruleNames = architectureRules.map((rule) => rule.name).sort();
   assert.deepEqual(Object.keys(controls).sort(), ruleNames);
@@ -511,6 +565,41 @@ for (const [ruleName, fixture] of Object.entries(controls)) {
           `strict plain-data control did not reject ${target}`,
         );
       }
+    }
+    if (ruleName === 'fleet-control-worker-entry-limits-core-imports') {
+      for (const target of [
+        'fs/promises',
+        'buffer',
+        'node:test',
+        'node:test/reporters',
+        'node:sea',
+        'node:sqlite',
+      ]) {
+        assert.ok(
+          report.summary.violations.some(
+            (violation) =>
+              violation.rule.name === ruleName && violation.to === target,
+          ),
+        );
+      }
+      for (const allowed of ['crypto', 'async_hooks']) {
+        assert.equal(
+          report.summary.violations.some(
+            (violation) =>
+              violation.rule.name === ruleName && violation.to === allowed,
+          ),
+          false,
+        );
+      }
+    }
+    if (ruleName === 'fleet-control-worker-entry-avoids-node-host-adapters') {
+      assert.ok(
+        report.summary.violations.some(
+          (violation) =>
+            violation.rule.name === ruleName &&
+            violation.to === 'packages/fleet-control/src/export-store.ts',
+        ),
+      );
     }
     if (ruleName === 'flowsafe-public-entry-no-breakwater') {
       const entry = report.modules.find((module) => module.source === fixture);

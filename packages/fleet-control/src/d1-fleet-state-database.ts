@@ -73,7 +73,7 @@ export class D1FleetStateDatabase implements FleetStateDatabase {
   async query(
     sql: string,
     bindings: readonly unknown[] = [],
-  ): Promise<readonly Row[]> {
+  ): Promise<readonly Readonly<Record<string, unknown>>[]> {
     const envelope: unknown = await this.#statement(sql, bindings).all();
     validateEnvelope(envelope, 'D1 query returned a malformed result');
     return envelope.results;
@@ -93,7 +93,7 @@ export class D1FleetStateDatabase implements FleetStateDatabase {
       sql: string;
       bindings?: readonly unknown[];
     }>[],
-  ): Promise<readonly (readonly Row[])[]> {
+  ): Promise<readonly (readonly Readonly<Record<string, unknown>>[])[]> {
     // The port's result is one entry per statement, so an empty list has no
     // statement to send.
     if (statements.length === 0) return [];
