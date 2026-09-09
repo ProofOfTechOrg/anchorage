@@ -31,6 +31,7 @@ import {
   UnknownWorkflowError,
 } from '../do-runner/index.js';
 import { readBoundedBody } from '../http-body.js';
+import { internalErrorResponse } from '../internal-error-response.js';
 import { queueApprovalForSuspension } from './approval-bridge.js';
 import { requireResourceAccess } from './resource-access.js';
 import { RunRouteError } from './run-route-error.js';
@@ -264,11 +265,6 @@ function errorResponse(error: unknown): Response {
   if (error instanceof InvalidRunRequestError) {
     return json({ error: error.message }, 400);
   }
-  // Every refusal this package authors on the taxonomy's own base renders with
-  // its declared status and reason — the reservation family among them. Placed
-  // LAST so the named branches above keep their exact shapes, and typed against
-  // the base rather than against each reservation class so a refusal added
-  // later cannot arrive here as an anonymous 500.
   if (error instanceof DoStatusError) {
     const { status } = error;
     if (Number.isInteger(status) && status >= 400 && status <= 599) {
@@ -281,10 +277,7 @@ function errorResponse(error: unknown): Response {
       );
     }
   }
-  return json(
-    { error: error instanceof Error ? error.message : String(error) },
-    500,
-  );
+  return internalErrorResponse('runs', error);
 }
 
 const MAX_RUN_BODY_BYTES = 1_048_576;

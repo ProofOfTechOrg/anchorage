@@ -489,11 +489,11 @@ The runner preserves stable statuses and structured refusal reasons across Durab
 | `InvalidStartIdempotencyRequestError` | `400` | `INVALID_START_IDEMPOTENCY_REQUEST` | The key or reservation request is malformed |
 | `InvalidInventoryRequestError` | `400` | `INVALID_INVENTORY_REQUEST` | The category, cursor, or limit is invalid |
 
-`isStartReservationRefusal()` recognizes the five reservation decisions, unsupported wiring, and malformed input. It excludes `StartReservationUnreadableError`, which propagates as an operational storage failure.
-
 The runtime also distinguishes unknown workflows, unknown runs, duplicate runs, runs that are not suspended, client-fixable input or resume-data errors, and internal execution or storage failures.
 
 The Durable Object maps known errors to stable HTTP status codes through `doErrorResponse()`. Unknown failures return an internal error without copying arbitrary thrown data to an audit sink.
+
+`createRunRouter()` returns HTTP 500 with `{ "error": "internal error" }` for unexpected failures and retains the original error in server diagnostics. Its typed refusals preserve their status, message and reason. Hosts that construct `RunRouteError` must supply caller-safe, JSON-compatible message/reason values; the router does not sanitize them. Runtime-authored `RunLifecycleBlockedError.reason` reports `DISPUTED_SETTLEMENT` with a fixed message. A host that constructs that error is responsible for its supplied message too.
 
 The runner does not provide an administrative “reset to last good state” API. Recovery uses authoritative D1 state, the approval redrive path, or deployment decommissioning.
 

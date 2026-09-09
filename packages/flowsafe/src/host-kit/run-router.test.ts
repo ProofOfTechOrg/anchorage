@@ -1,14 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Unit coverage for the run surface every host mounts: the authorization ORDER
-// (401 -> coarse RUN_START_ROLES -> per-workflow allowedRoles), the catalog, the
-// start/status/resume/terminate routes and their error mapping, the suspension bridge's
-// attribution (the starting actor becomes requestedBy, so they cannot decide
-// their own run), and the reconcileApprovals self-healing hook on status
-// reads.
-//
-// Driven with real InMemoryApprovalStore + ApprovalService (no mocks) and
-// fixture WorkflowMetas — depending on the showcase's modules here would invert
-// the layering (showcase imports host-kit, not the reverse).
+// Showcase modules depend on host-kit, so these fixtures remain independent.
 
 import { describe, expect, it, vi } from 'vitest';
 
@@ -39,6 +30,7 @@ import {
   StartIdempotencyStore,
   UnknownRunError,
 } from '../do-runner/index.js';
+import { internalErrorResponse } from '../internal-error-response.js';
 import { reconcileApprovalsOnStatus } from './approval-bridge.js';
 import { createDoRunTopology } from './do-run-topology.js';
 import { RunRouteError } from './run-route-error.js';
@@ -1555,20 +1547,113 @@ describe('createRunRouter — error mapping', () => {
     ).toBe(status);
   });
 
-  it('maps an unexpected failure to 500', async () => {
-    // #given
+  it.each([
+    new Error('private storage detail'),
+    'private callback detail',
+    { backend: 'private storage detail' },
+  ])('redacts an unexpected handler failure (%j)', async (error) => {
     const { handle } = makeHarness({
       status: async () => {
-        throw new Error('d1 exploded');
+        throw error;
       },
     });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const response = await handle(req('/runs/open-flow/acme_r1'));
+      expect(response?.status).toBe(500);
+      expect(response?.headers.get('content-type')).toBe('application/json');
+      expect(response?.headers.get('cache-control')).toBe('no-store');
+      expect(await response?.json()).toEqual({ error: 'internal error' });
+      expect(logged).toHaveBeenCalledWith(
+        JSON.stringify({
+          type: 'route-internal-error',
+          route: 'runs',
+          error: error instanceof Error ? error.message : String(error),
+        }),
+        error,
+      );
+    } finally {
+      logged.mockRestore();
+    }
+  });
 
-    // #when
+  it('returns the generic handler response when logging throws', async () => {
+    const { handle } = makeHarness({
+      status: async () => {
+        throw new Error('private storage detail');
+      },
+    });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {
+      throw new Error('diagnostic sink unavailable');
+    });
+    try {
+      const response = await handle(req('/runs/open-flow/acme_r1'));
+      expect(response?.status).toBe(500);
+      expect(await response?.json()).toEqual({ error: 'internal error' });
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it.each([
+    [503, new RunRouteError(503, 'retry later', { code: 'HOST_BUSY' })],
+    [503, new ExecutionFencedError('draining')],
+    [
+      409,
+      new RunLifecycleBlockedError({
+        code: 'DISPUTED_SETTLEMENT',
+        message:
+          'run termination is blocked while an economic operation is disputed',
+      }),
+    ],
+  ] as const)('preserves a typed status %s and its reason', async (status, error) => {
+    const { handle } = makeHarness({
+      status: async () => {
+        throw error;
+      },
+    });
     const response = await handle(req('/runs/open-flow/acme_r1'));
+    expect(response?.status).toBe(status);
+    expect(await response?.json()).toEqual({
+      error: error.message,
+      reason: error.reason,
+    });
+  });
+});
 
-    // #then
-    expect(response?.status).toBe(500);
-    expect(await response?.json()).toEqual({ error: 'd1 exploded' });
+describe('internal HTTP error diagnostics', () => {
+  it.each([
+    500, 502,
+  ] as const)('retains status %s and the original unreadable error', async (status) => {
+    const unreadableMessage = new Error();
+    Object.defineProperty(unreadableMessage, 'message', {
+      get() {
+        throw new Error('message is unreadable');
+      },
+    });
+    const unreadableValue = {
+      toString() {
+        throw new Error('value is unreadable');
+      },
+    };
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      for (const error of [unreadableMessage, unreadableValue]) {
+        const response = internalErrorResponse('test', error, status);
+        expect(response.status).toBe(status);
+        expect(response.headers.get('content-type')).toBe('application/json');
+        expect(response.headers.get('cache-control')).toBe('no-store');
+        expect(await response.json()).toEqual({ error: 'internal error' });
+        expect(logged.mock.lastCall?.[1]).toBe(error);
+        expect(JSON.parse(String(logged.mock.lastCall?.[0]))).toEqual({
+          type: 'route-internal-error',
+          route: 'test',
+          error: 'unreadable error',
+        });
+      }
+    } finally {
+      logged.mockRestore();
+    }
   });
 });
 
