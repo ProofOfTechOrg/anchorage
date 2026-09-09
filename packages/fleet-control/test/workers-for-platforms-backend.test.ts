@@ -2800,37 +2800,52 @@ describe('WorkersForPlatformsBackend', () => {
     expect(client.mutationFenceEntries).toBe(1);
   });
 
-  it('uses authenticated fixed maintenance endpoints', async () => {
+  it.each([
+    'injected',
+    'default',
+  ] as const)('uses authenticated fixed maintenance endpoints with %s fetch', async (selection) => {
     const fetch = vi.fn(attestedHealthResponse);
-    const backend = new WorkersForPlatformsBackend({
-      namespacedState: NAMESPACED_STATE,
-      client: new FakeApi(),
-      fetch,
-      hostRoutingKvId: 'host-routes',
-      platformProfileFor: () => platformProfile(),
-    });
+    if (selection === 'default') vi.stubGlobal('fetch', fetch);
+    try {
+      const backend = new WorkersForPlatformsBackend({
+        namespacedState: NAMESPACED_STATE,
+        client: new FakeApi(),
+        ...(selection === 'injected' ? { fetch } : {}),
+        hostRoutingKvId: 'host-routes',
+        platformProfileFor: () => platformProfile(),
+      });
 
-    await expect(
-      backend.ensureMaintenance(
-        deployment,
-        secrets.maintenanceAdmin,
-        fence,
-        'etag-v1',
-      ),
-    ).resolves.toMatchObject({ armed: true, nextAlarmAt: 2_000 });
-    await backend.inspect(deployment, secrets.maintenanceAdmin);
+      await expect(
+        backend.ensureMaintenance(
+          deployment,
+          secrets.maintenanceAdmin,
+          fence,
+          'etag-v1',
+        ),
+      ).resolves.toMatchObject({ armed: true, nextAlarmAt: 2_000 });
+      const live = await backend.inspect(deployment, secrets.maintenanceAdmin);
+      expect(live?.maintenance).toMatchObject({
+        armed: true,
+        nextAlarmAt: 2_000,
+      });
+      expect(
+        fetch.mock.contexts.map((context) => context === undefined),
+      ).toEqual([true, true]);
 
-    expect(String(fetch.mock.calls[0]?.[0])).toBe(
-      `https://control-acme.example.test/.well-known/anchorage/maintenance/acme/production/${externalReleaseScriptName(deployment)}/${deploymentSpecDigest(deployment)}/ensure-maintenance`,
-    );
-    expect(String(fetch.mock.calls[1]?.[0])).toBe(
-      `https://control-acme.example.test/.well-known/anchorage/maintenance/acme/production/${externalReleaseScriptName(deployment)}/${deploymentSpecDigest(deployment)}/maintenance-status`,
-    );
-    for (const [, init] of fetch.mock.calls) {
-      expect(new Headers(init?.headers).get('authorization')).toMatch(
-        /^Bearer ey/,
+      expect(String(fetch.mock.calls[0]?.[0])).toBe(
+        `https://control-acme.example.test/.well-known/anchorage/maintenance/acme/production/${externalReleaseScriptName(deployment)}/${deploymentSpecDigest(deployment)}/ensure-maintenance`,
       );
-      expect(init?.signal).toBeInstanceOf(AbortSignal);
+      expect(String(fetch.mock.calls[1]?.[0])).toBe(
+        `https://control-acme.example.test/.well-known/anchorage/maintenance/acme/production/${externalReleaseScriptName(deployment)}/${deploymentSpecDigest(deployment)}/maintenance-status`,
+      );
+      for (const [, init] of fetch.mock.calls) {
+        expect(new Headers(init?.headers).get('authorization')).toMatch(
+          /^Bearer ey/,
+        );
+        expect(init?.signal).toBeInstanceOf(AbortSignal);
+      }
+    } finally {
+      if (selection === 'default') vi.unstubAllGlobals();
     }
   });
 

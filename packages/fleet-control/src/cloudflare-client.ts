@@ -692,7 +692,8 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
           method: writeReceipt,
         });
     }
-    this.#fetch = options.fetch ?? fetch;
+    const fetchFn = options.fetch ?? fetch;
+    this.#fetch = (input, init) => fetchFn(input, init);
     this.#requestTimeoutMs = options.requestTimeoutMs ?? 60_000;
     if (
       !Number.isSafeInteger(this.#requestTimeoutMs) ||

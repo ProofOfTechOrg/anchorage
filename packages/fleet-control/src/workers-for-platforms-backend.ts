@@ -470,7 +470,8 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
     }
     const client = options.client;
     this.#client = client;
-    this.#fetch = options.fetch ?? fetch;
+    const fetchFn = options.fetch ?? fetch;
+    this.#fetch = (input, init) => fetchFn(input, init);
     this.#hostRoutingKvId = options.hostRoutingKvId;
     this.#auditQueueName = options.auditQueueName;
     this.#maintenanceRequestTimeoutMs =

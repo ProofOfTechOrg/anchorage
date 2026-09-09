@@ -273,7 +273,8 @@ export class PlainWorkerBackend implements ProvisioningBackend {
     }
     this.#api = options.api;
     this.#identityCaller = options.identityCaller;
-    this.#fetch = options.fetch ?? fetch;
+    const fetchFn = options.fetch ?? fetch;
+    this.#fetch = (input, init) => fetchFn(input, init);
     this.#maintenanceRequestTimeoutMs = maintenanceRequestTimeoutMs;
     this.#clock = options.clock ?? Date.now;
     const advanceDecommissionAttachmentScan =

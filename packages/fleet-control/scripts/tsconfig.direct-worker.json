@@ -9,7 +9,8 @@
     "direct-credentialed-tenant.ts",
     "direct-credentialed-spec.ts",
     "direct-reference-journal.ts",
-    "direct-reference-http.ts"
+    "direct-reference-http.ts",
+    "direct-reference-transport.ts"
   ],
   "include": []
 }
