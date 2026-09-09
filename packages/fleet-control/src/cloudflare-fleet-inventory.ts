@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { createHash } from 'node:crypto';
-import { domainToASCII } from 'node:url';
 import {
   CLOUDFLARE_INVENTORY_BOUND,
   inventoryBoundExceeded,
@@ -350,15 +349,15 @@ function tagValue(tags: readonly string[], prefix: string): string | undefined {
   return tags.find((tag) => tag.startsWith(prefix))?.slice(prefix.length);
 }
 
-/**
- * Hostnames reach the durable controls as ASCII, while the finding detail keeps
- * today's exact bytes: an ASCII value is never rewritten, so only a genuine IDN
- * value is punycoded for validation.
- */
 function asciiHost(value: string): string {
   if (!NON_ASCII.test(value)) return value;
-  const ascii = domainToASCII(value);
-  return ascii === '' ? value : ascii;
+  const url = new URL('ws://x');
+  url.hostname = value;
+  if (url.hostname !== 'x') return url.hostname;
+  // A rejected assignment retains the old host; a second host distinguishes it from a valid x.
+  url.hostname = 'y';
+  url.hostname = value;
+  return url.hostname === 'x' ? 'x' : value;
 }
 
 function detailValue(value: string, field: string): string {

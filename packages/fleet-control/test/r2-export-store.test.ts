@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { createHash } from 'node:crypto';
+import type { StreamPipeOptions } from 'node:stream/web';
 import type {
   R2Bucket,
   R2Conditional,
@@ -27,13 +28,7 @@ import {
   nodeWorkerStreams,
 } from './fixtures/worker-streams.js';
 
-type PutValue =
-  | WorkerReadableStream<Uint8Array>
-  | ArrayBuffer
-  | ArrayBufferView
-  | string
-  | null
-  | Blob;
+type PutValue = Parameters<R2Bucket['put']>[1];
 
 type PutMode =
   | 'normal'
@@ -677,10 +672,12 @@ describe('R2DatabaseExportStore', () => {
     ] satisfies readonly (keyof NodeFixedLengthStream)[]) {
       const sentinel = new Error(`${property} getter failed`);
       class ThrowingFixedLengthStream {
-        readonly #fixed: NodeFixedLengthStream;
+        readonly #fixed: InstanceType<
+          typeof nodeWorkerStreams.FixedLengthStream
+        >;
 
         constructor(expectedLength: number) {
-          this.#fixed = new NodeFixedLengthStream(expectedLength);
+          this.#fixed = new nodeWorkerStreams.FixedLengthStream(expectedLength);
         }
 
         get readable(): WorkerReadableStream<Uint8Array> {

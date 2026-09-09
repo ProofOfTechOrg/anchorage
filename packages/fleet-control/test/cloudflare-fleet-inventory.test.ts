@@ -513,6 +513,46 @@ const EMPTY_OPTIONS: FleetInventoryRunOptions = {
 };
 
 describe('advanceCloudflareFleetInventoryStage', () => {
+  it.each([
+    'bücher.example',
+    '例子.example',
+    'ｘ',
+    'ｙ',
+    'ｌｏｃａｌｈｏｓｔ',
+    '\u200b.example',
+    'ASCII.example',
+  ])('retains hostname finding bytes for %j', async (hostname) => {
+    const { deps } = harness({
+      domainPages: [[{ hostname, service: 'anchorage-missing' }]],
+      zoneIds: [],
+      scriptPages: [[]],
+    });
+    const run = await drive(deps, EMPTY_OPTIONS);
+    expect(details(run.rows)).toContain(
+      `custom domain '${hostname}' points to a missing or incomplete plain Worker 'anchorage-missing'`,
+    );
+    expect(run.rows.filter((row) => row.kind === 'route')).toEqual([
+      expect.objectContaining({
+        payload: expect.objectContaining({ hostname }),
+      }),
+    ]);
+  });
+
+  it.each([
+    'user@é.example\t',
+    'é.example:80\t',
+    'bad\u0000é.example',
+  ])('preserves finding refusal when hostname assignment rejects %j', async (hostname) => {
+    const { deps } = harness({
+      domainPages: [[{ hostname, service: 'anchorage-missing' }]],
+      zoneIds: [],
+      scriptPages: [[]],
+    });
+    await expect(drive(deps, EMPTY_OPTIONS)).rejects.toBeInstanceOf(
+      FleetInventoryFindingValueError,
+    );
+  });
+
   it('walks the fifteen provider stages in encounter order, one chunk per call', async () => {
     const { deps } = harness(RICH_WORLD);
     const run = await drive(deps, RICH_OPTIONS);

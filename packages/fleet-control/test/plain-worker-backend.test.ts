@@ -1310,7 +1310,7 @@ describe('PlainWorkerBackend core-policy refusals', () => {
     const api = new PlainWorkerProvisioningApiFake();
     deployedCandidate(api);
     const request = vi.fn(
-      async (input: RequestInfo | URL, init?: RequestInit) => {
+      async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
         expect(String(input)).toContain('/admin/ensure-maintenance');
         expect(init?.headers).toMatchObject({
           'Cloudflare-Workers-Version-Overrides': `${spec.scriptName}="candidate"`,

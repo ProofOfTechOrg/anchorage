@@ -189,12 +189,12 @@ class UnsupportedFormDataResponse {
   }
 }
 
-async function decodeBody(body: BodyInit | null | undefined): Promise<unknown> {
+async function decodeBody(body: RequestInit['body']): Promise<unknown> {
   if (body instanceof FormData) {
     const files: Array<{ name: string; type: string; text: string }> = [];
     const fields: Record<string, unknown> = {};
     for (const [name, value] of body.entries()) {
-      if (value instanceof File) {
+      if (typeof value !== 'string') {
         files.push({
           name: value.name,
           type: value.type,

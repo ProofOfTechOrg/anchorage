@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { Buffer } from 'node:buffer';
 import { createHash, randomBytes } from 'node:crypto';
 import type {
   ApplicationBindingTopology,
@@ -213,7 +212,7 @@ export function reserveApplicationR2Resources(
 ): readonly ApplicationR2Resource[] {
   return canonicalApplicationBindings(spec).r2Buckets.map((binding) => {
     const jurisdiction = binding.jurisdiction ?? 'default';
-    const reservationNonce = Buffer.from(randomBytes(24)).toString('base64url');
+    const reservationNonce = randomBytes(24).toString('base64url');
     return {
       name: binding.name,
       bucketName: reservedBucketName(
