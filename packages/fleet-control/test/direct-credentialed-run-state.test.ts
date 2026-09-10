@@ -22,6 +22,8 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { preflightDirectConformance } from '../scripts/direct-credentialed-conformance-preflight.mjs';
 import {
+  type DirectBootstrapContext,
+  type DirectBootstrapMutationReceipt,
   type DirectRunJournal,
   openDirectRunState,
 } from '../scripts/direct-credentialed-run-state.mjs';
@@ -121,6 +123,371 @@ afterEach(async () => {
 
 const describeLinux =
   process.platform === 'linux' ? describe.sequential : describe.skip;
+
+function bootstrapContext(
+  f: Awaited<ReturnType<typeof fixture>>,
+): DirectBootstrapContext {
+  return {
+    names: f.prepared.names,
+    zoneId: 'zone',
+    zoneName: 'example.test',
+    accountWorkersDevSubdomain: 'attested-account',
+    dispatch: { kind: 'empty', count: 0 },
+  };
+}
+
+function receipts(f: Awaited<ReturnType<typeof fixture>>) {
+  return [
+    {
+      kind: 'create-fleet-d1',
+      receipt: { uuid: 'fleet-uuid', name: f.prepared.names.fleetDatabase },
+    },
+    {
+      kind: 'create-quota-d1',
+      receipt: { uuid: 'quota-uuid', name: f.prepared.names.quotaDatabase },
+    },
+    {
+      kind: 'create-export-r2',
+      receipt: {
+        name: f.prepared.names.exportBucket,
+        jurisdiction: 'default',
+        creationDate: '2026-09-10T00:00:00.000Z',
+      },
+    },
+    {
+      kind: 'upload-reference',
+      receipt: {
+        scriptName: f.prepared.names.referenceWorker,
+        tag: null,
+        etag: null,
+      },
+    },
+    {
+      kind: 'enable-reference-ingress',
+      receipt: { enabled: true, previewsEnabled: false },
+    },
+  ] as const satisfies readonly DirectBootstrapMutationReceipt[];
+}
+
+async function confirmedBootstrap(
+  f: Awaited<ReturnType<typeof fixture>>,
+  journal: DirectRunJournal,
+) {
+  await journal.bindBootstrapContext(bootstrapContext(f));
+  for (const value of receipts(f)) {
+    if (value.kind === 'enable-reference-ingress')
+      await journal.recordBootstrapObservation({
+        kind: 'active',
+        deploymentId: 'deployment',
+        versionId: 'version',
+      });
+    await journal.beginBootstrapMutation(value.kind);
+    await journal.confirmBootstrapMutation(value);
+  }
+}
+
+describeLinux('durable bootstrap state', () => {
+  it('enforces mutation order, exact receipt association and exclusive invocation/provider pending state', async () => {
+    const f = await fixture();
+    const journal = await opened({ ...f.input, mode: 'run' });
+    await expect(
+      journal.beginBootstrapMutation('create-fleet-d1'),
+    ).rejects.toMatchObject({ code: 'invalid-state' });
+    await journal.bindBootstrapContext(bootstrapContext(f));
+    await expect(
+      journal.beginBootstrapMutation('create-quota-d1'),
+    ).rejects.toMatchObject({ code: 'invalid-state' });
+    await expect(
+      journal.recordBootstrapObservation({
+        kind: 'active',
+        deploymentId: 'deployment',
+        versionId: 'version',
+      }),
+    ).rejects.toMatchObject({ code: 'invalid-state' });
+    const reservation = await journal.reserveInvocation(f.request());
+    await expect(
+      journal.beginBootstrapMutation('create-fleet-d1'),
+    ).rejects.toMatchObject({ code: 'outcome-unknown' });
+    await journal.settleInvocation(reservation);
+    await journal.beginBootstrapMutation('create-fleet-d1');
+    await expect(journal.reserveInvocation(f.request())).rejects.toMatchObject({
+      code: 'outcome-unknown',
+    });
+    await expect(
+      journal.beginBootstrapMutation('create-quota-d1'),
+    ).rejects.toMatchObject({ code: 'outcome-unknown' });
+    await expect(
+      journal.confirmBootstrapMutation(receipts(f)[1]),
+    ).rejects.toMatchObject({ code: 'invalid-state' });
+    await expect(
+      journal.confirmBootstrapMutation({
+        kind: 'create-fleet-d1',
+        receipt: null,
+      } as unknown as DirectBootstrapMutationReceipt),
+    ).rejects.toMatchObject({ code: 'invalid-state' });
+    await expect(
+      journal.confirmBootstrapMutation({
+        kind: 'create-fleet-d1',
+        receipt: { uuid: 'fleet-uuid', name: 'foreign' },
+      }),
+    ).rejects.toMatchObject({ code: 'invalid-state' });
+    await journal.confirmBootstrapMutation(receipts(f)[0]);
+    await expect(
+      journal.beginBootstrapMutation('create-fleet-d1'),
+    ).rejects.toMatchObject({ code: 'invalid-state' });
+    await expect(
+      journal.confirmBootstrapMutation(receipts(f)[0]),
+    ).rejects.toMatchObject({ code: 'invalid-state' });
+    await journal.beginBootstrapMutation('create-quota-d1');
+    await expect(
+      journal.confirmBootstrapMutation({
+        kind: 'create-quota-d1',
+        receipt: { uuid: 'fleet-uuid', name: f.prepared.names.quotaDatabase },
+      }),
+    ).rejects.toMatchObject({ code: 'invalid-state' });
+    expect(journal.snapshot().bootstrap).toMatchObject({
+      pending: 'create-quota-d1',
+      fleet: { uuid: 'fleet-uuid' },
+      quota: null,
+    });
+  });
+
+  it('freezes closed context/receipts and preserves historical control-read ordinals across later invocations and resume', async () => {
+    const f = await fixture(4);
+    const journal = await opened({ ...f.input, mode: 'run' });
+    await confirmedBootstrap(f, journal);
+    const first = await journal.reserveInvocation(f.request());
+    await expect(
+      journal.recordBootstrapObservation({
+        kind: 'control-read',
+        ordinal: first.ordinal,
+      }),
+    ).rejects.toMatchObject({ code: 'outcome-unknown' });
+    await journal.settleInvocation(first);
+    await journal.recordBootstrapObservation({
+      kind: 'control-read',
+      ordinal: first.ordinal,
+    });
+    const second = await journal.reserveInvocation(
+      f.request({ kind: 'tenant-probe', role: 'a', operation: 'health' }),
+    );
+    await journal.settleInvocation(second);
+    await expect(
+      journal.recordBootstrapObservation({
+        kind: 'control-read',
+        ordinal: second.ordinal,
+      }),
+    ).rejects.toMatchObject({ code: 'invalid-state' });
+    await expect(
+      journal.recordBootstrapObservation({
+        kind: 'active',
+        deploymentId: 'replacement',
+        versionId: 'version',
+      }),
+    ).rejects.toMatchObject({ code: 'invalid-state' });
+    await journal.bindBootstrapContext({
+      ...bootstrapContext(f),
+      dispatch: { kind: 'enumerated', count: 9 },
+    });
+    const frozen = (value: unknown) => {
+      if (!value || typeof value !== 'object') return;
+      expect(Object.isFrozen(value)).toBe(true);
+      Object.values(value).forEach(frozen);
+    };
+    frozen(journal.snapshot());
+    await closed(journal);
+    const resumed = await opened({ ...f.input, mode: 'resume' });
+    expect(resumed.snapshot()).toMatchObject({
+      invocationCount: 2,
+      bootstrap: {
+        controlReadOrdinal: 1,
+        context: { dispatch: { kind: 'empty', count: 0 } },
+      },
+    });
+    const third = await resumed.reserveInvocation(f.request());
+    await resumed.settleInvocation(third);
+    await resumed.recordBootstrapObservation({
+      kind: 'control-read',
+      ordinal: 3,
+    });
+    expect(resumed.snapshot().bootstrap?.controlReadOrdinal).toBe(3);
+    expect(
+      (await stat(join(resumed.directory, 'journal.json'))).size,
+    ).toBeLessThanOrEqual(16 * 1024);
+  });
+
+  it('normalizes v1 without dropping settled history or resetting the budget', async () => {
+    const f = await fixture(2);
+    const journal = await opened({ ...f.input, mode: 'run' });
+    const first = await journal.reserveInvocation(f.request());
+    await journal.settleInvocation(first);
+    await closed(journal);
+    const path = join(journal.directory, 'journal.json');
+    const original = JSON.parse(await readFile(path, 'utf8'));
+    delete original.bootstrap;
+    original.version = 1;
+    await writeFile(path, JSON.stringify(original));
+    const resumed = await opened({ ...f.input, mode: 'resume' });
+    expect(resumed.snapshot()).toMatchObject({
+      version: 2,
+      bootstrap: null,
+      invocationCount: 1,
+      lastInvocation: { state: 'settled', ordinal: 1 },
+    });
+    await expect(
+      resumed.bindBootstrapContext(bootstrapContext(f)),
+    ).rejects.toMatchObject({ code: 'invalid-state' });
+    const second = await resumed.reserveInvocation(f.request());
+    await resumed.settleInvocation(second);
+    expect(JSON.parse(await readFile(path, 'utf8')).version).toBe(2);
+    await expect(resumed.reserveInvocation(f.request())).rejects.toMatchObject({
+      code: 'invocation-budget-exhausted',
+    });
+  });
+
+  it.each([
+    'file-1',
+    'rename-1',
+    'directory-1',
+    'file-2',
+    'rename-2',
+    'directory-2',
+  ])('retains the receipt barrier disposition and poisons the handle after %s failure', async (failure) => {
+    const f = await fixture();
+    const journal = await opened({ ...f.input, mode: 'run' });
+    await journal.bindBootstrapContext(bootstrapContext(f));
+    await journal.beginBootstrapMutation('create-fleet-d1');
+    const path = join(journal.directory, 'journal.json');
+    const directory = await stat(journal.directory);
+    const probe = await open(path, 'r');
+    const prototype = Object.getPrototypeOf(probe) as typeof probe;
+    const originalSync = prototype.sync;
+    const actualFs =
+      await vi.importActual<typeof import('node:fs/promises')>(
+        'node:fs/promises',
+      );
+    let occurrences = 0;
+    const [point, barrier] = failure.split('-');
+    const check = () => {
+      if (++occurrences === Number(barrier))
+        throw new Error('receipt-sync-secret-sentinel');
+    };
+    const sync = vi.spyOn(prototype, 'sync').mockImplementation(async function (
+      this: typeof probe,
+    ) {
+      const current = await this.stat();
+      if (
+        (point === 'file' && current.isFile()) ||
+        (point === 'directory' &&
+          current.isDirectory() &&
+          current.ino === directory.ino &&
+          current.dev === directory.dev)
+      )
+        check();
+      await originalSync.call(this);
+    });
+    vi.mocked(rename).mockImplementation(async (...args) => {
+      if (point === 'rename') check();
+      await actualFs.rename(...args);
+    });
+    try {
+      const error = await journal
+        .confirmBootstrapMutation(receipts(f)[0])
+        .catch((error: unknown) => error);
+      expect(error).toMatchObject({ code: 'invalid-state' });
+      expect(String(error)).not.toContain('receipt-sync-secret-sentinel');
+      await expect(
+        journal.reserveInvocation(f.request()),
+      ).rejects.toMatchObject({ code: 'invalid-state' });
+      const disk = JSON.parse(await readFile(path, 'utf8'));
+      expect(disk.bootstrap.pending).toBe(
+        failure === 'directory-2' ? null : 'create-fleet-d1',
+      );
+      expect(disk.bootstrap.fleet).toEqual(
+        ['file-1', 'rename-1'].includes(failure)
+          ? null
+          : receipts(f)[0].receipt,
+      );
+      expect(await readdir(journal.directory)).toEqual(['journal.json']);
+    } finally {
+      sync.mockRestore();
+      vi.mocked(rename).mockImplementation(actualFs.rename);
+      await probe.close();
+    }
+    await closed(journal);
+    if (failure === 'directory-2') {
+      const resumed = await opened({ ...f.input, mode: 'resume' });
+      expect(resumed.snapshot().bootstrap?.fleet).toEqual(
+        receipts(f)[0].receipt,
+      );
+    } else
+      await expect(
+        openDirectRunState({ ...f.input, mode: 'resume' }),
+      ).rejects.toMatchObject({ code: 'outcome-unknown' });
+  });
+
+  it('rejects malformed context, extra receipt fields, missing prerequisites and invalid historical ordinals on resume', async () => {
+    const f = await fixture();
+    const journal = await opened({ ...f.input, mode: 'run' });
+    await confirmedBootstrap(f, journal);
+    const reservation = await journal.reserveInvocation(f.request());
+    await journal.settleInvocation(reservation);
+    await journal.recordBootstrapObservation({
+      kind: 'control-read',
+      ordinal: 1,
+    });
+    await closed(journal);
+    const path = join(journal.directory, 'journal.json');
+    const original = JSON.parse(await readFile(path, 'utf8'));
+    for (const mutate of [
+      (value: typeof original) => {
+        value.bootstrap.context.token = CLAIM;
+      },
+      (value: typeof original) => {
+        value.bootstrap.context.names.roles.a.scriptName = 'foreign';
+      },
+      (value: typeof original) => {
+        value.bootstrap.context.zoneName = 'notexample.test';
+      },
+      (value: typeof original) => {
+        value.bootstrap.context.dispatch.count = 1;
+      },
+      (value: typeof original) => {
+        value.bootstrap.fleet.secret = CLAIM;
+      },
+      (value: typeof original) => {
+        value.bootstrap.quota.uuid = value.bootstrap.fleet.uuid;
+      },
+      (value: typeof original) => {
+        value.bootstrap.exports.creationDate = '2026-09-10';
+      },
+      (value: typeof original) => {
+        value.bootstrap.exports.jurisdiction = 'eu';
+      },
+      (value: typeof original) => {
+        value.bootstrap.upload.tag = 'x'.repeat(129);
+      },
+      (value: typeof original) => {
+        value.bootstrap.active = null;
+      },
+      (value: typeof original) => {
+        value.bootstrap.controlReadOrdinal = 2;
+      },
+      (value: typeof original) => {
+        value.bootstrap.pending = 'create-fleet-d1';
+      },
+    ]) {
+      const corrupted = structuredClone(original);
+      mutate(corrupted);
+      await writeFile(path, JSON.stringify(corrupted));
+      await expect(
+        openDirectRunState({ ...f.input, mode: 'resume' }),
+      ).rejects.toMatchObject({ code: 'invalid-state' });
+    }
+    await writeFile(path, JSON.stringify(original));
+    await closed(await opened({ ...f.input, mode: 'resume' }));
+  });
+});
 
 describeLinux('durable direct invocation state', () => {
   it('persists the reservation before return and resumes the original budget without retaining claims', async () => {

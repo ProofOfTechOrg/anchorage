@@ -6,6 +6,7 @@ import { constants } from 'node:fs';
 import { lstat, mkdir, open, rename, rmdir, unlink } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import PQueue from 'p-queue';
+import { deriveDirectConformanceNames } from './direct-credentialed-conformance-config.mjs';
 import {
   DIRECT_REFERENCE_BODY_LIMIT,
   readDirectReferenceRequest,
@@ -128,10 +129,11 @@ async function decodeRequest(serialized, configSha256) {
 }
 
 async function decodeSnapshot(value, binding) {
-  object(value, ['version', 'binding', 'invocationCount', 'lastInvocation']);
+  const keys = ['version', 'binding', 'invocationCount', 'lastInvocation'];
+  object(value, value.version === 1 ? keys : [...keys, 'bootstrap']);
   object(value.binding, Object.keys(binding));
   if (
-    value.version !== 1 ||
+    ![1, 2].includes(value.version) ||
     Object.entries(binding).some(
       ([key, expected]) => value.binding[key] !== expected,
     ) ||
@@ -181,11 +183,205 @@ async function decodeSnapshot(value, binding) {
     });
   }
   return Object.freeze({
-    version: 1,
+    version: 2,
     binding,
     invocationCount: value.invocationCount,
     lastInvocation,
+    bootstrap: decodeBootstrap(
+      value.version === 1 ? null : value.bootstrap,
+      binding,
+      value.invocationCount,
+      lastInvocation,
+    ),
   });
+}
+
+function identifier(value, max = 128) {
+  if (
+    typeof value !== 'string' ||
+    !value ||
+    value !== value.trim() ||
+    value.length > max ||
+    [...value].some(
+      (character) =>
+        character.charCodeAt(0) <= 31 || character.charCodeAt(0) === 127,
+    )
+  )
+    invalid();
+  return value;
+}
+
+function equalShape(value, expected) {
+  if (expected !== null && typeof expected === 'object') {
+    object(value, Object.keys(expected));
+    for (const key of Object.keys(expected))
+      equalShape(value[key], expected[key]);
+  } else if (value !== expected) invalid();
+}
+
+function bootstrapContext(value, binding) {
+  object(value, [
+    'names',
+    'zoneId',
+    'zoneName',
+    'accountWorkersDevSubdomain',
+    'dispatch',
+  ]);
+  const hostname = identifier(value.names?.referenceHostname, 253);
+  const prefix = `${binding.resourcePrefix}-reference.`;
+  if (!hostname.startsWith(prefix)) invalid();
+  const ownedHostname = hostname.slice(prefix.length);
+  const names = deriveDirectConformanceNames({
+    resourcePrefix: binding.resourcePrefix,
+    ownedHostname,
+  });
+  equalShape(value.names, names);
+  const zoneId = identifier(value.zoneId);
+  const zoneName = identifier(value.zoneName, 253);
+  if (
+    !/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/u.test(zoneName) ||
+    zoneName
+      .split('.')
+      .some(
+        (label) => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(label),
+      ) ||
+    (ownedHostname !== zoneName && !ownedHostname.endsWith(`.${zoneName}`))
+  )
+    invalid();
+  const subdomain = identifier(value.accountWorkersDevSubdomain);
+  if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(subdomain)) invalid();
+  object(value.dispatch, ['kind', 'count']);
+  const { kind, count } = value.dispatch;
+  if (
+    !Number.isSafeInteger(count) ||
+    count < 0 ||
+    count > 10_000 ||
+    !['first-page-404', 'empty', 'enumerated'].includes(kind) ||
+    (kind === 'enumerated' ? count === 0 : count !== 0)
+  )
+    invalid();
+  return Object.freeze({
+    names,
+    zoneId,
+    zoneName,
+    accountWorkersDevSubdomain: subdomain,
+    dispatch: Object.freeze({ kind, count }),
+  });
+}
+
+const MUTATION_FIELD = Object.freeze({
+  'create-fleet-d1': 'fleet',
+  'create-quota-d1': 'quota',
+  'create-export-r2': 'exports',
+  'upload-reference': 'upload',
+  'enable-reference-ingress': 'ingress',
+});
+
+function mutationField(kind) {
+  if (typeof kind !== 'string' || !Object.hasOwn(MUTATION_FIELD, kind))
+    invalid();
+  return MUTATION_FIELD[kind];
+}
+
+function decodeBootstrap(value, binding, invocationCount, lastInvocation) {
+  if (value === null) return null;
+  object(value, [
+    'context',
+    'fleet',
+    'quota',
+    'exports',
+    'upload',
+    'active',
+    'ingress',
+    'controlReadOrdinal',
+    'pending',
+  ]);
+  const context = bootstrapContext(value.context, binding);
+  const result = { context };
+  for (const [key, name] of [
+    ['fleet', context.names.fleetDatabase],
+    ['quota', context.names.quotaDatabase],
+  ]) {
+    const receipt = value[key];
+    if (receipt === null) result[key] = null;
+    else {
+      object(receipt, ['uuid', 'name']);
+      if (receipt.name !== name) invalid();
+      result[key] = Object.freeze({ uuid: identifier(receipt.uuid), name });
+    }
+  }
+  if (result.fleet && result.quota && result.fleet.uuid === result.quota.uuid)
+    invalid();
+  if (value.exports !== null) {
+    object(value.exports, ['name', 'jurisdiction', 'creationDate']);
+    const { name, jurisdiction, creationDate } = value.exports;
+    if (
+      name !== context.names.exportBucket ||
+      jurisdiction !== 'default' ||
+      typeof creationDate !== 'string' ||
+      creationDate.length > 32 ||
+      !Number.isFinite(Date.parse(creationDate)) ||
+      new Date(creationDate).toISOString() !== creationDate
+    )
+      invalid();
+    result.exports = Object.freeze({ name, jurisdiction, creationDate });
+  } else result.exports = null;
+  if (value.upload !== null) {
+    object(value.upload, ['scriptName', 'tag', 'etag']);
+    if (value.upload.scriptName !== context.names.referenceWorker) invalid();
+    result.upload = Object.freeze({
+      scriptName: value.upload.scriptName,
+      tag: value.upload.tag === null ? null : identifier(value.upload.tag),
+      etag: value.upload.etag === null ? null : identifier(value.upload.etag),
+    });
+  } else result.upload = null;
+  if (value.active !== null) {
+    object(value.active, ['deploymentId', 'versionId']);
+    result.active = Object.freeze({
+      deploymentId: identifier(value.active.deploymentId),
+      versionId: identifier(value.active.versionId),
+    });
+  } else result.active = null;
+  if (value.ingress !== null) {
+    equalShape(value.ingress, { enabled: true, previewsEnabled: false });
+    result.ingress = Object.freeze({ enabled: true, previewsEnabled: false });
+  } else result.ingress = null;
+  const ordinal = value.controlReadOrdinal;
+  if (
+    ordinal !== null &&
+    (!Number.isSafeInteger(ordinal) ||
+      ordinal < 1 ||
+      ordinal > invocationCount ||
+      (ordinal === invocationCount &&
+        (lastInvocation?.state !== 'settled' ||
+          lastInvocation.action.kind !== 'control-read')))
+  )
+    invalid();
+  result.controlReadOrdinal = ordinal;
+  const fields = [
+    'fleet',
+    'quota',
+    'exports',
+    'upload',
+    'active',
+    'ingress',
+    'controlReadOrdinal',
+  ];
+  for (let index = 1; index < fields.length; index++) {
+    if (result[fields[index]] !== null && result[fields[index - 1]] === null)
+      invalid();
+  }
+  result.pending = value.pending;
+  if (value.pending !== null) {
+    const index = fields.indexOf(mutationField(value.pending));
+    if (
+      lastInvocation?.state === 'pending' ||
+      (index > 0 && result[fields[index - 1]] === null) ||
+      fields.slice(index + 1).some((field) => result[field] !== null)
+    )
+      invalid();
+  }
+  return Object.freeze(result);
 }
 
 function assertPrivate(stat, directory) {
@@ -352,10 +548,11 @@ async function initializeRun(basePath, base, directory, binding) {
   try {
     handle = await privateDirectory(staging);
     const snapshot = Object.freeze({
-      version: 1,
+      version: 2,
       binding,
       invocationCount: 0,
       lastInvocation: null,
+      bootstrap: null,
     });
     await writeSnapshot(staging, handle, snapshot);
     if (await exists(directory)) throw new DirectRunStateError('run-exists');
@@ -404,15 +601,112 @@ function runJournal(directory, directoryHandle, base, lock, initial) {
       throw error;
     }
   };
+  const publishBootstrap = async (bootstrap) => {
+    const next = await decodeSnapshot(
+      { ...snapshot, bootstrap },
+      snapshot.binding,
+    );
+    await publish(next);
+  };
+  const assertSettled = () => {
+    if (
+      snapshot.lastInvocation?.state === 'pending' ||
+      snapshot.bootstrap?.pending
+    )
+      throw new DirectRunStateError('outcome-unknown');
+  };
   return Object.freeze({
     directory,
     snapshot() {
       return snapshot;
     },
+    bindBootstrapContext(context) {
+      return enqueue(async () => {
+        assertSettled();
+        const checked = bootstrapContext(context, snapshot.binding);
+        if (snapshot.bootstrap) {
+          const { dispatch: _historical, ...previous } =
+            snapshot.bootstrap.context;
+          const { dispatch: _fresh, ...current } = checked;
+          equalShape(current, previous);
+          return;
+        }
+        if (snapshot.invocationCount !== 0) invalid();
+        await publishBootstrap({
+          context: checked,
+          fleet: null,
+          quota: null,
+          exports: null,
+          upload: null,
+          active: null,
+          ingress: null,
+          controlReadOrdinal: null,
+          pending: null,
+        });
+      });
+    },
+    beginBootstrapMutation(kind) {
+      return enqueue(async () => {
+        assertSettled();
+        const field = mutationField(kind);
+        if (!snapshot.bootstrap || snapshot.bootstrap[field] !== null)
+          invalid();
+        await publishBootstrap({ ...snapshot.bootstrap, pending: kind });
+      });
+    },
+    confirmBootstrapMutation(value) {
+      return enqueue(async () => {
+        object(value, ['kind', 'receipt']);
+        if (value.receipt === null) invalid();
+        const field = mutationField(value.kind);
+        if (
+          !snapshot.bootstrap ||
+          snapshot.bootstrap.pending !== value.kind ||
+          snapshot.bootstrap[field] !== null
+        )
+          invalid();
+        await publishBootstrap({
+          ...snapshot.bootstrap,
+          [field]: value.receipt,
+        });
+        await publishBootstrap({ ...snapshot.bootstrap, pending: null });
+      });
+    },
+    recordBootstrapObservation(value) {
+      return enqueue(async () => {
+        assertSettled();
+        const bootstrap = snapshot.bootstrap;
+        if (!bootstrap) invalid();
+        if (value?.kind === 'active') {
+          object(value, ['kind', 'deploymentId', 'versionId']);
+          const active = {
+            deploymentId: value.deploymentId,
+            versionId: value.versionId,
+          };
+          if (bootstrap.active) {
+            equalShape(active, bootstrap.active);
+            return;
+          }
+          await publishBootstrap({ ...bootstrap, active });
+        } else if (value?.kind === 'control-read') {
+          object(value, ['kind', 'ordinal']);
+          const last = snapshot.lastInvocation;
+          if (
+            last?.state !== 'settled' ||
+            last.action.kind !== 'control-read' ||
+            last.ordinal !== value.ordinal
+          )
+            invalid();
+          await publishBootstrap({
+            ...bootstrap,
+            controlReadOrdinal: value.ordinal,
+          });
+        } else invalid();
+      });
+    },
     reserveInvocation(serializedRequest) {
       return enqueue(async () => {
-        if (snapshot.lastInvocation?.state === 'pending')
-          throw new DirectRunStateError('outcome-unknown');
+        assertSettled();
         if (snapshot.invocationCount >= snapshot.binding.maxInvocations)
           throw new DirectRunStateError('invocation-budget-exhausted');
         const request = await decodeRequest(
@@ -513,7 +807,10 @@ export async function openDirectRunState(input) {
         throw new DirectRunStateError('run-missing');
       directoryHandle = await privateDirectory(directory);
       snapshot = await readSnapshot(join(directory, 'journal.json'), binding);
-      if (snapshot.lastInvocation?.state === 'pending')
+      if (
+        snapshot.lastInvocation?.state === 'pending' ||
+        snapshot.bootstrap?.pending
+      )
         throw new DirectRunStateError('outcome-unknown');
     }
     return runJournal(directory, directoryHandle, base, lock, snapshot);
