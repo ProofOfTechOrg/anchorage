@@ -2,8 +2,11 @@
 
 import { createHash } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { directDeploymentSpec } from '../scripts/direct-credentialed-spec.js';
+import type { DirectDecommissionExportMetadata } from '../scripts/direct-reference-lifecycle.js';
 import type { CleanupAdvanceResult } from '../src/cleanup-advance.js';
 import type { DecommissionAdvanceResult } from '../src/decommission-advance.js';
+import { deploymentSpecDigest } from '../src/spec-digest.js';
 import {
   createDirectReferenceHarness,
   type DirectReferenceHarness,
@@ -36,6 +39,12 @@ describe.sequential('direct lifecycle through native control state', {
   }
 
   it('uses real provision and normal teardown with native export integrity', async () => {
+    const metadataAction = { kind: 'decommission-export', role: 'a' } as const;
+    expect(await fixture.success(metadataAction)).toEqual({
+      available: false,
+      role: 'a',
+      lifecyclePhase: 'not-started',
+    });
     const result = await fixture.success<{ status: string }>({
       kind: 'provision',
       role: 'a',
@@ -58,6 +67,11 @@ describe.sequential('direct lifecycle through native control state', {
       kind: 'decommission-start',
       role: 'a',
     });
+    expect(await fixture.success(metadataAction)).toMatchObject({
+      available: false,
+      role: 'a',
+    });
+    let verifiedBeforeDelete = false;
     for (let calls = 0; advance.status !== 'complete' && calls < 150; calls++) {
       expect(advance.status).toBe('pending');
       advance = await fixture.success<DecommissionAdvanceResult>({
@@ -65,10 +79,300 @@ describe.sequential('direct lifecycle through native control state', {
         role: 'a',
         token: advance.token,
       });
+      const current = await fixture.fleetStore.get(
+        fixture.manifest.names.roles.a.tenantTag,
+        fixture.manifest.environment,
+      );
+      if (
+        !verifiedBeforeDelete &&
+        current?.decommissionIntent?.state === 'transitioning' &&
+        current.decommissionIntent.lifecyclePhase === 'database-exported'
+      ) {
+        const selected = await fixture
+          .journal()
+          .readOperation('decommission-a');
+        const providerRequests = fixture.projection.requests.length;
+        const journalRow = await fixture.db
+          .prepare(
+            'SELECT operation_id,start_json,start_sha256,token_json,token_sha256,token_revision FROM direct_reference_operations WHERE run_key=? AND slot=?',
+          )
+          .bind(fixture.manifest.resourcePrefix, 'decommission-a')
+          .first<{
+            operation_id: string;
+            start_json: string;
+            start_sha256: string;
+            token_json: string;
+            token_sha256: string;
+            token_revision: number;
+          }>();
+        if (!journalRow?.token_json)
+          throw new Error('selected journal token is missing');
+        const intent = current.decommissionIntent;
+        expect(
+          fixture.world.databases.some(
+            (database) => database.databaseId === current.databaseId,
+          ),
+        ).toBe(true);
+        const metadata =
+          await fixture.success<DirectDecommissionExportMetadata>(
+            metadataAction,
+          );
+        if (!metadata.available)
+          throw new Error('saved export metadata is unavailable');
+        const operationId = current.decommissionIntent.operationId;
+        const key = `${fixture.manifest.resourcePrefix}/receipts/v1/${current.databaseId}/${operationId}.sql`;
+        expect(metadata).toEqual({
+          available: true,
+          role: 'a',
+          receipt: {
+            version: 1,
+            authority: `r2://${fixture.binding.exportBucketName}/${fixture.manifest.resourcePrefix}/receipts/v1`,
+            databaseId: current.databaseId,
+            operationId,
+          },
+          location: `r2://${fixture.binding.exportBucketName}/${key}`,
+          size: current.databaseExportSize,
+          sha256: current.databaseExportSha256,
+          lifecyclePhase: 'database-exported',
+          intentState: 'transitioning',
+          revision: current.decommissionIntent.revision,
+          generation: current.decommissionIntent.generation,
+        });
+        const object = await fixture.exportBytes.get(key);
+        if (!object?.customMetadata)
+          throw new Error('receipt object metadata is missing');
+        const originalMetadata = { ...object.customMetadata };
+        const bytes = new Uint8Array(await object.arrayBuffer());
+        expect(bytes.byteLength).toBe(metadata.size);
+        expect(createHash('sha256').update(bytes).digest('hex')).toBe(
+          metadata.sha256,
+        );
+        const failures = await Promise.allSettled([
+          (async () => {
+            for (const changed of [
+              {
+                ...current,
+                decommissionIntent: {
+                  ...intent,
+                  operationId: '00000000-0000-4000-8000-000000000000',
+                },
+              },
+              {
+                ...current,
+                databaseExportLocation: 'r2://different/receipts/v1/other.sql',
+              },
+              { ...current, databaseExportSize: metadata.size + 1 },
+              { ...current, databaseExportSha256: 'invalid' },
+              {
+                ...current,
+                decommissionIntent: {
+                  ...intent,
+                  databaseExportReceiptAuthority: 'r2://different/receipts/v1',
+                },
+              },
+            ]) {
+              await fixture.fleetStore.withDeploymentLease(
+                current.tenantTag,
+                current.environment,
+                (lease) => lease.put(changed),
+              );
+              expect(
+                await fixture.fleetStore.get(
+                  current.tenantTag,
+                  current.environment,
+                ),
+              ).toEqual(changed);
+              expect((await fixture.call(metadataAction)).value.ok).toBe(false);
+              await fixture.fleetStore.withDeploymentLease(
+                current.tenantTag,
+                current.environment,
+                (lease) => lease.put(current),
+              );
+            }
+            const otherOperationId = '00000000-0000-4000-8000-000000000000';
+            const tokenJson = JSON.stringify({
+              ...JSON.parse(journalRow.token_json),
+              operationId: otherOperationId,
+            });
+            const tokenHash = createHash('sha256')
+              .update(
+                JSON.stringify([
+                  'token',
+                  fixture.manifest.resourcePrefix,
+                  'decommission-a',
+                  tokenJson,
+                ]),
+              )
+              .digest('hex');
+            await fixture.db
+              .prepare(
+                'UPDATE direct_reference_operations SET operation_id=?,token_json=?,token_sha256=? WHERE run_key=? AND slot=?',
+              )
+              .bind(
+                otherOperationId,
+                tokenJson,
+                tokenHash,
+                fixture.manifest.resourcePrefix,
+                'decommission-a',
+              )
+              .run();
+            expect(
+              (await fixture.journal().readOperation('decommission-a'))
+                ?.operationId,
+            ).toBe(otherOperationId);
+            expect((await fixture.call(metadataAction)).value.ok).toBe(false);
+            await fixture.db
+              .prepare(
+                'UPDATE direct_reference_operations SET operation_id=?,token_json=?,token_sha256=? WHERE run_key=? AND slot=?',
+              )
+              .bind(
+                journalRow.operation_id,
+                journalRow.token_json,
+                journalRow.token_sha256,
+                fixture.manifest.resourcePrefix,
+                'decommission-a',
+              )
+              .run();
+            const nextSpec = directDeploymentSpec(
+              fixture.manifest,
+              'a',
+              'next',
+              fixture.secrets.a,
+              fixture.binding,
+            );
+            const startJson = JSON.stringify({
+              version: 1,
+              role: 'a',
+              release: 'next',
+              specDigest: deploymentSpecDigest(nextSpec),
+            });
+            const startHash = createHash('sha256')
+              .update(
+                JSON.stringify([
+                  'start',
+                  fixture.manifest.resourcePrefix,
+                  'decommission-a',
+                  'decommission',
+                  null,
+                  startJson,
+                ]),
+              )
+              .digest('hex');
+            await fixture.db
+              .prepare(
+                'UPDATE direct_reference_operations SET start_json=?,start_sha256=? WHERE run_key=? AND slot=?',
+              )
+              .bind(
+                startJson,
+                startHash,
+                fixture.manifest.resourcePrefix,
+                'decommission-a',
+              )
+              .run();
+            expect(
+              (await fixture.journal().readOperation('decommission-a'))
+                ?.inputJson,
+            ).toBe(startJson);
+            expect((await fixture.call(metadataAction)).value.ok).toBe(false);
+            await fixture.db
+              .prepare(
+                'UPDATE direct_reference_operations SET start_json=?,start_sha256=? WHERE run_key=? AND slot=?',
+              )
+              .bind(
+                journalRow.start_json,
+                journalRow.start_sha256,
+                fixture.manifest.resourcePrefix,
+                'decommission-a',
+              )
+              .run();
+            for (const customMetadata of [
+              {},
+              {
+                ...originalMetadata,
+                anchorageOperationId: '00000000-0000-4000-8000-000000000000',
+              },
+              {
+                ...originalMetadata,
+                anchorageReceiptAuthority: 'r2://foreign/receipts/v1',
+              },
+              { ...originalMetadata, extra: 'unexpected' },
+            ]) {
+              await fixture.exportBytes.put(key, bytes, { customMetadata });
+              expect((await fixture.call(metadataAction)).value).toEqual({
+                contractVersion: 1,
+                ok: false,
+                error: { code: 'operation-refused' },
+              });
+            }
+            await fixture.exportBytes.put(
+              key,
+              bytes.slice(0, bytes.byteLength - 1),
+              { customMetadata: originalMetadata },
+            );
+            expect((await fixture.call(metadataAction)).value.ok).toBe(false);
+            await fixture.exportBytes.delete(key);
+            expect((await fixture.call(metadataAction)).value.ok).toBe(false);
+          })(),
+        ]);
+        const restored = await Promise.allSettled([
+          fixture.fleetStore.withDeploymentLease(
+            current.tenantTag,
+            current.environment,
+            (lease) => lease.put(current),
+          ),
+          fixture.db
+            .prepare(
+              'UPDATE direct_reference_operations SET operation_id=?,start_json=?,start_sha256=?,token_json=?,token_sha256=?,token_revision=? WHERE run_key=? AND slot=?',
+            )
+            .bind(
+              journalRow.operation_id,
+              journalRow.start_json,
+              journalRow.start_sha256,
+              journalRow.token_json,
+              journalRow.token_sha256,
+              journalRow.token_revision,
+              fixture.manifest.resourcePrefix,
+              'decommission-a',
+            )
+            .run(),
+          fixture.exportBytes.put(key, bytes, {
+            customMetadata: originalMetadata,
+          }),
+        ]);
+        const errors = [...failures, ...restored].flatMap((result) =>
+          result.status === 'rejected' ? [result.reason] : [],
+        );
+        if (errors.length)
+          throw new AggregateError(
+            errors,
+            'export metadata controls or restoration failed',
+          );
+        expect(await fixture.success(metadataAction)).toEqual(metadata);
+        expect(
+          await fixture.fleetStore.get(current.tenantTag, current.environment),
+        ).toEqual(current);
+        expect(await fixture.journal().readOperation('decommission-a')).toEqual(
+          selected,
+        );
+        expect(fixture.projection.requests).toHaveLength(providerRequests);
+        expect(
+          fixture.world.databases.some(
+            (database) => database.databaseId === current.databaseId,
+          ),
+        ).toBe(true);
+        verifiedBeforeDelete = true;
+      }
     }
+    expect(verifiedBeforeDelete).toBe(true);
     expect(advance.status).toBe('complete');
     expect(fixture.world.databases).toHaveLength(0);
     expect(fixture.buckets.size).toBe(0);
+    expect(await fixture.success(metadataAction)).toMatchObject({
+      available: true,
+      role: 'a',
+      lifecyclePhase: 'decommissioned',
+      intentState: 'complete',
+    });
     const stored = await fixture.exportBytes.list();
     expect(stored.objects.length).toBeGreaterThan(0);
     const expectedSql = [...fixture.world.exports.values()][0];

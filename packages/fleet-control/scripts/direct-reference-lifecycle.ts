@@ -5,6 +5,8 @@ import {
   type CleanupAdvanceResult,
   type CleanupTerminalReceipt,
   type CloudflareDeploymentSpec,
+  type DatabaseExportReceiptIdentity,
+  type DecommissionAdvanceIntent,
   deploymentSpecDigest,
   type FleetRecord,
   ProvisioningError,
@@ -31,6 +33,126 @@ type LifecycleAction = Exclude<
   { kind: 'tenant-probe' }
 >;
 type CleanupSlot = `cleanup-${DirectFixtureRole}` | 'cleanup-recovery-initial';
+
+export type DirectDecommissionExportMetadata =
+  | Readonly<{
+      available: false;
+      role: DirectFixtureRole;
+      lifecyclePhase:
+        | DecommissionAdvanceIntent['lifecyclePhase']
+        | 'not-started';
+    }>
+  | Readonly<{
+      available: true;
+      role: DirectFixtureRole;
+      receipt: DatabaseExportReceiptIdentity;
+      location: string;
+      size: number;
+      sha256: string;
+      lifecyclePhase:
+        | 'database-exported'
+        | 'database-deleting'
+        | 'decommissioned';
+      intentState: DecommissionAdvanceIntent['state'];
+      revision: number;
+      generation: number;
+    }>;
+
+async function readDirectDecommissionExport(
+  context: DirectReferenceContext,
+  manifest: DirectRunManifest,
+  role: DirectFixtureRole,
+): Promise<DirectDecommissionExportMetadata> {
+  context.transport.assertWithinBudget();
+  const slot: DirectOperationSlot = `decommission-${role}`;
+  const stored = await context.journal.readOperation(slot);
+  const record = await context.control.getDeployment(
+    manifest.names.roles[role].tenantTag,
+    manifest.environment,
+  );
+  if (record && context.roleFor(record) !== role)
+    throw new DirectReferenceExecutionError();
+  if (stored && (stored.slot !== slot || stored.kind !== 'decommission'))
+    throw new DirectReferenceJournalError();
+  const spec = stored
+    ? readFrozenLifecycleSpec(context, stored, role)
+    : undefined;
+  const intent = record?.decommissionIntent;
+  const hasExport =
+    record &&
+    (record.databaseExportLocation !== undefined ||
+      record.databaseExportSize !== undefined ||
+      record.databaseExportSha256 !== undefined);
+  if (!stored?.operationId) {
+    if (intent || hasExport) throw new DirectReferenceJournalError();
+    return { available: false, role, lifecyclePhase: 'not-started' };
+  }
+  if (
+    !record ||
+    !intent ||
+    !spec ||
+    context.specFor(record) !== spec ||
+    intent.operationId !== stored.operationId ||
+    intent.identity.mode.kind !== 'normal' ||
+    intent.identity.mode.requestedSpecDigest !== deploymentSpecDigest(spec)
+  )
+    throw new DirectReferenceJournalError();
+  for (const field of [
+    'tenantTag',
+    'environment',
+    'backend',
+    'scriptName',
+    'databaseId',
+    'databaseName',
+    'routeHostname',
+  ] as const) {
+    if (intent.identity.record[field] !== record[field])
+      throw new DirectReferenceJournalError();
+  }
+  const lifecyclePhase = intent.lifecyclePhase;
+  if (
+    lifecyclePhase !== 'database-exported' &&
+    lifecyclePhase !== 'database-deleting' &&
+    lifecyclePhase !== 'decommissioned'
+  ) {
+    if (hasExport) throw new DirectReferenceExecutionError();
+    return { available: false, role, lifecyclePhase };
+  }
+  const authority = `r2://${context.binding.exportBucketName}/${manifest.resourcePrefix}/receipts/v1`;
+  const receipt: DatabaseExportReceiptIdentity = {
+    version: 1,
+    authority,
+    databaseId: record.databaseId,
+    operationId: intent.operationId,
+  };
+  const location = record.databaseExportLocation;
+  const size = record.databaseExportSize;
+  const sha256 = record.databaseExportSha256;
+  if (
+    intent.databaseExportReceiptAuthority !== authority ||
+    location !==
+      `${authority}/${receipt.databaseId}/${receipt.operationId}.sql` ||
+    typeof size !== 'number' ||
+    !Number.isSafeInteger(size) ||
+    size < 1 ||
+    typeof sha256 !== 'string' ||
+    !/^[0-9a-f]{64}$/u.test(sha256)
+  )
+    throw new DirectReferenceExecutionError();
+  await context.headDecommissionExport(receipt, size);
+  return {
+    available: true,
+    role,
+    receipt,
+    location,
+    size,
+    sha256,
+    lifecyclePhase,
+    intentState: intent.state,
+    revision: intent.revision,
+    generation: intent.generation,
+  };
+}
 
 function cleanupSlot(
   role: DirectFixtureRole,
@@ -258,6 +380,8 @@ export async function dispatchDirectLifecycle(
   signal: AbortSignal,
 ): Promise<unknown> {
   if (action.kind === 'provision') return provision(context, manifest, action);
+  if (action.kind === 'decommission-export')
+    return readDirectDecommissionExport(context, manifest, action.role);
   const decommission = action.kind.startsWith('decommission-');
   let stored: DirectStoredOperation;
   if (decommission) {

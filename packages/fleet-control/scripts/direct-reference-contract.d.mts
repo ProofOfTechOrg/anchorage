@@ -57,7 +57,11 @@ export type DirectReferenceAction =
   | Readonly<{ kind: 'migration-page'; afterOrdinal?: number; limit: number }>
   | Readonly<{ kind: 'migration-continue'; token?: unknown }>
   | Readonly<{
-      kind: 'cleanup-start' | 'cleanup-receipt' | 'decommission-start';
+      kind:
+        | 'cleanup-start'
+        | 'cleanup-receipt'
+        | 'decommission-start'
+        | 'decommission-export';
       role: DirectFixtureRole;
     }>
   | Readonly<{

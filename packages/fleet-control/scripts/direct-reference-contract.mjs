@@ -104,6 +104,7 @@ function actionFromParsed(value) {
     case 'cleanup-start':
     case 'cleanup-receipt':
     case 'decommission-start':
+    case 'decommission-export':
       keys(value, ['kind', 'role']);
       member(value.role, ['a', 'b', 'recovery']);
       break;

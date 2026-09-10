@@ -20,6 +20,7 @@ import {
   type CloudflareDeploymentSpec,
   createCloudflareControlPlane,
   D1FleetStateDatabase,
+  type DatabaseExportReceiptIdentity,
   type DeploymentSecrets,
   deploymentSpecDigest,
   type FleetRecord,
@@ -72,6 +73,10 @@ export interface DirectReferenceContext {
     backend: CloudflareApiPlainWorkerBackend;
   }>;
   readonly recoveryClaimSetPresent: () => Promise<boolean>;
+  readonly headDecommissionExport: (
+    identity: DatabaseExportReceiptIdentity,
+    expectedSize: number,
+  ) => Promise<void>;
   readonly roleFor: (record: FleetRecord) => DirectFixtureRole;
   readonly spec: (
     role: DirectFixtureRole,
@@ -342,6 +347,53 @@ export async function createDirectReferenceContext(
     journal,
     inventoryStore,
     transport,
+    async headDecommissionExport(
+      identity: DatabaseExportReceiptIdentity,
+      expectedSize: number,
+    ) {
+      transport.assertWithinBudget();
+      const authority = `r2://${binding.exportBucketName}/${manifest.resourcePrefix}/receipts/v1`;
+      if (
+        !identity ||
+        identity.version !== 1 ||
+        identity.authority !== authority ||
+        typeof identity.databaseId !== 'string' ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(
+          identity.databaseId,
+        ) ||
+        typeof identity.operationId !== 'string' ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(
+          identity.operationId,
+        ) ||
+        !Number.isSafeInteger(expectedSize) ||
+        expectedSize < 1
+      )
+        refused();
+      const key = `${manifest.resourcePrefix}/receipts/v1/${identity.databaseId}/${identity.operationId}.sql`;
+      const expected = {
+        anchorageReceiptVersion: '1',
+        anchorageReceiptAuthority: authority,
+        anchorageDatabaseId: identity.databaseId,
+        anchorageOperationId: identity.operationId,
+      };
+      const object = await environment.EXPORTS.head(key);
+      transport.assertWithinBudget();
+      const metadata = object?.customMetadata;
+      if (
+        !object ||
+        object.key !== key ||
+        object.size !== expectedSize ||
+        !metadata ||
+        typeof metadata !== 'object' ||
+        Array.isArray(metadata) ||
+        JSON.stringify(Object.keys(metadata).sort()) !==
+          JSON.stringify(Object.keys(expected).sort()) ||
+        Object.entries(expected).some(
+          ([name, value]) => metadata[name] !== value,
+        )
+      )
+        refused();
+    },
     createForcePlane() {
       transport.assertWithinBudget();
       const store = new D1FleetStateStore(
