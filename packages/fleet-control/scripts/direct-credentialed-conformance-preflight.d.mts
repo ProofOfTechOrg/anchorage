@@ -56,6 +56,19 @@ export interface PreparedDirectConformance {
   readonly referenceModuleSetSha256: string;
 }
 
+export function readDirectConformanceConfig(
+  input: Readonly<{
+    configPath: string;
+    now?: number;
+  }>,
+): Promise<
+  Readonly<{
+    configPath: string;
+    configBytes: Uint8Array;
+    config: DirectConformanceConfig;
+  }>
+>;
+
 export function preflightDirectConformance(
   input: Readonly<{
     configPath: string;

@@ -18,6 +18,7 @@ import {
   DIRECT_MANIFEST_MODULE,
   DIRECT_MAX_UPLOAD_BYTES,
   preflightDirectConformance,
+  readDirectConformanceConfig,
 } from '../scripts/direct-credentialed-conformance-preflight.mjs';
 
 const NOW = Date.parse('2026-09-09T12:00:00.000Z');
@@ -73,6 +74,22 @@ afterEach(async () => {
 });
 
 describe('direct artifact preflight', () => {
+  it('reads validated config before artifact creation while preflight still requires the bytes', async () => {
+    const f = await fixture();
+    await rm(f.referencePath);
+    const result = await readDirectConformanceConfig({
+      configPath: f.configPath,
+      now: NOW,
+    });
+    expect(result.configPath).toBe(f.configPath);
+    expect(result.configBytes).toEqual(await readFile(f.configPath));
+    expect(result.config).toEqual(f.config);
+    expect(Object.isFrozen(result)).toBe(true);
+    await expect(prepare(f.configPath)).rejects.toThrow(
+      'reference artifact file',
+    );
+  });
+
   it('accepts literal-template compatibility imports through the ordinary dependency check', async () => {
     const f = await fixture(
       `${REFERENCE}\nimport(\`node:buffer\`);`,

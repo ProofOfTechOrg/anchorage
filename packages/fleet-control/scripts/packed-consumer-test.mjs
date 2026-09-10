@@ -19,6 +19,7 @@ import { verifyControlPlanePackedBundle } from './control-plane-packed-bundle.mj
 import { verifyControlPlanePackedRuntime } from './control-plane-packed-runtime.mjs';
 import { verifyControlPlanePackedSurface } from './control-plane-packed-surface.mjs';
 import { verifyControlPlanePackedWorkload } from './control-plane-packed-workload.mjs';
+import { verifyDirectArtifactsPacked } from './direct-artifacts-packed.mjs';
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const workspaceRoot = resolve(packageRoot, '../..');
@@ -1211,6 +1212,7 @@ assert.ok(new WorkersForPlatformsBackend(complete));
   await verifyControlPlanePackedBundle({ consumerDirectory, packageRoot });
   await verifyControlPlanePackedRuntime({ consumerDirectory, packageRoot });
   await verifyControlPlanePackedWorkload({ consumerDirectory, packageRoot });
+  await verifyDirectArtifactsPacked({ consumerDirectory, packageRoot });
   assert.deepEqual(
     await readFile(join(workspaceRoot, 'pnpm-lock.yaml')),
     lockfileBefore,

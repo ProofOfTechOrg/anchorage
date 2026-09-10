@@ -253,7 +253,7 @@ function runtimeFields(runtime) {
   };
 }
 
-export async function preflightDirectConformance(input) {
+export async function readDirectConformanceConfig(input) {
   let configPath;
   try {
     configPath = resolve(input.configPath);
@@ -268,6 +268,12 @@ export async function preflightDirectConformance(input) {
     throw invalid('config JSON');
   }
   const config = validateDirectConformanceConfig(parsed, { now: input.now });
+  return Object.freeze({ configPath, configBytes, config });
+}
+
+export async function preflightDirectConformance(input) {
+  const { configPath, configBytes, config } =
+    await readDirectConformanceConfig(input);
   const names = deriveDirectConformanceNames(config);
   const configDirectory = dirname(configPath);
   const reference = await readArtifact(
