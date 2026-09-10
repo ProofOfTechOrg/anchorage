@@ -7,6 +7,7 @@ import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
+import { finished } from 'node:stream/promises';
 import {
   captureDatabaseExportReceiptCapability,
   type DurableDatabaseExportStore,
@@ -653,24 +654,31 @@ export class WranglerPlainWorkerProvisioningApi
         hash.update(chunk);
       }
       const sha256 = hash.digest('hex');
-      const stored = await this.#exportStore.write({
-        databaseId: database.id,
-        fileName,
-        body: Readable.toWeb(
-          createReadStream(temporaryLocation),
-        ) as ReadableStream<Uint8Array>,
-        contentLength: metadata.size,
-      });
-      if (
-        !stored.location ||
-        stored.size !== metadata.size ||
-        stored.sha256 !== sha256
-      ) {
-        throw new Error(
-          'durable database export store returned mismatched committed integrity',
-        );
+      const source = createReadStream(temporaryLocation);
+      const sourceClosed = finished(source, { cleanup: true }).catch(
+        () => undefined,
+      );
+      try {
+        const stored = await this.#exportStore.write({
+          databaseId: database.id,
+          fileName,
+          body: Readable.toWeb(source) as ReadableStream<Uint8Array>,
+          contentLength: metadata.size,
+        });
+        if (
+          !stored.location ||
+          stored.size !== metadata.size ||
+          stored.sha256 !== sha256
+        ) {
+          throw new Error(
+            'durable database export store returned mismatched committed integrity',
+          );
+        }
+        return { location: stored.location, size: metadata.size, sha256 };
+      } finally {
+        source.destroy();
+        await sourceClosed;
       }
-      return { location: stored.location, size: metadata.size, sha256 };
     } finally {
       await rm(temporaryDirectory, { recursive: true, force: true });
     }
@@ -707,28 +715,35 @@ export class WranglerPlainWorkerProvisioningApi
         throw new Error('Wrangler database export changed while being hashed');
       }
       const expectedIntegrity = Promise.resolve(integrity);
-      const stored = await writeReceipt({
-        identity,
-        body: Readable.toWeb(
-          createReadStream(temporaryLocation),
-        ) as ReadableStream<Uint8Array>,
-        contentLength: integrity.size,
-        expectedIntegrity,
-      });
-      if (
-        !stored.location ||
-        stored.size !== integrity.size ||
-        stored.sha256 !== integrity.sha256
-      ) {
-        throw new Error(
-          'durable database export store returned mismatched committed integrity',
-        );
+      const source = createReadStream(temporaryLocation);
+      const sourceClosed = finished(source, { cleanup: true }).catch(
+        () => undefined,
+      );
+      try {
+        const stored = await writeReceipt({
+          identity,
+          body: Readable.toWeb(source) as ReadableStream<Uint8Array>,
+          contentLength: integrity.size,
+          expectedIntegrity,
+        });
+        if (
+          !stored.location ||
+          stored.size !== integrity.size ||
+          stored.sha256 !== integrity.sha256
+        ) {
+          throw new Error(
+            'durable database export store returned mismatched committed integrity',
+          );
+        }
+        return {
+          location: stored.location,
+          size: integrity.size,
+          sha256: integrity.sha256,
+        };
+      } finally {
+        source.destroy();
+        await sourceClosed;
       }
-      return {
-        location: stored.location,
-        size: integrity.size,
-        sha256: integrity.sha256,
-      };
     });
     const cleanup = await settleOperation(() =>
       rm(temporaryDirectory, { recursive: true, force: true }),

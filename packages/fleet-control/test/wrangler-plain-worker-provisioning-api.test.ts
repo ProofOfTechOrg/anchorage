@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { Readable } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
 import type { DurableDatabaseExportStore } from '../src/cloudflare-client.js';
 import { initialWorkerAttachmentScan } from '../src/cloudflare-worker-attachment-scan-state.js';
@@ -1610,6 +1611,71 @@ describe('WranglerPlainWorkerProvisioningApi exports', () => {
       subject.exportDatabase({ id: 'db', name: 'name' }, mutationFence()),
     ).rejects.toBe(storeError);
     await expectExportScratchRemoved(output());
+  });
+
+  it.each(
+    ['legacy', 'receipt'].flatMap((method) =>
+      ['sync', 'async', 'integrity'].flatMap((failure) =>
+        [false, true].map((locked) => ({ method, failure, locked })),
+      ),
+    ),
+  )('closes $method source after $failure refusal with locked=$locked', async ({
+    method,
+    failure,
+    locked,
+  }) => {
+    const primary = new Error('supplied store refused');
+    const sources: Readable[] = [];
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    const toWeb = Readable.toWeb;
+    const observe = vi
+      .spyOn(Readable, 'toWeb')
+      .mockImplementation((source, options) => {
+        sources.push(source);
+        return toWeb(source, options);
+      });
+    const write = (input: { readonly body: ReadableStream<Uint8Array> }) => {
+      if (locked) {
+        reader = input.body.getReader();
+        void reader.closed.catch(() => undefined);
+      }
+      if (failure === 'sync') throw primary;
+      if (failure === 'async') return Promise.reject(primary);
+      return Promise.resolve({
+        location: 'memory://invalid',
+        size: 0,
+        sha256: '0'.repeat(64),
+      });
+    };
+    try {
+      const { subject, output } = await exportSubject({
+        bytes: 'x'.repeat(1024 * 1024),
+        store: {
+          write,
+          receiptAuthority: RECEIPT_AUTHORITY,
+          writeReceipt: write,
+        },
+      });
+      const exportReceipt = subject.exportDatabaseReceipt;
+      if (!exportReceipt) throw new Error('expected receipt export capability');
+      const result =
+        method === 'legacy'
+          ? subject.exportDatabase({ id: 'db', name: 'name' }, mutationFence())
+          : exportReceipt(RECEIPT_IDENTITY, mutationFence());
+      if (failure === 'integrity') {
+        await expect(result).rejects.toThrow('mismatched committed integrity');
+      } else {
+        await expect(result).rejects.toBe(primary);
+      }
+      expect(sources).toHaveLength(1);
+      expect(sources[0]?.destroyed).toBe(true);
+      expect(sources[0]?.closed).toBe(true);
+      await expectExportScratchRemoved(output());
+    } finally {
+      reader?.releaseLock();
+      for (const source of sources) source.destroy();
+      observe.mockRestore();
+    }
   });
 
   it('returns the independent digest, size, location, and secure file mode', async () => {
