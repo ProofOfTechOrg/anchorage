@@ -858,7 +858,7 @@ describe('CloudflareProvisioningClient plain-worker plane', () => {
     }
   });
 
-  it('reads undefined-tolerant database and deployment facts', async () => {
+  it('refuses incomplete database identity and retains raw deployment facts', async () => {
     const fixture = recordingFetch(({ url }) => {
       const target = new URL(url);
       if (target.pathname.endsWith('/d1/database')) {
@@ -880,10 +880,9 @@ describe('CloudflareProvisioningClient plain-worker plane', () => {
       throw new Error(`unexpected request ${target.pathname}`);
     });
     const client = plainClient({ fetch: fixture.fetch });
-    await expect(client.listOrdinaryWorkerDatabases()).resolves.toEqual([
-      { databaseId: 'db', name: 'name' },
-      { databaseId: undefined, name: undefined },
-    ]);
+    await expect(client.listOrdinaryWorkerDatabases()).rejects.toThrow(
+      'D1 database inventory has an invalid uuid or name',
+    );
     await expect(
       client.ordinaryWorkerDeploymentStatus('plain'),
     ).resolves.toEqual({

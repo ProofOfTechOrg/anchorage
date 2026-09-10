@@ -342,15 +342,18 @@ export class PlainWorkerBackend implements ProvisioningBackend {
   ): Promise<DatabaseReference | undefined> {
     const listed = await this.#api.listDatabases({ name: spec.databaseName });
     // A name filter narrows the listing toward the name, so compare exactly.
-    const matches = listed.filter(
-      (database) => database.name === spec.databaseName,
-    );
+    const matches = listed.filter((database) => {
+      if (typeof database.name !== 'string' || !database.name)
+        throw new Error('D1 list result has no name');
+      return database.name === spec.databaseName;
+    });
     if (matches.length > 1) {
       throw new Error(`multiple D1 databases are named '${spec.databaseName}'`);
     }
     if (matches[0]) {
       const id = matches[0].databaseId;
-      if (!id) throw new Error('D1 list result has no uuid');
+      if (typeof id !== 'string' || !id)
+        throw new Error('D1 list result has no uuid');
       return { id, name: spec.databaseName, created: false };
     }
     return undefined;

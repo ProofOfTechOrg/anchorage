@@ -710,6 +710,105 @@ describe('advanceCloudflareFleetInventoryStage', () => {
     }
   });
 
+  it.each([
+    { id: 'ns-a' },
+    { script: 'anchorage-alpha' },
+    { id: '', script: 'anchorage-alpha' },
+    { id: 'ns-a', script: '' },
+  ])('refuses incomplete namespace association %# before or after a valid page', async (namespace) => {
+    for (const namespacePages of [
+      [[namespace]],
+      [[{ id: 'other', script: 'unrelated' }], [namespace]],
+    ]) {
+      const { deps } = harness({ namespacePages });
+      const stage = { step: 'do-namespaces' } as const;
+      await expect(
+        advanceCloudflareFleetInventoryStage(deps, {
+          stage,
+          options: EMPTY_OPTIONS,
+          progress: { ...initialProgress(EMPTY_OPTIONS), stage },
+          maxProviderRequests: 1_000,
+        }),
+      ).rejects.toThrow(/namespace/);
+    }
+  });
+
+  it.each([
+    { world: { scriptPages: [[{}]] }, reason: 'invalid ID' },
+    { world: { scriptPages: [[{ id: '' }]] }, reason: 'invalid ID' },
+    {
+      world: { domainPages: [[{ service: '', hostname: 'example.test' }]] },
+      reason: 'invalid service',
+    },
+    {
+      world: { domainPages: [[{ service: 'anchorage-alpha', hostname: '' }]] },
+      reason: 'invalid hostname',
+    },
+    {
+      world: {
+        zoneIds: ['z1'],
+        zoneRoutePages: {
+          z1: [[{ script: 'anchorage-alpha', pattern: 'example.test/*' }]],
+        },
+      },
+      reason: 'invalid ID or pattern',
+    },
+    {
+      world: {
+        zoneIds: ['z1'],
+        zoneRoutePages: { z1: [[{ script: 'anchorage-alpha', id: 'route' }]] },
+      },
+      reason: 'invalid ID or pattern',
+    },
+  ] satisfies {
+    world: World;
+    reason: string;
+  }[])('refuses incomplete provider identity before filtering %#', async ({
+    world,
+    reason,
+  }) => {
+    const { deps } = harness(world);
+    await expect(drive(deps, EMPTY_OPTIONS)).rejects.toThrow(reason);
+  });
+
+  it.each([
+    { name: 'anchorage-db-a' },
+    { uuid: 'db-a' },
+    { uuid: '', name: 'anchorage-db-a' },
+    { uuid: 'db-a', name: '' },
+  ])('refuses incomplete D1 identity before or after a valid page %#', async (row) => {
+    for (const databasePages of [
+      [[row]],
+      [[{ uuid: 'foreign', name: 'foreign' }], [row]],
+    ]) {
+      const { deps } = harness({ databasePages });
+      const stage = { step: 'd1-databases' } as const;
+      await expect(
+        advanceCloudflareFleetInventoryStage(deps, {
+          stage,
+          options: EMPTY_OPTIONS,
+          progress: { ...initialProgress(EMPTY_OPTIONS), stage },
+          maxProviderRequests: 1_000,
+        }),
+      ).rejects.toThrow(/D1/);
+    }
+  });
+
+  it('preserves unassigned routes in provider inventory', async () => {
+    const { deps } = harness({
+      zoneIds: ['z1'],
+      zoneRoutePages: {
+        z1: [
+          [
+            { id: 'unset', pattern: 'unset.example.test/*' },
+            { id: 'empty', pattern: 'empty.example.test/*', script: '' },
+          ],
+        ],
+      },
+    });
+    await expect(drive(deps, EMPTY_OPTIONS)).resolves.toBeDefined();
+  });
+
   it('finalizes an empty generation for an account with no host routing KV', async () => {
     const { deps, calls } = harness({
       domainPages: [[]],

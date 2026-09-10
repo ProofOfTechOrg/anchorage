@@ -34,20 +34,30 @@ import type {
 import type { CommandResult, CommandRunner } from './wrangler-runner.js';
 
 function parseJson(value: string, operation: string): unknown {
+  let parsed: unknown;
   try {
-    return JSON.parse(value);
+    parsed = JSON.parse(value);
   } catch (cause) {
     throw new Error(`wrangler ${operation} returned invalid JSON`, { cause });
   }
+  const success = readField(parsed, 'success');
+  const errors = readField(parsed, 'errors');
+  if (
+    (success !== undefined && success !== true) ||
+    (errors !== undefined && (!Array.isArray(errors) || errors.length !== 0))
+  )
+    throw new Error(`wrangler ${operation} returned a failed inventory result`);
+  return parsed;
 }
 
 function asArray(value: unknown): readonly unknown[] {
   if (Array.isArray(value)) return value;
   if (value && typeof value === 'object' && 'result' in value) {
-    const result = (value as { result?: unknown }).result;
-    return Array.isArray(result) ? result : result ? [result] : [];
+    const result = readField(value, 'result');
+    if (Array.isArray(result)) return result;
+    if (result && typeof result === 'object') return [result];
   }
-  return [];
+  throw new Error('Wrangler inventory result has an invalid list shape');
 }
 
 function isWranglerNotFound(error: unknown): boolean {
@@ -295,10 +305,13 @@ export class WranglerPlainWorkerProvisioningApi
     // The pinned Wrangler command has no name flag, so the adapter filters
     // the parsed inventory.
     return asArray(parseJson(listed.stdout, 'd1 list'))
-      .map((database) => ({
-        databaseId: readStringField(database, 'uuid'),
-        name: readStringField(database, 'name'),
-      }))
+      .map((database) => {
+        const databaseId = readStringField(database, 'uuid');
+        const name = readStringField(database, 'name');
+        if (!databaseId || !name)
+          throw new Error('D1 database inventory has an invalid uuid or name');
+        return { databaseId, name };
+      })
       .filter(
         (database) =>
           filter?.name === undefined || database.name === filter.name,
@@ -422,7 +435,7 @@ export class WranglerPlainWorkerProvisioningApi
       versionId: readVersionId(parsed),
       tag: versionTag(parsed),
       bindings: providerBindingsToPlainWorkerShape(
-        asArray(readField(resources, 'bindings')),
+        asArray(readField(resources, 'bindings') ?? []),
       ),
     };
   }

@@ -3241,3 +3241,438 @@ function activeRouteClient(
     },
   });
 }
+
+describe('inventory absence proofs', () => {
+  const readers = [
+    {
+      name: 'R2 emptiness',
+      path: '/client/v4/accounts/account/r2/buckets/bucket/objects',
+      read: (client: CloudflareProvisioningClient) =>
+        client.assertR2BucketEmpty({
+          name: 'DATA',
+          bucketName: 'bucket',
+          jurisdiction: 'default',
+        }),
+    },
+    {
+      name: 'namespace IDs',
+      path: '/client/v4/accounts/account/workers/durable_objects/namespaces',
+      read: (client: CloudflareProvisioningClient) =>
+        client.existingDurableObjectNamespaceIds(['target']),
+    },
+    {
+      name: 'namespace parent',
+      path: '/client/v4/accounts/account/workers/durable_objects/namespaces',
+      read: (client: CloudflareProvisioningClient) =>
+        client.listDurableObjectNamespaces('target-script'),
+    },
+  ];
+  function fixture(path: string, reply: (url: URL) => Response) {
+    const requests: URL[] = [];
+    const client = new CloudflareProvisioningClient({
+      plane: 'plain-worker',
+      accountId: 'account',
+      apiToken: 'inert',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (input, init) => {
+        const url = new URL(new Request(input, init).url);
+        expect(url.pathname).toBe(path);
+        requests.push(url);
+        return reply(url);
+      },
+    });
+    return { client, requests };
+  }
+  const malformed = [
+    { label: 'missing result', body: { success: true } },
+    { label: 'missing success', body: { result: [] } },
+    { label: 'failed success', body: { success: false, result: [] } },
+    { label: 'null result', body: { success: true, result: null } },
+    { label: 'false result', body: { success: true, result: false } },
+    { label: 'string result', body: { success: true, result: 'invalid' } },
+    {
+      label: 'error metadata',
+      body: { success: true, result: [], errors: [{ code: 1 }] },
+    },
+    {
+      label: 'continuing empty page',
+      body: { success: true, result: [], result_info: { cursor: 'next' } },
+    },
+    {
+      label: 'invalid cursor',
+      body: { success: true, result: [], result_info: { cursor: 1 } },
+    },
+    {
+      label: 'invalid page info',
+      body: { success: true, result: [], result_info: [] },
+    },
+  ];
+  it.each(
+    readers.flatMap((reader) =>
+      malformed.map((input) => ({ ...reader, ...input })),
+    ),
+  )('$name refuses $label', async ({ path, read, body }) => {
+    const { client } = fixture(path, (url) =>
+      Number(url.searchParams.get('page') ?? '1') > 1
+        ? envelope([])
+        : Response.json(body),
+    );
+    await expect(read(client)).rejects.toThrow();
+  });
+  it.each(
+    readers,
+  )('$name accepts a successful empty list and preserves permission failure', async ({
+    path,
+    read,
+    name,
+  }) => {
+    const empty = fixture(path, () => envelope([]));
+    expect(await read(empty.client)).toEqual(
+      name === 'R2 emptiness' ? undefined : [],
+    );
+    const denied = fixture(path, () =>
+      Response.json({ success: false, errors: [{ code: 1 }] }, { status: 403 }),
+    );
+    await expect(read(denied.client)).rejects.toMatchObject({ status: 403 });
+  });
+  it.each(
+    readers,
+  )('$name rejects non-JSON and partial success responses', async ({
+    path,
+    read,
+  }) => {
+    for (const response of [
+      new Response('{"success":true,"result":[]}', {
+        headers: { 'Content-Type': 'text/plain' },
+      }),
+      Response.json({ success: true, result: [] }, { status: 206 }),
+    ]) {
+      const { client } = fixture(path, () => response);
+      await expect(read(client)).rejects.toThrow();
+    }
+  });
+  it.each([
+    {},
+    { key: '' },
+    { key: null },
+    { key: 0 },
+    { key: 'present' },
+    null,
+  ])('R2 refuses a yielded row %#', async (row) => {
+    const reader = readers[0];
+    if (!reader) throw new Error('missing R2 reader');
+    const { client } = fixture(reader.path, () => envelope([row]));
+    await expect(reader.read(client)).rejects.toThrow();
+  });
+  it.each([
+    {},
+    { id: '' },
+    { id: null },
+    { id: 1 },
+  ])('namespace readers refuse incomplete IDs %#', async (row) => {
+    for (const reader of readers.slice(1)) {
+      const { client } = fixture(reader.path, (url) =>
+        Number(url.searchParams.get('page') ?? '1') > 1
+          ? envelope([])
+          : envelope([{ ...row, script: 'target-script' }]),
+      );
+      await expect(reader.read(client)).rejects.toThrow();
+    }
+  });
+  it.each([
+    undefined,
+    '',
+    null,
+    1,
+  ])('parent reader refuses incomplete association %#', async (script) => {
+    const reader = readers[2];
+    if (!reader) throw new Error('missing parent reader');
+    const { client } = fixture(reader.path, (url) =>
+      Number(url.searchParams.get('page') ?? '1') > 1
+        ? envelope([])
+        : envelope([{ id: 'target', script }]),
+    );
+    await expect(reader.read(client)).rejects.toThrow();
+  });
+  it('retains exact ID membership without requiring an unused parent association', async () => {
+    const reader = readers[1];
+    if (!reader) throw new Error('missing ID reader');
+    const { client } = fixture(reader.path, (url) =>
+      Number(url.searchParams.get('page') ?? '1') > 1
+        ? envelope([])
+        : envelope([{ id: 'target' }]),
+    );
+    expect(await reader.read(client)).toEqual(['target']);
+  });
+  it.each(readers.slice(1))('$name refuses a malformed later page', async ({
+    path,
+    read,
+  }) => {
+    const { client, requests } = fixture(path, (url) =>
+      Number(url.searchParams.get('page') ?? '1') === 1
+        ? envelope([{ id: 'other', script: 'other' }])
+        : Response.json({ success: true }),
+    );
+    await expect(read(client)).rejects.toThrow();
+    expect(requests).toHaveLength(2);
+  });
+  it.each(
+    readers
+      .slice(1)
+      .flatMap((reader) => [1, 2].map((gap) => ({ ...reader, gap }))),
+  )('$name refuses a numbered gap on page $gap', async ({
+    path,
+    read,
+    gap,
+  }) => {
+    const { client, requests } = fixture(path, (url) => {
+      const page = Number(url.searchParams.get('page') ?? '1');
+      const result =
+        page < gap
+          ? [{ id: 'other', script: 'other' }]
+          : page === gap
+            ? []
+            : [{ id: 'target', script: 'target-script' }];
+      return Response.json({
+        success: true,
+        result,
+        result_info: { page, per_page: 1, total_pages: gap + 1 },
+      });
+    });
+    await expect(read(client)).rejects.toThrow();
+    expect(requests).toHaveLength(gap);
+  });
+  it.each(readers.slice(1))('$name completes numbered pagination', async ({
+    path,
+    read,
+  }) => {
+    const { client, requests } = fixture(path, (url) => {
+      const page = Number(url.searchParams.get('page') ?? '1');
+      return Response.json({
+        success: true,
+        result:
+          page === 1
+            ? [{ id: 'other', script: 'other' }]
+            : page === 2
+              ? [{ id: 'target', script: 'target-script' }]
+              : [],
+        result_info: { page, per_page: 1, total_count: 2, total_pages: 2 },
+      });
+    });
+    expect(await read(client)).toEqual(['target']);
+    expect(
+      requests.map((url) => Number(url.searchParams.get('page') ?? '1')),
+    ).toEqual([1, 2, 3]);
+  });
+});
+
+describe('inventory proof consumers', () => {
+  it.each([
+    { name: 'target' },
+    { uuid: '', name: 'target' },
+    { uuid: 42, name: 'target' },
+    { uuid: 'database' },
+    { uuid: 'database', name: '' },
+    { uuid: 'database', name: 42 },
+  ])('D1 readers refuse incomplete identities %#', async (row) => {
+    for (const read of [
+      (client: CloudflareProvisioningClient) => client.findDatabase('target'),
+      (client: CloudflareProvisioningClient) =>
+        client.listOrdinaryWorkerDatabases({ name: 'target' }),
+    ]) {
+      const client = new CloudflareProvisioningClient({
+        plane: 'plain-worker',
+        accountId: 'account',
+        apiToken: 'inert',
+        rateCoordinator: testRateCoordinator(),
+        fetch: async (input, init) => {
+          const page = Number(
+            new URL(new Request(input, init).url).searchParams.get('page') ??
+              '1',
+          );
+          return envelope(page === 1 ? [row] : []);
+        },
+      });
+      await expect(read(client)).rejects.toThrow(/D1/);
+    }
+  });
+  it.each([
+    {},
+    { namespace_name: '' },
+    { namespace_name: 42 },
+  ])('refuses unknown namespace identity before creating %#', async (row) => {
+    const writes: string[] = [];
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'inert',
+      dispatchNamespace: 'fleet',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (input, init) => {
+        const request = new Request(input, init);
+        const url = new URL(request.url);
+        if (request.method !== 'GET') writes.push(request.method);
+        if (url.pathname.endsWith('/namespaces') && request.method === 'GET')
+          return envelope(
+            Number(url.searchParams.get('page') ?? '1') === 1 ? [row] : [],
+          );
+        return envelope({
+          namespace_name: 'fleet',
+          trusted_workers: false,
+          script_count: 0,
+        });
+      },
+    });
+    await expect(
+      fenced(client, () => client.ensureDispatchNamespace()),
+    ).rejects.toThrow(/namespace/);
+    expect(writes).toEqual([]);
+  });
+  const secretReaders = [
+    {
+      name: 'ordinary read',
+      run: (client: CloudflareProvisioningClient) =>
+        client.listOrdinaryWorkerSecretNames('worker'),
+    },
+    {
+      name: 'control revoke',
+      run: (client: CloudflareProvisioningClient) =>
+        client.revokeControlSecrets('worker'),
+    },
+    {
+      name: 'control convergence',
+      run: (client: CloudflareProvisioningClient) =>
+        client.putControlSecrets('worker', {}),
+    },
+    {
+      name: 'dispatch revoke',
+      run: (client: CloudflareProvisioningClient) =>
+        client.revokeDispatchSecrets('worker'),
+    },
+    {
+      name: 'dispatch convergence',
+      run: (client: CloudflareProvisioningClient) =>
+        client.putDispatchSecrets('worker', {
+          deploymentIdentity: 'identity',
+          maintenanceAdmin: 'maintenance',
+        }),
+    },
+  ];
+  it.each(
+    secretReaders.flatMap((reader) =>
+      [undefined, [{ name: 42 }], [{}]].map((result) => ({
+        ...reader,
+        result,
+      })),
+    ),
+  )('$name rejects incomplete secret inventory %#', async ({ run, result }) => {
+    const writes: string[] = [];
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'inert',
+      dispatchNamespace: 'fleet',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (input, init) => {
+        const request = new Request(input, init);
+        if (request.method !== 'GET') writes.push(request.method);
+        return Response.json({ success: true, result });
+      },
+    });
+    await expect(
+      fenced(client, async () => {
+        await run(client);
+      }),
+    ).rejects.toThrow();
+    expect(writes).toEqual([]);
+  });
+  it.each(
+    secretReaders.slice(1),
+  )('$name refuses incomplete post-mutation readback', async ({ run }) => {
+    let reads = 0;
+    let writes = 0;
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'inert',
+      dispatchNamespace: 'fleet',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (input, init) => {
+        const request = new Request(input, init);
+        if (request.method !== 'GET') {
+          writes++;
+          return envelope(null);
+        }
+        return ++reads === 1
+          ? envelope([{ name: 'OLD_SECRET' }])
+          : Response.json({ success: true });
+      },
+    });
+    await expect(
+      fenced(client, async () => {
+        await run(client);
+      }),
+    ).rejects.toThrow();
+    expect(writes).toBe(1);
+    expect(reads).toBe(2);
+  });
+  it.each([
+    '/workers/scripts',
+    '/workers/domains',
+    '/zones',
+    '/workers/routes',
+  ])('footprint refuses an incomplete %s listing', async (suffix) => {
+    const client = new CloudflareProvisioningClient({
+      plane: 'plain-worker',
+      accountId: 'account',
+      apiToken: 'inert',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (input, init) => {
+        const url = new URL(new Request(input, init).url);
+        if (url.pathname.endsWith(suffix))
+          return Response.json({ success: true });
+        return zoneAuthorityResponse(url, ['zone-1'], []) ?? envelope([]);
+      },
+    });
+    await expect(
+      client.inspectOrdinaryWorkerFootprint('worker'),
+    ).rejects.toThrow();
+  });
+  it.each([
+    undefined,
+    {},
+    { items: null },
+    [],
+  ])('version inventory refuses missing items %#', async (result) => {
+    const client = new CloudflareProvisioningClient({
+      plane: 'plain-worker',
+      accountId: 'account',
+      apiToken: 'inert',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async () => Response.json({ success: true, result }),
+    });
+    await expect(client.listOrdinaryWorkerVersions('worker')).rejects.toThrow();
+  });
+  it.each([
+    { suffix: '/workers/scripts', row: {} },
+    { suffix: '/workers/scripts', row: { id: 42 } },
+    { suffix: '/workers/domains', row: {} },
+    { suffix: '/workers/domains', row: { service: 42 } },
+    { suffix: '/workers/routes', row: { script: 42 } },
+  ])('footprint refuses missing identity or association %#', async ({
+    suffix,
+    row,
+  }) => {
+    const client = new CloudflareProvisioningClient({
+      plane: 'plain-worker',
+      accountId: 'account',
+      apiToken: 'inert',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (input, init) => {
+        const url = new URL(new Request(input, init).url);
+        if (url.pathname.endsWith(suffix)) return envelope([row]);
+        return zoneAuthorityResponse(url, ['zone-1'], []) ?? envelope([]);
+      },
+    });
+    await expect(
+      client.inspectOrdinaryWorkerFootprint('worker'),
+    ).rejects.toThrow();
+  });
+});

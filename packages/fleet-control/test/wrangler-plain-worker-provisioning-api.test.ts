@@ -197,6 +197,49 @@ describe('WranglerPlainWorkerProvisioningApi parsing', () => {
     expect(runner.calls).toEqual([{ arguments: ['d1', 'list', '--json'] }]);
   });
 
+  it.each([
+    [{ name: 'target' }],
+    [{ uuid: '', name: 'target' }],
+    [{ uuid: 42, name: 'target' }],
+    [{ uuid: 'id' }],
+    [{ uuid: 'id', name: '' }],
+    [{ uuid: 'id', name: 42 }],
+  ])('refuses incomplete D1 identity before local filtering %#', async (row) => {
+    const subject = await api(
+      new FakeRunner(async () => ({
+        stdout: JSON.stringify([row]),
+        stderr: '',
+      })),
+    );
+    await expect(subject.listDatabases({ name: 'target' })).rejects.toThrow(
+      /D1/,
+    );
+  });
+
+  it.each([
+    null,
+    false,
+    {},
+    { result: null },
+    { result: false },
+    { success: false, result: [] },
+    { success: false, result: { versions: [] } },
+    { errors: [{}], result: { versions: [] } },
+    { errors: [{}], result: [] },
+  ])('refuses malformed complete inventory shapes %#', async (result) => {
+    const subject = await api(
+      new FakeRunner(async () => ({
+        stdout: JSON.stringify(result),
+        stderr: '',
+      })),
+    );
+    await expect(subject.listDatabases()).rejects.toThrow(/inventory/);
+    await expect(subject.listVersions('worker')).rejects.toThrow(/inventory/);
+    await expect(subject.deploymentStatus('worker')).rejects.toThrow(
+      /inventory/,
+    );
+  });
+
   it('rejects invalid JSON with the operation name', async () => {
     const subject = await api(
       new FakeRunner(async () => ({ stdout: '{', stderr: '' })),

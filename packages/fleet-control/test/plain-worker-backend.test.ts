@@ -775,6 +775,17 @@ describe('PlainWorkerBackend core policy', () => {
     );
   });
 
+  it.each([
+    undefined,
+    '',
+  ])('refuses a D1 row without a usable name: %s', async (name) => {
+    const api = new PlainWorkerProvisioningApiFake();
+    vi.spyOn(api, 'listDatabases').mockResolvedValue([
+      { databaseId: 'database', name },
+    ]);
+    await expect(backend(api).findDatabase(spec)).rejects.toThrow(/D1.*name/);
+  });
+
   it('selects an exact database name from search-like inventory', async () => {
     const api = new PlainWorkerProvisioningApiFake();
     api.databases.set('database-1', {
