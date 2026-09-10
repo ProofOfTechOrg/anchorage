@@ -29,7 +29,10 @@ import { directFixtureManifest } from './direct-credentialed-config.js';
 import { maintenanceResponder, providerWorld } from './provider-world.js';
 
 export async function createDirectReferenceHarness(
-  policy: Readonly<{ maintenanceNow?: () => number }> = {},
+  policy: Readonly<{
+    maintenanceNow?: () => number;
+    applicationFetch?: (request: CloudflareFixtureRequest) => Promise<Response>;
+  }> = {},
 ) {
   const manifest = directFixtureManifest();
   const roles = ['a', 'b', 'recovery'] as const;
@@ -99,6 +102,15 @@ export async function createDirectReferenceHarness(
   }
   const projection = recordingFetch(async (request) => {
     const url = new URL(request.url);
+    if (
+      policy.applicationFetch &&
+      specs.some(
+        (candidate) => url.origin === `https://${candidate.routeHostname}`,
+      ) &&
+      (url.pathname === '/__direct/health' ||
+        url.pathname === '/__direct/object')
+    )
+      return policy.applicationFetch(request);
     const spec = specs.find(
       (candidate) => candidate.maintenanceBaseUrl === url.origin,
     );

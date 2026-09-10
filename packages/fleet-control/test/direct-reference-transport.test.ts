@@ -7,6 +7,10 @@ import { fileURLToPath } from 'node:url';
 import Cloudflare from 'cloudflare';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createTestHarness, type TestHarness } from 'wrangler';
+import {
+  directDeploymentSpec,
+  generateDirectDeploymentSecrets,
+} from '../scripts/direct-credentialed-spec.js';
 import { DIRECT_REFERENCE_PATH } from '../scripts/direct-reference-contract.mjs';
 import { handleDirectReferenceHttpRequest } from '../scripts/direct-reference-http.js';
 import {
@@ -14,6 +18,13 @@ import {
   DirectReferenceTransport,
   type DirectReferenceTransportOptions,
 } from '../scripts/direct-reference-transport.js';
+import { probeDirectTenant } from '../scripts/direct-reference-worker.js';
+import { deploymentSpecDigest } from '../src/spec-digest.js';
+import type { FleetRecord } from '../src/types.js';
+import {
+  DIRECT_FIXTURE_PROVIDER,
+  directFixtureManifest,
+} from './fixtures/direct-credentialed-config.js';
 
 const runtime = {
   requestTimeoutMs: 1000,
@@ -35,19 +46,22 @@ function fixture(overrides: Partial<DirectReferenceTransportOptions> = {}) {
 }
 
 describe('direct reference transport', () => {
-  it('shares concurrent provider/maintenance counts and permits the last allowed attempt', async () => {
+  it('shares concurrent provider, maintenance and application attempts', async () => {
     const { transport, nativeFetch } = fixture();
     await Promise.all(
       Array.from({ length: 9 }, (_, i) =>
-        (i % 2 ? transport.maintenanceFetch : transport.providerFetch)(
-          'https://fixture.test',
-        ),
+        (i % 3 === 0
+          ? transport.providerFetch
+          : i % 3 === 1
+            ? transport.maintenanceFetch
+            : transport.applicationFetch)('https://fixture.test'),
       ),
     );
     expect(nativeFetch).toHaveBeenCalledTimes(9);
     expect(transport.snapshot()).toMatchObject({
-      providerAttempts: 5,
-      maintenanceAttempts: 4,
+      providerAttempts: 3,
+      maintenanceAttempts: 3,
+      applicationAttempts: 3,
       failure: null,
     });
     expect(() => transport.assertWithinBudget()).not.toThrow();
@@ -56,6 +70,9 @@ describe('direct reference transport', () => {
     ).rejects.toMatchObject({ code: 'budget-exhausted' });
     await expect(
       transport.providerFetch('https://fixture.test'),
+    ).rejects.toMatchObject({ code: 'budget-exhausted' });
+    await expect(
+      transport.applicationFetch('https://fixture.test'),
     ).rejects.toMatchObject({ code: 'budget-exhausted' });
     expect(nativeFetch).toHaveBeenCalledTimes(9);
     expect(transport.snapshot().failure).toBe('attempts');
@@ -404,5 +421,215 @@ describe('direct reference transport inside workerd', () => {
       aborted: true,
       metrics: { maintenanceAttempts: 1, failure: null },
     });
+  });
+});
+
+describe('fixed tenant probe transport', () => {
+  const manifest = directFixtureManifest();
+  const secrets = generateDirectDeploymentSecrets();
+  const spec = directDeploymentSpec(
+    manifest,
+    'a',
+    'initial',
+    secrets,
+    DIRECT_FIXTURE_PROVIDER,
+  );
+  const record: FleetRecord = {
+    tenantTag: spec.tenantTag,
+    environment: spec.environment,
+    backend: 'plain-worker',
+    scriptName: spec.scriptName,
+    databaseId: 'fixture-database',
+    databaseName: spec.databaseName,
+    schemaVersion: spec.schemaVersion,
+    desiredSpecDigest: deploymentSpecDigest(spec),
+    artifactVersion: 'fixture-version',
+    durableObjectBindings: [],
+    routeHostname: spec.routeHostname,
+    phase: 'ready',
+    updatedAt: '2026-09-10T00:00:00.000Z',
+  };
+  function probe(
+    response: Response,
+    options: Partial<DirectReferenceTransportOptions> = {},
+  ) {
+    const state = fixture(options);
+    state.nativeFetch.mockResolvedValue(response);
+    const context: Parameters<typeof probeDirectTenant>[0] = {
+      transport: state.transport,
+      control: { getDeployment: async () => record },
+      roleFor: () => 'a',
+      specFor: () => spec,
+      secrets: () => secrets,
+    };
+    return {
+      ...state,
+      context,
+      run: (
+        operation: 'health' | 'object-put' | 'object-read' | 'object-delete',
+      ) =>
+        probeDirectTenant(
+          context,
+          manifest,
+          { kind: 'tenant-probe', role: 'a', operation },
+          state.abort.signal,
+        ),
+    };
+  }
+  it.each([
+    {
+      operation: 'health' as const,
+      facts: { release: '1', marker: 'initial' },
+    },
+    { operation: 'health' as const, facts: { release: '2', marker: null } },
+    { operation: 'object-read' as const, facts: { present: false } },
+    {
+      operation: 'object-read' as const,
+      facts: { present: true, size: 29, sha256: 'a'.repeat(64) },
+    },
+  ])('projects bounded $operation facts without exposing its token', async ({
+    operation,
+    facts,
+  }) => {
+    const state = probe(Response.json(facts));
+    const result = await state.run(operation);
+    expect(result).toEqual({ role: 'a', operation, ...facts });
+    expect(JSON.stringify(result)).not.toContain(
+      secrets.application?.APP_PROBE_TOKEN,
+    );
+    const input = state.nativeFetch.mock.calls[0]?.[0];
+    if (!(input instanceof Request)) throw new Error('missing probe request');
+    expect(input.url).toBe(
+      `https://${spec.routeHostname}/__direct/${operation === 'health' ? 'health' : 'object'}`,
+    );
+    expect(input.method).toBe('GET');
+    expect(input.headers.get('authorization')).toBe(
+      `Bearer ${secrets.application?.APP_PROBE_TOKEN}`,
+    );
+    expect(state.transport.snapshot()).toMatchObject({
+      providerAttempts: 0,
+      maintenanceAttempts: 0,
+      applicationAttempts: 1,
+    });
+  });
+  it.each([
+    'object-put',
+    'object-delete',
+  ] as const)('uses the fixed %s request and empty acknowledgement', async (operation) => {
+    const state = probe(new Response(null, { status: 204 }));
+    expect(await state.run(operation)).toEqual({
+      role: 'a',
+      operation,
+      returned: true,
+    });
+    const input = state.nativeFetch.mock.calls[0]?.[0];
+    if (!(input instanceof Request)) throw new Error('missing probe request');
+    expect(input.method).toBe(operation === 'object-put' ? 'POST' : 'DELETE');
+    expect(input.body).toBeNull();
+    const incorrect = probe(Response.json({ returned: true }));
+    await expect(incorrect.run(operation)).rejects.toMatchObject({
+      code: 'operation-refused',
+    });
+    const unexpectedBytes = probe(
+      new Response(null, {
+        status: 204,
+        headers: { 'content-length': '1' },
+      }),
+    );
+    await expect(unexpectedBytes.run(operation)).rejects.toMatchObject({
+      code: 'operation-refused',
+    });
+  });
+  it.each([
+    () => Response.json({ release: 1, marker: 'initial' }),
+    () =>
+      Response.json({
+        release: '1',
+        marker: 'initial',
+        extra: 'private-sentinel',
+      }),
+    () => Response.json({ release: '1', marker: 'private-sentinel' }),
+    () =>
+      new Response('{', { headers: { 'content-type': 'application/json' } }),
+    () =>
+      new Response(new Uint8Array([255]), {
+        headers: { 'content-type': 'application/json' },
+      }),
+    () =>
+      new Response('x'.repeat(1025), {
+        headers: { 'content-type': 'application/json' },
+      }),
+    () => new Response('{}', { headers: { 'content-type': 'text/plain' } }),
+    () => Response.json({ secret: 'private-sentinel' }, { status: 503 }),
+  ])('refuses malformed or incomplete health responses %#', async (response) => {
+    const state = probe(response());
+    await expect(state.run('health')).rejects.toMatchObject({
+      message: 'operation-refused',
+    });
+  });
+  it.each([
+    { present: true },
+    { present: true, size: 0, sha256: 'a'.repeat(64) },
+    { present: true, size: 29, sha256: 'A'.repeat(64) },
+    { present: false, size: 0 },
+  ])('refuses malformed object observations %#', async (facts) => {
+    const state = probe(Response.json(facts));
+    await expect(state.run('object-read')).rejects.toMatchObject({
+      code: 'operation-refused',
+    });
+  });
+  it('requires the selected current record and retained token before dispatch', async () => {
+    const state = probe(Response.json({ release: '1', marker: 'initial' }));
+    state.context.control.getDeployment = async () => undefined;
+    await expect(state.run('health')).rejects.toMatchObject({
+      code: 'operation-refused',
+    });
+    state.context.control.getDeployment = async () => record;
+    vi.spyOn(state.context, 'secrets').mockReturnValue({
+      ...secrets,
+      application: {},
+    });
+    await expect(state.run('health')).rejects.toMatchObject({
+      code: 'operation-refused',
+    });
+    expect(state.nativeFetch).not.toHaveBeenCalled();
+  });
+  it('keeps timeout cancellation attached until the response body settles', async () => {
+    let cancelled = false;
+    let release: (() => void) | undefined;
+    const cancellation = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const body = new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelled = true;
+        return cancellation;
+      },
+    });
+    const state = probe(
+      new Response(body, { headers: { 'content-type': 'application/json' } }),
+      {
+        runtime: { ...runtime, requestTimeoutMs: 15 },
+      },
+    );
+    let settled = false;
+    const pending = state.run('health').then(
+      (result) => {
+        settled = true;
+        return { result };
+      },
+      (error: unknown) => {
+        settled = true;
+        return { error };
+      },
+    );
+    try {
+      await vi.waitFor(() => expect(cancelled).toBe(true));
+      expect(settled).toBe(false);
+    } finally {
+      release?.();
+    }
+    expect(await pending).toHaveProperty('error');
+    expect(state.transport.snapshot().applicationAttempts).toBe(1);
   });
 });

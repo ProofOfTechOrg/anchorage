@@ -21,6 +21,7 @@ export interface DirectReferenceTransportOptions {
 export interface DirectReferenceTransportSnapshot {
   readonly providerAttempts: number;
   readonly maintenanceAttempts: number;
+  readonly applicationAttempts: number;
   readonly effectiveRequestTimeoutMs: number;
   readonly failure: 'deadline' | 'attempts' | 'aborted' | null;
 }
@@ -34,6 +35,7 @@ export class DirectReferenceTransport {
   readonly effectiveRequestTimeoutMs: number;
   #providerAttempts = 0;
   #maintenanceAttempts = 0;
+  #applicationAttempts = 0;
   #failure: DirectReferenceTransportSnapshot['failure'] = null;
 
   constructor(options: DirectReferenceTransportOptions) {
@@ -71,6 +73,9 @@ export class DirectReferenceTransport {
   readonly maintenanceFetch: typeof fetch = (input, init) =>
     this.#send('maintenance', input, init);
 
+  readonly applicationFetch: typeof fetch = (input, init) =>
+    this.#send('application', input, init);
+
   #fail(
     reason: NonNullable<DirectReferenceTransportSnapshot['failure']>,
   ): void {
@@ -94,13 +99,14 @@ export class DirectReferenceTransport {
     return Object.freeze({
       providerAttempts: this.#providerAttempts,
       maintenanceAttempts: this.#maintenanceAttempts,
+      applicationAttempts: this.#applicationAttempts,
       effectiveRequestTimeoutMs: this.effectiveRequestTimeoutMs,
       failure: this.#failure,
     });
   }
 
   async #send(
-    kind: 'provider' | 'maintenance',
+    kind: 'provider' | 'maintenance' | 'application',
     input: Parameters<typeof fetch>[0],
     init: Parameters<typeof fetch>[1],
   ): Promise<Response> {
@@ -118,7 +124,9 @@ export class DirectReferenceTransport {
       throw new DirectReferenceExecutionError();
     this.assertWithinBudget();
     if (
-      this.#providerAttempts + this.#maintenanceAttempts >=
+      this.#providerAttempts +
+        this.#maintenanceAttempts +
+        this.#applicationAttempts >=
       this.#maxAttempts
     ) {
       this.#fail('attempts');
@@ -142,7 +150,8 @@ export class DirectReferenceTransport {
     this.assertWithinBudget();
     signal.throwIfAborted();
     if (kind === 'provider') this.#providerAttempts++;
-    else this.#maintenanceAttempts++;
+    else if (kind === 'maintenance') this.#maintenanceAttempts++;
+    else this.#applicationAttempts++;
     const response = await this.#nativeFetch(request, {
       signal,
       redirect: 'manual',

@@ -19,6 +19,11 @@ export type DirectInventorySlot = 'inventory-before' | 'inventory-after';
 export type DirectAuditSlot = 'audit-before' | 'audit-after';
 export type DirectReferenceAction =
   | Readonly<{
+      kind: 'tenant-probe';
+      role: DirectFixtureRole;
+      operation: 'health' | 'object-put' | 'object-read' | 'object-delete';
+    }>
+  | Readonly<{
       kind:
         | 'control-read'
         | 'migration-start'

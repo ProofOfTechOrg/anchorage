@@ -43,6 +43,10 @@ const actions: readonly DirectReferenceAction[] = [
   { kind: 'decommission-restart-blocked', role: 'recovery', token: [] },
   { kind: 'force-recovery' },
   { kind: 'force-observe' },
+  { kind: 'tenant-probe', role: 'a', operation: 'health' },
+  { kind: 'tenant-probe', role: 'b', operation: 'object-put' },
+  { kind: 'tenant-probe', role: 'recovery', operation: 'object-read' },
+  { kind: 'tenant-probe', role: 'a', operation: 'object-delete' },
 ];
 
 function request(body: NonNullable<RequestInit['body']>) {
@@ -117,6 +121,10 @@ describe('direct reference request contract', () => {
     { kind: 'cleanup-start', role: 'other' },
     { kind: 'decommission-continue' },
     { kind: 'force-recovery', role: 'a' },
+    { kind: 'tenant-probe', role: 'a' },
+    { kind: 'tenant-probe', role: 'other', operation: 'health' },
+    { kind: 'tenant-probe', role: 'a', operation: 'other' },
+    { kind: 'tenant-probe', role: 'a', operation: null },
   ])('refuses an invalid action %j', async (action) => {
     await expect(read(action)).rejects.toBeInstanceOf(
       DirectReferenceRequestError,

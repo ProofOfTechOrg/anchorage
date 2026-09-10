@@ -31,6 +31,7 @@ import {
   DIRECT_FIXTURE_PROVIDER,
   directFixtureManifest,
 } from './fixtures/direct-credentialed-config.js';
+import { createDirectReferenceHarness } from './fixtures/direct-reference-harness.js';
 
 const manifest = directFixtureManifest();
 const secrets = generateDirectDeploymentSecrets();
@@ -246,6 +247,151 @@ describe.sequential('direct tenant fixture in workerd', {
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ live: false });
   });
+
+  it('runs retained-token reference probes through the native tenant across reloads', async () => {
+    const forwarded: {
+      url: string;
+      method: string;
+      authorization: string | null;
+    }[] = [];
+    const reference = await createDirectReferenceHarness({
+      applicationFetch: async (request) => {
+        expect(request.body === undefined || request.body === '').toBe(true);
+        forwarded.push({
+          url: request.url,
+          method: request.method,
+          authorization: request.headers.get('authorization'),
+        });
+        return worker.fetch(request.url, {
+          method: request.method,
+          headers: [...request.headers],
+        });
+      },
+    });
+    const work = await Promise.allSettled([
+      (async () => {
+        const probeSpec = reference.specs.find(
+          (spec) => spec.tenantTag === initial.tenantTag,
+        );
+        const token = reference.secrets.a.application?.APP_PROBE_TOKEN;
+        if (!probeSpec || !token)
+          throw new Error('reference fixture role is missing');
+        expect(probeSpec.routeHostname).toBe(initial.routeHostname);
+        const active = options('1', token);
+        const configuration = active.workers[0]?.config;
+        if (!configuration)
+          throw new Error('test Worker configuration is missing');
+        const databaseId = configuration.d1_databases[0]?.database_id;
+        if (!databaseId) throw new Error('native tenant database is missing');
+        await server.update(active);
+        worker = server.getWorker<HarnessBindings>();
+        await reference.fleetStore.withDeploymentLease(
+          probeSpec.tenantTag,
+          probeSpec.environment,
+          (lease) =>
+            lease.put({
+              tenantTag: probeSpec.tenantTag,
+              environment: probeSpec.environment,
+              backend: 'plain-worker',
+              scriptName: probeSpec.scriptName,
+              databaseId,
+              databaseName: probeSpec.databaseName,
+              schemaVersion: probeSpec.schemaVersion,
+              desiredSpecDigest: deploymentSpecDigest(probeSpec),
+              artifactVersion: 'native-probe-fixture',
+              durableObjectBindings: [],
+              routeHostname: probeSpec.routeHostname,
+              phase: 'ready',
+              updatedAt: new Date().toISOString(),
+            }),
+        );
+        const action = (
+          operation: 'health' | 'object-put' | 'object-read' | 'object-delete',
+        ) => ({ kind: 'tenant-probe', role: 'a', operation }) as const;
+        expect(await reference.success(action('health'))).toEqual({
+          role: 'a',
+          operation: 'health',
+          release: '1',
+          marker: 'initial',
+        });
+        const put = await reference.call(action('object-put'));
+        expect(reference.bridgeErrors).toEqual([]);
+        expect(put.value).toEqual({
+          contractVersion: 1,
+          configSha256: reference.manifest.configSha256,
+          action: 'tenant-probe',
+          ok: true,
+          result: { role: 'a', operation: 'object-put', returned: true },
+        });
+        expect(put.response.headers.get('X-Direct-Application-Attempts')).toBe(
+          '1',
+        );
+        expect(put.response.headers.get('X-Direct-Provider-Attempts')).toBe(
+          '0',
+        );
+        expect(put.response.headers.get('X-Direct-Maintenance-Attempts')).toBe(
+          '0',
+        );
+        const expected = {
+          role: 'a',
+          operation: 'object-read',
+          present: true,
+          size: Buffer.byteLength('direct-conformance-fixture-data'),
+          sha256: createHash('sha256')
+            .update('direct-conformance-fixture-data')
+            .digest('hex'),
+        };
+        expect(await reference.success(action('object-read'))).toEqual(
+          expected,
+        );
+        await reference.reload();
+        expect(await reference.success(action('object-read'))).toEqual(
+          expected,
+        );
+        await server.update(active);
+        worker = server.getWorker<HarnessBindings>();
+        expect(await reference.success(action('object-read'))).toEqual(
+          expected,
+        );
+        await reference.success(action('object-delete'));
+        expect(await reference.success(action('object-read'))).toEqual({
+          role: 'a',
+          operation: 'object-read',
+          present: false,
+        });
+        expect(forwarded.length).toBeGreaterThan(0);
+        for (const request of forwarded) {
+          expect(request.authorization).toBe(`Bearer ${token}`);
+          expect(new URL(request.url).origin).toBe(
+            `https://${initial.routeHostname}`,
+          );
+        }
+        expect(JSON.stringify(put.value)).not.toContain(token);
+        await server.update(options('1', 'wrong-token'));
+        worker = server.getWorker<HarnessBindings>();
+        expect((await reference.call(action('health'))).value).toEqual({
+          contractVersion: 1,
+          ok: false,
+          error: { code: 'operation-refused' },
+        });
+      })(),
+    ]);
+    const cleanup = await Promise.allSettled([
+      reference.close(),
+      (async () => {
+        await server.update(options('1'));
+        worker = server.getWorker<HarnessBindings>();
+        await (await worker.getEnv()).PROBE_BUCKET.delete(
+          'direct-conformance-fixture',
+        );
+      })(),
+    ]);
+    const failures = [...work, ...cleanup].flatMap((result) =>
+      result.status === 'rejected' ? [result.reason] : [],
+    );
+    if (failures.length)
+      throw new AggregateError(failures, 'native probe or cleanup failed');
+  }, 60_000);
 
   it('writes fixed R2 bytes and retains them across reload and additive D1 migration', async () => {
     expect(

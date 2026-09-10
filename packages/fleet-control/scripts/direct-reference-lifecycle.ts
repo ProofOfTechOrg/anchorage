@@ -26,9 +26,9 @@ import {
 } from './direct-reference-journal.js';
 import { recordDirectResource } from './direct-reference-observations.js';
 
-type LifecycleAction = Extract<
-  DirectReferenceAction,
-  { role: DirectFixtureRole }
+type LifecycleAction = Exclude<
+  Extract<DirectReferenceAction, { role: DirectFixtureRole }>,
+  { kind: 'tenant-probe' }
 >;
 type CleanupSlot = `cleanup-${DirectFixtureRole}` | 'cleanup-recovery-initial';
 

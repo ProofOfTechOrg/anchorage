@@ -56,6 +56,16 @@ function actionFromParsed(value) {
     case 'force-observe':
       keys(value, ['kind']);
       break;
+    case 'tenant-probe':
+      keys(value, ['kind', 'role', 'operation']);
+      member(value.role, ['a', 'b', 'recovery']);
+      member(value.operation, [
+        'health',
+        'object-put',
+        'object-read',
+        'object-delete',
+      ]);
+      break;
     case 'provision':
       keys(value, ['kind', 'role', 'release']);
       member(value.role, ['a', 'b', 'recovery']);
