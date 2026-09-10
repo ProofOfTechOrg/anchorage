@@ -487,7 +487,6 @@ describe.sequential('direct lifecycle through native control state', {
   it('does not provision again from prepared history with no observable result', async () => {
     const spec = fixture.specs[1];
     if (!spec) throw new Error('fixture b specification is missing');
-    const { deploymentSpecDigest } = await import('../src/spec-digest.js');
     await fixture.journal().freezeStart('cleanup-b', async () => ({
       operationId: null,
       inputJson: JSON.stringify({

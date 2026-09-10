@@ -354,8 +354,7 @@ export async function createDirectReferenceContext(
       transport.assertWithinBudget();
       const authority = `r2://${binding.exportBucketName}/${manifest.resourcePrefix}/receipts/v1`;
       if (
-        !identity ||
-        identity.version !== 1 ||
+        identity?.version !== 1 ||
         identity.authority !== authority ||
         typeof identity.databaseId !== 'string' ||
         !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(
