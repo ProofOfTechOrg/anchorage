@@ -8,7 +8,13 @@ import type {
   R2Bucket,
   FixedLengthStream as WorkerFixedLengthStream,
 } from '@cloudflare/workers-types';
-import { D1FleetInventoryRunStore } from '@proofoftech/fleet-control';
+import {
+  CloudflareApiPlainWorkerBackend,
+  CloudflareProvisioningClient,
+  D1CloudflareApiRateCoordinator,
+  D1FleetInventoryRunStore,
+  D1FleetStateStore,
+} from '@proofoftech/fleet-control';
 import {
   type CloudflareControlPlane,
   type CloudflareDeploymentSpec,
@@ -60,6 +66,12 @@ export interface DirectReferenceContext {
   readonly journal: DirectReferenceJournal;
   readonly inventoryStore: D1FleetInventoryRunStore;
   readonly transport: DirectReferenceTransport;
+  readonly createForcePlane: () => Readonly<{
+    store: D1FleetStateStore;
+    client: CloudflareProvisioningClient;
+    backend: CloudflareApiPlainWorkerBackend;
+  }>;
+  readonly recoveryClaimSetPresent: () => Promise<boolean>;
   readonly roleFor: (record: FleetRecord) => DirectFixtureRole;
   readonly spec: (
     role: DirectFixtureRole,
@@ -330,6 +342,45 @@ export async function createDirectReferenceContext(
     journal,
     inventoryStore,
     transport,
+    createForcePlane() {
+      transport.assertWithinBudget();
+      const store = new D1FleetStateStore(
+        new D1FleetStateDatabase(environment.FLEET_DB),
+        { accountId: binding.accountId, ...DIRECT_REFERENCE_LEASE },
+      );
+      const rateCoordinator = new D1CloudflareApiRateCoordinator(
+        environment.QUOTA_DB,
+        { quotaScope: manifest.resourcePrefix },
+      );
+      const client = new CloudflareProvisioningClient({
+        accountId: binding.accountId,
+        apiToken,
+        plane: 'plain-worker',
+        rateCoordinator,
+        requestTimeoutMs: transport.effectiveRequestTimeoutMs,
+        fetch: transport.providerFetch,
+      });
+      const backend = new CloudflareApiPlainWorkerBackend({
+        client,
+        fetch: transport.maintenanceFetch,
+        maintenanceRequestTimeoutMs: transport.effectiveRequestTimeoutMs,
+      });
+      return { store, client, backend };
+    },
+    async recoveryClaimSetPresent() {
+      transport.assertWithinBudget();
+      const row = await environment.FLEET_DB.prepare(
+        'SELECT EXISTS(SELECT 1 FROM anchorage_platform_plane_claims WHERE account_id=? AND resource_set_key=?) AS present',
+      )
+        .bind(
+          binding.accountId,
+          `deployment:${manifest.names.roles.recovery.tenantTag}:${manifest.environment}`,
+        )
+        .first<{ present: number }>();
+      transport.assertWithinBudget();
+      if (row?.present !== 0 && row?.present !== 1) refused();
+      return row.present === 1;
+    },
     roleFor,
     spec(role: DirectFixtureRole, release: DirectFixtureRelease) {
       return specs.get(role)?.get(release) ?? refused();

@@ -7,6 +7,10 @@ import {
   type DirectReferenceEnvironment,
 } from './direct-reference-context.js';
 import type { DirectReferenceAction } from './direct-reference-contract.mjs';
+import {
+  observeDirectForce,
+  recoverDirectForce,
+} from './direct-reference-force.js';
 import { handleDirectReferenceHttpRequest } from './direct-reference-http.js';
 import { dispatchDirectInventory } from './direct-reference-inventory.js';
 import type { DirectOperationSlot } from './direct-reference-journal.js';
@@ -64,8 +68,13 @@ async function dispatch(
       operations: operations.filter((value) => value !== undefined),
       records,
       interruption: await context.journal.readInterruption(),
+      forceBefore: await context.journal.readForceBefore(),
+      forceAfter: await context.journal.readForceAfter(),
     };
   }
+  if (action.kind === 'force-recovery')
+    return recoverDirectForce(context, manifest);
+  if (action.kind === 'force-observe') return observeDirectForce(context);
   if ('role' in action)
     return dispatchDirectLifecycle(context, manifest, action, signal);
   if (

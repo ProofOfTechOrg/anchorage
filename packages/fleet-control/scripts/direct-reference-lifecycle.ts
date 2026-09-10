@@ -132,6 +132,8 @@ async function provision(
   action: Extract<LifecycleAction, { kind: 'provision' }>,
 ) {
   const { role, release } = action;
+  if (role === 'recovery' && (await context.journal.readForceBefore()))
+    throw new DirectReferenceExecutionError();
   const names = manifest.names.roles[role];
   const slot = cleanupSlot(role, release);
   const stored = await context.journal.freezeStart(slot, async () => {

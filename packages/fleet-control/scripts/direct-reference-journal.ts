@@ -64,7 +64,11 @@ export interface DirectStoredResource extends DirectStoredObservation {
   readonly identitySha256: string;
 }
 
-type ObservationKind = 'resource' | 'settlement';
+type ObservationKind =
+  | 'resource'
+  | 'settlement'
+  | 'force-before'
+  | 'force-after';
 
 const MAX_JSON_BYTES = 256 * 1024;
 const schema = [
@@ -538,5 +542,41 @@ export class DirectReferenceJournal {
     return this.#withState(() =>
       this.#observation('settlement', sha256(settlementKey)),
     );
+  }
+
+  recordForceBefore(
+    identityJson: string,
+    provenanceJson: string,
+  ): Promise<DirectStoredObservation> {
+    return this.#withState(() =>
+      this.#recordObservation(
+        'force-before',
+        'recovery',
+        identityJson,
+        provenanceJson,
+      ),
+    );
+  }
+
+  readForceBefore(): Promise<DirectStoredObservation | undefined> {
+    return this.#withState(() => this.#observation('force-before', 'recovery'));
+  }
+
+  recordForceAfter(
+    identityJson: string,
+    provenanceJson: string,
+  ): Promise<DirectStoredObservation> {
+    return this.#withState(() =>
+      this.#recordObservation(
+        'force-after',
+        'recovery',
+        identityJson,
+        provenanceJson,
+      ),
+    );
+  }
+
+  readForceAfter(): Promise<DirectStoredObservation | undefined> {
+    return this.#withState(() => this.#observation('force-after', 'recovery'));
   }
 }

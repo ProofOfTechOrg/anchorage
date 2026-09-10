@@ -209,3 +209,302 @@ describe.sequential('direct lifecycle through native control state', {
     expect(fixture.bridgeErrors).toEqual([]);
   });
 });
+
+describe.sequential('private force through native control state', {
+  timeout: 180_000,
+}, () => {
+  async function readyRecovery(fixture: DirectReferenceHarness) {
+    const names = fixture.manifest.names.roles.recovery;
+    const environment = fixture.manifest.environment;
+    const failed = await fixture.success<{ cleanup: CleanupAdvanceResult }>({
+      kind: 'provision',
+      role: 'recovery',
+      release: 'failed-recovery',
+    });
+    let cleanup = failed.cleanup;
+    for (let count = 0; cleanup.status !== 'complete' && count < 150; count++) {
+      expect(cleanup.status).toBe('pending');
+      cleanup = await fixture.success<CleanupAdvanceResult>({
+        kind: 'cleanup-continue',
+        role: 'recovery',
+        token: cleanup.token,
+      });
+    }
+    if (cleanup.status !== 'complete')
+      throw new Error('force fixture cleanup did not complete');
+    const receipt = cleanup.receipt;
+    await fixture.success({
+      kind: 'provision',
+      role: 'recovery',
+      release: 'initial',
+    });
+    const ready = await fixture.fleetStore.get(names.tenantTag, environment);
+    if (!ready) throw new Error('fresh recovery record is missing');
+    expect(ready.phase).toBe('ready');
+    expect(
+      fixture.world.databases.some(
+        (database) => database.databaseId === ready.databaseId,
+      ),
+    ).toBe(true);
+    return { ready, receipt };
+  }
+
+  it('captures before the force phase write and retains the original witness across deletion failure and replay', async () => {
+    const fixture = await createDirectReferenceHarness();
+    try {
+      const names = fixture.manifest.names.roles.recovery;
+      const environment = fixture.manifest.environment;
+      const absent = await fixture.call({ kind: 'force-recovery' });
+      expect(absent.response.status).toBe(409);
+      expect(fixture.projection.requests).toEqual([]);
+      const { ready, receipt } = await readyRecovery(fixture);
+      const mutations = [...fixture.world.mutationLog];
+      await fixture.db.exec(
+        "CREATE TRIGGER refuse_force_witness BEFORE INSERT ON direct_reference_observations WHEN NEW.observation_kind='force-before' BEGIN SELECT RAISE(ABORT,'fixture force witness unavailable'); END",
+      );
+      try {
+        const refused = await fixture.call({ kind: 'force-recovery' });
+        expect(refused.response.status).toBe(500);
+        expect(
+          (await fixture.fleetStore.get(names.tenantTag, environment))?.phase,
+        ).toBe('ready');
+        expect(fixture.world.mutationLog).toEqual(mutations);
+        expect(await fixture.journal().readForceBefore()).toBeUndefined();
+      } finally {
+        await fixture.db.exec('DROP TRIGGER refuse_force_witness');
+      }
+      await fixture.db.exec(
+        "CREATE TRIGGER require_force_witness BEFORE UPDATE ON anchorage_fleet_deployments WHEN NEW.phase='decommissioning' AND NOT EXISTS(SELECT 1 FROM direct_reference_observations WHERE observation_kind='force-before') BEGIN SELECT RAISE(ABORT,'force phase precedes its witness'); END",
+      );
+      fixture.world.failNext('deleteDatabase', { dispatched: false });
+      const interrupted = await fixture.call({ kind: 'force-recovery' });
+      expect(interrupted.response.status).toBe(500);
+      expect(fixture.world.peekFailure('deleteDatabase')).toBeUndefined();
+      expect(
+        (await fixture.fleetStore.get(names.tenantTag, environment))?.phase,
+      ).toBe('database-deleting');
+      const before = await fixture.journal().readForceBefore();
+      if (!before) throw new Error('force before witness is missing');
+      expect(JSON.parse(before.provenanceJson)).toMatchObject({
+        phase: 'ready',
+        recordUpdatedAt: ready.updatedAt,
+      });
+      expect(JSON.parse(before.identityJson).priorCleanup.operationId).toBe(
+        receipt.operationId,
+      );
+      const exportCount = fixture.world.exports.size;
+      await fixture.reload();
+      expect(await fixture.success({ kind: 'force-recovery' })).toMatchObject({
+        returned: true,
+      });
+      expect(
+        await fixture.fleetStore.get(names.tenantTag, environment),
+      ).toBeUndefined();
+      expect(
+        fixture.world.databases.some(
+          (database) => database.databaseId === ready.databaseId,
+        ),
+      ).toBe(false);
+      expect(fixture.world.scripts.has(ready.scriptName)).toBe(true);
+      for (const resource of ready.applicationResources ?? [])
+        expect(
+          fixture.buckets.has(
+            `${resource.jurisdiction}:${resource.bucketName}`,
+          ),
+        ).toBe(true);
+      expect(
+        await fixture.fleetStore.readCleanupReceipt(receipt.operationId),
+      ).toEqual(receipt);
+      expect(await fixture.journal().readForceBefore()).toEqual(before);
+      expect(fixture.world.exports.size).toBe(exportCount);
+      const after = [...fixture.world.mutationLog];
+      await fixture.fleetStore.withDeploymentLease(
+        names.tenantTag,
+        environment,
+        (lease) =>
+          lease.put({
+            ...ready,
+            databaseId: '00000000-0000-4000-8000-000000000099',
+          }),
+      );
+      const beforeForeignReplay = fixture.projection.requests.length;
+      expect(
+        (await fixture.call({ kind: 'force-recovery' })).response.status,
+      ).toBe(409);
+      expect(fixture.projection.requests).toHaveLength(beforeForeignReplay);
+      expect(fixture.world.mutationLog).toEqual(after);
+      await fixture.fleetStore.withDeploymentLease(
+        names.tenantTag,
+        environment,
+        (lease) => {
+          if (!lease.deleteReleasingClaims)
+            throw new Error('fixture claim release is unavailable');
+          return lease.deleteReleasingClaims();
+        },
+      );
+      fixture.world.durableObjectNamespaces.push({
+        id: 'unrelated-namespace',
+        script: 'unrelated-script',
+        className: 'Other',
+      });
+      const footprint = await fixture.success<{
+        observation: Record<string, unknown>;
+        provenance: Record<string, unknown>;
+      }>({ kind: 'force-observe' });
+      const retainedScript = fixture.world.scripts.get(ready.scriptName);
+      if (!retainedScript) throw new Error('force removed the retained script');
+      expect(footprint.observation).toMatchObject({
+        version: 1,
+        role: 'recovery',
+        beforeIdentitySha256: JSON.parse(before.identityJson)
+          .beforeIdentitySha256,
+        fleetRecordPresent: false,
+        deploymentClaimsPresent: false,
+        database: {
+          id: ready.databaseId,
+          expectedName: ready.databaseName,
+          observedName: null,
+        },
+        worker: {
+          scriptName: ready.scriptName,
+          scriptPresent: true,
+          workersDevEnabled: false,
+          previewUrlsEnabled: false,
+          customDomains: [],
+          zoneRoutes: [],
+          currentSecretNames: [],
+          currentVersionIds: retainedScript.versions
+            .map((version) => version.versionId)
+            .sort(),
+          currentNamespaceIds: ready.durableObjectBindings
+            .map((binding) => binding.namespaceId)
+            .sort(),
+          survivingRecordedNamespaceIds: ready.durableObjectBindings
+            .map((binding) => binding.namespaceId)
+            .sort(),
+        },
+        priorCleanup: { operationId: receipt.operationId, matchesBefore: true },
+      });
+      expect(footprint.observation.buckets).toEqual(
+        (ready.applicationResources ?? [])
+          .map((resource) => ({
+            bindingName: resource.name,
+            bucketName: resource.bucketName,
+            jurisdiction: resource.jurisdiction,
+            expectedCreationDate: resource.creationDate,
+            observedCreationDate: resource.creationDate,
+          }))
+          .sort((a, b) => a.bindingName.localeCompare(b.bindingName)),
+      );
+      expect(fixture.world.mutationLog).toEqual(after);
+      const reads = fixture.projection.requests.length;
+      await fixture.reload();
+      expect(await fixture.success({ kind: 'force-observe' })).toEqual(
+        footprint,
+      );
+      expect(fixture.projection.requests).toHaveLength(reads);
+      expect(await fixture.success({ kind: 'force-recovery' })).toMatchObject({
+        returned: true,
+      });
+      expect(fixture.world.mutationLog).toEqual(after);
+      expect(
+        (
+          await fixture.call({
+            kind: 'provision',
+            role: 'recovery',
+            release: 'initial',
+          })
+        ).response.status,
+      ).toBe(409);
+      expect(fixture.world.mutationLog).toEqual(after);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it('leaves incomplete reads unrecorded and reports retained claims and changed resources independently', async () => {
+    const fixture = await createDirectReferenceHarness();
+    try {
+      const { ready, receipt } = await readyRecovery(fixture);
+      fixture.world.failNext('deleteDatabase', { dispatched: false });
+      expect(
+        (await fixture.call({ kind: 'force-recovery' })).response.status,
+      ).toBe(500);
+      expect(fixture.world.peekFailure('deleteDatabase')).toBeUndefined();
+      expect(await fixture.journal().readForceBefore()).toBeDefined();
+      const script = fixture.world.scripts.get(ready.scriptName);
+      const version = script?.versions[0];
+      if (!version)
+        throw new Error('force fixture has no recorded Worker version');
+      const descriptor = Object.getOwnPropertyDescriptor(version, 'versionId');
+      if (!descriptor)
+        throw new Error('force fixture version has no identifier');
+      Object.defineProperty(version, 'versionId', { value: undefined });
+      const mutations = [...fixture.world.mutationLog];
+      try {
+        expect(
+          (await fixture.call({ kind: 'force-observe' })).response.status,
+        ).toBe(500);
+        expect(await fixture.journal().readForceAfter()).toBeUndefined();
+        expect(fixture.world.mutationLog).toEqual(mutations);
+      } finally {
+        Object.defineProperty(version, 'versionId', descriptor);
+      }
+      await fixture.fleetStore.withDeploymentLease(
+        ready.tenantTag,
+        ready.environment,
+        (lease) => lease.delete(),
+      );
+      expect(
+        await fixture.fleetStore.get(ready.tenantTag, ready.environment),
+      ).toBeUndefined();
+      await fixture.fleetStore.pruneCleanupReceipts({
+        completedBeforeMs: Number.MAX_SAFE_INTEGER,
+        limit: 100,
+      });
+      expect(
+        await fixture.fleetStore.readCleanupReceipt(receipt.operationId),
+      ).toBeUndefined();
+      const resource = ready.applicationResources?.[0];
+      if (!resource) throw new Error('force fixture has no application bucket');
+      const bucket = fixture.buckets.get(
+        `${resource.jurisdiction}:${resource.bucketName}`,
+      );
+      if (!bucket) throw new Error('force fixture bucket is missing');
+      const originalCreationDate = bucket.creation_date;
+      bucket.creation_date = new Date(
+        Date.parse(originalCreationDate) + 1000,
+      ).toISOString();
+      const observed = await fixture.success<{
+        observation: Record<string, unknown>;
+      }>({ kind: 'force-observe' });
+      expect(observed.observation).toMatchObject({
+        fleetRecordPresent: false,
+        deploymentClaimsPresent: true,
+        database: { id: ready.databaseId, observedName: ready.databaseName },
+        buckets: [
+          {
+            bindingName: resource.name,
+            expectedCreationDate: originalCreationDate,
+            observedCreationDate: bucket.creation_date,
+          },
+        ],
+        priorCleanup: {
+          operationId: receipt.operationId,
+          observedReceiptSha256: null,
+          matchesBefore: false,
+        },
+      });
+      expect(fixture.world.mutationLog).toEqual(mutations);
+      bucket.creation_date = originalCreationDate;
+      const requests = fixture.projection.requests.length;
+      await fixture.reload();
+      expect(await fixture.success({ kind: 'force-observe' })).toEqual(
+        observed,
+      );
+      expect(fixture.projection.requests).toHaveLength(requests);
+    } finally {
+      await fixture.close();
+    }
+  });
+});

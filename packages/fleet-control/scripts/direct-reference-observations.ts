@@ -1,12 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { fleetSettlementKey } from '@proofoftech/fleet-control';
+import {
+  fleetSettlementKey,
+  type R2Jurisdiction,
+} from '@proofoftech/fleet-control';
 import {
   deploymentSpecDigest,
   type FleetRecord,
   type FleetSettlementHost,
 } from '@proofoftech/fleet-control/cloudflare-control-plane';
-import type { DirectFixtureRelease } from './direct-credentialed-spec.js';
+import type {
+  DirectFixtureRelease,
+  DirectFixtureRole,
+} from './direct-credentialed-spec.js';
 import type { DirectReferenceContext } from './direct-reference-context.js';
 import { DirectReferenceExecutionError } from './direct-reference-http.js';
 import type { DirectStoredResource } from './direct-reference-journal.js';
@@ -17,16 +23,42 @@ type ResourceSource =
   | 'teardown-read'
   | 'before-force';
 
+export interface DirectResourceIdentity {
+  readonly version: 1;
+  readonly role: DirectFixtureRole;
+  readonly backend: FleetRecord['backend'];
+  readonly tenantTag: string;
+  readonly environment: string;
+  readonly scriptName: string;
+  readonly database: Readonly<{ name: string; id: string | null }>;
+  readonly knownVersionIds: readonly string[];
+  readonly localNamespaces: readonly Readonly<{
+    name: string;
+    className: string;
+    namespaceId: string;
+  }>[];
+  readonly applicationBuckets: readonly Readonly<{
+    name: string;
+    bucketName: string;
+    jurisdiction: R2Jurisdiction;
+    reservationNonce: string;
+    creationDate: string | null;
+  }>[];
+}
+
 function compare(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-export async function recordDirectResource(
+export function directResourceObservation(
   context: DirectReferenceContext,
   record: FleetRecord,
   source: ResourceSource,
-): Promise<DirectStoredResource> {
-  context.transport.assertWithinBudget();
+): Readonly<{
+  role: DirectFixtureRole;
+  identityJson: string;
+  provenanceJson: string;
+}> {
   const role = context.roleFor(record);
   context.specFor(record);
   if (
@@ -43,7 +75,7 @@ export async function recordDirectResource(
       : admittedPhase === 'database-create-authorized'
         ? 'create-outcome-unresolved'
         : 'recorded';
-  const identity = {
+  const identity: DirectResourceIdentity = {
     version: 1,
     role,
     backend: record.backend,
@@ -91,10 +123,10 @@ export async function recordDirectResource(
       )
       .sort((left, right) => compare(left.name, right.name)),
   };
-  const stored = await context.journal.recordResource(
+  return {
     role,
-    JSON.stringify(identity),
-    JSON.stringify({
+    identityJson: JSON.stringify(identity),
+    provenanceJson: JSON.stringify({
       source,
       phase: record.phase,
       schemaVersion: record.schemaVersion,
@@ -106,6 +138,20 @@ export async function recordDirectResource(
         .map(({ name, state }) => ({ name, state }))
         .sort((left, right) => compare(left.name, right.name)),
     }),
+  };
+}
+
+export async function recordDirectResource(
+  context: DirectReferenceContext,
+  record: FleetRecord,
+  source: ResourceSource,
+): Promise<DirectStoredResource> {
+  context.transport.assertWithinBudget();
+  const observation = directResourceObservation(context, record, source);
+  const stored = await context.journal.recordResource(
+    observation.role,
+    observation.identityJson,
+    observation.provenanceJson,
   );
   context.transport.assertWithinBudget();
   return stored;

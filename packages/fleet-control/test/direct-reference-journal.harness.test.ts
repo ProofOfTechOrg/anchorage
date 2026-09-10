@@ -81,6 +81,42 @@ describe.sequential('direct reference journal in native D1', {
     return { runKey, journal: new DirectReferenceJournal(db, runKey, binding) };
   }
 
+  it.each([
+    'before',
+    'after',
+  ] as const)('retains the first force %s observation and refuses changed identity or purpose', async (phase) => {
+    const { runKey, journal } = fixture();
+    const write =
+      phase === 'before'
+        ? journal.recordForceBefore.bind(journal)
+        : journal.recordForceAfter.bind(journal);
+    const identity = '{"version":1,"resource":"original"}';
+    const first = await write(identity, '{"observedAt":1}');
+    expect(await write(identity, '{"observedAt":2}')).toEqual(first);
+    const reloaded = new DirectReferenceJournal(db, runKey, binding);
+    const read = () =>
+      phase === 'before'
+        ? reloaded.readForceBefore()
+        : reloaded.readForceAfter();
+    expect(await read()).toEqual(first);
+    await expect(
+      write('{"version":1,"resource":"replacement"}', '{}'),
+    ).rejects.toMatchObject({ code: 'journal-state' });
+    expect(await read()).toEqual(first);
+    const other = phase === 'before' ? 'after' : 'before';
+    await db
+      .prepare(
+        'UPDATE direct_reference_observations SET observation_kind=? WHERE run_key=? AND observation_kind=?',
+      )
+      .bind(`force-${other}`, runKey, `force-${phase}`)
+      .run();
+    await expect(
+      other === 'before'
+        ? reloaded.readForceBefore()
+        : reloaded.readForceAfter(),
+    ).rejects.toMatchObject({ code: 'journal-state' });
+  });
+
   it('retains first resource provenance and distinct incarnations across reload', async () => {
     const { runKey, journal } = fixture();
     const first = await journal.recordResource(
