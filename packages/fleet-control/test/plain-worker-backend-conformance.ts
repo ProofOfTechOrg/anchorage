@@ -118,6 +118,68 @@ export function describePlainWorkerConformance(
   makeHarness: (world?: ProviderWorld) => PlainWorkerHarness,
 ): void {
   describe(`ordinary Worker conformance: ${label}`, () => {
+    it('inspects a prior release and migrates changed variables, service and queue bindings', async () => {
+      const harness = makeHarness();
+      const currentSpec: DeploymentSpec = {
+        ...initialSpec(),
+        egressProxyService: 'initial-egress',
+        queueProducer: { binding: 'EVENTS', queueName: 'initial-events' },
+        application: {
+          vars: [{ name: 'RELEASE', value: 'initial' }],
+          secrets: [],
+          r2Buckets: [],
+        },
+      };
+      const targetSpec: DeploymentSpec = {
+        ...migrationSpec(),
+        egressProxyService: 'next-egress',
+        queueProducer: { binding: 'EVENTS', queueName: 'next-events' },
+        application: {
+          vars: [{ name: 'RELEASE', value: 'next' }],
+          secrets: [],
+          r2Buckets: [],
+        },
+      };
+      const initial = await provisionReady(harness, currentSpec);
+      const prior = await harness.backend.inspect(
+        targetSpec,
+        sharedSecrets.maintenanceAdmin,
+        undefined,
+      );
+      expect(prior).toMatchObject({
+        artifactVersion: initial.record.artifactVersion,
+        desiredSpecDigest: deploymentSpecDigest(currentSpec),
+        schemaVersion: currentSpec.schemaVersion,
+        plainTextBindings: { RELEASE: 'initial' },
+        serviceBindings: [{ name: 'EGRESS_PROXY', service: 'initial-egress' }],
+        queueProducerBindings: [
+          { name: 'EVENTS', queueName: 'initial-events' },
+        ],
+      });
+      expect(
+        harness.world.scripts.get(currentSpec.scriptName)?.versions,
+      ).toHaveLength(1);
+      const [migrated] = await migrate(harness, initial.record, targetSpec);
+      expect(migrated).toMatchObject({
+        phase: 'ready',
+        desiredSpecDigest: deploymentSpecDigest(targetSpec),
+      });
+      expect(
+        await harness.backend.inspect(
+          targetSpec,
+          sharedSecrets.maintenanceAdmin,
+          undefined,
+        ),
+      ).toMatchObject({
+        artifactVersion: migrated?.artifactVersion,
+        desiredSpecDigest: deploymentSpecDigest(targetSpec),
+        schemaVersion: targetSpec.schemaVersion,
+        plainTextBindings: { RELEASE: 'next' },
+        serviceBindings: [{ name: 'EGRESS_PROXY', service: 'next-egress' }],
+        queueProducerBindings: [{ name: 'EVENTS', queueName: 'next-events' }],
+      });
+    });
+
     it('1. provisions an initial deployment to ready with one guarded live version', async () => {
       const harness = makeHarness();
       const spec = buildPlainWorkerSpec();

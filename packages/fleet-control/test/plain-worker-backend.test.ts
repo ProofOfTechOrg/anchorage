@@ -201,6 +201,59 @@ function maintenanceResponse(digest = deploymentSpecDigest(spec)): Response {
   });
 }
 
+describe('inspection across release bindings', () => {
+  const target: DeploymentSpec = {
+    ...spec,
+    egressProxyService: 'next-egress',
+    queueProducer: { binding: 'EVENTS', queueName: 'next-events' },
+    application: {
+      vars: [{ name: 'RELEASE', value: 'next' }],
+      secrets: [],
+      r2Buckets: [],
+    },
+  };
+  const releaseBindings: PlainWorkerVersionDetail['bindings'] = [
+    { type: 'service', name: 'EGRESS_PROXY', service: 'next-egress' },
+    { type: 'queue-producer', name: 'EVENTS', queueName: 'next-events' },
+    { type: 'plain-text', name: 'RELEASE', value: 'next' },
+  ];
+
+  it.each([
+    'EGRESS_PROXY',
+    'EVENTS',
+    'RELEASE',
+  ])('rejects target-digest %s drift through candidate and active discovery', async (missing) => {
+    for (const selection of ['tag', 'explicit', 'fallback'] as const) {
+      const api = new PlainWorkerProvisioningApiFake();
+      const version = ownedVersion('target', target);
+      api.versions.set(target.scriptName, [
+        {
+          ...version,
+          tag: selection === 'fallback' ? 'unmatched-tag' : version.tag,
+          bindings: [
+            ...version.bindings,
+            ...releaseBindings.filter(({ name }) => name !== missing),
+          ],
+        },
+      ]);
+      api.deployments.set(target.scriptName, {
+        versions: [{ versionId: 'target', percentage: 100 }],
+      });
+      const request = vi.fn(async () =>
+        maintenanceResponse(deploymentSpecDigest(target)),
+      );
+      await expect(
+        backend(api, { fetch: request }).inspect(
+          target,
+          secrets.maintenanceAdmin,
+          selection === 'explicit' ? 'target' : undefined,
+        ),
+      ).rejects.toThrow('different resource mapping');
+      expect(request).not.toHaveBeenCalled();
+    }
+  });
+});
+
 function fleetRecord(): FleetRecord {
   return {
     tenantTag: spec.tenantTag,

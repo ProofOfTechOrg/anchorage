@@ -1681,6 +1681,7 @@ export class PlainWorkerBackend implements ProvisioningBackend {
       )
       .sort((left, right) => left.name.localeCompare(right.name));
     const plainText = this.#plainTextBindings(version);
+    const desiredSpecDigest = plainText.get('FLEET_SPEC_DIGEST');
     const expectedServiceBindings = spec.egressProxyService
       ? [{ name: 'EGRESS_PROXY', service: spec.egressProxyService }]
       : [];
@@ -1696,13 +1697,14 @@ export class PlainWorkerBackend implements ProvisioningBackend {
       databaseIds.length !== 1 ||
       plainText.get('DEPLOYMENT_TENANT') !== spec.tenantTag ||
       plainText.get('FLEET_ENVIRONMENT') !== spec.environment ||
-      JSON.stringify(serviceBindings) !==
-        JSON.stringify(expectedServiceBindings) ||
-      JSON.stringify(queueProducerBindings) !==
-        JSON.stringify(expectedQueueProducerBindings) ||
-      canonicalApplicationBindings(spec).vars.some(
-        ({ name, value }) => plainText.get(name) !== value,
-      )
+      (desiredSpecDigest === deploymentSpecDigest(spec) &&
+        (JSON.stringify(serviceBindings) !==
+          JSON.stringify(expectedServiceBindings) ||
+          JSON.stringify(queueProducerBindings) !==
+            JSON.stringify(expectedQueueProducerBindings) ||
+          canonicalApplicationBindings(spec).vars.some(
+            ({ name, value }) => plainText.get(name) !== value,
+          )))
     ) {
       throw new Error(
         `script '${spec.scriptName}' has a different resource mapping`,
@@ -1711,7 +1713,6 @@ export class PlainWorkerBackend implements ProvisioningBackend {
     const databaseId = databaseIds[0];
     if (!databaseId) throw new Error('D1 binding has no database id');
     const schemaVersion = Number(plainText.get('FLEET_SCHEMA_VERSION'));
-    const desiredSpecDigest = plainText.get('FLEET_SPEC_DIGEST');
     if (
       !Number.isSafeInteger(schemaVersion) ||
       !desiredSpecDigest ||
