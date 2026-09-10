@@ -42,6 +42,7 @@ import {
   validateExternalPlatformProfile,
 } from './platform-resources.js';
 import {
+  assertCompleteWorkerPublicAccess,
   assertProviderBindingIdentitiesMatchInspection,
   assertSupportedPlainWorkerBindings,
 } from './provider-binding-inventory.js';
@@ -2445,6 +2446,7 @@ export class WorkersForPlatformsBackendSwitchProvider
     const footprint = await this.#client.inspectOrdinaryWorkerFootprint(
       input.prior.scriptName,
     );
+    assertCompleteWorkerPublicAccess(footprint);
     if (live ? !footprint.scriptPresent : footprint.scriptPresent) {
       throw new Error(
         'refusing to mutate backend-switch traffic with an inconsistent ordinary Worker footprint',
@@ -2555,6 +2557,7 @@ export class WorkersForPlatformsBackendSwitchProvider
       this.#client.listCustomDomains(),
       this.#client.inspectOrdinaryWorkerFootprint(input.prior.scriptName),
     ]);
+    assertCompleteWorkerPublicAccess(footprint);
     if (
       route !== undefined ||
       domains.some((domain) => domain.service === input.prior.scriptName) ||

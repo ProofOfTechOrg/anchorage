@@ -185,6 +185,274 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe('CloudflareProvisioningClient subdomain ingress proof', () => {
+  function fixture(reply: () => Response, present = true) {
+    const world = providerWorld();
+    world.seedScript('plain', {
+      present,
+      versions: [
+        {
+          versionId: 'v1',
+          tag: undefined,
+          bindings: [
+            { type: 'plain_text', name: 'DEPLOYMENT_TENANT', text: 'acme' },
+            {
+              type: 'plain_text',
+              name: 'FLEET_ENVIRONMENT',
+              text: 'production',
+            },
+            { type: 'plain_text', name: 'FLEET_SCHEMA_VERSION', text: '1' },
+          ],
+          mainModule: 'worker.js',
+          modules: [{ name: 'worker.js', content: 'export default {}' }],
+        },
+      ],
+      deployment: [{ versionId: 'v1', percentage: 100 }],
+      subdomain: { enabled: true, previewsEnabled: true },
+    });
+    const project = restProjection(world);
+    const transport = recordingFetch((request) => {
+      const url = new URL(request.url);
+      if (request.method === 'GET' && url.pathname.endsWith('/subdomain'))
+        return reply();
+      return zoneAuthorityResponse(url, []) ?? project(request);
+    });
+    return {
+      client: plainClient({ fetch: transport.fetch }),
+      subdomainReads: () =>
+        transport.requests.filter(
+          ({ method, url }) =>
+            method === 'GET' && new URL(url).pathname.endsWith('/subdomain'),
+        ),
+    };
+  }
+
+  const readers = [
+    {
+      name: 'footprint',
+      read: (client: CloudflareProvisioningClient) =>
+        client.inspectOrdinaryWorkerFootprint('plain'),
+    },
+    {
+      name: 'disable readback',
+      read: (client: CloudflareProvisioningClient) =>
+        client.disableOrdinaryWorkerPublicAccess('plain', {
+          mutationLeaseTtlMs: 15 * 60_000,
+          assertOwned: async () => {},
+        }),
+    },
+    {
+      name: 'control inspection',
+      read: (client: CloudflareProvisioningClient) =>
+        client.inspectControlWorker('plain'),
+    },
+  ] as const;
+  const malformed = [
+    { label: 'missing flags', reply: () => single({}) },
+    {
+      label: 'missing enabled',
+      reply: () => single({ previews_enabled: false }),
+    },
+    {
+      label: 'missing previews',
+      reply: () => single({ enabled: false }),
+    },
+    {
+      label: 'null enabled',
+      reply: () => single({ enabled: null, previews_enabled: false }),
+    },
+    {
+      label: 'numeric enabled',
+      reply: () => single({ enabled: 0, previews_enabled: false }),
+    },
+    {
+      label: 'string enabled',
+      reply: () => single({ enabled: 'false', previews_enabled: false }),
+    },
+    {
+      label: 'null previews',
+      reply: () => single({ enabled: false, previews_enabled: null }),
+    },
+    {
+      label: 'string previews',
+      reply: () => single({ enabled: false, previews_enabled: 'false' }),
+    },
+    {
+      label: 'numeric previews',
+      reply: () => single({ enabled: false, previews_enabled: 0 }),
+    },
+    {
+      label: 'missing result',
+      reply: () => Response.json({ success: true }),
+    },
+    { label: 'null result', reply: () => single(null) },
+    { label: 'array result', reply: () => single([]) },
+    {
+      label: 'failed envelope',
+      reply: () =>
+        Response.json({
+          success: false,
+          result: { enabled: false, previews_enabled: false },
+        }),
+    },
+    {
+      label: 'missing success',
+      reply: () =>
+        Response.json({ result: { enabled: false, previews_enabled: false } }),
+    },
+    {
+      label: 'error metadata',
+      reply: () =>
+        Response.json({
+          success: true,
+          errors: [{ code: 1000 }],
+          result: { enabled: false, previews_enabled: false },
+        }),
+    },
+    {
+      label: 'non-array errors',
+      reply: () =>
+        Response.json({
+          success: true,
+          errors: null,
+          result: { enabled: false, previews_enabled: false },
+        }),
+    },
+    {
+      label: 'non-JSON media',
+      reply: () =>
+        new Response(
+          '{"success":true,"result":{"enabled":false,"previews_enabled":false}}',
+          { headers: { 'content-type': 'text/plain' } },
+        ),
+    },
+    {
+      label: 'partial success',
+      reply: () =>
+        Response.json(
+          {
+            success: true,
+            result: { enabled: false, previews_enabled: false },
+          },
+          { status: 206 },
+        ),
+    },
+  ];
+
+  it.each(
+    readers.flatMap((reader) =>
+      malformed.map((response) => ({ ...reader, ...response })),
+    ),
+  )('$name refuses $label', async ({ read, reply }) => {
+    const { client, subdomainReads } = fixture(reply);
+    await expect(read(client)).rejects.toThrow();
+    expect(subdomainReads()).toHaveLength(1);
+  });
+
+  it.each([
+    { enabled: false, previews_enabled: false },
+    { enabled: true, previews_enabled: false },
+    { enabled: false, previews_enabled: true },
+    { enabled: true, previews_enabled: true },
+  ])('preserves explicit ingress flags %j', async (flags) => {
+    const { client } = fixture(() => single(flags));
+    const expected = {
+      workersDevEnabled: flags.enabled,
+      previewUrlsEnabled: flags.previews_enabled,
+    };
+    await expect(
+      client.inspectOrdinaryWorkerFootprint('plain'),
+    ).resolves.toMatchObject({
+      scriptPresent: true,
+      ...expected,
+    });
+    await expect(client.inspectControlWorker('plain')).resolves.toMatchObject(
+      expected,
+    );
+    const disabled = readers[1].read(client);
+    if (flags.enabled || flags.previews_enabled)
+      await expect(disabled).rejects.toThrow();
+    else await expect(disabled).resolves.toBeUndefined();
+  });
+
+  it.each(readers)('$name preserves a real subdomain 404', async ({
+    name,
+    read,
+  }) => {
+    const { client, subdomainReads } = fixture(() => apiFailure(404));
+    if (name === 'footprint')
+      await expect(read(client)).rejects.toMatchObject({ status: 404 });
+    else await expect(read(client)).resolves.toBeUndefined();
+    expect(subdomainReads()).toHaveLength(1);
+  });
+
+  it.each(readers)('$name preserves permission failure', async ({ read }) => {
+    const { client } = fixture(() => apiFailure(403));
+    await expect(read(client)).rejects.toMatchObject({ status: 403 });
+  });
+
+  it.each(
+    readers,
+  )('$name preserves an absent Worker without reading subdomain flags', async ({
+    name,
+    read,
+  }) => {
+    const { client, subdomainReads } = fixture(() => {
+      throw new Error('absent Worker must not read subdomain flags');
+    }, false);
+    if (name === 'footprint')
+      await expect(read(client)).resolves.toMatchObject({
+        scriptPresent: false,
+      });
+    else await expect(read(client)).resolves.toBeUndefined();
+    expect(subdomainReads()).toEqual([]);
+  });
+
+  it.each([
+    { label: 'missing flags', reply: () => single({}) },
+    { label: 'missing result', reply: () => Response.json({ success: true }) },
+    {
+      label: 'nonboolean flags',
+      reply: () => single({ enabled: 'false', previews_enabled: 0 }),
+    },
+    {
+      label: 'failed envelope',
+      reply: () =>
+        Response.json({
+          success: false,
+          result: { enabled: false, previews_enabled: false },
+        }),
+    },
+  ])('R3 records unavailable detail for $label', async ({ reply }) => {
+    const { client, subdomainReads } = fixture(reply);
+    const inventory = await client.collectFleetInventory({
+      databaseNamePrefix: 'fleet-',
+      scriptNamePrefix: 'plain',
+      includeDispatchNamespace: false,
+    });
+    expect(subdomainReads().length).toBeGreaterThan(0);
+    expect(inventory.deployments).toEqual([]);
+    expect(inventory.findings).toContainEqual(
+      expect.objectContaining({ kind: 'incomplete-deployment' }),
+    );
+  });
+
+  it('R3 retains an inventoried deployment with explicit disabled flags', async () => {
+    const { client } = fixture(() =>
+      single({ enabled: false, previews_enabled: false }),
+    );
+    const inventory = await client.collectFleetInventory({
+      databaseNamePrefix: 'fleet-',
+      scriptNamePrefix: 'plain',
+      includeDispatchNamespace: false,
+    });
+    expect(inventory.deployments).toMatchObject([
+      { scriptName: 'plain', artifactVersion: 'v1' },
+    ]);
+    expect(inventory.findings).toEqual([]);
+  });
+});
+
 describe('CloudflareProvisioningClient plain-worker plane', () => {
   it('a queued mutation asserts its own lease', async () => {
     const response = deferred<Response>();

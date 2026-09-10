@@ -17,7 +17,10 @@ import { isSha256 } from './deployment-context.js';
 import { WorkerDeploymentError } from './deployment-error.js';
 import { maintenanceUrl, readMaintenanceHealth } from './maintenance-health.js';
 import { applyMigrationsWithLedger } from './migration-ledger.js';
-import { assertSupportedPlainWorkerBindings } from './provider-binding-inventory.js';
+import {
+  assertCompleteWorkerPublicAccess,
+  assertSupportedPlainWorkerBindings,
+} from './provider-binding-inventory.js';
 import { deploymentSpecDigest } from './spec-digest.js';
 import type {
   ActiveRouteAttestation,
@@ -1925,6 +1928,7 @@ export class PlainWorkerBackend implements ProvisioningBackend {
         this.#api.inspectOrdinaryWorkerFootprint(record.scriptName),
         this.#api.listCustomDomains(),
       ]);
+      assertCompleteWorkerPublicAccess(footprint);
       if (
         footprint.customDomains.length > 0 ||
         footprint.zoneRoutes.length > 0 ||
@@ -2024,6 +2028,7 @@ export class PlainWorkerBackend implements ProvisioningBackend {
     const footprint = await this.#api.inspectOrdinaryWorkerFootprint(
       spec.scriptName,
     );
+    assertCompleteWorkerPublicAccess(footprint);
     if (
       footprint.customDomains.length > 0 ||
       footprint.zoneRoutes.length > 0 ||

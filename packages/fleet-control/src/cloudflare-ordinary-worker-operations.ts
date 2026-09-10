@@ -183,6 +183,49 @@ type OrdinaryWorkerCollectContext = Pick<
   'accountId' | 'inventoryClient' | 'collectBounded'
 >;
 
+export async function ordinaryWorkerSubdomain(
+  context: Pick<OrdinaryWorkerContext, 'accountId' | 'client'>,
+  scriptName: string,
+): Promise<Readonly<{ enabled: boolean; previews_enabled: boolean }>> {
+  const response = await context.client.workers.scripts.subdomain
+    .get(scriptName, { account_id: context.accountId })
+    .asResponse();
+  const media = response.headers
+    .get('content-type')
+    ?.split(';')[0]
+    ?.trim()
+    .toLowerCase();
+  if (
+    response.status !== 200 ||
+    !(media === 'application/json' || media?.endsWith('+json'))
+  ) {
+    void response.body?.cancel().catch(() => undefined);
+    throw new Error(
+      `ordinary Worker '${scriptName}' returned incomplete public-access metadata`,
+    );
+  }
+  const body: unknown = await response.json();
+  const result = readField(body, 'result');
+  const errors = readField(body, 'errors');
+  const enabled = readField(result, 'enabled');
+  const previews = readField(result, 'previews_enabled');
+  if (
+    readField(body, 'success') !== true ||
+    (errors !== undefined && (!Array.isArray(errors) || errors.length !== 0)) ||
+    !result ||
+    typeof result !== 'object' ||
+    Array.isArray(result) ||
+    !Object.hasOwn(result, 'enabled') ||
+    !Object.hasOwn(result, 'previews_enabled') ||
+    typeof enabled !== 'boolean' ||
+    typeof previews !== 'boolean'
+  )
+    throw new Error(
+      `ordinary Worker '${scriptName}' returned incomplete public-access metadata`,
+    );
+  return { enabled, previews_enabled: previews };
+}
+
 export async function listOrdinaryWorkerSecretNames(
   context: OrdinaryWorkerPagedContext,
   scriptName: string,
@@ -454,9 +497,7 @@ export async function dispatchOrdinaryWorkerUpload(
       });
       return;
     }
-    const current = await subdomain.get(intent.scriptName, {
-      account_id: context.accountId,
-    });
+    const current = await ordinaryWorkerSubdomain(context, intent.scriptName);
     if (
       current.enabled !== intent.publicAccess.workersDevEnabled ||
       current.previews_enabled !== intent.publicAccess.previewUrlsEnabled
@@ -546,10 +587,7 @@ export async function disableOrdinaryWorkerPublicAccess(
       }
       const subdomain = await (async () => {
         try {
-          return await context.client.workers.scripts.subdomain.get(
-            scriptName,
-            { account_id: context.accountId },
-          );
+          return await ordinaryWorkerSubdomain(context, scriptName);
         } catch (error) {
           if (!isNotFound(error)) throw error;
           return undefined;
@@ -748,9 +786,7 @@ export async function inspectOrdinaryWorkerFootprint(
       }
     }
     const subdomain = scriptPresent
-      ? await context.client.workers.scripts.subdomain.get(scriptName, {
-          account_id: context.accountId,
-        })
+      ? await ordinaryWorkerSubdomain(context, scriptName)
       : undefined;
     return {
       scriptPresent,

@@ -40,6 +40,7 @@ import {
   type OrdinaryWorkerFootprint,
   ordinaryWorkerDeploymentStatus,
   ordinaryWorkerSecretNames,
+  ordinaryWorkerSubdomain,
   prepareOrdinaryWorkerDeployment,
   prepareOrdinaryWorkerUpload,
   viewOrdinaryWorkerVersion,
@@ -1825,9 +1826,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
         account_id: this.#accountId,
         script_name: scriptName,
       }),
-      this.#client.workers.scripts.subdomain.get(scriptName, {
-        account_id: this.#accountId,
-      }),
+      ordinaryWorkerSubdomain(this.#ordinary, scriptName),
       ordinaryWorkerSecretNames(this.#ordinary, scriptName),
     ]);
     const bindings = activeVersion.resources.bindings ?? [];
@@ -1849,8 +1848,8 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     return {
       artifactVersion,
       bindings: bindings as readonly FleetInventoryProviderBinding[],
-      subdomainEnabled: Boolean(subdomain.enabled),
-      previewsEnabled: Boolean(subdomain.previews_enabled),
+      subdomainEnabled: subdomain.enabled,
+      previewsEnabled: subdomain.previews_enabled,
       secretNames,
     };
   }
@@ -2060,9 +2059,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
             account_id: this.#accountId,
             script_name: scriptName,
           }),
-          this.#client.workers.scripts.subdomain.get(scriptName, {
-            account_id: this.#accountId,
-          }),
+          ordinaryWorkerSubdomain(this.#ordinary, scriptName),
           ordinaryWorkerSecretNames(this.#ordinary, scriptName),
         ]);
         const bindings = activeVersion.resources.bindings ?? [];
@@ -2228,8 +2225,8 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
           secretNames,
           plainTextBindings,
           providerBindingIdentities,
-          workersDevEnabled: subdomain.enabled === true,
-          previewUrlsEnabled: subdomain.previews_enabled === true,
+          workersDevEnabled: subdomain.enabled,
+          previewUrlsEnabled: subdomain.previews_enabled,
           routeHostnames,
           zoneRoutes,
         };

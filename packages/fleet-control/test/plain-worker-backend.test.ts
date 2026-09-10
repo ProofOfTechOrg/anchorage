@@ -1230,6 +1230,52 @@ const carrierScenarios = fenceModes.flatMap((mode) => [
 ]);
 
 describe('PlainWorkerBackend mutation-fence carrier ordering', () => {
+  it.each([
+    {},
+    { workersDevEnabled: false },
+    { previewUrlsEnabled: false },
+  ])('refuses unknown present-Worker public access in normal and force proofs %#', async (flags) => {
+    const api = new PlainWorkerProvisioningApiFake();
+    vi.spyOn(api, 'inspectOrdinaryWorkerFootprint').mockResolvedValue({
+      scriptPresent: true,
+      customDomains: [],
+      zoneRoutes: [],
+      ...flags,
+    });
+    vi.spyOn(api, 'disableOrdinaryWorkerPublicAccess').mockResolvedValue(
+      undefined,
+    );
+    await expect(backend(api).assertTrafficRemoved(spec)).rejects.toThrow(
+      'public-access footprint is incomplete',
+    );
+    await expect(
+      backend(api).forceDecommissionStep(
+        fleetRecord(),
+        'remove-traffic',
+        api.fence(),
+      ),
+    ).rejects.toThrow('public-access footprint is incomplete');
+  });
+
+  it('accepts an absent Worker without subdomain flags in ingress proofs', async () => {
+    const api = new PlainWorkerProvisioningApiFake();
+    vi.spyOn(api, 'inspectOrdinaryWorkerFootprint').mockResolvedValue({
+      scriptPresent: false,
+      customDomains: [],
+      zoneRoutes: [],
+    });
+    await expect(
+      backend(api).assertTrafficRemoved(spec),
+    ).resolves.toBeUndefined();
+    await expect(
+      backend(api).forceDecommissionStep(
+        fleetRecord(),
+        'remove-traffic',
+        api.fence(),
+      ),
+    ).resolves.toBeUndefined();
+  });
+
   it.each(
     carrierScenarios,
   )('$scenario records exact ordering in $mode mode', async ({
@@ -1496,6 +1542,13 @@ describe('PlainWorkerBackend core-policy refusals', () => {
     const api = new PlainWorkerProvisioningApiFake();
     api.scripts.add(spec.scriptName);
     deployedCandidate(api);
+    api.footprints.set(spec.scriptName, {
+      scriptPresent: true,
+      workersDevEnabled: false,
+      previewUrlsEnabled: false,
+      customDomains: [],
+      zoneRoutes: [],
+    });
     api.onDeleteWorkerScript = () => {
       api.namespaces.set(spec.scriptName, ['residual-namespace']);
     };
