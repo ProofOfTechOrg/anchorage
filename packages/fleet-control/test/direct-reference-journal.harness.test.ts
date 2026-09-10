@@ -325,6 +325,7 @@ describe.sequential('direct reference journal in native D1', {
 
   it.each([
     'cleanup-a',
+    'cleanup-recovery-initial',
     'decommission-a',
   ] as const)('adopts %s identity only from a Fleet token', async (slot) => {
     const { runKey, journal } = fixture();
@@ -428,11 +429,29 @@ describe.sequential('direct reference journal in native D1', {
       operationId: randomUUID(),
       inputJson: JSON.stringify({ records: ['second'] }),
     };
+    let entered = 0;
+    let bothReady!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      bothReady = resolve;
+    });
+    const produce = async (value: typeof first) => {
+      entered++;
+      if (entered === 2) bothReady();
+      await ready;
+      return value;
+    };
     const results = await Promise.all([
-      journal.freezeStart('inventory-before', async () => first),
-      other.freezeStart('inventory-before', async () => second),
+      journal.freezeStart('inventory-before', () => produce(first)),
+      other.freezeStart('inventory-before', () => produce(second)),
     ]);
-    expect(results[0]).toEqual(results[1]);
+    expect(results.map((result) => result.inserted).sort()).toEqual([
+      false,
+      true,
+    ]);
+    expect(results[0]).toEqual({
+      ...results[1],
+      inserted: results[0]?.inserted,
+    });
     expect([first.inputJson, second.inputJson]).toContain(
       results[0]?.inputJson,
     );
@@ -441,11 +460,113 @@ describe.sequential('direct reference journal in native D1', {
       inputJson: '{"records":["changed"]}',
     }));
     const reloaded = new DirectReferenceJournal(db, runKey, binding);
-    expect(await reloaded.freezeStart('inventory-before', changed)).toEqual(
-      results[0],
+    expect(await reloaded.freezeStart('inventory-before', changed)).toEqual({
+      ...results[0],
+      inserted: false,
+    });
+    expect(await reloaded.readOperation('inventory-before')).not.toHaveProperty(
+      'inserted',
     );
     expect(changed).not.toHaveBeenCalled();
     expect(Object.isFrozen(results[0])).toBe(true);
+  });
+
+  it('reports insertion ownership and refuses a suppressed first insert', async () => {
+    const { runKey, journal } = fixture();
+    await journal.readInterruption();
+    const trigger = `ignore_start_${runKey.replaceAll('-', '')}`;
+    await db.exec(
+      `CREATE TRIGGER ${trigger} BEFORE INSERT ON direct_reference_operations WHEN NEW.run_key='${runKey}' BEGIN SELECT RAISE(IGNORE); END`,
+    );
+    try {
+      await expect(
+        journal.freezeStart('cleanup-recovery-initial', async () => ({
+          operationId: null,
+          inputJson: '{}',
+        })),
+      ).rejects.toMatchObject({ code: 'journal-state' });
+    } finally {
+      await db.exec(`DROP TRIGGER ${trigger}`);
+    }
+    const result = await journal.freezeStart(
+      'cleanup-recovery-initial',
+      async () => ({ operationId: null, inputJson: '{}' }),
+    );
+    expect(result.inserted).toBe(true);
+    const replay = await new DirectReferenceJournal(
+      db,
+      runKey,
+      binding,
+    ).freezeStart('cleanup-recovery-initial', async () => {
+      throw new Error('must use retained input');
+    });
+    expect(replay.inserted).toBe(false);
+    expect(replay.operationId).toBeNull();
+  });
+
+  it('does not renew first-dispatch permission after committed insertion loses readback', async () => {
+    const { runKey } = fixture();
+    let inserted = false;
+    let failRead = true;
+    const wrap = (
+      statement: ReturnType<D1Database['prepare']>,
+      sql: string,
+    ): ReturnType<D1Database['prepare']> =>
+      new Proxy(statement, {
+        get(target, key) {
+          if (key === 'bind')
+            return (...values: unknown[]) => wrap(target.bind(...values), sql);
+          if (key === 'all')
+            return async () => {
+              if (
+                inserted &&
+                failRead &&
+                sql.startsWith('SELECT * FROM direct_reference_operations')
+              ) {
+                failRead = false;
+                throw new Error('injected committed-start readback loss');
+              }
+              const value = await target.all();
+              if (sql.startsWith('INSERT INTO direct_reference_operations'))
+                inserted = true;
+              return value;
+            };
+          const value = Reflect.get(target, key);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+    const wrapped = new Proxy(db, {
+      get(target, key) {
+        if (key === 'prepare')
+          return (sql: string) => wrap(target.prepare(sql), sql);
+        const value = Reflect.get(target, key);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const journal = new DirectReferenceJournal(wrapped, runKey, binding);
+    await expect(
+      journal.freezeStart('cleanup-recovery-initial', async () => ({
+        operationId: null,
+        inputJson: '{"retained":true}',
+      })),
+    ).rejects.toMatchObject({ code: 'journal-state' });
+    expect(inserted).toBe(true);
+    const unexpected = vi.fn(async () => ({
+      operationId: null,
+      inputJson: '{}',
+    }));
+    const replay = await new DirectReferenceJournal(
+      db,
+      runKey,
+      binding,
+    ).freezeStart('cleanup-recovery-initial', unexpected);
+    expect(replay).toMatchObject({
+      inserted: false,
+      operationId: null,
+      tokenJson: null,
+      inputJson: '{"retained":true}',
+    });
+    expect(unexpected).not.toHaveBeenCalled();
   });
 
   it('refuses a changed run binding without replacing the original', async () => {

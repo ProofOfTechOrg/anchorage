@@ -13,6 +13,7 @@
     "direct-reference-transport.ts",
     "direct-reference-context.ts",
     "direct-reference-observations.ts",
+    "direct-reference-lifecycle.ts",
     "direct-reference-worker.ts"
   ],
   "include": []

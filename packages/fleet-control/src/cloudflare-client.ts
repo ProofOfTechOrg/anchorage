@@ -59,6 +59,7 @@ import {
   type WorkerAttachmentScanChunk,
   type WorkerAttachmentScanInput,
 } from './cloudflare-worker-attachment-scan.js';
+import { namedWorkerUploadBody } from './cloudflare-worker-upload.js';
 import {
   cancelBodyWithoutAwait,
   captureDatabaseExportReceiptCapability,
@@ -1788,22 +1789,26 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       ),
     );
     return this.#schedule(async () => {
+      const metadata = JSON.stringify({
+        bindings: spec.bindings,
+        compatibility_date: spec.compatibilityDate,
+        compatibility_flags: spec.compatibilityFlags
+          ? [...spec.compatibilityFlags]
+          : undefined,
+        keep_bindings: ['secret_text'],
+        main_module: spec.mainModule,
+        migrations: spec.migrations,
+        tags: spec.tags ? [...spec.tags] : undefined,
+      });
       const result = await this.#client.workers.scripts.update(
         spec.scriptName,
         {
           account_id: this.#accountId,
-          files,
-          metadata: {
-            bindings: spec.bindings as never,
-            compatibility_date: spec.compatibilityDate,
-            compatibility_flags: spec.compatibilityFlags
-              ? [...spec.compatibilityFlags]
-              : undefined,
-            keep_bindings: ['secret_text'],
-            main_module: spec.mainModule,
-            migrations: spec.migrations as never,
-            tags: spec.tags ? [...spec.tags] : undefined,
-          },
+          metadata: metadata as never,
+        },
+        {
+          body: namedWorkerUploadBody(files, metadata),
+          headers: { 'Content-Type': null },
         },
       );
       if (!result.etag) {
@@ -2516,6 +2521,30 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
 
     return this.#schedule(async () => {
       await this.#assertUntrustedDispatchNamespace(dispatchNamespace);
+      const metadata = JSON.stringify({
+        bindings,
+        compatibility_date: spec.compatibilityDate,
+        compatibility_flags: spec.compatibilityFlags
+          ? [...spec.compatibilityFlags]
+          : undefined,
+        keep_bindings: ['secret_text'],
+        limits: {
+          cpu_ms: spec.cpuLimitMs,
+          subrequests: spec.subrequestLimit,
+        },
+        main_module: spec.mainModule,
+        migrations,
+        tags: [
+          FLEET_SCRIPT_TAG,
+          `tenant:${spec.tenantTag}`,
+          `environment:${spec.environment}`,
+          `schema:${spec.schemaVersion}`,
+          `spec:${deploymentSpecDigest(spec)}`,
+          ...(spec.durableObjectMigrations.at(-1)?.tag
+            ? [`do:${spec.durableObjectMigrations.at(-1)?.tag}`]
+            : []),
+        ],
+      });
       const result =
         await this.#client.workersForPlatforms.dispatch.namespaces.scripts.update(
           physicalScriptName,
@@ -2523,31 +2552,11 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
             account_id: this.#accountId,
             dispatch_namespace: dispatchNamespace,
             bindings_inherit: 'strict',
-            files,
-            metadata: {
-              bindings: bindings as never,
-              compatibility_date: spec.compatibilityDate,
-              compatibility_flags: spec.compatibilityFlags
-                ? [...spec.compatibilityFlags]
-                : undefined,
-              keep_bindings: ['secret_text'],
-              limits: {
-                cpu_ms: spec.cpuLimitMs,
-                subrequests: spec.subrequestLimit,
-              },
-              main_module: spec.mainModule,
-              migrations,
-              tags: [
-                FLEET_SCRIPT_TAG,
-                `tenant:${spec.tenantTag}`,
-                `environment:${spec.environment}`,
-                `schema:${spec.schemaVersion}`,
-                `spec:${deploymentSpecDigest(spec)}`,
-                ...(spec.durableObjectMigrations.at(-1)?.tag
-                  ? [`do:${spec.durableObjectMigrations.at(-1)?.tag}`]
-                  : []),
-              ],
-            },
+            metadata: metadata as never,
+          },
+          {
+            body: namedWorkerUploadBody(files, metadata),
+            headers: { 'Content-Type': null },
           },
         );
       if (!result.etag) {
@@ -2706,6 +2715,30 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     };
     return this.#schedule(async () => {
       await this.#assertUntrustedDispatchNamespace(dispatchNamespace);
+      const metadata = JSON.stringify({
+        bindings,
+        compatibility_date: options.artifact.compatibilityDate,
+        compatibility_flags: options.artifact.compatibilityFlags
+          ? [...options.artifact.compatibilityFlags]
+          : undefined,
+        keep_bindings: ['secret_text'],
+        main_module: options.artifact.mainModule,
+        migrations: dispatchMigrations(stateSpec),
+        tags: [
+          FLEET_SCRIPT_TAG,
+          'role:platform-state',
+          `group:${resourceGroupId}`,
+          `tenant:${spec.tenantTag}`,
+          `environment:${spec.environment}`,
+          `schema:${spec.schemaVersion}`,
+          `spec:${deploymentSpecDigest(spec)}`,
+          ...(spec.durableObjectMigrations.at(-1)?.tag
+            ? [`do:${spec.durableObjectMigrations.at(-1)?.tag}`]
+            : []),
+          `artifact:${options.artifactDigest}`,
+          `state-egress:${options.stateEgressCredentialDigest}`,
+        ],
+      });
       const result =
         await this.#client.workersForPlatforms.dispatch.namespaces.scripts.update(
           scriptName,
@@ -2713,31 +2746,11 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
             account_id: this.#accountId,
             dispatch_namespace: dispatchNamespace,
             bindings_inherit: 'strict',
-            files,
-            metadata: {
-              bindings: bindings as never,
-              compatibility_date: options.artifact.compatibilityDate,
-              compatibility_flags: options.artifact.compatibilityFlags
-                ? [...options.artifact.compatibilityFlags]
-                : undefined,
-              keep_bindings: ['secret_text'],
-              main_module: options.artifact.mainModule,
-              migrations: dispatchMigrations(stateSpec),
-              tags: [
-                FLEET_SCRIPT_TAG,
-                'role:platform-state',
-                `group:${resourceGroupId}`,
-                `tenant:${spec.tenantTag}`,
-                `environment:${spec.environment}`,
-                `schema:${spec.schemaVersion}`,
-                `spec:${deploymentSpecDigest(spec)}`,
-                ...(spec.durableObjectMigrations.at(-1)?.tag
-                  ? [`do:${spec.durableObjectMigrations.at(-1)?.tag}`]
-                  : []),
-                `artifact:${options.artifactDigest}`,
-                `state-egress:${options.stateEgressCredentialDigest}`,
-              ],
-            },
+            metadata: metadata as never,
+          },
+          {
+            body: namedWorkerUploadBody(files, metadata),
+            headers: { 'Content-Type': null },
           },
         );
       if (!result.etag) {

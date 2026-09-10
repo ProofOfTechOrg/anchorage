@@ -11,7 +11,11 @@ import type { DirectReferenceContext } from './direct-reference-context.js';
 import { DirectReferenceExecutionError } from './direct-reference-http.js';
 import type { DirectStoredResource } from './direct-reference-journal.js';
 
-type ResourceSource = 'provision-read' | 'migration-read' | 'before-force';
+type ResourceSource =
+  | 'provision-read'
+  | 'migration-read'
+  | 'teardown-read'
+  | 'before-force';
 
 function compare(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;

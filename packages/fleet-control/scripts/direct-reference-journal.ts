@@ -14,6 +14,7 @@ export type DirectOperationSlot =
   | DirectInventorySlot
   | DirectAuditSlot
   | 'migration-next'
+  | 'cleanup-recovery-initial'
   | `cleanup-${DirectFixtureRole}`
   | `decommission-${DirectFixtureRole}`;
 export type DirectOperationKind =
@@ -48,6 +49,10 @@ export interface DirectStoredOperation extends DirectStartCandidate {
   readonly kind: DirectOperationKind;
   readonly tokenJson: string | null;
   readonly tokenRevision: number | null;
+}
+
+export interface DirectFrozenStart extends DirectStoredOperation {
+  readonly inserted: boolean;
 }
 
 export interface DirectStoredObservation {
@@ -121,6 +126,7 @@ function kindFor(slot: string): DirectOperationKind {
     return 'inventory';
   if (slot === 'audit-before' || slot === 'audit-after') return 'audit';
   if (slot === 'migration-next') return 'migration';
+  if (slot === 'cleanup-recovery-initial') return 'cleanup';
   for (const kind of ['cleanup', 'decommission'] as const)
     if (['a', 'b', 'recovery'].some((role) => slot === `${kind}-${role}`))
       return kind;
@@ -303,10 +309,10 @@ export class DirectReferenceJournal {
   freezeStart(
     slot: DirectOperationSlot,
     create: () => Promise<DirectStartCandidate>,
-  ): Promise<DirectStoredOperation> {
+  ): Promise<DirectFrozenStart> {
     return this.#withState(async () => {
       const prior = await this.#operation(slot);
-      if (prior) return prior;
+      if (prior) return Object.freeze({ ...prior, inserted: false });
       const candidate = await create();
       const kind = kindFor(slot);
       const operationId =
@@ -314,8 +320,8 @@ export class DirectReferenceJournal {
       const assignedByFleet = kind === 'cleanup' || kind === 'decommission';
       if ((operationId === null) !== assignedByFleet) stateError();
       const input = jsonObject(candidate.inputJson);
-      await this.#database.execute(
-        'INSERT INTO direct_reference_operations (run_key,slot,operation_kind,operation_id,start_json,start_sha256) VALUES (?,?,?,?,?,?) ON CONFLICT DO NOTHING',
+      const inserted = await this.#database.query(
+        'INSERT INTO direct_reference_operations (run_key,slot,operation_kind,operation_id,start_json,start_sha256) VALUES (?,?,?,?,?,?) ON CONFLICT DO NOTHING RETURNING slot',
         [
           this.#runKey,
           slot,
@@ -328,9 +334,16 @@ export class DirectReferenceJournal {
           ),
         ],
       );
+      if (
+        inserted.length > 1 ||
+        (inserted.length === 1 && inserted[0]?.slot !== slot)
+      )
+        stateError();
       const winner = await this.#operation(slot);
       if (!winner) stateError();
-      return winner;
+      if (inserted.length === 1 && winner.inputJson !== input.text)
+        stateError();
+      return Object.freeze({ ...winner, inserted: inserted.length === 1 });
     });
   }
 

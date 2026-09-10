@@ -48,6 +48,23 @@ export default {async fetch(request){
       const result=await transport.providerFetch('data:,');await result.text();
       return Response.json({ok:true,status:result.status,metrics:transport.snapshot()});
     }
+    if(kind==='upload'){
+      const observed=[];const uploadFetch=async(input,init)=>{
+        const request=new Request(input,init);if(request.url==='data:,')return new Response('');
+        const path=new URL(request.url).pathname;
+        if(path.endsWith('/subdomain'))return Response.json({success:true,errors:[],result:{enabled:false,previews_enabled:false}});
+        const form=await request.formData(),metadata=JSON.parse(form.get('metadata')),module=form.get('bin/fixture.wasm');
+        observed.push({path,method:request.method,keys:[...form.keys()].sort(),metadata,wasm:module&&typeof module!=='string'?[...new Uint8Array(await module.arrayBuffer())]:null,wasmType:module&&typeof module!=='string'?module.type:null});
+        return Response.json({success:true,errors:[],result:{id:'v1',etag:'v1'}});
+      };
+      const client=new CloudflareProvisioningClient({plane:'plain-worker',accountId:'account',apiToken:'inert',rateCoordinator:{async acquire(){}},fetch:uploadFetch});
+      const common={scriptName:'native-upload',candidateTag:'native-candidate',mainModule:'src/worker.js',modules:[{name:'src/worker.js',content:'export default {}'},{name:'bin/fixture.wasm',content:new Uint8Array([0,97,115,109,1,0,0,0,0,6,0,255,128,0,195,169]),contentType:'application/wasm'}],compatibilityDate:'2026-08-06',bindings:{plainText:[],secrets:[],d1:[],durableObjects:[],services:[],queueProducers:[],r2Buckets:[]},limits:{cpuMs:42,subrequests:70},publicAccess:{workersDevEnabled:false,previewUrlsEnabled:false}};
+      for(const mode of ['initial','staged']){
+        const prepared=await client.prepareOrdinaryWorkerUpload({...common,mode,...(mode==='initial'?{durableObjectMigrations:[]}:{})});
+        await client.withMutationFence({mutationLeaseTtlMs:900000,async assertOwned(){}},()=>client.dispatchOrdinaryWorkerUpload(prepared));
+      }
+      return Response.json(observed);
+    }
     globalThis.fetch=intercept;
     if(kind==='export'){
       const exportStore={async write(input){stored=true;const text=await new Response(input.body).text();return {location:'r2://fixture/export.sql',size:new TextEncoder().encode(text).length,sha256:createHash('sha256').update(text).digest('hex')};}};
@@ -125,6 +142,44 @@ export default {async fetch(request){
         value.url.startsWith('https://download.example.test/'),
       ),
     ).toEqual([expect.objectContaining({ redirect: 'manual' })]);
+  });
+
+  it('names native initial and staged multipart fields after their modules', async () => {
+    const response = await server
+      .getWorker()
+      .fetch('https://fixture.test?kind=upload');
+    const body = (await response.json()) as Array<{
+      path: string;
+      method: string;
+      keys: string[];
+      metadata: unknown;
+      wasm: number[];
+      wasmType: string;
+    }>;
+    expect(body).toHaveLength(2);
+    expect(body.map(({ path, method }) => [path, method])).toEqual([
+      ['/client/v4/accounts/account/workers/scripts/native-upload', 'PUT'],
+      [
+        '/client/v4/accounts/account/workers/scripts/native-upload/versions',
+        'POST',
+      ],
+    ]);
+    for (const upload of body) {
+      expect(upload.keys).toEqual([
+        'bin/fixture.wasm',
+        'metadata',
+        'src/worker.js',
+      ]);
+      expect(upload.metadata).toMatchObject({
+        main_module: 'src/worker.js',
+        limits: { cpu_ms: 42, subrequests: 70 },
+        annotations: { 'workers/tag': 'native-candidate' },
+      });
+      expect(upload.wasm).toEqual([
+        0, 97, 115, 109, 1, 0, 0, 0, 0, 6, 0, 255, 128, 0, 195, 169,
+      ]);
+      expect(upload.wasmType).toBe('application/wasm');
+    }
   });
 
   it('rejects an export redirect without storing data or awaiting cancellation', async () => {

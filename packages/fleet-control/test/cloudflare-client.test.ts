@@ -53,6 +53,192 @@ function deployment(overrides: Partial<DeploymentSpec> = {}): DeploymentSpec {
 }
 
 describe('CloudflareProvisioningClient', () => {
+  it.each([
+    'reserved',
+    'duplicate',
+  ] as const)('refuses %s module part names before an upload', async (kind) => {
+    let requests = 0;
+    const client = new CloudflareProvisioningClient({
+      plane: 'plain-worker',
+      accountId: 'account',
+      apiToken: 'inert',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async () => {
+        requests++;
+        return envelope({ etag: 'unexpected' });
+      },
+    });
+    const names =
+      kind === 'reserved' ? ['metadata'] : ['worker.js', 'worker.js'];
+    await expect(
+      fenced(client, () =>
+        client.uploadControlWorker({
+          scriptName: 'parts',
+          mainModule: names[0] ?? '',
+          modules: names.map((name) => ({
+            name,
+            content: 'export default {}',
+          })),
+          compatibilityDate: '2026-08-06',
+          bindings: [],
+        }),
+      ),
+    ).rejects.toThrow('duplicated or reserved');
+    expect(requests).toBe(0);
+  });
+
+  it('keeps upload module names separate from SDK routing parameters', async () => {
+    const observations: unknown[] = [];
+    const client = new CloudflareProvisioningClient({
+      plane: 'plain-worker',
+      accountId: 'account',
+      apiToken: 'inert',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (input, init) => {
+        const request = new Request(input, init);
+        if (request.url === 'data:,') return new Response('');
+        const form = await request.formData(),
+          module = form.get('account_id');
+        observations.push({
+          path: new URL(request.url).pathname,
+          metadata: JSON.parse(String(form.get('metadata'))),
+          module:
+            module && typeof module !== 'string' ? await module.text() : null,
+        });
+        return envelope({ etag: 'uploaded' });
+      },
+    });
+    await fenced(client, () =>
+      client.uploadControlWorker({
+        scriptName: 'parts',
+        mainModule: 'account_id',
+        modules: [{ name: 'account_id', content: 'export default {}' }],
+        compatibilityDate: '2026-08-06',
+        bindings: [],
+      }),
+    );
+    expect(observations).toEqual([
+      expect.objectContaining({
+        path: '/client/v4/accounts/account/workers/scripts/parts',
+        metadata: expect.objectContaining({ main_module: 'account_id' }),
+        module: 'export default {}',
+      }),
+    ]);
+  });
+
+  it.each([
+    'control',
+    'dispatch',
+    'state',
+  ] as const)('encodes %s uploads as native multipart with one JSON metadata part', async (kind) => {
+    const wasm = new Uint8Array([
+      0, 97, 115, 109, 1, 0, 0, 0, 0, 6, 0, 255, 128, 0, 195, 169,
+    ]);
+    const spec = deployment({
+      authoredBy: 'platform',
+      modules: [
+        { name: 'worker.js', content: 'export default {}' },
+        {
+          name: 'fixture.wasm',
+          content: wasm,
+          contentType: 'application/wasm',
+        },
+      ],
+    });
+    const observations: unknown[] = [];
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'inert',
+      dispatchNamespace: 'fleet',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (input, init) => {
+        const request = new Request(input, init);
+        if (request.url === 'data:,') return new Response('');
+        if (
+          request.method === 'GET' &&
+          new URL(request.url).pathname.endsWith(
+            '/workers/dispatch/namespaces/fleet',
+          )
+        )
+          return envelope({
+            namespace_name: 'fleet',
+            trusted_workers: false,
+            script_count: 0,
+          });
+        expect(request.method).toBe('PUT');
+        let form: FormData | undefined;
+        try {
+          form = await request.formData();
+        } catch {
+          /* The assertions retain malformed wire metadata. */
+        }
+        const metadata = form?.get('metadata');
+        const file = [...(form?.values() ?? [])].find(
+          (value) => typeof value !== 'string' && value.name === 'fixture.wasm',
+        );
+        observations.push({
+          multipart: /^multipart\/form-data;\s*boundary=/u.test(
+            request.headers.get('content-type') ?? '',
+          ),
+          rawMetadataPart:
+            init?.body instanceof FormData &&
+            typeof init.body.get('metadata') === 'string',
+          entryPart: form?.has('worker.js') ?? false,
+          auxiliaryPart: form?.has('fixture.wasm') ?? false,
+          mainModule:
+            typeof metadata === 'string'
+              ? JSON.parse(metadata).main_module
+              : undefined,
+          wasm:
+            typeof file === 'object'
+              ? [...new Uint8Array(await file.arrayBuffer())]
+              : undefined,
+        });
+        return envelope({ etag: 'uploaded-version' });
+      },
+    });
+    await fenced(client, async () => {
+      if (kind === 'control')
+        await client.uploadControlWorker({
+          scriptName: spec.scriptName,
+          mainModule: spec.mainModule,
+          modules: spec.modules,
+          compatibilityDate: spec.compatibilityDate,
+          bindings: [],
+        });
+      else if (kind === 'dispatch')
+        await client.uploadDispatchWorker(spec, {
+          id: 'db-acme',
+          name: spec.databaseName,
+          created: false,
+        });
+      else
+        await client.uploadNamespacedStateWorker({
+          spec,
+          database: { id: 'db-acme', name: spec.databaseName, created: false },
+          artifact: {
+            mainModule: spec.mainModule,
+            modules: spec.modules,
+            compatibilityDate: spec.compatibilityDate,
+          },
+          artifactDigest: 'a'.repeat(64),
+          maintenanceCapabilityPublicKey: 'inert-public-key',
+          sharedOutboundWorkerName: 'fixture-outbound',
+          stateEgressCredentialDigest: 'b'.repeat(64),
+        });
+    });
+    expect(observations).toEqual([
+      {
+        multipart: true,
+        rawMetadataPart: true,
+        entryPart: true,
+        auxiliaryPart: true,
+        mainModule: 'worker.js',
+        wasm: [...wasm],
+      },
+    ]);
+  });
+
   it('fails closed for unfenced writes and request timeouts outside the lease TTL', async () => {
     let providerWrites = 0;
     const client = new CloudflareProvisioningClient({
@@ -1877,28 +2063,32 @@ describe('CloudflareProvisioningClient', () => {
       'dispatch-upload',
     ]);
     expect(requestUrl?.pathname).toContain('/acme-physical-candidate');
-    const entries = [...(uploadBody?.entries() ?? [])].map(
-      ([name, value]) => [name, String(value)] as const,
-    );
-    expect(entries).toEqual(
+    const metadata = JSON.parse(String(uploadBody?.get('metadata')));
+    expect(metadata.bindings).toEqual(
       expect.arrayContaining([
-        ['metadata[bindings][][name]', 'MAINTENANCE'],
-        ['metadata[bindings][][type]', 'durable_object_namespace'],
-        ['metadata[bindings][][class_name]', 'Maintenance'],
-        ['metadata[bindings][][script_name]', 'fleet-maintenance-host'],
-        ['metadata[bindings][][dispatch_namespace]', 'fleet'],
-        ['metadata[bindings][][name]', 'AUDIT_PROXY'],
-        ['metadata[bindings][][class_name]', 'FlowsafeFleetAuditProxy'],
-        ['metadata[bindings][][name]', 'FLEET_SPEC_DIGEST'],
-        ['metadata[bindings][][name]', 'FLEET_MAINTENANCE_CAPABILITIES'],
-        ['metadata[tags][]', 'fleet:anchorage'],
+        {
+          name: 'MAINTENANCE',
+          type: 'durable_object_namespace',
+          class_name: 'Maintenance',
+          script_name: 'fleet-maintenance-host',
+          dispatch_namespace: 'fleet',
+        },
+        expect.objectContaining({
+          name: 'AUDIT_PROXY',
+          class_name: 'FlowsafeFleetAuditProxy',
+        }),
+        expect.objectContaining({ name: 'FLEET_SPEC_DIGEST' }),
+        expect.objectContaining({ name: 'FLEET_MAINTENANCE_CAPABILITIES' }),
       ]),
     );
-    expect(entries).not.toEqual(
-      expect.arrayContaining([['metadata[bindings][][name]', 'EGRESS_PROXY']]),
+    expect(metadata.tags).toContain('fleet:anchorage');
+    expect(metadata.bindings).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: 'EGRESS_PROXY' }),
+      ]),
     );
-    expect(entries).not.toEqual(
-      expect.arrayContaining([['metadata[bindings][][type]', 'service']]),
+    expect(metadata.bindings).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ type: 'service' })]),
     );
   });
 
@@ -2201,12 +2391,9 @@ describe('CloudflareProvisioningClient', () => {
     )?.[1]?.body;
     expect(controlUpload).toBeInstanceOf(FormData);
     expect(
-      [...((controlUpload as FormData).entries() ?? [])].map(
-        ([name, value]) => [name, String(value)],
-      ),
-    ).toEqual(
-      expect.arrayContaining([['metadata[keep_bindings][]', 'secret_text']]),
-    );
+      JSON.parse(String((controlUpload as FormData).get('metadata')))
+        .keep_bindings,
+    ).toEqual(['secret_text']);
     await fenced(client, () =>
       client.disableControlWorkerPublicAccess('fleet-state'),
     );

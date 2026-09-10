@@ -1,12 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// This module holds ordinary-Worker (plain-plane) provider operations that
-// CloudflareProvisioningClient calls through one-line forwards or directly.
-// Context-taking functions declare the slice of OrdinaryWorkerContext they
-// need; the preparation and migration helpers take no context.
-// Provider requests go through context.client, the client's SDK instance;
-// this module imports nothing from cloudflare-client.ts.
-
 import type Cloudflare from 'cloudflare';
 import type { ScriptUpdateParams } from 'cloudflare/resources/workers/scripts/scripts';
 import type { VersionCreateParams } from 'cloudflare/resources/workers/scripts/versions';
@@ -16,6 +9,7 @@ import {
   isNotFound,
   sanitizeProviderError,
 } from './cloudflare-provider-errors.js';
+import { namedWorkerUploadBody } from './cloudflare-worker-upload.js';
 import {
   readArrayField,
   readField,
@@ -407,13 +401,13 @@ export async function dispatchOrdinaryWorkerUpload(
   const { files, intent, metadata, secretValues } = prepared;
   await context.schedule(async () => {
     const subdomain = context.client.workers.scripts.subdomain;
-    const uploadBody = {
+    const uploadParameters = {
       account_id: context.accountId,
-      files: [...files],
       // cloudflare/internal/uploads.mjs:102-129 bracket-flattens objects;
       // Wrangler 4.118.0 serializes the same metadata value as JSON.
       metadata: metadata as never,
     };
+    const body = namedWorkerUploadBody(files, metadata);
     const send = async (call: () => Promise<unknown>): Promise<void> => {
       try {
         await call();
@@ -423,9 +417,15 @@ export async function dispatchOrdinaryWorkerUpload(
     };
     if (intent.mode === 'initial') {
       await send(() =>
-        context.client.workers.scripts.update(intent.scriptName, uploadBody, {
-          maxRetries: 0,
-        }),
+        context.client.workers.scripts.update(
+          intent.scriptName,
+          uploadParameters,
+          {
+            maxRetries: 0,
+            body,
+            headers: { 'Content-Type': null },
+          },
+        ),
       );
       // Sanitization is limited to the upload request that carries secrets.
       // Cloudflare rejects subdomain writes before the script exists. The
@@ -455,8 +455,8 @@ export async function dispatchOrdinaryWorkerUpload(
     await send(() =>
       context.client.workers.scripts.versions.create(
         intent.scriptName,
-        uploadBody,
-        { maxRetries: 0 },
+        uploadParameters,
+        { maxRetries: 0, body },
       ),
     );
   });

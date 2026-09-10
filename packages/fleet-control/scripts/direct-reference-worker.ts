@@ -8,6 +8,7 @@ import {
   type DirectReferenceContext,
   type DirectReferenceEnvironment,
 } from './direct-reference-context.js';
+import { directContinuation } from './direct-reference-continuation.js';
 import type {
   DirectInventorySlot,
   DirectReferenceAction,
@@ -21,6 +22,7 @@ import {
   DirectReferenceJournalError,
   type DirectStoredOperation,
 } from './direct-reference-journal.js';
+import { dispatchDirectLifecycle } from './direct-reference-lifecycle.js';
 import type { DirectReferenceTransportSnapshot } from './direct-reference-transport.js';
 
 const operationSlots: readonly DirectOperationSlot[] = [
@@ -32,6 +34,7 @@ const operationSlots: readonly DirectOperationSlot[] = [
   'cleanup-a',
   'cleanup-b',
   'cleanup-recovery',
+  'cleanup-recovery-initial',
   'decommission-a',
   'decommission-b',
   'decommission-recovery',
@@ -60,28 +63,6 @@ function inventoryStart(
   if (stored.inputJson !== JSON.stringify(action))
     throw new DirectReferenceJournalError();
   return action;
-}
-
-function continuation(
-  stored: DirectStoredOperation,
-  action: DirectReferenceAction,
-): unknown {
-  const token: unknown = Object.hasOwn(action, 'token')
-    ? Reflect.get(action, 'token')
-    : stored.tokenJson === null
-      ? undefined
-      : JSON.parse(stored.tokenJson);
-  if (token === undefined)
-    throw new DirectReferenceExecutionError('missing-continuation');
-  if (
-    !token ||
-    typeof token !== 'object' ||
-    Array.isArray(token) ||
-    !Object.hasOwn(token, 'operationId') ||
-    (token as { operationId: unknown }).operationId !== stored.operationId
-  )
-    throw new DirectReferenceExecutionError('wrong-operation');
-  return token;
 }
 
 function pinOwner(
@@ -163,6 +144,8 @@ async function dispatch(
       ),
     };
   }
+  if ('role' in action)
+    return dispatchDirectLifecycle(context, manifest, action, signal);
   if (action.kind !== 'inventory-start' && action.kind !== 'inventory-continue')
     throw new DirectReferenceExecutionError();
   let advance: CloudflareFleetInventoryAdvanceAction;
@@ -193,13 +176,13 @@ async function dispatch(
     advance =
       stored.tokenJson === null
         ? start
-        : { kind: 'continue', token: continuation(stored, action) };
+        : { kind: 'continue', token: directContinuation(stored, action) };
   } else {
     const stored = await context.journal.readOperation(action.slot);
     if (!stored)
       throw new DirectReferenceExecutionError('missing-continuation');
     inventoryStart(manifest, stored);
-    advance = { kind: 'continue', token: continuation(stored, action) };
+    advance = { kind: 'continue', token: directContinuation(stored, action) };
   }
   const result = await context.control.advanceFleetInventory({
     action: advance,

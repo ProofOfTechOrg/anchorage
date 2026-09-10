@@ -194,14 +194,16 @@ async function decodeBody(body: RequestInit['body']): Promise<unknown> {
     const files: Array<{ name: string; type: string; text: string }> = [];
     const fields: Record<string, unknown> = {};
     for (const [name, value] of body.entries()) {
-      if (typeof value !== 'string') {
+      if (name === 'metadata') {
+        fields[name] = JSON.parse(
+          typeof value === 'string' ? value : await value.text(),
+        );
+      } else if (typeof value !== 'string') {
         files.push({
-          name: value.name,
+          name,
           type: value.type,
           text: await value.text(),
         });
-      } else if (name === 'metadata') {
-        fields[name] = JSON.parse(value);
       } else {
         fields[name] = value;
       }
@@ -541,6 +543,15 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
       throw new Error(`unexpected request ${method} ${target.pathname}`);
     }
     const script = world.scripts.get(scriptName);
+    if (
+      (target.pathname.endsWith(`/workers/scripts/${scriptName}`) &&
+        method === 'PUT') ||
+      (target.pathname.endsWith('/versions') && method === 'POST')
+    ) {
+      const mainModule = readStringFact(bodyField('metadata'), 'main_module');
+      if (!readModules(body).some((module) => module.name === mainModule))
+        return failedResponse('the declared entrypoint module part is missing');
+    }
     if (
       target.pathname.endsWith(`/workers/scripts/${scriptName}`) &&
       method === 'PUT'
