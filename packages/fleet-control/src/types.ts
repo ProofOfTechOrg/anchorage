@@ -56,6 +56,11 @@ export interface ExternalPlatformProfile {
   readonly organizationEgressHosts: readonly string[];
 }
 
+export type MaintenanceSigningProfile = Pick<
+  ExternalPlatformProfile,
+  'maintenanceCapabilityPublicKey' | 'maintenanceCapabilityPrivateKey'
+>;
+
 export interface DurableObjectMigration {
   readonly tag: string;
   readonly newSqliteClasses?: readonly string[];
@@ -972,6 +977,8 @@ export interface CleanupTerminalReceipt {
 export interface FleetRecord {
   readonly tenantTag: string;
   readonly backend: ProvisioningBackendKind;
+  /** Absence preserves external ownership for legacy WFP rows. */
+  readonly wfpMode?: 'platform-catalog';
   readonly environment: string;
   readonly scriptName: string;
   readonly databaseId: string;
@@ -1017,6 +1024,16 @@ export interface FleetRecord {
    */
   readonly settledSettlementKey?: string;
   readonly updatedAt: string;
+}
+
+export function isPlatformCatalogRecord(
+  record: Pick<FleetRecord, 'backend' | 'wfpMode'>,
+): boolean {
+  return (
+    record.backend === 'workers-for-platforms' &&
+    Object.hasOwn(record, 'wfpMode') &&
+    record.wfpMode === 'platform-catalog'
+  );
 }
 
 export function effectiveLifecyclePhase(

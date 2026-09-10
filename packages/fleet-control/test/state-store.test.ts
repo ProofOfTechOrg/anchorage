@@ -193,6 +193,7 @@ class MemoryD1 implements FleetStateDatabase {
         'database_export_size',
         'settled_settlement_key',
         'updated_at',
+        'wfp_mode',
       ];
       this.row = Object.fromEntries(
         names.map((name, index) => [name, bindings[index] ?? null]),
@@ -599,6 +600,61 @@ function platformSet(workerName: string): PlatformPlaneResourceSet {
 }
 
 describe('D1FleetStateStore release state', () => {
+  it.each([
+    'plain-worker',
+    'workers-for-platforms',
+  ] as const)('round-trips own mutable teardown artifacts without external topology (%s)', async (backend) => {
+    const db = new MemoryD1();
+    const store = new D1FleetStateStore(db, { accountId: 'account' });
+    const base = decommissionBase();
+    const activeRelease = {
+      physicalScriptName: base.scriptName,
+      specDigest: base.desiredSpecDigest,
+      artifactVersion: base.artifactVersion,
+      releaseSchemaVersion: base.schemaVersion,
+      application: base.applicationBindings,
+    };
+    const record: FleetRecord = {
+      ...base,
+      backend,
+      activeRelease,
+      ...(backend === 'workers-for-platforms'
+        ? {
+            wfpMode: 'platform-catalog',
+            outboundPolicy: externalPolicyAndTarget(base).outboundPolicy,
+          }
+        : {}),
+    };
+    await store.withDeploymentLease(
+      record.tenantTag,
+      record.environment,
+      (lease) => lease.put(record),
+    );
+    await expect(
+      store.get(record.tenantTag, record.environment),
+    ).resolves.toMatchObject({ activeRelease });
+    if (!db.row) throw new Error('stored mutable fixture row is missing');
+    const stored = { ...db.row };
+    for (const alteration of [
+      { physicalScriptName: 'foreign-script' },
+      { artifactVersion: '' },
+    ]) {
+      db.row = {
+        ...stored,
+        active_release: JSON.stringify({ ...activeRelease, ...alteration }),
+      };
+      await expect(
+        store.get(record.tenantTag, record.environment),
+      ).rejects.toThrow('invalid active_release');
+    }
+    if (backend === 'workers-for-platforms') {
+      db.row = { ...stored, wfp_mode: null };
+      await expect(
+        store.get(record.tenantTag, record.environment),
+      ).rejects.toThrow('invalid active_release');
+    }
+  });
+
   it('retries a transient schema bootstrap failure on the same instance', async () => {
     const db = new SchemaD1();
     db.failCreateOnce = true;
@@ -1047,6 +1103,7 @@ describe('D1FleetStateStore release state', () => {
       'decommission_intent',
       'cleanup_intent',
       'invocation_authority',
+      'wfp_mode',
     ]);
     const current = new SchemaD1();
     await new D1FleetStateStore(current, { accountId: 'account' }).get(
@@ -1130,6 +1187,7 @@ describe('D1FleetStateStore release state', () => {
       'database_export_size',
       'settled_settlement_key',
       'updated_at',
+      'wfp_mode',
     ]);
   });
 
@@ -1501,6 +1559,37 @@ describe('D1FleetStateStore release state', () => {
     );
     await expect(store.get('acme', 'production')).resolves.toEqual(record);
     if (!record.migrationIntent) throw new Error('missing migration intent');
+
+    const legacyTeardown: FleetRecord = {
+      ...record,
+      desiredSpecDigest: record.migrationIntent.targetSpecDigest,
+      phase: 'decommissioning',
+    };
+    for (const phase of [
+      'decommissioning',
+      'traffic-removed',
+      'credentials-revoked',
+      'worker-deleted',
+      'platform-credentials-revoked',
+    ] as const) {
+      const retained = { ...legacyTeardown, phase };
+      await store.withDeploymentLease('acme', 'production', (lease) =>
+        lease.put(retained),
+      );
+      await expect(store.get('acme', 'production')).resolves.toEqual(retained);
+    }
+    for (const invalid of [
+      { ...legacyTeardown, desiredSpecDigest: record.desiredSpecDigest },
+      { ...legacyTeardown, phase: 'ready' as const },
+      { ...legacyTeardown, phase: 'platform-resources-deleted' as const },
+      { ...legacyTeardown, phase: 'decommissioned' as const },
+    ]) {
+      await expect(
+        store.withDeploymentLease('acme', 'production', (lease) =>
+          lease.put(invalid),
+        ),
+      ).rejects.toThrow(/inconsistent migration intent/);
+    }
 
     const decommissioningMigration: FleetRecord = {
       ...record,

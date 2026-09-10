@@ -275,8 +275,6 @@ export async function createDirectReferenceContext(
       record.environment !== manifest.environment ||
       record.backendSwitchIntent ||
       record.migrationIntent ||
-      record.activeRelease ||
-      record.pendingRelease ||
       record.migrationPriorRelease ||
       record.rollbackRelease ||
       record.retiringRelease ||
@@ -295,6 +293,35 @@ export async function createDirectReferenceContext(
       record.routeHostname !== names.routeHostname
     )
       refused();
+    for (const release of [record.activeRelease, record.pendingRelease]) {
+      if (!release) continue;
+      const recipe = digests.get(role)?.get(release.specDigest);
+      if (
+        ![
+          'migrating',
+          'decommissioning',
+          'traffic-removed',
+          'credentials-revoked',
+          'worker-deleted',
+          'platform-credentials-revoked',
+          'platform-resources-deleted',
+          'application-resources-deleting',
+          'application-resources-deleted',
+          'database-exported',
+          'database-deleting',
+          'decommissioned',
+        ].includes(record.decommissionIntent?.lifecyclePhase ?? record.phase) ||
+        release.physicalScriptName !== record.scriptName ||
+        !recipe ||
+        release.releaseSchemaVersion !== recipe.schemaVersion ||
+        !release.artifactVersion ||
+        release.artifactVersion === 'pending' ||
+        release.topology ||
+        (release === record.activeRelease &&
+          release.artifactVersion !== record.artifactVersion)
+      )
+        refused();
+    }
     return role;
   };
   return Object.freeze({

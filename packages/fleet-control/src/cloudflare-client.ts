@@ -81,6 +81,7 @@ import {
 } from './fleet-inventory-state.js';
 import type { HostRoutingTarget } from './host-routing.js';
 import {
+  canonicalMaintenanceCapabilityPublicKey,
   externalPlatformResourceGroupId,
   externalStateScriptName,
   FLEET_AUDIT_PROXY_BINDING,
@@ -2398,6 +2399,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     physicalScriptName = spec.scriptName,
     platformResources?: import('./types.js').ExternalPlatformResources,
     application?: import('./types.js').ApplicationBindingTopology,
+    maintenanceCapabilityPublicKey?: string,
   ): Promise<{ artifactVersion: string }> {
     const dispatchNamespace = this.#requireDispatchNamespace(
       'uploadDispatchWorker',
@@ -2405,6 +2407,19 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     if (spec.authoredBy === 'external' && !platformResources) {
       throw new Error('external dispatch upload requires platform resources');
     }
+    if (
+      maintenanceCapabilityPublicKey !== undefined &&
+      spec.authoredBy !== 'platform'
+    )
+      throw new Error(
+        'catalog maintenance enrollment requires a platform-authored Worker',
+      );
+    const catalogPublicKey =
+      maintenanceCapabilityPublicKey === undefined
+        ? undefined
+        : canonicalMaintenanceCapabilityPublicKey(
+            maintenanceCapabilityPublicKey,
+          );
     const bindings: Array<Record<string, unknown>> = [
       { name: 'DB', type: 'd1', database_id: database.id },
       { name: 'DEPLOYMENT_TENANT', type: 'plain_text', text: spec.tenantTag },
@@ -2419,12 +2434,31 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
         type: 'plain_text',
         text: deploymentSpecDigest(spec),
       },
-      ...(spec.authoredBy === 'external'
+      ...(spec.authoredBy === 'external' || catalogPublicKey !== undefined
         ? [
             {
               name: 'FLEET_MAINTENANCE_CAPABILITIES',
               type: 'plain_text',
               text: 'required',
+            },
+          ]
+        : []),
+      ...(catalogPublicKey !== undefined
+        ? [
+            {
+              name: 'FLEET_MAINTENANCE_CAPABILITY_PUBLIC_KEY',
+              type: 'plain_text',
+              text: catalogPublicKey,
+            },
+            {
+              name: 'FLEET_DEPLOYMENT_SCRIPT',
+              type: 'plain_text',
+              text: physicalScriptName,
+            },
+            {
+              name: 'FLEET_RESOURCE_ROLE',
+              type: 'plain_text',
+              text: 'platform-catalog',
             },
           ]
         : []),

@@ -5,7 +5,6 @@ import {
   provisionDeploymentIdentityProtocol,
   readDeploymentIdentityProtocol,
 } from '@proofoftech/flowsafe/deployment-identity-protocol';
-import type { MaintenanceCapabilityJwk } from '@proofoftech/flowsafe/host-kit';
 import {
   MAINTENANCE_RECEIPT_HEADER,
   mintAsymmetricMaintenanceCapability,
@@ -42,6 +41,7 @@ import {
   FLEET_AUDIT_PROXY_STATE_BINDING,
   trustedArtifactDigest,
   validateExternalPlatformProfile,
+  validateMaintenanceSigningProfile,
 } from './platform-resources.js';
 import { assertProviderBindingIdentitiesMatchInspection } from './provider-binding-inventory.js';
 import { deploymentSpecDigest } from './spec-digest.js';
@@ -65,12 +65,14 @@ import type {
   FleetRecord,
   LiveDeployment,
   MaintenanceHealth,
+  MaintenanceSigningProfile,
   PromotionGuard,
   ProviderBindingIdentity,
   ProvisioningBackend,
   ScriptInventoryTarget,
   SeedDeploymentIdentityOptions,
 } from './types.js';
+import { isPlatformCatalogRecord } from './types.js';
 
 const RELEASE_DIGEST_LENGTH = 48;
 const DEFAULT_MAINTENANCE_REQUEST_TIMEOUT_MS = 15_000;
@@ -88,9 +90,10 @@ function candidateMaintenanceUrl(
   spec: DeploymentSpec,
   physicalScriptName: string,
   operation: 'ensure-maintenance' | 'maintenance-status',
+  specDigest = deploymentSpecDigest(spec),
 ): URL {
   return new URL(
-    `/.well-known/anchorage/maintenance/${encodeURIComponent(spec.tenantTag)}/${encodeURIComponent(spec.environment)}/${encodeURIComponent(physicalScriptName)}/${deploymentSpecDigest(spec)}/${operation}`,
+    `/.well-known/anchorage/maintenance/${encodeURIComponent(spec.tenantTag)}/${encodeURIComponent(spec.environment)}/${encodeURIComponent(physicalScriptName)}/${specDigest}/${operation}`,
     spec.maintenanceBaseUrl,
   );
 }
@@ -238,6 +241,7 @@ export interface WorkersForPlatformsApi {
     physicalScriptName?: string,
     platformResources?: ExternalPlatformResources,
     application?: import('./types.js').ApplicationBindingTopology,
+    maintenanceCapabilityPublicKey?: string,
   ): Promise<{ artifactVersion: string }>;
   uploadNamespacedStateWorker?(options: {
     readonly spec: DeploymentSpec;
@@ -441,7 +445,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
   readonly #clock: () => number;
   readonly #platformProfileFor?: (
     spec: DeploymentSpec,
-  ) => ExternalPlatformProfile;
+  ) => ExternalPlatformProfile | MaintenanceSigningProfile;
   readonly #namespacedState: Readonly<{
     dispatchNamespace: string;
     sharedOutboundWorkerName: string;
@@ -458,7 +462,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
     readonly clock?: () => number;
     readonly platformProfileFor?: (
       spec: DeploymentSpec,
-    ) => ExternalPlatformProfile;
+    ) => ExternalPlatformProfile | MaintenanceSigningProfile;
     readonly namespacedState: Readonly<{
       dispatchNamespace: string;
       sharedOutboundWorkerName: string;
@@ -566,7 +570,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
   }
 
   #deploymentAuditQueueName(spec: DeploymentSpec): string | undefined {
-    if (!spec.queueProducer) return undefined;
+    if (spec.authoredBy !== 'external' || !spec.queueProducer) return undefined;
     if (
       spec.queueProducer.binding !== 'AUDIT_QUEUE' ||
       !this.#auditQueueName ||
@@ -782,7 +786,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
 
   #platformProfile(spec: DeploymentSpec): ExternalPlatformProfile {
     const profile = this.#platformProfileFor?.(spec);
-    if (!profile) {
+    if (!profile || !('stateWorker' in profile)) {
       throw new Error(
         'external Workers for Platforms deployment requires a trusted platformProfileFor provider',
       );
@@ -791,34 +795,33 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
     return profile;
   }
 
-  #capabilityPrivateKey(spec: DeploymentSpec): MaintenanceCapabilityJwk {
-    const profile = this.#platformProfile(spec);
-    const privateKey = profile.maintenanceCapabilityPrivateKey;
+  #maintenanceSigningProfile(spec: DeploymentSpec): MaintenanceSigningProfile {
+    if (spec.authoredBy === 'external') return this.#platformProfile(spec);
+    const profile = this.#platformProfileFor?.(spec);
+    if (!profile) {
+      throw new Error(
+        'Workers for Platforms maintenance requires a trusted platformProfileFor signer',
+      );
+    }
+    validateMaintenanceSigningProfile(profile);
+    return profile;
+  }
+
+  #assertCatalogMaintenanceBindings(
+    spec: DeploymentSpec,
+    bindings: Readonly<Record<string, string>>,
+    publicKey: string,
+  ): void {
     if (
-      !privateKey ||
-      typeof privateKey.d !== 'string' ||
-      typeof privateKey.x !== 'string' ||
-      typeof privateKey.kid !== 'string'
+      bindings.FLEET_MAINTENANCE_CAPABILITIES !== 'required' ||
+      bindings.FLEET_MAINTENANCE_CAPABILITY_PUBLIC_KEY !== publicKey ||
+      bindings.FLEET_DEPLOYMENT_SCRIPT !== spec.scriptName ||
+      bindings.FLEET_RESOURCE_ROLE !== 'platform-catalog'
     ) {
       throw new Error(
-        'external maintenance requires a fleet-private Ed25519 capability signer',
+        `platform catalog '${spec.scriptName}' requires signed maintenance enrollment with its configured verifier`,
       );
     }
-    const publicKey = canonicalMaintenanceCapabilityPublicKey(
-      JSON.stringify({
-        kty: privateKey.kty,
-        crv: privateKey.crv,
-        alg: privateKey.alg,
-        kid: privateKey.kid,
-        x: privateKey.x,
-      }),
-    );
-    if (publicKey !== profile.maintenanceCapabilityPublicKey) {
-      throw new Error(
-        'maintenance capability signer does not match the immutable platform verifier',
-      );
-    }
-    return privateKey;
   }
 
   #describeExternalPlatformTarget(
@@ -1271,6 +1274,10 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
     database: DatabaseReference,
     fence: ExternalMutationFence,
   ): Promise<void> {
+    if (spec.authoredBy !== 'external' || record.wfpMode !== undefined)
+      throw new Error(
+        'external platform resources require an external deployment',
+      );
     await this.#withMutationFence(fence, async () => {
       const resources = record.platformResources;
       const stateName = externalStateScriptName(spec);
@@ -1377,6 +1384,10 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
     database: DatabaseReference,
     fence: ExternalMutationFence,
   ): Promise<void> {
+    if (spec.authoredBy !== 'external' || record.wfpMode !== undefined)
+      throw new Error(
+        'external platform resources require an external deployment',
+      );
     await this.#withMutationFence(fence, async () => {
       const resources = record.platformResources;
       const stateName = externalStateScriptName(spec);
@@ -1437,8 +1448,29 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
   }> {
     return this.#withMutationFence(fence, async () => {
       const physicalScriptName = this.releaseScriptName(spec);
+      const catalogPublicKey =
+        spec.authoredBy === 'platform'
+          ? this.#maintenanceSigningProfile(spec).maintenanceCapabilityPublicKey
+          : undefined;
       this.#deploymentAuditQueueName(spec);
       const existing = await this.#inspectDispatchWorker(physicalScriptName);
+      if (catalogPublicKey && existing) {
+        const currentKey =
+          existing.plainTextBindings.FLEET_MAINTENANCE_CAPABILITY_PUBLIC_KEY;
+        if (currentKey !== undefined && currentKey !== catalogPublicKey)
+          throw new Error(
+            'platform catalog maintenance verifier cannot change during deployment',
+          );
+        if (
+          existing.plainTextBindings.FLEET_MAINTENANCE_CAPABILITIES ===
+          'required'
+        )
+          this.#assertCatalogMaintenanceBindings(
+            spec,
+            existing.plainTextBindings,
+            catalogPublicKey,
+          );
+      }
       const targetDigest = deploymentSpecDigest(spec);
       if (
         spec.authoredBy === 'external' &&
@@ -1530,17 +1562,18 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
         if (
           existing.tenantTag !== spec.tenantTag ||
           existing.environment !== spec.environment ||
+          !isSha256(existing.desiredSpecDigest) ||
           (spec.authoredBy === 'external' &&
             (existing.desiredSpecDigest !== targetDigest ||
-              existing.schemaVersion !== spec.schemaVersion)) ||
+              existing.schemaVersion !== spec.schemaVersion ||
+              bindingKeys(existing.durableObjectBindings) !==
+                bindingKeys(expectedBindings) ||
+              JSON.stringify(existing.serviceBindings ?? []) !==
+                JSON.stringify(expectedServiceBindings) ||
+              JSON.stringify(existing.queueProducerBindings ?? []) !==
+                JSON.stringify(expectedQueueBindings))) ||
           existing.databaseIds.length !== 1 ||
-          existing.databaseIds[0] !== database.id ||
-          bindingKeys(existing.durableObjectBindings) !==
-            bindingKeys(expectedBindings) ||
-          JSON.stringify(existing.serviceBindings ?? []) !==
-            JSON.stringify(expectedServiceBindings) ||
-          JSON.stringify(existing.queueProducerBindings ?? []) !==
-            JSON.stringify(expectedQueueBindings)
+          existing.databaseIds[0] !== database.id
         ) {
           throw new Error(
             spec.authoredBy === 'external'
@@ -1584,6 +1617,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
             physicalScriptName,
             platformResources,
             application,
+            catalogPublicKey,
           );
         } else {
           deployed = await this.#client.uploadDispatchWorker(
@@ -1592,6 +1626,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
             physicalScriptName,
             platformResources,
             application,
+            catalogPublicKey,
           );
           await this.#client.putDispatchSecrets(physicalScriptName, secrets, {
             includeMaintenanceAdmin: spec.authoredBy !== 'external',
@@ -1601,6 +1636,12 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
           });
         }
         const attested = await this.#inspectDispatchWorker(physicalScriptName);
+        if (catalogPublicKey && attested)
+          this.#assertCatalogMaintenanceBindings(
+            spec,
+            attested.plainTextBindings,
+            catalogPublicKey,
+          );
         if (
           !attested ||
           attested.artifactVersion !== deployed.artifactVersion ||
@@ -1775,13 +1816,17 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
           policyId: policy.policyId,
           policyDigest: policy.policyDigest,
           policyHosts: policy.policyHosts,
-          stateEgress: {
-            resourceGroupId: externalPlatformResourceGroupId(spec),
-            stateScriptName: externalStateScriptName(spec),
-            credentialDigest: createHash('sha256')
-              .update(this.#stateEgressCredential(spec))
-              .digest('hex'),
-          },
+          ...(spec.authoredBy === 'external'
+            ? {
+                stateEgress: {
+                  resourceGroupId: externalPlatformResourceGroupId(spec),
+                  stateScriptName: externalStateScriptName(spec),
+                  credentialDigest: createHash('sha256')
+                    .update(this.#stateEgressCredential(spec))
+                    .digest('hex'),
+                },
+              }
+            : {}),
         },
         guard,
       ),
@@ -1825,8 +1870,19 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
         `immutable release '${physicalScriptName}' does not match persisted artifact version '${expectedArtifactVersion}'`,
       );
     }
+    if (live.desiredSpecDigest !== deploymentSpecDigest(spec))
+      throw new Error(
+        'maintenance target does not match the requested specification digest',
+      );
+    const profile = this.#maintenanceSigningProfile(spec);
+    if (spec.authoredBy === 'platform')
+      this.#assertCatalogMaintenanceBindings(
+        spec,
+        live.plainTextBindings,
+        profile.maintenanceCapabilityPublicKey,
+      );
     const capability = await mintAsymmetricMaintenanceCapability({
-      privateKey: this.#capabilityPrivateKey(spec),
+      privateKey: profile.maintenanceCapabilityPrivateKey,
       operation: 'ensure-maintenance',
       tenantTag: spec.tenantTag,
       environment: spec.environment,
@@ -1900,19 +1956,42 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
     }
     const databaseId = live.databaseIds[0];
     if (!databaseId) throw new Error('D1 binding has no database id');
+    if (!isSha256(live.desiredSpecDigest))
+      throw new Error('dispatch Worker has no valid specification digest');
+    const targetDigest = deploymentSpecDigest(spec);
+    if (
+      (spec.authoredBy === 'external' ||
+        expectedArtifactVersion !== undefined) &&
+      live.desiredSpecDigest !== targetDigest
+    )
+      throw new Error(
+        'inspected artifact does not match the requested specification digest',
+      );
+    const profile = this.#maintenanceSigningProfile(spec);
+    if (spec.authoredBy === 'platform')
+      this.#assertCatalogMaintenanceBindings(
+        spec,
+        live.plainTextBindings,
+        profile.maintenanceCapabilityPublicKey,
+      );
     const capability = await mintAsymmetricMaintenanceCapability({
-      privateKey: this.#capabilityPrivateKey(spec),
+      privateKey: profile.maintenanceCapabilityPrivateKey,
       operation: 'maintenance-status',
       tenantTag: spec.tenantTag,
       environment: spec.environment,
       scriptName: physicalScriptName,
-      specDigest: deploymentSpecDigest(spec),
+      specDigest: live.desiredSpecDigest,
       ttlSeconds:
         Math.ceil(this.#maintenanceRequestTimeoutMs / 1_000) +
         MAINTENANCE_CAPABILITY_SKEW_SECONDS,
     });
     const response = await this.#fetch(
-      candidateMaintenanceUrl(spec, physicalScriptName, 'maintenance-status'),
+      candidateMaintenanceUrl(
+        spec,
+        physicalScriptName,
+        'maintenance-status',
+        live.desiredSpecDigest,
+      ),
       {
         headers: { authorization: `Bearer ${capability.token}` },
         signal: AbortSignal.timeout(this.#maintenanceRequestTimeoutMs),
@@ -2038,7 +2117,12 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
         activeRelease,
       );
       for (const release of releases) {
-        await this.#assertReleaseOwner(spec, release, database);
+        await this.#assertReleaseOwner(
+          spec,
+          release,
+          database,
+          retainedReleases ?? [],
+        );
       }
       for (const release of releases) {
         await this.#client.revokeDispatchSecrets(release.physicalScriptName);
@@ -2060,7 +2144,12 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
         activeRelease,
       );
       for (const release of releases) {
-        await this.#assertReleaseOwner(spec, release, database);
+        await this.#assertReleaseOwner(
+          spec,
+          release,
+          database,
+          retainedReleases ?? [],
+        );
       }
       await this.#client.deleteHostRouting(
         this.#hostRoutingKvId,
@@ -2123,26 +2212,41 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
               ) === index,
           ),
         ]
-      : [active];
+      : [routed];
   }
 
   async #assertReleaseOwner(
     spec: DeploymentSpec,
     release: ExternalReleaseSnapshot,
     database: DatabaseReference,
+    retainedReleases: readonly ExternalReleaseSnapshot[] = [],
   ): Promise<void> {
+    const expected =
+      spec.authoredBy === 'platform'
+        ? [release, ...retainedReleases]
+        : [release];
+    if (
+      spec.authoredBy === 'platform' &&
+      expected.some((target) => target.physicalScriptName !== spec.scriptName)
+    )
+      throw new Error(
+        'catalog teardown authority contains a different physical script',
+      );
     const live = await this.#inspectDispatchWorker(release.physicalScriptName);
     if (!live) return;
     if (
       live.tenantTag !== spec.tenantTag ||
       live.environment !== spec.environment ||
-      live.desiredSpecDigest !== release.specDigest ||
-      live.schemaVersion !== release.releaseSchemaVersion ||
+      !expected.some(
+        (target) =>
+          live.desiredSpecDigest === target.specDigest &&
+          live.schemaVersion === target.releaseSchemaVersion &&
+          (target.artifactVersion === '' ||
+            target.artifactVersion === 'pending' ||
+            live.artifactVersion === target.artifactVersion),
+      ) ||
       live.databaseIds.length !== 1 ||
       live.databaseIds[0] !== database.id ||
-      (release.artifactVersion !== '' &&
-        release.artifactVersion !== 'pending' &&
-        live.artifactVersion !== release.artifactVersion) ||
       (spec.authoredBy === 'external' && live.durableObjectTag !== undefined)
     ) {
       throw new Error(
@@ -2163,7 +2267,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
       activeRelease,
     );
     for (const release of releases) {
-      await this.#assertReleaseOwner(spec, release, database);
+      await this.#assertReleaseOwner(spec, release, database, retainedReleases);
     }
     await this.assertTrafficRemoved(spec);
     const errors: unknown[] = [];
@@ -2247,6 +2351,14 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
   ): Promise<void> {
     await fence.assertOwned();
     if (
+      (Object.hasOwn(record, 'wfpMode') && !isPlatformCatalogRecord(record)) ||
+      ((isPlatformCatalogRecord(record) || spec.authoredBy === 'platform') &&
+        (!isPlatformCatalogRecord(record) ||
+          spec.authoredBy !== 'platform' ||
+          record.scriptName !== spec.scriptName ||
+          record.platformResources !== undefined ||
+          record.platformTarget !== undefined ||
+          record.backendSwitchIntent !== undefined)) ||
       record.tenantTag !== spec.tenantTag ||
       record.environment !== spec.environment ||
       record.routeHostname !== spec.routeHostname ||
@@ -2315,9 +2427,13 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
         );
       }
     }
-    const stateName = externalStateScriptName(spec);
-    const proxyName = externalEgressProxyScriptName(spec);
-    for (const scriptName of [stateName, proxyName]) {
+    const catalog = isPlatformCatalogRecord(record);
+    const stateName = catalog
+      ? record.scriptName
+      : externalStateScriptName(spec);
+    for (const scriptName of catalog
+      ? []
+      : [stateName, externalEgressProxyScriptName(spec)]) {
       if (await this.#inspectControlWorker(scriptName)) {
         throw new Error(
           `trusted platform Worker '${scriptName}' remains before D1 deletion`,

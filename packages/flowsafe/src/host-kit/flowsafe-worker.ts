@@ -202,8 +202,7 @@ export interface FlowsafeWorkerEnv {
   FLEET_DEPLOYMENT_SCRIPT?: string;
   /** Fleet resource group stamped onto trusted state. */
   FLEET_RESOURCE_GROUP?: string;
-  /** Distinguishes the trusted state runtime from an external candidate. */
-  FLEET_RESOURCE_ROLE?: 'platform-state';
+  FLEET_RESOURCE_ROLE?: 'platform-state' | 'platform-catalog';
   /** Per-deployment Worker-to-Durable-Object credential. */
   DEPLOYMENT_IDENTITY_SECRET: string;
   /** The runner DO namespace createDoRunTopology drives. */
@@ -694,22 +693,6 @@ function json(payload: unknown, status = 200): Response {
 const MAINTENANCE_ADMIN_SECRET_PATTERN = /^[\x21-\x7e]{32,256}$/;
 const FLEET_SPEC_DIGEST_PATTERN = /^[a-f0-9]{64}$/;
 
-/**
- * What the shared admin gate decided. A union rather than `Response | null`
- * because an authorized answer carries two things a caller needs: the
- * credential the request presented, which the maintenance route forwards to its
- * Durable Object on the delegating path below, and WHETHER this was that
- * delegating path. Recovering the credential by re-reading the header would
- * either re-duplicate the Bearer extraction this gate exists to own, or need an
- * unreachable `undefined` branch to satisfy the types.
- *
- * `delegated` is reported rather than re-derived for the stronger reason: the
- * rule that makes `MAINTENANCE_ADMIN_SECRET === undefined` mean "delegating" is
- * enforced HERE — an absent secret refuses outright unless the caller asked to
- * delegate — so a route re-testing the env var is restating a decision it
- * cannot see, and would keep answering `true` if this gate's policy ever
- * changed. One decision, reported once.
- */
 type AdminCredentialDecision =
   | {
       readonly authorized: true;
@@ -722,38 +705,13 @@ type AdminCredentialDecision =
     }
   | { readonly authorized: false; readonly response: Response };
 
-/**
- * The credential preamble EVERY /admin surface runs before it does anything.
- *
- * One function rather than a copy per route because this is the trust boundary
- * itself (docs/security-threat-model.md, "The provisioning boundary"): it
- * proves MAINTENANCE_ADMIN_SECRET is configured, proves it is DISTINCT from the
- * deployment identity secret (sharing them would let a Worker-to-DO credential
- * move the fence, and vice versa), and constant-time compares the request's
- * Bearer token against it. A second copy is a second place for one of those
- * three to be dropped in a hurry, and the inventory route lands here next.
- *
- * The surfaces differ in exactly ONE thing, which is why it is a parameter
- * rather than a fork: what an ABSENT secret means. `/admin/execution-fence`
- * always refuses — the fence is the control that stops a deployment executing,
- * so an unauthenticated caller must never reach it. The maintenance routes
- * delegate instead when the fleet requires capability tokens, because there the
- * Durable Object verifies a signed capability and this Worker is only a relay;
- * the longer credential cap applies to that path alone, since a capability
- * token is not a shared secret.
- */
 async function authorizeAdminCredential<Env extends FlowsafeWorkerEnv>(
   request: Request,
   env: Env,
   options: {
     /** Names the surface in the config-error log and the 503 body. */
     readonly surface: string;
-    /**
-     * Whether an absent MAINTENANCE_ADMIN_SECRET delegates authentication
-     * downstream rather than refusing. The caller folds its own policy into
-     * this boolean so the gate stays about credentials only.
-     */
-    readonly delegateWhenUnconfigured: boolean;
+    readonly delegateCapability: boolean;
   },
 ): Promise<AdminCredentialDecision> {
   const { surface } = options;
@@ -775,12 +733,11 @@ async function authorizeAdminCredential<Env extends FlowsafeWorkerEnv>(
     response: json({ error: 'authentication required' }, 401),
   });
   const expected = env.MAINTENANCE_ADMIN_SECRET;
-  const delegating = expected === undefined && options.delegateWhenUnconfigured;
-  if (!delegating) {
-    if (
-      expected === undefined ||
-      !MAINTENANCE_ADMIN_SECRET_PATTERN.test(expected)
-    ) {
+  const delegating = options.delegateCapability;
+  if (expected === undefined) {
+    if (!delegating) return unavailable(`${surface} is not configured`);
+  } else {
+    if (!MAINTENANCE_ADMIN_SECRET_PATTERN.test(expected)) {
       return unavailable(`${surface} is not configured`);
     }
     if (await credentialsMatch(expected, env.DEPLOYMENT_IDENTITY_SECRET)) {
@@ -795,6 +752,7 @@ async function authorizeAdminCredential<Env extends FlowsafeWorkerEnv>(
     return unauthenticated();
   }
   if (
+    !delegating &&
     expected !== undefined &&
     !(await credentialsMatch(credential, expected))
   ) {
@@ -826,10 +784,7 @@ async function maintenanceAdminResponse<Env extends FlowsafeWorkerEnv>(
   }
   const gate = await authorizeAdminCredential(request, env, {
     surface: 'maintenance administration',
-    // An unconfigured secret is survivable HERE and only here: a fleet that
-    // requires capability tokens authenticates at the maintenance DO, which
-    // verifies a signed capability this Worker only relays.
-    delegateWhenUnconfigured: env.FLEET_MAINTENANCE_CAPABILITIES === 'required',
+    delegateCapability: env.FLEET_MAINTENANCE_CAPABILITIES === 'required',
   });
   if (!gate.authorized) return gate.response;
   const deploymentSpecDigest = env.FLEET_SPEC_DIGEST;
@@ -936,7 +891,7 @@ async function executionFenceAdminResponse<Env extends FlowsafeWorkerEnv>(
     // Unconfigured is 503, never open: the fence is the control that stops a
     // deployment executing, so an unauthenticated caller must never move it.
     // There is no capability-token relay behind this route to delegate to.
-    delegateWhenUnconfigured: false,
+    delegateCapability: false,
   });
   if (!gate.authorized) return gate.response;
   const fence = executionFenceForEnv(env);
@@ -1063,7 +1018,7 @@ async function inventoryAdminResponse<Env extends FlowsafeWorkerEnv>(
     // Unconfigured is 503, never open: this read enumerates every outstanding
     // run, approval, and reservation on the deployment. There is no capability
     // relay behind it to delegate to, either.
-    delegateWhenUnconfigured: false,
+    delegateCapability: false,
   });
   if (!gate.authorized) return gate.response;
   try {
@@ -1920,6 +1875,12 @@ export function createFlowsafeMaintenanceDurableObject<
         });
       }
       if (!capability) return undefined;
+      if (
+        this.#env.FLEET_RESOURCE_ROLE === 'platform-catalog' &&
+        (capability.scriptName !== this.#env.FLEET_DEPLOYMENT_SCRIPT ||
+          capability.specDigest !== this.#env.FLEET_SPEC_DIGEST)
+      )
+        return undefined;
       if (operation === 'maintenance-status') return capability;
       const nowSeconds = Math.floor(Date.now() / 1_000);
       const consumed = await this.#state.storage.transaction(

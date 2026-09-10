@@ -118,6 +118,38 @@ export function describePlainWorkerConformance(
   makeHarness: (world?: ProviderWorld) => PlainWorkerHarness,
 ): void {
   describe(`ordinary Worker conformance: ${label}`, () => {
+    it('decommissions the prior artifact after schema advancement and interrupted candidate upload', async () => {
+      const harness = makeHarness();
+      const currentSpec = initialSpec();
+      const targetSpec = migrationSpec();
+      const initial = await provisionReady(harness, currentSpec);
+      harness.backend.deployWorker = async () => {
+        throw new Error('fixture interruption before upload');
+      };
+      await expect(
+        migrate(harness, initial.record, targetSpec),
+      ).rejects.toThrow('fixture interruption before upload');
+      expect(harness.store.record).toMatchObject({
+        phase: 'migrating',
+        schemaVersion: 2,
+        activeRelease: {
+          artifactVersion: initial.record.artifactVersion,
+          specDigest: deploymentSpecDigest(currentSpec),
+          releaseSchemaVersion: 1,
+        },
+      });
+      const removed = await decommissionDeployment({
+        backend: harness.backend,
+        store: harness.store,
+        spec: targetSpec,
+      });
+      expect(removed.record.phase).toBe('decommissioned');
+      expect(harness.world.databases).toHaveLength(0);
+      expect(harness.world.scripts.get(targetSpec.scriptName)?.present).toBe(
+        false,
+      );
+    });
+
     it('inspects a prior release and migrates changed variables, service and queue bindings', async () => {
       const harness = makeHarness();
       const currentSpec: DeploymentSpec = {

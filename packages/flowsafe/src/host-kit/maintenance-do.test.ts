@@ -664,7 +664,60 @@ describe('alarm-driven deployment maintenance', () => {
     });
   });
 
-  it('consumes one-shot capabilities and signs a nonce-bound result', async () => {
+  it.each([
+    'script',
+    'digest',
+  ] as const)('rejects a capability for another catalog %s before maintenance work', async (changed) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    for (const operation of [
+      'ensure-maintenance',
+      'maintenance-status',
+    ] as const) {
+      const { env, instance, storage } = harness();
+      env.MAINTENANCE_ADMIN_SECRET = MAINTENANCE_SECRET;
+      env.FLEET_MAINTENANCE_CAPABILITIES = 'required';
+      env.FLEET_MAINTENANCE_CAPABILITY_PUBLIC_KEY = JSON.stringify(
+        CAPABILITY_PUBLIC_KEY,
+      );
+      Object.assign(env, {
+        FLEET_RESOURCE_ROLE: 'platform-catalog',
+        FLEET_DEPLOYMENT_SCRIPT: 'acme-catalog',
+        FLEET_SPEC_DIGEST: 'a'.repeat(64),
+      });
+      const minted = await mintAsymmetricMaintenanceCapability({
+        privateKey: CAPABILITY_PRIVATE_KEY,
+        operation,
+        tenantTag: 'acme',
+        environment: 'production',
+        scriptName: changed === 'script' ? 'other-catalog' : 'acme-catalog',
+        specDigest: changed === 'digest' ? 'b'.repeat(64) : 'a'.repeat(64),
+        now: () => NOW,
+      });
+      const response = await instance.fetch(
+        new Request(
+          operation === 'ensure-maintenance'
+            ? 'http://maintenance/ensure'
+            : 'http://maintenance/status',
+          {
+            method: operation === 'ensure-maintenance' ? 'POST' : 'GET',
+            headers: { authorization: `Bearer ${minted.token}` },
+          },
+        ),
+      );
+      expect(response.status).toBe(401);
+      expect(response.headers.get(MAINTENANCE_RECEIPT_HEADER)).toBeNull();
+      expect(
+        await storage.get('flowsafe:maintenance-nonces:v1'),
+      ).toBeUndefined();
+      expect(storage.alarmAt).toBeNull();
+    }
+  });
+
+  it.each([
+    false,
+    true,
+  ])('consumes one-shot capabilities and signs a nonce-bound result (local catalog: %s)', async (catalog) => {
     vi.useFakeTimers();
     vi.setSystemTime(NOW);
     const { env, instance } = harness();
@@ -673,6 +726,12 @@ describe('alarm-driven deployment maintenance', () => {
     env.FLEET_MAINTENANCE_CAPABILITY_PUBLIC_KEY = JSON.stringify(
       CAPABILITY_PUBLIC_KEY,
     );
+    if (catalog)
+      Object.assign(env, {
+        FLEET_RESOURCE_ROLE: 'platform-catalog',
+        FLEET_DEPLOYMENT_SCRIPT: 'acme-release-a1b2',
+        FLEET_SPEC_DIGEST: 'a'.repeat(64),
+      });
     const minted = await mintAsymmetricMaintenanceCapability({
       privateKey: CAPABILITY_PRIVATE_KEY,
       operation: 'ensure-maintenance',

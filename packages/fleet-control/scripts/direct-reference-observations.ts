@@ -55,7 +55,12 @@ export async function recordDirectResource(
       id: record.databaseId.startsWith('reserved-') ? null : record.databaseId,
     },
     knownVersionIds: [
-      ...new Set([record.artifactVersion, record.pendingArtifactVersion]),
+      ...new Set([
+        record.artifactVersion,
+        record.pendingArtifactVersion,
+        record.activeRelease?.artifactVersion,
+        record.pendingRelease?.artifactVersion,
+      ]),
     ]
       .filter(
         (value): value is string => value !== undefined && value !== 'pending',

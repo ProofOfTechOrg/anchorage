@@ -41,6 +41,10 @@ import {
   provisionDeployment,
 } from '../src/provision.js';
 import { deploymentSpecDigest } from '../src/spec-digest.js';
+import {
+  D1FleetStateStore,
+  type FleetStateDatabase,
+} from '../src/state-store.js';
 import type {
   ActiveRouteAttestation,
   ApplicationR2BucketSnapshot,
@@ -4532,6 +4536,46 @@ describe('fleet provisioning', () => {
     expect(legacyStore.deleteCalls).toBe(1);
   });
 
+  it.each([
+    'database-reserved',
+    'decommissioned',
+  ] as const)('uses claim-releasing deletion for force %s replay when the lease supports it', async (phase) => {
+    for (const capable of [false, true]) {
+      const backend = new FakeBackend('plain-worker');
+      const store = new MemoryStore();
+      store.supportsDeleteReleasingClaims = capable;
+      const deployment = spec();
+      store.record = {
+        tenantTag: deployment.tenantTag,
+        environment: deployment.environment,
+        backend: backend.kind,
+        scriptName: deployment.scriptName,
+        databaseName: deployment.databaseName,
+        databaseId:
+          phase === 'database-reserved' ? 'reserved-acme' : DATABASE_ID,
+        schemaVersion:
+          phase === 'database-reserved' ? 0 : deployment.schemaVersion,
+        artifactVersion:
+          phase === 'database-reserved' ? 'pending' : 'completed-v1',
+        desiredSpecDigest: deploymentSpecDigest(deployment),
+        durableObjectBindings: [],
+        routeHostname: deployment.routeHostname,
+        phase,
+        updatedAt: '2026-09-10T00:00:00.000Z',
+      };
+      await forceDecommissionDeployment({
+        backend,
+        store,
+        tenantTag: deployment.tenantTag,
+        environment: deployment.environment,
+      });
+      expect(store.record).toBeUndefined();
+      expect(store.deleteReleasingClaimsCalls).toBe(capable ? 1 : 0);
+      expect(store.deleteCalls).toBe(capable ? 0 : 1);
+      expect(backend.events).toEqual([]);
+    }
+  });
+
   it('refuses force decommission during an active cleanup', async () => {
     const backend = new FakeBackend('plain-worker');
     backend.failAt = 'worker';
@@ -8424,8 +8468,12 @@ describe('fleet provisioning', () => {
   });
 
   it('atomically consumes plain and WFP migration carriers while preserving snapshots', async () => {
-    for (const kind of ['plain-worker', 'workers-for-platforms'] as const) {
-      const harness = await boundedDecommissionHarness({ kind });
+    for (const mode of ['plain', 'catalog', 'external'] as const) {
+      const mutable = mode !== 'external';
+      const harness = await boundedDecommissionHarness({
+        kind: mode === 'plain' ? 'plain-worker' : 'workers-for-platforms',
+        external: mode === 'external',
+      });
       const record = harness.store.record as FleetRecord;
       const targetDigest = deploymentSpecDigest(harness.deployment);
       const oldDigest = 'f'.repeat(64);
@@ -8437,10 +8485,9 @@ describe('fleet provisioning', () => {
         application: record.applicationBindings,
       };
       const pendingRelease: ExternalReleaseSnapshot = {
-        physicalScriptName:
-          kind === 'plain-worker'
-            ? record.scriptName
-            : `${record.scriptName}-next`,
+        physicalScriptName: mutable
+          ? record.scriptName
+          : `${record.scriptName}-next`,
         specDigest: targetDigest,
         artifactVersion: 'artifact-next',
         releaseSchemaVersion: harness.deployment.schemaVersion,
@@ -8451,7 +8498,7 @@ describe('fleet provisioning', () => {
         phase: 'migrating',
         desiredSpecDigest: oldDigest,
         activeRelease,
-        ...(kind === 'plain-worker'
+        ...(mutable
           ? {
               pendingSpecDigest: targetDigest,
               pendingArtifactVersion: pendingRelease.artifactVersion,
@@ -8516,6 +8563,168 @@ describe('fleet provisioning', () => {
     expect(withoutArtifact.store.record).not.toHaveProperty(
       'pendingSpecDigest',
     );
+  });
+
+  it.each([
+    'plain-worker',
+    'workers-for-platforms',
+    'external',
+  ] as const)('preserves migration authority through compatibility teardown (%s)', async (mode) => {
+    const external = mode === 'external';
+    const kind = external ? 'workers-for-platforms' : mode;
+    const harness = await boundedDecommissionHarness({ kind, external });
+    const original = harness.store.record;
+    if (!original) throw new Error('legacy teardown fixture record is missing');
+    const activeRelease: ExternalReleaseSnapshot = {
+      ...original.activeRelease,
+      physicalScriptName: external
+        ? `${original.scriptName}-${'f'.repeat(20)}`
+        : original.scriptName,
+      artifactVersion: 'artifact-old',
+      specDigest: 'f'.repeat(64),
+      releaseSchemaVersion: original.schemaVersion,
+      application: original.applicationBindings,
+    };
+    let source: FleetRecord = {
+      ...original,
+      phase: 'migrating',
+      artifactVersion: activeRelease.artifactVersion,
+      desiredSpecDigest: activeRelease.specDigest,
+      activeRelease,
+      pendingSpecDigest: deploymentSpecDigest(harness.deployment),
+      pendingArtifactVersion: 'artifact-next',
+    };
+    if (external) {
+      const target = original.platformTarget;
+      const pendingRelease = original.activeRelease;
+      const resources = original.platformResources;
+      if (!target || !pendingRelease || !resources)
+        throw new Error(
+          'external compatibility fixture lacks target authority',
+        );
+      const { pendingArtifactVersion: _pendingArtifactVersion, ...remaining } =
+        source;
+      source = {
+        ...remaining,
+        platformResources: {
+          ...resources,
+          stateWorker: {
+            ...resources.stateWorker,
+            plane: 'dispatch',
+            dispatchNamespace: 'compatibility',
+          },
+        },
+        pendingRelease,
+        migrationPriorRelease: activeRelease,
+        migrationIntent: {
+          priorRelease: activeRelease,
+          priorTarget: target,
+          priorOutboundPolicy: target.outboundPolicy,
+          targetRelease: pendingRelease,
+          targetSpecDigest: pendingRelease.specDigest,
+          target,
+          subphase: 'schema-applied',
+        },
+      };
+    }
+    const { DatabaseSync } = process.getBuiltinModule(
+      'node:sqlite',
+    ) as typeof import('node:sqlite');
+    const sqlite = new DatabaseSync(':memory:');
+    const query = (sql: string, bindings: readonly unknown[] = []) =>
+      sqlite.prepare(sql).all(
+        ...bindings.map((value) => {
+          if (
+            value === null ||
+            typeof value === 'string' ||
+            typeof value === 'number'
+          )
+            return value;
+          throw new Error('unexpected fixture SQL binding');
+        }),
+      );
+    const db: FleetStateDatabase = {
+      query: async (sql, bindings) => query(sql, bindings),
+      execute: async (sql, bindings) => {
+        query(sql, bindings);
+      },
+      async batch(statements) {
+        sqlite.exec('BEGIN');
+        try {
+          const results = statements.map(({ sql, bindings }) =>
+            query(sql, bindings),
+          );
+          sqlite.exec('COMMIT');
+          return results;
+        } catch (error) {
+          sqlite.exec('ROLLBACK');
+          throw error;
+        }
+      },
+    };
+    try {
+      const store = new D1FleetStateStore(db, { accountId: 'compatibility' });
+      await store.withDeploymentLease(
+        source.tenantTag,
+        source.environment,
+        (lease) => lease.put(source),
+      );
+      const hidden = new Set<PropertyKey>([
+        'advanceDecommissionAttachmentScan',
+        'databaseExportReceiptAuthority',
+        'exportDatabaseReceipt',
+      ]);
+      const backend = new Proxy(harness.backend, {
+        has(target, property) {
+          return !hidden.has(property) && Reflect.has(target, property);
+        },
+        get(target, property) {
+          if (hidden.has(property)) return undefined;
+          const value = Reflect.get(target, property, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+      if (external) {
+        const deletion = vi.spyOn(harness.backend, 'deletePlatformResources');
+        deletion.mockRejectedValueOnce(
+          new Error('fixture state deletion unavailable'),
+        );
+        await expect(
+          decommissionDeployment({ backend, store, spec: harness.deployment }),
+        ).rejects.toThrow('fixture state deletion unavailable');
+        const interrupted = await store.get(
+          source.tenantTag,
+          source.environment,
+        );
+        expect(interrupted).toMatchObject({
+          phase: 'platform-credentials-revoked',
+          desiredSpecDigest: deploymentSpecDigest(harness.deployment),
+          migrationIntent: source.migrationIntent,
+        });
+        await expect(
+          decommissionDeployment({
+            backend,
+            store,
+            spec: { ...harness.deployment, compatibilityDate: '2026-08-11' },
+          }),
+        ).rejects.toThrow(/different desired specification/);
+      }
+      const result = await decommissionDeployment({
+        backend,
+        store,
+        spec: harness.deployment,
+      });
+      expect(result.record.phase).toBe('decommissioned');
+      expect(result.record.activeRelease).toEqual(activeRelease);
+      expect(result.record.desiredSpecDigest).toBe(
+        deploymentSpecDigest(harness.deployment),
+      );
+      expect(result.record).not.toHaveProperty('pendingSpecDigest');
+      expect(result.record).not.toHaveProperty('pendingArtifactVersion');
+      expect(result.record).not.toHaveProperty('migrationIntent');
+    } finally {
+      sqlite.close();
+    }
   });
 
   it('drains bounded backend-switch teardown and preserves legacy late recovery', async () => {

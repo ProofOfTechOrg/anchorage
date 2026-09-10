@@ -15,6 +15,7 @@ import {
   convergeApplicationR2Deletion,
   DEPLOYMENT_PLATFORM_VARIABLE_NAMES,
   liveApplicationTopologyMatches,
+  PLATFORM_CATALOG_VARIABLE_NAMES,
   reserveApplicationR2Resources,
 } from './application-bindings.js';
 import {
@@ -42,6 +43,7 @@ import {
   advanceDecommissionDeployment,
   assertImmutableDeploymentMapping,
   assertNormalDecommissionD1ResourcesDeleted,
+  consumeMigrationCarrier,
   type DecommissionAdvanceAction,
   reconcilePersistedDatabase,
   retainedExternalReleases,
@@ -177,6 +179,10 @@ function recordAt(
   return {
     tenantTag: spec.tenantTag,
     backend: backend.kind,
+    ...(backend.kind === 'workers-for-platforms' &&
+    spec.authoredBy === 'platform'
+      ? { wfpMode: 'platform-catalog' as const }
+      : {}),
     environment: spec.environment,
     scriptName: spec.scriptName,
     databaseId: database.id,
@@ -217,7 +223,9 @@ function expectedBindingKeys(
 export function assertLiveDeploymentMatches(
   live: import('./types.js').LiveDeployment,
   record: Pick<FleetRecord, 'tenantTag' | 'environment' | 'databaseId'> &
-    Partial<Pick<FleetRecord, 'platformResources' | 'applicationBindings'>>,
+    Partial<
+      Pick<FleetRecord, 'backend' | 'platformResources' | 'applicationBindings'>
+    >,
   spec: DeploymentSpec,
   expectedDigest: string,
   expectedApplication:
@@ -306,7 +314,10 @@ export function assertLiveDeploymentMatches(
     !liveApplicationTopologyMatches(
       application,
       live,
-      DEPLOYMENT_PLATFORM_VARIABLE_NAMES,
+      record.backend === 'workers-for-platforms' &&
+        spec.authoredBy === 'platform'
+        ? PLATFORM_CATALOG_VARIABLE_NAMES
+        : DEPLOYMENT_PLATFORM_VARIABLE_NAMES,
     ) ||
     JSON.stringify([...live.secretNames].sort()) !==
       JSON.stringify(expectedSecretNames)
@@ -1819,6 +1830,17 @@ export interface ForceDecommissionDeploymentOptions {
   }>;
 }
 
+async function deleteForceRecord(lease: FleetStateLease): Promise<void> {
+  if (
+    Reflect.has(lease, 'deleteReleasingClaims') &&
+    typeof lease.deleteReleasingClaims === 'function'
+  ) {
+    await lease.deleteReleasingClaims();
+  } else {
+    await lease.delete();
+  }
+}
+
 export async function forceDecommissionDeployment(
   input: ForceDecommissionDeploymentOptions,
 ): Promise<void> {
@@ -1838,12 +1860,12 @@ export async function forceDecommissionDeployment(
         );
       }
       if (current.phase === 'decommissioned') {
-        await lease.delete();
+        await deleteForceRecord(lease);
         return;
       }
       if (current.phase === 'database-reserved') {
         await emitDecommissionAudit(input.options?.audit, current, true);
-        await lease.delete();
+        await deleteForceRecord(lease);
         return;
       }
       if (current.phase === 'database-create-authorized') {
@@ -1927,16 +1949,7 @@ export async function forceDecommissionDeployment(
       };
       await lease.put(record);
       await emitDecommissionAudit(input.options?.audit, record, true);
-      // Capable stores release this deployment's current claims with the row;
-      // legacy lease implementations keep tombstone claims through delete().
-      if (
-        Reflect.has(lease, 'deleteReleasingClaims') &&
-        typeof lease.deleteReleasingClaims === 'function'
-      ) {
-        await lease.deleteReleasingClaims();
-      } else {
-        await lease.delete();
-      }
+      await deleteForceRecord(lease);
     },
   );
 }
@@ -2004,7 +2017,13 @@ async function decommissionDeploymentUnderLease(
       backend,
       fence: lease,
     });
-    record = { ...record, phase: 'decommissioning', updatedAt: nowIso(clock) };
+    record = {
+      ...(record.migrationIntent
+        ? { ...record, desiredSpecDigest: deploymentSpecDigest(spec) }
+        : consumeMigrationCarrier(record, spec, deploymentSpecDigest(spec))),
+      phase: 'decommissioning',
+      updatedAt: nowIso(clock),
+    };
     await lease.put(record);
   }
   if (record.phase === 'decommissioning') {
@@ -2092,8 +2111,14 @@ async function decommissionDeploymentUnderLease(
       await backend.deletePlatformResources(spec, record, database, lease);
       await backend.assertDatabaseDetached(spec, record, database, lease);
     }
+    const {
+      migrationIntent: _migrationIntent,
+      pendingSpecDigest: _pendingSpecDigest,
+      pendingArtifactVersion: _pendingArtifactVersion,
+      ...withoutMigrationCarrier
+    } = record;
     record = {
-      ...record,
+      ...withoutMigrationCarrier,
       phase: 'platform-resources-deleted',
       updatedAt: nowIso(clock),
     };

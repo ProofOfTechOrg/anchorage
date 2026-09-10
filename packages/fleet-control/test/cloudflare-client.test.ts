@@ -129,6 +129,7 @@ describe('CloudflareProvisioningClient', () => {
   it.each([
     'control',
     'dispatch',
+    'catalog',
     'state',
   ] as const)('encodes %s uploads as native multipart with one JSON metadata part', async (kind) => {
     const wasm = new Uint8Array([
@@ -146,6 +147,8 @@ describe('CloudflareProvisioningClient', () => {
       ],
     });
     const observations: unknown[] = [];
+    const publicKey =
+      '{"kty":"OKP","crv":"Ed25519","alg":"EdDSA","kid":"fleet-maintenance-v1","x":"Lhp1XFeTJJx8FLOCKpn4nkO-tWuZZxXX8ziw0LEvUZo"}';
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'inert',
@@ -173,6 +176,32 @@ describe('CloudflareProvisioningClient', () => {
           /* The assertions retain malformed wire metadata. */
         }
         const metadata = form?.get('metadata');
+        if (kind === 'catalog') {
+          expect(JSON.parse(String(metadata)).bindings).toEqual(
+            expect.arrayContaining([
+              {
+                name: 'FLEET_MAINTENANCE_CAPABILITIES',
+                type: 'plain_text',
+                text: 'required',
+              },
+              {
+                name: 'FLEET_MAINTENANCE_CAPABILITY_PUBLIC_KEY',
+                type: 'plain_text',
+                text: publicKey,
+              },
+              {
+                name: 'FLEET_DEPLOYMENT_SCRIPT',
+                type: 'plain_text',
+                text: spec.scriptName,
+              },
+              {
+                name: 'FLEET_RESOURCE_ROLE',
+                type: 'plain_text',
+                text: 'platform-catalog',
+              },
+            ]),
+          );
+        }
         const file = [...(form?.values() ?? [])].find(
           (value) => typeof value !== 'string' && value.name === 'fixture.wasm',
         );
@@ -206,12 +235,19 @@ describe('CloudflareProvisioningClient', () => {
           compatibilityDate: spec.compatibilityDate,
           bindings: [],
         });
-      else if (kind === 'dispatch')
-        await client.uploadDispatchWorker(spec, {
-          id: 'db-acme',
-          name: spec.databaseName,
-          created: false,
-        });
+      else if (kind === 'dispatch' || kind === 'catalog')
+        await client.uploadDispatchWorker(
+          spec,
+          {
+            id: 'db-acme',
+            name: spec.databaseName,
+            created: false,
+          },
+          spec.scriptName,
+          undefined,
+          undefined,
+          kind === 'catalog' ? publicKey : undefined,
+        );
       else
         await client.uploadNamespacedStateWorker({
           spec,

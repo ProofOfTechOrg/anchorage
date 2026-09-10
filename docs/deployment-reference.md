@@ -96,7 +96,7 @@ Host routing belongs to the provisioning control plane. It must resolve a hostna
 | --- | --- | --- |
 | `DEPLOYMENT_TENANT` | None | Required provisioning tag. Protected routes return `503` unless it matches the D1 sentinel |
 | `DEPLOYMENT_IDENTITY_SECRET` | None | Required internal credential. Worker-to-Durable-Object requests fail before storage unless it matches |
-| `MAINTENANCE_ADMIN_SECRET` | None | Shared-secret credential. Execution-fence and inventory routes always return `503` when it is absent or malformed. Ensure-maintenance and maintenance-status instead accept a relayed fleet capability when `FLEET_MAINTENANCE_CAPABILITIES=required` and the secret is absent |
+| `MAINTENANCE_ADMIN_SECRET` | None | Shared-secret credential. Execution-fence and inventory routes always return `503` when it is absent or malformed. Ensure-maintenance and maintenance-status relay fleet capabilities when `FLEET_MAINTENANCE_CAPABILITIES=required`; a local Maintenance object retains this secret for receipt signing |
 | `APPROVAL_ACTOR_TOKENS` | Empty | Static verifier map. Empty means every authenticated route returns 401 |
 | `APPROVAL_SLA_SECONDS` | `14400` | SLA assigned to new approval records |
 | `APPROVAL_ALLOW_SELF_DECISION` | Unset | Separation of duties enabled. Accepts `true` or a comma-separated role list |
@@ -161,7 +161,7 @@ GET  /admin/maintenance-status
 
 The execution-fence and inventory routes require `Authorization: Bearer <maintenance_admin_secret>`. `MAINTENANCE_ADMIN_SECRET` must contain 32 to 256 visible ASCII characters and must differ from `DEPLOYMENT_IDENTITY_SECRET`. If the secret is absent, both routes return `503`; they never delegate authentication to a fleet capability.
 
-The ensure-maintenance and maintenance-status routes use the same shared-secret rule when `MAINTENANCE_ADMIN_SECRET` is configured. When `FLEET_MAINTENANCE_CAPABILITIES=required` and that secret is absent, they instead relay the caller's Ed25519 fleet capability token for downstream verification. The Worker does not compare the relayed token with a shared secret, and caps the credential at 2,048 characters.
+The ensure-maintenance and maintenance-status routes relay the caller’s Ed25519 fleet capability when `FLEET_MAINTENANCE_CAPABILITIES=required`, including when a local Maintenance object has a receipt-signing secret. A configured secret must still be well formed and distinct from deployment identity. The Maintenance object verifies the capability; a raw maintenance secret does not substitute for it. Without the required-capability marker, these routes use shared-secret authentication.
 
 The deployment-identity gate runs before every control-plane route, so a binding or sentinel mismatch still returns `503` before administration.
 

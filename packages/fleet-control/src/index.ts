@@ -279,6 +279,7 @@ export {
   type InvocationAuthorityCarrier,
   type LiveDeployment,
   type MaintenanceHealth,
+  type MaintenanceSigningProfile,
   type NormalDecommissionLifecyclePhase,
   type ObservedActiveRoute,
   type PlainWorkerCleanupOutcome,

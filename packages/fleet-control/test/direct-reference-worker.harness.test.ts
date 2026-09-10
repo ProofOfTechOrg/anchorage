@@ -124,7 +124,16 @@ export default {async fetch(request,env){
     if(mode==='recipes'){
       const initial=context.spec('a','initial'),next=context.spec('a','next');
       const record={tenantTag:initial.tenantTag,environment:initial.environment,backend:'plain-worker',scriptName:initial.scriptName,databaseId:'db-a',databaseName:initial.databaseName,schemaVersion:1,artifactVersion:'version-1',desiredSpecDigest:deploymentSpecDigest(initial),durableObjectBindings:[],routeHostname:initial.routeHostname,phase:'ready',updatedAt:new Date().toISOString()};
-      return Response.json({initial:deploymentSpecDigest(initial),next:deploymentSpecDigest(next),selectedInitial:deploymentSpecDigest(context.specFor(record)),selectedNext:deploymentSpecDigest(context.specFor({...record,phase:'migrating',pendingSpecDigest:deploymentSpecDigest(next)})),providerCalls:calls.length});
+      const activeRelease={physicalScriptName:record.scriptName,specDigest:record.desiredSpecDigest,artifactVersion:record.artifactVersion,releaseSchemaVersion:initial.schemaVersion};
+      const migrating={...record,phase:'migrating',schemaVersion:next.schemaVersion,pendingSpecDigest:deploymentSpecDigest(next),activeRelease};
+      const pendingRelease={physicalScriptName:record.scriptName,specDigest:deploymentSpecDigest(next),artifactVersion:'version-2',releaseSchemaVersion:next.schemaVersion};
+      const teardown={...record,phase:'decommissioning',desiredSpecDigest:deploymentSpecDigest(next),activeRelease,pendingRelease};
+      const resource=await recordDirectResource(context,teardown,'teardown-read');
+      const rejected=[];
+      for(const change of [{activeRelease:{...activeRelease,physicalScriptName:'foreign'}},{activeRelease:{...activeRelease,specDigest:'f'.repeat(64)}},{activeRelease:{...activeRelease,releaseSchemaVersion:99}},{activeRelease:{...activeRelease,artifactVersion:'pending'}},{activeRelease:{...activeRelease,artifactVersion:'foreign'}},{activeRelease:{...activeRelease,topology:{}}},{migrationPriorRelease:activeRelease},{migrationIntent:{}},{phase:'ready'}]){
+        try{context.specFor({...migrating,...change});rejected.push(false);}catch{rejected.push(true);}
+      }
+      return Response.json({initial:deploymentSpecDigest(initial),next:deploymentSpecDigest(next),selectedInitial:deploymentSpecDigest(context.specFor(record)),selectedNext:deploymentSpecDigest(context.specFor(migrating)),selectedTeardown:deploymentSpecDigest(context.specFor(teardown)),knownVersionIds:JSON.parse(resource.identityJson).knownVersionIds,rejected,providerCalls:calls.length});
     }
     if(mode==='release-pin'){
       const slot=await context.journal.readOperation('inventory-before');const run=await context.inventoryStore.readRunByOperation(slot.operationId);
@@ -346,11 +355,17 @@ export default {async fetch(request,env){
       next: string;
       selectedInitial: string;
       selectedNext: string;
+      selectedTeardown: string;
+      knownVersionIds: string[];
+      rejected: boolean[];
       providerCalls: number;
     };
     expect(value.initial).not.toBe(value.next);
     expect(value.selectedInitial).toBe(value.initial);
     expect(value.selectedNext).toBe(value.next);
+    expect(value.selectedTeardown).toBe(value.next);
+    expect(value.knownVersionIds).toEqual(['version-1', 'version-2']);
+    expect(value.rejected).toEqual(Array(9).fill(true));
     expect(value.providerCalls).toBe(0);
   });
 

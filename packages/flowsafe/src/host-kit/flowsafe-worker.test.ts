@@ -752,10 +752,15 @@ describe('createFlowsafeWorker fetch pipeline', () => {
     );
   });
 
-  it('relays a one-shot fleet capability without holding the signing secret', async () => {
+  it.each([
+    undefined,
+    'local-maintenance-receipt-secret-0001',
+  ])('relays a fleet capability with local receipt secret %s', async (receiptSecret) => {
     const worker = makeWorker();
     const { env, ctx } = makeEnv();
     env.FLEET_MAINTENANCE_CAPABILITIES = 'required';
+    if (receiptSecret !== undefined)
+      env.MAINTENANCE_ADMIN_SECRET = receiptSecret;
     env.FLEET_SPEC_DIGEST = 'a'.repeat(64);
     const fetch = vi.fn(async () => {
       const response = Response.json({ alarmAt: 1 });
@@ -784,7 +789,7 @@ describe('createFlowsafeWorker fetch pipeline', () => {
       method: 'POST',
       headers: { authorization: 'Bearer one-shot-capability' },
     });
-    expect(env.MAINTENANCE_ADMIN_SECRET).toBeUndefined();
+    expect(env.MAINTENANCE_ADMIN_SECRET).toBe(receiptSecret);
   });
 
   it('refuses to reuse the Worker-to-DO credential for maintenance administration', async () => {
