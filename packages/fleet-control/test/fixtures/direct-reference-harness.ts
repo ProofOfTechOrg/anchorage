@@ -32,6 +32,10 @@ export async function createDirectReferenceHarness(
   policy: Readonly<{
     maintenanceNow?: () => number;
     applicationFetch?: (request: CloudflareFixtureRequest) => Promise<Response>;
+    providerResponse?: (
+      request: CloudflareFixtureRequest,
+      response: Response,
+    ) => Promise<Response>;
   }> = {},
 ) {
   const manifest = directFixtureManifest();
@@ -80,7 +84,10 @@ export async function createDirectReferenceHarness(
     request: CloudflareFixtureRequest,
   ): Promise<Response> {
     try {
-      return await rest(request);
+      const response = await rest(request);
+      return policy.providerResponse
+        ? await policy.providerResponse(request, response)
+        : response;
     } catch (error) {
       if (
         new URL(request.url).pathname.endsWith('/query') &&
@@ -202,6 +209,18 @@ export async function createDirectReferenceHarness(
       return single({ buckets: selected });
     }
     const key = `${jurisdiction}:${name}`;
+    if (
+      !match[2] &&
+      request.method === 'GET' &&
+      world.consumeFailure('getApplicationR2Bucket')
+    )
+      return Response.json(
+        {
+          success: false,
+          errors: [{ code: 10000, message: 'fixture bucket read denied' }],
+        },
+        { status: 403 },
+      );
     const descriptor = buckets.get(key);
     if (!descriptor) return Response.json({ errors: [] }, { status: 404 });
     const prefix = `${key}/`;
@@ -226,10 +245,22 @@ export async function createDirectReferenceHarness(
     }
     if (!match[2] && request.method === 'GET') return single(descriptor);
     if (!match[2] && request.method === 'DELETE') {
+      const failure = world.consumeFailure('deleteApplicationR2Bucket');
+      const failed = () =>
+        Response.json(
+          {
+            success: false,
+            errors: [{ code: 1, message: 'fixture bucket deletion failed' }],
+          },
+          { status: 400 },
+        );
+      if (failure && !failure.dispatched) return failed();
       const objects = await applicationBytes.list({ prefix, limit: 1 });
       if (objects.objects.length)
         return new Response('bucket nonempty', { status: 409 });
       buckets.delete(key);
+      await world.applyAfter('deleteApplicationR2Bucket');
+      if (failure) return failed();
       return single({});
     }
     throw new Error('unexpected fixture R2 method');

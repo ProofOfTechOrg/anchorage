@@ -94,6 +94,10 @@ export default {async fetch(request,env){
     try{const worker=createDirectReferenceWorker({...manifest,referenceRuntime:{...manifest.referenceRuntime,invocationTimeoutMs:1000}},{fetch:provider});const response=await worker.fetch(request,current);return Response.json({status:response.status,observedFailure,body:await response.json(),providerCalls:calls.length});}
     finally{Object.defineProperty(performance,'now',{configurable:true,value:oldNow});DirectReferenceTransport.prototype.snapshot=oldSnapshot;}
   }
+  if(mode==='residual-claims'){
+    const context=await createDirectReferenceContext(manifest,current,{startedAt:performance.now(),signal:request.signal,fetch:provider});
+    return Response.json({sameSet:await context.recoveryClaimSetPresent(),exact:await context.recoveryResidualClaimsPresent('witness-script',["witness-'bucket"]),emptyBuckets:await context.recoveryResidualClaimsPresent('witness-script',[]),providerCalls:calls.length});
+  }
   if(mode==='observations'){
     const context=await createDirectReferenceContext(manifest,current,{startedAt:performance.now(),signal:request.signal,fetch:provider});
     const spec=context.spec('a','initial'),digest=deploymentSpecDigest(spec);
@@ -222,6 +226,126 @@ export default {async fetch(request,env){
     );
     expect(response.status).toBe(401);
     expect(response.headers.get('X-Fixture-Calls')).toBe('[]');
+  });
+
+  it('checks the fixed recovery set and exact witness keys across claim owners', async () => {
+    const recoverySet = `deployment:${manifest.names.roles.recovery.tenantTag}:${manifest.environment}`;
+    const cases = [
+      [
+        'account',
+        'worker-script',
+        'unrelated-script',
+        recoverySet,
+        true,
+        true,
+        true,
+      ],
+      [
+        'account',
+        'worker-script',
+        'witness-script',
+        'foreign-set',
+        false,
+        true,
+        true,
+      ],
+      [
+        'account',
+        'r2-bucket',
+        "witness-'bucket",
+        'foreign-set',
+        false,
+        true,
+        false,
+      ],
+      [
+        'account',
+        'worker-script',
+        'witness-script-extra',
+        'foreign-set',
+        false,
+        false,
+        false,
+      ],
+      [
+        'account',
+        'r2-bucket',
+        "witness-'bucket-extra",
+        'foreign-set',
+        false,
+        false,
+        false,
+      ],
+      [
+        'another-account',
+        'worker-script',
+        'witness-script',
+        recoverySet,
+        false,
+        false,
+        false,
+      ],
+      [
+        'another-account',
+        'r2-bucket',
+        "witness-'bucket",
+        recoverySet,
+        false,
+        false,
+        false,
+      ],
+    ] as const;
+    for (const [
+      account,
+      type,
+      name,
+      set,
+      sameSet,
+      exact,
+      emptyBuckets,
+    ] of cases) {
+      await db
+        .prepare(
+          'INSERT INTO anchorage_platform_plane_claims(account_id,resource_type,resource_name,resource_role,resource_set_key,platform_plane_identity) VALUES(?,?,?,?,?,?)',
+        )
+        .bind(
+          account,
+          type,
+          name,
+          type === 'r2-bucket' ? 'deployment-r2' : 'deployment-worker',
+          set,
+          'foreign-owner',
+        )
+        .run();
+      try {
+        const response = await call(
+          { kind: 'control-read' },
+          'residual-claims',
+        );
+        expect(response.status).toBe(200);
+        expect(await response.json()).toEqual({
+          sameSet,
+          exact,
+          emptyBuckets,
+          providerCalls: 0,
+        });
+      } finally {
+        await db
+          .prepare(
+            'DELETE FROM anchorage_platform_plane_claims WHERE account_id=? AND resource_type=? AND resource_name=?',
+          )
+          .bind(account, type, name)
+          .run();
+      }
+    }
+    expect(
+      await (await call({ kind: 'control-read' }, 'residual-claims')).json(),
+    ).toEqual({
+      sameSet: false,
+      exact: false,
+      emptyBuckets: false,
+      providerCalls: 0,
+    });
   });
 
   it('retains resource and settlement identities through real context producers', async () => {

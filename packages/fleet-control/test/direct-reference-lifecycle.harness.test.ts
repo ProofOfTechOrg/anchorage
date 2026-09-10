@@ -552,7 +552,7 @@ describe.sequential('private force through native control state', {
     return { ready, receipt };
   }
 
-  it('captures before the force phase write and retains the original witness across deletion failure and replay', async () => {
+  it('preserves force witnesses and resumes settled residual cleanup after exhausting the provider budget', async () => {
     const fixture = await createDirectReferenceHarness();
     try {
       const names = fixture.manifest.names.roles.recovery;
@@ -720,6 +720,662 @@ describe.sequential('private force through native control state', {
         ).response.status,
       ).toBe(409);
       expect(fixture.world.mutationLog).toEqual(after);
+      const archived = await fixture.journal().readForceAfter();
+      const operations = await fixture.db
+        .prepare('SELECT * FROM direct_reference_operations ORDER BY slot')
+        .all();
+      const exports = await fixture.exportBytes.list();
+      const exhausted = await fixture.call({ kind: 'recover-force-residual' });
+      expect(exhausted.response.status).toBe(500);
+      expect(exhausted.value).toMatchObject({
+        ok: false,
+        error: { code: 'operation-refused' },
+      });
+      expect(exhausted.response.headers.get('X-Direct-Provider-Attempts')).toBe(
+        '100',
+      );
+      expect(retainedScript.present).toBe(false);
+      expect(retainedScript.versions).toEqual([]);
+      for (const resource of ready.applicationResources ?? [])
+        expect(
+          fixture.buckets.has(
+            `${resource.jurisdiction}:${resource.bucketName}`,
+          ),
+        ).toBe(false);
+      const exhaustedDeletes = fixture.projection.requests.filter(
+        (request) => request.method === 'DELETE',
+      );
+      expect(await fixture.journal().readForceAfter()).toEqual(archived);
+      expect(
+        await fixture.fleetStore.readCleanupReceipt(receipt.operationId),
+      ).toEqual(receipt);
+      expect(
+        (
+          await fixture.db
+            .prepare('SELECT * FROM direct_reference_operations ORDER BY slot')
+            .all()
+        ).results,
+      ).toEqual(operations.results);
+      await fixture.reload();
+      const recovered = await fixture.success<{
+        returned: true;
+        observation: Record<string, unknown>;
+      }>({ kind: 'recover-force-residual' });
+      expect(
+        fixture.projection.requests.filter(
+          (request) => request.method === 'DELETE',
+        ),
+      ).toEqual(exhaustedDeletes);
+      expect(recovered).toMatchObject({
+        returned: true,
+        observation: {
+          beforeIdentitySha256: footprint.observation.beforeIdentitySha256,
+          fleetRecordPresent: false,
+          deploymentClaimsPresent: false,
+          database: { id: ready.databaseId, observedName: null },
+          worker: {
+            scriptPresent: false,
+            currentVersionIds: null,
+            currentNamespaceIds: [],
+            survivingRecordedNamespaceIds: [],
+            customDomains: [],
+            zoneRoutes: [],
+            currentSecretNames: [],
+          },
+          buckets: (ready.applicationResources ?? []).map((resource) => ({
+            bucketName: resource.bucketName,
+            observedCreationDate: null,
+          })),
+          priorCleanup: {
+            operationId: receipt.operationId,
+            matchesBefore: true,
+          },
+        },
+      });
+      expect(retainedScript.present).toBe(false);
+      expect(retainedScript.versions).toEqual([]);
+      expect(fixture.world.durableObjectNamespaces).toEqual([
+        {
+          id: 'unrelated-namespace',
+          script: 'unrelated-script',
+          className: 'Other',
+        },
+      ]);
+      for (const resource of ready.applicationResources ?? [])
+        expect(
+          fixture.buckets.has(
+            `${resource.jurisdiction}:${resource.bucketName}`,
+          ),
+        ).toBe(false);
+      const deletes = fixture.projection.requests.filter(
+        (request) => request.method === 'DELETE',
+      );
+      await fixture.reload();
+      expect(
+        await fixture.success({ kind: 'recover-force-residual' }),
+      ).toMatchObject({
+        returned: true,
+        observation: recovered.observation,
+      });
+      expect(
+        fixture.projection.requests.filter(
+          (request) => request.method === 'DELETE',
+        ),
+      ).toEqual(deletes);
+      expect(await fixture.success({ kind: 'force-observe' })).toEqual(
+        footprint,
+      );
+      expect(await fixture.journal().readForceAfter()).toEqual(archived);
+      expect(await fixture.journal().readForceBefore()).toEqual(before);
+      expect(
+        (
+          await fixture.db
+            .prepare('SELECT * FROM direct_reference_operations ORDER BY slot')
+            .all()
+        ).results,
+      ).toEqual(operations.results);
+      expect(
+        await fixture.fleetStore.readCleanupReceipt(receipt.operationId),
+      ).toEqual(receipt);
+      expect(
+        await fixture.fleetStore.get(names.tenantTag, environment),
+      ).toBeUndefined();
+      expect((await fixture.exportBytes.list()).objects).toEqual(
+        exports.objects,
+      );
+      expect(fixture.world.exports.size).toBe(exportCount);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it('refuses residual deletion when archived evidence or current ownership and resource facts change', async () => {
+    let hideAttachmentIdentity = false;
+    const fixture = await createDirectReferenceHarness({
+      async providerResponse(request, response) {
+        const path = new URL(request.url).pathname;
+        if (
+          !hideAttachmentIdentity ||
+          request.method !== 'GET' ||
+          !path.includes('/scripts/foreign-attachment/') ||
+          !(
+            path.endsWith('/versions/foreign-version') ||
+            path.endsWith('/settings')
+          )
+        )
+          return response;
+        const body = (await response.json()) as {
+          result: {
+            resources?: { bindings: Record<string, unknown>[] };
+            bindings?: Record<string, unknown>[];
+          };
+        };
+        const bindings =
+          body.result.resources?.bindings ?? body.result.bindings;
+        if (!bindings)
+          throw new Error('fixture attachment response is missing bindings');
+        for (const binding of bindings) {
+          if (binding.type === 'd1') delete binding.database_id;
+          if (binding.type === 'r2_bucket') delete binding.bucket_name;
+        }
+        return Response.json(body, {
+          status: response.status,
+          headers: response.headers,
+        });
+      },
+    });
+    try {
+      const { ready, receipt } = await readyRecovery(fixture);
+      const database = fixture.world.databases.find(
+        (entry) => entry.databaseId === ready.databaseId,
+      );
+      if (!database) throw new Error('recovery database is missing');
+      await fixture.success({ kind: 'force-recovery' });
+      const mutations = [...fixture.world.mutationLog];
+      const deletes = fixture.projection.requests.filter(
+        (request) => request.method === 'DELETE',
+      );
+      async function refused(reason: string) {
+        const result = await fixture.call({ kind: 'recover-force-residual' });
+        expect(result.value.ok, reason).toBe(false);
+        expect(fixture.world.mutationLog, reason).toEqual(mutations);
+        expect(
+          fixture.projection.requests.filter(
+            (request) => request.method === 'DELETE',
+          ),
+          reason,
+        ).toEqual(deletes);
+      }
+      await refused('missing force-after');
+      await fixture.success({ kind: 'force-observe' });
+      const archived = await fixture.journal().readForceAfter();
+      if (!archived) throw new Error('force-after is missing');
+      const original = JSON.parse(archived.identityJson);
+      async function storeAfter(
+        identityJson: string,
+        provenanceJson = archived?.provenanceJson,
+      ) {
+        if (!provenanceJson) throw new Error('force provenance is missing');
+        const hash = (field: string, value: string) =>
+          createHash('sha256')
+            .update(
+              JSON.stringify([
+                'observation',
+                fixture.manifest.resourcePrefix,
+                'force-after',
+                'recovery',
+                field,
+                value,
+              ]),
+            )
+            .digest('hex');
+        await fixture.db
+          .prepare(
+            "UPDATE direct_reference_observations SET identity_json=?,identity_sha256=?,provenance_json=?,provenance_sha256=? WHERE observation_kind='force-after'",
+          )
+          .bind(
+            identityJson,
+            hash('identity', identityJson),
+            provenanceJson,
+            hash('provenance', provenanceJson),
+          )
+          .run();
+      }
+      const malformed = [
+        {
+          ...original,
+          worker: { ...original.worker, scriptPresent: undefined },
+        },
+        { ...original, extra: true },
+        {
+          ...original,
+          worker: {
+            ...original.worker,
+            currentVersionIds: [
+              ...original.worker.currentVersionIds,
+              original.worker.currentVersionIds[0],
+            ],
+          },
+        },
+        {
+          ...original,
+          database: { ...original.database, id: 'foreign-database' },
+        },
+        { ...original, buckets: [] },
+      ];
+      for (const [index, observation] of malformed.entries()) {
+        await storeAfter(JSON.stringify(observation));
+        expect(await fixture.journal().readForceAfter()).toBeDefined();
+        await refused(`valid-hash malformed force-after ${index}`);
+        expect((await fixture.call({ kind: 'force-observe' })).value.ok).toBe(
+          false,
+        );
+      }
+      for (const observation of [
+        { ...original, fleetRecordPresent: true },
+        { ...original, deploymentClaimsPresent: true },
+        {
+          ...original,
+          database: { ...original.database, observedName: ready.databaseName },
+        },
+        {
+          ...original,
+          worker: { ...original.worker, workersDevEnabled: null },
+        },
+        { ...original, worker: { ...original.worker, scriptPresent: false } },
+        {
+          ...original,
+          worker: { ...original.worker, currentVersionIds: null },
+        },
+        {
+          ...original,
+          buckets: original.buckets.map((bucket: Record<string, unknown>) => ({
+            ...bucket,
+            observedCreationDate: null,
+          })),
+        },
+        {
+          ...original,
+          priorCleanup: { ...original.priorCleanup, matchesBefore: false },
+        },
+      ]) {
+        await storeAfter(JSON.stringify(observation));
+        await refused('complete but unsuccessful initial footprint');
+      }
+      await storeAfter(
+        archived.identityJson,
+        JSON.stringify({ startedAtMs: 0, completedAtMs: -1 }),
+      );
+      await refused('valid-hash invalid provenance');
+      await storeAfter(archived.identityJson);
+      await fixture.fleetStore.withDeploymentLease(
+        ready.tenantTag,
+        ready.environment,
+        (lease) => lease.put(ready),
+      );
+      await refused('replacement fleet record');
+      await fixture.fleetStore.withDeploymentLease(
+        ready.tenantTag,
+        ready.environment,
+        (lease) => {
+          if (!lease.deleteReleasingClaims)
+            throw new Error('claim release is unavailable');
+          return lease.deleteReleasingClaims();
+        },
+      );
+      const resource = ready.applicationResources?.[0];
+      if (!resource) throw new Error('recovery bucket witness is missing');
+      for (const [type, name, set] of [
+        [
+          'worker-script',
+          'unrelated-worker',
+          `deployment:${ready.tenantTag}:${ready.environment}`,
+        ],
+        ['worker-script', ready.scriptName, 'foreign-set'],
+        ['r2-bucket', resource.bucketName, 'foreign-set'],
+      ]) {
+        await fixture.db
+          .prepare(
+            'INSERT INTO anchorage_platform_plane_claims (account_id,resource_type,resource_name,resource_role,resource_set_key,platform_plane_identity) VALUES (?,?,?,?,?,?)',
+          )
+          .bind(
+            fixture.binding.accountId,
+            type,
+            name,
+            type === 'r2-bucket' ? 'deployment-r2' : 'deployment-worker',
+            set,
+            'fixture-residual-foreign',
+          )
+          .run();
+        await refused(`visible ${type} claim ${name}`);
+        await fixture.db
+          .prepare(
+            "DELETE FROM anchorage_platform_plane_claims WHERE platform_plane_identity='fixture-residual-foreign'",
+          )
+          .run();
+      }
+      fixture.world.databases.push(database);
+      await refused('D1 reappeared');
+      fixture.world.databases.splice(
+        fixture.world.databases.indexOf(database),
+        1,
+      );
+      const script = fixture.world.scripts.get(ready.scriptName);
+      if (!script) throw new Error('retained Worker is missing');
+      script.subdomain.enabled = true;
+      await refused('workers.dev enabled');
+      script.subdomain.enabled = false;
+      script.subdomain.previewsEnabled = true;
+      await refused('preview URLs enabled');
+      script.subdomain.previewsEnabled = false;
+      fixture.world.customDomains.push({
+        id: 'residual-domain',
+        hostname: 'foreign.example.test',
+        service: ready.scriptName,
+      });
+      await refused('custom domain returned');
+      fixture.world.customDomains.pop();
+      fixture.world.zones.push({ id: 'residual-zone' });
+      fixture.world.routes.push({
+        zoneId: 'residual-zone',
+        id: 'residual-route',
+        pattern: 'foreign.example.test/*',
+        script: ready.scriptName,
+      });
+      await refused('zone route returned');
+      fixture.world.routes.pop();
+      fixture.world.zones.pop();
+      script.secretNames.add('FOREIGN_SECRET');
+      await refused('secret returned');
+      script.secretNames.delete('FOREIGN_SECRET');
+      const versions = [...script.versions];
+      const first = versions[0];
+      if (!first) throw new Error('retained version is missing');
+      script.versions.push({ ...first, versionId: 'foreign-version' });
+      await refused('unrecorded version');
+      script.versions = versions.filter(
+        (version) => version.versionId !== ready.artifactVersion,
+      );
+      await refused('original version anchor missing');
+      script.versions = [];
+      await refused('retained version inventory empty');
+      script.versions = versions;
+      const namespaces = [...fixture.world.durableObjectNamespaces];
+      fixture.world.durableObjectNamespaces.push({
+        id: 'foreign-namespace',
+        script: ready.scriptName,
+        className: 'Foreign',
+      });
+      await refused('unrecorded namespace');
+      fixture.world.durableObjectNamespaces.splice(
+        0,
+        fixture.world.durableObjectNamespaces.length,
+        ...namespaces.slice(1),
+      );
+      await refused('recorded namespace missing');
+      fixture.world.durableObjectNamespaces.splice(
+        0,
+        fixture.world.durableObjectNamespaces.length,
+        ...namespaces,
+      );
+      const bucketKey = `${resource.jurisdiction}:${resource.bucketName}`;
+      const bucket = fixture.buckets.get(bucketKey);
+      if (!bucket) throw new Error('retained bucket is missing');
+      const creationDate = bucket.creation_date;
+      bucket.creation_date = new Date(
+        Date.parse(creationDate) + 1000,
+      ).toISOString();
+      await refused('bucket incarnation changed');
+      bucket.creation_date = creationDate;
+      fixture.buckets.delete(bucketKey);
+      await refused('bucket absent while Worker remains');
+      fixture.buckets.set(bucketKey, bucket);
+      const objectKey = `${bucketKey}/foreign-object`;
+      await fixture.applicationBytes.put(objectKey, 'must survive');
+      await refused('nonempty bucket prevents Worker deletion');
+      expect(
+        await (await fixture.applicationBytes.get(objectKey))?.text(),
+      ).toBe('must survive');
+      await fixture.applicationBytes.delete(objectKey);
+      for (const binding of [
+        { type: 'd1', name: 'FOREIGN_DATABASE', database_id: ready.databaseId },
+        {
+          type: 'r2_bucket',
+          name: 'FOREIGN_BUCKET',
+          bucket_name: resource.bucketName,
+        },
+      ]) {
+        fixture.world.seedScript('foreign-attachment', {
+          versions: [
+            { ...first, versionId: 'foreign-version', bindings: [binding] },
+          ],
+          deployment: [{ versionId: 'foreign-version', percentage: 100 }],
+          subdomain: { enabled: false, previewsEnabled: false },
+        });
+        await refused(`foreign ordinary ${binding.type} attachment`);
+        hideAttachmentIdentity = true;
+        await refused(`incomplete foreign ordinary ${binding.type} attachment`);
+        hideAttachmentIdentity = false;
+        expect(
+          fixture.world.scripts.get('foreign-attachment')?.versions[0]
+            ?.bindings,
+        ).toEqual([binding]);
+        fixture.world.scripts.delete('foreign-attachment');
+        fixture.world.dispatchNamespaces.push({
+          name: 'foreign-dispatch',
+          scripts: [{ name: 'foreign-attachment', bindings: [binding] }],
+        });
+        await refused(`foreign dispatch ${binding.type} attachment`);
+        hideAttachmentIdentity = true;
+        await refused(`incomplete foreign dispatch ${binding.type} attachment`);
+        hideAttachmentIdentity = false;
+        expect(
+          fixture.world.dispatchNamespaces.at(-1)?.scripts[0]?.bindings,
+        ).toEqual([binding]);
+        fixture.world.dispatchNamespaces.pop();
+      }
+      const completedAtMs = receipt.completedAtMs;
+      if (completedAtMs === undefined)
+        throw new Error('cleanup completion time is missing');
+      await fixture.db
+        .prepare(
+          'UPDATE anchorage_fleet_cleanup_receipts SET completed_at_ms=? WHERE operation_id=?',
+        )
+        .bind(completedAtMs + 1, receipt.operationId)
+        .run();
+      await refused('historical receipt changed');
+      await fixture.db
+        .prepare(
+          'UPDATE anchorage_fleet_cleanup_receipts SET completed_at_ms=? WHERE operation_id=?',
+        )
+        .bind(completedAtMs, receipt.operationId)
+        .run();
+      for (const fault of ['claim', 'lease'] as const) {
+        let applied = false;
+        fixture.world.afterNext('listCustomDomains', async () => {
+          if (fault === 'claim') {
+            await fixture.db
+              .prepare(
+                'INSERT INTO anchorage_platform_plane_claims (account_id,resource_type,resource_name,resource_role,resource_set_key,platform_plane_identity) VALUES (?,?,?,?,?,?)',
+              )
+              .bind(
+                fixture.binding.accountId,
+                'worker-script',
+                ready.scriptName,
+                'deployment-worker',
+                'foreign-set',
+                'fixture-residual-foreign',
+              )
+              .run();
+          } else {
+            await fixture.db
+              .prepare(
+                'UPDATE anchorage_fleet_leases SET owner_token=? WHERE tenant_tag=? AND environment=?',
+              )
+              .bind('foreign-lease-owner', ready.tenantTag, ready.environment)
+              .run();
+          }
+          applied = true;
+        });
+        await refused(`${fault} changed during provider reads`);
+        expect(applied).toBe(true);
+        await fixture.db
+          .prepare(
+            "DELETE FROM anchorage_platform_plane_claims WHERE platform_plane_identity='fixture-residual-foreign'",
+          )
+          .run();
+        await fixture.db
+          .prepare(
+            "DELETE FROM anchorage_fleet_leases WHERE owner_token='foreign-lease-owner'",
+          )
+          .run();
+      }
+      expect(await fixture.journal().readForceAfter()).toEqual(archived);
+      expect(
+        await fixture.fleetStore.readCleanupReceipt(receipt.operationId),
+      ).toEqual(receipt);
+      expect(
+        await fixture.success({ kind: 'recover-force-residual' }),
+      ).toMatchObject({ returned: true });
+      expect(fixture.bridgeErrors).toEqual([]);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it('retries settled residual deletions without duplicating committed Worker or bucket deletes', async () => {
+    const fixture = await createDirectReferenceHarness();
+    try {
+      const { ready, receipt } = await readyRecovery(fixture);
+      await fixture.success({ kind: 'force-recovery' });
+      const observed = await fixture.success({ kind: 'force-observe' });
+      const resource = ready.applicationResources?.[0];
+      const script = fixture.world.scripts.get(ready.scriptName);
+      if (!resource || !script) throw new Error('residual fixture is missing');
+      const bucketKey = `${resource.jurisdiction}:${resource.bucketName}`;
+      const originalDeletes = fixture.projection.requests.filter(
+        (request) => request.method === 'DELETE',
+      ).length;
+      fixture.world.failNext('deleteWorkerScript', { dispatched: false });
+      expect(
+        (await fixture.call({ kind: 'recover-force-residual' })).value.ok,
+      ).toBe(false);
+      expect(fixture.world.peekFailure('deleteWorkerScript')).toBeUndefined();
+      expect(script.present).toBe(true);
+      expect(fixture.buckets.has(bucketKey)).toBe(true);
+      const namespaces = [...fixture.world.durableObjectNamespaces];
+      fixture.world.failNext('deleteWorkerScript', { dispatched: true });
+      fixture.world.afterNext('deleteWorkerScript', () => {
+        fixture.world.durableObjectNamespaces.push(
+          ...namespaces.map((namespace) => ({
+            ...namespace,
+            script: 'provider-lag',
+          })),
+        );
+      });
+      expect(
+        (await fixture.call({ kind: 'recover-force-residual' })).value.ok,
+      ).toBe(false);
+      expect(script.present).toBe(false);
+      expect(fixture.buckets.has(bucketKey)).toBe(true);
+      expect(
+        fixture.world.mutationLog.filter(
+          (entry) => entry === `delete-script:${ready.scriptName}`,
+        ),
+      ).toHaveLength(1);
+      const afterWorker = fixture.projection.requests.filter(
+        (request) => request.method === 'DELETE',
+      );
+      expect(afterWorker).toHaveLength(originalDeletes + 2);
+      await fixture.reload();
+      expect(
+        (await fixture.call({ kind: 'recover-force-residual' })).value.ok,
+      ).toBe(false);
+      expect(
+        fixture.projection.requests.filter(
+          (request) => request.method === 'DELETE',
+        ),
+      ).toEqual(afterWorker);
+      expect(fixture.buckets.has(bucketKey)).toBe(true);
+      fixture.world.durableObjectNamespaces.length = 0;
+      fixture.world.failNext('deleteApplicationR2Bucket', {
+        dispatched: false,
+      });
+      expect(
+        (await fixture.call({ kind: 'recover-force-residual' })).value.ok,
+      ).toBe(false);
+      expect(
+        fixture.world.peekFailure('deleteApplicationR2Bucket'),
+      ).toBeUndefined();
+      expect(fixture.buckets.has(bucketKey)).toBe(true);
+      fixture.world.failNext('deleteApplicationR2Bucket', { dispatched: true });
+      fixture.world.afterNext('deleteApplicationR2Bucket', () => {
+        fixture.world.failNext('getApplicationR2Bucket', { dispatched: false });
+      });
+      expect(
+        (await fixture.call({ kind: 'recover-force-residual' })).value.ok,
+      ).toBe(false);
+      expect(
+        fixture.world.peekFailure('deleteApplicationR2Bucket'),
+      ).toBeUndefined();
+      expect(fixture.buckets.has(bucketKey)).toBe(false);
+      const afterBucket = fixture.projection.requests.filter(
+        (request) => request.method === 'DELETE',
+      );
+      expect(afterBucket).toHaveLength(originalDeletes + 4);
+      await fixture.db
+        .prepare(
+          'INSERT INTO anchorage_platform_plane_claims (account_id,resource_type,resource_name,resource_role,resource_set_key,platform_plane_identity) VALUES (?,?,?,?,?,?)',
+        )
+        .bind(
+          fixture.binding.accountId,
+          'r2-bucket',
+          resource.bucketName,
+          'deployment-r2',
+          'foreign-set',
+          'fixture-residual-foreign',
+        )
+        .run();
+      expect(
+        (await fixture.call({ kind: 'recover-force-residual' })).value.ok,
+      ).toBe(false);
+      expect(
+        fixture.projection.requests.filter(
+          (request) => request.method === 'DELETE',
+        ),
+      ).toEqual(afterBucket);
+      await fixture.db
+        .prepare(
+          "DELETE FROM anchorage_platform_plane_claims WHERE platform_plane_identity='fixture-residual-foreign'",
+        )
+        .run();
+      await fixture.reload();
+      expect(
+        (await fixture.call({ kind: 'recover-force-residual' })).value.ok,
+      ).toBe(false);
+      expect(
+        fixture.world.peekFailure('getApplicationR2Bucket'),
+      ).toBeUndefined();
+      expect(
+        fixture.projection.requests.filter(
+          (request) => request.method === 'DELETE',
+        ),
+      ).toEqual(afterBucket);
+      expect(
+        await fixture.success({ kind: 'recover-force-residual' }),
+      ).toMatchObject({ returned: true });
+      expect(
+        fixture.projection.requests.filter(
+          (request) => request.method === 'DELETE',
+        ),
+      ).toEqual(afterBucket);
+      expect(await fixture.success({ kind: 'force-observe' })).toEqual(
+        observed,
+      );
+      expect(
+        await fixture.fleetStore.readCleanupReceipt(receipt.operationId),
+      ).toEqual(receipt);
+      expect(fixture.bridgeErrors).toEqual([]);
     } finally {
       await fixture.close();
     }

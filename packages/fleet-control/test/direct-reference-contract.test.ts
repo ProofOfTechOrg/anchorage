@@ -44,6 +44,7 @@ const actions: readonly DirectReferenceAction[] = [
   { kind: 'decommission-restart-blocked', role: 'recovery', token: [] },
   { kind: 'force-recovery' },
   { kind: 'force-observe' },
+  { kind: 'recover-force-residual' },
   { kind: 'tenant-probe', role: 'a', operation: 'health' },
   { kind: 'tenant-probe', role: 'b', operation: 'object-put' },
   { kind: 'tenant-probe', role: 'recovery', operation: 'object-read' },

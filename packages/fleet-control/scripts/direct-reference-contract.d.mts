@@ -29,7 +29,8 @@ export type DirectReferenceAction =
         | 'migration-start'
         | 'migration-abandon'
         | 'force-recovery'
-        | 'force-observe';
+        | 'force-observe'
+        | 'recover-force-residual';
     }>
   | Readonly<{ kind: 'provision'; role: DirectFixtureRole; release: 'initial' }>
   | Readonly<{

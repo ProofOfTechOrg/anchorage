@@ -11,6 +11,7 @@ import type { DirectReferenceAction } from './direct-reference-contract.mjs';
 import {
   observeDirectForce,
   recoverDirectForce,
+  recoverDirectForceResidual,
 } from './direct-reference-force.js';
 import {
   DirectReferenceExecutionError,
@@ -202,6 +203,8 @@ async function dispatch(
   if (action.kind === 'force-recovery')
     return recoverDirectForce(context, manifest);
   if (action.kind === 'force-observe') return observeDirectForce(context);
+  if (action.kind === 'recover-force-residual')
+    return recoverDirectForceResidual(context);
   if (action.kind === 'tenant-probe')
     return probeDirectTenant(context, manifest, action, signal);
   if ('role' in action)

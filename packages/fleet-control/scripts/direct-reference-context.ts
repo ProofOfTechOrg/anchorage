@@ -73,6 +73,10 @@ export interface DirectReferenceContext {
     backend: CloudflareApiPlainWorkerBackend;
   }>;
   readonly recoveryClaimSetPresent: () => Promise<boolean>;
+  readonly recoveryResidualClaimsPresent: (
+    scriptName: string,
+    bucketNames: readonly string[],
+  ) => Promise<boolean>;
   readonly headDecommissionExport: (
     identity: DatabaseExportReceiptIdentity,
     expectedSize: number,
@@ -426,6 +430,25 @@ export async function createDirectReferenceContext(
         .bind(
           binding.accountId,
           `deployment:${manifest.names.roles.recovery.tenantTag}:${manifest.environment}`,
+        )
+        .first<{ present: number }>();
+      transport.assertWithinBudget();
+      if (row?.present !== 0 && row?.present !== 1) refused();
+      return row.present === 1;
+    },
+    async recoveryResidualClaimsPresent(
+      scriptName: string,
+      bucketNames: readonly string[],
+    ) {
+      transport.assertWithinBudget();
+      const row = await environment.FLEET_DB.prepare(
+        "SELECT EXISTS(SELECT 1 FROM anchorage_platform_plane_claims WHERE account_id=? AND (resource_set_key=? OR (resource_type='worker-script' AND resource_name=?) OR (resource_type='r2-bucket' AND resource_name IN (SELECT value FROM json_each(?))))) AS present",
+      )
+        .bind(
+          binding.accountId,
+          `deployment:${manifest.names.roles.recovery.tenantTag}:${manifest.environment}`,
+          scriptName,
+          JSON.stringify(bucketNames),
         )
         .first<{ present: number }>();
       transport.assertWithinBudget();

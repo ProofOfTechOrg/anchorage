@@ -54,6 +54,7 @@ function actionFromParsed(value) {
     case 'migration-abandon':
     case 'force-recovery':
     case 'force-observe':
+    case 'recover-force-residual':
       keys(value, ['kind']);
       break;
     case 'tenant-probe':
