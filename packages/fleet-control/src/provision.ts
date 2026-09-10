@@ -1895,8 +1895,13 @@ export async function forceDecommissionDeployment(
         record.phase !== 'database-exported' &&
         record.phase !== 'database-deleting'
       ) {
+        const {
+          pendingSpecDigest: _pendingSpecDigest,
+          pendingArtifactVersion: _pendingArtifactVersion,
+          ...forceRecord
+        } = record;
         record = {
-          ...record,
+          ...forceRecord,
           phase: 'decommissioning',
           updatedAt: nowIso(clock),
         };
