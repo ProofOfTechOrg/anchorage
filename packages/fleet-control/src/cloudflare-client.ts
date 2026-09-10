@@ -3339,7 +3339,8 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       method: NonNullable<DurableDatabaseExportStore['writeReceipt']>;
     }>,
   ): Promise<DatabaseExport> {
-    if (!this.#exportStore) {
+    const exportStore = this.#exportStore;
+    if (!exportStore) {
       throw new Error(
         'a durable exportStore is required before D1 can be exported for deletion',
       );
@@ -3414,14 +3415,21 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
             stored = await storedPromise;
             integrity = await integrityPromise;
           } else {
-            [stored, integrity] = await Promise.all([
-              this.#exportStore.write({
+            const integrityPromise = hashExport(hashBody);
+            const storedPromise = funnel(() =>
+              exportStore.write({
                 databaseId,
                 fileName: `${databaseId}-${Date.now()}.sql`,
                 body: storeBody,
                 ...(hasContentLength ? { contentLength } : {}),
               }),
-              hashExport(hashBody),
+            );
+            void storedPromise.catch((primary) =>
+              cancelBodyWithoutAwait(storeBody, primary),
+            );
+            [stored, integrity] = await Promise.all([
+              storedPromise,
+              integrityPromise,
             ]);
           }
           if (!stored.location || integrity.size === 0) {

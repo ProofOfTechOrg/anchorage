@@ -2020,6 +2020,49 @@ describe('CloudflareProvisioningClient plain-worker plane', () => {
     expect(fixture.requests).toHaveLength(1);
   });
 
+  it.each([
+    false,
+    true,
+  ])('closes an unused export tee branch when a supplied store fails synchronously=%s', async (synchronous) => {
+    const bytes = new Uint8Array(1024 * 1024).fill(7);
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(bytes);
+        controller.close();
+      },
+    });
+    let branch: ReadableStream<Uint8Array> | undefined;
+    const refused = new Error('fixture custom store refused');
+    const fixture = recordingFetch(({ url }) =>
+      url === 'https://download.example.test/export'
+        ? new Response(source)
+        : single({
+            status: 'complete',
+            result: { signed_url: 'https://download.example.test/export' },
+          }),
+    );
+    const client = plainClient({
+      fetch: fixture.fetch,
+      exportStore: {
+        write(input) {
+          branch = input.body;
+          if (synchronous) throw refused;
+          return Promise.reject(refused);
+        },
+      },
+    });
+    await expect(
+      fenced(client, () => client.exportDatabase('db')),
+    ).rejects.toBeDefined();
+    if (!branch) throw new Error('store branch was not supplied');
+    const reader = branch.getReader();
+    try {
+      expect(await reader.read()).toEqual({ done: true, value: undefined });
+    } finally {
+      reader.releaseLock();
+    }
+  });
+
   it('exposes receipt export only for a receipt-capable store', () => {
     const legacy = plainClient({
       exportStore: {
