@@ -1,0 +1,531 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import { createHash } from 'node:crypto';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { preflightDirectConformance } from '../../scripts/direct-credentialed-conformance-preflight.mjs';
+import {
+  DIRECT_SCENARIO_OPERATION_SLOTS,
+  type DirectBootstrapContext,
+  type DirectBootstrapMutationReceipt,
+  type DirectRunJournal,
+  openDirectRunState,
+} from '../../scripts/direct-credentialed-run-state.mjs';
+import type { DirectScenarioState } from '../../scripts/direct-credentialed-scenario.mjs';
+import { DIRECT_SCENARIO_PHASES } from '../../scripts/direct-credentialed-scenario-budget.mjs';
+
+export const directories: string[] = [];
+export const journals = new Set<DirectRunJournal>();
+export const hash = (value: string) =>
+  createHash('sha256').update(value).digest('hex');
+export type Mutable<T> = T extends readonly (infer Entry)[]
+  ? Mutable<Entry>[]
+  : T extends object
+    ? { -readonly [Key in keyof T]: Mutable<T[Key]> }
+    : T;
+export type MutableScenario = Mutable<DirectScenarioState>;
+
+export function first<Entry>(entries: readonly Entry[]): Entry {
+  const [entry] = entries;
+  if (entry === undefined) throw new Error('empty scenario fixture array');
+  return entry;
+}
+
+export function present<Value>(value: Value | null | undefined): Value {
+  if (value === null || value === undefined)
+    throw new Error('absent scenario fixture value');
+  return value;
+}
+
+export async function fixture(limit = 3) {
+  const directory = await mkdtemp(join(tmpdir(), 'direct-run-state-'));
+  directories.push(directory);
+  const config = JSON.parse(
+    await readFile(
+      new URL(
+        '../../scripts/direct-credentialed-conformance.example.json',
+        import.meta.url,
+      ),
+      'utf8',
+    ),
+  );
+  const reference =
+    "import manifest from './direct-run-manifest.js'; export default {fetch(){return Response.json(manifest.contractVersion)}};";
+  const tenant =
+    'export class Maintenance {} export class Runner {} export default {};';
+  config.referenceWorker.artifact = {
+    bundle: './reference.mjs',
+    mainModule: 'worker.js',
+    sha256: hash(reference),
+  };
+  config.referenceWorker.maxInvocations = limit;
+  config.deployment.artifact = {
+    bundle: './tenant.mjs',
+    mainModule: 'worker.js',
+    sha256: hash(tenant),
+  };
+  const configPath = join(directory, 'config.json');
+  await writeFile(configPath, JSON.stringify(config));
+  await writeFile(join(directory, 'reference.mjs'), reference);
+  await writeFile(join(directory, 'tenant.mjs'), tenant);
+  const prepared = await preflightDirectConformance({
+    configPath,
+    now: Date.parse('2026-09-10T12:00:00Z'),
+  });
+  const base = join(directory, '.direct-conformance');
+  const runDirectory = join(base, config.resourcePrefix);
+  const lockPath = join(base, `${config.resourcePrefix}.lock`);
+  const input = { configPath, prepared, accountId: 'account' };
+  const request = (action: unknown = { kind: 'control-read' }) =>
+    JSON.stringify({
+      contractVersion: 1,
+      configSha256: prepared.configSha256,
+      action,
+    });
+  return {
+    directory,
+    configPath,
+    prepared,
+    base,
+    runDirectory,
+    lockPath,
+    input,
+    request,
+  };
+}
+
+export async function opened(input: Parameters<typeof openDirectRunState>[0]) {
+  const journal = await openDirectRunState(input);
+  journals.add(journal);
+  return journal;
+}
+
+export async function closed(journal: DirectRunJournal) {
+  await journal.close();
+  journals.delete(journal);
+}
+
+export async function cleanupDirectRunState() {
+  try {
+    await Promise.all([...journals].map((journal) => journal.close()));
+  } finally {
+    journals.clear();
+    await Promise.all(
+      directories
+        .splice(0)
+        .map((directory) => rm(directory, { recursive: true, force: true })),
+    );
+  }
+}
+
+export function bootstrapContext(
+  f: Awaited<ReturnType<typeof fixture>>,
+): DirectBootstrapContext {
+  return {
+    names: f.prepared.names,
+    zoneId: 'zone',
+    zoneName: 'example.test',
+    accountWorkersDevSubdomain: 'attested-account',
+    dispatch: { kind: 'empty', count: 0 },
+  };
+}
+
+export function receipts(f: Awaited<ReturnType<typeof fixture>>) {
+  return [
+    {
+      kind: 'create-fleet-d1',
+      receipt: { uuid: 'fleet-uuid', name: f.prepared.names.fleetDatabase },
+    },
+    {
+      kind: 'create-quota-d1',
+      receipt: { uuid: 'quota-uuid', name: f.prepared.names.quotaDatabase },
+    },
+    {
+      kind: 'create-export-r2',
+      receipt: {
+        name: f.prepared.names.exportBucket,
+        jurisdiction: 'default',
+        creationDate: '2026-09-10T00:00:00.000Z',
+      },
+    },
+    {
+      kind: 'upload-reference',
+      receipt: {
+        scriptName: f.prepared.names.referenceWorker,
+        tag: null,
+        etag: null,
+      },
+    },
+    {
+      kind: 'enable-reference-ingress',
+      receipt: { enabled: true, previewsEnabled: false },
+    },
+  ] as const satisfies readonly DirectBootstrapMutationReceipt[];
+}
+
+export async function confirmedBootstrap(
+  f: Awaited<ReturnType<typeof fixture>>,
+  journal: DirectRunJournal,
+) {
+  await journal.bindBootstrapContext(bootstrapContext(f));
+  for (const value of receipts(f)) {
+    if (value.kind === 'enable-reference-ingress')
+      await journal.recordBootstrapObservation({
+        kind: 'active',
+        deploymentId: 'deployment',
+        versionId: 'version',
+      });
+    await journal.beginBootstrapMutation(value.kind);
+    await journal.confirmBootstrapMutation(value);
+  }
+}
+
+export const MAX_ID = 'z'.repeat(128);
+export const DIGEST = 'a'.repeat(64);
+export const LOCATION = `r2://${'p'.repeat(700)}`;
+export const DATE = '2026-09-10T00:00:00.000Z';
+export const PROCESS = { pid: 1, startTicks: '1000', bootId: MAX_ID };
+export const RESUMED = { pid: 2, startTicks: '2000', bootId: MAX_ID };
+
+export function workerVersion(
+  role: 'a' | 'b' | 'recovery',
+  applicationRelease: '1' | '2',
+  trafficPercentage: number,
+) {
+  return {
+    role,
+    versionId: MAX_ID,
+    databaseId: MAX_ID,
+    specDigest: DIGEST,
+    applicationRelease,
+    accountId: MAX_ID,
+    tenantTag: MAX_ID,
+    environment: MAX_ID,
+    scriptName: MAX_ID,
+    currentDeployment: {
+      deploymentId: MAX_ID,
+      activeVersionId: MAX_ID,
+      versions: [
+        { versionId: MAX_ID, percentage: 100 },
+        { versionId: MAX_ID, percentage: 0 },
+      ],
+    },
+    trafficPercentage,
+    cpuLimitMs: 50,
+    subrequestLimit: 50,
+    schemaVersion: 2,
+    namespaces: [
+      {
+        binding: 'MAINTENANCE' as const,
+        className: 'Maintenance' as const,
+        namespaceId: MAX_ID,
+      },
+      {
+        binding: 'RUNNER' as const,
+        className: 'Runner' as const,
+        namespaceId: MAX_ID,
+      },
+    ],
+    bucket: {
+      name: MAX_ID,
+      jurisdiction: 'default' as const,
+      creationDate: DATE,
+    },
+  };
+}
+
+export function exportProof(role: 'a' | 'b') {
+  return {
+    verified: true as const,
+    role,
+    receipt: {
+      version: 1 as const,
+      authority: LOCATION,
+      databaseId: MAX_ID,
+      operationId: MAX_ID,
+    },
+    location: LOCATION,
+    size: 1,
+    sha256: DIGEST,
+    sourceInvocationOrdinal: 1,
+  };
+}
+
+export function footprint() {
+  return {
+    version: 1 as const,
+    role: 'recovery' as const,
+    beforeIdentitySha256: DIGEST,
+    fleetRecordPresent: false as const,
+    deploymentClaimsPresent: false as const,
+    database: { id: MAX_ID, expectedName: MAX_ID, observedName: null },
+    worker: {
+      scriptName: MAX_ID,
+      scriptPresent: true,
+      workersDevEnabled: false as const,
+      previewUrlsEnabled: false as const,
+      customDomains: [],
+      zoneRoutes: [],
+      currentSecretNames: [],
+      currentVersionIds: Array.from({ length: 8 }, () => MAX_ID),
+      currentNamespaceIds: [MAX_ID, MAX_ID],
+      survivingRecordedNamespaceIds: [MAX_ID, MAX_ID],
+    },
+    buckets: [
+      {
+        bindingName: 'PROBE_BUCKET' as const,
+        bucketName: MAX_ID,
+        jurisdiction: 'default' as const,
+        expectedCreationDate: DATE,
+        observedCreationDate: DATE,
+      },
+    ],
+    priorCleanup: {
+      operationId: MAX_ID,
+      observedReceiptSha256: DIGEST,
+      matchesBefore: true as const,
+    },
+  };
+}
+
+export function inventoryProof() {
+  return {
+    operationId: MAX_ID,
+    generation: 1,
+    calls: 2,
+    databaseIds: [MAX_ID, MAX_ID],
+    namespaceIds: Array.from({ length: 4 }, () => MAX_ID),
+    scriptNames: [MAX_ID, MAX_ID],
+    bucketNames: [MAX_ID, MAX_ID],
+    findings: Array.from({ length: 32 }, () => ({
+      kind: MAX_ID,
+      detailSha256: DIGEST,
+    })),
+  };
+}
+
+export function auditProof() {
+  return {
+    operationId: MAX_ID,
+    generation: 1,
+    recordCount: 2 as const,
+    findingCount: 16,
+    finalizedAtMs: 1,
+    findings: Array.from({ length: 16 }, () => ({
+      tenantTag: MAX_ID,
+      environment: MAX_ID,
+      kind: MAX_ID,
+      detailSha256: DIGEST,
+    })),
+  };
+}
+
+export function maximalScenario(): MutableScenario {
+  const phaseCalls = Object.fromEntries(
+    DIRECT_SCENARIO_PHASES.map((phase) => [phase, 0]),
+  ) as MutableScenario['phaseCalls'];
+  phaseCalls['provision-a'] = 3;
+  const call = {
+    ordinal: 3,
+    action: {
+      kind: 'audit-page' as const,
+      slot: 'audit-after' as const,
+      limit: 32,
+      afterOrdinal: 1,
+    },
+    outcome: 'returned' as const,
+    attempts: { provider: 1, maintenance: 1, application: 1 },
+    migration: {
+      itemOrdinal: 0 as const,
+      cursor: 0,
+      step: MAX_ID,
+      itemsSha256: DIGEST,
+    },
+  };
+  return {
+    version: 1,
+    phase: 'provision-a',
+    startedOrdinal: 0,
+    callCount: 3,
+    phaseCalls,
+    attempts: { provider: 1, maintenance: 1, application: 1 },
+    sdkRequests: 4,
+    inventoryCalls: { before: 2, after: 2 },
+    lastCall: call,
+    mutation: call,
+    reconciledOrdinal: 3,
+    operations: DIRECT_SCENARIO_OPERATION_SLOTS.map((slot) => ({
+      slot,
+      operationId: MAX_ID,
+      inputSha256: DIGEST,
+      tokenRevision: 3,
+    })),
+    records: (['a', 'b', 'recovery'] as const).map((role) => ({
+      role,
+      present: true,
+      phase: MAX_ID,
+      desiredSpecDigest: DIGEST,
+      pendingSpecDigest: DIGEST,
+      artifactVersion: MAX_ID,
+      pendingArtifactVersion: MAX_ID,
+      databaseId: MAX_ID,
+    })),
+    failure: { code: 'observation-mismatch', ordinal: 3 },
+    proofs: {
+      initial: {
+        a: workerVersion('a', '1', 100),
+        b: workerVersion('b', '1', 100),
+        recovery: workerVersion('recovery', '1', 100),
+      },
+      candidate: {
+        a: workerVersion('a', '2', 0),
+        b: workerVersion('b', '2', 0),
+      },
+      final: {
+        a: workerVersion('a', '2', 100),
+        b: workerVersion('b', '2', 100),
+      },
+      objects: {
+        a: { size: 31, sha256: DIGEST },
+        b: { size: 31, sha256: DIGEST },
+      },
+      objectDeletions: { a: 1, b: 1 },
+      recoveryExportAbsent: { beforeOrdinal: 1, afterOrdinal: 2 },
+      health: [
+        {
+          role: 'a' as const,
+          release: '1' as const,
+          marker: 'initial' as const,
+          ordinal: 1,
+        },
+        {
+          role: 'b' as const,
+          release: '1' as const,
+          marker: 'initial' as const,
+          ordinal: 1,
+        },
+        {
+          role: 'recovery' as const,
+          release: '1' as const,
+          marker: 'initial' as const,
+          ordinal: 1,
+        },
+        {
+          role: 'a' as const,
+          release: '2' as const,
+          marker: 'next' as const,
+          ordinal: 1,
+        },
+        {
+          role: 'b' as const,
+          release: '2' as const,
+          marker: 'next' as const,
+          ordinal: 1,
+        },
+      ],
+      inventories: { before: inventoryProof(), after: inventoryProof() },
+      audits: { before: auditProof(), after: auditProof() },
+      restart: {
+        process: { ...PROCESS },
+        resumedProcess: { ...RESUMED },
+        lossOrdinal: 1,
+        operationId: MAX_ID,
+        witnessSha256: DIGEST,
+        claimSha256: DIGEST,
+        successorSha256: DIGEST,
+        itemsSha256: DIGEST,
+        replayOrdinal: 2,
+      },
+      steps: Array.from({ length: 64 }, (_entry, index) => ({
+        ordinal: 1,
+        itemOrdinal: (index % 2) as 0 | 1,
+        step: MAX_ID,
+        beforeCursor: 0,
+        afterCursor: 1,
+        provider: 1,
+        maintenance: 1,
+        application: 1,
+      })),
+      effects: (['a', 'b'] as const).map((role) => ({
+        role,
+        tenantTag: MAX_ID,
+        environment: MAX_ID,
+        scriptName: MAX_ID,
+        databaseId: MAX_ID,
+        versionId: MAX_ID,
+        specDigest: DIGEST,
+        schemaVersion: 2,
+        settlementKey: DIGEST,
+        identitySha256: DIGEST,
+        provenanceSha256: DIGEST,
+      })),
+      cleanup: {
+        version: 1 as const,
+        operationId: MAX_ID,
+        tenantTag: MAX_ID,
+        environment: MAX_ID,
+        backend: 'plain-worker' as const,
+        scriptName: MAX_ID,
+        databaseId: MAX_ID,
+        databaseName: MAX_ID,
+        authority: 'provisioning-rollback' as const,
+        admittedPhase: MAX_ID,
+        disposition: 'reservation-cleared' as const,
+        evidence: {
+          eligibility: 'reservation-only' as const,
+          ingressRemoved: true,
+          workerAbsent: true,
+          platformResourcesAbsent: true,
+          applicationR2Settled: true,
+          databaseAbsentReadback: true,
+          scan: {
+            discover: { evidenceSha256: DIGEST, evidenceCount: 1 },
+            verify: { evidenceSha256: DIGEST, evidenceCount: 1 },
+          },
+        },
+        completedAtMs: 1,
+      },
+      exports: { a: exportProof('a'), b: exportProof('b') },
+      exportVerifications: Array.from({ length: 16 }, () => exportProof('a')),
+      decommission: {
+        a: {
+          operationId: MAX_ID,
+          databaseId: MAX_ID,
+          scriptName: MAX_ID,
+          phase: 'decommissioned' as const,
+        },
+        b: {
+          operationId: MAX_ID,
+          databaseId: MAX_ID,
+          scriptName: MAX_ID,
+          phase: 'decommissioned' as const,
+        },
+      },
+      force: footprint(),
+      residual: footprint(),
+    },
+  } as MutableScenario;
+}
+
+export function scenarioWith(
+  mutate: (state: MutableScenario) => unknown,
+): MutableScenario {
+  const state = maximalScenario();
+  mutate(state);
+  return state;
+}
+
+export async function scenarioJournal(limit = 8) {
+  const f = await fixture(limit);
+  const journal = await opened({ ...f.input, mode: 'run' });
+  await confirmedBootstrap(f, journal);
+  let ordinal = 0;
+  for (let index = 0; index < 3; index++) {
+    const reservation = await journal.reserveInvocation(f.request());
+    await journal.settleInvocation(reservation);
+    ordinal = reservation.ordinal;
+  }
+  await journal.recordBootstrapObservation({ kind: 'control-read', ordinal });
+  return { f, journal };
+}

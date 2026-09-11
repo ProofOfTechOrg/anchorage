@@ -1,190 +1,64 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import {
   chmod,
   link,
   mkdir,
-  mkdtemp,
   open,
   readdir,
   readFile,
   rename,
-  rm,
   stat,
   symlink,
   unlink,
   writeFile,
 } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { preflightDirectConformance } from '../scripts/direct-credentialed-conformance-preflight.mjs';
 import {
-  type DirectBootstrapContext,
+  DIRECT_RUN_MAX_JOURNAL_BYTES,
   type DirectBootstrapMutationReceipt,
   type DirectRunJournal,
   openDirectRunState,
 } from '../scripts/direct-credentialed-run-state.mjs';
+import {
+  auditProof,
+  bootstrapContext,
+  cleanupDirectRunState,
+  closed,
+  confirmedBootstrap,
+  DIGEST,
+  first,
+  fixture,
+  hash,
+  inventoryProof,
+  journals,
+  type MutableScenario,
+  maximalScenario,
+  opened,
+  PROCESS,
+  present,
+  RESUMED,
+  receipts,
+  scenarioJournal,
+  scenarioWith,
+} from './fixtures/direct-run-state-builder.js';
 
 vi.mock('node:fs/promises', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs/promises')>();
   return { ...actual, rename: vi.fn(actual.rename) };
 });
 
-const directories: string[] = [];
-const journals = new Set<DirectRunJournal>();
-const hash = (value: string) =>
-  createHash('sha256').update(value).digest('hex');
 const CLAIM = 'opaque-claim-must-not-enter-local-state';
-
-async function fixture(limit = 3) {
-  const directory = await mkdtemp(join(tmpdir(), 'direct-run-state-'));
-  directories.push(directory);
-  const config = JSON.parse(
-    await readFile(
-      new URL(
-        '../scripts/direct-credentialed-conformance.example.json',
-        import.meta.url,
-      ),
-      'utf8',
-    ),
-  );
-  const reference =
-    "import manifest from './direct-run-manifest.js'; export default {fetch(){return Response.json(manifest.contractVersion)}};";
-  const tenant =
-    'export class Maintenance {} export class Runner {} export default {};';
-  config.referenceWorker.artifact = {
-    bundle: './reference.mjs',
-    mainModule: 'worker.js',
-    sha256: hash(reference),
-  };
-  config.referenceWorker.maxInvocations = limit;
-  config.deployment.artifact = {
-    bundle: './tenant.mjs',
-    mainModule: 'worker.js',
-    sha256: hash(tenant),
-  };
-  const configPath = join(directory, 'config.json');
-  await writeFile(configPath, JSON.stringify(config));
-  await writeFile(join(directory, 'reference.mjs'), reference);
-  await writeFile(join(directory, 'tenant.mjs'), tenant);
-  const prepared = await preflightDirectConformance({
-    configPath,
-    now: Date.parse('2026-09-10T12:00:00Z'),
-  });
-  const base = join(directory, '.direct-conformance');
-  const runDirectory = join(base, config.resourcePrefix);
-  const lockPath = join(base, `${config.resourcePrefix}.lock`);
-  const input = { configPath, prepared, accountId: 'account' };
-  const request = (action: unknown = { kind: 'control-read' }) =>
-    JSON.stringify({
-      contractVersion: 1,
-      configSha256: prepared.configSha256,
-      action,
-    });
-  return {
-    directory,
-    configPath,
-    prepared,
-    base,
-    runDirectory,
-    lockPath,
-    input,
-    request,
-  };
-}
-
-async function opened(input: Parameters<typeof openDirectRunState>[0]) {
-  const journal = await openDirectRunState(input);
-  journals.add(journal);
-  return journal;
-}
-
-async function closed(journal: DirectRunJournal) {
-  await journal.close();
-  journals.delete(journal);
-}
 
 afterEach(async () => {
   vi.restoreAllMocks();
-  try {
-    await Promise.all([...journals].map((journal) => journal.close()));
-  } finally {
-    journals.clear();
-    await Promise.all(
-      directories
-        .splice(0)
-        .map((directory) => rm(directory, { recursive: true, force: true })),
-    );
-  }
+  await cleanupDirectRunState();
 });
 
 const describeLinux =
   process.platform === 'linux' ? describe.sequential : describe.skip;
-
-function bootstrapContext(
-  f: Awaited<ReturnType<typeof fixture>>,
-): DirectBootstrapContext {
-  return {
-    names: f.prepared.names,
-    zoneId: 'zone',
-    zoneName: 'example.test',
-    accountWorkersDevSubdomain: 'attested-account',
-    dispatch: { kind: 'empty', count: 0 },
-  };
-}
-
-function receipts(f: Awaited<ReturnType<typeof fixture>>) {
-  return [
-    {
-      kind: 'create-fleet-d1',
-      receipt: { uuid: 'fleet-uuid', name: f.prepared.names.fleetDatabase },
-    },
-    {
-      kind: 'create-quota-d1',
-      receipt: { uuid: 'quota-uuid', name: f.prepared.names.quotaDatabase },
-    },
-    {
-      kind: 'create-export-r2',
-      receipt: {
-        name: f.prepared.names.exportBucket,
-        jurisdiction: 'default',
-        creationDate: '2026-09-10T00:00:00.000Z',
-      },
-    },
-    {
-      kind: 'upload-reference',
-      receipt: {
-        scriptName: f.prepared.names.referenceWorker,
-        tag: null,
-        etag: null,
-      },
-    },
-    {
-      kind: 'enable-reference-ingress',
-      receipt: { enabled: true, previewsEnabled: false },
-    },
-  ] as const satisfies readonly DirectBootstrapMutationReceipt[];
-}
-
-async function confirmedBootstrap(
-  f: Awaited<ReturnType<typeof fixture>>,
-  journal: DirectRunJournal,
-) {
-  await journal.bindBootstrapContext(bootstrapContext(f));
-  for (const value of receipts(f)) {
-    if (value.kind === 'enable-reference-ingress')
-      await journal.recordBootstrapObservation({
-        kind: 'active',
-        deploymentId: 'deployment',
-        versionId: 'version',
-      });
-    await journal.beginBootstrapMutation(value.kind);
-    await journal.confirmBootstrapMutation(value);
-  }
-}
 
 describeLinux('durable bootstrap state', () => {
   it('enforces mutation order, exact receipt association and exclusive invocation/provider pending state', async () => {
@@ -1012,4 +886,228 @@ process.stdout.write(JSON.stringify({ready:true})+'\\n');setInterval(()=>journal
       await stopped;
     }
   }, 30_000);
+});
+
+const refuses = (journal: DirectRunJournal, state: MutableScenario) =>
+  expect(journal.recordScenario(state)).rejects.toMatchObject({
+    code: 'invalid-state',
+  });
+
+describeLinux('durable scenario state', () => {
+  it('publishes a scenario sitting on every declared maximum inside the journal byte bound', async () => {
+    const { f, journal } = await scenarioJournal();
+    await journal.recordScenario(maximalScenario());
+    const serialized = await readFile(
+      join(f.runDirectory, 'journal.json'),
+      'utf8',
+    );
+    expect(Buffer.byteLength(serialized)).toBeLessThan(
+      DIRECT_RUN_MAX_JOURNAL_BYTES / 2,
+    );
+    expect(journal.snapshot().scenario?.proofs.cleanup?.evidence.scan).toEqual({
+      discover: { evidenceSha256: DIGEST, evidenceCount: 1 },
+      verify: { evidenceSha256: DIGEST, evidenceCount: 1 },
+    });
+  });
+
+  it('refuses a stored journal larger than the byte bound before parsing it', async () => {
+    const { f, journal } = await scenarioJournal();
+    await journal.recordScenario(maximalScenario());
+    const path = join(f.runDirectory, 'journal.json');
+    const serialized = await readFile(path, 'utf8');
+    await closed(journal);
+    await writeFile(
+      path,
+      serialized.padEnd(DIRECT_RUN_MAX_JOURNAL_BYTES + 1, ' '),
+    );
+    await expect(
+      openDirectRunState({ ...f.input, mode: 'resume' }),
+    ).rejects.toMatchObject({ code: 'invalid-state' });
+  });
+
+  it('refuses ordinals the durable invocation count cannot account for', async () => {
+    const { journal } = await scenarioJournal();
+    for (const mutate of [
+      (state: MutableScenario) => {
+        state.startedOrdinal = 4;
+      },
+      (state: MutableScenario) => {
+        state.callCount = 4;
+      },
+      (state: MutableScenario) => {
+        state.callCount = 2;
+      },
+      (state: MutableScenario) => {
+        state.reconciledOrdinal = 4;
+      },
+      (state: MutableScenario) => {
+        state.phaseCalls['provision-a'] = 2;
+      },
+      (state: MutableScenario) => {
+        present(state.lastCall).ordinal = 4;
+      },
+      (state: MutableScenario) => {
+        present(state.lastCall).attempts = null;
+      },
+      (state: MutableScenario) => {
+        present(state.proofs.exports.a).sourceInvocationOrdinal = 4;
+      },
+      (state: MutableScenario) => {
+        first(state.proofs.health).ordinal = 4;
+      },
+      (state: MutableScenario) => {
+        present(state.proofs.restart).replayOrdinal = 1;
+      },
+    ])
+      await refuses(journal, scenarioWith(mutate));
+    await journal.recordScenario(maximalScenario());
+  });
+
+  it('refuses a restart proof whose resumed process is the process that recorded the loss', async () => {
+    const { journal } = await scenarioJournal();
+    await refuses(
+      journal,
+      scenarioWith((state) => {
+        present(state.proofs.restart).resumedProcess = { ...PROCESS };
+      }),
+    );
+    await journal.recordScenario(maximalScenario());
+  });
+
+  it('refuses duplicate operation slots and duplicate record roles', async () => {
+    const { journal } = await scenarioJournal();
+    await refuses(
+      journal,
+      scenarioWith((state) => {
+        state.operations = [first(state.operations), first(state.operations)];
+      }),
+    );
+    await refuses(
+      journal,
+      scenarioWith((state) => {
+        state.records = [first(state.records), first(state.records)];
+      }),
+    );
+  });
+
+  it('refuses a later phase whose implied proofs are absent', async () => {
+    const { journal } = await scenarioJournal();
+    await refuses(
+      journal,
+      scenarioWith((state) => {
+        state.phase = 'provision-b';
+        state.proofs.initial.a = null;
+      }),
+    );
+    await refuses(
+      journal,
+      scenarioWith((state) => {
+        state.phase = 'provision-b';
+        state.proofs.objects.a = null;
+      }),
+    );
+    await refuses(
+      journal,
+      scenarioWith((state) => {
+        state.phase = 'provision-b';
+        state.proofs.health = state.proofs.health.filter(
+          (entry) => entry.role !== 'a' || entry.release !== '1',
+        );
+      }),
+    );
+  });
+
+  it('refuses arrays longer than the schema maximum', async () => {
+    const { journal } = await scenarioJournal();
+    for (const mutate of [
+      (state: MutableScenario) => {
+        state.proofs.health.push(first(state.proofs.health));
+      },
+      (state: MutableScenario) => {
+        state.proofs.steps.push(first(state.proofs.steps));
+      },
+      (state: MutableScenario) => {
+        state.proofs.effects.push(first(state.proofs.effects));
+      },
+      (state: MutableScenario) => {
+        state.proofs.exportVerifications.push(
+          first(state.proofs.exportVerifications),
+        );
+      },
+      (state: MutableScenario) => {
+        present(state.proofs.audits.before).findings.push(
+          first(auditProof().findings),
+        );
+      },
+      (state: MutableScenario) => {
+        present(state.proofs.inventories.before).findings.push(
+          first(inventoryProof().findings),
+        );
+      },
+      (state: MutableScenario) => {
+        state.operations.push({
+          ...first(state.operations),
+          slot: 'decommission-recovery' as MutableScenario['operations'][number]['slot'],
+        });
+      },
+    ])
+      await refuses(journal, scenarioWith(mutate));
+  });
+
+  it('refuses a phase regression, a phase skip and a weakened proof after publication', async () => {
+    const { journal } = await scenarioJournal();
+    await journal.recordScenario(maximalScenario());
+    await refuses(
+      journal,
+      scenarioWith((state) => {
+        state.phase = 'inventory-before';
+      }),
+    );
+    await journal.recordScenario(
+      scenarioWith((state) => {
+        state.phase = 'provision-b';
+      }),
+    );
+    await refuses(journal, maximalScenario());
+    for (const mutate of [
+      (state: MutableScenario) => {
+        state.startedOrdinal = 1;
+      },
+      (state: MutableScenario) => {
+        state.attempts.provider = 0;
+      },
+      (state: MutableScenario) => {
+        state.sdkRequests = 3;
+      },
+      (state: MutableScenario) => {
+        state.phaseCalls['provision-a'] = 2;
+        state.phaseCalls['provision-b'] = 1;
+      },
+      (state: MutableScenario) => {
+        state.proofs.steps.pop();
+      },
+      (state: MutableScenario) => {
+        first(state.proofs.steps).beforeCursor = 5;
+      },
+      (state: MutableScenario) => {
+        state.proofs.objects.a = { size: 30, sha256: DIGEST };
+      },
+      (state: MutableScenario) => {
+        present(state.proofs.exports.a).sourceInvocationOrdinal = 0;
+      },
+      (state: MutableScenario) => {
+        present(state.proofs.restart).resumedProcess = { ...RESUMED, pid: 3 };
+      },
+      (state: MutableScenario) => {
+        present(state.failure).code = 'proof-unavailable';
+      },
+    ])
+      await refuses(
+        journal,
+        scenarioWith((state) => {
+          state.phase = 'provision-b';
+          mutate(state);
+        }),
+      );
+  });
 });

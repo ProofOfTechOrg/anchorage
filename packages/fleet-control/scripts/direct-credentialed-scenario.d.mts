@@ -1,0 +1,223 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import type { FleetAuditResultRef } from '../src/fleet-audit-advance.js';
+import type { CleanupTerminalReceipt } from '../src/types.js';
+import type { PreparedDirectConformance } from './direct-credentialed-conformance-preflight.mjs';
+import type {
+  DirectInvocationAttempts,
+  DirectInvocationClient,
+} from './direct-credentialed-invocation.mjs';
+import type {
+  DirectSettlementEffect,
+  DirectVerifiedExport,
+  DirectWorkerVersionObservation,
+} from './direct-credentialed-observations.mjs';
+import type {
+  DIRECT_SCENARIO_FAILURES,
+  DirectRunActionSummary,
+  DirectRunJournal,
+} from './direct-credentialed-run-state.mjs';
+import type {
+  DirectScenarioNormalRole,
+  DirectScenarioOperationFacts,
+  DirectScenarioPhase,
+  DirectScenarioRecordFacts,
+} from './direct-credentialed-scenario-checks.mjs';
+import type { DirectFixtureRole } from './direct-credentialed-spec.js';
+
+type Role = DirectFixtureRole;
+type NormalRole = DirectScenarioNormalRole;
+
+export type { DirectScenarioOperationSlot } from './direct-credentialed-scenario-checks.mjs';
+export type { DirectScenarioPhase };
+export type DirectScenarioFailure = (typeof DIRECT_SCENARIO_FAILURES)[number];
+interface ScenarioCall {
+  readonly ordinal: number;
+  readonly action: DirectRunActionSummary;
+  readonly outcome:
+    | 'prepared'
+    | 'returned'
+    | 'injected-response-loss'
+    | 'reference-refused';
+  readonly attempts: DirectInvocationAttempts | null;
+  readonly migration: Readonly<{
+    itemOrdinal: 0 | 1;
+    cursor: number;
+    step: string;
+    itemsSha256: string;
+  }> | null;
+}
+interface ScenarioProcess {
+  readonly pid: number;
+  readonly startTicks: string;
+  readonly bootId: string;
+}
+export interface DirectScenarioFootprint {
+  readonly version: 1;
+  readonly role: 'recovery';
+  readonly beforeIdentitySha256: string;
+  readonly fleetRecordPresent: false;
+  readonly deploymentClaimsPresent: false;
+  readonly database: Readonly<{
+    id: string;
+    expectedName: string;
+    observedName: null;
+  }>;
+  readonly worker: Readonly<{
+    scriptName: string;
+    scriptPresent: boolean;
+    workersDevEnabled: false | null;
+    previewUrlsEnabled: false | null;
+    customDomains: readonly never[];
+    zoneRoutes: readonly never[];
+    currentSecretNames: readonly never[];
+    currentVersionIds: readonly string[] | null;
+    currentNamespaceIds: readonly string[];
+    survivingRecordedNamespaceIds: readonly string[];
+  }>;
+  readonly buckets: readonly Readonly<{
+    bindingName: 'PROBE_BUCKET';
+    bucketName: string;
+    jurisdiction: 'default';
+    expectedCreationDate: string;
+    observedCreationDate: string | null;
+  }>[];
+  readonly priorCleanup: Readonly<{
+    operationId: string;
+    observedReceiptSha256: string;
+    matchesBefore: true;
+  }>;
+}
+interface ScenarioInventory {
+  readonly operationId: string;
+  readonly generation: number;
+  readonly calls: number;
+  readonly databaseIds: readonly string[];
+  readonly namespaceIds: readonly string[];
+  readonly scriptNames: readonly string[];
+  readonly bucketNames: readonly string[];
+  readonly findings: readonly Readonly<{
+    kind: string;
+    detailSha256: string;
+  }>[];
+}
+type ScenarioAudit = FleetAuditResultRef &
+  Readonly<{
+    recordCount: 2;
+    findings: readonly Readonly<{
+      tenantTag: string;
+      environment: string;
+      kind: string;
+      detailSha256: string;
+    }>[];
+  }>;
+export interface DirectScenarioProofs {
+  readonly initial: Readonly<
+    Record<Role, DirectWorkerVersionObservation | null>
+  >;
+  readonly candidate: Readonly<
+    Record<NormalRole, DirectWorkerVersionObservation | null>
+  >;
+  readonly final: Readonly<
+    Record<NormalRole, DirectWorkerVersionObservation | null>
+  >;
+  readonly objects: Readonly<
+    Record<NormalRole, Readonly<{ size: number; sha256: string }> | null>
+  >;
+  readonly objectDeletions: Readonly<Record<NormalRole, number | null>>;
+  readonly recoveryExportAbsent: Readonly<{
+    beforeOrdinal: number | null;
+    afterOrdinal: number | null;
+  }>;
+  readonly health: readonly Readonly<{
+    role: Role;
+    release: '1' | '2';
+    marker: 'initial' | 'next';
+    ordinal: number;
+  }>[];
+  readonly inventories: Readonly<
+    Record<'before' | 'after', ScenarioInventory | null>
+  >;
+  readonly audits: Readonly<Record<'before' | 'after', ScenarioAudit | null>>;
+  readonly restart: Readonly<{
+    process: ScenarioProcess;
+    resumedProcess: ScenarioProcess | null;
+    lossOrdinal: number;
+    operationId: string;
+    witnessSha256: string;
+    claimSha256: string;
+    successorSha256: string;
+    itemsSha256: string;
+    replayOrdinal: number | null;
+  }> | null;
+  readonly steps: readonly Readonly<
+    DirectInvocationAttempts & {
+      ordinal: number;
+      itemOrdinal: 0 | 1;
+      step: string;
+      beforeCursor: number;
+      afterCursor: number;
+    }
+  >[];
+  readonly effects: readonly DirectSettlementEffect[];
+  readonly cleanup: CleanupTerminalReceipt | null;
+  readonly exports: Readonly<Record<NormalRole, DirectVerifiedExport | null>>;
+  readonly exportVerifications: readonly DirectVerifiedExport[];
+  readonly decommission: Readonly<
+    Record<
+      NormalRole,
+      Readonly<{
+        operationId: string;
+        databaseId: string;
+        scriptName: string;
+        phase: 'decommissioned';
+      }> | null
+    >
+  >;
+  readonly force: DirectScenarioFootprint | null;
+  readonly residual: DirectScenarioFootprint | null;
+}
+export interface DirectScenarioState {
+  readonly version: 1;
+  readonly phase: DirectScenarioPhase;
+  readonly startedOrdinal: number;
+  readonly callCount: number;
+  readonly phaseCalls: Readonly<Record<DirectScenarioPhase, number>>;
+  readonly attempts: DirectInvocationAttempts;
+  readonly sdkRequests: number;
+  readonly inventoryCalls: Readonly<{ before: number; after: number }>;
+  readonly lastCall: ScenarioCall | null;
+  readonly mutation: ScenarioCall | null;
+  readonly reconciledOrdinal: number;
+  readonly operations: readonly DirectScenarioOperationFacts[];
+  readonly records: readonly DirectScenarioRecordFacts[];
+  readonly failure: Readonly<{
+    code: DirectScenarioFailure;
+    ordinal: number;
+  }> | null;
+  readonly proofs: DirectScenarioProofs;
+}
+export type DirectScenarioOutcome =
+  | Readonly<{ status: 'restart-required' }>
+  | Readonly<{
+      status: 'complete';
+      facts: DirectScenarioProofs;
+      invocationCount: number;
+      attempts: DirectInvocationAttempts;
+      sdkRequests: number;
+    }>
+  | Readonly<{
+      status: 'failed';
+      reason: DirectScenarioFailure;
+      phase: DirectScenarioPhase | null;
+      invocationCount: number;
+    }>;
+export function runDirectCredentialedScenario(
+  input: Readonly<{
+    prepared: PreparedDirectConformance;
+    journal: DirectRunJournal;
+    invocation: DirectInvocationClient;
+    apiToken: string;
+    fetch?: typeof fetch;
+  }>,
+): Promise<DirectScenarioOutcome>;

@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { createHash } from 'node:crypto';
 import {
   type ApplicationR2Binding,
   type CleanupTerminalReceipt,
@@ -26,6 +25,7 @@ import {
   directResourceObservation,
   recordDirectResource,
 } from './direct-reference-observations.js';
+import { directCleanupReceiptDigest } from './direct-reference-receipt.mjs';
 
 function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value))
@@ -163,39 +163,7 @@ function fulfilled<T>(result: PromiseSettledResult<T>): T {
 function receiptDigest(receipt: CleanupTerminalReceipt): string {
   if (!Number.isSafeInteger(receipt.completedAtMs))
     throw new DirectReferenceJournalError();
-  const evidence = receipt.evidence;
-  return createHash('sha256')
-    .update(
-      JSON.stringify([
-        receipt.version,
-        receipt.operationId,
-        receipt.tenantTag,
-        receipt.environment,
-        receipt.backend,
-        receipt.scriptName,
-        receipt.databaseId,
-        receipt.databaseName,
-        receipt.authority,
-        receipt.admittedPhase,
-        receipt.disposition,
-        evidence.eligibility,
-        evidence.ingressRemoved,
-        evidence.workerAbsent,
-        evidence.platformResourcesAbsent,
-        evidence.applicationR2Settled,
-        evidence.databaseAbsentReadback,
-        evidence.scan
-          ? [
-              evidence.scan.discover.evidenceSha256,
-              evidence.scan.discover.evidenceCount,
-              evidence.scan.verify.evidenceSha256,
-              evidence.scan.verify.evidenceCount,
-            ]
-          : null,
-        receipt.completedAtMs,
-      ]),
-    )
-    .digest('hex');
+  return directCleanupReceiptDigest(receipt);
 }
 
 async function beforeIdentity(

@@ -20,6 +20,10 @@ import {
   type FlowsafeWorkerEnv,
   staticTokenVerifier,
 } from '@proofoftech/flowsafe/host-kit';
+import {
+  DIRECT_TENANT_OBJECT_BODY,
+  DIRECT_TENANT_OBJECT_KEY,
+} from './direct-credentialed-tenant-object.mjs';
 
 export interface DirectTenantEnv extends FlowsafeWorkerEnv {
   DB: D1Database;
@@ -29,9 +33,6 @@ export interface DirectTenantEnv extends FlowsafeWorkerEnv {
   APPLICATION_RELEASE: string;
   PROBE_BUCKET: R2Bucket;
 }
-
-const OBJECT_KEY = 'direct-conformance-fixture';
-const OBJECT_BODY = 'direct-conformance-fixture-data';
 
 const config: FlowsafeWorkerConfig<DirectTenantEnv> = {
   workflows: [],
@@ -65,17 +66,23 @@ const config: FlowsafeWorkerConfig<DirectTenantEnv> = {
     }
     if (path === '/__direct/object') {
       if (request.method === 'POST') {
-        await env.PROBE_BUCKET.put(OBJECT_KEY, OBJECT_BODY);
+        await env.PROBE_BUCKET.put(
+          DIRECT_TENANT_OBJECT_KEY,
+          DIRECT_TENANT_OBJECT_BODY,
+        );
         return new Response(null, { status: 204 });
       }
       if (request.method === 'DELETE') {
-        await env.PROBE_BUCKET.delete(OBJECT_KEY);
+        await env.PROBE_BUCKET.delete(DIRECT_TENANT_OBJECT_KEY);
         return new Response(null, { status: 204 });
       }
       if (request.method === 'GET') {
-        const object = await env.PROBE_BUCKET.get(OBJECT_KEY);
+        const object = await env.PROBE_BUCKET.get(DIRECT_TENANT_OBJECT_KEY);
         if (!object) return Response.json({ present: false });
-        if (object.size !== new TextEncoder().encode(OBJECT_BODY).byteLength)
+        if (
+          object.size !==
+          new TextEncoder().encode(DIRECT_TENANT_OBJECT_BODY).byteLength
+        )
           return new Response('Unexpected fixture object', { status: 409 });
         const digest = await crypto.subtle.digest(
           'SHA-256',

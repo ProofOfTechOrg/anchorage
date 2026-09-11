@@ -33,6 +33,11 @@ export async function directObservationFixture(
     | 'absent'
     | 'provider-pending'
     | 'no-control' = 'confirmed',
+  runtimeOptions: Readonly<{
+    invocationTimeoutMs?: number;
+    maxProviderRequests?: number;
+    maxInvocations?: number;
+  }> = {},
 ) {
   const directory = await mkdtemp(join(tmpdir(), 'direct-observations-'));
   const config = JSON.parse(
@@ -60,6 +65,7 @@ export async function directObservationFixture(
   };
   config.referenceWorker.requestTimeoutMs = timeout;
   config.referenceWorker.invocationTimeoutMs = 2000;
+  Object.assign(config.referenceWorker, runtimeOptions);
   const configPath = join(directory, 'config.json');
   await Promise.all([
     writeFile(configPath, JSON.stringify(config)),
@@ -392,6 +398,7 @@ export async function directObservationFixture(
     requests,
     unexpected,
     directory,
+    configPath,
     settle,
     input: {
       prepared,

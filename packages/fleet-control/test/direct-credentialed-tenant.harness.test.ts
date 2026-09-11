@@ -25,6 +25,10 @@ import {
   directDeploymentSpec,
   generateDirectDeploymentSecrets,
 } from '../scripts/direct-credentialed-spec.js';
+import {
+  DIRECT_TENANT_OBJECT_BODY,
+  DIRECT_TENANT_OBJECT_KEY,
+} from '../scripts/direct-credentialed-tenant-object.mjs';
 import { plainWorkerIngressModule } from '../src/plain-worker-backend.js';
 import { deploymentSpecDigest } from '../src/spec-digest.js';
 import {
@@ -336,9 +340,9 @@ describe.sequential('direct tenant fixture in workerd', {
           role: 'a',
           operation: 'object-read',
           present: true,
-          size: Buffer.byteLength('direct-conformance-fixture-data'),
+          size: Buffer.byteLength(DIRECT_TENANT_OBJECT_BODY),
           sha256: createHash('sha256')
-            .update('direct-conformance-fixture-data')
+            .update(DIRECT_TENANT_OBJECT_BODY)
             .digest('hex'),
         };
         expect(await reference.success(action('object-read'))).toEqual(
@@ -382,7 +386,7 @@ describe.sequential('direct tenant fixture in workerd', {
         await server.update(options('1'));
         worker = server.getWorker<HarnessBindings>();
         await (await worker.getEnv()).PROBE_BUCKET.delete(
-          'direct-conformance-fixture',
+          DIRECT_TENANT_OBJECT_KEY,
         );
       })(),
     ]);
@@ -403,10 +407,10 @@ describe.sequential('direct tenant fixture in workerd', {
         })
       ).status,
     ).toBe(204);
-    const body = 'direct-conformance-fixture-data';
+    const body = DIRECT_TENANT_OBJECT_BODY;
     const env = await worker.getEnv();
     expect(
-      await (await env.PROBE_BUCKET.get('direct-conformance-fixture'))?.text(),
+      await (await env.PROBE_BUCKET.get(DIRECT_TENANT_OBJECT_KEY))?.text(),
     ).toBe(body);
     for (const migration of next.migrations.slice(initial.migrations.length))
       await env.DB.batch(

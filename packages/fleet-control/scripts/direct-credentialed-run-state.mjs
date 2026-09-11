@@ -7,6 +7,7 @@ import { lstat, mkdir, open, rename, rmdir, unlink } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import PQueue from 'p-queue';
 import { deriveDirectConformanceNames } from './direct-credentialed-conformance-config.mjs';
+import { DIRECT_SCENARIO_PHASES } from './direct-credentialed-scenario-budget.mjs';
 import {
   DIRECT_REFERENCE_BODY_LIMIT,
   readDirectReferenceRequest,
@@ -29,7 +30,21 @@ const SUMMARY_FIELDS = [
   'limit',
   'afterOrdinal',
 ];
-const MAX_JOURNAL_BYTES = 16 * 1024;
+export const DIRECT_RUN_MAX_JOURNAL_BYTES = 256 * 1024;
+export const DIRECT_SCENARIO_ARRAY_MAXIMA = Object.freeze({
+  health: 5,
+  steps: 64,
+  exportVerifications: 16,
+  auditFindings: 16,
+  footprintVersionIds: 8,
+  inventory: Object.freeze({
+    databaseIds: 2,
+    namespaceIds: 4,
+    scriptNames: 2,
+    bucketNames: 2,
+    findings: 32,
+  }),
+});
 
 export class DirectRunStateError extends Error {
   constructor(code = 'invalid-state') {
@@ -98,7 +113,7 @@ function bindingFromInput(input) {
   });
 }
 
-function actionSummary(action) {
+export function actionSummary(action) {
   return Object.freeze(
     Object.fromEntries(
       SUMMARY_FIELDS.filter((key) => Object.hasOwn(action, key)).map((key) => [
@@ -107,6 +122,16 @@ function actionSummary(action) {
       ]),
     ),
   );
+}
+
+function replayableAction(action) {
+  const result = { ...action };
+  if (
+    result.kind === 'cleanup-restart-blocked' ||
+    result.kind === 'decommission-restart-blocked'
+  )
+    result.token = null;
+  return result;
 }
 
 async function decodeRequest(serialized, configSha256) {
@@ -130,7 +155,16 @@ async function decodeRequest(serialized, configSha256) {
 
 async function decodeSnapshot(value, binding) {
   const keys = ['version', 'binding', 'invocationCount', 'lastInvocation'];
-  object(value, value.version === 1 ? keys : [...keys, 'bootstrap']);
+  object(
+    value,
+    value.version === 1
+      ? keys
+      : [
+          ...keys,
+          'bootstrap',
+          ...(Object.hasOwn(value, 'scenario') ? ['scenario'] : []),
+        ],
+  );
   object(value.binding, Object.keys(binding));
   if (
     ![1, 2].includes(value.version) ||
@@ -161,17 +195,11 @@ async function decodeSnapshot(value, binding) {
       Object.hasOwn(last.action, 'token')
     )
       invalid();
-    const action = { ...last.action };
-    if (
-      action.kind === 'cleanup-restart-blocked' ||
-      action.kind === 'decommission-restart-blocked'
-    )
-      action.token = null;
     const decoded = await decodeRequest(
       JSON.stringify({
         contractVersion: 1,
         configSha256: binding.configSha256,
-        action,
+        action: replayableAction(last.action),
       }),
       binding.configSha256,
     );
@@ -182,6 +210,10 @@ async function decodeSnapshot(value, binding) {
       state: last.state,
     });
   }
+  const scenario = Object.hasOwn(value, 'scenario')
+    ? decodeScenario(value.scenario, value.invocationCount)
+    : undefined;
+  if (scenario) await validateScenarioActions(scenario, binding);
   return Object.freeze({
     version: 2,
     binding,
@@ -193,6 +225,7 @@ async function decodeSnapshot(value, binding) {
       value.invocationCount,
       lastInvocation,
     ),
+    ...(scenario ? { scenario } : {}),
   });
 }
 
@@ -212,11 +245,621 @@ function identifier(value, max = 128) {
 }
 
 function equalShape(value, expected) {
-  if (expected !== null && typeof expected === 'object') {
+  if (Array.isArray(expected)) {
+    if (!Array.isArray(value) || value.length !== expected.length) invalid();
+    expected.forEach((entry, index) => {
+      equalShape(value[index], entry);
+    });
+  } else if (expected !== null && typeof expected === 'object') {
     object(value, Object.keys(expected));
     for (const key of Object.keys(expected))
       equalShape(value[key], expected[key]);
   } else if (value !== expected) invalid();
+}
+
+export const DIRECT_SCENARIO_FAILURES = Object.freeze([
+  'observation-mismatch',
+  'outcome-unknown',
+  'proof-unavailable',
+  'budget-exhausted',
+  'invocation-budget-exhausted',
+  'reference-refused',
+  'invalid-input',
+  'provider-unavailable',
+  'journal-failed',
+  'blocked',
+]);
+
+export const DIRECT_SCENARIO_OPERATION_SLOTS = Object.freeze([
+  'inventory-before',
+  'inventory-after',
+  'audit-before',
+  'audit-after',
+  'migration-next',
+  'cleanup-a',
+  'cleanup-b',
+  'cleanup-recovery',
+  'cleanup-recovery-initial',
+  'decommission-a',
+  'decommission-b',
+]);
+
+const scenarioNumber = (value) => {
+  if (!Number.isSafeInteger(value) || value < 0) invalid();
+  return value;
+};
+const scenarioId = (value) => {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_.:-]{1,128}$/u.test(value))
+    invalid();
+  return value;
+};
+const scenarioEnum =
+  (...values) =>
+  (value) => {
+    if (!values.includes(value)) invalid();
+    return value;
+  };
+const nullable = (schema) => (value) =>
+  value === null ? null : scenarioShape(value, schema);
+const boundedArray = (schema, max) => (value) => {
+  if (!Array.isArray(value) || value.length > max) invalid();
+  return Object.freeze(value.map((entry) => scenarioShape(entry, schema)));
+};
+const OPTIONAL = Symbol('optional');
+const optional = (schema) => ({ [OPTIONAL]: schema });
+const optionalSchema = (field) =>
+  field && typeof field === 'object' && OPTIONAL in field
+    ? field[OPTIONAL]
+    : null;
+function scenarioShape(value, schema) {
+  if (typeof schema === 'function') return schema(value);
+  if (schema === null || typeof schema !== 'object') {
+    if (value !== schema) invalid();
+    return value;
+  }
+  const fields = Object.entries(schema).filter(
+    ([key, field]) =>
+      !optionalSchema(field) ||
+      (Boolean(value) &&
+        typeof value === 'object' &&
+        Object.hasOwn(value, key)),
+  );
+  object(
+    value,
+    fields.map(([key]) => key),
+  );
+  return Object.freeze(
+    Object.fromEntries(
+      fields.map(([key, field]) => [
+        key,
+        scenarioShape(value[key], optionalSchema(field) ?? field),
+      ]),
+    ),
+  );
+}
+const scenarioDate = (value) => {
+  identifier(value, 32);
+  if (
+    !Number.isFinite(Date.parse(value)) ||
+    new Date(value).toISOString() !== value
+  )
+    invalid();
+  return value;
+};
+const scenarioLocation = (value) => {
+  if (
+    typeof value !== 'string' ||
+    !/^r2:\/\/[A-Za-z0-9_./:-]{1,700}$/u.test(value)
+  )
+    invalid();
+  return value;
+};
+const normalRole = scenarioEnum('a', 'b');
+const scenarioRole = scenarioEnum('a', 'b', 'recovery');
+const attemptsShape = {
+  provider: scenarioNumber,
+  maintenance: scenarioNumber,
+  application: scenarioNumber,
+};
+const expectedVersionShape = {
+  role: scenarioRole,
+  versionId: scenarioId,
+  databaseId: scenarioId,
+  specDigest: digest,
+  applicationRelease: scenarioEnum('1', '2'),
+};
+const workerVersionShape = {
+  ...expectedVersionShape,
+  accountId: scenarioId,
+  tenantTag: scenarioId,
+  environment: scenarioId,
+  scriptName: scenarioId,
+  currentDeployment: {
+    deploymentId: scenarioId,
+    activeVersionId: scenarioId,
+    versions: boundedArray(
+      {
+        versionId: scenarioId,
+        percentage: (value) => {
+          if (
+            typeof value !== 'number' ||
+            !Number.isFinite(value) ||
+            value < 0 ||
+            value > 100
+          )
+            invalid();
+          return value;
+        },
+      },
+      2,
+    ),
+  },
+  trafficPercentage: scenarioEnum(0, 100),
+  cpuLimitMs: scenarioNumber,
+  subrequestLimit: scenarioNumber,
+  schemaVersion: scenarioEnum(1, 2),
+  namespaces: boundedArray(
+    {
+      binding: scenarioEnum('MAINTENANCE', 'RUNNER'),
+      className: scenarioEnum('Maintenance', 'Runner'),
+      namespaceId: scenarioId,
+    },
+    2,
+  ),
+  bucket: {
+    name: scenarioId,
+    jurisdiction: 'default',
+    creationDate: scenarioDate,
+  },
+};
+const receiptShape = {
+  version: 1,
+  authority: scenarioLocation,
+  databaseId: scenarioId,
+  operationId: scenarioId,
+};
+const exportShape = {
+  verified: true,
+  role: normalRole,
+  receipt: receiptShape,
+  location: scenarioLocation,
+  size: scenarioNumber,
+  sha256: digest,
+  sourceInvocationOrdinal: scenarioNumber,
+};
+const cleanupShape = {
+  version: 1,
+  operationId: scenarioId,
+  tenantTag: scenarioId,
+  environment: scenarioId,
+  backend: 'plain-worker',
+  scriptName: scenarioId,
+  databaseId: scenarioId,
+  databaseName: scenarioId,
+  authority: 'provisioning-rollback',
+  admittedPhase: scenarioId,
+  disposition: scenarioEnum(
+    'prepublication-owned-no-export',
+    'reservation-cleared',
+  ),
+  evidence: {
+    eligibility: scenarioEnum(
+      'carrier-null',
+      'legacy-phase-impossible',
+      'reservation-only',
+    ),
+    ingressRemoved: true,
+    workerAbsent: true,
+    platformResourcesAbsent: true,
+    applicationR2Settled: true,
+    databaseAbsentReadback: true,
+    scan: optional({
+      discover: { evidenceSha256: digest, evidenceCount: scenarioNumber },
+      verify: { evidenceSha256: digest, evidenceCount: scenarioNumber },
+    }),
+  },
+  completedAtMs: scenarioNumber,
+};
+const noEntries = boundedArray(scenarioId, 0);
+const footprintShape = {
+  version: 1,
+  role: 'recovery',
+  beforeIdentitySha256: digest,
+  fleetRecordPresent: false,
+  deploymentClaimsPresent: false,
+  database: { id: scenarioId, expectedName: scenarioId, observedName: null },
+  worker: {
+    scriptName: scenarioId,
+    scriptPresent: scenarioEnum(true, false),
+    workersDevEnabled: scenarioEnum(false, null),
+    previewUrlsEnabled: scenarioEnum(false, null),
+    customDomains: noEntries,
+    zoneRoutes: noEntries,
+    currentSecretNames: noEntries,
+    currentVersionIds: nullable(
+      boundedArray(
+        scenarioId,
+        DIRECT_SCENARIO_ARRAY_MAXIMA.footprintVersionIds,
+      ),
+    ),
+    currentNamespaceIds: boundedArray(scenarioId, 2),
+    survivingRecordedNamespaceIds: boundedArray(scenarioId, 2),
+  },
+  buckets: boundedArray(
+    {
+      bindingName: 'PROBE_BUCKET',
+      bucketName: scenarioId,
+      jurisdiction: 'default',
+      expectedCreationDate: scenarioDate,
+      observedCreationDate: nullable(scenarioDate),
+    },
+    1,
+  ),
+  priorCleanup: {
+    operationId: scenarioId,
+    observedReceiptSha256: digest,
+    matchesBefore: true,
+  },
+};
+const operationSlots = scenarioEnum(...DIRECT_SCENARIO_OPERATION_SLOTS);
+const processShape = {
+  pid: scenarioNumber,
+  startTicks: scenarioId,
+  bootId: scenarioId,
+};
+const decommissionShape = {
+  operationId: scenarioId,
+  databaseId: scenarioId,
+  scriptName: scenarioId,
+  phase: 'decommissioned',
+};
+const callShape = {
+  ordinal: scenarioNumber,
+  action: (value) => {
+    if (
+      !value ||
+      typeof value !== 'object' ||
+      Array.isArray(value) ||
+      Object.keys(value).some((key) => !SUMMARY_FIELDS.includes(key))
+    )
+      invalid();
+    const result = {};
+    for (const [key, field] of Object.entries(value))
+      result[key] =
+        key === 'limit' || key === 'afterOrdinal'
+          ? scenarioNumber(field)
+          : scenarioId(field);
+    if (typeof value.kind !== 'string') invalid();
+    return Object.freeze(result);
+  },
+  outcome: scenarioEnum(
+    'prepared',
+    'returned',
+    'injected-response-loss',
+    'reference-refused',
+  ),
+  attempts: nullable(attemptsShape),
+  migration: nullable({
+    itemOrdinal: scenarioEnum(0, 1),
+    cursor: scenarioNumber,
+    step: scenarioId,
+    itemsSha256: digest,
+  }),
+};
+const inventoryShape = {
+  operationId: scenarioId,
+  generation: scenarioNumber,
+  calls: scenarioNumber,
+  databaseIds: boundedArray(
+    scenarioId,
+    DIRECT_SCENARIO_ARRAY_MAXIMA.inventory.databaseIds,
+  ),
+  namespaceIds: boundedArray(
+    scenarioId,
+    DIRECT_SCENARIO_ARRAY_MAXIMA.inventory.namespaceIds,
+  ),
+  scriptNames: boundedArray(
+    scenarioId,
+    DIRECT_SCENARIO_ARRAY_MAXIMA.inventory.scriptNames,
+  ),
+  bucketNames: boundedArray(
+    scenarioId,
+    DIRECT_SCENARIO_ARRAY_MAXIMA.inventory.bucketNames,
+  ),
+  findings: boundedArray(
+    { kind: scenarioId, detailSha256: digest },
+    DIRECT_SCENARIO_ARRAY_MAXIMA.inventory.findings,
+  ),
+};
+const auditShape = {
+  operationId: scenarioId,
+  generation: scenarioNumber,
+  recordCount: 2,
+  findingCount: scenarioNumber,
+  finalizedAtMs: scenarioNumber,
+  findings: boundedArray(
+    {
+      tenantTag: scenarioId,
+      environment: scenarioId,
+      kind: scenarioId,
+      detailSha256: digest,
+    },
+    DIRECT_SCENARIO_ARRAY_MAXIMA.auditFindings,
+  ),
+};
+function decodeScenario(value, invocationCount) {
+  const result = scenarioShape(value, {
+    version: 1,
+    phase: scenarioEnum(...DIRECT_SCENARIO_PHASES),
+    startedOrdinal: scenarioNumber,
+    callCount: scenarioNumber,
+    phaseCalls: Object.fromEntries(
+      DIRECT_SCENARIO_PHASES.map((phase) => [phase, scenarioNumber]),
+    ),
+    attempts: attemptsShape,
+    sdkRequests: scenarioNumber,
+    inventoryCalls: { before: scenarioNumber, after: scenarioNumber },
+    lastCall: nullable(callShape),
+    mutation: nullable(callShape),
+    reconciledOrdinal: scenarioNumber,
+    operations: boundedArray(
+      {
+        slot: operationSlots,
+        operationId: nullable(scenarioId),
+        inputSha256: digest,
+        tokenRevision: nullable(scenarioNumber),
+      },
+      11,
+    ),
+    records: boundedArray(
+      {
+        role: scenarioRole,
+        present: scenarioEnum(true, false),
+        phase: nullable(scenarioId),
+        desiredSpecDigest: nullable(digest),
+        pendingSpecDigest: nullable(digest),
+        artifactVersion: nullable(scenarioId),
+        pendingArtifactVersion: nullable(scenarioId),
+        databaseId: nullable(scenarioId),
+      },
+      3,
+    ),
+    failure: nullable({
+      code: scenarioEnum(...DIRECT_SCENARIO_FAILURES),
+      ordinal: scenarioNumber,
+    }),
+    proofs: {
+      initial: {
+        a: nullable(workerVersionShape),
+        b: nullable(workerVersionShape),
+        recovery: nullable(workerVersionShape),
+      },
+      candidate: {
+        a: nullable(workerVersionShape),
+        b: nullable(workerVersionShape),
+      },
+      final: {
+        a: nullable(workerVersionShape),
+        b: nullable(workerVersionShape),
+      },
+      objects: {
+        a: nullable({ size: scenarioNumber, sha256: digest }),
+        b: nullable({ size: scenarioNumber, sha256: digest }),
+      },
+      objectDeletions: {
+        a: nullable(scenarioNumber),
+        b: nullable(scenarioNumber),
+      },
+      recoveryExportAbsent: {
+        beforeOrdinal: nullable(scenarioNumber),
+        afterOrdinal: nullable(scenarioNumber),
+      },
+      health: boundedArray(
+        {
+          role: scenarioRole,
+          release: scenarioEnum('1', '2'),
+          marker: scenarioEnum('initial', 'next'),
+          ordinal: scenarioNumber,
+        },
+        DIRECT_SCENARIO_ARRAY_MAXIMA.health,
+      ),
+      inventories: {
+        before: nullable(inventoryShape),
+        after: nullable(inventoryShape),
+      },
+      audits: { before: nullable(auditShape), after: nullable(auditShape) },
+      restart: nullable({
+        process: processShape,
+        resumedProcess: nullable(processShape),
+        lossOrdinal: scenarioNumber,
+        operationId: scenarioId,
+        witnessSha256: digest,
+        claimSha256: digest,
+        successorSha256: digest,
+        itemsSha256: digest,
+        replayOrdinal: nullable(scenarioNumber),
+      }),
+      steps: boundedArray(
+        {
+          ordinal: scenarioNumber,
+          itemOrdinal: scenarioEnum(0, 1),
+          step: scenarioId,
+          beforeCursor: scenarioNumber,
+          afterCursor: scenarioNumber,
+          provider: scenarioNumber,
+          maintenance: scenarioNumber,
+          application: scenarioNumber,
+        },
+        DIRECT_SCENARIO_ARRAY_MAXIMA.steps,
+      ),
+      effects: boundedArray(
+        {
+          role: normalRole,
+          tenantTag: scenarioId,
+          environment: scenarioId,
+          scriptName: scenarioId,
+          databaseId: scenarioId,
+          versionId: scenarioId,
+          specDigest: digest,
+          schemaVersion: 2,
+          settlementKey: digest,
+          identitySha256: digest,
+          provenanceSha256: digest,
+        },
+        2,
+      ),
+      cleanup: nullable(cleanupShape),
+      exports: { a: nullable(exportShape), b: nullable(exportShape) },
+      exportVerifications: boundedArray(
+        exportShape,
+        DIRECT_SCENARIO_ARRAY_MAXIMA.exportVerifications,
+      ),
+      decommission: {
+        a: nullable(decommissionShape),
+        b: nullable(decommissionShape),
+      },
+      force: nullable(footprintShape),
+      residual: nullable(footprintShape),
+    },
+  });
+  if (
+    result.startedOrdinal > invocationCount ||
+    result.callCount > invocationCount - result.startedOrdinal ||
+    Object.values(result.phaseCalls).reduce(
+      (total, count) => total + count,
+      0,
+    ) !== result.callCount
+  )
+    invalid();
+  for (const call of [result.lastCall, result.mutation]) {
+    if (!call) continue;
+    if (
+      call.ordinal > invocationCount + (call.outcome === 'prepared' ? 1 : 0) ||
+      call.ordinal < 1 ||
+      (call.outcome === 'prepared') !== (call.attempts === null)
+    )
+      invalid();
+  }
+  for (const proof of Object.values(result.proofs.exports))
+    if (
+      proof &&
+      (proof.sourceInvocationOrdinal < 1 ||
+        proof.sourceInvocationOrdinal > invocationCount ||
+        proof.size < 1)
+    )
+      invalid();
+  if (
+    new Set(result.operations.map((entry) => entry.slot)).size !==
+      result.operations.length ||
+    new Set(result.records.map((entry) => entry.role)).size !==
+      result.records.length
+  )
+    invalid();
+  validateScenarioProofs(result, invocationCount);
+  return result;
+}
+
+function validateScenarioProofs(state, invocationCount) {
+  const proof = state.proofs;
+  const past = (phase) =>
+    DIRECT_SCENARIO_PHASES.indexOf(state.phase) >
+    DIRECT_SCENARIO_PHASES.indexOf(phase);
+  const need = (condition) => {
+    if (!condition) invalid();
+  };
+  for (const role of ['a', 'b', 'recovery']) {
+    if (past(`provision-${role}`))
+      need(
+        proof.initial[role] &&
+          proof.health.some(
+            (entry) =>
+              entry.role === role &&
+              entry.release === '1' &&
+              entry.marker === 'initial',
+          ),
+      );
+    if (role === 'recovery') continue;
+    if (past(`provision-${role}`)) need(proof.objects[role]);
+    if (past('migration'))
+      need(
+        proof.candidate[role]?.trafficPercentage === 0 &&
+          proof.final[role]?.trafficPercentage === 100 &&
+          proof.steps.some(
+            (entry) =>
+              entry.itemOrdinal === (role === 'a' ? 0 : 1) &&
+              entry.step === 'arm-maintenance' &&
+              entry.maintenance > 0,
+          ),
+      );
+    if (past('post-migration'))
+      need(
+        proof.health.some(
+          (entry) =>
+            entry.role === role &&
+            entry.release === '2' &&
+            entry.marker === 'next',
+        ),
+      );
+    if (past('delete-objects')) need(proof.objectDeletions[role] > 0);
+    if (past(`decommission-${role}`))
+      need(proof.exports[role] && proof.decommission[role]);
+  }
+  for (const when of ['before', 'after']) {
+    if (past(`inventory-${when}`)) need(proof.inventories[when]?.calls > 1);
+    if (past(`audit-${when}`))
+      need(
+        proof.audits[when]?.recordCount === 2 &&
+          proof.audits[when].findingCount ===
+            proof.audits[when].findings.length &&
+          proof.audits[when].generation === proof.inventories[when].generation,
+      );
+  }
+  if (past('migration-interrupt')) need(proof.restart);
+  if (past('migration-restart'))
+    need(proof.restart?.replayOrdinal && proof.restart.resumedProcess);
+  if (past('migration')) need(proof.effects.length === 2);
+  if (past('cleanup-recovery')) need(proof.cleanup);
+  if (past('force-recovery'))
+    need(proof.recoveryExportAbsent.beforeOrdinal > 0);
+  if (past('force-observe'))
+    need(proof.force && proof.recoveryExportAbsent.afterOrdinal > 0);
+  if (past('recover-force-residual')) need(proof.residual);
+  for (const ordinal of [
+    state.reconciledOrdinal,
+    ...Object.values(proof.objectDeletions),
+    ...Object.values(proof.recoveryExportAbsent),
+    ...proof.health.map((entry) => entry.ordinal),
+    ...proof.steps.map((entry) => entry.ordinal),
+  ])
+    if (ordinal !== null) need(ordinal <= invocationCount);
+  if (proof.restart) {
+    need(
+      proof.restart.lossOrdinal > 0 &&
+        proof.restart.lossOrdinal <= invocationCount,
+    );
+    if (proof.restart.replayOrdinal !== null)
+      need(
+        proof.restart.replayOrdinal > proof.restart.lossOrdinal &&
+          proof.restart.replayOrdinal <= invocationCount &&
+          proof.restart.resumedProcess &&
+          JSON.stringify(proof.restart.process) !==
+            JSON.stringify(proof.restart.resumedProcess),
+      );
+  }
+}
+
+async function validateScenarioActions(state, binding) {
+  for (const call of [state.lastCall, state.mutation]) {
+    if (!call) continue;
+    await decodeRequest(
+      JSON.stringify({
+        contractVersion: 1,
+        configSha256: binding.configSha256,
+        action: replayableAction(call.action),
+      }),
+      binding.configSha256,
+    );
+  }
 }
 
 function bootstrapContext(value, binding) {
@@ -472,7 +1115,7 @@ async function readSnapshot(path, binding) {
   try {
     const stat = await handle.stat();
     assertPrivate(stat, false);
-    if (stat.size < 1 || stat.size > MAX_JOURNAL_BYTES) invalid();
+    if (stat.size < 1 || stat.size > DIRECT_RUN_MAX_JOURNAL_BYTES) invalid();
     const bytes = Buffer.alloc(stat.size);
     let offset = 0;
     while (offset < bytes.length) {
@@ -509,7 +1152,7 @@ async function writeSnapshot(directory, handle, snapshot) {
     created = true;
     assertPrivate(await file.stat(), false);
     const serialized = `${JSON.stringify(snapshot)}\n`;
-    if (Buffer.byteLength(serialized) > MAX_JOURNAL_BYTES) invalid();
+    if (Buffer.byteLength(serialized) > DIRECT_RUN_MAX_JOURNAL_BYTES) invalid();
     await file.writeFile(serialized);
     await file.sync();
     await file.close();
@@ -619,6 +1262,86 @@ function runJournal(directory, directoryHandle, base, lock, initial) {
     directory,
     snapshot() {
       return snapshot;
+    },
+    recordScenario(value) {
+      return enqueue(async () => {
+        assertSettled();
+        const scenario = decodeScenario(value, snapshot.invocationCount);
+        await validateScenarioActions(scenario, snapshot.binding);
+        if (!snapshot.bootstrap?.controlReadOrdinal) invalid();
+        const previous = snapshot.scenario;
+        if (previous) {
+          if (
+            scenario.startedOrdinal !== previous.startedOrdinal ||
+            scenario.callCount < previous.callCount ||
+            DIRECT_SCENARIO_PHASES.indexOf(scenario.phase) <
+              DIRECT_SCENARIO_PHASES.indexOf(previous.phase) ||
+            DIRECT_SCENARIO_PHASES.indexOf(scenario.phase) >
+              DIRECT_SCENARIO_PHASES.indexOf(previous.phase) + 1
+          )
+            invalid();
+          for (const kind of ['provider', 'maintenance', 'application'])
+            if (scenario.attempts[kind] < previous.attempts[kind]) invalid();
+          if (scenario.sdkRequests < previous.sdkRequests) invalid();
+          for (const phase of DIRECT_SCENARIO_PHASES)
+            if (scenario.phaseCalls[phase] < previous.phaseCalls[phase])
+              invalid();
+          for (const group of [
+            'initial',
+            'candidate',
+            'final',
+            'objects',
+            'objectDeletions',
+            'recoveryExportAbsent',
+            'inventories',
+            'audits',
+            'decommission',
+          ])
+            for (const [key, proof] of Object.entries(previous.proofs[group]))
+              if (proof !== null)
+                equalShape(scenario.proofs[group][key], proof);
+          for (const key of ['cleanup', 'force', 'residual'])
+            if (previous.proofs[key] !== null)
+              equalShape(scenario.proofs[key], previous.proofs[key]);
+          if (previous.failure) equalShape(scenario.failure, previous.failure);
+          if (previous.proofs.restart) {
+            const { resumedProcess, replayOrdinal, ...fixed } =
+              previous.proofs.restart;
+            for (const [key, expected] of Object.entries(fixed))
+              equalShape(scenario.proofs.restart?.[key], expected);
+            if (replayOrdinal !== null) {
+              equalShape(scenario.proofs.restart.replayOrdinal, replayOrdinal);
+              equalShape(
+                scenario.proofs.restart.resumedProcess,
+                resumedProcess,
+              );
+            }
+          }
+          for (const role of ['a', 'b']) {
+            if (previous.proofs.exports[role]) {
+              const { sourceInvocationOrdinal, ...proof } =
+                previous.proofs.exports[role];
+              const { sourceInvocationOrdinal: freshOrdinal, ...freshProof } =
+                scenario.proofs.exports[role] ?? {};
+              equalShape(freshProof, proof);
+              if (freshOrdinal < sourceInvocationOrdinal) invalid();
+            }
+          }
+          for (const key of [
+            'steps',
+            'effects',
+            'health',
+            'exportVerifications',
+          ]) {
+            if (scenario.proofs[key].length < previous.proofs[key].length)
+              invalid();
+            previous.proofs[key].forEach((proof, index) => {
+              equalShape(scenario.proofs[key][index], proof);
+            });
+          }
+        }
+        await publish(Object.freeze({ ...snapshot, scenario }));
+      });
     },
     bindBootstrapContext(context) {
       return enqueue(async () => {

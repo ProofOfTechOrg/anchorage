@@ -10,7 +10,13 @@ import { fileURLToPath } from 'node:url';
 import type { D1Database, R2Bucket } from '@cloudflare/workers-types';
 import { expect } from 'vitest';
 import { createTestHarness, type TestHarness } from 'wrangler';
+import type { DirectRunManifest } from '../../scripts/direct-credentialed-conformance-preflight.mjs';
 import { directDeploymentSpec } from '../../scripts/direct-credentialed-spec.js';
+import {
+  DIRECT_TENANT_OBJECT_BODY,
+  DIRECT_TENANT_OBJECT_KEY,
+} from '../../scripts/direct-credentialed-tenant-object.mjs';
+import type { DirectRunBinding } from '../../scripts/direct-reference-context.js';
 import {
   DIRECT_REFERENCE_PATH,
   type DirectReferenceAction,
@@ -31,6 +37,10 @@ import { maintenanceResponder, providerWorld } from './provider-world.js';
 export async function createDirectReferenceHarness(
   policy: Readonly<{
     maintenanceNow?: () => number;
+    manifest?: DirectRunManifest;
+    binding?: DirectRunBinding;
+    applicationProbes?: boolean;
+    nodeResponse?: (request: Request, response: Response) => Promise<Response>;
     applicationFetch?: (request: CloudflareFixtureRequest) => Promise<Response>;
     providerResponse?: (
       request: CloudflareFixtureRequest,
@@ -38,7 +48,7 @@ export async function createDirectReferenceHarness(
     ) => Promise<Response>;
   }> = {},
 ) {
-  const manifest = directFixtureManifest();
+  const manifest = policy.manifest ?? directFixtureManifest();
   const roles = ['a', 'b', 'recovery'] as const;
   function fixtureSecrets(role: string): DeploymentSecrets {
     return {
@@ -52,7 +62,7 @@ export async function createDirectReferenceHarness(
     b: fixtureSecrets('b'),
     recovery: fixtureSecrets('recovery'),
   };
-  const binding = {
+  const binding = policy.binding ?? {
     version: 1,
     accountId: 'account',
     fleetDatabaseId: '00000000-0000-0000-0000-000000000011',
@@ -80,11 +90,120 @@ export async function createDirectReferenceHarness(
     { name: string; jurisdiction: string; creation_date: string }
   >();
   const rest = restProjection(world);
+  const versionRuntime = new Map<string, unknown>();
+  const activeVersion = (script: ReturnType<typeof world.scripts.get>) =>
+    script?.versions.find((version) =>
+      script.deployment?.some(
+        (entry) =>
+          entry.versionId === version.versionId && entry.percentage === 100,
+      ),
+    );
   async function providerRest(
     request: CloudflareFixtureRequest,
   ): Promise<Response> {
     try {
-      const response = await rest(request);
+      const url = new URL(request.url);
+      const scriptName = url.pathname
+        .split('/workers/scripts/')[1]
+        ?.split('/')[0];
+      const script = scriptName ? world.scripts.get(scriptName) : undefined;
+      const metadata =
+        request.body &&
+        typeof request.body === 'object' &&
+        'metadata' in request.body
+          ? (request.body.metadata as Record<string, unknown>)
+          : undefined;
+      let response: Response;
+      if (
+        request.method === 'GET' &&
+        url.pathname.endsWith('/deployments/deployment')
+      ) {
+        response = single({
+          id: 'deployment',
+          strategy: 'percentage',
+          versions: script?.deployment?.map(({ versionId, percentage }) => ({
+            version_id: versionId,
+            percentage,
+          })),
+        });
+      } else if (
+        request.method === 'GET' &&
+        url.pathname.endsWith('/settings') &&
+        script?.present
+      ) {
+        const active = activeVersion(script);
+        const runtime = versionRuntime.get(active?.versionId ?? '') as
+          | Record<string, unknown>
+          | undefined;
+        response = single({
+          ...runtime,
+          bindings: active?.bindings.map((entry) => {
+            const value = entry as Record<string, unknown>;
+            return value.type === 'secret_text'
+              ? { type: value.type, name: value.name }
+              : value;
+          }),
+        });
+      } else if (
+        request.method === 'POST' &&
+        url.pathname ===
+          `/client/v4/accounts/account/d1/database/${binding.fleetDatabaseId}/query`
+      ) {
+        const query = request.body as { sql: string; params: string[] };
+        if (
+          !query.sql.startsWith('SELECT ') ||
+          (!query.sql.includes(' FROM direct_reference_observations WHERE ') &&
+            !query.sql.includes(' FROM anchorage_fleet_deployments WHERE '))
+        )
+          throw new Error('unexpected Node D1 query');
+        const result = await db
+          .prepare(query.sql)
+          .bind(...query.params)
+          .all();
+        response = single([{ success: true, results: result.results }]);
+      } else if (
+        request.method === 'GET' &&
+        url.pathname.startsWith(
+          `/client/v4/accounts/account/r2/buckets/${binding.exportBucketName}/objects/`,
+        )
+      ) {
+        const key = decodeURIComponent(
+          url.pathname.split('/objects/')[1] ?? '',
+        );
+        const value = await exportBytes.get(key);
+        response = value
+          ? new Response(await value.arrayBuffer())
+          : new Response(null, { status: 404 });
+      } else {
+        response = await rest(request);
+        if (metadata && response.ok && scriptName) {
+          const current = world.scripts.get(scriptName);
+          for (const version of current?.versions ?? [])
+            if (!versionRuntime.has(version.versionId))
+              versionRuntime.set(version.versionId, {
+                compatibility_date: metadata.compatibility_date,
+                compatibility_flags: metadata.compatibility_flags ?? [],
+                limits: metadata.limits,
+              });
+        }
+        if (
+          request.method === 'GET' &&
+          /\/versions\/[^/]+$/u.test(url.pathname) &&
+          response.ok
+        ) {
+          const value = (await response.json()) as {
+            result: { id: string; resources: Record<string, unknown> };
+          };
+          const runtime = versionRuntime.get(value.result.id) as
+            | { limits?: { cpu_ms?: number } }
+            | undefined;
+          value.result.resources.script_runtime = {
+            ...runtime,
+            limits: { cpu_ms: runtime?.limits?.cpu_ms },
+          };
+          response = Response.json(value);
+        }
+      }
       return policy.providerResponse
         ? await policy.providerResponse(request, response)
         : response;
@@ -109,6 +228,73 @@ export async function createDirectReferenceHarness(
   }
   const projection = recordingFetch(async (request) => {
     const url = new URL(request.url);
+    if (
+      policy.applicationProbes &&
+      specs.some((spec) => url.origin === `https://${spec.routeHostname}`)
+    ) {
+      const role = roles.find(
+        (role) => url.hostname === manifest.names.roles[role].routeHostname,
+      );
+      if (!role) throw new Error('unknown fixture application role');
+      if (
+        request.headers.get('authorization') !==
+        `Bearer ${secrets[role].application?.APP_PROBE_TOKEN}`
+      )
+        return new Response(null, { status: 401 });
+      const record = await fleetStore.get(
+        manifest.names.roles[role].tenantTag,
+        manifest.environment,
+      );
+      if (!record) throw new Error('missing fixture application record');
+      const database = world.databases.find(
+        (database) => database.databaseId === record.databaseId,
+      );
+      const active = activeVersion(world.scripts.get(record.scriptName));
+      if (!database || !active)
+        throw new Error('missing active fixture application');
+      const releaseBinding = active.bindings.find(
+        (binding) =>
+          binding &&
+          typeof binding === 'object' &&
+          Reflect.get(binding, 'name') === 'APPLICATION_RELEASE',
+      );
+      const release =
+        releaseBinding && typeof releaseBinding === 'object'
+          ? Reflect.get(releaseBinding, 'text')
+          : undefined;
+      if (url.pathname === '/__direct/health' && request.method === 'GET') {
+        const rows = database.d1.queryDatabase(
+          'SELECT marker FROM direct_conformance_fixture WHERE id=1',
+        );
+        return Response.json({ release, marker: rows[0]?.marker });
+      }
+      const bucket = record.applicationResources?.find(
+        (resource) => resource.name === 'PROBE_BUCKET',
+      );
+      if (!bucket || url.pathname !== '/__direct/object')
+        throw new Error('unknown fixture application route');
+      const key = `${bucket.jurisdiction}:${bucket.bucketName}/${DIRECT_TENANT_OBJECT_KEY}`;
+      if (request.method === 'POST') {
+        await applicationBytes.put(key, DIRECT_TENANT_OBJECT_BODY);
+        return new Response(null, { status: 204 });
+      }
+      if (request.method === 'DELETE') {
+        await applicationBytes.delete(key);
+        return new Response(null, { status: 204 });
+      }
+      if (request.method !== 'GET')
+        throw new Error('unexpected fixture application method');
+      const value = await applicationBytes.get(key);
+      return value
+        ? Response.json({
+            present: true,
+            size: value.size,
+            sha256: createHash('sha256')
+              .update(Buffer.from(await value.arrayBuffer()))
+              .digest('hex'),
+          })
+        : Response.json({ present: false });
+    }
     if (
       policy.applicationFetch &&
       specs.some(
@@ -163,6 +349,10 @@ export async function createDirectReferenceHarness(
     }
     if (url.origin !== 'https://api.cloudflare.com')
       throw new Error('unexpected fixture origin');
+    if (
+      url.pathname.includes(`/r2/buckets/${binding.exportBucketName}/objects/`)
+    )
+      return providerRest(request);
     const match = url.pathname.match(
       /^\/client\/v4\/accounts\/account\/r2\/buckets(?:\/([^/]+)(\/objects)?)?$/u,
     );
@@ -267,6 +457,7 @@ export async function createDirectReferenceHarness(
   });
 
   let reload: () => Promise<void>;
+  let bridgeUrl: string;
   async function refreshBindings() {
     const env = await server
       .getWorker<{
@@ -314,7 +505,10 @@ export async function createDirectReferenceHarness(
     bridge = createServer(async (incoming, outgoing) => {
       try {
         const original = incoming.headers['x-direct-fixture-url'];
-        if (typeof original !== 'string' || incoming.url !== '/')
+        if (
+          typeof original !== 'string' ||
+          !['/', '/node'].includes(incoming.url ?? '')
+        )
           throw new Error('invalid fixture bridge request');
         const headers = new Headers();
         for (const [name, values] of Object.entries(incoming.headers)) {
@@ -343,12 +537,32 @@ export async function createDirectReferenceHarness(
             ? await request.formData()
             : await request.text()
           : undefined;
-        const response = await projection.fetch(original, {
-          method,
-          headers,
-          body,
-          redirect: 'manual',
-        });
+        const referenceOrigin = `https://${manifest.names.referenceWorker}.${binding.accountWorkersDevSubdomain}.workers.dev`;
+        let response: Response;
+        if (
+          incoming.url === '/node' &&
+          original === `${referenceOrigin}${DIRECT_REFERENCE_PATH}`
+        ) {
+          response = await server.getWorker().fetch(original, {
+            method,
+            headers: [...headers],
+            body: body as string,
+          });
+        } else {
+          if (
+            incoming.url === '/node' &&
+            new URL(original).origin !== 'https://api.cloudflare.com'
+          )
+            throw new Error('unexpected Node fixture origin');
+          response = await projection.fetch(original, {
+            method,
+            headers,
+            body,
+            redirect: 'manual',
+          });
+        }
+        if (incoming.url === '/node' && policy.nodeResponse)
+          response = await policy.nodeResponse(request, response);
         outgoing.writeHead(
           response.status,
           Object.fromEntries(response.headers),
@@ -366,6 +580,7 @@ export async function createDirectReferenceHarness(
     const address = bridge.address();
     if (!address || typeof address === 'string')
       throw new Error('missing fixture listener');
+    bridgeUrl = `http://127.0.0.1:${address.port}/node`;
     const main = join(directory, 'worker.ts');
     const workerSource = fileURLToPath(
       new URL('../../scripts/direct-reference-worker.ts', import.meta.url),
@@ -505,6 +720,20 @@ let instance; export default {async fetch(request,env){instance??=crypto.randomU
     buckets,
     bridgeErrors,
     sqlFailures,
+    bridgeUrl,
+    fetch: (async (input, init) => {
+      const request = new Request(input, init);
+      const headers = new Headers(request.headers);
+      headers.set('X-Direct-Fixture-Url', request.url);
+      return fetch(bridgeUrl, {
+        method: request.method,
+        headers,
+        body: request.body,
+        signal: request.signal,
+        redirect: 'manual',
+        duplex: 'half',
+      } as RequestInit);
+    }) as typeof fetch,
     call,
     success,
     journal,

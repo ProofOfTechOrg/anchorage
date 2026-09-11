@@ -2,6 +2,7 @@
 
 import type { DirectConformanceNames } from './direct-credentialed-conformance-config.mjs';
 import type { PreparedDirectConformance } from './direct-credentialed-conformance-preflight.mjs';
+import type { DirectScenarioState } from './direct-credentialed-scenario.mjs';
 import type { DirectReferenceAction } from './direct-reference-contract.mjs';
 
 export type DirectRunStateErrorCode =
@@ -48,6 +49,7 @@ export interface DirectRunSnapshot {
         }>)
     | null;
   readonly bootstrap: DirectBootstrapState | null;
+  readonly scenario?: DirectScenarioState;
 }
 
 export interface DirectBootstrapContext {
@@ -119,6 +121,7 @@ export interface DirectBootstrapState {
 export interface DirectRunJournal {
   readonly directory: string;
   snapshot(): DirectRunSnapshot;
+  recordScenario(state: DirectScenarioState): Promise<void>;
   bindBootstrapContext(context: DirectBootstrapContext): Promise<void>;
   beginBootstrapMutation(kind: DirectBootstrapMutation): Promise<void>;
   confirmBootstrapMutation(
@@ -133,6 +136,54 @@ export interface DirectRunJournal {
   settleInvocation(reservation: DirectInvocationReservation): Promise<void>;
   close(): Promise<void>;
 }
+
+export const DIRECT_SCENARIO_FAILURES: readonly [
+  'observation-mismatch',
+  'outcome-unknown',
+  'proof-unavailable',
+  'budget-exhausted',
+  'invocation-budget-exhausted',
+  'reference-refused',
+  'invalid-input',
+  'provider-unavailable',
+  'journal-failed',
+  'blocked',
+];
+
+export const DIRECT_SCENARIO_OPERATION_SLOTS: readonly [
+  'inventory-before',
+  'inventory-after',
+  'audit-before',
+  'audit-after',
+  'migration-next',
+  'cleanup-a',
+  'cleanup-b',
+  'cleanup-recovery',
+  'cleanup-recovery-initial',
+  'decommission-a',
+  'decommission-b',
+];
+
+export const DIRECT_RUN_MAX_JOURNAL_BYTES: number;
+
+export const DIRECT_SCENARIO_ARRAY_MAXIMA: Readonly<{
+  health: number;
+  steps: number;
+  exportVerifications: number;
+  auditFindings: number;
+  footprintVersionIds: number;
+  inventory: Readonly<{
+    databaseIds: number;
+    namespaceIds: number;
+    scriptNames: number;
+    bucketNames: number;
+    findings: number;
+  }>;
+}>;
+
+export function actionSummary(
+  action: DirectReferenceAction,
+): DirectRunActionSummary;
 
 export function openDirectRunState(
   input: Readonly<{
