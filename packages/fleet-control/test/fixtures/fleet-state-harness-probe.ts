@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-/// <reference types="@cloudflare/workers-types" />
+import type {
+  D1Database,
+  ExportedHandler,
+  Request,
+  Response as WorkerResponse,
+} from '@cloudflare/workers-types';
 
 import {
   applicationBindingTopology,
@@ -63,6 +68,8 @@ import {
   backendSwitchDecommissionRecordFixture,
   decommissionAdvancingRecordFixture,
 } from './decommission-intent-fixture.js';
+
+declare const Response: typeof WorkerResponse;
 
 interface Env {
   DB: D1Database;
@@ -4922,7 +4929,7 @@ async function cloudflareRateCoordination(db: D1Database): Promise<unknown> {
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<WorkerResponse> {
     const url = new URL(request.url);
     if (request.method !== 'POST' || url.pathname !== '/fleet-state') {
       return new Response('not found', { status: 404 });

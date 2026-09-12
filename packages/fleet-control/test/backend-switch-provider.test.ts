@@ -1216,6 +1216,47 @@ describe('backend switch provider teardown authority', () => {
     expect(publicAccessDisables).toBe(1);
   });
 
+  it.each([
+    {},
+    { workersDevEnabled: false },
+    { previewUrlsEnabled: false },
+  ])('refuses unknown present-Worker access before switch traffic proof %#', async (flags) => {
+    const subject = provider({
+      getHostRouting: async () => undefined,
+      listCustomDomains: async () => [],
+      inspectOrdinaryWorkerFootprint: async () => ({
+        scriptPresent: true,
+        customDomains: [],
+        zoneRoutes: [],
+        ...flags,
+      }),
+    });
+    await expect(
+      subject.assertSwitchTrafficRemoved({
+        prior,
+        routeHostname: targetSpec.routeHostname,
+      }),
+    ).rejects.toThrow('public-access footprint is incomplete');
+  });
+
+  it('accepts an absent Worker without flags in switch traffic proof', async () => {
+    const subject = provider({
+      getHostRouting: async () => undefined,
+      listCustomDomains: async () => [],
+      inspectOrdinaryWorkerFootprint: async () => ({
+        scriptPresent: false,
+        customDomains: [],
+        zoneRoutes: [],
+      }),
+    });
+    await expect(
+      subject.assertSwitchTrafficRemoved({
+        prior,
+        routeHostname: targetSpec.routeHostname,
+      }),
+    ).resolves.toBeUndefined();
+  });
+
   it('requires HOSTS, every ordinary ingress surface, workers.dev, and previews to be absent', async () => {
     const subject = provider({
       getHostRouting: async () => undefined,

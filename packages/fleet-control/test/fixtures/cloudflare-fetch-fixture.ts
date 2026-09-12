@@ -106,7 +106,7 @@ export function zoneAuthorityResponse(
   }
   if (url.pathname.endsWith('/zones')) {
     expect(url.searchParams.get('account.id')).toBe('account');
-    if (url.searchParams.has('page')) return envelope([]);
+    if (Number(url.searchParams.get('page') ?? '1') !== 1) return envelope([]);
     return envelope(zoneIds.map((id) => ({ id, account: { id: 'account' } })));
   }
   const parts = url.pathname.split('/').filter(Boolean);
@@ -189,19 +189,21 @@ class UnsupportedFormDataResponse {
   }
 }
 
-async function decodeBody(body: BodyInit | null | undefined): Promise<unknown> {
+async function decodeBody(body: RequestInit['body']): Promise<unknown> {
   if (body instanceof FormData) {
     const files: Array<{ name: string; type: string; text: string }> = [];
     const fields: Record<string, unknown> = {};
     for (const [name, value] of body.entries()) {
-      if (value instanceof File) {
+      if (name === 'metadata') {
+        fields[name] = JSON.parse(
+          typeof value === 'string' ? value : await value.text(),
+        );
+      } else if (typeof value !== 'string') {
         files.push({
-          name: value.name,
+          name,
           type: value.type,
           text: await value.text(),
         });
-      } else if (name === 'metadata') {
-        fields[name] = JSON.parse(value);
       } else {
         fields[name] = value;
       }
@@ -324,7 +326,8 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
     const bodyField = (name: string): unknown =>
       body && typeof body === 'object' ? Reflect.get(body, name) : undefined;
     if (target.pathname.endsWith('/d1/database') && method === 'GET') {
-      if (target.searchParams.has('page')) return pageArray([]);
+      if (Number(target.searchParams.get('page') ?? '1') !== 1)
+        return pageArray([]);
       const requestedName = target.searchParams.get('name');
       return pageArray(
         world.databases
@@ -429,7 +432,8 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
       });
     }
     if (target.pathname.endsWith('/workers/scripts') && method === 'GET') {
-      if (target.searchParams.has('page')) return pageArray([]);
+      if (Number(target.searchParams.get('page') ?? '1') !== 1)
+        return pageArray([]);
       return pageArray(
         [...world.scripts.entries()].flatMap(([id, script]) =>
           script.present ? [{ id }] : [],
@@ -485,7 +489,8 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
       target.pathname.endsWith('/workers/durable_objects/namespaces') &&
       method === 'GET'
     ) {
-      if (target.searchParams.has('page')) return pageArray([]);
+      if (Number(target.searchParams.get('page') ?? '1') !== 1)
+        return pageArray([]);
       return pageArray(
         world.durableObjectNamespaces.map((namespace) => ({
           id: namespace.id,
@@ -541,6 +546,15 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
       throw new Error(`unexpected request ${method} ${target.pathname}`);
     }
     const script = world.scripts.get(scriptName);
+    if (
+      (target.pathname.endsWith(`/workers/scripts/${scriptName}`) &&
+        method === 'PUT') ||
+      (target.pathname.endsWith('/versions') && method === 'POST')
+    ) {
+      const mainModule = readStringFact(bodyField('metadata'), 'main_module');
+      if (!readModules(body).some((module) => module.name === mainModule))
+        return failedResponse('the declared entrypoint module part is missing');
+    }
     if (
       target.pathname.endsWith(`/workers/scripts/${scriptName}`) &&
       method === 'PUT'
@@ -610,7 +624,8 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
       return single({});
     }
     if (target.pathname.endsWith('/secrets') && method === 'GET') {
-      if (target.searchParams.has('page')) return pageArray([]);
+      if (Number(target.searchParams.get('page') ?? '1') !== 1)
+        return pageArray([]);
       return pageArray(
         [...script.secretNames].sort().map((name) => ({ name })),
       );
@@ -669,7 +684,8 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
       });
     }
     if (target.pathname.endsWith('/versions') && method === 'GET') {
-      if (target.searchParams.has('page')) return pageItems([]);
+      if (Number(target.searchParams.get('page') ?? '1') !== 1)
+        return pageItems([]);
       return pageItems(
         script.versions.map(({ versionId, tag }) => ({
           id: versionId,

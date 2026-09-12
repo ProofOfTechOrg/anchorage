@@ -7,6 +7,7 @@ import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
+import { finished } from 'node:stream/promises';
 import {
   captureDatabaseExportReceiptCapability,
   type DurableDatabaseExportStore,
@@ -34,20 +35,30 @@ import type {
 import type { CommandResult, CommandRunner } from './wrangler-runner.js';
 
 function parseJson(value: string, operation: string): unknown {
+  let parsed: unknown;
   try {
-    return JSON.parse(value);
+    parsed = JSON.parse(value);
   } catch (cause) {
     throw new Error(`wrangler ${operation} returned invalid JSON`, { cause });
   }
+  const success = readField(parsed, 'success');
+  const errors = readField(parsed, 'errors');
+  if (
+    (success !== undefined && success !== true) ||
+    (errors !== undefined && (!Array.isArray(errors) || errors.length !== 0))
+  )
+    throw new Error(`wrangler ${operation} returned a failed inventory result`);
+  return parsed;
 }
 
 function asArray(value: unknown): readonly unknown[] {
   if (Array.isArray(value)) return value;
   if (value && typeof value === 'object' && 'result' in value) {
-    const result = (value as { result?: unknown }).result;
-    return Array.isArray(result) ? result : result ? [result] : [];
+    const result = readField(value, 'result');
+    if (Array.isArray(result)) return result;
+    if (result && typeof result === 'object') return [result];
   }
-  return [];
+  throw new Error('Wrangler inventory result has an invalid list shape');
 }
 
 function isWranglerNotFound(error: unknown): boolean {
@@ -295,10 +306,13 @@ export class WranglerPlainWorkerProvisioningApi
     // The pinned Wrangler command has no name flag, so the adapter filters
     // the parsed inventory.
     return asArray(parseJson(listed.stdout, 'd1 list'))
-      .map((database) => ({
-        databaseId: readStringField(database, 'uuid'),
-        name: readStringField(database, 'name'),
-      }))
+      .map((database) => {
+        const databaseId = readStringField(database, 'uuid');
+        const name = readStringField(database, 'name');
+        if (!databaseId || !name)
+          throw new Error('D1 database inventory has an invalid uuid or name');
+        return { databaseId, name };
+      })
       .filter(
         (database) =>
           filter?.name === undefined || database.name === filter.name,
@@ -422,7 +436,7 @@ export class WranglerPlainWorkerProvisioningApi
       versionId: readVersionId(parsed),
       tag: versionTag(parsed),
       bindings: providerBindingsToPlainWorkerShape(
-        asArray(readField(resources, 'bindings')),
+        asArray(readField(resources, 'bindings') ?? []),
       ),
     };
   }
@@ -517,9 +531,14 @@ export class WranglerPlainWorkerProvisioningApi
             binding: binding.name,
             bucket_name: binding.bucketName,
           })),
-          limits: intent.limits.cpuMs
-            ? { cpu_ms: intent.limits.cpuMs }
-            : undefined,
+          limits:
+            intent.limits.cpuMs === undefined &&
+            intent.limits.subrequests === undefined
+              ? undefined
+              : {
+                  cpu_ms: intent.limits.cpuMs,
+                  subrequests: intent.limits.subrequests,
+                },
         }),
       );
       const secretsPath = join(directory, 'wrangler.secrets.json');
@@ -635,24 +654,31 @@ export class WranglerPlainWorkerProvisioningApi
         hash.update(chunk);
       }
       const sha256 = hash.digest('hex');
-      const stored = await this.#exportStore.write({
-        databaseId: database.id,
-        fileName,
-        body: Readable.toWeb(
-          createReadStream(temporaryLocation),
-        ) as ReadableStream<Uint8Array>,
-        contentLength: metadata.size,
-      });
-      if (
-        !stored.location ||
-        stored.size !== metadata.size ||
-        stored.sha256 !== sha256
-      ) {
-        throw new Error(
-          'durable database export store returned mismatched committed integrity',
-        );
+      const source = createReadStream(temporaryLocation);
+      const sourceClosed = finished(source, { cleanup: true }).catch(
+        () => undefined,
+      );
+      try {
+        const stored = await this.#exportStore.write({
+          databaseId: database.id,
+          fileName,
+          body: Readable.toWeb(source) as ReadableStream<Uint8Array>,
+          contentLength: metadata.size,
+        });
+        if (
+          !stored.location ||
+          stored.size !== metadata.size ||
+          stored.sha256 !== sha256
+        ) {
+          throw new Error(
+            'durable database export store returned mismatched committed integrity',
+          );
+        }
+        return { location: stored.location, size: metadata.size, sha256 };
+      } finally {
+        source.destroy();
+        await sourceClosed;
       }
-      return { location: stored.location, size: metadata.size, sha256 };
     } finally {
       await rm(temporaryDirectory, { recursive: true, force: true });
     }
@@ -689,28 +715,35 @@ export class WranglerPlainWorkerProvisioningApi
         throw new Error('Wrangler database export changed while being hashed');
       }
       const expectedIntegrity = Promise.resolve(integrity);
-      const stored = await writeReceipt({
-        identity,
-        body: Readable.toWeb(
-          createReadStream(temporaryLocation),
-        ) as ReadableStream<Uint8Array>,
-        contentLength: integrity.size,
-        expectedIntegrity,
-      });
-      if (
-        !stored.location ||
-        stored.size !== integrity.size ||
-        stored.sha256 !== integrity.sha256
-      ) {
-        throw new Error(
-          'durable database export store returned mismatched committed integrity',
-        );
+      const source = createReadStream(temporaryLocation);
+      const sourceClosed = finished(source, { cleanup: true }).catch(
+        () => undefined,
+      );
+      try {
+        const stored = await writeReceipt({
+          identity,
+          body: Readable.toWeb(source) as ReadableStream<Uint8Array>,
+          contentLength: integrity.size,
+          expectedIntegrity,
+        });
+        if (
+          !stored.location ||
+          stored.size !== integrity.size ||
+          stored.sha256 !== integrity.sha256
+        ) {
+          throw new Error(
+            'durable database export store returned mismatched committed integrity',
+          );
+        }
+        return {
+          location: stored.location,
+          size: integrity.size,
+          sha256: integrity.sha256,
+        };
+      } finally {
+        source.destroy();
+        await sourceClosed;
       }
-      return {
-        location: stored.location,
-        size: integrity.size,
-        sha256: integrity.sha256,
-      };
     });
     const cleanup = await settleOperation(() =>
       rm(temporaryDirectory, { recursive: true, force: true }),

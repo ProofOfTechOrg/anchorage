@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { Readable } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
 import type { DurableDatabaseExportStore } from '../src/cloudflare-client.js';
 import { initialWorkerAttachmentScan } from '../src/cloudflare-worker-attachment-scan-state.js';
@@ -195,6 +196,49 @@ describe('WranglerPlainWorkerProvisioningApi parsing', () => {
       subject.listDatabases({ name: 'acme-production' }),
     ).resolves.toEqual([{ databaseId: 'database-1', name: 'acme-production' }]);
     expect(runner.calls).toEqual([{ arguments: ['d1', 'list', '--json'] }]);
+  });
+
+  it.each([
+    [{ name: 'target' }],
+    [{ uuid: '', name: 'target' }],
+    [{ uuid: 42, name: 'target' }],
+    [{ uuid: 'id' }],
+    [{ uuid: 'id', name: '' }],
+    [{ uuid: 'id', name: 42 }],
+  ])('refuses incomplete D1 identity before local filtering %#', async (row) => {
+    const subject = await api(
+      new FakeRunner(async () => ({
+        stdout: JSON.stringify([row]),
+        stderr: '',
+      })),
+    );
+    await expect(subject.listDatabases({ name: 'target' })).rejects.toThrow(
+      /D1/,
+    );
+  });
+
+  it.each([
+    null,
+    false,
+    {},
+    { result: null },
+    { result: false },
+    { success: false, result: [] },
+    { success: false, result: { versions: [] } },
+    { errors: [{}], result: { versions: [] } },
+    { errors: [{}], result: [] },
+  ])('refuses malformed complete inventory shapes %#', async (result) => {
+    const subject = await api(
+      new FakeRunner(async () => ({
+        stdout: JSON.stringify(result),
+        stderr: '',
+      })),
+    );
+    await expect(subject.listDatabases()).rejects.toThrow(/inventory/);
+    await expect(subject.listVersions('worker')).rejects.toThrow(/inventory/);
+    await expect(subject.deploymentStatus('worker')).rejects.toThrow(
+      /inventory/,
+    );
   });
 
   it('rejects invalid JSON with the operation name', async () => {
@@ -711,10 +755,36 @@ describe('WranglerPlainWorkerProvisioningApi parsing', () => {
 });
 
 describe('WranglerPlainWorkerProvisioningApi mutations', () => {
-  it.each([
-    'initial',
-    'staged',
-  ] as const)('writes the exact %s config, secret mode, and argv', async (mode) => {
+  it.each(
+    (['initial', 'staged'] as const).flatMap((mode) =>
+      [
+        {
+          label: 'neither limit',
+          limits: { cpuMs: undefined },
+          wireLimits: undefined,
+        },
+        {
+          label: 'CPU only',
+          limits: { cpuMs: 25 },
+          wireLimits: { cpu_ms: 25 },
+        },
+        {
+          label: 'subrequests only',
+          limits: { cpuMs: undefined, subrequests: 500 },
+          wireLimits: { subrequests: 500 },
+        },
+        {
+          label: 'both limits',
+          limits: { cpuMs: 25, subrequests: 500 },
+          wireLimits: { cpu_ms: 25, subrequests: 500 },
+        },
+      ].map((limits) => ({ mode, ...limits })),
+    ),
+  )('writes the exact $mode config with $label, secret mode, and argv', async ({
+    mode,
+    limits,
+    wireLimits,
+  }) => {
     let config: unknown;
     let secretMode: number | undefined;
     const runner = new FakeRunner(async (arguments_) => {
@@ -738,7 +808,7 @@ describe('WranglerPlainWorkerProvisioningApi mutations', () => {
       return { stdout: '', stderr: '' };
     });
     const outcome = await (await api(runner)).uploadCandidate(
-      uploadIntent(mode),
+      { ...uploadIntent(mode), limits },
       mutationFence(),
     );
     expect(outcome).toEqual({
@@ -773,7 +843,7 @@ describe('WranglerPlainWorkerProvisioningApi mutations', () => {
           }
         : {}),
       r2_buckets: [{ binding: 'BUCKET', bucket_name: 'bucket-name' }],
-      limits: { cpu_ms: 25 },
+      ...(wireLimits === undefined ? {} : { limits: wireLimits }),
     });
     await expectUploadScratchRemoved();
   });
@@ -1541,6 +1611,71 @@ describe('WranglerPlainWorkerProvisioningApi exports', () => {
       subject.exportDatabase({ id: 'db', name: 'name' }, mutationFence()),
     ).rejects.toBe(storeError);
     await expectExportScratchRemoved(output());
+  });
+
+  it.each(
+    ['legacy', 'receipt'].flatMap((method) =>
+      ['sync', 'async', 'integrity'].flatMap((failure) =>
+        [false, true].map((locked) => ({ method, failure, locked })),
+      ),
+    ),
+  )('closes $method source after $failure refusal with locked=$locked', async ({
+    method,
+    failure,
+    locked,
+  }) => {
+    const primary = new Error('supplied store refused');
+    const sources: Readable[] = [];
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    const toWeb = Readable.toWeb;
+    const observe = vi
+      .spyOn(Readable, 'toWeb')
+      .mockImplementation((source, options) => {
+        sources.push(source);
+        return toWeb(source, options);
+      });
+    const write = (input: { readonly body: ReadableStream<Uint8Array> }) => {
+      if (locked) {
+        reader = input.body.getReader();
+        void reader.closed.catch(() => undefined);
+      }
+      if (failure === 'sync') throw primary;
+      if (failure === 'async') return Promise.reject(primary);
+      return Promise.resolve({
+        location: 'memory://invalid',
+        size: 0,
+        sha256: '0'.repeat(64),
+      });
+    };
+    try {
+      const { subject, output } = await exportSubject({
+        bytes: 'x'.repeat(1024 * 1024),
+        store: {
+          write,
+          receiptAuthority: RECEIPT_AUTHORITY,
+          writeReceipt: write,
+        },
+      });
+      const exportReceipt = subject.exportDatabaseReceipt;
+      if (!exportReceipt) throw new Error('expected receipt export capability');
+      const result =
+        method === 'legacy'
+          ? subject.exportDatabase({ id: 'db', name: 'name' }, mutationFence())
+          : exportReceipt(RECEIPT_IDENTITY, mutationFence());
+      if (failure === 'integrity') {
+        await expect(result).rejects.toThrow('mismatched committed integrity');
+      } else {
+        await expect(result).rejects.toBe(primary);
+      }
+      expect(sources).toHaveLength(1);
+      expect(sources[0]?.destroyed).toBe(true);
+      expect(sources[0]?.closed).toBe(true);
+      await expectExportScratchRemoved(output());
+    } finally {
+      reader?.releaseLock();
+      for (const source of sources) source.destroy();
+      observe.mockRestore();
+    }
   });
 
   it('returns the independent digest, size, location, and secure file mode', async () => {

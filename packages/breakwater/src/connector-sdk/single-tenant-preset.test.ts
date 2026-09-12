@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 import { RequestContext } from '@mastra/core/request-context';
 import type { Tool, ToolExecutionContext } from '@mastra/core/tools';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { AuditLogger } from '../audit/index.js';
 import {
   backgroundExecution,
+  networkEgress,
   tenantIsolation,
 } from '../policy-engine/index.js';
 import {
@@ -510,7 +511,47 @@ describe('singleTenantConnectorPolicies', () => {
       connector.execute?.({}, {
         requestContext: new RequestContext(),
       } as ToolExecutionContext),
-    ).rejects.toMatchObject({ policy: 'always-deny' });
+    ).rejects.toMatchObject({
+      policy: 'always-deny',
+      code: 'EVALUATOR_DENIED',
+      policyKind: 'evaluator',
+      retryable: false,
+    });
     expect(reads).toBe(1);
+  });
+
+  it('retains built-in decision metadata through the bound evaluator snapshot', async () => {
+    const evaluator = networkEgress({
+      allowedDomains: [],
+      name: 'organization-check',
+    });
+    const policies = singleTenantConnectorPolicies({
+      audit: { mode: 'development', allowUnaudited: true },
+      egress: { allowedDomains: ['api.example.com'] },
+      permissions: { principalPermissions: 'not-configured' },
+      evaluators: [evaluator],
+    });
+    evaluator.evaluate = () => ({ allowed: true });
+    const execute = vi.fn(async () => ({ ok: true }));
+    const connector = createConnector({
+      id: 'records.coded-snapshot',
+      description: 'Read one remote record',
+      permissions: { sideEffect: 'read', egress: ['api.example.com'] },
+      policies,
+      execute,
+    });
+
+    await expect(
+      connector.execute?.({}, {
+        requestContext: new RequestContext(),
+      } as ToolExecutionContext),
+    ).rejects.toMatchObject({
+      policy: 'organization-check',
+      code: 'EGRESS_HOST_NOT_ALLOWED_BY_ORG',
+      policyKind: 'network-egress',
+      retryable: false,
+      details: { declaredHost: 'api.example.com' },
+    });
+    expect(execute).not.toHaveBeenCalled();
   });
 });

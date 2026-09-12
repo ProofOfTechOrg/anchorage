@@ -74,6 +74,12 @@ The migration and idempotency surfaces are grouped by subpath:
 | Settlement | `fleetSettlementKey`, `FleetSettlementContext`, `FleetSettlementEntry`, and `FleetSettlementHost` |
 | Backends and provider client | `PlainWorkerBackend`, `PlainWorkerBackendOptions`, `CloudflareApiPlainWorkerBackend`, `CloudflareApiPlainWorkerBackendOptions`, `WranglerLoopBackend`, `WorkersForPlatformsBackend`, `CloudflareProvisioningClient`, `CloudflareClientOptions`, `PlainWorkerCloudflareClientOptions`, `CloudflarePlaneCapabilityError`, `D1CloudflareApiRateCoordinator`, and `ProcessLocalCloudflareApiRateCoordinator` |
 
+## fleet-control Worker library
+
+`@proofoftech/fleet-control/cloudflare-control-plane` is a library for a dedicated trusted Cloudflare control-plane Worker. Start with `createCloudflareControlPlane` and `CloudflareControlPlaneOptions`; the returned `CloudflareControlPlane` coordinates ordinary-Worker deployments through durable Fleet state. See the [Fleet Control guide](fleet-control.md) for deployment ownership and authorization.
+
+The subpath also exposes `D1FleetStateDatabase`, `D1CloudflareApiRateCoordinator`, and `R2DatabaseExportStore`. Its declarations require `@cloudflare/workers-types >=5.20260730.1 <6`. The `workers/*` entries remain deployable platform Workers.
+
 ## Browser and server boundaries
 
 Safe browser imports:

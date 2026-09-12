@@ -13,6 +13,7 @@ import {
   finalizedBridgeForRecord,
   reconcileFinalizedBackendSwitchState,
 } from './backend-switch.js';
+import { activeExternalRelease } from './decommission-advance.js';
 import type {
   FleetMigrationItem,
   FleetMigrationPlanEntry,
@@ -68,6 +69,7 @@ import {
   assertNoActiveDecommission,
   EXTERNAL_MIGRATION_SUBPHASES,
   effectiveLifecyclePhase,
+  isPlatformCatalogRecord,
 } from './types.js';
 import {
   targetDurableObjectTag,
@@ -281,7 +283,12 @@ function liveScriptName(record: FleetRecord): string {
 function expectedReleaseSnapshots(
   record: FleetRecord,
 ): readonly ExternalReleaseSnapshot[] {
-  if (!expectsWorker(record) || record.backend === 'plain-worker') return [];
+  if (
+    !expectsWorker(record) ||
+    record.backend === 'plain-worker' ||
+    isPlatformCatalogRecord(record)
+  )
+    return [];
   const phase = effectiveLifecyclePhase(record);
   const snapshots = (() => {
     switch (phase) {
@@ -337,7 +344,8 @@ function expectedReleaseSnapshots(
 
 function expectedScriptNames(record: FleetRecord): readonly string[] {
   if (!expectsWorker(record)) return [];
-  if (record.backend === 'plain-worker') return [record.scriptName];
+  if (record.backend === 'plain-worker' || isPlatformCatalogRecord(record))
+    return [record.scriptName];
   const phase = effectiveLifecyclePhase(record);
   const releases = expectedReleaseSnapshots(record);
   const names = releases.map((release) => release.physicalScriptName);
@@ -378,6 +386,12 @@ function routeMatchesRecord(
   route: FleetResourceInventory['routes'][number],
   record: FleetRecord,
 ): boolean {
+  if (isPlatformCatalogRecord(record))
+    return (
+      route.scriptName === record.scriptName &&
+      routePolicyMatches(route, record) &&
+      route.stateEgress === undefined
+    );
   if (record.backend === 'workers-for-platforms') {
     return externalRouteExpectations(record).some((expected) => {
       const target = externalHostRoutingTarget(record, expected);
@@ -450,6 +464,7 @@ function expectedNamespaceIdsForRecord(record: FleetRecord): readonly string[] {
 }
 
 function allowedRouteScriptNames(record: FleetRecord): readonly string[] {
+  if (isPlatformCatalogRecord(record)) return [record.scriptName];
   if (record.backend === 'workers-for-platforms') {
     return externalRouteExpectations(record).map(
       (expected) => expected.release.physicalScriptName,
@@ -2827,7 +2842,19 @@ async function migrationAdmitMigrating(
     targetRelease,
     targetPlatform,
     platformOnlyTarget,
+    spec,
   } = admitted;
+  const preserveMutableArtifact =
+    current.phase === 'ready' &&
+    !targetRelease &&
+    spec.authoredBy === 'platform';
+  const mutableActiveRelease = preserveMutableArtifact
+    ? activeExternalRelease(current)
+    : undefined;
+  if (preserveMutableArtifact && !mutableActiveRelease)
+    throw new Error(
+      'mutable migration requires a recorded prior Worker artifact',
+    );
   const externalIntent: ExternalMigrationIntent | undefined =
     immutableExternal && targetRelease && targetPlatform
       ? planKind === 'platform-only'
@@ -2860,6 +2887,9 @@ async function migrationAdmitMigrating(
       ? {
           ...current,
           phase: 'migrating',
+          ...(mutableActiveRelease
+            ? { activeRelease: mutableActiveRelease }
+            : {}),
           ...(externalIntent?.platformOnly
             ? { migrationIntent: externalIntent }
             : targetRelease
@@ -3563,6 +3593,7 @@ async function migrationSettleReady(
   delete settled.pendingSpecDigest;
   delete settled.pendingArtifactVersion;
   delete settled.migrationIntent;
+  if (spec.authoredBy === 'platform') delete settled.activeRelease;
   const migrated: FleetRecord = {
     ...settled,
     phase: 'ready',

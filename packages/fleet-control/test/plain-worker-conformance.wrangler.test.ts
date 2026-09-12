@@ -56,6 +56,45 @@ describePlainWorkerConformance('Wrangler loop', (world?: ProviderWorld) => {
 });
 
 describe('provider projection equivalence', () => {
+  it.each(
+    (['initial', 'staged'] as const).flatMap((mode) =>
+      [
+        {
+          label: 'neither limit',
+          specLimits: {},
+          expected: { cpuMs: undefined },
+        },
+        {
+          label: 'CPU only',
+          specLimits: { cpuLimitMs: 25 },
+          expected: { cpuMs: 25 },
+        },
+        {
+          label: 'subrequests only',
+          specLimits: { subrequestLimit: 500 },
+          expected: { cpuMs: undefined, subrequests: 500 },
+        },
+        {
+          label: 'both limits',
+          specLimits: { cpuLimitMs: 25, subrequestLimit: 500 },
+          expected: { cpuMs: 25, subrequests: 500 },
+        },
+      ].map((limits) => ({ mode, ...limits })),
+    ),
+  )('preserves $label in conformance $mode upload limits', ({
+    mode,
+    specLimits,
+    expected,
+  }) => {
+    expect(
+      uploadIntentForSpec(
+        buildPlainWorkerSpec(specLimits),
+        '00000000-0000-4000-8000-000000000001',
+        mode,
+      ).limits,
+    ).toStrictEqual(expected);
+  });
+
   it('writes identical raw bindings for one shared upload intent', async () => {
     const cliWorld = providerWorld();
     const restWorld = providerWorld();

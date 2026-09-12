@@ -245,8 +245,26 @@ function bindingsFrom(
 ): readonly Readonly<Record<string, unknown>>[] {
   return value.map((binding) => {
     const record = plainRecord(binding);
-    if (!record) {
+    if (
+      !record ||
+      !boundedString(record.type) ||
+      record.type !== record.type.trim()
+    ) {
       throw new Error('Cloudflare Worker binding inventory was malformed');
+    }
+    if (record.type === 'd1' || record.type === 'r2_bucket') {
+      const identity =
+        record.type === 'd1' ? record.database_id : record.bucket_name;
+      if (
+        !boundedString(identity) ||
+        identity !== identity.trim() ||
+        (record.type === 'd1' &&
+          Object.hasOwn(record, 'id') &&
+          record.id !== '' &&
+          record.id !== identity)
+      ) {
+        throw new Error('Cloudflare Worker binding inventory was malformed');
+      }
     }
     return record;
   });

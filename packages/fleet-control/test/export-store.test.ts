@@ -36,6 +36,12 @@ import {
   createFileSystemDatabaseExportStoreWithReceiptPrimitives,
   FileSystemDatabaseExportStore,
 } from '../src/export-store.js';
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return { ...actual, open: vi.fn(actual.open) };
+});
+
 import type {
   DatabaseExportIntegrity,
   DatabaseExportReceiptIdentity,
@@ -150,6 +156,150 @@ afterEach(async () => {
 });
 
 describe('FileSystemDatabaseExportStore', () => {
+  it.each([
+    'name',
+    'length',
+    'directory',
+    'ancestor',
+    'open',
+  ] as const)('cancels its unread tee input after an early %s failure', async (stage) => {
+    const parent = await temporaryDirectory();
+    const root = join(parent, 'exports');
+    const store = new FileSystemDatabaseExportStore(root);
+    const source = new ReadableStream<Uint8Array>();
+    const [branch, sibling] = source.tee();
+    const cancellation = vi.spyOn(branch, 'cancel');
+    const actual =
+      await vi.importActual<typeof import('node:fs/promises')>(
+        'node:fs/promises',
+      );
+    const fault = new Error('fixture early export failure');
+    let probe: Awaited<ReturnType<typeof open>> | undefined;
+    let restoreSync: (() => void) | undefined;
+    if (stage === 'directory') await writeFile(root, 'preserve');
+    if (stage === 'open') {
+      vi.mocked(open).mockImplementation((...args) => {
+        if (args[1] === 'wx' && String(args[0]).startsWith(`${root}/.`))
+          return Promise.reject(fault);
+        return actual.open(...args);
+      });
+    }
+    if (stage === 'ancestor') {
+      probe = await open(parent, 'r');
+      const parentStat = await probe.stat();
+      const prototype = Object.getPrototypeOf(probe) as typeof probe;
+      const originalSync = prototype.sync;
+      const sync = vi
+        .spyOn(prototype, 'sync')
+        .mockImplementation(async function (this: NonNullable<typeof probe>) {
+          const value = await this.stat();
+          if (
+            value.isDirectory() &&
+            value.dev === parentStat.dev &&
+            value.ino === parentStat.ino
+          )
+            throw fault;
+          return originalSync.call(this);
+        });
+      restoreSync = () => sync.mockRestore();
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error('export refusal did not settle')),
+          1000,
+        );
+      });
+      const failure = await Promise.race([
+        store.write({
+          databaseId: 'database',
+          fileName: stage === 'name' ? '../escape.sql' : 'database.sql',
+          body: branch,
+          ...(stage === 'length' ? { contentLength: -1 } : {}),
+        }),
+        timeout,
+      ]).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(Error);
+      const primary =
+        failure instanceof AggregateError ? failure.errors[0] : failure;
+      expect(cancellation).toHaveBeenCalledExactlyOnceWith(primary);
+      const reader = branch.getReader();
+      try {
+        expect(await reader.read()).toEqual({ done: true, value: undefined });
+      } finally {
+        reader.releaseLock();
+      }
+      if (stage === 'directory')
+        expect(await readFile(root, 'utf8')).toBe('preserve');
+    } finally {
+      clearTimeout(timer);
+      restoreSync?.();
+      vi.mocked(open).mockImplementation(actual.open);
+      await probe?.close();
+      await Promise.allSettled([branch.cancel(), sibling.cancel()]);
+      cancellation.mockRestore();
+    }
+  });
+
+  it.each([
+    false,
+    true,
+  ])('persists nested root ancestors across retry with an alias=%s', async (alias) => {
+    const parent = await temporaryDirectory();
+    const inputParent = alias ? join(parent, 'alias') : parent;
+    if (alias) await symlink(parent, inputParent, 'dir');
+    const root = join(inputParent, 'nested', 'exports');
+    const store = new FileSystemDatabaseExportStore(root);
+    const parentStat = await stat(parent);
+    const probe = await open(parent, 'r');
+    const prototype = Object.getPrototypeOf(probe) as typeof probe;
+    const originalSync = prototype.sync;
+    let fail = true;
+    let parentAttempts = 0;
+    const synchronized = new Set<string>();
+    const key = (value: { dev: number; ino: number }) =>
+      `${value.dev}:${value.ino}`;
+    const sync = vi.spyOn(prototype, 'sync').mockImplementation(async function (
+      this: typeof probe,
+    ) {
+      const current = await this.stat();
+      if (current.isDirectory() && key(current) === key(parentStat)) {
+        parentAttempts += 1;
+        if (fail) throw new Error('fixture export ancestor sync failure');
+      }
+      await originalSync.call(this);
+      if (current.isDirectory()) synchronized.add(key(current));
+    });
+    const write = () =>
+      store.write({
+        databaseId: 'database',
+        fileName: 'database.sql',
+        body: body('SELECT 1;'),
+      });
+    try {
+      for (let retry = 0; retry < 2; retry++) {
+        await expect(write()).rejects.toThrow(
+          'fixture export ancestor sync failure',
+        );
+        expect(await readdir(root)).toEqual([]);
+      }
+      expect(parentAttempts).toBe(2);
+      expect(synchronized.has(key(parentStat))).toBe(false);
+      fail = false;
+      const result = await write();
+      expect(await readFile(fileURLToPath(result.location), 'utf8')).toBe(
+        'SELECT 1;',
+      );
+      for (const path of [parent, join(parent, 'nested'), root]) {
+        expect(synchronized.has(key(await stat(path)))).toBe(true);
+      }
+    } finally {
+      sync.mockRestore();
+      await probe.close();
+    }
+  });
+
   it('streams, syncs, closes, and publishes an absolute durable location', async () => {
     const parent = await temporaryDirectory();
     const root = join(parent, 'nested', 'exports');

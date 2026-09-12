@@ -50,7 +50,11 @@ import type {
   NormalDecommissionLifecyclePhase,
   ProvisioningBackend,
 } from './types.js';
-import { assertNoActiveCleanup, effectiveLifecyclePhase } from './types.js';
+import {
+  assertNoActiveCleanup,
+  effectiveLifecyclePhase,
+  isPlatformCatalogRecord,
+} from './types.js';
 import { validateDeploymentSpec } from './validation.js';
 
 const ACTION_ERROR = 'decommission advance action is malformed';
@@ -226,7 +230,7 @@ export function activeExternalRelease(
 ): ExternalReleaseSnapshot | undefined {
   return (
     record.activeRelease ??
-    (record.backend === 'plain-worker' &&
+    ((record.backend === 'plain-worker' || isPlatformCatalogRecord(record)) &&
     record.artifactVersion !== PENDING_ARTIFACT_VERSION
       ? {
           physicalScriptName: record.scriptName,
@@ -248,11 +252,11 @@ export function retainedExternalReleases(
   record: FleetRecord,
 ): readonly ExternalReleaseSnapshot[] {
   const active = activeExternalRelease(record);
+  const mutable =
+    record.backend === 'plain-worker' || isPlatformCatalogRecord(record);
   const releases = [
     record.pendingRelease,
-    ...(record.backend === 'plain-worker' &&
-    record.pendingArtifactVersion &&
-    record.pendingSpecDigest
+    ...(mutable && record.pendingArtifactVersion && record.pendingSpecDigest
       ? [
           {
             physicalScriptName: record.scriptName,
@@ -268,7 +272,7 @@ export function retainedExternalReleases(
   ].filter(
     (release): release is ExternalReleaseSnapshot =>
       release !== undefined &&
-      (record.backend === 'plain-worker'
+      (mutable
         ? release.artifactVersion !== active?.artifactVersion
         : release.physicalScriptName !== active?.physicalScriptName),
   );
@@ -276,12 +280,10 @@ export function retainedExternalReleases(
     (release, index) =>
       releases.findIndex(
         (candidate) =>
-          (record.backend === 'plain-worker'
+          (mutable
             ? candidate.artifactVersion
             : candidate.physicalScriptName) ===
-          (record.backend === 'plain-worker'
-            ? release.artifactVersion
-            : release.physicalScriptName),
+          (mutable ? release.artifactVersion : release.physicalScriptName),
       ) === index,
   );
 }
@@ -297,6 +299,9 @@ export function assertImmutableDeploymentMapping(
     prior.tenantTag !== spec.tenantTag ||
     prior.environment !== spec.environment ||
     prior.backend !== backend.kind ||
+    (Object.hasOwn(prior, 'wfpMode') && !isPlatformCatalogRecord(prior)) ||
+    (prior.backend === 'workers-for-platforms' &&
+      isPlatformCatalogRecord(prior) !== (spec.authoredBy === 'platform')) ||
     prior.scriptName !== spec.scriptName ||
     prior.databaseName !== spec.databaseName ||
     prior.routeHostname !== spec.routeHostname
@@ -872,19 +877,16 @@ async function commitRecord(
   );
 }
 
-function consumeMigrationCarrier(
+export function consumeMigrationCarrier(
   record: FleetRecord,
   spec: DeploymentSpec,
-  intent: Exclude<DecommissionAdvanceIntent, { readonly state: 'complete' }>,
+  requestedSpecDigest: string,
 ): FleetRecord {
-  if (intent.lifecyclePhase !== 'migrating') return record;
-  if (intent.identity.mode.kind !== 'normal') {
-    throw new Error('normal decommission cannot consume a backend switch');
-  }
+  if (effectiveLifecyclePhase(record) !== 'migrating') return record;
   const priorActive = record.activeRelease ?? activeExternalRelease(record);
   const pendingRelease =
     record.pendingRelease ??
-    (record.backend === 'plain-worker' &&
+    ((record.backend === 'plain-worker' || isPlatformCatalogRecord(record)) &&
     record.pendingArtifactVersion !== undefined &&
     record.pendingSpecDigest !== undefined
       ? {
@@ -906,7 +908,7 @@ function consumeMigrationCarrier(
   } = record;
   return {
     ...remaining,
-    desiredSpecDigest: intent.identity.mode.requestedSpecDigest,
+    desiredSpecDigest: requestedSpecDigest,
     ...(priorActive ? { activeRelease: priorActive } : {}),
     ...(pendingRelease ? { pendingRelease } : {}),
   };
@@ -965,7 +967,16 @@ async function advanceLifecycle(
         fence: lease,
       });
     }
-    const consumed = consumeMigrationCarrier(record, spec, intent);
+    let consumed = record;
+    if (phase === 'migrating') {
+      if (intent.identity.mode.kind !== 'normal')
+        throw new Error('normal decommission cannot consume a backend switch');
+      consumed = consumeMigrationCarrier(
+        record,
+        spec,
+        intent.identity.mode.requestedSpecDigest,
+      );
+    }
     return commitRecord(
       lease,
       consumed,

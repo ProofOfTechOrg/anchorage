@@ -17,7 +17,10 @@ import { isSha256 } from './deployment-context.js';
 import { WorkerDeploymentError } from './deployment-error.js';
 import { maintenanceUrl, readMaintenanceHealth } from './maintenance-health.js';
 import { applyMigrationsWithLedger } from './migration-ledger.js';
-import { assertSupportedPlainWorkerBindings } from './provider-binding-inventory.js';
+import {
+  assertCompleteWorkerPublicAccess,
+  assertSupportedPlainWorkerBindings,
+} from './provider-binding-inventory.js';
 import { deploymentSpecDigest } from './spec-digest.js';
 import type {
   ActiveRouteAttestation,
@@ -273,7 +276,8 @@ export class PlainWorkerBackend implements ProvisioningBackend {
     }
     this.#api = options.api;
     this.#identityCaller = options.identityCaller;
-    this.#fetch = options.fetch ?? fetch;
+    const fetchFn = options.fetch ?? fetch;
+    this.#fetch = (input, init) => fetchFn(input, init);
     this.#maintenanceRequestTimeoutMs = maintenanceRequestTimeoutMs;
     this.#clock = options.clock ?? Date.now;
     const advanceDecommissionAttachmentScan =
@@ -341,15 +345,18 @@ export class PlainWorkerBackend implements ProvisioningBackend {
   ): Promise<DatabaseReference | undefined> {
     const listed = await this.#api.listDatabases({ name: spec.databaseName });
     // A name filter narrows the listing toward the name, so compare exactly.
-    const matches = listed.filter(
-      (database) => database.name === spec.databaseName,
-    );
+    const matches = listed.filter((database) => {
+      if (typeof database.name !== 'string' || !database.name)
+        throw new Error('D1 list result has no name');
+      return database.name === spec.databaseName;
+    });
     if (matches.length > 1) {
       throw new Error(`multiple D1 databases are named '${spec.databaseName}'`);
     }
     if (matches[0]) {
       const id = matches[0].databaseId;
-      if (!id) throw new Error('D1 list result has no uuid');
+      if (typeof id !== 'string' || !id)
+        throw new Error('D1 list result has no uuid');
       return { id, name: spec.databaseName, created: false };
     }
     return undefined;
@@ -1320,7 +1327,12 @@ export class PlainWorkerBackend implements ProvisioningBackend {
               bucketName: binding.bucketName,
             })),
           },
-          limits: { cpuMs: spec.cpuLimitMs },
+          limits: {
+            cpuMs: spec.cpuLimitMs,
+            ...(spec.subrequestLimit !== undefined
+              ? { subrequests: spec.subrequestLimit }
+              : {}),
+          },
           publicAccess,
           ...(mode === 'initial'
             ? {
@@ -1675,6 +1687,7 @@ export class PlainWorkerBackend implements ProvisioningBackend {
       )
       .sort((left, right) => left.name.localeCompare(right.name));
     const plainText = this.#plainTextBindings(version);
+    const desiredSpecDigest = plainText.get('FLEET_SPEC_DIGEST');
     const expectedServiceBindings = spec.egressProxyService
       ? [{ name: 'EGRESS_PROXY', service: spec.egressProxyService }]
       : [];
@@ -1690,13 +1703,14 @@ export class PlainWorkerBackend implements ProvisioningBackend {
       databaseIds.length !== 1 ||
       plainText.get('DEPLOYMENT_TENANT') !== spec.tenantTag ||
       plainText.get('FLEET_ENVIRONMENT') !== spec.environment ||
-      JSON.stringify(serviceBindings) !==
-        JSON.stringify(expectedServiceBindings) ||
-      JSON.stringify(queueProducerBindings) !==
-        JSON.stringify(expectedQueueProducerBindings) ||
-      canonicalApplicationBindings(spec).vars.some(
-        ({ name, value }) => plainText.get(name) !== value,
-      )
+      (desiredSpecDigest === deploymentSpecDigest(spec) &&
+        (JSON.stringify(serviceBindings) !==
+          JSON.stringify(expectedServiceBindings) ||
+          JSON.stringify(queueProducerBindings) !==
+            JSON.stringify(expectedQueueProducerBindings) ||
+          canonicalApplicationBindings(spec).vars.some(
+            ({ name, value }) => plainText.get(name) !== value,
+          )))
     ) {
       throw new Error(
         `script '${spec.scriptName}' has a different resource mapping`,
@@ -1705,7 +1719,6 @@ export class PlainWorkerBackend implements ProvisioningBackend {
     const databaseId = databaseIds[0];
     if (!databaseId) throw new Error('D1 binding has no database id');
     const schemaVersion = Number(plainText.get('FLEET_SCHEMA_VERSION'));
-    const desiredSpecDigest = plainText.get('FLEET_SPEC_DIGEST');
     if (
       !Number.isSafeInteger(schemaVersion) ||
       !desiredSpecDigest ||
@@ -1915,6 +1928,7 @@ export class PlainWorkerBackend implements ProvisioningBackend {
         this.#api.inspectOrdinaryWorkerFootprint(record.scriptName),
         this.#api.listCustomDomains(),
       ]);
+      assertCompleteWorkerPublicAccess(footprint);
       if (
         footprint.customDomains.length > 0 ||
         footprint.zoneRoutes.length > 0 ||
@@ -2014,6 +2028,7 @@ export class PlainWorkerBackend implements ProvisioningBackend {
     const footprint = await this.#api.inspectOrdinaryWorkerFootprint(
       spec.scriptName,
     );
+    assertCompleteWorkerPublicAccess(footprint);
     if (
       footprint.customDomains.length > 0 ||
       footprint.zoneRoutes.length > 0 ||

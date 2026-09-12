@@ -3,6 +3,10 @@ import { RequestContext } from '@mastra/core/request-context';
 import { describe, expect, it } from 'vitest';
 
 import {
+  CONNECTOR_DECISIONS,
+  connectorDecisionRetryable,
+} from '../connector-decision.js';
+import {
   approvalRequired,
   backgroundExecution,
   crossWorkflowIsolation,
@@ -21,6 +25,75 @@ function call(
   return { connectorId: 'salesforce.export', sideEffect, egress, input: {} };
 }
 
+describe('tool policy decision metadata', () => {
+  const callerContext = new RequestContext();
+  callerContext.set(WORKFLOW_SCOPE_CONTEXT_KEY, 'private-caller');
+
+  it.each([
+    {
+      evaluator: networkEgress({ allowedDomains: [], name: 'custom-label' }),
+      context: call(['API.EXAMPLE.COM.']),
+      code: 'EGRESS_HOST_NOT_ALLOWED_BY_ORG',
+      policyKind: 'network-egress',
+      details: { declaredHost: 'api.example.com' },
+    },
+    {
+      evaluator: crossWorkflowIsolation({
+        name: 'custom-label',
+        targetScopeOf: () => 'private-target',
+      }),
+      context: call([]),
+      code: 'WORKFLOW_SCOPE_MISSING',
+      policyKind: 'cross-workflow-isolation',
+      details: undefined,
+    },
+    {
+      evaluator: crossWorkflowIsolation({
+        name: 'custom-label',
+        targetScopeOf: () => 'private-target',
+      }),
+      context: {
+        ...call([]),
+        requestContext: callerContext,
+      },
+      code: 'CROSS_WORKFLOW_ACCESS_DENIED',
+      policyKind: 'cross-workflow-isolation',
+      details: undefined,
+    },
+    {
+      evaluator: tenantIsolation({ name: 'custom-label' }),
+      context: call([]),
+      code: 'ISOLATION_SCOPE_MISSING',
+      policyKind: 'tenant-isolation',
+      details: undefined,
+    },
+    {
+      evaluator: backgroundExecution({ name: 'custom-label' }),
+      context: { ...call([], 'write'), input: { _background: {} } },
+      code: 'BACKGROUND_EXECUTION_DENIED',
+      policyKind: 'background-execution',
+      details: undefined,
+    },
+  ])('keeps $code independent of its diagnostic name', async ({
+    evaluator,
+    context,
+    code,
+    policyKind,
+    details,
+  }) => {
+    const decision = await evaluator.evaluate(context);
+
+    expect(evaluator.name).toBe('custom-label');
+    expect(decision).toMatchObject({ allowed: false, code });
+    if (decision.allowed || decision.code === undefined) {
+      throw new Error('expected a coded denial');
+    }
+    expect(decision.details).toEqual(details);
+    expect(CONNECTOR_DECISIONS[decision.code].policyKind).toBe(policyKind);
+    expect(connectorDecisionRetryable(decision.code)).toBe(false);
+  });
+});
+
 describe('networkEgress', () => {
   it('allows declared domains on the allowlist', async () => {
     // #given
@@ -38,6 +111,8 @@ describe('networkEgress', () => {
     expect(await policy.evaluate(call(['api.evil.com']))).toEqual({
       allowed: false,
       reason: expect.stringContaining('api.evil.com'),
+      code: 'EGRESS_HOST_NOT_ALLOWED_BY_ORG',
+      details: { declaredHost: 'api.evil.com' },
     });
   });
 
@@ -286,6 +361,7 @@ describe('crossWorkflowIsolation', () => {
     ).toEqual({
       allowed: false,
       reason: "workflow 'wf-a' may not access state of 'wf-b'",
+      code: 'CROSS_WORKFLOW_ACCESS_DENIED',
     });
   });
 
@@ -295,7 +371,7 @@ describe('crossWorkflowIsolation', () => {
     // #when / #then
     expect(
       await policy.evaluate(scopedCall({ input: { workflowId: 'wf-a' } })),
-    ).toMatchObject({ allowed: false });
+    ).toMatchObject({ allowed: false, code: 'WORKFLOW_SCOPE_MISSING' });
   });
 
   it('fails closed on a non-string scope value', async () => {
@@ -305,7 +381,7 @@ describe('crossWorkflowIsolation', () => {
       await policy.evaluate(
         scopedCall({ scope: ['wf-a'], input: { workflowId: 'wf-a' } }),
       ),
-    ).toMatchObject({ allowed: false });
+    ).toMatchObject({ allowed: false, code: 'WORKFLOW_SCOPE_MISSING' });
   });
 });
 
@@ -344,6 +420,7 @@ describe('tenantIsolation', () => {
     // could never reach it)
     expect(await policy.evaluate(scopedCall(scope))).toMatchObject({
       allowed: false,
+      code: 'ISOLATION_SCOPE_MISSING',
     });
   });
 
@@ -380,7 +457,7 @@ describe('backgroundExecution', () => {
       await policy.evaluate(
         bgCall(sideEffect, { topic: 'x', _background: { enabled: true } }),
       ),
-    ).toMatchObject({ allowed: false });
+    ).toMatchObject({ allowed: false, code: 'BACKGROUND_EXECUTION_DENIED' });
   });
 
   it('denies when _background is present with enabled undefined (defaults to background when eligible)', async () => {
@@ -388,7 +465,7 @@ describe('backgroundExecution', () => {
     // enabled it; deny-by-default treats the bare override as a background enable
     expect(
       await policy.evaluate(bgCall('write', { _background: { timeoutMs: 5 } })),
-    ).toMatchObject({ allowed: false });
+    ).toMatchObject({ allowed: false, code: 'BACKGROUND_EXECUTION_DENIED' });
   });
 
   it('allows a write-class call that explicitly forces FOREGROUND (enabled:false)', async () => {

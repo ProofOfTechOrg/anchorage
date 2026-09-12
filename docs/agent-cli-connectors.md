@@ -181,6 +181,10 @@ Codes distinguish unavailable runtime or codec, definition/flag failure, spawn f
 
 The one-argument `new AgentCliError(message)` constructor remains compatible for consumers that created their own error, but errors emitted by shipped connectors use the structured metadata.
 
+Connector refusals retain the [connector decision taxonomy](connector-interface.md#connector-decision-codes). `ConnectorPolicyError` preserves its code, canonical category, retryability and safe details while its reason becomes the fixed CLI denial message. `ConnectorStoreError` and `ConnectorEvaluatorError` retain their typed classification without raw `cause`, so executor, prompt and process data cannot escape through those exceptions. This differs from the base connector store boundary, where the original exception remains on `cause`.
+
+`invokeConnector` emits typed invocation and validation errors at its own public boundary. CLI-specific process failures continue to use `AgentCliError`; unknown executor/parser errors remain redacted.
+
 ## Timeouts and output limits
 
 `timeoutMs` defaults to 10 minutes and must be a safe integer from 1 through the JavaScript timer ceiling. On POSIX, the built-in runner starts the CLI as a new process-group and session leader, sends `SIGKILL` to the negative group id, and waits up to five seconds for that group to disappear. On Windows, it resolves `taskkill.exe` under a drive-absolute local `SystemRoot` or `WINDIR` before starting the CLI, then invokes that absolute path with `['/pid', pid, '/T', '/F']`, `shell: false`, and a hidden window. It rejects relative, root-relative, Universal Naming Convention (UNC), and device paths. This prevents a writable current directory, network share, device path, or `PATH` entry from replacing the timeout helper. It waits for taskkill to complete before returning the timeout.

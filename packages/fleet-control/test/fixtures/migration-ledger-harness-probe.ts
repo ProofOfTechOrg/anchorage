@@ -1,8 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
-/// <reference types="@cloudflare/workers-types" />
+import type {
+  D1Database,
+  ExportedHandler,
+  Request,
+  Response as WorkerResponse,
+} from '@cloudflare/workers-types';
 
 import { D1FleetStateDatabase } from '../../src/d1-fleet-state-database.js';
 import { applyMigrationsWithLedger } from '../../src/migration-ledger.js';
+
+declare const Response: typeof WorkerResponse;
 
 interface Env {
   DB: D1Database;
@@ -231,7 +238,7 @@ async function readAcrossBoundary(db: D1Database): Promise<unknown> {
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<WorkerResponse> {
     const url = new URL(request.url);
     if (request.method !== 'POST' || url.pathname !== '/migration-ledger') {
       return new Response('not found', { status: 404 });

@@ -12,10 +12,19 @@ import {
   createContentPolicyGate,
   denyPatterns,
 } from '@proofoftech/breakwater';
-import { describe, expect, it, vi } from 'vitest';
+import { assert, describe, expect, it, vi } from 'vitest';
 
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
-import { RUNTIME_DRIVEN_AGENT } from '../agent-runner/index.js';
+import {
+  type AgentThreadStateStorage,
+  createAgentThreadTopology,
+  createThreadAgentHost,
+  type ThreadAgentHost,
+} from '../agent-host/index.js';
+import {
+  bindAgentThread,
+  RUNTIME_DRIVEN_AGENT,
+} from '../agent-runner/index.js';
 import type { ActorContext, ApprovalActor } from '../approval-api/index.js';
 import {
   breakwaterActorFor,
@@ -23,6 +32,7 @@ import {
   humanPrincipal,
   InMemoryApprovalStoreFactory,
   principalAuditFields,
+  type ResourceOwnershipStore,
   trustAutomationPrincipal,
 } from '../approval-api/index.js';
 import {
@@ -34,14 +44,16 @@ import {
   type ThreadScope,
 } from '../do-runner/index.js';
 import {
+  type BoundThreadTargetValidator,
   createThreadTopology as createThreadTopologyWithSecret,
+  RunRouteError,
   type ThreadNamespaceLike,
   type ThreadTopology,
 } from '../host-kit/index.js';
 import type { SignalDatabase } from './d1-shared.js';
 import { createNotificationDispatchTick } from './notification-dispatch.js';
 import { D1NotificationsStorage } from './notifications-d1.js';
-import { createSignalRouter } from './router.js';
+import { createSignalRouter, type SignalIngestAuditEvent } from './router.js';
 import {
   createThreadSignalRoutes,
   type RunCapConsult,
@@ -64,6 +76,9 @@ interface TestEnv {
   consultRunCap?: RunCapConsult;
   startIdleRun?: StartIdleRun;
   contentPolicy?: SignalContentPolicy;
+  ownership?: ResourceOwnershipStore;
+  bindingHost?: ThreadAgentHost;
+  exchanges?: Array<{ request: Request; response?: Response }>;
 }
 
 // A minimal host thread DO: build() its init() wiring, route() the PRODUCTION
@@ -103,7 +118,20 @@ class TestThread extends ThreadDurableObject<TestEnv> {
     request: Request,
     scope: ThreadScope,
   ): Promise<Response> {
+    if (this.env.ownership) {
+      const owner = await this.env.ownership.owner('thread', scope.threadId);
+      if (
+        owner?.kind !== scope.principal.kind ||
+        owner.id !== scope.principal.id
+      ) {
+        return new Response('private thread ownership refusal', {
+          status: 404,
+          headers: { 'x-owner-policy': 'strict' },
+        });
+      }
+    }
     return (
+      (await this.env.bindingHost?.route(request, scope)) ??
       (await this.#routes(request, scope)) ??
       new Response(JSON.stringify({ error: 'not found' }), { status: 404 })
     );
@@ -136,9 +164,14 @@ function threadNamespace(
             body?: string;
           },
         ) => {
-          const response = await instance.fetch(
-            typeof input === 'string' ? new Request(input, reqInit) : input,
-          );
+          const request =
+            typeof input === 'string' ? new Request(input, reqInit) : input;
+          const exchange: { request: Request; response?: Response } = {
+            request,
+          };
+          env.exchanges?.push(exchange);
+          const response = await instance.fetch(request);
+          exchange.response = response;
           await afterResponse?.(response);
           return response;
         },
@@ -175,7 +208,7 @@ function actorContext(): ActorContext {
 
 // A runtime-driven reserve agent (no LLM): records the ifIdle target sendMessage
 // received. The brand is what lets a wake pass the thread-route gate.
-function reserveAgent() {
+function reserveAgent(accepted?: Promise<unknown>) {
   const targets: Array<{ ifIdle?: unknown }> = [];
   const sendSignal = vi.fn(
     (signal: AgentSignal, target: { ifIdle?: unknown }) => {
@@ -197,7 +230,8 @@ function reserveAgent() {
       targets.push(target);
       return {
         signal: { id: 'sig-1' },
-        accepted: Promise.resolve({ action: 'deliver', runId: 'acme_run' }),
+        accepted:
+          accepted ?? Promise.resolve({ action: 'deliver', runId: 'acme_run' }),
       };
     },
   } as unknown as Agent;
@@ -282,6 +316,245 @@ describe('signal ingestion — full chain (router → topology → thread DO →
 
     expect(res?.status).toBe(404);
     expect(consultRunCap).not.toHaveBeenCalled();
+  });
+});
+
+describe('signal ingestion — strict owner policy with durable binding validation', () => {
+  async function fixture(accepted?: Promise<unknown>) {
+    const storeFactory = new InMemoryApprovalStoreFactory();
+    const unused = () => {
+      throw new Error('binding validation must not initialize agent execution');
+    };
+    const owner = createPrincipalActorContext({
+      principal: humanPrincipal({ id: 'opal', role: 'operator' }),
+      storeFactory,
+      buildService: unused,
+      mutationEpoch: 7,
+    });
+    const admin = createPrincipalActorContext({
+      principal: humanPrincipal({ id: 'admin', role: 'admin' }),
+      storeFactory,
+      buildService: unused,
+      mutationEpoch: 7,
+    });
+    await owner.claimResource('thread', THREAD_ID);
+    await owner.claimResource('resource', resourceIdFromKey(THREAD_ID));
+    const state = new Map<string, unknown>();
+    const stateStorage: AgentThreadStateStorage = {
+      get: async <T>(key: string) =>
+        structuredClone(state.get(key)) as T | undefined,
+      put: async (key, value) => {
+        state.set(key, structuredClone(value));
+      },
+      delete: unused,
+      list: unused,
+      getAlarm: unused,
+      setAlarm: unused,
+      deleteAlarm: unused,
+    };
+    await bindAgentThread(stateStorage, {
+      version: 1,
+      agentId: 'reserve',
+      resourceId: resourceIdFromKey(THREAD_ID),
+    });
+    vi.spyOn(stateStorage, 'get');
+    vi.spyOn(stateStorage, 'put');
+    const bindingHost = createThreadAgentHost({
+      buildModules: unused,
+      storage: unused,
+      stateStorage: () => stateStorage,
+      resourceAccess: () => storeFactory.resources(),
+      approvalService: unused,
+    });
+    const { agent, targets } = reserveAgent(accepted);
+    const consultRunCap = vi.fn(async () => true);
+    const startIdleRun = vi.fn(async ({ runId }: { runId: string }) => ({
+      runId,
+    }));
+    const exchanges: NonNullable<TestEnv['exchanges']> = [];
+    const namespace = threadNamespace({
+      agent,
+      consultRunCap,
+      startIdleRun,
+      ownership: storeFactory.resources(),
+      bindingHost,
+      exchanges,
+    });
+    const address = vi.spyOn(namespace, 'idFromName');
+    const get = vi.spyOn(namespace, 'get');
+    const agentTopology = createAgentThreadTopology(
+      namespace,
+      DEPLOYMENT_IDENTITY_SECRET,
+      { executionFence: 'none', startIdempotency: 'none' },
+    );
+    const validateThreadTarget: BoundThreadTargetValidator = async (
+      context,
+      target,
+    ) => {
+      const registered = await context.resourceOwnerFor(
+        'thread',
+        target.threadId,
+      );
+      if (
+        registered?.kind !== context.principal.kind ||
+        registered.id !== context.principal.id
+      ) {
+        throw new RunRouteError(404, 'strict ingress ownership refusal');
+      }
+      await agentTopology.requireBoundThread(context, target);
+    };
+    return {
+      owner,
+      admin,
+      stateStorage,
+      targets,
+      consultRunCap,
+      startIdleRun,
+      exchanges,
+      address,
+      get,
+      validateThreadTarget,
+      topology: createThreadTopology(namespace),
+    };
+  }
+
+  it.each([
+    true,
+    false,
+  ])('normalizes foreign-admin and missing refusals with strict ingress enabled=%s', async (strictIngress) => {
+    const setup = await fixture();
+    expect(
+      await setup.admin.canAccessResource('thread', THREAD_ID, 'write'),
+    ).toBe(true);
+    const events: SignalIngestAuditEvent[] = [];
+    const rateLimit = vi.fn(() => true);
+    const router = createSignalRouter({
+      resolve: async () => setup.admin,
+      topology: setup.topology,
+      ...(strictIngress
+        ? { validateThreadTarget: setup.validateThreadTarget }
+        : {}),
+      rateLimit,
+      audit: (event) => {
+        events.push(event);
+      },
+    });
+    const missing = mintThreadId(() => 'missing');
+    const responses = [];
+    for (const threadId of [THREAD_ID, missing]) {
+      const request = wake(threadId);
+      const response = await router(request);
+      responses.push({
+        status: response?.status,
+        headers: [...(response?.headers ?? [])],
+        body: await response?.text(),
+      });
+      expect(request.bodyUsed).toBe(!strictIngress && threadId === THREAD_ID);
+    }
+    expect(responses[0]).toEqual(responses[1]);
+    expect(responses[0]).toEqual({
+      status: 404,
+      headers: [
+        ['cache-control', 'no-store'],
+        ['content-type', 'application/json'],
+      ],
+      body: '{"error":"thread not found"}',
+    });
+    expect(events).toEqual(
+      [THREAD_ID, missing].map((threadId) =>
+        expect.objectContaining({
+          actorId: 'admin',
+          threadId,
+          outcome: 'rejected',
+          reason: 'invalid-thread',
+        }),
+      ),
+    );
+    expect(setup.address).toHaveBeenCalledTimes(strictIngress ? 0 : 1);
+    expect(setup.get).toHaveBeenCalledTimes(strictIngress ? 0 : 1);
+    expect(rateLimit).toHaveBeenCalledTimes(strictIngress ? 0 : 1);
+    expect(setup.stateStorage.get).not.toHaveBeenCalled();
+    expect(setup.stateStorage.put).not.toHaveBeenCalled();
+    expect(setup.targets).toEqual([]);
+    expect(setup.consultRunCap).not.toHaveBeenCalled();
+    expect(setup.startIdleRun).not.toHaveBeenCalled();
+    if (strictIngress) {
+      expect(setup.exchanges).toEqual([]);
+    } else {
+      expect(setup.exchanges).toHaveLength(1);
+      const downstream = setup.exchanges[0];
+      assert(downstream);
+      expect(downstream.request.method).toBe('POST');
+      expect(new URL(downstream.request.url).pathname).toBe('/signal/message');
+      expect(downstream.response?.status).toBe(404);
+      expect(await downstream.response?.text()).toBe(
+        'private thread ownership refusal',
+      );
+      expect(downstream.response?.headers.get('x-owner-policy')).toBe('strict');
+    }
+  });
+
+  it('validates the owner binding through the host route and audits after the signal response', async () => {
+    let complete!: (decision: unknown) => void;
+    const accepted = new Promise<unknown>((resolve) => {
+      complete = resolve;
+    });
+    const setup = await fixture(accepted);
+    const events: SignalIngestAuditEvent[] = [];
+    const router = createSignalRouter({
+      resolve: async () => setup.owner,
+      topology: setup.topology,
+      validateThreadTarget: setup.validateThreadTarget,
+      audit: (event) => {
+        expect(setup.exchanges[1]?.response?.status).toBe(200);
+        events.push(event);
+      },
+    });
+    const pending = router(
+      new Request(`http://host/api/threads/${THREAD_ID}/message`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ contents: 'status update', ifIdle: 'persist' }),
+      }),
+    );
+    await vi.waitFor(() => expect(setup.targets).toHaveLength(1));
+    expect(events).toEqual([]);
+    expect(
+      setup.exchanges.map(({ request }) => ({
+        method: request.method,
+        path: new URL(request.url).pathname,
+      })),
+    ).toEqual([
+      { method: 'GET', path: '/_flowsafe/agent-host/binding' },
+      { method: 'POST', path: '/signal/message' },
+    ]);
+    const binding = setup.exchanges[0];
+    assert(binding);
+    expect(new URL(binding.request.url).searchParams.get('resourceId')).toBe(
+      resourceIdFromKey(THREAD_ID),
+    );
+    expect(await setup.exchanges[0]?.response?.clone().json()).toEqual({
+      bound: true,
+    });
+    expect(setup.exchanges[1]?.response).toBeUndefined();
+    complete({ action: 'deliver', runId: 'acme_run' });
+    const response = await pending;
+    expect(response).toBe(setup.exchanges[1]?.response);
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toMatchObject({
+      decision: { action: 'deliver', runId: 'acme_run' },
+      capped: false,
+    });
+    expect(events).toEqual([
+      expect.objectContaining({
+        actorId: 'opal',
+        threadId: THREAD_ID,
+        outcome: 'accepted',
+      }),
+    ]);
+    expect(setup.stateStorage.get).toHaveBeenCalledOnce();
+    expect(setup.stateStorage.put).not.toHaveBeenCalled();
+    expect(setup.startIdleRun).not.toHaveBeenCalled();
   });
 });
 

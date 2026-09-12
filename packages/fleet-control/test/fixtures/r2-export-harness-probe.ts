@@ -1,7 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
-/// <reference types="@cloudflare/workers-types" />
+import type {
+  Crypto,
+  ExportedHandler,
+  R2Bucket,
+  FixedLengthStream as WorkerFixedLengthStream,
+  Response as WorkerResponse,
+} from '@cloudflare/workers-types';
 
 import { R2DatabaseExportStore } from '../../src/r2-export-store.js';
+
+declare const crypto: Crypto;
+declare const FixedLengthStream: typeof WorkerFixedLengthStream;
+declare const Response: typeof WorkerResponse;
 
 interface Env {
   readonly EXPORTS: R2Bucket;
@@ -355,7 +365,7 @@ async function receiptMismatch(env: Env) {
   };
 }
 
-async function dispatch(action: string, env: Env): Promise<Response> {
+async function dispatch(action: string, env: Env): Promise<WorkerResponse> {
   switch (action) {
     case 'success':
       return Response.json(await success(env));

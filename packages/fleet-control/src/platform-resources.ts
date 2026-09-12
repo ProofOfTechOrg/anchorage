@@ -17,6 +17,7 @@ import type {
   ExternalReleaseSnapshot,
   ExternalReleaseTopology,
   FleetRecord,
+  MaintenanceSigningProfile,
   ProvisioningBackend,
   TrustedWorkerArtifact,
 } from './types.js';
@@ -596,21 +597,9 @@ function validateArtifact(
   }
 }
 
-export function validateExternalPlatformProfile(
-  spec: DeploymentSpec,
-  profile: ExternalPlatformProfile,
+export function validateMaintenanceSigningProfile(
+  profile: MaintenanceSigningProfile,
 ): void {
-  if (spec.authoredBy !== 'external') {
-    throw new Error('external platform resources require an external release');
-  }
-  if (profile.runtimeContractVersion !== 1) {
-    throw new Error('unsupported trusted platform runtime contract');
-  }
-  if (profile.backwardCompatibleWithRetainedReleases !== true) {
-    throw new Error(
-      'trusted platform profile must attest compatibility with retained releases',
-    );
-  }
   if (
     typeof profile.maintenanceCapabilityPublicKey !== 'string' ||
     canonicalMaintenanceCapabilityPublicKey(
@@ -621,7 +610,7 @@ export function validateExternalPlatformProfile(
   }
   const privateKey = profile.maintenanceCapabilityPrivateKey;
   if (
-    privateKey.kty !== 'OKP' ||
+    privateKey?.kty !== 'OKP' ||
     privateKey.crv !== 'Ed25519' ||
     privateKey.alg !== 'EdDSA' ||
     typeof privateKey.kid !== 'string' ||
@@ -648,6 +637,24 @@ export function validateExternalPlatformProfile(
       'maintenance capability private signer does not match its public verifier',
     );
   }
+}
+
+export function validateExternalPlatformProfile(
+  spec: DeploymentSpec,
+  profile: ExternalPlatformProfile,
+): void {
+  if (spec.authoredBy !== 'external') {
+    throw new Error('external platform resources require an external release');
+  }
+  if (profile.runtimeContractVersion !== 1) {
+    throw new Error('unsupported trusted platform runtime contract');
+  }
+  if (profile.backwardCompatibleWithRetainedReleases !== true) {
+    throw new Error(
+      'trusted platform profile must attest compatibility with retained releases',
+    );
+  }
+  validateMaintenanceSigningProfile(profile);
   validateArtifact(profile.stateWorker, 'state Worker artifact');
   if (profile.legacyBridgeWorker) {
     validateArtifact(profile.legacyBridgeWorker, 'legacy bridge artifact');

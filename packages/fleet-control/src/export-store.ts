@@ -998,27 +998,39 @@ export class FileSystemDatabaseExportStore
     readonly size: number;
     readonly sha256: string;
   }> {
-    assertFileName(input.fileName);
-    if (
-      input.contentLength !== undefined &&
-      (!Number.isSafeInteger(input.contentLength) || input.contentLength < 0)
-    ) {
-      throw new Error(
-        'export contentLength must be a non-negative safe integer',
-      );
-    }
-    await mkdir(this.#directory, { recursive: true });
-    const root = await realpath(this.#directory);
-    const target = resolve(root, input.fileName);
-    if (dirname(target) !== root) {
-      throw new Error('export fileName resolves outside the configured root');
-    }
-    const temporary = join(root, `.${input.fileName}.${randomUUID()}.tmp`);
+    let temporary: string | undefined;
     let file: Awaited<ReturnType<typeof open>> | undefined;
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    let source: ReadableStream<Uint8Array> | undefined;
     try {
+      source = input.body;
+      assertFileName(input.fileName);
+      if (
+        input.contentLength !== undefined &&
+        (!Number.isSafeInteger(input.contentLength) || input.contentLength < 0)
+      ) {
+        throw new Error(
+          'export contentLength must be a non-negative safe integer',
+        );
+      }
+      await mkdir(this.#directory, { recursive: true });
+      const root = await realpath(this.#directory);
+      for (let parent = dirname(root); ; parent = dirname(parent)) {
+        const handle = await open(parent, 'r');
+        try {
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+        if (dirname(parent) === parent) break;
+      }
+      const target = resolve(root, input.fileName);
+      if (dirname(target) !== root) {
+        throw new Error('export fileName resolves outside the configured root');
+      }
+      temporary = join(root, `.${input.fileName}.${randomUUID()}.tmp`);
       file = await open(temporary, 'wx', 0o600);
-      reader = input.body.getReader();
+      reader = source.getReader();
       let size = 0;
       const hash = createHash('sha256');
       for (;;) {
@@ -1057,13 +1069,12 @@ export class FileSystemDatabaseExportStore
         cleanupErrors.push(cleanupError);
       }
       try {
-        // The reader's cancel on a tee branch settles when the tee source is
-        // exhausted or errors, or the other branch is cancelled, so cleanup
+        // A tee branch's cancellation waits for its sibling, so rejection
         // does not await it.
-        void reader?.cancel(error).catch(() => undefined);
+        cancelBodyWithoutAwait(reader ?? source, error);
       } catch {}
       try {
-        await rm(temporary, { force: true });
+        if (temporary) await rm(temporary, { force: true });
       } catch (cleanupError) {
         cleanupErrors.push(cleanupError);
       }

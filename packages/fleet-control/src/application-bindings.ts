@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { Buffer } from 'node:buffer';
 import { createHash, randomBytes } from 'node:crypto';
 import type {
   ApplicationBindingTopology,
@@ -25,6 +24,13 @@ export const DEPLOYMENT_PLATFORM_VARIABLE_NAMES = Object.freeze([
   'FLEET_MAINTENANCE_CAPABILITIES',
   'FLEET_SCHEMA_VERSION',
   'FLEET_SPEC_DIGEST',
+]);
+
+export const PLATFORM_CATALOG_VARIABLE_NAMES = Object.freeze([
+  ...DEPLOYMENT_PLATFORM_VARIABLE_NAMES,
+  'FLEET_DEPLOYMENT_SCRIPT',
+  'FLEET_MAINTENANCE_CAPABILITY_PUBLIC_KEY',
+  'FLEET_RESOURCE_ROLE',
 ]);
 
 export const LEGACY_BRIDGE_PLATFORM_VARIABLE_NAMES = Object.freeze([
@@ -213,7 +219,7 @@ export function reserveApplicationR2Resources(
 ): readonly ApplicationR2Resource[] {
   return canonicalApplicationBindings(spec).r2Buckets.map((binding) => {
     const jurisdiction = binding.jurisdiction ?? 'default';
-    const reservationNonce = Buffer.from(randomBytes(24)).toString('base64url');
+    const reservationNonce = randomBytes(24).toString('base64url');
     return {
       name: binding.name,
       bucketName: reservedBucketName(

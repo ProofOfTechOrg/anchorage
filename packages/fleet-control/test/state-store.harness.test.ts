@@ -494,6 +494,7 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
         'cleanup_intent',
         'invocation_authority',
         'settled_settlement_key',
+        'wfp_mode',
         'decommission_intent',
       ],
     });
@@ -1435,6 +1436,7 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
         'decommission_intent',
         'cleanup_intent',
         'invocation_authority',
+        'wfp_mode',
       ],
       rows: 16,
       tables: [

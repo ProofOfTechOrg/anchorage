@@ -167,11 +167,14 @@ function ownedVersion(id: string, deployment = spec): PlainWorkerVersionDetail {
   };
 }
 
-function installOnUpload(api: PlainWorkerProvisioningApiFake): void {
+function installOnUpload(
+  api: PlainWorkerProvisioningApiFake,
+  deployment = spec,
+): void {
   api.onUploadCandidate = (intent) => {
     api.versions.set(intent.scriptName, [
       ...(api.versions.get(intent.scriptName) ?? []),
-      ownedVersion('candidate'),
+      ownedVersion('candidate', deployment),
     ]);
     if (intent.mode === 'initial') {
       api.deployments.set(intent.scriptName, {
@@ -197,6 +200,59 @@ function maintenanceResponse(digest = deploymentSpecDigest(spec)): Response {
     deploymentSpecDigest: digest,
   });
 }
+
+describe('inspection across release bindings', () => {
+  const target: DeploymentSpec = {
+    ...spec,
+    egressProxyService: 'next-egress',
+    queueProducer: { binding: 'EVENTS', queueName: 'next-events' },
+    application: {
+      vars: [{ name: 'RELEASE', value: 'next' }],
+      secrets: [],
+      r2Buckets: [],
+    },
+  };
+  const releaseBindings: PlainWorkerVersionDetail['bindings'] = [
+    { type: 'service', name: 'EGRESS_PROXY', service: 'next-egress' },
+    { type: 'queue-producer', name: 'EVENTS', queueName: 'next-events' },
+    { type: 'plain-text', name: 'RELEASE', value: 'next' },
+  ];
+
+  it.each([
+    'EGRESS_PROXY',
+    'EVENTS',
+    'RELEASE',
+  ])('rejects target-digest %s drift through candidate and active discovery', async (missing) => {
+    for (const selection of ['tag', 'explicit', 'fallback'] as const) {
+      const api = new PlainWorkerProvisioningApiFake();
+      const version = ownedVersion('target', target);
+      api.versions.set(target.scriptName, [
+        {
+          ...version,
+          tag: selection === 'fallback' ? 'unmatched-tag' : version.tag,
+          bindings: [
+            ...version.bindings,
+            ...releaseBindings.filter(({ name }) => name !== missing),
+          ],
+        },
+      ]);
+      api.deployments.set(target.scriptName, {
+        versions: [{ versionId: 'target', percentage: 100 }],
+      });
+      const request = vi.fn(async () =>
+        maintenanceResponse(deploymentSpecDigest(target)),
+      );
+      await expect(
+        backend(api, { fetch: request }).inspect(
+          target,
+          secrets.maintenanceAdmin,
+          selection === 'explicit' ? 'target' : undefined,
+        ),
+      ).rejects.toThrow('different resource mapping');
+      expect(request).not.toHaveBeenCalled();
+    }
+  });
+});
 
 function fleetRecord(): FleetRecord {
   return {
@@ -719,6 +775,17 @@ describe('PlainWorkerBackend core policy', () => {
     );
   });
 
+  it.each([
+    undefined,
+    '',
+  ])('refuses a D1 row without a usable name: %s', async (name) => {
+    const api = new PlainWorkerProvisioningApiFake();
+    vi.spyOn(api, 'listDatabases').mockResolvedValue([
+      { databaseId: 'database', name },
+    ]);
+    await expect(backend(api).findDatabase(spec)).rejects.toThrow(/D1.*name/);
+  });
+
   it('selects an exact database name from search-like inventory', async () => {
     const api = new PlainWorkerProvisioningApiFake();
     api.databases.set('database-1', {
@@ -842,6 +909,66 @@ describe('PlainWorkerBackend core policy', () => {
       ),
     ).rejects.toBe(denied);
     expect(api.events).toEqual(['port-assert']);
+  });
+
+  it.each(
+    (['initial', 'staged'] as const).flatMap((mode) =>
+      [
+        {
+          label: 'neither limit',
+          specLimits: {},
+          intentLimits: { cpuMs: undefined },
+        },
+        {
+          label: 'CPU only',
+          specLimits: { cpuLimitMs: 30_000 },
+          intentLimits: { cpuMs: 30_000 },
+        },
+        {
+          label: 'subrequests only',
+          specLimits: { subrequestLimit: 500 },
+          intentLimits: { cpuMs: undefined, subrequests: 500 },
+        },
+        {
+          label: 'both limits',
+          specLimits: { cpuLimitMs: 30_000, subrequestLimit: 500 },
+          intentLimits: { cpuMs: 30_000, subrequests: 500 },
+        },
+      ].map((limits) => ({ mode, ...limits })),
+    ),
+  )('forwards $label to the shared $mode upload intent', async ({
+    mode,
+    specLimits,
+    intentLimits,
+  }) => {
+    const deployment = { ...spec, ...specLimits } satisfies DeploymentSpec;
+    const api = new PlainWorkerProvisioningApiFake();
+    if (mode === 'staged') {
+      api.versions.set(deployment.scriptName, [
+        ownedVersion('current', deployment),
+      ]);
+      api.deployments.set(deployment.scriptName, {
+        versions: [{ versionId: 'current', percentage: 100 }],
+      });
+    }
+    installOnUpload(api, deployment);
+    const upload = vi.spyOn(api, 'uploadCandidate');
+
+    await expect(
+      backend(api).deployWorker(
+        deployment,
+        database,
+        secrets,
+        undefined,
+        mutationFence(),
+      ),
+    ).resolves.toEqual({
+      artifactVersion: 'candidate',
+      created: mode === 'initial',
+    });
+    expect(upload).toHaveBeenCalledOnce();
+    expect(upload.mock.calls[0]?.[0].mode).toBe(mode);
+    expect(upload.mock.calls[0]?.[0].limits).toStrictEqual(intentLimits);
   });
 
   it('separates initial and staged upload intents and refuses staged migrations', async () => {
@@ -1103,6 +1230,52 @@ const carrierScenarios = fenceModes.flatMap((mode) => [
 ]);
 
 describe('PlainWorkerBackend mutation-fence carrier ordering', () => {
+  it.each([
+    {},
+    { workersDevEnabled: false },
+    { previewUrlsEnabled: false },
+  ])('refuses unknown present-Worker public access in normal and force proofs %#', async (flags) => {
+    const api = new PlainWorkerProvisioningApiFake();
+    vi.spyOn(api, 'inspectOrdinaryWorkerFootprint').mockResolvedValue({
+      scriptPresent: true,
+      customDomains: [],
+      zoneRoutes: [],
+      ...flags,
+    });
+    vi.spyOn(api, 'disableOrdinaryWorkerPublicAccess').mockResolvedValue(
+      undefined,
+    );
+    await expect(backend(api).assertTrafficRemoved(spec)).rejects.toThrow(
+      'public-access footprint is incomplete',
+    );
+    await expect(
+      backend(api).forceDecommissionStep(
+        fleetRecord(),
+        'remove-traffic',
+        api.fence(),
+      ),
+    ).rejects.toThrow('public-access footprint is incomplete');
+  });
+
+  it('accepts an absent Worker without subdomain flags in ingress proofs', async () => {
+    const api = new PlainWorkerProvisioningApiFake();
+    vi.spyOn(api, 'inspectOrdinaryWorkerFootprint').mockResolvedValue({
+      scriptPresent: false,
+      customDomains: [],
+      zoneRoutes: [],
+    });
+    await expect(
+      backend(api).assertTrafficRemoved(spec),
+    ).resolves.toBeUndefined();
+    await expect(
+      backend(api).forceDecommissionStep(
+        fleetRecord(),
+        'remove-traffic',
+        api.fence(),
+      ),
+    ).resolves.toBeUndefined();
+  });
+
   it.each(
     carrierScenarios,
   )('$scenario records exact ordering in $mode mode', async ({
@@ -1310,7 +1483,7 @@ describe('PlainWorkerBackend core-policy refusals', () => {
     const api = new PlainWorkerProvisioningApiFake();
     deployedCandidate(api);
     const request = vi.fn(
-      async (input: RequestInfo | URL, init?: RequestInit) => {
+      async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
         expect(String(input)).toContain('/admin/ensure-maintenance');
         expect(init?.headers).toMatchObject({
           'Cloudflare-Workers-Version-Overrides': `${spec.scriptName}="candidate"`,
@@ -1369,6 +1542,13 @@ describe('PlainWorkerBackend core-policy refusals', () => {
     const api = new PlainWorkerProvisioningApiFake();
     api.scripts.add(spec.scriptName);
     deployedCandidate(api);
+    api.footprints.set(spec.scriptName, {
+      scriptPresent: true,
+      workersDevEnabled: false,
+      previewUrlsEnabled: false,
+      customDomains: [],
+      zoneRoutes: [],
+    });
     api.onDeleteWorkerScript = () => {
       api.namespaces.set(spec.scriptName, ['residual-namespace']);
     };

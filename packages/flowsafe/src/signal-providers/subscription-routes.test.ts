@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-// createSubscriptionRouter — the human-only HTTP subscribe/unsubscribe surface
-// (RA-009: NEVER exposed as model tools; nothing here mints capability, P8). The
-// gate order mirrors createSignalRouter: resolve → thread-ownership → role →
-// memory-id refusal → mutate. Committed mutations and probe-like post-auth
-// denials are audited.
 import { describe, expect, it, vi } from 'vitest';
 
-import type { ActorContext, ApprovalRole } from '../approval-api/index.js';
+import {
+  type ActorContext,
+  ActorResolutionError,
+  type ApprovalRole,
+} from '../approval-api/index.js';
 import { resourceIdFromKey } from '../do-runner/index.js';
 import { RunRouteError } from '../host-kit/index.js';
 import {
@@ -553,5 +552,218 @@ describe('createSubscriptionRouter', () => {
     } finally {
       log.mockRestore();
     }
+  });
+});
+
+describe('createSubscriptionRouter audit isolation', () => {
+  it.each([
+    'accepted list',
+    'store error',
+  ])('preserves the %s response with one failing audit call', async (outcome) => {
+    const factory = new InMemorySubscriptionStoreFactory();
+    if (outcome === 'store error') {
+      vi.spyOn(factory.store(), 'listForThread').mockRejectedValue(
+        new Error('store failed'),
+      );
+    }
+    const audit = vi.fn(async () => {
+      throw new ActorResolutionError('audit failed');
+    });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {
+      throw new Error('logger failed');
+    });
+    const router = createSubscriptionRouter({
+      resolve: async () => ctx('operator'),
+      subscriptions: factory,
+      validateThreadTarget: async () => undefined,
+      audit,
+    });
+    try {
+      const response = await router(req('GET', 'acme_t1'));
+      expect(response?.status).toBe(outcome === 'accepted list' ? 200 : 500);
+      expect(await response?.json()).toEqual(
+        outcome === 'accepted list'
+          ? { subscriptions: [] }
+          : { error: 'internal error' },
+      );
+      expect(audit).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          action: 'list',
+          outcome: outcome === 'accepted list' ? 'accepted' : 'rejected',
+          ...(outcome === 'store error' ? { reason: 'internal-error' } : {}),
+        }),
+      );
+    } finally {
+      logged.mockRestore();
+    }
+  });
+  it.each([
+    ['role', 'viewer', 'acme_t1', {}, 403, 'forbidden', 'forbidden-role'],
+    [
+      'owner',
+      'operator',
+      'foreign',
+      {},
+      404,
+      'thread not found',
+      'resource-not-found',
+    ],
+    [
+      'memory id',
+      'operator',
+      'acme_t1',
+      { threadId: 'forged' },
+      400,
+      'threadId is server-assigned (agent-memory ids are minted by the host)',
+      'client-memory-id',
+    ],
+    [
+      'typed refusal',
+      'operator',
+      'acme_t1',
+      {
+        providerId: 'github',
+        externalResourceId: 'res:1',
+        resourceKey: 'owner',
+      },
+      422,
+      'host refused subscription',
+      'route-error-422',
+    ],
+  ] as const)('preserves the %s refusal when audit and diagnostics throw', async (_label, role, threadId, body, status, message, reason) => {
+    const audit = vi.fn(() => {
+      throw new RunRouteError(409, 'audit failed');
+    });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {
+      throw new Error('logger failed');
+    });
+    const reconcilePolling = vi.fn(async () => undefined);
+    const { router, factory } = setup({
+      role,
+      audit,
+      reconcilePolling,
+      validateThreadTarget: async () => {
+        throw new RunRouteError(422, 'host refused subscription');
+      },
+    });
+    try {
+      const response = await router(req('POST', threadId, body));
+      expect(response?.status).toBe(status);
+      expect(await response?.json()).toEqual({ error: message });
+      expect(response?.headers.get('cache-control')).toBe('no-store');
+      expect(audit).toHaveBeenCalledExactlyOnceWith({
+        type: 'signal-provider.subscription',
+        actorId: 'op',
+        threadId,
+        action: 'subscribe',
+        outcome: 'rejected',
+        reason,
+        timestamp: expect.any(String),
+      });
+      expect(logged).toHaveBeenCalledTimes(1);
+      expect(await factory.store().listForThread('acme_t1')).toEqual([]);
+      expect(reconcilePolling).not.toHaveBeenCalled();
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it.each([
+    'actor error',
+    'message getter',
+    'toString',
+  ])('preserves subscription commits and polling metadata when audit throws %s', async (failure) => {
+    const error =
+      failure === 'actor error'
+        ? new ActorResolutionError('audit failed')
+        : failure === 'message getter'
+          ? Object.defineProperty(new Error(), 'message', {
+              get() {
+                throw new Error('message failed');
+              },
+            })
+          : {
+              toString() {
+                throw new Error('coercion failed');
+              },
+            };
+    const events: SignalProviderAuditEvent[] = [];
+    const audit = vi.fn(async (event: SignalProviderAuditEvent) => {
+      events.push(event);
+      throw error;
+    });
+    const reconcilePolling = vi
+      .fn(async () => undefined)
+      .mockRejectedValueOnce(error);
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {
+      throw new Error('logger failed');
+    });
+    const { router, factory } = setup({ audit, reconcilePolling });
+    const body = {
+      providerId: 'github',
+      externalResourceId: 'res:1',
+      resourceKey: 'owner',
+    };
+    try {
+      const subscribe = await router(req('POST', 'acme_t1', body));
+      expect(subscribe?.status).toBe(200);
+      expect(await subscribe?.json()).toMatchObject({
+        subscription: {
+          threadId: 'acme_t1',
+          providerId: 'github',
+          externalResourceId: 'res:1',
+        },
+      });
+      expect(await factory.store().listForThread('acme_t1')).toHaveLength(1);
+      const unsubscribe = await router(req('DELETE', 'acme_t1', body));
+      expect(unsubscribe?.status).toBe(200);
+      expect(await unsubscribe?.json()).toEqual({ removed: true });
+      expect(await factory.store().listForThread('acme_t1')).toEqual([]);
+      expect(events).toEqual([
+        expect.objectContaining({
+          action: 'subscribe',
+          outcome: 'accepted',
+          pollingLifecycle: 'failed',
+          reason: 'polling-reconcile-failed',
+          providerId: 'github',
+          externalResourceId: 'res:1',
+        }),
+        expect.objectContaining({
+          action: 'unsubscribe',
+          outcome: 'accepted',
+          pollingLifecycle: 'reconciled',
+          providerId: 'github',
+          externalResourceId: 'res:1',
+        }),
+      ]);
+      expect(events[1]).not.toHaveProperty('reason');
+      expect(audit).toHaveBeenCalledTimes(2);
+      expect(reconcilePolling).toHaveBeenCalledTimes(2);
+      expect(logged).toHaveBeenCalledTimes(3);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it('captures the audit callback and preserves its options receiver on a list', async () => {
+    let receiver: SubscriptionRouterOptions | undefined;
+    const audit = vi.fn(function (this: SubscriptionRouterOptions) {
+      receiver = this;
+    });
+    const replacement = vi.fn();
+    const options: SubscriptionRouterOptions = {
+      resolve: async () => ctx('operator'),
+      subscriptions: new InMemorySubscriptionStoreFactory(),
+      validateThreadTarget: async () => undefined,
+      audit,
+    };
+    const router = createSubscriptionRouter(options);
+    options.audit = replacement;
+    const response = await router(req('GET', 'acme_t1'));
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toEqual({ subscriptions: [] });
+    expect(audit).toHaveBeenCalledTimes(1);
+    expect(receiver).toBe(options);
+    expect(replacement).not.toHaveBeenCalled();
   });
 });

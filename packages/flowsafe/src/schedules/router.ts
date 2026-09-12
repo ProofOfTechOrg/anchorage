@@ -169,11 +169,7 @@ export interface ScheduleRouterOptions {
   targetPolicy: ScheduleTargetPolicy;
   /** Prove fixed-thread agent targets are durable bound memory. */
   validateThreadTarget: BoundThreadTargetValidator;
-  /**
-   * Who may create/update/delete/pause/resume. Default RUN_START_ROLES
-   * (operator/admin) — reviewers/viewers cannot author schedules. Reads (get/
-   * list/triggers) are not role-gated beyond ownership.
-   */
+  /** Roles allowed to mutate schedules. Defaults to RUN_START_ROLES. */
   roles?: readonly ApprovalRole[];
   /** Every mutation (and denied read) is audited through this. Absent ⇒ no audit. */
   audit?: ScheduleRouteAuditSink;

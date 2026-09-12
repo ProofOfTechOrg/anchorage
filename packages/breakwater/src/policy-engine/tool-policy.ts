@@ -8,6 +8,7 @@
 // See docs/policy-engine-design.md.
 
 import type { RequestContext } from '@mastra/core/request-context';
+import type { ConnectorDenialMetadata } from '../connector-decision.js';
 
 /**
  * Decision shape shared by both policy seams (agent-boundary evaluators in
@@ -19,12 +20,12 @@ export type PolicyDecision =
       /** Allow the operation. */
       allowed: true;
     }
-  | {
+  | ({
       /** Deny the operation. */
       allowed: false;
       /** Human-readable denial reason suitable for audit records. */
       reason: string;
-    };
+    } & (ConnectorDenialMetadata | { code?: undefined; details?: undefined }));
 
 /** Side-effect classification a connector declares in its manifest. */
 export type SideEffect = 'read' | 'write' | 'destructive' | 'idempotent';
@@ -45,7 +46,7 @@ export interface ToolCallContext {
 
 /** Evaluates one policy at the connector execution boundary. */
 export interface ToolPolicyEvaluator {
-  /** Stable policy name used in denials and audit records. */
+  /** Diagnostic policy name used in denials and audit records. */
   name: string;
   /** Return whether this connector call may proceed. */
   evaluate(context: ToolCallContext): PolicyDecision | Promise<PolicyDecision>;
@@ -175,6 +176,8 @@ export function networkEgress(
           return {
             allowed: false,
             reason: `egress to ${normalizedDeclared} is not in the allowed domains`,
+            code: 'EGRESS_HOST_NOT_ALLOWED_BY_ORG',
+            details: { declaredHost: normalizedDeclared },
           };
         }
       }
@@ -223,12 +226,14 @@ export function crossWorkflowIsolation(
         return {
           allowed: false,
           reason: 'caller has no workflow scope; cross-workflow access denied',
+          code: 'WORKFLOW_SCOPE_MISSING',
         };
       }
       if (target !== scope) {
         return {
           allowed: false,
           reason: `workflow '${scope}' may not access state of '${target}'`,
+          code: 'CROSS_WORKFLOW_ACCESS_DENIED',
         };
       }
       return { allowed: true };
@@ -270,6 +275,7 @@ export function tenantIsolation(
           allowed: false,
           reason:
             'caller carries no isolation scope; this deployment requires tenant-scoped connector calls',
+          code: 'ISOLATION_SCOPE_MISSING',
         };
       }
       return { allowed: true };
@@ -358,6 +364,7 @@ export function backgroundExecution(
         return {
           allowed: false,
           reason: `write-class connector '${connectorId}' may not run in background: an LLM _background override would move it off the foreground path (v1 connectors are foreground-only)`,
+          code: 'BACKGROUND_EXECUTION_DENIED',
         };
       }
       return { allowed: true };

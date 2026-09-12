@@ -250,6 +250,105 @@ const D1_TARGET = { kind: 'd1', databaseId: 'target-db' } as const;
 const R2_TARGET = { kind: 'r2', bucketName: 'target-bucket' } as const;
 
 describe('Cloudflare Worker attachment scan', () => {
+  describe.each([
+    'ordinary',
+    'dispatch',
+  ] as const)('%s binding identities', (plane) => {
+    it.each([
+      {
+        kind: 'd1',
+        target: D1_TARGET,
+        field: 'database_id',
+        identity: 'target-db',
+      },
+      {
+        kind: 'r2_bucket',
+        target: R2_TARGET,
+        field: 'bucket_name',
+        identity: 'target-bucket',
+      },
+    ])('refuses incomplete $kind selectors before reporting absence', async ({
+      kind,
+      target,
+      field,
+      identity,
+    }) => {
+      const scan = (bindings: readonly Readonly<Record<string, unknown>>[]) => {
+        const world: AttachmentWorld = {
+          ordinary:
+            plane === 'ordinary'
+              ? [
+                  {
+                    id: 'foreign',
+                    versions: [{ id: 'v1', percentage: 100, bindings }],
+                  },
+                ]
+              : [],
+          namespaces:
+            plane === 'dispatch'
+              ? [
+                  {
+                    name: 'foreign-plane',
+                    pages: [{ scripts: ['foreign'] }],
+                    bindings: { foreign: bindings },
+                  },
+                ]
+              : [],
+        };
+        return drain(client(recordingFetch(worldHandler(world)).fetch), target);
+      };
+      const binding = { type: kind, [field]: identity };
+      expect((await scan([binding])).attachments).toHaveLength(1);
+      for (const value of [
+        undefined,
+        null,
+        false,
+        0,
+        {},
+        '',
+        ' ',
+        ` ${identity}`,
+        `${identity} `,
+      ]) {
+        await expect(scan([{ ...binding, [field]: value }])).rejects.toThrow(
+          'binding inventory was malformed',
+        );
+      }
+      for (const type of [undefined, null, false, '', ' ', `${kind} `]) {
+        await expect(scan([{ ...binding, type }])).rejects.toThrow(
+          'binding inventory was malformed',
+        );
+      }
+      expect(
+        (await scan([{ ...binding, [field]: 'other-resource' }])).attachments,
+      ).toEqual([]);
+      expect(
+        (
+          await scan([
+            { type: 'plain_text', text: identity },
+            { type: 'future_binding' },
+          ])
+        ).attachments,
+      ).toEqual([]);
+      expect((await scan([])).attachments).toEqual([]);
+      if (kind === 'd1') {
+        for (const id of ['', identity]) {
+          expect((await scan([{ ...binding, id }])).attachments).toHaveLength(
+            1,
+          );
+        }
+        for (const id of [null, false, 'different-id']) {
+          await expect(scan([{ ...binding, id }])).rejects.toThrow(
+            'binding inventory was malformed',
+          );
+        }
+        await expect(scan([{ type: 'd1', id: identity }])).rejects.toThrow(
+          'binding inventory was malformed',
+        );
+      }
+    });
+  });
+
   it('resumes a D1 scan across every ordinary version and dispatch page', async () => {
     const events: string[] = [];
     const world: AttachmentWorld = {

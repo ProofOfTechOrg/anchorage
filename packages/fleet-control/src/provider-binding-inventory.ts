@@ -8,6 +8,24 @@ import type {
   ProviderBindingIdentity,
 } from './types.js';
 
+export function assertCompleteWorkerPublicAccess(
+  footprint: Readonly<{
+    scriptPresent: boolean;
+    workersDevEnabled?: boolean;
+    previewUrlsEnabled?: boolean;
+  }>,
+): void {
+  if (
+    typeof footprint.scriptPresent !== 'boolean' ||
+    [footprint.workersDevEnabled, footprint.previewUrlsEnabled].some((value) =>
+      value === undefined
+        ? footprint.scriptPresent
+        : typeof value !== 'boolean',
+    )
+  )
+    throw new Error('ordinary Worker public-access footprint is incomplete');
+}
+
 export function providerBindingsToPlainWorkerShape(
   bindings: readonly unknown[],
 ): readonly PlainWorkerVersionBinding[] {

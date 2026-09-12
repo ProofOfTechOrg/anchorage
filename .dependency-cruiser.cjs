@@ -1,3 +1,14 @@
+const { builtinModules } = require('node:module');
+
+const CLOUDFLARE_CONTROL_PLANE_ENTRY =
+  '^packages/fleet-control/src/cloudflare-control-plane\\.ts$';
+const CLOUDFLARE_FORBIDDEN_CORE = `^(?:node:(?!(?:crypto|async_hooks)$).+|${[
+  ...new Set(builtinModules.map((name) => name.replace(/^node:/, ''))),
+]
+  .filter((name) => name !== 'crypto' && name !== 'async_hooks')
+  .map((name) => name.replace(/[.*+?^$(){}|[\]\\]/g, '\\$&'))
+  .join('|')})$`;
+
 const FLOWSAFE_PUBLIC_ENTRY =
   '^packages/flowsafe/src/(?:index|host-kit/index|agent-runner/index|signals/client)\\.ts$';
 const ALLOWED_APPROVAL_API_LEAVES =
@@ -8,6 +19,34 @@ const KNOWN_APPROVAL_API_CYCLE =
 /** @type {import('dependency-cruiser').IConfiguration} */
 module.exports = {
   forbidden: [
+    {
+      name: 'fleet-control-worker-entry-avoids-node-host-adapters',
+      severity: 'error',
+      from: {
+        path: [
+          CLOUDFLARE_CONTROL_PLANE_ENTRY,
+          '^scripts/architecture-fixtures/control-plane-imports-node-host\\.ts$',
+        ],
+      },
+      to: {
+        path: '^packages/fleet-control/src/(?:export-store|wrangler-loop-backend|wrangler-plain-worker-provisioning-api|wrangler-runner)\\.ts$',
+        reachable: true,
+      },
+    },
+    {
+      name: 'fleet-control-worker-entry-limits-core-imports',
+      severity: 'error',
+      from: {
+        path: [
+          CLOUDFLARE_CONTROL_PLANE_ENTRY,
+          '^scripts/architecture-fixtures/control-plane-imports-forbidden-core\\.ts$',
+        ],
+      },
+      to: {
+        path: CLOUDFLARE_FORBIDDEN_CORE,
+        reachable: true,
+      },
+    },
     {
       name: 'flowsafe-public-entry-no-agent-host',
       severity: 'error',
@@ -158,7 +197,7 @@ module.exports = {
           '^scripts/architecture-fixtures/fleet-control-leaf-imports-client\\.ts$',
         ],
         pathNot:
-          '^packages/fleet-control/src/(?:cloudflare-api-plain-worker-backend|cloudflare-api-plain-worker-provisioning-api|cloudflare-client|index)\\.ts$',
+          '^packages/fleet-control/src/(?:cloudflare-api-plain-worker-backend|cloudflare-api-plain-worker-provisioning-api|cloudflare-client|cloudflare-control-plane|index)\\.ts$',
       },
       to: {
         path: '^packages/fleet-control/src/cloudflare-client\\.ts$',
@@ -387,7 +426,7 @@ module.exports = {
         ],
       },
       to: {
-        path: '^packages/fleet-control/src/(?:cloudflare-api-plain-worker-backend|cloudflare-api-plain-worker-provisioning-api|index)\\.ts$',
+        path: '^packages/fleet-control/src/(?:cloudflare-api-plain-worker-backend|cloudflare-api-plain-worker-provisioning-api|cloudflare-control-plane|index)\\.ts$',
         reachable: true,
       },
     },

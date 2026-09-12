@@ -55,6 +55,7 @@ import type {
 import {
   EXTERNAL_MIGRATION_SUBPHASES,
   effectiveLifecyclePhase,
+  isPlatformCatalogRecord,
   PROVISIONING_PHASES,
 } from './types.js';
 import { deploymentKey } from './validation.js';
@@ -174,21 +175,16 @@ const FLEET_ROW_COLUMNS = [
   'database_export_size',
   'settled_settlement_key',
   'updated_at',
+  'wfp_mode',
 ] as const;
 
-/**
- * Nullable TEXT columns added to a table that already shipped, in the order
- * they were added. Each is created by ALTER on an existing database and by the
- * CREATE above on a new one, and each is asserted present afterwards: a column
- * that silently failed to appear would not fail a write, it would drop the
- * value on every write.
- */
 export const ADDED_NULLABLE_TEXT_COLUMNS = [
   'backend_switch_intent',
   'settled_settlement_key',
   'decommission_intent',
   'cleanup_intent',
   'invocation_authority',
+  'wfp_mode',
 ] as const;
 
 function isDuplicateColumnError(
@@ -257,6 +253,7 @@ function rowNumber(
 function optionalReleaseSnapshot(
   value: unknown,
   key: string,
+  mutableScriptName?: string,
 ): ExternalReleaseSnapshot | undefined {
   if (value === null || value === undefined) return undefined;
   if (typeof value !== 'string') {
@@ -288,7 +285,16 @@ function optionalReleaseSnapshot(
     'application' in release ? release.application : undefined,
     `${key}.application`,
   );
-  if (release.artifactVersion !== 'pending' && !topology) {
+  const ownMutableArtifact =
+    mutableScriptName !== undefined &&
+    mutableScriptName.length > 0 &&
+    release.physicalScriptName === mutableScriptName &&
+    release.artifactVersion.length > 0;
+  if (
+    release.artifactVersion !== 'pending' &&
+    !topology &&
+    !ownMutableArtifact
+  ) {
     throw new Error(`fleet state row has invalid ${key}`);
   }
   if (
@@ -705,6 +711,29 @@ function assertCleanupIntentExclusive(record: FleetRecord): void {
 function validateRecordCrossFields(record: FleetRecord): void {
   const phase = effectiveLifecyclePhase(record);
   assertCleanupIntentExclusive(record);
+  const catalog = isPlatformCatalogRecord(record);
+  if (
+    catalog &&
+    [
+      record.activeRelease,
+      record.pendingRelease,
+      record.migrationPriorRelease,
+      record.rollbackRelease,
+      record.retiringRelease,
+    ].some(
+      (release) => release && release.physicalScriptName !== record.scriptName,
+    )
+  )
+    throw new Error('fleet state row has a foreign catalog release');
+  if (
+    Object.hasOwn(record, 'wfpMode') &&
+    (!catalog ||
+      record.platformResources ||
+      record.platformTarget ||
+      record.migrationIntent ||
+      record.backendSwitchIntent)
+  )
+    throw new Error('fleet state row has inconsistent wfp_mode');
   const {
     activeRelease,
     backend,
@@ -718,6 +747,21 @@ function validateRecordCrossFields(record: FleetRecord): void {
     platformTarget,
     schemaVersion,
   } = record;
+  // The retained target authorizes recovery of a state upload whose response is lost.
+  const legacyMigrationTeardown =
+    backend === 'workers-for-platforms' &&
+    record.wfpMode === undefined &&
+    record.cleanupIntent === undefined &&
+    record.decommissionIntent === undefined &&
+    record.backendSwitchIntent === undefined &&
+    record.desiredSpecDigest === migrationIntent?.targetSpecDigest &&
+    [
+      'decommissioning',
+      'traffic-removed',
+      'credentials-revoked',
+      'worker-deleted',
+      'platform-credentials-revoked',
+    ].includes(record.phase);
   if (
     (backend === 'workers-for-platforms' && !outboundPolicy) ||
     (backend === 'plain-worker' && outboundPolicy) ||
@@ -739,7 +783,7 @@ function validateRecordCrossFields(record: FleetRecord): void {
     (platformTarget &&
       JSON.stringify(platformTarget.outboundPolicy) !==
         JSON.stringify(outboundPolicy)) ||
-    (migrationIntent && phase !== 'migrating') ||
+    (migrationIntent && phase !== 'migrating' && !legacyMigrationTeardown) ||
     (migrationIntent &&
       migrationIntent.targetSpecDigest !==
         migrationIntent.targetRelease.specDigest) ||
@@ -768,11 +812,13 @@ function validateRecordCrossFields(record: FleetRecord): void {
     throw new Error('fleet state row has inconsistent migration intent');
   }
   if (
-    (backend === 'plain-worker' && (platformTarget || migrationIntent)) ||
+    ((backend === 'plain-worker' || catalog) &&
+      (platformTarget || migrationIntent)) ||
     (backend === 'workers-for-platforms' &&
       platformResources !== undefined &&
       platformTarget === undefined) ||
     (backend === 'workers-for-platforms' &&
+      !catalog &&
       phase === 'migrating' &&
       migrationIntent === undefined)
   ) {
@@ -780,7 +826,7 @@ function validateRecordCrossFields(record: FleetRecord): void {
   }
   if (
     pendingArtifactVersion !== undefined &&
-    (backend !== 'plain-worker' ||
+    ((backend !== 'plain-worker' && !catalog) ||
       phase !== 'migrating' ||
       typeof pendingSpecDigest !== 'string' ||
       pendingArtifactVersion.length === 0 ||
@@ -810,6 +856,13 @@ function toRecord(row: Readonly<Record<string, unknown>>): FleetRecord {
   if (backend !== 'plain-worker' && backend !== 'workers-for-platforms') {
     throw new Error('fleet state row has invalid backend');
   }
+  const wfpMode = row.wfp_mode;
+  if (
+    wfpMode !== null &&
+    wfpMode !== undefined &&
+    wfpMode !== 'platform-catalog'
+  )
+    throw new Error('fleet state row has invalid wfp_mode');
   const phase = rowString(row, 'phase');
   if (!PROVISIONING_PHASES.includes(phase as ProvisioningPhase)) {
     throw new Error('fleet state row has invalid phase');
@@ -1142,25 +1195,34 @@ function toRecord(row: Readonly<Record<string, unknown>>): FleetRecord {
   ) {
     throw new Error('fleet state row has invalid durable_object_bindings');
   }
+  const mutableScriptName =
+    backend === 'plain-worker' || wfpMode === 'platform-catalog'
+      ? rowString(row, 'script_name')
+      : undefined;
   const activeRelease = optionalReleaseSnapshot(
     row.active_release,
     'active_release',
+    mutableScriptName,
   );
   const pendingRelease = optionalReleaseSnapshot(
     row.pending_release,
     'pending_release',
+    mutableScriptName,
   );
   const migrationPriorRelease = optionalReleaseSnapshot(
     row.migration_prior_release,
     'migration_prior_release',
+    mutableScriptName,
   );
   const rollbackRelease = optionalReleaseSnapshot(
     row.rollback_release,
     'rollback_release',
+    mutableScriptName,
   );
   const retiringRelease = optionalReleaseSnapshot(
     row.retiring_release,
     'retiring_release',
+    mutableScriptName,
   );
   const tenantTag = rowString(row, 'tenant_tag');
   const environment = rowString(row, 'environment');
@@ -1222,6 +1284,7 @@ function toRecord(row: Readonly<Record<string, unknown>>): FleetRecord {
     tenantTag,
     environment,
     backend,
+    ...(wfpMode === 'platform-catalog' ? { wfpMode } : {}),
     scriptName: rowString(row, 'script_name'),
     databaseId: rowString(row, 'database_id'),
     databaseName: rowString(row, 'database_name'),
@@ -1527,6 +1590,7 @@ export class D1FleetStateStore
       database_export_size INTEGER,
       settled_settlement_key TEXT,
       updated_at TEXT NOT NULL,
+      wfp_mode TEXT,
       PRIMARY KEY (tenant_tag, environment),
       UNIQUE (backend, script_name),
       UNIQUE (database_id),
@@ -1539,7 +1603,6 @@ export class D1FleetStateStore
       try {
         await this.#db.execute(`ALTER TABLE ${TABLE} ADD COLUMN ${name} TEXT`);
       } catch (error) {
-        // A replica that added the same column between the read and the write.
         if (!isDuplicateColumnError(error, name)) throw error;
       }
       fleetColumns = await this.#db.query(`PRAGMA table_info(${TABLE})`);
@@ -2163,6 +2226,7 @@ export class D1FleetStateStore
       record.databaseExportSize ?? null,
       record.settledSettlementKey ?? null,
       record.updatedAt,
+      record.wfpMode ?? null,
     ] as const;
     const upsertSql = `INSERT INTO ${TABLE} (
         tenant_tag, environment, backend, script_name, database_id,
@@ -2175,15 +2239,17 @@ export class D1FleetStateStore
         durable_object_bindings, application_resources, application_bindings,
         route_hostname, phase,
         database_export_location, database_export_sha256,
-        database_export_size, settled_settlement_key, updated_at
+        database_export_size, settled_settlement_key, updated_at, wfp_mode
       ) SELECT CASE WHEN EXISTS (
         SELECT 1 FROM ${LEASE_TABLE}
         WHERE tenant_tag = ? AND environment = ? AND owner_token = ?
           AND expires_at > ${DB_NOW_MS}
       ) THEN ? ELSE NULL END,
-      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
       WHERE true
       ON CONFLICT (tenant_tag, environment) DO UPDATE SET
+        tenant_tag = CASE WHEN ${TABLE}.wfp_mode IS NULL OR ${TABLE}.wfp_mode IS excluded.wfp_mode
+          THEN excluded.tenant_tag ELSE NULL END,
         backend = excluded.backend,
         script_name = excluded.script_name,
         database_id = excluded.database_id,
@@ -2218,7 +2284,8 @@ export class D1FleetStateStore
         database_export_sha256 = excluded.database_export_sha256,
         database_export_size = excluded.database_export_size,
         settled_settlement_key = excluded.settled_settlement_key,
-        updated_at = excluded.updated_at
+        updated_at = excluded.updated_at,
+        wfp_mode = excluded.wfp_mode
       RETURNING tenant_tag, environment`;
     let results: readonly (readonly Readonly<Record<string, unknown>>[])[];
     try {
@@ -2327,6 +2394,8 @@ export class D1FleetStateStore
     let workerClaim: DeploymentClaim;
     if (record.backend === 'plain-worker') {
       workerClaim = ['worker-script', record.scriptName, 'deployment-worker'];
+    } else if (isPlatformCatalogRecord(record)) {
+      workerClaim = ['dispatch-script', record.scriptName, 'deployment-worker'];
     } else if (record.platformResources) {
       const state = record.platformResources.stateWorker;
       if (state.plane === 'ordinary') {

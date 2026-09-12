@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { createHash, randomUUID } from 'node:crypto';
+
 import {
   DEPLOYMENT_SENTINEL_COLUMNS,
   DEPLOYMENT_SENTINEL_DDL,
@@ -7,21 +9,31 @@ import {
 import type { MaintenanceCapabilityJwk } from '@proofoftech/flowsafe/host-kit';
 import {
   MAINTENANCE_RECEIPT_HEADER,
+  mintAsymmetricMaintenanceCapability,
   mintMaintenanceReceipt,
   verifyAsymmetricMaintenanceCapability,
 } from '@proofoftech/flowsafe/host-kit';
 import { describe, expect, it, vi } from 'vitest';
 import { ActiveRouteAttestationError } from '../src/active-route.js';
+import { D1FleetStateDatabase } from '../src/d1-fleet-state-database.js';
+import { advanceDecommissionDeployment } from '../src/decommission-advance.js';
 import { WorkerDeploymentError } from '../src/deployment-error.js';
+import { migrateFleet } from '../src/fleet.js';
 import {
   canonicalDeploymentEgressPolicy,
+  durableObjectMigrationHistoryDigest,
   externalEgressProxyScriptName,
   externalPlatformResourceGroupId,
   externalReleaseTopology,
   externalStateScriptName,
 } from '../src/platform-resources.js';
-import { provisionDeployment } from '../src/provision.js';
+import {
+  assertPlatformDurableObjectHistory,
+  forceDecommissionDeployment,
+  provisionDeployment,
+} from '../src/provision.js';
 import { deploymentSpecDigest } from '../src/spec-digest.js';
+import { D1FleetStateStore } from '../src/state-store.js';
 import type {
   ApplicationR2Binding,
   ApplicationR2BucketSnapshot,
@@ -35,11 +47,13 @@ import type {
   ExternalMutationFence,
   ExternalPlatformProfile,
   ExternalPlatformResources,
+  ExternalReleaseSnapshot,
   FleetRecord,
   FleetStateLease,
   FleetStateStore,
   PromotionGuard,
 } from '../src/types.js';
+import { validateDeploymentSpec } from '../src/validation.js';
 import {
   externalReleaseScriptName,
   type WorkersForPlatformsApi,
@@ -47,6 +61,7 @@ import {
 } from '../src/workers-for-platforms-backend.js';
 import { decommissionAdvancingRecordFixture } from './fixtures/decommission-intent-fixture.js';
 import { D1State } from './fixtures/provider-world.js';
+import { createWfpMaintenanceHarness } from './fixtures/wfp-maintenance-harness.js';
 
 const deployment: DeploymentSpec = {
   tenantTag: 'acme',
@@ -651,6 +666,7 @@ class FakeApi implements WorkersForPlatformsApi {
     physicalScriptName?: string,
     resources?: ExternalPlatformResources,
     application?: import('../src/types.js').ApplicationBindingTopology,
+    maintenanceCapabilityPublicKey?: string,
   ): Promise<{ artifactVersion: string }> {
     this.calls.push('upload');
     this.uploadedScriptNames.push(physicalScriptName ?? 'missing');
@@ -690,9 +706,20 @@ class FakeApi implements WorkersForPlatformsApi {
               ]
             : []),
         secretNames: this.dispatchSecretNames.get(scriptName) ?? [],
-        plainTextBindings: Object.fromEntries(
-          (application?.vars ?? []).map(({ name, value }) => [name, value]),
-        ),
+        plainTextBindings: {
+          ...Object.fromEntries(
+            (application?.vars ?? []).map(({ name, value }) => [name, value]),
+          ),
+          ...(maintenanceCapabilityPublicKey === undefined
+            ? {}
+            : {
+                FLEET_MAINTENANCE_CAPABILITIES: 'required',
+                FLEET_MAINTENANCE_CAPABILITY_PUBLIC_KEY:
+                  maintenanceCapabilityPublicKey,
+                FLEET_DEPLOYMENT_SCRIPT: scriptName,
+                FLEET_RESOURCE_ROLE: 'platform-catalog',
+              }),
+        },
         r2BucketBindings: application?.r2Buckets ?? [],
         tenantTag: spec.tenantTag,
         environment: spec.environment,
@@ -1055,6 +1082,939 @@ async function attestedHealthResponse(
 }
 
 describe('WorkersForPlatformsBackend', () => {
+  it.each([
+    'alias',
+    'class',
+    'service',
+    'queue',
+  ] as const)('uploads a valid mutable catalog binding change (%s)', async (change) => {
+    const prior: DeploymentSpec = {
+      ...deployment,
+      authoredBy: 'platform',
+      durableObjectMigrations: [
+        { tag: 'v1', newSqliteClasses: ['Maintenance'] },
+      ],
+      durableObjectBindings: [
+        { name: 'MAINTENANCE', className: 'Maintenance' },
+      ],
+    };
+    const target: DeploymentSpec = {
+      ...prior,
+      previousDurableObjectTag: 'v1',
+      ...(change === 'alias'
+        ? {
+            durableObjectBindings: [
+              ...prior.durableObjectBindings,
+              { name: 'ALIAS', className: 'Maintenance' },
+            ],
+          }
+        : {}),
+      ...(change === 'class'
+        ? {
+            durableObjectMigrations: [
+              ...prior.durableObjectMigrations,
+              { tag: 'v2', newSqliteClasses: ['Additional'] },
+            ],
+            durableObjectBindings: [
+              ...prior.durableObjectBindings,
+              { name: 'ADDITIONAL', className: 'Additional' },
+            ],
+          }
+        : {}),
+      ...(change === 'service' ? { egressProxyService: 'catalog-egress' } : {}),
+      ...(change === 'queue'
+        ? { queueProducer: { binding: 'EVENTS', queueName: 'catalog-events' } }
+        : {}),
+    };
+    validateDeploymentSpec(target);
+    assertPlatformDurableObjectHistory(
+      {
+        durableObjectTag: 'v1',
+        durableObjectMigrationHistory: prior.durableObjectMigrations,
+        durableObjectMigrationHistoryDigest:
+          durableObjectMigrationHistoryDigest(prior.durableObjectMigrations),
+      },
+      target,
+    );
+    const client = new FakeApi();
+    client.exists = false;
+    const backend = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client,
+      hostRoutingKvId: 'host-routes',
+      platformProfileFor: () => platformProfile(),
+    });
+    const database = {
+      id: 'db-acme',
+      name: prior.databaseName,
+      created: false,
+    };
+    await backend.deployWorker(prior, database, secrets, undefined, fence);
+    await backend.deployWorker(target, database, secrets, undefined, fence);
+    expect(client.uploadedScriptNames).toHaveLength(2);
+    const live = client.dispatchWorkers.get(prior.scriptName);
+    expect(live?.desiredSpecDigest).toBe(deploymentSpecDigest(target));
+    expect(live?.durableObjectBindings.map(({ name }) => name)).toEqual(
+      target.durableObjectBindings.map(({ name }) => name),
+    );
+    expect(live?.serviceBindings ?? []).toEqual(
+      change === 'service'
+        ? [{ name: 'EGRESS_PROXY', service: 'catalog-egress' }]
+        : [],
+    );
+    expect(live?.queueProducerBindings ?? []).toEqual(
+      change === 'queue'
+        ? [{ name: 'EVENTS', queueName: 'catalog-events' }]
+        : [],
+    );
+  });
+
+  it('checks catalog residuals without claiming derived external state', async () => {
+    const catalog: DeploymentSpec = { ...deployment, authoredBy: 'platform' };
+    const database = {
+      id: 'db-acme',
+      name: catalog.databaseName,
+      created: false,
+    };
+    const record: FleetRecord = {
+      tenantTag: catalog.tenantTag,
+      environment: catalog.environment,
+      backend: 'workers-for-platforms',
+      wfpMode: 'platform-catalog',
+      scriptName: catalog.scriptName,
+      databaseId: database.id,
+      databaseName: database.name,
+      schemaVersion: catalog.schemaVersion,
+      artifactVersion: 'catalog-v1',
+      desiredSpecDigest: deploymentSpecDigest(catalog),
+      durableObjectBindings: [
+        {
+          name: 'MAINTENANCE',
+          className: 'Maintenance',
+          namespaceId: 'known-local',
+        },
+      ],
+      routeHostname: catalog.routeHostname,
+      phase: 'database-deleting',
+      updatedAt: '2026-09-10T00:00:00.000Z',
+      outboundPolicy: canonicalDeploymentEgressPolicy({
+        policyId: externalPlatformResourceGroupId(catalog),
+        tenantTag: catalog.tenantTag,
+        environment: catalog.environment,
+        allowedHosts: [],
+      }),
+    };
+    const client = new FakeApi();
+    client.exists = false;
+    const events: string[] = [];
+    client.residualEvents = events;
+    const foreign = completeProviderBindingInspection({
+      artifactVersion: 'foreign-v1',
+      databaseIds: ['other-db'],
+      durableObjectBindings: [],
+      serviceBindings: [],
+      kvNamespaceBindings: [],
+      secretNames: [],
+      plainTextBindings: {},
+      workersDevEnabled: false,
+      previewUrlsEnabled: false,
+      routeHostnames: [],
+      zoneRoutes: [],
+    });
+    const stateName = externalStateScriptName(catalog);
+    const proxyName = externalEgressProxyScriptName(catalog);
+    client.controlWorkers.set(stateName, foreign);
+    client.controlWorkers.set(proxyName, foreign);
+    client.namespaceIdsByScript.set(stateName, new Set(['foreign-namespace']));
+    const backend = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client,
+      hostRoutingKvId: 'host-routes',
+    });
+    for (const method of [
+      'assertDatabaseDetached',
+      'assertDatabaseDeletionResidualsRemoved',
+    ] as const) {
+      await expect(
+        backend[method](catalog, record, database, fence),
+      ).resolves.toBeUndefined();
+      client.namespaceIdsByScript.set(
+        catalog.scriptName,
+        new Set(['unrecorded-local']),
+      );
+      await expect(
+        backend[method](catalog, record, database, fence),
+      ).rejects.toThrow("namespace 'unrecorded-local' remains");
+      client.namespaceIdsByScript.delete(catalog.scriptName);
+      client.remainingNamespaceIds.add('known-local');
+      await expect(
+        backend[method](catalog, record, database, fence),
+      ).rejects.toThrow("namespace 'known-local' remains");
+      client.remainingNamespaceIds.clear();
+      await expect(
+        backend[method](deployment, record, database, fence),
+      ).rejects.toThrow('different deployment');
+    }
+    expect(events).not.toContain(`control:${stateName}`);
+    expect(events).not.toContain(`control:${proxyName}`);
+    expect(events).not.toContain(`namespaces:${stateName}`);
+    expect(client.controlWorkers.get(stateName)).toEqual(foreign);
+    expect(client.namespaceIdsByScript.get(stateName)).toEqual(
+      new Set(['foreign-namespace']),
+    );
+    const before = [...events];
+    await expect(
+      backend.deletePlatformResources(catalog, record, database, fence),
+    ).rejects.toThrow('external deployment');
+    await expect(
+      backend.revokePlatformResourceCredentials(
+        catalog,
+        record,
+        database,
+        fence,
+      ),
+    ).rejects.toThrow('external deployment');
+    expect(events).toEqual(before);
+  });
+
+  it.each([
+    'prior',
+    'candidate',
+    'unrecorded',
+  ] as const)('checks catalog teardown against recorded active and pending artifacts (%s)', async (observed) => {
+    const prior: DeploymentSpec = { ...deployment, authoredBy: 'platform' };
+    const target: DeploymentSpec = { ...prior, schemaVersion: 2 };
+    const active: ExternalReleaseSnapshot = {
+      physicalScriptName: prior.scriptName,
+      specDigest: deploymentSpecDigest(prior),
+      artifactVersion: 'catalog-v1',
+      releaseSchemaVersion: 1,
+    };
+    const pending: ExternalReleaseSnapshot = {
+      physicalScriptName: prior.scriptName,
+      specDigest: deploymentSpecDigest(target),
+      artifactVersion: 'catalog-v2',
+      releaseSchemaVersion: 2,
+    };
+    for (const operation of [
+      'removeTraffic',
+      'revokeCredentials',
+      'deleteWorker',
+    ] as const) {
+      const client = new FakeApi();
+      const selected = observed === 'prior' ? active : pending;
+      client.dispatchWorkers.set(
+        prior.scriptName,
+        completeProviderBindingInspection({
+          tenantTag: prior.tenantTag,
+          environment: prior.environment,
+          artifactVersion:
+            observed === 'unrecorded' ? 'catalog-v3' : selected.artifactVersion,
+          desiredSpecDigest: selected.specDigest,
+          schemaVersion: selected.releaseSchemaVersion,
+          databaseIds: ['db-acme'],
+          durableObjectBindings: [],
+          secretNames: [],
+          plainTextBindings: {},
+        }),
+      );
+      const backend = new WorkersForPlatformsBackend({
+        namespacedState: NAMESPACED_STATE,
+        client,
+        hostRoutingKvId: 'host-routes',
+      });
+      const database = {
+        id: 'db-acme',
+        name: prior.databaseName,
+        created: false,
+      };
+      const result =
+        operation === 'deleteWorker'
+          ? backend.deleteWorker(target, [pending], database, active, fence)
+          : backend[operation](target, [pending], active, database, fence);
+      if (observed === 'unrecorded') {
+        await expect(result).rejects.toThrow(
+          'owned by another build or deployment',
+        );
+        expect(client.calls).toEqual([]);
+      } else await expect(result).resolves.toBeUndefined();
+    }
+  });
+
+  it.each([
+    'ready',
+    'before-candidate',
+    'after-candidate',
+  ] as const)('enrolls a legacy catalog under its native Fleet lease and decommissions from %s', async (boundary) => {
+    const catalog: DeploymentSpec = {
+      ...deployment,
+      authoredBy: 'platform',
+      durableObjectBindings: [
+        { name: 'RUNNER', className: 'Runner' },
+        { name: 'MAINTENANCE', className: 'Maintenance' },
+      ],
+      durableObjectMigrations: [
+        { tag: 'v1', newSqliteClasses: ['Runner', 'Maintenance'] },
+      ],
+    };
+    const target: DeploymentSpec = {
+      ...catalog,
+      previousDurableObjectTag: 'v1',
+      modules: [
+        { name: 'worker.js', content: 'export default { fetch() {} }' },
+      ],
+    };
+    const native = await createWfpMaintenanceHarness({
+      catalog,
+      external: deployment,
+      secrets,
+      publicKey: MAINTENANCE_CAPABILITY_PUBLIC_KEY,
+    });
+    try {
+      const client = new FakeApi();
+      client.exists = false;
+      const databaseId = '00000000-0000-0000-0000-000000000041';
+      const createDatabase = client.createDatabase.bind(client);
+      client.createDatabase = async () => {
+        const created = await createDatabase();
+        client.database = { ...created, id: databaseId, created: false };
+        return { ...created, id: databaseId };
+      };
+      client.getDatabase = async (id) => {
+        client.databaseIdsRead.push(id);
+        return client.database?.id === id ? client.database : undefined;
+      };
+      const exportBytes = new TextEncoder().encode(
+        '-- fixture database export\nSELECT 1;\n',
+      );
+      const exportSha256 = createHash('sha256')
+        .update(exportBytes)
+        .digest('hex');
+      const exports = await native.exportBucket();
+      const receiptKeys: string[] = [];
+      const lifecycleClient = Object.assign(client, {
+        databaseExportReceiptAuthority: RECEIPT_AUTHORITY,
+        async exportDatabaseReceipt(
+          identity: DatabaseExportReceiptIdentity,
+        ): Promise<DatabaseExport> {
+          expect(identity).toMatchObject({
+            authority: RECEIPT_AUTHORITY,
+            databaseId,
+          });
+          expect(client.database).toBeDefined();
+          client.calls.push('export-receipt');
+          const key = `receipts/v1/${identity.databaseId}/${identity.operationId}.sql`;
+          await exports.put(key, exportBytes);
+          receiptKeys.push(key);
+          return {
+            databaseId,
+            location: `r2://fleet-exports/${key}`,
+            size: exportBytes.byteLength,
+            sha256: exportSha256,
+          };
+        },
+        async advanceDecommissionAttachmentScan(
+          input: DecommissionAttachmentScanInput,
+        ): Promise<DecommissionAttachmentScanResult> {
+          expect(input.progress.target).toEqual({ kind: 'd1', databaseId });
+          const ordinary = [...client.controlWorkers.values()].filter(
+            (value) => value !== undefined,
+          );
+          const dispatched = [...client.dispatchWorkers.values()];
+          expect(
+            [...ordinary, ...dispatched].some((value) =>
+              value.databaseIds.includes(databaseId),
+            ),
+          ).toBe(false);
+          expect(client.databaseAttachments).toEqual([]);
+          return {
+            status: 'complete',
+            evidenceSha256: createHash('sha256')
+              .update(JSON.stringify({ ordinary, dispatched }))
+              .digest('hex'),
+            evidenceCount: 2 + ordinary.length + dispatched.length,
+            providerFetchAttemptsReserved: 0,
+          };
+        },
+        async deleteDatabase(id: string) {
+          expect(id).toBe(databaseId);
+          expect(receiptKeys).toHaveLength(1);
+          expect(await exports.get(receiptKeys[0] ?? '')).not.toBeNull();
+          client.calls.push('delete-db');
+          client.database = undefined;
+        },
+      });
+      let failEnsure = false;
+      const backend = new WorkersForPlatformsBackend({
+        namespacedState: NAMESPACED_STATE,
+        client: lifecycleClient,
+        fetch: async (input, init) => {
+          if (failEnsure && String(input).endsWith('/ensure-maintenance')) {
+            failEnsure = false;
+            throw new Error('fixture interruption after candidate');
+          }
+          return native.fetch(input, init);
+        },
+        hostRoutingKvId: 'host-routes',
+        platformProfileFor: () => platformProfile(),
+      });
+      const store = new D1FleetStateStore(
+        new D1FleetStateDatabase(await native.fleetDatabase()),
+        {
+          accountId: 'wfp-native',
+          leaseTtlMs: 60_000,
+          leaseRenewalIntervalMs: 20_000,
+        },
+      );
+      await store.get(catalog.tenantTag, catalog.environment);
+      const fleetDb = await native.fleetDatabase();
+      await fleetDb.exec(
+        'CREATE TABLE fixture_first_catalog_claims (phase TEXT, mode TEXT, resource_type TEXT, resource_name TEXT, resource_role TEXT)',
+      );
+      await fleetDb.exec(
+        "CREATE TRIGGER capture_first_catalog_claim AFTER INSERT ON anchorage_fleet_deployments BEGIN INSERT INTO fixture_first_catalog_claims SELECT NEW.phase,NEW.wfp_mode,resource_type,resource_name,resource_role FROM anchorage_platform_plane_claims WHERE account_id='wfp-native' AND resource_set_key='deployment:acme:production'; END",
+      );
+      const initial = await provisionDeployment({
+        backend,
+        store,
+        spec: catalog,
+        secrets,
+        initialExecutionFenceState: 'open',
+      });
+      expect(initial.record.phase).toBe('ready');
+      expect(initial.record.wfpMode).toBe('platform-catalog');
+      expect(client.lastPromotedRoute).not.toHaveProperty('stateEgress');
+      await fleetDb
+        .prepare(
+          'UPDATE anchorage_fleet_deployments SET wfp_mode=? WHERE tenant_tag=? AND environment=?',
+        )
+        .bind('unknown-mode', catalog.tenantTag, catalog.environment)
+        .run();
+      try {
+        await expect(
+          store.get(catalog.tenantTag, catalog.environment),
+        ).rejects.toThrow('invalid wfp_mode');
+      } finally {
+        await fleetDb
+          .prepare(
+            'UPDATE anchorage_fleet_deployments SET wfp_mode=? WHERE tenant_tag=? AND environment=?',
+          )
+          .bind('platform-catalog', catalog.tenantTag, catalog.environment)
+          .run();
+      }
+      expect(
+        (
+          await fleetDb
+            .prepare('SELECT * FROM fixture_first_catalog_claims')
+            .all()
+        ).results,
+      ).toEqual([
+        {
+          phase: 'database-reserved',
+          mode: 'platform-catalog',
+          resource_type: 'dispatch-script',
+          resource_name: catalog.scriptName,
+          resource_role: 'deployment-worker',
+        },
+      ]);
+      const claimRows = async () =>
+        (
+          await fleetDb
+            .prepare(
+              "SELECT resource_type,resource_name,resource_role,resource_set_key,platform_plane_identity FROM anchorage_platform_plane_claims WHERE account_id='wfp-native'",
+            )
+            .all()
+        ).results;
+      const claims = await claimRows();
+      const { wfpMode: _mode, ...lostMode } = initial.record;
+      await expect(
+        store.withDeploymentLease(
+          catalog.tenantTag,
+          catalog.environment,
+          (lease) => lease.put({ ...lostMode, phase: 'identity-seeded' }),
+        ),
+      ).rejects.toThrow();
+      expect(await store.get(catalog.tenantTag, catalog.environment)).toEqual(
+        initial.record,
+      );
+      expect(await claimRows()).toEqual(claims);
+      await expect(
+        store.withDeploymentLease(
+          catalog.tenantTag,
+          catalog.environment,
+          (lease) => lease.put({ ...initial.record, backend: 'plain-worker' }),
+        ),
+      ).rejects.toThrow('wfp_mode');
+      await expect(
+        store.withDeploymentLease(
+          catalog.tenantTag,
+          catalog.environment,
+          (lease) => lease.put({ ...initial.record, platformResources }),
+        ),
+      ).rejects.toThrow('wfp_mode');
+      const installed = client.dispatchWorkers.get(catalog.scriptName);
+      if (!installed) throw new Error('catalog upload is missing');
+      client.dispatchWorkers.set(catalog.scriptName, {
+        ...installed,
+        plainTextBindings: {},
+      });
+      await native.updateCatalog(catalog, false);
+      await expect(
+        backend.inspect(catalog, secrets.maintenanceAdmin),
+      ).rejects.toThrow('signed maintenance enrollment');
+      expect(
+        (
+          await native.catalogFetch(
+            new Request('https://catalog.test/admin/maintenance-status', {
+              headers: { authorization: `Bearer ${secrets.maintenanceAdmin}` },
+            }),
+          )
+        ).status,
+      ).toBe(200);
+      const uploads = client.uploadedScriptNames.length;
+      const upload = client.uploadDispatchWorker.bind(client);
+      client.uploadDispatchWorker = async (
+        ...args: Parameters<WorkersForPlatformsApi['uploadDispatchWorker']>
+      ) => {
+        await upload(...args);
+        await native.updateCatalog(target);
+        const current = client.dispatchWorkers.get(catalog.scriptName);
+        if (!current) throw new Error('enrolled provider snapshot is missing');
+        client.dispatchWorkers.set(catalog.scriptName, {
+          ...current,
+          artifactVersion: 'catalog-v2',
+        });
+        return { artifactVersion: 'catalog-v2' };
+      };
+      await store.withDeploymentLease(
+        catalog.tenantTag,
+        catalog.environment,
+        async (lease) => {
+          const owned = await store.get(catalog.tenantTag, catalog.environment);
+          expect(owned).toEqual(initial.record);
+          if (!owned) throw new Error('owned catalog record is missing');
+          const uploaded = await backend.deployWorker(
+            target,
+            { id: owned.databaseId, name: owned.databaseName, created: false },
+            secrets,
+            undefined,
+            lease,
+            undefined,
+            owned.applicationBindings,
+          );
+          expect(uploaded.artifactVersion).toBe('catalog-v2');
+          expect(
+            await store.get(catalog.tenantTag, catalog.environment),
+          ).toEqual(initial.record);
+        },
+      );
+      const [migrated] = await migrateFleet({
+        store,
+        records: [initial.record],
+        canaryTenantTags: [],
+        backendFor: () => backend,
+        specFor: () => target,
+        secretsFor: () => secrets,
+      });
+      expect(migrated).toMatchObject({
+        phase: 'ready',
+        wfpMode: 'platform-catalog',
+        desiredSpecDigest: deploymentSpecDigest(target),
+        artifactVersion: 'catalog-v2',
+        databaseId: initial.record.databaseId,
+        durableObjectBindings: initial.record.durableObjectBindings,
+        applicationResources: initial.record.applicationResources,
+      });
+      expect(client.uploadedScriptNames).toHaveLength(uploads + 1);
+      expect(await store.get(catalog.tenantTag, catalog.environment)).toEqual(
+        migrated,
+      );
+      await expect(
+        forceDecommissionDeployment({
+          backend,
+          store,
+          tenantTag: catalog.tenantTag,
+          environment: catalog.environment,
+        }),
+      ).rejects.toThrow('does not support spec-free force decommission');
+      expect(await store.get(catalog.tenantTag, catalog.environment)).toEqual(
+        migrated,
+      );
+      let teardownSpec = target;
+      if (boundary !== 'ready') {
+        teardownSpec = {
+          ...target,
+          schemaVersion: 2,
+          migrations: [
+            ...target.migrations,
+            {
+              version: 2,
+              sql: 'ALTER TABLE example ADD COLUMN value TEXT',
+              rollbackCompatible: true,
+            },
+          ],
+          modules: [
+            {
+              name: 'worker.js',
+              content:
+                'export default { fetch() { return new Response("third"); } }',
+            },
+          ],
+        };
+        client.uploadDispatchWorker = async (
+          ...args: Parameters<WorkersForPlatformsApi['uploadDispatchWorker']>
+        ) => {
+          if (boundary === 'before-candidate')
+            throw new Error('fixture interruption before candidate');
+          await upload(...args);
+          await native.updateCatalog(teardownSpec);
+          const current = client.dispatchWorkers.get(catalog.scriptName);
+          if (!current)
+            throw new Error('third catalog provider snapshot is missing');
+          client.dispatchWorkers.set(catalog.scriptName, {
+            ...current,
+            artifactVersion: 'catalog-v3',
+          });
+          return { artifactVersion: 'catalog-v3' };
+        };
+        failEnsure = boundary === 'after-candidate';
+        if (!migrated) throw new Error('migrated record is missing');
+        await expect(
+          migrateFleet({
+            store,
+            records: [migrated],
+            canaryTenantTags: [],
+            backendFor: () => backend,
+            specFor: () => teardownSpec,
+            secretsFor: () => secrets,
+          }),
+        ).rejects.toThrow('fixture interruption');
+        const interrupted = await store.get(
+          catalog.tenantTag,
+          catalog.environment,
+        );
+        expect(interrupted).toMatchObject({
+          phase: 'migrating',
+          schemaVersion: 2,
+          wfpMode: 'platform-catalog',
+          pendingSpecDigest: deploymentSpecDigest(teardownSpec),
+          activeRelease: {
+            artifactVersion: 'catalog-v2',
+            specDigest: deploymentSpecDigest(target),
+            releaseSchemaVersion: 1,
+          },
+        });
+        expect(interrupted?.pendingArtifactVersion).toBe(
+          boundary === 'after-candidate' ? 'catalog-v3' : undefined,
+        );
+      }
+      const removePlatform = vi.spyOn(backend, 'deletePlatformResources');
+      const revokePlatform = vi.spyOn(
+        backend,
+        'revokePlatformResourceCredentials',
+      );
+      const events: string[] = [];
+      client.residualEvents = events;
+      let result = await advanceDecommissionDeployment({
+        backend,
+        store,
+        spec: teardownSpec,
+        action: { kind: 'start' },
+        maxProviderRequests: 9,
+        randomUUID,
+      });
+      for (let count = 0; result.status === 'pending' && count < 80; count++)
+        result = await advanceDecommissionDeployment({
+          backend,
+          store,
+          spec: teardownSpec,
+          action: { kind: 'continue', token: result.token },
+          maxProviderRequests: 9,
+          randomUUID,
+        });
+      expect(result.status).toBe('complete');
+      expect(removePlatform).not.toHaveBeenCalled();
+      expect(revokePlatform).not.toHaveBeenCalled();
+      expect(events).toContain(`namespaces:${catalog.scriptName}`);
+      expect(events).not.toContain(
+        `control:${externalStateScriptName(catalog)}`,
+      );
+      expect(events).not.toContain(
+        `control:${externalEgressProxyScriptName(catalog)}`,
+      );
+      expect(client.calls.indexOf('export-receipt')).toBeLessThan(
+        client.calls.indexOf('delete-db'),
+      );
+      expect(receiptKeys).toHaveLength(1);
+      const exported = await exports.get(receiptKeys[0] ?? '');
+      if (!exported) throw new Error('fixture database export is missing');
+      expect(new Uint8Array(await exported.arrayBuffer())).toEqual(exportBytes);
+      expect(
+        await store.get(catalog.tenantTag, catalog.environment),
+      ).toMatchObject({
+        phase: 'decommissioned',
+        wfpMode: 'platform-catalog',
+        databaseExportSha256: exportSha256,
+        databaseExportSize: exportBytes.byteLength,
+      });
+      expect(await claimRows()).toEqual(claims);
+      await forceDecommissionDeployment({
+        backend,
+        store,
+        tenantTag: catalog.tenantTag,
+        environment: catalog.environment,
+      });
+      expect(
+        await store.get(catalog.tenantTag, catalog.environment),
+      ).toBeUndefined();
+      expect(await claimRows()).toEqual([]);
+    } finally {
+      await native.close();
+    }
+  }, 120_000);
+
+  it('uses the real dispatcher, native catalog and external-state Maintenance for signed health', async () => {
+    const catalog: DeploymentSpec = { ...deployment, authoredBy: 'platform' };
+    const native = await createWfpMaintenanceHarness({
+      catalog,
+      external: deployment,
+      secrets,
+      publicKey: MAINTENANCE_CAPABILITY_PUBLIC_KEY,
+    });
+    try {
+      const client = new FakeApi();
+      await client.putDispatchSecrets(catalog.scriptName, secrets, {
+        includeMaintenanceAdmin: true,
+      });
+      await client.uploadDispatchWorker(
+        catalog,
+        { id: 'db-acme', name: catalog.databaseName, created: false },
+        catalog.scriptName,
+        undefined,
+        undefined,
+        MAINTENANCE_CAPABILITY_PUBLIC_KEY,
+      );
+      const options = {
+        namespacedState: NAMESPACED_STATE,
+        client,
+        fetch: native.fetch,
+        hostRoutingKvId: 'host-routes',
+        platformProfileFor: () => platformProfile(),
+      };
+      const backend = new WorkersForPlatformsBackend(options);
+      const health = await backend.ensureMaintenance(
+        catalog,
+        secrets.maintenanceAdmin,
+        fence,
+        'etag-v1',
+      );
+      expect(health.armed).toBe(true);
+      const ensured = native.requests.at(-1);
+      if (!ensured) throw new Error('native ensure request is missing');
+      expect((await native.fetch(ensured.clone())).status).toBe(401);
+      const live = await backend.inspect(
+        catalog,
+        secrets.maintenanceAdmin,
+        'etag-v1',
+      );
+      expect(live?.maintenance).toMatchObject({
+        armed: true,
+        deploymentSpecDigest: deploymentSpecDigest(catalog),
+      });
+      const status = native.requests.at(-1);
+      if (!status) throw new Error('native status request is missing');
+      expect((await native.fetch(status.clone())).status).toBe(200);
+      expect((await native.fetch(status.clone())).status).toBe(200);
+
+      const wrong = await mintAsymmetricMaintenanceCapability({
+        privateKey: MAINTENANCE_CAPABILITY_PRIVATE_KEY,
+        operation: 'ensure-maintenance',
+        tenantTag: catalog.tenantTag,
+        environment: catalog.environment,
+        scriptName: catalog.scriptName,
+        specDigest: 'f'.repeat(64),
+        nonce: 'DDDDDDDDDDDDDDDDDDDDDD',
+      });
+      const local = (token: string) =>
+        new Request('https://catalog.test/admin/ensure-maintenance', {
+          method: 'POST',
+          headers: { authorization: `Bearer ${token}` },
+        });
+      expect((await native.catalogFetch(local(wrong.token))).status).toBe(401);
+      const valid = await mintAsymmetricMaintenanceCapability({
+        privateKey: MAINTENANCE_CAPABILITY_PRIVATE_KEY,
+        operation: 'ensure-maintenance',
+        tenantTag: catalog.tenantTag,
+        environment: catalog.environment,
+        scriptName: catalog.scriptName,
+        specDigest: deploymentSpecDigest(catalog),
+        nonce: wrong.claims.nonce,
+      });
+      expect((await native.catalogFetch(local(valid.token))).status).toBe(200);
+      expect((await native.catalogFetch(local(valid.token))).status).toBe(401);
+      expect(
+        (await native.catalogFetch(local(secrets.maintenanceAdmin))).status,
+      ).toBe(401);
+      expect(
+        (
+          await native.catalogFetch(
+            new Request('https://catalog.test/admin/execution-fence', {
+              headers: { authorization: `Bearer ${valid.token}` },
+            }),
+          )
+        ).status,
+      ).toBe(401);
+      expect(
+        (
+          await native.catalogFetch(
+            new Request('https://catalog.test/admin/execution-fence', {
+              headers: { authorization: `Bearer ${secrets.maintenanceAdmin}` },
+            }),
+          )
+        ).status,
+      ).toBe(200);
+
+      const externalClient = new FakeApi();
+      const external = new WorkersForPlatformsBackend({
+        ...options,
+        client: externalClient,
+      });
+      expect(
+        await external.ensureMaintenance(
+          deployment,
+          secrets.maintenanceAdmin,
+          fence,
+          'etag-v1',
+        ),
+      ).toMatchObject({
+        armed: true,
+        deploymentSpecDigest: deploymentSpecDigest(deployment),
+      });
+      expect(
+        (await external.inspect(deployment, secrets.maintenanceAdmin))
+          ?.maintenance.armed,
+      ).toBe(true);
+
+      const unsignedBody = new WorkersForPlatformsBackend({
+        ...options,
+        fetch: async (input, init) => {
+          const response = await native.fetch(input, init);
+          await response.arrayBuffer();
+          return Response.json(
+            { alarmAt: null },
+            { headers: response.headers },
+          );
+        },
+      });
+      expect(
+        (await unsignedBody.inspect(catalog, secrets.maintenanceAdmin))
+          ?.maintenance.armed,
+      ).toBe(true);
+      const missingReceipt = new WorkersForPlatformsBackend({
+        ...options,
+        fetch: async (input, init) => {
+          const response = await native.fetch(input, init);
+          const headers = new Headers(response.headers);
+          headers.delete(MAINTENANCE_RECEIPT_HEADER);
+          return new Response(await response.arrayBuffer(), {
+            status: response.status,
+            headers,
+          });
+        },
+      });
+      await expect(
+        missingReceipt.inspect(catalog, secrets.maintenanceAdmin),
+      ).rejects.toThrow('does not match dispatch Worker');
+      expect(native.calls.map(({ scriptName }) => scriptName)).toContain(
+        externalReleaseScriptName(deployment),
+      );
+      expect(native.calls[0]?.options).toMatchObject({
+        limits: { cpuMs: 1000, subRequests: 50 },
+      });
+    } finally {
+      await native.close();
+    }
+  }, 90_000);
+
+  it.each([
+    'current',
+    'changed',
+  ] as const)('inspects signed mutable catalog health when the requested spec is %s', async (selection) => {
+    const current: DeploymentSpec = { ...deployment, authoredBy: 'platform' };
+    const requested =
+      selection === 'current'
+        ? current
+        : {
+            ...current,
+            modules: [
+              { name: 'worker.js', content: 'export default { fetch() {} }' },
+            ],
+          };
+    const client = new FakeApi();
+    client.dispatchWorkers.set(current.scriptName, {
+      artifactVersion: 'catalog-v1',
+      databaseIds: ['db-acme'],
+      durableObjectBindings: [],
+      secretNames: ['DEPLOYMENT_IDENTITY_SECRET', 'MAINTENANCE_ADMIN_SECRET'],
+      tenantTag: current.tenantTag,
+      environment: current.environment,
+      schemaVersion: current.schemaVersion,
+      desiredSpecDigest: deploymentSpecDigest(current),
+      plainTextBindings: {
+        FLEET_MAINTENANCE_CAPABILITIES: 'required',
+        FLEET_MAINTENANCE_CAPABILITY_PUBLIC_KEY:
+          MAINTENANCE_CAPABILITY_PUBLIC_KEY,
+        FLEET_DEPLOYMENT_SCRIPT: current.scriptName,
+        FLEET_RESOURCE_ROLE: 'platform-catalog',
+      },
+      providerBindingIdentities: [],
+    });
+    const request = vi.fn(attestedHealthResponse);
+    const backend = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client,
+      fetch: request,
+      hostRoutingKvId: 'host-routes',
+      platformProfileFor: () => ({
+        maintenanceCapabilityPublicKey: MAINTENANCE_CAPABILITY_PUBLIC_KEY,
+        maintenanceCapabilityPrivateKey: MAINTENANCE_CAPABILITY_PRIVATE_KEY,
+      }),
+    });
+    expect(
+      await backend.inspect(requested, secrets.maintenanceAdmin),
+    ).toMatchObject({
+      artifactVersion: 'catalog-v1',
+      desiredSpecDigest: deploymentSpecDigest(current),
+      maintenance: {
+        armed: true,
+        deploymentSpecDigest: deploymentSpecDigest(current),
+      },
+    });
+    expect(String(request.mock.calls[0]?.[0])).toBe(
+      `https://control-acme.example.test/.well-known/anchorage/maintenance/acme/production/${current.scriptName}/${deploymentSpecDigest(current)}/maintenance-status`,
+    );
+    if (selection === 'current') {
+      expect(
+        await backend.ensureMaintenance(
+          requested,
+          secrets.maintenanceAdmin,
+          fence,
+          'catalog-v1',
+        ),
+      ).toMatchObject({ armed: true });
+    } else {
+      await expect(
+        backend.ensureMaintenance(
+          requested,
+          secrets.maintenanceAdmin,
+          fence,
+          'catalog-v1',
+        ),
+      ).rejects.toThrow('specification digest');
+      expect(request).toHaveBeenCalledOnce();
+    }
+  });
+
   it('exposes and forwards receipt export only for a capable WFP client', async () => {
     const absentClient = new FakeApi();
     const absent = new WorkersForPlatformsBackend({
@@ -2038,9 +2998,11 @@ describe('WorkersForPlatformsBackend', () => {
   });
 
   it.each([
-    'persisted',
-    'provider-committed',
-  ] as const)('deletes the exact %s trusted-resource variant after an interrupted migration', async (liveVariant) => {
+    ['persisted', false],
+    ['provider-committed', false],
+    ['persisted', true],
+    ['provider-committed', true],
+  ] as const)('deletes the exact %s trusted-resource variant after an interrupted migration (compatibility: %s)', async (liveVariant, compatibility) => {
     const client = new FakeApi();
     const initialSpec = {
       ...deployment,
@@ -2187,6 +3149,35 @@ describe('WorkersForPlatformsBackend', () => {
         ),
       ).rejects.toThrow(/drifted state Worker/u);
       expect(client.calls).not.toContain('revoke');
+    }
+
+    if (compatibility) {
+      teardownRecord = {
+        ...record,
+        desiredSpecDigest: targetRelease.specDigest,
+        phase: 'worker-deleted',
+      };
+      if (liveVariant === 'provider-committed') {
+        const intent = teardownRecord.migrationIntent;
+        if (!intent) throw new Error('missing retained migration authority');
+        await expect(
+          backend.revokePlatformResourceCredentials(
+            targetSpec,
+            {
+              ...teardownRecord,
+              migrationIntent: {
+                ...intent,
+                target: {
+                  ...intent.target,
+                  stateArtifactDigest: 'f'.repeat(64),
+                },
+              },
+            },
+            database,
+            fence,
+          ),
+        ).rejects.toThrow(/drifted state Worker/);
+      }
     }
 
     await expect(
@@ -2800,37 +3791,52 @@ describe('WorkersForPlatformsBackend', () => {
     expect(client.mutationFenceEntries).toBe(1);
   });
 
-  it('uses authenticated fixed maintenance endpoints', async () => {
+  it.each([
+    'injected',
+    'default',
+  ] as const)('uses authenticated fixed maintenance endpoints with %s fetch', async (selection) => {
     const fetch = vi.fn(attestedHealthResponse);
-    const backend = new WorkersForPlatformsBackend({
-      namespacedState: NAMESPACED_STATE,
-      client: new FakeApi(),
-      fetch,
-      hostRoutingKvId: 'host-routes',
-      platformProfileFor: () => platformProfile(),
-    });
+    if (selection === 'default') vi.stubGlobal('fetch', fetch);
+    try {
+      const backend = new WorkersForPlatformsBackend({
+        namespacedState: NAMESPACED_STATE,
+        client: new FakeApi(),
+        ...(selection === 'injected' ? { fetch } : {}),
+        hostRoutingKvId: 'host-routes',
+        platformProfileFor: () => platformProfile(),
+      });
 
-    await expect(
-      backend.ensureMaintenance(
-        deployment,
-        secrets.maintenanceAdmin,
-        fence,
-        'etag-v1',
-      ),
-    ).resolves.toMatchObject({ armed: true, nextAlarmAt: 2_000 });
-    await backend.inspect(deployment, secrets.maintenanceAdmin);
+      await expect(
+        backend.ensureMaintenance(
+          deployment,
+          secrets.maintenanceAdmin,
+          fence,
+          'etag-v1',
+        ),
+      ).resolves.toMatchObject({ armed: true, nextAlarmAt: 2_000 });
+      const live = await backend.inspect(deployment, secrets.maintenanceAdmin);
+      expect(live?.maintenance).toMatchObject({
+        armed: true,
+        nextAlarmAt: 2_000,
+      });
+      expect(
+        fetch.mock.contexts.map((context) => context === undefined),
+      ).toEqual([true, true]);
 
-    expect(String(fetch.mock.calls[0]?.[0])).toBe(
-      `https://control-acme.example.test/.well-known/anchorage/maintenance/acme/production/${externalReleaseScriptName(deployment)}/${deploymentSpecDigest(deployment)}/ensure-maintenance`,
-    );
-    expect(String(fetch.mock.calls[1]?.[0])).toBe(
-      `https://control-acme.example.test/.well-known/anchorage/maintenance/acme/production/${externalReleaseScriptName(deployment)}/${deploymentSpecDigest(deployment)}/maintenance-status`,
-    );
-    for (const [, init] of fetch.mock.calls) {
-      expect(new Headers(init?.headers).get('authorization')).toMatch(
-        /^Bearer ey/,
+      expect(String(fetch.mock.calls[0]?.[0])).toBe(
+        `https://control-acme.example.test/.well-known/anchorage/maintenance/acme/production/${externalReleaseScriptName(deployment)}/${deploymentSpecDigest(deployment)}/ensure-maintenance`,
       );
-      expect(init?.signal).toBeInstanceOf(AbortSignal);
+      expect(String(fetch.mock.calls[1]?.[0])).toBe(
+        `https://control-acme.example.test/.well-known/anchorage/maintenance/acme/production/${externalReleaseScriptName(deployment)}/${deploymentSpecDigest(deployment)}/maintenance-status`,
+      );
+      for (const [, init] of fetch.mock.calls) {
+        expect(new Headers(init?.headers).get('authorization')).toMatch(
+          /^Bearer ey/,
+        );
+        expect(init?.signal).toBeInstanceOf(AbortSignal);
+      }
+    } finally {
+      if (selection === 'default') vi.unstubAllGlobals();
     }
   });
 
@@ -2978,6 +3984,7 @@ describe('WorkersForPlatformsBackend', () => {
       namespacedState: NAMESPACED_STATE,
       client: api,
       hostRoutingKvId: 'host-routes',
+      platformProfileFor: () => platformProfile(),
     });
     await expect(
       backend.deployWorker(
@@ -3011,6 +4018,15 @@ describe('WorkersForPlatformsBackend', () => {
     expect(api.calls.slice(0, 3)).toEqual(['inventory', 'secrets', 'upload']);
     expect(api.dispatchSecretOptions.at(-1)).toEqual({
       includeMaintenanceAdmin: true,
+    });
+    expect(
+      api.dispatchWorkers.get(platform.scriptName)?.plainTextBindings,
+    ).toMatchObject({
+      FLEET_MAINTENANCE_CAPABILITIES: 'required',
+      FLEET_MAINTENANCE_CAPABILITY_PUBLIC_KEY:
+        MAINTENANCE_CAPABILITY_PUBLIC_KEY,
+      FLEET_DEPLOYMENT_SCRIPT: platform.scriptName,
+      FLEET_RESOURCE_ROLE: 'platform-catalog',
     });
   });
 

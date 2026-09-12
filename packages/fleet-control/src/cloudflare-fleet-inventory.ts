@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { createHash } from 'node:crypto';
-import { domainToASCII } from 'node:url';
 import {
   CLOUDFLARE_INVENTORY_BOUND,
   inventoryBoundExceeded,
@@ -350,15 +349,15 @@ function tagValue(tags: readonly string[], prefix: string): string | undefined {
   return tags.find((tag) => tag.startsWith(prefix))?.slice(prefix.length);
 }
 
-/**
- * Hostnames reach the durable controls as ASCII, while the finding detail keeps
- * today's exact bytes: an ASCII value is never rewritten, so only a genuine IDN
- * value is punycoded for validation.
- */
 function asciiHost(value: string): string {
   if (!NON_ASCII.test(value)) return value;
-  const ascii = domainToASCII(value);
-  return ascii === '' ? value : ascii;
+  const url = new URL('ws://x');
+  url.hostname = value;
+  if (url.hostname !== 'x') return url.hostname;
+  // A rejected assignment retains the old host; a second host distinguishes it from a valid x.
+  url.hostname = 'y';
+  url.hostname = value;
+  return url.hostname === 'x' ? 'x' : value;
 }
 
 function detailValue(value: string, field: string): string {
@@ -847,7 +846,11 @@ async function customDomains(
           CLOUDFLARE_INVENTORY_BOUND,
         );
       }
+      if (typeof domain.service !== 'string' || !domain.service)
+        throw new Error('custom domain inventory has an invalid service');
       if (domain.service.startsWith(context.options.scriptNamePrefix)) {
+        if (typeof domain.hostname !== 'string' || !domain.hostname)
+          throw new Error('custom domain inventory has an invalid hostname');
         matched.push({ hostname: domain.hostname, service: domain.service });
       }
     }
@@ -885,10 +888,21 @@ async function zoneRoutesForZone(
         );
       }
       if (
-        route.script?.startsWith(context.options.scriptNamePrefix) &&
-        route.id &&
-        route.pattern
-      ) {
+        route.script !== undefined &&
+        route.script !== null &&
+        typeof route.script !== 'string'
+      )
+        throw new Error('Worker zone-route inventory has an invalid script');
+      if (route.script?.startsWith(context.options.scriptNamePrefix)) {
+        if (
+          typeof route.id !== 'string' ||
+          !route.id ||
+          typeof route.pattern !== 'string' ||
+          !route.pattern
+        )
+          throw new Error(
+            'Worker zone-route inventory has an invalid ID or pattern',
+          );
         matched.push({
           zoneId,
           routeId: route.id,
@@ -935,7 +949,9 @@ async function ordinaryScriptNames(
       ...(context.signal ? { signal: context.signal } : {}),
     });
     for (const script of page.scripts) {
-      if (!script.id?.startsWith(context.options.scriptNamePrefix)) continue;
+      if (typeof script.id !== 'string' || !script.id)
+        throw new Error('ordinary Worker script inventory has an invalid ID');
+      if (!script.id.startsWith(context.options.scriptNamePrefix)) continue;
       matched.push(script.id);
       if (matched.length > CLOUDFLARE_INVENTORY_BOUND) {
         throw inventoryBoundExceeded(
@@ -1619,7 +1635,11 @@ async function advanceOrdinaryScripts(
     context.identity.observe([
       'ordinary-scripts',
       cursor ?? null,
-      page.scripts.map((script) => script.id ?? null),
+      page.scripts.map((script) => {
+        if (typeof script.id !== 'string' || !script.id)
+          throw new Error('ordinary Worker script inventory has an invalid ID');
+        return script.id;
+      }),
       page.cursor ?? null,
     ]);
     for (const script of page.scripts) {
@@ -1821,9 +1841,13 @@ async function advanceDatabases(
         );
       }
       if (
-        database.uuid &&
-        database.name?.startsWith(context.options.databaseNamePrefix)
-      ) {
+        typeof database.uuid !== 'string' ||
+        !database.uuid ||
+        typeof database.name !== 'string' ||
+        !database.name
+      )
+        throw new Error('D1 database inventory has an invalid uuid or name');
+      if (database.name.startsWith(context.options.databaseNamePrefix)) {
         context.sink.add('database-id', {
           record: 'database-id',
           databaseId: database.uuid,
@@ -1868,10 +1892,17 @@ async function advanceDurableObjectNamespaces(
         );
       }
       if (
-        namespace.id &&
-        namespace.script &&
-        (registeredScriptNames.has(namespace.script) ||
-          namespace.script.startsWith(context.options.scriptNamePrefix))
+        typeof namespace.id !== 'string' ||
+        namespace.id.length === 0 ||
+        typeof namespace.script !== 'string' ||
+        namespace.script.length === 0
+      )
+        throw new Error(
+          'Durable Object namespace inventory has incomplete identity or association',
+        );
+      if (
+        registeredScriptNames.has(namespace.script) ||
+        namespace.script.startsWith(context.options.scriptNamePrefix)
       ) {
         context.sink.add('namespace-id', {
           record: 'namespace-id',

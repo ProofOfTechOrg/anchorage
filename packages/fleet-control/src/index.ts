@@ -177,6 +177,7 @@ export type { HostRoutingTarget } from './host-routing.js';
 export {
   PlainWorkerBackend,
   type PlainWorkerBackendOptions,
+  plainWorkerIngressModule,
 } from './plain-worker-backend.js';
 export {
   type PlatformPlaneClient,
@@ -278,6 +279,7 @@ export {
   type InvocationAuthorityCarrier,
   type LiveDeployment,
   type MaintenanceHealth,
+  type MaintenanceSigningProfile,
   type NormalDecommissionLifecyclePhase,
   type ObservedActiveRoute,
   type PlainWorkerCleanupOutcome,

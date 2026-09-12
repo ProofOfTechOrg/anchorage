@@ -1,12 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// This module holds ordinary-Worker (plain-plane) provider operations that
-// CloudflareProvisioningClient calls through one-line forwards or directly.
-// Context-taking functions declare the slice of OrdinaryWorkerContext they
-// need; the preparation and migration helpers take no context.
-// Provider requests go through context.client, the client's SDK instance;
-// this module imports nothing from cloudflare-client.ts.
-
 import type Cloudflare from 'cloudflare';
 import type { ScriptUpdateParams } from 'cloudflare/resources/workers/scripts/scripts';
 import type { VersionCreateParams } from 'cloudflare/resources/workers/scripts/versions';
@@ -16,6 +9,7 @@ import {
   isNotFound,
   sanitizeProviderError,
 } from './cloudflare-provider-errors.js';
+import { namedWorkerUploadBody } from './cloudflare-worker-upload.js';
 import {
   readArrayField,
   readField,
@@ -53,11 +47,17 @@ export interface OrdinaryWorkerFootprint {
 
 export type CloudflareSdk = InstanceType<typeof Cloudflare>;
 type StagedOrdinaryWorkerUploadMetadata = VersionCreateParams.Metadata & {
-  readonly limits?: { readonly cpu_ms: number };
+  readonly limits?: {
+    readonly cpu_ms?: number;
+    readonly subrequests?: number;
+  };
 };
 type OrdinaryWorkerUploadMetadata =
   | (ScriptUpdateParams.Metadata & {
-      readonly limits?: { readonly cpu_ms: number };
+      readonly limits?: {
+        readonly cpu_ms?: number;
+        readonly subrequests?: number;
+      };
     })
   | StagedOrdinaryWorkerUploadMetadata;
 const PREPARED_ORDINARY_WORKER_UPLOAD: unique symbol = Symbol(
@@ -138,6 +138,8 @@ export function workerMigrations(
 export interface OrdinaryWorkerContext {
   readonly accountId: string;
   readonly client: CloudflareSdk;
+  readonly inventoryClient: CloudflareSdk;
+  readonly versionInventoryClient: CloudflareSdk;
   schedule<T>(operation: () => Promise<T>): Promise<T>;
   collectBounded<T>(
     iterable: AsyncIterable<T> | Iterable<T>,
@@ -156,7 +158,12 @@ type OrdinaryWorkerBaseContext = Pick<
 >;
 type OrdinaryWorkerPagedContext = Pick<
   OrdinaryWorkerContext,
-  'accountId' | 'client' | 'schedule' | 'collectBounded'
+  | 'accountId'
+  | 'client'
+  | 'inventoryClient'
+  | 'versionInventoryClient'
+  | 'schedule'
+  | 'collectBounded'
 >;
 type OrdinaryWorkerFencedContext = Pick<
   OrdinaryWorkerContext,
@@ -164,12 +171,60 @@ type OrdinaryWorkerFencedContext = Pick<
 >;
 type OrdinaryWorkerFootprintContext = Pick<
   OrdinaryWorkerContext,
-  'accountId' | 'client' | 'schedule' | 'collectBounded' | 'workerRouteZoneIds'
+  | 'accountId'
+  | 'client'
+  | 'inventoryClient'
+  | 'schedule'
+  | 'collectBounded'
+  | 'workerRouteZoneIds'
 >;
 type OrdinaryWorkerCollectContext = Pick<
   OrdinaryWorkerContext,
-  'accountId' | 'client' | 'collectBounded'
+  'accountId' | 'inventoryClient' | 'collectBounded'
 >;
+
+export async function ordinaryWorkerSubdomain(
+  context: Pick<OrdinaryWorkerContext, 'accountId' | 'client'>,
+  scriptName: string,
+): Promise<Readonly<{ enabled: boolean; previews_enabled: boolean }>> {
+  const response = await context.client.workers.scripts.subdomain
+    .get(scriptName, { account_id: context.accountId })
+    .asResponse();
+  const media = response.headers
+    .get('content-type')
+    ?.split(';')[0]
+    ?.trim()
+    .toLowerCase();
+  if (
+    response.status !== 200 ||
+    !(media === 'application/json' || media?.endsWith('+json'))
+  ) {
+    void response.body?.cancel().catch(() => undefined);
+    throw new Error(
+      `ordinary Worker '${scriptName}' returned incomplete public-access metadata`,
+    );
+  }
+  const body: unknown = await response.json();
+  const result = readField(body, 'result');
+  const errors = readField(body, 'errors');
+  const enabled = readField(result, 'enabled');
+  const previews = readField(result, 'previews_enabled');
+  if (
+    readField(body, 'success') !== true ||
+    (errors !== undefined && (!Array.isArray(errors) || errors.length !== 0)) ||
+    !result ||
+    typeof result !== 'object' ||
+    Array.isArray(result) ||
+    !Object.hasOwn(result, 'enabled') ||
+    !Object.hasOwn(result, 'previews_enabled') ||
+    typeof enabled !== 'boolean' ||
+    typeof previews !== 'boolean'
+  )
+    throw new Error(
+      `ordinary Worker '${scriptName}' returned incomplete public-access metadata`,
+    );
+  return { enabled, previews_enabled: previews };
+}
 
 export async function listOrdinaryWorkerSecretNames(
   context: OrdinaryWorkerPagedContext,
@@ -185,17 +240,18 @@ export async function ordinaryWorkerSecretNames(
   const names: string[] = [];
   try {
     for await (const secret of context.collectBounded(
-      context.client.workers.scripts.secrets.list(scriptName, {
+      context.inventoryClient.workers.scripts.secrets.list(scriptName, {
         account_id: context.accountId,
       }),
       'ordinary Worker secret inventory',
     )) {
-      if (!secret.name) {
+      const name = readStringField(secret, 'name');
+      if (!name) {
         throw new Error(
           `ordinary Worker '${scriptName}' returned a secret without a name`,
         );
       }
-      names.push(secret.name);
+      names.push(name);
     }
   } catch (error) {
     if (isNotFound(error)) return [];
@@ -211,7 +267,7 @@ export async function listOrdinaryWorkerDatabases(
   return context.schedule(async () => {
     const databases: PlainWorkerDatabaseInventoryEntry[] = [];
     for await (const database of context.collectBounded(
-      context.client.d1.database.list({
+      context.inventoryClient.d1.database.list({
         account_id: context.accountId,
         per_page: 100,
         ...(filter?.name === undefined ? {} : { name: filter.name }),
@@ -219,10 +275,11 @@ export async function listOrdinaryWorkerDatabases(
       'D1 database inventory',
       MAX_DATABASE_INVENTORY,
     )) {
-      databases.push({
-        databaseId: readStringField(database, 'uuid'),
-        name: readStringField(database, 'name'),
-      });
+      const databaseId = readStringField(database, 'uuid');
+      const name = readStringField(database, 'name');
+      if (!databaseId || !name)
+        throw new Error('D1 database inventory has an invalid uuid or name');
+      databases.push({ databaseId, name });
     }
     return databases;
   });
@@ -270,10 +327,13 @@ export async function listOrdinaryWorkerVersions(
     try {
       const versions: PlainWorkerVersionSummary[] = [];
       for await (const version of context.collectBounded(
-        context.client.workers.scripts.versions.list(scriptName, {
-          account_id: context.accountId,
-          per_page: 100,
-        }),
+        context.versionInventoryClient.workers.scripts.versions.list(
+          scriptName,
+          {
+            account_id: context.accountId,
+            per_page: 100,
+          },
+        ),
         'ordinary Worker version inventory',
         MAX_VERSION_INVENTORY,
       )) {
@@ -355,9 +415,13 @@ export async function prepareOrdinaryWorkerUpload(
       ? [...intent.compatibilityFlags]
       : undefined,
     limits:
-      intent.limits.cpuMs === undefined
+      intent.limits.cpuMs === undefined &&
+      intent.limits.subrequests === undefined
         ? undefined
-        : { cpu_ms: intent.limits.cpuMs },
+        : {
+            cpu_ms: intent.limits.cpuMs,
+            subrequests: intent.limits.subrequests,
+          },
     annotations: { 'workers/tag': intent.candidateTag },
   };
   const metadata: OrdinaryWorkerUploadMetadata =
@@ -397,13 +461,13 @@ export async function dispatchOrdinaryWorkerUpload(
   const { files, intent, metadata, secretValues } = prepared;
   await context.schedule(async () => {
     const subdomain = context.client.workers.scripts.subdomain;
-    const uploadBody = {
+    const uploadParameters = {
       account_id: context.accountId,
-      files: [...files],
       // cloudflare/internal/uploads.mjs:102-129 bracket-flattens objects;
       // Wrangler 4.118.0 serializes the same metadata value as JSON.
       metadata: metadata as never,
     };
+    const body = namedWorkerUploadBody(files, metadata);
     const send = async (call: () => Promise<unknown>): Promise<void> => {
       try {
         await call();
@@ -413,9 +477,15 @@ export async function dispatchOrdinaryWorkerUpload(
     };
     if (intent.mode === 'initial') {
       await send(() =>
-        context.client.workers.scripts.update(intent.scriptName, uploadBody, {
-          maxRetries: 0,
-        }),
+        context.client.workers.scripts.update(
+          intent.scriptName,
+          uploadParameters,
+          {
+            maxRetries: 0,
+            body,
+            headers: { 'Content-Type': null },
+          },
+        ),
       );
       // Sanitization is limited to the upload request that carries secrets.
       // Cloudflare rejects subdomain writes before the script exists. The
@@ -427,9 +497,7 @@ export async function dispatchOrdinaryWorkerUpload(
       });
       return;
     }
-    const current = await subdomain.get(intent.scriptName, {
-      account_id: context.accountId,
-    });
+    const current = await ordinaryWorkerSubdomain(context, intent.scriptName);
     if (
       current.enabled !== intent.publicAccess.workersDevEnabled ||
       current.previews_enabled !== intent.publicAccess.previewUrlsEnabled
@@ -445,8 +513,8 @@ export async function dispatchOrdinaryWorkerUpload(
     await send(() =>
       context.client.workers.scripts.versions.create(
         intent.scriptName,
-        uploadBody,
-        { maxRetries: 0 },
+        uploadParameters,
+        { maxRetries: 0, body },
       ),
     );
   });
@@ -519,10 +587,7 @@ export async function disableOrdinaryWorkerPublicAccess(
       }
       const subdomain = await (async () => {
         try {
-          return await context.client.workers.scripts.subdomain.get(
-            scriptName,
-            { account_id: context.accountId },
-          );
+          return await ordinaryWorkerSubdomain(context, scriptName);
         } catch (error) {
           if (!isNotFound(error)) throw error;
           return undefined;
@@ -544,10 +609,16 @@ export async function listCustomDomains(
   return context.schedule(async () => {
     const domains: Array<OrdinaryWorkerFootprint['customDomains'][number]> = [];
     for await (const domain of context.collectBounded(
-      context.client.workers.domains.list({ account_id: context.accountId }),
+      context.inventoryClient.workers.domains.list({
+        account_id: context.accountId,
+      }),
       'custom domain inventory',
     )) {
-      if (!domain.id || !domain.hostname || !domain.service) {
+      if (
+        !readStringField(domain, 'id') ||
+        !readStringField(domain, 'hostname') ||
+        !readStringField(domain, 'service')
+      ) {
         throw new Error(
           'Cloudflare returned incomplete custom-domain metadata',
         );
@@ -646,10 +717,15 @@ export async function inspectOrdinaryWorkerFootprint(
   return context.schedule(async () => {
     let scriptPresent = false;
     for await (const script of context.collectBounded(
-      context.client.workers.scripts.list({ account_id: context.accountId }),
+      context.inventoryClient.workers.scripts.list({
+        account_id: context.accountId,
+      }),
       'ordinary Worker script inventory',
     )) {
-      if (script.id === scriptName) scriptPresent = true;
+      const id = readStringField(script, 'id');
+      if (!id)
+        throw new Error('ordinary Worker script inventory has an invalid ID');
+      if (id === scriptName) scriptPresent = true;
     }
     const customDomains: Array<{
       id: string;
@@ -657,11 +733,19 @@ export async function inspectOrdinaryWorkerFootprint(
       service: string;
     }> = [];
     for await (const domain of context.collectBounded(
-      context.client.workers.domains.list({ account_id: context.accountId }),
+      context.inventoryClient.workers.domains.list({
+        account_id: context.accountId,
+      }),
       'custom domain inventory',
     )) {
-      if (domain.service !== scriptName) continue;
-      if (!domain.id || !domain.hostname) {
+      const service = readStringField(domain, 'service');
+      if (!service)
+        throw new Error('custom domain inventory has an invalid service');
+      if (service !== scriptName) continue;
+      if (
+        !readStringField(domain, 'id') ||
+        !readStringField(domain, 'hostname')
+      ) {
         throw new Error(
           `ordinary Worker '${scriptName}' has incomplete custom-domain metadata`,
         );
@@ -675,11 +759,21 @@ export async function inspectOrdinaryWorkerFootprint(
     const zoneRoutes: import('./types.js').WorkerZoneRoute[] = [];
     for (const zoneId of await context.workerRouteZoneIds()) {
       for await (const route of context.collectBounded(
-        context.client.workers.routes.list({ zone_id: zoneId }),
+        context.inventoryClient.workers.routes.list({ zone_id: zoneId }),
         'Worker zone-route inventory',
       )) {
-        if (route.script !== scriptName) continue;
-        if (!route.id || !route.pattern) {
+        const script = readField(route, 'script');
+        if (
+          script !== undefined &&
+          script !== null &&
+          typeof script !== 'string'
+        )
+          throw new Error('Worker zone-route inventory has an invalid script');
+        if (script !== scriptName) continue;
+        if (
+          !readStringField(route, 'id') ||
+          !readStringField(route, 'pattern')
+        ) {
           throw new Error(
             `ordinary Worker '${scriptName}' has incomplete zone-route metadata`,
           );
@@ -692,9 +786,7 @@ export async function inspectOrdinaryWorkerFootprint(
       }
     }
     const subdomain = scriptPresent
-      ? await context.client.workers.scripts.subdomain.get(scriptName, {
-          account_id: context.accountId,
-        })
+      ? await ordinaryWorkerSubdomain(context, scriptName)
       : undefined;
     return {
       scriptPresent,

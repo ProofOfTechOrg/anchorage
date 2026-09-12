@@ -2913,8 +2913,14 @@ describe('fleet operations', () => {
 
   it('persists the advanced Durable Object tag and rejects a stale migration base', async () => {
     const priorHistory = [{ tag: 'v1', newClasses: ['Runner'] }];
+    const {
+      activeRelease: _active,
+      platformTarget: _target,
+      ...catalog
+    } = record('acme');
     const acme = {
-      ...record('acme'),
+      ...catalog,
+      wfpMode: 'platform-catalog' as const,
       durableObjectTag: 'v1',
       durableObjectMigrationHistory: priorHistory,
       durableObjectMigrationHistoryDigest:

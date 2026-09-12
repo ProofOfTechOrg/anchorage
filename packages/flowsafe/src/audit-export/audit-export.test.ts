@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { type AuditEvent, AuditLogger } from '@proofoftech/breakwater/audit';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
@@ -29,6 +30,46 @@ function makeBatch(events: TestEvent[]): {
 }
 
 describe('queueAuditSink', () => {
+  it('preserves connector decision metadata from the logger through NDJSON export', async () => {
+    const queued: AuditEvent[] = [];
+    const audit = new AuditLogger({
+      sink: queueAuditSink<AuditEvent>({
+        send: async (event) => {
+          queued.push(event);
+        },
+      }),
+    });
+    const event = audit.record({
+      actor: null,
+      action: 'connector.execute',
+      resource: 'example.read',
+      decision: 'denied',
+      decisionCode: 'RATE_LIMIT_EXCEEDED',
+      policyKind: 'rate-limit',
+      retryable: true,
+    });
+    const fetch = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    const ackAll = vi.fn();
+    const retryAll = vi.fn();
+    await createAuditQueueConsumer<AuditEvent>({
+      endpoint: 'https://siem.example/collect',
+      fetch,
+    })({
+      messages: queued.map((body) => ({ body, ack: vi.fn(), retry: vi.fn() })),
+      ackAll,
+      retryAll,
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(fetch.mock.calls[0]?.[1].body)).toEqual(event);
+    expect(event).toMatchObject({
+      decisionCode: 'RATE_LIMIT_EXCEEDED',
+      policyKind: 'rate-limit',
+      retryable: true,
+    });
+    expect(ackAll).toHaveBeenCalledTimes(1);
+    expect(retryAll).not.toHaveBeenCalled();
+  });
+
   it('sends each event to the queue binding', async () => {
     // #given
     const send = vi.fn().mockResolvedValue(undefined);

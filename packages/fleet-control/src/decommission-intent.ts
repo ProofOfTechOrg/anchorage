@@ -21,7 +21,7 @@ import type {
   FleetRecord,
   NormalDecommissionLifecyclePhase,
 } from './types.js';
-import { BACKEND_SWITCH_SUBPHASES } from './types.js';
+import { BACKEND_SWITCH_SUBPHASES, isPlatformCatalogRecord } from './types.js';
 
 export const DECOMMISSION_INTENT_BYTE_BOUND = 96 * 1024;
 const TOKEN_BYTE_BOUND = 1024;
@@ -226,6 +226,7 @@ function migrationCarrier(
   if (source.migrationIntent) {
     if (
       source.backend !== 'workers-for-platforms' ||
+      isPlatformCatalogRecord(source) ||
       (source.pendingSpecDigest !== undefined &&
         source.pendingSpecDigest !== source.migrationIntent.targetSpecDigest) ||
       source.pendingArtifactVersion !== undefined
@@ -236,7 +237,7 @@ function migrationCarrier(
   }
   if (source.pendingSpecDigest !== undefined) {
     if (
-      source.backend !== 'plain-worker' ||
+      (source.backend !== 'plain-worker' && !isPlatformCatalogRecord(source)) ||
       !sha256(source.pendingSpecDigest) ||
       (source.pendingArtifactVersion !== undefined &&
         (typeof source.pendingArtifactVersion !== 'string' ||

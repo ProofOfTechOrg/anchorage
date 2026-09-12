@@ -214,6 +214,14 @@ const workerConfig = {
         env.THREAD,
         env.DEPLOYMENT_IDENTITY_SECRET,
       ),
+      validateThreadTarget: createAgentThreadTopology(
+        env.THREAD,
+        env.DEPLOYMENT_IDENTITY_SECRET,
+        {
+          startIdempotency: startIdempotency(env.DB),
+          executionFence: executionFence(env.DB),
+        },
+      ).requireBoundThread,
       attributeAllowlist: signalAttributeAllowlist(env),
       rateLimit: signalRateLimit,
       audit,
