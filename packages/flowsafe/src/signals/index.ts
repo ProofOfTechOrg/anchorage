@@ -20,6 +20,11 @@ export {
 export type { SignalDatabase, SignalStatement } from './d1-shared.js';
 export {
   createNotificationDispatchTick,
+  DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS,
+  type NotificationDeliveryFailure,
+  type NotificationDeliveryObservation,
+  type NotificationDeliveryStorage,
+  type NotificationDeliveryUpdateResult,
   type NotificationDispatchTickOptions,
   type NotificationDispatchTickResult,
 } from './notification-dispatch.js';

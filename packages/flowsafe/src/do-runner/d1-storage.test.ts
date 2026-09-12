@@ -2124,11 +2124,20 @@ async function signalDb(sqlite: SqliteDatabase): Promise<SignalDatabase> {
 
 function seedNotification(
   db: SqliteDatabase,
-  row: { id: string; threadId: string; status: string; updatedAt: number },
+  row: {
+    id: string;
+    threadId: string;
+    status: string;
+    updatedAt: number | string;
+    tablePrefix?: string;
+  },
 ): void {
-  const iso = new Date(row.updatedAt).toISOString();
+  const iso =
+    typeof row.updatedAt === 'string'
+      ? row.updatedAt
+      : new Date(row.updatedAt).toISOString();
   db.prepare(
-    `INSERT INTO mastra_notifications
+    `INSERT INTO ${row.tablePrefix ?? ''}mastra_notifications
        (id, thread_id, source, kind, priority, status, summary, coalescedCount,
         createdAt, updatedAt, deliveryAttempts)
      VALUES (?, ?, 'x', 'y', 'medium', ?, 'z', 1, ?, ?, 0)`,
@@ -2187,11 +2196,162 @@ describe('purgeExpiredNotifications', () => {
     expect(ids).toEqual(['ancient-pending', 'fresh-delivered']);
   });
 
-  it('reads a missing table as zero', async () => {
+  describe.each(['', 'tenant_'])('table prefix %j', (tablePrefix) => {
+    it.each([
+      {
+        name: 'ordinary year',
+        now: '2026-07-07T12:00:00.000Z',
+        oldOffset: '2026-07-06T15:59:59.999+04:00',
+        futureOffset: '2026-07-06T07:00:00-06:00',
+        equalOffset: '2026-07-06T16:00:00+0400',
+      },
+      {
+        name: 'negative year',
+        now: '-000100-01-02T12:00:00.000Z',
+        oldOffset: '-000100-01-01T15:59:59.999+04:00',
+        futureOffset: '-000100-01-01T07:00:00-06:00',
+        equalOffset: '-000100-01-01T16:00:00+0400',
+      },
+    ])('applies notification TTL by Date chronology for $name', async ({
+      now,
+      oldOffset,
+      futureOffset,
+      equalOffset,
+    }) => {
+      const sqlite = openSqlite();
+      const binding = sqliteUnitDatabase(sqlite) as SignalDatabase;
+      await new D1NotificationsStorage(binding, tablePrefix).init();
+      const instant = new Date(now).getTime();
+      const cutoff = instant - DAY_MS;
+      const rows = [
+        {
+          id: 'extended-future',
+          status: 'delivered',
+          updatedAt: '+010000-01-01T00:00:00.000Z',
+        },
+        {
+          id: 'negative-past',
+          status: 'seen',
+          updatedAt: '-000200-01-01T00:00:00.000Z',
+        },
+        {
+          id: 'old-canonical',
+          status: 'dismissed',
+          updatedAt: new Date(cutoff - 1).toISOString(),
+        },
+        { id: 'old-offset', status: 'archived', updatedAt: oldOffset },
+        {
+          id: 'future-offset',
+          status: 'discarded',
+          updatedAt: futureOffset,
+        },
+        { id: 'equal-offset', status: 'delivered', updatedAt: equalOffset },
+        {
+          id: 'equal-canonical',
+          status: 'discarded',
+          updatedAt: new Date(cutoff).toISOString(),
+        },
+        { id: 'pending-old', status: 'pending', updatedAt: oldOffset },
+      ];
+      for (const row of rows) {
+        expect(Number.isFinite(new Date(row.updatedAt).getTime())).toBe(true);
+        seedNotification(sqlite, { ...row, threadId: 'thread', tablePrefix });
+      }
+      if (tablePrefix !== '') {
+        await new D1NotificationsStorage(binding, '').init();
+        seedNotification(sqlite, {
+          id: 'other-prefix',
+          threadId: 'thread',
+          status: 'delivered',
+          updatedAt: oldOffset,
+        });
+      }
+      const retained = rows.filter(
+        (row) =>
+          row.status === 'pending' ||
+          new Date(row.updatedAt).getTime() >= cutoff,
+      );
+      expect(
+        await purgeExpiredNotifications(d1Like(sqlite), {
+          ttlMs: DAY_MS,
+          tablePrefix,
+          now: () => instant,
+        }),
+      ).toBe(rows.length - retained.length);
+      expect(
+        sqlite
+          .prepare(
+            `SELECT id, status, updatedAt FROM ${tablePrefix}mastra_notifications ORDER BY id`,
+          )
+          .all(),
+      ).toEqual(retained.sort((a, b) => a.id.localeCompare(b.id)));
+      if (tablePrefix !== '') {
+        expect(
+          sqlite.prepare('SELECT id FROM mastra_notifications').all(),
+        ).toEqual([{ id: 'other-prefix' }]);
+      }
+    });
+
+    it('reads a missing table as zero', async () => {
+      const sqlite = openSqlite();
+      expect(
+        await purgeExpiredNotifications(d1Like(sqlite), {
+          ttlMs: DAY_MS,
+          tablePrefix,
+        }),
+      ).toBe(0);
+    });
+  });
+
+  it.each([
+    'invalid',
+    '0',
+    '2026-07-06T00:00:00',
+    '2026-07-06T00:00:00Z\0',
+    '+275760-09-13T00:00:00.001Z',
+  ])('retains unsupported raw updatedAt %j', async (updatedAt) => {
     const sqlite = openSqlite();
+    await signalDb(sqlite);
+    seedNotification(sqlite, {
+      id: 'unreadable',
+      threadId: 'thread',
+      status: 'delivered',
+      updatedAt,
+    });
     expect(
-      await purgeExpiredNotifications(d1Like(sqlite), { ttlMs: DAY_MS }),
+      await purgeExpiredNotifications(d1Like(sqlite), {
+        ttlMs: DAY_MS,
+        now: () => NOW,
+      }),
     ).toBe(0);
+    expect(sqlite.prepare('SELECT id FROM mastra_notifications').all()).toEqual(
+      [{ id: 'unreadable' }],
+    );
+  });
+
+  it.each([
+    { now: NaN, ttlMs: DAY_MS },
+    { now: Infinity, ttlMs: DAY_MS },
+    { now: 8_640_000_000_000_001, ttlMs: 0 },
+    { now: -8_640_000_000_000_000, ttlMs: 1 },
+  ])('rejects a cutoff outside the finite Date range: %j', async ({
+    now,
+    ttlMs,
+  }) => {
+    const sqlite = openSqlite();
+    await signalDb(sqlite);
+    seedNotification(sqlite, {
+      id: 'retained',
+      threadId: 'thread',
+      status: 'delivered',
+      updatedAt: NOW - 2 * DAY_MS,
+    });
+    await expect(
+      purgeExpiredNotifications(d1Like(sqlite), { ttlMs, now: () => now }),
+    ).rejects.toThrow();
+    expect(sqlite.prepare('SELECT id FROM mastra_notifications').all()).toEqual(
+      [{ id: 'retained' }],
+    );
   });
 });
 

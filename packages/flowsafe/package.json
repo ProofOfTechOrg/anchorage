@@ -6,6 +6,7 @@
   },
   "files": [
     "dist",
+    "patches/@mastra__core@1.53.0.patch",
     "deployment-identity-protocol.d.mts",
     "deployment-identity-protocol.mjs",
     "scripts/seed-deployment-identity.mjs",

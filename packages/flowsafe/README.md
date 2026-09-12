@@ -25,7 +25,7 @@ Compatibility:
 - Node.js 22.13.0 or later (engine range `>=22.13.0`)
 - ESM only
 - TypeScript `moduleResolution: "NodeNext"`, `"Node16"`, or `"Bundler"`
-- `@mastra/core` `1.53.0`
+- `@mastra/core` `1.53.0`, with the patch this package ships under `patches/` applied at your application root — see [Apply the flowsafe patch to @mastra/core](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/getting-started.md#apply-the-flowsafe-patch-to-mastracore)
 - `react` and `react-dom` `>=18 <20` (React 18 or 19) for the optional approval UI
 - `@proofoftech/breakwater` `>=0.13.0 <1.0.0` when used
 - host-provided Wrangler `>=4.118 <5` for the optional `flowsafe-provision` CLI
@@ -439,7 +439,13 @@ The thread routes reject a signal whose `tagName` is not an XML name, and drop a
 
 Configure `ThreadSignalRoutesOptions.contentPolicy` when signal content needs a domain policy before it becomes model input. The Thread Durable Object invokes this structural callback for direct ingestion, provider delivery, schedule fires, and notification dispatch. Its `text` is Mastra's canonical escaped XML representation. A denial stops direct delivery with 422, settles a scheduled fire as discarded, or terminally discards the affected notification.
 
-A policy failure is opaque, and each lane recovers the way it already recovers from any other failure: direct delivery returns 503, schedule state is left unsettled so the lease expires and a later tick retries, and notification dispatch uses its existing backoff. A webhook whose matched deliveries the deployment could not decide is answered with 503 so the provider's own at-least-once redelivery recovers it; each delivery carries a dedupe key derived from the signed bytes and the subscription, so a redelivery coalesces into a still-pending row rather than duplicating it. A content denial is terminal and answers 2xx, because redelivering the identical bytes would only be denied again. Poll deliveries report the same three outcomes and depend on the adapter re-reporting state it has not seen accepted. Give a network-backed policy its own timeout and failure budget inside the callback; FlowSafe imposes neither.
+A policy failure is opaque: direct delivery returns 503, schedule state is left unsettled so the lease expires and a later tick retries, and notification dispatch records a bounded retry. A webhook whose matched deliveries the deployment could not decide is answered with 503 so the provider's own at-least-once redelivery recovers it; each delivery carries a dedupe key derived from the signed bytes and the subscription, so a redelivery coalesces into a still-pending row rather than duplicating it. A content denial is terminal and answers 2xx, because redelivering the identical bytes would only be denied again. Poll deliveries report the same three outcomes and depend on the adapter re-reporting state it has not seen accepted. Give a network-backed policy its own timeout and failure budget inside the callback; FlowSafe imposes neither.
+
+Configure the same positive safe-integer `maxDeliveryAttempts` on `createNotificationDispatchTick()` and `createThreadSignalRoutes()`. Both default to `DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS`. A recorded failure at the bound discards the notification with `deliveryReason: "delivery-attempts-exhausted"`, retaining its count and last error. An already-exhausted row is never sent; its discard is conditional on the observed record remaining current. Below the bound, existing retry delays apply.
+
+Dispatch requires `NotificationDeliveryStorage`; `D1NotificationsStorage` implements it. A custom store's `updateNotificationDeliveryIfUnchanged()` must compare the captured observation and apply the failure patch atomically against its other writers. Ordinary Core notification ingestion remains supported. See the [delivery and receipt guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/durable-agents.md#bound-notification-delivery) for custom-store migration, lost responses and receipt retention.
+
+Summary source counts and a configured source delivery policy read own properties only where the shipped `@mastra/core` patch is applied; without it a source named after an `Object.prototype` member is miscounted in the summary core renders and selects an inherited policy entry instead of the configured priority or default action. Flowsafe refuses to construct its notification dispatch tick and refuses notification dispatch on an unpatched install.
 
 Adapt Breakwater without adding a FlowSafe runtime dependency on it:
 
@@ -575,3 +581,5 @@ pnpm --filter @proofoftech/flowsafe spike:verify:llm
 ## License
 
 Apache-2.0.
+
+`patches/@mastra__core@1.53.0.patch` is a modification of `@mastra/core` `1.53.0`, which is licensed under Apache-2.0 and copyright its authors. It changes that package's published runtime chunks to correct the two defects reported as mastra-ai/mastra#23693 and mastra-ai/mastra#23694.

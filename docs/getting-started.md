@@ -175,6 +175,63 @@ grant. Side-effecting steps remain protected by the server-derived approval
 context. The agent host has no public resume route; an agent run advances only
 through an approval decision.
 
+## Apply the flowsafe patch to @mastra/core
+
+`@mastra/core` `1.53.0` reads inherited `Object.prototype` members when a notification's `source` names one. `summarizeNotifications()` accumulates per-source counts in an ordinary object literal, so a notification whose `source` is `constructor`, `toString`, `__proto__` or another prototype member is counted against the inherited value and rendered as text rather than a number ([mastra-ai/mastra#23693](https://github.com/mastra-ai/mastra/issues/23693)). `resolveNotificationDeliveryDecision()` indexes its `sources` policy map without an own-property test, so those same source names select an inherited function instead of falling through to the configured priority or default action, including `discard` ([mastra-ai/mastra#23694](https://github.com/mastra-ai/mastra/issues/23694)). The priority-keyed lookups beside both sites take a closed set that flowsafe validates before a record reaches them.
+
+Flowsafe notification delivery depends on both corrections: it inspects the summary core renders before sending it and records a receipt against that content, and it hosts ordinary core agents whose configured source policy the second defect bypasses. Flowsafe ships the correction as a patch file, published at `node_modules/@proofoftech/flowsafe/patches/@mastra__core@1.53.0.patch`. Apply it at your application root; installing flowsafe does not apply it for you.
+
+### Apply it with pnpm
+
+Copy the file into your application's `patches/` directory and record it in your root `package.json`:
+
+```bash
+mkdir -p patches
+cp node_modules/@proofoftech/flowsafe/patches/@mastra__core@1.53.0.patch patches/
+```
+
+```json
+{
+  "pnpm": {
+    "patchedDependencies": {
+      "@mastra/core@1.53.0": "patches/@mastra__core@1.53.0.patch"
+    }
+  }
+}
+```
+
+Then run `pnpm install`. pnpm applies the patch while it extracts the package, so it needs no install script.
+
+With the patch, `summary.bySource` is a null-prototype object: it carries no inherited methods such as `hasOwnProperty`. Read it with `Object.hasOwn()` or `Object.entries()`.
+
+### Apply it with npm or Yarn
+
+Copy the file the same way, then apply it after every install:
+
+```json
+{
+  "scripts": {
+    "postinstall": "patch -p1 -R -s -f --dry-run -d node_modules/@mastra/core < patches/@mastra__core@1.53.0.patch >/dev/null || patch -p1 -d node_modules/@mastra/core < patches/@mastra__core@1.53.0.patch"
+  }
+}
+```
+
+The patch file is fed on standard input rather than through `-i` because `-d` changes directory before a relative `-i` path is resolved. The reverse dry run succeeds only on an already-patched tree, so the second leg runs exactly once per fresh install.
+
+This route requires GNU `patch` on `PATH`, and Yarn only with `nodeLinker: node-modules`. When both legs fail on `1.53.0`, delete `node_modules/@mastra/core` and reinstall rather than re-running the command. When they fail because `@mastra/core` is no longer `1.53.0`, remove the `postinstall` script: the patch does not apply to other versions.
+
+The patch applies to `@mastra/core` `1.53.0` only. When you upgrade `@mastra/core`, remove the `patchedDependencies` entry or the `postinstall` script before installing, and check whether the release carries the upstream fixes. On an unpatched install flowsafe refuses to construct its notification dispatch tick with an error naming this section, and answers notification dispatch requests with a 502 whose server log line names it.
+
+### Confirm the patch is applied
+
+```bash
+node -e "const {summarizeNotifications}=require('@mastra/core/notifications');console.log(typeof summarizeNotifications([{id:'n',threadId:'t',source:'constructor',kind:'k',priority:'low',status:'pending',summary:'s',createdAt:new Date(0),updatedAt:new Date(0)}]).bySource.constructor)"
+```
+
+This prints `number` with the patch applied and `string` without it.
+
+The `postinstall` command above is exercised in continuous integration against a scratch application root holding an installed copy of the package: it applies the shipped patch on the first run and is a no-op on the second. No npm or Yarn install is exercised.
+
 ## Define an approval gate
 
 A gate suspends with a static connector list. The host bridge copies that server-authored list into the approval record, and `approvalGrantProvider()` derives the matching capability on resume.

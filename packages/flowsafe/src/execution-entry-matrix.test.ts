@@ -52,7 +52,6 @@
 import { Mastra } from '@mastra/core';
 import { Agent, createSignal } from '@mastra/core/agent';
 import { MockMemory } from '@mastra/core/memory';
-import type { NotificationsStorage } from '@mastra/core/notifications';
 import { RequestContext } from '@mastra/core/request-context';
 import { InMemoryStore } from '@mastra/core/storage';
 import {
@@ -133,6 +132,7 @@ import {
 import {
   createNotificationDispatchTick,
   createThreadSignalRoutes,
+  type NotificationDeliveryStorage,
 } from './signals/index.js';
 
 const STATES: readonly ExecutionFenceState[] = [
@@ -1219,7 +1219,13 @@ const ENTRIES: readonly Entry[] = [
           listed += 1;
           return [];
         },
-      } as unknown as NotificationsStorage;
+        getNotification: async () => {
+          throw new Error('unexpected notification readback');
+        },
+        updateNotificationDeliveryIfUnchanged: async () => {
+          throw new Error('unexpected notification failure write');
+        },
+      } as unknown as NotificationDeliveryStorage;
       const tick = createNotificationDispatchTick({
         storage,
         topology: stubTopology(),

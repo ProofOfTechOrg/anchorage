@@ -259,6 +259,24 @@ The agent host persists a thread-to-agent binding and per-run principal record i
 
 Thread delivery is priority-planned across summaries and individual notifications, remains stable across 100-record chunks, and suppresses summarized high-priority rows while the thread was active.
 
+### Bound notification delivery
+
+`createNotificationDispatchTick()` and `createThreadSignalRoutes()` accept `maxDeliveryAttempts`, a positive safe integer defaulting to `DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS`. Use the same value on both factories. They capture the policy at construction; request bodies cannot change it. A tick with `limit: 0` performs no delivery or storage work, while invalid numeric policy and an unpatched `@mastra/core` still fail at construction.
+
+`deliveryAttempts` counts persisted failed rounds. At the bound, the conditional write sets `discarded`, `deliveryReason: "delivery-attempts-exhausted"` and cleared delivery cursors. A row already at the bound is not sent; its conditional discard preserves the previous count, error and attempt time. Retry delays below the bound retain the existing backoff. Malformed counters remain unmodified and produce an unresolved failure. A due row whose other scalars cannot be read is not written: it is counted as a failed outcome, re-selected on every pass, holds its place in the bounded window and in the `pending-notifications` inventory category, and must be repaired or deleted directly.
+
+Terminal receipts remain available through `getNotification()` and `listNotifications()` until the host's configured retention removes them. They include the last error/count and discard timestamp. The due scan excludes terminal notifications so a persistently refused target can release its place in the bounded dispatch window.
+
+The tick requires `NotificationDeliveryStorage`. `D1NotificationsStorage` provides its `updateNotificationDeliveryIfUnchanged()` operation. Custom implementations must atomically compare the supplied `NotificationDeliveryObservation` and apply the narrow `NotificationDeliveryFailure` patch against their other writers. The observation uses detached scalar values, ISO timestamps and encoded JSON; the public types define its fields. A method implemented as an asynchronous read followed by an unconditional update does not satisfy that contract. Ordinary Core storage can still serve notification ingestion; driving dispatch requires the conditional operation.
+
+Failure bookkeeping preserves newer summary, delivery and content-denial receipts. A conditional write with an uncertain response can be confirmed by an exact target readback. General delivery responses that are lost remain conservatively counted as failed; the dispatcher does not invent successful deliveries from another writer's state. Invocation counters do not promise exactly-once signal delivery: a signal can succeed before its receipt write fails.
+
+Attempt time and retry cursors use the dispatch clock. Updated/discarded timestamps use a captured wall-clock value for retention. Identical same-ID replacements with no observable difference have no separate generation identity under this contract.
+
+D1 compares notification timestamps as instants when selecting due rows, ordering lists and applying retention. Public storage methods accept finite `Date` values. Direct database writers must use ISO dates or ISO date-times with an explicit UTC or numeric offset. A date-time with no zone, or non-ISO text, is outside that grammar: such a value in `deliverAt` or `summaryAt` never matches due selection, and such a value in `updatedAt` never matches retention, so repair or delete the row that carries it directly; supported raw encodings retain their stored bytes.
+
+Summary source counts and a configured source delivery policy read own properties only where the `@mastra/core` patch flowsafe ships is applied at the application root; without it a source named after an `Object.prototype` member is miscounted in the summary core renders and selects an inherited policy entry instead of the configured priority or default action. Flowsafe refuses to construct its notification dispatch tick and refuses notification dispatch on an unpatched install. See [Apply the flowsafe patch to @mastra/core](getting-started.md#apply-the-flowsafe-patch-to-mastracore).
+
 ## Expose signal ingestion
 
 Mount `createSignalRouter()` through `createFlowsafeWorker({ buildSignalRouter })`. The default prefix is `/api/threads`.

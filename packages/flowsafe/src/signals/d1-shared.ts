@@ -36,12 +36,7 @@ export function d1Changes(result: { meta?: { changes?: number } }): number {
   return typeof changes === 'number' ? changes : 0;
 }
 
-/**
- * A Date → ISO-8601 TEXT column value, or null. ISO text so a lexicographic `<`
- * against a cutoff is a correct timestamp comparison — the same encoding the
- * snapshot/memory tables use and the retention purges (and the schema guard)
- * ride on.
- */
+/** A Date → ISO-8601 TEXT column value, or null. */
 export function isoOrNull(value: Date | undefined): string | null {
   return value === undefined ? null : value.toISOString();
 }

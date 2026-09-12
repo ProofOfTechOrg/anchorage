@@ -7,7 +7,7 @@ import type { MastraModelConfig } from '@mastra/core/llm';
 import { Mastra } from '@mastra/core/mastra';
 import { MockMemory } from '@mastra/core/memory';
 import { RequestContext } from '@mastra/core/request-context';
-import { InMemoryStore } from '@mastra/core/storage';
+import { InMemoryStore, MastraCompositeStore } from '@mastra/core/storage';
 import {
   ACTOR_CONTEXT_KEY,
   AuditLogger,
@@ -20,7 +20,10 @@ import {
   createFlowsafeDurableAgent,
   type FlowsafeDurableAgent,
 } from '../agent-runner/index.js';
-import { humanPrincipal } from '../approval-api/index.js';
+import {
+  humanPrincipal,
+  trustAutomationPrincipal,
+} from '../approval-api/index.js';
 import type { ExecutionFenceDatabase } from '../do-runner/execution-fence.js';
 import {
   createHostPubSub,
@@ -29,6 +32,9 @@ import {
   type RunnerRuntime,
   type ThreadScope,
 } from '../do-runner/index.js';
+import type { SignalDatabase } from './d1-shared.js';
+import { DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS } from './notification-dispatch.js';
+import { D1NotificationsStorage } from './notifications-d1.js';
 import { createThreadSignalRoutes } from './thread-do-routes.js';
 
 const RESOURCE_ID = 'resource-real';
@@ -96,7 +102,15 @@ async function createHarness(options: { canPersist?: boolean } = {}) {
   const pubsub = createHostPubSub();
   const memory = new MockMemory();
   const { runtime, start } = fakeRuntime(pubsub);
-  const mastra = new Mastra({ storage: new InMemoryStore(), logger: false });
+  const notifications = new D1NotificationsStorage(
+    sqliteUnitDatabase(openSqlite()) as SignalDatabase,
+  );
+  const storage = new MastraCompositeStore({
+    id: 'real-notification-test',
+    default: new InMemoryStore(),
+    domains: { notifications },
+  });
+  const mastra = new Mastra({ storage, logger: false });
   const agent = createFlowsafeDurableAgent({
     agent: guardedTestAgent(memory),
     runtime,
@@ -118,7 +132,7 @@ async function createHarness(options: { canPersist?: boolean } = {}) {
       return storage;
     },
   });
-  return { agent, mastra, memory, pubsub, routes, start };
+  return { agent, mastra, memory, notifications, pubsub, routes, start };
 }
 
 function scope(
@@ -203,6 +217,83 @@ afterEach(() => {
 });
 
 describe('thread signal routes with a real durable agent', () => {
+  it.each([
+    'deliver',
+    'exhausted',
+  ] as const)('dispatches through D1 notification storage with a real agent: %s', async (mode) => {
+    const harness = await createHarness();
+    const threadId = crypto.randomUUID();
+    await seedThread(harness.memory, threadId);
+    const now = new Date();
+    const record = await harness.notifications.createNotification({
+      threadId,
+      resourceId: RESOURCE_ID,
+      agentId: 'writer',
+      source: 'provider',
+      kind: 'changed',
+      summary: 'notification input',
+      deliverAt: now,
+    });
+    if (mode === 'exhausted') {
+      await harness.notifications.updateNotification({
+        threadId,
+        id: record.id,
+        deliveryAttempts: DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS,
+        lastDeliveryError: 'target refused',
+        lastDeliveryAttemptAt: now,
+      });
+    }
+    const send = vi.spyOn(harness.agent, 'sendSignal');
+    const response = await harness.routes(
+      post('/signal/notifications/dispatch', {
+        notificationIds: [record.id],
+        resourceId: RESOURCE_ID,
+        agentId: 'writer',
+        now: now.toISOString(),
+      }),
+      {
+        ...scope(harness.pubsub, threadId),
+        principal: trustAutomationPrincipal({
+          kind: 'system',
+          id: 'notification-dispatch',
+          purpose: 'notification.dispatch',
+        }),
+      },
+    );
+    expect(response?.status).toBe(200);
+    const persisted = await harness.notifications.getNotification({
+      threadId,
+      id: record.id,
+    });
+    if (mode === 'exhausted') {
+      expect(await response?.json()).toMatchObject({
+        delivered: 0,
+        failed: 0,
+        discarded: 1,
+      });
+      expect(send).not.toHaveBeenCalled();
+      expect(persisted).toMatchObject({
+        status: 'discarded',
+        deliveryAttempts: DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS,
+        lastDeliveryError: 'target refused',
+        lastDeliveryAttemptAt: now,
+        deliveryReason: 'delivery-attempts-exhausted',
+        discardedAt: expect.any(Date),
+      });
+      expect(persisted?.deliverAt).toBeUndefined();
+      expect(persisted?.summaryAt).toBeUndefined();
+    } else {
+      expect(await response?.json()).toMatchObject({ delivered: 1, failed: 0 });
+      expect(send).toHaveBeenCalledOnce();
+      expect(persisted).toMatchObject({
+        status: 'delivered',
+        deliveredSignalId: expect.any(String),
+      });
+      expect(await recalled(harness.memory, threadId)).toHaveLength(1);
+    }
+    expect(harness.start).not.toHaveBeenCalled();
+  });
+
   it('persists an idle queue message without a run', async () => {
     const harness = await createHarness();
     const threadId = crypto.randomUUID();
@@ -517,6 +608,89 @@ describe('thread signal routes with a real durable agent', () => {
     expect(
       saveMessages.mock.calls.flatMap(([input]) => input.messages),
     ).not.toHaveLength(0);
+    expect(unhandled).toEqual([]);
+  });
+
+  // A low-priority owner notification is deferred to the dispatcher, which is
+  // where the real durable agent and the real D1 store reach Core's summary
+  // helper over a batch. The source strings here name Object.prototype members.
+  it('summarizes prototype-colliding owner notifications through the dispatcher', async () => {
+    // #given — deferred owner notifications with colliding source names
+    const harness = await createHarness();
+    const threadId = crypto.randomUUID();
+    await seedThread(harness.memory, threadId);
+    const ids: string[] = [];
+    for (const source of ['constructor', '__proto__']) {
+      const response = await harness.routes(
+        post('/signal/notification', {
+          source,
+          kind: 'changed',
+          summary: `${source} input`,
+          priority: 'low',
+        }),
+        scope(harness.pubsub, threadId),
+      );
+      expect(response?.status).toBe(200);
+      const body = (await response?.json()) as {
+        record: { record: { id: string; source: string }; decision: unknown };
+      };
+      expect(body.record.decision).toMatchObject({ action: 'summarize' });
+      expect(body.record.record.source).toBe(source);
+      ids.push(body.record.record.id);
+    }
+
+    // #when — the dispatcher summarizes the due batch
+    const send = vi.spyOn(harness.agent, 'sendSignal');
+    const response = await harness.routes(
+      post('/signal/notifications/dispatch', {
+        notificationIds: ids,
+        resourceId: RESOURCE_ID,
+        agentId: 'writer',
+        now: new Date(Date.now() + 60_000).toISOString(),
+      }),
+      {
+        ...scope(harness.pubsub, threadId),
+        principal: trustAutomationPrincipal({
+          kind: 'system',
+          id: 'notification-dispatch',
+          purpose: 'notification.dispatch',
+        }),
+      },
+    );
+
+    // #then — each colliding source is counted once, as its own entry
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toMatchObject({ delivered: 2, failed: 0 });
+    expect(send).toHaveBeenCalledOnce();
+    const summary = send.mock.calls[0]?.[0] as unknown as {
+      tagName: string;
+      contents: string;
+      attributes: Record<string, unknown>;
+      metadata: Record<string, unknown>;
+    };
+    expect(summary.tagName).toBe('notification-summary');
+    expect(summary.contents).toBe('__proto__: 1, constructor: 1');
+    expect(summary.attributes).toMatchObject({ pending: 2 });
+    expect(summary.metadata.notification).toMatchObject({
+      signal: 'summary',
+      pending: 2,
+      groups: [
+        { source: '__proto__', count: 1 },
+        { source: 'constructor', count: 1 },
+      ],
+      byPriority: { low: 2 },
+      priority: 'low',
+    });
+    for (const id of ids) {
+      expect(
+        await harness.notifications.getNotification({ threadId, id }),
+      ).toMatchObject({
+        status: 'pending',
+        summaryAt: undefined,
+        summarySignalId: expect.any(String),
+      });
+    }
+    expect(harness.start).not.toHaveBeenCalled();
     expect(unhandled).toEqual([]);
   });
 

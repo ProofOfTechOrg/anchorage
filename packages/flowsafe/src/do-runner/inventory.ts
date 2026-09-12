@@ -70,7 +70,10 @@ import {
   EXECUTION_FENCE_SUSPEND_KEY,
   type ExecutionFenceState,
 } from './execution-fence.js';
-import { DUE_NOTIFICATION_SQL } from './notification-predicate.js';
+import {
+  DUE_NOTIFICATION_SQL,
+  notificationTimestampMillis,
+} from './notification-predicate.js';
 import {
   START_IDEMPOTENCY_TABLE,
   START_RESERVATION_STATES,
@@ -1059,13 +1062,14 @@ export class DeploymentInventory {
           binds: [],
         };
       case 'pending-notifications': {
-        const now = new Date(this.#now()).toISOString();
+        const now = notificationTimestampMillis(new Date(this.#now()));
         // listDueNotifications' predicate, verbatim in meaning: pending AND
         // (deliverAt or summaryAt has come due). A pending row that is not yet
-        // due is NOT work a drain can finish — no dispatch pass will select
-        // it — so it stays out of the page and is reported as `notDue`
-        // instead. That total also covers pending rows carrying NEITHER
-        // timestamp, which no dispatch pass will ever select at all.
+        // due stays out of the page and is reported as `notDue` instead; that
+        // total also covers pending rows carrying NEITHER timestamp, which no
+        // dispatch pass will ever select. A due row the dispatcher cannot read
+        // is in the page on every pass and leaves it only when a writer
+        // repairs or deletes it.
         const due = DUE_NOTIFICATION_SQL;
         return {
           key: ['thread_id', 'id'],

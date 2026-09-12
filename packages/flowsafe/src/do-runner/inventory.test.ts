@@ -35,6 +35,8 @@ import { APPROVALS_TABLE } from '../approval-api/types.js';
 import { EXECUTION_FENCE_SUSPEND_KEY } from '../background-tasks/index.js';
 import { createScheduleStorageDomains } from '../schedules/storage.js';
 import { D1SubscriptionStoreFactory } from '../signal-providers/index.js';
+import type { SignalDatabase } from '../signals/d1-shared.js';
+import { D1NotificationsStorage } from '../signals/notifications-d1.js';
 import { createSignalStorageDomains } from '../signals/storage.js';
 import { createD1Storage, RESOURCE_OWNER_TABLE } from './d1-storage.js';
 import { RUN_OWNER_RECOVERY_DELAY_MS } from './durable-object.js';
@@ -508,6 +510,111 @@ describe('deployment drain inventory', () => {
         (entry) => entry.key,
       ),
     ).toEqual([['key-live']]);
+  });
+
+  it.each([
+    {
+      name: 'ordinary year',
+      now: '2026-08-24T12:00:00.000Z',
+      dueOffset: '2026-08-24T15:59:59.999+04:00',
+      futureOffset: '2026-08-24T07:00:00-06:00',
+      equalOffset: '2026-08-24T16:00:00+0400',
+    },
+    {
+      name: 'negative year',
+      now: '-000100-01-01T12:00:00.000Z',
+      dueOffset: '-000100-01-01T15:59:59.999+04:00',
+      futureOffset: '-000100-01-01T07:00:00-06:00',
+      equalOffset: '-000100-01-01T16:00:00+0400',
+    },
+  ])('matches notification due reads and Date chronology for $name inventory', async ({
+    now,
+    dueOffset,
+    futureOffset,
+    equalOffset,
+  }) => {
+    const sqlite = openSqlite();
+    const binding = sqliteUnitDatabase(sqlite);
+    const notifications = new D1NotificationsStorage(
+      binding as SignalDatabase,
+      '',
+    );
+    await notifications.init();
+    const instant = new Date(now).getTime();
+    const future = '+010000-01-01T00:00:00.000Z';
+    const due = new Date(instant - 1).toISOString();
+    const rows = [
+      { id: 'a-expanded-future', deliverAt: future, summaryAt: null },
+      { id: 'b-ordinary-due', deliverAt: due, summaryAt: null },
+      { id: 'c-offset-due', deliverAt: dueOffset, summaryAt: null },
+      { id: 'd-offset-future', deliverAt: futureOffset, summaryAt: null },
+      { id: 'e-summary-due', deliverAt: future, summaryAt: dueOffset },
+      { id: 'f-never', deliverAt: null, summaryAt: null },
+      { id: 'g-equal', deliverAt: equalOffset, summaryAt: null },
+      {
+        id: 'h-negative-past',
+        deliverAt: '-000200-01-01T00:00:00.000Z',
+        summaryAt: null,
+      },
+      {
+        id: 'i-delivered',
+        deliverAt: due,
+        summaryAt: null,
+        status: 'delivered',
+      },
+    ];
+    const insert = sqlite.prepare(
+      `INSERT INTO mastra_notifications
+         (id, thread_id, source, kind, priority, status, summary, coalescedCount,
+          createdAt, updatedAt, deliverAt, summaryAt, deliveryAttempts)
+       VALUES (?, 'thread', 'source', 'kind', 'medium', ?, 'summary', 1, ?, ?, ?, ?, 0)`,
+    );
+    for (const row of rows) {
+      for (const cursor of [row.deliverAt, row.summaryAt]) {
+        if (cursor !== null)
+          expect(Number.isFinite(new Date(cursor).getTime())).toBe(true);
+      }
+      insert.run(
+        row.id,
+        row.status ?? 'pending',
+        now,
+        now,
+        row.deliverAt,
+        row.summaryAt,
+      );
+    }
+    const expected = rows
+      .filter(
+        (row) =>
+          row.status !== 'delivered' &&
+          [row.deliverAt, row.summaryAt].some(
+            (cursor) =>
+              cursor !== null && new Date(cursor).getTime() <= instant,
+          ),
+      )
+      .map((row) => row.id)
+      .sort();
+    const inventory = new DeploymentInventory(binding as InventoryDatabase, {
+      now: () => instant,
+    });
+    const first = await inventory.read('pending-notifications', { limit: 1 });
+    expect(first.entries.map((entry) => entry.key[1])).toEqual(
+      expected.slice(0, 1),
+    );
+    expect(first.count).toBe(expected.length);
+    expect(first.totals).toEqual({
+      notDue:
+        rows.filter((row) => row.status !== 'delivered').length -
+        expected.length,
+    });
+    expect(await drain(inventory, 'pending-notifications', 1)).toEqual(
+      expected.map((id) => JSON.stringify(['thread', id])),
+    );
+    const dueNotifications = await notifications.listDueNotifications({
+      now: new Date(instant),
+      limit: rows.length,
+    });
+    expect(dueNotifications.map((row) => row.id).sort()).toEqual(expected);
   });
 
   it('reports standing configuration without asking a drain to empty it', async () => {

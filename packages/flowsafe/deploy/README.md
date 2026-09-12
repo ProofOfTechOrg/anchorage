@@ -42,6 +42,8 @@ Run and thread ids are server-minted opaque values. Resource ids are validated h
 
 ## Deploy the Worker
 
+Apply the `@mastra/core` patch flowsafe ships at your application root before deploying — see [Apply the flowsafe patch to @mastra/core](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/getting-started.md#apply-the-flowsafe-patch-to-mastracore).
+
 Run these commands from `packages/flowsafe`:
 
 ```bash

@@ -18,6 +18,10 @@ import {
   normalizeStartExecutionIdentity,
 } from './execution-admission.js';
 import { FencedWorkflowsStorageD1 } from './fenced-workflows-d1.js';
+import {
+  notificationTimestampMillis,
+  notificationTimestampSql,
+} from './notification-predicate.js';
 import { isPathSafeId } from './path-safe-id.js';
 import {
   decodeRunStartIdentity,
@@ -2006,9 +2010,8 @@ export interface PurgeExpiredNotificationsOptions {
  * rows from `mastra_notifications` once their `updatedAt` is older than the TTL,
  * at the storage layer so alarm maintenance reaps them without a live agent —
  * the same posture as the other purges (raw D1 binding, failure-isolated duty).
- * `updatedAt` is ISO-8601 TEXT, so lexicographic `<` is a correct timestamp
- * comparison. A missing table reads as zero (notifications may never have been
- * sent). Scheduling stays with the caller.
+ * A missing table reads as zero (notifications may never have been sent).
+ * Scheduling stays with the caller.
  */
 export async function purgeExpiredNotifications(
   db: SnapshotDatabase,
@@ -2016,14 +2019,14 @@ export async function purgeExpiredNotifications(
 ): Promise<number> {
   const prefix = validateTablePrefix(options.tablePrefix) ?? '';
   const now = options.now ?? Date.now;
-  const cutoff = new Date(now() - options.ttlMs).toISOString();
+  const cutoff = notificationTimestampMillis(new Date(now() - options.ttlMs));
   const placeholders = NOTIFICATION_TERMINAL_STATUSES.map(() => '?').join(', ');
   try {
     return d1Changes(
       await db
         .prepare(
           `DELETE FROM ${prefix}mastra_notifications
-           WHERE status IN (${placeholders}) AND updatedAt < ?`,
+           WHERE status IN (${placeholders}) AND ${notificationTimestampSql('updatedAt')} < ?`,
         )
         .bind(...NOTIFICATION_TERMINAL_STATUSES, cutoff)
         .run(),

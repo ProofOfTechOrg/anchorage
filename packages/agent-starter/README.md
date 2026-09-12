@@ -56,6 +56,8 @@ All six use the deployment's D1 database. `createComposedStorage()` overlays not
 
 ## Provision one physical deployment
 
+Application roots outside this workspace must apply the `@mastra/core` patch flowsafe ships — see [Apply the flowsafe patch to @mastra/core](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/getting-started.md#apply-the-flowsafe-patch-to-mastracore); this workspace applies it through the root `pnpm.patchedDependencies`.
+
 Each organization needs a dedicated Worker, D1 database, Durable Object namespaces, and internal Durable Object credential. Replace every `replace-me` segment in `wrangler.jsonc` with the stable lowercase deployment tag before creating resources. For tag `acme`, use Worker `anchorage-agent-starter-acme` and D1 database `anchorage-agent-starter-acme`; the unique Worker name creates the deployment's Durable Object namespaces. Then stamp the same tag into the new D1 database before any application schema or traffic:
 
 ```bash

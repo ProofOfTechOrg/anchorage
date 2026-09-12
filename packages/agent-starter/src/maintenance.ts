@@ -241,15 +241,25 @@ export function starterMaintenanceTick(env: Env): () => Promise<unknown> {
     },
     audit,
   });
-  const notifications = createNotificationDispatchTick({
-    storage: notificationsStore(env.DB),
-    topology: threadTopology,
-    resolveContext: () => systemContext(env, 'notification-dispatch'),
-    limit: 100,
-    executionFence: fence,
-  });
+  // Built on first use rather than at wiring time: an unpatched @mastra/core
+  // refuses this construction, and that refusal must fail the notifications
+  // leg of a pass, not the schedule leg that shares this tick nor the wiring
+  // of the maintenance duty.
+  let notifications:
+    | ReturnType<typeof createNotificationDispatchTick>
+    | undefined;
+  const notificationTick = () => {
+    notifications ??= createNotificationDispatchTick({
+      storage: notificationsStore(env.DB),
+      topology: threadTopology,
+      resolveContext: () => systemContext(env, 'notification-dispatch'),
+      limit: 100,
+      executionFence: fence,
+    });
+    return notifications();
+  };
   return async () => ({
     schedules: await schedules(),
-    notifications: await notifications(),
+    notifications: await notificationTick(),
   });
 }

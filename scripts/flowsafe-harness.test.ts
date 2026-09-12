@@ -1419,6 +1419,149 @@ describe.sequential('FlowSafe Wrangler test harness', () => {
     expect(outcome.rollbackSummary).not.toBe('should-rollback');
   });
 
+  it('F5 notification chronology selects ordinary due cursors before future expanded years under limit 1', async () => {
+    const outcomes = await result<
+      Array<{ cursor: string; boundedIds: string[]; dueIds: string[] }>
+    >(probe, '/notification-chronology/future');
+    expect(outcomes).toEqual([
+      { cursor: 'deliverAt', boundedIds: ['due'], dueIds: ['due'] },
+      { cursor: 'summaryAt', boundedIds: ['due'], dueIds: ['due'] },
+    ]);
+  });
+
+  it('F5 notification chronology orders raw offsets and truncates fractions before the due limit', async () => {
+    const outcomes = await result<
+      Array<{
+        cursor: string;
+        boundedIds: string[];
+        due: Array<{ id: string; at: number | null }>;
+        rawCursor: { cursor: string } | null;
+      }>
+    >(probe, '/notification-chronology/offsets');
+    expect(outcomes).toEqual(
+      ['deliverAt', 'summaryAt'].map((cursor) => ({
+        cursor,
+        boundedIds: ['first'],
+        due: [
+          {
+            id: 'first',
+            at: new Date('2026-09-09T10:30:00.123Z').getTime(),
+          },
+          {
+            id: 'second',
+            at: new Date('2026-09-09T10:45:00.123Z').getTime(),
+          },
+          {
+            id: 'third',
+            at: new Date('2026-09-09T11:00:00.123Z').getTime(),
+          },
+        ],
+        rawCursor: { cursor: '2026-09-09T12:30:00.1239+02:00' },
+      })),
+    );
+  });
+
+  it('F5 notification chronology compares negative cycles and Date endpoints with millisecond precision', async () => {
+    const outcomes = await result<
+      Array<{
+        name: string;
+        boundedIds: string[];
+        due: Array<{
+          id: string;
+          deliverAt: number | null;
+          summaryAt: number | null;
+        }>;
+      }>
+    >(probe, '/notification-chronology/bounds');
+    expect(outcomes).toEqual(
+      [
+        {
+          name: 'negative',
+          past: new Date('-000800-01-01T00:00:00.001Z').getTime(),
+          equal: new Date('-000400-01-01T00:00:00.000Z').getTime(),
+        },
+        {
+          name: 'minimum',
+          past: -8_640_000_000_000_000,
+          equal: -8_639_999_999_999_999,
+        },
+        {
+          name: 'maximum',
+          past: 8_639_999_999_999_998,
+          equal: 8_639_999_999_999_999,
+        },
+      ].map((fixture) => ({
+        name: fixture.name,
+        boundedIds: ['past'],
+        due: [
+          { id: 'past', deliverAt: fixture.past, summaryAt: null },
+          { id: 'equal', deliverAt: null, summaryAt: fixture.equal },
+        ],
+      })),
+    );
+  });
+
+  it('F5 notification chronology lists updated instants across offsets and expanded years before the limit', async () => {
+    const outcome = await result<{
+      boundedIds: string[];
+      records: Array<{ id: string; updatedAt: number }>;
+    }>(probe, '/notification-chronology/list');
+    expect(outcome).toEqual({
+      boundedIds: ['maximum', 'expanded', 'ordinary'],
+      records: [
+        { id: 'maximum', updatedAt: 8_640_000_000_000_000 },
+        {
+          id: 'expanded',
+          updatedAt: new Date('+010000-01-01T00:00:00.000Z').getTime(),
+        },
+        {
+          id: 'ordinary',
+          updatedAt: new Date('2026-09-09T11:00:00.000Z').getTime(),
+        },
+        {
+          id: 'offset',
+          updatedAt: new Date('2026-09-09T10:30:00.000Z').getTime(),
+        },
+        {
+          id: 'negative',
+          updatedAt: new Date('-000001-01-01T00:00:00.000Z').getTime(),
+        },
+        { id: 'minimum', updatedAt: -8_640_000_000_000_000 },
+      ],
+    });
+  });
+
+  it('F5 notification chronology TTL preserves future receipts, cutoff equality and pending work', async () => {
+    const outcome = await result<{
+      purged: number;
+      after: Array<{ id: string; status: string; updatedAt: string }>;
+      futureSignalId: string | null;
+      repeated: number;
+    }>(probe, '/notification-chronology/ttl');
+    expect(outcome).toEqual({
+      purged: 1,
+      after: [
+        {
+          id: 'equal',
+          status: 'delivered',
+          updatedAt: '2026-09-09T10:00:00.000-0100',
+        },
+        {
+          id: 'future',
+          status: 'delivered',
+          updatedAt: '+010000-01-01T00:00:00.000Z',
+        },
+        {
+          id: 'pending',
+          status: 'pending',
+          updatedAt: '2020-01-01T00:00:00.000Z',
+        },
+      ],
+      futureSignalId: 'signal-future',
+      repeated: 0,
+    });
+  });
+
   it('preserves concurrent background workflow state and results in Mastra D1', async () => {
     const outcome = await result<{
       supportsConcurrentUpdates: boolean;

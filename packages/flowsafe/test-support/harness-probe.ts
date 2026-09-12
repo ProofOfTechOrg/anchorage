@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import type { CreateNotificationInput } from '@mastra/core/notifications';
 import { createEmptyWorkflowSnapshot } from '@mastra/core/storage';
 import { z } from 'zod';
 import { EXECUTION_FENCE_TABLE } from '#deployment-identity-protocol';
@@ -18,6 +19,7 @@ import type { ApprovalRecord } from '../src/approval-api/types.js';
 import { createBackgroundTaskD1Domains } from '../src/background-tasks/d1-storage.js';
 import {
   createD1Storage,
+  purgeExpiredNotifications,
   purgeExpiredThreads,
   purgeExpiredWorkflowRuns,
   type RunRetentionCursor,
@@ -391,6 +393,266 @@ async function notificationProbe(db: D1Database): Promise<unknown> {
     ordinalColumns: ordinalColumns.results.filter(
       ({ name }) => name === 'insertionOrdinal',
     ).length,
+  };
+}
+
+function createChronologyNotification(
+  storage: D1NotificationsStorage,
+  input: Partial<CreateNotificationInput>,
+) {
+  return storage.createNotification({
+    threadId: 'thread-chronology',
+    source: 'source',
+    kind: 'kind',
+    summary: 'summary',
+    createdAt: new Date('2026-09-09T10:00:00.000Z'),
+    ...input,
+  });
+}
+
+async function notificationChronologyFutureProbe(db: D1Database) {
+  const storage = new D1NotificationsStorage(db, '');
+  const outcomes = [];
+  for (const cursor of ['deliverAt', 'summaryAt'] as const) {
+    await createChronologyNotification(storage, {
+      id: 'future',
+      threadId: cursor,
+      resourceId: cursor,
+      [cursor]: new Date('+010000-01-01T00:00:00.000Z'),
+    });
+    await createChronologyNotification(storage, {
+      id: 'due',
+      threadId: cursor,
+      resourceId: cursor,
+      [cursor]: new Date('2026-09-09T11:59:59.000Z'),
+    });
+    const query = {
+      now: new Date('2026-09-09T12:00:00.000Z'),
+      resourceId: cursor,
+    };
+    outcomes.push({
+      cursor,
+      boundedIds: (
+        await storage.listDueNotifications({ ...query, limit: 1 })
+      ).map((record) => record.id),
+      dueIds: (await storage.listDueNotifications(query)).map(
+        (record) => record.id,
+      ),
+    });
+  }
+  return outcomes;
+}
+
+async function notificationChronologyOffsetsProbe(db: D1Database) {
+  const storage = new D1NotificationsStorage(db, '');
+  const outcomes = [];
+  const fixtures = [
+    { id: 'first', at: '2026-09-09T12:30:00.1239+02:00' },
+    { id: 'second', at: '2026-09-09T09:45:00.123-0100' },
+    { id: 'third', at: '2026-09-09T11:00:00.123Z' },
+  ];
+  for (const cursor of ['deliverAt', 'summaryAt'] as const) {
+    for (const fixture of fixtures) {
+      await createChronologyNotification(storage, {
+        id: fixture.id,
+        threadId: cursor,
+        resourceId: cursor,
+      });
+      await db
+        .prepare(
+          `UPDATE mastra_notifications SET ${cursor} = ?
+           WHERE thread_id = ? AND id = ?`,
+        )
+        .bind(fixture.at, cursor, fixture.id)
+        .run();
+    }
+    const bounded = await storage.listDueNotifications({
+      now: new Date('2026-09-09T10:30:00.123Z'),
+      resourceId: cursor,
+      limit: 1,
+    });
+    const due = await storage.listDueNotifications({
+      now: new Date('2026-09-09T12:00:00.000Z'),
+      resourceId: cursor,
+    });
+    outcomes.push({
+      cursor,
+      boundedIds: bounded.map((record) => record.id),
+      due: due.map((record) => ({
+        id: record.id,
+        at: record[cursor]?.getTime() ?? null,
+      })),
+      rawCursor: await db
+        .prepare(
+          `SELECT ${cursor} AS cursor FROM mastra_notifications
+           WHERE thread_id = ? AND id = ?`,
+        )
+        .bind(cursor, 'first')
+        .first<{ cursor: string }>(),
+    });
+  }
+  return outcomes;
+}
+
+async function notificationChronologyBoundsProbe(db: D1Database) {
+  const storage = new D1NotificationsStorage(db, '');
+  const outcomes = [];
+  const fixtures = [
+    {
+      name: 'negative',
+      past: '-000800-01-01T00:00:00.001Z',
+      now: '-000400-01-01T00:00:00.000Z',
+      future: '-000001-01-01T00:00:00.000Z',
+    },
+    {
+      name: 'minimum',
+      past: '-271821-04-20T00:00:00.000Z',
+      now: '-271821-04-20T00:00:00.001Z',
+      future: '-271821-04-20T00:00:00.002Z',
+    },
+    {
+      name: 'maximum',
+      past: '+275760-09-12T23:59:59.998Z',
+      now: '+275760-09-12T23:59:59.999Z',
+      future: '+275760-09-13T00:00:00.000Z',
+    },
+  ];
+  for (const fixture of fixtures) {
+    const scope = { threadId: fixture.name, resourceId: fixture.name };
+    const now = new Date(fixture.now);
+    await createChronologyNotification(storage, {
+      ...scope,
+      id: 'past',
+      deliverAt: new Date(fixture.past),
+    });
+    await createChronologyNotification(storage, {
+      ...scope,
+      id: 'equal',
+      summaryAt: now,
+    });
+    await createChronologyNotification(storage, {
+      ...scope,
+      id: 'future',
+      deliverAt: new Date(fixture.future),
+      summaryAt: new Date(fixture.future),
+    });
+    const query = { now, resourceId: fixture.name };
+    const bounded = await storage.listDueNotifications({ ...query, limit: 1 });
+    const due = await storage.listDueNotifications(query);
+    outcomes.push({
+      name: fixture.name,
+      boundedIds: bounded.map((record) => record.id),
+      due: due.map((record) => ({
+        id: record.id,
+        deliverAt: record.deliverAt?.getTime() ?? null,
+        summaryAt: record.summaryAt?.getTime() ?? null,
+      })),
+    });
+  }
+  return outcomes;
+}
+
+async function notificationChronologyListProbe(db: D1Database) {
+  const storage = new D1NotificationsStorage(db, '');
+  const fixtures = [
+    { id: 'minimum', at: '-271821-04-20T00:00:00.000Z' },
+    { id: 'negative', at: '-000001-01-01T00:00:00.000Z' },
+    { id: 'offset', at: '2026-09-09T12:30:00.000+02:00' },
+    { id: 'ordinary', at: '2026-09-09T11:00:00.000Z' },
+    { id: 'expanded', at: '+010000-01-01T00:00:00.000Z' },
+    { id: 'maximum', at: '+275760-09-13T00:00:00.000Z' },
+  ];
+  for (const fixture of fixtures) {
+    await createChronologyNotification(storage, {
+      id: fixture.id,
+      createdAt: new Date(fixture.at),
+    });
+  }
+  await db
+    .prepare(
+      'UPDATE mastra_notifications SET updatedAt = ? WHERE thread_id = ? AND id = ?',
+    )
+    .bind('2026-09-09T12:30:00.000+02:00', 'thread-chronology', 'offset')
+    .run();
+  return {
+    boundedIds: (
+      await storage.listNotifications({
+        threadId: 'thread-chronology',
+        limit: 3,
+      })
+    ).map((record) => record.id),
+    records: (
+      await storage.listNotifications({ threadId: 'thread-chronology' })
+    ).map((record) => ({
+      id: record.id,
+      updatedAt: record.updatedAt.getTime(),
+    })),
+  };
+}
+
+async function notificationChronologyTtlProbe(db: D1Database) {
+  const storage = new D1NotificationsStorage(db, '');
+  const fixtures = [
+    {
+      id: 'future',
+      status: 'delivered',
+      updatedAt: '+010000-01-01T00:00:00.000Z',
+    },
+    {
+      id: 'older',
+      status: 'delivered',
+      updatedAt: '2026-09-09T12:59:59.999+02:00',
+    },
+    {
+      id: 'equal',
+      status: 'delivered',
+      updatedAt: '2026-09-09T10:00:00.000-0100',
+    },
+    {
+      id: 'pending',
+      status: 'pending',
+      updatedAt: '2020-01-01T00:00:00.000Z',
+    },
+  ] as const;
+  for (const fixture of fixtures) {
+    await createChronologyNotification(storage, {
+      id: fixture.id,
+      createdAt: new Date(fixture.updatedAt),
+    });
+    if (fixture.status === 'delivered') {
+      await storage.updateNotification({
+        threadId: 'thread-chronology',
+        id: fixture.id,
+        status: fixture.status,
+        deliveredSignalId: `signal-${fixture.id}`,
+      });
+    }
+    await db
+      .prepare(
+        'UPDATE mastra_notifications SET updatedAt = ? WHERE thread_id = ? AND id = ?',
+      )
+      .bind(fixture.updatedAt, 'thread-chronology', fixture.id)
+      .run();
+  }
+  const options = {
+    now: () => new Date('2026-09-09T12:00:00.000Z').getTime(),
+    ttlMs: 60 * 60 * 1000,
+  };
+  const purged = await purgeExpiredNotifications(db, options);
+  const { results: after } = await db
+    .prepare(
+      'SELECT id, status, updatedAt FROM mastra_notifications ORDER BY id',
+    )
+    .all<{ id: string; status: string; updatedAt: string }>();
+  const future = await storage.getNotification({
+    threadId: 'thread-chronology',
+    id: 'future',
+  });
+  return {
+    purged,
+    after,
+    futureSignalId: future?.deliveredSignalId ?? null,
+    repeated: await purgeExpiredNotifications(db, options),
   };
 }
 
@@ -3144,6 +3406,16 @@ const handler = {
         await seedDeploymentIdentity(env.DB, 'spike', 'open');
         return Response.json({ ok: true });
       }
+      if (path === '/notification-chronology/future')
+        return Response.json(await notificationChronologyFutureProbe(env.DB));
+      if (path === '/notification-chronology/offsets')
+        return Response.json(await notificationChronologyOffsetsProbe(env.DB));
+      if (path === '/notification-chronology/bounds')
+        return Response.json(await notificationChronologyBoundsProbe(env.DB));
+      if (path === '/notification-chronology/list')
+        return Response.json(await notificationChronologyListProbe(env.DB));
+      if (path === '/notification-chronology/ttl')
+        return Response.json(await notificationChronologyTtlProbe(env.DB));
       if (path === '/p3-cleanup') return Response.json(await p3Cleanup(env.DB));
       if (path === '/epoch-p3/isolation-missing-witness')
         return Response.json({ metrics: { diagnostic: p3Metrics() } });

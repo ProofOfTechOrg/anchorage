@@ -70,6 +70,7 @@ import {
   type ThreadScope,
 } from '../do-runner/index.js';
 import { internalErrorResponse } from '../internal-error-response.js';
+import { positiveSafeInteger } from '../numeric-config.js';
 import {
   createScheduleAgentDispatchReceipt,
   type ScheduleAgentDispatchAction,
@@ -78,9 +79,15 @@ import {
 } from '../schedules/schedules-d1.js';
 import type { AgentScheduleTarget } from '../schedules/tick.js';
 import {
-  deferNotificationAfterFailure,
+  assertNotificationSourceKeysPatched,
+  captureNotificationDeliverySelection,
+  captureNotificationDeliveryStorage,
+  DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS,
   MAX_NOTIFICATION_DISPATCH_IDS,
+  type NotificationDeliveryObservation,
   planNotificationDispatch,
+  recordNotificationDeliveryFailure,
+  reportNotificationDeliveryError,
 } from './notification-dispatch.js';
 
 /**
@@ -302,6 +309,8 @@ export interface ThreadSignalRoutesOptions {
   resolveNotificationsStorage?: (
     scope: ThreadScope,
   ) => NotificationsStorage | Promise<NotificationsStorage>;
+  /** Failed delivery rounds before a pending notification is discarded. */
+  maxDeliveryAttempts?: number;
   /** Target-side lease and receipt store for at-least-once schedule fires. */
   resolveScheduleDispatchStore?: (
     scope: ThreadScope,
@@ -487,6 +496,10 @@ function signalContentPolicyResponse(
 export function createThreadSignalRoutes(
   options: ThreadSignalRoutesOptions,
 ): ThreadSignalRouter {
+  const maxDeliveryAttempts = positiveSafeInteger(
+    options.maxDeliveryAttempts ?? DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS,
+    'notification maximum delivery attempts',
+  );
   const {
     resolveAgent,
     resolveResourceId,
@@ -867,6 +880,7 @@ export function createThreadSignalRoutes(
             persistenceAllowed,
             memoryAvailable,
             storage: await resolveNotificationsStorage(scope),
+            maxDeliveryAttempts,
             agentId: requestedAgentId,
             inspectContent,
             proof,
@@ -952,6 +966,7 @@ async function handleNotificationDispatch(options: {
   persistenceAllowed: boolean;
   memoryAvailable: MemoryAvailable;
   storage: NotificationsStorage;
+  maxDeliveryAttempts: number;
   agentId: string;
   inspectContent?: InspectSignalContent;
   proof?: SignalProofGuard;
@@ -997,6 +1012,7 @@ async function handleNotificationDispatch(options: {
   if (Number.isNaN(now.getTime())) {
     return json({ error: 'now must be an ISO timestamp' }, 400);
   }
+  const nowMs = now.getTime();
   const carriesBatchThreadState = Object.hasOwn(
     options.body,
     'batchThreadState',
@@ -1014,33 +1030,62 @@ async function handleNotificationDispatch(options: {
     );
   }
 
-  const records: NotificationRecord[] = [];
+  assertNotificationSourceKeysPatched();
+  const deliveryStorage = captureNotificationDeliveryStorage(options.storage);
+  const selections: ReturnType<typeof captureNotificationDeliverySelection>[] =
+    [];
+  // A record settles once: an already-discarded record must not be counted
+  // twice, nor have its content-policy reason overwritten by an unrelated
+  // storage error. `recordFailure` returns early for the same reason.
+  const settled = new Set<string>();
+  let delivered = 0;
+  let failed = 0;
+  let discarded = 0;
   let skipped = 0;
+  const settle = (
+    id: string,
+    outcome: 'delivered' | 'failed' | 'discarded' | 'skipped',
+  ) => {
+    if (settled.has(id)) return;
+    settled.add(id);
+    if (outcome === 'delivered') delivered += 1;
+    else if (outcome === 'failed') failed += 1;
+    else if (outcome === 'discarded') discarded += 1;
+    else skipped += 1;
+  };
   for (const id of uniqueIds) {
-    const current = await options.storage.getNotification({
+    const current = await deliveryStorage.getNotification({
       threadId: options.threadId,
       id,
     });
     if (current?.status !== 'pending' || current.deliveredSignalId) {
-      skipped += 1;
+      settle(id, 'skipped');
       continue;
     }
     if (
+      current.id !== id ||
+      current.threadId !== options.threadId ||
       current.resourceId !== options.resourceId ||
       current.agentId !== options.agentId
     ) {
       return json({ error: 'notification binding does not match' }, 404);
     }
-    const due =
-      (current.deliverAt !== undefined &&
-        current.deliverAt.getTime() <= now.getTime()) ||
-      (current.summaryAt !== undefined &&
-        current.summaryAt.getTime() <= now.getTime());
-    if (!due) {
-      skipped += 1;
-      continue;
+    try {
+      const selection = captureNotificationDeliverySelection(current);
+      const { record } = selection;
+      const due =
+        (record.deliverAt !== undefined &&
+          record.deliverAt.getTime() <= nowMs) ||
+        (record.summaryAt !== undefined && record.summaryAt.getTime() <= nowMs);
+      if (!due) {
+        settle(id, 'skipped');
+        continue;
+      }
+      selections.push(selection);
+    } catch (error) {
+      settle(id, 'failed');
+      reportNotificationDeliveryError(error);
     }
-    records.push(current);
   }
 
   const batchThreadState: 'active' | 'idle' =
@@ -1052,21 +1097,24 @@ async function handleNotificationDispatch(options: {
         ? 'active'
         : 'idle';
 
-  let delivered = 0;
-  let failed = 0;
-  let discarded = 0;
-  // Records whose terminal discard is already durable. A later throw in the
-  // same group funnels the group into `updateFailure`; without this, an
-  // already-discarded record would be counted twice and have its
-  // content-policy reason overwritten by an unrelated storage error.
-  const settledDiscards = new Set<string>();
-  const updateFailure = async (record: NotificationRecord, error: unknown) => {
-    if (isExecutionFenceRefusal(error)) throw error;
-    if (settledDiscards.has(record.id)) return;
+  const recordFailure = async (
+    expected: NotificationDeliveryObservation | undefined,
+    action: { type: 'failure'; error: unknown } | { type: 'exhausted' },
+  ) => {
+    if (action.type === 'failure' && isExecutionFenceRefusal(action.error))
+      throw action.error;
+    if (!expected) throw new Error('notification observation is unavailable');
+    if (settled.has(expected.id)) return;
     await options.proof?.check();
     options.proof?.assertActive();
-    failed += 1;
-    await deferNotificationAfterFailure(options.storage, record, now, error);
+    const outcome = await recordNotificationDeliveryFailure(
+      deliveryStorage,
+      expected,
+      new Date(nowMs),
+      options.maxDeliveryAttempts,
+      action,
+    );
+    settle(expected.id, outcome === 'discarded' ? 'discarded' : 'failed');
   };
   const discardAfterDenial = async (record: NotificationRecord) => {
     await options.proof?.check();
@@ -1076,10 +1124,9 @@ async function handleNotificationDispatch(options: {
       threadId: record.threadId,
       status: 'discarded',
       deliveryReason: 'content-policy-denied',
-      lastDeliveryAttemptAt: now,
+      lastDeliveryAttemptAt: new Date(nowMs),
     });
-    settledDiscards.add(record.id);
-    discarded += 1;
+    settle(record.id, 'discarded');
   };
   const inspect = async (
     signal: AgentSignal,
@@ -1178,12 +1225,22 @@ async function handleNotificationDispatch(options: {
     return result.signal.id;
   };
 
+  const records: NotificationRecord[] = [];
+  const observations = new Map<string, NotificationDeliveryObservation>();
+  for (const { record, expected } of selections) {
+    if (expected.deliveryAttempts >= options.maxDeliveryAttempts) {
+      await recordFailure(expected, { type: 'exhausted' });
+      continue;
+    }
+    records.push(record);
+    observations.set(record.id, expected);
+  }
+
   for (const item of planNotificationDispatch(records, now)) {
     if (item.type === 'summary') {
-      // Everything from rendering onward stays inside this try: a storage
-      // failure in the discard/failure bookkeeping below must be contained to
-      // this group, exactly as the individual branch contains its own, rather
-      // than escaping and abandoning the rest of the plan.
+      // A summary group's failure, from rendering through bookkeeping, is
+      // contained to this group rather than escaping and abandoning the rest
+      // of the plan.
       try {
         const signal = createNotificationSummarySignal(
           summarizeNotifications(item.records),
@@ -1195,10 +1252,10 @@ async function handleNotificationDispatch(options: {
         }
         if (inspection === 'error') {
           for (const record of item.records) {
-            await updateFailure(
-              record,
-              new Error('signal content policy failed'),
-            );
+            await recordFailure(observations.get(record.id), {
+              type: 'failure',
+              error: new Error('signal content policy failed'),
+            });
           }
           continue;
         }
@@ -1217,37 +1274,57 @@ async function handleNotificationDispatch(options: {
             threadId: record.threadId,
             summaryAt: null,
             summarySignalId: signalId,
-            lastDeliveryAttemptAt: now,
+            lastDeliveryAttemptAt: new Date(nowMs),
           });
-          delivered += 1;
+          settle(record.id, 'delivered');
         }
       } catch (error) {
-        for (const record of item.records) await updateFailure(record, error);
+        for (const record of item.records) {
+          await recordFailure(observations.get(record.id), {
+            type: 'failure',
+            error,
+          });
+        }
       }
       continue;
     }
 
     const selected = item.record;
+    let expected = observations.get(selected.id);
     try {
-      const record = await options.storage.getNotification({
+      const current = await deliveryStorage.getNotification({
         threadId: selected.threadId,
         id: selected.id,
       });
+      if (
+        current?.status !== 'pending' ||
+        current.deliveredSignalId ||
+        current.id !== selected.id ||
+        current.threadId !== options.threadId ||
+        current.resourceId !== resourceId ||
+        current.agentId !== options.agentId
+      ) {
+        settle(selected.id, 'skipped');
+        continue;
+      }
+      // Clearing the pre-read observation keeps a failure between here and the
+      // re-capture from being recorded against stale state.
+      expected = undefined;
+      const selection = captureNotificationDeliverySelection(current);
+      const { record } = selection;
+      expected = selection.expected;
       const summaryDue = Boolean(
-        record?.summaryAt && record.summaryAt.getTime() <= now.getTime(),
+        record.summaryAt && record.summaryAt.getTime() <= nowMs,
       );
       const deliveryDue = Boolean(
-        record?.deliverAt && record.deliverAt.getTime() <= now.getTime(),
+        record.deliverAt && record.deliverAt.getTime() <= nowMs,
       );
-      if (
-        record?.status !== 'pending' ||
-        record.deliveredSignalId ||
-        record.resourceId !== resourceId ||
-        record.agentId !== options.agentId ||
-        summaryDue ||
-        !deliveryDue
-      ) {
-        skipped += 1;
+      if (summaryDue || !deliveryDue) {
+        settle(selected.id, 'skipped');
+        continue;
+      }
+      if (expected.deliveryAttempts >= options.maxDeliveryAttempts) {
+        await recordFailure(expected, { type: 'exhausted' });
         continue;
       }
       if (
@@ -1255,13 +1332,13 @@ async function handleNotificationDispatch(options: {
         record.summarySignalId &&
         batchThreadState === 'active'
       ) {
-        skipped += 1;
+        settle(selected.id, 'skipped');
         continue;
       }
       const signal = createNotificationSignal({
         ...record,
         status: 'delivered',
-        deliveredAt: now,
+        deliveredAt: new Date(nowMs),
       });
       const inspection = await inspect(signal);
       if (inspection === 'denied') {
@@ -1269,7 +1346,10 @@ async function handleNotificationDispatch(options: {
         continue;
       }
       if (inspection === 'error') {
-        await updateFailure(record, new Error('signal content policy failed'));
+        await recordFailure(expected, {
+          type: 'failure',
+          error: new Error('signal content policy failed'),
+        });
         continue;
       }
       const signalId = await send(signal);
@@ -1280,11 +1360,16 @@ async function handleNotificationDispatch(options: {
         threadId: record.threadId,
         status: 'delivered',
         deliveredSignalId: signalId,
-        lastDeliveryAttemptAt: now,
+        lastDeliveryAttemptAt: new Date(nowMs),
       });
-      delivered += 1;
+      settle(record.id, 'delivered');
     } catch (error) {
-      await updateFailure(selected, error);
+      if (isExecutionFenceRefusal(error)) throw error;
+      if (expected) await recordFailure(expected, { type: 'failure', error });
+      else {
+        settle(selected.id, 'failed');
+        reportNotificationDeliveryError(error);
+      }
     }
   }
 

@@ -180,6 +180,15 @@ jobs:
       # @mastra/* exclude does not cover and which would wedge the probe on
       # ERR_PNPM_NO_MATURE_MATCHING_VERSION. Scoped to this one resolution;
       # every real install keeps the workspace gate.
+      # The workspace pins packages/flowsafe/patches/@mastra__core@1.53.0.patch
+      # to @mastra/core@1.53.0 through pnpm.patchedDependencies, and pnpm
+      # refuses an install whose patch targets a version no longer in the
+      # graph. This job drops that entry in its disposable checkout and
+      # resolves the newest core unpatched, so flowsafe's notification tick and
+      # dispatch refuse with a message naming the patch and
+      # notification-source-keys.test.ts reports its probe cases as the
+      # readable signal. See the maintainer guide's Mastra compatibility
+      # section.
       - name: Bump @mastra/core to newest 1.x
         id: mastra_versions
         run: |
@@ -187,6 +196,7 @@ jobs:
           D1_VERSION=$(npm view '@mastra/cloudflare-d1@^1' version --json | node -e 'const d=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(Array.isArray(d)?d.at(-1):d)')
           echo "core=$CORE_VERSION" >> "$GITHUB_OUTPUT"
           echo "d1=$D1_VERSION" >> "$GITHUB_OUTPUT"
+          node -e 'const fs=require("node:fs");const m=JSON.parse(fs.readFileSync("package.json","utf8"));delete m.pnpm.patchedDependencies;fs.writeFileSync("package.json",`${JSON.stringify(m,null,2)}\n`)'
           pnpm -r update --config.minimum-release-age=0 "@mastra/core@$CORE_VERSION" "@mastra/cloudflare-d1@$D1_VERSION"
           pnpm --filter @proofoftech/breakwater list @mastra/core
           pnpm --filter @proofoftech/flowsafe list @mastra/core @mastra/cloudflare-d1

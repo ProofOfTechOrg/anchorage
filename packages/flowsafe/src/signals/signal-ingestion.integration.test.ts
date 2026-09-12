@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-// One signal ingested through the FULL chain: createSignalRouter's ingestion
-// gate → real createThreadTopology → real ThreadDurableObject (its
-// stamped-principal assertion) → the production thread signal routes → a
-// runtime-driven reserve agent, with NO LLM. The unit suites
-// each mock a seam; this one wires the real seams together so the ingestion
-// boundary has one end-to-end proof, including the idle-wake run cap consulted
-// both allowing and capping, plus a foreign path-safe thread refusal.
+// The unit suites each mock a seam; this file wires the real seams together:
+// the real dispatch tick, the real thread topology, the real thread-DO signal
+// routes and a SQLite-backed D1 notification store.
 
-import type { Agent } from '@mastra/core/agent';
+import type { Agent, AgentSignal } from '@mastra/core/agent';
+import type { NotificationRecord } from '@mastra/core/notifications';
 import { RequestContext } from '@mastra/core/request-context';
 import { InMemoryStore } from '@mastra/core/storage';
 import {
@@ -19,12 +16,16 @@ import {
 } from '@proofoftech/breakwater';
 import { describe, expect, it, vi } from 'vitest';
 
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import { RUNTIME_DRIVEN_AGENT } from '../agent-runner/index.js';
 import type { ActorContext, ApprovalActor } from '../approval-api/index.js';
 import {
   breakwaterActorFor,
+  createPrincipalActorContext,
   humanPrincipal,
+  InMemoryApprovalStoreFactory,
   principalAuditFields,
+  trustAutomationPrincipal,
 } from '../approval-api/index.js';
 import {
   type InitResult,
@@ -39,6 +40,9 @@ import {
   type ThreadNamespaceLike,
   type ThreadTopology,
 } from '../host-kit/index.js';
+import type { SignalDatabase } from './d1-shared.js';
+import { createNotificationDispatchTick } from './notification-dispatch.js';
+import { D1NotificationsStorage } from './notifications-d1.js';
 import { createSignalRouter } from './router.js';
 import {
   createThreadSignalRoutes,
@@ -58,6 +62,7 @@ function createThreadTopology<Id>(
 
 interface TestEnv {
   agent: Agent;
+  resolveNotificationsStorage?: () => D1NotificationsStorage;
   consultRunCap?: RunCapConsult;
   startIdleRun?: StartIdleRun;
   contentPolicy?: SignalContentPolicy;
@@ -83,6 +88,7 @@ class TestThread extends ThreadDurableObject<TestEnv> {
     resolveResourceId: () => resourceIdFromKey('itest'),
     consultRunCap: this.env.consultRunCap,
     startIdleRun: this.env.startIdleRun,
+    resolveNotificationsStorage: this.env.resolveNotificationsStorage,
     ...(this.env.contentPolicy !== undefined
       ? { contentPolicy: this.env.contentPolicy }
       : {}),
@@ -109,7 +115,10 @@ class TestThread extends ThreadDurableObject<TestEnv> {
 // A namespace over in-memory TestThread instances: idFromName(name)=name and
 // get() memoizes one instance per thread name — its DO identity is its id.name,
 // exactly what the base class uses as the authoritative thread address.
-function threadNamespace(env: TestEnv): ThreadNamespaceLike<string> {
+function threadNamespace(
+  env: TestEnv,
+  afterResponse?: (response: Response) => Promise<void>,
+): ThreadNamespaceLike<string> {
   const instances = new Map<string, TestThread>();
   return {
     idFromName: (name) => name,
@@ -121,17 +130,20 @@ function threadNamespace(env: TestEnv): ThreadNamespaceLike<string> {
       }
       const instance = inst;
       return {
-        fetch: (
+        fetch: async (
           input: Request | string,
           reqInit?: {
             method?: string;
             headers?: Record<string, string>;
             body?: string;
           },
-        ) =>
-          instance.fetch(
+        ) => {
+          const response = await instance.fetch(
             typeof input === 'string' ? new Request(input, reqInit) : input,
-          ),
+          );
+          await afterResponse?.(response);
+          return response;
+        },
       };
     },
   };
@@ -165,16 +177,24 @@ function actorContext(): ActorContext {
 
 // A runtime-driven reserve agent (no LLM): records the ifIdle target sendMessage
 // received. The brand is what lets a wake pass the thread-route gate.
-function reserveAgent(): {
-  agent: Agent;
-  targets: Array<{ ifIdle?: unknown }>;
-} {
+function reserveAgent() {
   const targets: Array<{ ifIdle?: unknown }> = [];
+  const sendSignal = vi.fn(
+    (signal: AgentSignal, target: { ifIdle?: unknown }) => {
+      targets.push(target);
+      return {
+        signal,
+        accepted: Promise.resolve({ action: 'persist' as const }),
+        persisted: Promise.resolve(),
+      };
+    },
+  );
   const agent = {
     id: 'reserve',
     [RUNTIME_DRIVEN_AGENT]: true,
     __setPubSub: () => {},
     getMemory: () => ({ saveMessages: vi.fn() }),
+    sendSignal,
     sendMessage: (_message: unknown, target: { ifIdle?: unknown }) => {
       targets.push(target);
       return {
@@ -183,7 +203,7 @@ function reserveAgent(): {
       };
     },
   } as unknown as Agent;
-  return { agent, targets };
+  return { agent, targets, sendSignal };
 }
 
 function wake(threadId: string): Request {
@@ -388,5 +408,374 @@ describe('signal ingestion — Breakwater content gate over the full chain', () 
       decision: 'allowed',
       detail: { evaluated: ['no-credentials'] },
     });
+  });
+});
+
+describe('notification dispatch — lost response after the thread DO handler', () => {
+  it.each([
+    'summary',
+    'individual',
+    'denial',
+    'recorded-failure',
+  ] as const)('preserves the actual %s receipt across the outer tick fallback', async (mode) => {
+    const now = new Date('2026-07-20T12:00:00.000Z');
+    const futureDelivery = new Date(now.getTime() + 60_000);
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(now);
+    try {
+      const sqlite = openSqlite();
+      const storage = new D1NotificationsStorage(
+        sqliteUnitDatabase(sqlite) as SignalDatabase,
+      );
+      const { agent, sendSignal } = reserveAgent();
+      if (mode === 'recorded-failure') {
+        sendSignal.mockImplementation(() => {
+          throw new Error('original receiver refusal');
+        });
+      }
+      const record = await storage.createNotification({
+        id: `lost-${mode}`,
+        threadId: THREAD_ID,
+        resourceId: resourceIdFromKey('itest'),
+        agentId: agent.id,
+        source: 'provider',
+        kind: 'changed',
+        summary: 'notification input',
+        priority: mode === 'summary' ? 'low' : 'urgent',
+        deliverAt:
+          mode === 'summary' ? futureDelivery : new Date(now.getTime() - 1),
+        summaryAt: mode === 'summary' ? new Date(now.getTime() - 1) : undefined,
+        payload: { version: 1 },
+      });
+      const lookup = { threadId: THREAD_ID, id: record.id };
+      const rawReceipt = () =>
+        sqlite
+          .prepare(
+            'SELECT * FROM mastra_notifications WHERE thread_id = ? AND id = ?',
+          )
+          .get(lookup.threadId, lookup.id);
+      const before = await storage.getNotification(lookup);
+      const beforeRaw = rawReceipt();
+      let durableReceipt: NotificationRecord | null = null;
+      let durableRaw: unknown;
+      let routeResult: unknown;
+      const responseReceived = vi.fn(async (response: Response) => {
+        expect(response.status).toBe(200);
+        routeResult = await response.clone().json();
+        durableReceipt = await storage.getNotification(lookup);
+        durableRaw = rawReceipt();
+        throw new Error('thread handler response lost');
+      });
+      const contentPolicy = vi.fn<SignalContentPolicy>(() =>
+        mode === 'denial'
+          ? { allowed: false, outcome: 'denied' }
+          : { allowed: true },
+      );
+      const topology = createThreadTopology(
+        threadNamespace(
+          {
+            agent,
+            resolveNotificationsStorage: () => storage,
+            contentPolicy,
+          },
+          responseReceived,
+        ),
+      );
+      const context = createPrincipalActorContext({
+        principal: trustAutomationPrincipal({
+          kind: 'system',
+          id: 'notification-maintenance',
+          purpose: 'notification.dispatch',
+        }),
+        storeFactory: new InMemoryApprovalStoreFactory(),
+        buildService: () => {
+          throw new Error('approval service is not used in notification tests');
+        },
+      });
+      const conditional = vi.spyOn(
+        storage,
+        'updateNotificationDeliveryIfUnchanged',
+      );
+      const tick = createNotificationDispatchTick({
+        storage,
+        topology,
+        resolveContext: () => context,
+        executionFence: 'none',
+        now: () => now,
+      });
+
+      expect(await tick()).toEqual({ due: 1, delivered: 0, failed: 1 });
+      expect(responseReceived).toHaveBeenCalledOnce();
+      expect(contentPolicy).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          principal: {
+            kind: 'system',
+            id: 'notification-maintenance',
+            purpose: 'notification.dispatch',
+          },
+          threadId: THREAD_ID,
+          resourceId: resourceIdFromKey('itest'),
+          entryPath: 'notification.dispatch',
+        }),
+      );
+      expect(durableReceipt).not.toEqual(before);
+      expect(durableRaw).not.toEqual(beforeRaw);
+      expect(durableReceipt).toMatchObject({ updatedAt: before?.updatedAt });
+      expect(await storage.getNotification(lookup)).toEqual(durableReceipt);
+      expect(rawReceipt()).toEqual(durableRaw);
+      expect(conditional).toHaveBeenCalledTimes(
+        mode === 'recorded-failure' ? 2 : 1,
+      );
+      const outerFailure = conditional.mock.calls.at(-1)?.[0];
+      expect(outerFailure).toMatchObject({
+        expected: {
+          deliveryAttempts: 0,
+          summarySignalId: null,
+          deliveredSignalId: null,
+        },
+        failure: {
+          type: 'retry',
+          deliveryAttempts: 1,
+          lastDeliveryError: 'thread handler response lost',
+        },
+      });
+      expect(await conditional.mock.results.at(-1)?.value).toEqual({
+        applied: false,
+      });
+
+      if (mode === 'summary') {
+        expect(routeResult).toMatchObject({ delivered: 1, failed: 0 });
+        expect(durableReceipt).toMatchObject({
+          status: 'pending',
+          summaryAt: undefined,
+          summarySignalId: expect.any(String),
+          deliverAt: futureDelivery,
+          deliveryAttempts: 0,
+          lastDeliveryError: undefined,
+        });
+        expect(sendSignal).toHaveBeenCalledOnce();
+      } else if (mode === 'individual') {
+        expect(routeResult).toMatchObject({ delivered: 1, failed: 0 });
+        expect(durableReceipt).toMatchObject({
+          status: 'delivered',
+          deliveredSignalId: expect.any(String),
+          deliveryAttempts: 0,
+          lastDeliveryError: undefined,
+        });
+        expect(sendSignal).toHaveBeenCalledOnce();
+      } else if (mode === 'denial') {
+        expect(routeResult).toMatchObject({
+          delivered: 0,
+          failed: 0,
+          discarded: 1,
+        });
+        expect(durableReceipt).toMatchObject({
+          status: 'discarded',
+          deliveryReason: 'content-policy-denied',
+          deliveryAttempts: 0,
+          lastDeliveryError: undefined,
+          discardedAt: now,
+        });
+        expect(sendSignal).not.toHaveBeenCalled();
+      } else {
+        expect(routeResult).toMatchObject({ delivered: 0, failed: 1 });
+        expect(durableReceipt).toMatchObject({
+          status: 'pending',
+          deliveryAttempts: 1,
+          lastDeliveryError: 'original receiver refusal',
+          lastDeliveryAttemptAt: now,
+          deliverAt: new Date(now.getTime() + 1000),
+        });
+        expect(sendSignal).toHaveBeenCalledOnce();
+      }
+      expect(await storage.listDueNotifications({ now })).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('preserves the summary receipt for a batch naming an Object.prototype member', async () => {
+    // #given — a due summary batch whose sources collide with the prototype
+    const now = new Date('2026-07-20T12:00:00.000Z');
+    const futureDelivery = new Date(now.getTime() + 60_000);
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(now);
+    try {
+      const sqlite = openSqlite();
+      const storage = new D1NotificationsStorage(
+        sqliteUnitDatabase(sqlite) as SignalDatabase,
+      );
+      const { agent, sendSignal } = reserveAgent();
+      const ids: string[] = [];
+      for (const source of ['constructor', '__proto__', 'crm']) {
+        const created = await storage.createNotification({
+          id: `lost-summary-${source}`,
+          threadId: THREAD_ID,
+          resourceId: resourceIdFromKey('itest'),
+          agentId: agent.id,
+          source,
+          kind: 'changed',
+          summary: `${source} input`,
+          priority: 'low',
+          deliverAt: futureDelivery,
+          summaryAt: new Date(now.getTime() - 1),
+          payload: { version: 1 },
+        });
+        ids.push(created.id);
+      }
+      const durableReceipts: Array<Record<string, unknown> | null> = [];
+      const responseReceived = vi.fn(async (response: Response) => {
+        expect(response.status).toBe(200);
+        for (const id of ids) {
+          durableReceipts.push(
+            (await storage.getNotification({
+              threadId: THREAD_ID,
+              id,
+            })) as unknown as Record<string, unknown> | null,
+          );
+        }
+        throw new Error('thread handler response lost');
+      });
+      const topology = createThreadTopology(
+        threadNamespace(
+          { agent, resolveNotificationsStorage: () => storage },
+          responseReceived,
+        ),
+      );
+      const context = createPrincipalActorContext({
+        principal: trustAutomationPrincipal({
+          kind: 'system',
+          id: 'notification-maintenance',
+          purpose: 'notification.dispatch',
+        }),
+        storeFactory: new InMemoryApprovalStoreFactory(),
+        buildService: () => {
+          throw new Error('approval service is not used in notification tests');
+        },
+      });
+      const tick = createNotificationDispatchTick({
+        storage,
+        topology,
+        resolveContext: () => context,
+        executionFence: 'none',
+        now: () => now,
+      });
+
+      // #when — the thread DO succeeds and its response is lost
+      expect(await tick()).toEqual({ due: 3, delivered: 0, failed: 3 });
+
+      // #then — the emitted summary counted each colliding source once
+      expect(sendSignal).toHaveBeenCalledOnce();
+      const summary = sendSignal.mock.calls[0]?.[0] as unknown as {
+        tagName: string;
+        contents: string;
+        metadata: Record<string, unknown>;
+      };
+      expect(summary.tagName).toBe('notification-summary');
+      expect(summary.contents).toBe('__proto__: 1, constructor: 1, crm: 1');
+      expect(summary.metadata.notification).toMatchObject({
+        signal: 'summary',
+        pending: 3,
+        groups: [
+          { source: '__proto__', count: 1 },
+          { source: 'constructor', count: 1 },
+          { source: 'crm', count: 1 },
+        ],
+        byPriority: { low: 3 },
+      });
+
+      // The durable summary receipts survive the outer tick fallback.
+      for (const receipt of durableReceipts) {
+        expect(receipt).toMatchObject({
+          status: 'pending',
+          summaryAt: undefined,
+          summarySignalId: expect.any(String),
+          deliverAt: futureDelivery,
+          deliveryAttempts: 0,
+          lastDeliveryError: undefined,
+        });
+      }
+      for (const id of ids) {
+        expect(
+          await storage.getNotification({ threadId: THREAD_ID, id }),
+        ).toEqual(durableReceipts[ids.indexOf(id)]);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('notification dispatch — chronological due window', () => {
+  it.each([
+    'deliverAt',
+    'summaryAt',
+  ] as const)('delivers a due sibling through the thread DO ahead of a future expanded-year %s', async (cursor) => {
+    const now = new Date('2026-07-20T12:00:00.000Z');
+    const storage = new D1NotificationsStorage(
+      sqliteUnitDatabase(openSqlite()) as SignalDatabase,
+    );
+    const { agent, sendSignal } = reserveAgent();
+    const future = await storage.createNotification({
+      id: 'future',
+      threadId: THREAD_ID,
+      resourceId: resourceIdFromKey('itest'),
+      agentId: agent.id,
+      source: 'provider',
+      kind: 'changed',
+      summary: 'future input',
+      priority: 'urgent',
+      [cursor]: new Date('+010000-01-01T00:00:00.000Z'),
+    });
+    const due = await storage.createNotification({
+      id: 'due',
+      threadId: THREAD_ID,
+      resourceId: resourceIdFromKey('itest'),
+      agentId: agent.id,
+      source: 'provider',
+      kind: 'changed',
+      summary: 'due input',
+      priority: 'urgent',
+      deliverAt: new Date(now.getTime() - 1),
+    });
+    const topology = createThreadTopology(
+      threadNamespace({
+        agent,
+        resolveNotificationsStorage: () => storage,
+      }),
+    );
+    const context = createPrincipalActorContext({
+      principal: trustAutomationPrincipal({
+        kind: 'system',
+        id: 'notification-maintenance',
+        purpose: 'notification.dispatch',
+      }),
+      storeFactory: new InMemoryApprovalStoreFactory(),
+      buildService: () => {
+        throw new Error('approval service is not used in notification tests');
+      },
+    });
+    const tick = createNotificationDispatchTick({
+      storage,
+      topology,
+      resolveContext: () => context,
+      executionFence: 'none',
+      now: () => now,
+      limit: 1,
+    });
+
+    expect(await tick()).toEqual({ due: 1, delivered: 1, failed: 0 });
+    expect(sendSignal).toHaveBeenCalledOnce();
+    expect(sendSignal.mock.calls[0]?.[0]).toMatchObject({
+      contents: 'due input',
+      metadata: { notification: { recordId: due.id } },
+    });
+    expect(await storage.getNotification(due)).toMatchObject({
+      status: 'delivered',
+      deliveredSignalId: expect.any(String),
+    });
+    expect(await storage.getNotification(future)).toEqual(future);
+    expect(await tick()).toEqual({ due: 0, delivered: 0, failed: 0 });
+    expect(sendSignal).toHaveBeenCalledOnce();
   });
 });

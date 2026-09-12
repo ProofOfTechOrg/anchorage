@@ -14,6 +14,11 @@ overrides:
   nanoid@3: 3.3.17
   undici: 7.29.0
 
+patchedDependencies:
+  '@mastra/core@1.53.0':
+    hash: 1c56cc954864b021d43e9cfa80f22da840ba12d03f6d260a2e1435918ad5d048
+    path: packages/flowsafe/patches/@mastra__core@1.53.0.patch
+
 importers:
 
   .:
@@ -83,7 +88,7 @@ importers:
     dependencies:
       '@mastra/core':
         specifier: 1.53.0
-        version: 1.53.0(express@5.2.1)(zod@4.4.3)
+        version: 1.53.0(patch_hash=1c56cc954864b021d43e9cfa80f22da840ba12d03f6d260a2e1435918ad5d048)(express@5.2.1)(zod@4.4.3)
       '@proofoftech/breakwater':
         specifier: workspace:*
         version: link:../breakwater
@@ -115,7 +120,7 @@ importers:
     devDependencies:
       '@mastra/core':
         specifier: 1.53.0
-        version: 1.53.0(express@5.2.1)(zod@4.4.3)
+        version: 1.53.0(patch_hash=1c56cc954864b021d43e9cfa80f22da840ba12d03f6d260a2e1435918ad5d048)(express@5.2.1)(zod@4.4.3)
       '@types/node':
         specifier: ^22.20.0
         version: 22.20.0
@@ -158,7 +163,7 @@ importers:
     dependencies:
       '@mastra/cloudflare-d1':
         specifier: 1.1.1
-        version: 1.1.1(@cloudflare/workers-types@4.20260702.1)(@mastra/core@1.53.0(express@5.2.1)(zod@4.4.3))
+        version: 1.1.1(@cloudflare/workers-types@4.20260702.1)(@mastra/core@1.53.0(patch_hash=1c56cc954864b021d43e9cfa80f22da840ba12d03f6d260a2e1435918ad5d048)(express@5.2.1)(zod@4.4.3))
       jose:
         specifier: 6.2.8
         version: 6.2.8
@@ -168,7 +173,7 @@ importers:
         version: 4.20260702.1
       '@mastra/core':
         specifier: 1.53.0
-        version: 1.53.0(express@5.2.1)(zod@4.4.3)
+        version: 1.53.0(patch_hash=1c56cc954864b021d43e9cfa80f22da840ba12d03f6d260a2e1435918ad5d048)(express@5.2.1)(zod@4.4.3)
       '@proofoftech/breakwater':
         specifier: workspace:*
         version: link:../breakwater
@@ -219,7 +224,7 @@ importers:
         version: 5.2.7
       '@mastra/core':
         specifier: 1.53.0
-        version: 1.53.0(express@5.2.1)(zod@4.4.3)
+        version: 1.53.0(patch_hash=1c56cc954864b021d43e9cfa80f22da840ba12d03f6d260a2e1435918ad5d048)(express@5.2.1)(zod@4.4.3)
       '@proofoftech/breakwater':
         specifier: workspace:*
         version: link:../breakwater
@@ -4541,15 +4546,15 @@ snapshots:
       globby: 11.1.0
       read-yaml-file: 1.1.0
 
-  '@mastra/cloudflare-d1@1.1.1(@cloudflare/workers-types@4.20260702.1)(@mastra/core@1.53.0(express@5.2.1)(zod@4.4.3))':
+  '@mastra/cloudflare-d1@1.1.1(@cloudflare/workers-types@4.20260702.1)(@mastra/core@1.53.0(patch_hash=1c56cc954864b021d43e9cfa80f22da840ba12d03f6d260a2e1435918ad5d048)(express@5.2.1)(zod@4.4.3))':
     dependencies:
       '@cloudflare/workers-types': 4.20260702.1
-      '@mastra/core': 1.53.0(express@5.2.1)(zod@4.4.3)
+      '@mastra/core': 1.53.0(patch_hash=1c56cc954864b021d43e9cfa80f22da840ba12d03f6d260a2e1435918ad5d048)(express@5.2.1)(zod@4.4.3)
       cloudflare: 5.2.0
     transitivePeerDependencies:
       - encoding
 
-  '@mastra/core@1.53.0(express@5.2.1)(zod@4.4.3)':
+  '@mastra/core@1.53.0(patch_hash=1c56cc954864b021d43e9cfa80f22da840ba12d03f6d260a2e1435918ad5d048)(express@5.2.1)(zod@4.4.3)':
     dependencies:
       '@a2a-js/sdk': 0.3.14(express@5.2.1)
       '@ai-sdk/provider-utils-v5': '@ai-sdk/provider-utils@3.0.30(zod@4.4.3)'
