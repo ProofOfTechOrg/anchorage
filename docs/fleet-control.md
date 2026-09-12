@@ -455,7 +455,7 @@ The runner starts the FlowSafe run and observes its pending WebSocket update on 
 Set these environment variables:
 
 - `CLOUDFLARE_ACCOUNT_ID`
-- `CLOUDFLARE_API_TOKEN` with API Tokens Read, Zone Read, Workers Routes Read, and Workers Routes Write for every zone in the account
+- `CLOUDFLARE_API_TOKEN` with API Tokens Read, Zone Read, Workers Routes Read, and Workers Routes Write for every zone in the account, plus account-scoped Workers Scripts Edit and D1 Edit, and Workers R2 Storage Edit when application R2 is enabled. [Security threat model](security-threat-model.md) lists the route families the client calls with this token.
 - `FLEET_CONFORMANCE_CONFIG`
 - `FLEET_MAINTENANCE_CAPABILITY_PRIVATE_JWK` containing the fleet-private Ed25519 signing JWK
 - `FLEET_STATE_EGRESS_ROOT_SECRET` containing the shared state-egress derivation secret
