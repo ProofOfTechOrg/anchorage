@@ -475,3 +475,29 @@ describe.sequential('direct tenant fixture in workerd', {
       ).toBe(401);
   });
 });
+
+describe('direct reference harness provider surface', () => {
+  it('answers the Node-side deployment read only when the harness opts in', async () => {
+    const deployment =
+      'https://api.cloudflare.com/client/v4/accounts/account/workers/scripts/absent-script/deployments/deployment';
+    const gated = await createDirectReferenceHarness();
+    try {
+      expect((await gated.projection.fetch(deployment)).status).toBe(404);
+    } finally {
+      await gated.close();
+    }
+    const opted = await createDirectReferenceHarness({
+      nodeProviderRest: true,
+    });
+    try {
+      const response = await opted.projection.fetch(deployment);
+      const body = (await response.json()) as { result: { id: string } };
+      expect({ status: response.status, id: body.result.id }).toEqual({
+        status: 200,
+        id: 'deployment',
+      });
+    } finally {
+      await opted.close();
+    }
+  });
+});

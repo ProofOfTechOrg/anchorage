@@ -11,6 +11,7 @@ import {
 import {
   actionSummary,
   DIRECT_SCENARIO_ARRAY_MAXIMA,
+  DIRECT_SCENARIO_FAILURE_DETAILS,
   DIRECT_SCENARIO_FAILURES,
   DirectRunStateError,
 } from './direct-credentialed-run-state.mjs';
@@ -20,6 +21,9 @@ import {
 } from './direct-credentialed-scenario-budget.mjs';
 import {
   changedBy,
+  checkFootprint,
+  checkInterruptedItems,
+  checkInterruptionWitness,
   checkInvocationHeadroom,
   checkItemConvergence,
   checkTrafficDistribution,
@@ -38,12 +42,12 @@ import {
   zeroAttempts,
 } from './direct-credentialed-scenario-checks.mjs';
 import { DIRECT_TENANT_OBJECT_BODY } from './direct-credentialed-tenant-object.mjs';
-import { directCleanupReceiptDigest } from './direct-reference-receipt.mjs';
 
 const busy = new WeakSet();
 const objectDigest = hash(DIRECT_TENANT_OBJECT_BODY);
 const objectSize = Buffer.byteLength(DIRECT_TENANT_OBJECT_BODY);
 const failureCodes = new Set(DIRECT_SCENARIO_FAILURES);
+const failureDetails = new Set(DIRECT_SCENARIO_FAILURE_DETAILS);
 
 async function processIdentity() {
   const stat = await readFile('/proc/self/stat', 'utf8');
@@ -195,6 +199,9 @@ export async function runDirectCredentialedScenario(input) {
         : state.mutation?.action,
     );
     const operations = fresh.operations.map(operationFacts);
+    requireFact(
+      new Set(operations.map((entry) => entry.slot)).size === operations.length,
+    );
     for (const known of state.operations) {
       const remote = operations.find((entry) => entry.slot === known.slot);
       requireFact(remote);
@@ -322,6 +329,10 @@ export async function runDirectCredentialedScenario(input) {
     if (!state.proofs.initial[role]) {
       const observation = await observe(role, '1');
       equal(observation.trafficPercentage, 100);
+      requireFact(
+        observation.currentDeployment.versions.length <=
+          DIRECT_SCENARIO_ARRAY_MAXIMA.deploymentVersions,
+      );
       state.proofs.initial[role] = observation;
       await persist();
     }
@@ -461,29 +472,14 @@ export async function runDirectCredentialedScenario(input) {
     return page.items;
   };
   const interruption = async () => {
-    const value = parse(control.interruption);
-    equal(value.version, 1);
-    equal(value.boundary, 'after-migration-admission');
-    equal(value.slot, 'migration-next');
-    equal(value.operationId, slot('migration-next').operationId);
-    const claim = parse(value.claimJson);
-    const successor = parse(value.returnedTokenJson);
-    equal(claim.operationId, value.operationId);
-    equal(successor.operationId, value.operationId);
-    requireFact(successor.revision > claim.revision);
-    equal(value.item.ordinal, 0);
-    equal(value.item.beforeStatus, 'pending');
-    equal(value.item.afterStatus, 'active');
-    equal(value.item.planCursor, 0);
-    equal(value.item.tenantTag, prepared.names.roles.a.tenantTag);
-    equal(value.item.environment, prepared.config.environment);
+    const witness = checkInterruptionWitness(control.interruption, {
+      operationId: slot('migration-next').operationId,
+      tenantTag: prepared.names.roles.a.tenantTag,
+      environment: prepared.config.environment,
+    });
     const current = await items();
-    equal(current[0].status, 'active');
-    equal(current[0].planCursor, 0);
-    equal(current[0].entryRecordDigest, value.item.entryRecordDigest);
-    equal(current[0].targetSpecDigest, value.item.targetSpecDigest);
-    equal(current[1].status, 'pending');
-    return { value, claim, successor, current };
+    checkInterruptedItems(witness.value, current);
+    return { ...witness, current };
   };
   const migration = async () => {
     for (;;) {
@@ -680,73 +676,14 @@ export async function runDirectCredentialedScenario(input) {
     await persist();
     await advancePhase();
   };
-  const checkFootprint = (value, retained) => {
-    const resource = state.proofs.initial.recovery;
-    equal(value.version, 1);
-    equal(value.role, 'recovery');
-    equal(value.fleetRecordPresent, false);
-    equal(value.deploymentClaimsPresent, false);
-    equal(value.database, {
-      id: resource.databaseId,
-      expectedName: prepared.names.roles.recovery.databaseName,
-      observedName: null,
-    });
-    const worker = value.worker;
-    equal(worker.scriptName, resource.scriptName);
-    equal(worker.scriptPresent, retained);
-    requireFact(
-      worker.workersDevEnabled === false ||
-        (!retained && worker.workersDevEnabled === null),
-    );
-    requireFact(
-      worker.previewUrlsEnabled === false ||
-        (!retained && worker.previewUrlsEnabled === null),
-    );
-    for (const key of ['customDomains', 'zoneRoutes', 'currentSecretNames'])
-      equal(worker[key], []);
-    const namespaces = resource.namespaces
-      .map((entry) => entry.namespaceId)
-      .sort();
-    equal(worker.currentNamespaceIds, retained ? namespaces : []);
-    equal(worker.survivingRecordedNamespaceIds, retained ? namespaces : []);
-    if (retained)
-      requireFact(
-        worker.currentVersionIds.includes(resource.versionId) &&
-          worker.currentVersionIds.length <=
-            DIRECT_SCENARIO_ARRAY_MAXIMA.footprintVersionIds,
-      );
-    else
-      requireFact(
-        worker.currentVersionIds === null ||
-          worker.currentVersionIds.length === 0,
-      );
-    equal(value.buckets, [
-      {
-        bindingName: 'PROBE_BUCKET',
-        bucketName: resource.bucket.name,
-        jurisdiction: 'default',
-        expectedCreationDate: resource.bucket.creationDate,
-        observedCreationDate: retained ? resource.bucket.creationDate : null,
-      },
-    ]);
-    equal(value.priorCleanup.operationId, state.proofs.cleanup.operationId);
-    equal(value.priorCleanup.matchesBefore, true);
-    equal(
-      value.priorCleanup.observedReceiptSha256,
-      directCleanupReceiptDigest(state.proofs.cleanup),
-    );
-    requireFact(
-      /^[a-f0-9]{64}$/u.test(value.priorCleanup.observedReceiptSha256),
-    );
-    if (!retained) {
-      equal(
-        value.beforeIdentitySha256,
-        state.proofs.force.beforeIdentitySha256,
-      );
-      equal(value.priorCleanup, state.proofs.force.priorCleanup);
-    }
-    return value;
-  };
+  const footprintExpectation = (retained) => ({
+    retained,
+    resource: state.proofs.initial.recovery,
+    databaseName: prepared.names.roles.recovery.databaseName,
+    cleanup: state.proofs.cleanup,
+    force: state.proofs.force,
+    versionIdMaximum: DIRECT_SCENARIO_ARRAY_MAXIMA.footprintVersionIds,
+  });
   try {
     requireFact(
       journal &&
@@ -775,7 +712,8 @@ export async function runDirectCredentialedScenario(input) {
     state = structuredClone(
       snapshot.scenario ?? initialState(snapshot.invocationCount),
     );
-    if (state.failure) requireFact(false, state.failure.code);
+    if (state.failure)
+      requireFact(false, state.failure.code, state.failure.detail);
     if (
       state.lastCall?.outcome === 'prepared' ||
       state.mutation?.outcome === 'prepared'
@@ -999,7 +937,10 @@ export async function runDirectCredentialedScenario(input) {
         }
         case 'force-observe': {
           const result = await invoke({ kind: 'force-observe' });
-          state.proofs.force = checkFootprint(result.observation, true);
+          state.proofs.force = checkFootprint(
+            result.observation,
+            footprintExpectation(true),
+          );
           await persist();
           const metadata = await invoke({
             kind: 'decommission-export',
@@ -1020,7 +961,10 @@ export async function runDirectCredentialedScenario(input) {
         case 'recover-force-residual': {
           const result = await mutate({ kind: 'recover-force-residual' });
           requireFact(result.returned === true);
-          state.proofs.residual = checkFootprint(result.observation, false);
+          state.proofs.residual = checkFootprint(
+            result.observation,
+            footprintExpectation(false),
+          );
           await persist();
           await advancePhase();
           break;
@@ -1050,6 +994,7 @@ export async function runDirectCredentialedScenario(input) {
     const observed = failureCodes.has(error?.code)
       ? error.code
       : 'observation-mismatch';
+    const detail = failureDetails.has(error?.detail) ? error.detail : undefined;
     let code = observed;
     const snapshot = acquired ? journal.snapshot() : null;
     if (
@@ -1058,7 +1003,11 @@ export async function runDirectCredentialedScenario(input) {
       snapshot.lastInvocation?.state !== 'pending' &&
       !snapshot.bootstrap?.pending
     ) {
-      state.failure = { code: observed, ordinal: snapshot.invocationCount };
+      state.failure ??= {
+        code: observed,
+        ordinal: snapshot.invocationCount,
+        ...(detail === undefined ? {} : { detail }),
+      };
       try {
         await persist();
       } catch (unwritable) {
@@ -1069,6 +1018,7 @@ export async function runDirectCredentialedScenario(input) {
     return {
       status: 'failed',
       reason: code,
+      ...(code === observed && detail !== undefined ? { detail } : {}),
       phase: state?.phase ?? null,
       invocationCount: snapshot?.invocationCount ?? 0,
     };

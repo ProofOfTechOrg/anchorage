@@ -5,11 +5,10 @@
 // cumulative cap on one phase across resumes, wide enough for re-entries that each
 // repeat the entry `sync()` and its observation. Ceilings bound a runaway phase and
 // may sum past the configured budget, because they are a cap and not a reservation.
-// `reserve` is 1.25x measured rounded up to a multiple of 4, minimum 4; its suffix
-// sum from a phase onward is what the entry gate holds back, so a run that cannot
-// finish refuses before it strands provisioned infrastructure.
+// `reserve` is 1.25x measured rounded up to a multiple of 4, minimum 4.
 // DIRECT_SCENARIO_MIN_INVOCATIONS adds the bootstrap control read and resume
-// headroom to that total: it is the floor `referenceWorker.maxInvocations` clears.
+// headroom to the sum of every `reserve`: it is the floor
+// `referenceWorker.maxInvocations` clears.
 const MEASURED = Object.freeze({
   'provision-a': 10,
   'provision-b': 9,

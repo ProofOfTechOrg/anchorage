@@ -2,7 +2,7 @@
 
 import { createHash } from 'node:crypto';
 
-export function directCleanupReceiptPreimage(receipt) {
+function directCleanupReceiptPreimage(receipt) {
   const evidence = receipt.evidence;
   return [
     receipt.version,

@@ -20,6 +20,7 @@ const ERROR_CODES = new Set([
   'lock-unavailable',
   'outcome-unknown',
   'invocation-budget-exhausted',
+  'unsupported-scenario-version',
 ]);
 const SUMMARY_FIELDS = [
   'kind',
@@ -37,6 +38,7 @@ export const DIRECT_SCENARIO_ARRAY_MAXIMA = Object.freeze({
   exportVerifications: 16,
   auditFindings: 16,
   footprintVersionIds: 8,
+  deploymentVersions: 2,
   inventory: Object.freeze({
     databaseIds: 2,
     namespaceIds: 4,
@@ -270,6 +272,12 @@ export const DIRECT_SCENARIO_FAILURES = Object.freeze([
   'blocked',
 ]);
 
+export const DIRECT_SCENARIO_FAILURE_DETAILS = Object.freeze([
+  'phase-ceiling',
+  'run-reserve',
+  'below-scenario-floor',
+]);
+
 export const DIRECT_SCENARIO_OPERATION_SLOTS = Object.freeze([
   'inventory-before',
   'inventory-after',
@@ -282,6 +290,7 @@ export const DIRECT_SCENARIO_OPERATION_SLOTS = Object.freeze([
   'cleanup-recovery-initial',
   'decommission-a',
   'decommission-b',
+  'decommission-recovery',
 ]);
 
 const scenarioNumber = (value) => {
@@ -301,9 +310,12 @@ const scenarioEnum =
   };
 const nullable = (schema) => (value) =>
   value === null ? null : scenarioShape(value, schema);
-const boundedArray = (schema, max) => (value) => {
-  if (!Array.isArray(value) || value.length > max) invalid();
-  return Object.freeze(value.map((entry) => scenarioShape(entry, schema)));
+const boundedArray = (schema, max) => {
+  if (!Number.isSafeInteger(max) || max < 0) invalid();
+  return (value) => {
+    if (!Array.isArray(value) || value.length > max) invalid();
+    return Object.freeze(value.map((entry) => scenarioShape(entry, schema)));
+  };
 };
 const OPTIONAL = Symbol('optional');
 const optional = (schema) => ({ [OPTIONAL]: schema });
@@ -391,7 +403,7 @@ const workerVersionShape = {
           return value;
         },
       },
-      2,
+      DIRECT_SCENARIO_ARRAY_MAXIMA.deploymentVersions,
     ),
   },
   trafficPercentage: scenarioEnum(0, 100),
@@ -587,7 +599,79 @@ const auditShape = {
     DIRECT_SCENARIO_ARRAY_MAXIMA.auditFindings,
   ),
 };
+const operationsShape = boundedArray(
+  {
+    slot: operationSlots,
+    operationId: nullable(scenarioId),
+    inputSha256: digest,
+    tokenRevision: nullable(scenarioNumber),
+  },
+  DIRECT_SCENARIO_OPERATION_SLOTS.length,
+);
+const recordsShape = boundedArray(
+  {
+    role: scenarioRole,
+    present: scenarioEnum(true, false),
+    phase: nullable(scenarioId),
+    desiredSpecDigest: nullable(digest),
+    pendingSpecDigest: nullable(digest),
+    artifactVersion: nullable(scenarioId),
+    pendingArtifactVersion: nullable(scenarioId),
+    databaseId: nullable(scenarioId),
+  },
+  3,
+);
+const healthShape = boundedArray(
+  {
+    role: scenarioRole,
+    release: scenarioEnum('1', '2'),
+    marker: scenarioEnum('initial', 'next'),
+    ordinal: scenarioNumber,
+  },
+  DIRECT_SCENARIO_ARRAY_MAXIMA.health,
+);
+const stepsShape = boundedArray(
+  {
+    ordinal: scenarioNumber,
+    itemOrdinal: scenarioEnum(0, 1),
+    step: scenarioId,
+    beforeCursor: scenarioNumber,
+    afterCursor: scenarioNumber,
+    provider: scenarioNumber,
+    maintenance: scenarioNumber,
+    application: scenarioNumber,
+  },
+  DIRECT_SCENARIO_ARRAY_MAXIMA.steps,
+);
+const effectsShape = boundedArray(
+  {
+    role: normalRole,
+    tenantTag: scenarioId,
+    environment: scenarioId,
+    scriptName: scenarioId,
+    databaseId: scenarioId,
+    versionId: scenarioId,
+    specDigest: digest,
+    schemaVersion: 2,
+    settlementKey: digest,
+    identitySha256: digest,
+    provenanceSha256: digest,
+  },
+  2,
+);
+const exportVerificationsShape = boundedArray(
+  exportShape,
+  DIRECT_SCENARIO_ARRAY_MAXIMA.exportVerifications,
+);
 function decodeScenario(value, invocationCount) {
+  if (
+    value &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    Object.hasOwn(value, 'version') &&
+    value.version !== 1
+  )
+    throw new DirectRunStateError('unsupported-scenario-version');
   const result = scenarioShape(value, {
     version: 1,
     phase: scenarioEnum(...DIRECT_SCENARIO_PHASES),
@@ -602,31 +686,12 @@ function decodeScenario(value, invocationCount) {
     lastCall: nullable(callShape),
     mutation: nullable(callShape),
     reconciledOrdinal: scenarioNumber,
-    operations: boundedArray(
-      {
-        slot: operationSlots,
-        operationId: nullable(scenarioId),
-        inputSha256: digest,
-        tokenRevision: nullable(scenarioNumber),
-      },
-      11,
-    ),
-    records: boundedArray(
-      {
-        role: scenarioRole,
-        present: scenarioEnum(true, false),
-        phase: nullable(scenarioId),
-        desiredSpecDigest: nullable(digest),
-        pendingSpecDigest: nullable(digest),
-        artifactVersion: nullable(scenarioId),
-        pendingArtifactVersion: nullable(scenarioId),
-        databaseId: nullable(scenarioId),
-      },
-      3,
-    ),
+    operations: operationsShape,
+    records: recordsShape,
     failure: nullable({
       code: scenarioEnum(...DIRECT_SCENARIO_FAILURES),
       ordinal: scenarioNumber,
+      detail: optional(scenarioEnum(...DIRECT_SCENARIO_FAILURE_DETAILS)),
     }),
     proofs: {
       initial: {
@@ -654,15 +719,7 @@ function decodeScenario(value, invocationCount) {
         beforeOrdinal: nullable(scenarioNumber),
         afterOrdinal: nullable(scenarioNumber),
       },
-      health: boundedArray(
-        {
-          role: scenarioRole,
-          release: scenarioEnum('1', '2'),
-          marker: scenarioEnum('initial', 'next'),
-          ordinal: scenarioNumber,
-        },
-        DIRECT_SCENARIO_ARRAY_MAXIMA.health,
-      ),
+      health: healthShape,
       inventories: {
         before: nullable(inventoryShape),
         after: nullable(inventoryShape),
@@ -679,41 +736,11 @@ function decodeScenario(value, invocationCount) {
         itemsSha256: digest,
         replayOrdinal: nullable(scenarioNumber),
       }),
-      steps: boundedArray(
-        {
-          ordinal: scenarioNumber,
-          itemOrdinal: scenarioEnum(0, 1),
-          step: scenarioId,
-          beforeCursor: scenarioNumber,
-          afterCursor: scenarioNumber,
-          provider: scenarioNumber,
-          maintenance: scenarioNumber,
-          application: scenarioNumber,
-        },
-        DIRECT_SCENARIO_ARRAY_MAXIMA.steps,
-      ),
-      effects: boundedArray(
-        {
-          role: normalRole,
-          tenantTag: scenarioId,
-          environment: scenarioId,
-          scriptName: scenarioId,
-          databaseId: scenarioId,
-          versionId: scenarioId,
-          specDigest: digest,
-          schemaVersion: 2,
-          settlementKey: digest,
-          identitySha256: digest,
-          provenanceSha256: digest,
-        },
-        2,
-      ),
+      steps: stepsShape,
+      effects: effectsShape,
       cleanup: nullable(cleanupShape),
       exports: { a: nullable(exportShape), b: nullable(exportShape) },
-      exportVerifications: boundedArray(
-        exportShape,
-        DIRECT_SCENARIO_ARRAY_MAXIMA.exportVerifications,
-      ),
+      exportVerifications: exportVerificationsShape,
       decommission: {
         a: nullable(decommissionShape),
         b: nullable(decommissionShape),
@@ -1244,13 +1271,14 @@ function runJournal(directory, directoryHandle, base, lock, initial) {
       throw error;
     }
   };
-  const publishBootstrap = async (bootstrap) => {
+  const publishSnapshot = async (fields) => {
     const next = await decodeSnapshot(
-      { ...snapshot, bootstrap },
+      { ...snapshot, ...fields },
       snapshot.binding,
     );
     await publish(next);
   };
+  const publishBootstrap = (bootstrap) => publishSnapshot({ bootstrap });
   const assertSettled = () => {
     if (
       snapshot.lastInvocation?.state === 'pending' ||
@@ -1340,7 +1368,7 @@ function runJournal(directory, directoryHandle, base, lock, initial) {
             });
           }
         }
-        await publish(Object.freeze({ ...snapshot, scenario }));
+        await publishSnapshot({ scenario });
       });
     },
     bindBootstrapContext(context) {

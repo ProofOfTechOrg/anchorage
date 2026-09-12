@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import type { CleanupTerminalReceipt } from '../src/types.js';
 import type { DirectInvocationAttempts } from './direct-credentialed-invocation.mjs';
 import type {
   DirectExpectedWorkerVersion,
@@ -57,6 +58,82 @@ export interface DirectScenarioMigrationItem {
   readonly ordinal: number;
   readonly status: string;
   readonly planCursor: number;
+}
+
+export interface DirectScenarioInterruptedItem {
+  readonly status: string;
+  readonly planCursor: number;
+  readonly entryRecordDigest: string;
+  readonly targetSpecDigest: string;
+}
+
+export interface DirectScenarioInterruptionValue {
+  readonly version: 1;
+  readonly boundary: 'after-migration-admission';
+  readonly slot: 'migration-next';
+  readonly operationId: string;
+  readonly claimJson: string;
+  readonly returnedTokenJson: string;
+  readonly item: Readonly<{
+    ordinal: 0;
+    beforeStatus: string;
+    afterStatus: string;
+    planCursor: number;
+    tenantTag: string;
+    environment: string;
+    entryRecordDigest: string;
+    targetSpecDigest: string;
+  }>;
+}
+
+export interface DirectScenarioInterruption {
+  readonly value: DirectScenarioInterruptionValue;
+  readonly claim: unknown;
+  readonly successor: unknown;
+}
+
+export interface DirectScenarioFootprint {
+  readonly version: 1;
+  readonly role: 'recovery';
+  readonly beforeIdentitySha256: string;
+  readonly fleetRecordPresent: false;
+  readonly deploymentClaimsPresent: false;
+  readonly database: Readonly<{
+    id: string;
+    expectedName: string;
+    observedName: null;
+  }>;
+  readonly worker: Readonly<{
+    scriptName: string;
+    scriptPresent: boolean;
+    workersDevEnabled: false | null;
+    previewUrlsEnabled: false | null;
+    customDomains: readonly never[];
+    zoneRoutes: readonly never[];
+    currentSecretNames: readonly never[];
+    currentVersionIds: readonly string[] | null;
+    currentNamespaceIds: readonly string[];
+    survivingRecordedNamespaceIds: readonly string[];
+  }>;
+  readonly buckets: readonly Readonly<{
+    bindingName: 'PROBE_BUCKET';
+    bucketName: string;
+    jurisdiction: 'default';
+    expectedCreationDate: string;
+    observedCreationDate: string | null;
+  }>[];
+  readonly priorCleanup: Readonly<{
+    operationId: string;
+    observedReceiptSha256: string;
+    matchesBefore: true;
+  }>;
+}
+
+export interface DirectScenarioFootprintContext {
+  readonly resource: DirectWorkerVersionObservation;
+  readonly databaseName: string;
+  readonly cleanup: CleanupTerminalReceipt;
+  readonly versionIdMaximum: number;
 }
 
 export interface DirectScenarioSettledCall {
@@ -118,3 +195,27 @@ export function migrationInterruptSettled(
   control: Readonly<{ interruption: string | null }>,
   mutation: DirectScenarioSettledCall | null | undefined,
 ): boolean;
+export function checkInterruptionWitness(
+  interruption: unknown,
+  expected: Readonly<{
+    operationId: string | null;
+    tenantTag: string;
+    environment: string;
+  }>,
+): DirectScenarioInterruption;
+export function checkInterruptedItems(
+  witness: DirectScenarioInterruptionValue,
+  items: readonly [
+    DirectScenarioInterruptedItem,
+    DirectScenarioInterruptedItem,
+    ...DirectScenarioInterruptedItem[],
+  ],
+): void;
+export function checkFootprint(
+  observation: unknown,
+  expected: DirectScenarioFootprintContext &
+    (
+      | Readonly<{ retained: true; force?: null }>
+      | Readonly<{ retained: false; force: DirectScenarioFootprint }>
+    ),
+): DirectScenarioFootprint;

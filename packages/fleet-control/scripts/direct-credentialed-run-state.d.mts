@@ -11,7 +11,8 @@ export type DirectRunStateErrorCode =
   | 'run-missing'
   | 'lock-unavailable'
   | 'outcome-unknown'
-  | 'invocation-budget-exhausted';
+  | 'invocation-budget-exhausted'
+  | 'unsupported-scenario-version';
 
 export class DirectRunStateError extends Error {
   readonly code: DirectRunStateErrorCode;
@@ -150,6 +151,12 @@ export const DIRECT_SCENARIO_FAILURES: readonly [
   'blocked',
 ];
 
+export const DIRECT_SCENARIO_FAILURE_DETAILS: readonly [
+  'phase-ceiling',
+  'run-reserve',
+  'below-scenario-floor',
+];
+
 export const DIRECT_SCENARIO_OPERATION_SLOTS: readonly [
   'inventory-before',
   'inventory-after',
@@ -162,6 +169,7 @@ export const DIRECT_SCENARIO_OPERATION_SLOTS: readonly [
   'cleanup-recovery-initial',
   'decommission-a',
   'decommission-b',
+  'decommission-recovery',
 ];
 
 export const DIRECT_RUN_MAX_JOURNAL_BYTES: number;
@@ -172,6 +180,7 @@ export const DIRECT_SCENARIO_ARRAY_MAXIMA: Readonly<{
   exportVerifications: number;
   auditFindings: number;
   footprintVersionIds: number;
+  deploymentVersions: number;
   inventory: Readonly<{
     databaseIds: number;
     namespaceIds: number;

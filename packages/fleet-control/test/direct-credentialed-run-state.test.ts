@@ -15,15 +15,18 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   DIRECT_RUN_MAX_JOURNAL_BYTES,
+  DIRECT_SCENARIO_ARRAY_MAXIMA,
+  DIRECT_SCENARIO_OPERATION_SLOTS,
   type DirectBootstrapMutationReceipt,
   type DirectRunJournal,
   openDirectRunState,
 } from '../scripts/direct-credentialed-run-state.mjs';
+import type { DirectOperationSlot } from '../scripts/direct-reference-journal.js';
 import {
-  auditProof,
   bootstrapContext,
   cleanupDirectRunState,
   closed,
@@ -32,8 +35,8 @@ import {
   first,
   fixture,
   hash,
-  inventoryProof,
   journals,
+  MAX_COUNT,
   type MutableScenario,
   maximalScenario,
   opened,
@@ -894,7 +897,7 @@ const refuses = (journal: DirectRunJournal, state: MutableScenario) =>
   });
 
 describeLinux('durable scenario state', () => {
-  it('publishes a scenario sitting on every declared maximum inside the journal byte bound', async () => {
+  it('publishes a maximal scenario inside the journal byte bound', async () => {
     const { f, journal } = await scenarioJournal();
     await journal.recordScenario(maximalScenario());
     const serialized = await readFile(
@@ -905,9 +908,26 @@ describeLinux('durable scenario state', () => {
       DIRECT_RUN_MAX_JOURNAL_BYTES / 2,
     );
     expect(journal.snapshot().scenario?.proofs.cleanup?.evidence.scan).toEqual({
-      discover: { evidenceSha256: DIGEST, evidenceCount: 1 },
-      verify: { evidenceSha256: DIGEST, evidenceCount: 1 },
+      discover: { evidenceSha256: DIGEST, evidenceCount: MAX_COUNT },
+      verify: { evidenceSha256: DIGEST, evidenceCount: MAX_COUNT },
     });
+  });
+
+  it('publishes the journal fields in the order the decoder establishes', async () => {
+    const { f, journal } = await scenarioJournal();
+    await journal.recordScenario(maximalScenario());
+    const serialized = await readFile(
+      join(f.runDirectory, 'journal.json'),
+      'utf8',
+    );
+    expect(Object.keys(JSON.parse(serialized))).toEqual([
+      'version',
+      'binding',
+      'invocationCount',
+      'lastInvocation',
+      'bootstrap',
+      'scenario',
+    ]);
   });
 
   it('refuses a stored journal larger than the byte bound before parsing it', async () => {
@@ -1017,41 +1037,173 @@ describeLinux('durable scenario state', () => {
     );
   });
 
-  it('refuses arrays longer than the schema maximum', async () => {
+  it('refuses a settlement-effect list and an operation list past the schema bound', async () => {
     const { journal } = await scenarioJournal();
     for (const mutate of [
-      (state: MutableScenario) => {
-        state.proofs.health.push(first(state.proofs.health));
-      },
-      (state: MutableScenario) => {
-        state.proofs.steps.push(first(state.proofs.steps));
-      },
       (state: MutableScenario) => {
         state.proofs.effects.push(first(state.proofs.effects));
       },
       (state: MutableScenario) => {
-        state.proofs.exportVerifications.push(
-          first(state.proofs.exportVerifications),
-        );
-      },
-      (state: MutableScenario) => {
-        present(state.proofs.audits.before).findings.push(
-          first(auditProof().findings),
-        );
-      },
-      (state: MutableScenario) => {
-        present(state.proofs.inventories.before).findings.push(
-          first(inventoryProof().findings),
-        );
-      },
-      (state: MutableScenario) => {
-        state.operations.push({
-          ...first(state.operations),
-          slot: 'decommission-recovery' as MutableScenario['operations'][number]['slot'],
-        });
+        state.operations.push(first(state.operations));
       },
     ])
       await refuses(journal, scenarioWith(mutate));
+  });
+
+  it('carries every operation slot the reference control read can return', () => {
+    const slots: readonly DirectOperationSlot[] =
+      DIRECT_SCENARIO_OPERATION_SLOTS;
+    const unlisted: Exclude<
+      DirectOperationSlot,
+      (typeof DIRECT_SCENARIO_OPERATION_SLOTS)[number]
+    > extends never
+      ? true
+      : false = true;
+    expect({ count: slots.length, unlisted }).toEqual({
+      count: 12,
+      unlisted: true,
+    });
+  });
+
+  it('refuses one entry past each cap the shared array maxima declare', async () => {
+    const { journal } = await scenarioJournal();
+    const caps = new Map<string, number>();
+    for (const [key, value] of Object.entries(DIRECT_SCENARIO_ARRAY_MAXIMA))
+      if (typeof value === 'number') caps.set(key, value);
+      else
+        for (const [nested, bound] of Object.entries(value))
+          caps.set(`inventory.${nested}`, bound);
+    const bounded = (state: MutableScenario): Record<string, unknown[]> => {
+      const inventory = present(state.proofs.inventories.before);
+      return {
+        health: state.proofs.health,
+        steps: state.proofs.steps,
+        exportVerifications: state.proofs.exportVerifications,
+        auditFindings: present(state.proofs.audits.before).findings,
+        footprintVersionIds: present(
+          present(state.proofs.force).worker.currentVersionIds,
+        ),
+        deploymentVersions: present(state.proofs.initial.a).currentDeployment
+          .versions,
+        'inventory.databaseIds': inventory.databaseIds,
+        'inventory.namespaceIds': inventory.namespaceIds,
+        'inventory.scriptNames': inventory.scriptNames,
+        'inventory.bucketNames': inventory.bucketNames,
+        'inventory.findings': inventory.findings,
+      };
+    };
+    expect(Object.keys(bounded(maximalScenario())).sort()).toEqual(
+      [...caps.keys()].sort(),
+    );
+    for (const [key, cap] of caps) {
+      const state = maximalScenario();
+      const array = bounded(state)[key];
+      if (!array) throw new Error(`unbounded scenario array ${key}`);
+      expect({ key, length: array.length }).toEqual({ key, length: cap });
+      array.push(first(array));
+      await refuses(journal, state);
+    }
+  });
+
+  it('refuses a scenario version the decoder does not implement', async () => {
+    const { f, journal } = await scenarioJournal();
+    await expect(
+      journal.recordScenario(
+        scenarioWith((state) => {
+          (state as unknown as { version: number }).version = 2;
+        }),
+      ),
+    ).rejects.toMatchObject({ code: 'unsupported-scenario-version' });
+    await journal.recordScenario(maximalScenario());
+    await closed(journal);
+    const path = join(f.runDirectory, 'journal.json');
+    const stored = JSON.parse(await readFile(path, 'utf8'));
+    stored.scenario.version = 2;
+    await writeFile(path, JSON.stringify(stored));
+    await expect(
+      openDirectRunState({ ...f.input, mode: 'resume' }),
+    ).rejects.toMatchObject({ code: 'unsupported-scenario-version' });
+  });
+
+  it('refuses to load the journal module when a declared maximum is absent', async () => {
+    const source = new URL(
+      '../scripts/direct-credentialed-run-state.mjs',
+      import.meta.url,
+    );
+    const text = await readFile(source, 'utf8');
+    const declarations: [string, string][] = [];
+    for (const [key, value] of Object.entries(DIRECT_SCENARIO_ARRAY_MAXIMA))
+      if (typeof value === 'number')
+        declarations.push([key, `  ${key}: ${value},\n`]);
+      else
+        for (const [nested, bound] of Object.entries(value))
+          declarations.push([
+            `inventory.${nested}`,
+            `    ${nested}: ${bound},\n`,
+          ]);
+    const load = async (code: string) => {
+      const child = spawn(
+        process.execPath,
+        ['--input-type=module', '-e', code],
+        {
+          cwd: fileURLToPath(new URL('..', import.meta.url)),
+          stdio: ['ignore', 'ignore', 'pipe'],
+          env: { PATH: process.env.PATH ?? '' },
+        },
+      );
+      let stderr = '';
+      child.stderr.on('data', (chunk) => {
+        stderr += String(chunk);
+      });
+      const status = await new Promise<number | null>((resolve, reject) => {
+        child.once('error', reject);
+        child.once('close', (value) => resolve(value));
+      });
+      return { status, refused: stderr.includes('invalid-state') };
+    };
+    const absolute = (value: string) =>
+      value.replace(
+        /from '\.\/([^']+)'/gu,
+        (_match, name: string) =>
+          `from ${JSON.stringify(new URL(name, source).href)}`,
+      );
+    expect(await load(absolute(text))).toEqual({ status: 0, refused: false });
+    for (const [key, declaration] of declarations) {
+      expect({ key, occurrences: text.split(declaration).length - 1 }).toEqual({
+        key,
+        occurrences: 1,
+      });
+      expect({
+        key,
+        ...(await load(absolute(text.replace(declaration, '')))),
+      }).toEqual({ key, status: 1, refused: true });
+    }
+  }, 60_000);
+
+  it('accepts the optional refusal detail and refuses one outside the vocabulary', async () => {
+    const unknown = await scenarioJournal();
+    await refuses(
+      unknown.journal,
+      scenarioWith((state) => {
+        (present(state.failure) as { detail?: string }).detail = 'not-a-detail';
+      }),
+    );
+    await unknown.journal.recordScenario(maximalScenario());
+    expect(unknown.journal.snapshot().scenario?.failure).toEqual({
+      code: 'observation-mismatch',
+      ordinal: MAX_COUNT,
+    });
+    const carried = await scenarioJournal();
+    await carried.journal.recordScenario(
+      scenarioWith((state) => {
+        present(state.failure).detail = 'run-reserve';
+      }),
+    );
+    expect(carried.journal.snapshot().scenario?.failure).toEqual({
+      code: 'observation-mismatch',
+      ordinal: MAX_COUNT,
+      detail: 'run-reserve',
+    });
   });
 
   it('refuses a phase regression, a phase skip and a weakened proof after publication', async () => {

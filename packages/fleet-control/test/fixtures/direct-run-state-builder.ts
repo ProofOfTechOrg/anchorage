@@ -182,11 +182,20 @@ export async function confirmedBootstrap(
 }
 
 export const MAX_ID = 'z'.repeat(128);
+export const MAX_COUNT = Number.MAX_SAFE_INTEGER;
 export const DIGEST = 'a'.repeat(64);
 export const LOCATION = `r2://${'p'.repeat(700)}`;
 export const DATE = '2026-09-10T00:00:00.000Z';
-export const PROCESS = { pid: 1, startTicks: '1000', bootId: MAX_ID };
-export const RESUMED = { pid: 2, startTicks: '2000', bootId: MAX_ID };
+export const PROCESS = {
+  pid: MAX_COUNT,
+  startTicks: '1000',
+  bootId: MAX_ID,
+};
+export const RESUMED = {
+  pid: MAX_COUNT - 1,
+  startTicks: '2000',
+  bootId: MAX_ID,
+};
 
 export function workerVersion(
   role: 'a' | 'b' | 'recovery',
@@ -212,8 +221,8 @@ export function workerVersion(
       ],
     },
     trafficPercentage,
-    cpuLimitMs: 50,
-    subrequestLimit: 50,
+    cpuLimitMs: MAX_COUNT,
+    subrequestLimit: MAX_COUNT,
     schemaVersion: 2,
     namespaces: [
       {
@@ -246,7 +255,7 @@ export function exportProof(role: 'a' | 'b') {
       operationId: MAX_ID,
     },
     location: LOCATION,
-    size: 1,
+    size: MAX_COUNT,
     sha256: DIGEST,
     sourceInvocationOrdinal: 1,
   };
@@ -292,8 +301,8 @@ export function footprint() {
 export function inventoryProof() {
   return {
     operationId: MAX_ID,
-    generation: 1,
-    calls: 2,
+    generation: MAX_COUNT,
+    calls: MAX_COUNT,
     databaseIds: [MAX_ID, MAX_ID],
     namespaceIds: Array.from({ length: 4 }, () => MAX_ID),
     scriptNames: [MAX_ID, MAX_ID],
@@ -308,10 +317,10 @@ export function inventoryProof() {
 export function auditProof() {
   return {
     operationId: MAX_ID,
-    generation: 1,
+    generation: MAX_COUNT,
     recordCount: 2 as const,
     findingCount: 16,
-    finalizedAtMs: 1,
+    finalizedAtMs: MAX_COUNT,
     findings: Array.from({ length: 16 }, () => ({
       tenantTag: MAX_ID,
       environment: MAX_ID,
@@ -335,10 +344,14 @@ export function maximalScenario(): MutableScenario {
       afterOrdinal: 1,
     },
     outcome: 'returned' as const,
-    attempts: { provider: 1, maintenance: 1, application: 1 },
+    attempts: {
+      provider: MAX_COUNT,
+      maintenance: MAX_COUNT,
+      application: MAX_COUNT,
+    },
     migration: {
       itemOrdinal: 0 as const,
-      cursor: 0,
+      cursor: MAX_COUNT,
       step: MAX_ID,
       itemsSha256: DIGEST,
     },
@@ -349,9 +362,13 @@ export function maximalScenario(): MutableScenario {
     startedOrdinal: 0,
     callCount: 3,
     phaseCalls,
-    attempts: { provider: 1, maintenance: 1, application: 1 },
-    sdkRequests: 4,
-    inventoryCalls: { before: 2, after: 2 },
+    attempts: {
+      provider: MAX_COUNT,
+      maintenance: MAX_COUNT,
+      application: MAX_COUNT,
+    },
+    sdkRequests: MAX_COUNT,
+    inventoryCalls: { before: MAX_COUNT, after: MAX_COUNT },
     lastCall: call,
     mutation: call,
     reconciledOrdinal: 3,
@@ -371,7 +388,7 @@ export function maximalScenario(): MutableScenario {
       pendingArtifactVersion: MAX_ID,
       databaseId: MAX_ID,
     })),
-    failure: { code: 'observation-mismatch', ordinal: 3 },
+    failure: { code: 'observation-mismatch', ordinal: MAX_COUNT },
     proofs: {
       initial: {
         a: workerVersion('a', '1', 100),
@@ -387,8 +404,8 @@ export function maximalScenario(): MutableScenario {
         b: workerVersion('b', '2', 100),
       },
       objects: {
-        a: { size: 31, sha256: DIGEST },
-        b: { size: 31, sha256: DIGEST },
+        a: { size: MAX_COUNT, sha256: DIGEST },
+        b: { size: MAX_COUNT, sha256: DIGEST },
       },
       objectDeletions: { a: 1, b: 1 },
       recoveryExportAbsent: { beforeOrdinal: 1, afterOrdinal: 2 },
@@ -441,11 +458,11 @@ export function maximalScenario(): MutableScenario {
         ordinal: 1,
         itemOrdinal: (index % 2) as 0 | 1,
         step: MAX_ID,
-        beforeCursor: 0,
-        afterCursor: 1,
-        provider: 1,
-        maintenance: 1,
-        application: 1,
+        beforeCursor: MAX_COUNT,
+        afterCursor: MAX_COUNT,
+        provider: MAX_COUNT,
+        maintenance: MAX_COUNT,
+        application: MAX_COUNT,
       })),
       effects: (['a', 'b'] as const).map((role) => ({
         role,
@@ -480,11 +497,11 @@ export function maximalScenario(): MutableScenario {
           applicationR2Settled: true,
           databaseAbsentReadback: true,
           scan: {
-            discover: { evidenceSha256: DIGEST, evidenceCount: 1 },
-            verify: { evidenceSha256: DIGEST, evidenceCount: 1 },
+            discover: { evidenceSha256: DIGEST, evidenceCount: MAX_COUNT },
+            verify: { evidenceSha256: DIGEST, evidenceCount: MAX_COUNT },
           },
         },
-        completedAtMs: 1,
+        completedAtMs: MAX_COUNT,
       },
       exports: { a: exportProof('a'), b: exportProof('b') },
       exportVerifications: Array.from({ length: 16 }, () => exportProof('a')),

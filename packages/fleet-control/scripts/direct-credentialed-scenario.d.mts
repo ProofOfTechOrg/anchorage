@@ -13,11 +13,13 @@ import type {
   DirectWorkerVersionObservation,
 } from './direct-credentialed-observations.mjs';
 import type {
+  DIRECT_SCENARIO_FAILURE_DETAILS,
   DIRECT_SCENARIO_FAILURES,
   DirectRunActionSummary,
   DirectRunJournal,
 } from './direct-credentialed-run-state.mjs';
 import type {
+  DirectScenarioFootprint,
   DirectScenarioNormalRole,
   DirectScenarioOperationFacts,
   DirectScenarioPhase,
@@ -31,6 +33,8 @@ type NormalRole = DirectScenarioNormalRole;
 export type { DirectScenarioOperationSlot } from './direct-credentialed-scenario-checks.mjs';
 export type { DirectScenarioPhase };
 export type DirectScenarioFailure = (typeof DIRECT_SCENARIO_FAILURES)[number];
+export type DirectScenarioFailureDetail =
+  (typeof DIRECT_SCENARIO_FAILURE_DETAILS)[number];
 interface ScenarioCall {
   readonly ordinal: number;
   readonly action: DirectRunActionSummary;
@@ -51,42 +55,6 @@ interface ScenarioProcess {
   readonly pid: number;
   readonly startTicks: string;
   readonly bootId: string;
-}
-export interface DirectScenarioFootprint {
-  readonly version: 1;
-  readonly role: 'recovery';
-  readonly beforeIdentitySha256: string;
-  readonly fleetRecordPresent: false;
-  readonly deploymentClaimsPresent: false;
-  readonly database: Readonly<{
-    id: string;
-    expectedName: string;
-    observedName: null;
-  }>;
-  readonly worker: Readonly<{
-    scriptName: string;
-    scriptPresent: boolean;
-    workersDevEnabled: false | null;
-    previewUrlsEnabled: false | null;
-    customDomains: readonly never[];
-    zoneRoutes: readonly never[];
-    currentSecretNames: readonly never[];
-    currentVersionIds: readonly string[] | null;
-    currentNamespaceIds: readonly string[];
-    survivingRecordedNamespaceIds: readonly string[];
-  }>;
-  readonly buckets: readonly Readonly<{
-    bindingName: 'PROBE_BUCKET';
-    bucketName: string;
-    jurisdiction: 'default';
-    expectedCreationDate: string;
-    observedCreationDate: string | null;
-  }>[];
-  readonly priorCleanup: Readonly<{
-    operationId: string;
-    observedReceiptSha256: string;
-    matchesBefore: true;
-  }>;
 }
 interface ScenarioInventory {
   readonly operationId: string;
@@ -194,6 +162,7 @@ export interface DirectScenarioState {
   readonly failure: Readonly<{
     code: DirectScenarioFailure;
     ordinal: number;
+    detail?: DirectScenarioFailureDetail;
   }> | null;
   readonly proofs: DirectScenarioProofs;
 }
@@ -209,6 +178,7 @@ export type DirectScenarioOutcome =
   | Readonly<{
       status: 'failed';
       reason: DirectScenarioFailure;
+      detail?: DirectScenarioFailureDetail;
       phase: DirectScenarioPhase | null;
       invocationCount: number;
     }>;

@@ -6,6 +6,7 @@ import {
   DIRECT_SCENARIO_INVOCATION_BUDGET,
   DIRECT_SCENARIO_PHASES,
 } from './direct-credentialed-scenario-budget.mjs';
+import { directCleanupReceiptDigest } from './direct-reference-receipt.mjs';
 
 export const NORMAL_ROLES = Object.freeze(['a', 'b']);
 export const SCENARIO_ROLES = Object.freeze([...NORMAL_ROLES, 'recovery']);
@@ -49,12 +50,18 @@ export function phaseInvocationReserve(phase) {
 
 export function checkInvocationHeadroom(phase, phaseCalls, remaining) {
   requireFact(remaining > 0, 'invocation-budget-exhausted');
+  requireFact(Number.isSafeInteger(remaining), 'invalid-input');
+  requireFact(
+    Object.hasOwn(DIRECT_SCENARIO_INVOCATION_BUDGET, phase),
+    'invalid-input',
+  );
   const budget = DIRECT_SCENARIO_INVOCATION_BUDGET[phase];
-  requireFact(budget, 'invalid-input');
-  const spent = phaseCalls[phase];
+  const spent = phaseCalls?.[phase];
+  requireFact(Number.isSafeInteger(spent) && spent >= 0, 'invalid-input');
   requireFact(spent < budget.ceiling, 'budget-exhausted', 'phase-ceiling');
   requireFact(
-    remaining >= phaseInvocationReserve(phase) - spent,
+    remaining >=
+      phaseInvocationReserve(phase) - Math.min(spent, budget.reserve),
     'budget-exhausted',
     'run-reserve',
   );
@@ -127,6 +134,11 @@ export function checkItemConvergence(items) {
 export function checkTrafficDistribution(candidate, previous) {
   equal(candidate.trafficPercentage, 0);
   equal(candidate.currentDeployment.activeVersionId, previous.versionId);
+  const weights = new Map([
+    [previous.versionId, 100],
+    [candidate.versionId, 0],
+  ]);
+  equal(candidate.currentDeployment.versions.length, weights.size);
   equal(
     new Map(
       candidate.currentDeployment.versions.map((entry) => [
@@ -134,10 +146,7 @@ export function checkTrafficDistribution(candidate, previous) {
         entry.percentage,
       ]),
     ),
-    new Map([
-      [previous.versionId, 100],
-      [candidate.versionId, 0],
-    ]),
+    weights,
   );
 }
 
@@ -163,4 +172,97 @@ export function migrationInterruptSettled(control, mutation) {
     'proof-unavailable',
   );
   return true;
+}
+
+export function checkInterruptionWitness(interruption, expected) {
+  const value = parse(interruption);
+  equal(value.version, 1);
+  equal(value.boundary, 'after-migration-admission');
+  equal(value.slot, 'migration-next');
+  equal(value.operationId, expected.operationId);
+  const claim = parse(value.claimJson);
+  const successor = parse(value.returnedTokenJson);
+  equal(claim.operationId, value.operationId);
+  equal(successor.operationId, value.operationId);
+  requireFact(successor.revision > claim.revision);
+  equal(value.item.ordinal, 0);
+  equal(value.item.beforeStatus, 'pending');
+  equal(value.item.afterStatus, 'active');
+  equal(value.item.planCursor, 0);
+  equal(value.item.tenantTag, expected.tenantTag);
+  equal(value.item.environment, expected.environment);
+  return { value, claim, successor };
+}
+
+export function checkInterruptedItems(witness, items) {
+  equal(items[0].status, 'active');
+  equal(items[0].planCursor, 0);
+  equal(items[0].entryRecordDigest, witness.item.entryRecordDigest);
+  equal(items[0].targetSpecDigest, witness.item.targetSpecDigest);
+  equal(items[1].status, 'pending');
+}
+
+export function checkFootprint(observation, expected) {
+  const resource = expected.resource;
+  const retained = expected.retained;
+  equal(observation.version, 1);
+  equal(observation.role, 'recovery');
+  equal(observation.fleetRecordPresent, false);
+  equal(observation.deploymentClaimsPresent, false);
+  equal(observation.database, {
+    id: resource.databaseId,
+    expectedName: expected.databaseName,
+    observedName: null,
+  });
+  const worker = observation.worker;
+  equal(worker.scriptName, resource.scriptName);
+  equal(worker.scriptPresent, retained);
+  requireFact(
+    worker.workersDevEnabled === false ||
+      (!retained && worker.workersDevEnabled === null),
+  );
+  requireFact(
+    worker.previewUrlsEnabled === false ||
+      (!retained && worker.previewUrlsEnabled === null),
+  );
+  for (const key of ['customDomains', 'zoneRoutes', 'currentSecretNames'])
+    equal(worker[key], []);
+  const namespaces = resource.namespaces
+    .map((entry) => entry.namespaceId)
+    .sort();
+  equal(worker.currentNamespaceIds, retained ? namespaces : []);
+  equal(worker.survivingRecordedNamespaceIds, retained ? namespaces : []);
+  if (retained)
+    requireFact(
+      worker.currentVersionIds.includes(resource.versionId) &&
+        worker.currentVersionIds.length <= expected.versionIdMaximum,
+    );
+  else
+    requireFact(
+      worker.currentVersionIds === null ||
+        worker.currentVersionIds.length === 0,
+    );
+  equal(observation.buckets, [
+    {
+      bindingName: 'PROBE_BUCKET',
+      bucketName: resource.bucket.name,
+      jurisdiction: 'default',
+      expectedCreationDate: resource.bucket.creationDate,
+      observedCreationDate: retained ? resource.bucket.creationDate : null,
+    },
+  ]);
+  equal(observation.priorCleanup.operationId, expected.cleanup.operationId);
+  equal(observation.priorCleanup.matchesBefore, true);
+  equal(
+    observation.priorCleanup.observedReceiptSha256,
+    directCleanupReceiptDigest(expected.cleanup),
+  );
+  if (!retained) {
+    equal(
+      observation.beforeIdentitySha256,
+      expected.force.beforeIdentitySha256,
+    );
+    equal(observation.priorCleanup, expected.force.priorCleanup);
+  }
+  return observation;
 }

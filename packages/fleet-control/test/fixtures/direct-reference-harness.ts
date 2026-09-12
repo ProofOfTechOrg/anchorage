@@ -40,6 +40,7 @@ export async function createDirectReferenceHarness(
     manifest?: DirectRunManifest;
     binding?: DirectRunBinding;
     applicationProbes?: boolean;
+    nodeProviderRest?: boolean;
     nodeResponse?: (request: Request, response: Response) => Promise<Response>;
     applicationFetch?: (request: CloudflareFixtureRequest) => Promise<Response>;
     providerResponse?: (
@@ -98,112 +99,118 @@ export async function createDirectReferenceHarness(
           entry.versionId === version.versionId && entry.percentage === 100,
       ),
     );
+  async function observedProviderRest(
+    request: CloudflareFixtureRequest,
+  ): Promise<Response> {
+    const url = new URL(request.url);
+    const scriptName = url.pathname
+      .split('/workers/scripts/')[1]
+      ?.split('/')[0];
+    const script = scriptName ? world.scripts.get(scriptName) : undefined;
+    const metadata =
+      request.body &&
+      typeof request.body === 'object' &&
+      'metadata' in request.body
+        ? (request.body.metadata as Record<string, unknown>)
+        : undefined;
+    if (
+      request.method === 'GET' &&
+      url.pathname.endsWith('/deployments/deployment')
+    )
+      return single({
+        id: 'deployment',
+        strategy: 'percentage',
+        versions: script?.deployment?.map(({ versionId, percentage }) => ({
+          version_id: versionId,
+          percentage,
+        })),
+      });
+    if (
+      request.method === 'GET' &&
+      url.pathname.endsWith('/settings') &&
+      script?.present
+    ) {
+      const active = activeVersion(script);
+      const runtime = versionRuntime.get(active?.versionId ?? '') as
+        | Record<string, unknown>
+        | undefined;
+      return single({
+        ...runtime,
+        bindings: active?.bindings.map((entry) => {
+          const value = entry as Record<string, unknown>;
+          return value.type === 'secret_text'
+            ? { type: value.type, name: value.name }
+            : value;
+        }),
+      });
+    }
+    if (
+      request.method === 'POST' &&
+      url.pathname ===
+        `/client/v4/accounts/account/d1/database/${binding.fleetDatabaseId}/query`
+    ) {
+      const query = request.body as { sql: string; params: string[] };
+      if (
+        !query.sql.startsWith('SELECT ') ||
+        (!query.sql.includes(' FROM direct_reference_observations WHERE ') &&
+          !query.sql.includes(' FROM anchorage_fleet_deployments WHERE '))
+      )
+        throw new Error('unexpected Node D1 query');
+      const result = await db
+        .prepare(query.sql)
+        .bind(...query.params)
+        .all();
+      return single([{ success: true, results: result.results }]);
+    }
+    if (
+      request.method === 'GET' &&
+      url.pathname.startsWith(
+        `/client/v4/accounts/account/r2/buckets/${binding.exportBucketName}/objects/`,
+      )
+    ) {
+      const key = decodeURIComponent(url.pathname.split('/objects/')[1] ?? '');
+      const value = await exportBytes.get(key);
+      return value
+        ? new Response(await value.arrayBuffer())
+        : new Response(null, { status: 404 });
+    }
+    let response = await rest(request);
+    if (metadata && response.ok && scriptName) {
+      const current = world.scripts.get(scriptName);
+      for (const version of current?.versions ?? [])
+        if (!versionRuntime.has(version.versionId))
+          versionRuntime.set(version.versionId, {
+            compatibility_date: metadata.compatibility_date,
+            compatibility_flags: metadata.compatibility_flags ?? [],
+            limits: metadata.limits,
+          });
+    }
+    if (
+      request.method === 'GET' &&
+      /\/versions\/[^/]+$/u.test(url.pathname) &&
+      response.ok
+    ) {
+      const value = (await response.json()) as {
+        result: { id: string; resources: Record<string, unknown> };
+      };
+      const runtime = versionRuntime.get(value.result.id) as
+        | { limits?: { cpu_ms?: number } }
+        | undefined;
+      value.result.resources.script_runtime = {
+        ...runtime,
+        limits: { cpu_ms: runtime?.limits?.cpu_ms },
+      };
+      response = Response.json(value);
+    }
+    return response;
+  }
   async function providerRest(
     request: CloudflareFixtureRequest,
   ): Promise<Response> {
     try {
-      const url = new URL(request.url);
-      const scriptName = url.pathname
-        .split('/workers/scripts/')[1]
-        ?.split('/')[0];
-      const script = scriptName ? world.scripts.get(scriptName) : undefined;
-      const metadata =
-        request.body &&
-        typeof request.body === 'object' &&
-        'metadata' in request.body
-          ? (request.body.metadata as Record<string, unknown>)
-          : undefined;
-      let response: Response;
-      if (
-        request.method === 'GET' &&
-        url.pathname.endsWith('/deployments/deployment')
-      ) {
-        response = single({
-          id: 'deployment',
-          strategy: 'percentage',
-          versions: script?.deployment?.map(({ versionId, percentage }) => ({
-            version_id: versionId,
-            percentage,
-          })),
-        });
-      } else if (
-        request.method === 'GET' &&
-        url.pathname.endsWith('/settings') &&
-        script?.present
-      ) {
-        const active = activeVersion(script);
-        const runtime = versionRuntime.get(active?.versionId ?? '') as
-          | Record<string, unknown>
-          | undefined;
-        response = single({
-          ...runtime,
-          bindings: active?.bindings.map((entry) => {
-            const value = entry as Record<string, unknown>;
-            return value.type === 'secret_text'
-              ? { type: value.type, name: value.name }
-              : value;
-          }),
-        });
-      } else if (
-        request.method === 'POST' &&
-        url.pathname ===
-          `/client/v4/accounts/account/d1/database/${binding.fleetDatabaseId}/query`
-      ) {
-        const query = request.body as { sql: string; params: string[] };
-        if (
-          !query.sql.startsWith('SELECT ') ||
-          (!query.sql.includes(' FROM direct_reference_observations WHERE ') &&
-            !query.sql.includes(' FROM anchorage_fleet_deployments WHERE '))
-        )
-          throw new Error('unexpected Node D1 query');
-        const result = await db
-          .prepare(query.sql)
-          .bind(...query.params)
-          .all();
-        response = single([{ success: true, results: result.results }]);
-      } else if (
-        request.method === 'GET' &&
-        url.pathname.startsWith(
-          `/client/v4/accounts/account/r2/buckets/${binding.exportBucketName}/objects/`,
-        )
-      ) {
-        const key = decodeURIComponent(
-          url.pathname.split('/objects/')[1] ?? '',
-        );
-        const value = await exportBytes.get(key);
-        response = value
-          ? new Response(await value.arrayBuffer())
-          : new Response(null, { status: 404 });
-      } else {
-        response = await rest(request);
-        if (metadata && response.ok && scriptName) {
-          const current = world.scripts.get(scriptName);
-          for (const version of current?.versions ?? [])
-            if (!versionRuntime.has(version.versionId))
-              versionRuntime.set(version.versionId, {
-                compatibility_date: metadata.compatibility_date,
-                compatibility_flags: metadata.compatibility_flags ?? [],
-                limits: metadata.limits,
-              });
-        }
-        if (
-          request.method === 'GET' &&
-          /\/versions\/[^/]+$/u.test(url.pathname) &&
-          response.ok
-        ) {
-          const value = (await response.json()) as {
-            result: { id: string; resources: Record<string, unknown> };
-          };
-          const runtime = versionRuntime.get(value.result.id) as
-            | { limits?: { cpu_ms?: number } }
-            | undefined;
-          value.result.resources.script_runtime = {
-            ...runtime,
-            limits: { cpu_ms: runtime?.limits?.cpu_ms },
-          };
-          response = Response.json(value);
-        }
-      }
+      const response = policy.nodeProviderRest
+        ? await observedProviderRest(request)
+        : await rest(request);
       return policy.providerResponse
         ? await policy.providerResponse(request, response)
         : response;
@@ -226,80 +233,83 @@ export async function createDirectReferenceHarness(
       throw error;
     }
   }
+  async function applicationProbe(
+    request: CloudflareFixtureRequest,
+  ): Promise<Response> {
+    const url = new URL(request.url);
+    const role = roles.find(
+      (role) => url.hostname === manifest.names.roles[role].routeHostname,
+    );
+    if (!role) throw new Error('unknown fixture application role');
+    if (
+      request.headers.get('authorization') !==
+      `Bearer ${secrets[role].application?.APP_PROBE_TOKEN}`
+    )
+      return new Response(null, { status: 401 });
+    const record = await fleetStore.get(
+      manifest.names.roles[role].tenantTag,
+      manifest.environment,
+    );
+    if (!record) throw new Error('missing fixture application record');
+    const database = world.databases.find(
+      (database) => database.databaseId === record.databaseId,
+    );
+    const active = activeVersion(world.scripts.get(record.scriptName));
+    if (!database || !active)
+      throw new Error('missing active fixture application');
+    const releaseBinding = active.bindings.find(
+      (binding) =>
+        binding &&
+        typeof binding === 'object' &&
+        Reflect.get(binding, 'name') === 'APPLICATION_RELEASE',
+    );
+    const release =
+      releaseBinding && typeof releaseBinding === 'object'
+        ? Reflect.get(releaseBinding, 'text')
+        : undefined;
+    if (url.pathname === '/__direct/health' && request.method === 'GET') {
+      const rows = database.d1.queryDatabase(
+        'SELECT marker FROM direct_conformance_fixture WHERE id=1',
+      );
+      return Response.json({ release, marker: rows[0]?.marker });
+    }
+    const bucket = record.applicationResources?.find(
+      (resource) => resource.name === 'PROBE_BUCKET',
+    );
+    if (!bucket || url.pathname !== '/__direct/object')
+      throw new Error('unknown fixture application route');
+    const key = `${bucket.jurisdiction}:${bucket.bucketName}/${DIRECT_TENANT_OBJECT_KEY}`;
+    if (request.method === 'POST') {
+      await applicationBytes.put(key, DIRECT_TENANT_OBJECT_BODY);
+      return new Response(null, { status: 204 });
+    }
+    if (request.method === 'DELETE') {
+      await applicationBytes.delete(key);
+      return new Response(null, { status: 204 });
+    }
+    if (request.method !== 'GET')
+      throw new Error('unexpected fixture application method');
+    const value = await applicationBytes.get(key);
+    return value
+      ? Response.json({
+          present: true,
+          size: value.size,
+          sha256: createHash('sha256')
+            .update(Buffer.from(await value.arrayBuffer()))
+            .digest('hex'),
+        })
+      : Response.json({ present: false });
+  }
   const projection = recordingFetch(async (request) => {
     const url = new URL(request.url);
+    const application = specs.some(
+      (spec) => url.origin === `https://${spec.routeHostname}`,
+    );
+    if (application && policy.applicationProbes)
+      return applicationProbe(request);
     if (
-      policy.applicationProbes &&
-      specs.some((spec) => url.origin === `https://${spec.routeHostname}`)
-    ) {
-      const role = roles.find(
-        (role) => url.hostname === manifest.names.roles[role].routeHostname,
-      );
-      if (!role) throw new Error('unknown fixture application role');
-      if (
-        request.headers.get('authorization') !==
-        `Bearer ${secrets[role].application?.APP_PROBE_TOKEN}`
-      )
-        return new Response(null, { status: 401 });
-      const record = await fleetStore.get(
-        manifest.names.roles[role].tenantTag,
-        manifest.environment,
-      );
-      if (!record) throw new Error('missing fixture application record');
-      const database = world.databases.find(
-        (database) => database.databaseId === record.databaseId,
-      );
-      const active = activeVersion(world.scripts.get(record.scriptName));
-      if (!database || !active)
-        throw new Error('missing active fixture application');
-      const releaseBinding = active.bindings.find(
-        (binding) =>
-          binding &&
-          typeof binding === 'object' &&
-          Reflect.get(binding, 'name') === 'APPLICATION_RELEASE',
-      );
-      const release =
-        releaseBinding && typeof releaseBinding === 'object'
-          ? Reflect.get(releaseBinding, 'text')
-          : undefined;
-      if (url.pathname === '/__direct/health' && request.method === 'GET') {
-        const rows = database.d1.queryDatabase(
-          'SELECT marker FROM direct_conformance_fixture WHERE id=1',
-        );
-        return Response.json({ release, marker: rows[0]?.marker });
-      }
-      const bucket = record.applicationResources?.find(
-        (resource) => resource.name === 'PROBE_BUCKET',
-      );
-      if (!bucket || url.pathname !== '/__direct/object')
-        throw new Error('unknown fixture application route');
-      const key = `${bucket.jurisdiction}:${bucket.bucketName}/${DIRECT_TENANT_OBJECT_KEY}`;
-      if (request.method === 'POST') {
-        await applicationBytes.put(key, DIRECT_TENANT_OBJECT_BODY);
-        return new Response(null, { status: 204 });
-      }
-      if (request.method === 'DELETE') {
-        await applicationBytes.delete(key);
-        return new Response(null, { status: 204 });
-      }
-      if (request.method !== 'GET')
-        throw new Error('unexpected fixture application method');
-      const value = await applicationBytes.get(key);
-      return value
-        ? Response.json({
-            present: true,
-            size: value.size,
-            sha256: createHash('sha256')
-              .update(Buffer.from(await value.arrayBuffer()))
-              .digest('hex'),
-          })
-        : Response.json({ present: false });
-    }
-    if (
+      application &&
       policy.applicationFetch &&
-      specs.some(
-        (candidate) => url.origin === `https://${candidate.routeHostname}`,
-      ) &&
       (url.pathname === '/__direct/health' ||
         url.pathname === '/__direct/object')
     )

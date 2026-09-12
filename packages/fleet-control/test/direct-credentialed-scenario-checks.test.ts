@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import type { DirectWorkerVersionObservation } from '../scripts/direct-credentialed-observations.mjs';
+import { DIRECT_SCENARIO_ARRAY_MAXIMA } from '../scripts/direct-credentialed-run-state.mjs';
 import {
   DIRECT_SCENARIO_INVOCATION_BUDGET,
   DIRECT_SCENARIO_MIN_INVOCATIONS,
@@ -11,9 +12,14 @@ import {
 } from '../scripts/direct-credentialed-scenario-budget.mjs';
 import {
   changedBy,
+  checkFootprint,
+  checkInterruptedItems,
+  checkInterruptionWitness,
   checkInvocationHeadroom,
   checkItemConvergence,
   checkTrafficDistribution,
+  type DirectScenarioFootprint,
+  type DirectScenarioInterruptedItem,
   type DirectScenarioPhase,
   equal,
   expectedVersion,
@@ -30,6 +36,8 @@ import {
   SCENARIO_ROLES,
   zeroAttempts,
 } from '../scripts/direct-credentialed-scenario-checks.mjs';
+import { directCleanupReceiptDigest } from '../scripts/direct-reference-receipt.mjs';
+import type { CleanupTerminalReceipt } from '../src/types.js';
 
 function refusal(action: () => unknown): string {
   try {
@@ -228,6 +236,23 @@ describe('scenario migration guards', () => {
             'new',
             0,
             [
+              { versionId: 'old', percentage: 100 },
+              { versionId: 'new', percentage: 0 },
+              { versionId: 'new', percentage: 0 },
+            ],
+            'old',
+          ),
+          previous,
+        ),
+      ),
+    ).toBe('observation-mismatch');
+    expect(
+      refusal(() =>
+        checkTrafficDistribution(
+          observation(
+            'new',
+            0,
+            [
               { versionId: 'old', percentage: 0 },
               { versionId: 'new', percentage: 0 },
             ],
@@ -375,7 +400,8 @@ describe('scenario one-shot mutation reconciliation', () => {
 });
 
 describe('scenario reconciliation allowance', () => {
-  it('allows no record change during an audit action', () => {
+  it('maps each action family to the slot and roles it may change', () => {
+    expect(changedBy(null)).toEqual({ slots: [], roles: [] });
     expect(changedBy({ kind: 'audit-start', slot: 'audit-before' })).toEqual({
       slots: ['audit-before'],
       roles: [],
@@ -383,10 +409,6 @@ describe('scenario reconciliation allowance', () => {
     expect(
       changedBy({ kind: 'audit-page', slot: 'audit-after', limit: 32 }),
     ).toEqual({ slots: ['audit-after'], roles: [] });
-  });
-
-  it('maps every other action to the slot and roles it may change', () => {
-    expect(changedBy(null)).toEqual({ slots: [], roles: [] });
     expect(
       changedBy({ kind: 'provision', role: 'a', release: 'initial' }),
     ).toEqual({ slots: ['cleanup-a'], roles: ['a'] });
@@ -432,6 +454,30 @@ describe('scenario reconciliation allowance', () => {
     });
   });
 });
+
+const DECLARED_PHASES = [
+  'provision-a',
+  'provision-b',
+  'inventory-before',
+  'audit-before',
+  'migration-start',
+  'migration-interrupt',
+  'migration-restart',
+  'migration',
+  'post-migration',
+  'inventory-after',
+  'audit-after',
+  'failed-recovery',
+  'cleanup-recovery',
+  'provision-recovery',
+  'delete-objects',
+  'decommission-a',
+  'decommission-b',
+  'force-recovery',
+  'force-observe',
+  'recover-force-residual',
+  'complete',
+] as const;
 
 describe('scenario invocation budget', () => {
   const zeroCalls = () =>
@@ -510,6 +556,127 @@ describe('scenario invocation budget', () => {
     ).toBe('invalid-input');
   });
 
+  it('orders the phases the journal proof rules and resume check index by', () => {
+    const declared: readonly DirectScenarioPhase[] = DECLARED_PHASES;
+    const runtime: readonly (typeof DECLARED_PHASES)[number][] =
+      DIRECT_SCENARIO_PHASES;
+    expect([...runtime]).toEqual([...declared]);
+    expect(new Set(DECLARED_PHASES).size).toBe(DECLARED_PHASES.length);
+    expect(DIRECT_SCENARIO_PHASES.at(-1)).toBe('complete');
+    const ordered = (
+      earlier: DirectScenarioPhase,
+      later: DirectScenarioPhase,
+    ) =>
+      DIRECT_SCENARIO_PHASES.indexOf(earlier) <
+      DIRECT_SCENARIO_PHASES.indexOf(later);
+    for (const [producer, consumer] of [
+      ['provision-a', 'migration'],
+      ['provision-b', 'migration'],
+      ['migration', 'post-migration'],
+      ['post-migration', 'delete-objects'],
+      ['delete-objects', 'decommission-a'],
+      ['delete-objects', 'decommission-b'],
+      ['inventory-before', 'audit-before'],
+      ['inventory-after', 'audit-after'],
+      ['migration-interrupt', 'migration-restart'],
+      ['cleanup-recovery', 'provision-recovery'],
+      ['force-recovery', 'force-observe'],
+      ['force-observe', 'recover-force-residual'],
+    ] as const)
+      expect({
+        producer,
+        consumer,
+        ordered: ordered(producer, consumer),
+      }).toEqual({ producer, consumer, ordered: true });
+  });
+
+  it('holds back the later-phase reserve once a phase spends past its own', () => {
+    const calls = zeroCalls();
+    const observe = DIRECT_SCENARIO_INVOCATION_BUDGET['force-observe'];
+    expect({ reserve: observe.reserve, ceiling: observe.ceiling }).toEqual({
+      reserve: 4,
+      ceiling: 16,
+    });
+    expect(phaseInvocationReserve('force-observe')).toBe(12);
+    expect(phaseInvocationReserve('recover-force-residual')).toBe(8);
+    for (const [spent, minimum] of [
+      [0, 12],
+      [4, 8],
+      [11, 8],
+      [15, 8],
+    ] as const) {
+      const phaseCalls = { ...calls, 'force-observe': spent };
+      expect(
+        refusal(() =>
+          checkInvocationHeadroom('force-observe', phaseCalls, minimum),
+        ),
+      ).toBe('accepted');
+      expect(
+        cause(() =>
+          checkInvocationHeadroom('force-observe', phaseCalls, minimum - 1),
+        ),
+      ).toEqual({ code: 'budget-exhausted', detail: 'run-reserve' });
+    }
+    const migration = DIRECT_SCENARIO_INVOCATION_BUDGET.migration;
+    expect({ reserve: migration.reserve, ceiling: migration.ceiling }).toEqual({
+      reserve: 132,
+      ceiling: 216,
+    });
+    expect(phaseInvocationReserve('migration')).toBe(484);
+    const overspent = { ...calls, migration: 200 };
+    expect(
+      refusal(() => checkInvocationHeadroom('migration', overspent, 352)),
+    ).toBe('accepted');
+    expect(
+      cause(() => checkInvocationHeadroom('migration', overspent, 351)),
+    ).toEqual({ code: 'budget-exhausted', detail: 'run-reserve' });
+  });
+
+  it('refuses a phase call map without a usable count for the phase', () => {
+    const total = phaseInvocationReserve('provision-a');
+    const absent = {} as Record<DirectScenarioPhase, number>;
+    expect(
+      refusal(() => checkInvocationHeadroom('provision-a', absent, total)),
+    ).toBe('invalid-input');
+    expect(
+      refusal(() =>
+        checkInvocationHeadroom(
+          'provision-a',
+          null as unknown as Record<DirectScenarioPhase, number>,
+          total,
+        ),
+      ),
+    ).toBe('invalid-input');
+    for (const value of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1])
+      expect(
+        refusal(() =>
+          checkInvocationHeadroom(
+            'provision-a',
+            { ...zeroCalls(), 'provision-a': value },
+            total,
+          ),
+        ),
+      ).toBe('invalid-input');
+  });
+
+  it('refuses an inherited phase key and a remaining count that is not an integer', () => {
+    const calls = zeroCalls();
+    const total = phaseInvocationReserve('provision-a');
+    expect(
+      refusal(() =>
+        checkInvocationHeadroom(
+          'constructor' as DirectScenarioPhase,
+          calls,
+          total,
+        ),
+      ),
+    ).toBe('invalid-input');
+    for (const remaining of [1.5, Number.MAX_SAFE_INTEGER + 1])
+      expect(
+        refusal(() => checkInvocationHeadroom('provision-a', calls, remaining)),
+      ).toBe('invalid-input');
+  });
+
   it('declares the invocation floor the shipped configuration clears', async () => {
     const config = JSON.parse(
       await readFile(
@@ -524,5 +691,306 @@ describe('scenario invocation budget', () => {
     expect(config.referenceWorker.maxInvocations).toBeGreaterThanOrEqual(
       DIRECT_SCENARIO_MIN_INVOCATIONS,
     );
+  });
+});
+
+describe('scenario interruption witness', () => {
+  const OPERATION = 'migration-operation';
+  const ENTRY_DIGEST = 'e'.repeat(64);
+  const TARGET_DIGEST = 'f'.repeat(64);
+  const expected = {
+    operationId: OPERATION,
+    tenantTag: 'tenant',
+    environment: 'production',
+  };
+  const value = () => ({
+    version: 1,
+    boundary: 'after-migration-admission',
+    slot: 'migration-next',
+    operationId: OPERATION,
+    claimJson: JSON.stringify({ operationId: OPERATION, revision: 1 }),
+    returnedTokenJson: JSON.stringify({ operationId: OPERATION, revision: 2 }),
+    item: {
+      ordinal: 0,
+      beforeStatus: 'pending',
+      afterStatus: 'active',
+      planCursor: 0,
+      tenantTag: 'tenant',
+      environment: 'production',
+      entryRecordDigest: ENTRY_DIGEST,
+      targetSpecDigest: TARGET_DIGEST,
+    },
+  });
+  const serialized = (mutate: (current: ReturnType<typeof value>) => void) => {
+    const current = value();
+    mutate(current);
+    return JSON.stringify(current);
+  };
+
+  it('reads the claim and the successor the boundary recorded', () => {
+    const result = checkInterruptionWitness(JSON.stringify(value()), expected);
+    expect(result.value).toEqual(value());
+    expect(result.claim).toEqual({ operationId: OPERATION, revision: 1 });
+    expect(result.successor).toEqual({ operationId: OPERATION, revision: 2 });
+  });
+
+  it('refuses a witness the recorded operation and item do not account for', () => {
+    expect(refusal(() => checkInterruptionWitness(42, expected))).toBe(
+      'observation-mismatch',
+    );
+    for (const mutate of [
+      (current) => {
+        current.version = 2;
+      },
+      (current) => {
+        current.boundary = 'before-migration-admission';
+      },
+      (current) => {
+        current.slot = 'inventory-before';
+      },
+      (current) => {
+        current.operationId = 'other-operation';
+      },
+      (current) => {
+        current.claimJson = JSON.stringify({
+          operationId: 'other-operation',
+          revision: 1,
+        });
+      },
+      (current) => {
+        current.returnedTokenJson = JSON.stringify({
+          operationId: OPERATION,
+          revision: 1,
+        });
+      },
+      (current) => {
+        current.returnedTokenJson = JSON.stringify({
+          operationId: 'other-operation',
+          revision: 2,
+        });
+      },
+      (current) => {
+        current.item.ordinal = 1;
+      },
+      (current) => {
+        current.item.beforeStatus = 'active';
+      },
+      (current) => {
+        current.item.afterStatus = 'pending';
+      },
+      (current) => {
+        current.item.planCursor = 1;
+      },
+      (current) => {
+        current.item.tenantTag = 'other-tenant';
+      },
+      (current) => {
+        current.item.environment = 'staging';
+      },
+    ] satisfies ((current: ReturnType<typeof value>) => void)[])
+      expect(
+        refusal(() => checkInterruptionWitness(serialized(mutate), expected)),
+      ).toBe('observation-mismatch');
+  });
+
+  it('requires the interrupted item active at its recorded cursor beside a pending successor', () => {
+    const witness = checkInterruptionWitness(
+      JSON.stringify(value()),
+      expected,
+    ).value;
+    const active = {
+      status: 'active',
+      planCursor: 0,
+      entryRecordDigest: ENTRY_DIGEST,
+      targetSpecDigest: TARGET_DIGEST,
+    };
+    const pending = { ...active, status: 'pending' };
+    expect(
+      refusal(() => checkInterruptedItems(witness, [active, pending])),
+    ).toBe('accepted');
+    const pairs: readonly (readonly [
+      DirectScenarioInterruptedItem,
+      DirectScenarioInterruptedItem,
+    ])[] = [
+      [{ ...active, status: 'complete' }, pending],
+      [{ ...active, planCursor: 1 }, pending],
+      [{ ...active, entryRecordDigest: 'a'.repeat(64) }, pending],
+      [{ ...active, targetSpecDigest: 'a'.repeat(64) }, pending],
+      [active, { ...pending, status: 'active' }],
+    ];
+    for (const items of pairs)
+      expect(refusal(() => checkInterruptedItems(witness, items))).toBe(
+        'observation-mismatch',
+      );
+  });
+});
+
+describe('scenario recovery footprint', () => {
+  const DATABASE_NAME = 'recovery-database-name';
+  const CREATED = '2026-09-10T00:00:00.000Z';
+  const NAMESPACES = ['maintenance-namespace', 'runner-namespace'];
+  const receipt: CleanupTerminalReceipt = {
+    version: 1,
+    operationId: 'cleanup-operation',
+    tenantTag: 'tenant',
+    environment: 'production',
+    backend: 'plain-worker',
+    scriptName: 'recovery-script',
+    databaseId: 'recovery-database',
+    databaseName: DATABASE_NAME,
+    authority: 'provisioning-rollback',
+    admittedPhase: 'database-reserved',
+    disposition: 'reservation-cleared',
+    evidence: {
+      eligibility: 'reservation-only',
+      ingressRemoved: true,
+      workerAbsent: true,
+      platformResourcesAbsent: true,
+      applicationR2Settled: true,
+      databaseAbsentReadback: true,
+    },
+    completedAtMs: 1,
+  };
+  const resource: DirectWorkerVersionObservation = {
+    ...observation('recovery-version', 100, [
+      { versionId: 'recovery-version', percentage: 100 },
+    ]),
+    role: 'recovery',
+    scriptName: 'recovery-script',
+    databaseId: 'recovery-database',
+    namespaces: [
+      {
+        binding: 'RUNNER',
+        className: 'Runner',
+        namespaceId: 'runner-namespace',
+      },
+      {
+        binding: 'MAINTENANCE',
+        className: 'Maintenance',
+        namespaceId: 'maintenance-namespace',
+      },
+    ],
+    bucket: { name: 'bucket', jurisdiction: 'default', creationDate: CREATED },
+  };
+  const footprint = (retained: boolean): DirectScenarioFootprint => ({
+    version: 1,
+    role: 'recovery',
+    beforeIdentitySha256: 'b'.repeat(64),
+    fleetRecordPresent: false,
+    deploymentClaimsPresent: false,
+    database: {
+      id: 'recovery-database',
+      expectedName: DATABASE_NAME,
+      observedName: null,
+    },
+    worker: {
+      scriptName: 'recovery-script',
+      scriptPresent: retained,
+      workersDevEnabled: retained ? false : null,
+      previewUrlsEnabled: retained ? false : null,
+      customDomains: [],
+      zoneRoutes: [],
+      currentSecretNames: [],
+      currentVersionIds: retained ? ['recovery-version'] : null,
+      currentNamespaceIds: retained ? NAMESPACES : [],
+      survivingRecordedNamespaceIds: retained ? NAMESPACES : [],
+    },
+    buckets: [
+      {
+        bindingName: 'PROBE_BUCKET',
+        bucketName: 'bucket',
+        jurisdiction: 'default',
+        expectedCreationDate: CREATED,
+        observedCreationDate: retained ? CREATED : null,
+      },
+    ],
+    priorCleanup: {
+      operationId: 'cleanup-operation',
+      observedReceiptSha256: directCleanupReceiptDigest(receipt),
+      matchesBefore: true,
+    },
+  });
+  const context = {
+    resource,
+    databaseName: DATABASE_NAME,
+    cleanup: receipt,
+    versionIdMaximum: DIRECT_SCENARIO_ARRAY_MAXIMA.footprintVersionIds,
+  };
+
+  it('accepts the retained footprint and the residual footprint it carries forward', () => {
+    const force = checkFootprint(footprint(true), {
+      ...context,
+      retained: true,
+    });
+    expect(force).toEqual(footprint(true));
+    expect(
+      checkFootprint(footprint(false), {
+        ...context,
+        retained: false,
+        force,
+      }),
+    ).toEqual(footprint(false));
+  });
+
+  it('refuses a footprint the recovery resources and the cleanup receipt do not account for', () => {
+    const retained = footprint(true);
+    for (const observed of [
+      { ...retained, role: 'a' },
+      { ...retained, fleetRecordPresent: true },
+      {
+        ...retained,
+        database: { ...retained.database, observedName: 'present' },
+      },
+      { ...retained, worker: { ...retained.worker, scriptPresent: false } },
+      {
+        ...retained,
+        worker: { ...retained.worker, workersDevEnabled: null },
+      },
+      { ...retained, worker: { ...retained.worker, currentNamespaceIds: [] } },
+      {
+        ...retained,
+        worker: { ...retained.worker, currentVersionIds: ['other-version'] },
+      },
+      {
+        ...retained,
+        worker: {
+          ...retained.worker,
+          currentVersionIds: [
+            'recovery-version',
+            ...Array.from(
+              { length: DIRECT_SCENARIO_ARRAY_MAXIMA.footprintVersionIds },
+              () => 'other-version',
+            ),
+          ],
+        },
+      },
+      { ...retained, buckets: [] },
+      {
+        ...retained,
+        priorCleanup: { ...retained.priorCleanup, operationId: 'other' },
+      },
+      {
+        ...retained,
+        priorCleanup: {
+          ...retained.priorCleanup,
+          observedReceiptSha256: 'a'.repeat(64),
+        },
+      },
+    ])
+      expect(
+        refusal(() => checkFootprint(observed, { ...context, retained: true })),
+      ).toBe('observation-mismatch');
+    expect(
+      refusal(() =>
+        checkFootprint(footprint(false), {
+          ...context,
+          retained: false,
+          force: {
+            ...footprint(true),
+            beforeIdentitySha256: 'c'.repeat(64),
+          },
+        }),
+      ),
+    ).toBe('observation-mismatch');
   });
 });

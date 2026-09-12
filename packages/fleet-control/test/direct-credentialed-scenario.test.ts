@@ -260,6 +260,7 @@ describe('scenario journal refusal boundaries', () => {
     expect(await runDirectCredentialedScenario(input)).toMatchObject({
       status: 'failed',
       reason: 'budget-exhausted',
+      detail: 'below-scenario-floor',
       phase: 'provision-a',
       invocationCount: 1,
     });
@@ -270,6 +271,7 @@ describe('scenario journal refusal boundaries', () => {
     expect(await runDirectCredentialedScenario(input)).toMatchObject({
       status: 'failed',
       reason: 'budget-exhausted',
+      detail: 'below-scenario-floor',
     });
     expect(calls).toBe(0);
   });
@@ -352,6 +354,109 @@ describe('scenario journal refusal boundaries', () => {
     expect(calls).toBe(0);
   });
 
+  it('refuses a provisioned deployment carrying more versions than the journal holds', async () => {
+    const local = await directObservationFixture(1000, 'confirmed', {
+      maxInvocations: DIRECT_SCENARIO_MIN_INVOCATIONS,
+    });
+    cleanup.push(() => local.close());
+    const [target] = local.expected;
+    if (!target) throw new Error('observation fixture target is missing');
+    for (const versionId of ['zero-weight-1', 'zero-weight-2'])
+      local.deployment.versions.push({ version_id: versionId, percentage: 0 });
+    local.hook(async (request, fallback) => {
+      const response = fallback();
+      const path = new URL(request.url).pathname;
+      if (
+        !path.endsWith(`/versions/${target.versionId}`) &&
+        !path.endsWith('/settings')
+      )
+        return response;
+      const released = (bindings: unknown) =>
+        (bindings as { name: string; text?: string }[]).map((entry) =>
+          entry.name === 'APPLICATION_RELEASE' ||
+          entry.name === 'FLEET_SCHEMA_VERSION'
+            ? { ...entry, text: '1' }
+            : entry,
+        );
+      const body = (await response.json()) as {
+        result: {
+          bindings?: unknown;
+          resources?: { bindings?: unknown };
+        };
+      };
+      if (body.result.resources?.bindings)
+        body.result.resources.bindings = released(
+          body.result.resources.bindings,
+        );
+      if (body.result.bindings)
+        body.result.bindings = released(body.result.bindings);
+      return Response.json(body);
+    });
+    let provisioned = false;
+    const control = () => ({
+      binding: {
+        version: 1,
+        accountId: 'account',
+        fleetDatabaseId: 'fleet-id',
+        quotaDatabaseId: 'quota-id',
+        exportBucketName: local.prepared.names.exportBucket,
+        referenceModuleSetSha256: local.prepared.referenceModuleSetSha256,
+        accountWorkersDevSubdomain: 'attested-account',
+      },
+      operations: [],
+      records: [
+        ...local.expected.map((entry) => ({
+          role: entry.role,
+          present: provisioned && entry.role === target.role,
+          ...(provisioned && entry.role === target.role
+            ? {
+                phase: 'ready',
+                desiredSpecDigest: entry.specDigest,
+                pendingSpecDigest: entry.specDigest,
+                artifactVersion: entry.versionId,
+                pendingArtifactVersion: entry.versionId,
+                databaseId: entry.databaseId,
+              }
+            : {}),
+        })),
+        { role: 'recovery' as const, present: false },
+      ],
+      interruption: null,
+      forceBefore: null,
+      forceAfter: null,
+    });
+    const invocation: DirectInvocationClient = {
+      async invoke(action) {
+        const reservation = await local.journal.reserveInvocation(
+          JSON.stringify({
+            contractVersion: 1,
+            configSha256: local.prepared.configSha256,
+            action,
+          }),
+        );
+        await local.journal.settleInvocation(reservation);
+        const attempts = { provider: 0, maintenance: 0, application: 0 };
+        if (action.kind === 'control-read')
+          return { result: control(), attempts };
+        if (action.kind === 'provision' && action.role === target.role) {
+          provisioned = true;
+          return { result: { status: 'ready' }, attempts };
+        }
+        throw new Error(`unexpected fixture action ${action.kind}`);
+      },
+    };
+    expect(
+      await runDirectCredentialedScenario({ ...local.input, invocation }),
+    ).toMatchObject({
+      status: 'failed',
+      reason: 'observation-mismatch',
+      phase: 'provision-a',
+    });
+    const state = local.journal.snapshot().scenario;
+    expect(state?.failure).toMatchObject({ code: 'observation-mismatch' });
+    expect(state?.proofs.initial.a).toBeNull();
+  });
+
   it('retains an unknown pending invocation and refuses readbacks and concurrent mutation', async () => {
     const local = await directObservationFixture();
     cleanup.push(() => local.close());
@@ -390,7 +495,6 @@ describe('scenario journal refusal boundaries', () => {
 
 async function fixture(
   options: {
-    maxInvocations?: number;
     nodeResponse?: NonNullable<
       Parameters<typeof createDirectReferenceHarness>[0]
     >['nodeResponse'];
@@ -399,9 +503,6 @@ async function fixture(
   const local = await directObservationFixture(30_000, 'confirmed', {
     invocationTimeoutMs: 600_000,
     maxProviderRequests: 1000,
-    ...(options.maxInvocations
-      ? { maxInvocations: options.maxInvocations }
-      : {}),
   });
   cleanup.push(() => local.close());
   const native = await createDirectReferenceHarness({
@@ -417,6 +518,7 @@ async function fixture(
     },
     maintenanceNow: Date.now,
     applicationProbes: true,
+    nodeProviderRest: true,
     ...(options.nodeResponse ? { nodeResponse: options.nodeResponse } : {}),
   });
   cleanup.push(() => native.close());
@@ -808,6 +910,90 @@ describe('scenario resume re-entry against a settled journal', () => {
     if (!state) throw new Error('scenario state is missing');
     return state;
   };
+
+  it('refuses a control read that repeats an operation slot', async () => {
+    const target = await scenarioJournal(DIRECT_SCENARIO_MIN_INVOCATIONS);
+    await target.journal.recordScenario(
+      seed('migration-start', () => {}) as DirectScenarioState,
+    );
+    const { invocation } = reference(target, { interrupted: false });
+    const duplicating: DirectInvocationClient = {
+      async invoke(action) {
+        const outcome = await invocation.invoke(action);
+        if (action.kind !== 'control-read') return outcome;
+        const result = outcome.result as { operations: readonly unknown[] };
+        return {
+          ...outcome,
+          result: {
+            ...result,
+            operations: [...result.operations, ...result.operations],
+          },
+        };
+      },
+    };
+    expect(await run(target, duplicating)).toMatchObject({
+      status: 'failed',
+      reason: 'observation-mismatch',
+      phase: 'migration-start',
+    });
+    expect(stored(target).failure).toMatchObject({
+      code: 'observation-mismatch',
+    });
+  });
+
+  it('re-raises the persisted refusal detail on resume', async () => {
+    const target = await scenarioJournal(DIRECT_SCENARIO_MIN_INVOCATIONS);
+    await target.journal.recordScenario(
+      seed('migration-start', (state) => {
+        state.failure = {
+          code: 'budget-exhausted',
+          ordinal: 3,
+          detail: 'below-scenario-floor',
+        };
+      }) as DirectScenarioState,
+    );
+    const { actions, invocation } = reference(target, { interrupted: false });
+    expect(await run(target, invocation)).toMatchObject({
+      status: 'failed',
+      reason: 'budget-exhausted',
+      detail: 'below-scenario-floor',
+      phase: 'migration-start',
+    });
+    expect(actions).toEqual([]);
+    expect(stored(target).failure).toEqual({
+      code: 'budget-exhausted',
+      ordinal: 3,
+      detail: 'below-scenario-floor',
+    });
+  });
+
+  it('reports the persisted failure code after a resume spends an invocation', async () => {
+    const target = await scenarioJournal(DIRECT_SCENARIO_MIN_INVOCATIONS);
+    await target.journal.recordScenario(
+      seed('migration-start', (state) => {
+        state.failure = { code: 'reference-refused', ordinal: 3 };
+      }) as DirectScenarioState,
+    );
+    const reservation = await target.journal.reserveInvocation(
+      JSON.stringify({
+        contractVersion: 1,
+        configSha256: target.f.prepared.configSha256,
+        action: { kind: 'control-read' },
+      }),
+    );
+    await target.journal.settleInvocation(reservation);
+    const { actions, invocation } = reference(target, { interrupted: false });
+    expect(await run(target, invocation)).toMatchObject({
+      status: 'failed',
+      reason: 'reference-refused',
+      phase: 'migration-start',
+    });
+    expect(actions).toEqual([]);
+    expect(stored(target).failure).toEqual({
+      code: 'reference-refused',
+      ordinal: 3,
+    });
+  });
 
   it('issues no second migration start and consumes the injection only at the interrupt', async () => {
     const target = await scenarioJournal(DIRECT_SCENARIO_MIN_INVOCATIONS);
