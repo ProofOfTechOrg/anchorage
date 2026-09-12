@@ -83,7 +83,13 @@ async function mutationFixture() {
       hooks.beforeBatch = undefined;
       await before?.();
       const results = await native.batch(statements);
-      return hooks.afterBatch ? hooks.afterBatch(results) : results;
+      // The hooks hand back `unknown[]` on purpose: that is what a wrong
+      // adapter returns.
+      return hooks.afterBatch
+        ? (hooks.afterBatch(results) as Awaited<
+            ReturnType<NonNullable<ScheduleDatabase['batch']>>
+          >)
+        : results;
     },
   };
   const store = new D1SchedulesStorage(binding);

@@ -196,6 +196,211 @@ test('missing files, directory READMEs, and Markdown anchors fail', () => {
   );
 });
 
+test('relative links obey the internal-file policy', () => {
+  const root = fixture({
+    'docs/guide.md': `# Guide
+
+[Notes](../CLAUDE.md)
+[Plan](release-plan.md#target-heading)
+`,
+    'CLAUDE.md': '# Repository navigation\n',
+    'docs/release-plan.md': '# Target heading\n',
+  });
+
+  const result = checkRepository({
+    root,
+    markdownFiles: markdownFiles(root, [
+      'docs/guide.md',
+      'CLAUDE.md',
+      'docs/release-plan.md',
+    ]),
+    packageChecks: false,
+    orphanChecks: false,
+  });
+
+  assert.deepEqual(
+    result.errors.map((error) => error.message),
+    [
+      'public documentation links to an internal file: ../CLAUDE.md',
+      'public documentation links to an internal file: release-plan.md#target-heading',
+    ],
+  );
+});
+
+test('absolute repository links resolve their Markdown anchors', () => {
+  const root = fixture({
+    'packages/example/README.md': `# Example
+
+[Guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/guide.md#target-heading)
+`,
+    'docs/guide.md': '# Target heading\n',
+  });
+
+  const result = checkRepository({
+    root,
+    markdownFiles: markdownFiles(root, [
+      'packages/example/README.md',
+      'docs/guide.md',
+    ]),
+    packageChecks: false,
+    orphanChecks: false,
+  });
+
+  assert.deepEqual(result.errors, []);
+});
+
+test('absolute repository links fail on a missing Markdown anchor', () => {
+  const root = fixture({
+    'packages/example/README.md': `# Example
+
+[Guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/guide.md#absent)
+`,
+    'docs/guide.md': '# Target heading\n',
+  });
+
+  const result = checkRepository({
+    root,
+    markdownFiles: markdownFiles(root, [
+      'packages/example/README.md',
+      'docs/guide.md',
+    ]),
+    packageChecks: false,
+    orphanChecks: false,
+  });
+
+  assert.deepEqual(
+    result.errors.map((error) => error.message),
+    ['Markdown anchor does not exist: #absent'],
+  );
+});
+
+test('absolute repository links fail on a missing target file', () => {
+  const root = fixture({
+    'packages/example/README.md': `# Example
+
+[Guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/missing.md#target-heading)
+`,
+  });
+
+  const result = checkRepository({
+    root,
+    markdownFiles: markdownFiles(root, ['packages/example/README.md']),
+    packageChecks: false,
+    orphanChecks: false,
+  });
+
+  assert.deepEqual(
+    result.errors.map((error) => error.message),
+    [
+      'link target does not exist: https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/missing.md#target-heading',
+    ],
+  );
+});
+
+test('absolute repository links fail on a path that escapes the repository', () => {
+  const outer = fixture({
+    'repo/packages/example/README.md': `# Example
+
+[Guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/../outside.md#target-heading)
+`,
+    'outside.md': '# Target heading\n',
+  });
+  const root = join(outer, 'repo');
+
+  const result = checkRepository({
+    root,
+    markdownFiles: markdownFiles(root, ['packages/example/README.md']),
+    packageChecks: false,
+    orphanChecks: false,
+  });
+
+  assert.deepEqual(
+    result.errors.map((error) => error.message),
+    [
+      'link escapes the repository: https://github.com/ProofOfTechOrg/anchorage/blob/main/../outside.md#target-heading',
+    ],
+  );
+});
+
+test('fragment-less absolute repository links fail on a missing target file', () => {
+  const root = fixture({
+    'packages/example/README.md': `# Example
+
+[Guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/missing.md)
+`,
+  });
+
+  const result = checkRepository({
+    root,
+    markdownFiles: markdownFiles(root, ['packages/example/README.md']),
+    packageChecks: false,
+    orphanChecks: false,
+  });
+
+  assert.deepEqual(
+    result.errors.map((error) => error.message),
+    [
+      'link target does not exist: https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/missing.md',
+    ],
+  );
+});
+
+test('fragment-less absolute repository links fail on an escaping path', () => {
+  const outer = fixture({
+    'repo/packages/example/README.md': `# Example
+
+[Guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/../outside.md)
+`,
+    'outside.md': '# Target heading\n',
+  });
+  const root = join(outer, 'repo');
+
+  const result = checkRepository({
+    root,
+    markdownFiles: markdownFiles(root, ['packages/example/README.md']),
+    packageChecks: false,
+    orphanChecks: false,
+  });
+
+  assert.deepEqual(
+    result.errors.map((error) => error.message),
+    [
+      'link escapes the repository: https://github.com/ProofOfTechOrg/anchorage/blob/main/../outside.md',
+    ],
+  );
+});
+
+test('absolute repository links obey the internal-file policy', () => {
+  const root = fixture({
+    'packages/example/README.md': `# Example
+
+[Notes](https://github.com/ProofOfTechOrg/anchorage/blob/main/CLAUDE.md)
+[Plan](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/release-plan.md#target-heading)
+`,
+    'CLAUDE.md': '# Repository navigation\n',
+    'docs/release-plan.md': '# Target heading\n',
+  });
+
+  const result = checkRepository({
+    root,
+    markdownFiles: markdownFiles(root, [
+      'packages/example/README.md',
+      'CLAUDE.md',
+      'docs/release-plan.md',
+    ]),
+    packageChecks: false,
+    orphanChecks: false,
+  });
+
+  assert.deepEqual(
+    result.errors.map((error) => error.message),
+    [
+      'public documentation links to an internal file: https://github.com/ProofOfTechOrg/anchorage/blob/main/CLAUDE.md',
+      'public documentation links to an internal file: https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/release-plan.md#target-heading',
+    ],
+  );
+});
+
 test('invalid and unsafe URLs fail before the scheduled network check', () => {
   const root = fixture({
     'README.md': `[Invalid](https://[invalid)

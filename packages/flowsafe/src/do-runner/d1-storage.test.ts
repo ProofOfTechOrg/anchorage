@@ -2996,7 +2996,13 @@ function retentionIntercept(
       }
       hooks.beforeBatch?.();
       const results = await db.batch(prepared);
-      return hooks.afterBatch ? hooks.afterBatch(results) : results;
+      // The hooks hand back `unknown[]` on purpose: that is what a wrong
+      // adapter returns.
+      return hooks.afterBatch
+        ? (hooks.afterBatch(results) as Awaited<
+            ReturnType<RetentionTestDatabase['batch']>
+          >)
+        : results;
     },
   };
 }

@@ -22,7 +22,10 @@ export const FENCED_WORKFLOW_STORAGE: unique symbol = Symbol(
 );
 
 export interface InitialAdmissionDatabase extends SnapshotDatabase {
-  batch(statements: SnapshotStatement[]): Promise<unknown[]>;
+  /** `SnapshotDatabase.batch`, required: admission cannot run without it. */
+  batch(
+    statements: SnapshotStatement[],
+  ): ReturnType<NonNullable<SnapshotDatabase['batch']>>;
 }
 
 export interface InitialRunAdmission {

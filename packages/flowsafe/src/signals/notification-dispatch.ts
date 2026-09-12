@@ -450,13 +450,14 @@ export function captureNotificationDeliveryStorage(
   };
 }
 
-// Core's inline summary sender and the thread-DO summary route both reach
-// Core's summarizeNotifications; unpatched, a source named after an
-// Object.prototype member is miscounted in the summary a receipt is recorded
-// against, and Core's own source-policy lookup resolves an inherited entry
-// instead of the configured action. A behaviour probe rather than a prototype
-// check lets any correct upstream fix pass. The record is the getting-started
-// guide's confirmation record.
+// Guarded reaches into Core's patched functions: the thread-DO dispatch
+// route's summary group, the notification ingestion gate's prospective
+// summary, and Core's inline sender behind agent.sendNotificationSignal.
+// Unpatched, a source named after an Object.prototype member is miscounted in
+// the summary a receipt is recorded against, and Core's own source-policy
+// lookup resolves an inherited entry instead of the configured action. A
+// behaviour probe rather than a prototype check lets any correct upstream fix
+// pass. The record is the getting-started guide's confirmation record.
 const SOURCE_KEY_PROBE: NotificationRecord = {
   id: 'n',
   threadId: 't',
@@ -696,8 +697,8 @@ export function createNotificationDispatchTick(
     options.maxDeliveryAttempts ?? DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS,
     'notification maximum delivery attempts',
   );
-  assertNotificationSourceKeysPatched();
   if (limit === 0) return async () => ({ due: 0, delivered: 0, failed: 0 });
+  assertNotificationSourceKeysPatched();
   const {
     storage,
     topology,
@@ -797,7 +798,6 @@ export function createNotificationDispatchTick(
         continue;
       }
       const resourceId = record.resourceId;
-      if (!resourceId) continue;
       const key = `${record.threadId}\0${resourceId}\0${record.agentId}`;
       const group = groups.get(key) ?? {
         threadId: record.threadId,

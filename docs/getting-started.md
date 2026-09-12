@@ -211,7 +211,7 @@ Copy the file the same way, then apply it after every install:
 ```json
 {
   "scripts": {
-    "postinstall": "patch -p1 -R -s -f --dry-run -d node_modules/@mastra/core < patches/@mastra__core@1.53.0.patch >/dev/null || patch -p1 -d node_modules/@mastra/core < patches/@mastra__core@1.53.0.patch"
+    "postinstall": "patch -p1 -R -s -f --dry-run -d node_modules/@mastra/core < patches/@mastra__core@1.53.0.patch >/dev/null || patch -p1 --batch -N -d node_modules/@mastra/core < patches/@mastra__core@1.53.0.patch"
   }
 }
 ```
@@ -220,7 +220,7 @@ The patch file is fed on standard input rather than through `-i` because `-d` ch
 
 This route requires GNU `patch` on `PATH`, and Yarn only with `nodeLinker: node-modules`. When both legs fail on `1.53.0`, delete `node_modules/@mastra/core` and reinstall rather than re-running the command. When they fail because `@mastra/core` is no longer `1.53.0`, remove the `postinstall` script: the patch does not apply to other versions.
 
-The patch applies to `@mastra/core` `1.53.0` only. When you upgrade `@mastra/core`, remove the `patchedDependencies` entry or the `postinstall` script before installing, and check whether the release carries the upstream fixes. On an unpatched install flowsafe refuses to construct its notification dispatch tick with an error naming this section, and answers notification dispatch requests with a 502 whose server log line names it.
+The patch applies to `@mastra/core` `1.53.0` only. When you upgrade `@mastra/core`, remove the `patchedDependencies` entry or the `postinstall` script before installing, and check whether the release carries the upstream fixes. On an unpatched install flowsafe refuses to construct a notification dispatch tick that does delivery work with an error naming this section, and answers notification ingestion and dispatch requests with a 502 whose server log line names it.
 
 ### Confirm the patch is applied
 

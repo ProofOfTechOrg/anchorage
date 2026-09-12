@@ -25,9 +25,14 @@ export interface SignalDatabase {
   /**
    * D1's transactional prepared-statement batch. Optional because the simpler
    * signal domains need only `prepare`; notification schema migration requires
-   * it so rollback writers cannot interleave with ordinal backfill.
+   * it so rollback writers cannot interleave with ordinal backfill. The
+   * schedules domain reads `results` off a batch element and off `.all()`, so an
+   * element carries the rows a `D1Result` always carries; a hand-written adapter
+   * that returns only `meta` fails there at runtime.
    */
-  batch?(statements: SignalStatement[]): Promise<unknown[]>;
+  batch?(
+    statements: SignalStatement[],
+  ): Promise<Array<{ results: unknown[]; meta?: { changes?: number } }>>;
 }
 
 /** Rows affected by a D1 write, read from its `{ meta: { changes } }` envelope. */

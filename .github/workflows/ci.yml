@@ -184,8 +184,9 @@ jobs:
       # to @mastra/core@1.53.0 through pnpm.patchedDependencies, and pnpm
       # refuses an install whose patch targets a version no longer in the
       # graph. This job drops that entry in its disposable checkout and
-      # resolves the newest core unpatched, so flowsafe's notification tick and
-      # dispatch refuse with a message naming the patch and
+      # resolves the newest core unpatched, so constructing a delivering
+      # notification dispatch tick, and ingesting or dispatching notifications
+      # through the thread routes, refuse with a message naming the patch and
       # notification-source-keys.test.ts reports its probe cases as the
       # readable signal. See the maintainer guide's Mastra compatibility
       # section.

@@ -61,12 +61,30 @@ function scope(): ThreadScope {
   } as unknown as ThreadScope;
 }
 
-function post(body: unknown): Request {
-  return new Request('http://thread/signal/notifications/dispatch', {
+function post(path: string, body: unknown): Request {
+  return new Request(`http://thread${path}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   });
+}
+
+/** The route catch surfaces its refusal through `console.error`. */
+async function withCapturedErrors(
+  run: () => Promise<Response | null | undefined>,
+): Promise<{ response: Response | null | undefined; logged: string[] }> {
+  const logged: string[] = [];
+  const consoleError = console.error;
+  let response: Response | null | undefined;
+  try {
+    console.error = (...args: unknown[]) => {
+      logged.push(args.map(String).join(' '));
+    };
+    response = await run();
+  } finally {
+    console.error = consoleError;
+  }
+  return { response, logged };
 }
 
 describe('notification dispatch against an unpatched @mastra/core', () => {
@@ -79,10 +97,14 @@ describe('notification dispatch against an unpatched @mastra/core', () => {
     );
   });
 
-  it('refuses tick construction for a zero limit too', () => {
-    expect(() =>
-      createNotificationDispatchTick(tickOptions({ limit: 0 })),
-    ).toThrow(PATCH_MESSAGE);
+  it('builds a zero-limit tick, which does no notification work', async () => {
+    const tick = createNotificationDispatchTick(tickOptions({ limit: 0 }));
+
+    await expect(tick()).resolves.toEqual({
+      due: 0,
+      delivered: 0,
+      failed: 0,
+    });
   });
 
   it('refuses a dispatch request without reading a notification', async () => {
@@ -101,25 +123,17 @@ describe('notification dispatch against an unpatched @mastra/core', () => {
         storage as unknown as NotificationsStorage,
     });
 
-    const logged: string[] = [];
-    const consoleError = console.error;
-    let response: Response | null | undefined;
-    try {
-      console.error = (...args: unknown[]) => {
-        logged.push(args.map(String).join(' '));
-      };
-      response = await routes(
-        post({
+    const { response, logged } = await withCapturedErrors(() =>
+      routes(
+        post('/signal/notifications/dispatch', {
           notificationIds: ['n1'],
           resourceId: 'acme_res',
           agentId: 'agent',
           now: '2026-07-20T12:00:00.000Z',
         }),
         scope(),
-      );
-    } finally {
-      console.error = consoleError;
-    }
+      ),
+    );
 
     // Status and body match the conditional-storage capability refusal, which
     // takes the same route catch; the logged message is what tells them apart.
@@ -127,5 +141,33 @@ describe('notification dispatch against an unpatched @mastra/core', () => {
     expect(await response?.json()).toEqual({ error: 'internal error' });
     expect(logged.some((line) => PATCH_MESSAGE.test(line))).toBe(true);
     expect(storage.getNotification).not.toHaveBeenCalled();
+  });
+
+  it("refuses an ingestion request without reaching core's sender", async () => {
+    const sendNotificationSignal = vi.fn();
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () =>
+        ({ id: 'agent', sendNotificationSignal }) as unknown as Agent,
+      resolveResourceId: () => 'acme_res',
+    });
+
+    const { response, logged } = await withCapturedErrors(() =>
+      routes(
+        post('/signal/notification', {
+          source: 'constructor',
+          kind: 'changed',
+          summary: 's',
+        }),
+        scope(),
+      ),
+    );
+
+    // The agent stub carries the method: an absent one throws its own TypeError
+    // into the same catch, for the same status and body, so the uncalled spy is
+    // what tells the patch refusal from a stub-shape fault.
+    expect(response?.status).toBe(502);
+    expect(await response?.json()).toEqual({ error: 'internal error' });
+    expect(logged.some((line) => PATCH_MESSAGE.test(line))).toBe(true);
+    expect(sendNotificationSignal).not.toHaveBeenCalled();
   });
 });

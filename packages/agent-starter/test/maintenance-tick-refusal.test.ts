@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-// The maintenance tick against an @mastra/core that refuses notification
-// dispatch construction. The mocks are file-scoped, so these cases live apart
-// from the rest of the starter's tick coverage.
+// The maintenance tick against a mocked `createNotificationDispatchTick`:
+// refusing the way an unpatched @mastra/core does, and constructing where a
+// case overrides it. The mocks are file-scoped, so these cases live apart from
+// the rest of the starter's tick coverage.
 
 import type {
   ScheduleTickOptions,
@@ -21,19 +22,33 @@ const PATCH_MESSAGE = /Apply the flowsafe patch to @mastra\/core/;
 // above module-scope bindings, so one closing over a plain `const` throws
 // `Cannot access '<name>' before initialization` at import.
 const mocks = vi.hoisted(() => {
+  const scheduleResult: ScheduleTickResult = {
+    due: 0,
+    fired: 0,
+    skipped: 0,
+    failed: 0,
+    deferred: 0,
+    reconciled: 0,
+    lost: 0,
+  };
+  const notificationResult: NotificationDispatchTickResult = {
+    due: 2,
+    delivered: 1,
+    failed: 1,
+  };
   const scheduleTick = vi.fn(
-    async (): Promise<ScheduleTickResult> => ({
-      due: 0,
-      fired: 0,
-      skipped: 0,
-      failed: 0,
-      deferred: 0,
-      reconciled: 0,
-      lost: 0,
+    async (): Promise<ScheduleTickResult> => ({ ...scheduleResult }),
+  );
+  const notificationTick = vi.fn(
+    async (): Promise<NotificationDispatchTickResult> => ({
+      ...notificationResult,
     }),
   );
   return {
+    scheduleResult,
+    notificationResult,
     scheduleTick,
+    notificationTick,
     createScheduleTick: vi.fn(
       (_options: ScheduleTickOptions): (() => Promise<ScheduleTickResult>) =>
         scheduleTick,
@@ -69,7 +84,7 @@ vi.mock('@proofoftech/flowsafe/signals', async (importOriginal) => ({
 function namespace(): Env['RUNNER'] {
   const unreachable = () => {
     throw new Error(
-      'a fenced maintenance pass addressed a Durable Object — it claimed work',
+      'the maintenance tick addressed a Durable Object; no pass in this file should',
     );
   };
   return {
@@ -95,13 +110,14 @@ function starterEnv(): Env {
   } as unknown as Env;
 }
 
-describe('starter maintenance tick against an unpatched core', () => {
-  beforeEach(() => {
-    mocks.scheduleTick.mockClear();
-    mocks.createScheduleTick.mockClear();
-    mocks.createNotificationDispatchTick.mockClear();
-  });
+beforeEach(() => {
+  mocks.scheduleTick.mockClear();
+  mocks.createScheduleTick.mockClear();
+  mocks.createNotificationDispatchTick.mockClear();
+  mocks.notificationTick.mockClear();
+});
 
+describe('starter maintenance tick against an unpatched core', () => {
   it('wires the duty without constructing the notification tick', () => {
     expect(() => starterMaintenanceTick(starterEnv())).not.toThrow();
     expect(mocks.createNotificationDispatchTick).not.toHaveBeenCalled();
@@ -124,5 +140,28 @@ describe('starter maintenance tick against an unpatched core', () => {
 
     expect(mocks.scheduleTick).toHaveBeenCalledTimes(2);
     expect(mocks.createNotificationDispatchTick).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('starter maintenance tick with a constructing factory', () => {
+  it('invokes the constructed tick on each pass and constructs it once', async () => {
+    mocks.createNotificationDispatchTick.mockImplementationOnce(
+      () => mocks.notificationTick,
+    );
+    const tick = starterMaintenanceTick(starterEnv());
+
+    const first = await tick();
+    const second = await tick();
+
+    // Both legs' results reach the caller, so a notificationTick that returned
+    // the constructed tick instead of calling it goes red here.
+    const composed = {
+      schedules: mocks.scheduleResult,
+      notifications: mocks.notificationResult,
+    };
+    expect(first).toEqual(composed);
+    expect(second).toEqual(composed);
+    expect(mocks.notificationTick).toHaveBeenCalledTimes(2);
+    expect(mocks.createNotificationDispatchTick).toHaveBeenCalledTimes(1);
   });
 });

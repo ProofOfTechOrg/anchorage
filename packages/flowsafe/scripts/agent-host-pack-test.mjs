@@ -36,9 +36,10 @@ function run(command, args, cwd = packageRoot) {
   });
 }
 
-/** The ordinary consumer keeps @mastra/core's inherited-source-key defect. */
-function assertUnpatchedConsumerDefect(consumer) {
-  const sourceKeyProbe = `import {
+// Both consumers run this identical script, so their probe results are
+// comparable: the ordinary one keeps @mastra/core's inherited-source-key
+// defect, the patched one does not.
+const SOURCE_KEY_PROBE = `import {
   resolveNotificationDeliveryDecision,
   summarizeNotifications,
 } from '@mastra/core/notifications';
@@ -73,7 +74,9 @@ console.log(
 );
 `;
 
-  writeFileSync(join(consumer, 'source-key-probe.mjs'), sourceKeyProbe);
+/** The ordinary consumer keeps @mastra/core's inherited-source-key defect. */
+function assertUnpatchedConsumerDefect(consumer) {
+  writeFileSync(join(consumer, 'source-key-probe.mjs'), SOURCE_KEY_PROBE);
   const unpatchedProbe = JSON.parse(
     execFileSync(process.execPath, ['source-key-probe.mjs'], {
       cwd: consumer,
@@ -91,7 +94,11 @@ console.log(
   });
 }
 
-/** A consumer that records the shipped patch through pnpm installs it patched. */
+/**
+ * A consumer that records the shipped patch through pnpm installs it patched,
+ * and proves notification delivery bookkeeping there, which only a patched core
+ * runs.
+ */
 function assertPatchedConsumerInstall(consumer, patchName, shippedPatch) {
   const patchedConsumer = join(temporary, 'consumer-patched');
   mkdirSync(patchedConsumer);
@@ -113,9 +120,9 @@ function assertPatchedConsumerInstall(consumer, patchName, shippedPatch) {
     join(patchedConsumer, 'pnpm-workspace.yaml'),
   );
   copyFileSync(join(consumer, '.npmrc'), join(patchedConsumer, '.npmrc'));
-  copyFileSync(
-    join(consumer, 'source-key-probe.mjs'),
+  writeFileSync(
     join(patchedConsumer, 'source-key-probe.mjs'),
+    SOURCE_KEY_PROBE,
   );
   // notification-runtime.mjs imports sqlite-fixture.mjs from its own directory,
   // and its package specifiers resolve here because this manifest clones the
@@ -239,7 +246,9 @@ function assertToolNeutralPatchRoute(consumer, patchName, shippedPatch) {
     1,
     'the getting-started guide must document one postinstall command',
   );
-  const command = documented[0][1];
+  // The guide's block is JSON source text; a consumer's manifest is parsed
+  // before the shell sees the value, so parse it the same way.
+  const command = JSON.parse(`"${documented[0][1]}"`);
   // This site departs from the file's argv-only convention because the
   // documented command is a shell string carrying redirection and ||, and
   // running what the guide prints is what makes the guide's verification
@@ -1133,7 +1142,7 @@ for (const name of ['claim', 'release', 'settleRun']) {
 }
 for (const api of [flowsafe, doRunner, hostKit]) assert.equal('rollbackFencedStart' in api, false);
 for (const api of [flowsafe, approvals, doRunner, hostKit, host, agentRunner, schedules, signals]) {
-  for (const name of ['captureActorContext', 'captureAgentStartAuthority', 'captureStartRunOptions', 'startAuthorities', 'AgentStartAuthority', 'executionFenceAdmissionValues', 'captureExecutionFenceAdmissionSchema', 'executionFenceAdmissionSql', 'AgentRunSelectorMismatchError', 'captureNotificationDeliveryObservation', 'captureNotificationDeliverySelection', 'captureNotificationDeliveryStorage', 'recordNotificationDeliveryFailure']) {
+  for (const name of ['captureActorContext', 'captureAgentStartAuthority', 'captureStartRunOptions', 'startAuthorities', 'AgentStartAuthority', 'executionFenceAdmissionValues', 'captureExecutionFenceAdmissionSchema', 'executionFenceAdmissionSql', 'AgentRunSelectorMismatchError', 'assertNotificationSourceKeysPatched', 'captureNotificationDeliveryObservation', 'captureNotificationDeliverySelection', 'captureNotificationDeliveryStorage', 'recordNotificationDeliveryFailure']) {
     assert.equal(name in api, false, name);
   }
 }
@@ -1141,10 +1150,6 @@ assert.equal(signals.DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS, 10);
 const notificationSql = openSqlite();
 const notificationStore = new signals.D1NotificationsStorage(sqliteUnitDatabase(notificationSql));
 const notificationNow = new Date();
-await notificationStore.createNotification({
-  id: 'packed-notification', threadId: 'notification-thread', resourceId: 'notification-thread', agentId: 'writer',
-  source: 'packed', kind: 'changed', summary: 'delivery receipt', deliverAt: notificationNow,
-});
 const notificationContext = approvals.createPrincipalActorContext({
   principal: approvals.trustAutomationPrincipal({ kind: 'system', id: 'notification-dispatch', purpose: 'notification.dispatch' }),
   storeFactory: new approvals.InMemoryApprovalStoreFactory(),
@@ -1160,28 +1165,42 @@ const notificationTickOptions = {
 };
 assert.throws(() => signals.createNotificationDispatchTick(notificationTickOptions), { name: 'TypeError', message: /Apply the flowsafe patch to @mastra\\/core/ });
 let unsupportedNotificationReads = 0;
+let notificationSends = 0;
 const unsupportedNotificationRoutes = signals.createThreadSignalRoutes({
-  resolveAgent: () => ({ id: 'writer' }),
+  resolveAgent: () => ({ id: 'writer', sendNotificationSignal: async () => { notificationSends++; return { id: 'sent' }; } }),
   resolveResourceId: () => 'notification-thread',
   resolveNotificationsStorage: () => ({
     getNotification: async () => { unsupportedNotificationReads++; return null; },
   }),
 });
-const notificationLog = console.error;
-const notificationRefusals = [];
-let unsupportedNotificationResponse;
-try {
-  console.error = (...args) => { notificationRefusals.push(args.map(String).join(' ')); };
-  unsupportedNotificationResponse = await unsupportedNotificationRoutes(new Request('https://thread/signal/notifications/dispatch', {
-    method: 'POST', body: JSON.stringify({ notificationIds: ['packed-notification'], resourceId: 'notification-thread', agentId: 'writer', now: notificationNow.toISOString() }),
-  }), { threadId: 'notification-thread', principal: notificationContext.principal, init: doRunner.init({ storage: new InMemoryStore() }, { executionFence: 'none', startIdempotency: 'none' }) });
-} finally {
-  console.error = notificationLog;
+async function withCapturedErrors(run) {
+  const logged = [];
+  const consoleError = console.error;
+  let response;
+  try {
+    console.error = (...args) => { logged.push(args.map(String).join(' ')); };
+    response = await run();
+  } finally {
+    console.error = consoleError;
+  }
+  return { response, logged };
 }
+const { response: unsupportedNotificationResponse, logged: notificationRefusals } = await withCapturedErrors(() => unsupportedNotificationRoutes(new Request('https://thread/signal/notifications/dispatch', {
+  method: 'POST', body: JSON.stringify({ notificationIds: ['packed-notification'], resourceId: 'notification-thread', agentId: 'writer', now: notificationNow.toISOString() }),
+}), { threadId: 'notification-thread', principal: notificationContext.principal, init: doRunner.init({ storage: new InMemoryStore() }, { executionFence: 'none', startIdempotency: 'none' }) }));
 assert.equal(unsupportedNotificationResponse.status, 502);
 assert.deepEqual(await unsupportedNotificationResponse.json(), { error: 'internal error' });
 assert.equal(unsupportedNotificationReads, 0);
 assert.equal(notificationRefusals.some((line) => line.includes('Apply the flowsafe patch to @mastra/core')), true, 'the refusal naming the patch must reach console.error');
+const { response: ingestionResponse, logged: ingestionRefusals } = await withCapturedErrors(() => unsupportedNotificationRoutes(new Request('https://thread/signal/notification', {
+  method: 'POST', body: JSON.stringify({ source: 'constructor', kind: 'changed', summary: 'ingested' }),
+}), { threadId: 'notification-thread', principal: notificationContext.principal, init: doRunner.init({ storage: new InMemoryStore() }, { executionFence: 'none', startIdempotency: 'none' }) }));
+assert.equal(ingestionResponse.status, 502);
+assert.deepEqual(await ingestionResponse.json(), { error: 'internal error' });
+// The stub carries sendNotificationSignal, so an uncalled sender is what tells
+// the patch refusal from a missing-method TypeError on the same route catch.
+assert.equal(notificationSends, 0);
+assert.equal(ingestionRefusals.some((line) => line.includes('Apply the flowsafe patch to @mastra/core')), true, 'the ingestion refusal naming the patch must reach console.error');
 notificationSql.close();
 for (const api of [flowsafe, doRunner, hostKit]) {
   for (const name of ['FENCED_SCHEDULE_STORAGE', 'ScheduleMutationConflictError', 'ScheduleMutationOutcomeUnknownError']) {
@@ -1526,11 +1545,21 @@ export default {
     true,
     'the packed package must ship the @mastra/core patch',
   );
-  // files publishes this one path, so anything else left in patches/ would
-  // ship to consumers unremarked.
-  assert.deepEqual(readdirSync(join(packageDirectory, 'patches')).sort(), [
-    patchName,
-  ]);
+  // The manifest entry pins what npm-packlist may take; comparing the source
+  // directory with the shipped one pins that the published set equals the set
+  // this repository holds, and fails in both directions.
+  for (const entry of manifest.files ?? []) {
+    if (!entry.startsWith('patches/')) continue;
+    assert.equal(
+      existsSync(join(packageRoot, entry)),
+      true,
+      `${entry} is published but has no source file`,
+    );
+  }
+  assert.deepEqual(
+    readdirSync(join(packageRoot, 'patches')).sort(),
+    readdirSync(join(packageDirectory, 'patches')).sort(),
+  );
   assertUnpatchedConsumerDefect(consumer);
 
   assertPatchedConsumerInstall(consumer, patchName, shippedPatch);

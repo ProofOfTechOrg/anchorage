@@ -439,33 +439,34 @@ describe.skipIf(!patched.get('esm'))(
         agents: { 'inline-summary': agent },
         logger: false,
       });
+      const threadId = crypto.randomUUID();
       const runtime = mastra.agentThreadStreamRuntime;
       const pubsub = agent.getPubSub();
-      const threadId = crypto.randomUUID();
-      await memory.saveThread({
-        thread: {
-          id: threadId,
-          resourceId: 'resource-keys',
-          createdAt: CREATED_AT,
-          updatedAt: CREATED_AT,
-          metadata: {},
-        },
-      });
-      await agent.stream('active turn', {
-        runId: crypto.randomUUID(),
-        memory: { thread: threadId, resource: 'resource-keys' },
-      });
-      await vi.waitFor(() =>
-        expect(
-          runtime.getThreadState(
-            { threadId, resourceId: 'resource-keys' },
-            pubsub,
-          ),
-        ).toBe('active'),
-      );
-      const emitted = vi.spyOn(runtime, 'sendSignal');
 
       try {
+        await memory.saveThread({
+          thread: {
+            id: threadId,
+            resourceId: 'resource-keys',
+            createdAt: CREATED_AT,
+            updatedAt: CREATED_AT,
+            metadata: {},
+          },
+        });
+        await agent.stream('active turn', {
+          runId: crypto.randomUUID(),
+          memory: { thread: threadId, resource: 'resource-keys' },
+        });
+        await vi.waitFor(() =>
+          expect(
+            runtime.getThreadState(
+              { threadId, resourceId: 'resource-keys' },
+              pubsub,
+            ),
+          ).toBe('active'),
+        );
+        const emitted = vi.spyOn(runtime, 'sendSignal');
+
         // #when
         const result = await agent.sendNotificationSignal(
           { source, kind: 'changed', summary: 'payload', priority },

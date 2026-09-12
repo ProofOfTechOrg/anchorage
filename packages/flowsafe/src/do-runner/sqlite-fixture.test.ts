@@ -34,7 +34,7 @@ describe('native SQLite unit batch transport', () => {
     ]);
     expect(
       await db.prepare("INSERT INTO fixture(value) VALUES ('ordinary')").run(),
-    ).toEqual({ success: true, meta: { changes: 1 } });
+    ).toEqual({ success: true, results: [], meta: { changes: 1 } });
     expect(
       await db.prepare('SELECT value FROM fixture WHERE id = 2').all(),
     ).toEqual({ success: true, results: [{ value: 'ordinary' }], meta: {} });

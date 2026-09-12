@@ -104,21 +104,25 @@ CI tests the declared supported peer version as part of the normal gate. A separ
 
 Treat a red canary as a release investigation even though it does not block a merge. Update the declared peer range only after tests, workerd proofs, package tarball probes, and migration notes pass.
 
-The canary drops the workspace's `pnpm.patchedDependencies` entry before it resolves the newest core, so it runs unpatched. While upstream carries [mastra-ai/mastra#23693](https://github.com/mastra-ai/mastra/issues/23693) and [mastra-ai/mastra#23694](https://github.com/mastra-ai/mastra/issues/23694), expect `notification-source-keys.test.ts` to report its probe cases failed and its patched-behavior blocks skipped, and expect the flowsafe suites that construct `createNotificationDispatchTick()` or dispatch notifications through `createThreadSignalRoutes()` against the installed core to fail with the refusal naming the patch; `notification-dispatch.patch-seam.test.ts` mocks Core's `summarizeNotifications` with the unpatched accumulator and passes either way. A canary whose probe cases pass against a newer core is the signal that the patch can be retired, through the procedure below.
+The canary drops the workspace's `pnpm.patchedDependencies` entry before it resolves the newest core, so it runs unpatched. While upstream carries [mastra-ai/mastra#23693](https://github.com/mastra-ai/mastra/issues/23693) and [mastra-ai/mastra#23694](https://github.com/mastra-ai/mastra/issues/23694), expect `notification-source-keys.test.ts` to report its probe cases failed and its patched-behavior blocks skipped, and expect the flowsafe suites that construct a delivering `createNotificationDispatchTick()`, or ingest or dispatch notifications through `createThreadSignalRoutes()`, against the installed core to fail with the refusal naming the patch; `notification-dispatch.patch-seam.test.ts` mocks Core's `summarizeNotifications` with the unpatched accumulator and passes either way. A canary that goes green against a newer core — its probe cases passing, and the patched-behavior blocks those cases gate running green rather than skipping — is the signal that the patch can be retired, through the procedure below.
 
 Retiring the `@mastra/core` patch, once a release carrying the upstream fixes is adopted, reaches:
 
 - `packages/flowsafe/patches/@mastra__core@1.53.0.patch`.
 - The root `package.json` `pnpm.patchedDependencies` entry, and the `patchedDependencies` block and `patch_hash` keys in `pnpm-lock.yaml`, which `pnpm install` regenerates.
 - The `@proofoftech/flowsafe` `files` entry that publishes the patch.
-- The construction and dispatch refusal in `packages/flowsafe/src/signals/notification-dispatch.ts` and its call site in `packages/flowsafe/src/signals/thread-do-routes.ts`.
-- The manifest edit in the `mastra-compat` job in `.github/workflows/ci.yml`.
-- [Apply the flowsafe patch to @mastra/core](getting-started.md#apply-the-flowsafe-patch-to-mastracore) in the getting-started guide.
-- The `packages/flowsafe/README.md` compatibility bullet, own-property sentence and Apache-2.0 section 4(b) notice.
+- The construction, ingestion and dispatch refusal in `packages/flowsafe/src/signals/notification-dispatch.ts`, its error text naming the getting-started section, and its call sites in `packages/flowsafe/src/signals/thread-do-routes.ts`.
+- `packages/flowsafe/src/signals/notification-dispatch.patch-seam.test.ts`, which exists to prove that refusal and goes red without it.
+- The lazily built notification tick and its stated reason in `packages/agent-starter/src/maintenance.ts`, and `packages/agent-starter/test/maintenance-tick-refusal.test.ts`, which pins the composition that reason produced. The suite mocks the refusal rather than reaching it, so retirement leaves the comment's reason false and the suite green: retire both here instead of waiting for a failure.
+- The manifest edit in the `mastra-compat` job in `.github/workflows/ci.yml`, and the comment that explains it.
+- [Apply the flowsafe patch to @mastra/core](getting-started.md#apply-the-flowsafe-patch-to-mastracore) in the getting-started guide, including the `postinstall` command that the packed tool-neutral proof extracts from it and runs.
+- The GNU `patch` requirement in [Local setup](#local-setup), which the tool-neutral proof needs to apply the shipped patch.
+- The canary expectation earlier in this section, which is scoped to the open upstream issues.
+- The patch sentences in `packages/flowsafe/README.md`, including the Apache-2.0 section 4(b) notice.
 - The notification sentences in [Durable agents](durable-agents.md).
 - The patch sentences in `packages/flowsafe/deploy/README.md` and `packages/agent-starter/README.md`.
 - The exception paragraph in `CONTRIBUTING.md`.
-- The unpatched, patched and tool-neutral proofs in `packages/flowsafe/scripts/agent-host-pack-test.mjs`.
+- The unpatched, patched and tool-neutral proofs in `packages/flowsafe/scripts/agent-host-pack-test.mjs`, and the `assertNotificationSourceKeysPatched` entry in that file's not-exported name list, which passes vacuously once the helper is gone.
 - The probe and gating in `packages/flowsafe/src/signals/notification-source-keys.test.ts`. After an upstream fix its patched-behavior cases stay as regression coverage of upstream; the gating goes.
 
 A changeset describing the patch clears itself at release.

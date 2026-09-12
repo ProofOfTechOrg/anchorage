@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// The unit suites each mock a seam; this file wires the real seams together:
-// the real dispatch tick, the real thread topology, the real thread-DO signal
-// routes and a SQLite-backed D1 notification store.
+// The unit suites each mock a seam; this file wires the real seams together.
 
 import type { Agent, AgentSignal } from '@mastra/core/agent';
 import type { NotificationRecord } from '@mastra/core/notifications';

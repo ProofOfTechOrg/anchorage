@@ -2612,6 +2612,14 @@ async function handleNotification(
       409,
     );
   }
+  // Ingestion reaches core's patched functions below — the content-policy gate
+  // renders a prospective summary through summarizeNotifications, and core's
+  // inline sender resolves the configured source delivery policy — so the
+  // refusal sits above the branches rather than beside a single reach. It
+  // refuses the record-only branch as well, which a deployment that ingests
+  // here and delegates dispatch elsewhere pays. The route's catch answers 502
+  // with the message on the server log.
+  assertNotificationSourceKeysPatched();
   // This gate is AUTHORITATIVE, not a preview: core can send an individual or
   // summary signal before the record reaches the dispatcher's second gate.
   // Storage owns the id, timestamps, and coalescing, so inspect a prospective

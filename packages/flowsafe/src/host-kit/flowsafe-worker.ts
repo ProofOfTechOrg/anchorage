@@ -461,7 +461,10 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv>
    * (which needs the schedules store, its run-start seam — topology.start — and
    * the run-cap + audit config) and returns the closure here. The composer runs
    * it as its OWN failure-isolated alarm duty (own try/catch,
-   * own `schedule-tick` log line). INJECTED (not built here, structurally typed as
+   * own `schedule-tick` log line). The composer invokes THIS BUILDER outside
+   * that try, so a builder that throws is logged as `maintenance-error` with
+   * `surface: 'tick-duty'`; build a factory that can refuse at construction
+   * inside the returned closure. INJECTED (not built here, structurally typed as
    * `() => Promise<unknown>`) because createScheduleTick lives in `schedules/`,
    * which transitively imports host-kit — host-kit importing it back would cycle.
    * Absent (or `tickIntervalMs` unset) ⇒ no tick invocation.

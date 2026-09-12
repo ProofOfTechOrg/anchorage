@@ -8,7 +8,17 @@ import { validateTablePrefix } from './table-prefix.js';
 /** Structural D1 surface; a transactional batch is required for admission. */
 export interface SnapshotDatabase {
   prepare(query: string): SnapshotStatement;
-  batch?(statements: SnapshotStatement[]): Promise<unknown[]>;
+  /**
+   * Initial admission (`captureBatchResults`, fenced-workflows-d1.ts) reads
+   * `results` off every element; retention (`retentionBatchResult`,
+   * d1-storage.ts) reads `results` off the first element and requires
+   * `meta.changes` as a safe non-negative integer off the rest. So a
+   * hand-written adapter returning only `meta`, or omitting `meta` after the
+   * first element, fails at runtime.
+   */
+  batch?(
+    statements: SnapshotStatement[],
+  ): Promise<Array<{ results: unknown[]; meta?: { changes?: number } }>>;
 }
 
 export interface SnapshotStatement {
