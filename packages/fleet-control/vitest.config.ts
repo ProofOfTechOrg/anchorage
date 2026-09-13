@@ -1,8 +1,18 @@
-import { defineConfig } from 'vitest/config';
+import { configDefaults, defineConfig } from 'vitest/config';
 
 export default defineConfig({
   test: {
     include: ['test/**/*.test.ts'],
+    // The two direct scenario suites belong to the root project
+    // `fleet-control-direct-scenario` (vitest.direct-scenario.config.ts),
+    // which the package `test` script runs after this config and CI runs in
+    // its own job beside `verify-core`. Listing them here as well would run
+    // them twice under `pnpm test`.
+    exclude: [
+      ...configDefaults.exclude,
+      'test/direct-credentialed-scenario.test.ts',
+      'test/direct-reference-fence.harness.test.ts',
+    ],
     // Timeouts here bound hangs, not durations: no title asserts its own
     // duration, and the in-body watchdogs, races, and vi.waitFor bounds a few
     // titles carry are hang detectors, not budgets. Two titles have run past

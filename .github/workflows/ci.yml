@@ -6,14 +6,14 @@ on:
   pull_request:
     branches: [main, dev]
 
-# Both jobs only read the repo — and the compat job deliberately executes
+# These jobs only read the repo — and the compat job deliberately executes
 # packages younger than the workspace release-age buffer, so the token it
 # can reach must stay read-only.
 permissions:
   contents: read
 
 jobs:
-  verify:
+  verify-core:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -46,9 +46,11 @@ jobs:
       - name: Typecheck
         run: pnpm typecheck
 
-      # Root vitest workspace: every package's suite in one process.
+      # Root vitest workspace: every package's suite in one process, minus the
+      # direct scenario project, which the `direct-scenario` job below runs at
+      # the same time (about 35 minutes on its own).
       - name: Test
-        run: pnpm test
+        run: pnpm test:without-direct-scenario
 
       - name: Build
         run: pnpm build
@@ -139,6 +141,59 @@ jobs:
 
       - name: Conformance artifacts verify (workerd)
         run: pnpm conformance:verify
+
+  # The direct credentialed scenario and the offline fence suite: full
+  # scenario runs against the reference and tenant Workers on local workerd,
+  # about 35 minutes, independent of every `verify-core` step. The suites
+  # import @proofoftech/flowsafe subpaths and the fleet-control package from
+  # their dists, so the job builds fleet-control (whose prebuild builds
+  # breakwater and flowsafe) before running them.
+  direct-scenario:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reads the pnpm version from package.json "packageManager".
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the three packages
+        run: pnpm --filter @proofoftech/fleet-control build
+
+      - name: Direct scenario suites (workerd)
+        run: pnpm test:direct-scenario
+
+  # The `protect main` ruleset requires the status check named `verify`. This
+  # job is that check: it depends on the gating jobs and fails unless every job
+  # in its `needs` reports success, so a red or cancelled `direct-scenario`
+  # blocks a merge to main exactly as a red `verify-core` does, and a job added
+  # to `needs` is gating without a further edit (the assertion reads the whole
+  # `needs` context). `if: always()` makes it run when a
+  # dependency fails or is cancelled; without it the job would be skipped,
+  # and GitHub reports a skipped job as success for a required check.
+  # A dependency that timed out reports `cancelled`, and one that never ran
+  # reports `skipped`; both must reach the assertion below, so the job runs
+  # under `always()` and nothing narrower.
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [verify-core, direct-scenario]
+    if: always()
+    steps:
+      - name: Require every job this gate depends on to have succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          printf '%s' "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          printf '%s' "$NEEDS" | jq -e 'to_entries | all(.value.result == "success")' > /dev/null
 
   # Mastra compat matrix: the libraries pin behavioral contracts to
   # @mastra/core internals (resume-context merge-over semantics, snapshot

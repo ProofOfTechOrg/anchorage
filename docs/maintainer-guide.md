@@ -20,7 +20,7 @@ The workspace requires Node 22.22.0 or later and pnpm 10.16 or later. `packageMa
 
 ## Verification
 
-The commands below mirror the CI `verify` job after dependency installation, in order:
+The commands below mirror the CI `verify-core` job after dependency installation, in order; `pnpm test` also covers the direct scenario project that CI runs in its own `direct-scenario` job, and a `verify` gate job requires both:
 
 ```bash
 pnpm github:check
@@ -127,7 +127,7 @@ Retiring the `@mastra/core` patch, once a release carrying the upstream fixes is
 
 A changeset describing the patch clears itself at release.
 
-The canary's typecheck and test steps cannot see a published-dist bundling regression: neither links Mastra's shipped output through a bundler. `pnpm --filter @proofoftech/flowsafe spike:bundle-check` is the canary's bundling proof, and against the pinned peer that role belongs to `spike:verify` and the showcase build inside `verify`. Note that its `--outdir .wrangler/bundle-check` resolves relative to the wrangler CONFIG directory, not the working directory, so the output lands in `packages/flowsafe/spike/.wrangler/bundle-check`; a working-directory-relative path silently writes one level deeper, outside the ignored path. The bundle step carries its own `continue-on-error` so an expected upstream failure still lets the tripwire suites after it run.
+The canary's typecheck and test steps cannot see a published-dist bundling regression: neither links Mastra's shipped output through a bundler. `pnpm --filter @proofoftech/flowsafe spike:bundle-check` is the canary's bundling proof, and against the pinned peer that role belongs to `spike:verify` and the showcase build inside `verify-core`. Note that its `--outdir .wrangler/bundle-check` resolves relative to the wrangler CONFIG directory, not the working directory, so the output lands in `packages/flowsafe/spike/.wrangler/bundle-check`; a working-directory-relative path silently writes one level deeper, outside the ignored path. The bundle step carries its own `continue-on-error` so an expected upstream failure still lets the tripwire suites after it run.
 
 A second tripwire guards the durable agent surface. `packages/flowsafe/src/agent-runner/durable-agent-surface.test.ts` classifies every own member of Mastra's `DurableAgent.prototype`, and fails on any member the file does not classify. On a core upgrade it therefore demands reading the new member's implementation in the installed dist before classifying it — as a guarded entry point, a delegator, a refusal, or something that cannot drive a run. Never satisfy it by widening the non-execution list without that read. It pins the inherited `Agent.prototype` members the same way, since Mastra calls the agent instance and the instance inherits both surfaces. Breakwater carries its own inventory of `Agent.prototype` in `packages/breakwater/src/agent/agent.test.ts`, classifying the same surface for what a narrowed guarded handle may expose. The maintenance contract on a core bump: the reason table in `durable-agent-runner.ts` is authoritative, the surface test is what forces the read, the runner's module comment and [Durable agents](durable-agents.md) are updated from the table in the same commit — never left to drift behind it — and Breakwater's `forwardClassified` allowlist is pruned of every name the new pin now exposes, which its own test asserts. The `@mastra/core` patch is retired or re-cut in the same commit, through the procedure above.
 
@@ -154,3 +154,6 @@ Repository administrators separately own:
 - branch protection and required checks.
 
 Do not change those external controls as a side effect of an unrelated code change.
+The required check on `main` is `verify`, the gate job in `ci.yml` that succeeds
+only when `verify-core` and `direct-scenario` both succeed; a new gating job joins
+that gate's `needs` list, not the ruleset.

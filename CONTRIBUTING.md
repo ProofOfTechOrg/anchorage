@@ -35,7 +35,9 @@ git clone https://github.com/ProofOfTechOrg/anchorage.git
 cd anchorage
 ```
 
-The verification list below mirrors the CI `verify` job in order:
+The verification list below mirrors the CI `verify-core` job in order;
+`pnpm test` also covers the direct scenario project that CI runs in its own
+`direct-scenario` job:
 
 ```bash
 pnpm install --frozen-lockfile
@@ -69,6 +71,7 @@ directory when a `.github/**/*.{yml,yaml}` file is staged (lint-staged);
 pre-push runs react-doctor on the branch's changed files
 (`pnpm react-doctor:diff`; bypass with `git push --no-verify`). CI also runs a
 non-blocking compatibility probe against the newest `@mastra/core` 1.x release.
+A `verify` gate job requires both `verify-core` and `direct-scenario` to succeed.
 
 The showcase app uses mandatory absolute imports — `@/*` for `src`,
 `#worker/*` for worker modules, `@flowsafe/*` for deep flowsafe source
