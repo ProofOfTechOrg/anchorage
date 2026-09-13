@@ -38,6 +38,8 @@ Compatibility:
 | `@proofoftech/flowsafe/agent-host` | Server-only guarded-agent catalogs, authenticated run routes, thread hosting, NDJSON observation, and approval-only resume |
 | `@proofoftech/flowsafe/approval-api` | Approval records, actor resolver, service, deployment store, REST router, grants, SLA, retention, notifications, and stream events |
 | `@proofoftech/flowsafe/do-runner` | Durable Object runner, D1 storage, deployment sentinel, run summaries, snapshot provenance, identities, pub/sub, and retention |
+| `@proofoftech/flowsafe/do-runner/constants` | Suspension deadline values, duration validation, and timeout detection |
+| `@proofoftech/flowsafe/do-runner/testing` | Timeout resume fixtures for workflow tests |
 | `@proofoftech/flowsafe/approval-ui` | Styling-library-agnostic React dashboard, DOM-free API client, headless hook, and live transport |
 | `@proofoftech/flowsafe/host-kit` | Authenticator and verifier seams, topologies, run/stream routers, approval bridges, and composed Worker |
 | `@proofoftech/flowsafe/host-kit/module` | Import-safe workflow module contract |
@@ -176,7 +178,7 @@ A suspended step can carry its own deadline. It arms one by adding the reserved 
 import {
   isSuspensionTimeoutResumeData,
   SUSPENSION_DEADLINE_PAYLOAD_KEY,
-} from '@proofoftech/flowsafe/do-runner';
+} from '@proofoftech/flowsafe/do-runner/constants';
 import { z } from 'zod';
 
 const gate = createStep({
@@ -200,7 +202,11 @@ const gate = createStep({
 });
 ```
 
-The value is relative milliseconds between `MIN_SUSPENSION_DEADLINE_MS` and `MAX_SUSPENSION_DEADLINE_MS`. A step that declares a Zod `suspendSchema` must declare the reserved field or use a loose object, because Mastra substitutes the parsed suspend payload and a strict schema strips unknown keys. A step that declares a `resumeSchema` must accept the timeout envelope as well as its own signal shape, or the timeout resume fails validation and the deadline is abandoned after the runner's retries. The timeout resume delivers `SUSPENSION_TIMEOUT_RESUME_KEY` wrapping the expired step, its deadline, and the expiry time; branch on `isSuspensionTimeoutResumeData()` instead of the literal key, and build the same envelope in your own tests from that key and the `SuspensionTimeoutEnvelope` and `SuspensionTimeoutResumeData` types. Only the runner mints it: a resume request that carries the reserved key is rejected. It records `requestedByKind: 'system'` with the reserved `SUSPENSION_DEADLINE_PRINCIPAL_ID`, and it is not an approval decision: it mints no grant and records no reviewer.
+Use `isArmableSuspensionDeadlineMs(value)` to validate relative milliseconds against the runner's safe-integer and inclusive duration bounds. Import it and the deadline values from `@proofoftech/flowsafe/do-runner/constants` to avoid loading the runner graph. A step declaring a Zod `suspendSchema` must declare the reserved field or use a loose object, because Mastra replaces the suspend payload with parsed output. Its `resumeSchema` must accept the timeout envelope as well as the signal shape.
+
+For workflow tests, import `suspensionTimeoutResumeData` from `@proofoftech/flowsafe/do-runner/testing` and call it with `{ step, deadlineAt }` and an expiry time. It returns the alarm's envelope shape; `isSuspensionTimeoutResumeData` checks that shape without authenticating its origin. Public resume requests containing the reserved key are rejected. Alarm resumes record system provenance and do not grant approval.
+
+Import `suspensionDeadlinesOf` from `@proofoftech/flowsafe/do-runner` to inspect a `RunSummary`. It returns derived entries and rejected requests without scheduling a wake or mutating the summary. See the [acceptance rules](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/do-runner-design.md#inspect-and-test-suspension-deadlines).
 
 Only a top-level suspended step can arm a deadline. A step suspended inside a nested workflow is reported under the nested path while its suspension time is recorded against the enclosing step, so there is nothing to fence the resume against; the deadline is refused and logged instead of armed.
 

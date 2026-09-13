@@ -48,6 +48,8 @@
     "./artifacts": "./dist/artifacts/index.js",
     "./audit-export": "./dist/audit-export/index.js",
     "./do-runner": "./dist/do-runner/index.js",
+    "./do-runner/constants": "./dist/do-runner/constants.js",
+    "./do-runner/testing": "./dist/do-runner/testing.js",
     "./goals": "./dist/goals/index.js",
     "./host-kit": "./dist/host-kit/index.js",
     "./host-kit/module": "./dist/host-kit/module.js",

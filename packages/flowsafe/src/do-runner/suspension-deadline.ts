@@ -48,6 +48,15 @@ export const MIN_SUSPENSION_DEADLINE_MS = 1_000;
 /** Longest armable deadline (365 days), so week-scale waits still fit. */
 export const MAX_SUSPENSION_DEADLINE_MS = 31_536_000_000;
 
+/** Checks the duration accepted by suspension deadline arming. */
+export function isArmableSuspensionDeadlineMs(value: unknown): value is number {
+  return (
+    Number.isSafeInteger(value) &&
+    (value as number) >= MIN_SUSPENSION_DEADLINE_MS &&
+    (value as number) <= MAX_SUSPENSION_DEADLINE_MS
+  );
+}
+
 /** Per-run entry cap; a run cannot grow its object's storage without bound. */
 export const MAX_SUSPENSION_DEADLINES_PER_RUN = 32;
 
@@ -338,10 +347,7 @@ export function suspensionDeadlinesOf(summary: RunSummary): {
       });
       continue;
     }
-    if (
-      (deadlineMs as number) < MIN_SUSPENSION_DEADLINE_MS ||
-      (deadlineMs as number) > MAX_SUSPENSION_DEADLINE_MS
-    ) {
+    if (!isArmableSuspensionDeadlineMs(deadlineMs)) {
       rejected.push({
         step,
         reason: `${SUSPENSION_DEADLINE_PAYLOAD_KEY} must be between ${MIN_SUSPENSION_DEADLINE_MS} and ${MAX_SUSPENSION_DEADLINE_MS} ms`,
@@ -435,16 +441,7 @@ export function parseSuspensionDeadlineRecord(
   };
 }
 
-/**
- * A spent entry, kept for the suspension it was armed against: the ledger at
- * the budget, and every field that only means something while it is still
- * being retried — the backoff floor, the unreadable-state clock — dropped,
- * because a tombstone is never selected, never armed and never read again.
- * Lives beside its two recognizers, `abandoned()` and `storedEntry`'s ledger
- * rule, so the shape they accept and the shape written here cannot drift.
- * Exported from this module for the run object that writes it; deliberately
- * NOT from the package barrel, which exposes no part of the stored record.
- */
+/** Retains the suspension fence so reconciliation cannot give it a fresh retry budget. */
 export function tombstoned(
   entry: SuspensionDeadlineEntry,
 ): SuspensionDeadlineEntry {
@@ -511,7 +508,7 @@ export function dueSuspensionDeadline(
 
 /** The resume data a timeout resume delivers to the expired step. */
 export function suspensionTimeoutResumeData(
-  entry: SuspensionDeadlineEntry,
+  entry: Pick<SuspensionDeadlineEntry, 'step' | 'deadlineAt'>,
   expiredAt: number,
 ): SuspensionTimeoutResumeData {
   return {

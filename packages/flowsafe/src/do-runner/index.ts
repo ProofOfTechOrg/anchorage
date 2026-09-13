@@ -323,21 +323,14 @@ export {
   // answering the same key.
   startIdempotencyFor,
 } from './start-idempotency.js';
-// Per-suspension deadlines: the reserved suspend-payload key that arms one, the
-// timeout envelope a resumed step branches on, and the bounds each is validated
-// against (docs/do-runner-design.md, "Per-suspension deadlines"). The stored
-// record, its parser, the envelope factory it feeds, and the wake arithmetic
-// stay internal — they are the run object's own Durable-Object plumbing, and a
-// consumer holding them could only misread state the alarm owns.
-// MAX_SUSPENSION_DEADLINES_PER_RUN is the exception among the bounds: no single
-// value is validated against it, and it ships as an operational figure — the
-// per-run cap a host plans and documents against, which is how the README
-// quotes it — not as something to check a deadline with before arming.
 export type {
+  RejectedSuspensionDeadline,
+  SuspensionDeadlineEntry,
   SuspensionTimeoutEnvelope,
   SuspensionTimeoutResumeData,
 } from './suspension-deadline.js';
 export {
+  isArmableSuspensionDeadlineMs,
   isSuspensionTimeoutResumeData,
   MAX_SUSPENSION_DEADLINE_MS,
   MAX_SUSPENSION_DEADLINES_PER_RUN,
@@ -345,6 +338,7 @@ export {
   SUSPENSION_DEADLINE_PAYLOAD_KEY,
   SUSPENSION_DEADLINE_PRINCIPAL_ID,
   SUSPENSION_TIMEOUT_RESUME_KEY,
+  suspensionDeadlinesOf,
 } from './suspension-deadline.js';
 export type { ThreadScope } from './thread-do.js';
 export { ThreadDurableObject, ThreadIdentityError } from './thread-do.js';

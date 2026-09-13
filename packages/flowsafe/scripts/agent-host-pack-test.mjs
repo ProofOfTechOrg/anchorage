@@ -14,12 +14,13 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { ModuleKind, ScriptTarget, transpile } from 'typescript';
 import { parse as parseYaml } from 'yaml';
 import { assertAttwEsmPackage } from './attw-pack-check.mjs';
@@ -358,6 +359,8 @@ try {
       './background-tasks',
       './deployment-identity-protocol',
       './do-runner',
+      './do-runner/constants',
+      './do-runner/testing',
       './goals',
       './host-kit',
       './host-kit/module',
@@ -367,6 +370,85 @@ try {
       './signals',
       './signals/client',
     ].sort(),
+  );
+  const deadlineConsumer = join(temporary, 'deadline-consumer');
+  const deadlineScope = join(deadlineConsumer, 'node_modules', '@proofoftech');
+  mkdirSync(deadlineScope, { recursive: true });
+  symlinkSync(packageDirectory, join(deadlineScope, 'flowsafe'), 'dir');
+  const deadlineGraph = join(deadlineConsumer, 'module-graph.jsonl');
+  const packedDistUrl = pathToFileURL(
+    `${join(packageDirectory, 'dist')}/`,
+  ).href;
+  writeFileSync(
+    join(deadlineConsumer, 'graph-loader.mjs'),
+    `import { appendFileSync } from 'node:fs';
+export async function resolve(specifier, context, nextResolve) {
+  const result = await nextResolve(specifier, context);
+  if (context.parentURL?.startsWith(${JSON.stringify(packedDistUrl)}) &&
+      !result.url.startsWith(${JSON.stringify(packedDistUrl)})) {
+    throw new Error('deadline runtime imports outside the packed dist: ' + result.url);
+  }
+  appendFileSync(${JSON.stringify(deadlineGraph)}, JSON.stringify({
+    specifier, parentURL: context.parentURL, url: result.url,
+  }) + '\\n');
+  return result;
+}
+`,
+  );
+  writeFileSync(
+    join(deadlineConsumer, 'runtime.mjs'),
+    `import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+const requireFromPackage = createRequire(${JSON.stringify(pathToFileURL(join(packageDirectory, 'package.json')).href)});
+for (const name of ['@mastra/core', '@mastra/cloudflare-d1', 'jose']) {
+  assert.throws(() => requireFromPackage.resolve(name), { code: 'MODULE_NOT_FOUND' }, name);
+}
+const constants = await import('@proofoftech/flowsafe/do-runner/constants');
+const testing = await import('@proofoftech/flowsafe/do-runner/testing');
+assert.deepEqual(Object.keys(constants).sort(), [
+  'isArmableSuspensionDeadlineMs', 'isSuspensionTimeoutResumeData',
+  'MAX_SUSPENSION_DEADLINE_MS', 'MIN_SUSPENSION_DEADLINE_MS',
+  'SUSPENSION_DEADLINE_PAYLOAD_KEY', 'SUSPENSION_TIMEOUT_RESUME_KEY',
+].sort());
+assert.deepEqual(Object.keys(testing), ['suspensionTimeoutResumeData']);
+assert.equal(constants.MIN_SUSPENSION_DEADLINE_MS, 1000);
+assert.equal(constants.MAX_SUSPENSION_DEADLINE_MS, 31536000000);
+assert.equal(constants.SUSPENSION_DEADLINE_PAYLOAD_KEY, 'flowsafe.deadlineMs');
+assert.equal(constants.SUSPENSION_TIMEOUT_RESUME_KEY, 'flowsafe.suspensionTimeout');
+for (const value of [1000, 1001, 86400000, 31536000000]) {
+  assert.equal(constants.isArmableSuspensionDeadlineMs(value), true, String(value));
+}
+for (const value of [undefined, null, true, '1000', [], {}, NaN, Infinity, -Infinity, 0, -1, 999, 1000.5, 31536000001, Number.MAX_SAFE_INTEGER + 1]) {
+  assert.equal(constants.isArmableSuspensionDeadlineMs(value), false, String(value));
+}
+const timeout = testing.suspensionTimeoutResumeData({ step: 'gate', deadlineAt: 2000 }, 2500);
+assert.equal(JSON.stringify(timeout), '{"flowsafe.suspensionTimeout":{"step":"gate","deadlineAt":2000,"expiredAt":2500}}');
+assert.equal(constants.isSuspensionTimeoutResumeData(timeout), true);
+assert.equal(constants.isSuspensionTimeoutResumeData({
+  'flowsafe.suspensionTimeout': { step: 'gate', deadlineAt: 2000, expiredAt: 2500 },
+}), true);
+for (const value of [undefined, null, {}, [], { 'flowsafe.suspensionTimeout': {} }, {
+  'flowsafe.suspensionTimeout': { step: 'gate', deadlineAt: '2000', expiredAt: 2500 },
+}]) {
+  assert.equal(constants.isSuspensionTimeoutResumeData(value), false);
+}
+`,
+  );
+  run(
+    process.execPath,
+    ['--experimental-loader', './graph-loader.mjs', 'runtime.mjs'],
+    deadlineConsumer,
+  );
+  const deadlineModules = readFileSync(deadlineGraph, 'utf8')
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line).url)
+    .filter((url) => url.startsWith(packedDistUrl));
+  assert.deepEqual(
+    [...new Set(deadlineModules)].sort(),
+    ['constants', 'testing', 'suspension-deadline', 'path-safe-id']
+      .map((name) => `${packedDistUrl}do-runner/${name}.js`)
+      .sort(),
   );
   for (const leaf of [
     'fenced-workflows-d1',
@@ -814,6 +896,59 @@ void createRunRouter;
 `,
   );
   writeFileSync(
+    join(consumer, 'deadline-consumer.ts'),
+    `import {
+  isArmableSuspensionDeadlineMs,
+  suspensionDeadlinesOf,
+  type RejectedSuspensionDeadline,
+  type RunSummary,
+  type SuspensionDeadlineEntry,
+} from '@proofoftech/flowsafe/do-runner';
+import * as constants from '@proofoftech/flowsafe/do-runner/constants';
+import * as testing from '@proofoftech/flowsafe/do-runner/testing';
+
+declare const summary: RunSummary;
+const derived: {
+  entries: SuspensionDeadlineEntry[];
+  rejected: RejectedSuspensionDeadline[];
+} = suspensionDeadlinesOf(summary);
+declare const candidate: unknown;
+if (isArmableSuspensionDeadlineMs(candidate)) {
+  const duration: number = candidate;
+  void duration;
+}
+if (constants.isArmableSuspensionDeadlineMs(candidate)) {
+  const duration: number = candidate;
+  void duration;
+}
+const timeout: testing.SuspensionTimeoutResumeData = testing.suspensionTimeoutResumeData(
+  { step: 'gate', deadlineAt: 2000 }, 2500,
+);
+const constantsTimeout: constants.SuspensionTimeoutResumeData = timeout;
+const envelope: testing.SuspensionTimeoutEnvelope = timeout[constants.SUSPENSION_TIMEOUT_RESUME_KEY];
+const constantsEnvelope: constants.SuspensionTimeoutEnvelope = envelope;
+if (constants.isSuspensionTimeoutResumeData(candidate)) {
+  const detected: constants.SuspensionTimeoutResumeData = candidate;
+  void detected[constants.SUSPENSION_TIMEOUT_RESUME_KEY].expiredAt;
+}
+// @ts-expect-error the test minter requires the step id
+testing.suspensionTimeoutResumeData({ deadlineAt: 2000 }, 2500);
+// @ts-expect-error the test minter requires an epoch millisecond deadline
+testing.suspensionTimeoutResumeData({ step: 'gate', deadlineAt: '2000' }, 2500);
+// @ts-expect-error the storage record parser is private
+void constants.parseSuspensionDeadlineRecord;
+// @ts-expect-error the deadline merge helper is private
+void constants.mergeSuspensionDeadlines;
+// @ts-expect-error the storage key is private
+void constants.SUSPENSION_DEADLINE_STORAGE_KEY;
+// @ts-expect-error the storage record parser is private
+void testing.parseSuspensionDeadlineRecord;
+// @ts-expect-error the retry ledger is private
+void testing.tombstoned;
+void [derived, constantsTimeout, constantsEnvelope];
+`,
+  );
+  writeFileSync(
     join(consumer, 'transport-consumer.ts'),
     `import {
   type ActorContext, ApprovalService, createActorResolver,
@@ -1014,7 +1149,7 @@ void [legacyContext, epochContext, legacyScope, epochScope, legacyInput, epochIn
         noEmit: true,
         skipLibCheck: true,
       },
-      files: ['consumer.ts', 'transport-consumer.ts'],
+      files: ['consumer.ts', 'transport-consumer.ts', 'deadline-consumer.ts'],
     }),
   );
   run('pnpm', ['exec', 'tsc', '-p', 'tsconfig.json'], consumer);
@@ -1041,6 +1176,8 @@ import * as flowsafe from '@proofoftech/flowsafe';
 import * as approvals from '@proofoftech/flowsafe/approval-api';
 import * as backgroundTasks from '@proofoftech/flowsafe/background-tasks';
 import * as doRunner from '@proofoftech/flowsafe/do-runner';
+import * as deadlineConstants from '@proofoftech/flowsafe/do-runner/constants';
+import * as deadlineTesting from '@proofoftech/flowsafe/do-runner/testing';
 import * as hostKit from '@proofoftech/flowsafe/host-kit';
 import * as agentRunner from '@proofoftech/flowsafe/agent-runner';
 import * as schedules from '@proofoftech/flowsafe/schedules';
@@ -1050,6 +1187,35 @@ import { InMemoryStore } from '@mastra/core/storage';
 import { createStep, createWorkflow } from '@mastra/core/workflows';
 import { z } from 'zod';
 import { openSqlite, sqliteUnitDatabase } from './sqlite-fixture.mjs';
+assert.equal(doRunner.isArmableSuspensionDeadlineMs, deadlineConstants.isArmableSuspensionDeadlineMs);
+assert.equal(doRunner.isSuspensionTimeoutResumeData, deadlineConstants.isSuspensionTimeoutResumeData);
+assert.equal(doRunner.MIN_SUSPENSION_DEADLINE_MS, deadlineConstants.MIN_SUSPENSION_DEADLINE_MS);
+assert.equal(doRunner.MAX_SUSPENSION_DEADLINE_MS, deadlineConstants.MAX_SUSPENSION_DEADLINE_MS);
+const deadlineSummary = {
+  runId: 'packed-deadline-run', status: 'suspended', suspended: [['gate']],
+  suspendPayload: { gate: { [deadlineConstants.SUSPENSION_DEADLINE_PAYLOAD_KEY]: 1000 } },
+  suspendedAt: { gate: 2000 }, resumeCount: { gate: 3 },
+};
+const derivedDeadlines = doRunner.suspensionDeadlinesOf(deadlineSummary);
+assert.deepEqual(derivedDeadlines, {
+  entries: [{ step: 'gate', deadlineAt: 3000, suspendedAt: 2000, resumeCount: 3 }],
+  rejected: [],
+});
+const packedTimeout = deadlineTesting.suspensionTimeoutResumeData(derivedDeadlines.entries[0], 3500);
+assert.deepEqual(packedTimeout, {
+  'flowsafe.suspensionTimeout': { step: 'gate', deadlineAt: 3000, expiredAt: 3500 },
+});
+assert.equal(doRunner.isSuspensionTimeoutResumeData(packedTimeout), true);
+assert.deepEqual(doRunner.suspensionDeadlinesOf({
+  ...deadlineSummary,
+  suspendPayload: { gate: { [deadlineConstants.SUSPENSION_DEADLINE_PAYLOAD_KEY]: 999 } },
+}), {
+  entries: [],
+  rejected: [{ step: 'gate', reason: 'flowsafe.deadlineMs must be between 1000 and 31536000000 ms' }],
+});
+for (const name of ['parseSuspensionDeadlineRecord', 'mergeSuspensionDeadlines', 'SUSPENSION_DEADLINE_STORAGE_KEY', 'suspensionTimeoutResumeData']) {
+  assert.equal(name in doRunner, false, name);
+}
 for (const name of [
   'createD1Storage',
   'FencedWorkflowsStorageD1',
