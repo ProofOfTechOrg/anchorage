@@ -93,6 +93,33 @@ function digest(value) {
   return value;
 }
 
+export const DIRECT_RUN_MAX_RESUME_COUNT = 999_999;
+const RUN_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
+
+function runTimestamp(value) {
+  if (typeof value !== 'string' || !RUN_TIMESTAMP.test(value)) invalid();
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== value)
+    invalid();
+  return value;
+}
+
+function resumeCounter(value) {
+  if (
+    !Number.isSafeInteger(value) ||
+    value < 0 ||
+    value > DIRECT_RUN_MAX_RESUME_COUNT
+  )
+    invalid();
+  return value;
+}
+
+function runClock(now) {
+  if (now === undefined) return Date.now();
+  if (!Number.isSafeInteger(now) || now < 0) invalid();
+  return now;
+}
+
 function bindingFromInput(input) {
   const accountId = input.accountId;
   if (
@@ -173,10 +200,18 @@ async function decodeSnapshot(value, binding) {
       : [
           ...keys,
           'bootstrap',
+          ...(Object.hasOwn(value, 'createdAt') ? ['createdAt'] : []),
+          ...(Object.hasOwn(value, 'resumeCount') ? ['resumeCount'] : []),
           ...(Object.hasOwn(value, 'scenario') ? ['scenario'] : []),
           ...(Object.hasOwn(value, 'teardown') ? ['teardown'] : []),
         ],
   );
+  const createdAt = Object.hasOwn(value, 'createdAt')
+    ? runTimestamp(value.createdAt)
+    : undefined;
+  const resumeCount = Object.hasOwn(value, 'resumeCount')
+    ? resumeCounter(value.resumeCount)
+    : undefined;
   object(value.binding, Object.keys(binding));
   if (
     ![1, 2].includes(value.version) ||
@@ -231,6 +266,8 @@ async function decodeSnapshot(value, binding) {
     : undefined;
   return Object.freeze({
     version: 2,
+    ...(createdAt !== undefined ? { createdAt } : {}),
+    ...(resumeCount !== undefined ? { resumeCount } : {}),
     binding,
     invocationCount: value.invocationCount,
     lastInvocation,
@@ -1530,7 +1567,7 @@ async function exists(path) {
   }
 }
 
-async function initializeRun(basePath, base, directory, binding) {
+async function initializeRun(basePath, base, directory, binding, createdAt) {
   if (await exists(directory)) throw new DirectRunStateError('run-exists');
   const staging = join(
     basePath,
@@ -1543,6 +1580,7 @@ async function initializeRun(basePath, base, directory, binding) {
     handle = await privateDirectory(staging);
     const snapshot = Object.freeze({
       version: 2,
+      createdAt,
       binding,
       invocationCount: 0,
       lastInvocation: null,
@@ -1724,6 +1762,18 @@ function runJournal(directory, directoryHandle, base, lock, initial) {
           }
         }
         await publishSnapshot({ scenario });
+      });
+    },
+    recordResume() {
+      return enqueue(async () => {
+        if (
+          snapshot.lastInvocation?.state === 'pending' ||
+          snapshot.bootstrap?.pending
+        )
+          throw new DirectRunStateError('outcome-unknown');
+        const current = snapshot.resumeCount ?? 0;
+        if (current >= DIRECT_RUN_MAX_RESUME_COUNT) return;
+        await publishSnapshot({ resumeCount: current + 1 });
       });
     },
     recordTeardown(value) {
@@ -1923,10 +1973,9 @@ function runJournal(directory, directoryHandle, base, lock, initial) {
   });
 }
 
-export async function openDirectRunState(input) {
+async function attachRunState(input, modes) {
   let base;
   let lock;
-  let directoryHandle;
   try {
     if (
       process.platform !== 'linux' ||
@@ -1936,7 +1985,7 @@ export async function openDirectRunState(input) {
       !Number.isInteger(constants.O_DIRECTORY)
     )
       throw new DirectRunStateError('lock-unavailable');
-    if (input.mode !== 'run' && input.mode !== 'resume') invalid();
+    if (!modes.includes(input.mode)) invalid();
     const binding = bindingFromInput(input);
     const basePath = join(
       dirname(resolve(input.configPath)),
@@ -1948,6 +1997,22 @@ export async function openDirectRunState(input) {
       join(basePath, `${binding.resourcePrefix}.lock`),
       base,
     );
+    return { binding, basePath, directory, base, lock };
+  } catch (error) {
+    await Promise.allSettled(
+      [base, lock]
+        .filter((handle) => handle !== undefined)
+        .map((handle) => handle.close()),
+    );
+    throw stateError(error);
+  }
+}
+
+export async function openDirectRunState(input) {
+  const attached = await attachRunState(input, ['run', 'resume']);
+  const { binding, basePath, directory, base, lock } = attached;
+  let directoryHandle;
+  try {
     let snapshot;
     if (input.mode === 'run') {
       const initialized = await initializeRun(
@@ -1955,6 +2020,7 @@ export async function openDirectRunState(input) {
         base,
         directory,
         binding,
+        runTimestamp(new Date(runClock(input.now)).toISOString()),
       );
       directoryHandle = initialized.handle;
       snapshot = initialized.snapshot;
@@ -1973,6 +2039,42 @@ export async function openDirectRunState(input) {
   } catch (error) {
     await Promise.allSettled(
       [directoryHandle, base, lock]
+        .filter((handle) => handle !== undefined)
+        .map((handle) => handle.close()),
+    );
+    throw stateError(error);
+  }
+}
+
+export async function inspectDirectRunState(input) {
+  const attached = await attachRunState(input, ['inspect']);
+  let directoryHandle;
+  try {
+    if (!(await exists(attached.directory)))
+      throw new DirectRunStateError('run-missing');
+    directoryHandle = await privateDirectory(attached.directory);
+    const snapshot = await readSnapshot(
+      join(attached.directory, 'journal.json'),
+      attached.binding,
+    );
+    let closePromise;
+    return Object.freeze({
+      snapshot,
+      close() {
+        closePromise ??= (async () => {
+          const closed = await Promise.allSettled([
+            directoryHandle.close(),
+            attached.base.close(),
+            attached.lock.close(),
+          ]);
+          if (closed.some((result) => result.status === 'rejected')) invalid();
+        })();
+        return closePromise;
+      },
+    });
+  } catch (error) {
+    await Promise.allSettled(
+      [directoryHandle, attached.base, attached.lock]
         .filter((handle) => handle !== undefined)
         .map((handle) => handle.close()),
     );

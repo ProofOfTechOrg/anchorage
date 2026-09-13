@@ -40,6 +40,8 @@ export interface DirectInvocationReservation {
 
 export interface DirectRunSnapshot {
   readonly version: 2;
+  readonly createdAt?: string;
+  readonly resumeCount?: number;
   readonly binding: DirectRunBinding;
   readonly invocationCount: number;
   readonly lastInvocation:
@@ -223,6 +225,7 @@ export interface DirectRunJournal {
   readonly directory: string;
   snapshot(): DirectRunSnapshot;
   recordScenario(state: DirectScenarioState): Promise<void>;
+  recordResume(): Promise<void>;
   recordTeardown(state: DirectTeardownState): Promise<void>;
   assertTeardownCapacity(worstCase: DirectTeardownState): Promise<void>;
   bindBootstrapContext(context: DirectBootstrapContext): Promise<void>;
@@ -320,5 +323,22 @@ export function openDirectRunState(
     prepared: PreparedDirectConformance;
     accountId: string;
     mode: 'run' | 'resume';
+    now?: number;
   }>,
 ): Promise<DirectRunJournal>;
+
+export const DIRECT_RUN_MAX_RESUME_COUNT: number;
+
+export type DirectRunStateInspection = Readonly<{
+  snapshot: DirectRunSnapshot;
+  close(): Promise<void>;
+}>;
+
+export function inspectDirectRunState(
+  input: Readonly<{
+    configPath: string;
+    prepared: PreparedDirectConformance;
+    accountId: string;
+    mode: 'inspect';
+  }>,
+): Promise<DirectRunStateInspection>;

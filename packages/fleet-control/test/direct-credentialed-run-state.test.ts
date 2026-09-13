@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { spawn } from 'node:child_process';
+import { readdirSync } from 'node:fs';
 import {
   chmod,
   link,
@@ -20,10 +21,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   actionSummary,
   DIRECT_RUN_MAX_JOURNAL_BYTES,
+  DIRECT_RUN_MAX_RESUME_COUNT,
   DIRECT_SCENARIO_ARRAY_MAXIMA,
   DIRECT_SCENARIO_OPERATION_SLOTS,
   type DirectBootstrapMutationReceipt,
   type DirectRunJournal,
+  inspectDirectRunState,
   openDirectRunState,
 } from '../scripts/direct-credentialed-run-state.mjs';
 import type { DirectOperationSlot } from '../scripts/direct-reference-journal.js';
@@ -211,6 +214,7 @@ describeLinux('durable bootstrap state', () => {
     const path = join(journal.directory, 'journal.json');
     const original = JSON.parse(await readFile(path, 'utf8'));
     delete original.bootstrap;
+    delete original.createdAt;
     original.version = 1;
     await writeFile(path, JSON.stringify(original));
     const resumed = await opened({ ...f.input, mode: 'resume' });
@@ -1241,6 +1245,7 @@ describeLinux('durable scenario state', () => {
     );
     expect(Object.keys(JSON.parse(serialized))).toEqual([
       'version',
+      'createdAt',
       'binding',
       'invocationCount',
       'lastInvocation',
@@ -1608,6 +1613,7 @@ describeLinux('durable teardown state', () => {
     const after = JSON.parse(await readFile(path, 'utf8'));
     expect(Object.keys(after)).toEqual([
       'version',
+      'createdAt',
       'binding',
       'invocationCount',
       'lastInvocation',
@@ -1889,5 +1895,230 @@ describeLinux('durable teardown state', () => {
     expect(resumed.snapshot().teardown?.pending).toEqual({
       kind: 'disable-reference-ingress',
     });
+  });
+});
+
+describeLinux('CLI metadata and inspection', () => {
+  it('refuses an invalid mode before creating a base directory or lock', async () => {
+    const f = await fixture();
+    await expect(
+      openDirectRunState({
+        ...f.input,
+        mode: 'inspect',
+      } as unknown as Parameters<typeof openDirectRunState>[0]),
+    ).rejects.toMatchObject({ code: 'invalid-state' });
+    await expect(stat(f.base)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(stat(f.lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('closes the losing lock and base descriptors and permits a third opener', async () => {
+    const f = await fixture();
+    const holder = await opened({ ...f.input, mode: 'run' });
+    const before = readdirSync('/proc/self/fd').length;
+    await expect(
+      openDirectRunState({ ...f.input, mode: 'resume' }),
+    ).rejects.toMatchObject({ code: 'lock-unavailable' });
+    expect(readdirSync('/proc/self/fd').length).toBe(before);
+    await closed(holder);
+    await closed(await opened({ ...f.input, mode: 'resume' }));
+  });
+
+  it.each([
+    'invocation',
+    'bootstrap',
+  ] as const)('inspects pending %s without mutation and holds the lock until close', async (pending) => {
+    const f = await fixture();
+    const journal = await opened({ ...f.input, mode: 'run' });
+    if (pending === 'invocation') await journal.reserveInvocation(f.request());
+    else {
+      await journal.bindBootstrapContext(bootstrapContext(f));
+      await journal.beginBootstrapMutation('create-fleet-d1');
+    }
+    await expect(journal.recordResume()).rejects.toMatchObject({
+      code: 'outcome-unknown',
+    });
+    const snapshot = journal.snapshot();
+    await closed(journal);
+    const path = join(f.runDirectory, 'journal.json');
+    const before = await readFile(path);
+    await expect(
+      openDirectRunState({ ...f.input, mode: 'resume' }),
+    ).rejects.toMatchObject({ code: 'outcome-unknown' });
+    const inspection = await inspectDirectRunState({
+      ...f.input,
+      mode: 'inspect',
+    });
+    try {
+      expect(inspection.snapshot).toEqual(snapshot);
+      expect(Object.keys(inspection)).toEqual(['snapshot', 'close']);
+      await expect(
+        inspectDirectRunState({ ...f.input, mode: 'inspect' }),
+      ).rejects.toMatchObject({ code: 'lock-unavailable' });
+      expect(await readFile(path)).toEqual(before);
+    } finally {
+      await inspection.close();
+      await inspection.close();
+    }
+    const again = await inspectDirectRunState({ ...f.input, mode: 'inspect' });
+    await again.close();
+  });
+
+  it('inspects by content binding and directory, without imposing filename identity', async () => {
+    const f = await fixture();
+    await closed(await opened({ ...f.input, mode: 'run' }));
+    for (const overrides of [
+      { accountId: 'different' },
+      { prepared: { ...f.prepared, configSha256: 'e'.repeat(64) } },
+    ]) {
+      await expect(
+        inspectDirectRunState({ ...f.input, ...overrides, mode: 'inspect' }),
+      ).rejects.toMatchObject({ code: 'invalid-state' });
+    }
+    const alias = join(f.directory, 'alias.json');
+    await writeFile(alias, await readFile(f.configPath));
+    const inspection = await inspectDirectRunState({
+      ...f.input,
+      configPath: alias,
+      mode: 'inspect',
+    });
+    await inspection.close();
+    const other = join(f.directory, 'other');
+    await mkdir(other);
+    await writeFile(join(other, 'config.json'), await readFile(f.configPath));
+    await expect(
+      inspectDirectRunState({
+        ...f.input,
+        configPath: join(other, 'config.json'),
+        mode: 'inspect',
+      }),
+    ).rejects.toMatchObject({ code: 'run-missing' });
+    await writeFile(join(f.runDirectory, 'journal.json'), '{}');
+    await expect(
+      inspectDirectRunState({ ...f.input, mode: 'inspect' }),
+    ).rejects.toMatchObject({ code: 'invalid-state' });
+  });
+
+  it('increments queued resumes without changing other fields', async () => {
+    const f = await fixture();
+    const journal = await opened({
+      ...f.input,
+      mode: 'run',
+      now: Date.parse('2026-09-13T00:00:00.000Z'),
+    });
+    const before = journal.snapshot();
+    expect(before.createdAt).toBe('2026-09-13T00:00:00.000Z');
+    await Promise.all([journal.recordResume(), journal.recordResume()]);
+    const { resumeCount, ...rest } = journal.snapshot();
+    expect(resumeCount).toBe(2);
+    expect(JSON.stringify(rest)).toBe(JSON.stringify(before));
+    await closed(journal);
+    const resumed = await opened({ ...f.input, mode: 'resume' });
+    expect(resumed.snapshot().resumeCount).toBe(2);
+    await resumed.recordResume();
+    expect(resumed.snapshot().resumeCount).toBe(3);
+  });
+
+  it.each([
+    false,
+    true,
+  ])('saturates without writing and permits teardown reconciliation (pending=%s)', async (pending) => {
+    const { f, journal } = await completeScenarioJournal();
+    const state = teardownWith((value) => {
+      if (pending) value.pending = { kind: 'disable-reference-ingress' };
+    });
+    await journal.recordTeardown(state);
+    await journal.recordResume();
+    expect(journal.snapshot().teardown?.pending).toEqual(state.pending);
+    await closed(journal);
+    const path = join(f.runDirectory, 'journal.json');
+    const raw = JSON.parse(await readFile(path, 'utf8'));
+    raw.resumeCount = DIRECT_RUN_MAX_RESUME_COUNT;
+    await writeFile(path, `${JSON.stringify(raw)}\n`);
+    const resumed = await opened({ ...f.input, mode: 'resume' });
+    const before = await readFile(path);
+    const snapshot = JSON.stringify(resumed.snapshot());
+    await resumed.recordResume();
+    expect(await readFile(path)).toEqual(before);
+    expect(JSON.stringify(resumed.snapshot())).toBe(snapshot);
+    expect(resumed.snapshot().resumeCount).toBe(DIRECT_RUN_MAX_RESUME_COUNT);
+    await resumed.recordTeardown(
+      teardownWith((value) => {
+        value.receipts.ingress = { ordinal: 1, settledByReread: true };
+      }),
+    );
+    expect(resumed.snapshot().teardown?.pending).toBeNull();
+    await closed(resumed);
+    await closed(await opened({ ...f.input, mode: 'resume' }));
+  });
+
+  it.each([
+    ['createdAt', '2026-09-13T00:00:00Z'],
+    ['createdAt', '2026-09-13T00:00:00.000+00:00'],
+    ['createdAt', '2026-02-30T00:00:00.000Z'],
+    ['createdAt', '2026-09-13T00:00:00.0000Z'],
+    ['createdAt', '2026-99-99T00:00:00.000Z'],
+    ['resumeCount', -1],
+    ['resumeCount', 0.5],
+    ['resumeCount', 1_000_000],
+  ])('refuses malformed metadata %s=%s', async (key, value) => {
+    const f = await fixture();
+    await closed(await opened({ ...f.input, mode: 'run' }));
+    const path = join(f.runDirectory, 'journal.json');
+    const raw = JSON.parse(await readFile(path, 'utf8'));
+    raw[key] = value;
+    await writeFile(path, JSON.stringify(raw));
+    await expect(
+      openDirectRunState({ ...f.input, mode: 'resume' }),
+    ).rejects.toMatchObject({ code: 'invalid-state' });
+  });
+
+  it.each([
+    'createdAt',
+    'resumeCount',
+  ])('refuses version-1 journals carrying %s', async (key) => {
+    const f = await fixture();
+    const journal = await opened({ ...f.input, mode: 'run' });
+    const { binding, invocationCount, lastInvocation } = journal.snapshot();
+    await closed(journal);
+    await writeFile(
+      join(f.runDirectory, 'journal.json'),
+      JSON.stringify({
+        version: 1,
+        binding,
+        invocationCount,
+        lastInvocation,
+        [key]: key === 'createdAt' ? '2026-09-13T00:00:00.000Z' : 0,
+      }),
+    );
+    await expect(
+      openDirectRunState({ ...f.input, mode: 'resume' }),
+    ).rejects.toMatchObject({ code: 'invalid-state' });
+  });
+
+  it('re-emits older metadata-free journals identically and measures the bounded fields', async () => {
+    const f = await fixture();
+    const journal = await opened({ ...f.input, mode: 'run' });
+    const { createdAt: _createdAt, ...older } = journal.snapshot();
+    await closed(journal);
+    const path = join(f.runDirectory, 'journal.json');
+    const bytes = `${JSON.stringify(older)}\n`;
+    await writeFile(path, bytes);
+    const resumed = await opened({ ...f.input, mode: 'resume' });
+    expect(`${JSON.stringify(resumed.snapshot())}\n`).toBe(bytes);
+    expect(await readFile(path, 'utf8')).toBe(bytes);
+    const timeBytes = Buffer.byteLength(
+      '"createdAt":"2026-09-13T00:00:00.000Z",',
+    );
+    const countBytes = Buffer.byteLength(
+      `"resumeCount":${DIRECT_RUN_MAX_RESUME_COUNT},`,
+    );
+    console.log('CLI_METADATA_BYTES', {
+      timeBytes,
+      countBytes,
+      total: timeBytes + countBytes,
+    });
+    expect([timeBytes, countBytes, timeBytes + countBytes]).toEqual([
+      39, 21, 60,
+    ]);
   });
 });
