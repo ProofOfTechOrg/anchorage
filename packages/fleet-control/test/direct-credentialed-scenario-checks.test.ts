@@ -460,11 +460,14 @@ const DECLARED_PHASES = [
   'provision-b',
   'inventory-before',
   'audit-before',
+  'fence-drain',
   'migration-start',
   'migration-interrupt',
   'migration-restart',
   'migration',
   'post-migration',
+  'fence-reopen',
+  'fence-proofs',
   'inventory-after',
   'audit-after',
   'failed-recovery',
@@ -492,6 +495,18 @@ describe('scenario invocation budget', () => {
     );
 
   it('derives the phase list from the budget table and keeps both columns on the rule', () => {
+    console.log(
+      'A1_FENCE_BUDGET',
+      JSON.stringify(
+        Object.fromEntries(
+          ['fence-drain', 'fence-reopen', 'fence-proofs'].map((phase) => [
+            phase,
+            DIRECT_SCENARIO_INVOCATION_BUDGET[phase as DirectScenarioPhase],
+          ]),
+        ),
+      ),
+    );
+    console.log('A1_SCENARIO_MIN_INVOCATIONS', DIRECT_SCENARIO_MIN_INVOCATIONS);
     expect(Object.keys(DIRECT_SCENARIO_INVOCATION_BUDGET)).toEqual([
       ...DIRECT_SCENARIO_PHASES,
     ]);
@@ -577,6 +592,11 @@ describe('scenario invocation budget', () => {
       ['delete-objects', 'decommission-a'],
       ['delete-objects', 'decommission-b'],
       ['inventory-before', 'audit-before'],
+      ['audit-before', 'fence-drain'],
+      ['fence-drain', 'migration-start'],
+      ['post-migration', 'fence-reopen'],
+      ['fence-reopen', 'fence-proofs'],
+      ['fence-proofs', 'inventory-after'],
       ['inventory-after', 'audit-after'],
       ['migration-interrupt', 'migration-restart'],
       ['cleanup-recovery', 'provision-recovery'],
@@ -622,13 +642,13 @@ describe('scenario invocation budget', () => {
       reserve: 132,
       ceiling: 216,
     });
-    expect(phaseInvocationReserve('migration')).toBe(484);
+    expect(phaseInvocationReserve('migration')).toBe(508);
     const overspent = { ...calls, migration: 200 };
     expect(
-      refusal(() => checkInvocationHeadroom('migration', overspent, 352)),
+      refusal(() => checkInvocationHeadroom('migration', overspent, 376)),
     ).toBe('accepted');
     expect(
-      cause(() => checkInvocationHeadroom('migration', overspent, 351)),
+      cause(() => checkInvocationHeadroom('migration', overspent, 375)),
     ).toEqual({ code: 'budget-exhausted', detail: 'run-reserve' });
   });
 

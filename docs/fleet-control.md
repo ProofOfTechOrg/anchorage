@@ -344,6 +344,40 @@ Per-call leases permit another lifecycle driver to act between steps. The frozen
 
 Durable Object tag movement has an additional recovery limit. Continuations accept the recorded target tag or the consistent external finalized-state tag/resource pair. Fresh admission remains strict about the previous tag, just like the drain. A new operation over an external record whose tag already moved can therefore refuse on both the completed and interrupted paths. An operation that is still running after a lost progress response can resume with its continuation. A durably failed operation cannot: neither its failed token nor a new operation ID repairs the post-tag-move admission dead-end. This API provides no reset or repair operation for that state; abandonment does not supply one.
 
+## Roll out an artifact under the execution fence
+
+Coordinate the FlowSafe execution fence with a bounded migration of one deployment. Configure the artifact’s trusted caller epoch through `createFlowsafeWorker({ mutationEpoch })` and propagate that exact epoch to allowed mutations; never take it from a client header. Check the [trusted caller epoch requirements](deployment-reference.md#configure-the-trusted-caller-epoch) before activation, including the remaining generation-aware retention requirement.
+
+Use the deployment’s route hostname for the [execution-fence and inventory routes](deployment-reference.md#control-plane-routes), authenticated with its maintenance admin secret. The plain Worker’s control origin does not expose those routes. Persist transition inputs and observations alongside the migration operation so a lost response can be reconciled against authoritative state.
+
+Follow this order:
+
+1. Read `GET /admin/execution-fence`. Persist its epoch and revision, then POST `{ expected: 'open', next: 'draining', expectedMutationEpoch, expectedRevision, advanceMutationEpoch: true }` to the same path. This compare-and-swap atomically advances the epoch and activates `requireMutationEpoch`. Configure the target artifact for the returned epoch.
+2. Read the category index from `GET /admin/inventory` and sweep the categories it declares through `?category=`. Prove the drain with every `work` category empty on two sweeps taken from `draining`, at least 60 seconds apart. An empty observation has no entries and no continuation cursor; do not infer emptiness from an absent `count`. Standing categories need not be empty, and persisted idle signals remain across the migration. The [execution-fence design](do-runner-design.md#execution-fence-and-start-reservations) defines the drain and proof boundaries.
+3. Start `advanceFleetMigration()` with that deployment’s record and the trusted target specification. Persist the original start input and operation ID; persist each pending token before scheduling its continuation. Keep the fence `draining` while advancing the bounded migration.
+4. Require active-route attestation of the promoted artifact and settlement while the deployment lease is held. Retain the migration’s keyed, at-least-once delivery contract for attestation and settlement callbacks. Complete these checks before reopening; a candidate upload or promotion response alone does not establish completion.
+5. Read the fence again and persist its counters. POST `{ expected: 'draining', next: 'open', expectedMutationEpoch, expectedRevision }` without `advanceMutationEpoch`. Verify that the returned epoch matches the activated epoch and `requireMutationEpoch` remains `true`. Reopening changes the state without disabling enforcement.
+
+Schedule mutations encounter these refusal layers in order:
+
+| Layer | Applies to | Refusal |
+| --- | --- | --- |
+| Route state gate | `create`, `update`, `resume` | `503 EXECUTION_FENCED` while `draining` |
+| Storage epoch gate | Mutations including `pause` and `delete` | `409 MUTATION_EPOCH_MISMATCH`, classified `missing`, `stale`, or `future` once the requirement is armed |
+| Storage state gate | `create`, `update`, `resume` | `503 EXECUTION_FENCED` when the fence does not admit authoring |
+
+A delete with the current epoch is admitted while `draining`. After reopen, a pre-cutover artifact’s epoch is stale; a missing epoch or one ahead of the fence is also refused. For `missing`, configure the trusted writer epoch. For `stale`, replace the older artifact with the intended current artifact. For `future`, reconcile the artifact configuration with the authoritative fence and rollout record before proceeding; do not advance the fence to accommodate an unexplained caller value.
+
+Recover response loss at the boundary that produced it:
+
+| Boundary or failure | Recovery |
+| --- | --- |
+| Fence transition response lost, or `409 FENCE_CAS_CONFLICT` | Re-read and reconcile the state, epoch, requirement and revision against the persisted command. An exact retry can reuse the last upgraded command’s receipt; an intervening command invalidates it. Never blindly repeat an advance with fresh counters. The same expected counters cannot double-advance. |
+| Migration response lost | Continue from the stored token. If start stopped before staging completed, replay the original start input; a token cannot reconstruct it. |
+| Active-route attestation or settlement response lost | Retry with the same operation keys under the existing at-least-once contract. Reconcile the persisted migration state before reopening. |
+| `503 EXECUTION_FENCE_UNREADABLE` | Restore authoritative fence readability before allowing mutation or reopening. |
+| `503 SCHEDULE_MUTATION_OUTCOME_UNKNOWN` | Reconcile the schedule’s persisted outcome before retrying. A write may have occurred; this is not a clean fence refusal. |
+
 ## Switch a plain deployment to Workers for Platforms
 
 Use `switchPlainDeploymentToWorkersForPlatforms()` only for an existing platform-authored deployment that must accept external releases without moving D1 data or Durable Object namespaces. The switch stores its intent in the canonical fleet row and holds the same `FleetStateLease` used by provision, migration, rollback, and decommission. Those lifecycle operations reject an active switch.

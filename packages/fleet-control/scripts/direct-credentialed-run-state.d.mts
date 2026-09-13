@@ -300,6 +300,7 @@ export const DIRECT_SCENARIO_ARRAY_MAXIMA: Readonly<{
   auditFindings: number;
   footprintVersionIds: number;
   deploymentVersions: number;
+  inventoryCategories: number;
   inventory: Readonly<{
     databaseIds: number;
     namespaceIds: number;

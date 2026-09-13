@@ -8,6 +8,21 @@ import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import type { D1Database, R2Bucket } from '@cloudflare/workers-types';
+import {
+  assertExecutionFenceState,
+  assertMutationEpoch,
+  DeploymentInventory,
+  DoStatusError,
+  type ExecutionFenceDatabase,
+  type ExecutionFenceStatement,
+  ExecutionFenceStore,
+  executionFenceReadingPayload,
+  InvalidInventoryRequestError,
+  type InventoryDatabase,
+  type InventoryStatement,
+  isInventoryCategory,
+  MutationEpochMismatchError,
+} from '@proofoftech/flowsafe/do-runner';
 import { expect } from 'vitest';
 import { createTestHarness, type TestHarness } from 'wrangler';
 import type { DirectRunManifest } from '../../scripts/direct-credentialed-conformance-preflight.mjs';
@@ -15,6 +30,7 @@ import { directDeploymentSpec } from '../../scripts/direct-credentialed-spec.js'
 import {
   DIRECT_TENANT_OBJECT_BODY,
   DIRECT_TENANT_OBJECT_KEY,
+  directTenantMutationEpoch,
 } from '../../scripts/direct-credentialed-tenant-object.mjs';
 import type { DirectRunBinding } from '../../scripts/direct-reference-context.js';
 import {
@@ -32,7 +48,175 @@ import {
   single,
 } from './cloudflare-fetch-fixture.js';
 import { directFixtureManifest } from './direct-credentialed-config.js';
-import { maintenanceResponder, providerWorld } from './provider-world.js';
+import {
+  type D1State,
+  maintenanceResponder,
+  providerWorld,
+  type SqliteBinding,
+} from './provider-world.js';
+
+function fixtureFenceDatabase(
+  state: D1State,
+): ExecutionFenceDatabase & InventoryDatabase {
+  return {
+    prepare(query: string) {
+      let bindings: readonly SqliteBinding[] = [];
+      const statement: ExecutionFenceStatement & InventoryStatement = {
+        bind(...values: unknown[]) {
+          bindings = values as SqliteBinding[];
+          return statement;
+        },
+        async all<T = unknown>(): Promise<{ results: T[] }> {
+          const rows: readonly unknown[] = state.queryDatabase(query, bindings);
+          return { results: [...rows] as T[] };
+        },
+        async run(): Promise<unknown> {
+          return state.queryDatabase(query, bindings);
+        },
+      };
+      return statement;
+    },
+  };
+}
+
+async function fixtureExecutionFence(
+  request: CloudflareFixtureRequest,
+  state: D1State,
+): Promise<Response> {
+  if (request.method !== 'GET' && request.method !== 'POST')
+    return Response.json({ error: 'method not allowed' }, { status: 405 });
+  const fence = new ExecutionFenceStore(fixtureFenceDatabase(state));
+  try {
+    if (request.method === 'GET')
+      return Response.json(executionFenceReadingPayload(await fence.read()));
+    const parsed = request.body;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
+      return Response.json(
+        { error: 'a JSON object body is required' },
+        { status: 400 },
+      );
+    const body = parsed as Record<string, unknown>;
+    const reading = await fence.transition({
+      expected: assertExecutionFenceState(body.expected, 'expected'),
+      next: assertExecutionFenceState(body.next, 'next'),
+      ...(body.proofKey === undefined ? {} : { proofKey: body.proofKey }),
+      expectedMutationEpoch: body.expectedMutationEpoch,
+      expectedRevision: body.expectedRevision,
+      advanceMutationEpoch: body.advanceMutationEpoch,
+    });
+    return Response.json(executionFenceReadingPayload(reading));
+  } catch (error) {
+    if (error instanceof DoStatusError)
+      return Response.json(
+        {
+          error: error.message,
+          ...(error.reason === undefined ? {} : { reason: error.reason }),
+        },
+        { status: error.status },
+      );
+    throw error;
+  }
+}
+
+async function fixtureInventory(
+  request: CloudflareFixtureRequest,
+  url: URL,
+  state: D1State,
+): Promise<Response> {
+  if (request.method !== 'GET')
+    return Response.json({ error: 'method not allowed' }, { status: 405 });
+  try {
+    const inventory = new DeploymentInventory(fixtureFenceDatabase(state));
+    const category = url.searchParams.get('category');
+    if (category === null || category === '')
+      return Response.json(inventory.index());
+    if (!isInventoryCategory(category))
+      throw new InvalidInventoryRequestError(
+        `unknown inventory category '${category}'`,
+      );
+    const rawLimit = url.searchParams.get('limit');
+    if (rawLimit !== null && !/^[0-9]{1,4}$/.test(rawLimit))
+      throw new InvalidInventoryRequestError(
+        'inventory limit must be a positive integer',
+      );
+    const cursor = url.searchParams.get('cursor');
+    return Response.json(
+      await inventory.read(category, {
+        ...(cursor === null ? {} : { cursor }),
+        ...(rawLimit === null ? {} : { limit: Number(rawLimit) }),
+      }),
+    );
+  } catch (error) {
+    if (error instanceof DoStatusError)
+      return Response.json(
+        {
+          error: error.message,
+          ...(error.reason === undefined ? {} : { reason: error.reason }),
+        },
+        { status: error.status },
+      );
+    throw error;
+  }
+}
+
+async function fixtureFenceOutcome(
+  state: D1State,
+  epoch: number,
+): Promise<Response> {
+  const reading = await new ExecutionFenceStore(
+    fixtureFenceDatabase(state),
+  ).read();
+  try {
+    assertMutationEpoch(reading, epoch);
+    return Response.json({ accepted: true });
+  } catch (error) {
+    if (error instanceof MutationEpochMismatchError)
+      return Response.json({
+        accepted: false,
+        code: error.reason.code,
+        classification: error.reason.classification,
+        status: error.status,
+      });
+    throw error;
+  }
+}
+
+async function fixtureFenceProbe(
+  request: CloudflareFixtureRequest,
+  state: D1State,
+  release: string | undefined,
+): Promise<Response> {
+  const body = request.body;
+  const epoch =
+    body && typeof body === 'object' && !Array.isArray(body)
+      ? Reflect.get(body, 'epoch')
+      : undefined;
+  if (!['current', 'missing', 'stale', 'future'].includes(epoch))
+    return Response.json({ error: 'invalid epoch label' }, { status: 400 });
+  const host = directTenantMutationEpoch(release);
+  const supplied =
+    epoch === 'missing'
+      ? undefined
+      : epoch === 'stale'
+        ? Math.max(0, host - 1)
+        : epoch === 'future'
+          ? host + 1
+          : host;
+  const reading = await new ExecutionFenceStore(
+    fixtureFenceDatabase(state),
+  ).read();
+  try {
+    assertMutationEpoch(reading, supplied);
+    return Response.json({ epoch, classification: 'accepted' });
+  } catch (error) {
+    if (error instanceof MutationEpochMismatchError)
+      return Response.json({
+        epoch,
+        classification: error.reason.classification,
+      });
+    throw error;
+  }
+}
 
 export async function createDirectReferenceHarness(
   policy: Readonly<{
@@ -241,7 +425,16 @@ export async function createDirectReferenceHarness(
       (role) => url.hostname === manifest.names.roles[role].routeHostname,
     );
     if (!role) throw new Error('unknown fixture application role');
-    if (
+    const adminRoute =
+      url.pathname === '/admin/execution-fence' ||
+      url.pathname === '/admin/inventory';
+    if (adminRoute) {
+      if (
+        request.headers.get('authorization') !==
+        `Bearer ${secrets[role].maintenanceAdmin}`
+      )
+        return new Response(null, { status: 401 });
+    } else if (
       request.headers.get('authorization') !==
       `Bearer ${secrets[role].application?.APP_PROBE_TOKEN}`
     )
@@ -273,6 +466,17 @@ export async function createDirectReferenceHarness(
       );
       return Response.json({ release, marker: rows[0]?.marker });
     }
+    if (url.pathname === '/admin/execution-fence')
+      return fixtureExecutionFence(request, database.d1);
+    if (url.pathname === '/admin/inventory')
+      return fixtureInventory(request, url, database.d1);
+    if (url.pathname === '/__direct/fence-mutate' && request.method === 'POST')
+      return fixtureFenceOutcome(
+        database.d1,
+        directTenantMutationEpoch(release),
+      );
+    if (url.pathname === '/__direct/fence-probe' && request.method === 'POST')
+      return fixtureFenceProbe(request, database.d1, release);
     const bucket = record.applicationResources?.find(
       (resource) => resource.name === 'PROBE_BUCKET',
     );
@@ -311,7 +515,11 @@ export async function createDirectReferenceHarness(
       application &&
       policy.applicationFetch &&
       (url.pathname === '/__direct/health' ||
-        url.pathname === '/__direct/object')
+        url.pathname === '/__direct/object' ||
+        url.pathname === '/__direct/fence-mutate' ||
+        url.pathname === '/__direct/fence-probe' ||
+        url.pathname === '/admin/execution-fence' ||
+        url.pathname === '/admin/inventory')
     )
       return policy.applicationFetch(request);
     const spec = specs.find(

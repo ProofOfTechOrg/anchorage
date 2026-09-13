@@ -45,6 +45,16 @@ function page(action) {
     invalid();
 }
 
+function counters(value) {
+  for (const counter of [value.expectedMutationEpoch, value.expectedRevision])
+    if (
+      !Number.isSafeInteger(counter) ||
+      counter < 0 ||
+      counter >= Number.MAX_SAFE_INTEGER
+    )
+      invalid();
+}
+
 function actionFromParsed(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) invalid();
   const kind = value.kind;
@@ -67,6 +77,35 @@ function actionFromParsed(value) {
         'object-delete',
       ]);
       break;
+    case 'tenant-fence': {
+      member(value.operation, [
+        'read',
+        'drain',
+        'reopen',
+        'inventory',
+        'mutate-current',
+        'probe-missing',
+        'probe-stale',
+        'probe-future',
+      ]);
+      const versioned =
+        value.operation === 'drain' || value.operation === 'reopen';
+      keys(
+        value,
+        versioned
+          ? [
+              'kind',
+              'role',
+              'operation',
+              'expectedMutationEpoch',
+              'expectedRevision',
+            ]
+          : ['kind', 'role', 'operation'],
+      );
+      member(value.role, ['a', 'b']);
+      if (versioned) counters(value);
+      break;
+    }
     case 'provision':
       keys(value, ['kind', 'role', 'release']);
       member(value.role, ['a', 'b', 'recovery']);

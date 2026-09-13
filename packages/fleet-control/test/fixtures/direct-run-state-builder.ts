@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { preflightDirectConformance } from '../../scripts/direct-credentialed-conformance-preflight.mjs';
 import {
   DIRECT_RESIDUAL_SURFACES,
+  DIRECT_SCENARIO_ARRAY_MAXIMA,
   DIRECT_SCENARIO_OPERATION_SLOTS,
   DIRECT_TEARDOWN_MAXIMA,
   type DirectBootstrapContext,
@@ -336,6 +337,39 @@ export function auditProof() {
 }
 
 export function maximalScenario(): MutableScenario {
+  const fenceReading = () => ({
+    state: 'migration-locked' as const,
+    mutationEpoch: MAX_COUNT,
+    requireMutationEpoch: false,
+    transitionRevision: MAX_COUNT,
+  });
+  const fenceTransition = () => ({
+    before: fenceReading(),
+    after: fenceReading(),
+    ordinal: 3,
+  });
+  const fenceSweep = () => ({
+    fence: fenceReading(),
+    categories: Array.from(
+      { length: DIRECT_SCENARIO_ARRAY_MAXIMA.inventoryCategories },
+      () => ({ category: MAX_ID, class: 'standing' as const, empty: false }),
+    ),
+    observedAt: MAX_COUNT,
+    ordinal: 3,
+  });
+  const fenceSweeps = () => ({
+    first: fenceSweep(),
+    second: fenceSweep(),
+    intervalMs: MAX_COUNT,
+  });
+  const fenceProbes = () => ({
+    current: 'accepted' as const,
+    missing: 'missing' as const,
+    stale: 'stale' as const,
+    future: 'future' as const,
+    mutationEpoch: MAX_COUNT,
+    ordinal: 3,
+  });
   const phaseCalls = Object.fromEntries(
     DIRECT_SCENARIO_PHASES.map((phase) => [phase, 0]),
   ) as MutableScenario['phaseCalls'];
@@ -448,6 +482,12 @@ export function maximalScenario(): MutableScenario {
       ],
       inventories: { before: inventoryProof(), after: inventoryProof() },
       audits: { before: auditProof(), after: auditProof() },
+      fence: {
+        drain: { a: fenceTransition(), b: fenceTransition() },
+        sweeps: { a: fenceSweeps(), b: fenceSweeps() },
+        reopen: { a: fenceTransition(), b: fenceTransition() },
+        probes: { a: fenceProbes(), b: fenceProbes() },
+      },
       restart: {
         process: { ...PROCESS },
         resumedProcess: { ...RESUMED },

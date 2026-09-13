@@ -8,6 +8,7 @@ import {
   type DirectReferenceEnvironment,
 } from './direct-reference-context.js';
 import type { DirectReferenceAction } from './direct-reference-contract.mjs';
+import { dispatchDirectFence } from './direct-reference-fence.js';
 import {
   observeDirectForce,
   recoverDirectForce,
@@ -207,6 +208,8 @@ async function dispatch(
     return recoverDirectForceResidual(context);
   if (action.kind === 'tenant-probe')
     return probeDirectTenant(context, manifest, action, signal);
+  if (action.kind === 'tenant-fence')
+    return dispatchDirectFence(context, manifest, action, signal);
   if ('role' in action)
     return dispatchDirectLifecycle(context, manifest, action, signal);
   if (

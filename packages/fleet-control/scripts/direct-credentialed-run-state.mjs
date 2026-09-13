@@ -30,7 +30,15 @@ const SUMMARY_FIELDS = [
   'release',
   'limit',
   'afterOrdinal',
+  'expectedMutationEpoch',
+  'expectedRevision',
 ];
+const NUMERIC_SUMMARY_FIELDS = new Set([
+  'limit',
+  'afterOrdinal',
+  'expectedMutationEpoch',
+  'expectedRevision',
+]);
 export const DIRECT_RUN_MAX_JOURNAL_BYTES = 256 * 1024;
 export const DIRECT_SCENARIO_ARRAY_MAXIMA = Object.freeze({
   health: 5,
@@ -39,6 +47,7 @@ export const DIRECT_SCENARIO_ARRAY_MAXIMA = Object.freeze({
   auditFindings: 16,
   footprintVersionIds: 8,
   deploymentVersions: 2,
+  inventoryCategories: 9,
   inventory: Object.freeze({
     databaseIds: 2,
     namespaceIds: 4,
@@ -386,6 +395,7 @@ const scenarioEnum =
   };
 const nullable = (schema) => (value) =>
   value === null ? null : scenarioShape(value, schema);
+const scenarioFlag = scenarioEnum(true, false);
 const boundedArray = (schema, max) => {
   if (!Number.isSafeInteger(max) || max < 0) invalid();
   return (value) => {
@@ -613,10 +623,9 @@ const callShape = {
       invalid();
     const result = {};
     for (const [key, field] of Object.entries(value))
-      result[key] =
-        key === 'limit' || key === 'afterOrdinal'
-          ? scenarioNumber(field)
-          : scenarioId(field);
+      result[key] = NUMERIC_SUMMARY_FIELDS.has(key)
+        ? scenarioNumber(field)
+        : scenarioId(field);
     if (typeof value.kind !== 'string') invalid();
     return Object.freeze(result);
   },
@@ -739,6 +748,45 @@ const exportVerificationsShape = boundedArray(
   exportShape,
   DIRECT_SCENARIO_ARRAY_MAXIMA.exportVerifications,
 );
+const categoryShape = {
+  category: scenarioId,
+  class: scenarioEnum('work', 'standing'),
+  empty: scenarioFlag,
+};
+const sweepCategoriesShape = boundedArray(
+  categoryShape,
+  DIRECT_SCENARIO_ARRAY_MAXIMA.inventoryCategories,
+);
+const fenceReadingShape = {
+  state: scenarioEnum('open', 'draining', 'migration-locked', 'proof-only'),
+  mutationEpoch: scenarioNumber,
+  requireMutationEpoch: scenarioFlag,
+  transitionRevision: scenarioNumber,
+};
+const fenceTransitionShape = {
+  before: fenceReadingShape,
+  after: nullable(fenceReadingShape),
+  ordinal: nullable(scenarioNumber),
+};
+const fenceSweepShape = {
+  fence: fenceReadingShape,
+  categories: sweepCategoriesShape,
+  observedAt: scenarioNumber,
+  ordinal: scenarioNumber,
+};
+const fenceSweepsShape = {
+  first: fenceSweepShape,
+  second: nullable(fenceSweepShape),
+  intervalMs: nullable(scenarioNumber),
+};
+const fenceProbesShape = {
+  current: 'accepted',
+  missing: 'missing',
+  stale: 'stale',
+  future: 'future',
+  mutationEpoch: scenarioNumber,
+  ordinal: scenarioNumber,
+};
 function decodeScenario(value, invocationCount) {
   if (
     value &&
@@ -801,6 +849,24 @@ function decodeScenario(value, invocationCount) {
         after: nullable(inventoryShape),
       },
       audits: { before: nullable(auditShape), after: nullable(auditShape) },
+      fence: {
+        drain: {
+          a: nullable(fenceTransitionShape),
+          b: nullable(fenceTransitionShape),
+        },
+        sweeps: {
+          a: nullable(fenceSweepsShape),
+          b: nullable(fenceSweepsShape),
+        },
+        reopen: {
+          a: nullable(fenceTransitionShape),
+          b: nullable(fenceTransitionShape),
+        },
+        probes: {
+          a: nullable(fenceProbesShape),
+          b: nullable(fenceProbesShape),
+        },
+      },
       restart: nullable({
         process: processShape,
         resumedProcess: nullable(processShape),
@@ -927,12 +993,48 @@ function validateScenarioProofs(state, invocationCount) {
   if (past('force-observe'))
     need(proof.force && proof.recoveryExportAbsent.afterOrdinal > 0);
   if (past('recover-force-residual')) need(proof.residual);
+  if (past('fence-drain'))
+    need(
+      ['a', 'b'].every(
+        (role) =>
+          proof.fence.drain[role]?.after &&
+          proof.fence.drain[role].ordinal !== null &&
+          proof.fence.sweeps[role]?.first,
+      ),
+    );
+  if (past('fence-reopen'))
+    need(
+      ['a', 'b'].every(
+        (role) =>
+          proof.fence.sweeps[role]?.second &&
+          proof.fence.sweeps[role].intervalMs !== null &&
+          proof.fence.reopen[role]?.after &&
+          proof.fence.reopen[role].ordinal !== null,
+      ),
+    );
+  if (past('fence-proofs'))
+    need(['a', 'b'].every((role) => proof.fence.probes[role]));
   for (const ordinal of [
     state.reconciledOrdinal,
     ...Object.values(proof.objectDeletions),
     ...Object.values(proof.recoveryExportAbsent),
     ...proof.health.map((entry) => entry.ordinal),
     ...proof.steps.map((entry) => entry.ordinal),
+    ...Object.values(proof.fence.drain).flatMap((entry) =>
+      entry && entry.ordinal !== null ? [entry.ordinal] : [],
+    ),
+    ...Object.values(proof.fence.reopen).flatMap((entry) =>
+      entry && entry.ordinal !== null ? [entry.ordinal] : [],
+    ),
+    ...Object.values(proof.fence.probes).flatMap((entry) =>
+      entry ? [entry.ordinal] : [],
+    ),
+    ...Object.values(proof.fence.sweeps).flatMap((entry) =>
+      entry ? [entry.first.ordinal] : [],
+    ),
+    ...Object.values(proof.fence.sweeps).flatMap((entry) =>
+      entry && entry.second !== null ? [entry.second.ordinal] : [],
+    ),
   ])
     if (ordinal !== null) need(ordinal <= invocationCount);
   if (proof.restart) {
@@ -1583,6 +1685,21 @@ function runJournal(directory, directoryHandle, base, lock, initial) {
               );
             }
           }
+          for (const [group, later] of [
+            ['drain', ['after', 'ordinal']],
+            ['reopen', ['after', 'ordinal']],
+            ['sweeps', ['second', 'intervalMs']],
+            ['probes', []],
+          ])
+            for (const role of ['a', 'b']) {
+              const entry = previous.proofs.fence[group][role];
+              if (entry === null) continue;
+              const fresh = scenario.proofs.fence[group][role];
+              if (fresh === null) invalid();
+              for (const [key, expected] of Object.entries(entry))
+                if (!later.includes(key) || expected !== null)
+                  equalShape(fresh[key], expected);
+            }
           for (const role of ['a', 'b']) {
             if (previous.proofs.exports[role]) {
               const { sourceInvocationOrdinal, ...proof } =

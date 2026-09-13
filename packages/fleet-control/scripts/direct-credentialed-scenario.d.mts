@@ -79,6 +79,54 @@ type ScenarioAudit = FleetAuditResultRef &
       detailSha256: string;
     }>[];
   }>;
+interface ScenarioFenceReading {
+  readonly state: 'open' | 'draining' | 'migration-locked' | 'proof-only';
+  readonly mutationEpoch: number;
+  readonly requireMutationEpoch: boolean;
+  readonly transitionRevision: number;
+}
+interface ScenarioFenceTransition {
+  readonly before: ScenarioFenceReading;
+  readonly after: ScenarioFenceReading | null;
+  readonly ordinal: number | null;
+}
+interface ScenarioFenceSweep {
+  readonly fence: ScenarioFenceReading;
+  readonly categories: readonly Readonly<{
+    category: string;
+    class: 'work' | 'standing';
+    empty: boolean;
+  }>[];
+  readonly observedAt: number;
+  readonly ordinal: number;
+}
+export interface DirectScenarioFenceProofs {
+  readonly drain: Readonly<Record<NormalRole, ScenarioFenceTransition | null>>;
+  readonly sweeps: Readonly<
+    Record<
+      NormalRole,
+      Readonly<{
+        first: ScenarioFenceSweep;
+        second: ScenarioFenceSweep | null;
+        intervalMs: number | null;
+      }> | null
+    >
+  >;
+  readonly reopen: Readonly<Record<NormalRole, ScenarioFenceTransition | null>>;
+  readonly probes: Readonly<
+    Record<
+      NormalRole,
+      Readonly<{
+        current: 'accepted';
+        missing: 'missing';
+        stale: 'stale';
+        future: 'future';
+        mutationEpoch: number;
+        ordinal: number;
+      }> | null
+    >
+  >;
+}
 export interface DirectScenarioProofs {
   readonly initial: Readonly<
     Record<Role, DirectWorkerVersionObservation | null>
@@ -107,6 +155,7 @@ export interface DirectScenarioProofs {
     Record<'before' | 'after', ScenarioInventory | null>
   >;
   readonly audits: Readonly<Record<'before' | 'after', ScenarioAudit | null>>;
+  readonly fence: DirectScenarioFenceProofs;
   readonly restart: Readonly<{
     process: ScenarioProcess;
     resumedProcess: ScenarioProcess | null;

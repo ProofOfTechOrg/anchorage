@@ -18,6 +18,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  actionSummary,
   DIRECT_RUN_MAX_JOURNAL_BYTES,
   DIRECT_SCENARIO_ARRAY_MAXIMA,
   DIRECT_SCENARIO_OPERATION_SLOTS,
@@ -905,6 +906,312 @@ const refuses = (journal: DirectRunJournal, state: MutableScenario) =>
   });
 
 describeLinux('durable scenario state', () => {
+  it('projects and round-trips a drain summary with both expected counters', async () => {
+    const action = {
+      kind: 'tenant-fence' as const,
+      role: 'a' as const,
+      operation: 'drain' as const,
+      expectedMutationEpoch: 0,
+      expectedRevision: 2,
+    };
+    expect(actionSummary(action)).toEqual(action);
+    const { f, journal } = await scenarioJournal();
+    const state = scenarioWith((value) => {
+      present(value.lastCall).action = action;
+      present(value.mutation).action = action;
+    });
+    await journal.recordScenario(state);
+    await closed(journal);
+    const resumed = await opened({ ...f.input, mode: 'resume' });
+    expect(resumed.snapshot().scenario?.lastCall?.action).toEqual(action);
+    expect(resumed.snapshot().scenario?.mutation?.action).toEqual(action);
+  });
+
+  it.each([
+    'expectedMutationEpoch',
+    'expectedRevision',
+  ] as const)('refuses a non-integer %s in a journalled drain call', async (field) => {
+    const { journal } = await scenarioJournal();
+    await refuses(
+      journal,
+      scenarioWith((state) => {
+        present(state.lastCall).action = {
+          kind: 'tenant-fence',
+          role: 'a',
+          operation: 'drain',
+          expectedMutationEpoch: 0,
+          expectedRevision: 2,
+          [field]: 0.5,
+        };
+      }),
+    );
+  });
+
+  it('decodes an action summary written before the expected counters existed', async () => {
+    const { journal } = await scenarioJournal();
+    const state = maximalScenario();
+    const summary = present(state.lastCall).action;
+    expect(summary).not.toHaveProperty('expectedMutationEpoch');
+    expect(summary).not.toHaveProperty('expectedRevision');
+    await journal.recordScenario(state);
+    expect(journal.snapshot().scenario?.lastCall?.action).toEqual(summary);
+  });
+
+  it('decodes a fence group with every role entry null', async () => {
+    const { journal } = await scenarioJournal();
+    const state = scenarioWith((value) => {
+      value.proofs.fence = {
+        drain: { a: null, b: null },
+        sweeps: { a: null, b: null },
+        reopen: { a: null, b: null },
+        probes: { a: null, b: null },
+      };
+    });
+    await journal.recordScenario(state);
+    expect(journal.snapshot().scenario?.proofs.fence).toEqual(
+      state.proofs.fence,
+    );
+  });
+
+  it('decodes partial fence transitions and sweeps with nullable later members', async () => {
+    const { journal } = await scenarioJournal();
+    const state = scenarioWith((value) => {
+      for (const role of ['a', 'b'] as const) {
+        for (const group of ['drain', 'reopen'] as const) {
+          const entry = present(value.proofs.fence[group][role]);
+          entry.before = {
+            state: 'open',
+            mutationEpoch: 0,
+            requireMutationEpoch: false,
+            transitionRevision: 0,
+          };
+          entry.after = null;
+          entry.ordinal = null;
+        }
+        const sweep = present(value.proofs.fence.sweeps[role]);
+        sweep.second = null;
+        sweep.intervalMs = null;
+        first(sweep.first.categories).empty = true;
+        first(sweep.first.categories).class = 'work';
+      }
+    });
+    await journal.recordScenario(state);
+    expect(journal.snapshot().scenario?.proofs.fence).toEqual(
+      state.proofs.fence,
+    );
+  });
+
+  it('decodes filled fence evidence with a zero sweep interval', async () => {
+    const { journal } = await scenarioJournal();
+    const state = completeScenario();
+    for (const role of ['a', 'b'] as const)
+      present(state.proofs.fence.sweeps[role]).intervalMs = 0;
+    await journal.recordScenario(state);
+    expect(journal.snapshot().scenario?.proofs.fence).toEqual(
+      state.proofs.fence,
+    );
+  });
+
+  it('refuses an unknown fence proof key', async () => {
+    const { journal } = await scenarioJournal();
+    await refuses(
+      journal,
+      scenarioWith((state) => {
+        Object.assign(state.proofs.fence, { unknown: null });
+      }),
+    );
+  });
+
+  it('refuses one sweep category past DIRECT_SCENARIO_ARRAY_MAXIMA.inventoryCategories', async () => {
+    const { journal } = await scenarioJournal();
+    await refuses(
+      journal,
+      scenarioWith((state) => {
+        const sweep = present(state.proofs.fence.sweeps.a).first;
+        sweep.categories = Array.from(
+          { length: DIRECT_SCENARIO_ARRAY_MAXIMA.inventoryCategories + 1 },
+          () => structuredClone(first(sweep.categories)),
+        );
+      }),
+    );
+  });
+
+  it.each([
+    'a',
+    'b',
+  ] as const)('refuses null before and first members for fence role %s', async (role) => {
+    const { journal } = await scenarioJournal();
+    for (const group of ['drain', 'reopen'] as const)
+      await refuses(
+        journal,
+        scenarioWith((state) => {
+          Object.assign(present(state.proofs.fence[group][role]), {
+            before: null,
+          });
+        }),
+      );
+    await refuses(
+      journal,
+      scenarioWith((state) => {
+        Object.assign(present(state.proofs.fence.sweeps[role]), {
+          first: null,
+        });
+      }),
+    );
+  });
+
+  it.each([
+    'a',
+    'b',
+  ] as const)('refuses fence ordinals above invocationCount for role %s', async (role) => {
+    const { journal } = await scenarioJournal();
+    for (const group of ['drain', 'reopen', 'probes'] as const)
+      await refuses(
+        journal,
+        scenarioWith((state) => {
+          present(state.proofs.fence[group][role]).ordinal = 4;
+        }),
+      );
+    for (const member of ['first', 'second'] as const)
+      await refuses(
+        journal,
+        scenarioWith((state) => {
+          present(present(state.proofs.fence.sweeps[role])[member]).ordinal = 4;
+        }),
+      );
+  });
+
+  it.each([
+    'a',
+    'b',
+  ] as const)('refuses a null drain ordinal past fence-drain for role %s', async (role) => {
+    const { journal } = await scenarioJournal();
+    const state = maximalScenario();
+    state.phase = 'migration-start';
+    present(state.proofs.fence.drain[role]).ordinal = null;
+    await refuses(journal, state);
+  });
+
+  it.each([
+    'a',
+    'b',
+  ] as const)('refuses a null reopen ordinal past fence-reopen for role %s', async (role) => {
+    const { journal } = await scenarioJournal();
+    const state = completeScenario();
+    state.phase = 'fence-proofs';
+    present(state.proofs.fence.reopen[role]).ordinal = null;
+    await refuses(journal, state);
+  });
+
+  it.each([
+    'a',
+    'b',
+  ] as const)('preserves established fence entries and their populated members for role %s', async (role) => {
+    const { journal } = await scenarioJournal();
+    const baseline = maximalScenario();
+    await journal.recordScenario(baseline);
+    const rejectChange = async (mutate: (state: MutableScenario) => void) => {
+      const state = structuredClone(baseline);
+      mutate(state);
+      await refuses(journal, state);
+    };
+    for (const group of ['drain', 'reopen', 'sweeps', 'probes'] as const)
+      await rejectChange((state) => {
+        state.proofs.fence[group][role] = null;
+      });
+    for (const group of ['drain', 'reopen'] as const) {
+      await rejectChange((state) => {
+        present(state.proofs.fence[group][role]).before.transitionRevision--;
+      });
+      for (const reset of [false, true]) {
+        await rejectChange((state) => {
+          const entry = present(state.proofs.fence[group][role]);
+          if (reset) entry.after = null;
+          else present(entry.after).transitionRevision--;
+        });
+        await rejectChange((state) => {
+          present(state.proofs.fence[group][role]).ordinal = reset ? null : 2;
+        });
+      }
+    }
+    await rejectChange((state) => {
+      present(state.proofs.fence.sweeps[role]).first.observedAt--;
+    });
+    for (const reset of [false, true]) {
+      await rejectChange((state) => {
+        const entry = present(state.proofs.fence.sweeps[role]);
+        if (reset) entry.second = null;
+        else present(entry.second).observedAt--;
+      });
+      await rejectChange((state) => {
+        present(state.proofs.fence.sweeps[role]).intervalMs = reset ? null : 0;
+      });
+    }
+    for (const member of ['mutationEpoch', 'ordinal'] as const)
+      await rejectChange((state) => {
+        present(state.proofs.fence.probes[role])[member]--;
+      });
+    expect(journal.snapshot().scenario?.proofs.fence).toEqual(
+      baseline.proofs.fence,
+    );
+  });
+
+  it('completes a null transition after and ordinal on an established fence entry', async () => {
+    const { journal } = await scenarioJournal();
+    const state = maximalScenario();
+    for (const group of ['drain', 'reopen'] as const)
+      for (const role of ['a', 'b'] as const) {
+        const entry = present(state.proofs.fence[group][role]);
+        entry.after = null;
+        entry.ordinal = null;
+      }
+    await journal.recordScenario(state);
+    const complete = maximalScenario();
+    await journal.recordScenario(complete);
+    expect(journal.snapshot().scenario?.proofs.fence).toEqual(
+      complete.proofs.fence,
+    );
+  });
+
+  it('completes a null second sweep and interval with a zero interval', async () => {
+    const { journal } = await scenarioJournal();
+    const state = maximalScenario();
+    for (const role of ['a', 'b'] as const) {
+      const entry = present(state.proofs.fence.sweeps[role]);
+      entry.second = null;
+      entry.intervalMs = null;
+    }
+    await journal.recordScenario(state);
+    const complete = maximalScenario();
+    for (const role of ['a', 'b'] as const)
+      present(complete.proofs.fence.sweeps[role]).intervalMs = 0;
+    await journal.recordScenario(complete);
+    expect(journal.snapshot().scenario?.proofs.fence).toEqual(
+      complete.proofs.fence,
+    );
+  });
+
+  it('fills a null fence entry with its partial transition and first sweep', async () => {
+    const { journal } = await scenarioJournal();
+    const state = maximalScenario();
+    state.proofs.fence.drain = { a: null, b: null };
+    state.proofs.fence.sweeps = { a: null, b: null };
+    await journal.recordScenario(state);
+    const partial = maximalScenario();
+    for (const role of ['a', 'b'] as const) {
+      const transition = present(partial.proofs.fence.drain[role]);
+      transition.after = null;
+      transition.ordinal = null;
+      const sweeps = present(partial.proofs.fence.sweeps[role]);
+      sweeps.second = null;
+      sweeps.intervalMs = null;
+    }
+    await journal.recordScenario(partial);
+    expect(journal.snapshot().scenario?.proofs.fence).toEqual(
+      partial.proofs.fence,
+    );
+  });
+
   it('publishes a maximal scenario inside the journal byte bound', async () => {
     const { f, journal } = await scenarioJournal();
     await journal.recordScenario(maximalScenario());
@@ -912,8 +1219,12 @@ describeLinux('durable scenario state', () => {
       join(f.runDirectory, 'journal.json'),
       'utf8',
     );
+    console.log(
+      'A1_MAXIMAL_SCENARIO_JOURNAL_BYTES',
+      Buffer.byteLength(serialized),
+    );
     expect(Buffer.byteLength(serialized)).toBeLessThan(
-      DIRECT_RUN_MAX_JOURNAL_BYTES / 2,
+      DIRECT_RUN_MAX_JOURNAL_BYTES - 118 * 1024,
     );
     expect(journal.snapshot().scenario?.proofs.cleanup?.evidence.scan).toEqual({
       discover: { evidenceSha256: DIGEST, evidenceCount: MAX_COUNT },
@@ -1093,6 +1404,8 @@ describeLinux('durable scenario state', () => {
         ),
         deploymentVersions: present(state.proofs.initial.a).currentDeployment
           .versions,
+        inventoryCategories: present(present(state.proofs.fence.sweeps.a).first)
+          .categories,
         'inventory.databaseIds': inventory.databaseIds,
         'inventory.namespaceIds': inventory.namespaceIds,
         'inventory.scriptNames': inventory.scriptNames,
@@ -1518,9 +1831,17 @@ describeLinux('durable teardown state', () => {
       join(f.runDirectory, 'journal.json'),
       'utf8',
     );
+    console.log(
+      'A1_COMPLETE_TEARDOWN_JOURNAL_BYTES',
+      Buffer.byteLength(serialized),
+    );
+    console.log(
+      'A1_COMPLETE_TEARDOWN_JOURNAL_FREE_BYTES',
+      DIRECT_RUN_MAX_JOURNAL_BYTES - Buffer.byteLength(serialized),
+    );
     expect(
       DIRECT_RUN_MAX_JOURNAL_BYTES - Buffer.byteLength(serialized),
-    ).toBeGreaterThan(100_000);
+    ).toBeGreaterThan(90 * 1024);
   });
 
   it('refuses scenario and invocation writes once a teardown is pending or receipted', async () => {

@@ -30,7 +30,7 @@ import { recordDirectResource } from './direct-reference-observations.js';
 
 type LifecycleAction = Exclude<
   Extract<DirectReferenceAction, { role: DirectFixtureRole }>,
-  { kind: 'tenant-probe' }
+  { kind: 'tenant-probe' | 'tenant-fence' }
 >;
 type CleanupSlot = `cleanup-${DirectFixtureRole}` | 'cleanup-recovery-initial';
 

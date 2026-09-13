@@ -11,11 +11,14 @@ export const DIRECT_SCENARIO_INVOCATION_BUDGET: Readonly<{
   'provision-b': DirectScenarioPhaseBudget;
   'inventory-before': DirectScenarioPhaseBudget;
   'audit-before': DirectScenarioPhaseBudget;
+  'fence-drain': DirectScenarioPhaseBudget;
   'migration-start': DirectScenarioPhaseBudget;
   'migration-interrupt': DirectScenarioPhaseBudget;
   'migration-restart': DirectScenarioPhaseBudget;
   migration: DirectScenarioPhaseBudget;
   'post-migration': DirectScenarioPhaseBudget;
+  'fence-reopen': DirectScenarioPhaseBudget;
+  'fence-proofs': DirectScenarioPhaseBudget;
   'inventory-after': DirectScenarioPhaseBudget;
   'audit-after': DirectScenarioPhaseBudget;
   'failed-recovery': DirectScenarioPhaseBudget;

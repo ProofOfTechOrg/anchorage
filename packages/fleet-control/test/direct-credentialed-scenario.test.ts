@@ -3,7 +3,11 @@
 import { spawn } from 'node:child_process';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import {
+  EXECUTION_FENCE_ROW_ID,
+  EXECUTION_FENCE_TABLE,
+} from '@proofoftech/flowsafe/deployment-identity-protocol';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   createDirectInvocationClient,
   type DirectInvocationClient,
@@ -540,7 +544,10 @@ async function fixture(
 
 async function childResume(
   f: Awaited<ReturnType<typeof fixture>>,
-  fault?: 'export-fsync',
+  fault?:
+    | 'export-fsync'
+    | 'fence-reopen-after-settle'
+    | 'fence-drain-role-split',
 ) {
   await f.local.journal.close();
   const script = join(f.local.directory, 'resume.mjs');
@@ -558,10 +565,48 @@ import {syncBuiltinESMExports} from 'node:module';
 ${fault === 'export-fsync' ? `const realOpen=fs.open;let injected=false;fs.open=async(...args)=>{const handle=await realOpen(...args);if(String(args[0]).includes('/.journal-')){const realWrite=handle.writeFile.bind(handle),realSync=handle.sync.bind(handle);let proof=false;handle.writeFile=async(value,...rest)=>{const state=JSON.parse(String(value));proof=Boolean(state.scenario?.proofs.exports.a);return realWrite(value,...rest);};handle.sync=async()=>{if(proof&&!injected){injected=true;console.log('SCENARIO_FAULT export-fsync');throw new Error('fixture proof fsync failure');}return realSync();};}return handle;};syncBuiltinESMExports();` : ''}
 const prepared=await preflightDirectConformance({configPath:${JSON.stringify(f.local.configPath)}});
 const journal=await openDirectRunState({configPath:${JSON.stringify(f.local.configPath)},prepared,accountId:'account',mode:'resume'});
+${
+  fault === 'fence-reopen-after-settle'
+    ? `const faulted = Object.freeze({
+  ...journal,
+  recordScenario: async (...args) => {
+    const result = await journal.recordScenario(...args);
+    const [scenario] = args;
+    if (scenario.phase === 'fence-reopen' &&
+        scenario.mutation?.outcome === 'returned' &&
+        scenario.mutation?.action?.kind === 'tenant-fence' &&
+        scenario.mutation?.action?.operation === 'reopen' &&
+        scenario.mutation?.action?.role === 'a' &&
+        scenario.proofs.fence.reopen.a?.after === null) {
+      console.log('SCENARIO_FAULT fence-reopen-after-settle');
+      process.exit(0);
+    }
+    return result;
+  },
+});`
+    : fault === 'fence-drain-role-split'
+      ? `const faulted = Object.freeze({
+  ...journal,
+  recordScenario: async (...args) => {
+    const result = await journal.recordScenario(...args);
+    const [scenario] = args;
+    if (scenario.phase === 'fence-drain' &&
+        scenario.proofs.fence.drain.a?.after != null &&
+        scenario.proofs.fence.sweeps.a !== null &&
+        scenario.proofs.fence.drain.b?.after === null &&
+        scenario.proofs.fence.drain.b?.ordinal === null) {
+      console.log('SCENARIO_FAULT fence-drain-role-split');
+      process.exit(0);
+    }
+    return result;
+  },
+});`
+      : 'const faulted = journal;'
+}
 const originalFetch=globalThis.fetch;
 const fetch=async(input,init)=>{const request=new Request(input,init);const url=new URL(request.url);if(url.origin!=='https://api.cloudflare.com'&&url.origin!==${JSON.stringify(`https://${f.local.prepared.names.referenceWorker}.attested-account.workers.dev`)})throw new Error('unexpected child origin');const headers=new Headers(request.headers);headers.set('X-Direct-Fixture-Url',request.url);return originalFetch(${JSON.stringify(f.native.bridgeUrl)},{method:request.method,headers,body:request.body,signal:request.signal,redirect:'manual',duplex:'half'});};
 globalThis.fetch=async()=>{throw new Error('unexpected child network');};
-try {const invocation=createDirectInvocationClient({prepared,journal,accountWorkersDevSubdomain:'attested-account',invokeSecret:'inert-invoke',fetch});const result=await runDirectCredentialedScenario({prepared,journal,invocation,apiToken:'inert-provider-token',fetch});console.log('SCENARIO_RESULT '+JSON.stringify(result));}finally{await journal.close();}
+try {const invocation=createDirectInvocationClient({prepared,journal: faulted,accountWorkersDevSubdomain:'attested-account',invokeSecret:'inert-invoke',fetch});const result=await runDirectCredentialedScenario({prepared,journal: faulted,invocation,apiToken:'inert-provider-token',fetch});console.log('SCENARIO_RESULT '+JSON.stringify(result));}finally{await faulted.close();}
 `,
   );
   const child = spawn(process.execPath, [script], {
@@ -593,7 +638,14 @@ try {const invocation=createDirectInvocationClient({prepared,journal,accountWork
   const line = stdout
     .split('\n')
     .find((line) => line.startsWith('SCENARIO_RESULT '));
-  if (!line) throw new Error(`child returned no result: ${stdout}`);
+  if (!line) {
+    if (
+      fault !== 'fence-reopen-after-settle' &&
+      fault !== 'fence-drain-role-split'
+    )
+      throw new Error(`child returned no result: ${stdout}`);
+    return { result: null, stdout, stderr };
+  }
   return {
     result: JSON.parse(
       line.slice('SCENARIO_RESULT '.length),
@@ -642,12 +694,62 @@ describe.sequential('fixed Node scenario through native reference dispatch', {
         'utf8',
       ),
     }).toMatchObject({ result: { status: 'complete' }, bridgeErrors: [] });
-    if (child.result.status !== 'complete')
+    if (child.result?.status !== 'complete')
       throw new Error('scenario did not complete');
     const proofs = child.result.facts;
     expect(proofs.restart?.process.pid).toBe(process.pid);
     expect(proofs.restart?.resumedProcess?.pid).not.toBe(process.pid);
     for (const role of ['a', 'b'] as const) {
+      const fence = proofs.fence;
+      expect(fence.drain[role]).toMatchObject({
+        before: {
+          state: 'open',
+          mutationEpoch: 0,
+          requireMutationEpoch: false,
+        },
+        after: {
+          state: 'draining',
+          mutationEpoch: 1,
+          requireMutationEpoch: true,
+        },
+        ordinal: expect.any(Number),
+      });
+      expect(fence.reopen[role]).toMatchObject({
+        before: {
+          state: 'draining',
+          mutationEpoch: 1,
+          requireMutationEpoch: true,
+        },
+        after: { state: 'open', mutationEpoch: 1, requireMutationEpoch: true },
+        ordinal: expect.any(Number),
+      });
+      expect(fence.sweeps[role]).toMatchObject({
+        first: { fence: { state: 'draining' }, ordinal: expect.any(Number) },
+        second: { fence: { state: 'draining' }, ordinal: expect.any(Number) },
+        intervalMs: expect.any(Number),
+      });
+      for (const sweep of [
+        fence.sweeps[role]?.first,
+        fence.sweeps[role]?.second,
+      ]) {
+        expect(sweep).not.toBeNull();
+        expect(
+          sweep?.categories.every(
+            (entry) => entry.class !== 'work' || entry.empty,
+          ),
+        ).toBe(true);
+      }
+      expect(fence.probes[role]).toEqual({
+        current: 'accepted',
+        missing: 'missing',
+        stale: 'stale',
+        future: 'future',
+        mutationEpoch: 1,
+        ordinal: expect.any(Number),
+      });
+      process.stdout.write(
+        `A1_SWEEP_INTERVAL ${role} ${fence.sweeps[role]?.intervalMs}\n`,
+      );
       expect(proofs.initial[role]?.trafficPercentage).toBe(100);
       expect(proofs.candidate[role]?.trafficPercentage).toBe(0);
       expect(proofs.final[role]?.trafficPercentage).toBe(100);
@@ -698,6 +800,10 @@ describe.sequential('fixed Node scenario through native reference dispatch', {
       DIRECT_SCENARIO_INVOCATION_BUDGET;
     const phaseCalls: Record<string, number> =
       JSON.parse(serialized).scenario.phaseCalls;
+    for (const phase of ['fence-drain', 'fence-reopen', 'fence-proofs']) {
+      expect(phaseCalls[phase]).toBe(9);
+      process.stdout.write(`A1_PHASE_CALLS ${phase} ${phaseCalls[phase]}\n`);
+    }
     expect(
       Object.entries(phaseCalls).filter(
         ([phase, calls]) => calls > (budget[phase]?.ceiling ?? 0),
@@ -707,6 +813,317 @@ describe.sequential('fixed Node scenario through native reference dispatch', {
     const resumed = await resume(f);
     expect((await runDirectCredentialedScenario(f.input(resumed))).status).toBe(
       'complete',
+    );
+  });
+});
+
+describe.sequential('fence composition through native reference dispatch', {
+  timeout: 660_000,
+}, () => {
+  it.each([
+    ['reopen', 'draining', 1],
+    ['reopen', 'open', 2],
+    ['drain', 'open', 1],
+  ] as const)('refuses a %s conflict at %s epoch %i without a later mutation', async (operation, state, mutationEpoch) => {
+    let armed = true;
+    let mutations: string[] | undefined;
+    const f = await fixture({
+      nodeResponse: async (_request, response) => {
+        if (
+          !armed ||
+          !response.headers.get('content-type')?.includes('application/json')
+        )
+          return response;
+        const value = (await response.clone().json()) as {
+          action?: string;
+          result?: {
+            ok?: boolean;
+            after?: { state: string; transitionRevision: number };
+          };
+        };
+        if (
+          value.action !== 'tenant-fence' ||
+          value.result?.after?.state !==
+            (operation === 'drain' ? 'draining' : 'open')
+        )
+          return response;
+        armed = false;
+        mutations = [...f.native.world.mutationLog];
+        return Response.json(
+          {
+            ...value,
+            result: {
+              ok: false,
+              reason: {
+                code: 'FENCE_CAS_CONFLICT',
+                state,
+                mutationEpoch,
+                requireMutationEpoch: true,
+                transitionRevision: value.result.after.transitionRevision,
+                conflict: 'expectation-mismatch',
+              },
+            },
+          },
+          { status: response.status, headers: response.headers },
+        );
+      },
+    });
+    const first = await runDirectCredentialedScenario(f.input());
+    if (operation === 'reopen') {
+      expect(first).toEqual({ status: 'restart-required' });
+      expect((await childResume(f)).result).toMatchObject({
+        status: 'failed',
+        reason: 'observation-mismatch',
+        phase: 'fence-reopen',
+      });
+    } else {
+      expect(first).toMatchObject({
+        status: 'failed',
+        reason: 'observation-mismatch',
+        phase: 'fence-drain',
+      });
+    }
+    expect(armed).toBe(false);
+    const disk = JSON.parse(
+      await readFile(join(f.local.journal.directory, 'journal.json'), 'utf8'),
+    );
+    expect(disk.scenario.failure.code).toBe('observation-mismatch');
+    expect(f.native.world.mutationLog).toEqual(mutations);
+  });
+
+  it.each([
+    'drain',
+    'reopen',
+  ] as const)('accepts a flattened %s conflict with an intervening revision', async (operation) => {
+    let armed = true;
+    const f = await fixture({
+      nodeResponse: async (_request, response) => {
+        if (
+          !armed ||
+          !response.headers.get('content-type')?.includes('application/json')
+        )
+          return response;
+        const value = (await response.clone().json()) as {
+          action?: string;
+          result?: {
+            after?: {
+              state: string;
+              mutationEpoch: number;
+              requireMutationEpoch: boolean;
+              transitionRevision: number;
+            };
+          };
+        };
+        if (
+          value.action !== 'tenant-fence' ||
+          value.result?.after?.state !==
+            (operation === 'drain' ? 'draining' : 'open')
+        )
+          return response;
+        armed = false;
+        return Response.json(
+          {
+            ...value,
+            result: {
+              ok: false,
+              reason: {
+                code: 'FENCE_CAS_CONFLICT',
+                ...value.result.after,
+                transitionRevision: value.result.after.transitionRevision + 1,
+                conflict: 'expectation-mismatch',
+              },
+            },
+          },
+          { status: response.status, headers: response.headers },
+        );
+      },
+    });
+    expect(await runDirectCredentialedScenario(f.input())).toEqual({
+      status: 'restart-required',
+    });
+    const child = await childResume(f);
+    expect(child.result).toMatchObject({ status: 'complete' });
+    expect(armed).toBe(false);
+    if (child.result?.status !== 'complete')
+      throw new Error('scenario did not complete');
+    const entry = child.result.facts.fence[operation].a;
+    expect(entry?.after).toEqual({
+      state: operation === 'drain' ? 'draining' : 'open',
+      mutationEpoch: 1,
+      requireMutationEpoch: true,
+      transitionRevision: (entry?.before.transitionRevision ?? -1) + 2,
+    });
+    if (operation === 'drain')
+      expect(child.result.facts.fence.reopen.a?.before.transitionRevision).toBe(
+        (entry?.before.transitionRevision ?? -1) + 1,
+      );
+  });
+
+  it('replays a settled reopen body and preserves the saved draining sweep', async () => {
+    const f = await fixture();
+    expect(await runDirectCredentialedScenario(f.input())).toEqual({
+      status: 'restart-required',
+    });
+    await f.native.reload();
+    const hostname = f.local.prepared.names.roles.a.routeHostname;
+    const bodies: Buffer[] = [];
+    const originalFetch = f.native.projection.fetch;
+    const capture = vi
+      .spyOn(f.native.projection, 'fetch')
+      .mockImplementation(async (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : input);
+        if (
+          url.hostname === hostname &&
+          url.pathname === '/admin/execution-fence' &&
+          init?.method === 'POST' &&
+          typeof init.body === 'string'
+        ) {
+          const parsed = JSON.parse(init.body);
+          if (parsed.next === 'open')
+            bodies.push(Buffer.from(init.body, 'utf8'));
+        }
+        return originalFetch(input, init);
+      });
+    cleanup.push(async () => {
+      capture.mockRestore();
+    });
+    const child = await childResume(f, 'fence-reopen-after-settle');
+    expect(child.stdout).toContain('SCENARIO_FAULT fence-reopen-after-settle');
+    expect(child.result).toBeNull();
+    expect(bodies).toHaveLength(1);
+    const saved = JSON.parse(
+      await readFile(join(f.local.journal.directory, 'journal.json'), 'utf8'),
+    ) as { scenario: DirectScenarioState };
+    expect(saved.scenario).toMatchObject({
+      phase: 'fence-reopen',
+      failure: null,
+      mutation: {
+        outcome: 'returned',
+        action: { kind: 'tenant-fence', operation: 'reopen', role: 'a' },
+      },
+      proofs: {
+        fence: {
+          reopen: { a: { after: null, ordinal: null } },
+          sweeps: {
+            a: {
+              second: { fence: { state: 'draining' } },
+              intervalMs: expect.any(Number),
+            },
+          },
+        },
+      },
+    });
+    const inventoryCount = () =>
+      f.native.projection.requests.filter((request) => {
+        const url = new URL(request.url);
+        return url.hostname === hostname && url.pathname === '/admin/inventory';
+      }).length;
+    const beforeInventory = inventoryCount();
+    const record = await f.native.fleetStore.get(
+      f.local.prepared.names.roles.a.tenantTag,
+      f.local.prepared.manifest.environment,
+    );
+    const database = f.native.world.databases.find(
+      (entry) => entry.databaseId === record?.databaseId,
+    )?.d1;
+    if (!database) throw new Error('missing fixture database for role a');
+    const resumed = await resume(f);
+    const result = await runDirectCredentialedScenario(f.input(resumed));
+    expect(result.status).toBe('complete');
+    const proof = resumed.snapshot().scenario?.proofs.fence;
+    expect(JSON.stringify(proof?.reopen.a?.before)).toBe(
+      JSON.stringify(saved.scenario.proofs.fence.reopen.a?.before),
+    );
+    expect(JSON.stringify(proof?.sweeps.a?.second)).toBe(
+      JSON.stringify(saved.scenario.proofs.fence.sweeps.a?.second),
+    );
+    expect(proof?.sweeps.a?.intervalMs).toBe(
+      saved.scenario.proofs.fence.sweeps.a?.intervalMs,
+    );
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]).toEqual(bodies[0]);
+    expect(inventoryCount()).toBe(beforeInventory);
+    expect(proof?.reopen.a?.after).toMatchObject({
+      state: 'open',
+      mutationEpoch: 1,
+      requireMutationEpoch: true,
+    });
+    const revision = (proof?.reopen.a?.before.transitionRevision ?? -1) + 1;
+    expect(proof?.reopen.a?.after?.transitionRevision).toBe(revision);
+    expect(
+      database.queryDatabase(
+        `SELECT mutation_epoch, transition_revision FROM ${EXECUTION_FENCE_TABLE} WHERE id = ?`,
+        [EXECUTION_FENCE_ROW_ID],
+      ),
+    ).toEqual([{ mutation_epoch: 1, transition_revision: revision }]);
+  });
+
+  it('resumes a split drain without repeating completed role work', async () => {
+    const f = await fixture();
+    const child = await childResume(f, 'fence-drain-role-split');
+    expect(child.stdout).toContain('SCENARIO_FAULT fence-drain-role-split');
+    expect(child.result).toBeNull();
+    const saved = JSON.parse(
+      await readFile(join(f.local.journal.directory, 'journal.json'), 'utf8'),
+    ) as { scenario: DirectScenarioState };
+    expect(saved.scenario).toMatchObject({
+      phase: 'fence-drain',
+      failure: null,
+      mutation: {
+        outcome: 'returned',
+        action: { kind: 'tenant-fence', operation: 'drain', role: 'a' },
+      },
+      lastCall: {
+        outcome: 'returned',
+        action: { kind: 'tenant-fence', operation: 'read', role: 'b' },
+      },
+      proofs: {
+        fence: {
+          drain: {
+            a: { after: { state: 'draining', mutationEpoch: 1 } },
+            b: { after: null, ordinal: null },
+          },
+          sweeps: { a: { first: { fence: { state: 'draining' } } } },
+        },
+      },
+    });
+    const requests = () =>
+      f.native.projection.requests.filter((request) => {
+        const url = new URL(request.url);
+        return (
+          url.hostname === f.local.prepared.names.roles.a.routeHostname &&
+          (url.pathname === '/admin/execution-fence' ||
+            url.pathname === '/admin/inventory')
+        );
+      }).length;
+    const beforeRequests = requests();
+    const resumed = await resume(f);
+    expect(await runDirectCredentialedScenario(f.input(resumed))).toEqual({
+      status: 'restart-required',
+    });
+    const drained = resumed.snapshot().scenario?.proofs.fence;
+    expect(requests()).toBe(beforeRequests);
+    expect(JSON.stringify(drained?.drain.a)).toBe(
+      JSON.stringify(saved.scenario.proofs.fence.drain.a),
+    );
+    expect(JSON.stringify(drained?.sweeps.a?.first)).toBe(
+      JSON.stringify(saved.scenario.proofs.fence.sweeps.a?.first),
+    );
+    expect(JSON.stringify(drained?.drain.b?.before)).toBe(
+      JSON.stringify(saved.scenario.proofs.fence.drain.b?.before),
+    );
+    expect(drained?.drain.b).toMatchObject({
+      after: { state: 'draining', mutationEpoch: 1 },
+      ordinal: expect.any(Number),
+    });
+    await resumed.close();
+    await f.native.reload();
+    const completed = await childResume(f);
+    expect(completed.result).toMatchObject({ status: 'complete' });
+    if (completed.result?.status !== 'complete')
+      throw new Error('scenario did not complete');
+    expect(completed.result.facts.fence.drain.a).toEqual(
+      saved.scenario.proofs.fence.drain.a,
     );
   });
 });

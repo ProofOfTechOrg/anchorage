@@ -85,6 +85,12 @@ function initialState(ordinal) {
       health: [],
       inventories: { before: null, after: null },
       audits: { before: null, after: null },
+      fence: {
+        drain: { a: null, b: null },
+        sweeps: { a: null, b: null },
+        reopen: { a: null, b: null },
+        probes: { a: null, b: null },
+      },
       restart: null,
       steps: [],
       effects: [],
@@ -250,6 +256,56 @@ export async function runDirectCredentialedScenario(input) {
   const mutate = async (action, migration = null) => {
     await sync();
     return invoke(action, true, migration);
+  };
+  const fenceTransition = async (role, operation) => {
+    const before = state.proofs.fence[operation][role].before;
+    const result = await mutate({
+      kind: 'tenant-fence',
+      role,
+      operation,
+      expectedMutationEpoch: before.mutationEpoch,
+      expectedRevision: before.transitionRevision,
+    });
+    const next = operation === 'drain' ? 'draining' : 'open';
+    const epoch = before.mutationEpoch + (operation === 'drain' ? 1 : 0);
+    let after;
+    if (result.ok === true) {
+      after = result.after;
+      requireFact(after.transitionRevision === before.transitionRevision + 1);
+    } else {
+      requireFact(
+        result.ok === false && result.reason?.code === 'FENCE_CAS_CONFLICT',
+      );
+      const reason = result.reason;
+      after = {
+        state: reason.state,
+        mutationEpoch: reason.mutationEpoch,
+        requireMutationEpoch: reason.requireMutationEpoch,
+        transitionRevision: reason.transitionRevision,
+      };
+    }
+    requireFact(
+      after.state === next &&
+        after.mutationEpoch === epoch &&
+        after.requireMutationEpoch === true,
+    );
+    state.proofs.fence[operation][role].after = after;
+    state.proofs.fence[operation][role].ordinal = state.mutation.ordinal;
+    await persist();
+  };
+  const fenceSweep = async (role) => {
+    const result = await invoke({
+      kind: 'tenant-fence',
+      role,
+      operation: 'inventory',
+    });
+    requireFact(
+      result.fence.state === 'draining' &&
+        result.categories.every(
+          (category) => category.class !== 'work' || category.empty,
+        ),
+    );
+    return { ...result, ordinal: state.lastCall.ordinal };
   };
   const record = (role) => control.records.find((entry) => entry.role === role);
   const slot = (name) =>
@@ -750,6 +806,105 @@ export async function runDirectCredentialedScenario(input) {
           break;
         case 'audit-after':
           await audit('after');
+          break;
+        case 'fence-drain':
+          for (const role of NORMAL_ROLES) {
+            if (state.proofs.fence.drain[role] === null) {
+              const before = await invoke({
+                kind: 'tenant-fence',
+                role,
+                operation: 'read',
+              });
+              state.proofs.fence.drain[role] = {
+                before,
+                after: null,
+                ordinal: null,
+              };
+              await persist();
+            }
+            if (state.proofs.fence.drain[role].after === null)
+              await fenceTransition(role, 'drain');
+            if (state.proofs.fence.sweeps[role] === null) {
+              const first = await fenceSweep(role);
+              state.proofs.fence.sweeps[role] = {
+                first,
+                second: null,
+                intervalMs: null,
+              };
+              await persist();
+            }
+          }
+          await advancePhase();
+          break;
+        case 'fence-reopen':
+          for (const role of NORMAL_ROLES) {
+            if (state.proofs.fence.sweeps[role].second === null) {
+              const second = await fenceSweep(role);
+              state.proofs.fence.sweeps[role].second = second;
+              state.proofs.fence.sweeps[role].intervalMs = Math.max(
+                0,
+                second.observedAt -
+                  state.proofs.fence.sweeps[role].first.observedAt,
+              );
+              await persist();
+            }
+            if (state.proofs.fence.reopen[role] === null) {
+              const before = await invoke({
+                kind: 'tenant-fence',
+                role,
+                operation: 'read',
+              });
+              state.proofs.fence.reopen[role] = {
+                before,
+                after: null,
+                ordinal: null,
+              };
+              await persist();
+            }
+            if (state.proofs.fence.reopen[role].after === null)
+              await fenceTransition(role, 'reopen');
+          }
+          await advancePhase();
+          break;
+        case 'fence-proofs':
+          for (const role of NORMAL_ROLES) {
+            if (state.proofs.fence.probes[role] !== null) continue;
+            const current = await invoke({
+              kind: 'tenant-fence',
+              role,
+              operation: 'mutate-current',
+            });
+            requireFact(current.accepted === true);
+            const stale = await invoke({
+              kind: 'tenant-fence',
+              role,
+              operation: 'probe-stale',
+            });
+            requireFact(stale.classification === 'stale');
+            const missing = await invoke({
+              kind: 'tenant-fence',
+              role,
+              operation: 'probe-missing',
+            });
+            requireFact(missing.classification === 'missing');
+            const future = await invoke({
+              kind: 'tenant-fence',
+              role,
+              operation: 'probe-future',
+            });
+            requireFact(future.classification === 'future');
+            state.proofs.fence.probes[role] = {
+              current: 'accepted',
+              missing: 'missing',
+              stale: 'stale',
+              future: 'future',
+              mutationEpoch:
+                state.proofs.fence.reopen[role].after.mutationEpoch,
+              ordinal: state.lastCall.ordinal,
+            };
+            await persist();
+          }
+          await advancePhase();
           break;
         case 'migration-start': {
           await sync();

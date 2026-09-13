@@ -14,6 +14,7 @@
     "direct-reference-context.ts",
     "direct-reference-observations.ts",
     "direct-reference-lifecycle.ts",
+    "direct-reference-fence.ts",
     "direct-reference-r4.ts",
     "direct-reference-worker.ts"
   ],

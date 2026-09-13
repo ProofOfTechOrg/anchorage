@@ -11,6 +11,26 @@ import {
 
 const CONFIG = 'a'.repeat(64);
 const actions: readonly DirectReferenceAction[] = [
+  { kind: 'tenant-fence', role: 'a', operation: 'read' },
+  { kind: 'tenant-fence', role: 'b', operation: 'inventory' },
+  { kind: 'tenant-fence', role: 'a', operation: 'mutate-current' },
+  { kind: 'tenant-fence', role: 'a', operation: 'probe-missing' },
+  { kind: 'tenant-fence', role: 'b', operation: 'probe-stale' },
+  { kind: 'tenant-fence', role: 'b', operation: 'probe-future' },
+  {
+    kind: 'tenant-fence',
+    role: 'a',
+    operation: 'drain',
+    expectedMutationEpoch: 0,
+    expectedRevision: 0,
+  },
+  {
+    kind: 'tenant-fence',
+    role: 'b',
+    operation: 'reopen',
+    expectedMutationEpoch: Number.MAX_SAFE_INTEGER - 1,
+    expectedRevision: Number.MAX_SAFE_INTEGER - 1,
+  },
   { kind: 'control-read' },
   { kind: 'provision', role: 'a', release: 'initial' },
   { kind: 'provision', role: 'b', release: 'initial' },
@@ -125,6 +145,28 @@ describe('direct reference request contract', () => {
     { kind: 'decommission-export', role: 'other' },
     { kind: 'decommission-export', role: 'a', view: 'bytes' },
     { kind: 'force-recovery', role: 'a' },
+    { kind: 'tenant-fence', role: 'a', operation: 'drain' },
+    {
+      kind: 'tenant-fence',
+      role: 'a',
+      operation: 'drain',
+      expectedRevision: 0,
+    },
+    {
+      kind: 'tenant-fence',
+      role: 'a',
+      operation: 'drain',
+      expectedMutationEpoch: 0,
+    },
+    {
+      kind: 'tenant-fence',
+      role: 'a',
+      operation: 'read',
+      expectedMutationEpoch: 0,
+      expectedRevision: 0,
+    },
+    { kind: 'tenant-fence', role: 'recovery', operation: 'read' },
+    { kind: 'tenant-fence', role: 'a', operation: 'other' },
     { kind: 'tenant-probe', role: 'a' },
     { kind: 'tenant-probe', role: 'other', operation: 'health' },
     { kind: 'tenant-probe', role: 'a', operation: 'other' },
@@ -161,6 +203,26 @@ describe('direct reference request contract', () => {
     await expect(
       read({ kind: 'migration-page', limit: 1, afterOrdinal }),
     ).rejects.toMatchObject({ code: 'invalid-request' });
+  });
+
+  it.each([
+    -1,
+    1.5,
+    null,
+    '0',
+    Number.MAX_SAFE_INTEGER,
+  ])('refuses invalid fence counter %j', async (value) => {
+    for (const key of ['expectedMutationEpoch', 'expectedRevision'])
+      await expect(
+        read({
+          kind: 'tenant-fence',
+          role: 'a',
+          operation: 'drain',
+          expectedMutationEpoch: 0,
+          expectedRevision: 0,
+          [key]: value,
+        }),
+      ).rejects.toMatchObject({ code: 'invalid-request' });
   });
 
   it('refuses wrong root keys, version and run binding', async () => {

@@ -11,9 +11,11 @@ interface SqliteDatabase {
   exec(sql: string): void;
 }
 
+export type SqliteBinding = string | number | null;
+
 interface RecordedStatement {
   readonly sql: string;
-  readonly bindings: readonly string[];
+  readonly bindings: readonly SqliteBinding[];
   readonly mode: 'prepare' | 'exec';
 }
 
@@ -40,7 +42,7 @@ export class D1State {
 
   queryDatabase(
     sql: string,
-    bindings: readonly string[] = [],
+    bindings: readonly SqliteBinding[] = [],
   ): readonly Readonly<Record<string, unknown>>[] {
     const rows = this.#database.prepare(sql).all(...bindings);
     this.#statementLog.push({ sql, bindings: [...bindings], mode: 'prepare' });

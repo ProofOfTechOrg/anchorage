@@ -12,6 +12,8 @@ import type {
 } from '@cloudflare/workers-types';
 import {
   DEPLOYMENT_IDENTITY_HEADER,
+  type ExecutionFenceTransition,
+  type ExecutionFenceVersionedReading,
   seedDeploymentIdentity,
 } from '@proofoftech/flowsafe/do-runner';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -132,6 +134,23 @@ describe.sequential('direct tenant fixture in workerd', {
     path: string,
     init?: Parameters<WorkerHandle['fetch']>[1],
   ) => worker.fetch(new URL(path, initial.maintenanceBaseUrl), init);
+
+  const readFence = async () => {
+    const response = await appFetch('/admin/execution-fence', {
+      headers: maintenanceHeaders,
+    });
+    expect(response.status).toBe(200);
+    return response.json() as Promise<ExecutionFenceVersionedReading>;
+  };
+  const transitionFence = async (body: ExecutionFenceTransition) => {
+    const response = await appFetch('/admin/execution-fence', {
+      method: 'POST',
+      headers: maintenanceHeaders,
+      body: JSON.stringify(body),
+    });
+    expect(response.status).toBe(200);
+    return response.json() as Promise<ExecutionFenceVersionedReading>;
+  };
 
   beforeAll(async () => {
     directory = await mkdtemp(join(tmpdir(), 'fleet-direct-tenant-'));
@@ -396,6 +415,224 @@ describe.sequential('direct tenant fixture in workerd', {
     if (failures.length)
       throw new AggregateError(failures, 'native probe or cleanup failed');
   }, 60_000);
+
+  it('serves fence and inventory administration on public ingress and refuses the control origin', async () => {
+    expect(await readFence()).toEqual({
+      state: 'open',
+      mutationEpoch: 0,
+      requireMutationEpoch: false,
+      transitionRevision: expect.any(Number),
+    });
+    for (const path of ['/admin/execution-fence', '/admin/inventory']) {
+      const response = await appFetch(path, { headers: maintenanceHeaders });
+      expect(response.status).toBe(200);
+      await response.json();
+      expect(
+        (await controlFetch(path, { headers: maintenanceHeaders })).status,
+      ).toBe(404);
+    }
+  });
+
+  it('accepts the epoch labels before activation and refuses malformed probe members', async () => {
+    expect(await readFence()).toMatchObject({
+      state: 'open',
+      mutationEpoch: 0,
+      requireMutationEpoch: false,
+    });
+    for (const epoch of ['current', 'stale', 'missing', 'future']) {
+      const response = await appFetch('/__direct/fence-probe', {
+        method: 'POST',
+        headers: applicationHeaders,
+        body: JSON.stringify({ epoch }),
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        epoch,
+        classification: 'accepted',
+      });
+    }
+    for (const body of [undefined, '{}']) {
+      const response = await appFetch('/__direct/fence-mutate', {
+        method: 'POST',
+        headers: applicationHeaders,
+        ...(body === undefined ? {} : { body }),
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ accepted: true });
+    }
+    const env = await worker.getEnv();
+    for (const [path, body] of [
+      ['/__direct/fence-mutate', '{"phase":"bogus"}'],
+      ['/__direct/fence-probe', '{"epoch":"bogus"}'],
+      ['/__direct/fence-probe', undefined],
+    ] as const) {
+      const response = await appFetch(path, {
+        method: 'POST',
+        headers: applicationHeaders,
+        ...(body === undefined ? {} : { body }),
+      });
+      expect(response.status).toBe(400);
+      expect(
+        (await env.DB.prepare('SELECT id FROM mastra_schedules').all()).results,
+      ).toEqual([]);
+    }
+  });
+
+  it('refuses a draining create and admits a draining delete after rejecting malformed ids', async () => {
+    const created = await appFetch('/__direct/fence-mutate', {
+      method: 'POST',
+      headers: applicationHeaders,
+      body: JSON.stringify({ phase: 'create' }),
+    });
+    expect(created.status).toBe(200);
+    const creation = (await created.json()) as {
+      accepted: boolean;
+      scheduleId: string;
+    };
+    expect(creation).toEqual({
+      accepted: true,
+      scheduleId: expect.any(String),
+    });
+    const { scheduleId } = creation;
+    const before = await readFence();
+    const draining = await transitionFence({
+      expected: 'open',
+      next: 'draining',
+      expectedMutationEpoch: before.mutationEpoch,
+      expectedRevision: before.transitionRevision,
+    });
+    expect(draining).toMatchObject({
+      state: 'draining',
+      mutationEpoch: 0,
+      requireMutationEpoch: false,
+    });
+    const refused = await appFetch('/__direct/fence-mutate', {
+      method: 'POST',
+      headers: applicationHeaders,
+      body: JSON.stringify({ phase: 'create' }),
+    });
+    expect(refused.status).toBe(200);
+    expect(await refused.json()).toEqual({
+      accepted: false,
+      code: 'EXECUTION_FENCED',
+      status: 503,
+    });
+    const env = await worker.getEnv();
+    for (const malformed of ['..', 'x/y', '%', `${scheduleId}?ignored`]) {
+      const response = await appFetch('/__direct/fence-mutate', {
+        method: 'POST',
+        headers: applicationHeaders,
+        body: JSON.stringify({ phase: 'delete', scheduleId: malformed }),
+      });
+      expect(response.status).toBe(400);
+      expect(
+        (await env.DB.prepare('SELECT id FROM mastra_schedules').all()).results,
+      ).toEqual([{ id: scheduleId }]);
+    }
+    const deleted = await appFetch('/__direct/fence-mutate', {
+      method: 'POST',
+      headers: applicationHeaders,
+      body: JSON.stringify({ phase: 'delete', scheduleId }),
+    });
+    expect(deleted.status).toBe(200);
+    expect(await deleted.json()).toMatchObject({ accepted: true });
+    expect(
+      await transitionFence({
+        expected: 'draining',
+        next: 'open',
+        expectedMutationEpoch: draining.mutationEpoch,
+        expectedRevision: draining.transitionRevision,
+      }),
+    ).toMatchObject({
+      state: 'open',
+      mutationEpoch: 0,
+      requireMutationEpoch: false,
+    });
+  });
+
+  it('refuses the pre-cutover artifact and admits the next artifact on the same activated fence', async () => {
+    const before = await readFence();
+    const draining = await transitionFence({
+      expected: 'open',
+      next: 'draining',
+      expectedMutationEpoch: before.mutationEpoch,
+      expectedRevision: before.transitionRevision,
+      advanceMutationEpoch: true,
+    });
+    expect(draining).toEqual({
+      state: 'draining',
+      mutationEpoch: 1,
+      requireMutationEpoch: true,
+      transitionRevision: before.transitionRevision + 1,
+    });
+    const reopened = await transitionFence({
+      expected: 'draining',
+      next: 'open',
+      expectedMutationEpoch: draining.mutationEpoch,
+      expectedRevision: draining.transitionRevision,
+    });
+    expect(reopened).toEqual({
+      state: 'open',
+      mutationEpoch: 1,
+      requireMutationEpoch: true,
+      transitionRevision: draining.transitionRevision + 1,
+    });
+    const stale = await appFetch('/__direct/fence-mutate', {
+      method: 'POST',
+      headers: applicationHeaders,
+      body: JSON.stringify({ phase: 'both' }),
+    });
+    expect(stale.status).toBe(200);
+    const staleOutcome = await stale.json();
+    expect(staleOutcome).toEqual({
+      accepted: false,
+      code: 'MUTATION_EPOCH_MISMATCH',
+      classification: 'stale',
+      status: 409,
+    });
+    await server.update(options('2'));
+    worker = server.getWorker<HarnessBindings>();
+    expect(await readFence()).toEqual(reopened);
+    const current = await appFetch('/__direct/fence-mutate', {
+      method: 'POST',
+      headers: applicationHeaders,
+      body: JSON.stringify({ phase: 'both' }),
+    });
+    expect(current.status).toBe(200);
+    const currentOutcome = await current.json();
+    expect(currentOutcome).toEqual({ accepted: true });
+    process.stdout.write(
+      `A1_ARTIFACT_EPOCH ${JSON.stringify({ release1: staleOutcome, release2: currentOutcome })}\n`,
+    );
+  });
+
+  it('classifies missing, future and stale epochs after reopen and admits the current epoch', async () => {
+    for (const [epoch, classification] of [
+      ['missing', 'missing'],
+      ['future', 'future'],
+      ['stale', 'stale'],
+      ['current', 'accepted'],
+    ]) {
+      const response = await appFetch('/__direct/fence-probe', {
+        method: 'POST',
+        headers: applicationHeaders,
+        body: JSON.stringify({ epoch }),
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ epoch, classification });
+    }
+  });
+
+  it('leaves no schedule or trigger row after the fence probes', async () => {
+    const env = await worker.getEnv();
+    expect(
+      (await env.DB.prepare('SELECT id FROM mastra_schedules').all()).results,
+    ).toEqual([]);
+    expect(
+      (await env.DB.prepare('SELECT id FROM mastra_schedule_triggers').all())
+        .results,
+    ).toEqual([]);
+  });
 
   it('writes fixed R2 bytes and retains them across reload and additive D1 migration', async () => {
     expect(
