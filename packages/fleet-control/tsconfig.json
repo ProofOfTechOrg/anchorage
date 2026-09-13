@@ -4,7 +4,15 @@
     "declaration": false,
     "declarationMap": false,
     "noEmit": true,
-    "types": ["node", "vitest/globals"]
+    "types": ["node", "vitest/globals"],
+    // Copy-ready package specifiers resolve to source here; consumers keep the
+    // same imports against the published package.
+    "paths": {
+      "@proofoftech/fleet-control": ["./src/index.ts"],
+      "@proofoftech/fleet-control/cloudflare-control-plane": [
+        "./src/cloudflare-control-plane.ts"
+      ]
+    }
   },
   "include": ["src/**/*.ts", "test/**/*.ts"]
 }

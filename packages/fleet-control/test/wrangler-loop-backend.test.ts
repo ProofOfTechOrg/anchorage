@@ -1442,6 +1442,9 @@ export default {
           stderr: '',
         };
       }
+      if (arguments_[0] === 'versions' && arguments_[1] === 'list') {
+        return { stdout: JSON.stringify([]), stderr: '' };
+      }
       return {
         stdout: JSON.stringify({
           resources: {
@@ -1597,6 +1600,9 @@ export default {
           }),
           stderr: '',
         };
+      }
+      if (arguments_[0] === 'versions' && arguments_[1] === 'list') {
+        return { stdout: JSON.stringify([]), stderr: '' };
       }
       return { stdout: JSON.stringify(version), stderr: '' };
     });
@@ -2898,6 +2904,8 @@ export default {
       async inspectOrdinaryWorkerFootprint() {
         return {
           scriptPresent: true,
+          workersDevEnabled: false,
+          previewUrlsEnabled: false,
           customDomains: [
             {
               id: 'sticky-domain',

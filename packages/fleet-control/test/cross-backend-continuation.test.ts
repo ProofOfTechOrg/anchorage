@@ -151,7 +151,13 @@ async function assertVersionProjectionRedaction(
         bindings: sourceVersion.bindings,
         main_module: 'worker.js',
       },
-      files: [],
+      files: [
+        {
+          name: 'worker.js',
+          text: 'export default {}',
+          type: 'application/javascript+module',
+        },
+      ],
     },
     headers: new Headers(),
     redirect: undefined,

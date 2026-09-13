@@ -718,7 +718,10 @@ describe('bounded cleanup admission', () => {
           'invocation authority carrier is malformed; use export-backed decommissioning',
       },
       {
-        overrides: { backend: 'workers-for-platforms' },
+        overrides: {
+          backend: 'workers-for-platforms',
+          wfpMode: 'platform-catalog',
+        },
         backendKind: 'workers-for-platforms',
         message:
           'deployment carries an untrusted data binding; use export-backed decommissioning',
@@ -753,10 +756,11 @@ describe('bounded cleanup admission', () => {
         store.record = overridden;
       }
       if (testCase.backendKind) backend.kind = testCase.backendKind;
+      const recordBeforeAdmission = structuredClone(store.record);
       await expect(start(store, backend)).rejects.toThrow(testCase.message);
       expect(store.puts).toBe(0);
       expect(backend.providerCalls).toBe(0);
-      expect(store.record).toEqual(store.record);
+      expect(store.record).toStrictEqual(recordBeforeAdmission);
     }
     const empty = harness();
     await expect(start(empty.store, empty.backend)).rejects.toThrow(

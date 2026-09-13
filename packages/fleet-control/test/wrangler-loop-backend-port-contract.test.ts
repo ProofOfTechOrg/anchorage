@@ -664,7 +664,7 @@ describe('WranglerLoopBackend provisioning port contract', () => {
       stderr: '',
     }));
     await expect((await backend(runner)).findDatabase(spec)).rejects.toThrow(
-      'D1 list result has no uuid',
+      'D1 database inventory has an invalid uuid or name',
     );
   });
 
