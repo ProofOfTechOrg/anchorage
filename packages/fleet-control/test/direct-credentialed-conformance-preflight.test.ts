@@ -21,6 +21,31 @@ import {
   readDirectConformanceConfig,
 } from '../scripts/direct-credentialed-conformance-preflight.mjs';
 
+// TypeScript's CommonJS namespace exposes createSourceFile as a non-configurable
+// getter, so the compiler seam is reachable only by mocking the module.
+const compiler = vi.hoisted(() => ({ failOnCall: 0 }));
+
+vi.mock('typescript', async (importOriginal) => {
+  const actual = await importOriginal<{
+    default: typeof import('typescript');
+  }>();
+  const createSourceFile = (
+    ...args: Parameters<typeof actual.default.createSourceFile>
+  ) => {
+    if (compiler.failOnCall > 0) {
+      compiler.failOnCall -= 1;
+      if (compiler.failOnCall === 0)
+        throw new RangeError('Maximum call stack size exceeded');
+    }
+    return actual.default.createSourceFile(...args);
+  };
+  return {
+    ...actual,
+    createSourceFile,
+    default: { ...actual.default, createSourceFile },
+  };
+});
+
 const NOW = Date.parse('2026-09-09T12:00:00.000Z');
 const REFERENCE = `import manifest from './direct-run-manifest.js';
 export default {fetch() {return Response.json(manifest.contractVersion)}};`;
@@ -144,11 +169,8 @@ describe('direct artifact preflight', () => {
     'reference',
     'tenant',
   ] as const)('contains compiler failures for the %s role', async (role) => {
-    const suffix = `\nconst nested=${'('.repeat(1_000)}0${')'.repeat(1_000)};`;
-    const f = await fixture(
-      REFERENCE + (role === 'reference' ? suffix : ''),
-      TENANT + (role === 'tenant' ? suffix : ''),
-    );
+    compiler.failOnCall = role === 'reference' ? 1 : 2;
+    const f = await fixture();
     await expect(prepare(f.configPath)).rejects.toThrow(
       `direct conformance preflight has invalid ${role} artifact module inspection`,
     );
