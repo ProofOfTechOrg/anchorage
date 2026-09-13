@@ -11,6 +11,7 @@ const ERROR_CODES = new Set([
   'provider-unavailable',
   'observation-mismatch',
   'budget-exhausted',
+  'forbidden',
 ]);
 
 export class DirectProviderError extends Error {
@@ -27,6 +28,21 @@ function refuse(code = 'observation-mismatch') {
 }
 function object(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) refuse();
+  return value;
+}
+
+export function identifier(value, max = 128) {
+  if (
+    typeof value !== 'string' ||
+    !value ||
+    value !== value.trim() ||
+    value.length > max ||
+    [...value].some(
+      (character) =>
+        character.charCodeAt(0) <= 31 || character.charCodeAt(0) === 127,
+    )
+  )
+    refuse();
   return value;
 }
 
@@ -205,10 +221,12 @@ function providerTransport(fetchRequest, timeoutMs) {
 
 function validateEnvelope(value) {
   object(value);
+  const cursor = value.result_info?.cursor;
   if (
     value.success !== true ||
     (value.errors !== undefined &&
-      (!Array.isArray(value.errors) || value.errors.length !== 0))
+      (!Array.isArray(value.errors) || value.errors.length !== 0)) ||
+    (typeof cursor === 'string' && cursor.length > 0)
   )
     refuse('provider-unavailable');
 }
@@ -222,7 +240,9 @@ function proofFetch(transport, shape, bound) {
       !/^application\/(?:json|[a-z0-9.+-]+\+json)(?:\s*;.*)?$/iu.test(
         contentType,
       ) ||
-      (shape !== 'object' && response.status !== 200)
+      (shape !== 'object' && response.status !== 200) ||
+      // The SDK skips its parser, and so this validation, on an empty body.
+      (shape === 'settled' && response.headers.get('content-length') === '0')
     ) {
       cancel(response);
       refuse('provider-unavailable');
@@ -237,7 +257,9 @@ function proofFetch(transport, shape, bound) {
       const value = await parse();
       validateEnvelope(value);
       if (shape === 'object') object(value.result);
-      else {
+      else if (shape === 'settled') {
+        if (value.result !== null) object(value.result);
+      } else {
         const rows = value.result;
         if (!Array.isArray(rows) || rows.length > bound)
           refuse('provider-unavailable');
@@ -269,8 +291,7 @@ function proofFetch(transport, shape, bound) {
           (count !== undefined && count !== rows.length) ||
           (perPage !== undefined && rows.length > perPage) ||
           (totalCount !== undefined && rows.length > totalCount) ||
-          (totalPages === 0 && rows.length > 0) ||
-          (typeof cursor === 'string' && cursor.length > 0)
+          (totalPages === 0 && rows.length > 0)
         )
           refuse('provider-unavailable');
         if (shape === 'single') {
@@ -298,6 +319,121 @@ function proofFetch(transport, shape, bound) {
       },
     });
   };
+}
+
+export async function inventory(pages, identity, bound) {
+  const rows = [];
+  const seen = new Set();
+  let expectedCount = 0;
+  let expectedPages = 0;
+  let pageCount = 0;
+  for await (const page of (await pages).iterPages()) {
+    pageCount += 1;
+    expectedCount = Math.max(expectedCount, page.result_info?.total_count ?? 0);
+    expectedPages = Math.max(expectedPages, page.result_info?.total_pages ?? 0);
+    for (const row of page.result) {
+      const keys = identity(row);
+      if (keys.some((key) => seen.has(key)) || rows.length >= bound)
+        refuse('provider-unavailable');
+      for (const key of keys) seen.add(key);
+      rows.push(row);
+    }
+  }
+  if (rows.length < expectedCount || pageCount < expectedPages)
+    refuse('provider-unavailable');
+  return rows;
+}
+
+export async function classifyDispatchNamespaces(single, selectors, bound) {
+  const { APIError } = await import('cloudflare');
+  try {
+    const namespaces = await inventory(
+      single.workersForPlatforms.dispatch.namespaces.list(selectors),
+      (row) => [
+        `id:${identifier(row.namespace_id)}`,
+        `name:${identifier(row.namespace_name)}`,
+      ],
+      bound,
+    );
+    return {
+      kind: namespaces.length ? 'enumerated' : 'empty',
+      count: namespaces.length,
+      names: namespaces.map((row) => row.namespace_name),
+    };
+  } catch (error) {
+    if (error instanceof APIError && error.status === 404)
+      return { kind: 'first-page-404', count: 0, names: [] };
+    throw error;
+  }
+}
+
+export async function singlePage(promise) {
+  const rows = (await promise).result;
+  if (!Array.isArray(rows)) refuse('provider-unavailable');
+  return { rows, exhaustive: false };
+}
+
+export async function bucketPages({ sdk, selectors, jurisdiction }) {
+  const { CLOUDFLARE_INVENTORY_BOUND: bound } = await import(
+    '../src/cloudflare-client-config.ts'
+  );
+  const rows = [];
+  let startAfter;
+  // Only an empty page proves the end: a full page that happens to be last is
+  // indistinguishable from a truncated one.
+  for (;;) {
+    const page = await sdk.r2.buckets.list({
+      ...selectors,
+      per_page: 100,
+      order: 'name',
+      direction: 'asc',
+      jurisdiction,
+      ...(startAfter === undefined ? {} : { start_after: startAfter }),
+    });
+    const buckets = object(page).buckets;
+    if (!Array.isArray(buckets)) refuse('provider-unavailable');
+    if (buckets.length === 0) return rows;
+    for (const row of buckets) {
+      object(row);
+      if (
+        typeof row.name !== 'string' ||
+        !row.name ||
+        (startAfter !== undefined && row.name <= startAfter)
+      )
+        refuse('provider-unavailable');
+      startAfter = row.name;
+      rows.push(row);
+      if (rows.length > bound) refuse('provider-unavailable');
+    }
+  }
+}
+
+// The SDK reports a transport rejection as an APIConnectionError carrying the
+// original as `cause`, so a refusal raised here reaches callers wrapped.
+export function providerErrorFrom(error) {
+  let current = error;
+  for (let depth = 0; current && depth < 4; depth += 1) {
+    if (current instanceof DirectProviderError) return current;
+    current = current.cause;
+  }
+  return null;
+}
+
+export async function probeAbsent(promise) {
+  const { APIError } = await import('cloudflare');
+  try {
+    const value = await promise;
+    if (value instanceof Response) cancel(value);
+    return 'present';
+  } catch (error) {
+    const raised = providerErrorFrom(error);
+    if (raised) throw raised;
+    if (error instanceof APIError) {
+      if (error.status === 404) return 'absent';
+      if (error.status === 401 || error.status === 403) refuse('forbidden');
+    }
+    refuse('provider-unavailable');
+  }
 }
 
 export async function openDirectProviderSession({
@@ -334,11 +470,15 @@ export async function openDirectProviderSession({
     const status = sdk.withOptions({
       fetch: proofFetch(transport, 'status', bound),
     });
+    const settled = sdk.withOptions({
+      fetch: proofFetch(transport, 'settled', bound),
+    });
     return {
       sdk,
       numbered,
       single,
       status,
+      settled,
       APIError,
       bound,
       transport,

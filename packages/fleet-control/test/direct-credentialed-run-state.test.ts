@@ -30,6 +30,8 @@ import {
   bootstrapContext,
   cleanupDirectRunState,
   closed,
+  completeScenario,
+  completeScenarioJournal,
   confirmedBootstrap,
   DIGEST,
   first,
@@ -37,15 +39,21 @@ import {
   hash,
   journals,
   MAX_COUNT,
+  MAX_NAME,
   type MutableScenario,
+  type MutableTeardown,
   maximalScenario,
+  maximalTeardown,
   opened,
   PROCESS,
   present,
   RESUMED,
   receipts,
+  residualObservation,
   scenarioJournal,
   scenarioWith,
+  teardownState,
+  teardownWith,
 } from './fixtures/direct-run-state-builder.js';
 
 vi.mock('node:fs/promises', async (importOriginal) => {
@@ -1261,5 +1269,304 @@ describeLinux('durable scenario state', () => {
           mutate(state);
         }),
       );
+  });
+});
+
+const settlement = (ordinal = 1) => ({ ordinal, settledByReread: false });
+
+function filledReceipts(state: MutableTeardown) {
+  state.receipts.ingress = settlement();
+  state.receipts.worker = {
+    scriptName: 'reference',
+    secretNames: [],
+    ...settlement(),
+  };
+  state.receipts.fleet = { uuid: 'fleet-uuid', ...settlement() };
+  state.receipts.quota = { uuid: 'quota-uuid', ...settlement() };
+}
+
+describeLinux('durable teardown state', () => {
+  it('publishes teardown after scenario and leaves the earlier bytes unchanged', async () => {
+    const { f, journal } = await completeScenarioJournal();
+    const path = join(f.runDirectory, 'journal.json');
+    const before = await readFile(path, 'utf8');
+    expect(before).not.toContain('teardown');
+    await journal.recordTeardown(teardownState());
+    const after = JSON.parse(await readFile(path, 'utf8'));
+    expect(Object.keys(after)).toEqual([
+      'version',
+      'binding',
+      'invocationCount',
+      'lastInvocation',
+      'bootstrap',
+      'scenario',
+      'teardown',
+    ]);
+    delete after.teardown;
+    expect(`${JSON.stringify(after)}\n`).toBe(before);
+  });
+
+  it('refuses a teardown key on a version 1 snapshot', async () => {
+    const { f, journal } = await completeScenarioJournal();
+    await journal.recordTeardown(teardownState());
+    await closed(journal);
+    const path = join(f.runDirectory, 'journal.json');
+    const stored = JSON.parse(await readFile(path, 'utf8'));
+    await writeFile(
+      path,
+      JSON.stringify({
+        version: 1,
+        binding: stored.binding,
+        invocationCount: stored.invocationCount,
+        lastInvocation: stored.lastInvocation,
+        teardown: stored.teardown,
+      }),
+    );
+    await expect(
+      openDirectRunState({ ...f.input, mode: 'resume' }),
+    ).rejects.toMatchObject({ code: 'invalid-state' });
+  });
+
+  it('refuses every malformed teardown shape', async () => {
+    const { journal } = await completeScenarioJournal();
+    const cases: ((state: MutableTeardown) => unknown)[] = [
+      (state) => {
+        (state as unknown as Record<string, unknown>).extra = 1;
+      },
+      (state) => {
+        state.phase = 'worker';
+        state.receipts.worker = {
+          scriptName: 'reference',
+          secretNames: [],
+          ...settlement(),
+        };
+      },
+      (state) => {
+        state.pending = { kind: 'disable-reference-ingress' };
+        state.receipts.ingress = settlement();
+      },
+      (state) => {
+        state.pending = { kind: 'disable-reference-ingress', key: 'key' };
+      },
+      (state) => {
+        state.pending = { kind: 'delete-export-object' };
+      },
+      (state) => {
+        filledReceipts(state);
+        state.phase = 'export-objects';
+        state.pending = { kind: 'delete-export-object', key: 'first' };
+        state.receipts.exportObjects = [{ key: 'first', ...settlement() }];
+      },
+      (state) => {
+        filledReceipts(state);
+        state.phase = 'export-objects';
+        state.receipts.exportObjects = ['one', 'two', 'three'].map((key) => ({
+          key,
+          ...settlement(),
+        }));
+      },
+      (state) => {
+        filledReceipts(state);
+        state.phase = 'export-objects';
+        state.receipts.exportObjects = [
+          { key: 'same', ...settlement() },
+          { key: 'same', ...settlement() },
+        ];
+      },
+      (state) => {
+        filledReceipts(state);
+        state.phase = 'worker';
+        state.receipts.worker = {
+          scriptName: `${MAX_NAME}x`,
+          secretNames: [],
+          ...settlement(),
+        };
+      },
+      (state) => {
+        state.residual = residualObservation();
+      },
+      (state) => {
+        state.phase = 'refused';
+      },
+      (state) => {
+        state.phase = 'refused';
+        state.failure = 'scenario-incomplete';
+        state.receipts.ingress = settlement();
+      },
+      (state) => {
+        state.phase = 'refused';
+        state.failure = 'scenario-incomplete';
+        state.pending = { kind: 'disable-reference-ingress' };
+      },
+    ];
+    for (const [index, mutate] of cases.entries())
+      await expect({
+        index,
+        outcome: await journal.recordTeardown(teardownWith(mutate)).then(
+          () => 'accepted',
+          (error: { code?: string }) => error.code,
+        ),
+      }).toEqual({ index, outcome: 'invalid-state' });
+  });
+
+  it('publishes a receipt while its mutation is pending and refuses every regression', async () => {
+    const { journal } = await completeScenarioJournal();
+    await journal.recordTeardown(
+      teardownWith((state) => {
+        state.pending = { kind: 'disable-reference-ingress' };
+      }),
+    );
+    expect(journal.snapshot().teardown?.pending).toEqual({
+      kind: 'disable-reference-ingress',
+    });
+    await journal.recordTeardown(
+      teardownWith((state) => {
+        state.receipts.ingress = settlement(4);
+        state.providerRequests = 4;
+      }),
+    );
+    await journal.recordTeardown(
+      teardownWith((state) => {
+        state.phase = 'worker';
+        state.receipts.ingress = settlement(4);
+        state.receipts.worker = {
+          scriptName: 'reference',
+          secretNames: [],
+          ...settlement(6),
+        };
+        state.providerRequests = 6;
+      }),
+    );
+    const carried = (state: MutableTeardown) => {
+      state.phase = 'worker';
+      state.receipts.ingress = settlement(4);
+      state.receipts.worker = {
+        scriptName: 'reference',
+        secretNames: [],
+        ...settlement(6),
+      };
+      state.providerRequests = 6;
+    };
+    for (const mutate of [
+      (state: MutableTeardown) => {
+        carried(state);
+        state.phase = 'ingress';
+      },
+      (state: MutableTeardown) => {
+        carried(state);
+        state.phase = 'quota';
+        state.receipts.fleet = { uuid: 'fleet-uuid', ...settlement(8) };
+      },
+      (state: MutableTeardown) => {
+        carried(state);
+        state.receipts.ingress = settlement(5);
+      },
+      (state: MutableTeardown) => {
+        carried(state);
+        state.providerRequests = 5;
+      },
+      (state: MutableTeardown) => {
+        carried(state);
+        state.receipts.worker = null;
+      },
+    ])
+      await expect(
+        journal.recordTeardown(teardownWith(mutate)),
+      ).rejects.toMatchObject({ code: 'invalid-state' });
+  });
+
+  it('keeps a refused teardown terminal and rewritable in place', async () => {
+    const { journal } = await completeScenarioJournal();
+    const refused = (attempts: number) =>
+      teardownWith((state) => {
+        state.phase = 'refused';
+        state.failure = 'scenario-incomplete';
+        state.residual = {
+          ...residualObservation(),
+          settleAttempts: attempts,
+        };
+        state.providerRequests = attempts;
+      });
+    await journal.recordTeardown(refused(1));
+    await journal.recordTeardown(refused(2));
+    expect(journal.snapshot().teardown?.residual?.settleAttempts).toBe(2);
+    await expect(
+      journal.recordTeardown(
+        teardownWith((state) => {
+          state.pending = { kind: 'disable-reference-ingress' };
+          state.providerRequests = 2;
+        }),
+      ),
+    ).rejects.toMatchObject({ code: 'invalid-state' });
+  });
+
+  it('accepts the worst-case teardown inside the byte bound and refuses an undecodable one without poisoning', async () => {
+    const { f, journal } = await completeScenarioJournal();
+    await journal.assertTeardownCapacity(maximalTeardown());
+    expect(journal.snapshot().teardown).toBeUndefined();
+    await expect(
+      journal.assertTeardownCapacity(
+        teardownWith((state) => {
+          Object.assign(state, maximalTeardown());
+          const worker = present(state.receipts.worker);
+          worker.scriptName = `${MAX_NAME}x`;
+        }),
+      ),
+    ).rejects.toMatchObject({ code: 'invalid-state' });
+    await journal.recordTeardown(maximalTeardown());
+    const serialized = await readFile(
+      join(f.runDirectory, 'journal.json'),
+      'utf8',
+    );
+    expect(
+      DIRECT_RUN_MAX_JOURNAL_BYTES - Buffer.byteLength(serialized),
+    ).toBeGreaterThan(100_000);
+  });
+
+  it('refuses scenario and invocation writes once a teardown is pending or receipted', async () => {
+    const { f, journal } = await completeScenarioJournal();
+    await journal.recordTeardown(
+      teardownWith((state) => {
+        state.pending = { kind: 'disable-reference-ingress' };
+      }),
+    );
+    for (const call of [
+      () => journal.recordScenario(completeScenario()),
+      () => journal.reserveInvocation(f.request()),
+      () => journal.bindBootstrapContext(bootstrapContext(f)),
+      () => journal.beginBootstrapMutation('create-fleet-d1'),
+      () =>
+        journal.recordBootstrapObservation({
+          kind: 'active',
+          deploymentId: 'deployment',
+          versionId: 'version',
+        }),
+    ])
+      await expect(call()).rejects.toMatchObject({ code: 'outcome-unknown' });
+    await journal.recordTeardown(
+      teardownWith((state) => {
+        state.receipts.ingress = settlement();
+      }),
+    );
+    await expect(
+      journal.recordScenario(completeScenario()),
+    ).rejects.toMatchObject({ code: 'invalid-state' });
+    await expect(journal.reserveInvocation(f.request())).rejects.toMatchObject({
+      code: 'invalid-state',
+    });
+  });
+
+  it('resumes a run whose teardown mutation is still pending', async () => {
+    const { f, journal } = await completeScenarioJournal();
+    await journal.recordTeardown(
+      teardownWith((state) => {
+        state.pending = { kind: 'disable-reference-ingress' };
+      }),
+    );
+    await closed(journal);
+    const resumed = await opened({ ...f.input, mode: 'resume' });
+    expect(resumed.snapshot().teardown?.pending).toEqual({
+      kind: 'disable-reference-ingress',
+    });
   });
 });

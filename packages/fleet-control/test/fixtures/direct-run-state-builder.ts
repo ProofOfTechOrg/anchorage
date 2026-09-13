@@ -6,10 +6,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { preflightDirectConformance } from '../../scripts/direct-credentialed-conformance-preflight.mjs';
 import {
+  DIRECT_RESIDUAL_SURFACES,
   DIRECT_SCENARIO_OPERATION_SLOTS,
+  DIRECT_TEARDOWN_MAXIMA,
   type DirectBootstrapContext,
   type DirectBootstrapMutationReceipt,
+  type DirectResidualObservation,
   type DirectRunJournal,
+  type DirectTeardownState,
   openDirectRunState,
 } from '../../scripts/direct-credentialed-run-state.mjs';
 import type { DirectScenarioState } from '../../scripts/direct-credentialed-scenario.mjs';
@@ -38,7 +42,7 @@ export function present<Value>(value: Value | null | undefined): Value {
   return value;
 }
 
-export async function fixture(limit = 3) {
+export async function fixture(limit = 3, disposableAccount = true) {
   const directory = await mkdtemp(join(tmpdir(), 'direct-run-state-'));
   directories.push(directory);
   const config = JSON.parse(
@@ -50,6 +54,7 @@ export async function fixture(limit = 3) {
       'utf8',
     ),
   );
+  config.disposableAccount = disposableAccount;
   const reference =
     "import manifest from './direct-run-manifest.js'; export default {fetch(){return Response.json(manifest.contractVersion)}};";
   const tenant =
@@ -533,8 +538,8 @@ export function scenarioWith(
   return state;
 }
 
-export async function scenarioJournal(limit = 8) {
-  const f = await fixture(limit);
+export async function scenarioJournal(limit = 8, disposableAccount = true) {
+  const f = await fixture(limit, disposableAccount);
   const journal = await opened({ ...f.input, mode: 'run' });
   await confirmedBootstrap(f, journal);
   let ordinal = 0;
@@ -545,4 +550,142 @@ export async function scenarioJournal(limit = 8) {
   }
   await journal.recordBootstrapObservation({ kind: 'control-read', ordinal });
   return { f, journal };
+}
+
+export const EXPORT_IDENTITY = {
+  a: { databaseId: 'database-a', operationId: 'operation-a' },
+  b: { databaseId: 'database-b', operationId: 'operation-b' },
+} as const;
+
+export function exportKey(prefix: string, role: 'a' | 'b') {
+  const { databaseId, operationId } = EXPORT_IDENTITY[role];
+  return `${prefix}/receipts/v1/${databaseId}/${operationId}.sql`;
+}
+
+export function completeScenario(): MutableScenario {
+  return scenarioWith((state) => {
+    state.phase = 'complete';
+    state.failure = null;
+    const [armA, armB] = state.proofs.steps;
+    if (!armA || !armB) throw new Error('scenario fixture lost its steps');
+    armA.step = 'arm-maintenance';
+    armB.step = 'arm-maintenance';
+    for (const role of ['a', 'b'] as const) {
+      const proof = present(state.proofs.exports[role]);
+      proof.receipt.databaseId = EXPORT_IDENTITY[role].databaseId;
+      proof.receipt.operationId = EXPORT_IDENTITY[role].operationId;
+    }
+    state.proofs.exportVerifications = state.proofs.exportVerifications.map(
+      (_entry, index) =>
+        structuredClone(present(state.proofs.exports[index % 2 ? 'b' : 'a'])),
+    );
+  });
+}
+
+export async function completeScenarioJournal(
+  limit = 8,
+  disposableAccount = true,
+) {
+  const opening = await scenarioJournal(limit, disposableAccount);
+  await opening.journal.recordScenario(completeScenario());
+  return opening;
+}
+
+export type MutableResidual = Omit<
+  Mutable<DirectResidualObservation>,
+  'bucketJurisdictions'
+> & { bucketJurisdictions: ['default'] };
+export type MutableTeardown = Omit<Mutable<DirectTeardownState>, 'residual'> & {
+  residual: MutableResidual | null;
+};
+export const MAX_NAME = 'n'.repeat(DIRECT_TEARDOWN_MAXIMA.nameBytes);
+export const MAX_KEY = `k/${'k'.repeat(DIRECT_TEARDOWN_MAXIMA.keyBytes - 2)}`;
+
+export function residualObservation(): MutableResidual {
+  return {
+    version: 1,
+    surfaces: Object.fromEntries(
+      DIRECT_RESIDUAL_SURFACES.map((surface) => [
+        surface,
+        {
+          prefixCount: MAX_COUNT,
+          prefixNames: Array.from(
+            { length: DIRECT_TEARDOWN_MAXIMA.prefixNames },
+            () => MAX_NAME,
+          ),
+          globalCount: MAX_COUNT,
+          exhaustive: true,
+        },
+      ]),
+    ) as MutableResidual['surfaces'],
+    bucketJurisdictions: ['default'],
+    dispatch: {
+      kind: 'enumerated',
+      count: MAX_COUNT,
+      status: MAX_COUNT,
+      prefixCount: MAX_COUNT,
+    },
+    versionsGone: false,
+    settleAttempts: DIRECT_TEARDOWN_MAXIMA.settleAttempts,
+  };
+}
+
+export function maximalTeardown(): MutableTeardown {
+  const settlement = { ordinal: MAX_COUNT, settledByReread: true };
+  return {
+    version: 1,
+    phase: 'complete',
+    pending: null,
+    receipts: {
+      ingress: { ...settlement },
+      worker: {
+        scriptName: MAX_NAME,
+        secretNames: Array.from(
+          { length: DIRECT_TEARDOWN_MAXIMA.secretNames },
+          () => MAX_NAME,
+        ),
+        ...settlement,
+      },
+      fleet: { uuid: MAX_NAME, ...settlement },
+      quota: { uuid: MAX_NAME, ...settlement },
+      exportObjects: Array.from(
+        { length: DIRECT_TEARDOWN_MAXIMA.exportObjects },
+        (_entry, index) => ({
+          key: `${index}${MAX_KEY.slice(1)}`,
+          ...settlement,
+        }),
+      ),
+      exports: { name: MAX_NAME, ...settlement },
+    },
+    residual: residualObservation(),
+    providerRequests: MAX_COUNT,
+    failure: 'residual-present',
+  };
+}
+
+export function teardownState(): MutableTeardown {
+  return {
+    version: 1,
+    phase: 'ingress',
+    pending: null,
+    receipts: {
+      ingress: null,
+      worker: null,
+      fleet: null,
+      quota: null,
+      exportObjects: [],
+      exports: null,
+    },
+    residual: null,
+    providerRequests: 0,
+    failure: null,
+  };
+}
+
+export function teardownWith(
+  mutate: (state: MutableTeardown) => unknown,
+): MutableTeardown {
+  const state = teardownState();
+  mutate(state);
+  return state;
 }

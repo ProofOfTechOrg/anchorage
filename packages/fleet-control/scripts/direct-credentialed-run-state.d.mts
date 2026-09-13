@@ -51,6 +51,7 @@ export interface DirectRunSnapshot {
     | null;
   readonly bootstrap: DirectBootstrapState | null;
   readonly scenario?: DirectScenarioState;
+  readonly teardown?: DirectTeardownState;
 }
 
 export interface DirectBootstrapContext {
@@ -119,10 +120,111 @@ export interface DirectBootstrapState {
   readonly pending: DirectBootstrapMutation | null;
 }
 
+export type DirectTeardownPhase =
+  | 'refused'
+  | 'ingress'
+  | 'worker'
+  | 'fleet'
+  | 'quota'
+  | 'export-objects'
+  | 'exports'
+  | 'residual'
+  | 'complete';
+
+export type DirectTeardownMutation =
+  | 'disable-reference-ingress'
+  | 'delete-reference-worker'
+  | 'delete-fleet-d1'
+  | 'delete-quota-d1'
+  | 'delete-export-object'
+  | 'delete-export-r2';
+
+export type DirectTeardownFailure =
+  | 'scenario-incomplete'
+  | 'outcome-unknown'
+  | 'unexpected-object'
+  | 'identity-mismatch'
+  | 'residual-present'
+  | 'forbidden'
+  | 'provider-unavailable'
+  | 'budget-exhausted'
+  | 'invalid-state';
+
+export type DirectResidualSurface =
+  | 'databases'
+  | 'durableObjectNamespaces'
+  | 'scripts'
+  | 'buckets'
+  | 'domains'
+  | 'routes';
+
+export interface DirectResidualObservation {
+  readonly version: 1;
+  readonly surfaces: Readonly<
+    Record<
+      DirectResidualSurface,
+      Readonly<{
+        prefixCount: number;
+        prefixNames: readonly string[];
+        globalCount: number | null;
+        exhaustive: boolean;
+      }>
+    >
+  >;
+  readonly bucketJurisdictions: readonly ['default'];
+  readonly dispatch: Readonly<{
+    kind: 'first-page-404' | 'empty' | 'enumerated' | 'fail-closed';
+    count: number;
+    status: number | null;
+    prefixCount: number;
+  }>;
+  readonly versionsGone: boolean | null;
+  readonly settleAttempts: number;
+}
+
+interface DirectTeardownSettlement {
+  readonly ordinal: number;
+  readonly settledByReread: boolean;
+}
+
+export interface DirectTeardownReceipts {
+  readonly ingress: DirectTeardownSettlement | null;
+  readonly worker:
+    | (DirectTeardownSettlement &
+        Readonly<{ scriptName: string; secretNames: readonly string[] }>)
+    | null;
+  readonly fleet:
+    | (DirectTeardownSettlement & Readonly<{ uuid: string }>)
+    | null;
+  readonly quota:
+    | (DirectTeardownSettlement & Readonly<{ uuid: string }>)
+    | null;
+  readonly exportObjects: readonly (DirectTeardownSettlement &
+    Readonly<{ key: string }>)[];
+  readonly exports:
+    | (DirectTeardownSettlement & Readonly<{ name: string }>)
+    | null;
+}
+
+export interface DirectTeardownState {
+  readonly version: 1;
+  readonly phase: DirectTeardownPhase;
+  readonly pending: Readonly<{
+    kind: DirectTeardownMutation;
+    key?: string;
+  }> | null;
+  readonly receipts: DirectTeardownReceipts;
+  readonly residual: DirectResidualObservation | null;
+  readonly providerRequests: number;
+  readonly failure: DirectTeardownFailure | null;
+}
+
 export interface DirectRunJournal {
   readonly directory: string;
   snapshot(): DirectRunSnapshot;
   recordScenario(state: DirectScenarioState): Promise<void>;
+  recordTeardown(state: DirectTeardownState): Promise<void>;
+  assertTeardownCapacity(worstCase: DirectTeardownState): Promise<void>;
   bindBootstrapContext(context: DirectBootstrapContext): Promise<void>;
   beginBootstrapMutation(kind: DirectBootstrapMutation): Promise<void>;
   confirmBootstrapMutation(
@@ -171,6 +273,23 @@ export const DIRECT_SCENARIO_OPERATION_SLOTS: readonly [
   'decommission-b',
   'decommission-recovery',
 ];
+
+export const DIRECT_TEARDOWN_PHASES: readonly DirectTeardownPhase[];
+
+export const DIRECT_TEARDOWN_MUTATIONS: readonly DirectTeardownMutation[];
+
+export const DIRECT_TEARDOWN_FAILURES: readonly DirectTeardownFailure[];
+
+export const DIRECT_RESIDUAL_SURFACES: readonly DirectResidualSurface[];
+
+export const DIRECT_TEARDOWN_MAXIMA: Readonly<{
+  nameBytes: number;
+  keyBytes: number;
+  prefixNames: number;
+  secretNames: number;
+  exportObjects: number;
+  settleAttempts: number;
+}>;
 
 export const DIRECT_RUN_MAX_JOURNAL_BYTES: number;
 

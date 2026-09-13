@@ -165,6 +165,7 @@ async function decodeSnapshot(value, binding) {
           ...keys,
           'bootstrap',
           ...(Object.hasOwn(value, 'scenario') ? ['scenario'] : []),
+          ...(Object.hasOwn(value, 'teardown') ? ['teardown'] : []),
         ],
   );
   object(value.binding, Object.keys(binding));
@@ -216,6 +217,9 @@ async function decodeSnapshot(value, binding) {
     ? decodeScenario(value.scenario, value.invocationCount)
     : undefined;
   if (scenario) await validateScenarioActions(scenario, binding);
+  const teardown = Object.hasOwn(value, 'teardown')
+    ? decodeTeardown(value.teardown)
+    : undefined;
   return Object.freeze({
     version: 2,
     binding,
@@ -228,6 +232,7 @@ async function decodeSnapshot(value, binding) {
       lastInvocation,
     ),
     ...(scenario ? { scenario } : {}),
+    ...(teardown ? { teardown } : {}),
   });
 }
 
@@ -292,6 +297,77 @@ export const DIRECT_SCENARIO_OPERATION_SLOTS = Object.freeze([
   'decommission-b',
   'decommission-recovery',
 ]);
+
+export const DIRECT_TEARDOWN_PHASES = Object.freeze([
+  'refused',
+  'ingress',
+  'worker',
+  'fleet',
+  'quota',
+  'export-objects',
+  'exports',
+  'residual',
+  'complete',
+]);
+
+export const DIRECT_TEARDOWN_MUTATIONS = Object.freeze([
+  'disable-reference-ingress',
+  'delete-reference-worker',
+  'delete-fleet-d1',
+  'delete-quota-d1',
+  'delete-export-object',
+  'delete-export-r2',
+]);
+
+export const DIRECT_TEARDOWN_FAILURES = Object.freeze([
+  'scenario-incomplete',
+  'outcome-unknown',
+  'unexpected-object',
+  'identity-mismatch',
+  'residual-present',
+  'forbidden',
+  'provider-unavailable',
+  'budget-exhausted',
+  'invalid-state',
+]);
+
+export const DIRECT_RESIDUAL_SURFACES = Object.freeze([
+  'databases',
+  'durableObjectNamespaces',
+  'scripts',
+  'buckets',
+  'domains',
+  'routes',
+]);
+
+export const DIRECT_TEARDOWN_MAXIMA = Object.freeze({
+  nameBytes: 255,
+  keyBytes: 1024,
+  prefixNames: 16,
+  secretNames: 8,
+  exportObjects: 2,
+  settleAttempts: 5,
+});
+
+const TEARDOWN_RECEIPT_FIELD = Object.freeze({
+  'disable-reference-ingress': 'ingress',
+  'delete-reference-worker': 'worker',
+  'delete-fleet-d1': 'fleet',
+  'delete-quota-d1': 'quota',
+  'delete-export-object': 'exportObjects',
+  'delete-export-r2': 'exports',
+});
+
+const TEARDOWN_RECEIPT_ORDER = Object.freeze([
+  'ingress',
+  'worker',
+  'fleet',
+  'quota',
+  'exportObjects',
+  'exports',
+]);
+
+const RESIDUAL_PHASES = Object.freeze(['refused', 'residual', 'complete']);
 
 const scenarioNumber = (value) => {
   if (!Number.isSafeInteger(value) || value < 0) invalid();
@@ -1054,6 +1130,148 @@ function decodeBootstrap(value, binding, invocationCount, lastInvocation) {
   return Object.freeze(result);
 }
 
+const teardownText = (max) => (value) => {
+  identifier(value, max);
+  // Journal capacity is budgeted in bytes; `identifier` bounds UTF-16 units.
+  if (Buffer.byteLength(value) > max) invalid();
+  return value;
+};
+const teardownFlag = scenarioEnum(true, false);
+const teardownSettleAttempts = (value) => {
+  scenarioNumber(value);
+  if (value < 1 || value > DIRECT_TEARDOWN_MAXIMA.settleAttempts) invalid();
+  return value;
+};
+const teardownJurisdictions = (value) => {
+  if (!Array.isArray(value) || value.length !== 1 || value[0] !== 'default')
+    invalid();
+  return Object.freeze(['default']);
+};
+const residualSurfaceShape = {
+  prefixCount: scenarioNumber,
+  prefixNames: boundedArray(
+    teardownText(DIRECT_TEARDOWN_MAXIMA.nameBytes),
+    DIRECT_TEARDOWN_MAXIMA.prefixNames,
+  ),
+  globalCount: nullable(scenarioNumber),
+  exhaustive: teardownFlag,
+};
+const residualShape = {
+  version: 1,
+  surfaces: Object.fromEntries(
+    DIRECT_RESIDUAL_SURFACES.map((surface) => [surface, residualSurfaceShape]),
+  ),
+  bucketJurisdictions: teardownJurisdictions,
+  dispatch: {
+    kind: scenarioEnum('first-page-404', 'empty', 'enumerated', 'fail-closed'),
+    count: scenarioNumber,
+    status: nullable(scenarioNumber),
+    prefixCount: scenarioNumber,
+  },
+  versionsGone: nullable(teardownFlag),
+  settleAttempts: teardownSettleAttempts,
+};
+const teardownSettlement = {
+  ordinal: scenarioNumber,
+  settledByReread: teardownFlag,
+};
+const teardownShape = {
+  version: 1,
+  phase: scenarioEnum(...DIRECT_TEARDOWN_PHASES),
+  pending: nullable({
+    kind: scenarioEnum(...DIRECT_TEARDOWN_MUTATIONS),
+    key: optional(teardownText(DIRECT_TEARDOWN_MAXIMA.keyBytes)),
+  }),
+  receipts: {
+    ingress: nullable(teardownSettlement),
+    worker: nullable({
+      scriptName: teardownText(DIRECT_TEARDOWN_MAXIMA.nameBytes),
+      secretNames: boundedArray(
+        teardownText(DIRECT_TEARDOWN_MAXIMA.nameBytes),
+        DIRECT_TEARDOWN_MAXIMA.secretNames,
+      ),
+      ...teardownSettlement,
+    }),
+    fleet: nullable({
+      uuid: teardownText(DIRECT_TEARDOWN_MAXIMA.nameBytes),
+      ...teardownSettlement,
+    }),
+    quota: nullable({
+      uuid: teardownText(DIRECT_TEARDOWN_MAXIMA.nameBytes),
+      ...teardownSettlement,
+    }),
+    exportObjects: boundedArray(
+      {
+        key: teardownText(DIRECT_TEARDOWN_MAXIMA.keyBytes),
+        ...teardownSettlement,
+      },
+      DIRECT_TEARDOWN_MAXIMA.exportObjects,
+    ),
+    exports: nullable({
+      name: teardownText(DIRECT_TEARDOWN_MAXIMA.nameBytes),
+      ...teardownSettlement,
+    }),
+  },
+  residual: nullable(residualShape),
+  providerRequests: scenarioNumber,
+  failure: nullable(scenarioEnum(...DIRECT_TEARDOWN_FAILURES)),
+};
+
+function teardownReceiptSet(receipts, field) {
+  return field === 'exportObjects'
+    ? receipts.exportObjects.length > 0
+    : receipts[field] !== null;
+}
+
+function teardownOrdinals(state) {
+  return [
+    ...TEARDOWN_RECEIPT_ORDER.filter((field) => field !== 'exportObjects')
+      .map((field) => state.receipts[field]?.ordinal)
+      .filter((ordinal) => ordinal !== undefined),
+    ...state.receipts.exportObjects.map((entry) => entry.ordinal),
+  ];
+}
+
+function decodeTeardown(value) {
+  const result = scenarioShape(value, teardownShape);
+  const { pending, receipts } = result;
+  if (pending) {
+    const keyed = pending.kind === 'delete-export-object';
+    if (keyed !== Object.hasOwn(pending, 'key')) invalid();
+    // One atomic write publishes a receipt and clears the pending that names
+    // it, so this intermediate never reaches disk.
+    if (
+      keyed
+        ? receipts.exportObjects.some((entry) => entry.key === pending.key)
+        : receipts[TEARDOWN_RECEIPT_FIELD[pending.kind]] !== null
+    )
+      invalid();
+  }
+  const keys = new Set(receipts.exportObjects.map((entry) => entry.key));
+  if (keys.size !== receipts.exportObjects.length) invalid();
+  TEARDOWN_RECEIPT_ORDER.forEach((field, index) => {
+    if (!teardownReceiptSet(receipts, field)) return;
+    for (const earlier of TEARDOWN_RECEIPT_ORDER.slice(0, index))
+      if (
+        !(field === 'exports' && earlier === 'exportObjects') &&
+        !teardownReceiptSet(receipts, earlier)
+      )
+        invalid();
+  });
+  if (
+    result.phase === 'refused' &&
+    (pending !== null ||
+      result.failure === null ||
+      TEARDOWN_RECEIPT_ORDER.some((field) =>
+        teardownReceiptSet(receipts, field),
+      ))
+  )
+    invalid();
+  if (result.residual !== null && !RESIDUAL_PHASES.includes(result.phase))
+    invalid();
+  return result;
+}
+
 function assertPrivate(stat, directory) {
   if (
     stat.uid !== process.getuid() ||
@@ -1166,6 +1384,10 @@ async function readSnapshot(path, binding) {
   }
 }
 
+function serialize(snapshot) {
+  return `${JSON.stringify(snapshot)}\n`;
+}
+
 async function writeSnapshot(directory, handle, snapshot) {
   const temporary = join(directory, `.journal-${randomUUID()}.tmp`);
   let file;
@@ -1178,7 +1400,7 @@ async function writeSnapshot(directory, handle, snapshot) {
     );
     created = true;
     assertPrivate(await file.stat(), false);
-    const serialized = `${JSON.stringify(snapshot)}\n`;
+    const serialized = serialize(snapshot);
     if (Buffer.byteLength(serialized) > DIRECT_RUN_MAX_JOURNAL_BYTES) invalid();
     await file.writeFile(serialized);
     await file.sync();
@@ -1282,9 +1504,24 @@ function runJournal(directory, directoryHandle, base, lock, initial) {
   const assertSettled = () => {
     if (
       snapshot.lastInvocation?.state === 'pending' ||
-      snapshot.bootstrap?.pending
+      snapshot.bootstrap?.pending ||
+      snapshot.teardown?.pending
     )
       throw new DirectRunStateError('outcome-unknown');
+  };
+  const teardownStarted = () =>
+    Boolean(snapshot.teardown) &&
+    TEARDOWN_RECEIPT_ORDER.some((field) =>
+      teardownReceiptSet(snapshot.teardown.receipts, field),
+    );
+  const withinCapacity = async (fields) => {
+    const next = await decodeSnapshot(
+      { ...snapshot, ...fields },
+      snapshot.binding,
+    );
+    if (Buffer.byteLength(serialize(next)) > DIRECT_RUN_MAX_JOURNAL_BYTES)
+      invalid();
+    return next;
   };
   return Object.freeze({
     directory,
@@ -1294,6 +1531,7 @@ function runJournal(directory, directoryHandle, base, lock, initial) {
     recordScenario(value) {
       return enqueue(async () => {
         assertSettled();
+        if (teardownStarted()) invalid();
         const scenario = decodeScenario(value, snapshot.invocationCount);
         await validateScenarioActions(scenario, snapshot.binding);
         if (!snapshot.bootstrap?.controlReadOrdinal) invalid();
@@ -1369,6 +1607,55 @@ function runJournal(directory, directoryHandle, base, lock, initial) {
           }
         }
         await publishSnapshot({ scenario });
+      });
+    },
+    recordTeardown(value) {
+      return enqueue(async () => {
+        // Receipts publish while their own mutation is still pending, so this
+        // path checks the invocation and bootstrap gates without `assertSettled`.
+        if (
+          snapshot.lastInvocation?.state === 'pending' ||
+          snapshot.bootstrap?.pending
+        )
+          throw new DirectRunStateError('outcome-unknown');
+        const teardown = decodeTeardown(value);
+        const previous = snapshot.teardown;
+        if (previous) {
+          const position = (phase) => DIRECT_TEARDOWN_PHASES.indexOf(phase);
+          if (
+            previous.phase === 'refused'
+              ? teardown.phase !== 'refused'
+              : teardown.phase === 'refused' ||
+                position(teardown.phase) < position(previous.phase) ||
+                position(teardown.phase) > position(previous.phase) + 1
+          )
+            invalid();
+          if (
+            teardown.providerRequests < previous.providerRequests ||
+            Math.max(0, ...teardownOrdinals(teardown)) <
+              Math.max(0, ...teardownOrdinals(previous))
+          )
+            invalid();
+          for (const field of TEARDOWN_RECEIPT_ORDER) {
+            if (field === 'exportObjects') {
+              if (
+                teardown.receipts.exportObjects.length <
+                previous.receipts.exportObjects.length
+              )
+                invalid();
+              previous.receipts.exportObjects.forEach((entry, index) => {
+                equalShape(teardown.receipts.exportObjects[index], entry);
+              });
+            } else if (previous.receipts[field] !== null)
+              equalShape(teardown.receipts[field], previous.receipts[field]);
+          }
+        }
+        await publish(await withinCapacity({ teardown }));
+      });
+    },
+    assertTeardownCapacity(worstCase) {
+      return enqueue(async () => {
+        await withinCapacity({ teardown: worstCase });
       });
     },
     bindBootstrapContext(context) {
@@ -1458,6 +1745,7 @@ function runJournal(directory, directoryHandle, base, lock, initial) {
     reserveInvocation(serializedRequest) {
       return enqueue(async () => {
         assertSettled();
+        if (teardownStarted()) invalid();
         if (snapshot.invocationCount >= snapshot.binding.maxInvocations)
           throw new DirectRunStateError('invocation-budget-exhausted');
         const request = await decodeRequest(

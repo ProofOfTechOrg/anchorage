@@ -5,9 +5,13 @@ import { isDeepStrictEqual } from 'node:util';
 
 import {
   validateProviderAuth as auth,
+  classifyDispatchNamespaces,
   DirectProviderError,
+  identifier,
+  inventory,
   openDirectProviderSession,
 } from './direct-credentialed-provider.mjs';
+import { DirectRunStateError } from './direct-credentialed-run-state.mjs';
 
 const ERROR_CODES = new Set([
   'invalid-input',
@@ -35,21 +39,6 @@ function refuse(code = 'observation-mismatch') {
 
 function object(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) refuse();
-  return value;
-}
-
-function identifier(value, max = 128) {
-  if (
-    typeof value !== 'string' ||
-    !value ||
-    value !== value.trim() ||
-    value.length > max ||
-    [...value].some(
-      (character) =>
-        character.charCodeAt(0) <= 31 || character.charCodeAt(0) === 127,
-    )
-  )
-    refuse();
   return value;
 }
 
@@ -230,29 +219,6 @@ async function checkedInput(input) {
       throw error;
     refuse('invalid-input');
   }
-}
-
-async function inventory(pages, identity, bound) {
-  const rows = [];
-  const seen = new Set();
-  let expectedCount = 0;
-  let expectedPages = 0;
-  let pageCount = 0;
-  for await (const page of (await pages).iterPages()) {
-    pageCount += 1;
-    expectedCount = Math.max(expectedCount, page.result_info?.total_count ?? 0);
-    expectedPages = Math.max(expectedPages, page.result_info?.total_pages ?? 0);
-    for (const row of page.result) {
-      const keys = identity(row);
-      if (keys.some((key) => seen.has(key)) || rows.length >= bound)
-        refuse('provider-unavailable');
-      for (const key of keys) seen.add(key);
-      rows.push(row);
-    }
-  }
-  if (rows.length < expectedCount || pageCount < expectedPages)
-    refuse('provider-unavailable');
-  return rows;
 }
 
 function zone(row, accountId) {
@@ -459,26 +425,12 @@ export async function bootstrapDirectConformance(input) {
       selectedZone.name !== matches[0].name
     )
       refuse();
-    let dispatch;
-    try {
-      const namespaces = await inventory(
-        single.workersForPlatforms.dispatch.namespaces.list(selectors),
-        (row) => {
-          return [
-            `id:${identifier(row.namespace_id)}`,
-            `name:${identifier(row.namespace_name)}`,
-          ];
-        },
-        bound,
-      );
-      dispatch = {
-        kind: namespaces.length ? 'enumerated' : 'empty',
-        count: namespaces.length,
-      };
-    } catch (error) {
-      if (!(error instanceof APIError) || error.status !== 404) throw error;
-      dispatch = { kind: 'first-page-404', count: 0 };
-    }
+    const namespaces = await classifyDispatchNamespaces(
+      single,
+      selectors,
+      bound,
+    );
+    const dispatch = { kind: namespaces.kind, count: namespaces.count };
     await journal.bindBootstrapContext({
       names,
       zoneId: selectedZone.id,
@@ -800,6 +752,8 @@ export async function bootstrapDirectConformance(input) {
   } catch (error) {
     if (error instanceof DirectBootstrapError) throw error;
     if (error instanceof DirectProviderError) refuse(error.code);
+    if (error instanceof DirectRunStateError)
+      refuse(error.code === 'outcome-unknown' ? error.code : 'invalid-input');
     if (transport?.failure()) refuse(transport.failure());
     if (error?.name === 'DirectInvocationError' && ERROR_CODES.has(error.code))
       refuse(error.code);
