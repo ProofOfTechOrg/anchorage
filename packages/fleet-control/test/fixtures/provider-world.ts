@@ -117,6 +117,7 @@ export interface ProviderScript {
   present: boolean;
   versions: ProviderVersion[];
   deployment?: Array<{ versionId: string; percentage: number }>;
+  deploymentId?: string;
   subdomain: { enabled: boolean; previewsEnabled: boolean };
   secretNames: Set<string>;
 }
@@ -290,7 +291,7 @@ export class ProviderWorld {
     hostname: string;
     service: string;
   }> = [];
-  readonly zones: Array<{ id: string }> = [];
+  readonly zones: Array<{ id: string; name?: string }> = [];
   readonly routes: WorkerRoute[] = [];
   readonly durableObjectNamespaces: Array<{
     id: string;
@@ -407,6 +408,7 @@ export class ProviderWorld {
       ...(script.deployment
         ? { deployment: script.deployment.map((version) => ({ ...version })) }
         : {}),
+      ...(script.deploymentId ? { deploymentId: script.deploymentId } : {}),
       subdomain: { ...script.subdomain },
       secretNames:
         script.secretNames ??
@@ -540,6 +542,7 @@ export class ProviderWorld {
         present: script.present,
         versions: script.versions,
         ...(script.deployment ? { deployment: script.deployment } : {}),
+        ...(script.deploymentId ? { deploymentId: script.deploymentId } : {}),
         subdomain: script.subdomain,
         secretNames: new Set(script.secretNames),
       });

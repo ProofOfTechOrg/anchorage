@@ -640,6 +640,63 @@ After both Workers for Platforms deployments decommission, the runner derives th
 
 A backend wrapper records a valid, nonempty `wrangler versions list --json` version-ID set immediately before control-secret revocation, after revocation, and before Worker deletion. Secret deletion may add Worker versions, and Wrangler's ten-entry rolling window may remove earlier IDs from later observations. Decommission must still reach `decommissioned`, and the gate re-reads the exported database's immutable ID through Cloudflare to prove absence. Fleet Control uses exact persisted artifact-ID membership as the pre-mutation gate in traffic removal. Before secret mutation and Worker deletion, it separately resolves the persisted artifact with `wrangler versions view`, which is not limited to the ten entries returned by `versions list`, and verifies that every deployed version has the persisted tenant, environment, database, specification, schema, and ingress identity. This live check accepts provider-created version IDs. Deletion also validates ingress and the resource footprint, then verifies full Worker absence. If the proof fails after control-secret deletion begins, the runner validates the same live teardown identity before removing that exact uniquely suffixed Worker and resuming normal database and state cleanup.
 
+## Run the direct-API credentialed proof
+
+Use the repository's direct-API lane to verify ordinary Worker provisioning, migration interruption and resumption, execution-fence proofs, and teardown. The offline acceptance runs the real runtime through a fixture provider and local workerd, starting from confirmed bootstrap receipts. It exercises bootstrap revalidation and teardown; resource creation and live provider behavior require the credentialed lane. No live acceptance is established until you supply credentials and run it against an account.
+
+Start with the [direct configuration shape](../packages/fleet-control/scripts/direct-credentialed-conformance.example.json). Supply the reference and tenant artifacts and their digests, an owned hostname, a disposable resource prefix, and explicit request and invocation limits. Keep credentials outside the configuration. For the deployment protocol, follow [Roll out an artifact under the execution fence](#roll-out-an-artifact-under-the-execution-fence).
+
+Run this lane on Linux from a repository checkout. It uses a filesystem lock and stores the journal and evidence under `.direct-conformance/<resourcePrefix>/` beside the configuration file. Preserve that directory and the configuration bytes when resuming.
+
+Set these environment variables:
+
+| Variable | Required for | Value |
+| --- | --- | --- |
+| `FLEET_DIRECT_CONFORMANCE_CONFIG` | Preflight, run, resume | Path to the configuration |
+| `CLOUDFLARE_ACCOUNT_ID` | Run, resume | Account identifier |
+| `CLOUDFLARE_API_TOKEN` | Run, resume | Provider token |
+| `FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET` | Run, resume | Reference-worker invocation secret |
+
+Values must be nonempty, without surrounding whitespace or control characters. The runner does not load `.env` files or discover a Wrangler login. Help needs no configuration or credentials.
+
+Validate the local configuration and artifacts before supplying credentials. The default mode is `--preflight`; it constructs no SDK client, takes no run lock, and writes no evidence. The workspace script builds the package before invoking the entry:
+
+```bash
+pnpm fleet-control:credentialed:direct -- --preflight
+```
+
+After a build, the entry avoids another build for local preflight:
+
+```bash
+node packages/fleet-control/scripts/direct-credentialed-conformance.mjs --preflight
+```
+
+Start a new run with `--run`. When it exits with `3`, run `--resume` in a fresh process using the same configuration and credentials:
+
+```bash
+pnpm fleet-control:credentialed:direct -- --run
+pnpm fleet-control:credentialed:direct -- --resume
+```
+
+Modes are mutually exclusive. Use `--help` for usage. Live modes require built package output and reject an invocation budget below the scenario floor before acquiring a lock or contacting the provider. Resuming an in-flight scenario spends a bootstrap control read as well as scenario invocations; phase ceilings and remaining-phase reserves also constrain progress.
+
+| Exit | Meaning | Action |
+| --- | --- | --- |
+| `0` | Cleaned, or successful preflight/help | Inspect the summary and, for a live run, evidence |
+| `1` | Failed, outcome unknown, or run-state refusal | Inspect the refusal and retained identities |
+| `2` | Invalid usage, environment, configuration, or live-mode admission | Correct the named input |
+| `3` | Restart required | Resume in a fresh process |
+| `4` | Resources retained | Use the recorded facts for recovery approval |
+| `5` | Evidence failed, or the summary line is withheld because it would contain a credential | With a summary, check `evidenceWritten`; with no output at all, read `evidence.json` directly: its `exitCode` and `status` are the run's own |
+
+A successful complete teardown makes a later resume evidence-only, with no provider requests and a null `teardownCall`. A recorded teardown refusal re-observes residuals and retains resources instead of advancing into deletion. Pending invocation or bootstrap mutations refuse automated continuation with `outcome-unknown`: inspection validates the journal binding under the same lock, reports retained identities, and writes evidence without mutating the journal. Pending teardown work can resume reconciliation. Concurrent callers fail with `lock-unavailable`; an existing run refuses `--run` with `run-exists`.
+
+Give `evidence.json` to the recovery approval. Its allowlist projects configuration and artifact digests, versions, times, resume and invocation counts, dispatch classification, scenario failures and proofs, teardown receipts and residual counts, the current teardown call, and retained resource identities. Account and zone identifiers are represented by hash suffixes; cost remains `unknown`. The journal retains residual names that evidence omits. Top-level `status` describes cleanup disposition, while `scenario.failure` describes the scenario outcome; `teardownCall` records the current call separately from durable teardown state.
+
+The writer scans decoded string values and serialized bytes for credentials and forbidden literals. It writes with mode `0600`, verifies a temporary file by reading it back, and replaces the artifact atomically before syncing the directory. A failure before replacement leaves an older artifact untouched and reports `evidenceWritten: false`; a directory-sync failure after replacement reports `true` with durability unconfirmed. Summaries and refusals exclude raw provider errors, credentials, headers, and bodies.
+
+Treat residual inventory according to its recorded scope: `SinglePage` surfaces are not provably exhaustive, and the global bucket count covers the `default` jurisdiction. Offline results do not establish live resource creation, live account cleanup, or recovery authorization.
+
 ## Preserve the control-plane boundary
 
 Keep these constraints in every operator surface:

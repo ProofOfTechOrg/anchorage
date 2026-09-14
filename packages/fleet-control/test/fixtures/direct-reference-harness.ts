@@ -299,10 +299,12 @@ export async function createDirectReferenceHarness(
         : undefined;
     if (
       request.method === 'GET' &&
-      url.pathname.endsWith('/deployments/deployment')
+      url.pathname.endsWith(
+        `/deployments/${script?.deploymentId ?? 'deployment'}`,
+      )
     )
       return single({
-        id: 'deployment',
+        id: script?.deploymentId ?? 'deployment',
         strategy: 'percentage',
         versions: script?.deployment?.map(({ versionId, percentage }) => ({
           version_id: versionId,
@@ -357,6 +359,16 @@ export async function createDirectReferenceHarness(
       return value
         ? new Response(await value.arrayBuffer())
         : new Response(null, { status: 404 });
+    }
+    if (
+      request.method === 'DELETE' &&
+      url.pathname.startsWith(
+        `/client/v4/accounts/account/r2/buckets/${binding.exportBucketName}/objects/`,
+      )
+    ) {
+      const key = decodeURIComponent(url.pathname.split('/objects/')[1] ?? '');
+      await exportBytes.delete(key);
+      return single({});
     }
     let response = await rest(request);
     if (metadata && response.ok && scriptName) {
@@ -584,14 +596,17 @@ export async function createDirectReferenceHarness(
       );
       if (
         typeof requested !== 'string' ||
-        !records.some((record) =>
-          record?.applicationResources?.some(
-            (resource) =>
-              resource.bucketName === requested &&
-              resource.jurisdiction === jurisdiction &&
-              resource.state === 'create-authorized',
-          ),
-        )
+        (!(
+          requested === binding.exportBucketName && jurisdiction === 'default'
+        ) &&
+          !records.some((record) =>
+            record?.applicationResources?.some(
+              (resource) =>
+                resource.bucketName === requested &&
+                resource.jurisdiction === jurisdiction &&
+                resource.state === 'create-authorized',
+            ),
+          ))
       )
         throw new Error('unexpected fixture bucket');
       const key = `${jurisdiction}:${requested}`;
@@ -619,6 +634,7 @@ export async function createDirectReferenceHarness(
     const key = `${jurisdiction}:${name}`;
     if (
       !match[2] &&
+      name !== binding.exportBucketName &&
       request.method === 'GET' &&
       world.consumeFailure('getApplicationR2Bucket')
     )
@@ -632,6 +648,16 @@ export async function createDirectReferenceHarness(
     const descriptor = buckets.get(key);
     if (!descriptor) return Response.json({ errors: [] }, { status: 404 });
     const prefix = `${key}/`;
+    if (
+      name === binding.exportBucketName &&
+      match[2] &&
+      request.method === 'GET'
+    ) {
+      const objects = await exportBytes.list({
+        prefix: url.searchParams.get('prefix') ?? '',
+      });
+      return single(objects.objects.map(({ key }) => ({ key })));
+    }
     if (match[2] && request.method === 'GET') {
       expect(url.searchParams.get('per_page')).toBe('1');
       const objects = await applicationBytes.list({
@@ -653,6 +679,13 @@ export async function createDirectReferenceHarness(
     }
     if (!match[2] && request.method === 'GET') return single(descriptor);
     if (!match[2] && request.method === 'DELETE') {
+      if (name === binding.exportBucketName) {
+        const objects = await exportBytes.list({ limit: 1 });
+        if (objects.objects.length)
+          return new Response('bucket nonempty', { status: 409 });
+        buckets.delete(key);
+        return single({});
+      }
       const failure = world.consumeFailure('deleteApplicationR2Bucket');
       const failed = () =>
         Response.json(
@@ -936,6 +969,7 @@ let instance; export default {async fetch(request,env){instance??=crypto.randomU
       return exportBytes;
     },
     buckets,
+    versionRuntime,
     bridgeErrors,
     sqlFailures,
     bridgeUrl,

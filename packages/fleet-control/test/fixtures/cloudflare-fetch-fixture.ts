@@ -76,10 +76,13 @@ export function envelope(result: unknown): Response {
 
 export function zoneAuthorityResponse(
   url: URL,
-  zoneIds: readonly string[],
+  zoneIds: readonly (string | { id: string; name?: string })[],
   routes?: readonly WorkerRoute[],
 ): Response | undefined {
-  if (url.pathname.endsWith('/user/tokens/verify')) {
+  if (
+    url.pathname.endsWith('/user/tokens/verify') ||
+    url.pathname.endsWith('/accounts/account/tokens/verify')
+  ) {
     return envelope({ id: 'token-id', status: 'active' });
   }
   if (url.pathname.endsWith('/accounts/account/tokens/token-id')) {
@@ -106,12 +109,32 @@ export function zoneAuthorityResponse(
   }
   if (url.pathname.endsWith('/zones')) {
     expect(url.searchParams.get('account.id')).toBe('account');
-    if (Number(url.searchParams.get('page') ?? '1') !== 1) return envelope([]);
-    return envelope(zoneIds.map((id) => ({ id, account: { id: 'account' } })));
+    if (Number(url.searchParams.get('page') ?? '1') !== 1)
+      return pageArray([], {
+        page: Number(url.searchParams.get('page')),
+        per_page: 20,
+      });
+    return envelope(
+      zoneIds.map((zone) => ({
+        ...(typeof zone === 'string' ? { id: zone } : zone),
+        account: { id: 'account' },
+      })),
+    );
   }
   const parts = url.pathname.split('/').filter(Boolean);
   const zoneIndex = parts.indexOf('zones');
   const zoneId = zoneIndex >= 0 ? parts[zoneIndex + 1] : undefined;
+  if (zoneId && url.pathname.endsWith(`/zones/${zoneId}`)) {
+    const zone = zoneIds.find((zone) =>
+      typeof zone === 'string' ? zone === zoneId : zone.id === zoneId,
+    );
+    return zone
+      ? single({
+          ...(typeof zone === 'string' ? { id: zone } : zone),
+          account: { id: 'account' },
+        })
+      : Response.json({ errors: [] }, { status: 404 });
+  }
   if (routes && zoneId && url.pathname.endsWith('/workers/routes')) {
     return envelope(
       routes
@@ -303,12 +326,15 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
         status: 403,
       });
     }
-    const authority = zoneAuthorityResponse(
-      target,
-      world.zones.map(({ id }) => id),
-      world.routes,
-    );
+    const authority = zoneAuthorityResponse(target, world.zones, world.routes);
     if (authority) return authority;
+    if (method === 'GET' && target.pathname === '/client/v4/accounts/account')
+      return single({ id: 'account' });
+    if (
+      method === 'GET' &&
+      target.pathname === '/client/v4/accounts/account/workers/subdomain'
+    )
+      return single({ subdomain: 'attested-account' });
     const parts = target.pathname.split('/').filter(Boolean);
     const routeIndex = parts.indexOf('routes');
     const routeId = routeIndex >= 0 ? parts[routeIndex + 1] : undefined;
@@ -327,12 +353,15 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
       body && typeof body === 'object' ? Reflect.get(body, name) : undefined;
     if (target.pathname.endsWith('/d1/database') && method === 'GET') {
       if (Number(target.searchParams.get('page') ?? '1') !== 1)
-        return pageArray([]);
+        return pageArray([], { page: Number(target.searchParams.get('page')) });
       const requestedName = target.searchParams.get('name');
       return pageArray(
         world.databases
           .filter(
-            ({ name }) => requestedName === null || name === requestedName,
+            ({ name }) =>
+              requestedName === null ||
+              name === requestedName ||
+              name.startsWith(requestedName),
           )
           .map(({ databaseId, name }) => ({
             uuid: databaseId,
@@ -433,7 +462,7 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
     }
     if (target.pathname.endsWith('/workers/scripts') && method === 'GET') {
       if (Number(target.searchParams.get('page') ?? '1') !== 1)
-        return pageArray([]);
+        return pageArray([], { page: Number(target.searchParams.get('page')) });
       return pageArray(
         [...world.scripts.entries()].flatMap(([id, script]) =>
           script.present ? [{ id }] : [],
@@ -490,7 +519,7 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
       method === 'GET'
     ) {
       if (Number(target.searchParams.get('page') ?? '1') !== 1)
-        return pageArray([]);
+        return pageArray([], { page: Number(target.searchParams.get('page')) });
       return pageArray(
         world.durableObjectNamespaces.map((namespace) => ({
           id: namespace.id,
@@ -505,6 +534,7 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
     ) {
       return pageArray(
         world.dispatchNamespaces.map((namespace) => ({
+          namespace_id: namespace.name,
           namespace_name: namespace.name,
           trusted_workers: false,
           script_count: namespace.scripts.length,
@@ -625,7 +655,7 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
     }
     if (target.pathname.endsWith('/secrets') && method === 'GET') {
       if (Number(target.searchParams.get('page') ?? '1') !== 1)
-        return pageArray([]);
+        return pageArray([], { page: Number(target.searchParams.get('page')) });
       return pageArray(
         [...script.secretNames].sort().map((name) => ({ name })),
       );
@@ -668,7 +698,7 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
         deployments: script.deployment
           ? [
               {
-                id: 'deployment',
+                id: script.deploymentId ?? 'deployment',
                 created_on: '2026-08-26T00:00:00.000Z',
                 source: 'api',
                 strategy: 'percentage',
@@ -685,7 +715,7 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
     }
     if (target.pathname.endsWith('/versions') && method === 'GET') {
       if (Number(target.searchParams.get('page') ?? '1') !== 1)
-        return pageItems([]);
+        return pageItems([], { page: Number(target.searchParams.get('page')) });
       return pageItems(
         script.versions.map(({ versionId, tag }) => ({
           id: versionId,
@@ -760,7 +790,10 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
       if (uploadFailure) await world.applyAfter('uploadCandidate');
       else await world.applyAfter('disablePublicAccess');
       if (failure) return failure.response ?? failureResponse(failure);
-      return single({ enabled: script.subdomain.enabled });
+      return single({
+        enabled: script.subdomain.enabled,
+        previews_enabled: script.subdomain.previewsEnabled,
+      });
     }
     if (target.pathname.endsWith('/deployments') && method === 'POST') {
       const versions = bodyField('versions');
