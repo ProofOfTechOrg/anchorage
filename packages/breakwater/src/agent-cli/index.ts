@@ -486,6 +486,9 @@ export function createAgentCliConnector(
       // Write-class: the CLI mutates the workspace it runs in.
       sideEffect: 'write',
       egress: definition.egress,
+      // The child process carries its own transport; the list is checked
+      // against organization policy, never against the child's sockets.
+      egressEnforcement: 'declaration-only',
       requiresApproval: options.requiresApproval ?? true,
       dryRun: true,
       rateLimit: options.rateLimit,

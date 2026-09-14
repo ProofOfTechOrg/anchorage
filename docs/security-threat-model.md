@@ -321,7 +321,7 @@ A host with only one human reviewer must consciously choose availability or sepa
 | Provider alarm lost after subscription | Post-commit reconcile callback and retryable mutation-applied response | Hosts that omit reconciliation must arm polling themselves |
 | Duplicate connector side effect | Collision-proof v2 keys, fail-closed legacy inspection, atomic idempotency lease, and shared store | Poor business keys or too-short pending TTL can still duplicate |
 | One workload exhausts the deployment budget | Deployment-wide D1 rate state and host-set limits | Fixed-window boundary burst remains |
-| Connector redirects to attacker host | Manual per-hop guarded fetch | Transport outside runtime fetch is invisible |
+| Connector redirects to attacker host | Manual per-hop guarded fetch | Transport outside runtime fetch is invisible; connectors declare `egressEnforcement: 'declaration-only'`, readable through `connectorEgressPosture()` and audited as `detail.egressEnforcement` |
 | Credentials forwarded on redirect | Cross-origin credential-header stripping | Connector body may itself contain secrets |
 | Prompt becomes CLI flag | Wrapper-owned `--` and `--flag=value` | Vendor semantics can change; packed consumer tests pin current definitions |
 | Prompt/output leaks in error or audit | Static errors, redacted command, bounded metadata, safe audit registry | Successful functional text remains sensitive and caller-owned |

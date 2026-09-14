@@ -90,6 +90,7 @@ The helper accepts only an unmodified `Connector` created by `createConnector()`
 interface PermissionManifest {
   sideEffect: 'read' | 'write' | 'destructive' | 'idempotent';
   egress?: readonly string[];
+  egressEnforcement?: 'enforced' | 'declaration-only';
   idempotencyKey?: boolean;
   requiresApproval?: boolean;
   dryRun?: boolean;
@@ -127,6 +128,14 @@ Hostnames:
 - use label-boundary wildcard matching, and a wildcard does not include its apex.
 
 Declare redirect and regional hosts. Actual redirect hops must also remain within the list.
+
+### `egressEnforcement`
+
+`enforced` asserts that every HTTP request leaves through `ConnectorRuntime.fetch`, including a connector that issues no HTTP requests. This declaration concerns HTTP traffic; it excludes platform bindings such as D1, KV, R2, and service bindings, which the guard never sees. `declaration-only` states that a vendor SDK or child process uses its own transport: organization policy checks the declared hosts, but the guard cannot check its sockets.
+
+An omitted field resolves to `declaration-only`, because enforcement has not been established. `connectorEgressPosture(tool)` reads the resolved value and returns `undefined` for a tool that `createConnector()` did not build. The manifest itself retains the author's declaration without inserting a default, and connector audit events record the resolved value as `detail.egressEnforcement`.
+
+Set `policies.requireEgressEnforcement: true` to refuse construction unless the posture is `enforced`. The single-tenant preset accepts and pins the same flag. Construction rejects posture values outside the two literals.
 
 ### `idempotencyKey`
 
@@ -190,6 +199,8 @@ Authorization audit records the required identifiers and the resolution's `polic
 
 ## Deployment policy
 
+`requireEgressEnforcement` refuses construction of a connector whose resolved egress posture is not `enforced`.
+
 ```typescript
 interface ConnectorPolicies {
   networkEgress?: NetworkEgressOptions;
@@ -200,6 +211,7 @@ interface ConnectorPolicies {
   rateLimitStore?: RateLimitStore;
   audit?: AuditLogger;
   fetch?: EgressFetchBase;
+  requireEgressEnforcement?: true;
 }
 ```
 
@@ -363,7 +375,7 @@ The wrapper does not intercept:
 - a vendor SDK's private transport;
 - the child process used by an Agent CLI connector.
 
-Inject `runtime.fetch` into compatible SDKs. Apply infrastructure network policy for process-wide enforcement.
+Inject `runtime.fetch` into compatible SDKs. Apply infrastructure network policy for process-wide enforcement. A connector using a transport outside the guard declares `egressEnforcement: 'declaration-only'`; `connectorEgressPosture()` reads that declaration and connector audit events record it as `detail.egressEnforcement`.
 
 ## Approval context
 

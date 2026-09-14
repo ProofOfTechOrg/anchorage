@@ -184,6 +184,7 @@ try {
   type AgentCliErrorCode,
   type AgentCliErrorMetadata,
   type ConnectorApprovalGrant,
+  type ConnectorEgressPosture,
   type ConnectorExecutionIdentity,
   type ConnectorInvocationOptions,
   type GuardedAgentCallOptions,
@@ -204,6 +205,7 @@ import {
   migrateLegacyConnectorIdempotency as migrateLegacyConnectorIdempotencyFromSubpath,
   singleTenantConnectorPolicies as singleTenantConnectorPoliciesFromSubpath,
   type ConnectorApprovalSuspension,
+  type ConnectorEgressPosture as ConnectorEgressPostureFromSubpath,
   type SingleTenantConnectorPolicies,
 } from '@proofoftech/breakwater/connector-sdk';
 import { PolicyEngine } from '@proofoftech/breakwater/policy-engine';
@@ -219,6 +221,8 @@ import type { AuditEvent } from '@proofoftech/breakwater/audit';
 import { CODEX_CLI } from '@proofoftech/breakwater/agent-cli';
 
 const code: AgentCliErrorCode = 'nonzero-exit';
+const posture: ConnectorEgressPosture = 'enforced';
+const postureFromSubpath: ConnectorEgressPostureFromSubpath = 'declaration-only';
 const metadata: AgentCliErrorMetadata = { code };
 const event = null as AuditEvent | null;
 const permission: Permission = 'payments.release';
@@ -397,6 +401,7 @@ import {
   CONNECTOR_EXECUTION_CONTEXT_KEY,
   CONNECTOR_GRANTS_CONTEXT_KEY,
   connectorManifest,
+  connectorEgressPosture,
   invokeConnector as invokeConnectorFromSubpath,
   singleTenantConnectorPolicies as singleTenantConnectorPoliciesFromSubpath,
 } from '@proofoftech/breakwater/connector-sdk';
@@ -587,11 +592,22 @@ assert.deepEqual(output, {
 assert.deepEqual(connectorManifest(tool), {
   sideEffect: 'write',
   egress: ['api.openai.com', 'chatgpt.com'],
+  egressEnforcement: 'declaration-only',
   requiresApproval: false,
   dryRun: true,
   rateLimit: undefined,
   idempotencyKey: undefined,
 });
+assert.equal(connectorEgressPosture(tool), 'declaration-only');
+assert.equal(connectorEgressPosture(presetRead), 'declaration-only');
+assert.equal(connectorEgressPosture({}), undefined);
+assert.throws(() => createConnector({
+  id: 'packed.unenforced',
+  description: 'Refused by the deployment posture gate',
+  execute: async () => ({ ok: true }),
+  permissions: { sideEffect: 'read' },
+  policies: { requireEgressEnforcement: true },
+}), /requireEgressEnforcement/);
 assert.equal(JSON.stringify(output).includes(prompt), false);
 assert.equal(JSON.stringify(audit.events()).includes(prompt), false);
 

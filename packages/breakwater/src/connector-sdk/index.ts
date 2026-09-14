@@ -68,12 +68,28 @@ import {
 import { newToken } from './new-token.js';
 import { assertSingleTenantConnectorPolicies } from './single-tenant-preset.js';
 
+/** Whether a connector's declared egress binds its actual traffic. */
+export type ConnectorEgressPosture = 'enforced' | 'declaration-only';
+
 /** Permission manifest — what the connector declares about itself. */
 export interface PermissionManifest {
   /** Worst side effect the connector can cause. */
   sideEffect: SideEffect;
   /** Hostnames this connector calls; gated by the networkEgress policy. */
   egress?: readonly string[];
+  /**
+   * Whether the declared `egress` binds the connector's actual traffic.
+   * 'enforced' asserts every HTTP request leaves through
+   * `ConnectorRuntime.fetch`. It covers a connector that issues no HTTP
+   * request at all; it is a claim about HTTP traffic, not about platform
+   * bindings (D1, KV, R2, service bindings), which the guard never sees.
+   * 'declaration-only' states that a vendor SDK or child process carries its
+   * own transport, so the list is checked against organization policy but not
+   * against sockets. An omitted field resolves to 'declaration-only':
+   * nothing has proven enforcement. `connectorEgressPosture()` reads the
+   * resolved value.
+   */
+  egressEnforcement?: ConnectorEgressPosture;
   /**
    * Caller must supply a per-call idempotency key
    * (IDEMPOTENCY_KEY_CONTEXT_KEY in requestContext). Replays of a stored
@@ -518,6 +534,12 @@ export interface ConnectorPolicies {
    * here). Defaults to the runtime's global fetch.
    */
   fetch?: EgressFetchBase;
+  /**
+   * Refuse, at construction, any connector whose resolved egress posture is not
+   * 'enforced'. Set it on a deployment with no container, VM, or network policy
+   * behind ConnectorRuntime.fetch, where the guarded fetch is the only boundary.
+   */
+  requireEgressEnforcement?: true;
 }
 
 /**
@@ -531,7 +553,9 @@ export interface ConnectorPolicies {
  * that denies everything. A vendor SDK carrying its own HTTP stack bypasses
  * the guard — route its traffic through this fetch (most SDKs accept a
  * fetch/transport option) or that connector's egress posture degrades to
- * declaration-only.
+ * declaration-only — the posture a manifest declares as
+ * `permissions.egressEnforcement: 'declaration-only'` and
+ * `connectorEgressPosture()` reads back.
  */
 export interface ConnectorRuntime {
   /** Fetch guarded by the connector manifest's declared egress hosts. */
@@ -720,6 +744,15 @@ export function connectorManifest(
   tool: object,
 ): PermissionManifest | undefined {
   return manifests.get(tool);
+}
+
+/** Resolved egress posture; `undefined` for a tool createConnector did not build. */
+export function connectorEgressPosture(
+  tool: object,
+): ConnectorEgressPosture | undefined {
+  const manifest = manifests.get(tool);
+  if (manifest === undefined) return undefined;
+  return manifest.egressEnforcement ?? 'declaration-only';
 }
 
 function assertLegacyMigrationIdentity(
@@ -1056,6 +1089,8 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     egress: Object.freeze([...(config.permissions.egress ?? [])]),
     ...(requiredPermissions !== undefined ? { requiredPermissions } : {}),
   });
+  const egressEnforcement: ConnectorEgressPosture =
+    manifest.egressEnforcement ?? 'declaration-only';
 
   assertEgressHostList(
     manifest.egress ?? [],
@@ -1107,6 +1142,20 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
   if (config.dryRunExecute && !manifest.dryRun) {
     throw new TypeError(
       `connector ${id}: config.dryRunExecute requires permissions.dryRun (the manifest must declare what the connector supports)`,
+    );
+  }
+  if (
+    manifest.egressEnforcement !== undefined &&
+    manifest.egressEnforcement !== 'enforced' &&
+    manifest.egressEnforcement !== 'declaration-only'
+  ) {
+    throw new TypeError(
+      `connector ${id}: permissions.egressEnforcement must be 'enforced' or 'declaration-only'`,
+    );
+  }
+  if (policies.requireEgressEnforcement && egressEnforcement !== 'enforced') {
+    throw new TypeError(
+      `connector ${id}: policies.requireEgressEnforcement refuses a connector whose permissions.egressEnforcement is not 'enforced' (this deployment has no network boundary behind ConnectorRuntime.fetch)`,
     );
   }
   // v1: only a read-only connector may opt into background execution (DL-005).
@@ -1175,6 +1224,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
       detail: agentAuditDetail(requestContext, {
         sideEffect: manifest.sideEffect,
         ...extra.detail,
+        egressEnforcement,
       }),
     });
   }

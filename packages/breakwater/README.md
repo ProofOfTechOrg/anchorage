@@ -477,6 +477,9 @@ This enforcement cannot see:
 
 Route every connector request through `runtime.fetch`. Use host-level network
 controls when code outside that seam must also be constrained.
+Declare `permissions.egressEnforcement: 'declaration-only'` for traffic outside
+the guard; `connectorEgressPosture()` reads the resolved posture and connector
+audit events record it as `detail.egressEnforcement`.
 
 ## Public API
 
@@ -525,7 +528,7 @@ Use the [connector decision-code guide](https://github.com/ProofOfTechOrg/anchor
 
 | Runtime exports | Purpose |
 | --- | --- |
-| `createConnector`, `connectorManifest` | Build an enforced Mastra connector and inspect its immutable manifest |
+| `createConnector`, `connectorManifest`, `connectorEgressPosture` | Build an enforced Mastra connector and inspect its immutable manifest and resolved egress posture |
 | `invokeConnector` | Invoke an unmodified connector from trusted host or workflow code without fabricating a Mastra tool context |
 | `singleTenantConnectorPolicies` | Build the validated connector-policy baseline for one physically isolated deployment |
 | `ConnectorPolicyError`, `ConnectorStoreError`, `ConnectorEvaluatorError`, `ConnectorValidationError`, `ConnectorInvocationError` | Stable classification for authored connector failures |
@@ -542,7 +545,7 @@ Type exports: `Connector`, `ConnectorInvocationOptions`, `PermissionManifest`, `
 `SingleTenantPermissionPosture`,
 `ConnectorApprovalGrant`, `ConnectorApprovalGrantBase`,
 `ConnectorApprovalSuspension`, `ConnectorExecutionIdentity`,
-`ConnectorRuntime`, `IdempotencyStore`,
+`ConnectorRuntime`, `ConnectorEgressPosture`, `IdempotencyStore`,
 `AtomicIdempotencyStore`,
 `InspectableIdempotencyStore`, `IdempotencyInspection`,
 `IdempotencyRecord`, `IdempotencyReservation`, `RateLimitStore`,

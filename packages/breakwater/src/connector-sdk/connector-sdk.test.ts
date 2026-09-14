@@ -32,6 +32,7 @@ import {
   ConnectorPolicyError,
   ConnectorStoreError,
   ConnectorValidationError,
+  connectorEgressPosture,
   connectorManifest,
   createConnector as createConnectorBase,
   DRY_RUN_CONTEXT_KEY,
@@ -321,6 +322,205 @@ function makeConnector(
   });
   return { tool, execute };
 }
+
+describe('connector egress posture', () => {
+  it('carries a declared egressEnforcement onto the frozen manifest', () => {
+    // #given
+    for (const egressEnforcement of ['enforced', 'declaration-only'] as const) {
+      const permissions = { sideEffect: 'read' as const, egressEnforcement };
+      // #when
+      const { tool } = makeConnector({ permissions });
+      const manifest = connectorManifest(tool);
+      // #then
+      expect(manifest).toEqual({ ...permissions, egress: [] });
+      expect(Object.isFrozen(manifest)).toBe(true);
+      expect(manifest).not.toBe(permissions);
+    }
+  });
+
+  it('leaves egressEnforcement absent from the manifest when it is not declared', () => {
+    // #given / #when
+    const { tool } = makeConnector({ permissions: { sideEffect: 'read' } });
+    // #then
+    expect(connectorManifest(tool)).toEqual({ sideEffect: 'read', egress: [] });
+    expect(connectorManifest(tool)).not.toHaveProperty('egressEnforcement');
+  });
+
+  it('resolves an undeclared posture to declaration-only', () => {
+    // #given / #when
+    const { tool } = makeConnector({ permissions: { sideEffect: 'read' } });
+    // #then
+    expect(connectorEgressPosture(tool)).toBe('declaration-only');
+  });
+
+  it('resolves a declared enforced posture to enforced', () => {
+    // #given / #when
+    const { tool } = makeConnector({
+      permissions: { sideEffect: 'read', egressEnforcement: 'enforced' },
+    });
+    // #then
+    expect(connectorEgressPosture(tool)).toBe('enforced');
+  });
+
+  it('returns undefined for a tool createConnector did not build', () => {
+    // #given
+    const tool = createTool({
+      id: 'plain.read',
+      description: 'Read without a connector manifest',
+      execute: async () => ({ ok: true }),
+    });
+    // #when / #then
+    expect(connectorEgressPosture(tool)).toBeUndefined();
+    expect(connectorEgressPosture({})).toBeUndefined();
+  });
+
+  it('refuses an egressEnforcement value outside the two literals at construction', () => {
+    // #given
+    for (const value of ['Enforced', '', null, true, false, 0, {}, []]) {
+      const permissions = {
+        sideEffect: 'read',
+        egressEnforcement: value,
+      } as unknown as ConnectorConfig['permissions'];
+      // #when / #then
+      expect(() => makeConnector({ permissions })).toThrow(TypeError);
+      expect(() => makeConnector({ permissions })).toThrow(
+        "permissions.egressEnforcement must be 'enforced' or 'declaration-only'",
+      );
+    }
+  });
+
+  it('refuses construction when requireEgressEnforcement meets an undeclared posture', () => {
+    // #given
+    const config = {
+      permissions: { sideEffect: 'read' as const },
+      policies: { requireEgressEnforcement: true as const },
+    };
+    // #when / #then
+    expect(() => makeConnector(config)).toThrow(TypeError);
+    expect(() => makeConnector(config)).toThrow(/requireEgressEnforcement/);
+  });
+
+  it('refuses construction when requireEgressEnforcement meets declaration-only', () => {
+    // #given
+    const config = {
+      permissions: {
+        sideEffect: 'read' as const,
+        egressEnforcement: 'declaration-only' as const,
+      },
+      policies: { requireEgressEnforcement: true as const },
+    };
+    // #when / #then
+    expect(() => makeConnector(config)).toThrow(TypeError);
+    expect(() => makeConnector(config)).toThrow(/requireEgressEnforcement/);
+  });
+
+  it('admits construction when requireEgressEnforcement meets an enforced posture', () => {
+    // #given / #when
+    const { tool } = makeConnector({
+      permissions: { sideEffect: 'read', egressEnforcement: 'enforced' },
+      policies: { requireEgressEnforcement: true },
+    });
+    // #then
+    expect(connectorEgressPosture(tool)).toBe('enforced');
+  });
+
+  it('admits a declaration-only connector when the deployment sets no posture requirement', () => {
+    // #given / #when
+    const { tool } = makeConnector({
+      permissions: {
+        sideEffect: 'read',
+        egressEnforcement: 'declaration-only',
+      },
+    });
+    // #then
+    expect(connectorEgressPosture(tool)).toBe('declaration-only');
+  });
+
+  it('records the resolved posture on an allowed connector decision', async () => {
+    // #given
+    for (const egressEnforcement of [
+      undefined,
+      'enforced',
+      'declaration-only',
+    ] as const) {
+      const audit = new AuditLogger();
+      const permissions = {
+        sideEffect: 'read' as const,
+        ...(egressEnforcement === undefined ? {} : { egressEnforcement }),
+      };
+      const { tool } = makeConnector({ permissions, policies: { audit } });
+      const error = registerSafeAuditError(new Error('private failure'), {
+        reason: 'registered failure',
+        detail: {
+          egressEnforcement:
+            egressEnforcement === 'enforced' ? 'declaration-only' : 'enforced',
+        },
+      });
+      const failing = makeConnector({
+        permissions,
+        policies: { audit },
+        execute: async () => {
+          throw error;
+        },
+      }).tool;
+      // #when
+      await expect(run(tool, input)).resolves.toEqual({ ok: true });
+      await expect(run(failing, input)).rejects.toBe(error);
+      // #then
+      expect(audit.events()).toMatchObject([
+        {
+          decision: 'allowed',
+          decisionCode: 'CONNECTOR_ALLOWED',
+          detail: {
+            egressEnforcement: egressEnforcement ?? 'declaration-only',
+          },
+        },
+        {
+          decision: 'error',
+          reason: 'registered failure',
+          detail: {
+            stage: 'execute',
+            egressEnforcement: egressEnforcement ?? 'declaration-only',
+          },
+        },
+      ]);
+    }
+  });
+
+  it('records the resolved posture on a denied connector decision', async () => {
+    // #given
+    for (const egressEnforcement of [
+      undefined,
+      'enforced',
+      'declaration-only',
+    ] as const) {
+      const audit = new AuditLogger();
+      const { tool, execute } = makeConnector({
+        permissions: {
+          sideEffect: 'write',
+          requiresApproval: true,
+          ...(egressEnforcement === undefined ? {} : { egressEnforcement }),
+        },
+        policies: { audit },
+      });
+      // #when
+      await expect(run(tool, input)).rejects.toBeInstanceOf(
+        ConnectorPolicyError,
+      );
+      // #then
+      expect(execute).not.toHaveBeenCalled();
+      expect(audit.events()).toMatchObject([
+        {
+          decision: 'denied',
+          decisionCode: 'APPROVAL_GRANT_MISSING',
+          detail: {
+            egressEnforcement: egressEnforcement ?? 'declaration-only',
+          },
+        },
+      ]);
+    }
+  });
+});
 
 describe('connector id validation', () => {
   it("rejects an id containing ':' because the unchanged rate-budget tuple needs a colon-free final component", () => {

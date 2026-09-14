@@ -10,6 +10,7 @@ import {
   tenantIsolation,
 } from '../policy-engine/index.js';
 import {
+  connectorEgressPosture,
   connectorManifest,
   createConnector,
   D1IdempotencyStore,
@@ -46,6 +47,75 @@ function productionOptions(): SingleTenantConnectorPoliciesOptions {
 }
 
 describe('singleTenantConnectorPolicies', () => {
+  it('pins requireEgressEnforcement through the single-tenant preset', () => {
+    // #given
+    const options = {
+      ...productionOptions(),
+      requireEgressEnforcement: true as const,
+    };
+    const policies = singleTenantConnectorPolicies(options);
+    // #when
+    const connector = createConnector({
+      id: 'records.read',
+      description: 'Read one record',
+      permissions: { sideEffect: 'read', egressEnforcement: 'enforced' },
+      policies,
+      execute: async () => ({ ok: true }),
+    });
+    // #then
+    expect(Object.isFrozen(policies)).toBe(true);
+    expect(policies.requireEgressEnforcement).toBe(true);
+    expect(connectorEgressPosture(connector)).toBe('enforced');
+    expect(() =>
+      createConnector({
+        id: 'records.unenforced',
+        description: 'Read without declaring enforced egress',
+        permissions: { sideEffect: 'read' },
+        policies,
+        execute: async () => ({ ok: true }),
+      }),
+    ).toThrow(/requireEgressEnforcement/);
+  });
+
+  it('refuses a preset whose requireEgressEnforcement was added after validation', () => {
+    // #given
+    const baseline = singleTenantConnectorPolicies(productionOptions());
+    const added = { ...baseline, requireEgressEnforcement: true as const };
+    const required = singleTenantConnectorPolicies({
+      ...productionOptions(),
+      requireEgressEnforcement: true,
+    });
+    const removed = { ...required };
+    delete removed.requireEgressEnforcement;
+    // #when / #then
+    for (const policies of [added, removed]) {
+      expect(() =>
+        createConnector({
+          id: 'records.read',
+          description: 'Read one record',
+          permissions: { sideEffect: 'read' },
+          policies,
+          execute: async () => ({ ok: true }),
+        }),
+      ).toThrow(
+        'single-tenant preset requireEgressEnforcement was replaced, removed, or added after validation',
+      );
+    }
+  });
+
+  it('refuses an unknown posture key in the single-tenant preset options', () => {
+    // #given
+    const options = {
+      ...productionOptions(),
+      egressEnforcement: 'enforced',
+    };
+    // #when / #then
+    expect(() => singleTenantConnectorPolicies(options)).toThrow(TypeError);
+    expect(() => singleTenantConnectorPolicies(options)).toThrow(
+      /invalid options:.*egressEnforcement/,
+    );
+  });
+
   it('constructs a complete frozen policy set and validates the manifest', () => {
     const policies = singleTenantConnectorPolicies(productionOptions());
     const connector = createConnector({

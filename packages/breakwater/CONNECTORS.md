@@ -157,6 +157,7 @@ degraded store or a stale idempotency reservation takeover.
 | --- | --- | --- |
 | `sideEffect` | The worst state change the connector can cause | `read` is read-only. `write`, `destructive`, and `idempotent` are write-class. `destructive` requires approval by default. Mastra MCP hints are derived from this value. |
 | `egress` | Every hostname the connector contacts | Entries must be bare hosts or leading `*.` wildcards. The organization policy gates the declared list. `runtime.fetch` gates actual HTTP(S) requests and redirect hops against the declaration. An empty or absent list means no network through that fetch. |
+| `egressEnforcement` | Whether the declared list binds actual traffic | `enforced` asserts every HTTP request leaves through `runtime.fetch`, and covers a connector that issues no HTTP request at all: it is a claim about HTTP traffic, not about platform bindings (D1, KV, R2, service bindings), which the guard never sees. `declaration-only` states a vendor SDK or child process carries its own transport. An omitted field resolves to `declaration-only`. `connectorEgressPosture()` reads the resolved value and every connector audit event carries it. |
 | `requiresApproval` | This connector always needs human approval | Real execution requires a matching structured grant in `breakwater.connectorGrants`, regardless of call path. Mastra's native approval pause is also enabled, but the grant remains the authorization token. |
 | `dryRun` | A side-effect-free simulation exists | Requires `dryRunExecute`. The wrapper rejects a `dryRunExecute` that the manifest does not declare. A dry-run request never falls through to real execution. |
 | `idempotencyKey` | Repeated operation identities must replay | Requires `policies.idempotencyStore` and a non-empty `breakwater.idempotencyKey` for each real call. |
@@ -174,6 +175,10 @@ breakwater connector, or `undefined` for another Mastra tool. The wrapper also
 derives MCP `readOnlyHint`, `destructiveHint`, `idempotentHint`, and
 `openWorldHint` annotations from this manifest. These hints describe the tool;
 the wrapper remains the enforcement boundary.
+
+`connectorEgressPosture(tool)` reads the resolved egress posture, defaulting to
+`declaration-only` when the manifest omits it and returning `undefined` for
+a tool that `createConnector()` did not build.
 
 `background: true` only tells the breakwater wrapper that a read connector can
 accept background intent. Mastra owns whether an agent or tool is eligible for
@@ -197,6 +202,7 @@ contain `_background`.
 | `rateLimitStore` | Atomic fixed-window counters | `permissions.rateLimit` is present. |
 | `audit` | Structured decision sink | Optional but recommended for every production deployment. |
 | `fetch` | Base fetch wrapped by `runtime.fetch` | Optional. Inject vendor mocks in tests or a platform fetch in nonstandard runtimes. |
+| `requireEgressEnforcement` | Refuse a connector whose posture is not `enforced` | Optional. Set it where the guarded fetch is the only network boundary. |
 
 The included tool evaluators are:
 
@@ -473,6 +479,8 @@ The guard cannot see global `fetch`, a vendor SDK with its own transport, a raw
 socket, or child-process traffic. Pass `runtime.fetch` into SDKs that support a
 custom fetch or transport. Use a container, VM, or network policy when traffic
 outside this seam must also be denied.
+Declare `egressEnforcement: 'declaration-only'` when traffic bypasses the
+guard; the posture makes that degradation explicit and auditable.
 
 ## Handle errors and audit safely
 
@@ -606,7 +614,10 @@ safe.
 The child does not use `ConnectorRuntime.fetch`. Its provider egress list is
 therefore enforced as a declaration against the organization policy, not as
 socket-level interception. Apply host network controls for actual child
-traffic.
+traffic. The adapter declares `egressEnforcement: 'declaration-only'`.
+A deployment that sets `policies.requireEgressEnforcement` cannot register an
+Agent CLI adapter: construction throws a `TypeError`. Put the child behind an
+infrastructure boundary, or leave the flag off for that deployment.
 
 ### Know the CLI data boundary
 

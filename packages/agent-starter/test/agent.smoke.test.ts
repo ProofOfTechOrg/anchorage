@@ -5,6 +5,7 @@ import {
   ACTOR_CONTEXT_KEY,
   AuditLogger,
   ConnectorPolicyError,
+  connectorEgressPosture,
   invokeConnector,
 } from '@proofoftech/breakwater';
 import { describe, expect, it, vi } from 'vitest';
@@ -30,6 +31,16 @@ function sideEffectTrap(): {
 }
 
 describe('advanced starter agent', () => {
+  it('declares an enforced egress posture on the starter record-action connector', () => {
+    // #given
+    const { db, prepare } = sideEffectTrap();
+    // #when
+    const connector = createRecordActionConnector(db);
+    // #then
+    expect(connectorEgressPosture(connector)).toBe('enforced');
+    expect(prepare).not.toHaveBeenCalled();
+  });
+
   it('generates deterministically without a provider credential or side effect', async () => {
     const { db, prepare } = sideEffectTrap();
     const events: unknown[] = [];

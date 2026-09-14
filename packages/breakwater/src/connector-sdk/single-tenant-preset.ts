@@ -90,6 +90,8 @@ export interface SingleTenantConnectorPoliciesOptions {
   evaluators?: readonly ToolPolicyEvaluator[];
   /** Optional base fetch used by the connector runtime guard. */
   fetch?: EgressFetchBase;
+  /** Refuse connectors whose egress posture is not enforced. */
+  requireEgressEnforcement?: true;
 }
 
 const singleTenantPreset = Symbol('breakwater.singleTenantConnectorPolicies');
@@ -166,6 +168,7 @@ const optionsSchema = z.strictObject({
       'must be a fetch function',
     )
     .optional(),
+  requireEgressEnforcement: z.literal(true).optional(),
 });
 
 function parseOptions(options: SingleTenantConnectorPoliciesOptions) {
@@ -317,6 +320,9 @@ export function singleTenantConnectorPolicies(
     ...(rateLimitStore === undefined ? {} : { rateLimitStore }),
     ...(audit === undefined ? {} : { audit }),
     ...(parsed.fetch === undefined ? {} : { fetch: parsed.fetch }),
+    ...(parsed.requireEgressEnforcement === undefined
+      ? {}
+      : { requireEgressEnforcement: parsed.requireEgressEnforcement }),
   });
   const snapshot: SingleTenantPolicySnapshot = Object.freeze({
     policies: enforcedPolicies,
@@ -360,6 +366,7 @@ export function assertSingleTenantConnectorPolicies(
   const currentRateLimitStore = policies.rateLimitStore;
   const currentAudit = policies.audit;
   const currentFetch = policies.fetch;
+  const currentRequireEgressEnforcement = policies.requireEgressEnforcement;
   const baseline = metadata.snapshot.policies;
   assertUnchangedSurface(
     connectorId,
@@ -399,6 +406,12 @@ export function assertSingleTenantConnectorPolicies(
   );
   assertUnchangedSurface(connectorId, 'audit', currentAudit, baseline.audit);
   assertUnchangedSurface(connectorId, 'fetch', currentFetch, baseline.fetch);
+  assertUnchangedSurface(
+    connectorId,
+    'requireEgressEnforcement',
+    currentRequireEgressEnforcement,
+    baseline.requireEgressEnforcement,
+  );
   if (
     currentAudit !== undefined &&
     currentAudit.record !== metadata.snapshot.auditMember

@@ -97,6 +97,7 @@ export function createRecordActionConnector(db: Env['DB']) {
     },
     permissions: {
       sideEffect: 'write',
+      egressEnforcement: 'enforced',
       requiresApproval: true,
       rateLimit: '10/min',
     },
