@@ -596,3 +596,19 @@ At minimum, test:
 12. packed npm consumer behavior.
 
 For Agent CLIs, also read [Agent CLI connectors](agent-cli-connectors.md).
+
+### Assert connector conformance
+
+Use `assertConnectorConformance(factory, { manifest, cases, entryPoints? })` from the root or connector SDK export to certify supplied cases for an enforced connector. The synchronous factory must wire both supplied policy members, `fetch` and `audit`. The [connector authoring guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/packages/breakwater/CONNECTORS.md#assert-connector-conformance) explains the expectations, preset wiring, instrumentation refusals, and timeout handling.
+
+A conformant run returns a `ConnectorConformanceReport`; otherwise `ConnectorConformanceError.report` contains it. The report exposes `conformant`, the resolved `posture` when available, `instrumented` labels, per-case evidence, a flat `findings` list, and `limit`. Case results expose their name, `proved` outcome, observed `guardedHosts`, refused `escapes`, positional `decisionCodes`, `transportCalls`, `auditEvents`, and their view of the findings. A finding has a code, reason, optional case name, and an optional policy member for wiring failures.
+
+On an absent or configurable entry point, the harness installs an accessor whose getter returns the trap. An assignment to that instrumented entry point is recorded when it happens as `INSTRUMENTATION_REPLACED` and is not applied; the trap stays in place. A writable non-configurable data property uses assignment installation, which offers no defence against assignments during execution. A redefinition still in place when the case settles or times out, or when the probe factory returns, is reported as `INSTRUMENTATION_REPLACED`. A redefinition or deletion that the case itself reverses before it settles, like a reference to `fetch` captured before the run, is outside what the harness observes. It reports the requests that pass through its trap. A detected redefinition makes the case prove `nothing` and skip expectation checks. An assignment attempt or detected redefinition during probe construction refuses the run.
+
+| Finding | Meaning |
+| --- | --- |
+| `CASE_INVOCATION_FAILED` | Invocation failed before or during invocation; the reason names the error's constructor, uses `unknown` when that name is unavailable or unreadable, or describes a thrown non-Error value by type, without the message or value. During invocation, policy denials, boundary errors, and harness refusals retain their existing classifications. |
+
+The report states this finite-case limit:
+
+> conformance covers only the supplied cases, in this isolate, for the duration of each case: it does not prove every reachable network path, a captured fetch reference, a request through an entry point the subject redefines and restores inside a case, an uninstrumented transport, another isolate, work continuing outside a case lifetime, a call the connector makes on the supplied base transport for a host the manifest already declares, or, for a connector declaring no egress, a transport the factory supplied in place of the harness's. A case that times out ends the run, because its abandoned work would otherwise be attributed to a later case, and no further run is accepted in this isolate; that abandoned work then runs against the RESTORED global, so a request it issues after the case ends is neither trapped nor recorded and leaves the process. Entry-point targets you supply are your own test fixtures: each install is verified by its own descriptor, by an effective property read, and by the restore, against the mediations that verification names, and not against a target that adapts to those checks. Instrument globalThis.fetch alone for that guarantee.

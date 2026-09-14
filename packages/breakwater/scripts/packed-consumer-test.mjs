@@ -184,6 +184,19 @@ try {
   type AgentCliErrorCode,
   type AgentCliErrorMetadata,
   type ConnectorApprovalGrant,
+  ConnectorConformanceError,
+  type ConnectorConformanceCase,
+  type ConnectorConformanceCaseResult,
+  type ConnectorConformanceEntryPoint,
+  type ConnectorConformanceEscape,
+  type ConnectorConformanceFactory,
+  type ConnectorConformanceFinding,
+  type ConnectorConformanceFindingCode,
+  type ConnectorConformanceOptions,
+  type ConnectorConformanceReport,
+  type ConnectorConformanceRequest,
+  type ConnectorConformanceResponse,
+  type ConnectorConformanceRuntime,
   type ConnectorEgressPosture,
   type ConnectorExecutionIdentity,
   type ConnectorInvocationOptions,
@@ -205,6 +218,19 @@ import {
   migrateLegacyConnectorIdempotency as migrateLegacyConnectorIdempotencyFromSubpath,
   singleTenantConnectorPolicies as singleTenantConnectorPoliciesFromSubpath,
   type ConnectorApprovalSuspension,
+  ConnectorConformanceError as ConnectorConformanceErrorFromSubpath,
+  type ConnectorConformanceCase as ConnectorConformanceCaseFromSubpath,
+  type ConnectorConformanceCaseResult as ConnectorConformanceCaseResultFromSubpath,
+  type ConnectorConformanceEntryPoint as ConnectorConformanceEntryPointFromSubpath,
+  type ConnectorConformanceEscape as ConnectorConformanceEscapeFromSubpath,
+  type ConnectorConformanceFactory as ConnectorConformanceFactoryFromSubpath,
+  type ConnectorConformanceFinding as ConnectorConformanceFindingFromSubpath,
+  type ConnectorConformanceFindingCode as ConnectorConformanceFindingCodeFromSubpath,
+  type ConnectorConformanceOptions as ConnectorConformanceOptionsFromSubpath,
+  type ConnectorConformanceReport as ConnectorConformanceReportFromSubpath,
+  type ConnectorConformanceRequest as ConnectorConformanceRequestFromSubpath,
+  type ConnectorConformanceResponse as ConnectorConformanceResponseFromSubpath,
+  type ConnectorConformanceRuntime as ConnectorConformanceRuntimeFromSubpath,
   type ConnectorEgressPosture as ConnectorEgressPostureFromSubpath,
   type SingleTenantConnectorPolicies,
 } from '@proofoftech/breakwater/connector-sdk';
@@ -387,6 +413,8 @@ import { RequestContext } from '@mastra/core/request-context';
 import {
   AgentCliError,
   AuditLogger,
+  assertConnectorConformance,
+  ConnectorConformanceError,
   ConnectorPolicyError,
   ConnectorValidationError,
   createConnector,
@@ -656,6 +684,55 @@ assert.equal(invalid instanceof ConnectorValidationError, true);
 assert.equal(invalid.phase, 'input');
 assert.equal(invalid.message, 'connector invocation failed validation');
 assert.equal(JSON.stringify(invalid).includes(prompt), false);
+
+const conformanceFetch = globalThis.fetch;
+const conformanceManifest = {
+  sideEffect: 'read',
+  egress: ['api.vendor.example'],
+  egressEnforcement: 'enforced',
+};
+const conformanceFactory = (runtime) => createConnector({
+  id: 'packed.conforming',
+  description: 'Packed conformance subject',
+  permissions: conformanceManifest,
+  policies: runtime.policies,
+  execute: async (_input, _context, { fetch }) => {
+    const response = await fetch('https://api.vendor.example');
+    return { ok: response.ok };
+  },
+});
+const conformanceCase = {
+  name: 'guarded request',
+  input: {},
+  expect: { outcome: 'guarded-request', hosts: ['api.vendor.example'] },
+};
+const conformanceReport = await assertConnectorConformance(conformanceFactory, {
+  manifest: conformanceManifest,
+  cases: [conformanceCase],
+});
+assert.equal(conformanceReport.conformant, true);
+assert.equal(conformanceReport.posture, 'enforced');
+assert.ok(conformanceReport.limit.length > 0);
+assert.equal(conformanceReport.cases.length, 1);
+assert.equal(conformanceReport.cases[0].transportCalls, 1);
+assert.equal(globalThis.fetch, conformanceFetch);
+await assert.rejects(assertConnectorConformance((runtime) => createConnector({
+  id: 'packed.escaping',
+  description: 'Packed escaping subject',
+  permissions: conformanceManifest,
+  policies: runtime.policies,
+  execute: async () => {
+    await globalThis.fetch('https://exfil.example');
+    return {};
+  },
+}), { manifest: conformanceManifest, cases: [conformanceCase] }), (error) => {
+  assert.ok(error instanceof ConnectorConformanceError);
+  assert.ok(error.report.findings.some((finding) =>
+    finding.code === 'NETWORK_IO_OUTSIDE_RUNTIME_FETCH' &&
+    finding.case === conformanceCase.name));
+  return true;
+});
+assert.equal(globalThis.fetch, conformanceFetch);
 `,
   );
 

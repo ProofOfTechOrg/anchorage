@@ -709,6 +709,122 @@ The repository examples use `#given`, `#when`, and `#then` comments. See
 and
 [`connector-sdk.test.ts`](https://github.com/ProofOfTechOrg/anchorage/blob/main/packages/breakwater/src/connector-sdk/connector-sdk.test.ts).
 
+### Assert connector conformance
+
+Run `assertConnectorConformance(factory, { manifest, cases, entryPoints? })` in your connector's test suite. It certifies the supplied cases for a connector declaring `egressEnforcement: 'enforced'`. A non-conformant run throws `ConnectorConformanceError`; its `.report` contains the evidence and findings.
+
+Supply a synchronous factory that constructs a fresh connector using both members of `runtime.policies`: the inert `fetch` transport and the harness's `audit` logger. For example:
+
+```typescript
+import {
+  assertConnectorConformance,
+  type ConnectorConformanceFactory,
+  createConnector,
+} from '@proofoftech/breakwater/connector-sdk';
+
+const manifest = {
+  sideEffect: 'read',
+  egress: ['api.vendor.example'],
+  egressEnforcement: 'enforced',
+} as const;
+const factory: ConnectorConformanceFactory<unknown, { ok: boolean }> =
+  (runtime) => createConnector({
+  id: 'vendor.read',
+  description: 'Read a vendor record',
+  permissions: manifest,
+  policies: runtime.policies,
+  execute: async (_input, _context, { fetch }) => {
+    const response = await fetch('https://api.vendor.example');
+    return { ok: response.ok };
+  },
+});
+```
+
+Name the case and the outcome it must demonstrate:
+
+```typescript
+const report = await assertConnectorConformance(factory, {
+  manifest,
+  cases: [{
+    name: 'reads the declared vendor',
+    input: {},
+    expect: {
+      outcome: 'guarded-request',
+      hosts: ['api.vendor.example'],
+    },
+  }],
+});
+```
+
+When using `singleTenantConnectorPolicies`, pass the supplied members into the preset. Spreading them around an already validated preset fails its tamper checks. Replace the factory's `policies` value with:
+
+```typescript
+singleTenantConnectorPolicies({
+  audit: { mode: 'production', logger: runtime.policies.audit },
+  egress: { allowedDomains: ['api.vendor.example'] },
+  permissions: { principalPermissions: 'not-configured' },
+  fetch: runtime.policies.fetch,
+})
+```
+
+Import `singleTenantConnectorPolicies` from the connector SDK. Use the production audit arm: the development arm drops `audit` and silences the decisions the harness measures. The supplied logger already has the external sink that production requires; pass it through.
+
+Read failures using the report's finding codes:
+
+- `NETWORK_IO_OUTSIDE_RUNTIME_FETCH`: a trapped entry point received a request, or the supplied base transport received an undeclared host. The attempt is recorded before refusal, including when the connector catches it.
+- `MANIFEST_MISMATCH`: the registered manifest differs from your claim, or the case's subject differs from the probe.
+- `POSTURE_NOT_ENFORCED`: the connector declares a declaration-only posture, or its posture changes between the probe and a case.
+- `SUBJECT_UNREGISTERED`: the factory returned an unregistered value, such as `undefined`, `null`, a plain Mastra tool, or a connector from a second copy of Breakwater.
+- `CASE_EXPECTATION_UNMET`: the observed outcome, hosts, or decision code did not match the case, or the invocation never reached the connector's gate boundary.
+- `CASE_INVOCATION_FAILED`: Invocation failed before or during invocation; the reason names the error's constructor, uses `unknown` when that name is unavailable or unreadable, or describes a thrown non-Error value by type, without the message or value. During invocation, policy denials, boundary errors, and harness refusals retain their existing classifications.
+- `CASE_TIMEOUT`: the invocation exceeded its per-case bound. The run ends and names any skipped cases.
+- `NO_TRANSPORT_EVIDENCE`: the connector declares egress, but no case called the harness's transport.
+- `POLICIES_NOT_WIRED`: the report names `fetch`, `audit`, or `both`. A `fetch` finding cannot distinguish a factory that omitted `policies.fetch` from a connector calling ambient fetch directly for a declared host. Both leave an escape and zero harness transport calls. Read the escape record beside the finding for the authoritative request evidence. An `audit` finding means the subject reached its gate boundary without recording a witness on the supplied logger.
+- `FACTORY_FAILED`: construction threw. For an `Error` with a string message, the reason is that message. An unreadable error becomes `unreadable error`; a non-Error object becomes `a non-Error object` or `null`. Other thrown values use their string representation.
+- `INSTRUMENTATION_UNSUPPORTED`: an entry point could not be instrumented, or two entry points name the same property.
+- `INSTRUMENTATION_REPLACED`: assignment to a harness-installed accessor was recorded without applying it, or the descriptor or effective value differs from the installed instrumentation, or could not be read, before restoration. When verification fails, the case proves `nothing` and skips expectation checks. Either finding during probe construction refuses the run.
+- `INSTRUMENTATION_NOT_RESTORED`: restoration threw or its descriptor verification failed. The run ends and names any skipped cases.
+- `RUN_OVERLAPPING`: another harness run owns instrumentation in this isolate.
+- `ISOLATE_POISONED`: an earlier case timed out in this isolate; no further run is accepted.
+- `NO_CASES`: the supplied case set is empty. This is one finding, without an additional absence-of-transport finding.
+
+Choose expectations according to the path exercised:
+
+| Expectation | Evidence checked |
+| --- | --- |
+| `guarded-request` with `hosts` | No subject denial, and the transport reached matching declared hosts |
+| `guarded-denial` with `code` | A subject denial with `policyKind: 'egress-fetch'`, plus the expected subject decision code |
+| `policy-denied` with `code` | A subject denial with another policy kind, plus the expected subject decision code |
+| `no-network` | No subject denial and no allowed harness transport call |
+
+A recorded denial takes precedence over a guarded request. An egress-fetch denial takes precedence over another denial. Without a denial, a case that reached an allowed host proves `guarded-request`; otherwise it proves `no-network`. An expected code must occur among the subject's witness events, independently of the outcome check.
+
+`guarded-request` requires at least one host. Each host is validated at parse time using the manifest's hostname pattern; an empty list or malformed host throws `TypeError`. Matching uses the manifest's case-insensitive hostname and wildcard rules. Every expected host must match an observed host; extra observed hosts are allowed.
+
+An egress-declaring connector needs an observed transport call somewhere in the run. The rule reads `transportCalls`, not an expectation's classification. A `guarded-request` case ordinarily supplies that evidence; a case that reaches a declared host and then gets denied on another call also supplies it. Denials before transport do not: an evaluator can emit an egress-fetch denial without making a request, and `EGRESS_HOST_NOT_DECLARED` occurs before the transport is called. `policy-denied` and `no-network` also supply no transport evidence by themselves.
+
+Audit witnesses come from this case's supplied logger, during its invocation, with a `decisionCode` and `resource` equal to the subject connector's id. Setup logs, agent-policy records, and another connector's decisions cannot establish the subject's audit wiring or change its result. This attribution separates ordinary composition; it does not authenticate an arbitrary logger caller. `decisionCodes` preserves invocation-window events for diagnosis, including nested connector codes and `undefined` for events without a code.
+
+Input-schema failures and `invokeConnector` pre-flight refusals have no expectation arm. Test them in ordinary connector tests. Supplied here, they report `proved: 'nothing'` with `CASE_EXPECTATION_UNMET`, whatever the case declared, because the gate boundary was never reached. Cases refused before invocation by instrumentation, factory construction, registration, posture, or manifest checks also prove `nothing`, as do cases with an invocation setup failure. These cases add no expectation or wiring failure. Any escape recorded during their setup still becomes `NETWORK_IO_OUTSIDE_RUNTIME_FETCH`.
+
+The harness always instruments `globalThis.fetch`. Add other transports as `entryPoints: [{ label, target, property }]`. Entries are processed one at a time, global fetch first, so a supplied target's property callbacks run under the global trap. A consumer-supplied accessor, inherited accessor, locked data descriptor, ignored write, or effective property read that still returns the original causes refusal. A configurable entry point must start as a data property the harness can replace; the harness installs its own accessor in place of that data property. Each write is verified through both its own descriptor and its effective value; each restore is verified against the captured descriptor. A failed write or verification rolls back the stack including that attempted entry. A validation or descriptor-read failure occurs before capture, so rollback covers the preceding entries.
+
+A duplicate `(target, property)` pair refuses the run before any case. Duplicate case names, duplicate labels, and the reserved labels `globalThis.fetch` and `policies.fetch` are malformed options and reject with `TypeError`, without a report. A supplied entry's property refusal is case-scoped. The global fetch descriptor is checked before probe construction and again for each case: an initially unsupported global refuses the run, while a global made unsupported mid-run refuses the affected case. A finding's `case` identifies the latter. Fix the target or options, stop earlier work redefining the global, or use a runtime whose global fetch is a writable or configurable data property.
+
+Supplied targets are your own test fixtures. Verification detects concrete property mediation such as ignored writes and overriding getters; it does not defend against a target adapting to those checks. Supply no extra entry points when you need the guarantee for global fetch alone.
+
+On an absent or configurable entry point, the harness installs an accessor whose getter returns the trap. An assignment to that instrumented entry point is recorded when it happens as `INSTRUMENTATION_REPLACED` and is not applied; the trap stays in place. A writable non-configurable data property uses assignment installation, which offers no defence against assignments during execution. A redefinition still in place when the case settles or times out, or when the probe factory returns, is reported as `INSTRUMENTATION_REPLACED`. A redefinition or deletion that the case itself reverses before it settles, like a reference to `fetch` captured before the run, is outside what the harness observes. It reports the requests that pass through its trap. Restoration follows invocation settlement or timeout. It restores entry points before clearing the timer, attempts the remaining restores after a failure, and ends a run whose restoration fails.
+
+Each case has `timeoutMs`, defaulting to 2000 ms and accepting positive integers up to 2,147,483,647. Your test timeout must exceed `cases.length × timeoutMs` plus setup. Vitest defaults to 5000 ms per test, so three cases at the harness's default bound require a higher test timeout or lower per-case bounds. Cases must await their own work.
+
+A timed-out case proves `nothing`, with no expectation check or `CASE_EXPECTATION_UNMET`. It ends the run and permanently refuses later runs in the isolate, preventing abandoned work from being attributed to another case. Once the case times out, its abandoned work runs against the restored global: a request it issues after the case ends is neither trapped nor recorded and leaves the process. Put a test that expects a timeout last in its file, or give it its own file. Vitest reuses a file's module graph, so later runs in that file receive `ISOLATE_POISONED`. The package's suite places its timeout test and then its poisoned-isolate assertion last. There is no reset API.
+
+Use `respond(request)` to return `{ status?, headers?, body? }` for guarded traffic; the default is status 200 with an empty body. The request includes the exact URL, hostname, and uppercase method. The URL stays inside your test process and is not copied into harness-generated diagnostics, which use hostnames. `FACTORY_FAILED` is different: when a factory throws an `Error` with a readable string message, that message can contain URLs or other request data your code interpolated. String representations of other thrown values can also contain request data. Inspect those messages before sharing a report.
+
+Every report states its limit:
+
+> conformance covers only the supplied cases, in this isolate, for the duration of each case: it does not prove every reachable network path, a captured fetch reference, a request through an entry point the subject redefines and restores inside a case, an uninstrumented transport, another isolate, work continuing outside a case lifetime, a call the connector makes on the supplied base transport for a host the manifest already declares, or, for a connector declaring no egress, a transport the factory supplied in place of the harness's. A case that times out ends the run, because its abandoned work would otherwise be attributed to a later case, and no further run is accepted in this isolate; that abandoned work then runs against the RESTORED global, so a request it issues after the case ends is neither trapped nor recorded and leaves the process. Entry-point targets you supply are your own test fixtures: each install is verified by its own descriptor, by an effective property read, and by the restore, against the mediations that verification names, and not against a target that adapts to those checks. Instrument globalThis.fetch alone for that guarantee.
+
 ## Contribute a connector
 
 1. Add the implementation and tests under

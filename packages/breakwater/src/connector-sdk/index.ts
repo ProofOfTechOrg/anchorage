@@ -45,6 +45,12 @@ import {
   isPrincipalPermissions,
   PRINCIPAL_PERMISSIONS_CONTEXT_KEY,
 } from '../rbac/permission.js';
+import {
+  type ConnectorConformanceFactory,
+  type ConnectorConformanceOptions,
+  type ConnectorConformanceReport,
+  createConformanceAssertion,
+} from './egress-conformance.js';
 import type { EgressFetchBase, EgressGuardedFetch } from './egress-fetch.js';
 import {
   EgressDeniedError,
@@ -2207,6 +2213,30 @@ export type {
   RateLimitStatement,
 } from './d1-rate-limit-store.js';
 export { D1RateLimitStore } from './d1-rate-limit-store.js';
+export const assertConnectorConformance: <TInput, TOutput>(
+  factory: ConnectorConformanceFactory<TInput, TOutput>,
+  options: ConnectorConformanceOptions<TInput>,
+) => Promise<ConnectorConformanceReport> = createConformanceAssertion({
+  connectorManifest,
+  connectorEgressPosture,
+  invokeConnector,
+});
+// egress-conformance.ts imports only types from this module; its runtime collaborators are the three bound above.
+export type {
+  ConnectorConformanceCase,
+  ConnectorConformanceCaseResult,
+  ConnectorConformanceEntryPoint,
+  ConnectorConformanceEscape,
+  ConnectorConformanceFactory,
+  ConnectorConformanceFinding,
+  ConnectorConformanceFindingCode,
+  ConnectorConformanceOptions,
+  ConnectorConformanceReport,
+  ConnectorConformanceRequest,
+  ConnectorConformanceResponse,
+  ConnectorConformanceRuntime,
+} from './egress-conformance.js';
+export { ConnectorConformanceError } from './egress-conformance.js';
 export type {
   EgressDenial,
   EgressFetchBase,

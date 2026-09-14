@@ -13,6 +13,7 @@ overrides:
   js-yaml@4: 4.3.1
   nanoid@3: 3.3.17
   undici: 7.29.0
+  miniflare@5.20260730.0-alpha>workerd: 1.20260903.1
 
 patchedDependencies:
   '@mastra/core@1.53.0':
@@ -6261,7 +6262,7 @@ snapshots:
       '@cspotcode/source-map-support': 0.8.1
       sharp: 0.35.2
       undici: 7.29.0
-      workerd: 1.20260730.1
+      workerd: 1.20260903.1
       ws: 8.21.0
       youch: 4.1.0-beta.10
     transitivePeerDependencies:

@@ -529,6 +529,7 @@ Use the [connector decision-code guide](https://github.com/ProofOfTechOrg/anchor
 | Runtime exports | Purpose |
 | --- | --- |
 | `createConnector`, `connectorManifest`, `connectorEgressPosture` | Build an enforced Mastra connector and inspect its immutable manifest and resolved egress posture |
+| `assertConnectorConformance`, `ConnectorConformanceError` | Assert supplied connector cases against trapped egress entry points and inspect the failure report |
 | `invokeConnector` | Invoke an unmodified connector from trusted host or workflow code without fabricating a Mastra tool context |
 | `singleTenantConnectorPolicies` | Build the validated connector-policy baseline for one physically isolated deployment |
 | `ConnectorPolicyError`, `ConnectorStoreError`, `ConnectorEvaluatorError`, `ConnectorValidationError`, `ConnectorInvocationError` | Stable classification for authored connector failures |
@@ -556,7 +557,7 @@ Type exports: `Connector`, `ConnectorInvocationOptions`, `PermissionManifest`, `
 `IdempotencyStatement`, `IdempotencyBatchResult`, `D1RateLimitStoreOptions`, `RateLimitDatabase`,
 `RateLimitStatement`, `RateLimitBatchResult`, `EgressDenial`, `EgressFetchOptions`,
 `EgressFetchBase`, `EgressGuardedFetch`, `EgressRequestInit`,
-`EgressResponse`, and `EgressResponseHeaders`.
+`EgressResponse`, `EgressResponseHeaders`, `ConnectorConformanceCase`, `ConnectorConformanceCaseResult`, `ConnectorConformanceEntryPoint`, `ConnectorConformanceEscape`, `ConnectorConformanceFactory`, `ConnectorConformanceFinding`, `ConnectorConformanceFindingCode`, `ConnectorConformanceOptions`, `ConnectorConformanceReport`, `ConnectorConformanceRequest`, `ConnectorConformanceResponse`, `ConnectorConformanceRuntime`.
 
 ### Agent CLI exports
 
