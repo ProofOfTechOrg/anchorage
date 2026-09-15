@@ -3834,10 +3834,52 @@ describe('WorkersForPlatformsBackend', () => {
           /^Bearer ey/,
         );
         expect(init?.signal).toBeInstanceOf(AbortSignal);
+        expect(init?.redirect).toBe('manual');
       }
     } finally {
       if (selection === 'default') vi.unstubAllGlobals();
     }
+  });
+
+  it.each([
+    'ensureMaintenance',
+    'inspect',
+  ] as const)('refuses a redirected %s response that carries a valid receipt', async (operation) => {
+    const cancelled = vi.fn();
+    const redirected: typeof fetch = async (input, init) => {
+      const attested = await attestedHealthResponse(input, init);
+      void attested.body?.cancel();
+      return new Response(new ReadableStream({ cancel: cancelled }), {
+        status: 302,
+        headers: [
+          ...attested.headers,
+          ['location', 'https://redirected.invalid/elsewhere'],
+        ],
+      });
+    };
+    const backend = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client: new FakeApi(),
+      fetch: redirected,
+      hostRoutingKvId: 'host-routes',
+      platformProfileFor: () => platformProfile(),
+    });
+
+    await expect(
+      operation === 'ensureMaintenance'
+        ? backend.ensureMaintenance(
+            deployment,
+            secrets.maintenanceAdmin,
+            fence,
+            'etag-v1',
+          )
+        : backend.inspect(deployment, secrets.maintenanceAdmin),
+    ).rejects.toMatchObject({
+      name: 'CredentialedRedirectRefusedError',
+      message:
+        'Workers for Platforms maintenance request refused a redirect with status 302',
+    });
+    expect(cancelled).toHaveBeenCalledTimes(1);
   });
 
   it('uses only the signed trusted result when candidate response body is forged', async () => {

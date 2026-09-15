@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { createHash } from 'node:crypto';
+import { APIError } from 'cloudflare';
 import { BaseNamespaces } from 'cloudflare/resources/workers-for-platforms/dispatch/namespaces/namespaces';
 import { describe, expect, it, vi } from 'vitest';
 import {
@@ -12,6 +13,7 @@ import {
   CLOUDFLARE_SDK_MAX_ATTEMPTS,
   CLOUDFLARE_SDK_MAX_RETRIES,
 } from '../src/cloudflare-client-config.js';
+import { isTransientProviderError } from '../src/cloudflare-provider-errors.js';
 import {
   CloudflareAttachmentScanDriftError,
   CloudflareAttachmentScanProgressError,
@@ -734,6 +736,87 @@ describe('Cloudflare Worker attachment scan', () => {
     }
     expect(ceilingError).toBeInstanceOf(Error);
     expect(ceilingAttempts).toBe(CLOUDFLARE_SDK_MAX_ATTEMPTS);
+  });
+
+  const DISPATCH_PAGE_PATH = '/namespaces/fleet/scripts';
+
+  function dispatchPageWorld(): AttachmentWorld {
+    return {
+      ordinary: [],
+      namespaces: [{ name: 'fleet', pages: [{ scripts: [] }] }],
+    };
+  }
+
+  it('sends the raw dispatch script page request with manual redirect handling', async () => {
+    const handler = worldHandler(dispatchPageWorld());
+    const observed: RequestInit['redirect'][] = [];
+    const fixture = recordingFetch((request) => {
+      if (new URL(request.url).pathname.endsWith(DISPATCH_PAGE_PATH)) {
+        observed.push(request.redirect);
+      }
+      return handler(request);
+    });
+
+    const result = await drain(client(fixture.fetch), D1_TARGET);
+
+    expect(result.terminal.status).toBe('complete');
+    expect(observed).toEqual(['manual']);
+  });
+
+  it('refuses a redirected raw dispatch script page and cancels its body', async () => {
+    const cancelled = vi.fn();
+    const handler = worldHandler(dispatchPageWorld());
+    const fixture = recordingFetch((request) =>
+      new URL(request.url).pathname.endsWith(DISPATCH_PAGE_PATH)
+        ? new Response(new ReadableStream({ cancel: cancelled }), {
+            status: 302,
+            headers: { location: 'https://redirected.invalid/elsewhere' },
+          })
+        : handler(request),
+    );
+
+    const failure = await drain(client(fixture.fetch), D1_TARGET).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failure).toMatchObject({
+      name: 'CredentialedRedirectRefusedError',
+      message:
+        'Cloudflare dispatch script listing refused a redirect with status 302',
+    });
+    expect(cancelled).toHaveBeenCalledTimes(1);
+    expect(
+      fixture.requests.filter(({ url }) =>
+        new URL(url).pathname.endsWith(DISPATCH_PAGE_PATH),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it('surfaces an SDK-routed redirect as a non-retried, non-transient status', async () => {
+    let listings = 0;
+    const fixture = recordingFetch(({ url }) => {
+      const target = new URL(url);
+      if (target.pathname.endsWith('/workers/scripts')) {
+        listings += 1;
+        return new Response(null, {
+          status: 302,
+          headers: { location: 'https://redirected.invalid/elsewhere' },
+        });
+      }
+      if (target.pathname.endsWith('/workers/dispatch/namespaces')) {
+        return pageArray([]);
+      }
+      throw new Error(`unexpected request ${target.pathname}`);
+    });
+
+    const failure = await drain(client(fixture.fetch), D1_TARGET).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(APIError);
+    expect((failure as APIError).status).toBe(302);
+    expect(listings).toBe(1);
+    expect(isTransientProviderError(failure)).toBe(false);
   });
 
   it('resumes an ordinary version index without repeating a committed version read', async () => {

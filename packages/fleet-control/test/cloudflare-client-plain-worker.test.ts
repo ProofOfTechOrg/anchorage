@@ -2630,6 +2630,39 @@ describe('CloudflareProvisioningClient plain-worker plane', () => {
     }
   });
 
+  it('refuses a redirected signed export download and redacts its URL', async () => {
+    const signedUrl = 'https://download.example.test/private/path?token=secret';
+    const cancelled = vi.fn();
+    const fixture = recordingFetch(({ url, headers, redirect }) => {
+      if (url.startsWith('https://download.example.test/')) {
+        expect(headers.has('authorization')).toBe(false);
+        expect(redirect).toBe('manual');
+        return new Response(new ReadableStream({ cancel: cancelled }), {
+          status: 302,
+          headers: { location: 'https://redirected.invalid/elsewhere' },
+        });
+      }
+      return single({ status: 'complete', result: { signed_url: signedUrl } });
+    });
+    const client = plainClient({
+      fetch: fixture.fetch,
+      exportStore: {
+        write: async () => ({ location: 'x', size: 1, sha256: 'x' }),
+      },
+    });
+
+    const failure = await fenced(client, () =>
+      client.exportDatabase('db'),
+    ).catch((error: unknown) => error);
+
+    expect(cancelled).toHaveBeenCalledTimes(1);
+    expect(fact(failure, 'message')).toBe(
+      "D1 export for 'db' failed after 1 poll(s) with HTTP 302",
+    );
+    expect(ownSerialization(failure)).not.toContain('/private/path');
+    expect(ownSerialization(failure)).not.toContain('token=secret');
+  });
+
   it('redacts a signed export URL from a throwing status accessor', async () => {
     const signedUrl = 'https://download.example.test/private/path?token=secret';
     const fixture = recordingFetch(({ url }) => {

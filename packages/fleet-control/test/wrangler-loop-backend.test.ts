@@ -1548,6 +1548,7 @@ export default {
       {
         method: 'GET',
         signal: expect.any(AbortSignal),
+        redirect: 'manual',
         headers: { authorization: `Bearer ${secrets.maintenanceAdmin}` },
       },
     );
@@ -1663,6 +1664,7 @@ export default {
         {
           method: 'GET',
           signal: expect.any(AbortSignal),
+          redirect: 'manual',
           headers: {
             authorization: `Bearer ${secrets.maintenanceAdmin}`,
             'Cloudflare-Workers-Version-Overrides': `${deployment.scriptName}="version-next"`,

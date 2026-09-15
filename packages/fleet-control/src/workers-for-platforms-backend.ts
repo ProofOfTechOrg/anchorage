@@ -16,6 +16,11 @@ import {
   applicationSecretValues,
 } from './application-bindings.js';
 import {
+  CredentialedRedirectRefusedError,
+  isRedirectStatus,
+} from './cloudflare-provider-errors.js';
+import {
+  cancelBodyWithoutAwait,
   captureDatabaseExportReceiptCapability,
   databaseExportReceiptIdentityFromUnknown,
 } from './database-export-store.js';
@@ -475,7 +480,25 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
     const client = options.client;
     this.#client = client;
     const fetchFn = options.fetch ?? fetch;
-    this.#fetch = (input, init) => fetchFn(input, init);
+    // The maintenance requests below carry a minted capability token as a
+    // bearer credential to a tenant Worker URL. Forcing the policy after the
+    // spread denies a call site the chance to opt into following a redirect to
+    // an address the control plane did not choose. The refusal belongs here
+    // because both consumers read only the signed receipt header and then
+    // build a fresh response, so a 3xx carrying a valid receipt would
+    // otherwise succeed.
+    this.#fetch = async (input, init) => {
+      const response = await fetchFn(input, { ...init, redirect: 'manual' });
+      if (isRedirectStatus(response.status)) {
+        const refusal = new CredentialedRedirectRefusedError(
+          'Workers for Platforms maintenance request',
+          response.status,
+        );
+        cancelBodyWithoutAwait(response.body, refusal);
+        throw refusal;
+      }
+      return response;
+    };
     this.#hostRoutingKvId = options.hostRoutingKvId;
     this.#auditQueueName = options.auditQueueName;
     this.#maintenanceRequestTimeoutMs =

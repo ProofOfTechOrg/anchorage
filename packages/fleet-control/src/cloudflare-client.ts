@@ -47,7 +47,9 @@ import {
   workerMigrations,
 } from './cloudflare-ordinary-worker-operations.js';
 import {
+  CredentialedRedirectRefusedError,
   isNotFound,
+  isRedirectStatus,
   readErrorFieldSafely,
   sanitizedErrorName,
 } from './cloudflare-provider-errors.js';
@@ -700,7 +702,12 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
         });
     }
     const fetchFn = options.fetch ?? fetch;
-    this.#fetch = (input, init) => fetchFn(input, init);
+    // Every request below carries the account API token, and the signed export
+    // download carries a URL the provider chose. Forcing the policy after the
+    // spread denies a call site the chance to opt into following a redirect to
+    // an address the control plane did not choose.
+    this.#fetch = (input, init) =>
+      fetchFn(input, { ...init, redirect: 'manual' });
     this.#requestTimeoutMs = options.requestTimeoutMs ?? 60_000;
     if (
       !Number.isSafeInteger(this.#requestTimeoutMs) ||
@@ -831,16 +838,33 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       accountId: this.#accountId,
       client: this.#client,
       dispatchNamespace: this.#dispatchNamespace,
-      requestDispatchScriptPage: ({ namespace, cursor, perPage, signal }) => {
+      requestDispatchScriptPage: async ({
+        namespace,
+        cursor,
+        perPage,
+        signal,
+      }) => {
         const url = new URL(
           `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(this.#accountId)}/workers/dispatch/namespaces/${encodeURIComponent(namespace)}/scripts`,
         );
         url.searchParams.set('per_page', String(perPage));
         if (cursor) url.searchParams.set('cursor', cursor);
-        return this.#request(url, {
+        const response = await this.#request(url, {
           headers: { authorization: `Bearer ${this.#apiToken}` },
           signal,
         });
+        // This caller reads the raw response, so the refusal belongs here
+        // rather than in #request, whose SDK-routed callers reclassify a
+        // thrown error as a connection failure and retry it.
+        if (isRedirectStatus(response.status)) {
+          const refusal = new CredentialedRedirectRefusedError(
+            'Cloudflare dispatch script listing',
+            response.status,
+          );
+          cancelBodyWithoutAwait(response.body, refusal);
+          throw refusal;
+        }
+        return response;
       },
     };
   }
@@ -3412,7 +3436,6 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
           }
           const download = await this.#request(signedUrl, {
             headers: { 'Accept-Encoding': 'identity' },
-            redirect: 'manual',
           });
           httpStatus = download.status;
           if (!download.ok) {

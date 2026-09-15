@@ -1130,6 +1130,31 @@ describe('maintenance route readiness', () => {
     ).rejects.toThrow('lease lost');
     expect(request).toHaveBeenCalledTimes(1);
   });
+
+  it.each([
+    'ensureMaintenance',
+    'inspect',
+  ] as const)('sends the %s maintenance request with manual redirect handling', async (operation) => {
+    const api = new PlainWorkerProvisioningApiFake();
+    deployedCandidate(api);
+    const request = vi.fn(
+      async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) =>
+        maintenanceResponse(),
+    );
+    const subject = backend(api, { fetch: request });
+
+    await (operation === 'ensureMaintenance'
+      ? subject.ensureMaintenance(
+          spec,
+          secrets.maintenanceAdmin,
+          api.fence(),
+          'candidate',
+        )
+      : subject.inspect(spec, secrets.maintenanceAdmin, 'candidate'));
+
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(request.mock.calls[0]?.[1]?.redirect).toBe('manual');
+  });
 });
 
 describe('inspection across release bindings', () => {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// This module holds safe-read and secret-redaction helpers for Cloudflare SDK
-// errors, and the shared isNotFound predicate.
+// This module holds the classification and redaction helpers that Cloudflare
+// provider transports apply to SDK errors and to raw provider responses.
 // Its two sanitizer consumers use different members: the ordinary-Worker
 // upload dispatch (cloudflare-ordinary-worker-operations.ts) calls
 // sanitizeProviderError, while the client's D1 export calls
@@ -159,6 +159,26 @@ export function isNotFound(error: unknown): boolean {
       'status' in error &&
       error.status === 404,
   );
+}
+
+const REDIRECT_STATUSES: readonly number[] = [301, 302, 303, 307, 308];
+
+/** Matches the Worker egress proxy's enumeration in workers/outbound.ts. */
+export function isRedirectStatus(status: number): boolean {
+  return REDIRECT_STATUSES.includes(status);
+}
+
+/**
+ * A credentialed transport received a redirect. The message names the
+ * operation and the status but never the address, because the same refusal
+ * covers signed export URLs and tenant maintenance endpoints whose addresses
+ * belong inside the caller's redaction boundary.
+ */
+export class CredentialedRedirectRefusedError extends Error {
+  constructor(operation: string, status: number) {
+    super(`${operation} refused a redirect with status ${status}`);
+    this.name = 'CredentialedRedirectRefusedError';
+  }
 }
 
 /**
