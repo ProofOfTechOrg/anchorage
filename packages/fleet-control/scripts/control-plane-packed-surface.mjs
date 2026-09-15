@@ -135,6 +135,7 @@ const TYPE_NAMES = [
   'FleetInventoryDeployment',
   'FleetInventoryFinding',
   'FleetInventoryGenerationRef',
+  'FleetInventoryR2Jurisdiction',
   'FleetInventoryRowKind',
   'FleetInventoryRunToken',
   'FleetMigrationAdvanceAction',

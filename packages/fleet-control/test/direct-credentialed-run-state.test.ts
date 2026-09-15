@@ -1506,6 +1506,21 @@ describeLinux('durable scenario state', () => {
     }
   }, 60_000);
 
+  it.each([
+    'platform-page',
+    'transport-failure',
+    'non-contract-answer',
+    'delivery-window-expired',
+  ] as const)('persists invocation failure detail %s', async (detail) => {
+    const { journal } = await scenarioJournal();
+    await journal.recordScenario(
+      scenarioWith((state) => {
+        present(state.failure).detail = detail;
+      }),
+    );
+    expect(journal.snapshot().scenario?.failure?.detail).toBe(detail);
+  });
+
   it('accepts the optional refusal detail and refuses one outside the vocabulary', async () => {
     const unknown = await scenarioJournal();
     await refuses(

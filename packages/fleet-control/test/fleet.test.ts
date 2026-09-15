@@ -746,6 +746,7 @@ function inventoryFor(records: readonly FleetRecord[]): FleetResourceInventory {
     dispatchScriptCount: records.filter(
       (item) => item.backend === 'workers-for-platforms',
     ).length,
+    unavailableR2Jurisdictions: Object.freeze([]),
     scriptRegistrations: records.map((item) => ({
       scriptName: item.scriptName,
       tenantTag: item.tenantTag,
@@ -1100,6 +1101,7 @@ describe('fleet operations', () => {
       inventory: {
         findings: inventory.findings,
         dispatchScriptCount: inventory.dispatchScriptCount,
+        unavailableR2Jurisdictions: Object.freeze([]),
         scriptRegistrations: [
           ...inventory.scriptRegistrations,
           {
@@ -1232,6 +1234,7 @@ describe('fleet operations', () => {
       const inventory: FleetResourceInventory = {
         findings: [],
         dispatchScriptCount: releases.length,
+        unavailableR2Jurisdictions: Object.freeze([]),
         scriptRegistrations: releases.map((candidate) => ({
           scriptName: candidate.physicalScriptName,
           tenantTag: acme.tenantTag,
@@ -1598,6 +1601,7 @@ describe('fleet operations', () => {
     const inventory: FleetResourceInventory = {
       findings: [],
       dispatchScriptCount: 2,
+      unavailableR2Jurisdictions: Object.freeze([]),
       scriptRegistrations: [priorRelease, targetRelease].map((release) => ({
         scriptName: release.physicalScriptName,
         tenantTag: migrating.tenantTag,
@@ -1722,6 +1726,7 @@ describe('fleet operations', () => {
     const inventory: FleetResourceInventory = {
       findings: [],
       dispatchScriptCount: 0,
+      unavailableR2Jurisdictions: Object.freeze([]),
       scriptRegistrations: [],
       deployments: [],
       databaseIds: [],
@@ -1789,6 +1794,7 @@ describe('fleet operations', () => {
     const inventory: FleetResourceInventory = {
       findings: [],
       dispatchScriptCount: 1,
+      unavailableR2Jurisdictions: Object.freeze([]),
       scriptRegistrations: [
         {
           scriptName: active.physicalScriptName,
@@ -1914,6 +1920,7 @@ describe('fleet operations', () => {
         findings: [],
         hostRoutingKvId: 'host-routing-kv',
         dispatchScriptCount: 0,
+        unavailableR2Jurisdictions: Object.freeze([]),
         scriptRegistrations: [],
         deployments: expectsTrustedWorkers
           ? [
@@ -2014,6 +2021,7 @@ describe('fleet operations', () => {
       inventory: {
         findings: [],
         dispatchScriptCount: 0,
+        unavailableR2Jurisdictions: Object.freeze([]),
         scriptRegistrations: [],
         deployments: [],
         databaseIds: [releaseBearing.databaseId],
@@ -2067,6 +2075,7 @@ describe('fleet operations', () => {
       findings: [],
       hostRoutingKvId: 'host-routing-kv',
       dispatchScriptCount: 1,
+      unavailableR2Jurisdictions: Object.freeze([]),
       scriptRegistrations: [
         {
           scriptName: current.scriptName,
@@ -2241,6 +2250,7 @@ describe('fleet operations', () => {
         records: [current],
         inventory: {
           findings: [],
+          unavailableR2Jurisdictions: Object.freeze([]),
           scriptRegistrations: [],
           deployments: [],
           databaseIds: [current.databaseId],

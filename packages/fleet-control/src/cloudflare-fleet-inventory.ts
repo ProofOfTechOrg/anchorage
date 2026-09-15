@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { createHash } from 'node:crypto';
+import { APIError } from 'cloudflare';
 import {
   CLOUDFLARE_INVENTORY_BOUND,
   inventoryBoundExceeded,
@@ -1941,51 +1942,73 @@ async function advanceR2Buckets(
     }
     checkSignal(context.signal);
     context.budget.spend();
-    const page = await context.deps.listR2Buckets({
-      jurisdiction,
-      namePrefix: context.options.scriptNamePrefix,
-      ...(startAfter === undefined ? {} : { startAfter }),
-      ...(context.signal ? { signal: context.signal } : {}),
-    });
-    const buckets = page.buckets;
-    context.identity.observe([
-      'r2-buckets',
-      jurisdictionOrdinal,
-      startAfter ?? null,
-      buckets.map((bucket) => bucket.name ?? null),
-    ]);
-    for (const bucket of buckets) {
-      if (!bucket.name?.startsWith(context.options.scriptNamePrefix)) continue;
-      if (
-        bucket.jurisdiction !== undefined &&
-        bucket.jurisdiction !== jurisdiction
-      ) {
-        throw new Error(`R2 bucket '${bucket.name}' changed jurisdiction`);
-      }
-      if (
-        !bucket.creation_date ||
-        !Number.isFinite(Date.parse(bucket.creation_date))
-      ) {
-        throw new Error(
-          `R2 bucket '${bucket.name}' has no valid creation date`,
-        );
-      }
-      if (context.sink.count('r2-bucket') >= CLOUDFLARE_INVENTORY_BOUND) {
-        // The bound counts only accepted fleet-owned buckets, not every
-        // provider item scanned while filtering by prefix.
-        throw inventoryBoundExceeded(
-          'R2 bucket inventory',
-          CLOUDFLARE_INVENTORY_BOUND,
-        );
-      }
-      context.sink.add('r2-bucket', {
-        record: 'r2-bucket',
-        bucketName: bucket.name,
+    let page: FleetInventoryBucketPage | undefined;
+    try {
+      page = await context.deps.listR2Buckets({
         jurisdiction,
-        creationDate: new Date(bucket.creation_date).toISOString(),
+        namePrefix: context.options.scriptNamePrefix,
+        ...(startAfter === undefined ? {} : { startAfter }),
+        ...(context.signal ? { signal: context.signal } : {}),
       });
+    } catch (error) {
+      if (
+        jurisdiction === 'default' ||
+        startAfter !== undefined ||
+        !(error instanceof APIError) ||
+        error.status !== 403 ||
+        !Array.isArray(error.errors) ||
+        !error.errors.some((entry) => entry?.code === 10003)
+      ) {
+        throw error;
+      }
+      context.sink.add('meta', {
+        record: 'unavailable-r2-jurisdiction',
+        jurisdiction,
+      });
+      context.identity.observe(['unavailable-r2-jurisdiction', jurisdiction]);
     }
-    if (buckets.length < R2_PAGE_SIZE) {
+    if (page !== undefined) {
+      const buckets = page.buckets;
+      context.identity.observe([
+        'r2-buckets',
+        jurisdictionOrdinal,
+        startAfter ?? null,
+        buckets.map((bucket) => bucket.name ?? null),
+      ]);
+      for (const bucket of buckets) {
+        if (!bucket.name?.startsWith(context.options.scriptNamePrefix))
+          continue;
+        if (
+          bucket.jurisdiction !== undefined &&
+          bucket.jurisdiction !== jurisdiction
+        ) {
+          throw new Error(`R2 bucket '${bucket.name}' changed jurisdiction`);
+        }
+        if (
+          !bucket.creation_date ||
+          !Number.isFinite(Date.parse(bucket.creation_date))
+        ) {
+          throw new Error(
+            `R2 bucket '${bucket.name}' has no valid creation date`,
+          );
+        }
+        if (context.sink.count('r2-bucket') >= CLOUDFLARE_INVENTORY_BOUND) {
+          // The bound counts only accepted fleet-owned buckets, not every
+          // provider item scanned while filtering by prefix.
+          throw inventoryBoundExceeded(
+            'R2 bucket inventory',
+            CLOUDFLARE_INVENTORY_BOUND,
+          );
+        }
+        context.sink.add('r2-bucket', {
+          record: 'r2-bucket',
+          bucketName: bucket.name,
+          jurisdiction,
+          creationDate: new Date(bucket.creation_date).toISOString(),
+        });
+      }
+    }
+    if (page === undefined || page.buckets.length < R2_PAGE_SIZE) {
       const nextOrdinal = jurisdictionOrdinal + 1;
       if (nextOrdinal > 2) {
         return nextStage(stage, context.options, context.sink.counts);
@@ -1993,7 +2016,7 @@ async function advanceR2Buckets(
       jurisdictionOrdinal = nextOrdinal as 0 | 1 | 2;
       startAfter = undefined;
     } else {
-      const last = buckets.at(-1)?.name;
+      const last = page.buckets.at(-1)?.name;
       if (!last || last === startAfter) {
         throw new Error('R2 bucket inventory pagination did not advance');
       }

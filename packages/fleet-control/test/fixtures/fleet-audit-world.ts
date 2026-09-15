@@ -858,6 +858,7 @@ function fleetAuditWorldInventory(): FleetResourceInventory {
         detail: 'seeded provider finding carried through the golden baseline',
       },
     ],
+    unavailableR2Jurisdictions: Object.freeze([]),
     scriptRegistrations,
     deployments,
     databaseIds,

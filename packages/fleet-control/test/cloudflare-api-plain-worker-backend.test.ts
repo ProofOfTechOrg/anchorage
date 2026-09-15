@@ -177,6 +177,54 @@ describe('CloudflareApiPlainWorkerBackend', () => {
     expect(backend.kind).toBe('plain-worker');
   });
 
+  it('forwards maintenance route readiness timeout and interval', async () => {
+    const world = providerWorld();
+    const fixture = recordingFetch(projectedHandler(world));
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'inert',
+      plane: 'plain-worker',
+      rateCoordinator: testRateCoordinator(),
+      fetch: fixture.fetch,
+    });
+    const request = vi.fn(
+      async () =>
+        new Response('<html></html>', {
+          status: 404,
+          headers: { 'content-type': 'text/html' },
+        }),
+    );
+    const backend = new CloudflareApiPlainWorkerBackend({
+      client,
+      fetch: request,
+      maintenanceRouteReadyTimeoutMs: 5,
+      maintenanceRouteReadyIntervalMs: 2,
+    });
+    const deployed = await backend.deployWorker(
+      baseSpec,
+      database,
+      secrets,
+      undefined,
+      fence(),
+    );
+    vi.useFakeTimers();
+    try {
+      const pending = expect(
+        backend.ensureMaintenance(
+          baseSpec,
+          secrets.maintenanceAdmin,
+          fence(),
+          deployed.artifactVersion,
+        ),
+      ).rejects.toThrow('workers.dev route did not serve within 5 ms');
+      await vi.advanceTimersByTimeAsync(5);
+      await pending;
+      expect(request).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('passes its identity caller token into deployment-identity refusals', async () => {
     const { backend, fixture } = subject(projectedHandler(providerWorld()));
 

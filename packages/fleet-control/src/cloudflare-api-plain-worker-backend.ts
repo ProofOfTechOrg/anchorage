@@ -13,8 +13,12 @@ export interface CloudflareApiPlainWorkerBackendOptions {
   readonly client: CloudflareProvisioningClient;
   readonly fetch?: typeof fetch;
   readonly maintenanceRequestTimeoutMs?: number;
+  readonly maintenanceRouteReadyTimeoutMs?: number;
+  readonly maintenanceRouteReadyIntervalMs?: number;
   /** Stamps `observedAt` on an attestation. Injected so it can be pinned. */
   readonly clock?: () => number;
+  /** Delays reconciled mutation retries. Defaults to a `setTimeout` promise. */
+  readonly wait?: (ms: number) => Promise<void>;
 }
 
 /**
@@ -45,7 +49,10 @@ export class CloudflareApiPlainWorkerBackend extends PlainWorkerBackend {
       identityCaller: 'CloudflareApiPlainWorkerBackend.seedDeploymentIdentity',
       fetch: options.fetch,
       maintenanceRequestTimeoutMs: options.maintenanceRequestTimeoutMs,
+      maintenanceRouteReadyTimeoutMs: options.maintenanceRouteReadyTimeoutMs,
+      maintenanceRouteReadyIntervalMs: options.maintenanceRouteReadyIntervalMs,
       clock: options.clock,
+      wait: options.wait,
     });
   }
 }

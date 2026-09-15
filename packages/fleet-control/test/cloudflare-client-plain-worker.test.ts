@@ -314,7 +314,7 @@ describe('CloudflareProvisioningClient subdomain ingress proof', () => {
       reply: () =>
         Response.json({
           success: true,
-          errors: null,
+          errors: 'bad',
           result: { enabled: false, previews_enabled: false },
         }),
     },
@@ -347,6 +347,29 @@ describe('CloudflareProvisioningClient subdomain ingress proof', () => {
     const { client, subdomainReads } = fixture(reply);
     await expect(read(client)).rejects.toThrow();
     expect(subdomainReads()).toHaveLength(1);
+  });
+
+  it('accepts null errors and messages in subdomain ingress metadata', async () => {
+    const { client } = fixture(() =>
+      Response.json({
+        success: true,
+        errors: null,
+        messages: null,
+        result: { enabled: false, previews_enabled: false },
+      }),
+    );
+    await expect(
+      client.inspectOrdinaryWorkerFootprint('plain'),
+    ).resolves.toMatchObject({
+      scriptPresent: true,
+      workersDevEnabled: false,
+      previewUrlsEnabled: false,
+    });
+    await expect(client.inspectControlWorker('plain')).resolves.toMatchObject({
+      workersDevEnabled: false,
+      previewUrlsEnabled: false,
+    });
+    await expect(readers[1].read(client)).resolves.toBeUndefined();
   });
 
   it.each([
@@ -1208,6 +1231,70 @@ describe('CloudflareProvisioningClient plain-worker plane', () => {
     }
   });
 
+  it.each([
+    {
+      label: 'null errors and messages',
+      info: { page: 1, per_page: 100, total_count: 1, total_pages: 1 },
+    },
+    { label: 'null errors and result_info', info: null },
+  ])('accepts $label in version inventory and returns its rows', async ({
+    info,
+  }) => {
+    const fixture = recordingFetch(({ url }) =>
+      new URL(url).searchParams.get('page') === '2'
+        ? pageItems([])
+        : Response.json({
+            success: true,
+            errors: null,
+            messages: null,
+            result: {
+              items: [{ id: 'v1', annotations: { 'workers/tag': 'release' } }],
+            },
+            result_info: info,
+          }),
+    );
+    await expect(
+      plainClient({ fetch: fixture.fetch }).listOrdinaryWorkerVersions('plain'),
+    ).resolves.toEqual([{ versionId: 'v1', tag: 'release' }]);
+    expect(fixture.requests).toHaveLength(2);
+  });
+
+  it('accepts null errors and result_info as a single empty version page', async () => {
+    const fixture = recordingFetch(() =>
+      Response.json({
+        success: true,
+        errors: null,
+        result: { items: [] },
+        result_info: null,
+      }),
+    );
+    await expect(
+      plainClient({ fetch: fixture.fetch }).listOrdinaryWorkerVersions('plain'),
+    ).resolves.toEqual([]);
+    expect(fixture.requests).toHaveLength(1);
+  });
+
+  it.each([
+    {
+      label: 'non-empty errors',
+      fields: { errors: [{ code: 1000, message: 'x' }] },
+    },
+    { label: 'non-array non-null errors', fields: { errors: 'bad' } },
+    { label: 'non-object result_info', fields: { result_info: 'bad' } },
+  ])('refuses $label in version inventory', async ({ fields }) => {
+    const fixture = recordingFetch(() =>
+      Response.json({
+        success: true,
+        errors: null,
+        result: { items: [{ id: 'v1' }] },
+        ...fields,
+      }),
+    );
+    await expect(
+      plainClient({ fetch: fixture.fetch }).listOrdinaryWorkerVersions('plain'),
+    ).rejects.toThrow();
+  });
+
   it('paginates versions through a terminal empty page and reserves quota per request', async () => {
     const events: string[] = [];
     const fixture = recordingFetch(({ url }) => {
@@ -1235,7 +1322,7 @@ describe('CloudflareProvisioningClient plain-worker plane', () => {
     expect(events.filter((event) => event === 'quota:acquire')).toHaveLength(3);
   });
 
-  it('propagates a version-list 404 after the first page yielded', async () => {
+  it('classifies a version-list 404 after the first page as an absent Worker', async () => {
     let requests = 0;
     const fixture = recordingFetch(() => {
       requests += 1;
@@ -1252,7 +1339,11 @@ describe('CloudflareProvisioningClient plain-worker plane', () => {
 
     await expect(
       plainClient({ fetch: fixture.fetch }).listOrdinaryWorkerVersions('plain'),
-    ).rejects.toMatchObject({ status: 404 });
+    ).resolves.toBeUndefined();
+    expect(fixture.requests).toHaveLength(2);
+    expect(
+      fixture.requests.map(({ url }) => new URL(url).searchParams.get('page')),
+    ).toEqual([null, '2']);
   });
 
   it('rejects version and inherited secret inventories above their item bounds', async () => {

@@ -371,7 +371,13 @@ export async function observeDirectWorkerVersion(input) {
       runtime.compatibility_date !== intent.compatibilityDate
     )
       refuse();
-    equal(runtime.compatibility_flags, intent.compatibilityFlags);
+    // The version resource omits compatibility_flags when the list is empty.
+    equal(
+      runtime.compatibility_flags === undefined
+        ? []
+        : runtime.compatibility_flags,
+      intent.compatibilityFlags,
+    );
     const resources = bindings(version.resources?.bindings, expected, true);
     const settings = await sdk.workers.scripts.scriptAndVersionSettings.get(
       expected.scriptName,
@@ -434,9 +440,11 @@ async function queryRows(sdk, ctx, sql, params, limit) {
   });
   if (!Array.isArray(page.result) || page.result.length !== 1) refuse();
   const result = page.result[0];
+  // Cloudflare returns errors: null on successful pages; accept it on statements too.
   if (
     result.success !== true ||
     (result.errors !== undefined &&
+      result.errors !== null &&
       (!Array.isArray(result.errors) || result.errors.length !== 0)) ||
     (result.error !== undefined && result.error !== null) ||
     !Array.isArray(result.results) ||

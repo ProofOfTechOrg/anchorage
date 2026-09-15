@@ -206,7 +206,7 @@ export async function ordinaryWorkerSubdomain(
   }
   const body: unknown = await response.json();
   const result = readField(body, 'result');
-  const errors = readField(body, 'errors');
+  const errors = readField(body, 'errors') ?? undefined;
   const enabled = readField(result, 'enabled');
   const previews = readField(result, 'previews_enabled');
   if (
@@ -323,7 +323,6 @@ export async function listOrdinaryWorkerVersions(
   scriptName: string,
 ): Promise<readonly PlainWorkerVersionSummary[] | undefined> {
   return context.schedule(async () => {
-    let yielded = false;
     try {
       const versions: PlainWorkerVersionSummary[] = [];
       for await (const version of context.collectBounded(
@@ -337,7 +336,6 @@ export async function listOrdinaryWorkerVersions(
         'ordinary Worker version inventory',
         MAX_VERSION_INVENTORY,
       )) {
-        yielded = true;
         versions.push({
           versionId:
             readStringField(version, 'id') ??
@@ -347,7 +345,9 @@ export async function listOrdinaryWorkerVersions(
       }
       return versions;
     } catch (error) {
-      if (!yielded && isNotFound(error)) return undefined;
+      // The SDK requests the page after the last item. A 404 observes the
+      // script's absence between pages, so earlier pages are stale.
+      if (isNotFound(error)) return undefined;
       throw error;
     }
   });
@@ -698,7 +698,9 @@ export async function inspectActiveWorkerRoute(
       artifactVersion,
       { account_id: context.accountId, script_name: scriptName },
     );
-    const specDigest = (version.resources.bindings ?? []).flatMap((binding) =>
+    const specDigest = (
+      version.resources.bindings === undefined ? [] : version.resources.bindings
+    ).flatMap((binding) =>
       binding.type === 'plain_text' && binding.name === 'FLEET_SPEC_DIGEST'
         ? [binding.text]
         : [],

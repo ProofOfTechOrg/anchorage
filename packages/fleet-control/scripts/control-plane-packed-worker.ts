@@ -202,7 +202,11 @@ async function provider(env: Env, invocationId: string) {
       .bind(invocationId, method, url.href)
       .run();
     const path = url.pathname;
-    if (method === 'GET' && path === '/client/v4/user/tokens/verify') {
+    if (
+      method === 'GET' &&
+      (path === '/client/v4/accounts/account/tokens/verify' ||
+        path === '/client/v4/user/tokens/verify')
+    ) {
       return single({ id: 'token-id', status: 'active' });
     }
     if (

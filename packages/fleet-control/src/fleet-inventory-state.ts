@@ -1384,6 +1384,15 @@ export function materializeFleetInventoryGeneration(
     namespaceIds: of('namespace-id', 'namespace-id').map((row) =>
       text(row.payload, 'namespaceId'),
     ),
+    unavailableR2Jurisdictions: Object.freeze(
+      of('meta', 'unavailable-r2-jurisdiction').map((row) => {
+        const jurisdiction = text(row.payload, 'jurisdiction');
+        if (jurisdiction !== 'eu' && jurisdiction !== 'fedramp') {
+          throw new FleetInventoryStateError();
+        }
+        return jurisdiction;
+      }),
+    ),
     r2Buckets: of('r2-bucket', 'r2-bucket').map((row) => ({
       bucketName: text(row.payload, 'bucketName'),
       jurisdiction: text(row.payload, 'jurisdiction') as R2Jurisdiction,

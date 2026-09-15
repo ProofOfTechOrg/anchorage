@@ -124,6 +124,15 @@ function providerTransport(fetchRequest, timeoutMs) {
       timer = setTimeout(() => controller.abort(), Math.max(1, deadline));
       try {
         signal.throwIfAborted();
+        if (rawByteLimit !== undefined) {
+          const headers = new Headers(
+            init?.headers ??
+              (input instanceof Request ? input.headers : undefined),
+          );
+          // The export observation refuses compression even if the platform ignores identity.
+          headers.set('Accept-Encoding', 'identity');
+          init = { ...init, headers };
+        }
         const exchange = Promise.resolve(
           fetchRequest(input, { ...init, signal, redirect: 'manual' }),
         ).then((value) => {
@@ -222,9 +231,11 @@ function providerTransport(fetchRequest, timeoutMs) {
 function validateEnvelope(value) {
   object(value);
   const cursor = value.result_info?.cursor;
+  // Cloudflare returns errors: null on successful pages.
   if (
     value.success !== true ||
     (value.errors !== undefined &&
+      value.errors !== null &&
       (!Array.isArray(value.errors) || value.errors.length !== 0)) ||
     (typeof cursor === 'string' && cursor.length > 0)
   )
@@ -265,7 +276,8 @@ function proofFetch(transport, shape, bound) {
           refuse('provider-unavailable');
         rows.forEach(object);
         const info = value.result_info;
-        if (info !== undefined) object(info);
+        // Successful Cloudflare pages can omit optional metadata with null.
+        if (info !== undefined && info !== null) object(info);
         const {
           cursor,
           total_pages: totalPages,

@@ -143,7 +143,7 @@ export interface ProviderUpload {
   };
 }
 
-/** A one-shot provider failure at a logical backend operation boundary. */
+/** A provider failure at a logical backend operation boundary. */
 export interface ProviderFailure {
   /**
    * Whether the selected request commits before its response is lost. A
@@ -155,10 +155,12 @@ export interface ProviderFailure {
    * returned 400 would erase the injected message there. The other REST
    * handlers uniformly answer a non-retryable 400, because an endpoint on the
    * client's default `maxRetries` budget would otherwise retry a thrown error
-   * and commit the mutation on the retry, with the one-shot hook already
+   * and commit the mutation on the retry, with the default hook already
    * consumed.
    */
   readonly dispatched: boolean;
+  /** Consecutive uses before the failure is removed; defaults to one. */
+  readonly times?: number;
   readonly duplicate?: boolean;
   readonly error?: Error;
   /** REST-only; honoured by upload handlers and rejected by the CLI projection. */
@@ -291,7 +293,7 @@ export class ProviderWorld {
     hostname: string;
     service: string;
   }> = [];
-  readonly zones: Array<{ id: string; name?: string }> = [];
+  readonly zones: Array<{ id: string; name?: string; type?: string }> = [];
   readonly routes: WorkerRoute[] = [];
   readonly durableObjectNamespaces: Array<{
     id: string;
@@ -317,6 +319,9 @@ export class ProviderWorld {
     if (this.#failures.has(operation)) {
       throw new Error(`failure already registered for '${operation}'`);
     }
+    if (!Number.isSafeInteger(failure.times ?? 1) || (failure.times ?? 1) < 1) {
+      throw new Error('failure times must be a positive safe integer');
+    }
     this.#failures.set(operation, { ...failure });
   }
 
@@ -329,7 +334,14 @@ export class ProviderWorld {
 
   consumeFailure(operation: string): ProviderFailure | undefined {
     const failure = this.#failures.get(operation);
-    this.#failures.delete(operation);
+    if (failure && (failure.times ?? 1) > 1) {
+      this.#failures.set(operation, {
+        ...failure,
+        times: (failure.times ?? 1) - 1,
+      });
+    } else {
+      this.#failures.delete(operation);
+    }
     this.#deferredFailures.delete(operation);
     return failure;
   }

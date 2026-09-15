@@ -160,3 +160,29 @@ export function isNotFound(error: unknown): boolean {
       error.status === 404,
   );
 }
+
+/**
+ * Recognizes SDK provider responses and transport failures, including their
+ * sanitized forms. A transient classification still requires an absence read
+ * before a provisioning mutation can retry through the backend's wait seam.
+ */
+export function isTransientProviderError(error: unknown): boolean {
+  const sanitized =
+    readErrorFieldSafely(error, 'name') === 'CloudflareProviderError';
+  if (!sanitized && !(error instanceof APIError)) return false;
+  const status = readErrorFieldSafely(error, 'status');
+  if (typeof status === 'number') {
+    return status >= 500 || status === 408 || status === 429;
+  }
+  if (status !== undefined) return false;
+  const causeName = readErrorFieldSafely(
+    readErrorFieldSafely(error, 'cause'),
+    'name',
+  );
+  return (
+    error instanceof APIConnectionError ||
+    (sanitized &&
+      (causeName === 'APIConnectionError' ||
+        causeName === 'APIConnectionTimeoutError'))
+  );
+}

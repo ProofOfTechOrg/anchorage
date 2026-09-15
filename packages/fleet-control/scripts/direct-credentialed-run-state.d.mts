@@ -257,6 +257,10 @@ export const DIRECT_SCENARIO_FAILURES: readonly [
 ];
 
 export const DIRECT_SCENARIO_FAILURE_DETAILS: readonly [
+  'platform-page',
+  'transport-failure',
+  'non-contract-answer',
+  'delivery-window-expired',
   'phase-ceiling',
   'run-reserve',
   'below-scenario-floor',

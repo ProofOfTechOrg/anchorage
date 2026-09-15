@@ -5,6 +5,7 @@ import { constants } from 'node:fs';
 import { open, readFile, rename, unlink } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
+import { DIRECT_INVOCATION_FAILURE_DETAILS } from './direct-credentialed-invocation.mjs';
 import { DIRECT_RESIDUAL_SURFACES } from './direct-credentialed-run-state.mjs';
 import { DIRECT_SCENARIO_PHASES } from './direct-credentialed-scenario-budget.mjs';
 
@@ -53,6 +54,7 @@ const settlement = (value) => pick(value, ['settledByReread']);
 
 export function buildDirectEvidence({
   snapshot,
+  invocationFailureDetail,
   prepared,
   mode,
   outcome,
@@ -61,6 +63,15 @@ export function buildDirectEvidence({
 }) {
   const bootstrap = snapshot.bootstrap;
   const scenario = snapshot.scenario;
+  const invocationFailure =
+    snapshot.lastInvocation?.state === 'pending' &&
+    DIRECT_INVOCATION_FAILURE_DETAILS.includes(invocationFailureDetail)
+      ? {
+          code: 'outcome-unknown',
+          ordinal: snapshot.lastInvocation.ordinal,
+          detail: invocationFailureDetail,
+        }
+      : null;
   const teardown = snapshot.teardown;
   const receipts = teardown?.receipts;
   const observation = (value) => pick(value, ['versionId', 'cpuLimitMs']);
@@ -95,7 +106,7 @@ export function buildDirectEvidence({
     })),
     scenario: nullable(scenario, (value) => ({
       phase: value.phase,
-      failure: nullable(value.failure, (failure) => ({
+      failure: nullable(value.failure ?? invocationFailure, (failure) => ({
         code: failure.code,
         ordinal: failure.ordinal,
         detail: failure.detail ?? null,

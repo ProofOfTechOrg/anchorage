@@ -1888,6 +1888,29 @@ describe('Cloudflare Worker attachment scan', () => {
     expect(rawRequests).toBe(1);
   });
 
+  it('accepts null result_info as a terminal dispatch script page', async () => {
+    let rawRequests = 0;
+    const fixture = recordingFetch((request) => {
+      const target = new URL(request.url);
+      if (target.pathname.endsWith('/workers/scripts')) return pageArray([]);
+      if (target.pathname.endsWith('/workers/dispatch/namespaces')) {
+        return pageArray([{ namespace_name: 'fleet' }]);
+      }
+      rawRequests += 1;
+      return Response.json({
+        success: true,
+        errors: null,
+        messages: null,
+        result: [],
+        result_info: null,
+      });
+    });
+    await expect(
+      drain(client(fixture.fetch), D1_TARGET),
+    ).resolves.toMatchObject({ terminal: { status: 'complete' } });
+    expect(rawRequests).toBe(1);
+  });
+
   it('injects authorization internally without serializing it into progress or errors', async () => {
     for (const terminalCursor of [null, ''] as const) {
       let rawRequests = 0;

@@ -70,14 +70,25 @@ export {
   type OrdinaryWorkerFootprint,
   type PlainWorkerCloudflareClientOptions,
 } from './cloudflare-client.js';
+export type { FleetInventoryR2Jurisdiction } from './cloudflare-fleet-inventory.js';
+export type {
+  PreparedOrdinaryWorkerDeploymentVersions,
+  PreparedOrdinaryWorkerUpload,
+} from './cloudflare-ordinary-worker-operations.js';
 export {
   type CloudflareApiRateCoordinator,
   D1CloudflareApiRateCoordinator,
   type D1CloudflareApiRateCoordinatorOptions,
   ProcessLocalCloudflareApiRateCoordinator,
 } from './cloudflare-rate-coordinator.js';
-export { D1FleetInventoryRunStore } from './d1-fleet-inventory-run-store.js';
-export { D1FleetOperationStore } from './d1-fleet-operation-store.js';
+export {
+  D1FleetInventoryRunStore,
+  type D1FleetInventoryRunStoreOptions,
+} from './d1-fleet-inventory-run-store.js';
+export {
+  D1FleetOperationStore,
+  type D1FleetOperationStoreOptions,
+} from './d1-fleet-operation-store.js';
 export {
   type AdvanceDecommissionDeploymentOptions,
   advanceDecommissionDeployment,
@@ -129,15 +140,26 @@ export {
 } from './fleet-inventory-advance.js';
 export {
   type CollectFleetInventoryOptions,
+  type FleetInventoryDeploymentFactKind,
+  type FleetInventoryFailureReason,
+  type FleetInventoryGeneration,
   type FleetInventoryGenerationRef,
   type FleetInventoryLease,
   type FleetInventoryProviderContext,
+  type FleetInventoryRowKind,
   type FleetInventoryRunOptions,
+  type FleetInventoryRunProgress,
+  type FleetInventoryRunRecord,
   type FleetInventoryRunStore,
   type FleetInventoryRunToken,
   FleetInventoryRunTokenError,
   FleetInventoryRunTokenFutureError,
   FleetInventoryRunTokenOperationError,
+  type FleetInventoryStage,
+  type FleetInventoryStagedFact,
+  type FleetInventoryStagedRow,
+  type FleetInventoryStageInput,
+  type FleetInventoryStageResult,
 } from './fleet-inventory-state.js';
 export {
   type AdvanceFleetMigrationOptions,
@@ -282,6 +304,7 @@ export {
   type MaintenanceSigningProfile,
   type NormalDecommissionLifecyclePhase,
   type ObservedActiveRoute,
+  type OrdinaryWorkerDeploymentVersion,
   type PlainWorkerCleanupOutcome,
   type PlainWorkerCustomDomain,
   type PlainWorkerDatabaseExportResult,

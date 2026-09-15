@@ -42,7 +42,7 @@ function parseJson(value: string, operation: string): unknown {
     throw new Error(`wrangler ${operation} returned invalid JSON`, { cause });
   }
   const success = readField(parsed, 'success');
-  const errors = readField(parsed, 'errors');
+  const errors = readField(parsed, 'errors') ?? undefined;
   if (
     (success !== undefined && success !== true) ||
     (errors !== undefined && (!Array.isArray(errors) || errors.length !== 0))
@@ -432,11 +432,12 @@ export class WranglerPlainWorkerProvisioningApi
     ]);
     const parsed = parseJson(viewed.stdout, 'versions view');
     const resources = readField(parsed, 'resources');
+    const bindings = readField(resources, 'bindings');
     return {
       versionId: readVersionId(parsed),
       tag: versionTag(parsed),
       bindings: providerBindingsToPlainWorkerShape(
-        asArray(readField(resources, 'bindings') ?? []),
+        asArray(bindings === undefined ? [] : bindings),
       ),
     };
   }

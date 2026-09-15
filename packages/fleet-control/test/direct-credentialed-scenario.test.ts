@@ -488,12 +488,14 @@ describe('scenario journal refusal boundaries', () => {
     const snapshot = local.journal.snapshot();
     expect(snapshot.lastInvocation?.state).toBe('pending');
     expect(snapshot.invocationCount).toBe(2);
+    const firstRunCalls = calls;
+    expect(firstRunCalls).toBeGreaterThanOrEqual(1);
     expect(await runDirectCredentialedScenario(input)).toMatchObject({
       status: 'failed',
       reason: 'outcome-unknown',
     });
     expect(local.journal.snapshot()).toEqual(snapshot);
-    expect(calls).toBe(1);
+    expect(calls).toBe(firstRunCalls);
   });
 });
 
@@ -1355,6 +1357,34 @@ describe('scenario resume re-entry against a settled journal', () => {
     });
     expect(stored(target).failure).toMatchObject({
       code: 'observation-mismatch',
+    });
+  });
+
+  it.each([
+    'platform-page',
+    'transport-failure',
+    'non-contract-answer',
+    'delivery-window-expired',
+  ] as const)('persists invocation outcome-unknown detail %s in scenario failure', async (detail) => {
+    const target = await scenarioJournal(DIRECT_SCENARIO_MIN_INVOCATIONS);
+    const invocation: DirectInvocationClient = {
+      async invoke() {
+        throw new DirectInvocationError(
+          'outcome-unknown',
+          undefined,
+          undefined,
+          detail,
+        );
+      },
+    };
+    expect(await run(target, invocation)).toMatchObject({
+      status: 'failed',
+      reason: 'outcome-unknown',
+      detail,
+    });
+    expect(stored(target).failure).toMatchObject({
+      code: 'outcome-unknown',
+      detail,
     });
   });
 

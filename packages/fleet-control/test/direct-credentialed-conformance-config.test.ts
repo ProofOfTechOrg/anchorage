@@ -262,15 +262,44 @@ describe('direct conformance configuration', () => {
       expect(() =>
         validate(changed([target, 'compatibilityDate'], date)),
       ).toThrow();
-    for (const flags of [['unknown'], ['nodejs_compat', 'nodejs_compat'], null])
+    for (const flags of [
+      ['unknown'],
+      ['nodejs_compat', 'nodejs_compat'],
+      ['global_fetch_strictly_public', 'global_fetch_strictly_public'],
+      ['global_fetch_strictly_public', 'nodejs_compat'],
+      [
+        'nodejs_compat',
+        'global_fetch_strictly_public',
+        'global_fetch_strictly_public',
+      ],
+      null,
+    ])
       expect(() =>
         validate(changed([target, 'compatibilityFlags'], flags)),
       ).toThrow();
-    expect(
-      validate(changed([target, 'compatibilityFlags'], ['nodejs_compat']))[
-        target as 'referenceWorker' | 'deployment'
-      ].compatibilityFlags,
-    ).toEqual(['nodejs_compat']);
+    for (const flags of [
+      [],
+      ['nodejs_compat'],
+      ['global_fetch_strictly_public'],
+      ['nodejs_compat', 'global_fetch_strictly_public'],
+    ]) {
+      const raw = changed([target, 'compatibilityFlags'], flags);
+      if (
+        target === 'referenceWorker' &&
+        !flags.includes('global_fetch_strictly_public')
+      ) {
+        expect(() => validate(raw)).toThrow(
+          'direct conformance config has invalid referenceWorker.compatibilityFlags',
+        );
+      } else {
+        const result =
+          validate(raw)[target as 'referenceWorker' | 'deployment'];
+        expect(result.compatibilityFlags).toEqual(flags);
+        expect(Object.isFrozen(result.compatibilityFlags)).toBe(true);
+        flags.push('unknown');
+        expect(result.compatibilityFlags).not.toContain('unknown');
+      }
+    }
     const leap = changed([target, 'compatibilityDate'], '2028-02-29');
     expect(() =>
       validateDirectConformanceConfig(leap, {

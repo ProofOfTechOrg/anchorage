@@ -324,6 +324,10 @@ export const DIRECT_SCENARIO_FAILURES = Object.freeze([
 ]);
 
 export const DIRECT_SCENARIO_FAILURE_DETAILS = Object.freeze([
+  'platform-page',
+  'transport-failure',
+  'non-contract-answer',
+  'delivery-window-expired',
   'phase-ceiling',
   'run-reserve',
   'below-scenario-floor',

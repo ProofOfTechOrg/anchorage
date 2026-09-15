@@ -146,11 +146,16 @@ export async function runDirectCredentialedScenario(input) {
     } catch (caught) {
       error = caught;
     }
+    const detail =
+      error instanceof DirectInvocationError && failureDetails.has(error.detail)
+        ? error.detail
+        : undefined;
     const after = journal.snapshot();
     requireFact(
       after.invocationCount === call.ordinal &&
         after.lastInvocation?.state === 'settled',
       'outcome-unknown',
+      detail,
     );
     if (error)
       requireFact(
@@ -158,6 +163,7 @@ export async function runDirectCredentialedScenario(input) {
           error.attempts &&
           ['injected-response-loss', 'reference-refused'].includes(error.code),
         'outcome-unknown',
+        detail ?? 'non-contract-answer',
       );
     const attempts = error ? error.attempts : response.attempts;
     const settled = {

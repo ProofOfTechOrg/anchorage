@@ -281,6 +281,7 @@ function cleanRoute(
 
 /** A test-mutable variant of `FleetResourceInventory` (readonly at the public boundary). */
 interface MutableInventory {
+  unavailableR2Jurisdictions: FleetResourceInventory['unavailableR2Jurisdictions'];
   findings: FleetInventoryFinding[];
   scriptRegistrations: FleetResourceInventory['scriptRegistrations'][number][];
   deployments: FleetInventoryDeployment[];
@@ -294,6 +295,7 @@ interface MutableInventory {
 function emptyInventory(): MutableInventory {
   return {
     findings: [],
+    unavailableR2Jurisdictions: Object.freeze([]),
     scriptRegistrations: [],
     deployments: [],
     databaseIds: [],
@@ -307,6 +309,7 @@ function emptyInventory(): MutableInventory {
 function inventoryFor(records: readonly FleetRecord[]): MutableInventory {
   return {
     findings: [],
+    unavailableR2Jurisdictions: Object.freeze([]),
     scriptRegistrations: [],
     deployments: records.map((record) => cleanInventoryDeployment(record)),
     databaseIds: records.map((record) => record.databaseId),

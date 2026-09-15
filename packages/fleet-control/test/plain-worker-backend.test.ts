@@ -1,7 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it, vi } from 'vitest';
+import {
+  APIConnectionError,
+  APIConnectionTimeoutError,
+  APIError,
+  APIUserAbortError,
+} from 'cloudflare';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ActiveRouteAttestationError } from '../src/active-route.js';
+import { CloudflareApiPlainWorkerProvisioningApi } from '../src/cloudflare-api-plain-worker-provisioning-api.js';
+import { CloudflareProvisioningClient } from '../src/cloudflare-client.js';
+import {
+  isTransientProviderError,
+  sanitizeProviderError,
+} from '../src/cloudflare-provider-errors.js';
 import { WorkerDeploymentError } from '../src/deployment-error.js';
 import { PlainWorkerBackend } from '../src/plain-worker-backend.js';
 import { deploymentSpecDigest } from '../src/spec-digest.js';
@@ -21,6 +33,13 @@ import type {
 } from '../src/types.js';
 import { WranglerLoopBackend } from '../src/wrangler-loop-backend.js';
 import {
+  pageItems,
+  recordingFetch,
+  restProjection,
+  testRateCoordinator,
+  zoneAuthorityResponse,
+} from './fixtures/cloudflare-fetch-fixture.js';
+import {
   mutationFence,
   rejectedValue,
   routeApi,
@@ -29,7 +48,7 @@ import {
   type FenceAssertionMode,
   PlainWorkerProvisioningApiFake,
 } from './fixtures/plain-worker-provisioning-api-fake.js';
-import { D1State } from './fixtures/provider-world.js';
+import { D1State, providerWorld } from './fixtures/provider-world.js';
 
 const RECEIPT_AUTHORITY = 'memory://fleet-exports/receipts/v1';
 
@@ -122,6 +141,9 @@ function backend(
   options: {
     readonly fetch?: typeof fetch;
     readonly clock?: () => number;
+    readonly wait?: (ms: number) => Promise<void>;
+    readonly maintenanceRouteReadyTimeoutMs?: number;
+    readonly maintenanceRouteReadyIntervalMs?: number;
   } = {},
 ): PlainWorkerBackend {
   return new PlainWorkerBackend({
@@ -200,6 +222,915 @@ function maintenanceResponse(digest = deploymentSpecDigest(spec)): Response {
     deploymentSpecDigest: digest,
   });
 }
+
+describe('reconciled transient provisioning failures', () => {
+  const wait = vi.fn(
+    (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+  );
+  beforeEach(() => {
+    vi.useFakeTimers();
+    wait.mockClear();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  function providerFailure(status = 520): APIError {
+    return APIError.generate(
+      status,
+      undefined,
+      'provider unavailable',
+      new Headers(),
+    );
+  }
+
+  function uploadFixture() {
+    const api = new PlainWorkerProvisioningApiFake();
+    installOnUpload(api);
+    const upload = vi.spyOn(api, 'uploadCandidate');
+    const fence = api.fence();
+    const subject = backend(api, { wait });
+    return {
+      api,
+      upload,
+      fence,
+      invoke: () =>
+        subject.deployWorker(spec, database, secrets, undefined, fence),
+    };
+  }
+
+  it('retries the Worker upload after a transient provider failure when reconciliation finds no tagged version: two uploads return candidate', async () => {
+    const { api, upload, invoke } = uploadFixture();
+    upload.mockResolvedValueOnce({
+      status: 'failed',
+      error: sanitizeProviderError(providerFailure(), []),
+      cleanup: { status: 'succeeded' },
+    });
+    const result = invoke();
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(api.versions.get(spec.scriptName)).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(result).resolves.toEqual({
+      artifactVersion: 'candidate',
+      created: true,
+    });
+    expect(upload).toHaveBeenCalledTimes(2);
+    expect(wait).toHaveBeenNthCalledWith(1, 2_000);
+    expect(
+      api.versions.get(spec.scriptName)?.map(({ versionId }) => versionId),
+    ).toEqual(['candidate']);
+  });
+
+  it('accepts a tagged version created by an upload that answered a transient failure without a second upload: one upload returns candidate', async () => {
+    const { api, upload, invoke } = uploadFixture();
+    api.uploadOutcome = {
+      status: 'failed',
+      error: sanitizeProviderError(providerFailure(), []),
+    };
+    api.footprints.set(spec.scriptName, {
+      scriptPresent: true,
+      workersDevEnabled: true,
+      previewUrlsEnabled: false,
+      customDomains: [],
+      zoneRoutes: [],
+    });
+    await expect(invoke()).resolves.toEqual({
+      artifactVersion: 'candidate',
+      created: true,
+    });
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(
+      api.versions.get(spec.scriptName)?.map(({ versionId }) => versionId),
+    ).toEqual(['candidate']);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(wait.mock.calls.map(([ms]) => ms)).toEqual([]);
+  });
+
+  it('fails the upload after three transient failures with the last provider error: three uploads leave no version', async () => {
+    const { api, upload, invoke } = uploadFixture();
+    const errors = [520, 502, 503].map((status) =>
+      sanitizeProviderError(providerFailure(status), []),
+    );
+    for (const error of errors) {
+      upload.mockResolvedValueOnce({
+        status: 'failed',
+        error,
+        cleanup: { status: 'succeeded' },
+      });
+    }
+    const result = rejectedValue(invoke());
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(upload).toHaveBeenCalledTimes(2);
+    expect(wait).toHaveBeenNthCalledWith(1, 2_000);
+    await vi.advanceTimersByTimeAsync(3_999);
+    expect(upload).toHaveBeenCalledTimes(2);
+    expect(wait).toHaveBeenNthCalledWith(1, 2_000);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await result).toMatchObject({
+      cause: errors[2],
+      resourceState: 'absent',
+    });
+    expect(((await result) as Error).cause).toBe(errors[2]);
+    expect(upload).toHaveBeenCalledTimes(3);
+    expect(api.versions.get(spec.scriptName)).toBeUndefined();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(wait.mock.calls.map(([ms]) => ms)).toEqual([2_000, 4_000]);
+  });
+
+  it('does not retry a non-transient upload refusal: one upload leaves no version', async () => {
+    const { api, upload, invoke } = uploadFixture();
+    const error = sanitizeProviderError(providerFailure(403), []);
+    upload.mockResolvedValueOnce({
+      status: 'failed',
+      error,
+      cleanup: { status: 'succeeded' },
+    });
+    expect(await rejectedValue(invoke())).toMatchObject({ cause: error });
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(api.versions.get(spec.scriptName)).toBeUndefined();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(wait.mock.calls.map(([ms]) => ms)).toEqual([]);
+  });
+
+  it('retries within the mutation fence duration: two uploads return candidate after a duration check before each upload', async () => {
+    const { api, upload, fence, invoke } = uploadFixture();
+    const events: string[] = [];
+    Object.defineProperty(fence, 'mutationLeaseTtlMs', {
+      get() {
+        events.push('duration');
+        return 15 * 60_000;
+      },
+    });
+    const original =
+      PlainWorkerProvisioningApiFake.prototype.uploadCandidate.bind(api);
+    upload.mockImplementation(async (...args) => {
+      expect(events.at(-1)).toBe('duration');
+      events.push('upload');
+      return upload.mock.calls.length === 1
+        ? {
+            status: 'failed',
+            error: sanitizeProviderError(providerFailure(), []),
+            cleanup: { status: 'succeeded' },
+          }
+        : original(...args);
+    });
+    const result = invoke();
+    await vi.advanceTimersByTimeAsync(2_000);
+    await expect(result).resolves.toEqual({
+      artifactVersion: 'candidate',
+      created: true,
+    });
+    expect(upload).toHaveBeenCalledTimes(2);
+    expect(wait).toHaveBeenNthCalledWith(1, 2_000);
+    expect(events.filter((event) => event === 'upload')).toHaveLength(2);
+  });
+
+  it('stops before a second upload when the mutation duration exceeds the fence: one upload leaves no version', async () => {
+    const { api, upload, fence, invoke } = uploadFixture();
+    let ttl = 15 * 60_000;
+    Object.defineProperty(fence, 'mutationLeaseTtlMs', { get: () => ttl });
+    upload.mockResolvedValueOnce({
+      status: 'failed',
+      error: sanitizeProviderError(providerFailure(), []),
+      cleanup: { status: 'succeeded' },
+    });
+    const result = rejectedValue(invoke());
+    await vi.advanceTimersByTimeAsync(0);
+    ttl = api.maxMutationDurationMs;
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(String(await result)).toContain(
+      'provider mutation maximum duration must be below',
+    );
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(api.versions.get(spec.scriptName)).toBeUndefined();
+  });
+
+  it('does not retry an ambiguous upload: one upload rejects multiple tagged versions', async () => {
+    const { api, upload, invoke } = uploadFixture();
+    api.onUploadCandidate = () => {
+      api.versions.set(spec.scriptName, [
+        ownedVersion('first'),
+        ownedVersion('second'),
+      ]);
+    };
+    api.uploadOutcome = {
+      status: 'failed',
+      error: sanitizeProviderError(providerFailure(), []),
+    };
+    await rejectedValue(invoke());
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(wait.mock.calls.map(([ms]) => ms)).toEqual([]);
+  });
+
+  it('does not retry when upload reconciliation fails: one upload leaves the version unknown', async () => {
+    const { api, upload, invoke } = uploadFixture();
+    upload.mockResolvedValueOnce({
+      status: 'failed',
+      error: sanitizeProviderError(providerFailure(), []),
+      cleanup: { status: 'succeeded' },
+    });
+    vi.spyOn(api, 'listVersions')
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValue(new Error('inventory unavailable'));
+    await rejectedValue(invoke());
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(wait.mock.calls.map(([ms]) => ms)).toEqual([]);
+  });
+
+  it('preserves scratch cleanup failure across retries: two uploads install candidate but report the cleanup failure', async () => {
+    const { api, upload, invoke } = uploadFixture();
+    const cleanupError = new Error('scratch cleanup failed');
+    upload.mockResolvedValueOnce({
+      status: 'failed',
+      error: sanitizeProviderError(providerFailure(), []),
+      cleanup: { status: 'failed', error: cleanupError },
+    });
+    const result = rejectedValue(invoke());
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(await result).toMatchObject({
+      cause: cleanupError,
+      resourceState: 'present',
+    });
+    expect(upload).toHaveBeenCalledTimes(2);
+    expect(wait).toHaveBeenNthCalledWith(1, 2_000);
+    expect(
+      api.versions.get(spec.scriptName)?.map(({ versionId }) => versionId),
+    ).toEqual(['candidate']);
+  });
+
+  for (const operation of [
+    'D1 creation',
+    'R2 creation',
+    'candidate-at-zero deployment',
+    'promotion deployment',
+  ] as const) {
+    function fixture() {
+      const api = new PlainWorkerProvisioningApiFake();
+      const fence = api.fence();
+      const subject = backend(api, { wait });
+      if (operation === 'D1 creation') {
+        const mutation = vi.spyOn(api, 'createDatabase');
+        return {
+          api,
+          mutation,
+          fail(error: unknown) {
+            mutation.mockResolvedValueOnce({ status: 'failed', error });
+          },
+          invoke: () => subject.ensureDatabase(spec, fence),
+          verify() {
+            expect([...api.databases.values()]).toEqual([
+              {
+                id: spec.databaseName,
+                name: spec.databaseName,
+                created: false,
+              },
+            ]);
+          },
+        };
+      }
+      if (operation === 'R2 creation') {
+        const mutation = vi.spyOn(api, 'createR2Bucket');
+        return {
+          api,
+          mutation,
+          fail(error: unknown) {
+            mutation.mockRejectedValueOnce(error);
+          },
+          invoke: () => subject.ensureApplicationR2Bucket(r2Resource, fence),
+          verify() {
+            expect([...api.buckets.values()]).toEqual([
+              expect.objectContaining(r2Resource),
+            ]);
+          },
+        };
+      }
+      api.versions.set(spec.scriptName, [
+        ownedVersion('current'),
+        ownedVersion('candidate'),
+      ]);
+      api.deployments.set(spec.scriptName, {
+        versions:
+          operation === 'promotion deployment'
+            ? [
+                { versionId: 'current', percentage: 100 },
+                { versionId: 'candidate', percentage: 0 },
+              ]
+            : [{ versionId: 'current', percentage: 100 }],
+      });
+      const mutation = vi.spyOn(api, 'createDeployment');
+      return {
+        api,
+        mutation,
+        fail(error: unknown) {
+          mutation.mockResolvedValueOnce({ status: 'failed', error });
+        },
+        invoke: () =>
+          operation === 'promotion deployment'
+            ? subject.promoteWorker(
+                spec,
+                {
+                  allowedCurrentScriptNames: [spec.scriptName],
+                  allowUnrouted: true,
+                },
+                undefined,
+                fence,
+                'candidate',
+              )
+            : subject.deployWorker(
+                spec,
+                database,
+                secrets,
+                undefined,
+                fence,
+                'candidate',
+              ),
+        verify() {
+          expect(api.deployments.get(spec.scriptName)?.versions).toEqual(
+            operation === 'promotion deployment'
+              ? [{ versionId: 'candidate', percentage: 100 }]
+              : [
+                  { versionId: 'current', percentage: 100 },
+                  { versionId: 'candidate', percentage: 0 },
+                ],
+          );
+        },
+      };
+    }
+
+    it(`retries ${operation} after a transient provider failure when reconciliation finds no effect: two calls create the intended resource or candidate deployment`, async () => {
+      const { mutation, fail, invoke, verify } = fixture();
+      fail(providerFailure());
+      const result = invoke();
+      await vi.advanceTimersByTimeAsync(1_999);
+      expect(mutation).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      await result;
+      expect(mutation).toHaveBeenCalledTimes(2);
+      expect(wait.mock.calls.map(([ms]) => ms)).toEqual([2_000]);
+      verify();
+    });
+
+    it(`fails ${operation} after three transient failures with the last provider error`, async () => {
+      const { mutation, fail, invoke } = fixture();
+      const errors = [520, 502, 503].map(providerFailure);
+      for (const error of errors) fail(error);
+      const result = rejectedValue(invoke());
+      await vi.advanceTimersByTimeAsync(6_000);
+      const error = await result;
+      expect(error instanceof WorkerDeploymentError ? error.cause : error).toBe(
+        errors[2],
+      );
+      expect(mutation).toHaveBeenCalledTimes(3);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(wait.mock.calls.map(([ms]) => ms)).toEqual([2_000, 4_000]);
+    });
+
+    it(`does not retry a non-transient ${operation} refusal: one call`, async () => {
+      const { mutation, fail, invoke } = fixture();
+      const providerError = providerFailure(403);
+      fail(providerError);
+      const error = await rejectedValue(invoke());
+      expect(error instanceof WorkerDeploymentError ? error.cause : error).toBe(
+        providerError,
+      );
+      expect(mutation).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(wait.mock.calls.map(([ms]) => ms)).toEqual([]);
+    });
+  }
+
+  it.each([
+    ['520', () => providerFailure(520), true],
+    ['500', () => providerFailure(500), true],
+    ['408', () => providerFailure(408), true],
+    ['429', () => providerFailure(429), true],
+    ['403', () => providerFailure(403), false],
+    ['409', () => providerFailure(409), false],
+    [
+      'connection',
+      () => new APIConnectionError({ cause: new Error('connection reset') }),
+      true,
+    ],
+    ['timeout', () => new APIConnectionTimeoutError(), true],
+    ['abort', () => new APIUserAbortError(), false],
+  ])('classifies raw and sanitized %s failures as transient=%s', (_label, create, transient) => {
+    const error = create();
+    expect(isTransientProviderError(error)).toBe(transient);
+    expect(isTransientProviderError(sanitizeProviderError(error, []))).toBe(
+      transient,
+    );
+  });
+
+  it('does not classify arbitrary failures without status as transient', () => {
+    for (const error of [
+      undefined,
+      null,
+      false,
+      new Error('validation'),
+      { status: 520 },
+      { name: 'CloudflareProviderError' },
+    ]) {
+      expect(isTransientProviderError(error)).toBe(false);
+    }
+  });
+});
+
+describe('maintenance route readiness', () => {
+  function platform404(): Response {
+    return new Response('error code: 1042', {
+      status: 404,
+      headers: {
+        'content-type': 'text/plain; charset=UTF-8',
+        server: 'cloudflare',
+        'cache-control':
+          'private, max-age=0, no-store, no-cache, must-revalidate, post-check=0, pre-check=0',
+      },
+    });
+  }
+
+  for (const operation of [
+    'inspect',
+    'ensureMaintenance',
+    'inspect without override',
+  ] as const) {
+    describe(operation, () => {
+      const override = operation !== 'inspect without override';
+      const expectedDigest = deploymentSpecDigest(spec);
+      const staleDigest = 'f'.repeat(64);
+      const mismatch = override
+        ? `maintenance response did not attest fleet specification digest '${expectedDigest}'`
+        : "maintenance response does not match inspected Worker version 'candidate'";
+
+      function setup(request: typeof fetch) {
+        const api = new PlainWorkerProvisioningApiFake();
+        deployedCandidate(api);
+        if (!override) {
+          api.versions.set(spec.scriptName, [
+            { ...ownedVersion('candidate'), tag: 'unmatched-tag' },
+          ]);
+        }
+        const fence = api.fence();
+        const subject = backend(api, {
+          fetch: request,
+          maintenanceRouteReadyTimeoutMs: 5,
+          maintenanceRouteReadyIntervalMs: 2,
+        });
+        return {
+          api,
+          fence,
+          invoke: () =>
+            operation === 'ensureMaintenance'
+              ? subject.ensureMaintenance(
+                  spec,
+                  secrets.maintenanceAdmin,
+                  fence,
+                  'candidate',
+                )
+              : subject.inspect(
+                  spec,
+                  secrets.maintenanceAdmin,
+                  override ? 'candidate' : undefined,
+                ),
+        };
+      }
+
+      it(
+        override
+          ? `retries ${operation} while the version override answer attests the previous version, until the candidate serves`
+          : 'retries inspect without override while the answer attests the previous version, until the inspected version serves',
+        async () => {
+          vi.useFakeTimers();
+          try {
+            const requests: Request[] = [];
+            const events: string[] = [];
+            const digests = [staleDigest, staleDigest, expectedDigest];
+            const request = vi.fn(
+              async (
+                input: Parameters<typeof fetch>[0],
+                init?: RequestInit,
+              ) => {
+                requests.push(new Request(input, init));
+                events.push('fetch');
+                return maintenanceResponse(digests[requests.length - 1]);
+              },
+            );
+            const { invoke, fence } = setup(request);
+            vi.spyOn(fence, 'assertOwned').mockImplementation(async () => {
+              events.push('fence');
+            });
+            const pending = invoke();
+            await vi.advanceTimersByTimeAsync(0);
+            expect(request).toHaveBeenCalledTimes(1);
+            await vi.advanceTimersByTimeAsync(1);
+            expect(request).toHaveBeenCalledTimes(1);
+            await vi.advanceTimersByTimeAsync(1);
+            expect(request).toHaveBeenCalledTimes(2);
+            await vi.advanceTimersByTimeAsync(1);
+            expect(request).toHaveBeenCalledTimes(2);
+            await vi.advanceTimersByTimeAsync(1);
+            expect(await pending).toMatchObject(
+              operation === 'ensureMaintenance'
+                ? { deploymentSpecDigest: expectedDigest }
+                : { maintenance: { deploymentSpecDigest: expectedDigest } },
+            );
+            expect(request).toHaveBeenCalledTimes(3);
+            for (const sent of requests) {
+              expect(sent.url).toBe(
+                new URL(
+                  operation === 'ensureMaintenance'
+                    ? '/admin/ensure-maintenance'
+                    : '/admin/maintenance-status',
+                  spec.maintenanceBaseUrl,
+                ).href,
+              );
+              expect(sent.method).toBe(
+                operation === 'ensureMaintenance' ? 'POST' : 'GET',
+              );
+              expect([...sent.headers]).toEqual([
+                ['authorization', `Bearer ${secrets.maintenanceAdmin}`],
+                ...(override
+                  ? [
+                      [
+                        'cloudflare-workers-version-overrides',
+                        `${spec.scriptName}="candidate"`,
+                      ],
+                    ]
+                  : []),
+              ]);
+            }
+            expect(events).toEqual(
+              operation === 'ensureMaintenance'
+                ? ['fence', 'fetch', 'fence', 'fetch', 'fence', 'fetch']
+                : ['fetch', 'fetch', 'fetch'],
+            );
+          } finally {
+            vi.useRealTimers();
+          }
+        },
+      );
+
+      it(
+        override
+          ? 'names the deployment wait when the override answer never attests the candidate'
+          : 'names the deployment wait when the answer never attests the inspected version without override',
+        async () => {
+          vi.useFakeTimers();
+          try {
+            const request = vi.fn(async () => maintenanceResponse(staleDigest));
+            const { invoke } = setup(request);
+            const pending = expect(invoke()).rejects.toEqual(
+              new Error(`${mismatch} within 5 ms after the deployment change`),
+            );
+            await vi.advanceTimersByTimeAsync(5);
+            await pending;
+            expect(request).toHaveBeenCalledTimes(3);
+          } finally {
+            vi.useRealTimers();
+          }
+        },
+      );
+
+      it(
+        override
+          ? 'passes an override answer that attests the candidate through without retrying'
+          : 'passes an answer that attests the inspected version through without override or retrying',
+        async () => {
+          const request = vi.fn(async () => maintenanceResponse());
+          const { invoke } = setup(request);
+          await expect(invoke()).resolves.toBeDefined();
+          expect(request).toHaveBeenCalledTimes(1);
+        },
+      );
+
+      it('shares one deadline between platform 404s and stale deployment healths', async () => {
+        vi.useFakeTimers();
+        try {
+          const request = vi.fn(async () =>
+            request.mock.calls.length === 1
+              ? platform404()
+              : maintenanceResponse(staleDigest),
+          );
+          const { invoke } = setup(request);
+          const pending = expect(invoke()).rejects.toEqual(
+            new Error(`${mismatch} within 5 ms after the deployment change`),
+          );
+          await vi.advanceTimersByTimeAsync(5);
+          await pending;
+          expect(request).toHaveBeenCalledTimes(3);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it('preserves the deployment wait error when the next fetch times out at the deadline', async () => {
+        vi.useFakeTimers();
+        try {
+          const request = vi.fn(async (): Promise<Response> => {
+            if (request.mock.calls.length === 1) {
+              return maintenanceResponse(staleDigest);
+            }
+            return new Promise((_resolve, reject) => {
+              setTimeout(() => reject(new Error('request timed out')), 3);
+            });
+          });
+          const { invoke } = setup(request);
+          const pending = expect(invoke()).rejects.toEqual(
+            new Error(`${mismatch} within 5 ms after the deployment change`),
+          );
+          await vi.advanceTimersByTimeAsync(5);
+          await pending;
+          expect(request).toHaveBeenCalledTimes(2);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it.each([
+        [
+          'invalid digest',
+          { deploymentSpecDigest: 'invalid' },
+          "maintenance response field 'deploymentSpecDigest' is invalid",
+        ],
+        [
+          'invalid health',
+          { deploymentSpecDigest: staleDigest, alarmAt: -1 },
+          "maintenance response field 'alarmAt' is invalid",
+        ],
+      ])('rejects %s without retrying', async (_label, health, message) => {
+        const request = vi.fn(async () => Response.json(health));
+        const { invoke } = setup(request);
+        await expect(invoke()).rejects.toThrow(message as string);
+        expect(request).toHaveBeenCalledTimes(1);
+      });
+
+      it('preserves the missing-digest policy without retrying', async () => {
+        const request = vi.fn(async () => Response.json({ alarmAt: 2_000 }));
+        const { invoke } = setup(request);
+        if (override) {
+          await expect(invoke()).rejects.toEqual(new Error(mismatch));
+        } else {
+          await expect(invoke()).resolves.toMatchObject({
+            maintenance: { armed: true },
+          });
+        }
+        expect(request).toHaveBeenCalledTimes(1);
+      });
+    });
+  }
+
+  for (const operation of ['inspect', 'ensureMaintenance'] as const) {
+    function invoke(
+      subject: PlainWorkerBackend,
+      api: PlainWorkerProvisioningApiFake,
+    ) {
+      return operation === 'inspect'
+        ? subject.inspect(spec, secrets.maintenanceAdmin, 'candidate')
+        : subject.ensureMaintenance(
+            spec,
+            secrets.maintenanceAdmin,
+            api.fence(),
+            'candidate',
+          );
+    }
+
+    it.each([
+      404, 500,
+    ])(`retries platform %i pages with the same ${operation} request until health is served`, async (status) => {
+      const api = new PlainWorkerProvisioningApiFake();
+      deployedCandidate(api);
+      const requests: Request[] = [];
+      const request = vi.fn(
+        async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+          requests.push(new Request(input, init));
+          if (requests.length === 1)
+            return new Response('platform unavailable', {
+              status,
+              headers: { 'content-type': 'text/plain; charset=UTF-8' },
+            });
+          if (requests.length === 2) {
+            return new Response('<html>route unavailable</html>', {
+              status,
+              headers: { 'content-type': 'text/html; charset=UTF-8' },
+            });
+          }
+          return maintenanceResponse();
+        },
+      );
+      const result = await invoke(
+        backend(api, {
+          fetch: request,
+          maintenanceRouteReadyTimeoutMs: 1_000,
+          maintenanceRouteReadyIntervalMs: 1,
+        }),
+        api,
+      );
+      expect(result).toMatchObject(
+        operation === 'inspect'
+          ? { maintenance: { armed: true } }
+          : { armed: true },
+      );
+      expect(request).toHaveBeenCalledTimes(3);
+      for (const sent of requests) {
+        expect(sent.url).toBe(
+          new URL(
+            operation === 'inspect'
+              ? '/admin/maintenance-status'
+              : '/admin/ensure-maintenance',
+            spec.maintenanceBaseUrl,
+          ).href,
+        );
+        expect(sent.method).toBe(operation === 'inspect' ? 'GET' : 'POST');
+        expect([...sent.headers]).toEqual([
+          ['authorization', `Bearer ${secrets.maintenanceAdmin}`],
+          [
+            'cloudflare-workers-version-overrides',
+            `${spec.scriptName}="candidate"`,
+          ],
+        ]);
+      }
+      expect(new Set(requests.map(({ signal }) => signal)).size).toBe(3);
+      expect(
+        api.events.filter((event) => event === 'assertOwned'),
+      ).toHaveLength(operation === 'inspect' ? 0 : 3);
+    });
+
+    it.each([
+      [
+        'JSON Worker 404',
+        () => Response.json({ error: 'not_found' }, { status: 404 }),
+      ],
+      ...[404, 500].flatMap((status) =>
+        ['text/plain', 'text/html'].flatMap((mediaType) =>
+          ['cache-control', 'www-authenticate'].map(
+            (marker) =>
+              [
+                `${status} ${mediaType} with ${marker}`,
+                () =>
+                  new Response('unavailable', {
+                    status,
+                    headers: {
+                      'content-type': mediaType,
+                      [marker]:
+                        marker === 'cache-control' ? 'no-store' : 'Bearer',
+                    },
+                  }),
+              ] as const,
+          ),
+        ),
+      ),
+      ['empty ingress 404', () => new Response(null, { status: 404 })],
+      [
+        'JSON Worker 500',
+        () => Response.json({ error: 'operation-refused' }, { status: 500 }),
+      ],
+      [
+        'Worker 401',
+        () =>
+          Response.json(
+            { error: 'unauthorized' },
+            { status: 401, headers: { 'www-authenticate': 'Bearer' } },
+          ),
+      ],
+      [
+        'authenticated plain-text 404',
+        () => {
+          const response = platform404();
+          response.headers.set('www-authenticate', 'Bearer');
+          return response;
+        },
+      ],
+      [
+        'authenticated HTML 404',
+        () =>
+          new Response('', {
+            status: 404,
+            headers: {
+              'content-type': 'text/html',
+              'www-authenticate': 'Bearer',
+            },
+          }),
+      ],
+    ] as const)(`passes a %s through ${operation} without retrying`, async (_label, response) => {
+      const api = new PlainWorkerProvisioningApiFake();
+      deployedCandidate(api);
+      const request = vi.fn(async () => response());
+      await expect(
+        invoke(backend(api, { fetch: request }), api),
+      ).rejects.toThrow(
+        `maintenance request failed with HTTP ${response().status}`,
+      );
+      expect(request).toHaveBeenCalledTimes(1);
+    });
+
+    it(`names the route wait when an ${operation} retry times out at the deadline`, async () => {
+      vi.useFakeTimers();
+      try {
+        const api = new PlainWorkerProvisioningApiFake();
+        deployedCandidate(api);
+        const request = vi.fn(async (): Promise<Response> => {
+          if (request.mock.calls.length === 1) return platform404();
+          return new Promise((_resolve, reject) => {
+            setTimeout(() => reject(new Error('request timed out')), 3);
+          });
+        });
+        const pending = expect(
+          invoke(
+            backend(api, {
+              fetch: request,
+              maintenanceRouteReadyTimeoutMs: 5,
+              maintenanceRouteReadyIntervalMs: 2,
+            }),
+            api,
+          ),
+        ).rejects.toThrow(
+          'maintenance request failed with HTTP 404. workers.dev route did not serve within 5 ms; a Worker fetching another Worker on the same workers.dev subdomain needs the global_fetch_strictly_public compatibility flag',
+        );
+        await vi.advanceTimersByTimeAsync(5);
+        await pending;
+        expect(request).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it(`bounds the workers.dev route wait for ${operation}`, async () => {
+      vi.useFakeTimers();
+      try {
+        const api = new PlainWorkerProvisioningApiFake();
+        deployedCandidate(api);
+        const request = vi.fn(async () => platform404());
+        const pending = expect(
+          invoke(
+            backend(api, {
+              fetch: request,
+              maintenanceRouteReadyTimeoutMs: 5,
+              maintenanceRouteReadyIntervalMs: 2,
+            }),
+            api,
+          ),
+        ).rejects.toThrow(
+          'maintenance request failed with HTTP 404. workers.dev route did not serve within 5 ms; a Worker fetching another Worker on the same workers.dev subdomain needs the global_fetch_strictly_public compatibility flag',
+        );
+        await vi.advanceTimersByTimeAsync(5);
+        await pending;
+        expect(request).toHaveBeenCalledTimes(3);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  }
+
+  it('defaults to a 60-second route wait with 2-second retries', async () => {
+    vi.useFakeTimers();
+    try {
+      const api = new PlainWorkerProvisioningApiFake();
+      deployedCandidate(api);
+      const request = vi.fn(async () => platform404());
+      const pending = expect(
+        backend(api, { fetch: request }).ensureMaintenance(
+          spec,
+          secrets.maintenanceAdmin,
+          api.fence(),
+          'candidate',
+        ),
+      ).rejects.toThrow(
+        'maintenance request failed with HTTP 404. workers.dev route did not serve within 60000 ms; a Worker fetching another Worker on the same workers.dev subdomain needs the global_fetch_strictly_public compatibility flag',
+      );
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(request).toHaveBeenCalledTimes(30);
+      await vi.advanceTimersByTimeAsync(1);
+      await pending;
+      expect(request).toHaveBeenCalledTimes(30);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    'platform 404',
+    'stale digest',
+  ])('refuses a maintenance retry after mutation ownership is lost (%s)', async (answer) => {
+    const api = new PlainWorkerProvisioningApiFake();
+    deployedCandidate(api);
+    const owned = api.fence();
+    vi.spyOn(owned, 'assertOwned')
+      .mockResolvedValueOnce()
+      .mockRejectedValue(new Error('lease lost'));
+    const request = vi.fn(async () =>
+      answer === 'platform 404'
+        ? platform404()
+        : maintenanceResponse('f'.repeat(64)),
+    );
+    await expect(
+      backend(api, {
+        fetch: request,
+        maintenanceRouteReadyIntervalMs: 1,
+      }).ensureMaintenance(spec, secrets.maintenanceAdmin, owned, 'candidate'),
+    ).rejects.toThrow('lease lost');
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe('inspection across release bindings', () => {
   const target: DeploymentSpec = {
@@ -1480,30 +2411,37 @@ describe('PlainWorkerBackend core-policy refusals', () => {
   });
 
   it('refuses a mismatched maintenance digest without promoting', async () => {
-    const api = new PlainWorkerProvisioningApiFake();
-    deployedCandidate(api);
-    const request = vi.fn(
-      async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
-        expect(String(input)).toContain('/admin/ensure-maintenance');
-        expect(init?.headers).toMatchObject({
-          'Cloudflare-Workers-Version-Overrides': `${spec.scriptName}="candidate"`,
-        });
-        return maintenanceResponse('f'.repeat(64));
-      },
-    );
+    vi.useFakeTimers();
+    try {
+      const api = new PlainWorkerProvisioningApiFake();
+      deployedCandidate(api);
+      const request = vi.fn(
+        async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+          expect(String(input)).toContain('/admin/ensure-maintenance');
+          expect(init?.headers).toMatchObject({
+            'Cloudflare-Workers-Version-Overrides': `${spec.scriptName}="candidate"`,
+          });
+          return maintenanceResponse('f'.repeat(64));
+        },
+      );
 
-    await expect(
-      backend(api, { fetch: request }).ensureMaintenance(
-        spec,
-        secrets.maintenanceAdmin,
-        api.fence(),
-        'candidate',
-      ),
-    ).rejects.toThrow(
-      'maintenance response did not attest fleet specification',
-    );
-    expect(api.events).toEqual(['assertOwned']);
-    expect(api.events).not.toContain('mutation:createDeployment');
+      const pending = expect(
+        backend(api, { fetch: request }).ensureMaintenance(
+          spec,
+          secrets.maintenanceAdmin,
+          api.fence(),
+          'candidate',
+        ),
+      ).rejects.toThrow(
+        'maintenance response did not attest fleet specification',
+      );
+      await vi.advanceTimersByTimeAsync(60_000);
+      await pending;
+      expect(request).toHaveBeenCalledTimes(30);
+      expect(api.events).not.toContain('mutation:createDeployment');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('refuses a second secret deletion after live ownership changes', async () => {
@@ -1536,6 +2474,95 @@ describe('PlainWorkerBackend core-policy refusals', () => {
     ).rejects.toThrow('drifted live teardown ownership');
     expect(api.events).toEqual(portMutation('deleteControlSecrets'));
     expect(api.secretNames.get(spec.scriptName)).toEqual(['B']);
+  });
+
+  it('accepts a version-list 404 on the page after the last version during the post-delete residual check', async () => {
+    const world = providerWorld();
+    const digest = deploymentSpecDigest(spec);
+    const script = world.seedScript(spec.scriptName, {
+      versions: [
+        {
+          versionId: 'candidate',
+          tag: digest,
+          bindings: [
+            { type: 'd1', name: 'DB', database_id: database.id },
+            ...Object.entries({
+              DEPLOYMENT_TENANT: spec.tenantTag,
+              FLEET_ENVIRONMENT: spec.environment,
+              FLEET_SCHEMA_VERSION: String(spec.schemaVersion),
+              FLEET_SPEC_DIGEST: digest,
+              FLEET_INGRESS_CONTRACT: 'guarded-object-v1',
+            }).map(([name, text]) => ({ type: 'plain_text', name, text })),
+          ],
+          mainModule: spec.mainModule,
+          modules: spec.modules,
+        },
+      ],
+      deployment: [{ versionId: 'candidate', percentage: 100 }],
+      subdomain: { enabled: false, previewsEnabled: false },
+    });
+    const persistedVersions = script.versions.map(({ versionId, tag }) => ({
+      id: versionId,
+      annotations: { 'workers/tag': tag },
+    }));
+    const projected = restProjection(world);
+    const postDeletePages: number[] = [];
+    const fixture = recordingFetch((request) => {
+      const url = new URL(request.url);
+      const authority = zoneAuthorityResponse(url, []);
+      if (authority) return authority;
+      if (
+        !script.present &&
+        url.pathname.endsWith(`/workers/scripts/${spec.scriptName}/versions`)
+      ) {
+        const page = Number(url.searchParams.get('page') ?? '1');
+        postDeletePages.push(page);
+        return page === 1
+          ? pageItems(persistedVersions, {
+              page: 1,
+              total_count: persistedVersions.length,
+            })
+          : Response.json(
+              {
+                success: false,
+                errors: [
+                  {
+                    code: 10007,
+                    message: 'This Worker does not exist on your account.',
+                  },
+                ],
+                messages: [],
+                result: null,
+              },
+              { status: 404 },
+            );
+      }
+      return projected(request);
+    });
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'token',
+      plane: 'plain-worker',
+      rateCoordinator: testRateCoordinator(),
+      fetch: fixture.fetch,
+      requestTimeoutMs: 1_000,
+    });
+    const subject = new PlainWorkerBackend({
+      api: new CloudflareApiPlainWorkerProvisioningApi({ client }),
+      identityCaller: 'PlainWorkerBackend.test',
+    });
+
+    await expect(
+      subject.deleteWorker(
+        spec,
+        undefined,
+        database,
+        activeRelease,
+        mutationFence(),
+      ),
+    ).resolves.toBeUndefined();
+    expect(postDeletePages).toEqual([1, 2]);
+    expect(world.mutationLog).toEqual([`delete-script:${spec.scriptName}`]);
   });
 
   it('refuses deletion when a namespace remains after script deletion', async () => {

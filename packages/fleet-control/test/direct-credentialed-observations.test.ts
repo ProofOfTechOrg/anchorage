@@ -256,6 +256,33 @@ describe('fixed Worker observations through the native SDK', () => {
     ).toBe(50);
   });
 
+  it('accepts absent version compatibility_flags when configuration declares no flags', async () => {
+    const f = await fixture();
+    expect(f.prepared.config.deployment.compatibilityFlags).toEqual([]);
+    await mutateResponse(f, '/versions/version-a', (value) => {
+      delete recordAt(value, 'result.resources.script_runtime')
+        .compatibility_flags;
+    });
+    await expect(
+      observeDirectWorkerVersion(selected(f)),
+    ).resolves.toMatchObject({
+      versionId: 'version-a',
+      trafficPercentage: 100,
+    });
+  });
+
+  it('refuses explicit null version compatibility_flags when configuration declares no flags', async () => {
+    const f = await fixture();
+    expect(f.prepared.config.deployment.compatibilityFlags).toEqual([]);
+    await mutateResponse(f, '/versions/version-a', (value) => {
+      recordAt(value, 'result.resources.script_runtime').compatibility_flags =
+        null;
+    });
+    await expect(observeDirectWorkerVersion(selected(f))).rejects.toMatchObject(
+      { code: 'observation-mismatch' },
+    );
+  });
+
   it('starts a fresh bounded SDK session for each observation', async () => {
     const f = await fixture();
     const now = vi.spyOn(performance, 'now').mockReturnValue(0);
@@ -588,6 +615,37 @@ describe('confirmed context before provider work', () => {
 });
 
 describe('fixed settlement query and ready-row correlation', () => {
+  it('accepts null errors and messages on successful D1 statements', async () => {
+    const f = await fixture();
+    await mutateResponse(f, '/query', (body) => {
+      const statement = recordAt(body, 'result.0');
+      statement.errors = null;
+      statement.messages = null;
+    });
+    const output = await readDirectSettlementEffects({
+      ...f.input,
+      expected: f.expected,
+    });
+    expect(output.map((row) => row.role)).toEqual(['a', 'b']);
+    expect(f.requests).toHaveLength(3);
+  });
+
+  it.each([
+    { kind: 'non-empty array', errors: [{ code: 1000, message: 'x' }] },
+    { kind: 'non-array', errors: 'bad' },
+  ])('refuses $kind errors on successful D1 statements', async ({ errors }) => {
+    const f = await fixture();
+    await mutateResponse(f, '/query', (body) => {
+      recordAt(body, 'result.0').errors = errors;
+    });
+    await expect(
+      readDirectSettlementEffects({ ...f.input, expected: f.expected }),
+    ).rejects.toMatchObject({
+      name: 'DirectObservationError',
+      code: 'observation-mismatch',
+    });
+  });
+
   it('reads reference D1 only, binds prefix/tenants, validates hashes and returns allowlisted effects', async () => {
     const f = await fixture();
     const before = f.journal.snapshot();
@@ -737,6 +795,45 @@ describe('fixed settlement query and ready-row correlation', () => {
 });
 
 describe('normal export raw-byte proof', () => {
+  it.each([
+    undefined,
+    'identity',
+  ])('verifies a chunked identity body with content-encoding %s and no content-length', async (encoding) => {
+    const f = await fixture();
+    const input = await f.exportInput();
+    f.hook(() => {
+      const headers = new Headers({ 'transfer-encoding': 'chunked' });
+      if (encoding) headers.set('content-encoding', encoding);
+      return new Response(SQL_SENTINEL, { headers });
+    });
+    await expect(verifyDirectDecommissionExport(input)).resolves.toMatchObject({
+      verified: true,
+      size: input.metadata.size,
+      sha256: input.metadata.sha256,
+    });
+    expect(f.requests[0]?.headers.get('accept-encoding')).toBe('identity');
+  });
+
+  it.each([
+    {
+      name: 'gzip encoding',
+      headers: new Headers({ 'content-encoding': 'gzip' }),
+    },
+    {
+      name: 'a length differing from the receipt',
+      headers: new Headers({ 'content-length': '1' }),
+    },
+  ])('refuses $name with observation-mismatch despite exact body bytes', async ({
+    headers,
+  }) => {
+    const f = await fixture();
+    const input = await f.exportInput();
+    f.hook(() => new Response(SQL_SENTINEL, { headers }));
+    await expect(verifyDirectDecommissionExport(input)).rejects.toMatchObject({
+      code: 'observation-mismatch',
+    });
+  });
+
   it('derives exact R2 key and returns frozen receipt with source ordinal', async () => {
     const f = await fixture();
     const input = await f.exportInput();

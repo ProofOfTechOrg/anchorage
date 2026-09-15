@@ -73,6 +73,7 @@ export {
   CleanupAdvanceTokenFutureError,
   CleanupAdvanceTokenOperationError,
 } from './cleanup-intent.js';
+export type { FleetInventoryR2Jurisdiction } from './cloudflare-fleet-inventory.js';
 export {
   type CloudflareApiRateCoordinator,
   D1CloudflareApiRateCoordinator,

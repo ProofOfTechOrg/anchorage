@@ -850,7 +850,10 @@ let instance; export default {async fetch(request,env){instance??=crypto.randomU
             name: 'direct-lifecycle-harness',
             main,
             compatibility_date: '2026-08-06',
-            compatibility_flags: ['nodejs_compat'],
+            compatibility_flags: [
+              'nodejs_compat',
+              'global_fetch_strictly_public',
+            ],
             d1_databases: [
               {
                 binding: 'FLEET_DB',

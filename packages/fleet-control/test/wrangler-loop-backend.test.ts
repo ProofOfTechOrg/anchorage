@@ -1546,6 +1546,8 @@ export default {
     expect(request).toHaveBeenCalledWith(
       new URL('https://control-acme.example.test/admin/maintenance-status'),
       {
+        method: 'GET',
+        signal: expect.any(AbortSignal),
         headers: { authorization: `Bearer ${secrets.maintenanceAdmin}` },
       },
     );
@@ -1613,53 +1615,63 @@ export default {
   });
 
   it('inspects the tagged 0% candidate through a version override and rejects silent fallback', async () => {
-    const digest = deploymentSpecDigest(deployment);
-    const runner = new FakeRunner(async (arguments_) => {
-      const command = arguments_.slice(0, 2).join(' ');
-      if (command === 'deployments status') {
-        return {
-          stdout: JSON.stringify({
-            versions: [
-              { version_id: 'version-old', percentage: 100 },
-              { version_id: 'version-next', percentage: 0 },
-            ],
-          }),
-          stderr: '',
-        };
-      }
-      if (command === 'versions list') {
-        return {
-          stdout: JSON.stringify([listedVersion('version-next', digest)]),
-          stderr: '',
-        };
-      }
-      if (command === 'versions view') {
-        return { stdout: JSON.stringify(viewedVersion(digest)), stderr: '' };
-      }
-      return { stdout: '', stderr: '' };
-    });
-    const request = vi.fn(async () =>
-      Response.json({
-        alarmAt: 2_000,
-        deploymentSpecDigest: 'b'.repeat(64),
-      }),
-    );
+    vi.useFakeTimers();
+    try {
+      const digest = deploymentSpecDigest(deployment);
+      const runner = new FakeRunner(async (arguments_) => {
+        const command = arguments_.slice(0, 2).join(' ');
+        if (command === 'deployments status') {
+          return {
+            stdout: JSON.stringify({
+              versions: [
+                { version_id: 'version-old', percentage: 100 },
+                { version_id: 'version-next', percentage: 0 },
+              ],
+            }),
+            stderr: '',
+          };
+        }
+        if (command === 'versions list') {
+          return {
+            stdout: JSON.stringify([listedVersion('version-next', digest)]),
+            stderr: '',
+          };
+        }
+        if (command === 'versions view') {
+          return { stdout: JSON.stringify(viewedVersion(digest)), stderr: '' };
+        }
+        return { stdout: '', stderr: '' };
+      });
+      const request = vi.fn(async () =>
+        Response.json({
+          alarmAt: 2_000,
+          deploymentSpecDigest: 'b'.repeat(64),
+        }),
+      );
 
-    await expect(
-      backend(runner, { fetch: request }).inspect(
-        deployment,
-        secrets.maintenanceAdmin,
-      ),
-    ).rejects.toThrow(/did not attest fleet specification digest/);
-    expect(request).toHaveBeenCalledWith(
-      new URL('https://control-acme.example.test/admin/maintenance-status'),
-      {
-        headers: {
-          authorization: `Bearer ${secrets.maintenanceAdmin}`,
-          'Cloudflare-Workers-Version-Overrides': `${deployment.scriptName}="version-next"`,
+      const pending = expect(
+        backend(runner, { fetch: request }).inspect(
+          deployment,
+          secrets.maintenanceAdmin,
+        ),
+      ).rejects.toThrow(/did not attest fleet specification digest/);
+      await vi.advanceTimersByTimeAsync(60_000);
+      await pending;
+      expect(request).toHaveBeenCalledTimes(30);
+      expect(request).toHaveBeenCalledWith(
+        new URL('https://control-acme.example.test/admin/maintenance-status'),
+        {
+          method: 'GET',
+          signal: expect.any(AbortSignal),
+          headers: {
+            authorization: `Bearer ${secrets.maintenanceAdmin}`,
+            'Cloudflare-Workers-Version-Overrides': `${deployment.scriptName}="version-next"`,
+          },
         },
-      },
-    );
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it.each([

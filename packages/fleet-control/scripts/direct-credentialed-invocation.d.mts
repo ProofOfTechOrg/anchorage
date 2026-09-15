@@ -18,14 +18,25 @@ export type DirectReferenceRefusalCode =
   | 'missing-continuation'
   | 'budget-exhausted';
 
+export const DIRECT_INVOCATION_FAILURE_DETAILS: readonly [
+  'platform-page',
+  'transport-failure',
+  'non-contract-answer',
+  'delivery-window-expired',
+];
+export type DirectInvocationFailureDetail =
+  (typeof DIRECT_INVOCATION_FAILURE_DETAILS)[number];
+
 export class DirectInvocationError extends Error {
   readonly code: DirectInvocationErrorCode;
   readonly attempts: DirectInvocationAttempts | undefined;
+  readonly detail: DirectInvocationFailureDetail | undefined;
   readonly referenceCode: DirectReferenceRefusalCode | undefined;
   constructor(
     code?: DirectInvocationErrorCode,
     attempts?: DirectInvocationAttempts,
     referenceCode?: DirectReferenceRefusalCode,
+    detail?: DirectInvocationFailureDetail,
   );
 }
 
@@ -53,3 +64,14 @@ export function createDirectInvocationClient(
     fetch?: typeof fetch;
   }>,
 ): DirectInvocationClient;
+
+export function awaitReferenceIngress(
+  input: Readonly<{
+    prepared: PreparedDirectConformance;
+    accountWorkersDevSubdomain: string;
+    fetch?: typeof fetch;
+    deadlineMs?: number;
+    intervalMs?: number;
+    sleep?: (ms: number) => Promise<void>;
+  }>,
+): Promise<boolean>;

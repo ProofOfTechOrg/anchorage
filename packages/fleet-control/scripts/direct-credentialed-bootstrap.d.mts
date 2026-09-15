@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { PreparedDirectConformance } from './direct-credentialed-conformance-preflight.mjs';
-import type { DirectInvocationClient } from './direct-credentialed-invocation.mjs';
+import type {
+  DirectInvocationClient,
+  DirectInvocationFailureDetail,
+} from './direct-credentialed-invocation.mjs';
 import type { DirectRunJournal } from './direct-credentialed-run-state.mjs';
 
 export type DirectBootstrapErrorCode =
@@ -15,8 +18,12 @@ export type DirectBootstrapErrorCode =
   | 'reference-refused';
 
 export class DirectBootstrapError extends Error {
+  readonly detail: DirectInvocationFailureDetail | undefined;
   readonly code: DirectBootstrapErrorCode;
-  constructor(code?: DirectBootstrapErrorCode);
+  constructor(
+    code?: DirectBootstrapErrorCode,
+    detail?: DirectInvocationFailureDetail,
+  );
 }
 
 export function bootstrapDirectConformance(

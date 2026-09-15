@@ -34,13 +34,13 @@ import {
   listOrdinaryWorkerSecretNames,
   listOrdinaryWorkerVersions,
   MAX_DATABASE_INVENTORY,
-  type PreparedOrdinaryWorkerDeploymentVersions as OperationsPreparedOrdinaryWorkerDeploymentVersions,
-  type PreparedOrdinaryWorkerUpload as OperationsPreparedOrdinaryWorkerUpload,
   type OrdinaryWorkerContext,
   type OrdinaryWorkerFootprint,
   ordinaryWorkerDeploymentStatus,
   ordinaryWorkerSecretNames,
   ordinaryWorkerSubdomain,
+  type PreparedOrdinaryWorkerDeploymentVersions,
+  type PreparedOrdinaryWorkerUpload,
   prepareOrdinaryWorkerDeployment,
   prepareOrdinaryWorkerUpload,
   viewOrdinaryWorkerVersion,
@@ -116,6 +116,14 @@ import type {
   ProviderBindingIdentity,
   ScriptInventoryTarget,
 } from './types.js';
+
+// The SDK's repeated type query parameters return no rows from the live API.
+const WORKER_ROUTE_ZONE_TYPES = Object.freeze([
+  'full',
+  'partial',
+  'secondary',
+  'internal',
+] as const);
 
 const AUDIT_CONSUMER_SETTINGS = Object.freeze({
   batch_size: 100,
@@ -277,12 +285,6 @@ export type { OrdinaryWorkerFootprint } from './cloudflare-ordinary-worker-opera
 
 const SCRIPT_INVENTORY_PREFIX = '__anchorage_script__:';
 const FLEET_SCRIPT_TAG = 'fleet:anchorage';
-
-/** @inline */
-type PreparedOrdinaryWorkerUpload = OperationsPreparedOrdinaryWorkerUpload;
-/** @inline */
-type PreparedOrdinaryWorkerDeploymentVersions =
-  OperationsPreparedOrdinaryWorkerDeploymentVersions;
 
 export class CloudflareProviderRequestNotDispatchedError extends Error {
   constructor(cause: unknown) {
@@ -749,8 +751,9 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
             const result = readField(value, 'result');
             const rows =
               shape === 'array' ? result : readField(result, 'items');
-            const errors = readField(value, 'errors');
-            const info = readField(value, 'result_info');
+            // The versions list returns successful pages with errors: null.
+            const errors = readField(value, 'errors') ?? undefined;
+            const info = readField(value, 'result_info') ?? undefined;
             const cursor = readField(info, 'cursor');
             const totalPages = readField(info, 'total_pages');
             const totalCount = readField(info, 'total_count');
@@ -773,9 +776,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
               (errors !== undefined &&
                 (!Array.isArray(errors) || errors.length !== 0)) ||
               (info !== undefined &&
-                (info === null ||
-                  typeof info !== 'object' ||
-                  Array.isArray(info))) ||
+                (typeof info !== 'object' || Array.isArray(info))) ||
               (cursor !== undefined &&
                 cursor !== null &&
                 typeof cursor !== 'string') ||
@@ -964,28 +965,48 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   }
 
   async #workerRouteZoneIds(): Promise<readonly string[]> {
-    const verification = await this.#client.user.tokens.verify();
-    if (verification.status !== 'active') {
-      throw new Error('Cloudflare API token is not active');
-    }
     let token:
       | Awaited<ReturnType<CloudflareSdk['user']['tokens']['get']>>
       | undefined;
-    try {
-      token = await this.#client.accounts.tokens.get(verification.id, {
-        account_id: this.#accountId,
-      });
-    } catch {
+    for (const family of ['account', 'user'] as const) {
       try {
-        token = await this.#client.user.tokens.get(verification.id);
-      } catch {
-        throw new Error(
-          'Cloudflare API token policy is unavailable; API Tokens Read is required for account-wide zone attestation',
-        );
+        const verification =
+          family === 'account'
+            ? await this.#client.accounts.tokens.verify({
+                account_id: this.#accountId,
+              })
+            : await this.#client.user.tokens.verify();
+        if (verification.status !== 'active') {
+          throw new Error('Cloudflare API token is not active');
+        }
+        try {
+          token =
+            family === 'account'
+              ? await this.#client.accounts.tokens.get(verification.id, {
+                  account_id: this.#accountId,
+                })
+              : await this.#client.user.tokens.get(verification.id);
+        } catch (error) {
+          if (family === 'account') throw error;
+          throw new Error(
+            'Cloudflare API token policy is unavailable; API Tokens Read is required for account-wide zone attestation',
+          );
+        }
+        break;
+      } catch (error) {
+        if (
+          family === 'account' &&
+          error instanceof Cloudflare.APIError &&
+          ([401, 403, 404, 405, 429].includes(error.status) ||
+            (error.status >= 500 && error.status <= 599))
+        ) {
+          continue;
+        }
+        throw error;
       }
     }
     if (
-      token.status !== 'active' ||
+      token?.status !== 'active' ||
       !token.policies ||
       token.policies.length === 0
     ) {
@@ -1003,7 +1024,6 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       this.#inventoryProofClient.zones.list({
         account: { id: this.#accountId },
         per_page: 50,
-        type: ['full', 'partial', 'secondary', 'internal'],
       }),
       'zone inventory',
     )) {
@@ -1017,6 +1037,12 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
           'Cloudflare account-wide zone discovery returned incomplete or duplicate zone metadata',
         );
       }
+      if (typeof zone.type !== 'string') {
+        throw new Error(
+          'Cloudflare account-wide zone discovery returned incomplete zone type metadata',
+        );
+      }
+      if (!WORKER_ROUTE_ZONE_TYPES.some((type) => type === zone.type)) continue;
       seenZoneIds.add(zone.id);
       zoneIds.push(zone.id);
     }
@@ -1799,7 +1825,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
               per_page: R2_INVENTORY_PAGE_SIZE,
               ...(startAfter ? { start_after: startAfter } : {}),
             });
-            return { buckets: page.buckets ?? [] };
+            return { buckets: page.buckets === undefined ? [] : page.buckets };
           },
         ),
     };
@@ -1829,7 +1855,10 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       ordinaryWorkerSubdomain(this.#ordinary, scriptName),
       ordinaryWorkerSecretNames(this.#ordinary, scriptName),
     ]);
-    const bindings = activeVersion.resources.bindings ?? [];
+    const bindings =
+      activeVersion.resources.bindings === undefined
+        ? []
+        : activeVersion.resources.bindings;
     assertSupportedProviderBindings(
       bindings,
       new Set([
@@ -2062,7 +2091,10 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
           ordinaryWorkerSubdomain(this.#ordinary, scriptName),
           ordinaryWorkerSecretNames(this.#ordinary, scriptName),
         ]);
-        const bindings = activeVersion.resources.bindings ?? [];
+        const bindings =
+          activeVersion.resources.bindings === undefined
+            ? []
+            : activeVersion.resources.bindings;
         const databaseIds = bindings.flatMap((binding) =>
           binding.type === 'd1' && binding.database_id
             ? [binding.database_id]
@@ -2542,7 +2574,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
         if (result.success === false) {
           throw new Error(`D1 query failed for database '${databaseId}'`);
         }
-        for (const row of result.results ?? []) {
+        for (const row of result.results === undefined ? [] : result.results) {
           if (row && typeof row === 'object') {
             rows.push(row as Readonly<Record<string, unknown>>);
           }
@@ -3094,7 +3126,8 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
             dispatch_namespace: dispatchNamespace,
           }),
         ]);
-        const bindings = settings.bindings ?? [];
+        const bindings =
+          settings.bindings === undefined ? [] : settings.bindings;
         const databaseIds = bindings.flatMap((binding) =>
           binding.type === 'd1' && binding.database_id
             ? [binding.database_id]
@@ -3378,6 +3411,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
             fail('export returned a non-HTTPS download URL');
           }
           const download = await this.#request(signedUrl, {
+            headers: { 'Accept-Encoding': 'identity' },
             redirect: 'manual',
           });
           httpStatus = download.status;

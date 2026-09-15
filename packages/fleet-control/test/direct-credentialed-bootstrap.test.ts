@@ -7,11 +7,14 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { bootstrapDirectConformance } from '../scripts/direct-credentialed-bootstrap.mjs';
 import { preflightDirectConformance } from '../scripts/direct-credentialed-conformance-preflight.mjs';
+import * as invocation from '../scripts/direct-credentialed-invocation.mjs';
 import {
   type DirectRunJournal,
   openDirectRunState,
 } from '../scripts/direct-credentialed-run-state.mjs';
 import { DIRECT_REFERENCE_PATH } from '../scripts/direct-reference-contract.mjs';
+
+const awaitReferenceIngress = invocation.awaitReferenceIngress;
 
 const probes = vi.hoisted(() => ({ sdk: vi.fn(), generate: vi.fn() }));
 vi.mock('cloudflare', async (importOriginal) => {
@@ -84,7 +87,9 @@ async function fixture(
     limit?: number;
     timeout?: number;
     tag?: string | null;
+    invocationTimeoutMs?: number;
     mainModule?: string;
+    compatibilityFlags?: string[];
   } = {},
 ) {
   const directory = await mkdtemp(join(tmpdir(), 'direct-bootstrap-'));
@@ -113,7 +118,11 @@ async function fixture(
   };
   config.referenceWorker.maxInvocations = options.limit ?? 20;
   config.referenceWorker.requestTimeoutMs = options.timeout ?? 1000;
-  config.referenceWorker.invocationTimeoutMs = 2000;
+  config.referenceWorker.invocationTimeoutMs =
+    options.invocationTimeoutMs ?? 2000;
+  config.referenceWorker.compatibilityFlags = options.compatibilityFlags ?? [
+    'global_fetch_strictly_public',
+  ];
   config.deployment.artifact = {
     bundle: './tenant.mjs',
     mainModule: 'worker.js',
@@ -236,6 +245,21 @@ async function fixture(
       url.origin ===
       `https://${names.referenceWorker}.attested-account.workers.dev`
     ) {
+      if (!request.headers.has('authorization')) {
+        expect(url.pathname).toBe(DIRECT_REFERENCE_PATH);
+        expect(request.method).toBe('POST');
+        expect(await request.json()).toEqual({});
+        return Response.json(
+          { contractVersion: 1, ok: false, error: { code: 'unauthorized' } },
+          {
+            status: 401,
+            headers: {
+              'Cache-Control': 'no-store',
+              'WWW-Authenticate': 'Bearer',
+            },
+          },
+        );
+      }
       expect(request.headers.get('authorization')).toBe(
         `Bearer ${INVOKE_SECRET}`,
       );
@@ -300,13 +324,21 @@ async function fixture(
         return json(
           url.searchParams.has('page')
             ? []
-            : [{ id: 'zone', name: 'example.test', account: { id: ACCOUNT } }],
+            : [
+                {
+                  id: 'zone',
+                  name: 'example.test',
+                  type: 'full',
+                  account: { id: ACCOUNT },
+                },
+              ],
         );
       }
       if (url.pathname === '/client/v4/zones/zone')
         return json({
           id: 'zone',
           name: 'example.test',
+          type: 'full',
           account: { id: ACCOUNT },
         });
       if (url.pathname === `${root}/workers/dispatch/namespaces`)
@@ -473,6 +505,9 @@ async function fixture(
 }
 
 beforeEach(() => {
+  vi.spyOn(invocation, 'awaitReferenceIngress').mockImplementation((input) =>
+    awaitReferenceIngress({ ...input, sleep: input.sleep ?? (async () => {}) }),
+  );
   vi.stubGlobal(
     'fetch',
     vi.fn(() => {
@@ -484,6 +519,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   vi.restoreAllMocks();
+  vi.useRealTimers();
   vi.unstubAllEnvs();
   vi.unstubAllGlobals();
   probes.sdk.mockClear();
@@ -625,6 +661,80 @@ describeLinux('SDK direct bootstrap', () => {
     expect(f.requests.every((request) => request.method === 'GET')).toBe(true);
   });
 
+  it('lists zones without a type query parameter', async () => {
+    const f = await fixture();
+    await f.run();
+    const requests = f.requests
+      .map((request) => new URL(request.url))
+      .filter((url) => url.pathname === '/client/v4/zones');
+    expect(requests.length).toBeGreaterThan(0);
+    for (const url of requests) {
+      expect(url.searchParams.has('type')).toBe(false);
+      expect(url.searchParams.get('account.id')).toBe(ACCOUNT);
+      expect(url.searchParams.get('per_page')).toBe('50');
+    }
+  });
+
+  it('refuses an unsupported zone type even when its name equals ownedHostname', async () => {
+    const f = await fixture();
+    const row = {
+      id: 'zone',
+      name: f.prepared.config.ownedHostname,
+      type: 'unsupported',
+      account: { id: ACCOUNT },
+    };
+    f.setHook((_request, url) => {
+      if (url.pathname === '/client/v4/zones')
+        return json(url.searchParams.has('page') ? [] : [row]);
+      if (url.pathname === '/client/v4/zones/zone') return json(row);
+    });
+    await expect(f.run()).rejects.toMatchObject({
+      code: 'observation-mismatch',
+    });
+    expect(f.journal.snapshot().bootstrap).toBeNull();
+    expect(f.requests.every((request) => request.method === 'GET')).toBe(true);
+  });
+
+  it('refuses the selected zone when its detail reread reports an unsupported type', async () => {
+    const f = await fixture();
+    const row = {
+      id: 'zone',
+      name: f.prepared.config.ownedHostname,
+      type: 'full',
+      account: { id: ACCOUNT },
+    };
+    f.setHook((_request, url) => {
+      if (url.pathname === '/client/v4/zones')
+        return json(url.searchParams.has('page') ? [] : [row]);
+      if (url.pathname === '/client/v4/zones/zone')
+        return json({ ...row, type: 'unsupported' });
+    });
+    await expect(f.run()).rejects.toMatchObject({
+      code: 'observation-mismatch',
+    });
+    expect(f.journal.snapshot().bootstrap).toBeNull();
+    expect(f.requests.every((request) => request.method === 'GET')).toBe(true);
+  });
+
+  it('refuses a zone row with a missing type', async () => {
+    const f = await fixture();
+    const row = {
+      id: 'zone',
+      name: f.prepared.config.ownedHostname,
+      account: { id: ACCOUNT },
+    };
+    f.setHook((_request, url) => {
+      if (url.pathname === '/client/v4/zones')
+        return json(url.searchParams.has('page') ? [] : [row]);
+      if (url.pathname === '/client/v4/zones/zone') return json(row);
+    });
+    await expect(f.run()).rejects.toMatchObject({
+      code: 'observation-mismatch',
+    });
+    expect(f.journal.snapshot().bootstrap).toBeNull();
+    expect(f.requests.every((request) => request.method === 'GET')).toBe(true);
+  });
+
   it.each([
     'foreign-account',
     'wrong-boundary',
@@ -648,6 +758,7 @@ describeLinux('SDK direct bootstrap', () => {
             : kind === 'malformed-name'
               ? 'bad..test'
               : 'example.test',
+        type: 'full',
         account: { id: kind === 'foreign-account' ? 'foreign' : ACCOUNT },
       };
       return json([
@@ -695,10 +806,16 @@ describeLinux('SDK direct bootstrap', () => {
             url.searchParams.has('page')
               ? []
               : [
-                  { id: 'parent', name: 'test', account: { id: ACCOUNT } },
+                  {
+                    id: 'parent',
+                    name: 'test',
+                    type: 'full',
+                    account: { id: ACCOUNT },
+                  },
                   {
                     id: 'zone',
                     name: 'example.test',
+                    type: 'full',
                     account: { id: ACCOUNT },
                   },
                 ],
@@ -836,6 +953,7 @@ describeLinux('SDK direct bootstrap', () => {
         {
           id: `zone-${page}`,
           name: `zone-${page}.test`,
+          type: 'full',
           account: { id: ACCOUNT },
         },
       ]);
@@ -844,6 +962,34 @@ describeLinux('SDK direct bootstrap', () => {
     expect(f.fetchRequest).toHaveBeenCalledTimes(512);
     expect(f.journal.snapshot().bootstrap).toBeNull();
   }, 15_000);
+
+  it.each([
+    'platform-page',
+    'transport-failure',
+    'non-contract-answer',
+  ] as const)('classifies bootstrap mutation %s with one request and one pending intent', async (detail) => {
+    const f = await fixture();
+    f.setHook((request, url) => {
+      if (request.method !== 'POST' || !url.pathname.endsWith('/d1/database'))
+        return;
+      if (detail === 'transport-failure')
+        throw new Error('synthetic transport failure');
+      if (detail === 'platform-page')
+        return new Response('error code: 1104', {
+          status: 500,
+          headers: { 'content-type': 'text/plain' },
+        });
+      return json({ malformed: true });
+    });
+    await expect(f.run()).rejects.toMatchObject({
+      code: 'outcome-unknown',
+      detail,
+    });
+    expect(
+      f.requests.filter((request) => request.method === 'POST'),
+    ).toHaveLength(1);
+    expect(f.journal.snapshot().bootstrap?.pending).toBe('create-fleet-d1');
+  });
 
   it('retains create intent after a lost response and never retries dispatch', async () => {
     const f = await fixture({ timeout: 30 });
@@ -864,6 +1010,26 @@ describeLinux('SDK direct bootstrap', () => {
     await expect(f.run()).rejects.toMatchObject({ code: 'outcome-unknown' });
     expect(probes.sdk).toHaveBeenCalledTimes(calls);
     expect(probes.generate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    false,
+    true,
+  ])('constructs the invocation client with only an explicit fetch injection: %s', async (injected) => {
+    const f = await fixture();
+    vi.stubGlobal('fetch', f.fetchRequest);
+    const createClient = invocation.createDirectInvocationClient;
+    const construct = vi
+      .spyOn(invocation, 'createDirectInvocationClient')
+      .mockImplementation((options) =>
+        createClient({ ...options, fetch: f.fetchRequest }),
+      );
+    await f.run({ fetch: injected ? f.fetchRequest : undefined });
+    expect(construct).toHaveBeenCalledTimes(1);
+    expect(construct.mock.calls[0]?.[0].fetch).toBe(
+      injected ? f.fetchRequest : undefined,
+    );
+    expect(f.journal.snapshot().lastInvocation?.state).toBe('settled');
   });
 
   it('uploads original multipart bytes and fixed bindings, durably settles control-read, and resumes retained secrets', async () => {
@@ -1297,6 +1463,93 @@ describeLinux('SDK direct bootstrap', () => {
   });
 
   it.each([
+    'version',
+    'settings',
+  ])('refuses bootstrap when %s runtime omits required compatibility_flags', async (kind) => {
+    const f = await fixture();
+    f.setHook((_request, url) => {
+      const runtime = { ...f.runtime() };
+      Reflect.deleteProperty(runtime, 'compatibility_flags');
+      if (
+        kind === 'version' &&
+        url.pathname.endsWith(`/versions/${VERSION_ID}`)
+      )
+        return json({
+          id: VERSION_ID,
+          resources: { script_runtime: runtime, bindings: f.bindings() },
+        });
+      if (kind === 'settings' && url.pathname.endsWith('/settings'))
+        return json({ ...runtime, bindings: f.bindings() });
+    });
+    await expect(f.run()).rejects.toMatchObject({
+      code: 'observation-mismatch',
+    });
+    expect(f.metadata?.compatibility_flags).toEqual([
+      'global_fetch_strictly_public',
+    ]);
+    expect(f.journal.snapshot().bootstrap).toMatchObject({
+      upload: { scriptName: f.names.referenceWorker },
+      active: null,
+      controlReadOrdinal: null,
+    });
+  });
+
+  it.each([
+    'version',
+    'settings',
+  ])('refuses explicit null version compatibility_flags for the %s runtime', async (kind) => {
+    const f = await fixture();
+    f.setHook((_request, url) => {
+      const runtime = { ...f.runtime(), compatibility_flags: null };
+      if (
+        kind === 'version' &&
+        url.pathname.endsWith(`/versions/${VERSION_ID}`)
+      )
+        return json({
+          id: VERSION_ID,
+          resources: { script_runtime: runtime, bindings: f.bindings() },
+        });
+      if (kind === 'settings' && url.pathname.endsWith('/settings'))
+        return json({ ...runtime, bindings: f.bindings() });
+    });
+    await expect(f.run()).rejects.toMatchObject({
+      code: 'observation-mismatch',
+    });
+    expect(f.journal.snapshot().bootstrap).toMatchObject({
+      upload: { scriptName: f.names.referenceWorker },
+      active: null,
+      controlReadOrdinal: null,
+    });
+  });
+
+  it('refuses absent version compatibility_flags when configuration declares flags', async () => {
+    const f = await fixture({
+      compatibilityFlags: ['nodejs_compat', 'global_fetch_strictly_public'],
+    });
+    f.setHook((_request, url) => {
+      if (!url.pathname.endsWith(`/versions/${VERSION_ID}`)) return;
+      const runtime = { ...f.runtime() };
+      Reflect.deleteProperty(runtime, 'compatibility_flags');
+      return json({
+        id: VERSION_ID,
+        resources: { script_runtime: runtime, bindings: f.bindings() },
+      });
+    });
+    await expect(f.run()).rejects.toMatchObject({
+      code: 'observation-mismatch',
+    });
+    expect(f.metadata?.compatibility_flags).toEqual([
+      'nodejs_compat',
+      'global_fetch_strictly_public',
+    ]);
+    expect(f.journal.snapshot().bootstrap).toMatchObject({
+      upload: { scriptName: f.names.referenceWorker },
+      active: null,
+      controlReadOrdinal: null,
+    });
+  });
+
+  it.each([
     'tag',
     'traffic',
     'deployment',
@@ -1391,6 +1644,7 @@ describeLinux('SDK direct bootstrap', () => {
         return json({
           id: 'foreign',
           name: 'example.test',
+          type: 'full',
           account: { id: ACCOUNT },
         });
       if (
@@ -1411,6 +1665,165 @@ describeLinux('SDK direct bootstrap', () => {
     expect(probes.generate).toHaveBeenCalledTimes(3);
   });
 
+  it('re-delivers the bootstrap control-read after a platform 500 page on run and resume: two requests and one reservation per run', async () => {
+    const f = await fixture({ invocationTimeoutMs: 10_000 });
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    const requests: string[] = [];
+    const fetchRequest: typeof fetch = async (input, init) => {
+      const request = new Request(input, init);
+      if (
+        new URL(request.url).hostname.endsWith('.workers.dev') &&
+        request.headers.has('authorization')
+      ) {
+        requests.push(await request.text());
+        if (requests.length % 2 === 1)
+          return new Response('error code: 1104', {
+            status: 500,
+            headers: { 'content-type': 'text/plain' },
+          });
+      }
+      return f.fetchRequest(input, init);
+    };
+    const first = f.run({ fetch: fetchRequest });
+    await vi.waitFor(() => expect(requests).toHaveLength(1));
+    await vi.advanceTimersByTimeAsync(2_000);
+    await first;
+    expect(requests).toHaveLength(2);
+    expect(requests[1]).toBe(requests[0]);
+    expect(f.journal.snapshot()).toMatchObject({
+      invocationCount: 1,
+      lastInvocation: { state: 'settled' },
+    });
+    await f.reopen();
+    const resumed = f.run({ fetch: fetchRequest });
+    await vi.waitFor(() => expect(requests).toHaveLength(3));
+    await vi.advanceTimersByTimeAsync(2_000);
+    await resumed;
+    expect(requests).toHaveLength(4);
+    expect(requests[3]).toBe(requests[2]);
+    expect(f.journal.snapshot()).toMatchObject({
+      invocationCount: 2,
+      lastInvocation: { state: 'settled' },
+    });
+  }, 15_000);
+
+  it('requires three consecutive exact refusals and restarts the count after a platform flap on run and resume', async () => {
+    const f = await fixture();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    const sleep = vi.fn(async (ms: number) => {
+      await vi.advanceTimersByTimeAsync(ms);
+    });
+    vi.mocked(invocation.awaitReferenceIngress).mockImplementation((input) =>
+      awaitReferenceIngress({ ...input, sleep }),
+    );
+    const sequence: string[] = [];
+    const fetchRequest: typeof fetch = async (input, init) => {
+      const request = new Request(input, init);
+      if (new URL(request.url).hostname.endsWith('.workers.dev')) {
+        if (!request.headers.has('authorization')) {
+          expect(f.journal.snapshot().invocationCount).toBe(
+            sequence.includes('control-read') ? 1 : 0,
+          );
+          expect(f.journal.snapshot().lastInvocation?.state).not.toBe(
+            'pending',
+          );
+          sequence.push('probe');
+          if (sequence.length === 2)
+            return new Response('<html>missing</html>', { status: 404 });
+        } else sequence.push('control-read');
+      }
+      return f.fetchRequest(input, init);
+    };
+    await f.run({ fetch: fetchRequest });
+    expect(sequence).toEqual([
+      'probe',
+      'probe',
+      'probe',
+      'probe',
+      'probe',
+      'control-read',
+    ]);
+    await f.reopen();
+    await f.run({ fetch: fetchRequest });
+    expect(sequence).toEqual([
+      'probe',
+      'probe',
+      'probe',
+      'probe',
+      'probe',
+      'control-read',
+      'probe',
+      'probe',
+      'probe',
+      'control-read',
+    ]);
+    expect(f.journal.snapshot().invocationCount).toBe(2);
+    expect(sleep.mock.calls).toEqual(Array.from({ length: 6 }, () => [2_000]));
+  });
+
+  it('refuses provider-unavailable when the ingress deadline allows only two exact refusals', async () => {
+    const f = await fixture();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    vi.mocked(invocation.awaitReferenceIngress).mockImplementation((input) =>
+      awaitReferenceIngress({
+        ...input,
+        deadlineMs: 4_000,
+      }),
+    );
+    const probes: Request[] = [];
+    const fetchRequest: typeof fetch = async (input, init) => {
+      const request = new Request(input, init);
+      if (new URL(request.url).hostname.endsWith('.workers.dev'))
+        probes.push(request);
+      return f.fetchRequest(input, init);
+    };
+    const result = f
+      .run({ fetch: fetchRequest })
+      .catch((error: unknown) => error);
+    await vi.waitFor(() => expect(probes).toHaveLength(1));
+    await vi.advanceTimersByTimeAsync(4_000);
+    await expect(result).resolves.toMatchObject({
+      code: 'provider-unavailable',
+    });
+    expect(probes).toHaveLength(2);
+    expect(
+      probes.every((request) => !request.headers.has('authorization')),
+    ).toBe(true);
+    expect(f.journal.snapshot()).toMatchObject({
+      invocationCount: 0,
+      lastInvocation: null,
+    });
+  });
+
+  it('refuses an ingress readiness deadline with provider-unavailable and no invocation reserved', async () => {
+    const f = await fixture();
+    let probes = 0;
+    const fetchRequest: typeof fetch = async (input, init) => {
+      const request = new Request(input, init);
+      if (new URL(request.url).hostname.endsWith('.workers.dev')) {
+        expect(request.headers.has('authorization')).toBe(false);
+        probes++;
+        const elapsed = performance.now() + 120_000;
+        vi.spyOn(performance, 'now').mockReturnValue(elapsed);
+        return new Response('<html>missing</html>', { status: 404 });
+      }
+      return f.fetchRequest(input, init);
+    };
+    await expect(f.run({ fetch: fetchRequest })).rejects.toMatchObject({
+      code: 'provider-unavailable',
+      message: 'provider-unavailable',
+    });
+    expect(probes).toBe(1);
+    expect(f.journal.snapshot()).toMatchObject({
+      invocationCount: 0,
+      lastInvocation: null,
+      bootstrap: {
+        ingress: { enabled: true, previewsEnabled: false },
+        controlReadOrdinal: null,
+      },
+    });
+  });
+
   it('spends the committed control-read budget and preserves known refusal settlement', async () => {
     const f = await fixture({ limit: 1 });
     f.setHook((_request, url) =>
@@ -1426,8 +1839,10 @@ describeLinux('SDK direct bootstrap', () => {
       code: 'invocation-budget-exhausted',
     });
     expect(
-      f.requests.filter((request) =>
-        new URL(request.url).hostname.endsWith('.workers.dev'),
+      f.requests.filter(
+        (request) =>
+          new URL(request.url).hostname.endsWith('.workers.dev') &&
+          request.headers.has('authorization'),
       ),
     ).toHaveLength(1);
   });

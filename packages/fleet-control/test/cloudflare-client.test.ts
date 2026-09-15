@@ -4,9 +4,15 @@ import { describe, expect, it, vi } from 'vitest';
 import { ActiveRouteAttestationError } from '../src/active-route.js';
 import {
   CloudflareProvisioningClient,
+  cloudflareFleetInventoryContext,
   type DurableDatabaseExportStore,
   dispatchMigrations,
 } from '../src/cloudflare-client.js';
+import {
+  canonicalFleetInventoryRunOptions,
+  initialFleetInventoryProgress,
+  materializeFleetInventoryGeneration,
+} from '../src/fleet-inventory-state.js';
 import { canonicalDeploymentEgressPolicy } from '../src/platform-resources.js';
 import type {
   DeploymentSpec,
@@ -53,6 +59,61 @@ function deployment(overrides: Partial<DeploymentSpec> = {}): DeploymentSpec {
 }
 
 describe('CloudflareProvisioningClient', () => {
+  it.each([
+    [403, 10003, true],
+    [403, 10004, false],
+    [403, undefined, false],
+    [500, 10003, false],
+  ] as const)('classifies R2 listing HTTP %i code %s as unavailable=%s', async (status, code, unavailable) => {
+    const client = new CloudflareProvisioningClient({
+      plane: 'plain-worker',
+      accountId: 'account',
+      apiToken: 'inert',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (input, init) => {
+        const request = new Request(input, init);
+        expect(new URL(request.url).pathname).toBe(
+          '/client/v4/accounts/account/r2/buckets',
+        );
+        expect(request.headers.get('cf-r2-jurisdiction')).toBe('fedramp');
+        return Response.json(
+          {
+            success: false,
+            errors:
+              code === undefined ? [] : [{ code, message: 'Access Denied' }],
+            messages: [],
+            result: null,
+          },
+          { status },
+        );
+      },
+    });
+    const options = canonicalFleetInventoryRunOptions({
+      databaseNamePrefix: 'fleet-',
+      scriptNamePrefix: 'fleet-',
+      includeR2Buckets: true,
+    });
+    const stage = { step: 'r2-buckets', jurisdictionOrdinal: 2 } as const;
+    const result = fenced(client, () =>
+      cloudflareFleetInventoryContext(client).advanceStage({
+        stage,
+        options,
+        progress: initialFleetInventoryProgress(stage, 1),
+        maxProviderRequests: 9,
+      }),
+    );
+    if (unavailable) {
+      const inventory = materializeFleetInventoryGeneration({
+        ...(await result),
+        options,
+      });
+      expect(inventory.unavailableR2Jurisdictions).toEqual(['fedramp']);
+      expect(Object.isFrozen(inventory.unavailableR2Jurisdictions)).toBe(true);
+    } else {
+      await expect(result).rejects.toMatchObject({ status });
+    }
+  });
+
   it.each([
     'reserved',
     'duplicate',
@@ -962,7 +1023,7 @@ describe('CloudflareProvisioningClient', () => {
     }
   });
 
-  it('downloads an export into durable storage and records integrity', async () => {
+  it('downloads an identity export into durable storage and records integrity', async () => {
     const bytes = new TextEncoder().encode('CREATE TABLE durable(id TEXT);');
     const stored: Uint8Array[] = [];
     const exportStore: DurableDatabaseExportStore = {
@@ -981,24 +1042,32 @@ describe('CloudflareProvisioningClient', () => {
         };
       },
     };
-    const request = vi.fn(async (input: string | URL | Request) => {
-      const url = new URL(
-        typeof input === 'string'
-          ? input
-          : input instanceof URL
-            ? input.href
-            : input.url,
-      );
-      if (url.hostname === 'download.example.test') {
-        return new Response(bytes, {
-          headers: { 'content-length': String(bytes.byteLength) },
+    const request = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const url = new URL(
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url,
+        );
+        if (url.hostname === 'download.example.test') {
+          expect(new Request(input, init).headers.get('accept-encoding')).toBe(
+            'identity',
+          );
+          return new Response(bytes, {
+            headers: { 'content-length': String(bytes.byteLength) },
+          });
+        }
+        expect(new Request(input, init).headers.has('accept-encoding')).toBe(
+          false,
+        );
+        return envelope({
+          status: 'complete',
+          result: { signed_url: 'https://download.example.test/export.sql' },
         });
-      }
-      return envelope({
-        status: 'complete',
-        result: { signed_url: 'https://download.example.test/export.sql' },
-      });
-    });
+      },
+    );
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
@@ -2128,6 +2197,160 @@ describe('CloudflareProvisioningClient', () => {
     );
   });
 
+  it.each([
+    200, 404, 401, 400,
+  ])('verifies the account token family first when it returns HTTP %i', async (status) => {
+    const calls: string[] = [];
+    const request = vi.fn(
+      async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        const url = new URL(new Request(input, init).url);
+        calls.push(url.pathname);
+        if (
+          url.pathname.endsWith('/accounts/account/tokens/verify') &&
+          status !== 200
+        ) {
+          return Response.json(
+            {
+              success: false,
+              errors: [{ code: 1000, message: 'token verification refused' }],
+            },
+            { status },
+          );
+        }
+        if (url.pathname.endsWith('/user/tokens/token-id')) {
+          return zoneAuthorityResponse(
+            new URL(
+              'https://api.cloudflare.com/client/v4/accounts/account/tokens/token-id',
+            ),
+            [],
+          ) as Response;
+        }
+        const authority = zoneAuthorityResponse(url, []);
+        if (authority) return authority;
+        if (url.pathname.endsWith('/workers/scripts'))
+          return pageArray([{ id: 'plain' }]);
+        if (url.pathname.endsWith('/workers/domains')) return pageArray([]);
+        if (url.pathname.endsWith('/subdomain'))
+          return envelope({ enabled: false, previews_enabled: false });
+        throw new Error(`unexpected request: ${url.pathname}`);
+      },
+    );
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'inert',
+      plane: 'plain-worker',
+      rateCoordinator: testRateCoordinator(),
+      fetch: request,
+    });
+    const pending = client.inspectOrdinaryWorkerFootprint('plain');
+    if (status === 400) {
+      await expect(pending).rejects.toMatchObject({ status: 400 });
+    } else {
+      await expect(pending).resolves.toMatchObject({
+        workersDevEnabled: false,
+      });
+    }
+    expect(calls.filter((path) => path.endsWith('/tokens/verify'))).toEqual([
+      '/client/v4/accounts/account/tokens/verify',
+      ...([401, 404].includes(status) ? ['/client/v4/user/tokens/verify'] : []),
+    ]);
+    if (status === 200 || status === 400) {
+      expect(calls.some((path) => path.includes('/user/'))).toBe(false);
+    }
+    if ([401, 404].includes(status)) {
+      expect(calls.filter((path) => path.endsWith('/tokens/token-id'))).toEqual(
+        ['/client/v4/user/tokens/token-id'],
+      );
+    }
+  });
+
+  it('discovers zone routes with a type-less zone query and skips zones outside the four supported kinds', async () => {
+    const zones = [
+      'full',
+      'partial',
+      'secondary',
+      'internal',
+      'enterprise_zone_placeholder',
+    ].map((type) => ({ id: type, type }));
+    const requests: URL[] = [];
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'inert',
+      plane: 'plain-worker',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (input, init) => {
+        const url = new URL(new Request(input, init).url);
+        requests.push(url);
+        const authority = zoneAuthorityResponse(
+          url,
+          zones,
+          zones.map(({ id }) => ({
+            zoneId: id,
+            id: `route-${id}`,
+            pattern: `${id}.example.test/*`,
+            script: 'plain',
+          })),
+        );
+        if (authority) return authority;
+        if (url.pathname.endsWith('/workers/scripts'))
+          return pageArray([{ id: 'plain' }]);
+        if (url.pathname.endsWith('/workers/domains')) return pageArray([]);
+        if (url.pathname.endsWith('/subdomain'))
+          return envelope({ enabled: false, previews_enabled: false });
+        throw new Error(`unexpected request: ${url.pathname}`);
+      },
+    });
+    await expect(
+      client.inspectOrdinaryWorkerFootprint('plain'),
+    ).resolves.toMatchObject({
+      zoneRoutes: ['full', 'partial', 'secondary', 'internal'].map(
+        (zoneId) => ({
+          zoneId,
+          routeId: `route-${zoneId}`,
+          pattern: `${zoneId}.example.test/*`,
+        }),
+      ),
+    });
+    const zoneQueries = requests.filter((url) =>
+      url.pathname.endsWith('/zones'),
+    );
+    expect(zoneQueries.length).toBeGreaterThan(0);
+    for (const url of zoneQueries)
+      expect(url.searchParams.has('type')).toBe(false);
+    expect(
+      requests.some((url) =>
+        url.pathname.includes('/zones/enterprise_zone_placeholder/'),
+      ),
+    ).toBe(false);
+  });
+
+  it('refuses a zone discovery row without a string type', async () => {
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'inert',
+      plane: 'plain-worker',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (input, init) => {
+        const url = new URL(new Request(input, init).url);
+        if (url.pathname.endsWith('/zones'))
+          return envelope([{ id: 'zone', account: { id: 'account' } }]);
+        const authority = zoneAuthorityResponse(url, []);
+        if (authority) return authority;
+        if (url.pathname.endsWith('/workers/scripts'))
+          return pageArray([{ id: 'plain' }]);
+        if (url.pathname.endsWith('/workers/domains')) return pageArray([]);
+        if (url.pathname.endsWith('/subdomain'))
+          return envelope({ enabled: false, previews_enabled: false });
+        throw new Error(`unexpected request: ${url.pathname}`);
+      },
+    });
+    await expect(
+      client.inspectOrdinaryWorkerFootprint('plain'),
+    ).rejects.toThrow(
+      'Cloudflare account-wide zone discovery returned incomplete zone type metadata',
+    );
+  });
+
   it('fails before a privacy mutation when token policies omit account-wide zone authority', async () => {
     const calls: string[] = [];
     const request = vi.fn(
@@ -2140,7 +2363,7 @@ describe('CloudflareProvisioningClient', () => {
               : input.url,
         );
         calls.push(`${init?.method ?? 'GET'}:${url.pathname}`);
-        if (url.pathname.endsWith('/user/tokens/verify')) {
+        if (url.pathname.endsWith('/accounts/account/tokens/verify')) {
           return envelope({ id: 'token-id', status: 'active' });
         }
         if (url.pathname.endsWith('/accounts/account/tokens/token-id')) {
@@ -2178,7 +2401,7 @@ describe('CloudflareProvisioningClient', () => {
       client.disableControlWorkerPublicAccess('fleet-state'),
     ).rejects.toThrow(/every zone/);
     expect(calls).toEqual([
-      'GET:/client/v4/user/tokens/verify',
+      'GET:/client/v4/accounts/account/tokens/verify',
       'GET:/client/v4/accounts/account/tokens/token-id',
     ]);
   });
@@ -2959,6 +3182,65 @@ describe('CloudflareProvisioningClient', () => {
     ).rejects.toThrow(/unidentified namespace/);
   });
 
+  it('refuses explicit null D1 result rows instead of reporting an empty query', async () => {
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'inert',
+      plane: 'plain-worker',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async () => envelope([{ success: true, results: null }]),
+    });
+    await expect(
+      client.queryDatabase('database-id', 'SELECT 1'),
+    ).rejects.toThrow();
+  });
+
+  it('refuses explicit null active-version bindings instead of reporting an absent digest', async () => {
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'inert',
+      plane: 'plain-worker',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (input, init) => {
+        const url = new URL(new Request(input, init).url);
+        if (url.pathname.endsWith('/deployments'))
+          return envelope({
+            deployments: [
+              { versions: [{ version_id: 'version', percentage: 100 }] },
+            ],
+          });
+        return envelope({ resources: { bindings: null } });
+      },
+    });
+    await expect(client.inspectActiveWorkerRoute('plain')).rejects.toThrow();
+  });
+
+  it('refuses explicit null R2 buckets instead of completing empty inventory', async () => {
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'inert',
+      plane: 'plain-worker',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async () => envelope({ buckets: null }),
+    });
+    const options = canonicalFleetInventoryRunOptions({
+      databaseNamePrefix: 'fleet-',
+      scriptNamePrefix: 'fleet-',
+      includeR2Buckets: true,
+    });
+    const stage = { step: 'r2-buckets', jurisdictionOrdinal: 0 } as const;
+    await expect(
+      fenced(client, () =>
+        cloudflareFleetInventoryContext(client).advanceStage({
+          stage,
+          options,
+          progress: initialFleetInventoryProgress(stage, 1),
+          maxProviderRequests: 9,
+        }),
+      ),
+    ).rejects.toThrow();
+  });
+
   it('forwards anonymous and numbered D1 parameters without rewriting SQL text', async () => {
     const bodies: unknown[] = [];
     const client = new CloudflareProvisioningClient({
@@ -3283,6 +3565,47 @@ describe('inventory absence proofs', () => {
     });
     return { client, requests };
   }
+  it.each([
+    {
+      label: 'null errors and messages',
+      info: { page: 1, per_page: 100, total_count: 1, total_pages: 1 },
+    },
+    { label: 'null errors and result_info', info: null },
+  ])('accepts $label in database inventory and returns its rows', async ({
+    info,
+  }) => {
+    const { client, requests } = fixture(
+      '/client/v4/accounts/account/d1/database',
+      (url) =>
+        url.searchParams.get('page') === '2'
+          ? envelope([])
+          : Response.json({
+              success: true,
+              errors: null,
+              messages: null,
+              result: [{ uuid: 'db', name: 'database' }],
+              result_info: info,
+            }),
+    );
+    await expect(client.listOrdinaryWorkerDatabases()).resolves.toEqual([
+      { databaseId: 'db', name: 'database' },
+    ]);
+    expect(requests).toHaveLength(2);
+  });
+  it('accepts null errors and result_info as a single empty database page', async () => {
+    const { client, requests } = fixture(
+      '/client/v4/accounts/account/d1/database',
+      () =>
+        Response.json({
+          success: true,
+          errors: null,
+          result: [],
+          result_info: null,
+        }),
+    );
+    await expect(client.listOrdinaryWorkerDatabases()).resolves.toEqual([]);
+    expect(requests).toHaveLength(1);
+  });
   const malformed = [
     { label: 'missing result', body: { success: true } },
     { label: 'missing success', body: { result: [] } },
@@ -3292,7 +3615,19 @@ describe('inventory absence proofs', () => {
     { label: 'string result', body: { success: true, result: 'invalid' } },
     {
       label: 'error metadata',
-      body: { success: true, result: [], errors: [{ code: 1 }] },
+      body: {
+        success: true,
+        result: [],
+        errors: [{ code: 1000, message: 'x' }],
+      },
+    },
+    {
+      label: 'non-array non-null errors',
+      body: { success: true, result: [], errors: 'bad' },
+    },
+    {
+      label: 'non-object result_info',
+      body: { success: true, result: [], result_info: 'bad' },
     },
     {
       label: 'continuing empty page',

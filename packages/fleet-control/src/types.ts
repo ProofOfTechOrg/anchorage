@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { InitialExecutionFenceState } from '@proofoftech/flowsafe/deployment-identity-protocol';
+import type { FleetInventoryR2Jurisdiction } from './cloudflare-fleet-inventory.js';
 import type { HostRoutingTarget } from './host-routing.js';
 
 /**
@@ -1221,6 +1222,7 @@ export interface FleetInventoryFinding {
 }
 
 export interface FleetResourceInventory {
+  readonly unavailableR2Jurisdictions: readonly FleetInventoryR2Jurisdiction[];
   readonly findings: readonly FleetInventoryFinding[];
   /** Canonical HOSTS namespace assigned by the fleet control plane. */
   readonly hostRoutingKvId?: string;

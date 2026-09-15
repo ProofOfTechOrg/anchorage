@@ -216,6 +216,82 @@ describe.sequential('direct evidence', () => {
     ]);
   });
 
+  it.each([
+    'platform-page',
+    'transport-failure',
+    'non-contract-answer',
+    'delivery-window-expired',
+  ] as const)('admits invocation failure detail %s in evidence', async (detail) => {
+    const { f, snapshot } = await evidenceFixture();
+    const scenario = maximalScenario();
+    scenario.failure = { code: 'outcome-unknown', ordinal: 1, detail };
+    const evidence = buildDirectEvidence({
+      snapshot: { ...snapshot, scenario },
+      prepared: f.prepared,
+      mode: 'run',
+      outcome: { status: 'failed', exitCode: 1, teardownCall: null },
+      times: { finishedAt: '2026-09-13T00:00:00.000Z' },
+      commit: null,
+    });
+    expect(object(evidence.scenario).failure).toEqual(scenario.failure);
+    expect(
+      await writeDirectEvidence({
+        directory: f.runDirectory,
+        evidence,
+        sentinels,
+      }),
+    ).toEqual({ written: true });
+  });
+
+  it.each([
+    'platform-page',
+    'transport-failure',
+    'non-contract-answer',
+    'delivery-window-expired',
+  ] as const)('projects pending invocation detail %s without changing the journal snapshot', async (detail) => {
+    const { f, snapshot } = await evidenceFixture();
+    const scenario = maximalScenario();
+    scenario.failure = null;
+    const pending = {
+      ...snapshot,
+      scenario,
+      lastInvocation: {
+        ordinal: snapshot.invocationCount,
+        action: { kind: 'control-read' as const },
+        state: 'pending' as const,
+        requestSha256: 'a'.repeat(64),
+      },
+    };
+    const before = structuredClone(pending);
+    const input = {
+      snapshot: pending,
+      prepared: f.prepared,
+      mode: 'run' as const,
+      outcome: { status: 'failed' as const, exitCode: 1, teardownCall: null },
+      times: { finishedAt: '2026-09-13T00:00:00.000Z' },
+      commit: null,
+    };
+    expect(
+      object(
+        buildDirectEvidence({ ...input, invocationFailureDetail: detail })
+          .scenario,
+      ).failure,
+    ).toEqual({
+      code: 'outcome-unknown',
+      ordinal: pending.lastInvocation.ordinal,
+      detail,
+    });
+    expect(
+      object(
+        buildDirectEvidence({
+          ...input,
+          invocationFailureDetail: 'raw-provider-error' as typeof detail,
+        }).scenario,
+      ).failure,
+    ).toBeNull();
+    expect(pending).toEqual(before);
+  });
+
   it('preserves null observations, absent proofs and failure detail', async () => {
     const { f, snapshot } = await evidenceFixture();
     const scenario = maximalScenario();

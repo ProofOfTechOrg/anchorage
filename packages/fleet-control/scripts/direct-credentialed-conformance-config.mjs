@@ -147,7 +147,12 @@ function runtime(input, field, today) {
     !Array.isArray(flags) ||
     !(
       flags.length === 0 ||
-      (flags.length === 1 && flags[0] === 'nodejs_compat')
+      (flags.length === 1 &&
+        (flags[0] === 'nodejs_compat' ||
+          flags[0] === 'global_fetch_strictly_public')) ||
+      (flags.length === 2 &&
+        flags[0] === 'nodejs_compat' &&
+        flags[1] === 'global_fetch_strictly_public')
     )
   )
     throw invalid(`${field}.compatibilityFlags`);
@@ -245,6 +250,12 @@ export function validateDirectConformanceConfig(value, options = {}) {
     'referenceWorker',
   );
   const referenceRuntime = runtime(reference, 'referenceWorker', today);
+  if (
+    !referenceRuntime.compatibilityFlags.includes(
+      'global_fetch_strictly_public',
+    )
+  )
+    throw invalid('referenceWorker.compatibilityFlags');
   if (referenceRuntime.artifact.mainModule === 'direct-run-manifest.js')
     throw invalid('referenceWorker.artifact.mainModule');
   const maxProviderRequests = integer(

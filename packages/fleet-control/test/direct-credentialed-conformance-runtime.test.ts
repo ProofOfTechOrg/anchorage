@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runInNewContext } from 'node:vm';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { DirectBootstrapError } from '../scripts/direct-credentialed-bootstrap.mjs';
 import {
   DIRECT_CONFORMANCE_USAGE,
   DIRECT_FIXED_OUTPUT,
@@ -1145,6 +1146,60 @@ process.on('exit', () => writeFileSync(${JSON.stringify(readsPath)}, JSON.string
     const result = await w.run();
     expect(result.exitCode).toBe(status === 'failed' ? 1 : 4);
     expect(w.modules.teardown).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    'platform-page',
+    'transport-failure',
+    'non-contract-answer',
+    'delivery-window-expired',
+  ] as const)('prints bootstrap-time outcome-unknown detail %s', async (detail) => {
+    const w = await world();
+    w.modules.bootstrap.mockRejectedValue(
+      new DirectBootstrapError('outcome-unknown', detail),
+    );
+    const result = await w.run('run');
+    expect(result.exitCode).toBe(1);
+    expect(result.summary).toMatchObject({
+      code: 'outcome-unknown',
+      detail,
+      scenario: null,
+    });
+    expect(result.stdoutLine).toContain(JSON.stringify(detail));
+    expectCredentialSafeOutput(result);
+  });
+
+  it.each([
+    'platform-page',
+    'transport-failure',
+    'non-contract-answer',
+    'delivery-window-expired',
+  ] as const)('prints pending scenario failure detail %s without journal settlement', async (detail) => {
+    const w = await world();
+    const scenario = completeScenario();
+    const pending = {
+      ordinal: 1,
+      action: { kind: 'control-read' as const },
+      state: 'pending' as const,
+      requestSha256: 'a'.repeat(64),
+    };
+    w.modules.scenario.mockImplementation(async () => {
+      w.set({ invocationCount: 1, lastInvocation: pending, scenario });
+      return {
+        status: 'failed',
+        reason: 'outcome-unknown',
+        detail,
+        phase: scenario.phase,
+        invocationCount: 1,
+      };
+    });
+    const result = await w.run('run');
+    expect(result.summary).toMatchObject({
+      scenario: { failure: { code: 'outcome-unknown', ordinal: 1, detail } },
+    });
+    expect(w.snapshot().lastInvocation).toEqual(pending);
+    expect(w.snapshot().scenario?.failure).toBeNull();
+    expectCredentialSafeOutput(result);
   });
 
   it('uses inspection on outcome-unknown without recording a resume', async () => {

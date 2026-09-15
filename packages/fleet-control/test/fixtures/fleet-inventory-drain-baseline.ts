@@ -125,7 +125,7 @@ export const DRAIN_BASELINE_REQUESTS = [
   },
   {
     method: 'GET',
-    url: 'https://api.cloudflare.com/client/v4/user/tokens/verify',
+    url: 'https://api.cloudflare.com/client/v4/accounts/account/tokens/verify',
     body: undefined,
   },
   {
@@ -135,12 +135,12 @@ export const DRAIN_BASELINE_REQUESTS = [
   },
   {
     method: 'GET',
-    url: 'https://api.cloudflare.com/client/v4/zones?account.id=account&per_page=50&type=full&type=partial&type=secondary&type=internal',
+    url: 'https://api.cloudflare.com/client/v4/zones?account.id=account&per_page=50',
     body: undefined,
   },
   {
     method: 'GET',
-    url: 'https://api.cloudflare.com/client/v4/zones?account.id=account&per_page=50&type=full&type=partial&type=secondary&type=internal&page=2',
+    url: 'https://api.cloudflare.com/client/v4/zones?account.id=account&per_page=50&page=2',
     body: undefined,
   },
   {
@@ -427,6 +427,7 @@ export const DRAIN_BASELINE_INVENTORY = {
     trustedWorkers: true,
     scriptCount: 5,
   },
+  unavailableR2Jurisdictions: Object.freeze([]),
   scriptRegistrations: [
     {
       scriptName: 'fleet-alpha',

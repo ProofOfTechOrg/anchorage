@@ -18,7 +18,11 @@ export interface DirectArtifactIntent {
 export interface DirectRuntimeIntent {
   readonly artifact: DirectArtifactIntent;
   readonly compatibilityDate: string;
-  readonly compatibilityFlags: readonly [] | readonly ['nodejs_compat'];
+  readonly compatibilityFlags:
+    | readonly []
+    | readonly ['nodejs_compat']
+    | readonly ['global_fetch_strictly_public']
+    | readonly ['nodejs_compat', 'global_fetch_strictly_public'];
   readonly cpuLimitMs: number;
   readonly subrequestLimit: number;
 }

@@ -9,7 +9,9 @@ import {
   applicationSecretValues,
   canonicalApplicationBindings,
 } from './application-bindings.js';
+import { isTransientProviderError } from './cloudflare-provider-errors.js';
 import {
+  cancelBodyWithoutAwait,
   captureDatabaseExportReceiptCapability,
   databaseExportReceiptIdentityFromUnknown,
 } from './database-export-store.js';
@@ -197,8 +199,16 @@ export interface PlainWorkerBackendOptions {
   readonly identityCaller: string;
   readonly fetch?: typeof fetch;
   readonly maintenanceRequestTimeoutMs?: number;
+  /**
+   * Bounds maintenance route readiness and deployment propagation waits.
+   * @defaultValue 60000
+   */
+  readonly maintenanceRouteReadyTimeoutMs?: number;
+  readonly maintenanceRouteReadyIntervalMs?: number;
   /** Stamps `observedAt` on an attestation. Injected so it can be pinned. */
   readonly clock?: () => number;
+  /** Delays reconciled mutation retries. Defaults to a `setTimeout` promise. */
+  readonly wait?: (ms: number) => Promise<void>;
 }
 
 /**
@@ -260,7 +270,10 @@ export class PlainWorkerBackend implements ProvisioningBackend {
   readonly #identityCaller: string;
   readonly #fetch: typeof fetch;
   readonly #maintenanceRequestTimeoutMs: number;
+  readonly #maintenanceRouteReadyTimeoutMs: number;
+  readonly #maintenanceRouteReadyIntervalMs: number;
   readonly #clock: () => number;
+  readonly #wait: (ms: number) => Promise<void>;
 
   constructor(options: PlainWorkerBackendOptions) {
     const maintenanceRequestTimeoutMs = resolveMaintenanceRequestTimeoutMs(
@@ -279,7 +292,22 @@ export class PlainWorkerBackend implements ProvisioningBackend {
     const fetchFn = options.fetch ?? fetch;
     this.#fetch = (input, init) => fetchFn(input, init);
     this.#maintenanceRequestTimeoutMs = maintenanceRequestTimeoutMs;
+    this.#maintenanceRouteReadyTimeoutMs =
+      options.maintenanceRouteReadyTimeoutMs ?? 60_000;
+    this.#maintenanceRouteReadyIntervalMs =
+      options.maintenanceRouteReadyIntervalMs ?? 2_000;
+    for (const value of [
+      this.#maintenanceRouteReadyTimeoutMs,
+      this.#maintenanceRouteReadyIntervalMs,
+    ]) {
+      if (!Number.isSafeInteger(value) || value < 1) {
+        throw new Error('maintenance route readiness timing must be positive');
+      }
+    }
     this.#clock = options.clock ?? Date.now;
+    this.#wait =
+      options.wait ??
+      ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     const advanceDecommissionAttachmentScan =
       options.api.advanceDecommissionAttachmentScan;
     if (typeof advanceDecommissionAttachmentScan === 'function') {
@@ -372,29 +400,42 @@ export class PlainWorkerBackend implements ProvisioningBackend {
     spec: DeploymentSpec,
     fence: ExternalMutationFence,
   ): Promise<DatabaseReference> {
-    this.#assertMutationDuration(fence);
-    const outcome = await this.#api.createDatabase(spec.databaseName, fence);
-    if (outcome.status === 'failed') {
-      const recovered = await this.findDatabase(spec);
-      if (recovered) {
-        const owner = await this.readDeploymentIdentity(recovered, fence);
-        if (owner !== undefined) {
-          throw new Error(
-            `refusing authorized database reconciliation for '${recovered.id}' owned by '${owner}'`,
-            { cause: outcome.error },
-          );
+    for (let attempt = 0; ; attempt += 1) {
+      this.#assertMutationDuration(fence);
+      const outcome = await this.#api.createDatabase(spec.databaseName, fence);
+      if (outcome.status === 'failed') {
+        const recovered = await this.findDatabase(spec);
+        if (recovered) {
+          const owner = await this.readDeploymentIdentity(recovered, fence);
+          if (owner !== undefined) {
+            throw new Error(
+              `refusing authorized database reconciliation for '${recovered.id}' owned by '${owner}'`,
+              { cause: outcome.error },
+            );
+          }
+          return { ...recovered, created: true };
         }
-        return { ...recovered, created: true };
+        await this.#waitForReconciledMutationRetry(outcome.error, attempt);
+        continue;
       }
-      throw outcome.error;
+      const resolved = await this.findDatabase(spec);
+      if (!resolved) {
+        throw new Error(
+          `D1 database '${spec.databaseName}' is absent after successful creation`,
+        );
+      }
+      return { ...resolved, created: true };
     }
-    const resolved = await this.findDatabase(spec);
-    if (!resolved) {
-      throw new Error(
-        `D1 database '${spec.databaseName}' is absent after successful creation`,
-      );
-    }
-    return { ...resolved, created: true };
+  }
+
+  async #waitForReconciledMutationRetry(
+    error: unknown,
+    attempt: number,
+  ): Promise<void> {
+    // Reconciliation proves absence before the injected wait delays a retry;
+    // the next attempt checks the duration fence before dispatch.
+    if (attempt >= 2 || !isTransientProviderError(error)) throw error;
+    await this.#wait(2_000 * (attempt + 1));
   }
 
   async #query(
@@ -486,24 +527,28 @@ export class PlainWorkerBackend implements ProvisioningBackend {
     if (!this.#api.createR2Bucket) {
       throw new Error('plain Worker route API does not support application R2');
     }
-    await fence.assertOwned();
-    try {
-      await this.#api.createR2Bucket(resource, fence);
-    } catch (error) {
+    for (let attempt = 0; ; attempt += 1) {
+      this.#assertMutationDuration(fence);
       await fence.assertOwned();
-      const reconciled = await this.findApplicationR2Bucket(resource);
-      if (reconciled) return reconciled;
-      if (
-        error &&
-        typeof error === 'object' &&
-        'status' in error &&
-        error.status === 409
-      ) {
-        throw new Error(
-          `R2 bucket '${resource.bucketName}' conflicts with a foreign resource`,
-        );
+      try {
+        await this.#api.createR2Bucket(resource, fence);
+        break;
+      } catch (error) {
+        await fence.assertOwned();
+        const reconciled = await this.findApplicationR2Bucket(resource);
+        if (reconciled) return reconciled;
+        if (
+          error &&
+          typeof error === 'object' &&
+          'status' in error &&
+          error.status === 409
+        ) {
+          throw new Error(
+            `R2 bucket '${resource.bucketName}' conflicts with a foreign resource`,
+          );
+        }
+        await this.#waitForReconciledMutationRetry(error, attempt);
       }
-      throw error;
     }
     const confirmed = await this.findApplicationR2Bucket(resource);
     if (!confirmed)
@@ -1162,35 +1207,29 @@ export class PlainWorkerBackend implements ProvisioningBackend {
       );
     }
     if (current.versions.some((version) => version.id === candidateId)) return;
-    this.#assertMutationDuration(fence);
-    const outcome = await this.#api.createDeployment(
-      spec.scriptName,
-      [
-        ...current.versions.map((version) => ({
-          versionId: version.id,
-          percentage: version.percentage,
-        })),
-        { versionId: candidateId, percentage: 0 },
-      ],
-      fence,
-    );
-    if (outcome.status === 'failed') {
-      const reconciled = await this.#deploymentStatus(spec);
-      if (!reconciled?.versions.some((version) => version.id === candidateId)) {
-        throw outcome.error;
-      }
-    }
-  }
-
-  #requireMaintenanceDigest(
-    spec: DeploymentSpec,
-    maintenance: MaintenanceHealth,
-  ): void {
-    const expected = deploymentSpecDigest(spec);
-    if (maintenance.deploymentSpecDigest !== expected) {
-      throw new Error(
-        `maintenance response did not attest fleet specification digest '${expected}'`,
+    for (let attempt = 0; ; attempt += 1) {
+      this.#assertMutationDuration(fence);
+      const outcome = await this.#api.createDeployment(
+        spec.scriptName,
+        [
+          ...current.versions.map((version) => ({
+            versionId: version.id,
+            percentage: version.percentage,
+          })),
+          { versionId: candidateId, percentage: 0 },
+        ],
+        fence,
       );
+      if (outcome.status === 'failed') {
+        const reconciled = await this.#deploymentStatus(spec);
+        if (
+          !reconciled?.versions.some((version) => version.id === candidateId)
+        ) {
+          await this.#waitForReconciledMutationRetry(outcome.error, attempt);
+          continue;
+        }
+      }
+      return;
     }
   }
 
@@ -1257,7 +1296,8 @@ export class PlainWorkerBackend implements ProvisioningBackend {
       previewUrlsEnabled: false,
     };
     let uploadOutcome: PlainWorkerUploadOutcome | undefined;
-    if (!candidateId) {
+    const uploadCleanupErrors: unknown[] = [];
+    const uploadCandidate = async () => {
       this.#assertMutationDuration(fence);
       uploadOutcome = await this.#api.uploadCandidate(
         {
@@ -1343,7 +1383,11 @@ export class PlainWorkerBackend implements ProvisioningBackend {
         },
         fence,
       );
-    }
+      if (uploadOutcome.cleanup.status === 'failed') {
+        uploadCleanupErrors.push(uploadOutcome.cleanup.error);
+      }
+    };
+    if (!candidateId) await uploadCandidate();
     let settled:
       | Readonly<{
           ok: true;
@@ -1360,9 +1404,26 @@ export class PlainWorkerBackend implements ProvisioningBackend {
         }>;
     try {
       if (!candidateId) {
-        const operationCandidates = (
-          await this.#matchingCandidateIds(spec)
-        ).filter((id) => !priorVersionIds.has(id));
+        let operationCandidates: string[];
+        // A transient failure permits another upload only after tagged-version
+        // reconciliation proves that this attempt created no candidate.
+        for (let attempt = 0; ; attempt += 1) {
+          operationCandidates = (await this.#matchingCandidateIds(spec)).filter(
+            (id) => !priorVersionIds.has(id),
+          );
+          if (
+            operationCandidates.length !== 0 ||
+            uploadOutcome?.status !== 'failed' ||
+            !uploadOutcome.error
+          ) {
+            break;
+          }
+          await this.#waitForReconciledMutationRetry(
+            uploadOutcome.error,
+            attempt,
+          );
+          await uploadCandidate();
+        }
         if (operationCandidates.length !== 1) {
           if (uploadOutcome?.status === 'failed' && uploadOutcome.error) {
             throw uploadOutcome.error;
@@ -1490,18 +1551,21 @@ export class PlainWorkerBackend implements ProvisioningBackend {
     if (!settled.ok) {
       const record = settled.error;
       const cause =
-        uploadOutcome?.cleanup.status === 'failed'
+        uploadCleanupErrors.length > 0
           ? new AggregateError(
-              [record.cause, uploadOutcome.cleanup.error],
+              [record.cause, ...uploadCleanupErrors],
               'Worker upload and adapter scratch cleanup both failed',
             )
           : record.cause;
       throw new WorkerDeploymentError({ ...record, cause });
     }
-    if (uploadOutcome?.cleanup.status === 'failed') {
+    if (uploadCleanupErrors.length > 0) {
       throw new WorkerDeploymentError({
         message: `installed Worker '${spec.scriptName}' but failed to clean up the adapter credential scratch`,
-        cause: uploadOutcome.cleanup.error,
+        cause:
+          uploadCleanupErrors.length === 1
+            ? uploadCleanupErrors[0]
+            : new AggregateError(uploadCleanupErrors),
         createdByAttempt: !workerExisted,
         resourceState: 'present',
       });
@@ -1542,21 +1606,25 @@ export class PlainWorkerBackend implements ProvisioningBackend {
       current.versions[0]?.id === candidateId &&
       current.versions[0].percentage === 100;
     if (!promoted) {
-      this.#assertMutationDuration(fence);
-      const outcome = await this.#api.createDeployment(
-        spec.scriptName,
-        [{ versionId: candidateId, percentage: 100 }],
-        fence,
-      );
-      if (outcome.status === 'failed') {
-        const reconciled = await this.#deploymentStatus(spec);
-        if (
-          reconciled?.versions.length !== 1 ||
-          reconciled.versions[0]?.id !== candidateId ||
-          reconciled.versions[0].percentage !== 100
-        ) {
-          throw outcome.error;
+      for (let attempt = 0; ; attempt += 1) {
+        this.#assertMutationDuration(fence);
+        const outcome = await this.#api.createDeployment(
+          spec.scriptName,
+          [{ versionId: candidateId, percentage: 100 }],
+          fence,
+        );
+        if (outcome.status === 'failed') {
+          const reconciled = await this.#deploymentStatus(spec);
+          if (
+            reconciled?.versions.length !== 1 ||
+            reconciled.versions[0]?.id !== candidateId ||
+            reconciled.versions[0].percentage !== 100
+          ) {
+            await this.#waitForReconciledMutationRetry(outcome.error, attempt);
+            continue;
+          }
         }
+        break;
       }
     }
     const beforeAttach = await this.#attestPromotionRoute(spec, guard);
@@ -1575,6 +1643,69 @@ export class PlainWorkerBackend implements ProvisioningBackend {
       throw new Error(
         `custom domain '${spec.routeHostname}' did not attest Worker '${spec.scriptName}' after promotion`,
       );
+    }
+  }
+
+  async #requestMaintenance(
+    url: URL,
+    init: RequestInit,
+    mismatch: (maintenance: MaintenanceHealth) => string | undefined,
+    fence?: ExternalMutationFence,
+  ): Promise<MaintenanceHealth> {
+    const deadline = Date.now() + this.#maintenanceRouteReadyTimeoutMs;
+    let readinessError = new Error(
+      `maintenance request failed with HTTP 404. workers.dev route did not serve within ${this.#maintenanceRouteReadyTimeoutMs} ms; a Worker fetching another Worker on the same workers.dev subdomain needs the global_fetch_strictly_public compatibility flag`,
+    );
+    let routeNotReady = false;
+    for (;;) {
+      if (fence) await this.#assertMutationFence(fence);
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw readinessError;
+      let response: Response;
+      try {
+        response = await this.#fetch(url, {
+          ...init,
+          signal: AbortSignal.timeout(
+            Math.min(this.#maintenanceRequestTimeoutMs, remaining),
+          ),
+        });
+      } catch (error) {
+        if (routeNotReady && Date.now() >= deadline) throw readinessError;
+        throw error;
+      }
+      const mediaType = response.headers
+        .get('content-type')
+        ?.split(';')[0]
+        ?.trim()
+        .toLowerCase();
+      if (
+        (response.status !== 404 && response.status !== 500) ||
+        (mediaType !== 'text/plain' && mediaType !== 'text/html') ||
+        response.headers.get('cache-control') === 'no-store' ||
+        response.headers.has('www-authenticate')
+      ) {
+        const maintenance = await readMaintenanceHealth(response);
+        const message = mismatch(maintenance);
+        if (!message) return maintenance;
+        if (maintenance.deploymentSpecDigest === undefined) {
+          throw new Error(message);
+        }
+        readinessError = new Error(
+          `${message} within ${this.#maintenanceRouteReadyTimeoutMs} ms after the deployment change`,
+        );
+      } else {
+        readinessError = new Error(
+          `maintenance request failed with HTTP ${response.status}. workers.dev route did not serve within ${this.#maintenanceRouteReadyTimeoutMs} ms; a Worker fetching another Worker on the same workers.dev subdomain needs the global_fetch_strictly_public compatibility flag`,
+        );
+        cancelBodyWithoutAwait(response.body, readinessError);
+      }
+      routeNotReady = true;
+      const waitMs = Math.min(
+        this.#maintenanceRouteReadyIntervalMs,
+        deadline - Date.now(),
+      );
+      if (waitMs <= 0) throw readinessError;
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
     }
   }
 
@@ -1605,19 +1736,22 @@ export class PlainWorkerBackend implements ProvisioningBackend {
         'maintenance request timeout must be below the external mutation fence lease TTL',
       );
     }
-    await this.#assertMutationFence(fence);
-    const maintenance = await readMaintenanceHealth(
-      await this.#fetch(maintenanceUrl(spec, '/admin/ensure-maintenance'), {
+    const expected = deploymentSpecDigest(spec);
+    return this.#requestMaintenance(
+      maintenanceUrl(spec, '/admin/ensure-maintenance'),
+      {
         method: 'POST',
-        signal: AbortSignal.timeout(this.#maintenanceRequestTimeoutMs),
         headers: {
           authorization: `Bearer ${maintenanceAdminSecret}`,
           'Cloudflare-Workers-Version-Overrides': `${spec.scriptName}="${candidateId}"`,
         },
-      }),
+      },
+      (maintenance) =>
+        maintenance.deploymentSpecDigest !== expected
+          ? `maintenance response did not attest fleet specification digest '${expected}'`
+          : undefined,
+      fence,
     );
-    this.#requireMaintenanceDigest(spec, maintenance);
-    return maintenance;
   }
 
   async inspect(
@@ -1756,8 +1890,10 @@ export class PlainWorkerBackend implements ProvisioningBackend {
         `${right.type}\u0000${right.name}`,
       ),
     );
-    const maintenance = await readMaintenanceHealth(
-      await this.#fetch(maintenanceUrl(spec, '/admin/maintenance-status'), {
+    const maintenance = await this.#requestMaintenance(
+      maintenanceUrl(spec, '/admin/maintenance-status'),
+      {
+        method: 'GET',
         headers: {
           authorization: `Bearer ${maintenanceAdminSecret}`,
           ...(candidateDeployed
@@ -1766,18 +1902,20 @@ export class PlainWorkerBackend implements ProvisioningBackend {
               }
             : {}),
         },
-      }),
+      },
+      (health) => {
+        if (candidateDeployed) {
+          const expected = deploymentSpecDigest(spec);
+          return health.deploymentSpecDigest !== expected
+            ? `maintenance response did not attest fleet specification digest '${expected}'`
+            : undefined;
+        }
+        return health.deploymentSpecDigest !== undefined &&
+          health.deploymentSpecDigest !== desiredSpecDigest
+          ? `maintenance response does not match inspected Worker version '${artifactVersion}'`
+          : undefined;
+      },
     );
-    if (candidateDeployed) {
-      this.#requireMaintenanceDigest(spec, maintenance);
-    } else if (
-      maintenance.deploymentSpecDigest !== undefined &&
-      maintenance.deploymentSpecDigest !== desiredSpecDigest
-    ) {
-      throw new Error(
-        `maintenance response does not match inspected Worker version '${artifactVersion}'`,
-      );
-    }
     return {
       tenantTag: spec.tenantTag,
       environment: spec.environment,

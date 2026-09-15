@@ -69,7 +69,7 @@ export default {async fetch(request,env){
     if(req.method!=='GET'||url.origin!=='https://api.cloudflare.com'||!url.pathname.startsWith('/client/v4/'))throw new Error('unexpected fixture dispatch');
     const path=url.pathname.slice('/client/v4'.length);
     calls.push({path,page:url.searchParams.get('page'),jurisdiction:req.headers.get('cf-r2-jurisdiction')});
-    if(path==='/user/tokens/verify')return single({id:'token-id',status:'active'});
+    if(path==='/accounts/account/tokens/verify'||path==='/user/tokens/verify')return single({id:'token-id',status:'active'});
     if(path==='/accounts/account/tokens/token-id')return single({id:'token-id',status:'active',policies:[{id:'zone-authority',effect:'allow',permission_groups:[{id:'zone-read',name:'Zone Read'},{id:'routes-read',name:'Workers Routes Read'},{id:'routes-write',name:'Workers Routes Write'}],resources:{'com.cloudflare.api.account.account':{'com.cloudflare.api.account.zone.*':'*'}}}]});
     if(path==='/zones'){if(url.searchParams.get('account.id')!=='account')throw new Error('wrong zone account');return page([]);}
     if(path==='/accounts/account/workers/domains'||path==='/accounts/account/workers/scripts'||path==='/accounts/account/workers/durable_objects/namespaces')return page([]);
@@ -158,7 +158,10 @@ export default {async fetch(request,env){
             name: 'direct-reference-harness',
             main,
             compatibility_date: '2026-08-06',
-            compatibility_flags: ['nodejs_compat'],
+            compatibility_flags: [
+              'nodejs_compat',
+              'global_fetch_strictly_public',
+            ],
             d1_databases: [
               {
                 binding: 'FLEET_DB',

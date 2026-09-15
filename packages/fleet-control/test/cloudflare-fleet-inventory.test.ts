@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { APIError } from 'cloudflare';
 import { describe, expect, it } from 'vitest';
 import {
   advanceCloudflareFleetInventoryStage,
@@ -23,6 +24,7 @@ import {
   type FleetInventoryStagedFact,
   type FleetInventoryStagedRow,
   initialFleetInventoryStage,
+  materializeFleetInventoryGeneration,
 } from '../src/fleet-inventory-state.js';
 import { canonicalDeploymentEgressPolicy } from '../src/platform-resources.js';
 
@@ -119,6 +121,8 @@ function harness(world: World): Harness {
         const page = pageAt(world.dispatchPages, cursor);
         return new Response(
           JSON.stringify({
+            success: true,
+            errors: [],
             result: page.items,
             ...(page.cursor === undefined
               ? {}
@@ -551,6 +555,81 @@ describe('advanceCloudflareFleetInventoryStage', () => {
     await expect(drive(deps, EMPTY_OPTIONS)).rejects.toBeInstanceOf(
       FleetInventoryFindingValueError,
     );
+  });
+
+  it.each([
+    [
+      'refuses a dispatch script page whose envelope reports success false',
+      { success: false, errors: [] },
+    ],
+    [
+      'refuses a dispatch script page with a non-empty errors array',
+      { success: true, errors: [{ code: 1000, message: 'failure' }] },
+    ],
+    [
+      'refuses a dispatch script page whose errors field is not an array',
+      { success: true, errors: 'bad' },
+    ],
+  ])('%s', async (_title, metadata) => {
+    const { deps } = harness({
+      dispatchNamespace: 'anchorage-ns',
+      namespaceInventory: {
+        namespace_name: 'anchorage-ns',
+        script_count: 0,
+        trusted_workers: false,
+      },
+    });
+    const failed = {
+      ...deps,
+      attachmentScan: {
+        ...deps.attachmentScan,
+        requestDispatchScriptPage: async () =>
+          Response.json({ ...metadata, result: [], result_info: null }),
+      },
+    };
+    await expect(drive(failed, RICH_OPTIONS)).rejects.toThrow(
+      /Cloudflare dispatch script listing/,
+    );
+  });
+
+  it('accepts a dispatch script page with errors null', async () => {
+    const { deps } = harness({
+      dispatchNamespace: 'anchorage-ns',
+      namespaceInventory: {
+        namespace_name: 'anchorage-ns',
+        script_count: 0,
+        trusted_workers: false,
+      },
+    });
+    const nullable = {
+      ...deps,
+      attachmentScan: {
+        ...deps.attachmentScan,
+        requestDispatchScriptPage: async () =>
+          Response.json({
+            success: true,
+            errors: null,
+            result: [],
+            result_info: null,
+          }),
+      },
+    };
+    const run = await drive(nullable, RICH_OPTIONS);
+    expect(run.steps).toContain('dispatch-pages');
+    expect(run.rows).toEqual([
+      {
+        kind: 'meta',
+        ordinal: 0,
+        payload: {
+          record: 'dispatch-inventory',
+          dispatchScriptCount: 0,
+          name: 'anchorage-ns',
+          trustedWorkers: false,
+          scriptCount: 0,
+        },
+      },
+    ]);
+    expect(run.stages.at(-1)?.step).toBe('finalize');
   });
 
   it('walks the fifteen provider stages in encounter order, one chunk per call', async () => {
@@ -1061,6 +1140,147 @@ describe('advanceCloudflareFleetInventoryStage', () => {
     ).rejects.toThrow(
       'D1 database inventory exceeded the supported inventory bound of 25000 items',
     );
+  });
+
+  it.each([
+    'eu',
+    'fedramp',
+  ] as const)('records a first-page %s access refusal without losing accessible buckets', async (unavailable) => {
+    const buckets = Object.fromEntries(
+      ['default', 'eu', 'fedramp'].map((jurisdiction) => [
+        jurisdiction,
+        [{ name: `anchorage-${jurisdiction}`, creation_date: '2024-01-01' }],
+      ]),
+    );
+    const base = harness({ buckets }).deps;
+    const refusal = new APIError(
+      403,
+      { errors: [{ code: 10003 }] },
+      '',
+      new Headers(),
+    );
+    const deps = {
+      ...base,
+      listR2Buckets: async (
+        input: Parameters<typeof base.listR2Buckets>[0],
+      ) => {
+        if (input.jurisdiction === unavailable) throw refusal;
+        return base.listR2Buckets(input);
+      },
+    };
+    const options = { ...EMPTY_OPTIONS, includeR2Buckets: true };
+    const run = await drive(deps, options);
+    const inventory = materializeFleetInventoryGeneration({ ...run, options });
+    expect(inventory.unavailableR2Jurisdictions).toEqual([unavailable]);
+    expect(Object.isFrozen(inventory.unavailableR2Jurisdictions)).toBe(true);
+    expect(inventory.r2Buckets?.map((bucket) => bucket.bucketName)).toEqual(
+      ['default', 'eu', 'fedramp']
+        .filter((jurisdiction) => jurisdiction !== unavailable)
+        .map((jurisdiction) => `anchorage-${jurisdiction}`),
+    );
+    expect(run.steps.at(-1)).toBe('finalize');
+  });
+
+  it.each([
+    ['default', 403, [{ code: 10003 }]],
+    ['fedramp', 403, [{ code: 10004 }]],
+    ['fedramp', 403, []],
+    ['fedramp', 403, [{ code: '10003' }]],
+    ['fedramp', 500, [{ code: 10003 }]],
+  ] as const)('fails the R2 stage for %s HTTP %i with errors %j', async (jurisdiction, status, errors) => {
+    const base = harness({}).deps;
+    const refusal = new APIError(status, { errors }, '', new Headers());
+    await expect(
+      drive(
+        {
+          ...base,
+          listR2Buckets: async (input) => {
+            if (input.jurisdiction === jurisdiction) throw refusal;
+            return base.listR2Buckets(input);
+          },
+        },
+        { ...EMPTY_OPTIONS, includeR2Buckets: true },
+      ),
+    ).rejects.toBe(refusal);
+  });
+
+  it.each([
+    false,
+    true,
+  ])('fails a second-page EU access refusal, resumed=%s', async (resumed) => {
+    const base = harness({}).deps;
+    const refusal = new APIError(
+      403,
+      { errors: [{ code: 10003 }] },
+      '',
+      new Headers(),
+    );
+    const stage: FleetInventoryStage = {
+      step: 'r2-buckets',
+      jurisdictionOrdinal: 1,
+      ...(resumed ? { startAfter: 'anchorage-0999' } : {}),
+    };
+    const options = { ...EMPTY_OPTIONS, includeR2Buckets: true };
+    await expect(
+      advanceCloudflareFleetInventoryStage(
+        {
+          ...base,
+          listR2Buckets: async ({ startAfter }) => {
+            if (startAfter !== undefined) throw refusal;
+            return {
+              buckets: Array.from({ length: 1_000 }, (_, index) => ({
+                name: `anchorage-${String(index).padStart(4, '0')}`,
+                creation_date: '2024-01-01',
+              })),
+            };
+          },
+        },
+        {
+          stage,
+          options,
+          progress: { ...initialProgress(options), stage },
+          maxProviderRequests: 9,
+        },
+      ),
+    ).rejects.toBe(refusal);
+  });
+
+  it('distinguishes an unavailable jurisdiction from an empty page in the page digest', async () => {
+    const base = harness({}).deps;
+    const stage: FleetInventoryStage = {
+      step: 'r2-buckets',
+      jurisdictionOrdinal: 2,
+    };
+    const options = { ...EMPTY_OPTIONS, includeR2Buckets: true };
+    const input = {
+      stage,
+      options,
+      progress: { ...initialProgress(options), stage },
+      maxProviderRequests: 9,
+    };
+    const empty = await advanceCloudflareFleetInventoryStage(base, input);
+    const unavailable = await advanceCloudflareFleetInventoryStage(
+      {
+        ...base,
+        listR2Buckets: async () => {
+          throw new APIError(
+            403,
+            { errors: [{ code: 10003 }] },
+            '',
+            new Headers(),
+          );
+        },
+      },
+      input,
+    );
+    expect(unavailable.pageDigest).not.toBe(empty.pageDigest);
+    expect(unavailable.rows).not.toEqual(empty.rows);
+    const inventory = materializeFleetInventoryGeneration({
+      ...empty,
+      options,
+    });
+    expect(inventory.unavailableR2Jurisdictions).toEqual([]);
+    expect(Object.isFrozen(inventory.unavailableR2Jurisdictions)).toBe(true);
   });
 
   it('resumes R2 pagination inside one jurisdiction', async () => {

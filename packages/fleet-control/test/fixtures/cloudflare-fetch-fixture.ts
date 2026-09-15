@@ -22,7 +22,11 @@ type PageInfo = Readonly<{
   cursors?: Readonly<{ after?: string }>;
 }>;
 
-function page(result: unknown, info: PageInfo): Response {
+function page(
+  result: unknown,
+  info: PageInfo,
+  emptyEnvelopeFields?: { errors: null; messages: null },
+): Response {
   let items: readonly unknown[] | undefined;
   if (Array.isArray(result)) {
     items = result;
@@ -35,6 +39,7 @@ function page(result: unknown, info: PageInfo): Response {
     success: true,
     errors: [],
     messages: [],
+    ...emptyEnvelopeFields,
     result,
     result_info: {
       page: 1,
@@ -76,7 +81,7 @@ export function envelope(result: unknown): Response {
 
 export function zoneAuthorityResponse(
   url: URL,
-  zoneIds: readonly (string | { id: string; name?: string })[],
+  zoneIds: readonly (string | { id: string; name?: string; type?: string })[],
   routes?: readonly WorkerRoute[],
 ): Response | undefined {
   if (
@@ -114,11 +119,16 @@ export function zoneAuthorityResponse(
         page: Number(url.searchParams.get('page')),
         per_page: 20,
       });
+    const types = url.searchParams.getAll('type');
+    const zones = zoneIds.map((zone) => ({
+      type: 'full',
+      ...(typeof zone === 'string' ? { id: zone } : zone),
+      account: { id: 'account' },
+    }));
     return envelope(
-      zoneIds.map((zone) => ({
-        ...(typeof zone === 'string' ? { id: zone } : zone),
-        account: { id: 'account' },
-      })),
+      types.length > 1
+        ? []
+        : zones.filter((zone) => types.length === 0 || zone.type === types[0]),
     );
   }
   const parts = url.pathname.split('/').filter(Boolean);
@@ -130,6 +140,7 @@ export function zoneAuthorityResponse(
     );
     return zone
       ? single({
+          type: 'full',
           ...(typeof zone === 'string' ? { id: zone } : zone),
           account: { id: 'account' },
         })
@@ -714,13 +725,20 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
       });
     }
     if (target.pathname.endsWith('/versions') && method === 'GET') {
-      if (Number(target.searchParams.get('page') ?? '1') !== 1)
-        return pageItems([], { page: Number(target.searchParams.get('page')) });
-      return pageItems(
-        script.versions.map(({ versionId, tag }) => ({
-          id: versionId,
-          annotations: tag === undefined ? undefined : { 'workers/tag': tag },
-        })),
+      const pageNumber = Number(target.searchParams.get('page') ?? '1');
+      return page(
+        {
+          items:
+            pageNumber === 1
+              ? script.versions.map(({ versionId, tag }) => ({
+                  id: versionId,
+                  annotations:
+                    tag === undefined ? undefined : { 'workers/tag': tag },
+                }))
+              : [],
+        },
+        { page: pageNumber },
+        { errors: null, messages: null },
       );
     }
     if (target.pathname.endsWith('/versions') && method === 'POST') {

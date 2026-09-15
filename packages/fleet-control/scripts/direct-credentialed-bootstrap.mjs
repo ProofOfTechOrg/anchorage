@@ -2,7 +2,7 @@
 
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-
+import { DIRECT_INVOCATION_FAILURE_DETAILS } from './direct-credentialed-invocation.mjs';
 import {
   validateProviderAuth as auth,
   classifyDispatchNamespaces,
@@ -12,6 +12,9 @@ import {
   openDirectProviderSession,
 } from './direct-credentialed-provider.mjs';
 import { DirectRunStateError } from './direct-credentialed-run-state.mjs';
+
+// The SDK's repeated type query parameters return no rows from the live API.
+const ZONE_TYPES = Object.freeze(['full', 'partial', 'secondary', 'internal']);
 
 const ERROR_CODES = new Set([
   'invalid-input',
@@ -25,16 +28,19 @@ const ERROR_CODES = new Set([
 ]);
 
 export class DirectBootstrapError extends Error {
-  constructor(code = 'invalid-input') {
+  constructor(code = 'invalid-input', detail) {
     const accepted = ERROR_CODES.has(code) ? code : 'invalid-input';
     super(accepted);
     this.name = 'DirectBootstrapError';
     this.code = accepted;
+    this.detail = DIRECT_INVOCATION_FAILURE_DETAILS.includes(detail)
+      ? detail
+      : undefined;
   }
 }
 
-function refuse(code = 'observation-mismatch') {
-  throw new DirectBootstrapError(code);
+function refuse(code = 'observation-mismatch', detail) {
+  throw new DirectBootstrapError(code, detail);
 }
 
 function object(value) {
@@ -223,6 +229,7 @@ async function checkedInput(input) {
 
 function zone(row, accountId) {
   identifier(row.id);
+  identifier(row.type);
   const name = identifier(row.name, 253);
   if (
     row.account?.id !== accountId ||
@@ -401,12 +408,12 @@ export async function bootstrapDirectConformance(input) {
       numbered.zones.list({
         account: { id: accountId },
         per_page: 50,
-        type: ['full', 'partial', 'secondary', 'internal'],
       }),
       (row) => zone(row, accountId),
       bound,
     );
     const matches = zones
+      .filter((row) => ZONE_TYPES.includes(row.type))
       .filter(
         (row) =>
           prepared.config.ownedHostname === row.name ||
@@ -422,7 +429,8 @@ export async function bootstrapDirectConformance(input) {
     zone(selectedZone, accountId);
     if (
       selectedZone.id !== matches[0].id ||
-      selectedZone.name !== matches[0].name
+      selectedZone.name !== matches[0].name ||
+      !ZONE_TYPES.includes(selectedZone.type)
     )
       refuse();
     const namespaces = await classifyDispatchNamespaces(
@@ -492,14 +500,33 @@ export async function bootstrapDirectConformance(input) {
     const mutate = async (kind, dispatchMutation, receipt) => {
       transport.assertBudget();
       await journal.beginBootstrapMutation(kind);
+      let detail = 'transport-failure';
       try {
         const value = await dispatchMutation();
-        await journal.confirmBootstrapMutation({
-          kind,
-          receipt: receipt(value),
-        });
-      } catch {
-        refuse('outcome-unknown');
+        detail = 'non-contract-answer';
+        const confirmed = receipt(value);
+        detail = undefined;
+        await journal.confirmBootstrapMutation({ kind, receipt: confirmed });
+      } catch (error) {
+        if (
+          detail === 'transport-failure' &&
+          error instanceof APIError &&
+          error.status !== undefined
+        ) {
+          const headers = error.headers;
+          const mediaType = headers
+            ?.get('content-type')
+            ?.split(';')[0]
+            ?.trim()
+            .toLowerCase();
+          detail =
+            (mediaType === 'text/plain' || mediaType === 'text/html') &&
+            headers.get('cache-control') !== 'no-store' &&
+            !headers.has('www-authenticate')
+              ? 'platform-page'
+              : 'non-contract-answer';
+        }
+        refuse('outcome-unknown', detail);
       }
     };
     for (const [field, name, kind] of [
@@ -680,7 +707,13 @@ export async function bootstrapDirectConformance(input) {
         value?.limits?.cpu_ms !== runtime.cpuLimitMs
       )
         refuse();
-      equal(value.compatibility_flags, runtime.compatibilityFlags);
+      // The version resource omits compatibility_flags when the list is empty.
+      equal(
+        value.compatibility_flags === undefined
+          ? []
+          : value.compatibility_flags,
+        runtime.compatibilityFlags,
+      );
     };
     checkRuntime(version.resources?.script_runtime);
     const { providerBindingsToPlainWorkerShape } = await import(
@@ -732,15 +765,22 @@ export async function bootstrapDirectConformance(input) {
     checkIngress(
       await sdk.workers.scripts.subdomain.get(names.referenceWorker, selectors),
     );
-    const { createDirectInvocationClient } = await import(
-      './direct-credentialed-invocation.mjs'
-    );
+    const { awaitReferenceIngress, createDirectInvocationClient } =
+      await import('./direct-credentialed-invocation.mjs');
+    if (
+      !(await awaitReferenceIngress({
+        prepared,
+        accountWorkersDevSubdomain: subdomain,
+        fetch: fetchRequest,
+      }))
+    )
+      refuse('provider-unavailable');
     const client = createDirectInvocationClient({
       prepared,
       journal,
       accountWorkersDevSubdomain: subdomain,
       invokeSecret,
-      fetch: fetchRequest,
+      fetch: input.fetch,
     });
     const observed = await client.invoke({ kind: 'control-read' });
     equal(observed.result?.binding, runBinding);
@@ -756,7 +796,7 @@ export async function bootstrapDirectConformance(input) {
       refuse(error.code === 'outcome-unknown' ? error.code : 'invalid-input');
     if (transport?.failure()) refuse(transport.failure());
     if (error?.name === 'DirectInvocationError' && ERROR_CODES.has(error.code))
-      refuse(error.code);
+      refuse(error.code, error.detail);
     refuse('provider-unavailable');
   } finally {
     transport?.close();

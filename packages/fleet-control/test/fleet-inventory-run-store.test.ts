@@ -16,6 +16,7 @@ import {
   type FleetInventoryStagedRow,
   FleetInventoryStateError,
   fleetInventoryOptionsDigest,
+  materializeFleetInventoryGeneration,
 } from '../src/fleet-inventory-state.js';
 import type { FleetStateDatabase } from '../src/state-store.js';
 import { deferred } from './fixtures/cloudflare-fetch-fixture.js';
@@ -250,6 +251,40 @@ function inventoryState(db: MemoryD1): unknown {
 }
 
 describe('D1FleetInventoryRunStore', () => {
+  it('persists R2 availability separately from an empty bucket inventory', async () => {
+    const store = newStore(new MemoryD1());
+    const empty = await seedGeneration(store, OPERATION_ID, [], []);
+    await store.pinGeneration({
+      generation: empty,
+      pinnedBy: 'availability-test',
+    });
+    const unavailable = await seedGeneration(
+      store,
+      SECOND_OPERATION_ID,
+      [
+        stagedRow('meta', 0, {
+          record: 'unavailable-r2-jurisdiction',
+          jurisdiction: 'fedramp',
+        }),
+      ],
+      [],
+    );
+    const emptyState = await store.readFinalizedGeneration(empty);
+    const unavailableState = await store.readFinalizedGeneration(unavailable);
+    expect(JSON.stringify(unavailableState.rows)).not.toBe(
+      JSON.stringify(emptyState.rows),
+    );
+    const materialize = (state: typeof emptyState) =>
+      materializeFleetInventoryGeneration({ ...state, options: OPTIONS });
+    expect(materialize(emptyState).unavailableR2Jurisdictions).toEqual([]);
+    expect(materialize(unavailableState).unavailableR2Jurisdictions).toEqual([
+      'fedramp',
+    ]);
+    expect(
+      Object.isFrozen(materialize(unavailableState).unavailableR2Jurisdictions),
+    ).toBe(true);
+  });
+
   it('creates the six inventory tables, verifies every column, and fails closed on drift', async () => {
     const db = new MemoryD1();
     await newStore(db).latestFinalizedGeneration();

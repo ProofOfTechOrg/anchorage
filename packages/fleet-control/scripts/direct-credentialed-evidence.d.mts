@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { PreparedDirectConformance } from './direct-credentialed-conformance-preflight.mjs';
+import type { DirectInvocationFailureDetail } from './direct-credentialed-invocation.mjs';
 import type {
   DirectRunSnapshot,
   DirectTeardownFailure,
@@ -33,6 +34,7 @@ export class DirectEvidenceWriteError extends Error {
 export function buildDirectEvidence(
   input: Readonly<{
     snapshot: DirectRunSnapshot;
+    invocationFailureDetail?: DirectInvocationFailureDetail;
     prepared: PreparedDirectConformance;
     mode: 'run' | 'resume';
     outcome: Readonly<{

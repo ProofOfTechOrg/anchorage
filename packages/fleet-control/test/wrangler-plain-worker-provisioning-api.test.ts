@@ -241,6 +241,39 @@ describe('WranglerPlainWorkerProvisioningApi parsing', () => {
     );
   });
 
+  it('accepts null errors and messages in Wrangler inventory envelopes', async () => {
+    const subject = await api(
+      new FakeRunner(async () => ({
+        stdout: JSON.stringify({
+          success: true,
+          errors: null,
+          messages: null,
+          result: [{ id: 'v1' }],
+        }),
+        stderr: '',
+      })),
+    );
+    await expect(subject.listVersions('worker')).resolves.toEqual([
+      { versionId: 'v1', tag: undefined },
+    ]);
+  });
+
+  it('refuses non-array non-null errors in Wrangler inventory envelopes', async () => {
+    const subject = await api(
+      new FakeRunner(async () => ({
+        stdout: JSON.stringify({
+          success: true,
+          errors: 'bad',
+          result: [{ id: 'v1' }],
+        }),
+        stderr: '',
+      })),
+    );
+    await expect(subject.listVersions('worker')).rejects.toThrow(
+      'failed inventory result',
+    );
+  });
+
   it('rejects invalid JSON with the operation name', async () => {
     const subject = await api(
       new FakeRunner(async () => ({ stdout: '{', stderr: '' })),
@@ -442,6 +475,16 @@ describe('WranglerPlainWorkerProvisioningApi parsing', () => {
     expect(
       assertSupportedPlainWorkerBindings(viewed.bindings, 'version'),
     ).toEqual([{ type: reconstructedBinding.type, name: binding.name }]);
+  });
+
+  it('refuses explicit null version bindings instead of reporting an empty binding list', async () => {
+    const subject = await api(
+      new FakeRunner(async () => ({
+        stdout: JSON.stringify({ resources: { bindings: null } }),
+        stderr: '',
+      })),
+    );
+    await expect(subject.viewVersion('worker', 'version')).rejects.toThrow();
   });
 
   it('reconstructs the exact unsupported provider wire objects', () => {

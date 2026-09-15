@@ -335,7 +335,8 @@ function normalizeProviderCursor(value: unknown): string | undefined {
 }
 
 function nextCursorFrom(payload: Record<string, unknown>): string | undefined {
-  if (!Object.hasOwn(payload, 'result_info')) return undefined;
+  if (!Object.hasOwn(payload, 'result_info') || payload.result_info === null)
+    return undefined;
   const resultInfo = plainRecord(payload.result_info);
   if (!resultInfo) {
     throw new Error(
@@ -375,6 +376,13 @@ export async function listDispatchScriptPage(
   const record = plainRecord(payload);
   if (!record || !Object.hasOwn(record, 'result')) {
     throw new Error('Cloudflare dispatch script listing was malformed');
+  }
+  if (record.success !== true) {
+    throw new Error('Cloudflare dispatch script listing reported failure');
+  }
+  const errors = record.errors ?? undefined;
+  if (errors !== undefined && (!Array.isArray(errors) || errors.length !== 0)) {
+    throw new Error('Cloudflare dispatch script listing returned errors');
   }
   if (!Array.isArray(record.result)) {
     throw new Error('Cloudflare dispatch script listing had no result array');

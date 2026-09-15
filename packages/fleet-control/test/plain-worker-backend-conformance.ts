@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { createHash } from 'node:crypto';
-import { describe, expect, it } from 'vitest';
+import { APIConnectionError } from 'cloudflare';
+import { describe, expect, it, vi } from 'vitest';
 import { ActiveRouteAttestationError } from '../src/active-route.js';
+import { CloudflareApiPlainWorkerBackend } from '../src/cloudflare-api-plain-worker-backend.js';
 import { migrateFleet } from '../src/fleet.js';
-import { plainWorkerIngressModule } from '../src/plain-worker-backend.js';
+import {
+  PlainWorkerBackend,
+  plainWorkerIngressModule,
+} from '../src/plain-worker-backend.js';
 import {
   decommissionDeployment,
   forceDecommissionDeployment,
@@ -17,6 +22,11 @@ import {
   effectiveLifecyclePhase,
   type FleetRecord,
 } from '../src/types.js';
+import { WranglerPlainWorkerProvisioningApi } from '../src/wrangler-plain-worker-provisioning-api.js';
+import {
+  recordingFetch,
+  restProjection,
+} from './fixtures/cloudflare-fetch-fixture.js';
 import {
   buildPlainWorkerSpec,
   captureFailure,
@@ -26,6 +36,7 @@ import {
   initialSpec,
   migrationSpec,
   type PlainWorkerHarness,
+  plainOnlyClient,
   routeAttestation,
   seedWorkerFromSpec,
   sharedSecrets,
@@ -34,6 +45,7 @@ import type {
   ProviderDatabase,
   ProviderWorld,
 } from './fixtures/provider-world.js';
+import { cliProjection } from './fixtures/wrangler-world-projection.js';
 
 const ownedFence = {
   mutationLeaseTtlMs: 15 * 60_000,
@@ -389,28 +401,39 @@ export function describePlainWorkerConformance(
       const targetSpec = migrationSpec();
       const initial = await provisionReady(harness, currentSpec);
       harness.world.mutationLog.length = 0;
-      harness.world.afterNext('ensureMaintenance', (world) => {
-        alterFleetDigest(world, targetSpec.scriptName, 'f'.repeat(64));
+      const maintenanceRequested = new Promise<void>((resolve) => {
+        harness.world.afterNext('ensureMaintenance', (world) => {
+          alterFleetDigest(world, targetSpec.scriptName, 'f'.repeat(64));
+          vi.useFakeTimers();
+          resolve();
+        });
       });
 
-      const failure = await captureFailure(
-        migrate(harness, initial.record, targetSpec),
-      );
+      try {
+        const pending = captureFailure(
+          migrate(harness, initial.record, targetSpec),
+        );
 
-      expect(errorChain(failure)).toContain(
-        'maintenance response did not attest fleet specification',
-      );
-      const script = harness.world.scripts.get(targetSpec.scriptName);
-      expect(script?.deployment).toEqual([
-        { versionId: initial.record.artifactVersion, percentage: 100 },
-        { versionId: expect.any(String), percentage: 0 },
-      ]);
-      expect(harness.world.mutationLog).toContain(
-        `deploy-candidate:${targetSpec.scriptName}`,
-      );
-      expect(harness.world.mutationLog).not.toContain(
-        `deploy:${targetSpec.scriptName}`,
-      );
+        await maintenanceRequested;
+        await vi.advanceTimersByTimeAsync(60_000);
+        const failure = await pending;
+        expect(errorChain(failure)).toContain(
+          'maintenance response did not attest fleet specification',
+        );
+        const script = harness.world.scripts.get(targetSpec.scriptName);
+        expect(script?.deployment).toEqual([
+          { versionId: initial.record.artifactVersion, percentage: 100 },
+          { versionId: expect.any(String), percentage: 0 },
+        ]);
+        expect(harness.world.mutationLog).toContain(
+          `deploy-candidate:${targetSpec.scriptName}`,
+        );
+        expect(harness.world.mutationLog).not.toContain(
+          `deploy:${targetSpec.scriptName}`,
+        );
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('4. attests one active route and refuses absent or malformed routed digests', async () => {
@@ -759,7 +782,7 @@ export function describePlainWorkerConformance(
       );
     });
 
-    it('11. reconciles committed mutations and refuses requests that never commit', async () => {
+    it('11. reconciles committed mutations, retries a transport failure that never dispatched, and refuses one that persists', async () => {
       const spec = buildPlainWorkerSpec();
 
       const databaseCreate = makeHarness();
@@ -785,63 +808,146 @@ export function describePlainWorkerConformance(
         1,
       );
 
-      const rejectedUpload = makeHarness();
-      rejectedUpload.world.failNext('uploadCandidate', {
-        dispatched: false,
-        error: new Error('injected upload sentinel 0001'),
-      });
-      const uploadRejection = await captureFailure(
-        provisionReady(rejectedUpload, spec),
-      );
-      const rejectedScript = rejectedUpload.world.scripts.get(spec.scriptName);
-      expect(errorChain(uploadRejection)).toContain(
-        'injected upload sentinel 0001',
-      );
-      expect(rejectedScript).toBeUndefined();
-      expect(
-        rejectedUpload.world.mutationLog.some((entry) =>
-          entry.startsWith(`upload:${spec.scriptName}`),
-        ),
-      ).toBe(false);
+      function retryHarness() {
+        const harness = makeHarness();
+        const projected = recordingFetch(restProjection(harness.world));
+        const client = plainOnlyClient(projected, harness.exportStore);
+        const wait = vi.fn(async (_ms: number) => {});
+        const backend = harness.exportDirectory
+          ? new PlainWorkerBackend({
+              api: new WranglerPlainWorkerProvisioningApi({
+                runner: cliProjection(harness.world),
+                routeApi: client,
+                exportDirectory: harness.exportDirectory,
+                exportStore: harness.exportStore,
+              }),
+              identityCaller: 'PlainWorkerBackend.conformance',
+              fetch: projected.fetch,
+              wait,
+            })
+          : new CloudflareApiPlainWorkerBackend({
+              client,
+              fetch: projected.fetch,
+              wait,
+            });
+        const upload = vi.spyOn(harness.world, 'consumeFailure');
+        return {
+          ...harness,
+          backend,
+          wait,
+          uploadAttempts: () =>
+            harness.exportDirectory
+              ? upload.mock.calls.filter(
+                  ([operation]) => operation === 'uploadCandidate',
+                ).length
+              : projected.requests.filter(({ method, url }) => {
+                  const pathname = new URL(url).pathname;
+                  return (
+                    (method === 'PUT' &&
+                      pathname.endsWith(`/scripts/${spec.scriptName}`)) ||
+                    (method === 'POST' &&
+                      pathname.endsWith(`/scripts/${spec.scriptName}/versions`))
+                  );
+                }).length,
+          transportError: (message: string) => {
+            const error = new Error(message);
+            return harness.exportDirectory
+              ? new APIConnectionError({ cause: error })
+              : error;
+          },
+        };
+      }
 
-      const stagedUpload = makeHarness();
-      const stagedReady = await provisionReady(stagedUpload, initialSpec());
-      const stagedTarget = migrationSpec();
-      const database = stagedUpload.world.databases.find(
-        ({ databaseId }) => databaseId === stagedReady.record.databaseId,
-      );
-      if (!database) throw new Error('ready database disappeared');
-      stagedUpload.world.failNext('uploadCandidate', {
-        dispatched: false,
-        error: new Error('injected staged upload sentinel 0001'),
-      });
-      stagedUpload.world.mutationLog.length = 0;
+      for (const staged of [false, true]) {
+        for (const times of [1, 3]) {
+          const harness = retryHarness();
+          const target = staged ? migrationSpec() : spec;
+          const initial = staged
+            ? await provisionReady(harness, initialSpec())
+            : undefined;
+          const priorVersions =
+            harness.world.scripts
+              .get(target.scriptName)
+              ?.versions.map(({ versionId }) => versionId) ?? [];
+          const priorAttempts = harness.uploadAttempts();
+          const sentinel = staged
+            ? 'injected staged upload sentinel 0001'
+            : 'injected upload sentinel 0001';
+          harness.world.mutationLog.length = 0;
+          harness.world.failNext('uploadCandidate', {
+            dispatched: false,
+            times,
+            error: harness.transportError(sentinel),
+          });
+          const invoke = () =>
+            initial
+              ? migrate(harness, initial.record, target).then(([record]) => ({
+                  record,
+                }))
+              : provisionReady(harness, target);
 
-      const stagedRejection = await captureFailure(
-        stagedUpload.backend.deployWorker(
-          stagedTarget,
-          databaseReference(database),
-          sharedSecrets,
-          undefined,
-          ownedFence,
-          undefined,
-        ),
-      );
-
-      expect(errorChain(stagedRejection)).toContain(
-        'injected staged upload sentinel 0001',
-      );
-      expect(errorChain(stagedRejection)).toContain(
-        `failed to update existing Worker '${stagedTarget.scriptName}'`,
-      );
-      expect(
-        stagedUpload.world.scripts.get(stagedTarget.scriptName)?.versions,
-      ).toHaveLength(1);
-      expect(
-        stagedUpload.world.mutationLog.some((entry) =>
-          entry.startsWith('upload:'),
-        ),
-      ).toBe(false);
+          if (times === 1) {
+            const result = await invoke();
+            expect(result.record?.phase).toBe('ready');
+            expect(harness.uploadAttempts() - priorAttempts).toBe(2);
+            expect(harness.wait.mock.calls).toEqual([[2_000]]);
+            const versions = harness.world.scripts.get(
+              target.scriptName,
+            )?.versions;
+            expect(versions).toHaveLength(priorVersions.length + 1);
+            expect(
+              versions?.filter(
+                ({ versionId }) => !priorVersions.includes(versionId),
+              ),
+            ).toHaveLength(1);
+            expect(
+              harness.world.mutationLog.filter((entry) =>
+                entry.startsWith('upload:'),
+              ),
+            ).toEqual([`upload:${target.scriptName}`]);
+          } else {
+            const database =
+              initial &&
+              harness.world.databases.find(
+                ({ databaseId }) => databaseId === initial.record.databaseId,
+              );
+            const rejection = await captureFailure(
+              database
+                ? harness.backend.deployWorker(
+                    target,
+                    databaseReference(database),
+                    sharedSecrets,
+                    undefined,
+                    ownedFence,
+                    undefined,
+                  )
+                : invoke(),
+            );
+            expect(errorChain(rejection)).toContain(sentinel);
+            if (staged) {
+              expect(errorChain(rejection)).toContain(
+                `failed to update existing Worker '${target.scriptName}'`,
+              );
+              expect(
+                harness.world.scripts
+                  .get(target.scriptName)
+                  ?.versions.map(({ versionId }) => versionId),
+              ).toEqual(priorVersions);
+            } else {
+              expect(
+                harness.world.scripts.get(target.scriptName),
+              ).toBeUndefined();
+            }
+            expect(harness.uploadAttempts() - priorAttempts).toBe(3);
+            expect(harness.wait.mock.calls).toEqual([[2_000], [4_000]]);
+            expect(
+              harness.world.mutationLog.filter((entry) =>
+                entry.startsWith('upload:'),
+              ),
+            ).toEqual([]);
+          }
+        }
+      }
 
       for (const operation of ['deployCandidate', 'promoteWorker']) {
         const deployment = makeHarness();

@@ -269,6 +269,8 @@ export async function runDirectConformance(input) {
   let inspection;
   let outcome = { status: 'failed', exitCode: 1, teardownCall: null };
   let code;
+  let detail;
+  let invocationFailureDetail;
   let evidencePath = null;
   let summary;
   try {
@@ -334,6 +336,11 @@ export async function runDirectConformance(input) {
             ...networkInput,
             invocation,
           });
+          if (
+            scenario.status === 'failed' &&
+            scenario.reason === 'outcome-unknown'
+          )
+            invocationFailureDetail = scenario.detail;
           restart = scenario.status === 'restart-required';
         }
         if (restart) {
@@ -375,6 +382,8 @@ export async function runDirectConformance(input) {
         : error instanceof DirectBootstrapError
           ? new DirectBootstrapError(error.code).code
           : 'internal-error';
+    if (error instanceof DirectBootstrapError)
+      detail = new DirectBootstrapError(error.code, error.detail).detail;
     outcome = { status: 'failed', exitCode: 1, teardownCall: null };
   } finally {
     const handle = journal ?? inspection;
@@ -384,6 +393,7 @@ export async function runDirectConformance(input) {
         const snapshot = journal ? journal.snapshot() : inspection.snapshot;
         const evidence = buildDirectEvidence({
           snapshot,
+          invocationFailureDetail,
           prepared,
           mode: input.mode,
           outcome,
@@ -394,6 +404,7 @@ export async function runDirectConformance(input) {
           status: evidence.status,
           exitCode: evidence.exitCode,
           ...(code ? { code } : {}),
+          ...(detail ? { detail } : {}),
           resourcePrefix: evidence.resourcePrefix,
           resumeCount: evidence.resumeCount,
           scenario: evidence.scenario
