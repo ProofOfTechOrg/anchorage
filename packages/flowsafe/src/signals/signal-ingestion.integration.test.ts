@@ -977,6 +977,129 @@ describe('notification dispatch — lost response after the thread DO handler', 
   });
 });
 
+describe('notification dispatch — ownerless target', () => {
+  it('discards a notification whose thread became ownerless after it was created: each dispatch attempt fails with 404 until delivery-attempts-exhausted', async () => {
+    let now = new Date('2026-07-20T12:00:00.000Z');
+    const storage = new D1NotificationsStorage(
+      sqliteUnitDatabase(openSqlite()) as SignalDatabase,
+    );
+    const storeFactory = new InMemoryApprovalStoreFactory();
+    const context = createPrincipalActorContext({
+      principal: trustAutomationPrincipal({
+        kind: 'system',
+        id: 'notification-maintenance',
+        purpose: 'notification.dispatch',
+      }),
+      storeFactory,
+      buildService: () => {
+        throw new Error('approval service is not used in notification tests');
+      },
+    });
+    await context.claimResource('thread', THREAD_ID);
+    const ownership = storeFactory.resources();
+    const { agent, sendSignal, targets } = reserveAgent();
+    const exchanges: NonNullable<TestEnv['exchanges']> = [];
+    const namespace = threadNamespace({
+      agent,
+      ownership,
+      exchanges,
+      resolveNotificationsStorage: () => storage,
+    });
+    namespace.get(namespace.idFromName(THREAD_ID));
+    const record = await storage.createNotification({
+      id: 'ownerless',
+      threadId: THREAD_ID,
+      resourceId: resourceIdFromKey('itest'),
+      agentId: agent.id,
+      source: 'provider',
+      kind: 'changed',
+      summary: 'ownerless input',
+      priority: 'urgent',
+      deliverAt: new Date(now.getTime() - 1),
+    });
+    expect(await ownership.owner('thread', THREAD_ID)).toEqual(
+      context.resourceOwner,
+    );
+    expect(
+      await ownership.release('thread', THREAD_ID, context.resourceOwner),
+    ).toBe(true);
+    expect(await ownership.owner('thread', THREAD_ID)).toBeUndefined();
+
+    const conditional = vi.spyOn(
+      storage,
+      'updateNotificationDeliveryIfUnchanged',
+    );
+    const tick = createNotificationDispatchTick({
+      storage,
+      topology: createThreadTopology(namespace),
+      resolveContext: () => context,
+      executionFence: 'none',
+      maxDeliveryAttempts: 2,
+      now: () => now,
+    });
+    expect(await tick()).toEqual({ due: 1, delivered: 0, failed: 1 });
+    const deferred = await storage.getNotification(record);
+    expect(deferred).toMatchObject({
+      status: 'pending',
+      deliveryAttempts: 1,
+      lastDeliveryAttemptAt: now,
+      lastDeliveryError: 'thread notification dispatch returned 404',
+    });
+    assert(deferred?.deliverAt);
+    expect(deferred.deliverAt.getTime()).toBeGreaterThan(now.getTime());
+    expect(sendSignal).not.toHaveBeenCalled();
+    expect(targets).toEqual([]);
+
+    now = deferred.deliverAt;
+    expect(await tick()).toEqual({
+      due: 1,
+      delivered: 0,
+      failed: 0,
+      discarded: 1,
+    });
+    const terminal = await storage.getNotification(record);
+    expect(terminal).toMatchObject({
+      status: 'discarded',
+      deliveryReason: 'delivery-attempts-exhausted',
+      deliveryAttempts: 2,
+      lastDeliveryAttemptAt: now,
+      lastDeliveryError: 'thread notification dispatch returned 404',
+      discardedAt: expect.any(Date),
+      deliverAt: undefined,
+      summaryAt: undefined,
+      deliveredSignalId: undefined,
+    });
+    expect(conditional.mock.calls.map(([input]) => input.failure)).toEqual([
+      expect.objectContaining({
+        type: 'retry',
+        deliveryAttempts: 1,
+        lastDeliveryError: 'thread notification dispatch returned 404',
+      }),
+      expect.objectContaining({
+        type: 'discard',
+        deliveryAttempts: 2,
+        lastDeliveryError: 'thread notification dispatch returned 404',
+      }),
+    ]);
+    expect(exchanges).toHaveLength(2);
+    for (const exchange of exchanges) {
+      expect(new URL(exchange.request.url).pathname).toBe(
+        '/signal/notifications/dispatch',
+      );
+      expect(exchange.response?.status).toBe(404);
+      expect(await exchange.response?.clone().text()).toBe(
+        'private thread ownership refusal',
+      );
+    }
+    expect(await tick()).toEqual({ due: 0, delivered: 0, failed: 0 });
+    expect(await storage.getNotification(record)).toEqual(terminal);
+    expect(conditional).toHaveBeenCalledTimes(2);
+    expect(exchanges).toHaveLength(2);
+    expect(sendSignal).not.toHaveBeenCalled();
+    expect(targets).toEqual([]);
+  });
+});
+
 describe('notification dispatch — chronological due window', () => {
   it.each([
     'deliverAt',

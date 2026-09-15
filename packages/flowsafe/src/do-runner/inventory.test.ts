@@ -162,10 +162,7 @@ interface Fixture {
   inventory: DeploymentInventory;
 }
 
-/**
- * A deployment with every table created by its real owner, and one outstanding
- * item in each work category plus one row in each standing category.
- */
+/** A deployment with tables created by their production storage domains. */
 async function seeded(): Promise<Fixture> {
   const sqlite = openSqlite();
   const binding = sqliteUnitDatabase(sqlite);
@@ -430,12 +427,12 @@ describe('deployment drain inventory', () => {
     expect(INVENTORY_DRAIN_PROOF.proof).toContain(recoveryCadence);
   });
 
-  it('reads each work category with the predicate its production writer settles on', async () => {
-    // #given — one outstanding item per category beside settled siblings that
-    // must NOT be reported: a decided approval, a spent reservation, a
-    // completed background task, a delivered notification, settled fire
-    // history, and a released ownership row.
-    const { inventory } = await seeded();
+  it('reads outstanding work including pending notifications due or not yet due', async () => {
+    const { inventory, sqlite } = await seeded();
+    const summaryAt = new Date(NOW + 7_200_000).toISOString();
+    sqlite
+      .prepare('UPDATE mastra_notifications SET summaryAt = ? WHERE id = ?')
+      .run(summaryAt, 'ntf-later');
 
     // #when / #then — runs: the suspended run, annotated with its owner.
     const runs = await inventory.read('runs');
@@ -472,15 +469,14 @@ describe('deployment drain inventory', () => {
       ),
     ).toEqual([['trg-deferred']]);
 
-    // #then — notifications: only the DUE pending row is drainable work; the
-    // future-dated and the never-due rows are reported as a total instead.
     const notifications = await inventory.read('pending-notifications');
     expect(notifications.entries.map((entry) => entry.key)).toEqual([
       ['thr-1', 'ntf-due'],
+      ['thr-1', 'ntf-later'],
+      ['thr-1', 'ntf-never'],
     ]);
-    // `count` is this category's own rows (the DUE one); `notDue` describes
-    // the pending rows the page deliberately excludes.
-    expect(notifications.count).toBe(1);
+    expect(notifications.entries[1]?.detail.summaryAt).toBe(summaryAt);
+    expect(notifications.count).toBe(3);
     expect(notifications.totals).toEqual({ notDue: 2 });
 
     // #then — background tasks: nonterminal only, and the fence-parked one is
@@ -527,7 +523,7 @@ describe('deployment drain inventory', () => {
       futureOffset: '-000100-01-01T07:00:00-06:00',
       equalOffset: '-000100-01-01T16:00:00+0400',
     },
-  ])('matches notification due reads and Date chronology for $name inventory', async ({
+  ])('enumerates pending notifications and counts notDue by Date chronology for $name inventory', async ({
     now,
     dueOffset,
     futureOffset,
@@ -598,23 +594,90 @@ describe('deployment drain inventory', () => {
       now: () => instant,
     });
     const first = await inventory.read('pending-notifications', { limit: 1 });
-    expect(first.entries.map((entry) => entry.key[1])).toEqual(
-      expected.slice(0, 1),
-    );
-    expect(first.count).toBe(expected.length);
-    expect(first.totals).toEqual({
-      notDue:
-        rows.filter((row) => row.status !== 'delivered').length -
-        expected.length,
-    });
+    expect(first.entries.map((entry) => entry.key[1])).toEqual([
+      'a-expanded-future',
+    ]);
+    expect(first.count).toBe(8);
+    expect(first.totals).toEqual({ notDue: 3 });
     expect(await drain(inventory, 'pending-notifications', 1)).toEqual(
-      expected.map((id) => JSON.stringify(['thread', id])),
+      [
+        'a-expanded-future',
+        'b-ordinary-due',
+        'c-offset-due',
+        'd-offset-future',
+        'e-summary-due',
+        'f-never',
+        'g-equal',
+        'h-negative-past',
+      ].map((id) => JSON.stringify(['thread', id])),
     );
     const dueNotifications = await notifications.listDueNotifications({
       now: new Date(instant),
       limit: rows.length,
     });
     expect(dueNotifications.map((row) => row.id).sort()).toEqual(expected);
+  });
+
+  it('enumerates a pending notification that is not yet due beside the due ones', async () => {
+    const { inventory } = await seeded();
+    const first = await inventory.read('pending-notifications', { limit: 1 });
+    expect(first.entries.map((entry) => entry.key)).toEqual([
+      ['thr-1', 'ntf-due'],
+    ]);
+    expect(first.count).toBe(3);
+    expect(first.totals).toEqual({ notDue: 2 });
+    expect(first.cursor).toBeDefined();
+    const second = await inventory.read('pending-notifications', {
+      cursor: first.cursor,
+      limit: 1,
+    });
+    expect(second.entries).toEqual([
+      {
+        key: ['thr-1', 'ntf-later'],
+        detail: expect.objectContaining({
+          deliverAt: new Date(NOW + 3_600_000).toISOString(),
+        }),
+      },
+    ]);
+    expect(second.count).toBeUndefined();
+    expect(second.totals).toBeUndefined();
+  });
+
+  it('enumerates a pending notification carrying neither deliverAt nor summaryAt and counts it as notDue', async () => {
+    const { inventory, sqlite } = await seeded();
+    sqlite.exec("DELETE FROM mastra_notifications WHERE id <> 'ntf-never'");
+    const page = await inventory.read('pending-notifications');
+    expect(page.entries).toEqual([
+      {
+        key: ['thr-1', 'ntf-never'],
+        detail: {
+          source: 'src',
+          kind: 'kind',
+          priority: 'medium',
+          agentId: 'agent',
+        },
+      },
+    ]);
+    expect(page.count).toBe(1);
+    expect(page.totals).toEqual({ notDue: 1 });
+    expect(page.cursor).toBeUndefined();
+  });
+
+  it('keeps a sweep non-empty while only a not-yet-due notification is pending', async () => {
+    const { inventory, sqlite } = await seeded();
+    sqlite.exec("DELETE FROM mastra_notifications WHERE id <> 'ntf-later'");
+    const pages = await inventory.sweep();
+    const notifications = pages.find(
+      (page) => page.category === 'pending-notifications',
+    );
+    expect(notifications).toMatchObject({
+      class: 'work',
+      entries: [{ key: ['thr-1', 'ntf-later'] }],
+      count: 1,
+      totals: { notDue: 1 },
+    });
+    expect(notifications?.entries).toHaveLength(1);
+    expect(notifications?.cursor).toBeUndefined();
   });
 
   it('reports standing configuration without asking a drain to empty it', async () => {

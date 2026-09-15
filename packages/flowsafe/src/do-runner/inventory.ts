@@ -4,11 +4,9 @@
 //
 // WHY it exists. The fence (execution-fence.ts) can stop a deployment minting
 // work, but stopping is not finishing. A migration only becomes safe at the
-// moment nobody can point at a run, an approval, a queued task, or a due
-// dispatch that this deployment still owes. Before this module the only way to
-// answer that was to name the tables you happened to remember and count them by
-// hand — an answer whose failure mode is silence: a table nobody thought of
-// holds a suspended run, the migration proceeds, and two deployments resume it.
+// moment nobody can point at a run, an approval, a queued task, or a pending
+// dispatch that this deployment still owes. A pending notification remains
+// work even when its dispatch time has not arrived.
 //
 // THE TAXONOMY IS THE CONTRACT, and completeness is the product. What is sold
 // here is not a set of queries; it is the claim that these queries are ALL of
@@ -24,7 +22,7 @@
 //
 // TWO CLASSES, because a drain proof defined over everything can never pass.
 // `work` is what must reach empty: runs, approvals awaiting a decision, queued
-// tasks, due dispatches, unsettled reservations. `standing` is configuration
+// tasks, pending dispatches, unsettled reservations. `standing` is configuration
 // that ARMS future work — schedules, provider subscriptions — and by design it
 // never empties; a deployment with three cron schedules is drainable, and
 // demanding otherwise would make the proof unreachable rather than strict.
@@ -45,13 +43,11 @@
 // `listTriggers`. None of them is usable here, and not for style reasons: each
 // either initializes schema on the way in, or advances a cursor, or reaches a
 // Durable Object that would wake and re-arm an alarm. An inventory built on
-// them would perturb the very deployment it is measuring. So the queries below
-// are new and pure, and each one's predicate is derived from the production
-// reader or purge that owns the same notion — the terminal-run SQL is literally
-// the retention purge's fragment, the due-notification predicate is
-// `listDueNotifications`'s, the deferred-dispatch predicate is the schedule
-// store's own dispatch guard — so "finished" cannot come to mean one thing to
-// the code that acts and another to the code that certifies.
+// them would perturb the deployment it is measuring. The inventory uses the
+// retention purge's terminal-run fragment and the schedule store's deferred
+// dispatch guard. Pending notifications remain work even when the production
+// due scan does not select them; its predicate determines `notDue` within the
+// pending category.
 
 import {
   DEPLOYMENT_SENTINEL_TABLE,
@@ -185,7 +181,8 @@ export interface InventoryPage {
    * Category-specific totals taken with `count`, in the same read: the numbers
    * that answer an operator's next question without a second sweep. See
    * `background-tasks` (`fenceSuspended`) and `pending-notifications`
-   * (`notDue`).
+   * (`notDue`, the enumerated pending rows not yet due, including rows with
+   * neither delivery timestamp).
    */
   readonly totals?: Readonly<Record<string, number>>;
 }
@@ -500,8 +497,7 @@ export const INVENTORY_CATEGORY_DESCRIPTORS: readonly InventoryCategoryDescripto
       category: 'pending-notifications',
       class: 'work',
       table: NOTIFICATIONS_TABLE,
-      holds:
-        'an agent-inbox notification that is pending and already due for dispatch',
+      holds: 'a pending agent-inbox notification, due or not yet due',
     },
     {
       category: 'background-tasks',
@@ -586,34 +582,12 @@ interface CategoryQuery {
   readonly binds: readonly unknown[];
   /**
    * Extra `SUM(...) AS alias` aggregates taken with the count on the first
-   * page. Their predicate is the category's own, so a total here is always a
-   * partition of `count` unless its doc says otherwise.
+   * page over the category's predicate. `notDue` counts enumerated pending
+   * notifications that the dispatch due scan does not select.
    */
   readonly totals?: readonly string[];
   /** Bindings the `totals` expressions need, in order. */
   readonly totalsBinds?: readonly unknown[];
-  /**
-   * A WIDER predicate for the aggregate pass, when a category's totals must
-   * describe rows the page deliberately excludes — `pending-notifications`
-   * pages only what is DUE, but "how many are pending and not due yet" is the
-   * question an operator asks next and no amount of paging answers it.
-   *
-   * Widening the aggregate does NOT widen `count`: a category that sets this
-   * must also set `countExpression`, so `count` still means "rows in this
-   * category" everywhere. A count that meant one thing for eight categories
-   * and something larger for the ninth is a number an operator would read
-   * wrong exactly once.
-   */
-  readonly countWhere?: string;
-  /**
-   * How `count` is computed when `countWhere` is wider than `where` — a
-   * conditional SUM that re-applies the category's own predicate.
-   */
-  readonly countExpression?: string;
-  /** Bindings for `countExpression`, in order. */
-  readonly countExpressionBinds?: readonly unknown[];
-  /** Bindings for `countWhere`, when it differs. */
-  readonly countBinds?: readonly unknown[];
   /**
    * A second, strictly optional read that decorates the page. Used for the run
    * owner annotation, whose table is a different feature's and may not exist —
@@ -985,21 +959,13 @@ export class DeploymentInventory {
     query: CategoryQuery,
   ): Promise<Pick<InventoryPage, 'count' | 'totals'> | undefined> {
     const extra = query.totals ?? [];
-    // `count` is always "rows in this category", even when the aggregate scans
-    // wider: a category that widens `countWhere` re-applies its own predicate
-    // through `countExpression`.
-    const total = query.countExpression ?? 'COUNT(*)';
     const { results } = await this.#db
       .prepare(
-        `SELECT ${total} AS total${extra.length === 0 ? '' : `, ${extra.join(', ')}`}
+        `SELECT COUNT(*) AS total${extra.length === 0 ? '' : `, ${extra.join(', ')}`}
          FROM ${table}
-         WHERE ${query.countWhere ?? query.where}`,
+         WHERE ${query.where}`,
       )
-      .bind(
-        ...(query.countExpressionBinds ?? []),
-        ...(query.totalsBinds ?? []),
-        ...(query.countBinds ?? query.binds),
-      )
+      .bind(...(query.totalsBinds ?? []), ...query.binds)
       .all<RawRow>();
     const row = results[0];
     if (row === undefined) return undefined;
@@ -1063,26 +1029,22 @@ export class DeploymentInventory {
         };
       case 'pending-notifications': {
         const now = notificationTimestampMillis(new Date(this.#now()));
-        // listDueNotifications' predicate, verbatim in meaning: pending AND
-        // (deliverAt or summaryAt has come due). A pending row that is not yet
-        // due stays out of the page and is reported as `notDue` instead; that
-        // total also covers pending rows carrying NEITHER timestamp, which no
-        // dispatch pass will ever select. A due row the dispatcher cannot read
-        // is in the page on every pass and leaves it only when a writer
-        // repairs or deletes it.
+        // Future dispatch is still an outstanding obligation. Rows with
+        // neither timestamp also keep the drain open: dispatch cannot select
+        // them and retention does not remove pending notifications.
         const due = DUE_NOTIFICATION_SQL;
         return {
           key: ['thread_id', 'id'],
-          detail: ['source', 'kind', 'priority', 'agentId', 'deliverAt'],
-          where: due,
-          binds: [now, now],
-          // The aggregate scans every PENDING row so `notDue` can exist at
-          // all — but `count` re-applies the due predicate, so it still means
-          // what it means in every other category: rows in this one.
-          countWhere: "status = 'pending'",
-          countBinds: [],
-          countExpression: `SUM(CASE WHEN ${due} THEN 1 ELSE 0 END)`,
-          countExpressionBinds: [now, now],
+          detail: [
+            'source',
+            'kind',
+            'priority',
+            'agentId',
+            'deliverAt',
+            'summaryAt',
+          ],
+          where: "status = 'pending'",
+          binds: [],
           totals: [`SUM(CASE WHEN ${due} THEN 0 ELSE 1 END) AS notDue`],
           totalsBinds: [now, now],
         };

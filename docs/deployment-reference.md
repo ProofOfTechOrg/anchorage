@@ -179,7 +179,7 @@ Additive proof-identity columns preserve an active fence's epoch, revision, rece
 
 Runtime, approval and signal proof gates compare the complete stored generation. The [identity-data helpers](do-runner-design.md#validate-execution-identity-data) validate representations without changing caller authority; an admin reading or validated identity alone cannot authorize execution or establish owning quiescence.
 
-`GET /admin/inventory` returns the category index. Add `?category=<category>&cursor=<cursor>&limit=<limit>` to page one category. Prove a drain only from `draining`: sweep every work category to empty twice, at least 60 seconds apart. Standing categories remain present by design, and persisted idle signals deliberately carry across the migration.
+`GET /admin/inventory` returns the category index. Add `?category=<category>&cursor=<cursor>&limit=<limit>` to page one category. Prove a drain only from `draining`: sweep every work category to empty twice, at least 60 seconds apart. A pending agent-inbox notification scheduled for later, or carrying no due timestamp, is work and keeps the proof open. Standing categories remain present by design, and persisted idle signals deliberately carry across the migration.
 
 ### Configure the trusted caller epoch
 
