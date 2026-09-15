@@ -22,6 +22,8 @@ import {
   captureConnectorDenialMetadata,
   captureConnectorEvaluatorMetadata,
   connectorErrorDecision,
+  isInstanceOf,
+  readProperty,
 } from '../connector-decision.js';
 import type {
   NetworkEgressOptions,
@@ -1279,13 +1281,16 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     error: unknown,
     detail: Record<string, unknown> = {},
   ): void {
-    if (error instanceof OutputValidationFailure) return;
+    if (isInstanceOf(error, OutputValidationFailure)) return;
     // This connector's own policy denials (e.g. the rate-limit gate inside
     // a keyed attempt) were already audited by deny(); a second 'execute
     // threw' record would misattribute them to the connector's code. A
     // NESTED connector's denial still records here — that composite call
     // did fail in execute.
-    if (error instanceof ConnectorPolicyError && error.connector === id) {
+    if (
+      isInstanceOf(error, ConnectorPolicyError) &&
+      readProperty(error, 'connector') === id
+    ) {
       return;
     }
     if (
@@ -1346,7 +1351,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
       }
       return validation.value;
     } catch (error) {
-      if (error instanceof OutputValidationFailure) throw error;
+      if (isInstanceOf(error, OutputValidationFailure)) throw error;
       throw new OutputValidationFailure('exception', error);
     }
   }
@@ -1643,7 +1648,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
           dryRun: true,
         });
       } catch (error) {
-        if (error instanceof OutputValidationFailure) {
+        if (isInstanceOf(error, OutputValidationFailure)) {
           recordOutputValidationError(requestContext, { dryRun: true });
           if (directInvocation) {
             directInvocation.validationPhase = 'output';
@@ -1872,7 +1877,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
                 // side effect, so keep the reservation pending instead of
                 // making an immediate retry duplicate it. This matches the
                 // fail-safe posture for a failed final put.
-                if (!(error instanceof OutputValidationFailure)) {
+                if (!isInstanceOf(error, OutputValidationFailure)) {
                   try {
                     await store.release(storageKey, token);
                   } catch (releaseError) {
@@ -1933,7 +1938,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
           return { kind: 'attempt', attempt };
         });
       } catch (error) {
-        if (error instanceof OutputValidationFailure) {
+        if (isInstanceOf(error, OutputValidationFailure)) {
           recordOutputValidationError(requestContext, {
             idempotencyKey: key,
           });
@@ -1952,7 +1957,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
       const result = await config.execute(typedInput, context, runtime);
       return finishAllowed(requestContext, validateOutput(result));
     } catch (error) {
-      if (error instanceof OutputValidationFailure) {
+      if (isInstanceOf(error, OutputValidationFailure)) {
         recordOutputValidationError(requestContext);
         if (directInvocation) {
           directInvocation.validationPhase = 'output';

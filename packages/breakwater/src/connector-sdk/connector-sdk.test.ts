@@ -1430,6 +1430,76 @@ describe('invokeConnector', () => {
       applicationError,
     );
   });
+
+  it('rejects with the connector policy error when its connector property cannot be read', async () => {
+    const audit = new AuditLogger();
+    const id = 'direct.unreadable-connector';
+    const hostile = new Proxy(
+      new ConnectorPolicyError(id, 'custom-policy', 'application-owned denial'),
+      {
+        get(target, key, receiver) {
+          if (key === 'connector') throw new Error('trap');
+          return Reflect.get(target, key, receiver);
+        },
+      },
+    );
+    const tool = createConnector<unknown, unknown>({
+      id,
+      description:
+        'Throw a policy error whose connector property cannot be read',
+      execute: async () => {
+        throw hostile;
+      },
+      permissions: { sideEffect: 'read' },
+      policies: { audit },
+    });
+    const failure = await invokeConnector(tool, {}).catch(
+      (error: unknown) => error,
+    );
+    expect(failure).toBe(hostile);
+    expect(audit.events()).toEqual([
+      expect.objectContaining({
+        decision: 'error',
+        decisionCode: 'CONNECTOR_EXECUTION_FAILED',
+        detail: expect.objectContaining({ stage: 'execute' }),
+      }),
+    ]);
+  });
+
+  it('rejects with the connector value when its prototype chain cannot be read', async () => {
+    // #given
+    const audit = new AuditLogger();
+    const hostile = new Proxy(
+      { marker: 'unreadable-prototype' },
+      {
+        getPrototypeOf(): never {
+          throw new Error('prototype unreadable');
+        },
+      },
+    );
+    const tool = createConnector<unknown, unknown>({
+      id: 'direct.unreadable-prototype',
+      description: 'Throw a value whose prototype chain cannot be read',
+      execute: async () => {
+        throw hostile;
+      },
+      permissions: { sideEffect: 'read' },
+      policies: { audit },
+    });
+    // #when
+    const failure = await invokeConnector(tool, {}).catch(
+      (error: unknown) => error,
+    );
+    // #then
+    expect(failure).toBe(hostile);
+    expect(audit.events()).toEqual([
+      expect.objectContaining({
+        decision: 'error',
+        decisionCode: 'CONNECTOR_EXECUTION_FAILED',
+        detail: expect.objectContaining({ stage: 'execute' }),
+      }),
+    ]);
+  });
 });
 
 describe('network egress gate', () => {

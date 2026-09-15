@@ -348,6 +348,37 @@ export function connectorErrorDecision(
     : undefined;
 }
 
+/**
+ * `value instanceof ctor` for a value the caller does not own. The check walks
+ * the value's prototype chain, so a thrown value whose `getPrototypeOf` is a
+ * trap answers with a throw; a value that cannot say what it is, is not the
+ * constructor asked about.
+ *
+ * @internal
+ */
+export function isInstanceOf<T>(
+  value: unknown,
+  ctor: abstract new (...args: never[]) => T,
+): value is T {
+  try {
+    return value instanceof ctor;
+  } catch {
+    return false;
+  }
+}
+
+/** @internal */
+export function readProperty<T extends object, K extends keyof T>(
+  value: T,
+  key: K,
+): T[K] | undefined {
+  try {
+    return value[key];
+  } catch {
+    return undefined;
+  }
+}
+
 /** Policy refusal; diagnostic names do not determine machine classification. */
 export class ConnectorPolicyError extends Error {
   readonly kind = 'connector-policy';

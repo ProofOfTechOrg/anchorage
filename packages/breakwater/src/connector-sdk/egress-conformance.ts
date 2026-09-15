@@ -206,7 +206,7 @@ export class ConnectorConformanceError extends Error {
 }
 
 export const CONFORMANCE_LIMIT =
-  "conformance covers only the supplied cases, in this isolate, for the duration of each case: it does not prove every reachable network path, a captured fetch reference, a request through an entry point the subject redefines and restores inside a case, an uninstrumented transport, another isolate, work continuing outside a case lifetime, a call the connector makes on the supplied base transport for a host the manifest already declares, or, for a connector declaring no egress, a transport the factory supplied in place of the harness's. A case that times out ends the run, because its abandoned work would otherwise be attributed to a later case, and no further run is accepted in this isolate; that abandoned work then runs against the RESTORED global, so a request it issues after the case ends is neither trapped nor recorded and leaves the process. Entry-point targets you supply are your own test fixtures: each install is verified by its own descriptor, by an effective property read, and by the restore, against the mediations that verification names, and not against a target that adapts to those checks. Instrument globalThis.fetch alone for that guarantee.";
+  "conformance covers only the supplied cases, in this isolate, for the duration of each case: it does not prove every reachable network path, a captured fetch reference, a request through an entry point the subject redefines and restores inside a case, an uninstrumented transport, another isolate, work continuing outside a case lifetime, a call the connector makes on the supplied base transport for a host the manifest already declares, or, for a connector declaring no egress, a transport the factory supplied in place of the harness's. A case that times out ends the run, because its abandoned work would otherwise be attributed to a later case, and no further run is accepted in this isolate; that abandoned work then runs against the RESTORED global, so a request it issues after the case ends is neither trapped nor recorded and leaves the process. A request that work abandoned by any settled case issues on the supplied base transport for a host the manifest does not declare, or through a trap reference it captured during that case, is recorded as a run-level finding naming that case until the report is built, and is dropped after. Entry-point targets you supply are your own test fixtures: each install is verified by its own descriptor, by an effective property read, and by the restore, against the mediations that verification names, and not against a target that adapts to those checks. Instrument globalThis.fetch alone for that guarantee.";
 
 class ConformanceRefusal extends Error {}
 
@@ -589,6 +589,24 @@ function errorConstructorName(value: unknown): string {
   }
 }
 
+function classifyInvocationError(
+  value: unknown,
+): 'boundary' | 'policy' | 'refusal' | 'foreign' {
+  try {
+    if (
+      value instanceof ConnectorValidationError ||
+      value instanceof ConnectorInvocationError
+    ) {
+      return 'boundary';
+    }
+    if (value instanceof ConnectorPolicyError) return 'policy';
+    if (value instanceof ConformanceRefusal) return 'refusal';
+    return 'foreign';
+  } catch {
+    return 'foreign';
+  }
+}
+
 function invocationFailureReason(error: unknown): string {
   try {
     return `case invocation failed with ${error instanceof Error ? errorConstructorName(error) : describeValue(error)}`;
@@ -887,8 +905,10 @@ export function createConformanceAssertion(collaborators: {
     const cases: ConnectorConformanceCaseResult[] = [];
     const instrumented = new Set<string>();
     let posture: ConnectorEgressPosture | undefined;
+    let runClosed = false;
     try {
       const recordRun: RecordFinding = (finding) => {
+        if (runClosed) return;
         findings.push(finding);
       };
       const recordProbeEscape = (attempt: ConnectorConformanceEscape) => {
@@ -900,7 +920,10 @@ export function createConformanceAssertion(collaborators: {
         recordRun,
         'probe factory',
       );
-      if (probeStack === undefined) return refuseRun(findings);
+      if (probeStack === undefined) {
+        runClosed = true;
+        return refuseRun(findings);
+      }
       let probe!: Connector<TInput, TOutput>;
       try {
         const probeTransport = createCaseTransport(
@@ -934,6 +957,7 @@ export function createConformanceAssertion(collaborators: {
             f.code === 'INSTRUMENTATION_NOT_RESTORED',
         )
       ) {
+        runClosed = true;
         return refuseRun(findings);
       }
       posture = connectorEgressPosture(probe);
@@ -974,7 +998,17 @@ export function createConformanceAssertion(collaborators: {
               findings.push(scoped);
               caseFindings.push(scoped);
             };
+            let caseSettled = false;
             const recordEscape = (attempt: ConnectorConformanceEscape) => {
+              if (runClosed) return;
+              if (caseSettled) {
+                const finding = escapeFinding(attempt);
+                recordRun({
+                  ...finding,
+                  reason: `${finding.reason}; observed after case '${caseName}' settled`,
+                });
+                return;
+              }
               escapes.push(attempt);
             };
             const stack = installEntries(
@@ -998,6 +1032,7 @@ export function createConformanceAssertion(collaborators: {
             let timedOut = false;
             let instrumentationIntact = true;
             let invocationError: unknown;
+            let invocationFailed = false;
             let timer: unknown;
             if (stack !== undefined) {
               for (const entry of stack) instrumented.add(entry.label);
@@ -1009,7 +1044,9 @@ export function createConformanceAssertion(collaborators: {
                 );
                 const caseLogger = new AuditLogger({
                   sink: (event) => {
-                    caseAuditEvents.push({ event, inWindow });
+                    try {
+                      caseAuditEvents.push({ event: { ...event }, inWindow });
+                    } catch {}
                   },
                 });
                 let connector!: Connector<TInput, TOutput>;
@@ -1075,6 +1112,7 @@ export function createConformanceAssertion(collaborators: {
                   });
                 } else {
                   invocationError = error;
+                  invocationFailed = true;
                 }
               } finally {
                 inWindow = false;
@@ -1089,8 +1127,11 @@ export function createConformanceAssertion(collaborators: {
                 }
               }
             }
-            for (const attempt of escapes) recordCase(escapeFinding(attempt));
-            if (!invoked && invocationError !== undefined) {
+            const caseEscapes = [...escapes];
+            caseSettled = true;
+            for (const attempt of caseEscapes)
+              recordCase(escapeFinding(attempt));
+            if (!invoked && invocationFailed) {
               recordCase({
                 code: 'CASE_INVOCATION_FAILED',
                 reason: invocationFailureReason(invocationError),
@@ -1108,15 +1149,11 @@ export function createConformanceAssertion(collaborators: {
               decisionCodes = caseAuditEvents
                 .filter((e) => e.inWindow)
                 .map((e) => e.event.decisionCode);
-              const boundaryError =
-                invocationError instanceof ConnectorValidationError ||
-                invocationError instanceof ConnectorInvocationError;
-              if (
-                invocationError !== undefined &&
-                !boundaryError &&
-                !(invocationError instanceof ConnectorPolicyError) &&
-                !(invocationError instanceof ConformanceRefusal)
-              ) {
+              // A value whose classification cannot be read is by definition
+              // none of the three known kinds, so it takes the foreign branch.
+              const invocationKind = classifyInvocationError(invocationError);
+              const boundaryError = invocationKind === 'boundary';
+              if (invocationFailed && invocationKind === 'foreign') {
                 recordCase({
                   code: 'CASE_INVOCATION_FAILED',
                   reason: invocationFailureReason(invocationError),
@@ -1124,7 +1161,7 @@ export function createConformanceAssertion(collaborators: {
               }
               const missingFetch =
                 transportCalls === 0 &&
-                escapes.some(
+                caseEscapes.some(
                   (attempt) =>
                     attempt.entryPoint === 'globalThis.fetch' &&
                     attempt.host !== null &&
@@ -1193,11 +1230,11 @@ export function createConformanceAssertion(collaborators: {
               name: caseName,
               proved,
               guardedHosts,
-              escapes,
+              escapes: caseEscapes,
               decisionCodes,
               transportCalls,
               auditEvents: witnesses.length,
-              findings: caseFindings,
+              findings: [...caseFindings],
             });
             const stoppingCode = timedOut
               ? 'CASE_TIMEOUT'
@@ -1237,12 +1274,14 @@ export function createConformanceAssertion(collaborators: {
     } finally {
       activeRun = undefined;
     }
+    runClosed = true;
+    const runFindings = [...findings];
     const report: ConnectorConformanceReport = {
-      conformant: findings.length === 0,
+      conformant: runFindings.length === 0,
       ...(posture === undefined ? {} : { posture }),
       instrumented: [...instrumented],
-      cases,
-      findings,
+      cases: [...cases],
+      findings: runFindings,
       limit: CONFORMANCE_LIMIT,
     };
     if (!report.conformant) refuseRun(report.findings, report);
