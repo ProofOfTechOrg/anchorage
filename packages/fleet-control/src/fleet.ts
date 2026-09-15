@@ -1256,8 +1256,13 @@ export async function auditRecordStep(
     input.liveByScript.get(`${record.backend}:${liveScriptName(record)}`) ?? [];
   const inventoryDeployment = inventoryMatches[0];
   const recordUpdatedAt = Date.parse(record.updatedAt);
+  // `decommissioned` is terminal, not a phase that advances: a retained
+  // terminal row ages past `staleAfterMs` and stays there until a host clears
+  // it, so reading it as stalled provisioning misclassifies intended retained
+  // state as incomplete provisioning.
   if (
     phase !== 'ready' &&
+    phase !== 'decommissioned' &&
     (!Number.isFinite(recordUpdatedAt) ||
       input.auditNow - recordUpdatedAt > input.staleAfterMs)
   ) {

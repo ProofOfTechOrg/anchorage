@@ -779,6 +779,34 @@ describe('ordinary Worker cross-backend continuation', () => {
     expect(direct.world.scripts.get(spec.scriptName)?.present).toBe(false);
   });
 
+  it('reprovisions the decommissioned slug through the direct backend without touching the old database', async () => {
+    const source = wrangler();
+    const spec = buildPlainWorkerSpec();
+    const ready = await provision(source, spec);
+    const direct = directHarness(source.world);
+    direct.store.record = structuredClone(ready.record);
+    const retired = await decommissionDeployment({
+      backend: direct.backend,
+      store: direct.store,
+      spec,
+    });
+    expect(retired.record.phase).toBe('decommissioned');
+    const mutationsAtTeardown = direct.world.mutationLog.length;
+
+    const reprovisioned = await provision(direct, spec);
+
+    expect(reprovisioned.record.phase).toBe('ready');
+    expect(reprovisioned.record.databaseId).not.toBe(retired.record.databaseId);
+    expect(reprovisioned.record.scriptName).toBe(ready.record.scriptName);
+    expect(reprovisioned.record.databaseName).toBe(ready.record.databaseName);
+    expect(reprovisioned.record.routeHostname).toBe(ready.record.routeHostname);
+    expect(
+      direct.world.mutationLog
+        .slice(mutationsAtTeardown)
+        .filter((entry) => entry.includes(retired.record.databaseId)),
+    ).toEqual([]);
+  });
+
   it('retries every direct teardown state write from its retained predecessor', async () => {
     const source = wrangler();
     const spec = buildPlainWorkerSpec();

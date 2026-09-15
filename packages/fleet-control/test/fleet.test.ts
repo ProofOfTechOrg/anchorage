@@ -2602,6 +2602,13 @@ describe('fleet operations', () => {
     expect(findings.map(({ kind }) => kind)).toContain(
       'incomplete-provisioning',
     );
+
+    // A terminal row is retained state, not a phase that advances.
+    const retired: FleetRecord = { ...base, phase: 'decommissioned' };
+    const retiredFindings = await audit([retired]);
+    expect(retiredFindings.map(({ kind }) => kind)).not.toContain(
+      'incomplete-provisioning',
+    );
   });
 
   it('commits the invocation authority before migration staging, candidate maintenance, and promotion dispatches', async () => {

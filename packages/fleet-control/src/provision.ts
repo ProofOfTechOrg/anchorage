@@ -48,7 +48,10 @@ import {
   reconcilePersistedDatabase,
   retainedExternalReleases,
 } from './decommission-advance.js';
-import { decommissionAdvanceIntentFromUnknown } from './decommission-intent.js';
+import {
+  decommissionAdvanceIntentFromUnknown,
+  isCompleteTerminalRecord,
+} from './decommission-intent.js';
 import { isSha256 } from './deployment-context.js';
 import { WorkerDeploymentError } from './deployment-error.js';
 import {
@@ -598,6 +601,83 @@ export interface ProvisionDeploymentOptions {
   readonly clock?: () => number;
 }
 
+// The residue a terminal `decommissioned` row still describes, or `undefined`
+// when the row describes none. Written as a reason rather than a boolean so
+// the refusal below names what the operator has to resolve.
+function retainedTerminalResidue(record: FleetRecord): string | undefined {
+  const decommission = record.decommissionIntent;
+  if (decommission && decommission.state !== 'complete') {
+    return `an unfinished decommission operation in state '${decommission.state}'`;
+  }
+  if (record.cleanupIntent !== undefined) {
+    return 'an unfinished bounded cleanup operation';
+  }
+  const switchSubphase = record.backendSwitchIntent?.subphase;
+  if (
+    switchSubphase !== undefined &&
+    switchSubphase !== 'rolled-back' &&
+    switchSubphase !== 'finalized' &&
+    switchSubphase !== 'decommissioned'
+  ) {
+    return `an active backend switch in subphase '${switchSubphase}'`;
+  }
+  const retained = (record.applicationResources ?? []).filter(
+    (resource) => resource.state !== 'deleted',
+  );
+  const retainedNames = retained.map((resource) => `'${resource.name}'`);
+  if (retainedNames.length > 0) {
+    return `retained application R2 resources ${retainedNames.join(', ')}`;
+  }
+  if (!isCompleteTerminalRecord(record)) {
+    return 'incomplete teardown evidence: a completed decommission records the database export location, digest, and byte count and leaves no pending lifecycle field';
+  }
+  return undefined;
+}
+
+// Reads a stored `decommissioned` row as a RETIRED record: one
+// `provisionDeployment` treats as an absent prior rather than as a lifecycle
+// to resume.
+//
+// The row is the evidence, read against the package's own definition of a
+// completed decommission record in `isCompleteTerminalRecord`, so a teardown
+// that never finished refuses instead — including the row a forced
+// decommission strands between its terminal state write and its row delete,
+// which records no database export. The predicate reads the row, not its
+// provenance: a row carrying that same evidence reads as retired however it
+// was written.
+//
+// Physical resources the row does not describe stay outside that evidence —
+// an ordinary Worker script a forced decommission leaves behind, and the
+// Durable Object namespaces a backend asserts absent rather than deletes —
+// and a fresh provision over this slug meets them at the provider, which
+// refuses to adopt a database or a script it cannot attribute to this
+// deployment.
+//
+// The intent clauses live here rather than beside the guards that mirror them
+// because normalization runs before `assertNoActiveDecommission`, the cleanup
+// redirect, and `assertBackendSwitchInactive`: a row admitted here reaches
+// none of those guards.
+function isRetiredTerminalRecord(record: FleetRecord): boolean {
+  return (
+    record.phase === 'decommissioned' &&
+    retainedTerminalResidue(record) === undefined
+  );
+}
+
+// Refuses a database that already answers to the name this provision reserves.
+async function assertReservedDatabaseNameFree(
+  backend: ProvisioningBackend,
+  spec: DeploymentSpec,
+  reservedName: string,
+): Promise<void> {
+  const existingDatabase = await backend.findDatabase(spec);
+  if (existingDatabase) {
+    throw new Error(
+      `refusing to claim pre-existing database '${existingDatabase.id}:${existingDatabase.name}' for reserved name '${reservedName}'`,
+    );
+  }
+}
+
 // `async` so the entry validation below REJECTS rather than throwing
 // synchronously: every caller and every test treats this as a promise-returning
 // function, and a synchronous throw would escape an unguarded `.catch()`.
@@ -644,7 +724,18 @@ async function provisionDeploymentUnderLease(
       'maintenanceBaseUrl must use a control-plane hostname distinct from routeHostname',
     );
   }
-  const prior = await store.get(spec.tenantTag, spec.environment);
+  const stored = await store.get(spec.tenantTag, spec.environment);
+  const retiredPrior =
+    stored !== undefined && isRetiredTerminalRecord(stored)
+      ? stored
+      : undefined;
+  // Normalized ONCE, here: `prior` is what the lifecycle guards, the immutable
+  // mapping asserts, the phase refusal, `record` and `databaseReservationOwned`
+  // read below. A branch that admitted the retired row at one of those sites
+  // and left the rest reading the raw row would hold `databaseReservationOwned`
+  // at false and disable the failed-provision unwind for the database and
+  // Worker this attempt created.
+  const prior = retiredPrior === undefined ? stored : undefined;
   if (prior) {
     assertNoActiveDecommission(prior, 'provisionDeployment');
     // The fixed redirect IS this entry's cleanup guard: it must fire before
@@ -688,6 +779,19 @@ async function provisionDeploymentUnderLease(
   if (prior) {
     assertImmutableDeploymentMapping(prior, backend, spec);
     assertPlatformDurableObjectHistory(prior, spec);
+    // A terminal row that reaches here failed `isRetiredTerminalRecord`, so it
+    // still describes residue. It refuses by that reason instead of by the
+    // generic phase message, because the remedy is a physical one the operator
+    // performs before the record can be cleared.
+    const residue =
+      prior.phase === 'decommissioned'
+        ? retainedTerminalResidue(prior)
+        : undefined;
+    if (residue !== undefined) {
+      throw new Error(
+        `deployment '${spec.tenantTag}:${spec.environment}' has a decommissioned record with ${residue}; confirm the residual physical resources are removed, then clear the record with forceDecommissionDeployment() before provisioning this name again`,
+      );
+    }
     if (!RESUMABLE_PROVISIONING_PHASES.has(prior.phase)) {
       throw new Error(
         `deployment '${spec.tenantTag}:${spec.environment}' cannot be provisioned from phase '${prior.phase}'`,
@@ -851,6 +955,16 @@ async function provisionDeploymentUnderLease(
     prior.phase === 'database-reserved' ||
     prior.phase === 'database-create-authorized';
   try {
+    // A retired terminal record is still the stored row here and `lease.put`
+    // is an unconditional upsert, so the reserved-name proof runs before the
+    // claim: proving it afterwards would have replaced the export location,
+    // digest and size that `decommissionDeployment` replays from, for a
+    // provision that then refuses. An absent prior keeps the original order,
+    // where the durable reservation written first is what
+    // `cleanupDeploymentArtifacts()` clears with a receipt.
+    if (retiredPrior !== undefined) {
+      await assertReservedDatabaseNameFree(backend, spec, spec.databaseName);
+    }
     if (!record) {
       const reservation: DatabaseReference = {
         id: `reserved-${deploymentSpecDigest(spec).slice(0, 48)}`,
@@ -867,10 +981,11 @@ async function provisionDeploymentUnderLease(
       await lease.put(record);
     }
     if (record.phase === 'database-reserved') {
-      const existingDatabase = await backend.findDatabase(spec);
-      if (existingDatabase) {
-        throw new Error(
-          `refusing to claim pre-existing database '${existingDatabase.id}:${existingDatabase.name}' for reserved name '${record.databaseName}'`,
+      if (retiredPrior === undefined) {
+        await assertReservedDatabaseNameFree(
+          backend,
+          spec,
+          record.databaseName,
         );
       }
       record = {
@@ -1495,6 +1610,12 @@ async function provisionDeploymentUnderLease(
       cleanupErrors = legacy.errors;
       if (
         databaseReservationOwned &&
+        // The delete removes the row THIS attempt reserved. A retired terminal
+        // prior normalizes to an absent prior while its row is still stored,
+        // so a refusal before the first put owns no row to delete and leaves
+        // the terminal record for `forceDecommissionDeployment()` and the
+        // receipts contract to read.
+        record !== undefined &&
         cleanupErrors.length === 0 &&
         (!database || databaseOwnershipProven)
       ) {

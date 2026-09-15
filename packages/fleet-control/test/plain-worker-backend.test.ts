@@ -2414,6 +2414,29 @@ describe('PlainWorkerBackend direct mutation assertion ownership', () => {
 });
 
 describe('PlainWorkerBackend core-policy refusals', () => {
+  it('refuses to upload over a script a force decommission left behind', async () => {
+    const api = new PlainWorkerProvisioningApiFake();
+    api.versions.set(spec.scriptName, [ownedVersion('surviving')]);
+    api.deployments.set(spec.scriptName, {
+      versions: [{ versionId: 'surviving', percentage: 100 }],
+    });
+
+    // A fresh provision of the same slug mints a new D1; the surviving
+    // version still binds the retired one.
+    await expect(
+      backend(api).deployWorker(
+        spec,
+        { ...database, id: 'replacement-database-id' },
+        secrets,
+        undefined,
+        mutationFence(),
+      ),
+    ).rejects.toThrow(
+      `refusing to upload over existing Worker '${spec.scriptName}' with drifted tenant, environment, or D1 ownership`,
+    );
+    expect(api.events).not.toContain('mutation:uploadCandidate');
+  });
+
   it('refuses promotion from a disallowed route before creating a deployment', async () => {
     const api = new PlainWorkerProvisioningApiFake();
     api.versions.set(spec.scriptName, [

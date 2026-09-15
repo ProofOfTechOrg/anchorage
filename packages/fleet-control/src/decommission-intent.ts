@@ -17,6 +17,7 @@ import type {
   DecommissionBlockedAttachment,
   DecommissionIntentCommon,
   DecommissionOperationIdentity,
+  DecommissionOperationMode,
   DecommissionRecordIdentity,
   FleetRecord,
   NormalDecommissionLifecyclePhase,
@@ -587,7 +588,7 @@ function parseIntentCommon(
 
 function assertCompleteRecord(
   source: FleetRecord,
-  mode: DecommissionOperationIdentity['mode'],
+  mode: DecommissionOperationMode['kind'],
 ): void {
   const switchIntent = source.backendSwitchIntent;
   if (
@@ -605,8 +606,8 @@ function assertCompleteRecord(
     source.rollbackRelease !== undefined ||
     source.retiringRelease !== undefined ||
     source.migrationIntent !== undefined ||
-    (mode.kind === 'normal' && switchIntent !== undefined) ||
-    (mode.kind === 'backend-switch' &&
+    (mode === 'normal' && switchIntent !== undefined) ||
+    (mode === 'backend-switch' &&
       (switchIntent?.subphase !== 'decommissioned' ||
         !switchIntent.databaseExport ||
         switchIntent.databaseExport.location !==
@@ -619,6 +620,25 @@ function assertCompleteRecord(
         )))
   ) {
     malformed();
+  }
+}
+
+/**
+ * Whether `source` carries the record a completed decommission leaves. The
+ * mode comes from the row's own `backendSwitchIntent`, so a backend-switch
+ * teardown is read against its switch evidence and an ordinary one against
+ * none.
+ */
+export function isCompleteTerminalRecord(source: FleetRecord): boolean {
+  try {
+    assertCompleteRecord(
+      source,
+      source.backendSwitchIntent === undefined ? 'normal' : 'backend-switch',
+    );
+    return true;
+  } catch (error) {
+    if (error instanceof DecommissionAdvanceIntentError) return false;
+    throw error;
   }
 }
 
@@ -669,7 +689,7 @@ export function decommissionAdvanceIntentFromUnknown(
       source,
       'decommissioned',
     );
-    assertCompleteRecord(source, identity.mode);
+    assertCompleteRecord(source, identity.mode.kind);
     return {
       version: 1,
       operationId: candidate.operationId,

@@ -49,6 +49,7 @@ import type {
   ActiveRouteAttestation,
   ApplicationR2BucketSnapshot,
   ApplicationR2Resource,
+  BackendSwitchIntent,
   CleanupTerminalReceipt,
   DatabaseExport,
   DatabaseExportReceiptIdentity,
@@ -4684,6 +4685,348 @@ describe('fleet provisioning', () => {
     expect((failure as Error).cause).toMatchObject({
       message: expect.stringMatching(/refusing to claim pre-existing database/),
     });
+  });
+
+  it('provisions a retired terminal record as an absent prior and carries nothing forward', async () => {
+    const harness = await boundedDecommissionHarness({
+      r2Names: ['ARTIFACTS'],
+    });
+    const { backend, store } = harness;
+    await expect(
+      decommissionDeployment({ backend, store, spec: harness.deployment }),
+    ).resolves.toMatchObject({ record: { phase: 'decommissioned' } });
+    const terminal = store.record as FleetRecord;
+    expect(terminal.applicationResources?.map(({ state }) => state)).toEqual([
+      'deleted',
+    ]);
+    expect(terminal.databaseExportLocation).toBeDefined();
+
+    // A changed specification is admitted: the digest guard inside
+    // assertImmutableDeploymentMapping does not run for an absent prior.
+    const changed = spec({
+      ...harness.deployment,
+      compatibilityDate: '2026-08-11',
+    });
+    expect(deploymentSpecDigest(changed)).not.toBe(terminal.desiredSpecDigest);
+    backend.events.length = 0;
+    const writesBefore = store.phases.length;
+
+    const result = await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: changed,
+      secrets,
+    });
+
+    expect(result.record.phase).toBe('ready');
+    expect(result.record.desiredSpecDigest).toBe(deploymentSpecDigest(changed));
+    expect(result.record.decommissionIntent).toBeUndefined();
+    expect(result.record.databaseExportLocation).toBeUndefined();
+    expect(result.record.databaseExportSha256).toBeUndefined();
+    expect(result.record.databaseExportSize).toBeUndefined();
+    expect(
+      result.record.applicationResources?.map(({ state }) => state),
+    ).not.toContain('deleted');
+    // The database is minted again rather than reconciled from the retired row.
+    expect(backend.events[0]).toBe('database');
+    expect(store.phases.slice(writesBefore)[0]).toBe('database-reserved');
+    expect(store.phases.at(-1)).toBe('ready');
+  });
+
+  it('refuses a previous Durable Object migration tag over a retired terminal record', async () => {
+    const harness = await boundedDecommissionHarness();
+    const { backend, store } = harness;
+    await expect(
+      decommissionDeployment({ backend, store, spec: harness.deployment }),
+    ).resolves.toMatchObject({ record: { phase: 'decommissioned' } });
+    const before = structuredClone(store.record) as FleetRecord;
+
+    await expect(
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: spec({ ...harness.deployment, previousDurableObjectTag: 'v1' }),
+        secrets,
+      }),
+    ).rejects.toThrow(
+      'a new deployment cannot declare a previous Durable Object migration tag',
+    );
+    expect(store.record).toEqual(before);
+  });
+
+  it('keeps the generic phase refusal for every other non-resumable phase', async () => {
+    for (const phase of [
+      'worker-deleted',
+      'database-exported',
+      'database-deleting',
+    ] as const) {
+      const harness = await boundedDecommissionHarness();
+      harness.store.record = {
+        ...(harness.store.record as FleetRecord),
+        phase,
+      };
+      const before = structuredClone(harness.store.record) as FleetRecord;
+      harness.backend.events.length = 0;
+
+      await expect(
+        provisionDeployment({
+          initialExecutionFenceState: 'open',
+          backend: harness.backend,
+          store: harness.store,
+          spec: harness.deployment,
+          secrets,
+        }),
+        phase,
+      ).rejects.toThrow(
+        `deployment 'acme:production' cannot be provisioned from phase '${phase}'`,
+      );
+      expect(harness.store.record, phase).toEqual(before);
+      expect(harness.backend.events, phase).toEqual([]);
+    }
+  });
+
+  it('refuses a terminal record that still retains an application resource', async () => {
+    const harness = await boundedDecommissionHarness({
+      r2Names: ['ARTIFACTS'],
+    });
+    const { backend, store } = harness;
+    await expect(
+      decommissionDeployment({ backend, store, spec: harness.deployment }),
+    ).resolves.toMatchObject({ record: { phase: 'decommissioned' } });
+    const terminal = store.record as FleetRecord;
+    store.record = {
+      ...terminal,
+      applicationResources: (terminal.applicationResources ?? []).map(
+        (resource) => ({ ...resource, state: 'created' as const }),
+      ),
+    };
+    const before = structuredClone(store.record) as FleetRecord;
+    backend.events.length = 0;
+
+    await expect(
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: harness.deployment,
+        secrets,
+      }),
+    ).rejects.toThrow(
+      /has a decommissioned record with retained application R2 resources 'ARTIFACTS'; confirm the residual physical resources are removed, then clear the record with forceDecommissionDeployment\(\)/,
+    );
+    expect(store.record).toEqual(before);
+    expect(backend.events).toEqual([]);
+  });
+
+  it('refuses a pre-existing database before it claims the retired terminal row', async () => {
+    const harness = await boundedDecommissionHarness();
+    const { backend, store } = harness;
+    await expect(
+      decommissionDeployment({ backend, store, spec: harness.deployment }),
+    ).resolves.toMatchObject({ record: { phase: 'decommissioned' } });
+    const before = structuredClone(store.record) as FleetRecord;
+    expect(before.databaseExportLocation).toBeDefined();
+
+    // The fixture idiom for foreign physical residue under the reserved name.
+    backend.databaseExists = true;
+    backend.databaseOwner = undefined;
+
+    const failure = await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: harness.deployment,
+      secrets,
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ProvisioningError);
+    expect((failure as Error).cause).toMatchObject({
+      message: expect.stringMatching(/refusing to claim pre-existing database/),
+    });
+    expect(store.record).toEqual(before);
+  });
+
+  it('unwinds a failed provision over a retired terminal record as a fresh one', async () => {
+    const harness = await boundedDecommissionHarness();
+    const { backend, store } = harness;
+    await expect(
+      decommissionDeployment({ backend, store, spec: harness.deployment }),
+    ).resolves.toMatchObject({ record: { phase: 'decommissioned' } });
+    backend.events.length = 0;
+    backend.failAt = 'migrations';
+
+    await expect(
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: harness.deployment,
+        secrets,
+      }),
+    ).rejects.toBeInstanceOf(ProvisioningError);
+
+    expect(backend.events.at(-1)).toBe('delete-database');
+    expect(store.record).toBeUndefined();
+    expect([...store.receipts.values()]).toMatchObject([
+      {
+        disposition: 'prepublication-owned-no-export',
+        authority: 'provisioning-rollback',
+      },
+    ]);
+  });
+
+  it('provisions over a terminal record a backend switch retired', async () => {
+    const harness = await boundedDecommissionHarness();
+    const { backend, store } = harness;
+    await expect(
+      decommissionDeployment({ backend, store, spec: harness.deployment }),
+    ).resolves.toMatchObject({ record: { phase: 'decommissioned' } });
+    const terminal = store.record as FleetRecord;
+    const switchIntent: BackendSwitchIntent = {
+      kind: 'backend-switch',
+      tenantTag: terminal.tenantTag,
+      environment: terminal.environment,
+      prior: {
+        scriptName: terminal.scriptName,
+        artifactVersion: terminal.artifactVersion,
+        specDigest: terminal.desiredSpecDigest,
+        databaseId: terminal.databaseId,
+        databaseName: terminal.databaseName,
+        durableObjectBindings: [],
+        namespaceIds: [],
+        secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
+        applicationResources: [],
+        customDomain: { id: 'domain-acme', hostname: terminal.routeHostname },
+      },
+      targetSpecDigest: terminal.desiredSpecDigest,
+      targetApplication: terminal.applicationBindings ?? {
+        vars: [],
+        secrets: [],
+        r2Buckets: [],
+      },
+      target: backend.describeExternalPlatformTarget(harness.deployment),
+      rollbackUntil: '2026-09-30T00:00:00.000Z',
+      subphase: 'decommissioned',
+      // A switch that reached `decommissioned` committed the export the
+      // terminal row records and released the application resources it
+      // tracked; the package reads a backend-switch terminal row against that
+      // evidence.
+      databaseExport: {
+        databaseId: terminal.databaseId,
+        location: terminal.databaseExportLocation as string,
+        sha256: terminal.databaseExportSha256 as string,
+        size: terminal.databaseExportSize as number,
+      },
+      applicationR2Progress: [],
+    };
+    store.record = { ...terminal, backendSwitchIntent: switchIntent };
+    backend.events.length = 0;
+
+    const result = await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: harness.deployment,
+      secrets,
+    });
+
+    expect(result.record.phase).toBe('ready');
+    expect(result.record.backendSwitchIntent).toBeUndefined();
+    expect(backend.events[0]).toBe('database');
+  });
+
+  it('decommissions the replacement when a same-spec decommission follows a re-provision', async () => {
+    const harness = await boundedDecommissionHarness();
+    const { backend, store } = harness;
+    const first = await decommissionDeployment({
+      backend,
+      store,
+      spec: harness.deployment,
+    });
+    expect(first.record.phase).toBe('decommissioned');
+    const retiredExportLocation = first.record.databaseExportLocation;
+    expect(retiredExportLocation).toBeDefined();
+
+    const replacement = await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: harness.deployment,
+      secrets,
+    });
+
+    expect(replacement.record.phase).toBe('ready');
+    expect(replacement.record.databaseExportLocation).toBeUndefined();
+    backend.receiptCalls.length = 0;
+    backend.events.length = 0;
+
+    // decommissionDeployment() carries no operation identity, so a same-spec
+    // call issued after the replacement reached `ready` is a new decommission
+    // of the replacement rather than a retry that replays the retired row's
+    // export. The fake mints one provider database ID for every deployment,
+    // so the target shows in the export this call commits and in the teardown
+    // it drives rather than in that ID.
+    const late = await decommissionDeployment({
+      backend,
+      store,
+      spec: harness.deployment,
+    });
+
+    expect(backend.events).toEqual(
+      expect.arrayContaining(['delete-worker', 'export', 'delete-database']),
+    );
+    expect(backend.receiptCalls.map(({ databaseId }) => databaseId)).toEqual([
+      replacement.record.databaseId,
+    ]);
+    expect(late.record.phase).toBe('decommissioned');
+    expect(late.databaseExport.location).not.toBe(retiredExportLocation);
+    expect(store.record?.databaseExportLocation).toBe(
+      late.databaseExport.location,
+    );
+  });
+
+  it('refuses a terminal record a force decommission stranded without its export', async () => {
+    const harness = await boundedDecommissionHarness();
+    const { backend, store } = harness;
+    const ready = store.record as FleetRecord;
+    expect(ready.phase).toBe('ready');
+    expect(ready.databaseExportLocation).toBeUndefined();
+    // What forceDecommissionDeployment() leaves when its host audit sink
+    // rejects between the terminal state write and the row delete: force never
+    // exports, so the row reaches `decommissioned` with no export triple while
+    // the ordinary Worker script survives.
+    const {
+      pendingSpecDigest: _pendingSpecDigest,
+      pendingArtifactVersion: _pendingArtifactVersion,
+      ...forceRecord
+    } = ready;
+    store.record = {
+      ...forceRecord,
+      phase: 'decommissioned',
+      applicationResources: [],
+    };
+    backend.databaseExists = false;
+    backend.databaseOwner = undefined;
+    const before = structuredClone(store.record) as FleetRecord;
+    const writesBefore = store.phases.length;
+    backend.events.length = 0;
+
+    await expect(
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: harness.deployment,
+        secrets,
+      }),
+    ).rejects.toThrow(
+      /has a decommissioned record with incomplete teardown evidence: a completed decommission records the database export location, digest, and byte count and leaves no pending lifecycle field; confirm the residual physical resources are removed, then clear the record with forceDecommissionDeployment\(\)/,
+    );
+    expect(store.record).toEqual(before);
+    expect(store.phases.length).toBe(writesBefore);
+    expect(backend.events).toEqual([]);
   });
 
   it('starts stable operation before I/O and recovers lost start response', async () => {
