@@ -340,6 +340,15 @@ export async function teardownDirectReference(input) {
       const routes = await singlePage(
         single.workers.routes.list({ zone_id: zoneId }),
       );
+      let queues;
+      try {
+        queues = await singlePage(single.queues.list(selectors));
+      } catch (error) {
+        // A 404 states the account carries no queue collection: an empty page
+        // the provider did not attest.
+        if (!(error instanceof APIError) || error.status !== 404) throw error;
+        queues = { rows: [], exhaustive: false };
+      }
       let dispatch;
       try {
         const classified = await classifyDispatchNamespaces(
@@ -407,6 +416,11 @@ export async function teardownDirectReference(input) {
             matching(routes.rows, 'script'),
             routes.exhaustive,
             routes.rows.length,
+          ),
+          queues: surface(
+            matching(queues.rows, 'queue_name'),
+            queues.exhaustive,
+            queues.rows.length,
           ),
         },
         bucketJurisdictions: ['default'],

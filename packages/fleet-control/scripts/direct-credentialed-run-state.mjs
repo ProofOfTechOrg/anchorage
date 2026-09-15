@@ -388,6 +388,7 @@ export const DIRECT_RESIDUAL_SURFACES = Object.freeze([
   'buckets',
   'domains',
   'routes',
+  'queues',
 ]);
 
 export const DIRECT_TEARDOWN_MAXIMA = Object.freeze({

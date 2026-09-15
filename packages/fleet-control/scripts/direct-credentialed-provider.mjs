@@ -242,6 +242,11 @@ function validateEnvelope(value) {
     refuse('provider-unavailable');
 }
 
+// `SinglePage` copies only the rows, so a caller cannot reach the `result_info`
+// the provider sent. The transport records that attestation against the row
+// array the page carries.
+const singlePageAttestations = new WeakMap();
+
 function proofFetch(transport, shape, bound) {
   return async (input, init) => {
     const response = await transport.fetch(input, init);
@@ -312,6 +317,12 @@ function proofFetch(transport, shape, bound) {
             (totalCount !== undefined && totalCount !== rows.length)
           )
             refuse('provider-unavailable');
+          singlePageAttestations.set(
+            rows,
+            totalCount === rows.length ||
+              totalPages === 1 ||
+              (totalPages === 0 && rows.length === 0),
+          );
         } else if (
           rows.length === 0 &&
           ((totalPages !== undefined && totalPages > requestedPage) ||
@@ -382,7 +393,7 @@ export async function classifyDispatchNamespaces(single, selectors, bound) {
 export async function singlePage(promise) {
   const rows = (await promise).result;
   if (!Array.isArray(rows)) refuse('provider-unavailable');
-  return { rows, exhaustive: false };
+  return { rows, exhaustive: singlePageAttestations.get(rows) ?? false };
 }
 
 export async function bucketPages({ sdk, selectors, jurisdiction }) {

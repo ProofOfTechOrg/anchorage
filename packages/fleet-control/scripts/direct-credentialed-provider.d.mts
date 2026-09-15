@@ -75,7 +75,7 @@ export function classifyDispatchNamespaces(
 
 export function singlePage<Row>(
   promise: PromiseLike<{ readonly result: readonly Row[] }>,
-): Promise<Readonly<{ rows: readonly Row[]; exhaustive: false }>>;
+): Promise<Readonly<{ rows: readonly Row[]; exhaustive: boolean }>>;
 
 export function bucketPages(
   input: Readonly<{

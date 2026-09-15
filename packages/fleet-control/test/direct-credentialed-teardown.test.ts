@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DirectProviderError } from '../scripts/direct-credentialed-provider.mjs';
@@ -13,6 +13,7 @@ import { teardownDirectReference } from '../scripts/direct-credentialed-teardown
 import {
   bootstrapContext,
   cleanupDirectRunState,
+  closed,
   completeScenario,
   completeScenarioJournal,
   exportKey,
@@ -87,6 +88,7 @@ async function world(
     limit?: number;
     disposableAccount?: boolean;
     complete?: boolean;
+    corroborate?: boolean;
   } = {},
 ) {
   const limit = options.limit ?? 8;
@@ -117,6 +119,7 @@ async function world(
     scripts: [] as Row[],
     domains: [] as Row[],
     routes: [] as Row[],
+    queues: [] as Row[],
     dispatch: [] as Row[],
   };
   let hook: Hook | undefined;
@@ -133,6 +136,12 @@ async function world(
     ...(state.scriptPresent ? [{ id: names.referenceWorker }] : []),
     ...state.scripts,
   ];
+  // The live shapes carry no `result_info` on scripts and routes, so the
+  // default world sends none; `corroborate` opts into the attested shape.
+  const listing = (rows: Row[]) =>
+    options.corroborate === true
+      ? json(rows, { total_count: rows.length })
+      : json(rows);
   const fetchRequest = vi.fn<typeof fetch>(async (input, init) => {
     const request = new Request(input, init);
     const url = new URL(request.url);
@@ -168,7 +177,7 @@ async function world(
               headers: { 'Content-Type': 'application/javascript' },
             })
           : absent();
-      if (path === `${ROOT}/workers/scripts`) return json(residualScripts());
+      if (path === `${ROOT}/workers/scripts`) return listing(residualScripts());
       if (path.startsWith(`${ROOT}/d1/database/`)) {
         const row = state.databases.get(
           path.slice(`${ROOT}/d1/database/`.length),
@@ -217,8 +226,9 @@ async function world(
               creation_date: '2026-09-10T00:00:00.000Z',
             })
           : absent();
-      if (path === `${ROOT}/workers/domains`) return json(state.domains);
-      if (path === ROUTES) return json(state.routes);
+      if (path === `${ROOT}/workers/domains`) return listing(state.domains);
+      if (path === ROUTES) return listing(state.routes);
+      if (path === `${ROOT}/queues`) return listing(state.queues);
       if (path === `${ROOT}/workers/dispatch/namespaces`)
         return json(state.dispatch);
     }
@@ -342,6 +352,7 @@ describeLinux('direct reference teardown', () => {
       `GET ${ROOT}/r2/buckets`,
       `GET ${ROOT}/workers/domains`,
       `GET ${ROUTES}`,
+      `GET ${ROOT}/queues`,
       `GET ${ROOT}/workers/dispatch/namespaces`,
       `GET ${w.script}/versions`,
     ]);
@@ -806,6 +817,7 @@ describeLinux('direct reference teardown', () => {
       `${ROOT}/r2/buckets`,
       `${ROOT}/workers/domains`,
       ROUTES,
+      `${ROOT}/queues`,
     ]) {
       const w = await world();
       w.setHook((request, url) =>
@@ -971,6 +983,97 @@ describeLinux('direct reference teardown', () => {
       phase: 'worker',
       pending: { kind: 'delete-reference-worker' },
     });
+  });
+
+  it('records a prefixed queue as a residual and settles when none is left', async () => {
+    const left = await world();
+    left.state.queues.push({ queue_name: `${left.prefix}-left-behind` });
+    const retainedOutcome = retained(await left.run());
+    expect(retainedOutcome.reason).toBe('residual-present');
+    expect(present(retainedOutcome.facts.residual).surfaces.queues).toEqual({
+      prefixCount: 1,
+      prefixNames: [`${left.prefix}-left-behind`],
+      globalCount: 1,
+      exhaustive: false,
+    });
+    const empty = await world();
+    const outcome = await empty.run();
+    expect(outcome.status).toBe('cleaned');
+    expect(present(outcome.facts.residual).surfaces.queues).toEqual({
+      prefixCount: 0,
+      prefixNames: [],
+      globalCount: 0,
+      exhaustive: false,
+    });
+  });
+
+  it('records the provider attestation on every single-page surface', async () => {
+    const surfaces = ['scripts', 'domains', 'routes', 'queues'] as const;
+    const plain = await world();
+    const uncorroborated = await plain.run();
+    expect(uncorroborated.status).toBe('cleaned');
+    for (const name of surfaces)
+      expect(present(uncorroborated.facts.residual).surfaces[name]).toEqual({
+        prefixCount: 0,
+        prefixNames: [],
+        globalCount: 0,
+        exhaustive: false,
+      });
+    const attested = await world({ corroborate: true });
+    const corroborated = await attested.run();
+    expect(corroborated.status).toBe('cleaned');
+    for (const name of surfaces)
+      expect(present(corroborated.facts.residual).surfaces[name]).toEqual({
+        prefixCount: 0,
+        prefixNames: [],
+        globalCount: 0,
+        exhaustive: true,
+      });
+  });
+
+  it('settles a shared account on the prefix-scoped claim alone', async () => {
+    const w = await world({ disposableAccount: false });
+    w.state.scripts.push({ id: 'unrelated-worker' });
+    const outcome = await w.run();
+    expect(outcome.status).toBe('cleaned');
+    expect(present(outcome.facts.residual).surfaces.scripts).toEqual({
+      prefixCount: 0,
+      prefixNames: [],
+      globalCount: null,
+      exhaustive: false,
+    });
+  });
+
+  it('reads a queues 404 as an account without a queue collection', async () => {
+    const w = await world();
+    w.setHook((request, url) =>
+      request.method === 'GET' && url.pathname === `${ROOT}/queues`
+        ? absent()
+        : undefined,
+    );
+    const outcome = await w.run();
+    expect(outcome.status).toBe('cleaned');
+    expect(present(outcome.facts.residual).surfaces.queues).toEqual({
+      prefixCount: 0,
+      prefixNames: [],
+      globalCount: 0,
+      exhaustive: false,
+    });
+  });
+
+  it('refuses a journal recorded before the queues surface', async () => {
+    const w = await world();
+    expect((await w.run()).status).toBe('cleaned');
+    await closed(w.journal);
+    const path = join(w.journal.directory, 'journal.json');
+    const snapshot = JSON.parse(await readFile(path, 'utf8')) as {
+      teardown: { residual: { surfaces: Record<string, unknown> } };
+    };
+    delete snapshot.teardown.residual.surfaces.queues;
+    await writeFile(path, `${JSON.stringify(snapshot)}\n`);
+    await expect(
+      opened({ ...w.f.input, mode: 'resume' }),
+    ).rejects.toMatchObject({ code: 'invalid-state' });
   });
 
   it('keeps the API token and request headers out of the journal', async () => {

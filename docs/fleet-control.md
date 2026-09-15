@@ -660,7 +660,7 @@ Set these environment variables:
 | --- | --- | --- |
 | `FLEET_DIRECT_CONFORMANCE_CONFIG` | Preflight, run, resume | Path to the configuration |
 | `CLOUDFLARE_ACCOUNT_ID` | Run, resume | Account identifier |
-| `CLOUDFLARE_API_TOKEN` | Run, resume | Provider token |
+| `CLOUDFLARE_API_TOKEN` | Run, resume | Provider token; the residual scan lists the account's queues, so it must permit that read |
 | `FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET` | Run, resume | Reference-worker invocation secret |
 
 Values must be nonempty, without surrounding whitespace or control characters. The runner does not load `.env` files or discover a Wrangler login. Help needs no configuration or credentials.
@@ -701,7 +701,7 @@ Give `evidence.json` to the recovery approval. Its allowlist projects configurat
 
 The writer scans decoded string values and serialized bytes for credentials and forbidden literals. It writes with mode `0600`, verifies a temporary file by reading it back, and replaces the artifact atomically before syncing the directory. A failure before replacement leaves an older artifact untouched and reports `evidenceWritten: false`; a directory-sync failure after replacement reports `true` with durability unconfirmed. Summaries and refusals exclude raw provider errors, credentials, headers, and bodies.
 
-Treat residual inventory according to its recorded scope: `SinglePage` surfaces are not provably exhaustive, and the global bucket count covers the `default` jurisdiction. Offline results do not establish live resource creation, live account cleanup, or recovery authorization.
+Treat residual inventory according to its recorded scope. The scan lists scripts, domains, routes, and queues as single pages, and each records `exhaustive` from the provider's `result_info`: `true` when the provider corroborated the page, `false` when it sent no attestation. The transport refuses a response whose `result_info` contradicts a complete page. `isSettled` asserts a prefix-scoped zero residual on each recorded surface, and a global zero residual only under `disposableAccount: true`, both from the recorded counts; the global bucket count covers the `default` jurisdiction. A journal written before this version carries no queues surface and is refused on resume, so start a new run. Offline results do not establish live resource creation, live account cleanup, or recovery authorization.
 
 ## Preserve the control-plane boundary
 

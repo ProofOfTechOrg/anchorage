@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { openDirectProviderSession } from '../scripts/direct-credentialed-provider.mjs';
+import {
+  openDirectProviderSession,
+  singlePage,
+} from '../scripts/direct-credentialed-provider.mjs';
 
 const sessions: Awaited<ReturnType<typeof openDirectProviderSession>>[] = [];
 
@@ -67,6 +70,63 @@ describe.each([
   ])('refuses $kind errors', async ({ errors }) => {
     const { session } = await fixture({ success: true, result, errors });
     await expect(read(session)).rejects.toMatchObject({
+      code: 'provider-unavailable',
+    });
+  });
+});
+
+describe('single page attestation', () => {
+  const rows = [{ queue_name: 'queue' }];
+  const listed = async (envelope: Record<string, unknown>) => {
+    const { session } = await fixture({
+      success: true,
+      errors: [],
+      ...envelope,
+    });
+    return singlePage(session.single.queues.list({ account_id: 'account' }));
+  };
+
+  it.each([
+    {
+      kind: 'a total_count equal to the rows',
+      result_info: { total_count: 1 },
+    },
+    { kind: 'a single total_page', result_info: { total_pages: 1 } },
+  ])('records an exhaustive page for $kind', async ({ result_info }) => {
+    await expect(listed({ result: rows, result_info })).resolves.toEqual({
+      rows,
+      exhaustive: true,
+    });
+  });
+
+  it('records an exhaustive empty page for a zero total_pages', async () => {
+    await expect(
+      listed({ result: [], result_info: { total_pages: 0 } }),
+    ).resolves.toEqual({ rows: [], exhaustive: true });
+  });
+
+  it.each([
+    { kind: 'an absent', envelope: {} },
+    { kind: 'a null', envelope: { result_info: null } },
+    { kind: 'an empty', envelope: { result_info: {} } },
+    {
+      kind: 'a count-only',
+      envelope: { result_info: { count: 1, per_page: 50 } },
+    },
+  ])('records a non-exhaustive page for $kind result_info', async ({
+    envelope,
+  }) => {
+    await expect(listed({ result: rows, ...envelope })).resolves.toEqual({
+      rows,
+      exhaustive: false,
+    });
+  });
+
+  it.each([
+    { kind: 'more than one page', result_info: { total_pages: 2 } },
+    { kind: 'a total_count above the rows', result_info: { total_count: 2 } },
+  ])('refuses $kind', async ({ result_info }) => {
+    await expect(listed({ result: rows, result_info })).rejects.toMatchObject({
       code: 'provider-unavailable',
     });
   });

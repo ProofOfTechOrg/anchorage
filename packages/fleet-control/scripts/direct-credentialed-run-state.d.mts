@@ -158,7 +158,8 @@ export type DirectResidualSurface =
   | 'scripts'
   | 'buckets'
   | 'domains'
-  | 'routes';
+  | 'routes'
+  | 'queues';
 
 export interface DirectResidualObservation {
   readonly version: 1;

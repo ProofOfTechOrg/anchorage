@@ -480,6 +480,14 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
         ),
       );
     }
+    if (
+      method === 'GET' &&
+      /\/accounts\/[^/]+\/queues$/u.test(target.pathname)
+    ) {
+      // The direct lane's residual scan lists the account's queues; no world
+      // fixture creates one.
+      return pageArray([]);
+    }
     if (target.pathname.endsWith('/workers/domains') && method === 'GET') {
       const domains = world.customDomains.map((domain) => ({ ...domain }));
       await world.applyAfter('listCustomDomains');
