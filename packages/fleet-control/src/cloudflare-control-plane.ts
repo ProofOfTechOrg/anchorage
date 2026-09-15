@@ -40,6 +40,7 @@ import {
   advanceFleetMigration,
   type FleetMigrationAdvanceAction,
   type FleetMigrationAdvanceResult,
+  type FleetMigrationResultRef,
   readFleetMigrationItemsPage,
 } from './fleet-migration-advance.js';
 import type { FleetMigrationItem } from './fleet-migration-state.js';
@@ -325,6 +326,11 @@ export interface CloudflareAdvanceFleetMigrationOptions {
   ) => FleetSettlementHost | undefined;
   readonly routeAttestation?: AttestConvergedActiveRouteOptions;
   readonly clock?: () => number;
+  readonly signal?: AbortSignal;
+  /** Carries `AdvanceFleetMigrationOptions.onComplete`'s delivery contract. */
+  readonly onComplete?: (
+    result: FleetMigrationResultRef,
+  ) => void | Promise<void>;
 }
 
 export interface CloudflareFleetOperationPageOptions {
@@ -586,6 +592,8 @@ export function createCloudflareControlPlane(
         action: input.action,
         routeAttestation: input.routeAttestation,
         clock: input.clock?.bind(input),
+        signal: input.signal,
+        onComplete: input.onComplete?.bind(input),
       });
     },
     readFleetMigrationItemsPage: (input: CloudflareFleetOperationPageOptions) =>

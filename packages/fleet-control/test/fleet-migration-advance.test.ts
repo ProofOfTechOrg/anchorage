@@ -4388,3 +4388,155 @@ describe('bounded fleet migration', () => {
     }
   });
 });
+
+describe('bounded fleet migration abort signal and completion callback', () => {
+  it('an already-aborted start rejects with the sentinel and writes nothing', async () => {
+    const world = createWorld();
+    const sentinel = new Error('host cancelled the migration');
+    await expect(
+      advanceFleetMigration({
+        ...world.options({
+          kind: 'start',
+          operationId: uuid(),
+          records: [world.initial],
+          canaryTenantTags: [],
+        }),
+        signal: AbortSignal.abort(sentinel),
+      }),
+    ).rejects.toBe(sentinel);
+    expect(providerMutations(world)).toEqual([]);
+    expect(world.ops).toEqual([]);
+    expect(world.operationStore.calls).toEqual([]);
+    expect(world.operationStore.operations.size).toBe(0);
+    expect(world.operationStore.rows.size).toBe(0);
+    expect(world.fleetStore.puts).toEqual([]);
+  });
+
+  it('an abort raised before the item step leaves the operation resumable', async () => {
+    const world = createWorld();
+    const started = await world.start();
+    const item = world.operationStore.item();
+    const run = copy(world.operationStore.operations.get(uuid()));
+    const sentinel = new Error('host cancelled between calls');
+    const controller = new AbortController();
+    world.operationStore.beforeLease = () => controller.abort(sentinel);
+    world.ops.length = 0;
+    world.operationStore.calls.length = 0;
+    await expect(
+      advanceFleetMigration({
+        ...world.options({ kind: 'continue', token: started.token }),
+        signal: controller.signal,
+      }),
+    ).rejects.toBe(sentinel);
+    expect(providerMutations(world)).toEqual([]);
+    expect(world.operationStore.item()).toEqual(item);
+    expect(world.operationStore.operations.get(uuid())).toEqual(run);
+    expect(world.operationStore.calls).toEqual([]);
+    expect(world.operationStore.failures).toEqual([]);
+    world.operationStore.beforeLease = undefined;
+    const resumed = await advanceFleetMigration({
+      ...world.options({ kind: 'continue', token: started.token }),
+      signal: new AbortController().signal,
+    });
+    expect(await drainWorld(world, resumed)).toMatchObject({
+      status: 'complete',
+    });
+  });
+
+  it('completion invokes onComplete once with the returned result, after the durable finalize', async () => {
+    const world = createWorld();
+    const seen: unknown[] = [];
+    const states: (string | undefined)[] = [];
+    const base = world.options;
+    world.options = (action) => ({
+      ...base(action),
+      async onComplete(result) {
+        seen.push(result);
+        states.push(world.operationStore.operations.get(uuid())?.state);
+      },
+    });
+    const final = await drainWorld(world);
+    if (final.status !== 'complete') throw new Error('expected a complete run');
+    expect(seen).toEqual([final.result]);
+    expect(seen[0]).toBe(final.result);
+    expect(states).toEqual(['finalized']);
+  });
+
+  it('a continue on the finalized operation delivers onComplete again', async () => {
+    const world = createWorld();
+    const seen: unknown[] = [];
+    const base = world.options;
+    world.options = (action) => ({
+      ...base(action),
+      onComplete(result) {
+        seen.push(result);
+      },
+    });
+    const final = await drainWorld(world);
+    if (final.status !== 'complete') throw new Error('expected a complete run');
+    const replayed = await continueWorld(world, final);
+    if (replayed.status !== 'complete')
+      throw new Error('expected a complete replay');
+    expect(seen).toHaveLength(2);
+    expect(seen[1]).toBe(replayed.result);
+    expect(replayed.result).toEqual(final.result);
+    expect(
+      world.operationStore.calls.filter((call) => call === 'finalize'),
+    ).toHaveLength(1);
+  });
+
+  it.each([
+    'asynchronously',
+    'synchronously',
+  ] as const)('an onComplete that fails %s rejects the call and leaves the operation finalized', async (mode) => {
+    const world = createWorld();
+    const sentinel = new Error('host completion callback failed');
+    const base = world.options;
+    const onComplete =
+      mode === 'synchronously'
+        ? () => {
+            throw sentinel;
+          }
+        : () => Promise.reject(sentinel);
+    world.options = (action) => ({ ...base(action), onComplete });
+    let next: FleetMigrationAdvanceResult = await world.start();
+    let rejected: unknown;
+    for (let count = 0; count < 100 && next.status === 'pending'; count += 1) {
+      try {
+        next = await continueWorld(world, next);
+      } catch (error) {
+        rejected = error;
+        break;
+      }
+    }
+    expect(rejected).toBe(sentinel);
+    expect(world.operationStore.operations.get(uuid())).toMatchObject({
+      state: 'finalized',
+    });
+    world.options = base;
+    expect(await continueWorld(world, next)).toMatchObject({
+      status: 'complete',
+    });
+  });
+
+  it('omitting both options drains exactly as inert ones do', async () => {
+    const plain = createWorld();
+    const drained = await drainWorld(plain);
+    const armed = createWorld();
+    const base = armed.options;
+    const controller = new AbortController();
+    const seen: unknown[] = [];
+    armed.options = (action) => ({
+      ...base(action),
+      signal: controller.signal,
+      onComplete(result) {
+        seen.push(result);
+      },
+    });
+    expect(await drainWorld(armed)).toEqual(drained);
+    expect(armed.ops).toEqual(plain.ops);
+    expect(armed.operationStore.calls).toEqual(plain.operationStore.calls);
+    expect(armed.operationStore.item()).toEqual(plain.operationStore.item());
+    expect(seen).toHaveLength(1);
+  });
+});

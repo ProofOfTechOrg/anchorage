@@ -72,6 +72,19 @@ export interface AdvanceFleetMigrationOptions {
   ) => FleetSettlementHost | undefined;
   readonly routeAttestation?: AttestConvergedActiveRouteOptions;
   readonly clock?: () => number;
+  /** Call-local only; never persisted. */
+  readonly signal?: AbortSignal;
+  /**
+   * Runs on every call that returns `complete` — the call that finalizes the
+   * operation, a later continue on the finalized operation, and a replayed
+   * start of the same operationId — after the finalization is durable and
+   * before this call returns. Delivery is therefore at least once; the host
+   * deduplicates on `operationId`. A rejection propagates to the caller and
+   * leaves the durable finalization intact.
+   */
+  readonly onComplete?: (
+    result: FleetMigrationResultRef,
+  ) => void | Promise<void>;
   readonly action: FleetMigrationAdvanceAction;
 }
 
@@ -401,6 +414,7 @@ async function advanceItem(
   run: MigrationRun,
   item: FleetMigrationItem,
 ): Promise<FleetMigrationAdvanceResult> {
+  options.signal?.throwIfAborted();
   let next: FleetMigrationItem;
   try {
     const attestationOptions: AttestConvergedActiveRouteOptions = {
@@ -563,10 +577,14 @@ export async function advanceFleetMigration(
   options: AdvanceFleetMigrationOptions,
 ): Promise<FleetMigrationAdvanceResult> {
   assertOperationStore(options.operationStore);
+  options.signal?.throwIfAborted();
   const action = options.action;
-  return action.kind === 'start'
-    ? startMigration(options, action)
-    : continueMigration(options, action.token);
+  const result =
+    action.kind === 'start'
+      ? await startMigration(options, action)
+      : await continueMigration(options, action.token);
+  if (result.status === 'complete') await options.onComplete?.(result.result);
+  return result;
 }
 
 /** Reads ordered item metadata, including while the operation is running. */

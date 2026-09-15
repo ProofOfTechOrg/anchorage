@@ -771,6 +771,14 @@ describe('Cloudflare control-plane composition with real constructors and mocked
     const control = createCloudflareControlPlane(hostOptions());
     let resolvedSpec = SPEC;
     const settlement = { settle: vi.fn(async () => {}) };
+    const controller = new AbortController();
+    const completions: unknown[] = [];
+    const migrationResult = {
+      operationId: OPERATION_ID,
+      itemCount: 1,
+      completedItemCount: 1,
+      finalizedAtMs: 900,
+    };
     const input: CloudflareAdvanceFleetMigrationOptions = {
       action: {
         kind: 'start',
@@ -798,6 +806,11 @@ describe('Cloudflare control-plane composition with real constructors and mocked
         return 300;
       },
       routeAttestation,
+      signal: controller.signal,
+      onComplete(result) {
+        expect(this).toBe(input);
+        completions.push(result);
+      },
     };
     Reflect.set(input, 'finalizedStateProviderFor', () => ({}));
     Reflect.set(input, 'backendFor', () => ({}));
@@ -816,6 +829,10 @@ describe('Cloudflare control-plane composition with real constructors and mocked
     expect(forwarded.settlementFor?.(RECORD)).toBe(settlement);
     expect(forwarded.clock?.()).toBe(300);
     expect(forwarded.routeAttestation).toBe(routeAttestation);
+    expect(forwarded.signal).toBe(controller.signal);
+    await forwarded.onComplete?.(migrationResult);
+    expect(completions).toEqual([migrationResult]);
+    expect(completions[0]).toBe(migrationResult);
     expect(forwarded).not.toHaveProperty('finalizedStateProviderFor');
     expect(forwarded).toMatchObject({
       operationStore: required(constructed.operationStore.mock.calls[0])[0],
@@ -825,7 +842,12 @@ describe('Cloudflare control-plane composition with real constructors and mocked
     Reflect.set(input, 'specFor', () => {
       throw new Error('mutated callback');
     });
+    Reflect.set(input, 'onComplete', () => {
+      throw new Error('mutated callback');
+    });
     expect(forwarded.specFor(RECORD)).toBe(SPEC);
+    await forwarded.onComplete?.(migrationResult);
+    expect(completions).toEqual([migrationResult, migrationResult]);
     resolvedSpec = {
       ...SPEC,
       durableObjectBindings: [
