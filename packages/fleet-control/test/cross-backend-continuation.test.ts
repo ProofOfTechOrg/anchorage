@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { migrateFleet } from '../src/fleet.js';
+import { auditFleetDrift, migrateFleet } from '../src/fleet.js';
+import {
+  type AdvanceFleetAuditOptions,
+  advanceFleetAudit,
+  type FleetAuditAdvanceAction,
+  type FleetAuditAdvanceResult,
+  readFleetAuditFindingsPage,
+} from '../src/fleet-audit-advance.js';
+import type { FleetOperationToken } from '../src/fleet-operation-state.js';
 import {
   cleanupDeploymentArtifacts,
   decommissionDeployment,
@@ -13,26 +21,41 @@ import {
   type DeploymentSpec,
   effectiveLifecyclePhase,
   type FleetRecord,
+  type FleetResourceInventory,
   type FleetStateLease,
   type FleetStateStore,
+  type ProvisioningBackend,
 } from '../src/types.js';
-import { restProjection } from './fixtures/cloudflare-fetch-fixture.js';
+import {
+  recordingFetch,
+  restProjection,
+} from './fixtures/cloudflare-fetch-fixture.js';
+import {
+  FakeInventoryRunStore,
+  FakeOperationStore,
+  uuidFor,
+} from './fixtures/fleet-operation-fakes.js';
 import {
   assertHarnessFailuresConsumed,
   buildPlainWorkerSpec,
   captureFailure,
   directHarness,
   errorChain,
+  HarnessExportStore,
   HarnessFleetStore,
   ignoreFailure,
   initialSpec,
   migrationSpec,
   type PlainWorkerHarness,
+  plainOnlyClient,
   routeAttestation,
   sharedSecrets,
   wranglerHarness,
 } from './fixtures/plain-worker-harnesses.js';
-import type { ProviderWorld } from './fixtures/provider-world.js';
+import {
+  type ProviderWorld,
+  providerWorld,
+} from './fixtures/provider-world.js';
 import {
   type PlainWorkerFsControl,
   registerScratchCleanup,
@@ -1044,5 +1067,387 @@ describe('ordinary Worker cross-backend continuation', () => {
       enabled: false,
       previewsEnabled: false,
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Audit continuation across the backend-origin boundary. The bounded audit
+// coordinator needs two durable stores the provisioning harnesses do not carry
+// (`FleetOperationStore` and `FleetInventoryRunStore`) and one finalized
+// `FleetResourceInventory` generation; the stores come from
+// `test/fixtures/fleet-operation-fakes.ts` and the generation is collected from
+// this world through the real inventory engine. `backendFor` is a per-call
+// option the continuation token never carries, so an audit's backend switch is
+// a switch of that option over one operation store, one inventory store, and
+// one world.
+// ---------------------------------------------------------------------------
+
+/**
+ * The audit's frozen instant. The provider world answers maintenance health
+ * with `alarmAt: 2_000`, `lastSweepAt: 1_000`, and `lastPurgeAt: 1_000`, and
+ * `provision` stamps every record at 1_000, so pinning both audit clocks here
+ * leaves every duty inside `AUDIT_STALE_AFTER_MS` and the maintenance re-arm
+ * branch untaken.
+ */
+const AUDIT_NOW_MS = 1_000;
+const AUDIT_STALE_AFTER_MS = 3_600_000;
+const AUDIT_TENANT_TAGS = ['acme', 'beta'] as const;
+
+/**
+ * Every audited tenant keeps `buildPlainWorkerSpec`'s maintenance base URL,
+ * because a provider world serves one maintenance origin. Each tenant's
+ * inspection still resolves its own script there: the backend sends a
+ * version-override header for a deployed candidate, and the world's
+ * maintenance responder reads the script name out of it.
+ */
+function auditSpec(tenantTag: string): DeploymentSpec {
+  return buildPlainWorkerSpec({
+    tenantTag,
+    scriptName: `fleet-${tenantTag}-production`,
+    databaseName: `fleet-${tenantTag}-production`,
+    routeHostname: `${tenantTag}.example.test`,
+  });
+}
+
+/**
+ * Wraps one backend so every inspection and maintenance re-arm the audit
+ * reaches it through is recorded with its origin. An `inspect` that resolves
+ * appends a second entry naming its outcome, so a log that ends at the
+ * `inspect` entry is an inspection that threw.
+ */
+function observedAuditBackend(
+  origin: string,
+  backend: ProvisioningBackend,
+  log: string[],
+): ProvisioningBackend {
+  const inspect = backend.inspect.bind(backend);
+  vi.spyOn(backend, 'inspect').mockImplementation(
+    async (spec, maintenanceAdminSecret, expectedArtifactVersion) => {
+      log.push(`${origin}:inspect:${spec.tenantTag}`);
+      const live = await inspect(
+        spec,
+        maintenanceAdminSecret,
+        expectedArtifactVersion,
+      );
+      log.push(`${origin}:${live ? 'live' : 'absent'}:${spec.tenantTag}`);
+      return live;
+    },
+  );
+  const ensureMaintenance = backend.ensureMaintenance.bind(backend);
+  vi.spyOn(backend, 'ensureMaintenance').mockImplementation(
+    async (spec, maintenanceAdminSecret, fence, expectedArtifactVersion) => {
+      log.push(`${origin}:ensureMaintenance:${spec.tenantTag}`);
+      return ensureMaintenance(
+        spec,
+        maintenanceAdminSecret,
+        fence,
+        expectedArtifactVersion,
+      );
+    },
+  );
+  return backend;
+}
+
+interface AuditFleet {
+  readonly world: ProviderWorld;
+  readonly records: readonly FleetRecord[];
+  readonly inventory: FleetResourceInventory;
+  readonly operationStore: FakeOperationStore;
+  readonly fleetStore: ContinuationFleetStore;
+  readonly log: string[];
+  readonly wranglerBackend: ProvisioningBackend;
+  readonly directBackend: ProvisioningBackend;
+  readonly specFor: (record: FleetRecord) => DeploymentSpec;
+  readonly maintenanceSecretFor: () => string;
+  options(
+    action: FleetAuditAdvanceAction,
+    backend: ProvisioningBackend,
+  ): AdvanceFleetAuditOptions;
+}
+
+/**
+ * Provisions every tenant in `AUDIT_TENANT_TAGS` through its own Wrangler
+ * backend over ONE provider world, then pins that world's collected inventory
+ * as generation 1.
+ */
+async function wranglerAuditFleet(): Promise<AuditFleet> {
+  const world = providerWorld('uuid');
+  const specs = new Map<string, DeploymentSpec>();
+  const records: FleetRecord[] = [];
+  const sources: PlainWorkerHarness[] = [];
+  for (const tenantTag of AUDIT_TENANT_TAGS) {
+    const spec = auditSpec(tenantTag);
+    specs.set(tenantTag, spec);
+    const source = wrangler(world);
+    sources.push(source);
+    records.push((await provision(source, spec)).record);
+  }
+  const wranglerOrigin = sources[0];
+  if (!wranglerOrigin) throw new Error('audit fleet has no Wrangler origin');
+
+  const inventory = await plainOnlyClient(
+    recordingFetch(restProjection(world)),
+    new HarnessExportStore(),
+  ).collectFleetInventory({
+    databaseNamePrefix: 'fleet-',
+    scriptNamePrefix: 'fleet-',
+    includeDispatchNamespace: false,
+  });
+  const operationStore = new FakeOperationStore();
+  const inventoryStore = new FakeInventoryRunStore();
+  inventoryStore.registerFinalizedGeneration(1, inventory);
+  const fleetStore = new ContinuationFleetStore(records);
+  const log: string[] = [];
+  const specFor = (record: FleetRecord) => {
+    const spec = specs.get(record.tenantTag);
+    if (!spec) throw new Error(`no spec for '${record.tenantTag}'`);
+    return spec;
+  };
+  const maintenanceSecretFor = () => sharedSecrets.maintenanceAdmin;
+  return {
+    world,
+    records,
+    inventory,
+    operationStore,
+    fleetStore,
+    log,
+    wranglerBackend: observedAuditBackend(
+      'wrangler',
+      wranglerOrigin.backend,
+      log,
+    ),
+    directBackend: observedAuditBackend(
+      'direct',
+      directHarness(world).backend,
+      log,
+    ),
+    specFor,
+    maintenanceSecretFor,
+    options(action, backend) {
+      return {
+        operationStore,
+        inventoryStore,
+        fleetStore,
+        action,
+        backendFor: () => backend,
+        specFor,
+        maintenanceSecretFor,
+        auditClock: () => AUDIT_NOW_MS,
+        authorityClock: () => AUDIT_NOW_MS,
+      };
+    },
+  };
+}
+
+function auditInspections(log: readonly string[]): readonly string[] {
+  return log.filter((entry) => entry.includes(':inspect:'));
+}
+
+function auditMaintenanceCalls(log: readonly string[]): readonly string[] {
+  return log.filter((entry) => entry.includes(':ensureMaintenance:'));
+}
+
+function pendingAuditToken(
+  result: FleetAuditAdvanceResult,
+): FleetOperationToken {
+  if (result.status !== 'pending') {
+    throw new Error(`expected a pending audit result, got '${result.status}'`);
+  }
+  return result.token;
+}
+
+/**
+ * Advances the operation through `backend` until `stop` holds, and answers the
+ * token the next leg resumes from. `cap` is slack: every stage this fleet
+ * reaches commits once per call.
+ */
+async function advanceAuditUntil(
+  fleet: AuditFleet,
+  backend: ProvisioningBackend,
+  firstToken: FleetOperationToken,
+  stop: () => boolean,
+  cap = 60,
+): Promise<FleetOperationToken> {
+  let token = firstToken;
+  for (let attempt = 0; attempt < cap; attempt += 1) {
+    if (stop()) return token;
+    token = pendingAuditToken(
+      await advanceFleetAudit(
+        fleet.options({ kind: 'continue', token }, backend),
+      ),
+    );
+  }
+  throw new Error(`advanceAuditUntil exceeded its ${cap}-call cap`);
+}
+
+/** Advances the operation through `backend` to a terminal result. */
+async function advanceAuditToTerminal(
+  fleet: AuditFleet,
+  backend: ProvisioningBackend,
+  firstToken: FleetOperationToken,
+  cap = 60,
+): Promise<FleetAuditAdvanceResult> {
+  let token = firstToken;
+  for (let attempt = 0; attempt < cap; attempt += 1) {
+    const result = await advanceFleetAudit(
+      fleet.options({ kind: 'continue', token }, backend),
+    );
+    if (result.status !== 'pending') return result;
+    token = result.token;
+  }
+  throw new Error(`advanceAuditToTerminal exceeded its ${cap}-call cap`);
+}
+
+describe('ordinary Worker cross-backend audit continuation', () => {
+  afterEach(assertHarnessFailuresConsumed);
+
+  it('finishes a Wrangler-origin audit through the direct backend on the token leg 1 minted', async () => {
+    const fleet = await wranglerAuditFleet();
+    const operationId = uuidFor(701);
+
+    const started = await advanceFleetAudit(
+      fleet.options(
+        {
+          kind: 'start',
+          operationId,
+          records: fleet.records,
+          staleAfterMs: AUDIT_STALE_AFTER_MS,
+        },
+        fleet.wranglerBackend,
+      ),
+    );
+    const handoff = await advanceAuditUntil(
+      fleet,
+      fleet.wranglerBackend,
+      pendingAuditToken(started),
+      () => auditInspections(fleet.log).length === 1,
+    );
+    expect(auditInspections(fleet.log)).toEqual(['wrangler:inspect:acme']);
+
+    // The switch is a `backendFor` switch over the same operation store, the
+    // same inventory store, and the same world: the token carries only
+    // { version, operationId, revision }.
+    const resumed = await advanceFleetAudit(
+      fleet.options({ kind: 'continue', token: handoff }, fleet.directBackend),
+    );
+
+    expect(resumed.token.operationId).toBe(handoff.operationId);
+    expect(resumed.token.revision).toBeGreaterThan(handoff.revision);
+    expect(auditInspections(fleet.log)).toEqual([
+      'wrangler:inspect:acme',
+      'direct:inspect:beta',
+    ]);
+    const terminal =
+      resumed.status === 'pending'
+        ? await advanceAuditToTerminal(
+            fleet,
+            fleet.directBackend,
+            resumed.token,
+          )
+        : resumed;
+    expect(terminal.status).toBe('complete');
+    if (terminal.status !== 'complete') throw new Error('unreachable');
+    expect(terminal.result).toMatchObject({
+      operationId,
+      generation: 1,
+      recordCount: fleet.records.length,
+    });
+    expect(auditInspections(fleet.log)).toEqual([
+      'wrangler:inspect:acme',
+      'direct:inspect:beta',
+    ]);
+  });
+
+  it('audits the direct leg without a maintenance mutation', async () => {
+    const fleet = await wranglerAuditFleet();
+    const operationId = uuidFor(702);
+
+    const started = await advanceFleetAudit(
+      fleet.options(
+        {
+          kind: 'start',
+          operationId,
+          records: fleet.records,
+          staleAfterMs: AUDIT_STALE_AFTER_MS,
+        },
+        fleet.wranglerBackend,
+      ),
+    );
+    const handoff = await advanceAuditUntil(
+      fleet,
+      fleet.wranglerBackend,
+      pendingAuditToken(started),
+      () => auditInspections(fleet.log).length === 1,
+    );
+    const before = worldFacts(fleet.world);
+
+    const terminal = await advanceAuditToTerminal(
+      fleet,
+      fleet.directBackend,
+      handoff,
+    );
+
+    expect(terminal.status).toBe('complete');
+    // The world's maintenance POST answers health without touching the
+    // collections `worldFacts` snapshots, so the snapshot alone cannot rule a
+    // re-arm out; the backend's own call log does.
+    expect(worldFacts(fleet.world)).toEqual(before);
+    expect(auditMaintenanceCalls(fleet.log)).toEqual([]);
+  });
+
+  it('reads the same successful findings after the switch as a single-backend audit', async () => {
+    const fleet = await wranglerAuditFleet();
+    const operationId = uuidFor(703);
+
+    const started = await advanceFleetAudit(
+      fleet.options(
+        {
+          kind: 'start',
+          operationId,
+          records: fleet.records,
+          staleAfterMs: AUDIT_STALE_AFTER_MS,
+        },
+        fleet.wranglerBackend,
+      ),
+    );
+    const handoff = await advanceAuditUntil(
+      fleet,
+      fleet.wranglerBackend,
+      pendingAuditToken(started),
+      () => auditInspections(fleet.log).length === 1,
+    );
+    const terminal = await advanceAuditToTerminal(
+      fleet,
+      fleet.directBackend,
+      handoff,
+    );
+    expect(terminal.status).toBe('complete');
+
+    const page = await readFleetAuditFindingsPage(fleet.operationStore, {
+      operationId,
+      limit: 100,
+    });
+    const singleBackend = await auditFleetDrift({
+      store: new ContinuationFleetStore(fleet.records),
+      records: fleet.records,
+      inventory: fleet.inventory,
+      backendFor: () => directHarness(fleet.world).backend,
+      specFor: fleet.specFor,
+      maintenanceSecretFor: fleet.maintenanceSecretFor,
+      staleAfterMs: AUDIT_STALE_AFTER_MS,
+      now: AUDIT_NOW_MS,
+    });
+
+    expect(page).toMatchObject({ findings: [], done: true });
+    expect(page.findings).toEqual(singleBackend);
+    // An identical `audit-error` list on both sides would satisfy the equality
+    // above without either side reaching a deployment, so each inspection's
+    // recorded outcome carries the proof that it succeeded.
+    expect(fleet.log).toEqual([
+      'wrangler:inspect:acme',
+      'wrangler:live:acme',
+      'direct:inspect:beta',
+      'direct:live:beta',
+    ]);
   });
 });

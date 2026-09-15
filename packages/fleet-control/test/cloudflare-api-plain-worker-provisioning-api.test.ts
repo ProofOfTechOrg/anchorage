@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { APIConnectionTimeoutError } from 'cloudflare';
 import { describe, expect, it, vi } from 'vitest';
 import { CloudflareApiPlainWorkerBackend } from '../src/cloudflare-api-plain-worker-backend.js';
 import { CloudflareApiPlainWorkerProvisioningApi } from '../src/cloudflare-api-plain-worker-provisioning-api.js';
@@ -809,6 +810,36 @@ describe('CloudflareApiPlainWorkerProvisioningApi', () => {
     await expect(
       forbidden.api.deleteWorkerScript('forbidden', ownedFence()),
     ).rejects.toMatchObject({ status: 403 });
+
+    for (const status of [429, 500]) {
+      const refused = subject(async () =>
+        Response.json(
+          { success: false, errors: [] },
+          // The SDK's `shouldRetry` retries both of these, so each spends the
+          // client's whole retry budget; `retry-after-ms` holds every one of
+          // those retries to a millisecond of real-timer backoff.
+          { status, headers: { 'retry-after-ms': '1' } },
+        ),
+      );
+      await expect(
+        refused.api.deleteWorkerScript('refused', ownedFence()),
+      ).rejects.toMatchObject({ status });
+    }
+
+    const timedOut = subject(() =>
+      Promise.reject(new Error('transport timed out')),
+    );
+    const timeout = await rejectedValue(
+      timedOut.api.deleteWorkerScript('slow', ownedFence()),
+    );
+
+    // The SDK's error classes never assign `name` (core/error.js:78-93), so the
+    // subclass itself is what identifies a timeout on a raw rejection.
+    expect(timeout).toBeInstanceOf(APIConnectionTimeoutError);
+    expect((timeout as Error).message).toBe('Request timed out.');
+    // The absence gate reads `status === 404`; a timeout carries no status at
+    // all, so it can only refuse.
+    expect((timeout as { status?: unknown }).status).toBeUndefined();
   });
 
   it('propagates durable export integrity failures', async () => {

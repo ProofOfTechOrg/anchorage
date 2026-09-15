@@ -2,6 +2,7 @@
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
+import { APIConnectionTimeoutError } from 'cloudflare';
 import { BaseNamespaces } from 'cloudflare/resources/workers-for-platforms/dispatch/namespaces/namespaces';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -39,7 +40,11 @@ import { providerWorld } from './fixtures/provider-world.js';
 // Shared-client WFP-plane cases live here so the legacy WFP request and
 // response pins remain byte-comparable to the pre-plain-worker client.
 
-function apiFailure(status: number, message = 'provider failure'): Response {
+function apiFailure(
+  status: number,
+  message = 'provider failure',
+  headers?: Readonly<Record<string, string>>,
+): Response {
   return Response.json(
     {
       success: false,
@@ -47,7 +52,7 @@ function apiFailure(status: number, message = 'provider failure'): Response {
       messages: [],
       result: null,
     },
-    { status },
+    { status, ...(headers === undefined ? {} : { headers }) },
   );
 }
 
@@ -1216,9 +1221,18 @@ describe('CloudflareProvisioningClient plain-worker plane', () => {
   });
 
   it.each([
-    403, 500,
+    403, 429, 500,
   ])('propagates provider %s from every deployment and version read', async (status) => {
-    const fixture = recordingFetch(() => apiFailure(status));
+    // The SDK's `shouldRetry` retries a 429, so this row spends the client's
+    // whole retry budget on each read; `retry-after-ms` holds every one of
+    // those retries to a millisecond of real-timer backoff.
+    const fixture = recordingFetch(() =>
+      apiFailure(
+        status,
+        'provider failure',
+        status === 429 ? { 'retry-after-ms': '1' } : undefined,
+      ),
+    );
     const client = plainClient({ fetch: fixture.fetch });
     const operations = [
       () => client.ordinaryWorkerDeploymentStatus('plain'),
@@ -1229,6 +1243,60 @@ describe('CloudflareProvisioningClient plain-worker plane', () => {
     for (const operation of operations) {
       await expect(operation()).rejects.toMatchObject({ status });
     }
+  });
+
+  it('refuses every deployment and version read that times out', async () => {
+    // A never-resolving fetch cannot stand in for a timeout: `recordingFetch`
+    // never reads `init.signal`, so the client's `AbortSignal.timeout` reaches
+    // a fetch that ignores it. A rejection the SDK reads as a timeout reaches
+    // the same boundary and carries no `status`, which is why this case is not
+    // a row in the matrix above.
+    const fixture = recordingFetch(() =>
+      Promise.reject(new Error('transport timed out')),
+    );
+    const client = plainClient({ fetch: fixture.fetch });
+    const operations = [
+      () => client.ordinaryWorkerDeploymentStatus('plain'),
+      () => client.listOrdinaryWorkerVersions('plain'),
+      () => client.findOrdinaryWorkerVersion('plain', 'v1'),
+      () => client.viewOrdinaryWorkerVersion('plain', 'v1'),
+    ];
+    // The SDK's error classes never assign `name` (core/error.js:78-93), so a
+    // raw rejection reports the base `Error` name and the subclass itself is
+    // what identifies a timeout; `sanitizeProviderError` is what stamps the
+    // constructor name the sanitized chains elsewhere in this file read.
+    type ReadOutcome =
+      | Readonly<{ settled: 'resolved'; value: unknown }>
+      | Readonly<{ settled: 'rejected'; timeout: boolean; message: unknown }>;
+    const outcomes: ReadOutcome[] = [];
+    for (const operation of operations) {
+      outcomes.push(
+        await operation().then(
+          (value): ReadOutcome => ({ settled: 'resolved', value }),
+          (error: unknown): ReadOutcome => ({
+            settled: 'rejected',
+            timeout: error instanceof APIConnectionTimeoutError,
+            message: fact(error, 'message'),
+          }),
+        ),
+      );
+    }
+
+    expect(outcomes).toEqual(
+      operations.map(() => ({
+        settled: 'rejected',
+        timeout: true,
+        message: 'Request timed out.',
+      })),
+    );
+    // A read that resolved to `undefined` would have classified the timeout as
+    // absence, which is the outcome this requirement forbids.
+    expect(
+      outcomes.filter(
+        (outcome) =>
+          outcome.settled === 'resolved' && outcome.value === undefined,
+      ),
+    ).toEqual([]);
   });
 
   it.each([

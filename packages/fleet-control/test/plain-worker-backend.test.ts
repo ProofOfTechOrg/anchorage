@@ -11,6 +11,7 @@ import { ActiveRouteAttestationError } from '../src/active-route.js';
 import { CloudflareApiPlainWorkerProvisioningApi } from '../src/cloudflare-api-plain-worker-provisioning-api.js';
 import { CloudflareProvisioningClient } from '../src/cloudflare-client.js';
 import {
+  isNotFound,
   isTransientProviderError,
   sanitizeProviderError,
 } from '../src/cloudflare-provider-errors.js';
@@ -620,6 +621,16 @@ describe('reconciled transient provisioning failures', () => {
     expect(isTransientProviderError(sanitizeProviderError(error, []))).toBe(
       transient,
     );
+  });
+
+  it.each([
+    ['429', () => providerFailure(429)],
+    ['timeout', () => new APIConnectionTimeoutError()],
+  ])('classifies a %s failure as transient but never as absence', (_label, create) => {
+    const error = create();
+    expect(isTransientProviderError(error)).toBe(true);
+    expect(isNotFound(error)).toBe(false);
+    expect(isNotFound(sanitizeProviderError(error, []))).toBe(false);
   });
 
   it('does not classify arbitrary failures without status as transient', () => {
