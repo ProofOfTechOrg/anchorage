@@ -25,7 +25,7 @@ import {
   queueApprovalForSuspension,
   resumeRunWithRequeue,
 } from '@proofoftech/flowsafe/host-kit';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { buildShowcaseRuntime, SHOWCASE_MODULES } from '#worker/runtime';
 import { ACCESS_CONNECTOR } from '#worker/workflows/access-request';
 import { PUBLISH_CONNECTOR } from '#worker/workflows/content-pipeline';
@@ -554,11 +554,13 @@ describe('showcase run routes', () => {
   function routerFor(
     harness: ReturnType<typeof buildHarness>,
     actor: ApprovalActor,
+    mutationEpoch?: number,
   ) {
     return createRunRouter({
       workflows: SHOWCASE_MODULES.map((entry) => entry.meta),
       resolve: createActorResolver({
         authenticate: () => actor,
+        mutationEpoch,
         storeFactory: harness.storeFactory,
         deploymentTag: 'showcase-test',
         buildService: (store) =>
@@ -576,7 +578,13 @@ describe('showcase run routes', () => {
       // In-memory harness, no database to reserve against: the opt-out is
       // written down rather than defaulted — see RunRouterStartIdempotency.
       startIdempotency: 'none',
-      start: async ({ workflowId, runId, inputData, principal }) => {
+      start: async ({
+        workflowId,
+        runId,
+        inputData,
+        principal,
+        mutationEpoch,
+      }) => {
         const resources = harness.storeFactory.resources();
         const resourceOwner = principalOwner(principal);
         if (!(await resources.claim('run', runId, resourceOwner))) {
@@ -586,6 +594,7 @@ describe('showcase run routes', () => {
           return await harness.runtime.start(workflowId, {
             runId,
             inputData,
+            mutationEpoch,
             requestedBy: principal.id,
             requestedByKind: principal.kind,
           });
@@ -627,6 +636,55 @@ describe('showcase run routes', () => {
     justification: 'oncall',
     targetScope: 'access-request',
   };
+
+  it('forwards a configured epoch to Runtime after the ownership claim wait', async () => {
+    const harness = buildHarness();
+    const handle = routerFor(harness, { id: 'ada', role: 'admin' }, 7);
+    const resources = harness.storeFactory.resources();
+    const claim = resources.claim.bind(resources);
+    let release = () => {};
+    let entered = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const ready = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let holdNext = true;
+    const claimSpy = vi
+      .spyOn(resources, 'claim')
+      .mockImplementation(async (...args) => {
+        if (holdNext && args[0] === 'run') {
+          holdNext = false;
+          entered();
+          await held;
+        }
+        return claim(...args);
+      });
+    const start = vi.spyOn(harness.runtime, 'start');
+    const operation = handle(startRequest('access-request', ACCESS_INPUT));
+    try {
+      await Promise.race([ready, operation]);
+      expect(holdNext).toBe(false);
+      expect(start).not.toHaveBeenCalled();
+      release();
+      expect((await operation)?.status).toBe(200);
+      expect(start).toHaveBeenCalledTimes(1);
+      expect(start.mock.calls[0]).toEqual([
+        'access-request',
+        expect.objectContaining({
+          mutationEpoch: 7,
+          requestedBy: 'ada',
+          requestedByKind: 'human',
+        }),
+      ]);
+    } finally {
+      release();
+      await Promise.allSettled([operation]);
+      claimSpy.mockRestore();
+      start.mockRestore();
+    }
+  });
 
   it('serves all six workflow metas at GET /workflows', async () => {
     // #given

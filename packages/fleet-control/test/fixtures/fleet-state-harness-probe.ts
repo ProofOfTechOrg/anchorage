@@ -1,22 +1,75 @@
 // SPDX-License-Identifier: Apache-2.0
-/// <reference types="@cloudflare/workers-types" />
+import type {
+  D1Database,
+  ExportedHandler,
+  Request,
+  Response as WorkerResponse,
+} from '@cloudflare/workers-types';
 
+import {
+  applicationBindingTopology,
+  reserveApplicationR2Resources,
+} from '../../src/application-bindings.js';
 import { D1CloudflareApiRateCoordinator } from '../../src/cloudflare-rate-coordinator.js';
+import { initialWorkerAttachmentScan } from '../../src/cloudflare-worker-attachment-scan-state.js';
+import { D1FleetInventoryRunStore } from '../../src/d1-fleet-inventory-run-store.js';
+import { D1FleetOperationStore } from '../../src/d1-fleet-operation-store.js';
+import { D1FleetStateDatabase } from '../../src/d1-fleet-state-database.js';
+import { advanceDecommissionDeployment } from '../../src/decommission-advance.js';
+import type { FleetAuditProgress } from '../../src/fleet-audit-state.js';
+import { advanceFleetInventory } from '../../src/fleet-inventory-advance.js';
+import {
+  canonicalFleetInventoryRunOptions,
+  emptyFleetInventoryRowCounts,
+  type FleetInventoryRowKind,
+  type FleetInventoryRunRecord,
+  type FleetInventoryRunStore,
+  type FleetInventoryStagedFact,
+  type FleetInventoryStagedRow,
+  fleetInventoryOptionsDigest,
+} from '../../src/fleet-inventory-state.js';
+import type { FleetMigrationProgress } from '../../src/fleet-migration-state.js';
+import type {
+  FleetOperationKind,
+  FleetOperationRunRecord,
+  FleetOperationStagedRow,
+} from '../../src/fleet-operation-state.js';
 import {
   canonicalDeploymentEgressPolicy,
   externalEgressProxyScriptName,
   externalStateScriptName,
 } from '../../src/platform-resources.js';
+import { deploymentSpecDigest } from '../../src/spec-digest.js';
 import {
+  ADDED_NULLABLE_TEXT_COLUMNS,
   D1FleetStateStore,
   type FleetStateDatabase,
 } from '../../src/state-store.js';
 import type {
+  ApplicationR2BucketSnapshot,
+  ApplicationR2Resource,
+  CleanupAdvanceIntent,
+  CleanupTerminalReceipt,
+  DatabaseExport,
+  DatabaseExportReceiptIdentity,
+  DatabaseReference,
+  DecommissionAdvanceIntent,
+  DecommissionAttachmentScanInput,
+  DecommissionAttachmentScanResult,
+  DeploymentSpec,
   FleetRecord,
   FleetStateLease,
+  FleetStateStore,
   PlatformPlaneLease,
   PlatformPlaneResourceSet,
+  ProvisioningBackend,
 } from '../../src/types.js';
+import {
+  backendSwitchDecommissionRecordFixture,
+  decommissionAdvancingRecordFixture,
+} from './decommission-intent-fixture.js';
+
+declare const Response: typeof WorkerResponse;
 
 interface Env {
   DB: D1Database;
@@ -26,34 +79,9 @@ const STATE_TABLE = 'anchorage_fleet_deployments';
 const LEASE_TABLE = 'anchorage_fleet_leases';
 const PLATFORM_CLAIM_TABLE = 'anchorage_platform_plane_claims';
 const PLATFORM_LEASE_TABLE = 'anchorage_platform_plane_leases';
+const BOUNDED_PROVIDER_TABLE = 'anchorage_test_bounded_decommission_provider';
+const CLEANUP_RECEIPT_TABLE = 'anchorage_fleet_cleanup_receipts';
 const DB_NOW_MS = "CAST(unixepoch('subsec') * 1000 AS INTEGER)";
-
-function database(db: D1Database): FleetStateDatabase {
-  const statement = (sql: string, bindings: readonly unknown[]) => {
-    const prepared = db.prepare(sql);
-    return bindings.length > 0 ? prepared.bind(...bindings) : prepared;
-  };
-  return {
-    async query(sql, bindings = []) {
-      const result = await statement(sql, bindings).all<
-        Readonly<Record<string, unknown>>
-      >();
-      return result.results;
-    },
-    async execute(sql, bindings = []) {
-      await statement(sql, bindings).run();
-    },
-    async batch(statements) {
-      const results = await db.batch(
-        statements.map(({ sql, bindings = [] }) => statement(sql, bindings)),
-      );
-      return results.map(
-        (result) =>
-          result.results as readonly Readonly<Record<string, unknown>>[],
-      );
-    },
-  };
-}
 
 function controlledLeaseClock(
   db: D1Database,
@@ -61,12 +89,14 @@ function controlledLeaseClock(
 ): Readonly<{
   database: FleetStateDatabase;
   advance(ms: number): void;
+  advanceBeforeBatchStatement(index: number, ms: number): void;
   allowHeartbeat(): void;
   now(): number;
   heartbeat: Promise<void>;
 }> {
-  const delegate = database(db);
+  const delegate = new D1FleetStateDatabase(db);
   let now = 1_000_000;
+  let batchClockAdvance: { index: number; ms: number } | undefined;
   let allowHeartbeat: (() => void) | undefined;
   const heartbeatAllowed = new Promise<void>((resolve) => {
     allowHeartbeat = resolve;
@@ -88,16 +118,22 @@ function controlledLeaseClock(
       },
       execute: (sql, bindings = []) =>
         delegate.execute(atControlledTime(sql), bindings),
-      batch: (statements) =>
-        delegate.batch(
-          statements.map((statement) => ({
-            ...statement,
-            sql: atControlledTime(statement.sql),
-          })),
-        ),
+      batch: (statements) => {
+        const advance = batchClockAdvance;
+        batchClockAdvance = undefined;
+        return delegate.batch(
+          statements.map((statement, index) => {
+            if (advance?.index === index) now += advance.ms;
+            return { ...statement, sql: atControlledTime(statement.sql) };
+          }),
+        );
+      },
     },
     advance(ms) {
       now += ms;
+    },
+    advanceBeforeBatchStatement(index, ms) {
+      batchClockAdvance = { index, ms };
     },
     allowHeartbeat() {
       allowHeartbeat?.();
@@ -129,6 +165,782 @@ function record(
   };
 }
 
+function decommissionRecord(tenantTag: string, revision: number): FleetRecord {
+  const base = {
+    ...record(tenantTag, 'production'),
+    applicationResources: [],
+    applicationBindings: { vars: [], secrets: [], r2Buckets: [] },
+  };
+  return decommissionAdvancingRecordFixture(base, 'ready', {
+    operationId: '123e4567-e89b-42d3-a456-426614174000',
+    revision,
+    generation: 0,
+    updatedAt: `2026-08-11T00:00:${String(revision).padStart(2, '0')}.000Z`,
+  });
+}
+
+const DECOMMISSION_SCAN_EVIDENCE = 'b'.repeat(64);
+const DECOMMISSION_SCAN_EVIDENCE_COUNT = 2;
+const DECOMMISSION_CREATED_AT = '2026-08-30T00:00:00.000Z';
+const DECOMMISSION_RECEIPT_AUTHORITY = 'd1-test://fleet-exports/receipts/v1';
+const DECOMMISSION_EXPORT_SHA256 = 'c'.repeat(64);
+const DECOMMISSION_EXPORT_SIZE = 37;
+
+function boundedDatabaseId(tenantTag: 'advance' | 'advancelost'): string {
+  return tenantTag === 'advance'
+    ? '00000000-0000-4000-8000-000000000201'
+    : '00000000-0000-4000-8000-000000000202';
+}
+
+function boundedDecommissionSpec(tenantTag: string): DeploymentSpec {
+  return {
+    tenantTag,
+    environment: 'production',
+    scriptName: `${tenantTag}-worker`,
+    databaseName: `${tenantTag}-database`,
+    compatibilityDate: '2026-08-30',
+    mainModule: 'worker.js',
+    modules: [{ name: 'worker.js', content: 'export default {}' }],
+    authoredBy: 'platform',
+    schemaVersion: 1,
+    migrations: [{ version: 1, sql: 'CREATE TABLE example (id TEXT)' }],
+    durableObjectMigrations: [],
+    durableObjectBindings: [],
+    maintenanceBaseUrl: `https://${tenantTag}-control.example.test`,
+    routeHostname: `${tenantTag}.example.test`,
+    application: {
+      vars: [],
+      secrets: [],
+      r2Buckets: [{ name: 'FILES' }],
+    },
+  };
+}
+
+function boundedDecommissionRecord(
+  spec: DeploymentSpec,
+  startAtD1 = false,
+): Readonly<{ record: FleetRecord; resource: ApplicationR2Resource }> {
+  const reserved = reserveApplicationR2Resources(spec)[0];
+  if (!reserved) throw new Error('bounded decommission R2 reservation missing');
+  const resource: ApplicationR2Resource = {
+    ...reserved,
+    state: startAtD1 ? 'deleted' : 'created',
+    creationDate: DECOMMISSION_CREATED_AT,
+  };
+  return {
+    resource,
+    record: {
+      tenantTag: spec.tenantTag,
+      environment: spec.environment,
+      backend: 'plain-worker',
+      scriptName: spec.scriptName,
+      databaseId: boundedDatabaseId(
+        spec.tenantTag as 'advance' | 'advancelost',
+      ),
+      databaseName: spec.databaseName,
+      schemaVersion: spec.schemaVersion,
+      artifactVersion: `${spec.tenantTag}-artifact-v1`,
+      desiredSpecDigest: deploymentSpecDigest(spec),
+      applicationResources: [resource],
+      applicationBindings: applicationBindingTopology(spec, [resource]),
+      durableObjectBindings: [],
+      routeHostname: spec.routeHostname,
+      phase: startAtD1
+        ? 'application-resources-deleted'
+        : 'application-resources-deleting',
+      updatedAt: '2026-08-29T00:00:00.000Z',
+    },
+  };
+}
+
+type BoundedProviderOutcome =
+  | Readonly<{ status: 'fulfilled'; value?: 'default' | 'present' | 'absent' }>
+  | Readonly<{
+      status: 'rejected';
+      reason: 'error' | 'null' | 'undefined';
+    }>;
+
+interface BoundedProviderRow {
+  readonly tenant_tag: string;
+  readonly database_id: string;
+  readonly database_name: string;
+  readonly observed_database_id: string;
+  readonly observed_database_name: string;
+  readonly owner: string;
+  readonly database_present: number;
+  readonly receipt_authority: string | null;
+  readonly receipt_operation_id: string | null;
+  readonly receipt_location: string | null;
+  readonly receipt_size: number | null;
+  readonly receipt_sha256: string | null;
+  readonly receipt_commit_count: number;
+  readonly export_call_count: number;
+  readonly delete_count: number;
+  readonly next_export_outcome: string | null;
+  readonly next_delete_outcome: string | null;
+  readonly next_readback_outcome: string | null;
+  readonly ownership_assertion_count: number;
+  readonly next_ownership_failure_ordinal: number | null;
+}
+
+async function ensureBoundedProviderState(
+  db: D1Database,
+  tenantTag: 'advance' | 'advancelost',
+  databaseName: string,
+): Promise<void> {
+  await db
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS ${BOUNDED_PROVIDER_TABLE} (
+        tenant_tag TEXT PRIMARY KEY,
+        database_id TEXT NOT NULL,
+        database_name TEXT NOT NULL,
+        observed_database_id TEXT NOT NULL,
+        observed_database_name TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        database_present INTEGER NOT NULL,
+        receipt_authority TEXT,
+        receipt_operation_id TEXT,
+        receipt_location TEXT,
+        receipt_size INTEGER,
+        receipt_sha256 TEXT,
+        receipt_commit_count INTEGER NOT NULL DEFAULT 0,
+        export_call_count INTEGER NOT NULL DEFAULT 0,
+        delete_count INTEGER NOT NULL DEFAULT 0,
+        next_export_outcome TEXT,
+        next_delete_outcome TEXT,
+        next_readback_outcome TEXT,
+        ownership_assertion_count INTEGER NOT NULL DEFAULT 0,
+        next_ownership_failure_ordinal INTEGER
+      )`,
+    )
+    .run();
+  const databaseId = boundedDatabaseId(tenantTag);
+  await db
+    .prepare(
+      `INSERT OR IGNORE INTO ${BOUNDED_PROVIDER_TABLE} (
+        tenant_tag,
+        database_id,
+        database_name,
+        observed_database_id,
+        observed_database_name,
+        owner,
+        database_present
+      ) VALUES (?, ?, ?, ?, ?, ?, 1)`,
+    )
+    .bind(
+      tenantTag,
+      databaseId,
+      databaseName,
+      databaseId,
+      databaseName,
+      tenantTag,
+    )
+    .run();
+}
+
+async function readBoundedProviderState(
+  db: D1Database,
+  tenantTag: 'advance' | 'advancelost',
+): Promise<BoundedProviderRow> {
+  const row = await db
+    .prepare(`SELECT * FROM ${BOUNDED_PROVIDER_TABLE} WHERE tenant_tag = ?`)
+    .bind(tenantTag)
+    .first<BoundedProviderRow>();
+  if (!row) throw new Error('bounded provider state is absent');
+  return row;
+}
+
+function decodeBoundedProviderOutcome(
+  value: string | null,
+): BoundedProviderOutcome | undefined {
+  return value === null
+    ? undefined
+    : (JSON.parse(value) as BoundedProviderOutcome);
+}
+
+function rejectBoundedProviderOutcome(
+  outcome: Extract<BoundedProviderOutcome, { status: 'rejected' }>,
+): never {
+  if (outcome.reason === 'null') throw null;
+  if (outcome.reason === 'undefined') throw undefined;
+  throw new Error('bounded provider injected rejection');
+}
+
+class BoundedDecommissionBackend implements ProvisioningBackend {
+  readonly kind = 'plain-worker' as const;
+  readonly databaseExportReceiptAuthority = DECOMMISSION_RECEIPT_AUTHORITY;
+  readonly events: string[] = [];
+  #bucketExists: boolean;
+  #deleteAttempted = false;
+
+  constructor(
+    readonly db: D1Database,
+    readonly tenantTag: 'advance' | 'advancelost',
+    readonly resource: ApplicationR2Resource,
+    bucketExists: boolean,
+    readonly scanPass: string | undefined,
+    readonly options: Readonly<{
+      afterScan?: 'absent' | 'id' | 'name' | 'owner';
+      loseReceiptResponse?: boolean;
+      loseDeleteResponse?: boolean;
+    }>,
+  ) {
+    this.#bucketExists = bucketExists;
+  }
+
+  async advanceDecommissionAttachmentScan(
+    input: DecommissionAttachmentScanInput,
+  ): Promise<DecommissionAttachmentScanResult> {
+    this.events.push(`scan:${this.scanPass ?? 'unexpected'}`);
+    if (input.progress.target.kind === 'd1') {
+      switch (this.options.afterScan) {
+        case 'absent':
+          await this.db
+            .prepare(
+              `UPDATE ${BOUNDED_PROVIDER_TABLE}
+               SET database_present = 0
+               WHERE tenant_tag = ?`,
+            )
+            .bind(this.tenantTag)
+            .run();
+          break;
+        case 'id':
+          await this.db
+            .prepare(
+              `UPDATE ${BOUNDED_PROVIDER_TABLE}
+               SET observed_database_id = database_id || '-drift'
+               WHERE tenant_tag = ?`,
+            )
+            .bind(this.tenantTag)
+            .run();
+          break;
+        case 'name':
+          await this.db
+            .prepare(
+              `UPDATE ${BOUNDED_PROVIDER_TABLE}
+               SET observed_database_name = database_name || '-drift'
+               WHERE tenant_tag = ?`,
+            )
+            .bind(this.tenantTag)
+            .run();
+          break;
+        case 'owner':
+          await this.db
+            .prepare(
+              `UPDATE ${BOUNDED_PROVIDER_TABLE}
+               SET owner = 'foreign'
+               WHERE tenant_tag = ?`,
+            )
+            .bind(this.tenantTag)
+            .run();
+          break;
+      }
+    }
+    return {
+      status: 'complete',
+      evidenceSha256: DECOMMISSION_SCAN_EVIDENCE,
+      evidenceCount: DECOMMISSION_SCAN_EVIDENCE_COUNT,
+      providerFetchAttemptsReserved: 6,
+    };
+  }
+
+  async findApplicationR2Bucket(): Promise<
+    ApplicationR2BucketSnapshot | undefined
+  > {
+    this.events.push('r2-find');
+    return this.#bucketExists
+      ? {
+          name: this.resource.name,
+          bucketName: this.resource.bucketName,
+          jurisdiction: this.resource.jurisdiction,
+          creationDate: this.resource.creationDate as string,
+        }
+      : undefined;
+  }
+
+  async assertApplicationR2Empty(): Promise<void> {
+    this.events.push('r2-empty');
+  }
+
+  async deleteApplicationR2Bucket(): Promise<void> {
+    this.events.push('r2-delete');
+    this.#bucketExists = false;
+  }
+
+  async assertApplicationR2Detached(): Promise<never> {
+    throw new Error('bounded coordinator called legacy R2 attachment listing');
+  }
+
+  async assertDatabaseDeletionResidualsRemoved(): Promise<void> {
+    this.events.push('d1-residuals');
+  }
+
+  async findDatabase(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly found D1');
+  }
+
+  async getDatabase(
+    databaseId: string,
+  ): Promise<DatabaseReference | undefined> {
+    this.events.push('d1-get');
+    const row = await readBoundedProviderState(this.db, this.tenantTag);
+    if (databaseId !== row.database_id) {
+      throw new Error('bounded coordinator read an unexpected D1 ID');
+    }
+    if (this.#deleteAttempted) {
+      const outcome = decodeBoundedProviderOutcome(row.next_readback_outcome);
+      if (outcome) {
+        await this.db
+          .prepare(
+            `UPDATE ${BOUNDED_PROVIDER_TABLE}
+             SET next_readback_outcome = NULL
+             WHERE tenant_tag = ?`,
+          )
+          .bind(this.tenantTag)
+          .run();
+        if (outcome.status === 'rejected') {
+          rejectBoundedProviderOutcome(outcome);
+        }
+        if (outcome.value === 'absent') return undefined;
+        if (outcome.value === 'present') {
+          return {
+            id: row.observed_database_id,
+            name: row.observed_database_name,
+            created: false,
+          };
+        }
+      }
+    }
+    return row.database_present === 0
+      ? undefined
+      : {
+          id: row.observed_database_id,
+          name: row.observed_database_name,
+          created: false,
+        };
+  }
+
+  async ensureDatabase(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly created D1');
+  }
+
+  async seedDeploymentIdentity(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly seeded D1');
+  }
+
+  async readDeploymentIdentity(): Promise<string | undefined> {
+    this.events.push('d1-owner');
+    return (await readBoundedProviderState(this.db, this.tenantTag)).owner;
+  }
+
+  async applyMigrations(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly migrated D1');
+  }
+
+  async deployWorker(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly deployed a Worker');
+  }
+
+  async promoteWorker(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly promoted a Worker');
+  }
+
+  async ensureMaintenance(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly armed maintenance');
+  }
+
+  async inspect(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly inspected a Worker');
+  }
+
+  async attestActiveRoute(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly attested a route');
+  }
+
+  async removeTraffic(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly removed traffic');
+  }
+
+  async assertTrafficRemoved(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly attested traffic');
+  }
+
+  async revokeCredentials(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly revoked credentials');
+  }
+
+  async deleteWorker(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly deleted a Worker');
+  }
+
+  async assertDatabaseDetached(): Promise<never> {
+    throw new Error('bounded coordinator called legacy D1 attachment listing');
+  }
+
+  async exportDatabase(): Promise<never> {
+    throw new Error('bounded coordinator unexpectedly exported D1');
+  }
+
+  async exportDatabaseReceipt(
+    identity: DatabaseExportReceiptIdentity,
+  ): Promise<DatabaseExport> {
+    this.events.push('d1-export');
+    const row = await readBoundedProviderState(this.db, this.tenantTag);
+    await this.db
+      .prepare(
+        `UPDATE ${BOUNDED_PROVIDER_TABLE}
+         SET export_call_count = export_call_count + 1
+         WHERE tenant_tag = ?`,
+      )
+      .bind(this.tenantTag)
+      .run();
+    const outcome = decodeBoundedProviderOutcome(row.next_export_outcome);
+    if (outcome) {
+      await this.db
+        .prepare(
+          `UPDATE ${BOUNDED_PROVIDER_TABLE}
+           SET next_export_outcome = NULL
+           WHERE tenant_tag = ?`,
+        )
+        .bind(this.tenantTag)
+        .run();
+      if (outcome.status === 'rejected') {
+        rejectBoundedProviderOutcome(outcome);
+      }
+    }
+    if (
+      identity.authority !== DECOMMISSION_RECEIPT_AUTHORITY ||
+      identity.databaseId !== row.database_id
+    ) {
+      throw new Error(
+        'bounded provider received a mismatched receipt identity',
+      );
+    }
+    const location =
+      row.receipt_location ??
+      `${DECOMMISSION_RECEIPT_AUTHORITY}/${identity.databaseId}/${identity.operationId}.sql`;
+    if (row.receipt_operation_id === null) {
+      await this.db
+        .prepare(
+          `UPDATE ${BOUNDED_PROVIDER_TABLE}
+           SET receipt_authority = ?,
+               receipt_operation_id = ?,
+               receipt_location = ?,
+               receipt_size = ?,
+               receipt_sha256 = ?,
+               receipt_commit_count = receipt_commit_count + 1
+           WHERE tenant_tag = ?`,
+        )
+        .bind(
+          identity.authority,
+          identity.operationId,
+          location,
+          DECOMMISSION_EXPORT_SIZE,
+          DECOMMISSION_EXPORT_SHA256,
+          this.tenantTag,
+        )
+        .run();
+    } else if (
+      row.receipt_authority !== identity.authority ||
+      row.receipt_operation_id !== identity.operationId ||
+      row.receipt_size !== DECOMMISSION_EXPORT_SIZE ||
+      row.receipt_sha256 !== DECOMMISSION_EXPORT_SHA256
+    ) {
+      throw new Error('bounded provider preserved a mismatched receipt winner');
+    }
+    if (this.options.loseReceiptResponse) {
+      throw new Error('bounded receipt response lost');
+    }
+    return {
+      databaseId: identity.databaseId,
+      location,
+      size: DECOMMISSION_EXPORT_SIZE,
+      sha256: DECOMMISSION_EXPORT_SHA256,
+    };
+  }
+
+  async deleteDatabase(): Promise<void> {
+    this.events.push('d1-delete');
+    this.#deleteAttempted = true;
+    const row = await readBoundedProviderState(this.db, this.tenantTag);
+    const outcome = decodeBoundedProviderOutcome(row.next_delete_outcome);
+    if (outcome) {
+      await this.db
+        .prepare(
+          `UPDATE ${BOUNDED_PROVIDER_TABLE}
+           SET next_delete_outcome = NULL
+           WHERE tenant_tag = ?`,
+        )
+        .bind(this.tenantTag)
+        .run();
+      if (outcome.status === 'rejected') {
+        rejectBoundedProviderOutcome(outcome);
+      }
+    }
+    await this.db
+      .prepare(
+        `UPDATE ${BOUNDED_PROVIDER_TABLE}
+         SET database_present = ?, delete_count = delete_count + 1
+         WHERE tenant_tag = ?`,
+      )
+      .bind(outcome?.value === 'present' ? 1 : 0, this.tenantTag)
+      .run();
+    if (this.options.loseDeleteResponse) {
+      throw new Error('bounded delete response lost');
+    }
+  }
+}
+
+interface BoundedDecommissionStepInput {
+  readonly tenantTag: 'advance' | 'advancelost';
+  readonly operation: Readonly<
+    { kind: 'start' } | { kind: 'continue'; token: unknown }
+  >;
+  readonly afterScan?: 'absent' | 'id' | 'name' | 'owner';
+  readonly failWriteBeforeCommit?: boolean;
+  readonly loseWrite?: boolean;
+  readonly loseReceiptResponse?: boolean;
+  readonly loseDeleteResponse?: boolean;
+  readonly nextExportOutcome?: BoundedProviderOutcome;
+  readonly nextDeleteOutcome?: BoundedProviderOutcome;
+  readonly nextReadbackOutcome?: BoundedProviderOutcome;
+  readonly nextOwnershipFailureOrdinal?: number;
+  readonly seedAtD1?: boolean;
+}
+
+async function configureBoundedProviderState(
+  db: D1Database,
+  input: BoundedDecommissionStepInput,
+): Promise<void> {
+  const outcomes = [
+    ['next_export_outcome', input.nextExportOutcome],
+    ['next_delete_outcome', input.nextDeleteOutcome],
+    ['next_readback_outcome', input.nextReadbackOutcome],
+  ] as const;
+  for (const [column, outcome] of outcomes) {
+    if (outcome === undefined) continue;
+    await db
+      .prepare(
+        `UPDATE ${BOUNDED_PROVIDER_TABLE}
+         SET ${column} = ?
+         WHERE tenant_tag = ?`,
+      )
+      .bind(JSON.stringify(outcome), input.tenantTag)
+      .run();
+  }
+  if (input.nextOwnershipFailureOrdinal !== undefined) {
+    await db
+      .prepare(
+        `UPDATE ${BOUNDED_PROVIDER_TABLE}
+         SET ownership_assertion_count = 0,
+             next_ownership_failure_ordinal = ?
+         WHERE tenant_tag = ?`,
+      )
+      .bind(input.nextOwnershipFailureOrdinal, input.tenantTag)
+      .run();
+  }
+}
+
+function providerAssertionStore(
+  db: D1Database,
+  tenantTag: 'advance' | 'advancelost',
+  delegate: D1FleetStateStore,
+): FleetStateStore {
+  return {
+    get: (requestedTenantTag, environment) =>
+      delegate.get(requestedTenantTag, environment),
+    list: () => delegate.list(),
+    withDeploymentLease: (requestedTenantTag, environment, operation) =>
+      delegate.withDeploymentLease(requestedTenantTag, environment, (lease) =>
+        operation({
+          tenantTag: lease.tenantTag,
+          environment: lease.environment,
+          mutationLeaseTtlMs: lease.mutationLeaseTtlMs,
+          async assertOwned() {
+            const state = await readBoundedProviderState(db, tenantTag);
+            const ordinal = state.ownership_assertion_count + 1;
+            await db
+              .prepare(
+                `UPDATE ${BOUNDED_PROVIDER_TABLE}
+                   SET ownership_assertion_count = ?,
+                       next_ownership_failure_ordinal =
+                         CASE WHEN next_ownership_failure_ordinal = ?
+                           THEN NULL
+                           ELSE next_ownership_failure_ordinal
+                         END
+                   WHERE tenant_tag = ?`,
+              )
+              .bind(ordinal, ordinal, tenantTag)
+              .run();
+            if (state.next_ownership_failure_ordinal === ordinal) {
+              throw new Error('bounded provider lease ownership transferred');
+            }
+            await lease.assertOwned();
+          },
+          renew: () => lease.renew(),
+          put: (record) => lease.put(record),
+          delete: () => lease.delete(),
+        }),
+      ),
+  };
+}
+
+async function boundedDecommissionStep(
+  db: D1Database,
+  input: BoundedDecommissionStepInput,
+): Promise<unknown> {
+  const spec = boundedDecommissionSpec(input.tenantTag);
+  await ensureBoundedProviderState(db, input.tenantTag, spec.databaseName);
+  await configureBoundedProviderState(db, input);
+  const seedStore = new D1FleetStateStore(new D1FleetStateDatabase(db), {
+    accountId: 'account-primary',
+  });
+  let current = await seedStore.get(spec.tenantTag, spec.environment);
+  if (!current) {
+    const seeded = boundedDecommissionRecord(spec, input.seedAtD1).record;
+    await seedStore.withDeploymentLease(
+      seeded.tenantTag,
+      seeded.environment,
+      (lease) => lease.put(seeded),
+    );
+    current = seeded;
+  }
+
+  const delegate = new D1FleetStateDatabase(db);
+  let lostWriteCount = 0;
+  let precommitWriteFailureCount = 0;
+  const database: FleetStateDatabase =
+    input.loseWrite || input.failWriteBeforeCommit
+      ? {
+          query: (sql, bindings) => delegate.query(sql, bindings),
+          execute: (sql, bindings) => delegate.execute(sql, bindings),
+          async batch(statements) {
+            if (
+              input.failWriteBeforeCommit &&
+              precommitWriteFailureCount === 0
+            ) {
+              precommitWriteFailureCount += 1;
+              throw new Error('bounded coordinator write failed before commit');
+            }
+            const result = await delegate.batch(statements);
+            if (input.loseWrite && lostWriteCount === 0) {
+              lostWriteCount += 1;
+              throw new Error('bounded coordinator write response lost');
+            }
+            return result;
+          },
+        }
+      : delegate;
+  const store = new D1FleetStateStore(database, {
+    accountId: 'account-primary',
+  });
+  const resource = current.applicationResources?.[0];
+  if (!resource) throw new Error('bounded decommission resource missing');
+  const backend = new BoundedDecommissionBackend(
+    db,
+    input.tenantTag,
+    resource,
+    resource.state !== 'deleted',
+    current.decommissionIntent?.state,
+    {
+      afterScan: input.afterScan,
+      loseReceiptResponse: input.loseReceiptResponse,
+      loseDeleteResponse: input.loseDeleteResponse,
+    },
+  );
+  const result = await advanceDecommissionDeployment({
+    backend,
+    store: providerAssertionStore(db, input.tenantTag, store),
+    spec,
+    action: input.operation,
+    maxProviderRequests: 12,
+    clock: () => Date.parse('2026-08-30T00:00:00.000Z'),
+    randomUUID: () =>
+      input.tenantTag === 'advance'
+        ? '00000000-0000-4000-8000-000000000101'
+        : '00000000-0000-4000-8000-000000000102',
+  });
+  const stored = await store.get(spec.tenantTag, spec.environment);
+  const provider = await readBoundedProviderState(db, input.tenantTag);
+  const claims = await db
+    .prepare(
+      `SELECT resource_type, resource_name, resource_role
+       FROM ${PLATFORM_CLAIM_TABLE}
+       WHERE resource_set_key = ?
+       ORDER BY resource_type, resource_name, resource_role`,
+    )
+    .bind(`deployment:${spec.tenantTag}:${spec.environment}`)
+    .all<{
+      resource_type: string;
+      resource_name: string;
+      resource_role: string;
+    }>();
+  return {
+    result,
+    trace: backend.events,
+    phase: stored?.phase,
+    lifecyclePhase: stored?.decommissionIntent?.lifecyclePhase,
+    intentState: stored?.decommissionIntent?.state,
+    revision: stored?.decommissionIntent?.revision,
+    generation: stored?.decommissionIntent?.generation,
+    resourceStates:
+      stored?.applicationResources?.map(({ state }) => state) ?? [],
+    bucketName: resource.bucketName,
+    lostWriteCount,
+    precommitWriteFailureCount,
+    provider: {
+      databaseId: provider.database_id,
+      databasePresent: provider.database_present === 1,
+      observedDatabaseId: provider.observed_database_id,
+      observedDatabaseName: provider.observed_database_name,
+      owner: provider.owner,
+      receiptAuthority: provider.receipt_authority,
+      receiptOperationId: provider.receipt_operation_id,
+      receiptLocation: provider.receipt_location,
+      receiptSize: provider.receipt_size,
+      receiptSha256: provider.receipt_sha256,
+      receiptCommitCount: provider.receipt_commit_count,
+      exportCallCount: provider.export_call_count,
+      deleteCount: provider.delete_count,
+      ownershipAssertionCount: provider.ownership_assertion_count,
+    },
+    claims: claims.results.map((claim) => ({
+      resourceType: claim.resource_type,
+      resourceName: claim.resource_name,
+      resourceRole: claim.resource_role,
+    })),
+  };
+}
+
+async function resetBoundedDecommission(
+  db: D1Database,
+  tenantTag: 'advance' | 'advancelost',
+): Promise<unknown> {
+  await db
+    .prepare(`DELETE FROM ${PLATFORM_CLAIM_TABLE} WHERE resource_set_key = ?`)
+    .bind(`deployment:${tenantTag}:production`)
+    .run();
+  await db
+    .prepare(
+      `DELETE FROM ${STATE_TABLE}
+       WHERE tenant_tag = ? AND environment = 'production'`,
+    )
+    .bind(tenantTag)
+    .run();
+  await db
+    .prepare(
+      `DELETE FROM ${LEASE_TABLE}
+       WHERE tenant_tag = ? AND environment = 'production'`,
+    )
+    .bind(tenantTag)
+    .run();
+  await db
+    .prepare(`DELETE FROM ${BOUNDED_PROVIDER_TABLE} WHERE tenant_tag = ?`)
+    .bind(tenantTag)
+    .run();
+  return { reset: true };
+}
+
 function errorShape(error: unknown): unknown {
   if (error instanceof AggregateError) {
     return {
@@ -151,7 +963,7 @@ async function clean(db: D1Database): Promise<void> {
 }
 
 async function readyStore(db: D1Database): Promise<D1FleetStateStore> {
-  const store = new D1FleetStateStore(database(db), {
+  const store = new D1FleetStateStore(new D1FleetStateDatabase(db), {
     accountId: 'account-primary',
   });
   await store.get('warm', 'test');
@@ -172,7 +984,7 @@ async function concurrentAcquisition(db: D1Database): Promise<unknown> {
     settleLosers = resolve;
   });
   const attempts = Array.from({ length: 16 }, () => {
-    const store = new D1FleetStateStore(database(db), {
+    const store = new D1FleetStateStore(new D1FleetStateDatabase(db), {
       accountId: 'account-primary',
     });
     return store
@@ -268,7 +1080,7 @@ async function renewal(db: D1Database): Promise<unknown> {
 
 async function takeoverAndFence(db: D1Database): Promise<unknown> {
   const staleStore = await readyStore(db);
-  const winnerStore = new D1FleetStateStore(database(db), {
+  const winnerStore = new D1FleetStateStore(new D1FleetStateDatabase(db), {
     accountId: 'account-primary',
   });
   let staleLease: FleetStateLease | undefined;
@@ -441,7 +1253,7 @@ async function forcedLifecycleErrors(
   kind: 'deployment' | 'platform',
 ): Promise<unknown> {
   await readyStore(db);
-  const store = new D1FleetStateStore(database(db), {
+  const store = new D1FleetStateStore(new D1FleetStateDatabase(db), {
     accountId: 'account-primary',
     leaseTtlMs: 1_000,
     leaseRenewalIntervalMs: 100,
@@ -575,7 +1387,7 @@ async function platformClaimsAndConcurrency(db: D1Database): Promise<unknown> {
 
 async function platformTakeoverAndFence(db: D1Database): Promise<unknown> {
   const staleStore = await readyStore(db);
-  const winnerStore = new D1FleetStateStore(database(db), {
+  const winnerStore = new D1FleetStateStore(new D1FleetStateDatabase(db), {
     accountId: 'account-primary',
   });
   let staleLease: PlatformPlaneLease | undefined;
@@ -705,19 +1517,21 @@ async function crossPlaneClaimExclusion(db: D1Database): Promise<unknown> {
   await store.withDeploymentLease(plain.tenantTag, plain.environment, (lease) =>
     lease.put(plain),
   );
+  const externalPolicy = canonicalDeploymentEgressPolicy({
+    policyId: 'policy-claimc',
+    tenantTag: 'claimc',
+    environment: 'production',
+    allowedHosts: [],
+  });
   const external = {
     ...record('claimc', 'production'),
     backend: 'workers-for-platforms' as const,
     scriptName: plain.scriptName,
-    outboundPolicy: canonicalDeploymentEgressPolicy({
-      policyId: 'policy-claimc',
-      tenantTag: 'claimc',
-      environment: 'production',
-      allowedHosts: [],
-    }),
+    outboundPolicy: externalPolicy,
     platformResources: {
       maintenanceCapabilityPublicKey:
         platformSet.maintenanceCapabilityPublicKey,
+      outboundPolicy: externalPolicy,
       stateWorker: {
         scriptName: plain.scriptName,
         artifactVersion: 'bridge-version',
@@ -726,6 +1540,22 @@ async function crossPlaneClaimExclusion(db: D1Database): Promise<unknown> {
         durableObjectBindings: [],
         namespaceIds: [],
       },
+      egressProxy: {
+        scriptName: 'claimc-production-egress',
+        artifactVersion: 'bridge-egress-version',
+        artifactDigest: 'c'.repeat(64),
+        ...externalPolicy,
+      },
+    },
+    platformTarget: {
+      maintenanceCapabilityPublicKey:
+        platformSet.maintenanceCapabilityPublicKey,
+      stateArtifactDigest: 'a'.repeat(64),
+      stateDurableObjectHistoryDigest: 'b'.repeat(64),
+      egressArtifactDigest: 'c'.repeat(64),
+      d1SchemaVersion: 1,
+      d1SchemaHistoryDigest: 'd'.repeat(64),
+      outboundPolicy: externalPolicy,
     },
   };
   let bridgeCollision: unknown;
@@ -771,10 +1601,11 @@ async function crossPlaneClaimExclusion(db: D1Database): Promise<unknown> {
 
 async function atomicClaimBatch(db: D1Database): Promise<unknown> {
   await readyStore(db);
-  const delegate = database(db);
+  const delegate = new D1FleetStateDatabase(db);
   let loseResponse = true;
-  const lostResponseDatabase: FleetStateDatabase = {
-    ...delegate,
+  const failAfterCommitDatabase: FleetStateDatabase = {
+    query: (sql, bindings) => delegate.query(sql, bindings),
+    execute: (sql, bindings) => delegate.execute(sql, bindings),
     async batch(statements) {
       const result = await delegate.batch(statements);
       if (loseResponse) {
@@ -784,7 +1615,7 @@ async function atomicClaimBatch(db: D1Database): Promise<unknown> {
       return result;
     },
   };
-  const store = new D1FleetStateStore(lostResponseDatabase, {
+  const store = new D1FleetStateStore(failAfterCommitDatabase, {
     accountId: 'account-primary',
   });
   const applicationResources = Array.from({ length: 32 }, (_, index) => ({
@@ -813,19 +1644,21 @@ async function atomicClaimBatch(db: D1Database): Promise<unknown> {
   await store.withDeploymentLease('atomic', 'production', (lease) =>
     lease.put(intended),
   );
+  const switchedPolicy = canonicalDeploymentEgressPolicy({
+    policyId: 'policy-atomic',
+    tenantTag: 'atomic',
+    environment: 'production',
+    allowedHosts: [],
+  });
   const switched: FleetRecord = {
     ...intended,
     backend: 'workers-for-platforms',
     phase: 'ready',
-    outboundPolicy: canonicalDeploymentEgressPolicy({
-      policyId: 'policy-atomic',
-      tenantTag: 'atomic',
-      environment: 'production',
-      allowedHosts: [],
-    }),
+    outboundPolicy: switchedPolicy,
     platformResources: {
       maintenanceCapabilityPublicKey:
         platformSet.maintenanceCapabilityPublicKey,
+      outboundPolicy: switchedPolicy,
       stateWorker: {
         scriptName: intended.scriptName,
         artifactVersion: 'bridge-version',
@@ -834,6 +1667,22 @@ async function atomicClaimBatch(db: D1Database): Promise<unknown> {
         durableObjectBindings: [],
         namespaceIds: [],
       },
+      egressProxy: {
+        scriptName: 'atomic-production-egress',
+        artifactVersion: 'bridge-egress-version',
+        artifactDigest: 'c'.repeat(64),
+        ...switchedPolicy,
+      },
+    },
+    platformTarget: {
+      maintenanceCapabilityPublicKey:
+        platformSet.maintenanceCapabilityPublicKey,
+      stateArtifactDigest: 'a'.repeat(64),
+      stateDurableObjectHistoryDigest: 'b'.repeat(64),
+      egressArtifactDigest: 'c'.repeat(64),
+      d1SchemaVersion: 1,
+      d1SchemaHistoryDigest: 'd'.repeat(64),
+      outboundPolicy: switchedPolicy,
     },
   };
   await store.withDeploymentLease('atomic', 'production', (lease) =>
@@ -904,6 +1753,323 @@ async function finalLeaseAssertionRollback(db: D1Database): Promise<unknown> {
   };
 }
 
+const SWITCH_LOST_TENANT = 'switchlost';
+const SWITCH_LOST_RECEIPT_AUTHORITY =
+  'memory://fleet-exports/backend-switch/receipts/v1';
+const SWITCH_LOST_EXPORT: DatabaseExport = {
+  databaseId: 'database-switchlost-production',
+  location: 'memory://fleet-exports/backend-switch/switchlost.sql',
+  sha256: 'f'.repeat(64),
+  size: 37,
+};
+
+type BackendSwitchLostWriteStage =
+  | 'reset'
+  | 'start'
+  | 'cursor'
+  | 'receipt'
+  | 'barrier'
+  | 'terminal';
+
+function backendSwitchLostWriteSource(): FleetRecord {
+  const base = record(SWITCH_LOST_TENANT, 'production');
+  const outboundPolicy = canonicalDeploymentEgressPolicy({
+    policyId: 'policy-switchlost',
+    tenantTag: base.tenantTag,
+    environment: base.environment,
+    allowedHosts: [],
+  });
+  const target = {
+    maintenanceCapabilityPublicKey: platformSet.maintenanceCapabilityPublicKey,
+    stateArtifactDigest: 'a'.repeat(64),
+    stateDurableObjectHistoryDigest: 'b'.repeat(64),
+    egressArtifactDigest: 'c'.repeat(64),
+    d1SchemaVersion: base.schemaVersion,
+    d1SchemaHistoryDigest: 'd'.repeat(64),
+    outboundPolicy,
+  } as const;
+  const current: FleetRecord = {
+    ...base,
+    backend: 'workers-for-platforms',
+    outboundPolicy,
+    platformTarget: target,
+    platformResources: {
+      maintenanceCapabilityPublicKey:
+        platformSet.maintenanceCapabilityPublicKey,
+      outboundPolicy,
+      stateWorker: {
+        scriptName: base.scriptName,
+        artifactVersion: 'bridge-switchlost-v1',
+        artifactDigest: target.stateArtifactDigest,
+        plane: 'ordinary',
+        durableObjectBindings: [],
+        namespaceIds: [],
+      },
+      egressProxy: {
+        scriptName: 'switchlost-production-egress',
+        artifactVersion: 'egress-switchlost-v1',
+        artifactDigest: target.egressArtifactDigest,
+        ...outboundPolicy,
+      },
+    },
+    applicationResources: [],
+    applicationBindings: { vars: [], secrets: [], r2Buckets: [] },
+  };
+  const prior = {
+    scriptName: current.scriptName,
+    artifactVersion: current.artifactVersion,
+    specDigest: current.desiredSpecDigest,
+    databaseId: current.databaseId,
+    databaseName: current.databaseName,
+    durableObjectBindings: [],
+    namespaceIds: [],
+    secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
+    application: { vars: [], secrets: [], r2Buckets: [] },
+    applicationResources: [],
+    customDomain: {
+      id: 'domain-switchlost',
+      hostname: current.routeHostname,
+    },
+  } as const;
+  return backendSwitchDecommissionRecordFixture(
+    current,
+    {
+      kind: 'backend-switch',
+      tenantTag: current.tenantTag,
+      environment: current.environment,
+      prior,
+      targetSpecDigest: current.desiredSpecDigest,
+      targetApplication: { vars: [], secrets: [], r2Buckets: [] },
+      target,
+      rollbackUntil: '2026-09-30T00:00:00.000Z',
+      subphase: 'decommission-export-authorized',
+      applicationR2Progress: [],
+      decommissionSnapshot: {
+        prior,
+        restoredArtifactVersion: null,
+        entryPendingArtifactVersion: null,
+        entryPendingNamespaceIds: null,
+        providerTargetSpecDigest: current.desiredSpecDigest,
+        routeHostname: current.routeHostname,
+        routeTargets: [],
+        desiredSpecDigest: current.desiredSpecDigest,
+        target,
+        releases: [],
+        applicationResources: [],
+      },
+    },
+    { subphase: 'decommission-export-authorized' },
+  );
+}
+
+function backendSwitchShellCommon(
+  shell: DecommissionAdvanceIntent,
+  revision: number,
+  updatedAt: string,
+): Omit<
+  Extract<DecommissionAdvanceIntent, { readonly state: 'transitioning' }>,
+  'lifecyclePhase' | 'state'
+> {
+  return {
+    version: 1,
+    operationId: shell.operationId,
+    revision,
+    generation: shell.generation,
+    updatedAt,
+    identity: shell.identity,
+    ...(shell.databaseExportReceiptAuthority
+      ? {
+          databaseExportReceiptAuthority: shell.databaseExportReceiptAuthority,
+        }
+      : {}),
+  };
+}
+
+function backendSwitchLostWriteNext(
+  current: FleetRecord,
+  stage: Exclude<BackendSwitchLostWriteStage, 'reset' | 'start'>,
+): FleetRecord {
+  const intent = current.backendSwitchIntent;
+  const shell = current.decommissionIntent;
+  if (!intent || !shell || shell.state === 'complete') {
+    throw new Error('bounded backend-switch harness authority is absent');
+  }
+  const revision = shell.revision + 1;
+  const updatedAt = `2026-08-30T00:00:${String(revision).padStart(2, '0')}.000Z`;
+  const common = backendSwitchShellCommon(shell, revision, updatedAt);
+  if (stage === 'cursor') {
+    const decommissionIntent: DecommissionAdvanceIntent = {
+      ...common,
+      databaseExportReceiptAuthority: SWITCH_LOST_RECEIPT_AUTHORITY,
+      lifecyclePhase: 'application-resources-deleted',
+      state: 'discover',
+      purpose: {
+        kind: 'database-pre-export',
+        databaseId: current.databaseId,
+      },
+      progress: initialWorkerAttachmentScan({
+        kind: 'd1',
+        databaseId: current.databaseId,
+      }),
+    };
+    return {
+      ...current,
+      decommissionIntent,
+      updatedAt,
+    };
+  }
+  if (stage === 'receipt') {
+    const decommissionIntent: DecommissionAdvanceIntent = {
+      ...common,
+      databaseExportReceiptAuthority: SWITCH_LOST_RECEIPT_AUTHORITY,
+      lifecyclePhase: 'database-exported',
+      state: 'transitioning',
+    };
+    return {
+      ...current,
+      backendSwitchIntent: {
+        ...intent,
+        subphase: 'decommission-exported',
+        databaseExport: SWITCH_LOST_EXPORT,
+      },
+      decommissionIntent,
+      databaseExportLocation: SWITCH_LOST_EXPORT.location,
+      databaseExportSha256: SWITCH_LOST_EXPORT.sha256,
+      databaseExportSize: SWITCH_LOST_EXPORT.size,
+      updatedAt,
+    };
+  }
+  if (stage === 'barrier') {
+    const decommissionIntent: DecommissionAdvanceIntent = {
+      ...common,
+      databaseExportReceiptAuthority: SWITCH_LOST_RECEIPT_AUTHORITY,
+      lifecyclePhase: 'database-deleting',
+      state: 'transitioning',
+    };
+    return {
+      ...current,
+      backendSwitchIntent: {
+        ...intent,
+        subphase: 'decommission-database-authorized',
+      },
+      decommissionIntent,
+      updatedAt,
+    };
+  }
+  return backendSwitchDecommissionRecordFixture(
+    current,
+    {
+      ...intent,
+      subphase: 'decommissioned',
+      databaseExport: SWITCH_LOST_EXPORT,
+      applicationR2Progress: [],
+    },
+    {
+      operationId: shell.operationId,
+      revision,
+      generation: shell.generation,
+      ...(intent.decommissionEntrySubphase
+        ? { entrySubphase: intent.decommissionEntrySubphase }
+        : {}),
+      subphase: 'decommissioned',
+      updatedAt,
+    },
+  );
+}
+
+async function backendSwitchLostWriteStep(
+  db: D1Database,
+  input: Readonly<{
+    stage: BackendSwitchLostWriteStage;
+    loseWrite?: boolean;
+  }>,
+): Promise<unknown> {
+  if (input.stage === 'reset') {
+    await readyStore(db);
+    await db
+      .prepare(
+        `DELETE FROM ${STATE_TABLE} WHERE tenant_tag = ? AND environment = 'production'`,
+      )
+      .bind(SWITCH_LOST_TENANT)
+      .run();
+    await db
+      .prepare(
+        `DELETE FROM ${LEASE_TABLE} WHERE tenant_tag = ? AND environment = 'production'`,
+      )
+      .bind(SWITCH_LOST_TENANT)
+      .run();
+    await db
+      .prepare(`DELETE FROM ${PLATFORM_CLAIM_TABLE} WHERE resource_set_key = ?`)
+      .bind(`deployment:${SWITCH_LOST_TENANT}:production`)
+      .run();
+    return { reset: true };
+  }
+  const delegate = new D1FleetStateDatabase(db);
+  let lostWriteCount = 0;
+  const database: FleetStateDatabase = {
+    query: (sql, bindings = []) => delegate.query(sql, bindings),
+    execute: (sql, bindings = []) => delegate.execute(sql, bindings),
+    async batch(statements) {
+      const results = await delegate.batch(statements);
+      if (
+        input.loseWrite &&
+        lostWriteCount === 0 &&
+        statements.some(({ sql }) => sql.includes(`INSERT INTO ${STATE_TABLE}`))
+      ) {
+        lostWriteCount += 1;
+        throw new Error('bounded backend-switch D1 write response lost');
+      }
+      return results;
+    },
+  };
+  const store = new D1FleetStateStore(database, {
+    accountId: 'account-primary',
+  });
+  const current = await store.get(SWITCH_LOST_TENANT, 'production');
+  const next =
+    input.stage === 'start'
+      ? backendSwitchLostWriteSource()
+      : current
+        ? backendSwitchLostWriteNext(current, input.stage)
+        : (() => {
+            throw new Error('bounded backend-switch harness record is absent');
+          })();
+  await store.withDeploymentLease(SWITCH_LOST_TENANT, 'production', (lease) =>
+    lease.put(next),
+  );
+  const persisted = await new D1FleetStateStore(new D1FleetStateDatabase(db), {
+    accountId: 'account-primary',
+  }).get(SWITCH_LOST_TENANT, 'production');
+  const raw = await db
+    .prepare(
+      `SELECT backend_switch_intent, decommission_intent
+       FROM ${STATE_TABLE}
+       WHERE tenant_tag = ? AND environment = 'production'`,
+    )
+    .bind(SWITCH_LOST_TENANT)
+    .first<{
+      backend_switch_intent: string | null;
+      decommission_intent: string | null;
+    }>();
+  return {
+    lostWriteCount,
+    phase: persisted?.phase,
+    switchSubphase: persisted?.backendSwitchIntent?.subphase,
+    shellState: persisted?.decommissionIntent?.state,
+    shellRevision: persisted?.decommissionIntent?.revision,
+    lifecyclePhase: persisted?.decommissionIntent?.lifecyclePhase,
+    scanStage:
+      persisted?.decommissionIntent?.state === 'discover' ||
+      persisted?.decommissionIntent?.state === 'verify'
+        ? persisted.decommissionIntent.progress.stage
+        : undefined,
+    databaseExportLocation: persisted?.databaseExportLocation,
+    columnsPresent:
+      typeof raw?.backend_switch_intent === 'string' &&
+      typeof raw.decommission_intent === 'string',
+  };
+}
+
 async function backendSwitchColumnUpgrade(db: D1Database): Promise<unknown> {
   const store = await readyStore(db);
   const base = record('legacyswitch', 'production');
@@ -964,7 +2130,7 @@ async function backendSwitchColumnUpgrade(db: D1Database): Promise<unknown> {
     .bind(base.tenantTag, base.environment)
     .run();
 
-  const upgraded = await new D1FleetStateStore(database(db), {
+  const upgraded = await new D1FleetStateStore(new D1FleetStateDatabase(db), {
     accountId: 'account-primary',
   }).get(base.tenantTag, base.environment);
   const raw = await db
@@ -985,6 +2151,2739 @@ async function backendSwitchColumnUpgrade(db: D1Database): Promise<unknown> {
       ? (JSON.parse(raw.backend_switch_intent) as { kind?: unknown }).kind
       : undefined,
   };
+}
+
+async function decommissionIntentColumnUpgrade(
+  db: D1Database,
+): Promise<unknown> {
+  await readyStore(db);
+  await db
+    .prepare(`ALTER TABLE ${STATE_TABLE} DROP COLUMN decommission_intent`)
+    .run();
+  const store = new D1FleetStateStore(new D1FleetStateDatabase(db), {
+    accountId: 'account-primary',
+  });
+  const intended = decommissionRecord('intentupgrade', 1);
+  await store.withDeploymentLease(
+    intended.tenantTag,
+    intended.environment,
+    (lease) => lease.put(intended),
+  );
+  const columns = await db
+    .prepare(`PRAGMA table_info(${STATE_TABLE})`)
+    .all<{ name: string }>();
+  const upgraded = await store.get(intended.tenantTag, intended.environment);
+  return {
+    phase: upgraded?.phase,
+    revision: upgraded?.decommissionIntent?.revision,
+    columns: columns.results
+      .map(({ name }) => name)
+      .filter((name) => ADDED_NULLABLE_TEXT_COLUMNS.includes(name as never)),
+  };
+}
+
+async function decommissionIntentLostResponse(
+  db: D1Database,
+): Promise<unknown> {
+  await readyStore(db);
+  const delegate = new D1FleetStateDatabase(db);
+  let lose: 'exact' | 'changed' | undefined = 'exact';
+  const database: FleetStateDatabase = {
+    query: (sql, bindings) => delegate.query(sql, bindings),
+    execute: (sql, bindings) => delegate.execute(sql, bindings),
+    async batch(statements) {
+      const results = await delegate.batch(statements);
+      const failure = lose;
+      if (!failure) return results;
+      lose = undefined;
+      if (failure === 'changed') {
+        await db
+          .prepare(
+            `UPDATE ${STATE_TABLE}
+             SET decommission_intent = json_set(
+               decommission_intent, '$.revision', 3
+             )
+             WHERE tenant_tag = 'intentlost'
+               AND environment = 'production'`,
+          )
+          .run();
+      }
+      throw new Error(`committed ${failure} D1 batch response lost`);
+    },
+  };
+  const store = new D1FleetStateStore(database, {
+    accountId: 'account-primary',
+  });
+  const first = decommissionRecord('intentlost', 1);
+  await store.withDeploymentLease(first.tenantTag, first.environment, (lease) =>
+    lease.put(first),
+  );
+  const exact = await store.get(first.tenantTag, first.environment);
+
+  lose = 'changed';
+  let changedFailure: unknown;
+  try {
+    await store.withDeploymentLease(
+      first.tenantTag,
+      first.environment,
+      (lease) => lease.put(decommissionRecord('intentlost', 2)),
+    );
+  } catch (error) {
+    changedFailure = errorShape(error);
+  }
+  const final = await store.get(first.tenantTag, first.environment);
+  const claim = await db
+    .prepare(
+      `SELECT COUNT(*) AS count FROM ${PLATFORM_CLAIM_TABLE}
+       WHERE resource_set_key = 'deployment:intentlost:production'`,
+    )
+    .first<{ count: number }>();
+  return {
+    exactRevision: exact?.decommissionIntent?.revision,
+    changedFailure,
+    finalRevision: final?.decommissionIntent?.revision,
+    claimCount: Number(claim?.count),
+  };
+}
+
+function cleanupIntentFor(base: FleetRecord): CleanupAdvanceIntent {
+  return {
+    version: 1,
+    operationId: '00000000-0000-4000-8000-0000000000aa',
+    revision: 0,
+    generation: 0,
+    updatedAt: '2026-08-11T00:00:00.000Z',
+    authority: { kind: 'manual-cleanup' },
+    identity: {
+      record: {
+        tenantTag: base.tenantTag,
+        environment: base.environment,
+        backend: base.backend,
+        scriptName: base.scriptName,
+        databaseId: base.databaseId,
+        databaseName: base.databaseName,
+        routeHostname: base.routeHostname,
+      },
+      admittedPhase: 'worker-deployed',
+      externalArtifact: false,
+    },
+    state: { step: 'database-deletion' },
+  };
+}
+
+function cleanupAdvancingFixture(
+  tenantTag: string,
+  operationId?: string,
+): FleetRecord {
+  const base = {
+    ...record(tenantTag, 'production'),
+    phase: 'cleanup-advancing' as const,
+    applicationResources: [],
+    applicationBindings: { vars: [], secrets: [], r2Buckets: [] },
+  };
+  const intent = cleanupIntentFor(base);
+  return {
+    ...base,
+    cleanupIntent: operationId ? { ...intent, operationId } : intent,
+  };
+}
+
+function cleanupReceiptFor(active: FleetRecord): CleanupTerminalReceipt {
+  const intent = active.cleanupIntent;
+  if (!intent) throw new Error('fixture record has no cleanup intent');
+  return {
+    version: 1,
+    operationId: intent.operationId,
+    tenantTag: active.tenantTag,
+    environment: active.environment,
+    backend: active.backend,
+    scriptName: active.scriptName,
+    databaseId: active.databaseId,
+    databaseName: active.databaseName,
+    authority: 'manual-cleanup',
+    admittedPhase: intent.identity.admittedPhase,
+    disposition: 'prepublication-owned-no-export',
+    evidence: {
+      eligibility: 'carrier-null',
+      ingressRemoved: true,
+      workerAbsent: true,
+      platformResourcesAbsent: true,
+      applicationR2Settled: true,
+      databaseAbsentReadback: true,
+      scan: {
+        discover: { evidenceSha256: 'b'.repeat(64), evidenceCount: 2 },
+        verify: { evidenceSha256: 'b'.repeat(64), evidenceCount: 2 },
+      },
+    },
+  };
+}
+
+async function cleanupClaimCount(
+  db: D1Database,
+  tenantTag: string,
+): Promise<number> {
+  const row = await db
+    .prepare(
+      `SELECT COUNT(*) AS count FROM ${PLATFORM_CLAIM_TABLE}
+       WHERE resource_set_key = ?`,
+    )
+    .bind(`deployment:${tenantTag}:production`)
+    .first<{ count: number }>();
+  return Number(row?.count);
+}
+
+async function cleanupReceiptCount(db: D1Database): Promise<number> {
+  const row = await db
+    .prepare(`SELECT COUNT(*) AS count FROM ${CLEANUP_RECEIPT_TABLE}`)
+    .first<{ count: number }>();
+  return Number(row?.count);
+}
+
+async function cleanupTerminalReceipt(db: D1Database): Promise<unknown> {
+  const store = await readyStore(db);
+  await db.prepare(`DELETE FROM ${CLEANUP_RECEIPT_TABLE}`).run();
+  const active = cleanupAdvancingFixture('cleanupterm');
+  const receipt = cleanupReceiptFor(active);
+  return store.withDeploymentLease(
+    'cleanupterm',
+    'production',
+    async (lease) => {
+      if (!lease.completeCleanup) {
+        throw new Error('completeCleanup capability missing');
+      }
+      await lease.put(active);
+      const claimsBefore = await cleanupClaimCount(db, 'cleanupterm');
+      const stale = await lease
+        .completeCleanup({ receipt, expectedRevision: 4 })
+        .then(
+          () => undefined,
+          (error: unknown) => errorShape(error),
+        );
+      const rowAfterStale = await store.get('cleanupterm', 'production');
+      const receiptsAfterStale = await cleanupReceiptCount(db);
+      const persisted = await lease.completeCleanup({
+        receipt,
+        expectedRevision: 0,
+      });
+      const claimsAfter = await cleanupClaimCount(db, 'cleanupterm');
+      const rowAfter = await store.get('cleanupterm', 'production');
+      const replay = await lease.completeCleanup({
+        receipt,
+        expectedRevision: 0,
+      });
+      const reordered: CleanupTerminalReceipt = {
+        ...receipt,
+        evidence: {
+          scan: {
+            verify: { evidenceCount: 2, evidenceSha256: 'b'.repeat(64) },
+            discover: { evidenceCount: 2, evidenceSha256: 'b'.repeat(64) },
+          },
+          databaseAbsentReadback: true,
+          applicationR2Settled: true,
+          platformResourcesAbsent: true,
+          workerAbsent: true,
+          ingressRemoved: true,
+          eligibility: 'carrier-null',
+        },
+      };
+      const keyOrderReplay = await lease.completeCleanup({
+        receipt: reordered,
+        expectedRevision: 0,
+      });
+      const conflict = await lease
+        .completeCleanup({
+          receipt: { ...receipt, disposition: 'reservation-cleared' },
+          expectedRevision: 0,
+        })
+        .then(
+          () => undefined,
+          (error: unknown) => errorShape(error),
+        );
+      const foreign = await lease
+        .completeCleanup({
+          receipt: { ...receipt, tenantTag: 'other' },
+          expectedRevision: 0,
+        })
+        .then(
+          () => undefined,
+          (error: unknown) => errorShape(error),
+        );
+      await lease.put(record('cleanupterm', 'production'));
+      const reprovisioned = await store.get('cleanupterm', 'production');
+      const survivingReceipt = await store.readCleanupReceipt?.(
+        receipt.operationId,
+      );
+      return {
+        stale,
+        rowPhaseAfterStale: rowAfterStale?.phase ?? null,
+        receiptsAfterStale,
+        claimsBefore,
+        claimsAfter,
+        rowAfterTerminal: rowAfter?.phase ?? null,
+        persistedHasCompletedAt: typeof persisted.completedAtMs === 'number',
+        replayEqual: JSON.stringify(replay) === JSON.stringify(persisted),
+        keyOrderReplayEqual:
+          JSON.stringify(keyOrderReplay) === JSON.stringify(persisted),
+        conflict,
+        foreign,
+        reprovisionPhase: reprovisioned?.phase ?? null,
+        survivingOperationId: survivingReceipt?.operationId ?? null,
+      };
+    },
+  );
+}
+
+async function cleanupReceiptPrune(db: D1Database): Promise<unknown> {
+  const store = await readyStore(db);
+  await db.prepare(`DELETE FROM ${CLEANUP_RECEIPT_TABLE}`).run();
+  const operations = [
+    '00000000-0000-4000-8000-0000000000a1',
+    '00000000-0000-4000-8000-0000000000a2',
+    '00000000-0000-4000-8000-0000000000a3',
+  ];
+  for (const [index, operationId] of operations.entries()) {
+    const tenantTag = `prune${index}`;
+    const active = cleanupAdvancingFixture(tenantTag, operationId);
+    const receipt = cleanupReceiptFor(active);
+    await store.withDeploymentLease(tenantTag, 'production', async (lease) => {
+      if (!lease.completeCleanup) {
+        throw new Error('completeCleanup capability missing');
+      }
+      await lease.put(active);
+      await lease.completeCleanup({ receipt, expectedRevision: 0 });
+    });
+  }
+  if (!store.pruneCleanupReceipts) {
+    throw new Error('pruneCleanupReceipts capability missing');
+  }
+  const cutoff = Date.now() + 3_600_000;
+  const invalid: unknown[] = [];
+  for (const limit of [0, 1001, 1.5]) {
+    invalid.push(
+      await store
+        .pruneCleanupReceipts({ completedBeforeMs: cutoff, limit })
+        .then(
+          () => undefined,
+          (error: unknown) => errorShape(error),
+        ),
+    );
+  }
+  const untouched = await cleanupReceiptCount(db);
+  const nothing = await store.pruneCleanupReceipts({
+    completedBeforeMs: 0,
+    limit: 1000,
+  });
+  const firstTwo = await store.pruneCleanupReceipts({
+    completedBeforeMs: cutoff,
+    limit: 2,
+  });
+  const remaining = await db
+    .prepare(
+      `SELECT operation_id FROM ${CLEANUP_RECEIPT_TABLE} ORDER BY operation_id`,
+    )
+    .all<{ operation_id: string }>();
+  const lowerBound = await store.pruneCleanupReceipts({
+    completedBeforeMs: cutoff,
+    limit: 1,
+  });
+  const rest = await store.pruneCleanupReceipts({
+    completedBeforeMs: cutoff,
+    limit: 1000,
+  });
+  return {
+    invalid,
+    untouched,
+    nothing,
+    firstTwo,
+    remainingAfterFirstTwo: remaining.results.map((row) => row.operation_id),
+    lowerBound,
+    rest,
+    finalCount: await cleanupReceiptCount(db),
+  };
+}
+
+async function cleanupClaimsRelease(db: D1Database): Promise<unknown> {
+  const store = await readyStore(db);
+  const active = record('claimsrel', 'production');
+  return store.withDeploymentLease('claimsrel', 'production', async (lease) => {
+    await lease.put(active);
+    const claims = await db
+      .prepare(
+        `SELECT resource_set_key, platform_plane_identity
+           FROM ${PLATFORM_CLAIM_TABLE}`,
+      )
+      .all<{ resource_set_key: string; platform_plane_identity: string }>();
+    if (!lease.deleteReleasingClaims) {
+      throw new Error('deleteReleasingClaims capability missing');
+    }
+    await lease.deleteReleasingClaims();
+    return {
+      identities: claims.results,
+      claimsAfter: await cleanupClaimCount(db, 'claimsrel'),
+      rowAfter: (await store.get('claimsrel', 'production'))?.phase ?? null,
+    };
+  });
+}
+
+async function coldConcurrentSchemaInitialization(
+  db: D1Database,
+): Promise<unknown> {
+  const stores = Array.from(
+    { length: 16 },
+    () =>
+      new D1FleetStateStore(new D1FleetStateDatabase(db), {
+        accountId: 'account-primary',
+      }),
+  );
+  const written = await Promise.all(
+    stores.map((store, index) => {
+      const tenantTag = `cold${index}`;
+      return store.withDeploymentLease(
+        tenantTag,
+        'production',
+        async (lease) => {
+          await lease.put(record(tenantTag, 'production'));
+          return tenantTag;
+        },
+      );
+    }),
+  );
+  const columnRows = await db
+    .prepare(`PRAGMA table_info(${STATE_TABLE})`)
+    .all<{ name: string }>();
+  const tableRows = await db
+    .prepare(
+      `SELECT name FROM sqlite_master
+       WHERE type = 'table' AND name IN (?, ?, ?, ?)
+       ORDER BY name`,
+    )
+    .bind(STATE_TABLE, LEASE_TABLE, PLATFORM_CLAIM_TABLE, PLATFORM_LEASE_TABLE)
+    .all<{ name: string }>();
+  const row = await db
+    .prepare(`SELECT COUNT(*) AS count FROM ${STATE_TABLE}`)
+    .first<{ count: number }>();
+  return {
+    written: [...written].sort(),
+    columns: ADDED_NULLABLE_TEXT_COLUMNS.filter((name) =>
+      columnRows.results.some((column) => column.name === name),
+    ),
+    rows: Number(row?.count),
+    tables: tableRows.results.map(({ name }) => name),
+  };
+}
+
+const INVENTORY_TABLES = [
+  'anchorage_fleet_inventory_deployment_facts',
+  'anchorage_fleet_inventory_heads',
+  'anchorage_fleet_inventory_leases',
+  'anchorage_fleet_inventory_pins',
+  'anchorage_fleet_inventory_rows',
+  'anchorage_fleet_inventory_runs',
+];
+const INVENTORY_LEASE_TABLE = 'anchorage_fleet_inventory_leases';
+const INVENTORY_ACCOUNT = 'account-inventory';
+const INVENTORY_OPTIONS = canonicalFleetInventoryRunOptions({
+  hostRoutingKvId: 'kv-host-routing',
+  databaseNamePrefix: 'anchorage-db',
+  scriptNamePrefix: 'anchorage',
+});
+const INVENTORY_DIGEST = fleetInventoryOptionsDigest(INVENTORY_OPTIONS);
+
+function inventoryOperationId(index: number): string {
+  return `123e4567-e89b-42d3-a456-42661417${String(4200 + index)}`;
+}
+
+function inventoryStore(
+  database: FleetStateDatabase,
+  accountId = INVENTORY_ACCOUNT,
+): D1FleetInventoryRunStore {
+  return new D1FleetInventoryRunStore(database, {
+    accountId,
+  });
+}
+
+async function readyInventoryStore(
+  db: D1Database,
+): Promise<D1FleetInventoryRunStore> {
+  const store = inventoryStore(new D1FleetStateDatabase(db));
+  await store.latestFinalizedGeneration();
+  for (const table of INVENTORY_TABLES) {
+    await db.prepare(`DELETE FROM ${table}`).run();
+  }
+  return store;
+}
+
+/** Drops the next batch's result rows, reproducing a lost D1 response. */
+function hideResultsDatabase(
+  delegate: FleetStateDatabase,
+): FleetStateDatabase & Readonly<{ loseNextBatch(): void }> {
+  let lose = false;
+  return {
+    query: (sql, bindings) => delegate.query(sql, bindings),
+    execute: (sql, bindings) => delegate.execute(sql, bindings),
+    async batch(statements) {
+      const results = await delegate.batch(statements);
+      if (!lose) return results;
+      lose = false;
+      return results.map(() => []);
+    },
+    loseNextBatch() {
+      lose = true;
+    },
+  };
+}
+
+function inventoryRows(label: string): readonly FleetInventoryStagedRow[] {
+  return [
+    { kind: 'registration', ordinal: 0, payload: { scriptName: label } },
+    { kind: 'deployment', ordinal: 0, payload: { scriptName: label } },
+    {
+      kind: 'finding',
+      ordinal: 0,
+      payload: { detail: `stale route ${label}` },
+    },
+  ];
+}
+
+function inventoryFacts(): readonly FleetInventoryStagedFact[] {
+  return [
+    {
+      deploymentOrdinal: 0,
+      factKind: 'secret-name',
+      factOrdinal: 0,
+      payload: { name: 'ANCHORAGE_NAME_0' },
+    },
+  ];
+}
+
+function inventoryCounts(
+  rows: readonly FleetInventoryStagedRow[],
+): Record<FleetInventoryRowKind, number> {
+  const counts = emptyFleetInventoryRowCounts() as Record<
+    FleetInventoryRowKind,
+    number
+  >;
+  for (const row of rows) counts[row.kind] += 1;
+  return counts;
+}
+
+function inventoryCommitted(
+  record: FleetInventoryRunRecord,
+  rows: readonly FleetInventoryStagedRow[],
+  facts: readonly FleetInventoryStagedFact[],
+): FleetInventoryRunRecord {
+  return {
+    ...record,
+    progress: {
+      ...record.progress,
+      stage: { step: 'finalize' },
+      revision: record.progress.revision + 1,
+      stagedCounts: inventoryCounts(rows),
+      factCount: facts.length,
+      providerRequests: record.progress.providerRequests + 1,
+    },
+    updatedAt: '2026-08-29T00:00:00.000Z',
+  };
+}
+
+async function seedInventoryGeneration(
+  store: D1FleetInventoryRunStore,
+  index: number,
+  rows: readonly FleetInventoryStagedRow[] = inventoryRows(`gen-${index}`),
+  facts: readonly FleetInventoryStagedFact[] = inventoryFacts(),
+): Promise<number> {
+  const operationId = inventoryOperationId(index);
+  return store.withAccountInventoryLease(async (lease) => {
+    const started = await lease.startRun({
+      operationId,
+      options: INVENTORY_OPTIONS,
+      optionsDigest: INVENTORY_DIGEST,
+    });
+    const record = await lease.commitChunk({
+      operationId,
+      expectedRevision: started.progress.revision,
+      runRecord: inventoryCommitted(started, rows, facts),
+      rows,
+      facts,
+    });
+    const ref = await lease.finalizeRun({
+      operationId,
+      expectedRevision: record.progress.revision,
+      manifest: record.progress.stagedCounts,
+      factCount: record.progress.factCount,
+    });
+    return ref.generation;
+  });
+}
+
+async function inventorySnapshot(db: D1Database) {
+  const heads = await db
+    .prepare(
+      `SELECT account_id, active_operation_id, latest_finalized_generation, next_generation
+         FROM anchorage_fleet_inventory_heads ORDER BY account_id`,
+    )
+    .all();
+  const runs = await db
+    .prepare(
+      `SELECT account_id, operation_id, generation, options_digest,
+              run_record, created_at_ms, finalized_at_ms
+         FROM anchorage_fleet_inventory_runs ORDER BY account_id, operation_id`,
+    )
+    .all();
+  const rows = await db
+    .prepare(
+      `SELECT account_id, generation, kind, ordinal, payload
+         FROM anchorage_fleet_inventory_rows
+        ORDER BY account_id, generation, kind, ordinal`,
+    )
+    .all();
+  const facts = await db
+    .prepare(
+      `SELECT account_id, generation, deployment_ordinal, fact_kind,
+              fact_ordinal, payload
+         FROM anchorage_fleet_inventory_deployment_facts
+        ORDER BY account_id, generation, deployment_ordinal, fact_kind, fact_ordinal`,
+    )
+    .all();
+  return {
+    heads: heads.results,
+    runs: runs.results,
+    rows: rows.results,
+    facts: facts.results,
+  };
+}
+
+interface InventoryCommitRefusalInput {
+  fault:
+    | 'account'
+    | 'generation'
+    | 'options'
+    | 'row-conflict'
+    | 'fact-conflict'
+    | 'duplicate-row'
+    | 'duplicate-fact';
+  hideResults: boolean;
+  duplicatePayload?: 'same' | 'different';
+}
+
+async function inventoryCommitRefusal(
+  db: D1Database,
+  { fault, hideResults, duplicatePayload }: InventoryCommitRefusalInput,
+): Promise<unknown> {
+  await readyInventoryStore(db);
+  const database = hideResultsDatabase(new D1FleetStateDatabase(db));
+  const store = inventoryStore(database);
+  const operationId = inventoryOperationId(21);
+  return store.withAccountInventoryLease(async (lease) => {
+    const started = await lease.startRun({
+      operationId,
+      options: INVENTORY_OPTIONS,
+      optionsDigest: INVENTORY_DIGEST,
+    });
+    const seededRows = inventoryRows('prior');
+    const seededFacts = inventoryFacts();
+    const prior = await lease.commitChunk({
+      operationId,
+      expectedRevision: 0,
+      runRecord: inventoryCommitted(started, seededRows, seededFacts),
+      rows: seededRows,
+      facts: seededFacts,
+    });
+    const row: FleetInventoryStagedRow = {
+      kind: 'meta',
+      ordinal: 0,
+      payload: { marker: 'earlier-sibling' },
+    };
+    const fact: FleetInventoryStagedFact = {
+      deploymentOrdinal: 0,
+      factKind: 'secret-name',
+      factOrdinal: 1,
+      payload: { name: 'ANCHORAGE_NAME_1' },
+    };
+    const existingRow = seededRows[0];
+    const existingFact = seededFacts[0];
+    if (!existingRow || !existingFact) {
+      throw new Error('inventory refusal seed is absent');
+    }
+    const intended = inventoryCommitted(
+      prior,
+      [...seededRows, row],
+      [...seededFacts, fact],
+    );
+    const input = {
+      operationId,
+      expectedRevision: prior.progress.revision,
+      runRecord: intended,
+      rows: fault === 'row-conflict' ? [row, existingRow] : [row],
+      facts: fault === 'fact-conflict' ? [fact, existingFact] : [fact],
+    };
+    const attempted = { ...input };
+    switch (fault) {
+      case 'generation':
+        attempted.runRecord = {
+          ...intended,
+          progress: { ...intended.progress, generation: 99 },
+        };
+        break;
+      case 'options': {
+        const options = canonicalFleetInventoryRunOptions({
+          ...INVENTORY_OPTIONS,
+          scriptNamePrefix: 'alternate',
+        });
+        attempted.runRecord = {
+          ...intended,
+          options,
+          optionsDigest: fleetInventoryOptionsDigest(options),
+        };
+        break;
+      }
+      case 'row-conflict':
+        attempted.rows = [
+          row,
+          { ...existingRow, payload: { scriptName: 'different' } },
+        ];
+        break;
+      case 'fact-conflict':
+        attempted.facts = [
+          fact,
+          { ...existingFact, payload: { name: 'DIFFERENT_NAME' } },
+        ];
+        break;
+      case 'duplicate-row':
+        attempted.rows = [
+          row,
+          duplicatePayload === 'same'
+            ? row
+            : { ...row, payload: { marker: 'different' } },
+        ];
+        break;
+      case 'duplicate-fact':
+        attempted.facts = [
+          fact,
+          duplicatePayload === 'same'
+            ? fact
+            : { ...fact, payload: { name: 'DIFFERENT_NAME' } },
+        ];
+        break;
+    }
+    const before = await inventorySnapshot(db);
+    let refused: unknown = null;
+    try {
+      if (fault === 'account') {
+        await new D1FleetInventoryRunStore(database, {
+          accountId: 'other-inventory-account',
+        }).withAccountInventoryLease(async (foreignLease) => {
+          await foreignLease.assertOwned();
+          if (hideResults) database.loseNextBatch();
+          await foreignLease.commitChunk(attempted);
+        });
+      } else {
+        if (hideResults) database.loseNextBatch();
+        await lease.commitChunk(attempted);
+      }
+    } catch (error) {
+      refused = errorShape(error);
+    }
+    const afterRefusal = await inventorySnapshot(db);
+    let accepted: FleetInventoryRunRecord | null = null;
+    let replay: FleetInventoryRunRecord | null = null;
+    let acceptanceError: unknown = null;
+    let afterAcceptance = afterRefusal;
+    try {
+      if (hideResults) database.loseNextBatch();
+      accepted = await lease.commitChunk(input);
+      afterAcceptance = await inventorySnapshot(db);
+      if (hideResults) database.loseNextBatch();
+      replay = await lease.commitChunk(input);
+    } catch (error) {
+      acceptanceError = errorShape(error);
+    }
+    return {
+      prior,
+      intended,
+      attempted,
+      before,
+      afterRefusal,
+      refused,
+      accepted,
+      acceptanceError,
+      afterAcceptance,
+      replay,
+      afterReplay: await inventorySnapshot(db),
+    };
+  });
+}
+
+async function inventoryCommitReplay(
+  db: D1Database,
+  change: 'failed' | 'stage' | 'provider-requests' | 'updated-at',
+  hideResults: boolean,
+): Promise<unknown> {
+  await readyInventoryStore(db);
+  const database = hideResultsDatabase(new D1FleetStateDatabase(db));
+  const store = inventoryStore(database);
+  const operationId = inventoryOperationId(22);
+  return store.withAccountInventoryLease(async (lease) => {
+    const started = await lease.startRun({
+      operationId,
+      options: INVENTORY_OPTIONS,
+      optionsDigest: INVENTORY_DIGEST,
+    });
+    const rows = inventoryRows('prior');
+    const facts = inventoryFacts();
+    const input = {
+      operationId,
+      expectedRevision: 0,
+      runRecord: inventoryCommitted(started, rows, facts),
+      rows,
+      facts,
+    };
+    if (hideResults) database.loseNextBatch();
+    const accepted = await lease.commitChunk(input);
+    const afterAcceptance = await inventorySnapshot(db);
+    if (hideResults) database.loseNextBatch();
+    const replay = await lease.commitChunk(input);
+    const afterReplay = await inventorySnapshot(db);
+    let attempted = input.runRecord;
+    switch (change) {
+      case 'failed':
+        await lease.failRun({
+          operationId,
+          expectedRevision: accepted.progress.revision,
+          reason: 'operator-abandoned',
+        });
+        break;
+      case 'stage':
+        attempted = {
+          ...attempted,
+          progress: {
+            ...attempted.progress,
+            stage: { step: 'ordinary-scripts' },
+          },
+        };
+        break;
+      case 'provider-requests':
+        attempted = {
+          ...attempted,
+          progress: {
+            ...attempted.progress,
+            providerRequests: attempted.progress.providerRequests + 1,
+          },
+        };
+        break;
+      case 'updated-at':
+        attempted = { ...attempted, updatedAt: '2026-08-30T00:00:00.000Z' };
+        break;
+    }
+    const beforeRefusal = await inventorySnapshot(db);
+    let refused: unknown = null;
+    if (hideResults) database.loseNextBatch();
+    try {
+      await lease.commitChunk({ ...input, runRecord: attempted });
+    } catch (error) {
+      refused = errorShape(error);
+    }
+    return {
+      intended: input.runRecord,
+      attempted,
+      accepted,
+      afterAcceptance,
+      replay,
+      afterReplay,
+      beforeRefusal,
+      afterRefusal: await inventorySnapshot(db),
+      refused,
+    };
+  });
+}
+
+async function inventoryMaximumChunk(db: D1Database): Promise<unknown> {
+  await readyInventoryStore(db);
+  const delegate = new D1FleetStateDatabase(db);
+  let maxStatements = 0;
+  let maxBindings = 0;
+  let maxSqlBytes = 0;
+  let maxBindingBytes = 0;
+  const encoder = new TextEncoder();
+  const measured: FleetStateDatabase = {
+    query: (sql, bindings) => delegate.query(sql, bindings),
+    execute: (sql, bindings) => delegate.execute(sql, bindings),
+    async batch(statements) {
+      maxStatements = Math.max(maxStatements, statements.length);
+      for (const { sql, bindings = [] } of statements) {
+        maxBindings = Math.max(maxBindings, bindings.length);
+        maxSqlBytes = Math.max(maxSqlBytes, encoder.encode(sql).byteLength);
+        for (const binding of bindings) {
+          if (typeof binding === 'string')
+            maxBindingBytes = Math.max(
+              maxBindingBytes,
+              encoder.encode(binding).byteLength,
+            );
+        }
+      }
+      return delegate.batch(statements);
+    },
+  };
+  const store = inventoryStore(measured);
+  const rows: FleetInventoryStagedRow[] = Array.from(
+    { length: 1000 },
+    (_, ordinal) => ({ kind: 'meta', ordinal, payload: { index: ordinal } }),
+  );
+  const facts: FleetInventoryStagedFact[] = Array.from(
+    { length: 1000 },
+    (_, factOrdinal) => ({
+      deploymentOrdinal: 0,
+      factKind: 'secret-name',
+      factOrdinal,
+      payload: { name: `ANCHORAGE_NAME_${factOrdinal}` },
+    }),
+  );
+  const id = inventoryOperationId(23);
+  const result = await store.withAccountInventoryLease(async (lease) => {
+    const started = await lease.startRun({
+      operationId: id,
+      options: INVENTORY_OPTIONS,
+      optionsDigest: INVENTORY_DIGEST,
+    });
+    const input = {
+      operationId: id,
+      expectedRevision: 0,
+      runRecord: inventoryCommitted(started, rows, facts),
+      rows,
+      facts,
+    };
+    const accepted = await lease.commitChunk(input);
+    const replay = await lease.commitChunk(input);
+    const finalized = await lease.finalizeRun({
+      operationId: id,
+      expectedRevision: accepted.progress.revision,
+      manifest: accepted.progress.stagedCounts,
+      factCount: accepted.progress.factCount,
+    });
+    return { accepted, replay, finalized };
+  });
+  const materialized = await store.readFinalizedGeneration(
+    result.finalized.generation,
+  );
+  return {
+    acceptedRevision: result.accepted.progress.revision,
+    replayEqual:
+      JSON.stringify(result.accepted) === JSON.stringify(result.replay),
+    rowsEqual: JSON.stringify(materialized.rows) === JSON.stringify(rows),
+    factsEqual: JSON.stringify(materialized.facts) === JSON.stringify(facts),
+    rowCount: materialized.rows.length,
+    factCount: materialized.facts.length,
+    maxStatements,
+    maxBindings,
+    maxSqlBytes,
+    maxBindingBytes,
+  };
+}
+
+async function inventoryStartAtomicity(db: D1Database): Promise<unknown> {
+  await readyInventoryStore(db);
+  const operationId = inventoryOperationId(0);
+  const stores = Array.from({ length: 16 }, () =>
+    inventoryStore(new D1FleetStateDatabase(db)),
+  );
+  const attempts = await Promise.allSettled(
+    stores.map((store) =>
+      store.withAccountInventoryLease((lease) =>
+        lease.startRun({
+          operationId,
+          options: INVENTORY_OPTIONS,
+          optionsDigest: INVENTORY_DIGEST,
+        }),
+      ),
+    ),
+  );
+  const head = await db
+    .prepare(
+      `SELECT active_operation_id, latest_finalized_generation, next_generation
+         FROM anchorage_fleet_inventory_heads WHERE account_id = ?`,
+    )
+    .bind(INVENTORY_ACCOUNT)
+    .first<{
+      active_operation_id: string | null;
+      latest_finalized_generation: number | null;
+      next_generation: number;
+    }>();
+  const run = await db
+    .prepare(
+      `SELECT operation_id, generation, options_digest, finalized_at_ms
+         FROM anchorage_fleet_inventory_runs WHERE account_id = ?`,
+    )
+    .bind(INVENTORY_ACCOUNT)
+    .all<{
+      operation_id: string;
+      generation: number;
+      options_digest: string;
+      finalized_at_ms: number | null;
+    }>();
+  return {
+    started: attempts.filter((attempt) => attempt.status === 'fulfilled')
+      .length,
+    rejected: attempts.filter((attempt) => attempt.status === 'rejected')
+      .length,
+    head: {
+      activeOperationId: head?.active_operation_id ?? null,
+      latestFinalizedGeneration: head?.latest_finalized_generation ?? null,
+      nextGeneration: Number(head?.next_generation),
+    },
+    runs: run.results.map((row) => ({
+      operationId: row.operation_id,
+      generation: Number(row.generation),
+      digestMatches: row.options_digest === INVENTORY_DIGEST,
+      finalized: row.finalized_at_ms !== null,
+    })),
+    generation:
+      run.results.length === 1 ? Number(run.results[0]?.generation) : 0,
+  };
+}
+
+async function inventoryCrossAccountStart(
+  db: D1Database,
+  concurrent: boolean,
+): Promise<unknown> {
+  await readyInventoryStore(db);
+  const accounts = [INVENTORY_ACCOUNT, 'account-inventory-other'] as const;
+  const stores = accounts.map((account) =>
+    inventoryStore(new D1FleetStateDatabase(db), account),
+  );
+  const firstStore = stores[0];
+  const secondStore = stores[1];
+  if (!firstStore || !secondStore) throw new Error('collision stores missing');
+  await seedInventoryGeneration(firstStore, 24);
+  await seedInventoryGeneration(secondStore, 25);
+  const operationId = inventoryOperationId(26);
+  const nextOperationId = inventoryOperationId(27);
+  const start = (store: D1FleetInventoryRunStore, id: string) =>
+    store.withAccountInventoryLease((lease) =>
+      lease.startRun({
+        operationId: id,
+        options: INVENTORY_OPTIONS,
+        optionsDigest: INVENTORY_DIGEST,
+      }),
+    );
+  const before = await inventorySnapshot(db);
+  const first = start(firstStore, operationId);
+  if (!concurrent) await first;
+  const attempts = await Promise.allSettled([
+    first,
+    start(secondStore, operationId),
+  ]);
+  const afterCollision = await inventorySnapshot(db);
+  const winnerIndex = attempts.findIndex(
+    (entry) => entry.status === 'fulfilled',
+  );
+  const loserIndex = attempts.findIndex((entry) => entry.status === 'rejected');
+  const winner = stores[winnerIndex];
+  const loser = stores[loserIndex];
+  if (!winner || !loser) {
+    throw new Error(`collision outcomes: ${JSON.stringify(attempts)}`);
+  }
+  const refused = await start(loser, operationId).then(
+    () => null,
+    (error: unknown) => errorShape(error),
+  );
+  const replay = await start(winner, operationId);
+  const busy = await start(winner, nextOperationId).then(
+    () => null,
+    (error: unknown) => errorShape(error),
+  );
+  const afterRefusals = await inventorySnapshot(db);
+  let next: FleetInventoryRunRecord | null = null;
+  const nextError = await start(loser, nextOperationId).then(
+    (run) => {
+      next = run;
+      return null;
+    },
+    (error: unknown) => errorShape(error),
+  );
+  return {
+    operationId,
+    nextOperationId,
+    winnerAccount: accounts[winnerIndex],
+    loserAccount: accounts[loserIndex],
+    attempts: attempts.map((entry) =>
+      entry.status === 'fulfilled'
+        ? { status: entry.status, run: entry.value }
+        : { status: entry.status, error: errorShape(entry.reason) },
+    ),
+    before,
+    afterCollision,
+    refused,
+    replay,
+    busy,
+    afterRefusals,
+    next,
+    nextError,
+    afterNext: await inventorySnapshot(db),
+  };
+}
+
+async function inventoryPartialPrune(
+  db: D1Database,
+  mode: 'rows' | 'both' | 'empty',
+): Promise<unknown> {
+  await readyInventoryStore(db);
+  const clock = controlledLeaseClock(db, INVENTORY_LEASE_TABLE);
+  clock.allowHeartbeat();
+  const store = new D1FleetInventoryRunStore(clock.database, {
+    accountId: INVENTORY_ACCOUNT,
+    leaseTtlMs: 60_000,
+    leaseRenewalIntervalMs: 30_000,
+  });
+  await seedInventoryGeneration(
+    store,
+    38,
+    mode === 'empty' ? [] : inventoryRows('partial-prune'),
+    mode === 'empty' ? [] : inventoryFacts(),
+  );
+  await seedInventoryGeneration(store, 39);
+  const before = await inventorySnapshot(db);
+  clock.advanceBeforeBatchStatement(mode === 'rows' ? 1 : 2, 60_001);
+  const interrupted = await store.pruneInventoryGenerations({ limit: 1 }).then(
+    () => null,
+    (error: unknown) => errorShape(error),
+  );
+  const partial = await inventorySnapshot(db);
+  const pin = await store
+    .pinGeneration({ generation: 1, pinnedBy: 'reader' })
+    .then(
+      () => null,
+      (error: unknown) => errorShape(error),
+    );
+  const afterPin = await inventorySnapshot(db);
+  const pins = await db
+    .prepare(
+      'SELECT account_id, generation, pinned_by FROM anchorage_fleet_inventory_pins',
+    )
+    .all();
+  const read = await store.readFinalizedGeneration(1).then(
+    (generation) => ({ generation, error: null }),
+    (error: unknown) => ({ generation: null, error: errorShape(error) }),
+  );
+  await store.releasePin({ generation: 1, pinnedBy: 'reader' });
+  const retried = await store.pruneInventoryGenerations({ limit: 1 });
+  return {
+    before,
+    interrupted,
+    partial,
+    pin,
+    afterPin,
+    pins: pins.results,
+    read,
+    retried,
+    afterRetry: await inventorySnapshot(db),
+  };
+}
+
+async function inventoryDenseFinalization(db: D1Database): Promise<unknown> {
+  const store = await readyInventoryStore(db);
+  const operationId = inventoryOperationId(40);
+  return store.withAccountInventoryLease(async (lease) => {
+    const started = await lease.startRun({
+      operationId,
+      options: INVENTORY_OPTIONS,
+      optionsDigest: INVENTORY_DIGEST,
+    });
+    const rows: FleetInventoryStagedRow[] = [
+      { kind: 'meta', ordinal: 0, payload: { index: 0 } },
+      { kind: 'meta', ordinal: 2, payload: { index: 2 } },
+    ];
+    const current = await lease.commitChunk({
+      operationId,
+      expectedRevision: 0,
+      runRecord: inventoryCommitted(started, rows, []),
+      rows,
+      facts: [],
+    });
+    const before = await inventorySnapshot(db);
+    const refused = await lease
+      .finalizeRun({
+        operationId,
+        expectedRevision: 1,
+        manifest: current.progress.stagedCounts,
+        factCount: 0,
+      })
+      .then(
+        () => null,
+        (error: unknown) => errorShape(error),
+      );
+    const afterRefusal = await inventorySnapshot(db);
+    const missing: FleetInventoryStagedRow = {
+      kind: 'meta',
+      ordinal: 1,
+      payload: { index: 1 },
+    };
+    const complete = await lease.commitChunk({
+      operationId,
+      expectedRevision: 1,
+      runRecord: inventoryCommitted(current, [...rows, missing], []),
+      rows: [missing],
+      facts: [],
+    });
+    await lease.finalizeRun({
+      operationId,
+      expectedRevision: 2,
+      manifest: complete.progress.stagedCounts,
+      factCount: 0,
+    });
+    return {
+      operationId,
+      before,
+      afterRefusal,
+      refused,
+      final: await store.readFinalizedGeneration(1),
+    };
+  });
+}
+
+async function inventoryPinPruneRace(
+  db: D1Database,
+  winner: 'pin' | 'prune',
+): Promise<unknown> {
+  await readyInventoryStore(db);
+  const delegate = new D1FleetStateDatabase(db);
+  let release!: () => void;
+  const resume = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let arrived!: () => void;
+  const entered = new Promise<void>((resolve) => {
+    arrived = resolve;
+  });
+  let armed = false;
+  const database: FleetStateDatabase = {
+    query: (sql, bindings) => delegate.query(sql, bindings),
+    execute: (sql, bindings) => delegate.execute(sql, bindings),
+    async batch(statements) {
+      const heldSql =
+        winner === 'prune'
+          ? 'INSERT INTO anchorage_fleet_inventory_pins'
+          : 'DELETE FROM anchorage_fleet_inventory_rows';
+      if (
+        armed &&
+        statements.some((statement) => statement.sql.includes(heldSql))
+      ) {
+        armed = false;
+        arrived();
+        await resume;
+      }
+      return delegate.batch(statements);
+    },
+  };
+  const store = inventoryStore(database);
+  await seedInventoryGeneration(store, 36);
+  await seedInventoryGeneration(store, 37);
+  const before = await inventorySnapshot(db);
+  let pinOutcome: unknown;
+  let pruneOutcome: unknown;
+  await store.withAccountInventoryLease(async (lease) => {
+    armed = true;
+    const pin = () =>
+      lease.pinGeneration({ generation: 1, pinnedBy: 'race-reader' }).then(
+        () => ({ ok: true, error: null }),
+        (error: unknown) => ({ ok: false, error: errorShape(error) }),
+      );
+    const prune = () =>
+      lease.pruneInventoryGenerations({ limit: 1 }).then(
+        (result) => ({ deleted: result.deleted, error: null }),
+        (error: unknown) => ({ deleted: null, error: errorShape(error) }),
+      );
+    const held = winner === 'prune' ? pin() : prune();
+    let other: unknown;
+    try {
+      const reached = await Promise.race([
+        entered.then(() => true),
+        held.then(() => false),
+      ]);
+      if (!reached)
+        throw new Error('inventory pin/prune barrier was not reached');
+      other = await (winner === 'prune' ? prune() : pin());
+    } finally {
+      release();
+    }
+    const resumed = await held;
+    pinOutcome = winner === 'prune' ? resumed : other;
+    pruneOutcome = winner === 'prune' ? other : resumed;
+  });
+  const after = await inventorySnapshot(db);
+  const pins = await db
+    .prepare(
+      'SELECT account_id, generation, pinned_by FROM anchorage_fleet_inventory_pins ORDER BY account_id, generation, pinned_by',
+    )
+    .all();
+  const read = await store.readFinalizedGeneration(1).then(
+    (generation) => ({ generation, error: null }),
+    (error: unknown) => ({ generation: null, error: errorShape(error) }),
+  );
+  return { before, after, pins: pins.results, pinOutcome, pruneOutcome, read };
+}
+
+async function inventoryPruneActiveRace(db: D1Database): Promise<unknown> {
+  await readyInventoryStore(db);
+  const delegate = new D1FleetStateDatabase(db);
+  const operationId = inventoryOperationId(35);
+  let arm = false;
+  let afterPromotion: unknown = null;
+  const database: FleetStateDatabase = {
+    query: (sql, bindings) => delegate.query(sql, bindings),
+    execute: (sql, bindings) => delegate.execute(sql, bindings),
+    async batch(statements) {
+      if (arm) {
+        arm = false;
+        await db
+          .prepare(
+            'UPDATE anchorage_fleet_inventory_heads SET active_operation_id = ? WHERE account_id = ?',
+          )
+          .bind(operationId, INVENTORY_ACCOUNT)
+          .run();
+        afterPromotion = await inventorySnapshot(db);
+      }
+      return delegate.batch(statements);
+    },
+  };
+  const store = inventoryStore(database);
+  await store.withAccountInventoryLease(async (lease) => {
+    const started = await lease.startRun({
+      operationId,
+      options: INVENTORY_OPTIONS,
+      optionsDigest: INVENTORY_DIGEST,
+    });
+    const rows = inventoryRows('prune-active-race');
+    const facts = inventoryFacts();
+    await lease.commitChunk({
+      operationId,
+      expectedRevision: 0,
+      runRecord: inventoryCommitted(started, rows, facts),
+      rows,
+      facts,
+    });
+    await lease.failRun({
+      operationId,
+      expectedRevision: 1,
+      reason: 'operator-abandoned',
+    });
+  });
+  const before = await inventorySnapshot(db);
+  arm = true;
+  const pruned = await store.pruneInventoryGenerations({ limit: 1 });
+  return {
+    operationId,
+    before,
+    afterPromotion,
+    pruned,
+    afterPrune: await inventorySnapshot(db),
+  };
+}
+
+async function inventoryFailureRecovery(db: D1Database): Promise<unknown> {
+  await readyInventoryStore(db);
+  const clock = controlledLeaseClock(db, INVENTORY_LEASE_TABLE);
+  clock.allowHeartbeat();
+  const store = new D1FleetInventoryRunStore(clock.database, {
+    accountId: INVENTORY_ACCOUNT,
+    leaseTtlMs: 60_000,
+    leaseRenewalIntervalMs: 30_000,
+  });
+  await seedInventoryGeneration(store, 28);
+  const operationId = inventoryOperationId(29);
+  const nextOperationId = inventoryOperationId(30);
+  const staged = await store.withAccountInventoryLease(async (lease) => {
+    const started = await lease.startRun({
+      operationId,
+      options: INVENTORY_OPTIONS,
+      optionsDigest: INVENTORY_DIGEST,
+    });
+    const rows = inventoryRows('failure-recovery');
+    const facts = inventoryFacts();
+    return lease.commitChunk({
+      operationId,
+      expectedRevision: started.progress.revision,
+      runRecord: inventoryCommitted(started, rows, facts),
+      rows,
+      facts,
+    });
+  });
+  const input = {
+    operationId,
+    expectedRevision: staged.progress.revision,
+    reason: 'operator-abandoned' as const,
+  };
+  const before = await inventorySnapshot(db);
+  const leaseOwners: unknown[] = [];
+  const interrupted = await store
+    .withAccountInventoryLease(async (lease) => {
+      leaseOwners.push(
+        await db
+          .prepare(`SELECT owner_token, expires_at FROM ${INVENTORY_LEASE_TABLE}
+        WHERE account_id = ?`)
+          .bind(INVENTORY_ACCOUNT)
+          .first(),
+      );
+      clock.advanceBeforeBatchStatement(1, 60_001);
+      await lease.failRun(input);
+    })
+    .then(
+      () => null,
+      (error: unknown) => errorShape(error),
+    );
+  const afterInterrupted = await inventorySnapshot(db);
+  const pruningBeforeRepair = await store.pruneInventoryGenerations({
+    limit: 1,
+  });
+  const afterPruningBeforeRepair = await inventorySnapshot(db);
+  const wrongRevision = await store
+    .withAccountInventoryLease((lease) =>
+      lease.failRun({ ...input, expectedRevision: input.expectedRevision + 1 }),
+    )
+    .then(
+      () => null,
+      (error: unknown) => errorShape(error),
+    );
+  const afterWrongRevision = await inventorySnapshot(db);
+  const recoveryError = await store
+    .withAccountInventoryLease(async (lease) => {
+      leaseOwners.push(
+        await db
+          .prepare(`SELECT owner_token, expires_at FROM ${INVENTORY_LEASE_TABLE}
+        WHERE account_id = ?`)
+          .bind(INVENTORY_ACCOUNT)
+          .first(),
+      );
+      await lease.failRun(input);
+    })
+    .then(
+      () => null,
+      (error: unknown) => errorShape(error),
+    );
+  const afterRecovery = await inventorySnapshot(db);
+  let next: FleetInventoryRunRecord | null = null;
+  const nextError = await store
+    .withAccountInventoryLease((lease) =>
+      lease.startRun({
+        operationId: nextOperationId,
+        options: INVENTORY_OPTIONS,
+        optionsDigest: INVENTORY_DIGEST,
+      }),
+    )
+    .then(
+      (run) => {
+        next = run;
+        return null;
+      },
+      (error: unknown) => errorShape(error),
+    );
+  const beforeNewHeadReplay = await inventorySnapshot(db);
+  const newHeadReplayError = await store
+    .withAccountInventoryLease((lease) => lease.failRun(input))
+    .then(
+      () => null,
+      (error: unknown) => errorShape(error),
+    );
+  const afterNewHeadReplay = await inventorySnapshot(db);
+  const prunedInactive = await store.pruneInventoryGenerations({ limit: 1 });
+  const afterInactivePrune = await inventorySnapshot(db);
+  return {
+    staged,
+    nextOperationId,
+    before,
+    interrupted,
+    afterInterrupted,
+    pruningBeforeRepair,
+    afterPruningBeforeRepair,
+    wrongRevision,
+    afterWrongRevision,
+    recoveryError,
+    afterRecovery,
+    leaseOwners,
+    now: clock.now(),
+    next,
+    nextError,
+    beforeNewHeadReplay,
+    newHeadReplayError,
+    afterNewHeadReplay,
+    prunedInactive,
+    afterInactivePrune,
+  };
+}
+
+async function inventoryFinalizedContinuationRecovery(
+  db: D1Database,
+  mode: 'normal' | 'stale' | 'fallback',
+): Promise<unknown> {
+  await readyInventoryStore(db);
+  const clock = controlledLeaseClock(db, INVENTORY_LEASE_TABLE);
+  clock.allowHeartbeat();
+  const store = new D1FleetInventoryRunStore(clock.database, {
+    accountId: INVENTORY_ACCOUNT,
+    leaseTtlMs: 60_000,
+    leaseRenewalIntervalMs: 30_000,
+  });
+  const operationId = inventoryOperationId(31);
+  const staged = await store.withAccountInventoryLease(async (lease) => {
+    const started = await lease.startRun({
+      operationId,
+      options: INVENTORY_OPTIONS,
+      optionsDigest: INVENTORY_DIGEST,
+    });
+    const rows = inventoryRows('finalized-continuation');
+    const facts = inventoryFacts();
+    return lease.commitChunk({
+      operationId,
+      expectedRevision: started.progress.revision,
+      runRecord: inventoryCommitted(started, rows, facts),
+      rows,
+      facts,
+    });
+  });
+  let providerCalls = 0;
+  const context = {
+    async advanceStage(): Promise<never> {
+      providerCalls += 1;
+      throw new Error('finalized continuation reached the provider');
+    },
+  };
+  const token = {
+    version: 1 as const,
+    operationId,
+    revision: staged.progress.revision,
+  };
+  const before = await inventorySnapshot(db);
+  clock.advanceBeforeBatchStatement(1, 60_001);
+  const interrupted = await advanceFleetInventory({
+    context,
+    store,
+    action: { kind: 'continue', token },
+    maxProviderRequests: 9,
+  }).then(
+    () => null,
+    (error: unknown) => errorShape(error),
+  );
+  const afterInterrupted = await inventorySnapshot(db);
+  const pruningBeforeRepair = await store.pruneInventoryGenerations({
+    limit: 1,
+  });
+  const afterPruningBeforeRepair = await inventorySnapshot(db);
+  const trace: string[] = [];
+  const repairs: unknown[] = [];
+  const continuationStore: FleetInventoryRunStore = {
+    withAccountInventoryLease: (operation) =>
+      store.withAccountInventoryLease((lease) =>
+        operation({
+          ...lease,
+          readRun: (id) => {
+            trace.push('lease-read');
+            return mode === 'fallback'
+              ? Promise.resolve(undefined)
+              : lease.readRun(id);
+          },
+          finalizeRun: (input) => {
+            trace.push('finalize');
+            repairs.push(input);
+            return lease.finalizeRun(input);
+          },
+        }),
+      ),
+    readRunByOperation: (id) => {
+      trace.push('fallback-read');
+      return store.readRunByOperation(id);
+    },
+    readFinalizedGeneration: (generation) => {
+      trace.push('generation-read');
+      return store.readFinalizedGeneration(generation);
+    },
+    latestFinalizedGeneration: () => store.latestFinalizedGeneration(),
+    pinGeneration: (input) => store.pinGeneration(input),
+    releasePin: (input) => store.releasePin(input),
+    pruneInventoryGenerations: (input) =>
+      store.pruneInventoryGenerations(input),
+  };
+  const continueRun = () =>
+    advanceFleetInventory({
+      context,
+      store: continuationStore,
+      action: {
+        kind: 'continue',
+        token: { ...token, revision: mode === 'stale' ? 0 : token.revision },
+      },
+      maxProviderRequests: 9,
+    });
+  const recovery = await continueRun().then(
+    (result) => ({ result, error: null }),
+    (error: unknown) => ({ result: null, error: errorShape(error) }),
+  );
+  const afterRecovery = await inventorySnapshot(db);
+  const recoveryTrace = [...trace];
+  const recoveryRepairs = [...repairs];
+  const base = {
+    staged,
+    before,
+    interrupted,
+    afterInterrupted,
+    pruningBeforeRepair,
+    afterPruningBeforeRepair,
+    recovery,
+    afterRecovery,
+    recoveryTrace,
+    recoveryRepairs,
+  };
+  if (!recovery.result) return { ...base, providerCalls, historical: null };
+  await seedInventoryGeneration(store, 32);
+  const newer = await store.withAccountInventoryLease((lease) =>
+    lease.startRun({
+      operationId: inventoryOperationId(33),
+      options: INVENTORY_OPTIONS,
+      optionsDigest: INVENTORY_DIGEST,
+    }),
+  );
+  const beforeHistorical = await inventorySnapshot(db);
+  const unpinned = await continueRun().then(
+    () => null,
+    (error: unknown) => errorShape(error),
+  );
+  const afterUnpinned = await inventorySnapshot(db);
+  await store.pinGeneration({ generation: 1, pinnedBy: 'audit-recovery' });
+  const pinned = await continueRun();
+  const afterPinned = await inventorySnapshot(db);
+  await store.releasePin({ generation: 1, pinnedBy: 'audit-recovery' });
+  const released = await continueRun().then(
+    () => null,
+    (error: unknown) => errorShape(error),
+  );
+  return {
+    ...base,
+    providerCalls,
+    historical: {
+      newer,
+      before: beforeHistorical,
+      unpinned,
+      afterUnpinned,
+      pinned,
+      afterPinned,
+      released,
+      afterReleased: await inventorySnapshot(db),
+    },
+  };
+}
+
+async function inventoryCommitConcurrency(db: D1Database): Promise<unknown> {
+  const store = await readyInventoryStore(db);
+  const operationId = inventoryOperationId(1);
+  // The account lease serializes lease HOLDERS, so the guarded commit batch can
+  // only be raced by concurrent calls under one lease. Concurrency is expressed
+  // exactly like coldConcurrentSchemaInitialization: Promise.allSettled over N
+  // writers inside the one request.
+  return store.withAccountInventoryLease(async (lease) => {
+    const started = await lease.startRun({
+      operationId,
+      options: INVENTORY_OPTIONS,
+      optionsDigest: INVENTORY_DIGEST,
+    });
+    const shared = inventoryRows('race');
+    const writers = Array.from({ length: 16 }, (_unused, index) => {
+      const rows = [
+        ...shared,
+        { kind: 'meta' as const, ordinal: index, payload: { writer: index } },
+      ];
+      const base = inventoryCommitted(started, rows, []);
+      return {
+        operationId,
+        expectedRevision: started.progress.revision,
+        // Each writer's intended record differs, so the winner is the writer
+        // whose own record the guarded UPDATE persisted.
+        runRecord: {
+          ...base,
+          progress: { ...base.progress, providerRequests: index + 1 },
+        },
+        rows,
+        facts: [] as readonly FleetInventoryStagedFact[],
+      };
+    });
+    const settled = await Promise.allSettled(
+      writers.map((input) => lease.commitChunk(input)),
+    );
+    const outcomes = settled.map((result, index) => {
+      if (result.status === 'rejected') {
+        return {
+          index,
+          outcome: (result.reason as Error).message.includes('diverge')
+            ? 'corrupt'
+            : 'conflict',
+        };
+      }
+      const intended = JSON.stringify(writers[index]?.runRecord);
+      return {
+        index,
+        outcome:
+          JSON.stringify(result.value) === intended ? 'committed' : 'converged',
+      };
+    });
+    const winner = outcomes.find((entry) => entry.outcome === 'committed');
+    const winning = writers[winner?.index ?? -1];
+    if (!winning) throw new Error('inventory commit race had no winner');
+    // The winner's own replay is the lost-response case: its rows are already
+    // present byte-identically at the intended revision, so it converges on the
+    // persisted record without advancing the revision a second time.
+    const beforeReplay = (await store.readRunByOperation(operationId))?.progress
+      .revision;
+    const replayResult = await lease.commitChunk(winning).then(
+      (record) => JSON.stringify(record) === JSON.stringify(winning.runRecord),
+      () => false,
+    );
+    const afterReplay = (await store.readRunByOperation(operationId))?.progress
+      .revision;
+    const lostResponseReplay =
+      replayResult && beforeReplay === afterReplay ? 'converged' : 'conflict';
+    const persisted = await store.readRunByOperation(operationId);
+    if (!persisted) throw new Error('inventory commit race lost its run');
+    const trailing = {
+      kind: 'meta' as const,
+      ordinal: 100,
+      payload: { writer: 'trailing' },
+    };
+    const advanced = await lease.commitChunk({
+      operationId,
+      expectedRevision: persisted.progress.revision,
+      runRecord: inventoryCommitted(persisted, [...shared, trailing], []),
+      rows: [trailing],
+      facts: [],
+    });
+    const replayed = writers[0];
+    if (!replayed) throw new Error('inventory commit race had no writer');
+    const staleReplay = await lease.commitChunk(replayed).then(
+      () => 'committed',
+      (error: unknown) =>
+        (error as Error).message.includes('no longer at the expected revision')
+          ? 'conflict'
+          : 'other',
+    );
+    const counts = await db
+      .prepare(
+        `SELECT kind, COUNT(*) AS count FROM anchorage_fleet_inventory_rows
+          WHERE account_id = ? AND generation = ? GROUP BY kind ORDER BY kind`,
+      )
+      .bind(INVENTORY_ACCOUNT, started.progress.generation)
+      .all<{ kind: string; count: number }>();
+    return {
+      committed: outcomes.filter((entry) => entry.outcome === 'committed')
+        .length,
+      converged: outcomes.filter((entry) => entry.outcome === 'converged')
+        .length,
+      conflicts: outcomes.filter((entry) => entry.outcome === 'conflict')
+        .length,
+      corrupt: outcomes.filter((entry) => entry.outcome === 'corrupt').length,
+      winnerIsWriter: typeof winner?.index === 'number',
+      lostResponseReplay,
+      revision: advanced.progress.revision,
+      staleReplay,
+      rowCounts: counts.results.map((row) => ({
+        kind: row.kind,
+        count: Number(row.count),
+      })),
+    };
+  });
+}
+
+async function inventoryFinalizeConvergence(db: D1Database): Promise<unknown> {
+  await readyInventoryStore(db);
+  const database = hideResultsDatabase(new D1FleetStateDatabase(db));
+  const store = inventoryStore(database);
+  const operationId = inventoryOperationId(2);
+  const rows = inventoryRows('finalize');
+  const facts = inventoryFacts();
+  const refs = await store.withAccountInventoryLease(async (lease) => {
+    const started = await lease.startRun({
+      operationId,
+      options: INVENTORY_OPTIONS,
+      optionsDigest: INVENTORY_DIGEST,
+    });
+    const record = await lease.commitChunk({
+      operationId,
+      expectedRevision: started.progress.revision,
+      runRecord: inventoryCommitted(started, rows, facts),
+      rows,
+      facts,
+    });
+    const input = {
+      operationId,
+      expectedRevision: record.progress.revision,
+      manifest: record.progress.stagedCounts,
+      factCount: record.progress.factCount,
+    };
+    database.loseNextBatch();
+    const first = await lease.finalizeRun(input);
+    const replayed = await lease.finalizeRun(input);
+    return { first, replayed };
+  });
+  const head = await db
+    .prepare(
+      `SELECT active_operation_id, latest_finalized_generation
+         FROM anchorage_fleet_inventory_heads WHERE account_id = ?`,
+    )
+    .bind(INVENTORY_ACCOUNT)
+    .first<{
+      active_operation_id: string | null;
+      latest_finalized_generation: number | null;
+    }>();
+  return {
+    first: refs.first,
+    replayed: refs.replayed,
+    identical: JSON.stringify(refs.first) === JSON.stringify(refs.replayed),
+    head: {
+      activeOperationId: head?.active_operation_id ?? null,
+      latestFinalizedGeneration: head?.latest_finalized_generation ?? null,
+    },
+  };
+}
+
+async function inventoryGenerationReadback(db: D1Database): Promise<unknown> {
+  const store = await readyInventoryStore(db);
+  const generation = await seedInventoryGeneration(store, 3);
+  const read = await store.readFinalizedGeneration(generation);
+  const latest = await store.latestFinalizedGeneration();
+  return {
+    ref: read.ref,
+    latestMatches: JSON.stringify(latest) === JSON.stringify(read.ref),
+    rowOrdinals: read.rows.map((row) => `${row.kind}:${row.ordinal}`),
+    factOrdinals: read.facts.map(
+      (fact) =>
+        `${fact.deploymentOrdinal}:${fact.factKind}:${fact.factOrdinal}`,
+    ),
+  };
+}
+
+async function inventoryCorruptUnreadable(db: D1Database): Promise<unknown> {
+  const store = await readyInventoryStore(db);
+  const generation = await seedInventoryGeneration(store, 4);
+  await db
+    .prepare(
+      `DELETE FROM anchorage_fleet_inventory_rows
+        WHERE account_id = ? AND generation = ? AND kind = 'finding'`,
+    )
+    .bind(INVENTORY_ACCOUNT, generation)
+    .run();
+  const readError = await store.readFinalizedGeneration(generation).then(
+    () => null,
+    (error: unknown) => errorShape(error),
+  );
+  const operationId = inventoryOperationId(5);
+  const rows = inventoryRows('mismatch');
+  const facts = inventoryFacts();
+  const finalizeError = await store
+    .withAccountInventoryLease(async (lease) => {
+      const started = await lease.startRun({
+        operationId,
+        options: INVENTORY_OPTIONS,
+        optionsDigest: INVENTORY_DIGEST,
+      });
+      // The persisted record claims more findings than the rows it staged, so
+      // finalize's in-SQL count guard is what refuses.
+      const overstated = inventoryCommitted(started, rows, facts);
+      const record = await lease.commitChunk({
+        operationId,
+        expectedRevision: started.progress.revision,
+        runRecord: {
+          ...overstated,
+          progress: {
+            ...overstated.progress,
+            stagedCounts: { ...overstated.progress.stagedCounts, finding: 9 },
+          },
+        },
+        rows,
+        facts,
+      });
+      return lease.finalizeRun({
+        operationId,
+        expectedRevision: record.progress.revision,
+        manifest: record.progress.stagedCounts,
+        factCount: record.progress.factCount,
+      });
+    })
+    .then(
+      () => null,
+      (error: unknown) => errorShape(error),
+    );
+  const run = await store.readRunByOperation(operationId);
+  return {
+    readError,
+    finalizeError,
+    stateAfterFinalize: run?.state ?? null,
+    latestGeneration:
+      (await store.latestFinalizedGeneration())?.generation ?? null,
+  };
+}
+
+async function inventoryPruneOrder(db: D1Database): Promise<unknown> {
+  const store = await readyInventoryStore(db);
+  for (const index of [10, 11, 12, 13]) {
+    await seedInventoryGeneration(store, index);
+  }
+  await store.pinGeneration({ generation: 2, pinnedBy: 'audit' });
+  const deleted = [
+    await store.pruneInventoryGenerations({ limit: 1 }),
+    await store.pruneInventoryGenerations({ limit: 1 }),
+    await store.pruneInventoryGenerations({ limit: 10 }),
+  ];
+  const pinnedSurvives = (await store.readFinalizedGeneration(2)).ref
+    .generation;
+  await store.releasePin({ generation: 2, pinnedBy: 'audit' });
+  deleted.push(await store.pruneInventoryGenerations({ limit: 10 }));
+  const surviving = await db
+    .prepare(
+      `SELECT generation FROM anchorage_fleet_inventory_runs
+        WHERE account_id = ? ORDER BY generation`,
+    )
+    .bind(INVENTORY_ACCOUNT)
+    .all<{ generation: number }>();
+  const rows = await db
+    .prepare(
+      `SELECT DISTINCT generation FROM anchorage_fleet_inventory_rows
+        WHERE account_id = ? ORDER BY generation`,
+    )
+    .bind(INVENTORY_ACCOUNT)
+    .all<{ generation: number }>();
+  return {
+    deleted: deleted.map((entry) => entry.deleted),
+    pinnedSurvives,
+    surviving: surviving.results.map((row) => Number(row.generation)),
+    survivingRowGenerations: rows.results.map((row) => Number(row.generation)),
+  };
+}
+
+async function inventoryLeaseLifecycle(db: D1Database): Promise<unknown> {
+  await readyInventoryStore(db);
+  await db
+    .prepare(
+      `INSERT INTO ${INVENTORY_LEASE_TABLE} (account_id, owner_token, expires_at)
+       VALUES (?, 'abandoned-token', 1)`,
+    )
+    .bind(INVENTORY_ACCOUNT)
+    .run();
+  const takeover = await inventoryStore(new D1FleetStateDatabase(db))
+    .withAccountInventoryLease(async (lease) => {
+      await lease.assertOwned();
+      return 'acquired';
+    })
+    .catch((error: unknown) => errorShape(error));
+  const clock = controlledLeaseClock(db, INVENTORY_LEASE_TABLE);
+  const store = new D1FleetInventoryRunStore(clock.database, {
+    accountId: INVENTORY_ACCOUNT,
+    leaseTtlMs: 2_500,
+    leaseRenewalIntervalMs: 1,
+  });
+  let contenderRejected = false;
+  await store.withAccountInventoryLease(async () => {
+    const original = await clock.database.query(
+      `SELECT expires_at FROM ${INVENTORY_LEASE_TABLE} WHERE account_id = ?`,
+      [INVENTORY_ACCOUNT],
+    );
+    const originalExpiresAt = Number(original[0]?.expires_at);
+    if (!Number.isFinite(originalExpiresAt)) {
+      throw new Error('inventory lease did not expose its original expiry');
+    }
+    clock.advance(2_000);
+    clock.allowHeartbeat();
+    await clock.heartbeat;
+    clock.advance(600);
+    try {
+      await new D1FleetInventoryRunStore(clock.database, {
+        accountId: INVENTORY_ACCOUNT,
+        leaseTtlMs: 2_500,
+        leaseRenewalIntervalMs: 1,
+      }).withAccountInventoryLease(async () => {});
+    } catch {
+      contenderRejected = true;
+    }
+    if (clock.now() <= originalExpiresAt) {
+      throw new Error('controlled D1 time did not pass the original expiry');
+    }
+  });
+  const remaining = await db
+    .prepare(`SELECT COUNT(*) AS count FROM ${INVENTORY_LEASE_TABLE}`)
+    .first<{ count: number }>();
+  return {
+    takeover,
+    heartbeatObserved: true,
+    contenderRejected,
+    leasesAfterRelease: Number(remaining?.count),
+  };
+}
+
+async function inventoryColdConcurrentSchema(db: D1Database): Promise<unknown> {
+  const stores = Array.from({ length: 16 }, () =>
+    inventoryStore(new D1FleetStateDatabase(db)),
+  );
+  const latest = await Promise.all(
+    stores.map((store) => store.latestFinalizedGeneration()),
+  );
+  const columns: Record<string, string[]> = {};
+  for (const table of INVENTORY_TABLES) {
+    const rows = await db
+      .prepare(`PRAGMA table_info(${table})`)
+      .all<{ name: string; type: string }>();
+    columns[table] = rows.results.map((row) => `${row.name}:${row.type}`);
+  }
+  const tables = await db
+    .prepare(
+      `SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name LIKE 'anchorage_fleet_inventory_%'
+        ORDER BY name`,
+    )
+    .all<{ name: string }>();
+  const started = await stores[0]?.withAccountInventoryLease((lease) =>
+    lease.startRun({
+      operationId: inventoryOperationId(20),
+      options: INVENTORY_OPTIONS,
+      optionsDigest: INVENTORY_DIGEST,
+    }),
+  );
+  return {
+    latest: latest.filter((entry) => entry === undefined).length,
+    columns,
+    tables: tables.results.map((row) => row.name),
+    generation: started?.progress.generation ?? null,
+  };
+}
+
+const OPERATION_TABLES = [
+  'anchorage_fleet_operation_heads',
+  'anchorage_fleet_operation_leases',
+  'anchorage_fleet_operation_rows',
+  'anchorage_fleet_operations',
+];
+const OPERATION_LEASE_TABLE = 'anchorage_fleet_operation_leases';
+const OPERATION_ACCOUNT = 'account-operation';
+
+function operationId(index: number): string {
+  return `123e4567-e89b-42d3-a456-42661417${String(4300 + index)}`;
+}
+
+function operationRun(
+  kind: FleetOperationKind,
+  id: string,
+  revision = 0,
+  state: 'running' | 'finalized' | 'failed' = 'running',
+): FleetOperationRunRecord {
+  return {
+    version: 1,
+    operationId: id,
+    kind,
+    state,
+    progress:
+      kind === 'audit'
+        ? ({
+            kind,
+            revision,
+            stage: { step: 'provider-findings', rowOrdinal: 0 },
+            generation: 1,
+            auditTimeMs: 1_700_000_000_000,
+            staleAfterMs: 60_000,
+            recordCount: 1,
+            findingCount: 0,
+            factCount: 0,
+            ...(state === 'failed'
+              ? { failure: { reason: 'operator-abandoned' as const } }
+              : {}),
+          } as FleetAuditProgress)
+        : ({
+            kind,
+            revision,
+            itemCount: 0,
+            activeItemOrdinal: 0,
+            completedItemCount: 0,
+            ...(state === 'failed'
+              ? { failure: { reason: 'operator-abandoned' as const } }
+              : {}),
+          } as FleetMigrationProgress),
+    updatedAt: '2026-09-01T00:00:00.000Z',
+  };
+}
+
+function operationAdvanced(
+  record: FleetOperationRunRecord,
+  state: 'running' | 'finalized' | 'failed' = 'running',
+): FleetOperationRunRecord {
+  return {
+    ...record,
+    state,
+    progress: {
+      ...record.progress,
+      revision: record.progress.revision + 1,
+      ...(state === 'failed'
+        ? { failure: { reason: 'operator-abandoned' as const } }
+        : {}),
+    },
+  };
+}
+
+function operationFinding(ordinal: number): FleetOperationStagedRow {
+  return {
+    rowKind: 'finding',
+    ordinal,
+    payload: {
+      tenantTag: 'tenant',
+      environment: 'production',
+      kind: 'audit-error',
+      detail: `safe finding ${ordinal}`,
+    },
+  };
+}
+
+function operationFact(ordinal: number): FleetOperationStagedRow {
+  return {
+    rowKind: 'fact',
+    ordinal,
+    payload: { factKind: 'duplicate-namespace', key: `namespace-${ordinal}` },
+  };
+}
+
+function operationItem(
+  status: 'pending' | 'active',
+  ordinal: number,
+): FleetOperationStagedRow {
+  return {
+    rowKind: 'item',
+    ordinal,
+    payload: {
+      ordinal,
+      tenantTag: 'tenant',
+      environment: 'production',
+      entryRecordDigest: 'c'.repeat(64),
+      ...(status === 'pending'
+        ? {}
+        : {
+            targetSpecDigest: 'd'.repeat(64),
+            plan: [{ step: 'promote' }],
+            planCursor: 0,
+          }),
+      status,
+    },
+  };
+}
+
+function operationStore(
+  database: FleetStateDatabase,
+  accountId = OPERATION_ACCOUNT,
+): D1FleetOperationStore {
+  return new D1FleetOperationStore(database, { accountId });
+}
+
+async function readyOperationStore(
+  db: D1Database,
+): Promise<D1FleetOperationStore> {
+  const target = operationStore(new D1FleetStateDatabase(db));
+  await target.readOperationById(operationId(0));
+  for (const table of OPERATION_TABLES) {
+    await db.prepare(`DELETE FROM ${table}`).run();
+  }
+  return target;
+}
+
+function operationStart(
+  lease: Parameters<
+    Parameters<D1FleetOperationStore['withAccountOperationLease']>[1]
+  >[0],
+  kind: FleetOperationKind,
+  id: string,
+) {
+  return lease.startOperation({
+    operationId: id,
+    kind,
+    runRecord: operationRun(kind, id),
+    intakeDigest: 'a'.repeat(64),
+  });
+}
+
+async function operationSnapshot(db: D1Database, id: string) {
+  const run = await db
+    .prepare(
+      `SELECT op_record, json_extract(op_record, '$.progress.revision') AS revision
+        FROM anchorage_fleet_operations
+        WHERE account_id = ? AND operation_id = ?`,
+    )
+    .bind(OPERATION_ACCOUNT, id)
+    .first<{ op_record: string; revision: number }>();
+  const rows = await db
+    .prepare(
+      `SELECT row_kind, ordinal, payload FROM anchorage_fleet_operation_rows
+        WHERE account_id = ? AND operation_id = ? ORDER BY row_kind, ordinal`,
+    )
+    .bind(OPERATION_ACCOUNT, id)
+    .all<{ row_kind: string; ordinal: number; payload: string }>();
+  return {
+    revision: run?.revision ?? null,
+    record: run?.op_record ?? null,
+    rows: rows.results,
+  };
+}
+
+async function operationStartAtomicity(db: D1Database): Promise<unknown> {
+  await readyOperationStore(db);
+  const id = operationId(0);
+  const stores = Array.from({ length: 16 }, () =>
+    operationStore(new D1FleetStateDatabase(db)),
+  );
+  const attempts = await Promise.allSettled(
+    stores.map((target) =>
+      target.withAccountOperationLease('audit', (lease) =>
+        operationStart(lease, 'audit', id),
+      ),
+    ),
+  );
+  const head = await db
+    .prepare(
+      `SELECT active_operation_id FROM anchorage_fleet_operation_heads
+        WHERE account_id = ? AND operation_kind = 'audit'`,
+    )
+    .bind(OPERATION_ACCOUNT)
+    .first<{ active_operation_id: string | null }>();
+  const count = await db
+    .prepare(
+      `SELECT COUNT(*) AS count FROM anchorage_fleet_operations
+        WHERE account_id = ?`,
+    )
+    .bind(OPERATION_ACCOUNT)
+    .first<{ count: number }>();
+  return {
+    started: attempts.filter((attempt) => attempt.status === 'fulfilled')
+      .length,
+    rejected: attempts.filter((attempt) => attempt.status === 'rejected')
+      .length,
+    activeOperationId: head?.active_operation_id ?? null,
+    operations: Number(count?.count),
+  };
+}
+
+async function operationCommitConcurrency(db: D1Database): Promise<unknown> {
+  const target = await readyOperationStore(db);
+  const id = operationId(1);
+  return target.withAccountOperationLease('audit', async (lease) => {
+    const created = await operationStart(lease, 'audit', id);
+    const intended = operationAdvanced(created.record);
+    const inputs = Array.from({ length: 16 }, (_unused, ordinal) => ({
+      operationId: id,
+      expectedRevision: 0,
+      runRecord: intended,
+      rows: [operationFinding(ordinal)],
+    }));
+    const attempts = await Promise.allSettled(
+      inputs.map((input) => lease.commitProgress(input)),
+    );
+    const winner = attempts.findIndex(
+      (attempt) => attempt.status === 'fulfilled',
+    );
+    if (winner < 0) throw new Error('operation commit race had no winner');
+    const before = (await lease.readOperation(id))?.progress.revision;
+    const replay = await lease.commitProgress(
+      inputs[winner] as (typeof inputs)[number],
+    );
+    const after = (await lease.readOperation(id))?.progress.revision;
+    const rows = await db
+      .prepare(
+        `SELECT ordinal FROM anchorage_fleet_operation_rows
+          WHERE account_id = ? AND operation_id = ? ORDER BY ordinal`,
+      )
+      .bind(OPERATION_ACCOUNT, id)
+      .all<{ ordinal: number }>();
+    return {
+      winners: attempts.filter((attempt) => attempt.status === 'fulfilled')
+        .length,
+      losers: attempts.filter((attempt) => attempt.status === 'rejected')
+        .length,
+      rowOrdinals: rows.results.map((row) => Number(row.ordinal)),
+      replayRevision: replay.progress.revision,
+      noSecondAdvance: before === after,
+    };
+  });
+}
+
+async function operationCommitWatermark(db: D1Database): Promise<unknown> {
+  const target = await readyOperationStore(db);
+  const id = operationId(5);
+  return target.withAccountOperationLease('audit', async (lease) => {
+    const created = await operationStart(lease, 'audit', id);
+    const beforeFindingRefusal = await operationSnapshot(db, id);
+    let findingRefused: unknown = null;
+    try {
+      await lease.commitProgress({
+        operationId: id,
+        expectedRevision: 0,
+        runRecord: operationAdvanced(created.record),
+        rows: [operationFinding(1)],
+        expectedRowWatermarks: { finding: 2 },
+      });
+    } catch (error) {
+      findingRefused = errorShape(error);
+    }
+    const afterFindingRefusal = await operationSnapshot(db, id);
+    await lease.stageRows({
+      operationId: id,
+      expectedRevision: 0,
+      rows: [operationFinding(0), operationFact(1)],
+    });
+    const before = await operationSnapshot(db, id);
+    let refused: unknown = null;
+    try {
+      await lease.commitProgress({
+        operationId: id,
+        expectedRevision: 0,
+        runRecord: operationAdvanced(created.record),
+        rows: [operationFinding(1)],
+        expectedRowWatermarks: { finding: 2, fact: 1 },
+      });
+    } catch (error) {
+      refused = errorShape(error);
+    }
+    const afterRefusal = await operationSnapshot(db, id);
+    await lease.stageRows({
+      operationId: id,
+      expectedRevision: 0,
+      rows: [operationFinding(1), operationFact(0)],
+    });
+    const input = {
+      operationId: id,
+      expectedRevision: 0,
+      runRecord: operationAdvanced(created.record),
+      rows: [operationFinding(2), operationFact(2)],
+      expectedRowWatermarks: { finding: 3, fact: 2 },
+    };
+    const accepted = await lease.commitProgress(input);
+    const afterAcceptance = await operationSnapshot(db, id);
+    const replay = await lease.commitProgress(input);
+    return {
+      beforeFindingRefusal,
+      afterFindingRefusal,
+      findingRefused,
+      before,
+      afterRefusal,
+      refused,
+      accepted,
+      afterAcceptance,
+      replay,
+      afterReplay: await operationSnapshot(db, id),
+    };
+  });
+}
+
+async function operationCommitRowUpdate(db: D1Database): Promise<unknown> {
+  const target = await readyOperationStore(db);
+  const id = operationId(6);
+  return target.withAccountOperationLease('migration', async (lease) => {
+    const created = await operationStart(lease, 'migration', id);
+    await lease.stageRows({
+      operationId: id,
+      expectedRevision: 0,
+      rows: [operationItem('pending', 0), operationItem('pending', 1)],
+    });
+    const before = await operationSnapshot(db, id);
+    const accepted = await lease.commitProgress({
+      operationId: id,
+      expectedRevision: 0,
+      runRecord: operationAdvanced(created.record),
+      updateRows: [operationItem('active', 1)],
+      expectedRowWatermarks: { item: 2 },
+    });
+    const page = await target.readOperationRowsPage({
+      operationId: id,
+      rowKind: 'item',
+      limit: 10,
+    });
+    return {
+      before,
+      afterAcceptance: await operationSnapshot(db, id),
+      acceptedRevision: accepted.progress.revision,
+      items: page.rows,
+    };
+  });
+}
+
+async function operationCommitImmutableConflict(
+  db: D1Database,
+  hideResults: boolean,
+  viaStage: boolean,
+): Promise<unknown> {
+  await readyOperationStore(db);
+  const database = hideResultsDatabase(new D1FleetStateDatabase(db));
+  const target = operationStore(database);
+  const id = operationId(7);
+  return target.withAccountOperationLease('audit', async (lease) => {
+    const created = await operationStart(lease, 'audit', id);
+    const staged = operationFinding(1);
+    await lease.stageRows({
+      operationId: id,
+      expectedRevision: 0,
+      rows: [staged],
+    });
+    const before = await operationSnapshot(db, id);
+    const input = {
+      operationId: id,
+      expectedRevision: 0,
+      runRecord: operationAdvanced(created.record),
+      rows: [operationFinding(0), staged],
+    };
+    let refused: unknown = null;
+    if (hideResults) database.loseNextBatch();
+    try {
+      const conflicting = {
+        ...input,
+        rows: [
+          operationFinding(0),
+          { ...staged, payload: { ...staged.payload, detail: 'different' } },
+        ],
+      };
+      if (viaStage) await lease.stageRows(conflicting);
+      else await lease.commitProgress(conflicting);
+    } catch (error) {
+      refused = errorShape(error);
+    }
+    const afterRefusal = await operationSnapshot(db, id);
+    if (viaStage) await lease.stageRows(input);
+    if (hideResults) database.loseNextBatch();
+    const accepted = await lease.commitProgress(input);
+    const afterAcceptance = await operationSnapshot(db, id);
+    if (hideResults) database.loseNextBatch();
+    const replay = await lease.commitProgress(input);
+    return {
+      before,
+      afterRefusal,
+      refused,
+      accepted,
+      afterAcceptance,
+      replay,
+      afterReplay: await operationSnapshot(db, id),
+    };
+  });
+}
+
+async function operationCommitMissingUpdate(
+  db: D1Database,
+  hideResults: boolean,
+): Promise<unknown> {
+  await readyOperationStore(db);
+  const database = hideResultsDatabase(new D1FleetStateDatabase(db));
+  const target = operationStore(database);
+  const id = operationId(8);
+  return target.withAccountOperationLease('migration', async (lease) => {
+    const created = await operationStart(lease, 'migration', id);
+    await lease.stageRows({
+      operationId: id,
+      expectedRevision: 0,
+      rows: [operationItem('pending', 0)],
+    });
+    const before = await operationSnapshot(db, id);
+    const input = {
+      operationId: id,
+      expectedRevision: 0,
+      runRecord: operationAdvanced(created.record),
+      rows: [operationItem('pending', 2)],
+      updateRows: [operationItem('active', 0), operationItem('active', 1)],
+    };
+    let refused: unknown = null;
+    if (hideResults) database.loseNextBatch();
+    try {
+      await lease.commitProgress(input);
+    } catch (error) {
+      refused = errorShape(error);
+    }
+    const afterRefusal = await operationSnapshot(db, id);
+    await lease.stageRows({
+      operationId: id,
+      expectedRevision: 0,
+      rows: [operationItem('pending', 1)],
+    });
+    if (hideResults) database.loseNextBatch();
+    const accepted = await lease.commitProgress(input);
+    const afterAcceptance = await operationSnapshot(db, id);
+    if (hideResults) database.loseNextBatch();
+    const replay = await lease.commitProgress(input);
+    return {
+      before,
+      afterRefusal,
+      refused,
+      accepted,
+      afterAcceptance,
+      replay,
+      afterReplay: await operationSnapshot(db, id),
+    };
+  });
+}
+
+async function operationFinalizeConvergence(db: D1Database): Promise<unknown> {
+  await readyOperationStore(db);
+  const database = hideResultsDatabase(new D1FleetStateDatabase(db));
+  const target = operationStore(database);
+  const id = operationId(2);
+  return target.withAccountOperationLease('migration', async (lease) => {
+    const created = await operationStart(lease, 'migration', id);
+    const input = {
+      operationId: id,
+      expectedRevision: 0,
+      runRecord: operationAdvanced(created.record, 'finalized'),
+      expectedRowCounts: {},
+    };
+    database.loseNextBatch();
+    const first = await lease.finalizeOperation(input);
+    const replay = await lease.finalizeOperation(input);
+    const head = await db
+      .prepare(
+        `SELECT active_operation_id FROM anchorage_fleet_operation_heads
+          WHERE account_id = ? AND operation_kind = 'migration'`,
+      )
+      .bind(OPERATION_ACCOUNT)
+      .first<{ active_operation_id: string | null }>();
+    return {
+      identical: JSON.stringify(first) === JSON.stringify(replay),
+      revision: replay.progress.revision,
+      terminalAtMs: replay.terminalAtMs,
+      activeOperationId: head?.active_operation_id ?? null,
+    };
+  });
+}
+
+async function operationRowsReadback(db: D1Database): Promise<unknown> {
+  const target = await readyOperationStore(db);
+  const id = operationId(3);
+  await target.withAccountOperationLease('audit', async (lease) => {
+    await operationStart(lease, 'audit', id);
+    await lease.stageRows({
+      operationId: id,
+      expectedRevision: 0,
+      rows: [operationFinding(2), operationFinding(0), operationFinding(1)],
+    });
+  });
+  const first = await target.readOperationRowsPage({
+    operationId: id,
+    rowKind: 'finding',
+    limit: 2,
+  });
+  const second = await target.readOperationRowsPage({
+    operationId: id,
+    rowKind: 'finding',
+    afterOrdinal: 1,
+    limit: 2,
+  });
+  return {
+    first: first.rows.map((row) => row.ordinal),
+    firstDone: first.done,
+    second: second.rows.map((row) => row.ordinal),
+    secondDone: second.done,
+  };
+}
+
+async function operationCorruptUnreadable(db: D1Database): Promise<unknown> {
+  const target = await readyOperationStore(db);
+  const id = operationId(4);
+  await target.withAccountOperationLease('audit', async (lease) => {
+    await operationStart(lease, 'audit', id);
+    await lease.stageRows({
+      operationId: id,
+      expectedRevision: 0,
+      rows: [operationFinding(0)],
+    });
+  });
+  await db
+    .prepare(
+      `UPDATE anchorage_fleet_operation_rows SET payload = '{'
+        WHERE account_id = ? AND operation_id = ?`,
+    )
+    .bind(OPERATION_ACCOUNT, id)
+    .run();
+  return target
+    .readOperationRowsPage({ operationId: id, rowKind: 'finding', limit: 10 })
+    .then(
+      () => null,
+      (error: unknown) => errorShape(error),
+    );
+}
+
+async function seedOperationTerminal(
+  target: D1FleetOperationStore,
+  id: string,
+  state: 'finalized' | 'failed',
+): Promise<void> {
+  await target.withAccountOperationLease('migration', async (lease) => {
+    const created = await operationStart(lease, 'migration', id);
+    const terminal = operationAdvanced(created.record, state);
+    if (state === 'finalized') {
+      await lease.finalizeOperation({
+        operationId: id,
+        expectedRevision: 0,
+        runRecord: terminal,
+        expectedRowCounts: {},
+      });
+    } else {
+      await lease.failOperation({
+        operationId: id,
+        expectedRevision: 0,
+        runRecord: terminal,
+      });
+    }
+  });
+}
+
+async function operationPruneOrder(db: D1Database): Promise<unknown> {
+  const target = await readyOperationStore(db);
+  for (const [index, id] of [
+    operationId(10),
+    operationId(11),
+    operationId(12),
+  ].entries()) {
+    await seedOperationTerminal(
+      target,
+      id,
+      index === 2 ? 'finalized' : 'failed',
+    );
+    await db
+      .prepare(
+        `UPDATE anchorage_fleet_operations SET terminal_at_ms = ?
+          WHERE account_id = ? AND operation_id = ?`,
+      )
+      .bind(index + 1, OPERATION_ACCOUNT, id)
+      .run();
+  }
+  await target.withAccountOperationLease('migration', (lease) =>
+    operationStart(lease, 'migration', operationId(13)),
+  );
+  const pruned = await target.pruneFleetOperations({
+    kind: 'migration',
+    limit: 1,
+  });
+  const remaining = await db
+    .prepare(
+      `SELECT operation_id FROM anchorage_fleet_operations
+        WHERE account_id = ? ORDER BY operation_id`,
+    )
+    .bind(OPERATION_ACCOUNT)
+    .all<{ operation_id: string }>();
+  return {
+    pruned,
+    remaining: remaining.results.map((row) => row.operation_id),
+  };
+}
+
+async function operationLeaseLifecycle(db: D1Database): Promise<unknown> {
+  await readyOperationStore(db);
+  await db
+    .prepare(
+      `INSERT INTO ${OPERATION_LEASE_TABLE} (
+        account_id, operation_kind, owner_token, expires_at
+      ) VALUES (?, 'audit', 'abandoned-token', 1)`,
+    )
+    .bind(OPERATION_ACCOUNT)
+    .run();
+  const takeover = await operationStore(
+    new D1FleetStateDatabase(db),
+  ).withAccountOperationLease('audit', async (auditLease) => {
+    await auditLease.assertOwned();
+    return operationStore(
+      new D1FleetStateDatabase(db),
+    ).withAccountOperationLease('migration', async (migrationLease) => {
+      await migrationLease.assertOwned();
+      return 'independent';
+    });
+  });
+  const clock = controlledLeaseClock(db, OPERATION_LEASE_TABLE);
+  const target = new D1FleetOperationStore(clock.database, {
+    accountId: OPERATION_ACCOUNT,
+    leaseTtlMs: 2_500,
+    leaseRenewalIntervalMs: 1,
+  });
+  let contenderRejected = false;
+  await target.withAccountOperationLease('audit', async () => {
+    const original = await clock.database.query(
+      `SELECT expires_at FROM ${OPERATION_LEASE_TABLE}
+        WHERE account_id = ? AND operation_kind = 'audit'`,
+      [OPERATION_ACCOUNT],
+    );
+    const originalExpiresAt = Number(original[0]?.expires_at);
+    if (!Number.isFinite(originalExpiresAt)) {
+      throw new Error('operation lease did not expose its original expiry');
+    }
+    clock.advance(2_000);
+    clock.allowHeartbeat();
+    await clock.heartbeat;
+    clock.advance(600);
+    try {
+      await new D1FleetOperationStore(clock.database, {
+        accountId: OPERATION_ACCOUNT,
+        leaseTtlMs: 2_500,
+        leaseRenewalIntervalMs: 1,
+      }).withAccountOperationLease('audit', async () => {});
+    } catch {
+      contenderRejected = true;
+    }
+    if (clock.now() <= originalExpiresAt) {
+      throw new Error('controlled D1 time did not pass the original expiry');
+    }
+  });
+  const remaining = await db
+    .prepare(`SELECT COUNT(*) AS count FROM ${OPERATION_LEASE_TABLE}`)
+    .first<{ count: number }>();
+  return {
+    takeover,
+    heartbeatObserved: true,
+    contenderRejected,
+    leasesAfterRelease: Number(remaining?.count),
+  };
+}
+
+async function operationColdConcurrentSchema(db: D1Database): Promise<unknown> {
+  const stores = Array.from({ length: 16 }, () =>
+    operationStore(new D1FleetStateDatabase(db)),
+  );
+  const absent = await Promise.all(
+    stores.map((target) => target.readOperationById(operationId(20))),
+  );
+  const columns: Record<string, string[]> = {};
+  for (const table of OPERATION_TABLES) {
+    const rows = await db
+      .prepare(`PRAGMA table_info(${table})`)
+      .all<{ name: string; type: string }>();
+    columns[table] = rows.results.map((row) => `${row.name}:${row.type}`);
+  }
+  const tables = await db
+    .prepare(
+      `SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name LIKE 'anchorage_fleet_operation%'
+        ORDER BY name`,
+    )
+    .all<{ name: string }>();
+  return {
+    absent: absent.filter((entry) => entry === undefined).length,
+    columns,
+    tables: tables.results.map((row) => row.name),
+  };
+}
+
+async function operationTwoAccountIsolation(db: D1Database): Promise<unknown> {
+  const first = operationStore(
+    new D1FleetStateDatabase(db),
+    'operation-account-one',
+  );
+  const second = operationStore(
+    new D1FleetStateDatabase(db),
+    'operation-account-two',
+  );
+  const id = operationId(30);
+  await Promise.all([
+    first.withAccountOperationLease('audit', (lease) =>
+      operationStart(lease, 'audit', id),
+    ),
+    second.withAccountOperationLease('audit', (lease) =>
+      operationStart(lease, 'audit', id),
+    ),
+  ]);
+  const rows = await db
+    .prepare(
+      `SELECT account_id, operation_id FROM anchorage_fleet_operations
+        WHERE operation_id = ? ORDER BY account_id`,
+    )
+    .bind(id)
+    .all<{ account_id: string; operation_id: string }>();
+  return rows.results;
 }
 
 async function cloudflareRateCoordination(db: D1Database): Promise<unknown> {
@@ -1030,12 +4929,15 @@ async function cloudflareRateCoordination(db: D1Database): Promise<unknown> {
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<WorkerResponse> {
     const url = new URL(request.url);
     if (request.method !== 'POST' || url.pathname !== '/fleet-state') {
       return new Response('not found', { status: 404 });
     }
-    const body = (await request.json()) as { action?: unknown };
+    const body = (await request.json()) as {
+      action?: unknown;
+      input?: unknown;
+    };
     try {
       switch (body.action) {
         case 'concurrent-acquisition':
@@ -1062,10 +4964,161 @@ export default {
           return Response.json(await finalLeaseAssertionRollback(env.DB));
         case 'backend-switch-column-upgrade':
           return Response.json(await backendSwitchColumnUpgrade(env.DB));
+        case 'bounded-backend-switch-write-step':
+          return Response.json(
+            await backendSwitchLostWriteStep(
+              env.DB,
+              body.input as {
+                stage: BackendSwitchLostWriteStage;
+                loseWrite?: boolean;
+              },
+            ),
+          );
+        case 'decommission-intent-column-upgrade':
+          return Response.json(await decommissionIntentColumnUpgrade(env.DB));
+        case 'decommission-intent-lost-response':
+          return Response.json(await decommissionIntentLostResponse(env.DB));
+        case 'bounded-decommission-step':
+          return Response.json(
+            await boundedDecommissionStep(
+              env.DB,
+              body.input as BoundedDecommissionStepInput,
+            ),
+          );
+        case 'bounded-decommission-reset':
+          return Response.json(
+            await resetBoundedDecommission(
+              env.DB,
+              (body.input as { tenantTag: 'advance' | 'advancelost' })
+                .tenantTag,
+            ),
+          );
         case 'lifecycle-errors':
           return Response.json(await lifecycleErrors(env.DB));
         case 'cloudflare-rate-coordination':
           return Response.json(await cloudflareRateCoordination(env.DB));
+        case 'cleanup-terminal-receipt':
+          return Response.json(await cleanupTerminalReceipt(env.DB));
+        case 'cleanup-receipt-prune':
+          return Response.json(await cleanupReceiptPrune(env.DB));
+        case 'cleanup-claims-release':
+          return Response.json(await cleanupClaimsRelease(env.DB));
+        case 'cold-concurrent-schema-initialization':
+          return Response.json(
+            await coldConcurrentSchemaInitialization(env.DB),
+          );
+        case 'inventory-maximum-chunk':
+          return Response.json(await inventoryMaximumChunk(env.DB));
+        case 'inventory-start-atomicity':
+          return Response.json(await inventoryStartAtomicity(env.DB));
+        case 'inventory-cross-account-start':
+          return Response.json(
+            await inventoryCrossAccountStart(
+              env.DB,
+              (body.input as { concurrent: boolean }).concurrent,
+            ),
+          );
+        case 'inventory-partial-prune':
+          return Response.json(
+            await inventoryPartialPrune(
+              env.DB,
+              (body.input as { mode: 'rows' | 'both' | 'empty' }).mode,
+            ),
+          );
+        case 'inventory-dense-finalization':
+          return Response.json(await inventoryDenseFinalization(env.DB));
+        case 'inventory-pin-prune-race':
+          return Response.json(
+            await inventoryPinPruneRace(
+              env.DB,
+              (body.input as { winner: 'pin' | 'prune' }).winner,
+            ),
+          );
+        case 'inventory-prune-active-race':
+          return Response.json(await inventoryPruneActiveRace(env.DB));
+        case 'inventory-failure-recovery':
+          return Response.json(await inventoryFailureRecovery(env.DB));
+        case 'inventory-finalized-continuation-recovery':
+          return Response.json(
+            await inventoryFinalizedContinuationRecovery(
+              env.DB,
+              (body.input as { mode: 'normal' | 'stale' | 'fallback' }).mode,
+            ),
+          );
+        case 'inventory-commit-concurrency':
+          return Response.json(await inventoryCommitConcurrency(env.DB));
+        case 'inventory-commit-refusal':
+          return Response.json(
+            await inventoryCommitRefusal(
+              env.DB,
+              body.input as InventoryCommitRefusalInput,
+            ),
+          );
+        case 'inventory-commit-replay':
+          return Response.json(
+            await inventoryCommitReplay(
+              env.DB,
+              (
+                body.input as {
+                  change:
+                    | 'failed'
+                    | 'stage'
+                    | 'provider-requests'
+                    | 'updated-at';
+                }
+              ).change,
+              (body.input as { hideResults: boolean }).hideResults,
+            ),
+          );
+        case 'inventory-finalize-convergence':
+          return Response.json(await inventoryFinalizeConvergence(env.DB));
+        case 'inventory-generation-readback':
+          return Response.json(await inventoryGenerationReadback(env.DB));
+        case 'inventory-corrupt-unreadable':
+          return Response.json(await inventoryCorruptUnreadable(env.DB));
+        case 'inventory-prune-order':
+          return Response.json(await inventoryPruneOrder(env.DB));
+        case 'inventory-lease-lifecycle':
+          return Response.json(await inventoryLeaseLifecycle(env.DB));
+        case 'inventory-cold-concurrent-schema':
+          return Response.json(await inventoryColdConcurrentSchema(env.DB));
+        case 'operation-start-atomicity':
+          return Response.json(await operationStartAtomicity(env.DB));
+        case 'operation-commit-concurrency':
+          return Response.json(await operationCommitConcurrency(env.DB));
+        case 'operation-commit-watermark':
+          return Response.json(await operationCommitWatermark(env.DB));
+        case 'operation-commit-row-update':
+          return Response.json(await operationCommitRowUpdate(env.DB));
+        case 'operation-commit-immutable-conflict':
+          return Response.json(
+            await operationCommitImmutableConflict(
+              env.DB,
+              (body.input as { hideResults: boolean }).hideResults,
+              (body.input as { viaStage: boolean }).viaStage,
+            ),
+          );
+        case 'operation-commit-missing-update':
+          return Response.json(
+            await operationCommitMissingUpdate(
+              env.DB,
+              (body.input as { hideResults: boolean }).hideResults,
+            ),
+          );
+        case 'operation-finalize-convergence':
+          return Response.json(await operationFinalizeConvergence(env.DB));
+        case 'operation-rows-readback':
+          return Response.json(await operationRowsReadback(env.DB));
+        case 'operation-corrupt-unreadable':
+          return Response.json(await operationCorruptUnreadable(env.DB));
+        case 'operation-prune-order':
+          return Response.json(await operationPruneOrder(env.DB));
+        case 'operation-lease-lifecycle':
+          return Response.json(await operationLeaseLifecycle(env.DB));
+        case 'operation-cold-concurrent-schema':
+          return Response.json(await operationColdConcurrentSchema(env.DB));
+        case 'operation-two-account-isolation':
+          return Response.json(await operationTwoAccountIsolation(env.DB));
         default:
           return Response.json({ error: 'unknown action' }, { status: 400 });
       }

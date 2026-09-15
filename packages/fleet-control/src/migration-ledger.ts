@@ -10,12 +10,13 @@ export interface MigrationDatabase {
     sql: string,
     bindings?: readonly string[],
   ): Promise<readonly Readonly<Record<string, unknown>>[]>;
+  /** Applies the statements as one transaction; the ledger does not read the result. */
   batch(
     statements: readonly {
       readonly sql: string;
       readonly bindings?: readonly string[];
     }[],
-  ): Promise<void>;
+  ): Promise<unknown>;
 }
 
 function migrationDigest(migration: D1Migration): string {

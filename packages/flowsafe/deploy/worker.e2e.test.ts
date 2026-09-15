@@ -44,6 +44,7 @@ import {
   D1ApprovalStoreFactory,
 } from '../src/approval-api/index.js';
 import {
+  type DurableKeyValueStorage,
   HUB_INSTANCE_NAME,
   PATH_SAFE_ID_PATTERN,
   type RunArtifactPurger,
@@ -51,6 +52,7 @@ import {
 } from '../src/do-runner/index.js';
 import {
   createFlowsafeWorker,
+  type MaintenanceDutyContext,
   staticTokenVerifier,
 } from '../src/host-kit/index.js';
 import {
@@ -78,17 +80,33 @@ const maintenanceWorker = createFlowsafeWorker<Env>({
   },
 });
 
+// The purge duty reads its retention cursor from this context and, with no way
+// to advance it, skips the run-row purge and reports a retention-purge failure
+// while its sibling surfaces continue. The shipped template's
+// FlowsafeMaintenance DO supplies both from its own storage, so a caller that
+// drives the seam directly owns the cursor itself.
+function retentionContext(): MaintenanceDutyContext {
+  const context: MaintenanceDutyContext = {
+    advanceRetentionCursor: async (cursor) => {
+      context.retentionCursor = structuredClone(cursor);
+    },
+  };
+  return context;
+}
+
 async function runMaintenanceDuty(
   duty: 'sweep' | 'purge',
   env: Env,
 ): Promise<void> {
-  await maintenanceWorker.runMaintenanceDuty(duty, env);
+  await maintenanceWorker.runMaintenanceDuty(duty, env, retentionContext());
 }
 
 // In-process DO namespace: idFromName carries the name, get() memoizes a REAL
-// FlowsafeRunner per name with a stub state exposing that identity — the same
-// `{ id: { name } }` shape durable-object.ts documents for node tests, so
-// request identity and deployment identity assertions both execute for real.
+// FlowsafeRunner per name over a stub state carrying that identity and an
+// in-memory DurableKeyValueStorage. Request identity and deployment identity
+// assertions execute against the real guards, and the run-owner recovery
+// journal the start path writes has the storage it requires — a storage-less
+// state fails that journal's prepared phase.
 function fakeRunnerNamespace(getEnv: () => Env): DurableObjectNamespace {
   const instances = new Map<string, FlowsafeRunner>();
   const namespace = {
@@ -97,8 +115,23 @@ function fakeRunnerNamespace(getEnv: () => Env): DurableObjectNamespace {
       fetch: async (input: string, init?: RequestInit) => {
         let runner = instances.get(id.name);
         if (!runner) {
+          const values = new Map<string, unknown>();
+          const storage: DurableKeyValueStorage = {
+            async get<T>(key: string): Promise<T | undefined> {
+              return values.get(key) as T | undefined;
+            },
+            async put<T>(key: string, value: T): Promise<void> {
+              values.set(key, value);
+            },
+            async delete(key: string): Promise<boolean> {
+              return values.delete(key);
+            },
+            async setAlarm(_scheduledTime: number | Date): Promise<void> {},
+            async deleteAlarm(): Promise<void> {},
+          };
           const state = {
             id: { name: id.name },
+            storage,
           } as unknown as DurableObjectState;
           runner = new FlowsafeRunner(state, getEnv());
           instances.set(id.name, runner);
@@ -1102,7 +1135,11 @@ describe('createFlowsafeWorker artifact-paired retention purge (F4)', () => {
     };
 
     // #when — the PURGE duty runs
-    await workerWith(() => artifactStore).runMaintenanceDuty('purge', env);
+    await workerWith(() => artifactStore).runMaintenanceDuty(
+      'purge',
+      env,
+      retentionContext(),
+    );
 
     // #then — the stale run's artifacts were deleted (while its row still
     // existed), then its row was purged; the fresh run is untouched
@@ -1140,8 +1177,8 @@ describe('createFlowsafeWorker artifact-paired retention purge (F4)', () => {
     );
     const worker = workerWith<ArtifactEnv>(artifactStore);
 
-    await worker.runMaintenanceDuty('purge', firstEnv);
-    await worker.runMaintenanceDuty('purge', secondEnv);
+    await worker.runMaintenanceDuty('purge', firstEnv, retentionContext());
+    await worker.runMaintenanceDuty('purge', secondEnv, retentionContext());
 
     expect(artifactStore).toHaveBeenNthCalledWith(1, firstEnv);
     expect(artifactStore).toHaveBeenNthCalledWith(2, secondEnv);
@@ -1179,7 +1216,7 @@ describe('createFlowsafeWorker artifact-paired retention purge (F4)', () => {
     const outcome = await workerWith(
       artifactStore,
       extraPurgeDuty,
-    ).runMaintenanceDuty('purge', env);
+    ).runMaintenanceDuty('purge', env, retentionContext());
 
     expect(outcome).toMatchObject({ ok: false });
     expect(remainingRunIds(sqlite)).toEqual(['acme_stale-done']);
@@ -1202,7 +1239,11 @@ describe('createFlowsafeWorker artifact-paired retention purge (F4)', () => {
     });
 
     // #when
-    await workerWith(undefined).runMaintenanceDuty('purge', env);
+    await workerWith(undefined).runMaintenanceDuty(
+      'purge',
+      env,
+      retentionContext(),
+    );
 
     // #then — byte-identical row-only outcome
     expect(remainingRunIds(sqlite)).toEqual(['acme_fresh-done']);
@@ -1217,7 +1258,11 @@ describe('createFlowsafeWorker artifact-paired retention purge (F4)', () => {
       updatedAt: Date.now() - 40 * DAY_MS,
     });
 
-    await workerWith(() => undefined).runMaintenanceDuty('purge', env);
+    await workerWith(() => undefined).runMaintenanceDuty(
+      'purge',
+      env,
+      retentionContext(),
+    );
 
     expect(remainingRunIds(sqlite)).toEqual([]);
   });

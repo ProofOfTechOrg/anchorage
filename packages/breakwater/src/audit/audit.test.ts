@@ -49,6 +49,73 @@ describe('agentAuditDetail', () => {
 });
 
 describe('AuditLogger', () => {
+  it.each([
+    ['throw', 'throw'],
+    ['throw', 'reject'],
+    ['reject', 'throw'],
+    ['reject', 'reject'],
+  ] as const)('keeps records when the sink %s and observer %s', async (sinkMode, observerMode) => {
+    const sinkFailure = new Error('sink failure');
+    const observerFailure = new Error('observer failure');
+    const observed: Array<{
+      error: unknown;
+      event: AuditEvent;
+      receiver: unknown;
+    }> = [];
+    const audit = new AuditLogger({
+      sink: () => {
+        if (sinkMode === 'throw') throw sinkFailure;
+        return Promise.reject(sinkFailure);
+      },
+      onSinkError: function (this: unknown, error, event) {
+        observed.push({ error, event, receiver: this });
+        if (observerMode === 'throw') throw observerFailure;
+        return Promise.reject(observerFailure);
+      },
+    });
+    let recorded: AuditEvent | undefined;
+    expect(() => {
+      recorded = audit.record({
+        actor: null,
+        action: 'connector.execute',
+        resource: 'local',
+        decision: 'allowed',
+      });
+    }).not.toThrow();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(recorded).toMatchObject({ decision: 'allowed' });
+    expect(audit.events()).toEqual([recorded]);
+    expect(observed).toEqual([
+      { error: sinkFailure, event: recorded, receiver: audit },
+    ]);
+  });
+
+  it('preserves connector taxonomy in both exported and buffered events', () => {
+    const exported: AuditEvent[] = [];
+    const audit = new AuditLogger({
+      sink: (event) => {
+        exported.push(event);
+      },
+    });
+    audit.record({
+      actor: null,
+      action: 'connector.execute',
+      resource: 'example.read',
+      decision: 'denied',
+      decisionCode: 'RATE_LIMIT_EXCEEDED',
+      policyKind: 'rate-limit',
+      retryable: true,
+    });
+    expect(exported).toEqual([
+      expect.objectContaining({
+        decisionCode: 'RATE_LIMIT_EXCEEDED',
+        policyKind: 'rate-limit',
+        retryable: true,
+      }),
+    ]);
+    expect(audit.events()).toEqual(exported);
+  });
+
   it('caps the buffer at maxBuffered, dropping oldest first', () => {
     // #given
     const audit = new AuditLogger({ maxBuffered: 2 });

@@ -8,6 +8,7 @@
 // (grants.ts) derives requestContext grants from approved records at
 // start/resume. Nothing here ever reads capability data from client input.
 
+import type { D1RunExecutionIdentity } from '../do-runner/execution-admission.js';
 import {
   admitsExistingRun,
   ExecutionFencedError,
@@ -15,6 +16,7 @@ import {
   readExecutionFence,
 } from '../do-runner/execution-fence.js';
 import { isPathSafeId } from '../do-runner/path-safe-id.js';
+import { validateTablePrefix } from '../do-runner/table-prefix.js';
 import type {
   ApprovalActor,
   ApprovalAuditSink,
@@ -192,6 +194,7 @@ export interface ApprovalServiceOptions {
    * someone made rather than one they missed. See ExecutionFenceWiring.
    */
   executionFence: ExecutionFenceWiring;
+  workflowTablePrefix?: string;
   /** Injectable clock (tests, deterministic SLA math). */
   now?: () => Date;
 }
@@ -220,6 +223,7 @@ export class ApprovalService {
   ) => Promise<unknown>;
   readonly #allowSelfDecision?: SelfDecisionPolicy;
   readonly #executionFence: ExecutionFenceWiring;
+  readonly #workflowTablePrefix?: string;
   readonly #now: () => Date;
 
   constructor(options: ApprovalServiceOptions) {
@@ -231,6 +235,10 @@ export class ApprovalService {
     this.#resumeRun = options.resumeRun;
     this.#allowSelfDecision = options.allowSelfDecision;
     this.#executionFence = options.executionFence;
+    this.#workflowTablePrefix = validateTablePrefix(
+      options.workflowTablePrefix,
+      'workflowTablePrefix',
+    )?.toLowerCase();
     this.#now = options.now ?? (() => new Date());
   }
 
@@ -467,16 +475,49 @@ export class ApprovalService {
    * definition of what "no fence" does, so the opt-out cannot be a ternary this
    * gate gets subtly wrong.
    */
-  async #assertDecidable(id: string): Promise<void> {
-    const reading = await readExecutionFence(this.#executionFence);
+  async #assertDecidable(
+    id: string,
+  ): Promise<D1RunExecutionIdentity | undefined> {
+    const fence = this.#executionFence;
+    const reading = await readExecutionFence(fence);
     if (reading.state === 'open' || reading.state === 'draining') return;
-    const runId =
-      reading.state === 'proof-only'
-        ? (await this.#store.get(id))?.runId
-        : undefined;
-    if (!admitsExistingRun(reading, runId)) {
-      throw new ExecutionFencedError(reading.state, 'approval decision');
+    if (
+      reading.state === 'proof-only' &&
+      fence !== 'none' &&
+      this.#workflowTablePrefix !== undefined
+    ) {
+      const record = await this.#store.get(id);
+      if (record !== null && record !== undefined) {
+        const { workflowId, runId } = record;
+        const execution = await fence.readCurrentRunExecution({
+          tablePrefix: this.#workflowTablePrefix,
+          workflowId,
+          runId,
+        });
+        if (execution !== undefined && admitsExistingRun(reading, execution))
+          return execution;
+      }
     }
+    throw new ExecutionFencedError(reading.state, 'approval decision');
+  }
+
+  async #assertRetainedDecidable(
+    execution: D1RunExecutionIdentity | undefined,
+  ): Promise<void> {
+    if (execution === undefined) return;
+    const fence = this.#executionFence;
+    if (fence === 'none')
+      throw new ExecutionFencedError('proof-only', 'approval decision');
+    const reading = await fence.read();
+    const current = await fence.readCurrentRunExecution(execution);
+    if (
+      !admitsExistingRun(
+        { state: 'proof-only', proofExecution: execution },
+        current,
+      ) ||
+      !admitsExistingRun(reading, execution)
+    )
+      throw new ExecutionFencedError(reading.state, 'approval decision');
   }
 
   async decide(
@@ -491,7 +532,7 @@ export class ApprovalService {
       `approval:${id}`,
     );
     this.#assertDecisionInput(input);
-    await this.#assertDecidable(id);
+    const admitted = await this.#assertDecidable(id);
     // Role-scoped SoD: an exempt decider (allowSelfDecision: true, or a role
     // named in { roles }) skips the pre-read entirely; everyone else keeps
     // today's read-then-CAS self-request denial.
@@ -591,6 +632,7 @@ export class ApprovalService {
       updatedAt: now,
     };
     if (input.comment !== undefined) patch.comment = input.comment;
+    await this.#assertRetainedDecidable(admitted);
     const updated = await this.#transitionOrExplain(id, 'decide', authorized, {
       from: OPEN_STATUSES,
       patch,
@@ -1244,7 +1286,11 @@ export class ApprovalService {
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  try {
+    return String(error instanceof Error ? error.message : error);
+  } catch {
+    return 'unreadable error';
+  }
 }
 
 // Maps a per-record decide() failure to BatchDecideItem.code — the same

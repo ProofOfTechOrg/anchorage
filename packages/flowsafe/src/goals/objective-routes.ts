@@ -15,26 +15,6 @@
 // through core's OWN writeObjective/readObjective/clearObjective over the SAME
 // (threadId, 'goal') key, so the stored shape can never drift from the reader's.
 //
-// An objective is a STANDING INSTRUCTION injected into every future model
-// turn, so the write path is an ingestion trust boundary. It uses the same
-// resource-first authorization rule as the signal router:
-//
-//   1. resolve and validate the actor              -> 401 / 403
-//   2. verify registry-backed thread ownership     -> 404
-//   3. require RUN_START_ROLES for mutations       -> 403
-//   4. cap the raw body, then parse JSON           -> 413 / 400
-//   5. reject client-supplied memory ids           -> 400
-//   6. allow only objective fields                 -> 400
-//   7. enforce the host maxRuns cap                -> 400
-//   8. audit (goal.objective) + persist
-//
-// Every MUTATION (set/update/clear) is audited on ACCEPT and on EVERY post-auth
-// denial (role 403, malformed target 404, size/body/field/cap 400), following
-// the signal-ingestion lesson. A GET is audited only on a post-auth denial; a
-// benign successful read is not a standing-instruction write and is not logged.
-// Pre-auth failures (401 / a resolver throw -> 403) are NOT audited: an
-// unauthenticated flood must never be able to write the log.
-//
 // maxRuns: a requested maxRuns above the host cap is REJECTED (400),
 // not silently clamped. A caller that asked for 200 evaluations and got 50 would
 // see mysterious early-stopping — exactly the "your value was quietly replaced"
@@ -81,6 +61,7 @@ import {
   isExecutionFenceRefusal,
   readExecutionFence,
 } from '../do-runner/index.js';
+import { hostErrorText } from '../host-kit/host-approval-service.js';
 import {
   assertNoClientMemoryIds,
   type BoundThreadTargetValidator,
@@ -168,11 +149,7 @@ export interface ObjectiveRouterOptions {
   store: ObjectiveStore;
   /** Prove mutations target durable bound memory, not an ephemeral run id. */
   validateThreadTarget: BoundThreadTargetValidator;
-  /**
-   * Who may SET/UPDATE/CLEAR an objective. Default RUN_START_ROLES
-   * (operator/admin) — reviewers/viewers cannot author standing instructions.
-   * Reads (GET) are not role-gated beyond ownership.
-   */
+  /** Roles allowed to mutate objectives. Defaults to RUN_START_ROLES. */
   roles?: readonly ApprovalRole[];
   /** Every mutation (and denied read) is audited through this. Absent ⇒ no audit. */
   audit?: ObjectiveAuditSink;
@@ -403,7 +380,7 @@ function buildUpdateRecord(
 export function createObjectiveRouter(
   options: ObjectiveRouterOptions,
 ): ObjectiveRouter {
-  const { executionFence, resolve, store } = options;
+  const { executionFence, resolve, store, audit: auditSink } = options;
   const roles = options.roles ?? RUN_START_ROLES;
   const maxRunsCap = positiveSafeInteger(
     options.maxRunsCap ?? DEFAULT_GOAL_MAX_RUNS,
@@ -432,48 +409,47 @@ export function createObjectiveRouter(
     // route-absent, never a pre-auth decodeURIComponent throw out of the handler.
     const threadId = safeDecodeSegment(segments[baseSegments.length]);
     if (threadId === undefined) return null;
-    const operation = OPERATION_BY_METHOD[request.method];
+    const operation = Object.hasOwn(OPERATION_BY_METHOD, request.method)
+      ? OPERATION_BY_METHOD[request.method]
+      : undefined;
     if (operation === undefined) {
       return json({ error: 'method not allowed' }, 405);
     }
     const isMutation = operation !== 'get';
 
-    // Hoisted above the try so the catch audits the post-auth denials that
-    // surface as thrown RunRouteErrors (the ownership 404, the memory-id 400).
-    // `context` is undefined until resolve succeeds and the closure no-ops while
-    // it is, so a pre-auth throw is never audited; a benign GET is not audited.
     let context: ActorContext | undefined;
     const audit = async (
       outcome: 'accepted' | 'rejected',
       reason?: string,
     ): Promise<void> => {
-      if (!options.audit || !context) return;
+      if (!auditSink || !context) return;
       if (operation === 'get' && outcome === 'accepted') return;
-      await options.audit({
-        type: 'goal.objective',
-        ...(context.deploymentTag !== undefined
-          ? { deploymentTag: context.deploymentTag }
-          : {}),
-        actorId: context.actor.id,
-        threadId,
-        operation,
-        outcome,
-        ...(reason !== undefined ? { reason } : {}),
-        timestamp: new Date().toISOString(),
-      });
-    };
-    const auditCommittedMutation = async (): Promise<void> => {
       try {
-        await audit('accepted');
+        await auditSink.call(options, {
+          type: 'goal.objective',
+          ...(context.deploymentTag !== undefined
+            ? { deploymentTag: context.deploymentTag }
+            : {}),
+          actorId: context.actor.id,
+          threadId,
+          operation,
+          outcome,
+          ...(reason !== undefined ? { reason } : {}),
+          timestamp: new Date().toISOString(),
+        });
       } catch (error) {
-        console.error(
-          JSON.stringify({
-            type: 'goal.objective-audit-error',
-            threadId,
-            operation,
-            reason: error instanceof Error ? error.message : String(error),
-          }),
-        );
+        try {
+          console.error(
+            JSON.stringify({
+              type: 'goal.objective-audit-error',
+              threadId,
+              operation,
+              reason: hostErrorText(error, true),
+            }),
+          );
+        } catch {
+          // Diagnostics cannot change the request's selected outcome.
+        }
       }
     };
 
@@ -491,8 +467,6 @@ export function createObjectiveRouter(
         'thread',
       );
 
-      // 3. Coarse role on mutations: authoring a standing instruction is an
-      // operator/admin act.
       if (isMutation && !roles.includes(context.actor.role)) {
         await audit('rejected', 'forbidden-role');
         return json({ error: 'forbidden' }, 403);
@@ -522,7 +496,7 @@ export function createObjectiveRouter(
       }
       if (operation === 'clear') {
         await clearObjective(store, threadId);
-        await auditCommittedMutation();
+        await audit('accepted');
         return json({ ok: true });
       }
 
@@ -573,7 +547,7 @@ export function createObjectiveRouter(
         }
         await options.validateThreadTarget(context, { threadId });
         await writeObjective(store, threadId, built.value);
-        await auditCommittedMutation();
+        await audit('accepted');
         return json({ objective: built.value });
       }
 
@@ -591,7 +565,7 @@ export function createObjectiveRouter(
       }
       await options.validateThreadTarget(context, { threadId });
       await writeObjective(store, threadId, built.value);
-      await auditCommittedMutation();
+      await audit('accepted');
       return json({ objective: built.value });
     } catch (error) {
       // A fence that could not be READ is not evidence the deployment is open,

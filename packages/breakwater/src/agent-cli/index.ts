@@ -20,6 +20,11 @@ import {
   registerSafeAuditError,
   safeAuditErrorSummary,
 } from '../audit/safe-error.js';
+import {
+  ConnectorEvaluatorError,
+  ConnectorStoreError,
+  captureConnectorDenialMetadata,
+} from '../connector-decision.js';
 import type { Connector, ConnectorPolicies } from '../connector-sdk/index.js';
 import {
   ConnectorPolicyError,
@@ -481,6 +486,9 @@ export function createAgentCliConnector(
       // Write-class: the CLI mutates the workspace it runs in.
       sideEffect: 'write',
       egress: definition.egress,
+      // The child process carries its own transport; the list is checked
+      // against organization policy, never against the child's sockets.
+      egressEnforcement: 'declaration-only',
       requiresApproval: options.requiresApproval ?? true,
       dryRun: true,
       rateLimit: options.rateLimit,
@@ -585,7 +593,21 @@ export function createAgentCliConnector(
           error.connector,
           error.policy,
           'agent CLI connector policy denied execution',
+          captureConnectorDenialMetadata({
+            code: error.code,
+            details: error.details,
+          }),
         );
+      }
+      if (error instanceof ConnectorStoreError) {
+        throw new ConnectorStoreError(
+          error.connector,
+          error.store,
+          error.operation,
+        );
+      }
+      if (error instanceof ConnectorEvaluatorError) {
+        throw new ConnectorEvaluatorError(error.connector, error.policy);
       }
       throw createAgentCliError('connector-failed', connectorId);
     }

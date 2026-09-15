@@ -1,30 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-// Fetch-level egress enforcement — the runtime half of the egress posture.
-// The networkEgress POLICY gates what a manifest DECLARES; this guard gates
-// what the connector actually REACHES: egressFetch() wraps a base fetch so
-// every request — redirect hops included — must resolve to an allowed host
-// before any bytes leave. createConnector() hands each execution a guard
-// bound to the manifest's declared egress (ConnectorRuntime.fetch), closing
-// the actual ⊆ declared ⊆ org-allowed chain.
-//
-// Everything here is structural on purpose: breakwater's build tsconfig is
-// lib-ES2022-only (runtime-agnostic — no DOM, no @types/node, no
-// workers-types), so the web fetch surface is modeled as minimal structural
-// subsets, the same discipline as the D1 store seams. URL and Headers are
-// runtime globals everywhere fetch exists (Workers, Node >= 18, browsers).
-//
-// Redirects are followed MANUALLY with a per-hop allowlist check — the whole
-// point: with the platform's redirect: 'follow', an allowed host could 302
-// to an arbitrary one and the response would come back as if nothing left
-// the allowlist. Divergences from platform 'follow' (accepted): the final
-// response's `redirected` flag stays false (each hop was a 'manual' fetch);
-// a one-shot stream body cannot be re-sent across a 307/308 hop (throws
-// instead of silently truncating — buffer the body or handle the 3xx
-// yourself with redirect: 'manual'); and a browser's opaque redirect
-// response (status 0, all a browser exposes for the internal 'manual' hop) is
-// refused fail-closed rather than returned unfollowed — inert on Workers/Node,
-// which return a real 3xx status the per-hop check can inspect.
+// Structural fetch types keep the ES2022 build independent of DOM declarations.
+// Manual redirects let the guard check Location before the transport follows it.
 
+import {
+  CONNECTOR_DECISIONS,
+  type ConnectorDenialCode,
+  type ConnectorDenialMetadata,
+  captureConnectorDenialMetadata,
+} from '../connector-decision.js';
 import {
   assertEgressHostList,
   domainAllowed,
@@ -107,12 +90,16 @@ export type EgressFetchBase = (...args: never[]) => Promise<unknown>;
 
 /**
  * One denied request. `host` is null when the URL never parsed; `hop` is 0
- * for the initial request, n for the nth redirect. Deliberately never
- * carries the full URL — denials get audited, and query strings/paths can
- * embed secrets that must not reach a log sink.
+ * for the initial request, n for the nth redirect. Paths and query strings
+ * can contain secrets, so diagnostic fields use the hostname.
  */
 export interface EgressDenial {
-  /** Normalized denied hostname, or `null` when the URL was invalid. */
+  /** Stable request refusal code; omitted by legacy manual construction. */
+  readonly code?: Exclude<
+    Extract<ConnectorDenialCode, `EGRESS_${string}`>,
+    'EGRESS_HOST_NOT_ALLOWED_BY_ORG'
+  >;
+  /** Denied hostname, or `null` when the URL was invalid. */
   readonly host: string | null;
   /** Safe explanation that excludes the path and query string. */
   readonly reason: string;
@@ -120,9 +107,39 @@ export interface EgressDenial {
   readonly hop: number;
 }
 
+type AuthoredEgressDenial = EgressDenial & {
+  readonly code: NonNullable<EgressDenial['code']>;
+};
+
+type EgressDecisionMetadata = Extract<
+  ConnectorDenialMetadata,
+  { code: NonNullable<EgressDenial['code']> }
+>;
+
+/** Code-specific metadata for an operational redirect refusal. */
+export type EgressGuardMetadata = Extract<
+  ConnectorDenialMetadata,
+  {
+    code:
+      | 'EGRESS_REDIRECT_UNVERIFIABLE'
+      | 'EGRESS_REDIRECT_LIMIT_EXCEEDED'
+      | 'EGRESS_REDIRECT_BODY_UNREPLAYABLE';
+  }
+>;
+
 /** Error thrown when {@link egressFetch} refuses a request. */
 export class EgressDeniedError extends Error {
-  /** Normalized denied hostname, or `null` when the URL was invalid. */
+  /** Structural discriminator for a request denial. */
+  readonly kind = 'egress-denied';
+  /** Stable refusal code. */
+  readonly code: EgressDecisionMetadata['code'];
+  /** Canonical policy category independent of diagnostic names. */
+  readonly policyKind: 'egress-fetch';
+  /** Whether the unchanged logical operation may be retried. */
+  readonly retryable: false;
+  /** Copied safe decision fields, excluding request contents. */
+  readonly details: EgressDecisionMetadata['details'];
+  /** Denied hostname, or `null` when the URL was invalid. */
   readonly host: string | null;
   /** Zero for the initial request, or the one-based redirect hop number. */
   readonly hop: number;
@@ -131,10 +148,45 @@ export class EgressDeniedError extends Error {
 
   constructor(denial: EgressDenial) {
     super(`egress denied: ${denial.reason}`);
+    const metadata = captureConnectorDenialMetadata({
+      code: denial.code ?? 'EGRESS_DENIED',
+      details: {
+        host: denial.host === null ? null : normalizeDomain(denial.host),
+        hop: denial.hop,
+      },
+    });
     this.name = 'EgressDeniedError';
+    this.code = metadata.code;
+    this.policyKind = CONNECTOR_DECISIONS[this.code].policyKind;
+    this.retryable = CONNECTOR_DECISIONS[this.code].retryable;
+    this.details = metadata.details;
     this.host = denial.host;
     this.hop = denial.hop;
     this.reason = denial.reason;
+  }
+}
+
+/** A redirect refusal that retains the guard's TypeError boundary. */
+export class EgressGuardError extends TypeError {
+  /** Structural discriminator for an operational redirect refusal. */
+  readonly kind = 'egress-guard';
+  /** Stable refusal code. */
+  readonly code: EgressGuardMetadata['code'];
+  /** Canonical policy category independent of diagnostic names. */
+  readonly policyKind: 'egress-fetch';
+  /** Whether the unchanged logical operation may be retried. */
+  readonly retryable: false;
+  /** Copied safe decision fields, excluding request contents. */
+  readonly details: EgressGuardMetadata['details'];
+
+  constructor(message: string, metadata: EgressGuardMetadata) {
+    super(message);
+    const captured = captureConnectorDenialMetadata(metadata);
+    this.name = 'EgressGuardError';
+    this.code = captured.code;
+    this.policyKind = CONNECTOR_DECISIONS[this.code].policyKind;
+    this.retryable = CONNECTOR_DECISIONS[this.code].retryable;
+    this.details = captured.details;
   }
 }
 
@@ -146,9 +198,8 @@ export interface EgressFetchOptions {
    */
   fetch?: EgressFetchBase;
   /**
-   * Map a denial to the error thrown to the caller — the audit seam
-   * (createConnector records the denial and returns a ConnectorPolicyError
-   * here). Default: `new EgressDeniedError(denial)`.
+   * Map a request denial to a caller-owned error.
+   * Default: `new EgressDeniedError(denial)`.
    */
   denied?: (denial: EgressDenial) => Error;
   /** Redirect hops followed before throwing a TypeError (default 20, the
@@ -287,7 +338,7 @@ export function egressFetch(
   // uses.
   const normalizedHosts = allowedHosts.map(normalizeDomain);
   const UrlCtor = requireGlobal<UrlConstructor>('URL');
-  const denied =
+  const denied: (denial: AuthoredEgressDenial) => Error =
     options.denied ?? ((denial: EgressDenial) => new EgressDeniedError(denial));
   // A non-negative integer, symmetric with the allowlist validation above:
   // NaN/negative/fractional would make `hop > maxRedirects` never fire and an
@@ -319,6 +370,7 @@ export function egressFetch(
       url = from ? new UrlCtor(raw, from.href) : new UrlCtor(raw);
     } catch {
       throw denied({
+        code: hop === 0 ? 'EGRESS_URL_INVALID' : 'EGRESS_REDIRECT_URL_INVALID',
         host: null,
         reason:
           hop === 0
@@ -329,6 +381,10 @@ export function egressFetch(
     }
     if (url.protocol !== 'http:' && url.protocol !== 'https:') {
       throw denied({
+        code:
+          hop === 0
+            ? 'EGRESS_SCHEME_NOT_ALLOWED'
+            : 'EGRESS_REDIRECT_SCHEME_NOT_ALLOWED',
         host: url.hostname,
         reason: `scheme '${url.protocol}' is not http(s)`,
         hop,
@@ -336,6 +392,10 @@ export function egressFetch(
     }
     if (!domainAllowed(normalizeDomain(url.hostname), normalizedHosts)) {
       throw denied({
+        code:
+          hop === 0
+            ? 'EGRESS_HOST_NOT_DECLARED'
+            : 'EGRESS_REDIRECT_HOST_DENIED',
         host: url.hostname,
         reason: `host '${url.hostname}' is not in the allowed egress hosts`,
         hop,
@@ -353,6 +413,7 @@ export function egressFetch(
           : undefined;
     if (raw === undefined) {
       throw denied({
+        code: 'EGRESS_INPUT_INVALID',
         host: null,
         reason:
           'input must be a URL string or URL object — pass (url, init), not a Request',
@@ -376,30 +437,28 @@ export function egressFetch(
 
     for (let hop = 1; ; hop++) {
       if (response.status === 0) {
-        // A browser's redirect: 'manual' yields an opaque status-0 response
-        // (Workers/Node return a real 3xx); its Location is unreadable, so the
-        // per-hop check cannot run. Fail closed rather than return an
-        // unfollowed redirect. Covers the initial response and every hop.
-        // Release the discarded response's body first, like the sites below.
         releaseResponse(response);
-        throw new TypeError(
+        throw new EgressGuardError(
           'egressFetch: received an opaque redirect (status 0) whose Location cannot be read — this guard cannot verify the hop, so it fails closed; on a browser use redirect: "manual" and handle the 3xx yourself',
+          {
+            code: 'EGRESS_REDIRECT_UNVERIFIABLE',
+            details: { host: normalizeDomain(url.hostname), hop },
+          },
         );
       }
       if (!REDIRECT_STATUSES.has(response.status)) return response;
       const location = response.headers.get('location');
       if (location === null) return response;
-      // Past here `response` is a redirect this loop consumes: every path below
-      // either follows the hop (reassigning `response`) or throws, so the caller
-      // never sees it again. Capture the one field the follow-up still needs,
-      // then release its body — the hop cap, a denied Location, the one-shot
-      // refusal, and the reassignment would each otherwise leak the discarded
-      // 3xx's connection (the opaque status-0 refusal above is the fifth discard
-      // site, released the same way at the top of the loop before its throw).
       const status = response.status;
       releaseResponse(response);
       if (hop > maxRedirects) {
-        throw new TypeError(`egressFetch: exceeded ${maxRedirects} redirects`);
+        throw new EgressGuardError(
+          `egressFetch: exceeded ${maxRedirects} redirects`,
+          {
+            code: 'EGRESS_REDIRECT_LIMIT_EXCEEDED',
+            details: { host: normalizeDomain(url.hostname), hop },
+          },
+        );
       }
       const nextUrl = checkUrl(location, hop, url);
       headers ??= new (requireGlobal<HeadersConstructor>('Headers'))(
@@ -410,8 +469,12 @@ export function egressFetch(
         body = null;
         for (const name of BODY_HEADER_NAMES) headers.delete(name);
       } else if (body !== null && isOneShotBody(body)) {
-        throw new TypeError(
+        throw new EgressGuardError(
           'egressFetch: cannot follow a redirect that re-sends a one-shot (stream) body — buffer the body or handle the 3xx with redirect: "manual"',
+          {
+            code: 'EGRESS_REDIRECT_BODY_UNREPLAYABLE',
+            details: { host: normalizeDomain(nextUrl.hostname), hop },
+          },
         );
       }
       if (nextUrl.origin !== url.origin) {

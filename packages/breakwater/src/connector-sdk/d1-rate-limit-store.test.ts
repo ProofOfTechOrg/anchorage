@@ -14,7 +14,7 @@ import {
   type RateLimitDatabase,
   type RateLimitStatement,
 } from './d1-rate-limit-store.js';
-import { createConnector } from './index.js';
+import { ConnectorStoreError, createConnector } from './index.js';
 
 // --- node:sqlite -> RateLimitDatabase adapter -------------------------------
 
@@ -196,9 +196,15 @@ describe('D1RateLimitStore (Node SQLite facsimile)', () => {
       );
       vi.setSystemTime(T0 + MINUTE);
 
-      await expect(runConnector(tool)).rejects.toThrow(
-        'injected cleanup failure',
-      );
+      const failure = await runConnector(tool).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(ConnectorStoreError);
+      expect(failure).toMatchObject({
+        code: 'STORE_UNAVAILABLE',
+        store: 'rate-limit',
+        operation: 'increment',
+        retryable: true,
+        cause: expect.objectContaining({ message: 'injected cleanup failure' }),
+      });
       expect(execute).not.toHaveBeenCalled();
       expect(
         sqlite
@@ -212,6 +218,9 @@ describe('D1RateLimitStore (Node SQLite facsimile)', () => {
         {
           decision: 'error',
           reason: 'rate-limit store increment failed',
+          decisionCode: 'STORE_UNAVAILABLE',
+          policyKind: 'store',
+          retryable: true,
           detail: { stage: 'rate-limit-store' },
         },
       ]);

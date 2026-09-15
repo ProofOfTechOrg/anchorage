@@ -1275,3 +1275,51 @@ describe('createScheduleTick and the deployment execution fence', () => {
     expect(store.schedules.get('schedule_a')?.nextFireAt).toBe(NOW - 1000);
   });
 });
+
+describe('FS8 D3 host activation pending schedule status', () => {
+  it('retains a deferred signal without resending or publishing finality while initial admission is pending', async () => {
+    const store = new FakeStore();
+    store.seed(
+      workflowSchedule({
+        id: 'agent_schedule',
+        target: {
+          type: 'agent',
+          agentId: 'a1',
+          prompt: 'go',
+          threadId: 'acme_thread',
+          resourceId: 'acme_resource',
+          signalType: 'reactive',
+          tagName: 'scheduled',
+        },
+      }),
+    );
+    const signalAgent = vi.fn(async (_input: ScheduleTickSignalAgentInput) => {
+      throw new Error('response lost');
+    });
+    const pending = Object.assign(
+      new Error('run start has no durable execution outcome'),
+      { status: 503, reason: { code: 'RUN_START_PENDING' } },
+    );
+    const tick = createScheduleTick({
+      store,
+      start: vi.fn(),
+      signalAgent,
+      status: async () => {
+        throw pending;
+      },
+      now: () => NOW,
+    });
+    await tick();
+    const first = structuredClone(store.triggers[0]);
+    expect(first).toMatchObject({ outcome: 'deferred' });
+    const result = await tick();
+    expect(store.triggers[0]).toMatchObject({
+      id: first?.id,
+      runId: first?.runId,
+      outcome: 'deferred',
+      metadata: { dispatchRef: first?.metadata?.dispatchRef },
+    });
+    expect(signalAgent).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({ deferred: 1, fired: 0, failed: 0 });
+  });
+});

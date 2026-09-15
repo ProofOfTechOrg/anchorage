@@ -24,6 +24,8 @@ export type {
   RunArtifactPurger,
   RunDeadlineCandidate,
   RunDeadlineCursor,
+  RunRetentionCursor,
+  RunRetentionScanPosition,
   SnapshotDatabase,
   SnapshotStatement,
   SweepExpiredRunDeadlinesOptions,
@@ -80,6 +82,31 @@ export {
   type DurableObjectRunOwnershipStore,
 } from './durable-object.js';
 export {
+  assertMutationEpoch,
+  type D1RunExecutionIdentity,
+  type D1StartExecutionIdentity,
+  InvalidExecutionIdentityError,
+  InvalidMutationEpochError,
+  isRunStartPendingError,
+  MUTATION_EPOCH_HEADER,
+  type MutationEpochContext,
+  MutationEpochMismatchError,
+  mutationEpochFromHeader,
+  normalizeD1RunExecutionIdentity,
+  normalizeMutationEpoch,
+  normalizeRunExecutionIdentity,
+  normalizeStartExecutionIdentity,
+  normalizeStartIdentity,
+  type ProofEntryExpectation,
+  type RunAdmissionConflictClassification,
+  RunAdmissionConflictError,
+  type RunExecutionIdentity,
+  RunStartPendingError,
+  type StartExecutionIdentity,
+  type StartIdentity,
+  stampMutationEpoch,
+} from './execution-admission.js';
+export {
   assertNoReservedExecutionContext,
   findReservedExecutionContextKey,
   isReservedExecutionContextKey,
@@ -106,6 +133,7 @@ export type {
   ExecutionFenceStatement,
   ExecutionFenceStoreOptions,
   ExecutionFenceTransition,
+  ExecutionFenceVersionedReading,
   ExecutionFenceWiring,
   // One arm of ExecutionFenceRefusal, published because that union is: a
   // consumer that catches a fence refusal on the far side of a Durable Object
@@ -137,6 +165,16 @@ export {
   readExecutionFence,
 } from './execution-fence.js';
 export { EXECUTION_PRINCIPAL_HEADER } from './execution-principal-header.js';
+export {
+  FENCED_WORKFLOW_STORAGE,
+  type FencedWorkflowAdmissionCapability,
+  type InitialAdmissionDatabase,
+  type InitialAdmissionWitness,
+  type InitialRunAdmission,
+  type InitialTerminalizationRequest,
+  type InitialTerminalizationResult,
+} from './fenced-workflow-capability.js';
+export { FencedWorkflowsStorageD1 } from './fenced-workflows-d1.js';
 export type { HubStreamEvent, PresenceMember } from './hub-do.js';
 export { HUB_INSTANCE_NAME, HubDurableObject } from './hub-do.js';
 export type {
@@ -147,6 +185,7 @@ export type {
   StorageInitOptions,
 } from './init.js';
 export { init } from './init.js';
+export { isDefinitiveInitialAdmissionRefusal } from './initial-admission-refusal.js';
 // The drain inventory: the read-only surface an operator proves a deployment
 // empty with, and the table census that keeps that proof complete as new
 // tables arrive.
@@ -189,10 +228,13 @@ export type {
   RunEconomicOperation,
   RunLifecyclePrincipal,
   RunScheduleDispatch,
+  RunTerminalCleanup,
   RunTerminalErrorEnvelope,
   RunTerminalStatus,
 } from './run-lifecycle.js';
 export type {
+  AuthoritativeStartState,
+  RecoveredStart,
   RequestContextProvider,
   ResumeRunOptions,
   RunLeg,
@@ -242,13 +284,16 @@ export { resolveScheduleStartOwner } from './schedule-source.js';
 export type {
   IdempotentStartDecision,
   IdempotentStartSurface,
+  PersistedStartResult,
   StartIdempotencyDatabase,
   StartIdempotencyStatement,
   StartIdempotencyStoreOptions,
   StartIdempotencyWiring,
   StartReservation,
+  StartReservationBinding,
   StartReservationOutcome,
   StartReservationOwner,
+  StartReservationReading,
   StartReservationRefusal,
   StartReservationRequest,
   StartReservationState,
@@ -262,7 +307,6 @@ export {
   InvalidStartIdempotencyRequestError,
   isStartReservationRefusal,
   requireStartIdempotency,
-  rollbackFencedStart,
   START_IDEMPOTENCY_DDL,
   START_IDEMPOTENCY_RUN_INDEX_DDL,
   START_IDEMPOTENCY_STATE_INDEX_DDL,
@@ -279,21 +323,14 @@ export {
   // answering the same key.
   startIdempotencyFor,
 } from './start-idempotency.js';
-// Per-suspension deadlines: the reserved suspend-payload key that arms one, the
-// timeout envelope a resumed step branches on, and the bounds each is validated
-// against (docs/do-runner-design.md, "Per-suspension deadlines"). The stored
-// record, its parser, the envelope factory it feeds, and the wake arithmetic
-// stay internal — they are the run object's own Durable-Object plumbing, and a
-// consumer holding them could only misread state the alarm owns.
-// MAX_SUSPENSION_DEADLINES_PER_RUN is the exception among the bounds: no single
-// value is validated against it, and it ships as an operational figure — the
-// per-run cap a host plans and documents against, which is how the README
-// quotes it — not as something to check a deadline with before arming.
 export type {
+  RejectedSuspensionDeadline,
+  SuspensionDeadlineEntry,
   SuspensionTimeoutEnvelope,
   SuspensionTimeoutResumeData,
 } from './suspension-deadline.js';
 export {
+  isArmableSuspensionDeadlineMs,
   isSuspensionTimeoutResumeData,
   MAX_SUSPENSION_DEADLINE_MS,
   MAX_SUSPENSION_DEADLINES_PER_RUN,
@@ -301,6 +338,11 @@ export {
   SUSPENSION_DEADLINE_PAYLOAD_KEY,
   SUSPENSION_DEADLINE_PRINCIPAL_ID,
   SUSPENSION_TIMEOUT_RESUME_KEY,
+  suspensionDeadlinesOf,
 } from './suspension-deadline.js';
 export type { ThreadScope } from './thread-do.js';
 export { ThreadDurableObject, ThreadIdentityError } from './thread-do.js';
+export type {
+  D1RunAddress,
+  RawWorkflowSnapshot,
+} from './workflow-snapshot-row.js';

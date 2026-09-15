@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { InitialExecutionFenceState } from '@proofoftech/flowsafe/deployment-identity-protocol';
+import type { HostRoutingTarget } from './host-routing.js';
 
 /**
  * The execution-fence state a freshly provisioned deployment is born in —
@@ -13,6 +14,12 @@ import type { InitialExecutionFenceState } from '@proofoftech/flowsafe/deploymen
 export type { InitialExecutionFenceState };
 
 export type ProvisioningBackendKind = 'plain-worker' | 'workers-for-platforms';
+
+/** One immutable Worker version and its intended deployment percentage. */
+export type OrdinaryWorkerDeploymentVersion = Readonly<{
+  versionId: string;
+  percentage: number;
+}>;
 
 export interface WorkerModule {
   readonly name: string;
@@ -49,6 +56,11 @@ export interface ExternalPlatformProfile {
   readonly organizationEgressHosts: readonly string[];
 }
 
+export type MaintenanceSigningProfile = Pick<
+  ExternalPlatformProfile,
+  'maintenanceCapabilityPublicKey' | 'maintenanceCapabilityPrivateKey'
+>;
+
 export interface DurableObjectMigration {
   readonly tag: string;
   readonly newSqliteClasses?: readonly string[];
@@ -66,7 +78,17 @@ export interface D1Migration {
   readonly rollbackCompatible?: true;
 }
 
-export type R2Jurisdiction = 'default' | 'eu' | 'fedramp';
+/** The R2 jurisdictions this control plane addresses, in encounter order. */
+export const R2_JURISDICTIONS = Object.freeze([
+  'default',
+  'eu',
+  'fedramp',
+] as const);
+
+export type R2Jurisdiction = (typeof R2_JURISDICTIONS)[number];
+
+/** One R2 jurisdiction, in today's fixed encounter order. */
+export type FleetInventoryR2Jurisdiction = R2Jurisdiction;
 
 /**
  * One Worker's identity plus its D1 and routing claims, as the authoritative
@@ -200,6 +222,8 @@ export const PROVISIONING_PHASES = [
   'publishing',
   'migrating',
   'ready',
+  'decommission-advancing',
+  'cleanup-advancing',
   'decommissioning',
   'traffic-removed',
   'credentials-revoked',
@@ -291,6 +315,158 @@ export interface ExternalPlatformTargetDescription {
   readonly outboundPolicy: DeploymentEgressPolicy;
 }
 
+export const EXTERNAL_MIGRATION_SUBPHASES = [
+  'planned',
+  'schema-applied',
+  'platform-applied',
+  'candidate-deployed',
+  'candidate-armed',
+  'route-published',
+] as const satisfies readonly ExternalMigrationSubphase[];
+
+export const BACKEND_SWITCH_SUBPHASES = [
+  'planned',
+  'bridge-upload-authorized',
+  'bridge-deployed',
+  'candidate-deploy-authorized',
+  'candidate-deployed',
+  'host-publish-authorized',
+  'host-published',
+  'domain-detach-authorized',
+  'dispatch-serving',
+  'bridge-private-authorized',
+  'bridge-private',
+  'ownership-commit-authorized',
+  'ready',
+  'rollback-route-authorized',
+  'rollback-routed',
+  'rollback-drain-authorized',
+  'rollback-drained',
+  'rollback-restore-authorized',
+  'rollback-restored',
+  'rollback-ownership-authorized',
+  'rolled-back',
+  'finalize-authorized',
+  'finalized',
+  'decommission-traffic-authorized',
+  'decommission-traffic-removed',
+  'decommission-candidate-authorized',
+  'decommission-candidate-removed',
+  'decommission-bridge-authorized',
+  'decommission-bridge-removed',
+  'decommission-application-r2-authorized',
+  'decommission-application-r2-removed',
+  'decommission-export-authorized',
+  'decommission-exported',
+  'decommission-database-authorized',
+  'decommissioned',
+] as const;
+
+export type BackendSwitchSubphase = (typeof BACKEND_SWITCH_SUBPHASES)[number];
+
+export interface PlainBackendSnapshot {
+  readonly scriptName: string;
+  readonly artifactVersion: string;
+  readonly specDigest: string;
+  readonly databaseId: string;
+  readonly databaseName: string;
+  readonly durableObjectBindings: readonly DurableObjectBindingInventory[];
+  readonly namespaceIds: readonly string[];
+  readonly secretNames: readonly string[];
+  readonly application?: ApplicationBindingTopology;
+  readonly applicationResources: readonly ApplicationR2Resource[];
+  readonly customDomain: Readonly<{ id: string; hostname: string }>;
+}
+
+export interface BridgeSnapshot {
+  readonly scriptName: string;
+  readonly artifactVersion: string;
+  readonly artifactDigest: string;
+  readonly databaseId: string;
+  readonly durableObjectBindings: readonly DurableObjectBindingInventory[];
+  readonly namespaceIds: readonly string[];
+  readonly secretNames: readonly string[];
+  readonly application?: ApplicationBindingTopology;
+  readonly publicRouteAttached: boolean;
+  readonly stateOnly: boolean;
+}
+
+export interface BridgeMutationPlan {
+  readonly artifactDigest: string;
+  readonly durableObjectMigrations: readonly DurableObjectMigration[];
+  readonly priorDurableObjectTag?: string;
+  readonly targetDurableObjectTag?: string;
+  readonly secretNames: readonly string[];
+  readonly mutationDigest: string;
+}
+
+export interface BackendSwitchCandidateSnapshot
+  extends ExternalReleaseSnapshot {
+  readonly maintenance: Readonly<{
+    receipt: string;
+    specDigest: string;
+  }>;
+}
+
+export interface BackendSwitchApplicationR2Progress {
+  readonly resource: ApplicationR2Resource;
+  readonly subphase: ApplicationR2Resource['state'];
+}
+
+export interface BackendSwitchDecommissionRelease {
+  readonly release: ExternalReleaseSnapshot;
+  readonly subphase: 'present' | 'delete-authorized' | 'deleted';
+}
+
+export interface BackendSwitchDecommissionRouteTarget {
+  readonly release: ExternalReleaseSnapshot;
+  readonly target: ExternalPlatformTargetDescription;
+  readonly routeTarget: HostRoutingTarget;
+}
+
+export interface BackendSwitchDecommissionSnapshot {
+  readonly prior?: PlainBackendSnapshot;
+  readonly restoredArtifactVersion?: string | null;
+  readonly entryPendingArtifactVersion?: string | null;
+  readonly entryPendingNamespaceIds?: readonly string[] | null;
+  readonly providerTargetSpecDigest?: string;
+  readonly routeHostname: string;
+  readonly routeTargets: readonly BackendSwitchDecommissionRouteTarget[];
+  readonly desiredSpecDigest: string;
+  readonly target: ExternalPlatformTargetDescription;
+  readonly releases: readonly BackendSwitchDecommissionRelease[];
+  readonly applicationResources: readonly ApplicationR2Resource[];
+  readonly bridge?: BridgeSnapshot;
+  readonly resources?: ExternalPlatformResources;
+  readonly bridgePlan?: BridgeMutationPlan;
+}
+
+export interface BackendSwitchIntent {
+  readonly kind: 'backend-switch';
+  readonly tenantTag: string;
+  readonly environment: string;
+  readonly prior: PlainBackendSnapshot;
+  readonly targetSpecDigest: string;
+  readonly targetApplication: ApplicationBindingTopology;
+  readonly target: ExternalPlatformTargetDescription;
+  readonly rollbackUntil: string;
+  readonly subphase: BackendSwitchSubphase;
+  readonly bridgePlan?: BridgeMutationPlan;
+  readonly bridge?: BridgeSnapshot;
+  readonly candidate?: BackendSwitchCandidateSnapshot;
+  readonly restoredArtifactVersion?: string;
+  readonly databaseExport?: DatabaseExport;
+  readonly applicationR2Progress?: readonly BackendSwitchApplicationR2Progress[];
+  readonly stateReconcileIntent?: Readonly<{
+    targetSpecDigest: string;
+    plan: BridgeMutationPlan;
+    subphase: 'upload-authorized' | 'uploaded';
+  }>;
+  readonly decommissionSnapshot?: BackendSwitchDecommissionSnapshot;
+  readonly decommissionSnapshotSha256?: string;
+  readonly decommissionEntrySubphase?: BackendSwitchSubphase;
+}
+
 export type ExternalMigrationSubphase =
   | 'planned'
   | 'schema-applied'
@@ -310,9 +486,509 @@ export interface ExternalMigrationIntent {
   readonly subphase: ExternalMigrationSubphase;
 }
 
+export type NormalDecommissionLifecyclePhase =
+  | 'publishing'
+  | 'ready'
+  | 'migrating'
+  | 'rolling-back'
+  | 'decommissioning'
+  | 'traffic-removed'
+  | 'credentials-revoked'
+  | 'worker-deleted'
+  | 'platform-credentials-revoked'
+  | 'platform-resources-deleted'
+  | 'application-resources-deleting'
+  | 'application-resources-deleted'
+  | 'database-exported'
+  | 'database-deleting';
+
+export interface DecommissionRecordIdentity {
+  readonly tenantTag: string;
+  readonly environment: string;
+  readonly backend: ProvisioningBackendKind;
+  readonly scriptName: string;
+  readonly databaseId: string;
+  readonly databaseName: string;
+  readonly routeHostname: string;
+}
+
+export type DecommissionOperationMode =
+  | Readonly<{
+      kind: 'normal';
+      requestedSpecDigest: string;
+      entryLifecyclePhase: NormalDecommissionLifecyclePhase;
+    }>
+  | Readonly<{
+      kind: 'backend-switch';
+      priorSpecDigest: string;
+      targetSpecDigest: string;
+      decommissionSnapshotSha256: string;
+      /** Immutable entry subphase, not the switch's current progress. */
+      backendSwitchSubphase: BackendSwitchSubphase;
+    }>;
+
+export interface DecommissionOperationIdentity {
+  readonly record: DecommissionRecordIdentity;
+  readonly mode: DecommissionOperationMode;
+}
+
+export type DecommissionAttachmentPurpose =
+  | Readonly<{
+      kind: 'application-r2-detach';
+      resourceIndex: number;
+      name: string;
+      bucketName: string;
+      jurisdiction: R2Jurisdiction;
+      reservationNonce: string;
+      creationDate: string;
+    }>
+  | Readonly<{ kind: 'database-pre-export'; databaseId: string }>
+  | Readonly<{
+      kind: 'database-pre-delete';
+      databaseId: string;
+      exportLocation: string;
+      exportSha256: string;
+      exportSize: number;
+    }>;
+
+export type DecommissionBlockedAttachment =
+  | Readonly<{ plane: 'ordinary'; scriptName: string }>
+  | Readonly<{
+      plane: 'dispatch';
+      scriptName: string;
+      dispatchNamespace: string;
+    }>;
+
+export type DecommissionAttachmentProgress =
+  | Readonly<{
+      version: 1;
+      target:
+        | Readonly<{ kind: 'd1'; databaseId: string }>
+        | Readonly<{ kind: 'r2'; bucketName: string }>;
+      evidenceSha256: string;
+      evidenceCount: number;
+      stage: 'ordinary-script-inventory';
+      ordinaryInventorySha256?: string;
+      scriptIndex: number;
+    }>
+  | Readonly<{
+      version: 1;
+      target:
+        | Readonly<{ kind: 'd1'; databaseId: string }>
+        | Readonly<{ kind: 'r2'; bucketName: string }>;
+      evidenceSha256: string;
+      evidenceCount: number;
+      stage: 'ordinary-deployment';
+      ordinaryInventorySha256: string;
+      scriptIndex: number;
+      scriptName: string;
+    }>
+  | Readonly<{
+      version: 1;
+      target:
+        | Readonly<{ kind: 'd1'; databaseId: string }>
+        | Readonly<{ kind: 'r2'; bucketName: string }>;
+      evidenceSha256: string;
+      evidenceCount: number;
+      stage: 'ordinary-version';
+      ordinaryInventorySha256: string;
+      scriptIndex: number;
+      scriptName: string;
+      deploymentSha256: string;
+      versionIndex: number;
+    }>
+  | Readonly<{
+      version: 1;
+      target:
+        | Readonly<{ kind: 'd1'; databaseId: string }>
+        | Readonly<{ kind: 'r2'; bucketName: string }>;
+      evidenceSha256: string;
+      evidenceCount: number;
+      stage: 'dispatch-namespace-inventory';
+      ordinaryInventorySha256: string;
+      namespaceInventorySha256?: string;
+      namespaceIndex: number;
+    }>
+  | Readonly<{
+      version: 1;
+      target:
+        | Readonly<{ kind: 'd1'; databaseId: string }>
+        | Readonly<{ kind: 'r2'; bucketName: string }>;
+      evidenceSha256: string;
+      evidenceCount: number;
+      stage: 'dispatch-script-page';
+      ordinaryInventorySha256: string;
+      namespaceInventorySha256: string;
+      namespaceIndex: number;
+      namespaceName: string;
+      pageStartCursor?: string;
+      pageNumber: number;
+      seenCursorSha256: readonly string[];
+      totalDispatchItems: number;
+      dispatchEvidenceSum256: string;
+      dispatchEvidenceCount: number;
+    }>
+  | Readonly<{
+      version: 1;
+      target:
+        | Readonly<{ kind: 'd1'; databaseId: string }>
+        | Readonly<{ kind: 'r2'; bucketName: string }>;
+      evidenceSha256: string;
+      evidenceCount: number;
+      stage: 'dispatch-script-settings';
+      ordinaryInventorySha256: string;
+      namespaceInventorySha256: string;
+      namespaceIndex: number;
+      namespaceName: string;
+      pageStartCursor?: string;
+      nextCursor?: string;
+      pageSha256: string;
+      pageItemCount: number;
+      itemOffset: number;
+      pageNumber: number;
+      seenCursorSha256: readonly string[];
+      totalDispatchItems: number;
+      dispatchEvidenceSum256: string;
+      dispatchEvidenceCount: number;
+    }>;
+
+export interface DecommissionAttachmentScanEvidence {
+  readonly evidenceSha256: string;
+  readonly evidenceCount: number;
+}
+
+export interface DecommissionIntentCommon {
+  readonly version: 1;
+  readonly operationId: string;
+  readonly revision: number;
+  readonly generation: number;
+  readonly updatedAt: string;
+  readonly identity: DecommissionOperationIdentity;
+  readonly databaseExportReceiptAuthority?: string;
+  readonly lifecyclePhase: NormalDecommissionLifecyclePhase;
+}
+
+export type DecommissionAdvanceIntent =
+  | (DecommissionIntentCommon & Readonly<{ state: 'transitioning' }>)
+  | (DecommissionIntentCommon &
+      Readonly<{
+        state: 'discover';
+        purpose: DecommissionAttachmentPurpose;
+        progress: DecommissionAttachmentProgress;
+      }>)
+  | (DecommissionIntentCommon &
+      Readonly<{
+        state: 'verify';
+        purpose: DecommissionAttachmentPurpose;
+        progress: DecommissionAttachmentProgress;
+        discoverEvidence: DecommissionAttachmentScanEvidence;
+      }>)
+  | (DecommissionIntentCommon &
+      Readonly<{
+        state: 'blocked';
+        purpose: DecommissionAttachmentPurpose;
+        attachment: DecommissionBlockedAttachment;
+      }>)
+  | Readonly<{
+      version: 1;
+      operationId: string;
+      revision: number;
+      generation: number;
+      updatedAt: string;
+      identity: DecommissionOperationIdentity;
+      databaseExportReceiptAuthority: string;
+      lifecyclePhase: 'decommissioned';
+      state: 'complete';
+    }>;
+
+export interface DecommissionAdvanceToken {
+  readonly version: 1;
+  readonly tenantTag: string;
+  readonly environment: string;
+  readonly operationId: string;
+  readonly revision: number;
+}
+
+export type DecommissionAdvanceTokenClassification = 'current' | 'stale';
+
+/** Call-local request for one read-only bounded provider scan chunk. */
+export interface DecommissionAttachmentScanInput {
+  readonly progress: DecommissionAttachmentProgress;
+  /** Reserved provider-attempt ceiling; an integer from 9 through 1,000. */
+  readonly maxProviderRequests: number;
+  /** Call-local cancellation; never persisted in a shell or Queue token. */
+  readonly signal?: AbortSignal;
+}
+
+/** Read-only provider facts; never durable absence or deletion authority. */
+export type DecommissionAttachmentScanResult =
+  | Readonly<{
+      /** More read-only provider work remains. */
+      status: 'pending';
+      progress: DecommissionAttachmentProgress;
+      providerFetchAttemptsReserved: number;
+    }>
+  | Readonly<{
+      /** The first safe Worker attachment found by this chunk. */
+      status: 'attached';
+      attachment: DecommissionBlockedAttachment;
+      providerFetchAttemptsReserved: number;
+    }>
+  | Readonly<{
+      /** This pass completed; evidence is not durable deletion authority. */
+      status: 'complete';
+      evidenceSha256: string;
+      evidenceCount: number;
+      providerFetchAttemptsReserved: number;
+    }>
+  | Readonly<{
+      /** Provider inventory changed; the caller must start a new generation. */
+      status: 'drift';
+    }>;
+
+/** Versioned provider-neutral candidate-invocation authority carrier. */
+export interface InvocationAuthorityCarrier {
+  readonly version: 1;
+  /** ISO timestamp of the durable authorization commit, or null when never authorized. */
+  readonly authorizedAt: string | null;
+}
+
+/** Purpose binding that decommission codecs structurally reject. */
+export interface CleanupAttachmentPurpose {
+  readonly kind: 'cleanup-database-pre-delete';
+  readonly databaseId: string;
+  readonly operationId: string;
+}
+
+/**
+ * Durable scan progress DEFINED here, mirroring the existing
+ * `DecommissionAttachmentProgress` precedent field for field. types.ts does
+ * NOT import cloudflare-worker-attachment-scan-state.ts. There is NO
+ * conversion function: exactly like decommission today, the engine passes
+ * `intent.progress` to the backend scan capability directly and, on a pending
+ * chunk, validates the returned value with `parseWorkerAttachmentScanProgress`
+ * and assigns it structurally (the shapes are identical).
+ */
+export type CleanupAttachmentProgress =
+  | Readonly<{
+      version: 1;
+      target:
+        | Readonly<{ kind: 'd1'; databaseId: string }>
+        | Readonly<{ kind: 'r2'; bucketName: string }>;
+      evidenceSha256: string;
+      evidenceCount: number;
+      stage: 'ordinary-script-inventory';
+      ordinaryInventorySha256?: string;
+      scriptIndex: number;
+    }>
+  | Readonly<{
+      version: 1;
+      target:
+        | Readonly<{ kind: 'd1'; databaseId: string }>
+        | Readonly<{ kind: 'r2'; bucketName: string }>;
+      evidenceSha256: string;
+      evidenceCount: number;
+      stage: 'ordinary-deployment';
+      ordinaryInventorySha256: string;
+      scriptIndex: number;
+      scriptName: string;
+    }>
+  | Readonly<{
+      version: 1;
+      target:
+        | Readonly<{ kind: 'd1'; databaseId: string }>
+        | Readonly<{ kind: 'r2'; bucketName: string }>;
+      evidenceSha256: string;
+      evidenceCount: number;
+      stage: 'ordinary-version';
+      ordinaryInventorySha256: string;
+      scriptIndex: number;
+      scriptName: string;
+      deploymentSha256: string;
+      versionIndex: number;
+    }>
+  | Readonly<{
+      version: 1;
+      target:
+        | Readonly<{ kind: 'd1'; databaseId: string }>
+        | Readonly<{ kind: 'r2'; bucketName: string }>;
+      evidenceSha256: string;
+      evidenceCount: number;
+      stage: 'dispatch-namespace-inventory';
+      ordinaryInventorySha256: string;
+      namespaceInventorySha256?: string;
+      namespaceIndex: number;
+    }>
+  | Readonly<{
+      version: 1;
+      target:
+        | Readonly<{ kind: 'd1'; databaseId: string }>
+        | Readonly<{ kind: 'r2'; bucketName: string }>;
+      evidenceSha256: string;
+      evidenceCount: number;
+      stage: 'dispatch-script-page';
+      ordinaryInventorySha256: string;
+      namespaceInventorySha256: string;
+      namespaceIndex: number;
+      namespaceName: string;
+      pageStartCursor?: string;
+      pageNumber: number;
+      seenCursorSha256: readonly string[];
+      totalDispatchItems: number;
+      dispatchEvidenceSum256: string;
+      dispatchEvidenceCount: number;
+    }>
+  | Readonly<{
+      version: 1;
+      target:
+        | Readonly<{ kind: 'd1'; databaseId: string }>
+        | Readonly<{ kind: 'r2'; bucketName: string }>;
+      evidenceSha256: string;
+      evidenceCount: number;
+      stage: 'dispatch-script-settings';
+      ordinaryInventorySha256: string;
+      namespaceInventorySha256: string;
+      namespaceIndex: number;
+      namespaceName: string;
+      pageStartCursor?: string;
+      nextCursor?: string;
+      pageSha256: string;
+      pageItemCount: number;
+      itemOffset: number;
+      pageNumber: number;
+      seenCursorSha256: readonly string[];
+      totalDispatchItems: number;
+      dispatchEvidenceSum256: string;
+      dispatchEvidenceCount: number;
+    }>;
+
+/** One bounded cleanup attachment-scan pass and its durable progress. */
+export interface CleanupAttachmentScan {
+  readonly purpose: CleanupAttachmentPurpose;
+  readonly pass: 'discover' | 'verify';
+  readonly progress: CleanupAttachmentProgress;
+  /** Present only during the verify pass. */
+  readonly discoverEvidence?: Readonly<{
+    evidenceSha256: string;
+    evidenceCount: number;
+  }>;
+}
+
+/** Who authorized this cleanup, with persisted rollback attempt facts. */
+export type CleanupAuthority =
+  | Readonly<{ kind: 'manual-cleanup' }>
+  | Readonly<{
+      kind: 'provisioning-rollback';
+      reservationOwned: boolean;
+      databaseOwned: boolean;
+      workerCreatedByAttempt: boolean;
+      workerResourceState: 'absent' | 'present' | 'unknown';
+      requestedSpecDigest: string;
+    }>;
+
+/** One durable cleanup step; one call performs at most one step's group. */
+export type CleanupAdvanceState =
+  | Readonly<{ step: 'teardown-traffic' }>
+  | Readonly<{ step: 'teardown-worker' }>
+  | Readonly<{ step: 'teardown-platform' }>
+  | Readonly<{
+      step: 'r2-deletion';
+      startResourceIndex: number;
+      verifiedDetachmentResourceIndex?: number;
+    }>
+  | Readonly<{ step: 'attachment-scan'; scan: CleanupAttachmentScan }>
+  | Readonly<{
+      step: 'blocked';
+      purpose: CleanupAttachmentPurpose;
+      attachment: DecommissionBlockedAttachment;
+    }>
+  | Readonly<{ step: 'database-deletion' }>;
+
+/**
+ * Durable authority for one bounded cleanup or provisioning-rollback
+ * operation. Cleanup has no terminal intent state — the terminal deletes the
+ * Fleet row — so any present intent is active.
+ */
+export interface CleanupAdvanceIntent {
+  readonly version: 1;
+  readonly operationId: string;
+  readonly revision: number;
+  readonly generation: number;
+  readonly updatedAt: string;
+  readonly authority: CleanupAuthority;
+  readonly identity: Readonly<{
+    record: Readonly<{
+      tenantTag: string;
+      environment: string;
+      backend: ProvisioningBackendKind;
+      scriptName: string;
+      databaseId: string;
+      databaseName: string;
+      routeHostname: string;
+    }>;
+    admittedPhase: ProvisioningPhase;
+    /** backend.immutableExternalArtifacts === true at admission. */
+    externalArtifact: boolean;
+  }>;
+  readonly state: CleanupAdvanceState;
+}
+
+/** Transport-neutral non-authoritative continuation token for one cleanup. */
+export interface CleanupAdvanceToken {
+  readonly version: 1;
+  readonly tenantTag: string;
+  readonly environment: string;
+  readonly operationId: string;
+  readonly revision: number;
+}
+
+/** Terminal evidence recorded on the immutable cleanup receipt. */
+export interface CleanupReceiptEvidence {
+  readonly eligibility:
+    | 'carrier-null'
+    | 'legacy-phase-impossible'
+    | 'reservation-only';
+  readonly ingressRemoved: boolean;
+  readonly workerAbsent: boolean;
+  readonly platformResourcesAbsent: boolean;
+  readonly applicationR2Settled: boolean;
+  readonly databaseAbsentReadback: boolean;
+  /**
+   * Optional discover/verify attachment-scan digests. Receipts written by the
+   * bounded engine omit this pair (the scan gate is proven by the persisted
+   * database-deletion transition); the codec retains it for compatibility.
+   */
+  readonly scan?: Readonly<{
+    discover: Readonly<{ evidenceSha256: string; evidenceCount: number }>;
+    verify: Readonly<{ evidenceSha256: string; evidenceCount: number }>;
+  }>;
+}
+
+/** Operation-keyed immutable terminal receipt persisted outside the Fleet row. */
+export interface CleanupTerminalReceipt {
+  readonly version: 1;
+  readonly operationId: string;
+  readonly tenantTag: string;
+  readonly environment: string;
+  readonly backend: ProvisioningBackendKind;
+  readonly scriptName: string;
+  readonly databaseId: string;
+  readonly databaseName: string;
+  readonly authority: 'manual-cleanup' | 'provisioning-rollback';
+  readonly admittedPhase: ProvisioningPhase;
+  readonly disposition:
+    | 'prepublication-owned-no-export'
+    | 'reservation-cleared';
+  readonly evidence: CleanupReceiptEvidence;
+  /** D1-assigned; present on every read/return path, absent only on the caller-constructed input. */
+  readonly completedAtMs?: number;
+}
+
 export interface FleetRecord {
   readonly tenantTag: string;
   readonly backend: ProvisioningBackendKind;
+  /** Absence preserves external ownership for legacy WFP rows. */
+  readonly wfpMode?: 'platform-catalog';
   readonly environment: string;
   readonly scriptName: string;
   readonly databaseId: string;
@@ -331,7 +1007,10 @@ export interface FleetRecord {
   readonly platformResources?: ExternalPlatformResources;
   readonly platformTarget?: ExternalPlatformTargetDescription;
   readonly migrationIntent?: ExternalMigrationIntent;
-  readonly backendSwitchIntent?: import('./backend-switch.js').BackendSwitchIntent;
+  readonly backendSwitchIntent?: BackendSwitchIntent;
+  readonly decommissionIntent?: DecommissionAdvanceIntent;
+  readonly cleanupIntent?: CleanupAdvanceIntent;
+  readonly invocationAuthority?: InvocationAuthorityCarrier;
   readonly applicationResources?: readonly ApplicationR2Resource[];
   readonly applicationBindings?: ApplicationBindingTopology;
   readonly durableObjectTag?: string;
@@ -355,6 +1034,79 @@ export interface FleetRecord {
    */
   readonly settledSettlementKey?: string;
   readonly updatedAt: string;
+}
+
+export function isPlatformCatalogRecord(
+  record: Pick<FleetRecord, 'backend' | 'wfpMode'>,
+): boolean {
+  return (
+    record.backend === 'workers-for-platforms' &&
+    Object.hasOwn(record, 'wfpMode') &&
+    record.wfpMode === 'platform-catalog'
+  );
+}
+
+export function effectiveLifecyclePhase(
+  record: FleetRecord,
+): ProvisioningPhase {
+  if (record.phase === 'cleanup-advancing') {
+    if (!record.cleanupIntent) {
+      throw new Error('cleanup-advancing record has no active cleanup intent');
+    }
+    return 'cleanup-advancing';
+  }
+  if (record.cleanupIntent) {
+    throw new Error('fleet record has inconsistent cleanup intent state');
+  }
+  const intent = record.decommissionIntent;
+  if (record.phase === 'decommission-advancing') {
+    if (!intent || intent.state === 'complete') {
+      throw new Error(
+        'decommission-advancing record has no active decommission intent',
+      );
+    }
+    return intent.lifecyclePhase;
+  }
+  if (
+    intent &&
+    !(record.phase === 'decommissioned' && intent.state === 'complete')
+  ) {
+    throw new Error('fleet record has inconsistent decommission intent state');
+  }
+  return record.phase;
+}
+
+export function assertNoActiveDecommission(
+  record: FleetRecord,
+  operation: string,
+): void {
+  if (
+    record.phase === 'decommission-advancing' ||
+    (record.decommissionIntent &&
+      !(
+        record.phase === 'decommissioned' &&
+        record.decommissionIntent.state === 'complete'
+      ))
+  ) {
+    throw new Error(`${operation} cannot run during an active decommission`);
+  }
+}
+
+/**
+ * Refuses lifecycle entries while a bounded cleanup is active. Cleanup has no
+ * terminal intent state — the terminal deletes the Fleet row — so ANY present
+ * intent is active.
+ */
+export function assertNoActiveCleanup(
+  record: FleetRecord,
+  operation: string,
+): void {
+  if (
+    record.phase === 'cleanup-advancing' ||
+    record.cleanupIntent !== undefined
+  ) {
+    throw new Error(`${operation} cannot run during an active cleanup`);
+  }
 }
 
 export interface MaintenanceHealth {
@@ -401,11 +1153,36 @@ export interface LiveDeployment {
   readonly maintenance: MaintenanceHealth;
 }
 
-export interface DatabaseExport {
+/** Independently verified byte integrity for one complete database export. */
+export interface DatabaseExportIntegrity {
+  /** Positive safe-integer byte length of the complete export. */
+  readonly size: number;
+  /** Lowercase hexadecimal SHA-256 digest of the complete export. */
+  readonly sha256: string;
+}
+
+/**
+ * Immutable identity of one durable database-export receipt.
+ *
+ * `authority` identifies the configured storage root and must remain unchanged
+ * for every retry. Reusing the same complete identity converges only when the
+ * already-committed export has exact byte integrity; a collision is preserved
+ * and refused.
+ */
+export interface DatabaseExportReceiptIdentity {
+  /** Receipt derivation version. Version 1 is permanently stable. */
+  readonly version: 1;
+  /** Canonical identifier of the immutable receipt storage authority. */
+  readonly authority: string;
+  /** Immutable provider database identifier. */
+  readonly databaseId: string;
+  /** Durable UUIDv4 operation identifier reused by every retry. */
+  readonly operationId: string;
+}
+
+export interface DatabaseExport extends DatabaseExportIntegrity {
   readonly databaseId: string;
   readonly location: string;
-  readonly sha256: string;
-  readonly size: number;
 }
 
 export interface FleetInventoryDeployment {
@@ -454,6 +1231,7 @@ export interface FleetInventoryFinding {
 }
 
 export interface FleetResourceInventory {
+  readonly unavailableR2Jurisdictions: readonly FleetInventoryR2Jurisdiction[];
   readonly findings: readonly FleetInventoryFinding[];
   /** Canonical HOSTS namespace assigned by the fleet control plane. */
   readonly hostRoutingKvId?: string;
@@ -518,6 +1296,221 @@ export interface PlainWorkerCustomDomain {
   readonly service: string;
 }
 
+/** Provider facts for one D1 database inventory entry. */
+export interface PlainWorkerDatabaseInventoryEntry {
+  /** Provider database identifier, when present and well formed. */
+  readonly databaseId: string | undefined;
+  /** Provider database name, when present and well formed. */
+  readonly name: string | undefined;
+}
+
+/** Provider facts for one ordinary Worker version binding. */
+export type PlainWorkerVersionBinding =
+  | Readonly<{
+      type: 'd1';
+      name: string | undefined;
+      databaseId: string | undefined;
+    }>
+  | Readonly<{
+      type: 'durable-object';
+      name: string | undefined;
+      className: string | undefined;
+      namespaceId: string | undefined;
+      /** Optional provider script selector retained without reinterpretation. */
+      scriptName?: string;
+      /** Optional provider dispatch selector retained without reinterpretation. */
+      dispatchNamespace?: string;
+    }>
+  | Readonly<{
+      type: 'service';
+      name: string | undefined;
+      service: string | undefined;
+      /** Optional service entrypoint retained for exact-version comparison. */
+      entrypoint?: string;
+    }>
+  | Readonly<{
+      type: 'queue-producer';
+      name: string | undefined;
+      queueName: string | undefined;
+    }>
+  | Readonly<{
+      type: 'r2-bucket';
+      name: string | undefined;
+      bucketName: string | undefined;
+      /** Provider-observable jurisdiction when Fleet can represent it. */
+      jurisdiction?: 'eu' | 'fedramp';
+    }>
+  | Readonly<{
+      type: 'plain-text';
+      name: string | undefined;
+      value: string | undefined;
+    }>
+  | Readonly<{
+      type: 'secret-text';
+      name: string | undefined;
+    }>
+  | Readonly<{
+      type: 'unsupported';
+      name: string | undefined;
+      /** The provider binding was not an object, so it has no raw type fact. */
+      issue: 'not-object';
+    }>
+  | Readonly<{
+      type: 'unsupported';
+      name: string | undefined;
+      /** Raw provider binding type, when the invalid wire value was a string. */
+      providerType: string | undefined;
+      issue: 'invalid-type';
+    }>
+  | Readonly<{
+      type: 'unsupported';
+      name: string | undefined;
+      /** Raw unsupported provider binding type. */
+      providerType: string;
+      issue: 'unsupported-type';
+    }>
+  | Readonly<{
+      type: 'unsupported';
+      name: string | undefined;
+      /** Supported raw provider type whose decision fields were malformed. */
+      providerType:
+        | 'd1'
+        | 'durable_object_namespace'
+        | 'service'
+        | 'queue'
+        | 'r2_bucket'
+        | 'plain_text'
+        | 'secret_text';
+      /** Prevents malformed supported input from being normalized lossily. */
+      issue: 'malformed-supported-binding';
+    }>;
+
+/** Provider facts for one ordinary Worker version summary. */
+export interface PlainWorkerVersionSummary {
+  /** Provider version identifier, when present and well formed. */
+  readonly versionId: string | undefined;
+  /** Fleet tag attached to the version, when present and well formed. */
+  readonly tag: string | undefined;
+}
+
+/** Provider facts for one ordinary Worker version and its bindings. */
+export interface PlainWorkerVersionDetail extends PlainWorkerVersionSummary {
+  /** Provider bindings attached to the version. */
+  readonly bindings: readonly PlainWorkerVersionBinding[];
+}
+
+/** Provider facts for an ordinary Worker's deployment status. */
+export interface PlainWorkerDeploymentStatus {
+  /** Traffic assignments reported by the provider. */
+  readonly versions: readonly {
+    /** Provider version identifier, when present and well formed. */
+    readonly versionId: string | undefined;
+    /** Provider traffic percentage, when present. */
+    readonly percentage: number | undefined;
+  }[];
+}
+
+/** Result of a durable ordinary-Worker database export. */
+export interface PlainWorkerDatabaseExportResult
+  extends DatabaseExportIntegrity {
+  /** Durable location returned by the export store. */
+  readonly location: string;
+}
+
+/** Outcome of a provider mutation that may have been dispatched. */
+export type PlainWorkerMutationOutcome =
+  | Readonly<{ status: 'succeeded' }>
+  | Readonly<{ status: 'failed'; error: unknown }>;
+
+/**
+ * Adapter-owned post-dispatch cleanup outcome. A failure is never thrown by
+ * the adapter after dispatch; the caller surfaces it after reconciliation. An
+ * adapter with no adapter-owned scratch always reports `succeeded`.
+ */
+export type PlainWorkerCleanupOutcome =
+  | Readonly<{ status: 'succeeded' }>
+  | Readonly<{ status: 'failed'; error: unknown }>;
+
+/** Upload outcome including the adapter scratch-cleanup outcome. */
+export type PlainWorkerUploadOutcome = PlainWorkerMutationOutcome &
+  Readonly<{ cleanup: PlainWorkerCleanupOutcome }>;
+
+/** Shared provider intent for an ordinary Worker candidate upload. */
+export interface PlainWorkerUploadIntentBase {
+  /** Provider script name. */
+  readonly scriptName: string;
+  /** Fleet tag attached to the uploaded candidate. */
+  readonly candidateTag: string;
+  /** Main module selected from the uploaded modules. */
+  readonly mainModule: string;
+  /** Worker modules to upload. */
+  readonly modules: readonly WorkerModule[];
+  /** Worker compatibility date. */
+  readonly compatibilityDate: string;
+  /** Worker compatibility flags, preserving provider-config omission. */
+  readonly compatibilityFlags: readonly string[] | undefined;
+  /** Desired Worker bindings. */
+  readonly bindings: {
+    readonly plainText: readonly {
+      readonly name: string;
+      readonly value: string;
+    }[];
+    readonly secrets: readonly {
+      readonly name: string;
+      readonly value: string;
+    }[];
+    readonly d1: readonly {
+      readonly name: string;
+      readonly databaseId: string;
+      readonly databaseName: string;
+    }[];
+    readonly durableObjects: readonly {
+      readonly name: string;
+      readonly className: string;
+    }[];
+    readonly services: readonly {
+      readonly name: string;
+      readonly service: string;
+    }[];
+    readonly queueProducers: readonly {
+      readonly name: string;
+      readonly queueName: string;
+    }[];
+    readonly r2Buckets: readonly {
+      readonly name: string;
+      readonly bucketName: string;
+    }[];
+  };
+  /** Desired Worker resource limits. */
+  readonly limits: {
+    readonly cpuMs: number | undefined;
+    readonly subrequests?: number;
+  };
+  /** Ordinary Worker public-access mechanics applied by this upload. */
+  readonly publicAccess: {
+    readonly workersDevEnabled: boolean;
+    readonly previewUrlsEnabled: boolean;
+  };
+}
+
+/** Intent for an initial deploy or staged ordinary Worker version upload. */
+export type PlainWorkerUploadIntent = PlainWorkerUploadIntentBase &
+  (
+    | Readonly<{
+        mode: 'initial';
+        durableObjectMigrations: readonly DurableObjectMigration[];
+      }>
+    | Readonly<{ mode: 'staged' }>
+  );
+
+/**
+ * Provider operations shared by ordinary-Worker adapters.
+ *
+ * Every mutating member that takes an `ExternalMutationFence` must assert it
+ * immediately before each provider request it issues. The Cloudflare transport
+ * enforces this requirement for `CloudflareProvisioningClient`.
+ * `withMutationFence` carries the active fence through nested provider calls.
+ */
 export interface PlainWorkerRouteApi {
   withMutationFence<T>(
     fence: ExternalMutationFence,
@@ -551,6 +1544,17 @@ export interface PlainWorkerRouteApi {
       dispatchNamespace?: string;
     }>[]
   >;
+  /**
+   * Advances one bounded, read-only attachment scan chunk.
+   *
+   * The implementation must use the same Cloudflare account and credential
+   * authority as this port's teardown mutations, including when a route API is
+   * paired with a Wrangler runner. It never performs an unbounded fallback and
+   * returns no durable absence or deletion authority.
+   */
+  advanceDecommissionAttachmentScan?(
+    input: DecommissionAttachmentScanInput,
+  ): Promise<DecommissionAttachmentScanResult>;
   getR2Bucket?(
     bucketName: string,
     jurisdiction: R2Jurisdiction,
@@ -617,12 +1621,165 @@ export interface PlainWorkerRouteApi {
   ): Promise<void>;
 }
 
+/**
+ * Provider-neutral port whose methods return provider facts and perform
+ * provider mechanics. Absence policy, malformed-fact refusals, ordering,
+ * reconciliation, and compensation belong to the caller.
+ *
+ * A method whose result type cannot represent a malformed provider fact refuses
+ * it in the adapter (e.g. `getDatabase` (`DatabaseReference` has required string
+ * fields) and `exportDatabase` (`location` is required)); every other
+ * malformed-fact refusal belongs to the caller.
+ *
+ * A method declared here that accepts an `ExternalMutationFence`, other than
+ * `deleteDatabaseFenced`, asserts it immediately before every provider request
+ * it issues through the command runner or route API. `deleteDatabaseFenced`
+ * runs inside `withMutationFence` and relies on the route API's per-request
+ * assertion. The direct-API adapter does not pre-assert either, so both
+ * adapters have identical assertion counts.
+ *
+ * A method that resolves a `PlainWorkerMutationOutcome` over a transport that
+ * asserts per request must ALSO assert explicitly before dispatch, so a lost
+ * lease rejects instead of resolving `failed` and triggering readback.
+ *
+ * `PlainWorkerRouteApi.withMutationFence` entry is not itself an ownership
+ * assertion; assertion belongs to each mutating request. Nested scopes retain
+ * that request-level contract. Inherited `PlainWorkerRouteApi` members retain
+ * their own contract.
+ *
+ * `undefined` and `'absent'` mean provider absence only. Adapters propagate
+ * provider status and classification, may strip transport bodies and redact
+ * secret material from messages, and never classify a fence failure as
+ * absence. Methods without an absence-typed result do not classify absence.
+ *
+ * `createDatabase`, `uploadCandidate`, and `createDeployment` resolve a failed
+ * outcome only after a provider mutation request was dispatched and failed or
+ * its result became unknown; a preceding provider read does not count as
+ * dispatch. They reject failures that provably predate that dispatch, including
+ * fence assertion and local preparation failures. Other mutations reject on
+ * failure except for their documented absence result.
+ */
+export interface PlainWorkerProvisioningApi extends PlainWorkerRouteApi {
+  /** Maximum duration of any one provider mutation request after assertion. */
+  readonly maxMutationDurationMs: number;
+  /** Whether immutable-ID D1 reads and deletion are both available. */
+  readonly supportsExactDatabaseDeletion: boolean;
+  /**
+   * Lists D1 database inventory facts visible to the adapter. A name filter
+   * narrows the listing toward that name; an adapter forwards it where the
+   * provider accepts one and filters locally otherwise, so a caller that needs
+   * an exact match still compares the returned names.
+   */
+  listDatabases(
+    filter?: Readonly<{ name?: string }>,
+  ): Promise<readonly PlainWorkerDatabaseInventoryEntry[]>;
+  /** Reads a D1 database, returning undefined only for provider absence. */
+  getDatabase(databaseId: string): Promise<DatabaseReference | undefined>;
+  /** Creates a D1 database and reports a dispatched mutation outcome. */
+  createDatabase(
+    name: string,
+    fence: ExternalMutationFence,
+  ): Promise<PlainWorkerMutationOutcome>;
+  /** Prevents the shared core from using the inherited unfenced deletion. */
+  readonly deleteDatabase?: never;
+  /** Deletes a D1 database by immutable ID through the fenced route API. */
+  deleteDatabaseFenced(
+    databaseId: string,
+    fence: ExternalMutationFence,
+  ): Promise<void>;
+  /** Reads deployment facts, returning undefined only for provider absence. */
+  deploymentStatus(
+    scriptName: string,
+  ): Promise<PlainWorkerDeploymentStatus | undefined>;
+  /**
+   * Lists the provider's Worker version inventory, or `undefined` for provider
+   * absence. The listing is bounded by item count and rejects rather than
+   * truncating.
+   */
+  listVersions(
+    scriptName: string,
+  ): Promise<readonly PlainWorkerVersionSummary[] | undefined>;
+  /** Strictly reads one version and never classifies provider absence. */
+  viewVersion(
+    scriptName: string,
+    versionId: string,
+  ): Promise<PlainWorkerVersionDetail>;
+  /** Reads one version, returning undefined only for provider absence. */
+  findVersion(
+    scriptName: string,
+    versionId: string,
+  ): Promise<PlainWorkerVersionDetail | undefined>;
+  /**
+   * Uploads a candidate and reports dispatch and cleanup outcomes separately.
+   * Scratch, if any, is adapter-owned and exists only for the duration of the
+   * call. If a pre-dispatch failure (fence assertion or local preparation) and
+   * scratch cleanup both occur, rejects with an `AggregateError` containing the
+   * pre-dispatch error followed by the cleanup error; neither failure is
+   * discarded.
+   */
+  uploadCandidate(
+    intent: PlainWorkerUploadIntent,
+    fence: ExternalMutationFence,
+  ): Promise<PlainWorkerUploadOutcome>;
+  /** Creates a deployment and reports a dispatched mutation outcome. */
+  createDeployment(
+    scriptName: string,
+    versions: readonly OrdinaryWorkerDeploymentVersion[],
+    fence: ExternalMutationFence,
+  ): Promise<PlainWorkerMutationOutcome>;
+  /** Deletes a Worker script, returning absent only for provider absence. */
+  deleteWorkerScript(
+    scriptName: string,
+    fence: ExternalMutationFence,
+  ): Promise<'deleted' | 'absent'>;
+  /** Exports a D1 database into the durable store with independent integrity. */
+  exportDatabase(
+    database: { readonly id: string; readonly name: string },
+    fence: ExternalMutationFence,
+  ): Promise<PlainWorkerDatabaseExportResult>;
+  /**
+   * Canonical receipt storage authority. Present together with
+   * `exportDatabaseReceipt`, absent together when unsupported, and immutable
+   * for every retry of one receipt identity.
+   */
+  readonly databaseExportReceiptAuthority?: string;
+  /**
+   * Streams one operation-scoped export whose eager source-integrity promise is
+   * independently verified by the configured store. An exact retry converges;
+   * an identity or byte collision is preserved and refused.
+   */
+  exportDatabaseReceipt?(
+    identity: DatabaseExportReceiptIdentity,
+    fence: ExternalMutationFence,
+  ): Promise<PlainWorkerDatabaseExportResult>;
+}
+
 export interface FleetStateLease extends ExternalMutationFence {
   readonly tenantTag: string;
   readonly environment: string;
   renew(): Promise<void>;
   put(record: FleetRecord): Promise<void>;
   delete(): Promise<void>;
+  /**
+   * Atomically persists the immutable terminal cleanup receipt, releases this
+   * deployment's ownership claims, and deletes the Fleet row in one guarded
+   * batch. Optional so external lease implementations do not break; callers
+   * detect it with `Reflect.has`.
+   */
+  completeCleanup?(
+    input: Readonly<{
+      /** The terminal receipt, without `completedAtMs`. */
+      receipt: CleanupTerminalReceipt;
+      /** The intent revision the engine acted on. */
+      expectedRevision: number;
+    }>,
+  ): Promise<CleanupTerminalReceipt>;
+  /**
+   * Force path: deletes the Fleet row AND releases this deployment's current
+   * claims, with no receipt. Optional; legacy lease implementations keep
+   * tombstone claims through `delete()`.
+   */
+  deleteReleasingClaims?(): Promise<void>;
 }
 
 export interface FleetStateStore {
@@ -633,6 +1790,19 @@ export interface FleetStateStore {
   ): Promise<T>;
   get(tenantTag: string, environment: string): Promise<FleetRecord | undefined>;
   list(): Promise<readonly FleetRecord[]>;
+  /** Reads one immutable terminal cleanup receipt by operation id. */
+  readCleanupReceipt?(
+    operationId: string,
+  ): Promise<CleanupTerminalReceipt | undefined>;
+  /**
+   * Bounded explicit receipt GC: deletes at most `limit` receipts whose
+   * D1-assigned `completedAtMs` is before the cutoff, in stable
+   * completed-time-then-operation order. `limit` is an integer from 1 to
+   * 1,000; anything else fails closed.
+   */
+  pruneCleanupReceipts?(
+    input: Readonly<{ completedBeforeMs: number; limit: number }>,
+  ): Promise<Readonly<{ deleted: number }>>;
 }
 
 export type ForceDecommissionStep =
@@ -821,6 +1991,13 @@ export interface ProvisioningBackend {
   readonly immutableExternalArtifacts?: true;
   releaseScriptName?(spec: DeploymentSpec): string;
   findDatabase(spec: DeploymentSpec): Promise<DatabaseReference | undefined>;
+  /**
+   * Reads one database by immutable ID. Only `undefined` means absence.
+   *
+   * Present results are descriptor-safe plain data with bounded `id` and
+   * `name`, `created: false`, and optional safe plain-data fields. Destructive
+   * consumers reconstruct the required fields and discard extras.
+   */
   getDatabase(databaseId: string): Promise<DatabaseReference | undefined>;
   ensureDatabase(
     spec: DeploymentSpec,
@@ -858,6 +2035,16 @@ export interface ProvisioningBackend {
     migrations: readonly D1Migration[],
     fence: ExternalMutationFence,
   ): Promise<void>;
+  /**
+   * Advances one bounded, read-only attachment scan chunk.
+   *
+   * It must use the same provider authority as this backend's teardown
+   * mutations, never perform an unbounded fallback, and return no durable
+   * absence or deletion authority.
+   */
+  advanceDecommissionAttachmentScan?(
+    input: DecommissionAttachmentScanInput,
+  ): Promise<DecommissionAttachmentScanResult>;
   findApplicationR2Bucket?(
     resource: ApplicationR2Binding,
   ): Promise<ApplicationR2BucketSnapshot | undefined>;
@@ -991,8 +2178,39 @@ export interface ProvisioningBackend {
     database: DatabaseReference,
     fence: ExternalMutationFence,
   ): Promise<void>;
+  /**
+   * Checks deployment-owned D1 deletion residuals without enumerating the
+   * account-wide Worker attachment inventory.
+   *
+   * This retains deployment identity, route, release, inventory, control
+   * Worker, Durable Object, and initial/final lease checks. It is read-only and
+   * is not durable absence or deletion authority.
+   */
+  assertDatabaseDeletionResidualsRemoved?(
+    spec: DeploymentSpec,
+    record: FleetRecord,
+    database: DatabaseReference,
+    fence: ExternalMutationFence,
+  ): Promise<void>;
   exportDatabase(
     database: DatabaseReference,
+    fence: ExternalMutationFence,
+  ): Promise<DatabaseExport>;
+  /**
+   * Canonical receipt storage authority. Present together with
+   * `exportDatabaseReceipt`, absent together when unsupported, and immutable
+   * for every retry of one receipt identity.
+   */
+  readonly databaseExportReceiptAuthority?: string;
+  /**
+   * Exports one operation-scoped receipt. The lower store consumes the body
+   * while its eager source-integrity promise settles, exact retries converge,
+   * and identity or byte collisions are preserved and refused. The result must
+   * be descriptor-safe plain data; bounded destructive consumers reconstruct
+   * the required export fields and discard safe extras.
+   */
+  exportDatabaseReceipt?(
+    identity: DatabaseExportReceiptIdentity,
     fence: ExternalMutationFence,
   ): Promise<DatabaseExport>;
   deleteDatabase(

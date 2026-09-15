@@ -55,6 +55,7 @@ import type {
   ScheduleUpdate,
 } from '@mastra/core/storage';
 import { computeNextFireAt, validateCron } from '@mastra/core/workflows';
+import { captureActorContext } from '../approval-api/actor-context.js';
 import {
   type ActorContext,
   ActorResolutionError,
@@ -64,12 +65,18 @@ import {
   RUN_START_ROLES,
 } from '../approval-api/index.js';
 import {
+  InvalidMutationEpochError,
+  type MutationEpochContext,
+  MutationEpochMismatchError,
+} from '../do-runner/execution-admission.js';
+import {
   admitsWorkAuthoring,
   type ExecutionFenceWiring,
   executionFencedResponse,
   isExecutionFenceRefusal,
   readExecutionFence,
 } from '../do-runner/index.js';
+import { hostErrorText } from '../host-kit/host-approval-service.js';
 import {
   type BoundThreadTargetValidator,
   RunRouteError,
@@ -84,6 +91,12 @@ import {
   positiveSafeInteger,
 } from '../numeric-config.js';
 import {
+  FENCED_SCHEDULE_STORAGE,
+  type FencedScheduleMutationCapability,
+  ScheduleMutationConflictError,
+  ScheduleMutationOutcomeUnknownError,
+} from './mutation-contract.js';
+import {
   type AuthorizedSchedule,
   type ScheduleTargetPolicy,
   scheduleCreatorRole,
@@ -93,15 +106,24 @@ import { isReservedScheduleContextKey } from './tick.js';
 
 /** The storage subset the facade reads/writes (a subset of D1SchedulesStorage). */
 export interface ScheduleFacadeStore {
+  readonly [FENCED_SCHEDULE_STORAGE]?: FencedScheduleMutationCapability;
   createOwnedSchedule(
     schedule: AuthorizedSchedule,
     owner: ResourceOwner,
     maxSchedules: number,
+    context?: MutationEpochContext,
   ): Promise<Schedule | null>;
   getSchedule(id: string): Promise<Schedule | null>;
   listSchedules(filter?: ScheduleFilter): Promise<Schedule[]>;
-  updateSchedule(id: string, patch: ScheduleUpdate): Promise<Schedule>;
-  deleteOwnedSchedule(id: string): Promise<'deleted' | 'pending'>;
+  updateSchedule(
+    id: string,
+    patch: ScheduleUpdate,
+    context?: MutationEpochContext,
+  ): Promise<Schedule>;
+  deleteOwnedSchedule(
+    id: string,
+    context?: MutationEpochContext,
+  ): Promise<'deleted' | 'pending'>;
   listTriggers(
     scheduleId: string,
     opts?: ScheduleTriggerListOptions,
@@ -147,11 +169,7 @@ export interface ScheduleRouterOptions {
   targetPolicy: ScheduleTargetPolicy;
   /** Prove fixed-thread agent targets are durable bound memory. */
   validateThreadTarget: BoundThreadTargetValidator;
-  /**
-   * Who may create/update/delete/pause/resume. Default RUN_START_ROLES
-   * (operator/admin) — reviewers/viewers cannot author schedules. Reads (get/
-   * list/triggers) are not role-gated beyond ownership.
-   */
+  /** Roles allowed to mutate schedules. Defaults to RUN_START_ROLES. */
   roles?: readonly ApprovalRole[];
   /** Every mutation (and denied read) is audited through this. Absent ⇒ no audit. */
   audit?: ScheduleRouteAuditSink;
@@ -175,17 +193,10 @@ export interface ScheduleRouterOptions {
    */
   maxContentBytes?: number;
   /**
-   * The deployment execution fence, or `'none'` for a router with no database
-   * behind it. REQUIRED: a router receives a store facade and a resolver, not a
-   * database, so it cannot build one for itself the way `init({ DB })` can —
-   * which leaves the host as the only place the wiring can happen, and an
-   * option a host may omit is one a host will omit. See ExecutionFenceWiring
-   * for the split-brain this closes (an unfenced surface next to a fenced
-   * runtime consumes work it then cannot run).
-   *
-   * The gate itself is the runtime's refusal made earlier: an operator draining
-   * a deployment sees a schedule create refused at the API instead of accepted
-   * and then never fired.
+   * The early state gate. A configured fence requires the store's same-binding
+   * mutation capability before epoch activation can race a waiting request.
+   * `'none'` supports method-only custom facades; an advertised capability still
+   * applies its storage-level mutation guards.
    */
   executionFence: ExecutionFenceWiring;
   /** Route prefix. Default '/api/schedules'. */
@@ -695,21 +706,79 @@ function buildCreateRow(
   };
 }
 
-/**
- * The operations the execution fence blocks past `open`: every one of them
- * ARMS a future fire. `pause` and `delete` are deliberately absent — they take
- * work away, which is what a drain wants — and so are the three reads.
- */
 const FENCE_GATED_SCHEDULE_OPERATIONS = new Set<ScheduleOperation>([
   'create',
   'update',
   'resume',
 ]);
 
+function captureScheduleMutations(
+  store: ScheduleFacadeStore,
+  executionFence: ExecutionFenceWiring,
+): FencedScheduleMutationCapability | undefined {
+  const capability = store[FENCED_SCHEDULE_STORAGE];
+  if (capability === undefined) {
+    if (executionFence !== 'none') {
+      throw new Error('fenced schedule storage capability is unavailable');
+    }
+    return undefined;
+  }
+  if (
+    capability === null ||
+    typeof capability !== 'object' ||
+    Array.isArray(capability)
+  ) {
+    throw new Error('schedule mutation capability is malformed');
+  }
+  const {
+    database,
+    createOwnedSchedule,
+    updateSchedule,
+    pauseSchedule,
+    resumeSchedule,
+    deleteOwnedSchedule,
+    observeScheduleMutation,
+  } = capability;
+  if (
+    !database ||
+    typeof database !== 'object' ||
+    Array.isArray(database) ||
+    typeof database.prepare !== 'function' ||
+    typeof database.batch !== 'function' ||
+    typeof createOwnedSchedule !== 'function' ||
+    typeof updateSchedule !== 'function' ||
+    typeof pauseSchedule !== 'function' ||
+    typeof resumeSchedule !== 'function' ||
+    typeof deleteOwnedSchedule !== 'function' ||
+    typeof observeScheduleMutation !== 'function'
+  ) {
+    throw new Error('schedule mutation capability is malformed');
+  }
+  if (executionFence !== 'none' && !executionFence.usesDatabase(database)) {
+    throw new Error('schedule storage binding disagrees with execution fence');
+  }
+  return {
+    database,
+    createOwnedSchedule: createOwnedSchedule.bind(capability),
+    updateSchedule: updateSchedule.bind(capability),
+    pauseSchedule: pauseSchedule.bind(capability),
+    resumeSchedule: resumeSchedule.bind(capability),
+    deleteOwnedSchedule: deleteOwnedSchedule.bind(capability),
+    observeScheduleMutation: observeScheduleMutation.bind(capability),
+  };
+}
+
 export function createScheduleRouter(
   options: ScheduleRouterOptions,
 ): ScheduleRouter {
-  const { executionFence, resolve, store, targetPolicy } = options;
+  const {
+    executionFence,
+    resolve,
+    store,
+    targetPolicy,
+    audit: auditSink,
+  } = options;
+  const mutations = captureScheduleMutations(store, executionFence);
   const roles = options.roles ?? RUN_START_ROLES;
   const maxSchedules = nonnegativeSafeInteger(
     options.maxSchedules ?? 100,
@@ -762,45 +831,57 @@ export function createScheduleRouter(
     // no-ops while it is — so a pre-auth failure never writes the log (an
     // unauthenticated flood cannot spam the audit sink).
     let context: ActorContext | undefined;
+    const reportError = (
+      type: 'schedule.route-audit-error' | 'schedule.route-mutation-error',
+      error: unknown,
+    ): void => {
+      try {
+        console.error(
+          JSON.stringify({
+            type,
+            operation,
+            ...(id !== undefined ? { scheduleId: id } : {}),
+            reason: hostErrorText(error, true),
+          }),
+          error,
+        );
+      } catch {
+        // Diagnostics cannot change the request's selected outcome.
+      }
+    };
     const audit = async (
       outcome: 'accepted' | 'rejected',
       reason?: string,
     ): Promise<void> => {
-      if (!options.audit || !context) return;
+      if (!auditSink || !context) return;
       // A benign read is not audited; only its denial is.
       if (!isMutation && outcome === 'accepted') return;
-      await options.audit({
-        type: 'schedule.route',
-        ...(context.deploymentTag !== undefined
-          ? { deploymentTag: context.deploymentTag }
-          : {}),
-        actorId: context.actor.id,
-        operation,
-        ...(id !== undefined ? { scheduleId: id } : {}),
-        outcome,
-        ...(reason !== undefined ? { reason } : {}),
-        timestamp: new Date().toISOString(),
-      });
-    };
-    const auditCommittedMutation = async (): Promise<void> => {
       try {
-        await audit('accepted');
+        await auditSink.call(options, {
+          type: 'schedule.route',
+          ...(context.deploymentTag !== undefined
+            ? { deploymentTag: context.deploymentTag }
+            : {}),
+          actorId: context.actor.id,
+          operation,
+          ...(id !== undefined ? { scheduleId: id } : {}),
+          outcome,
+          ...(reason !== undefined ? { reason } : {}),
+          timestamp: new Date().toISOString(),
+        });
       } catch (error) {
-        console.error(
-          JSON.stringify({
-            type: 'schedule.route-audit-error',
-            operation,
-            ...(id !== undefined ? { scheduleId: id } : {}),
-            reason: error instanceof Error ? error.message : String(error),
-          }),
-        );
+        reportError('schedule.route-audit-error', error);
       }
     };
 
     try {
       // 1. Resolve.
-      context = await resolve(request);
-      if (!context) return json({ error: 'authentication required' }, 401);
+      const resolved = await resolve(request);
+      if (!resolved) return json({ error: 'authentication required' }, 401);
+      context = captureActorContext(resolved);
+      const mutation: MutationEpochContext = Object.freeze({
+        mutationEpoch: context.mutationEpoch,
+      });
 
       // CREATE has no resource to resolve yet, so its coarse role gate comes
       // immediately after authentication.
@@ -882,11 +963,18 @@ export function createScheduleRouter(
           options.validateThreadTarget,
         );
         const row = scheduleWithCreatorRole(built.value, context.actor.role);
-        const created = await store.createOwnedSchedule(
-          row,
-          context.resourceOwner,
-          maxSchedules,
-        );
+        const created = mutations
+          ? await mutations.createOwnedSchedule(
+              row,
+              context.resourceOwner,
+              maxSchedules,
+              mutation,
+            )
+          : await store.createOwnedSchedule(
+              row,
+              context.resourceOwner,
+              maxSchedules,
+            );
         if (!created) {
           await audit('rejected', 'schedule-count-cap');
           return json(
@@ -894,7 +982,7 @@ export function createScheduleRouter(
             400,
           );
         }
-        await auditCommittedMutation();
+        await audit('accepted');
         return json({ schedule: toView(created) }, 201);
       }
 
@@ -925,14 +1013,28 @@ export function createScheduleRouter(
       }
 
       if (operation === 'delete') {
-        const outcome = await store.deleteOwnedSchedule(scheduleId);
-        await auditCommittedMutation();
+        const outcome = mutations
+          ? await mutations.deleteOwnedSchedule(scheduleId, mutation)
+          : await store.deleteOwnedSchedule(scheduleId);
+        await audit('accepted');
         return outcome === 'pending'
           ? json({ ok: true, pending: true }, 202)
           : json({ ok: true });
       }
 
-      const existing = await store.getSchedule(scheduleId);
+      let existing = await store.getSchedule(scheduleId);
+      if (
+        existing &&
+        mutations &&
+        ((operation === 'pause' && existing.status === 'paused') ||
+          (operation === 'resume' && existing.status === 'active'))
+      ) {
+        existing = await mutations.observeScheduleMutation(
+          scheduleId,
+          operation,
+          mutation,
+        );
+      }
       if (!existing) {
         await audit('rejected', 'not-found');
         return json({ error: 'not found' }, 404);
@@ -944,19 +1046,19 @@ export function createScheduleRouter(
 
       if (operation === 'pause') {
         if (existing.status === 'paused') {
-          await auditCommittedMutation();
+          await audit('accepted');
           return json({ schedule: toView(existing) });
         }
-        const updated = await store.updateSchedule(scheduleId, {
-          status: 'paused',
-        });
-        await auditCommittedMutation();
+        const updated = mutations
+          ? await mutations.pauseSchedule(scheduleId, mutation)
+          : await store.updateSchedule(scheduleId, { status: 'paused' });
+        await audit('accepted');
         return json({ schedule: toView(updated) });
       }
 
       if (operation === 'resume') {
         if (existing.status === 'active') {
-          await auditCommittedMutation();
+          await audit('accepted');
           return json({ schedule: toView(existing) });
         }
         // Re-activating recomputes nextFireAt from now (core's resume semantics).
@@ -973,11 +1075,21 @@ export function createScheduleRouter(
           return json({ error: nextFire.error.message }, nextFire.error.status);
         }
         const nextFireAt = nextFire.value;
-        const updated = await store.updateSchedule(scheduleId, {
-          status: 'active',
-          nextFireAt,
-        });
-        await auditCommittedMutation();
+        const updated = mutations
+          ? await mutations.resumeSchedule(
+              scheduleId,
+              {
+                expectedCron: existing.cron,
+                expectedTimezone: existing.timezone,
+                nextFireAt,
+              },
+              mutation,
+            )
+          : await store.updateSchedule(scheduleId, {
+              status: 'active',
+              nextFireAt,
+            });
+        await audit('accepted');
         return json({ schedule: toView(updated) });
       }
 
@@ -1028,8 +1140,10 @@ export function createScheduleRouter(
           options.validateThreadTarget,
         );
       }
-      const updated = await store.updateSchedule(scheduleId, patch.value);
-      await auditCommittedMutation();
+      const updated = mutations
+        ? await mutations.updateSchedule(scheduleId, patch.value, mutation)
+        : await store.updateSchedule(scheduleId, patch.value);
+      await audit('accepted');
       return json({ schedule: toView(updated) });
     } catch (error) {
       // A fence that could not be READ is not evidence the deployment is open,
@@ -1037,7 +1151,32 @@ export function createScheduleRouter(
       // generic 500 below — an operator must be able to tell a deployment
       // that is being migrated from one that is broken.
       if (isExecutionFenceRefusal(error)) {
-        await audit('rejected', 'execution-fence-unreadable');
+        await audit(
+          'rejected',
+          error.reason.code === 'EXECUTION_FENCED'
+            ? 'execution-fenced'
+            : 'execution-fence-unreadable',
+        );
+        return json(
+          { error: error.message, reason: error.reason },
+          error.status,
+        );
+      }
+      if (
+        error instanceof InvalidMutationEpochError ||
+        error instanceof MutationEpochMismatchError ||
+        error instanceof ScheduleMutationConflictError ||
+        error instanceof ScheduleMutationOutcomeUnknownError
+      ) {
+        if (error instanceof ScheduleMutationOutcomeUnknownError) {
+          reportError('schedule.route-mutation-error', error);
+        }
+        await audit(
+          'rejected',
+          'classification' in error.reason
+            ? `${error.reason.code}:${error.reason.classification}`
+            : error.reason.code,
+        );
         return json(
           { error: error.message, reason: error.reason },
           error.status,

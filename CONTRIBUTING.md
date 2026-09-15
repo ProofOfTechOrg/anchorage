@@ -35,7 +35,9 @@ git clone https://github.com/ProofOfTechOrg/anchorage.git
 cd anchorage
 ```
 
-The verification list below mirrors the CI `verify` job in order:
+The verification list below mirrors the CI `verify-core` job in order;
+`pnpm test` also covers the direct scenario project that CI runs in its own
+`direct-scenario` job:
 
 ```bash
 pnpm install --frozen-lockfile
@@ -69,6 +71,7 @@ directory when a `.github/**/*.{yml,yaml}` file is staged (lint-staged);
 pre-push runs react-doctor on the branch's changed files
 (`pnpm react-doctor:diff`; bypass with `git push --no-verify`). CI also runs a
 non-blocking compatibility probe against the newest `@mastra/core` 1.x release.
+A `verify` gate job requires both `verify-core` and `direct-scenario` to succeed.
 
 The showcase app uses mandatory absolute imports — `@/*` for `src`,
 `#worker/*` for worker modules, `@flowsafe/*` for deep flowsafe source
@@ -91,7 +94,8 @@ repository maintenance and docs-only changes do not need one.
 
 ## Releasing
 
-Versioning and publishing run through [changesets](.changeset/README.md), with
+Versioning and publishing run through
+[Changesets](https://github.com/changesets/changesets), with
 version bumps happening ON `dev` (bump-on-dev). Feature and fix PRs target the
 `dev` integration branch and include a changeset (`pnpm exec changeset` — pick
 the packages, a semver bump, and write the CHANGELOG entry) when they change
@@ -129,3 +133,14 @@ tier.
 Anchorage is an independent implementation built ON Mastra. Contributions must
 not fork or modify Mastra source code, wrap Mastra Enterprise features to
 bypass their licensing, or copy any third-party proprietary implementation.
+
+The single permitted exception is
+`packages/flowsafe/patches/@mastra__core@1.53.0.patch`, which changes the
+published `@mastra/core@1.53.0` runtime chunks so that `summarizeNotifications`
+counts sources in a null-prototype object and the delivery policy's `sources`
+lookup reads own properties only (mastra-ai/mastra#23693, #23694). It is applied
+through pnpm `patchedDependencies` and leaves the shipped source maps untouched.
+It is removed when a `@mastra/core` release carrying the upstream fix is
+adopted, following the procedure in the
+[maintainer guide's Mastra compatibility section](docs/maintainer-guide.md#mastra-compatibility).
+No other Mastra modification is permitted.

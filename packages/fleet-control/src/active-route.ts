@@ -65,6 +65,93 @@ export class ActiveRouteAttestationError extends Error {
   }
 }
 
+export type ProviderDeployment =
+  | Readonly<{
+      versions?: readonly Readonly<{
+        percentage?: unknown;
+        version_id?: unknown;
+      }>[];
+    }>
+  | undefined;
+
+export function exactActiveVersionId(
+  deployment: ProviderDeployment,
+  context: string,
+): string {
+  if (!deployment || !Array.isArray(deployment.versions)) {
+    throw new Error(`${context} has no current deployment`);
+  }
+  for (const version of deployment.versions) {
+    if (
+      typeof version.percentage !== 'number' ||
+      !Number.isFinite(version.percentage) ||
+      version.percentage < 0 ||
+      version.percentage > 100 ||
+      typeof version.version_id !== 'string' ||
+      version.version_id.length === 0
+    ) {
+      throw new Error(`${context} has malformed version traffic metadata`);
+    }
+  }
+  const onlyVersion = deployment.versions[0];
+  if (
+    deployment.versions.length !== 1 ||
+    onlyVersion?.percentage !== 100 ||
+    typeof onlyVersion.version_id !== 'string'
+  ) {
+    throw new Error(
+      `${context} must have exactly one current version receiving 100% of traffic`,
+    );
+  }
+  return onlyVersion.version_id;
+}
+
+/**
+ * The traffic split as the provider reported it, for a refusal to carry. Only
+ * well-formed entries survive: a malformed one is exactly what
+ * `exactActiveVersionId` already refused over, and inventing a shape for it
+ * would put a fabricated percentage into an operator-facing error.
+ */
+function observedTrafficSplit(
+  deployment: ProviderDeployment,
+): readonly Readonly<{ artifactVersion: string; percentage: number }>[] {
+  return (deployment?.versions ?? []).flatMap((version) =>
+    typeof version.version_id === 'string' &&
+    typeof version.percentage === 'number' &&
+    Number.isFinite(version.percentage)
+      ? [
+          {
+            artifactVersion: version.version_id,
+            percentage: version.percentage,
+          },
+        ]
+      : [],
+  );
+}
+
+/**
+ * `exactActiveVersionId` with its refusal restated as an attestation refusal
+ * carrying the split. The rule is unchanged and deliberately not relaxed: one
+ * version at 100% or nothing, never the version with the largest share.
+ */
+export function attestedActiveVersionId(
+  deployment: ProviderDeployment,
+  scriptName: string,
+): string {
+  try {
+    return exactActiveVersionId(deployment, `ordinary Worker '${scriptName}'`);
+  } catch (cause) {
+    throw new ActiveRouteAttestationError(
+      cause instanceof Error ? cause.message : String(cause),
+      {
+        routedScriptName: scriptName,
+        trafficSplit: observedTrafficSplit(deployment),
+      },
+      { cause },
+    );
+  }
+}
+
 /** The release identity a caller believes should be serving traffic. */
 export interface ActiveRouteExpectation {
   readonly specDigest: string;

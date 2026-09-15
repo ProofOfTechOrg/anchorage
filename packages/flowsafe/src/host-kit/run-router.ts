@@ -1,28 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-// HTTP surface for the run catalog + run lifecycle, shared by every host.
-//
-// Mirrors createApprovalRouter's contract — plain fetch routing, an injected
-// `authenticate`, and `null` for paths outside its ownership so a host Worker
-// can compose it after the approval router. (Its two paths are fixed rather
-// than configurable: unlike the approval surface, a host mounts exactly one run
-// surface.) What it owns that the hosts used to triplicate is the route-specific
-// AUTHORIZATION order:
-//
-//   start:   authenticate -> coarse role -> workflow role -> host policy
-//   resume:    authenticate -> catalog -> ownership -> coarse role -> workflow
-//              role -> host policy
-//   terminate: authenticate -> catalog -> ownership -> coarse role -> workflow
-//              role
-//
-// and the suspension bridge: a start that suspends queues its approval
-// attributed to the STARTING actor, so that actor cannot later decide their own
-// run (separation of duties).
-//
-// The resume route deliberately carries NO grants. A forged `resumeData.approved`
-// can flip a workflow boolean, but capability comes only from the server-derived
-// grant the runtime mints per leg (approval-api/grants.ts), so a side-effecting
-// step re-checks and fails closed. Approve through the queue, not this route.
+// Connector approval comes from stored decisions, not client resume data.
 
+import { captureActorContext } from '../approval-api/actor-context.js';
 import {
   type ActorContext,
   ActorResolutionError,
@@ -33,23 +12,30 @@ import {
   RUN_START_ROLES,
 } from '../approval-api/index.js';
 import {
+  assertNoReservedExecutionContext,
+  ReservedExecutionContextError,
+} from '../do-runner/execution-context.js';
+import {
   beginIdempotentStart,
   DoStatusError,
   type ExecutionFenceWiring,
   InvalidRunRequestError,
+  type PersistedStartResult,
   RunAlreadyExistsError,
   RunLifecycleBlockedError,
   RunNotSuspendedError,
   type RunSummary,
   RunTerminalConflictError,
   requireStartIdempotency,
-  rollbackFencedStart,
+  StartIdempotencyUnsupportedError,
   type StartIdempotencyWiring,
   type StartReservation,
+  type StartReservationReading,
   UnknownRunError,
   UnknownWorkflowError,
 } from '../do-runner/index.js';
 import { readBoundedBody } from '../http-body.js';
+import { internalErrorResponse } from '../internal-error-response.js';
 import { queueApprovalForSuspension } from './approval-bridge.js';
 import { requireResourceAccess } from './resource-access.js';
 import { RunRouteError } from './run-route-error.js';
@@ -121,6 +107,7 @@ export interface RunRouterOptions {
     context: ActorContext,
     workflowId: string,
     inputData: unknown,
+    requestContext: Record<string, unknown> | undefined,
   ) => Promise<void>;
   /** Host policy that must pass immediately before a validated raw resume. */
   beforeResume?: (
@@ -174,6 +161,10 @@ export type RunRouterStartIdempotency =
        * runtime's own `isRunActive`.
        */
       live: (workflowId: string, runId: string) => Promise<boolean>;
+      persistedStart: (
+        workflowId: string,
+        runId: string,
+      ) => Promise<PersistedStartResult<RunSummary> | undefined>;
       /**
        * The deployment execution fence, so a REPLAY can re-assert a proof-only
        * fence's binding to the run this key already made.
@@ -192,9 +183,12 @@ export type RunRouterStartIdempotency =
     };
 
 export interface RunStartInput {
+  readonly startReservation?: StartReservationReading;
+  readonly mutationEpoch?: number;
   workflowId: string;
   runId: string;
   inputData: unknown;
+  requestContext?: Record<string, unknown>;
   /** Full trusted identity stamped onto the target Durable Object request. */
   principal: ExecutionPrincipal;
   /** Present only for a target-verifiable schedule fire. */
@@ -217,6 +211,7 @@ interface StartBody {
   workflowId?: string;
   runId?: string;
   inputData?: unknown;
+  requestContext?: Record<string, unknown>;
   deadlineMs?: unknown;
   /**
    * A caller-chosen key that makes this start exactly-once for this caller.
@@ -244,6 +239,9 @@ function json(payload: unknown, status = 200): Response {
 }
 
 function errorResponse(error: unknown): Response {
+  if (error instanceof ReservedExecutionContextError) {
+    return json({ error: error.message, reason: 'reserved-context-key' }, 400);
+  }
   if (error instanceof RunRouteError) {
     return json(
       {
@@ -277,11 +275,6 @@ function errorResponse(error: unknown): Response {
   if (error instanceof InvalidRunRequestError) {
     return json({ error: error.message }, 400);
   }
-  // Every refusal this package authors on the taxonomy's own base renders with
-  // its declared status and reason — the reservation family among them. Placed
-  // LAST so the named branches above keep their exact shapes, and typed against
-  // the base rather than against each reservation class so a refusal added
-  // later cannot arrive here as an anonymous 500.
   if (error instanceof DoStatusError) {
     const { status } = error;
     if (Number.isInteger(status) && status >= 400 && status <= 599) {
@@ -294,10 +287,7 @@ function errorResponse(error: unknown): Response {
       );
     }
   }
-  return json(
-    { error: error instanceof Error ? error.message : String(error) },
-    500,
-  );
+  return internalErrorResponse('runs', error);
 }
 
 const MAX_RUN_BODY_BYTES = 1_048_576;
@@ -347,18 +337,16 @@ interface IdempotentStartResult {
 async function startIdempotently(
   options: RunRouterOptions,
   context: ActorContext,
+  principal: ExecutionPrincipal,
+  mutationEpoch: number | undefined,
   workflowId: string,
   body: StartBody,
   rawKey: unknown,
 ): Promise<IdempotentStartResult> {
   const wiring = options.startIdempotency;
-  // `requireStartIdempotency` turns the opt-out into the published refusal. A
-  // key on an unwired host is never ignored: honouring it silently would be an
-  // exactly-once promise this deployment cannot keep.
-  const store = requireStartIdempotency(
-    wiring === 'none' ? 'none' : wiring.store,
-  );
-  const live = wiring === 'none' ? undefined : wiring.live;
+  if (wiring === 'none') throw new StartIdempotencyUnsupportedError();
+  const store = requireStartIdempotency(wiring.store);
+  const live = wiring.live;
   const decision = await beginIdempotentStart<RunSummary>(
     store,
     {
@@ -367,8 +355,8 @@ async function startIdempotently(
       // the check as whatever the JSON parser actually produced.
       key: rawKey,
       owner: {
-        kind: context.principal.kind,
-        id: context.principal.id,
+        kind: principal.kind,
+        id: principal.id,
       },
       targetKind: 'workflow',
       targetId: workflowId,
@@ -376,38 +364,35 @@ async function startIdempotently(
     },
     {
       persisted: async (reservation: StartReservation) =>
-        options.status(workflowId, reservation.runId),
+        wiring.persistedStart(workflowId, reservation.runId),
       live: async (reservation: StartReservation) =>
-        live ? live(workflowId, reservation.runId) : false,
+        live(workflowId, reservation.runId),
     },
-    wiring === 'none' ? undefined : wiring.executionFence,
+    wiring.executionFence,
+    mutationEpoch,
   );
   if (decision.kind === 'replay') {
     return { summary: decision.persisted, replayed: true };
   }
   const { runId, key } = decision.reservation;
-  try {
-    return {
-      summary: await options.start({
-        workflowId,
-        runId,
-        inputData: body.inputData,
-        principal: context.principal,
-        idempotencyKey: key,
-        ...(body.deadlineMs === undefined
-          ? {}
-          : { deadlineMs: body.deadlineMs as number }),
-      }),
-      replayed: false,
-    };
-  } catch (error) {
-    // Only a fence refusal gives the claim back — see rollbackFencedStart. A
-    // deployment that closed its fence between the claim and the start executed
-    // nothing, so holding the claim would turn an operator's drain into a
-    // permanently poisoned key; anything else may have executed, and giving the
-    // claim back there would hand the next retry a second run.
-    return rollbackFencedStart(store, key, runId, error);
-  }
+  return {
+    summary: await options.start({
+      workflowId,
+      runId,
+      inputData: body.inputData,
+      ...(body.requestContext === undefined
+        ? {}
+        : { requestContext: body.requestContext }),
+      principal,
+      mutationEpoch,
+      idempotencyKey: key,
+      startReservation: decision.reservation,
+      ...(body.deadlineMs === undefined
+        ? {}
+        : { deadlineMs: body.deadlineMs as number }),
+    }),
+    replayed: false,
+  };
 }
 
 export function createRunRouter(options: RunRouterOptions): RunRouter {
@@ -425,8 +410,14 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
     if (url.pathname !== '/workflows' && segments[0] !== 'runs') return null;
 
     try {
-      const context = await resolve(request);
-      if (!context) return json({ error: 'authentication required' }, 401);
+      const resolved = await resolve(request);
+      if (!resolved) return json({ error: 'authentication required' }, 401);
+      const context =
+        request.method === 'POST' &&
+        segments[0] === 'runs' &&
+        segments.length === 1
+          ? captureActorContext(resolved)
+          : resolved;
       const actor = context.actor;
 
       if (request.method === 'GET' && url.pathname === '/workflows') {
@@ -458,8 +449,40 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
         if (!RUN_START_ROLES.includes(actor.role)) {
           return json({ error: 'forbidden' }, 403);
         }
-        const body = (await readJson(request)) as StartBody | null;
-        if (!body || typeof body.workflowId !== 'string') {
+        const { principal, mutationEpoch } = context;
+        const parsed = (await readJson(request)) as StartBody | null;
+        if (!parsed) return json({ error: 'workflowId is required' }, 400);
+        const forbidden = [
+          'startReservation',
+          'mutationEpoch',
+          'startIdentity',
+          'agentStart',
+          'execution',
+          'tablePrefix',
+          'startToken',
+          'attemptToken',
+          'runOwnerGuard',
+          'onPreparedStartIdentity',
+        ].find((field) => Object.hasOwn(parsed, field));
+        if (forbidden !== undefined) {
+          return json({ error: `field '${forbidden}' is not allowed` }, 400);
+        }
+        const {
+          workflowId: startTarget,
+          idempotencyKey,
+          deadlineMs,
+          inputData,
+          requestContext,
+          runId: suppliedRunId,
+        } = parsed;
+        const body: StartBody = {
+          workflowId: startTarget,
+          idempotencyKey,
+          deadlineMs,
+          inputData,
+          runId: suppliedRunId,
+        };
+        if (typeof startTarget !== 'string') {
           return json({ error: 'workflowId is required' }, 400);
         }
         // A client may never choose the runId. 400 (not silent override) so a
@@ -467,9 +490,9 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
         if (body.runId !== undefined) {
           return json({ error: 'runId is server-assigned' }, 400);
         }
-        const meta = metaFor(body.workflowId);
+        const meta = metaFor(startTarget);
         if (!meta) {
-          return json({ error: `unknown workflow '${body.workflowId}'` }, 404);
+          return json({ error: `unknown workflow '${startTarget}'` }, 404);
         }
         // Per-workflow RBAC: a workflow may restrict who can START it — a finer
         // gate than the coarse "can start any run" check above.
@@ -477,16 +500,32 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
         if (allowedRoles && !allowedRoles.includes(actor.role)) {
           return json(
             {
-              error: `role '${actor.role}' may not start '${body.workflowId}'`,
+              error: `role '${actor.role}' may not start '${startTarget}'`,
             },
             403,
           );
         }
-        await options.beforeStart?.(context, body.workflowId, body.inputData);
-        const startTarget = body.workflowId;
-        // Unkeyed starts take the path they always took: mint, start, answer.
-        // Keyed starts route through the reservation, which decides whether
-        // this request starts a run or reports one that already exists.
+        if (requestContext !== undefined) {
+          if (
+            typeof requestContext !== 'object' ||
+            requestContext === null ||
+            Array.isArray(requestContext)
+          ) {
+            throw new RunRouteError(
+              400,
+              'requestContext must be an object',
+              'reserved-context-key',
+            );
+          }
+          assertNoReservedExecutionContext(requestContext);
+        }
+        body.requestContext = requestContext;
+        await options.beforeStart?.(
+          context,
+          startTarget,
+          inputData,
+          requestContext,
+        );
         const { summary, replayed } =
           body.idempotencyKey === undefined
             ? {
@@ -494,7 +533,11 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
                   workflowId: startTarget,
                   runId: context.newRunId(),
                   inputData: body.inputData,
-                  principal: context.principal,
+                  ...(body.requestContext === undefined
+                    ? {}
+                    : { requestContext: body.requestContext }),
+                  principal,
+                  mutationEpoch,
                   ...(body.deadlineMs === undefined
                     ? {}
                     : { deadlineMs: body.deadlineMs as number }),
@@ -504,6 +547,8 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
             : await startIdempotently(
                 options,
                 context,
+                principal,
+                mutationEpoch,
                 startTarget,
                 body,
                 body.idempotencyKey,
@@ -539,7 +584,7 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
         try {
           approvals = await queueApprovalForSuspension(
             context.service(),
-            body.workflowId,
+            startTarget,
             summary,
             actor.id,
             systemPrincipalId,
@@ -548,7 +593,7 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
           console.error(
             JSON.stringify({
               type: 'approval-filing-error',
-              workflowId: body.workflowId,
+              workflowId: startTarget,
               runId: summary.runId,
               error: error instanceof Error ? error.message : String(error),
             }),

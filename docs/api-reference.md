@@ -44,10 +44,12 @@ New host-side and React features remain subpath-only so importing the root does 
 | `@proofoftech/flowsafe/artifacts` | R2 artifact store and in-memory bucket |
 | `@proofoftech/flowsafe/audit-export` | Queue producer sink and NDJSON SIEM consumer |
 | `@proofoftech/flowsafe/do-runner` | Runtime, Durable Object classes, D1 storage, deployment sentinel and caller attestation, identity helpers, pub/sub, retention, run summaries, execution fence, start reservations, and drain inventory |
+| `@proofoftech/flowsafe/do-runner/constants` | Deadline values, duration validation, and timeout detection without the runner graph |
+| `@proofoftech/flowsafe/do-runner/testing` | Timeout resume fixtures for workflow tests |
 | `@proofoftech/flowsafe/goals` | Objective HTTP router and goal request-context contract |
 | `@proofoftech/flowsafe/host-kit` | Authenticator and verifier seams, run/thread/hub/provider topologies, routes, approval bridges, tickets, composed Worker, and execution-fence and inventory admin routes |
 | `@proofoftech/flowsafe/host-kit/module` | Workflow-module interface for import-safe host registration |
-| `@proofoftech/flowsafe/schedules` | D1 schedule domain, deployment router, reserved-context guard, and CAS tick |
+| `@proofoftech/flowsafe/schedules` | D1 schedule domain, atomic mutation capability and outcomes, deployment router, reserved-context guard, and CAS tick |
 | `@proofoftech/flowsafe/signal-providers` | Provider adapters, host Durable Object, topology, subscriptions, verified webhooks, and GitHub provider |
 | `@proofoftech/flowsafe/signals` | D1 signal domains, thread routes, canonical content-policy seam, ingress router, notification dispatch, and client |
 | `@proofoftech/flowsafe/signals/client` | DOM-free `SignalClient` without host-side signal code |
@@ -68,11 +70,17 @@ The migration and idempotency surfaces are grouped by subpath:
 
 | Surface | Main exports |
 | --- | --- |
-| Provisioning | `provisionDeployment`, `cleanupDeploymentArtifacts`, `decommissionDeployment`, `forceDecommissionDeployment`, `ProvisionDeploymentOptions`, `ProvisioningBackend`, `PlainWorkerRouteApi`, and `SeedDeploymentIdentityOptions` |
+| Provisioning | `provisionDeployment`, `cleanupDeploymentArtifacts`, `advanceDecommissionDeployment`, `advanceBackendSwitchDecommission`, `decommissionDeployment`, `forceDecommissionDeployment`, `ProvisionDeploymentOptions`, `AdvanceDecommissionDeploymentOptions`, `AdvanceBackendSwitchDecommissionOptions`, `DecommissionAdvanceAction`, `DecommissionAdvanceResult`, `ProvisioningBackend`, `PlainWorkerProvisioningApi`, `PlainWorkerCleanupOutcome`, `PlainWorkerDatabaseExportResult`, `PlainWorkerDatabaseInventoryEntry`, `PlainWorkerDeploymentStatus`, `PlainWorkerMutationOutcome`, `PlainWorkerUploadIntent`, `PlainWorkerUploadIntentBase`, `PlainWorkerUploadOutcome`, `PlainWorkerVersionBinding`, `PlainWorkerVersionDetail`, `PlainWorkerVersionSummary`, `PlainWorkerRouteApi`, and `SeedDeploymentIdentityOptions` |
 | Fleet lifecycle | `migrateFleet`, `rollbackExternalRelease`, `auditFleetDrift`, `fleetVersionReport`, `FleetRecord`, and `D1FleetStateStore` |
 | Active-route attestation | `attestFleetRecordActiveRoute`, `attestConvergedActiveRoute`, `ActiveRouteAttestation`, `ActiveRouteAttestationError`, `ActiveRouteExpectation`, `AttestConvergedActiveRouteOptions`, and `ObservedActiveRoute` |
 | Settlement | `fleetSettlementKey`, `FleetSettlementContext`, `FleetSettlementEntry`, and `FleetSettlementHost` |
-| Backends and provider client | `WranglerLoopBackend`, `WorkersForPlatformsBackend`, `CloudflareProvisioningClient`, `D1CloudflareApiRateCoordinator`, and `ProcessLocalCloudflareApiRateCoordinator` |
+| Backends and provider client | `PlainWorkerBackend`, `PlainWorkerBackendOptions`, `CloudflareApiPlainWorkerBackend`, `CloudflareApiPlainWorkerBackendOptions`, `WranglerLoopBackend`, `WorkersForPlatformsBackend`, `CloudflareProvisioningClient`, `CloudflareClientOptions`, `PlainWorkerCloudflareClientOptions`, `CloudflarePlaneCapabilityError`, `D1CloudflareApiRateCoordinator`, and `ProcessLocalCloudflareApiRateCoordinator` |
+
+## fleet-control Worker library
+
+`@proofoftech/fleet-control/cloudflare-control-plane` is a library for a dedicated trusted Cloudflare control-plane Worker. Start with `createCloudflareControlPlane` and `CloudflareControlPlaneOptions`; the returned `CloudflareControlPlane` coordinates ordinary-Worker deployments through durable Fleet state. See the [Fleet Control guide](fleet-control.md) for deployment ownership and authorization.
+
+The subpath also exposes `D1FleetStateDatabase`, `D1CloudflareApiRateCoordinator`, and `R2DatabaseExportStore`. Its declarations require `@cloudflare/workers-types >=5.20260730.1 <6`. The `workers/*` entries remain deployable platform Workers.
 
 ## Browser and server boundaries
 

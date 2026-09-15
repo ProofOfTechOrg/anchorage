@@ -4,15 +4,33 @@ import { describe, expect, it, vi } from 'vitest';
 import { ActiveRouteAttestationError } from '../src/active-route.js';
 import {
   CloudflareProvisioningClient,
+  cloudflareFleetInventoryContext,
   type DurableDatabaseExportStore,
   dispatchMigrations,
 } from '../src/cloudflare-client.js';
-import { ProcessLocalCloudflareApiRateCoordinator } from '../src/cloudflare-rate-coordinator.js';
+import {
+  canonicalFleetInventoryRunOptions,
+  initialFleetInventoryProgress,
+  materializeFleetInventoryGeneration,
+} from '../src/fleet-inventory-state.js';
 import { canonicalDeploymentEgressPolicy } from '../src/platform-resources.js';
 import type {
   DeploymentSpec,
   ExternalPlatformResources,
 } from '../src/types.js';
+import {
+  envelope,
+  fenced,
+  pageArray,
+  testRateCoordinator,
+  zoneAuthorityResponse,
+} from './fixtures/cloudflare-fetch-fixture.js';
+import {
+  DRAIN_BASELINE_INVENTORY,
+  DRAIN_BASELINE_REQUESTS,
+} from './fixtures/fleet-inventory-drain-baseline.js';
+import { runFleetInventoryDrain } from './fixtures/fleet-inventory-drain-world.js';
+import { errorChain } from './fixtures/plain-worker-harnesses.js';
 
 function deployment(overrides: Partial<DeploymentSpec> = {}): DeploymentSpec {
   return {
@@ -40,89 +58,284 @@ function deployment(overrides: Partial<DeploymentSpec> = {}): DeploymentSpec {
   };
 }
 
-function envelope(result: unknown): Response {
-  return Response.json({
-    success: true,
-    errors: [],
-    messages: [],
-    result,
-    result_info: {
-      page: 1,
-      per_page: 20,
-      count: Array.isArray(result) ? result.length : 1,
-      total_count: Array.isArray(result) ? result.length : 1,
-      total_pages: 1,
-    },
-  });
-}
-
-function zoneAuthorityResponse(
-  url: URL,
-  zoneIds: readonly string[],
-): Response | undefined {
-  if (url.pathname.endsWith('/user/tokens/verify')) {
-    return envelope({ id: 'token-id', status: 'active' });
-  }
-  if (url.pathname.endsWith('/accounts/account/tokens/token-id')) {
-    return envelope({
-      id: 'token-id',
-      status: 'active',
-      policies: [
-        {
-          id: 'zone-authority',
-          effect: 'allow',
-          permission_groups: [
-            { id: 'zone-read', name: 'Zone Read' },
-            { id: 'routes-read', name: 'Workers Routes Read' },
-            { id: 'routes-write', name: 'Workers Routes Write' },
-          ],
-          resources: {
-            'com.cloudflare.api.account.account': {
-              'com.cloudflare.api.account.zone.*': '*',
-            },
+describe('CloudflareProvisioningClient', () => {
+  it.each([
+    [403, 10003, true],
+    [403, 10004, false],
+    [403, undefined, false],
+    [500, 10003, false],
+  ] as const)('classifies R2 listing HTTP %i code %s as unavailable=%s', async (status, code, unavailable) => {
+    const client = new CloudflareProvisioningClient({
+      plane: 'plain-worker',
+      accountId: 'account',
+      apiToken: 'inert',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (input, init) => {
+        const request = new Request(input, init);
+        expect(new URL(request.url).pathname).toBe(
+          '/client/v4/accounts/account/r2/buckets',
+        );
+        expect(request.headers.get('cf-r2-jurisdiction')).toBe('fedramp');
+        return Response.json(
+          {
+            success: false,
+            errors:
+              code === undefined ? [] : [{ code, message: 'Access Denied' }],
+            messages: [],
+            result: null,
           },
+          { status },
+        );
+      },
+    });
+    const options = canonicalFleetInventoryRunOptions({
+      databaseNamePrefix: 'fleet-',
+      scriptNamePrefix: 'fleet-',
+      includeR2Buckets: true,
+    });
+    const stage = { step: 'r2-buckets', jurisdictionOrdinal: 2 } as const;
+    const result = fenced(client, () =>
+      cloudflareFleetInventoryContext(client).advanceStage({
+        stage,
+        options,
+        progress: initialFleetInventoryProgress(stage, 1),
+        maxProviderRequests: 9,
+      }),
+    );
+    if (unavailable) {
+      const inventory = materializeFleetInventoryGeneration({
+        ...(await result),
+        options,
+      });
+      expect(inventory.unavailableR2Jurisdictions).toEqual(['fedramp']);
+      expect(Object.isFrozen(inventory.unavailableR2Jurisdictions)).toBe(true);
+    } else {
+      await expect(result).rejects.toMatchObject({ status });
+    }
+  });
+
+  it.each([
+    'reserved',
+    'duplicate',
+  ] as const)('refuses %s module part names before an upload', async (kind) => {
+    let requests = 0;
+    const client = new CloudflareProvisioningClient({
+      plane: 'plain-worker',
+      accountId: 'account',
+      apiToken: 'inert',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async () => {
+        requests++;
+        return envelope({ etag: 'unexpected' });
+      },
+    });
+    const names =
+      kind === 'reserved' ? ['metadata'] : ['worker.js', 'worker.js'];
+    await expect(
+      fenced(client, () =>
+        client.uploadControlWorker({
+          scriptName: 'parts',
+          mainModule: names[0] ?? '',
+          modules: names.map((name) => ({
+            name,
+            content: 'export default {}',
+          })),
+          compatibilityDate: '2026-08-06',
+          bindings: [],
+        }),
+      ),
+    ).rejects.toThrow('duplicated or reserved');
+    expect(requests).toBe(0);
+  });
+
+  it('keeps upload module names separate from SDK routing parameters', async () => {
+    const observations: unknown[] = [];
+    const client = new CloudflareProvisioningClient({
+      plane: 'plain-worker',
+      accountId: 'account',
+      apiToken: 'inert',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (input, init) => {
+        const request = new Request(input, init);
+        if (request.url === 'data:,') return new Response('');
+        const form = await request.formData(),
+          module = form.get('account_id');
+        observations.push({
+          path: new URL(request.url).pathname,
+          metadata: JSON.parse(String(form.get('metadata'))),
+          module:
+            module && typeof module !== 'string' ? await module.text() : null,
+        });
+        return envelope({ etag: 'uploaded' });
+      },
+    });
+    await fenced(client, () =>
+      client.uploadControlWorker({
+        scriptName: 'parts',
+        mainModule: 'account_id',
+        modules: [{ name: 'account_id', content: 'export default {}' }],
+        compatibilityDate: '2026-08-06',
+        bindings: [],
+      }),
+    );
+    expect(observations).toEqual([
+      expect.objectContaining({
+        path: '/client/v4/accounts/account/workers/scripts/parts',
+        metadata: expect.objectContaining({ main_module: 'account_id' }),
+        module: 'export default {}',
+      }),
+    ]);
+  });
+
+  it.each([
+    'control',
+    'dispatch',
+    'catalog',
+    'state',
+  ] as const)('encodes %s uploads as native multipart with one JSON metadata part', async (kind) => {
+    const wasm = new Uint8Array([
+      0, 97, 115, 109, 1, 0, 0, 0, 0, 6, 0, 255, 128, 0, 195, 169,
+    ]);
+    const spec = deployment({
+      authoredBy: 'platform',
+      modules: [
+        { name: 'worker.js', content: 'export default {}' },
+        {
+          name: 'fixture.wasm',
+          content: wasm,
+          contentType: 'application/wasm',
         },
       ],
     });
-  }
-  if (url.pathname.endsWith('/zones')) {
-    expect(url.searchParams.get('account.id')).toBe('account');
-    if (url.searchParams.has('page')) return envelope([]);
-    return envelope(zoneIds.map((id) => ({ id, account: { id: 'account' } })));
-  }
-  return undefined;
-}
+    const observations: unknown[] = [];
+    const publicKey =
+      '{"kty":"OKP","crv":"Ed25519","alg":"EdDSA","kid":"fleet-maintenance-v1","x":"Lhp1XFeTJJx8FLOCKpn4nkO-tWuZZxXX8ziw0LEvUZo"}';
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'inert',
+      dispatchNamespace: 'fleet',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (input, init) => {
+        const request = new Request(input, init);
+        if (request.url === 'data:,') return new Response('');
+        if (
+          request.method === 'GET' &&
+          new URL(request.url).pathname.endsWith(
+            '/workers/dispatch/namespaces/fleet',
+          )
+        )
+          return envelope({
+            namespace_name: 'fleet',
+            trusted_workers: false,
+            script_count: 0,
+          });
+        expect(request.method).toBe('PUT');
+        let form: FormData | undefined;
+        try {
+          form = await request.formData();
+        } catch {
+          /* The assertions retain malformed wire metadata. */
+        }
+        const metadata = form?.get('metadata');
+        if (kind === 'catalog') {
+          expect(JSON.parse(String(metadata)).bindings).toEqual(
+            expect.arrayContaining([
+              {
+                name: 'FLEET_MAINTENANCE_CAPABILITIES',
+                type: 'plain_text',
+                text: 'required',
+              },
+              {
+                name: 'FLEET_MAINTENANCE_CAPABILITY_PUBLIC_KEY',
+                type: 'plain_text',
+                text: publicKey,
+              },
+              {
+                name: 'FLEET_DEPLOYMENT_SCRIPT',
+                type: 'plain_text',
+                text: spec.scriptName,
+              },
+              {
+                name: 'FLEET_RESOURCE_ROLE',
+                type: 'plain_text',
+                text: 'platform-catalog',
+              },
+            ]),
+          );
+        }
+        const file = [...(form?.values() ?? [])].find(
+          (value) => typeof value !== 'string' && value.name === 'fixture.wasm',
+        );
+        observations.push({
+          multipart: /^multipart\/form-data;\s*boundary=/u.test(
+            request.headers.get('content-type') ?? '',
+          ),
+          rawMetadataPart:
+            init?.body instanceof FormData &&
+            typeof init.body.get('metadata') === 'string',
+          entryPart: form?.has('worker.js') ?? false,
+          auxiliaryPart: form?.has('fixture.wasm') ?? false,
+          mainModule:
+            typeof metadata === 'string'
+              ? JSON.parse(metadata).main_module
+              : undefined,
+          wasm:
+            typeof file === 'object'
+              ? [...new Uint8Array(await file.arrayBuffer())]
+              : undefined,
+        });
+        return envelope({ etag: 'uploaded-version' });
+      },
+    });
+    await fenced(client, async () => {
+      if (kind === 'control')
+        await client.uploadControlWorker({
+          scriptName: spec.scriptName,
+          mainModule: spec.mainModule,
+          modules: spec.modules,
+          compatibilityDate: spec.compatibilityDate,
+          bindings: [],
+        });
+      else if (kind === 'dispatch' || kind === 'catalog')
+        await client.uploadDispatchWorker(
+          spec,
+          {
+            id: 'db-acme',
+            name: spec.databaseName,
+            created: false,
+          },
+          spec.scriptName,
+          undefined,
+          undefined,
+          kind === 'catalog' ? publicKey : undefined,
+        );
+      else
+        await client.uploadNamespacedStateWorker({
+          spec,
+          database: { id: 'db-acme', name: spec.databaseName, created: false },
+          artifact: {
+            mainModule: spec.mainModule,
+            modules: spec.modules,
+            compatibilityDate: spec.compatibilityDate,
+          },
+          artifactDigest: 'a'.repeat(64),
+          maintenanceCapabilityPublicKey: 'inert-public-key',
+          sharedOutboundWorkerName: 'fixture-outbound',
+          stateEgressCredentialDigest: 'b'.repeat(64),
+        });
+    });
+    expect(observations).toEqual([
+      {
+        multipart: true,
+        rawMetadataPart: true,
+        entryPart: true,
+        auxiliaryPart: true,
+        mainModule: 'worker.js',
+        wasm: [...wasm],
+      },
+    ]);
+  });
 
-function fenced<T>(
-  client: CloudflareProvisioningClient,
-  operation: () => Promise<T>,
-): Promise<T> {
-  return client.withMutationFence(
-    {
-      mutationLeaseTtlMs: 15 * 60_000,
-      assertOwned: async () => {},
-    },
-    operation,
-  );
-}
-
-function testRateCoordinator(
-  intervalCap?: number,
-): ProcessLocalCloudflareApiRateCoordinator {
-  return new ProcessLocalCloudflareApiRateCoordinator(intervalCap);
-}
-
-function errorChain(error: unknown): string {
-  const messages: string[] = [];
-  let current = error;
-  while (current instanceof Error) {
-    messages.push(current.message);
-    current = current.cause;
-  }
-  return messages.join(' | ');
-}
-
-describe('CloudflareProvisioningClient', () => {
   it('fails closed for unfenced writes and request timeouts outside the lease TTL', async () => {
     let providerWrites = 0;
     const client = new CloudflareProvisioningClient({
@@ -810,7 +1023,7 @@ describe('CloudflareProvisioningClient', () => {
     }
   });
 
-  it('downloads an export into durable storage and records integrity', async () => {
+  it('downloads an identity export into durable storage and records integrity', async () => {
     const bytes = new TextEncoder().encode('CREATE TABLE durable(id TEXT);');
     const stored: Uint8Array[] = [];
     const exportStore: DurableDatabaseExportStore = {
@@ -829,24 +1042,32 @@ describe('CloudflareProvisioningClient', () => {
         };
       },
     };
-    const request = vi.fn(async (input: string | URL | Request) => {
-      const url = new URL(
-        typeof input === 'string'
-          ? input
-          : input instanceof URL
-            ? input.href
-            : input.url,
-      );
-      if (url.hostname === 'download.example.test') {
-        return new Response(bytes, {
-          headers: { 'content-length': String(bytes.byteLength) },
+    const request = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const url = new URL(
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url,
+        );
+        if (url.hostname === 'download.example.test') {
+          expect(new Request(input, init).headers.get('accept-encoding')).toBe(
+            'identity',
+          );
+          return new Response(bytes, {
+            headers: { 'content-length': String(bytes.byteLength) },
+          });
+        }
+        expect(new Request(input, init).headers.has('accept-encoding')).toBe(
+          false,
+        );
+        return envelope({
+          status: 'complete',
+          result: { signed_url: 'https://download.example.test/export.sql' },
         });
-      }
-      return envelope({
-        status: 'complete',
-        result: { signed_url: 'https://download.example.test/export.sql' },
-      });
-    });
+      },
+    );
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
@@ -1205,6 +1426,9 @@ describe('CloudflareProvisioningClient', () => {
         return envelope([
           { id: 'ns-wfp', script: 'fleet-wfp' },
           { id: 'ns-plain', script: 'fleet-plain' },
+          { id: 'Z', script: 'other' },
+          { id: 'z', script: 'other' },
+          { id: 'é', script: 'other' },
         ]);
       }
       throw new Error(`unexpected Cloudflare request: ${url.href}`);
@@ -1288,6 +1512,150 @@ describe('CloudflareProvisioningClient', () => {
     await expect(client.hasDurableObjectNamespace('ns-absent')).resolves.toBe(
       false,
     );
+    const namespaceRequestCount = () =>
+      request.mock.calls.filter(([input]) => {
+        const url = new URL(
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url,
+        );
+        return url.pathname.endsWith('/workers/durable_objects/namespaces');
+      }).length;
+    let priorNamespaceRequests = namespaceRequestCount();
+    await expect(client.existingDurableObjectNamespaceIds([])).resolves.toEqual(
+      [],
+    );
+    expect(namespaceRequestCount()).toBe(priorNamespaceRequests);
+    await expect(
+      client.existingDurableObjectNamespaceIds([
+        'ns-plain',
+        'missing',
+        'ns-wfp',
+        'ns-plain',
+        'é',
+        'z',
+        'Z',
+      ]),
+    ).resolves.toEqual(['Z', 'ns-plain', 'ns-wfp', 'z', 'é']);
+    const namespaceTraversalRequests =
+      namespaceRequestCount() - priorNamespaceRequests;
+    expect(namespaceTraversalRequests).toBeGreaterThan(0);
+    priorNamespaceRequests = namespaceRequestCount();
+    const maximumIds = Array.from(
+      { length: 10_000 },
+      (_, index) => `namespace-${index}`,
+    );
+    maximumIds[0] = 'ns-wfp';
+    await expect(
+      client.existingDurableObjectNamespaceIds(maximumIds),
+    ).resolves.toEqual(['ns-wfp']);
+    expect(namespaceRequestCount()).toBe(
+      priorNamespaceRequests + namespaceTraversalRequests,
+    );
+    priorNamespaceRequests = namespaceRequestCount();
+    const maximumUtf8Id = 'é'.repeat(2_048);
+    await expect(
+      client.existingDurableObjectNamespaceIds([maximumUtf8Id]),
+    ).resolves.toEqual([]);
+    expect(namespaceRequestCount()).toBe(
+      priorNamespaceRequests + namespaceTraversalRequests,
+    );
+    priorNamespaceRequests = namespaceRequestCount();
+
+    let accessorReads = 0;
+    const accessorArray = ['safe'];
+    Object.defineProperty(accessorArray, '0', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        accessorReads += 1;
+        return 'unsafe';
+      },
+    });
+    const symbolArray = ['safe'];
+    Object.assign(symbolArray, { [Symbol('extra')]: true });
+    const extraArray = Object.assign(['safe'], { extra: true });
+    const holeArray = new Array<string>(1);
+    const nonArrayPrototype = ['safe'];
+    Object.setPrototypeOf(nonArrayPrototype, null);
+    const indexNotWritable = ['safe'];
+    Object.defineProperty(indexNotWritable, '0', { writable: false });
+    const indexNotEnumerable = ['safe'];
+    Object.defineProperty(indexNotEnumerable, '0', { enumerable: false });
+    const indexNotConfigurable = ['safe'];
+    Object.defineProperty(indexNotConfigurable, '0', { configurable: false });
+    const lengthNotWritable = ['safe'];
+    Object.defineProperty(lengthNotWritable, 'length', { writable: false });
+    const transparentProxy = new Proxy(['safe'], {});
+    const revoked = Proxy.revocable(['safe'], {});
+    revoked.revoke();
+    const malformedRows: readonly (readonly [string, unknown])[] = [
+      ['nonarray', { 0: 'safe', length: 1 }],
+      ['hole', holeArray],
+      ['accessor', accessorArray],
+      ['symbol', symbolArray],
+      ['extra string', extraArray],
+      ['non-Array prototype', nonArrayPrototype],
+      ['nonwritable index', indexNotWritable],
+      ['nonenumerable index', indexNotEnumerable],
+      ['nonconfigurable index', indexNotConfigurable],
+      ['nonwritable length', lengthNotWritable],
+      ['transparent proxy', transparentProxy],
+      ['revoked proxy', revoked.proxy],
+      ['empty id', ['']],
+      ['non-string id', [1]],
+      ['overlong UTF-8 id', [`${maximumUtf8Id}a`]],
+      [
+        '10,001 distinct ids',
+        Array.from({ length: 10_001 }, (_, index) => `id-${index}`),
+      ],
+      ['10,001 duplicate ids', Array.from({ length: 10_001 }, () => 'same')],
+    ];
+    for (const [label, value] of malformedRows) {
+      let error: unknown;
+      try {
+        await client.existingDurableObjectNamespaceIds(value as never);
+      } catch (caught) {
+        error = caught;
+      }
+      expect({ label, error: (error as Error | undefined)?.message }).toEqual({
+        label,
+        error: 'Durable Object namespace ID inventory is malformed',
+      });
+      expect(namespaceRequestCount(), label).toBe(priorNamespaceRequests);
+    }
+    expect(accessorReads).toBe(0);
+
+    const iteratorFailure = new Error('namespace iterator failed after match');
+    let iteratorPage = 0;
+    const iteratorClient = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
+      dispatchNamespace: 'fleet',
+      fetch: async () => {
+        iteratorPage += 1;
+        if (iteratorPage === 1) {
+          return pageArray([{ id: 'ns-wfp', script: 'fleet-wfp' }], {
+            page: 1,
+            per_page: 1,
+            count: 1,
+            total_count: 2,
+            total_pages: 2,
+          });
+        }
+        throw iteratorFailure;
+      },
+    });
+    const iteratorRejection = await iteratorClient
+      .existingDurableObjectNamespaceIds(['ns-wfp'])
+      .catch((error: unknown) => error);
+    expect((iteratorRejection as Error & { cause?: unknown }).cause).toBe(
+      iteratorFailure,
+    );
+    expect(iteratorPage).toBeGreaterThan(1);
     expect(inventory.findings.map((finding) => finding.kind)).toEqual(
       expect.arrayContaining([
         'malformed-script-registration',
@@ -1800,28 +2168,186 @@ describe('CloudflareProvisioningClient', () => {
       'dispatch-upload',
     ]);
     expect(requestUrl?.pathname).toContain('/acme-physical-candidate');
-    const entries = [...(uploadBody?.entries() ?? [])].map(
-      ([name, value]) => [name, String(value)] as const,
-    );
-    expect(entries).toEqual(
+    const metadata = JSON.parse(String(uploadBody?.get('metadata')));
+    expect(metadata.bindings).toEqual(
       expect.arrayContaining([
-        ['metadata[bindings][][name]', 'MAINTENANCE'],
-        ['metadata[bindings][][type]', 'durable_object_namespace'],
-        ['metadata[bindings][][class_name]', 'Maintenance'],
-        ['metadata[bindings][][script_name]', 'fleet-maintenance-host'],
-        ['metadata[bindings][][dispatch_namespace]', 'fleet'],
-        ['metadata[bindings][][name]', 'AUDIT_PROXY'],
-        ['metadata[bindings][][class_name]', 'FlowsafeFleetAuditProxy'],
-        ['metadata[bindings][][name]', 'FLEET_SPEC_DIGEST'],
-        ['metadata[bindings][][name]', 'FLEET_MAINTENANCE_CAPABILITIES'],
-        ['metadata[tags][]', 'fleet:anchorage'],
+        {
+          name: 'MAINTENANCE',
+          type: 'durable_object_namespace',
+          class_name: 'Maintenance',
+          script_name: 'fleet-maintenance-host',
+          dispatch_namespace: 'fleet',
+        },
+        expect.objectContaining({
+          name: 'AUDIT_PROXY',
+          class_name: 'FlowsafeFleetAuditProxy',
+        }),
+        expect.objectContaining({ name: 'FLEET_SPEC_DIGEST' }),
+        expect.objectContaining({ name: 'FLEET_MAINTENANCE_CAPABILITIES' }),
       ]),
     );
-    expect(entries).not.toEqual(
-      expect.arrayContaining([['metadata[bindings][][name]', 'EGRESS_PROXY']]),
+    expect(metadata.tags).toContain('fleet:anchorage');
+    expect(metadata.bindings).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: 'EGRESS_PROXY' }),
+      ]),
     );
-    expect(entries).not.toEqual(
-      expect.arrayContaining([['metadata[bindings][][type]', 'service']]),
+    expect(metadata.bindings).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ type: 'service' })]),
+    );
+  });
+
+  it.each([
+    200, 404, 401, 400,
+  ])('verifies the account token family first when it returns HTTP %i', async (status) => {
+    const calls: string[] = [];
+    const request = vi.fn(
+      async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        const url = new URL(new Request(input, init).url);
+        calls.push(url.pathname);
+        if (
+          url.pathname.endsWith('/accounts/account/tokens/verify') &&
+          status !== 200
+        ) {
+          return Response.json(
+            {
+              success: false,
+              errors: [{ code: 1000, message: 'token verification refused' }],
+            },
+            { status },
+          );
+        }
+        if (url.pathname.endsWith('/user/tokens/token-id')) {
+          return zoneAuthorityResponse(
+            new URL(
+              'https://api.cloudflare.com/client/v4/accounts/account/tokens/token-id',
+            ),
+            [],
+          ) as Response;
+        }
+        const authority = zoneAuthorityResponse(url, []);
+        if (authority) return authority;
+        if (url.pathname.endsWith('/workers/scripts'))
+          return pageArray([{ id: 'plain' }]);
+        if (url.pathname.endsWith('/workers/domains')) return pageArray([]);
+        if (url.pathname.endsWith('/subdomain'))
+          return envelope({ enabled: false, previews_enabled: false });
+        throw new Error(`unexpected request: ${url.pathname}`);
+      },
+    );
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'inert',
+      plane: 'plain-worker',
+      rateCoordinator: testRateCoordinator(),
+      fetch: request,
+    });
+    const pending = client.inspectOrdinaryWorkerFootprint('plain');
+    if (status === 400) {
+      await expect(pending).rejects.toMatchObject({ status: 400 });
+    } else {
+      await expect(pending).resolves.toMatchObject({
+        workersDevEnabled: false,
+      });
+    }
+    expect(calls.filter((path) => path.endsWith('/tokens/verify'))).toEqual([
+      '/client/v4/accounts/account/tokens/verify',
+      ...([401, 404].includes(status) ? ['/client/v4/user/tokens/verify'] : []),
+    ]);
+    if (status === 200 || status === 400) {
+      expect(calls.some((path) => path.includes('/user/'))).toBe(false);
+    }
+    if ([401, 404].includes(status)) {
+      expect(calls.filter((path) => path.endsWith('/tokens/token-id'))).toEqual(
+        ['/client/v4/user/tokens/token-id'],
+      );
+    }
+  });
+
+  it('discovers zone routes with a type-less zone query and skips zones outside the four supported kinds', async () => {
+    const zones = [
+      'full',
+      'partial',
+      'secondary',
+      'internal',
+      'enterprise_zone_placeholder',
+    ].map((type) => ({ id: type, type }));
+    const requests: URL[] = [];
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'inert',
+      plane: 'plain-worker',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (input, init) => {
+        const url = new URL(new Request(input, init).url);
+        requests.push(url);
+        const authority = zoneAuthorityResponse(
+          url,
+          zones,
+          zones.map(({ id }) => ({
+            zoneId: id,
+            id: `route-${id}`,
+            pattern: `${id}.example.test/*`,
+            script: 'plain',
+          })),
+        );
+        if (authority) return authority;
+        if (url.pathname.endsWith('/workers/scripts'))
+          return pageArray([{ id: 'plain' }]);
+        if (url.pathname.endsWith('/workers/domains')) return pageArray([]);
+        if (url.pathname.endsWith('/subdomain'))
+          return envelope({ enabled: false, previews_enabled: false });
+        throw new Error(`unexpected request: ${url.pathname}`);
+      },
+    });
+    await expect(
+      client.inspectOrdinaryWorkerFootprint('plain'),
+    ).resolves.toMatchObject({
+      zoneRoutes: ['full', 'partial', 'secondary', 'internal'].map(
+        (zoneId) => ({
+          zoneId,
+          routeId: `route-${zoneId}`,
+          pattern: `${zoneId}.example.test/*`,
+        }),
+      ),
+    });
+    const zoneQueries = requests.filter((url) =>
+      url.pathname.endsWith('/zones'),
+    );
+    expect(zoneQueries.length).toBeGreaterThan(0);
+    for (const url of zoneQueries)
+      expect(url.searchParams.has('type')).toBe(false);
+    expect(
+      requests.some((url) =>
+        url.pathname.includes('/zones/enterprise_zone_placeholder/'),
+      ),
+    ).toBe(false);
+  });
+
+  it('refuses a zone discovery row without a string type', async () => {
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'inert',
+      plane: 'plain-worker',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (input, init) => {
+        const url = new URL(new Request(input, init).url);
+        if (url.pathname.endsWith('/zones'))
+          return envelope([{ id: 'zone', account: { id: 'account' } }]);
+        const authority = zoneAuthorityResponse(url, []);
+        if (authority) return authority;
+        if (url.pathname.endsWith('/workers/scripts'))
+          return pageArray([{ id: 'plain' }]);
+        if (url.pathname.endsWith('/workers/domains')) return pageArray([]);
+        if (url.pathname.endsWith('/subdomain'))
+          return envelope({ enabled: false, previews_enabled: false });
+        throw new Error(`unexpected request: ${url.pathname}`);
+      },
+    });
+    await expect(
+      client.inspectOrdinaryWorkerFootprint('plain'),
+    ).rejects.toThrow(
+      'Cloudflare account-wide zone discovery returned incomplete zone type metadata',
     );
   });
 
@@ -1837,7 +2363,7 @@ describe('CloudflareProvisioningClient', () => {
               : input.url,
         );
         calls.push(`${init?.method ?? 'GET'}:${url.pathname}`);
-        if (url.pathname.endsWith('/user/tokens/verify')) {
+        if (url.pathname.endsWith('/accounts/account/tokens/verify')) {
           return envelope({ id: 'token-id', status: 'active' });
         }
         if (url.pathname.endsWith('/accounts/account/tokens/token-id')) {
@@ -1875,7 +2401,7 @@ describe('CloudflareProvisioningClient', () => {
       client.disableControlWorkerPublicAccess('fleet-state'),
     ).rejects.toThrow(/every zone/);
     expect(calls).toEqual([
-      'GET:/client/v4/user/tokens/verify',
+      'GET:/client/v4/accounts/account/tokens/verify',
       'GET:/client/v4/accounts/account/tokens/token-id',
     ]);
   });
@@ -2124,12 +2650,9 @@ describe('CloudflareProvisioningClient', () => {
     )?.[1]?.body;
     expect(controlUpload).toBeInstanceOf(FormData);
     expect(
-      [...((controlUpload as FormData).entries() ?? [])].map(
-        ([name, value]) => [name, String(value)],
-      ),
-    ).toEqual(
-      expect.arrayContaining([['metadata[keep_bindings][]', 'secret_text']]),
-    );
+      JSON.parse(String((controlUpload as FormData).get('metadata')))
+        .keep_bindings,
+    ).toEqual(['secret_text']);
     await fenced(client, () =>
       client.disableControlWorkerPublicAccess('fleet-state'),
     );
@@ -2659,6 +3182,65 @@ describe('CloudflareProvisioningClient', () => {
     ).rejects.toThrow(/unidentified namespace/);
   });
 
+  it('refuses explicit null D1 result rows instead of reporting an empty query', async () => {
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'inert',
+      plane: 'plain-worker',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async () => envelope([{ success: true, results: null }]),
+    });
+    await expect(
+      client.queryDatabase('database-id', 'SELECT 1'),
+    ).rejects.toThrow();
+  });
+
+  it('refuses explicit null active-version bindings instead of reporting an absent digest', async () => {
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'inert',
+      plane: 'plain-worker',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (input, init) => {
+        const url = new URL(new Request(input, init).url);
+        if (url.pathname.endsWith('/deployments'))
+          return envelope({
+            deployments: [
+              { versions: [{ version_id: 'version', percentage: 100 }] },
+            ],
+          });
+        return envelope({ resources: { bindings: null } });
+      },
+    });
+    await expect(client.inspectActiveWorkerRoute('plain')).rejects.toThrow();
+  });
+
+  it('refuses explicit null R2 buckets instead of completing empty inventory', async () => {
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'inert',
+      plane: 'plain-worker',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async () => envelope({ buckets: null }),
+    });
+    const options = canonicalFleetInventoryRunOptions({
+      databaseNamePrefix: 'fleet-',
+      scriptNamePrefix: 'fleet-',
+      includeR2Buckets: true,
+    });
+    const stage = { step: 'r2-buckets', jurisdictionOrdinal: 0 } as const;
+    await expect(
+      fenced(client, () =>
+        cloudflareFleetInventoryContext(client).advanceStage({
+          stage,
+          options,
+          progress: initialFleetInventoryProgress(stage, 1),
+          maxProviderRequests: 9,
+        }),
+      ),
+    ).rejects.toThrow();
+  });
+
   it('forwards anonymous and numbered D1 parameters without rewriting SQL text', async () => {
     const bodies: unknown[] = [];
     const client = new CloudflareProvisioningClient({
@@ -2895,6 +3477,13 @@ describe('CloudflareProvisioningClient', () => {
     ).resolves.toBeUndefined();
     expect(versionReads).toBe(reads);
   });
+
+  it('drains the recorded world into the frozen golden inventory and request sequence', async () => {
+    const { requests, inventory } = await runFleetInventoryDrain();
+
+    expect(inventory).toEqual(DRAIN_BASELINE_INVENTORY);
+    expect(requests).toEqual(DRAIN_BASELINE_REQUESTS);
+  });
 });
 
 function activeRouteClient(
@@ -2934,3 +3523,491 @@ function activeRouteClient(
     },
   });
 }
+
+describe('inventory absence proofs', () => {
+  const readers = [
+    {
+      name: 'R2 emptiness',
+      path: '/client/v4/accounts/account/r2/buckets/bucket/objects',
+      read: (client: CloudflareProvisioningClient) =>
+        client.assertR2BucketEmpty({
+          name: 'DATA',
+          bucketName: 'bucket',
+          jurisdiction: 'default',
+        }),
+    },
+    {
+      name: 'namespace IDs',
+      path: '/client/v4/accounts/account/workers/durable_objects/namespaces',
+      read: (client: CloudflareProvisioningClient) =>
+        client.existingDurableObjectNamespaceIds(['target']),
+    },
+    {
+      name: 'namespace parent',
+      path: '/client/v4/accounts/account/workers/durable_objects/namespaces',
+      read: (client: CloudflareProvisioningClient) =>
+        client.listDurableObjectNamespaces('target-script'),
+    },
+  ];
+  function fixture(path: string, reply: (url: URL) => Response) {
+    const requests: URL[] = [];
+    const client = new CloudflareProvisioningClient({
+      plane: 'plain-worker',
+      accountId: 'account',
+      apiToken: 'inert',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (input, init) => {
+        const url = new URL(new Request(input, init).url);
+        expect(url.pathname).toBe(path);
+        requests.push(url);
+        return reply(url);
+      },
+    });
+    return { client, requests };
+  }
+  it.each([
+    {
+      label: 'null errors and messages',
+      info: { page: 1, per_page: 100, total_count: 1, total_pages: 1 },
+    },
+    { label: 'null errors and result_info', info: null },
+  ])('accepts $label in database inventory and returns its rows', async ({
+    info,
+  }) => {
+    const { client, requests } = fixture(
+      '/client/v4/accounts/account/d1/database',
+      (url) =>
+        url.searchParams.get('page') === '2'
+          ? envelope([])
+          : Response.json({
+              success: true,
+              errors: null,
+              messages: null,
+              result: [{ uuid: 'db', name: 'database' }],
+              result_info: info,
+            }),
+    );
+    await expect(client.listOrdinaryWorkerDatabases()).resolves.toEqual([
+      { databaseId: 'db', name: 'database' },
+    ]);
+    expect(requests).toHaveLength(2);
+  });
+  it('accepts null errors and result_info as a single empty database page', async () => {
+    const { client, requests } = fixture(
+      '/client/v4/accounts/account/d1/database',
+      () =>
+        Response.json({
+          success: true,
+          errors: null,
+          result: [],
+          result_info: null,
+        }),
+    );
+    await expect(client.listOrdinaryWorkerDatabases()).resolves.toEqual([]);
+    expect(requests).toHaveLength(1);
+  });
+  const malformed = [
+    { label: 'missing result', body: { success: true } },
+    { label: 'missing success', body: { result: [] } },
+    { label: 'failed success', body: { success: false, result: [] } },
+    { label: 'null result', body: { success: true, result: null } },
+    { label: 'false result', body: { success: true, result: false } },
+    { label: 'string result', body: { success: true, result: 'invalid' } },
+    {
+      label: 'error metadata',
+      body: {
+        success: true,
+        result: [],
+        errors: [{ code: 1000, message: 'x' }],
+      },
+    },
+    {
+      label: 'non-array non-null errors',
+      body: { success: true, result: [], errors: 'bad' },
+    },
+    {
+      label: 'non-object result_info',
+      body: { success: true, result: [], result_info: 'bad' },
+    },
+    {
+      label: 'continuing empty page',
+      body: { success: true, result: [], result_info: { cursor: 'next' } },
+    },
+    {
+      label: 'invalid cursor',
+      body: { success: true, result: [], result_info: { cursor: 1 } },
+    },
+    {
+      label: 'invalid page info',
+      body: { success: true, result: [], result_info: [] },
+    },
+  ];
+  it.each(
+    readers.flatMap((reader) =>
+      malformed.map((input) => ({ ...reader, ...input })),
+    ),
+  )('$name refuses $label', async ({ path, read, body }) => {
+    const { client } = fixture(path, (url) =>
+      Number(url.searchParams.get('page') ?? '1') > 1
+        ? envelope([])
+        : Response.json(body),
+    );
+    await expect(read(client)).rejects.toThrow();
+  });
+  it.each(
+    readers,
+  )('$name accepts a successful empty list and preserves permission failure', async ({
+    path,
+    read,
+    name,
+  }) => {
+    const empty = fixture(path, () => envelope([]));
+    expect(await read(empty.client)).toEqual(
+      name === 'R2 emptiness' ? undefined : [],
+    );
+    const denied = fixture(path, () =>
+      Response.json({ success: false, errors: [{ code: 1 }] }, { status: 403 }),
+    );
+    await expect(read(denied.client)).rejects.toMatchObject({ status: 403 });
+  });
+  it.each(
+    readers,
+  )('$name rejects non-JSON and partial success responses', async ({
+    path,
+    read,
+  }) => {
+    for (const response of [
+      new Response('{"success":true,"result":[]}', {
+        headers: { 'Content-Type': 'text/plain' },
+      }),
+      Response.json({ success: true, result: [] }, { status: 206 }),
+    ]) {
+      const { client } = fixture(path, () => response);
+      await expect(read(client)).rejects.toThrow();
+    }
+  });
+  it.each([
+    {},
+    { key: '' },
+    { key: null },
+    { key: 0 },
+    { key: 'present' },
+    null,
+  ])('R2 refuses a yielded row %#', async (row) => {
+    const reader = readers[0];
+    if (!reader) throw new Error('missing R2 reader');
+    const { client } = fixture(reader.path, () => envelope([row]));
+    await expect(reader.read(client)).rejects.toThrow();
+  });
+  it.each([
+    {},
+    { id: '' },
+    { id: null },
+    { id: 1 },
+  ])('namespace readers refuse incomplete IDs %#', async (row) => {
+    for (const reader of readers.slice(1)) {
+      const { client } = fixture(reader.path, (url) =>
+        Number(url.searchParams.get('page') ?? '1') > 1
+          ? envelope([])
+          : envelope([{ ...row, script: 'target-script' }]),
+      );
+      await expect(reader.read(client)).rejects.toThrow();
+    }
+  });
+  it.each([
+    undefined,
+    '',
+    null,
+    1,
+  ])('parent reader refuses incomplete association %#', async (script) => {
+    const reader = readers[2];
+    if (!reader) throw new Error('missing parent reader');
+    const { client } = fixture(reader.path, (url) =>
+      Number(url.searchParams.get('page') ?? '1') > 1
+        ? envelope([])
+        : envelope([{ id: 'target', script }]),
+    );
+    await expect(reader.read(client)).rejects.toThrow();
+  });
+  it('retains exact ID membership without requiring an unused parent association', async () => {
+    const reader = readers[1];
+    if (!reader) throw new Error('missing ID reader');
+    const { client } = fixture(reader.path, (url) =>
+      Number(url.searchParams.get('page') ?? '1') > 1
+        ? envelope([])
+        : envelope([{ id: 'target' }]),
+    );
+    expect(await reader.read(client)).toEqual(['target']);
+  });
+  it.each(readers.slice(1))('$name refuses a malformed later page', async ({
+    path,
+    read,
+  }) => {
+    const { client, requests } = fixture(path, (url) =>
+      Number(url.searchParams.get('page') ?? '1') === 1
+        ? envelope([{ id: 'other', script: 'other' }])
+        : Response.json({ success: true }),
+    );
+    await expect(read(client)).rejects.toThrow();
+    expect(requests).toHaveLength(2);
+  });
+  it.each(
+    readers
+      .slice(1)
+      .flatMap((reader) => [1, 2].map((gap) => ({ ...reader, gap }))),
+  )('$name refuses a numbered gap on page $gap', async ({
+    path,
+    read,
+    gap,
+  }) => {
+    const { client, requests } = fixture(path, (url) => {
+      const page = Number(url.searchParams.get('page') ?? '1');
+      const result =
+        page < gap
+          ? [{ id: 'other', script: 'other' }]
+          : page === gap
+            ? []
+            : [{ id: 'target', script: 'target-script' }];
+      return Response.json({
+        success: true,
+        result,
+        result_info: { page, per_page: 1, total_pages: gap + 1 },
+      });
+    });
+    await expect(read(client)).rejects.toThrow();
+    expect(requests).toHaveLength(gap);
+  });
+  it.each(readers.slice(1))('$name completes numbered pagination', async ({
+    path,
+    read,
+  }) => {
+    const { client, requests } = fixture(path, (url) => {
+      const page = Number(url.searchParams.get('page') ?? '1');
+      return Response.json({
+        success: true,
+        result:
+          page === 1
+            ? [{ id: 'other', script: 'other' }]
+            : page === 2
+              ? [{ id: 'target', script: 'target-script' }]
+              : [],
+        result_info: { page, per_page: 1, total_count: 2, total_pages: 2 },
+      });
+    });
+    expect(await read(client)).toEqual(['target']);
+    expect(
+      requests.map((url) => Number(url.searchParams.get('page') ?? '1')),
+    ).toEqual([1, 2, 3]);
+  });
+});
+
+describe('inventory proof consumers', () => {
+  it.each([
+    { name: 'target' },
+    { uuid: '', name: 'target' },
+    { uuid: 42, name: 'target' },
+    { uuid: 'database' },
+    { uuid: 'database', name: '' },
+    { uuid: 'database', name: 42 },
+  ])('D1 readers refuse incomplete identities %#', async (row) => {
+    for (const read of [
+      (client: CloudflareProvisioningClient) => client.findDatabase('target'),
+      (client: CloudflareProvisioningClient) =>
+        client.listOrdinaryWorkerDatabases({ name: 'target' }),
+    ]) {
+      const client = new CloudflareProvisioningClient({
+        plane: 'plain-worker',
+        accountId: 'account',
+        apiToken: 'inert',
+        rateCoordinator: testRateCoordinator(),
+        fetch: async (input, init) => {
+          const page = Number(
+            new URL(new Request(input, init).url).searchParams.get('page') ??
+              '1',
+          );
+          return envelope(page === 1 ? [row] : []);
+        },
+      });
+      await expect(read(client)).rejects.toThrow(/D1/);
+    }
+  });
+  it.each([
+    {},
+    { namespace_name: '' },
+    { namespace_name: 42 },
+  ])('refuses unknown namespace identity before creating %#', async (row) => {
+    const writes: string[] = [];
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'inert',
+      dispatchNamespace: 'fleet',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (input, init) => {
+        const request = new Request(input, init);
+        const url = new URL(request.url);
+        if (request.method !== 'GET') writes.push(request.method);
+        if (url.pathname.endsWith('/namespaces') && request.method === 'GET')
+          return envelope(
+            Number(url.searchParams.get('page') ?? '1') === 1 ? [row] : [],
+          );
+        return envelope({
+          namespace_name: 'fleet',
+          trusted_workers: false,
+          script_count: 0,
+        });
+      },
+    });
+    await expect(
+      fenced(client, () => client.ensureDispatchNamespace()),
+    ).rejects.toThrow(/namespace/);
+    expect(writes).toEqual([]);
+  });
+  const secretReaders = [
+    {
+      name: 'ordinary read',
+      run: (client: CloudflareProvisioningClient) =>
+        client.listOrdinaryWorkerSecretNames('worker'),
+    },
+    {
+      name: 'control revoke',
+      run: (client: CloudflareProvisioningClient) =>
+        client.revokeControlSecrets('worker'),
+    },
+    {
+      name: 'control convergence',
+      run: (client: CloudflareProvisioningClient) =>
+        client.putControlSecrets('worker', {}),
+    },
+    {
+      name: 'dispatch revoke',
+      run: (client: CloudflareProvisioningClient) =>
+        client.revokeDispatchSecrets('worker'),
+    },
+    {
+      name: 'dispatch convergence',
+      run: (client: CloudflareProvisioningClient) =>
+        client.putDispatchSecrets('worker', {
+          deploymentIdentity: 'identity',
+          maintenanceAdmin: 'maintenance',
+        }),
+    },
+  ];
+  it.each(
+    secretReaders.flatMap((reader) =>
+      [undefined, [{ name: 42 }], [{}]].map((result) => ({
+        ...reader,
+        result,
+      })),
+    ),
+  )('$name rejects incomplete secret inventory %#', async ({ run, result }) => {
+    const writes: string[] = [];
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'inert',
+      dispatchNamespace: 'fleet',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (input, init) => {
+        const request = new Request(input, init);
+        if (request.method !== 'GET') writes.push(request.method);
+        return Response.json({ success: true, result });
+      },
+    });
+    await expect(
+      fenced(client, async () => {
+        await run(client);
+      }),
+    ).rejects.toThrow();
+    expect(writes).toEqual([]);
+  });
+  it.each(
+    secretReaders.slice(1),
+  )('$name refuses incomplete post-mutation readback', async ({ run }) => {
+    let reads = 0;
+    let writes = 0;
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'inert',
+      dispatchNamespace: 'fleet',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (input, init) => {
+        const request = new Request(input, init);
+        if (request.method !== 'GET') {
+          writes++;
+          return envelope(null);
+        }
+        return ++reads === 1
+          ? envelope([{ name: 'OLD_SECRET' }])
+          : Response.json({ success: true });
+      },
+    });
+    await expect(
+      fenced(client, async () => {
+        await run(client);
+      }),
+    ).rejects.toThrow();
+    expect(writes).toBe(1);
+    expect(reads).toBe(2);
+  });
+  it.each([
+    '/workers/scripts',
+    '/workers/domains',
+    '/zones',
+    '/workers/routes',
+  ])('footprint refuses an incomplete %s listing', async (suffix) => {
+    const client = new CloudflareProvisioningClient({
+      plane: 'plain-worker',
+      accountId: 'account',
+      apiToken: 'inert',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (input, init) => {
+        const url = new URL(new Request(input, init).url);
+        if (url.pathname.endsWith(suffix))
+          return Response.json({ success: true });
+        return zoneAuthorityResponse(url, ['zone-1'], []) ?? envelope([]);
+      },
+    });
+    await expect(
+      client.inspectOrdinaryWorkerFootprint('worker'),
+    ).rejects.toThrow();
+  });
+  it.each([
+    undefined,
+    {},
+    { items: null },
+    [],
+  ])('version inventory refuses missing items %#', async (result) => {
+    const client = new CloudflareProvisioningClient({
+      plane: 'plain-worker',
+      accountId: 'account',
+      apiToken: 'inert',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async () => Response.json({ success: true, result }),
+    });
+    await expect(client.listOrdinaryWorkerVersions('worker')).rejects.toThrow();
+  });
+  it.each([
+    { suffix: '/workers/scripts', row: {} },
+    { suffix: '/workers/scripts', row: { id: 42 } },
+    { suffix: '/workers/domains', row: {} },
+    { suffix: '/workers/domains', row: { service: 42 } },
+    { suffix: '/workers/routes', row: { script: 42 } },
+  ])('footprint refuses missing identity or association %#', async ({
+    suffix,
+    row,
+  }) => {
+    const client = new CloudflareProvisioningClient({
+      plane: 'plain-worker',
+      accountId: 'account',
+      apiToken: 'inert',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (input, init) => {
+        const url = new URL(new Request(input, init).url);
+        if (url.pathname.endsWith(suffix)) return envelope([row]);
+        return zoneAuthorityResponse(url, ['zone-1'], []) ?? envelope([]);
+      },
+    });
+    await expect(
+      client.inspectOrdinaryWorkerFootprint('worker'),
+    ).rejects.toThrow();
+  });
+});

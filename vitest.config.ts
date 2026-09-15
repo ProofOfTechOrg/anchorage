@@ -7,6 +7,7 @@ export default defineConfig({
   test: {
     projects: [
       'packages/*/vitest.config.ts',
+      'packages/fleet-control/vitest.direct-scenario.config.ts',
       'vitest.*-workers.config.*',
       'vitest.flowsafe-harness.config.ts',
       'vitest.workerd-lifecycle.config.ts',

@@ -1,13 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-// One signal ingested through the FULL chain: createSignalRouter's ingestion
-// gate → real createThreadTopology → real ThreadDurableObject (its
-// stamped-principal assertion) → the production thread signal routes → a
-// runtime-driven reserve agent, with NO LLM. The unit suites
-// each mock a seam; this one wires the real seams together so the ingestion
-// boundary has one end-to-end proof, including the idle-wake run cap consulted
-// both allowing and capping, plus a foreign path-safe thread refusal.
+// The unit suites each mock a seam; this file wires the real seams together.
 
-import type { Agent } from '@mastra/core/agent';
+import type { Agent, AgentSignal } from '@mastra/core/agent';
+import type { NotificationRecord } from '@mastra/core/notifications';
 import { RequestContext } from '@mastra/core/request-context';
 import { InMemoryStore } from '@mastra/core/storage';
 import {
@@ -17,14 +12,28 @@ import {
   createContentPolicyGate,
   denyPatterns,
 } from '@proofoftech/breakwater';
-import { describe, expect, it, vi } from 'vitest';
+import { assert, describe, expect, it, vi } from 'vitest';
 
-import { RUNTIME_DRIVEN_AGENT } from '../agent-runner/index.js';
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
+import {
+  type AgentThreadStateStorage,
+  createAgentThreadTopology,
+  createThreadAgentHost,
+  type ThreadAgentHost,
+} from '../agent-host/index.js';
+import {
+  bindAgentThread,
+  RUNTIME_DRIVEN_AGENT,
+} from '../agent-runner/index.js';
 import type { ActorContext, ApprovalActor } from '../approval-api/index.js';
 import {
   breakwaterActorFor,
+  createPrincipalActorContext,
   humanPrincipal,
+  InMemoryApprovalStoreFactory,
   principalAuditFields,
+  type ResourceOwnershipStore,
+  trustAutomationPrincipal,
 } from '../approval-api/index.js';
 import {
   type InitResult,
@@ -35,11 +44,16 @@ import {
   type ThreadScope,
 } from '../do-runner/index.js';
 import {
+  type BoundThreadTargetValidator,
   createThreadTopology as createThreadTopologyWithSecret,
+  RunRouteError,
   type ThreadNamespaceLike,
   type ThreadTopology,
 } from '../host-kit/index.js';
-import { createSignalRouter } from './router.js';
+import type { SignalDatabase } from './d1-shared.js';
+import { createNotificationDispatchTick } from './notification-dispatch.js';
+import { D1NotificationsStorage } from './notifications-d1.js';
+import { createSignalRouter, type SignalIngestAuditEvent } from './router.js';
 import {
   createThreadSignalRoutes,
   type RunCapConsult,
@@ -58,9 +72,13 @@ function createThreadTopology<Id>(
 
 interface TestEnv {
   agent: Agent;
+  resolveNotificationsStorage?: () => D1NotificationsStorage;
   consultRunCap?: RunCapConsult;
   startIdleRun?: StartIdleRun;
   contentPolicy?: SignalContentPolicy;
+  ownership?: ResourceOwnershipStore;
+  bindingHost?: ThreadAgentHost;
+  exchanges?: Array<{ request: Request; response?: Response }>;
 }
 
 // A minimal host thread DO: build() its init() wiring, route() the PRODUCTION
@@ -83,6 +101,7 @@ class TestThread extends ThreadDurableObject<TestEnv> {
     resolveResourceId: () => resourceIdFromKey('itest'),
     consultRunCap: this.env.consultRunCap,
     startIdleRun: this.env.startIdleRun,
+    resolveNotificationsStorage: this.env.resolveNotificationsStorage,
     ...(this.env.contentPolicy !== undefined
       ? { contentPolicy: this.env.contentPolicy }
       : {}),
@@ -99,7 +118,20 @@ class TestThread extends ThreadDurableObject<TestEnv> {
     request: Request,
     scope: ThreadScope,
   ): Promise<Response> {
+    if (this.env.ownership) {
+      const owner = await this.env.ownership.owner('thread', scope.threadId);
+      if (
+        owner?.kind !== scope.principal.kind ||
+        owner.id !== scope.principal.id
+      ) {
+        return new Response('private thread ownership refusal', {
+          status: 404,
+          headers: { 'x-owner-policy': 'strict' },
+        });
+      }
+    }
     return (
+      (await this.env.bindingHost?.route(request, scope)) ??
       (await this.#routes(request, scope)) ??
       new Response(JSON.stringify({ error: 'not found' }), { status: 404 })
     );
@@ -109,7 +141,10 @@ class TestThread extends ThreadDurableObject<TestEnv> {
 // A namespace over in-memory TestThread instances: idFromName(name)=name and
 // get() memoizes one instance per thread name — its DO identity is its id.name,
 // exactly what the base class uses as the authoritative thread address.
-function threadNamespace(env: TestEnv): ThreadNamespaceLike<string> {
+function threadNamespace(
+  env: TestEnv,
+  afterResponse?: (response: Response) => Promise<void>,
+): ThreadNamespaceLike<string> {
   const instances = new Map<string, TestThread>();
   return {
     idFromName: (name) => name,
@@ -121,17 +156,25 @@ function threadNamespace(env: TestEnv): ThreadNamespaceLike<string> {
       }
       const instance = inst;
       return {
-        fetch: (
+        fetch: async (
           input: Request | string,
           reqInit?: {
             method?: string;
             headers?: Record<string, string>;
             body?: string;
           },
-        ) =>
-          instance.fetch(
-            typeof input === 'string' ? new Request(input, reqInit) : input,
-          ),
+        ) => {
+          const request =
+            typeof input === 'string' ? new Request(input, reqInit) : input;
+          const exchange: { request: Request; response?: Response } = {
+            request,
+          };
+          env.exchanges?.push(exchange);
+          const response = await instance.fetch(request);
+          exchange.response = response;
+          await afterResponse?.(response);
+          return response;
+        },
       };
     },
   };
@@ -165,25 +208,34 @@ function actorContext(): ActorContext {
 
 // A runtime-driven reserve agent (no LLM): records the ifIdle target sendMessage
 // received. The brand is what lets a wake pass the thread-route gate.
-function reserveAgent(): {
-  agent: Agent;
-  targets: Array<{ ifIdle?: unknown }>;
-} {
+function reserveAgent(accepted?: Promise<unknown>) {
   const targets: Array<{ ifIdle?: unknown }> = [];
+  const sendSignal = vi.fn(
+    (signal: AgentSignal, target: { ifIdle?: unknown }) => {
+      targets.push(target);
+      return {
+        signal,
+        accepted: Promise.resolve({ action: 'persist' as const }),
+        persisted: Promise.resolve(),
+      };
+    },
+  );
   const agent = {
     id: 'reserve',
     [RUNTIME_DRIVEN_AGENT]: true,
     __setPubSub: () => {},
     getMemory: () => ({ saveMessages: vi.fn() }),
+    sendSignal,
     sendMessage: (_message: unknown, target: { ifIdle?: unknown }) => {
       targets.push(target);
       return {
         signal: { id: 'sig-1' },
-        accepted: Promise.resolve({ action: 'deliver', runId: 'acme_run' }),
+        accepted:
+          accepted ?? Promise.resolve({ action: 'deliver', runId: 'acme_run' }),
       };
     },
   } as unknown as Agent;
-  return { agent, targets };
+  return { agent, targets, sendSignal };
 }
 
 function wake(threadId: string): Request {
@@ -264,6 +316,245 @@ describe('signal ingestion — full chain (router → topology → thread DO →
 
     expect(res?.status).toBe(404);
     expect(consultRunCap).not.toHaveBeenCalled();
+  });
+});
+
+describe('signal ingestion — strict owner policy with durable binding validation', () => {
+  async function fixture(accepted?: Promise<unknown>) {
+    const storeFactory = new InMemoryApprovalStoreFactory();
+    const unused = () => {
+      throw new Error('binding validation must not initialize agent execution');
+    };
+    const owner = createPrincipalActorContext({
+      principal: humanPrincipal({ id: 'opal', role: 'operator' }),
+      storeFactory,
+      buildService: unused,
+      mutationEpoch: 7,
+    });
+    const admin = createPrincipalActorContext({
+      principal: humanPrincipal({ id: 'admin', role: 'admin' }),
+      storeFactory,
+      buildService: unused,
+      mutationEpoch: 7,
+    });
+    await owner.claimResource('thread', THREAD_ID);
+    await owner.claimResource('resource', resourceIdFromKey(THREAD_ID));
+    const state = new Map<string, unknown>();
+    const stateStorage: AgentThreadStateStorage = {
+      get: async <T>(key: string) =>
+        structuredClone(state.get(key)) as T | undefined,
+      put: async (key, value) => {
+        state.set(key, structuredClone(value));
+      },
+      delete: unused,
+      list: unused,
+      getAlarm: unused,
+      setAlarm: unused,
+      deleteAlarm: unused,
+    };
+    await bindAgentThread(stateStorage, {
+      version: 1,
+      agentId: 'reserve',
+      resourceId: resourceIdFromKey(THREAD_ID),
+    });
+    vi.spyOn(stateStorage, 'get');
+    vi.spyOn(stateStorage, 'put');
+    const bindingHost = createThreadAgentHost({
+      buildModules: unused,
+      storage: unused,
+      stateStorage: () => stateStorage,
+      resourceAccess: () => storeFactory.resources(),
+      approvalService: unused,
+    });
+    const { agent, targets } = reserveAgent(accepted);
+    const consultRunCap = vi.fn(async () => true);
+    const startIdleRun = vi.fn(async ({ runId }: { runId: string }) => ({
+      runId,
+    }));
+    const exchanges: NonNullable<TestEnv['exchanges']> = [];
+    const namespace = threadNamespace({
+      agent,
+      consultRunCap,
+      startIdleRun,
+      ownership: storeFactory.resources(),
+      bindingHost,
+      exchanges,
+    });
+    const address = vi.spyOn(namespace, 'idFromName');
+    const get = vi.spyOn(namespace, 'get');
+    const agentTopology = createAgentThreadTopology(
+      namespace,
+      DEPLOYMENT_IDENTITY_SECRET,
+      { executionFence: 'none', startIdempotency: 'none' },
+    );
+    const validateThreadTarget: BoundThreadTargetValidator = async (
+      context,
+      target,
+    ) => {
+      const registered = await context.resourceOwnerFor(
+        'thread',
+        target.threadId,
+      );
+      if (
+        registered?.kind !== context.principal.kind ||
+        registered.id !== context.principal.id
+      ) {
+        throw new RunRouteError(404, 'strict ingress ownership refusal');
+      }
+      await agentTopology.requireBoundThread(context, target);
+    };
+    return {
+      owner,
+      admin,
+      stateStorage,
+      targets,
+      consultRunCap,
+      startIdleRun,
+      exchanges,
+      address,
+      get,
+      validateThreadTarget,
+      topology: createThreadTopology(namespace),
+    };
+  }
+
+  it.each([
+    true,
+    false,
+  ])('normalizes foreign-admin and missing refusals with strict ingress enabled=%s', async (strictIngress) => {
+    const setup = await fixture();
+    expect(
+      await setup.admin.canAccessResource('thread', THREAD_ID, 'write'),
+    ).toBe(true);
+    const events: SignalIngestAuditEvent[] = [];
+    const rateLimit = vi.fn(() => true);
+    const router = createSignalRouter({
+      resolve: async () => setup.admin,
+      topology: setup.topology,
+      ...(strictIngress
+        ? { validateThreadTarget: setup.validateThreadTarget }
+        : {}),
+      rateLimit,
+      audit: (event) => {
+        events.push(event);
+      },
+    });
+    const missing = mintThreadId(() => 'missing');
+    const responses = [];
+    for (const threadId of [THREAD_ID, missing]) {
+      const request = wake(threadId);
+      const response = await router(request);
+      responses.push({
+        status: response?.status,
+        headers: [...(response?.headers ?? [])],
+        body: await response?.text(),
+      });
+      expect(request.bodyUsed).toBe(!strictIngress && threadId === THREAD_ID);
+    }
+    expect(responses[0]).toEqual(responses[1]);
+    expect(responses[0]).toEqual({
+      status: 404,
+      headers: [
+        ['cache-control', 'no-store'],
+        ['content-type', 'application/json'],
+      ],
+      body: '{"error":"thread not found"}',
+    });
+    expect(events).toEqual(
+      [THREAD_ID, missing].map((threadId) =>
+        expect.objectContaining({
+          actorId: 'admin',
+          threadId,
+          outcome: 'rejected',
+          reason: 'invalid-thread',
+        }),
+      ),
+    );
+    expect(setup.address).toHaveBeenCalledTimes(strictIngress ? 0 : 1);
+    expect(setup.get).toHaveBeenCalledTimes(strictIngress ? 0 : 1);
+    expect(rateLimit).toHaveBeenCalledTimes(strictIngress ? 0 : 1);
+    expect(setup.stateStorage.get).not.toHaveBeenCalled();
+    expect(setup.stateStorage.put).not.toHaveBeenCalled();
+    expect(setup.targets).toEqual([]);
+    expect(setup.consultRunCap).not.toHaveBeenCalled();
+    expect(setup.startIdleRun).not.toHaveBeenCalled();
+    if (strictIngress) {
+      expect(setup.exchanges).toEqual([]);
+    } else {
+      expect(setup.exchanges).toHaveLength(1);
+      const downstream = setup.exchanges[0];
+      assert(downstream);
+      expect(downstream.request.method).toBe('POST');
+      expect(new URL(downstream.request.url).pathname).toBe('/signal/message');
+      expect(downstream.response?.status).toBe(404);
+      expect(await downstream.response?.text()).toBe(
+        'private thread ownership refusal',
+      );
+      expect(downstream.response?.headers.get('x-owner-policy')).toBe('strict');
+    }
+  });
+
+  it('validates the owner binding through the host route and audits after the signal response', async () => {
+    let complete!: (decision: unknown) => void;
+    const accepted = new Promise<unknown>((resolve) => {
+      complete = resolve;
+    });
+    const setup = await fixture(accepted);
+    const events: SignalIngestAuditEvent[] = [];
+    const router = createSignalRouter({
+      resolve: async () => setup.owner,
+      topology: setup.topology,
+      validateThreadTarget: setup.validateThreadTarget,
+      audit: (event) => {
+        expect(setup.exchanges[1]?.response?.status).toBe(200);
+        events.push(event);
+      },
+    });
+    const pending = router(
+      new Request(`http://host/api/threads/${THREAD_ID}/message`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ contents: 'status update', ifIdle: 'persist' }),
+      }),
+    );
+    await vi.waitFor(() => expect(setup.targets).toHaveLength(1));
+    expect(events).toEqual([]);
+    expect(
+      setup.exchanges.map(({ request }) => ({
+        method: request.method,
+        path: new URL(request.url).pathname,
+      })),
+    ).toEqual([
+      { method: 'GET', path: '/_flowsafe/agent-host/binding' },
+      { method: 'POST', path: '/signal/message' },
+    ]);
+    const binding = setup.exchanges[0];
+    assert(binding);
+    expect(new URL(binding.request.url).searchParams.get('resourceId')).toBe(
+      resourceIdFromKey(THREAD_ID),
+    );
+    expect(await setup.exchanges[0]?.response?.clone().json()).toEqual({
+      bound: true,
+    });
+    expect(setup.exchanges[1]?.response).toBeUndefined();
+    complete({ action: 'deliver', runId: 'acme_run' });
+    const response = await pending;
+    expect(response).toBe(setup.exchanges[1]?.response);
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toMatchObject({
+      decision: { action: 'deliver', runId: 'acme_run' },
+      capped: false,
+    });
+    expect(events).toEqual([
+      expect.objectContaining({
+        actorId: 'opal',
+        threadId: THREAD_ID,
+        outcome: 'accepted',
+      }),
+    ]);
+    expect(setup.stateStorage.get).toHaveBeenCalledOnce();
+    expect(setup.stateStorage.put).not.toHaveBeenCalled();
+    expect(setup.startIdleRun).not.toHaveBeenCalled();
   });
 });
 
@@ -388,5 +679,497 @@ describe('signal ingestion — Breakwater content gate over the full chain', () 
       decision: 'allowed',
       detail: { evaluated: ['no-credentials'] },
     });
+  });
+});
+
+describe('notification dispatch — lost response after the thread DO handler', () => {
+  it.each([
+    'summary',
+    'individual',
+    'denial',
+    'recorded-failure',
+  ] as const)('preserves the actual %s receipt across the outer tick fallback', async (mode) => {
+    const now = new Date('2026-07-20T12:00:00.000Z');
+    const futureDelivery = new Date(now.getTime() + 60_000);
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(now);
+    try {
+      const sqlite = openSqlite();
+      const storage = new D1NotificationsStorage(
+        sqliteUnitDatabase(sqlite) as SignalDatabase,
+      );
+      const { agent, sendSignal } = reserveAgent();
+      if (mode === 'recorded-failure') {
+        sendSignal.mockImplementation(() => {
+          throw new Error('original receiver refusal');
+        });
+      }
+      const record = await storage.createNotification({
+        id: `lost-${mode}`,
+        threadId: THREAD_ID,
+        resourceId: resourceIdFromKey('itest'),
+        agentId: agent.id,
+        source: 'provider',
+        kind: 'changed',
+        summary: 'notification input',
+        priority: mode === 'summary' ? 'low' : 'urgent',
+        deliverAt:
+          mode === 'summary' ? futureDelivery : new Date(now.getTime() - 1),
+        summaryAt: mode === 'summary' ? new Date(now.getTime() - 1) : undefined,
+        payload: { version: 1 },
+      });
+      const lookup = { threadId: THREAD_ID, id: record.id };
+      const rawReceipt = () =>
+        sqlite
+          .prepare(
+            'SELECT * FROM mastra_notifications WHERE thread_id = ? AND id = ?',
+          )
+          .get(lookup.threadId, lookup.id);
+      const before = await storage.getNotification(lookup);
+      const beforeRaw = rawReceipt();
+      let durableReceipt: NotificationRecord | null = null;
+      let durableRaw: unknown;
+      let routeResult: unknown;
+      const responseReceived = vi.fn(async (response: Response) => {
+        expect(response.status).toBe(200);
+        routeResult = await response.clone().json();
+        durableReceipt = await storage.getNotification(lookup);
+        durableRaw = rawReceipt();
+        throw new Error('thread handler response lost');
+      });
+      const contentPolicy = vi.fn<SignalContentPolicy>(() =>
+        mode === 'denial'
+          ? { allowed: false, outcome: 'denied' }
+          : { allowed: true },
+      );
+      const topology = createThreadTopology(
+        threadNamespace(
+          {
+            agent,
+            resolveNotificationsStorage: () => storage,
+            contentPolicy,
+          },
+          responseReceived,
+        ),
+      );
+      const context = createPrincipalActorContext({
+        principal: trustAutomationPrincipal({
+          kind: 'system',
+          id: 'notification-maintenance',
+          purpose: 'notification.dispatch',
+        }),
+        storeFactory: new InMemoryApprovalStoreFactory(),
+        buildService: () => {
+          throw new Error('approval service is not used in notification tests');
+        },
+      });
+      const conditional = vi.spyOn(
+        storage,
+        'updateNotificationDeliveryIfUnchanged',
+      );
+      const tick = createNotificationDispatchTick({
+        storage,
+        topology,
+        resolveContext: () => context,
+        executionFence: 'none',
+        now: () => now,
+      });
+
+      expect(await tick()).toEqual({ due: 1, delivered: 0, failed: 1 });
+      expect(responseReceived).toHaveBeenCalledOnce();
+      expect(contentPolicy).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          principal: {
+            kind: 'system',
+            id: 'notification-maintenance',
+            purpose: 'notification.dispatch',
+          },
+          threadId: THREAD_ID,
+          resourceId: resourceIdFromKey('itest'),
+          entryPath: 'notification.dispatch',
+        }),
+      );
+      expect(durableReceipt).not.toEqual(before);
+      expect(durableRaw).not.toEqual(beforeRaw);
+      expect(durableReceipt).toMatchObject({ updatedAt: before?.updatedAt });
+      expect(await storage.getNotification(lookup)).toEqual(durableReceipt);
+      expect(rawReceipt()).toEqual(durableRaw);
+      expect(conditional).toHaveBeenCalledTimes(
+        mode === 'recorded-failure' ? 2 : 1,
+      );
+      const outerFailure = conditional.mock.calls.at(-1)?.[0];
+      expect(outerFailure).toMatchObject({
+        expected: {
+          deliveryAttempts: 0,
+          summarySignalId: null,
+          deliveredSignalId: null,
+        },
+        failure: {
+          type: 'retry',
+          deliveryAttempts: 1,
+          lastDeliveryError: 'thread handler response lost',
+        },
+      });
+      expect(await conditional.mock.results.at(-1)?.value).toEqual({
+        applied: false,
+      });
+
+      if (mode === 'summary') {
+        expect(routeResult).toMatchObject({ delivered: 1, failed: 0 });
+        expect(durableReceipt).toMatchObject({
+          status: 'pending',
+          summaryAt: undefined,
+          summarySignalId: expect.any(String),
+          deliverAt: futureDelivery,
+          deliveryAttempts: 0,
+          lastDeliveryError: undefined,
+        });
+        expect(sendSignal).toHaveBeenCalledOnce();
+      } else if (mode === 'individual') {
+        expect(routeResult).toMatchObject({ delivered: 1, failed: 0 });
+        expect(durableReceipt).toMatchObject({
+          status: 'delivered',
+          deliveredSignalId: expect.any(String),
+          deliveryAttempts: 0,
+          lastDeliveryError: undefined,
+        });
+        expect(sendSignal).toHaveBeenCalledOnce();
+      } else if (mode === 'denial') {
+        expect(routeResult).toMatchObject({
+          delivered: 0,
+          failed: 0,
+          discarded: 1,
+        });
+        expect(durableReceipt).toMatchObject({
+          status: 'discarded',
+          deliveryReason: 'content-policy-denied',
+          deliveryAttempts: 0,
+          lastDeliveryError: undefined,
+          discardedAt: now,
+        });
+        expect(sendSignal).not.toHaveBeenCalled();
+      } else {
+        expect(routeResult).toMatchObject({ delivered: 0, failed: 1 });
+        expect(durableReceipt).toMatchObject({
+          status: 'pending',
+          deliveryAttempts: 1,
+          lastDeliveryError: 'original receiver refusal',
+          lastDeliveryAttemptAt: now,
+          deliverAt: new Date(now.getTime() + 1000),
+        });
+        expect(sendSignal).toHaveBeenCalledOnce();
+      }
+      expect(await storage.listDueNotifications({ now })).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('preserves the summary receipt for a batch naming an Object.prototype member', async () => {
+    // #given — a due summary batch whose sources collide with the prototype
+    const now = new Date('2026-07-20T12:00:00.000Z');
+    const futureDelivery = new Date(now.getTime() + 60_000);
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(now);
+    try {
+      const sqlite = openSqlite();
+      const storage = new D1NotificationsStorage(
+        sqliteUnitDatabase(sqlite) as SignalDatabase,
+      );
+      const { agent, sendSignal } = reserveAgent();
+      const ids: string[] = [];
+      for (const source of ['constructor', '__proto__', 'crm']) {
+        const created = await storage.createNotification({
+          id: `lost-summary-${source}`,
+          threadId: THREAD_ID,
+          resourceId: resourceIdFromKey('itest'),
+          agentId: agent.id,
+          source,
+          kind: 'changed',
+          summary: `${source} input`,
+          priority: 'low',
+          deliverAt: futureDelivery,
+          summaryAt: new Date(now.getTime() - 1),
+          payload: { version: 1 },
+        });
+        ids.push(created.id);
+      }
+      const durableReceipts: Array<Record<string, unknown> | null> = [];
+      const responseReceived = vi.fn(async (response: Response) => {
+        expect(response.status).toBe(200);
+        for (const id of ids) {
+          durableReceipts.push(
+            (await storage.getNotification({
+              threadId: THREAD_ID,
+              id,
+            })) as unknown as Record<string, unknown> | null,
+          );
+        }
+        throw new Error('thread handler response lost');
+      });
+      const topology = createThreadTopology(
+        threadNamespace(
+          { agent, resolveNotificationsStorage: () => storage },
+          responseReceived,
+        ),
+      );
+      const context = createPrincipalActorContext({
+        principal: trustAutomationPrincipal({
+          kind: 'system',
+          id: 'notification-maintenance',
+          purpose: 'notification.dispatch',
+        }),
+        storeFactory: new InMemoryApprovalStoreFactory(),
+        buildService: () => {
+          throw new Error('approval service is not used in notification tests');
+        },
+      });
+      const tick = createNotificationDispatchTick({
+        storage,
+        topology,
+        resolveContext: () => context,
+        executionFence: 'none',
+        now: () => now,
+      });
+
+      // #when — the thread DO succeeds and its response is lost
+      expect(await tick()).toEqual({ due: 3, delivered: 0, failed: 3 });
+
+      // #then — the emitted summary counted each colliding source once
+      expect(sendSignal).toHaveBeenCalledOnce();
+      const summary = sendSignal.mock.calls[0]?.[0] as unknown as {
+        tagName: string;
+        contents: string;
+        metadata: Record<string, unknown>;
+      };
+      expect(summary.tagName).toBe('notification-summary');
+      expect(summary.contents).toBe('__proto__: 1, constructor: 1, crm: 1');
+      expect(summary.metadata.notification).toMatchObject({
+        signal: 'summary',
+        pending: 3,
+        groups: [
+          { source: '__proto__', count: 1 },
+          { source: 'constructor', count: 1 },
+          { source: 'crm', count: 1 },
+        ],
+        byPriority: { low: 3 },
+      });
+
+      // The durable summary receipts survive the outer tick fallback.
+      for (const receipt of durableReceipts) {
+        expect(receipt).toMatchObject({
+          status: 'pending',
+          summaryAt: undefined,
+          summarySignalId: expect.any(String),
+          deliverAt: futureDelivery,
+          deliveryAttempts: 0,
+          lastDeliveryError: undefined,
+        });
+      }
+      for (const id of ids) {
+        expect(
+          await storage.getNotification({ threadId: THREAD_ID, id }),
+        ).toEqual(durableReceipts[ids.indexOf(id)]);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('notification dispatch — ownerless target', () => {
+  it('discards a notification whose thread became ownerless after it was created: each dispatch attempt fails with 404 until delivery-attempts-exhausted', async () => {
+    let now = new Date('2026-07-20T12:00:00.000Z');
+    const storage = new D1NotificationsStorage(
+      sqliteUnitDatabase(openSqlite()) as SignalDatabase,
+    );
+    const storeFactory = new InMemoryApprovalStoreFactory();
+    const context = createPrincipalActorContext({
+      principal: trustAutomationPrincipal({
+        kind: 'system',
+        id: 'notification-maintenance',
+        purpose: 'notification.dispatch',
+      }),
+      storeFactory,
+      buildService: () => {
+        throw new Error('approval service is not used in notification tests');
+      },
+    });
+    await context.claimResource('thread', THREAD_ID);
+    const ownership = storeFactory.resources();
+    const { agent, sendSignal, targets } = reserveAgent();
+    const exchanges: NonNullable<TestEnv['exchanges']> = [];
+    const namespace = threadNamespace({
+      agent,
+      ownership,
+      exchanges,
+      resolveNotificationsStorage: () => storage,
+    });
+    namespace.get(namespace.idFromName(THREAD_ID));
+    const record = await storage.createNotification({
+      id: 'ownerless',
+      threadId: THREAD_ID,
+      resourceId: resourceIdFromKey('itest'),
+      agentId: agent.id,
+      source: 'provider',
+      kind: 'changed',
+      summary: 'ownerless input',
+      priority: 'urgent',
+      deliverAt: new Date(now.getTime() - 1),
+    });
+    expect(await ownership.owner('thread', THREAD_ID)).toEqual(
+      context.resourceOwner,
+    );
+    expect(
+      await ownership.release('thread', THREAD_ID, context.resourceOwner),
+    ).toBe(true);
+    expect(await ownership.owner('thread', THREAD_ID)).toBeUndefined();
+
+    const conditional = vi.spyOn(
+      storage,
+      'updateNotificationDeliveryIfUnchanged',
+    );
+    const tick = createNotificationDispatchTick({
+      storage,
+      topology: createThreadTopology(namespace),
+      resolveContext: () => context,
+      executionFence: 'none',
+      maxDeliveryAttempts: 2,
+      now: () => now,
+    });
+    expect(await tick()).toEqual({ due: 1, delivered: 0, failed: 1 });
+    const deferred = await storage.getNotification(record);
+    expect(deferred).toMatchObject({
+      status: 'pending',
+      deliveryAttempts: 1,
+      lastDeliveryAttemptAt: now,
+      lastDeliveryError: 'thread notification dispatch returned 404',
+    });
+    assert(deferred?.deliverAt);
+    expect(deferred.deliverAt.getTime()).toBeGreaterThan(now.getTime());
+    expect(sendSignal).not.toHaveBeenCalled();
+    expect(targets).toEqual([]);
+
+    now = deferred.deliverAt;
+    expect(await tick()).toEqual({
+      due: 1,
+      delivered: 0,
+      failed: 0,
+      discarded: 1,
+    });
+    const terminal = await storage.getNotification(record);
+    expect(terminal).toMatchObject({
+      status: 'discarded',
+      deliveryReason: 'delivery-attempts-exhausted',
+      deliveryAttempts: 2,
+      lastDeliveryAttemptAt: now,
+      lastDeliveryError: 'thread notification dispatch returned 404',
+      discardedAt: expect.any(Date),
+      deliverAt: undefined,
+      summaryAt: undefined,
+      deliveredSignalId: undefined,
+    });
+    expect(conditional.mock.calls.map(([input]) => input.failure)).toEqual([
+      expect.objectContaining({
+        type: 'retry',
+        deliveryAttempts: 1,
+        lastDeliveryError: 'thread notification dispatch returned 404',
+      }),
+      expect.objectContaining({
+        type: 'discard',
+        deliveryAttempts: 2,
+        lastDeliveryError: 'thread notification dispatch returned 404',
+      }),
+    ]);
+    expect(exchanges).toHaveLength(2);
+    for (const exchange of exchanges) {
+      expect(new URL(exchange.request.url).pathname).toBe(
+        '/signal/notifications/dispatch',
+      );
+      expect(exchange.response?.status).toBe(404);
+      expect(await exchange.response?.clone().text()).toBe(
+        'private thread ownership refusal',
+      );
+    }
+    expect(await tick()).toEqual({ due: 0, delivered: 0, failed: 0 });
+    expect(await storage.getNotification(record)).toEqual(terminal);
+    expect(conditional).toHaveBeenCalledTimes(2);
+    expect(exchanges).toHaveLength(2);
+    expect(sendSignal).not.toHaveBeenCalled();
+    expect(targets).toEqual([]);
+  });
+});
+
+describe('notification dispatch — chronological due window', () => {
+  it.each([
+    'deliverAt',
+    'summaryAt',
+  ] as const)('delivers a due sibling through the thread DO ahead of a future expanded-year %s', async (cursor) => {
+    const now = new Date('2026-07-20T12:00:00.000Z');
+    const storage = new D1NotificationsStorage(
+      sqliteUnitDatabase(openSqlite()) as SignalDatabase,
+    );
+    const { agent, sendSignal } = reserveAgent();
+    const future = await storage.createNotification({
+      id: 'future',
+      threadId: THREAD_ID,
+      resourceId: resourceIdFromKey('itest'),
+      agentId: agent.id,
+      source: 'provider',
+      kind: 'changed',
+      summary: 'future input',
+      priority: 'urgent',
+      [cursor]: new Date('+010000-01-01T00:00:00.000Z'),
+    });
+    const due = await storage.createNotification({
+      id: 'due',
+      threadId: THREAD_ID,
+      resourceId: resourceIdFromKey('itest'),
+      agentId: agent.id,
+      source: 'provider',
+      kind: 'changed',
+      summary: 'due input',
+      priority: 'urgent',
+      deliverAt: new Date(now.getTime() - 1),
+    });
+    const topology = createThreadTopology(
+      threadNamespace({
+        agent,
+        resolveNotificationsStorage: () => storage,
+      }),
+    );
+    const context = createPrincipalActorContext({
+      principal: trustAutomationPrincipal({
+        kind: 'system',
+        id: 'notification-maintenance',
+        purpose: 'notification.dispatch',
+      }),
+      storeFactory: new InMemoryApprovalStoreFactory(),
+      buildService: () => {
+        throw new Error('approval service is not used in notification tests');
+      },
+    });
+    const tick = createNotificationDispatchTick({
+      storage,
+      topology,
+      resolveContext: () => context,
+      executionFence: 'none',
+      now: () => now,
+      limit: 1,
+    });
+
+    expect(await tick()).toEqual({ due: 1, delivered: 1, failed: 0 });
+    expect(sendSignal).toHaveBeenCalledOnce();
+    expect(sendSignal.mock.calls[0]?.[0]).toMatchObject({
+      contents: 'due input',
+      metadata: { notification: { recordId: due.id } },
+    });
+    expect(await storage.getNotification(due)).toMatchObject({
+      status: 'delivered',
+      deliveredSignalId: expect.any(String),
+    });
+    expect(await storage.getNotification(future)).toEqual(future);
+    expect(await tick()).toEqual({ due: 0, delivered: 0, failed: 0 });
+    expect(sendSignal).toHaveBeenCalledOnce();
   });
 });

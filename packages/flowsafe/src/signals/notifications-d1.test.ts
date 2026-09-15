@@ -2,10 +2,23 @@
 // D1NotificationsStorage round-trip / coalescing / listDue / update — mirrors the
 // core InMemoryNotificationsStorage behavior over a node:sqlite SQL unit facade.
 
+import type {
+  CreateNotificationInput,
+  NotificationRecord,
+} from '@mastra/core/notifications';
 import { describe, expect, it } from 'vitest';
 
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
+import {
+  notificationTimestampMillis,
+  notificationTimestampSql,
+} from '../do-runner/notification-predicate.js';
 import type { SignalDatabase, SignalStatement } from './d1-shared.js';
+import {
+  captureNotificationDeliveryObservation,
+  type NotificationDeliveryFailure,
+  type NotificationDeliveryObservation,
+} from './notification-dispatch.js';
 import { D1NotificationsStorage } from './notifications-d1.js';
 
 function store(): D1NotificationsStorage {
@@ -25,6 +38,34 @@ function sharedStores(): [D1NotificationsStorage, D1NotificationsStorage] {
   ];
 }
 
+function interceptFirst(
+  db: SignalDatabase,
+  intercept: (query: string, read: () => Promise<unknown>) => Promise<unknown>,
+): SignalDatabase {
+  function wrap(query: string, statement: SignalStatement): SignalStatement {
+    return {
+      bind(...values: unknown[]) {
+        return wrap(query, statement.bind(...values));
+      },
+      async first<T = unknown>(): Promise<T | null> {
+        return (await intercept(query, () => statement.first<T>())) as T | null;
+      },
+      all<T = unknown>() {
+        return statement.all<T>();
+      },
+      run() {
+        return statement.run();
+      },
+    };
+  }
+  return {
+    prepare(query) {
+      return wrap(query, db.prepare(query));
+    },
+    ...(db.batch ? { batch: db.batch.bind(db) } : {}),
+  };
+}
+
 function coalescableReadBarrier(db: SignalDatabase): {
   db: SignalDatabase;
   selected: Promise<void>;
@@ -40,61 +81,120 @@ function coalescableReadBarrier(db: SignalDatabase): {
   });
   let intercepted = false;
 
-  function wrap(query: string, statement: SignalStatement): SignalStatement {
-    return {
-      bind(...values: unknown[]) {
-        return wrap(query, statement.bind(...values));
-      },
-      async first<T = unknown>(): Promise<T | null> {
-        const row = await statement.first<T>();
-        if (
-          !intercepted &&
-          row !== null &&
-          query.includes('insertionOrdinal IS NULL ASC')
-        ) {
-          intercepted = true;
-          markSelected();
-          await released;
-        }
-        return row;
-      },
-      all<T = unknown>() {
-        return statement.all<T>();
-      },
-      run() {
-        return statement.run();
-      },
-    };
-  }
-
   return {
-    db: {
-      prepare(query: string) {
-        return wrap(query, db.prepare(query));
-      },
-      batch(statements) {
-        if (!db.batch) throw new Error('test database has no batch');
-        return db.batch(statements);
-      },
-    },
+    db: interceptFirst(db, async (query, read) => {
+      const row = await read();
+      if (
+        !intercepted &&
+        row !== null &&
+        query.includes('insertionOrdinal IS NULL ASC')
+      ) {
+        intercepted = true;
+        markSelected();
+        await released;
+      }
+      return row;
+    }),
     selected,
     release: releaseRead,
   };
 }
 
+const ATTEMPT_TIME = '2026-09-09T12:00:00.000Z';
+const WRITE_TIME = '2026-09-09T13:00:00.000Z';
+const RETRY_TIME = '2026-09-09T12:00:01.000Z';
+
+function createDueNotification(
+  storage: D1NotificationsStorage,
+  input: Partial<CreateNotificationInput> = {},
+): Promise<NotificationRecord> {
+  return storage.createNotification({
+    id: 'receipt',
+    threadId: 'thread',
+    source: 'source',
+    kind: 'kind',
+    summary: 'summary',
+    resourceId: 'resource',
+    agentId: 'agent',
+    createdAt: new Date('2026-09-09T10:00:00.000Z'),
+    deliverAt: new Date('2026-09-09T11:59:59.000Z'),
+    summaryAt: new Date('2026-09-09T14:00:00.000Z'),
+    ...input,
+  });
+}
+
+function retryFailure(): Extract<
+  NotificationDeliveryFailure,
+  { type: 'retry' }
+> {
+  return {
+    type: 'retry',
+    updatedAt: WRITE_TIME,
+    deliveryAttempts: 1,
+    lastDeliveryAttemptAt: ATTEMPT_TIME,
+    lastDeliveryError: 'target refused',
+    deliverAt: RETRY_TIME,
+  };
+}
+
+function isDeliveryUpdate(query: string): boolean {
+  return (
+    query.trimStart().startsWith('UPDATE ') && query.includes('RETURNING *')
+  );
+}
+
+function deliveryWriteBarrier(db: SignalDatabase): {
+  db: SignalDatabase;
+  writing: Promise<void>;
+  release: () => void;
+} {
+  let markWriting: () => void = () => undefined;
+  let release: () => void = () => undefined;
+  const writing = new Promise<void>((resolve) => {
+    markWriting = resolve;
+  });
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let intercepted = false;
+  return {
+    db: interceptFirst(db, async (query, read) => {
+      if (!intercepted && isDeliveryUpdate(query)) {
+        intercepted = true;
+        markWriting();
+        await released;
+      }
+      return read();
+    }),
+    writing,
+    release,
+  };
+}
+
+async function rawNotification(
+  db: SignalDatabase,
+): Promise<Record<string, unknown>> {
+  const row = await db
+    .prepare('SELECT * FROM mastra_notifications')
+    .first<Record<string, unknown>>();
+  if (!row) throw new Error('notification fixture is missing');
+  return row;
+}
+
 async function createLegacyNotificationsTable(
   db: SignalDatabase,
+  textCollation: 'BINARY' | 'NOCASE' = 'BINARY',
 ): Promise<void> {
   await db
     .prepare(
       `CREATE TABLE mastra_notifications (
-         id TEXT NOT NULL,
-         thread_id TEXT NOT NULL,
+         id TEXT NOT NULL COLLATE ${textCollation},
+         thread_id TEXT NOT NULL COLLATE ${textCollation},
          source TEXT NOT NULL,
          kind TEXT NOT NULL,
          priority TEXT NOT NULL,
          status TEXT NOT NULL,
-         summary TEXT NOT NULL,
+         summary TEXT NOT NULL COLLATE ${textCollation},
          payload TEXT,
          resourceId TEXT,
          agentId TEXT,
@@ -354,6 +454,48 @@ describe('D1NotificationsStorage', () => {
     });
     const due = await s.listDueNotifications({ now });
     expect(due.map((r) => r.summary)).toEqual(['due']);
+  });
+
+  it.each(
+    (
+      ['delivered', 'seen', 'dismissed', 'archived', 'discarded'] as const
+    ).flatMap((status) =>
+      (['deliverAt', 'summaryAt'] as const).map((cursor) => ({
+        status,
+        cursor,
+      })),
+    ),
+  )('excludes $status with a retained $cursor from a limited due window', async ({
+    status,
+    cursor,
+  }) => {
+    const s = store();
+    const now = new Date('2026-01-01T00:00:00.000Z');
+    const dueAt = new Date(now.getTime() - 1000);
+    const terminal = await s.createNotification({
+      threadId: 'acme_t1',
+      source: 'x',
+      kind: 'a',
+      summary: 'terminal',
+      [cursor]: dueAt,
+    });
+    await s.updateNotification({
+      threadId: terminal.threadId,
+      id: terminal.id,
+      status,
+    });
+    expect(await s.getNotification(terminal)).toMatchObject({
+      status,
+      [cursor]: dueAt,
+    });
+    const pending = await s.createNotification({
+      threadId: 'acme_t1',
+      source: 'x',
+      kind: 'b',
+      summary: 'pending',
+      [cursor]: now,
+    });
+    expect(await s.listDueNotifications({ now, limit: 1 })).toEqual([pending]);
   });
 
   it('updateNotification stamps the status timestamp and filters by status', async () => {
@@ -928,5 +1070,954 @@ describe('D1NotificationsStorage', () => {
 
     const due = await s.listDueNotifications({ now, limit: 1 });
     expect(due.map((record) => record.id)).toEqual(['both']);
+  });
+});
+
+describe('D1 notification conditional delivery bookkeeping', () => {
+  it('advances the due cursor and preserves future cursor bytes and other fields', async () => {
+    const db = database();
+    const s = new D1NotificationsStorage(db);
+    const original = await createDueNotification(s, {
+      payload: { value: 1 },
+      metadata: { origin: 'source' },
+    });
+    await db
+      .prepare(
+        `UPDATE mastra_notifications
+         SET summaryAt = '2026-09-09T18:00:00+04:00',
+             payload = '{ "value" : 1.0 }'`,
+      )
+      .run();
+    const before = await rawNotification(db);
+    const result = await s.updateNotificationDeliveryIfUnchanged({
+      expected: captureNotificationDeliveryObservation(original),
+      failure: retryFailure(),
+    });
+    expect(result).toMatchObject({
+      applied: true,
+      record: {
+        status: 'pending',
+        deliveryAttempts: 1,
+        lastDeliveryError: 'target refused',
+        lastDeliveryAttemptAt: new Date(ATTEMPT_TIME),
+        updatedAt: new Date(WRITE_TIME),
+      },
+    });
+    expect(await rawNotification(db)).toEqual({
+      ...before,
+      updatedAt: WRITE_TIME,
+      deliveryAttempts: 1,
+      lastDeliveryAttemptAt: ATTEMPT_TIME,
+      lastDeliveryError: 'target refused',
+      deliverAt: RETRY_TIME,
+    });
+  });
+
+  it('moves both due cursors without clearing a completed summary receipt', async () => {
+    const s = store();
+    await createDueNotification(s, { summaryAt: new Date(ATTEMPT_TIME) });
+    const original = await s.updateNotification({
+      threadId: 'thread',
+      id: 'receipt',
+      summarySignalId: 'prior-summary',
+    });
+    await expect(
+      s.updateNotificationDeliveryIfUnchanged({
+        expected: captureNotificationDeliveryObservation(original),
+        failure: { ...retryFailure(), summaryAt: RETRY_TIME },
+      }),
+    ).resolves.toMatchObject({
+      applied: true,
+      record: {
+        summaryAt: new Date(RETRY_TIME),
+        deliverAt: new Date(RETRY_TIME),
+        summarySignalId: 'prior-summary',
+      },
+    });
+  });
+
+  it('persists the final failed round and keeps its terminal receipt visible', async () => {
+    const s = store();
+    await createDueNotification(s);
+    const original = await s.updateNotification({
+      threadId: 'thread',
+      id: 'receipt',
+      deliveryAttempts: 9,
+      summarySignalId: 'prior-summary',
+    });
+    const failure: NotificationDeliveryFailure = {
+      type: 'discard',
+      updatedAt: WRITE_TIME,
+      deliveryAttempts: 10,
+      lastDeliveryAttemptAt: ATTEMPT_TIME,
+      lastDeliveryError: 'last refusal',
+    };
+    await expect(
+      s.updateNotificationDeliveryIfUnchanged({
+        expected: captureNotificationDeliveryObservation(original),
+        failure,
+      }),
+    ).resolves.toMatchObject({
+      applied: true,
+      record: {
+        status: 'discarded',
+        deliveryReason: 'delivery-attempts-exhausted',
+        deliveryAttempts: 10,
+        lastDeliveryError: 'last refusal',
+        lastDeliveryAttemptAt: new Date(ATTEMPT_TIME),
+        discardedAt: new Date(WRITE_TIME),
+        updatedAt: new Date(WRITE_TIME),
+        summarySignalId: 'prior-summary',
+        deliverAt: undefined,
+        summaryAt: undefined,
+      },
+    });
+    expect(await s.listDueNotifications({ now: new Date(WRITE_TIME) })).toEqual(
+      [],
+    );
+    const listed = await s.listNotifications({ threadId: 'thread' });
+    expect(listed).toHaveLength(1);
+    expect(listed[0]).toEqual(
+      await s.getNotification({ threadId: 'thread', id: 'receipt' }),
+    );
+  });
+
+  it.each([
+    10,
+    Number.MAX_SAFE_INTEGER,
+  ])('terminalizes an existing count of %s without replacing the failed receipt', async (deliveryAttempts) => {
+    const db = database();
+    const s = new D1NotificationsStorage(db);
+    await createDueNotification(s);
+    const original = await s.updateNotification({
+      threadId: 'thread',
+      id: 'receipt',
+      deliveryAttempts,
+      lastDeliveryAttemptAt: new Date(ATTEMPT_TIME),
+      lastDeliveryError: 'original refusal',
+    });
+    await db
+      .prepare(
+        `UPDATE mastra_notifications
+           SET lastDeliveryAttemptAt = '2026-09-09T16:00:00+04:00'`,
+      )
+      .run();
+    const before = await rawNotification(db);
+    await expect(
+      s.updateNotificationDeliveryIfUnchanged({
+        expected: captureNotificationDeliveryObservation(original),
+        failure: { type: 'exhausted', updatedAt: WRITE_TIME },
+      }),
+    ).resolves.toMatchObject({ applied: true });
+    expect(await rawNotification(db)).toEqual({
+      ...before,
+      status: 'discarded',
+      deliveryReason: 'delivery-attempts-exhausted',
+      updatedAt: WRITE_TIME,
+      discardedAt: WRITE_TIME,
+      deliverAt: null,
+      summaryAt: null,
+    });
+  });
+
+  it('preserves absent prior error and attempt time during terminalization', async () => {
+    const db = database();
+    const s = new D1NotificationsStorage(db);
+    await createDueNotification(s);
+    const original = await s.updateNotification({
+      threadId: 'thread',
+      id: 'receipt',
+      deliveryAttempts: 10,
+    });
+    await s.updateNotificationDeliveryIfUnchanged({
+      expected: captureNotificationDeliveryObservation(original),
+      failure: { type: 'exhausted', updatedAt: WRITE_TIME },
+    });
+    expect(await rawNotification(db)).toMatchObject({
+      deliveryAttempts: 10,
+      lastDeliveryAttemptAt: null,
+      lastDeliveryError: null,
+    });
+  });
+
+  it.each([
+    ['status', 'delivered'],
+    ['deliveredSignalId', 'existing-signal'],
+  ] as const)('refuses an observed %s receipt', async (field, value) => {
+    const db = database();
+    const s = new D1NotificationsStorage(db);
+    await createDueNotification(s);
+    const original = await s.updateNotification({
+      threadId: 'thread',
+      id: 'receipt',
+      [field]: value,
+    });
+    const before = await rawNotification(db);
+    await expect(
+      s.updateNotificationDeliveryIfUnchanged({
+        expected: captureNotificationDeliveryObservation(original),
+        failure: retryFailure(),
+      }),
+    ).resolves.toEqual({ applied: false });
+    expect(await rawNotification(db)).toEqual(before);
+  });
+
+  it('returns no-write after a notification is removed', async () => {
+    const s = store();
+    const original = await createDueNotification(s);
+    await s.dangerouslyClearAll();
+    await expect(
+      s.updateNotificationDeliveryIfUnchanged({
+        expected: captureNotificationDeliveryObservation(original),
+        failure: retryFailure(),
+      }),
+    ).resolves.toEqual({ applied: false });
+  });
+
+  it.each([
+    ['thread_id', 'another-thread'],
+    ['id', 'another-receipt'],
+    ['source', 'another-source'],
+    ['kind', 'another-kind'],
+    ['priority', 'urgent'],
+    ['status', 'discarded'],
+    ['summary', 'another-summary'],
+    ['payload', '{"changed":true}'],
+    ['resourceId', 'another-resource'],
+    ['agentId', 'another-agent'],
+    ['sourceId', 'another-source-id'],
+    ['dedupeKey', 'another-dedupe-key'],
+    ['coalesceKey', 'another-coalesce-key'],
+    ['coalescedCount', 2],
+    ['attributes', '{"changed":true}'],
+    ['createdAt', WRITE_TIME],
+    ['updatedAt', WRITE_TIME],
+    ['deliverAt', null],
+    ['summaryAt', null],
+    ['deliveryReason', 'another-reason'],
+    ['deliveryAttempts', 1],
+    ['lastDeliveryAttemptAt', ATTEMPT_TIME],
+    ['lastDeliveryError', 'another-error'],
+    ['deliveredSignalId', 'another-delivery'],
+    ['summarySignalId', 'another-summary-signal'],
+    ['deliveredAt', WRITE_TIME],
+    ['seenAt', WRITE_TIME],
+    ['dismissedAt', WRITE_TIME],
+    ['archivedAt', WRITE_TIME],
+    ['discardedAt', WRITE_TIME],
+    ['metadata', '{"changed":true}'],
+  ])('preserves a concurrent %s change at the final SQL write', async (column, value) => {
+    const db = database();
+    const barrier = deliveryWriteBarrier(db);
+    const left = new D1NotificationsStorage(barrier.db);
+    const right = new D1NotificationsStorage(db);
+    const original = await createDueNotification(right);
+    const pending = left.updateNotificationDeliveryIfUnchanged({
+      expected: captureNotificationDeliveryObservation(original),
+      failure: retryFailure(),
+    });
+    await barrier.writing;
+    await db
+      .prepare(`UPDATE mastra_notifications SET ${column} = ?`)
+      .bind(value)
+      .run();
+    const newer = await rawNotification(db);
+    barrier.release();
+    await expect(pending).resolves.toEqual({ applied: false });
+    expect(await rawNotification(db)).toEqual(newer);
+  });
+
+  it.each([
+    'summary',
+    'delivery',
+    'denial',
+    'failure',
+    'coalescing',
+    'replacement',
+  ])('preserves a newer %s written by another storage adapter', async (outcome) => {
+    const db = database();
+    const barrier = deliveryWriteBarrier(db);
+    const left = new D1NotificationsStorage(barrier.db);
+    const right = new D1NotificationsStorage(db);
+    const original = await createDueNotification(right, {
+      coalesceKey: 'group',
+    });
+    const pending = left.updateNotificationDeliveryIfUnchanged({
+      expected: captureNotificationDeliveryObservation(original),
+      failure: retryFailure(),
+    });
+    await barrier.writing;
+    if (outcome === 'coalescing') {
+      await createDueNotification(right, {
+        coalesceKey: 'group',
+        summary: 'merged',
+      });
+    } else if (outcome === 'replacement') {
+      await createDueNotification(right, {
+        source: 'replacement',
+        payload: { new: true },
+      });
+    } else if (outcome === 'failure') {
+      await right.updateNotificationDeliveryIfUnchanged({
+        expected: captureNotificationDeliveryObservation(original),
+        failure: { ...retryFailure(), lastDeliveryError: 'original refusal' },
+      });
+    } else {
+      await right.updateNotification({
+        threadId: 'thread',
+        id: 'receipt',
+        ...(outcome === 'summary'
+          ? { summaryAt: null, summarySignalId: 'summary-receipt' }
+          : outcome === 'delivery'
+            ? { status: 'delivered', deliveredSignalId: 'delivery-receipt' }
+            : { status: 'discarded', deliveryReason: 'content-policy-denied' }),
+      });
+    }
+    await db
+      .prepare('UPDATE mastra_notifications SET updatedAt = ?')
+      .bind(original.updatedAt.toISOString())
+      .run();
+    const newer = await rawNotification(db);
+    barrier.release();
+    await expect(pending).resolves.toEqual({ applied: false });
+    expect(await rawNotification(db)).toEqual(newer);
+  });
+
+  it('does not manufacture an identity for an identical same-ID replacement', async () => {
+    const db = database();
+    const barrier = deliveryWriteBarrier(db);
+    const left = new D1NotificationsStorage(barrier.db);
+    const right = new D1NotificationsStorage(db);
+    const original = await createDueNotification(right);
+    const pending = left.updateNotificationDeliveryIfUnchanged({
+      expected: captureNotificationDeliveryObservation(original),
+      failure: retryFailure(),
+    });
+    await barrier.writing;
+    await createDueNotification(right);
+    barrier.release();
+    await expect(pending).resolves.toMatchObject({ applied: true });
+  });
+
+  it('captures input scalars before its first await', async () => {
+    const db = database();
+    const s = new D1NotificationsStorage(db);
+    const original = await createDueNotification(s);
+    const expected = { ...captureNotificationDeliveryObservation(original) };
+    const failure = retryFailure();
+    const pending = s.updateNotificationDeliveryIfUnchanged({
+      expected,
+      failure,
+    });
+    expected.summary = 'mutated';
+    expected.deliveryAttempts = 200;
+    Object.assign(failure, {
+      deliveryAttempts: 201,
+      lastDeliveryError: 'mutated',
+    });
+    await expect(pending).resolves.toMatchObject({
+      applied: true,
+      record: {
+        summary: 'summary',
+        deliveryAttempts: 1,
+        lastDeliveryError: 'target refused',
+      },
+    });
+  });
+
+  it.each([
+    ['payload', 'not-json'],
+    ['payload', '{"overflow":1e999}'],
+    ['attributes', '{'],
+    ['metadata', '{'],
+    ['deliverAt', 'not-a-date'],
+    ['summaryAt', ''],
+    ['createdAt', ''],
+    ['updatedAt', 'not-a-date'],
+    ['lastDeliveryAttemptAt', 'not-a-date'],
+    ['deliveryAttempts', -1],
+    ['deliveryAttempts', 0.5],
+    ['deliveryAttempts', 'broken'],
+    ['coalescedCount', 'broken'],
+  ])('rejects unreadable raw %s values instead of treating them as absent', async (column, value) => {
+    const db = database();
+    const s = new D1NotificationsStorage(db);
+    const original = await createDueNotification(s);
+    await db
+      .prepare(`UPDATE mastra_notifications SET ${column} = ?`)
+      .bind(value)
+      .run();
+    const before = await rawNotification(db);
+    await expect(
+      s.updateNotificationDeliveryIfUnchanged({
+        expected: captureNotificationDeliveryObservation(original),
+        failure: retryFailure(),
+      }),
+    ).rejects.toThrow();
+    expect(await rawNotification(db)).toEqual(before);
+  });
+
+  it('keeps an unsafe SQLite integer unchanged when the driver cannot read it', async () => {
+    const db = database();
+    const s = new D1NotificationsStorage(db);
+    const original = await createDueNotification(s);
+    await db
+      .prepare('UPDATE mastra_notifications SET deliveryAttempts = ?')
+      .bind(Number.MAX_SAFE_INTEGER + 1)
+      .run();
+    const readReceipt = () =>
+      db
+        .prepare(
+          `SELECT CAST(deliveryAttempts AS TEXT) AS attempts,
+       updatedAt, lastDeliveryError, lastDeliveryAttemptAt
+       FROM mastra_notifications`,
+        )
+        .first();
+    const before = await readReceipt();
+    await expect(
+      s.updateNotificationDeliveryIfUnchanged({
+        expected: captureNotificationDeliveryObservation(original),
+        failure: retryFailure(),
+      }),
+    ).rejects.toThrow();
+    expect(await readReceipt()).toEqual(before);
+  });
+
+  it('uses binary final guards when the stored content collation ignores case', async () => {
+    const db = database();
+    await createLegacyNotificationsTable(db, 'NOCASE');
+    const barrier = deliveryWriteBarrier(db);
+    const left = new D1NotificationsStorage(barrier.db);
+    const right = new D1NotificationsStorage(db);
+    const original = await createDueNotification(right);
+    const pending = left.updateNotificationDeliveryIfUnchanged({
+      expected: captureNotificationDeliveryObservation(original),
+      failure: retryFailure(),
+    });
+    await barrier.writing;
+    await db
+      .prepare("UPDATE mastra_notifications SET summary = 'SUMMARY'")
+      .run();
+    const newer = await rawNotification(db);
+    barrier.release();
+    await expect(pending).resolves.toEqual({ applied: false });
+    expect(await rawNotification(db)).toEqual(newer);
+  });
+
+  it.each([
+    null,
+    -1,
+    0.5,
+    NaN,
+    Infinity,
+    Number.MAX_SAFE_INTEGER + 1,
+    '0',
+  ])('rejects malformed captured deliveryAttempts %s without database work', async (value) => {
+    const s = store();
+    const original = await createDueNotification(s);
+    const expected = {
+      ...captureNotificationDeliveryObservation(original),
+      deliveryAttempts: value,
+    } as NotificationDeliveryObservation;
+    await expect(
+      new D1NotificationsStorage({
+        prepare() {
+          throw new Error('database must not be reached');
+        },
+      }).updateNotificationDeliveryIfUnchanged({
+        expected,
+        failure: retryFailure(),
+      }),
+    ).rejects.toThrow('nonnegative safe integer');
+  });
+
+  it.each([
+    { type: 'unknown', updatedAt: WRITE_TIME },
+    { ...retryFailure(), summary: 'unauthorized content edit' },
+    { ...retryFailure(), deliveryAttempts: 0 },
+    { ...retryFailure(), deliveryAttempts: 2 },
+    { ...retryFailure(), lastDeliveryAttemptAt: 'not-a-date' },
+    { ...retryFailure(), updatedAt: '2026-09-09T13:00:00Z' },
+    { ...retryFailure(), lastDeliveryError: null },
+    { ...retryFailure(), deliverAt: undefined },
+    { ...retryFailure(), deliverAt: ATTEMPT_TIME },
+    { ...retryFailure(), summaryAt: RETRY_TIME },
+    { type: 'exhausted', updatedAt: WRITE_TIME, deliveryAttempts: 1 },
+  ])('rejects malformed or broad failure patches %#', async (failure) => {
+    const db = database();
+    const s = new D1NotificationsStorage(db);
+    const original = await createDueNotification(s);
+    const before = await rawNotification(db);
+    await expect(
+      s.updateNotificationDeliveryIfUnchanged({
+        expected: captureNotificationDeliveryObservation(original),
+        failure: failure as NotificationDeliveryFailure,
+      }),
+    ).rejects.toThrow();
+    expect(await rawNotification(db)).toEqual(before);
+  });
+
+  it('cannot overflow a maximum safe counter while recording a new failure', async () => {
+    const s = store();
+    await createDueNotification(s);
+    const original = await s.updateNotification({
+      threadId: 'thread',
+      id: 'receipt',
+      deliveryAttempts: Number.MAX_SAFE_INTEGER,
+    });
+    await expect(
+      s.updateNotificationDeliveryIfUnchanged({
+        expected: captureNotificationDeliveryObservation(original),
+        failure: {
+          ...retryFailure(),
+          deliveryAttempts: Number.MAX_SAFE_INTEGER,
+        },
+      }),
+    ).rejects.toThrow('increment once');
+  });
+
+  it('distinguishes absent JSON from JSON null and preserves serializer conversions', async () => {
+    const s = store();
+    const original = await createDueNotification(s, {
+      payload: {
+        date: new Date(ATTEMPT_TIME),
+        omitted: undefined,
+        infinite: Infinity,
+      },
+      attributes: { omitted: undefined },
+      metadata: { values: [undefined, null] },
+    });
+    const expected = captureNotificationDeliveryObservation(original);
+    await expect(
+      s.updateNotificationDeliveryIfUnchanged({
+        expected,
+        failure: retryFailure(),
+      }),
+    ).resolves.toMatchObject({
+      applied: true,
+      record: {
+        payload: { date: ATTEMPT_TIME, infinite: null },
+        attributes: {},
+        metadata: { values: [null, null] },
+      },
+    });
+    const second = await createDueNotification(s, { id: 'second' });
+    await s.updateNotification({
+      threadId: 'thread',
+      id: 'second',
+      payload: null,
+    });
+    await expect(
+      s.updateNotificationDeliveryIfUnchanged({
+        expected: captureNotificationDeliveryObservation(second),
+        failure: retryFailure(),
+      }),
+    ).resolves.toEqual({ applied: false });
+  });
+
+  it('accepts absent public counters and optional null bindings/dates', async () => {
+    const s = store();
+    const original = await createDueNotification(s, {
+      agentId: undefined,
+      summaryAt: undefined,
+    });
+    const compatible = {
+      ...original,
+      deliveryAttempts: undefined,
+      coalescedCount: undefined,
+      agentId: null,
+      summaryAt: null,
+    } as unknown as NotificationRecord;
+    await expect(
+      s.updateNotificationDeliveryIfUnchanged({
+        expected: captureNotificationDeliveryObservation(compatible),
+        failure: retryFailure(),
+      }),
+    ).resolves.toMatchObject({
+      applied: true,
+      record: { deliveryAttempts: 1 },
+    });
+  });
+
+  it('compares numeric values without inventing a coalescing generation', async () => {
+    const db = database();
+    const s = new D1NotificationsStorage(db);
+    const original = await createDueNotification(s);
+    await db
+      .prepare('UPDATE mastra_notifications SET coalescedCount = -2.5')
+      .run();
+    await expect(
+      s.updateNotificationDeliveryIfUnchanged({
+        expected: {
+          ...captureNotificationDeliveryObservation(original),
+          deliveryAttempts: -0,
+          coalescedCount: -2.5,
+        },
+        failure: retryFailure(),
+      }),
+    ).resolves.toMatchObject({
+      applied: true,
+      record: { deliveryAttempts: 1, coalescedCount: -2.5 },
+    });
+  });
+
+  it.each([
+    'not-json',
+    '{"overflow":1e999}',
+  ])('rejects unreadable JSON in a supplied observation: %s', async (payload) => {
+    const s = store();
+    const original = await createDueNotification(s);
+    const expected = {
+      ...captureNotificationDeliveryObservation(original),
+      payload,
+    };
+    await expect(
+      new D1NotificationsStorage({
+        prepare() {
+          throw new Error('database must not be reached');
+        },
+      }).updateNotificationDeliveryIfUnchanged({
+        expected,
+        failure: retryFailure(),
+      }),
+    ).rejects.toMatchObject({
+      name: 'TypeError',
+      message: 'Notification delivery JSON is malformed',
+    });
+  });
+
+  it.each([
+    { deliveryAttempts: null },
+    { deliveryAttempts: Infinity },
+    { payload: {} },
+    { deliverAt: 1 },
+    { agentId: 1 },
+  ])('rejects unreadable driver row values before forgiving conversion %#', async (patch) => {
+    const db = database();
+    const s = new D1NotificationsStorage(
+      interceptFirst(db, async (query, read) => {
+        const row = await read();
+        return query.startsWith('SELECT *') &&
+          query.includes('thread_id COLLATE BINARY')
+          ? { ...(row as object), ...patch }
+          : row;
+      }),
+    );
+    const original = await createDueNotification(s);
+    const before = await rawNotification(db);
+    await expect(
+      s.updateNotificationDeliveryIfUnchanged({
+        expected: captureNotificationDeliveryObservation(original),
+        failure: retryFailure(),
+      }),
+    ).rejects.toThrow();
+    expect(await rawNotification(db)).toEqual(before);
+  });
+
+  it('bookkeeps path-unsafe physical bindings without routing them', async () => {
+    const s = store();
+    const original = await createDueNotification(s, {
+      threadId: '../thread',
+      resourceId: '../resource',
+      agentId: '',
+    });
+    await expect(
+      s.updateNotificationDeliveryIfUnchanged({
+        expected: captureNotificationDeliveryObservation(original),
+        failure: retryFailure(),
+      }),
+    ).resolves.toMatchObject({
+      applied: true,
+      record: { threadId: '../thread', deliveryAttempts: 1 },
+    });
+  });
+
+  it('isolates the configured table prefix', async () => {
+    const db = database();
+    const left = new D1NotificationsStorage(db, 'left_');
+    const right = new D1NotificationsStorage(db, 'right_');
+    const original = await createDueNotification(left);
+    const neighbor = await createDueNotification(right);
+    await left.updateNotificationDeliveryIfUnchanged({
+      expected: captureNotificationDeliveryObservation(original),
+      failure: retryFailure(),
+    });
+    expect(
+      await right.getNotification({ threadId: 'thread', id: 'receipt' }),
+    ).toEqual(neighbor);
+  });
+
+  it.each([
+    'before',
+    'after',
+  ] as const)('surfaces response loss %s the write without replay', async (phase) => {
+    const db = database();
+    let writes = 0;
+    const wrapped = interceptFirst(db, async (query, read) => {
+      if (!isDeliveryUpdate(query)) return read();
+      writes += 1;
+      if (phase === 'after') await read();
+      throw new Error('response lost');
+    });
+    const s = new D1NotificationsStorage(wrapped);
+    const original = await createDueNotification(s);
+    await expect(
+      s.updateNotificationDeliveryIfUnchanged({
+        expected: captureNotificationDeliveryObservation(original),
+        failure: retryFailure(),
+      }),
+    ).rejects.toThrow('response lost');
+    expect(writes).toBe(1);
+    expect((await rawNotification(db)).deliveryAttempts).toBe(
+      phase === 'after' ? 1 : 0,
+    );
+  });
+
+  it.each([
+    undefined,
+    false,
+    [],
+    {},
+    { deliveryAttempts: 1 },
+  ])('rejects a malformed database RETURNING row %#', async (returned) => {
+    const db = database();
+    const s = new D1NotificationsStorage(
+      interceptFirst(db, async (query, read) => {
+        const row = await read();
+        return isDeliveryUpdate(query) ? returned : row;
+      }),
+    );
+    const original = await createDueNotification(s);
+    await expect(
+      s.updateNotificationDeliveryIfUnchanged({
+        expected: captureNotificationDeliveryObservation(original),
+        failure: retryFailure(),
+      }),
+    ).rejects.toThrow();
+  });
+
+  it.each([
+    { id: 'wrong' },
+    { updatedAt: ATTEMPT_TIME },
+    { deliveryAttempts: 2 },
+    { lastDeliveryError: 'different' },
+    { summarySignalId: 'different' },
+    { payload: 'null' },
+  ])('rejects a database RETURNING row with a different receipt %#', async (patch) => {
+    const db = database();
+    const s = new D1NotificationsStorage(
+      interceptFirst(db, async (query, read) => {
+        const row = await read();
+        return isDeliveryUpdate(query) ? { ...(row as object), ...patch } : row;
+      }),
+    );
+    const original = await createDueNotification(s);
+    await expect(
+      s.updateNotificationDeliveryIfUnchanged({
+        expected: captureNotificationDeliveryObservation(original),
+        failure: retryFailure(),
+      }),
+    ).rejects.toThrow('different receipt');
+  });
+});
+
+describe('chronological notification timestamps', () => {
+  const now = new Date('2026-01-01T00:00:00.000Z');
+
+  it.each([
+    'deliverAt',
+    'summaryAt',
+  ] as const)('keeps a future extended-year %s out of a limited due window', async (cursor) => {
+    const s = store();
+    await s.createNotification({
+      id: 'future',
+      threadId: 'acme_t1',
+      source: 'test',
+      kind: 'ready',
+      summary: 'future',
+      [cursor]: new Date('+010000-01-01T00:00:00.000Z'),
+    });
+    await s.createNotification({
+      id: 'due',
+      threadId: 'acme_t1',
+      source: 'test',
+      kind: 'ready',
+      summary: 'due',
+      [cursor]: new Date(now.getTime() - 1),
+    });
+    expect(
+      (await s.listDueNotifications({ now, limit: 1 })).map((row) => row.id),
+    ).toEqual(['due']);
+  });
+
+  it('orders negative years by their instants before applying the limit', async () => {
+    const s = store();
+    for (const [id, timestamp] of [
+      ['newer', '-000001-01-01T00:00:00.000Z'],
+      ['older', '-000010-01-01T00:00:00.000Z'],
+    ] as const) {
+      await s.createNotification({
+        id,
+        threadId: 'acme_t1',
+        source: 'test',
+        kind: 'ready',
+        summary: id,
+        deliverAt: new Date(timestamp),
+      });
+    }
+    expect(
+      (await s.listDueNotifications({ now, limit: 1 })).map((row) => row.id),
+    ).toEqual(['older']);
+  });
+
+  it.each([
+    { timestamp: '2026-01-01T01:00:00+02:00', expected: 'offset' },
+    { timestamp: '2025-12-31T23:00:00-02:00', expected: 'due' },
+  ])('uses the instant of raw offset $timestamp in a limited due window', async ({
+    timestamp,
+    expected,
+  }) => {
+    const db = database();
+    const s = new D1NotificationsStorage(db);
+    const record = await s.createNotification({
+      id: 'offset',
+      threadId: 'acme_t1',
+      source: 'test',
+      kind: 'ready',
+      summary: 'offset',
+      summaryAt: new Date(timestamp),
+    });
+    await db
+      .prepare('UPDATE mastra_notifications SET summaryAt = ? WHERE id = ?')
+      .bind(timestamp, record.id)
+      .run();
+    await s.createNotification({
+      id: 'due',
+      threadId: 'acme_t1',
+      source: 'test',
+      kind: 'ready',
+      summary: 'due',
+      summaryAt: new Date(now.getTime() - 1),
+    });
+    expect(
+      (await s.listDueNotifications({ now, limit: 1 })).map((row) => row.id),
+    ).toEqual([expected]);
+  });
+
+  it('lists updated timestamps chronologically across extended years', async () => {
+    const db = database();
+    const s = new D1NotificationsStorage(db);
+    for (const [id, updatedAt] of [
+      ['ordinary', now.toISOString()],
+      ['future', '+010000-01-01T00:00:00.000Z'],
+    ] as const) {
+      const record = await s.createNotification({
+        id,
+        threadId: 'acme_t1',
+        source: 'test',
+        kind: 'ready',
+        summary: id,
+      });
+      await db
+        .prepare('UPDATE mastra_notifications SET updatedAt = ? WHERE id = ?')
+        .bind(updatedAt, record.id)
+        .run();
+    }
+    expect(
+      (await s.listNotifications({ threadId: 'acme_t1', limit: 1 })).map(
+        (row) => row.id,
+      ),
+    ).toEqual(['future']);
+  });
+});
+
+describe('notification timestamp conversion', () => {
+  const epochs = [
+    -8_640_000_000_000_000, -8_639_999_999_999_999, -62_167_219_200_001,
+    -62_167_219_200_000, -1, 0, 1, 253_402_300_799_999, 253_402_300_800_000,
+    253_402_300_800_001, 8_639_999_999_999_999, 8_640_000_000_000_000,
+  ];
+  for (let index = 1; index <= 64; index += 1) {
+    epochs.push(Math.trunc((index / 65) * 8_640_000_000_000_000));
+    epochs.push(-Math.trunc((index / 65) * 8_640_000_000_000_000));
+  }
+
+  const timestamps = [
+    ...epochs.map((epoch) => new Date(epoch).toISOString()),
+    '0000',
+    '0000-02',
+    '2026-09-09',
+    '-000001',
+    '-000001-02',
+    '+010000',
+    '+010000-02',
+    '1900-02-29T12:00:00.000Z',
+    '2000-02-29T12:00:00.000Z',
+    '2100-02-29T12:00:00.000Z',
+    '2400-02-29T12:00:00.000Z',
+    '9999-12-31T24:00:00.000Z',
+    '-000001-12-31T23:59:59.999-23:59',
+    '0000-01-01T00:00:00.001+23:59',
+    '+010000-01-01T00:00:00.1239+2359',
+    '+010000-12-31T23:59:59.9999-2359',
+    '+275760-09-13T01:00:00.000+01:00',
+    '-271821-04-19T23:00:00.000-0100',
+    '2026-09-09T12:34Z',
+    '2026-09-09T12:34:56.1Z',
+    '2026-09-09T12:34:56.12Z',
+    '2026-09-09T12:34:56.1239Z',
+    '2026-09-09T12:34:56.9999Z',
+    '2026-09-09T12:34:56.00000001Z',
+    '2026-09-09t12:34:56.123z',
+  ];
+
+  it.each(timestamps)('matches Date for %s', async (timestamp) => {
+    const db = database();
+    const expected = new Date(timestamp).getTime();
+    expect(Number.isFinite(expected)).toBe(true);
+    expect(notificationTimestampMillis(timestamp)).toBe(expected);
+    expect(notificationTimestampMillis(new Date(timestamp))).toBe(expected);
+    const row = await db
+      .prepare(
+        `SELECT ${notificationTimestampSql('deliverAt')} AS epoch
+         FROM (SELECT ? AS deliverAt)`,
+      )
+      .bind(timestamp)
+      .first<{ epoch: number }>();
+    expect(row?.epoch).toBe(expected);
+  });
+
+  it.each([
+    'now',
+    '1700000000000',
+    'September 9, 2026',
+    '2026-09-09T12:34:56',
+    '2026-09-09 12:34:56Z',
+    '2026-13-01',
+    '2026-01-32',
+    '2026-09-09T24:01:00Z',
+    '2026-09-09T12:60:00Z',
+    '2026-09-09T12:34:60Z',
+    '2026-09-09T12:34:56.Z',
+    '2026-09-09T12:34:56+2400',
+    '2026-09-09T12:34:56+00:60',
+    '-000000-01-01T00:00:00.000Z',
+    '+275760-09-13T00:00:00.001Z',
+    '-271821-04-19T23:59:59.999Z',
+    '2026\n',
+    '2026-09-09T12:34:56.123Z\0',
+    '2026-09-09T12:34:56.123Z\0ignored',
+    '+010000-01-01T00:00:00.123Z\0',
+  ])('leaves %j unavailable as a portable stored instant', async (timestamp) => {
+    expect(() => notificationTimestampMillis(timestamp)).toThrow(TypeError);
+    const db = database();
+    const row = await db
+      .prepare(
+        `SELECT ${notificationTimestampSql('updatedAt')} AS epoch
+         FROM (SELECT ? AS updatedAt)`,
+      )
+      .bind(timestamp)
+      .first<{ epoch: number | null }>();
+    expect(row?.epoch).toBeNull();
   });
 });

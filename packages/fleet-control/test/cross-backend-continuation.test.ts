@@ -1,0 +1,1481 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { auditFleetDrift, migrateFleet } from '../src/fleet.js';
+import {
+  type AdvanceFleetAuditOptions,
+  advanceFleetAudit,
+  type FleetAuditAdvanceAction,
+  type FleetAuditAdvanceResult,
+  readFleetAuditFindingsPage,
+} from '../src/fleet-audit-advance.js';
+import type { FleetOperationToken } from '../src/fleet-operation-state.js';
+import {
+  cleanupDeploymentArtifacts,
+  decommissionDeployment,
+  forceDecommissionDeployment,
+  ProvisioningError,
+  provisionDeployment,
+} from '../src/provision.js';
+import {
+  type DeploymentSpec,
+  effectiveLifecyclePhase,
+  type FleetRecord,
+  type FleetResourceInventory,
+  type FleetStateLease,
+  type FleetStateStore,
+  type ProvisioningBackend,
+} from '../src/types.js';
+import {
+  recordingFetch,
+  restProjection,
+} from './fixtures/cloudflare-fetch-fixture.js';
+import {
+  FakeInventoryRunStore,
+  FakeOperationStore,
+  uuidFor,
+} from './fixtures/fleet-operation-fakes.js';
+import {
+  assertHarnessFailuresConsumed,
+  buildPlainWorkerSpec,
+  captureFailure,
+  directHarness,
+  errorChain,
+  HarnessExportStore,
+  HarnessFleetStore,
+  ignoreFailure,
+  initialSpec,
+  migrationSpec,
+  type PlainWorkerHarness,
+  plainOnlyClient,
+  routeAttestation,
+  sharedSecrets,
+  wranglerHarness,
+} from './fixtures/plain-worker-harnesses.js';
+import {
+  type ProviderWorld,
+  providerWorld,
+} from './fixtures/provider-world.js';
+import {
+  type PlainWorkerFsControl,
+  registerScratchCleanup,
+} from './fixtures/wrangler-fs-mock.js';
+
+const fsControl = vi.hoisted<PlainWorkerFsControl>(() => ({
+  failFleetCleanup: false,
+  residualDirectory: undefined,
+  cleanupError: new Error('continuation scratch cleanup failed'),
+}));
+
+vi.mock('node:fs/promises', async () => {
+  const { createFsPromisesMock } = await import(
+    './fixtures/wrangler-fs-mock.js'
+  );
+  return createFsPromisesMock(fsControl);
+});
+
+const exportDirectories = registerScratchCleanup(fsControl, {
+  cleanupError: fsControl.cleanupError,
+});
+
+function wrangler(world?: ProviderWorld): PlainWorkerHarness {
+  const harness = wranglerHarness(world, { snapshot: true });
+  exportDirectories.add(harness.exportDirectory);
+  return harness;
+}
+
+function provision(harness: PlainWorkerHarness, spec: DeploymentSpec) {
+  return provisionWithStore(harness, harness.store, spec);
+}
+
+function provisionWithStore(
+  harness: Pick<PlainWorkerHarness, 'backend'>,
+  store: FleetStateStore,
+  spec: DeploymentSpec,
+) {
+  return provisionDeployment({
+    backend: harness.backend,
+    store,
+    spec,
+    secrets: sharedSecrets,
+    initialExecutionFenceState: 'open',
+    clock: () => 1_000,
+    routeAttestation,
+  });
+}
+
+function mapping(record: FleetRecord) {
+  return {
+    backend: record.backend,
+    scriptName: record.scriptName,
+    databaseName: record.databaseName,
+    databaseId: record.databaseId,
+    routeHostname: record.routeHostname,
+  };
+}
+
+function secretBinding(
+  bindings: readonly unknown[],
+  name = 'DEPLOYMENT_IDENTITY_SECRET',
+): object {
+  const binding = bindings.find(
+    (candidate) =>
+      candidate !== null &&
+      typeof candidate === 'object' &&
+      Reflect.get(candidate, 'type') === 'secret_text' &&
+      Reflect.get(candidate, 'name') === name,
+  );
+  if (!binding || typeof binding !== 'object') {
+    throw new Error(`missing secret binding '${name}'`);
+  }
+  return binding;
+}
+
+async function responseBindings(
+  response: Response,
+): Promise<readonly unknown[]> {
+  const envelope: unknown = await response.json();
+  const result =
+    envelope && typeof envelope === 'object'
+      ? Reflect.get(envelope, 'result')
+      : undefined;
+  const resources =
+    result && typeof result === 'object'
+      ? Reflect.get(result, 'resources')
+      : undefined;
+  const bindings =
+    resources && typeof resources === 'object'
+      ? Reflect.get(resources, 'bindings')
+      : undefined;
+  if (!Array.isArray(bindings)) {
+    throw new Error('projected version response has no binding array');
+  }
+  return bindings;
+}
+
+async function assertVersionProjectionRedaction(
+  world: ProviderWorld,
+  spec: DeploymentSpec,
+): Promise<void> {
+  const script = world.scripts.get(spec.scriptName);
+  const sourceVersion = script?.versions[0];
+  if (!sourceVersion) throw new Error('ready source has no Worker version');
+  expect(Reflect.get(secretBinding(sourceVersion.bindings), 'text')).toBe(
+    sharedSecrets.deploymentIdentity,
+  );
+
+  const responseWorld = world.clone();
+  const stagedResponse = await restProjection(responseWorld)({
+    method: 'POST',
+    url: `https://api.cloudflare.com/client/v4/accounts/account/workers/scripts/${spec.scriptName}/versions`,
+    body: {
+      metadata: {
+        annotations: { 'workers/tag': 'staged-response-proof' },
+        bindings: sourceVersion.bindings,
+        main_module: 'worker.js',
+      },
+      files: [
+        {
+          name: 'worker.js',
+          text: 'export default {}',
+          type: 'application/javascript+module',
+        },
+      ],
+    },
+    headers: new Headers(),
+    redirect: undefined,
+  });
+  const stagedSecret = secretBinding(await responseBindings(stagedResponse));
+  expect(Reflect.ownKeys(stagedSecret).sort()).toEqual(['name', 'type']);
+  expect(
+    Reflect.get(
+      secretBinding(
+        responseWorld.scripts.get(spec.scriptName)?.versions[0]?.bindings ?? [],
+      ),
+      'text',
+    ),
+  ).toBe(sharedSecrets.deploymentIdentity);
+
+  const exactResponse = await restProjection(world)({
+    method: 'GET',
+    url: `https://api.cloudflare.com/client/v4/accounts/account/workers/scripts/${spec.scriptName}/versions/${sourceVersion.versionId}`,
+    body: undefined,
+    headers: new Headers(),
+    redirect: undefined,
+  });
+  const exactSecret = secretBinding(await responseBindings(exactResponse));
+  expect(Reflect.ownKeys(exactSecret).sort()).toEqual(['name', 'type']);
+  expect(Reflect.get(secretBinding(sourceVersion.bindings), 'text')).toBe(
+    sharedSecrets.deploymentIdentity,
+  );
+}
+
+function worldFacts(world: ProviderWorld) {
+  return {
+    scripts: [...world.scripts.entries()].map(([name, script]) => ({
+      name,
+      present: script.present,
+      versions: structuredClone(script.versions),
+      deployment: structuredClone(script.deployment),
+      subdomain: { ...script.subdomain },
+      secretNames: [...script.secretNames].sort(),
+    })),
+    databases: world.databases.map(({ databaseId, name }) => ({
+      databaseId,
+      name,
+    })),
+    customDomains: structuredClone(world.customDomains),
+    zones: structuredClone(world.zones),
+    routes: structuredClone(world.routes),
+    durableObjectNamespaces: structuredClone(world.durableObjectNamespaces),
+    dispatchNamespaces: structuredClone(world.dispatchNamespaces),
+    exports: [...world.exports].map(([databaseId, bytes]) => [
+      databaseId,
+      [...bytes],
+    ]),
+    mutationLog: [...world.mutationLog],
+  };
+}
+
+class ContinuationFleetStore implements FleetStateStore {
+  readonly #records = new Map<string, FleetRecord>();
+  readonly #leases = new Set<string>();
+
+  constructor(records: readonly FleetRecord[]) {
+    for (const record of records) {
+      this.#records.set(this.#key(record.tenantTag, record.environment), {
+        ...structuredClone(record),
+      });
+    }
+  }
+
+  async withDeploymentLease<T>(
+    tenantTag: string,
+    environment: string,
+    operation: (lease: FleetStateLease) => Promise<T>,
+  ): Promise<T> {
+    const key = this.#key(tenantTag, environment);
+    if (this.#leases.has(key)) throw new Error('deployment is already leased');
+    this.#leases.add(key);
+    try {
+      return await operation({
+        tenantTag,
+        environment,
+        mutationLeaseTtlMs: 15 * 60_000,
+        assertOwned: async () => {},
+        renew: async () => {},
+        put: async (record) => {
+          this.#records.set(key, structuredClone(record));
+        },
+        delete: async () => {
+          this.#records.delete(key);
+        },
+      });
+    } finally {
+      this.#leases.delete(key);
+    }
+  }
+
+  async get(
+    tenantTag: string,
+    environment: string,
+  ): Promise<FleetRecord | undefined> {
+    const record = this.#records.get(this.#key(tenantTag, environment));
+    return record ? structuredClone(record) : undefined;
+  }
+
+  async list(): Promise<readonly FleetRecord[]> {
+    return [...this.#records.values()].map((record) => structuredClone(record));
+  }
+
+  #key(tenantTag: string, environment: string): string {
+    return `${tenantTag}:${environment}`;
+  }
+}
+
+class RepeatedPhaseFailureStore extends HarnessFleetStore {
+  #remainingFailures: number;
+
+  constructor(
+    world: ProviderWorld,
+    readonly failedPhase: FleetRecord['phase'],
+    failureCount: number,
+  ) {
+    super(world);
+    this.#remainingFailures = failureCount;
+  }
+
+  override async put(record: FleetRecord): Promise<void> {
+    if (
+      (record.phase === this.failedPhase ||
+        effectiveLifecyclePhase(record) === this.failedPhase) &&
+      this.#remainingFailures > 0
+    ) {
+      this.#remainingFailures -= 1;
+      throw new Error(`failed state write at ${this.failedPhase}`);
+    }
+    await super.put(record);
+  }
+}
+
+function migrate(
+  harness: Pick<PlainWorkerHarness, 'backend'>,
+  store: FleetStateStore,
+  record: FleetRecord,
+  spec: DeploymentSpec,
+) {
+  return migrateFleet({
+    store,
+    records: [record],
+    canaryTenantTags: [],
+    backendFor: () => harness.backend,
+    specFor: () => spec,
+    secretsFor: () => sharedSecrets,
+    clock: () => 2_000,
+    routeAttestation,
+  });
+}
+
+async function authorizedWranglerCreate(dispatched: boolean) {
+  const harness = wrangler();
+  const spec = buildPlainWorkerSpec();
+  const store = dispatched
+    ? new RepeatedPhaseFailureStore(harness.world, 'database-created', 2)
+    : harness.store;
+  harness.world.failNext('createDatabase', { dispatched });
+  const failure = await captureFailure(
+    provisionWithStore(harness, store, spec),
+  );
+  if (dispatched) {
+    expect(failure).toMatchObject({
+      message: 'failed state write at database-created',
+    });
+  } else {
+    expect(failure).toBeInstanceOf(ProvisioningError);
+  }
+  expect(store.record?.phase).toBe('database-create-authorized');
+  return { harness, spec, store };
+}
+
+describe('ordinary Worker cross-backend continuation', () => {
+  afterEach(assertHarnessFailuresConsumed);
+  it('converges a Wrangler-created ready deployment through the direct backend without provider mutations', async () => {
+    const spec = buildPlainWorkerSpec();
+    const source = wrangler();
+    const ready = await provision(source, spec);
+    const before = worldFacts(source.world);
+    const direct = directHarness(source.world);
+    direct.store.record = structuredClone(ready.record);
+
+    const converged = await provision(direct, spec);
+
+    expect(converged.record).toEqual(ready.record);
+    expect(worldFacts(source.world)).toEqual(before);
+  });
+
+  it('resumes every Wrangler provisioning snapshot with the direct backend', async () => {
+    const spec = buildPlainWorkerSpec();
+    const source = wrangler();
+    const ready = await provision(source, spec);
+    const snapshots = source.store.snapshots.filter(
+      ({ record }) => record.phase !== 'ready',
+    );
+    expect(
+      snapshots.map(({ record }) => [record.phase, record.schemaVersion]),
+    ).toEqual([
+      ['database-reserved', 0],
+      ['database-create-authorized', 0],
+      ['database-created', 0],
+      ['identity-seeded', 0],
+      ['identity-seeded', 1],
+      ['identity-seeded', 2],
+      ['migrated', 2],
+      ['application-resources-create-authorized', 2],
+      ['application-resources-deployed', 2],
+      ['worker-deployed', 2],
+      // The invocation-authority flip commits on a dedicated put before the
+      // first maintenance request.
+      ['worker-deployed', 2],
+      ['maintenance-armed', 2],
+      ['publishing', 2],
+    ]);
+
+    for (const snapshot of snapshots) {
+      const world = snapshot.world.clone();
+      const direct = directHarness(world);
+      direct.store.record = structuredClone(snapshot.record);
+      const persistedVersionExists = snapshot.world.scripts
+        .get(snapshot.record.scriptName)
+        ?.versions.some(
+          ({ versionId }) => versionId === snapshot.record.artifactVersion,
+        );
+
+      const resumed = await provision(direct, spec);
+
+      expect(resumed.record.phase).toBe('ready');
+      expect(resumed.record).toMatchObject({
+        backend: snapshot.record.backend,
+        scriptName: snapshot.record.scriptName,
+        databaseName: snapshot.record.databaseName,
+        routeHostname: snapshot.record.routeHostname,
+      });
+      if (
+        snapshot.record.phase !== 'database-reserved' &&
+        snapshot.record.phase !== 'database-create-authorized'
+      ) {
+        expect(resumed.record.databaseId).toBe(snapshot.record.databaseId);
+      }
+      expect(resumed.record.applicationResources).toEqual([]);
+      expect(
+        world.databases
+          .find(({ databaseId }) => databaseId === resumed.record.databaseId)
+          ?.d1.queryDatabase(
+            'SELECT version FROM anchorage_fleet_migrations ORDER BY version',
+          ),
+      ).toEqual([{ version: 1 }, { version: 2 }]);
+      expect(
+        world.scripts
+          .get(spec.scriptName)
+          ?.versions.some(
+            ({ versionId }) => versionId === resumed.record.artifactVersion,
+          ),
+      ).toBe(true);
+      if (persistedVersionExists) {
+        expect(resumed.record.artifactVersion).toBe(
+          snapshot.record.artifactVersion,
+        );
+      }
+    }
+    expect(ready.record.phase).toBe('ready');
+  });
+
+  it('resumes migration before and after the staged artifact is persisted', async () => {
+    const currentSpec = initialSpec();
+    const targetSpec = migrationSpec();
+    const source = wrangler();
+    const ready = await provision(source, currentSpec);
+    source.store.snapshots.length = 0;
+
+    await migrate(source, source.store, ready.record, targetSpec);
+
+    const withoutArtifact = source.store.snapshots.find(
+      ({ record }) =>
+        record.phase === 'migrating' &&
+        record.pendingSpecDigest !== undefined &&
+        record.pendingArtifactVersion === undefined,
+    );
+    const withArtifact = source.store.snapshots.find(
+      ({ record }) =>
+        record.phase === 'migrating' &&
+        record.pendingSpecDigest !== undefined &&
+        record.pendingArtifactVersion !== undefined,
+    );
+    if (!withoutArtifact || !withArtifact) {
+      throw new Error('Wrangler migration did not persist both resume states');
+    }
+
+    for (const snapshot of [withoutArtifact, withArtifact]) {
+      const world = snapshot.world.clone();
+      const direct = directHarness(world);
+      const otherRecord: FleetRecord = {
+        ...structuredClone(snapshot.record),
+        tenantTag: 'other',
+        environment: 'staging',
+        scriptName: 'other-staging',
+        databaseName: 'other-staging',
+        databaseId: 'database-other',
+        routeHostname: 'other.example.test',
+      };
+      const store = new ContinuationFleetStore([snapshot.record, otherRecord]);
+      const [resumed] = await migrate(
+        direct,
+        store,
+        snapshot.record,
+        targetSpec,
+      );
+
+      expect(resumed).toMatchObject({
+        phase: 'ready',
+        schemaVersion: targetSpec.schemaVersion,
+      });
+      expect(mapping(resumed ?? snapshot.record)).toEqual(
+        mapping(snapshot.record),
+      );
+      expect(resumed?.pendingSpecDigest).toBeUndefined();
+      expect(resumed?.pendingArtifactVersion).toBeUndefined();
+      await expect(store.get('other', 'staging')).resolves.toEqual(otherRecord);
+      expect(
+        world.scripts
+          .get(targetSpec.scriptName)
+          ?.versions.some(
+            ({ versionId }) => versionId === resumed?.artifactVersion,
+          ),
+      ).toBe(true);
+    }
+  });
+
+  it('aborts authorized and owned Wrangler-shaped partial deployments through the direct backend', async () => {
+    const authorized = await authorizedWranglerCreate(true);
+    const directAuthorized = directHarness(authorized.harness.world);
+    directAuthorized.store.record = structuredClone(authorized.store.record);
+
+    await cleanupDeploymentArtifacts({
+      backend: directAuthorized.backend,
+      store: directAuthorized.store,
+      spec: authorized.spec,
+    });
+
+    expect(directAuthorized.store.record).toBeUndefined();
+    expect(directAuthorized.world.databases).toEqual([]);
+    expect([...directAuthorized.store.receipts.values()]).toMatchObject([
+      {
+        disposition: 'prepublication-owned-no-export',
+        admittedPhase: 'database-create-authorized',
+        authority: 'manual-cleanup',
+      },
+    ]);
+
+    const source = wrangler();
+    const spec = buildPlainWorkerSpec();
+    await provision(source, spec);
+    // The never-authorized carrier keeps trusted plain no-export cleanup
+    // through worker-deployed; the maintenance-armed row is authorized and
+    // now refuses toward export-backed decommissioning.
+    const snapshot = source.store.snapshots.find(
+      ({ record }) => record.phase === 'worker-deployed',
+    );
+    if (!snapshot) throw new Error('missing worker-deployed snapshot');
+    expect(snapshot.record.invocationAuthority).toEqual({
+      version: 1,
+      authorizedAt: null,
+    });
+    const direct = directHarness(snapshot.world.clone());
+    direct.store.record = structuredClone(snapshot.record);
+
+    await cleanupDeploymentArtifacts({
+      backend: direct.backend,
+      store: direct.store,
+      spec,
+    });
+
+    expect(direct.store.record).toBeUndefined();
+    expect(direct.world.databases).toEqual([]);
+    expect(direct.world.scripts.get(spec.scriptName)?.present).toBe(false);
+    expect([...direct.store.receipts.values()]).toMatchObject([
+      {
+        disposition: 'prepublication-owned-no-export',
+        admittedPhase: 'worker-deployed',
+      },
+    ]);
+  });
+
+  it('refuses legacy ambiguous-phase snapshots without mutation and routes them to export-backed decommission', async () => {
+    const source = wrangler();
+    const spec = buildPlainWorkerSpec();
+    await provision(source, spec);
+    for (const phase of ['worker-deployed', 'maintenance-armed'] as const) {
+      const snapshot = source.store.snapshots.find(
+        ({ record }) => record.phase === phase,
+      );
+      if (!snapshot) throw new Error(`missing ${phase} snapshot`);
+      const world = snapshot.world.clone();
+      const direct = directHarness(world);
+      // A legacy row predates the invocation-authority carrier entirely, so
+      // its phase alone cannot rule out a dispatched candidate invocation.
+      const { invocationAuthority: _carrier, ...legacy } = structuredClone(
+        snapshot.record,
+      );
+      direct.store.record = legacy;
+      const before = worldFacts(world);
+
+      const failure = await captureFailure(
+        cleanupDeploymentArtifacts({
+          backend: direct.backend,
+          store: direct.store,
+          spec,
+        }),
+      );
+
+      expect((failure as Error).message).toBe(
+        'legacy deployment phase cannot rule out candidate invocation; use export-backed decommissioning',
+      );
+      expect(worldFacts(world)).toEqual(before);
+      expect(direct.store.record).toEqual(legacy);
+      expect(direct.store.receipts.size).toBe(0);
+
+      // The refused row stays provisioning-resumable; completing it makes
+      // the deployment decommissionable with its export receipt.
+      const resumed = await provision(direct, spec);
+      expect(resumed.record.phase).toBe('ready');
+      const decommissioned = await decommissionDeployment({
+        backend: direct.backend,
+        store: direct.store,
+        spec,
+      });
+      expect(decommissioned.record.phase).toBe('decommissioned');
+      expect(decommissioned.databaseExport.size).toBeGreaterThan(0);
+      expect(world.databases).toEqual([]);
+      expect(world.scripts.get(spec.scriptName)?.present).toBe(false);
+    }
+  });
+
+  it('refuses foreign and mismatched resources during direct abort', async () => {
+    const foreign = await authorizedWranglerCreate(false);
+    const foreignDirect = directHarness(foreign.harness.world);
+    foreignDirect.store.record = structuredClone(foreign.store.record);
+    const foreignDatabase = foreignDirect.world.seedDatabase(
+      foreign.spec.databaseName,
+    );
+    await foreignDirect.backend.seedDeploymentIdentity(
+      {
+        id: foreignDatabase.databaseId,
+        name: foreignDatabase.name,
+        created: false,
+      },
+      'foreign',
+      {
+        mutationLeaseTtlMs: 15 * 60_000,
+        assertOwned: async () => {},
+      },
+      { initialExecutionFenceState: 'open' },
+    );
+
+    const foreignFailure = await captureFailure(
+      cleanupDeploymentArtifacts({
+        backend: foreignDirect.backend,
+        store: foreignDirect.store,
+        spec: foreign.spec,
+      }),
+    );
+    expect(errorChain(foreignFailure)).toContain("owned by 'foreign'");
+    // The provider refusal fires inside the database-deletion group, after
+    // the intent was durably admitted; the row stays resumable there.
+    expect(foreignDirect.store.record?.phase).toBe('cleanup-advancing');
+    expect(
+      foreignDirect.store.record?.cleanupIntent?.identity.admittedPhase,
+    ).toBe('database-create-authorized');
+
+    const source = wrangler();
+    const spec = buildPlainWorkerSpec();
+    await provision(source, spec);
+    const worker = source.store.snapshots.find(
+      ({ record }) => record.phase === 'worker-deployed',
+    );
+    if (!worker) throw new Error('missing worker-deployed snapshot');
+    const mismatched = directHarness(worker.world.clone());
+    mismatched.store.record = structuredClone(worker.record);
+    const index = mismatched.world.databases.findIndex(
+      ({ databaseId }) => databaseId === worker.record.databaseId,
+    );
+    mismatched.world.databases.splice(index, 1);
+    mismatched.world.seedDatabase('mismatched-name', {
+      databaseId: worker.record.databaseId,
+    });
+
+    const mismatchFailure = await captureFailure(
+      cleanupDeploymentArtifacts({
+        backend: mismatched.backend,
+        store: mismatched.store,
+        spec,
+      }),
+    );
+    expect(mismatchFailure).toBeInstanceOf(AggregateError);
+    expect(
+      (mismatchFailure as AggregateError).errors.map((error) =>
+        errorChain(error),
+      ),
+    ).toEqual([expect.stringContaining('resolved with unexpected identity')]);
+    expect(mismatched.store.record?.phase).toBe('cleanup-advancing');
+    expect(mismatched.store.record?.cleanupIntent?.identity.admittedPhase).toBe(
+      'worker-deployed',
+    );
+  });
+
+  it('preserves a direct recovery whose maintenance request was authorized and completes through export-backed decommission', async () => {
+    const authorized = await authorizedWranglerCreate(true);
+    const direct = directHarness(authorized.harness.world);
+    direct.store.record = structuredClone(authorized.store.record);
+    const deployWorker = direct.backend.deployWorker.bind(direct.backend);
+    let deployedCreated: boolean | undefined;
+    vi.spyOn(direct.backend, 'deployWorker').mockImplementation(
+      async (...arguments_) => {
+        const deployed = await deployWorker(...arguments_);
+        deployedCreated = deployed.created;
+        return deployed;
+      },
+    );
+    direct.world.failNext('ensureMaintenance', { dispatched: false });
+
+    const failure = await captureFailure(provision(direct, authorized.spec));
+
+    expect(failure).toBeInstanceOf(ProvisioningError);
+    expect(deployedCreated).toBe(true);
+    // The invocation-authority flip committed before the maintenance
+    // request, so rollback refuses no-export teardown and preserves the
+    // deployment whole for export-backed decommissioning.
+    expect((failure as ProvisioningError).cleanupErrors).toEqual([
+      expect.objectContaining({
+        message:
+          'deployment candidate invocation was durably authorized; use export-backed decommissioning',
+      }),
+    ]);
+    expect(direct.store.record?.phase).toBe('worker-deployed');
+    expect(direct.world.databases).toHaveLength(1);
+    expect(direct.world.scripts.get(authorized.spec.scriptName)?.present).toBe(
+      true,
+    );
+
+    const resumed = await provision(direct, authorized.spec);
+    expect(resumed.record.phase).toBe('ready');
+    const decommissioned = await decommissionDeployment({
+      backend: direct.backend,
+      store: direct.store,
+      spec: authorized.spec,
+    });
+    expect(decommissioned.record.phase).toBe('decommissioned');
+    expect(decommissioned.databaseExport.size).toBeGreaterThan(0);
+    expect(direct.world.databases).toEqual([]);
+    expect(direct.world.scripts.get(authorized.spec.scriptName)?.present).toBe(
+      false,
+    );
+  });
+
+  it('does not roll back a direct resume that started at database-created', async () => {
+    const source = wrangler();
+    const spec = buildPlainWorkerSpec();
+    await provision(source, spec);
+    const created = source.store.snapshots.find(
+      ({ record }) => record.phase === 'database-created',
+    );
+    if (!created) throw new Error('missing database-created snapshot');
+    const direct = directHarness(created.world.clone());
+    direct.store.record = structuredClone(created.record);
+    direct.world.failNext('ensureMaintenance', { dispatched: false });
+
+    await expect(provision(direct, spec)).rejects.toBeInstanceOf(
+      ProvisioningError,
+    );
+
+    expect(direct.store.record?.phase).toBe('worker-deployed');
+    expect(direct.world.databases).toHaveLength(1);
+    expect(direct.world.scripts.get(spec.scriptName)?.present).toBe(true);
+  });
+
+  it('decommissions a Wrangler-created ready deployment through the direct backend', async () => {
+    const source = wrangler();
+    const spec = buildPlainWorkerSpec();
+    const ready = await provision(source, spec);
+    const direct = directHarness(source.world);
+    direct.store.record = structuredClone(ready.record);
+
+    const result = await decommissionDeployment({
+      backend: direct.backend,
+      store: direct.store,
+      spec,
+    });
+
+    expect(result.record.phase).toBe('decommissioned');
+    expect(direct.world.databases).toEqual([]);
+    expect(direct.world.scripts.get(spec.scriptName)?.present).toBe(false);
+  });
+
+  it('reprovisions the decommissioned slug through the direct backend without touching the old database', async () => {
+    const source = wrangler();
+    const spec = buildPlainWorkerSpec();
+    const ready = await provision(source, spec);
+    const direct = directHarness(source.world);
+    direct.store.record = structuredClone(ready.record);
+    const retired = await decommissionDeployment({
+      backend: direct.backend,
+      store: direct.store,
+      spec,
+    });
+    expect(retired.record.phase).toBe('decommissioned');
+    const mutationsAtTeardown = direct.world.mutationLog.length;
+
+    const reprovisioned = await provision(direct, spec);
+
+    expect(reprovisioned.record.phase).toBe('ready');
+    expect(reprovisioned.record.databaseId).not.toBe(retired.record.databaseId);
+    expect(reprovisioned.record.scriptName).toBe(ready.record.scriptName);
+    expect(reprovisioned.record.databaseName).toBe(ready.record.databaseName);
+    expect(reprovisioned.record.routeHostname).toBe(ready.record.routeHostname);
+    expect(
+      direct.world.mutationLog
+        .slice(mutationsAtTeardown)
+        .filter((entry) => entry.includes(retired.record.databaseId)),
+    ).toEqual([]);
+  });
+
+  it('retries every direct teardown state write from its retained predecessor', async () => {
+    const source = wrangler();
+    const spec = buildPlainWorkerSpec();
+    const ready = await provision(source, spec);
+    const rows: readonly Readonly<{
+      phase: FleetRecord['phase'];
+      predecessor: FleetRecord['phase'];
+    }>[] = [
+      { phase: 'decommissioning', predecessor: 'ready' },
+      { phase: 'traffic-removed', predecessor: 'decommissioning' },
+      { phase: 'credentials-revoked', predecessor: 'traffic-removed' },
+      { phase: 'worker-deleted', predecessor: 'credentials-revoked' },
+      {
+        phase: 'platform-credentials-revoked',
+        predecessor: 'worker-deleted',
+      },
+      {
+        phase: 'platform-resources-deleted',
+        predecessor: 'platform-credentials-revoked',
+      },
+      {
+        phase: 'application-resources-deleting',
+        predecessor: 'platform-resources-deleted',
+      },
+      {
+        phase: 'application-resources-deleted',
+        predecessor: 'application-resources-deleting',
+      },
+      {
+        phase: 'database-exported',
+        predecessor: 'application-resources-deleted',
+      },
+      { phase: 'database-deleting', predecessor: 'database-exported' },
+      { phase: 'decommissioned', predecessor: 'database-deleting' },
+    ];
+
+    for (const row of rows) {
+      const direct = directHarness(source.world.clone());
+      direct.store.record = structuredClone(ready.record);
+      direct.store.failPutPhase = row.phase;
+
+      await expect(
+        decommissionDeployment({
+          backend: direct.backend,
+          store: direct.store,
+          spec,
+        }),
+      ).rejects.toThrow(`failed state write at ${row.phase}`);
+      const retained = direct.store.record;
+      if (!retained) throw new Error('failed write removed the Fleet row');
+      expect(effectiveLifecyclePhase(retained)).toBe(row.predecessor);
+
+      const retried = await decommissionDeployment({
+        backend: direct.backend,
+        store: direct.store,
+        spec,
+      });
+      expect(retried.record.phase).toBe('decommissioned');
+      expect(direct.world.databases).toEqual([]);
+    }
+  });
+
+  it('force-decommissions a wedged Wrangler-created deployment through the direct backend', async () => {
+    const source = wrangler();
+    const spec = buildPlainWorkerSpec();
+    const ready = await provision(source, spec);
+    const direct = directHarness(source.world);
+    direct.store.record = {
+      ...structuredClone(ready.record),
+      phase: 'migrating',
+      pendingSpecDigest: 'f'.repeat(64),
+    };
+
+    await forceDecommissionDeployment({
+      backend: direct.backend,
+      store: direct.store,
+      tenantTag: spec.tenantTag,
+      environment: spec.environment,
+    });
+
+    expect(direct.store.record).toBeUndefined();
+    expect(direct.world.databases).toEqual([]);
+    expect(direct.world.scripts.get(spec.scriptName)?.present).toBe(true);
+    expect(direct.world.scripts.get(spec.scriptName)?.subdomain).toEqual({
+      enabled: false,
+      previewsEnabled: false,
+    });
+    expect(direct.world.scripts.get(spec.scriptName)?.secretNames.size).toBe(0);
+  });
+
+  it('converges direct continuation after every ambiguous provider boundary', async () => {
+    const spec = buildPlainWorkerSpec();
+
+    const createSource = await authorizedWranglerCreate(false);
+    const create = directHarness(createSource.harness.world);
+    create.store.record = structuredClone(createSource.store.record);
+    create.world.failNext('createDatabase', { dispatched: true });
+    // The core adopts an exact unowned database after a lost create response.
+    const created = await provision(create, spec);
+    expect(created.record.phase).toBe('ready');
+    expect(create.world.databases).toHaveLength(1);
+    expect(created.record.databaseId).toBe(
+      create.world.databases[0]?.databaseId,
+    );
+    expect(
+      create.world.mutationLog.filter((entry) =>
+        entry.startsWith('create-database:'),
+      ),
+    ).toHaveLength(1);
+
+    const source = wrangler();
+    const ready = await provision(source, spec);
+    await assertVersionProjectionRedaction(source.world, spec);
+    const beforeWorker = source.store.snapshots.find(
+      ({ record }) => record.phase === 'application-resources-deployed',
+    );
+    if (!beforeWorker) {
+      throw new Error('missing application-resources-deployed snapshot');
+    }
+    const upload = directHarness(beforeWorker.world.clone());
+    upload.store.record = structuredClone(beforeWorker.record);
+    upload.world.failNext('uploadCandidate', { dispatched: true });
+    expect((await provision(upload, spec)).record.phase).toBe('ready');
+
+    for (const operation of ['deployCandidate', 'promoteWorker']) {
+      const direct = directHarness(source.world.clone());
+      direct.store.record = structuredClone(ready.record);
+      const targetSpec = migrationSpec();
+      direct.world.failNext(operation, { dispatched: true });
+      const [resumed] = await migrate(
+        direct,
+        direct.store,
+        ready.record,
+        targetSpec,
+      );
+      expect(resumed?.phase).toBe('ready');
+    }
+
+    const deletion = directHarness(source.world.clone());
+    deletion.store.record = structuredClone(ready.record);
+    deletion.world.failNext('deleteWorkerScript', { dispatched: true });
+    await ignoreFailure(
+      decommissionDeployment({
+        backend: deletion.backend,
+        store: deletion.store,
+        spec,
+      }),
+    );
+    const removed = await decommissionDeployment({
+      backend: deletion.backend,
+      store: deletion.store,
+      spec,
+    });
+    expect(removed.record.phase).toBe('decommissioned');
+
+    const beforeAttach = source.store.snapshots.find(
+      ({ record }) => record.phase === 'publishing',
+    );
+    if (!beforeAttach) throw new Error('missing publishing snapshot');
+    const attached = directHarness(beforeAttach.world.clone());
+    attached.store.record = structuredClone(beforeAttach.record);
+    attached.world.failNext('attachCustomDomain', { dispatched: true });
+    await ignoreFailure(provision(attached, spec));
+    const attachedReady = await provision(attached, spec);
+    expect(attachedReady.record.phase).toBe('ready');
+    expect(attached.world.customDomains).toEqual([
+      expect.objectContaining({
+        hostname: spec.routeHostname,
+        service: spec.scriptName,
+      }),
+    ]);
+
+    const detached = directHarness(source.world.clone());
+    detached.store.record = structuredClone(ready.record);
+    detached.world.failNext('detachCustomDomain', { dispatched: true });
+    await ignoreFailure(
+      decommissionDeployment({
+        backend: detached.backend,
+        store: detached.store,
+        spec,
+      }),
+    );
+    const detachedReady = await decommissionDeployment({
+      backend: detached.backend,
+      store: detached.store,
+      spec,
+    });
+    expect(detachedReady.record.phase).toBe('decommissioned');
+
+    const databaseDeletion = directHarness(source.world.clone());
+    databaseDeletion.store.record = structuredClone(ready.record);
+    if (
+      typeof databaseDeletion.backend.advanceDecommissionAttachmentScan !==
+        'function' ||
+      typeof databaseDeletion.backend.exportDatabaseReceipt !== 'function' ||
+      databaseDeletion.backend.databaseExportReceiptAuthority === undefined ||
+      typeof databaseDeletion.backend.assertDatabaseDeletionResidualsRemoved !==
+        'function'
+    ) {
+      throw new Error('direct continuation has no bounded teardown capability');
+    }
+    const boundedScan = vi.spyOn(
+      databaseDeletion.backend,
+      'advanceDecommissionAttachmentScan',
+    );
+    const boundedReceipt = vi.spyOn(
+      databaseDeletion.backend,
+      'exportDatabaseReceipt',
+    );
+    const boundedResiduals = vi.spyOn(
+      databaseDeletion.backend,
+      'assertDatabaseDeletionResidualsRemoved',
+    );
+    const legacyAttachments = vi
+      .spyOn(databaseDeletion.backend, 'assertDatabaseDetached')
+      .mockRejectedValue(
+        new Error('bounded continuation used legacy attachment enumeration'),
+      );
+    const legacyExport = vi
+      .spyOn(databaseDeletion.backend, 'exportDatabase')
+      .mockRejectedValue(new Error('bounded continuation used legacy export'));
+    databaseDeletion.world.failNext('deleteDatabase', { dispatched: true });
+    const databaseDeleted = await decommissionDeployment({
+      backend: databaseDeletion.backend,
+      store: databaseDeletion.store,
+      spec,
+    });
+    expect(databaseDeleted.record.phase).toBe('decommissioned');
+    expect(databaseDeletion.world.databases).toEqual([]);
+    expect(boundedScan).toHaveBeenCalled();
+    expect(boundedReceipt).toHaveBeenCalledTimes(1);
+    expect(boundedResiduals).toHaveBeenCalled();
+    expect(legacyAttachments).not.toHaveBeenCalled();
+    expect(legacyExport).not.toHaveBeenCalled();
+    expect(
+      databaseDeletion.world.mutationLog.filter(
+        (entry) => entry === `delete-database:${ready.record.databaseId}`,
+      ),
+    ).toHaveLength(1);
+
+    const secretDeletion = directHarness(source.world.clone());
+    secretDeletion.store.record = structuredClone(ready.record);
+    secretDeletion.world.failNext('deleteControlSecrets', {
+      dispatched: true,
+    });
+    await ignoreFailure(
+      decommissionDeployment({
+        backend: secretDeletion.backend,
+        store: secretDeletion.store,
+        spec,
+      }),
+    );
+    const secretsDeleted = await decommissionDeployment({
+      backend: secretDeletion.backend,
+      store: secretDeletion.store,
+      spec,
+    });
+    expect(secretsDeleted.record.phase).toBe('decommissioned');
+    expect(
+      secretDeletion.world.scripts.get(spec.scriptName)?.secretNames.size,
+    ).toBe(0);
+
+    const publicAccess = directHarness(source.world.clone());
+    publicAccess.store.record = {
+      ...structuredClone(ready.record),
+      phase: 'migrating',
+      pendingSpecDigest: 'f'.repeat(64),
+    };
+    publicAccess.world.failNext('disablePublicAccess', { dispatched: true });
+    await ignoreFailure(
+      forceDecommissionDeployment({
+        backend: publicAccess.backend,
+        store: publicAccess.store,
+        tenantTag: spec.tenantTag,
+        environment: spec.environment,
+      }),
+    );
+    await forceDecommissionDeployment({
+      backend: publicAccess.backend,
+      store: publicAccess.store,
+      tenantTag: spec.tenantTag,
+      environment: spec.environment,
+    });
+    expect(publicAccess.store.record).toBeUndefined();
+    expect(publicAccess.world.scripts.get(spec.scriptName)?.subdomain).toEqual({
+      enabled: false,
+      previewsEnabled: false,
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Audit continuation across the backend-origin boundary. The bounded audit
+// coordinator needs two durable stores the provisioning harnesses do not carry
+// (`FleetOperationStore` and `FleetInventoryRunStore`) and one finalized
+// `FleetResourceInventory` generation; the stores come from
+// `test/fixtures/fleet-operation-fakes.ts` and the generation is collected from
+// this world through the real inventory engine. `backendFor` is a per-call
+// option the continuation token never carries, so an audit's backend switch is
+// a switch of that option over one operation store, one inventory store, and
+// one world.
+// ---------------------------------------------------------------------------
+
+/**
+ * The audit's frozen instant. The provider world answers maintenance health
+ * with `alarmAt: 2_000`, `lastSweepAt: 1_000`, and `lastPurgeAt: 1_000`, and
+ * `provision` stamps every record at 1_000, so pinning both audit clocks here
+ * leaves every duty inside `AUDIT_STALE_AFTER_MS` and the maintenance re-arm
+ * branch untaken.
+ */
+const AUDIT_NOW_MS = 1_000;
+const AUDIT_STALE_AFTER_MS = 3_600_000;
+const AUDIT_TENANT_TAGS = ['acme', 'beta'] as const;
+
+/**
+ * Every audited tenant keeps `buildPlainWorkerSpec`'s maintenance base URL,
+ * because a provider world serves one maintenance origin. Each tenant's
+ * inspection still resolves its own script there: the backend sends a
+ * version-override header for a deployed candidate, and the world's
+ * maintenance responder reads the script name out of it.
+ */
+function auditSpec(tenantTag: string): DeploymentSpec {
+  return buildPlainWorkerSpec({
+    tenantTag,
+    scriptName: `fleet-${tenantTag}-production`,
+    databaseName: `fleet-${tenantTag}-production`,
+    routeHostname: `${tenantTag}.example.test`,
+  });
+}
+
+/**
+ * Wraps one backend so every inspection and maintenance re-arm the audit
+ * reaches it through is recorded with its origin. An `inspect` that resolves
+ * appends a second entry naming its outcome, so a log that ends at the
+ * `inspect` entry is an inspection that threw.
+ */
+function observedAuditBackend(
+  origin: string,
+  backend: ProvisioningBackend,
+  log: string[],
+): ProvisioningBackend {
+  const inspect = backend.inspect.bind(backend);
+  vi.spyOn(backend, 'inspect').mockImplementation(
+    async (spec, maintenanceAdminSecret, expectedArtifactVersion) => {
+      log.push(`${origin}:inspect:${spec.tenantTag}`);
+      const live = await inspect(
+        spec,
+        maintenanceAdminSecret,
+        expectedArtifactVersion,
+      );
+      log.push(`${origin}:${live ? 'live' : 'absent'}:${spec.tenantTag}`);
+      return live;
+    },
+  );
+  const ensureMaintenance = backend.ensureMaintenance.bind(backend);
+  vi.spyOn(backend, 'ensureMaintenance').mockImplementation(
+    async (spec, maintenanceAdminSecret, fence, expectedArtifactVersion) => {
+      log.push(`${origin}:ensureMaintenance:${spec.tenantTag}`);
+      return ensureMaintenance(
+        spec,
+        maintenanceAdminSecret,
+        fence,
+        expectedArtifactVersion,
+      );
+    },
+  );
+  return backend;
+}
+
+interface AuditFleet {
+  readonly world: ProviderWorld;
+  readonly records: readonly FleetRecord[];
+  readonly inventory: FleetResourceInventory;
+  readonly operationStore: FakeOperationStore;
+  readonly fleetStore: ContinuationFleetStore;
+  readonly log: string[];
+  readonly wranglerBackend: ProvisioningBackend;
+  readonly directBackend: ProvisioningBackend;
+  readonly specFor: (record: FleetRecord) => DeploymentSpec;
+  readonly maintenanceSecretFor: () => string;
+  options(
+    action: FleetAuditAdvanceAction,
+    backend: ProvisioningBackend,
+  ): AdvanceFleetAuditOptions;
+}
+
+/**
+ * Provisions every tenant in `AUDIT_TENANT_TAGS` through its own Wrangler
+ * backend over ONE provider world, then pins that world's collected inventory
+ * as generation 1.
+ */
+async function wranglerAuditFleet(): Promise<AuditFleet> {
+  const world = providerWorld('uuid');
+  const specs = new Map<string, DeploymentSpec>();
+  const records: FleetRecord[] = [];
+  const sources: PlainWorkerHarness[] = [];
+  for (const tenantTag of AUDIT_TENANT_TAGS) {
+    const spec = auditSpec(tenantTag);
+    specs.set(tenantTag, spec);
+    const source = wrangler(world);
+    sources.push(source);
+    records.push((await provision(source, spec)).record);
+  }
+  const wranglerOrigin = sources[0];
+  if (!wranglerOrigin) throw new Error('audit fleet has no Wrangler origin');
+
+  const inventory = await plainOnlyClient(
+    recordingFetch(restProjection(world)),
+    new HarnessExportStore(),
+  ).collectFleetInventory({
+    databaseNamePrefix: 'fleet-',
+    scriptNamePrefix: 'fleet-',
+    includeDispatchNamespace: false,
+  });
+  const operationStore = new FakeOperationStore();
+  const inventoryStore = new FakeInventoryRunStore();
+  inventoryStore.registerFinalizedGeneration(1, inventory);
+  const fleetStore = new ContinuationFleetStore(records);
+  const log: string[] = [];
+  const specFor = (record: FleetRecord) => {
+    const spec = specs.get(record.tenantTag);
+    if (!spec) throw new Error(`no spec for '${record.tenantTag}'`);
+    return spec;
+  };
+  const maintenanceSecretFor = () => sharedSecrets.maintenanceAdmin;
+  return {
+    world,
+    records,
+    inventory,
+    operationStore,
+    fleetStore,
+    log,
+    wranglerBackend: observedAuditBackend(
+      'wrangler',
+      wranglerOrigin.backend,
+      log,
+    ),
+    directBackend: observedAuditBackend(
+      'direct',
+      directHarness(world).backend,
+      log,
+    ),
+    specFor,
+    maintenanceSecretFor,
+    options(action, backend) {
+      return {
+        operationStore,
+        inventoryStore,
+        fleetStore,
+        action,
+        backendFor: () => backend,
+        specFor,
+        maintenanceSecretFor,
+        auditClock: () => AUDIT_NOW_MS,
+        authorityClock: () => AUDIT_NOW_MS,
+      };
+    },
+  };
+}
+
+function auditInspections(log: readonly string[]): readonly string[] {
+  return log.filter((entry) => entry.includes(':inspect:'));
+}
+
+function auditMaintenanceCalls(log: readonly string[]): readonly string[] {
+  return log.filter((entry) => entry.includes(':ensureMaintenance:'));
+}
+
+function pendingAuditToken(
+  result: FleetAuditAdvanceResult,
+): FleetOperationToken {
+  if (result.status !== 'pending') {
+    throw new Error(`expected a pending audit result, got '${result.status}'`);
+  }
+  return result.token;
+}
+
+/**
+ * Advances the operation through `backend` until `stop` holds, and answers the
+ * token the next leg resumes from. `cap` is slack: every stage this fleet
+ * reaches commits once per call.
+ */
+async function advanceAuditUntil(
+  fleet: AuditFleet,
+  backend: ProvisioningBackend,
+  firstToken: FleetOperationToken,
+  stop: () => boolean,
+  cap = 60,
+): Promise<FleetOperationToken> {
+  let token = firstToken;
+  for (let attempt = 0; attempt < cap; attempt += 1) {
+    if (stop()) return token;
+    token = pendingAuditToken(
+      await advanceFleetAudit(
+        fleet.options({ kind: 'continue', token }, backend),
+      ),
+    );
+  }
+  throw new Error(`advanceAuditUntil exceeded its ${cap}-call cap`);
+}
+
+/** Advances the operation through `backend` to a terminal result. */
+async function advanceAuditToTerminal(
+  fleet: AuditFleet,
+  backend: ProvisioningBackend,
+  firstToken: FleetOperationToken,
+  cap = 60,
+): Promise<FleetAuditAdvanceResult> {
+  let token = firstToken;
+  for (let attempt = 0; attempt < cap; attempt += 1) {
+    const result = await advanceFleetAudit(
+      fleet.options({ kind: 'continue', token }, backend),
+    );
+    if (result.status !== 'pending') return result;
+    token = result.token;
+  }
+  throw new Error(`advanceAuditToTerminal exceeded its ${cap}-call cap`);
+}
+
+describe('ordinary Worker cross-backend audit continuation', () => {
+  afterEach(assertHarnessFailuresConsumed);
+
+  it('finishes a Wrangler-origin audit through the direct backend on the token leg 1 minted', async () => {
+    const fleet = await wranglerAuditFleet();
+    const operationId = uuidFor(701);
+
+    const started = await advanceFleetAudit(
+      fleet.options(
+        {
+          kind: 'start',
+          operationId,
+          records: fleet.records,
+          staleAfterMs: AUDIT_STALE_AFTER_MS,
+        },
+        fleet.wranglerBackend,
+      ),
+    );
+    const handoff = await advanceAuditUntil(
+      fleet,
+      fleet.wranglerBackend,
+      pendingAuditToken(started),
+      () => auditInspections(fleet.log).length === 1,
+    );
+    expect(auditInspections(fleet.log)).toEqual(['wrangler:inspect:acme']);
+
+    // The switch is a `backendFor` switch over the same operation store, the
+    // same inventory store, and the same world: the token carries only
+    // { version, operationId, revision }.
+    const resumed = await advanceFleetAudit(
+      fleet.options({ kind: 'continue', token: handoff }, fleet.directBackend),
+    );
+
+    expect(resumed.token.operationId).toBe(handoff.operationId);
+    expect(resumed.token.revision).toBeGreaterThan(handoff.revision);
+    expect(auditInspections(fleet.log)).toEqual([
+      'wrangler:inspect:acme',
+      'direct:inspect:beta',
+    ]);
+    const terminal =
+      resumed.status === 'pending'
+        ? await advanceAuditToTerminal(
+            fleet,
+            fleet.directBackend,
+            resumed.token,
+          )
+        : resumed;
+    expect(terminal.status).toBe('complete');
+    if (terminal.status !== 'complete') throw new Error('unreachable');
+    expect(terminal.result).toMatchObject({
+      operationId,
+      generation: 1,
+      recordCount: fleet.records.length,
+    });
+    expect(auditInspections(fleet.log)).toEqual([
+      'wrangler:inspect:acme',
+      'direct:inspect:beta',
+    ]);
+  });
+
+  it('audits the direct leg without a maintenance mutation', async () => {
+    const fleet = await wranglerAuditFleet();
+    const operationId = uuidFor(702);
+
+    const started = await advanceFleetAudit(
+      fleet.options(
+        {
+          kind: 'start',
+          operationId,
+          records: fleet.records,
+          staleAfterMs: AUDIT_STALE_AFTER_MS,
+        },
+        fleet.wranglerBackend,
+      ),
+    );
+    const handoff = await advanceAuditUntil(
+      fleet,
+      fleet.wranglerBackend,
+      pendingAuditToken(started),
+      () => auditInspections(fleet.log).length === 1,
+    );
+    const before = worldFacts(fleet.world);
+
+    const terminal = await advanceAuditToTerminal(
+      fleet,
+      fleet.directBackend,
+      handoff,
+    );
+
+    expect(terminal.status).toBe('complete');
+    // The world's maintenance POST answers health without touching the
+    // collections `worldFacts` snapshots, so the snapshot alone cannot rule a
+    // re-arm out; the backend's own call log does.
+    expect(worldFacts(fleet.world)).toEqual(before);
+    expect(auditMaintenanceCalls(fleet.log)).toEqual([]);
+  });
+
+  it('reads the same successful findings after the switch as a single-backend audit', async () => {
+    const fleet = await wranglerAuditFleet();
+    const operationId = uuidFor(703);
+
+    const started = await advanceFleetAudit(
+      fleet.options(
+        {
+          kind: 'start',
+          operationId,
+          records: fleet.records,
+          staleAfterMs: AUDIT_STALE_AFTER_MS,
+        },
+        fleet.wranglerBackend,
+      ),
+    );
+    const handoff = await advanceAuditUntil(
+      fleet,
+      fleet.wranglerBackend,
+      pendingAuditToken(started),
+      () => auditInspections(fleet.log).length === 1,
+    );
+    const terminal = await advanceAuditToTerminal(
+      fleet,
+      fleet.directBackend,
+      handoff,
+    );
+    expect(terminal.status).toBe('complete');
+
+    const page = await readFleetAuditFindingsPage(fleet.operationStore, {
+      operationId,
+      limit: 100,
+    });
+    const singleBackend = await auditFleetDrift({
+      store: new ContinuationFleetStore(fleet.records),
+      records: fleet.records,
+      inventory: fleet.inventory,
+      backendFor: () => directHarness(fleet.world).backend,
+      specFor: fleet.specFor,
+      maintenanceSecretFor: fleet.maintenanceSecretFor,
+      staleAfterMs: AUDIT_STALE_AFTER_MS,
+      now: AUDIT_NOW_MS,
+    });
+
+    expect(page).toMatchObject({ findings: [], done: true });
+    expect(page.findings).toEqual(singleBackend);
+    // An identical `audit-error` list on both sides would satisfy the equality
+    // above without either side reaching a deployment, so each inspection's
+    // recorded outcome carries the proof that it succeeded.
+    expect(fleet.log).toEqual([
+      'wrangler:inspect:acme',
+      'wrangler:live:acme',
+      'direct:inspect:beta',
+      'direct:live:beta',
+    ]);
+  });
+});

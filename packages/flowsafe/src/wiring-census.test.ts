@@ -43,7 +43,9 @@ import type {
   ExecutionFenceStore,
   ExecutionFenceWiring,
   InitOptions,
+  PersistedStartResult,
   RunnerRuntimeOptions,
+  RunSummary,
   StartIdempotencyStore,
   StartIdempotencyWiring,
   StorageInitOptions,
@@ -234,6 +236,15 @@ export type RunRouterStartIdempotencyOk = [
     >
   >,
   Assert<Equals<Extract<RunRouterStartIdempotency, 'none'>, 'none'>>,
+  Assert<
+    Equals<
+      Exclude<RunRouterStartIdempotency, 'none'>['persistedStart'],
+      (
+        workflowId: string,
+        runId: string,
+      ) => Promise<PersistedStartResult<RunSummary> | undefined>
+    >
+  >,
 ];
 
 /**
@@ -289,6 +300,11 @@ describe('wiring census', () => {
     // #then — identical readings. This is the premise the whole census rests
     // on: requiring the field costs a database-less host nothing but the words.
     expect(written).toEqual(absent);
-    expect(written).toEqual({ state: 'open' });
+    expect(written).toEqual({
+      state: 'open',
+      mutationEpoch: 0,
+      requireMutationEpoch: false,
+      transitionRevision: 0,
+    });
   });
 });

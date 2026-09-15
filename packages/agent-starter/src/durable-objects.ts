@@ -200,6 +200,7 @@ export class StarterThread extends ThreadDurableObject<Env> {
           // the service: a decision recorded against a locked deployment
           // would be durable with nothing behind it.
           executionFence: executionFence(env.DB),
+          workflowTablePrefix: '',
           ...(this.env.STREAM_TICKET_SECRET
             ? {
                 stream: (event) =>
@@ -241,11 +242,16 @@ export class StarterThread extends ThreadDurableObject<Env> {
     _env: Env,
     threadId: string,
     initResult: InitResult,
+    deploymentTag?: string,
   ): Promise<void> {
     if (!this.#agentHost) {
       throw new Error('thread agent host is unavailable');
     }
-    await this.#agentHost.recoverOwnership(initResult.runtime, threadId);
+    await this.#agentHost.recoverOwnership({
+      threadId,
+      init: initResult,
+      deploymentTag,
+    });
   }
 
   #host(): ThreadAgentHost {

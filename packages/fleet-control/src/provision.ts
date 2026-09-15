@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { randomUUID } from 'node:crypto';
 import { assertInitialExecutionFenceState } from '@proofoftech/flowsafe/deployment-identity-protocol';
 
 import {
@@ -9,22 +10,48 @@ import {
 } from './active-route.js';
 import {
   applicationBindingTopology,
-  applicationR2Bindings,
   assertApplicationR2EmptyBeforeDecommission,
   convergeApplicationR2Creation,
   convergeApplicationR2Deletion,
   DEPLOYMENT_PLATFORM_VARIABLE_NAMES,
   liveApplicationTopologyMatches,
+  PLATFORM_CATALOG_VARIABLE_NAMES,
   reserveApplicationR2Resources,
 } from './application-bindings.js';
 import {
   assertBackendSwitchInactive,
+  BACKEND_SWITCH_RECORD_ERROR,
   type BackendSwitchProvider,
+  backendSwitchFleetRecordFromUnknown,
+  commitInvocationAuthority,
   decommissionBackendSwitch,
   type FinalizedOrdinaryStateProvider,
   finalizedBridgeForRecord,
   reconcileFinalizedBackendSwitchState,
+  structuralBackendSwitchFleetRecordFromUnknown,
 } from './backend-switch.js';
+import {
+  type AdvanceCleanupDeploymentOptions,
+  advanceCleanupDeployment,
+  advanceCleanupUnderLease,
+  type CleanupAdvanceAction,
+  type CleanupAdvanceResult,
+  startProvisioningRollbackCleanup,
+} from './cleanup-advance.js';
+import {
+  activeExternalRelease,
+  advanceDecommissionDeployment,
+  assertImmutableDeploymentMapping,
+  assertNormalDecommissionD1ResourcesDeleted,
+  consumeMigrationCarrier,
+  type DecommissionAdvanceAction,
+  reconcilePersistedDatabase,
+  retainedExternalReleases,
+} from './decommission-advance.js';
+import {
+  decommissionAdvanceIntentFromUnknown,
+  isCompleteTerminalRecord,
+} from './decommission-intent.js';
 import { isSha256 } from './deployment-context.js';
 import { WorkerDeploymentError } from './deployment-error.js';
 import {
@@ -41,6 +68,7 @@ import { buildPromotionGuard } from './promotion-guard.js';
 import { assertProviderBindingIdentitiesMatchInspection } from './provider-binding-inventory.js';
 import { deploymentSpecDigest } from './spec-digest.js';
 import type {
+  CleanupAdvanceToken,
   DatabaseExport,
   DatabaseReference,
   DecommissionAuditSink,
@@ -57,92 +85,81 @@ import type {
   ProvisioningPhase,
   ProvisioningResult,
 } from './types.js';
+import { assertNoActiveCleanup, assertNoActiveDecommission } from './types.js';
 import {
   targetDurableObjectTag,
   validateDeploymentSecrets,
   validateDeploymentSpec,
 } from './validation.js';
 
+function canonicalNormalDecommissionRecord(record: FleetRecord): FleetRecord {
+  const { decommissionIntent, ...source } = record;
+  try {
+    // A cleanup intent never rides beside a decommission shell; fail closed.
+    if (record.cleanupIntent !== undefined) {
+      throw new Error(BACKEND_SWITCH_RECORD_ERROR);
+    }
+    const intent = decommissionAdvanceIntentFromUnknown(
+      decommissionIntent,
+      source,
+    );
+    if (intent.identity.mode.kind !== 'normal') {
+      throw new Error(BACKEND_SWITCH_RECORD_ERROR);
+    }
+    return { ...source, decommissionIntent: intent };
+  } catch {
+    throw new Error(BACKEND_SWITCH_RECORD_ERROR);
+  }
+}
+
+export {
+  assertImmutableDeploymentMapping,
+  reconcilePersistedDatabase,
+} from './decommission-advance.js';
+
 export class ProvisioningError extends Error {
   readonly cleanupErrors: readonly unknown[];
+  /**
+   * The bounded rollback outcome, present only when the failed provision ran
+   * with `failureCleanup: 'bounded'` and the rollback admitted the engine.
+   */
+  readonly cleanup?: CleanupAdvanceResult;
 
   constructor(
     message: string,
     cause: unknown,
     cleanupErrors: readonly unknown[],
+    cleanup?: CleanupAdvanceResult,
   ) {
     super(message, { cause });
     this.name = 'ProvisioningError';
     this.cleanupErrors = cleanupErrors;
+    if (cleanup !== undefined) this.cleanup = cleanup;
   }
+}
+
+function canonicalStructuralValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalStructuralValue);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(
+    Object.keys(value as Record<string, unknown>)
+      .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0))
+      .map((key) => [
+        key,
+        canonicalStructuralValue((value as Record<string, unknown>)[key]),
+      ]),
+  );
+}
+
+function sameCanonicalStructure(left: unknown, right: unknown): boolean {
+  return (
+    JSON.stringify(canonicalStructuralValue(left)) ===
+    JSON.stringify(canonicalStructuralValue(right))
+  );
 }
 
 function nowIso(clock: () => number): string {
   return new Date(clock()).toISOString();
-}
-
-function activeExternalRelease(
-  record: FleetRecord,
-): import('./types.js').ExternalReleaseSnapshot | undefined {
-  return (
-    record.activeRelease ??
-    (record.backend === 'plain-worker' &&
-    record.artifactVersion !== PENDING_ARTIFACT_VERSION
-      ? {
-          physicalScriptName: record.scriptName,
-          specDigest: record.desiredSpecDigest,
-          artifactVersion: record.artifactVersion,
-          releaseSchemaVersion: record.schemaVersion,
-          application: record.applicationBindings ?? {
-            vars: [],
-            secrets: [],
-            r2Buckets: [],
-          },
-        }
-      : undefined)
-  );
-}
-
-function retainedExternalReleases(
-  record: FleetRecord,
-): readonly import('./types.js').ExternalReleaseSnapshot[] {
-  const active = activeExternalRelease(record);
-  const releases = [
-    record.pendingRelease,
-    ...(record.backend === 'plain-worker' &&
-    record.pendingArtifactVersion &&
-    record.pendingSpecDigest
-      ? [
-          {
-            physicalScriptName: record.scriptName,
-            specDigest: record.pendingSpecDigest,
-            artifactVersion: record.pendingArtifactVersion,
-            releaseSchemaVersion: record.schemaVersion,
-          },
-        ]
-      : []),
-    record.rollbackRelease,
-    record.retiringRelease,
-    record.migrationPriorRelease,
-  ].filter(
-    (release): release is import('./types.js').ExternalReleaseSnapshot =>
-      release !== undefined &&
-      (record.backend === 'plain-worker'
-        ? release.artifactVersion !== active?.artifactVersion
-        : release.physicalScriptName !== active?.physicalScriptName),
-  );
-  return releases.filter(
-    (release, index) =>
-      releases.findIndex(
-        (candidate) =>
-          (record.backend === 'plain-worker'
-            ? candidate.artifactVersion
-            : candidate.physicalScriptName) ===
-          (record.backend === 'plain-worker'
-            ? release.artifactVersion
-            : release.physicalScriptName),
-      ) === index,
-  );
 }
 
 function recordAt(
@@ -165,6 +182,10 @@ function recordAt(
   return {
     tenantTag: spec.tenantTag,
     backend: backend.kind,
+    ...(backend.kind === 'workers-for-platforms' &&
+    spec.authoredBy === 'platform'
+      ? { wfpMode: 'platform-catalog' as const }
+      : {}),
     environment: spec.environment,
     scriptName: spec.scriptName,
     databaseId: database.id,
@@ -205,7 +226,9 @@ function expectedBindingKeys(
 export function assertLiveDeploymentMatches(
   live: import('./types.js').LiveDeployment,
   record: Pick<FleetRecord, 'tenantTag' | 'environment' | 'databaseId'> &
-    Partial<Pick<FleetRecord, 'platformResources' | 'applicationBindings'>>,
+    Partial<
+      Pick<FleetRecord, 'backend' | 'platformResources' | 'applicationBindings'>
+    >,
   spec: DeploymentSpec,
   expectedDigest: string,
   expectedApplication:
@@ -294,7 +317,10 @@ export function assertLiveDeploymentMatches(
     !liveApplicationTopologyMatches(
       application,
       live,
-      DEPLOYMENT_PLATFORM_VARIABLE_NAMES,
+      record.backend === 'workers-for-platforms' &&
+        spec.authoredBy === 'platform'
+        ? PLATFORM_CATALOG_VARIABLE_NAMES
+        : DEPLOYMENT_PLATFORM_VARIABLE_NAMES,
     ) ||
     JSON.stringify([...live.secretNames].sort()) !==
       JSON.stringify(expectedSecretNames)
@@ -478,6 +504,7 @@ async function rollbackProvisioning(
     let cleanupRecord = latestRecord ?? record;
     try {
       const resources = await convergeApplicationR2Deletion({
+        spec,
         resources: cleanupRecord.applicationResources ?? [],
         backend,
         fence: lease,
@@ -534,49 +561,6 @@ const RESUMABLE_PROVISIONING_PHASES = new Set<ProvisioningPhase>([
   'ready',
 ]);
 
-export function assertImmutableDeploymentMapping(
-  prior: FleetRecord,
-  backend: ProvisioningBackend,
-  spec: DeploymentSpec,
-): void {
-  applicationR2Bindings(spec, prior.applicationResources ?? []);
-  if (
-    prior.tenantTag !== spec.tenantTag ||
-    prior.environment !== spec.environment ||
-    prior.backend !== backend.kind ||
-    prior.scriptName !== spec.scriptName ||
-    prior.databaseName !== spec.databaseName ||
-    prior.routeHostname !== spec.routeHostname
-  ) {
-    throw new Error(
-      `deployment '${spec.tenantTag}:${spec.environment}' already exists with a different immutable resource mapping`,
-    );
-  }
-  if (
-    prior.schemaVersion > spec.schemaVersion &&
-    !(
-      backend.immutableExternalArtifacts === true &&
-      spec.authoredBy === 'external' &&
-      prior.activeRelease?.releaseSchemaVersion === spec.schemaVersion
-    )
-  ) {
-    throw new Error('provisioning refuses a schema downgrade');
-  }
-  if (
-    prior.phase !== 'ready' &&
-    prior.phase !== 'rolling-back' &&
-    (prior.phase === 'migrating'
-      ? (prior.migrationIntent?.targetSpecDigest ??
-        prior.pendingRelease?.specDigest ??
-        prior.pendingSpecDigest)
-      : prior.desiredSpecDigest) !== deploymentSpecDigest(spec)
-  ) {
-    throw new Error(
-      `deployment '${spec.tenantTag}:${spec.environment}' retry uses a different desired specification`,
-    );
-  }
-}
-
 export interface ProvisionDeploymentOptions {
   readonly backend: ProvisioningBackend;
   readonly store: FleetStateStore;
@@ -606,7 +590,92 @@ export interface ProvisionDeploymentOptions {
    * The defaults suit every provider this package targets.
    */
   readonly routeAttestation?: AttestConvergedActiveRouteOptions;
+  /**
+   * How a failed provision rolls back once the bounded cleanup engine admits
+   * it. `'drain'` (the default) drains the engine to its terminal receipt
+   * within the failing call; `'bounded'` performs at most one bounded advance
+   * and surfaces the outcome through `ProvisioningError.cleanup` so the caller
+   * resumes the durable operation with `advanceCleanupDeployment()`.
+   */
+  readonly failureCleanup?: 'drain' | 'bounded';
   readonly clock?: () => number;
+}
+
+// The residue a terminal `decommissioned` row still describes, or `undefined`
+// when the row describes none. Written as a reason rather than a boolean so
+// the refusal below names what the operator has to resolve.
+function retainedTerminalResidue(record: FleetRecord): string | undefined {
+  const decommission = record.decommissionIntent;
+  if (decommission && decommission.state !== 'complete') {
+    return `an unfinished decommission operation in state '${decommission.state}'`;
+  }
+  if (record.cleanupIntent !== undefined) {
+    return 'an unfinished bounded cleanup operation';
+  }
+  const switchSubphase = record.backendSwitchIntent?.subphase;
+  if (
+    switchSubphase !== undefined &&
+    switchSubphase !== 'rolled-back' &&
+    switchSubphase !== 'finalized' &&
+    switchSubphase !== 'decommissioned'
+  ) {
+    return `an active backend switch in subphase '${switchSubphase}'`;
+  }
+  const retained = (record.applicationResources ?? []).filter(
+    (resource) => resource.state !== 'deleted',
+  );
+  const retainedNames = retained.map((resource) => `'${resource.name}'`);
+  if (retainedNames.length > 0) {
+    return `retained application R2 resources ${retainedNames.join(', ')}`;
+  }
+  if (!isCompleteTerminalRecord(record)) {
+    return 'incomplete teardown evidence: a completed decommission records the database export location, digest, and byte count and leaves no pending lifecycle field';
+  }
+  return undefined;
+}
+
+// Reads a stored `decommissioned` row as a RETIRED record: one
+// `provisionDeployment` treats as an absent prior rather than as a lifecycle
+// to resume.
+//
+// The row is the evidence, read against the package's own definition of a
+// completed decommission record in `isCompleteTerminalRecord`, so a teardown
+// that never finished refuses instead — including the row a forced
+// decommission strands between its terminal state write and its row delete,
+// which records no database export. The predicate reads the row, not its
+// provenance: a row carrying that same evidence reads as retired however it
+// was written.
+//
+// Physical resources the row does not describe stay outside that evidence —
+// an ordinary Worker script a forced decommission leaves behind, and the
+// Durable Object namespaces a backend asserts absent rather than deletes —
+// and a fresh provision over this slug meets them at the provider, which
+// refuses to adopt a database or a script it cannot attribute to this
+// deployment.
+//
+// The intent clauses live here rather than beside the guards that mirror them
+// because normalization runs before `assertNoActiveDecommission`, the cleanup
+// redirect, and `assertBackendSwitchInactive`: a row admitted here reaches
+// none of those guards.
+function isRetiredTerminalRecord(record: FleetRecord): boolean {
+  return (
+    record.phase === 'decommissioned' &&
+    retainedTerminalResidue(record) === undefined
+  );
+}
+
+// Refuses a database that already answers to the name this provision reserves.
+async function assertReservedDatabaseNameFree(
+  backend: ProvisioningBackend,
+  spec: DeploymentSpec,
+  reservedName: string,
+): Promise<void> {
+  const existingDatabase = await backend.findDatabase(spec);
+  if (existingDatabase) {
+    throw new Error(
+      `refusing to claim pre-existing database '${existingDatabase.id}:${existingDatabase.name}' for reserved name '${reservedName}'`,
+    );
+  }
 }
 
 // `async` so the entry validation below REJECTS rather than throwing
@@ -655,8 +724,33 @@ async function provisionDeploymentUnderLease(
       'maintenanceBaseUrl must use a control-plane hostname distinct from routeHostname',
     );
   }
-  const prior = await store.get(spec.tenantTag, spec.environment);
-  if (prior) assertBackendSwitchInactive(prior);
+  const stored = await store.get(spec.tenantTag, spec.environment);
+  const retiredPrior =
+    stored !== undefined && isRetiredTerminalRecord(stored)
+      ? stored
+      : undefined;
+  // Normalized ONCE, here: `prior` is what the lifecycle guards, the immutable
+  // mapping asserts, the phase refusal, `record` and `databaseReservationOwned`
+  // read below. A branch that admitted the retired row at one of those sites
+  // and left the rest reading the raw row would hold `databaseReservationOwned`
+  // at false and disable the failed-provision unwind for the database and
+  // Worker this attempt created.
+  const prior = retiredPrior === undefined ? stored : undefined;
+  if (prior) {
+    assertNoActiveDecommission(prior, 'provisionDeployment');
+    // The fixed redirect IS this entry's cleanup guard: it must fire before
+    // the generic non-resumable-phase refusal so a rollback that admitted the
+    // bounded engine routes to cleanup instead of a provisioning retry.
+    if (
+      prior.phase === 'cleanup-advancing' ||
+      prior.cleanupIntent !== undefined
+    ) {
+      throw new Error(
+        `deployment '${spec.tenantTag}:${spec.environment}' has an active bounded cleanup; complete it with cleanupDeploymentArtifacts() or advanceCleanupDeployment() before provisioning again`,
+      );
+    }
+    assertBackendSwitchInactive(prior);
+  }
   const finalizedOrdinaryState =
     prior?.backendSwitchIntent?.subphase === 'finalized' &&
     prior.platformResources?.stateWorker.plane === 'ordinary';
@@ -685,6 +779,19 @@ async function provisionDeploymentUnderLease(
   if (prior) {
     assertImmutableDeploymentMapping(prior, backend, spec);
     assertPlatformDurableObjectHistory(prior, spec);
+    // A terminal row that reaches here failed `isRetiredTerminalRecord`, so it
+    // still describes residue. It refuses by that reason instead of by the
+    // generic phase message, because the remedy is a physical one the operator
+    // performs before the record can be cleared.
+    const residue =
+      prior.phase === 'decommissioned'
+        ? retainedTerminalResidue(prior)
+        : undefined;
+    if (residue !== undefined) {
+      throw new Error(
+        `deployment '${spec.tenantTag}:${spec.environment}' has a decommissioned record with ${residue}; confirm the residual physical resources are removed, then clear the record with forceDecommissionDeployment() before provisioning this name again`,
+      );
+    }
     if (!RESUMABLE_PROVISIONING_PHASES.has(prior.phase)) {
       throw new Error(
         `deployment '${spec.tenantTag}:${spec.environment}' cannot be provisioned from phase '${prior.phase}'`,
@@ -781,12 +888,18 @@ async function provisionDeploymentUnderLease(
           rollbackCompatibleTarget,
         );
         if (
-          JSON.stringify(platform.resources) !==
-            JSON.stringify(converged.platformResources) ||
-          JSON.stringify(rollbackCompatibleTarget) !==
-            JSON.stringify(converged.platformTarget) ||
-          JSON.stringify(rollbackCompatibleTarget.outboundPolicy) !==
-            JSON.stringify(converged.outboundPolicy)
+          !sameCanonicalStructure(
+            platform.resources,
+            converged.platformResources,
+          ) ||
+          !sameCanonicalStructure(
+            rollbackCompatibleTarget,
+            converged.platformTarget,
+          ) ||
+          !sameCanonicalStructure(
+            rollbackCompatibleTarget.outboundPolicy,
+            converged.outboundPolicy,
+          )
         ) {
           converged = {
             ...converged,
@@ -820,6 +933,7 @@ async function provisionDeploymentUnderLease(
     }
     let maintenance = live.maintenance;
     if (!maintenance.armed) {
+      converged = await commitInvocationAuthority(lease, converged, clock);
       await lease.assertOwned();
       maintenance = await backend.ensureMaintenance(
         spec,
@@ -841,20 +955,37 @@ async function provisionDeploymentUnderLease(
     prior.phase === 'database-reserved' ||
     prior.phase === 'database-create-authorized';
   try {
+    // A retired terminal record is still the stored row here and `lease.put`
+    // is an unconditional upsert, so the reserved-name proof runs before the
+    // claim: proving it afterwards would have replaced the export location,
+    // digest and size that `decommissionDeployment` replays from, for a
+    // provision that then refuses. An absent prior keeps the original order,
+    // where the durable reservation written first is what
+    // `cleanupDeploymentArtifacts()` clears with a receipt.
+    if (retiredPrior !== undefined) {
+      await assertReservedDatabaseNameFree(backend, spec, spec.databaseName);
+    }
     if (!record) {
       const reservation: DatabaseReference = {
         id: `reserved-${deploymentSpecDigest(spec).slice(0, 48)}`,
         name: spec.databaseName,
         created: true,
       };
-      record = recordAt(backend, spec, reservation, 'database-reserved', clock);
+      record = {
+        ...recordAt(backend, spec, reservation, 'database-reserved', clock),
+        // A new deployment carries the never-authorized carrier from its
+        // FIRST durable put so later cleanup can distinguish "no candidate
+        // invocation ever authorized" from a legacy row.
+        invocationAuthority: { version: 1, authorizedAt: null },
+      };
       await lease.put(record);
     }
     if (record.phase === 'database-reserved') {
-      const existingDatabase = await backend.findDatabase(spec);
-      if (existingDatabase) {
-        throw new Error(
-          `refusing to claim pre-existing database '${existingDatabase.id}:${existingDatabase.name}' for reserved name '${record.databaseName}'`,
+      if (retiredPrior === undefined) {
+        await assertReservedDatabaseNameFree(
+          backend,
+          spec,
+          record.databaseName,
         );
       }
       record = {
@@ -867,9 +998,14 @@ async function provisionDeploymentUnderLease(
     if (record.phase === 'database-create-authorized') {
       await lease.assertOwned();
       database = await backend.ensureDatabase(spec, lease);
-      record = recordAt(backend, spec, database, 'database-created', clock, {
-        applicationResources: record.applicationResources,
-      });
+      record = {
+        ...recordAt(backend, spec, database, 'database-created', clock, {
+          applicationResources: record.applicationResources,
+        }),
+        ...(record.invocationAuthority
+          ? { invocationAuthority: record.invocationAuthority }
+          : {}),
+      };
       await lease.put(record);
     } else {
       database = await reconcilePersistedDatabase(
@@ -1048,6 +1184,12 @@ async function provisionDeploymentUnderLease(
       (record.phase === 'application-resources-deployed' &&
         spec.authoredBy !== 'external')
     ) {
+      if (backend.immutableExternalArtifacts === true) {
+        // External upload is the dispatch trigger, so the flip commits before
+        // it; the trusted plain initial deploy is deliberately NOT a flip
+        // site, preserving no-export cleanup at worker-deployed.
+        record = await commitInvocationAuthority(lease, record, clock);
+      }
       await lease.assertOwned();
       const deployed = await backend.deployWorker(
         spec,
@@ -1060,6 +1202,7 @@ async function provisionDeploymentUnderLease(
       );
       workerCreated = deployed.created;
       workerResourceState = deployed.created ? 'present' : 'absent';
+      const deployedDurableObjectTag = targetDurableObjectTag(spec);
       record = {
         ...record,
         phase: 'worker-deployed',
@@ -1084,7 +1227,9 @@ async function provisionDeploymentUnderLease(
               },
             }
           : {}),
-        durableObjectTag: targetDurableObjectTag(spec),
+        ...(deployedDurableObjectTag
+          ? { durableObjectTag: deployedDurableObjectTag }
+          : {}),
         ...(spec.authoredBy === 'platform'
           ? {
               durableObjectMigrationHistory:
@@ -1126,6 +1271,9 @@ async function provisionDeploymentUnderLease(
         );
       }
       if (!live || live.desiredSpecDigest !== record.desiredSpecDigest) {
+        if (backend.immutableExternalArtifacts === true) {
+          record = await commitInvocationAuthority(lease, record, clock);
+        }
         await lease.assertOwned();
         const deployed = await backend.deployWorker(
           spec,
@@ -1185,6 +1333,10 @@ async function provisionDeploymentUnderLease(
           'maintenance bootstrap',
         );
       }
+      // Dedicated flip put: maintenance is the first candidate-invoking
+      // request for trusted plain deployments, and the flip must never ride
+      // the worker-deployed put, which stays no-export-eligible.
+      record = await commitInvocationAuthority(lease, record, clock);
       await lease.assertOwned();
       maintenance = await backend.ensureMaintenance(
         spec,
@@ -1209,11 +1361,14 @@ async function provisionDeploymentUnderLease(
           'maintenance bootstrap',
         );
       }
+      const liveDurableObjectTag = targetDurableObjectTag(spec);
       record = {
         ...record,
         phase: 'maintenance-armed',
         artifactVersion: live.artifactVersion,
-        durableObjectTag: targetDurableObjectTag(spec),
+        ...(liveDurableObjectTag
+          ? { durableObjectTag: liveDurableObjectTag }
+          : {}),
         ...(spec.authoredBy === 'platform'
           ? {
               durableObjectMigrationHistory:
@@ -1233,7 +1388,21 @@ async function provisionDeploymentUnderLease(
     }
 
     if (record.phase === 'maintenance-armed') {
-      record = { ...record, phase: 'publishing', updatedAt: nowIso(clock) };
+      record = {
+        ...record,
+        // The flip rides this already export-required transition; here it is
+        // consistency for legacy rows, not an eligibility change.
+        ...(typeof record.invocationAuthority?.authorizedAt === 'string'
+          ? {}
+          : {
+              invocationAuthority: {
+                version: 1 as const,
+                authorizedAt: nowIso(clock),
+              },
+            }),
+        phase: 'publishing',
+        updatedAt: nowIso(clock),
+      };
       await lease.put(record);
     }
 
@@ -1264,6 +1433,9 @@ async function provisionDeploymentUnderLease(
           'release publication',
         );
       }
+      // A no-op unless a legacy row resumed directly at 'publishing' without
+      // riding the flip on the transition put above.
+      record = await commitInvocationAuthority(lease, record, clock);
       await lease.assertOwned();
       await backend.promoteWorker(
         spec,
@@ -1323,11 +1495,14 @@ async function provisionDeploymentUnderLease(
         readyRecord.activeRelease = readyRecord.pendingRelease;
         delete readyRecord.pendingRelease;
       }
+      const routedDurableObjectTag = targetDurableObjectTag(spec);
       record = {
         ...readyRecord,
         phase: 'ready',
         artifactVersion: attestation.artifactVersion,
-        durableObjectTag: targetDurableObjectTag(spec),
+        ...(routedDurableObjectTag
+          ? { durableObjectTag: routedDurableObjectTag }
+          : {}),
         durableObjectBindings: live.durableObjectBindings,
         updatedAt: nowIso(clock),
       };
@@ -1356,39 +1531,98 @@ async function provisionDeploymentUnderLease(
         [],
       );
     }
-    const cleanup =
+    let cleanupErrors: readonly unknown[];
+    let boundedOutcome: CleanupAdvanceResult | undefined;
+    if (
+      record !== undefined &&
+      databaseReservationOwned &&
+      database !== undefined &&
+      // Today's rollback is destructive only once ownership is proven or the
+      // attempt created the Worker; an unproven no-worker failure keeps its
+      // resumable row (the engine could never delete that database and would
+      // wedge the operation at 'cleanup-advancing').
+      (databaseOwnershipProven || workerCreated) &&
+      // Legacy stacks without the bounded capabilities keep the in-memory
+      // rollback: admitting the engine without a terminal or scan capability
+      // would strand a durable 'cleanup-advancing' row it can never finish
+      // (the same capability split decommissionDeployment already applies).
+      Reflect.has(backend, 'advanceDecommissionAttachmentScan') &&
+      Reflect.has(backend, 'assertDatabaseDeletionResidualsRemoved') &&
+      Reflect.has(lease, 'completeCleanup')
+    ) {
+      // The attempt owns the reservation and the database outcome is
+      // resolved: rollback runs through the bounded cleanup engine under the
+      // held lease. Refusals (external candidates, WFP, authorized
+      // invocation) throw before any mutation, persist no intent, and leave
+      // the row at its phase; an admitted rollback is durably
+      // 'cleanup-advancing' and its all-clean terminal writes the receipt in
+      // place of the old bare row delete.
+      const rollback = await rollbackThroughBoundedCleanup({
+        lease,
+        backend,
+        store,
+        spec,
+        record,
+        mode: options.failureCleanup ?? 'drain',
+        authority: {
+          kind: 'provisioning-rollback',
+          reservationOwned: databaseReservationOwned,
+          databaseOwned: databaseOwnershipProven,
+          workerCreatedByAttempt: workerCreated,
+          workerResourceState,
+          requestedSpecDigest: deploymentSpecDigest(spec),
+        },
+        ...(options.clock ? { clock: options.clock } : {}),
+      });
+      cleanupErrors = rollback.errors;
+      // The default drain keeps the historical error shape; only the
+      // explicitly bounded mode surfaces the resumable outcome.
+      if ((options.failureCleanup ?? 'drain') === 'bounded') {
+        boundedOutcome = rollback.cleanup;
+      }
+    } else if (
       (record?.phase === 'database-reserved' ||
         record?.phase === 'database-create-authorized') &&
       !database
-        ? {
-            errors: [
-              new Error('reserved database creation outcome is unresolved'),
-            ] as readonly unknown[],
-            ...(record ? { record } : {}),
-          }
-        : await rollbackProvisioning(
-            lease,
-            backend,
-            spec,
-            database,
-            databaseReservationOwned && workerCreated,
-            workerResourceState,
-            databaseReservationOwned &&
-              database !== undefined &&
-              databaseOwnershipProven,
-            databaseReservationOwned ? record?.platformResources : undefined,
-            databaseReservationOwned ? record : undefined,
-          );
-    record = cleanup.record ?? record;
-    const cleanupErrors = cleanup.errors;
-    if (
-      databaseReservationOwned &&
-      cleanupErrors.length === 0 &&
-      (!database || databaseOwnershipProven)
     ) {
-      await lease.delete();
-    } else if (record) {
+      cleanupErrors = [
+        new Error('reserved database creation outcome is unresolved'),
+      ];
       await lease.put(record);
+    } else {
+      // Record-less, non-owned, or worker-without-database rollbacks keep the
+      // pre-engine in-memory branch verbatim; the engine handles only
+      // record-bearing owned rollbacks with a resolved database outcome.
+      const legacy = await rollbackProvisioning(
+        lease,
+        backend,
+        spec,
+        database,
+        databaseReservationOwned && workerCreated,
+        workerResourceState,
+        databaseReservationOwned &&
+          database !== undefined &&
+          databaseOwnershipProven,
+        databaseReservationOwned ? record?.platformResources : undefined,
+        databaseReservationOwned ? record : undefined,
+      );
+      record = legacy.record ?? record;
+      cleanupErrors = legacy.errors;
+      if (
+        databaseReservationOwned &&
+        // The delete removes the row THIS attempt reserved. A retired terminal
+        // prior normalizes to an absent prior while its row is still stored,
+        // so a refusal before the first put owns no row to delete and leaves
+        // the terminal record for `forceDecommissionDeployment()` and the
+        // receipts contract to read.
+        record !== undefined &&
+        cleanupErrors.length === 0 &&
+        (!database || databaseOwnershipProven)
+      ) {
+        await lease.delete();
+      } else if (record) {
+        await lease.put(record);
+      }
     }
     throw new ProvisioningError(
       `failed to provision '${spec.tenantTag}:${spec.environment}'${
@@ -1398,8 +1632,96 @@ async function provisionDeploymentUnderLease(
       }`,
       cause,
       cleanupErrors,
+      boundedOutcome,
     );
   }
+}
+
+async function rollbackThroughBoundedCleanup(input: {
+  readonly lease: FleetStateLease;
+  readonly backend: ProvisioningBackend;
+  readonly store: FleetStateStore;
+  readonly spec: DeploymentSpec;
+  readonly record: FleetRecord;
+  readonly mode: 'drain' | 'bounded';
+  readonly authority: Readonly<{
+    kind: 'provisioning-rollback';
+    reservationOwned: boolean;
+    databaseOwned: boolean;
+    workerCreatedByAttempt: boolean;
+    workerResourceState: 'absent' | 'present' | 'unknown';
+    requestedSpecDigest: string;
+  }>;
+  readonly clock?: () => number;
+}): Promise<
+  Readonly<{ errors: readonly unknown[]; cleanup?: CleanupAdvanceResult }>
+> {
+  const { lease, backend, store, spec } = input;
+  const errors: unknown[] = [];
+  let cleanup: CleanupAdvanceResult | undefined;
+  try {
+    const admitted = await startProvisioningRollbackCleanup(
+      lease,
+      input.record,
+      input.authority,
+      {
+        backend,
+        spec,
+        randomUUID,
+        ...(input.clock ? { clock: input.clock } : {}),
+      },
+    );
+    const intent = admitted.cleanupIntent;
+    if (!intent) {
+      throw new Error('bounded rollback did not persist its cleanup intent');
+    }
+    let token: CleanupAdvanceToken = {
+      version: 1,
+      tenantTag: spec.tenantTag,
+      environment: spec.environment,
+      operationId: intent.operationId,
+      revision: intent.revision,
+    };
+    let action: CleanupAdvanceAction = { kind: 'continue', token };
+    let restarted = false;
+    while (true) {
+      const engineOptions: AdvanceCleanupDeploymentOptions = {
+        backend,
+        store,
+        spec,
+        action,
+        maxProviderRequests: 1_000,
+        randomUUID,
+        ...(input.clock ? { clock: input.clock } : {}),
+      };
+      const result = await advanceCleanupUnderLease(
+        engineOptions,
+        action,
+        token,
+        lease,
+      );
+      cleanup = result;
+      if (result.status === 'complete') break;
+      if (result.status === 'blocked') {
+        if (restarted) {
+          errors.push(
+            new Error('bounded cleanup remains blocked by a Worker attachment'),
+          );
+          break;
+        }
+        restarted = true;
+        token = result.token;
+        action = { kind: 'restart-blocked', token };
+      } else {
+        token = result.token;
+        action = { kind: 'continue', token };
+      }
+      if (input.mode === 'bounded') break;
+    }
+  } catch (error) {
+    errors.push(error);
+  }
+  return { errors, ...(cleanup ? { cleanup } : {}) };
 }
 
 export interface CleanupDeploymentArtifactsOptions {
@@ -1408,244 +1730,62 @@ export interface CleanupDeploymentArtifactsOptions {
   readonly spec: DeploymentSpec;
 }
 
-export async function reconcilePersistedDatabase(
-  backend: ProvisioningBackend,
-  record: Pick<FleetRecord, 'databaseId' | 'databaseName' | 'tenantTag'>,
-  allowAbsent: boolean,
-  fence: import('./types.js').ExternalMutationFence,
-  requireOwner = true,
-): Promise<(DatabaseReference & { readonly created: false }) | undefined> {
-  const database = await backend.getDatabase(record.databaseId);
-  if (!database) {
-    if (allowAbsent) return undefined;
-    throw new Error(`persisted database '${record.databaseId}' is absent`);
-  }
-  if (
-    database.id !== record.databaseId ||
-    database.name !== record.databaseName
-  ) {
-    throw new Error(
-      `persisted database '${record.databaseId}' resolved with unexpected identity '${database.id}:${database.name}'`,
-    );
-  }
-  if (requireOwner) {
-    const owner = await backend.readDeploymentIdentity(database, fence);
-    if (owner !== record.tenantTag) {
-      throw new Error(
-        `refusing database operation for '${database.id}' owned by '${owner ?? 'no deployment'}'`,
-      );
-    }
-  }
-  return { id: database.id, name: database.name, created: false };
-}
-
-export function cleanupDeploymentArtifacts(
+/**
+ * Drains one deployment's bounded no-export cleanup to its terminal receipt.
+ *
+ * Holds no outer lease: each bounded advance acquires its own deployment
+ * lease. An absent row is a no-op; an active cleanup intent of either
+ * authority resumes; admission refusals propagate unchanged; a bounded group
+ * failure surfaces as the historical `AggregateError` and leaves the durable
+ * intent for retry.
+ */
+export async function cleanupDeploymentArtifacts(
   options: CleanupDeploymentArtifactsOptions,
-): Promise<void> {
-  return options.store.withDeploymentLease(
-    options.spec.tenantTag,
-    options.spec.environment,
-    (lease) => cleanupDeploymentArtifactsUnderLease(options, lease),
-  );
-}
-
-async function cleanupDeploymentArtifactsUnderLease(
-  options: CleanupDeploymentArtifactsOptions,
-  lease: FleetStateLease,
 ): Promise<void> {
   const { backend, store, spec } = options;
   validateDeploymentSpec(spec);
-  let record = await store.get(spec.tenantTag, spec.environment);
-  if (record) assertBackendSwitchInactive(record);
+  const record = await store.get(spec.tenantTag, spec.environment);
   if (!record) return;
-  assertImmutableDeploymentMapping(record, backend, spec);
-  if (record.phase === 'database-reserved') {
-    const reservedDatabase = await backend.findDatabase(spec);
-    if (reservedDatabase) {
-      throw new Error(
-        `refusing to clear an unauthorized database reservation while '${reservedDatabase.id}:${reservedDatabase.name}' exists`,
-      );
-    }
-    await lease.delete();
-    return;
-  }
-  if (record.phase === 'database-create-authorized') {
-    const reservedDatabase = await backend.findDatabase(spec);
-    if (!reservedDatabase) {
-      await lease.delete();
-      return;
-    }
-    if (reservedDatabase.name !== record.databaseName) {
-      throw new Error(
-        `authorized database '${record.databaseName}' resolved with unexpected identity '${reservedDatabase.id}:${reservedDatabase.name}'`,
-      );
-    }
-    const owner = await backend.readDeploymentIdentity(reservedDatabase, lease);
-    if (owner !== undefined) {
-      throw new Error(
-        `refusing reserved database cleanup for '${reservedDatabase.id}' owned by '${owner}'`,
-      );
-    }
-    await lease.assertOwned();
-    // A freshness PROOF, not a provisioning: this database is stamped only so
-    // the read-back below can show it was empty, and it is deleted three lines
-    // later. The fence state is therefore hard-coded rather than taken from the
-    // caller — cleanup has no provisioning options to take it from — and it is
-    // 'migration-locked' because a database that survives a failed delete must
-    // never come back as one that executes.
-    await backend.seedDeploymentIdentity(
-      reservedDatabase,
-      record.tenantTag,
-      lease,
-      { initialExecutionFenceState: 'migration-locked' },
-    );
-    const seededOwner = await backend.readDeploymentIdentity(
-      reservedDatabase,
-      lease,
-    );
-    if (seededOwner !== record.tenantTag) {
-      throw new Error(
-        `reserved database '${reservedDatabase.id}' could not be proven fresh before cleanup`,
-      );
-    }
-    await lease.assertOwned();
-    await backend.deleteDatabase(reservedDatabase, lease);
-    const remainingDatabase = await backend.findDatabase(spec);
-    if (remainingDatabase) {
-      throw new Error(
-        `reserved database '${remainingDatabase.id}' is still present after deletion`,
-      );
-    }
-    await lease.delete();
-    return;
-  }
-  if (
-    record.phase !== 'database-created' &&
-    record.phase !== 'identity-seeded' &&
-    record.phase !== 'migrated' &&
-    record.phase !== 'application-resources-create-authorized' &&
-    record.phase !== 'application-resources-deployed' &&
-    record.phase !== 'platform-resources-deployed' &&
-    record.phase !== 'worker-deployed' &&
-    record.phase !== 'maintenance-armed'
-  ) {
-    throw new Error(
-      `deployment in phase '${record.phase}' requires export-backed decommissioning`,
-    );
-  }
-  const database: DatabaseReference = {
-    id: record.databaseId,
-    name: record.databaseName,
-    created: false,
-  };
-  const liveDatabase = await reconcilePersistedDatabase(
-    backend,
-    record,
-    true,
-    lease,
-    record.phase !== 'database-created',
-  );
-  const errors: unknown[] = [];
-  const cleanupRecord = record;
-  try {
-    await lease.assertOwned();
-    await backend.removeTraffic(
-      spec,
-      retainedExternalReleases(cleanupRecord),
-      activeExternalRelease(cleanupRecord),
-      database,
-      lease,
-    );
-    await backend.assertTrafficRemoved(spec);
-    await assertApplicationR2EmptyBeforeDecommission({
-      resources: cleanupRecord.applicationResources ?? [],
-      backend,
-      fence: lease,
-    });
-    await lease.assertOwned();
-    await backend.revokeCredentials(
-      spec,
-      retainedExternalReleases(cleanupRecord),
-      activeExternalRelease(cleanupRecord),
-      database,
-      lease,
-    );
-    await lease.assertOwned();
-    await backend.deleteWorker(
-      spec,
-      retainedExternalReleases(cleanupRecord),
-      database,
-      activeExternalRelease(cleanupRecord),
-      lease,
-    );
-  } catch (error) {
-    errors.push(error);
-  }
-  if (
-    errors.length === 0 &&
-    (record.platformResources || record.platformTarget)
-  ) {
-    if (
-      !backend.revokePlatformResourceCredentials ||
-      !backend.deletePlatformResources
-    ) {
-      errors.push(
-        new Error('backend cannot clean persisted trusted platform resources'),
-      );
-    }
+  // Reservation-phase cleanups historically threw their provider refusals
+  // directly; teardown-phase group failures aggregated. Preserve both shapes.
+  const admittedPhase =
+    record.cleanupIntent?.identity.admittedPhase ?? record.phase;
+  const reservation =
+    admittedPhase === 'database-reserved' ||
+    admittedPhase === 'database-create-authorized';
+  let action: CleanupAdvanceAction = { kind: 'start' };
+  let restarted = false;
+  while (true) {
+    let result: CleanupAdvanceResult;
     try {
-      if (
-        backend.revokePlatformResourceCredentials &&
-        backend.deletePlatformResources
-      ) {
-        await lease.assertOwned();
-        await backend.revokePlatformResourceCredentials(
-          spec,
-          record,
-          database,
-          lease,
-        );
-        await lease.assertOwned();
-        await backend.deletePlatformResources(spec, record, database, lease);
-      }
-    } catch (error) {
-      errors.push(error);
-    }
-  }
-  if (errors.length === 0) {
-    try {
-      await convergeApplicationR2Deletion({
-        resources: record.applicationResources ?? [],
+      result = await advanceCleanupDeployment({
         backend,
-        fence: lease,
-        persist: async (applicationResources) => {
-          record = {
-            ...(record as FleetRecord),
-            applicationResources,
-            updatedAt: new Date().toISOString(),
-          };
-          await lease.put(record);
-        },
+        store,
+        spec,
+        action,
+        maxProviderRequests: 1_000,
+        randomUUID,
       });
     } catch (error) {
-      errors.push(error);
+      if (action.kind === 'start' || reservation) throw error;
+      throw new AggregateError(
+        [error],
+        `failed to clean 1 deployment artifact(s) for '${spec.scriptName}'`,
+      );
     }
-  }
-  if (errors.length === 0 && liveDatabase) {
-    try {
-      await backend.assertDatabaseDetached(spec, record, liveDatabase, lease);
-      await backend.deleteDatabase(liveDatabase, lease);
-    } catch (error) {
-      errors.push(error);
+    if (result.status === 'complete') return;
+    if (result.status === 'blocked') {
+      if (restarted) {
+        throw new Error(
+          'bounded cleanup remains blocked by a Worker attachment',
+        );
+      }
+      restarted = true;
+      action = { kind: 'restart-blocked', token: result.token };
+      continue;
     }
+    action = { kind: 'continue', token: result.token };
   }
-  if (errors.length > 0) {
-    throw new AggregateError(
-      errors,
-      `failed to clean ${errors.length} deployment artifact(s) for '${spec.scriptName}'`,
-    );
-  }
-  await lease.delete();
 }
 
 export interface DecommissionDeploymentOptions {
@@ -1664,14 +1804,34 @@ export interface DecommissionDeploymentOptions {
 export async function decommissionDeployment(
   options: DecommissionDeploymentOptions,
 ): Promise<DecommissionResult> {
-  const current = await options.store.get(
+  const loaded = await options.store.get(
     options.spec.tenantTag,
     options.spec.environment,
   );
-  if (
-    current?.backendSwitchIntent &&
-    current.backendSwitchIntent.subphase !== 'decommissioned'
-  ) {
+  const reconstructed =
+    loaded === undefined
+      ? undefined
+      : structuralBackendSwitchFleetRecordFromUnknown(loaded);
+  let current = reconstructed?.record;
+  if (reconstructed?.carriesBackendSwitchAuthority) {
+    current = backendSwitchFleetRecordFromUnknown(current).record;
+    const currentSwitch = current.backendSwitchIntent;
+    if (!currentSwitch) {
+      throw new Error('backend switch decommission record is malformed');
+    }
+    if (currentSwitch.subphase === 'decommissioned') {
+      if (!currentSwitch.databaseExport) {
+        throw new Error(
+          'backend switch decommission did not commit its export',
+        );
+      }
+      const result = {
+        record: current,
+        databaseExport: currentSwitch.databaseExport,
+      };
+      await emitDecommissionAudit(options.audit, result.record, false);
+      return result;
+    }
     if (!options.backendSwitch) {
       throw new Error(
         'active backend switch decommission requires its dedicated provider and both specifications',
@@ -1682,25 +1842,84 @@ export async function decommissionDeployment(
       provider: options.backendSwitch.provider,
       priorSpec: options.backendSwitch.priorSpec,
       targetSpec: options.backendSwitch.targetSpec,
+      currentSpec: options.spec,
     });
-    const record = await options.store.get(
+    const stored = await options.store.get(
       options.spec.tenantTag,
       options.spec.environment,
     );
-    if (!record || !intent.databaseExport) {
+    const record = backendSwitchFleetRecordFromUnknown(stored).record;
+    if (!intent.databaseExport) {
       throw new Error('backend switch decommission did not commit its export');
     }
     const result = { record, databaseExport: intent.databaseExport };
     await emitDecommissionAudit(options.audit, result.record, false);
     return result;
   }
-  const result = await options.store.withDeploymentLease(
-    options.spec.tenantTag,
-    options.spec.environment,
-    (lease) => decommissionDeploymentUnderLease(options, lease),
-  );
+  let hasNormalIntent = false;
+  if (current?.decommissionIntent !== undefined) {
+    current = canonicalNormalDecommissionRecord(current);
+    hasNormalIntent = true;
+  }
+  // After the canonicalizers: a hostile decommission-shell record carrying
+  // cleanup material keeps its malformed-record refusal; a clean record with
+  // an active cleanup refuses here, before any lease or backend dispatch.
+  if (current) {
+    assertNoActiveCleanup(current, 'decommissionDeployment');
+  }
+  const shellLessLatePhase =
+    current !== undefined &&
+    current.decommissionIntent === undefined &&
+    (current.phase === 'database-exported' ||
+      current.phase === 'database-deleting' ||
+      current.phase === 'decommissioned');
+  let useBounded = hasNormalIntent;
+  if (current && !hasNormalIntent && !shellLessLatePhase) {
+    useBounded =
+      Reflect.has(options.backend, 'advanceDecommissionAttachmentScan') &&
+      (Reflect.has(options.backend, 'databaseExportReceiptAuthority') ||
+        Reflect.has(options.backend, 'exportDatabaseReceipt'));
+  }
+  const result = useBounded
+    ? await drainBoundedDecommission(options)
+    : await options.store.withDeploymentLease(
+        options.spec.tenantTag,
+        options.spec.environment,
+        (lease) => decommissionDeploymentUnderLease(options, lease),
+      );
   await emitDecommissionAudit(options.audit, result.record, false);
   return result;
+}
+
+async function drainBoundedDecommission(
+  options: DecommissionDeploymentOptions,
+): Promise<DecommissionResult> {
+  let action: DecommissionAdvanceAction = { kind: 'start' };
+  let firstResult = true;
+  while (true) {
+    const result = await advanceDecommissionDeployment({
+      backend: options.backend,
+      store: options.store,
+      spec: options.spec,
+      action,
+      maxProviderRequests: 1_000,
+      ...(options.clock ? { clock: options.clock } : {}),
+      randomUUID,
+    });
+    if (result.status === 'complete') return result.result;
+    if (result.status === 'blocked') {
+      if (firstResult) {
+        firstResult = false;
+        action = { kind: 'restart-blocked', token: result.token };
+        continue;
+      }
+      throw new Error(
+        'bounded decommission remains blocked by a Worker attachment',
+      );
+    }
+    firstResult = false;
+    action = { kind: 'continue', token: result.token };
+  }
 }
 
 function emitDecommissionAudit(
@@ -1732,6 +1951,17 @@ export interface ForceDecommissionDeploymentOptions {
   }>;
 }
 
+async function deleteForceRecord(lease: FleetStateLease): Promise<void> {
+  if (
+    Reflect.has(lease, 'deleteReleasingClaims') &&
+    typeof lease.deleteReleasingClaims === 'function'
+  ) {
+    await lease.deleteReleasingClaims();
+  } else {
+    await lease.delete();
+  }
+}
+
 export async function forceDecommissionDeployment(
   input: ForceDecommissionDeploymentOptions,
 ): Promise<void> {
@@ -1741,18 +1971,22 @@ export async function forceDecommissionDeployment(
     async (lease) => {
       const current = await input.store.get(input.tenantTag, input.environment);
       if (!current) return;
+      assertNoActiveDecommission(current, 'forceDecommissionDeployment');
+      // Blocked-cleanup plus refused-force is intentional: restart-blocked
+      // after remediation is the only resolution path for a blocked cleanup.
+      assertNoActiveCleanup(current, 'forceDecommissionDeployment');
       if (current.backend !== input.backend.kind) {
         throw new Error(
           'force-decommission backend does not own this deployment',
         );
       }
       if (current.phase === 'decommissioned') {
-        await lease.delete();
+        await deleteForceRecord(lease);
         return;
       }
       if (current.phase === 'database-reserved') {
         await emitDecommissionAudit(input.options?.audit, current, true);
-        await lease.delete();
+        await deleteForceRecord(lease);
         return;
       }
       if (current.phase === 'database-create-authorized') {
@@ -1782,8 +2016,13 @@ export async function forceDecommissionDeployment(
         record.phase !== 'database-exported' &&
         record.phase !== 'database-deleting'
       ) {
+        const {
+          pendingSpecDigest: _pendingSpecDigest,
+          pendingArtifactVersion: _pendingArtifactVersion,
+          ...forceRecord
+        } = record;
         record = {
-          ...record,
+          ...forceRecord,
           phase: 'decommissioning',
           updatedAt: nowIso(clock),
         };
@@ -1836,7 +2075,7 @@ export async function forceDecommissionDeployment(
       };
       await lease.put(record);
       await emitDecommissionAudit(input.options?.audit, record, true);
-      await lease.delete();
+      await deleteForceRecord(lease);
     },
   );
 }
@@ -1850,6 +2089,8 @@ async function decommissionDeploymentUnderLease(
   validateDeploymentSpec(spec);
   const current = await store.get(spec.tenantTag, spec.environment);
   if (!current) throw new Error('deployment is not registered');
+  assertNoActiveDecommission(current, 'decommissionDeployment');
+  assertNoActiveCleanup(current, 'decommissionDeployment');
   assertBackendSwitchInactive(current);
   if (current.backend !== backend.kind) {
     throw new Error('decommission backend does not own this deployment');
@@ -1902,7 +2143,13 @@ async function decommissionDeploymentUnderLease(
       backend,
       fence: lease,
     });
-    record = { ...record, phase: 'decommissioning', updatedAt: nowIso(clock) };
+    record = {
+      ...(record.migrationIntent
+        ? { ...record, desiredSpecDigest: deploymentSpecDigest(spec) }
+        : consumeMigrationCarrier(record, spec, deploymentSpecDigest(spec))),
+      phase: 'decommissioning',
+      updatedAt: nowIso(clock),
+    };
     await lease.put(record);
   }
   if (record.phase === 'decommissioning') {
@@ -1990,8 +2237,14 @@ async function decommissionDeploymentUnderLease(
       await backend.deletePlatformResources(spec, record, database, lease);
       await backend.assertDatabaseDetached(spec, record, database, lease);
     }
+    const {
+      migrationIntent: _migrationIntent,
+      pendingSpecDigest: _pendingSpecDigest,
+      pendingArtifactVersion: _pendingArtifactVersion,
+      ...withoutMigrationCarrier
+    } = record;
     record = {
-      ...record,
+      ...withoutMigrationCarrier,
       phase: 'platform-resources-deleted',
       updatedAt: nowIso(clock),
     };
@@ -2007,6 +2260,7 @@ async function decommissionDeploymentUnderLease(
   }
   if (record.phase === 'application-resources-deleting') {
     const applicationResources = await convergeApplicationR2Deletion({
+      spec,
       resources: record.applicationResources ?? [],
       backend,
       fence: lease,
@@ -2026,6 +2280,14 @@ async function decommissionDeploymentUnderLease(
       updatedAt: nowIso(clock),
     };
     await lease.put(record);
+  }
+  if (
+    record.phase === 'application-resources-deleted' ||
+    record.phase === 'database-exported' ||
+    record.phase === 'database-deleting' ||
+    record.phase === 'decommissioned'
+  ) {
+    assertNormalDecommissionD1ResourcesDeleted(record);
   }
   if (record.phase === 'application-resources-deleted') {
     await backend.assertDatabaseDetached(spec, record, database, lease);

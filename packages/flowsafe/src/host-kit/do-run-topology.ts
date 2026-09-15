@@ -19,10 +19,19 @@ import {
 import {
   deploymentIdentityHeaders,
   EXECUTION_PRINCIPAL_HEADER,
+  InvalidRunRequestError,
   type RunLifecycleCas,
   type RunSummary,
+  stampMutationEpoch,
 } from '../do-runner/index.js';
-import { type DoResponseLike, doSummary } from './do-response.js';
+import type { PersistedStartResult } from '../do-runner/start-idempotency.js';
+import { captureReservation } from '../do-runner/start-reservation-contract.js';
+import {
+  type DoResponseLike,
+  doPersistedStart,
+  doStartLiveness,
+  doSummary,
+} from './do-response.js';
 import type { RunStartInput } from './run-router.js';
 
 /** The subset of a DurableObjectStub the topology uses. */
@@ -44,6 +53,10 @@ export interface RunnerNamespaceLike<Id = unknown> {
 }
 
 export interface DoRunTopology {
+  persistedStart(
+    workflowId: string,
+    runId: string,
+  ): Promise<PersistedStartResult<RunSummary> | undefined>;
   /** createRunRouter's `start` thunk. */
   start(input: DoRunStartInput): Promise<RunSummary>;
   /** createRunRouter's `status` thunk (a DO 404 reads as undefined). */
@@ -53,20 +66,6 @@ export interface DoRunTopology {
     workflowId: string,
     runId: string,
   ): Promise<RunSummary | undefined>;
-  /**
-   * Is a start for this run executing in its Durable Object right now?
-   *
-   * createRunRouter's liveness probe, and the reason an idempotent replay can
-   * tell "still working" from "died holding the claim" without a timer. The run
-   * object is the only place that can answer: it is addressed by
-   * `idFromName(workflowId:runId)`, so there is exactly one instance that could
-   * be running this run, and if that instance says no then nothing is.
-   *
-   * An unreachable object reads as NOT live. That is the fail-closed direction
-   * here — it produces the refusal that asks a human to investigate, whereas a
-   * default of "live" would answer a permanently broken run with a permanently
-   * retryable 503.
-   */
   startLiveness(workflowId: string, runId: string): Promise<boolean>;
   /** createRunRouter's `resume` thunk. */
   resume(
@@ -110,11 +109,6 @@ export type DoRunStartInput = RunStartInput & {
   initialState?: unknown;
 };
 
-/** The run object's answer to the liveness probe. */
-interface StartLivenessBody {
-  live?: unknown;
-}
-
 export function createDoRunTopology<Id>(
   namespace: RunnerNamespaceLike<Id>,
   deploymentIdentitySecret: string,
@@ -153,25 +147,47 @@ export function createDoRunTopology<Id>(
       workflowId,
       runId,
       inputData,
+      requestContext,
       initialState,
       principal,
+      mutationEpoch,
       scheduleId,
       dispatchId,
       deadlineMs,
       idempotencyKey,
+      startReservation: suppliedReservation,
     }) => {
+      const startReservation =
+        suppliedReservation === undefined
+          ? undefined
+          : captureReservation(suppliedReservation, 'started');
+      if (
+        startReservation &&
+        (startReservation.key !== idempotencyKey ||
+          startReservation.runId !== runId ||
+          startReservation.targetKind !== 'workflow' ||
+          startReservation.targetId !== workflowId ||
+          startReservation.threadId !== undefined ||
+          startReservation.owner.kind !== principal.kind ||
+          startReservation.owner.id !== principal.id)
+      )
+        throw new InvalidRunRequestError(
+          'start reservation does not match the trusted start',
+        );
       if ((scheduleId === undefined) !== (dispatchId === undefined)) {
         throw new Error(
           'scheduled run starts require both scheduleId and dispatchId',
         );
       }
+      const headers = new Headers({
+        'content-type': 'application/json',
+        [EXECUTION_PRINCIPAL_HEADER]: encodeExecutionPrincipal(principal),
+      });
+      stampMutationEpoch(headers, mutationEpoch);
       return doSummary(
         await stub(workflowId, runId).fetch('http://do/runs', {
           method: 'POST',
-          headers: deploymentIdentityHeaders(deploymentIdentitySecret, {
-            'content-type': 'application/json',
-            [EXECUTION_PRINCIPAL_HEADER]: encodeExecutionPrincipal(principal),
-          }),
+          headers: deploymentIdentityHeaders(deploymentIdentitySecret, headers),
           body: JSON.stringify({
             workflowId,
             runId,
@@ -180,30 +196,21 @@ export function createDoRunTopology<Id>(
             // bearing one is refused for, so the DO can treat what arrives
             // here as the router's own reserved key.
             ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
+            ...(startReservation === undefined ? {} : { startReservation }),
             ...(scheduleId === undefined
-              ? { inputData, initialState, deadlineMs }
+              ? { inputData, initialState, deadlineMs, requestContext }
               : { scheduleId, dispatchId, deadlineMs }),
           }),
         }),
       );
     },
-    startLiveness: async (workflowId, runId) => {
-      // Only an explicit `true` from the run's own object counts as live.
-      // Everything else — a non-200, an unparseable body, a field of the wrong
-      // shape — is "this did not tell me the run is running", which is not the
-      // same as "it is", and treating it as such would turn a broken probe into
-      // an indefinitely retryable PENDING for a run nobody is executing.
-      const response = await stub(workflowId, runId).fetch(
-        `http://do/runs/${workflowId}/${runId}/start-liveness`,
-        { headers: deploymentIdentityHeaders(deploymentIdentitySecret) },
-      );
-      if (response.status !== 200) return false;
-      try {
-        return ((await response.json()) as StartLivenessBody).live === true;
-      } catch {
-        return false;
-      }
-    },
+    startLiveness: async (workflowId, runId) =>
+      doStartLiveness(
+        await stub(workflowId, runId).fetch(
+          `http://do/runs/${workflowId}/${runId}/start-liveness`,
+          { headers: deploymentIdentityHeaders(deploymentIdentitySecret) },
+        ),
+      ),
     // The DO answers 404 for a run it has never seen; the router turns the
     // undefined into its own 404 rather than leaking the DO's body.
     status: async (workflowId, runId) => {
@@ -213,6 +220,14 @@ export function createDoRunTopology<Id>(
       );
       if (response.status === 404) return undefined;
       return doSummary(response);
+    },
+    persistedStart: async (workflowId, runId) => {
+      const response = await stub(workflowId, runId).fetch(
+        `http://do/runs/${workflowId}/${runId}?replay=1`,
+        { headers: deploymentIdentityHeaders(deploymentIdentitySecret) },
+      );
+      if (response.status === 404) return undefined;
+      return doPersistedStart(response, { workflowId, runId });
     },
     dispatchStatus: async (workflowId, runId) => {
       const response = await stub(workflowId, runId).fetch(

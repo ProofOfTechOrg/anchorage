@@ -38,12 +38,14 @@ export function sqliteUnitDatabase(db: SqliteDatabase): unknown {
 
   function statement(sql: string, params: unknown[]): Record<string, unknown> {
     const execute = () => {
-      const outcome = db.prepare(sql).run(...params) as {
-        changes?: number | bigint;
+      const results = db.prepare(sql).all(...params);
+      const outcome = db.prepare('SELECT changes() AS count').get() as {
+        count: number | bigint;
       };
       return {
         success: true,
-        meta: { changes: Number(outcome?.changes ?? 0) },
+        results,
+        meta: { changes: Number(outcome.count) },
       };
     };
     return {

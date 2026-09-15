@@ -1,0 +1,1824 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import { createHash } from 'node:crypto';
+import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { Readable } from 'node:stream';
+import { describe, expect, it, vi } from 'vitest';
+import type { DurableDatabaseExportStore } from '../src/cloudflare-client.js';
+import { initialWorkerAttachmentScan } from '../src/cloudflare-worker-attachment-scan-state.js';
+import {
+  assertSupportedPlainWorkerBindings,
+  plainWorkerBindingsToProviderShape,
+} from '../src/provider-binding-inventory.js';
+import type {
+  DatabaseExportReceiptIdentity,
+  DecommissionAttachmentScanInput,
+  DecommissionAttachmentScanResult,
+  ExternalMutationFence,
+  PlainWorkerRouteApi,
+  PlainWorkerUploadIntent,
+} from '../src/types.js';
+import { WranglerPlainWorkerProvisioningApi } from '../src/wrangler-plain-worker-provisioning-api.js';
+import type { CommandResult, CommandRunner } from '../src/wrangler-runner.js';
+import {
+  drain,
+  memoryStore,
+  mutationFence,
+  routeApi,
+} from './fixtures/plain-worker-port-probe.js';
+import {
+  type PlainWorkerFsControl,
+  registerScratchCleanup,
+} from './fixtures/wrangler-fs-mock.js';
+
+const RECEIPT_AUTHORITY = 'file:///fleet-exports/.anchorage-receipts/v1';
+const RECEIPT_IDENTITY: DatabaseExportReceiptIdentity = {
+  version: 1,
+  authority: RECEIPT_AUTHORITY,
+  databaseId: '00000000-0000-0000-0000-000000000001',
+  operationId: '00000000-0000-4000-8000-000000000002',
+};
+
+const fsControl = vi.hoisted<PlainWorkerFsControl>(() => ({
+  failFleetCleanup: false,
+  residualDirectory: undefined,
+  cleanupError: new Error('scratch cleanup failed'),
+  failOperation: undefined,
+  operationError: new Error('filesystem operation failed'),
+  scratchDirectories: [],
+}));
+
+function scratchDirectories(): string[] {
+  const directories = fsControl.scratchDirectories;
+  if (!directories) {
+    throw new Error(
+      'adapter test filesystem control requires scratch tracking',
+    );
+  }
+  return directories;
+}
+
+vi.mock('node:fs/promises', async () => {
+  const { createFsPromisesMock } = await import(
+    './fixtures/wrangler-fs-mock.js'
+  );
+  return createFsPromisesMock(fsControl);
+});
+
+const exportDirectories = registerScratchCleanup(fsControl, {
+  cleanupError: fsControl.cleanupError,
+  operationError: fsControl.operationError,
+});
+
+interface RunnerCall {
+  readonly arguments: readonly string[];
+}
+
+class FakeRunner implements CommandRunner {
+  readonly maxDurationMs = 5 * 60_000;
+  readonly calls: RunnerCall[] = [];
+
+  constructor(
+    readonly handler: (
+      arguments_: readonly string[],
+    ) => Promise<CommandResult> = async () => ({ stdout: '', stderr: '' }),
+  ) {}
+
+  run(arguments_: readonly string[]): Promise<CommandResult> {
+    this.calls.push({ arguments: [...arguments_] });
+    return this.handler(arguments_);
+  }
+}
+
+async function api(
+  runner: CommandRunner,
+  options: {
+    readonly routeApi?: PlainWorkerRouteApi;
+    readonly exportStore?: DurableDatabaseExportStore;
+    readonly exportDirectory?: string;
+  } = {},
+): Promise<WranglerPlainWorkerProvisioningApi> {
+  const exportDirectory =
+    options.exportDirectory ??
+    (await mkdtemp(join(tmpdir(), 'adapter-export-')));
+  if (!options.exportDirectory) exportDirectories.add(exportDirectory);
+  return new WranglerPlainWorkerProvisioningApi({
+    runner,
+    routeApi: options.routeApi ?? routeApi(),
+    exportDirectory,
+    exportStore: options.exportStore ?? memoryStore(),
+  });
+}
+
+function uploadIntent(mode: 'initial' | 'staged'): PlainWorkerUploadIntent {
+  const shared = {
+    scriptName: 'worker-name',
+    candidateTag: 'candidate-tag',
+    mainModule: 'worker.js',
+    modules: [{ name: 'worker.js', content: 'export default {}' }],
+    compatibilityDate: '2026-08-10',
+    compatibilityFlags: undefined,
+    bindings: {
+      plainText: [{ name: 'TEXT', value: 'value' }],
+      secrets: [{ name: 'SECRET', value: 'secret' }],
+      d1: [{ name: 'DB', databaseId: 'db-id', databaseName: 'db-name' }],
+      durableObjects: [{ name: 'OBJECT', className: 'ObjectClass' }],
+      services: [],
+      queueProducers: [],
+      r2Buckets: [{ name: 'BUCKET', bucketName: 'bucket-name' }],
+    },
+    limits: { cpuMs: 25 },
+    publicAccess: { workersDevEnabled: true, previewUrlsEnabled: false },
+  } as const;
+  return mode === 'initial'
+    ? {
+        ...shared,
+        mode,
+        durableObjectMigrations: [
+          {
+            tag: 'v1',
+            newSqliteClasses: ['ObjectClass'],
+            newClasses: [],
+            deletedClasses: [],
+            renamedClasses: [],
+          },
+        ],
+      }
+    : { ...shared, mode };
+}
+
+async function expectUploadScratchRemoved(): Promise<void> {
+  const actual =
+    await vi.importActual<typeof import('node:fs/promises')>(
+      'node:fs/promises',
+    );
+  expect(scratchDirectories().length).toBeGreaterThan(0);
+  for (const directory of scratchDirectories()) {
+    await expect(actual.stat(directory)).rejects.toThrow();
+  }
+}
+
+async function expectExportScratchRemoved(outputPath: string): Promise<void> {
+  const actual =
+    await vi.importActual<typeof import('node:fs/promises')>(
+      'node:fs/promises',
+    );
+  await expect(actual.stat(dirname(outputPath))).rejects.toThrow();
+}
+
+describe('WranglerPlainWorkerProvisioningApi parsing', () => {
+  it.each([
+    ['array', '[{"uuid":"db-1","name":"one"}]'],
+    ['wrapped array', '{"result":[{"uuid":"db-1","name":"one"}]}'],
+    ['wrapped object', '{"result":{"uuid":"db-1","name":"one"}}'],
+  ])('parses %s JSON results', async (_name, stdout) => {
+    const subject = await api(
+      new FakeRunner(async () => ({ stdout, stderr: '' })),
+    );
+    await expect(subject.listDatabases()).resolves.toEqual([
+      { databaseId: 'db-1', name: 'one' },
+    ]);
+  });
+
+  it('filters database inventory locally without changing Wrangler arguments', async () => {
+    const runner = new FakeRunner(async () => ({
+      stdout: JSON.stringify([
+        { uuid: 'database-1', name: 'acme-production' },
+        { uuid: 'database-2', name: 'other' },
+      ]),
+      stderr: '',
+    }));
+    const subject = await api(runner);
+
+    await expect(
+      subject.listDatabases({ name: 'acme-production' }),
+    ).resolves.toEqual([{ databaseId: 'database-1', name: 'acme-production' }]);
+    expect(runner.calls).toEqual([{ arguments: ['d1', 'list', '--json'] }]);
+  });
+
+  it.each([
+    [{ name: 'target' }],
+    [{ uuid: '', name: 'target' }],
+    [{ uuid: 42, name: 'target' }],
+    [{ uuid: 'id' }],
+    [{ uuid: 'id', name: '' }],
+    [{ uuid: 'id', name: 42 }],
+  ])('refuses incomplete D1 identity before local filtering %#', async (row) => {
+    const subject = await api(
+      new FakeRunner(async () => ({
+        stdout: JSON.stringify([row]),
+        stderr: '',
+      })),
+    );
+    await expect(subject.listDatabases({ name: 'target' })).rejects.toThrow(
+      /D1/,
+    );
+  });
+
+  it.each([
+    null,
+    false,
+    {},
+    { result: null },
+    { result: false },
+    { success: false, result: [] },
+    { success: false, result: { versions: [] } },
+    { errors: [{}], result: { versions: [] } },
+    { errors: [{}], result: [] },
+  ])('refuses malformed complete inventory shapes %#', async (result) => {
+    const subject = await api(
+      new FakeRunner(async () => ({
+        stdout: JSON.stringify(result),
+        stderr: '',
+      })),
+    );
+    await expect(subject.listDatabases()).rejects.toThrow(/inventory/);
+    await expect(subject.listVersions('worker')).rejects.toThrow(/inventory/);
+    await expect(subject.deploymentStatus('worker')).rejects.toThrow(
+      /inventory/,
+    );
+  });
+
+  it('accepts null errors and messages in Wrangler inventory envelopes', async () => {
+    const subject = await api(
+      new FakeRunner(async () => ({
+        stdout: JSON.stringify({
+          success: true,
+          errors: null,
+          messages: null,
+          result: [{ id: 'v1' }],
+        }),
+        stderr: '',
+      })),
+    );
+    await expect(subject.listVersions('worker')).resolves.toEqual([
+      { versionId: 'v1', tag: undefined },
+    ]);
+  });
+
+  it('refuses non-array non-null errors in Wrangler inventory envelopes', async () => {
+    const subject = await api(
+      new FakeRunner(async () => ({
+        stdout: JSON.stringify({
+          success: true,
+          errors: 'bad',
+          result: [{ id: 'v1' }],
+        }),
+        stderr: '',
+      })),
+    );
+    await expect(subject.listVersions('worker')).rejects.toThrow(
+      'failed inventory result',
+    );
+  });
+
+  it('rejects invalid JSON with the operation name', async () => {
+    const subject = await api(
+      new FakeRunner(async () => ({ stdout: '{', stderr: '' })),
+    );
+    await expect(subject.listDatabases()).rejects.toThrow(
+      'wrangler d1 list returned invalid JSON',
+    );
+  });
+
+  it('normalizes every binding branch and preserves D1 alias compatibility', async () => {
+    const bindings = [
+      {
+        type: 'd1',
+        name: 'DB_SENTINEL',
+        id: '',
+        database_id: 'db-alias',
+      },
+      {
+        type: 'd1',
+        name: 'DB_EQUAL',
+        id: 'db-equal',
+        database_id: 'db-equal',
+      },
+      {
+        type: 'd1',
+        name: 'DB_CONFLICT',
+        id: 'db-legacy',
+        database_id: 'db-current',
+      },
+      {
+        type: 'durable_object_namespace',
+        name: 'OBJECT',
+        class_name: 'ObjectClass',
+        namespace_id: 'namespace',
+      },
+      { type: 'service', name: 'SERVICE', service: 'upstream' },
+      { type: 'queue', name: 'QUEUE', queue_name: 'queue-name' },
+      { type: 'r2_bucket', name: 'BUCKET', bucket_name: 'bucket-name' },
+      { type: 'plain_text', name: 'TEXT', text: 'value' },
+      { type: 'secret_text', name: 'SECRET' },
+      { type: 'kv_namespace', name: 'KV' },
+      { type: ' ', name: 'INVALID' },
+      null,
+    ];
+    const subject = await api(
+      new FakeRunner(async () => ({
+        stdout: JSON.stringify({ resources: { bindings } }),
+        stderr: '',
+      })),
+    );
+    const viewed = await subject.viewVersion('worker', 'requested');
+    expect(viewed).toEqual({
+      versionId: undefined,
+      tag: undefined,
+      bindings: [
+        { type: 'd1', name: 'DB_SENTINEL', databaseId: 'db-alias' },
+        { type: 'd1', name: 'DB_EQUAL', databaseId: 'db-equal' },
+        {
+          type: 'unsupported',
+          name: 'DB_CONFLICT',
+          providerType: 'd1',
+          issue: 'malformed-supported-binding',
+        },
+        {
+          type: 'durable-object',
+          name: 'OBJECT',
+          className: 'ObjectClass',
+          namespaceId: 'namespace',
+        },
+        { type: 'service', name: 'SERVICE', service: 'upstream' },
+        { type: 'queue-producer', name: 'QUEUE', queueName: 'queue-name' },
+        { type: 'r2-bucket', name: 'BUCKET', bucketName: 'bucket-name' },
+        { type: 'plain-text', name: 'TEXT', value: 'value' },
+        { type: 'secret-text', name: 'SECRET' },
+        {
+          type: 'unsupported',
+          name: 'KV',
+          providerType: 'kv_namespace',
+          issue: 'unsupported-type',
+        },
+        {
+          type: 'unsupported',
+          name: 'INVALID',
+          providerType: ' ',
+          issue: 'invalid-type',
+        },
+        {
+          type: 'unsupported',
+          name: undefined,
+          issue: 'not-object',
+        },
+      ],
+    });
+    expect(
+      assertSupportedPlainWorkerBindings(
+        viewed.bindings.slice(0, 2),
+        "plain Worker 'worker'",
+      ),
+    ).toEqual([
+      { type: 'd1', name: 'DB_EQUAL' },
+      { type: 'd1', name: 'DB_SENTINEL' },
+    ]);
+    expect(() =>
+      assertSupportedPlainWorkerBindings(
+        viewed.bindings.slice(2, 3),
+        "plain Worker 'worker'",
+      ),
+    ).toThrow(
+      "plain Worker 'worker' has an unsupported or malformed provider binding",
+    );
+  });
+
+  it('normalizes wrapped binding inventories like direct arrays', async () => {
+    const bindings = [
+      { type: 'd1', name: 'DB', database_id: 'db-id' },
+      { type: 'plain_text', name: 'TEXT', text: 'value' },
+    ];
+    const subject = await api(
+      new FakeRunner(async () => ({
+        stdout: JSON.stringify({
+          resources: { bindings: { result: bindings } },
+        }),
+        stderr: '',
+      })),
+    );
+
+    await expect(
+      subject.viewVersion('worker', 'version'),
+    ).resolves.toMatchObject({
+      bindings: [
+        { type: 'd1', name: 'DB', databaseId: 'db-id' },
+        { type: 'plain-text', name: 'TEXT', value: 'value' },
+      ],
+    });
+  });
+
+  it.each([
+    [
+      'D1 id',
+      { type: 'd1', name: 'DB', id: 'db-id' },
+      { type: 'd1', name: 'DB', id: 'db-id' },
+    ],
+    [
+      'D1 database_id',
+      { type: 'd1', name: 'DB', database_id: 'db-id' },
+      { type: 'd1', name: 'DB', id: 'db-id' },
+    ],
+    [
+      'Durable Object',
+      {
+        type: 'durable_object_namespace',
+        name: 'OBJECT',
+        namespace_id: 'namespace-id',
+        class_name: 'ObjectClass',
+      },
+      {
+        type: 'durable_object_namespace',
+        name: 'OBJECT',
+        namespace_id: 'namespace-id',
+        class_name: 'ObjectClass',
+      },
+    ],
+    [
+      'service',
+      { type: 'service', name: 'SERVICE', service: 'upstream' },
+      { type: 'service', name: 'SERVICE', service: 'upstream' },
+    ],
+    [
+      'queue producer',
+      { type: 'queue', name: 'QUEUE', queue_name: 'queue-name' },
+      { type: 'queue', name: 'QUEUE', queue_name: 'queue-name' },
+    ],
+    [
+      'R2 bucket',
+      { type: 'r2_bucket', name: 'BUCKET', bucket_name: 'bucket-name' },
+      { type: 'r2_bucket', name: 'BUCKET', bucket_name: 'bucket-name' },
+    ],
+    [
+      'plain text',
+      { type: 'plain_text', name: 'TEXT', text: 'value' },
+      { type: 'plain_text', name: 'TEXT', text: 'value' },
+    ],
+    [
+      'secret text',
+      { type: 'secret_text', name: 'SECRET' },
+      { type: 'secret_text', name: 'SECRET' },
+    ],
+  ] as const)('round-trips the exact valid %s wire object through inventory reconstruction', async (_title, binding, reconstructedBinding) => {
+    const subject = await api(
+      new FakeRunner(async () => ({
+        stdout: JSON.stringify({ resources: { bindings: [binding] } }),
+        stderr: '',
+      })),
+    );
+    const viewed = await subject.viewVersion('worker', 'version');
+    expect(plainWorkerBindingsToProviderShape(viewed.bindings)).toEqual([
+      reconstructedBinding,
+    ]);
+    expect(
+      assertSupportedPlainWorkerBindings(viewed.bindings, 'version'),
+    ).toEqual([{ type: reconstructedBinding.type, name: binding.name }]);
+  });
+
+  it('refuses explicit null version bindings instead of reporting an empty binding list', async () => {
+    const subject = await api(
+      new FakeRunner(async () => ({
+        stdout: JSON.stringify({ resources: { bindings: null } }),
+        stderr: '',
+      })),
+    );
+    await expect(subject.viewVersion('worker', 'version')).rejects.toThrow();
+  });
+
+  it('reconstructs the exact unsupported provider wire objects', () => {
+    expect(
+      plainWorkerBindingsToProviderShape([
+        { type: 'unsupported', name: undefined, issue: 'not-object' },
+        {
+          type: 'unsupported',
+          name: 'INVALID_STRING',
+          providerType: ' ',
+          issue: 'invalid-type',
+        },
+        {
+          type: 'unsupported',
+          name: 'INVALID_NON_STRING',
+          providerType: undefined,
+          issue: 'invalid-type',
+        },
+        {
+          type: 'unsupported',
+          name: 'KV',
+          providerType: 'kv_namespace',
+          issue: 'unsupported-type',
+        },
+      ]),
+    ).toStrictEqual([
+      undefined,
+      { type: ' ', name: 'INVALID_STRING' },
+      { type: undefined, name: 'INVALID_NON_STRING' },
+      { type: 'kv_namespace', name: 'KV' },
+    ]);
+  });
+
+  it.each([
+    ['D1', { type: 'd1', name: ' ', id: 'db-id' }],
+    [
+      'Durable Object',
+      {
+        type: 'durable_object_namespace',
+        name: ' ',
+        namespace_id: 'namespace',
+        class_name: 'ObjectClass',
+      },
+    ],
+    ['service', { type: 'service', name: ' ', service: 'upstream' }],
+    ['queue', { type: 'queue', name: ' ', queue_name: 'queue' }],
+    ['R2', { type: 'r2_bucket', name: ' ', bucket_name: 'bucket' }],
+    ['plain text', { type: 'plain_text', name: ' ', text: '' }],
+    ['secret text', { type: 'secret_text', name: ' ' }],
+  ] as const)('reports the exact index for a blank %s binding name', async (_title, binding) => {
+    const subject = await api(
+      new FakeRunner(async () => ({
+        stdout: JSON.stringify({ resources: { bindings: [binding] } }),
+        stderr: '',
+      })),
+    );
+    const viewed = await subject.viewVersion('worker', 'version');
+    expect(() =>
+      assertSupportedPlainWorkerBindings(viewed.bindings, 'version'),
+    ).toThrow('version binding 0 has no valid name');
+  });
+
+  it.each([
+    ['D1 missing id', { type: 'd1', name: 'DB' }],
+    ['D1 blank id', { type: 'd1', name: 'DB', id: ' ' }],
+    [
+      'Durable Object missing namespace',
+      {
+        type: 'durable_object_namespace',
+        name: 'OBJECT',
+        class_name: 'ObjectClass',
+      },
+    ],
+    [
+      'Durable Object blank class',
+      {
+        type: 'durable_object_namespace',
+        name: 'OBJECT',
+        namespace_id: 'namespace',
+        class_name: ' ',
+      },
+    ],
+    ['service missing target', { type: 'service', name: 'SERVICE' }],
+    [
+      'service blank target',
+      { type: 'service', name: 'SERVICE', service: ' ' },
+    ],
+    ['queue missing target', { type: 'queue', name: 'QUEUE' }],
+    ['queue blank target', { type: 'queue', name: 'QUEUE', queue_name: ' ' }],
+    ['R2 missing bucket', { type: 'r2_bucket', name: 'BUCKET' }],
+    [
+      'R2 blank bucket',
+      { type: 'r2_bucket', name: 'BUCKET', bucket_name: ' ' },
+    ],
+    ['plain text missing value', { type: 'plain_text', name: 'TEXT' }],
+  ] as const)('refuses malformed %s with the exact inventory message', async (_title, binding) => {
+    const subject = await api(
+      new FakeRunner(async () => ({
+        stdout: JSON.stringify({ resources: { bindings: [binding] } }),
+        stderr: '',
+      })),
+    );
+    const viewed = await subject.viewVersion('worker', 'version');
+    expect(() =>
+      assertSupportedPlainWorkerBindings(viewed.bindings, 'version'),
+    ).toThrow('version has an unsupported or malformed provider binding');
+  });
+
+  it('exposes the raw provider type on the unsupported binding fact', async () => {
+    const subject = await api(
+      new FakeRunner(async () => ({
+        stdout: JSON.stringify({
+          resources: { bindings: [{ type: 'kv_namespace', name: 'KV' }] },
+        }),
+        stderr: '',
+      })),
+    );
+    const viewed = await subject.viewVersion('worker', 'version');
+    expect(viewed.bindings).toEqual([
+      {
+        type: 'unsupported',
+        name: 'KV',
+        providerType: 'kv_namespace',
+        issue: 'unsupported-type',
+      },
+    ]);
+    expect(() =>
+      assertSupportedPlainWorkerBindings(viewed.bindings, 'version'),
+    ).toThrow('version has an unsupported or malformed provider binding');
+  });
+
+  it.each([
+    [
+      'invalid string type',
+      { type: ' ', name: 'INVALID' },
+      {
+        type: 'unsupported',
+        name: 'INVALID',
+        providerType: ' ',
+        issue: 'invalid-type',
+      },
+    ],
+    [
+      'invalid non-string type',
+      { type: 42, name: 'INVALID' },
+      {
+        type: 'unsupported',
+        name: 'INVALID',
+        providerType: undefined,
+        issue: 'invalid-type',
+      },
+    ],
+  ] as const)('refuses the %s binding with the exact inventory message', async (_title, binding, expectedBinding) => {
+    const subject = await api(
+      new FakeRunner(async () => ({
+        stdout: JSON.stringify({ resources: { bindings: [binding] } }),
+        stderr: '',
+      })),
+    );
+    const viewed = await subject.viewVersion('worker', 'version');
+    expect(viewed.bindings[0]).toStrictEqual(expectedBinding);
+    expect(() =>
+      assertSupportedPlainWorkerBindings(viewed.bindings, 'version'),
+    ).toThrowError(new Error('version binding 0 has no valid type'));
+  });
+
+  it('reports binding indexes and duplicate names through the shared inventory', () => {
+    expect(() =>
+      assertSupportedPlainWorkerBindings(
+        [
+          {
+            type: 'unsupported',
+            name: undefined,
+            issue: 'not-object',
+          },
+        ],
+        'version',
+      ),
+    ).toThrow('version binding 0 is not an object');
+    expect(() =>
+      assertSupportedPlainWorkerBindings(
+        [
+          { type: 'secret-text', name: 'DUPLICATE' },
+          { type: 'plain-text', name: 'DUPLICATE', value: 'value' },
+        ],
+        'version',
+      ),
+    ).toThrow('version has duplicate provider binding names');
+  });
+
+  it('uses route D1 reads, falls back to Wrangler, and classifies absence only', async () => {
+    const routeRead = vi.fn(async () => ({
+      id: 'db',
+      name: 'route',
+      created: false,
+    }));
+    const routeSubject = await api(new FakeRunner(), {
+      routeApi: routeApi({ getDatabase: routeRead }),
+    });
+    await expect(routeSubject.getDatabase('db')).resolves.toEqual({
+      id: 'db',
+      name: 'route',
+      created: false,
+    });
+    expect(routeRead).toHaveBeenCalledWith('db');
+
+    const success = await api(
+      new FakeRunner(async () => ({
+        stdout: '{"result":{"uuid":"db","name":"fallback"}}',
+        stderr: '',
+      })),
+    );
+    await expect(success.getDatabase('db')).resolves.toEqual({
+      id: 'db',
+      name: 'fallback',
+      created: false,
+    });
+
+    const absent = await api(
+      new FakeRunner(async () => {
+        throw new Error('D1 database does not exist');
+      }),
+    );
+    await expect(absent.getDatabase('db')).resolves.toBeUndefined();
+    const denied = new Error('authentication failed');
+    const failure = await api(
+      new FakeRunner(async () => {
+        throw denied;
+      }),
+    );
+    await expect(failure.getDatabase('db')).rejects.toBe(denied);
+    const malformed = await api(
+      new FakeRunner(async () => ({ stdout: '{"uuid":"other"}', stderr: '' })),
+    );
+    await expect(malformed.getDatabase('db')).rejects.toThrow(
+      'D1 info result has an invalid uuid or name',
+    );
+  });
+
+  it('distinguishes an absent version inventory from an empty one and preserves missing ids', async () => {
+    const absent = await api(
+      new FakeRunner(async () => {
+        throw new Error('Worker not found');
+      }),
+    );
+    await expect(absent.listVersions('worker')).resolves.toBeUndefined();
+    const empty = await api(
+      new FakeRunner(async () => ({ stdout: '[]', stderr: '' })),
+    );
+    await expect(empty.listVersions('worker')).resolves.toEqual([]);
+    const incomplete = await api(
+      new FakeRunner(async () => ({
+        stdout: '[{"tag":"candidate"}]',
+        stderr: '',
+      })),
+    );
+    await expect(incomplete.listVersions('worker')).resolves.toEqual([
+      { versionId: undefined, tag: 'candidate' },
+    ]);
+    const denied = new Error('version inventory permission denied');
+    const failure = await api(
+      new FakeRunner(async () => {
+        throw denied;
+      }),
+    );
+    await expect(failure.listVersions('worker')).rejects.toBe(denied);
+  });
+
+  it('keeps strict and absence-classifying version reads separate', async () => {
+    const missing = new Error('version 10090 not found');
+    const subject = await api(
+      new FakeRunner(async () => {
+        throw missing;
+      }),
+    );
+    await expect(subject.viewVersion('worker', 'v1')).rejects.toBe(missing);
+    await expect(subject.findVersion('worker', 'v1')).resolves.toBeUndefined();
+    const denied = new Error('permission denied');
+    const failure = await api(
+      new FakeRunner(async () => {
+        throw denied;
+      }),
+    );
+    await expect(failure.findVersion('worker', 'v1')).rejects.toBe(denied);
+  });
+
+  it('returns raw deployment facts without applying backend refusals', async () => {
+    const subject = await api(
+      new FakeRunner(async () => ({
+        stdout:
+          '{"result":{"versions":[{"id":"v1","percentage":"25"},{"id":"v2"},{"id":"v3","percentage":"not-a-number"},{"id":"v4","percentage":null}]}}',
+        stderr: '',
+      })),
+    );
+    await expect(subject.deploymentStatus('worker')).resolves.toEqual({
+      versions: [
+        { versionId: 'v1', percentage: 25 },
+        { versionId: 'v2', percentage: undefined },
+        { versionId: 'v3', percentage: Number.NaN },
+        { versionId: 'v4', percentage: 0 },
+      ],
+    });
+    const denied = new Error('deployment status permission denied');
+    const failure = await api(
+      new FakeRunner(async () => {
+        throw denied;
+      }),
+    );
+    await expect(failure.deploymentStatus('worker')).rejects.toBe(denied);
+  });
+});
+
+describe('WranglerPlainWorkerProvisioningApi mutations', () => {
+  it.each(
+    (['initial', 'staged'] as const).flatMap((mode) =>
+      [
+        {
+          label: 'neither limit',
+          limits: { cpuMs: undefined },
+          wireLimits: undefined,
+        },
+        {
+          label: 'CPU only',
+          limits: { cpuMs: 25 },
+          wireLimits: { cpu_ms: 25 },
+        },
+        {
+          label: 'subrequests only',
+          limits: { cpuMs: undefined, subrequests: 500 },
+          wireLimits: { subrequests: 500 },
+        },
+        {
+          label: 'both limits',
+          limits: { cpuMs: 25, subrequests: 500 },
+          wireLimits: { cpu_ms: 25, subrequests: 500 },
+        },
+      ].map((limits) => ({ mode, ...limits })),
+    ),
+  )('writes the exact $mode config with $label, secret mode, and argv', async ({
+    mode,
+    limits,
+    wireLimits,
+  }) => {
+    let config: unknown;
+    let secretMode: number | undefined;
+    const runner = new FakeRunner(async (arguments_) => {
+      const configPath = arguments_[
+        arguments_.indexOf('--config') + 1
+      ] as string;
+      const secretsPath = arguments_[
+        arguments_.indexOf('--secrets-file') + 1
+      ] as string;
+      config = JSON.parse(await readFile(configPath, 'utf8'));
+      secretMode = (await stat(secretsPath)).mode & 0o777;
+      expect(arguments_).toEqual([
+        ...(mode === 'initial' ? ['deploy'] : ['versions', 'upload']),
+        '--config',
+        configPath,
+        '--secrets-file',
+        secretsPath,
+        '--tag',
+        'candidate-tag',
+      ]);
+      return { stdout: '', stderr: '' };
+    });
+    const outcome = await (await api(runner)).uploadCandidate(
+      { ...uploadIntent(mode), limits },
+      mutationFence(),
+    );
+    expect(outcome).toEqual({
+      status: 'succeeded',
+      cleanup: { status: 'succeeded' },
+    });
+    expect(secretMode).toBe(0o600);
+    expect(config).toEqual({
+      name: 'worker-name',
+      main: 'worker.js',
+      workers_dev: true,
+      preview_urls: false,
+      compatibility_date: '2026-08-10',
+      vars: { TEXT: 'value' },
+      d1_databases: [
+        { binding: 'DB', database_name: 'db-name', database_id: 'db-id' },
+      ],
+      durable_objects: {
+        bindings: [{ name: 'OBJECT', class_name: 'ObjectClass' }],
+      },
+      ...(mode === 'initial'
+        ? {
+            migrations: [
+              {
+                tag: 'v1',
+                new_sqlite_classes: ['ObjectClass'],
+                new_classes: [],
+                deleted_classes: [],
+                renamed_classes: [],
+              },
+            ],
+          }
+        : {}),
+      r2_buckets: [{ binding: 'BUCKET', bucket_name: 'bucket-name' }],
+      ...(wireLimits === undefined ? {} : { limits: wireLimits }),
+    });
+    await expectUploadScratchRemoved();
+  });
+
+  it('asserts immediately before every Wrangler mutation dispatch', async () => {
+    const events: string[] = [];
+    const runner = new FakeRunner(async (arguments_) => {
+      events.push(`run:${arguments_[0]}`);
+      if (arguments_[0] === 'd1' && arguments_[1] === 'export') {
+        await writeFile(
+          arguments_[arguments_.indexOf('--output') + 1] as string,
+          'select 1;',
+        );
+      }
+      return { stdout: '', stderr: '' };
+    });
+    const subject = await api(runner);
+    const owned = mutationFence(
+      vi.fn(async () => {
+        events.push('assert');
+      }),
+    );
+    const calls = [
+      ['d1', () => subject.createDatabase('db', owned)],
+      [
+        'versions',
+        () =>
+          subject.createDeployment(
+            'worker',
+            [{ versionId: 'v1', percentage: 100 }],
+            owned,
+          ),
+      ],
+      ['delete', () => subject.deleteWorkerScript('worker', owned)],
+      [
+        'versions',
+        () => subject.uploadCandidate(uploadIntent('staged'), owned),
+      ],
+      ['d1', () => subject.exportDatabase({ id: 'db', name: 'name' }, owned)],
+    ] as const;
+    for (const [command, call] of calls) {
+      events.length = 0;
+      await call();
+      expect(events).toEqual(['assert', `run:${command}`]);
+    }
+  });
+
+  it.each([
+    'createDatabase',
+    'createDeployment',
+    'deleteWorkerScript',
+    'uploadCandidate',
+    'exportDatabase',
+  ] as const)('rejects a not-found-shaped fence failure before %s dispatch', async (method) => {
+    const runner = new FakeRunner();
+    const subject = await api(runner);
+    const denied = new Error('lease not found');
+    const deniedFence = mutationFence(
+      vi.fn(async () => {
+        throw denied;
+      }),
+    );
+    const operation = {
+      createDatabase: () => subject.createDatabase('db', deniedFence),
+      createDeployment: () =>
+        subject.createDeployment('worker', [], deniedFence),
+      deleteWorkerScript: () =>
+        subject.deleteWorkerScript('worker', deniedFence),
+      uploadCandidate: () =>
+        subject.uploadCandidate(uploadIntent('staged'), deniedFence),
+      exportDatabase: () =>
+        subject.exportDatabase({ id: 'db', name: 'db' }, deniedFence),
+    }[method];
+    await expect(operation()).rejects.toBe(denied);
+    expect(runner.calls).toEqual([]);
+    expect(deniedFence.assertOwned).toHaveBeenCalledTimes(1);
+    if (method === 'uploadCandidate') await expectUploadScratchRemoved();
+  });
+
+  it('retains a pre-dispatch upload denial when scratch cleanup also fails', async () => {
+    fsControl.failFleetCleanup = true;
+    const cleanupError = fsControl.cleanupError;
+    const denied = new Error('lease lost before upload dispatch');
+    const runner = new FakeRunner();
+    const subject = await api(runner);
+    const rejection = await subject
+      .uploadCandidate(
+        uploadIntent('staged'),
+        mutationFence(
+          vi.fn(async () => {
+            throw denied;
+          }),
+        ),
+      )
+      .then(
+        () => new Error('expected upload to reject'),
+        (error: unknown) => error,
+      );
+    expect(rejection).toBeInstanceOf(AggregateError);
+    const aggregate = rejection as AggregateError;
+    expect(aggregate.message).toBe(
+      'Worker upload preparation and adapter scratch cleanup both failed',
+    );
+    expect(aggregate.errors).toHaveLength(2);
+    expect(aggregate.errors[0]).toBe(denied);
+    expect(aggregate.errors[1]).toBe(cleanupError);
+    expect(runner.calls).toEqual([]);
+  });
+
+  it('classifies undefined upload rejection values by dispatch state', async () => {
+    fsControl.failOperation = 'writeFile';
+    fsControl.operationError = undefined;
+    const preparationRunner = new FakeRunner();
+    const preparation = await api(preparationRunner);
+    await expect(
+      preparation.uploadCandidate(uploadIntent('staged'), mutationFence()),
+    ).rejects.toBeUndefined();
+    expect(preparationRunner.calls).toEqual([]);
+    await expectUploadScratchRemoved();
+
+    fsControl.failOperation = undefined;
+    scratchDirectories().length = 0;
+    const preDispatchRunner = new FakeRunner();
+    const preDispatch = await api(preDispatchRunner);
+    await expect(
+      preDispatch.uploadCandidate(
+        uploadIntent('staged'),
+        mutationFence(vi.fn(() => Promise.reject(undefined))),
+      ),
+    ).rejects.toBeUndefined();
+    expect(preDispatchRunner.calls).toEqual([]);
+    await expectUploadScratchRemoved();
+
+    scratchDirectories().length = 0;
+    const dispatched = await api(
+      new FakeRunner(() => Promise.reject(undefined)),
+    );
+    await expect(
+      dispatched.uploadCandidate(uploadIntent('staged'), mutationFence()),
+    ).resolves.toEqual({
+      status: 'failed',
+      error: undefined,
+      cleanup: { status: 'succeeded' },
+    });
+    await expectUploadScratchRemoved();
+
+    scratchDirectories().length = 0;
+    fsControl.failFleetCleanup = true;
+    fsControl.cleanupError = undefined;
+    const cleanup = await api(new FakeRunner());
+    await expect(
+      cleanup.uploadCandidate(uploadIntent('staged'), mutationFence()),
+    ).resolves.toEqual({
+      status: 'succeeded',
+      cleanup: { status: 'failed', error: undefined },
+    });
+    expect(fsControl.residualDirectory).toBeDefined();
+  });
+
+  it('requires both exact-ID route methods and has no unfenced delete member', async () => {
+    let runInsideCalls = 0;
+    // vi.fn erases this generic, so keep the hand-rolled fenced scope.
+    async function runInside<T>(
+      fence: ExternalMutationFence,
+      operation: () => Promise<T>,
+    ): Promise<T> {
+      runInsideCalls += 1;
+      await fence.assertOwned();
+      return operation();
+    }
+    const deleteDatabase = vi.fn(async () => {});
+    const subject = await api(new FakeRunner(), {
+      routeApi: routeApi({
+        withMutationFence: runInside,
+        getDatabase: async () => undefined,
+        deleteDatabase,
+      }),
+    });
+    expect('deleteDatabase' in subject).toBe(false);
+    await subject.deleteDatabaseFenced('db', mutationFence());
+    expect(runInsideCalls).toBe(1);
+    expect(deleteDatabase).toHaveBeenCalledWith('db');
+    const unsupported = await api(new FakeRunner());
+    await expect(
+      unsupported.deleteDatabaseFenced('db', mutationFence()),
+    ).rejects.toThrow(
+      'Wrangler plain Worker adapter requires immutable-ID D1 route methods',
+    );
+  });
+
+  it('returns delete outcomes and rethrows non-absence failures', async () => {
+    const deleted = await api(new FakeRunner());
+    await expect(
+      deleted.deleteWorkerScript('worker', mutationFence()),
+    ).resolves.toBe('deleted');
+    const absent = await api(
+      new FakeRunner(async () => {
+        throw new Error('script not found');
+      }),
+    );
+    await expect(
+      absent.deleteWorkerScript('worker', mutationFence()),
+    ).resolves.toBe('absent');
+    const denied = new Error('denied');
+    const failed = await api(
+      new FakeRunner(async () => {
+        throw denied;
+      }),
+    );
+    await expect(
+      failed.deleteWorkerScript('worker', mutationFence()),
+    ).rejects.toBe(denied);
+  });
+
+  it('reports upload preparation, dispatch, and cleanup failures separately', async () => {
+    const prepRunner = new FakeRunner();
+    const prep = await api(prepRunner);
+    await expect(
+      prep.uploadCandidate(
+        {
+          ...uploadIntent('staged'),
+          modules: [{ name: '../escape.js', content: '' }],
+        },
+        mutationFence(),
+      ),
+    ).rejects.toThrow('escapes the staging directory');
+    expect(prepRunner.calls).toEqual([]);
+    await expectUploadScratchRemoved();
+
+    scratchDirectories().length = 0;
+    const dispatchError = new Error('dispatch failed');
+    const dispatch = await api(
+      new FakeRunner(async () => {
+        throw dispatchError;
+      }),
+    );
+    await expect(
+      dispatch.uploadCandidate(uploadIntent('staged'), mutationFence()),
+    ).resolves.toEqual({
+      status: 'failed',
+      error: dispatchError,
+      cleanup: { status: 'succeeded' },
+    });
+    await expectUploadScratchRemoved();
+
+    scratchDirectories().length = 0;
+    fsControl.failFleetCleanup = true;
+    const cleanup = await api(new FakeRunner());
+    await expect(
+      cleanup.uploadCandidate(uploadIntent('staged'), mutationFence()),
+    ).resolves.toEqual({
+      status: 'succeeded',
+      cleanup: { status: 'failed', error: fsControl.cleanupError },
+    });
+    expect(fsControl.residualDirectory).toBeDefined();
+  });
+
+  it('retains dispatch and cleanup errors together', async () => {
+    fsControl.failFleetCleanup = true;
+    const dispatchError = new Error('dispatch failed');
+    const subject = await api(
+      new FakeRunner(async () => {
+        throw dispatchError;
+      }),
+    );
+    await expect(
+      subject.uploadCandidate(uploadIntent('staged'), mutationFence()),
+    ).resolves.toEqual({
+      status: 'failed',
+      error: dispatchError,
+      cleanup: { status: 'failed', error: fsControl.cleanupError },
+    });
+  });
+
+  it('delegates optional R2 capabilities only when present', async () => {
+    const listWorkerR2Attachments = vi.fn(async () => []);
+    const getR2Bucket = vi.fn(async () => undefined);
+    const createR2Bucket = vi.fn(async () => {});
+    const assertR2BucketEmpty = vi.fn(async () => {});
+    const deleteR2Bucket = vi.fn(async () => {});
+    const present = await api(new FakeRunner(), {
+      routeApi: routeApi({
+        listWorkerR2Attachments,
+        getR2Bucket,
+        createR2Bucket,
+        assertR2BucketEmpty,
+        deleteR2Bucket,
+      }),
+    });
+    const resource = {
+      name: 'BUCKET',
+      bucketName: 'bucket',
+      jurisdiction: 'default',
+    } as const;
+    const owned = mutationFence();
+    await present.listWorkerR2Attachments?.('bucket');
+    await present.getR2Bucket?.('bucket', 'default');
+    await present.createR2Bucket?.(resource, owned);
+    await present.assertR2BucketEmpty?.(resource);
+    await present.deleteR2Bucket?.(resource, owned);
+    expect(listWorkerR2Attachments).toHaveBeenCalledWith('bucket');
+    expect(getR2Bucket).toHaveBeenCalledWith('bucket', 'default');
+    expect(createR2Bucket).toHaveBeenCalledWith(resource, owned);
+    expect(assertR2BucketEmpty).toHaveBeenCalledWith(resource);
+    expect(deleteR2Bucket).toHaveBeenCalledWith(resource, owned);
+    const absent = await api(new FakeRunner());
+    expect(absent.getR2Bucket).toBeUndefined();
+    expect(absent.listWorkerR2Attachments).toBeUndefined();
+    expect(absent.createR2Bucket).toBeUndefined();
+    expect(absent.assertR2BucketEmpty).toBeUndefined();
+    expect(absent.deleteR2Bucket).toBeUndefined();
+  });
+});
+
+describe('WranglerPlainWorkerProvisioningApi exports', () => {
+  it('exports one canonical receipt by immutable database identity and cleans scratch', async () => {
+    const bytes = 'canonical Wrangler receipt';
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    let outputPath = '';
+    const runner = new FakeRunner(async (arguments_) => {
+      outputPath = arguments_[arguments_.indexOf('--output') + 1] as string;
+      expect(arguments_.slice(0, 3)).toEqual([
+        'd1',
+        'export',
+        RECEIPT_IDENTITY.databaseId,
+      ]);
+      await writeFile(outputPath, bytes);
+      return { stdout: '', stderr: '' };
+    });
+    let authorityReads = 0;
+    let methodReads = 0;
+    let receiver: unknown;
+    let expectedPromise: Promise<unknown> | undefined;
+    const store: DurableDatabaseExportStore = {
+      async write() {
+        throw new Error('legacy export must not run');
+      },
+    };
+    Object.defineProperties(store, {
+      receiptAuthority: {
+        configurable: true,
+        get() {
+          authorityReads += 1;
+          return RECEIPT_AUTHORITY;
+        },
+      },
+      writeReceipt: {
+        configurable: true,
+        get() {
+          methodReads += 1;
+          return async function (
+            this: unknown,
+            input: Parameters<
+              NonNullable<DurableDatabaseExportStore['writeReceipt']>
+            >[0],
+          ) {
+            receiver = this;
+            expect(input.identity).toEqual(RECEIPT_IDENTITY);
+            expect(input.contentLength).toBe(Buffer.byteLength(bytes));
+            expectedPromise = input.expectedIntegrity;
+            const body = await drain(input.body);
+            await expect(input.expectedIntegrity).resolves.toEqual({
+              size: Buffer.byteLength(bytes),
+              sha256,
+            });
+            return {
+              location: 'memory://receipt',
+              size: body.size,
+              sha256: body.sha256,
+            };
+          };
+        },
+      },
+    });
+    const subject = await api(runner, { exportStore: store });
+    const exportReceipt = subject.exportDatabaseReceipt;
+    if (!exportReceipt) throw new Error('expected receipt export capability');
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => {
+      throw new Error('receipt export must not consult the clock');
+    });
+    const successfulFence = mutationFence();
+    try {
+      await expect(
+        exportReceipt(RECEIPT_IDENTITY, successfulFence),
+      ).resolves.toEqual({
+        location: 'memory://receipt',
+        size: Buffer.byteLength(bytes),
+        sha256,
+      });
+    } finally {
+      clock.mockRestore();
+    }
+    expect([authorityReads, methodReads]).toEqual([1, 1]);
+    expect(receiver).toBe(store);
+    expect(expectedPromise).toBeInstanceOf(Promise);
+    expect(successfulFence.assertOwned).toHaveBeenCalledTimes(1);
+    await expectExportScratchRemoved(outputPath);
+
+    runner.calls.length = 0;
+    const authorityFailure = await Promise.resolve()
+      .then(() =>
+        exportReceipt(
+          { ...RECEIPT_IDENTITY, authority: 'file:///other/receipts/v1' },
+          mutationFence(),
+        ),
+      )
+      .catch((error: unknown) => error);
+    expect(authorityFailure).toBeInstanceOf(Error);
+    expect((authorityFailure as Error).message).toBe(
+      'database export receipt authority differs from configured authority',
+    );
+    expect((authorityFailure as Error).cause).toBeUndefined();
+    expect(runner.calls).toEqual([]);
+
+    const absent = await api(new FakeRunner());
+    expect('databaseExportReceiptAuthority' in absent).toBe(false);
+    expect('exportDatabaseReceipt' in absent).toBe(false);
+    const malformedCapability = await api(new FakeRunner(), {
+      exportStore: {
+        receiptAuthority: RECEIPT_AUTHORITY,
+        async write() {
+          throw new Error('legacy export must not run');
+        },
+      },
+    }).catch((error: unknown) => error);
+    expect(malformedCapability).toBeInstanceOf(Error);
+    expect((malformedCapability as Error).message).toBe(
+      'database export receipt capability is malformed',
+    );
+    expect((malformedCapability as Error).cause).toBeUndefined();
+
+    for (const property of ['receiptAuthority', 'writeReceipt'] as const) {
+      const throwingStore: DurableDatabaseExportStore = {
+        async write() {
+          throw new Error('legacy export must not run');
+        },
+      };
+      if (property === 'writeReceipt') {
+        Object.defineProperty(throwingStore, 'receiptAuthority', {
+          configurable: true,
+          value: RECEIPT_AUTHORITY,
+        });
+      }
+      Object.defineProperty(throwingStore, property, {
+        configurable: true,
+        get() {
+          throw new Error(`${property} getter must not escape`);
+        },
+      });
+      const getterFailure = await api(new FakeRunner(), {
+        exportStore: throwingStore,
+      }).catch((error: unknown) => error);
+      expect(getterFailure).toBeInstanceOf(Error);
+      expect((getterFailure as Error).message).toBe(
+        'database export receipt capability is malformed',
+      );
+      expect((getterFailure as Error).cause).toBeUndefined();
+    }
+
+    const verifyFailureSettlement = async (
+      primary: unknown,
+      cleanupFails: boolean,
+    ) => {
+      const exportDirectory = await mkdtemp(
+        join(tmpdir(), 'anchorage-fleet-receipt-'),
+      );
+      exportDirectories.add(exportDirectory);
+      const failingRunner = new FakeRunner(async (arguments_) => {
+        const location = arguments_[arguments_.indexOf('--output') + 1];
+        if (!location) throw new Error('missing output path');
+        await writeFile(location, bytes);
+        return { stdout: '', stderr: '' };
+      });
+      const failingStore: DurableDatabaseExportStore = {
+        receiptAuthority: RECEIPT_AUTHORITY,
+        async write() {
+          throw new Error('legacy export must not run');
+        },
+        async writeReceipt() {
+          throw primary;
+        },
+      };
+      const failing = await api(failingRunner, {
+        exportDirectory,
+        exportStore: failingStore,
+      });
+      const failingExportReceipt = failing.exportDatabaseReceipt;
+      if (!failingExportReceipt) {
+        throw new Error('expected failing receipt export capability');
+      }
+      fsControl.failFleetCleanup = cleanupFails;
+      const [state] = await Promise.allSettled([
+        failingExportReceipt(RECEIPT_IDENTITY, mutationFence()),
+      ]);
+      expect(state?.status).toBe('rejected');
+      if (state?.status !== 'rejected') {
+        throw new Error('expected receipt export to reject');
+      }
+      if (cleanupFails) {
+        expect(state.reason).toBeInstanceOf(AggregateError);
+        expect((state.reason as AggregateError).message).toBe(
+          'database export receipt and Wrangler scratch cleanup failed',
+        );
+        expect((state.reason as AggregateError).errors).toEqual([
+          primary,
+          fsControl.cleanupError,
+        ]);
+        fsControl.failFleetCleanup = false;
+        const residual = fsControl.residualDirectory;
+        if (residual) {
+          const actual =
+            await vi.importActual<typeof import('node:fs/promises')>(
+              'node:fs/promises',
+            );
+          await actual.rm(residual, { recursive: true, force: true });
+          fsControl.residualDirectory = undefined;
+        }
+      } else {
+        expect(state.reason).toBe(primary);
+      }
+    };
+    for (const primary of [new Error('primary'), undefined, null]) {
+      await verifyFailureSettlement(primary, false);
+      await verifyFailureSettlement(primary, true);
+    }
+
+    fsControl.failFleetCleanup = true;
+    const cleanupOnlyDirectory = await mkdtemp(
+      join(tmpdir(), 'anchorage-fleet-receipt-'),
+    );
+    exportDirectories.add(cleanupOnlyDirectory);
+    const cleanupOnlySubject = await api(runner, {
+      exportDirectory: cleanupOnlyDirectory,
+      exportStore: store,
+    });
+    const cleanupOnlyExportReceipt = cleanupOnlySubject.exportDatabaseReceipt;
+    if (!cleanupOnlyExportReceipt) {
+      throw new Error('expected cleanup-only receipt export capability');
+    }
+    const cleanupOnlyFence = mutationFence();
+    const cleanupOnlyFailure = await cleanupOnlyExportReceipt(
+      RECEIPT_IDENTITY,
+      cleanupOnlyFence,
+    ).catch((error: unknown) => error);
+    expect(cleanupOnlyFailure).toBe(fsControl.cleanupError);
+    expect(cleanupOnlyFence.assertOwned).toHaveBeenCalledTimes(1);
+    fsControl.failFleetCleanup = false;
+    const cleanupResidual = fsControl.residualDirectory;
+    if (cleanupResidual) {
+      const actual =
+        await vi.importActual<typeof import('node:fs/promises')>(
+          'node:fs/promises',
+        );
+      await actual.rm(cleanupResidual, { recursive: true, force: true });
+      fsControl.residualDirectory = undefined;
+    }
+
+    const dishonestStore: DurableDatabaseExportStore = {
+      receiptAuthority: RECEIPT_AUTHORITY,
+      async write() {
+        throw new Error('legacy export must not run');
+      },
+      async writeReceipt(input) {
+        const body = await drain(input.body);
+        await input.expectedIntegrity;
+        return {
+          location: 'memory://dishonest-receipt',
+          size: body.size + 1,
+          sha256: body.sha256,
+        };
+      },
+    };
+    const dishonest = await api(runner, { exportStore: dishonestStore });
+    const dishonestExportReceipt = dishonest.exportDatabaseReceipt;
+    if (!dishonestExportReceipt) {
+      throw new Error('expected dishonest receipt export capability');
+    }
+    const dishonestFence = mutationFence();
+    await expect(
+      dishonestExportReceipt(RECEIPT_IDENTITY, dishonestFence),
+    ).rejects.toThrow(
+      'durable database export store returned mismatched committed integrity',
+    );
+    expect(dishonestFence.assertOwned).toHaveBeenCalledTimes(1);
+    await expectExportScratchRemoved(outputPath);
+  });
+
+  it('removes export scratch when the fence denies dispatch', async () => {
+    const exportDirectory = await mkdtemp(join(tmpdir(), 'adapter-export-'));
+    exportDirectories.add(exportDirectory);
+    const denied = new Error('lease lost before export dispatch');
+    const runner = new FakeRunner();
+    const subject = await api(runner, { exportDirectory });
+    await expect(
+      subject.exportDatabase(
+        { id: 'db', name: 'name' },
+        mutationFence(
+          vi.fn(async () => {
+            throw denied;
+          }),
+        ),
+      ),
+    ).rejects.toBe(denied);
+    const actual =
+      await vi.importActual<typeof import('node:fs/promises')>(
+        'node:fs/promises',
+      );
+    await expect(actual.readdir(exportDirectory)).resolves.toEqual([]);
+    expect(runner.calls).toEqual([]);
+  });
+
+  async function exportSubject(
+    options: {
+      readonly bytes?: string;
+      readonly store?: DurableDatabaseExportStore;
+      readonly output?: 'file' | 'empty' | 'directory';
+    } = {},
+  ) {
+    let outputPath = '';
+    const runner = new FakeRunner(async (arguments_) => {
+      outputPath = arguments_[arguments_.indexOf('--output') + 1] as string;
+      if (options.output === 'directory') {
+        const fs =
+          await vi.importActual<typeof import('node:fs/promises')>(
+            'node:fs/promises',
+          );
+        await fs.mkdir(outputPath);
+      } else {
+        await writeFile(
+          outputPath,
+          options.output === 'empty' ? '' : (options.bytes ?? 'select 1;'),
+        );
+      }
+      return { stdout: '', stderr: '' };
+    });
+    return {
+      subject: await api(runner, { exportStore: options.store }),
+      output: () => outputPath,
+    };
+  }
+
+  it('rejects a store that reads only one prefix byte', async () => {
+    const store: DurableDatabaseExportStore = {
+      async write(input) {
+        const reader = input.body.getReader();
+        const first = await reader.read();
+        const bytes = first.done ? new Uint8Array() : first.value.slice(0, 1);
+        return {
+          location: 'memory://prefix',
+          size: bytes.byteLength,
+          sha256: createHash('sha256').update(bytes).digest('hex'),
+        };
+      },
+    };
+    const { subject, output } = await exportSubject({
+      bytes: 'complete export',
+      store,
+    });
+    await expect(
+      subject.exportDatabase({ id: 'db', name: 'name' }, mutationFence()),
+    ).rejects.toThrow(
+      'durable database export store returned mismatched committed integrity',
+    );
+    await expectExportScratchRemoved(output());
+  });
+
+  it('rejects a store that never reads the body and claims the empty digest', async () => {
+    const store: DurableDatabaseExportStore = {
+      async write(input) {
+        await input.body.cancel();
+        return {
+          location: 'memory://empty',
+          size: 0,
+          sha256: createHash('sha256').digest('hex'),
+        };
+      },
+    };
+    const { subject, output } = await exportSubject({
+      bytes: 'complete export',
+      store,
+    });
+    await expect(
+      subject.exportDatabase({ id: 'db', name: 'name' }, mutationFence()),
+    ).rejects.toThrow(
+      'durable database export store returned mismatched committed integrity',
+    );
+    await expectExportScratchRemoved(output());
+  });
+
+  it('rejects a multi-chunk export store that commits only the first chunk', async () => {
+    const store: DurableDatabaseExportStore = {
+      async write(input) {
+        const reader = input.body.getReader();
+        const first = await reader.read();
+        if (first.done) throw new Error('expected a first export chunk');
+        await reader.cancel();
+        return {
+          location: 'memory://first-chunk',
+          size: first.value.byteLength,
+          sha256: createHash('sha256').update(first.value).digest('hex'),
+        };
+      },
+    };
+    const { subject, output } = await exportSubject({
+      bytes: 'x'.repeat(128 * 1024 + 1),
+      store,
+    });
+    await expect(
+      subject.exportDatabase({ id: 'db', name: 'name' }, mutationFence()),
+    ).rejects.toThrow(
+      'durable database export store returned mismatched committed integrity',
+    );
+    await expectExportScratchRemoved(output());
+  });
+
+  it.each([
+    'empty',
+    'directory',
+  ] as const)('refuses %s export output and removes scratch', async (outputKind) => {
+    const { subject, output } = await exportSubject({ output: outputKind });
+    await expect(
+      subject.exportDatabase({ id: 'db', name: 'name' }, mutationFence()),
+    ).rejects.toThrow('Wrangler database export is not a non-empty file');
+    await expectExportScratchRemoved(output());
+  });
+
+  it.each([
+    'chmod',
+    'stat',
+  ] as const)('propagates %s failure and removes export scratch', async (operation) => {
+    fsControl.failOperation = operation;
+    const failure = new Error(`${operation} failed`);
+    fsControl.operationError = failure;
+    const { subject, output } = await exportSubject();
+    await expect(
+      subject.exportDatabase({ id: 'db', name: 'name' }, mutationFence()),
+    ).rejects.toBe(failure);
+    await expectExportScratchRemoved(output());
+  });
+
+  it('propagates runner failure and removes export scratch', async () => {
+    const failure = new Error('export dispatch failed');
+    let outputPath = '';
+    const runner = new FakeRunner(async (arguments_) => {
+      outputPath = arguments_[arguments_.indexOf('--output') + 1] as string;
+      throw failure;
+    });
+    const subject = await api(runner);
+    await expect(
+      subject.exportDatabase({ id: 'db', name: 'name' }, mutationFence()),
+    ).rejects.toBe(failure);
+    await expectExportScratchRemoved(outputPath);
+  });
+
+  it('propagates store failures and removes scratch', async () => {
+    const storeError = new Error('store failed');
+    const { subject, output } = await exportSubject({
+      store: {
+        async write() {
+          throw storeError;
+        },
+      },
+    });
+    await expect(
+      subject.exportDatabase({ id: 'db', name: 'name' }, mutationFence()),
+    ).rejects.toBe(storeError);
+    await expectExportScratchRemoved(output());
+  });
+
+  it.each(
+    ['legacy', 'receipt'].flatMap((method) =>
+      ['sync', 'async', 'integrity'].flatMap((failure) =>
+        [false, true].map((locked) => ({ method, failure, locked })),
+      ),
+    ),
+  )('closes $method source after $failure refusal with locked=$locked', async ({
+    method,
+    failure,
+    locked,
+  }) => {
+    const primary = new Error('supplied store refused');
+    const sources: Readable[] = [];
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    const toWeb = Readable.toWeb;
+    const observe = vi
+      .spyOn(Readable, 'toWeb')
+      .mockImplementation((source, options) => {
+        sources.push(source);
+        return toWeb(source, options);
+      });
+    const write = (input: { readonly body: ReadableStream<Uint8Array> }) => {
+      if (locked) {
+        reader = input.body.getReader();
+        void reader.closed.catch(() => undefined);
+      }
+      if (failure === 'sync') throw primary;
+      if (failure === 'async') return Promise.reject(primary);
+      return Promise.resolve({
+        location: 'memory://invalid',
+        size: 0,
+        sha256: '0'.repeat(64),
+      });
+    };
+    try {
+      const { subject, output } = await exportSubject({
+        bytes: 'x'.repeat(1024 * 1024),
+        store: {
+          write,
+          receiptAuthority: RECEIPT_AUTHORITY,
+          writeReceipt: write,
+        },
+      });
+      const exportReceipt = subject.exportDatabaseReceipt;
+      if (!exportReceipt) throw new Error('expected receipt export capability');
+      const result =
+        method === 'legacy'
+          ? subject.exportDatabase({ id: 'db', name: 'name' }, mutationFence())
+          : exportReceipt(RECEIPT_IDENTITY, mutationFence());
+      if (failure === 'integrity') {
+        await expect(result).rejects.toThrow('mismatched committed integrity');
+      } else {
+        await expect(result).rejects.toBe(primary);
+      }
+      expect(sources).toHaveLength(1);
+      expect(sources[0]?.destroyed).toBe(true);
+      expect(sources[0]?.closed).toBe(true);
+      await expectExportScratchRemoved(output());
+    } finally {
+      reader?.releaseLock();
+      for (const source of sources) source.destroy();
+      observe.mockRestore();
+    }
+  });
+
+  it('returns the independent digest, size, location, and secure file mode', async () => {
+    const bytes = 'fixture export bytes';
+    let mode: number | undefined;
+    let outputPath = '';
+    const runner = new FakeRunner(async (arguments_) => {
+      outputPath = arguments_[arguments_.indexOf('--output') + 1] as string;
+      await writeFile(outputPath, bytes);
+      return { stdout: '', stderr: '' };
+    });
+    const store: DurableDatabaseExportStore = {
+      async write(input) {
+        mode = (await stat(outputPath)).mode & 0o777;
+        const body = await drain(input.body);
+        return {
+          location: 'memory://complete',
+          size: body.size,
+          sha256: body.sha256,
+        };
+      },
+    };
+    const subject = await api(runner, { exportStore: store });
+    await expect(
+      subject.exportDatabase({ id: 'db', name: 'name' }, mutationFence()),
+    ).resolves.toEqual({
+      location: 'memory://complete',
+      size: Buffer.byteLength(bytes),
+      sha256: createHash('sha256').update(bytes).digest('hex'),
+    });
+    expect(mode).toBe(0o600);
+    await expectExportScratchRemoved(outputPath);
+  });
+
+  it('conditionally forwards a bounded decommission scanner with exact identity', async () => {
+    const absent = await api(new FakeRunner());
+    expect(absent.advanceDecommissionAttachmentScan).toBeUndefined();
+    expect('advanceDecommissionAttachmentScan' in absent).toBe(false);
+    expect(Object.hasOwn(absent, 'advanceDecommissionAttachmentScan')).toBe(
+      false,
+    );
+
+    const input: DecommissionAttachmentScanInput = {
+      progress: initialWorkerAttachmentScan({ kind: 'd1', databaseId: 'db' }),
+      maxProviderRequests: 12,
+    };
+    const result: DecommissionAttachmentScanResult = { status: 'drift' };
+    const calls: Array<readonly [unknown, DecommissionAttachmentScanInput]> =
+      [];
+    const capableRouteApi = routeApi();
+    let capabilityReads = 0;
+    Object.defineProperty(
+      capableRouteApi,
+      'advanceDecommissionAttachmentScan',
+      {
+        configurable: true,
+        get() {
+          capabilityReads += 1;
+          return function (
+            this: unknown,
+            actual: DecommissionAttachmentScanInput,
+          ) {
+            calls.push([this, actual]);
+            return Promise.resolve(result);
+          };
+        },
+      },
+    );
+    const capable = await api(new FakeRunner(), {
+      routeApi: capableRouteApi,
+    });
+    expect(typeof capable.advanceDecommissionAttachmentScan).toBe('function');
+    expect('advanceDecommissionAttachmentScan' in capable).toBe(true);
+    expect(Object.hasOwn(capable, 'advanceDecommissionAttachmentScan')).toBe(
+      true,
+    );
+    await expect(
+      capable.advanceDecommissionAttachmentScan?.(input),
+    ).resolves.toBe(result);
+    expect(calls).toEqual([[capableRouteApi, input]]);
+    expect(capabilityReads).toBe(1);
+  });
+
+  it('refuses an empty durable location', async () => {
+    const store: DurableDatabaseExportStore = {
+      async write(input) {
+        const body = await drain(input.body);
+        return {
+          location: '',
+          size: body.size,
+          sha256: body.sha256,
+        };
+      },
+    };
+    const { subject, output } = await exportSubject({ store });
+    await expect(
+      subject.exportDatabase({ id: 'db', name: 'name' }, mutationFence()),
+    ).rejects.toThrow(
+      'durable database export store returned mismatched committed integrity',
+    );
+    await expectExportScratchRemoved(output());
+  });
+});

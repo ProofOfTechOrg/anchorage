@@ -34,6 +34,7 @@ export {
   parseAgentApprovalSuspend,
 } from './approval-shapes.js';
 export {
+  type AgentStartAuthority,
   createFlowsafeDurableAgent,
   DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
   FlowsafeDurableAgent,

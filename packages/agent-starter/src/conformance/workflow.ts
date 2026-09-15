@@ -73,7 +73,11 @@ function createRecordEffectConnector(db: D1Database) {
     // Grant-only, exactly as the workerd spike proves it: the write gate is
     // satisfied by a requestContext grant the runtime derives from an APPROVED
     // record, never by anything in the resume body.
-    permissions: { sideEffect: 'write', requiresApproval: true },
+    permissions: {
+      sideEffect: 'write',
+      egressEnforcement: 'enforced',
+      requiresApproval: true,
+    },
     execute: async ({ effectNonce, runId }) => {
       await db.prepare(EFFECTS_DDL).run();
       const result = await db

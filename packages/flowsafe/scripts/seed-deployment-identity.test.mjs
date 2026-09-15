@@ -2,11 +2,13 @@
 
 import { describe, expect, it } from 'vitest';
 
+import { EXECUTION_FENCE_DDL } from '../deployment-identity-protocol.mjs';
 import {
   DeploymentIdentityError,
   readDeploymentIdentity,
   seedDeploymentIdentity,
 } from '../src/do-runner/deployment-identity.js';
+import { ExecutionFenceStore } from '../src/do-runner/execution-fence.js';
 import { openSqlite, sqliteUnitDatabase } from '../test-support/sqlite.js';
 import {
   parseProvisioningArguments,
@@ -31,6 +33,11 @@ const COLUMNS = [
   { name: 'tenant_tag', type: 'TEXT', notnull: 1, pk: 0 },
   { name: 'provisioned_at', type: 'TEXT', notnull: 1, pk: 0 },
 ];
+const LEGACY_FENCE_DDL = `CREATE TABLE ${FENCE_TABLE} (
+  id TEXT PRIMARY KEY CHECK (id = 'deployment'),
+  state TEXT NOT NULL CHECK (state IN ('open', 'draining', 'migration-locked', 'proof-only')),
+  proof_key TEXT, proof_run_id TEXT, updated_at INTEGER NOT NULL
+)`;
 
 function databaseQuery(initialTables = [], ownerTag = 'acme') {
   const tables = [...initialTables];
@@ -39,14 +46,36 @@ function databaseQuery(initialTables = [], ownerTag = 'acme') {
   // The fence table is reported by the schema scan once created, so the
   // ownership guard below faces the same residue a crashed provisioning pass
   // would leave behind.
-  let fenceTable = initialTables.some((row) => row.name === FENCE_TABLE);
-  let fenceState;
+  const fenceSqlite = openSqlite();
+  if (initialTables.some((row) => row.name === FENCE_TABLE))
+    fenceSqlite.exec(LEGACY_FENCE_DDL);
+  const fenceSchema = () =>
+    fenceSqlite
+      .prepare(`SELECT name, sql FROM sqlite_schema WHERE type = 'table'`)
+      .all();
   const mutations = [];
   return {
     mutations,
-    fence: () => ({ table: fenceTable, state: fenceState }),
+    fence: () => ({
+      table: fenceSchema().length === 1,
+      state:
+        fenceSchema().length === 0
+          ? undefined
+          : fenceSqlite.prepare(`SELECT state FROM ${FENCE_TABLE}`).get()
+              ?.state,
+    }),
     addTable: (row) => tables.push(row),
     query: async (statement) => {
+      if (
+        /^(?:CREATE TABLE IF NOT EXISTS|INSERT OR IGNORE INTO|ALTER TABLE) flowsafe_execution_fence\b/.test(
+          statement,
+        ) ||
+        statement.startsWith(`SELECT * FROM ${FENCE_TABLE}`) ||
+        statement === `PRAGMA table_xinfo(${FENCE_TABLE})`
+      ) {
+        if (/^(CREATE|INSERT|ALTER)/.test(statement)) mutations.push(statement);
+        return fenceSqlite.prepare(statement).all();
+      }
       if (statement.startsWith('SELECT name, sql')) {
         const applicationTables = tables.filter(
           (row) =>
@@ -54,30 +83,17 @@ function databaseQuery(initialTables = [], ownerTag = 'acme') {
         );
         return [
           ...(seeded ? [{ name: 'flowsafe_deployment', sql: SQL }] : []),
-          ...(fenceTable ? [{ name: FENCE_TABLE, sql: 'CREATE' }] : []),
+          ...fenceSchema(),
           ...applicationTables,
         ];
       }
       if (statement.startsWith('CREATE TABLE')) {
         mutations.push(statement);
-        // Dispatch on the TARGET table, never on a substring: the ownership
-        // insert names the fence table in its exclusion list, so `includes`
-        // would route it here.
-        if (statement.startsWith(`CREATE TABLE IF NOT EXISTS ${FENCE_TABLE}`)) {
-          fenceTable = true;
-        } else {
-          seeded = true;
-        }
+        seeded = true;
         return [];
       }
       if (statement.startsWith('INSERT OR IGNORE')) {
         mutations.push(statement);
-        if (statement.startsWith(`INSERT OR IGNORE INTO ${FENCE_TABLE}`)) {
-          // INSERT OR IGNORE: an existing row wins, exactly as the protocol
-          // requires so a re-provision cannot reopen a closed fence.
-          fenceState ??= statement.match(/VALUES \('[^']+', '([^']+)'/)?.[1];
-          return [];
-        }
         const blocking = tables.filter(
           (row) =>
             row.name !== 'flowsafe_deployment' &&
@@ -166,6 +182,143 @@ async function rejectedError(action) {
 }
 
 describe('deployment identity provisioning CLI', () => {
+  it('migrates a legacy fence identically through runtime and CLI executors', async () => {
+    const runtimeSqlite = openSqlite();
+    const cliSqlite = openSqlite();
+    for (const sqlite of [runtimeSqlite, cliSqlite]) {
+      sqlite.exec(LEGACY_FENCE_DDL);
+      sqlite.exec(
+        `INSERT INTO ${FENCE_TABLE} VALUES ('deployment', 'proof-only', 'old-key', 'old-run', 17)`,
+      );
+    }
+    await new ExecutionFenceStore(sqliteUnitDatabase(runtimeSqlite)).seed(
+      'open',
+    );
+    await provisionDeploymentIdentity(OPTIONS, sqliteQuery(cliSqlite));
+    expect(fenceSnapshot(runtimeSqlite)).toEqual(fenceSnapshot(cliSqlite));
+    expect(cliSqlite.prepare(`SELECT * FROM ${FENCE_TABLE}`).get()).toEqual({
+      id: 'deployment',
+      state: 'proof-only',
+      proof_key: 'old-key',
+      proof_run_id: 'old-run',
+      updated_at: 17,
+      last_transition_request: null,
+      transition_revision: 0,
+      mutation_epoch: 0,
+      require_mutation_epoch: 0,
+      proof_table_prefix: null,
+      proof_workflow_id: null,
+      proof_start_token: null,
+    });
+  });
+
+  it('does not seed a new-format row from a stale legacy-empty observation', async () => {
+    const sqlite = openSqlite();
+    sqlite.exec(LEGACY_FENCE_DDL);
+    const statements = [];
+    const query = sqliteQuery(sqlite, (sql) => {
+      statements.push(sql);
+      if (sql.startsWith(`INSERT OR IGNORE INTO ${FENCE_TABLE}`)) {
+        sqlite.exec(`DROP TABLE ${FENCE_TABLE}`);
+        sqlite.exec(EXECUTION_FENCE_DDL);
+      }
+    });
+    await expect(
+      provisionDeploymentIdentity(OPTIONS, query),
+    ).rejects.toBeInstanceOf(DeploymentIdentityError);
+    expect(sqlite.prepare(`SELECT * FROM ${FENCE_TABLE}`).all()).toEqual([]);
+    expect(
+      statements.filter((sql) =>
+        sql.startsWith(`INSERT OR IGNORE INTO ${FENCE_TABLE}`),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it('preserves active proof schema prefixes identically through runtime and CLI', async () => {
+    const proofColumns = [
+      'proof_table_prefix',
+      'proof_workflow_id',
+      'proof_start_token',
+    ];
+    for (const stage of [4, 5, 6]) {
+      const runtimeSqlite = openSqlite();
+      const cliSqlite = openSqlite();
+      for (const sqlite of [runtimeSqlite, cliSqlite]) {
+        const fence = new ExecutionFenceStore(sqliteUnitDatabase(sqlite), {
+          now: () => 17,
+        });
+        const admitted = await fence.transition({
+          expected: 'open',
+          next: 'proof-only',
+          proofKey: 'key',
+          expectedMutationEpoch: 0,
+          expectedRevision: 0,
+          advanceMutationEpoch: true,
+        });
+        await fence.recordProofRun('key', 'run', admitted);
+        for (const name of proofColumns.slice(stage - 4).reverse())
+          sqlite.exec(`ALTER TABLE ${FENCE_TABLE} DROP COLUMN ${name}`);
+      }
+      const before = cliSqlite.prepare(`SELECT * FROM ${FENCE_TABLE}`).get();
+      await seedDeploymentIdentity(
+        sqliteUnitDatabase(runtimeSqlite),
+        'acme',
+        'open',
+      );
+      const statements = [];
+      await provisionDeploymentIdentity(
+        OPTIONS,
+        sqliteQuery(cliSqlite, (sql) => statements.push(sql)),
+      );
+      expect(fenceSnapshot(cliSqlite)).toEqual(fenceSnapshot(runtimeSqlite));
+      expect(cliSqlite.prepare(`SELECT * FROM ${FENCE_TABLE}`).get()).toEqual({
+        ...before,
+        proof_table_prefix: null,
+        proof_workflow_id: null,
+        proof_start_token: null,
+      });
+      expect(
+        statements.filter((sql) =>
+          sql.startsWith(`ALTER TABLE ${FENCE_TABLE}`),
+        ),
+      ).toHaveLength(7 - stage);
+      const after = statements.length;
+      await provisionDeploymentIdentity(
+        OPTIONS,
+        sqliteQuery(cliSqlite, (sql) => statements.push(sql)),
+      );
+      expect(
+        statements
+          .slice(after)
+          .filter((sql) => /^(CREATE|INSERT|UPDATE|ALTER)/.test(sql)),
+      ).toEqual([]);
+    }
+  });
+
+  it('preserves the runtime seed vocabulary and the provisioning birth-state restriction', async () => {
+    for (const state of ['draining', 'proof-only']) {
+      const sqlite = openSqlite();
+      const fence = new ExecutionFenceStore(sqliteUnitDatabase(sqlite));
+      await fence.seed(state);
+      expect(await fence.read()).toEqual({
+        state,
+        mutationEpoch: 0,
+        requireMutationEpoch: false,
+        transitionRevision: 0,
+      });
+      const statements = [];
+      await expect(
+        provisionDeploymentIdentity(
+          { ...OPTIONS, initialFenceState: state },
+          async (sql) => {
+            statements.push(sql);
+            return [];
+          },
+        ),
+      ).rejects.toBeInstanceOf(DeploymentIdentityError);
+      expect(statements).toEqual([]);
+    }
+  });
   it('requires an explicit database, valid tag, fence state, and execution target', () => {
     expect(
       parseProvisioningArguments([
@@ -277,7 +430,7 @@ describe('deployment identity provisioning CLI', () => {
     // Sentinel DDL, ownership insert, then the fence: the fence DDL runs LAST
     // so it can never add a table to a database whose ownership is still being
     // decided.
-    expect(fake.mutations).toHaveLength(4);
+    expect(fake.mutations).toHaveLength(11);
     expect(fake.mutations[0]).toMatch(
       /^CREATE TABLE IF NOT EXISTS flowsafe_deployment/,
     );
@@ -290,6 +443,13 @@ describe('deployment identity provisioning CLI', () => {
     expect(fake.mutations[3]).toMatch(
       /^INSERT OR IGNORE INTO flowsafe_execution_fence/,
     );
+    expect(
+      fake.mutations
+        .slice(4)
+        .every((sql) =>
+          sql.startsWith(`ALTER TABLE ${FENCE_TABLE} ADD COLUMN`),
+        ),
+    ).toBe(true);
     expect(fake.fence()).toEqual({ table: true, state: 'open' });
   });
 
@@ -298,20 +458,13 @@ describe('deployment identity provisioning CLI', () => {
     await provisionDeploymentIdentity(OPTIONS, fake.query);
     const afterFirst = fake.mutations.length;
 
-    // A second pass short-circuits on ownership but still writes the fence, so
-    // a run that died between the ownership insert and the fence row heals.
+    // A current singleton is validated without a fence mutation.
     await provisionDeploymentIdentity(
       { ...OPTIONS, initialFenceState: 'migration-locked' },
       fake.query,
     );
 
-    expect(fake.mutations.slice(afterFirst)).toHaveLength(2);
-    expect(fake.mutations[afterFirst]).toMatch(
-      /^CREATE TABLE IF NOT EXISTS flowsafe_execution_fence/,
-    );
-    expect(fake.mutations[afterFirst + 1]).toMatch(
-      /^INSERT OR IGNORE INTO flowsafe_execution_fence/,
-    );
+    expect(fake.mutations.slice(afterFirst)).toEqual([]);
     // INSERT-if-absent: the existing row survives a re-provision that asked for
     // a different state.
     expect(fake.fence()).toEqual({ table: true, state: 'open' });
@@ -419,7 +572,7 @@ describe('deployment identity provisioning CLI', () => {
 
     await provisionDeploymentIdentity(OPTIONS, fake.query);
 
-    expect(fake.mutations).toHaveLength(3);
+    expect(fake.mutations).toHaveLength(10);
     expect(fake.mutations[0]).toMatch(
       /^INSERT OR IGNORE INTO flowsafe_deployment/,
     );
@@ -457,7 +610,7 @@ describe('deployment identity provisioning CLI', () => {
   ])('allows the exact D1-owned %s table', async (name) => {
     const fake = databaseQuery([{ name, sql: 'CREATE' }]);
     await provisionDeploymentIdentity(OPTIONS, fake.query);
-    expect(fake.mutations).toHaveLength(4);
+    expect(fake.mutations).toHaveLength(11);
   });
 
   it('allows a pre-existing execution fence table left by an interrupted pass', async () => {

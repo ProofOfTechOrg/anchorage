@@ -17,6 +17,7 @@ import {
   runCredentialedConformance,
   validateOperationalConformance,
 } from '../scripts/credentialed-conformance-runtime.mjs';
+import { plainWorkerIngressModule } from '../src/plain-worker-backend.js';
 import {
   canonicalMaintenanceCapabilityPublicKey,
   FLEET_AUDIT_PROXY_CLASS_NAME,
@@ -32,7 +33,6 @@ import {
   validateDeploymentSecrets,
   validateDeploymentSpec,
 } from '../src/validation.js';
-import { plainWorkerIngressModule } from '../src/wrangler-loop-backend.js';
 
 const REQUIRED_ENVIRONMENT_VARIABLES = [
   'FLEET_CONFORMANCE_CONFIG',
@@ -591,8 +591,8 @@ describe('credentialed conformance command', () => {
 
   it('pins live-only plain-lane request and recovery invariants', () => {
     const source = readFileSync(scriptPath, 'utf8');
-    expect(source).toContain(
-      'const cloudflare = new Cloudflare({ apiToken, maxRetries: 0 });',
+    expect(source).toMatch(
+      /const cloudflare = new Cloudflare\(\{\s*apiToken,\s*logLevel: 'off',\s*maxRetries: 0,\s*\}\);/u,
     );
     expect(source).toMatch(
       /deployment\.store\.withDeploymentLease\(\s*spec\.tenantTag,\s*spec\.environment,\s*async \(fence\)/u,

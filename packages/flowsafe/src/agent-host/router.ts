@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { captureActorContext } from '../approval-api/actor-context.js';
 import {
   ActorResolutionError,
   type ActorResolver,
   RUN_START_ROLES,
 } from '../approval-api/index.js';
+import {
+  InvalidMutationEpochError,
+  MutationEpochMismatchError,
+} from '../do-runner/execution-admission.js';
 import { isPathSafeId } from '../do-runner/index.js';
 import {
   RunRouteError,
@@ -184,6 +189,12 @@ function offsetFor(url: URL): number | Response {
 }
 
 function internalError(error: unknown, route: MatchedRoute): Response {
+  if (
+    error instanceof InvalidMutationEpochError ||
+    error instanceof MutationEpochMismatchError
+  ) {
+    return json({ error: error.message, reason: error.reason }, error.status);
+  }
   if (error instanceof ActorResolutionError) {
     return json({ error: 'forbidden' }, 403);
   }
@@ -221,8 +232,13 @@ export function createAgentRouter(options: AgentRouterOptions): AgentRouter {
     if (route.kind === 'not-found') return json({ error: 'not found' }, 404);
 
     try {
-      const context = await options.resolve(request);
-      if (!context) return json({ error: 'authentication required' }, 401);
+      const sourceContext = await options.resolve(request);
+      if (!sourceContext)
+        return json({ error: 'authentication required' }, 401);
+      const context =
+        route.kind === 'start' && request.method === route.allow
+          ? captureActorContext(sourceContext)
+          : sourceContext;
 
       if (route.kind === 'catalog') {
         if (request.method !== route.allow) {

@@ -627,6 +627,17 @@ describe('agent gate grant round-trip (both suspension shapes)', () => {
       },
       'operator-1',
       'human',
+      undefined,
+      undefined,
+      undefined,
+      {
+        startIdentity: {
+          owner: { kind: 'human', id: 'operator-1' },
+          target: { kind: 'agent', id: 'writer', threadId: runId },
+        },
+        agentStart: { threaded: false },
+        onPreparedStartIdentity: undefined,
+      },
     );
     const started = await runtime.status(
       DURABLE_AGENTIC_LOOP_WORKFLOW_ID,

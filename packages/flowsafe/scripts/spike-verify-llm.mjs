@@ -11,7 +11,7 @@ import {
 import { parseLlmSpikeConfig } from './spike-llm-config.mjs';
 
 const FLOWSAFE = dirname(dirname(fileURLToPath(import.meta.url)));
-const WRANGLER = join(FLOWSAFE, 'node_modules/.bin/wrangler');
+const WRANGLER = join(FLOWSAFE, '../../node_modules/.bin/wrangler');
 const CONFIG = join(FLOWSAFE, 'spike/wrangler.jsonc');
 // Distinct from every other harness default (spike:verify 8799,
 // durability-benchmark 8801, conformance:verify 8821) so two can run at once.

@@ -109,6 +109,12 @@ Terminate:
 
 A repeated request reads the terminal snapshot and returns the same summary. After ownership release, the public router delegates replay authorization to the owner object. The object accepts only a principal recorded by the original transition.
 
+### Read stored run summaries
+
+Stored summaries use the selected workflow's direct step records, without recursively merging child workflow rows. A nested `a` workflow's `b` step therefore cannot overwrite the payload or suspension timestamp of a direct `a.b` step. The same root-local projection applies to status, authoritative status, recovered execution outcomes and lifecycle completion summaries.
+
+Detailed resume preparation still reads nested steps so the selected child's suspension timestamp and prior resume count reach grant derivation. Nested-workflow metadata and deadline refusals remain intact; the naming constraints below still apply to ambiguous approval paths. This read correction does not activate generation-bound admission or the private replay protocol.
+
 ### Fence execution during a deployment migration
 
 The execution fence controls one physical deployment, which is also one tenant boundary. It is never scoped to an actor or run. Each admission reads the current row without memoization, and storage failures fail closed.
@@ -138,13 +144,17 @@ The key is accepted by `POST /runs`, trusted `AgentThreadStartInput` calls, and 
 
 Retries use these outcomes:
 
-- A persisted snapshot returns the same run and state without executing again
-- A `reserved` row with no snapshot reclaims the same reserved run ID
-- A live `started` row with no snapshot returns `IDEMPOTENT_START_PENDING` and `pendingSince`
+- A matching nonpending generation returns its observed result without executing again
+- A modern-unbound `reserved` row with no snapshot can claim the same reserved run ID after the owning liveness probe confirms it is not live
+- A live `reserved` or `started` row with no snapshot returns `IDEMPOTENT_START_PENDING` and `pendingSince`
 - A non-live `started` row with no snapshot returns `IDEMPOTENT_START_UNRESOLVABLE`
 - A `terminal` row whose snapshot expired returns `IDEMPOTENT_START_ALREADY_SETTLED`
 
+Bound reservations compare namespace, workflow, run and execution token before classifying a snapshot as pending or a result. A replacement generation never supplies a replay or liveness answer for the original one. Valid pending snapshots are nonreplayable. Legacy nonterminal reservations remain unresolved; legacy terminal reservations stay spent. An unbound alias can bind a result observed in one authoritative read even if that snapshot disappears afterward; it returns that original value.
+
 `IDEMPOTENT_START_UNRESOLVABLE` is a point-in-time probe. A read can occur between the Worker-side claim and the run object learning that execution started, so re-probe before investigating or choosing a fresh key. Flowsafe never starts another run automatically. A replayed suspended start returns the persisted `RunSummary` without the start response's `approval` and `approvals` fields; read `GET /runs/:workflowId/:runId` to reconcile approval state.
+
+An agent stream can remain registered while Core finishes cleanup after a refused start. During that interval, retrying a released key returns pending without claiming it again. An unreadable liveness response returns `503` and leaves the reservation unchanged; it does not establish that the run is absent.
 
 The reservation remains valid for its retention horizon. Once the terminal reservation is purged, the same key is fresh and can start another run. Keep the horizon at least as long as callers can retry.
 
@@ -164,9 +174,110 @@ Flowsafe does not maintain a parallel custom workflow state object.
 
 ### Execution fence and start reservations
 
-`flowsafe_execution_fence` stores the deployment's singleton fence state, optional proof key, and optional bound proof run. State transitions compare the caller's `expected` state before they write. A database created by Flowsafe 0.19 has no row or table, which reads as `open`; provisioning from 0.20 onward writes an explicit initial row.
+`flowsafe_execution_fence` stores the deployment's singleton fence state, optional proof key, bound proof run, mutation epoch, sticky epoch requirement, and transition revision. The epoch identifies artifact authority; an explicit `advanceMutationEpoch: true` increments it once and enables the requirement in the same compare-and-set. Every newly applied administrative command increments the revision, including same-state and legacy commands. Ordinary lock, proof, and reopen commands preserve the epoch and requirement.
+
+A missing pre-0.20 table or empty five-column legacy table reads as optional `open`, with epoch and revision zero. Initialization seeds only that legacy shape, then adds mutation and proof metadata columns in order. Interrupted additive upgrades resume without changing the state, proof fields, or timestamp. A missing row once any metadata column exists is unreadable, never implicitly open or refilled. Readers allow one bounded re-observation when an empty legacy row read races a concurrent schema upgrade. Deleting the whole table or restoring an old-format backup is indistinguishable from genuine legacy absence.
+
+Store reads are uncached and require an authoritative database binding. Upgrade the deployment's writers and configure their trusted artifact epoch before activating the requirement. Runtime initial admission and D1 schedule authoring enforce the original caller epoch in their final SQL.
+
+Schedule mutations compare the captured semantic fence frame and schema in the same transaction as their writes. Owned deletion independently guards its schedule, trigger and ownership changes; zero affected rows do not roll back a batch. Pausing and deleting retain their state policy while enforcing the active epoch. Guarded no-op observations preserve timestamps and reject stale callers. A resume compares the cron/timezone used to calculate its next fire, returning a conflict if that configuration changed.
+
+The schedules subpath exposes `FENCED_SCHEDULE_STORAGE` for custom facades using the configured fence's original database object. The capability is required before activation because activation can race a waiting request. Direct context-free D1 calls remain compatible while the requirement is optional. Ordinary reads and admitted trigger settlement do not acquire an external authoring epoch. See [schedule integration](durable-agents.md#add-schedules) for caller and outcome contracts.
+
+`recordProofRun(key, runId, admitted)` retains legacy metadata compatibility at the admitted epoch and revision. Two-argument calls work only while the requirement is optional, and neither form can overwrite or acknowledge a modern proof identity. Initial admission binds modern proof identity atomically. Replay nomination separately checks its original proof round and caller epoch against the current exact snapshot and bound reservation at the final SQL write. It preserves the administrative revision, receipt and existing nomination timestamp.
 
 `flowsafe_start_idempotency` stores owner, target, server-minted run ID, reservation state, and timestamps. The claim from `reserved` to `started` is the cross-isolate serializer. Terminal run cleanup pairs snapshot and reservation retention so a spent key remains distinguishable from a fresh key until its configured horizon expires.
+
+Reservation reads also return a `binding`: `legacy` for an unassociated old-format row, `unbound` for a modern row awaiting association, or `bound` with an execution identity. A bound identity has `tablePrefix`, `workflowId`, `runId`, and `startToken`. A null prefix explicitly asserts no D1 namespace; it differs from the empty string, which identifies the default D1 tables.
+
+Schema upgrades preserve existing rows and add nullable binding columns. New reservations explicitly use the modern-unbound representation. An exact claimed row travels through protected host channels to Runtime; public bodies and application context cannot supply one.
+
+`StartIdempotencyStore` provides these exact reservation operations:
+
+| Method | Required observation and result |
+| --- | --- |
+| `claimReservation` | Claims an exact modern-unbound reserved row and returns this caller’s successful `RETURNING` observation, or undefined on a known miss |
+| `releaseReservation` | Releases an exact modern-unbound started row; a lost write response remains unreadable without a reread |
+| `associateReservation` | Binds an alias to an already-observed nonpending execution without reading its snapshot again; one readback may converge on that exact binding after a miss or lost response |
+| `bindPreparedStart` | Binds a newly prepared execution to the exact started claim; only a lost response permits readback, which must preserve the original claim state and timestamps |
+| `settleExecution` | Settles all aliases matching the complete physical execution, owner, logical target and thread, preserving neighboring generations and already-terminal timestamps |
+
+Claim and release compare every observed field and strictly advance `updatedAt` using the captured clock or the previous stamp plus one. This optimistic concurrency control stamp is neither an execution generation nor a host correlation token. A stopped or backward clock can make `pendingSince` lead wall time; an exhausted nonadvancing stamp refuses before database access. Only a successful claim response establishes that caller’s claim, because simultaneous contenders can propose the same stamp.
+
+Binding preserves both timestamps. Alias readback can accept later state changes, including terminal settlement, while prepared-start readback must preserve the exact original claim. Settlement uses one finite captured clock even when it precedes the previous timestamp. These operations require the current schema without creating or upgrading tables; settlement alone treats a genuinely absent table as empty. The old run-only `claim`, `release`, `settleRun` methods and `rollbackFencedStart` helper are removed. Use the exact observation APIs and let Runtime or the owning host perform locally evidenced rollback; a generic HTTP 409/503 cannot establish that nothing executed.
+
+The fence can retain a complete D1 proof identity alongside `proofRunId`. Store readings expose it as `proofExecution`; admin JSON excludes that identity and its token. Adding its nullable columns preserves active epochs, revisions, receipts, proof fields, and timestamps.
+
+Provisioning validates structural schema metadata; Runtime additionally validates proof identifiers and canonical prefixes. Provisioning does not repair corrupt identity or receipt bytes. Proof-only existing-work gates require the complete D1 namespace/workflow/run/generation tuple. They retain the admitted generation across preparation and policy waits, including a final active-run check before agent delivery. They do not make external effects transactional with fence state.
+
+### Validate execution identity data
+
+The `do-runner` and `host-kit` entry points export identity and mutation-epoch helpers. The normalizers copy and freeze validated data; they do not authenticate a caller or establish execution authority:
+
+| Helper | Result |
+| --- | --- |
+| `normalizeRunExecutionIdentity` | Validates workflow/run/token fields and normalizes a string prefix to lowercase, preserving explicit null |
+| `normalizeD1RunExecutionIdentity` | Requires a string D1 prefix, including the empty default prefix |
+| `normalizeStartIdentity` | Validates the original principal and a workflow or agent target; agent targets require a thread |
+| `normalizeStartExecutionIdentity` | Validates both identity shapes without inferring an owner or root/child relationship |
+| `normalizeMutationEpoch` | Accepts undefined or a nonnegative safe-integer number without string coercion |
+| `assertMutationEpoch` | Compares an already-observed fence reading to a supplied epoch; it does not make a later write atomic |
+
+Invalid identity or epoch input throws the corresponding `INVALID_EXECUTION_IDENTITY` or `INVALID_MUTATION_EPOCH` error with status 400. An active epoch mismatch throws `MUTATION_EPOCH_MISMATCH` with status 409 and a `missing`, `stale`, or `future` classification. Malformed reading metadata remains `EXECUTION_FENCE_UNREADABLE` with status 503.
+
+`MUTATION_EPOCH_HEADER`, `mutationEpochFromHeader`, and `stampMutationEpoch` encode canonical decimal epochs for a trusted internal channel. Authenticate that channel before interpreting its header. Host composition now forwards the captured epoch through the protected internal header and trusted agent bridge. This transport does not enforce the current epoch at a write; activation still requires final-write support from every writer.
+
+`createFlowsafeWorker()` accepts a numeric `mutationEpoch` or a synchronous environment callback. It captures the configuration source at construction and evaluates the callback once at fetch entry, before deployment checks, authentication, or body reads. Resolver and principal-context constructors accept a scalar epoch. Public requests cannot supply the protected header or start-authority fields in JSON.
+
+Workflow and agent starts retain the original actor, principal, epoch and selectors across body, policy and ownership waits. Context snapshots preserve declared host methods on their original receiver, including class-backed methods. Both Durable Object shells capture header strings before asynchronous deployment verification and interpret only those captured strings afterward.
+
+`RunnerRuntime.start()` captures the trusted epoch, original logical identity, agent mode, prepared callback, exact winning claim and resource-owner guard before waits. New starts write v2 with an independently generated execution token. Resumes preserve that token and original identity/epoch/mode while assigning a new current-leg token. Managed hosts supply real awaited preparation callbacks; direct callers may omit one. Before a modern start or resume resolves, Runtime requires the expected generation/current leg and a nonpending durable result from its captured storage source. `RUN_START_PENDING` is a fixed status 503 refusal; it supplies no rollback authority.
+
+Economic-operation lists must contain an entry at every index. Start, resume and shared lifecycle parsing reject sparse lists with the existing lifecycle-format error instead of persisting null placeholders or silently dropping operations. Valid dense lists retain their existing validation and settlement behavior.
+
+### Use explicit initial-admission scopes
+
+`createD1Storage()` composes `FencedWorkflowsStorageD1` as its default workflow domain. Explicit custom or disabled workflow domains retain precedence. The serialized background workflow domain extends the same class and retains its existing per-run update lock. Outside an explicit admission scope, both classes delegate persistence to the pinned D1 adapter.
+
+Advanced trusted integrations can obtain `FENCED_WORKFLOW_STORAGE` from the actual workflow domain. The capability exists only for a selected raw binding with transactional `batch()` support; standalone client and REST configurations retain ordinary adapter behavior without that capability. Fence and participating reservation stores must hold that exact binding. The capability reports its actual lowercase table prefix, with the empty string identifying the default namespace.
+
+Runtime derives physical execution identity and a root-local summary from one stored v2 observation. It captures the registered workflow's actual storage source before reading; D1 results retain exact raw bytes, while custom storage results explicitly have no D1 namespace. Raw pending state remains initial regardless of lifecycle metadata or an admission stamp. Protected replay validates the actual workflow or agent wrapper's logical selectors and projects its public value from that same observation. Internal identity, raw rows and journals are not included in public responses.
+
+| Runtime configuration | Admission and interrupted-start behavior |
+| --- | --- |
+| Configured fence | Require the actual capable D1 domain, matching database bindings and a positive initial-write witness; owning recovery may use exact initial-row repair |
+| Capable D1 without a fence | Keep the actual string namespace and ordinary persistence options; bind a keyed prepared identity before creation, retaining uncertain outcomes |
+| Custom storage without the capability or a fence | Use explicit null namespace and the same conservative prepared binding; missing or pending state supplies no initial-repair or rollback proof |
+
+The fenced Runtime calls `withInitialAdmission(admission, () => workflow.createRun(...))` around initial Core creation only. Advanced trusted callers use the same boundary with a server-generated generation token, original caller epoch/proof observation and coherent v2 context. A keyed call requires its own successful modern-unbound started claim. Both callbacks are invoked as plain functions; use a closure or bound function when you need a receiver.
+
+The initial conditional INSERT checks the captured fence schema, singleton and typed semantic frame, then atomically chains its winning reservation and proof bindings. A positive exact witness permits the caller to invoke the returned Run’s `start()` after the scope ends. A fence change after that commit does not revoke the admission. Suppressed pending persistence, a cached/existing Run, or another domain’s write does not supply that witness.
+
+Admission stamps `initialAdmission: true` into the stored provenance. Ordinary updates can preserve that stamp while changing the row’s bytes or status. The marker alone proves neither an unchanged initial row, lack of progress, nor absence of effects. Recovery checks the full authoritative row and its execution identity.
+
+The same capability exposes `terminalizeInitialAdmission({ expected, execution, attemptToken, nowMs })` for explicit repair of an already-admitted initial row. It accepts the exact raw observation and generation/correlation tokens, not a caller-selected status or replacement snapshot. An eligible row is pending, admission-stamped, and still has the strict initial control and provenance fields. Legacy observations and valid but ineligible rows return an input error; malformed consumed snapshot or owned metadata returns `EXECUTION_FENCE_UNREADABLE`.
+
+Before repair, the trusted owning host must establish exclusive quiescence for the exact attempt: no active execution can resume or write. Possessing a raw D1 binding and matching tokens does not prove inactivity. Neither the conditional update nor the background domain’s local queue establishes distributed quiescence.
+
+Without a recorded cancellation or timeout intent, repair writes a fixed `StartOutcomeUnknown` failure: effects may have occurred, and the run must not be automatically re-executed. A stored intent supplies its own disposition and replay principals. Repair preserves economic metadata, refuses forced termination during a dispute, and returns any required terminal cleanup without performing it. Both outcomes clear active/suspension fields and remove the admission stamp from the replacement only.
+
+The write compares all six original raw-row fields in one UPDATE and joins the serialized background domain’s existing per-run queue. An exact result is `terminalized`; one readback can establish `already-terminalized` or same-generation, known nonpending `progressed` state. A pending readback is never progress, even without the stamp.
+
+A known conditional miss can return `conflict`; an uncertain write remains unreadable unless exact replacement or progress is observed. Malformed returned data does not trigger recovery. This operation supplies no no-insert evidence and runs neither an engine nor cleanup. Runtime projects the returned row directly, then strictly settles its terminal execution before handing required cleanup to the owning host.
+
+Lifecycle revisions and resume ordinals remain readable at `Number.MAX_SAFE_INTEGER`, but an operation that would increment an exhausted counter refuses before persistence or execution. Existing no-increment paths keep their behavior. Legacy provenance remains explicitly readable/resumable under its compatibility rules; it never acquires a manufactured v2 generation.
+
+Normal hosts also validate v1 and absent-provenance observations from the actual selected storage source. With no recovery journal, a known raw terminal outcome and unchanged canonical owner, record and binding permit ordinary lifecycle completion and record cleanup. Legacy requester metadata may change during an authorized resume; it does not replace the saved run-record principal or actual resource owner. Legacy cleanup cannot infer a generation or change a start reservation. Termination and completion retain their existing lifecycle compare-and-swap writes.
+
+A validated all-zero batch changes no participant. `isDefinitiveInitialAdmissionRefusal(error, execution)` recognizes only package-owned, in-process evidence for that exact execution, including bounded cause wrappers. It never authorizes deleting a durable snapshot. A thrown batch converges only on matching raw bytes and every required binding; malformed returned results and uncertain readbacks cannot grant a witness.
+
+`readSnapshot()` returns an immutable observation of the six stored fields without Core cache fallback or timestamp conversion. Both managed hosts persist v2 `preparing`, `prepared` or `prepared-unfenced` journals at their existing recovery keys. They retain the original keyed claim and actual source owner, which may differ from the initiating principal. Preparation response loss converges only on the exact durable phase/identity. V1 journals stay unresolved.
+
+Recovery requires awaited owning quiescence equal to true and exact journal/frame matching. A new Runtime's empty map proves no inactivity. Cold agent alarms reconstruct the actual registered wrapper from a principal-free instance scope before reading a workflow; the alarm passes its captured verified deployment tag. Runtime checks the host's expected target and agent mode against the same row it recovers, including any returned repair observation.
+
+A workflow journal must match its named Durable Object before recovery can use that object's quiescence. Agent recovery rechecks the complete journal after the authoritative read and before rolling back H-owned reservations. Both hosts require a keyed journal's configured reservation store before bookkeeping, even when its selected outcome is nonterminal.
+
+Strict terminal reservation settlement precedes managed approval, dispatch, owner and completion cleanup, with exact journal clearing last. Failures retain the journal and watchdog. A missing snapshot after fenced preparation also retains the journal and agent record/binding, preventing an unkeyed same-ID retry from executing again. Only an actual local, matching zero-insert receipt with an unwound owning frame and an absent row permits complete rollback. Prepared-unfenced absence/pending never enters initial repair or unspends a bound key. Final schedule enforcement and deployment-wide acceptance remain required before enabling artifact epochs across the deployment.
 
 ### Snapshot provenance
 
@@ -195,7 +306,7 @@ A step arms one by adding the reserved key to the payload it hands Mastra's `sus
 import {
   isSuspensionTimeoutResumeData,
   SUSPENSION_DEADLINE_PAYLOAD_KEY,
-} from '@proofoftech/flowsafe/do-runner';
+} from '@proofoftech/flowsafe/do-runner/constants';
 import { z } from 'zod';
 
 const gate = createStep({
@@ -237,7 +348,34 @@ The expiring resume delivers one flowsafe-defined envelope as its resume data:
 }
 ```
 
-Branch on `isSuspensionTimeoutResumeData()` rather than the literal key. A step that declares a `resumeSchema` must accept this shape as well as its signal shape: Mastra validates resume data before the engine runs, so a schema that rejects the envelope makes every timeout resume throw, and the deadline is dropped once the retry budget is spent. The envelope is the runner's to mint — a resume request that carries the reserved key is refused with a 400, so a caller cannot drive a step's timeout branch while provenance still names them as the requester.
+Branch on `isSuspensionTimeoutResumeData()` rather than the literal key. A step that declares a `resumeSchema` must accept this shape as well as its signal shape: Mastra validates resume data before the engine runs, so a schema that rejects the envelope makes every timeout resume throw, and the deadline is dropped once the retry budget is spent. The detector checks structure, not provenance. Public resume requests containing the reserved key return HTTP 400; the alarm supplies the system provenance for an actual timeout resume.
+
+### Inspect and test suspension deadlines
+
+The `@proofoftech/flowsafe/do-runner/constants` entry exports `isArmableSuspensionDeadlineMs` with the deadline values and timeout detector. It uses the same duration predicate as deadline arming. The constants and testing entries load without the runner, Core, D1 adapter or jose runtime modules.
+
+Use `suspensionDeadlinesOf(summary)` from `@proofoftech/flowsafe/do-runner` to inspect a `RunSummary`. It returns `{ entries, rejected }` without changing the summary or scheduling an alarm. The entries use suspension time and resume ordinal from that summary; obtaining an entry does not authorize a resume. The runner still checks authoritative state before acting.
+
+A duration accepted by the predicate is insufficient to arm a deadline by itself. Derivation also requires a suspended run, an unambiguous top-level step and a usable suspension fence. Nested or ambiguous paths are refused as described above. Missing requests produce no entry, while invalid requests appear in `rejected` with their step and reason. `MAX_SUSPENSION_DEADLINES_PER_RUN` bounds the result. Use `SuspensionDeadlineEntry` and `RejectedSuspensionDeadline` from the main runner entry for these projections; the record parser and retry operations remain internal.
+
+Build a timeout fixture with the same function the alarm uses:
+
+```typescript
+import { isSuspensionTimeoutResumeData } from
+  '@proofoftech/flowsafe/do-runner/constants';
+import { suspensionTimeoutResumeData } from
+  '@proofoftech/flowsafe/do-runner/testing';
+
+const resumeData = suspensionTimeoutResumeData(
+  { step: 'gate', deadlineAt: 1_751_883_300_000 },
+  1_751_883_300_123,
+);
+const isTimeout = isSuspensionTimeoutResumeData(resumeData);
+```
+
+The minter accepts the step, deadline and expiry time without validating or authorizing them. The testing entry also exports `SuspensionTimeoutEnvelope` and `SuspensionTimeoutResumeData` types. A fixture does not schedule a wake, establish system identity or grant approval.
+
+### Suspension wake behavior
 
 Behavior worth knowing before relying on it:
 
@@ -312,9 +450,15 @@ GET  /admin/inventory
 
 All three require a bearer token matching `MAINTENANCE_ADMIN_SECRET`, which must differ from `DEPLOYMENT_IDENTITY_SECRET`. The deployment-identity gate still runs first. A mis-provisioned deployment therefore returns `503` before an operator can read or move its fence.
 
-`GET /admin/execution-fence` returns `{ state, proofKey?, proofRunId? }`. `POST /admin/execution-fence` accepts `{ expected, next, proofKey? }`; a stale expectation returns `409` with `reason.code: 'FENCE_CAS_CONFLICT'` and the current state.
+`GET` and successful `POST /admin/execution-fence` both return `{ state, mutationEpoch, requireMutationEpoch, transitionRevision, proofKey?, proofRunId? }`. `POST` accepts `{ expected, next, proofKey?, expectedMutationEpoch?, expectedRevision?, advanceMutationEpoch? }`. Supply both expected counters together as nonnegative safe-integer numbers. The advance flag is boolean, defaults to false, and requires the expected pair when true. Invalid fields return `400`; counters never wrap. The host continues to own transition policy, and `proofKey` is required only when entering `proof-only`.
+
+An upgraded command compares state, epoch, and revision in one UPDATE. Its exact retry converges only while its canonical command remains the last applied upgraded command. A matching resulting state alone is insufficient. A successful retry preserves an already-bound proof run and the original timestamp; an intervening administrative command makes the old retry conflict. The internal receipt is never returned over HTTP.
+
+A valid conditional miss returns `409` with `reason.code: 'FENCE_CAS_CONFLICT'`, the full current reading, and `reason.conflict: 'expectation-mismatch'`. Legacy state-only requests remain compatible before activation, retain their state-only ABA limitation, and clear the last upgraded receipt. After activation they return `versioned-expectation-required`. An uncertain write returns `503` unless strict readback proves the exact last command; malformed state or an invalid write-result envelope always returns `EXECUTION_FENCE_UNREADABLE`.
 
 `GET /admin/inventory` returns an index or one keyset-paginated category selected with `?category&cursor&limit`. The work categories are `runs`, `approvals-waiting`, `schedule-deferred-dispatches`, `pending-notifications`, `background-tasks`, `resource-owners`, and `start-reservations`. The standing categories are `schedules` and `signal-subscriptions`; they are reported for reconciliation and never required to empty.
+
+`pending-notifications` lists every pending notification, due or not yet due, and reports the not-yet-due count as `notDue`. A notification scheduled for later keeps a drain unproven until it leaves the pending status (delivered or discarded) or is deleted; rescheduling alone does not clear it. A pending row carrying neither `deliverAt` nor `summaryAt` leaves through a direct write or deletion because no dispatch pass selects it and retention does not remove pending rows.
 
 `INVENTORY_DRAIN_PROOF` defines a proof as two consecutive full sweeps with every work category empty, at least 60 seconds apart, while the fence remains `draining`. Each reading is a point-in-time observation rather than a snapshot and can move in either direction because draining still admits work. Empty results cannot over-count, and keyset pagination never skips a row that existed before the sweep began.
 
@@ -332,16 +476,15 @@ The maintenance Durable Object persists a rotating tuple cursor after every sele
 
 ## Request context
 
-Before every create or resume, the runtime sets:
+`POST /runs` accepts an optional `requestContext` object after authenticated start authorization. The router rejects invalid shapes and keys identified by [`isReservedExecutionContextKey()`](../packages/flowsafe/src/do-runner/execution-context.ts) with HTTP 400 and `reason: "reserved-context-key"`. The validated record reaches `beforeStart` before reservation or execution; hosts enforce stricter application attribution policy there.
 
-- run id;
-- workflow id;
-- `breakwater.workflowScope`;
-- values returned by the host's `requestContextForRun` provider.
+`RunStartInput.requestContext` crosses the authenticated Worker-to-Durable-Object channel and becomes `StartRunOptions.storedRequestContext`. A verified schedule target supplies its own context even when that value is absent; an ordinary-start body cannot fill that absence. `inputData` remains workflow input and does not populate request context.
 
-Runtime-derived base keys win over stored or client-provided context. `breakwater.isolationScope` remains reserved and is dropped from provider values because connector keys are deployment-wide. Schedules additionally reject these reserved namespaces when data is written.
+Stored non-reserved application values have the lowest precedence. Application values from `requestContextForRun` override matching stored keys. Runtime-derived execution metadata and trusted provider capabilities/identity are applied after application values. `breakwater.isolationScope` remains reserved and is dropped from provider values because connector keys are deployment-wide.
 
-`approvalGrantProvider()` is the normal provider. A provider failure happens before `createRun()` or resume, so a failed start leaves its run id retryable.
+Application context persists with the run and survives resume in a fresh Runtime or Durable Object. The provider runs again for each execution leg. A provider that revokes a capability must return an explicit empty value for that key; omission leaves a persisted value available to the context merge. A keyed replay revalidates the supplied context and executes host policy, then retains the winning run's context without comparing or overwriting it.
+
+`approvalGrantProvider()` derives approval capabilities from persisted decisions. A provider failure aborts the execution leg before `createRun()` or resume.
 
 ## Import-safe workflow modules
 
@@ -374,30 +517,42 @@ The runner preserves stable statuses and structured refusal reasons across Durab
 | `InvalidStartIdempotencyRequestError` | `400` | `INVALID_START_IDEMPOTENCY_REQUEST` | The key or reservation request is malformed |
 | `InvalidInventoryRequestError` | `400` | `INVALID_INVENTORY_REQUEST` | The category, cursor, or limit is invalid |
 
-`isStartReservationRefusal()` recognizes the five reservation decisions, unsupported wiring, and malformed input. It excludes `StartReservationUnreadableError`, which propagates as an operational storage failure.
-
 The runtime also distinguishes unknown workflows, unknown runs, duplicate runs, runs that are not suspended, client-fixable input or resume-data errors, and internal execution or storage failures.
 
 The Durable Object maps known errors to stable HTTP status codes through `doErrorResponse()`. Unknown failures return an internal error without copying arbitrary thrown data to an audit sink.
+
+`createRunRouter()` returns HTTP 500 with `{ "error": "internal error" }` for unexpected failures and retains the original error in server diagnostics. Its typed refusals preserve their status, message and reason. Hosts that construct `RunRouteError` must supply caller-safe, JSON-compatible message/reason values; the router does not sanitize them. Runtime-authored `RunLifecycleBlockedError.reason` reports `DISPUTED_SETTLEMENT` with a fixed message. A host that constructs that error is responsible for its supplied message too.
 
 The runner does not provide an administrative “reset to last good state” API. Recovery uses authoritative D1 state, the approval redrive path, or deployment decommissioning.
 
 ## Retention
 
-`purgeExpiredWorkflowRuns(db, options)`:
+`purgeExpiredWorkflowRuns(db, options)` processes bounded pages of terminal snapshots and spent start reservations. It requires a transactional `db.batch()` and an `advanceCursor` callback. Persist the callback's `RunRetentionCursor` and pass it as `cursor` on the next invocation. The maintenance Durable Object handles this persistence for composed Workers.
 
-- selects only terminal statuses;
-- uses a bounded batch;
-- deletes paired R2 artifacts before the snapshot row;
-- keeps a failed row as a retry anchor while allowing later rows to proceed;
-- aggregates per-run failures after the pass;
-- treats a not-yet-created snapshot table as empty.
+For a lower-level caller with a D1 binding and Durable Object storage:
 
-The composed Worker resolves its optional artifact purger from the current maintenance invocation's environment inside this failure boundary. A factory or deletion failure keeps the enumerable snapshot row and does not stop approval or other domain purges.
+```typescript
+import {
+  purgeExpiredWorkflowRuns,
+  type RunRetentionCursor,
+} from '@proofoftech/flowsafe/do-runner';
 
-When runtime storage uses `tablePrefix`, configure the same `storageTablePrefix` on `createFlowsafeWorker()`. It threads that validated prefix through every prefix-aware built-in purge. Direct callers of any exported low-level purge receive the same fail-fast validation before D1 preparation. Fixed-schema Flowsafe tables remain unprefixed.
+const cursorKey = 'workflow-retention-cursor';
+const cursor = await state.storage.get<RunRetentionCursor>(cursorKey);
+await purgeExpiredWorkflowRuns(env.DB, {
+  ttlMs: 30 * 24 * 60 * 60 * 1000,
+  cursor,
+  advanceCursor: (next) => state.storage.put(cursorKey, next),
+});
+```
 
-Running and suspended rows are never age-purged. Retention treats `cancelled` and `timed_out` as terminal after lifecycle cleanup releases ownership.
+Serialize calls that share a cursor. A scan finishes against its captured high-water mark; a subsequent cycle revisits earlier skipped rows even while new rows arrive. A failed artifact deletion leaves its snapshot and permits progress to later candidates. A failed cursor write or uncertain D1 outcome stops that phase without recording unproved progress.
+
+Modern cleanup rechecks the physical address, execution token and owned provenance fields before deleting. Legacy cleanup rechecks its observed raw row. Run owners remain protected by reserved ownership or a matching run ID in another supported snapshot namespace. Bound reservations pair with the selected execution; an unreadable current generation is not evidence that an orphaned key can expire. Existing terminal timestamps remain unchanged; key expiry respects the configured retention horizon. Running and suspended rows remain; `cancelled` and `timed_out` require completed lifecycle cleanup.
+
+Configure `storageTablePrefix` on `createFlowsafeWorker()` to match runtime storage. Direct purge cursors must match their configured namespace and reservation table. Managed maintenance starts a fresh scan when a valid stored cursor belongs to a changed configuration; malformed stored cursors fail retention. Approval and other domain purges retain their separate failure handling.
+
+The composed Worker resolves its optional artifact purger from the current maintenance invocation's environment. Artifacts delete before D1 cleanup; use the runtime's bucket and matching `R2ArtifactStore.keyPrefix`. The artifact API addresses workflow/run pairs, so a D1 generation check cannot restore artifacts deleted during an uncoordinated replacement. Atomic owner-admission protection depends on fenced admission's owner guard; ordinary unfenced starts do not supply that transaction.
 
 Decommissioning deletes the bound storage after credentials and traffic are revoked. There is no in-database tenant purge in the single-organization data plane.
 

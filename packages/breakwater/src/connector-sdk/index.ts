@@ -1,34 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-// Connector SDK — createConnector() wraps Mastra's createTool() with an
-// enforced permission manifest. Mastra createTool() has no manifest field
-// (its MCP annotations are descriptive only), so the manifest is stripped
-// from the config, compiled, and enforced by wrapping execute:
-//
-// 1. Network egress — declared domains checked against the org allowlist
-// 2. Authorization  — declared requiredPermissions checked against the
-//                     trusted principal-permissions projection, before the
-//                     dry-run branch and the approval gate; an approval must
-//                     not elevate an unauthorized principal
-// 3. Write gate     — write-class calls needing approval are denied unless
-//                     the request carries a grant, on every path; Mastra's
-//                     native requireApproval is also compiled so agent runs
-//                     pause for the decision, but it never substitutes for
-//                     the grant
-// 4. Idempotency    — keyed replay returns the stored result, so retries
-//                     and DO lifecycle boundaries cannot duplicate a side
-//                     effect
-// 5. Dry-run        — a caller-requested simulation (DRY_RUN_CONTEXT_KEY)
-//                     runs the connector's side-effect-free dryRunExecute;
-//                     connectors that do not declare dry-run support fail
-//                     the request closed instead of executing for real
-// 6. Rate limit     — a '<count>/<unit>' manifest budget enforced against a
-//                     fixed-window counter store; only actual executions
-//                     consume it
-//
-// Denials throw ConnectorPolicyError; every decision lands in the audit log.
-// The manifest carries only fields the wrapper enforces (see
-// docs/connector-interface.md).
-
 import { RequestContext } from '@mastra/core/request-context';
 import {
   type PublicSchema,
@@ -40,9 +10,23 @@ import type { Tool, ToolExecutionContext } from '@mastra/core/tools';
 import { createTool, isValidationError, noopObserve } from '@mastra/core/tools';
 import { type AuditLogger, agentAuditDetail } from '../audit/index.js';
 import { safeAuditErrorSummary } from '../audit/safe-error.js';
+import {
+  CONNECTOR_DECISIONS,
+  type ConnectorDecisionCode,
+  type ConnectorDenialMetadata,
+  ConnectorEvaluatorError,
+  ConnectorInvocationError,
+  ConnectorPolicyError,
+  ConnectorStoreError,
+  ConnectorValidationError,
+  captureConnectorDenialMetadata,
+  captureConnectorEvaluatorMetadata,
+  connectorErrorDecision,
+  isInstanceOf,
+  readProperty,
+} from '../connector-decision.js';
 import type {
   NetworkEgressOptions,
-  PolicyDecision,
   SideEffect,
   ToolCallContext,
   ToolPolicyEvaluator,
@@ -63,8 +47,18 @@ import {
   isPrincipalPermissions,
   PRINCIPAL_PERMISSIONS_CONTEXT_KEY,
 } from '../rbac/permission.js';
+import {
+  type ConnectorConformanceFactory,
+  type ConnectorConformanceOptions,
+  type ConnectorConformanceReport,
+  createConformanceAssertion,
+} from './egress-conformance.js';
 import type { EgressFetchBase, EgressGuardedFetch } from './egress-fetch.js';
-import { EgressDeniedError, egressFetch } from './egress-fetch.js';
+import {
+  EgressDeniedError,
+  EgressGuardError,
+  egressFetch,
+} from './egress-fetch.js';
 import {
   idempotencyStorageKey,
   isAmbiguousLegacyIdempotencyIdentity,
@@ -82,12 +76,28 @@ import {
 import { newToken } from './new-token.js';
 import { assertSingleTenantConnectorPolicies } from './single-tenant-preset.js';
 
+/** Whether a connector's declared egress binds its actual traffic. */
+export type ConnectorEgressPosture = 'enforced' | 'declaration-only';
+
 /** Permission manifest — what the connector declares about itself. */
 export interface PermissionManifest {
   /** Worst side effect the connector can cause. */
   sideEffect: SideEffect;
   /** Hostnames this connector calls; gated by the networkEgress policy. */
   egress?: readonly string[];
+  /**
+   * Whether the declared `egress` binds the connector's actual traffic.
+   * 'enforced' asserts every HTTP request leaves through
+   * `ConnectorRuntime.fetch`. It covers a connector that issues no HTTP
+   * request at all; it is a claim about HTTP traffic, not about platform
+   * bindings (D1, KV, R2, service bindings), which the guard never sees.
+   * 'declaration-only' states that a vendor SDK or child process carries its
+   * own transport, so the list is checked against organization policy but not
+   * against sockets. An omitted field resolves to 'declaration-only':
+   * nothing has proven enforcement. `connectorEgressPosture()` reads the
+   * resolved value.
+   */
+  egressEnforcement?: ConnectorEgressPosture;
   /**
    * Caller must supply a per-call idempotency key
    * (IDEMPOTENCY_KEY_CONTEXT_KEY in requestContext). Replays of a stored
@@ -532,6 +542,12 @@ export interface ConnectorPolicies {
    * here). Defaults to the runtime's global fetch.
    */
   fetch?: EgressFetchBase;
+  /**
+   * Refuse, at construction, any connector whose resolved egress posture is not
+   * 'enforced'. Set it on a deployment with no container, VM, or network policy
+   * behind ConnectorRuntime.fetch, where the guarded fetch is the only boundary.
+   */
+  requireEgressEnforcement?: true;
 }
 
 /**
@@ -545,7 +561,9 @@ export interface ConnectorPolicies {
  * that denies everything. A vendor SDK carrying its own HTTP stack bypasses
  * the guard — route its traffic through this fetch (most SDKs accept a
  * fetch/transport option) or that connector's egress posture degrades to
- * declaration-only.
+ * declaration-only — the posture a manifest declares as
+ * `permissions.egressEnforcement: 'declaration-only'` and
+ * `connectorEgressPosture()` reads back.
  */
 export interface ConnectorRuntime {
   /** Fetch guarded by the connector manifest's declared egress hosts. */
@@ -702,39 +720,6 @@ export const IDEMPOTENCY_KEY_CONTEXT_KEY = 'breakwater.idempotencyKey';
  */
 export const DRY_RUN_CONTEXT_KEY = 'breakwater.dryRun';
 
-/** Policy denial raised before a connector side effect is allowed to run. */
-export class ConnectorPolicyError extends Error {
-  /** Connector ID associated with the denial. */
-  readonly connector: string;
-  /** Name of the policy that denied the call. */
-  readonly policy: string;
-  /** Policy-supplied denial reason. */
-  readonly reason: string;
-
-  constructor(connector: string, policy: string, reason: string) {
-    super(`connector ${connector} denied by ${policy}: ${reason}`);
-    this.name = 'ConnectorPolicyError';
-    this.connector = connector;
-    this.policy = policy;
-    this.reason = reason;
-  }
-}
-
-/** Redacted input or output validation failure from a direct connector call. */
-export class ConnectorValidationError extends Error {
-  /** Connector whose public Mastra boundary rejected the value. */
-  readonly connector: string;
-  /** Side of the public connector boundary that rejected the value. */
-  readonly phase: 'input' | 'output';
-
-  constructor(connector: string, phase: 'input' | 'output') {
-    super('connector invocation failed validation');
-    this.name = 'ConnectorValidationError';
-    this.connector = connector;
-    this.phase = phase;
-  }
-}
-
 const manifests = new WeakMap<object, PermissionManifest>();
 const DIRECT_INVOCATION_STATE = Symbol('breakwater.direct-invocation-state');
 
@@ -767,6 +752,15 @@ export function connectorManifest(
   tool: object,
 ): PermissionManifest | undefined {
   return manifests.get(tool);
+}
+
+/** Resolved egress posture; `undefined` for a tool createConnector did not build. */
+export function connectorEgressPosture(
+  tool: object,
+): ConnectorEgressPosture | undefined {
+  const manifest = manifests.get(tool);
+  if (manifest === undefined) return undefined;
+  return manifest.egressEnforcement ?? 'declaration-only';
 }
 
 function assertLegacyMigrationIdentity(
@@ -980,10 +974,6 @@ function hasBackgroundOverride(input: unknown): boolean {
   );
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
 // The caller's opaque isolation scope (multi-tenant hosts mint their tenant
 // id; see ISOLATION_SCOPE_CONTEXT_KEY). Used as a KEY SEGMENT only — never
 // parsed. Absent (or non-string) scope preserves the single-tenant keys
@@ -1107,6 +1097,8 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     egress: Object.freeze([...(config.permissions.egress ?? [])]),
     ...(requiredPermissions !== undefined ? { requiredPermissions } : {}),
   });
+  const egressEnforcement: ConnectorEgressPosture =
+    manifest.egressEnforcement ?? 'declaration-only';
 
   assertEgressHostList(
     manifest.egress ?? [],
@@ -1160,6 +1152,20 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
       `connector ${id}: config.dryRunExecute requires permissions.dryRun (the manifest must declare what the connector supports)`,
     );
   }
+  if (
+    manifest.egressEnforcement !== undefined &&
+    manifest.egressEnforcement !== 'enforced' &&
+    manifest.egressEnforcement !== 'declaration-only'
+  ) {
+    throw new TypeError(
+      `connector ${id}: permissions.egressEnforcement must be 'enforced' or 'declaration-only'`,
+    );
+  }
+  if (policies.requireEgressEnforcement && egressEnforcement !== 'enforced') {
+    throw new TypeError(
+      `connector ${id}: policies.requireEgressEnforcement refuses a connector whose permissions.egressEnforcement is not 'enforced' (this deployment has no network boundary behind ConnectorRuntime.fetch)`,
+    );
+  }
   // v1: only a read-only connector may opt into background execution (DL-005).
   // A write / destructive / idempotent connector carries a side effect whose
   // approval topology the background flip would move off the foreground path,
@@ -1211,6 +1217,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
   function record(
     requestContext: RequestContext | undefined,
     decision: 'allowed' | 'denied' | 'error',
+    code: ConnectorDecisionCode,
     extra: { reason?: string; detail?: Record<string, unknown> } = {},
     action = 'connector.execute',
   ): void {
@@ -1219,45 +1226,43 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
       action,
       resource: id,
       decision,
+      decisionCode: code,
+      ...CONNECTOR_DECISIONS[code],
       reason: extra.reason,
       detail: agentAuditDetail(requestContext, {
         sideEffect: manifest.sideEffect,
         ...extra.detail,
+        egressEnforcement,
       }),
     });
   }
 
-  // `detail` merges into the denial's audit detail beside `policy` — for
-  // gates whose audit contract carries more than the policy name (the
-  // required-permissions gate records requiredPermissions and the policy
-  // snapshot version on every decision).
   function deny(
     requestContext: RequestContext | undefined,
     policy: string,
     reason: string,
+    metadata: ConnectorDenialMetadata,
     detail: Record<string, unknown> = {},
   ): never {
-    record(requestContext, 'denied', {
+    const error = new ConnectorPolicyError(id, policy, reason, metadata);
+    record(requestContext, 'denied', error.code, {
       reason: `${policy}: ${reason}`,
-      detail: { policy, ...detail },
+      detail: { policy, ...error.details, ...detail },
     });
-    throw new ConnectorPolicyError(id, policy, reason);
+    throw error;
   }
 
-  // Single audit seam: every path that produces a successful result — a
-  // fresh execute, a replayed/joined idempotent result, or a dry-run
-  // simulation — routes through here to record the one 'allowed' audit
-  // event, instead of duplicating that call at each site. There is no
-  // post-execute policy stage today: retention and isolation
-  // (crossWorkflowIsolation, tenantIsolation) are PRE-execute evaluators run
-  // from the `gates` loop above, before execute — nothing currently gates
-  // the result of a call.
   function finishAllowed(
     requestContext: RequestContext | undefined,
     result: TOutput,
     detail?: Record<string, unknown>,
   ): TOutput {
-    record(requestContext, 'allowed', detail ? { detail } : {});
+    record(
+      requestContext,
+      'allowed',
+      'CONNECTOR_ALLOWED',
+      detail ? { detail } : {},
+    );
     return result;
   }
 
@@ -1266,18 +1271,9 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
   // them as 'execute threw' when they propagate out through the attempt.
   const auditedErrors = new WeakSet<object>();
 
-  // The WeakSet can only hold objects, so a primitive throw from a custom
-  // store is wrapped once (message preserved, original on `cause`) and the
-  // WRAPPER is what propagates — otherwise audit-once breaks and the same
-  // store crash records a second, misattributed 'execute threw' event.
-  function markAudited(error: unknown): unknown {
-    if (typeof error === 'object' && error !== null) {
-      auditedErrors.add(error);
-      return error;
-    }
-    const wrapped = new Error(errorMessage(error), { cause: error });
-    auditedErrors.add(wrapped);
-    return wrapped;
+  function markAudited<T extends Error>(error: T): T {
+    auditedErrors.add(error);
+    return error;
   }
 
   function recordExecuteError(
@@ -1285,13 +1281,16 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     error: unknown,
     detail: Record<string, unknown> = {},
   ): void {
-    if (error instanceof OutputValidationFailure) return;
+    if (isInstanceOf(error, OutputValidationFailure)) return;
     // This connector's own policy denials (e.g. the rate-limit gate inside
     // a keyed attempt) were already audited by deny(); a second 'execute
     // threw' record would misattribute them to the connector's code. A
     // NESTED connector's denial still records here — that composite call
     // did fail in execute.
-    if (error instanceof ConnectorPolicyError && error.connector === id) {
+    if (
+      isInstanceOf(error, ConnectorPolicyError) &&
+      readProperty(error, 'connector') === id
+    ) {
       return;
     }
     if (
@@ -1302,17 +1301,22 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
       return;
     }
     const safe = safeAuditErrorSummary(error);
-    record(requestContext, 'error', {
-      reason: safe?.reason ?? 'connector execution failed',
-      detail: { stage: 'execute', ...safe?.detail, ...detail },
-    });
+    record(
+      requestContext,
+      'error',
+      connectorErrorDecision(error)?.code ?? 'CONNECTOR_EXECUTION_FAILED',
+      {
+        reason: safe?.reason ?? 'connector execution failed',
+        detail: { stage: 'execute', ...safe?.detail, ...detail },
+      },
+    );
   }
 
   function recordOutputValidationError(
     requestContext: RequestContext | undefined,
     detail: Record<string, unknown> = {},
   ): void {
-    record(requestContext, 'error', {
+    record(requestContext, 'error', 'CONNECTOR_OUTPUT_INVALID', {
       reason: 'connector output validation failed',
       detail: { stage: 'output-validation', ...detail },
     });
@@ -1347,21 +1351,11 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
       }
       return validation.value;
     } catch (error) {
-      if (error instanceof OutputValidationFailure) throw error;
+      if (isInstanceOf(error, OutputValidationFailure)) throw error;
       throw new OutputValidationFailure('exception', error);
     }
   }
 
-  // Budget counts ACTUAL executions: denied calls, cached replays, and
-  // shared in-flight joins never consume it — hence an internal gate invoked
-  // immediately before each config.execute call site (reserve-keyed,
-  // legacy-keyed, plain), not a pre-execute evaluator. Audits exactly once:
-  // a denial goes through deny(), and a store crash is recorded here as
-  // 'rate-limit-store' and marked so recordExecuteError never re-records it
-  // as 'execute threw' when it propagates out of a keyed attempt.
-  // Fixed-window semantics: counts bucket into epoch-aligned windows, so a
-  // burst may span two adjacent windows; simplest correct budget for a
-  // per-connector cap.
   async function consumeRateLimit(
     requestContext: RequestContext | undefined,
   ): Promise<void> {
@@ -1392,27 +1386,37 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
       );
     } catch (error) {
       // Fail closed: an unbudgeted execution would break the declared cap.
-      record(requestContext, 'error', {
+      const failure = new ConnectorStoreError(id, 'rate-limit', 'increment', {
+        cause: error,
+      });
+      record(requestContext, 'error', failure.code, {
         reason: 'rate-limit store increment failed',
         detail: { stage: 'rate-limit-store' },
       });
-      throw markAudited(error);
+      throw markAudited(failure);
     }
     if (count > rateLimit.limit) {
-      deny(requestContext, 'rate-limit', `exceeded ${manifest.rateLimit}`);
+      deny(requestContext, 'rate-limit', `exceeded ${manifest.rateLimit}`, {
+        code: 'RATE_LIMIT_EXCEEDED',
+        details: { limit: rateLimit.limit, windowMs: rateLimit.windowMs },
+      });
     }
   }
 
   function recordStoreError(
     requestContext: RequestContext | undefined,
     op: 'get' | 'inspect' | 'put' | 'reserve' | 'release',
-    _error: unknown,
+    error: unknown,
     key: string,
-  ): void {
-    record(requestContext, 'error', {
+  ): ConnectorStoreError {
+    const failure = new ConnectorStoreError(id, 'idempotency', op, {
+      cause: error,
+    });
+    record(requestContext, 'error', failure.code, {
       reason: `idempotency store ${op} failed`,
       detail: { stage: 'idempotency-store', idempotencyKey: key },
     });
+    return failure;
   }
 
   // Join a same-isolate in-flight attempt for the same key. Await before
@@ -1506,60 +1510,33 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     const toolCallId =
       context.agent?.toolCallId ?? directInvocation?.toolCallId;
 
-    // _background model-override defense (DL-005), FIRST — before the gates,
-    // the dry-run branch, and any execute. A `_background` field in the args
-    // asks the runtime to flip this call to background execution, a topology
-    // change a foreground-only connector must never take. Reject its presence
-    // outright unless the manifest opts in (read-only tools only, enforced at
-    // construction). Same argv-flag-smuggling posture as agent-cli buildFlags;
-    // fires for BOTH execute and dryRunExecute (both route through here).
-    //
-    // REACH (accuracy): this is DEFENSE-IN-DEPTH for direct / nested programmatic
-    // calls, NOT the agent-path guard. On the AGENT path core deletes
-    // `_background` from the tool-call args before dispatch (`delete args
-    // ._background`), UNCONDITIONALLY — schema or not — so this presence check
-    // sees clean args and fires on nothing there. What actually stops the model
-    // backgrounding a call on the agent path is core's OWN `resolveBackgroundConfig`
-    // baseEnabled gate: a breakwater connector sets no background config, so the
-    // tool is ineligible and the override cannot enable it. This check's
-    // independent teeth are direct / nested calls that hand args straight to
-    // execute, bypassing core's agent dispatch (and its stripping) entirely. And
-    // on EVERY path — including inside the background executor — the real write
-    // boundary is the requestContext GRANT gate below, not this check. The
-    // `backgroundExecution` tool-policy evaluator is the same defense-in-depth at
-    // the gate loop.
     if (!manifest.background && hasBackgroundOverride(inputData)) {
       deny(
         requestContext,
         'background',
         `tool-call args carry a '${LLM_BACKGROUND_OVERRIDE_KEY}' override but this connector is foreground-only (the manifest does not opt into background execution)`,
+        { code: 'BACKGROUND_OVERRIDE_DENIED' },
       );
     }
 
-    // The base egress guard is built once at construction; this per-call
-    // wrapper binds only this call's requestContext so an egress denial
-    // audits under it. The org allowlist already gated the DECLARED egress
-    // list (the networkEgress evaluator below); the guard pins the
-    // connector's ACTUAL requests to that list — redirect hops included. No
-    // declared egress means the guard denies all network. The denial audit
-    // fires here at the guard boundary, guaranteed even if the connector
-    // swallows the ConnectorPolicyError (recordExecuteError early-returns on
-    // this connector's own ConnectorPolicyError, so it is never re-recorded).
     const runtime: ConnectorRuntime = {
       fetch: async (input, init) => {
         try {
           return await baseEgressGuard(input, init);
         } catch (error) {
-          if (error instanceof EgressDeniedError) {
-            record(requestContext, 'denied', {
-              reason: `egress-fetch: ${error.reason}`,
-              detail: {
-                policy: 'egress-fetch',
-                host: error.host,
-                hop: error.hop,
-              },
-            });
-            throw new ConnectorPolicyError(id, 'egress-fetch', error.reason);
+          if (
+            error instanceof EgressDeniedError ||
+            error instanceof EgressGuardError
+          ) {
+            deny(
+              requestContext,
+              'egress-fetch',
+              error instanceof EgressDeniedError ? error.reason : error.message,
+              captureConnectorDenialMetadata({
+                code: error.code,
+                details: error.details,
+              }),
+            );
           }
           throw error;
         }
@@ -1575,33 +1552,33 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
         requestContext,
       };
       for (const gate of gates) {
-        let decision: PolicyDecision;
+        let refusal:
+          | { reason: string; metadata: ConnectorDenialMetadata }
+          | undefined;
         try {
-          decision = await gate.evaluate(toolCall);
+          const decision = await gate.evaluate(toolCall);
+          if (!decision.allowed) {
+            refusal = {
+              reason: decision.reason,
+              metadata: captureConnectorEvaluatorMetadata(decision),
+            };
+          }
         } catch (error) {
-          // Mirror PolicyEngine: an evaluator crash must not leave less
-          // audit evidence than a denial. Record, then fail closed.
-          record(requestContext, 'error', {
+          const failure = new ConnectorEvaluatorError(id, gate.name, {
+            cause: error,
+          });
+          record(requestContext, 'error', failure.code, {
             reason: `${gate.name} evaluator failed`,
             detail: { policy: gate.name },
           });
-          throw error;
+          throw markAudited(failure);
         }
-        if (!decision.allowed) {
-          deny(requestContext, gate.name, decision.reason);
+        if (refusal) {
+          deny(requestContext, gate.name, refusal.reason, refusal.metadata);
         }
       }
     }
 
-    // Authorization before capability (roadmap §9): required permissions ask
-    // WHO may invoke this connector at all, so the gate runs before the
-    // dry-run branch (a simulation still needs an authorized principal) and
-    // before the approval-grant gate (a valid approval must not elevate an
-    // otherwise unauthorized principal). Its input is the trusted
-    // `breakwater.principalPermissions` projection, mintable only by host/
-    // runtime code — a missing or malformed projection fails closed. Audit
-    // records the required identifiers and the policy snapshot version,
-    // never the principal's effective permission set.
     if (manifest.requiredPermissions !== undefined) {
       const required = manifest.requiredPermissions;
       const projection = requestContext?.get(PRINCIPAL_PERMISSIONS_CONTEXT_KEY);
@@ -1610,24 +1587,36 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
           requestContext,
           'required-permissions',
           'no valid principal permission projection is present; only a trusted host may mint it',
+          {
+            code: 'PERMISSION_PROJECTION_INVALID',
+            details: { requiredPermissions: required },
+          },
           { requiredPermissions: required, permissionPolicyVersion: null },
         );
       }
       const effective = new Set(projection.permissions);
-      if (!required.every((permission) => effective.has(permission))) {
+      const missingPermissions = required.filter(
+        (permission) => !effective.has(permission),
+      );
+      if (missingPermissions.length > 0) {
         deny(
           requestContext,
           'required-permissions',
           'required permissions are not satisfied',
           {
-            requiredPermissions: required,
-            permissionPolicyVersion: projection.policyVersion,
+            code: 'PERMISSION_MISSING',
+            details: {
+              requiredPermissions: required,
+              missingPermissions,
+              permissionPolicyVersion: projection.policyVersion,
+            },
           },
         );
       }
       record(
         requestContext,
         'allowed',
+        'PERMISSION_GRANTED',
         {
           reason: 'required permissions are satisfied',
           detail: {
@@ -1649,7 +1638,9 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
       // gates above still applied.
       const simulate = config.dryRunExecute;
       if (!manifest.dryRun || !simulate) {
-        deny(requestContext, 'dry-run', 'connector does not support dry-run');
+        deny(requestContext, 'dry-run', 'connector does not support dry-run', {
+          code: 'DRY_RUN_UNSUPPORTED',
+        });
       }
       try {
         const result = await simulate(typedInput, context, runtime);
@@ -1657,7 +1648,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
           dryRun: true,
         });
       } catch (error) {
-        if (error instanceof OutputValidationFailure) {
+        if (isInstanceOf(error, OutputValidationFailure)) {
           recordOutputValidationError(requestContext, { dryRun: true });
           if (directInvocation) {
             directInvocation.validationPhase = 'output';
@@ -1686,11 +1677,13 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
           requestContext,
           'write-permissions',
           'approval required and no matching structured grant was found',
+          { code: 'APPROVAL_GRANT_MISSING' },
         );
       }
       record(
         requestContext,
         'allowed',
+        'APPROVAL_GRANTED',
         {
           reason: 'structured approval grant matched',
           detail: {
@@ -1721,6 +1714,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
           requestContext,
           'idempotency',
           `manifest requires an idempotency key; set requestContext '${IDEMPOTENCY_KEY_CONTEXT_KEY}'`,
+          { code: 'IDEMPOTENCY_KEY_MISSING' },
         );
       }
       // Replay-cache key segments by isolation scope: metamind's canonical
@@ -1749,8 +1743,10 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
       try {
         return await keyedFlow(requestContext, storageKey, key, async () => {
           let legacy: IdempotencyInspection;
+          let inspectionOperation: 'get' | 'inspect' = 'get';
           try {
             if (isInspectableStore(store)) {
+              inspectionOperation = 'inspect';
               legacy = await store.inspect(legacyKey);
             } else {
               const record = await store.get(legacyKey);
@@ -1759,8 +1755,9 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
                 : { state: 'absent' };
             }
           } catch (error) {
-            recordStoreError(requestContext, 'inspect', error, key);
-            throw markAudited(error);
+            throw markAudited(
+              recordStoreError(requestContext, inspectionOperation, error, key),
+            );
           }
           if (legacy.state !== 'absent') {
             if (ambiguousLegacyKey) {
@@ -1768,6 +1765,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
                 requestContext,
                 'idempotency-key-migration',
                 'an ambiguous legacy idempotency record exists for this tuple; map it externally to exactly one v2 identity before retrying',
+                { code: 'IDEMPOTENCY_LEGACY_AMBIGUOUS' },
               );
             }
             if (legacy.state === 'replay') {
@@ -1781,6 +1779,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
               requestContext,
               'idempotency',
               'a legacy execution for this key is in progress; retry to replay its result',
+              { code: 'IDEMPOTENCY_CONFLICT' },
             );
           }
           if (policies.idempotencyKeyMigration !== 'legacy-writers-drained') {
@@ -1788,6 +1787,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
               requestContext,
               'idempotency-key-migration',
               `the legacy key is absent but v2 execution is disabled until policies.idempotencyKeyMigration acknowledges that every legacy writer sharing this store has been stopped and drained`,
+              { code: 'IDEMPOTENCY_MIGRATION_REQUIRED' },
             );
           }
 
@@ -1801,8 +1801,9 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
               // safe and preserves replay protection for the retry. Marked
               // audited: joined twins rethrow it via joinInflight, and
               // recordExecuteError must not re-record it as 'execute threw'.
-              recordStoreError(requestContext, 'reserve', error, key);
-              throw markAudited(error);
+              throw markAudited(
+                recordStoreError(requestContext, 'reserve', error, key),
+              );
             }
             if (reservation.state === 'replay') {
               return {
@@ -1820,6 +1821,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
                 requestContext,
                 'idempotency',
                 'another execution for this key is in progress; retry to replay its result',
+                { code: 'IDEMPOTENCY_CONFLICT' },
               );
             }
             if (reservation.tookOver) {
@@ -1828,7 +1830,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
               // not dead, if pendingTtlMs was set too low relative to the real
               // execute duration (agent-cli's definition-time guard checks
               // this; other connectors must size the store's TTL themselves).
-              record(requestContext, 'allowed', {
+              record(requestContext, 'allowed', 'IDEMPOTENCY_TAKEOVER', {
                 reason:
                   'stale-pending idempotency reservation taken over; the previous holder may still be executing',
                 detail: { idempotencyKey: key, tookOver: true },
@@ -1846,13 +1848,6 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
             // The consume stays INSIDE the attempt so denied calls, replays,
             // and joins never spend budget; single-audit of rate failures is
             // handled by deny()/auditedErrors.
-            // Accepted ordering quirk (audit D5, deliberate): reserve() runs
-            // BEFORE the rate-limit check, so a concurrent cross-isolate call
-            // for this same key that arrives while THIS attempt is later
-            // denied by the rate limit (and its reservation released) sees
-            // 'pending' and is denied 'idempotency' rather than 'rate-limit' —
-            // a transient misattribution in the audit reason, self-correcting
-            // on retry, with no duplicated side effect. Not fixed.
             const attempt = (async () => {
               try {
                 await consumeRateLimit(requestContext);
@@ -1869,13 +1864,9 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
                     token,
                   );
                 } catch (error) {
-                  // The side effect already succeeded; failing the call now
-                  // would invite a retry that re-executes it — the exact
-                  // duplication this store exists to prevent. Deliver the
-                  // result and surface the degraded replay protection in the
-                  // audit log. The reservation is deliberately NOT released: a
-                  // pending row blocks duplicates until the stale-pending TTL,
-                  // safer than inviting an immediate re-execute.
+                  // Returning the completed result avoids a retry that repeats
+                  // its side effect. The pending reservation prevents immediate
+                  // duplicate execution while replay persistence is unavailable.
                   recordStoreError(requestContext, 'put', error, key);
                 }
                 return validatedResult;
@@ -1886,7 +1877,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
                 // side effect, so keep the reservation pending instead of
                 // making an immediate retry duplicate it. This matches the
                 // fail-safe posture for a failed final put.
-                if (!(error instanceof OutputValidationFailure)) {
+                if (!isInstanceOf(error, OutputValidationFailure)) {
                   try {
                     await store.release(storageKey, token);
                   } catch (releaseError) {
@@ -1915,8 +1906,9 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
             // Fail closed: nothing has executed yet, so failing the call is
             // safe and preserves replay protection for the retry. Marked
             // audited so joined twins do not re-record it (see reserve probe).
-            recordStoreError(requestContext, 'get', error, key);
-            throw markAudited(error);
+            throw markAudited(
+              recordStoreError(requestContext, 'get', error, key),
+            );
           }
           if (cached) {
             return {
@@ -1946,7 +1938,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
           return { kind: 'attempt', attempt };
         });
       } catch (error) {
-        if (error instanceof OutputValidationFailure) {
+        if (isInstanceOf(error, OutputValidationFailure)) {
           recordOutputValidationError(requestContext, {
             idempotencyKey: key,
           });
@@ -1965,7 +1957,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
       const result = await config.execute(typedInput, context, runtime);
       return finishAllowed(requestContext, validateOutput(result));
     } catch (error) {
-      if (error instanceof OutputValidationFailure) {
+      if (isInstanceOf(error, OutputValidationFailure)) {
         recordOutputValidationError(requestContext);
         if (directInvocation) {
           directInvocation.validationPhase = 'output';
@@ -2120,7 +2112,9 @@ export async function invokeConnector<TInput, TOutput>(
     connector === null ||
     !manifests.has(connector)
   ) {
-    throw new TypeError(
+    throw new ConnectorInvocationError(
+      undefined,
+      'CONNECTOR_UNREGISTERED',
       'invokeConnector requires a connector created by createConnector()',
     );
   }
@@ -2129,12 +2123,16 @@ export async function invokeConnector<TInput, TOutput>(
     !invocation ||
     !isConnectorInvocationBoundaryCurrent(connector, invocation)
   ) {
-    throw new TypeError(
+    throw new ConnectorInvocationError(
+      invocation?.id,
+      'CONNECTOR_BOUNDARY_MODIFIED',
       'invokeConnector refuses a connector whose execution boundary was modified after construction',
     );
   }
   if (options.toolCallId !== undefined && !nonEmptyString(options.toolCallId)) {
-    throw new TypeError(
+    throw new ConnectorInvocationError(
+      invocation.id,
+      'CONNECTOR_INVOCATION_OPTIONS_INVALID',
       'invokeConnector toolCallId must be a non-empty string when provided',
     );
   }
@@ -2173,12 +2171,35 @@ export async function invokeConnector<TInput, TOutput>(
     throw new ConnectorValidationError(invocation.id, 'input');
   }
   if (!state.entered) {
-    throw new TypeError(
+    throw new ConnectorInvocationError(
+      invocation.id,
+      'CONNECTOR_BOUNDARY_UNVERIFIABLE',
       'invokeConnector could not verify the connector enforcement boundary',
     );
   }
   return result as TOutput;
 }
+
+export type {
+  ConnectorDecisionCode,
+  ConnectorDecisionDetails,
+  ConnectorDenialCode,
+  ConnectorDenialMetadata,
+  ConnectorInvocationCode,
+  ConnectorPolicyName,
+  ConnectorStoreName,
+  ConnectorStoreOperation,
+} from '../connector-decision.js';
+export {
+  CONNECTOR_DECISIONS,
+  ConnectorEvaluatorError,
+  ConnectorInvocationError,
+  ConnectorPolicyError,
+  ConnectorStoreError,
+  ConnectorValidationError,
+  connectorDecisionRetryable,
+  isConnectorDecisionCode,
+} from '../connector-decision.js';
 
 export type {
   D1IdempotencyStoreOptions,
@@ -2197,18 +2218,47 @@ export type {
   RateLimitStatement,
 } from './d1-rate-limit-store.js';
 export { D1RateLimitStore } from './d1-rate-limit-store.js';
+export const assertConnectorConformance: <TInput, TOutput>(
+  factory: ConnectorConformanceFactory<TInput, TOutput>,
+  options: ConnectorConformanceOptions<TInput>,
+) => Promise<ConnectorConformanceReport> = createConformanceAssertion({
+  connectorManifest,
+  connectorEgressPosture,
+  invokeConnector,
+});
+// egress-conformance.ts imports only types from this module; its runtime collaborators are the three bound above.
+export type {
+  ConnectorConformanceCase,
+  ConnectorConformanceCaseResult,
+  ConnectorConformanceEntryPoint,
+  ConnectorConformanceEscape,
+  ConnectorConformanceFactory,
+  ConnectorConformanceFinding,
+  ConnectorConformanceFindingCode,
+  ConnectorConformanceOptions,
+  ConnectorConformanceReport,
+  ConnectorConformanceRequest,
+  ConnectorConformanceResponse,
+  ConnectorConformanceRuntime,
+} from './egress-conformance.js';
+export { ConnectorConformanceError } from './egress-conformance.js';
 export type {
   EgressDenial,
   EgressFetchBase,
   EgressFetchOptions,
   EgressGuardedFetch,
+  EgressGuardMetadata,
   EgressRequestInit,
   EgressResponse,
   EgressResponseHeaders,
 } from './egress-fetch.js';
 // Fetch-level egress enforcement (own module; createConnector wires it per
 // call as ConnectorRuntime.fetch, but it also works standalone).
-export { EgressDeniedError, egressFetch } from './egress-fetch.js';
+export {
+  EgressDeniedError,
+  EgressGuardError,
+  egressFetch,
+} from './egress-fetch.js';
 export type {
   SingleTenantAuditPosture,
   SingleTenantConnectorPolicies,

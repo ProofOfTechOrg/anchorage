@@ -190,6 +190,7 @@ function wranglerQuery(options, sql) {
   if (options.persistTo) args.push('--persist-to', options.persistTo);
   const result = spawnSync(process.execPath, [wranglerEntrypoint(), ...args], {
     encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   if (result.error) {

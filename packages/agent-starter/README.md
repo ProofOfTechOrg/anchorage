@@ -56,6 +56,8 @@ All six use the deployment's D1 database. `createComposedStorage()` overlays not
 
 ## Provision one physical deployment
 
+Application roots outside this workspace must apply the `@mastra/core` patch flowsafe ships — see [Apply the flowsafe patch to @mastra/core](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/getting-started.md#apply-the-flowsafe-patch-to-mastracore); this workspace applies it through the root `pnpm.patchedDependencies`.
+
 Each organization needs a dedicated Worker, D1 database, Durable Object namespaces, and internal Durable Object credential. Replace every `replace-me` segment in `wrangler.jsonc` with the stable lowercase deployment tag before creating resources. For tag `acme`, use Worker `anchorage-agent-starter-acme` and D1 database `anchorage-agent-starter-acme`; the unique Worker name creates the deployment's Durable Object namespaces. Then stamp the same tag into the new D1 database before any application schema or traffic:
 
 ```bash
@@ -271,6 +273,8 @@ https://YOUR_WORKER/api/signal-providers/github/webhook
 The route verifies `X-Hub-Signature-256` over raw bytes before parsing or subscription lookup. Payload routing ids are not authoritative; the stored subscription determines delivery.
 
 ## Schedules and unattended work
+
+Schedule routes use the composed Worker's captured artifact epoch and the concrete D1 store's `FENCED_SCHEDULE_STORAGE` capability on the same database. After activation, missing, stale and future epochs refuse mutations, including pause/delete and already-matching pause/resume requests. Configure the epoch through the trusted host configuration; request data cannot supply it. Admitted trigger settlement can finish a pending deletion after an epoch change.
 
 The one-minute tick claims due schedules with D1 CAS, starts generic workflows or the same runtime-driven thread agent, and dispatches due notifications through the owning thread Durable Object.
 

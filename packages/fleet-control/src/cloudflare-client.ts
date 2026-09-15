@@ -5,15 +5,87 @@ import { createHash } from 'node:crypto';
 import Cloudflare from 'cloudflare';
 import { toFile } from 'cloudflare/uploads';
 import PQueue from 'p-queue';
-import { ActiveRouteAttestationError } from './active-route.js';
+import { exactActiveVersionId } from './active-route.js';
 import { canonicalApplicationBindings } from './application-bindings.js';
+import {
+  CLOUDFLARE_INVENTORY_BOUND,
+  CLOUDFLARE_SDK_MAX_RETRIES,
+  inventoryBoundExceeded,
+} from './cloudflare-client-config.js';
+import {
+  advanceCloudflareFleetInventoryStage,
+  type CloudflareFleetInventoryDeps,
+  type FleetInventoryOrdinaryScriptDetail,
+  type FleetInventoryProviderBinding,
+} from './cloudflare-fleet-inventory.js';
+import {
+  attachCustomDomain,
+  type CloudflareSdk,
+  deleteOrdinaryWorkerScript,
+  detachCustomDomain,
+  disableOrdinaryWorkerPublicAccess,
+  dispatchOrdinaryWorkerDeployment,
+  dispatchOrdinaryWorkerUpload,
+  findOrdinaryWorkerVersion,
+  inspectActiveWorkerRoute,
+  inspectOrdinaryWorkerFootprint,
+  listCustomDomains,
+  listOrdinaryWorkerDatabases,
+  listOrdinaryWorkerSecretNames,
+  listOrdinaryWorkerVersions,
+  MAX_DATABASE_INVENTORY,
+  type OrdinaryWorkerContext,
+  type OrdinaryWorkerFootprint,
+  ordinaryWorkerDeploymentStatus,
+  ordinaryWorkerSecretNames,
+  ordinaryWorkerSubdomain,
+  type PreparedOrdinaryWorkerDeploymentVersions,
+  type PreparedOrdinaryWorkerUpload,
+  prepareOrdinaryWorkerDeployment,
+  prepareOrdinaryWorkerUpload,
+  viewOrdinaryWorkerVersion,
+  workerMigrations,
+} from './cloudflare-ordinary-worker-operations.js';
+import {
+  CredentialedRedirectRefusedError,
+  isNotFound,
+  isRedirectStatus,
+  readErrorFieldSafely,
+  sanitizedErrorName,
+} from './cloudflare-provider-errors.js';
 import type { CloudflareApiRateCoordinator } from './cloudflare-rate-coordinator.js';
 import {
-  type HostRoutingTarget,
-  parseHostRoutingTarget,
-} from './host-routing.js';
+  advanceWorkerAttachmentScan,
+  CloudflareAttachmentScanDriftError,
+  type CloudflareWorkerAttachmentScanContext,
+  listAllWorkerAttachments,
+  type WorkerAttachmentScanChunk,
+  type WorkerAttachmentScanInput,
+} from './cloudflare-worker-attachment-scan.js';
+import { namedWorkerUploadBody } from './cloudflare-worker-upload.js';
 import {
-  canonicalDeploymentEgressPolicy,
+  cancelBodyWithoutAwait,
+  captureDatabaseExportReceiptCapability,
+  type DurableDatabaseExportStore,
+  databaseExportReceiptIdentityFromUnknown,
+  isDatabaseExportReceiptError,
+} from './database-export-store.js';
+import {
+  advanceFleetInventoryProgress,
+  type CollectFleetInventoryOptions,
+  canonicalFleetInventoryRunOptions,
+  type FleetInventoryProviderContext,
+  type FleetInventoryStagedFact,
+  type FleetInventoryStagedRow,
+  type FleetInventoryStageResult,
+  initialFleetInventoryProgress,
+  initialFleetInventoryStage,
+  materializeFleetInventoryGeneration,
+} from './fleet-inventory-state.js';
+import type { HostRoutingTarget } from './host-routing.js';
+import { readField, readStringField } from './json-field-reads.js';
+import {
+  canonicalMaintenanceCapabilityPublicKey,
   externalPlatformResourceGroupId,
   externalStateScriptName,
   FLEET_AUDIT_PROXY_BINDING,
@@ -27,16 +99,33 @@ import {
 import { deploymentSpecDigest } from './spec-digest.js';
 import type {
   DatabaseExport,
+  DatabaseExportReceiptIdentity,
   DatabaseReference,
+  DecommissionAttachmentScanInput,
+  DecommissionAttachmentScanResult,
   DeploymentSecrets,
   DeploymentSpec,
   ExternalMutationFence,
   FleetResourceInventory,
+  OrdinaryWorkerDeploymentVersion,
+  PlainWorkerDatabaseInventoryEntry,
+  PlainWorkerDeploymentStatus,
   PlainWorkerRouteApi,
+  PlainWorkerUploadIntent,
+  PlainWorkerVersionDetail,
+  PlainWorkerVersionSummary,
   PromotionGuard,
   ProviderBindingIdentity,
   ScriptInventoryTarget,
 } from './types.js';
+
+// The SDK's repeated type query parameters return no rows from the live API.
+const WORKER_ROUTE_ZONE_TYPES = Object.freeze([
+  'full',
+  'partial',
+  'secondary',
+  'internal',
+] as const);
 
 const AUDIT_CONSUMER_SETTINGS = Object.freeze({
   batch_size: 100,
@@ -45,6 +134,80 @@ const AUDIT_CONSUMER_SETTINGS = Object.freeze({
   max_wait_time_ms: 5_000,
 });
 const SDK_TRANSPORT_TIMEOUT_MS = 2_147_483_647;
+/** The single in-memory drain reads one generation that is never persisted. */
+const DRAIN_GENERATION = 1;
+/**
+ * The in-memory drain runs each stage to completion, so it hands every chunk
+ * the largest budget the shared 9..1,000 provider-request contract allows.
+ */
+const DRAIN_PROVIDER_REQUEST_BUDGET = 1_000;
+const R2_INVENTORY_PAGE_SIZE = 1_000;
+const DRAIN_INSPECT_SUFFIX = ' could not be inspected';
+const DRAIN_INVENTORY_SUFFIX = ' could not be inventoried';
+const STRUCTURED_CLONE = structuredClone;
+const UTF8_ENCODER = new TextEncoder();
+const MAX_DURABLE_OBJECT_NAMESPACE_ID_BYTES = 4_096;
+
+function malformedDurableObjectNamespaceInventory(): Error {
+  return new Error('Durable Object namespace ID inventory is malformed');
+}
+
+function canonicalDurableObjectNamespaceIds(value: unknown): readonly string[] {
+  let ids: string[];
+  try {
+    if (
+      !Array.isArray(value) ||
+      Object.getPrototypeOf(value) !== Array.prototype
+    ) {
+      throw malformedDurableObjectNamespaceInventory();
+    }
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+    const length =
+      lengthDescriptor && 'value' in lengthDescriptor
+        ? lengthDescriptor.value
+        : undefined;
+    if (
+      !Number.isSafeInteger(length) ||
+      length < 0 ||
+      length > CLOUDFLARE_INVENTORY_BOUND ||
+      lengthDescriptor?.writable !== true ||
+      lengthDescriptor.enumerable !== false ||
+      lengthDescriptor.configurable !== false
+    ) {
+      throw malformedDurableObjectNamespaceInventory();
+    }
+    const keys = Reflect.ownKeys(value);
+    if (
+      keys.length !== length + 1 ||
+      !keys.includes('length') ||
+      keys.some((key) => typeof key !== 'string')
+    ) {
+      throw malformedDurableObjectNamespaceInventory();
+    }
+    ids = [];
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (
+        !descriptor ||
+        !('value' in descriptor) ||
+        descriptor.writable !== true ||
+        descriptor.enumerable !== true ||
+        descriptor.configurable !== true ||
+        typeof descriptor.value !== 'string' ||
+        descriptor.value.length === 0 ||
+        UTF8_ENCODER.encode(descriptor.value).byteLength >
+          MAX_DURABLE_OBJECT_NAMESPACE_ID_BYTES
+      ) {
+        throw malformedDurableObjectNamespaceInventory();
+      }
+      ids.push(descriptor.value);
+    }
+    STRUCTURED_CLONE(value);
+  } catch {
+    throw malformedDurableObjectNamespaceInventory();
+  }
+  return [...new Set(ids)].sort();
+}
 
 export interface CloudflareClientOptions {
   readonly accountId: string;
@@ -57,18 +220,25 @@ export interface CloudflareClientOptions {
   readonly exportStore?: DurableDatabaseExportStore;
 }
 
-export interface DurableDatabaseExportStore {
-  write(input: {
-    readonly databaseId: string;
-    readonly fileName: string;
-    readonly body: ReadableStream<Uint8Array>;
-    readonly contentLength?: number;
-  }): Promise<{
-    readonly location: string;
-    readonly size: number;
-    readonly sha256: string;
-  }>;
+export type PlainWorkerCloudflareClientOptions = Omit<
+  CloudflareClientOptions,
+  'dispatchNamespace'
+> & { readonly plane: 'plain-worker' };
+
+export class CloudflarePlaneCapabilityError extends Error {
+  readonly operation: string;
+  readonly requiredPlane = 'workers-for-platforms' as const;
+
+  constructor(operation: string) {
+    super(
+      `Cloudflare operation '${operation}' requires the workers-for-platforms plane`,
+    );
+    this.name = 'CloudflarePlaneCapabilityError';
+    this.operation = operation;
+  }
 }
+
+export type { DurableDatabaseExportStore } from './database-export-store.js';
 
 export interface ControlWorkerSpec {
   readonly scriptName: string;
@@ -113,113 +283,17 @@ export interface ControlWorkerInspection {
   readonly zoneRoutes: readonly import('./types.js').WorkerZoneRoute[];
 }
 
-export interface OrdinaryWorkerFootprint {
-  readonly scriptPresent: boolean;
-  readonly workersDevEnabled?: boolean;
-  readonly previewUrlsEnabled?: boolean;
-  readonly customDomains: readonly Readonly<{
-    id: string;
-    hostname: string;
-    service: string;
-  }>[];
-  readonly zoneRoutes: readonly import('./types.js').WorkerZoneRoute[];
-}
+export type { OrdinaryWorkerFootprint } from './cloudflare-ordinary-worker-operations.js';
 
 const SCRIPT_INVENTORY_PREFIX = '__anchorage_script__:';
 const FLEET_SCRIPT_TAG = 'fleet:anchorage';
 
-type ProviderDeployment =
-  | Readonly<{
-      versions?: readonly Readonly<{
-        percentage?: unknown;
-        version_id?: unknown;
-      }>[];
-    }>
-  | undefined;
-
-function exactActiveVersionId(
-  deployment: ProviderDeployment,
-  context: string,
-): string {
-  if (!deployment || !Array.isArray(deployment.versions)) {
-    throw new Error(`${context} has no current deployment`);
-  }
-  for (const version of deployment.versions) {
-    if (
-      typeof version.percentage !== 'number' ||
-      !Number.isFinite(version.percentage) ||
-      version.percentage < 0 ||
-      version.percentage > 100 ||
-      typeof version.version_id !== 'string' ||
-      version.version_id.length === 0
-    ) {
-      throw new Error(`${context} has malformed version traffic metadata`);
-    }
-  }
-  const onlyVersion = deployment.versions[0];
-  if (
-    deployment.versions.length !== 1 ||
-    onlyVersion?.percentage !== 100 ||
-    typeof onlyVersion.version_id !== 'string'
-  ) {
-    throw new Error(
-      `${context} must have exactly one current version receiving 100% of traffic`,
-    );
-  }
-  return onlyVersion.version_id;
-}
-
-/**
- * The traffic split as the provider reported it, for a refusal to carry. Only
- * well-formed entries survive: a malformed one is exactly what
- * `exactActiveVersionId` already refused over, and inventing a shape for it
- * would put a fabricated percentage into an operator-facing error.
- */
-function observedTrafficSplit(
-  deployment: ProviderDeployment,
-): readonly Readonly<{ artifactVersion: string; percentage: number }>[] {
-  return (deployment?.versions ?? []).flatMap((version) =>
-    typeof version.version_id === 'string' &&
-    typeof version.percentage === 'number' &&
-    Number.isFinite(version.percentage)
-      ? [
-          {
-            artifactVersion: version.version_id,
-            percentage: version.percentage,
-          },
-        ]
-      : [],
-  );
-}
-
-/**
- * `exactActiveVersionId` with its refusal restated as an attestation refusal
- * carrying the split. The rule is unchanged and deliberately not relaxed: one
- * version at 100% or nothing, never the version with the largest share.
- */
-function attestedActiveVersionId(
-  deployment: ProviderDeployment,
-  scriptName: string,
-): string {
-  try {
-    return exactActiveVersionId(deployment, `ordinary Worker '${scriptName}'`);
-  } catch (cause) {
-    throw new ActiveRouteAttestationError(
-      cause instanceof Error ? cause.message : String(cause),
-      {
-        routedScriptName: scriptName,
-        trafficSplit: observedTrafficSplit(deployment),
-      },
-      { cause },
-    );
+export class CloudflareProviderRequestNotDispatchedError extends Error {
+  constructor(cause: unknown) {
+    super('Cloudflare provider request was not dispatched', { cause });
+    this.name = 'CloudflareProviderRequestNotDispatchedError';
   }
 }
-
-function tagValue(tags: readonly string[], prefix: string): string | undefined {
-  return tags.find((tag) => tag.startsWith(prefix))?.slice(prefix.length);
-}
-
-type CloudflareSdk = InstanceType<typeof Cloudflare>;
 
 const REQUIRED_ZONE_PERMISSION_GROUPS = [
   ['Zone Read'],
@@ -326,15 +400,6 @@ function assertAccountWideZoneToken(options: {
   }
 }
 
-function isNotFound(error: unknown): boolean {
-  return Boolean(
-    error &&
-      typeof error === 'object' &&
-      'status' in error &&
-      error.status === 404,
-  );
-}
-
 function d1RestParameters(
   bindings: readonly string[],
   operation: string,
@@ -379,43 +444,6 @@ export function dispatchMigrations(spec: DeploymentSpec) {
   );
 }
 
-export function workerMigrations(
-  migrations: readonly import('./types.js').DurableObjectMigration[],
-  previousTag?: string,
-) {
-  if (migrations.length === 0) return undefined;
-  let pending = migrations;
-  if (previousTag !== undefined) {
-    const previousIndex = migrations.findIndex(
-      (migration) => migration.tag === previousTag,
-    );
-    if (previousIndex < 0) {
-      throw new Error(
-        `previous Durable Object tag '${previousTag}' is absent from the ordered migration history`,
-      );
-    }
-    pending = migrations.slice(previousIndex + 1);
-  }
-  if (pending.length === 0) return undefined;
-  return {
-    new_tag: pending.at(-1)?.tag,
-    old_tag: previousTag,
-    steps: pending.map((migration) => ({
-      new_sqlite_classes: migration.newSqliteClasses
-        ? [...migration.newSqliteClasses]
-        : undefined,
-      new_classes: migration.newClasses ? [...migration.newClasses] : undefined,
-      deleted_classes: migration.deletedClasses
-        ? [...migration.deletedClasses]
-        : undefined,
-      renamed_classes: migration.renamedClasses?.map((renamed) => ({
-        from: renamed.from,
-        to: renamed.to,
-      })),
-    })),
-  };
-}
-
 async function hashExport(
   body: ReadableStream<Uint8Array>,
 ): Promise<{ sha256: string; size: number }> {
@@ -431,21 +459,211 @@ async function hashExport(
   return { sha256: hash.digest('hex'), size };
 }
 
+async function funnel<T>(operation: () => T | PromiseLike<T>): Promise<T> {
+  return operation();
+}
+
+let trackProviderDispatch: <T>(
+  client: CloudflareProvisioningClient,
+  operation: () => Promise<T>,
+) => Promise<T>;
+
+let scanProviderAttachments: (
+  client: CloudflareProvisioningClient,
+  input: WorkerAttachmentScanInput,
+) => Promise<WorkerAttachmentScanChunk>;
+
+let buildFleetInventoryContext: (
+  client: CloudflareProvisioningClient,
+) => FleetInventoryProviderContext;
+
+/**
+ * Restores the two provider-error details the durable engine deliberately
+ * sanitizes. The chunk's call-local diagnostics carry the transient text, so
+ * the in-memory drain composes today's exact bytes without the engine ever
+ * staging them.
+ */
+function drainFindingRows(
+  result: FleetInventoryStageResult,
+): readonly FleetInventoryStagedRow[] {
+  if (result.diagnostics.length === 0) return result.rows;
+  const remaining = [...result.diagnostics];
+  return result.rows.map((row) => {
+    const detail = row.payload.detail;
+    if (row.kind !== 'finding' || typeof detail !== 'string') return row;
+    const label = detail.endsWith(DRAIN_INSPECT_SUFFIX)
+      ? detail.slice(0, -DRAIN_INSPECT_SUFFIX.length)
+      : detail.endsWith(DRAIN_INVENTORY_SUFFIX)
+        ? detail.slice(0, -DRAIN_INVENTORY_SUFFIX.length)
+        : undefined;
+    if (label === undefined) return row;
+    const prefix = `${label}: `;
+    const index = remaining.findIndex((entry) => entry.startsWith(prefix));
+    const diagnostic = index < 0 ? undefined : remaining.splice(index, 1)[0];
+    if (diagnostic === undefined) return row;
+    return {
+      ...row,
+      payload: {
+        ...row.payload,
+        detail: `${detail}: ${diagnostic.slice(prefix.length)}`,
+      },
+    };
+  });
+}
+
+/**
+ * Runs `operation`; rejects with
+ * `CloudflareProviderRequestNotDispatchedError` (`cause` = the failure) when it
+ * fails before any provider mutation request was invoked. Provider reads do
+ * not count. Not re-entrant: one scope per outcome member. A nested scope
+ * shadows the outer store, so a mutation dispatched inside it leaves the outer
+ * tracker unmarked and a later outer failure is misclassified as pre-dispatch.
+ */
+export function withProviderDispatchTracking<T>(
+  client: CloudflareProvisioningClient,
+  operation: () => Promise<T>,
+): Promise<T> {
+  return trackProviderDispatch(client, operation);
+}
+
+/** @internal Package-private seam for the resumable lifecycle engine. */
+export function advanceCloudflareWorkerAttachmentScan(
+  client: CloudflareProvisioningClient,
+  input: WorkerAttachmentScanInput,
+): Promise<WorkerAttachmentScanChunk> {
+  return scanProviderAttachments(client, input);
+}
+
+/**
+ * @internal Package-private provider seam for the bounded account inventory
+ * coordinator. Each context memoizes its provider listings, so one context
+ * serves one bounded run or one in-memory drain.
+ */
+export function cloudflareFleetInventoryContext(
+  client: CloudflareProvisioningClient,
+): FleetInventoryProviderContext {
+  return buildFleetInventoryContext(client);
+}
+
+/** @internal Package-private conversion for the bounded lifecycle provider. */
+export function mapDecommissionAttachmentScanChunk(
+  chunk: WorkerAttachmentScanChunk,
+): DecommissionAttachmentScanResult {
+  switch (chunk.status) {
+    case 'pending':
+      if (chunk.attachments.length !== 0) {
+        throw new Error(
+          'bounded attachment scan returned unexpected accumulated attachments',
+        );
+      }
+      return {
+        status: 'pending',
+        progress: chunk.progress,
+        providerFetchAttemptsReserved: chunk.providerFetchAttemptsReserved,
+      };
+    case 'attached':
+      if (chunk.attachment.plane === 'ordinary') {
+        return {
+          status: 'attached',
+          attachment: {
+            plane: 'ordinary',
+            scriptName: chunk.attachment.scriptName,
+          },
+          providerFetchAttemptsReserved: chunk.providerFetchAttemptsReserved,
+        };
+      }
+      if (
+        chunk.attachment.plane !== 'dispatch' ||
+        !chunk.attachment.dispatchNamespace
+      ) {
+        throw new Error(
+          'bounded attachment scan returned malformed dispatch attachment',
+        );
+      }
+      return {
+        status: 'attached',
+        attachment: {
+          plane: 'dispatch',
+          scriptName: chunk.attachment.scriptName,
+          dispatchNamespace: chunk.attachment.dispatchNamespace,
+        },
+        providerFetchAttemptsReserved: chunk.providerFetchAttemptsReserved,
+      };
+    case 'complete':
+      if (chunk.attachments.length !== 0) {
+        throw new Error(
+          'bounded attachment scan returned unexpected accumulated attachments',
+        );
+      }
+      return {
+        status: 'complete',
+        evidenceSha256: chunk.evidenceSha256,
+        evidenceCount: chunk.evidenceCount,
+        providerFetchAttemptsReserved: chunk.providerFetchAttemptsReserved,
+      };
+    default: {
+      const unknownChunk: never = chunk;
+      void unknownChunk;
+      throw new Error('bounded attachment scan returned unknown result');
+    }
+  }
+}
+
 export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
+  /** Canonical immutable receipt authority, present only with receipt export. */
+  declare readonly databaseExportReceiptAuthority?: string;
+  /**
+   * Streams one stable operation receipt while independently hashing the
+   * provider download. Exact retries converge; collisions are preserved.
+   */
+  declare readonly exportDatabaseReceipt?: (
+    identity: DatabaseExportReceiptIdentity,
+  ) => Promise<DatabaseExport>;
   readonly #accountId: string;
   readonly #apiToken: string;
-  readonly #dispatchNamespace: string;
+  readonly #dispatchNamespace: string | undefined;
   readonly #client: CloudflareSdk;
+  readonly #inventoryProofClient: CloudflareSdk;
+  readonly #ordinary: OrdinaryWorkerContext;
+  readonly #attachmentScan: CloudflareWorkerAttachmentScanContext;
   readonly #operationQueue: PQueue;
   readonly #requestQueue: PQueue;
   readonly #rateCoordinator: CloudflareApiRateCoordinator;
   readonly #exportStore: DurableDatabaseExportStore | undefined;
   readonly #fetch: typeof fetch;
+  readonly #dispatchTracker = new AsyncLocalStorage<{ dispatched: boolean }>();
   readonly #mutationFence = new AsyncLocalStorage<ExternalMutationFence>();
   readonly #requestTimeoutMs: number;
 
-  constructor(options: CloudflareClientOptions) {
-    if (!options.accountId || !options.apiToken || !options.dispatchNamespace) {
+  static {
+    // This module-private friend keeps dispatch classification out of the
+    // public class; by convention only the direct ordinary-Worker adapter
+    // enters it, and Workers for Platforms callers never do.
+    trackProviderDispatch = (client, operation) =>
+      client.#trackDispatch(operation);
+    scanProviderAttachments = (client, input) =>
+      advanceWorkerAttachmentScan(client.#attachmentScan, input);
+    buildFleetInventoryContext = (client) => client.#fleetInventoryContext();
+  }
+
+  constructor(
+    options: CloudflareClientOptions | PlainWorkerCloudflareClientOptions,
+  ) {
+    if ('plane' in options) {
+      if (options.plane !== 'plain-worker') {
+        throw new Error('unsupported Cloudflare client plane');
+      }
+      if (!options.accountId || !options.apiToken) {
+        throw new Error('accountId and apiToken are required');
+      }
+      if ('dispatchNamespace' in options) {
+        throw new Error('plain-worker plane cannot name a dispatch namespace');
+      }
+    } else if (
+      !options.accountId ||
+      !options.apiToken ||
+      !options.dispatchNamespace
+    ) {
       throw new Error(
         'accountId, apiToken, and dispatchNamespace are required',
       );
@@ -455,7 +673,8 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     }
     this.#accountId = options.accountId;
     this.#apiToken = options.apiToken;
-    this.#dispatchNamespace = options.dispatchNamespace;
+    this.#dispatchNamespace =
+      'plane' in options ? undefined : options.dispatchNamespace;
     const concurrency = options.concurrency ?? 8;
     if (!Number.isInteger(concurrency) || concurrency < 1) {
       throw new Error('concurrency must be a positive integer');
@@ -463,8 +682,32 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     this.#operationQueue = new PQueue({ concurrency });
     this.#requestQueue = new PQueue({ concurrency });
     this.#rateCoordinator = options.rateCoordinator;
-    this.#exportStore = options.exportStore;
-    this.#fetch = options.fetch ?? fetch;
+    const exportStore = options.exportStore;
+    this.#exportStore = exportStore;
+    const receiptCapability = exportStore
+      ? captureDatabaseExportReceiptCapability(exportStore, () => [
+          exportStore.receiptAuthority,
+          exportStore.writeReceipt,
+        ])
+      : undefined;
+    if (receiptCapability) {
+      const writeReceipt = receiptCapability.method as NonNullable<
+        DurableDatabaseExportStore['writeReceipt']
+      >;
+      this.databaseExportReceiptAuthority = receiptCapability.authority;
+      this.exportDatabaseReceipt = (identity) =>
+        this.#exportDatabaseReceipt(identity, {
+          authority: receiptCapability.authority,
+          method: writeReceipt,
+        });
+    }
+    const fetchFn = options.fetch ?? fetch;
+    // Every request below carries the account API token, and the signed export
+    // download carries a URL the provider chose. Forcing the policy after the
+    // spread denies a call site the chance to opt into following a redirect to
+    // an address the control plane did not choose.
+    this.#fetch = (input, init) =>
+      fetchFn(input, { ...init, redirect: 'manual' });
     this.#requestTimeoutMs = options.requestTimeoutMs ?? 60_000;
     if (
       !Number.isSafeInteger(this.#requestTimeoutMs) ||
@@ -472,18 +715,163 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     ) {
       throw new Error('requestTimeoutMs must be a positive integer');
     }
-    const rateLimitedFetch: typeof fetch = async (input, init) => {
-      return this.#request(input, init);
-    };
+    const rateLimitedFetch: typeof fetch = (input, init) =>
+      this.#request(input, init);
     this.#client = new Cloudflare({
       apiToken: options.apiToken,
       fetch: rateLimitedFetch,
-      maxRetries: 2,
+      // An injected logger cannot be disabled independently, so the client
+      // option must override CLOUDFLARE_LOG before credentials reach the SDK.
+      logLevel: 'off',
+      maxRetries: CLOUDFLARE_SDK_MAX_RETRIES,
       // The SDK timeout starts before its custom transport. Apply the real
       // timeout after shared quota acquisition so replica coordination cannot
       // consume the network request's lease-bounded execution budget.
       timeout: SDK_TRANSPORT_TIMEOUT_MS,
     });
+    const inventoryProofClient = (shape: 'array' | 'items') =>
+      this.#client.withOptions({
+        fetch: async (input, init) => {
+          const response = await rateLimitedFetch(input, init);
+          if (!response.ok) return response;
+          const mediaType = response.headers
+            .get('content-type')
+            ?.split(';')[0]
+            ?.trim();
+          if (
+            response.status !== 200 ||
+            !(
+              mediaType?.includes('application/json') ||
+              mediaType?.endsWith('+json')
+            )
+          ) {
+            const error = new Error(
+              'Cloudflare inventory response is not complete JSON',
+            );
+            cancelBodyWithoutAwait(response.body, error);
+            throw error;
+          }
+          const parse = response.json.bind(response);
+          // SDK page defaults erase missing result arrays before callers see them.
+          const validatedJson: Response['json'] = async () => {
+            const value: unknown = await parse();
+            const result = readField(value, 'result');
+            const rows =
+              shape === 'array' ? result : readField(result, 'items');
+            // The versions list returns successful pages with errors: null.
+            const errors = readField(value, 'errors') ?? undefined;
+            const info = readField(value, 'result_info') ?? undefined;
+            const cursor = readField(info, 'cursor');
+            const totalPages = readField(info, 'total_pages');
+            const totalCount = readField(info, 'total_count');
+            const perPage = readField(info, 'per_page');
+            const requestUrl = new URL(
+              typeof input === 'string' || input instanceof URL
+                ? input
+                : input.url,
+            );
+            const requestedPage = Number(
+              requestUrl.searchParams.get('page') ?? '1',
+            );
+            if (
+              readField(value, 'success') !== true ||
+              !Array.isArray(rows) ||
+              rows.some(
+                (row) =>
+                  row === null || typeof row !== 'object' || Array.isArray(row),
+              ) ||
+              (errors !== undefined &&
+                (!Array.isArray(errors) || errors.length !== 0)) ||
+              (info !== undefined &&
+                (typeof info !== 'object' || Array.isArray(info))) ||
+              (cursor !== undefined &&
+                cursor !== null &&
+                typeof cursor !== 'string') ||
+              [totalPages, totalCount, perPage].some(
+                (value) =>
+                  value !== undefined &&
+                  (typeof value !== 'number' ||
+                    !Number.isSafeInteger(value) ||
+                    value < 0),
+              ) ||
+              (rows.length === 0 &&
+                ((typeof cursor === 'string' && cursor.length > 0) ||
+                  (!requestUrl.searchParams.has('cursor') &&
+                    typeof totalPages === 'number' &&
+                    totalPages > requestedPage) ||
+                  (!requestUrl.searchParams.has('cursor') &&
+                    typeof totalCount === 'number' &&
+                    totalCount > 0 &&
+                    (requestedPage === 1 ||
+                      (typeof perPage === 'number' &&
+                        perPage > 0 &&
+                        totalCount / perPage > requestedPage - 1)))))
+            )
+              throw new Error(
+                'Cloudflare inventory response has incomplete page metadata',
+              );
+            return value;
+          };
+          return new Proxy(response, {
+            get(target, property) {
+              if (property === 'json') return validatedJson;
+              const value = Reflect.get(target, property, target);
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          });
+        },
+      });
+    this.#inventoryProofClient = inventoryProofClient('array');
+    this.#ordinary = {
+      accountId: this.#accountId,
+      client: this.#client,
+      inventoryClient: this.#inventoryProofClient,
+      versionInventoryClient: inventoryProofClient('items'),
+      schedule: (operation) => this.#schedule(operation),
+      collectBounded: (iterable, label, max) =>
+        this.#collectBounded(iterable, label, max),
+      withMutationFence: (fence, operation) =>
+        this.withMutationFence(fence, operation),
+      workerRouteZoneIds: () => this.#workerRouteZoneIds(),
+    };
+    this.#attachmentScan = {
+      accountId: this.#accountId,
+      client: this.#client,
+      dispatchNamespace: this.#dispatchNamespace,
+      requestDispatchScriptPage: async ({
+        namespace,
+        cursor,
+        perPage,
+        signal,
+      }) => {
+        const url = new URL(
+          `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(this.#accountId)}/workers/dispatch/namespaces/${encodeURIComponent(namespace)}/scripts`,
+        );
+        url.searchParams.set('per_page', String(perPage));
+        if (cursor) url.searchParams.set('cursor', cursor);
+        const response = await this.#request(url, {
+          headers: { authorization: `Bearer ${this.#apiToken}` },
+          signal,
+        });
+        // This caller reads the raw response, so the refusal belongs here
+        // rather than in #request, whose SDK-routed callers reclassify a
+        // thrown error as a connection failure and retry it.
+        if (isRedirectStatus(response.status)) {
+          const refusal = new CredentialedRedirectRefusedError(
+            'Cloudflare dispatch script listing',
+            response.status,
+          );
+          cancelBodyWithoutAwait(response.body, refusal);
+          throw refusal;
+        }
+        return response;
+      },
+    };
+  }
+
+  /** Configured provider request timeout in milliseconds. */
+  get requestTimeoutMs(): number {
+    return this.#requestTimeoutMs;
   }
 
   async #request(
@@ -493,13 +881,20 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     const method = (
       init?.method ?? (input instanceof Request ? input.method : 'GET')
     ).toUpperCase();
+    const mutation = method !== 'GET' && method !== 'HEAD';
+    // These reads are deliberately redundant with the request-queue binding
+    // for explicit call-time capture. The binding stays required for consumer
+    // callbacks (injected fetch, assertOwned, and acquire); the 'runs a queued
+    // request under its enqueuer context' case in
+    // test/cloudflare-client-plain-worker.test.ts pins it.
     const fence = this.#mutationFence.getStore();
+    const tracker = this.#dispatchTracker.getStore();
     const signal =
       init?.signal ?? (input instanceof Request ? input.signal : undefined);
     const response = await this.#requestQueue.add(
-      async () => {
+      this.#inEnqueuerContext(async () => {
         await this.#rateCoordinator.acquire(signal);
-        if (method !== 'GET' && method !== 'HEAD') {
+        if (mutation) {
           if (!fence) {
             throw new Error(
               `Cloudflare ${method} request requires an external mutation fence`,
@@ -508,13 +903,16 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
           await fence.assertOwned();
         }
         const timeoutSignal = AbortSignal.timeout(this.#requestTimeoutMs);
+        // Mark only after quota and fence checks. The SDK's `data:` FormData
+        // probe is a GET, so it neither asserts nor marks.
+        if (mutation && tracker) tracker.dispatched = true;
         return this.#fetch(input, {
           ...init,
           signal: signal
             ? AbortSignal.any([signal, timeoutSignal])
             : timeoutSignal,
         });
-      },
+      }),
       { signal },
     );
     if (!response) {
@@ -524,7 +922,52 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   }
 
   async #schedule<T>(operation: () => Promise<T>): Promise<T> {
-    return (await this.#operationQueue.add(operation)) as T;
+    return (await this.#operationQueue.add(
+      this.#inEnqueuerContext(operation),
+    )) as T;
+  }
+
+  #inEnqueuerContext<T>(operation: () => Promise<T>): () => Promise<T> {
+    // p-queue starts a deferred task from the previous task's microtask, so a
+    // bare callback would run under the previous operation's context. The
+    // operation queue's hop precedes every read in #request; the request
+    // queue's hop runs consumer callbacks that must observe their operation.
+    const run = AsyncLocalStorage.snapshot();
+    return () => run(operation);
+  }
+
+  async #trackDispatch<T>(operation: () => Promise<T>): Promise<T> {
+    const tracker = { dispatched: false };
+    try {
+      return await this.#dispatchTracker.run(tracker, operation);
+    } catch (error) {
+      if (!tracker.dispatched) {
+        throw new CloudflareProviderRequestNotDispatchedError(error);
+      }
+      throw error;
+    }
+  }
+
+  async *#collectBounded<T>(
+    iterable: AsyncIterable<T> | Iterable<T>,
+    label: string,
+    max = CLOUDFLARE_INVENTORY_BOUND,
+  ): AsyncGenerator<T> {
+    let count = 0;
+    for await (const item of iterable) {
+      count += 1;
+      if (count > max) {
+        throw inventoryBoundExceeded(label, max);
+      }
+      yield item;
+    }
+  }
+
+  #requireDispatchNamespace(operation: string): string {
+    if (this.#dispatchNamespace === undefined) {
+      throw new CloudflarePlaneCapabilityError(operation);
+    }
+    return this.#dispatchNamespace;
   }
 
   async withMutationFence<T>(
@@ -546,28 +989,48 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   }
 
   async #workerRouteZoneIds(): Promise<readonly string[]> {
-    const verification = await this.#client.user.tokens.verify();
-    if (verification.status !== 'active') {
-      throw new Error('Cloudflare API token is not active');
-    }
     let token:
       | Awaited<ReturnType<CloudflareSdk['user']['tokens']['get']>>
       | undefined;
-    try {
-      token = await this.#client.accounts.tokens.get(verification.id, {
-        account_id: this.#accountId,
-      });
-    } catch {
+    for (const family of ['account', 'user'] as const) {
       try {
-        token = await this.#client.user.tokens.get(verification.id);
-      } catch {
-        throw new Error(
-          'Cloudflare API token policy is unavailable; API Tokens Read is required for account-wide zone attestation',
-        );
+        const verification =
+          family === 'account'
+            ? await this.#client.accounts.tokens.verify({
+                account_id: this.#accountId,
+              })
+            : await this.#client.user.tokens.verify();
+        if (verification.status !== 'active') {
+          throw new Error('Cloudflare API token is not active');
+        }
+        try {
+          token =
+            family === 'account'
+              ? await this.#client.accounts.tokens.get(verification.id, {
+                  account_id: this.#accountId,
+                })
+              : await this.#client.user.tokens.get(verification.id);
+        } catch (error) {
+          if (family === 'account') throw error;
+          throw new Error(
+            'Cloudflare API token policy is unavailable; API Tokens Read is required for account-wide zone attestation',
+          );
+        }
+        break;
+      } catch (error) {
+        if (
+          family === 'account' &&
+          error instanceof Cloudflare.APIError &&
+          ([401, 403, 404, 405, 429].includes(error.status) ||
+            (error.status >= 500 && error.status <= 599))
+        ) {
+          continue;
+        }
+        throw error;
       }
     }
     if (
-      token.status !== 'active' ||
+      token?.status !== 'active' ||
       !token.policies ||
       token.policies.length === 0
     ) {
@@ -581,11 +1044,13 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     });
     const zoneIds: string[] = [];
     const seenZoneIds = new Set<string>();
-    for await (const zone of this.#client.zones.list({
-      account: { id: this.#accountId },
-      per_page: 50,
-      type: ['full', 'partial', 'secondary', 'internal'],
-    })) {
+    for await (const zone of this.#collectBounded(
+      this.#inventoryProofClient.zones.list({
+        account: { id: this.#accountId },
+        per_page: 50,
+      }),
+      'zone inventory',
+    )) {
       if (zone.account.id !== this.#accountId) {
         throw new Error(
           `Cloudflare returned zone '${zone.id}' outside account '${this.#accountId}'`,
@@ -596,6 +1061,12 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
           'Cloudflare account-wide zone discovery returned incomplete or duplicate zone metadata',
         );
       }
+      if (typeof zone.type !== 'string') {
+        throw new Error(
+          'Cloudflare account-wide zone discovery returned incomplete zone type metadata',
+        );
+      }
+      if (!WORKER_ROUTE_ZONE_TYPES.some((type) => type === zone.type)) continue;
       seenZoneIds.add(zone.id);
       zoneIds.push(zone.id);
     }
@@ -606,13 +1077,15 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     accountId: string;
     dispatchNamespace: string;
   }> {
+    const dispatchNamespace =
+      this.#requireDispatchNamespace('platformPlaneScope');
     return {
       accountId: this.#accountId,
-      dispatchNamespace: this.#dispatchNamespace,
+      dispatchNamespace,
     };
   }
 
-  async #assertUntrustedDispatchNamespace(): Promise<
+  async #assertUntrustedDispatchNamespace(dispatchNamespace: string): Promise<
     Readonly<{
       name: string;
       namespaceId?: string;
@@ -622,15 +1095,15 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   > {
     const namespace =
       await this.#client.workersForPlatforms.dispatch.namespaces.get(
-        this.#dispatchNamespace,
+        dispatchNamespace,
         { account_id: this.#accountId },
       );
     if (
-      namespace.namespace_name !== this.#dispatchNamespace ||
+      namespace.namespace_name !== dispatchNamespace ||
       namespace.trusted_workers !== false
     ) {
       throw new Error(
-        `dispatch namespace '${this.#dispatchNamespace}' must attest trusted_workers=false`,
+        `dispatch namespace '${dispatchNamespace}' must attest trusted_workers=false`,
       );
     }
     if (
@@ -639,7 +1112,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       namespace.script_count < 0
     ) {
       throw new Error(
-        `dispatch namespace '${this.#dispatchNamespace}' returned no valid script_count`,
+        `dispatch namespace '${dispatchNamespace}' returned no valid script_count`,
       );
     }
     return {
@@ -653,9 +1126,32 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   }
 
   async assertUntrustedDispatchNamespace(): Promise<void> {
+    const dispatchNamespace = this.#requireDispatchNamespace(
+      'assertUntrustedDispatchNamespace',
+    );
     await this.#schedule(async () => {
-      await this.#assertUntrustedDispatchNamespace();
+      await this.#assertUntrustedDispatchNamespace(dispatchNamespace);
     });
+  }
+
+  async advanceDecommissionAttachmentScan(
+    input: DecommissionAttachmentScanInput,
+  ): Promise<DecommissionAttachmentScanResult> {
+    try {
+      const chunk = await scanProviderAttachments(this, {
+        target: input.progress.target,
+        progress: input.progress,
+        maxProviderRequests: input.maxProviderRequests,
+        signal: input.signal,
+        stopOnFirstAttachment: true,
+      });
+      return mapDecommissionAttachmentScanChunk(chunk);
+    } catch (error) {
+      if (error instanceof CloudflareAttachmentScanDriftError) {
+        return { status: 'drift' };
+      }
+      throw error;
+    }
   }
 
   async listWorkerDatabaseAttachments(databaseId: string): Promise<
@@ -665,122 +1161,10 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       dispatchNamespace?: string;
     }>[]
   > {
-    const attachments: Array<{
-      scriptName: string;
-      plane: 'ordinary' | 'dispatch';
-      dispatchNamespace?: string;
-    }> = [];
-    const attachmentKeys = new Set<string>();
-    const addAttachment = (
-      scriptName: string,
-      plane: 'ordinary' | 'dispatch',
-      dispatchNamespace?: string,
-    ): void => {
-      const key = `${plane}:${dispatchNamespace ?? ''}:${scriptName}`;
-      if (attachmentKeys.has(key)) return;
-      attachmentKeys.add(key);
-      attachments.push({
-        scriptName,
-        plane,
-        ...(dispatchNamespace ? { dispatchNamespace } : {}),
-      });
-    };
-    for await (const script of this.#client.workers.scripts.list({
-      account_id: this.#accountId,
-    })) {
-      if (typeof script.id !== 'string' || script.id.length === 0) {
-        throw new Error(
-          'Cloudflare ordinary Worker listing contained a script without an id',
-        );
-      }
-      const deployments = await this.#client.workers.scripts.deployments.list(
-        script.id,
-        {
-          account_id: this.#accountId,
-        },
-      );
-      const active = deployments.deployments[0];
-      if (!active) continue;
-      if (!Array.isArray(active.versions) || active.versions.length === 0) {
-        throw new Error(
-          `Cloudflare current deployment for ordinary Worker '${script.id}' had no versions`,
-        );
-      }
-      let hasLiveVersion = false;
-      const currentVersions = active.versions.map((deployedVersion) => {
-        if (
-          typeof deployedVersion.percentage !== 'number' ||
-          !Number.isFinite(deployedVersion.percentage) ||
-          deployedVersion.percentage < 0 ||
-          deployedVersion.percentage > 100 ||
-          typeof deployedVersion.version_id !== 'string' ||
-          deployedVersion.version_id.length === 0
-        ) {
-          throw new Error(
-            `Cloudflare current deployment for ordinary Worker '${script.id}' had malformed version metadata`,
-          );
-        }
-        if (deployedVersion.percentage > 0) hasLiveVersion = true;
-        return deployedVersion;
-      });
-      if (!hasLiveVersion) {
-        throw new Error(
-          `Cloudflare current deployment for ordinary Worker '${script.id}' had no live versions`,
-        );
-      }
-      for (const deployedVersion of currentVersions) {
-        const version = await this.#client.workers.scripts.versions.get(
-          deployedVersion.version_id,
-          { account_id: this.#accountId, script_name: script.id },
-        );
-        if (
-          (version.resources.bindings ?? []).some(
-            (binding) =>
-              binding.type === 'd1' && binding.database_id === databaseId,
-          )
-        ) {
-          addAttachment(script.id, 'ordinary');
-          break;
-        }
-      }
-    }
-    for await (const namespace of this.#client.workersForPlatforms.dispatch.namespaces.list(
-      { account_id: this.#accountId },
-    )) {
-      if (
-        typeof namespace.namespace_name !== 'string' ||
-        namespace.namespace_name.length === 0
-      ) {
-        throw new Error(
-          'Cloudflare dispatch namespace listing contained an unidentified namespace',
-        );
-      }
-      for (const script of await this.#dispatchScripts(
-        namespace.namespace_name,
-      )) {
-        const settings =
-          await this.#client.workersForPlatforms.dispatch.namespaces.scripts.settings.get(
-            script.id,
-            {
-              account_id: this.#accountId,
-              dispatch_namespace: namespace.namespace_name,
-            },
-          );
-        if (
-          (settings.bindings ?? []).some(
-            (binding) =>
-              binding.type === 'd1' && binding.database_id === databaseId,
-          )
-        ) {
-          addAttachment(script.id, 'dispatch', namespace.namespace_name);
-        }
-      }
-    }
-    return attachments.sort((left, right) =>
-      `${left.plane}:${left.dispatchNamespace ?? ''}:${left.scriptName}`.localeCompare(
-        `${right.plane}:${right.dispatchNamespace ?? ''}:${right.scriptName}`,
-      ),
-    );
+    return listAllWorkerAttachments(this.#attachmentScan, {
+      kind: 'd1',
+      databaseId,
+    });
   }
 
   async listWorkerR2Attachments(bucketName: string): Promise<
@@ -790,78 +1174,10 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       dispatchNamespace?: string;
     }>[]
   > {
-    const attachments: Array<{
-      scriptName: string;
-      plane: 'ordinary' | 'dispatch';
-      dispatchNamespace?: string;
-    }> = [];
-    for await (const script of this.#client.workers.scripts.list({
-      account_id: this.#accountId,
-    })) {
-      if (!script.id) throw new Error('ordinary Worker has no id');
-      const deployments = await this.#client.workers.scripts.deployments.list(
-        script.id,
-        { account_id: this.#accountId },
-      );
-      for (const deployed of deployments.deployments[0]?.versions ?? []) {
-        if (!deployed.version_id) {
-          throw new Error(
-            `ordinary Worker '${script.id}' has a malformed version`,
-          );
-        }
-        const version = await this.#client.workers.scripts.versions.get(
-          deployed.version_id,
-          { account_id: this.#accountId, script_name: script.id },
-        );
-        if (
-          (version.resources.bindings ?? []).some(
-            (binding) =>
-              binding.type === 'r2_bucket' &&
-              binding.bucket_name === bucketName,
-          )
-        ) {
-          attachments.push({ scriptName: script.id, plane: 'ordinary' });
-          break;
-        }
-      }
-    }
-    for await (const namespace of this.#client.workersForPlatforms.dispatch.namespaces.list(
-      { account_id: this.#accountId },
-    )) {
-      if (!namespace.namespace_name) {
-        throw new Error('dispatch namespace has no name');
-      }
-      for (const script of await this.#dispatchScripts(
-        namespace.namespace_name,
-      )) {
-        const settings =
-          await this.#client.workersForPlatforms.dispatch.namespaces.scripts.settings.get(
-            script.id,
-            {
-              account_id: this.#accountId,
-              dispatch_namespace: namespace.namespace_name,
-            },
-          );
-        if (
-          (settings.bindings ?? []).some(
-            (binding) =>
-              binding.type === 'r2_bucket' &&
-              binding.bucket_name === bucketName,
-          )
-        ) {
-          attachments.push({
-            scriptName: script.id,
-            plane: 'dispatch',
-            dispatchNamespace: namespace.namespace_name,
-          });
-        }
-      }
-    }
-    return attachments.sort((left, right) =>
-      `${left.plane}:${left.dispatchNamespace ?? ''}:${left.scriptName}`.localeCompare(
-        `${right.plane}:${right.dispatchNamespace ?? ''}:${right.scriptName}`,
-      ),
-    );
+    return listAllWorkerAttachments(this.#attachmentScan, {
+      kind: 'r2',
+      bucketName,
+    });
   }
 
   async getR2Bucket(
@@ -898,14 +1214,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
           creationDate: new Date(bucket.creation_date).toISOString(),
         };
       } catch (error) {
-        if (
-          error &&
-          typeof error === 'object' &&
-          'status' in error &&
-          error.status === 404
-        ) {
-          return undefined;
-        }
+        if (isNotFound(error)) return undefined;
         throw error;
       }
     });
@@ -930,17 +1239,18 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     resource: import('./types.js').ApplicationR2Binding,
   ): Promise<void> {
     await this.#schedule(async () => {
-      for await (const object of this.#client.r2.buckets.objects.list(
-        resource.bucketName,
-        {
-          account_id: this.#accountId,
-          jurisdiction: resource.jurisdiction,
-          per_page: 1,
-        },
+      for await (const _object of this.#collectBounded(
+        this.#inventoryProofClient.r2.buckets.objects.list(
+          resource.bucketName,
+          {
+            account_id: this.#accountId,
+            jurisdiction: resource.jurisdiction,
+            per_page: 1,
+          },
+        ),
+        'R2 object inventory',
       )) {
-        if (object.key) {
-          throw new Error(`R2 bucket '${resource.bucketName}' is not empty`);
-        }
+        throw new Error(`R2 bucket '${resource.bucketName}' is not empty`);
       }
     });
   }
@@ -962,125 +1272,93 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   async listOrdinaryWorkerSecretNames(
     scriptName: string,
   ): Promise<readonly string[]> {
-    return this.#schedule(() => this.#ordinaryWorkerSecretNames(scriptName));
+    return listOrdinaryWorkerSecretNames(this.#ordinary, scriptName);
   }
 
-  async #ordinaryWorkerSecretNames(scriptName: string): Promise<string[]> {
-    const names: string[] = [];
-    try {
-      for await (const secret of this.#client.workers.scripts.secrets.list(
-        scriptName,
-        { account_id: this.#accountId },
-      )) {
-        if (!secret.name) {
-          throw new Error(
-            `ordinary Worker '${scriptName}' returned a secret without a name`,
-          );
-        }
-        names.push(secret.name);
-      }
-    } catch (error) {
-      if (isNotFound(error)) return [];
-      throw error;
-    }
-    return names.sort();
+  async listOrdinaryWorkerDatabases(
+    filter?: Readonly<{ name?: string }>,
+  ): Promise<readonly PlainWorkerDatabaseInventoryEntry[]> {
+    return listOrdinaryWorkerDatabases(this.#ordinary, filter);
   }
 
-  async #dispatchScripts(
-    dispatchNamespace = this.#dispatchNamespace,
-  ): Promise<readonly Readonly<{ id: string; tags: readonly string[] }>[]> {
-    const scripts: Array<Readonly<{ id: string; tags: readonly string[] }>> =
-      [];
-    let cursor: string | undefined;
-    const seenCursors = new Set<string>();
-    do {
-      const url = new URL(
-        `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(this.#accountId)}/workers/dispatch/namespaces/${encodeURIComponent(dispatchNamespace)}/scripts`,
-      );
-      url.searchParams.set('per_page', '1000');
-      if (cursor) url.searchParams.set('cursor', cursor);
-      let response: Response | undefined;
-      for (let attempt = 0; attempt < 3; attempt += 1) {
-        response = await this.#request(url, {
-          headers: { authorization: `Bearer ${this.#apiToken}` },
-        });
-        if (response.status !== 429 && response.status < 500) break;
-      }
-      if (!response?.ok) {
-        throw new Error(
-          `Cloudflare dispatch script listing failed with status ${response?.status ?? 'unknown'}`,
-        );
-      }
-      const payload: unknown = await response.json();
-      if (!payload || typeof payload !== 'object' || !('result' in payload)) {
-        throw new Error('Cloudflare dispatch script listing was malformed');
-      }
-      const result = payload.result;
-      if (!Array.isArray(result)) {
-        throw new Error(
-          'Cloudflare dispatch script listing had no result array',
-        );
-      }
-      for (const item of result) {
-        if (!item || typeof item !== 'object' || !('id' in item)) {
-          throw new Error(
-            'Cloudflare dispatch script listing contained an invalid item',
-          );
-        }
-        const id = item.id;
-        const tags = 'tags' in item ? item.tags : undefined;
-        if (
-          typeof id !== 'string' ||
-          id.length === 0 ||
-          (tags !== undefined &&
-            (!Array.isArray(tags) ||
-              !tags.every((tag) => typeof tag === 'string')))
-        ) {
-          throw new Error(
-            'Cloudflare dispatch script listing contained malformed script metadata',
-          );
-        }
-        scripts.push({ id, tags: (tags as string[] | undefined) ?? [] });
-      }
-      const resultInfo =
-        'result_info' in payload &&
-        payload.result_info &&
-        typeof payload.result_info === 'object'
-          ? payload.result_info
-          : undefined;
-      const cursors =
-        resultInfo && 'cursors' in resultInfo && resultInfo.cursors
-          ? resultInfo.cursors
-          : undefined;
-      const nextCursor =
-        resultInfo && 'cursor' in resultInfo
-          ? resultInfo.cursor
-          : cursors && typeof cursors === 'object' && 'after' in cursors
-            ? cursors.after
-            : undefined;
-      cursor =
-        typeof nextCursor === 'string' && nextCursor ? nextCursor : undefined;
-      if (cursor) {
-        if (seenCursors.has(cursor)) {
-          throw new Error(
-            'Cloudflare dispatch script listing repeated a cursor',
-          );
-        }
-        seenCursors.add(cursor);
-      }
-    } while (cursor);
-    return scripts;
+  async ordinaryWorkerDeploymentStatus(
+    scriptName: string,
+  ): Promise<PlainWorkerDeploymentStatus | undefined> {
+    return ordinaryWorkerDeploymentStatus(this.#ordinary, scriptName);
+  }
+
+  async listOrdinaryWorkerVersions(
+    scriptName: string,
+  ): Promise<readonly PlainWorkerVersionSummary[] | undefined> {
+    return listOrdinaryWorkerVersions(this.#ordinary, scriptName);
+  }
+
+  async viewOrdinaryWorkerVersion(
+    scriptName: string,
+    versionId: string,
+  ): Promise<PlainWorkerVersionDetail> {
+    return viewOrdinaryWorkerVersion(this.#ordinary, scriptName, versionId);
+  }
+
+  async findOrdinaryWorkerVersion(
+    scriptName: string,
+    versionId: string,
+  ): Promise<PlainWorkerVersionDetail | undefined> {
+    return findOrdinaryWorkerVersion(this.#ordinary, scriptName, versionId);
+  }
+
+  async prepareOrdinaryWorkerUpload(
+    intent: PlainWorkerUploadIntent,
+  ): Promise<PreparedOrdinaryWorkerUpload> {
+    return prepareOrdinaryWorkerUpload(intent);
+  }
+
+  async dispatchOrdinaryWorkerUpload(
+    prepared: PreparedOrdinaryWorkerUpload,
+  ): Promise<void> {
+    return dispatchOrdinaryWorkerUpload(this.#ordinary, prepared);
+  }
+
+  prepareOrdinaryWorkerDeployment(
+    versions: readonly OrdinaryWorkerDeploymentVersion[],
+  ): PreparedOrdinaryWorkerDeploymentVersions {
+    return prepareOrdinaryWorkerDeployment(versions);
+  }
+
+  async dispatchOrdinaryWorkerDeployment(
+    scriptName: string,
+    versions: PreparedOrdinaryWorkerDeploymentVersions,
+  ): Promise<void> {
+    return dispatchOrdinaryWorkerDeployment(
+      this.#ordinary,
+      scriptName,
+      versions,
+    );
+  }
+
+  async deleteOrdinaryWorkerScript(
+    scriptName: string,
+  ): Promise<'deleted' | 'absent'> {
+    return deleteOrdinaryWorkerScript(this.#ordinary, scriptName);
   }
 
   async findDatabase(name: string): Promise<DatabaseReference | undefined> {
     return this.#schedule(async () => {
       const matches: DatabaseReference[] = [];
-      for await (const database of this.#client.d1.database.list({
-        account_id: this.#accountId,
-        name,
-      })) {
-        if (database.name === name && database.uuid) {
-          matches.push({ id: database.uuid, name, created: false });
+      for await (const database of this.#collectBounded(
+        this.#inventoryProofClient.d1.database.list({
+          account_id: this.#accountId,
+          name,
+        }),
+        'D1 database inventory',
+        MAX_DATABASE_INVENTORY,
+      )) {
+        const id = readStringField(database, 'uuid');
+        const databaseName = readStringField(database, 'name');
+        if (!id || !databaseName)
+          throw new Error('D1 database inventory has an invalid uuid or name');
+        if (databaseName === name) {
+          matches.push({ id, name, created: false });
         }
       }
       if (matches.length > 1) {
@@ -1116,12 +1394,23 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   }
 
   async ensureDispatchNamespace(): Promise<void> {
+    const dispatchNamespace = this.#requireDispatchNamespace(
+      'ensureDispatchNamespace',
+    );
     await this.#schedule(async () => {
       let found = false;
-      for await (const namespace of this.#client.workersForPlatforms.dispatch.namespaces.list(
-        { account_id: this.#accountId },
+      for await (const namespace of this.#collectBounded(
+        this.#inventoryProofClient.workersForPlatforms.dispatch.namespaces.list(
+          {
+            account_id: this.#accountId,
+          },
+        ),
+        'dispatch namespace inventory',
       )) {
-        if (namespace.namespace_name === this.#dispatchNamespace) {
+        const name = readStringField(namespace, 'namespace_name');
+        if (!name)
+          throw new Error('dispatch namespace inventory has an invalid name');
+        if (name === dispatchNamespace) {
           found = true;
           break;
         }
@@ -1129,10 +1418,10 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       if (!found) {
         await this.#client.workersForPlatforms.dispatch.namespaces.create({
           account_id: this.#accountId,
-          name: this.#dispatchNamespace,
+          name: dispatchNamespace,
         });
       }
-      await this.#assertUntrustedDispatchNamespace();
+      await this.#assertUntrustedDispatchNamespace(dispatchNamespace);
     });
   }
 
@@ -1319,728 +1608,343 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     });
   }
 
-  async collectFleetInventory(options: {
-    readonly hostRoutingKvId?: string;
-    readonly databaseNamePrefix: string;
-    readonly scriptNamePrefix: string;
-    readonly includeDispatchNamespace?: boolean;
-    readonly includeR2Buckets?: boolean;
-  }): Promise<FleetResourceInventory> {
+  /**
+   * Drains the bounded account inventory engine in memory: one stage chunk per
+   * iteration over a call-local accumulator, with no durable run, no
+   * continuation token, and no account lease. Observable behavior — provider
+   * encounter order, finding vocabulary, finding order, and result bytes — is
+   * unchanged and pinned by the frozen golden baseline.
+   */
+  async collectFleetInventory(
+    options: CollectFleetInventoryOptions,
+  ): Promise<FleetResourceInventory> {
     if (!options.databaseNamePrefix || !options.scriptNamePrefix) {
       throw new Error(
         'databaseNamePrefix and scriptNamePrefix are required for fleet inventory',
       );
     }
-    const findings: FleetResourceInventory['findings'][number][] = [];
-    const registrations: Array<
-      ScriptInventoryTarget & { readonly keyOwned: boolean }
-    > = [];
-    const routes: FleetResourceInventory['routes'][number][] = [];
-    if (options.hostRoutingKvId) {
-      for await (const key of this.#client.kv.namespaces.keys.list(
-        options.hostRoutingKvId,
-        { account_id: this.#accountId },
-      )) {
-        if (!key.name) continue;
-        const isRegistration = key.name.startsWith(SCRIPT_INVENTORY_PREFIX);
-        const registeredName = isRegistration
-          ? key.name.slice(SCRIPT_INVENTORY_PREFIX.length)
-          : undefined;
-        const serialized = await this.#readHostRouting(
-          options.hostRoutingKvId,
-          key.name,
-        );
-        if (serialized === undefined) {
-          findings.push({
-            tenantTag: 'unknown',
-            environment: 'unknown',
-            kind: isRegistration ? 'stale-script-registration' : 'stale-route',
-            detail: `fleet inventory key '${key.name}' disappeared while it was being read`,
-          });
-          continue;
-        }
-        let value: unknown;
-        try {
-          value = JSON.parse(serialized);
-        } catch {
-          findings.push({
-            tenantTag: 'unknown',
-            environment: 'unknown',
-            kind: isRegistration
-              ? 'malformed-script-registration'
-              : 'malformed-route',
-            detail: `fleet inventory key '${key.name}' is not valid JSON`,
-          });
-          continue;
-        }
-        if (!value || typeof value !== 'object') {
-          findings.push({
-            tenantTag: 'unknown',
-            environment: 'unknown',
-            kind: isRegistration
-              ? 'malformed-script-registration'
-              : 'malformed-route',
-            detail: `fleet inventory key '${key.name}' is not an object`,
-          });
-          continue;
-        }
-        const candidate = value as Record<string, unknown>;
-        if (isRegistration) {
-          if (
-            typeof candidate.scriptName !== 'string' ||
-            typeof candidate.tenantTag !== 'string' ||
-            typeof candidate.environment !== 'string' ||
-            typeof candidate.databaseId !== 'string' ||
-            typeof candidate.routeHostname !== 'string'
-          ) {
-            findings.push({
-              tenantTag:
-                typeof candidate.tenantTag === 'string'
-                  ? candidate.tenantTag
-                  : 'unknown',
-              environment:
-                typeof candidate.environment === 'string'
-                  ? candidate.environment
-                  : 'unknown',
-              kind: 'malformed-script-registration',
-              detail: `script inventory key '${key.name}' has incomplete ownership metadata`,
-            });
-            continue;
-          }
-          if (
-            !candidate.scriptName.startsWith(options.scriptNamePrefix) &&
-            !registeredName?.startsWith(options.scriptNamePrefix)
-          ) {
-            continue;
-          }
-          const keyOwned = registeredName === candidate.scriptName;
-          registrations.push({
-            scriptName: candidate.scriptName,
-            tenantTag: candidate.tenantTag,
-            environment: candidate.environment,
-            databaseId: candidate.databaseId,
-            routeHostname: candidate.routeHostname,
-            keyOwned,
-          });
-          if (!keyOwned) {
-            findings.push({
-              tenantTag: candidate.tenantTag,
-              environment: candidate.environment,
-              kind: 'stale-script-registration',
-              detail: `script inventory key '${key.name}' claims '${candidate.scriptName}'`,
-            });
-          }
-          continue;
-        }
-        if (
-          typeof candidate.scriptName !== 'string' ||
-          typeof candidate.tenantTag !== 'string' ||
-          typeof candidate.environment !== 'string' ||
-          typeof candidate.policyId !== 'string' ||
-          typeof candidate.policyDigest !== 'string' ||
-          !Array.isArray(candidate.policyHosts) ||
-          candidate.policyHosts.some((host) => typeof host !== 'string')
-        ) {
-          findings.push({
-            tenantTag:
-              typeof candidate.tenantTag === 'string'
-                ? candidate.tenantTag
-                : 'unknown',
-            environment:
-              typeof candidate.environment === 'string'
-                ? candidate.environment
-                : 'unknown',
-            kind: 'malformed-route',
-            detail: `host route '${key.name}' has incomplete ownership metadata`,
-          });
-          continue;
-        }
-        let policy: ReturnType<typeof canonicalDeploymentEgressPolicy>;
-        try {
-          policy = canonicalDeploymentEgressPolicy({
-            policyId: candidate.policyId,
-            tenantTag: candidate.tenantTag,
-            environment: candidate.environment,
-            allowedHosts: candidate.policyHosts as string[],
-          });
-        } catch {
-          findings.push({
-            tenantTag: candidate.tenantTag,
-            environment: candidate.environment,
-            kind: 'malformed-route',
-            detail: `host route '${key.name}' has invalid policy metadata`,
-          });
-          continue;
-        }
-        if (
-          candidate.policyDigest !== policy.policyDigest ||
-          JSON.stringify(candidate.policyHosts) !==
-            JSON.stringify(policy.policyHosts)
-        ) {
-          findings.push({
-            tenantTag: candidate.tenantTag,
-            environment: candidate.environment,
-            kind: 'malformed-route',
-            detail: `host route '${key.name}' has inconsistent policy metadata`,
-          });
-          continue;
-        }
-        let stateEgress: HostRoutingTarget['stateEgress'];
-        try {
-          stateEgress = (await parseHostRoutingTarget(serialized)).stateEgress;
-        } catch {
-          findings.push({
-            tenantTag: candidate.tenantTag,
-            environment: candidate.environment,
-            kind: 'malformed-route',
-            detail: `host route '${key.name}' has invalid state-egress metadata`,
-          });
-          continue;
-        }
-        if (!candidate.scriptName.startsWith(options.scriptNamePrefix))
-          continue;
-        routes.push({
-          backend: 'workers-for-platforms',
-          surface: 'host-registry',
-          hostname: key.name,
-          scriptName: candidate.scriptName,
-          tenantTag: candidate.tenantTag,
-          environment: candidate.environment,
-          ...policy,
-          ...(stateEgress ? { stateEgress } : {}),
-        });
-      }
-    }
-
-    const includeDispatchNamespace =
-      options.includeDispatchNamespace ?? options.hostRoutingKvId !== undefined;
-    const dispatchScripts = includeDispatchNamespace
-      ? await this.#dispatchScripts()
-      : [];
-    const dispatchScriptsByName = new Map(
-      dispatchScripts.map((script) => [script.id, script]),
+    const runOptions = canonicalFleetInventoryRunOptions(options);
+    const context = this.#fleetInventoryContext();
+    const rows: FleetInventoryStagedRow[] = [];
+    const facts: FleetInventoryStagedFact[] = [];
+    let progress = initialFleetInventoryProgress(
+      initialFleetInventoryStage(runOptions),
+      DRAIN_GENERATION,
     );
-    const deployments: FleetResourceInventory['deployments'][number][] = [];
-    for (const registration of registrations) {
-      const listed = dispatchScriptsByName.get(registration.scriptName);
-      if (includeDispatchNamespace && !listed) {
-        findings.push({
-          tenantTag: registration.tenantTag,
-          environment: registration.environment,
-          kind: 'stale-script-registration',
-          detail: `registered script '${registration.scriptName}' is absent from the dispatch namespace listing`,
-        });
-      }
-      if (
-        includeDispatchNamespace &&
-        listed &&
-        (!listed.tags.includes(FLEET_SCRIPT_TAG) ||
-          tagValue(listed.tags, 'tenant:') !== registration.tenantTag ||
-          tagValue(listed.tags, 'environment:') !== registration.environment)
-      ) {
-        findings.push({
-          tenantTag: registration.tenantTag,
-          environment: registration.environment,
-          kind: 'stale-script-registration',
-          detail: `registered script '${registration.scriptName}' does not match its live fleet tags`,
-        });
-      }
-      let live: Awaited<ReturnType<typeof this.inspectDispatchWorker>>;
-      try {
-        live = await this.inspectDispatchWorker(registration.scriptName);
-      } catch (error) {
-        findings.push({
-          tenantTag: registration.tenantTag,
-          environment: registration.environment,
-          kind: 'stale-script-registration',
-          detail: `registered script '${registration.scriptName}' could not be inspected: ${String(error)}`,
-        });
-        continue;
-      }
-      if (!live) {
-        findings.push({
-          tenantTag: registration.tenantTag,
-          environment: registration.environment,
-          kind: 'stale-script-registration',
-          detail: `registered script '${registration.scriptName}' is missing`,
-        });
-        continue;
-      }
-      deployments.push({
-        backend: 'workers-for-platforms',
-        scriptName: registration.scriptName,
-        tenantTag: live.tenantTag,
-        environment: live.environment,
-        databaseIds: live.databaseIds,
-        durableObjectBindings: live.durableObjectBindings,
-        serviceBindings: live.serviceBindings,
-        queueProducerBindings: live.queueProducerBindings,
-        r2BucketBindings: live.r2BucketBindings,
-        plainTextBindings: live.plainTextBindings,
-        secretNames: live.secretNames,
-        routeHostnames: routes
-          .filter(
-            (route) =>
-              route.backend === 'workers-for-platforms' &&
-              route.scriptName === registration.scriptName,
-          )
-          .map((route) => route.hostname),
-        artifactVersion: live.artifactVersion,
-        desiredSpecDigest: live.desiredSpecDigest,
-        schemaVersion: live.schemaVersion,
+    while (progress.stage.step !== 'finalize') {
+      const executed = progress.stage;
+      const result = await context.advanceStage({
+        stage: executed,
+        options: runOptions,
+        progress,
+        maxProviderRequests: DRAIN_PROVIDER_REQUEST_BUDGET,
       });
-      const ownerMatches =
-        registration.keyOwned &&
-        live.tenantTag === registration.tenantTag &&
-        live.environment === registration.environment &&
-        live.databaseIds.length === 1 &&
-        live.databaseIds[0] === registration.databaseId;
-      if (!ownerMatches && registration.keyOwned) {
-        findings.push({
-          tenantTag: registration.tenantTag,
-          environment: registration.environment,
-          kind: 'stale-script-registration',
-          detail: `registered script '${registration.scriptName}' does not match its live tenant, environment, or database ownership`,
-        });
-      }
+      rows.push(...drainFindingRows(result));
+      facts.push(...result.facts);
+      progress = advanceFleetInventoryProgress(progress, executed, result);
     }
-    const registrationByScript = new Map(
-      registrations.map((registration) => [
-        registration.scriptName,
-        registration,
-      ]),
-    );
-    for (const script of dispatchScripts) {
-      const registration = registrationByScript.get(script.id);
-      if (registration?.keyOwned) continue;
-      findings.push({
-        tenantTag: tagValue(script.tags, 'tenant:') ?? 'unknown',
-        environment: tagValue(script.tags, 'environment:') ?? 'unknown',
-        kind: 'unknown-dispatch-scripts',
-        detail: `dispatch script '${script.id}' has no valid owner-checked registry entry`,
-      });
-    }
-    for (const route of routes) {
-      if (route.backend !== 'workers-for-platforms') continue;
-      const registration = registrationByScript.get(route.scriptName);
-      if (
-        !registration?.keyOwned ||
-        registration.tenantTag !== route.tenantTag ||
-        registration.environment !== route.environment ||
-        registration.routeHostname !== route.hostname
-      ) {
-        findings.push({
-          tenantTag: route.tenantTag,
-          environment: route.environment,
-          kind: 'stale-route',
-          detail: `host route '${route.hostname}' does not match its script registration owner`,
-        });
-      }
-    }
+    return materializeFleetInventoryGeneration({
+      rows,
+      facts,
+      options: runOptions,
+    });
+  }
 
-    let dispatchScriptCount: number | undefined;
-    let dispatchNamespaceInventory: FleetResourceInventory['dispatchNamespace'];
-    if (includeDispatchNamespace) {
-      const dispatchNamespace =
-        await this.#client.workersForPlatforms.dispatch.namespaces.get(
-          this.#dispatchNamespace,
-          { account_id: this.#accountId },
-        );
-      dispatchScriptCount = dispatchNamespace.script_count;
-      if (
-        typeof dispatchScriptCount !== 'number' ||
-        !Number.isSafeInteger(dispatchScriptCount) ||
-        dispatchScriptCount < 0
-      ) {
-        throw new Error(
-          `dispatch namespace '${this.#dispatchNamespace}' returned no valid script_count`,
-        );
-      }
-      dispatchNamespaceInventory = {
-        name: dispatchNamespace.namespace_name ?? this.#dispatchNamespace,
-        ...(dispatchNamespace.namespace_id
-          ? { namespaceId: dispatchNamespace.namespace_id }
-          : {}),
-        trustedWorkers: dispatchNamespace.trusted_workers,
-        scriptCount: dispatchScriptCount,
-      };
-      if (
-        dispatchNamespace.namespace_name !== this.#dispatchNamespace ||
-        dispatchNamespace.trusted_workers !== false
-      ) {
-        findings.push({
-          tenantTag: 'unknown',
-          environment: 'unknown',
-          kind: 'trusted-dispatch-namespace',
-          detail: `dispatch namespace '${this.#dispatchNamespace}' does not attest trusted_workers=false`,
-        });
-      }
-      if (dispatchScriptCount > dispatchScripts.length) {
-        findings.push({
-          tenantTag: 'unknown',
-          environment: 'unknown',
-          kind: 'unknown-dispatch-scripts',
-          detail: `dispatch namespace '${this.#dispatchNamespace}' reports ${dispatchScriptCount - dispatchScripts.length} script(s) missing from the paginated listing`,
-        });
-      }
-    }
-
-    const customDomains = [];
-    for await (const domain of this.#client.workers.domains.list({
-      account_id: this.#accountId,
-    })) {
-      if (domain.service.startsWith(options.scriptNamePrefix)) {
-        customDomains.push(domain);
-      }
-    }
-    const zoneRoutes: Array<
-      import('./types.js').WorkerZoneRoute & { readonly scriptName: string }
-    > = [];
-    const workerRouteZoneIds = await this.#workerRouteZoneIds();
-    for (const zoneId of workerRouteZoneIds) {
-      for await (const route of this.#client.workers.routes.list({
-        zone_id: zoneId,
-      })) {
-        if (
-          route.script?.startsWith(options.scriptNamePrefix) &&
-          route.id &&
-          route.pattern
-        ) {
-          zoneRoutes.push({
-            zoneId,
-            routeId: route.id,
-            pattern: route.pattern,
-            scriptName: route.script,
-          });
-        }
-      }
-    }
-    const plainIdentities = new Map<
-      string,
-      { readonly tenantTag: string; readonly environment: string }
-    >();
-    for await (const script of this.#client.workers.scripts.list({
-      account_id: this.#accountId,
-    })) {
-      const scriptName = script.id;
-      if (!scriptName?.startsWith(options.scriptNamePrefix)) continue;
-      try {
-        const deploymentList =
-          await this.#client.workers.scripts.deployments.list(scriptName, {
-            account_id: this.#accountId,
-          });
-        const activeDeployment = deploymentList.deployments[0];
-        const artifactVersion = exactActiveVersionId(
-          activeDeployment,
-          `ordinary Worker '${scriptName}'`,
-        );
-        const [activeVersion, subdomain, secretNames] = await Promise.all([
-          this.#client.workers.scripts.versions.get(artifactVersion, {
-            account_id: this.#accountId,
-            script_name: scriptName,
-          }),
-          this.#client.workers.scripts.subdomain.get(scriptName, {
-            account_id: this.#accountId,
-          }),
-          this.#ordinaryWorkerSecretNames(scriptName),
-        ]);
-        const bindings = activeVersion.resources.bindings ?? [];
-        const databaseIds = bindings.flatMap((binding) =>
-          binding.type === 'd1' && binding.database_id
-            ? [binding.database_id]
-            : [],
-        );
-        const durableObjectBindings = bindings.flatMap((binding) => {
-          if (
-            binding.type !== 'durable_object_namespace' ||
-            !binding.namespace_id ||
-            !binding.name ||
-            !binding.class_name
-          ) {
-            return [];
-          }
-          return [
-            {
-              name: binding.name,
-              className: binding.class_name,
-              namespaceId: binding.namespace_id,
-              ...(binding.script_name
-                ? { scriptName: binding.script_name }
-                : {}),
-              ...(binding.dispatch_namespace
-                ? { dispatchNamespace: binding.dispatch_namespace }
-                : {}),
-            },
-          ];
-        });
-        const serviceBindings = bindings.flatMap((binding) =>
-          binding.type === 'service' && binding.name && binding.service
-            ? [
-                {
-                  name: binding.name,
-                  service: binding.service,
-                  ...(binding.entrypoint
-                    ? { entrypoint: binding.entrypoint }
-                    : {}),
-                },
-              ]
-            : [],
-        );
-        const queueProducerBindings = bindings.flatMap((binding) =>
-          binding.type === 'queue' && binding.name && binding.queue_name
-            ? [{ name: binding.name, queueName: binding.queue_name }]
-            : [],
-        );
-        const kvNamespaceBindings = bindings.flatMap((binding) =>
-          binding.type === 'kv_namespace' &&
-          binding.name &&
-          binding.namespace_id
-            ? [{ name: binding.name, namespaceId: binding.namespace_id }]
-            : [],
-        );
-        const r2BucketBindings = bindings.flatMap((binding) =>
-          binding.type === 'r2_bucket' && binding.name && binding.bucket_name
-            ? [
-                {
-                  name: binding.name,
-                  bucketName: binding.bucket_name,
-                  jurisdiction: 'default' as const,
-                },
-              ]
-            : [],
-        );
-        const plainText = new Map(
-          bindings.flatMap((binding) =>
-            binding.type === 'plain_text'
-              ? [[binding.name, binding.text] as const]
-              : [],
-          ),
-        );
-        assertSupportedProviderBindings(
-          bindings,
-          new Set([
-            'd1',
-            'durable_object_namespace',
-            'service',
-            'queue',
-            'kv_namespace',
-            'dispatch_namespace',
-            'r2_bucket',
-            'plain_text',
-            'secret_text',
-          ]),
-          `plain Worker '${scriptName}'`,
-        );
-        const tenantTag = plainText.get('DEPLOYMENT_TENANT');
-        const environment = plainText.get('FLEET_ENVIRONMENT');
-        const resourceRole = plainText.get('FLEET_RESOURCE_ROLE');
-        const resourceGroupId = plainText.get('FLEET_RESOURCE_GROUP');
-        const schemaVersion = Number(plainText.get('FLEET_SCHEMA_VERSION'));
-        const scriptZoneRoutes = zoneRoutes.filter(
-          (route) => route.scriptName === scriptName,
-        );
-        if (
-          !tenantTag ||
-          !environment ||
-          !Number.isSafeInteger(schemaVersion)
-        ) {
-          throw new Error('active Worker identity settings are missing');
-        }
-        if (
-          (resourceRole === 'platform-state' ||
-            resourceRole === 'deployment-egress') &&
-          (subdomain.enabled ||
-            subdomain.previews_enabled ||
-            scriptZoneRoutes.length > 0)
-        ) {
-          findings.push({
-            tenantTag,
-            environment,
-            kind: 'incomplete-deployment',
-            detail: `trusted Worker '${scriptName}' is publicly reachable on workers.dev, a preview URL, or a zone route`,
-          });
-        }
-        plainIdentities.set(scriptName, { tenantTag, environment });
-        deployments.push({
-          backend: 'plain-worker',
-          ...(resourceRole === 'platform-state' ||
-          resourceRole === 'deployment-egress'
-            ? { resourceRole, resourceGroupId }
-            : {}),
-          scriptName,
-          tenantTag,
-          environment,
-          databaseIds,
-          durableObjectBindings,
-          serviceBindings,
-          queueProducerBindings,
-          kvNamespaceBindings,
-          r2BucketBindings,
-          secretNames,
-          plainTextBindings: Object.fromEntries(plainText),
-          routeHostnames: customDomains
-            .filter((domain) => domain.service === scriptName)
-            .map((domain) => domain.hostname),
-          zoneRoutes: scriptZoneRoutes.map(
-            ({ scriptName: _scriptName, ...route }) => route,
-          ),
-          artifactVersion,
-          ...(plainText.get('FLEET_SPEC_DIGEST')
-            ? { desiredSpecDigest: plainText.get('FLEET_SPEC_DIGEST') }
-            : {}),
-          schemaVersion,
-        });
-      } catch (error) {
-        findings.push({
-          tenantTag: 'unknown',
-          environment: 'unknown',
-          kind: 'incomplete-deployment',
-          detail: `plain Worker '${scriptName}' could not be inventoried: ${String(error)}`,
-        });
-      }
-    }
-    for (const domain of customDomains) {
-      const identity = plainIdentities.get(domain.service);
-      routes.push({
-        backend: 'plain-worker',
-        surface: 'custom-domain',
-        hostname: domain.hostname,
-        scriptName: domain.service,
-        tenantTag: identity?.tenantTag ?? 'unknown',
-        environment: identity?.environment ?? 'unknown',
-      });
-      if (!identity) {
-        findings.push({
-          tenantTag: 'unknown',
-          environment: 'unknown',
-          kind: 'stale-route',
-          detail: `custom domain '${domain.hostname}' points to a missing or incomplete plain Worker '${domain.service}'`,
-        });
-      }
-    }
-    for (const route of zoneRoutes) {
-      const identity = plainIdentities.get(route.scriptName);
-      routes.push({
-        backend: 'plain-worker',
-        surface: 'zone-route',
-        zoneId: route.zoneId,
-        routeId: route.routeId,
-        hostname: route.pattern,
-        scriptName: route.scriptName,
-        tenantTag: identity?.tenantTag ?? 'unknown',
-        environment: identity?.environment ?? 'unknown',
-      });
-      findings.push({
-        tenantTag: identity?.tenantTag ?? 'unknown',
-        environment: identity?.environment ?? 'unknown',
-        kind: 'stale-route',
-        detail: `zone route '${route.pattern}' exposes plain Worker '${route.scriptName}'`,
-      });
-    }
-
-    const databaseIds: string[] = [];
-    for await (const database of this.#client.d1.database.list({
-      account_id: this.#accountId,
-    })) {
-      if (
-        database.uuid &&
-        database.name?.startsWith(options.databaseNamePrefix)
-      ) {
-        databaseIds.push(database.uuid);
-      }
-    }
-    const namespaceIds: string[] = [];
-    const registeredScriptNames = new Set(
-      registrations.map((registration) => registration.scriptName),
-    );
-    for await (const namespace of this.#client.durableObjects.namespaces.list({
-      account_id: this.#accountId,
-    })) {
-      if (
-        namespace.id &&
-        namespace.script &&
-        (registeredScriptNames.has(namespace.script) ||
-          namespace.script.startsWith(options.scriptNamePrefix))
-      ) {
-        namespaceIds.push(namespace.id);
-      }
-    }
-    const r2Buckets: Array<
-      NonNullable<FleetResourceInventory['r2Buckets']>[number]
-    > = [];
-    for (const jurisdiction of options.includeR2Buckets
-      ? (['default', 'eu', 'fedramp'] as const)
-      : []) {
-      let startAfter: string | undefined;
-      for (;;) {
-        const page = await this.#client.r2.buckets.list({
-          account_id: this.#accountId,
-          jurisdiction,
-          name_contains: options.scriptNamePrefix,
-          order: 'name',
-          direction: 'asc',
-          per_page: 1000,
-          ...(startAfter ? { start_after: startAfter } : {}),
-        });
-        const buckets = page.buckets ?? [];
-        for (const bucket of buckets) {
-          if (!bucket.name?.startsWith(options.scriptNamePrefix)) continue;
-          if (
-            bucket.jurisdiction !== undefined &&
-            bucket.jurisdiction !== jurisdiction
-          ) {
-            throw new Error(`R2 bucket '${bucket.name}' changed jurisdiction`);
-          }
-          if (
-            !bucket.creation_date ||
-            !Number.isFinite(Date.parse(bucket.creation_date))
-          ) {
-            throw new Error(
-              `R2 bucket '${bucket.name}' has no valid creation date`,
-            );
-          }
-          r2Buckets.push({
-            bucketName: bucket.name,
-            jurisdiction,
-            creationDate: new Date(bucket.creation_date).toISOString(),
-          });
-        }
-        if (buckets.length < 1000) break;
-        const last = buckets.at(-1)?.name;
-        if (!last || last === startAfter) {
-          throw new Error('R2 bucket inventory pagination did not advance');
-        }
-        startAfter = last;
-      }
-    }
+  /**
+   * Builds the narrow provider seam the bounded inventory engine drives. Stages
+   * are stateless and re-read their prerequisites, so every listing is memoized
+   * for the lifetime of ONE context; without that the in-memory drain would
+   * repeat provider requests the frozen baseline pins.
+   */
+  #fleetInventoryDeps(): CloudflareFleetInventoryDeps {
+    const pending = new Map<string, Promise<unknown>>();
+    /** Caches one provider listing for the lifetime of a single context, which
+     * is one bounded run or one `collectFleetInventory` call. */
+    const memoizePerContext = <Value>(
+      key: string,
+      compute: () => Promise<Value>,
+    ): Promise<Value> => {
+      const existing = pending.get(key);
+      if (existing !== undefined) return existing as Promise<Value>;
+      const started = compute();
+      pending.set(key, started);
+      return started;
+    };
+    const dispatchPages = new Map<string, Response>();
+    const attachmentScan: CloudflareWorkerAttachmentScanContext = {
+      ...this.#attachmentScan,
+      requestDispatchScriptPage: async (input) => {
+        const key = `${input.namespace}\u0000${input.cursor ?? ''}\u0000${input.perPage}`;
+        const cached = dispatchPages.get(key);
+        if (cached !== undefined) return cached.clone();
+        const response =
+          await this.#attachmentScan.requestDispatchScriptPage(input);
+        // Only a successful page is reusable; a 429 or 5xx must still reach the
+        // provider again so the shared retry contract keeps its parity.
+        if (response.ok) dispatchPages.set(key, response.clone());
+        return response;
+      },
+    };
     return {
-      findings,
-      ...(options.hostRoutingKvId
-        ? { hostRoutingKvId: options.hostRoutingKvId }
-        : {}),
-      dispatchScriptCount,
-      ...(dispatchNamespaceInventory
-        ? { dispatchNamespace: dispatchNamespaceInventory }
-        : {}),
-      scriptRegistrations: registrations.map(
-        ({ keyOwned: _keyOwned, ...registration }) => registration,
-      ),
-      deployments,
-      databaseIds,
-      namespaceIds,
-      r2Buckets,
-      routes,
+      attachmentScan,
+      dispatchNamespace: () =>
+        this.#requireDispatchNamespace('collectFleetInventory'),
+      isDispatchCapabilityError: (error) =>
+        error instanceof CloudflarePlaneCapabilityError,
+      listHostRoutingKeys: async ({ namespaceId }) =>
+        memoizePerContext(`kv-keys:${namespaceId}`, async () => {
+          const keys: { name?: string }[] = [];
+          for await (const key of this.#collectBounded(
+            this.#inventoryProofClient.kv.namespaces.keys.list(namespaceId, {
+              account_id: this.#accountId,
+            }),
+            'host-routing KV key inventory',
+          )) {
+            keys.push({
+              ...(key.name === undefined ? {} : { name: key.name }),
+            });
+          }
+          return { keys };
+        }),
+      readHostRoutingValue: async ({ namespaceId, keyName }) =>
+        memoizePerContext(`kv-value:${namespaceId}\u0000${keyName}`, () =>
+          this.#readHostRouting(namespaceId, keyName),
+        ),
+      inspectDispatchWorker: async ({ scriptName }) =>
+        memoizePerContext(`dispatch-worker:${scriptName}`, () =>
+          this.inspectDispatchWorker(scriptName),
+        ),
+      getDispatchNamespace: async ({ namespace }) =>
+        memoizePerContext(`dispatch-namespace:${namespace}`, () =>
+          this.#client.workersForPlatforms.dispatch.namespaces.get(namespace, {
+            account_id: this.#accountId,
+          }),
+        ),
+      listCustomDomains: async () =>
+        memoizePerContext('custom-domains', async () => {
+          const domains: { hostname: string; service: string }[] = [];
+          for await (const domain of this.#collectBounded(
+            this.#inventoryProofClient.workers.domains.list({
+              account_id: this.#accountId,
+            }),
+            'custom domain inventory',
+          )) {
+            if (
+              !readStringField(domain, 'hostname') ||
+              !readStringField(domain, 'service')
+            )
+              throw new Error(
+                'custom domain inventory has an invalid hostname or service',
+              );
+            domains.push({
+              hostname: domain.hostname,
+              service: domain.service,
+            });
+          }
+          return { domains };
+        }),
+      listWorkerRouteZoneIds: async () =>
+        memoizePerContext('zone-ids', () => this.#workerRouteZoneIds()),
+      listZoneRoutes: async ({ zoneId }) =>
+        memoizePerContext(`zone-routes:${zoneId}`, async () => {
+          const routes: {
+            id?: string;
+            pattern?: string;
+            script?: string;
+          }[] = [];
+          for await (const route of this.#collectBounded(
+            this.#inventoryProofClient.workers.routes.list({ zone_id: zoneId }),
+            'Worker zone-route inventory',
+          )) {
+            const script = readField(route, 'script');
+            if (
+              script !== undefined &&
+              script !== null &&
+              typeof script !== 'string'
+            )
+              throw new Error(
+                'Worker zone-route inventory has an invalid script',
+              );
+            routes.push({
+              ...(route.id === undefined ? {} : { id: route.id }),
+              ...(route.pattern === undefined
+                ? {}
+                : { pattern: route.pattern }),
+              ...(typeof script === 'string' ? { script } : {}),
+            });
+          }
+          return { routes };
+        }),
+      listOrdinaryScripts: async () =>
+        memoizePerContext('ordinary-scripts', async () => {
+          const scripts: { id?: string }[] = [];
+          for await (const script of this.#collectBounded(
+            this.#inventoryProofClient.workers.scripts.list({
+              account_id: this.#accountId,
+            }),
+            'ordinary Worker script inventory',
+          )) {
+            const id = readStringField(script, 'id');
+            if (!id)
+              throw new Error(
+                'ordinary Worker script inventory has an invalid ID',
+              );
+            scripts.push({ id });
+          }
+          return { scripts };
+        }),
+      readOrdinaryScriptDetail: async ({ scriptName }) =>
+        memoizePerContext(`ordinary-detail:${scriptName}`, () =>
+          this.#readOrdinaryScriptDetail(scriptName),
+        ),
+      listDatabases: async () =>
+        memoizePerContext('d1-databases', async () => {
+          const databases: { uuid: string; name: string }[] = [];
+          for await (const database of this.#collectBounded(
+            this.#inventoryProofClient.d1.database.list({
+              account_id: this.#accountId,
+            }),
+            'D1 database inventory',
+            MAX_DATABASE_INVENTORY,
+          )) {
+            const uuid = readStringField(database, 'uuid');
+            const name = readStringField(database, 'name');
+            if (!uuid || !name)
+              throw new Error(
+                'D1 database inventory has an invalid uuid or name',
+              );
+            databases.push({ uuid, name });
+          }
+          return { databases };
+        }),
+      listDurableObjectNamespaces: async () =>
+        memoizePerContext('do-namespaces', async () => {
+          const namespaces: { id: string; script: string }[] = [];
+          for await (const namespace of this.#collectBounded(
+            this.#inventoryProofClient.durableObjects.namespaces.list({
+              account_id: this.#accountId,
+            }),
+            'Durable Object namespace inventory',
+          )) {
+            const id = readStringField(namespace, 'id');
+            const script = readStringField(namespace, 'script');
+            if (!id || !script)
+              throw new Error(
+                'Durable Object namespace inventory has an invalid ID or script association',
+              );
+            namespaces.push({ id, script });
+          }
+          return { namespaces };
+        }),
+      listR2Buckets: async ({ jurisdiction, namePrefix, startAfter }) =>
+        memoizePerContext(
+          `r2:${jurisdiction}\u0000${startAfter ?? ''}\u0000${namePrefix}`,
+          async () => {
+            const page = await this.#client.r2.buckets.list({
+              account_id: this.#accountId,
+              jurisdiction,
+              name_contains: namePrefix,
+              order: 'name',
+              direction: 'asc',
+              per_page: R2_INVENTORY_PAGE_SIZE,
+              ...(startAfter ? { start_after: startAfter } : {}),
+            });
+            return { buckets: page.buckets === undefined ? [] : page.buckets };
+          },
+        ),
+    };
+  }
+
+  /**
+   * Resolves one ordinary Worker's active artifact exactly as the single-pass
+   * drain did inside its per-script `try`, so an unsupported binding or a
+   * missing active version still becomes the `incomplete-deployment` finding.
+   */
+  async #readOrdinaryScriptDetail(
+    scriptName: string,
+  ): Promise<FleetInventoryOrdinaryScriptDetail> {
+    const deploymentList = await this.#client.workers.scripts.deployments.list(
+      scriptName,
+      { account_id: this.#accountId },
+    );
+    const artifactVersion = exactActiveVersionId(
+      deploymentList.deployments[0],
+      `ordinary Worker '${scriptName}'`,
+    );
+    const [activeVersion, subdomain, secretNames] = await Promise.all([
+      this.#client.workers.scripts.versions.get(artifactVersion, {
+        account_id: this.#accountId,
+        script_name: scriptName,
+      }),
+      ordinaryWorkerSubdomain(this.#ordinary, scriptName),
+      ordinaryWorkerSecretNames(this.#ordinary, scriptName),
+    ]);
+    const bindings =
+      activeVersion.resources.bindings === undefined
+        ? []
+        : activeVersion.resources.bindings;
+    assertSupportedProviderBindings(
+      bindings,
+      new Set([
+        'd1',
+        'durable_object_namespace',
+        'service',
+        'queue',
+        'kv_namespace',
+        'dispatch_namespace',
+        'r2_bucket',
+        'plain_text',
+        'secret_text',
+      ]),
+      `plain Worker '${scriptName}'`,
+    );
+    return {
+      artifactVersion,
+      bindings: bindings as readonly FleetInventoryProviderBinding[],
+      subdomainEnabled: subdomain.enabled,
+      previewsEnabled: subdomain.previews_enabled,
+      secretNames,
+    };
+  }
+
+  #fleetInventoryContext(): FleetInventoryProviderContext {
+    const deps = this.#fleetInventoryDeps();
+    return {
+      advanceStage: (input) =>
+        advanceCloudflareFleetInventoryStage(deps, input),
     };
   }
 
   async hasDurableObjectNamespace(namespaceId: string): Promise<boolean> {
     if (!namespaceId) throw new Error('namespaceId is required');
-    for await (const namespace of this.#client.durableObjects.namespaces.list({
-      account_id: this.#accountId,
-    })) {
-      if (namespace.id === namespaceId) return true;
+    return (
+      (await this.existingDurableObjectNamespaceIds([namespaceId])).length > 0
+    );
+  }
+
+  /**
+   * Returns the requested namespace IDs that still exist after one complete,
+   * bounded account inventory traversal.
+   */
+  async existingDurableObjectNamespaceIds(
+    ids: readonly string[],
+  ): Promise<readonly string[]> {
+    const requestedIds = canonicalDurableObjectNamespaceIds(ids);
+    if (requestedIds.length === 0) return [];
+    const requested = new Set(requestedIds);
+    const existing = new Set<string>();
+    for await (const namespace of this.#collectBounded(
+      this.#inventoryProofClient.durableObjects.namespaces.list({
+        account_id: this.#accountId,
+      }),
+      'Durable Object namespace inventory',
+    )) {
+      const id = readStringField(namespace, 'id');
+      if (!id)
+        throw new Error('Durable Object namespace inventory has an invalid ID');
+      if (requested.has(id)) existing.add(id);
     }
-    return false;
+    return [...existing].sort();
   }
 
   async listDurableObjectNamespaces(
@@ -2048,12 +1952,19 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   ): Promise<readonly string[]> {
     if (!scriptName) throw new Error('scriptName is required');
     const namespaceIds: string[] = [];
-    for await (const namespace of this.#client.durableObjects.namespaces.list({
-      account_id: this.#accountId,
-    })) {
-      if (namespace.script === scriptName && namespace.id) {
-        namespaceIds.push(namespace.id);
-      }
+    for await (const namespace of this.#collectBounded(
+      this.#inventoryProofClient.durableObjects.namespaces.list({
+        account_id: this.#accountId,
+      }),
+      'Durable Object namespace inventory',
+    )) {
+      const id = readStringField(namespace, 'id');
+      const script = readStringField(namespace, 'script');
+      if (!id || !script)
+        throw new Error(
+          'Durable Object namespace inventory has an invalid ID or script association',
+        );
+      if (script === scriptName) namespaceIds.push(id);
     }
     return [...new Set(namespaceIds)].sort();
   }
@@ -2073,22 +1984,26 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       ),
     );
     return this.#schedule(async () => {
+      const metadata = JSON.stringify({
+        bindings: spec.bindings,
+        compatibility_date: spec.compatibilityDate,
+        compatibility_flags: spec.compatibilityFlags
+          ? [...spec.compatibilityFlags]
+          : undefined,
+        keep_bindings: ['secret_text'],
+        main_module: spec.mainModule,
+        migrations: spec.migrations,
+        tags: spec.tags ? [...spec.tags] : undefined,
+      });
       const result = await this.#client.workers.scripts.update(
         spec.scriptName,
         {
           account_id: this.#accountId,
-          files,
-          metadata: {
-            bindings: spec.bindings as never,
-            compatibility_date: spec.compatibilityDate,
-            compatibility_flags: spec.compatibilityFlags
-              ? [...spec.compatibilityFlags]
-              : undefined,
-            keep_bindings: ['secret_text'],
-            main_module: spec.mainModule,
-            migrations: spec.migrations as never,
-            tags: spec.tags ? [...spec.tags] : undefined,
-          },
+          metadata: metadata as never,
+        },
+        {
+          body: namedWorkerUploadBody(files, metadata),
+          headers: { 'Content-Type': null },
         },
       );
       if (!result.etag) {
@@ -2104,11 +2019,13 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   ): Promise<void> {
     await this.#schedule(async () => {
       const currentSecretNames: string[] = [];
-      for await (const secret of this.#client.workers.scripts.secrets.list(
-        scriptName,
-        { account_id: this.#accountId },
+      for await (const secret of this.#collectBounded(
+        this.#inventoryProofClient.workers.scripts.secrets.list(scriptName, {
+          account_id: this.#accountId,
+        }),
+        'ordinary Worker secret inventory',
       )) {
-        if (!secret.name) {
+        if (!readStringField(secret, 'name')) {
           throw new Error(
             `control Worker '${scriptName}' returned a secret without a name`,
           );
@@ -2135,11 +2052,18 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
         });
       }
       const secretNames: string[] = [];
-      for await (const secret of this.#client.workers.scripts.secrets.list(
-        scriptName,
-        { account_id: this.#accountId },
+      for await (const secret of this.#collectBounded(
+        this.#inventoryProofClient.workers.scripts.secrets.list(scriptName, {
+          account_id: this.#accountId,
+        }),
+        'ordinary Worker secret inventory',
       )) {
-        if (secret.name) secretNames.push(secret.name);
+        const name = readStringField(secret, 'name');
+        if (!name)
+          throw new Error(
+            'ordinary Worker secret inventory has an invalid name',
+          );
+        secretNames.push(name);
       }
       secretNames.sort();
       if (JSON.stringify(secretNames) !== JSON.stringify(desiredSecretNames)) {
@@ -2188,12 +2112,13 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
             account_id: this.#accountId,
             script_name: scriptName,
           }),
-          this.#client.workers.scripts.subdomain.get(scriptName, {
-            account_id: this.#accountId,
-          }),
-          this.#ordinaryWorkerSecretNames(scriptName),
+          ordinaryWorkerSubdomain(this.#ordinary, scriptName),
+          ordinaryWorkerSecretNames(this.#ordinary, scriptName),
         ]);
-        const bindings = activeVersion.resources.bindings ?? [];
+        const bindings =
+          activeVersion.resources.bindings === undefined
+            ? []
+            : activeVersion.resources.bindings;
         const databaseIds = bindings.flatMap((binding) =>
           binding.type === 'd1' && binding.database_id
             ? [binding.database_id]
@@ -2297,19 +2222,46 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
           `control Worker '${scriptName}'`,
         );
         const routeHostnames: string[] = [];
-        for await (const domain of this.#client.workers.domains.list({
-          account_id: this.#accountId,
-        })) {
-          if (domain.service === scriptName)
+        for await (const domain of this.#collectBounded(
+          this.#inventoryProofClient.workers.domains.list({
+            account_id: this.#accountId,
+          }),
+          'custom domain inventory',
+        )) {
+          if (!readStringField(domain, 'service'))
+            throw new Error('custom domain inventory has an invalid service');
+          if (domain.service === scriptName) {
+            if (!readStringField(domain, 'hostname'))
+              throw new Error(
+                'custom domain inventory has an invalid hostname',
+              );
             routeHostnames.push(domain.hostname);
+          }
         }
         const zoneRoutes: import('./types.js').WorkerZoneRoute[] = [];
         const workerRouteZoneIds = await this.#workerRouteZoneIds();
         for (const zoneId of workerRouteZoneIds) {
-          for await (const route of this.#client.workers.routes.list({
-            zone_id: zoneId,
-          })) {
-            if (route.script !== scriptName) continue;
+          for await (const route of this.#collectBounded(
+            this.#inventoryProofClient.workers.routes.list({ zone_id: zoneId }),
+            'Worker zone-route inventory',
+          )) {
+            const script = readField(route, 'script');
+            if (
+              script !== undefined &&
+              script !== null &&
+              typeof script !== 'string'
+            )
+              throw new Error(
+                'Worker zone-route inventory has an invalid script',
+              );
+            if (script !== scriptName) continue;
+            if (
+              !readStringField(route, 'id') ||
+              !readStringField(route, 'pattern')
+            )
+              throw new Error(
+                'Worker zone-route inventory has an invalid ID or pattern',
+              );
             zoneRoutes.push({
               zoneId,
               routeId: route.id,
@@ -2329,8 +2281,8 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
           secretNames,
           plainTextBindings,
           providerBindingIdentities,
-          workersDevEnabled: subdomain.enabled === true,
-          previewUrlsEnabled: subdomain.previews_enabled === true,
+          workersDevEnabled: subdomain.enabled,
+          previewUrlsEnabled: subdomain.previews_enabled,
           routeHostnames,
           zoneRoutes,
         };
@@ -2351,11 +2303,16 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       const listNames = async (): Promise<string[]> => {
         try {
           const names: string[] = [];
-          for await (const secret of this.#client.workers.scripts.secrets.list(
-            scriptName,
-            { account_id: this.#accountId },
+          for await (const secret of this.#collectBounded(
+            this.#inventoryProofClient.workers.scripts.secrets.list(
+              scriptName,
+              {
+                account_id: this.#accountId,
+              },
+            ),
+            'ordinary Worker secret inventory',
           )) {
-            if (!secret.name) {
+            if (!readStringField(secret, 'name')) {
               throw new Error(
                 `control Worker '${scriptName}' returned a secret without a name`,
               );
@@ -2401,10 +2358,17 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       } catch (error) {
         if (!isNotFound(error)) throw error;
       }
-      for await (const domain of this.#client.workers.domains.list({
-        account_id: this.#accountId,
-      })) {
-        if (domain.service !== scriptName || !domain.id) continue;
+      for await (const domain of this.#collectBounded(
+        this.#inventoryProofClient.workers.domains.list({
+          account_id: this.#accountId,
+        }),
+        'custom domain inventory',
+      )) {
+        if (!readStringField(domain, 'service'))
+          throw new Error('custom domain inventory has an invalid service');
+        if (domain.service !== scriptName) continue;
+        if (!readStringField(domain, 'id'))
+          throw new Error('custom domain inventory has an invalid ID');
         try {
           await this.#client.workers.domains.delete(domain.id, {
             account_id: this.#accountId,
@@ -2414,10 +2378,22 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
         }
       }
       for (const zoneId of workerRouteZoneIds) {
-        for await (const route of this.#client.workers.routes.list({
-          zone_id: zoneId,
-        })) {
-          if (route.script !== scriptName) continue;
+        for await (const route of this.#collectBounded(
+          this.#inventoryProofClient.workers.routes.list({ zone_id: zoneId }),
+          'Worker zone-route inventory',
+        )) {
+          const script = readField(route, 'script');
+          if (
+            script !== undefined &&
+            script !== null &&
+            typeof script !== 'string'
+          )
+            throw new Error(
+              'Worker zone-route inventory has an invalid script',
+            );
+          if (script !== scriptName) continue;
+          if (!readStringField(route, 'id'))
+            throw new Error('Worker zone-route inventory has an invalid ID');
           try {
             await this.#client.workers.routes.delete(route.id, {
               zone_id: zoneId,
@@ -2434,93 +2410,27 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     scriptName: string,
     fence: ExternalMutationFence,
   ): Promise<void> {
-    await this.withMutationFence(fence, () =>
-      this.#schedule(async () => {
-        try {
-          await this.#client.workers.scripts.subdomain.create(scriptName, {
-            account_id: this.#accountId,
-            enabled: false,
-            previews_enabled: false,
-          });
-        } catch (error) {
-          if (!isNotFound(error)) throw error;
-          return;
-        }
-        const subdomain = await (async () => {
-          try {
-            return await this.#client.workers.scripts.subdomain.get(
-              scriptName,
-              { account_id: this.#accountId },
-            );
-          } catch (error) {
-            if (!isNotFound(error)) throw error;
-            return undefined;
-          }
-        })();
-        if (!subdomain) return;
-        if (subdomain.enabled === true || subdomain.previews_enabled === true) {
-          throw new Error(
-            `ordinary Worker '${scriptName}' retains public subdomain ingress`,
-          );
-        }
-      }),
-    );
+    return disableOrdinaryWorkerPublicAccess(this.#ordinary, scriptName, fence);
   }
 
   async listCustomDomains(): Promise<
     readonly OrdinaryWorkerFootprint['customDomains'][number][]
   > {
-    return this.#schedule(async () => {
-      const domains: Array<OrdinaryWorkerFootprint['customDomains'][number]> =
-        [];
-      for await (const domain of this.#client.workers.domains.list({
-        account_id: this.#accountId,
-      })) {
-        if (!domain.id || !domain.hostname || !domain.service) {
-          throw new Error(
-            'Cloudflare returned incomplete custom-domain metadata',
-          );
-        }
-        domains.push({
-          id: domain.id,
-          hostname: domain.hostname,
-          service: domain.service,
-        });
-      }
-      return domains;
-    });
+    return listCustomDomains(this.#ordinary);
   }
 
   attachCustomDomain(
     target: { readonly hostname: string; readonly service: string },
     fence: ExternalMutationFence,
   ): Promise<void> {
-    return this.withMutationFence(fence, () =>
-      this.#schedule(async () => {
-        await this.#client.workers.domains.update({
-          account_id: this.#accountId,
-          hostname: target.hostname,
-          service: target.service,
-        });
-      }),
-    );
+    return attachCustomDomain(this.#ordinary, target, fence);
   }
 
   detachCustomDomain(
     domainId: string,
     fence: ExternalMutationFence,
   ): Promise<void> {
-    return this.withMutationFence(fence, () =>
-      this.#schedule(async () => {
-        try {
-          await this.#client.workers.domains.delete(domainId, {
-            account_id: this.#accountId,
-          });
-        } catch (error) {
-          if (!isNotFound(error)) throw error;
-        }
-      }),
-    );
+    return detachCustomDomain(this.#ordinary, domainId, fence);
   }
 
   async inspectActiveWorkerRoute(scriptName: string): Promise<
@@ -2530,101 +2440,13 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       }>
     | undefined
   > {
-    return this.#schedule(async () => {
-      let deploymentList: Awaited<
-        ReturnType<CloudflareSdk['workers']['scripts']['deployments']['list']>
-      >;
-      try {
-        deploymentList = await this.#client.workers.scripts.deployments.list(
-          scriptName,
-          { account_id: this.#accountId },
-        );
-      } catch (error) {
-        if (isNotFound(error)) return undefined;
-        throw error;
-      }
-      const artifactVersion = attestedActiveVersionId(
-        deploymentList.deployments[0],
-        scriptName,
-      );
-      const version = await this.#client.workers.scripts.versions.get(
-        artifactVersion,
-        { account_id: this.#accountId, script_name: scriptName },
-      );
-      const specDigest = (version.resources.bindings ?? []).flatMap(
-        (binding) =>
-          binding.type === 'plain_text' && binding.name === 'FLEET_SPEC_DIGEST'
-            ? [binding.text]
-            : [],
-      )[0];
-      return {
-        artifactVersion,
-        specDigest: typeof specDigest === 'string' ? specDigest : undefined,
-      };
-    });
+    return inspectActiveWorkerRoute(this.#ordinary, scriptName);
   }
 
   async inspectOrdinaryWorkerFootprint(
     scriptName: string,
   ): Promise<OrdinaryWorkerFootprint> {
-    return this.#schedule(async () => {
-      let scriptPresent = false;
-      for await (const script of this.#client.workers.scripts.list({
-        account_id: this.#accountId,
-      })) {
-        if (script.id === scriptName) scriptPresent = true;
-      }
-      const customDomains: Array<{
-        id: string;
-        hostname: string;
-        service: string;
-      }> = [];
-      for await (const domain of this.#client.workers.domains.list({
-        account_id: this.#accountId,
-      })) {
-        if (domain.service !== scriptName) continue;
-        if (!domain.id || !domain.hostname) {
-          throw new Error(
-            `ordinary Worker '${scriptName}' has incomplete custom-domain metadata`,
-          );
-        }
-        customDomains.push({
-          id: domain.id,
-          hostname: domain.hostname,
-          service: domain.service,
-        });
-      }
-      const zoneRoutes: import('./types.js').WorkerZoneRoute[] = [];
-      for (const zoneId of await this.#workerRouteZoneIds()) {
-        for await (const route of this.#client.workers.routes.list({
-          zone_id: zoneId,
-        })) {
-          if (route.script !== scriptName) continue;
-          if (!route.id || !route.pattern) {
-            throw new Error(
-              `ordinary Worker '${scriptName}' has incomplete zone-route metadata`,
-            );
-          }
-          zoneRoutes.push({
-            zoneId,
-            routeId: route.id,
-            pattern: route.pattern,
-          });
-        }
-      }
-      const subdomain = scriptPresent
-        ? await this.#client.workers.scripts.subdomain.get(scriptName, {
-            account_id: this.#accountId,
-          })
-        : undefined;
-      return {
-        scriptPresent,
-        workersDevEnabled: subdomain?.enabled === true,
-        previewUrlsEnabled: subdomain?.previews_enabled === true,
-        customDomains,
-        zoneRoutes,
-      };
-    });
+    return inspectOrdinaryWorkerFootprint(this.#ordinary, scriptName);
   }
 
   async deleteControlWorker(scriptName: string): Promise<void> {
@@ -2646,9 +2468,10 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   }): Promise<void> {
     await this.#schedule(async () => {
       const matches = [];
-      for await (const queue of this.#client.queues.list({
-        account_id: this.#accountId,
-      })) {
+      for await (const queue of this.#collectBounded(
+        this.#inventoryProofClient.queues.list({ account_id: this.#accountId }),
+        'queue inventory',
+      )) {
         if (queue.queue_name === options.queueName && queue.queue_id) {
           matches.push(queue);
         }
@@ -2661,9 +2484,12 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       const queueId = matches[0]?.queue_id;
       if (!queueId) throw new Error('audit queue result has no queue_id');
       const consumers = [];
-      for await (const consumer of this.#client.queues.consumers.list(queueId, {
-        account_id: this.#accountId,
-      })) {
+      for await (const consumer of this.#collectBounded(
+        this.#inventoryProofClient.queues.consumers.list(queueId, {
+          account_id: this.#accountId,
+        }),
+        'queue consumer inventory',
+      )) {
         consumers.push(consumer);
       }
       if (consumers.length > 1) {
@@ -2711,9 +2537,12 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
         );
       }
       const finalConsumers = [];
-      for await (const consumer of this.#client.queues.consumers.list(queueId, {
-        account_id: this.#accountId,
-      })) {
+      for await (const consumer of this.#collectBounded(
+        this.#inventoryProofClient.queues.consumers.list(queueId, {
+          account_id: this.#accountId,
+        }),
+        'queue consumer inventory',
+      )) {
         finalConsumers.push(consumer);
       }
       if (
@@ -2730,10 +2559,13 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
 
   async createDatabase(name: string): Promise<DatabaseReference> {
     return this.#schedule(async () => {
-      const database = await this.#client.d1.database.create({
-        account_id: this.#accountId,
-        name,
-      });
+      const database = await this.#client.d1.database.create(
+        {
+          account_id: this.#accountId,
+          name,
+        },
+        { maxRetries: 0 },
+      );
       if (!database.uuid || database.name !== name) {
         throw new Error(
           `Cloudflare returned an invalid D1 create result for '${name}'`,
@@ -2751,15 +2583,22 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     const params = d1RestParameters(bindings, 'D1 query');
     return this.#schedule(async () => {
       const rows: Readonly<Record<string, unknown>>[] = [];
-      for await (const result of this.#client.d1.database.query(databaseId, {
-        account_id: this.#accountId,
-        sql,
-        params,
-      })) {
+      for await (const result of this.#collectBounded(
+        this.#client.d1.database.query(
+          databaseId,
+          {
+            account_id: this.#accountId,
+            sql,
+            params,
+          },
+          { maxRetries: 0 },
+        ),
+        'D1 query result inventory',
+      )) {
         if (result.success === false) {
           throw new Error(`D1 query failed for database '${databaseId}'`);
         }
-        for (const row of result.results ?? []) {
+        for (const row of result.results === undefined ? [] : result.results) {
           if (row && typeof row === 'object') {
             rows.push(row as Readonly<Record<string, unknown>>);
           }
@@ -2781,10 +2620,17 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       params: d1RestParameters(statement.bindings ?? [], 'D1 batch'),
     }));
     await this.#schedule(async () => {
-      for await (const result of this.#client.d1.database.query(databaseId, {
-        account_id: this.#accountId,
-        batch,
-      })) {
+      for await (const result of this.#collectBounded(
+        this.#client.d1.database.query(
+          databaseId,
+          {
+            account_id: this.#accountId,
+            batch,
+          },
+          { maxRetries: 0 },
+        ),
+        'D1 batch result inventory',
+      )) {
         if (result.success === false) {
           throw new Error(`D1 batch failed for database '${databaseId}'`);
         }
@@ -2798,10 +2644,27 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     physicalScriptName = spec.scriptName,
     platformResources?: import('./types.js').ExternalPlatformResources,
     application?: import('./types.js').ApplicationBindingTopology,
+    maintenanceCapabilityPublicKey?: string,
   ): Promise<{ artifactVersion: string }> {
+    const dispatchNamespace = this.#requireDispatchNamespace(
+      'uploadDispatchWorker',
+    );
     if (spec.authoredBy === 'external' && !platformResources) {
       throw new Error('external dispatch upload requires platform resources');
     }
+    if (
+      maintenanceCapabilityPublicKey !== undefined &&
+      spec.authoredBy !== 'platform'
+    )
+      throw new Error(
+        'catalog maintenance enrollment requires a platform-authored Worker',
+      );
+    const catalogPublicKey =
+      maintenanceCapabilityPublicKey === undefined
+        ? undefined
+        : canonicalMaintenanceCapabilityPublicKey(
+            maintenanceCapabilityPublicKey,
+          );
     const bindings: Array<Record<string, unknown>> = [
       { name: 'DB', type: 'd1', database_id: database.id },
       { name: 'DEPLOYMENT_TENANT', type: 'plain_text', text: spec.tenantTag },
@@ -2816,12 +2679,31 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
         type: 'plain_text',
         text: deploymentSpecDigest(spec),
       },
-      ...(spec.authoredBy === 'external'
+      ...(spec.authoredBy === 'external' || catalogPublicKey !== undefined
         ? [
             {
               name: 'FLEET_MAINTENANCE_CAPABILITIES',
               type: 'plain_text',
               text: 'required',
+            },
+          ]
+        : []),
+      ...(catalogPublicKey !== undefined
+        ? [
+            {
+              name: 'FLEET_MAINTENANCE_CAPABILITY_PUBLIC_KEY',
+              type: 'plain_text',
+              text: catalogPublicKey,
+            },
+            {
+              name: 'FLEET_DEPLOYMENT_SCRIPT',
+              type: 'plain_text',
+              text: physicalScriptName,
+            },
+            {
+              name: 'FLEET_RESOURCE_ROLE',
+              type: 'plain_text',
+              text: 'platform-catalog',
             },
           ]
         : []),
@@ -2917,39 +2799,43 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     const migrations = dispatchMigrations(spec);
 
     return this.#schedule(async () => {
-      await this.#assertUntrustedDispatchNamespace();
+      await this.#assertUntrustedDispatchNamespace(dispatchNamespace);
+      const metadata = JSON.stringify({
+        bindings,
+        compatibility_date: spec.compatibilityDate,
+        compatibility_flags: spec.compatibilityFlags
+          ? [...spec.compatibilityFlags]
+          : undefined,
+        keep_bindings: ['secret_text'],
+        limits: {
+          cpu_ms: spec.cpuLimitMs,
+          subrequests: spec.subrequestLimit,
+        },
+        main_module: spec.mainModule,
+        migrations,
+        tags: [
+          FLEET_SCRIPT_TAG,
+          `tenant:${spec.tenantTag}`,
+          `environment:${spec.environment}`,
+          `schema:${spec.schemaVersion}`,
+          `spec:${deploymentSpecDigest(spec)}`,
+          ...(spec.durableObjectMigrations.at(-1)?.tag
+            ? [`do:${spec.durableObjectMigrations.at(-1)?.tag}`]
+            : []),
+        ],
+      });
       const result =
         await this.#client.workersForPlatforms.dispatch.namespaces.scripts.update(
           physicalScriptName,
           {
             account_id: this.#accountId,
-            dispatch_namespace: this.#dispatchNamespace,
+            dispatch_namespace: dispatchNamespace,
             bindings_inherit: 'strict',
-            files,
-            metadata: {
-              bindings: bindings as never,
-              compatibility_date: spec.compatibilityDate,
-              compatibility_flags: spec.compatibilityFlags
-                ? [...spec.compatibilityFlags]
-                : undefined,
-              keep_bindings: ['secret_text'],
-              limits: {
-                cpu_ms: spec.cpuLimitMs,
-                subrequests: spec.subrequestLimit,
-              },
-              main_module: spec.mainModule,
-              migrations,
-              tags: [
-                FLEET_SCRIPT_TAG,
-                `tenant:${spec.tenantTag}`,
-                `environment:${spec.environment}`,
-                `schema:${spec.schemaVersion}`,
-                `spec:${deploymentSpecDigest(spec)}`,
-                ...(spec.durableObjectMigrations.at(-1)?.tag
-                  ? [`do:${spec.durableObjectMigrations.at(-1)?.tag}`]
-                  : []),
-              ],
-            },
+            metadata: metadata as never,
+          },
+          {
+            body: namedWorkerUploadBody(files, metadata),
+            headers: { 'Content-Type': null },
           },
         );
       if (!result.etag) {
@@ -2971,6 +2857,9 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     readonly sharedOutboundWorkerName: string;
     readonly stateEgressCredentialDigest: string;
   }): Promise<{ artifactVersion: string }> {
+    const dispatchNamespace = this.#requireDispatchNamespace(
+      'uploadNamespacedStateWorker',
+    );
     const { spec } = options;
     const scriptName = externalStateScriptName(spec);
     const resourceGroupId = externalPlatformResourceGroupId(spec);
@@ -3104,39 +2993,43 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       compatibilityFlags: options.artifact.compatibilityFlags,
     };
     return this.#schedule(async () => {
-      await this.#assertUntrustedDispatchNamespace();
+      await this.#assertUntrustedDispatchNamespace(dispatchNamespace);
+      const metadata = JSON.stringify({
+        bindings,
+        compatibility_date: options.artifact.compatibilityDate,
+        compatibility_flags: options.artifact.compatibilityFlags
+          ? [...options.artifact.compatibilityFlags]
+          : undefined,
+        keep_bindings: ['secret_text'],
+        main_module: options.artifact.mainModule,
+        migrations: dispatchMigrations(stateSpec),
+        tags: [
+          FLEET_SCRIPT_TAG,
+          'role:platform-state',
+          `group:${resourceGroupId}`,
+          `tenant:${spec.tenantTag}`,
+          `environment:${spec.environment}`,
+          `schema:${spec.schemaVersion}`,
+          `spec:${deploymentSpecDigest(spec)}`,
+          ...(spec.durableObjectMigrations.at(-1)?.tag
+            ? [`do:${spec.durableObjectMigrations.at(-1)?.tag}`]
+            : []),
+          `artifact:${options.artifactDigest}`,
+          `state-egress:${options.stateEgressCredentialDigest}`,
+        ],
+      });
       const result =
         await this.#client.workersForPlatforms.dispatch.namespaces.scripts.update(
           scriptName,
           {
             account_id: this.#accountId,
-            dispatch_namespace: this.#dispatchNamespace,
+            dispatch_namespace: dispatchNamespace,
             bindings_inherit: 'strict',
-            files,
-            metadata: {
-              bindings: bindings as never,
-              compatibility_date: options.artifact.compatibilityDate,
-              compatibility_flags: options.artifact.compatibilityFlags
-                ? [...options.artifact.compatibilityFlags]
-                : undefined,
-              keep_bindings: ['secret_text'],
-              main_module: options.artifact.mainModule,
-              migrations: dispatchMigrations(stateSpec),
-              tags: [
-                FLEET_SCRIPT_TAG,
-                'role:platform-state',
-                `group:${resourceGroupId}`,
-                `tenant:${spec.tenantTag}`,
-                `environment:${spec.environment}`,
-                `schema:${spec.schemaVersion}`,
-                `spec:${deploymentSpecDigest(spec)}`,
-                ...(spec.durableObjectMigrations.at(-1)?.tag
-                  ? [`do:${spec.durableObjectMigrations.at(-1)?.tag}`]
-                  : []),
-                `artifact:${options.artifactDigest}`,
-                `state-egress:${options.stateEgressCredentialDigest}`,
-              ],
-            },
+            metadata: metadata as never,
+          },
+          {
+            body: namedWorkerUploadBody(files, metadata),
+            headers: { 'Content-Type': null },
           },
         );
       if (!result.etag) {
@@ -3156,16 +3049,22 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       additionalSecrets?: Readonly<Record<string, string>>;
     }> = {},
   ): Promise<void> {
+    const dispatchNamespace =
+      this.#requireDispatchNamespace('putDispatchSecrets');
     await this.#schedule(async () => {
-      const scripts =
-        this.#client.workersForPlatforms.dispatch.namespaces.scripts;
       const listSecretNames = async (): Promise<string[]> => {
         const names: string[] = [];
-        for await (const secret of scripts.secrets.list(scriptName, {
-          account_id: this.#accountId,
-          dispatch_namespace: this.#dispatchNamespace,
-        })) {
-          if (!secret.name) {
+        for await (const secret of this.#collectBounded(
+          this.#inventoryProofClient.workersForPlatforms.dispatch.namespaces.scripts.secrets.list(
+            scriptName,
+            {
+              account_id: this.#accountId,
+              dispatch_namespace: dispatchNamespace,
+            },
+          ),
+          'dispatch Worker secret inventory',
+        )) {
+          if (!readStringField(secret, 'name')) {
             throw new Error(
               `dispatch Worker '${scriptName}' returned a secret without a name`,
             );
@@ -3187,7 +3086,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
         scriptName,
         {
           account_id: this.#accountId,
-          dispatch_namespace: this.#dispatchNamespace,
+          dispatch_namespace: dispatchNamespace,
           secrets: Object.fromEntries([
             ...Object.entries(desiredSecrets).map(
               ([name, text]) =>
@@ -3234,6 +3133,9 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       }
     | undefined
   > {
+    const dispatchNamespace = this.#requireDispatchNamespace(
+      'inspectDispatchWorker',
+    );
     return this.#schedule(async () => {
       try {
         const scripts =
@@ -3241,14 +3143,15 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
         const [script, settings] = await Promise.all([
           scripts.get(scriptName, {
             account_id: this.#accountId,
-            dispatch_namespace: this.#dispatchNamespace,
+            dispatch_namespace: dispatchNamespace,
           }),
           scripts.settings.get(scriptName, {
             account_id: this.#accountId,
-            dispatch_namespace: this.#dispatchNamespace,
+            dispatch_namespace: dispatchNamespace,
           }),
         ]);
-        const bindings = settings.bindings ?? [];
+        const bindings =
+          settings.bindings === undefined ? [] : settings.bindings;
         const databaseIds = bindings.flatMap((binding) =>
           binding.type === 'd1' && binding.database_id
             ? [binding.database_id]
@@ -3385,31 +3288,33 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
         );
         return inspection;
       } catch (error) {
-        if (
-          error &&
-          typeof error === 'object' &&
-          'status' in error &&
-          error.status === 404
-        ) {
-          return undefined;
-        }
+        if (isNotFound(error)) return undefined;
         throw error;
       }
     });
   }
 
   async revokeDispatchSecrets(scriptName: string): Promise<void> {
+    const dispatchNamespace = this.#requireDispatchNamespace(
+      'revokeDispatchSecrets',
+    );
     await this.#schedule(async () => {
       const scripts =
         this.#client.workersForPlatforms.dispatch.namespaces.scripts;
       const listNames = async (): Promise<string[]> => {
         try {
           const names: string[] = [];
-          for await (const secret of scripts.secrets.list(scriptName, {
-            account_id: this.#accountId,
-            dispatch_namespace: this.#dispatchNamespace,
-          })) {
-            if (!secret.name) {
+          for await (const secret of this.#collectBounded(
+            this.#inventoryProofClient.workersForPlatforms.dispatch.namespaces.scripts.secrets.list(
+              scriptName,
+              {
+                account_id: this.#accountId,
+                dispatch_namespace: dispatchNamespace,
+              },
+            ),
+            'dispatch Worker secret inventory',
+          )) {
+            if (!readStringField(secret, 'name')) {
               throw new Error(
                 `dispatch Worker '${scriptName}' returned a secret without a name`,
               );
@@ -3427,7 +3332,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
         try {
           await scripts.secrets.bulkUpdate(scriptName, {
             account_id: this.#accountId,
-            dispatch_namespace: this.#dispatchNamespace,
+            dispatch_namespace: dispatchNamespace,
             secrets: Object.fromEntries(
               current.map((name) => [name, null] as const),
             ),
@@ -3445,13 +3350,16 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   }
 
   async deleteDispatchWorker(scriptName: string): Promise<void> {
+    const dispatchNamespace = this.#requireDispatchNamespace(
+      'deleteDispatchWorker',
+    );
     await this.#schedule(async () => {
       try {
         await this.#client.workersForPlatforms.dispatch.namespaces.scripts.delete(
           scriptName,
           {
             account_id: this.#accountId,
-            dispatch_namespace: this.#dispatchNamespace,
+            dispatch_namespace: dispatchNamespace,
           },
         );
       } catch (error) {
@@ -3460,84 +3368,162 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
     });
   }
 
-  async exportDatabase(databaseId: string): Promise<DatabaseExport> {
-    if (!this.#exportStore) {
+  exportDatabase(databaseId: string): Promise<DatabaseExport> {
+    return this.#exportDatabase(databaseId);
+  }
+
+  #exportDatabaseReceipt(
+    identity: DatabaseExportReceiptIdentity,
+    receipt: Readonly<{
+      authority: string;
+      method: NonNullable<DurableDatabaseExportStore['writeReceipt']>;
+    }>,
+  ): Promise<DatabaseExport> {
+    const canonical = databaseExportReceiptIdentityFromUnknown(
+      identity,
+      receipt.authority,
+    );
+    return this.#exportDatabase(canonical.databaseId, {
+      identity: canonical,
+      method: receipt.method,
+    });
+  }
+
+  async #exportDatabase(
+    databaseId: string,
+    receipt?: Readonly<{
+      identity: DatabaseExportReceiptIdentity;
+      method: NonNullable<DurableDatabaseExportStore['writeReceipt']>;
+    }>,
+  ): Promise<DatabaseExport> {
+    const exportStore = this.#exportStore;
+    if (!exportStore) {
       throw new Error(
         'a durable exportStore is required before D1 can be exported for deletion',
       );
     }
     let bookmark: string | undefined;
-    for (let attempt = 0; attempt < 120; attempt += 1) {
-      const response = await this.#schedule(() =>
-        this.#client.d1.database.export(databaseId, {
-          account_id: this.#accountId,
-          output_format: 'polling',
-          current_bookmark: bookmark,
-        }),
-      );
-      if (response.status === 'error') {
-        throw new Error(
-          response.error ?? `D1 export failed for '${databaseId}'`,
-        );
-      }
-      if (response.status === 'complete' && response.result?.signed_url) {
-        const signedUrl = new URL(response.result.signed_url);
-        if (signedUrl.protocol !== 'https:') {
-          throw new Error('D1 export returned a non-HTTPS download URL');
-        }
-        const download = await this.#request(signedUrl, {
-          redirect: 'error',
-        });
-        if (!download.ok || !download.body) {
-          throw new Error(
-            `D1 export download failed with HTTP ${download.status}`,
-          );
-        }
-        const [storeBody, hashBody] = download.body.tee();
-        const contentLengthValue = download.headers.get('content-length');
-        const contentLength = contentLengthValue
-          ? Number(contentLengthValue)
-          : undefined;
-        const hasContentLength =
-          contentLength !== undefined &&
-          Number.isSafeInteger(contentLength) &&
-          contentLength >= 0;
-        const [stored, integrity] = await Promise.all([
-          this.#exportStore.write({
+    let pollCount = 0;
+    let providerStatusError = false;
+    let httpStatus: number | undefined;
+    let safeDetail: string | undefined;
+    const fail: (detail?: string) => never = (detail) => {
+      if (detail !== undefined) safeDetail = detail;
+      throw new Error('D1 export failed');
+    };
+    try {
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        pollCount += 1;
+        const response = await this.#schedule(() =>
+          this.#client.d1.database.export(
             databaseId,
-            fileName: `${databaseId}-${Date.now()}.sql`,
-            body: storeBody,
-            ...(hasContentLength ? { contentLength } : {}),
-          }),
-          hashExport(hashBody),
-        ]);
-        if (!stored.location || integrity.size === 0) {
-          throw new Error('durable D1 export is empty or has no location');
-        }
-        if (hasContentLength && integrity.size !== contentLength) {
-          throw new Error('durable D1 export size differs from the download');
-        }
-        if (
-          stored.size !== integrity.size ||
-          stored.sha256 !== integrity.sha256
-        ) {
-          throw new Error(
-            'committed durable D1 export integrity differs from the download',
-          );
-        }
-        return { databaseId, location: stored.location, ...integrity };
-      }
-      if (!response.at_bookmark) {
-        throw new Error(
-          `D1 export for '${databaseId}' returned no polling bookmark`,
+            {
+              account_id: this.#accountId,
+              output_format: 'polling',
+              current_bookmark: bookmark,
+            },
+            { maxRetries: 0 },
+          ),
         );
+        if (response.status === 'error') {
+          providerStatusError = true;
+          fail();
+        }
+        if (response.status === 'complete' && response.result?.signed_url) {
+          const signedUrl = new URL(response.result.signed_url);
+          if (signedUrl.protocol !== 'https:') {
+            fail('export returned a non-HTTPS download URL');
+          }
+          const download = await this.#request(signedUrl, {
+            headers: { 'Accept-Encoding': 'identity' },
+          });
+          httpStatus = download.status;
+          if (!download.ok) {
+            cancelBodyWithoutAwait(download.body, 'D1 export download refused');
+            fail();
+          }
+          const downloadBody = download.body;
+          if (!downloadBody) fail();
+          const [storeBody, hashBody] = downloadBody.tee();
+          const contentLengthValue = download.headers.get('content-length');
+          const contentLength = contentLengthValue
+            ? Number(contentLengthValue)
+            : undefined;
+          const hasContentLength =
+            contentLength !== undefined &&
+            Number.isSafeInteger(contentLength) &&
+            contentLength >= 0;
+          let stored: Awaited<ReturnType<DurableDatabaseExportStore['write']>>;
+          let integrity: Awaited<ReturnType<typeof hashExport>>;
+          if (receipt) {
+            const integrityPromise = hashExport(hashBody);
+            void integrityPromise.catch(() => undefined);
+            const storedPromise = funnel(() =>
+              receipt.method({
+                identity: receipt.identity,
+                body: storeBody,
+                ...(hasContentLength ? { contentLength } : {}),
+                expectedIntegrity: integrityPromise,
+              }),
+            );
+            void storedPromise.catch((primary) =>
+              cancelBodyWithoutAwait(storeBody, primary),
+            );
+            stored = await storedPromise;
+            integrity = await integrityPromise;
+          } else {
+            const integrityPromise = hashExport(hashBody);
+            const storedPromise = funnel(() =>
+              exportStore.write({
+                databaseId,
+                fileName: `${databaseId}-${Date.now()}.sql`,
+                body: storeBody,
+                ...(hasContentLength ? { contentLength } : {}),
+              }),
+            );
+            void storedPromise.catch((primary) =>
+              cancelBodyWithoutAwait(storeBody, primary),
+            );
+            [stored, integrity] = await Promise.all([
+              storedPromise,
+              integrityPromise,
+            ]);
+          }
+          if (!stored.location || integrity.size === 0) {
+            fail('durable D1 export is empty or has no location');
+          }
+          if (hasContentLength && integrity.size !== contentLength) {
+            fail('durable D1 export size differs from the download');
+          }
+          if (
+            stored.size !== integrity.size ||
+            stored.sha256 !== integrity.sha256
+          ) {
+            fail(
+              'committed durable D1 export integrity differs from the download',
+            );
+          }
+          return { databaseId, location: stored.location, ...integrity };
+        }
+        if (!response.at_bookmark) {
+          fail('export returned no polling bookmark');
+        }
+        bookmark = response.at_bookmark;
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
       }
-      bookmark = response.at_bookmark;
-      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      fail('export did not complete within the poll budget');
+    } catch (error) {
+      if (receipt && isDatabaseExportReceiptError(error)) throw error;
+      const errorStatus = readErrorFieldSafely(error, 'status');
+      if (typeof errorStatus === 'number') httpStatus = errorStatus;
+      const name = sanitizedErrorName(error);
+      throw new Error(
+        `${safeDetail ? `${safeDetail}: ` : ''}D1 export for '${databaseId}' failed after ${pollCount} poll(s)${
+          providerStatusError ? " with provider status 'error'" : ''
+        }${httpStatus === undefined ? '' : ` with HTTP ${httpStatus}`}`,
+        { cause: { name } },
+      );
     }
-    throw new Error(
-      `D1 export for '${databaseId}' did not complete within two minutes`,
-    );
   }
 
   async deleteDatabase(databaseId: string): Promise<void> {

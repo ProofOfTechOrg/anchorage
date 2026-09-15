@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+
+import { isRunStartPendingError } from '../do-runner/execution-admission.js';
 // createScheduleTick. WE OWN THE TICK: a Durable Object alarm drives
 // listDueSchedules -> CAS updateScheduleNextFire claim -> fire, bypassing
 // core's pubsub worker loop entirely under the "one chokepoint, no second
@@ -773,6 +775,7 @@ export function createScheduleTick(
       } catch (error) {
         let pendingError = error;
         if (
+          !isRunStartPendingError(error) &&
           ref.target === 'agent' &&
           ref.mode === 'signal' &&
           options.signalAgent

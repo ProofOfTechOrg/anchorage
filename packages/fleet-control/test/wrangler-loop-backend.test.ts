@@ -8,10 +8,14 @@ import { pathToFileURL } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import { ActiveRouteAttestationError } from '../src/active-route.js';
 import type { DurableDatabaseExportStore } from '../src/cloudflare-client.js';
+import { initialWorkerAttachmentScan } from '../src/cloudflare-worker-attachment-scan-state.js';
 import { WorkerDeploymentError } from '../src/deployment-error.js';
+import { plainWorkerIngressModule } from '../src/plain-worker-backend.js';
 import { deploymentSpecDigest } from '../src/spec-digest.js';
 import type {
   DatabaseReference,
+  DecommissionAttachmentScanInput,
+  DecommissionAttachmentScanResult,
   DeploymentSecrets,
   DeploymentSpec,
   ExternalMutationFence,
@@ -20,11 +24,9 @@ import type {
   PlainWorkerCustomDomain,
   PlainWorkerRouteApi,
 } from '../src/types.js';
-import {
-  plainWorkerIngressModule,
-  WranglerLoopBackend,
-} from '../src/wrangler-loop-backend.js';
+import { WranglerLoopBackend } from '../src/wrangler-loop-backend.js';
 import type { CommandResult, CommandRunner } from '../src/wrangler-runner.js';
+import { D1State } from './fixtures/provider-world.js';
 
 const deployment: DeploymentSpec = {
   tenantTag: 'acme',
@@ -1440,6 +1442,9 @@ export default {
           stderr: '',
         };
       }
+      if (arguments_[0] === 'versions' && arguments_[1] === 'list') {
+        return { stdout: JSON.stringify([]), stderr: '' };
+      }
       return {
         stdout: JSON.stringify({
           resources: {
@@ -1541,6 +1546,9 @@ export default {
     expect(request).toHaveBeenCalledWith(
       new URL('https://control-acme.example.test/admin/maintenance-status'),
       {
+        method: 'GET',
+        signal: expect.any(AbortSignal),
+        redirect: 'manual',
         headers: { authorization: `Bearer ${secrets.maintenanceAdmin}` },
       },
     );
@@ -1596,6 +1604,9 @@ export default {
           stderr: '',
         };
       }
+      if (arguments_[0] === 'versions' && arguments_[1] === 'list') {
+        return { stdout: JSON.stringify([]), stderr: '' };
+      }
       return { stdout: JSON.stringify(version), stderr: '' };
     });
 
@@ -1605,53 +1616,64 @@ export default {
   });
 
   it('inspects the tagged 0% candidate through a version override and rejects silent fallback', async () => {
-    const digest = deploymentSpecDigest(deployment);
-    const runner = new FakeRunner(async (arguments_) => {
-      const command = arguments_.slice(0, 2).join(' ');
-      if (command === 'deployments status') {
-        return {
-          stdout: JSON.stringify({
-            versions: [
-              { version_id: 'version-old', percentage: 100 },
-              { version_id: 'version-next', percentage: 0 },
-            ],
-          }),
-          stderr: '',
-        };
-      }
-      if (command === 'versions list') {
-        return {
-          stdout: JSON.stringify([listedVersion('version-next', digest)]),
-          stderr: '',
-        };
-      }
-      if (command === 'versions view') {
-        return { stdout: JSON.stringify(viewedVersion(digest)), stderr: '' };
-      }
-      return { stdout: '', stderr: '' };
-    });
-    const request = vi.fn(async () =>
-      Response.json({
-        alarmAt: 2_000,
-        deploymentSpecDigest: 'b'.repeat(64),
-      }),
-    );
+    vi.useFakeTimers();
+    try {
+      const digest = deploymentSpecDigest(deployment);
+      const runner = new FakeRunner(async (arguments_) => {
+        const command = arguments_.slice(0, 2).join(' ');
+        if (command === 'deployments status') {
+          return {
+            stdout: JSON.stringify({
+              versions: [
+                { version_id: 'version-old', percentage: 100 },
+                { version_id: 'version-next', percentage: 0 },
+              ],
+            }),
+            stderr: '',
+          };
+        }
+        if (command === 'versions list') {
+          return {
+            stdout: JSON.stringify([listedVersion('version-next', digest)]),
+            stderr: '',
+          };
+        }
+        if (command === 'versions view') {
+          return { stdout: JSON.stringify(viewedVersion(digest)), stderr: '' };
+        }
+        return { stdout: '', stderr: '' };
+      });
+      const request = vi.fn(async () =>
+        Response.json({
+          alarmAt: 2_000,
+          deploymentSpecDigest: 'b'.repeat(64),
+        }),
+      );
 
-    await expect(
-      backend(runner, { fetch: request }).inspect(
-        deployment,
-        secrets.maintenanceAdmin,
-      ),
-    ).rejects.toThrow(/did not attest fleet specification digest/);
-    expect(request).toHaveBeenCalledWith(
-      new URL('https://control-acme.example.test/admin/maintenance-status'),
-      {
-        headers: {
-          authorization: `Bearer ${secrets.maintenanceAdmin}`,
-          'Cloudflare-Workers-Version-Overrides': `${deployment.scriptName}="version-next"`,
+      const pending = expect(
+        backend(runner, { fetch: request }).inspect(
+          deployment,
+          secrets.maintenanceAdmin,
+        ),
+      ).rejects.toThrow(/did not attest fleet specification digest/);
+      await vi.advanceTimersByTimeAsync(60_000);
+      await pending;
+      expect(request).toHaveBeenCalledTimes(30);
+      expect(request).toHaveBeenCalledWith(
+        new URL('https://control-acme.example.test/admin/maintenance-status'),
+        {
+          method: 'GET',
+          signal: expect.any(AbortSignal),
+          redirect: 'manual',
+          headers: {
+            authorization: `Bearer ${secrets.maintenanceAdmin}`,
+            'Cloudflare-Workers-Version-Overrides': `${deployment.scriptName}="version-next"`,
+          },
         },
-      },
-    );
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it.each([
@@ -1741,9 +1763,11 @@ export default {
       }
       return { stdout: '', stderr: '' };
     });
+    const reconciledRouteApi = new FakeRouteApi();
+    reconciledRouteApi.workersDevEnabled = true;
 
     await expect(
-      backend(runner).deployWorker(
+      backend(runner, { routeApi: reconciledRouteApi }).deployWorker(
         deployment,
         database,
         secrets,
@@ -1754,7 +1778,7 @@ export default {
 
     const callsBeforeRetry = runner.calls.length;
     await expect(
-      backend(runner).deployWorker(
+      backend(runner, { routeApi: reconciledRouteApi }).deployWorker(
         deployment,
         database,
         secrets,
@@ -1818,58 +1842,21 @@ export default {
     expect(runner.calls.map(operation)).toContain('versions upload');
   });
 
-  it('reads and seeds database ownership through fenced provider-native SQL', async () => {
-    const sentinelDdl = `CREATE TABLE IF NOT EXISTS flowsafe_deployment (
-  id INTEGER PRIMARY KEY CHECK (id = 1),
-  tenant_tag TEXT NOT NULL,
-  provisioned_at TEXT NOT NULL
-)`;
-    let sentinelExists = false;
-    let fenceExists = false;
-    let owner: string | undefined;
+  it('seeds optional FS8 metadata through string-bound provider SQL', async () => {
+    const d1 = new D1State();
     let fenceBindings: readonly unknown[] | undefined;
     const runner = new FakeRunner();
     const routeApi = new FakeRouteApi();
     routeApi.queryHandler = async (sql, bindings) => {
-      let results: readonly Readonly<Record<string, unknown>>[] = [];
-      if (sql.includes("sqlite_schema WHERE type = 'table' ORDER BY name")) {
-        results = [
-          ...(sentinelExists
-            ? [{ name: 'flowsafe_deployment', sql: sentinelDdl }]
-            : []),
-          ...(fenceExists
-            ? [{ name: 'flowsafe_execution_fence', sql: 'CREATE' }]
-            : []),
-        ];
-      } else if (
-        sql.includes('name = ?') &&
-        bindings[0] === 'flowsafe_deployment'
-      ) {
-        results = sentinelExists ? [{ sql: sentinelDdl }] : [];
-      } else if (sql.startsWith('PRAGMA table_info')) {
-        results = [
-          { name: 'id', type: 'INTEGER', notnull: 0, pk: 1 },
-          { name: 'tenant_tag', type: 'TEXT', notnull: 1, pk: 0 },
-          { name: 'provisioned_at', type: 'TEXT', notnull: 1, pk: 0 },
-        ];
-      } else if (sql.startsWith('SELECT id, tenant_tag')) {
-        results = owner ? [{ id: 1, tenant_tag: owner }] : [];
-      } else if (
-        // Matched on the TARGET table, ahead of the generic arms: the ownership
-        // insert names the fence table inside its exclusion list.
-        sql.startsWith('CREATE TABLE IF NOT EXISTS flowsafe_execution_fence')
-      ) {
-        fenceExists = true;
-      } else if (
-        sql.startsWith('INSERT OR IGNORE INTO flowsafe_execution_fence')
-      ) {
+      if (sql.startsWith('INSERT OR IGNORE INTO flowsafe_execution_fence')) {
         fenceBindings = bindings;
-      } else if (sql.startsWith('CREATE TABLE')) {
-        sentinelExists = true;
-      } else if (sql.startsWith('INSERT OR IGNORE')) {
-        owner = String(bindings[0]);
       }
-      return results;
+      const parameters = bindings.map((value) => {
+        if (typeof value !== 'string')
+          throw new Error('fence parameters must be strings');
+        return value;
+      });
+      return d1.queryDatabase(sql, parameters);
     };
     const subject = backend(runner, { routeApi });
 
@@ -1893,7 +1880,22 @@ export default {
     // reaches it as a STRING — the plain-Worker adapter rejects anything else
     // (restD1Bindings), which is why the seeded timestamp is bound as text and
     // left to SQLite's INTEGER affinity.
-    expect(fenceExists).toBe(true);
+    expect(d1.queryDatabase('SELECT * FROM flowsafe_execution_fence')).toEqual([
+      {
+        id: 'deployment',
+        state: 'migration-locked',
+        proof_key: null,
+        proof_run_id: null,
+        updated_at: expect.any(Number),
+        last_transition_request: null,
+        transition_revision: 0,
+        mutation_epoch: 0,
+        require_mutation_epoch: 0,
+        proof_table_prefix: null,
+        proof_workflow_id: null,
+        proof_start_token: null,
+      },
+    ]);
     expect(fenceBindings).toEqual([
       'deployment',
       'migration-locked',
@@ -2079,7 +2081,7 @@ export default {
     await expect(
       backend(runner).ensureDatabase(deployment, fence),
     ).rejects.toThrow(
-      'Wrangler command maximum duration must be below the external mutation fence lease TTL',
+      'provider mutation maximum duration must be below the external mutation fence lease TTL',
     );
     expect(runner.calls.map(operation)).toEqual([]);
     expect(fence.assertOwned).not.toHaveBeenCalled();
@@ -2916,6 +2918,8 @@ export default {
       async inspectOrdinaryWorkerFootprint() {
         return {
           scriptPresent: true,
+          workersDevEnabled: false,
+          previewUrlsEnabled: false,
           customDomains: [
             {
               id: 'sticky-domain',
@@ -3224,5 +3228,33 @@ export default {
 
     // #then the refusal reaches the caller intact, percentages included
     expect(failure).toBe(split);
+  });
+
+  it('carries the route-owned bounded scanner through both Wrangler layers', async () => {
+    const routeApi = new FakeRouteApi();
+    const input: DecommissionAttachmentScanInput = {
+      progress: initialWorkerAttachmentScan({
+        kind: 'd1',
+        databaseId: database.id,
+      }),
+      maxProviderRequests: 12,
+    };
+    const result: DecommissionAttachmentScanResult = { status: 'drift' };
+    const calls: Array<readonly [unknown, DecommissionAttachmentScanInput]> =
+      [];
+    Object.defineProperty(routeApi, 'advanceDecommissionAttachmentScan', {
+      configurable: true,
+      value(this: unknown, actual: DecommissionAttachmentScanInput) {
+        calls.push([this, actual]);
+        return Promise.resolve(result);
+      },
+    });
+    const subject = backend(new FakeRunner(), { routeApi });
+
+    expect(typeof subject.advanceDecommissionAttachmentScan).toBe('function');
+    await expect(
+      subject.advanceDecommissionAttachmentScan?.(input),
+    ).resolves.toBe(result);
+    expect(calls).toEqual([[routeApi, input]]);
   });
 });

@@ -14,6 +14,8 @@
     "dev": "pnpm --filter showcase dev",
     "test": "pnpm run architecture:check && vitest run",
     "test:watch": "vitest",
+    "test:without-direct-scenario": "pnpm run architecture:check && vitest run --project '!fleet-control-direct-scenario'",
+    "test:direct-scenario": "vitest run --project fleet-control-direct-scenario",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "typecheck": "pnpm -r typecheck && pnpm run typecheck:harness",
@@ -29,6 +31,7 @@
     "architecture:check:agent-starter": "dependency-cruise packages/agent-starter/src packages/agent-starter/test packages/agent-starter/scripts",
     "fleet-control:check": "pnpm --filter @proofoftech/fleet-control test && pnpm --filter @proofoftech/fleet-control typecheck && pnpm --filter @proofoftech/fleet-control build",
     "fleet-control:credentialed": "pnpm --filter @proofoftech/fleet-control test:credentialed",
+    "fleet-control:credentialed:direct": "pnpm --filter @proofoftech/fleet-control test:credentialed:direct",
     "durability:benchmark": "pnpm --filter @proofoftech/flowsafe exec node scripts/durability-benchmark.mjs",
     "architecture:controls": "node --test scripts/architecture-positive-controls.test.mjs",
     "test:packed-breakwater": "pnpm --filter @proofoftech/breakwater test:packed-consumer",
@@ -51,7 +54,7 @@
     "@biomejs/biome": "^2.4.11",
     "@changesets/cli": "^2.31.0",
     "@cloudflare/vitest-pool-workers": "0.20.1",
-    "@cloudflare/workers-types": "5.20260730.1",
+    "@cloudflare/workers-types": "5.20260905.1",
     "@types/node": "22.20.0",
     "dependency-cruiser": "18.1.1",
     "github-slugger": "2.0.0",
@@ -65,7 +68,7 @@
     "unified": "11.0.5",
     "unist-util-visit": "5.1.0",
     "vitest": "^4.1.8",
-    "wrangler": "4.118.0",
+    "wrangler": "4.129.0",
     "yaml": "2.9.0"
   },
   "engines": {
@@ -85,7 +88,11 @@
       "js-yaml@3": "3.15.1",
       "js-yaml@4": "4.3.1",
       "nanoid@3": "3.3.17",
-      "undici": "7.29.0"
+      "undici": "7.29.0",
+      "miniflare@5.20260730.0-alpha>workerd": "1.20260903.1"
+    },
+    "patchedDependencies": {
+      "@mastra/core@1.53.0": "packages/flowsafe/patches/@mastra__core@1.53.0.patch"
     }
   }
 }

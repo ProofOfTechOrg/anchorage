@@ -168,6 +168,20 @@ const durableAgent = createFlowsafeDurableAgent({
 
 `createFlowsafeDurableAgent()` registers Mastra's `durable-agentic-loop` workflow on the supplied runtime. Its `stream()`, `generate()`, and `prepare()` entry points require a host-minted opaque run id. Only a start registered through `streamUntilPersisted()` reaches `RunnerRuntime`; an unregistered start fails terminally after a bounded, best-effort attempt to preserve its serialized input. Preservation is skipped when the thread is missing or memory is explicitly read-only. `prepare()` remains an initial-execution API and runs the full initial processor chain. `resumeViaRuntime()` uses the dedicated registry rehydration behavior described above.
 
+The trusted host calls `streamUntilPersisted(messages, options, requestedBy, requestedByKind, attemptToken, scheduleDispatch, idempotencyKey, authority)`. The eighth argument is required; pass explicit `undefined` for unused positional options. Its `AgentStartAuthority` type is exported only from `agent-runner`. It carries the initiating owner, agent and thread identity, threaded mode, optional caller epoch, separate resource-owner guard and original successful start-reservation claim when keyed.
+
+The bridge captures that authority before streaming and keeps it out of Core input, stream options and public JSON. It preserves the original method caller's requester identity even when a schedule or thread has a different resource owner. Mutable caller objects cannot replace the captured values after an await.
+
+The `onPreparedStartIdentity` property must exist on the authority. Managed hosts supply an awaited callback that persists the prepared execution identity before initial admission; direct integrations may explicitly omit the callback with `undefined`. A placeholder callback does not establish a durable journal. Runtime generates a v2 execution token independently of the host's leg token and acknowledges the persistence waiter only after observing the matching nonpending durable outcome.
+
+Both threaded and ephemeral agent starts use exact preparation journals and preserve the actual source owner separately from the initiating principal. Recovery after eviction reconstructs the actual wrapper before reading its workflow, without a synthetic request principal. A valid pending generation stays unresolved; prepared-unfenced absence or pending state cannot authorize initial repair. Terminal reservation settlement precedes approval, dispatch, owner and lifecycle cleanup, with exact journal clearing last.
+
+The blocking-run scan and new run-record installation share the same lock, including on an already bound thread whose ownership is committed. Recovery validates a keyed journal's reservation-store configuration before bookkeeping and rechecks the complete journal after storage waits before releasing reservations.
+
+Ordinary v1 and absent-provenance runs retain validated status, resume and lifecycle completion. Their mode, binding, canonical run record and saved principal pass the same normal host checks. Only a confirmed raw terminal outcome with no recovery journal and no active owning execution permits legacy record cleanup. These compatibility reads supply no generation identity or start-key settlement authority. During termination, the canonical record remains until lifecycle completion confirms.
+
+Protected keyed replay reads the actual wrapper's workflow once and pairs its public envelope with that observation's identity. A terminal ephemeral run does not need a retained thread binding to replay. Optional stored context may be pruned, but present selectors must agree with the original agent/thread/mode. The execution token, raw snapshot, claim and recovery journal remain internal. Proof-only signal delivery retains the selected generation through policy and memory waits and checks the active run again immediately before delivery.
+
 The runtime's pub/sub identity is reused by default. This lets the durable loop, observer, and active-thread signal delivery share one feed inside the thread Durable Object.
 
 This wrapper does not add the guarded-agent brand or catalog authorization to a raw agent. Use `agent-host` for the supported protected public surface. Route clients through its authenticated run routes because only the host start seam may execute a run. Direct `stream()` with an unregistered id resolves to a failed output; direct `generate()` rejects. `stream()`, `generate()`, `prepare()`, and `streamUntilPersisted()` synchronously refuse a live id. A successful `prepare({ runId: X })` keeps `X` live until core cleans up that prepared run.
@@ -245,6 +259,24 @@ The agent host persists a thread-to-agent binding and per-run principal record i
 
 Thread delivery is priority-planned across summaries and individual notifications, remains stable across 100-record chunks, and suppresses summarized high-priority rows while the thread was active.
 
+### Bound notification delivery
+
+`createNotificationDispatchTick()` and `createThreadSignalRoutes()` accept `maxDeliveryAttempts`, a positive safe integer defaulting to `DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS`. Use the same value on both factories. They capture the policy at construction; request bodies cannot change it. A tick with `limit: 0` performs no delivery or storage work and needs no patch; invalid numeric policy still fails at construction, and an unpatched `@mastra/core` fails construction of a tick that dispatches.
+
+`deliveryAttempts` counts persisted failed rounds. At the bound, the conditional write sets `discarded`, `deliveryReason: "delivery-attempts-exhausted"` and cleared delivery cursors. A row already at the bound is not sent; its conditional discard preserves the previous count, error and attempt time. Retry delays below the bound retain the existing backoff. Malformed counters remain unmodified and produce an unresolved failure. A due row whose other scalars cannot be read is not written: it is counted as a failed outcome, re-selected on every pass, holds its place in the bounded window and in the `pending-notifications` inventory category, and must be repaired or deleted directly.
+
+Terminal receipts remain available through `getNotification()` and `listNotifications()` until the host's configured retention removes them. They include the last error/count and discard timestamp. The due scan excludes terminal notifications so a persistently refused target can release its place in the bounded dispatch window.
+
+The tick requires `NotificationDeliveryStorage`. `D1NotificationsStorage` provides its `updateNotificationDeliveryIfUnchanged()` operation. Custom implementations must atomically compare the supplied `NotificationDeliveryObservation` and apply the narrow `NotificationDeliveryFailure` patch against their other writers. The observation uses detached scalar values, ISO timestamps and encoded JSON; the public types define its fields. A method implemented as an asynchronous read followed by an unconditional update does not satisfy that contract. Ordinary Core storage can still serve notification ingestion; driving dispatch requires the conditional operation.
+
+Failure bookkeeping preserves newer summary, delivery and content-denial receipts. A conditional write with an uncertain response can be confirmed by an exact target readback. General delivery responses that are lost remain conservatively counted as failed; the dispatcher does not invent successful deliveries from another writer's state. Invocation counters do not promise exactly-once signal delivery: a signal can succeed before its receipt write fails.
+
+Attempt time and retry cursors use the dispatch clock. Updated/discarded timestamps use a captured wall-clock value for retention. Identical same-ID replacements with no observable difference have no separate generation identity under this contract.
+
+D1 compares notification timestamps as instants when selecting due rows, ordering lists and applying retention. Public storage methods accept finite `Date` values. Direct database writers must use ISO dates or ISO date-times with an explicit UTC or numeric offset. A date-time with no zone, or non-ISO text, is outside that grammar: such a value in `deliverAt` or `summaryAt` never matches due selection, and such a value in `updatedAt` never matches retention and sorts its row last in an unlimited `listNotifications` page, so repair or delete the row that carries it directly; supported raw encodings retain their stored bytes.
+
+Summary source counts and a configured source delivery policy read own properties only where the `@mastra/core` patch flowsafe ships is applied at the application root; without it a source named after an `Object.prototype` member is miscounted in the summary core renders and selects an inherited policy entry instead of the configured priority or default action. Flowsafe refuses notification ingestion and dispatch on an unpatched install, and refuses to construct a notification dispatch tick that does delivery work. See [Apply the flowsafe patch to @mastra/core](getting-started.md#apply-the-flowsafe-patch-to-mastracore).
+
 ## Expose signal ingestion
 
 Mount `createSignalRouter()` through `createFlowsafeWorker({ buildSignalRouter })`. The default prefix is `/api/threads`.
@@ -259,7 +291,9 @@ Mount `createSignalRouter()` through `createFlowsafeWorker({ buildSignalRouter }
 
 Without agent memory, persist outcomes return `memory-unavailable`, except that a default or `ifIdle: 'persist'` message or signal still delivers into an active run (an active persist that no memory could write still answers `memory-unavailable`), a persist-behavior agent-schedule fire settles a canonical `discard` receipt, and an owner notification keeps its inbox row while the model-visible memory write remains best-effort.
 
-The Worker applies this order: authentication, coarse role, thread lookup, byte cap, JSON parse, client-memory-id rejection, attribute-key allowlist, the configured rate-limit seam, audit, then topology forwarding. The starter's limiter is isolate-local example protection; use shared durable state when the limit is contractual across the deployment.
+Configure `SignalRouterOptions.validateThreadTarget` with the existing `BoundThreadTargetValidator` type to apply host-specific restrictions before body parsing or signal forwarding. `createAgentThreadTopology().requireBoundThread` verifies a durable binding. For strict ownership, compare the captured principal's `kind` and `id` with the owner returned by `await context.resourceOwnerFor('thread', target.threadId)`, and throw `RunRouteError` with status 404 on refusal. Omitting the callback retains the router's existing resource-access policy, including its administrator access.
+
+The router records acceptance after the downstream response succeeds and normalizes thread-not-found refusals from registry access, the validator and the receiving Durable Object. Audit-sink and diagnostic failures retain the selected response. The starter's limiter is isolate-local example protection; use shared durable state when the limit is contractual across the deployment.
 
 Signals are untrusted model input. Core escapes the XML representation, while the route validates tag and attribute names and caps payload size. A receiving agent's ordinary `processInput` policy is not a complete signal boundary: Mastra can drain queued signals after the initiating input processor has run. Configure `createThreadSignalRoutes({ contentPolicy })` to inspect Mastra's canonical escaped XML inside the Thread Durable Object before delivery, persistence, wake, or run start. The same boundary covers direct routes, providers, schedules, and notification dispatch.
 
@@ -276,13 +310,21 @@ PATCH  /api/threads/:threadId/goal
 DELETE /api/threads/:threadId/goal
 ```
 
-Objectives are standing instructions injected into future turns. The router therefore uses the signal-ingestion trust posture for writes: authenticate, authorize, ownership-check, reject client memory ids, cap size and `maxRuns`, then audit every accepted or post-auth rejected mutation.
+Objectives are standing instructions injected into future turns. Mutations require authenticated thread access. Audit-sink failures retain the selected mutation result.
 
 The router writes through Mastra's objective helpers into the goal lane of `mastra_thread_state`, so the durable goal step reads the identical shape. Updates are deployment-local last-write-wins rather than a serialized thread lease.
 
 ## Add schedules
 
 Create a `D1SchedulesStorage`, expose `createScheduleRouter()`, and pass `createScheduleTick()` to the maintenance singleton with a dedicated tick interval.
+
+Use the same database object for the schedule store and its `ExecutionFenceStore`. A fenced custom facade must advertise `FENCED_SCHEDULE_STORAGE` before serving requests, including before epoch activation. `D1SchedulesStorage` and `createScheduleStorageDomains()` provide that capability. An explicit `executionFence: 'none'` supports a custom facade without the atomic storage contract.
+
+Supply the artifact epoch through trusted resolver configuration or the composed Worker's `mutationEpoch` option. The router retains that authenticated value through asynchronous work. Direct D1 authoring methods accept a trailing `MutationEpochContext` and require transactional `batch()`. Context-free calls through Core refuse once the epoch requirement is active. Request bodies and external headers cannot supply this authority.
+
+Create, update and resume require an open fence. Pause and delete retain their state allowance but require the current epoch after activation. The router checks the epoch even when the requested pause/resume status matches the row. Direct `pauseSchedule` accepts no patch; `resumeSchedule` takes the observed cron/timezone with the computed next fire and rejects a concurrent configuration change. Admitted trigger settlement can finish a pending deletion after the fence changes.
+
+`SCHEDULE_MUTATION_CONFLICT` is a 409 for a changed fence frame or resume configuration. `SCHEDULE_MUTATION_OUTCOME_UNKNOWN` is a 503 when the write cannot be confirmed; it can follow a committed write and supplies no rollback authority. A later matching row is not an invocation receipt. See the [API reference](api-reference.md#flowsafe-subpath-exports) for the schedules entry.
 
 The router:
 

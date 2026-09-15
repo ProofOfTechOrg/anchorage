@@ -1,30 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
-// Unit coverage for the run surface every host mounts: the authorization ORDER
-// (401 -> coarse RUN_START_ROLES -> per-workflow allowedRoles), the catalog, the
-// start/status/resume/terminate routes and their error mapping, the suspension bridge's
-// attribution (the starting actor becomes requestedBy, so they cannot decide
-// their own run), and the reconcileApprovals self-healing hook on status
-// reads.
-//
-// Driven with real InMemoryApprovalStore + ApprovalService (no mocks) and
-// fixture WorkflowMetas — depending on the showcase's modules here would invert
-// the layering (showcase imports host-kit, not the reverse).
+// Showcase modules depend on host-kit, so these fixtures remain independent.
 
+import { InMemoryStore } from '@mastra/core/storage';
+import {
+  type ConnectorConfig,
+  createConnector,
+  invokeConnector,
+} from '@proofoftech/breakwater';
 import { describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 
+import { TEST_DEPLOYMENT_IDENTITY_SECRET } from '../../test-support/deployment-identity.js';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
+  type ActorContext,
   type ApprovalActor,
   ApprovalService,
   type ApprovalStore,
   createActorResolver,
+  humanPrincipal,
   InMemoryApprovalStoreFactory,
   type SelfDecisionPolicy,
 } from '../approval-api/index.js';
+import { RESERVED_EXECUTION_CONTEXT_KEYS } from '../do-runner/execution-context.js';
 import {
+  doErrorResponse,
   ExecutionFencedError,
   type ExecutionFenceWiring,
+  InvalidMutationEpochError,
   InvalidRunRequestError,
+  init,
+  MutationEpochMismatchError,
   RunLifecycleBlockedError,
   RunNotSuspendedError,
   type RunSummary,
@@ -33,7 +39,9 @@ import {
   StartIdempotencyStore,
   UnknownRunError,
 } from '../do-runner/index.js';
+import { internalErrorResponse } from '../internal-error-response.js';
 import { reconcileApprovalsOnStatus } from './approval-bridge.js';
+import { createDoRunTopology } from './do-run-topology.js';
 import { RunRouteError } from './run-route-error.js';
 import { createRunRouter, type RunRouterOptions } from './run-router.js';
 import type { WorkflowMeta } from './workflow-meta.js';
@@ -83,6 +91,8 @@ function suspendedSummary(runId: string): RunSummary {
 }
 
 interface HarnessOptions {
+  transformContext?: (context: ActorContext) => ActorContext;
+  beforeStart?: RunRouterOptions['beforeStart'];
   start?: RunRouterOptions['start'];
   status?: (
     workflowId: string,
@@ -101,7 +111,18 @@ interface HarnessOptions {
    * which is what every earlier unkeyed-start case in this file wants: unkeyed
    * starts are unaffected; keyed starts on an unwired host refuse.
    */
-  startIdempotency?: RunRouterOptions['startIdempotency'];
+  startIdempotency?:
+    | 'none'
+    | (Omit<
+        Exclude<RunRouterOptions['startIdempotency'], 'none'>,
+        'persistedStart'
+      > &
+        Partial<
+          Pick<
+            Exclude<RunRouterOptions['startIdempotency'], 'none'>,
+            'persistedStart'
+          >
+        >);
 }
 
 function makeHarness(options: HarnessOptions = {}) {
@@ -159,9 +180,40 @@ function makeHarness(options: HarnessOptions = {}) {
   });
   const handle = createRunRouter({
     workflows: WORKFLOWS,
-    resolve,
+    resolve: async (request) => {
+      const context = await resolve(request);
+      return context && options.transformContext
+        ? options.transformContext(context)
+        : context;
+    },
+    beforeStart: options.beforeStart,
     systemPrincipalId: SYSTEM.id,
-    startIdempotency: options.startIdempotency ?? 'none',
+    startIdempotency:
+      options.startIdempotency === undefined ||
+      options.startIdempotency === 'none'
+        ? 'none'
+        : {
+            ...options.startIdempotency,
+            persistedStart:
+              options.startIdempotency.persistedStart ??
+              (async (workflowId, runId) => {
+                const value = await options.status?.(workflowId, runId);
+                return value === undefined
+                  ? undefined
+                  : {
+                      kind: 'result',
+                      value,
+                      execution: {
+                        tablePrefix: '',
+                        workflowId,
+                        runId,
+                        startToken: 'test-generation',
+                        owner: { kind: 'human', id: OPERATOR.id },
+                        target: { kind: 'workflow', id: workflowId },
+                      },
+                    };
+              }),
+          },
     start: async (input) => {
       await backend.resources().claim('run', input.runId, {
         kind: input.principal.kind,
@@ -221,6 +273,479 @@ function req(path: string, options: ReqOptions = {}): Request {
     body,
   });
 }
+
+function cDeferred() {
+  let resolve = () => {};
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+function cStartStore() {
+  return new StartIdempotencyStore(
+    sqliteUnitDatabase(openSqlite()) as StartIdempotencyDatabase,
+  );
+}
+
+function cHeldBody(body: unknown) {
+  const entered = cDeferred();
+  const release = cDeferred();
+  const bytes = new TextEncoder().encode(JSON.stringify(body));
+  const stream = new ReadableStream<Uint8Array>(
+    {
+      async pull(controller) {
+        entered.resolve();
+        await release.promise;
+        controller.enqueue(bytes);
+        controller.close();
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  const request = new Request('http://host.test/runs', {
+    method: 'POST',
+    headers: {
+      'x-actor-id': OPERATOR.id,
+      'x-actor-role': OPERATOR.role,
+      'content-type': 'application/json',
+    },
+    body: stream,
+    duplex: 'half',
+  } as RequestInit & { duplex: 'half' });
+  return { request, entered, release };
+}
+
+describe('C workflow router capture', () => {
+  it('C keyed replay keeps the captured policy view through persisted lookup and reconciliation', async () => {
+    const store = cStartStore();
+    await store.reserve({
+      key: 'original-key',
+      owner: { kind: 'human', id: OPERATOR.id },
+      targetKind: 'workflow',
+      targetId: OPEN_FLOW.id,
+      mintRunId: () => 'r1',
+    });
+    const actor: ApprovalActor = { id: OPERATOR.id, role: 'operator' };
+    let source: ActorContext | undefined;
+    const entered = cDeferred();
+    const release = cDeferred();
+    const policy = vi.fn<NonNullable<RunRouterOptions['beforeStart']>>(
+      async () => {},
+    );
+    const reconcile = vi.fn<
+      NonNullable<RunRouterOptions['reconcileApprovals']>
+    >(async () => {});
+    const start = vi.fn<RunRouterOptions['start']>(async (input) =>
+      suspendedSummary(input.runId),
+    );
+    const fixture = makeHarness({
+      transformContext: (context) => {
+        source = { ...context, actor, mutationEpoch: 2 };
+        return source;
+      },
+      startIdempotency: {
+        store,
+        executionFence: 'none',
+        live: async () => false,
+      },
+      beforeStart: policy,
+      reconcileApprovals: reconcile,
+      start,
+      status: async (_workflowId, runId) => {
+        entered.resolve();
+        await release.promise;
+        return suspendedSummary(runId);
+      },
+    });
+    const pending = fixture.handle(
+      req('/runs', {
+        body: { workflowId: OPEN_FLOW.id, idempotencyKey: 'original-key' },
+      }),
+    );
+    const outcome = pending.then(
+      () => false,
+      () => false,
+    );
+    try {
+      expect(
+        await Promise.race([entered.promise.then(() => true), outcome]),
+      ).toBe(true);
+      Object.assign(actor, { id: 'replacement', role: 'viewer' });
+      Object.assign(source ?? {}, {
+        principal: humanPrincipal({ id: 'replacement', role: 'viewer' }),
+        mutationEpoch: 3,
+      });
+    } finally {
+      release.resolve();
+      await outcome;
+    }
+    expect((await pending)?.status).toBe(200);
+    expect(start).not.toHaveBeenCalled();
+    expect(reconcile).toHaveBeenCalledOnce();
+    const captured = reconcile.mock.calls[0]?.[0];
+    expect(captured).toBe(policy.mock.calls[0]?.[0]);
+    expect(captured).toMatchObject({
+      actor: { id: OPERATOR.id, role: 'operator' },
+      principal: { id: OPERATOR.id },
+      mutationEpoch: 2,
+    });
+    expect(reconcile.mock.calls[0]?.[1]).toBe(OPEN_FLOW.id);
+    expect(reconcile.mock.calls[0]?.[2]).toMatchObject({
+      runId: 'r1',
+      status: 'suspended',
+    });
+  });
+
+  it.each([
+    'mutationEpoch',
+    'startIdentity',
+    'startReservation',
+    'agentStart',
+    'execution',
+    'tablePrefix',
+    'startToken',
+    'attemptToken',
+    'runOwnerGuard',
+    'onPreparedStartIdentity',
+  ])('C workflow route refuses public authority field %s', async (field) => {
+    const start = vi.fn<RunRouterOptions['start']>(async (input) => ({
+      runId: input.runId,
+      status: 'success',
+    }));
+    const fixture = makeHarness({ start });
+    const response = await fixture.handle(
+      req('/runs', { body: { workflowId: OPEN_FLOW.id, [field]: 2 } }),
+    );
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({
+      error: `field '${field}' is not allowed`,
+    });
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it('C workflow route retains direct invalid-epoch error data', async () => {
+    const start = vi.fn<RunRouterOptions['start']>(async (input) => ({
+      runId: input.runId,
+      status: 'success',
+    }));
+    const fixture = makeHarness({
+      transformContext: (context) => ({ ...context, mutationEpoch: -1 }),
+      start,
+    });
+    const response = await fixture.handle(
+      req('/runs', { body: { workflowId: OPEN_FLOW.id } }),
+    );
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({
+      error: 'mutationEpoch must be a nonnegative safe integer or undefined',
+      reason: { code: 'INVALID_MUTATION_EPOCH' },
+    });
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'missing',
+    'stale',
+    'future',
+    'invalid',
+  ] as const)('C workflow route retains complete encoded epoch refusals: %s', async (classification) => {
+    const error =
+      classification === 'invalid'
+        ? new InvalidMutationEpochError()
+        : new MutationEpochMismatchError(classification, 2);
+    const fetch = vi.fn(async () => doErrorResponse(error));
+    const topology = createDoRunTopology(
+      { idFromName: (name) => name, get: () => ({ fetch }) },
+      TEST_DEPLOYMENT_IDENTITY_SECRET,
+    );
+    const fixture = makeHarness({ start: topology.start });
+    const response = await fixture.handle(
+      req('/runs', { body: { workflowId: OPEN_FLOW.id } }),
+    );
+    expect(response?.status).toBe(classification === 'invalid' ? 400 : 409);
+    expect(await response?.json()).toEqual(
+      classification === 'invalid'
+        ? {
+            error:
+              'mutationEpoch must be a nonnegative safe integer or undefined',
+            reason: { code: 'INVALID_MUTATION_EPOCH' },
+          }
+        : {
+            error: 'mutation epoch does not match the active deployment',
+            reason: {
+              code: 'MUTATION_EPOCH_MISMATCH',
+              classification,
+              mutationEpoch: 2,
+            },
+          },
+    );
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    [false, 'operator', 'admin', 403],
+    [true, 'operator', 'admin', 403],
+    [false, 'admin', 'operator', 200],
+    [true, 'admin', 'operator', 200],
+  ] as const)('C workflow start keeps the original actor role across body reads: keyed=%s %s to %s', async (keyed, initialRole, laterRole, status) => {
+    const values = {
+      id: 'original-actor',
+      role: initialRole as ApprovalActor['role'],
+    };
+    const id = vi.fn(() => values.id);
+    const role = vi.fn(() => values.role);
+    const actor: ApprovalActor = {
+      get id() {
+        return id();
+      },
+      get role() {
+        return role();
+      },
+    };
+    let source: ActorContext | undefined;
+    const store = cStartStore();
+    const reserve = vi.spyOn(store, 'reserve');
+    const policy = vi.fn<NonNullable<RunRouterOptions['beforeStart']>>(
+      async () => {},
+    );
+    const start = vi.fn<RunRouterOptions['start']>(async (input) => ({
+      runId: input.runId,
+      status: 'success',
+    }));
+    const fixture = makeHarness({
+      transformContext: (context) => {
+        source = { ...context, actor, mutationEpoch: 2 };
+        return source;
+      },
+      beforeStart: policy,
+      start,
+      status: async () => undefined,
+      startIdempotency: keyed
+        ? { store, live: async () => false, executionFence: 'none' }
+        : 'none',
+    });
+    const body = cHeldBody({
+      workflowId: RESTRICTED_FLOW.id,
+      requestContext: { 'app.attribution': 'original' },
+      ...(keyed ? { idempotencyKey: 'original-key' } : {}),
+    });
+    const pending = fixture.handle(body.request);
+    void pending.catch(() => undefined);
+    try {
+      await body.entered.promise;
+      expect(id).toHaveBeenCalledTimes(1);
+      expect(role).toHaveBeenCalledTimes(1);
+      expect(policy).not.toHaveBeenCalled();
+      expect(reserve).not.toHaveBeenCalled();
+      values.id = 'replacement-actor';
+      values.role = laterRole;
+      Object.assign(source ?? {}, {
+        principal: humanPrincipal({
+          id: 'replacement-principal',
+          role: 'admin',
+        }),
+        mutationEpoch: 3,
+      });
+    } finally {
+      body.release.resolve();
+      await pending;
+    }
+    const response = await pending;
+    expect(response?.status).toBe(status);
+    if (status === 403) {
+      expect(await response?.json()).toEqual({
+        error: "role 'operator' may not start 'restricted-flow'",
+      });
+      expect(policy).not.toHaveBeenCalled();
+      expect(reserve).not.toHaveBeenCalled();
+      expect(start).not.toHaveBeenCalled();
+    } else {
+      expect(policy.mock.calls[0]?.[0]).toMatchObject({
+        actor: { id: 'original-actor', role: initialRole },
+        principal: { id: OPERATOR.id },
+        mutationEpoch: 2,
+      });
+      expect(start.mock.calls[0]?.[0]).toMatchObject({
+        workflowId: RESTRICTED_FLOW.id,
+        requestContext: { 'app.attribution': 'original' },
+        principal: { id: OPERATOR.id },
+        mutationEpoch: 2,
+      });
+      expect(start).toHaveBeenCalledOnce();
+      expect(reserve).toHaveBeenCalledTimes(keyed ? 1 : 0);
+    }
+    expect(id).toHaveBeenCalledTimes(1);
+    expect(role).toHaveBeenCalledTimes(1);
+    expect(Object.isFrozen(actor)).toBe(false);
+    expect(Object.isFrozen(source)).toBe(false);
+  });
+
+  it.each([
+    'unkeyed',
+    'reserve',
+    'claim',
+  ] as const)('C suspended start keeps original approval requester and workflow: %s', async (boundary) => {
+    const keyed = boundary !== 'unkeyed';
+    const actor: ApprovalActor = { id: OPERATOR.id, role: 'operator' };
+    let source: ActorContext | undefined;
+    const policyEntered = cDeferred();
+    const policyRelease = cDeferred();
+    const f3Entered = cDeferred();
+    const f3Release = cDeferred();
+    const startEntered = cDeferred();
+    const startRelease = cDeferred();
+    const store = cStartStore();
+    const reserve = store.reserve.bind(store);
+    const claim = store.claimReservation.bind(store);
+    const reserveSpy = vi
+      .spyOn(store, 'reserve')
+      .mockImplementation(async (...args) => {
+        if (boundary === 'reserve') {
+          f3Entered.resolve();
+          await f3Release.promise;
+        }
+        return reserve(...args);
+      });
+    vi.spyOn(store, 'claimReservation').mockImplementation(async (...args) => {
+      if (boundary === 'claim') {
+        f3Entered.resolve();
+        await f3Release.promise;
+      }
+      return claim(...args);
+    });
+    const policy = vi.fn<NonNullable<RunRouterOptions['beforeStart']>>(
+      async () => {
+        policyEntered.resolve();
+        await policyRelease.promise;
+      },
+    );
+    const start = vi.fn<RunRouterOptions['start']>(async (input) => {
+      startEntered.resolve();
+      await startRelease.promise;
+      return {
+        ...suspendedSummary(input.runId),
+        requestedBy: OPERATOR.id,
+        requestedByKind: 'human',
+      };
+    });
+    const fixture = makeHarness({
+      transformContext: (context) => {
+        source = { ...context, actor, mutationEpoch: 2 };
+        return source;
+      },
+      beforeStart: policy,
+      start,
+      status: async () => undefined,
+      startIdempotency: keyed
+        ? { store, live: async () => false, executionFence: 'none' }
+        : 'none',
+    });
+    let applicationContext = { 'app.attribution': 'original' };
+    const contextRead = vi.fn(() => applicationContext);
+    const body = {
+      workflowId: OPEN_FLOW.id,
+      inputData: { original: true },
+      get requestContext() {
+        return contextRead();
+      },
+      set requestContext(value) {
+        applicationContext = value;
+      },
+      deadlineMs: 60,
+      idempotencyKey: keyed ? 'original-key' : undefined,
+    };
+    const originalInput = body.inputData;
+    const originalContext = applicationContext;
+    const raw = JSON.stringify(body);
+    contextRead.mockClear();
+    const parse = JSON.parse;
+    const parser = vi
+      .spyOn(JSON, 'parse')
+      .mockImplementation((text, reviver) =>
+        text === raw ? body : parse(text, reviver),
+      );
+    const pending = fixture.handle(req('/runs', { body: raw }));
+    const outcome = pending.then(
+      () => false,
+      () => false,
+    );
+    try {
+      expect(
+        await Promise.race([policyEntered.promise.then(() => true), outcome]),
+      ).toBe(true);
+      Object.assign(actor, { id: 'replacement', role: 'admin' });
+      Object.assign(source ?? {}, {
+        principal: humanPrincipal({ id: 'replacement', role: 'admin' }),
+        mutationEpoch: 3,
+      });
+      Object.assign(body, {
+        workflowId: RESTRICTED_FLOW.id,
+        idempotencyKey: 'replacement',
+        deadlineMs: 999,
+        inputData: { replaced: true },
+        requestContext: { 'app.attribution': 'replacement' },
+      });
+      policyRelease.resolve();
+      if (keyed) {
+        expect(
+          await Promise.race([
+            f3Entered.promise.then(() => true),
+            startEntered.promise.then(() => false),
+            outcome,
+          ]),
+        ).toBe(true);
+        Object.assign(actor, { id: 'after-f3', role: 'viewer' });
+        Object.assign(source ?? {}, { mutationEpoch: 4 });
+        f3Release.resolve();
+      }
+      expect(
+        await Promise.race([startEntered.promise.then(() => true), outcome]),
+      ).toBe(true);
+      Object.assign(actor, { id: 'after-execution', role: 'viewer' });
+      body.workflowId = 'after-execution';
+    } finally {
+      policyRelease.resolve();
+      f3Release.resolve();
+      startRelease.resolve();
+      await outcome;
+      parser.mockRestore();
+    }
+    const response = await pending;
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toMatchObject({
+      approval: { requestedBy: OPERATOR.id, workflowId: OPEN_FLOW.id },
+    });
+    expect(policy.mock.calls[0]?.[0]).toMatchObject({
+      actor: { id: OPERATOR.id, role: 'operator' },
+      principal: { id: OPERATOR.id },
+      mutationEpoch: 2,
+    });
+    expect(policy.mock.calls[0]?.slice(1)).toEqual([
+      OPEN_FLOW.id,
+      originalInput,
+      originalContext,
+    ]);
+    expect(start.mock.calls[0]?.[0]).toMatchObject({
+      workflowId: OPEN_FLOW.id,
+      inputData: originalInput,
+      requestContext: originalContext,
+      deadlineMs: 60,
+      principal: { id: OPERATOR.id },
+      mutationEpoch: 2,
+    });
+    if (keyed) {
+      expect(start.mock.calls[0]?.[0].idempotencyKey).toBe('original-key');
+      expect(reserveSpy.mock.calls[0]?.[0]).toMatchObject({
+        key: 'original-key',
+        targetId: OPEN_FLOW.id,
+        owner: { kind: 'human', id: OPERATOR.id },
+      });
+    }
+    expect(start).toHaveBeenCalledOnce();
+    expect(contextRead).toHaveBeenCalledOnce();
+  });
+});
 
 describe('createRunRouter — composition and auth', () => {
   it('returns null for paths it does not own', async () => {
@@ -516,6 +1041,214 @@ describe('createRunRouter — per-workflow allowedRoles', () => {
 
     // #then
     expect(response?.status).toBe(404);
+  });
+});
+
+describe('createRunRouter — run-start application context', () => {
+  it.each([
+    undefined,
+    {},
+    { 'app.attribution': 'operator', nested: { tags: [1, true, null] } },
+  ])('forwards an accepted context to policy and both start branches: %j', async (requestContext) => {
+    for (const keyed of [false, true]) {
+      const beforeStart = vi.fn<NonNullable<RunRouterOptions['beforeStart']>>(
+        async () => {},
+      );
+      const start = vi.fn<RunRouterOptions['start']>(async ({ runId }) => ({
+        runId,
+        status: 'success',
+      }));
+      const { handle } = keyed
+        ? keyedHarness({ beforeStart, start })
+        : makeHarness({ beforeStart, start });
+      const inputData = { topic: 'launch' };
+      const response = await handle(
+        req('/runs', {
+          body: {
+            workflowId: OPEN_FLOW.id,
+            inputData,
+            requestContext,
+            ...(keyed ? { idempotencyKey: 'context-key' } : {}),
+          },
+        }),
+      );
+
+      expect(response?.status).toBe(200);
+      expect(beforeStart).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          principal: expect.objectContaining({ id: OPERATOR.id }),
+        }),
+        OPEN_FLOW.id,
+        inputData,
+        requestContext,
+      );
+      expect(start).toHaveBeenCalledOnce();
+      expect(start.mock.calls[0]?.[0].requestContext).toEqual(requestContext);
+      expect(
+        Object.hasOwn(start.mock.calls[0]?.[0] ?? {}, 'requestContext'),
+      ).toBe(requestContext !== undefined);
+    }
+  });
+
+  it.each([
+    null,
+    [],
+    ['value'],
+    true,
+    false,
+    0,
+    1,
+    '',
+    'value',
+  ])('refuses a non-record context before policy: %j', async (requestContext) => {
+    const beforeStart = vi.fn<NonNullable<RunRouterOptions['beforeStart']>>(
+      async () => {},
+    );
+    const { handle, started } = makeHarness({ beforeStart });
+    const response = await handle(
+      req('/runs', {
+        body: { workflowId: OPEN_FLOW.id, requestContext },
+      }),
+    );
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({
+      error: 'requestContext must be an object',
+      reason: 'reserved-context-key',
+    });
+    expect(beforeStart).not.toHaveBeenCalled();
+    expect(started).toEqual([]);
+  });
+
+  it.each([
+    ...RESERVED_EXECUTION_CONTEXT_KEYS,
+    'breakwater.futureCapability',
+  ])('refuses reserved application-context key %s before policy', async (key) => {
+    const beforeStart = vi.fn<NonNullable<RunRouterOptions['beforeStart']>>(
+      async () => {},
+    );
+    const { handle, started } = makeHarness({ beforeStart });
+    const response = await handle(
+      req('/runs', {
+        body: {
+          workflowId: OPEN_FLOW.id,
+          requestContext: Object.fromEntries([[key, 'forged']]),
+        },
+      }),
+    );
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({
+      error: `requestContext may not carry the reserved key '${key}'`,
+      reason: 'reserved-context-key',
+    });
+    expect(beforeStart).not.toHaveBeenCalled();
+    expect(started).toEqual([]);
+  });
+
+  it.each([
+    { actor: null, workflowId: OPEN_FLOW.id, status: 401 },
+    { actor: REVIEWER, workflowId: OPEN_FLOW.id, status: 403 },
+    { actor: VIEWER, workflowId: OPEN_FLOW.id, status: 403 },
+    { actor: OPERATOR, workflowId: RESTRICTED_FLOW.id, status: 403 },
+  ])('authenticates and authorizes before context validation: $actor $workflowId', async ({
+    actor,
+    workflowId,
+    status,
+  }) => {
+    const beforeStart = vi.fn<NonNullable<RunRouterOptions['beforeStart']>>(
+      async () => {},
+    );
+    const { handle, started } = makeHarness({ beforeStart });
+    for (const requestContext of [null, { runId: 'forged' }]) {
+      const response = await handle(
+        req('/runs', {
+          actor,
+          body: { workflowId, requestContext },
+        }),
+      );
+      expect(response?.status).toBe(status);
+      expect(await response?.json()).not.toHaveProperty('reason');
+    }
+    expect(beforeStart).not.toHaveBeenCalled();
+    expect(started).toEqual([]);
+  });
+
+  it.each([
+    undefined,
+    { 'app.attribution': 'accepted' },
+  ])('delivers application context to an actual connector without input-data attribution: %j', async (requestContext) => {
+    const execute = vi.fn<
+      ConnectorConfig<
+        Record<string, unknown>,
+        { attribution: unknown }
+      >['execute']
+    >(async (_input, context) => ({
+      attribution: context.requestContext?.get('app.attribution') ?? null,
+    }));
+    const connector = createConnector({
+      id: 'inspect-attribution',
+      description: 'Reads run attribution',
+      inputSchema: z.record(z.string(), z.unknown()),
+      outputSchema: z.object({ attribution: z.unknown() }),
+      permissions: { sideEffect: 'read' },
+      execute,
+    });
+    const host = init(
+      { storage: new InMemoryStore() },
+      { executionFence: 'none', startIdempotency: 'none' },
+    );
+    const inputSchema = z.record(z.string(), z.unknown());
+    host
+      .createWorkflow({
+        id: OPEN_FLOW.id,
+        inputSchema,
+        outputSchema: z.object({ attribution: z.unknown() }),
+      })
+      .then(
+        host.createStep({
+          id: 'inspect',
+          inputSchema,
+          outputSchema: z.object({ attribution: z.unknown() }),
+          execute: async ({ inputData, requestContext: stepContext }) =>
+            invokeConnector(connector, inputData, {
+              requestContext: stepContext,
+            }),
+        }),
+      )
+      .commit();
+    const { handle } = makeHarness({
+      start: ({
+        workflowId,
+        runId,
+        inputData,
+        requestContext: context,
+        principal,
+      }) =>
+        host.runtime.start(workflowId, {
+          runId,
+          inputData,
+          storedRequestContext: context,
+          requestedBy: principal.id,
+          requestedByKind: principal.kind,
+        }),
+    });
+    const response = await handle(
+      req('/runs', {
+        body: {
+          workflowId: OPEN_FLOW.id,
+          requestContext,
+          inputData: {
+            'app.attribution': 'forged-top-level',
+            requestContext: { 'app.attribution': 'forged-nested' },
+          },
+        },
+      }),
+    );
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toMatchObject({
+      status: 'success',
+      result: { attribution: requestContext?.['app.attribution'] ?? null },
+    });
+    expect(execute).toHaveBeenCalledOnce();
   });
 });
 
@@ -1047,20 +1780,113 @@ describe('createRunRouter — error mapping', () => {
     ).toBe(status);
   });
 
-  it('maps an unexpected failure to 500', async () => {
-    // #given
+  it.each([
+    new Error('private storage detail'),
+    'private callback detail',
+    { backend: 'private storage detail' },
+  ])('redacts an unexpected handler failure (%j)', async (error) => {
     const { handle } = makeHarness({
       status: async () => {
-        throw new Error('d1 exploded');
+        throw error;
       },
     });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const response = await handle(req('/runs/open-flow/acme_r1'));
+      expect(response?.status).toBe(500);
+      expect(response?.headers.get('content-type')).toBe('application/json');
+      expect(response?.headers.get('cache-control')).toBe('no-store');
+      expect(await response?.json()).toEqual({ error: 'internal error' });
+      expect(logged).toHaveBeenCalledWith(
+        JSON.stringify({
+          type: 'route-internal-error',
+          route: 'runs',
+          error: error instanceof Error ? error.message : String(error),
+        }),
+        error,
+      );
+    } finally {
+      logged.mockRestore();
+    }
+  });
 
-    // #when
+  it('returns the generic handler response when logging throws', async () => {
+    const { handle } = makeHarness({
+      status: async () => {
+        throw new Error('private storage detail');
+      },
+    });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {
+      throw new Error('diagnostic sink unavailable');
+    });
+    try {
+      const response = await handle(req('/runs/open-flow/acme_r1'));
+      expect(response?.status).toBe(500);
+      expect(await response?.json()).toEqual({ error: 'internal error' });
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it.each([
+    [503, new RunRouteError(503, 'retry later', { code: 'HOST_BUSY' })],
+    [503, new ExecutionFencedError('draining')],
+    [
+      409,
+      new RunLifecycleBlockedError({
+        code: 'DISPUTED_SETTLEMENT',
+        message:
+          'run termination is blocked while an economic operation is disputed',
+      }),
+    ],
+  ] as const)('preserves a typed status %s and its reason', async (status, error) => {
+    const { handle } = makeHarness({
+      status: async () => {
+        throw error;
+      },
+    });
     const response = await handle(req('/runs/open-flow/acme_r1'));
+    expect(response?.status).toBe(status);
+    expect(await response?.json()).toEqual({
+      error: error.message,
+      reason: error.reason,
+    });
+  });
+});
 
-    // #then
-    expect(response?.status).toBe(500);
-    expect(await response?.json()).toEqual({ error: 'd1 exploded' });
+describe('internal HTTP error diagnostics', () => {
+  it.each([
+    500, 502,
+  ] as const)('retains status %s and the original unreadable error', async (status) => {
+    const unreadableMessage = new Error();
+    Object.defineProperty(unreadableMessage, 'message', {
+      get() {
+        throw new Error('message is unreadable');
+      },
+    });
+    const unreadableValue = {
+      toString() {
+        throw new Error('value is unreadable');
+      },
+    };
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      for (const error of [unreadableMessage, unreadableValue]) {
+        const response = internalErrorResponse('test', error, status);
+        expect(response.status).toBe(status);
+        expect(response.headers.get('content-type')).toBe('application/json');
+        expect(response.headers.get('cache-control')).toBe('no-store');
+        expect(await response.json()).toEqual({ error: 'internal error' });
+        expect(logged.mock.lastCall?.[1]).toBe(error);
+        expect(JSON.parse(String(logged.mock.lastCall?.[0]))).toEqual({
+          type: 'route-internal-error',
+          route: 'test',
+          error: 'unreadable error',
+        });
+      }
+    } finally {
+      logged.mockRestore();
+    }
   });
 });
 
@@ -1136,6 +1962,73 @@ function keyedHarness(
 }
 
 describe('createRunRouter — idempotent start', () => {
+  it('revalidates context and host policy on replay while retaining the first accepted context', async () => {
+    let persisted: RunSummary | undefined;
+    const beforeStart = vi.fn<NonNullable<RunRouterOptions['beforeStart']>>(
+      async (_context, _workflowId, _inputData, requestContext) => {
+        if (requestContext?.['app.attribution'] === 'denied') {
+          throw new RunRouteError(403, 'attribution is not allowed');
+        }
+      },
+    );
+    const start = vi.fn<RunRouterOptions['start']>(
+      async ({ runId, requestContext }) => {
+        persisted = {
+          runId,
+          status: 'success',
+          result: { attribution: requestContext?.['app.attribution'] },
+        };
+        return persisted;
+      },
+    );
+    const { handle } = keyedHarness({
+      beforeStart,
+      start,
+      status: async () => persisted,
+    });
+    const request = (requestContext: unknown) =>
+      req('/runs', {
+        body: {
+          workflowId: OPEN_FLOW.id,
+          idempotencyKey: 'context-key',
+          requestContext,
+        },
+      });
+    const first = await handle(request({ 'app.attribution': 'winner' }));
+    const winningBody = await first?.json();
+    expect(first?.status).toBe(200);
+    expect(winningBody).toMatchObject({ result: { attribution: 'winner' } });
+
+    const divergent = await handle(request({ 'app.attribution': 'retry' }));
+    expect(divergent?.status).toBe(200);
+    expect(await divergent?.json()).toEqual(winningBody);
+    expect(beforeStart).toHaveBeenCalledTimes(2);
+    expect(beforeStart.mock.calls[1]?.[3]).toEqual({
+      'app.attribution': 'retry',
+    });
+
+    for (const invalid of [null, { runId: 'forged' }]) {
+      const response = await handle(request(invalid));
+      expect(response?.status).toBe(400);
+      expect(await response?.json()).toMatchObject({
+        reason: 'reserved-context-key',
+      });
+    }
+    expect(beforeStart).toHaveBeenCalledTimes(2);
+
+    const denied = await handle(request({ 'app.attribution': 'denied' }));
+    expect(denied?.status).toBe(403);
+    expect(await denied?.json()).toEqual({
+      error: 'attribution is not allowed',
+    });
+    expect(beforeStart).toHaveBeenCalledTimes(3);
+    expect(start).toHaveBeenCalledOnce();
+    expect(start.mock.calls[0]?.[0].requestContext).toEqual({
+      'app.attribution': 'winner',
+    });
+    expect(persisted).toEqual(winningBody);
+  });
+
   it('refuses a key on a host that wired no reservation store', async () => {
     // #given the typed opt-out — the default in this file
     const { handle } = makeHarness();
@@ -1305,7 +2198,9 @@ describe('createRunRouter — idempotent start', () => {
       targetId: 'open-flow',
       mintRunId: () => 'inflight_run',
     });
-    await store.claim('key-1', 'inflight_run');
+    const unclaimedReservation = await store.readForAdmission('key-1');
+    if (!unclaimedReservation) throw new Error('missing reservation');
+    await store.claimReservation(unclaimedReservation);
 
     // #when
     const response = await handle(
@@ -1333,7 +2228,9 @@ describe('createRunRouter — idempotent start', () => {
       targetId: 'open-flow',
       mintRunId: () => 'orphan_run',
     });
-    await store.claim('key-1', 'orphan_run');
+    const unclaimedReservation = await store.readForAdmission('key-1');
+    if (!unclaimedReservation) throw new Error('missing reservation');
+    await store.claimReservation(unclaimedReservation);
 
     // #when
     const response = await handle(
@@ -1361,8 +2258,21 @@ describe('createRunRouter — idempotent start', () => {
       targetId: 'open-flow',
       mintRunId: () => 'settled_run',
     });
-    await store.claim('key-1', 'settled_run');
-    await store.settleRun('settled_run');
+    const unclaimedReservation = await store.readForAdmission('key-1');
+    if (!unclaimedReservation) throw new Error('missing reservation');
+    await store.claimReservation(unclaimedReservation);
+    const terminalExecution = {
+      tablePrefix: '',
+      workflowId: 'open-flow',
+      runId: 'settled_run',
+      startToken: 'settled-generation',
+      owner: { kind: 'human' as const, id: OPERATOR.id },
+      target: { kind: 'workflow' as const, id: 'open-flow' },
+    };
+    const startedReservation = await store.readForAdmission('key-1');
+    if (!startedReservation) throw new Error('missing started reservation');
+    await store.bindPreparedStart(startedReservation, terminalExecution);
+    await store.settleExecution(terminalExecution);
 
     // #when
     const response = await handle(
@@ -1405,7 +2315,7 @@ describe('createRunRouter — idempotent start', () => {
     });
   });
 
-  it('gives the claim back when the execution fence refuses, and converges on retry after it reopens', async () => {
+  it('retains the claim after an outer fence error and refuses another engine entry', async () => {
     // #given a deployment whose fence closes between the claim and the start
     let fenced = true;
     const executions: string[] = [];
@@ -1427,6 +2337,7 @@ describe('createRunRouter — idempotent start', () => {
       }),
     );
     const reservedRunId = (await store.read('key-1'))?.runId;
+    expect((await store.read('key-1'))?.state).toBe('started');
     fenced = false;
     const retry = await handle(
       req('/runs', {
@@ -1434,15 +2345,15 @@ describe('createRunRouter — idempotent start', () => {
       }),
     );
 
-    // #then the fence's own refusal reached the caller, the claim went back,
-    // and the retry ran the SAME run — a fence transition mid-start must not
-    // manufacture an unresolvable reservation, nor a second run.
+    // The outer error proves no absence of effects, so the exact claim remains spent.
     expect(refused?.status).toBe(503);
     expect(await refused?.json()).toMatchObject({
       reason: { code: 'EXECUTION_FENCED' },
     });
-    expect(retry?.status).toBe(200);
-    expect(executions).toEqual([reservedRunId]);
+    expect(retry?.status).toBe(409);
+    expect((await store.read('key-1'))?.state).toBe('started');
+    expect((await store.read('key-1'))?.runId).toBe(reservedRunId);
+    expect(executions).toEqual([]);
   });
 
   it('keeps the claim when a start fails for any other reason', async () => {

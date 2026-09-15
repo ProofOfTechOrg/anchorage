@@ -15,6 +15,53 @@
 // depend on breakwater for their connectors) need to reach for. See module.ts.
 
 export {
+  assertMutationEpoch,
+  type D1RunExecutionIdentity,
+  type D1StartExecutionIdentity,
+  ExecutionFenceUnreadableError,
+  InvalidExecutionIdentityError,
+  InvalidMutationEpochError,
+  isRunStartPendingError,
+  MUTATION_EPOCH_HEADER,
+  type MutationEpochContext,
+  MutationEpochMismatchError,
+  mutationEpochFromHeader,
+  normalizeD1RunExecutionIdentity,
+  normalizeMutationEpoch,
+  normalizeRunExecutionIdentity,
+  normalizeStartExecutionIdentity,
+  normalizeStartIdentity,
+  type ProofEntryExpectation,
+  type RunAdmissionConflictClassification,
+  RunAdmissionConflictError,
+  type RunExecutionIdentity,
+  RunStartPendingError,
+  type StartExecutionIdentity,
+  type StartIdentity,
+  stampMutationEpoch,
+} from '../do-runner/execution-admission.js';
+export {
+  type ExecutionFenceReading,
+  type ExecutionFenceTransition,
+  type ExecutionFenceVersionedReading,
+  executionFenceReadingPayload,
+} from '../do-runner/execution-fence.js';
+export {
+  FENCED_WORKFLOW_STORAGE,
+  type FencedWorkflowAdmissionCapability,
+  type InitialAdmissionDatabase,
+  type InitialAdmissionWitness,
+  type InitialRunAdmission,
+  type InitialTerminalizationRequest,
+  type InitialTerminalizationResult,
+} from '../do-runner/fenced-workflow-capability.js';
+export { isDefinitiveInitialAdmissionRefusal } from '../do-runner/initial-admission-refusal.js';
+export type { RunTerminalCleanup } from '../do-runner/run-lifecycle.js';
+export type {
+  D1RunAddress,
+  RawWorkflowSnapshot,
+} from '../do-runner/workflow-snapshot-row.js';
+export {
   type BoundedBodyResult,
   readBoundedBody,
 } from '../http-body.js';

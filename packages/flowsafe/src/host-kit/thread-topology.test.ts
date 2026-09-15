@@ -6,7 +6,11 @@ import {
   type ExecutionPrincipal,
   principalActor,
 } from '../approval-api/index.js';
-import { EXECUTION_PRINCIPAL_HEADER } from '../do-runner/index.js';
+import {
+  EXECUTION_PRINCIPAL_HEADER,
+  InvalidMutationEpochError,
+  MUTATION_EPOCH_HEADER,
+} from '../do-runner/index.js';
 import {
   createThreadTopology,
   type ThreadNamespaceLike,
@@ -61,6 +65,94 @@ function harness() {
     hits,
   };
 }
+
+describe('C thread epoch transport', () => {
+  it('C thread send deletes an absent epoch header', async () => {
+    const { topology, hits } = harness();
+    await topology.send(context(), 'thread-1', '/start', {
+      method: 'POST',
+      body: '{"prompt":"hello"}',
+      headers: {
+        'X-Flowsafe-Mutation-Epoch': '7',
+        [MUTATION_EPOCH_HEADER]: '8',
+      },
+    });
+    expect(
+      new Headers(hits[0]?.init?.headers).get(MUTATION_EPOCH_HEADER),
+    ).toBeNull();
+    expect(hits[0]?.init?.body).toBe('{"prompt":"hello"}');
+  });
+
+  it('C thread forward deletes an absent epoch header', async () => {
+    const { topology, hits } = harness();
+    const request = new Request('https://host/stream', {
+      headers: {
+        Upgrade: 'websocket',
+        'X-Flowsafe-Mutation-Epoch': '7',
+        [MUTATION_EPOCH_HEADER]: '8',
+      },
+    });
+    await topology.forward(context(), 'thread-1', request);
+    const forwarded = hits[0]?.request as Request;
+    expect(forwarded.headers.get(MUTATION_EPOCH_HEADER)).toBeNull();
+    expect(forwarded.headers.get('upgrade')).toBe('websocket');
+    expect(request.headers.get(MUTATION_EPOCH_HEADER)).toBe('7, 8');
+  });
+
+  it.each([
+    0,
+    Number.MAX_SAFE_INTEGER,
+  ])('C stamps both thread transports with canonical epoch %s', async (mutationEpoch) => {
+    const { topology, hits } = harness();
+    const trusted = { ...context(), mutationEpoch };
+    await topology.send(trusted, 'thread-1', '/start', {
+      headers: {
+        'X-Flowsafe-Mutation-Epoch': 'forged',
+        [MUTATION_EPOCH_HEADER]: '8',
+      },
+      body: '{"prompt":"hello"}',
+    });
+    const request = new Request('https://host/start', {
+      method: 'POST',
+      headers: { [MUTATION_EPOCH_HEADER]: 'forged' },
+      body: 'payload',
+    });
+    await topology.forward(trusted, 'thread-1', request);
+    expect(new Headers(hits[0]?.init?.headers).get(MUTATION_EPOCH_HEADER)).toBe(
+      String(mutationEpoch),
+    );
+    const forwarded = hits[1]?.request as Request;
+    expect(forwarded.headers.get(MUTATION_EPOCH_HEADER)).toBe(
+      String(mutationEpoch),
+    );
+    expect(await forwarded.text()).toBe('payload');
+    expect(request.headers.get(MUTATION_EPOCH_HEADER)).toBe('forged');
+  });
+
+  it.each([
+    null,
+    '2',
+    true,
+    -1,
+    0.5,
+    NaN,
+    Infinity,
+    Number.MAX_SAFE_INTEGER + 1,
+  ])('C invalid thread epoch refuses before namespace lookup (%s)', async (mutationEpoch) => {
+    const { topology, namespace, hits } = harness();
+    const get = vi.spyOn(namespace, 'get');
+    const trusted = { ...context(), mutationEpoch } as ActorContext;
+    await expect(
+      topology.send(trusted, 'thread-1', '/start'),
+    ).rejects.toBeInstanceOf(InvalidMutationEpochError);
+    await expect(
+      topology.forward(trusted, 'thread-1', new Request('https://host/')),
+    ).rejects.toBeInstanceOf(InvalidMutationEpochError);
+    expect(namespace.idFromName).not.toHaveBeenCalled();
+    expect(get).not.toHaveBeenCalled();
+    expect(hits).toEqual([]);
+  });
+});
 
 describe('createThreadTopology', () => {
   it('stamps the canonical human principal and strips retired identity headers', async () => {

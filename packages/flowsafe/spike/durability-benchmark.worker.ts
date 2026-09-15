@@ -423,6 +423,7 @@ function flowsafeService(env: Env): ApprovalService {
     // This one DECIDES, and decide() commits before it resumes: same database,
     // same fence as the runs it moves.
     executionFence: executionFenceFor(env.DB as unknown as never),
+    workflowTablePrefix: '',
   });
 }
 

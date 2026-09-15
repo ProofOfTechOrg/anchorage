@@ -19,7 +19,33 @@ Repository documentation, architecture, and publication checks. Markdown syntax 
   satisfy fleet control's own validators. Lives here because
   `.dependency-cruiser.cjs` forbids anything under `packages/` from importing
   fleet control.
-- `workerd-server-lifecycle.mjs` — the one `wrangler dev` start/stop protocol
-  shared by the FlowSafe workerd harnesses and the conformance harness.
+- [`baseline-recorder.mjs`](baseline-recorder.mjs): recorder configuration and supported literal values are documented on `runBaselineRecorder`.
+- [`baseline-recorder.test.mjs`](baseline-recorder.test.mjs): run with `node --test scripts/baseline-recorder.test.mjs`.
+- [`record-drain-baseline.mjs`](record-drain-baseline.mjs): inventory recorder. Golden assertions live in [`cloudflare-client.test.ts`](../packages/fleet-control/test/cloudflare-client.test.ts).
+- [`record-audit-baseline.mjs`](record-audit-baseline.mjs): audit recorder. Golden assertions live in [`fleet-audit-golden.test.ts`](../packages/fleet-control/test/fleet-audit-golden.test.ts).
+- [`record-migration-baseline.mjs`](record-migration-baseline.mjs): migration recorder. Golden assertions live in [`fleet-migration-golden.test.ts`](../packages/fleet-control/test/fleet-migration-golden.test.ts).
+- [`workerd-server-lifecycle.mjs`](workerd-server-lifecycle.mjs)
 - `workerd-server-lifecycle.test.mjs` — its vitest suite, run through the root
   `vitest.workerd-lifecycle.config.ts` project.
+
+## Record or compare a baseline
+
+Run a recorder manually with an explicit mode. Use `--check` to compare derived values without writing, or `--write` to replace the configured baseline and format it with Biome. Missing, unknown, or conflicting modes return status 2.
+
+`--check` compares configured exports. It does not establish refusal-guard coverage; retain the ordinary guard tests and architecture checks alongside the golden assertions.
+
+Run these checks before accepting a generated-file change:
+
+```bash
+node scripts/record-drain-baseline.mjs --check
+node scripts/record-audit-baseline.mjs --check
+node scripts/record-migration-baseline.mjs --check
+```
+
+To record an intended baseline change, select its command:
+
+```bash
+node scripts/record-drain-baseline.mjs --write
+node scripts/record-audit-baseline.mjs --write
+node scripts/record-migration-baseline.mjs --write
+```

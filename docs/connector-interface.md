@@ -82,7 +82,7 @@ const contact = await invokeConnector(createContact, input, {
 
 Omit `toolCallId` for suspension and run grants. For a tool-call grant, pass the exact runtime-owned ID. Never derive it from client input or store it in a shared `RequestContext`.
 
-The helper accepts only an unmodified `Connector` created by `createConnector()`. It calls the public Mastra execution wrapper, so schema validation and every Breakwater gate remain active. Input or output validation throws `ConnectorValidationError`. The error exposes only `connector` and `phase`; it omits Mastra's raw message, schema issue text, invalid value, and cause.
+The helper accepts only an unmodified `Connector` created by `createConnector()`. It calls the public Mastra execution wrapper, so schema validation and every Breakwater gate remain active. Input or output validation throws `ConnectorValidationError`. The error identifies the connector and phase with a stable kind/code; it omits Mastra's raw message, schema issue text, invalid value, and cause.
 
 ## Permission manifest
 
@@ -90,6 +90,7 @@ The helper accepts only an unmodified `Connector` created by `createConnector()`
 interface PermissionManifest {
   sideEffect: 'read' | 'write' | 'destructive' | 'idempotent';
   egress?: readonly string[];
+  egressEnforcement?: 'enforced' | 'declaration-only';
   idempotencyKey?: boolean;
   requiresApproval?: boolean;
   dryRun?: boolean;
@@ -127,6 +128,14 @@ Hostnames:
 - use label-boundary wildcard matching, and a wildcard does not include its apex.
 
 Declare redirect and regional hosts. Actual redirect hops must also remain within the list.
+
+### `egressEnforcement`
+
+`enforced` asserts that every HTTP request leaves through `ConnectorRuntime.fetch`, including a connector that issues no HTTP requests. This declaration concerns HTTP traffic; it excludes platform bindings such as D1, KV, R2, and service bindings, which the guard never sees. `declaration-only` states that a vendor SDK or child process uses its own transport: organization policy checks the declared hosts, but the guard cannot check its sockets.
+
+An omitted field resolves to `declaration-only`, because enforcement has not been established. `connectorEgressPosture(tool)` reads the resolved value and returns `undefined` for a tool that `createConnector()` did not build. The manifest itself retains the author's declaration without inserting a default, and connector audit events record the resolved value as `detail.egressEnforcement`.
+
+Set `policies.requireEgressEnforcement: true` to refuse construction unless the posture is `enforced`. The single-tenant preset accepts and pins the same flag. Construction rejects posture values outside the two literals.
 
 ### `idempotencyKey`
 
@@ -190,6 +199,8 @@ Authorization audit records the required identifiers and the resolution's `polic
 
 ## Deployment policy
 
+`requireEgressEnforcement` refuses construction of a connector whose resolved egress posture is not `enforced`.
+
 ```typescript
 interface ConnectorPolicies {
   networkEgress?: NetworkEgressOptions;
@@ -200,6 +211,7 @@ interface ConnectorPolicies {
   rateLimitStore?: RateLimitStore;
   audit?: AuditLogger;
   fetch?: EgressFetchBase;
+  requireEgressEnforcement?: true;
 }
 ```
 
@@ -256,9 +268,73 @@ schema validation
   -> idempotency commit
 ```
 
-A denial throws `ConnectorPolicyError` with connector id, policy name, and reason. Every gate records its decision through the supplied audit logger. Connector decisions use `agentAuditDetail()`, so trusted `breakwater.auditContext` correlation overrides same-named decision detail.
+A denial throws `ConnectorPolicyError`; use its [decision code](#connector-decision-codes) for machine handling. Decisions that reach the configured audit wrapper retain their existing audit events. Connector decisions use `agentAuditDetail()`, so trusted `breakwater.auditContext` correlation overrides same-named decision detail.
 
 An arbitrary execution, store, evaluator, or parser throw is not copied verbatim into audit. Safe built-in errors can register a static reason and bounded metadata.
+
+## Connector decision codes
+
+Branch on `code`, `policyKind` and `retryable` from the exported error types instead of parsing human reasons. `ConnectorDecisionCode` names the patch-stable catalogue; `ConnectorPolicyName` describes canonical categories. Diagnostic `policy` values remain arbitrary strings, including custom evaluator names.
+
+Import `CONNECTOR_DECISIONS`, `isConnectorDecisionCode`, `connectorDecisionRetryable` and the error types from `@proofoftech/breakwater/connector-sdk` or the root package. The catalogue and its entries are frozen. The retryability helper rejects unknown codes; a structural code check classifies data without establishing who produced it.
+
+| Code | Emitted for | Retryable |
+| --- | --- | --- |
+| `CONNECTOR_ALLOWED` | Fresh execution, replay, joined execution or simulation returns a result | false |
+| `PERMISSION_GRANTED` | existing connector.authorize allow event | false |
+| `APPROVAL_GRANTED` | existing connector.approval allow event | false |
+| `IDEMPOTENCY_TAKEOVER` | existing separate stale-reservation takeover event; no new takeover behavior | false |
+| `EGRESS_INPUT_INVALID` | standalone guard received neither supported URL string nor URL-like object | false |
+| `EGRESS_URL_INVALID` | initial URL parsing refusal | false |
+| `EGRESS_SCHEME_NOT_ALLOWED` | initial non-http(s) scheme | false |
+| `EGRESS_HOST_NOT_DECLARED` | initial actual request host outside manifest | false |
+| `EGRESS_REDIRECT_URL_INVALID` | unparseable redirect Location | false |
+| `EGRESS_REDIRECT_SCHEME_NOT_ALLOWED` | redirect to non-http(s) scheme | false |
+| `EGRESS_REDIRECT_HOST_DENIED` | redirect host outside manifest | false |
+| `EGRESS_REDIRECT_UNVERIFIABLE` | opaque status-0 redirect; Location unavailable | false |
+| `EGRESS_REDIRECT_LIMIT_EXCEEDED` | guard refuses to follow beyond configured cap | false |
+| `EGRESS_REDIRECT_BODY_UNREPLAYABLE` | one-shot body cannot be resent safely | false |
+| `EGRESS_DENIED` | backward-compatible manually constructed standalone EgressDeniedError without explicit metadata | false |
+| `EGRESS_HOST_NOT_ALLOWED_BY_ORG` | networkEgress rejects a declared host; independent of name override | false |
+| `PERMISSION_PROJECTION_INVALID` | required-permission projection absent or malformed | false |
+| `PERMISSION_MISSING` | valid projection lacks one or more required identifiers | false |
+| `APPROVAL_GRANT_MISSING` | no valid matching structured approval grant, including stale/wrong/malformed grants | false |
+| `RATE_LIMIT_EXCEEDED` | increment succeeded and exhausted configured budget | true |
+| `IDEMPOTENCY_KEY_MISSING` | manifest requires a nonempty key | false |
+| `IDEMPOTENCY_CONFLICT` | legacy or current atomic pending execution owns the same key | true |
+| `IDEMPOTENCY_LEGACY_AMBIGUOUS` | ambiguous legacy tuple needs external association | false |
+| `IDEMPOTENCY_MIGRATION_REQUIRED` | legacy writer drain acknowledgement absent | false |
+| `DRY_RUN_UNSUPPORTED` | simulation requested without declared implementation | false |
+| `WORKFLOW_SCOPE_MISSING` | crossWorkflowIsolation addresses workflow state without caller scope | false |
+| `CROSS_WORKFLOW_ACCESS_DENIED` | target differs from caller workflow | false |
+| `ISOLATION_SCOPE_MISSING` | tenantIsolation has no valid opaque scope | false |
+| `BACKGROUND_OVERRIDE_DENIED` | SDK hard presence check rejects foreground-only argument override | false |
+| `BACKGROUND_EXECUTION_DENIED` | backgroundExecution evaluator rejects write-class enabled override | false |
+| `EVALUATOR_DENIED` | custom/legacy evaluator denial without more specific metadata | false |
+| `EVALUATOR_FAILED` | tool evaluator throws or returns invalid new decision metadata | false |
+| `STORE_UNAVAILABLE` | pre-execution increment/get/inspect/reserve exception | true |
+| `STORE_COMMIT_FAILED` | post-success put failed; audit only, successful result still delivered | false |
+| `STORE_RELEASE_FAILED` | best-effort release failed; audit only, original failure remains primary | false |
+| `CONNECTOR_EXECUTION_FAILED` | existing generic execute-failure audit; arbitrary application exception still propagates unchanged | false |
+| `CONNECTOR_INPUT_INVALID` | invokeConnector input validation boundary | false |
+| `CONNECTOR_OUTPUT_INVALID` | wrapper output validation audit and invokeConnector validation boundary | false |
+| `CONNECTOR_UNREGISTERED` | invokeConnector did not receive a registered connector | false |
+| `CONNECTOR_BOUNDARY_MODIFIED` | registered execution boundary fingerprint differs | false |
+| `CONNECTOR_INVOCATION_OPTIONS_INVALID` | explicit invalid toolCallId boundary | false |
+| `CONNECTOR_BOUNDARY_UNVERIFIABLE` | public execute returned without entering protected wrapper and was not recognized input validation | false |
+
+
+A retryable refusal permits another attempt after its condition clears, with the same logical operation and idempotency identity. It does not authorize a fresh key or prove that uncertain external effects can be repeated. Breakwater adds no automatic retries. A redirect refusal remains non-retryable because the preceding request may already have caused an effect.
+
+`ConnectorPolicyError` retains `connector`, `policy`, `reason` and its three-string constructor. It adds `kind: 'connector-policy'`, code, canonical category, retryability and code-specific details. A manually constructed legacy error receives `EVALUATOR_DENIED`; names never determine codes. Custom evaluators may still return `{ allowed: false, reason }`, or supply a denial code and its supported details. Invalid new metadata becomes `ConnectorEvaluatorError` with `EVALUATOR_FAILED`.
+
+`ConnectorStoreError` identifies the actual store and operation. Before execution, a store failure retains the original exception on native `cause`, with a fixed public message and `STORE_UNAVAILABLE`. After a successful effect, a failed `put` is audited as `STORE_COMMIT_FAILED` while the successful result remains returned. A failed best-effort release is audited as `STORE_RELEASE_FAILED` while the original failure remains primary. The [Agent CLI adapter](agent-cli-connectors.md#error-handling) preserves the taxonomy while omitting raw causes.
+
+`ConnectorValidationError` has `kind: 'connector-validation'` and the input/output code while keeping schema values, issue text and causes private. `ConnectorInvocationError` extends `TypeError` for the public ownership, options and enforcement-boundary refusals. Arbitrary application execution exceptions retain their original identity; their audit event uses `CONNECTOR_EXECUTION_FAILED`.
+
+Safe details describe an extracted host/hop, declared or missing permission identifiers, policy version, or configured rate limit/window where the code supports them. They are copied rather than merged from arbitrary objects. Effective grants, idempotency keys, request bodies, full URLs and raw causes do not enter these new details. Host-authored diagnostic names and reasons remain prose; do not put secrets in them.
+
+SDK-owned audit events carry `decisionCode`, `policyKind` and `retryable` from the same classification as the thrown error. Nested connector errors retain their causal code even when the outer event's decision is `error`. Shared audit fields remain optional for non-connector events. Input validation or invocation refusal can precede the configured audit wrapper, so such a refusal does not imply that an audit event exists.
 
 ## Network egress
 
@@ -299,7 +375,7 @@ The wrapper does not intercept:
 - a vendor SDK's private transport;
 - the child process used by an Agent CLI connector.
 
-Inject `runtime.fetch` into compatible SDKs. Apply infrastructure network policy for process-wide enforcement.
+Inject `runtime.fetch` into compatible SDKs. Apply infrastructure network policy for process-wide enforcement. A connector using a transport outside the guard declares `egressEnforcement: 'declaration-only'`; `connectorEgressPosture()` reads that declaration and connector audit events record it as `detail.egressEnforcement`.
 
 ## Approval context
 
@@ -520,3 +596,19 @@ At minimum, test:
 12. packed npm consumer behavior.
 
 For Agent CLIs, also read [Agent CLI connectors](agent-cli-connectors.md).
+
+### Assert connector conformance
+
+Use `assertConnectorConformance(factory, { manifest, cases, entryPoints? })` from the root or connector SDK export to certify supplied cases for an enforced connector. The synchronous factory must wire both supplied policy members, `fetch` and `audit`. The [connector authoring guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/packages/breakwater/CONNECTORS.md#assert-connector-conformance) explains the expectations, preset wiring, instrumentation refusals, and timeout handling.
+
+A conformant run returns a `ConnectorConformanceReport`; otherwise `ConnectorConformanceError.report` contains it. The report exposes `conformant`, the resolved `posture` when available, `instrumented` labels, per-case evidence, a flat `findings` list, and `limit`. Case results expose their name, `proved` outcome, observed `guardedHosts`, refused `escapes`, positional `decisionCodes`, `transportCalls`, `auditEvents`, and their view of the findings. A finding has a code, reason, optional case name, and an optional policy member for wiring failures.
+
+On an absent or configurable entry point, the harness installs an accessor whose getter returns the trap. An assignment to that instrumented entry point is recorded when it happens as `INSTRUMENTATION_REPLACED` and is not applied; the trap stays in place. A writable non-configurable data property uses assignment installation, which offers no defence against assignments during execution. A redefinition still in place when the case settles or times out, or when the probe factory returns, is reported as `INSTRUMENTATION_REPLACED`. The channels the harness does not observe, a reference captured before installation and a redefinition the case reverses before it settles among them, are listed under [Conformance limits](https://github.com/ProofOfTechOrg/anchorage/blob/main/packages/breakwater/CONNECTORS.md#conformance-limits). The harness reports the requests that pass through its trap. A detected redefinition makes the case prove `nothing` and skip expectation checks. An assignment attempt or detected redefinition during probe construction refuses the run.
+
+| Finding | Meaning |
+| --- | --- |
+| `CASE_INVOCATION_FAILED` | Invocation failed before or during invocation; the reason names the error's constructor, uses `unknown` when that name is unavailable or unreadable, or describes a thrown non-Error value by type, without the message or value. During invocation, policy denials, boundary errors, and harness refusals retain their existing classifications. |
+
+The report states this finite-case limit:
+
+> conformance covers only the supplied cases, in this isolate, for the duration of each case; the channels it does not observe are listed at https://github.com/ProofOfTechOrg/anchorage/blob/main/packages/breakwater/CONNECTORS.md#conformance-limits

@@ -161,7 +161,7 @@ The manifest declaration and injected fetch are separate checks:
 
 Cross-origin redirect hops strip credential headers. A 307/308 redirect with a one-shot stream body is refused because replaying it safely is impossible.
 
-This is not socket interception. Code that calls global `fetch`, opens a socket, or uses an SDK with an independent HTTP stack bypasses runtime-fetch enforcement. Inject `runtime.fetch` into compatible SDKs and apply infrastructure egress controls around the process.
+This is not socket interception. Code that calls global `fetch`, opens a socket, or uses an SDK with an independent HTTP stack bypasses runtime-fetch enforcement. Inject `runtime.fetch` into compatible SDKs and apply infrastructure egress controls around the process. A connector using an independent transport declares `egressEnforcement: 'declaration-only'`, readable through `connectorEgressPosture()` and recorded in connector audit events as `detail.egressEnforcement`.
 
 ## Replay and rate budgets
 

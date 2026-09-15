@@ -8,7 +8,7 @@
 // row whose run is still readable — and each one asserts the EXPENSIVE
 // direction: that exactly one caller was told to start.
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   openSqlite,
@@ -16,13 +16,15 @@ import {
   sqliteUnitDatabase,
 } from '../../test-support/sqlite.js';
 import { doErrorResponse } from './do-error-response.js';
-import type { ExecutionFenceDatabase } from './execution-fence.js';
 import {
-  ExecutionFencedError,
-  ExecutionFenceStore,
-} from './execution-fence.js';
+  InvalidExecutionIdentityError,
+  RunAdmissionConflictError,
+  type StartExecutionIdentity,
+} from './execution-admission.js';
+import { ExecutionFenceStore } from './execution-fence.js';
 import {
   beginIdempotentStart,
+  decodeStartReservationAdmissionResult,
   IdempotentStartAlreadySettledError,
   IdempotentStartPendingError,
   type IdempotentStartSurface,
@@ -30,19 +32,1308 @@ import {
   InvalidStartIdempotencyRequestError,
   isStartReservationRefusal,
   requireStartIdempotency,
-  rollbackFencedStart,
+  START_IDEMPOTENCY_DDL,
   START_IDEMPOTENCY_TABLE,
   type StartIdempotencyDatabase,
+  type StartIdempotencyStatement,
   StartIdempotencyStore,
   StartIdempotencyUnsupportedError,
   type StartReservation,
   StartReservationOwnerMismatchError,
+  type StartReservationReading,
+  type StartReservationRequest,
   StartReservationTargetMismatchError,
   StartReservationUnreadableError,
+  validateStartReservationAdmissionSchema,
 } from './start-idempotency.js';
 
 const OWNER = { kind: 'human', id: 'operator-1' } as const;
 const OTHER_OWNER = { kind: 'human', id: 'operator-2' } as const;
+
+describe('FS8 D2 exact reservation primitives', () => {
+  const execution: StartExecutionIdentity = {
+    tablePrefix: '',
+    workflowId: 'payout',
+    runId: 'run',
+    startToken: 'generation',
+    owner: OWNER,
+    target: { kind: 'workflow', id: 'payout' },
+  };
+  const methods = [
+    'claimReservation',
+    'releaseReservation',
+    'associateReservation',
+    'bindPreparedStart',
+  ] as const;
+  type Method = (typeof methods)[number];
+
+  async function modern(state: 'reserved' | 'started' = 'reserved') {
+    const h = harness();
+    const reserved = await h.store.reserve(workflowRequest('key', 'run'));
+    expect(reserved.reservation.binding).toEqual({ kind: 'unbound' });
+    h.sqlite
+      .prepare(
+        "UPDATE flowsafe_start_idempotency SET state = ?, start_token = ''",
+      )
+      .run(state);
+    const observed = await h.store.readForAdmission('key');
+    if (!observed) throw new Error('modern fixture is missing');
+    return { ...h, observed };
+  }
+
+  function invoke(
+    store: StartIdempotencyStore,
+    method: Method,
+    observed: StartReservationReading,
+    identity = execution,
+  ) {
+    return method === 'claimReservation' || method === 'releaseReservation'
+      ? store[method](observed)
+      : store[method](observed, identity);
+  }
+
+  const stateFor = (method: Method) =>
+    method === 'claimReservation' ? 'reserved' : 'started';
+  const bindingFor = (identity = execution) => ({
+    kind: 'bound' as const,
+    execution: {
+      tablePrefix: identity.tablePrefix,
+      workflowId: identity.workflowId,
+      runId: identity.runId,
+      startToken: identity.startToken,
+    },
+  });
+
+  it('returns exactly one own claim receipt for simultaneous equal-stamp contenders', async () => {
+    const h = await modern();
+    const claims = await Promise.all([
+      h.store.claimReservation(h.observed),
+      new StartIdempotencyStore(h.binding, {
+        now: () => 1_000,
+      }).claimReservation(h.observed),
+    ]);
+    expect(claims.filter(Boolean)).toHaveLength(1);
+    const winner = claims.find(Boolean);
+    if (!winner) throw new Error('winning claim is missing');
+    expect(winner).toEqual({
+      ...h.observed,
+      state: 'started',
+      updatedAt: 1_001,
+    });
+    expect(Object.isFrozen(winner)).toBe(true);
+    expect(Object.isFrozen(winner?.owner)).toBe(true);
+    expect(Object.isFrozen(winner?.binding)).toBe(true);
+    expect(await h.store.releaseReservation(winner)).toBe(true);
+    expect(rows(h.sqlite)[0]).toMatchObject({
+      state: 'reserved',
+      updated_at: 1_002,
+    });
+  });
+
+  it('returns one successful release for simultaneous callers holding the same claim', async () => {
+    const h = await modern('started');
+    await expect(
+      Promise.all([
+        h.store.releaseReservation(h.observed),
+        h.store.releaseReservation(h.observed),
+      ]),
+    ).resolves.toEqual([true, false]);
+    expect(rows(h.sqlite)[0]).toMatchObject({
+      state: 'reserved',
+      updated_at: 1_001,
+    });
+  });
+
+  it.each([
+    1_000, 100,
+  ])('rejects stale release and claim observations through an ABA cycle at clock %s', async (clock) => {
+    const h = await modern();
+    const store = new StartIdempotencyStore(h.binding, { now: () => clock });
+    const first = await store.claimReservation(h.observed);
+    if (!first) throw new Error('first claim is missing');
+    expect(await store.releaseReservation(first)).toBe(true);
+    const released = await store.readForAdmission('key');
+    if (!released) throw new Error('released row is missing');
+    const second = await store.claimReservation(released);
+    if (!second) throw new Error('second claim is missing');
+    const before = rows(h.sqlite);
+    const staleRelease = await store
+      .releaseReservation(first)
+      .catch((error: unknown) => error);
+    expect(rows(h.sqlite)).toEqual(before);
+    expect(staleRelease).toBe(false);
+    expect(first.updatedAt).toBe(1_001);
+    expect(released.updatedAt).toBe(1_002);
+    expect(second.updatedAt).toBe(1_003);
+    expect(await store.claimReservation(h.observed)).toBeUndefined();
+    expect(await store.releaseReservation(second)).toBe(true);
+    const staleClaim = await store
+      .claimReservation(released)
+      .catch((error: unknown) => error);
+    expect(rows(h.sqlite)[0]).toMatchObject({
+      state: 'reserved',
+      updated_at: 1_004,
+    });
+    expect(staleClaim).toBeUndefined();
+  });
+
+  it.each([
+    'claimReservation',
+    'releaseReservation',
+  ] as const)('%s refuses invalid or exhausted clocks before preparing SQL', async (method) => {
+    const h = await modern(stateFor(method));
+    for (const [clock, updatedAt] of [
+      [Number.NaN, 1_000],
+      [Number.POSITIVE_INFINITY, 1_000],
+      [Number.NEGATIVE_INFINITY, 1_000],
+      [1_000, Number.MAX_VALUE],
+      [1_000, 2 ** 54],
+    ] as const) {
+      const prepare = vi.fn(h.binding.prepare.bind(h.binding));
+      const now = vi.fn(() => clock);
+      const store = new StartIdempotencyStore({ prepare }, { now });
+      await expect(
+        store[method]({ ...h.observed, updatedAt }),
+      ).rejects.toBeInstanceOf(StartReservationUnreadableError);
+      expect(now).toHaveBeenCalledTimes(1);
+      expect(prepare).not.toHaveBeenCalled();
+    }
+    const store = new StartIdempotencyStore(h.binding, { now: () => 1e100 });
+    h.sqlite
+      .prepare('UPDATE flowsafe_start_idempotency SET updated_at = ?')
+      .run(2 ** 54);
+    const outcome = await store[method]({ ...h.observed, updatedAt: 2 ** 54 });
+    expect(outcome).toBeTruthy();
+    expect(rows(h.sqlite)[0]?.updated_at).toBe(1e100);
+  });
+
+  it.each(
+    methods,
+  )('%s preserves every rewritten observation field before reporting a miss', async (method) => {
+    for (const change of [
+      "key = 'replacement'",
+      "run_id = 'replacement'",
+      "owner_kind = 'service'",
+      "owner_id = 'replacement'",
+      "target_kind = 'agent', thread_id = 'thread'",
+      "target_id = 'replacement'",
+      "thread_id = 'replacement'",
+      'created_at = created_at + 1',
+      'updated_at = updated_at + 1',
+      "state = 'terminal'",
+    ]) {
+      const h = await modern(stateFor(method));
+      h.sqlite.exec(`UPDATE flowsafe_start_idempotency SET ${change}`);
+      const before = rows(h.sqlite);
+      const outcome = await invoke(h.store, method, h.observed).catch(
+        (error: unknown) => error,
+      );
+      expect(rows(h.sqlite), change).toEqual(before);
+      if (method === 'claimReservation')
+        expect(outcome, change).toBeUndefined();
+      else if (method === 'releaseReservation')
+        expect(outcome, change).toBe(false);
+      else if (
+        method === 'associateReservation' &&
+        change.startsWith('thread_id')
+      )
+        expect(outcome).toBeInstanceOf(StartReservationUnreadableError);
+      else expect(outcome, change).toBeInstanceOf(RunAdmissionConflictError);
+    }
+  });
+
+  it.each(
+    methods,
+  )('%s preserves each independently changed unbound column before reporting failure', async (method) => {
+    for (const change of [
+      "start_token = 'other'",
+      "start_table_prefix = ''",
+      "start_workflow_id = 'payout'",
+      'start_token = NULL',
+    ]) {
+      const h = await modern(stateFor(method));
+      h.sqlite.exec(`UPDATE flowsafe_start_idempotency SET ${change}`);
+      const before = rows(h.sqlite);
+      const outcome = await invoke(h.store, method, h.observed).catch(
+        (error: unknown) => error,
+      );
+      expect(rows(h.sqlite), change).toEqual(before);
+      if (method === 'claimReservation') expect(outcome).toBeUndefined();
+      else if (method === 'releaseReservation') expect(outcome).toBe(false);
+      else
+        expect(outcome).toBeInstanceOf(
+          method === 'associateReservation' && change !== 'start_token = NULL'
+            ? StartReservationUnreadableError
+            : RunAdmissionConflictError,
+        );
+    }
+  });
+
+  it.each(
+    methods,
+  )('%s refuses legacy, bound, terminal and wrong-state observations before I/O', async (method) => {
+    const h = await modern(stateFor(method));
+    const prepare = vi.fn(h.binding.prepare.bind(h.binding));
+    const store = new StartIdempotencyStore({ prepare });
+    const invalid: StartReservationReading[] = [
+      { ...h.observed, binding: { kind: 'legacy' } },
+      {
+        ...h.observed,
+        binding: bindingFor(),
+      },
+      { ...h.observed, state: 'terminal' },
+      { ...h.observed, key: 'bad/key' },
+      { ...h.observed, targetId: 'bad/target' },
+      { ...h.observed, createdAt: Number.NaN },
+      { ...h.observed, updatedAt: Number.POSITIVE_INFINITY },
+    ];
+    if (method !== 'associateReservation')
+      invalid.push({
+        ...h.observed,
+        state: method === 'claimReservation' ? 'started' : 'reserved',
+      });
+    for (const observed of invalid)
+      await expect(invoke(store, method, observed)).rejects.toBeInstanceOf(
+        InvalidExecutionIdentityError,
+      );
+    expect(prepare).not.toHaveBeenCalled();
+  });
+
+  it.each(
+    methods,
+  )('%s captures caller getters, nested identities and clock before held schema I/O', async (method) => {
+    const h = await modern(stateFor(method));
+    let resume!: () => void;
+    const held = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    const original = structuredClone(h.observed);
+    const identity = structuredClone(execution);
+    const counts = new Map<string, number>();
+    function getters<T extends object>(source: T, prefix: string): T {
+      return Object.defineProperties(
+        {},
+        Object.fromEntries(
+          Object.keys(source).map((key) => [
+            key,
+            {
+              enumerable: true,
+              get() {
+                const name = `${prefix}.${key}`;
+                counts.set(name, (counts.get(name) ?? 0) + 1);
+                return source[key as keyof T];
+              },
+            },
+          ]),
+        ),
+      ) as T;
+    }
+    const observationSource = {
+      ...original,
+      owner: getters(original.owner, 'owner'),
+      binding: getters(original.binding, 'binding'),
+    };
+    const observation = getters(observationSource, 'reservation');
+    const executionSource = {
+      ...identity,
+      owner: getters(identity.owner, 'execution.owner'),
+      target: getters(identity.target, 'execution.target'),
+    };
+    const supplied = getters(executionSource, 'execution');
+    let clock = 2_000;
+    const now = vi.fn(() => clock);
+    const store = new StartIdempotencyStore(
+      interceptReservations(h.binding, async (sql, execute) => {
+        if (sql.startsWith('PRAGMA')) await held;
+        return execute();
+      }),
+      { now },
+    );
+    const operation = invoke(store, method, observation, supplied);
+    Object.assign(original.owner, { kind: 'service', id: 'changed' });
+    Object.assign(original.binding, { kind: 'legacy' });
+    Object.assign(identity.owner, { kind: 'service', id: 'changed' });
+    Object.assign(identity.target, {
+      kind: 'agent',
+      id: 'changed',
+      threadId: 'changed',
+    });
+    Object.assign(observationSource, {
+      key: 'changed',
+      runId: 'changed',
+      targetKind: 'agent',
+      targetId: 'changed',
+      threadId: 'changed',
+      state: 'terminal',
+      createdAt: 77,
+      updatedAt: 88,
+    });
+    Object.assign(executionSource, {
+      workflowId: 'changed',
+      runId: 'changed',
+      startToken: 'changed',
+      tablePrefix: 'changed_',
+    });
+    clock = 9_000;
+    resume();
+    await expect(operation).resolves.toBeTruthy();
+    expect(rows(h.sqlite)[0]).toMatchObject({
+      owner_id: OWNER.id,
+      target_id: 'payout',
+      updated_at:
+        method === 'claimReservation' || method === 'releaseReservation'
+          ? 2_000
+          : 1_000,
+      start_token:
+        method === 'claimReservation' || method === 'releaseReservation'
+          ? ''
+          : 'generation',
+    });
+    expect([...counts.values()].every((count) => count === 1)).toBe(true);
+    expect(now).toHaveBeenCalledTimes(
+      method === 'claimReservation' || method === 'releaseReservation' ? 1 : 0,
+    );
+  });
+
+  it.each([
+    'claimReservation',
+    'releaseReservation',
+  ] as const)('%s never recovers or retries a thrown UPDATE', async (method) => {
+    for (const executeFirst of [false, true]) {
+      const h = await modern(stateFor(method));
+      const sqlSeen: string[] = [];
+      const cause = new Error('lost response');
+      const store = new StartIdempotencyStore(
+        interceptReservations(h.binding, async (sql, execute) => {
+          sqlSeen.push(sql);
+          if (sql.startsWith('UPDATE')) {
+            if (executeFirst) await execute();
+            else if (method === 'claimReservation')
+              await h.store.claimReservation(h.observed);
+            throw cause;
+          }
+          return execute();
+        }),
+        { now: () => 1_000 },
+      );
+      await expect(store[method](h.observed)).rejects.toMatchObject({ cause });
+      expect(sqlSeen.filter((sql) => sql.startsWith('UPDATE'))).toHaveLength(1);
+      expect(sqlSeen.some((sql) => sql.startsWith('SELECT'))).toBe(false);
+      expect(rows(h.sqlite)[0]).toMatchObject({
+        state:
+          executeFirst && method === 'releaseReservation'
+            ? 'reserved'
+            : 'started',
+        updated_at:
+          executeFirst || method === 'claimReservation' ? 1_001 : 1_000,
+      });
+    }
+  });
+
+  it('preserves a bound row when a delayed old release arrives', async () => {
+    const h = await modern('started');
+    await h.store.bindPreparedStart(h.observed, execution);
+    const before = rows(h.sqlite);
+    const outcome = await h.store
+      .releaseReservation(h.observed)
+      .catch((error: unknown) => error);
+    expect(rows(h.sqlite)).toEqual(before);
+    expect(outcome).toBe(false);
+  });
+
+  it.each([
+    'associateReservation',
+    'bindPreparedStart',
+  ] as const)('%s binds canonical D1 and explicit custom namespaces without clock or snapshot access', async (method) => {
+    for (const tablePrefix of ['', 'APP_', null]) {
+      const h = await modern('started');
+      const now = vi.fn(() => {
+        throw new Error('binding must not read a clock');
+      });
+      const queries: string[] = [];
+      const store = new StartIdempotencyStore(
+        interceptReservations(h.binding, async (sql, execute) => {
+          queries.push(sql);
+          return execute();
+        }),
+        { now },
+      );
+      await expect(
+        store[method](h.observed, { ...execution, tablePrefix }),
+      ).resolves.toEqual({
+        ...h.observed,
+        binding: bindingFor({
+          ...execution,
+          tablePrefix: tablePrefix?.toLowerCase() ?? null,
+        }),
+      });
+      expect(now).not.toHaveBeenCalled();
+      expect(queries).toHaveLength(2);
+      expect(queries[0]).toContain(
+        'PRAGMA table_xinfo(flowsafe_start_idempotency)',
+      );
+      expect(queries[1]).toContain('UPDATE flowsafe_start_idempotency');
+    }
+  });
+
+  it.each([
+    'associateReservation',
+    'bindPreparedStart',
+  ] as const)('%s validates root introduction in owner-first order while permitting agent wrappers', async (method) => {
+    const h = await modern('started');
+    const prepare = vi.fn(h.binding.prepare.bind(h.binding));
+    const store = new StartIdempotencyStore({ prepare });
+    const cases: Array<
+      [
+        StartExecutionIdentity,
+        (
+          | typeof StartReservationOwnerMismatchError
+          | typeof StartReservationTargetMismatchError
+          | typeof InvalidExecutionIdentityError
+        ),
+      ]
+    > = [
+      [
+        {
+          ...execution,
+          owner: OTHER_OWNER,
+          target: { kind: 'workflow', id: 'other' },
+        },
+        StartReservationOwnerMismatchError,
+      ],
+      [
+        { ...execution, target: { kind: 'workflow', id: 'other' } },
+        StartReservationTargetMismatchError,
+      ],
+      [
+        {
+          ...execution,
+          target: { kind: 'agent', id: 'payout', threadId: 'thread' },
+        },
+        StartReservationTargetMismatchError,
+      ],
+      [{ ...execution, runId: 'other' }, InvalidExecutionIdentityError],
+      [{ ...execution, workflowId: 'child' }, InvalidExecutionIdentityError],
+    ];
+    for (const [identity, error] of cases)
+      await expect(store[method](h.observed, identity)).rejects.toBeInstanceOf(
+        error,
+      );
+    expect(prepare).not.toHaveBeenCalled();
+    h.sqlite.exec(
+      "UPDATE flowsafe_start_idempotency SET target_kind = 'agent', thread_id = 'thread'",
+    );
+    const observed = await h.store.readForAdmission('key');
+    if (!observed) throw new Error('agent reservation is missing');
+    const agent: StartExecutionIdentity = {
+      ...execution,
+      workflowId: 'trusted-wrapper',
+      target: { kind: 'agent', id: 'payout', threadId: 'thread' },
+    };
+    await expect(
+      store[method](observed, {
+        ...agent,
+        target: { ...agent.target, threadId: 'other' },
+      } as StartExecutionIdentity),
+    ).rejects.toBeInstanceOf(InvalidExecutionIdentityError);
+    expect(prepare).not.toHaveBeenCalled();
+    await expect(store[method](observed, agent)).resolves.toMatchObject({
+      binding: bindingFor(agent),
+    });
+  });
+
+  it.each([
+    'reserved',
+    'started',
+    'terminal',
+  ] as const)('alias lost-receipt convergence accepts S1 %s advancement without restamping', async (state) => {
+    const h = await modern();
+    const queries: string[] = [];
+    const store = new StartIdempotencyStore(
+      interceptReservations(h.binding, async (sql, execute) => {
+        queries.push(sql);
+        const result = await execute();
+        if (sql.startsWith('UPDATE')) {
+          h.sqlite
+            .prepare(
+              'UPDATE flowsafe_start_idempotency SET state = ?, updated_at = ?',
+            )
+            .run(state, 4_000);
+          throw new Error('lost alias receipt');
+        }
+        return result;
+      }),
+      { now: () => 9_000 },
+    );
+    await expect(
+      store.associateReservation(h.observed, execution),
+    ).resolves.toEqual({
+      ...h.observed,
+      state,
+      updatedAt: 4_000,
+      binding: bindingFor(),
+    });
+    expect(rows(h.sqlite)[0]?.updated_at).toBe(4_000);
+    expect(queries.filter((sql) => sql.startsWith('UPDATE'))).toHaveLength(1);
+    expect(queries.filter((sql) => sql.startsWith('SELECT'))).toHaveLength(1);
+  });
+
+  it('associates the same S1 result after its snapshot disappears without reading a replacement result', async () => {
+    const h = await modern();
+    h.sqlite.exec('CREATE TABLE result_fixture (token TEXT, result TEXT)');
+    h.sqlite
+      .prepare('INSERT INTO result_fixture VALUES (?, ?)')
+      .run('generation', 'original-result');
+    const readResult = vi.fn(() =>
+      h.sqlite.prepare('SELECT * FROM result_fixture').get(),
+    );
+    const found = readResult();
+    h.sqlite.exec(
+      "DELETE FROM result_fixture; INSERT INTO result_fixture VALUES ('replacement', 'replacement-result')",
+    );
+    const queries: string[] = [];
+    const store = new StartIdempotencyStore(
+      interceptReservations(h.binding, async (sql, execute) => {
+        queries.push(sql);
+        return execute();
+      }),
+    );
+    await expect(
+      store.associateReservation(h.observed, execution),
+    ).resolves.toMatchObject({ binding: bindingFor() });
+    expect(found).toEqual({ token: 'generation', result: 'original-result' });
+    expect(readResult).toHaveBeenCalledTimes(1);
+    expect(queries).toHaveLength(2);
+    expect(rows(h.sqlite)[0]?.updated_at).toBe(h.observed.updatedAt);
+  });
+
+  it.each([
+    'known-zero',
+    'lost-receipt',
+  ] as const)('alias %s converges only the same immutable identity and complete binding', async (mode) => {
+    for (const change of [
+      '',
+      "start_token = 'replacement'",
+      "start_table_prefix = 'other_'",
+      "start_workflow_id = 'other'",
+      "owner_id = 'other'",
+      'created_at = created_at + 1',
+      "start_token = '', start_table_prefix = NULL, start_workflow_id = NULL",
+      'start_token = NULL, start_table_prefix = NULL, start_workflow_id = NULL',
+      'DELETE',
+      'DROP',
+      "thread_id = 'bad/thread'",
+    ]) {
+      const h = await modern('started');
+      const cause = new Error('lost alias write');
+      let reads = 0;
+      const store = new StartIdempotencyStore(
+        interceptReservations(h.binding, async (sql, execute) => {
+          if (sql.startsWith('SELECT')) reads += 1;
+          if (!sql.startsWith('UPDATE')) return execute();
+          await execute();
+          if (change === 'DELETE')
+            h.sqlite.exec('DELETE FROM flowsafe_start_idempotency');
+          else if (change === 'DROP')
+            h.sqlite.exec('DROP TABLE flowsafe_start_idempotency');
+          else if (change)
+            h.sqlite.exec(`UPDATE flowsafe_start_idempotency SET ${change}`);
+          if (mode === 'lost-receipt') throw cause;
+          return { results: [] };
+        }),
+      );
+      if (!change)
+        await expect(
+          store.associateReservation(h.observed, execution),
+        ).resolves.toMatchObject({ binding: bindingFor() });
+      else if (mode === 'lost-receipt')
+        await expect(
+          store.associateReservation(h.observed, execution),
+        ).rejects.toMatchObject({ cause });
+      else
+        await expect(
+          store.associateReservation(h.observed, execution),
+        ).rejects.toBeInstanceOf(
+          change === 'DROP' || change.startsWith('thread_id')
+            ? StartReservationUnreadableError
+            : RunAdmissionConflictError,
+        );
+      expect(reads).toBe(1);
+    }
+  });
+
+  it('prepared known-zero never reads back another caller claim', async () => {
+    const h = await modern('started');
+    await h.store.bindPreparedStart(h.observed, execution);
+    const queries: string[] = [];
+    const store = new StartIdempotencyStore(
+      interceptReservations(h.binding, async (sql, execute) => {
+        queries.push(sql);
+        return execute();
+      }),
+    );
+    await expect(
+      store.bindPreparedStart(h.observed, execution),
+    ).rejects.toBeInstanceOf(RunAdmissionConflictError);
+    expect(queries.some((sql) => sql.startsWith('SELECT'))).toBe(false);
+    expect(queries.filter((sql) => sql.startsWith('UPDATE'))).toHaveLength(1);
+  });
+
+  it.each([
+    '',
+    "state = 'terminal'",
+    "state = 'reserved'",
+    'updated_at = updated_at + 1',
+    'created_at = created_at + 1',
+    "start_token = 'other'",
+    "start_table_prefix = 'other_'",
+    "start_workflow_id = 'other'",
+    "owner_id = 'other'",
+    "target_id = 'other'",
+    "run_id = 'other'",
+  ])('prepared lost-receipt readback requires the exact original claim: %s', async (change) => {
+    const h = await modern('started');
+    const cause = new Error('lost prepared receipt');
+    const store = new StartIdempotencyStore(
+      interceptReservations(h.binding, async (sql, execute) => {
+        const result = await execute();
+        if (sql.startsWith('UPDATE')) {
+          if (change)
+            h.sqlite.exec(`UPDATE flowsafe_start_idempotency SET ${change}`);
+          throw cause;
+        }
+        return result;
+      }),
+    );
+    if (change)
+      await expect(
+        store.bindPreparedStart(h.observed, execution),
+      ).rejects.toMatchObject({ cause });
+    else
+      await expect(
+        store.bindPreparedStart(h.observed, execution),
+      ).resolves.toEqual({ ...h.observed, binding: bindingFor() });
+  });
+
+  it.each(
+    methods,
+  )('%s rejects malformed RETURNING envelopes without readback', async (method) => {
+    const corruptions: Array<
+      [string, (row: Record<string, unknown>) => unknown]
+    > = [
+      ['failed', (row) => ({ success: false, results: [row] })],
+      ['missing results', () => ({ meta: { changes: 1 } })],
+      ['nonarray', (row) => ({ results: { 0: row, length: 1 } })],
+      ['sparse', () => ({ results: new Array(1) })],
+      [
+        'inherited',
+        (row) => ({
+          results: Object.setPrototypeOf(
+            new Array(1),
+            Object.assign(Object.create(Array.prototype), { 0: row }),
+          ),
+        }),
+      ],
+      [
+        'iterator',
+        (row) => ({
+          results: Object.assign([null], {
+            *[Symbol.iterator]() {
+              yield row;
+            },
+          }),
+        }),
+      ],
+      ['multiple', (row) => ({ results: [row, row] })],
+      [
+        'missing column',
+        (row) => ({
+          results: [
+            Object.fromEntries(
+              Object.entries(row).filter(([key]) => key !== 'created_at'),
+            ),
+          ],
+        }),
+      ],
+      ...Object.entries({
+        key: 'other',
+        run_id: 'other',
+        owner_id: 'other',
+        target_id: 'other',
+        created_at: 2,
+        updated_at: 2,
+        state: 'terminal',
+        start_token: 'other',
+        target_kind: 'unknown',
+        thread_id: 'bad/thread',
+      }).map(
+        ([key, value]) =>
+          [
+            key,
+            (row: Record<string, unknown>) => ({
+              results: [{ ...row, [key]: value }],
+            }),
+          ] as [string, (row: Record<string, unknown>) => unknown],
+      ),
+    ];
+    for (const [name, corrupt] of corruptions) {
+      const h = await modern(stateFor(method));
+      let reads = 0;
+      const store = new StartIdempotencyStore(
+        interceptReservations(h.binding, async (sql, execute) => {
+          if (sql.startsWith('SELECT')) reads += 1;
+          const result = (await execute()) as {
+            results: Array<Record<string, unknown>>;
+          };
+          if (!sql.startsWith('UPDATE')) return result;
+          const row = result.results[0];
+          if (!row) throw new Error('successful mutation row is missing');
+          return corrupt(row);
+        }),
+        { now: () => 1_000 },
+      );
+      await expect(
+        invoke(store, method, h.observed),
+        name,
+      ).rejects.toBeInstanceOf(StartReservationUnreadableError);
+      expect(reads, name).toBe(0);
+    }
+  });
+
+  it.each(
+    methods,
+  )('%s captures each successful RETURNING field once', async (method) => {
+    const h = await modern(stateFor(method));
+    const counts = new Map<string, number>();
+    const once = (key: string, value: unknown) => ({
+      get() {
+        const count = (counts.get(key) ?? 0) + 1;
+        counts.set(key, count);
+        if (count > 1) throw new Error(`reread ${key}`);
+        return value;
+      },
+      enumerable: true,
+    });
+    const store = new StartIdempotencyStore(
+      interceptReservations(h.binding, async (sql, execute) => {
+        const result = (await execute()) as {
+          results: Array<Record<string, unknown>>;
+        };
+        if (!sql.startsWith('UPDATE')) return result;
+        const returnedRow = result.results[0];
+        if (!returnedRow) throw new Error('successful mutation row is missing');
+        const row = Object.defineProperties(
+          {},
+          Object.fromEntries(
+            Object.entries(returnedRow).map(([key, value]) => [
+              key,
+              once(key, value),
+            ]),
+          ),
+        );
+        const returned: unknown[] = [];
+        Object.defineProperty(returned, 0, once('slot', row));
+        return Object.defineProperties(
+          {},
+          {
+            success: once('success', true),
+            results: once('results', returned),
+          },
+        );
+      }),
+      { now: () => 1_000 },
+    );
+    await expect(invoke(store, method, h.observed)).resolves.toBeTruthy();
+    expect(counts.size).toBe(16);
+    expect([...counts.values()].every((count) => count === 1)).toBe(true);
+  });
+
+  it.each(
+    methods,
+  )('%s requires the current schema without running readiness', async (method) => {
+    for (const stage of [0, 1, 2, 3, -1]) {
+      const h = await modern(stateFor(method));
+      if (stage === -1) h.sqlite.exec('DROP TABLE flowsafe_start_idempotency');
+      else if (stage < 3)
+        for (const column of bindingColumns.slice(stage).reverse())
+          h.sqlite.exec(
+            `ALTER TABLE flowsafe_start_idempotency DROP COLUMN ${column}`,
+          );
+      else
+        h.sqlite.exec(
+          'ALTER TABLE flowsafe_start_idempotency ADD COLUMN unexpected TEXT',
+        );
+      const ready = vi.fn(async () => {});
+      const queries: string[] = [];
+      const store = new StartIdempotencyStore(
+        interceptReservations(h.binding, async (sql, execute) => {
+          queries.push(sql);
+          return execute();
+        }),
+        { ready, now: () => 1_000 },
+      );
+      await expect(invoke(store, method, h.observed)).rejects.toBeInstanceOf(
+        StartReservationUnreadableError,
+      );
+      expect(ready).not.toHaveBeenCalled();
+      expect(queries).toHaveLength(1);
+      expect(queries[0]).toMatch(/^PRAGMA/);
+    }
+  });
+
+  it('settles both aliases of one full execution and preserves every neighboring execution before checking outcome', async () => {
+    const h = await modern('started');
+    await h.store.bindPreparedStart(h.observed, execution);
+    const insert = h.sqlite.prepare(
+      `INSERT INTO flowsafe_start_idempotency SELECT ?, owner_kind, owner_id, target_kind, target_id, run_id, thread_id, state, created_at, updated_at, start_token, start_table_prefix, start_workflow_id FROM flowsafe_start_idempotency WHERE key = 'key'`,
+    );
+    insert.run('alias');
+    const neighbors = [
+      "run_id = 'other'",
+      "start_token = 'other'",
+      "start_table_prefix = 'other_'",
+      'start_table_prefix = NULL',
+      "start_workflow_id = 'other'",
+      "owner_kind = 'service'",
+      "owner_id = 'other'",
+      "target_kind = 'agent', thread_id = 'thread'",
+      "target_id = 'other'",
+      "thread_id = 'other'",
+      "start_token = '', start_table_prefix = NULL, start_workflow_id = NULL",
+      'start_token = NULL, start_table_prefix = NULL, start_workflow_id = NULL',
+    ];
+    for (const [index, change] of neighbors.entries()) {
+      insert.run(`neighbor-${index}`);
+      h.sqlite.exec(
+        `UPDATE flowsafe_start_idempotency SET ${change} WHERE key = 'neighbor-${index}'`,
+      );
+    }
+    const before = rows(h.sqlite).filter((row) =>
+      String(row.key).startsWith('neighbor-'),
+    );
+    const store = new StartIdempotencyStore(h.binding, { now: () => 500 });
+    const outcome = await store
+      .settleExecution(execution)
+      .catch((error: unknown) => error);
+    expect(
+      rows(h.sqlite).filter((row) => String(row.key).startsWith('neighbor-')),
+    ).toEqual(before);
+    expect(outcome).toBe(2);
+    expect(
+      rows(h.sqlite).filter((row) => row.key === 'key' || row.key === 'alias'),
+    ).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          key: 'key',
+          state: 'terminal',
+          updated_at: 500,
+        }),
+        expect.objectContaining({
+          key: 'alias',
+          state: 'terminal',
+          updated_at: 500,
+        }),
+      ]),
+    );
+    expect(
+      await new StartIdempotencyStore(h.binding, {
+        now: () => 9_000,
+      }).settleExecution(execution),
+    ).toBe(0);
+    expect(rows(h.sqlite)[0]?.updated_at).toBe(500);
+  });
+
+  it('settles explicit null and inherited child identities without a root classifier', async () => {
+    const h = await modern('started');
+    h.sqlite.exec(
+      "UPDATE flowsafe_start_idempotency SET start_token = 'generation', start_workflow_id = 'child'",
+    );
+    const inherited = { ...execution, workflowId: 'child', tablePrefix: null };
+    expect(
+      await h.store.settleExecution({ ...inherited, tablePrefix: '' }),
+    ).toBe(0);
+    expect(await h.store.settleExecution(inherited)).toBe(1);
+    expect(rows(h.sqlite)[0]).toMatchObject({
+      state: 'terminal',
+      start_table_prefix: null,
+      start_workflow_id: 'child',
+    });
+  });
+
+  it('settlement captures its execution and finite clock before I/O and permits only genuine table absence', async () => {
+    const h = await modern('started');
+    await h.store.bindPreparedStart(h.observed, execution);
+    let resume!: () => void;
+    const held = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    const identity = structuredClone(execution);
+    let clock = 3_000;
+    const store = new StartIdempotencyStore(
+      interceptReservations(h.binding, async (sql, execute) => {
+        if (sql.startsWith('PRAGMA')) await held;
+        return execute();
+      }),
+      { now: () => clock },
+    );
+    const settling = store.settleExecution(identity);
+    Object.assign(identity, { workflowId: 'other', startToken: 'other' });
+    Object.assign(identity.owner, { id: 'other' });
+    Object.assign(identity.target, { id: 'other' });
+    clock = 9_000;
+    resume();
+    await expect(settling).resolves.toBe(1);
+    expect(rows(h.sqlite)[0]?.updated_at).toBe(3_000);
+    const prepare = vi.fn(h.binding.prepare.bind(h.binding));
+    await expect(
+      new StartIdempotencyStore(
+        { prepare },
+        { now: () => Number.NaN },
+      ).settleExecution(execution),
+    ).rejects.toBeInstanceOf(StartReservationUnreadableError);
+    expect(prepare).not.toHaveBeenCalled();
+    for (const stage of [0, 1, 2])
+      await expect(
+        schemaHarness(stage).store.settleExecution(execution),
+      ).rejects.toBeInstanceOf(StartReservationUnreadableError);
+    expect(await harness().store.settleExecution(execution)).toBe(0);
+    for (const root of [true, false]) {
+      const missing = new Error('no such table: flowsafe_start_idempotency');
+      const cause = root
+        ? new Error('wrapper', { cause: missing })
+        : new Error(missing.message, { cause: new Error('transport') });
+      const broken = new StartIdempotencyStore(
+        interceptReservations(h.binding, async () => {
+          throw cause;
+        }),
+      );
+      if (root)
+        await expect(broken.settleExecution(execution)).resolves.toBe(0);
+      else
+        await expect(broken.settleExecution(execution)).rejects.toMatchObject({
+          cause,
+        });
+    }
+  });
+
+  it.each([
+    'associateReservation',
+    'bindPreparedStart',
+  ] as const)('%s retains the original thrown write cause when its row is absent or readback fails', async (method) => {
+    for (const mode of ['unbound', 'absent', 'dropped', 'read-error']) {
+      const h = await modern('started');
+      const cause = new Error('write response unavailable');
+      let reads = 0;
+      let updates = 0;
+      const store = new StartIdempotencyStore(
+        interceptReservations(h.binding, async (sql, execute) => {
+          if (sql.startsWith('UPDATE')) {
+            updates += 1;
+            if (mode === 'absent')
+              h.sqlite.exec('DELETE FROM flowsafe_start_idempotency');
+            if (mode === 'dropped')
+              h.sqlite.exec('DROP TABLE flowsafe_start_idempotency');
+            throw cause;
+          }
+          if (sql.startsWith('SELECT')) {
+            reads += 1;
+            if (mode === 'read-error') throw new Error('readback failed');
+          }
+          return execute();
+        }),
+      );
+      await expect(store[method](h.observed, execution)).rejects.toMatchObject({
+        cause,
+      });
+      expect(updates).toBe(1);
+      expect(reads).toBe(1);
+    }
+  });
+
+  it.each([
+    ...methods,
+    'settleExecution' as const,
+  ])('%s handles a table disappearing after schema validation without recreating it', async (method) => {
+    const h = await modern(
+      method === 'claimReservation' ? 'reserved' : 'started',
+    );
+    const store = new StartIdempotencyStore(
+      interceptReservations(h.binding, async (sql, execute) => {
+        if (sql.startsWith('UPDATE'))
+          h.sqlite.exec('DROP TABLE flowsafe_start_idempotency');
+        return execute();
+      }),
+    );
+    const operation =
+      method === 'settleExecution'
+        ? store.settleExecution(execution)
+        : invoke(store, method, h.observed);
+    if (method === 'settleExecution') await expect(operation).resolves.toBe(0);
+    else
+      await expect(operation).rejects.toBeInstanceOf(
+        StartReservationUnreadableError,
+      );
+    expect(
+      h.sqlite
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .all(),
+    ).toEqual([]);
+  });
+
+  it.each([
+    'duplicate',
+    'foreign',
+    'timestamp',
+    'sparse',
+    'failed',
+    'throw',
+  ] as const)('settlement rejects %s responses without recovery or restamping on retry', async (mode) => {
+    const h = await modern('started');
+    await h.store.bindPreparedStart(h.observed, execution);
+    const queries: string[] = [];
+    const store = new StartIdempotencyStore(
+      interceptReservations(h.binding, async (sql, execute) => {
+        queries.push(sql);
+        const result = (await execute()) as {
+          results: Array<Record<string, unknown>>;
+        };
+        if (!sql.startsWith('UPDATE')) return result;
+        const row = result.results[0];
+        if (!row) throw new Error('settlement row is missing');
+        if (mode === 'throw') throw new Error('lost settlement response');
+        if (mode === 'failed') return { success: false, results: [row] };
+        if (mode === 'sparse') return { results: new Array(1) };
+        return {
+          results:
+            mode === 'duplicate'
+              ? [row, row]
+              : [
+                  {
+                    ...row,
+                    [mode === 'foreign' ? 'start_token' : 'updated_at']:
+                      mode === 'foreign' ? 'other' : 99,
+                  },
+                ],
+        };
+      }),
+      { now: () => 2_000 },
+    );
+    await expect(store.settleExecution(execution)).rejects.toBeInstanceOf(
+      StartReservationUnreadableError,
+    );
+    expect(queries.some((sql) => sql.startsWith('SELECT'))).toBe(false);
+    expect(await h.store.settleExecution(execution)).toBe(0);
+    expect(rows(h.sqlite)[0]?.updated_at).toBe(2_000);
+  });
+});
+
+describe('strict initial-admission reservation observations', () => {
+  it.each([
+    'row',
+    'schema',
+  ])('rejects inherited slots in the reservation %s observation', async (mode) => {
+    const { sqlite, binding } = schemaHarness(3);
+    const sparse = (rows: unknown[]) =>
+      Object.setPrototypeOf(
+        new Array(rows.length),
+        Object.assign(Object.create(Array.prototype), rows),
+      );
+    if (mode === 'schema') {
+      const columns = sqlite
+        .prepare('PRAGMA table_xinfo(flowsafe_start_idempotency)')
+        .all();
+      expect(() =>
+        validateStartReservationAdmissionSchema({ results: sparse(columns) }),
+      ).toThrow('invalid row');
+    } else {
+      const wrapped = interceptReservations(binding, async (sql, execute) => {
+        const result = (await execute()) as { results: unknown[] };
+        return sql.startsWith('SELECT * FROM flowsafe_start_idempotency')
+          ? { results: sparse(result.results) }
+          : result;
+      });
+      await expect(
+        new StartIdempotencyStore(wrapped).readForAdmission('key'),
+      ).rejects.toBeInstanceOf(StartReservationUnreadableError);
+    }
+  });
+  it('does not let a custom iterator hide a malformed admission row', async () => {
+    const { binding } = schemaHarness(3);
+    const wrapped = interceptReservations(binding, async (sql, execute) => {
+      const result = (await execute()) as { results: unknown[] };
+      if (!sql.startsWith('SELECT * FROM flowsafe_start_idempotency'))
+        return result;
+      const rows = [null];
+      Object.defineProperty(rows, Symbol.iterator, {
+        value: function* () {
+          yield* result.results;
+        },
+      });
+      return { results: rows };
+    });
+    await expect(
+      new StartIdempotencyStore(wrapped).readForAdmission('key'),
+    ).rejects.toBeInstanceOf(StartReservationUnreadableError);
+  });
+  it('rejects the first malformed schema envelope even if its getter later returns real columns', () => {
+    const { sqlite } = schemaHarness(3);
+    const columns = sqlite
+      .prepare('PRAGMA table_xinfo(flowsafe_start_idempotency)')
+      .all();
+    let reads = 0;
+    expect(() =>
+      validateStartReservationAdmissionSchema({
+        get results() {
+          return ++reads === 1 ? [null] : columns;
+        },
+      }),
+    ).toThrow('invalid row');
+    expect(reads).toBe(1);
+  });
+  it.each([
+    'envelope',
+    'element',
+  ])('captures one %s observation before admission decoding', async (mode) => {
+    const { binding, sqlite } = schemaHarness(3);
+    sqlite.exec("UPDATE flowsafe_start_idempotency SET start_token = ''");
+    let reads = 0;
+    const wrapped = interceptReservations(binding, async (sql, execute) => {
+      const result = (await execute()) as { results: unknown[] };
+      if (!sql.startsWith('SELECT * FROM flowsafe_start_idempotency'))
+        return result;
+      if (mode === 'envelope')
+        return {
+          get results() {
+            return ++reads === 1 ? result.results : new Array(1);
+          },
+        };
+      const rows: unknown[] = [];
+      Object.defineProperty(rows, 0, {
+        get() {
+          return ++reads === 1 ? result.results[0] : undefined;
+        },
+      });
+      return { results: rows };
+    });
+    expect(
+      (await new StartIdempotencyStore(wrapped).readForAdmission('key'))?.runId,
+    ).toBe('run');
+    expect(reads).toBe(1);
+  });
+  const raw = {
+    key: 'key',
+    owner_kind: 'human',
+    owner_id: 'owner',
+    target_kind: 'workflow',
+    target_id: 'workflow',
+    run_id: 'run',
+    thread_id: null,
+    state: 'started',
+    created_at: 100,
+    updated_at: 200,
+    start_token: '',
+    start_table_prefix: null,
+    start_workflow_id: null,
+  };
+
+  it.each([
+    ['workflow', 'thread', 'admission workflow thread must be null'],
+    ['workflow', 'bad/thread', 'admission workflow thread must be null'],
+    ['agent', null, 'admission agent thread is invalid'],
+    ['agent', undefined, 'admission agent thread is invalid'],
+    ['agent', 'bad/thread', 'admission agent thread is invalid'],
+  ])('validates raw %s thread %s before normalization', (target_kind, thread_id, cause) => {
+    expect(() =>
+      decodeStartReservationAdmissionResult({
+        results: [{ ...raw, target_kind, thread_id }],
+      }),
+    ).toThrow(cause);
+  });
+
+  it('validates every own current field and logical identifier with populated rows', () => {
+    for (const key of Object.keys(raw)) {
+      const row = Object.fromEntries(
+        Object.entries(raw).filter(([name]) => name !== key),
+      );
+      expect(() =>
+        decodeStartReservationAdmissionResult({ results: [row] }),
+      ).toThrow(`row is missing ${key}`);
+    }
+    for (const target_id of ['', 'bad/id'])
+      expect(() =>
+        decodeStartReservationAdmissionResult({
+          results: [{ ...raw, target_id }],
+        }),
+      ).toThrow('admission target id is invalid');
+    expect(() =>
+      decodeStartReservationAdmissionResult({
+        results: [{ ...raw, key: 'bad/key' }],
+      }),
+    ).toThrow('admission key is invalid');
+    expect(() =>
+      decodeStartReservationAdmissionResult({ results: new Array(1) }),
+    ).toThrow('invalid row');
+    expect(() =>
+      decodeStartReservationAdmissionResult({ results: [raw, raw] }),
+    ).toThrow('multiple rows');
+    expect(
+      decodeStartReservationAdmissionResult({ results: [raw] })?.threadId,
+    ).toBeUndefined();
+    expect(
+      decodeStartReservationAdmissionResult({
+        results: [{ ...raw, target_kind: 'agent', thread_id: 'thread' }],
+      })?.threadId,
+    ).toBe('thread');
+  });
+
+  it('requires a current schema without readiness writes and preserves ordinary compatibility', async () => {
+    const { sqlite, binding, store } = harness();
+    expect(store.usesDatabase(binding)).toBe(true);
+    expect(store.usesDatabase({ ...binding })).toBe(false);
+    await expect(store.readForAdmission('absent')).rejects.toBeInstanceOf(
+      StartReservationUnreadableError,
+    );
+    expect(
+      sqlite
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .all(),
+    ).toEqual([]);
+    sqlite.exec(START_IDEMPOTENCY_DDL);
+    const schema = sqlite
+      .prepare('PRAGMA table_xinfo(flowsafe_start_idempotency)')
+      .all();
+    for (let stage = 0; stage < 3; stage += 1)
+      expect(() =>
+        validateStartReservationAdmissionSchema({
+          results: schema.slice(0, 10 + stage),
+        }),
+      ).toThrow('admission requires current schema');
+    expect(() =>
+      validateStartReservationAdmissionSchema({ results: schema }),
+    ).not.toThrow();
+    await expect(store.readForAdmission('absent')).resolves.toBeUndefined();
+    sqlite
+      .prepare(
+        'INSERT INTO flowsafe_start_idempotency VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run(...Object.values({ ...raw, thread_id: 'bad/thread' }));
+    expect((await store.read('key'))?.threadId).toBeUndefined();
+    const error = await store
+      .readForAdmission('key')
+      .catch((error: unknown) => error);
+    expect(error).toMatchObject({
+      status: 503,
+      cause: {
+        message: expect.stringContaining(
+          'admission workflow thread must be null',
+        ),
+      },
+    });
+    expect(
+      sqlite.prepare('SELECT thread_id FROM flowsafe_start_idempotency').get(),
+    ).toEqual({ thread_id: 'bad/thread' });
+  });
+});
 
 function harness(now: () => number = () => 1_000) {
   const sqlite = openSqlite();
@@ -58,6 +1349,59 @@ function rows(sqlite: SqliteDatabase): Array<Record<string, unknown>> {
   return sqlite
     .prepare(`SELECT * FROM ${START_IDEMPOTENCY_TABLE}`)
     .all() as Array<Record<string, unknown>>;
+}
+
+const bindingColumns = [
+  'start_token',
+  'start_table_prefix',
+  'start_workflow_id',
+];
+const legacyBinding = {
+  start_token: null,
+  start_table_prefix: null,
+  start_workflow_id: null,
+};
+
+function schemaHarness(stage: number) {
+  const fixture = harness();
+  fixture.sqlite.exec(START_IDEMPOTENCY_DDL);
+  for (const column of bindingColumns.slice(stage).reverse())
+    fixture.sqlite.exec(
+      `ALTER TABLE ${START_IDEMPOTENCY_TABLE} DROP COLUMN ${column}`,
+    );
+  fixture.sqlite
+    .prepare(
+      `INSERT INTO ${START_IDEMPOTENCY_TABLE} (key, owner_kind, owner_id, target_kind, target_id, run_id, thread_id, state, created_at, updated_at) VALUES ('key', 'human', 'operator-1', 'workflow', 'payout', 'run', NULL, 'started', 10, 20)`,
+    )
+    .run();
+  return fixture;
+}
+
+function interceptReservations(
+  db: StartIdempotencyDatabase,
+  intercept: (sql: string, execute: () => Promise<unknown>) => Promise<unknown>,
+): StartIdempotencyDatabase {
+  const statement = (
+    sql: string,
+    values: unknown[],
+  ): StartIdempotencyStatement => ({
+    bind: (...bound) => statement(sql, bound),
+    run: () =>
+      intercept(sql, () =>
+        db
+          .prepare(sql)
+          .bind(...values)
+          .run(),
+      ),
+    all: async <T>() =>
+      (await intercept(sql, () =>
+        db
+          .prepare(sql)
+          .bind(...values)
+          .all(),
+      )) as { results: T[] },
+  });
+  return { prepare: (sql) => statement(sql, []) };
 }
 
 function workflowRequest(key: string, runId: string, workflowId = 'payout') {
@@ -125,6 +1469,565 @@ describe('isStartReservationRefusal', () => {
     expect(
       isStartReservationRefusal(new StartReservationUnreadableError('key-1')),
     ).toBe(false);
+  });
+});
+
+describe('reservation binding representation', () => {
+  it('reads legacy and supported partial reservation schemas without DDL', async () => {
+    for (const stage of [0, 1, 2, 3]) {
+      const { sqlite, binding } = schemaHarness(stage);
+      const statements: string[] = [];
+      const store = new StartIdempotencyStore(
+        interceptReservations(binding, async (sql, execute) => {
+          statements.push(sql);
+          return execute();
+        }),
+      );
+      expect(await store.read('key')).toMatchObject({
+        key: 'key',
+        binding: { kind: 'legacy' },
+      });
+      expect(await store.reservationsForRuns(['run'])).toHaveLength(1);
+      expect(await store.read('missing')).toBeUndefined();
+      sqlite.exec(`DELETE FROM ${START_IDEMPOTENCY_TABLE}`);
+      expect(await store.read('key')).toBeUndefined();
+      expect(await store.reservationsForRuns(['run'])).toEqual([]);
+      expect(statements.every((sql) => /^(SELECT|PRAGMA)/.test(sql))).toBe(
+        true,
+      );
+      expect(
+        sqlite.prepare(`PRAGMA table_xinfo(${START_IDEMPOTENCY_TABLE})`).all(),
+      ).toHaveLength(10 + stage);
+    }
+    const { sqlite, binding, store } = schemaHarness(0);
+    expect((await store.read('key'))?.binding).toEqual({ kind: 'legacy' });
+    let advanced = false;
+    const reader = new StartIdempotencyStore(
+      interceptReservations(binding, async (sql, execute) => {
+        const result = await execute();
+        if (!advanced && sql.startsWith('SELECT *')) {
+          advanced = true;
+          for (const column of bindingColumns)
+            sqlite.exec(
+              `ALTER TABLE ${START_IDEMPOTENCY_TABLE} ADD COLUMN ${column} TEXT`,
+            );
+          sqlite.exec(
+            `UPDATE ${START_IDEMPOTENCY_TABLE} SET start_token = 'generation', start_table_prefix = '', start_workflow_id = 'payout'`,
+          );
+        }
+        return result;
+      }),
+    );
+    expect((await reader.read('key'))?.binding).toEqual({ kind: 'legacy' });
+    expect((await store.read('key'))?.binding).toEqual({
+      kind: 'bound',
+      execution: {
+        tablePrefix: '',
+        workflowId: 'payout',
+        runId: 'run',
+        startToken: 'generation',
+      },
+    });
+  });
+
+  it('resumes concurrent reservation schema upgrades without changing rows', async () => {
+    for (const stopAfter of [1, 2, 3]) {
+      const { sqlite, binding } = schemaHarness(0);
+      const before = rows(sqlite)[0];
+      let additions = 0;
+      let stopped = false;
+      const crashed = new StartIdempotencyStore(
+        interceptReservations(binding, async (sql, execute) => {
+          if (stopped) throw new Error('process interrupted');
+          const result = await execute();
+          if (sql.startsWith('ALTER TABLE') && ++additions === stopAfter)
+            stopped = true;
+          return result;
+        }),
+      );
+      await expect(
+        crashed.reserve(workflowRequest('new', 'new-run')),
+      ).rejects.toBeInstanceOf(StartReservationUnreadableError);
+      expect(
+        sqlite.prepare(`PRAGMA table_xinfo(${START_IDEMPOTENCY_TABLE})`).all(),
+      ).toHaveLength(10 + stopAfter);
+      const recovered = new StartIdempotencyStore(binding);
+      await recovered.reserve(workflowRequest('new', 'new-run'));
+      expect(
+        sqlite
+          .prepare(`SELECT * FROM ${START_IDEMPOTENCY_TABLE} WHERE key = 'key'`)
+          .get(),
+      ).toEqual({ ...before, ...legacyBinding });
+    }
+    for (const outcome of ['before', 'after', 'incompatible'] as const) {
+      const { sqlite, binding } = schemaHarness(0);
+      const failure = new Error('ALTER response lost');
+      let injected = false;
+      const store = new StartIdempotencyStore(
+        interceptReservations(binding, async (sql, execute) => {
+          if (injected || !sql.startsWith('ALTER TABLE')) return execute();
+          injected = true;
+          if (outcome === 'after') await execute();
+          if (outcome === 'incompatible')
+            sqlite.exec(
+              `ALTER TABLE ${START_IDEMPOTENCY_TABLE} ADD COLUMN start_token INTEGER`,
+            );
+          throw failure;
+        }),
+      );
+      if (outcome === 'after')
+        await expect(
+          store.reserve(workflowRequest('new', 'new-run')),
+        ).resolves.toMatchObject({
+          reservation: { binding: { kind: 'unbound' } },
+        });
+      else {
+        const error = await store
+          .reserve(workflowRequest('new', 'new-run'))
+          .catch((error: unknown) => error);
+        expect(error).toBeInstanceOf(StartReservationUnreadableError);
+        if (outcome === 'before') {
+          expect((error as Error).cause).toBe(failure);
+          await expect(
+            store.reserve(workflowRequest('retry', 'retry-run')),
+          ).resolves.toMatchObject({ created: true });
+        } else
+          expect(String((error as Error).cause)).toContain(
+            'column start_token differs',
+          );
+      }
+    }
+    const { sqlite, binding, store: competing } = schemaHarness(0);
+    let raced = false;
+    const first = new StartIdempotencyStore(
+      interceptReservations(binding, async (sql, execute) => {
+        if (!raced && sql.startsWith('ALTER TABLE')) {
+          raced = true;
+          await competing.reserve(workflowRequest('other', 'other-run'));
+        }
+        return execute();
+      }),
+    );
+    await first.reserve(workflowRequest('first', 'first-run'));
+    expect(rows(sqlite)).toHaveLength(3);
+    expect(
+      sqlite.prepare(`PRAGMA table_xinfo(${START_IDEMPOTENCY_TABLE})`).all(),
+    ).toHaveLength(13);
+    const empty = harness();
+    const hostReady = new StartIdempotencyStore(empty.binding, {
+      ready: async () => {
+        empty.sqlite.exec(START_IDEMPOTENCY_DDL);
+      },
+    });
+    await expect(
+      hostReady.reserve(workflowRequest('new', 'run')),
+    ).resolves.toMatchObject({ created: true });
+    const legacy = schemaHarness(0);
+    const noMigration = new StartIdempotencyStore(legacy.binding, {
+      ready: async () => {},
+    });
+    await expect(
+      noMigration.reserve(workflowRequest('new', 'run')),
+    ).rejects.toMatchObject({
+      cause: {
+        message: `${START_IDEMPOTENCY_TABLE} has an invalid reservation schema (host readiness did not reach the current schema)`,
+      },
+    });
+    expect(
+      legacy.sqlite
+        .prepare(`PRAGMA table_xinfo(${START_IDEMPOTENCY_TABLE})`)
+        .all(),
+    ).toHaveLength(10);
+  });
+
+  it('distinguishes legacy unbound D1-bound and unfenced-bound reservations', async () => {
+    const { sqlite, store, binding } = schemaHarness(3);
+    for (const [token, prefix, workflow, expected] of [
+      [null, null, null, { kind: 'legacy' }],
+      ['', null, null, { kind: 'unbound' }],
+      [
+        'generation',
+        '',
+        'payout',
+        {
+          kind: 'bound',
+          execution: {
+            tablePrefix: '',
+            workflowId: 'payout',
+            runId: 'run',
+            startToken: 'generation',
+          },
+        },
+      ],
+      [
+        'generation',
+        null,
+        'payout',
+        {
+          kind: 'bound',
+          execution: {
+            tablePrefix: null,
+            workflowId: 'payout',
+            runId: 'run',
+            startToken: 'generation',
+          },
+        },
+      ],
+    ] as const) {
+      sqlite
+        .prepare(
+          `UPDATE ${START_IDEMPOTENCY_TABLE} SET start_token = ?, start_table_prefix = ?, start_workflow_id = ?`,
+        )
+        .run(token, prefix, workflow);
+      expect((await store.read('key'))?.binding).toEqual(expected);
+    }
+    for (const values of [
+      [null, '', null],
+      ['', '', null],
+      ['generation', null, null],
+      ['generation', 'Mixed_', 'payout'],
+      ['bad token', '', 'payout'],
+      ['generation', '', 'bad/workflow'],
+    ]) {
+      sqlite
+        .prepare(
+          `UPDATE ${START_IDEMPOTENCY_TABLE} SET start_token = ?, start_table_prefix = ?, start_workflow_id = ?`,
+        )
+        .run(...values);
+      await expect(store.read('key')).rejects.toBeInstanceOf(
+        StartReservationUnreadableError,
+      );
+    }
+    sqlite.exec(
+      `UPDATE ${START_IDEMPOTENCY_TABLE} SET start_token = 'generation', start_table_prefix = '', start_workflow_id = 'payout', target_kind = 'agent'`,
+    );
+    await expect(store.read('key')).rejects.toBeInstanceOf(
+      StartReservationUnreadableError,
+    );
+    sqlite.exec(
+      `UPDATE ${START_IDEMPOTENCY_TABLE} SET target_kind = 'workflow', start_token = NULL, start_table_prefix = NULL, start_workflow_id = NULL`,
+    );
+    for (const result of [
+      null,
+      {},
+      { results: null },
+      { results: [undefined] },
+      { results: new Array(1) },
+      { results: [], success: false },
+    ]) {
+      const corrupt = new StartIdempotencyStore(
+        interceptReservations(binding, async (sql, execute) =>
+          sql.startsWith('SELECT *') ? result : execute(),
+        ),
+      );
+      await expect(corrupt.read('key')).rejects.toBeInstanceOf(
+        StartReservationUnreadableError,
+      );
+    }
+    for (const stage of [1, 2]) {
+      const partial = schemaHarness(stage);
+      partial.sqlite.exec(
+        `UPDATE ${START_IDEMPOTENCY_TABLE} SET start_token = ''`,
+      );
+      await expect(partial.store.read('key')).rejects.toMatchObject({
+        cause: {
+          message: `${START_IDEMPOTENCY_TABLE} has an invalid reservation schema (partial binding is not legacy defaults)`,
+        },
+      });
+      await expect(
+        partial.store.reserve(workflowRequest('new', 'new-run')),
+      ).rejects.toBeInstanceOf(StartReservationUnreadableError);
+      expect(
+        partial.sqlite
+          .prepare(`PRAGMA table_xinfo(${START_IDEMPOTENCY_TABLE})`)
+          .all(),
+      ).toHaveLength(10 + stage);
+    }
+    for (const [schema, field] of [
+      [
+        START_IDEMPOTENCY_DDL.replace(
+          'start_token TEXT',
+          'start_token INTEGER',
+        ),
+        'start_token',
+      ],
+      [
+        START_IDEMPOTENCY_DDL.replace(
+          'start_table_prefix TEXT',
+          'start_table_prefix TEXT DEFAULT NULL',
+        ),
+        'start_table_prefix',
+      ],
+      [
+        START_IDEMPOTENCY_DDL.replace(
+          'owner_id TEXT NOT NULL,\n    target_kind',
+          'target_id_alias TEXT NOT NULL,\n    target_kind',
+        ),
+        'owner_id',
+      ],
+    ] as const) {
+      const malformed = harness();
+      malformed.sqlite.exec(schema);
+      const ownerColumn = schema.includes('target_id_alias')
+        ? 'target_id_alias'
+        : 'owner_id';
+      malformed.sqlite.exec(
+        `INSERT INTO ${START_IDEMPOTENCY_TABLE} (key,owner_kind,${ownerColumn},target_kind,target_id,run_id,state,created_at,updated_at) VALUES ('key','human','operator-1','workflow','payout','run','started',10,20)`,
+      );
+      await expect(malformed.store.read('key')).rejects.toMatchObject({
+        cause: {
+          message: `${START_IDEMPOTENCY_TABLE} has an invalid reservation schema (column ${field} differs)`,
+        },
+      });
+    }
+  });
+
+  it('captures the first ready getter result with the store receiver', async () => {
+    const { sqlite, binding } = harness();
+    let getterReads = 0;
+    const calls: number[] = [];
+    const receivers: StartIdempotencyStore[] = [];
+    const store = new StartIdempotencyStore(binding, {
+      get ready() {
+        const selected = ++getterReads;
+        return async function (this: StartIdempotencyStore) {
+          calls.push(selected);
+          receivers.push(this);
+          sqlite.exec(START_IDEMPOTENCY_DDL);
+        };
+      },
+    });
+    await store.reserve(workflowRequest('first', 'first-run'));
+    await store.reserve(workflowRequest('second', 'second-run'));
+    expect(getterReads).toBe(1);
+    expect(calls).toEqual([1, 1]);
+    expect(receivers).toEqual([store, store]);
+  });
+
+  it('captures reserve authority and mint callback before readiness waits', async () => {
+    const { sqlite, binding } = harness();
+    let calls = 0;
+    const request = {
+      key: 'key',
+      owner: { ...OWNER, id: 'operator-1' },
+      targetKind: 'agent' as 'agent' | 'workflow',
+      targetId: 'agent',
+      threadId: 'thread',
+      marker: 'receiver',
+      mintRunId() {
+        expect(this.marker).toBe('receiver');
+        calls += 1;
+        this.targetId = 'mint-mutated';
+        return 'run';
+      },
+    };
+    const store = new StartIdempotencyStore(binding, {
+      ready: async () => {
+        sqlite.exec(START_IDEMPOTENCY_DDL);
+        request.owner.id = 'other';
+        request.targetKind = 'workflow';
+        request.targetId = 'changed';
+        request.threadId = 'changed';
+        request.mintRunId = () => {
+          throw new Error('replacement mint');
+        };
+      },
+    });
+    const created = await store.reserve(request);
+    expect(calls).toBe(1);
+    expect(created.reservation).toMatchObject({
+      owner: OWNER,
+      targetKind: 'agent',
+      targetId: 'agent',
+      threadId: 'thread',
+      runId: 'run',
+      binding: { kind: 'unbound' },
+    });
+    const counts = new Map<string, number>();
+    const data = workflowRequest('getter-key', 'getter-run');
+    const getters = Object.defineProperties(
+      {},
+      Object.fromEntries(
+        Object.entries(data).map(([field, value]) => [
+          field,
+          {
+            get() {
+              const count = (counts.get(field) ?? 0) + 1;
+              counts.set(field, count);
+              return count === 1 ? value : 'changed';
+            },
+          },
+        ]),
+      ),
+    );
+    await expect(
+      new StartIdempotencyStore(binding).reserve(getters as typeof data),
+    ).resolves.toMatchObject({
+      created: true,
+      reservation: { targetId: 'payout' },
+    });
+    expect([...counts.values()].every((count) => count === 1)).toBe(true);
+    const invalid = harness();
+    await expect(
+      invalid.store.reserve({
+        ...workflowRequest('key', 'run'),
+        mintRunId: false as never,
+      }),
+    ).rejects.toBeInstanceOf(InvalidStartIdempotencyRequestError);
+    expect(
+      invalid.sqlite
+        .prepare('SELECT name FROM sqlite_schema WHERE type = ?')
+        .all('table'),
+    ).toEqual([]);
+    const shadowed = harness();
+    let readyCalls = 0;
+    let mintCalls = 0;
+    const mint = () => {
+      mintCalls += 1;
+      return 'captured-run';
+    };
+    const ready = async () => {
+      readyCalls += 1;
+      shadowed.sqlite.exec(START_IDEMPOTENCY_DDL);
+      Object.defineProperty(mint, 'call', { value: () => 'replacement-run' });
+    };
+    Object.defineProperty(ready, 'call', {
+      value: () => {
+        throw new Error('shadowed call invoked');
+      },
+    });
+    await expect(
+      new StartIdempotencyStore(shadowed.binding, { ready }).reserve({
+        ...workflowRequest('shadowed', 'unused'),
+        mintRunId: mint,
+      }),
+    ).resolves.toMatchObject({ reservation: { runId: 'captured-run' } });
+    expect([readyCalls, mintCalls]).toEqual([1, 1]);
+  });
+
+  it.each([
+    {
+      name: 'a binding tail hole',
+      missingToken: true,
+      schemaStage: 3,
+      cause: 'binding prefix has a hole',
+    },
+    {
+      name: 'a row binding ahead of the schema',
+      missingToken: false,
+      schemaStage: 2,
+      cause: 'schema observation precedes row binding',
+    },
+  ])('rejects $name without writes', async (scenario) => {
+    const { sqlite, binding } = schemaHarness(3);
+    const before = rows(sqlite);
+    const observed = before.map((row) => ({ ...row }));
+    if (scenario.missingToken) {
+      for (const row of observed) delete row.start_token;
+    }
+    const schema = sqlite
+      .prepare(`PRAGMA table_xinfo(${START_IDEMPOTENCY_TABLE})`)
+      .all();
+    const statements: string[] = [];
+    const store = new StartIdempotencyStore(
+      interceptReservations(binding, async (sql, execute) => {
+        statements.push(sql);
+        if (sql.startsWith('SELECT *')) return { results: observed };
+        if (sql.startsWith('PRAGMA'))
+          return { results: schema.slice(0, 10 + scenario.schemaStage) };
+        return execute();
+      }),
+    );
+    for (const read of [
+      () => store.read('key'),
+      () => store.reservationsForRuns(['run']),
+    ]) {
+      const error = await read().catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(StartReservationUnreadableError);
+      expect((error as StartReservationUnreadableError).status).toBe(503);
+      expect(String((error as Error).cause)).toContain(scenario.cause);
+    }
+    expect(statements.every((sql) => /^(SELECT|PRAGMA)/.test(sql))).toBe(true);
+    expect(rows(sqlite)).toEqual(before);
+    expect(
+      sqlite.prepare(`PRAGMA table_xinfo(${START_IDEMPOTENCY_TABLE})`).all(),
+    ).toEqual(schema);
+  });
+
+  it('rejects invalid reservation observations without absence fallback', async () => {
+    const { sqlite, binding } = schemaHarness(3);
+    const valid = rows(sqlite)[0];
+    if (valid === undefined) throw new Error('fixture reservation is missing');
+    const cases = [
+      {
+        name: 'wrong key',
+        rows: [{ ...valid, key: 'other-key' }],
+        lookup: false,
+        schemaMissing: false,
+        cause: 'requested singleton key',
+      },
+      {
+        name: 'multiple rows',
+        rows: [valid, valid],
+        lookup: false,
+        schemaMissing: false,
+        cause: 'requested singleton key',
+      },
+      {
+        name: 'foreign run',
+        rows: [{ ...valid, run_id: 'other-run' }],
+        lookup: true,
+        schemaMissing: false,
+        cause: 'unrequested run',
+      },
+      ...Object.keys(valid)
+        .slice(0, 10)
+        .map((field) => {
+          const copy = { ...valid };
+          delete copy[field];
+          return {
+            name: `missing ${field}`,
+            rows: [copy],
+            lookup: false,
+            schemaMissing: false,
+            cause: `row is missing ${field}`,
+          };
+        }),
+      ...[[], [valid]].map((result) => ({
+        name: 'schema disappeared',
+        rows: result,
+        lookup: false,
+        schemaMissing: true,
+        cause: 'row observation has no schema',
+      })),
+    ];
+    for (const scenario of cases) {
+      const statements: string[] = [];
+      const store = new StartIdempotencyStore(
+        interceptReservations(binding, async (sql, execute) => {
+          statements.push(sql);
+          if (sql.startsWith('SELECT *')) return { results: scenario.rows };
+          if (scenario.schemaMissing && sql.startsWith('PRAGMA'))
+            return { results: [] };
+          return execute();
+        }),
+      );
+      const error = await (scenario.lookup
+        ? store.reservationsForRuns(['run'])
+        : store.read('key')
+      ).catch((error: unknown) => error);
+      expect(error, scenario.name).toBeInstanceOf(
+        StartReservationUnreadableError,
+      );
+      expect((error as StartReservationUnreadableError).status).toBe(503);
+      expect(String((error as Error).cause), scenario.name).toContain(
+        scenario.cause,
+      );
+      expect(statements.every((sql) => /^(SELECT|PRAGMA)/.test(sql))).toBe(
+        true,
+      );
+      expect(rows(sqlite)).toEqual([valid]);
+    }
   });
 });
 
@@ -311,116 +2214,6 @@ describe('StartIdempotencyStore.reserve', () => {
   });
 });
 
-describe('StartIdempotencyStore.claim', () => {
-  it('lets exactly one of many concurrent callers through', async () => {
-    // #given one reservation and five callers racing its claim — the
-    // cross-isolate race the agent surface cannot serialize any other way
-    const { store } = harness();
-    const { reservation } = await store.reserve(
-      workflowRequest('key-1', 'run-1'),
-    );
-
-    // #when
-    const outcomes = await Promise.all(
-      Array.from({ length: 5 }, () =>
-        store.claim(reservation.key, reservation.runId),
-      ),
-    );
-
-    // #then exactly one winner. Not "at most one", not "usually one".
-    expect(outcomes.filter(Boolean)).toHaveLength(1);
-  });
-
-  it('refuses a claim naming a different run than the reservation holds', async () => {
-    // #given
-    const { store } = harness();
-    await store.reserve(workflowRequest('key-1', 'run-1'));
-
-    // #when / #then a claim can never land on a row rewritten underneath it
-    expect(await store.claim('key-1', 'run-other')).toBe(false);
-  });
-
-  it('cannot re-claim a reservation that is already started', async () => {
-    // #given a claimed reservation
-    const { store } = harness();
-    await store.reserve(workflowRequest('key-1', 'run-1'));
-    expect(await store.claim('key-1', 'run-1')).toBe(true);
-
-    // #when / #then
-    expect(await store.claim('key-1', 'run-1')).toBe(false);
-  });
-});
-
-describe('StartIdempotencyStore.release', () => {
-  it('returns a claim to reserved so a retry after the fence reopens converges', async () => {
-    // #given a claim taken and then refused by the fence
-    const { store } = harness();
-    await store.reserve(workflowRequest('key-1', 'run-1'));
-    await store.claim('key-1', 'run-1');
-
-    // #when
-    expect(await store.release('key-1', 'run-1')).toBe(true);
-
-    // #then the SAME run id is claimable again — a fence transition mid-start
-    // must not manufacture an unresolvable reservation out of an operator
-    // action, nor hand the retry a second run.
-    expect((await store.read('key-1'))?.state).toBe('reserved');
-    expect(await store.claim('key-1', 'run-1')).toBe(true);
-    expect((await store.read('key-1'))?.runId).toBe('run-1');
-  });
-
-  it('cannot release a reservation that already settled', async () => {
-    // #given a terminal reservation
-    const { store } = harness();
-    await store.reserve(workflowRequest('key-1', 'run-1'));
-    await store.claim('key-1', 'run-1');
-    await store.settleRun('run-1');
-
-    // #when / #then a spent key never becomes startable again
-    expect(await store.release('key-1', 'run-1')).toBe(false);
-    expect((await store.read('key-1'))?.state).toBe('terminal');
-  });
-});
-
-describe('StartIdempotencyStore.settleRun', () => {
-  it('marks the run’s reservation terminal and stamps the horizon from that moment', async () => {
-    // #given a claimed reservation, and a clock that moves
-    let now = 1_000;
-    const { store } = harness(() => now);
-    await store.reserve(workflowRequest('key-1', 'run-1'));
-    await store.claim('key-1', 'run-1');
-    now = 5_000;
-
-    // #when
-    expect(await store.settleRun('run-1')).toBe(1);
-
-    // #then
-    const stored = await store.read('key-1');
-    expect(stored?.state).toBe('terminal');
-    expect(stored?.updatedAt).toBe(5_000);
-  });
-
-  it('is a no-op the second time, so every terminal path may call it', async () => {
-    // #given — a run can reach terminal by completing, failing, being cancelled
-    // or timing out, and those paths do not coordinate.
-    const { store } = harness();
-    await store.reserve(workflowRequest('key-1', 'run-1'));
-    await store.settleRun('run-1');
-
-    // #when / #then
-    expect(await store.settleRun('run-1')).toBe(0);
-  });
-
-  it('settles nothing for a run nobody reserved', async () => {
-    // #given the overwhelmingly common case: a run started without a key
-    const { store } = harness();
-    await store.reserve(workflowRequest('key-1', 'run-1'));
-
-    // #when / #then
-    expect(await store.settleRun('run-unrelated')).toBe(0);
-  });
-});
-
 describe('StartIdempotencyStore against a missing table', () => {
   it('reads as absent, and neither claims nor settles', async () => {
     // #given a database on which no key has ever been used, so the lazy DDL
@@ -430,9 +2223,7 @@ describe('StartIdempotencyStore against a missing table', () => {
     // #when / #then absence is not a fault — it is an empty table by another
     // name — but it must also never look like a successful transition.
     expect(await store.read('key-1')).toBeUndefined();
-    expect(await store.claim('key-1', 'run-1')).toBe(false);
-    expect(await store.release('key-1', 'run-1')).toBe(false);
-    expect(await store.settleRun('run-1')).toBe(0);
+
     expect(await store.reservationsForRuns(['run-1'])).toEqual([]);
   });
 
@@ -483,7 +2274,12 @@ describe('beginIdempotentStart', () => {
     const { store } = harness();
     const persisted = new Map<string, string>();
     const surface: IdempotentStartSurface<string> = {
-      persisted: async (reservation) => persisted.get(reservation.runId),
+      persisted: async (reservation) => {
+        const value = persisted.get(reservation.runId);
+        return value === undefined
+          ? undefined
+          : { kind: 'result', value, execution: executionFor(reservation) };
+      },
       live: async () => false,
     };
 
@@ -514,13 +2310,20 @@ describe('beginIdempotentStart', () => {
     // whose run persisted
     const { store } = harness();
     await store.reserve(workflowRequest('key-1', 'run-1'));
-    await store.claim('key-1', 'run-1');
+    await claimObserved(store, 'key-1');
 
     // #when
     const decision = await beginIdempotentStart(
       store,
       workflowRequest('key-1', 'run-2'),
-      { persisted: async () => 'summary', live: async () => false },
+      {
+        persisted: async (row) => ({
+          kind: 'result',
+          value: 'summary',
+          execution: executionFor(row),
+        }),
+        live: async () => false,
+      },
     );
 
     // #then the persisted state wins over the row's state: a stale `started`
@@ -546,7 +2349,7 @@ describe('beginIdempotentStart', () => {
     // that can never be used again.
     expect(decision).toMatchObject({
       kind: 'start',
-      reservation: { runId: 'run-1', state: 'reserved' },
+      reservation: { runId: 'run-1', state: 'started' },
     });
   });
 
@@ -558,7 +2361,7 @@ describe('beginIdempotentStart', () => {
     const { store } = harness(() => now);
     await store.reserve(workflowRequest('key-1', 'run-1'));
     now = 2_500;
-    await store.claim('key-1', 'run-1');
+    await claimObserved(store, 'key-1');
 
     // #when
     const refusal = await beginIdempotentStart(
@@ -584,7 +2387,7 @@ describe('beginIdempotentStart', () => {
     // persisted, and the host that took it is gone
     const { store } = harness();
     await store.reserve(workflowRequest('key-1', 'run-1'));
-    await store.claim('key-1', 'run-1');
+    await claimObserved(store, 'key-1');
 
     // #when
     const refusal = await beginIdempotentStart(
@@ -608,8 +2411,8 @@ describe('beginIdempotentStart', () => {
     // #given a completed run whose snapshot the retention purge removed
     const { store } = harness();
     await store.reserve(workflowRequest('key-1', 'run-1'));
-    await store.claim('key-1', 'run-1');
-    await store.settleRun('run-1');
+    await claimObserved(store, 'key-1');
+    await settleObserved(store, 'key-1');
 
     // #when
     const refusal = await beginIdempotentStart(
@@ -673,17 +2476,16 @@ describe('beginIdempotentStart', () => {
     // creating the row entitles A to start it, and if both ever believed they
     // could, the key would have bought nothing.
     const { store } = harness();
+    let winnerLive = false;
     const live: IdempotentStartSurface<string> = {
       persisted: async () => undefined,
-      // The winner IS executing — the realistic state of the world at the
-      // moment the loser asks.
-      live: async () => true,
+      live: async () => winnerLive,
     };
     const decisions: string[] = [];
     let loserDecision: unknown;
-    const realClaim = store.claim.bind(store);
+    const realClaim = store.claimReservation.bind(store);
     let interleaved = false;
-    store.claim = async (key: string, runId: string) => {
+    store.claimReservation = async (row) => {
       if (!interleaved) {
         // B arrives in the window between A's insert and A's claim.
         interleaved = true;
@@ -692,8 +2494,9 @@ describe('beginIdempotentStart', () => {
           workflowRequest('key-1', 'run-B'),
           live,
         );
+        winnerLive = true;
       }
-      return realClaim(key, runId);
+      return realClaim(row);
     };
 
     // #when A (the creator) races its own claim against B's
@@ -838,162 +2641,6 @@ describe('beginIdempotentStart', () => {
   });
 });
 
-describe('rollbackFencedStart', () => {
-  it('gives the claim back for a fence refusal and re-throws it unchanged', async () => {
-    // #given a claim consumed by a start the fence refused — provably
-    // pre-execution, because the fence is read before the run lock
-    const { store } = harness();
-    await store.reserve(workflowRequest('key-1', 'run-1'));
-    await store.claim('key-1', 'run-1');
-    const fenced = new ExecutionFencedError('migration-locked', 'run start');
-
-    // #when
-    const thrown = await rollbackFencedStart(
-      store,
-      'key-1',
-      'run-1',
-      fenced,
-    ).catch((error: unknown) => error);
-
-    // #then the caller still sees the fence's own refusal, and the key is
-    // usable again once the operator reopens.
-    expect(thrown).toBe(fenced);
-    expect((await store.read('key-1'))?.state).toBe('reserved');
-  });
-
-  it('recognizes a fence refusal that crossed a Durable Object boundary', async () => {
-    // #given the shape a fenced run-DO start takes on the Worker side: the
-    // class is gone, the status and structured reason survive
-    const { store } = harness();
-    await store.reserve(workflowRequest('key-1', 'run-1'));
-    await store.claim('key-1', 'run-1');
-    const wire = Object.assign(new Error('deployment execution is fenced'), {
-      status: 503,
-      reason: { code: 'EXECUTION_FENCED', state: 'migration-locked' },
-    });
-
-    // #when
-    await rollbackFencedStart(store, 'key-1', 'run-1', wire).catch(
-      () => undefined,
-    );
-
-    // #then rolled back all the same — an instanceof-only test would answer
-    // "not a fence refusal" for every caller on the far side of the boundary,
-    // which is where the run router actually sits.
-    expect((await store.read('key-1'))?.state).toBe('reserved');
-  });
-
-  it('KEEPS the claim for any other start failure', async () => {
-    // #given a start that failed for a reason that may well have executed
-    const { store } = harness();
-    await store.reserve(workflowRequest('key-1', 'run-1'));
-    await store.claim('key-1', 'run-1');
-
-    // #when
-    await rollbackFencedStart(
-      store,
-      'key-1',
-      'run-1',
-      new Error('step exploded'),
-    ).catch(() => undefined);
-
-    // #then still claimed: releasing here would hand the next retry a second
-    // run after a start that may already have charged somebody.
-    expect((await store.read('key-1'))?.state).toBe('started');
-  });
-
-  it('completes the whole round trip: claim, fence refusal, release, reopen, and ONE execution of the same run', async () => {
-    // #given a real fence and a real reservation over one database, and a host
-    // whose start executes paid work — the shape the round trip has to be
-    // proved in, because each half of it is only correct given the other.
-    const sqlite = openSqlite();
-    const binding = sqliteUnitDatabase(sqlite);
-    const store = new StartIdempotencyStore(
-      binding as StartIdempotencyDatabase,
-    );
-    const fence = new ExecutionFenceStore(binding as ExecutionFenceDatabase);
-    await fence.seed('open');
-    await fence.transition({ expected: 'open', next: 'migration-locked' });
-    let executions = 0;
-    const startRun = async (): Promise<void> => {
-      const reading = await fence.read();
-      if (reading.state !== 'open') {
-        throw new ExecutionFencedError(reading.state, 'run start');
-      }
-      executions += 1;
-    };
-    const attempt = async (candidate: string): Promise<StartReservation> => {
-      const decision = await beginIdempotentStart(
-        store,
-        workflowRequest('key-1', candidate),
-        EMPTY_SURFACE,
-      );
-      if (decision.kind !== 'start') throw new Error('expected a start');
-      const { key, runId } = decision.reservation;
-      try {
-        await startRun();
-      } catch (error) {
-        return rollbackFencedStart(store, key, runId, error);
-      }
-      return decision.reservation;
-    };
-
-    // #when the fenced attempt is refused, the operator reopens, and the client
-    // retries with the same key
-    const refused = await attempt('run-1').catch((error: unknown) => error);
-    expect(refused).toBeInstanceOf(ExecutionFencedError);
-    expect((await store.read('key-1'))?.state).toBe('reserved');
-    await fence.transition({ expected: 'migration-locked', next: 'open' });
-    const started = await attempt('run-ignored');
-
-    // #then the retry ran the SAME run the fenced attempt reserved, exactly
-    // once. A rollback that did not land would have left the key UNRESOLVABLE
-    // forever; a rollback that handed back a fresh run id would have made an
-    // operator's drain the cause of a second charge.
-    expect(started.runId).toBe('run-1');
-    expect(executions).toBe(1);
-    expect((await store.read('key-1'))?.state).toBe('started');
-  });
-
-  it('still re-throws the fence refusal when the release itself fails', async () => {
-    // #given a claimed reservation and a store whose release cannot be written
-    // — a storage incident arriving during a deployment that is already
-    // refusing to execute
-    const { store } = harness();
-    await store.reserve(workflowRequest('key-1', 'run-1'));
-    await store.claim('key-1', 'run-1');
-    store.release = async () => {
-      throw new Error('D1_ERROR: network');
-    };
-    const fenced = new ExecutionFencedError('migration-locked', 'run start');
-
-    // #when
-    const thrown = await rollbackFencedStart(
-      store,
-      'key-1',
-      'run-1',
-      fenced,
-    ).catch((error: unknown) => error);
-
-    // #then the caller sees the FENCE's refusal, not the storage error:
-    // swallowing it would leave the caller believing the deployment is broken
-    // rather than fenced, and the rollback's own failure is not something the
-    // caller can act on.
-    expect(thrown).toBe(fenced);
-    // The claim stayed taken, so the key is now UNRESOLVABLE rather than
-    // startable — recoverable by investigation, which is the direction this
-    // best-effort rollback deliberately fails in.
-    expect((await store.read('key-1'))?.state).toBe('started');
-    await expect(
-      beginIdempotentStart(
-        store,
-        workflowRequest('key-1', 'run-2'),
-        EMPTY_SURFACE,
-      ),
-    ).rejects.toBeInstanceOf(IdempotentStartUnresolvableError);
-  });
-});
-
 describe('requireStartIdempotency', () => {
   it('refuses a key on a host that wired no store', () => {
     // #given / #when / #then honouring the key silently would answer an
@@ -1033,102 +2680,681 @@ describe('reservationsForRuns', () => {
   });
 });
 
-describe('proof-only composition', () => {
-  it('re-asserts the proof binding on a REPLAY, so a run whose binding was lost stays resumable', async () => {
-    // #given a proof-only deployment whose proof run already exists and
-    // persisted, but whose fence has lost its proof_run_id — the shape left by
-    // a fence moved away and back onto the same key while the run survived.
-    // Without the binding, proof-only admits no resume for it at all.
-    const sqlite = openSqlite();
-    const binding = sqliteUnitDatabase(sqlite);
-    const store = new StartIdempotencyStore(
-      binding as StartIdempotencyDatabase,
-    );
-    const fence = new ExecutionFenceStore(binding as ExecutionFenceDatabase);
-    await fence.seed('migration-locked');
-    await fence.transition({
-      expected: 'migration-locked',
-      next: 'proof-only',
-      proofKey: 'proof-key-1',
-    });
-    await store.reserve({
-      ...workflowRequest('proof-key-1', 'proof-run'),
-      key: 'proof-key-1',
-    });
-    await store.claim('proof-key-1', 'proof-run');
-    expect((await fence.read()).proofRunId).toBeUndefined();
+function executionFor(row: StartReservationReading): StartExecutionIdentity {
+  return {
+    tablePrefix: '',
+    workflowId: row.targetKind === 'workflow' ? row.targetId : 'agent-loop',
+    runId: row.runId,
+    startToken: 'generation',
+    owner: row.owner,
+    target:
+      row.targetKind === 'workflow'
+        ? { kind: 'workflow', id: row.targetId }
+        : { kind: 'agent', id: row.targetId, threadId: row.threadId as string },
+  };
+}
+async function claimObserved(store: StartIdempotencyStore, key: string) {
+  const row = await store.readForAdmission(key);
+  if (!row) throw new Error('fixture reservation missing');
+  const claim = await store.claimReservation(row);
+  if (!claim) throw new Error('fixture claim missing');
+  return claim;
+}
+async function settleObserved(store: StartIdempotencyStore, key: string) {
+  const row = await store.readForAdmission(key);
+  if (!row) throw new Error('fixture reservation missing');
+  const execution = executionFor(row);
+  await store.associateReservation(row, execution);
+  return store.settleExecution(execution);
+}
 
-    // #when a retry carrying the same key finds the run persisted
-    const decision = await beginIdempotentStart(
-      store,
-      workflowRequest('proof-key-1', 'ignored'),
-      { persisted: async () => 'summary', live: async () => false },
-      fence,
-    );
-
-    // #then the replay answered with the run's state AND put the binding back
-    expect(decision.kind).toBe('replay');
-    await expect(fence.read()).resolves.toEqual({
-      state: 'proof-only',
-      proofKey: 'proof-key-1',
-      proofRunId: 'proof-run',
+describe('FS8 D3 F3 activation', () => {
+  it.each([
+    ['same-tick clock', 1_000],
+    ['backward clock', 900],
+  ] as const)('keeps a delayed creator pending after another caller releases its claim (%s)', async (_scenario, laterClock) => {
+    let clock = 1_000;
+    const h = harness(() => clock);
+    const other = new StartIdempotencyStore(h.binding, { now: () => clock });
+    let entered!: () => void;
+    let release!: () => void;
+    const waiting = new Promise<void>((resolve) => {
+      entered = resolve;
     });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const read = h.store.read.bind(h.store);
+    vi.spyOn(h.store, 'read').mockImplementationOnce(async (key) => {
+      entered();
+      await gate;
+      return read(key);
+    });
+    const live = vi.fn(async () => true);
+    const surface = { persisted: async () => undefined, live };
+    const claim = vi.spyOn(h.store, 'claimReservation');
+    const pending = beginIdempotentStart(
+      h.store,
+      workflowRequest('key', 'run'),
+      surface,
+    ).catch((error: unknown) => error);
+    try {
+      await waiting;
+      clock = laterClock;
+      const winner = await beginIdempotentStart(
+        other,
+        workflowRequest('key', 'discarded-run'),
+        EMPTY_SURFACE,
+      );
+      expect(winner.kind).toBe('start');
+      await other.releaseReservation(winner.reservation);
+      const released = await other.readForAdmission('key');
+      const before = rows(h.sqlite);
+      expect(released).toMatchObject({
+        state: 'reserved',
+        createdAt: 1_000,
+        updatedAt: 1_002,
+        binding: { kind: 'unbound' },
+      });
+      release();
+      const outcome = await pending;
+      expect(rows(h.sqlite)).toEqual(before);
+      expect(claim).not.toHaveBeenCalled();
+      expect(live).toHaveBeenCalledExactlyOnceWith(released);
+      expect(outcome).toBeInstanceOf(IdempotentStartPendingError);
+
+      live.mockResolvedValue(false);
+      const retry = await beginIdempotentStart(
+        h.store,
+        workflowRequest('key', 'discarded-retry-run'),
+        surface,
+      );
+      expect(retry).toEqual({
+        kind: 'start',
+        reservation: { ...released, state: 'started', updatedAt: 1_003 },
+      });
+      expect(claim).toHaveBeenCalledExactlyOnceWith(released);
+    } finally {
+      release();
+      await pending;
+    }
   });
 
-  it('changes nothing on a replay whose key is not the nominated proof key', async () => {
-    // #given a proof-only fence nominating a DIFFERENT key
-    const sqlite = openSqlite();
-    const binding = sqliteUnitDatabase(sqlite);
-    const store = new StartIdempotencyStore(
-      binding as StartIdempotencyDatabase,
-    );
-    const fence = new ExecutionFenceStore(binding as ExecutionFenceDatabase);
-    await fence.seed('migration-locked');
-    await fence.transition({
-      expected: 'migration-locked',
-      next: 'proof-only',
-      proofKey: 'proof-key-1',
-    });
-    await store.reserve(workflowRequest('other-key', 'other-run'));
-    await store.claim('other-key', 'other-run');
-
-    // #when
-    await beginIdempotentStart(
-      store,
-      workflowRequest('other-key', 'ignored'),
-      { persisted: async () => 'summary', live: async () => false },
-      fence,
-    );
-
-    // #then the proof slot is untouched: every guard lives in recordProofRun's
-    // own CAS, so an unrelated key is zero rows and no harm.
-    await expect(fence.read()).resolves.toEqual({
-      state: 'proof-only',
-      proofKey: 'proof-key-1',
-    });
-  });
-
-  it('does not fail a replay when the proof re-bind cannot be written', async () => {
-    // #given a fence whose write-back throws — a storage incident during a
-    // replay of a run that already happened
-    const { store } = harness();
-    await store.reserve(workflowRequest('key-1', 'run-1'));
-    await store.claim('key-1', 'run-1');
-    const failing = {
-      recordProofRun: async () => {
-        throw new Error('D1_ERROR: network');
+  it('retains a reserved row while its previous wrapper remains live, then reclaims after cleanup', async () => {
+    const h = harness();
+    await h.store.reserve(workflowRequest('key', 'run'));
+    const firstClaim = await claimObserved(h.store, 'key');
+    await h.store.releaseReservation(firstClaim);
+    const before = rows(h.sqlite);
+    const retained = await h.store.readForAdmission('key');
+    const claim = vi.spyOn(h.store, 'claimReservation');
+    const live = vi.fn(async () => true);
+    const surface = { persisted: async () => undefined, live };
+    await expect(
+      beginIdempotentStart(h.store, workflowRequest('key', 'other'), surface),
+    ).rejects.toMatchObject({
+      reason: {
+        code: 'IDEMPOTENT_START_PENDING',
+        runId: 'run',
+        pendingSince: retained?.updatedAt,
       },
-    } as unknown as ExecutionFenceStore;
+    });
+    expect(claim).not.toHaveBeenCalled();
+    expect(rows(h.sqlite)).toEqual(before);
+    expect(live).toHaveBeenCalledWith(retained);
+    expect(live.mock.contexts).toEqual([surface]);
 
-    // #when / #then the caller still gets the run's persisted state: refusing
-    // the read would answer a successful retry with an error while changing
-    // nothing about the run.
+    live.mockResolvedValue(false);
     const decision = await beginIdempotentStart(
-      store,
-      workflowRequest('key-1', 'run-2'),
-      { persisted: async () => 'summary', live: async () => false },
-      failing,
+      h.store,
+      workflowRequest('key', 'other'),
+      surface,
     );
-    expect(decision.kind).toBe('replay');
+    expect(decision).toEqual({
+      kind: 'start',
+      reservation: { ...retained, state: 'started', updatedAt: 1_003 },
+    });
+    expect(claim).toHaveBeenCalledExactlyOnceWith(retained);
+    expect(await h.store.readForAdmission('key')).toEqual(decision.reservation);
+  });
+
+  it('leaves a retained reserved row unchanged when its liveness probe throws', async () => {
+    const h = harness();
+    await h.store.reserve(workflowRequest('key', 'run'));
+    await h.store.releaseReservation(await claimObserved(h.store, 'key'));
+    const before = rows(h.sqlite);
+    const claim = vi.spyOn(h.store, 'claimReservation');
+    const failure = new Error('liveness unavailable');
+    await expect(
+      beginIdempotentStart(h.store, workflowRequest('key', 'other'), {
+        persisted: async () => undefined,
+        live: async () => {
+          throw failure;
+        },
+      }),
+    ).rejects.toBe(failure);
+    expect(claim).not.toHaveBeenCalled();
+    expect(rows(h.sqlite)).toEqual(before);
+  });
+
+  it.each([
+    'claim',
+    'release',
+    'release-reclaim',
+  ] as const)('loses the exact reclaim CAS after another caller completes %s during the probe', async (race) => {
+    const h = harness();
+    await h.store.reserve(workflowRequest('key', 'run'));
+    await h.store.releaseReservation(await claimObserved(h.store, 'key'));
+    const retained = await h.store.readForAdmission('key');
+    const other = new StartIdempotencyStore(h.binding, { now: () => 1_000 });
+    const claim = vi.spyOn(h.store, 'claimReservation');
+    let current: StartReservationReading | undefined;
+    let afterWinner: Array<Record<string, unknown>> = [];
+    const live = vi.fn(async () => {
+      if (current !== undefined) return current.state === 'started';
+      const winner = await claimObserved(other, 'key');
+      if (race !== 'claim') {
+        await other.releaseReservation(winner);
+        if (race === 'release-reclaim') await claimObserved(other, 'key');
+      }
+      current = await other.readForAdmission('key');
+      afterWinner = rows(h.sqlite);
+      return false;
+    });
+    await expect(
+      beginIdempotentStart(h.store, workflowRequest('key', 'other'), {
+        persisted: async () => undefined,
+        live,
+      }),
+    ).rejects.toBeInstanceOf(
+      race === 'release'
+        ? IdempotentStartUnresolvableError
+        : IdempotentStartPendingError,
+    );
+    expect(claim).toHaveBeenCalledExactlyOnceWith(retained);
+    expect(live).toHaveBeenCalledTimes(2);
+    expect(rows(h.sqlite)).toEqual(afterWinner);
+    expect(await h.store.readForAdmission('key')).toEqual(current);
+    expect(current?.updatedAt).toBe(
+      race === 'claim' ? 1_003 : race === 'release' ? 1_004 : 1_005,
+    );
+  });
+
+  it('replays a persisted retained reservation without probing or claiming', async () => {
+    const h = harness();
+    const { reservation } = await h.store.reserve(
+      workflowRequest('key', 'run'),
+    );
+    const live = vi.fn(async () => {
+      throw new Error('liveness unavailable');
+    });
+    const claim = vi.spyOn(h.store, 'claimReservation');
+    const decision = await beginIdempotentStart(
+      h.store,
+      workflowRequest('key', 'other'),
+      {
+        persisted: async () => ({
+          kind: 'result',
+          value: 'done',
+          execution: executionFor(reservation),
+        }),
+        live,
+      },
+    );
+    expect(decision).toMatchObject({ kind: 'replay', persisted: 'done' });
+    expect(claim).not.toHaveBeenCalled();
+    expect(live).not.toHaveBeenCalled();
+  });
+
+  it('claims a newly created key without consulting liveness or persistence', async () => {
+    const h = harness();
+    const unavailable = vi.fn(async () => {
+      throw new Error('no existing run');
+    });
+    await expect(
+      beginIdempotentStart(h.store, workflowRequest('key', 'run'), {
+        persisted: unavailable,
+        live: unavailable,
+      }),
+    ).resolves.toMatchObject({ kind: 'start' });
+    expect(unavailable).not.toHaveBeenCalled();
+  });
+
+  it('returns the exact winning started row with modern unbound binding', async () => {
+    const h = harness();
+    const decision = await beginIdempotentStart(
+      h.store,
+      workflowRequest('key', 'run'),
+      EMPTY_SURFACE,
+    ).catch((error) => error);
+    expect(rows(h.sqlite)[0]).toMatchObject({
+      state: 'started',
+      start_token: '',
+      updated_at: 1001,
+    });
+    expect(decision.reservation).toEqual(await h.store.readForAdmission('key'));
+    expect(decision.reservation.state).toBe('started');
+  });
+
+  it.each([
+    'reserved',
+    'started',
+    'terminal',
+  ] as const)('refuses a legacy %s reservation before consulting its producer', async (state) => {
+    const h = harness();
+    const { reservation } = await h.store.reserve(
+      workflowRequest('key', 'run'),
+    );
+    h.sqlite
+      .prepare(
+        'UPDATE flowsafe_start_idempotency SET state = ?, start_token = NULL',
+      )
+      .run(state);
+    const before = rows(h.sqlite);
+    const persisted = vi.fn(async () => ({
+      kind: 'result' as const,
+      value: 'done',
+      execution: executionFor(reservation),
+    }));
+    const outcome = await beginIdempotentStart(
+      h.store,
+      workflowRequest('key', 'other'),
+      { persisted, live: async () => true },
+    ).catch((error) => error);
+    expect(rows(h.sqlite)).toEqual(before);
+    expect(persisted).not.toHaveBeenCalled();
+    expect(outcome).toBeInstanceOf(
+      state === 'terminal'
+        ? IdempotentStartAlreadySettledError
+        : IdempotentStartUnresolvableError,
+    );
+  });
+
+  it.each([
+    'bound',
+    'legacy',
+  ] as const)('never attempts to reclaim an absent %s reserved reservation', async (binding) => {
+    const h = harness();
+    const { reservation } = await h.store.reserve(
+      workflowRequest('key', 'run'),
+    );
+    if (binding === 'bound')
+      await h.store.associateReservation(
+        reservation,
+        executionFor(reservation),
+      );
+    else
+      h.sqlite.exec('UPDATE flowsafe_start_idempotency SET start_token = NULL');
+    const before = rows(h.sqlite);
+    const claim = vi.spyOn(h.store, 'claimReservation');
+    const outcome = await beginIdempotentStart(
+      h.store,
+      workflowRequest('key', 'other'),
+      EMPTY_SURFACE,
+    ).catch((error) => error);
+    expect(rows(h.sqlite)).toEqual(before);
+    expect(claim).not.toHaveBeenCalled();
+    expect(outcome).toBeInstanceOf(IdempotentStartUnresolvableError);
+  });
+
+  it.each([
+    'startToken',
+    'tablePrefix',
+    'workflowId',
+  ] as const)('compares bound %s before classifying a replacement initial snapshot', async (field) => {
+    const h = harness();
+    const reserved = await h.store.reserve({
+      key: 'key',
+      owner: OWNER,
+      targetKind: 'agent',
+      targetId: 'agent',
+      threadId: 'thread',
+      mintRunId: () => 'run',
+    });
+    const execution = executionFor(reserved.reservation);
+    await h.store.associateReservation(reserved.reservation, execution);
+    const before = rows(h.sqlite);
+    const live = vi.fn(async () => true);
+    const outcome = await beginIdempotentStart(
+      h.store,
+      {
+        key: 'key',
+        owner: OWNER,
+        targetKind: 'agent',
+        targetId: 'agent',
+        threadId: 'candidate',
+        mintRunId: () => 'other',
+      },
+      {
+        persisted: async () => ({
+          kind: 'initial',
+          execution: {
+            ...execution,
+            [field]: field === 'tablePrefix' ? 'other_' : 'replacement',
+          },
+        }),
+        live,
+      },
+    ).catch((error) => error);
+    expect(rows(h.sqlite)).toEqual(before);
+    expect(live).not.toHaveBeenCalled();
+    expect(outcome).toBeInstanceOf(IdempotentStartUnresolvableError);
+  });
+
+  it.each([
+    'reserved',
+    'started',
+    'terminal',
+  ] as const)('never associates or replays a matching initial snapshot from %s', async (state) => {
+    const h = harness();
+    const { reservation } = await h.store.reserve(
+      workflowRequest('key', 'run'),
+    );
+    h.sqlite
+      .prepare('UPDATE flowsafe_start_idempotency SET state = ?')
+      .run(state);
+    const before = rows(h.sqlite);
+    const outcome = await beginIdempotentStart(
+      h.store,
+      workflowRequest('key', 'other'),
+      {
+        persisted: async () => ({
+          kind: 'initial',
+          execution: executionFor(reservation),
+        }),
+        live: async () => true,
+      },
+    ).catch((error) => error);
+    expect(rows(h.sqlite)).toEqual(before);
+    expect(outcome).toBeInstanceOf(
+      state === 'terminal'
+        ? IdempotentStartAlreadySettledError
+        : IdempotentStartPendingError,
+    );
+  });
+
+  it('associates the same observed value after its snapshot disappears and preserves generic undefined results', async () => {
+    for (const value of [{ status: 'success' }, undefined]) {
+      const h = harness();
+      const { reservation } = await h.store.reserve(
+        workflowRequest('key', 'run'),
+      );
+      h.sqlite.exec(
+        'CREATE TABLE mastra_workflow_snapshot (run_id TEXT, snapshot TEXT)',
+      );
+      h.sqlite
+        .prepare('INSERT INTO mastra_workflow_snapshot VALUES (?,?)')
+        .run('run', JSON.stringify(value ?? null));
+      let observedValue = value;
+      const persisted = vi.fn(async () => {
+        const snapshot = h.sqlite
+          .prepare(
+            'SELECT snapshot FROM mastra_workflow_snapshot WHERE run_id = ?',
+          )
+          .get('run') as { snapshot: string } | undefined;
+        if (snapshot === undefined) return undefined;
+        observedValue =
+          value === undefined ? undefined : JSON.parse(snapshot.snapshot);
+        const result = {
+          kind: 'result' as const,
+          value: observedValue,
+          execution: executionFor(reservation),
+        };
+        h.sqlite.exec('DELETE FROM mastra_workflow_snapshot');
+        return result;
+      });
+      const associate = vi.spyOn(h.store, 'associateReservation');
+      const result = await beginIdempotentStart(
+        h.store,
+        workflowRequest('key', 'other'),
+        { persisted, live: async () => false },
+      );
+      expect(rows(h.sqlite)[0]).toMatchObject({
+        start_token: 'generation',
+        state: 'reserved',
+      });
+      expect(
+        h.sqlite.prepare('SELECT * FROM mastra_workflow_snapshot').all(),
+      ).toEqual([]);
+      expect(persisted).toHaveBeenCalledTimes(1);
+      expect(associate).toHaveBeenCalledTimes(1);
+      expect(result.kind).toBe('replay');
+      if (result.kind === 'replay')
+        expect(result.persisted).toBe(observedValue);
+    }
+  });
+
+  it('captures request, receiver, original proof round and caller epoch before any waits', async () => {
+    const h = harness();
+    const fence = new ExecutionFenceStore(h.binding);
+    await fence.seed('migration-locked');
+    for (let revision = 0; revision < 8; revision++)
+      await fence.transition({
+        expected: 'migration-locked',
+        next: 'migration-locked',
+        expectedMutationEpoch: revision,
+        expectedRevision: revision,
+        advanceMutationEpoch: revision < 7,
+      });
+    await fence.transition({
+      expected: 'migration-locked',
+      next: 'proof-only',
+      proofKey: 'key',
+      expectedMutationEpoch: 7,
+      expectedRevision: 8,
+    });
+    const request: StartReservationRequest = workflowRequest('key', 'run');
+    await h.store.reserve(request);
+    let mintReceiver: unknown;
+    request.mintRunId = function () {
+      mintReceiver = this;
+      return 'other';
+    };
+    const persisted = vi.fn(async (row: StartReservationReading) => {
+      await fence.transition({
+        expected: 'proof-only',
+        next: 'migration-locked',
+        expectedMutationEpoch: 7,
+        expectedRevision: 9,
+      });
+      await fence.transition({
+        expected: 'migration-locked',
+        next: 'proof-only',
+        proofKey: 'key',
+        expectedMutationEpoch: 7,
+        expectedRevision: 10,
+      });
+      return {
+        kind: 'result' as const,
+        value: 'done',
+        execution: executionFor(row),
+      };
+    });
+    const surface = {
+      persisted,
+      live: async () => false,
+    };
+    const nominated = vi.spyOn(fence, 'rebindProofRun').mockResolvedValue(true);
+    const read = fence.read.bind(fence);
+    vi.spyOn(fence, 'read').mockImplementationOnce(async () => {
+      const frame = await read();
+      request.key = 'changed';
+      request.owner = OTHER_OWNER;
+      request.targetId = 'changed';
+      request.mintRunId = () => {
+        throw new Error('mutated mint');
+      };
+      surface.persisted = vi.fn(async () => {
+        throw new Error('mutated callback');
+      });
+      return frame;
+    });
+    const decision = await beginIdempotentStart(
+      h.store,
+      request,
+      surface,
+      fence,
+      7,
+    );
+    expect(rows(h.sqlite)).toHaveLength(1);
+    expect(await read()).toMatchObject({
+      state: 'proof-only',
+      proofKey: 'key',
+      mutationEpoch: 7,
+      transitionRevision: 11,
+    });
+    expect(decision).toMatchObject({ kind: 'replay', persisted: 'done' });
+    expect(mintReceiver).toBe(request);
+    expect(persisted.mock.contexts).toEqual([surface]);
+    expect(nominated).toHaveBeenCalledWith(
+      expect.objectContaining({
+        proof: { key: 'key', mutationEpoch: 7, transitionRevision: 9 },
+        mutationEpoch: 7,
+        reservationStore: h.store,
+      }),
+    );
+  });
+
+  it.each([
+    'missing-value',
+    'inherited-value',
+    'initial-value',
+    'bad-prefix',
+    'bad-owner',
+    'bad-discriminator',
+  ] as const)('refuses malformed producer data %s without mutating the reservation', async (mode) => {
+    const h = harness();
+    const { reservation } = await h.store.reserve(
+      workflowRequest('key', 'run'),
+    );
+    const execution = executionFor(reservation);
+    let value: unknown = { kind: 'result', value: 'done', execution };
+    if (mode === 'missing-value') value = { kind: 'result', execution };
+    if (mode === 'inherited-value')
+      value = Object.assign(Object.create({ value: 'done' }), {
+        kind: 'result',
+        execution,
+      });
+    if (mode === 'initial-value')
+      value = { kind: 'initial', value: 'done', execution };
+    if (mode === 'bad-prefix')
+      value = {
+        kind: 'result',
+        value: 'done',
+        execution: { ...execution, tablePrefix: 'ACME_' },
+      };
+    if (mode === 'bad-owner')
+      value = {
+        kind: 'result',
+        value: 'done',
+        execution: { ...execution, owner: OTHER_OWNER },
+      };
+    if (mode === 'bad-discriminator')
+      value = { kind: 'unknown', value: 'done', execution };
+    const before = rows(h.sqlite);
+    const outcome = await beginIdempotentStart(
+      h.store,
+      workflowRequest('key', 'other'),
+      { persisted: async () => value as never, live: async () => true },
+    ).catch((error) => error);
+    expect(rows(h.sqlite)).toEqual(before);
+    expect(outcome).toBeInstanceOf(StartReservationUnreadableError);
+  });
+
+  it('preserves unrelated callback errors', async () => {
+    const h = harness();
+    await h.store.reserve(workflowRequest('key', 'run'));
+    const failure = new Error('callback transport');
+    await expect(
+      beginIdempotentStart(h.store, workflowRequest('key', 'other'), {
+        persisted: async () => {
+          throw failure;
+        },
+        live: async () => false,
+      }),
+    ).rejects.toBe(failure);
+  });
+
+  it.each([
+    ['created', 'own'],
+    ['created', 'other'],
+    ['existing', 'own'],
+    ['existing', 'other'],
+  ] as const)('cannot manufacture a %s-branch winner after the %s claim response is lost', async (branch, winner) => {
+    const h = harness();
+    if (branch === 'existing')
+      await h.store.reserve(workflowRequest('key', 'run'));
+    const failure = new Error('claim response lost');
+    let claimAttempts = 0;
+    let ownClaimWrites = 0;
+    let otherClaim: StartReservationReading | undefined;
+    const store = new StartIdempotencyStore(
+      interceptReservations(h.binding, async (sql, execute) => {
+        if (
+          sql.startsWith('UPDATE flowsafe_start_idempotency') &&
+          sql.includes("SET state = 'started'")
+        ) {
+          claimAttempts++;
+          if (winner === 'own') {
+            await execute();
+            ownClaimWrites++;
+          } else {
+            const observed = await h.store.readForAdmission('key');
+            if (!observed) throw new Error('contended reservation missing');
+            otherClaim = await h.store.claimReservation(observed);
+            if (!otherClaim) throw new Error('other caller did not win');
+          }
+          throw failure;
+        }
+        return execute();
+      }),
+      { now: () => 1_000 },
+    );
+    const outcome = await beginIdempotentStart(
+      store,
+      workflowRequest('key', branch === 'created' ? 'run' : 'other'),
+      EMPTY_SURFACE,
+    ).catch((error) => error);
+    expect(rows(h.sqlite)[0]).toMatchObject({
+      state: 'started',
+      start_token: '',
+      run_id: 'run',
+      updated_at: 1_001,
+    });
+    expect(claimAttempts).toBe(1);
+    expect(ownClaimWrites).toBe(winner === 'own' ? 1 : 0);
+    if (winner === 'other')
+      expect(await h.store.readForAdmission('key')).toEqual(otherClaim);
+    expect(outcome).toBeInstanceOf(StartReservationUnreadableError);
+    expect(outcome.cause).toBe(failure);
+  });
+
+  it('replays a matching bound terminal value and keeps an unbound terminal key spent', async () => {
+    const h = harness();
+    const { reservation } = await h.store.reserve(
+      workflowRequest('key', 'run'),
+    );
+    const execution = executionFor(reservation);
+    await h.store.associateReservation(reservation, execution);
+    await h.store.settleExecution(execution);
+    const before = rows(h.sqlite);
+    const surface = {
+      persisted: async () => ({
+        kind: 'result' as const,
+        value: 'done',
+        execution,
+      }),
+      live: async () => false,
+    };
+    await expect(
+      beginIdempotentStart(h.store, workflowRequest('key', 'other'), surface),
+    ).resolves.toMatchObject({ kind: 'replay', persisted: 'done' });
+    expect(rows(h.sqlite)).toEqual(before);
+    h.sqlite.exec(
+      "UPDATE flowsafe_start_idempotency SET start_token = '', start_table_prefix = NULL, start_workflow_id = NULL",
+    );
+    await expect(
+      beginIdempotentStart(h.store, workflowRequest('key', 'other'), surface),
+    ).rejects.toBeInstanceOf(IdempotentStartAlreadySettledError);
   });
 });

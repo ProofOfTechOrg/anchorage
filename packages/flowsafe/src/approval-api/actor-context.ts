@@ -3,6 +3,10 @@
 // validates the human before exposing services or server-owned identifiers.
 
 import { DEPLOYMENT_IDENTITY_HEADER } from '../do-runner/deployment-identity.js';
+import {
+  MUTATION_EPOCH_HEADER,
+  normalizeMutationEpoch,
+} from '../do-runner/execution-admission.js';
 import { EXECUTION_PRINCIPAL_HEADER } from '../do-runner/execution-principal-header.js';
 import { mintThreadId, resourceIdFromKey } from '../do-runner/memory-id.js';
 import { isPathSafeId } from '../do-runner/path-safe-id.js';
@@ -19,6 +23,7 @@ import {
   principalActor,
 } from './principal.js';
 import {
+  canonicalResourceOwner,
   principalMayAccess,
   principalOwner,
   type ResourceAccess,
@@ -38,6 +43,7 @@ import type { ApprovalStore } from './store.js';
 import type { ApprovalStoreFactory } from './store-factory.js';
 
 export interface ActorContext {
+  readonly mutationEpoch?: number;
   /** Already authenticated and validated. */
   readonly actor: ApprovalActor;
   /** Infrastructure-verified deployment tag for audit attribution. */
@@ -93,6 +99,7 @@ export interface CreateActorResolverOptions {
   storeFactory: ApprovalStoreFactory;
   /** Infrastructure-configured deployment tag, never derived from claims. */
   deploymentTag?: string;
+  mutationEpoch?: unknown;
   /** Host-specific service assembly, called lazily at most once per request. */
   buildService: (store: ApprovalStore, actor: ApprovalActor) => ApprovalService;
   /** Run-id generator. Default: crypto.randomUUID. */
@@ -106,6 +113,7 @@ export interface CreatePrincipalActorContextOptions {
   principal: ExecutionPrincipal;
   storeFactory: ApprovalStoreFactory;
   deploymentTag?: string;
+  mutationEpoch?: unknown;
   buildService: (store: ApprovalStore, actor: ApprovalActor) => ApprovalService;
   newRunId?: () => string;
   canSelfDecide?: (role: ApprovalRole) => boolean;
@@ -119,6 +127,7 @@ export function createPrincipalActorContext(
     options.principal,
     'actor context principal',
   );
+  const mutationEpoch = normalizeMutationEpoch(options.mutationEpoch);
   const actor = principalActor(principal);
   const owner = principalOwner(principal);
   const resources = options.storeFactory.resources();
@@ -126,6 +135,7 @@ export function createPrincipalActorContext(
   let service: ApprovalService | undefined;
   return {
     actor,
+    ...(mutationEpoch === undefined ? {} : { mutationEpoch }),
     ...(options.deploymentTag !== undefined
       ? { deploymentTag: options.deploymentTag }
       : {}),
@@ -170,15 +180,76 @@ export function createPrincipalActorContext(
   };
 }
 
+export function captureActorContext(source: ActorContext): ActorContext {
+  const rawActor = source.actor;
+  if (rawActor === null || typeof rawActor !== 'object') {
+    throw new ActorResolutionError('actor context actor is malformed');
+  }
+  const { id, role } = rawActor;
+  const actor = canonicalApprovalActor({ id, role });
+  if (!actor) {
+    throw new ActorResolutionError('actor context actor is malformed');
+  }
+  const principal = assertExecutionPrincipal(
+    source.principal,
+    'actor context principal',
+  );
+  const mutationEpoch = normalizeMutationEpoch(source.mutationEpoch);
+  const deploymentTag = source.deploymentTag;
+  const rawOwner = source.resourceOwner;
+  const resourceOwner = canonicalResourceOwner(
+    rawOwner === null || typeof rawOwner !== 'object'
+      ? rawOwner
+      : { kind: rawOwner.kind, id: rawOwner.id },
+  );
+  const {
+    service,
+    newRunId,
+    newThreadId,
+    resourceIdFromKey,
+    claimResource,
+    releaseResource,
+    resourceOwnerFor,
+    canAccessResource,
+    canSelfDecide,
+  } = source;
+  const captured: ActorContext = {
+    actor,
+    principal,
+    ...(mutationEpoch === undefined ? {} : { mutationEpoch }),
+    ...(deploymentTag === undefined ? {} : { deploymentTag }),
+    resourceOwner,
+    service: () => service.call(source),
+    newRunId: () => newRunId.call(source),
+    newThreadId: () => newThreadId.call(source),
+    resourceIdFromKey: (key) => resourceIdFromKey.call(source, key),
+    claimResource: (kind, resourceId) =>
+      claimResource.call(source, kind, resourceId),
+    releaseResource: (kind, resourceId) =>
+      releaseResource.call(source, kind, resourceId),
+    resourceOwnerFor: (kind, resourceId) =>
+      resourceOwnerFor.call(source, kind, resourceId),
+    canAccessResource: (kind, resourceId, access) =>
+      canAccessResource.call(source, kind, resourceId, access),
+    canSelfDecide: (role) => canSelfDecide.call(source, role),
+  };
+  return Object.freeze(captured);
+}
+
 /** Rebind mutations and reads to the common registered owner of trusted ids. */
 export async function withRegisteredResourceOwner(
   context: ActorContext,
   resources: ResourceOwnershipStore,
   claims: readonly ResourceClaim[],
 ): Promise<ActorContext> {
-  const owner = await requireCommonResourceOwner(resources, claims);
-  return {
-    ...context,
+  const captured = captureActorContext(context);
+  const registered = await requireCommonResourceOwner(resources, claims);
+  const owner = canonicalResourceOwner({
+    kind: registered.kind,
+    id: registered.id,
+  });
+  const rebound: ActorContext = {
+    ...captured,
     resourceOwner: owner,
     claimResource: async (kind, resourceId) => {
       if (!(await resources.claim(kind, resourceId, owner))) {
@@ -194,14 +265,17 @@ export async function withRegisteredResourceOwner(
       return stored?.kind === owner.kind && stored.id === owner.id;
     },
   };
+  return Object.freeze(rebound);
 }
 
 export function createActorResolver(
   options: CreateActorResolverOptions,
 ): ActorResolver {
+  const mutationEpoch = normalizeMutationEpoch(options.mutationEpoch);
   const mintUuid = options.newRunId ?? (() => crypto.randomUUID());
   return async (request) => {
     if (
+      request.headers.has(MUTATION_EPOCH_HEADER) ||
       request.headers.has(EXECUTION_PRINCIPAL_HEADER) ||
       request.headers.has(DEPLOYMENT_IDENTITY_HEADER) ||
       request.headers.has('x-flowsafe-actor') ||
@@ -223,6 +297,7 @@ export function createActorResolver(
     const principal = humanPrincipal(actor);
     return createPrincipalActorContext({
       principal,
+      mutationEpoch,
       storeFactory: options.storeFactory,
       ...(options.deploymentTag !== undefined
         ? { deploymentTag: options.deploymentTag }

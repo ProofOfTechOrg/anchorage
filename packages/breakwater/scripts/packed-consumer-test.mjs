@@ -160,7 +160,7 @@ try {
           noEmit: true,
           skipLibCheck: true,
         },
-        include: ['consumer.ts'],
+        include: ['consumer.ts', 'decision-consumer.ts'],
       },
       null,
       2,
@@ -184,6 +184,20 @@ try {
   type AgentCliErrorCode,
   type AgentCliErrorMetadata,
   type ConnectorApprovalGrant,
+  ConnectorConformanceError,
+  type ConnectorConformanceCase,
+  type ConnectorConformanceCaseResult,
+  type ConnectorConformanceEntryPoint,
+  type ConnectorConformanceEscape,
+  type ConnectorConformanceFactory,
+  type ConnectorConformanceFinding,
+  type ConnectorConformanceFindingCode,
+  type ConnectorConformanceOptions,
+  type ConnectorConformanceReport,
+  type ConnectorConformanceRequest,
+  type ConnectorConformanceResponse,
+  type ConnectorConformanceRuntime,
+  type ConnectorEgressPosture,
   type ConnectorExecutionIdentity,
   type ConnectorInvocationOptions,
   type GuardedAgentCallOptions,
@@ -204,6 +218,20 @@ import {
   migrateLegacyConnectorIdempotency as migrateLegacyConnectorIdempotencyFromSubpath,
   singleTenantConnectorPolicies as singleTenantConnectorPoliciesFromSubpath,
   type ConnectorApprovalSuspension,
+  ConnectorConformanceError as ConnectorConformanceErrorFromSubpath,
+  type ConnectorConformanceCase as ConnectorConformanceCaseFromSubpath,
+  type ConnectorConformanceCaseResult as ConnectorConformanceCaseResultFromSubpath,
+  type ConnectorConformanceEntryPoint as ConnectorConformanceEntryPointFromSubpath,
+  type ConnectorConformanceEscape as ConnectorConformanceEscapeFromSubpath,
+  type ConnectorConformanceFactory as ConnectorConformanceFactoryFromSubpath,
+  type ConnectorConformanceFinding as ConnectorConformanceFindingFromSubpath,
+  type ConnectorConformanceFindingCode as ConnectorConformanceFindingCodeFromSubpath,
+  type ConnectorConformanceOptions as ConnectorConformanceOptionsFromSubpath,
+  type ConnectorConformanceReport as ConnectorConformanceReportFromSubpath,
+  type ConnectorConformanceRequest as ConnectorConformanceRequestFromSubpath,
+  type ConnectorConformanceResponse as ConnectorConformanceResponseFromSubpath,
+  type ConnectorConformanceRuntime as ConnectorConformanceRuntimeFromSubpath,
+  type ConnectorEgressPosture as ConnectorEgressPostureFromSubpath,
   type SingleTenantConnectorPolicies,
 } from '@proofoftech/breakwater/connector-sdk';
 import { PolicyEngine } from '@proofoftech/breakwater/policy-engine';
@@ -219,6 +247,8 @@ import type { AuditEvent } from '@proofoftech/breakwater/audit';
 import { CODEX_CLI } from '@proofoftech/breakwater/agent-cli';
 
 const code: AgentCliErrorCode = 'nonzero-exit';
+const posture: ConnectorEgressPosture = 'enforced';
+const postureFromSubpath: ConnectorEgressPostureFromSubpath = 'declaration-only';
 const metadata: AgentCliErrorMetadata = { code };
 const event = null as AuditEvent | null;
 const permission: Permission = 'payments.release';
@@ -335,12 +365,56 @@ void execution;
 `,
   );
   await writeFile(
+    join(consumerDirectory, 'decision-consumer.ts'),
+    `import {
+  CONNECTOR_DECISIONS, ConnectorPolicyError, ConnectorStoreError,
+  ConnectorEvaluatorError, ConnectorInvocationError, ConnectorValidationError,
+  connectorDecisionRetryable, isConnectorDecisionCode,
+  type ConnectorDecisionCode, type ConnectorPolicyName, type ConnectorDenialMetadata,
+  type ConnectorStoreName, type ConnectorStoreOperation, type ConnectorInvocationCode,
+} from '@proofoftech/breakwater';
+import { ConnectorPolicyError as SdkPolicyError } from '@proofoftech/breakwater/connector-sdk';
+import type { AuditEvent } from '@proofoftech/breakwater/audit';
+const metadata: ConnectorDenialMetadata = {
+  code: 'PERMISSION_MISSING',
+  details: { missingPermissions: ['resource.read'], permissionPolicyVersion: 'v1' },
+};
+const legacy: ConnectorPolicyError = new SdkPolicyError('example.read', 'custom-label', 'denied');
+const denial = new ConnectorPolicyError('example.read', 'custom-label', 'denied', metadata);
+const kind: ConnectorPolicyName = denial.policyKind;
+const code: ConnectorDecisionCode = denial.code;
+const retry: boolean = CONNECTOR_DECISIONS[code].retryable;
+const storeName: ConnectorStoreName = 'idempotency';
+const operation: ConnectorStoreOperation = 'get';
+const store = new ConnectorStoreError('example.read', storeName, operation, { cause: null });
+const evaluator = new ConnectorEvaluatorError('example.read', 'custom', { cause: null });
+const invocationCode: ConnectorInvocationCode = 'CONNECTOR_UNREGISTERED';
+const invocation: TypeError = new ConnectorInvocationError(undefined, invocationCode, 'unregistered');
+const validation = new ConnectorValidationError('example.read', 'input');
+const event: AuditEvent = {
+  timestamp: '2026-09-09T00:00:00.000Z', actor: null, action: 'connector.execute',
+  resource: 'example.read', decision: 'denied', decisionCode: code, policyKind: kind, retryable: retry,
+};
+declare const candidate: unknown;
+if (isConnectorDecisionCode(candidate)) connectorDecisionRetryable(candidate);
+// @ts-expect-error unknown codes are not part of the published union
+const unknownCode: ConnectorDecisionCode = 'UNKNOWN_CONNECTOR_CODE';
+// @ts-expect-error error details do not accept a raw request body
+const unsafe: ConnectorDenialMetadata = { code: 'EGRESS_HOST_NOT_DECLARED', details: { body: 'private' } };
+void [legacy, store, evaluator, invocation, validation, event, unknownCode, unsafe];
+`,
+  );
+  await writeFile(
     join(consumerDirectory, 'runtime.mjs'),
     `import assert from 'node:assert/strict';
+import * as root from '@proofoftech/breakwater';
+import * as sdk from '@proofoftech/breakwater/connector-sdk';
 import { RequestContext } from '@mastra/core/request-context';
 import {
   AgentCliError,
   AuditLogger,
+  assertConnectorConformance,
+  ConnectorConformanceError,
   ConnectorPolicyError,
   ConnectorValidationError,
   createConnector,
@@ -355,6 +429,7 @@ import {
   CONNECTOR_EXECUTION_CONTEXT_KEY,
   CONNECTOR_GRANTS_CONTEXT_KEY,
   connectorManifest,
+  connectorEgressPosture,
   invokeConnector as invokeConnectorFromSubpath,
   singleTenantConnectorPolicies as singleTenantConnectorPoliciesFromSubpath,
 } from '@proofoftech/breakwater/connector-sdk';
@@ -371,6 +446,55 @@ await Promise.all([
   import('@proofoftech/breakwater/audit'),
   import('@proofoftech/breakwater/agent-cli'),
 ]);
+for (const name of [
+  'CONNECTOR_DECISIONS', 'ConnectorPolicyError', 'ConnectorStoreError',
+  'ConnectorEvaluatorError', 'ConnectorInvocationError', 'ConnectorValidationError',
+  'EgressDeniedError', 'EgressGuardError', 'connectorDecisionRetryable', 'isConnectorDecisionCode',
+]) assert.equal(root[name], sdk[name], name);
+const legacyPolicy = new root.ConnectorPolicyError('packed.read', 'custom', 'denied');
+assert.equal(legacyPolicy.code, 'EVALUATOR_DENIED');
+assert.equal(legacyPolicy.policyKind, 'evaluator');
+assert.equal(legacyPolicy.retryable, false);
+assert.equal(legacyPolicy.message, 'connector packed.read denied by custom: denied');
+assert.equal(root.isConnectorDecisionCode(JSON.parse(JSON.stringify(legacyPolicy)).code), true);
+assert.equal(root.isConnectorDecisionCode('constructor'), false);
+assert.equal(root.isConnectorDecisionCode('__proto__'), false);
+assert.equal(Object.isFrozen(root.CONNECTOR_DECISIONS), true);
+assert.equal(Object.isFrozen(root.CONNECTOR_DECISIONS.STORE_UNAVAILABLE), true);
+assert.equal(root.connectorDecisionRetryable('STORE_UNAVAILABLE'), true);
+assert.equal(root.connectorDecisionRetryable('STORE_COMMIT_FAILED'), false);
+assert.equal(root.connectorDecisionRetryable('STORE_RELEASE_FAILED'), false);
+assert.throws(() => root.connectorDecisionRetryable('unknown'), TypeError);
+const storeCause = new Error('packed-private-store-cause');
+const storeAudit = new AuditLogger();
+let storeExecutions = 0;
+const storeFailure = createConnector({
+  id: 'packed.store-failure', description: 'Exercise a refused local budget',
+  permissions: { sideEffect: 'read', rateLimit: '1/min' },
+  policies: { audit: storeAudit, rateLimitStore: { increment: async () => { throw storeCause; } } },
+  execute: async () => { storeExecutions++; return {}; },
+});
+const storeError = await invokeConnector(storeFailure, {}, {}).catch(error => error);
+assert.equal(storeError instanceof sdk.ConnectorStoreError, true);
+assert.equal(storeError.cause, storeCause);
+assert.equal(storeError.code, 'STORE_UNAVAILABLE');
+assert.equal(storeError.operation, 'increment');
+assert.equal(storeError.retryable, true);
+assert.equal(storeExecutions, 0);
+assert.equal(storeAudit.events().length, 1);
+assert.equal(storeAudit.events()[0].decisionCode, storeError.code);
+assert.equal(JSON.stringify(storeAudit.events()).includes('packed-private-store-cause'), false);
+let cliExecutions = 0;
+const cliStoreFailure = createCodexConnector({
+  requiresApproval: false, rateLimit: '1/min',
+  exec: async () => { cliExecutions++; return { stdout: '', stderr: '', exitCode: 0 }; },
+  policies: { rateLimitStore: { increment: async () => { throw storeCause; } } },
+});
+const cliStoreError = await invokeConnector(cliStoreFailure, { prompt: 'private prompt' }, {}).catch(error => error);
+assert.equal(cliStoreError instanceof sdk.ConnectorStoreError, true);
+assert.equal(cliStoreError.code, 'STORE_UNAVAILABLE');
+assert.equal(Object.hasOwn(cliStoreError, 'cause'), false);
+assert.equal(cliExecutions, 0);
 assert.equal(CONNECTOR_GRANTS_CONTEXT_KEY, 'breakwater.connectorGrants');
 assert.equal(
   CONNECTOR_EXECUTION_CONTEXT_KEY,
@@ -435,6 +559,9 @@ const unauthorized = await invokeConnector(release, {}, {
 }).catch((error) => error);
 assert.equal(unauthorized instanceof ConnectorPolicyError, true);
 assert.equal(unauthorized.policy, 'required-permissions');
+assert.equal(unauthorized.code, 'PERMISSION_PROJECTION_INVALID');
+assert.equal(unauthorized.kind, 'connector-policy');
+assert.equal(unauthorized.retryable, false);
 const authorizedContext = new RequestContext();
 authorizedContext.set(PRINCIPAL_PERMISSIONS_CONTEXT_KEY, {
   permissions: ['payments.release'],
@@ -493,11 +620,22 @@ assert.deepEqual(output, {
 assert.deepEqual(connectorManifest(tool), {
   sideEffect: 'write',
   egress: ['api.openai.com', 'chatgpt.com'],
+  egressEnforcement: 'declaration-only',
   requiresApproval: false,
   dryRun: true,
   rateLimit: undefined,
   idempotencyKey: undefined,
 });
+assert.equal(connectorEgressPosture(tool), 'declaration-only');
+assert.equal(connectorEgressPosture(presetRead), 'declaration-only');
+assert.equal(connectorEgressPosture({}), undefined);
+assert.throws(() => createConnector({
+  id: 'packed.unenforced',
+  description: 'Refused by the deployment posture gate',
+  execute: async () => ({ ok: true }),
+  permissions: { sideEffect: 'read' },
+  policies: { requireEgressEnforcement: true },
+}), /requireEgressEnforcement/);
 assert.equal(JSON.stringify(output).includes(prompt), false);
 assert.equal(JSON.stringify(audit.events()).includes(prompt), false);
 
@@ -546,6 +684,55 @@ assert.equal(invalid instanceof ConnectorValidationError, true);
 assert.equal(invalid.phase, 'input');
 assert.equal(invalid.message, 'connector invocation failed validation');
 assert.equal(JSON.stringify(invalid).includes(prompt), false);
+
+const conformanceFetch = globalThis.fetch;
+const conformanceManifest = {
+  sideEffect: 'read',
+  egress: ['api.vendor.example'],
+  egressEnforcement: 'enforced',
+};
+const conformanceFactory = (runtime) => createConnector({
+  id: 'packed.conforming',
+  description: 'Packed conformance subject',
+  permissions: conformanceManifest,
+  policies: runtime.policies,
+  execute: async (_input, _context, { fetch }) => {
+    const response = await fetch('https://api.vendor.example');
+    return { ok: response.ok };
+  },
+});
+const conformanceCase = {
+  name: 'guarded request',
+  input: {},
+  expect: { outcome: 'guarded-request', hosts: ['api.vendor.example'] },
+};
+const conformanceReport = await assertConnectorConformance(conformanceFactory, {
+  manifest: conformanceManifest,
+  cases: [conformanceCase],
+});
+assert.equal(conformanceReport.conformant, true);
+assert.equal(conformanceReport.posture, 'enforced');
+assert.ok(conformanceReport.limit.length > 0);
+assert.equal(conformanceReport.cases.length, 1);
+assert.equal(conformanceReport.cases[0].transportCalls, 1);
+assert.equal(globalThis.fetch, conformanceFetch);
+await assert.rejects(assertConnectorConformance((runtime) => createConnector({
+  id: 'packed.escaping',
+  description: 'Packed escaping subject',
+  permissions: conformanceManifest,
+  policies: runtime.policies,
+  execute: async () => {
+    await globalThis.fetch('https://exfil.example');
+    return {};
+  },
+}), { manifest: conformanceManifest, cases: [conformanceCase] }), (error) => {
+  assert.ok(error instanceof ConnectorConformanceError);
+  assert.ok(error.report.findings.some((finding) =>
+    finding.code === 'NETWORK_IO_OUTSIDE_RUNTIME_FETCH' &&
+    finding.case === conformanceCase.name));
+  return true;
+});
+assert.equal(globalThis.fetch, conformanceFetch);
 `,
   );
 

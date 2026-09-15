@@ -8,7 +8,6 @@ import {
   type ExecutionFenceState,
   ExecutionFenceStore,
 } from '../do-runner/index.js';
-
 import type {
   ApprovalActor,
   ApprovalAuditEvent,
@@ -17,6 +16,7 @@ import type {
   ApprovalStreamEvent,
   ApprovalStreamSink,
 } from './contract.js';
+import type { ApprovalDatabase } from './d1-store.js';
 import {
   type AutomatedExecutionPrincipal,
   trustAutomationPrincipal,
@@ -31,7 +31,10 @@ import {
   UnknownApprovalError,
 } from './service.js';
 import type { ApprovalStore, InMemoryApprovalStore } from './store.js';
-import { InMemoryApprovalStoreFactory } from './store-factory.js';
+import {
+  D1ApprovalStoreFactory,
+  InMemoryApprovalStoreFactory,
+} from './store-factory.js';
 import {
   type ApprovalRecord,
   type CreateApprovalInput,
@@ -1705,6 +1708,101 @@ describe('ApprovalService.delegate concurrency', () => {
   });
 });
 
+describe('ApprovalService sink failure diagnostics', () => {
+  const failures = [
+    {
+      name: 'ordinary Error',
+      create: () => new Error('transport unavailable'),
+      diagnostic: 'transport unavailable',
+    },
+    {
+      name: 'throwing message getter',
+      create: () =>
+        Object.defineProperty(new Error(), 'message', {
+          get() {
+            throw new Error('message getter failed');
+          },
+        }),
+      diagnostic: 'unreadable error',
+    },
+    {
+      name: 'BigInt message',
+      create: () =>
+        Object.defineProperty(new Error(), 'message', { value: 1n }),
+      diagnostic: '1',
+    },
+    {
+      name: 'null-prototype rejection',
+      create: () => Object.create(null),
+      diagnostic: 'unreadable error',
+    },
+  ];
+
+  for (const sink of ['notify', 'stream'] as const) {
+    for (const mode of ['threw', 'rejected'] as const) {
+      it.each(
+        failures,
+      )(`${sink} ${mode} with $name preserves the approval and audit`, async ({
+        create,
+        diagnostic,
+      }) => {
+        const harness = makeHarness({
+          [sink]: () => {
+            if (mode === 'threw') throw create();
+            return Promise.reject(create());
+          },
+        });
+
+        const record = await seedPending(harness);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+
+        expect((await harness.store.get(record.id))?.status).toBe('pending');
+        expect(harness.events).toContainEqual(
+          expect.objectContaining({
+            action: `approval.${sink}`,
+            decision: 'error',
+            reason: `${sink === 'notify' ? 'notification' : 'stream'} sink ${mode}: ${diagnostic}`,
+          }),
+        );
+      });
+    }
+  }
+
+  it.each(
+    failures,
+  )('continues the SLA sweep when escalation hooks throw with $name', async ({
+    create,
+    diagnostic,
+  }) => {
+    const harness = makeHarness();
+    const first = await seedPending(harness, { slaSeconds: 60 });
+    const second = await seedPending(harness, {
+      slaSeconds: 60,
+      runId: 'acme_run-2',
+    });
+    harness.advance(61_000);
+
+    const escalated = await runSweep(harness, {
+      onEscalation: () => {
+        throw create();
+      },
+    });
+
+    expect(escalated.map(({ id }) => id).sort()).toEqual(
+      [first.id, second.id].sort(),
+    );
+    expect(
+      harness.events.filter(
+        (event) =>
+          event.action === 'approval.escalate' && event.decision === 'error',
+      ),
+    ).toEqual([
+      expect.objectContaining({ reason: `onEscalation threw: ${diagnostic}` }),
+      expect.objectContaining({ reason: `onEscalation threw: ${diagnostic}` }),
+    ]);
+  });
+});
+
 describe('ApprovalService notification seam', () => {
   it('notifies once per actually-created record, with the record', async () => {
     // #given
@@ -2555,8 +2653,7 @@ describe('ApprovalService.decide and the deployment execution fence', () => {
     ]);
   });
 
-  it('decides only for the nominated proof run under proof-only', async () => {
-    // #given — a proof state bound to one run.
+  it('refuses legacy run-only proof metadata without committing decisions', async () => {
     const fence = await fenceAt('migration-locked');
     await fence.transition({
       expected: 'migration-locked',
@@ -2575,19 +2672,138 @@ describe('ApprovalService.decide and the deployment execution fence', () => {
       stepPath: ['approval'],
     });
 
-    // #then — an approval that gates a different run is refused...
     await expect(
       harness.service.decide(other.id, { decision: 'approve' }, REVIEWER),
     ).rejects.toBeInstanceOf(ExecutionFencedError);
 
-    // #and — the proof run's gate is decided, which is what makes the proof
-    // able to reach a suspension and come back.
-    const decided = await harness.service.decide(
-      proof.id,
-      { decision: 'approve' },
-      REVIEWER,
+    const result = await harness.service
+      .decide(proof.id, { decision: 'approve' }, REVIEWER)
+      .catch((error) => error);
+    expect((await harness.store.get(proof.id))?.status).toBe('pending');
+    expect(resumeRun).not.toHaveBeenCalled();
+    expect(result).toBeInstanceOf(ExecutionFencedError);
+  });
+});
+
+describe('FS8 D3 proof activation approval decisions', () => {
+  async function modern(prefix: string | undefined) {
+    const sqlite = openSqlite();
+    const db = sqliteUnitDatabase(sqlite) as ApprovalDatabase;
+    const fence = new ExecutionFenceStore(db);
+    await fence.seed('migration-locked');
+    await fence.transition({
+      expected: 'migration-locked',
+      next: 'proof-only',
+      proofKey: 'proof',
+    });
+    sqlite.exec(
+      "UPDATE flowsafe_execution_fence SET proof_run_id = 'acme_run-1', proof_table_prefix = 'proof_', proof_workflow_id = 'wf', proof_start_token = 'generation'",
     );
-    expect(decided.record.status).toBe('approved');
-    expect(resumeRun).toHaveBeenCalledTimes(1);
+    sqlite.exec(
+      'CREATE TABLE proof_mastra_workflow_snapshot (workflow_name TEXT, run_id TEXT, resourceId TEXT, snapshot TEXT, createdAt TEXT, updatedAt TEXT, PRIMARY KEY (workflow_name,run_id))',
+    );
+    const snapshot = {
+      runId: 'acme_run-1',
+      status: 'suspended',
+      requestContext: {
+        'flowsafe.runProvenance': {
+          version: 2,
+          startToken: 'generation',
+          attemptToken: 'attempt',
+          resumeCounts: [],
+        },
+      },
+    };
+    const write = () =>
+      sqlite
+        .prepare(
+          'INSERT OR REPLACE INTO proof_mastra_workflow_snapshot VALUES (?,?,?,?,?,?)',
+        )
+        .run(
+          'wf',
+          'acme_run-1',
+          null,
+          JSON.stringify(snapshot),
+          'created',
+          'updated',
+        );
+    write();
+    const store = new D1ApprovalStoreFactory(db, {
+      workflowSnapshotTable: 'proof_mastra_workflow_snapshot',
+    }).store();
+    const resumeRun = vi.fn(async () => undefined);
+    const service = new ApprovalService({
+      store,
+      executionFence: fence,
+      workflowTablePrefix: prefix,
+      resumeRun,
+    });
+    const { record } = await service.create(
+      input({ stepPath: ['approval'] }),
+      OPERATOR,
+    );
+    return {
+      sqlite,
+      store,
+      fence,
+      service,
+      record,
+      resumeRun,
+      snapshot,
+      write,
+    };
+  }
+
+  it('requires an explicit trusted prefix and canonicalizes a supplied namespace', async () => {
+    for (const prefix of [undefined, 'PROOF_']) {
+      const h = await modern(prefix);
+      const result = await h.service
+        .decide(h.record.id, { decision: 'approve' }, REVIEWER)
+        .catch((error) => error);
+      expect((await h.store.get(h.record.id))?.status).toBe(
+        prefix === undefined ? 'pending' : 'approved',
+      );
+      expect(h.resumeRun).toHaveBeenCalledTimes(prefix === undefined ? 0 : 1);
+      if (prefix === undefined)
+        expect(result).toBeInstanceOf(ExecutionFencedError);
+      else expect(result).toMatchObject({ record: { status: 'approved' } });
+    }
+  });
+
+  it.each([
+    'sod-record',
+    'approved-history',
+  ] as const)('retains the originally admitted generation through the %s await', async (boundary) => {
+    const h = await modern('proof_');
+    const replace = () => {
+      h.snapshot.requestContext['flowsafe.runProvenance'].startToken =
+        'replacement';
+      h.write();
+      h.sqlite.exec(
+        "UPDATE flowsafe_execution_fence SET proof_start_token = 'replacement'",
+      );
+    };
+    if (boundary === 'sod-record') {
+      const get = h.store.get.bind(h.store);
+      let reads = 0;
+      h.store.get = async (id) => {
+        const result = await get(id);
+        if (++reads === 2) replace();
+        return result;
+      };
+    } else {
+      const list = h.store.list.bind(h.store);
+      h.store.list = async (filter) => {
+        const result = await list(filter);
+        replace();
+        return result;
+      };
+    }
+    const result = await h.service
+      .decide(h.record.id, { decision: 'approve' }, REVIEWER)
+      .catch((error) => error);
+    expect((await h.store.get(h.record.id))?.status).toBe('pending');
+    expect(h.resumeRun).not.toHaveBeenCalled();
+    expect(result).toBeInstanceOf(ExecutionFencedError);
   });
 });

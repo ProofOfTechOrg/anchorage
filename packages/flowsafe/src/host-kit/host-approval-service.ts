@@ -1,14 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-// The host-side ApprovalService assembly and alarm-owned SLA sweep that the
-// showcase Worker and the deploy template previously carried as byte-copies:
-// the structured-log + optional-Queues audit sink, the system principal, and the
-// SoD-guarded multi-gate
-// re-queue over the host's injected resume topology. The only genuine host
-// difference — HOW a run resumes — stays injected as `resumeRun`
-// (createDoRunTopology(...).resumeRecord for DO hosts, resumeViaRuntime for
-// in-process ones). Also home to the isolate-scoped D1ApprovalStoreFactory
-// memo, which every host needs for the same reason (the DDL promise must
-// span the isolate, not one request).
 
 import type {
   ApprovalAuditEvent,
@@ -37,6 +27,17 @@ import {
   resumeRunWithRequeue,
 } from './approval-bridge.js';
 import { numberVar } from './env-vars.js';
+
+/** @internal Preserve diagnostics when a rejection cannot be converted to text. */
+export function hostErrorText(error: unknown, preferMessage = false): string {
+  try {
+    return String(
+      preferMessage && error instanceof Error ? error.message : error,
+    );
+  } catch {
+    return 'unreadable error';
+  }
+}
 
 /**
  * Attribution identity for alarm-owned maintenance — audit only. The sweep is TCB
@@ -121,7 +122,7 @@ export function hostAuditSink(
         console.error(
           JSON.stringify({
             type: 'audit-queue-error',
-            reason: String(error),
+            reason: hostErrorText(error),
           }),
         );
       });
@@ -193,6 +194,7 @@ export interface HostApprovalServiceOptions {
    * the wiring can happen, so the type has to make it name one.
    */
   executionFence: ExecutionFenceWiring;
+  workflowTablePrefix?: string;
 }
 
 /**
@@ -228,6 +230,7 @@ export function buildHostApprovalService(
     // erased, one layer above the gate, the distinction between a host that
     // named the opt-out and one that never held a fence at all.
     executionFence: options.executionFence,
+    workflowTablePrefix: options.workflowTablePrefix,
     resumeRun: resumeRunWithRequeue(
       options.resumeRun,
       () => service,
@@ -299,28 +302,23 @@ export async function runSlaSweepMaintenance(
           deploymentTag: options.deploymentTag,
           queue: options.queue,
           keepAlive: (send) => pendingSends.push(send),
-          onError: (error) => failures.push(`audit-queue: ${String(error)}`),
+          onError: (error) =>
+            failures.push(`audit-queue: ${hostErrorText(error)}`),
         }),
         notify: options.notify,
-        // Mirror the audit sink's keepAlive idiom: COLLECT each escalation's
-        // publish promise into pendingSends so the terminal Promise.all keeps it
-        // within the directly awaited alarm duty. The inner .catch keeps a
-        // failed fan-out from rejecting the whole Promise.all.
         stream: (event) => {
           pendingSends.push(
-            Promise.resolve(options.stream?.(event)).catch((error: unknown) => {
-              failures.push(`stream-publish: ${String(error)}`);
-              // Log a wedged maintenance fan-out (matching the fetch path's
-              // stream-publish-error) instead of swallowing it silently, while
-              // still containing it so it can't reject the whole Promise.all.
-              console.error(
-                JSON.stringify({
-                  type: 'stream-publish-error',
-                  reason:
-                    error instanceof Error ? error.message : String(error),
-                }),
-              );
-            }),
+            Promise.resolve()
+              .then(() => options.stream?.(event))
+              .catch((error: unknown) => {
+                failures.push(`stream-publish: ${hostErrorText(error)}`);
+                console.error(
+                  JSON.stringify({
+                    type: 'stream-publish-error',
+                    reason: hostErrorText(error, true),
+                  }),
+                );
+              }),
           );
         },
         onEscalation: (record) =>
@@ -339,7 +337,8 @@ export async function runSlaSweepMaintenance(
       })
     ).length;
   } catch (error) {
-    failures.push(String(error));
+    const failure = hostErrorText(error);
+    failures.push(failure);
     console.error(
       JSON.stringify({
         type: 'maintenance-error',
@@ -348,7 +347,7 @@ export async function runSlaSweepMaintenance(
           : {}),
         surface: 'sla-sweep',
         trigger: options.trigger,
-        error: String(error),
+        error: failure,
       }),
     );
   }
@@ -391,7 +390,7 @@ export function reconcileApprovalsOnStatusDetached(
             type: 'reconcile-error',
             workflowId,
             runId: summary.runId,
-            error: error instanceof Error ? error.message : String(error),
+            error: hostErrorText(error, true),
           }),
         ),
       ),
@@ -415,20 +414,7 @@ export interface ApprovalRetentionPurgeOptions {
   trigger: string;
 }
 
-/**
- * The maintenance-owned approval-retention purge, previously hand-copied verbatim
- * by the hosts (deploy/worker.ts and the showcase worker): purgeExpiredApprovals
- * over the deployment store, the APPROVAL_RETENTION_DAYS var parsing
- * (allowZero: a 0-day retention purges decided approvals immediately, the
- * same convention RUN_RETENTION_DAYS uses), and containment — a purge
- * failure logs a maintenance-error and returns an explicit failed outcome
- * instead of throwing, so it never aborts a caller's other duties or gets
- * mistaken for a successful purge. Unlike
- * runSlaSweepMaintenance, this does NOT log its own "maintenance" summary
- * line: both hosts fold the returned count into ONE combined purge log
- * alongside their other maintenance duties, so logging it here too would
- * double-log.
- */
+/** Contains approval-retention failures so sibling maintenance can continue. */
 export async function runApprovalRetentionPurge(
   options: ApprovalRetentionPurgeOptions,
 ): Promise<MaintenanceOutcome<number>> {
@@ -449,7 +435,7 @@ export async function runApprovalRetentionPurge(
       }),
     };
   } catch (error) {
-    const failure = String(error);
+    const failure = hostErrorText(error).slice(0, 256);
     console.error(
       JSON.stringify({
         type: 'maintenance-error',

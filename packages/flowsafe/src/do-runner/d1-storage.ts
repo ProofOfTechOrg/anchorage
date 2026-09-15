@@ -11,11 +11,46 @@ import {
   MastraCompositeStore,
   type MastraStorageDomains,
 } from '@mastra/core/storage';
-
+import { missingTableReadsEmpty } from './cause-chain.js';
 import type { D1DatabaseBinding } from './cf-types.js';
+import {
+  normalizeD1RunExecutionIdentity,
+  normalizeStartExecutionIdentity,
+} from './execution-admission.js';
+import { FencedWorkflowsStorageD1 } from './fenced-workflows-d1.js';
+import {
+  notificationTimestampMillis,
+  notificationTimestampSql,
+} from './notification-predicate.js';
 import { isPathSafeId } from './path-safe-id.js';
+import {
+  decodeRunStartIdentity,
+  runExecutionIdentityFor,
+} from './run-provenance.js';
+import { RESOURCE_OWNER_TABLE } from './run-storage-tables.js';
 import { START_IDEMPOTENCY_TABLE } from './start-idempotency.js';
+import {
+  admissionReservationFromRow,
+  reservationFromRow,
+  reservationSchemaStage,
+  START_IDEMPOTENCY_COLUMNS,
+  type StartReservationSchemaStage,
+} from './start-reservation-contract.js';
 import { validateTablePrefix } from './table-prefix.js';
+import {
+  decodeRawWorkflowSnapshotResult,
+  prepareRawWorkflowSnapshotRead,
+  type RawWorkflowSnapshot,
+  type SnapshotDatabase,
+  type SnapshotStatement,
+  snapshotResultRows,
+} from './workflow-snapshot-row.js';
+
+export { RESOURCE_OWNER_TABLE } from './run-storage-tables.js';
+export type {
+  SnapshotDatabase,
+  SnapshotStatement,
+} from './workflow-snapshot-row.js';
 
 export interface D1StorageOptions {
   /** D1 binding from the Worker/DO environment. */
@@ -29,8 +64,9 @@ export interface D1StorageOptions {
    * notifications and thread state, which @mastra/cloudflare-d1 does not ship, so
    * they are flowsafe-owned D1 impls). Injected rather than imported so this
    * lower layer never depends on `signals/` (which imports do-runner) — build
-   * them with `createSignalStorageDomains()` and pass them here. Absent ⇒ the
-   * bare D1Store, byte-identical to before this seam existed.
+   * them with `createSignalStorageDomains()` and pass them here. The default
+   * workflow domain supports explicit initial-admission scopes; false/custom
+   * workflow overrides retain precedence.
    */
   domains?: MastraStorageDomains;
 }
@@ -38,42 +74,64 @@ export interface D1StorageOptions {
 export function createD1Storage(
   options: D1StorageOptions,
 ): MastraCompositeStore {
-  const tablePrefix = validateTablePrefix(options.tablePrefix);
+  const {
+    binding,
+    id: suppliedId,
+    tablePrefix: suppliedPrefix,
+    domains: suppliedDomains,
+  } = options;
+  const domainSource = suppliedDomains ?? {};
+  const capturedDomains = {
+    workflows: domainSource.workflows,
+    scores: domainSource.scores,
+    memory: domainSource.memory,
+    channels: domainSource.channels,
+    notifications: domainSource.notifications,
+    observability: domainSource.observability,
+    agents: domainSource.agents,
+    datasets: domainSource.datasets,
+    experiments: domainSource.experiments,
+    promptBlocks: domainSource.promptBlocks,
+    scorerDefinitions: domainSource.scorerDefinitions,
+    mcpClients: domainSource.mcpClients,
+    mcpServers: domainSource.mcpServers,
+    workspaces: domainSource.workspaces,
+    skills: domainSource.skills,
+    favorites: domainSource.favorites,
+    blobs: domainSource.blobs,
+    backgroundTasks: domainSource.backgroundTasks,
+    schedules: domainSource.schedules,
+    harness: domainSource.harness,
+    toolProviderConnections: domainSource.toolProviderConnections,
+    threadState: domainSource.threadState,
+  } satisfies Record<keyof MastraStorageDomains, unknown>;
+  const { workflows: suppliedWorkflows, ...otherDomains } = capturedDomains;
+  const id = suppliedId ?? 'flowsafe';
+  const tablePrefix = validateTablePrefix(suppliedPrefix);
+  const domainConfig = {
+    binding: binding as unknown as D1Database,
+    ...(tablePrefix === undefined ? {} : { tablePrefix }),
+  };
   const d1 = new D1Store({
-    id: options.id ?? 'flowsafe',
+    id,
     // @mastra/cloudflare-d1's own D1Store signature wants the real
     // D1Database; D1DatabaseBinding is the structural subset this package
     // exposes instead, so consumers of its shipped types don't need
     // @cloudflare/workers-types installed.
-    binding: options.binding as unknown as D1Database,
-    ...(tablePrefix !== undefined ? { tablePrefix } : {}),
+    ...domainConfig,
   });
-  // No extra domains ⇒ return the D1Store itself (it IS a MastraCompositeStore),
-  // preserving byte-identical behavior for every host that does not opt into
-  // signals. With domains, compose them OVER d1 as the default: its own init()
-  // (all adapter tables, DDL ordering, coalesced callers) runs first via the
-  // parentDefault path, THEN each override domain's init() — the composite never
-  // double-inits a parent's domain (validated: chunk #runInit).
-  if (!options.domains) return d1;
+  const workflows =
+    suppliedWorkflows === undefined
+      ? new FencedWorkflowsStorageD1(domainConfig)
+      : suppliedWorkflows;
   return new MastraCompositeStore({
-    id: options.id ?? 'flowsafe',
+    id,
     default: d1,
-    domains: options.domains,
+    domains: { ...otherDomains, workflows },
   });
 }
 
-/**
- * Mastra workflow terminals plus FlowSafe's lifecycle-owned terminals.
- * Deleting a live run (running/suspended/waiting/pending/paused) would kill a
- * pending approval, so only these are ever purged.
- *
- * Exported because retention and the drain inventory must agree on the word
- * "terminal" to the letter. The purge deletes what this set matches; the
- * inventory counts what it does NOT, and a run that is terminal to one and live
- * to the other is either a row the purge reaps while the inventory still calls
- * it work, or — worse — a run the inventory declares finished while it is still
- * executing, which is exactly the reading a migration would act on.
- */
+/** Shared with the drain inventory so cleanup and liveness use the same vocabulary. */
 export const RUN_TERMINAL_STATUSES = [
   'success',
   'failed',
@@ -85,29 +143,25 @@ export const RUN_TERMINAL_STATUSES = [
   'timed_out',
 ] as const;
 
-/**
- * The SQL that decides one snapshot row is TERMINAL, with `?` for each entry of
- * RUN_TERMINAL_STATUSES in order.
- *
- * A shared FRAGMENT rather than a shared list because the rule is not "the
- * status is in the set": a run that reached 'cancelled' or 'timed_out' is
- * terminal only once its lifecycle cleanup stamped `cleanupCompletedAt`, and
- * before that it is still executing compensation. Two hand-written copies of
- * that carve-out are two chances for one of them to answer "finished" for a run
- * that is mid-cleanup — the retention purge would delete a live run's snapshot,
- * and the drain inventory would report a deployment empty while it still runs
- * work. The caller supplies the `json_valid` guard, because it decides which
- * way an unclassifiable row should fail.
- */
-export const RUN_TERMINAL_SNAPSHOT_SQL = `json_extract(snapshot, '$.status') IN (${RUN_TERMINAL_STATUSES.map(
-  () => '?',
-).join(', ')})
+/** Duplicate keys can disagree between SQLite and JSON.parse on terminal eligibility. */
+export const RUN_TERMINAL_SNAPSHOT_SQL = `json_type(snapshot, '$') = 'object'
+             AND (SELECT count(*) FROM json_each(snapshot) WHERE key COLLATE BINARY = 'status') = 1
+             AND (SELECT count(*) FROM json_each(snapshot) WHERE key COLLATE BINARY = 'requestContext') <= 1
+             AND (SELECT count(*) FROM json_each(snapshot, '$.requestContext') WHERE key COLLATE BINARY = 'flowsafe.runLifecycle') <= 1
+             AND (SELECT count(*) FROM json_each(snapshot, '$.requestContext."flowsafe.runLifecycle"') WHERE key COLLATE BINARY = 'terminal') <= 1
+             AND (SELECT count(*) FROM json_each(snapshot, '$.requestContext."flowsafe.runLifecycle".terminal') WHERE key COLLATE BINARY = 'cleanupCompletedAt') <= 1
+             AND json_extract(snapshot, '$.status') IN (${RUN_TERMINAL_STATUSES.map(
+               () => '?',
+             ).join(', ')})
              AND (
                json_extract(snapshot, '$.status') NOT IN ('cancelled', 'timed_out')
-               OR json_extract(
-                 snapshot,
-                 '$.requestContext."flowsafe.runLifecycle".terminal.cleanupCompletedAt'
-               ) IS NOT NULL
+               OR (
+                 json_type(snapshot, '$.requestContext."flowsafe.runLifecycle".terminal.cleanupCompletedAt') IN ('integer', 'real')
+                 AND json_extract(snapshot, '$.requestContext."flowsafe.runLifecycle".terminal.cleanupCompletedAt') BETWEEN 0 AND 9007199254740991
+                 AND json_extract(snapshot, '$.requestContext."flowsafe.runLifecycle".terminal.cleanupCompletedAt') = CAST(
+                   json_extract(snapshot, '$.requestContext."flowsafe.runLifecycle".terminal.cleanupCompletedAt') AS INTEGER
+                 )
+               )
              )`;
 
 const DEADLINE_LIVE_STATUSES = [
@@ -303,530 +357,1269 @@ export async function sweepExpiredRunDeadlines(
   return processed;
 }
 
-/**
- * Minimal structural D1 surface the purge uses — same posture as the
- * approval store: tests back it with node:sqlite, Workers pass env.DB.
- */
-export interface SnapshotDatabase {
-  prepare(query: string): SnapshotStatement;
-  /** D1 transactional batch, required when owner lifecycle cleanup is wired. */
-  batch?(statements: SnapshotStatement[]): Promise<unknown[]>;
-}
-
-export interface SnapshotStatement {
-  bind(...values: unknown[]): SnapshotStatement;
-  run(): Promise<unknown>;
-  all<T = unknown>(): Promise<{ results: T[] }>;
-}
-
 /** Structural: R2ArtifactStore.deleteRun, without importing the artifacts module. */
 export interface RunArtifactPurger {
   deleteRun(workflowId: string, runId: string): Promise<number>;
 }
 
-export interface PurgeExpiredRunsOptions {
-  /** workflowOutputTTL: runs untouched for longer than this are eligible. */
-  ttlMs: number;
-  /** Must satisfy and match createD1Storage's max-39 tablePrefix contract. */
-  tablePrefix?: string;
-  /**
-   * When set, each purged run's R2 artifacts are deleted WITH its snapshot
-   * row. Hosts that store artifacts must wire this: the snapshot row is the
-   * only enumerable record of a run's artifact keys (R2 keys lead with
-   * workflowId — there is no run-level listing without it), so a retention
-   * purge without this pairing strands the run's artifacts until the
-   * deployment itself is decommissioned.
-   */
-  artifactStore?: RunArtifactPurger;
-  /**
-   * Deployment-local resource-owner table. When supplied, each snapshot delete
-   * and its run-owner release commit in the same D1 transaction. The composed
-   * Flowsafe Worker always supplies this; lower-level callers without the
-   * resource registry omit it.
-   */
-  resourceOwnerTable?: string;
-  /**
-   * The start-reservation table (`flowsafe_start_idempotency`). When supplied,
-   * this purge is also what keeps idempotency keys finite.
-   *
-   * Wired the same way `resourceOwnerTable` is — by name, from the composed
-   * Flowsafe Worker — for the same reason: this module owns the SQL of run
-   * retention, and a reservation must be reaped in the same transaction that
-   * removes the run it points at, never by a second sweep that could interleave
-   * with it.
-   */
-  startIdempotencyTable?: string;
-  /**
-   * How long a spent idempotency key stays answerable after its run settled —
-   * the KEY-VALIDITY HORIZON, and the only tuning decision this feature has.
-   *
-   * Until it elapses, a retry of a completed run is told ALREADY_SETTLED. After
-   * it, the reservation is gone and the same key reads as brand new, so a retry
-   * would START A SECOND RUN. That is the whole reason this exists as its own
-   * knob rather than riding `ttlMs`: a host whose callers retry for longer than
-   * its run retention (an overnight batch re-run, a queue with a multi-day
-   * redrive) needs keys to outlive summaries, and a host whose keys are minted
-   * per HTTP request does not.
-   *
-   * DEFAULTS TO `ttlMs`, and is floored at it: a reservation shorter-lived than
-   * the snapshot it guards would be deleted while its run is still readable,
-   * and the very next retry would mint a fresh run alongside the live one — the
-   * exact double-execution this feature exists to prevent. A caller asking for
-   * less gets `ttlMs`, silently, because there is no configuration in which the
-   * smaller number is what anybody meant.
-   */
-  startIdempotencyTtlMs?: number;
-  /**
-   * Runs processed per call. Artifact-paired path: default 100 — the purge duty's
-   * subrequest-budget guard, same batching as any batched reaper. Each
-   * run costs ~2+N subrequests (R2 list, per-artifact deletes, its row's
-   * DELETE), so an UNBOUNDED first backlog would blow the Workers
-   * per-invocation cap mid-pass and log an error every firing until it
-   * drained; size this to your plan's budget instead. Row-only path:
-   * default 1000 — one LIMIT-batched DELETE statement per firing, bounding
-   * D1 per-query cost instead of subrequests. Both paths use the shrinking
-   * eligible set as the cursor — the next firing resumes at the survivors.
-   */
-  limit?: number;
-  /** Clock override for tests. */
-  now?: () => number;
+export interface RunRetentionScanPosition {
+  readonly afterRowId: number;
+  readonly highWaterRowId: number;
 }
 
-/**
- * The MASTRA-OWNED tables `purgeExpiredWorkflowRuns` deletes from under the run
- * TTL — the production anchor the schema guard cross-checks every `run-ttl`
- * retention declaration against. The guard reads THIS, not a literal copied
- * into the test, so a purge that changes what it targets and a guard that still
- * blesses the old set cannot drift apart silently.
- *
- * Mastra-owned specifically: the purge ALSO deletes from flowsafe's own
- * registries when a caller wires them, and those live in
- * RUN_TTL_FLOWSAFE_PURGE_TABLES below rather than here — see its note for why
- * the two sets are not one.
- */
+export interface RunRetentionCursor {
+  readonly version: 1;
+  readonly tablePrefix: string;
+  readonly startIdempotencyTable?: string;
+  readonly snapshots?: RunRetentionScanPosition;
+  readonly reservations?: RunRetentionScanPosition;
+}
+
+export interface PurgeExpiredRunsOptions {
+  /** Terminal snapshot retention measured from updatedAt. */
+  ttlMs: number;
+  tablePrefix?: string;
+  /** Artifact deletion precedes the guarded snapshot transaction. */
+  artifactStore?: RunArtifactPurger;
+  resourceOwnerTable?: string;
+  startIdempotencyTable?: string;
+  /** Defaults to ttlMs and cannot shorten the snapshot retention horizon. */
+  startIdempotencyTtlMs?: number;
+  /** Physical rows scanned per phase, capped at 90. */
+  limit?: number;
+  now?: () => number;
+  cursor?: RunRetentionCursor;
+  advanceCursor: (next: RunRetentionCursor) => Promise<void>;
+}
+
 export const RUN_TTL_PURGE_TABLES: readonly string[] = [
   'mastra_workflow_snapshot',
 ];
 
-/**
- * The resource-ownership registry's table, named here rather than imported from
- * the store that creates it (approval-api/resource-ownership.ts).
- *
- * The layering forbids the import: do-runner may reach approval-api only
- * through its declared leaves, and the ownership store is not one — it is built
- * ON do-runner. So this file has always carried the name as a literal inside
- * RUN_TTL_FLOWSAFE_PURGE_TABLES; giving it a name adds no second home, it names
- * the one that was already here, and lets the drain inventory read the registry
- * without a third copy. The census test crosses it against
- * RESOURCE_OWNERSHIP_TABLE, which is the only place the two can be compared.
- */
-export const RESOURCE_OWNER_TABLE = 'flowsafe_resource_owners';
-
-/**
- * The FLOWSAFE-owned tables this purge also deletes from when the caller wires
- * them, and the reason they are not in the list above.
- *
- * `RUN_TTL_PURGE_TABLES` is cross-checked against the `mastra_%` inventory in
- * mastra-schema-guard.test.ts — its job is to catch a @mastra/core bump that
- * changes what run retention targets. These two are ours, they are optional
- * (a lower-level caller without the registries omits both), and they are
- * deleted on a DIFFERENT predicate: `flowsafe_resource_owners` when its run's
- * last snapshot is gone, `flowsafe_start_idempotency` when its reservation is
- * settled AND past the key-validity horizon. Folding them into the Mastra
- * anchor would make that guard assert an equality it cannot mean.
- */
 export const RUN_TTL_FLOWSAFE_PURGE_TABLES: readonly string[] = [
   RESOURCE_OWNER_TABLE,
   START_IDEMPOTENCY_TABLE,
 ];
 
-/**
- * Data-retention purge: deletes TERMINAL runs (success/failed/tripwire/
- * canceled/bailed/skipped and cleanup-complete cancelled/timed_out) whose
- * updatedAt is older than the TTL from
- * mastra_workflow_snapshot — and, when `artifactStore` is wired, each purged
- * run's R2 artifacts with its row, plus (when their tables are wired) the run's
- * ownership row and its spent start reservation, each in the SAME transaction
- * as the snapshot delete. Live runs (running/suspended/waiting/
- * pending/paused) are never touched — expiring a suspended run would kill a
- * pending approval. A missing snapshot table reads as zero purgeable runs
- * (Mastra creates it lazily with the first persisted run). TTL enforcement
- * is a storage-layer property, so it lives here; alarm scheduling stays with
- * the caller. Returns the number of deleted rows.
- */
-export async function purgeExpiredWorkflowRuns(
+const RETENTION_SQL_BYTES = 90_000;
+const RETENTION_SELECTOR_BYTES = 1_000_000;
+const RETENTION_FRAGMENT_BYTES = 4096;
+const RETENTION_NAMESPACES = 64;
+const RETENTION_PAGE = 90;
+const RETENTION_SUFFIX = 'mastra_workflow_snapshot';
+const RETENTION_PATH = '$.requestContext."flowsafe.runProvenance"';
+const RETENTION_OWNED_KEYS = [
+  'version',
+  'startToken',
+  'startIdentity',
+  'agentStart',
+] as const;
+const retentionEncoder = new TextEncoder();
+
+type RetentionDatabase = SnapshotDatabase &
+  Required<Pick<SnapshotDatabase, 'batch'>>;
+type RetentionOwned = readonly (string | null)[];
+type RetentionStartTuple = readonly [
+  string,
+  string,
+  string,
+  string,
+  string,
+  string,
+  string | null,
+];
+type RetentionSelector = readonly [
+  string,
+  string,
+  RetentionOwned,
+  RetentionStartTuple | null,
+];
+interface RetentionSchema {
+  names: string[];
+  table?: string;
+  stage?: StartReservationSchemaStage;
+  bindings: [string, string | null, string | null];
+}
+interface RetentionStatement {
+  sql: string;
+  values: unknown[];
+}
+interface RetentionPage {
+  rows: Record<string, unknown>[];
+  position?: RunRetentionScanPosition;
+}
+interface RetentionOrphan {
+  raw: Record<string, unknown>;
+  namespace?: string;
+  observation: 'legacy' | 'missing' | 'absent' | RetentionOwned;
+}
+
+function retentionRegistry(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(value))
+    throw new Error('retention registry must be a safe SQL identifier');
+  if (value.length >= RETENTION_SQL_BYTES)
+    throw new Error('retention registry exceeds SQL byte budget');
+  return value.toLowerCase();
+}
+
+function retentionRecord(
+  value: unknown,
+  keys: readonly string[],
+): Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value))
+    throw new Error('run retention cursor is malformed');
+  const captured: Record<string, unknown> = {};
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== 'string' || !keys.includes(key))
+      throw new Error('run retention cursor is malformed');
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !('value' in descriptor))
+      throw new Error('run retention cursor is malformed');
+    captured[key] = descriptor.value;
+  }
+  return captured;
+}
+
+/** @internal */
+export function parseRunRetentionCursor(
+  value: unknown,
+): RunRetentionCursor | undefined {
+  if (value === undefined) return undefined;
+  const {
+    version,
+    tablePrefix,
+    startIdempotencyTable,
+    snapshots,
+    reservations,
+  } = retentionRecord(value, [
+    'version',
+    'tablePrefix',
+    'startIdempotencyTable',
+    'snapshots',
+    'reservations',
+  ]);
+  if (version !== 1 || typeof tablePrefix !== 'string')
+    throw new Error('run retention cursor is malformed');
+  const prefix = validateTablePrefix(tablePrefix)?.toLowerCase() ?? '';
+  const table = retentionRegistry(startIdempotencyTable);
+  const capturePosition = (
+    position: unknown,
+  ): RunRetentionScanPosition | undefined => {
+    if (position === undefined) return undefined;
+    const { afterRowId, highWaterRowId } = retentionRecord(position, [
+      'afterRowId',
+      'highWaterRowId',
+    ]);
+    if (
+      typeof afterRowId !== 'number' ||
+      !Number.isSafeInteger(afterRowId) ||
+      typeof highWaterRowId !== 'number' ||
+      !Number.isSafeInteger(highWaterRowId) ||
+      afterRowId > highWaterRowId
+    )
+      throw new Error('run retention position is malformed');
+    return Object.freeze({ afterRowId, highWaterRowId });
+  };
+  const snapshotPosition = capturePosition(snapshots);
+  const reservationPosition = capturePosition(reservations);
+  if (reservationPosition && table === undefined)
+    throw new Error('reservation cursor requires a registry');
+  return Object.freeze({
+    version: 1,
+    tablePrefix: prefix,
+    ...(table === undefined ? {} : { startIdempotencyTable: table }),
+    ...(snapshotPosition === undefined ? {} : { snapshots: snapshotPosition }),
+    ...(reservationPosition === undefined
+      ? {}
+      : { reservations: reservationPosition }),
+  });
+}
+
+function retentionStatement(
+  sql: string,
+  values: unknown[],
+): RetentionStatement {
+  if (
+    retentionEncoder.encode(sql).length > RETENTION_SQL_BYTES ||
+    values.length > 100
+  )
+    throw new Error('run retention statement exceeds SQL or binding budget');
+  return { sql, values };
+}
+
+function retentionSelectorJson(values: readonly unknown[]): string {
+  const json = JSON.stringify(values);
+  if (retentionEncoder.encode(json).length > RETENTION_SELECTOR_BYTES)
+    throw new Error('run retention selector exceeds byte budget');
+  return json;
+}
+
+function prepareRetentionStatement(
   db: SnapshotDatabase,
-  options: PurgeExpiredRunsOptions,
-): Promise<number> {
-  const prefix = validateTablePrefix(options.tablePrefix) ?? '';
-  const now = options.now ?? Date.now;
-  // @mastra/cloudflare-d1 stores updatedAt as ISO-8601 TEXT
-  // (persistWorkflowSnapshot serializes via toISOString), so lexicographic
-  // < against an ISO cutoff is a correct timestamp comparison.
-  const cutoff = new Date(now() - options.ttlMs).toISOString();
-  // json_extract throws on malformed JSON and would abort the WHOLE delete —
-  // one corrupt row must not stop every valid terminal row from being
-  // reclaimed. The CASE guard (not `AND json_valid(...)`) is load-bearing:
-  // SQLite does not guarantee AND short-circuit order in a WHERE, so a bare
-  // conjunct could still evaluate the extract on the bad row. Unclassifiable
-  // rows yield NULL and survive (fail safe: never delete what can't be
-  // proven terminal).
-  const eligible = `updatedAt < ?
-         AND CASE WHEN json_valid(snapshot) THEN
-           (
-             ${RUN_TERMINAL_SNAPSHOT_SQL}
-           )
-         ELSE 0 END`;
-  const resourceOwnerTable = options.resourceOwnerTable;
-  if (
-    resourceOwnerTable !== undefined &&
-    !/^[A-Za-z_][A-Za-z0-9_]*$/.test(resourceOwnerTable)
-  ) {
-    throw new Error('resourceOwnerTable must be a safe SQL identifier');
+  statement: RetentionStatement,
+): SnapshotStatement {
+  return db.prepare(statement.sql).bind(...statement.values);
+}
+
+async function observeRunRetentionSchema(
+  db: SnapshotDatabase,
+  table: string | undefined,
+): Promise<RetentionSchema> {
+  const names = snapshotResultRows(
+    await db
+      .prepare(`SELECT name, type FROM sqlite_schema
+    WHERE type IN ('table', 'view') AND lower(name) GLOB '*${RETENTION_SUFFIX}'
+    ORDER BY lower(name) LIMIT ${RETENTION_NAMESPACES + 1}`)
+      .all(),
+  );
+  if (names.length > RETENTION_NAMESPACES)
+    throw new Error('run retention namespace overflow');
+  const canonical: string[] = [];
+  for (const row of names) {
+    if (
+      row.type !== 'table' ||
+      typeof row.name !== 'string' ||
+      !row.name.toLowerCase().endsWith(RETENTION_SUFFIX)
+    )
+      throw new Error('run retention namespace is not a supported table');
+    validateTablePrefix(row.name.slice(0, -RETENTION_SUFFIX.length));
+    const name = row.name.toLowerCase();
+    if (canonical.includes(name))
+      throw new Error('run retention duplicate namespace');
+    canonical.push(name);
   }
-  const startIdempotencyTable = options.startIdempotencyTable;
-  if (
-    startIdempotencyTable !== undefined &&
-    !/^[A-Za-z_][A-Za-z0-9_]*$/.test(startIdempotencyTable)
-  ) {
-    throw new Error('startIdempotencyTable must be a safe SQL identifier');
+  let stage: StartReservationSchemaStage | undefined;
+  let metadata: unknown[][] | null = null;
+  if (table !== undefined) {
+    const rows = snapshotResultRows(
+      await prepareRetentionStatement(
+        db,
+        retentionStatement(
+          `SELECT s.type AS schema_type,
+      p.cid, p.name, p.type, p."notnull", p.dflt_value, p.pk, p.hidden
+      FROM sqlite_schema s LEFT JOIN pragma_table_xinfo(?1) p ON 1
+      WHERE lower(s.name)=?1 AND s.type IN ('table','view') ORDER BY p.cid LIMIT 14`,
+          [table],
+        ),
+      ).all(),
+    );
+    if (rows.length > 0) {
+      if (
+        rows.some(
+          (row, index) => row.schema_type !== 'table' || row.cid !== index,
+        )
+      )
+        throw new Error('run retention reservation schema is unsupported');
+      stage = reservationSchemaStage({ results: rows });
+      if (stage === undefined)
+        throw new Error('run retention reservation schema is empty');
+      metadata = rows.map((row) => [
+        row.cid,
+        row.name,
+        row.type,
+        row.notnull,
+        row.dflt_value,
+        row.pk,
+        row.hidden,
+      ]);
+    }
   }
-  // Floored at the run TTL, never below it — see startIdempotencyTtlMs. A
-  // reservation deleted while its run is still readable would let the next
-  // retry of that key start a SECOND run beside the live one.
-  const reservationCutoff =
-    now() -
-    Math.max(options.startIdempotencyTtlMs ?? options.ttlMs, options.ttlMs);
-  const batch =
-    resourceOwnerTable || startIdempotencyTable
-      ? db.batch?.bind(db)
-      : undefined;
-  if ((resourceOwnerTable || startIdempotencyTable) && !batch) {
-    throw new Error(
-      'purgeExpiredWorkflowRuns requires database.batch() for atomic owner cleanup',
+  return {
+    names: canonical,
+    table,
+    stage,
+    bindings: [
+      JSON.stringify(canonical),
+      table ?? null,
+      metadata === null ? null : JSON.stringify(metadata),
+    ],
+  };
+}
+
+const RETENTION_SCHEMA_SQL = `WITH expected_names(name) AS (SELECT value FROM json_each(?1)),
+current_names(name,type) AS (
+ SELECT lower(name),type FROM sqlite_schema WHERE type IN ('table','view')
+ AND lower(name) GLOB '*${RETENTION_SUFFIX}' LIMIT ${RETENTION_NAMESPACES + 1}
+), ecols(cid,name,type,nn,dflt,pk,hidden) AS (
+ SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]'),json_extract(value,'$[2]'),
+ json_extract(value,'$[3]'),json_extract(value,'$[4]'),json_extract(value,'$[5]'),json_extract(value,'$[6]') FROM json_each(?3)
+), ccols(cid,name,type,nn,dflt,pk,hidden) AS (
+ SELECT cid,name,type,"notnull",dflt_value,pk,hidden FROM pragma_table_xinfo(?2) ORDER BY cid LIMIT 14
+), schema_ok(ok) AS (SELECT
+ (SELECT count(*) FROM current_names)=(SELECT count(*) FROM expected_names)
+ AND NOT EXISTS (SELECT name FROM current_names EXCEPT SELECT name FROM expected_names)
+ AND NOT EXISTS (SELECT 1 FROM current_names WHERE type COLLATE BINARY <> 'table')
+ AND CASE WHEN ?2 IS NULL THEN 1 WHEN ?3 IS NULL THEN NOT EXISTS (
+ SELECT 1 FROM sqlite_schema WHERE lower(name)=?2 AND type IN ('table','view'))
+ ELSE EXISTS (SELECT 1 FROM sqlite_schema WHERE lower(name)=?2 AND type='table')
+ AND (SELECT count(*) FROM ccols)=(SELECT count(*) FROM ecols)
+ AND NOT EXISTS (SELECT * FROM ccols EXCEPT SELECT * FROM ecols) END)`;
+
+function retentionPathGuard(): string {
+  return `json_type(s.snapshot,'$')='object'
+    AND (SELECT count(*) FROM json_each(s.snapshot) WHERE key COLLATE BINARY='requestContext') <= 1
+    AND (json_type(s.snapshot,'$.requestContext') IS NULL OR json_type(s.snapshot,'$.requestContext')='object')
+    AND (SELECT count(*) FROM json_each(s.snapshot,'$.requestContext') WHERE key COLLATE BINARY='flowsafe.runProvenance') <= 1
+    AND NOT EXISTS (SELECT key FROM json_each(s.snapshot,'${RETENTION_PATH}')
+      WHERE key COLLATE BINARY IN ('version','startToken','startIdentity','agentStart') GROUP BY key COLLATE BINARY HAVING count(*) > 1)`;
+}
+
+function retentionOwnedExpressions(): string[] {
+  return RETENTION_OWNED_KEYS.map(
+    (key) => `s.snapshot -> '${RETENTION_PATH}.${key}'`,
+  );
+}
+
+function retentionOwnedProjection(): string {
+  const expressions = retentionOwnedExpressions();
+  const size = expressions
+    .map((expression) => `COALESCE(length(CAST((${expression}) AS BLOB)),0)`)
+    .join('+');
+  const bounded = `CASE WHEN json_valid(s.snapshot) THEN (${size})<=${RETENTION_FRAGMENT_BYTES} ELSE 0 END`;
+  return `CASE WHEN json_valid(s.snapshot) THEN ${retentionPathGuard()} ELSE 0 END AS path_ok,
+    CASE WHEN json_valid(s.snapshot) THEN json_type(s.snapshot,'${RETENTION_PATH}') END AS provenance_type,
+    ${bounded} AS owned_ok,
+    ${expressions.map((expression, index) => `CASE WHEN ${bounded} THEN ${expression} END AS owned_${index}`).join(',')}`;
+}
+
+function retentionOwnedEquality(path: string): string {
+  return `CASE WHEN json_valid(s.snapshot) THEN json_type(s.snapshot,'${RETENTION_PATH}')='object'
+    AND ${retentionPathGuard()} AND ${retentionOwnedExpressions()
+      .map(
+        (expression, index) =>
+          `(${expression}) COLLATE BINARY IS json_extract(c.value,'${path}[${index}]')`,
+      )
+      .join(' AND ')} ELSE 0 END`;
+}
+
+function decodeRunRetentionCandidate(
+  row: Record<string, unknown>,
+  prefix: string,
+): RetentionSelector | 'legacy' | undefined {
+  for (const key of [
+    'workflow_name',
+    'run_id',
+    'path_ok',
+    'owned_ok',
+    'provenance_type',
+    ...RETENTION_OWNED_KEYS.map((_, index) => `owned_${index}`),
+  ]) {
+    if (!Object.hasOwn(row, key))
+      throw new Error('run retention capsule projection is incomplete');
+  }
+  if (
+    ![0, 1, null].includes(row.path_ok as number | null) ||
+    ![0, 1].includes(row.owned_ok as number) ||
+    ![
+      null,
+      'object',
+      'array',
+      'text',
+      'integer',
+      'real',
+      'true',
+      'false',
+      'null',
+    ].includes(row.provenance_type as string | null)
+  )
+    throw new Error('run retention capsule projection is malformed');
+  const owned = RETENTION_OWNED_KEYS.map((_, index) => row[`owned_${index}`]);
+  if (owned.some((value) => value !== null && typeof value !== 'string'))
+    throw new Error('run retention capsule projection is malformed');
+  let fragments: unknown[];
+  try {
+    fragments = owned.map((value) =>
+      typeof value === 'string' ? JSON.parse(value) : undefined,
+    );
+  } catch {
+    throw new Error('run retention capsule projection is malformed');
+  }
+  if (
+    !isPathSafeId(row.workflow_name) ||
+    !isPathSafeId(row.run_id) ||
+    row.path_ok !== 1 ||
+    row.owned_ok !== 1
+  )
+    return undefined;
+  try {
+    let value: Record<string, unknown> | undefined;
+    if (row.provenance_type !== null) {
+      if (row.provenance_type !== 'object') return undefined;
+      const object: Record<string, unknown> = {};
+      RETENTION_OWNED_KEYS.forEach((key, index) => {
+        if (typeof owned[index] === 'string') object[key] = fragments[index];
+      });
+      value = object;
+    }
+    const decoded = decodeRunStartIdentity(value);
+    if (decoded === undefined) return 'legacy';
+    const execution = normalizeD1RunExecutionIdentity(
+      runExecutionIdentityFor(
+        {
+          tablePrefix: prefix,
+          workflowId: row.workflow_name,
+          runId: row.run_id,
+        },
+        decoded,
+      ),
+    );
+    const start =
+      decoded.startIdentity === undefined
+        ? undefined
+        : normalizeStartExecutionIdentity({
+            ...execution,
+            ...decoded.startIdentity,
+          });
+    return [
+      execution.workflowId,
+      execution.runId,
+      owned as RetentionOwned,
+      start === undefined
+        ? null
+        : [
+            prefix,
+            start.startToken,
+            start.owner.kind,
+            start.owner.id,
+            start.target.kind,
+            start.target.id,
+            start.target.kind === 'agent' ? start.target.threadId : null,
+          ],
+    ];
+  } catch {
+    return undefined;
+  }
+}
+
+function retentionTerminalSql(first: number): string {
+  let binding = first;
+  return RUN_TERMINAL_SNAPSHOT_SQL.replace(/\bsnapshot\b/g, 's.snapshot')
+    .replace(/\?/g, () => `?${binding++}`)
+    .replace(
+      /json_extract\(s.snapshot, '\$\.status'\)/g,
+      "json_extract(s.snapshot, '$.status') COLLATE BINARY",
+    );
+}
+
+function retentionPageStatement(
+  table: string,
+  position: RunRetentionScanPosition | undefined,
+  limit: number,
+  projection: string,
+  extra: unknown[] = [],
+): RetentionStatement {
+  return retentionStatement(
+    `WITH bounds(h) AS MATERIALIZED (SELECT COALESCE(?1,(SELECT MAX(rowid) FROM "${table}"))),
+    page AS (SELECT rowid AS rid FROM "${table}",bounds WHERE rowid <= h ${position ? 'AND rowid > ?2' : ''} ORDER BY rowid LIMIT ?3)
+    SELECT b.h,p.rid,${projection} FROM bounds b LEFT JOIN page p ON 1
+    LEFT JOIN "${table}" s ON s.rowid=p.rid ORDER BY p.rid`,
+    [
+      position?.highWaterRowId ?? null,
+      position?.afterRowId ?? null,
+      limit,
+      ...extra,
+    ],
+  );
+}
+
+function decodeRetentionPage(
+  result: unknown,
+  position: RunRetentionScanPosition | undefined,
+  limit: number,
+): RetentionPage {
+  const rows = snapshotResultRows(result);
+  if (rows.length === 0 || rows.length > limit)
+    throw new Error('run retention page is malformed');
+  const highWater = rows[0]?.h;
+  if (
+    highWater !== null &&
+    (typeof highWater !== 'number' || !Number.isSafeInteger(highWater))
+  )
+    throw new Error('run retention high water is malformed');
+  if (position && highWater !== position.highWaterRowId)
+    throw new Error('run retention high water changed');
+  let previous = position?.afterRowId;
+  for (const row of rows) {
+    if (row.h !== highWater)
+      throw new Error('run retention high water disagrees');
+    if (row.rid === null && rows.length === 1) return { rows: [] };
+    if (
+      typeof row.rid !== 'number' ||
+      !Number.isSafeInteger(row.rid) ||
+      typeof highWater !== 'number' ||
+      row.rid > highWater ||
+      (previous !== undefined && row.rid <= previous)
+    )
+      throw new Error('run retention row position is malformed');
+    previous = row.rid;
+  }
+  if (previous === undefined || typeof highWater !== 'number')
+    throw new Error('run retention page is malformed');
+  return {
+    rows,
+    ...(rows.length < limit || previous === highWater
+      ? {}
+      : {
+          position: Object.freeze({
+            afterRowId: previous,
+            highWaterRowId: highWater,
+          }),
+        }),
+  };
+}
+
+function retentionMembership(
+  names: readonly string[],
+  selector: string,
+): string {
+  if (names.length === 0) return 'SELECT NULL AS run_id WHERE 0';
+  const compoundLimit = 5;
+  const grouped = names.length > compoundLimit;
+  const definitions = grouped
+    ? [`retention_ids(run_id) AS MATERIALIZED (${selector})`]
+    : [];
+  let selects = names.map(
+    (name) =>
+      `SELECT DISTINCT run_id COLLATE BINARY AS run_id FROM "${name}" WHERE run_id COLLATE BINARY IN (${grouped ? 'SELECT run_id FROM retention_ids' : selector})`,
+  );
+  // Materialized groups prevent flattening beyond workerd's compound limit.
+  while (selects.length > compoundLimit) {
+    const next: string[] = [];
+    for (let index = 0; index < selects.length; index += compoundLimit) {
+      const name = `retention_members_${definitions.length}`;
+      definitions.push(
+        `${name}(run_id) AS MATERIALIZED (${selects.slice(index, index + compoundLimit).join(' UNION ALL ')})`,
+      );
+      next.push(`SELECT run_id FROM ${name}`);
+    }
+    selects = next;
+  }
+  return `${definitions.length > 0 ? `WITH ${definitions.join(', ')} ` : ''}${selects.join(' UNION ALL ')}`;
+}
+
+function retentionSnapshotGroup(
+  schema: RetentionSchema,
+  table: string,
+  owner: string | undefined,
+  selectors: readonly RetentionSelector[],
+  raw: RawWorkflowSnapshot | undefined,
+  cutoff: string,
+  keyCutoff: number,
+  now: number,
+): RetentionStatement[] {
+  const result = [
+    retentionStatement(
+      `${RETENTION_SCHEMA_SQL} SELECT ok AS schema_ok FROM schema_ok`,
+      [...schema.bindings],
+    ),
+  ];
+  const json = retentionSelectorJson(selectors);
+  if (schema.names.includes(table)) {
+    result.push(
+      raw
+        ? retentionStatement(
+            `${RETENTION_SCHEMA_SQL} DELETE FROM "${table}" AS s WHERE (SELECT ok FROM schema_ok)=1
+      AND s.workflow_name COLLATE BINARY=?4 AND s.run_id COLLATE BINARY=?5 AND s.snapshot COLLATE BINARY=?6
+      AND s.createdAt COLLATE BINARY IS ?7 AND s.updatedAt COLLATE BINARY IS ?8 AND s.resourceId COLLATE BINARY IS ?9
+      AND s.updatedAt COLLATE BINARY < ?10 AND CASE WHEN json_valid(s.snapshot) THEN (${retentionTerminalSql(11)}) AND ${retentionPathGuard()} ELSE 0 END`,
+            [
+              ...schema.bindings,
+              raw.workflowId,
+              raw.runId,
+              raw.snapshot,
+              raw.createdAt,
+              raw.updatedAt,
+              raw.resourceId,
+              cutoff,
+              ...RUN_TERMINAL_STATUSES,
+            ],
+          )
+        : retentionStatement(
+            `${RETENTION_SCHEMA_SQL} DELETE FROM "${table}" AS s WHERE (SELECT ok FROM schema_ok)=1
+      AND s.updatedAt COLLATE BINARY < ?5 AND CASE WHEN json_valid(s.snapshot) THEN (${retentionTerminalSql(6)}) ELSE 0 END
+      AND EXISTS (SELECT 1 FROM json_each(?4) c WHERE s.workflow_name COLLATE BINARY=json_extract(c.value,'$[0]')
+      AND s.run_id COLLATE BINARY=json_extract(c.value,'$[1]') AND ${retentionOwnedEquality('$[2]')})`,
+            [...schema.bindings, json, cutoff, ...RUN_TERMINAL_STATUSES],
+          ),
     );
   }
-  /**
-   * The two reservation statements that ride a snapshot delete, in order.
-   *
-   * They run INSIDE the same `batch()` as the snapshot's own DELETE and AFTER
-   * it, which is what makes the pairing atomic: by the time these execute, the
-   * runs named here have no snapshot in this transaction, so neither statement
-   * can act on a reservation whose run is still readable.
-   *
-   *  1. DELETE the reservations already past the horizon. This is the pairing
-   *     the design asks for: a spent key and the run it named leave together.
-   *  2. MARK the rest terminal. A reservation still inside its horizon must
-   *     survive — that is what makes a late retry ALREADY_SETTLED rather than a
-   *     fresh start — but its run is gone, so it is settled by definition. This
-   *     also HEALS the reconcile a crash between a run's terminal persist and
-   *     `settleRun` would have lost, and re-stamps `updated_at` so the horizon
-   *     is measured from a point at which the reservation is definitely spent.
-   *
-   *     `state <> 'terminal'` also settles `reserved` rows, not just `started`
-   *     ones. The ordinary lifecycle should not produce one here — a run only
-   *     persists a snapshot after its claim, so a row this statement can see is
-   *     normally `started` — and the point is that this statement does not
-   *     depend on that. It is selected by RUN, and every run it names has just
-   *     lost its snapshot in this same transaction, so whatever left the row
-   *     un-claimed (a released claim, a hand-edited row, a caller yet to be
-   *     written), the run it names is gone and the key cannot be worth starting
-   *     again. Settling too eagerly costs a retry a refusal it can resolve with
-   *     a fresh key; leaving a row readable as `reserved` after its run is
-   *     unreadable costs a second run of work that already completed.
-   */
-  /**
-   * Whether the reservation table has been seen to exist this pass.
-   *
-   * It is created lazily by the first `reserve()`, so a deployment on which no
-   * idempotency key has ever been used has none — and a batch naming a missing
-   * table fails as ONE TRANSACTION, taking the snapshot delete down with it.
-   * That would turn "this host wired reservations and nobody has used one yet"
-   * into "run retention is silently unenforced", so the first such failure
-   * retries the batch WITHOUT the reservation statements and the pass carries
-   * on with the pairing disabled. Nothing is lost: a table that does not exist
-   * holds no reservation to reap.
-   */
-  let reservationsUnavailable = false;
-  const reservationStatements = (
-    runIds: readonly string[],
-  ): SnapshotStatement[] => {
-    if (
-      !startIdempotencyTable ||
-      reservationsUnavailable ||
-      runIds.length === 0
-    ) {
-      return [];
-    }
-    const placeholders = runIds.map(() => '?').join(', ');
-    return [
-      db
-        .prepare(
-          `DELETE FROM ${startIdempotencyTable}
-           WHERE run_id IN (${placeholders})
-             AND state = 'terminal' AND updated_at < ?`,
-        )
-        .bind(...runIds, reservationCutoff),
-      db
-        .prepare(
-          `UPDATE ${startIdempotencyTable}
-             SET state = 'terminal', updated_at = ?
-           WHERE run_id IN (${placeholders}) AND state <> 'terminal'`,
-        )
-        .bind(now(), ...runIds),
+  if (owner !== undefined) {
+    const candidates = "SELECT json_extract(value,'$[1]') FROM json_each(?4)";
+    result.push(
+      retentionStatement(
+        `${RETENTION_SCHEMA_SQL}, present(run_id) AS (${retentionMembership(schema.names, candidates)})
+      DELETE FROM "${owner}" WHERE (SELECT ok FROM schema_ok)=1 AND resource_kind COLLATE BINARY='run' AND reservation_token IS NULL
+      AND resource_id COLLATE BINARY IN (${candidates}) AND NOT EXISTS (SELECT 1 FROM present WHERE present.run_id COLLATE BINARY=resource_id COLLATE BINARY)`,
+        [...schema.bindings, json],
+      ),
+    );
+  }
+  if (!raw && schema.stage === 3 && schema.table !== undefined) {
+    const absence = schema.names.includes(table)
+      ? `NOT EXISTS (SELECT 1 FROM "${table}" s WHERE s.workflow_name COLLATE BINARY=json_extract(c.value,'$[0]') AND s.run_id COLLATE BINARY=json_extract(c.value,'$[1]'))`
+      : '1';
+    const fields = [
+      'start_table_prefix',
+      'start_token',
+      'owner_kind',
+      'owner_id',
+      'target_kind',
+      'target_id',
+      'thread_id',
     ];
-  };
-  /**
-   * Reap the reservations that OUTLIVED their snapshot.
-   *
-   * The paired statements above only ever see runs whose snapshot is expiring
-   * in THIS pass, and a reservation is meant to survive that moment — the whole
-   * point of a horizon longer than run retention is that a late retry still
-   * finds ALREADY_SETTLED after the summary is gone. Which means the pairing
-   * alone can never delete those rows: by the time they are old enough, their
-   * snapshot has been gone for passes and nothing re-visits them. This sweep is
-   * what keeps the table finite, and without it the reservation table would be
-   * the one piece of this deployment's state that only ever grows.
-   *
-   * `NOT EXISTS (snapshot)` is not an optimization — it is the safety predicate
-   * that makes this sweep structurally unable to delete a reservation whose run
-   * is still readable, whatever a caller configured the horizon to be. The
-   * LIMIT rides a rowid subselect for the same reason every other purge here
-   * does: plain `DELETE ... LIMIT` needs a SQLite compile-time option D1 does
-   * not guarantee.
-   */
-  /**
-   * Run a snapshot-delete batch, retrying once without the reservation
-   * statements if the reservation table turns out not to exist yet.
-   *
-   * `build(withReservations)` rather than a prepared array, because D1
-   * statements are single-use once run: a retry has to re-prepare.
-   */
-  const runPurgeBatch = async (
-    build: (withReservations: boolean) => SnapshotStatement[],
-  ): Promise<unknown[]> => {
-    if (!batch) throw new Error('purgeExpiredWorkflowRuns: batch unavailable');
-    try {
-      return await batch(build(true));
-    } catch (error) {
-      if (
-        startIdempotencyTable === undefined ||
-        reservationsUnavailable ||
-        !isMissingTable(error, startIdempotencyTable)
-      ) {
-        throw error;
-      }
-      reservationsUnavailable = true;
-      return batch(build(false));
-    }
-  };
-  const sweepOrphanedStartReservations = async (): Promise<void> => {
-    if (!startIdempotencyTable || reservationsUnavailable) return;
-    try {
-      await db
-        .prepare(
-          `DELETE FROM ${startIdempotencyTable}
-           WHERE rowid IN (
-             SELECT r.rowid FROM ${startIdempotencyTable} AS r
-             WHERE r.state = 'terminal' AND r.updated_at < ?
-               AND NOT EXISTS (
-                 SELECT 1 FROM ${prefix}mastra_workflow_snapshot AS s
-                 WHERE s.run_id = r.run_id
-               )
-             LIMIT ?
-           )`,
-        )
-        .bind(reservationCutoff, options.limit ?? 1000)
-        .run();
-    } catch (error) {
-      // Either table may legitimately not exist yet: the reservation table is
-      // created by the first reserve() and the snapshot table by the first run.
-      // Neither absence is a fault, and neither leaves anything to reap.
-      if (
-        isMissingTable(error, startIdempotencyTable) ||
-        isMissingTable(error, `${prefix}mastra_workflow_snapshot`)
-      ) {
-        return;
-      }
-      throw error;
-    }
-  };
+    const pair = `EXISTS (SELECT 1 FROM json_each(?4) c WHERE json_type(c.value,'$[3]')='array' AND
+      ${fields.map((field, index) => `r.${field} COLLATE BINARY IS json_extract(c.value,'$[3][${index}]')`).join(' AND ')}
+      AND r.start_workflow_id COLLATE BINARY=json_extract(c.value,'$[0]') AND r.run_id COLLATE BINARY=json_extract(c.value,'$[1]') AND ${absence})`;
+    result.push(
+      retentionStatement(
+        `${RETENTION_SCHEMA_SQL} DELETE FROM "${schema.table}" AS r WHERE (SELECT ok FROM schema_ok)=1
+      AND r.state COLLATE BINARY='terminal' AND ${retentionFiniteExpiry('r.updated_at', '?5')} AND ${pair}`,
+        [...schema.bindings, json, keyCutoff],
+      ),
+    );
+    result.push(
+      retentionStatement(
+        `${RETENTION_SCHEMA_SQL} UPDATE "${schema.table}" AS r SET state='terminal', updated_at=?5
+      WHERE (SELECT ok FROM schema_ok)=1 AND r.state COLLATE BINARY IN ('reserved','started') AND ${pair}`,
+        [...schema.bindings, json, now],
+      ),
+    );
+  }
+  return result;
+}
 
-  if (options.artifactStore) {
-    // Artifact-paired path, run by run: artifacts BEFORE the row, because
-    // the row is the only record of the run's artifact keys — dying between
-    // the two leaves the row for the next sweep (deleteRun is idempotent),
-    // while row-first would strand the artifacts forever. Each deleted row
-    // is durable progress: a mid-pass crash or the LIMIT batch cap resumes
-    // at the survivors on the next firing, and per-run failures are
-    // isolated below so one wedged run cannot stall the rows behind it.
-    let rows: Array<{ workflow_name: string; run_id: string }>;
-    try {
-      ({ results: rows } = await db
-        .prepare(
-          `SELECT workflow_name, run_id
-           FROM ${prefix}mastra_workflow_snapshot
-           WHERE ${eligible}
-           LIMIT ?`,
-        )
-        .bind(cutoff, ...RUN_TERMINAL_STATUSES, options.limit ?? 100)
-        .all<{ workflow_name: string; run_id: string }>());
-    } catch (error) {
-      if (!isMissingTable(error, `${prefix}mastra_workflow_snapshot`))
-        throw error;
-      return 0;
+function retentionFiniteExpiry(column: string, cutoff: string): string {
+  return `typeof(${column}) IN ('integer','real') AND ${column} BETWEEN -1.7976931348623157e308 AND 1.7976931348623157e308 AND ${column} < ${cutoff}`;
+}
+
+function retentionBatchResult(
+  value: unknown,
+  count: number,
+): { schemaOk: boolean; deleted: number } {
+  if (!Array.isArray(value) || value.length !== count)
+    throw new Error('run retention batch result is malformed');
+  let deleted = 0;
+  let schemaOk = false;
+  for (let index = 0; index < count; index += 1) {
+    if (!Object.hasOwn(value, index))
+      throw new Error('run retention batch result is sparse');
+    const result = value[index];
+    if (
+      result === null ||
+      typeof result !== 'object' ||
+      Array.isArray(result) ||
+      ('success' in result && result.success !== true)
+    )
+      throw new Error('run retention batch result failed');
+    if (index === 0) {
+      const rows = snapshotResultRows(result);
+      if (
+        rows.length !== 1 ||
+        (rows[0]?.schema_ok !== 0 && rows[0]?.schema_ok !== 1)
+      )
+        throw new Error('run retention schema result is malformed');
+      schemaOk = rows[0]?.schema_ok === 1;
+    } else {
+      const changes = result.meta?.changes;
+      if (
+        typeof changes !== 'number' ||
+        !Number.isSafeInteger(changes) ||
+        changes < 0 ||
+        (!schemaOk && changes !== 0)
+      )
+        throw new Error('run retention mutation result is uncertain');
+      if (index === 1) deleted = changes;
     }
-    let deleted = 0;
-    const failures: Array<{ run: string; message: string }> = [];
-    for (const row of rows) {
+  }
+  return { schemaOk, deleted };
+}
+
+function retentionReservationProjection(
+  stage: StartReservationSchemaStage,
+): string {
+  const columns = START_IDEMPOTENCY_COLUMNS.slice(0, 10 + stage).map(
+    ([name]) => name,
+  );
+  const scalars = columns
+    .map((name) => `typeof(s."${name}") IN ('null','text','integer','real')`)
+    .join(' AND ');
+  const size = columns
+    .map((name) => `COALESCE(length(CAST(s."${name}" AS BLOB)),0)`)
+    .join('+');
+  const json = `json_object(${columns.map((name) => `'${name}',s."${name}"`).join(',')})`;
+  return `CASE WHEN ${scalars} AND (${size}) <= ${RETENTION_FRAGMENT_BYTES} THEN CASE WHEN length(CAST(${json} AS BLOB)) <= ${RETENTION_FRAGMENT_BYTES} THEN ${json} END END AS raw`;
+}
+
+function decodeRetentionReservationProjection(
+  row: Record<string, unknown>,
+  stage: StartReservationSchemaStage,
+): Record<string, unknown> | undefined {
+  if (row.raw === null) return undefined;
+  if (typeof row.raw !== 'string')
+    throw new Error('run retention reservation projection is malformed');
+  let raw: unknown;
+  try {
+    raw = JSON.parse(row.raw);
+  } catch {
+    throw new Error('run retention reservation projection is malformed');
+  }
+  const columns = START_IDEMPOTENCY_COLUMNS.slice(0, 10 + stage).map(
+    ([name]) => name,
+  );
+  if (
+    raw === null ||
+    typeof raw !== 'object' ||
+    Array.isArray(raw) ||
+    Object.keys(raw).length !== columns.length ||
+    columns.some((name) => !Object.hasOwn(raw, name)) ||
+    Object.values(raw).some(
+      (value) =>
+        value !== null &&
+        typeof value !== 'string' &&
+        typeof value !== 'number',
+    )
+  )
+    throw new Error('run retention reservation projection is malformed');
+  return raw as Record<string, unknown>;
+}
+
+function retentionOrphanGroup(
+  schema: RetentionSchema,
+  orphans: readonly RetentionOrphan[],
+  keyCutoff: number,
+): RetentionStatement[] {
+  const first = orphans[0];
+  if (!first || schema.stage === undefined)
+    throw new Error('run retention orphan group is empty');
+  const json = retentionSelectorJson(
+    orphans.map((orphan) => [
+      orphan.raw,
+      Array.isArray(orphan.observation) ? orphan.observation : null,
+    ]),
+  );
+  const columns = START_IDEMPOTENCY_COLUMNS.slice(0, 10 + schema.stage).map(
+    ([name]) => name,
+  );
+  const exact = columns
+    .map(
+      (name) =>
+        `r."${name}" COLLATE BINARY IS json_extract(c.value,'$[0].${name}')`,
+    )
+    .join(' AND ');
+  let guard: string;
+  let membership = '';
+  if (first.observation === 'legacy') {
+    membership = `, present(run_id) AS (${retentionMembership(schema.names, "SELECT json_extract(value,'$[0].run_id') FROM json_each(?4)")})`;
+    guard =
+      'NOT EXISTS (SELECT 1 FROM present WHERE run_id COLLATE BINARY=r.run_id COLLATE BINARY)';
+  } else if (first.observation === 'missing') guard = '1';
+  else {
+    const address = `s.workflow_name COLLATE BINARY=json_extract(c.value,'$[0].start_workflow_id') AND s.run_id COLLATE BINARY=json_extract(c.value,'$[0].run_id')`;
+    guard =
+      first.observation === 'absent'
+        ? `NOT EXISTS (SELECT 1 FROM "${first.namespace}" s WHERE ${address})`
+        : `EXISTS (SELECT 1 FROM "${first.namespace}" s WHERE ${address} AND ${retentionOwnedEquality('$[1]')})`;
+  }
+  return [
+    retentionStatement(
+      `${RETENTION_SCHEMA_SQL} SELECT ok AS schema_ok FROM schema_ok`,
+      [...schema.bindings],
+    ),
+    retentionStatement(
+      `${RETENTION_SCHEMA_SQL}${membership} DELETE FROM "${schema.table}" AS r WHERE (SELECT ok FROM schema_ok)=1
+      AND r.state COLLATE BINARY='terminal' AND ${retentionFiniteExpiry('r.updated_at', '?5')}
+      AND EXISTS (SELECT 1 FROM json_each(?4) c WHERE ${exact} AND ${guard})`,
+      [...schema.bindings, json, keyCutoff],
+    ),
+  ];
+}
+
+function retentionOrphanPackets(
+  candidates: readonly RetentionOrphan[],
+): RetentionOrphan[][] {
+  const groups = new Map<string, RetentionOrphan[]>();
+  for (const candidate of candidates) {
+    const key = `${candidate.namespace ?? ''}/${typeof candidate.observation === 'string' ? candidate.observation : 'different'}`;
+    const group = groups.get(key) ?? [];
+    group.push(candidate);
+    groups.set(key, group);
+  }
+  const packets: RetentionOrphan[][] = [];
+  for (const group of groups.values()) {
+    let packet: RetentionOrphan[] = [];
+    let bytes = 2;
+    for (const candidate of group) {
+      const rowBytes = retentionEncoder.encode(
+        JSON.stringify([
+          candidate.raw,
+          Array.isArray(candidate.observation) ? candidate.observation : null,
+        ]),
+      ).length;
+      if (rowBytes + 2 > RETENTION_SELECTOR_BYTES)
+        throw new Error('run retention orphan selector exceeds byte budget');
+      if (
+        bytes + rowBytes + (packet.length ? 1 : 0) >
+        RETENTION_SELECTOR_BYTES
+      ) {
+        packets.push(packet);
+        packet = [];
+        bytes = 2;
+      }
+      bytes += rowBytes + (packet.length ? 1 : 0);
+      packet.push(candidate);
+    }
+    if (packet.length) packets.push(packet);
+  }
+  return packets;
+}
+
+/** Delete expired snapshots with durable, independent physical scan positions. */
+export async function purgeExpiredWorkflowRuns(
+  db: SnapshotDatabase & Required<Pick<SnapshotDatabase, 'batch'>>,
+  options: PurgeExpiredRunsOptions,
+): Promise<number> {
+  const {
+    ttlMs,
+    tablePrefix,
+    artifactStore,
+    resourceOwnerTable,
+    startIdempotencyTable,
+    startIdempotencyTtlMs,
+    limit: suppliedLimit,
+    now: suppliedNow,
+    cursor: suppliedCursor,
+    advanceCursor,
+  } = options;
+  const prepare = db.prepare;
+  const batch = db.batch;
+  const deleteRun = artifactStore?.deleteRun;
+  if (
+    typeof prepare !== 'function' ||
+    typeof batch !== 'function' ||
+    typeof advanceCursor !== 'function' ||
+    (artifactStore !== undefined && typeof deleteRun !== 'function')
+  )
+    throw new Error(
+      'purgeExpiredWorkflowRuns requires database.batch(), advanceCursor and a valid artifact callback',
+    );
+  const captured: RetentionDatabase = {
+    prepare: prepare.bind(db),
+    batch: batch.bind(db),
+  };
+  const deleteArtifacts = deleteRun?.bind(artifactStore);
+  const prefix = validateTablePrefix(tablePrefix)?.toLowerCase() ?? '';
+  const owner = retentionRegistry(resourceOwnerTable);
+  const registry = retentionRegistry(startIdempotencyTable);
+  let cursor = parseRunRetentionCursor(suppliedCursor);
+  if (
+    cursor &&
+    (cursor.tablePrefix !== prefix || cursor.startIdempotencyTable !== registry)
+  )
+    throw new Error('run retention cursor scope mismatch');
+  if (
+    !Number.isFinite(ttlMs) ||
+    ttlMs < 0 ||
+    (startIdempotencyTtlMs !== undefined &&
+      (!Number.isFinite(startIdempotencyTtlMs) || startIdempotencyTtlMs < 0))
+  )
+    throw new Error('run retention TTL must be finite and nonnegative');
+  if (
+    suppliedLimit !== undefined &&
+    (!Number.isSafeInteger(suppliedLimit) || suppliedLimit <= 0)
+  )
+    throw new Error('run retention limit must be a positive safe integer');
+  const limit = Math.min(suppliedLimit ?? RETENTION_PAGE, RETENTION_PAGE);
+  const nowFunction = suppliedNow === undefined ? Date.now : suppliedNow;
+  if (typeof nowFunction !== 'function')
+    throw new Error('run retention clock is invalid');
+  const now = nowFunction();
+  const keyCutoff = now - Math.max(ttlMs, startIdempotencyTtlMs ?? ttlMs);
+  const snapshotCutoff = now - ttlMs;
+  if (
+    !Number.isFinite(now) ||
+    !Number.isFinite(keyCutoff) ||
+    !Number.isFinite(snapshotCutoff)
+  )
+    throw new Error('run retention cutoff is invalid');
+  const cutoff = new Date(snapshotCutoff).toISOString();
+  if (!/^\d{4}-/.test(cutoff))
+    throw new Error('run retention cutoff must have a four-digit ISO year');
+  const table = `${prefix}${RETENTION_SUFFIX}`;
+  let schema = await observeRunRetentionSchema(captured, registry);
+  let schemaRetryUsed = false;
+  let deleted = 0;
+  const failures: string[] = [];
+  const reportedSkips = new Set<string>();
+  const reportUnsupported = (
+    kind: 'snapshot' | 'legacy-snapshot' | 'reservation' | 'orphan-snapshot',
+  ): void => {
+    if (reportedSkips.has(kind)) return;
+    reportedSkips.add(kind);
+    console.warn(
+      JSON.stringify({ type: 'run-retention-skip', kind, tablePrefix: prefix }),
+    );
+  };
+  const knownSkip = (error: unknown) => {
+    if (failures.length >= 8) return;
+    let message = 'unreadable error';
+    try {
+      message = errorMessageOf(error).slice(0, 256);
+    } catch {}
+    failures.push(message);
+  };
+  const refresh = async () => {
+    if (schemaRetryUsed)
+      throw new Error('run retention schema changed repeatedly');
+    schemaRetryUsed = true;
+    schema = await observeRunRetentionSchema(captured, registry);
+  };
+  const execute = async (
+    build: () => RetentionStatement[],
+    onRetry?: () => Promise<void>,
+  ): Promise<number> => {
+    for (;;) {
+      const statements = build();
+      let result: unknown;
       try {
-        await options.artifactStore.deleteRun(row.workflow_name, row.run_id);
+        const prepared = statements.map((statement) =>
+          prepareRetentionStatement(captured, statement),
+        );
+        result = await captured.batch(prepared);
       } catch (error) {
-        // Isolate per run: aborting the
-        // loop would re-hit this run at the same scan position every firing
-        // and stall every eligible row behind it forever. Its row survives
-        // as its own retry cursor; the aggregate throw below keeps the
-        // purge duty's error surface firing. A wedged run does occupy a batch
-        // slot until fixed, so isolation holds while wedged runs number
-        // fewer than `limit`.
-        failures.push({
-          run: `${row.workflow_name}/${row.run_id}`,
-          message: errorMessageOf(error),
-        });
+        let missing = false;
+        try {
+          missing = [...schema.names, ...(registry ? [registry] : [])].some(
+            (name) => missingTableReadsEmpty(error, name),
+          );
+        } catch {}
+        if (!missing) throw error;
+        const previous = JSON.stringify(schema.bindings);
+        await refresh();
+        if (JSON.stringify(schema.bindings) === previous) throw error;
+        if (onRetry) await onRetry();
         continue;
       }
-      // Re-checking eligibility keys the delete to the row the SELECT saw;
-      // terminal is absorbing, so this is belt-and-braces, not a race fix.
-      //
-      // A FACTORY, not one prepared statement: D1 statements are single-use
-      // once run, and `runPurgeBatch` re-prepares its whole batch when the
-      // reservation table turns out not to exist. Written once so the batch and
-      // non-batch paths cannot drift onto different delete predicates.
-      const deleteSnapshot = (): SnapshotStatement =>
-        db
-          .prepare(
-            `DELETE FROM ${prefix}mastra_workflow_snapshot
-             WHERE workflow_name = ? AND run_id = ? AND ${eligible}`,
-          )
-          .bind(
-            row.workflow_name,
-            row.run_id,
-            cutoff,
-            ...RUN_TERMINAL_STATUSES,
-          );
-      if (batch) {
-        const [result] = await runPurgeBatch((withReservations) => [
-          deleteSnapshot(),
-          ...(resourceOwnerTable
-            ? [
-                db
-                  .prepare(
-                    `DELETE FROM ${resourceOwnerTable}
-               WHERE resource_kind = 'run' AND resource_id = ?
-                 AND NOT EXISTS (
-                   SELECT 1 FROM ${prefix}mastra_workflow_snapshot
-                   WHERE run_id = ?
-                 )`,
-                  )
-                  .bind(row.run_id, row.run_id),
-              ]
-            : []),
-          ...(withReservations ? reservationStatements([row.run_id]) : []),
-        ]);
-        deleted += d1Changes(result);
-      } else {
-        deleted += d1Changes(await deleteSnapshot().run());
+      const outcome = retentionBatchResult(result, statements.length);
+      if (outcome.schemaOk) return outcome.deleted;
+      await refresh();
+      if (onRetry) await onRetry();
+    }
+  };
+  const advance = async (
+    component: 'snapshots' | 'reservations',
+    position: RunRetentionScanPosition | undefined,
+  ) => {
+    const next = {
+      version: 1 as const,
+      tablePrefix: prefix,
+      ...(registry === undefined ? {} : { startIdempotencyTable: registry }),
+      ...cursor,
+    };
+    delete next[component];
+    if (position) next[component] = position;
+    cursor = Object.freeze(next);
+    await advanceCursor(cursor);
+  };
+  const snapshotGroup = (
+    selectors: readonly RetentionSelector[],
+    raw?: RawWorkflowSnapshot,
+  ) =>
+    retentionSnapshotGroup(
+      schema,
+      table,
+      owner,
+      selectors,
+      raw,
+      cutoff,
+      keyCutoff,
+      now,
+    );
+  const artifacts = async (workflowId: string, runId: string) => {
+    try {
+      await deleteArtifacts?.(workflowId, runId);
+      return true;
+    } catch (error) {
+      knownSkip(error);
+      return false;
+    }
+  };
+  if (schema.names.includes(table)) {
+    const page = decodeRetentionPage(
+      await prepareRetentionStatement(
+        captured,
+        retentionPageStatement(
+          table,
+          cursor?.snapshots,
+          limit,
+          `CASE WHEN length(s.workflow_name)<=200 THEN s.workflow_name END AS workflow_name,
+       CASE WHEN length(s.run_id)<=200 THEN s.run_id END AS run_id,
+       s.updatedAt COLLATE BINARY < ?4 AND CASE WHEN json_valid(s.snapshot) THEN (${retentionTerminalSql(5)}) ELSE 0 END AS eligible,
+       ${retentionOwnedProjection()}`,
+          [cutoff, ...RUN_TERMINAL_STATUSES],
+        ),
+      ).all(),
+      cursor?.snapshots,
+      limit,
+    );
+    const modern: RetentionSelector[] = [];
+    for (const row of page.rows) {
+      if (
+        !Object.hasOwn(row, 'eligible') ||
+        ![0, 1, null].includes(row.eligible as number | null)
+      )
+        throw new Error('run retention eligibility projection is malformed');
+      if (row.eligible !== 1) continue;
+      const candidate = decodeRunRetentionCandidate(row, prefix);
+      if (candidate === undefined) {
+        reportUnsupported('snapshot');
+        continue;
       }
-    }
-    await sweepOrphanedStartReservations();
-    if (failures.length > 0) {
-      throw new Error(
-        `purgeExpiredWorkflowRuns: artifact deletion failed for ${failures.length} of ${rows.length} eligible run(s), the rest were purged (${failures
-          .map((failure) => `${failure.run}: ${failure.message}`)
-          .join('; ')})`,
-      );
-    }
-    return deleted;
-  }
-
-  // Row-only path: LIMIT-batched like the artifact path, but against D1's
-  // per-QUERY budget rather than the subrequest cap (it stays one statement
-  // per firing whatever the batch size, hence the larger default). An
-  // unbounded DELETE over a huge first backlog can exceed the per-query
-  // limits and then fail the same way on EVERY firing — retention silently
-  // unenforced, the exact wedge the one-duty-per-alarm split exists to avoid. The
-  // shrinking eligible set is the cursor: a backlog drains across firings.
-  let deleted: number;
-  try {
-    if (batch) {
-      // D1 accepts at most 100 bound parameters per statement. Keep the exact
-      // rowid + owner-id transaction below under that limit even when a caller
-      // requests a larger generic purge batch.
-      const limit = Math.min(options.limit ?? 1000, 90);
-      const selected = await db
-        .prepare(
-          `SELECT rowid, run_id
-           FROM ${prefix}mastra_workflow_snapshot
-           WHERE ${eligible}
-           LIMIT ?`,
+      if (candidate !== 'legacy') {
+        modern.push(candidate);
+        continue;
+      }
+      const address = {
+        tablePrefix: prefix,
+        workflowId: row.workflow_name as string,
+        runId: row.run_id as string,
+      };
+      const read = prepareRawWorkflowSnapshotRead(captured, address);
+      const result = await read.statement.all();
+      const rawRows = snapshotResultRows(result);
+      if (
+        rawRows.length > 1 ||
+        rawRows.some((row) =>
+          [
+            'workflow_name',
+            'run_id',
+            'resourceId',
+            'snapshot',
+            'createdAt',
+            'updatedAt',
+          ].some((key) => !Object.hasOwn(row, key)),
         )
-        .bind(cutoff, ...RUN_TERMINAL_STATUSES, limit)
-        .all<{ rowid: number; run_id: string }>();
-      if (selected.results.length === 0) {
-        // No eligible run this pass, but reservations left behind by EARLIER
-        // passes still age out — so the orphan sweep runs before the return.
-        await sweepOrphanedStartReservations();
-        return 0;
+      )
+        throw new Error('run retention raw snapshot result is malformed');
+      let raw: RawWorkflowSnapshot | undefined;
+      try {
+        raw = decodeRawWorkflowSnapshotResult(result, read.address);
+        if (!raw || raw.updatedAt >= cutoff) continue;
+        const snapshot = JSON.parse(raw.snapshot);
+        const cleanupCompletedAt =
+          snapshot.requestContext?.['flowsafe.runLifecycle']?.terminal
+            ?.cleanupCompletedAt;
+        if (
+          decodeRunStartIdentity(
+            snapshot.requestContext?.['flowsafe.runProvenance'],
+          ) !== undefined ||
+          !RUN_TERMINAL_STATUSES.includes(snapshot.status) ||
+          ((snapshot.status === 'cancelled' ||
+            snapshot.status === 'timed_out') &&
+            (!Number.isSafeInteger(cleanupCompletedAt) ||
+              cleanupCompletedAt < 0))
+        )
+          continue;
+      } catch {
+        reportUnsupported('legacy-snapshot');
+        continue;
       }
-      const rowIds = selected.results.map((row) => row.rowid);
-      const runIds = [...new Set(selected.results.map((row) => row.run_id))];
-      const rowPlaceholders = rowIds.map(() => '?').join(', ');
-      const runPlaceholders = runIds.map(() => '?').join(', ');
-      const [result] = await runPurgeBatch((withReservations) => [
-        db
-          .prepare(
-            `DELETE FROM ${prefix}mastra_workflow_snapshot
-             WHERE rowid IN (${rowPlaceholders}) AND ${eligible}`,
+      const selectors: RetentionSelector[] = [
+        [address.workflowId, address.runId, [], null],
+      ];
+      snapshotGroup(selectors, raw);
+      if (await artifacts(address.workflowId, address.runId)) {
+        const count = await execute(() => snapshotGroup(selectors, raw));
+        if (schema.names.includes(table)) deleted += count;
+      }
+    }
+    if (modern.length > 0) {
+      snapshotGroup(modern);
+      const ready: RetentionSelector[] = [];
+      for (const candidate of modern)
+        if (await artifacts(candidate[0], candidate[1])) ready.push(candidate);
+      if (ready.length > 0) {
+        const count = await execute(() => snapshotGroup(ready));
+        if (schema.names.includes(table)) deleted += count;
+      }
+    }
+    await advance('snapshots', page.position);
+  } else await advance('snapshots', undefined);
+
+  const classifyOrphans = async (
+    raws: Record<string, unknown>[],
+  ): Promise<RetentionOrphan[]> => {
+    const orphans: RetentionOrphan[] = [];
+    const grouped = new Map<string, Record<string, unknown>[]>();
+    if (schema.stage === undefined) return orphans;
+    for (const raw of raws) {
+      try {
+        let row = reservationFromRow(raw, schema.stage);
+        if (row.state !== 'terminal' || row.updatedAt >= keyCutoff) continue;
+        if (row.binding.kind === 'legacy') {
+          orphans.push({ raw, observation: 'legacy' });
+          continue;
+        }
+        row = admissionReservationFromRow(raw, schema.stage);
+        if (
+          row.binding.kind !== 'bound' ||
+          row.binding.execution.tablePrefix === null
+        )
+          continue;
+        const namespace = `${row.binding.execution.tablePrefix}${RETENTION_SUFFIX}`;
+        if (!schema.names.includes(namespace)) {
+          orphans.push({ raw, namespace, observation: 'missing' });
+          continue;
+        }
+        const values = grouped.get(namespace) ?? [];
+        values.push(raw);
+        grouped.set(namespace, values);
+      } catch {
+        reportUnsupported('reservation');
+      }
+    }
+    for (const [namespace, values] of grouped) {
+      const selectors = retentionSelectorJson(
+        values.map((raw) => [raw.start_workflow_id, raw.run_id]),
+      );
+      const rows = snapshotResultRows(
+        await prepareRetentionStatement(
+          captured,
+          retentionStatement(
+            `SELECT c.key AS candidate, s.rowid AS present,
+        json_extract(c.value,'$[0]') AS workflow_name, json_extract(c.value,'$[1]') AS run_id, ${retentionOwnedProjection()}
+        FROM json_each(?1) c LEFT JOIN "${namespace}" s ON s.workflow_name COLLATE BINARY=json_extract(c.value,'$[0]')
+        AND s.run_id COLLATE BINARY=json_extract(c.value,'$[1]') ORDER BY c.key`,
+            [selectors],
+          ),
+        ).all(),
+      );
+      if (rows.length !== values.length)
+        throw new Error('run retention orphan observation is malformed');
+      for (const [index, row] of rows.entries()) {
+        if (row.candidate !== index || !Object.hasOwn(row, 'present'))
+          throw new Error('run retention orphan observation is malformed');
+        const raw = values[index];
+        if (!raw) throw new Error('run retention orphan candidate is missing');
+        if (
+          row.workflow_name !== raw.start_workflow_id ||
+          row.run_id !== raw.run_id
+        )
+          throw new Error('run retention orphan address is malformed');
+        if (
+          row.present !== null &&
+          (typeof row.present !== 'number' ||
+            !Number.isSafeInteger(row.present))
+        )
+          throw new Error('run retention orphan rowid is malformed');
+        const decoded = decodeRunRetentionCandidate(
+          row,
+          namespace.slice(0, -RETENTION_SUFFIX.length),
+        );
+        if (row.present === null) {
+          orphans.push({ raw, namespace, observation: 'absent' });
+          continue;
+        }
+        if (decoded === undefined) reportUnsupported('orphan-snapshot');
+        if (
+          decoded &&
+          decoded !== 'legacy' &&
+          typeof decoded[2][1] === 'string' &&
+          JSON.parse(decoded[2][1]) !== raw.start_token
+        )
+          orphans.push({ raw, namespace, observation: decoded[2] });
+      }
+    }
+    return orphans;
+  };
+  if (schema.stage !== undefined && registry !== undefined) {
+    const page = decodeRetentionPage(
+      await prepareRetentionStatement(
+        captured,
+        retentionPageStatement(
+          registry,
+          cursor?.reservations,
+          limit,
+          retentionReservationProjection(schema.stage),
+        ),
+      ).all(),
+      cursor?.reservations,
+      limit,
+    );
+    const raws: Record<string, unknown>[] = [];
+    for (const row of page.rows) {
+      const raw = decodeRetentionReservationProjection(row, schema.stage);
+      if (raw === undefined) {
+        reportUnsupported('reservation');
+        continue;
+      }
+      raws.push(raw);
+    }
+    const candidates = await classifyOrphans(raws);
+    for (const initial of retentionOrphanPackets(candidates)) {
+      let pending = initial;
+      const retry = async () => {
+        if (schema.stage === undefined) {
+          pending = [];
+          return;
+        }
+        const keys = retentionSelectorJson(
+          initial.map((candidate) => candidate.raw.key),
+        );
+        const rows = snapshotResultRows(
+          await prepareRetentionStatement(
+            captured,
+            retentionStatement(
+              `SELECT ${retentionReservationProjection(schema.stage)}
+          FROM "${registry}" s WHERE s.key COLLATE BINARY IN (SELECT value FROM json_each(?1)) LIMIT ?2`,
+              [keys, limit + 1],
+            ),
+          ).all(),
+        );
+        if (rows.length > initial.length)
+          throw new Error('run retention orphan retry is ambiguous');
+        const unchanged: Record<string, unknown>[] = [];
+        for (const row of rows) {
+          const raw = decodeRetentionReservationProjection(row, schema.stage);
+          if (raw === undefined) {
+            reportUnsupported('reservation');
+            continue;
+          }
+          const prior = initial.find(
+            (candidate) => candidate.raw.key === raw.key,
+          )?.raw;
+          if (
+            prior &&
+            Object.entries(prior).every(
+              ([key, value]) => Object.hasOwn(raw, key) && raw[key] === value,
+            ) &&
+            Object.entries(raw).every(
+              ([key, value]) => Object.hasOwn(prior, key) || value === null,
+            )
           )
-          .bind(...rowIds, cutoff, ...RUN_TERMINAL_STATUSES),
-        ...(resourceOwnerTable
-          ? [
-              db
-                .prepare(
-                  `DELETE FROM ${resourceOwnerTable}
-             WHERE resource_kind = 'run'
-               AND resource_id IN (${runPlaceholders})
-               AND resource_id NOT IN (
-                 SELECT run_id FROM ${prefix}mastra_workflow_snapshot
-               )`,
-                )
-                .bind(...runIds),
-            ]
-          : []),
-        ...(withReservations ? reservationStatements(runIds) : []),
-      ]);
-      deleted = d1Changes(result);
-    } else {
-      deleted = d1Changes(
-        await db
-          .prepare(
-            `DELETE FROM ${prefix}mastra_workflow_snapshot
-           WHERE rowid IN (
-             SELECT rowid FROM ${prefix}mastra_workflow_snapshot
-             WHERE ${eligible}
-             LIMIT ?
-           )`,
-          )
-          .bind(cutoff, ...RUN_TERMINAL_STATUSES, options.limit ?? 1000)
-          .run(),
+            unchanged.push(raw);
+        }
+        pending = await classifyOrphans(unchanged);
+      };
+      await execute(
+        () => [
+          retentionStatement(
+            `${RETENTION_SCHEMA_SQL} SELECT ok AS schema_ok FROM schema_ok`,
+            [...schema.bindings],
+          ),
+          ...retentionOrphanPackets(pending).flatMap((packet) =>
+            retentionOrphanGroup(schema, packet, keyCutoff).slice(1),
+          ),
+        ],
+        retry,
       );
     }
-  } catch (error) {
-    if (!isMissingTable(error, `${prefix}mastra_workflow_snapshot`))
-      throw error;
-    return 0;
-  }
-  await sweepOrphanedStartReservations();
+    await advance('reservations', page.position);
+  } else await advance('reservations', undefined);
+  if (failures.length > 0)
+    throw new Error(
+      `purgeExpiredWorkflowRuns: artifact deletion failed (${failures.join('; ')})`,
+    );
   return deleted;
 }
 
@@ -1217,9 +2010,8 @@ export interface PurgeExpiredNotificationsOptions {
  * rows from `mastra_notifications` once their `updatedAt` is older than the TTL,
  * at the storage layer so alarm maintenance reaps them without a live agent —
  * the same posture as the other purges (raw D1 binding, failure-isolated duty).
- * `updatedAt` is ISO-8601 TEXT, so lexicographic `<` is a correct timestamp
- * comparison. A missing table reads as zero (notifications may never have been
- * sent). Scheduling stays with the caller.
+ * A missing table reads as zero (notifications may never have been sent).
+ * Scheduling stays with the caller.
  */
 export async function purgeExpiredNotifications(
   db: SnapshotDatabase,
@@ -1227,14 +2019,14 @@ export async function purgeExpiredNotifications(
 ): Promise<number> {
   const prefix = validateTablePrefix(options.tablePrefix) ?? '';
   const now = options.now ?? Date.now;
-  const cutoff = new Date(now() - options.ttlMs).toISOString();
+  const cutoff = notificationTimestampMillis(new Date(now() - options.ttlMs));
   const placeholders = NOTIFICATION_TERMINAL_STATUSES.map(() => '?').join(', ');
   try {
     return d1Changes(
       await db
         .prepare(
           `DELETE FROM ${prefix}mastra_notifications
-           WHERE status IN (${placeholders}) AND updatedAt < ?`,
+           WHERE status IN (${placeholders}) AND ${notificationTimestampSql('updatedAt')} < ?`,
         )
         .bind(...NOTIFICATION_TERMINAL_STATUSES, cutoff)
         .run(),
@@ -1371,7 +2163,11 @@ export function d1Changes(result: unknown): number {
 }
 
 function errorMessageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  try {
+    return String(error instanceof Error ? error.message : error);
+  } catch {
+    return 'unreadable error';
+  }
 }
 
 /**

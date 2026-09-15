@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { createHash, randomUUID } from 'node:crypto';
+
 import {
   DEPLOYMENT_SENTINEL_COLUMNS,
   DEPLOYMENT_SENTINEL_DDL,
@@ -7,38 +9,59 @@ import {
 import type { MaintenanceCapabilityJwk } from '@proofoftech/flowsafe/host-kit';
 import {
   MAINTENANCE_RECEIPT_HEADER,
+  mintAsymmetricMaintenanceCapability,
   mintMaintenanceReceipt,
   verifyAsymmetricMaintenanceCapability,
 } from '@proofoftech/flowsafe/host-kit';
 import { describe, expect, it, vi } from 'vitest';
 import { ActiveRouteAttestationError } from '../src/active-route.js';
+import { D1FleetStateDatabase } from '../src/d1-fleet-state-database.js';
+import { advanceDecommissionDeployment } from '../src/decommission-advance.js';
 import { WorkerDeploymentError } from '../src/deployment-error.js';
+import { migrateFleet } from '../src/fleet.js';
 import {
   canonicalDeploymentEgressPolicy,
+  durableObjectMigrationHistoryDigest,
+  externalEgressProxyScriptName,
   externalPlatformResourceGroupId,
   externalReleaseTopology,
   externalStateScriptName,
 } from '../src/platform-resources.js';
-import { provisionDeployment } from '../src/provision.js';
+import {
+  assertPlatformDurableObjectHistory,
+  forceDecommissionDeployment,
+  provisionDeployment,
+} from '../src/provision.js';
 import { deploymentSpecDigest } from '../src/spec-digest.js';
+import { D1FleetStateStore } from '../src/state-store.js';
 import type {
+  ApplicationR2Binding,
+  ApplicationR2BucketSnapshot,
   DatabaseExport,
+  DatabaseExportReceiptIdentity,
   DatabaseReference,
+  DecommissionAttachmentScanInput,
+  DecommissionAttachmentScanResult,
   DeploymentSecrets,
   DeploymentSpec,
   ExternalMutationFence,
   ExternalPlatformProfile,
   ExternalPlatformResources,
+  ExternalReleaseSnapshot,
   FleetRecord,
   FleetStateLease,
   FleetStateStore,
   PromotionGuard,
 } from '../src/types.js';
+import { validateDeploymentSpec } from '../src/validation.js';
 import {
   externalReleaseScriptName,
   type WorkersForPlatformsApi,
   WorkersForPlatformsBackend,
 } from '../src/workers-for-platforms-backend.js';
+import { decommissionAdvancingRecordFixture } from './fixtures/decommission-intent-fixture.js';
+import { D1State } from './fixtures/provider-world.js';
+import { createWfpMaintenanceHarness } from './fixtures/wfp-maintenance-harness.js';
 
 const deployment: DeploymentSpec = {
   tenantTag: 'acme',
@@ -84,6 +107,11 @@ const secrets: DeploymentSecrets = {
   deploymentIdentity: 'deployment-identity-secret-value-0001',
   maintenanceAdmin: 'maintenance-admin-secret-value-00001',
 };
+const r2Resource: ApplicationR2Binding = {
+  name: 'ARTIFACTS',
+  bucketName: 'acme-production-artifacts',
+  jurisdiction: 'default',
+};
 const MAINTENANCE_CAPABILITY_PRIVATE_KEY = {
   kty: 'OKP',
   crv: 'Ed25519',
@@ -104,6 +132,13 @@ const NAMESPACED_STATE = Object.freeze({
   sharedOutboundWorkerName: 'fleet-shared-outbound',
   stateEgressRootSecret: 'state-egress-root-secret-value-0001',
 });
+const RECEIPT_AUTHORITY = 'r2://fleet-exports/receipts/v1';
+const RECEIPT_IDENTITY: DatabaseExportReceiptIdentity = {
+  version: 1,
+  authority: RECEIPT_AUTHORITY,
+  databaseId: '00000000-0000-0000-0000-000000000001',
+  operationId: '00000000-0000-4000-8000-000000000002',
+};
 
 class MemoryFleetStore implements FleetStateStore {
   record: FleetRecord | undefined;
@@ -229,7 +264,9 @@ function platformProfile(
 }
 
 class FakeApi implements WorkersForPlatformsApi {
+  readonly fenceState = new D1State();
   readonly calls: string[] = [];
+  residualEvents: string[] | undefined;
   failSecrets = false;
   failUpload = false;
   failDelete = false;
@@ -274,7 +311,13 @@ class FakeApi implements WorkersForPlatformsApi {
   failDisableScriptName: string | undefined;
   failControlUploadAfterCommitScriptName: string | undefined;
   failDatabaseCreateAfterCommit = false;
+  failR2CreateAfterCommit = false;
   database: DatabaseReference | undefined;
+  r2Bucket: ApplicationR2BucketSnapshot | undefined;
+  databaseFindCalls = 0;
+  databaseCreateCalls = 0;
+  r2ReadCalls = 0;
+  r2CreateCalls = 0;
   databaseOwner: string | undefined;
   deploymentSentinelPresent = false;
   readonly migrationRows: Array<{
@@ -327,6 +370,7 @@ class FakeApi implements WorkersForPlatformsApi {
       plane: 'ordinary' | 'dispatch';
     }>[]
   > {
+    this.residualEvents?.push('attachments');
     return this.databaseAttachments;
   }
 
@@ -339,6 +383,7 @@ class FakeApi implements WorkersForPlatformsApi {
   }
 
   async findDatabase(): Promise<DatabaseReference | undefined> {
+    this.databaseFindCalls += 1;
     return this.database;
   }
 
@@ -354,6 +399,7 @@ class FakeApi implements WorkersForPlatformsApi {
   }
 
   async createDatabase(): Promise<DatabaseReference> {
+    this.databaseCreateCalls += 1;
     this.database = {
       id: 'db-acme',
       name: 'acme-production',
@@ -366,13 +412,47 @@ class FakeApi implements WorkersForPlatformsApi {
     return { ...this.database, created: true };
   }
 
+  async getR2Bucket(): Promise<ApplicationR2BucketSnapshot | undefined> {
+    this.r2ReadCalls += 1;
+    return this.r2Bucket;
+  }
+
+  async createR2Bucket(resource: ApplicationR2Binding): Promise<void> {
+    this.r2CreateCalls += 1;
+    this.r2Bucket = {
+      ...resource,
+      creationDate: '2026-08-26T00:00:00.000Z',
+    };
+    if (this.failR2CreateAfterCommit) {
+      this.failR2CreateAfterCommit = false;
+      throw Object.assign(new Error('bucket create response lost'), {
+        status: 409,
+      });
+    }
+  }
+
   async queryDatabase(
     _databaseId: string,
     sql: string,
     bindings: readonly unknown[] = [],
   ): Promise<readonly Readonly<Record<string, unknown>>[]> {
+    if (
+      /^(?:CREATE TABLE IF NOT EXISTS|INSERT OR IGNORE INTO|ALTER TABLE) flowsafe_execution_fence\b/.test(
+        sql,
+      ) ||
+      sql.startsWith('SELECT * FROM flowsafe_execution_fence') ||
+      sql === 'PRAGMA table_xinfo(flowsafe_execution_fence)'
+    ) {
+      const parameters = bindings.map((value) => {
+        if (typeof value !== 'string')
+          throw new Error('fence parameters must be strings');
+        return value;
+      });
+      return this.fenceState.queryDatabase(sql, parameters);
+    }
     if (sql.includes("FROM sqlite_schema WHERE type = 'table' ORDER BY name")) {
       return [
+        ...this.fenceState.queryDatabase(sql),
         ...(this.deploymentSentinelPresent
           ? [{ name: 'flowsafe_deployment', sql: DEPLOYMENT_SENTINEL_DDL }]
           : []),
@@ -525,6 +605,7 @@ class FakeApi implements WorkersForPlatformsApi {
   }
 
   async inspectControlWorker(scriptName: string) {
+    this.residualEvents?.push(`control:${scriptName}`);
     const inspection = this.controlWorkers.get(scriptName);
     return inspection
       ? {
@@ -562,6 +643,7 @@ class FakeApi implements WorkersForPlatformsApi {
   }
 
   async hasDurableObjectNamespace(namespaceId: string): Promise<boolean> {
+    this.residualEvents?.push(`namespace:${namespaceId}`);
     this.namespaceExistenceChecks.push(namespaceId);
     return (
       this.remainingNamespaceIds.has(namespaceId) ||
@@ -574,6 +656,7 @@ class FakeApi implements WorkersForPlatformsApi {
   async listDurableObjectNamespaces(
     scriptName: string,
   ): Promise<readonly string[]> {
+    this.residualEvents?.push(`namespaces:${scriptName}`);
     return [...(this.namespaceIdsByScript.get(scriptName) ?? [])].sort();
   }
 
@@ -583,6 +666,7 @@ class FakeApi implements WorkersForPlatformsApi {
     physicalScriptName?: string,
     resources?: ExternalPlatformResources,
     application?: import('../src/types.js').ApplicationBindingTopology,
+    maintenanceCapabilityPublicKey?: string,
   ): Promise<{ artifactVersion: string }> {
     this.calls.push('upload');
     this.uploadedScriptNames.push(physicalScriptName ?? 'missing');
@@ -622,9 +706,20 @@ class FakeApi implements WorkersForPlatformsApi {
               ]
             : []),
         secretNames: this.dispatchSecretNames.get(scriptName) ?? [],
-        plainTextBindings: Object.fromEntries(
-          (application?.vars ?? []).map(({ name, value }) => [name, value]),
-        ),
+        plainTextBindings: {
+          ...Object.fromEntries(
+            (application?.vars ?? []).map(({ name, value }) => [name, value]),
+          ),
+          ...(maintenanceCapabilityPublicKey === undefined
+            ? {}
+            : {
+                FLEET_MAINTENANCE_CAPABILITIES: 'required',
+                FLEET_MAINTENANCE_CAPABILITY_PUBLIC_KEY:
+                  maintenanceCapabilityPublicKey,
+                FLEET_DEPLOYMENT_SCRIPT: scriptName,
+                FLEET_RESOURCE_ROLE: 'platform-catalog',
+              }),
+        },
         r2BucketBindings: application?.r2Buckets ?? [],
         tenantTag: spec.tenantTag,
         environment: spec.environment,
@@ -762,6 +857,7 @@ class FakeApi implements WorkersForPlatformsApi {
       }
     | undefined
   > {
+    this.residualEvents?.push(`release:${scriptName}`);
     this.inspectedScriptNames.push(scriptName);
     const stateWorker = this.dispatchWorkers.get(scriptName);
     if (stateWorker)
@@ -872,6 +968,7 @@ class FakeApi implements WorkersForPlatformsApi {
   }
 
   async getHostRouting(): Promise<string | undefined> {
+    this.residualEvents?.push('host');
     return this.routeOwner ? JSON.stringify(this.routeOwner) : undefined;
   }
 
@@ -898,6 +995,7 @@ class FakeApi implements WorkersForPlatformsApi {
   }
 
   async getScriptInventory(_namespaceId: string, scriptName: string) {
+    this.residualEvents?.push(`inventory:${scriptName}`);
     return this.scriptInventories.get(scriptName);
   }
 }
@@ -984,6 +1082,1081 @@ async function attestedHealthResponse(
 }
 
 describe('WorkersForPlatformsBackend', () => {
+  it.each([
+    'alias',
+    'class',
+    'service',
+    'queue',
+  ] as const)('uploads a valid mutable catalog binding change (%s)', async (change) => {
+    const prior: DeploymentSpec = {
+      ...deployment,
+      authoredBy: 'platform',
+      durableObjectMigrations: [
+        { tag: 'v1', newSqliteClasses: ['Maintenance'] },
+      ],
+      durableObjectBindings: [
+        { name: 'MAINTENANCE', className: 'Maintenance' },
+      ],
+    };
+    const target: DeploymentSpec = {
+      ...prior,
+      previousDurableObjectTag: 'v1',
+      ...(change === 'alias'
+        ? {
+            durableObjectBindings: [
+              ...prior.durableObjectBindings,
+              { name: 'ALIAS', className: 'Maintenance' },
+            ],
+          }
+        : {}),
+      ...(change === 'class'
+        ? {
+            durableObjectMigrations: [
+              ...prior.durableObjectMigrations,
+              { tag: 'v2', newSqliteClasses: ['Additional'] },
+            ],
+            durableObjectBindings: [
+              ...prior.durableObjectBindings,
+              { name: 'ADDITIONAL', className: 'Additional' },
+            ],
+          }
+        : {}),
+      ...(change === 'service' ? { egressProxyService: 'catalog-egress' } : {}),
+      ...(change === 'queue'
+        ? { queueProducer: { binding: 'EVENTS', queueName: 'catalog-events' } }
+        : {}),
+    };
+    validateDeploymentSpec(target);
+    assertPlatformDurableObjectHistory(
+      {
+        durableObjectTag: 'v1',
+        durableObjectMigrationHistory: prior.durableObjectMigrations,
+        durableObjectMigrationHistoryDigest:
+          durableObjectMigrationHistoryDigest(prior.durableObjectMigrations),
+      },
+      target,
+    );
+    const client = new FakeApi();
+    client.exists = false;
+    const backend = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client,
+      hostRoutingKvId: 'host-routes',
+      platformProfileFor: () => platformProfile(),
+    });
+    const database = {
+      id: 'db-acme',
+      name: prior.databaseName,
+      created: false,
+    };
+    await backend.deployWorker(prior, database, secrets, undefined, fence);
+    await backend.deployWorker(target, database, secrets, undefined, fence);
+    expect(client.uploadedScriptNames).toHaveLength(2);
+    const live = client.dispatchWorkers.get(prior.scriptName);
+    expect(live?.desiredSpecDigest).toBe(deploymentSpecDigest(target));
+    expect(live?.durableObjectBindings.map(({ name }) => name)).toEqual(
+      target.durableObjectBindings.map(({ name }) => name),
+    );
+    expect(live?.serviceBindings ?? []).toEqual(
+      change === 'service'
+        ? [{ name: 'EGRESS_PROXY', service: 'catalog-egress' }]
+        : [],
+    );
+    expect(live?.queueProducerBindings ?? []).toEqual(
+      change === 'queue'
+        ? [{ name: 'EVENTS', queueName: 'catalog-events' }]
+        : [],
+    );
+  });
+
+  it('checks catalog residuals without claiming derived external state', async () => {
+    const catalog: DeploymentSpec = { ...deployment, authoredBy: 'platform' };
+    const database = {
+      id: 'db-acme',
+      name: catalog.databaseName,
+      created: false,
+    };
+    const record: FleetRecord = {
+      tenantTag: catalog.tenantTag,
+      environment: catalog.environment,
+      backend: 'workers-for-platforms',
+      wfpMode: 'platform-catalog',
+      scriptName: catalog.scriptName,
+      databaseId: database.id,
+      databaseName: database.name,
+      schemaVersion: catalog.schemaVersion,
+      artifactVersion: 'catalog-v1',
+      desiredSpecDigest: deploymentSpecDigest(catalog),
+      durableObjectBindings: [
+        {
+          name: 'MAINTENANCE',
+          className: 'Maintenance',
+          namespaceId: 'known-local',
+        },
+      ],
+      routeHostname: catalog.routeHostname,
+      phase: 'database-deleting',
+      updatedAt: '2026-09-10T00:00:00.000Z',
+      outboundPolicy: canonicalDeploymentEgressPolicy({
+        policyId: externalPlatformResourceGroupId(catalog),
+        tenantTag: catalog.tenantTag,
+        environment: catalog.environment,
+        allowedHosts: [],
+      }),
+    };
+    const client = new FakeApi();
+    client.exists = false;
+    const events: string[] = [];
+    client.residualEvents = events;
+    const foreign = completeProviderBindingInspection({
+      artifactVersion: 'foreign-v1',
+      databaseIds: ['other-db'],
+      durableObjectBindings: [],
+      serviceBindings: [],
+      kvNamespaceBindings: [],
+      secretNames: [],
+      plainTextBindings: {},
+      workersDevEnabled: false,
+      previewUrlsEnabled: false,
+      routeHostnames: [],
+      zoneRoutes: [],
+    });
+    const stateName = externalStateScriptName(catalog);
+    const proxyName = externalEgressProxyScriptName(catalog);
+    client.controlWorkers.set(stateName, foreign);
+    client.controlWorkers.set(proxyName, foreign);
+    client.namespaceIdsByScript.set(stateName, new Set(['foreign-namespace']));
+    const backend = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client,
+      hostRoutingKvId: 'host-routes',
+    });
+    for (const method of [
+      'assertDatabaseDetached',
+      'assertDatabaseDeletionResidualsRemoved',
+    ] as const) {
+      await expect(
+        backend[method](catalog, record, database, fence),
+      ).resolves.toBeUndefined();
+      client.namespaceIdsByScript.set(
+        catalog.scriptName,
+        new Set(['unrecorded-local']),
+      );
+      await expect(
+        backend[method](catalog, record, database, fence),
+      ).rejects.toThrow("namespace 'unrecorded-local' remains");
+      client.namespaceIdsByScript.delete(catalog.scriptName);
+      client.remainingNamespaceIds.add('known-local');
+      await expect(
+        backend[method](catalog, record, database, fence),
+      ).rejects.toThrow("namespace 'known-local' remains");
+      client.remainingNamespaceIds.clear();
+      await expect(
+        backend[method](deployment, record, database, fence),
+      ).rejects.toThrow('different deployment');
+    }
+    expect(events).not.toContain(`control:${stateName}`);
+    expect(events).not.toContain(`control:${proxyName}`);
+    expect(events).not.toContain(`namespaces:${stateName}`);
+    expect(client.controlWorkers.get(stateName)).toEqual(foreign);
+    expect(client.namespaceIdsByScript.get(stateName)).toEqual(
+      new Set(['foreign-namespace']),
+    );
+    const before = [...events];
+    await expect(
+      backend.deletePlatformResources(catalog, record, database, fence),
+    ).rejects.toThrow('external deployment');
+    await expect(
+      backend.revokePlatformResourceCredentials(
+        catalog,
+        record,
+        database,
+        fence,
+      ),
+    ).rejects.toThrow('external deployment');
+    expect(events).toEqual(before);
+  });
+
+  it.each([
+    'prior',
+    'candidate',
+    'unrecorded',
+  ] as const)('checks catalog teardown against recorded active and pending artifacts (%s)', async (observed) => {
+    const prior: DeploymentSpec = { ...deployment, authoredBy: 'platform' };
+    const target: DeploymentSpec = { ...prior, schemaVersion: 2 };
+    const active: ExternalReleaseSnapshot = {
+      physicalScriptName: prior.scriptName,
+      specDigest: deploymentSpecDigest(prior),
+      artifactVersion: 'catalog-v1',
+      releaseSchemaVersion: 1,
+    };
+    const pending: ExternalReleaseSnapshot = {
+      physicalScriptName: prior.scriptName,
+      specDigest: deploymentSpecDigest(target),
+      artifactVersion: 'catalog-v2',
+      releaseSchemaVersion: 2,
+    };
+    for (const operation of [
+      'removeTraffic',
+      'revokeCredentials',
+      'deleteWorker',
+    ] as const) {
+      const client = new FakeApi();
+      const selected = observed === 'prior' ? active : pending;
+      client.dispatchWorkers.set(
+        prior.scriptName,
+        completeProviderBindingInspection({
+          tenantTag: prior.tenantTag,
+          environment: prior.environment,
+          artifactVersion:
+            observed === 'unrecorded' ? 'catalog-v3' : selected.artifactVersion,
+          desiredSpecDigest: selected.specDigest,
+          schemaVersion: selected.releaseSchemaVersion,
+          databaseIds: ['db-acme'],
+          durableObjectBindings: [],
+          secretNames: [],
+          plainTextBindings: {},
+        }),
+      );
+      const backend = new WorkersForPlatformsBackend({
+        namespacedState: NAMESPACED_STATE,
+        client,
+        hostRoutingKvId: 'host-routes',
+      });
+      const database = {
+        id: 'db-acme',
+        name: prior.databaseName,
+        created: false,
+      };
+      const result =
+        operation === 'deleteWorker'
+          ? backend.deleteWorker(target, [pending], database, active, fence)
+          : backend[operation](target, [pending], active, database, fence);
+      if (observed === 'unrecorded') {
+        await expect(result).rejects.toThrow(
+          'owned by another build or deployment',
+        );
+        expect(client.calls).toEqual([]);
+      } else await expect(result).resolves.toBeUndefined();
+    }
+  });
+
+  it.each([
+    'ready',
+    'before-candidate',
+    'after-candidate',
+  ] as const)('enrolls a legacy catalog under its native Fleet lease and decommissions from %s', async (boundary) => {
+    const catalog: DeploymentSpec = {
+      ...deployment,
+      authoredBy: 'platform',
+      durableObjectBindings: [
+        { name: 'RUNNER', className: 'Runner' },
+        { name: 'MAINTENANCE', className: 'Maintenance' },
+      ],
+      durableObjectMigrations: [
+        { tag: 'v1', newSqliteClasses: ['Runner', 'Maintenance'] },
+      ],
+    };
+    const target: DeploymentSpec = {
+      ...catalog,
+      previousDurableObjectTag: 'v1',
+      modules: [
+        { name: 'worker.js', content: 'export default { fetch() {} }' },
+      ],
+    };
+    const native = await createWfpMaintenanceHarness({
+      catalog,
+      external: deployment,
+      secrets,
+      publicKey: MAINTENANCE_CAPABILITY_PUBLIC_KEY,
+    });
+    try {
+      const client = new FakeApi();
+      client.exists = false;
+      const databaseId = '00000000-0000-0000-0000-000000000041';
+      const createDatabase = client.createDatabase.bind(client);
+      client.createDatabase = async () => {
+        const created = await createDatabase();
+        client.database = { ...created, id: databaseId, created: false };
+        return { ...created, id: databaseId };
+      };
+      client.getDatabase = async (id) => {
+        client.databaseIdsRead.push(id);
+        return client.database?.id === id ? client.database : undefined;
+      };
+      const exportBytes = new TextEncoder().encode(
+        '-- fixture database export\nSELECT 1;\n',
+      );
+      const exportSha256 = createHash('sha256')
+        .update(exportBytes)
+        .digest('hex');
+      const exports = await native.exportBucket();
+      const receiptKeys: string[] = [];
+      const lifecycleClient = Object.assign(client, {
+        databaseExportReceiptAuthority: RECEIPT_AUTHORITY,
+        async exportDatabaseReceipt(
+          identity: DatabaseExportReceiptIdentity,
+        ): Promise<DatabaseExport> {
+          expect(identity).toMatchObject({
+            authority: RECEIPT_AUTHORITY,
+            databaseId,
+          });
+          expect(client.database).toBeDefined();
+          client.calls.push('export-receipt');
+          const key = `receipts/v1/${identity.databaseId}/${identity.operationId}.sql`;
+          await exports.put(key, exportBytes);
+          receiptKeys.push(key);
+          return {
+            databaseId,
+            location: `r2://fleet-exports/${key}`,
+            size: exportBytes.byteLength,
+            sha256: exportSha256,
+          };
+        },
+        async advanceDecommissionAttachmentScan(
+          input: DecommissionAttachmentScanInput,
+        ): Promise<DecommissionAttachmentScanResult> {
+          expect(input.progress.target).toEqual({ kind: 'd1', databaseId });
+          const ordinary = [...client.controlWorkers.values()].filter(
+            (value) => value !== undefined,
+          );
+          const dispatched = [...client.dispatchWorkers.values()];
+          expect(
+            [...ordinary, ...dispatched].some((value) =>
+              value.databaseIds.includes(databaseId),
+            ),
+          ).toBe(false);
+          expect(client.databaseAttachments).toEqual([]);
+          return {
+            status: 'complete',
+            evidenceSha256: createHash('sha256')
+              .update(JSON.stringify({ ordinary, dispatched }))
+              .digest('hex'),
+            evidenceCount: 2 + ordinary.length + dispatched.length,
+            providerFetchAttemptsReserved: 0,
+          };
+        },
+        async deleteDatabase(id: string) {
+          expect(id).toBe(databaseId);
+          expect(receiptKeys).toHaveLength(1);
+          expect(await exports.get(receiptKeys[0] ?? '')).not.toBeNull();
+          client.calls.push('delete-db');
+          client.database = undefined;
+        },
+      });
+      let failEnsure = false;
+      const backend = new WorkersForPlatformsBackend({
+        namespacedState: NAMESPACED_STATE,
+        client: lifecycleClient,
+        fetch: async (input, init) => {
+          if (failEnsure && String(input).endsWith('/ensure-maintenance')) {
+            failEnsure = false;
+            throw new Error('fixture interruption after candidate');
+          }
+          return native.fetch(input, init);
+        },
+        hostRoutingKvId: 'host-routes',
+        platformProfileFor: () => platformProfile(),
+      });
+      const store = new D1FleetStateStore(
+        new D1FleetStateDatabase(await native.fleetDatabase()),
+        {
+          accountId: 'wfp-native',
+          leaseTtlMs: 60_000,
+          leaseRenewalIntervalMs: 20_000,
+        },
+      );
+      await store.get(catalog.tenantTag, catalog.environment);
+      const fleetDb = await native.fleetDatabase();
+      await fleetDb.exec(
+        'CREATE TABLE fixture_first_catalog_claims (phase TEXT, mode TEXT, resource_type TEXT, resource_name TEXT, resource_role TEXT)',
+      );
+      await fleetDb.exec(
+        "CREATE TRIGGER capture_first_catalog_claim AFTER INSERT ON anchorage_fleet_deployments BEGIN INSERT INTO fixture_first_catalog_claims SELECT NEW.phase,NEW.wfp_mode,resource_type,resource_name,resource_role FROM anchorage_platform_plane_claims WHERE account_id='wfp-native' AND resource_set_key='deployment:acme:production'; END",
+      );
+      const initial = await provisionDeployment({
+        backend,
+        store,
+        spec: catalog,
+        secrets,
+        initialExecutionFenceState: 'open',
+      });
+      expect(initial.record.phase).toBe('ready');
+      expect(initial.record.wfpMode).toBe('platform-catalog');
+      expect(client.lastPromotedRoute).not.toHaveProperty('stateEgress');
+      await fleetDb
+        .prepare(
+          'UPDATE anchorage_fleet_deployments SET wfp_mode=? WHERE tenant_tag=? AND environment=?',
+        )
+        .bind('unknown-mode', catalog.tenantTag, catalog.environment)
+        .run();
+      try {
+        await expect(
+          store.get(catalog.tenantTag, catalog.environment),
+        ).rejects.toThrow('invalid wfp_mode');
+      } finally {
+        await fleetDb
+          .prepare(
+            'UPDATE anchorage_fleet_deployments SET wfp_mode=? WHERE tenant_tag=? AND environment=?',
+          )
+          .bind('platform-catalog', catalog.tenantTag, catalog.environment)
+          .run();
+      }
+      expect(
+        (
+          await fleetDb
+            .prepare('SELECT * FROM fixture_first_catalog_claims')
+            .all()
+        ).results,
+      ).toEqual([
+        {
+          phase: 'database-reserved',
+          mode: 'platform-catalog',
+          resource_type: 'dispatch-script',
+          resource_name: catalog.scriptName,
+          resource_role: 'deployment-worker',
+        },
+      ]);
+      const claimRows = async () =>
+        (
+          await fleetDb
+            .prepare(
+              "SELECT resource_type,resource_name,resource_role,resource_set_key,platform_plane_identity FROM anchorage_platform_plane_claims WHERE account_id='wfp-native'",
+            )
+            .all()
+        ).results;
+      const claims = await claimRows();
+      const { wfpMode: _mode, ...lostMode } = initial.record;
+      await expect(
+        store.withDeploymentLease(
+          catalog.tenantTag,
+          catalog.environment,
+          (lease) => lease.put({ ...lostMode, phase: 'identity-seeded' }),
+        ),
+      ).rejects.toThrow();
+      expect(await store.get(catalog.tenantTag, catalog.environment)).toEqual(
+        initial.record,
+      );
+      expect(await claimRows()).toEqual(claims);
+      await expect(
+        store.withDeploymentLease(
+          catalog.tenantTag,
+          catalog.environment,
+          (lease) => lease.put({ ...initial.record, backend: 'plain-worker' }),
+        ),
+      ).rejects.toThrow('wfp_mode');
+      await expect(
+        store.withDeploymentLease(
+          catalog.tenantTag,
+          catalog.environment,
+          (lease) => lease.put({ ...initial.record, platformResources }),
+        ),
+      ).rejects.toThrow('wfp_mode');
+      const installed = client.dispatchWorkers.get(catalog.scriptName);
+      if (!installed) throw new Error('catalog upload is missing');
+      client.dispatchWorkers.set(catalog.scriptName, {
+        ...installed,
+        plainTextBindings: {},
+      });
+      await native.updateCatalog(catalog, false);
+      await expect(
+        backend.inspect(catalog, secrets.maintenanceAdmin),
+      ).rejects.toThrow('signed maintenance enrollment');
+      expect(
+        (
+          await native.catalogFetch(
+            new Request('https://catalog.test/admin/maintenance-status', {
+              headers: { authorization: `Bearer ${secrets.maintenanceAdmin}` },
+            }),
+          )
+        ).status,
+      ).toBe(200);
+      const uploads = client.uploadedScriptNames.length;
+      const upload = client.uploadDispatchWorker.bind(client);
+      client.uploadDispatchWorker = async (
+        ...args: Parameters<WorkersForPlatformsApi['uploadDispatchWorker']>
+      ) => {
+        await upload(...args);
+        await native.updateCatalog(target);
+        const current = client.dispatchWorkers.get(catalog.scriptName);
+        if (!current) throw new Error('enrolled provider snapshot is missing');
+        client.dispatchWorkers.set(catalog.scriptName, {
+          ...current,
+          artifactVersion: 'catalog-v2',
+        });
+        return { artifactVersion: 'catalog-v2' };
+      };
+      await store.withDeploymentLease(
+        catalog.tenantTag,
+        catalog.environment,
+        async (lease) => {
+          const owned = await store.get(catalog.tenantTag, catalog.environment);
+          expect(owned).toEqual(initial.record);
+          if (!owned) throw new Error('owned catalog record is missing');
+          const uploaded = await backend.deployWorker(
+            target,
+            { id: owned.databaseId, name: owned.databaseName, created: false },
+            secrets,
+            undefined,
+            lease,
+            undefined,
+            owned.applicationBindings,
+          );
+          expect(uploaded.artifactVersion).toBe('catalog-v2');
+          expect(
+            await store.get(catalog.tenantTag, catalog.environment),
+          ).toEqual(initial.record);
+        },
+      );
+      const [migrated] = await migrateFleet({
+        store,
+        records: [initial.record],
+        canaryTenantTags: [],
+        backendFor: () => backend,
+        specFor: () => target,
+        secretsFor: () => secrets,
+      });
+      expect(migrated).toMatchObject({
+        phase: 'ready',
+        wfpMode: 'platform-catalog',
+        desiredSpecDigest: deploymentSpecDigest(target),
+        artifactVersion: 'catalog-v2',
+        databaseId: initial.record.databaseId,
+        durableObjectBindings: initial.record.durableObjectBindings,
+        applicationResources: initial.record.applicationResources,
+      });
+      expect(client.uploadedScriptNames).toHaveLength(uploads + 1);
+      expect(await store.get(catalog.tenantTag, catalog.environment)).toEqual(
+        migrated,
+      );
+      await expect(
+        forceDecommissionDeployment({
+          backend,
+          store,
+          tenantTag: catalog.tenantTag,
+          environment: catalog.environment,
+        }),
+      ).rejects.toThrow('does not support spec-free force decommission');
+      expect(await store.get(catalog.tenantTag, catalog.environment)).toEqual(
+        migrated,
+      );
+      let teardownSpec = target;
+      if (boundary !== 'ready') {
+        teardownSpec = {
+          ...target,
+          schemaVersion: 2,
+          migrations: [
+            ...target.migrations,
+            {
+              version: 2,
+              sql: 'ALTER TABLE example ADD COLUMN value TEXT',
+              rollbackCompatible: true,
+            },
+          ],
+          modules: [
+            {
+              name: 'worker.js',
+              content:
+                'export default { fetch() { return new Response("third"); } }',
+            },
+          ],
+        };
+        client.uploadDispatchWorker = async (
+          ...args: Parameters<WorkersForPlatformsApi['uploadDispatchWorker']>
+        ) => {
+          if (boundary === 'before-candidate')
+            throw new Error('fixture interruption before candidate');
+          await upload(...args);
+          await native.updateCatalog(teardownSpec);
+          const current = client.dispatchWorkers.get(catalog.scriptName);
+          if (!current)
+            throw new Error('third catalog provider snapshot is missing');
+          client.dispatchWorkers.set(catalog.scriptName, {
+            ...current,
+            artifactVersion: 'catalog-v3',
+          });
+          return { artifactVersion: 'catalog-v3' };
+        };
+        failEnsure = boundary === 'after-candidate';
+        if (!migrated) throw new Error('migrated record is missing');
+        await expect(
+          migrateFleet({
+            store,
+            records: [migrated],
+            canaryTenantTags: [],
+            backendFor: () => backend,
+            specFor: () => teardownSpec,
+            secretsFor: () => secrets,
+          }),
+        ).rejects.toThrow('fixture interruption');
+        const interrupted = await store.get(
+          catalog.tenantTag,
+          catalog.environment,
+        );
+        expect(interrupted).toMatchObject({
+          phase: 'migrating',
+          schemaVersion: 2,
+          wfpMode: 'platform-catalog',
+          pendingSpecDigest: deploymentSpecDigest(teardownSpec),
+          activeRelease: {
+            artifactVersion: 'catalog-v2',
+            specDigest: deploymentSpecDigest(target),
+            releaseSchemaVersion: 1,
+          },
+        });
+        expect(interrupted?.pendingArtifactVersion).toBe(
+          boundary === 'after-candidate' ? 'catalog-v3' : undefined,
+        );
+      }
+      const removePlatform = vi.spyOn(backend, 'deletePlatformResources');
+      const revokePlatform = vi.spyOn(
+        backend,
+        'revokePlatformResourceCredentials',
+      );
+      const events: string[] = [];
+      client.residualEvents = events;
+      let result = await advanceDecommissionDeployment({
+        backend,
+        store,
+        spec: teardownSpec,
+        action: { kind: 'start' },
+        maxProviderRequests: 9,
+        randomUUID,
+      });
+      for (let count = 0; result.status === 'pending' && count < 80; count++)
+        result = await advanceDecommissionDeployment({
+          backend,
+          store,
+          spec: teardownSpec,
+          action: { kind: 'continue', token: result.token },
+          maxProviderRequests: 9,
+          randomUUID,
+        });
+      expect(result.status).toBe('complete');
+      expect(removePlatform).not.toHaveBeenCalled();
+      expect(revokePlatform).not.toHaveBeenCalled();
+      expect(events).toContain(`namespaces:${catalog.scriptName}`);
+      expect(events).not.toContain(
+        `control:${externalStateScriptName(catalog)}`,
+      );
+      expect(events).not.toContain(
+        `control:${externalEgressProxyScriptName(catalog)}`,
+      );
+      expect(client.calls.indexOf('export-receipt')).toBeLessThan(
+        client.calls.indexOf('delete-db'),
+      );
+      expect(receiptKeys).toHaveLength(1);
+      const exported = await exports.get(receiptKeys[0] ?? '');
+      if (!exported) throw new Error('fixture database export is missing');
+      expect(new Uint8Array(await exported.arrayBuffer())).toEqual(exportBytes);
+      expect(
+        await store.get(catalog.tenantTag, catalog.environment),
+      ).toMatchObject({
+        phase: 'decommissioned',
+        wfpMode: 'platform-catalog',
+        databaseExportSha256: exportSha256,
+        databaseExportSize: exportBytes.byteLength,
+      });
+      expect(await claimRows()).toEqual(claims);
+      await forceDecommissionDeployment({
+        backend,
+        store,
+        tenantTag: catalog.tenantTag,
+        environment: catalog.environment,
+      });
+      expect(
+        await store.get(catalog.tenantTag, catalog.environment),
+      ).toBeUndefined();
+      expect(await claimRows()).toEqual([]);
+    } finally {
+      await native.close();
+    }
+  }, 120_000);
+
+  it('uses the real dispatcher, native catalog and external-state Maintenance for signed health', async () => {
+    const catalog: DeploymentSpec = { ...deployment, authoredBy: 'platform' };
+    const native = await createWfpMaintenanceHarness({
+      catalog,
+      external: deployment,
+      secrets,
+      publicKey: MAINTENANCE_CAPABILITY_PUBLIC_KEY,
+    });
+    try {
+      const client = new FakeApi();
+      await client.putDispatchSecrets(catalog.scriptName, secrets, {
+        includeMaintenanceAdmin: true,
+      });
+      await client.uploadDispatchWorker(
+        catalog,
+        { id: 'db-acme', name: catalog.databaseName, created: false },
+        catalog.scriptName,
+        undefined,
+        undefined,
+        MAINTENANCE_CAPABILITY_PUBLIC_KEY,
+      );
+      const options = {
+        namespacedState: NAMESPACED_STATE,
+        client,
+        fetch: native.fetch,
+        hostRoutingKvId: 'host-routes',
+        platformProfileFor: () => platformProfile(),
+      };
+      const backend = new WorkersForPlatformsBackend(options);
+      const health = await backend.ensureMaintenance(
+        catalog,
+        secrets.maintenanceAdmin,
+        fence,
+        'etag-v1',
+      );
+      expect(health.armed).toBe(true);
+      const ensured = native.requests.at(-1);
+      if (!ensured) throw new Error('native ensure request is missing');
+      expect((await native.fetch(ensured.clone())).status).toBe(401);
+      const live = await backend.inspect(
+        catalog,
+        secrets.maintenanceAdmin,
+        'etag-v1',
+      );
+      expect(live?.maintenance).toMatchObject({
+        armed: true,
+        deploymentSpecDigest: deploymentSpecDigest(catalog),
+      });
+      const status = native.requests.at(-1);
+      if (!status) throw new Error('native status request is missing');
+      expect((await native.fetch(status.clone())).status).toBe(200);
+      expect((await native.fetch(status.clone())).status).toBe(200);
+
+      const wrong = await mintAsymmetricMaintenanceCapability({
+        privateKey: MAINTENANCE_CAPABILITY_PRIVATE_KEY,
+        operation: 'ensure-maintenance',
+        tenantTag: catalog.tenantTag,
+        environment: catalog.environment,
+        scriptName: catalog.scriptName,
+        specDigest: 'f'.repeat(64),
+        nonce: 'DDDDDDDDDDDDDDDDDDDDDD',
+      });
+      const local = (token: string) =>
+        new Request('https://catalog.test/admin/ensure-maintenance', {
+          method: 'POST',
+          headers: { authorization: `Bearer ${token}` },
+        });
+      expect((await native.catalogFetch(local(wrong.token))).status).toBe(401);
+      const valid = await mintAsymmetricMaintenanceCapability({
+        privateKey: MAINTENANCE_CAPABILITY_PRIVATE_KEY,
+        operation: 'ensure-maintenance',
+        tenantTag: catalog.tenantTag,
+        environment: catalog.environment,
+        scriptName: catalog.scriptName,
+        specDigest: deploymentSpecDigest(catalog),
+        nonce: wrong.claims.nonce,
+      });
+      expect((await native.catalogFetch(local(valid.token))).status).toBe(200);
+      expect((await native.catalogFetch(local(valid.token))).status).toBe(401);
+      expect(
+        (await native.catalogFetch(local(secrets.maintenanceAdmin))).status,
+      ).toBe(401);
+      expect(
+        (
+          await native.catalogFetch(
+            new Request('https://catalog.test/admin/execution-fence', {
+              headers: { authorization: `Bearer ${valid.token}` },
+            }),
+          )
+        ).status,
+      ).toBe(401);
+      expect(
+        (
+          await native.catalogFetch(
+            new Request('https://catalog.test/admin/execution-fence', {
+              headers: { authorization: `Bearer ${secrets.maintenanceAdmin}` },
+            }),
+          )
+        ).status,
+      ).toBe(200);
+
+      const externalClient = new FakeApi();
+      const external = new WorkersForPlatformsBackend({
+        ...options,
+        client: externalClient,
+      });
+      expect(
+        await external.ensureMaintenance(
+          deployment,
+          secrets.maintenanceAdmin,
+          fence,
+          'etag-v1',
+        ),
+      ).toMatchObject({
+        armed: true,
+        deploymentSpecDigest: deploymentSpecDigest(deployment),
+      });
+      expect(
+        (await external.inspect(deployment, secrets.maintenanceAdmin))
+          ?.maintenance.armed,
+      ).toBe(true);
+
+      const unsignedBody = new WorkersForPlatformsBackend({
+        ...options,
+        fetch: async (input, init) => {
+          const response = await native.fetch(input, init);
+          await response.arrayBuffer();
+          return Response.json(
+            { alarmAt: null },
+            { headers: response.headers },
+          );
+        },
+      });
+      expect(
+        (await unsignedBody.inspect(catalog, secrets.maintenanceAdmin))
+          ?.maintenance.armed,
+      ).toBe(true);
+      const missingReceipt = new WorkersForPlatformsBackend({
+        ...options,
+        fetch: async (input, init) => {
+          const response = await native.fetch(input, init);
+          const headers = new Headers(response.headers);
+          headers.delete(MAINTENANCE_RECEIPT_HEADER);
+          return new Response(await response.arrayBuffer(), {
+            status: response.status,
+            headers,
+          });
+        },
+      });
+      await expect(
+        missingReceipt.inspect(catalog, secrets.maintenanceAdmin),
+      ).rejects.toThrow('does not match dispatch Worker');
+      expect(native.calls.map(({ scriptName }) => scriptName)).toContain(
+        externalReleaseScriptName(deployment),
+      );
+      expect(native.calls[0]?.options).toMatchObject({
+        limits: { cpuMs: 1000, subRequests: 50 },
+      });
+    } finally {
+      await native.close();
+    }
+  }, 90_000);
+
+  it.each([
+    'current',
+    'changed',
+  ] as const)('inspects signed mutable catalog health when the requested spec is %s', async (selection) => {
+    const current: DeploymentSpec = { ...deployment, authoredBy: 'platform' };
+    const requested =
+      selection === 'current'
+        ? current
+        : {
+            ...current,
+            modules: [
+              { name: 'worker.js', content: 'export default { fetch() {} }' },
+            ],
+          };
+    const client = new FakeApi();
+    client.dispatchWorkers.set(current.scriptName, {
+      artifactVersion: 'catalog-v1',
+      databaseIds: ['db-acme'],
+      durableObjectBindings: [],
+      secretNames: ['DEPLOYMENT_IDENTITY_SECRET', 'MAINTENANCE_ADMIN_SECRET'],
+      tenantTag: current.tenantTag,
+      environment: current.environment,
+      schemaVersion: current.schemaVersion,
+      desiredSpecDigest: deploymentSpecDigest(current),
+      plainTextBindings: {
+        FLEET_MAINTENANCE_CAPABILITIES: 'required',
+        FLEET_MAINTENANCE_CAPABILITY_PUBLIC_KEY:
+          MAINTENANCE_CAPABILITY_PUBLIC_KEY,
+        FLEET_DEPLOYMENT_SCRIPT: current.scriptName,
+        FLEET_RESOURCE_ROLE: 'platform-catalog',
+      },
+      providerBindingIdentities: [],
+    });
+    const request = vi.fn(attestedHealthResponse);
+    const backend = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client,
+      fetch: request,
+      hostRoutingKvId: 'host-routes',
+      platformProfileFor: () => ({
+        maintenanceCapabilityPublicKey: MAINTENANCE_CAPABILITY_PUBLIC_KEY,
+        maintenanceCapabilityPrivateKey: MAINTENANCE_CAPABILITY_PRIVATE_KEY,
+      }),
+    });
+    expect(
+      await backend.inspect(requested, secrets.maintenanceAdmin),
+    ).toMatchObject({
+      artifactVersion: 'catalog-v1',
+      desiredSpecDigest: deploymentSpecDigest(current),
+      maintenance: {
+        armed: true,
+        deploymentSpecDigest: deploymentSpecDigest(current),
+      },
+    });
+    expect(String(request.mock.calls[0]?.[0])).toBe(
+      `https://control-acme.example.test/.well-known/anchorage/maintenance/acme/production/${current.scriptName}/${deploymentSpecDigest(current)}/maintenance-status`,
+    );
+    if (selection === 'current') {
+      expect(
+        await backend.ensureMaintenance(
+          requested,
+          secrets.maintenanceAdmin,
+          fence,
+          'catalog-v1',
+        ),
+      ).toMatchObject({ armed: true });
+    } else {
+      await expect(
+        backend.ensureMaintenance(
+          requested,
+          secrets.maintenanceAdmin,
+          fence,
+          'catalog-v1',
+        ),
+      ).rejects.toThrow('specification digest');
+      expect(request).toHaveBeenCalledOnce();
+    }
+  });
+
+  it('exposes and forwards receipt export only for a capable WFP client', async () => {
+    const absentClient = new FakeApi();
+    const absent = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client: absentClient,
+      hostRoutingKvId: 'host-routing',
+    });
+    expect('databaseExportReceiptAuthority' in absent).toBe(false);
+    expect('exportDatabaseReceipt' in absent).toBe(false);
+
+    const client = new FakeApi();
+    const legacy = vi
+      .spyOn(client, 'exportDatabase')
+      .mockRejectedValue(new Error('legacy export must not run'));
+    let authorityReads = 0;
+    let methodReads = 0;
+    let receiver: unknown;
+    let received: DatabaseExportReceiptIdentity | undefined;
+    Object.defineProperties(client, {
+      databaseExportReceiptAuthority: {
+        configurable: true,
+        get() {
+          authorityReads += 1;
+          return RECEIPT_AUTHORITY;
+        },
+      },
+      exportDatabaseReceipt: {
+        configurable: true,
+        get() {
+          methodReads += 1;
+          return function (
+            this: unknown,
+            identity: DatabaseExportReceiptIdentity,
+          ) {
+            receiver = this;
+            received = identity;
+            return Promise.resolve({
+              databaseId: identity.databaseId,
+              location: 'r2://fleet-exports/receipt.sql',
+              size: 4,
+              sha256: 'a'.repeat(64),
+            });
+          };
+        },
+      },
+    });
+    const capable = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client,
+      hostRoutingKvId: 'host-routing',
+    });
+    expect(capable.databaseExportReceiptAuthority).toBe(RECEIPT_AUTHORITY);
+    expect([authorityReads, methodReads]).toEqual([1, 1]);
+    const exportReceipt = capable.exportDatabaseReceipt;
+    if (!exportReceipt) throw new Error('expected receipt export capability');
+    await expect(exportReceipt(RECEIPT_IDENTITY, fence)).resolves.toEqual({
+      databaseId: RECEIPT_IDENTITY.databaseId,
+      location: 'r2://fleet-exports/receipt.sql',
+      size: 4,
+      sha256: 'a'.repeat(64),
+    });
+    expect(receiver).toBe(client);
+    expect(received).toEqual(RECEIPT_IDENTITY);
+    expect(client.mutationFenceEntries).toBe(1);
+    expect(legacy).not.toHaveBeenCalled();
+
+    received = undefined;
+    const authorityFailure = await Promise.resolve()
+      .then(() =>
+        exportReceipt(
+          { ...RECEIPT_IDENTITY, authority: 'r2://different/receipts/v1' },
+          fence,
+        ),
+      )
+      .catch((error: unknown) => error);
+    expect(authorityFailure).toBeInstanceOf(Error);
+    expect((authorityFailure as Error).message).toBe(
+      'database export receipt authority differs from configured authority',
+    );
+    expect((authorityFailure as Error).cause).toBeUndefined();
+    expect(received).toBeUndefined();
+    expect(client.mutationFenceEntries).toBe(1);
+
+    const incomplete = new FakeApi();
+    Object.defineProperty(incomplete, 'databaseExportReceiptAuthority', {
+      configurable: true,
+      value: RECEIPT_AUTHORITY,
+    });
+    const failure = (() => {
+      try {
+        return new WorkersForPlatformsBackend({
+          namespacedState: NAMESPACED_STATE,
+          client: incomplete,
+          hostRoutingKvId: 'host-routing',
+        });
+      } catch (error) {
+        return error;
+      }
+    })();
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe(
+      'database export receipt capability is malformed',
+    );
+    expect((failure as Error).cause).toBeUndefined();
+
+    for (const property of [
+      'databaseExportReceiptAuthority',
+      'exportDatabaseReceipt',
+    ] as const) {
+      const throwingClient = new FakeApi();
+      if (property === 'exportDatabaseReceipt') {
+        Object.defineProperty(
+          throwingClient,
+          'databaseExportReceiptAuthority',
+          { configurable: true, value: RECEIPT_AUTHORITY },
+        );
+      }
+      Object.defineProperty(throwingClient, property, {
+        configurable: true,
+        get() {
+          throw new Error(`${property} getter must not escape`);
+        },
+      });
+      const getterFailure = (() => {
+        try {
+          return new WorkersForPlatformsBackend({
+            namespacedState: NAMESPACED_STATE,
+            client: throwingClient,
+            hostRoutingKvId: 'host-routing',
+          });
+        } catch (error) {
+          return error;
+        }
+      })();
+      expect(getterFailure).toBeInstanceOf(Error);
+      expect((getterFailure as Error).message).toBe(
+        'database export receipt capability is malformed',
+      );
+      expect((getterFailure as Error).cause).toBeUndefined();
+    }
+  });
+
   it('provisions dispatch-native state without an ordinary per-deployment Worker', async () => {
     const client = new FakeApi();
     const external = {
@@ -1825,9 +2998,11 @@ describe('WorkersForPlatformsBackend', () => {
   });
 
   it.each([
-    'persisted',
-    'provider-committed',
-  ] as const)('deletes the exact %s trusted-resource variant after an interrupted migration', async (liveVariant) => {
+    ['persisted', false],
+    ['provider-committed', false],
+    ['persisted', true],
+    ['provider-committed', true],
+  ] as const)('deletes the exact %s trusted-resource variant after an interrupted migration (compatibility: %s)', async (liveVariant, compatibility) => {
     const client = new FakeApi();
     const initialSpec = {
       ...deployment,
@@ -1919,6 +3094,7 @@ describe('WorkersForPlatformsBackend', () => {
       },
     );
 
+    let teardownRecord = record;
     if (liveVariant === 'provider-committed') {
       await backend.ensurePlatformResources(
         targetSpec,
@@ -1928,18 +3104,97 @@ describe('WorkersForPlatformsBackend', () => {
         record,
         fence,
       );
+      const {
+        migrationIntent: _migrationIntent,
+        pendingSpecDigest: _pendingSpecDigest,
+        pendingArtifactVersion: _pendingArtifactVersion,
+        ...withoutCarrier
+      } = record;
+      teardownRecord = decommissionAdvancingRecordFixture(
+        {
+          ...withoutCarrier,
+          desiredSpecDigest: targetRelease.specDigest,
+        },
+        'worker-deleted',
+        {
+          requestedSpecDigest: targetRelease.specDigest,
+          entryLifecyclePhase: 'migrating',
+        },
+      );
+      const teardownIntent = teardownRecord.decommissionIntent;
+      if (!teardownIntent || teardownIntent.state === 'complete') {
+        throw new Error('missing active decommission recovery marker');
+      }
+      const wrongMarker: FleetRecord = {
+        ...teardownRecord,
+        decommissionIntent: {
+          ...teardownIntent,
+          identity: {
+            ...teardownIntent.identity,
+            mode: {
+              kind: 'normal',
+              requestedSpecDigest: targetRelease.specDigest,
+              entryLifecyclePhase: 'ready',
+            },
+          },
+        },
+      };
+      client.calls.length = 0;
+      await expect(
+        backend.revokePlatformResourceCredentials(
+          targetSpec,
+          wrongMarker,
+          database,
+          fence,
+        ),
+      ).rejects.toThrow(/drifted state Worker/u);
+      expect(client.calls).not.toContain('revoke');
+    }
+
+    if (compatibility) {
+      teardownRecord = {
+        ...record,
+        desiredSpecDigest: targetRelease.specDigest,
+        phase: 'worker-deleted',
+      };
+      if (liveVariant === 'provider-committed') {
+        const intent = teardownRecord.migrationIntent;
+        if (!intent) throw new Error('missing retained migration authority');
+        await expect(
+          backend.revokePlatformResourceCredentials(
+            targetSpec,
+            {
+              ...teardownRecord,
+              migrationIntent: {
+                ...intent,
+                target: {
+                  ...intent.target,
+                  stateArtifactDigest: 'f'.repeat(64),
+                },
+              },
+            },
+            database,
+            fence,
+          ),
+        ).rejects.toThrow(/drifted state Worker/);
+      }
     }
 
     await expect(
       backend.revokePlatformResourceCredentials(
         targetSpec,
-        record,
+        teardownRecord,
         database,
         fence,
       ),
     ).resolves.toBeUndefined();
     await expect(
-      backend.deletePlatformResources(targetSpec, record, database, fence),
+      backend.deletePlatformResources(
+        targetSpec,
+        teardownRecord,
+        database,
+        fence,
+      ),
     ).resolves.toBeUndefined();
     expect(client.dispatchWorkers.size).toBe(0);
     if (liveVariant === 'provider-committed') {
@@ -2363,6 +3618,112 @@ describe('WorkersForPlatformsBackend', () => {
     });
   });
 
+  it('refuses a D1 create before dispatch when the lease is already lost', async () => {
+    const client = new FakeApi();
+    const subject = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client,
+      hostRoutingKvId: 'host-routing',
+    });
+    const denied = new Error('lease lost');
+    const lostFence: ExternalMutationFence = {
+      mutationLeaseTtlMs: 60_000,
+      assertOwned: vi.fn(async () => Promise.reject(denied)),
+    };
+
+    await expect(subject.ensureDatabase(deployment, lostFence)).rejects.toBe(
+      denied,
+    );
+    expect(client.databaseCreateCalls).toBe(0);
+    expect(client.databaseFindCalls).toBe(0);
+  });
+
+  it('refuses D1 readback when the lease is lost during creation', async () => {
+    const client = new FakeApi();
+    client.failDatabaseCreateAfterCommit = true;
+    const subject = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client,
+      hostRoutingKvId: 'host-routing',
+    });
+    const denied = new Error('lease lost');
+    const assertOwned = vi
+      .fn<() => Promise<void>>()
+      .mockResolvedValueOnce()
+      .mockRejectedValue(denied);
+
+    await expect(
+      subject.ensureDatabase(deployment, {
+        mutationLeaseTtlMs: 60_000,
+        assertOwned,
+      }),
+    ).rejects.toBe(denied);
+    expect(client.databaseCreateCalls).toBe(1);
+    expect(client.databaseFindCalls).toBe(0);
+  });
+
+  it('refuses an R2 create before dispatch when the lease is already lost', async () => {
+    const client = new FakeApi();
+    const subject = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client,
+      hostRoutingKvId: 'host-routing',
+    });
+    const denied = new Error('lease lost');
+
+    await expect(
+      subject.ensureApplicationR2Bucket(r2Resource, {
+        mutationLeaseTtlMs: 60_000,
+        assertOwned: vi.fn(async () => Promise.reject(denied)),
+      }),
+    ).rejects.toBe(denied);
+    expect(client.r2CreateCalls).toBe(0);
+    expect(client.r2ReadCalls).toBe(0);
+  });
+
+  it('refuses R2 readback when the lease is lost during creation', async () => {
+    const client = new FakeApi();
+    client.failR2CreateAfterCommit = true;
+    const subject = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client,
+      hostRoutingKvId: 'host-routing',
+    });
+    const denied = new Error('lease lost');
+    const assertOwned = vi
+      .fn<() => Promise<void>>()
+      .mockResolvedValueOnce()
+      .mockRejectedValue(denied);
+
+    await expect(
+      subject.ensureApplicationR2Bucket(r2Resource, {
+        mutationLeaseTtlMs: 60_000,
+        assertOwned,
+      }),
+    ).rejects.toBe(denied);
+    expect(client.r2CreateCalls).toBe(1);
+    expect(client.r2ReadCalls).toBe(0);
+  });
+
+  it('reconciles a duplicate R2 create while the lease remains healthy', async () => {
+    const client = new FakeApi();
+    client.failR2CreateAfterCommit = true;
+    const subject = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client,
+      hostRoutingKvId: 'host-routing',
+    });
+
+    await expect(
+      subject.ensureApplicationR2Bucket(r2Resource, fence),
+    ).resolves.toEqual({
+      ...r2Resource,
+      creationDate: '2026-08-26T00:00:00.000Z',
+    });
+    expect(client.r2CreateCalls).toBe(1);
+    expect(client.r2ReadCalls).toBe(1);
+  });
+
   it('rejects an authorized D1 create race that resolves to another owner', async () => {
     const client = new FakeApi();
     client.failDatabaseCreateAfterCommit = true;
@@ -2377,6 +3738,40 @@ describe('WorkersForPlatformsBackend', () => {
       /owned by 'other-tenant'/,
     );
     expect(client.database).toMatchObject({ name: deployment.databaseName });
+  });
+
+  it('seeds optional FS8 metadata through string-bound provider SQL', async () => {
+    const client = new FakeApi();
+    const subject = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client,
+      hostRoutingKvId: 'host-routing',
+    });
+    await subject.seedDeploymentIdentity(
+      { id: 'db-persisted', name: deployment.databaseName, created: false },
+      'acme',
+      fence,
+      { initialExecutionFenceState: 'migration-locked' },
+    );
+    expect(
+      client.fenceState.queryDatabase('SELECT * FROM flowsafe_execution_fence'),
+    ).toEqual([
+      {
+        id: 'deployment',
+        state: 'migration-locked',
+        proof_key: null,
+        proof_run_id: null,
+        updated_at: expect.any(Number),
+        last_transition_request: null,
+        transition_revision: 0,
+        mutation_epoch: 0,
+        require_mutation_epoch: 0,
+        proof_table_prefix: null,
+        proof_workflow_id: null,
+        proof_start_token: null,
+      },
+    ]);
+    expect(client.mutationFenceEntries).toBe(1);
   });
 
   it('runs D1 ownership reads inside the provider mutation fence', async () => {
@@ -2396,38 +3791,95 @@ describe('WorkersForPlatformsBackend', () => {
     expect(client.mutationFenceEntries).toBe(1);
   });
 
-  it('uses authenticated fixed maintenance endpoints', async () => {
+  it.each([
+    'injected',
+    'default',
+  ] as const)('uses authenticated fixed maintenance endpoints with %s fetch', async (selection) => {
     const fetch = vi.fn(attestedHealthResponse);
+    if (selection === 'default') vi.stubGlobal('fetch', fetch);
+    try {
+      const backend = new WorkersForPlatformsBackend({
+        namespacedState: NAMESPACED_STATE,
+        client: new FakeApi(),
+        ...(selection === 'injected' ? { fetch } : {}),
+        hostRoutingKvId: 'host-routes',
+        platformProfileFor: () => platformProfile(),
+      });
+
+      await expect(
+        backend.ensureMaintenance(
+          deployment,
+          secrets.maintenanceAdmin,
+          fence,
+          'etag-v1',
+        ),
+      ).resolves.toMatchObject({ armed: true, nextAlarmAt: 2_000 });
+      const live = await backend.inspect(deployment, secrets.maintenanceAdmin);
+      expect(live?.maintenance).toMatchObject({
+        armed: true,
+        nextAlarmAt: 2_000,
+      });
+      expect(
+        fetch.mock.contexts.map((context) => context === undefined),
+      ).toEqual([true, true]);
+
+      expect(String(fetch.mock.calls[0]?.[0])).toBe(
+        `https://control-acme.example.test/.well-known/anchorage/maintenance/acme/production/${externalReleaseScriptName(deployment)}/${deploymentSpecDigest(deployment)}/ensure-maintenance`,
+      );
+      expect(String(fetch.mock.calls[1]?.[0])).toBe(
+        `https://control-acme.example.test/.well-known/anchorage/maintenance/acme/production/${externalReleaseScriptName(deployment)}/${deploymentSpecDigest(deployment)}/maintenance-status`,
+      );
+      for (const [, init] of fetch.mock.calls) {
+        expect(new Headers(init?.headers).get('authorization')).toMatch(
+          /^Bearer ey/,
+        );
+        expect(init?.signal).toBeInstanceOf(AbortSignal);
+        expect(init?.redirect).toBe('manual');
+      }
+    } finally {
+      if (selection === 'default') vi.unstubAllGlobals();
+    }
+  });
+
+  it.each([
+    'ensureMaintenance',
+    'inspect',
+  ] as const)('refuses a redirected %s response that carries a valid receipt', async (operation) => {
+    const cancelled = vi.fn();
+    const redirected: typeof fetch = async (input, init) => {
+      const attested = await attestedHealthResponse(input, init);
+      void attested.body?.cancel();
+      return new Response(new ReadableStream({ cancel: cancelled }), {
+        status: 302,
+        headers: [
+          ...attested.headers,
+          ['location', 'https://redirected.invalid/elsewhere'],
+        ],
+      });
+    };
     const backend = new WorkersForPlatformsBackend({
       namespacedState: NAMESPACED_STATE,
       client: new FakeApi(),
-      fetch,
+      fetch: redirected,
       hostRoutingKvId: 'host-routes',
       platformProfileFor: () => platformProfile(),
     });
 
     await expect(
-      backend.ensureMaintenance(
-        deployment,
-        secrets.maintenanceAdmin,
-        fence,
-        'etag-v1',
-      ),
-    ).resolves.toMatchObject({ armed: true, nextAlarmAt: 2_000 });
-    await backend.inspect(deployment, secrets.maintenanceAdmin);
-
-    expect(String(fetch.mock.calls[0]?.[0])).toBe(
-      `https://control-acme.example.test/.well-known/anchorage/maintenance/acme/production/${externalReleaseScriptName(deployment)}/${deploymentSpecDigest(deployment)}/ensure-maintenance`,
-    );
-    expect(String(fetch.mock.calls[1]?.[0])).toBe(
-      `https://control-acme.example.test/.well-known/anchorage/maintenance/acme/production/${externalReleaseScriptName(deployment)}/${deploymentSpecDigest(deployment)}/maintenance-status`,
-    );
-    for (const [, init] of fetch.mock.calls) {
-      expect(new Headers(init?.headers).get('authorization')).toMatch(
-        /^Bearer ey/,
-      );
-      expect(init?.signal).toBeInstanceOf(AbortSignal);
-    }
+      operation === 'ensureMaintenance'
+        ? backend.ensureMaintenance(
+            deployment,
+            secrets.maintenanceAdmin,
+            fence,
+            'etag-v1',
+          )
+        : backend.inspect(deployment, secrets.maintenanceAdmin),
+    ).rejects.toMatchObject({
+      name: 'CredentialedRedirectRefusedError',
+      message:
+        'Workers for Platforms maintenance request refused a redirect with status 302',
+    });
+    expect(cancelled).toHaveBeenCalledTimes(1);
   });
 
   it('uses only the signed trusted result when candidate response body is forged', async () => {
@@ -2574,6 +4026,7 @@ describe('WorkersForPlatformsBackend', () => {
       namespacedState: NAMESPACED_STATE,
       client: api,
       hostRoutingKvId: 'host-routes',
+      platformProfileFor: () => platformProfile(),
     });
     await expect(
       backend.deployWorker(
@@ -2607,6 +4060,15 @@ describe('WorkersForPlatformsBackend', () => {
     expect(api.calls.slice(0, 3)).toEqual(['inventory', 'secrets', 'upload']);
     expect(api.dispatchSecretOptions.at(-1)).toEqual({
       includeMaintenanceAdmin: true,
+    });
+    expect(
+      api.dispatchWorkers.get(platform.scriptName)?.plainTextBindings,
+    ).toMatchObject({
+      FLEET_MAINTENANCE_CAPABILITIES: 'required',
+      FLEET_MAINTENANCE_CAPABILITY_PUBLIC_KEY:
+        MAINTENANCE_CAPABILITY_PUBLIC_KEY,
+      FLEET_DEPLOYMENT_SCRIPT: platform.scriptName,
+      FLEET_RESOURCE_ROLE: 'platform-catalog',
     });
   });
 
@@ -3040,6 +4502,270 @@ describe('WorkersForPlatformsBackend', () => {
       ),
     ).rejects.toThrow(/remains after deletion/);
     expect(api.calls).not.toContain('delete-inventory');
+  });
+
+  it('exposes a bounded attachment scanner only when the client supplies one', async () => {
+    const absentBackend = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client: new FakeApi(),
+      hostRoutingKvId: 'host-routes',
+    });
+    expect(absentBackend.advanceDecommissionAttachmentScan).toBeUndefined();
+    expect('advanceDecommissionAttachmentScan' in absentBackend).toBe(false);
+    expect(
+      Object.hasOwn(absentBackend, 'advanceDecommissionAttachmentScan'),
+    ).toBe(false);
+
+    const input: DecommissionAttachmentScanInput = {
+      progress: {
+        version: 1,
+        target: { kind: 'd1', databaseId: 'db-acme' },
+        evidenceSha256: '0'.repeat(64),
+        evidenceCount: 0,
+        stage: 'ordinary-script-inventory',
+        scriptIndex: 0,
+      },
+      maxProviderRequests: 12,
+      signal: new AbortController().signal,
+    };
+    const result = Object.freeze({
+      status: 'drift',
+    } as const satisfies DecommissionAttachmentScanResult);
+    let receivedThis: WorkersForPlatformsApi | undefined;
+    let receivedInput: DecommissionAttachmentScanInput | undefined;
+    const capability = vi.fn(function (
+      this: WorkersForPlatformsApi,
+      candidate: DecommissionAttachmentScanInput,
+    ) {
+      receivedThis = this;
+      receivedInput = candidate;
+      return Promise.resolve(result);
+    });
+    const capableClient = Object.assign(new FakeApi(), {
+      advanceDecommissionAttachmentScan: capability,
+    });
+    const capableBackend = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client: capableClient,
+      hostRoutingKvId: 'host-routes',
+    });
+
+    expect(typeof capableBackend.advanceDecommissionAttachmentScan).toBe(
+      'function',
+    );
+    expect('advanceDecommissionAttachmentScan' in capableBackend).toBe(true);
+    expect(
+      Object.hasOwn(capableBackend, 'advanceDecommissionAttachmentScan'),
+    ).toBe(true);
+    await expect(
+      capableBackend.advanceDecommissionAttachmentScan?.(input),
+    ).resolves.toBe(result);
+    expect(capability).toHaveBeenCalledTimes(1);
+    expect(receivedThis).toBe(capableClient);
+    expect(receivedInput).toBe(input);
+  });
+
+  it('keeps owned D1 residual checks independent from the legacy attachment scan', async () => {
+    type AssertionPath = 'residual' | 'legacy';
+
+    const database: DatabaseReference = {
+      id: 'db-acme',
+      name: deployment.databaseName,
+      created: false,
+    };
+    const physicalScriptName = externalReleaseScriptName(deployment);
+    const stateName = externalStateScriptName(deployment);
+    const proxyName = externalEgressProxyScriptName(deployment);
+    const record: FleetRecord = {
+      tenantTag: deployment.tenantTag,
+      backend: 'workers-for-platforms',
+      environment: deployment.environment,
+      scriptName: deployment.scriptName,
+      databaseId: database.id,
+      databaseName: database.name,
+      schemaVersion: deployment.schemaVersion,
+      artifactVersion: 'etag-v1',
+      desiredSpecDigest: deploymentSpecDigest(deployment),
+      activeRelease: {
+        physicalScriptName,
+        specDigest: deploymentSpecDigest(deployment),
+        artifactVersion: 'etag-v1',
+        releaseSchemaVersion: deployment.schemaVersion,
+      },
+      durableObjectBindings: [
+        {
+          name: 'MAINTENANCE',
+          className: 'Maintenance',
+          namespaceId: 'namespace-maintenance',
+        },
+      ],
+      routeHostname: deployment.routeHostname,
+      phase: 'database-deleting',
+      updatedAt: '2026-08-11T00:00:00.000Z',
+    };
+    const prefix = (path: AssertionPath): readonly string[] => [
+      'fence',
+      'host',
+      ...(path === 'legacy' ? ['attachments'] : []),
+    ];
+    const successEvents = (path: AssertionPath): readonly string[] => [
+      ...prefix(path),
+      `release:${physicalScriptName}`,
+      `inventory:${physicalScriptName}`,
+      `control:${stateName}`,
+      `control:${proxyName}`,
+      `namespaces:${stateName}`,
+      'namespace:namespace-maintenance',
+      'fence',
+    ];
+    const scenario = async (
+      path: AssertionPath,
+      configure: (client: FakeApi) => void | Promise<void> = () => {},
+      candidateRecord: FleetRecord = record,
+    ) => {
+      const client = new FakeApi();
+      client.exists = false;
+      await configure(client);
+      const events: string[] = [];
+      client.residualEvents = events;
+      const assertOwned = vi.fn(async () => {
+        events.push('fence');
+      });
+      const assertionFence: ExternalMutationFence = {
+        mutationLeaseTtlMs: 60_000,
+        assertOwned,
+      };
+      const backend = new WorkersForPlatformsBackend({
+        namespacedState: NAMESPACED_STATE,
+        client,
+        hostRoutingKvId: 'host-routes',
+      });
+      const invoke = () =>
+        path === 'legacy'
+          ? backend.assertDatabaseDetached(
+              deployment,
+              candidateRecord,
+              database,
+              assertionFence,
+            )
+          : backend.assertDatabaseDeletionResidualsRemoved(
+              deployment,
+              candidateRecord,
+              database,
+              assertionFence,
+            );
+      return { assertOwned, events, invoke };
+    };
+    const failureRows: readonly Readonly<{
+      configure?: (client: FakeApi) => void | Promise<void>;
+      record?: FleetRecord;
+      message: string;
+      expectedEvents(path: AssertionPath): readonly string[];
+    }>[] = [
+      {
+        record: { ...record, databaseId: 'db-other' },
+        message:
+          'refusing to attest database detachment for a different deployment',
+        expectedEvents: () => ['fence'],
+      },
+      {
+        configure(client) {
+          client.routeOwner = hostRoutingTarget(physicalScriptName);
+        },
+        message: `host route '${record.routeHostname}' remains before D1 deletion`,
+        expectedEvents: () => ['fence', 'host'],
+      },
+      {
+        configure(client) {
+          client.exists = true;
+        },
+        message: `dispatch release '${physicalScriptName}' remains before D1 deletion`,
+        expectedEvents: (path) => [
+          ...prefix(path),
+          `release:${physicalScriptName}`,
+        ],
+      },
+      {
+        configure(client) {
+          client.scriptInventories.set(physicalScriptName, {
+            scriptName: physicalScriptName,
+            tenantTag: deployment.tenantTag,
+            environment: deployment.environment,
+            databaseId: database.id,
+            routeHostname: deployment.routeHostname,
+          });
+        },
+        message: `script inventory '${physicalScriptName}' remains before D1 deletion`,
+        expectedEvents: (path) => [
+          ...prefix(path),
+          `release:${physicalScriptName}`,
+          `inventory:${physicalScriptName}`,
+        ],
+      },
+      {
+        async configure(client) {
+          await client.uploadControlWorker({
+            scriptName: stateName,
+            bindings: [],
+          });
+        },
+        message: `trusted platform Worker '${stateName}' remains before D1 deletion`,
+        expectedEvents: (path) => [
+          ...prefix(path),
+          `release:${physicalScriptName}`,
+          `inventory:${physicalScriptName}`,
+          `control:${stateName}`,
+        ],
+      },
+      {
+        configure(client) {
+          client.remainingNamespaceIds.add('namespace-maintenance');
+        },
+        message:
+          "Durable Object namespace 'namespace-maintenance' remains before D1 deletion",
+        expectedEvents: (path) => [...successEvents(path).slice(0, -1)],
+      },
+    ];
+
+    for (const path of ['residual', 'legacy'] as const) {
+      for (const row of failureRows) {
+        const test = await scenario(path, row.configure, row.record ?? record);
+        await expect(test.invoke()).rejects.toMatchObject({
+          message: row.message,
+        });
+        expect(test.events).toEqual(row.expectedEvents(path));
+        expect(test.assertOwned).toHaveBeenCalledTimes(1);
+      }
+    }
+
+    const legacyAttachment = await scenario('legacy', (client) => {
+      client.databaseAttachments.push({
+        plane: 'ordinary',
+        scriptName: 'unrelated-ordinary-worker',
+      });
+    });
+    await expect(legacyAttachment.invoke()).rejects.toMatchObject({
+      message:
+        "database 'db-acme' remains bound to Worker scripts before D1 deletion: ordinary:unrelated-ordinary-worker",
+    });
+    expect(legacyAttachment.events).toEqual(prefix('legacy'));
+    expect(legacyAttachment.assertOwned).toHaveBeenCalledTimes(1);
+
+    const residualSuccess = await scenario('residual', (client) => {
+      client.databaseAttachments.push({
+        plane: 'ordinary',
+        scriptName: 'must-not-be-listed',
+      });
+    });
+    await expect(residualSuccess.invoke()).resolves.toBeUndefined();
+    expect(residualSuccess.events).toEqual(successEvents('residual'));
+    expect(residualSuccess.events).not.toContain('attachments');
+    expect(residualSuccess.assertOwned).toHaveBeenCalledTimes(2);
+
+    const legacySuccess = await scenario('legacy');
+    await expect(legacySuccess.invoke()).resolves.toBeUndefined();
+    expect(legacySuccess.events).toEqual(successEvents('legacy'));
+    expect(legacySuccess.assertOwned).toHaveBeenCalledTimes(2);
   });
 
   it('requires positive route, script, and inventory absence before D1 deletion', async () => {

@@ -144,7 +144,11 @@ function createEgressProbeConnector(hostname: string) {
     description: 'Probe one upstream through the connector egress guard',
     inputSchema: z.object({ url: z.string().url() }),
     outputSchema: z.object({ upstreamStatus: z.number() }),
-    permissions: { sideEffect: 'read', egress: [hostname] },
+    permissions: {
+      sideEffect: 'read',
+      egress: [hostname],
+      egressEnforcement: 'enforced',
+    },
     execute: async ({ url }, _context, runtime) => {
       const response = await runtime.fetch(url, { redirect: 'manual' });
       return { upstreamStatus: response.status };

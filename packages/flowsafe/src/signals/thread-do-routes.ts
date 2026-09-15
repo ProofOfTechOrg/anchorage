@@ -58,7 +58,9 @@ import {
 } from '../approval-api/index.js';
 import {
   admitsExistingRun,
+  type D1RunExecutionIdentity,
   DoStatusError,
+  ExecutionFencedError,
   type ExecutionFenceReading,
   executionFencedResponse,
   isExecutionFenceRefusal,
@@ -68,6 +70,7 @@ import {
   type ThreadScope,
 } from '../do-runner/index.js';
 import { internalErrorResponse } from '../internal-error-response.js';
+import { positiveSafeInteger } from '../numeric-config.js';
 import {
   createScheduleAgentDispatchReceipt,
   type ScheduleAgentDispatchAction,
@@ -76,9 +79,15 @@ import {
 } from '../schedules/schedules-d1.js';
 import type { AgentScheduleTarget } from '../schedules/tick.js';
 import {
-  deferNotificationAfterFailure,
+  assertNotificationSourceKeysPatched,
+  captureNotificationDeliverySelection,
+  captureNotificationDeliveryStorage,
+  DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS,
   MAX_NOTIFICATION_DISPATCH_IDS,
+  type NotificationDeliveryObservation,
   planNotificationDispatch,
+  recordNotificationDeliveryFailure,
+  reportNotificationDeliveryError,
 } from './notification-dispatch.js';
 
 /**
@@ -300,6 +309,8 @@ export interface ThreadSignalRoutesOptions {
   resolveNotificationsStorage?: (
     scope: ThreadScope,
   ) => NotificationsStorage | Promise<NotificationsStorage>;
+  /** Failed delivery rounds before a pending notification is discarded. */
+  maxDeliveryAttempts?: number;
   /** Target-side lease and receipt store for at-least-once schedule fires. */
   resolveScheduleDispatchStore?: (
     scope: ThreadScope,
@@ -485,6 +496,10 @@ function signalContentPolicyResponse(
 export function createThreadSignalRoutes(
   options: ThreadSignalRoutesOptions,
 ): ThreadSignalRouter {
+  const maxDeliveryAttempts = positiveSafeInteger(
+    options.maxDeliveryAttempts ?? DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS,
+    'notification maximum delivery attempts',
+  );
   const {
     resolveAgent,
     resolveResourceId,
@@ -619,15 +634,64 @@ export function createThreadSignalRoutes(
       // the lanes that never reach it (the persist routes, and a default
       // non-wake delivery) ungated; handleWake keeps its own check for the
       // wake path it owns.
+      let proof: SignalProofGuard | undefined;
       if (executionFence.state === 'proof-only') {
-        const activeRunId = activeThreadRunIdOf(
-          agent,
-          threadId,
-          resourceId ?? '',
+        const runtime = scope.init.runtime;
+        const reader = (
+          agent as Agent & {
+            proofExecutionFor?: (
+              runtime: typeof scope.init.runtime,
+              threadId: string,
+              runId: string,
+            ) => Promise<D1RunExecutionIdentity | undefined>;
+          }
+        ).proofExecutionFor;
+        if (
+          !runtimeDriven ||
+          typeof reader !== 'function' ||
+          runtime.executionFence !== scope.init.executionFence
+        )
+          throw new ExecutionFencedError(executionFence.state, entryPath);
+        const capture = async (runId: string | undefined) => {
+          if (runId === undefined)
+            throw new ExecutionFencedError(executionFence.state, entryPath);
+          const execution = await Reflect.apply(reader, agent, [
+            runtime,
+            threadId,
+            runId,
+          ]);
+          if (
+            execution === undefined ||
+            !admitsExistingRun(executionFence, execution)
+          )
+            throw new ExecutionFencedError(executionFence.state, entryPath);
+          return Object.freeze({ ...execution });
+        };
+        const admitted = await capture(
+          activeThreadRunIdOf(agent, threadId, resourceId ?? ''),
         );
-        if (!admitsExistingRun(executionFence, activeRunId)) {
-          return executionFencedResponse(executionFence.state, entryPath);
-        }
+        const assertActive = (expected = admitted) => {
+          if (
+            activeThreadRunIdOf(agent, threadId, resourceId ?? '') !==
+            expected.runId
+          )
+            throw new ExecutionFencedError(executionFence.state, entryPath);
+        };
+        proof = {
+          capture,
+          async check(expected = admitted) {
+            const current = await capture(expected.runId);
+            if (
+              !admitsExistingRun(
+                { state: 'proof-only', proofExecution: expected },
+                current,
+              )
+            )
+              throw new ExecutionFencedError(executionFence.state, entryPath);
+          },
+          assertActive,
+        };
+        assertActive();
       }
       let memoryResolution: Promise<boolean> | undefined;
       const memoryAvailable: MemoryAvailable = () => {
@@ -638,12 +702,16 @@ export function createThreadSignalRoutes(
               Boolean(await agent.getMemory())
             );
           } catch {
-            console.error(
-              JSON.stringify({
-                type: 'signal-memory-resolution-failed',
-                threadId,
-              }),
-            );
+            try {
+              console.error(
+                JSON.stringify({
+                  type: 'signal-memory-resolution-failed',
+                  threadId,
+                }),
+              );
+            } catch {
+              // Diagnostics cannot change the memory fallback.
+            }
             return false;
           }
         })();
@@ -703,6 +771,7 @@ export function createThreadSignalRoutes(
             persistenceAllowed,
             memoryAvailable,
             inspectContent,
+            proof,
             executionFence,
           },
         );
@@ -716,6 +785,7 @@ export function createThreadSignalRoutes(
           persistenceAllowed,
           memoryAvailable,
           inspectContent,
+          proof,
         });
       }
       // POST /signal — a system signal (ifActive/ifIdle deliver/persist/discard/wake).
@@ -737,6 +807,7 @@ export function createThreadSignalRoutes(
             persistenceAllowed,
             memoryAvailable,
             inspectContent,
+            proof,
             executionFence,
           },
         );
@@ -773,6 +844,7 @@ export function createThreadSignalRoutes(
           store: await resolveScheduleDispatchStore(scope),
           completed: completedScheduleDispatches,
           inspectContent,
+          proof,
         });
       }
       // POST /signal/state — a durable thread-state lane (snapshot/delta).
@@ -784,6 +856,7 @@ export function createThreadSignalRoutes(
           runtimeDriven,
           memoryAvailable,
           inspectContent,
+          proof,
         });
       }
       if (requestedAgentId !== undefined) {
@@ -811,8 +884,10 @@ export function createThreadSignalRoutes(
             persistenceAllowed,
             memoryAvailable,
             storage: await resolveNotificationsStorage(scope),
+            maxDeliveryAttempts,
             agentId: requestedAgentId,
             inspectContent,
+            proof,
           }),
         );
       }
@@ -827,7 +902,7 @@ export function createThreadSignalRoutes(
             resolveNotificationsStorage
               ? () => resolveNotificationsStorage(scope)
               : undefined,
-            { persistenceAllowed, runtimeDriven, inspectContent },
+            { persistenceAllowed, runtimeDriven, inspectContent, proof },
           ),
         );
       }
@@ -873,6 +948,12 @@ export function createThreadSignalRoutes(
   };
 }
 
+interface SignalProofGuard {
+  capture(runId: string | undefined): Promise<D1RunExecutionIdentity>;
+  check(execution?: D1RunExecutionIdentity): Promise<void>;
+  assertActive(execution?: D1RunExecutionIdentity): void;
+}
+
 async function handleNotificationDispatch(options: {
   agent: Agent;
   body: Record<string, unknown>;
@@ -889,8 +970,10 @@ async function handleNotificationDispatch(options: {
   persistenceAllowed: boolean;
   memoryAvailable: MemoryAvailable;
   storage: NotificationsStorage;
+  maxDeliveryAttempts: number;
   agentId: string;
   inspectContent?: InspectSignalContent;
+  proof?: SignalProofGuard;
   /** The ONE fence reading this request took — see handleWake. */
   executionFence: ExecutionFenceReading;
 }): Promise<Response> {
@@ -933,6 +1016,7 @@ async function handleNotificationDispatch(options: {
   if (Number.isNaN(now.getTime())) {
     return json({ error: 'now must be an ISO timestamp' }, 400);
   }
+  const nowMs = now.getTime();
   const carriesBatchThreadState = Object.hasOwn(
     options.body,
     'batchThreadState',
@@ -950,33 +1034,62 @@ async function handleNotificationDispatch(options: {
     );
   }
 
-  const records: NotificationRecord[] = [];
+  assertNotificationSourceKeysPatched();
+  const deliveryStorage = captureNotificationDeliveryStorage(options.storage);
+  const selections: ReturnType<typeof captureNotificationDeliverySelection>[] =
+    [];
+  // A record settles once: an already-discarded record must not be counted
+  // twice, nor have its content-policy reason overwritten by an unrelated
+  // storage error. `recordFailure` returns early for the same reason.
+  const settled = new Set<string>();
+  let delivered = 0;
+  let failed = 0;
+  let discarded = 0;
   let skipped = 0;
+  const settle = (
+    id: string,
+    outcome: 'delivered' | 'failed' | 'discarded' | 'skipped',
+  ) => {
+    if (settled.has(id)) return;
+    settled.add(id);
+    if (outcome === 'delivered') delivered += 1;
+    else if (outcome === 'failed') failed += 1;
+    else if (outcome === 'discarded') discarded += 1;
+    else skipped += 1;
+  };
   for (const id of uniqueIds) {
-    const current = await options.storage.getNotification({
+    const current = await deliveryStorage.getNotification({
       threadId: options.threadId,
       id,
     });
     if (current?.status !== 'pending' || current.deliveredSignalId) {
-      skipped += 1;
+      settle(id, 'skipped');
       continue;
     }
     if (
+      current.id !== id ||
+      current.threadId !== options.threadId ||
       current.resourceId !== options.resourceId ||
       current.agentId !== options.agentId
     ) {
       return json({ error: 'notification binding does not match' }, 404);
     }
-    const due =
-      (current.deliverAt !== undefined &&
-        current.deliverAt.getTime() <= now.getTime()) ||
-      (current.summaryAt !== undefined &&
-        current.summaryAt.getTime() <= now.getTime());
-    if (!due) {
-      skipped += 1;
-      continue;
+    try {
+      const selection = captureNotificationDeliverySelection(current);
+      const { record } = selection;
+      const due =
+        (record.deliverAt !== undefined &&
+          record.deliverAt.getTime() <= nowMs) ||
+        (record.summaryAt !== undefined && record.summaryAt.getTime() <= nowMs);
+      if (!due) {
+        settle(id, 'skipped');
+        continue;
+      }
+      selections.push(selection);
+    } catch (error) {
+      settle(id, 'failed');
+      reportNotificationDeliveryError(error);
     }
-    records.push(current);
   }
 
   const batchThreadState: 'active' | 'idle' =
@@ -988,29 +1101,36 @@ async function handleNotificationDispatch(options: {
         ? 'active'
         : 'idle';
 
-  let delivered = 0;
-  let failed = 0;
-  let discarded = 0;
-  // Records whose terminal discard is already durable. A later throw in the
-  // same group funnels the group into `updateFailure`; without this, an
-  // already-discarded record would be counted twice and have its
-  // content-policy reason overwritten by an unrelated storage error.
-  const settledDiscards = new Set<string>();
-  const updateFailure = async (record: NotificationRecord, error: unknown) => {
-    if (settledDiscards.has(record.id)) return;
-    failed += 1;
-    await deferNotificationAfterFailure(options.storage, record, now, error);
+  const recordFailure = async (
+    expected: NotificationDeliveryObservation | undefined,
+    action: { type: 'failure'; error: unknown } | { type: 'exhausted' },
+  ) => {
+    if (action.type === 'failure' && isExecutionFenceRefusal(action.error))
+      throw action.error;
+    if (!expected) throw new Error('notification observation is unavailable');
+    if (settled.has(expected.id)) return;
+    await options.proof?.check();
+    options.proof?.assertActive();
+    const outcome = await recordNotificationDeliveryFailure(
+      deliveryStorage,
+      expected,
+      new Date(nowMs),
+      options.maxDeliveryAttempts,
+      action,
+    );
+    settle(expected.id, outcome === 'discarded' ? 'discarded' : 'failed');
   };
   const discardAfterDenial = async (record: NotificationRecord) => {
+    await options.proof?.check();
+    options.proof?.assertActive();
     await options.storage.updateNotification({
       id: record.id,
       threadId: record.threadId,
       status: 'discarded',
       deliveryReason: 'content-policy-denied',
-      lastDeliveryAttemptAt: now,
+      lastDeliveryAttemptAt: new Date(nowMs),
     });
-    settledDiscards.add(record.id);
-    discarded += 1;
+    settle(record.id, 'discarded');
   };
   const inspect = async (
     signal: AgentSignal,
@@ -1038,6 +1158,7 @@ async function handleNotificationDispatch(options: {
       startIdleRun: options.startIdleRun,
       serializeWake: options.serializeWake,
       executionFence: options.executionFence,
+      proof: options.proof,
       blockingRun: durableBlockingRun
         ? () => durableBlockingRun
         : options.blockingRun,
@@ -1064,8 +1185,11 @@ async function handleNotificationDispatch(options: {
           ifIdle: { behavior: 'persist' },
         }),
     });
-    if (!response.ok)
+    if (!response.ok) {
+      if (options.executionFence.state === 'proof-only')
+        throw new ExecutionFencedError('proof-only', 'notification signal');
       throw new Error(`notification signal returned ${response.status}`);
+    }
     const result = (await response.json()) as {
       signalId?: string;
       decision?: unknown;
@@ -1092,6 +1216,8 @@ async function handleNotificationDispatch(options: {
     if (!(await options.memoryAvailable())) {
       throw new Error('signal persistence requires agent memory');
     }
+    await options.proof?.check();
+    options.proof?.assertActive();
     const result = options.agent.sendSignal(signal, {
       threadId: options.threadId,
       resourceId,
@@ -1103,12 +1229,22 @@ async function handleNotificationDispatch(options: {
     return result.signal.id;
   };
 
+  const records: NotificationRecord[] = [];
+  const observations = new Map<string, NotificationDeliveryObservation>();
+  for (const { record, expected } of selections) {
+    if (expected.deliveryAttempts >= options.maxDeliveryAttempts) {
+      await recordFailure(expected, { type: 'exhausted' });
+      continue;
+    }
+    records.push(record);
+    observations.set(record.id, expected);
+  }
+
   for (const item of planNotificationDispatch(records, now)) {
     if (item.type === 'summary') {
-      // Everything from rendering onward stays inside this try: a storage
-      // failure in the discard/failure bookkeeping below must be contained to
-      // this group, exactly as the individual branch contains its own, rather
-      // than escaping and abandoning the rest of the plan.
+      // A summary group's failure, from rendering through bookkeeping, is
+      // contained to this group rather than escaping and abandoning the rest
+      // of the plan.
       try {
         const signal = createNotificationSummarySignal(
           summarizeNotifications(item.records),
@@ -1120,10 +1256,10 @@ async function handleNotificationDispatch(options: {
         }
         if (inspection === 'error') {
           for (const record of item.records) {
-            await updateFailure(
-              record,
-              new Error('signal content policy failed'),
-            );
+            await recordFailure(observations.get(record.id), {
+              type: 'failure',
+              error: new Error('signal content policy failed'),
+            });
           }
           continue;
         }
@@ -1135,42 +1271,64 @@ async function handleNotificationDispatch(options: {
             ? await persistWithoutWake(signal)
             : await send(signal);
         for (const record of item.records) {
+          await options.proof?.check();
+          options.proof?.assertActive();
           await options.storage.updateNotification({
             id: record.id,
             threadId: record.threadId,
             summaryAt: null,
             summarySignalId: signalId,
-            lastDeliveryAttemptAt: now,
+            lastDeliveryAttemptAt: new Date(nowMs),
           });
-          delivered += 1;
+          settle(record.id, 'delivered');
         }
       } catch (error) {
-        for (const record of item.records) await updateFailure(record, error);
+        for (const record of item.records) {
+          await recordFailure(observations.get(record.id), {
+            type: 'failure',
+            error,
+          });
+        }
       }
       continue;
     }
 
     const selected = item.record;
+    let expected = observations.get(selected.id);
     try {
-      const record = await options.storage.getNotification({
+      const current = await deliveryStorage.getNotification({
         threadId: selected.threadId,
         id: selected.id,
       });
+      if (
+        current?.status !== 'pending' ||
+        current.deliveredSignalId ||
+        current.id !== selected.id ||
+        current.threadId !== options.threadId ||
+        current.resourceId !== resourceId ||
+        current.agentId !== options.agentId
+      ) {
+        settle(selected.id, 'skipped');
+        continue;
+      }
+      // Clearing the pre-read observation keeps a failure between here and the
+      // re-capture from being recorded against stale state.
+      expected = undefined;
+      const selection = captureNotificationDeliverySelection(current);
+      const { record } = selection;
+      expected = selection.expected;
       const summaryDue = Boolean(
-        record?.summaryAt && record.summaryAt.getTime() <= now.getTime(),
+        record.summaryAt && record.summaryAt.getTime() <= nowMs,
       );
       const deliveryDue = Boolean(
-        record?.deliverAt && record.deliverAt.getTime() <= now.getTime(),
+        record.deliverAt && record.deliverAt.getTime() <= nowMs,
       );
-      if (
-        record?.status !== 'pending' ||
-        record.deliveredSignalId ||
-        record.resourceId !== resourceId ||
-        record.agentId !== options.agentId ||
-        summaryDue ||
-        !deliveryDue
-      ) {
-        skipped += 1;
+      if (summaryDue || !deliveryDue) {
+        settle(selected.id, 'skipped');
+        continue;
+      }
+      if (expected.deliveryAttempts >= options.maxDeliveryAttempts) {
+        await recordFailure(expected, { type: 'exhausted' });
         continue;
       }
       if (
@@ -1178,13 +1336,13 @@ async function handleNotificationDispatch(options: {
         record.summarySignalId &&
         batchThreadState === 'active'
       ) {
-        skipped += 1;
+        settle(selected.id, 'skipped');
         continue;
       }
       const signal = createNotificationSignal({
         ...record,
         status: 'delivered',
-        deliveredAt: now,
+        deliveredAt: new Date(nowMs),
       });
       const inspection = await inspect(signal);
       if (inspection === 'denied') {
@@ -1192,20 +1350,30 @@ async function handleNotificationDispatch(options: {
         continue;
       }
       if (inspection === 'error') {
-        await updateFailure(record, new Error('signal content policy failed'));
+        await recordFailure(expected, {
+          type: 'failure',
+          error: new Error('signal content policy failed'),
+        });
         continue;
       }
       const signalId = await send(signal);
+      await options.proof?.check();
+      options.proof?.assertActive();
       await options.storage.updateNotification({
         id: record.id,
         threadId: record.threadId,
         status: 'delivered',
         deliveredSignalId: signalId,
-        lastDeliveryAttemptAt: now,
+        lastDeliveryAttemptAt: new Date(nowMs),
       });
-      delivered += 1;
+      settle(record.id, 'delivered');
     } catch (error) {
-      await updateFailure(selected, error);
+      if (isExecutionFenceRefusal(error)) throw error;
+      if (expected) await recordFailure(expected, { type: 'failure', error });
+      else {
+        settle(selected.id, 'failed');
+        reportNotificationDeliveryError(error);
+      }
     }
   }
 
@@ -1357,6 +1525,7 @@ async function handleWake(options: {
    * exactly what proof-only admits by.
    */
   executionFence: ExecutionFenceReading;
+  proof?: SignalProofGuard;
   deliverActive(runId: string, memoryAvailable: boolean): WakeDelivery;
   persist(): WakeDelivery;
 }): Promise<Response> {
@@ -1378,9 +1547,12 @@ async function handleWake(options: {
     // what the drain is waiting for — and in proof-only it is admitted only
     // for the nominated run. The check sits after the principal gate so a
     // fenced deployment leaks nothing a permitted caller could not see.
-    if (activeRunId && !admitsExistingRun(fence, activeRunId)) {
-      return executionFencedResponse(fence.state, 'signal delivery');
-    }
+    const admitted =
+      fence.state === 'proof-only'
+        ? await options.proof?.capture(activeRunId)
+        : undefined;
+    if (fence.state === 'proof-only' && admitted === undefined)
+      throw new ExecutionFencedError(fence.state, 'signal delivery');
     if (activeRunId) {
       if (durableBlockingRun && durableBlockingRun.runId !== activeRunId) {
         return json({
@@ -1393,6 +1565,8 @@ async function handleWake(options: {
         });
       }
       const memoryAvailable = await options.memoryAvailable();
+      await options.proof?.check(admitted);
+      options.proof?.assertActive(admitted);
       const delivered = options.deliverActive(activeRunId, memoryAvailable);
       const decision = await delivered.accepted;
       if (delivered.persisted) await delivered.persisted;
@@ -1595,6 +1769,7 @@ async function handleScheduleSignal(options: {
   store: ScheduleSignalDispatchStore;
   completed: Map<string, ScheduleAgentDispatchReceipt>;
   inspectContent?: InspectSignalContent;
+  proof?: SignalProofGuard;
   /** The ONE fence reading this request took — see handleWake. */
   executionFence: ExecutionFenceReading;
 }): Promise<Response> {
@@ -1625,6 +1800,8 @@ async function handleScheduleSignal(options: {
     const receipt = createScheduleAgentDispatchReceipt('discard', {
       signalId: dispatchId,
     });
+    await options.proof?.check();
+    options.proof?.assertActive();
     options.completed.set(dispatchId, receipt);
     await options.store.settle(scheduleId, dispatchId, receipt);
     options.completed.delete(dispatchId);
@@ -1633,10 +1810,14 @@ async function handleScheduleSignal(options: {
 
   const completed = options.completed.get(dispatchId);
   if (completed) {
+    await options.proof?.check();
+    options.proof?.assertActive();
     await options.store.settle(scheduleId, dispatchId, completed);
     options.completed.delete(dispatchId);
     return json({ receipt: completed });
   }
+  await options.proof?.check();
+  options.proof?.assertActive();
   const state = await options.store.begin(scheduleId, dispatchId);
   if (state.state === 'missing') {
     return json({ error: 'schedule dispatch not found' }, 404);
@@ -1660,6 +1841,8 @@ async function handleScheduleSignal(options: {
       runId: recoveredRun.runId,
       signalId: dispatchId,
     };
+    await options.proof?.check();
+    options.proof?.assertActive();
     options.completed.set(dispatchId, receipt);
     await options.store.settle(scheduleId, dispatchId, receipt);
     options.completed.delete(dispatchId);
@@ -1677,6 +1860,8 @@ async function handleScheduleSignal(options: {
       runId: durableBlockingRun.runId,
       signalId: dispatchId,
     };
+    await options.proof?.check();
+    options.proof?.assertActive();
     options.completed.set(dispatchId, receipt);
     await options.store.settle(scheduleId, dispatchId, receipt);
     options.completed.delete(dispatchId);
@@ -1698,14 +1883,18 @@ async function handleScheduleSignal(options: {
   ) {
     // The operator has to be able to find the broken schedule; the offending
     // name itself stays out of the log.
-    console.error(
-      JSON.stringify({
-        type: 'schedule-target-unrenderable',
-        scheduleId,
-        dispatchId,
-        agentId: target.agentId,
-      }),
-    );
+    try {
+      console.error(
+        JSON.stringify({
+          type: 'schedule-target-unrenderable',
+          scheduleId,
+          dispatchId,
+          agentId: target.agentId,
+        }),
+      );
+    } catch {
+      // Diagnostics cannot prevent terminal settlement.
+    }
     return await settleDiscard();
   }
 
@@ -1845,6 +2034,7 @@ async function handleScheduleSignal(options: {
       startIdleRun: options.startIdleRun,
       serializeWake: options.serializeWake,
       executionFence: options.executionFence,
+      proof: options.proof,
       blockingRun: durableBlockingRun
         ? () => durableBlockingRun
         : options.blockingRun,
@@ -1881,6 +2071,8 @@ async function handleScheduleSignal(options: {
     signalId =
       typeof payload.signalId === 'string' ? payload.signalId : undefined;
   } else {
+    await options.proof?.check();
+    options.proof?.assertActive();
     const sent = options.agent.sendSignal(deliverableSignal, signalTarget);
     decision = await sent.accepted;
     const action = recordValue(decision)?.action;
@@ -1899,6 +2091,8 @@ async function handleScheduleSignal(options: {
   if (!receipt) {
     throw new Error('agent schedule returned an invalid signal decision');
   }
+  await options.proof?.check();
+  options.proof?.assertActive();
   options.completed.set(dispatchId, receipt);
   await options.store.settle(scheduleId, dispatchId, receipt);
   options.completed.delete(dispatchId);
@@ -1934,6 +2128,7 @@ async function handleMessage(
     persistenceAllowed: boolean;
     memoryAvailable: MemoryAvailable;
     inspectContent: InspectSignalContent | undefined;
+    proof?: SignalProofGuard;
     /** The ONE fence reading this request took — see handleWake. */
     executionFence: ExecutionFenceReading;
   },
@@ -1986,6 +2181,7 @@ async function handleMessage(
       startIdleRun,
       serializeWake,
       executionFence: options.executionFence,
+      proof: options.proof,
       blockingRun: durableBlockingRun
         ? () => durableBlockingRun
         : options.blockingRun,
@@ -2019,6 +2215,8 @@ async function handleMessage(
     return persistenceForbiddenResponse({ capped: false });
   }
   const memoryAvailable = await options.memoryAvailable();
+  await options.proof?.check();
+  options.proof?.assertActive();
   const result = agent.sendMessage(message, {
     threadId,
     resourceId,
@@ -2051,6 +2249,7 @@ async function handleQueue(
     persistenceAllowed: boolean;
     memoryAvailable: MemoryAvailable;
     inspectContent: InspectSignalContent | undefined;
+    proof?: SignalProofGuard;
   },
 ): Promise<Response> {
   if (!isContents(body.contents)) {
@@ -2083,6 +2282,8 @@ async function handleQueue(
   );
   if (policyRefusal) return policyRefusal;
   if (!(await options.memoryAvailable())) return memoryUnavailableResponse();
+  await options.proof?.check();
+  options.proof?.assertActive();
   const result = agent.sendMessage(message, {
     threadId,
     resourceId,
@@ -2111,6 +2312,7 @@ async function handleSignal(
     persistenceAllowed: boolean;
     memoryAvailable: MemoryAvailable;
     inspectContent: InspectSignalContent | undefined;
+    proof?: SignalProofGuard;
     /** The ONE fence reading this request took — see handleWake. */
     executionFence: ExecutionFenceReading;
   },
@@ -2166,6 +2368,8 @@ async function handleSignal(
     if (!isPathSafeId(runId)) {
       throw new Error('thread signal generated a non-path-safe run id');
     }
+    await options.proof?.check();
+    options.proof?.assertActive();
     const result = agent.sendSignal(signal, {
       threadId,
       runId,
@@ -2188,6 +2392,7 @@ async function handleSignal(
       startIdleRun,
       serializeWake,
       executionFence: options.executionFence,
+      proof: options.proof,
       blockingRun: durableBlockingRun
         ? () => durableBlockingRun
         : options.blockingRun,
@@ -2223,6 +2428,8 @@ async function handleSignal(
   const memoryAvailable = await options.memoryAvailable();
   const wasActive =
     activeThreadRunIdOf(agent, threadId, resourceId) !== undefined;
+  await options.proof?.check();
+  options.proof?.assertActive();
   const result = agent.sendSignal(signal, {
     threadId,
     resourceId,
@@ -2267,6 +2474,7 @@ async function handleState(
     runtimeDriven: boolean;
     memoryAvailable: MemoryAvailable;
     inspectContent: InspectSignalContent | undefined;
+    proof?: SignalProofGuard;
   },
 ): Promise<Response> {
   if (typeof body.id !== 'string' || typeof body.cacheKey !== 'string') {
@@ -2321,6 +2529,8 @@ async function handleState(
   );
   if (policyRefusal) return policyRefusal;
   if (!(await options.memoryAvailable())) return memoryUnavailableResponse();
+  await options.proof?.check();
+  options.proof?.assertActive();
   const result = await agent.sendStateSignal(state, {
     threadId,
     resourceId,
@@ -2357,6 +2567,7 @@ async function handleNotification(
     persistenceAllowed: boolean;
     runtimeDriven: boolean;
     inspectContent: InspectSignalContent | undefined;
+    proof?: SignalProofGuard;
   },
 ): Promise<Response> {
   if (
@@ -2409,6 +2620,14 @@ async function handleNotification(
       409,
     );
   }
+  // Ingestion reaches core's patched functions below — the content-policy gate
+  // renders a prospective summary through summarizeNotifications, and core's
+  // inline sender resolves the configured source delivery policy — so the
+  // refusal sits above the branches rather than beside a single reach. It
+  // refuses the record-only branch as well, which a deployment that ingests
+  // here and delegates dispatch elsewhere pays. The route's catch answers 502
+  // with the message on the server log.
+  assertNotificationSourceKeysPatched();
   // This gate is AUTHORITATIVE, not a preview: core can send an individual or
   // summary signal before the record reaches the dispatcher's second gate.
   // Storage owns the id, timestamps, and coalescing, so inspect a prospective
@@ -2454,6 +2673,8 @@ async function handleNotification(
     if (!storage) {
       return json({ error: 'notifications storage unavailable' }, 409);
     }
+    await options.proof?.check();
+    options.proof?.assertActive();
     const record = await storage.createNotification({
       ...notification,
       threadId,
@@ -2466,6 +2687,8 @@ async function handleNotification(
       delivery: { action: 'deferred', reason: 'dispatcher' },
     });
   }
+  await options.proof?.check();
+  options.proof?.assertActive();
   const result = await agent.sendNotificationSignal(notification, {
     threadId,
     resourceId,

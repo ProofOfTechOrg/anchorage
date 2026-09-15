@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   type EgressDenial,
   EgressDeniedError,
+  EgressGuardError,
   egressFetch,
 } from './egress-fetch.js';
 
@@ -49,6 +50,230 @@ function baseFetch(...responses: StubResponse[]) {
 function hopHeaders(call: BaseCall): { get(name: string): string | null } {
   return call.init?.headers as { get(name: string): string | null };
 }
+
+describe('egress decision metadata', () => {
+  it.each([
+    {
+      input: { url: 'https://api.example.com/private?secret=hidden' },
+      code: 'EGRESS_INPUT_INVALID',
+      host: null,
+    },
+    { input: '/private?secret=hidden', code: 'EGRESS_URL_INVALID', host: null },
+    {
+      input: 'ftp://api.example.com/private?secret=hidden',
+      code: 'EGRESS_SCHEME_NOT_ALLOWED',
+      host: 'api.example.com',
+    },
+    {
+      input: 'data:text/plain,hidden',
+      code: 'EGRESS_SCHEME_NOT_ALLOWED',
+      host: '',
+    },
+    {
+      input: 'https://EVIL.EXAMPLE.ORG./private?secret=hidden',
+      code: 'EGRESS_HOST_NOT_DECLARED',
+      host: 'evil.example.org',
+      legacyHost: 'evil.example.org.',
+    },
+    {
+      input: 'https://[::1]/private?secret=hidden',
+      code: 'EGRESS_HOST_NOT_DECLARED',
+      host: '[::1]',
+    },
+    {
+      input: 'https://_service.example.com/private?secret=hidden',
+      code: 'EGRESS_HOST_NOT_DECLARED',
+      host: '_service.example.com',
+    },
+    {
+      input: 'https://a!b.example.com/private?secret=hidden',
+      code: 'EGRESS_HOST_NOT_DECLARED',
+      host: 'a!b.example.com',
+    },
+    {
+      input: 'https://-host.example.com/private?secret=hidden',
+      code: 'EGRESS_HOST_NOT_DECLARED',
+      host: '-host.example.com',
+    },
+    {
+      input: 'https://foo../private?secret=hidden',
+      code: 'EGRESS_HOST_NOT_DECLARED',
+      host: 'foo.',
+      legacyHost: 'foo..',
+    },
+    {
+      input: 'custom://%F0%9F%8C%90/private?secret=hidden',
+      code: 'EGRESS_SCHEME_NOT_ALLOWED',
+      host: '%f0%9f%8c%90',
+      legacyHost: '%F0%9F%8C%90',
+    },
+  ])('classifies $input as $code without fetching', async ({
+    input,
+    code,
+    host,
+    legacyHost,
+  }) => {
+    const { fn, calls } = baseFetch();
+    const guarded = egressFetch(['api.example.com'], { fetch: fn });
+
+    const failure = await guarded(input as string).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(EgressDeniedError);
+    expect(failure).toMatchObject({
+      kind: 'egress-denied',
+      host: legacyHost ?? host,
+      code,
+      policyKind: 'egress-fetch',
+      retryable: false,
+      details: { host, hop: 0 },
+    });
+    expect(JSON.stringify(failure)).not.toContain('hidden');
+    expect(calls).toHaveLength(0);
+  });
+
+  it.each([
+    {
+      location: 'https://[invalid/private?secret=hidden',
+      code: 'EGRESS_REDIRECT_URL_INVALID',
+      host: null,
+    },
+    {
+      location: 'ftp://api.example.com/private?secret=hidden',
+      code: 'EGRESS_REDIRECT_SCHEME_NOT_ALLOWED',
+      host: 'api.example.com',
+    },
+    {
+      location: 'https://evil.example.org/private?secret=hidden',
+      code: 'EGRESS_REDIRECT_HOST_DENIED',
+      host: 'evil.example.org',
+    },
+  ])('classifies $code and releases the redirect before refusing its request', async ({
+    location,
+    code,
+    host,
+  }) => {
+    const cancel = vi.fn(() => Promise.resolve());
+    const { fn, calls } = baseFetch(
+      stubResponse(302, { location }, { cancel }),
+    );
+    const guarded = egressFetch(['api.example.com'], { fetch: fn });
+
+    const failure = await guarded('https://api.example.com/start').catch(
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(EgressDeniedError);
+    expect(failure).toMatchObject({
+      code,
+      policyKind: 'egress-fetch',
+      retryable: false,
+      details: { host, hop: 1 },
+    });
+    expect(JSON.stringify(failure)).not.toContain('hidden');
+    expect(calls).toHaveLength(1);
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    {
+      status: 0,
+      maxRedirects: 20,
+      body: undefined,
+      code: 'EGRESS_REDIRECT_UNVERIFIABLE',
+      message:
+        'egressFetch: received an opaque redirect (status 0) whose Location cannot be read — this guard cannot verify the hop, so it fails closed; on a browser use redirect: "manual" and handle the 3xx yourself',
+    },
+    {
+      status: 302,
+      maxRedirects: 0,
+      body: undefined,
+      code: 'EGRESS_REDIRECT_LIMIT_EXCEEDED',
+      message: 'egressFetch: exceeded 0 redirects',
+    },
+    {
+      status: 307,
+      maxRedirects: 20,
+      body: { getReader: () => ({}) },
+      code: 'EGRESS_REDIRECT_BODY_UNREPLAYABLE',
+      message:
+        'egressFetch: cannot follow a redirect that re-sends a one-shot (stream) body — buffer the body or handle the 3xx with redirect: "manual"',
+    },
+  ])('keeps the TypeError message for $code with no next request', async ({
+    status,
+    maxRedirects,
+    body,
+    code,
+    message,
+  }) => {
+    const cancel = vi.fn(() => Promise.resolve());
+    const { fn, calls } = baseFetch(
+      stubResponse(status, { location: '/next?secret=hidden' }, { cancel }),
+    );
+    const guarded = egressFetch(['api.example.com'], {
+      fetch: fn,
+      maxRedirects,
+    });
+
+    const failure = await guarded('https://api.example.com/start', {
+      method: 'POST',
+      body,
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(TypeError);
+    expect(failure).toBeInstanceOf(EgressGuardError);
+    expect(failure).toMatchObject({
+      kind: 'egress-guard',
+      message,
+      code,
+      policyKind: 'egress-fetch',
+      retryable: false,
+      details: { host: 'api.example.com', hop: 1 },
+    });
+    expect(JSON.stringify(failure)).not.toContain('hidden');
+    expect(calls).toHaveLength(1);
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it('classifies opaque redirects after an allowed hop and disposes both responses', async () => {
+    const cancel = vi.fn(() => Promise.resolve());
+    const { fn, calls } = baseFetch(
+      stubResponse(302, { location: '/next' }, { cancel }),
+      stubResponse(0, {}, { cancel }),
+    );
+
+    await expect(
+      egressFetch(['api.example.com'], { fetch: fn })(
+        'https://api.example.com/start',
+      ),
+    ).rejects.toMatchObject({
+      code: 'EGRESS_REDIRECT_UNVERIFIABLE',
+      retryable: false,
+      details: { host: 'api.example.com', hop: 2 },
+    });
+    expect(calls).toHaveLength(2);
+    expect(cancel).toHaveBeenCalledTimes(2);
+  });
+
+  it('retains legacy standalone construction and copies safe details', () => {
+    const denial = { host: 'api.example.com', hop: 0, reason: 'custom reason' };
+    const error = new EgressDeniedError(denial);
+    denial.host = 'changed.example.com';
+
+    expect(error).toMatchObject({
+      message: 'egress denied: custom reason',
+      host: 'api.example.com',
+      hop: 0,
+      reason: 'custom reason',
+      code: 'EGRESS_DENIED',
+      policyKind: 'egress-fetch',
+      retryable: false,
+      details: { host: 'api.example.com', hop: 0 },
+    });
+    expect(Object.isFrozen(error.details)).toBe(true);
+  });
+});
 
 describe('egressFetch construction', () => {
   it('rejects allowlist entries that are not bare hostnames', () => {
@@ -516,11 +741,31 @@ describe('egressFetch seams', () => {
     );
     expect(denials).toEqual([
       {
+        code: 'EGRESS_HOST_NOT_DECLARED',
         host: 'evil.example.org',
         reason: "host 'evil.example.org' is not in the allowed egress hosts",
         hop: 0,
       },
     ]);
+  });
+
+  it('preserves a frozen custom mapper error without adding metadata', async () => {
+    const mapped = Object.freeze(new Error('mapper-owned error'));
+    const { fn, calls } = baseFetch();
+    const denied = vi.fn((_denial: EgressDenial) => mapped);
+    const guarded = egressFetch(['api.example.com'], { fetch: fn, denied });
+
+    await expect(guarded('https://evil.example.org/')).rejects.toBe(mapped);
+
+    expect(denied).toHaveBeenCalledWith({
+      code: 'EGRESS_HOST_NOT_DECLARED',
+      host: 'evil.example.org',
+      reason: "host 'evil.example.org' is not in the allowed egress hosts",
+      hop: 0,
+    });
+    expect(mapped).not.toHaveProperty('code');
+    expect(mapped).not.toHaveProperty('details');
+    expect(calls).toHaveLength(0);
   });
 
   it('defaults the base to the global fetch and fails loudly without one', async () => {

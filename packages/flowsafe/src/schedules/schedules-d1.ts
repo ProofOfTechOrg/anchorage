@@ -34,6 +34,7 @@ import {
   type ScheduleTriggerListOptions,
   type ScheduleUpdate,
 } from '@mastra/core/storage';
+import { EXECUTION_FENCE_TABLE } from '#deployment-identity-protocol';
 import {
   APPROVAL_ROLES,
   canonicalResourceOwner,
@@ -41,6 +42,22 @@ import {
   RESOURCE_OWNERSHIP_TABLE,
   type ResourceOwner,
 } from '../approval-api/index.js';
+import {
+  assertMutationEpoch,
+  ExecutionFenceUnreadableError,
+  type MutationEpochContext,
+  normalizeMutationEpoch,
+} from '../do-runner/execution-admission.js';
+import {
+  admitsWorkAuthoring,
+  captureExecutionFenceAdmissionSchema,
+  decodeExecutionFenceAdmissionRow,
+  type ExecutionFenceAdmissionObservation,
+  ExecutionFencedError,
+  ExecutionFenceStore,
+  executionFenceAdmissionSql,
+  executionFenceAdmissionValues,
+} from '../do-runner/execution-fence.js';
 import { isPathSafeId } from '../do-runner/path-safe-id.js';
 import { validateTablePrefix } from '../do-runner/table-prefix.js';
 
@@ -51,6 +68,13 @@ import {
   type SignalDatabase,
   type SignalStatement,
 } from '../signals/d1-shared.js';
+import {
+  FENCED_SCHEDULE_STORAGE,
+  type FencedScheduleMutationCapability,
+  ScheduleMutationConflictError,
+  ScheduleMutationOutcomeUnknownError,
+  type ScheduleResumeMutation,
+} from './mutation-contract.js';
 import type { AuthorizedSchedule } from './target-policy.js';
 
 // The D1 seam + column helpers are Track C's canonical shared leaf
@@ -185,6 +209,285 @@ interface ScheduleTriggerRow {
   metadata: string | null;
 }
 
+const SCHEDULE_COLUMNS = [
+  'id',
+  'target',
+  'cron',
+  'timezone',
+  'status',
+  'nextFireAt',
+  'lastFireAt',
+  'lastRunId',
+  'createdAt',
+  'updatedAt',
+  'metadata',
+  'ownerType',
+  'ownerId',
+  'creatorRole',
+] as const;
+
+type ScheduleMutationOperation =
+  | 'create'
+  | 'update'
+  | 'pause'
+  | 'resume'
+  | 'delete';
+
+interface PreparedScheduleMutation {
+  epoch: number | undefined;
+  operation: ScheduleMutationOperation;
+  semantic: readonly unknown[];
+  schema: string;
+  bindings: unknown[];
+}
+
+interface ScheduleStatementResult {
+  rows: Record<string, unknown>[];
+  hasChanges: boolean;
+  changes: unknown;
+}
+
+function mutationUnknown(cause: unknown): ScheduleMutationOutcomeUnknownError {
+  return new ScheduleMutationOutcomeUnknownError({ cause });
+}
+
+function mutationRecord(value: unknown): Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('schedule mutation result is malformed');
+  }
+  return value as Record<string, unknown>;
+}
+
+function captureScheduleResult(value: unknown): ScheduleStatementResult {
+  const result = mutationRecord(value);
+  if ('success' in result && result.success !== true) {
+    throw new Error('schedule mutation statement did not succeed');
+  }
+  const rows = result.results;
+  if (!Array.isArray(rows))
+    throw new Error('schedule mutation rows are missing');
+  const captured = Array.from({ length: rows.length }, (_, index) => {
+    if (!Object.hasOwn(rows, index))
+      throw new Error('schedule mutation row is missing');
+    const row = mutationRecord(rows[index]);
+    return Object.freeze(
+      Object.fromEntries(
+        Object.getOwnPropertyNames(row).map((key) => [key, row[key]]),
+      ),
+    );
+  });
+  const meta = 'meta' in result ? mutationRecord(result.meta) : undefined;
+  const hasChanges = meta !== undefined && 'changes' in meta;
+  return {
+    rows: captured,
+    hasChanges,
+    changes: hasChanges ? meta.changes : undefined,
+  };
+}
+
+function captureScheduleBatch(
+  value: unknown,
+  length: number,
+): ScheduleStatementResult[] {
+  if (!Array.isArray(value) || value.length !== length) {
+    throw new Error('schedule mutation batch cardinality is invalid');
+  }
+  return Array.from({ length }, (_, index) => {
+    if (!Object.hasOwn(value, index))
+      throw new Error('schedule mutation result is missing');
+    return captureScheduleResult(value[index]);
+  });
+}
+
+function scheduleChanges(
+  result: ScheduleStatementResult | undefined,
+  returning: boolean,
+): number {
+  if (!result) throw new Error('schedule mutation result is missing');
+  const { rows, hasChanges, changes } = result;
+  if (
+    (returning && rows.length > 1) ||
+    (!returning && (rows.length !== 0 || !hasChanges)) ||
+    (hasChanges &&
+      (typeof changes !== 'number' ||
+        !Number.isSafeInteger(changes) ||
+        changes < 0 ||
+        (returning && changes !== rows.length)))
+  )
+    throw new Error('schedule mutation changes contradict its evidence');
+  return returning ? rows.length : (changes as number);
+}
+
+function singleScheduleRow(
+  result: ScheduleStatementResult | undefined,
+): Record<string, unknown> | undefined {
+  if (!result) throw new Error('schedule mutation result is missing');
+  if (result.rows.length > 1)
+    throw new Error('schedule mutation returned multiple rows');
+  return result.rows[0];
+}
+
+function sameScheduleFields(
+  row: Record<string, unknown>,
+  expected: Record<string, unknown>,
+): boolean {
+  return Object.entries(expected).every(
+    ([key, value]) => Object.hasOwn(row, key) && row[key] === value,
+  );
+}
+
+function requireScheduleFields(
+  row: Record<string, unknown> | undefined,
+  expected: Record<string, unknown>,
+): asserts row is Record<string, unknown> {
+  if (!row || !sameScheduleFields(row, expected)) {
+    throw new Error('schedule mutation returned a different row');
+  }
+}
+
+function mutationScheduleRow(row: Record<string, unknown>): ScheduleRow {
+  const text = ['id', 'target', 'cron', 'status'];
+  const nullableText = [
+    'timezone',
+    'lastRunId',
+    'metadata',
+    'ownerType',
+    'ownerId',
+    'creatorRole',
+  ];
+  const numeric = ['nextFireAt', 'createdAt', 'updatedAt'];
+  const nullableNumeric = ['lastFireAt', 'deletionRequestedAt'];
+  if (
+    text.some((key) => typeof row[key] !== 'string') ||
+    nullableText.some(
+      (key) => row[key] !== null && typeof row[key] !== 'string',
+    ) ||
+    numeric.some(
+      (key) => typeof row[key] !== 'number' || !Number.isFinite(row[key]),
+    ) ||
+    nullableNumeric.some(
+      (key) =>
+        row[key] !== null &&
+        (typeof row[key] !== 'number' || !Number.isFinite(row[key])),
+    )
+  ) {
+    throw new Error('schedule mutation row is malformed');
+  }
+  return row as unknown as ScheduleRow;
+}
+
+function captureSchedule(schedule: Schedule): ScheduleRow {
+  const {
+    id,
+    target,
+    cron,
+    timezone,
+    status,
+    nextFireAt,
+    lastFireAt,
+    lastRunId,
+    createdAt,
+    updatedAt,
+    metadata,
+    ownerType,
+    ownerId,
+    creatorRole,
+  } = schedule as Schedule & { creatorRole?: string };
+  return {
+    id,
+    target: JSON.stringify(target),
+    cron,
+    timezone: timezone ?? null,
+    status,
+    nextFireAt,
+    lastFireAt: lastFireAt ?? null,
+    lastRunId: lastRunId ?? null,
+    createdAt,
+    updatedAt,
+    metadata: jsonOrNull(metadata),
+    ownerType: ownerType ?? null,
+    ownerId: ownerId ?? null,
+    creatorRole: creatorRole ?? null,
+    deletionRequestedAt: null,
+  };
+}
+
+function captureSchedulePatch(patch: ScheduleUpdate): Partial<ScheduleRow> {
+  const {
+    cron,
+    timezone,
+    status,
+    nextFireAt,
+    metadata,
+    target,
+    ownerType,
+    ownerId,
+  } = patch;
+  return {
+    updatedAt: Date.now(),
+    ...(cron !== undefined ? { cron } : {}),
+    ...(timezone !== undefined ? { timezone: timezone ?? null } : {}),
+    ...(status !== undefined ? { status } : {}),
+    ...(nextFireAt !== undefined ? { nextFireAt } : {}),
+    ...(metadata !== undefined ? { metadata: jsonOrNull(metadata) } : {}),
+    ...(target !== undefined ? { target: JSON.stringify(target) } : {}),
+    ...(ownerType !== undefined ? { ownerType: ownerType ?? null } : {}),
+    ...(ownerId !== undefined ? { ownerId: ownerId ?? null } : {}),
+  };
+}
+
+function requiresOpenFence(operation: ScheduleMutationOperation): boolean {
+  return (
+    operation === 'create' || operation === 'update' || operation === 'resume'
+  );
+}
+
+function scheduleMutationGuard(prepared: PreparedScheduleMutation): string {
+  return executionFenceAdmissionSql({
+    callerEpoch: '?1',
+    semantic: prepared.semantic.map((_, index) => `?${index + 2}`),
+    schema: '?12',
+    statePredicate: requiresOpenFence(prepared.operation)
+      ? "f.state COLLATE BINARY = 'open'"
+      : '1',
+  });
+}
+
+interface ScheduleDeletionFacts {
+  schedules: number;
+  deletion_requested_at: number | null;
+  triggers: number;
+  deferred: number;
+  owners: number;
+}
+
+function deletionFacts(result: ScheduleStatementResult): ScheduleDeletionFacts {
+  const row = singleScheduleRow(result);
+  if (
+    !row ||
+    ['schedules', 'triggers', 'deferred', 'owners'].some(
+      (key) =>
+        typeof row[key] !== 'number' ||
+        !Number.isSafeInteger(row[key]) ||
+        row[key] < 0,
+    )
+  )
+    throw new Error('schedule deletion facts are malformed');
+  const facts = row as unknown as ScheduleDeletionFacts;
+  if (
+    facts.schedules > 1 ||
+    facts.owners > 1 ||
+    facts.deferred > facts.triggers ||
+    (facts.deletion_requested_at !== null &&
+      (typeof facts.deletion_requested_at !== 'number' ||
+        !Number.isFinite(facts.deletion_requested_at))) ||
+    (facts.schedules === 0 && facts.deletion_requested_at !== null)
+  ) {
+    throw new Error('schedule deletion facts are inconsistent');
+  }
+  return facts;
+}
+
 function rowToSchedule(row: ScheduleRow): Schedule {
   const target = parseJsonOrUndefined<Schedule['target']>(row.target);
   const schedule: Schedule = {
@@ -251,17 +554,162 @@ function rowToTrigger(row: ScheduleTriggerRow): ScheduleTrigger {
  * no adapter change.
  */
 export class D1SchedulesStorage extends SchedulesStorage {
+  readonly [FENCED_SCHEDULE_STORAGE]?: FencedScheduleMutationCapability;
   readonly #db: ScheduleDatabase;
+  readonly #fence: ExecutionFenceStore;
+  readonly #mutationBatch?: (
+    statements: ScheduleStatement[],
+  ) => Promise<unknown[]>;
   readonly #schedules: string;
   readonly #triggers: string;
   #ready?: Promise<void>;
+  #authoringReady?: Promise<void>;
 
   constructor(db: ScheduleDatabase, tablePrefix = '') {
     super();
     const prefix = validateTablePrefix(tablePrefix) ?? '';
     this.#db = db;
+    this.#fence = new ExecutionFenceStore(db);
     this.#schedules = `${prefix}mastra_schedules`;
     this.#triggers = `${prefix}mastra_schedule_triggers`;
+    const batch = db.batch;
+    if (typeof batch === 'function') {
+      this.#mutationBatch = (statements) =>
+        Reflect.apply(batch, db, [statements]);
+      this[FENCED_SCHEDULE_STORAGE] = Object.freeze({
+        database: db as FencedScheduleMutationCapability['database'],
+        createOwnedSchedule: this.createOwnedSchedule.bind(this),
+        updateSchedule: this.updateSchedule.bind(this),
+        pauseSchedule: this.pauseSchedule.bind(this),
+        resumeSchedule: this.resumeSchedule.bind(this),
+        deleteOwnedSchedule: this.deleteOwnedSchedule.bind(this),
+        observeScheduleMutation: this.observeScheduleMutation.bind(this),
+      });
+    }
+  }
+
+  async #prepareMutation(
+    epoch: number | undefined,
+    operation: ScheduleMutationOperation,
+  ): Promise<PreparedScheduleMutation> {
+    if (!this.#mutationBatch) {
+      throw new Error(
+        'D1SchedulesStorage requires database.batch() for schedule mutations',
+      );
+    }
+    if (!this.#authoringReady) {
+      this.#authoringReady = this.#ensureSchema()
+        .then(() => this.#fence.seed('open'))
+        .catch((error: unknown) => {
+          this.#authoringReady = undefined;
+          throw error;
+        });
+    }
+    await this.#authoringReady;
+    const observation = await this.#fence.readForAdmission();
+    const semantic = executionFenceAdmissionValues(observation);
+    assertMutationEpoch(observation.reading, epoch);
+    if (
+      requiresOpenFence(operation) &&
+      !admitsWorkAuthoring(observation.reading)
+    ) {
+      throw new ExecutionFencedError(observation.reading.state);
+    }
+    let schema: string;
+    try {
+      const captured = captureScheduleResult(
+        await this.#db
+          .prepare(`PRAGMA table_xinfo(${EXECUTION_FENCE_TABLE})`)
+          .all(),
+      );
+      schema = await captureExecutionFenceAdmissionSchema({
+        results: captured.rows,
+      });
+    } catch (cause) {
+      throw new ExecutionFenceUnreadableError(
+        'execution fence schema is not readable',
+        { cause },
+      );
+    }
+    return {
+      epoch,
+      operation,
+      semantic,
+      schema,
+      bindings: [epoch ?? null, ...semantic, schema],
+    };
+  }
+
+  #mutationDiagnostics(): [ScheduleStatement, ScheduleStatement] {
+    return [
+      this.#db.prepare(`SELECT * FROM ${EXECUTION_FENCE_TABLE} LIMIT 2`),
+      this.#db.prepare(`PRAGMA table_xinfo(${EXECUTION_FENCE_TABLE})`),
+    ];
+  }
+
+  async #executeMutation<const Statements extends readonly ScheduleStatement[]>(
+    prepared: PreparedScheduleMutation,
+    statements: Statements,
+    returningSlots: readonly number[],
+    changesSlot?: number,
+  ): Promise<{ [Index in keyof Statements]: ScheduleStatementResult }> {
+    let results: ScheduleStatementResult[];
+    let writes: number;
+    try {
+      if (!this.#mutationBatch)
+        throw new Error('schedule mutation batch is unavailable');
+      results = captureScheduleBatch(
+        await this.#mutationBatch([...statements]),
+        statements.length,
+      );
+      writes = returningSlots.reduce(
+        (count, slot) => count + scheduleChanges(results[slot], true),
+        0,
+      );
+      if (changesSlot !== undefined)
+        writes += scheduleChanges(results[changesSlot], false);
+    } catch (cause) {
+      throw mutationUnknown(cause);
+    }
+    let current: ExecutionFenceAdmissionObservation;
+    let semantic: readonly unknown[];
+    let schema: string;
+    const schemaResult = results[1];
+    try {
+      const row = singleScheduleRow(results[0]);
+      if (!row) throw new Error('execution fence singleton is missing');
+      current = decodeExecutionFenceAdmissionRow(row);
+      semantic = executionFenceAdmissionValues(current);
+      if (!schemaResult)
+        throw new Error('execution fence schema result is missing');
+      schema = await captureExecutionFenceAdmissionSchema({
+        results: schemaResult.rows,
+      });
+    } catch (cause) {
+      const unreadable = new ExecutionFenceUnreadableError(
+        'execution fence state is not readable',
+        { cause },
+      );
+      throw writes === 0 ? unreadable : mutationUnknown(unreadable);
+    }
+    try {
+      assertMutationEpoch(current.reading, prepared.epoch);
+      if (
+        requiresOpenFence(prepared.operation) &&
+        !admitsWorkAuthoring(current.reading)
+      ) {
+        throw new ExecutionFencedError(current.reading.state);
+      }
+      if (
+        semantic.some((value, index) => value !== prepared.semantic[index]) ||
+        schema !== prepared.schema
+      ) {
+        throw new ScheduleMutationConflictError('fence-changed');
+      }
+    } catch (cause) {
+      throw writes === 0 ? cause : mutationUnknown(cause);
+    }
+    return results as { [Index in keyof Statements]: ScheduleStatementResult };
   }
 
   /**
@@ -371,17 +819,41 @@ export class D1SchedulesStorage extends SchedulesStorage {
     await this.#ensureSchema();
   }
 
-  async createSchedule(schedule: Schedule): Promise<Schedule> {
-    await this.#ensureSchema();
+  async createSchedule(
+    schedule: Schedule,
+    context?: MutationEpochContext,
+  ): Promise<Schedule> {
+    const epoch = normalizeMutationEpoch(context?.mutationEpoch);
+    const row = captureSchedule(schedule);
+    const prepared = await this.#prepareMutation(epoch, 'create');
+    const results = await this.#executeMutation(
+      prepared,
+      [
+        ...this.#mutationDiagnostics(),
+        this.#db
+          .prepare(
+            `SELECT id FROM ${this.#schedules} WHERE id COLLATE BINARY = ?1 LIMIT 2`,
+          )
+          .bind(row.id),
+        this.#insertScheduleStatement(row, prepared),
+      ],
+      [3],
+    );
     try {
-      await this.#insertSchedule(schedule);
-    } catch (error) {
-      if (String(error).includes('UNIQUE constraint failed')) {
-        throw new Error(`schedule ${schedule.id} already exists`);
+      const existing = singleScheduleRow(results[2]);
+      if (existing) requireScheduleFields(existing, { id: row.id });
+      const created = singleScheduleRow(results[3]);
+      if (created) {
+        if (existing)
+          throw new Error('schedule insertion contradicts existing id');
+        requireScheduleFields(created, { ...row });
+        return rowToSchedule(mutationScheduleRow(created));
       }
-      throw error;
+      if (!existing) throw new Error('schedule insertion has no outcome');
+    } catch (cause) {
+      throw mutationUnknown(cause);
     }
-    return schedule;
+    throw new Error(`schedule ${row.id} already exists`);
   }
 
   /**
@@ -393,33 +865,77 @@ export class D1SchedulesStorage extends SchedulesStorage {
     schedule: AuthorizedSchedule,
     owner: ResourceOwner,
     maxSchedules: number,
+    context?: MutationEpochContext,
   ): Promise<Schedule | null> {
-    const safeOwner = canonicalResourceOwner(owner);
+    const epoch = normalizeMutationEpoch(context?.mutationEpoch);
+    const row = captureSchedule(schedule);
+    const safeOwner = canonicalResourceOwner(
+      owner === null || typeof owner !== 'object'
+        ? owner
+        : { kind: owner.kind, id: owner.id },
+    );
     if (!Number.isSafeInteger(maxSchedules) || maxSchedules < 0) {
       throw new Error('maxSchedules must be a nonnegative safe integer');
     }
-    await this.#ensureSchema();
-    const batch = this.#db.batch?.bind(this.#db);
-    if (!batch) {
-      throw new Error(
-        'D1SchedulesStorage requires database.batch() for atomic owned schedule creation',
-      );
-    }
-    const [created] = await batch([
-      this.#insertScheduleStatement(schedule, maxSchedules),
-      this.#db
-        .prepare(
-          `INSERT INTO ${RESOURCE_OWNERSHIP_TABLE}
+    const prepared = await this.#prepareMutation(epoch, 'create');
+    const results = await this.#executeMutation(
+      prepared,
+      [
+        ...this.#mutationDiagnostics(),
+        this.#db
+          .prepare(`SELECT COUNT(*) AS total,
+        EXISTS(SELECT 1 FROM ${this.#schedules} WHERE id COLLATE BINARY = ?1) AS id_exists
+        FROM ${this.#schedules}`)
+          .bind(row.id),
+        this.#insertScheduleStatement(row, prepared, maxSchedules),
+        this.#db
+          .prepare(
+            `INSERT INTO ${RESOURCE_OWNERSHIP_TABLE}
              (resource_kind, resource_id, owner_kind, owner_id)
-           SELECT 'schedule', ?, ?, ?
+           SELECT 'schedule', ?13, ?14, ?15
            WHERE changes() = 1
-             AND EXISTS (SELECT 1 FROM ${this.#schedules} WHERE id = ?)`,
-        )
-        .bind(schedule.id, safeOwner.kind, safeOwner.id, schedule.id),
-    ]);
-    return d1Changes(created as { meta?: { changes?: number } }) === 1
-      ? schedule
-      : null;
+             AND EXISTS (SELECT 1 FROM ${this.#schedules} WHERE id COLLATE BINARY = ?13)
+             AND ${scheduleMutationGuard(prepared)}
+           RETURNING resource_kind, resource_id, owner_kind, owner_id, reservation_token`,
+          )
+          .bind(...prepared.bindings, row.id, safeOwner.kind, safeOwner.id),
+      ],
+      [3, 4],
+    );
+    try {
+      const facts = singleScheduleRow(results[2]);
+      if (
+        !facts ||
+        typeof facts.total !== 'number' ||
+        !Number.isSafeInteger(facts.total) ||
+        facts.total < 0 ||
+        (facts.id_exists !== 0 && facts.id_exists !== 1)
+      ) {
+        throw new Error('schedule creation facts are malformed');
+      }
+      const created = singleScheduleRow(results[3]);
+      const owned = singleScheduleRow(results[4]);
+      if (created) {
+        if (facts.total >= maxSchedules || facts.id_exists !== 0)
+          throw new Error('schedule insertion contradicts its cap or id');
+        requireScheduleFields(created, { ...row });
+        requireScheduleFields(owned, {
+          resource_kind: 'schedule',
+          resource_id: row.id,
+          owner_kind: safeOwner.kind,
+          owner_id: safeOwner.id,
+          reservation_token: null,
+        });
+        return rowToSchedule(mutationScheduleRow(created));
+      }
+      if (owned) throw new Error('zero schedule insertion acquired an owner');
+      if (facts.total >= maxSchedules) return null;
+      if (facts.id_exists !== 1)
+        throw new Error('schedule insertion has no outcome');
+    } catch (cause) {
+      throw mutationUnknown(cause);
+    }
+    throw new Error(`schedule ${row.id} already exists`);
   }
 
   async getSchedule(id: string): Promise<Schedule | null> {
@@ -494,61 +1010,164 @@ export class D1SchedulesStorage extends SchedulesStorage {
     return results.map(rowToSchedule);
   }
 
-  async updateSchedule(id: string, patch: ScheduleUpdate): Promise<Schedule> {
-    await this.#ensureSchema();
-    // A TARGETED UPDATE — set ONLY the patched columns, never a full-row rewrite.
-    // A read-modify-write `INSERT OR REPLACE` of the whole row would carry a
-    // stale `nextFireAt`/`lastFireAt`/`lastRunId` back over whatever the tick's
-    // CAS (`updateScheduleNextFire`) advanced in the read→write window — reverting
-    // a claimed fire and re-arming the schedule for a SECOND fire of the same
-    // occurrence. This statement touches only what the patch names, so a facade
-    // mutation racing a tick can never clobber the CAS-owned columns it did not
-    // ask to change.
-    const sets = ['updatedAt = ?'];
-    const binds: unknown[] = [Date.now()];
-    if (patch.cron !== undefined) {
-      sets.push('cron = ?');
-      binds.push(patch.cron);
+  async updateSchedule(
+    id: string,
+    patch: ScheduleUpdate,
+    context?: MutationEpochContext,
+  ): Promise<Schedule> {
+    const epoch = normalizeMutationEpoch(context?.mutationEpoch);
+    return this.#updateSchedule(
+      id,
+      captureSchedulePatch(patch),
+      epoch,
+      'update',
+    );
+  }
+
+  async pauseSchedule(
+    id: string,
+    context?: MutationEpochContext,
+  ): Promise<Schedule> {
+    const epoch = normalizeMutationEpoch(context?.mutationEpoch);
+    return this.#updateSchedule(
+      id,
+      { status: 'paused', updatedAt: Date.now() },
+      epoch,
+      'pause',
+    );
+  }
+
+  async resumeSchedule(
+    id: string,
+    mutation: ScheduleResumeMutation,
+    context?: MutationEpochContext,
+  ): Promise<Schedule> {
+    const epoch = normalizeMutationEpoch(context?.mutationEpoch);
+    const { expectedCron, expectedTimezone, nextFireAt } = mutation;
+    return this.#updateSchedule(
+      id,
+      { status: 'active', nextFireAt, updatedAt: Date.now() },
+      epoch,
+      'resume',
+      {
+        cron: expectedCron,
+        timezone: expectedTimezone ?? null,
+      },
+    );
+  }
+
+  async #updateSchedule(
+    id: string,
+    patch: Partial<ScheduleRow>,
+    epoch: number | undefined,
+    operation: 'update' | 'pause' | 'resume',
+    expected?: { cron: string; timezone: string | null },
+  ): Promise<Schedule> {
+    const fields = Object.entries(patch);
+    const prepared = await this.#prepareMutation(epoch, operation);
+    const idParameter = fields.length + 13;
+    // Targeted writes preserve columns advanced by a concurrent fire claim.
+    const sets = fields.map(([key], index) => `${key} = ?${index + 13}`);
+    const results = await this.#executeMutation(
+      prepared,
+      [
+        ...this.#mutationDiagnostics(),
+        this.#db
+          .prepare(
+            `SELECT * FROM ${this.#schedules} WHERE id COLLATE BINARY = ?1 LIMIT 2`,
+          )
+          .bind(id),
+        this.#db
+          .prepare(`UPDATE ${this.#schedules} SET ${sets.join(', ')}
+        WHERE id COLLATE BINARY = ?${idParameter} AND deletionRequestedAt IS NULL
+          ${expected ? `AND cron COLLATE BINARY = ?${idParameter + 1} AND timezone COLLATE BINARY IS ?${idParameter + 2}` : ''}
+          AND ${scheduleMutationGuard(prepared)} RETURNING *`)
+          .bind(
+            ...prepared.bindings,
+            ...fields.map(([, value]) => value),
+            id,
+            ...(expected ? [expected.cron, expected.timezone] : []),
+          ),
+      ],
+      [3],
+    );
+    let missing: boolean;
+    let changed = false;
+    try {
+      const previous = singleScheduleRow(results[2]);
+      const updated = singleScheduleRow(results[3]);
+      if (previous) {
+        requireScheduleFields(previous, { id });
+        mutationScheduleRow(previous);
+      }
+      missing = !previous || previous.deletionRequestedAt !== null;
+      if (updated) {
+        if (
+          missing ||
+          (expected &&
+            !sameScheduleFields(previous as Record<string, unknown>, expected))
+        ) {
+          throw new Error('schedule update contradicts its prior row');
+        }
+        requireScheduleFields(updated, { ...previous, ...patch, id });
+        return rowToSchedule(mutationScheduleRow(updated));
+      }
+      changed =
+        !missing &&
+        expected !== undefined &&
+        !sameScheduleFields(previous as Record<string, unknown>, expected);
+      if (!missing && !changed)
+        throw new Error('schedule update has no outcome');
+    } catch (cause) {
+      throw mutationUnknown(cause);
     }
-    if (patch.timezone !== undefined) {
-      sets.push('timezone = ?');
-      binds.push(patch.timezone ?? null);
+    if (changed) throw new ScheduleMutationConflictError('schedule-changed');
+    throw new Error(`schedule ${id} not found`);
+  }
+
+  async observeScheduleMutation(
+    id: string,
+    operation: 'pause' | 'resume',
+    context: MutationEpochContext,
+  ): Promise<Schedule | null> {
+    const epoch = normalizeMutationEpoch(context?.mutationEpoch);
+    if (operation !== 'pause' && operation !== 'resume')
+      throw new Error('schedule mutation observation is invalid');
+    const prepared = await this.#prepareMutation(epoch, operation);
+    const results = await this.#executeMutation(
+      prepared,
+      [
+        ...this.#mutationDiagnostics(),
+        this.#db
+          .prepare(
+            `SELECT * FROM ${this.#schedules} WHERE id COLLATE BINARY = ?1 LIMIT 2`,
+          )
+          .bind(id),
+        this.#db
+          .prepare(`SELECT * FROM ${this.#schedules}
+        WHERE id COLLATE BINARY = ?13 AND deletionRequestedAt IS NULL
+          AND ${scheduleMutationGuard(prepared)} LIMIT 2`)
+          .bind(...prepared.bindings, id),
+      ],
+      [],
+    );
+    try {
+      const previous = singleScheduleRow(results[2]);
+      const observed = singleScheduleRow(results[3]);
+      if (previous) {
+        requireScheduleFields(previous, { id });
+        mutationScheduleRow(previous);
+      }
+      if (!previous || previous.deletionRequestedAt !== null) {
+        if (observed)
+          throw new Error('schedule observation contradicts absence');
+        return null;
+      }
+      requireScheduleFields(observed, previous);
+      return rowToSchedule(mutationScheduleRow(observed));
+    } catch (cause) {
+      throw mutationUnknown(cause);
     }
-    if (patch.status !== undefined) {
-      sets.push('status = ?');
-      binds.push(patch.status);
-    }
-    if (patch.nextFireAt !== undefined) {
-      sets.push('nextFireAt = ?');
-      binds.push(patch.nextFireAt);
-    }
-    if (patch.metadata !== undefined) {
-      sets.push('metadata = ?');
-      binds.push(jsonOrNull(patch.metadata));
-    }
-    if (patch.target !== undefined) {
-      sets.push('target = ?');
-      binds.push(JSON.stringify(patch.target));
-    }
-    if (patch.ownerType !== undefined) {
-      sets.push('ownerType = ?');
-      binds.push(patch.ownerType ?? null);
-    }
-    if (patch.ownerId !== undefined) {
-      sets.push('ownerId = ?');
-      binds.push(patch.ownerId ?? null);
-    }
-    binds.push(id);
-    await this.#db
-      .prepare(
-        `UPDATE ${this.#schedules} SET ${sets.join(', ')}
-         WHERE id = ? AND deletionRequestedAt IS NULL`,
-      )
-      .bind(...binds)
-      .run();
-    const updated = await this.getSchedule(id);
-    if (!updated) throw new Error(`schedule ${id} not found`);
-    return updated;
   }
 
   async updateScheduleNextFire(
@@ -814,65 +1433,136 @@ export class D1SchedulesStorage extends SchedulesStorage {
     throw new Error('agent schedule dispatch could not be force-discarded');
   }
 
-  async deleteSchedule(id: string): Promise<void> {
-    await this.deleteOwnedSchedule(id);
+  async deleteSchedule(
+    id: string,
+    context?: MutationEpochContext,
+  ): Promise<void> {
+    await this.deleteOwnedSchedule(id, context);
   }
 
   /** Delete an authorized facade schedule and its owner in one transaction. */
-  async deleteOwnedSchedule(id: string): Promise<'deleted' | 'pending'> {
-    await this.#ensureSchema();
-    const batch = this.#db.batch?.bind(this.#db);
-    if (!batch) {
-      throw new Error(
-        'D1SchedulesStorage requires database.batch() for atomic owned schedule deletion',
-      );
-    }
-    await batch([
-      this.#db
-        .prepare(
-          `UPDATE ${this.#schedules}
-           SET status = 'paused', updatedAt = ?,
+  async deleteOwnedSchedule(
+    id: string,
+    context?: MutationEpochContext,
+  ): Promise<'deleted' | 'pending'> {
+    const epoch = normalizeMutationEpoch(context?.mutationEpoch);
+    const now = Date.now();
+    const prepared = await this.#prepareMutation(epoch, 'delete');
+    const guard = scheduleMutationGuard(prepared);
+    const results = await this.#executeMutation(
+      prepared,
+      [
+        ...this.#mutationDiagnostics(),
+        this.#deletionFactsStatement(id),
+        this.#db
+          .prepare(
+            `UPDATE ${this.#schedules}
+           SET status = 'paused', updatedAt = ?13,
                deletionRequestedAt = CASE
                  WHEN EXISTS (
                    SELECT 1 FROM ${this.#triggers}
-                   WHERE scheduleId = ? AND outcome = 'deferred'
-                 ) THEN COALESCE(deletionRequestedAt, ?)
+                   WHERE scheduleId COLLATE BINARY = ?14 AND outcome = 'deferred'
+                 ) THEN COALESCE(deletionRequestedAt, ?13)
                  ELSE NULL
                END
-           WHERE id = ?`,
-        )
-        .bind(Date.now(), id, Date.now(), id),
-      this.#db
-        .prepare(
-          `DELETE FROM ${this.#triggers}
-           WHERE scheduleId = ?
+           WHERE id COLLATE BINARY = ?14 AND ${guard}
+           RETURNING id, status, updatedAt, deletionRequestedAt`,
+          )
+          .bind(...prepared.bindings, now, id),
+        this.#db
+          .prepare(
+            `DELETE FROM ${this.#triggers}
+           WHERE scheduleId COLLATE BINARY = ?13 AND ${guard}
              AND NOT EXISTS (
                SELECT 1 FROM ${this.#schedules}
-               WHERE id = ? AND deletionRequestedAt IS NOT NULL
+               WHERE id COLLATE BINARY = ?13 AND deletionRequestedAt IS NOT NULL
              )`,
-        )
-        .bind(id, id),
-      this.#db
-        .prepare(
-          `DELETE FROM ${this.#schedules}
-           WHERE id = ? AND deletionRequestedAt IS NULL`,
-        )
-        .bind(id),
-      this.#db
-        .prepare(
-          `DELETE FROM ${RESOURCE_OWNERSHIP_TABLE}
-           WHERE resource_kind = 'schedule' AND resource_id = ?
-             AND NOT EXISTS (SELECT 1 FROM ${this.#schedules} WHERE id = ?)`,
-        )
-        .bind(id, id),
-    ]);
-    const pending = await this.#db
-      .prepare(
-        `SELECT deletionRequestedAt FROM ${this.#schedules} WHERE id = ?`,
-      )
-      .bind(id)
-      .first<{ deletionRequestedAt: number | null }>();
-    return pending?.deletionRequestedAt != null ? 'pending' : 'deleted';
+          )
+          .bind(...prepared.bindings, id),
+        this.#db
+          .prepare(
+            `DELETE FROM ${this.#schedules}
+           WHERE id COLLATE BINARY = ?13 AND deletionRequestedAt IS NULL
+             AND ${guard} RETURNING id`,
+          )
+          .bind(...prepared.bindings, id),
+        this.#db
+          .prepare(
+            `DELETE FROM ${RESOURCE_OWNERSHIP_TABLE}
+           WHERE resource_kind COLLATE BINARY = 'schedule' AND resource_id COLLATE BINARY = ?13
+             AND NOT EXISTS (SELECT 1 FROM ${this.#schedules} WHERE id COLLATE BINARY = ?13)
+             AND ${guard}
+           RETURNING resource_kind, resource_id, owner_kind, owner_id, reservation_token`,
+          )
+          .bind(...prepared.bindings, id),
+        this.#deletionFactsStatement(id),
+      ],
+      [3, 5, 6],
+      4,
+    );
+    try {
+      const before = deletionFacts(results[2]);
+      const after = deletionFacts(results[7]);
+      const pending = before.schedules === 1 && before.deferred > 0;
+      const marker = pending ? (before.deletion_requested_at ?? now) : null;
+      if (
+        results[3].rows.length !== before.schedules ||
+        scheduleChanges(results[4], false) !==
+          (pending ? 0 : before.triggers) ||
+        results[5].rows.length !== (pending ? 0 : before.schedules) ||
+        results[6].rows.length !== (pending ? 0 : before.owners)
+      ) {
+        throw new Error('schedule deletion writes contradict its prior state');
+      }
+      if (before.schedules === 1)
+        requireScheduleFields(results[3].rows[0], {
+          id,
+          status: 'paused',
+          updatedAt: now,
+          deletionRequestedAt: marker,
+        });
+      for (const row of results[5].rows) requireScheduleFields(row, { id });
+      for (const row of results[6].rows) {
+        requireScheduleFields(row, {
+          resource_kind: 'schedule',
+          resource_id: id,
+        });
+        if (
+          typeof row.owner_kind !== 'string' ||
+          typeof row.owner_id !== 'string' ||
+          (row.reservation_token !== null &&
+            typeof row.reservation_token !== 'string')
+        ) {
+          throw new Error('schedule deletion owner is malformed');
+        }
+      }
+      const expected = pending
+        ? { ...before, deletion_requested_at: marker }
+        : {
+            schedules: 0,
+            deletion_requested_at: null,
+            triggers: 0,
+            deferred: 0,
+            owners: 0,
+          };
+      if (!sameScheduleFields({ ...after }, expected))
+        throw new Error('schedule deletion did not converge');
+      return pending ? 'pending' : 'deleted';
+    } catch (cause) {
+      throw mutationUnknown(cause);
+    }
+  }
+
+  #deletionFactsStatement(id: string): ScheduleStatement {
+    return this.#db
+      .prepare(`SELECT
+      (SELECT COUNT(*) FROM ${this.#schedules} WHERE id COLLATE BINARY = ?1) AS schedules,
+      (SELECT deletionRequestedAt FROM ${this.#schedules} WHERE id COLLATE BINARY = ?1) AS deletion_requested_at,
+      (SELECT COUNT(*) FROM ${this.#triggers} WHERE scheduleId COLLATE BINARY = ?1) AS triggers,
+      (SELECT COUNT(*) FROM ${this.#triggers} WHERE scheduleId COLLATE BINARY = ?1 AND outcome = 'deferred') AS deferred,
+      (SELECT COUNT(*) FROM ${RESOURCE_OWNERSHIP_TABLE}
+        WHERE resource_kind COLLATE BINARY = 'schedule' AND resource_id COLLATE BINARY = ?1) AS owners`)
+      .bind(id);
   }
 
   async recordTrigger(trigger: ScheduleTrigger): Promise<void> {
@@ -1073,51 +1763,24 @@ export class D1SchedulesStorage extends SchedulesStorage {
     ]);
   }
 
-  /** Insert a new core schedule row. */
-  async #insertSchedule(schedule: Schedule): Promise<void> {
-    await this.#insertScheduleStatement(schedule).run();
-  }
-
   #insertScheduleStatement(
-    schedule: Schedule,
+    row: ScheduleRow,
+    prepared: PreparedScheduleMutation,
     maxSchedules?: number,
   ): ScheduleStatement {
-    const columns = `(
-           id, target, cron, timezone, status, nextFireAt, lastFireAt,
-           lastRunId, createdAt, updatedAt, metadata, ownerType, ownerId,
-           creatorRole
-         )`;
-    const values = [
-      schedule.id,
-      JSON.stringify(schedule.target),
-      schedule.cron,
-      schedule.timezone ?? null,
-      schedule.status,
-      schedule.nextFireAt,
-      schedule.lastFireAt ?? null,
-      schedule.lastRunId ?? null,
-      schedule.createdAt,
-      schedule.updatedAt,
-      jsonOrNull(schedule.metadata),
-      schedule.ownerType ?? null,
-      schedule.ownerId ?? null,
-      (schedule as Partial<AuthorizedSchedule>).creatorRole ?? null,
-    ];
-    if (maxSchedules === undefined) {
-      return this.#db
-        .prepare(
-          `INSERT INTO ${this.#schedules} ${columns}
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .bind(...values);
-    }
     return this.#db
       .prepare(
-        `INSERT INTO ${this.#schedules} ${columns}
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-         WHERE (SELECT COUNT(*) FROM ${this.#schedules}) < ?`,
+        `INSERT INTO ${this.#schedules} (${SCHEDULE_COLUMNS.join(', ')})
+         SELECT ${SCHEDULE_COLUMNS.map((_, index) => `?${index + 13}`).join(', ')}
+         WHERE ${scheduleMutationGuard(prepared)}
+           ${maxSchedules === undefined ? '' : `AND (SELECT COUNT(*) FROM ${this.#schedules}) < ?27`}
+         ON CONFLICT (id) DO NOTHING RETURNING *`,
       )
-      .bind(...values, maxSchedules);
+      .bind(
+        ...prepared.bindings,
+        ...SCHEDULE_COLUMNS.map((key) => row[key]),
+        ...(maxSchedules === undefined ? [] : [maxSchedules]),
+      );
   }
 }
 

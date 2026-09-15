@@ -3,12 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { cloudflareTest } from '@cloudflare/vitest-pool-workers';
 import { defineConfig } from 'vitest/config';
 
-const packageRoot = fileURLToPath(
-  new URL('./packages/breakwater/', import.meta.url),
-);
-
 export default defineConfig({
-  root: packageRoot,
   plugins: [
     cloudflareTest({
       wrangler: {
@@ -23,6 +18,6 @@ export default defineConfig({
   ],
   test: {
     name: 'breakwater-workers',
-    include: ['worker-tests/**/*.workers.test.ts'],
+    include: ['packages/breakwater/worker-tests/**/*.workers.test.ts'],
   },
 });

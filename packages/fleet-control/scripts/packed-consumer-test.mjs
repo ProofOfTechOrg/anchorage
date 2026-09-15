@@ -1,15 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//
-// Publishing gate for @proofoftech/fleet-control, matching the breakwater and
-// flowsafe packed-consumer tests. This package has four export entries, three
-// of which are Workers entry points that no in-repo consumer imports through
-// the package boundary, so `pnpm build` proves nothing about whether the
-// published export map resolves. This packs the real tarball and consumes it.
-//
-// It runs publint --strict and attw --profile esm-only over the tarball, then
-// typechecks and executes a consumer that reaches every export entry, so a
-// missing dist file, a stale exports key, or a workspace: specifier that
-// survived packing fails here rather than on the registry.
+
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import {
@@ -25,12 +15,18 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { verifyControlPlanePackedBundle } from './control-plane-packed-bundle.mjs';
+import { verifyControlPlanePackedRuntime } from './control-plane-packed-runtime.mjs';
+import { verifyControlPlanePackedSurface } from './control-plane-packed-surface.mjs';
+import { verifyControlPlanePackedWorkload } from './control-plane-packed-workload.mjs';
+import { verifyDirectArtifactsPacked } from './direct-artifacts-packed.mjs';
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const workspaceRoot = resolve(packageRoot, '../..');
 const temporaryRoot = await mkdtemp(
   join(tmpdir(), 'fleet-control-packed-consumer-'),
 );
+const lockfileBefore = await readFile(join(workspaceRoot, 'pnpm-lock.yaml'));
 
 function run(command, args, options = {}) {
   execFileSync(command, args, {
@@ -96,6 +92,37 @@ try {
   const manifest = JSON.parse(
     await readFile(join(packedPackageRoot, 'package.json'), 'utf8'),
   );
+  assert.deepEqual(manifest.exports, {
+    '.': { types: './dist/index.d.ts', default: './dist/index.js' },
+    './cloudflare-control-plane': {
+      types: './dist/cloudflare-control-plane.d.ts',
+      default: './dist/cloudflare-control-plane.js',
+    },
+    './workers/dispatch': {
+      types: './dist/workers/dispatch.d.ts',
+      default: './dist/workers/dispatch.js',
+    },
+    './workers/outbound': {
+      types: './dist/workers/outbound.d.ts',
+      default: './dist/workers/outbound.js',
+    },
+    './workers/audit-consumer': {
+      types: './dist/workers/audit-consumer.d.ts',
+      default: './dist/workers/audit-consumer.js',
+    },
+    './package.json': './package.json',
+  });
+  assert.deepEqual(manifest.peerDependencies, {
+    '@cloudflare/workers-types': '>=5.20260730.1 <6',
+  });
+  assert.equal(
+    manifest.peerDependenciesMeta?.['@cloudflare/workers-types']?.optional,
+    undefined,
+  );
+  assert.equal(
+    manifest.devDependencies['@cloudflare/workers-types'],
+    '5.20260905.1',
+  );
 
   // Unscoped, this name would be squattable, and a granular token scoped to
   // @proofoftech would 403 at publish time.
@@ -138,9 +165,15 @@ try {
         name: 'fleet-control-packed-consumer',
         private: true,
         type: 'module',
+        packageManager: 'pnpm@10.34.4',
+        engines: { node: '>=22.22.0', pnpm: '>=10.16.0' },
         dependencies: {
           '@proofoftech/fleet-control': `file:${tarball}`,
           '@proofoftech/flowsafe': `link:${flowsafeDirectory}`,
+        },
+        devDependencies: {
+          '@cloudflare/workers-types':
+            manifest.devDependencies['@cloudflare/workers-types'],
         },
       },
       null,
@@ -154,7 +187,7 @@ try {
   // whole window between the version bump and the release publishing.
   await writeFile(
     join(consumerDirectory, 'pnpm-workspace.yaml'),
-    `packages:\n  - "."\noverrides:\n  "@proofoftech/flowsafe": ${JSON.stringify(
+    `minimumReleaseAge: 10080\nminimumReleaseAgeExclude:\n  - "@cloudflare/workers-types@5.20260905.1"\npackages:\n  - "."\noverrides:\n  "@proofoftech/flowsafe": ${JSON.stringify(
       `link:${flowsafeDirectory}`,
     )}\n`,
   );
@@ -182,8 +215,18 @@ try {
     join(consumerDirectory, 'consumer.ts'),
     `import {
   ActiveRouteAttestationError,
+  CloudflareApiPlainWorkerBackend,
   CloudflareProvisioningClient,
+  DecommissionAdvanceCapabilityError,
+  DecommissionAdvanceRestartError,
+  DecommissionAdvanceTokenDeploymentError,
+  DecommissionAdvanceTokenError,
+  DecommissionAdvanceTokenFutureError,
+  DecommissionAdvanceTokenOperationError,
   D1CloudflareApiRateCoordinator,
+  FileSystemDatabaseExportStore,
+  FleetMigrationAdvanceCapabilityError,
+  PlainWorkerBackend,
   ProcessLocalCloudflareApiRateCoordinator,
   ProvisioningError,
   WorkersForPlatformsBackend,
@@ -192,32 +235,200 @@ try {
   attestConvergedActiveRoute,
   attestFleetRecordActiveRoute,
   auditFleetDrift,
+  advanceBackendSwitchDecommission,
+  advanceDecommissionDeployment,
+  abandonFleetMigrationOperation,
+  advanceFleetMigration,
+  readFleetMigrationItemsPage,
   decommissionDeployment,
   forceDecommissionDeployment,
   deploymentSpecDigest,
   deriveStateEgressCredential,
   fleetSettlementKey,
   provisionDeployment,
+  plainWorkerIngressModule,
   validateDeploymentSpec,
   type ActiveRouteAttestation,
   type ActiveRouteExpectation,
   type AttestConvergedActiveRouteOptions,
+  type AdvanceBackendSwitchDecommissionOptions,
+  type AdvanceDecommissionDeploymentOptions,
+  type AdvanceFleetMigrationOptions,
+  type BackendSwitchProvider,
+  type CloudflareApiPlainWorkerBackendOptions,
   type CloudflareApiRateCoordinator,
   type DeploymentEgressPolicy,
   type DeploymentSpec,
+  type DecommissionAdvanceIntent,
+  type DecommissionAdvanceAction,
+  type DecommissionAdvanceCapability,
+  type DecommissionAdvanceResult,
+  type DecommissionAdvanceToken,
+  type DecommissionAdvanceTokenClassification,
+  type DecommissionAttachmentProgress,
+  type DecommissionAttachmentPurpose,
+  type DecommissionAttachmentScanEvidence,
+  type DecommissionAttachmentScanInput,
+  type DecommissionAttachmentScanResult,
+  type DecommissionBlockedAttachment,
+  type DecommissionIntentCommon,
+  type DecommissionOperationIdentity,
+  type DecommissionOperationMode,
+  type DecommissionRecordIdentity,
+  type DatabaseExport,
+  type DatabaseExportIntegrity,
+  type DatabaseExportReceiptIdentity,
+  type DurableDatabaseExportStore,
+  type ExternalMutationFence,
+  type FleetAuditFindingsPage,
   type FleetRecord,
+  type FleetMigrationAdvanceAction,
+  type FleetMigrationAdvanceCapability,
+  type FleetMigrationAdvanceResult,
+  type FleetMigrationItem,
+  type FleetMigrationPlanEntry,
+  type FleetMigrationProgress,
+  type FleetMigrationResultRef,
+  type FleetMigrationStep,
+  type FleetStateStore,
   type FleetSettlementContext,
   type FleetSettlementEntry,
   type FleetSettlementHost,
   type FleetStateDatabase,
   type InitialExecutionFenceState,
+  type NormalDecommissionLifecyclePhase,
   type ObservedActiveRoute,
+  type PlainWorkerBackendOptions,
+  type PlainWorkerCleanupOutcome,
   type PlainWorkerCustomDomain,
+  type PlainWorkerDatabaseExportResult,
+  type PlainWorkerDatabaseInventoryEntry,
+  type PlainWorkerDeploymentStatus,
+  type PlainWorkerMutationOutcome,
+  type PlainWorkerProvisioningApi,
   type PlainWorkerRouteApi,
+  type PlainWorkerUploadIntent,
+  type PlainWorkerUploadIntentBase,
+  type PlainWorkerUploadOutcome,
+  type PlainWorkerVersionBinding,
+  type PlainWorkerVersionDetail,
+  type PlainWorkerVersionSummary,
   type ProvisioningBackend,
   type SeedDeploymentIdentityOptions,
   type WorkersForPlatformsApi,
 } from '@proofoftech/fleet-control';
+// @ts-expect-error migration admission is package-private.
+import { admitFleetMigrationItem } from '@proofoftech/fleet-control';
+// @ts-expect-error migration revalidation is package-private.
+import { revalidateFleetMigrationAdmission } from '@proofoftech/fleet-control';
+// @ts-expect-error migration plan compatibility is package-private.
+import { assertFleetMigrationPlanCompatibility } from '@proofoftech/fleet-control';
+// @ts-expect-error migration carrier validation is package-private.
+import { assertMigratingCarrierState } from '@proofoftech/fleet-control';
+// @ts-expect-error the migration step executor is package-private.
+import { executeNextMigrationStep } from '@proofoftech/fleet-control';
+// @ts-expect-error R1's client friend is package-private, not a root API.
+import { advanceCloudflareWorkerAttachmentScan } from '@proofoftech/fleet-control';
+// @ts-expect-error R1 provider attachments stay behind decommission types.
+import type { WorkerAttachment } from '@proofoftech/fleet-control';
+// @ts-expect-error R1 scan targets stay package-private.
+import type { WorkerAttachmentScanTarget } from '@proofoftech/fleet-control';
+// @ts-expect-error R1 progress stays package-private.
+import type { WorkerAttachmentScanProgress } from '@proofoftech/fleet-control';
+// @ts-expect-error R1 scan inputs stay package-private.
+import type { WorkerAttachmentScanInput } from '@proofoftech/fleet-control';
+// @ts-expect-error R1 scan chunks stay package-private.
+import type { WorkerAttachmentScanChunk } from '@proofoftech/fleet-control';
+// @ts-expect-error R1 provider context stays package-private.
+import type { CloudflareWorkerAttachmentScanContext } from '@proofoftech/fleet-control';
+// @ts-expect-error R1 progress errors stay package-private.
+import { CloudflareAttachmentScanProgressError } from '@proofoftech/fleet-control';
+// @ts-expect-error R1 drift errors stay package-private.
+import { CloudflareAttachmentScanDriftError } from '@proofoftech/fleet-control';
+// @ts-expect-error the pure mapper is a deep package-private seam.
+import { mapDecommissionAttachmentScanChunk } from '@proofoftech/fleet-control';
+// @ts-expect-error raw action parsing is package-private.
+import { decommissionAdvanceActionFromUnknown } from '@proofoftech/fleet-control';
+// @ts-expect-error token parsing is package-private.
+import { parseDecommissionAdvanceToken } from '@proofoftech/fleet-control';
+// @ts-expect-error token classification is package-private.
+import { classifyDecommissionAdvanceToken } from '@proofoftech/fleet-control';
+// @ts-expect-error intent normalization is package-private.
+import { normalizeDecommissionAdvanceIntent } from '@proofoftech/fleet-control';
+// @ts-expect-error provider budget validation is package-private.
+import { assertWorkerAttachmentProviderRequestBudget } from '@proofoftech/fleet-control';
+// @ts-expect-error one-step R2 deletion is package-private.
+import { advanceApplicationR2Deletion } from '@proofoftech/fleet-control';
+// @ts-expect-error one-step R2 deletion result is package-private.
+import type { ApplicationR2DeletionAdvance } from '@proofoftech/fleet-control';
+// @ts-expect-error release derivation is package-private.
+import { activeExternalRelease } from '@proofoftech/fleet-control';
+// @ts-expect-error release inventory derivation is package-private.
+import { retainedExternalReleases } from '@proofoftech/fleet-control';
+// @ts-expect-error immutable mapping assertion is package-private.
+import { assertImmutableDeploymentMapping } from '@proofoftech/fleet-control';
+// @ts-expect-error persisted database reconciliation is package-private.
+import { reconcilePersistedDatabase } from '@proofoftech/fleet-control';
+// @ts-expect-error backend-switch application authority is package-private.
+import type { BackendSwitchApplicationR2Authority } from '@proofoftech/fleet-control';
+// @ts-expect-error backend-switch authority projection is package-private.
+import type { BackendSwitchDecommissionAuthorityProjection } from '@proofoftech/fleet-control';
+// @ts-expect-error backend-switch snapshot hashing is package-private.
+import { backendSwitchDecommissionSnapshotDigest } from '@proofoftech/fleet-control';
+// @ts-expect-error backend-switch shell construction is package-private.
+import { backendSwitchDecommissionShell } from '@proofoftech/fleet-control';
+// @ts-expect-error backend-switch entry normalization is package-private.
+import { normalizeSwitchDecommissionEntry } from '@proofoftech/fleet-control';
+// @ts-expect-error backend-switch capability capture is package-private.
+import { captureBackendSwitchDecommissionCapabilities } from '@proofoftech/fleet-control';
+// @ts-expect-error the production backend-switch lease seam is package-private.
+import { withBackendSwitchLease } from '@proofoftech/fleet-control';
+// @ts-expect-error decommission transitions are package-private.
+import type { DecommissionIntentTransition } from '@proofoftech/fleet-control';
+// @ts-expect-error scan-step options are package-private.
+import type { DecommissionAttachmentScanStepOptions } from '@proofoftech/fleet-control';
+// @ts-expect-error scan-step execution is package-private.
+import { advanceDecommissionAttachmentScanStep } from '@proofoftech/fleet-control';
+// @ts-expect-error D1 callback options are package-private.
+import type { ReconcilePersistedDatabaseFromCallbacksOptions } from '@proofoftech/fleet-control';
+// @ts-expect-error D1 callback reconciliation is package-private.
+import { reconcilePersistedDatabaseFromCallbacks } from '@proofoftech/fleet-control';
+// @ts-expect-error D1 export reconstruction is package-private.
+import { databaseExportFromUnknown } from '@proofoftech/fleet-control';
+// @ts-expect-error D1 receipt identity construction is package-private.
+import { databaseExportReceiptIdentity } from '@proofoftech/fleet-control';
+// @ts-expect-error D1 deletion settlement is package-private.
+import { settleDatabaseDeletionUnderBarrier } from '@proofoftech/fleet-control';
+// @ts-expect-error pending ordinary inspection is package-private.
+import type { SwitchEntryPendingArtifactInspection } from '@proofoftech/fleet-control';
+// @ts-expect-error intent codec errors are package-private.
+import { DecommissionAdvanceIntentError } from '@proofoftech/fleet-control';
+// @ts-expect-error receipt capability capture is package-private.
+import { captureDatabaseExportReceiptCapability } from '@proofoftech/fleet-control';
+// @ts-expect-error receipt authority normalization is package-private.
+import { databaseExportReceiptAuthorityFromUnknown } from '@proofoftech/fleet-control';
+// @ts-expect-error receipt identity normalization is package-private.
+import { databaseExportReceiptIdentityFromUnknown } from '@proofoftech/fleet-control';
+// @ts-expect-error receipt integrity normalization is package-private.
+import { databaseExportIntegrityFromUnknown } from '@proofoftech/fleet-control';
+// @ts-expect-error native receipt integrity capture is package-private.
+import { captureDatabaseExportIntegrityPromise } from '@proofoftech/fleet-control';
+// @ts-expect-error receipt body cancellation is package-private.
+import { cancelBodyWithoutAwait } from '@proofoftech/fleet-control';
+// @ts-expect-error tagged receipt errors are package-private.
+import { databaseExportReceiptError } from '@proofoftech/fleet-control';
+// @ts-expect-error the receipt-error classifier is package-private.
+import { isDatabaseExportReceiptError } from '@proofoftech/fleet-control';
+// @ts-expect-error captured receipt capabilities are package-private.
+import type { CapturedDatabaseExportReceiptCapability } from '@proofoftech/fleet-control';
+// @ts-expect-error filesystem receipt primitives are package-private.
+import type { FileSystemDatabaseExportStoreReceiptPrimitives } from '@proofoftech/fleet-control';
+// @ts-expect-error filesystem receipt overrides are package-private.
+import type { FileSystemDatabaseExportStoreReceiptPrimitiveOverrides } from '@proofoftech/fleet-control';
+// @ts-expect-error the filesystem publication seam is package-private.
+import { createFileSystemDatabaseExportStoreWithReceiptPrimitives } from '@proofoftech/fleet-control';
+// @ts-expect-error the R2 implementation remains a deep-only adapter.
+import { R2DatabaseExportStore } from '@proofoftech/fleet-control';
 import type { FleetDispatchEnv } from '@proofoftech/fleet-control/workers/dispatch';
 import {
   createEgressProxyFetch,
@@ -233,10 +444,244 @@ declare const database: FleetStateDatabase;
 declare const api: WorkersForPlatformsApi;
 declare const policy: DeploymentEgressPolicy;
 declare const coordinator: CloudflareApiRateCoordinator;
+export const emptyAuditPage: FleetAuditFindingsPage = { findings: [], done: true };
+// @ts-expect-error An unfinished page requires its continuation cursor.
+export const unfinishedAuditPage: FleetAuditFindingsPage = { findings: [], done: false };
+
+export function auditPageCursor(page: FleetAuditFindingsPage): number | undefined {
+  if (page.done) return page.nextAfterOrdinal;
+  const requiredCursor: number = page.nextAfterOrdinal;
+  return requiredCursor;
+}
+
 declare const deploymentSpec: DeploymentSpec;
+const inspectedIngress: Readonly<{ name: string; content: string }> =
+  plainWorkerIngressModule(deploymentSpec);
+void inspectedIngress;
 declare const provisioningBackend: ProvisioningBackend;
+declare const backendSwitchProvider: BackendSwitchProvider;
 declare const fleetRecord: FleetRecord;
+declare const fleetStateStore: FleetStateStore;
+declare const decommissionIntent: DecommissionAdvanceIntent;
+declare const decommissionToken: DecommissionAdvanceToken;
+declare const decommissionClassification: DecommissionAdvanceTokenClassification;
+declare const decommissionProgress: DecommissionAttachmentProgress;
+declare const decommissionPurpose: DecommissionAttachmentPurpose;
+declare const decommissionEvidence: DecommissionAttachmentScanEvidence;
+declare const decommissionScanInput: DecommissionAttachmentScanInput;
+declare const decommissionAttachment: DecommissionBlockedAttachment;
+declare const decommissionCommon: DecommissionIntentCommon;
+declare const decommissionIdentity: DecommissionOperationIdentity;
+declare const decommissionMode: DecommissionOperationMode;
+declare const decommissionRecordIdentity: DecommissionRecordIdentity;
+declare const decommissionPhase: NormalDecommissionLifecyclePhase;
 declare const plainWorkerRouteApi: PlainWorkerRouteApi;
+declare const plainWorkerProvisioningApiShape: PlainWorkerProvisioningApi;
+declare const receiptFence: ExternalMutationFence;
+const databaseExportIntegrity: DatabaseExportIntegrity = {
+  size: 1,
+  sha256: 'a'.repeat(64),
+};
+const databaseExportReceiptIdentity: DatabaseExportReceiptIdentity = {
+  version: 1,
+  authority: 'memory://fleet-exports/receipts/v1',
+  databaseId: '00000000-0000-0000-0000-000000000001',
+  operationId: '00000000-0000-4000-8000-000000000002',
+};
+const legacyExportStore: DurableDatabaseExportStore = {
+  async write() {
+    return { location: 'memory://legacy', ...databaseExportIntegrity };
+  },
+};
+const receiptExportStore: DurableDatabaseExportStore = {
+  ...legacyExportStore,
+  receiptAuthority: databaseExportReceiptIdentity.authority,
+  async writeReceipt() {
+    return { location: 'memory://receipt', ...databaseExportIntegrity };
+  },
+};
+const storeReceiptAuthority: string | undefined =
+  receiptExportStore.receiptAuthority;
+const storeReceiptWrite: DurableDatabaseExportStore['writeReceipt'] =
+  receiptExportStore.writeReceipt;
+const plainWorkerBackendOptions: PlainWorkerBackendOptions = {
+  api: plainWorkerProvisioningApiShape,
+  identityCaller: 'PackedConsumer.seedDeploymentIdentity',
+};
+const plainWorkerBackend: ProvisioningBackend = new PlainWorkerBackend(
+  plainWorkerBackendOptions,
+);
+const directClient = new CloudflareProvisioningClient({
+  accountId: 'account',
+  apiToken: 'token',
+  plane: 'plain-worker',
+  rateCoordinator: new ProcessLocalCloudflareApiRateCoordinator(),
+});
+const directBackendOptions: CloudflareApiPlainWorkerBackendOptions = {
+  client: directClient,
+};
+const directBackend: ProvisioningBackend =
+  new CloudflareApiPlainWorkerBackend(directBackendOptions);
+const directReceiptAuthority: string | undefined =
+  directClient.databaseExportReceiptAuthority;
+const directReceiptExport:
+  | ((identity: DatabaseExportReceiptIdentity) => Promise<DatabaseExport>)
+  | undefined = directClient.exportDatabaseReceipt;
+const plainReceiptAuthority: string | undefined =
+  plainWorkerProvisioningApiShape.databaseExportReceiptAuthority;
+const plainReceiptExport:
+  | ((
+      identity: DatabaseExportReceiptIdentity,
+      fence: ExternalMutationFence,
+    ) => Promise<PlainWorkerDatabaseExportResult>)
+  | undefined = plainWorkerProvisioningApiShape.exportDatabaseReceipt;
+const wfpReceiptAuthority: string | undefined =
+  api.databaseExportReceiptAuthority;
+const wfpReceiptExport:
+  | ((identity: DatabaseExportReceiptIdentity) => Promise<DatabaseExport>)
+  | undefined = api.exportDatabaseReceipt;
+const backendReceiptAuthority: string | undefined =
+  provisioningBackend.databaseExportReceiptAuthority;
+const backendReceiptExport:
+  | ((
+      identity: DatabaseExportReceiptIdentity,
+      fence: ExternalMutationFence,
+    ) => Promise<DatabaseExport>)
+  | undefined = provisioningBackend.exportDatabaseReceipt;
+const decommissionScanResults: readonly DecommissionAttachmentScanResult[] = [
+  {
+    status: 'pending',
+    progress: decommissionProgress,
+    providerFetchAttemptsReserved: 9,
+  },
+  {
+    status: 'attached',
+    attachment: decommissionAttachment,
+    providerFetchAttemptsReserved: 9,
+  },
+  {
+    status: 'complete',
+    evidenceSha256: decommissionEvidence.evidenceSha256,
+    evidenceCount: decommissionEvidence.evidenceCount,
+    providerFetchAttemptsReserved: 9,
+  },
+  { status: 'drift' },
+];
+const directDecommissionScan =
+  directClient.advanceDecommissionAttachmentScan(decommissionScanInput);
+const routeDecommissionScan =
+  plainWorkerRouteApi.advanceDecommissionAttachmentScan?.(
+    decommissionScanInput,
+  );
+const backendDecommissionScan =
+  provisioningBackend.advanceDecommissionAttachmentScan?.(
+    decommissionScanInput,
+  );
+const wfpDecommissionScan = api.advanceDecommissionAttachmentScan?.(
+  decommissionScanInput,
+);
+const databaseResidualAssertion =
+  provisioningBackend.assertDatabaseDeletionResidualsRemoved;
+const decommissionActions: readonly DecommissionAdvanceAction[] = [
+  { kind: 'start' },
+  { kind: 'continue', token: decommissionToken },
+  { kind: 'restart-blocked', token: decommissionToken },
+];
+const decommissionCapabilities: readonly DecommissionAdvanceCapability[] = [
+  'attachment-scan',
+  'database-residuals',
+  'application-r2-inspection',
+  'application-r2-empty',
+  'application-r2-delete',
+  'database-export-receipt',
+  'database-read',
+  'database-delete',
+  'pending-artifact-inspection',
+];
+const optionalReceiptAuthority: string | undefined =
+  decommissionCommon.databaseExportReceiptAuthority;
+if (decommissionIntent.state === 'complete') {
+  const requiredReceiptAuthority: string =
+    decommissionIntent.databaseExportReceiptAuthority;
+  void requiredReceiptAuthority;
+}
+const decommissionAdvanceOptions: AdvanceDecommissionDeploymentOptions = {
+  backend: provisioningBackend,
+  store: fleetStateStore,
+  spec: deploymentSpec,
+  action: decommissionActions[0]!,
+  maxProviderRequests: 12,
+  randomUUID: () => '00000000-0000-4000-8000-000000000001',
+};
+const backendSwitchAdvanceOptions: AdvanceBackendSwitchDecommissionOptions = {
+  store: fleetStateStore,
+  provider: backendSwitchProvider,
+  priorSpec: deploymentSpec,
+  targetSpec: deploymentSpec,
+  action: decommissionActions[0]!,
+  maxProviderRequests: 12,
+  randomUUID: () => '00000000-0000-4000-8000-000000000003',
+};
+const decommissionAdvanceResults: readonly DecommissionAdvanceResult[] = [
+  { status: 'pending', token: decommissionToken },
+  {
+    status: 'blocked',
+    token: decommissionToken,
+    purpose: decommissionPurpose,
+    attachment: decommissionAttachment,
+  },
+  {
+    status: 'complete',
+    token: decommissionToken,
+    result: {
+      record: fleetRecord,
+      databaseExport: {
+        databaseId: fleetRecord.databaseId,
+        location: 'r2://exports/database.sql',
+        sha256: 'a'.repeat(64),
+        size: 1,
+      },
+    },
+  },
+];
+const boundedDecommissionAdvance = advanceDecommissionDeployment(
+  decommissionAdvanceOptions,
+);
+const boundedBackendSwitchAdvance = advanceBackendSwitchDecommission(
+  backendSwitchAdvanceOptions,
+);
+const boundedBackendSwitchActions = decommissionActions.map((action) =>
+  advanceBackendSwitchDecommission({
+    ...backendSwitchAdvanceOptions,
+    action,
+  }),
+);
+const switchPendingArtifactCapture =
+  backendSwitchProvider.captureSwitchEntryPendingArtifact;
+const switchAttachmentScan =
+  backendSwitchProvider.advanceSwitchDecommissionAttachmentScan;
+const switchReceiptAuthority: string | undefined =
+  backendSwitchProvider.databaseExportReceiptAuthority;
+const switchReceiptExport = backendSwitchProvider.exportSwitchDatabaseReceipt;
+const switchDatabaseRead = backendSwitchProvider.getSwitchDatabase;
+const switchDatabaseOwnerRead = backendSwitchProvider.readSwitchDatabaseOwner;
+const switchDatabaseResiduals =
+  backendSwitchProvider.assertSwitchDatabaseDeletionResidualsRemoved;
+const switchDatabaseDelete = backendSwitchProvider.deleteSwitchDatabaseBounded;
+type PlainWorkerPortRecords = readonly [
+  PlainWorkerCleanupOutcome,
+  PlainWorkerDatabaseExportResult,
+  PlainWorkerDatabaseInventoryEntry,
+  PlainWorkerDeploymentStatus,
+  PlainWorkerMutationOutcome,
+  PlainWorkerUploadIntent,
+  PlainWorkerUploadIntentBase,
+  PlainWorkerUploadOutcome,
+  PlainWorkerVersionBinding,
+  PlainWorkerVersionDetail,
+  PlainWorkerVersionSummary,
+];
+declare const plainWorkerPortRecords: PlainWorkerPortRecords;
 // The provisioning-time fence state a control plane has to choose. Named here
 // because it is a REQUIRED provisionDeployment option: a consumer that cannot
 // import its type cannot type its own provisioning wrapper.
@@ -270,6 +715,70 @@ type SettledSettlementKeyIsOptional = {} extends Pick<
 const settledSettlementKeyIsOptional: SettledSettlementKeyIsOptional = true;
 const settledSettlementKey: string | undefined =
   fleetRecord.settledSettlementKey;
+type DecommissionIntentIsOptional = {} extends Pick<
+  FleetRecord,
+  'decommissionIntent'
+>
+  ? true
+  : false;
+const decommissionIntentIsOptional: DecommissionIntentIsOptional = true;
+const storedDecommissionIntent: DecommissionAdvanceIntent | undefined =
+  fleetRecord.decommissionIntent;
+void [
+  decommissionIntent,
+  decommissionToken,
+  decommissionClassification,
+  decommissionProgress,
+  decommissionPurpose,
+  decommissionEvidence,
+  decommissionScanInput,
+  decommissionScanResults,
+  decommissionAttachment,
+  decommissionCommon,
+  decommissionIdentity,
+  decommissionMode,
+  decommissionRecordIdentity,
+  decommissionPhase,
+  decommissionIntentIsOptional,
+  storedDecommissionIntent,
+  directDecommissionScan,
+  routeDecommissionScan,
+  backendDecommissionScan,
+  wfpDecommissionScan,
+  databaseResidualAssertion,
+  decommissionActions,
+  decommissionCapabilities,
+  optionalReceiptAuthority,
+  decommissionAdvanceOptions,
+  decommissionAdvanceResults,
+  boundedDecommissionAdvance,
+  backendSwitchAdvanceOptions,
+  boundedBackendSwitchAdvance,
+  boundedBackendSwitchActions,
+  switchPendingArtifactCapture,
+  switchAttachmentScan,
+  switchReceiptAuthority,
+  switchReceiptExport,
+  switchDatabaseRead,
+  switchDatabaseOwnerRead,
+  switchDatabaseResiduals,
+  switchDatabaseDelete,
+  databaseExportIntegrity,
+  databaseExportReceiptIdentity,
+  legacyExportStore,
+  receiptExportStore,
+  storeReceiptAuthority,
+  storeReceiptWrite,
+  receiptFence,
+  directReceiptAuthority,
+  directReceiptExport,
+  plainReceiptAuthority,
+  plainReceiptExport,
+  wfpReceiptAuthority,
+  wfpReceiptExport,
+  backendReceiptAuthority,
+  backendReceiptExport,
+];
 const customDomain: PlainWorkerCustomDomain = {
   id: 'domain-id',
   hostname: 'acme.example.test',
@@ -295,9 +804,55 @@ const settlementHost: FleetSettlementHost = {
   },
 };
 
+declare const migrationOptions: AdvanceFleetMigrationOptions;
+declare const migrationResult: FleetMigrationAdvanceResult;
+const migrationAction: FleetMigrationAdvanceAction = {
+  kind: 'continue',
+  token: migrationResult.token,
+};
+const migrationAdvance: Promise<FleetMigrationAdvanceResult> =
+  advanceFleetMigration({ ...migrationOptions, action: migrationAction });
+const migrationCapability: FleetMigrationAdvanceCapability =
+  new FleetMigrationAdvanceCapabilityError().capability;
+const migrationStep: FleetMigrationStep = 'admit-migrating';
+const migrationPlan: readonly FleetMigrationPlanEntry[] = [
+  { step: migrationStep },
+];
+const migrationProgress: FleetMigrationProgress = {
+  kind: 'migration',
+  revision: 0,
+  itemCount: 0,
+  activeItemOrdinal: 0,
+  completedItemCount: 0,
+};
+const migrationPage: Promise<Readonly<{
+  items: readonly FleetMigrationItem[];
+  done: boolean;
+}>> = readFleetMigrationItemsPage(migrationOptions.operationStore, {
+  operationId: migrationResult.token.operationId,
+  limit: 1,
+});
+const migrationAbandon: Promise<void> = abandonFleetMigrationOperation({
+  operationStore: migrationOptions.operationStore,
+  operationId: migrationResult.token.operationId,
+});
+if (migrationResult.status === 'complete') {
+  const summary: FleetMigrationResultRef = migrationResult.result;
+  void summary;
+}
+void migrationAdvance;
+void migrationCapability;
+void migrationPlan;
+void migrationProgress;
+void migrationPage;
+void migrationAbandon;
+
 void ActiveRouteAttestationError;
+void CloudflareApiPlainWorkerBackend;
 void CloudflareProvisioningClient;
 void D1CloudflareApiRateCoordinator;
+void FileSystemDatabaseExportStore;
+void PlainWorkerBackend;
 void ProcessLocalCloudflareApiRateCoordinator;
 void ProvisioningError;
 void WorkersForPlatformsBackend;
@@ -326,6 +881,13 @@ void deploymentSpec;
 void provisioningBackend;
 void fleetRecord;
 void plainWorkerRouteApi;
+void plainWorkerProvisioningApiShape;
+void plainWorkerBackendOptions;
+void plainWorkerBackend;
+void directClient;
+void directBackendOptions;
+void directBackend;
+void plainWorkerPortRecords;
 void initialExecutionFenceState;
 void lockedAtBirth;
 void seedOptions;
@@ -346,18 +908,30 @@ void settlementHost;
     `import assert from 'node:assert/strict';
 import {
   ActiveRouteAttestationError,
+  CloudflareProvisioningClient,
+  DecommissionAdvanceCapabilityError,
+  DecommissionAdvanceRestartError,
+  DecommissionAdvanceTokenDeploymentError,
+  DecommissionAdvanceTokenError,
+  DecommissionAdvanceTokenFutureError,
+  DecommissionAdvanceTokenOperationError,
   ProcessLocalCloudflareApiRateCoordinator,
+  FileSystemDatabaseExportStore,
+  FleetMigrationAdvanceCapabilityError,
   ProvisioningError,
   WorkersForPlatformsBackend,
+  advanceBackendSwitchDecommission,
+  advanceDecommissionDeployment,
+  abandonFleetMigrationOperation,
+  advanceFleetMigration,
+  readFleetMigrationItemsPage,
   attestConvergedActiveRoute,
   attestFleetRecordActiveRoute,
   deploymentSpecDigest,
   fleetSettlementKey,
+  plainWorkerIngressModule,
 } from '@proofoftech/fleet-control';
 
-// Every export entry must load. The three Workers entries are default-export
-// module objects that no in-repo consumer imports across the package boundary,
-// so this is the only place a broken exports key surfaces before the registry.
 const [dispatch, outbound, auditConsumer] = await Promise.all([
   import('@proofoftech/fleet-control/workers/dispatch'),
   import('@proofoftech/fleet-control/workers/outbound'),
@@ -370,6 +944,25 @@ assert.equal(typeof outbound.StateEgress, 'function');
 assert.equal(typeof auditConsumer.default.queue, 'function');
 
 assert.equal(typeof deploymentSpecDigest, 'function');
+const inspectionSpec = {
+  tenantTag: 'packed', environment: 'test', scriptName: 'packed-inspection',
+  databaseName: 'packed-inspection', compatibilityDate: '2026-08-06',
+  authoredBy: 'platform', schemaVersion: 1,
+  migrations: [{ version: 1, sql: 'CREATE TABLE example (id TEXT)' }],
+  mainModule: 'worker.js',
+  modules: [{ name: 'worker.js', content: 'export class Maintenance {} export default {fetch(){return new Response()}};' }],
+  durableObjectMigrations: [{ tag: 'v1', newSqliteClasses: ['Maintenance'] }],
+  durableObjectBindings: [{ name: 'MAINTENANCE', className: 'Maintenance' }],
+  routeHostname: 'app.example.test', maintenanceBaseUrl: 'https://control.example.test',
+};
+const inspectedIngress = plainWorkerIngressModule(inspectionSpec);
+assert.equal(typeof inspectedIngress.name, 'string');
+assert.ok(inspectedIngress.content.length > 0);
+assert.notEqual(inspectedIngress.name, inspectionSpec.mainModule);
+assert.throws(
+  () => plainWorkerIngressModule({ ...inspectionSpec, modules: [...inspectionSpec.modules, inspectedIngress] }),
+  /reserve/,
+);
 assert.equal(typeof ProcessLocalCloudflareApiRateCoordinator, 'function');
 assert.ok(new ProvisioningError('probe') instanceof Error);
 assert.equal(typeof ActiveRouteAttestationError, 'function');
@@ -377,6 +970,147 @@ assert.ok(new ActiveRouteAttestationError('probe', {}) instanceof Error);
 assert.equal(typeof attestConvergedActiveRoute, 'function');
 assert.equal(typeof attestFleetRecordActiveRoute, 'function');
 assert.equal(typeof fleetSettlementKey, 'function');
+assert.equal(typeof advanceBackendSwitchDecommission, 'function');
+assert.equal(typeof advanceDecommissionDeployment, 'function');
+assert.equal(typeof advanceFleetMigration, 'function');
+assert.equal(typeof readFleetMigrationItemsPage, 'function');
+assert.equal(typeof abandonFleetMigrationOperation, 'function');
+const migrationCapability = new FleetMigrationAdvanceCapabilityError();
+assert.ok(migrationCapability instanceof Error);
+assert.equal(migrationCapability.name, 'FleetMigrationAdvanceCapabilityError');
+assert.equal(migrationCapability.capability, 'operation-store');
+assert.equal(
+  migrationCapability.message,
+  'fleet migration advance requires an operation store',
+);
+await assert.rejects(
+  advanceFleetMigration({ operationStore: {} }),
+  FleetMigrationAdvanceCapabilityError,
+);
+const rootExports = await import('@proofoftech/fleet-control');
+for (const internal of [
+  'admitFleetMigrationItem',
+  'revalidateFleetMigrationAdmission',
+  'assertFleetMigrationPlanCompatibility',
+  'assertMigratingCarrierState',
+  'executeNextMigrationStep',
+]) assert.equal(internal in rootExports, false);
+const missingCapability = new DecommissionAdvanceCapabilityError(
+  'attachment-scan',
+);
+assert.equal(missingCapability.name, 'DecommissionAdvanceCapabilityError');
+assert.equal(missingCapability.capability, 'attachment-scan');
+assert.equal(
+  missingCapability.message,
+  'backend cannot perform bounded decommission attachment scans',
+);
+const missingReceiptCapability = new DecommissionAdvanceCapabilityError(
+  'database-export-receipt',
+);
+assert.equal(
+  Object.getPrototypeOf(missingReceiptCapability),
+  DecommissionAdvanceCapabilityError.prototype,
+);
+assert.equal(
+  missingReceiptCapability.name,
+  'DecommissionAdvanceCapabilityError',
+);
+assert.equal(
+  missingReceiptCapability.capability,
+  'database-export-receipt',
+);
+assert.equal(
+  missingReceiptCapability.message,
+  'backend cannot write idempotent database export receipts',
+);
+for (const [capability, message] of [
+  [
+    'database-read',
+    'backend cannot read the database for bounded decommission',
+  ],
+  [
+    'database-delete',
+    'backend cannot delete the database for bounded decommission',
+  ],
+  [
+    'pending-artifact-inspection',
+    'backend cannot inspect pending ordinary Worker authority for bounded decommission',
+  ],
+]) {
+  const error = new DecommissionAdvanceCapabilityError(capability);
+  assert.equal(error.capability, capability);
+  assert.equal(error.message, message);
+}
+const restartError = new DecommissionAdvanceRestartError();
+assert.equal(restartError.name, 'DecommissionAdvanceRestartError');
+assert.equal(
+  restartError.message,
+  'decommission advance restart requires a current blocked operation',
+);
+for (const ErrorClass of [
+  DecommissionAdvanceTokenDeploymentError,
+  DecommissionAdvanceTokenError,
+  DecommissionAdvanceTokenFutureError,
+  DecommissionAdvanceTokenOperationError,
+]) {
+  assert.ok(new ErrorClass() instanceof Error);
+}
+assert.equal(
+  typeof CloudflareProvisioningClient.prototype
+    .advanceDecommissionAttachmentScan,
+  'function',
+);
+assert.equal(
+  typeof CloudflareProvisioningClient.prototype
+    .existingDurableObjectNamespaceIds,
+  'function',
+);
+const legacyClient = new CloudflareProvisioningClient({
+  accountId: 'a',
+  apiToken: 't',
+  plane: 'plain-worker',
+  rateCoordinator: new ProcessLocalCloudflareApiRateCoordinator(),
+  exportStore: {
+    async write() {
+      return { location: 'memory://legacy', size: 1, sha256: 'a'.repeat(64) };
+    },
+  },
+});
+assert.equal('databaseExportReceiptAuthority' in legacyClient, false);
+assert.equal('exportDatabaseReceipt' in legacyClient, false);
+const fileStore = new FileSystemDatabaseExportStore('/tmp/fleet-control-packed-receipts');
+if (process.platform !== 'win32') {
+  assert.equal(typeof fileStore.receiptAuthority, 'string');
+  assert.equal(typeof fileStore.writeReceipt, 'function');
+}
+assert.throws(
+  () =>
+    new CloudflareProvisioningClient({
+      accountId: 'a',
+      apiToken: 't',
+      plane: 'plain-worker',
+      dispatchNamespace: 'x',
+      rateCoordinator: new ProcessLocalCloudflareApiRateCoordinator(),
+    }),
+  /plain-worker plane cannot name a dispatch namespace/,
+);
+assert.throws(
+  () =>
+    new CloudflareProvisioningClient({
+      accountId: 'a',
+      apiToken: 't',
+      rateCoordinator: new ProcessLocalCloudflareApiRateCoordinator(),
+    }),
+  /dispatchNamespace/,
+);
+assert.ok(
+  new CloudflareProvisioningClient({
+    accountId: 'a',
+    apiToken: 't',
+    plane: 'plain-worker',
+    rateCoordinator: new ProcessLocalCloudflareApiRateCoordinator(),
+  }),
+);
 
 // The trusted-configuration constructor must fail closed. This is the barrier
 // that makes a published fleet-control inert without control-plane inputs, so
@@ -427,19 +1161,11 @@ assert.ok(new WorkersForPlatformsBackend(complete));
   // metadata mirror, so --offline fails there with ERR_PNPM_NO_OFFLINE_META
   // while passing on a developer machine whose mirror is warm.
   //
-  // Resolution is still pinned: cloudflare and p-queue come from the packed
-  // manifest as exact versions and flowsafe is overridden to the workspace
-  // tree, so nothing floats. The age-gate flag matches the sibling gates.
-  run(
-    'pnpm',
-    [
-      'install',
-      '--prefer-offline',
-      '--ignore-scripts',
-      '--config.minimum-release-age=0',
-    ],
-    { cwd: consumerDirectory },
-  );
+  // Resolution is pinned and the standalone workspace enforces the same
+  // seven-day quarantine as the repository. Lifecycle scripts stay disabled.
+  run('pnpm', ['install', '--prefer-offline', '--ignore-scripts'], {
+    cwd: consumerDirectory,
+  });
   // Prove the override actually took. Without this, deleting the overrides
   // block above leaves this gate green while the consumer resolves the
   // previously published flowsafe instead of the one being released with it.
@@ -477,9 +1203,24 @@ assert.ok(new WorkersForPlatformsBackend(complete));
     cwd: consumerDirectory,
   });
   run(process.execPath, ['runtime.mjs'], { cwd: consumerDirectory });
+  await verifyControlPlanePackedSurface({ consumerDirectory, packageRoot });
+  run(process.execPath, [
+    '--test',
+    join(packageRoot, 'scripts/control-plane-packed-surface.test.mjs'),
+    join(packageRoot, 'scripts/control-plane-packed-bundle.test.mjs'),
+  ]);
+  await verifyControlPlanePackedBundle({ consumerDirectory, packageRoot });
+  await verifyControlPlanePackedRuntime({ consumerDirectory, packageRoot });
+  await verifyControlPlanePackedWorkload({ consumerDirectory, packageRoot });
+  await verifyDirectArtifactsPacked({ consumerDirectory, packageRoot });
+  assert.deepEqual(
+    await readFile(join(workspaceRoot, 'pnpm-lock.yaml')),
+    lockfileBefore,
+    'packed consumer verification must preserve the workspace resolution',
+  );
 
   process.stdout.write(
-    'fleet-control packed consumer: manifest, all four export entries, types, and the fail-closed constructor passed\n',
+    'fleet-control packed consumer: package exports, strict Worker types, bundle checks and Worker runtime probes passed\n',
   );
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });

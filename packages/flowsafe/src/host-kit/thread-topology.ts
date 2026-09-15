@@ -28,7 +28,9 @@ import {
 import {
   deploymentIdentityHeaders,
   EXECUTION_PRINCIPAL_HEADER,
+  normalizeMutationEpoch,
   stampDeploymentIdentityRequest,
+  stampMutationEpoch,
 } from '../do-runner/index.js';
 import { requireMemoryId } from './memory-boundary.js';
 
@@ -62,7 +64,10 @@ export interface ThreadRequestInit {
   body?: string;
 }
 
-export type ThreadPrincipalContext = Pick<ActorContext, 'principal'>;
+export type ThreadPrincipalContext = Pick<
+  ActorContext,
+  'principal' | 'mutationEpoch'
+>;
 
 /** A standing-memory target that must resolve to a durable thread binding. */
 export interface BoundThreadTarget {
@@ -129,10 +134,12 @@ export function createThreadTopology<Id>(
   // 404 would escape past the very handler meant to map it.
   return {
     send: async (context, threadId, path, init = {}) => {
+      const principal = stampedPrincipal(context);
+      const mutationEpoch = normalizeMutationEpoch(context.mutationEpoch);
       // Merge through Headers so the stamp wins by case-insensitive name. A
       // plain-object spread can preserve duplicate case variants instead.
       const merged = new Headers(init.headers);
-      const principal = stampedPrincipal(context);
+      stampMutationEpoch(merged, mutationEpoch);
       merged.set(
         EXECUTION_PRINCIPAL_HEADER,
         encodeExecutionPrincipal(principal),
@@ -152,6 +159,8 @@ export function createThreadTopology<Id>(
       });
     },
     forward: async (context, threadId, request) => {
+      const principal = stampedPrincipal(context);
+      const mutationEpoch = normalizeMutationEpoch(context.mutationEpoch);
       const threadName = addressed(threadId);
       // A cloned Request has MUTABLE headers where an inbound one does not, so
       // this is what lets the overwrite happen at all — and `set` (not `append`)
@@ -161,7 +170,7 @@ export function createThreadTopology<Id>(
         request,
         deploymentIdentitySecret,
       );
-      const principal = stampedPrincipal(context);
+      stampMutationEpoch(forwarded.headers, mutationEpoch);
       // Retired identity headers: nothing reads them, but a client's forged
       // value must not ride into the DO as if the topology had stamped it.
       forwarded.headers.delete('x-flowsafe-actor');

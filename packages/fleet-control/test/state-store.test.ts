@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { backendSwitchDecommissionSnapshotDigest } from '../src/backend-switch.js';
+import { initialWorkerAttachmentScan } from '../src/cloudflare-worker-attachment-scan-state.js';
+import { DECOMMISSION_INTENT_BYTE_BOUND } from '../src/decommission-intent.js';
 import {
   canonicalDeploymentEgressPolicy,
   durableObjectMigrationHistoryDigest,
@@ -13,9 +16,29 @@ import {
   type FleetStateDatabase,
 } from '../src/state-store.js';
 import type { FleetRecord, PlatformPlaneResourceSet } from '../src/types.js';
+import {
+  backendSwitchDecommissionRecordFixture,
+  type NormalDecommissionIntentFixtureOptions,
+  normalDecommissionIntentFixture,
+} from './fixtures/decommission-intent-fixture.js';
 
 const MAINTENANCE_PUBLIC_KEY =
   '{"kty":"OKP","crv":"Ed25519","alg":"EdDSA","kid":"fleet-maintenance-v1","x":"Lhp1XFeTJJx8FLOCKpn4nkO-tWuZZxXX8ziw0LEvUZo"}';
+const INVALID_DECOMMISSION_INTENT =
+  'fleet state row has invalid decommission_intent';
+
+async function expectInvalidDecommission(
+  operation: Promise<unknown>,
+): Promise<void> {
+  let refusal: unknown;
+  try {
+    await operation;
+  } catch (error) {
+    refusal = error;
+  }
+  expect(refusal).toBeInstanceOf(Error);
+  expect((refusal as Error).message).toBe(INVALID_DECOMMISSION_INTENT);
+}
 
 function nullableTextColumn(name: string): Readonly<Record<string, unknown>> {
   return { name, type: 'TEXT', notnull: 0, pk: 0 };
@@ -27,6 +50,7 @@ function addedColumnName(sql: string): string | undefined {
 
 class MemoryD1 implements FleetStateDatabase {
   row: Readonly<Record<string, unknown>> | undefined;
+  deploymentInsertSql: string | undefined;
   readonly claims = new Map<string, Readonly<Record<string, unknown>>>();
 
   async query(
@@ -130,6 +154,7 @@ class MemoryD1 implements FleetStateDatabase {
       );
     }
     if (sql.startsWith('INSERT INTO anchorage_fleet_deployments')) {
+      this.deploymentInsertSql = sql;
       const names = [
         'tenant_tag',
         'environment',
@@ -152,6 +177,9 @@ class MemoryD1 implements FleetStateDatabase {
         'platform_target',
         'migration_intent',
         'backend_switch_intent',
+        'decommission_intent',
+        'cleanup_intent',
+        'invocation_authority',
         'durable_object_tag',
         'durable_object_migration_history',
         'durable_object_migration_history_digest',
@@ -165,6 +193,7 @@ class MemoryD1 implements FleetStateDatabase {
         'database_export_size',
         'settled_settlement_key',
         'updated_at',
+        'wfp_mode',
       ];
       this.row = Object.fromEntries(
         names.map((name, index) => [name, bindings[index] ?? null]),
@@ -287,11 +316,45 @@ class MemoryD1 implements FleetStateDatabase {
   }
 }
 
+class LostResponseD1 extends MemoryD1 {
+  lose: 'exact' | 'changed' | undefined;
+
+  override async batch(
+    statements: readonly Readonly<{
+      sql: string;
+      bindings?: readonly unknown[];
+    }>[],
+  ): Promise<readonly (readonly Readonly<Record<string, unknown>>[])[]> {
+    const results = await super.batch(statements);
+    const lose = this.lose;
+    if (!lose) return results;
+    this.lose = undefined;
+    if (
+      lose === 'changed' &&
+      typeof this.row?.decommission_intent === 'string'
+    ) {
+      const intent = JSON.parse(this.row.decommission_intent) as Record<
+        string,
+        unknown
+      >;
+      this.row = {
+        ...this.row,
+        decommission_intent: JSON.stringify({
+          ...intent,
+          revision: Number(intent.revision) + 1,
+        }),
+      };
+    }
+    throw new Error(`committed ${lose} D1 batch response lost`);
+  }
+}
+
 class SchemaD1 implements FleetStateDatabase {
   readonly columns = new Map<string, Readonly<Record<string, unknown>>>(
     ADDED_NULLABLE_TEXT_COLUMNS.map((name) => [name, nullableTextColumn(name)]),
   );
   createAttempts = 0;
+  deploymentCreateSql: string | undefined;
   alterAttempts = 0;
   failCreateOnce = false;
   failAlterOnce = false;
@@ -308,6 +371,7 @@ class SchemaD1 implements FleetStateDatabase {
       sql.startsWith('CREATE TABLE IF NOT EXISTS anchorage_fleet_deployments')
     ) {
       this.createAttempts += 1;
+      this.deploymentCreateSql = sql;
       if (this.failCreateOnce) {
         this.failCreateOnce = false;
         throw new Error('transient schema failure');
@@ -392,6 +456,135 @@ function reservedRecord(
   };
 }
 
+const DECOMMISSION_OPERATION_ID = '123e4567-e89b-42d3-a456-426614174000';
+const DECOMMISSION_RECEIPT_AUTHORITY = 'memory://fleet-exports/receipts/v1';
+
+function decommissionBase(): FleetRecord {
+  return {
+    ...reservedRecord('plain-worker'),
+    artifactVersion: 'artifact-v1',
+    phase: 'ready',
+    applicationResources: [],
+    applicationBindings: { vars: [], secrets: [], r2Buckets: [] },
+  };
+}
+
+function decommissionFixtureOptions(
+  revision: number,
+): NormalDecommissionIntentFixtureOptions {
+  return {
+    operationId: DECOMMISSION_OPERATION_ID,
+    revision,
+    generation: 0,
+    updatedAt: `2026-08-11T00:00:${String(revision).padStart(2, '0')}.000Z`,
+    entryLifecyclePhase: 'ready',
+  };
+}
+
+function transitioningRecord(revision = 0): FleetRecord {
+  const base = decommissionBase();
+  return {
+    ...base,
+    phase: 'decommission-advancing',
+    decommissionIntent: {
+      state: 'transitioning',
+      ...normalDecommissionIntentFixture(
+        base,
+        'ready',
+        decommissionFixtureOptions(revision),
+      ),
+    },
+  };
+}
+
+function externalPolicyAndTarget(record: FleetRecord) {
+  const outboundPolicy = canonicalDeploymentEgressPolicy({
+    policyId: `policy-${record.tenantTag}`,
+    tenantTag: record.tenantTag,
+    environment: record.environment,
+    allowedHosts: [],
+  });
+  return {
+    outboundPolicy,
+    platformTarget: {
+      maintenanceCapabilityPublicKey: MAINTENANCE_PUBLIC_KEY,
+      stateArtifactDigest: 'a'.repeat(64),
+      stateDurableObjectHistoryDigest: 'b'.repeat(64),
+      egressArtifactDigest: 'c'.repeat(64),
+      d1SchemaVersion: record.schemaVersion,
+      d1SchemaHistoryDigest: 'd'.repeat(64),
+      outboundPolicy,
+    },
+  };
+}
+
+function backendSwitchStateRecord(): FleetRecord {
+  const base = decommissionBase();
+  const { outboundPolicy, platformTarget } = externalPolicyAndTarget(base);
+  const prior = {
+    scriptName: base.scriptName,
+    artifactVersion: base.artifactVersion,
+    specDigest: base.desiredSpecDigest,
+    databaseId: base.databaseId,
+    databaseName: base.databaseName,
+    durableObjectBindings: [],
+    namespaceIds: [],
+    secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
+    application: { vars: [], secrets: [], r2Buckets: [] },
+    applicationResources: [],
+    customDomain: { id: 'domain-acme', hostname: base.routeHostname },
+  } as const;
+  const record: FleetRecord = {
+    ...base,
+    backend: 'workers-for-platforms',
+    outboundPolicy,
+    platformTarget,
+    platformResources: {
+      maintenanceCapabilityPublicKey: MAINTENANCE_PUBLIC_KEY,
+      outboundPolicy,
+      stateWorker: {
+        scriptName: base.scriptName,
+        artifactVersion: 'bridge-v1',
+        artifactDigest: platformTarget.stateArtifactDigest,
+        plane: 'ordinary',
+        durableObjectBindings: [],
+        namespaceIds: [],
+      },
+      egressProxy: {
+        scriptName: 'acme-production-egress',
+        artifactVersion: 'egress-v1',
+        artifactDigest: platformTarget.egressArtifactDigest,
+        ...outboundPolicy,
+      },
+    },
+  };
+  const decommissionSnapshot = {
+    prior,
+    restoredArtifactVersion: null,
+    entryPendingArtifactVersion: null,
+    entryPendingNamespaceIds: null,
+    providerTargetSpecDigest: base.desiredSpecDigest,
+    routeHostname: base.routeHostname,
+    routeTargets: [],
+    desiredSpecDigest: base.desiredSpecDigest,
+    target: platformTarget,
+    releases: [],
+    applicationResources: [],
+  } as const;
+  return backendSwitchDecommissionRecordFixture(record, {
+    kind: 'backend-switch',
+    tenantTag: record.tenantTag,
+    environment: record.environment,
+    prior,
+    targetSpecDigest: record.desiredSpecDigest,
+    targetApplication: { vars: [], secrets: [], r2Buckets: [] },
+    target: platformTarget,
+    rollbackUntil: '2026-09-30T00:00:00.000Z',
+    subphase: 'finalized',
+    decommissionSnapshot,
+  });
+}
+
 function platformSet(workerName: string): PlatformPlaneResourceSet {
   return {
     accountId: 'account',
@@ -407,6 +600,61 @@ function platformSet(workerName: string): PlatformPlaneResourceSet {
 }
 
 describe('D1FleetStateStore release state', () => {
+  it.each([
+    'plain-worker',
+    'workers-for-platforms',
+  ] as const)('round-trips own mutable teardown artifacts without external topology (%s)', async (backend) => {
+    const db = new MemoryD1();
+    const store = new D1FleetStateStore(db, { accountId: 'account' });
+    const base = decommissionBase();
+    const activeRelease = {
+      physicalScriptName: base.scriptName,
+      specDigest: base.desiredSpecDigest,
+      artifactVersion: base.artifactVersion,
+      releaseSchemaVersion: base.schemaVersion,
+      application: base.applicationBindings,
+    };
+    const record: FleetRecord = {
+      ...base,
+      backend,
+      activeRelease,
+      ...(backend === 'workers-for-platforms'
+        ? {
+            wfpMode: 'platform-catalog',
+            outboundPolicy: externalPolicyAndTarget(base).outboundPolicy,
+          }
+        : {}),
+    };
+    await store.withDeploymentLease(
+      record.tenantTag,
+      record.environment,
+      (lease) => lease.put(record),
+    );
+    await expect(
+      store.get(record.tenantTag, record.environment),
+    ).resolves.toMatchObject({ activeRelease });
+    if (!db.row) throw new Error('stored mutable fixture row is missing');
+    const stored = { ...db.row };
+    for (const alteration of [
+      { physicalScriptName: 'foreign-script' },
+      { artifactVersion: '' },
+    ]) {
+      db.row = {
+        ...stored,
+        active_release: JSON.stringify({ ...activeRelease, ...alteration }),
+      };
+      await expect(
+        store.get(record.tenantTag, record.environment),
+      ).rejects.toThrow('invalid active_release');
+    }
+    if (backend === 'workers-for-platforms') {
+      db.row = { ...stored, wfp_mode: null };
+      await expect(
+        store.get(record.tenantTag, record.environment),
+      ).rejects.toThrow('invalid active_release');
+    }
+  });
+
   it('retries a transient schema bootstrap failure on the same instance', async () => {
     const db = new SchemaD1();
     db.failCreateOnce = true;
@@ -485,6 +733,489 @@ describe('D1FleetStateStore release state', () => {
     ).rejects.toThrow(/absent or incompatible/u);
   });
 
+  it('round-trips every decommission shell arm and an absent shell', async () => {
+    const db = new MemoryD1();
+    const store = new D1FleetStateStore(db, { accountId: 'account' });
+    const base = decommissionBase();
+    const explicitFixture = normalDecommissionIntentFixture(
+      base,
+      'database-deleting',
+      {
+        operationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        revision: 7,
+        generation: 8,
+        updatedAt: '2026-08-29T12:34:56.789Z',
+        requestedSpecDigest: 'e'.repeat(64),
+        entryLifecyclePhase: 'rolling-back',
+        databaseExportReceiptAuthority: DECOMMISSION_RECEIPT_AUTHORITY,
+      },
+    );
+    expect(JSON.stringify(explicitFixture)).toBe(
+      JSON.stringify({
+        version: 1,
+        operationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        revision: 7,
+        generation: 8,
+        updatedAt: '2026-08-29T12:34:56.789Z',
+        identity: {
+          record: {
+            tenantTag: base.tenantTag,
+            environment: base.environment,
+            backend: base.backend,
+            scriptName: base.scriptName,
+            databaseId: base.databaseId,
+            databaseName: base.databaseName,
+            routeHostname: base.routeHostname,
+          },
+          mode: {
+            kind: 'normal',
+            requestedSpecDigest: 'e'.repeat(64),
+            entryLifecyclePhase: 'rolling-back',
+          },
+        },
+        databaseExportReceiptAuthority: DECOMMISSION_RECEIPT_AUTHORITY,
+        lifecyclePhase: 'database-deleting',
+      }),
+    );
+    await store.withDeploymentLease('acme', 'production', (lease) =>
+      lease.put(base),
+    );
+    await expect(store.get('acme', 'production')).resolves.toEqual(base);
+
+    const purpose = {
+      kind: 'database-pre-export' as const,
+      databaseId: base.databaseId,
+    };
+    const progress = initialWorkerAttachmentScan({
+      kind: 'd1',
+      databaseId: base.databaseId,
+    });
+    const active = (
+      intent: NonNullable<FleetRecord['decommissionIntent']>,
+    ): FleetRecord => ({
+      ...base,
+      phase: 'decommission-advancing',
+      decommissionIntent: intent,
+    });
+    const pendingSpecDigest = 'd'.repeat(64);
+    const migratingBase: FleetRecord = {
+      ...base,
+      phase: 'decommission-advancing',
+      pendingSpecDigest,
+      pendingArtifactVersion: 'candidate-v1',
+    };
+    const migratingCommon = normalDecommissionIntentFixture(
+      migratingBase,
+      'migrating',
+      {
+        ...decommissionFixtureOptions(1),
+        requestedSpecDigest: pendingSpecDigest,
+        entryLifecyclePhase: 'migrating',
+      },
+    );
+    const migratingRecord: FleetRecord = {
+      ...migratingBase,
+      decommissionIntent: {
+        ...migratingCommon,
+        state: 'transitioning',
+      },
+    };
+    const {
+      pendingArtifactVersion: _pendingArtifactVersion,
+      ...migratingWithoutArtifact
+    } = migratingRecord;
+    const transitioning = transitioningRecord();
+    const records: FleetRecord[] = [
+      transitioning,
+      migratingRecord,
+      migratingWithoutArtifact,
+      active({
+        ...normalDecommissionIntentFixture(
+          base,
+          'application-resources-deleted',
+          {
+            ...decommissionFixtureOptions(1),
+            databaseExportReceiptAuthority: DECOMMISSION_RECEIPT_AUTHORITY,
+          },
+        ),
+        state: 'discover',
+        purpose,
+        progress,
+      }),
+      active({
+        ...normalDecommissionIntentFixture(
+          base,
+          'application-resources-deleted',
+          {
+            ...decommissionFixtureOptions(2),
+            databaseExportReceiptAuthority: DECOMMISSION_RECEIPT_AUTHORITY,
+          },
+        ),
+        state: 'verify',
+        purpose,
+        progress,
+        discoverEvidence: {
+          evidenceSha256: 'b'.repeat(64),
+          evidenceCount: 2,
+        },
+      }),
+      active({
+        ...normalDecommissionIntentFixture(
+          base,
+          'application-resources-deleted',
+          {
+            ...decommissionFixtureOptions(3),
+            databaseExportReceiptAuthority: DECOMMISSION_RECEIPT_AUTHORITY,
+          },
+        ),
+        state: 'blocked',
+        purpose,
+        attachment: { plane: 'ordinary', scriptName: 'foreign-worker' },
+      }),
+      { ...base, phase: 'decommissioned' },
+      (() => {
+        const common = normalDecommissionIntentFixture(
+          base,
+          'database-deleting',
+          {
+            ...decommissionFixtureOptions(4),
+            databaseExportReceiptAuthority: DECOMMISSION_RECEIPT_AUTHORITY,
+          },
+        );
+        return {
+          ...base,
+          phase: 'decommissioned',
+          databaseExportLocation: 'r2://exports/database.sql',
+          databaseExportSha256: 'c'.repeat(64),
+          databaseExportSize: 42,
+          decommissionIntent: {
+            ...common,
+            databaseExportReceiptAuthority: DECOMMISSION_RECEIPT_AUTHORITY,
+            lifecyclePhase: 'decommissioned',
+            state: 'complete',
+          },
+        };
+      })(),
+    ];
+
+    for (const record of records) {
+      await store.withDeploymentLease('acme', 'production', (lease) =>
+        lease.put(record),
+      );
+      const roundTripped = await store.get('acme', 'production');
+      expect(roundTripped).toEqual(record);
+      await expect(store.list()).resolves.toEqual([record]);
+      const persistedIntent = db.row?.decommission_intent;
+      expect(persistedIntent).toBe(
+        roundTripped?.decommissionIntent
+          ? JSON.stringify(roundTripped.decommissionIntent)
+          : null,
+      );
+      if (
+        record.decommissionIntent &&
+        record !== migratingRecord &&
+        record !== migratingWithoutArtifact
+      ) {
+        expect(record.decommissionIntent.identity.mode).toMatchObject({
+          kind: 'normal',
+          entryLifecyclePhase: 'ready',
+        });
+      }
+      if (record === transitioning) {
+        expect(JSON.stringify(record.decommissionIntent)).toMatch(
+          /^\{"state":"transitioning"/u,
+        );
+        expect(persistedIntent).not.toBe(
+          JSON.stringify(record.decommissionIntent),
+        );
+      }
+    }
+    const persisted = structuredClone(db.row);
+    await expectInvalidDecommission(
+      store.withDeploymentLease('acme', 'production', (lease) =>
+        lease.put({
+          ...transitioning,
+          decommissionIntent: {
+            ...transitioning.decommissionIntent,
+            databaseExportReceiptAuthority: DECOMMISSION_RECEIPT_AUTHORITY,
+          } as NonNullable<FleetRecord['decommissionIntent']>,
+        }),
+      ),
+    );
+    const d1Record = records[3];
+    if (!d1Record?.decommissionIntent) {
+      throw new Error('missing D1 decommission fixture');
+    }
+    const {
+      databaseExportReceiptAuthority: _databaseExportReceiptAuthority,
+      ...d1IntentWithoutAuthority
+    } = d1Record.decommissionIntent;
+    await expectInvalidDecommission(
+      store.withDeploymentLease('acme', 'production', (lease) =>
+        lease.put({
+          ...d1Record,
+          decommissionIntent: d1IntentWithoutAuthority as NonNullable<
+            FleetRecord['decommissionIntent']
+          >,
+        }),
+      ),
+    );
+    for (const pendingArtifactVersion of ['', 'pending', 42]) {
+      await expectInvalidDecommission(
+        store.withDeploymentLease('acme', 'production', (lease) =>
+          lease.put({
+            ...migratingRecord,
+            pendingArtifactVersion: pendingArtifactVersion as never,
+          }),
+        ),
+      );
+    }
+    await expectInvalidDecommission(
+      store.withDeploymentLease('acme', 'production', (lease) =>
+        lease.put({
+          ...migratingRecord,
+          decommissionIntent: {
+            ...migratingRecord.decommissionIntent,
+            lifecyclePhase: 'decommissioning',
+          } as NonNullable<FleetRecord['decommissionIntent']>,
+        }),
+      ),
+    );
+    expect(db.row).toEqual(persisted);
+  });
+
+  it('refuses malformed decommission columns and write values', async () => {
+    const db = new MemoryD1();
+    const store = new D1FleetStateStore(db, { accountId: 'account' });
+    const valid = transitioningRecord();
+    await store.withDeploymentLease('acme', 'production', (lease) =>
+      lease.put(valid),
+    );
+    const persisted = structuredClone(db.row);
+    const validIntent = valid.decommissionIntent;
+    if (!validIntent) throw new Error('test record has no decommission intent');
+
+    const serialized = String(persisted?.decommission_intent);
+    const exactBound = serialized.padEnd(DECOMMISSION_INTENT_BYTE_BOUND, ' ');
+    expect(DECOMMISSION_INTENT_BYTE_BOUND).toBe(98_304);
+    expect(new TextEncoder().encode(exactBound).byteLength).toBe(
+      DECOMMISSION_INTENT_BYTE_BOUND,
+    );
+    db.row = { ...persisted, decommission_intent: exactBound };
+    await expect(store.get('acme', 'production')).resolves.toEqual(valid);
+
+    for (const malformed of [
+      42,
+      '{',
+      'x'.repeat(98_305),
+      'é'.repeat(49_153),
+      JSON.stringify({ ...validIntent, version: 2 }),
+      JSON.stringify({
+        ...validIntent,
+        identity: {
+          ...validIntent.identity,
+          record: { ...validIntent.identity.record, scriptName: 'other' },
+        },
+      }),
+    ]) {
+      db.row = { ...persisted, decommission_intent: malformed };
+      await expectInvalidDecommission(store.get('acme', 'production'));
+    }
+    db.row = persisted;
+
+    const encode = vi.spyOn(TextEncoder.prototype, 'encode');
+    try {
+      const before = encode.mock.calls.length;
+      db.row = { ...persisted, decommission_intent: 'x'.repeat(98_305) };
+      await expectInvalidDecommission(store.get('acme', 'production'));
+      expect(encode).toHaveBeenCalledTimes(before);
+    } finally {
+      encode.mockRestore();
+      db.row = persisted;
+    }
+
+    db.row = {
+      ...persisted,
+      phase: 'decommission-advancing',
+      decommission_intent: null,
+    };
+    await expectInvalidDecommission(store.get('acme', 'production'));
+    db.row = persisted;
+
+    await expect(
+      store.withDeploymentLease('acme', 'production', (lease) =>
+        lease.put({ ...valid, decommissionIntent: undefined }),
+      ),
+    ).rejects.toThrow('backend switch decommission record is malformed');
+    for (const malformed of [null, false]) {
+      await expectInvalidDecommission(
+        store.withDeploymentLease('acme', 'production', (lease) =>
+          lease.put({
+            ...decommissionBase(),
+            decommissionIntent: malformed as never,
+          }),
+        ),
+      );
+    }
+    await expectInvalidDecommission(
+      store.withDeploymentLease('acme', 'production', (lease) =>
+        lease.put({
+          ...decommissionBase(),
+          phase: 'decommission-advancing',
+        }),
+      ),
+    );
+    await expectInvalidDecommission(
+      store.withDeploymentLease('acme', 'production', (lease) =>
+        lease.put({
+          ...valid,
+          decommissionIntent: {
+            ...valid.decommissionIntent,
+            version: 2,
+          } as never,
+        }),
+      ),
+    );
+    await expectInvalidDecommission(
+      store.withDeploymentLease('acme', 'production', (lease) =>
+        lease.put({
+          ...valid,
+          pendingSpecDigest: 'e'.repeat(64),
+        }),
+      ),
+    );
+    await expectInvalidDecommission(
+      store.withDeploymentLease('acme', 'production', (lease) =>
+        lease.put({
+          ...valid,
+          pendingSpecDigest: 'e'.repeat(64),
+          pendingArtifactVersion: 'candidate-v2',
+        }),
+      ),
+    );
+    expect(db.row).toEqual(persisted);
+  });
+
+  it('keeps the decommission column compatible and chronologically appended', async () => {
+    expect(ADDED_NULLABLE_TEXT_COLUMNS).toEqual([
+      'backend_switch_intent',
+      'settled_settlement_key',
+      'decommission_intent',
+      'cleanup_intent',
+      'invocation_authority',
+      'wfp_mode',
+    ]);
+    const current = new SchemaD1();
+    await new D1FleetStateStore(current, { accountId: 'account' }).get(
+      'acme',
+      'production',
+    );
+    expect(current.columns.get('decommission_intent')).toEqual(
+      nullableTextColumn('decommission_intent'),
+    );
+    expect(current.columns.get('cleanup_intent')).toEqual(
+      nullableTextColumn('cleanup_intent'),
+    );
+    expect(current.columns.get('invocation_authority')).toEqual(
+      nullableTextColumn('invocation_authority'),
+    );
+    expect(current.deploymentCreateSql).toMatch(
+      /backend_switch_intent TEXT,\s+decommission_intent TEXT,\s+cleanup_intent TEXT,\s+invocation_authority TEXT,\s+durable_object_tag TEXT/u,
+    );
+
+    const incompatible = new SchemaD1();
+    incompatible.columns.set('decommission_intent', {
+      name: 'decommission_intent',
+      type: 'INTEGER',
+      notnull: 1,
+      pk: 0,
+    });
+    await expect(
+      new D1FleetStateStore(incompatible, { accountId: 'account' }).get(
+        'acme',
+        'production',
+      ),
+    ).rejects.toThrow(/absent or incompatible/u);
+  });
+
+  it('keeps the independent INSERT projection in exact logical order', async () => {
+    const db = new MemoryD1();
+    const store = new D1FleetStateStore(db, { accountId: 'account' });
+    await store.withDeploymentLease('acme', 'production', (lease) =>
+      lease.put(transitioningRecord()),
+    );
+    const columns =
+      /INSERT INTO anchorage_fleet_deployments \(([\s\S]*?)\) SELECT/u
+        .exec(String(db.deploymentInsertSql))?.[1]
+        ?.split(',')
+        .map((column) => column.trim());
+    expect(columns).toEqual([
+      'tenant_tag',
+      'environment',
+      'backend',
+      'script_name',
+      'database_id',
+      'database_name',
+      'schema_version',
+      'artifact_version',
+      'desired_spec_digest',
+      'pending_spec_digest',
+      'pending_artifact_version',
+      'active_release',
+      'pending_release',
+      'migration_prior_release',
+      'rollback_release',
+      'retiring_release',
+      'outbound_policy',
+      'platform_resources',
+      'platform_target',
+      'migration_intent',
+      'backend_switch_intent',
+      'decommission_intent',
+      'cleanup_intent',
+      'invocation_authority',
+      'durable_object_tag',
+      'durable_object_migration_history',
+      'durable_object_migration_history_digest',
+      'durable_object_bindings',
+      'application_resources',
+      'application_bindings',
+      'route_hostname',
+      'phase',
+      'database_export_location',
+      'database_export_sha256',
+      'database_export_size',
+      'settled_settlement_key',
+      'updated_at',
+      'wfp_mode',
+    ]);
+  });
+
+  it('converges only a byte-identical lost decommission write response', async () => {
+    const db = new LostResponseD1();
+    const store = new D1FleetStateStore(db, { accountId: 'account' });
+    db.lose = 'exact';
+    await expect(
+      store.withDeploymentLease('acme', 'production', (lease) =>
+        lease.put(transitioningRecord(1)),
+      ),
+    ).resolves.toBeUndefined();
+    await expect(store.get('acme', 'production')).resolves.toMatchObject({
+      decommissionIntent: { revision: 1 },
+    });
+
+    db.lose = 'changed';
+    await expect(
+      store.withDeploymentLease('acme', 'production', (lease) =>
+        lease.put(transitioningRecord(2)),
+      ),
+    ).rejects.toThrow('mixed atomic ownership commit');
+    await expect(store.get('acme', 'production')).resolves.toMatchObject({
+      decommissionIntent: { revision: 3 },
+    });
+    expect(db.claims.size).toBe(1);
+  });
+
   it('atomically transitions the deployment claim role with backend ownership', async () => {
     const db = new MemoryD1();
     const store = new D1FleetStateStore(db, { accountId: 'account' });
@@ -492,7 +1223,12 @@ describe('D1FleetStateStore release state', () => {
     await store.withDeploymentLease('acme', 'production', (lease) =>
       lease.put(plain),
     );
-    const external = { ...plain, backend: 'workers-for-platforms' as const };
+    const { outboundPolicy } = externalPolicyAndTarget(plain);
+    const external = {
+      ...plain,
+      backend: 'workers-for-platforms' as const,
+      outboundPolicy,
+    };
 
     await store.withDeploymentLease('acme', 'production', (lease) =>
       lease.put(external),
@@ -514,12 +1250,15 @@ describe('D1FleetStateStore release state', () => {
     await store.withDeploymentLease('acme', 'production', (lease) =>
       lease.put(plain),
     );
+    const ownership = externalPolicyAndTarget(plain);
     const switched: FleetRecord = {
       ...plain,
+      ...ownership,
       backend: 'workers-for-platforms',
       phase: 'ready',
       platformResources: {
         maintenanceCapabilityPublicKey: MAINTENANCE_PUBLIC_KEY,
+        outboundPolicy: ownership.outboundPolicy,
         stateWorker: {
           scriptName: plain.scriptName,
           artifactVersion: 'bridge-v1',
@@ -527,6 +1266,12 @@ describe('D1FleetStateStore release state', () => {
           plane: 'ordinary',
           durableObjectBindings: [],
           namespaceIds: [],
+        },
+        egressProxy: {
+          scriptName: 'plain-worker-egress',
+          artifactVersion: 'bridge-egress-v1',
+          artifactDigest: 'c'.repeat(64),
+          ...ownership.outboundPolicy,
         },
       },
     };
@@ -593,12 +1338,13 @@ describe('D1FleetStateStore release state', () => {
     const db = new MemoryD1();
     const store = new D1FleetStateStore(db, { accountId: 'account' });
     const record = reservedRecord('workers-for-platforms');
+    const { outboundPolicy } = externalPolicyAndTarget(record);
     const trustedName =
       role === 'state'
         ? externalStateScriptName(record)
         : externalEgressProxyScriptName(record);
     await store.withDeploymentLease('acme', 'production', (lease) =>
-      lease.put(record),
+      lease.put({ ...record, outboundPolicy }),
     );
 
     await expect(
@@ -608,6 +1354,44 @@ describe('D1FleetStateStore release state', () => {
         async () => {},
       ),
     ).resolves.toBeUndefined();
+  });
+
+  it('rejects persisted Durable Object history, digest, and tag divergence on read', async () => {
+    const db = new MemoryD1();
+    const store = new D1FleetStateStore(db, { accountId: 'account' });
+    const history = [{ tag: 'state-v1', newClasses: ['State'] }];
+    const base = reservedRecord('workers-for-platforms');
+    const record: FleetRecord = {
+      ...base,
+      outboundPolicy: externalPolicyAndTarget(base).outboundPolicy,
+      applicationResources: [],
+      applicationBindings: { vars: [], secrets: [], r2Buckets: [] },
+      durableObjectTag: 'state-v1',
+      durableObjectMigrationHistory: history,
+      durableObjectMigrationHistoryDigest:
+        durableObjectMigrationHistoryDigest(history),
+    };
+    await store.withDeploymentLease('acme', 'production', (lease) =>
+      lease.put(record),
+    );
+    await expect(store.get('acme', 'production')).resolves.toEqual(record);
+    const persisted = db.row;
+    if (!persisted) throw new Error('missing persisted record');
+    for (const corruption of [
+      { durable_object_tag: 'foreign-tag' },
+      { durable_object_migration_history_digest: 'f'.repeat(64) },
+      { durable_object_migration_history: null },
+      { durable_object_migration_history_digest: null },
+    ]) {
+      db.row = { ...persisted, ...corruption };
+      const corrupted = { ...db.row };
+      await expect(store.get('acme', 'production')).rejects.toThrow(
+        new Error(
+          'fleet state row has inconsistent Durable Object migration history',
+        ),
+      );
+      expect(db.row).toEqual(corrupted);
+    }
   });
 
   it('round-trips active, pending, and retained immutable release metadata', async () => {
@@ -774,6 +1558,80 @@ describe('D1FleetStateStore release state', () => {
       lease.put(record),
     );
     await expect(store.get('acme', 'production')).resolves.toEqual(record);
+    if (!record.migrationIntent) throw new Error('missing migration intent');
+
+    const legacyTeardown: FleetRecord = {
+      ...record,
+      desiredSpecDigest: record.migrationIntent.targetSpecDigest,
+      phase: 'decommissioning',
+    };
+    for (const phase of [
+      'decommissioning',
+      'traffic-removed',
+      'credentials-revoked',
+      'worker-deleted',
+      'platform-credentials-revoked',
+    ] as const) {
+      const retained = { ...legacyTeardown, phase };
+      await store.withDeploymentLease('acme', 'production', (lease) =>
+        lease.put(retained),
+      );
+      await expect(store.get('acme', 'production')).resolves.toEqual(retained);
+    }
+    for (const invalid of [
+      { ...legacyTeardown, desiredSpecDigest: record.desiredSpecDigest },
+      { ...legacyTeardown, phase: 'ready' as const },
+      { ...legacyTeardown, phase: 'platform-resources-deleted' as const },
+      { ...legacyTeardown, phase: 'decommissioned' as const },
+    ]) {
+      await expect(
+        store.withDeploymentLease('acme', 'production', (lease) =>
+          lease.put(invalid),
+        ),
+      ).rejects.toThrow(/inconsistent migration intent/);
+    }
+
+    const decommissioningMigration: FleetRecord = {
+      ...record,
+      phase: 'decommission-advancing',
+      decommissionIntent: {
+        ...normalDecommissionIntentFixture(record, 'migrating', {
+          operationId: '12345678-1234-4abc-8def-1234567890ab',
+          revision: 0,
+          generation: 0,
+          updatedAt: '2026-08-29T12:00:00.000Z',
+          requestedSpecDigest: record.migrationIntent.targetSpecDigest,
+          entryLifecyclePhase: 'migrating',
+        }),
+        state: 'transitioning',
+      },
+    };
+    await store.withDeploymentLease('acme', 'production', (lease) =>
+      lease.put(decommissioningMigration),
+    );
+    await expect(store.get('acme', 'production')).resolves.toEqual(
+      decommissioningMigration,
+    );
+
+    const { migrationIntent: _withoutIntent, ...withoutIntent } =
+      decommissioningMigration;
+    await expectInvalidDecommission(
+      store.withDeploymentLease('acme', 'production', (lease) =>
+        lease.put(withoutIntent),
+      ),
+    );
+    await expectInvalidDecommission(
+      store.withDeploymentLease('acme', 'production', (lease) =>
+        lease.put({
+          ...decommissioningMigration,
+          pendingSpecDigest: '9'.repeat(64),
+        }),
+      ),
+    );
+
+    await store.withDeploymentLease('acme', 'production', (lease) =>
+      lease.put(record),
+    );
 
     const serializedIntent = JSON.parse(
       String(db.row?.migration_intent),
@@ -935,6 +1793,12 @@ describe('D1FleetStateStore release state', () => {
   it('rejects malformed persisted platform resource ownership', async () => {
     const db = new MemoryD1();
     const store = new D1FleetStateStore(db, { accountId: 'account' });
+    const outboundPolicy = canonicalDeploymentEgressPolicy({
+      policyId: 'policy-acme',
+      tenantTag: 'acme',
+      environment: 'production',
+      allowedHosts: [],
+    });
     const base: FleetRecord = {
       tenantTag: 'acme',
       environment: 'production',
@@ -945,17 +1809,13 @@ describe('D1FleetStateStore release state', () => {
       schemaVersion: 1,
       artifactVersion: 'release-version',
       desiredSpecDigest: 'a'.repeat(64),
-      outboundPolicy: canonicalDeploymentEgressPolicy({
-        policyId: 'policy-acme',
-        tenantTag: 'acme',
-        environment: 'production',
-        allowedHosts: [],
-      }),
+      outboundPolicy,
       durableObjectBindings: [],
       routeHostname: 'acme.example.test',
       phase: 'platform-resources-deployed',
       platformResources: {
         maintenanceCapabilityPublicKey: MAINTENANCE_PUBLIC_KEY,
+        outboundPolicy,
         stateWorker: {
           scriptName: 'acme-production-state',
           artifactVersion: 'state-version',
@@ -965,6 +1825,21 @@ describe('D1FleetStateStore release state', () => {
           durableObjectBindings: [],
           namespaceIds: [],
         },
+        egressProxy: {
+          scriptName: 'acme-production-egress',
+          artifactVersion: 'egress-version',
+          artifactDigest: 'c'.repeat(64),
+          ...outboundPolicy,
+        },
+      },
+      platformTarget: {
+        maintenanceCapabilityPublicKey: MAINTENANCE_PUBLIC_KEY,
+        stateArtifactDigest: 'a'.repeat(64),
+        stateDurableObjectHistoryDigest: 'b'.repeat(64),
+        egressArtifactDigest: 'c'.repeat(64),
+        d1SchemaVersion: 1,
+        d1SchemaHistoryDigest: 'd'.repeat(64),
+        outboundPolicy,
       },
       updatedAt: '2026-08-11T00:00:00.000Z',
     };
@@ -993,5 +1868,502 @@ describe('D1FleetStateStore release state', () => {
     await expect(store.get('acme', 'production')).rejects.toThrow(
       /invalid platform_resources/,
     );
+  });
+
+  it('persists backend-switch and decommission authorities atomically', async () => {
+    const record = backendSwitchStateRecord();
+    const db = new LostResponseD1();
+    const store = new D1FleetStateStore(db, { accountId: 'account' });
+
+    db.lose = 'exact';
+    await expect(
+      store.withDeploymentLease(record.tenantTag, record.environment, (lease) =>
+        lease.put(record),
+      ),
+    ).resolves.toBeUndefined();
+    await expect(
+      store.get(record.tenantTag, record.environment),
+    ).resolves.toEqual(record);
+    expect(db.row).toMatchObject({
+      phase: 'decommission-advancing',
+      backend_switch_intent: expect.any(String),
+      decommission_intent: expect.any(String),
+    });
+    const committedRow = db.row;
+    const committedClaims = [...db.claims.entries()];
+    const switchIntent = record.backendSwitchIntent;
+    if (!switchIntent)
+      throw new Error('backend-switch fixture lost its intent');
+    const batch = vi.spyOn(db, 'batch');
+    const batchCalls = batch.mock.calls.length;
+    let switchGetterCalls = 0;
+    const accessorRecord = { ...record };
+    Object.defineProperty(accessorRecord, 'backendSwitchIntent', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        switchGetterCalls += 1;
+        return switchIntent;
+      },
+    });
+    const hidingProxy = new Proxy(record, {
+      ownKeys(target) {
+        return Reflect.ownKeys(target).filter(
+          (key) => key !== 'backendSwitchIntent',
+        );
+      },
+    });
+    const revoked = Proxy.revocable(record, {});
+    revoked.revoke();
+    const hostileWrites = [
+      ['accessor', accessorRecord],
+      ['symbol', { ...record, [Symbol('hostile')]: true }],
+      ['transparent proxy', new Proxy(record, {})],
+      ['hiding proxy', hidingProxy],
+      ['revoked proxy', revoked.proxy],
+    ] as const;
+    for (const [label, hostile] of hostileWrites) {
+      await expect(
+        store.withDeploymentLease(
+          record.tenantTag,
+          record.environment,
+          (lease) => lease.put(hostile as FleetRecord),
+        ),
+        label,
+      ).rejects.toThrow('backend switch decommission record is malformed');
+      expect(batch.mock.calls.length, label).toBe(batchCalls);
+    }
+    expect(switchGetterCalls).toBe(0);
+    expect(db.row).toBe(committedRow);
+    expect([...db.claims.entries()]).toEqual(committedClaims);
+
+    await expect(
+      store.withDeploymentLease(record.tenantTag, record.environment, (lease) =>
+        lease.put({ ...record, backendSwitchIntent: undefined }),
+      ),
+    ).rejects.toThrow('backend switch decommission record is malformed');
+    await expect(
+      store.withDeploymentLease(record.tenantTag, record.environment, (lease) =>
+        lease.put({ ...record, decommissionIntent: undefined }),
+      ),
+    ).rejects.toThrow('backend switch decommission record is malformed');
+    const { backendSwitchIntent: _switchIntent, ...shellWithoutSwitch } =
+      record;
+    await expect(
+      store.withDeploymentLease(record.tenantTag, record.environment, (lease) =>
+        lease.put(shellWithoutSwitch),
+      ),
+    ).rejects.toThrow('backend switch decommission record is malformed');
+    const { outboundPolicy: _outboundPolicy, ...withoutOutboundPolicy } =
+      record;
+    await expect(
+      store.withDeploymentLease(record.tenantTag, record.environment, (lease) =>
+        lease.put(withoutOutboundPolicy),
+      ),
+    ).rejects.toThrow('backend switch decommission record is malformed');
+    await expect(
+      store.withDeploymentLease(record.tenantTag, record.environment, (lease) =>
+        lease.put({
+          ...record,
+          updatedAt: '2026-08-11T00:00:01.000Z',
+        }),
+      ),
+    ).rejects.toThrow('backend switch decommission record is malformed');
+    await expect(
+      store.withDeploymentLease(record.tenantTag, record.environment, (lease) =>
+        lease.put({
+          ...record,
+          backendSwitchIntent: {
+            ...switchIntent,
+            decommissionSnapshotSha256: 'f'.repeat(64),
+          },
+        }),
+      ),
+    ).rejects.toThrow('backend switch decommission record is malformed');
+    const routeMutant = (
+      mutation: 'outer-only' | 'snapshot-only' | 'outer-and-shell',
+    ): FleetRecord => {
+      const snapshot = switchIntent.decommissionSnapshot;
+      const shell = record.decommissionIntent;
+      if (
+        !snapshot ||
+        !shell ||
+        shell.state === 'complete' ||
+        shell.identity.mode.kind !== 'backend-switch'
+      ) {
+        throw new Error('backend-switch route fixture is incomplete');
+      }
+      if (mutation === 'outer-only') {
+        return { ...record, routeHostname: 'foreign.example.test' };
+      }
+      const changedSnapshot = {
+        ...snapshot,
+        routeHostname: 'foreign.example.test',
+      };
+      const changedSnapshotSha256 =
+        backendSwitchDecommissionSnapshotDigest(changedSnapshot);
+      return {
+        ...record,
+        ...(mutation === 'outer-and-shell'
+          ? { routeHostname: 'foreign.example.test' }
+          : {}),
+        backendSwitchIntent: {
+          ...switchIntent,
+          decommissionSnapshot: changedSnapshot,
+          decommissionSnapshotSha256: changedSnapshotSha256,
+        },
+        decommissionIntent: {
+          ...shell,
+          identity: {
+            ...shell.identity,
+            record: {
+              ...shell.identity.record,
+              ...(mutation === 'outer-and-shell'
+                ? { routeHostname: 'foreign.example.test' }
+                : {}),
+            },
+            mode: {
+              ...shell.identity.mode,
+              decommissionSnapshotSha256: changedSnapshotSha256,
+            },
+          },
+        },
+      };
+    };
+    for (const mutation of [
+      'outer-only',
+      'snapshot-only',
+      'outer-and-shell',
+    ] as const) {
+      await expect(
+        store.withDeploymentLease(
+          record.tenantTag,
+          record.environment,
+          (lease) => lease.put(routeMutant(mutation)),
+        ),
+        `${mutation} write`,
+      ).rejects.toThrow('backend switch decommission record is malformed');
+      expect(batch.mock.calls.length, mutation).toBe(batchCalls);
+      expect(db.row, mutation).toBe(committedRow);
+    }
+    expect(db.row).toBe(committedRow);
+    expect([...db.claims.entries()]).toEqual(committedClaims);
+
+    db.row = {
+      ...db.row,
+      updated_at: '2026-08-11T00:00:01.000Z',
+    };
+    await expect(
+      store.get(record.tenantTag, record.environment),
+    ).rejects.toThrow('backend switch decommission record is malformed');
+    db.row = committedRow;
+
+    for (const mutation of [
+      'outer-only',
+      'snapshot-only',
+      'outer-and-shell',
+    ] as const) {
+      const mutant = routeMutant(mutation);
+      db.row = {
+        ...committedRow,
+        route_hostname: mutant.routeHostname,
+        backend_switch_intent: JSON.stringify(mutant.backendSwitchIntent),
+        decommission_intent: JSON.stringify(mutant.decommissionIntent),
+      };
+      await expect(
+        store.get(record.tenantTag, record.environment),
+        `${mutation} read`,
+      ).rejects.toThrow('backend switch decommission record is malformed');
+    }
+    db.row = committedRow;
+
+    db.row = {
+      ...committedRow,
+      backend_switch_intent: null,
+      migration_intent: null,
+    };
+    await expect(
+      store.get(record.tenantTag, record.environment),
+    ).rejects.toThrow('backend switch decommission record is malformed');
+    db.row = committedRow;
+
+    db.row = {
+      ...db.row,
+      migration_intent: db.row?.backend_switch_intent,
+      backend_switch_intent: null,
+    };
+    await expect(
+      store.get(record.tenantTag, record.environment),
+    ).resolves.toEqual(record);
+  });
+});
+
+const CLEANUP_OPERATION_ID = '4c5d6e7f-1234-4abc-8def-1234567890ab';
+
+function cleanupIntentFixture(
+  record: FleetRecord,
+): import('../src/types.js').CleanupAdvanceIntent {
+  return {
+    version: 1,
+    operationId: CLEANUP_OPERATION_ID,
+    revision: 0,
+    generation: 0,
+    updatedAt: '2026-08-11T00:00:00.000Z',
+    authority: { kind: 'manual-cleanup' },
+    identity: {
+      record: {
+        tenantTag: record.tenantTag,
+        environment: record.environment,
+        backend: record.backend,
+        scriptName: record.scriptName,
+        databaseId: record.databaseId,
+        databaseName: record.databaseName,
+        routeHostname: record.routeHostname,
+      },
+      admittedPhase: 'worker-deployed',
+      externalArtifact: false,
+    },
+    state: { step: 'teardown-traffic' },
+  };
+}
+
+function cleanupAdvancingRecord(): FleetRecord {
+  const base = {
+    ...reservedRecord('plain-worker'),
+    artifactVersion: 'artifact-v1',
+    phase: 'cleanup-advancing' as const,
+    applicationResources: [],
+    applicationBindings: { vars: [], secrets: [], r2Buckets: [] },
+  };
+  return { ...base, cleanupIntent: cleanupIntentFixture(base) };
+}
+
+describe('D1FleetStateStore cleanup state', () => {
+  it('round-trips an active cleanup intent and invocation authority carrier', async () => {
+    const db = new MemoryD1();
+    const store = new D1FleetStateStore(db, { accountId: 'account' });
+    const record: FleetRecord = {
+      ...cleanupAdvancingRecord(),
+      invocationAuthority: { version: 1, authorizedAt: null },
+    };
+    await store.withDeploymentLease('acme', 'production', (lease) =>
+      lease.put(record),
+    );
+    await expect(store.get('acme', 'production')).resolves.toEqual(record);
+  });
+
+  it('round-trips null and timestamp carriers on a provisioning record', async () => {
+    const db = new MemoryD1();
+    const store = new D1FleetStateStore(db, { accountId: 'account' });
+    const base = {
+      ...reservedRecord('plain-worker'),
+      applicationResources: [],
+      applicationBindings: { vars: [], secrets: [], r2Buckets: [] },
+    };
+    for (const authorizedAt of [null, '2026-08-11T00:00:01.000Z']) {
+      const record: FleetRecord = {
+        ...base,
+        invocationAuthority: { version: 1, authorizedAt },
+      };
+      await store.withDeploymentLease('acme', 'production', (lease) =>
+        lease.put(record),
+      );
+      await expect(store.get('acme', 'production')).resolves.toEqual(record);
+    }
+  });
+
+  it('refuses malformed stored cleanup intent columns', async () => {
+    const db = new MemoryD1();
+    const store = new D1FleetStateStore(db, { accountId: 'account' });
+    await store.withDeploymentLease('acme', 'production', (lease) =>
+      lease.put(cleanupAdvancingRecord()),
+    );
+    const persisted = db.row;
+    for (const malformed of [
+      '{not json',
+      '{"version":2}',
+      JSON.stringify({ version: 1 }),
+      'x'.repeat(98_305),
+    ]) {
+      db.row = { ...persisted, cleanup_intent: malformed };
+      await expect(store.get('acme', 'production')).rejects.toThrow(
+        'fleet state row has invalid cleanup_intent',
+      );
+    }
+    db.row = persisted;
+  });
+
+  it('refuses malformed stored invocation authority carriers', async () => {
+    const db = new MemoryD1();
+    const store = new D1FleetStateStore(db, { accountId: 'account' });
+    await store.withDeploymentLease('acme', 'production', (lease) =>
+      lease.put({
+        ...reservedRecord('plain-worker'),
+        invocationAuthority: { version: 1, authorizedAt: null },
+      }),
+    );
+    const persisted = db.row;
+    for (const malformed of [
+      '{not json',
+      JSON.stringify({ version: 2, authorizedAt: null }),
+      JSON.stringify({ version: 1 }),
+      JSON.stringify({ version: 1, authorizedAt: 'not-a-timestamp' }),
+      JSON.stringify({ version: 1, authorizedAt: null, extra: true }),
+    ]) {
+      db.row = { ...persisted, invocation_authority: malformed };
+      await expect(store.get('acme', 'production')).rejects.toThrow(
+        'fleet state row has invalid invocation_authority',
+      );
+    }
+    db.row = persisted;
+  });
+
+  it('refuses a cleanup intent outside the cleanup-advancing phase', async () => {
+    const db = new MemoryD1();
+    const store = new D1FleetStateStore(db, { accountId: 'account' });
+    const base = reservedRecord('plain-worker');
+    await expect(
+      store.withDeploymentLease('acme', 'production', (lease) =>
+        lease.put({ ...base, cleanupIntent: cleanupIntentFixture(base) }),
+      ),
+    ).rejects.toThrow('fleet state row has invalid cleanup_intent');
+  });
+
+  it('refuses a cleanup-advancing record without a cleanup intent', async () => {
+    const db = new MemoryD1();
+    const store = new D1FleetStateStore(db, { accountId: 'account' });
+    await expect(
+      store.withDeploymentLease('acme', 'production', (lease) =>
+        lease.put({
+          ...reservedRecord('plain-worker'),
+          phase: 'cleanup-advancing',
+        }),
+      ),
+    ).rejects.toThrow('fleet state row has invalid cleanup_intent');
+  });
+
+  it('refuses a cleanup intent coexisting with another durable authority', async () => {
+    const db = new MemoryD1();
+    const store = new D1FleetStateStore(db, { accountId: 'account' });
+    const cleanup = cleanupAdvancingRecord();
+    const decommissioned = transitioningRecord();
+    await expect(
+      store.withDeploymentLease('acme', 'production', (lease) =>
+        lease.put({
+          ...cleanup,
+          decommissionIntent: decommissioned.decommissionIntent,
+        }),
+      ),
+    ).rejects.toThrow(/cleanup intent|decommission_intent/u);
+    await expect(
+      store.withDeploymentLease('acme', 'production', (lease) =>
+        lease.put({
+          ...decommissioned,
+          cleanupIntent: cleanupIntentFixture(decommissioned),
+        }),
+      ),
+    ).rejects.toThrow(/cleanup|inconsistent/u);
+  });
+
+  it('refuses a cleanup intent coexisting with a migration intent', async () => {
+    const db = new MemoryD1();
+    const store = new D1FleetStateStore(db, { accountId: 'account' });
+    const policy = canonicalDeploymentEgressPolicy({
+      policyId: 'policy-acme',
+      tenantTag: 'acme',
+      environment: 'production',
+      allowedHosts: ['api.example.com'],
+    });
+    const application = { vars: [], secrets: [], r2Buckets: [] };
+    const topology = {
+      durableObjectBindings: [],
+      serviceBindings: [],
+      queueProducerBindings: [],
+      secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
+      application,
+    };
+    const release = (suffix: string, digest: string) => ({
+      physicalScriptName: `acme-production-${suffix.repeat(20)}`,
+      specDigest: digest.repeat(64),
+      artifactVersion: `etag-${suffix}`,
+      releaseSchemaVersion: 1,
+      application,
+      topology,
+    });
+    const target = {
+      maintenanceCapabilityPublicKey: MAINTENANCE_PUBLIC_KEY,
+      stateArtifactDigest: 'e'.repeat(64),
+      stateDurableObjectHistoryDigest: '1'.repeat(64),
+      stateDurableObjectTag: 'state-v1',
+      egressArtifactDigest: 'f'.repeat(64),
+      d1SchemaVersion: 1,
+      d1SchemaHistoryDigest: '2'.repeat(64),
+      outboundPolicy: policy,
+    };
+    const base = cleanupAdvancingRecord();
+    await expect(
+      store.withDeploymentLease('acme', 'production', (lease) =>
+        lease.put({
+          ...base,
+          migrationIntent: {
+            targetSpecDigest: 'b'.repeat(64),
+            priorRelease: release('a', 'a'),
+            priorTarget: target,
+            priorOutboundPolicy: policy,
+            targetRelease: release('b', 'b'),
+            target,
+            subphase: 'planned',
+          },
+        }),
+      ),
+    ).rejects.toThrow(/cleanup intent|migration/u);
+  });
+
+  it('preserves the invocation authority carrier through backend-switch canonicalization', async () => {
+    const db = new MemoryD1();
+    const store = new D1FleetStateStore(db, { accountId: 'account' });
+    const record: FleetRecord = {
+      ...backendSwitchStateRecord(),
+      invocationAuthority: { version: 1, authorizedAt: null },
+    };
+    await store.withDeploymentLease('acme', 'production', (lease) =>
+      lease.put(record),
+    );
+    await expect(store.get('acme', 'production')).resolves.toEqual(record);
+  });
+
+  it('refuses a cleanup intent riding backend-switch authority', async () => {
+    const db = new MemoryD1();
+    const store = new D1FleetStateStore(db, { accountId: 'account' });
+    const record = backendSwitchStateRecord();
+    await expect(
+      store.withDeploymentLease('acme', 'production', (lease) =>
+        lease.put({
+          ...record,
+          cleanupIntent: cleanupIntentFixture(record),
+        }),
+      ),
+    ).rejects.toThrow('backend switch decommission record is malformed');
+  });
+
+  it('refuses a cleanup intent beside a settled shell-free backend switch', async () => {
+    const db = new MemoryD1();
+    const store = new D1FleetStateStore(db, { accountId: 'account' });
+    const {
+      decommissionIntent: _shell,
+      databaseExportLocation: _location,
+      databaseExportSha256: _sha256,
+      databaseExportSize: _size,
+      ...settled
+    } = backendSwitchStateRecord();
+    const base = { ...settled, phase: 'cleanup-advancing' as const };
+    await expect(
+      store.withDeploymentLease('acme', 'production', (lease) =>
+        lease.put({
+          ...base,
+          cleanupIntent: cleanupIntentFixture(base),
+        }),
+      ),
+    ).rejects.toThrow('backend switch decommission record is malformed');
   });
 });
