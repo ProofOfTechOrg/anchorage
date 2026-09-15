@@ -465,14 +465,14 @@ export async function teardownDirectReference(input) {
       const pending = teardown?.pending ?? null;
       if (pending && (pending.kind !== kind || pending.key !== key))
         refuse('invalid-state');
-      if (pending) {
-        if ((await probe()) === 'absent') {
-          await write({ receipts: receipt(true) });
-          return;
-        }
-        // Steps whose probe already establishes identity carry none of their own.
-        await identity?.();
+      if ((await probe()) === 'absent') {
+        await write({ phase: nextPhase, receipts: receipt(true) });
+        return;
       }
+      // Ownership attestation gates every dispatch, not only a resumed one, and
+      // runs only against a resource the probe has proved present. Steps whose
+      // probe already establishes identity carry none of their own.
+      await identity?.();
       // Reads that gate the delete run outside its ambiguity window: a refusal
       // here leaves nothing pending because nothing was issued.
       await prepare?.();
@@ -523,6 +523,40 @@ export async function teardownDirectReference(input) {
       probeAbsent(
         sdk.r2.buckets.get(bucket, { ...selectors, jurisdiction: 'default' }),
       );
+
+    // Shared so that a step which mutates one of these resources attests it
+    // itself, rather than on the strength of a later step's check.
+    const scriptIdentity = async () => {
+      const { exactActiveVersionId } = await import('../src/active-route.ts');
+      const deployments = (
+        await sdk.workers.scripts.deployments.list(script, selectors)
+      ).deployments;
+      if (!Array.isArray(deployments) || deployments.length === 0)
+        refuse('provider-unavailable');
+      let active;
+      try {
+        active = exactActiveVersionId(deployments[0], 'reference');
+      } catch {
+        refuse('identity-mismatch');
+      }
+      if (active !== bootstrap.active.versionId) refuse('identity-mismatch');
+    };
+    const bucketIdentity = async () => {
+      const observed = await sdk.r2.buckets.get(bucket, {
+        ...selectors,
+        jurisdiction: 'default',
+      });
+      if (
+        observed?.name !== bucket ||
+        (observed.jurisdiction !== undefined &&
+          observed.jurisdiction !== 'default') ||
+        typeof observed.creation_date !== 'string' ||
+        !Number.isFinite(Date.parse(observed.creation_date)) ||
+        new Date(observed.creation_date).toISOString() !==
+          bootstrap.exports.creationDate
+      )
+        refuse('identity-mismatch');
+    };
 
     if (!receipts.exports) {
       const ceiling = Number.MAX_SAFE_INTEGER;
@@ -592,6 +626,7 @@ export async function teardownDirectReference(input) {
         kind: 'disable-reference-ingress',
         nextPhase: 'ingress',
         probe: ingressProbe,
+        identity: scriptIdentity,
         call: async () => {
           const answer = await sdk.workers.scripts.subdomain.create(
             script,
@@ -613,32 +648,14 @@ export async function teardownDirectReference(input) {
         kind: 'delete-reference-worker',
         nextPhase: 'worker',
         probe: scriptProbe,
-        identity: async () => {
-          const { exactActiveVersionId } = await import(
-            '../src/active-route.ts'
-          );
-          const deployments = (
-            await sdk.workers.scripts.deployments.list(script, selectors)
-          ).deployments;
-          if (!Array.isArray(deployments) || deployments.length === 0)
-            refuse('provider-unavailable');
-          let active;
-          try {
-            active = exactActiveVersionId(deployments[0], 'reference');
-          } catch {
-            refuse('identity-mismatch');
-          }
-          if (active !== bootstrap.active.versionId)
-            refuse('identity-mismatch');
-        },
+        identity: scriptIdentity,
         prepare: async () => {
           const listed = await singlePage(
             single.workers.scripts.secrets.list(script, selectors),
           );
-          const observed = listed.rows
-            .map((row) => row.name)
-            .filter(recordableName)
-            .sort();
+          // The complete observed set is what is compared: a name
+          // `recordableName` rejects is still a secret the script carries.
+          const observed = listed.rows.map((row) => row.name).sort();
           if (!isDeepStrictEqual(observed, [...REFERENCE_SECRET_NAMES]))
             refuse('identity-mismatch');
           secretNames = observed;
@@ -702,6 +719,9 @@ export async function teardownDirectReference(input) {
       };
       inspect(await listObjects(true));
       inspect(await listObjects(false));
+      // The listings already prove the bucket present, so this attestation
+      // needs no probe of its own.
+      await bucketIdentity();
       for (const key of confirmed) {
         if (receipts.exportObjects.some((entry) => entry.key === key)) continue;
         await mutate({
@@ -741,22 +761,7 @@ export async function teardownDirectReference(input) {
         kind: 'delete-export-r2',
         nextPhase: 'exports',
         probe: bucketProbe,
-        identity: async () => {
-          const observed = await sdk.r2.buckets.get(bucket, {
-            ...selectors,
-            jurisdiction: 'default',
-          });
-          if (
-            observed?.name !== bucket ||
-            (observed.jurisdiction !== undefined &&
-              observed.jurisdiction !== 'default') ||
-            typeof observed.creation_date !== 'string' ||
-            !Number.isFinite(Date.parse(observed.creation_date)) ||
-            new Date(observed.creation_date).toISOString() !==
-              bootstrap.exports.creationDate
-          )
-            refuse('identity-mismatch');
-        },
+        identity: bucketIdentity,
         call: () =>
           settled.r2.buckets.delete(
             bucket,

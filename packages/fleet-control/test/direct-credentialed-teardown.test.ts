@@ -4,7 +4,10 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DirectProviderError } from '../scripts/direct-credentialed-provider.mjs';
-import type { DirectRunJournal } from '../scripts/direct-credentialed-run-state.mjs';
+import {
+  DIRECT_TEARDOWN_MAXIMA,
+  type DirectRunJournal,
+} from '../scripts/direct-credentialed-run-state.mjs';
 import type { DirectTeardownOutcome } from '../scripts/direct-credentialed-teardown.mjs';
 import { teardownDirectReference } from '../scripts/direct-credentialed-teardown.mjs';
 import {
@@ -49,6 +52,16 @@ const absent = (status = 404) =>
     { status },
   );
 const forbid = () => absent(403);
+const deployments = (versionId: string) =>
+  json({
+    deployments: [
+      {
+        id: 'deployment',
+        strategy: 'percentage',
+        versions: [{ version_id: versionId, percentage: 100 }],
+      },
+    ],
+  });
 const paged = (url: URL, rows: Row[]) =>
   json(url.searchParams.has('page') ? [] : rows);
 const never = () =>
@@ -291,22 +304,35 @@ describeLinux('direct reference teardown', () => {
     const outcome = await w.run();
     expect(outcome.status).toBe('cleaned');
     expect(w.requests).toEqual([
+      `GET ${w.script}/subdomain`,
+      `GET ${w.script}/deployments`,
       `POST ${w.script}/subdomain`,
       `GET ${w.script}/subdomain`,
+      `GET ${w.script}`,
+      `GET ${w.script}/deployments`,
       `GET ${w.script}/secrets`,
       `DELETE ${w.script}`,
       `GET ${w.script}`,
+      `GET ${ROOT}/d1/database/fleet-uuid`,
+      `GET ${ROOT}/d1/database/fleet-uuid`,
       `DELETE ${ROOT}/d1/database/fleet-uuid`,
       `GET ${ROOT}/d1/database/fleet-uuid`,
+      `GET ${ROOT}/d1/database/quota-uuid`,
+      `GET ${ROOT}/d1/database/quota-uuid`,
       `DELETE ${ROOT}/d1/database/quota-uuid`,
       `GET ${ROOT}/d1/database/quota-uuid`,
       `GET ${w.bucketPath}/objects`,
       `GET ${w.bucketPath}/objects`,
+      `GET ${w.bucketPath}`,
+      `GET ${w.bucketPath}/objects/${w.keyA}`,
       `DELETE ${w.bucketPath}/objects/${w.keyA}`,
       `GET ${w.bucketPath}/objects/${w.keyA}`,
+      `GET ${w.bucketPath}/objects/${w.keyB}`,
       `DELETE ${w.bucketPath}/objects/${w.keyB}`,
       `GET ${w.bucketPath}/objects/${w.keyB}`,
       `GET ${w.bucketPath}/objects`,
+      `GET ${w.bucketPath}`,
+      `GET ${w.bucketPath}`,
       `DELETE ${w.bucketPath}`,
       `GET ${w.bucketPath}`,
       `GET ${ROOT}/d1/database`,
@@ -320,24 +346,24 @@ describeLinux('direct reference teardown', () => {
       `GET ${w.script}/versions`,
     ]);
     expect(outcome.facts.receipts).toMatchObject({
-      ingress: { ordinal: 2, settledByReread: false },
+      ingress: { ordinal: 4, settledByReread: false },
       worker: {
         scriptName: w.names.referenceWorker,
         secretNames: SECRET_NAMES,
-        ordinal: 5,
+        ordinal: 9,
         settledByReread: false,
       },
-      fleet: { uuid: 'fleet-uuid', ordinal: 7, settledByReread: false },
-      quota: { uuid: 'quota-uuid', ordinal: 9, settledByReread: false },
+      fleet: { uuid: 'fleet-uuid', ordinal: 13, settledByReread: false },
+      quota: { uuid: 'quota-uuid', ordinal: 17, settledByReread: false },
       exports: {
         name: w.names.exportBucket,
-        ordinal: 18,
+        ordinal: 31,
         settledByReread: false,
       },
     });
     expect(outcome.facts.receipts.exportObjects).toEqual([
-      { key: w.keyA, ordinal: 13, settledByReread: false },
-      { key: w.keyB, ordinal: 15, settledByReread: false },
+      { key: w.keyA, ordinal: 23, settledByReread: false },
+      { key: w.keyB, ordinal: 26, settledByReread: false },
     ]);
     expect(outcome.facts.retainedIdentities).toEqual({
       fleetUuid: null,
@@ -655,6 +681,121 @@ describeLinux('direct reference teardown', () => {
     const outcome = retained(await w.run());
     expect(outcome.reason).toBe('identity-mismatch');
     expect(w.requests).not.toContain(`DELETE ${w.script}`);
+  });
+
+  it('refuses a first-attempt export bucket delete whose creation date changed', async () => {
+    const w = await world();
+    let reads = 0;
+    w.setHook((request, url) => {
+      if (request.method !== 'GET' || url.pathname !== w.bucketPath)
+        return undefined;
+      reads += 1;
+      return reads === 1
+        ? undefined
+        : json({
+            name: w.names.exportBucket,
+            creation_date: '2020-01-01T00:00:00.000Z',
+          });
+    });
+    expect(retained(await w.run()).reason).toBe('identity-mismatch');
+    expect(w.requests).toContain(`DELETE ${w.bucketPath}/objects/${w.keyB}`);
+    expect(w.requests).not.toContain(`DELETE ${w.bucketPath}`);
+    expect(w.state.bucketPresent).toBe(true);
+  });
+
+  it('refuses a first-attempt fleet database delete whose name changed', async () => {
+    const w = await world();
+    w.state.databases.set('fleet-uuid', {
+      uuid: 'fleet-uuid',
+      name: `${w.names.fleetDatabase}-replacement`,
+    });
+    expect(retained(await w.run()).reason).toBe('identity-mismatch');
+    expect(w.requests).not.toContain(`DELETE ${ROOT}/d1/database/fleet-uuid`);
+    expect(w.state.databases.has('fleet-uuid')).toBe(true);
+  });
+
+  it('refuses a first-attempt worker delete whose active version changed', async () => {
+    const w = await world();
+    let reads = 0;
+    w.setHook((request, url) => {
+      if (
+        request.method !== 'GET' ||
+        url.pathname !== `${w.script}/deployments`
+      )
+        return undefined;
+      reads += 1;
+      return reads === 1 ? undefined : deployments('other-version');
+    });
+    expect(retained(await w.run()).reason).toBe('identity-mismatch');
+    expect(w.requests).toContain(`POST ${w.script}/subdomain`);
+    expect(w.requests).not.toContain(`DELETE ${w.script}`);
+    expect(w.state.scriptPresent).toBe(true);
+  });
+
+  it('refuses a secret set carrying an extra unrecordable name', async () => {
+    for (const extra of [
+      'n'.repeat(DIRECT_TEARDOWN_MAXIMA.nameBytes + 1),
+      'CONTROLNAME',
+    ]) {
+      const w = await world();
+      w.state.secretNames.push(extra);
+      expect(retained(await w.run()).reason).toBe('identity-mismatch');
+      expect(w.requests).not.toContain(`DELETE ${w.script}`);
+      expect(w.state.scriptPresent).toBe(true);
+    }
+  });
+
+  it('refuses a first-attempt ingress disable whose active version changed', async () => {
+    const w = await world();
+    w.setHook((request, url) =>
+      request.method === 'GET' && url.pathname === `${w.script}/deployments`
+        ? deployments('other-version')
+        : undefined,
+    );
+    expect(retained(await w.run()).reason).toBe('identity-mismatch');
+    expect(w.requests).not.toContain(`POST ${w.script}/subdomain`);
+    expect(w.state.ingress).toBe(true);
+  });
+
+  it('refuses a first-attempt export object delete whose bucket changed', async () => {
+    const w = await world();
+    w.setHook((request, url) =>
+      request.method === 'GET' && url.pathname === w.bucketPath
+        ? json({
+            name: w.names.exportBucket,
+            creation_date: '2020-01-01T00:00:00.000Z',
+          })
+        : undefined,
+    );
+    expect(retained(await w.run()).reason).toBe('identity-mismatch');
+    expect(
+      w.requests.filter(
+        (entry) => entry.startsWith('DELETE') && entry.includes('/objects/'),
+      ),
+    ).toEqual([]);
+    expect([...w.state.objects]).toHaveLength(2);
+  });
+
+  it('settles a first-attempt step whose probe already finds the resource absent', async () => {
+    const w = await world();
+    w.state.databases.delete('fleet-uuid');
+    const outcome = await w.run();
+    expect(outcome.status).toBe('cleaned');
+    expect(outcome.facts.receipts.fleet).toMatchObject({
+      uuid: 'fleet-uuid',
+      settledByReread: true,
+    });
+    expect(
+      w.requests.filter(
+        (entry) => entry === `GET ${ROOT}/d1/database/fleet-uuid`,
+      ),
+    ).toHaveLength(1);
+    expect(w.requests).not.toContain(`DELETE ${ROOT}/d1/database/fleet-uuid`);
+    expect((await diskState(w.journal)).teardown).toMatchObject({
+      phase: 'complete',
+      pending: null,
+      failure: null,
+    });
   });
 
   it('refuses a forbidden residual surface and records a fail-closed dispatch', async () => {
