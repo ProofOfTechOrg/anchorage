@@ -12,6 +12,7 @@
   "name": "@proofoftech/fleet-control",
   "excludeExternals": true,
   "excludeInternal": true,
+  "intentionallyNotExported": ["R2_JURISDICTIONS"],
   "validation": {
     "notExported": true,
     "invalidLink": true,

@@ -70,7 +70,6 @@ export {
   type OrdinaryWorkerFootprint,
   type PlainWorkerCloudflareClientOptions,
 } from './cloudflare-client.js';
-export type { FleetInventoryR2Jurisdiction } from './cloudflare-fleet-inventory.js';
 export type {
   PreparedOrdinaryWorkerDeploymentVersions,
   PreparedOrdinaryWorkerUpload,
@@ -289,6 +288,7 @@ export {
   type ExternalReleaseTopology,
   type FleetInventoryDeployment,
   type FleetInventoryFinding,
+  type FleetInventoryR2Jurisdiction,
   type FleetRecord,
   type FleetResourceInventory,
   type FleetSettlementContext,

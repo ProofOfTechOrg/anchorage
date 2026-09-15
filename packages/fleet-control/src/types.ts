@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { InitialExecutionFenceState } from '@proofoftech/flowsafe/deployment-identity-protocol';
-import type { FleetInventoryR2Jurisdiction } from './cloudflare-fleet-inventory.js';
 import type { HostRoutingTarget } from './host-routing.js';
 
 /**
@@ -79,7 +78,17 @@ export interface D1Migration {
   readonly rollbackCompatible?: true;
 }
 
-export type R2Jurisdiction = 'default' | 'eu' | 'fedramp';
+/** The R2 jurisdictions this control plane addresses, in encounter order. */
+export const R2_JURISDICTIONS = Object.freeze([
+  'default',
+  'eu',
+  'fedramp',
+] as const);
+
+export type R2Jurisdiction = (typeof R2_JURISDICTIONS)[number];
+
+/** One R2 jurisdiction, in today's fixed encounter order. */
+export type FleetInventoryR2Jurisdiction = R2Jurisdiction;
 
 /**
  * One Worker's identity plus its D1 and routing claims, as the authoritative

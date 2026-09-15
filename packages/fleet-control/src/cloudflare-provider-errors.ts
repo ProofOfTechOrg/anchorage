@@ -162,6 +162,19 @@ export function isNotFound(error: unknown): boolean {
 }
 
 /**
+ * R2 lists use HTTP 403 with provider code 10003 when the account lacks
+ * entitlement to the requested jurisdiction.
+ */
+export function isR2JurisdictionAccessRefusal(error: unknown): boolean {
+  return (
+    error instanceof APIError &&
+    error.status === 403 &&
+    Array.isArray(error.errors) &&
+    error.errors.some((entry) => entry?.code === 10003)
+  );
+}
+
+/**
  * Recognizes SDK provider responses and transport failures, including their
  * sanitized forms. A transient classification still requires an absence read
  * before a provisioning mutation can retry through the backend's wait seam.

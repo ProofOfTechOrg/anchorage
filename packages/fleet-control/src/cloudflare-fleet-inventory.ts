@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { createHash } from 'node:crypto';
-import { APIError } from 'cloudflare';
 import {
   CLOUDFLARE_INVENTORY_BOUND,
   inventoryBoundExceeded,
 } from './cloudflare-client-config.js';
 import { MAX_DATABASE_INVENTORY } from './cloudflare-ordinary-worker-operations.js';
+import { isR2JurisdictionAccessRefusal } from './cloudflare-provider-errors.js';
 import {
   type CloudflareWorkerAttachmentScanContext,
   listDispatchScriptPage,
@@ -36,7 +36,12 @@ import {
   parseHostRoutingTarget,
 } from './host-routing.js';
 import { canonicalDeploymentEgressPolicy } from './platform-resources.js';
-import type { FleetInventoryFinding, WorkerZoneRoute } from './types.js';
+import {
+  type FleetInventoryFinding,
+  type FleetInventoryR2Jurisdiction,
+  R2_JURISDICTIONS,
+  type WorkerZoneRoute,
+} from './types.js';
 
 /**
  * The registry key prefix and fleet tag are private to the Cloudflare client
@@ -49,14 +54,10 @@ const FLEET_SCRIPT_TAG = 'fleet:anchorage';
 const DISPATCH_PAGE_SIZE = 1_000;
 const DISPATCH_PAGE_BOUND = 100;
 const R2_PAGE_SIZE = 1_000;
-const R2_JURISDICTIONS = Object.freeze(['default', 'eu', 'fedramp'] as const);
 const NON_ASCII = /[^\p{ASCII}]/u;
 
 /** The frozen finding vocabulary every staged finding row must name. */
 type FleetInventoryFindingKind = FleetInventoryFinding['kind'];
-
-/** One R2 jurisdiction, in today's fixed encounter order. */
-export type FleetInventoryR2Jurisdiction = (typeof R2_JURISDICTIONS)[number];
 
 /** A provider binding as the account API returns it. */
 export interface FleetInventoryProviderBinding {
@@ -1954,10 +1955,7 @@ async function advanceR2Buckets(
       if (
         jurisdiction === 'default' ||
         startAfter !== undefined ||
-        !(error instanceof APIError) ||
-        error.status !== 403 ||
-        !Array.isArray(error.errors) ||
-        !error.errors.some((entry) => entry?.code === 10003)
+        !isR2JurisdictionAccessRefusal(error)
       ) {
         throw error;
       }
