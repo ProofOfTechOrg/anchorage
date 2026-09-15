@@ -19,7 +19,7 @@ become findings; a later observation is a run-level `NETWORK_IO_OUTSIDE_RUNTIME_
 reason names the settled case and carries no `case`. The report snapshots `findings` and `cases` and
 computes `conformant` from the snapshot, and an escape observed after that is dropped.
 
-`CONFORMANCE_LIMIT` says so: work a timed-out case abandons is unrecorded through the restored
-global, and work any settled case abandons is recorded as a run-level finding through the supplied
-base transport for a host the manifest does not declare, or through a captured trap, until the
-report is built.
+`CONFORMANCE_LIMIT` points at the channel list that says so:
+[Conformance limits](https://github.com/ProofOfTechOrg/anchorage/blob/main/packages/breakwater/CONNECTORS.md#conformance-limits)
+in the connector authoring guide states what a settled case's retained transport or trap reaches,
+what a read of the restored global after the run closes bypasses, and what a timed-out case's abandoned work does not.

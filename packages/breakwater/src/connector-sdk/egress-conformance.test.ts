@@ -507,7 +507,8 @@ describe('connector egress conformance', () => {
     expect(Object.getOwnPropertyDescriptor(holder, 'fetch')).toEqual(saved);
   });
 
-  // CONNECTORS.md: “A redefinition or deletion that the case itself reverses before it settles, like a reference to `fetch` captured before the run, is outside what the harness observes.”
+  // CONNECTORS.md, "Conformance limits": the item on a reference captured
+  // before installation and a redefinition the case reverses before it settles.
   it('does not observe a request sent through a redefinition the case reverses before settling', async () => {
     const saved = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
     const replacement = vi.fn(async () => new Response());
@@ -1761,7 +1762,7 @@ describe('connector egress conformance', () => {
     expect(mismatch.findings).toContainEqual(
       expect.objectContaining({ code: 'MANIFEST_MISMATCH' }),
     );
-    expect(mismatch.limit).toContain('captured fetch reference');
+    expect(mismatch.limit).toBe(CONFORMANCE_LIMIT);
     const matched = await assertConnectorConformance(
       factory(async () => ({}), {
         ...noEgress,
