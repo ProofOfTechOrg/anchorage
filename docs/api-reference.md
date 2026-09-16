@@ -44,7 +44,7 @@ New host-side and React features remain subpath-only so importing the root does 
 | `@proofoftech/flowsafe/artifacts` | R2 artifact store and in-memory bucket |
 | `@proofoftech/flowsafe/audit-export` | Queue producer sink and NDJSON SIEM consumer |
 | `@proofoftech/flowsafe/do-runner` | Runtime, Durable Object classes, D1 storage, deployment sentinel and caller attestation, identity helpers, pub/sub, retention, run summaries, execution fence, start reservations, and drain inventory |
-| `@proofoftech/flowsafe/do-runner/constants` | Deadline values, duration validation, and timeout detection without the runner graph |
+| `@proofoftech/flowsafe/do-runner/constants` | Suspension deadline values, duration validation, and timeout detection without the runner graph |
 | `@proofoftech/flowsafe/do-runner/testing` | Timeout resume fixtures for workflow tests |
 | `@proofoftech/flowsafe/goals` | Objective HTTP router and goal request-context contract |
 | `@proofoftech/flowsafe/host-kit` | Authenticator and verifier seams, run/thread/hub/provider topologies, routes, approval bridges, tickets, composed Worker, and execution-fence and inventory admin routes |
@@ -88,12 +88,13 @@ Safe browser imports:
 
 - `@proofoftech/flowsafe/approval-ui`
 - `@proofoftech/flowsafe/signals/client`
+- `@proofoftech/flowsafe/do-runner/constants` and `@proofoftech/flowsafe/do-runner/testing`, which carry the suspension deadline values, duration predicate, timeout detector and fixture minter without the runner graph
 - `ApprovalApiClient` and structural client types
 
 Server or Worker imports:
 
 - breakwater processors and connector SDK
-- flowsafe approval API, agent host, runner, host kit, agents, schedules, signals, providers, tasks, artifacts, and audit export
+- flowsafe approval API, agent host, the `@proofoftech/flowsafe/do-runner` entry, host kit, agents, schedules, signals, providers, tasks, artifacts, and audit export
 
 Node-only execution:
 

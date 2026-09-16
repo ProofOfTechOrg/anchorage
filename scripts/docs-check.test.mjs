@@ -227,11 +227,12 @@ test('relative links obey the internal-file policy', () => {
   );
 });
 
-test('absolute repository links resolve their Markdown anchors', () => {
+test('absolute repository links resolve target files and Markdown anchors', () => {
   const root = fixture({
     'packages/example/README.md': `# Example
 
-[Guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/guide.md#target-heading)
+[Anchored](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/guide.md#target-heading)
+[Whole file](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/guide.md)
 `,
     'docs/guide.md': '# Target heading\n',
   });
@@ -278,7 +279,8 @@ test('absolute repository links fail on a missing target file', () => {
   const root = fixture({
     'packages/example/README.md': `# Example
 
-[Guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/missing.md#target-heading)
+[Anchored](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/missing.md#target-heading)
+[Whole file](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/missing.md)
 `,
   });
 
@@ -293,6 +295,7 @@ test('absolute repository links fail on a missing target file', () => {
     result.errors.map((error) => error.message),
     [
       'link target does not exist: https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/missing.md#target-heading',
+      'link target does not exist: https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/missing.md',
     ],
   );
 });
@@ -301,7 +304,8 @@ test('absolute repository links fail on a path that escapes the repository', () 
   const outer = fixture({
     'repo/packages/example/README.md': `# Example
 
-[Guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/../outside.md#target-heading)
+[Anchored](https://github.com/ProofOfTechOrg/anchorage/blob/main/../outside.md#target-heading)
+[Whole file](https://github.com/ProofOfTechOrg/anchorage/blob/main/../outside.md)
 `,
     'outside.md': '# Target heading\n',
   });
@@ -318,21 +322,28 @@ test('absolute repository links fail on a path that escapes the repository', () 
     result.errors.map((error) => error.message),
     [
       'link escapes the repository: https://github.com/ProofOfTechOrg/anchorage/blob/main/../outside.md#target-heading',
+      'link escapes the repository: https://github.com/ProofOfTechOrg/anchorage/blob/main/../outside.md',
     ],
   );
 });
 
-test('fragment-less absolute repository links fail on a missing target file', () => {
+test('absolute repository links accept GitHub line fragments', () => {
   const root = fixture({
     'packages/example/README.md': `# Example
 
-[Guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/missing.md)
+[Line](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/guide.md#L12)
+[Range](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/guide.md#L12-L20)
+[Missing line](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/missing.md#L12)
 `,
+    'docs/guide.md': '# Target heading\n',
   });
 
   const result = checkRepository({
     root,
-    markdownFiles: markdownFiles(root, ['packages/example/README.md']),
+    markdownFiles: markdownFiles(root, [
+      'packages/example/README.md',
+      'docs/guide.md',
+    ]),
     packageChecks: false,
     orphanChecks: false,
   });
@@ -340,32 +351,40 @@ test('fragment-less absolute repository links fail on a missing target file', ()
   assert.deepEqual(
     result.errors.map((error) => error.message),
     [
-      'link target does not exist: https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/missing.md',
+      'link target does not exist: https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/missing.md#L12',
     ],
   );
 });
 
-test('fragment-less absolute repository links fail on an escaping path', () => {
-  const outer = fixture({
-    'repo/packages/example/README.md': `# Example
+test('reachability follows absolute repository links into the docs tree', () => {
+  const root = fixture({
+    'docs/README.md': `# Documentation
 
-[Guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/../outside.md)
+[Guide](guide.md)
 `,
-    'outside.md': '# Target heading\n',
+    'docs/guide.md': `# Guide
+
+[Reference](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/reference.md)
+`,
+    'docs/reference.md': '# Reference\n',
+    'docs/unlinked.md': '# Unlinked\n',
   });
-  const root = join(outer, 'repo');
 
   const result = checkRepository({
     root,
-    markdownFiles: markdownFiles(root, ['packages/example/README.md']),
+    markdownFiles: markdownFiles(root, [
+      'docs/README.md',
+      'docs/guide.md',
+      'docs/reference.md',
+      'docs/unlinked.md',
+    ]),
     packageChecks: false,
-    orphanChecks: false,
   });
 
   assert.deepEqual(
-    result.errors.map((error) => error.message),
+    result.errors.map((error) => `${error.file}: ${error.message}`),
     [
-      'link escapes the repository: https://github.com/ProofOfTechOrg/anchorage/blob/main/../outside.md',
+      'docs/unlinked.md: guide is not reachable from a public documentation index',
     ],
   );
 });

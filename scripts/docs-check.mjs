@@ -32,6 +32,7 @@ const INTERNAL_MILESTONE_PATTERN =
   /\b(?:CI-M-\d{3}(?:-\d{3})?|DL-\d{3}|INV-\d+|M-\d{3}|RA-\d{3}|[A-Z]-S\d+|R-[A-Z0-9][A-Z0-9-]*|[A-Z]-D\d+|D(?:[2-9]|\d{2,})|F\d+|P\d+(?:-lite)?|Track [A-Z]|Phase \d+)\b/g;
 const VOLATILE_COUNT_PATTERN =
   /(?<![\w.-])\d[\d,]*(?![.\d])\s+(?:tests?|test files?|packages?)\b/gi;
+const GITHUB_LINE_FRAGMENT_PATTERN = /^L\d+(?:C\d+)?(?:-L\d+(?:C\d+)?)?$/;
 const REPOSITORY_URL = 'https://github.com/ProofOfTechOrg/anchorage';
 const REQUIRED_PUBLIC_URLS = [
   'https://anchorage.proofoftech.org/',
@@ -316,15 +317,16 @@ function internalFileError(root, sourceFile, resolved, target) {
 
 const REPOSITORY_BLOB_PREFIX = `${REPOSITORY_URL}/blob/main/`;
 
-// A copy-ready README cannot carry a relative link, so it names a file or a
-// heading through the permanent GitHub URL instead. Resolve that URL back into
-// this repository, with or without a fragment, and report the first message
-// `localTargetError`, `internalFileError` or `anchorError` returns. The
-// package-boundary guard stays on the relative branch, because a permanent
-// GitHub URL is the remedy it prescribes. A URL that does not match the prefix
-// (another host, a `tree/` path, a `blob/<sha>` pin) is left to the
-// `--external` run, which fetches it and fails on 404/410; that run cannot see
-// a bad fragment, because GitHub answers 200 for one.
+// A copy-ready README cannot carry a relative link out of its package, so it
+// names such a file or heading through the permanent GitHub URL instead.
+// Resolve that URL back into this repository, with or without a fragment, and
+// report the first message `localTargetError`, `internalFileError` or
+// `absoluteAnchorError` returns. The package-boundary guard stays on the
+// relative branch, because a permanent GitHub URL is the remedy it prescribes.
+// A URL that does not match the prefix (another host, a `tree/` path, a
+// `blob/<sha>` pin) is left to the `--external` run, which fetches it and
+// fails on 404/410; that run cannot see a bad fragment, because GitHub answers
+// 200 for one.
 function repositoryBlobTarget(root, target) {
   if (!target.startsWith(REPOSITORY_BLOB_PREFIX)) return undefined;
   const split = splitLocalTarget(target.slice(REPOSITORY_BLOB_PREFIX.length));
@@ -403,16 +405,24 @@ function checkLocalLinks(root, markdownFiles, manifests) {
   // Shared by both link branches like the diagnostics above, but declared
   // here because it reads the anchor cache. A link with no fragment has
   // nothing to check.
-  const anchorError = (resolved, anchor) => {
+  const anchorError = (resolved) => {
     if (
-      anchor &&
+      resolved.anchor &&
       extname(resolved.path).toLowerCase() === '.md' &&
-      !anchorsFor(resolved.path).has(anchor)
+      !anchorsFor(resolved.path).has(resolved.anchor)
     ) {
-      return `Markdown anchor does not exist: #${anchor}`;
+      return `Markdown anchor does not exist: #${resolved.anchor}`;
     }
     return undefined;
   };
+
+  // A permanent GitHub URL can address a line or a line range with GitHub's
+  // own `#L12`, `#L12-L20` or column-qualified grammar, which names no
+  // Markdown heading.
+  const absoluteAnchorError = (resolved) =>
+    GITHUB_LINE_FRAGMENT_PATTERN.test(resolved.anchor ?? '')
+      ? undefined
+      : anchorError(resolved);
 
   for (const sourceFile of markdownFiles) {
     const markdown = readFileSync(sourceFile, 'utf8');
@@ -453,7 +463,7 @@ function checkLocalLinks(root, markdownFiles, manifests) {
           const message =
             localTargetError(inRepository, link.target) ??
             internalFileError(root, sourceFile, inRepository, link.target) ??
-            anchorError(inRepository, inRepository.anchor);
+            absoluteAnchorError(inRepository);
           if (message) {
             errors.push(diagnostic(root, sourceFile, link.line, message));
           }
@@ -508,7 +518,7 @@ function checkLocalLinks(root, markdownFiles, manifests) {
         }
       }
 
-      const anchorMessage = anchorError(resolved, resolved.anchor);
+      const anchorMessage = anchorError(resolved);
       if (anchorMessage) {
         errors.push(diagnostic(root, sourceFile, link.line, anchorMessage));
       }
@@ -798,15 +808,15 @@ function markdownGraph(root, markdownFiles) {
   for (const sourceFile of markdownFiles) {
     const targets = new Set();
     for (const link of collectMarkdownLinks(readFileSync(sourceFile, 'utf8'))) {
+      if (!link.target || isIgnoredScheme(link.target)) continue;
+      // A permanent GitHub URL into this repository is an edge like a
+      // relative link, so reachability resolves it the way `checkLocalLinks`
+      // does.
+      const resolved = isExternal(link.target)
+        ? repositoryBlobTarget(root, link.target)
+        : resolveLocalTarget(root, sourceFile, link.target);
       if (
-        !link.target ||
-        isExternal(link.target) ||
-        isIgnoredScheme(link.target)
-      ) {
-        continue;
-      }
-      const resolved = resolveLocalTarget(root, sourceFile, link.target);
-      if (
+        resolved &&
         !resolved.outsideRoot &&
         existsSync(resolved.path) &&
         extname(resolved.path).toLowerCase() === '.md' &&

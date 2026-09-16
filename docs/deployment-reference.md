@@ -189,6 +189,8 @@ Set `mutationEpoch` on `createFlowsafeWorker()` to a nonnegative safe-integer nu
 
 The topologies stamp `x-flowsafe-mutation-epoch` for internal calls, replacing or removing incoming values. `createActorResolver()` refuses that header on public requests. Both Durable Object shells capture it before deployment verification and decode the captured value only afterward.
 
+The Fleet Control guide carries the procedure that applies this configuration: [roll out an artifact under the execution fence](fleet-control.md#roll-out-an-artifact-under-the-execution-fence) coordinates the epoch with a bounded migration of one deployment.
+
 Fenced Runtime starts enforce the captured caller epoch at the initial D1 write and bind their generated execution identity with the winning claim and proof. Both hosts journal preparation and recover only exact owned generations. Generation-aware retention still requires implementation and acceptance before enabling artifact epochs across the deployment. An explicitly unfenced Runtime retains ordinary persistence and supplies no atomic fence guarantee.
 
 Custom run-router idempotency wiring must supply the topology's private `persistedStart(workflowId, runId)` callback alongside its store, fence and liveness probe. It carries one observed identity/result internally; ordinary public status is not a substitute. Use `claimReservation`, `releaseReservation`, `associateReservation`, `bindPreparedStart` and `settleExecution` with their exact observations. The old run-only methods and HTTP rollback helper are removed.

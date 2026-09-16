@@ -20,7 +20,7 @@ The workspace requires Node 22.22.0 or later and pnpm 10.16 or later. `packageMa
 
 ## Verification
 
-The commands below mirror the CI `verify-core` job after dependency installation, in order; `pnpm test` also covers the direct scenario project that CI runs in its own `direct-scenario` job, and a `verify` gate job requires both:
+The commands below mirror the CI `verify-core` job after dependency installation, in order; `pnpm test` also covers the direct scenario project that CI runs in its own `direct-scenario` job, and the `verify` gate job requires every job in its `needs` list, these two among them, to succeed:
 
 ```bash
 pnpm github:check
@@ -154,6 +154,8 @@ Repository administrators separately own:
 - branch protection and required checks.
 
 Do not change those external controls as a side effect of an unrelated code change.
-The required check on `main` is `verify`, the gate job in `ci.yml` that succeeds
-only when `verify-core` and `direct-scenario` both succeed; a new gating job joins
-that gate's `needs` list, not the ruleset.
+The `protect main` ruleset requires the status check named `verify`, the gate job
+in `ci.yml`; it fails unless its `needs` list carries at least one job and every
+job in that list reports success, so a new gating job joins the list, not the
+ruleset. A push to `main` starts `ci.yml` and `release.yml` concurrently, and the
+release workflow does not wait for CI's result.

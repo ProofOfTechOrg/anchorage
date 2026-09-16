@@ -71,7 +71,8 @@ directory when a `.github/**/*.{yml,yaml}` file is staged (lint-staged);
 pre-push runs react-doctor on the branch's changed files
 (`pnpm react-doctor:diff`; bypass with `git push --no-verify`). CI also runs a
 non-blocking compatibility probe against the newest `@mastra/core` 1.x release.
-A `verify` gate job requires both `verify-core` and `direct-scenario` to succeed.
+The `verify` gate job requires every job in its `needs` list to succeed,
+`verify-core` and `direct-scenario` among them.
 
 The showcase app uses mandatory absolute imports — `@/*` for `src`,
 `#worker/*` for worker modules, `@flowsafe/*` for deep flowsafe source
