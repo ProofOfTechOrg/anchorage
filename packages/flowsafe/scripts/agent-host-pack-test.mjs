@@ -338,7 +338,10 @@ try {
   assertAttwEsmPackage(archive, packageRoot);
   run('tar', ['-xzf', archive, '-C', extracted]);
 
-  const packageDirectory = join(extracted, 'package');
+  // Symlink-resolved, because Node reports module URLs under the real path:
+  // the loader hook and the module-graph filter below compare those URLs
+  // against the `packedDistUrl` derived from this directory.
+  const packageDirectory = realpathSync(join(extracted, 'package'));
   assert.equal(
     existsSync(join(packageDirectory, 'dist', 'stale-package-probe.js')),
     false,
@@ -434,9 +437,19 @@ for (const value of [undefined, null, {}, [], { 'flowsafe.suspensionTimeout': {}
 }
 `,
   );
+  writeFileSync(
+    join(deadlineConsumer, 'graph-register.mjs'),
+    `import { register } from 'node:module';
+register('./graph-loader.mjs', import.meta.url);
+`,
+  );
   run(
     process.execPath,
-    ['--experimental-loader', './graph-loader.mjs', 'runtime.mjs'],
+    [
+      '--import',
+      pathToFileURL(join(deadlineConsumer, 'graph-register.mjs')).href,
+      'runtime.mjs',
+    ],
     deadlineConsumer,
   );
   const deadlineModules = readFileSync(deadlineGraph, 'utf8')
@@ -956,12 +969,12 @@ void [derived, constantsTimeout, constantsEnvelope];
 } from '@proofoftech/flowsafe/approval-api';
 import type { NotificationsStorage } from '@mastra/core/notifications';
 import {
-  createNotificationDispatchTick, createThreadSignalRoutes,
+  createNotificationDispatchTick, createSignalRouter, createThreadSignalRoutes,
   DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS, D1NotificationsStorage,
   type NotificationDeliveryStorage, type NotificationDeliveryObservation,
   type NotificationDeliveryFailure, type NotificationDeliveryUpdateResult,
   type NotificationDispatchTickOptions, type ThreadSignalRoutesOptions,
-  type SignalDatabase,
+  type SignalDatabase, type SignalRouterOptions,
 } from '@proofoftech/flowsafe/signals';
 import {
   type RunnerRuntime, type RunExecutionIdentity, type StartRunOptions,
@@ -973,7 +986,6 @@ import {
   type RunStartInput, type DoRunStartInput, type RunRouterOptions,
   type RunRouterStartIdempotency, type BoundThreadTargetValidator, type ThreadTopology,
 } from '@proofoftech/flowsafe/host-kit';
-import { createSignalRouter, type SignalRouterOptions } from '@proofoftech/flowsafe/signals';
 import {
   type AgentStartAuthority, type FlowsafeDurableAgent,
 } from '@proofoftech/flowsafe/agent-runner';
@@ -1153,6 +1165,33 @@ void [legacyContext, epochContext, legacyScope, epochScope, legacyInput, epochIn
     }),
   );
   run('pnpm', ['exec', 'tsc', '-p', 'tsconfig.json'], consumer);
+  // `skipLibCheck: true` above keeps the consumer program from reading the
+  // declarations it resolves, so the deadline entries' declaration axis is
+  // pinned here the way the loader probe pins their runtime axis: each entry
+  // declares one module, and the module they share reaches the runner through
+  // the single type-only import its exported projections need.
+  const packedDeclarationSpecifiers = (fileName) => {
+    const declaration = readFileSync(
+      join(packageDirectory, 'dist', 'do-runner', fileName),
+      'utf8',
+    );
+    return [
+      ...new Set(
+        [...declaration.matchAll(/(?:from|import\()\s*['"]([^'"]+)['"]/g)].map(
+          (match) => match[1],
+        ),
+      ),
+    ].sort();
+  };
+  assert.deepEqual(packedDeclarationSpecifiers('constants.d.ts'), [
+    './suspension-deadline.js',
+  ]);
+  assert.deepEqual(packedDeclarationSpecifiers('testing.d.ts'), [
+    './suspension-deadline.js',
+  ]);
+  assert.deepEqual(packedDeclarationSpecifiers('suspension-deadline.d.ts'), [
+    './runtime.js',
+  ]);
   writeFileSync(
     join(consumer, 'tsconfig.es2022.json'),
     JSON.stringify({

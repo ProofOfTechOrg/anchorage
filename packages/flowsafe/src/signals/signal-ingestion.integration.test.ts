@@ -70,6 +70,9 @@ function createThreadTopology<Id>(
   return createThreadTopologyWithSecret(namespace, DEPLOYMENT_IDENTITY_SECRET);
 }
 
+/** One request and the response the thread DO returned for it. */
+type ThreadExchange = { request: Request; response?: Response };
+
 interface TestEnv {
   agent: Agent;
   resolveNotificationsStorage?: () => D1NotificationsStorage;
@@ -78,12 +81,14 @@ interface TestEnv {
   contentPolicy?: SignalContentPolicy;
   ownership?: ResourceOwnershipStore;
   bindingHost?: ThreadAgentHost;
-  exchanges?: Array<{ request: Request; response?: Response }>;
+  exchanges?: ThreadExchange[];
 }
 
 // A minimal host thread DO: build() its init() wiring, route() the PRODUCTION
-// signal routes over the env's reserve agent + run cap. The base class refuses
-// a request without the topology-stamped execution principal before route().
+// signal routes. Two gates stand in front of them — the base class refuses a
+// request without the topology-stamped execution principal before route(), and
+// route() refuses a thread the env's ownership store assigns to another
+// principal.
 class TestThread extends ThreadDurableObject<TestEnv> {
   readonly #threadName: string;
 
@@ -143,7 +148,7 @@ class TestThread extends ThreadDurableObject<TestEnv> {
 // exactly what the base class uses as the authoritative thread address.
 function threadNamespace(
   env: TestEnv,
-  afterResponse?: (response: Response) => Promise<void>,
+  afterResponse?: (exchange: ThreadExchange) => Promise<void>,
 ): ThreadNamespaceLike<string> {
   const instances = new Map<string, TestThread>();
   return {
@@ -166,13 +171,14 @@ function threadNamespace(
         ) => {
           const request =
             typeof input === 'string' ? new Request(input, reqInit) : input;
-          const exchange: { request: Request; response?: Response } = {
-            request,
-          };
+          // The recorded exchange is where a response is observed: an observer
+          // reads it from the record, so it cannot see a call whose response
+          // the record is still missing.
+          const exchange: ThreadExchange = { request };
           env.exchanges?.push(exchange);
           const response = await instance.fetch(request);
           exchange.response = response;
-          await afterResponse?.(response);
+          await afterResponse?.(exchange);
           return response;
         },
       };
@@ -206,8 +212,9 @@ function actorContext(): ActorContext {
   };
 }
 
-// A runtime-driven reserve agent (no LLM): records the ifIdle target sendMessage
-// received. The brand is what lets a wake pass the thread-route gate.
+// A runtime-driven reserve agent (no LLM): both writers, sendSignal and
+// sendMessage, record the ifIdle target they received into one list. The brand
+// is what lets a wake pass the thread-route gate.
 function reserveAgent(accepted?: Promise<unknown>) {
   const targets: Array<{ ifIdle?: unknown }> = [];
   const sendSignal = vi.fn(
@@ -272,6 +279,41 @@ describe('signal ingestion — full chain (router → topology → thread DO →
       expect.objectContaining({ runId: expect.any(String) }),
     );
     expect(targets).toHaveLength(0);
+  });
+
+  it('records the thread response before an observer runs', async () => {
+    // #given an observer of the namespace's exchange record
+    const { agent } = reserveAgent();
+    const exchanges: NonNullable<TestEnv['exchanges']> = [];
+    const observed: Array<Response | undefined> = [];
+    const topology = createThreadTopology(
+      threadNamespace(
+        {
+          agent,
+          consultRunCap: async () => true,
+          startIdleRun: async ({ runId }) => ({ runId }),
+          exchanges,
+        },
+        async (exchange) => {
+          observed.push(exchange.response);
+        },
+      ),
+    );
+    const router = createSignalRouter({
+      resolve: async () => actorContext(),
+      topology,
+    });
+
+    // #when
+    const res = await router(wake(THREAD_ID));
+
+    // #then the observer read the response off the record, so the record
+    // carried it already
+    expect(res?.status).toBe(200);
+    const recorded = exchanges[0]?.response;
+    assert(recorded);
+    expect(observed).toHaveLength(1);
+    expect(observed[0]).toBe(recorded);
   });
 
   it('degrades the wake to persist when the deployment is over its run cap', async () => {
@@ -730,7 +772,8 @@ describe('notification dispatch — lost response after the thread DO handler', 
       let durableReceipt: NotificationRecord | null = null;
       let durableRaw: unknown;
       let routeResult: unknown;
-      const responseReceived = vi.fn(async (response: Response) => {
+      const responseReceived = vi.fn(async ({ response }: ThreadExchange) => {
+        assert(response);
         expect(response.status).toBe(200);
         routeResult = await response.clone().json();
         durableReceipt = await storage.getNotification(lookup);
@@ -895,7 +938,8 @@ describe('notification dispatch — lost response after the thread DO handler', 
         ids.push(created.id);
       }
       const durableReceipts: Array<Record<string, unknown> | null> = [];
-      const responseReceived = vi.fn(async (response: Response) => {
+      const responseReceived = vi.fn(async ({ response }: ThreadExchange) => {
+        assert(response);
         expect(response.status).toBe(200);
         for (const id of ids) {
           durableReceipts.push(

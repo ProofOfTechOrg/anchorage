@@ -99,6 +99,7 @@ export type {
   MaintenanceDutyContext,
   MaintenanceHealth,
   MaintenanceNamespaceLike,
+  MaintenancePurgeDutyContext,
   MaintenanceStorage,
   MaintenanceStorageTransaction,
   MaintenanceStubLike,

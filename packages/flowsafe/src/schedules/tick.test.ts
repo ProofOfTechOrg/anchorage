@@ -684,6 +684,47 @@ describe('createScheduleTick', () => {
     );
   });
 
+  it('audits an unadvanceable cron, writes no trigger, and leaves the row due', async () => {
+    // #given a stored row whose cron is syntactically legal — so a facade that
+    // validates at create can have accepted it — but has no future occurrence,
+    // which is what computeNextFireAt throws on
+    const store = new FakeStore();
+    store.seed(
+      workflowSchedule({ id: 'schedule_corrupt', cron: '0 0 30 2 *' }),
+    );
+    const start = vi.fn();
+    const events: ScheduleTickAuditEvent[] = [];
+    const tick = createScheduleTick({
+      store,
+      start,
+      audit: (event) => {
+        events.push(event);
+      },
+      now: () => NOW,
+    });
+
+    // #when
+    const first = await tick();
+
+    // #then the pass audits the failure and dispatches nothing; nextFireAt is
+    // untouched, so no trigger identifies a claim
+    expect(first).toMatchObject({ due: 1, failed: 1, fired: 0, lost: 0 });
+    expect(start).not.toHaveBeenCalled();
+    expect(store.triggers).toEqual([]);
+    expect(store.schedules.get('schedule_corrupt')?.nextFireAt).toBe(
+      NOW - 1000,
+    );
+    expect(events).toEqual([
+      expect.objectContaining({ outcome: 'failed', reason: 'invalid-cron' }),
+    ]);
+
+    // #and the row is still due: it is selected again and holds a slot of the
+    // bounded page until an operator repairs or removes it
+    expect(await tick()).toMatchObject({ due: 1, failed: 1 });
+    expect(store.triggers).toEqual([]);
+    expect(events).toHaveLength(2);
+  });
+
   it('rejects invalid limits synchronously and treats zero as a no-op', async () => {
     const store = new FakeStore();
     store.seed(workflowSchedule());

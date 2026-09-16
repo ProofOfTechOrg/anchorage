@@ -11,8 +11,9 @@ import type { D1Database } from '@cloudflare/workers-types';
 import type {
   InitialAdmissionDatabase,
   SnapshotDatabase,
+  SnapshotStatement,
 } from '../src/do-runner/index.js';
-import type { SignalDatabase } from '../src/signals/index.js';
+import type { SignalDatabase, SignalStatement } from '../src/signals/index.js';
 
 type AssertTrue<T extends true> = T;
 type _D1SatisfiesSignalDatabase = AssertTrue<
@@ -23,4 +24,31 @@ type _D1SatisfiesSnapshotDatabase = AssertTrue<
 >;
 type _D1SatisfiesInitialAdmissionDatabase = AssertTrue<
   D1Database extends InitialAdmissionDatabase ? true : false
+>;
+
+// The assertions above hold one direction of the seam: a real D1Database
+// satisfies it. These hold the other direction. A batch element carries
+// `results` — the requirement the `batch` docstrings in signals/d1-shared.ts
+// and do-runner/workflow-snapshot-row.ts place on a hand-written adapter — and
+// an element widened back to `unknown` admits an adapter that resolves write
+// metadata alone, while the assertions above still pass.
+type AssertFalse<T extends false> = T;
+/** D1 write metadata alone, without the rows a `D1Result` carries. */
+type MetaOnlyBatchResult = { meta?: { changes?: number } };
+interface MetaOnlySignalAdapter {
+  prepare(query: string): SignalStatement;
+  batch(statements: SignalStatement[]): Promise<MetaOnlyBatchResult[]>;
+}
+interface MetaOnlySnapshotAdapter {
+  prepare(query: string): SnapshotStatement;
+  batch(statements: SnapshotStatement[]): Promise<MetaOnlyBatchResult[]>;
+}
+type _MetaOnlyAdapterFailsSignalDatabase = AssertFalse<
+  MetaOnlySignalAdapter extends SignalDatabase ? true : false
+>;
+type _MetaOnlyAdapterFailsSnapshotDatabase = AssertFalse<
+  MetaOnlySnapshotAdapter extends SnapshotDatabase ? true : false
+>;
+type _MetaOnlyAdapterFailsInitialAdmissionDatabase = AssertFalse<
+  MetaOnlySnapshotAdapter extends InitialAdmissionDatabase ? true : false
 >;

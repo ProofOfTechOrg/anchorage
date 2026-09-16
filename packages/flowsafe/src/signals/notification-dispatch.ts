@@ -3,6 +3,7 @@
 import {
   type NotificationRecord,
   type NotificationsStorage,
+  resolveNotificationDeliveryDecision,
   summarizeNotifications,
 } from '@mastra/core/notifications';
 
@@ -482,6 +483,33 @@ export function assertNotificationSourceKeysPatched(): void {
   }
 }
 
+let deliveryPolicyPatched: Promise<boolean> | undefined;
+
+/**
+ * The second subject of the @mastra/core patch: the source-policy lookup in
+ * resolveNotificationDeliveryDecision guards its own keys, so a source named
+ * after an Object.prototype member resolves the configured default instead
+ * of the inherited member. The lookup is asynchronous, so this probe is the
+ * async sibling of assertNotificationSourceKeysPatched and is consulted at
+ * the async handlers that reach the sender.
+ */
+export async function assertNotificationDeliveryPolicyPatched(): Promise<void> {
+  deliveryPolicyPatched ??= resolveNotificationDeliveryDecision({
+    config: { sources: {}, default: 'discard' },
+    record: SOURCE_KEY_PROBE,
+    threadState: 'idle',
+    now: new Date(0),
+  }).then(
+    (decision) => decision.action === 'discard',
+    () => false,
+  );
+  if (!(await deliveryPolicyPatched)) {
+    throw new TypeError(
+      'notification ingestion requires the @mastra/core patch flowsafe ships; apply it at the application root (getting started: "Apply the flowsafe patch to @mastra/core")',
+    );
+  }
+}
+
 function errorMessage(error: unknown): string {
   try {
     return String(error instanceof Error ? error.message : error);
@@ -697,16 +725,11 @@ export function createNotificationDispatchTick(
     options.maxDeliveryAttempts ?? DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS,
     'notification maximum delivery attempts',
   );
+  const { storage } = options;
+  const deliveryStorage = captureNotificationDeliveryStorage(storage);
   if (limit === 0) return async () => ({ due: 0, delivered: 0, failed: 0 });
   assertNotificationSourceKeysPatched();
-  const {
-    storage,
-    topology,
-    resolveContext,
-    now: clock,
-    executionFence,
-  } = options;
-  const deliveryStorage = captureNotificationDeliveryStorage(storage);
+  const { topology, resolveContext, now: clock, executionFence } = options;
   return async () => {
     // The fence, before the due read and before any delivery. This runs on a
     // maintenance alarm, so a fence that cannot be READ degrades closed by

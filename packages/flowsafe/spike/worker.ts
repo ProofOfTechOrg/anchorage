@@ -539,7 +539,7 @@ function createSpikeAgentModule(env: Env, audit: AuditLogger): AgentModule {
       ]);
       return { recorded: true };
     },
-    permissions: { sideEffect: 'write' },
+    permissions: { sideEffect: 'write', egressEnforcement: 'enforced' },
     policies: {
       writePermissions: { requireApproval: [SPIKE_WRITE_CONNECTOR_ID] },
       audit,
@@ -718,7 +718,11 @@ function defineWorkflows(env: Env): RunnerRuntime {
       published: z.boolean(),
       applicationValue: z.string().optional(),
     }),
-    permissions: { sideEffect: 'write', requiresApproval: true },
+    permissions: {
+      sideEffect: 'write',
+      requiresApproval: true,
+      egressEnforcement: 'enforced',
+    },
     execute: async (_input, context) => ({
       published: true,
       applicationValue: z
@@ -2041,7 +2045,7 @@ async function handleBackgroundTaskProbe(
       description:
         'B-S3: a write connector must reject a smuggled _background arg',
       execute: async () => ({ ok: true }),
-      permissions: { sideEffect: 'write' },
+      permissions: { sideEffect: 'write', egressEnforcement: 'enforced' },
       policies: { audit },
     });
     let denied = false;

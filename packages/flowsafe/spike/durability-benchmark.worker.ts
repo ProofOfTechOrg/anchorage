@@ -165,7 +165,11 @@ function defineFlowsafeWorkflow(env: Env): RunnerRuntime {
       runId: z.string(),
     }),
     outputSchema: z.object({ effectCount: z.number() }),
-    permissions: { sideEffect: 'write', requiresApproval: true },
+    permissions: {
+      sideEffect: 'write',
+      requiresApproval: true,
+      egressEnforcement: 'enforced',
+    },
     execute: async (input) => ({
       effectCount: (await recordEffect(env.DB, 'flowsafe', input.runId, input))
         .effectCount,

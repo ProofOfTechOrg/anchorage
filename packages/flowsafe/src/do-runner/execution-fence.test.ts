@@ -37,9 +37,19 @@ import {
   InvalidExecutionFenceRequestError,
   validateExecutionFenceAdmissionSchema,
 } from './execution-fence.js';
+import { StartReservationUnreadableError as BarrelStartReservationUnreadableError } from './index.js';
 import { init } from './init.js';
 import type { RunnerRuntime } from './runtime.js';
-import { StartIdempotencyStore } from './start-idempotency.js';
+import {
+  decodeStartReservationAdmissionResult as reExportedDecode,
+  validateStartReservationAdmissionSchema as reExportedValidate,
+  StartIdempotencyStore,
+  StartReservationUnreadableError,
+} from './start-idempotency.js';
+import {
+  decodeStartReservationAdmissionResult,
+  validateStartReservationAdmissionSchema,
+} from './start-reservation-contract.js';
 
 const fenceDatabases = new WeakMap<
   ExecutionFenceStore,
@@ -3095,5 +3105,70 @@ describe('FS8 D3 proof activation', () => {
     expect(await h.fence.rebindProofRun(h.options)).toBe(true);
     expect(h.row().proof_start_token).toBe('generation');
     expect((await h.store.read('key'))?.owner).toEqual(execution.owner);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The contracts the fence's reservation seam rests on, each carrying its own
+// evidence. `refuses mismatched database ports before I/O and never lets the
+// legacy setter alter or acknowledge a modern tuple` is the structural DB-port
+// control and establishes nothing beyond it, so the import boundary, the codec
+// definitions and the refusal constructor are asserted here instead of being
+// read off that one case.
+// ---------------------------------------------------------------------------
+
+type SourceReader = { readFileSync(path: string, encoding: string): string };
+
+/**
+ * A sibling module's source, through getBuiltinModule so this workers-typed
+ * program needs no Node ambient types — the idiom test-support/sqlite.ts uses.
+ */
+function siblingSource(file: string): string {
+  const fs = (
+    globalThis as {
+      process?: { getBuiltinModule?: (id: string) => unknown };
+    }
+  ).process?.getBuiltinModule?.('node:fs') as SourceReader | undefined;
+  if (!fs) throw new Error('node:fs unavailable — tests require node >= 22');
+  return fs.readFileSync(
+    new URL(file, (import.meta as ImportMeta & { url: string }).url).pathname,
+    'utf8',
+  );
+}
+
+describe('start-reservation contract evidence', () => {
+  it('keeps the reservation contract a leaf of three declared edges', () => {
+    // Source edges, not a cycle check: a cycle rule admits a one-way edge from
+    // this leaf into a store, a fence, Runtime or a capability, and admitting
+    // one would put the fence's codecs behind the graph they decode for. Type-
+    // only edges count — they are erased, and the boundary is not.
+    const edges = siblingSource('./start-reservation-contract.ts')
+      .split('\n')
+      .map((line) => / from '([^']+)';$/.exec(line)?.[1])
+      .filter((specifier): specifier is string => specifier !== undefined);
+    expect(edges).toEqual([
+      '../approval-api/principal-identity.js',
+      './execution-admission.js',
+      './path-safe-id.js',
+    ]);
+  });
+
+  it('gives the fence and the reservation store one definition of each codec', () => {
+    // The strict admission-codec suites drive these two functions through the
+    // store's re-export; the fence imports them from the leaf. Same function
+    // objects, so that evidence is evidence about the fence's own decode.
+    expect(reExportedDecode).toBe(decodeStartReservationAdmissionResult);
+    expect(reExportedValidate).toBe(validateStartReservationAdmissionSchema);
+  });
+
+  it('publishes the reservation refusal constructor rather than a second copy', () => {
+    // A forwarding copy would satisfy every instanceof test inside the store
+    // and fail every one a consumer writes against the package surface.
+    expect(BarrelStartReservationUnreadableError).toBe(
+      StartReservationUnreadableError,
+    );
+    expect(new StartReservationUnreadableError('key')).toBeInstanceOf(
+      BarrelStartReservationUnreadableError,
+    );
   });
 });

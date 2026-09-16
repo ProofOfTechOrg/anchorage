@@ -4,6 +4,10 @@
 
 import type { Agent } from '@mastra/core/agent';
 import type {
+  NotificationDeliveryDecision,
+  NotificationDeliveryPolicyConfig,
+  NotificationDeliveryPolicyDecision,
+  NotificationDeliveryPolicyInput,
   NotificationRecord,
   NotificationsStorage,
 } from '@mastra/core/notifications';
@@ -11,31 +15,86 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { ThreadScope } from '../do-runner/index.js';
 import {
+  assertNotificationDeliveryPolicyPatched,
   createNotificationDispatchTick,
   type NotificationDispatchTickOptions,
 } from './notification-dispatch.js';
 import { createThreadSignalRoutes } from './thread-do-routes.js';
 
-vi.mock('@mastra/core/notifications', async (importOriginal) => {
-  const actual =
-    await importOriginal<typeof import('@mastra/core/notifications')>();
-  return {
-    ...actual,
-    // 1.53.0's accumulator is an ordinary object literal, so a source named
-    // after an Object.prototype member resolves the inherited member instead of
-    // its own count.
-    summarizeNotifications: (records: NotificationRecord[]) => {
-      const summary = actual.summarizeNotifications(records);
-      const bySource: Record<string, number> = {};
-      for (const notification of records) {
-        if (notification.status !== 'pending') continue;
-        bySource[notification.source] =
-          (bySource[notification.source] ?? 0) + 1;
-      }
-      return { ...summary, bySource };
+// The module shape both mock registrations build: `summarizeNotifications`
+// unpatched, or patched for the delivery-policy case, which reaches the
+// asynchronous probe only when the synchronous one passes.
+const unpatchedNotifications = vi.hoisted(
+  () =>
+    (
+      actual: typeof import('@mastra/core/notifications'),
+      patchedAccumulator: boolean,
+    ) => {
+      const normalize = (
+        decision: NotificationDeliveryPolicyDecision,
+      ): NotificationDeliveryDecision =>
+        typeof decision === 'string' ? { action: decision } : decision;
+      return {
+        ...actual,
+        // 1.53.0's accumulator is an ordinary object literal, so a source named
+        // after an Object.prototype member resolves the inherited member instead
+        // of its own count. The patched shape is built here rather than read
+        // from the installed core, so both shapes hold whichever core the
+        // workspace installs.
+        summarizeNotifications: (records: NotificationRecord[]) => {
+          const summary = actual.summarizeNotifications(records);
+          const bySource: Record<string, number> = patchedAccumulator
+            ? Object.create(null)
+            : {};
+          for (const notification of records) {
+            if (notification.status !== 'pending') continue;
+            bySource[notification.source] =
+              (bySource[notification.source] ?? 0) + 1;
+          }
+          return { ...summary, bySource };
+        },
+        // 1.53.0's source lookup, reproduced from the shipped patch's `-` lines:
+        // the bare index read resolves an Object.prototype member for a source
+        // named after one, and normalizeDecision hands that member back as the
+        // decision, which therefore carries no action.
+        resolveNotificationDeliveryDecision: async ({
+          config,
+          ...input
+        }: NotificationDeliveryPolicyInput & {
+          config?: NotificationDeliveryPolicyConfig;
+        }): Promise<NotificationDeliveryDecision> => {
+          const custom = await config?.decide?.(input);
+          if (custom) return normalize(custom);
+          const sourceDecision = config?.sources?.[input.record.source];
+          if (sourceDecision) return normalize(sourceDecision);
+          const priorityDecision = config?.priorities?.[input.record.priority];
+          if (priorityDecision) return normalize(priorityDecision);
+          if (config?.default) return normalize(config.default);
+          return actual.defaultNotificationDeliveryDecision(input);
+        },
+      };
     },
-  };
-});
+);
+
+vi.mock('@mastra/core/notifications', async (importOriginal) =>
+  unpatchedNotifications(
+    await importOriginal<typeof import('@mastra/core/notifications')>(),
+    false,
+  ),
+);
+
+// Vitest caches a factory's result per registration, so a case that needs the
+// other accumulator registers its own factory rather than resetting modules
+// around a switch the cached result would keep ignoring.
+const mockNotifications = (patchedAccumulator: boolean): void => {
+  vi.doMock('@mastra/core/notifications', async (importOriginal) =>
+    unpatchedNotifications(
+      await importOriginal<typeof import('@mastra/core/notifications')>(),
+      patchedAccumulator,
+    ),
+  );
+  vi.resetModules();
+};
 
 const PATCH_MESSAGE = /Apply the flowsafe patch to @mastra\/core/;
 
@@ -43,7 +102,14 @@ function tickOptions(
   overrides: Record<string, unknown> = {},
 ): NotificationDispatchTickOptions {
   return {
-    storage: {},
+    // The tick captures the conditional-delivery capability ahead of the patch
+    // probe, so storage lacking it refuses for the other reason.
+    storage: {
+      getNotification: async () => null,
+      updateNotificationDeliveryIfUnchanged: async () => ({
+        outcome: 'unchanged',
+      }),
+    },
     topology: { send: async () => new Response(null, { status: 404 }) },
     resolveContext: () => ({}),
     executionFence: 'none',
@@ -169,5 +235,55 @@ describe('notification dispatch against an unpatched @mastra/core', () => {
     expect(await response?.json()).toEqual({ error: 'internal error' });
     expect(logged.some((line) => PATCH_MESSAGE.test(line))).toBe(true);
     expect(sendNotificationSignal).not.toHaveBeenCalled();
+  });
+
+  it('refuses the delivery policy probe, naming the patch', async () => {
+    await expect(assertNotificationDeliveryPolicyPatched()).rejects.toThrow(
+      PATCH_MESSAGE,
+    );
+  });
+});
+
+describe('notification ingestion against a core patched for summaries alone', () => {
+  it("refuses without reaching core's sender", async () => {
+    const sendNotificationSignal = vi.fn();
+    mockNotifications(true);
+    try {
+      // Both probes memoize per module instance, and the instance the cases
+      // above hold has recorded the summary half as unpatched, so this case
+      // reads the delivery half through a module graph of its own.
+      const { assertNotificationSourceKeysPatched } = await import(
+        './notification-dispatch.js'
+      );
+      const { createThreadSignalRoutes } = await import(
+        './thread-do-routes.js'
+      );
+      expect(() => assertNotificationSourceKeysPatched()).not.toThrow();
+
+      const routes = createThreadSignalRoutes({
+        resolveAgent: () =>
+          ({ id: 'agent', sendNotificationSignal }) as unknown as Agent,
+        resolveResourceId: () => 'acme_res',
+      });
+      const { response, logged } = await withCapturedErrors(() =>
+        routes(
+          post('/signal/notification', {
+            source: 'constructor',
+            kind: 'changed',
+            summary: 's',
+          }),
+          scope(),
+        ),
+      );
+
+      // The summary half passing is what leaves the source delivery policy
+      // lookup as the only subject this refusal can belong to.
+      expect(response?.status).toBe(502);
+      expect(await response?.json()).toEqual({ error: 'internal error' });
+      expect(logged.some((line) => PATCH_MESSAGE.test(line))).toBe(true);
+      expect(sendNotificationSignal).not.toHaveBeenCalled();
+    } finally {
+      mockNotifications(false);
+    }
   });
 });

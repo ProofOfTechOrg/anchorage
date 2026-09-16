@@ -63,6 +63,7 @@ import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
+import { durableKeyValueStorageFixture } from '../test-support/durable-key-value-storage.js';
 import {
   openSqlite,
   type SqliteDatabase,
@@ -77,7 +78,6 @@ import {
   type ResourceOwnershipDatabase,
 } from './approval-api/index.js';
 import { BackgroundTaskHost } from './background-tasks/index.js';
-import type { DurableKeyValueStorage } from './do-runner/cf-types.js';
 import type {
   D1StartExecutionIdentity,
   RunExecutionIdentity,
@@ -363,24 +363,9 @@ async function matrixRunner(
   runId: string,
 ): Promise<{ runner: MatrixRunner; runtime: RunnerRuntime }> {
   const runtime = await gatedRuntime(fence, database);
-  const values = new Map<string, unknown>();
-  let alarm: number | undefined;
-  const storage: DurableKeyValueStorage = {
-    get: async <T>(key: string) =>
-      structuredClone(values.get(key)) as T | undefined,
-    put: async (key, value) => {
-      values.set(key, structuredClone(value));
-    },
-    delete: async (key) => values.delete(key),
-    setAlarm: async (at) => {
-      alarm = Number(at);
-    },
-    deleteAlarm: async () => {
-      alarm = undefined;
-    },
-  };
+  const journal = durableKeyValueStorageFixture();
   const runner = new MatrixRunner(
-    { id: { name: `gated:${runId}` }, storage },
+    { id: { name: `gated:${runId}` }, storage: journal.storage },
     {
       runtime,
       owners: new D1ResourceOwnershipStore(
@@ -391,7 +376,7 @@ async function matrixRunner(
       DB: database,
     },
   );
-  expect(alarm).toBeUndefined();
+  expect(journal.alarms).toEqual([]);
   return { runner, runtime };
 }
 

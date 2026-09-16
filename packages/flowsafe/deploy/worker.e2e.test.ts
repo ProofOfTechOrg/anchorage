@@ -44,7 +44,6 @@ import {
   D1ApprovalStoreFactory,
 } from '../src/approval-api/index.js';
 import {
-  type DurableKeyValueStorage,
   HUB_INSTANCE_NAME,
   PATH_SAFE_ID_PATTERN,
   type RunArtifactPurger,
@@ -52,9 +51,10 @@ import {
 } from '../src/do-runner/index.js';
 import {
   createFlowsafeWorker,
-  type MaintenanceDutyContext,
+  type MaintenancePurgeDutyContext,
   staticTokenVerifier,
 } from '../src/host-kit/index.js';
+import { durableKeyValueStorageFixture } from '../test-support/durable-key-value-storage.js';
 import {
   openSqlite,
   type SqliteDatabase,
@@ -80,13 +80,14 @@ const maintenanceWorker = createFlowsafeWorker<Env>({
   },
 });
 
-// The purge duty reads its retention cursor from this context and, with no way
-// to advance it, skips the run-row purge and reports a retention-purge failure
-// while its sibling surfaces continue. The shipped template's
-// FlowsafeMaintenance DO supplies both from its own storage, so a caller that
-// drives the seam directly owns the cursor itself.
-function retentionContext(): MaintenanceDutyContext {
-  const context: MaintenanceDutyContext = {
+// One context per maintenance invocation, as the shipped template's
+// FlowsafeMaintenance DO gives the seam: it supplies the retention cursor and
+// the callback that advances it from its own storage, so a caller driving the
+// seam directly owns both. The purge duty requires the callback — a context
+// without it refuses the invocation before any purge surface runs — and the
+// cursor it writes back is what the per-invocation case below reads.
+function retentionContext(): MaintenancePurgeDutyContext {
+  const context: MaintenancePurgeDutyContext = {
     advanceRetentionCursor: async (cursor) => {
       context.retentionCursor = structuredClone(cursor);
     },
@@ -98,7 +99,12 @@ async function runMaintenanceDuty(
   duty: 'sweep' | 'purge',
   env: Env,
 ): Promise<void> {
-  await maintenanceWorker.runMaintenanceDuty(duty, env, retentionContext());
+  // The sweep reads no cursor, so it takes no context; the purge takes its own.
+  if (duty === 'purge') {
+    await maintenanceWorker.runMaintenanceDuty(duty, env, retentionContext());
+    return;
+  }
+  await maintenanceWorker.runMaintenanceDuty(duty, env);
 }
 
 // In-process DO namespace: idFromName carries the name, get() memoizes a REAL
@@ -115,20 +121,11 @@ function fakeRunnerNamespace(getEnv: () => Env): DurableObjectNamespace {
       fetch: async (input: string, init?: RequestInit) => {
         let runner = instances.get(id.name);
         if (!runner) {
-          const values = new Map<string, unknown>();
-          const storage: DurableKeyValueStorage = {
-            async get<T>(key: string): Promise<T | undefined> {
-              return values.get(key) as T | undefined;
-            },
-            async put<T>(key: string, value: T): Promise<void> {
-              values.set(key, value);
-            },
-            async delete(key: string): Promise<boolean> {
-              return values.delete(key);
-            },
-            async setAlarm(_scheduledTime: number | Date): Promise<void> {},
-            async deleteAlarm(): Promise<void> {},
-          };
+          // The fixture's alarm members are required and unread here: the
+          // runner refuses to arm the run-owner journal on a storage that
+          // cannot set an alarm, while these cases assert nothing about when a
+          // wake is scheduled.
+          const { storage } = durableKeyValueStorageFixture();
           const state = {
             id: { name: id.name },
             storage,
@@ -912,7 +909,17 @@ describe('deploy worker alarm-owned maintenance duties', () => {
     const surfaces = errorSpy.mock.calls
       .map(([line]) => String(line))
       .filter((line) => line.includes('maintenance-error'));
-    expect(surfaces.some((line) => line.includes('sla-sweep'))).toBe(true);
+    // Every surface assertion in this describe names the cause its case
+    // injected, not just the surface: a fixture-shaped failure — a context with
+    // no cursor callback, a table the fixture never created — reaches the same
+    // surface, and a bare surface check passes while the isolation under test
+    // was never exercised.
+    expect(
+      surfaces.some(
+        (line) =>
+          line.includes('sla-sweep') && line.includes('approval store down'),
+      ),
+    ).toBe(true);
     errorSpy.mockRestore();
   });
 
@@ -962,22 +969,38 @@ describe('deploy worker alarm-owned maintenance duties', () => {
     const surfaces = errorSpy.mock.calls
       .map(([line]) => String(line))
       .filter((line) => line.includes('maintenance-error'));
-    expect(surfaces.some((line) => line.includes('retention-purge'))).toBe(
-      true,
-    );
+    expect(
+      surfaces.some(
+        (line) =>
+          line.includes('retention-purge') &&
+          line.includes('snapshot table down'),
+      ),
+    ).toBe(true);
     errorSpy.mockRestore();
   });
 
   it('purges DECIDED approvals and snapshots in the same purge-duty alarm', async () => {
     // #given — an old decided (approved) approval, a fresh decided
     // (rejected) approval, and an old but still-OPEN approval (never
-    // purged at any age). RUN_RETENTION_DAYS is unset (fallback default);
+    // purged at any age), beside a stale and a fresh terminal snapshot row.
+    // RUN_RETENTION_DAYS is unset (fallback default);
     // APPROVAL_RETENTION_DAYS is deliberately invalid: numberVar must log
     // the config error and fall back to 30 days rather than skip the purge.
-    const { env, d1 } = makeEnv({ APPROVAL_RETENTION_DAYS: '-5' });
+    const { env, sqlite, d1 } = makeEnv({ APPROVAL_RETENTION_DAYS: '-5' });
     const store = new D1ApprovalStoreFactory(d1 as never).store();
     const old = new Date(Date.now() - 40 * DAY_MS).toISOString();
     const fresh = new Date(Date.now() - 1 * DAY_MS).toISOString();
+    createSnapshotTable(sqlite);
+    seedRun(sqlite, {
+      runId: 'acme_stale-done',
+      status: 'success',
+      updatedAt: Date.now() - 40 * DAY_MS,
+    });
+    seedRun(sqlite, {
+      runId: 'acme_fresh-done',
+      status: 'success',
+      updatedAt: Date.now() - 1 * DAY_MS,
+    });
     await store.create({
       id: 'apr-old-decided',
       workflowId: 'example-approval',
@@ -1023,6 +1046,10 @@ describe('deploy worker alarm-owned maintenance duties', () => {
     expect(await store.get('apr-old-decided')).toBeNull();
     expect(await store.get('apr-fresh-decided')).not.toBeNull();
     expect(await store.get('apr-old-open')).not.toBeNull();
+    // ...and the SAME alarm reclaimed the stale terminal snapshot under the
+    // fallback 30-day run TTL, which is what "in the same purge-duty alarm"
+    // claims of the two surfaces
+    expect(remainingRunIds(sqlite)).toEqual(['acme_fresh-done']);
     // ...and the invalid var was surfaced as the operator's tripwire (same
     // convention as RUN_RETENTION_DAYS's config-error test above)
     expect(
@@ -1035,6 +1062,33 @@ describe('deploy worker alarm-owned maintenance duties', () => {
       }),
     ).toBe(true);
     errorSpy.mockRestore();
+  });
+
+  it('gives each maintenance invocation its own retention cursor', async () => {
+    // #given — a stale terminal snapshot for the purge to reclaim, and two
+    // contexts built the way every call site in this file builds one
+    const { env, sqlite } = makeEnv();
+    createSnapshotTable(sqlite);
+    seedRun(sqlite, {
+      runId: 'acme_stale-done',
+      status: 'success',
+      updatedAt: Date.now() - 40 * DAY_MS,
+    });
+    const driven = retentionContext();
+    const sibling = retentionContext();
+    expect(driven.retentionCursor).toBeUndefined();
+    expect(sibling.retentionCursor).toBeUndefined();
+
+    // #when — one purge duty runs on the first context
+    await maintenanceWorker.runMaintenanceDuty('purge', env, driven);
+
+    // #then — the purge advanced a cursor, it is readable on the context that
+    // duty was given, and it reached no other. A module-level context shared by
+    // every call site here would hand the next invocation this one's cursor,
+    // and every other case in this file would still pass.
+    expect(remainingRunIds(sqlite)).toEqual([]);
+    expect(driven.retentionCursor).toMatchObject({ version: 1 });
+    expect(sibling.retentionCursor).toBeUndefined();
   });
 
   it('an approval-purge failure does not stop the snapshot retention purge (isolated surfaces)', async () => {
@@ -1076,7 +1130,11 @@ describe('deploy worker alarm-owned maintenance duties', () => {
       .map(([line]) => String(line))
       .filter((line) => line.includes('maintenance-error'));
     expect(
-      surfaces.some((line) => line.includes('approval-retention-purge')),
+      surfaces.some(
+        (line) =>
+          line.includes('approval-retention-purge') &&
+          line.includes('approval store down'),
+      ),
     ).toBe(true);
     errorSpy.mockRestore();
   });

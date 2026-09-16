@@ -192,7 +192,11 @@ function defineWorkflows(env: Env): RunnerRuntime {
     description: 'Publishes the approved example topic',
     inputSchema: z.object({ topic: z.string() }),
     outputSchema: z.object({ published: z.boolean() }),
-    permissions: { sideEffect: 'write', requiresApproval: true },
+    permissions: {
+      sideEffect: 'write',
+      requiresApproval: true,
+      egressEnforcement: 'enforced',
+    },
     execute: async () => ({ published: true }),
   });
 

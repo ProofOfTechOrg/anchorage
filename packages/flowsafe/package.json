@@ -70,6 +70,7 @@
     "dev": "tsc --watch",
     "test": "vitest run",
     "test:agent-host-export": "node scripts/agent-host-pack-test.mjs",
+    "test:packed-surface": "node scripts/agent-host-pack-test.mjs",
     "test:provisioning-export": "node scripts/provisioning-pack-test.mjs",
     "test:signals-client-export": "node scripts/signals-client-pack-test.mjs",
     "test:watch": "vitest",

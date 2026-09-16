@@ -202,7 +202,7 @@ const gate = createStep({
 });
 ```
 
-Use `isArmableSuspensionDeadlineMs(value)` to validate relative milliseconds against the runner's safe-integer and inclusive duration bounds. Import it and the deadline values from `@proofoftech/flowsafe/do-runner/constants` to avoid loading the runner graph. A step declaring a Zod `suspendSchema` must declare the reserved field or use a loose object, because Mastra replaces the suspend payload with parsed output. Its `resumeSchema` must accept the timeout envelope as well as the signal shape.
+Use `isArmableSuspensionDeadlineMs(value)` to validate relative milliseconds against the runner's safe-integer and inclusive duration bounds. Import it, those duration bounds and the reserved payload keys from `@proofoftech/flowsafe/do-runner/constants` to avoid loading the runner graph; the per-run cap `MAX_SUSPENSION_DEADLINES_PER_RUN` comes from `@proofoftech/flowsafe/do-runner`. A step declaring a Zod `suspendSchema` must declare the reserved field or use a loose object, because Mastra replaces the suspend payload with parsed output. Its `resumeSchema` must accept the timeout envelope as well as the signal shape.
 
 For workflow tests, import `suspensionTimeoutResumeData` from `@proofoftech/flowsafe/do-runner/testing` and call it with `{ step, deadlineAt }` and an expiry time. It returns the alarm's envelope shape; `isSuspensionTimeoutResumeData` checks that shape without authenticating its origin. Public resume requests containing the reserved key are rejected. Alarm resumes record system provenance and do not grant approval.
 

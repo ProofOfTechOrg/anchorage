@@ -1116,21 +1116,74 @@ describe('bounded notification dispatch tick', () => {
     );
   });
 
-  it('returns the zero-limit no-op before reading dependency references', async () => {
+  it('captures the delivery capability before the zero-limit no-op, leaving the other dependencies unread', async () => {
+    const storage = notificationStorage();
+    let storageReads = 0;
     const options = {
       limit: 0,
       get storage() {
-        throw new Error('dependency accessed');
+        storageReads += 1;
+        return storage;
+      },
+      get topology() {
+        throw new Error('topology accessed');
+      },
+      get resolveContext() {
+        throw new Error('context accessed');
+      },
+      get now() {
+        throw new Error('clock accessed');
       },
       get executionFence() {
         throw new Error('fence accessed');
       },
     } as unknown as NotificationDispatchTickOptions;
-    expect(await createNotificationDispatchTickImpl(options)()).toEqual({
-      due: 0,
-      delivered: 0,
-      failed: 0,
+    const list = vi.spyOn(storage, 'listDueNotifications');
+
+    const tick = createNotificationDispatchTickImpl(options);
+    expect(storageReads).toBe(1);
+
+    expect(await tick()).toEqual({ due: 0, delivered: 0, failed: 0 });
+    expect(storageReads).toBe(1);
+    expect(list).not.toHaveBeenCalled();
+  });
+
+  it('refuses a zero-limit tick on storage without conditional delivery', () => {
+    const storage = new InMemoryNotificationsStorage();
+    const read = vi.spyOn(storage, 'listDueNotifications');
+    const build = () =>
+      createNotificationDispatchTick({
+        storage: storage as unknown as NotificationDeliveryStorage,
+        topology: { send: vi.fn() } as unknown as ThreadTopology,
+        resolveContext: actorContext,
+        limit: 0,
+      });
+
+    expect(build).toThrow(TypeError);
+    expect(build).toThrow(
+      'notification dispatch requires conditional delivery storage',
+    );
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it('resolves the zero-limit no-op with the captured capability unused', async () => {
+    const storage = notificationStorage();
+    const list = vi.spyOn(storage, 'listDueNotifications');
+    const get = vi.spyOn(storage, 'getNotification');
+    const update = vi.spyOn(storage, 'updateNotificationDeliveryIfUnchanged');
+    const send = vi.fn();
+    const tick = createNotificationDispatchTick({
+      storage,
+      topology: { send } as unknown as ThreadTopology,
+      resolveContext: actorContext,
+      limit: 0,
     });
+
+    expect(await tick()).toEqual({ due: 0, delivered: 0, failed: 0 });
+    expect(list).not.toHaveBeenCalled();
+    expect(get).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
   });
 
   it('refuses ordinary Core storage before reading or sending', () => {

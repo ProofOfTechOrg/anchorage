@@ -665,11 +665,38 @@ async function validateFleetChannelTopology<Env extends FlowsafeWorkerEnv>(
 
 export type MaintenanceDuty = 'deadline' | 'sweep' | 'purge' | 'tick';
 
+/**
+ * The cursor seam a duty resumes from and advances. Each field is optional
+ * because the deadline sweep and the retention purge own one pair each, and a
+ * caller driving one duty has nothing to say about the other's cursor. The
+ * purge takes `MaintenancePurgeDutyContext` instead, which requires its half.
+ */
 export interface MaintenanceDutyContext {
   deadlineCursor?: RunDeadlineCursor;
   advanceDeadlineCursor?(cursor: RunDeadlineCursor): Promise<void>;
   retentionCursor?: RunRetentionCursor;
   advanceRetentionCursor?(cursor: RunRetentionCursor): Promise<void>;
+}
+
+/**
+ * The retention purge's own context. `advanceRetentionCursor` is required here
+ * because the layer it feeds requires it: `purgeExpiredWorkflowRuns` declares
+ * `advanceCursor` non-optional (do-runner/d1-storage.ts), and a purge with
+ * nowhere to record its progress rescans the same terminal rows on every
+ * alarm. Declaring it optional on the shared context and enforcing it at run
+ * time turned a host's wiring mistake into a purge that reports failure.
+ */
+export interface MaintenancePurgeDutyContext extends MaintenanceDutyContext {
+  advanceRetentionCursor(cursor: RunRetentionCursor): Promise<void>;
+}
+
+const RETENTION_CURSOR_SEAM_REASON =
+  'retention purge requires advanceRetentionCursor';
+
+function hasRetentionCursorSeam(
+  context: MaintenanceDutyContext | undefined,
+): context is MaintenancePurgeDutyContext {
+  return typeof context?.advanceRetentionCursor === 'function';
 }
 
 /** The Worker handler plus the maintenance duty seam consumed by its DO. */
@@ -679,8 +706,14 @@ export interface FlowsafeWorker<Env extends FlowsafeWorkerEnv> {
     env: Env,
     ctx: FlowsafeWorkerContext,
   ): Promise<Response>;
+  /** The purge duty requires the retention cursor seam; the others do not. */
   runMaintenanceDuty(
-    duty: MaintenanceDuty,
+    duty: 'purge',
+    env: Env,
+    context: MaintenancePurgeDutyContext,
+  ): Promise<MaintenanceOutcome>;
+  runMaintenanceDuty(
+    duty: Exclude<MaintenanceDuty, 'purge'>,
     env: Env,
     context?: MaintenanceDutyContext,
   ): Promise<MaintenanceOutcome>;
@@ -1145,7 +1178,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
   async function runPurgeMaintenance(
     env: Env,
     trigger: string,
-    context?: MaintenanceDutyContext,
+    context: MaintenancePurgeDutyContext,
   ): Promise<MaintenanceOutcome> {
     const failures: string[] = [];
     const recordFailure = (surface: string, error: unknown): void => {
@@ -1162,10 +1195,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
     };
     let purged: number | undefined;
     try {
-      const advanceCursor = context?.advanceRetentionCursor;
-      if (typeof advanceCursor !== 'function') {
-        throw new Error('retention purge requires advanceRetentionCursor');
-      }
+      const advanceCursor = context.advanceRetentionCursor;
       const db = env.DB;
       const prepare = db.prepare;
       const batch = db.batch;
@@ -1178,7 +1208,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         prepare: prepare.bind(db),
         batch: batch.bind(db),
       };
-      const storedCursor = parseRunRetentionCursor(context?.retentionCursor);
+      const storedCursor = parseRunRetentionCursor(context.retentionCursor);
       const cursor =
         storedCursor?.tablePrefix ===
           (storageTablePrefix?.toLowerCase() ?? '') &&
@@ -1650,7 +1680,11 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
       }
     },
 
-    async runMaintenanceDuty(duty, env, context) {
+    async runMaintenanceDuty(
+      duty: MaintenanceDuty,
+      env: Env,
+      context?: MaintenanceDutyContext,
+    ): Promise<MaintenanceOutcome> {
       try {
         await ensureDeploymentIdentityBindings(env);
         await validateFleetChannelTopology(env);
@@ -1675,6 +1709,24 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
           });
         }
         if (duty === 'purge') {
+          if (!hasRetentionCursorSeam(context)) {
+            // The same refusal the tick duty makes below for an unwired
+            // builder: the cursor seam is part of the purge's wiring, not one
+            // of its surfaces, so a host that omits it gets the misconfig
+            // named rather than its remaining surfaces purged and the run
+            // retention reported as failed. MaintenancePurgeDutyContext
+            // requires the seam; this is the check for hosts types do not
+            // reach.
+            console.error(
+              JSON.stringify({
+                type: 'config-error',
+                var: 'maintenance.purge.advanceRetentionCursor',
+                trigger: duty,
+                reason: RETENTION_CURSOR_SEAM_REASON,
+              }),
+            );
+            return { ok: false, error: RETENTION_CURSOR_SEAM_REASON };
+          }
           return await runPurgeMaintenance(env, duty, context);
         }
         return await runScheduleTickDuty(env, duty);
@@ -2024,24 +2076,27 @@ export function createFlowsafeMaintenanceDurableObject<
         hasDueDuty(health, intervals, now) ? now : followUpAt,
       );
 
-      let context: MaintenanceDutyContext | undefined;
+      // Each duty carries the cursor pair it owns, so the call sits inside the
+      // branch that builds it: the purge seam is required by its context type,
+      // which a single call over the whole duty union cannot satisfy.
+      let outcome: MaintenanceOutcome;
       if (duty === 'deadline') {
         const deadlineCursor = await this.#state.storage.get<RunDeadlineCursor>(
           MAINTENANCE_DEADLINE_CURSOR_KEY,
         );
-        context = {
+        outcome = await worker.runMaintenanceDuty(duty, this.#env, {
           ...(deadlineCursor ? { deadlineCursor } : {}),
           advanceDeadlineCursor: (cursor) =>
             this.#state.storage.transaction(async (transaction) => {
               await transaction.put(MAINTENANCE_DEADLINE_CURSOR_KEY, cursor);
             }),
-        };
+        });
       } else if (duty === 'purge') {
         const retentionCursor =
           await this.#state.storage.get<RunRetentionCursor>(
             MAINTENANCE_RUN_RETENTION_CURSOR_KEY,
           );
-        context = {
+        outcome = await worker.runMaintenanceDuty(duty, this.#env, {
           ...(retentionCursor === undefined ? {} : { retentionCursor }),
           advanceRetentionCursor: (cursor) =>
             this.#state.storage.transaction(async (transaction) => {
@@ -2050,9 +2105,10 @@ export function createFlowsafeMaintenanceDurableObject<
                 cursor,
               );
             }),
-        };
+        });
+      } else {
+        outcome = await worker.runMaintenanceDuty(duty, this.#env);
       }
-      const outcome = await worker.runMaintenanceDuty(duty, this.#env, context);
       await this.#recordOutcome(duty, Date.now(), outcome);
     }
   };

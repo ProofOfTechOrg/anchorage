@@ -13,6 +13,7 @@ import {
   deploymentIdentityRequest,
   TEST_DEPLOYMENT_IDENTITY_SECRET,
 } from '../../test-support/deployment-identity.js';
+import { durableKeyValueStorageFixture } from '../../test-support/durable-key-value-storage.js';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
   ApprovalService,
@@ -247,7 +248,7 @@ async function hostR1WorkflowFixture(
     DEPLOYMENT_TENANT: 'acme',
     DEPLOYMENT_IDENTITY_SECRET: TEST_DEPLOYMENT_IDENTITY_SECRET,
   };
-  const journal = recoveryStorage();
+  const journal = durableKeyValueStorageFixture();
   const runner = new TestRunner(journal.state, env);
   const workflows = await storage.getStore('workflows');
   if (!workflows) throw new Error('missing workflow domain');
@@ -327,7 +328,8 @@ class TestRunner extends DurableObjectRunner<TestEnv> {
       withStorage
         ? ({
             ...state,
-            storage: state?.storage ?? recoveryStorage().state.storage,
+            storage:
+              state?.storage ?? durableKeyValueStorageFixture().state.storage,
           } as DurableObjectState)
         : state,
       env,
@@ -471,45 +473,6 @@ function preparedScheduleSource(input: {
   };
 }
 
-function recoveryStorage(events: string[] = []): {
-  state: DurableObjectState;
-  storage: DurableKeyValueStorage;
-  values: Map<string, unknown>;
-  alarms: number[];
-} {
-  const values = new Map<string, unknown>();
-  const alarms: number[] = [];
-  const storage: DurableKeyValueStorage = {
-    async get<T>(key: string): Promise<T | undefined> {
-      events.push(`get:${key}`);
-      return values.get(key) as T | undefined;
-    },
-    async put<T>(key: string, value: T): Promise<void> {
-      events.push(`put:${key}`);
-      values.set(key, value);
-    },
-    async delete(key: string): Promise<boolean> {
-      events.push(`delete:${key}`);
-      return values.delete(key);
-    },
-    async setAlarm(scheduledTime: number | Date): Promise<void> {
-      events.push('setAlarm');
-      alarms.push(
-        scheduledTime instanceof Date ? scheduledTime.getTime() : scheduledTime,
-      );
-    },
-    async deleteAlarm(): Promise<void> {
-      events.push('deleteAlarm');
-    },
-  };
-  return {
-    state: { storage } as unknown as DurableObjectState,
-    storage,
-    values,
-    alarms,
-  };
-}
-
 async function startGated(runner: TestRunner): Promise<RunSummary> {
   const response = await runner.fetch(
     post('/runs', {
@@ -531,7 +494,7 @@ function cDeferred() {
 
 function cWorkflowFixture(owned = false, provider?: RequestContextProvider) {
   const events: string[] = [];
-  const journal = recoveryStorage(events);
+  const journal = durableKeyValueStorageFixture(events);
   const env = makeProductionEnv();
   const binding = env.DB;
   if (!binding) throw new Error('missing managed test database');
@@ -1822,7 +1785,7 @@ describe('DurableObjectRunner.fetch', () => {
 
   it('pre-arms owner recovery before deployment identity I/O', async () => {
     const events: string[] = [];
-    const { state } = recoveryStorage(events);
+    const { state } = durableKeyValueStorageFixture(events);
     const identity = deploymentIdentityDatabase('globex');
     const env = makeProductionEnv();
     env.DB = {
@@ -1846,7 +1809,7 @@ describe('DurableObjectRunner.fetch', () => {
 
   it('clears the prearmed watchdog when no recovery journal exists', async () => {
     const events: string[] = [];
-    const { state } = recoveryStorage(events);
+    const { state } = durableKeyValueStorageFixture(events);
     const runner = new TestRunner(state, makeProductionEnv());
 
     await runner.alarm();
@@ -1857,7 +1820,7 @@ describe('DurableObjectRunner.fetch', () => {
 
   it('arms recovery before reserving and commits the reservation after persistence', async () => {
     const events: string[] = [];
-    const { state } = recoveryStorage(events);
+    const { state } = durableKeyValueStorageFixture(events);
     const reserve = vi.fn(async () => {
       events.push('reserve');
       return true;
@@ -1901,9 +1864,36 @@ describe('DurableObjectRunner.fetch', () => {
     });
   });
 
+  it('journals nothing on a storage-less host and refuses to prepare the claim', async () => {
+    // #given — a run object whose state carries no storage at all
+    const runner = new TestRunner(undefined, makeProductionEnv(), false);
+
+    // #when — a start walks the whole run-owner journal protocol
+    const response = await runner.fetch(
+      post('/runs', {
+        workflowId: 'gated',
+        runId: 'run-storage-less',
+        inputData: { topic: 't' },
+      }),
+    );
+
+    // #then — both halves of the one absence policy: arming journaled nothing
+    // and said nothing, so the start reached the prepared phase, which no wake
+    // could recover from an unwritten journal and which refuses by name. The
+    // message is pinned because a bare 500 is also what a storage without
+    // alarms produces, and this case would pass while the prepared-phase guard
+    // had stopped firing.
+    expect(response.status).toBe(500);
+    expect(await response.json()).toMatchObject({
+      error: expect.stringContaining(
+        'run owner recovery requires durable storage',
+      ),
+    });
+  });
+
   it('returns a persisted start after a lost settlement receipt and clears recovery on retry', async () => {
     const events: string[] = [];
-    const { state, values } = recoveryStorage(events);
+    const { state, values } = durableKeyValueStorageFixture(events);
     const env = makeProductionEnv();
     const committed = new D1ResourceOwnershipStore(
       testDatabase(env.storage) as ResourceOwnershipDatabase,
@@ -1953,7 +1943,7 @@ describe('DurableObjectRunner.fetch', () => {
   });
 
   it('rolls back only the attempt reservation when start has no snapshot', async () => {
-    const { state } = recoveryStorage();
+    const { state } = durableKeyValueStorageFixture();
     const reserve = vi.fn(async () => true);
     const settle = vi.fn(async () => undefined);
     const runtime = {
@@ -1986,7 +1976,7 @@ describe('DurableObjectRunner.fetch', () => {
   });
 
   it('rolls back preparing bookkeeping without querying a failed Runtime reader', async () => {
-    const { state, values, alarms } = recoveryStorage();
+    const { state, values, alarms } = durableKeyValueStorageFixture();
     const reserve = vi.fn(async () => true);
     const settle = vi.fn(async () => undefined);
     const runtime = {
@@ -2035,7 +2025,7 @@ describe('DurableObjectRunner.fetch', () => {
   });
 
   it('does not execute when the owner reservation conflicts', async () => {
-    const { state, values } = recoveryStorage();
+    const { state, values } = durableKeyValueStorageFixture();
     const reserve = vi.fn(async () => false);
     const settle = vi.fn(async () => undefined);
     const env = makeProductionEnv(testStorage(), { reserve, settle });
@@ -2068,7 +2058,7 @@ describe('DurableObjectRunner.fetch', () => {
   });
 
   it('rejects a malformed stored recovery journal before touching ownership', async () => {
-    const { state, values } = recoveryStorage();
+    const { state, values } = durableKeyValueStorageFixture();
     const settle = vi.fn(async () => undefined);
     values.set('flowsafe:run-owner-recovery:v1', {
       version: 2,
@@ -2151,7 +2141,7 @@ describe('DurableObjectRunner.fetch', () => {
   });
 
   it('retains requester kind through eviction and status reconciliation', async () => {
-    const { state } = recoveryStorage();
+    const { state } = durableKeyValueStorageFixture();
     const env = makeProductionEnv();
     const before = new TestRunner(state, env);
     const started = await before.fetch(
@@ -2572,25 +2562,9 @@ describe('DurableObjectRunner.fetch', () => {
         return runtime;
       }
     }
-    const persisted = new Map<string, unknown>();
-    const objectStorage: DurableKeyValueStorage = {
-      async get<T>(key: string): Promise<T | undefined> {
-        return persisted.get(key) as T | undefined;
-      },
-      async put<T>(key: string, value: T): Promise<void> {
-        persisted.set(key, value);
-      },
-      async delete(key: string): Promise<boolean> {
-        return persisted.delete(key);
-      },
-      async setAlarm(): Promise<void> {},
-      async deleteAlarm(): Promise<void> {},
-    };
-    // Minimal Durable Object storage stub for run-owner recovery. Resume
-    // provenance lives in env.storage, not in this object-local storage.
-    const state = {
-      storage: objectStorage,
-    } as unknown as DurableObjectState;
+    // Object-local storage for run-owner recovery. Resume provenance lives in
+    // env.storage, not here.
+    const { state } = durableKeyValueStorageFixture();
     const env = makeProductionEnv();
 
     // #given — instance A re-suspends the run once (falsy resume)
@@ -3509,7 +3483,7 @@ async function countRowDeletes(
 
 describe('DurableObjectRunner suspension deadlines', () => {
   it('arms the record and the alarm at the suspension fence plus the deadline', async () => {
-    const { state, values, alarms } = recoveryStorage();
+    const { state, values, alarms } = durableKeyValueStorageFixture();
     const runner = new TestRunner(state, timedEnv());
 
     const started = await startTimed(runner, 'run-armed');
@@ -3533,7 +3507,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('arms nothing for a suspension without the reserved key', async () => {
-    const { state, values, alarms } = recoveryStorage();
+    const { state, values, alarms } = durableKeyValueStorageFixture();
     const runner = new TestRunner(state, makeProductionEnv());
 
     await startGated(runner);
@@ -3544,7 +3518,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
 
   it('keeps the alarm armed on a wake with no recovery journal but a pending deadline', async () => {
     const events: string[] = [];
-    const { state, values, alarms } = recoveryStorage(events);
+    const { state, values, alarms } = durableKeyValueStorageFixture(events);
     const runner = new TestRunner(state, timedEnv());
     const started = await startTimed(runner, 'run-pending');
     const dueAt = (started.suspendedAt?.gate as number) + TIMED_DEADLINE_MS;
@@ -3562,7 +3536,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('arms the recovery watchdog when it falls due before a far-future deadline', async () => {
-    const { state, values, alarms } = recoveryStorage();
+    const { state, values, alarms } = durableKeyValueStorageFixture();
     const farFuture = Date.now() + 10 * 24 * 60 * 60 * 1_000;
     seedDeadlines(values, 'run-far-future', [
       { ...armedEntry('gate', Date.now()), deadlineAt: farFuture },
@@ -3579,7 +3553,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('re-arms to the pending deadline when run-owner recovery clears', async () => {
-    const { state, values, alarms } = recoveryStorage();
+    const { state, values, alarms } = durableKeyValueStorageFixture();
     const dueAt = Date.now() + TIMED_DEADLINE_MS;
     seedDeadlines(values, 'run-cleared', [
       { ...armedEntry('gate', 1), deadlineAt: dueAt },
@@ -3615,7 +3589,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
 
   it('resumes the suspended step with the timeout envelope under a system principal', async () => {
     const sent: string[] = [];
-    const { storage, values } = recoveryStorage();
+    const { storage, values } = durableKeyValueStorageFixture();
     const state = {
       id: { name: 'timed:run-timeout' },
       storage,
@@ -3645,7 +3619,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('drops a stale entry without resuming when the suspension fence moved', async () => {
-    const { state, values } = recoveryStorage();
+    const { state, values } = durableKeyValueStorageFixture();
     const resume = vi.fn();
     const movedAt = Date.now() - TIMED_DEADLINE_MS + 60_000;
     const runtime = {
@@ -3690,7 +3664,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('records a backoff attempt and never rethrows when the timeout resume fails', async () => {
-    const { state, values, alarms } = recoveryStorage();
+    const { state, values, alarms } = durableKeyValueStorageFixture();
     const runtime = {
       ...statusStub(async () => suspendedFence('run-retry', 1)),
       resume: vi.fn(async () => {
@@ -3716,7 +3690,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
 
   it('abandons a spent entry as a tombstone for exactly its own suspension', async () => {
     const events: string[] = [];
-    const { state, values, alarms } = recoveryStorage(events);
+    const { state, values, alarms } = durableKeyValueStorageFixture(events);
     let resumeFails = true;
     const resume = vi.fn(async () => {
       if (resumeFails) throw new Error('injected resume failure');
@@ -3807,7 +3781,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
     // written for `run-other`: a stale record left by a namespace reused under
     // another id, or one hand-written into storage.
     const events: string[] = [];
-    const { storage, values } = recoveryStorage(events);
+    const { storage, values } = durableKeyValueStorageFixture(events);
     const state = {
       id: { name: 'timed:run-mine' },
       storage,
@@ -3898,7 +3872,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
     // stamped for `run-other` whose SPENT entry matches every key the merge
     // carries a ledger on: the same step, the same fence, the same deadline.
     const events: string[] = [];
-    const { storage, values, alarms } = recoveryStorage(events);
+    const { storage, values, alarms } = durableKeyValueStorageFixture(events);
     const state = {
       id: { name: 'timed:run-mine' },
       storage,
@@ -3941,7 +3915,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
     // stamped for `run-other` whose entry is far from due, and this run has
     // already finished: the reconcile has nothing to write in its place.
     const events: string[] = [];
-    const { storage, values } = recoveryStorage(events);
+    const { storage, values } = durableKeyValueStorageFixture(events);
     const state = {
       id: { name: 'timed:run-mine' },
       storage,
@@ -3974,7 +3948,11 @@ describe('DurableObjectRunner suspension deadlines', () => {
 
   it('keeps the record and its wake when a nothing-due wake reads Mastra in-memory fallback state', async () => {
     const events: string[] = [];
-    const { storage: doStorage, values, alarms } = recoveryStorage(events);
+    const {
+      storage: doStorage,
+      values,
+      alarms,
+    } = durableKeyValueStorageFixture(events);
     const state = {
       id: { name: 'timed:run-blinded-idle' },
       storage: doStorage,
@@ -4029,7 +4007,11 @@ describe('DurableObjectRunner suspension deadlines', () => {
 
   it('charges nothing and runs nothing when a due wake reads Mastra in-memory fallback state', async () => {
     const events: string[] = [];
-    const { storage: doStorage, values, alarms } = recoveryStorage(events);
+    const {
+      storage: doStorage,
+      values,
+      alarms,
+    } = durableKeyValueStorageFixture(events);
     const state = {
       id: { name: 'timed:run-blinded-due' },
       storage: doStorage,
@@ -4089,7 +4071,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
     // not already a RunStateUnreadableError: a storage fault, as a driver
     // surfaces one.
     const events: string[] = [];
-    const { storage, values } = recoveryStorage(events);
+    const { storage, values } = durableKeyValueStorageFixture(events);
     const state = {
       id: { name: 'timed:run-read-threw' },
       storage,
@@ -4140,7 +4122,11 @@ describe('DurableObjectRunner suspension deadlines', () => {
 
   it('deletes no run row and settles nothing when recovery reads in-memory fallback state', async () => {
     const events: string[] = [];
-    const { storage: doStorage, values, alarms } = recoveryStorage(events);
+    const {
+      storage: doStorage,
+      values,
+      alarms,
+    } = durableKeyValueStorageFixture(events);
     const state = {
       id: { name: 'timed:run-blinded-recovery' },
       storage: doStorage,
@@ -4225,7 +4211,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('answers dispatch-status with a retryable 503 while the run state cannot be read', async () => {
-    const { state, values } = recoveryStorage();
+    const { state, values } = durableKeyValueStorageFixture();
     const env = makeProductionEnv();
     env.runtime = {
       ...statusStub(async () => null),
@@ -4272,7 +4258,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
     // journal, with the read that would settle it refusing to answer from
     // state it could not reach. The recovery runs BEFORE the existing-run
     // check, so nothing downstream of it sees a fabricated read.
-    const { state, values } = recoveryStorage();
+    const { state, values } = durableKeyValueStorageFixture();
     const env = makeProductionEnv();
     const start = vi.fn();
     env.runtime = {
@@ -4320,7 +4306,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('stamps the unreadable clock once and clears it on the first read that succeeds', async () => {
-    const { state, values } = recoveryStorage();
+    const { state, values } = durableKeyValueStorageFixture();
     const armedAt = Date.now() - TIMED_DEADLINE_MS - 1;
     let readable = false;
     const movedAt = Date.now();
@@ -4371,7 +4357,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
 
   it('abandons an entry whose run state has been unreadable for a day', async () => {
     const events: string[] = [];
-    const { state, values, alarms } = recoveryStorage(events);
+    const { state, values, alarms } = durableKeyValueStorageFixture(events);
     const armedAt = Date.now() - TIMED_DEADLINE_MS - 1;
     const env = makeProductionEnv();
     const resume = vi.fn();
@@ -4438,7 +4424,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
     // backwards between two wakes, or a hand-written record. Left as read, its
     // elapsed time can never pass the limit and the entry keeps an uncharged
     // heartbeat forever.
-    const { state, values } = recoveryStorage();
+    const { state, values } = durableKeyValueStorageFixture();
     const armedAt = Date.now() - TIMED_DEADLINE_MS - 1;
     const env = makeProductionEnv();
     env.runtime = {
@@ -4502,7 +4488,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
 
   it('runs one unreadable-state clock over the whole due batch and leaves entries that are not due alone', async () => {
     const events: string[] = [];
-    const { state, values, alarms } = recoveryStorage(events);
+    const { state, values, alarms } = durableKeyValueStorageFixture(events);
     const now = Date.now();
     const alphaAt = now - TIMED_DEADLINE_MS - 10_000;
     const bravoAt = now - TIMED_DEADLINE_MS - 5_000;
@@ -4584,7 +4570,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('clears the unreadable stamp from a lifecycle boundary while the wake read is still failing', async () => {
-    const { storage, values } = recoveryStorage();
+    const { storage, values } = durableKeyValueStorageFixture();
     const state = {
       id: { name: 'timed:run-boundary' },
       storage,
@@ -4646,7 +4632,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('keeps its cadence when the unreadable stamp itself cannot be written', async () => {
-    const { storage, values, alarms } = recoveryStorage();
+    const { storage, values, alarms } = durableKeyValueStorageFixture();
     const { state } = deadlineWriteFailures(storage, {
       name: 'timed:run-stamp-write-fail',
     });
@@ -4698,7 +4684,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('reaches the tombstone in five charges when readable and unreadable wakes alternate', async () => {
-    const { state, values } = recoveryStorage();
+    const { state, values } = durableKeyValueStorageFixture();
     const armedAt = Date.now() - TIMED_DEADLINE_MS - 1;
     const armed = armedEntry('gate', armedAt);
     let readable = false;
@@ -4749,7 +4735,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
 
   it('spends no abandonment budget on a wake that cannot build its runtime', async () => {
     const events: string[] = [];
-    const { state, values, alarms } = recoveryStorage(events);
+    const { state, values, alarms } = durableKeyValueStorageFixture(events);
     const armedAt = Date.now() - TIMED_DEADLINE_MS - 1;
     const armed = armedEntry('gate', armedAt);
     // A misconfigured binding: build(env) throws on EVERY wake and nothing
@@ -4793,7 +4779,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('keeps an unwritable record and its cadence on a nothing-due wake', async () => {
-    const { storage, values, alarms } = recoveryStorage();
+    const { storage, values, alarms } = durableKeyValueStorageFixture();
     const { state } = deadlineWriteFailures(storage, {
       name: 'timed:run-idle-write-fail',
     });
@@ -4836,7 +4822,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('discards a malformed stored record and converges instead of throwing every wake', async () => {
-    const { state, values } = recoveryStorage();
+    const { state, values } = durableKeyValueStorageFixture();
     values.set(SUSPENSION_DEADLINE_STORAGE_KEY, {
       version: 1,
       workflowId: 'timed/forged',
@@ -4856,7 +4842,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('re-arms at the new fence when the timeout resume suspends again', async () => {
-    const { state, values, alarms } = recoveryStorage();
+    const { state, values, alarms } = durableKeyValueStorageFixture();
     const runner = new TestRunner(state, timedEnv());
     const started = await startTimed(
       runner,
@@ -4882,7 +4868,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
 
   it('clears the record when the run is terminated', async () => {
     const events: string[] = [];
-    const { state, values } = recoveryStorage(events);
+    const { state, values } = durableKeyValueStorageFixture(events);
     const runner = new TestRunner(state, timedEnv());
     await startTimed(runner, 'run-terminated');
     expect(storedDeadlines(values)?.entries).toHaveLength(1);
@@ -4897,7 +4883,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('clears the record on a terminal deadline route that transitions nothing', async () => {
-    const { state, values } = recoveryStorage();
+    const { state, values } = durableKeyValueStorageFixture();
     const env = makeProductionEnv();
     // A deadline request whose compare-and-swap no longer matches: the route
     // returns the current terminal summary without finalizing, and it is the
@@ -4933,7 +4919,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('charges nothing and keeps the watchdog when a due wake cannot read authoritative state', async () => {
-    const { state, values, alarms } = recoveryStorage();
+    const { state, values, alarms } = durableKeyValueStorageFixture();
     const resume = vi.fn();
     const env = makeProductionEnv();
     // A run whose workflow a deploy unregistered, or a D1 fault: the read
@@ -4993,7 +4979,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('does not charge a bookkeeping failure to a resume that succeeded', async () => {
-    const { storage, values, alarms } = recoveryStorage();
+    const { storage, values, alarms } = durableKeyValueStorageFixture();
     const { state, fail } = deadlineWriteFailures(storage, {
       once: true,
       armed: false,
@@ -5069,7 +5055,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
     // built by JSON.stringify outside safeSend's per-socket tolerance, so
     // building it throws after the resume has already run the step.
     const events: string[] = [];
-    const { storage, values } = recoveryStorage(events);
+    const { storage, values } = durableKeyValueStorageFixture(events);
     const sent: string[] = [];
     const state = {
       id: { name: 'timed:run-broadcast-throws' },
@@ -5134,7 +5120,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('retries rather than dropping the entry when the run is momentarily unreadable', async () => {
-    const { state, values, alarms } = recoveryStorage();
+    const { state, values, alarms } = durableKeyValueStorageFixture();
     const resume = vi.fn();
     const env = makeProductionEnv();
     // A read replica that has not caught up with a snapshot this object wrote
@@ -5161,7 +5147,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('drops the entry when only the resumeCount fence moved', async () => {
-    const { state, values } = recoveryStorage();
+    const { state, values } = durableKeyValueStorageFixture();
     const resume = vi.fn();
     const env = makeProductionEnv();
     // Same step, same suspension time, one resume further on: a real signal
@@ -5192,7 +5178,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('resumes one due entry per wake and keeps the other armed', async () => {
-    const { state, values, alarms } = recoveryStorage();
+    const { state, values, alarms } = durableKeyValueStorageFixture();
     const gateSuspendedAt = Date.now() - TIMED_DEADLINE_MS - 2;
     const otherSuspendedAt = gateSuspendedAt + 1;
     const bothSuspended: RunSummary = {
@@ -5246,7 +5232,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('serves the deadline duty in a wake whose recovery journal is poisoned', async () => {
-    const { state, values, alarms } = recoveryStorage();
+    const { state, values, alarms } = durableKeyValueStorageFixture();
     const runner = new TestRunner(state, timedEnv());
     await startTimed(runner, 'run-both-duties');
     elapseDeadlines(values);
@@ -5275,7 +5261,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('runs the expired step body once when a real resume races the wake', async () => {
-    const { state, values } = recoveryStorage();
+    const { state, values } = durableKeyValueStorageFixture();
     const env = makeProductionEnv();
     const counted = countedTimedRuntime(env.storage);
     env.runtime = counted.runtime;
@@ -5302,7 +5288,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('arms, fences and resumes a top-level step id containing a dot', async () => {
-    const { state, values } = recoveryStorage();
+    const { state, values } = durableKeyValueStorageFixture();
     const runner = new TestRunner(state, timedEnv());
 
     const started = await startTimed(runner, 'run-dotted', 'timed-dotted');
@@ -5353,7 +5339,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
 
   it('arms the deadline of a run whose start was interrupted', async () => {
     const events: string[] = [];
-    const { state, values } = recoveryStorage(events);
+    const { state, values } = durableKeyValueStorageFixture(events);
     const env = timedEnv();
     const token = 'attempt-token';
     // The start leg as an interrupted one leaves it: the claim is reserved and
@@ -5396,7 +5382,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('keeps the recovery cadence when a wake cannot verify its deployment', async () => {
-    const { state, values, alarms } = recoveryStorage();
+    const { state, values, alarms } = durableKeyValueStorageFixture();
     const env = timedEnv();
     // A namespace bound to another deployment's database: verification throws on
     // every wake, so the deadline duty never runs and its ledger can never
@@ -5423,7 +5409,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('charges the entry the wake was working on when its own re-arm fails', async () => {
-    const { storage, values } = recoveryStorage();
+    const { storage, values } = durableKeyValueStorageFixture();
     let setAlarmCalls = 0;
     const state = {
       storage: {
@@ -5489,7 +5475,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
 
   it('touches no deadline storage for a run that arms nothing', async () => {
     const events: string[] = [];
-    const { state } = recoveryStorage(events);
+    const { state } = durableKeyValueStorageFixture(events);
     const runner = new TestRunner(state, makeProductionEnv());
     const started = await startGated(runner);
 
@@ -5514,7 +5500,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('reports an unarmable deadline once, not at every boundary', async () => {
-    const { state } = recoveryStorage();
+    const { state } = durableKeyValueStorageFixture();
     const runner = new TestRunner(state, timedEnv());
     const logged: string[] = [];
     const log = vi
@@ -5585,7 +5571,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
 
   it('leaves a retry wake when the first deadline write of a start fails', async () => {
     const events: string[] = [];
-    const { storage, values, alarms } = recoveryStorage(events);
+    const { storage, values, alarms } = durableKeyValueStorageFixture(events);
     const { state } = deadlineWriteFailures(storage, {
       name: 'timed:run-first-arm',
       once: true,
@@ -5629,7 +5615,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
 
   it('leaves a retry wake when a resume boundary is the first arm and it fails', async () => {
     const events: string[] = [];
-    const { storage, values, alarms } = recoveryStorage(events);
+    const { storage, values, alarms } = durableKeyValueStorageFixture(events);
     const { state, stop } = deadlineWriteFailures(storage, {
       name: 'timed-relay:run-relay',
     });
@@ -5679,7 +5665,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
 
   it('keeps a wake when an interrupted start cannot record its deadline', async () => {
     const events: string[] = [];
-    const { storage, values, alarms } = recoveryStorage(events);
+    const { storage, values, alarms } = durableKeyValueStorageFixture(events);
     const { state, stop } = deadlineWriteFailures(storage, {
       name: 'timed:run-recovery-arm',
     });
@@ -5735,7 +5721,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
 
   it('writes nothing on a no-record wake for a run that is not suspended', async () => {
     const events: string[] = [];
-    const { storage, values } = recoveryStorage(events);
+    const { storage, values } = durableKeyValueStorageFixture(events);
     const state = {
       id: { name: 'timed:run-finished' },
       storage,
@@ -5778,7 +5764,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('keeps the recovery cadence when the retry ledger itself cannot be written', async () => {
-    const { storage, values, alarms } = recoveryStorage();
+    const { storage, values, alarms } = durableKeyValueStorageFixture();
     const { state } = deadlineWriteFailures(storage);
     const armedAt = Date.now() - TIMED_DEADLINE_MS - 1;
     const armed = armedEntry('gate', armedAt);
@@ -5817,7 +5803,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('keeps the recovery cadence when an unwritable ledger shares a wake with a poisoned journal', async () => {
-    const { storage, values, alarms } = recoveryStorage();
+    const { storage, values, alarms } = durableKeyValueStorageFixture();
     const { state } = deadlineWriteFailures(storage);
     const armedAt = Date.now() - TIMED_DEADLINE_MS - 1;
     const env = makeProductionEnv();
@@ -5850,7 +5836,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('arms nothing and runs no step body when two suspensions share one key', async () => {
-    const { storage, values } = recoveryStorage();
+    const { storage, values } = durableKeyValueStorageFixture();
     const state = {
       id: { name: 'timed-collision:run-collision' },
       storage,
@@ -5891,7 +5877,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('resumes one foreach iteration per wake and re-arms from the new fence', async () => {
-    const { state, values, alarms } = recoveryStorage();
+    const { state, values, alarms } = durableKeyValueStorageFixture();
     const env = makeProductionEnv();
     const each = foreachRuntime(env.storage, 'timed-foreach');
     env.runtime = each.runtime;
@@ -5934,7 +5920,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('resumes every suspended iteration of a concurrent foreach in one wake', async () => {
-    const { state, values } = recoveryStorage();
+    const { state, values } = durableKeyValueStorageFixture();
     const env = makeProductionEnv();
     const each = foreachRuntime(env.storage, 'timed-foreach-concurrent', {
       concurrency: 3,
@@ -5978,7 +5964,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('clears a concurrent foreach with more items than concurrency batch by batch', async () => {
-    const { state, values } = recoveryStorage();
+    const { state, values } = durableKeyValueStorageFixture();
     const env = makeProductionEnv();
     const each = foreachRuntime(env.storage, 'timed-foreach-batched', {
       concurrency: 2,
@@ -6049,7 +6035,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
     // written from an unvalidated name would discard itself on read-back.
     // The other four shapes were already skipped — regression pins.
     const events: string[] = [];
-    const { storage } = recoveryStorage(events);
+    const { storage } = durableKeyValueStorageFixture(events);
     const state = { id: { name }, storage } as unknown as DurableObjectState;
     const env = makeProductionEnv();
     const reads = statusStub(async () => null);
@@ -6067,7 +6053,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
 
   it('converges to no alarm on a no-record wake without an object name', async () => {
     const events: string[] = [];
-    const { state, values } = recoveryStorage(events);
+    const { state, values } = durableKeyValueStorageFixture(events);
     const env = makeProductionEnv();
     const reads = statusStub(async () => null);
     env.runtime = { ...reads } as unknown as RunnerRuntime;
@@ -6086,7 +6072,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('keeps the record and its wake when a nothing-due wake reads a degraded summary', async () => {
-    const { state, values, alarms } = recoveryStorage();
+    const { state, values, alarms } = durableKeyValueStorageFixture();
     const env = makeProductionEnv();
     // Mastra's in-memory fallback: storage unavailable while the isolate still
     // holds the run — 'suspended' with no suspended paths and no fences.
@@ -6137,7 +6123,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('charges the ledger instead of wiping the record when a due wake reads a degraded summary', async () => {
-    const { state, values } = recoveryStorage();
+    const { state, values } = durableKeyValueStorageFixture();
     const env = makeProductionEnv();
     const reads = statusStub(async () => ({
       runId: 'run-degraded-due',
@@ -6179,7 +6165,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('re-arms to the current suspension when a retry wake holds only a stale record', async () => {
-    const { storage, values, alarms } = recoveryStorage();
+    const { storage, values, alarms } = durableKeyValueStorageFixture();
     const { state, fail } = deadlineWriteFailures(storage, {
       name: 'timed-relay-shortening:run-shortening',
       once: true,
@@ -6230,7 +6216,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('arms a parallel suspension missed by a failed write on the next nothing-due wake', async () => {
-    const { state, values, alarms } = recoveryStorage();
+    const { state, values, alarms } = durableKeyValueStorageFixture();
     const gateSuspendedAt = Date.now();
     const otherSuspendedAt = Date.now() + 1;
     const env = makeProductionEnv();
@@ -6264,7 +6250,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
 
   it('clears a stale record and its alarm when the run moved on with nothing to arm', async () => {
     const events: string[] = [];
-    const { state, values } = recoveryStorage(events);
+    const { state, values } = durableKeyValueStorageFixture(events);
     const env = makeProductionEnv();
     env.runtime = {
       ...statusStub(async () => ({
@@ -6284,7 +6270,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('keeps the backoff of a re-derived entry instead of the past deadline or the floor', async () => {
-    const { state, values, alarms } = recoveryStorage();
+    const { state, values, alarms } = durableKeyValueStorageFixture();
     const suspendedAt = Date.now() - TIMED_DEADLINE_MS - 1;
     const nextAttemptAt = Date.now() + 300_000;
     const entry = {
@@ -6312,7 +6298,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
   });
 
   it('reconciles idempotently on a wake just before the deadline and resumes once after it', async () => {
-    const { state, values, alarms } = recoveryStorage();
+    const { state, values, alarms } = durableKeyValueStorageFixture();
     // Authoritative state whose derived deadline lands 150 ms ahead of the
     // wake — workerd can deliver an alarm marginally early.
     const suspendedAt = Date.now() + 150 - TIMED_DEADLINE_MS;
@@ -6348,7 +6334,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
 
   it('keeps the recovery cadence when a no-record wake cannot read authoritative state', async () => {
     const events: string[] = [];
-    const { storage, alarms } = recoveryStorage(events);
+    const { storage, alarms } = durableKeyValueStorageFixture(events);
     const state = {
       id: { name: 'timed:run-status-throws' },
       storage,
@@ -6386,7 +6372,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
 
   it('keeps a valid record on the recovery cadence when its nothing-due wake cannot read state', async () => {
     const events: string[] = [];
-    const { storage, values, alarms } = recoveryStorage(events);
+    const { storage, values, alarms } = durableKeyValueStorageFixture(events);
     const state = {
       id: { name: 'timed:run-throws-recorded' },
       storage,
@@ -6467,7 +6453,7 @@ describe('DurableObjectRunner and the deployment execution fence', () => {
     // #given — a locked deployment and a start that would otherwise journal a
     // recovery record, arm an alarm, and reserve the run's owner.
     const events: string[] = [];
-    const { state } = recoveryStorage(events);
+    const { state } = durableKeyValueStorageFixture(events);
     const reserve = vi.fn(async () => true);
     const env = makeProductionEnv(testStorage(), {
       reserve,
@@ -6513,7 +6499,7 @@ describe('DurableObjectRunner and the deployment execution fence', () => {
   it('keeps reads open while locked', async () => {
     // #given — a run started before the lock.
     const env = timedEnv();
-    const { state } = recoveryStorage();
+    const { state } = durableKeyValueStorageFixture();
     const runner = new TestRunner(state, env);
     await startTimed(runner, 'fenced-read');
     await env.fence?.seed('open');
@@ -6537,7 +6523,7 @@ describe('DurableObjectRunner and the deployment execution fence', () => {
   it('leaves a due deadline uncharged and unconverged under a locked fence, then fires it after reopen', async () => {
     // #given — a suspended run with a due deadline on a locked deployment.
     const env = timedEnv();
-    const { state, values, alarms } = recoveryStorage();
+    const { state, values, alarms } = durableKeyValueStorageFixture();
     const runner = new TestRunner(state, env);
     await startTimed(runner, 'fenced-deadline');
     elapseDeadlines(values);
@@ -7563,7 +7549,7 @@ describe('FS8 D3 host activation prepared absence and local zero', () => {
       },
       configurable: true,
     });
-    const journal = recoveryStorage();
+    const journal = durableKeyValueStorageFixture();
     const runner = new TestRunner(journal.state, env);
     const makeClaim = async () => {
       const reserved = await reservations.reserve({

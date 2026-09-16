@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, it } from 'vitest';
 
-import type { DurableKeyValueStorage } from '../do-runner/index.js';
+import { durableKeyValueStorageFixture } from '../../test-support/durable-key-value-storage.js';
 import {
   AgentRunStateConflictError,
   AgentRunStateError,
@@ -12,23 +12,9 @@ import {
   writeAgentRunRecord,
 } from './agent-run-state.js';
 
-function memoryStorage(): DurableKeyValueStorage & {
-  values: Map<string, unknown>;
-} {
-  const values = new Map<string, unknown>();
-  return {
-    values,
-    get: async <T>(key: string) => values.get(key) as T | undefined,
-    put: async (key, value) => {
-      values.set(key, structuredClone(value));
-    },
-    delete: async (key) => values.delete(key),
-  };
-}
-
 describe('durable agent thread/run metadata', () => {
   it('binds a thread once and rejects an agent/resource change', async () => {
-    const storage = memoryStorage();
+    const { storage } = durableKeyValueStorageFixture();
     const binding = {
       version: 1 as const,
       agentId: 'writer',
@@ -44,7 +30,7 @@ describe('durable agent thread/run metadata', () => {
   });
 
   it('preserves the original principal until terminal cleanup', async () => {
-    const storage = memoryStorage();
+    const { storage } = durableKeyValueStorageFixture();
     const record = {
       version: 2 as const,
       agentId: 'writer',
@@ -73,7 +59,7 @@ describe('durable agent thread/run metadata', () => {
   });
 
   it('snapshots run metadata before awaiting storage', async () => {
-    const storage = memoryStorage();
+    const { storage } = durableKeyValueStorageFixture();
     const record = {
       version: 2 as const,
       agentId: 'writer',
@@ -102,8 +88,8 @@ describe('durable agent thread/run metadata', () => {
   });
 
   it('fails closed on malformed persisted state and malformed run principals', async () => {
-    const storage = memoryStorage();
-    storage.values.set('flowsafe:agent-thread-binding:v1', {
+    const { storage, values } = durableKeyValueStorageFixture();
+    values.set('flowsafe:agent-thread-binding:v1', {
       version: 2,
       agentId: '../writer',
       resourceId: 'acme_resource',
@@ -142,7 +128,7 @@ describe('agent run metadata migration', () => {
   it('rejects a version-1 record rather than upgrading it to a human', async () => {
     // #given — exactly what the previous release wrote for a schedule.fire run:
     // an ApprovalActor whose fabricated role was 'operator'.
-    const storage = memoryStorage();
+    const { storage } = durableKeyValueStorageFixture();
     await storage.put('flowsafe:agent-run:v1:acme_run-1', {
       version: 1,
       agentId: 'writer',
@@ -159,7 +145,7 @@ describe('agent run metadata migration', () => {
 
   it('rejects a version-2 record whose principal is still an ApprovalActor', async () => {
     // #given — the shape change, not just the version number.
-    const storage = memoryStorage();
+    const { storage } = durableKeyValueStorageFixture();
     await storage.put('flowsafe:agent-run:v1:acme_run-2', {
       version: 2,
       agentId: 'writer',
@@ -175,7 +161,7 @@ describe('agent run metadata migration', () => {
 
   it('rejects an automated principal that carries no purpose', async () => {
     // #given — purpose is the provenance the whole model restores.
-    const storage = memoryStorage();
+    const { storage } = durableKeyValueStorageFixture();
     await storage.put('flowsafe:agent-run:v1:acme_run-3', {
       version: 2,
       agentId: 'writer',

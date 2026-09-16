@@ -107,6 +107,19 @@ it.each(
   ).toBe('number');
 });
 
+it.each(
+  modules,
+)('reports the @mastra/core delivery policy patch applied (%s)', async (_label, core) => {
+  const decision = await core.resolveNotificationDeliveryDecision({
+    config: { sources: {}, default: 'discard' },
+    record: PATCH_PROBE,
+    threadState: 'idle',
+    now: new Date(0),
+  });
+
+  expect(decision.action).toBe('discard');
+});
+
 const CREATED_AT = new Date('2026-01-01T00:00:00.000Z');
 
 function record(

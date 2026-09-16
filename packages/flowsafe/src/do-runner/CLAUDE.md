@@ -10,6 +10,7 @@
 - `do-status-error.ts`, `do-error-response.ts`: Durable Object refusal base class and structured HTTP rendering
 - `durable-object.ts`, `thread-do.ts`, `hub-do.ts`: Durable Object hosts
 - `path-safe-id.ts`, `memory-id.ts`, `execution-principal-header.ts`: run, memory, and execution identity
+- `constants.ts`, `testing.ts`: the published `do-runner/constants` and `do-runner/testing` entries, re-exporting `suspension-deadline.ts`'s deadline values, timeout detection, and fixture factory
 - `runtime.ts`, `pubsub.ts`: resume provenance and observation state
 - `mastra-schema-guard.test.ts`: adopted-domain inventory and retention coverage
 

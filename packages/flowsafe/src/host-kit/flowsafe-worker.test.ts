@@ -35,8 +35,8 @@ import {
   type FlowsafeWorkerConfig,
   type FlowsafeWorkerEnv,
   MAINTENANCE_INSTANCE_NAME,
-  type MaintenanceDutyContext,
   type MaintenanceHealth,
+  type MaintenancePurgeDutyContext,
 } from './flowsafe-worker.js';
 import { approvalStoreFactoryFor } from './host-approval-service.js';
 import { MAINTENANCE_RECEIPT_HEADER } from './maintenance-capability.js';
@@ -173,8 +173,8 @@ function makeWorker(
   });
 }
 
-function retentionContext(): MaintenanceDutyContext {
-  const context: MaintenanceDutyContext = {
+function retentionContext(): MaintenancePurgeDutyContext {
+  const context: MaintenancePurgeDutyContext = {
     advanceRetentionCursor: async (cursor) => {
       context.retentionCursor = structuredClone(cursor);
     },
@@ -1531,11 +1531,25 @@ describe('createFlowsafeWorker maintenance duties', () => {
     expect(lines[0]).not.toHaveProperty('escalated');
   });
 
+  it('requires the retention cursor seam in the purge duty signature', async () => {
+    capturedLogs();
+    const worker = makeWorker();
+    const { env } = makeEnv();
+
+    // @ts-expect-error the purge context requires advanceRetentionCursor
+    const outcome = await worker.runMaintenanceDuty('purge', env, {});
+
+    expect(outcome).toEqual({
+      ok: false,
+      error: 'retention purge requires advanceRetentionCursor',
+    });
+  });
+
   it.each([
     undefined,
     null,
     false,
-  ])('refuses a missing or non-callable retention callback before factories and schema work: %j', async (advanceRetentionCursor) => {
+  ])('refuses a missing or non-callable retention callback before any purge surface: %j', async (advanceRetentionCursor) => {
     const logs = capturedLogs();
     const artifactStore = vi.fn(() => ({ deleteRun: async () => 0 }));
     const extraPurgeDuties = vi.fn(async () => ({ extraDuty: 'ran' }));
@@ -1549,23 +1563,35 @@ describe('createFlowsafeWorker maintenance duties', () => {
         ...env,
         THREAD_RETENTION_DAYS: '30',
       },
-      advanceRetentionCursor === undefined
-        ? undefined
-        : ({ advanceRetentionCursor } as unknown as MaintenanceDutyContext),
+      // MaintenancePurgeDutyContext requires the seam, so this branch belongs
+      // to hosts the types do not reach; the cast is what one looks like.
+      { advanceRetentionCursor } as unknown as MaintenancePurgeDutyContext,
     );
 
+    // #then — a wiring fault, not a purge that failed: the invocation is
+    // refused under its own config-error and no surface runs, so the idle
+    // thread survives and no combined maintenance line lands.
     expect(outcome).toEqual({
       ok: false,
-      error: expect.stringContaining('advanceRetentionCursor'),
+      error: 'retention purge requires advanceRetentionCursor',
     });
+    expect(
+      logs
+        .errors()
+        .filter((line) => line.includes('config-error'))
+        .map((line) => JSON.parse(line) as Record<string, unknown>),
+    ).toEqual([
+      {
+        type: 'config-error',
+        var: 'maintenance.purge.advanceRetentionCursor',
+        trigger: 'purge',
+        reason: 'retention purge requires advanceRetentionCursor',
+      },
+    ]);
     expect(artifactStore).not.toHaveBeenCalled();
-    expect(extraPurgeDuties).toHaveBeenCalledOnce();
-    expect(await threadIds(env)).toEqual([]);
-    expect(maintenanceLines(logs.lines())[0]).toMatchObject({
-      approvalsPurged: 0,
-      threadsPurged: 1,
-      extraDuty: 'ran',
-    });
+    expect(extraPurgeDuties).not.toHaveBeenCalled();
+    expect(await threadIds(env)).toEqual(['acme_idle']);
+    expect(maintenanceLines(logs.lines())).toEqual([]);
     expect(
       await env.DB.prepare(
         "SELECT name FROM sqlite_schema WHERE name = 'flowsafe_resource_owners'",
@@ -1809,14 +1835,18 @@ describe('createFlowsafeWorker maintenance duties', () => {
     );
 
     // #then — the failure is on record and the OTHER duties still folded
-    // into the one combined maintenance line
+    // into the one combined maintenance line. The line must name the cause
+    // this case injects, not only the surface: a fixture-shaped failure
+    // reaches the same surface, and a bare surface check passes while the
+    // isolation under test was never exercised.
     expect(
       logs
         .errors()
         .some(
           (line) =>
             line.includes('maintenance-error') &&
-            line.includes('retention-purge'),
+            line.includes('retention-purge') &&
+            line.includes('snapshot table wedged'),
         ),
     ).toBe(true);
     const lines = maintenanceLines(logs.lines());
@@ -2020,7 +2050,8 @@ describe('createFlowsafeWorker maintenance duties', () => {
         .some(
           (line) =>
             line.includes('maintenance-error') &&
-            line.includes('thread-retention-purge'),
+            line.includes('thread-retention-purge') &&
+            line.includes('threads table wedged'),
         ),
     ).toBe(true);
     const lines = maintenanceLines(logs.lines());
@@ -2154,7 +2185,8 @@ describe('createFlowsafeWorker maintenance duties', () => {
         .some(
           (line) =>
             line.includes('maintenance-error') &&
-            line.includes('extra-purge-duties'),
+            line.includes('extra-purge-duties') &&
+            line.includes('reaper wedged'),
         ),
     ).toBe(true);
     expect(maintenanceLines(logs.lines())).toHaveLength(1);
