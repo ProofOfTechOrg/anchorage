@@ -312,6 +312,9 @@ export function inventoryProof() {
     databaseIds: [MAX_ID, MAX_ID],
     namespaceIds: Array.from({ length: 4 }, () => MAX_ID),
     scriptNames: [MAX_ID, MAX_ID],
+    routeHostnames: Array.from({ length: 2 }, () =>
+      [63, 63, 63, 61].map((length) => 'a'.repeat(length)).join('.'),
+    ),
     bucketNames: [MAX_ID, MAX_ID],
     findings: Array.from({ length: 32 }, () => ({
       kind: MAX_ID,
@@ -336,7 +339,9 @@ export function auditProof() {
   };
 }
 
-export function maximalScenario(): MutableScenario {
+export function maximalScenario(
+  callKind: 'audit-page' | 'force-terminal' = 'force-terminal',
+): MutableScenario {
   const fenceReading = () => ({
     state: 'migration-locked' as const,
     mutationEpoch: MAX_COUNT,
@@ -395,6 +400,15 @@ export function maximalScenario(): MutableScenario {
       itemsSha256: DIGEST,
     },
   };
+  const selectedCall =
+    callKind === 'force-terminal'
+      ? {
+          ...call,
+          action: { kind: 'force-terminal' as const, role: 'a' as const },
+          migration: null,
+          before: { databaseId: MAX_ID, scriptName: MAX_ID },
+        }
+      : call;
   return {
     version: 1,
     phase: 'provision-a',
@@ -408,8 +422,8 @@ export function maximalScenario(): MutableScenario {
     },
     sdkRequests: MAX_COUNT,
     inventoryCalls: { before: MAX_COUNT, after: MAX_COUNT },
-    lastCall: call,
-    mutation: call,
+    lastCall: selectedCall,
+    mutation: selectedCall,
     reconciledOrdinal: 3,
     operations: DIRECT_SCENARIO_OPERATION_SLOTS.map((slot) => ({
       slot,
@@ -562,6 +576,18 @@ export function maximalScenario(): MutableScenario {
           databaseId: MAX_ID,
           scriptName: MAX_ID,
           phase: 'decommissioned' as const,
+        },
+      },
+      terminalForce: {
+        a: {
+          databaseId: MAX_ID,
+          scriptName: MAX_ID,
+          ordinal: 3,
+          attempts: {
+            provider: MAX_COUNT,
+            maintenance: MAX_COUNT,
+            application: MAX_COUNT,
+          },
         },
       },
       force: footprint(),

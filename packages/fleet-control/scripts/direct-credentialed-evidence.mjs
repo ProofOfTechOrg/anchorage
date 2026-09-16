@@ -148,6 +148,19 @@ export function buildDirectEvidence({
       exports: roles(value.proofs.exports, ['a', 'b'], (proof) =>
         pick(proof, ['location', 'size', 'sha256']),
       ),
+      inventories: roles(
+        value.proofs.inventories,
+        ['before', 'after'],
+        (proof) => pick(proof, ['routeHostnames']),
+      ),
+      terminalForce: roles(value.proofs.terminalForce, ['a'], (proof) => ({
+        ...pick(proof, ['databaseId', 'scriptName', 'ordinal']),
+        attempts: pick(proof.attempts, [
+          'provider',
+          'maintenance',
+          'application',
+        ]),
+      })),
     })),
     teardown: nullable(teardown, (value) => ({
       failure: value.failure,
@@ -205,7 +218,16 @@ export function buildDirectEvidence({
         ? null
         : (bootstrap?.active?.versionId ?? null),
     },
-    cost: 'unknown',
+    cost: {
+      basis: 'request-counters',
+      referenceProvider: scenario?.attempts.provider ?? null,
+      referenceMaintenance: scenario?.attempts.maintenance ?? null,
+      referenceApplication: scenario?.attempts.application ?? null,
+      sdkRequests: scenario?.sdkRequests ?? null,
+      referenceInvocations: snapshot.invocationCount,
+      teardownProvider: teardown?.providerRequests ?? null,
+      billed: null,
+    },
   };
 }
 

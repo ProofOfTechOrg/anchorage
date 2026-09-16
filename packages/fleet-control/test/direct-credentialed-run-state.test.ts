@@ -910,6 +910,128 @@ const refuses = (journal: DirectRunJournal, state: MutableScenario) =>
   });
 
 describeLinux('durable scenario state', () => {
+  it.each([
+    'lastCall',
+    'mutation',
+  ] as const)('round-trips the settled terminal force before identity in %s', async (field) => {
+    for (const before of [
+      null,
+      { databaseId: 'database-a', scriptName: 'script-a' },
+    ]) {
+      const { f, journal } = await scenarioJournal();
+      const state = scenarioWith((state) => {
+        state[field] = {
+          ordinal: 3,
+          action: { kind: 'force-terminal', role: 'a' },
+          outcome: 'returned',
+          attempts: { provider: 0, maintenance: 0, application: 0 },
+          migration: null,
+          before,
+        };
+      });
+      await journal.recordScenario(state);
+      const path = join(f.runDirectory, 'journal.json');
+      const serialized = await readFile(path, 'utf8');
+      await closed(journal);
+      const resumed = await opened({ ...f.input, mode: 'resume' });
+      const decoded = present(resumed.snapshot().scenario?.[field]);
+      expect(decoded.before).toEqual(before);
+      expect(Object.isFrozen(decoded)).toBe(true);
+      if (before !== null) expect(Object.isFrozen(decoded.before)).toBe(true);
+      expect(`${JSON.stringify(resumed.snapshot())}\n`).toBe(serialized);
+      await resumed.recordScenario(present(resumed.snapshot().scenario));
+      expect(await readFile(path, 'utf8')).toBe(serialized);
+    }
+  });
+
+  it.each([
+    ['settled force without before', 'force-terminal', 'returned', {}],
+    [
+      'prepared force with before',
+      'force-terminal',
+      'prepared',
+      { before: null },
+    ],
+    ['non-force with before', 'control-read', 'returned', { before: null }],
+    [
+      'extra identity key',
+      'force-terminal',
+      'returned',
+      {
+        before: {
+          databaseId: 'database-a',
+          scriptName: 'script-a',
+          extra: true,
+        },
+      },
+    ],
+    [
+      'non-string databaseId',
+      'force-terminal',
+      'returned',
+      { before: { databaseId: 1, scriptName: 'script-a' } },
+    ],
+    [
+      'non-string scriptName',
+      'force-terminal',
+      'returned',
+      { before: { databaseId: 'database-a', scriptName: null } },
+    ],
+  ] as const)('refuses terminal force call schema violation: %s', async (_title, kind, outcome, witness) => {
+    for (const field of ['lastCall', 'mutation'] as const) {
+      const { journal } = await scenarioJournal();
+      await refuses(
+        journal,
+        scenarioWith((state) => {
+          state[field] = {
+            ordinal: 3,
+            action: kind === 'force-terminal' ? { kind, role: 'a' } : { kind },
+            outcome,
+            attempts:
+              outcome === 'prepared'
+                ? null
+                : { provider: 0, maintenance: 0, application: 0 },
+            migration: null,
+          };
+          Object.assign(present(state[field]), witness);
+        }),
+      );
+    }
+  });
+
+  it.each([
+    ['prepared force', 'force-terminal', 'prepared', {}],
+    ['returned non-force', 'control-read', 'returned', {}],
+    [
+      'lost force response',
+      'force-terminal',
+      'injected-response-loss',
+      { before: null },
+    ],
+    ['refused force', 'force-terminal', 'reference-refused', { before: null }],
+  ] as const)('accepts the before-field rule for %s', async (_title, kind, outcome, witness) => {
+    const { journal } = await scenarioJournal();
+    const call: NonNullable<MutableScenario['lastCall']> = {
+      ordinal: 3,
+      action: kind === 'force-terminal' ? { kind, role: 'a' } : { kind },
+      outcome,
+      attempts:
+        outcome === 'prepared'
+          ? null
+          : { provider: 0, maintenance: 0, application: 0 },
+      migration: null,
+      ...witness,
+    };
+    await journal.recordScenario(
+      scenarioWith((state) => {
+        state.lastCall = call;
+        state.mutation = call;
+      }),
+    );
+    expect(journal.snapshot().scenario?.lastCall).toEqual(call);
+    expect(journal.snapshot().scenario?.mutation).toEqual(call);
+  });
+
   it('projects and round-trips a drain summary with both expected counters', async () => {
     const action = {
       kind: 'tenant-fence' as const,
@@ -923,6 +1045,8 @@ describeLinux('durable scenario state', () => {
     const state = scenarioWith((value) => {
       present(value.lastCall).action = action;
       present(value.mutation).action = action;
+      delete present(value.lastCall).before;
+      delete present(value.mutation).before;
     });
     await journal.recordScenario(state);
     await closed(journal);
@@ -939,6 +1063,7 @@ describeLinux('durable scenario state', () => {
     await refuses(
       journal,
       scenarioWith((state) => {
+        delete present(state.lastCall).before;
         present(state.lastCall).action = {
           kind: 'tenant-fence',
           role: 'a',
@@ -1216,16 +1341,75 @@ describeLinux('durable scenario state', () => {
     );
   });
 
+  it('validates terminal force and freezes its proof after publication', async () => {
+    const { journal } = await scenarioJournal();
+    const state = maximalScenario();
+    state.proofs.terminalForce = { a: null };
+    await journal.recordScenario(state);
+    const proof = {
+      databaseId: 'database-a',
+      scriptName: 'script-a',
+      ordinal: 3,
+      attempts: { provider: 0, maintenance: 0, application: 0 },
+    };
+    state.proofs.terminalForce.a = proof;
+    await journal.recordScenario(state);
+    expect(journal.snapshot().scenario?.proofs.terminalForce.a).toEqual(proof);
+    for (const replacement of [
+      null,
+      { ...proof, databaseId: 'foreign' },
+      { ...proof, attempts: { ...proof.attempts, provider: 1 } },
+    ]) {
+      state.proofs.terminalForce.a = replacement;
+      await refuses(journal, state);
+    }
+    const fresh = await scenarioJournal();
+    for (const malformed of [
+      { ...proof, ordinal: -1 },
+      { ...proof, ordinal: 4 },
+      { ...proof, attempts: { provider: -1, maintenance: 0, application: 0 } },
+    ]) {
+      state.proofs.terminalForce.a = malformed;
+      await refuses(fresh.journal, state);
+    }
+  });
+
+  it('bounds inventory route hostnames by count and DNS length', async () => {
+    const { journal } = await scenarioJournal();
+    const state = maximalScenario();
+    const inventory = present(state.proofs.inventories.before);
+    inventory.routeHostnames = ['a.example.test', 'b.example.test'];
+    await journal.recordScenario(state);
+    inventory.routeHostnames.push('c.example.test');
+    await refuses(journal, state);
+    const fresh = await scenarioJournal();
+    inventory.routeHostnames = [
+      [63, 63, 63, 62].map((length) => 'a'.repeat(length)).join('.'),
+    ];
+    expect(inventory.routeHostnames[0]).toHaveLength(254);
+    await refuses(fresh.journal, state);
+  });
+
   it('publishes a maximal scenario inside the journal byte bound', async () => {
     const { f, journal } = await scenarioJournal();
+    await journal.recordScenario(maximalScenario('audit-page'));
+    const migrationBytes = Buffer.byteLength(
+      await readFile(join(f.runDirectory, 'journal.json'), 'utf8'),
+    );
+    process.stdout.write(
+      `A1_MAXIMAL_SCENARIO_JOURNAL_BYTES audit-page-migration ${migrationBytes}\n`,
+    );
     await journal.recordScenario(maximalScenario());
     const serialized = await readFile(
       join(f.runDirectory, 'journal.json'),
       'utf8',
     );
-    console.log(
-      'A1_MAXIMAL_SCENARIO_JOURNAL_BYTES',
-      Buffer.byteLength(serialized),
+    process.stdout.write(
+      `A1_MAXIMAL_SCENARIO_JOURNAL_BYTES force-terminal ${Buffer.byteLength(serialized)}\n`,
+    );
+    expect(Buffer.byteLength(serialized)).toBeGreaterThan(migrationBytes);
+    process.stdout.write(
+      `A1_MAXIMAL_SCENARIO_JOURNAL_FREE_BYTES ${DIRECT_RUN_MAX_JOURNAL_BYTES - Buffer.byteLength(serialized)}\n`,
     );
     expect(Buffer.byteLength(serialized)).toBeLessThan(
       DIRECT_RUN_MAX_JOURNAL_BYTES - 118 * 1024,
@@ -1414,6 +1598,7 @@ describeLinux('durable scenario state', () => {
         'inventory.databaseIds': inventory.databaseIds,
         'inventory.namespaceIds': inventory.namespaceIds,
         'inventory.scriptNames': inventory.scriptNames,
+        'inventory.routeHostnames': inventory.routeHostnames,
         'inventory.bucketNames': inventory.bucketNames,
         'inventory.findings': inventory.findings,
       };
@@ -1852,13 +2037,11 @@ describeLinux('durable teardown state', () => {
       join(f.runDirectory, 'journal.json'),
       'utf8',
     );
-    console.log(
-      'A1_COMPLETE_TEARDOWN_JOURNAL_BYTES',
-      Buffer.byteLength(serialized),
+    process.stdout.write(
+      `A1_COMPLETE_TEARDOWN_JOURNAL_BYTES ${Buffer.byteLength(serialized)}\n`,
     );
-    console.log(
-      'A1_COMPLETE_TEARDOWN_JOURNAL_FREE_BYTES',
-      DIRECT_RUN_MAX_JOURNAL_BYTES - Buffer.byteLength(serialized),
+    process.stdout.write(
+      `A1_COMPLETE_TEARDOWN_JOURNAL_FREE_BYTES ${DIRECT_RUN_MAX_JOURNAL_BYTES - Buffer.byteLength(serialized)}\n`,
     );
     expect(
       DIRECT_RUN_MAX_JOURNAL_BYTES - Buffer.byteLength(serialized),

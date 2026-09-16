@@ -448,6 +448,10 @@ describe('scenario reconciliation allowance', () => {
     expect(
       changedBy({ kind: 'tenant-probe', role: 'a', operation: 'object-put' }),
     ).toEqual({ slots: [], roles: [] });
+    expect(changedBy({ kind: 'force-terminal', role: 'a' })).toEqual({
+      slots: [],
+      roles: ['a'],
+    });
     expect(changedBy({ kind: 'control-read' })).toEqual({
       slots: [],
       roles: [],
@@ -476,6 +480,7 @@ const DECLARED_PHASES = [
   'delete-objects',
   'decommission-a',
   'decommission-b',
+  'force-terminal-a',
   'force-recovery',
   'force-observe',
   'recover-force-residual',
@@ -600,6 +605,8 @@ describe('scenario invocation budget', () => {
       ['inventory-after', 'audit-after'],
       ['migration-interrupt', 'migration-restart'],
       ['cleanup-recovery', 'provision-recovery'],
+      ['decommission-b', 'force-terminal-a'],
+      ['force-terminal-a', 'force-recovery'],
       ['force-recovery', 'force-observe'],
       ['force-observe', 'recover-force-residual'],
     ] as const)
@@ -642,13 +649,13 @@ describe('scenario invocation budget', () => {
       reserve: 132,
       ceiling: 216,
     });
-    expect(phaseInvocationReserve('migration')).toBe(508);
+    expect(phaseInvocationReserve('migration')).toBe(516);
     const overspent = { ...calls, migration: 200 };
     expect(
-      refusal(() => checkInvocationHeadroom('migration', overspent, 376)),
+      refusal(() => checkInvocationHeadroom('migration', overspent, 384)),
     ).toBe('accepted');
     expect(
-      cause(() => checkInvocationHeadroom('migration', overspent, 375)),
+      cause(() => checkInvocationHeadroom('migration', overspent, 383)),
     ).toEqual({ code: 'budget-exhausted', detail: 'run-reserve' });
   });
 

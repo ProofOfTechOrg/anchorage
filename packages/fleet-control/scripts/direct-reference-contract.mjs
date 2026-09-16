@@ -67,6 +67,10 @@ function actionFromParsed(value) {
     case 'recover-force-residual':
       keys(value, ['kind']);
       break;
+    case 'force-terminal':
+      keys(value, ['kind', 'role']);
+      member(value.role, ['a']);
+      break;
     case 'tenant-probe':
       keys(value, ['kind', 'role', 'operation']);
       member(value.role, ['a', 'b', 'recovery']);

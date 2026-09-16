@@ -52,6 +52,7 @@ export const DIRECT_SCENARIO_ARRAY_MAXIMA = Object.freeze({
     databaseIds: 2,
     namespaceIds: 4,
     scriptNames: 2,
+    routeHostnames: 2,
     bucketNames: 2,
     findings: 32,
   }),
@@ -429,6 +430,18 @@ const scenarioId = (value) => {
     invalid();
   return value;
 };
+const scenarioHostname = (value) => {
+  if (
+    typeof value !== 'string' ||
+    value.length > 253 ||
+    !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/u.test(
+      value,
+    ) ||
+    !/[a-z]/u.test(value)
+  )
+    invalid();
+  return value;
+};
 const scenarioEnum =
   (...values) =>
   (value) => {
@@ -684,6 +697,9 @@ const callShape = {
     step: scenarioId,
     itemsSha256: digest,
   }),
+  before: optional(
+    nullable({ databaseId: scenarioId, scriptName: scenarioId }),
+  ),
 };
 const inventoryShape = {
   operationId: scenarioId,
@@ -700,6 +716,10 @@ const inventoryShape = {
   scriptNames: boundedArray(
     scenarioId,
     DIRECT_SCENARIO_ARRAY_MAXIMA.inventory.scriptNames,
+  ),
+  routeHostnames: boundedArray(
+    scenarioHostname,
+    DIRECT_SCENARIO_ARRAY_MAXIMA.inventory.routeHostnames,
   ),
   bucketNames: boundedArray(
     scenarioId,
@@ -929,6 +949,14 @@ function decodeScenario(value, invocationCount) {
         a: nullable(decommissionShape),
         b: nullable(decommissionShape),
       },
+      terminalForce: {
+        a: nullable({
+          databaseId: scenarioId,
+          scriptName: scenarioId,
+          ordinal: scenarioNumber,
+          attempts: attemptsShape,
+        }),
+      },
       force: nullable(footprintShape),
       residual: nullable(footprintShape),
     },
@@ -947,7 +975,9 @@ function decodeScenario(value, invocationCount) {
     if (
       call.ordinal > invocationCount + (call.outcome === 'prepared' ? 1 : 0) ||
       call.ordinal < 1 ||
-      (call.outcome === 'prepared') !== (call.attempts === null)
+      (call.outcome === 'prepared') !== (call.attempts === null) ||
+      Object.hasOwn(call, 'before') !==
+        (call.action.kind === 'force-terminal' && call.outcome !== 'prepared')
     )
       invalid();
   }
@@ -1030,6 +1060,7 @@ function validateScenarioProofs(state, invocationCount) {
     need(proof.restart?.replayOrdinal && proof.restart.resumedProcess);
   if (past('migration')) need(proof.effects.length === 2);
   if (past('cleanup-recovery')) need(proof.cleanup);
+  if (past('force-terminal-a')) need(proof.terminalForce.a);
   if (past('force-recovery'))
     need(proof.recoveryExportAbsent.beforeOrdinal > 0);
   if (past('force-observe'))
@@ -1058,6 +1089,7 @@ function validateScenarioProofs(state, invocationCount) {
     need(['a', 'b'].every((role) => proof.fence.probes[role]));
   for (const ordinal of [
     state.reconciledOrdinal,
+    proof.terminalForce.a?.ordinal ?? null,
     ...Object.values(proof.objectDeletions),
     ...Object.values(proof.recoveryExportAbsent),
     ...proof.health.map((entry) => entry.ordinal),
@@ -1707,6 +1739,7 @@ function runJournal(directory, directoryHandle, base, lock, initial) {
             'inventories',
             'audits',
             'decommission',
+            'terminalForce',
           ])
             for (const [key, proof] of Object.entries(previous.proofs[group]))
               if (proof !== null)

@@ -552,6 +552,89 @@ describe.sequential('private force through native control state', {
     return { ready, receipt };
   }
 
+  it('force terminal guards the leased identity and clears a terminal row without provider requests', async () => {
+    const fixture = await createDirectReferenceHarness();
+    try {
+      const names = fixture.manifest.names.roles.a;
+      const environment = fixture.manifest.environment;
+      const action = { kind: 'force-terminal', role: 'a' } as const;
+      await fixture.success({
+        kind: 'provision',
+        role: 'a',
+        release: 'initial',
+      });
+      const ready = await fixture.fleetStore.get(names.tenantTag, environment);
+      if (!ready) throw new Error('ready row is missing');
+      const refused = await fixture.call(action);
+      expect(refused.response.status).toBe(409);
+      expect(refused.response.headers.get('X-Direct-Provider-Attempts')).toBe(
+        '0',
+      );
+      await fixture.success({ kind: 'decommission-start', role: 'a' });
+      const active = await fixture.fleetStore.get(names.tenantTag, environment);
+      if (!active?.decommissionIntent)
+        throw new Error('decommission intent is missing');
+      // The store rejects this phase/intent pair on write, so corrupt the row
+      // through SQL to exercise refusal at the native read boundary.
+      await fixture.db
+        .prepare(
+          "UPDATE anchorage_fleet_deployments SET phase = 'decommissioned' WHERE tenant_tag = ? AND environment = ?",
+        )
+        .bind(names.tenantTag, environment)
+        .run();
+      expect((await fixture.call(action)).response.status).toBe(500);
+      await fixture.db
+        .prepare(
+          'UPDATE anchorage_fleet_deployments SET phase = ? WHERE tenant_tag = ? AND environment = ?',
+        )
+        .bind(active.phase, names.tenantTag, environment)
+        .run();
+      await fixture.fleetStore.withDeploymentLease(
+        names.tenantTag,
+        environment,
+        (lease) =>
+          lease.put({
+            ...ready,
+            phase: 'decommissioned',
+            scriptName: fixture.manifest.names.roles.b.scriptName,
+          }),
+      );
+      expect((await fixture.call(action)).response.status).toBe(409);
+      await fixture.fleetStore.withDeploymentLease(
+        names.tenantTag,
+        environment,
+        (lease) => lease.put({ ...ready, phase: 'decommissioned' }),
+      );
+      const requests = fixture.projection.requests.length;
+      const cleared = await fixture.call(action);
+      expect(cleared.response.status).toBe(200);
+      expect(cleared.response.headers.get('X-Direct-Provider-Attempts')).toBe(
+        '0',
+      );
+      expect(cleared.value.result).toEqual({
+        returned: true,
+        before: { databaseId: ready.databaseId, scriptName: ready.scriptName },
+        after: { present: false },
+      });
+      expect(
+        await fixture.fleetStore.get(names.tenantTag, environment),
+      ).toBeUndefined();
+      const repeated = await fixture.call(action);
+      expect(repeated.response.status).toBe(200);
+      expect(repeated.response.headers.get('X-Direct-Provider-Attempts')).toBe(
+        '0',
+      );
+      expect(repeated.value.result).toEqual({
+        returned: true,
+        before: null,
+        after: { present: false },
+      });
+      expect(fixture.projection.requests).toHaveLength(requests);
+    } finally {
+      await fixture.close();
+    }
+  });
+
   it('preserves force witnesses and resumes settled residual cleanup after exhausting the provider budget', async () => {
     const fixture = await createDirectReferenceHarness();
     try {

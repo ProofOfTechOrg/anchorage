@@ -10,6 +10,7 @@ import {
 import type { DirectReferenceAction } from './direct-reference-contract.mjs';
 import { dispatchDirectFence } from './direct-reference-fence.js';
 import {
+  forceDirectTerminal,
   observeDirectForce,
   recoverDirectForce,
   recoverDirectForceResidual,
@@ -210,6 +211,8 @@ async function dispatch(
     return probeDirectTenant(context, manifest, action, signal);
   if (action.kind === 'tenant-fence')
     return dispatchDirectFence(context, manifest, action, signal);
+  if (action.kind === 'force-terminal')
+    return forceDirectTerminal(context, manifest, action.role);
   if ('role' in action)
     return dispatchDirectLifecycle(context, manifest, action, signal);
   if (

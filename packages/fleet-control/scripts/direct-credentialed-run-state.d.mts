@@ -313,6 +313,7 @@ export const DIRECT_SCENARIO_ARRAY_MAXIMA: Readonly<{
     databaseIds: number;
     namespaceIds: number;
     scriptNames: number;
+    routeHostnames: number;
     bucketNames: number;
     findings: number;
   }>;

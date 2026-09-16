@@ -210,6 +210,48 @@ async function readBefore(context: DirectReferenceContext) {
   return { identity, resource };
 }
 
+export async function forceDirectTerminal(
+  context: DirectReferenceContext,
+  manifest: DirectRunManifest,
+  role: 'a',
+) {
+  const names = manifest.names.roles[role];
+  const plane = context.createForcePlane();
+  const underLease = plane.store.withDeploymentLease.bind(plane.store);
+  let before: { databaseId: string; scriptName: string } | null = null;
+  plane.store.withDeploymentLease = (tenantTag, environment, operation) => {
+    if (tenantTag !== names.tenantTag || environment !== manifest.environment)
+      throw new DirectReferenceExecutionError();
+    return underLease(tenantTag, environment, async (lease) => {
+      const record = await plane.store.get(tenantTag, environment);
+      if (record) {
+        if (
+          record.phase !== 'decommissioned' ||
+          (record.decommissionIntent &&
+            record.decommissionIntent.state !== 'complete') ||
+          record.cleanupIntent ||
+          context.roleFor(record) !== role
+        )
+          throw new DirectReferenceExecutionError();
+        before = {
+          databaseId: record.databaseId,
+          scriptName: record.scriptName,
+        };
+      }
+      return operation(lease);
+    });
+  };
+  await forceDecommissionDeployment({
+    backend: plane.backend,
+    store: plane.store,
+    tenantTag: names.tenantTag,
+    environment: manifest.environment,
+  });
+  if (await plane.store.get(names.tenantTag, manifest.environment))
+    throw new DirectReferenceExecutionError();
+  return { returned: true, before, after: { present: false } };
+}
+
 export async function recoverDirectForce(
   context: DirectReferenceContext,
   manifest: DirectRunManifest,

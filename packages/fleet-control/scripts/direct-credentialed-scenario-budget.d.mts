@@ -27,6 +27,7 @@ export const DIRECT_SCENARIO_INVOCATION_BUDGET: Readonly<{
   'delete-objects': DirectScenarioPhaseBudget;
   'decommission-a': DirectScenarioPhaseBudget;
   'decommission-b': DirectScenarioPhaseBudget;
+  'force-terminal-a': DirectScenarioPhaseBudget;
   'force-recovery': DirectScenarioPhaseBudget;
   'force-observe': DirectScenarioPhaseBudget;
   'recover-force-residual': DirectScenarioPhaseBudget;

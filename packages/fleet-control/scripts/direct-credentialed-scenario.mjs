@@ -98,6 +98,7 @@ function initialState(ordinal) {
       exports: { a: null, b: null },
       exportVerifications: [],
       decommission: { a: null, b: null },
+      terminalForce: { a: null },
       force: null,
       residual: null,
     },
@@ -171,6 +172,21 @@ export async function runDirectCredentialedScenario(input) {
       outcome: error ? error.code : 'returned',
       attempts,
     };
+    if (action.kind === 'force-terminal') {
+      const before = error ? null : response?.result?.before;
+      requireFact(
+        before === null ||
+          (typeof before === 'object' &&
+            !Array.isArray(before) &&
+            Object.keys(before).length === 2 &&
+            Object.hasOwn(before, 'databaseId') &&
+            Object.hasOwn(before, 'scriptName') &&
+            typeof before.databaseId === 'string' &&
+            typeof before.scriptName === 'string'),
+        'observation-mismatch',
+      );
+      settled.before = before;
+    }
     state.lastCall = settled;
     if (mutates) state.mutation = settled;
     state.callCount++;
@@ -434,6 +450,18 @@ export async function runDirectCredentialedScenario(input) {
     equal(selected.operationId, result.generation.operationId);
     equal(selected.generation, result.generation.generation);
     const observed = selected.inventory;
+    const routes = NORMAL_ROLES.map((role) =>
+      observed.routes.filter(
+        (route) =>
+          route.backend === 'plain-worker' &&
+          route.surface === 'custom-domain' &&
+          route.scriptName === prepared.names.roles[role].scriptName,
+      ),
+    );
+    const routeHostnames = routes
+      .flatMap((rows) => rows.map((row) => row.hostname))
+      .sort();
+    equal(routeHostnames.length, 2);
     const proof = {
       operationId: selected.operationId,
       generation: selected.generation,
@@ -441,6 +469,7 @@ export async function runDirectCredentialedScenario(input) {
       databaseIds: [...observed.databaseIds].sort(),
       namespaceIds: [...observed.namespaceIds].sort(),
       scriptNames: observed.deployments.map((entry) => entry.scriptName).sort(),
+      routeHostnames,
       bucketNames: observed.r2Buckets.map((entry) => entry.bucketName).sort(),
       findings: observed.findings.map((entry) => ({
         kind: entry.kind,
@@ -459,10 +488,20 @@ export async function runDirectCredentialedScenario(input) {
       proof.scriptNames,
       NORMAL_ROLES.map((role) => prepared.names.roles[role].scriptName).sort(),
     );
-    if (when === 'after')
+    if (when === 'after') {
       requireFact(
         proof.generation > state.proofs.inventories.before.generation,
       );
+      equal(
+        proof.routeHostnames,
+        state.proofs.inventories.before.routeHostnames,
+      );
+      for (const [index, role] of NORMAL_ROLES.entries())
+        equal(
+          routes[index].map((row) => row.hostname),
+          [prepared.names.roles[role].routeHostname],
+        );
+    }
     state.proofs.inventories[when] = proof;
     await persist();
     await advancePhase();
@@ -1066,6 +1105,60 @@ export async function runDirectCredentialedScenario(input) {
         case 'decommission-b':
           await decommission('b');
           break;
+        case 'force-terminal-a': {
+          if (!state.proofs.terminalForce.a) {
+            const prior = state.mutation;
+            const resumed =
+              prior?.action.kind === 'force-terminal' &&
+              prior.action.role === 'a';
+            if (resumed) {
+              // The force settles and persists its attempts before returning.
+              // Repeating it answers from the absent-record branch and replaces
+              // the deleting call's witness with a no-op's zeros.
+              requireFact(
+                prior.outcome === 'returned' && prior.attempts !== null,
+                'proof-unavailable',
+              );
+              equal(prior.attempts, zeroAttempts());
+              equal(prior.before, {
+                databaseId: state.proofs.decommission.a.databaseId,
+                scriptName: state.proofs.decommission.a.scriptName,
+              });
+              await sync();
+              equal(record('a'), { role: 'a', present: false });
+              state.proofs.terminalForce.a = {
+                databaseId: prior.before.databaseId,
+                scriptName: prior.before.scriptName,
+                ordinal: prior.ordinal,
+                attempts: prior.attempts,
+              };
+            } else {
+              const result = await mutate({
+                kind: 'force-terminal',
+                role: 'a',
+              });
+              requireFact(
+                result.returned === true && result.after.present === false,
+              );
+              equal(state.mutation.attempts, zeroAttempts());
+              equal(result.before, {
+                databaseId: state.proofs.decommission.a.databaseId,
+                scriptName: state.proofs.decommission.a.scriptName,
+              });
+              await sync();
+              equal(record('a'), { role: 'a', present: false });
+              state.proofs.terminalForce.a = {
+                databaseId: result.before.databaseId,
+                scriptName: result.before.scriptName,
+                ordinal: state.mutation.ordinal,
+                attempts: state.mutation.attempts,
+              };
+            }
+            await persist();
+          }
+          await advancePhase();
+          break;
+        }
         case 'force-recovery': {
           await sync();
           if (control.forceBefore) {
@@ -1136,6 +1229,7 @@ export async function runDirectCredentialedScenario(input) {
               state.proofs.effects.length === 2 &&
               state.proofs.decommission.a &&
               state.proofs.decommission.b &&
+              state.proofs.terminalForce.a &&
               state.proofs.force &&
               state.proofs.residual,
           );

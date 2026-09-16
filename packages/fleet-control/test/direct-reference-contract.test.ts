@@ -62,6 +62,7 @@ const actions: readonly DirectReferenceAction[] = [
   { kind: 'decommission-export', role: 'a' },
   { kind: 'decommission-continue', role: 'b' },
   { kind: 'decommission-restart-blocked', role: 'recovery', token: [] },
+  { kind: 'force-terminal', role: 'a' },
   { kind: 'force-recovery' },
   { kind: 'force-observe' },
   { kind: 'recover-force-residual' },
@@ -144,6 +145,10 @@ describe('direct reference request contract', () => {
     { kind: 'decommission-continue' },
     { kind: 'decommission-export', role: 'other' },
     { kind: 'decommission-export', role: 'a', view: 'bytes' },
+    { kind: 'force-terminal', role: 'a', extra: true },
+    { kind: 'force-terminal' },
+    { kind: 'force-terminal', role: 'b' },
+    { kind: 'force-terminal', role: 'recovery' },
     { kind: 'force-recovery', role: 'a' },
     { kind: 'tenant-fence', role: 'a', operation: 'drain' },
     {

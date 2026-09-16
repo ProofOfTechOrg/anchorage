@@ -87,6 +87,7 @@ export function changedBy(action) {
     return { slots: [`cleanup-${role}`], roles: [role] };
   if (kind.startsWith('decommission-'))
     return { slots: [`decommission-${role}`], roles: [role] };
+  if (kind === 'force-terminal') return { slots: [], roles: [role] };
   if (kind === 'force-recovery' || kind === 'recover-force-residual')
     return { slots: [], roles: ['recovery'] };
   return { slots: [], roles: [] };

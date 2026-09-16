@@ -102,8 +102,41 @@ describe.sequential('direct evidence', () => {
       'final',
       'fence',
       'exports',
+      'inventories',
+      'terminalForce',
     ]);
+    expect(evidence.cost).toEqual({
+      basis: 'request-counters',
+      referenceProvider: snapshot.scenario.attempts.provider,
+      referenceMaintenance: snapshot.scenario.attempts.maintenance,
+      referenceApplication: snapshot.scenario.attempts.application,
+      sdkRequests: snapshot.scenario.sdkRequests,
+      referenceInvocations: snapshot.invocationCount,
+      teardownProvider: snapshot.teardown.providerRequests,
+      billed: null,
+    });
+    for (const key of [
+      'referenceProvider',
+      'referenceMaintenance',
+      'referenceApplication',
+      'sdkRequests',
+      'referenceInvocations',
+      'teardownProvider',
+    ])
+      expect(object(evidence.cost)[key]).toBeTypeOf('number');
     const scenario = object(evidence.scenario);
+    keys(scenario.inventories, ['before', 'after']);
+    for (const when of ['before', 'after'] as const) {
+      keys(object(scenario.inventories)[when], ['routeHostnames']);
+      expect(object(scenario.inventories)[when]).toEqual({
+        routeHostnames:
+          snapshot.scenario.proofs.inventories[when]?.routeHostnames,
+      });
+    }
+    keys(scenario.terminalForce, ['a']);
+    expect(scenario.terminalForce).toEqual(
+      snapshot.scenario.proofs.terminalForce,
+    );
     expect(scenario.invocationCount).toBe(snapshot.invocationCount);
     keys(scenario.attempts, ['provider', 'maintenance', 'application']);
     keys(scenario.phaseCalls, DIRECT_SCENARIO_PHASES);
@@ -311,6 +344,8 @@ describe.sequential('direct evidence', () => {
     };
     scenario.proofs.restart = null;
     scenario.proofs.exports = { a: null, b: null };
+    scenario.proofs.inventories = { before: null, after: null };
+    scenario.proofs.terminalForce = { a: null };
     const input = {
       snapshot: { ...snapshot, scenario },
       prepared: f.prepared,
@@ -327,6 +362,8 @@ describe.sequential('direct evidence', () => {
       final: scenario.proofs.final,
       fence: scenario.proofs.fence,
       exports: scenario.proofs.exports,
+      inventories: scenario.proofs.inventories,
+      terminalForce: scenario.proofs.terminalForce,
       restart: null,
     });
     delete scenario.failure.detail;
@@ -344,6 +381,16 @@ describe.sequential('direct evidence', () => {
     const empty = buildDirectEvidence({
       ...input,
       snapshot: { ...older, bootstrap: null },
+    });
+    expect(empty.cost).toEqual({
+      basis: 'request-counters',
+      referenceProvider: null,
+      referenceMaintenance: null,
+      referenceApplication: null,
+      sdkRequests: null,
+      referenceInvocations: snapshot.invocationCount,
+      teardownProvider: null,
+      billed: null,
     });
     expect(empty).toMatchObject({
       startedAt: null,

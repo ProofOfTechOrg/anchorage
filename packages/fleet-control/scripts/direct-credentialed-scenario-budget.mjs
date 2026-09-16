@@ -30,6 +30,7 @@ const MEASURED = Object.freeze({
   'delete-objects': 7,
   'decommission-a': 70,
   'decommission-b': 70,
+  'force-terminal-a': 4,
   'force-recovery': 6,
   'force-observe': 3,
   'recover-force-residual': 3,

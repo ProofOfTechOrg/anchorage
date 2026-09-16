@@ -44,6 +44,8 @@ interface ScenarioCall {
     | 'injected-response-loss'
     | 'reference-refused';
   readonly attempts: DirectInvocationAttempts | null;
+  /** Settled force-terminal calls require a nullable before identity; prepared and other calls omit it. */
+  readonly before?: Readonly<{ databaseId: string; scriptName: string }> | null;
   readonly migration: Readonly<{
     itemOrdinal: 0 | 1;
     cursor: number;
@@ -63,6 +65,7 @@ interface ScenarioInventory {
   readonly databaseIds: readonly string[];
   readonly namespaceIds: readonly string[];
   readonly scriptNames: readonly string[];
+  readonly routeHostnames: readonly string[];
   readonly bucketNames: readonly string[];
   readonly findings: readonly Readonly<{
     kind: string;
@@ -191,6 +194,14 @@ export interface DirectScenarioProofs {
       }> | null
     >
   >;
+  readonly terminalForce: Readonly<{
+    a: Readonly<{
+      databaseId: string;
+      scriptName: string;
+      ordinal: number;
+      attempts: DirectInvocationAttempts;
+    }> | null;
+  }>;
   readonly force: DirectScenarioFootprint | null;
   readonly residual: DirectScenarioFootprint | null;
 }

@@ -18,6 +18,7 @@ export class DirectReferenceRequestError extends Error {
 export type DirectInventorySlot = 'inventory-before' | 'inventory-after';
 export type DirectAuditSlot = 'audit-before' | 'audit-after';
 export type DirectReferenceAction =
+  | Readonly<{ kind: 'force-terminal'; role: 'a' }>
   | Readonly<{
       kind: 'tenant-fence';
       role: 'a' | 'b';
