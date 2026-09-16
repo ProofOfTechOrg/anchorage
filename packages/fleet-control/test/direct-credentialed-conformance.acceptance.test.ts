@@ -1,67 +1,63 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
-import type { runDirectConformance } from '../scripts/direct-credentialed-conformance-runtime.mjs';
+import {
+  DIRECT_CONFORMANCE_EXIT_CODES,
+  type runDirectConformance,
+} from '../scripts/direct-credentialed-conformance-runtime.mjs';
 import {
   DIRECT_EVIDENCE_LITERALS,
-  scanDirectEvidence,
+  inspectDirectEvidence,
 } from '../scripts/direct-credentialed-evidence.mjs';
+import { REFERENCE_SECRET_NAMES } from '../scripts/direct-credentialed-reference-vocabulary.mjs';
 import {
   DIRECT_RESIDUAL_SURFACES,
   openDirectRunState,
 } from '../scripts/direct-credentialed-run-state.mjs';
+import {
+  directBridgePreamble,
+  directModuleUrl,
+  spawnDirectChild,
+} from './fixtures/direct-cli-child.js';
 import { directObservationFixture } from './fixtures/direct-observations.js';
 import { createDirectReferenceHarness } from './fixtures/direct-reference-harness.js';
+import {
+  cleanupDirectRunState,
+  fixture as directRunStateFixture,
+} from './fixtures/direct-run-state-builder.js';
 
 const cleanup: Array<() => Promise<void>> = [];
 const apiToken = 'inert-provider-token';
 const invokeSecret = 'inert-invoke';
-const moduleUrl = (name: string) =>
-  new URL(`../scripts/${name}.mjs`, import.meta.url).href;
+const SUITE_TIMEOUT_MS = 900_000;
+// The child is killed a minute before the suite times out, so a hung run is
+// reported with the child's own output rather than as a suite timeout.
+const CHILD_TIMEOUT_MS = SUITE_TIMEOUT_MS - 60_000;
+const REFERENCE_REQUEST_TIMEOUT_MS = 30_000;
+const INVOCATION_TIMEOUT_MS = 600_000;
+const PROVIDER_REQUEST_BUDGET = 1000;
 
 afterEach(async () => {
   for (const close of cleanup.splice(0).reverse()) await close();
+  await cleanupDirectRunState();
 });
 
-async function childProcess(args: string[], env: NodeJS.ProcessEnv = {}) {
-  const child = spawn(process.execPath, args, {
-    env: { PATH: process.env.PATH, ...env },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  let stdout = '';
-  let stderr = '';
-  child.stdout.on('data', (chunk) => {
-    stdout += String(chunk);
-  });
-  child.stderr.on('data', (chunk) => {
-    stderr += String(chunk);
-  });
-  const status = await new Promise<number | null>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL');
-    }, 840_000);
-    child.once('error', (error) => {
-      clearTimeout(timer);
-      reject(error);
-    });
-    child.once('close', (code) => {
-      clearTimeout(timer);
-      resolve(code);
-    });
-  });
-  return { status, stdout, stderr };
-}
+const childProcess = (args: string[], env: NodeJS.ProcessEnv = {}) =>
+  spawnDirectChild(args, { env, timeoutMs: CHILD_TIMEOUT_MS });
 
 async function fixture() {
-  const local = await directObservationFixture(30_000, 'confirmed', {
-    invocationTimeoutMs: 600_000,
-    maxProviderRequests: 1000,
-  });
+  const local = await directObservationFixture(
+    REFERENCE_REQUEST_TIMEOUT_MS,
+    'confirmed',
+    {
+      invocationTimeoutMs: INVOCATION_TIMEOUT_MS,
+      maxProviderRequests: PROVIDER_REQUEST_BUDGET,
+    },
+  );
   cleanup.push(() => local.close());
   const native = await createDirectReferenceHarness({
     manifest: local.prepared.manifest,
@@ -91,13 +87,17 @@ async function fixture() {
     id: 'zone',
     name: local.prepared.config.ownedHostname,
   });
-  for (const receipt of [bootstrap.fleet, bootstrap.quota])
+  const exportedDatabases = [bootstrap.fleet, bootstrap.quota];
+  for (const receipt of exportedDatabases)
     native.world.seedDatabase(receipt.name, { databaseId: receipt.uuid });
-  native.buckets.set(`default:${bootstrap.exports.name}`, {
-    name: bootstrap.exports.name,
-    jurisdiction: bootstrap.exports.jurisdiction,
-    creation_date: bootstrap.exports.creationDate,
-  });
+  native.buckets.set(
+    `${bootstrap.exports.jurisdiction}:${bootstrap.exports.name}`,
+    {
+      name: bootstrap.exports.name,
+      jurisdiction: bootstrap.exports.jurisdiction,
+      creation_date: bootstrap.exports.creationDate,
+    },
+  );
   const bindings = [
     { name: 'FLEET_DB', type: 'd1', database_id: bootstrap.fleet.uuid },
     { name: 'QUOTA_DB', type: 'd1', database_id: bootstrap.quota.uuid },
@@ -107,11 +107,7 @@ async function fixture() {
       type: 'plain_text',
       text: JSON.stringify(native.binding),
     },
-    ...[
-      'CLOUDFLARE_API_TOKEN',
-      'FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET',
-      'DIRECT_DEPLOYMENT_SECRETS',
-    ].map((name) => ({ name, type: 'secret_text' })),
+    ...REFERENCE_SECRET_NAMES.map((name) => ({ name, type: 'secret_text' })),
   ];
   native.world.seedScript(local.prepared.names.referenceWorker, {
     versions: [
@@ -137,7 +133,14 @@ async function fixture() {
     },
   });
   await local.journal.close();
-  return { local, native };
+  return {
+    local,
+    native,
+    exportedDatabaseCount: exportedDatabases.length,
+    seededSecretCount: bindings.filter(
+      (binding) => binding.type === 'secret_text',
+    ).length,
+  };
 }
 
 async function drive(
@@ -148,25 +151,26 @@ async function drive(
   await writeFile(
     script,
     `
-import { runDirectConformance } from ${JSON.stringify(moduleUrl('direct-credentialed-conformance-runtime'))};
-const originalFetch = globalThis.fetch;
-let requests = 0;
-const fetch = async (input, init) => {
-  const request = new Request(input, init);
-  const url = new URL(request.url);
-  if (url.origin !== 'https://api.cloudflare.com' && url.origin !== ${JSON.stringify(`https://${f.local.prepared.names.referenceWorker}.attested-account.workers.dev`)})
-    throw new Error('unexpected child origin');
-  requests += 1;
-  const headers = new Headers(request.headers);
-  headers.set('X-Direct-Fixture-Url', request.url);
-  return originalFetch(${JSON.stringify(f.native.bridgeUrl)}, { method: request.method, headers, body: request.body, signal: request.signal, redirect: 'manual', duplex: 'half' });
+import { runDirectConformance } from ${JSON.stringify(directModuleUrl('direct-credentialed-conformance-runtime'))};
+${directBridgePreamble({
+  bridgeUrl: f.native.bridgeUrl,
+  workerOrigin: `https://${f.local.prepared.names.referenceWorker}.attested-account.workers.dev`,
+  countRequests: true,
+})}const refusals = {
+  origin: await fetch('https://forbidden.test/probe').then(
+    () => null,
+    (error) => error.message,
+  ),
+  closed: await globalThis.fetch('https://api.cloudflare.com/probe').then(
+    () => null,
+    (error) => error.message,
+  ),
 };
-globalThis.fetch = async () => { throw new Error('unexpected child network'); };
 const result = await runDirectConformance({
   mode: ${JSON.stringify(mode)}, configPath: ${JSON.stringify(f.local.configPath)},
   env: { CLOUDFLARE_ACCOUNT_ID: 'account', CLOUDFLARE_API_TOKEN: ${JSON.stringify(apiToken)}, FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET: ${JSON.stringify(invokeSecret)} }, fetch,
 });
-console.log('CLI_RESULT ' + JSON.stringify({ result, requests }));
+console.log('CLI_RESULT ' + JSON.stringify({ result, requests, refusals }));
 process.exitCode = result.exitCode;
 `,
   );
@@ -179,13 +183,18 @@ process.exitCode = result.exitCode;
   const parsed = JSON.parse(lines[0]?.slice('CLI_RESULT '.length) ?? '') as {
     result: Awaited<ReturnType<typeof runDirectConformance>>;
     requests: number;
+    refusals: Record<string, string | null>;
   };
-  expect(child.status).toBe(parsed.result.exitCode);
+  expect(parsed.refusals).toEqual({
+    origin: 'unexpected child origin',
+    closed: 'unexpected child network',
+  });
+  expect(Object.values(DIRECT_CONFORMANCE_EXIT_CODES)).toContain(child.status);
   return { ...parsed, status: child.status };
 }
 
 describe.sequential('direct credentialed CLI native offline acceptance', {
-  timeout: 900_000,
+  timeout: SUITE_TIMEOUT_MS,
 }, () => {
   beforeAll(() => {
     expect(
@@ -196,41 +205,34 @@ describe.sequential('direct credentialed CLI native offline acceptance', {
 
   it('revalidates, restarts, cleans, rereads evidence, and refuses existing runs and concurrent resumes', async () => {
     const f = await fixture();
-    const directory = join(
-      f.local.directory,
-      '.direct-conformance',
-      f.local.prepared.config.resourcePrefix,
-    );
-    const evidencePath = join(directory, 'evidence.json');
-    const evidence = async () =>
-      JSON.parse(await readFile(evidencePath, 'utf8'));
-    const first = await drive(f, 'resume');
-    expect(
-      first.result,
+    const diagnostic = (step: Awaited<ReturnType<typeof drive>>) =>
       JSON.stringify({
         bridgeErrors: f.native.bridgeErrors,
         requests: f.native.projection.requests
           .slice(-12)
           .map(({ method, url }) => ({ method, url })),
-        result: first.result.summary,
-      }),
-    ).toMatchObject({ exitCode: 3 });
+        result: step.result.summary,
+      });
+    const sentinels = {
+      secrets: [apiToken, invokeSecret],
+      literals: DIRECT_EVIDENCE_LITERALS,
+    };
+    const first = await drive(f, 'resume');
+    expect(first.result, diagnostic(first)).toMatchObject({ exitCode: 3 });
+    // The run reports where it published; the layout is the runtime's, not a
+    // second derivation here.
+    const evidencePath = first.result.evidencePath as string;
+    const directory = dirname(evidencePath);
+    const evidence = async () =>
+      JSON.parse(await readFile(evidencePath, 'utf8'));
     const interrupted = await evidence();
     expect(interrupted).toMatchObject({
       status: 'restart-required',
       resumeCount: 1,
     });
     const second = await drive(f, 'resume');
-    expect(
-      second.result,
-      JSON.stringify({
-        bridgeErrors: f.native.bridgeErrors,
-        requests: f.native.projection.requests
-          .slice(-12)
-          .map(({ method, url }) => ({ method, url })),
-        result: second.result.summary,
-      }),
-    ).toMatchObject({ exitCode: 0 });
+    expect(second.result, diagnostic(second)).toMatchObject({ exitCode: 0 });
+    expect(second.result.evidencePath).toBe(evidencePath);
     const cleaned = await evidence();
     expect(cleaned).toMatchObject({
       status: 'cleaned',
@@ -238,26 +240,16 @@ describe.sequential('direct credentialed CLI native offline acceptance', {
       teardownCall: { status: 'cleaned' },
       teardown: { phase: 'complete', failure: null },
     });
-    expect(Object.keys(cleaned.teardown.receipts).sort()).toEqual(
-      [
-        'ingress',
-        'worker',
-        'fleet',
-        'quota',
-        'exports',
-        'exportObjects',
-      ].sort(),
-    );
     for (const key of ['ingress', 'fleet', 'quota', 'exports'])
       expect(cleaned.teardown.receipts[key]).toMatchObject({
         settledByReread: false,
       });
     expect(cleaned.teardown.receipts.worker).toMatchObject({
       settledByReread: false,
-      secretNameCount: 3,
+      secretNameCount: f.seededSecretCount,
     });
     expect(cleaned.teardown.receipts.exportObjects).toMatchObject({
-      count: 2,
+      count: f.exportedDatabaseCount,
       settledByReread: 0,
     });
     const residual = cleaned.teardown.residual;
@@ -290,14 +282,11 @@ describe.sequential('direct credentialed CLI native offline acceptance', {
     expect(await readdir(directory)).not.toEqual(
       expect.arrayContaining([expect.stringMatching(/\.tmp$/u)]),
     );
-    expect(
-      scanDirectEvidence(cleaned, {
-        secrets: [apiToken, invokeSecret],
-        literals: DIRECT_EVIDENCE_LITERALS,
-      }),
-    ).toBeNull();
+    for (const document of [interrupted, cleaned])
+      expect(inspectDirectEvidence(document, sentinels).hit).toBeNull();
     const third = await drive(f, 'resume');
     expect(third).toMatchObject({ status: 0, requests: 0 });
+    expect(third.result.evidencePath).toBe(evidencePath);
     const reread = await evidence();
     expect(reread).toMatchObject({ resumeCount: 3, teardownCall: null });
     const mask = new Set([
@@ -312,12 +301,14 @@ describe.sequential('direct credentialed CLI native offline acceptance', {
       Object.fromEntries(
         Object.entries(value).filter(([key]) => !mask.has(key)),
       );
-    for (const document of [cleaned, reread])
+    for (const document of [cleaned, reread]) {
       expect(document).toMatchObject({
         mode: 'resume',
         exitCode: 0,
         status: 'cleaned',
       });
+      expect(inspectDirectEvidence(document, sentinels).hit).toBeNull();
+    }
     expect(durable(reread)).toEqual(durable(cleaned));
     await unlink(evidencePath);
     const journalPath = join(directory, 'journal.json');
@@ -356,30 +347,49 @@ describe.sequential('direct credentialed CLI native offline acceptance', {
     }
     expect(f.native.bridgeErrors).toEqual([]);
     process.stdout.write(
-      `CLI_ACCEPTANCE ${JSON.stringify({ exits: [first.status, second.status, third.status, fourth.status, fifth.status], statuses: [interrupted.status, cleaned.status, reread.status, null, null], resumeCounts: [interrupted.resumeCount, cleaned.resumeCount, reread.resumeCount], residual, retainedIdentities: cleaned.retainedIdentities, evidenceOnlyEqual: true, teardownCall: reread.teardownCall, refusalEvidenceAbsent: true })}\n`,
+      `CLI_ACCEPTANCE ${JSON.stringify({ exits: [first.status, second.status, third.status, fourth.status, fifth.status], statuses: [interrupted.status, cleaned.status, reread.status], resumeCounts: [interrupted.resumeCount, cleaned.resumeCount, reread.resumeCount], residual, retainedIdentities: cleaned.retainedIdentities, teardownCall: reread.teardownCall })}\n`,
     );
   });
 
   it('runs the real entry for preflight and help and pins both workspace scripts', async () => {
-    const local = await directObservationFixture();
-    cleanup.push(() => local.close());
+    const local = await directRunStateFixture();
     const entry = fileURLToPath(
       new URL(
         '../scripts/direct-credentialed-conformance.mjs',
         import.meta.url,
       ),
     );
-    const preflight = await childProcess([entry, '--preflight'], {
-      FLEET_DIRECT_CONFORMANCE_CONFIG: local.configPath,
-    });
+    const attemptsPath = join(local.directory, 'network-attempts.json');
+    const guard = join(local.directory, 'network-guard.mjs');
+    await writeFile(
+      guard,
+      `import { writeFileSync } from 'node:fs';
+const attempts = [];
+globalThis.fetch = async (input) => {
+  attempts.push(new Request(input).url);
+  throw new Error('unexpected entry network');
+};
+process.on('exit', () => writeFileSync(${JSON.stringify(attemptsPath)}, JSON.stringify(attempts)));
+`,
+    );
+    const attempts = async () =>
+      JSON.parse(await readFile(attemptsPath, 'utf8')) as string[];
+    const preflight = await childProcess(
+      ['--import', guard, entry, '--preflight'],
+      {
+        FLEET_DIRECT_CONFORMANCE_CONFIG: local.configPath,
+      },
+    );
     expect(preflight.status).toBe(0);
     expect(preflight.stderr).toBe('');
     expect(preflight.stdout.trim().split('\n')).toHaveLength(1);
     expect(preflight.stdout).toMatch(/^DIRECT_CONFORMANCE /u);
-    const help = await childProcess([entry, '--help']);
+    expect(await attempts()).toEqual([]);
+    const help = await childProcess(['--import', guard, entry, '--help']);
     expect(help.status).toBe(0);
     expect(help.stderr).toBe('');
     expect(help.stdout).toContain('--resume');
+    expect(await attempts()).toEqual([]);
     const manifest = JSON.parse(
       await readFile(new URL('../package.json', import.meta.url), 'utf8'),
     );

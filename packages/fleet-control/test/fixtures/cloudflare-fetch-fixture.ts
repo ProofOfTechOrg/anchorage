@@ -7,6 +7,7 @@ import {
   ProcessLocalCloudflareApiRateCoordinator,
 } from '../../src/cloudflare-rate-coordinator.js';
 import {
+  deploymentIdentity,
   maintenanceResponder,
   type ProviderWorld,
   type WorkerRoute,
@@ -79,9 +80,17 @@ export function envelope(result: unknown): Response {
   return page(result, { per_page: 20 });
 }
 
+/** The empty page answering a request past the first; undefined for page 1. */
+function pageBeyondFirst(url: URL, info: PageInfo = {}): Response | undefined {
+  const requested = Number(url.searchParams.get('page') ?? '1');
+  return requested === 1
+    ? undefined
+    : pageArray([], { page: requested, ...info });
+}
+
 export function zoneAuthorityResponse(
   url: URL,
-  zoneIds: readonly (string | { id: string; name?: string; type?: string })[],
+  zones: readonly (string | { id: string; name?: string; type?: string })[],
   routes?: readonly WorkerRoute[],
 ): Response | undefined {
   if (
@@ -114,13 +123,10 @@ export function zoneAuthorityResponse(
   }
   if (url.pathname.endsWith('/zones')) {
     expect(url.searchParams.get('account.id')).toBe('account');
-    if (Number(url.searchParams.get('page') ?? '1') !== 1)
-      return pageArray([], {
-        page: Number(url.searchParams.get('page')),
-        per_page: 20,
-      });
+    const beyondFirst = pageBeyondFirst(url, { per_page: 20 });
+    if (beyondFirst) return beyondFirst;
     const types = url.searchParams.getAll('type');
-    const zones = zoneIds.map((zone) => ({
+    const listed = zones.map((zone) => ({
       type: 'full',
       ...(typeof zone === 'string' ? { id: zone } : zone),
       account: { id: 'account' },
@@ -128,23 +134,23 @@ export function zoneAuthorityResponse(
     return envelope(
       types.length > 1
         ? []
-        : zones.filter((zone) => types.length === 0 || zone.type === types[0]),
+        : listed.filter((zone) => types.length === 0 || zone.type === types[0]),
     );
   }
   const parts = url.pathname.split('/').filter(Boolean);
   const zoneIndex = parts.indexOf('zones');
   const zoneId = zoneIndex >= 0 ? parts[zoneIndex + 1] : undefined;
   if (zoneId && url.pathname.endsWith(`/zones/${zoneId}`)) {
-    const zone = zoneIds.find((zone) =>
+    const zone = zones.find((zone) =>
       typeof zone === 'string' ? zone === zoneId : zone.id === zoneId,
     );
-    return zone
-      ? single({
-          type: 'full',
-          ...(typeof zone === 'string' ? { id: zone } : zone),
-          account: { id: 'account' },
-        })
-      : Response.json({ errors: [] }, { status: 404 });
+    // An unmatched zone detail leaves the request to the caller's fallback.
+    if (zone)
+      return single({
+        type: 'full',
+        ...(typeof zone === 'string' ? { id: zone } : zone),
+        account: { id: 'account' },
+      });
   }
   if (routes && zoneId && url.pathname.endsWith('/workers/routes')) {
     return envelope(
@@ -345,7 +351,7 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
       method === 'GET' &&
       target.pathname === '/client/v4/accounts/account/workers/subdomain'
     )
-      return single({ subdomain: 'attested-account' });
+      return single({ subdomain: world.accountSubdomain });
     const parts = target.pathname.split('/').filter(Boolean);
     const routeIndex = parts.indexOf('routes');
     const routeId = routeIndex >= 0 ? parts[routeIndex + 1] : undefined;
@@ -363,16 +369,14 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
     const bodyField = (name: string): unknown =>
       body && typeof body === 'object' ? Reflect.get(body, name) : undefined;
     if (target.pathname.endsWith('/d1/database') && method === 'GET') {
-      if (Number(target.searchParams.get('page') ?? '1') !== 1)
-        return pageArray([], { page: Number(target.searchParams.get('page')) });
+      const beyondFirst = pageBeyondFirst(target);
+      if (beyondFirst) return beyondFirst;
       const requestedName = target.searchParams.get('name');
       return pageArray(
         world.databases
           .filter(
             ({ name }) =>
-              requestedName === null ||
-              name === requestedName ||
-              name.startsWith(requestedName),
+              requestedName === null || name.startsWith(requestedName),
           )
           .map(({ databaseId, name }) => ({
             uuid: databaseId,
@@ -472,21 +476,22 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
       });
     }
     if (target.pathname.endsWith('/workers/scripts') && method === 'GET') {
-      if (Number(target.searchParams.get('page') ?? '1') !== 1)
-        return pageArray([], { page: Number(target.searchParams.get('page')) });
+      const beyondFirst = pageBeyondFirst(target);
+      if (beyondFirst) return beyondFirst;
       return pageArray(
         [...world.scripts.entries()].flatMap(([id, script]) =>
           script.present ? [{ id }] : [],
         ),
       );
     }
-    if (
-      method === 'GET' &&
-      /\/accounts\/[^/]+\/queues$/u.test(target.pathname)
-    ) {
-      // The direct lane's residual scan lists the account's queues; no world
-      // fixture creates one.
-      return pageArray([]);
+    if (target.pathname.endsWith('/queues') && method === 'GET') {
+      // The direct lane's residual scan lists the account's queues.
+      return pageArray(
+        world.queues.map(({ queueId, queueName }) => ({
+          queue_id: queueId,
+          queue_name: queueName,
+        })),
+      );
     }
     if (target.pathname.endsWith('/workers/domains') && method === 'GET') {
       const domains = world.customDomains.map((domain) => ({ ...domain }));
@@ -537,8 +542,8 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
       target.pathname.endsWith('/workers/durable_objects/namespaces') &&
       method === 'GET'
     ) {
-      if (Number(target.searchParams.get('page') ?? '1') !== 1)
-        return pageArray([], { page: Number(target.searchParams.get('page')) });
+      const beyondFirst = pageBeyondFirst(target);
+      if (beyondFirst) return beyondFirst;
       return pageArray(
         world.durableObjectNamespaces.map((namespace) => ({
           id: namespace.id,
@@ -553,7 +558,7 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
     ) {
       return pageArray(
         world.dispatchNamespaces.map((namespace) => ({
-          namespace_id: namespace.name,
+          namespace_id: `${namespace.name}-namespace-id`,
           namespace_name: namespace.name,
           trusted_workers: false,
           script_count: namespace.scripts.length,
@@ -673,8 +678,8 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
       return single({});
     }
     if (target.pathname.endsWith('/secrets') && method === 'GET') {
-      if (Number(target.searchParams.get('page') ?? '1') !== 1)
-        return pageArray([], { page: Number(target.searchParams.get('page')) });
+      const beyondFirst = pageBeyondFirst(target);
+      if (beyondFirst) return beyondFirst;
       return pageArray(
         [...script.secretNames].sort().map((name) => ({ name })),
       );
@@ -717,7 +722,7 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
         deployments: script.deployment
           ? [
               {
-                id: script.deploymentId ?? 'deployment',
+                id: deploymentIdentity(script),
                 created_on: '2026-08-26T00:00:00.000Z',
                 source: 'api',
                 strategy: 'percentage',
@@ -838,7 +843,7 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
       world.applyDeployment(scriptName, deployment);
       await world.applyAfter(operation);
       if (failure) return failureResponse(failure);
-      return single({ id: 'deployment' });
+      return single({ id: deploymentIdentity(script) });
     }
     throw new Error(`unexpected request ${method} ${target.pathname}`);
   };

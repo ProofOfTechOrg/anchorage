@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { APIConnectionTimeoutError } from 'cloudflare';
 import { describe, expect, it, vi } from 'vitest';
 import { CloudflareApiPlainWorkerBackend } from '../src/cloudflare-api-plain-worker-backend.js';
@@ -13,6 +15,7 @@ import type {
   ExternalMutationFence,
   PlainWorkerUploadIntent,
 } from '../src/types.js';
+import { WranglerPlainWorkerProvisioningApi } from '../src/wrangler-plain-worker-provisioning-api.js';
 import {
   type CloudflareFixtureHandler,
   deferred,
@@ -26,6 +29,7 @@ import {
   memoryStore,
   mutationFence,
   rejectedValue,
+  routeApi,
 } from './fixtures/plain-worker-port-probe.js';
 import { providerWorld } from './fixtures/provider-world.js';
 
@@ -804,20 +808,14 @@ describe('CloudflareApiPlainWorkerProvisioningApi', () => {
       absent.api.deleteWorkerScript('absent', ownedFence()),
     ).resolves.toBe('absent');
 
-    const forbidden = subject(async () =>
-      Response.json({ success: false, errors: [] }, { status: 403 }),
-    );
-    await expect(
-      forbidden.api.deleteWorkerScript('forbidden', ownedFence()),
-    ).rejects.toMatchObject({ status: 403 });
-
-    for (const status of [429, 500]) {
+    for (const status of [403, 429, 500]) {
       const refused = subject(async () =>
         Response.json(
           { success: false, errors: [] },
-          // The SDK's `shouldRetry` retries both of these, so each spends the
-          // client's whole retry budget; `retry-after-ms` holds every one of
-          // those retries to a millisecond of real-timer backoff.
+          // The SDK's `shouldRetry` retries 429 and 500, so each of those
+          // spends the client's whole retry budget; `retry-after-ms` holds
+          // every one of those retries to a millisecond of real-timer backoff.
+          // A 403 is not retried, so the header is unread on that pass.
           { status, headers: { 'retry-after-ms': '1' } },
         ),
       );
@@ -970,5 +968,29 @@ describe('CloudflareApiPlainWorkerProvisioningApi', () => {
         message: 'Cloudflare Worker upload failed',
       },
     });
+  });
+});
+
+describe('WranglerPlainWorkerProvisioningApi inventory shape', () => {
+  it('refuses a Wrangler inventory result that is not a list', async () => {
+    const api = new WranglerPlainWorkerProvisioningApi({
+      runner: {
+        maxDurationMs: 5 * 60_000,
+        async run() {
+          return {
+            stdout: JSON.stringify({ success: true, result: 'not-a-list' }),
+            stderr: '',
+          };
+        },
+      },
+      routeApi: routeApi(),
+      // `listDatabases` reads no file, so this path is never created.
+      exportDirectory: join(tmpdir(), 'wrangler-inventory-shape'),
+      exportStore: memoryStore(),
+    });
+
+    await expect(api.listDatabases()).rejects.toThrow(
+      'Wrangler inventory result has an invalid list shape',
+    );
   });
 });

@@ -250,6 +250,14 @@ function multisetEvidence(leaves: readonly (readonly unknown[])[]): string {
 
 const D1_TARGET = { kind: 'd1', databaseId: 'target-db' } as const;
 const R2_TARGET = { kind: 'r2', bucketName: 'target-bucket' } as const;
+const DISPATCH_PAGE_PATH = '/namespaces/fleet/scripts';
+
+function dispatchPageWorld(): AttachmentWorld {
+  return {
+    ordinary: [],
+    namespaces: [{ name: 'fleet', pages: [{ scripts: [] }] }],
+  };
+}
 
 describe('Cloudflare Worker attachment scan', () => {
   describe.each([
@@ -738,15 +746,6 @@ describe('Cloudflare Worker attachment scan', () => {
     expect(ceilingAttempts).toBe(CLOUDFLARE_SDK_MAX_ATTEMPTS);
   });
 
-  const DISPATCH_PAGE_PATH = '/namespaces/fleet/scripts';
-
-  function dispatchPageWorld(): AttachmentWorld {
-    return {
-      ordinary: [],
-      namespaces: [{ name: 'fleet', pages: [{ scripts: [] }] }],
-    };
-  }
-
   it('sends the raw dispatch script page request with manual redirect handling', async () => {
     const handler = worldHandler(dispatchPageWorld());
     const observed: RequestInit['redirect'][] = [];
@@ -790,6 +789,51 @@ describe('Cloudflare Worker attachment scan', () => {
         new URL(url).pathname.endsWith(DISPATCH_PAGE_PATH),
       ),
     ).toHaveLength(1);
+  });
+
+  it('cancels the body of a retried raw dispatch script page', async () => {
+    const cancelled = vi.fn();
+    const handler = worldHandler(dispatchPageWorld());
+    let attempts = 0;
+    const fixture = recordingFetch((request) => {
+      if (!new URL(request.url).pathname.endsWith(DISPATCH_PAGE_PATH)) {
+        return handler(request);
+      }
+      attempts += 1;
+      return attempts === 1
+        ? new Response(new ReadableStream({ cancel: cancelled }), {
+            status: 503,
+            headers: { 'retry-after-ms': '1' },
+          })
+        : handler(request);
+    });
+
+    const result = await drain(client(fixture.fetch), D1_TARGET);
+
+    expect(result.terminal.status).toBe('complete');
+    expect(attempts).toBe(2);
+    expect(cancelled).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancels the body of a refused raw dispatch script page', async () => {
+    const cancelled = vi.fn();
+    const handler = worldHandler(dispatchPageWorld());
+    const fixture = recordingFetch((request) =>
+      new URL(request.url).pathname.endsWith(DISPATCH_PAGE_PATH)
+        ? new Response(new ReadableStream({ cancel: cancelled }), {
+            status: 400,
+          })
+        : handler(request),
+    );
+
+    const failure = await drain(client(fixture.fetch), D1_TARGET).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failure).toMatchObject({
+      message: 'Cloudflare dispatch script listing failed with status 400',
+    });
+    expect(cancelled).toHaveBeenCalledTimes(1);
   });
 
   it('surfaces an SDK-routed redirect as a non-retried, non-transient status', async () => {

@@ -773,7 +773,7 @@ describe('Cloudflare control-plane composition with real constructors and mocked
     const settlement = { settle: vi.fn(async () => {}) };
     const controller = new AbortController();
     const completions: unknown[] = [];
-    const migrationResult = {
+    const completionResult = {
       operationId: OPERATION_ID,
       itemCount: 1,
       completedItemCount: 1,
@@ -830,9 +830,9 @@ describe('Cloudflare control-plane composition with real constructors and mocked
     expect(forwarded.clock?.()).toBe(300);
     expect(forwarded.routeAttestation).toBe(routeAttestation);
     expect(forwarded.signal).toBe(controller.signal);
-    await forwarded.onComplete?.(migrationResult);
-    expect(completions).toEqual([migrationResult]);
-    expect(completions[0]).toBe(migrationResult);
+    await forwarded.onComplete?.(completionResult);
+    expect(completions).toEqual([completionResult]);
+    expect(completions[0]).toBe(completionResult);
     expect(forwarded).not.toHaveProperty('finalizedStateProviderFor');
     expect(forwarded).toMatchObject({
       operationStore: required(constructed.operationStore.mock.calls[0])[0],
@@ -846,8 +846,8 @@ describe('Cloudflare control-plane composition with real constructors and mocked
       throw new Error('mutated callback');
     });
     expect(forwarded.specFor(RECORD)).toBe(SPEC);
-    await forwarded.onComplete?.(migrationResult);
-    expect(completions).toEqual([migrationResult, migrationResult]);
+    await forwarded.onComplete?.(completionResult);
+    expect(completions).toEqual([completionResult, completionResult]);
     resolvedSpec = {
       ...SPEC,
       durableObjectBindings: [

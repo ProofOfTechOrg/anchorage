@@ -574,15 +574,20 @@ describe.sequential('private force through native control state', {
       const active = await fixture.fleetStore.get(names.tenantTag, environment);
       if (!active?.decommissionIntent)
         throw new Error('decommission intent is missing');
-      // The store rejects this phase/intent pair on write, so corrupt the row
-      // through SQL to exercise refusal at the native read boundary.
+      // A 'decommissioned' phase beside an active decommission intent never
+      // survives a write, so SQL forges the pair: the store refuses the forged
+      // terminal row at its own read boundary, before the force guard sees it.
       await fixture.db
         .prepare(
           "UPDATE anchorage_fleet_deployments SET phase = 'decommissioned' WHERE tenant_tag = ? AND environment = ?",
         )
         .bind(names.tenantTag, environment)
         .run();
-      expect((await fixture.call(action)).response.status).toBe(500);
+      const forged = await fixture.call(action);
+      expect(forged.response.status).toBe(500);
+      expect(forged.response.headers.get('X-Direct-Provider-Attempts')).toBe(
+        '0',
+      );
       await fixture.db
         .prepare(
           'UPDATE anchorage_fleet_deployments SET phase = ? WHERE tenant_tag = ? AND environment = ?',

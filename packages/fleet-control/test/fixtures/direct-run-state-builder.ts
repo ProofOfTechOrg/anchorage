@@ -339,6 +339,11 @@ export function auditProof() {
   };
 }
 
+/**
+ * The largest scenario the journal admits. `callKind` selects the kind of the
+ * settled call it carries in `lastCall` and `mutation`; the default is the
+ * larger of the two, so a caller that does not choose still bounds the journal.
+ */
 export function maximalScenario(
   callKind: 'audit-page' | 'force-terminal' = 'force-terminal',
 ): MutableScenario {
@@ -379,36 +384,41 @@ export function maximalScenario(
     DIRECT_SCENARIO_PHASES.map((phase) => [phase, 0]),
   ) as MutableScenario['phaseCalls'];
   phaseCalls['provision-a'] = 3;
-  const call = {
+  const settled = {
     ordinal: 3,
-    action: {
-      kind: 'audit-page' as const,
-      slot: 'audit-after' as const,
-      limit: 32,
-      afterOrdinal: 1,
-    },
     outcome: 'returned' as const,
     attempts: {
       provider: MAX_COUNT,
       maintenance: MAX_COUNT,
       application: MAX_COUNT,
     },
-    migration: {
-      itemOrdinal: 0 as const,
-      cursor: MAX_COUNT,
-      step: MAX_ID,
-      itemsSha256: DIGEST,
-    },
   };
-  const selectedCall =
+  // Each kind carries the largest call of its own shape, built here and
+  // nowhere else: `force-terminal` is the larger of the two, which is why it
+  // is the default the journal-capacity fixtures take.
+  const call =
     callKind === 'force-terminal'
       ? {
-          ...call,
+          ...settled,
           action: { kind: 'force-terminal' as const, role: 'a' as const },
           migration: null,
           before: { databaseId: MAX_ID, scriptName: MAX_ID },
         }
-      : call;
+      : {
+          ...settled,
+          action: {
+            kind: 'audit-page' as const,
+            slot: 'audit-after' as const,
+            limit: 32,
+            afterOrdinal: 1,
+          },
+          migration: {
+            itemOrdinal: 0 as const,
+            cursor: MAX_COUNT,
+            step: MAX_ID,
+            itemsSha256: DIGEST,
+          },
+        };
   return {
     version: 1,
     phase: 'provision-a',
@@ -422,8 +432,8 @@ export function maximalScenario(
     },
     sdkRequests: MAX_COUNT,
     inventoryCalls: { before: MAX_COUNT, after: MAX_COUNT },
-    lastCall: selectedCall,
-    mutation: selectedCall,
+    lastCall: call,
+    mutation: call,
     reconciledOrdinal: 3,
     operations: DIRECT_SCENARIO_OPERATION_SLOTS.map((slot) => ({
       slot,
@@ -441,7 +451,11 @@ export function maximalScenario(
       pendingArtifactVersion: MAX_ID,
       databaseId: MAX_ID,
     })),
-    failure: { code: 'observation-mismatch', ordinal: MAX_COUNT },
+    failure: {
+      code: 'observation-mismatch',
+      ordinal: MAX_COUNT,
+      detail: 'below-scenario-floor' as const,
+    },
     proofs: {
       initial: {
         a: workerVersion('a', '1', 100),
@@ -598,8 +612,9 @@ export function maximalScenario(
 
 export function scenarioWith(
   mutate: (state: MutableScenario) => unknown,
+  callKind: 'audit-page' | 'force-terminal' = 'force-terminal',
 ): MutableScenario {
-  const state = maximalScenario();
+  const state = maximalScenario(callKind);
   mutate(state);
   return state;
 }

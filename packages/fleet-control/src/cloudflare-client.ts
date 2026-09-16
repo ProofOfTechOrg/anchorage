@@ -47,10 +47,9 @@ import {
   workerMigrations,
 } from './cloudflare-ordinary-worker-operations.js';
 import {
-  CredentialedRedirectRefusedError,
   isNotFound,
-  isRedirectStatus,
   readErrorFieldSafely,
+  refuseRedirectStatus,
   sanitizedErrorName,
 } from './cloudflare-provider-errors.js';
 import type { CloudflareApiRateCoordinator } from './cloudflare-rate-coordinator.js';
@@ -702,10 +701,11 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
         });
     }
     const fetchFn = options.fetch ?? fetch;
-    // Every request below carries the account API token, and the signed export
-    // download carries a URL the provider chose. Forcing the policy after the
-    // spread denies a call site the chance to opt into following a redirect to
-    // an address the control plane did not choose.
+    // Forcing the policy after the spread denies a call site the chance to opt
+    // into following a redirect to an address the control plane did not choose.
+    // The SDK-routed callers classify the status themselves, so the rule at
+    // refuseRedirectStatus leaves the refusal to them; the raw dispatch script
+    // listing below reads the raw response and refuses there.
     this.#fetch = (input, init) =>
       fetchFn(input, { ...init, redirect: 'manual' });
     this.#requestTimeoutMs = options.requestTimeoutMs ?? 60_000;
@@ -853,17 +853,10 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
           headers: { authorization: `Bearer ${this.#apiToken}` },
           signal,
         });
-        // This caller reads the raw response, so the refusal belongs here
-        // rather than in #request, whose SDK-routed callers reclassify a
-        // thrown error as a connection failure and retry it.
-        if (isRedirectStatus(response.status)) {
-          const refusal = new CredentialedRedirectRefusedError(
-            'Cloudflare dispatch script listing',
-            response.status,
-          );
-          cancelBodyWithoutAwait(response.body, refusal);
-          throw refusal;
-        }
+        // This caller reads the raw response, so by the rule at
+        // refuseRedirectStatus the refusal belongs here rather than in
+        // #request.
+        refuseRedirectStatus(response, 'Cloudflare dispatch script listing');
         return response;
       },
     };
@@ -3434,6 +3427,8 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
           if (signedUrl.protocol !== 'https:') {
             fail('export returned a non-HTTPS download URL');
           }
+          // The signed download leaves the SDK's credentialed path: it carries
+          // no authorization header, and the provider chose its address.
           const download = await this.#request(signedUrl, {
             headers: { 'Accept-Encoding': 'identity' },
           });

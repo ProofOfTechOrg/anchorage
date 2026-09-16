@@ -5,7 +5,7 @@
     "declarationMap": false,
     "noEmit": true,
     "types": ["node", "vitest/globals"],
-    // Copy-ready package specifiers resolve to source here; consumers keep the
+    // The package specifiers mapped here resolve to source; consumers keep the
     // same imports against the published package.
     "paths": {
       "@proofoftech/fleet-control": ["./src/index.ts"],

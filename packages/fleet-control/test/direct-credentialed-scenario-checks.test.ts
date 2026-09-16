@@ -211,6 +211,13 @@ describe('scenario migration guards', () => {
         checkItemConvergence([item(0, 'pending'), item(1, 'complete')]),
       ),
     ).toBe('observation-mismatch');
+    expect(
+      refusal(() =>
+        checkItemConvergence([item(0, 'complete')] as unknown as Parameters<
+          typeof checkItemConvergence
+        >[0]),
+      ),
+    ).toBe('observation-mismatch');
   });
 
   it('requires the candidate at zero percent beside the original at one hundred in one deployment', () => {
@@ -282,6 +289,14 @@ describe('scenario migration guards', () => {
             ],
             'old',
           ),
+          previous,
+        ),
+      ),
+    ).toBe('observation-mismatch');
+    expect(
+      refusal(() =>
+        checkTrafficDistribution(
+          observation('old', 0, [{ versionId: 'old', percentage: 0 }], 'old'),
           previous,
         ),
       ),
@@ -500,18 +515,6 @@ describe('scenario invocation budget', () => {
     );
 
   it('derives the phase list from the budget table and keeps both columns on the rule', () => {
-    console.log(
-      'A1_FENCE_BUDGET',
-      JSON.stringify(
-        Object.fromEntries(
-          ['fence-drain', 'fence-reopen', 'fence-proofs'].map((phase) => [
-            phase,
-            DIRECT_SCENARIO_INVOCATION_BUDGET[phase as DirectScenarioPhase],
-          ]),
-        ),
-      ),
-    );
-    console.log('A1_SCENARIO_MIN_INVOCATIONS', DIRECT_SCENARIO_MIN_INVOCATIONS);
     expect(Object.keys(DIRECT_SCENARIO_INVOCATION_BUDGET)).toEqual([
       ...DIRECT_SCENARIO_PHASES,
     ]);
@@ -686,19 +689,30 @@ describe('scenario invocation budget', () => {
       ).toBe('invalid-input');
   });
 
-  it('refuses an inherited phase key and a remaining count that is not an integer', () => {
+  it('refuses an inherited phase key and a remaining count that is not a nonnegative safe integer', () => {
     const calls = zeroCalls();
     const total = phaseInvocationReserve('provision-a');
+    // A count of its own for the inherited key, so the budget's own-property
+    // check is what refuses it rather than the count being a prototype member.
     expect(
       refusal(() =>
         checkInvocationHeadroom(
           'constructor' as DirectScenarioPhase,
-          calls,
+          { ...zeroCalls(), constructor: 0 } as unknown as Record<
+            DirectScenarioPhase,
+            number
+          >,
           total,
         ),
       ),
     ).toBe('invalid-input');
-    for (const remaining of [1.5, Number.MAX_SAFE_INTEGER + 1])
+    for (const remaining of [
+      1.5,
+      Number.MAX_SAFE_INTEGER + 1,
+      -1,
+      Number.NaN,
+      '4' as unknown as number,
+    ])
       expect(
         refusal(() => checkInvocationHeadroom('provision-a', calls, remaining)),
       ).toBe('invalid-input');

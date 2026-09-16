@@ -31,6 +31,7 @@ import {
   DIRECT_TENANT_OBJECT_BODY,
   DIRECT_TENANT_OBJECT_KEY,
   directTenantMutationEpoch,
+  directTenantProbeEpoch,
 } from '../../scripts/direct-credentialed-tenant-object.mjs';
 import type { DirectRunBinding } from '../../scripts/direct-reference-context.js';
 import {
@@ -50,10 +51,49 @@ import {
 import { directFixtureManifest } from './direct-credentialed-config.js';
 import {
   type D1State,
+  deploymentIdentity,
   maintenanceResponder,
   providerWorld,
   type SqliteBinding,
 } from './provider-world.js';
+
+/** Tenant routes the harness answers with the maintenance credential. */
+const ADMIN_ROUTES: readonly string[] = Object.freeze([
+  '/admin/execution-fence',
+  '/admin/inventory',
+]);
+
+/** Tenant routes the harness answers with the application probe credential. */
+const APPLICATION_ROUTES: readonly string[] = Object.freeze([
+  '/__direct/health',
+  '/__direct/object',
+  '/__direct/fence-mutate',
+  '/__direct/fence-probe',
+]);
+
+/** The union a supplied `applicationFetch` is handed. */
+const TENANT_ROUTES: readonly string[] = Object.freeze([
+  ...APPLICATION_ROUTES,
+  ...ADMIN_ROUTES,
+]);
+
+/** Projects a do-runner fault onto the status response the tenant returns. */
+function doStatusResponse(error: unknown): Response {
+  if (!(error instanceof DoStatusError)) throw error;
+  return Response.json(
+    {
+      error: error.message,
+      ...(error.reason === undefined ? {} : { reason: error.reason }),
+    },
+    { status: error.status },
+  );
+}
+
+/** Reads the epoch classification a fence comparison refused with. */
+function epochMismatch(error: unknown): MutationEpochMismatchError {
+  if (!(error instanceof MutationEpochMismatchError)) throw error;
+  return error;
+}
 
 function fixtureFenceDatabase(
   state: D1State,
@@ -106,15 +146,7 @@ async function fixtureExecutionFence(
     });
     return Response.json(executionFenceReadingPayload(reading));
   } catch (error) {
-    if (error instanceof DoStatusError)
-      return Response.json(
-        {
-          error: error.message,
-          ...(error.reason === undefined ? {} : { reason: error.reason }),
-        },
-        { status: error.status },
-      );
-    throw error;
+    return doStatusResponse(error);
   }
 }
 
@@ -147,15 +179,7 @@ async function fixtureInventory(
       }),
     );
   } catch (error) {
-    if (error instanceof DoStatusError)
-      return Response.json(
-        {
-          error: error.message,
-          ...(error.reason === undefined ? {} : { reason: error.reason }),
-        },
-        { status: error.status },
-      );
-    throw error;
+    return doStatusResponse(error);
   }
 }
 
@@ -170,14 +194,13 @@ async function fixtureFenceOutcome(
     assertMutationEpoch(reading, epoch);
     return Response.json({ accepted: true });
   } catch (error) {
-    if (error instanceof MutationEpochMismatchError)
-      return Response.json({
-        accepted: false,
-        code: error.reason.code,
-        classification: error.reason.classification,
-        status: error.status,
-      });
-    throw error;
+    const mismatch = epochMismatch(error);
+    return Response.json({
+      accepted: false,
+      code: mismatch.reason.code,
+      classification: mismatch.reason.classification,
+      status: mismatch.status,
+    });
   }
 }
 
@@ -193,15 +216,7 @@ async function fixtureFenceProbe(
       : undefined;
   if (!['current', 'missing', 'stale', 'future'].includes(epoch))
     return Response.json({ error: 'invalid epoch label' }, { status: 400 });
-  const host = directTenantMutationEpoch(release);
-  const supplied =
-    epoch === 'missing'
-      ? undefined
-      : epoch === 'stale'
-        ? Math.max(0, host - 1)
-        : epoch === 'future'
-          ? host + 1
-          : host;
+  const supplied = directTenantProbeEpoch(release, epoch);
   const reading = await new ExecutionFenceStore(
     fixtureFenceDatabase(state),
   ).read();
@@ -209,12 +224,10 @@ async function fixtureFenceProbe(
     assertMutationEpoch(reading, supplied);
     return Response.json({ epoch, classification: 'accepted' });
   } catch (error) {
-    if (error instanceof MutationEpochMismatchError)
-      return Response.json({
-        epoch,
-        classification: error.reason.classification,
-      });
-    throw error;
+    return Response.json({
+      epoch,
+      classification: epochMismatch(error).reason.classification,
+    });
   }
 }
 
@@ -259,6 +272,13 @@ export async function createDirectReferenceHarness(
   const specs = roles.map((role) =>
     directDeploymentSpec(manifest, role, 'initial', secrets[role], binding),
   );
+  /** True for the run's own export bucket, false for a tenant's. */
+  const isExportBucket = (name: string | undefined) =>
+    name === binding.exportBucketName;
+  const exportObjectsPath = `/r2/buckets/${binding.exportBucketName}/objects/`;
+  const exportObjectsPrefix = `/client/v4/accounts/account${exportObjectsPath}`;
+  const exportObjectKey = (pathname: string) =>
+    decodeURIComponent(pathname.split('/objects/')[1] ?? '');
 
   let directory: string;
   let server: TestHarness;
@@ -268,6 +288,7 @@ export async function createDirectReferenceHarness(
   let applicationBytes: R2Bucket;
   let exportBytes: R2Bucket;
   const world = providerWorld('uuid');
+  world.accountSubdomain = binding.accountWorkersDevSubdomain;
   const bridgeErrors: unknown[] = [];
   const sqlFailures: string[] = [];
   const buckets = new Map<
@@ -283,6 +304,28 @@ export async function createDirectReferenceHarness(
           entry.versionId === version.versionId && entry.percentage === 100,
       ),
     );
+  /**
+   * Answers the export bucket's per-key object routes out of `exportBytes`.
+   * Its one caller is `observedProviderRest`, so `policy.nodeProviderRest`
+   * decides whether these answer or the plain projection does.
+   */
+  async function exportObjectResponse(
+    request: CloudflareFixtureRequest,
+    url: URL,
+  ): Promise<Response | undefined> {
+    if (!url.pathname.startsWith(exportObjectsPrefix)) return undefined;
+    if (request.method === 'GET') {
+      const value = await exportBytes.get(exportObjectKey(url.pathname));
+      return value
+        ? new Response(await value.arrayBuffer())
+        : new Response(null, { status: 404 });
+    }
+    if (request.method === 'DELETE') {
+      await exportBytes.delete(exportObjectKey(url.pathname));
+      return single({});
+    }
+    return undefined;
+  }
   async function observedProviderRest(
     request: CloudflareFixtureRequest,
   ): Promise<Response> {
@@ -299,12 +342,10 @@ export async function createDirectReferenceHarness(
         : undefined;
     if (
       request.method === 'GET' &&
-      url.pathname.endsWith(
-        `/deployments/${script?.deploymentId ?? 'deployment'}`,
-      )
+      url.pathname.endsWith(`/deployments/${deploymentIdentity(script)}`)
     )
       return single({
-        id: script?.deploymentId ?? 'deployment',
+        id: deploymentIdentity(script),
         strategy: 'percentage',
         versions: script?.deployment?.map(({ versionId, percentage }) => ({
           version_id: versionId,
@@ -348,28 +389,8 @@ export async function createDirectReferenceHarness(
         .all();
       return single([{ success: true, results: result.results }]);
     }
-    if (
-      request.method === 'GET' &&
-      url.pathname.startsWith(
-        `/client/v4/accounts/account/r2/buckets/${binding.exportBucketName}/objects/`,
-      )
-    ) {
-      const key = decodeURIComponent(url.pathname.split('/objects/')[1] ?? '');
-      const value = await exportBytes.get(key);
-      return value
-        ? new Response(await value.arrayBuffer())
-        : new Response(null, { status: 404 });
-    }
-    if (
-      request.method === 'DELETE' &&
-      url.pathname.startsWith(
-        `/client/v4/accounts/account/r2/buckets/${binding.exportBucketName}/objects/`,
-      )
-    ) {
-      const key = decodeURIComponent(url.pathname.split('/objects/')[1] ?? '');
-      await exportBytes.delete(key);
-      return single({});
-    }
+    const exported = await exportObjectResponse(request, url);
+    if (exported) return exported;
     let response = await rest(request);
     if (metadata && response.ok && scriptName) {
       const current = world.scripts.get(scriptName);
@@ -437,9 +458,7 @@ export async function createDirectReferenceHarness(
       (role) => url.hostname === manifest.names.roles[role].routeHostname,
     );
     if (!role) throw new Error('unknown fixture application role');
-    const adminRoute =
-      url.pathname === '/admin/execution-fence' ||
-      url.pathname === '/admin/inventory';
+    const adminRoute = ADMIN_ROUTES.includes(url.pathname);
     if (adminRoute) {
       if (
         request.headers.get('authorization') !==
@@ -526,12 +545,7 @@ export async function createDirectReferenceHarness(
     if (
       application &&
       policy.applicationFetch &&
-      (url.pathname === '/__direct/health' ||
-        url.pathname === '/__direct/object' ||
-        url.pathname === '/__direct/fence-mutate' ||
-        url.pathname === '/__direct/fence-probe' ||
-        url.pathname === '/admin/execution-fence' ||
-        url.pathname === '/admin/inventory')
+      TENANT_ROUTES.includes(url.pathname)
     )
       return policy.applicationFetch(request);
     const spec = specs.find(
@@ -579,10 +593,7 @@ export async function createDirectReferenceHarness(
     }
     if (url.origin !== 'https://api.cloudflare.com')
       throw new Error('unexpected fixture origin');
-    if (
-      url.pathname.includes(`/r2/buckets/${binding.exportBucketName}/objects/`)
-    )
-      return providerRest(request);
+    if (url.pathname.includes(exportObjectsPath)) return providerRest(request);
     const match = url.pathname.match(
       /^\/client\/v4\/accounts\/account\/r2\/buckets(?:\/([^/]+)(\/objects)?)?$/u,
     );
@@ -594,21 +605,22 @@ export async function createDirectReferenceHarness(
       const records = await Promise.all(
         specs.map((spec) => fleetStore.get(spec.tenantTag, spec.environment)),
       );
-      if (
-        typeof requested !== 'string' ||
-        (!(
-          requested === binding.exportBucketName && jurisdiction === 'default'
-        ) &&
-          !records.some((record) =>
+      // `scripts/direct-credentialed-bootstrap.mjs` creates the export bucket
+      // in the `default` jurisdiction, and the first arm answers that create.
+      // The acceptance seeds the bucket into `buckets` ahead of its run, so
+      // there the application-resource arm is the one that admits a POST.
+      const authorized =
+        typeof requested === 'string' &&
+        ((isExportBucket(requested) && jurisdiction === 'default') ||
+          records.some((record) =>
             record?.applicationResources?.some(
               (resource) =>
                 resource.bucketName === requested &&
                 resource.jurisdiction === jurisdiction &&
                 resource.state === 'create-authorized',
             ),
-          ))
-      )
-        throw new Error('unexpected fixture bucket');
+          ));
+      if (!authorized) throw new Error('unexpected fixture bucket');
       const key = `${jurisdiction}:${requested}`;
       if (buckets.has(key))
         return new Response('bucket exists', { status: 409 });
@@ -632,9 +644,12 @@ export async function createDirectReferenceHarness(
       return single({ buckets: selected });
     }
     const key = `${jurisdiction}:${name}`;
+    // The injected `getApplicationR2Bucket` failure is armed against a
+    // tenant's application bucket. The export bucket the run bootstraps is not
+    // one, so this read steps past the failure, as the delete below does.
     if (
       !match[2] &&
-      name !== binding.exportBucketName &&
+      !isExportBucket(name) &&
       request.method === 'GET' &&
       world.consumeFailure('getApplicationR2Bucket')
     )
@@ -648,11 +663,7 @@ export async function createDirectReferenceHarness(
     const descriptor = buckets.get(key);
     if (!descriptor) return Response.json({ errors: [] }, { status: 404 });
     const prefix = `${key}/`;
-    if (
-      name === binding.exportBucketName &&
-      match[2] &&
-      request.method === 'GET'
-    ) {
+    if (isExportBucket(name) && match[2] && request.method === 'GET') {
       const objects = await exportBytes.list({
         prefix: url.searchParams.get('prefix') ?? '',
       });
@@ -679,7 +690,10 @@ export async function createDirectReferenceHarness(
     }
     if (!match[2] && request.method === 'GET') return single(descriptor);
     if (!match[2] && request.method === 'DELETE') {
-      if (name === binding.exportBucketName) {
+      if (isExportBucket(name)) {
+        // This arm answers before the injected `deleteApplicationR2Bucket`
+        // failure below is consumed: the export bucket the run bootstraps is
+        // not a tenant application resource.
         const objects = await exportBytes.list({ limit: 1 });
         if (objects.objects.length)
           return new Response('bucket nonempty', { status: 409 });

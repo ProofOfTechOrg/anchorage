@@ -72,15 +72,20 @@ export interface AdvanceFleetMigrationOptions {
   ) => FleetSettlementHost | undefined;
   readonly routeAttestation?: AttestConvergedActiveRouteOptions;
   readonly clock?: () => number;
-  /** Call-local only; never persisted. */
+  /**
+   * Call-local only; never persisted. Read at the entry and at the head of
+   * each item advance; a step already in flight runs to completion.
+   */
   readonly signal?: AbortSignal;
   /**
    * Runs on every call that returns `complete` — the call that finalizes the
    * operation, a later continue on the finalized operation, and a replayed
-   * start of the same operationId — after the finalization is durable and
-   * before this call returns. Delivery is therefore at least once; the host
-   * deduplicates on `operationId`. A rejection propagates to the caller and
-   * leaves the durable finalization intact.
+   * start carrying the same intake — after the finalization is durable and
+   * before this call returns, with no operation lease held. Delivery follows
+   * the durable outcome, so an abort raised after the call begins does not
+   * suppress it. Delivery is therefore at least once; the host deduplicates
+   * on `operationId`. A rejection propagates to the caller and leaves the
+   * durable finalization intact.
    */
   readonly onComplete?: (
     result: FleetMigrationResultRef,
@@ -414,6 +419,8 @@ async function advanceItem(
   run: MigrationRun,
   item: FleetMigrationItem,
 ): Promise<FleetMigrationAdvanceResult> {
+  // Outside the try below: its catch durably fails the item, so an abort
+  // raised there would turn a cancellation into a permanent failure.
   options.signal?.throwIfAborted();
   let next: FleetMigrationItem;
   try {

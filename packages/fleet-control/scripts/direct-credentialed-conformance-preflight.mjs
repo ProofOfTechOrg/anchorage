@@ -82,7 +82,33 @@ function utf8(bytes, field) {
   }
 }
 
+/**
+ * The bracket-nesting ceiling both parsers below run under. Recursive-descent
+ * depth is what exhausts a stack, and the host's stack size is what decides
+ * when; bounding the depth here decides it for every host alike, so one
+ * artifact gets one verdict.
+ */
+const DIRECT_MAX_NESTING_DEPTH = 512;
+
+// A lexical count over the whole text, literal and comment content included: an
+// unbalanced bracket inside a string raises the reading and refuses the
+// artifact, which is the direction a gate fails in.
+function inspectNesting(text, field) {
+  let depth = 0;
+  for (const character of text) {
+    if (character === '(' || character === '[' || character === '{') {
+      depth += 1;
+      if (depth > DIRECT_MAX_NESTING_DEPTH) throw invalid(`${field} nesting`);
+    } else if (
+      (character === ')' || character === ']' || character === '}') &&
+      depth > 0
+    )
+      depth -= 1;
+  }
+}
+
 function inspectModule(text, reference, field, wasm) {
+  inspectNesting(text, field);
   const syntax = spawnSync(
     process.execPath,
     ['--input-type=module', '--check'],

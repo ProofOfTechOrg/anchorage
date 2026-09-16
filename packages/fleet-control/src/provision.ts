@@ -85,7 +85,12 @@ import type {
   ProvisioningPhase,
   ProvisioningResult,
 } from './types.js';
-import { assertNoActiveCleanup, assertNoActiveDecommission } from './types.js';
+import {
+  assertNoActiveCleanup,
+  assertNoActiveDecommission,
+  hasActiveCleanup,
+  RETIRED_BACKEND_SWITCH_SUBPHASE,
+} from './types.js';
 import {
   targetDurableObjectTag,
   validateDeploymentSecrets,
@@ -162,6 +167,19 @@ function nowIso(clock: () => number): string {
   return new Date(clock()).toISOString();
 }
 
+// The catalog mode a first reservation for this backend and specification
+// pins on the durable row. Admission reads the same expression the reservation
+// writes, so the two cannot drift.
+function reservedWfpMode(
+  backend: ProvisioningBackend,
+  spec: DeploymentSpec,
+): FleetRecord['wfpMode'] {
+  return backend.kind === 'workers-for-platforms' &&
+    spec.authoredBy === 'platform'
+    ? 'platform-catalog'
+    : undefined;
+}
+
 function recordAt(
   backend: ProvisioningBackend,
   spec: DeploymentSpec,
@@ -179,13 +197,11 @@ function recordAt(
 ): FleetRecord {
   const applicationResources =
     options.applicationResources ?? reserveApplicationR2Resources(spec);
+  const wfpMode = reservedWfpMode(backend, spec);
   return {
     tenantTag: spec.tenantTag,
     backend: backend.kind,
-    ...(backend.kind === 'workers-for-platforms' &&
-    spec.authoredBy === 'platform'
-      ? { wfpMode: 'platform-catalog' as const }
-      : {}),
+    ...(wfpMode ? { wfpMode } : {}),
     environment: spec.environment,
     scriptName: spec.scriptName,
     databaseId: database.id,
@@ -604,29 +620,29 @@ export interface ProvisionDeploymentOptions {
 // The residue a terminal `decommissioned` row still describes, or `undefined`
 // when the row describes none. Written as a reason rather than a boolean so
 // the refusal below names what the operator has to resolve.
+//
+// A switch-carrying row is read against the subphase whose teardown evidence
+// `isCompleteTerminalRecord` matches; every other subphase, settled ones
+// included, is named as the switch record it is rather than falling through
+// to the teardown-evidence reason.
 function retainedTerminalResidue(record: FleetRecord): string | undefined {
-  const decommission = record.decommissionIntent;
-  if (decommission && decommission.state !== 'complete') {
-    return `an unfinished decommission operation in state '${decommission.state}'`;
-  }
-  if (record.cleanupIntent !== undefined) {
-    return 'an unfinished bounded cleanup operation';
-  }
   const switchSubphase = record.backendSwitchIntent?.subphase;
   if (
     switchSubphase !== undefined &&
-    switchSubphase !== 'rolled-back' &&
-    switchSubphase !== 'finalized' &&
-    switchSubphase !== 'decommissioned'
+    switchSubphase !== RETIRED_BACKEND_SWITCH_SUBPHASE
   ) {
-    return `an active backend switch in subphase '${switchSubphase}'`;
+    return `a backend-switch record in subphase '${switchSubphase}'`;
   }
   const retained = (record.applicationResources ?? []).filter(
     (resource) => resource.state !== 'deleted',
   );
-  const retainedNames = retained.map((resource) => `'${resource.name}'`);
-  if (retainedNames.length > 0) {
-    return `retained application R2 resources ${retainedNames.join(', ')}`;
+  // The bucket name is what the operator removes; the binding names which
+  // declaration in the spec reserved it.
+  const retainedBuckets = retained.map(
+    (resource) => `'${resource.bucketName}' (binding '${resource.name}')`,
+  );
+  if (retainedBuckets.length > 0) {
+    return `retained application R2 resources ${retainedBuckets.join(', ')}`;
   }
   if (!isCompleteTerminalRecord(record)) {
     return 'incomplete teardown evidence: a completed decommission records the database export location, digest, and byte count and leaves no pending lifecycle field';
@@ -634,46 +650,93 @@ function retainedTerminalResidue(record: FleetRecord): string | undefined {
   return undefined;
 }
 
-// Reads a stored `decommissioned` row as a RETIRED record: one
-// `provisionDeployment` treats as an absent prior rather than as a lifecycle
-// to resume.
+// Reads a stored row already known to be in the terminal phase as a RETIRED
+// record: one `provisionDeployment` treats as an absent prior rather than as a
+// lifecycle to resume.
 //
 // The row is the evidence, read against the package's own definition of a
 // completed decommission record in `isCompleteTerminalRecord`, so a teardown
 // that never finished refuses instead — including the row a forced
 // decommission strands between its terminal state write and its row delete,
-// which records no database export. The predicate reads the row, not its
-// provenance: a row carrying that same evidence reads as retired however it
-// was written.
+// which records no database export. That definition reads a switch-carrying
+// row against the export and application-resource evidence only the retired
+// subphase records, and nothing in this package clears a settled switch
+// intent, so a row whose switch settled at `finalized` or `rolled-back` is
+// refused by that subphase. The predicate reads the row, not its provenance:
+// a row carrying that same evidence reads as retired however it was written.
 //
-// Physical resources the row does not describe stay outside that evidence —
-// an ordinary Worker script a forced decommission leaves behind, and the
-// Durable Object namespaces a backend asserts absent rather than deletes —
-// and a fresh provision over this slug meets them at the provider, which
-// refuses to adopt a database or a script it cannot attribute to this
-// deployment.
+// Behind that evidence stand the steps a normal decommission ran: it deleted
+// the application R2 buckets the row carries at `deleted`, then deleted the D1
+// database and read it back absent (`decommissionDeployment`'s
+// `database-deleting` phase), and the backend it asked to detach that database
+// asserted the row's Durable Object namespaces absent first. A terminal row
+// therefore evidences namespace absence by the mechanism that evidences D1
+// absence. A force-produced row ran none of those assertions, and the export
+// triple it lacks is what refuses it above.
 //
-// The intent clauses live here rather than beside the guards that mirror them
-// because normalization runs before `assertNoActiveDecommission`, the cleanup
-// redirect, and `assertBackendSwitchInactive`: a row admitted here reaches
-// none of those guards.
-function isRetiredTerminalRecord(record: FleetRecord): boolean {
-  return (
-    record.phase === 'decommissioned' &&
-    retainedTerminalResidue(record) === undefined
+// An ordinary Worker script a forced decommission leaves behind is outside the
+// row's description. A fresh provision over this slug meets it at the
+// provider: `assertReservedDatabaseNameFree` refuses a database already
+// answering to the reserved name, and `PlainWorkerBackend` refuses to upload
+// over a surviving script whose deployed versions bind another tenant,
+// environment, or database. `WorkersForPlatformsBackend.deployWorker` carries
+// no equivalent script refusal.
+//
+// Two kinds of clause answer this, and they are split by what they produce.
+// `residue` decides retirement AND names what the refusal below renders, so
+// the caller computes it once and passes it here rather than recomputing it
+// there. The decommission and cleanup intents decide retirement only: a row
+// they reject carries no reason of its own and refuses through the guard that
+// owns it. Those two clauses live here rather than beside the guards that
+// mirror them because normalization runs before `assertNoActiveDecommission`
+// and the cleanup redirect, so a row admitted here reaches neither guard.
+function isRetiredTerminalRecord(
+  record: FleetRecord,
+  residue: string | undefined,
+): boolean {
+  if (residue !== undefined) return false;
+  const decommission = record.decommissionIntent;
+  if (decommission && decommission.state !== 'complete') return false;
+  return !hasActiveCleanup(record);
+}
+
+// Refuses a retired row whose persisted deployment mode is not the one this
+// specification reserves. The store pins `wfpMode` from the first reservation
+// and refuses an upsert that changes an established one; a retired row is
+// replaced through that same upsert, so the mismatch is named here, before the
+// first write, instead of surfacing as a constraint violation. A row that
+// persisted no mode is the case the store admits, and is admitted here too.
+function assertRetiredDeploymentMode(
+  retired: FleetRecord,
+  backend: ProvisioningBackend,
+  spec: DeploymentSpec,
+): void {
+  const reserved = reservedWfpMode(backend, spec);
+  if (retired.wfpMode === undefined || retired.wfpMode === reserved) return;
+  throw new Error(
+    `deployment '${spec.tenantTag}:${spec.environment}' has a retired terminal record in deployment mode '${retired.wfpMode}' and this specification reserves '${reserved ?? 'unmarked'}'; an established catalog mode cannot change, so clear the record with forceDecommissionDeployment() before provisioning this name again`,
   );
 }
 
 // Refuses a database that already answers to the name this provision reserves.
+// The reserved name is `spec.databaseName` at every call site: a prior that
+// reached here passed `assertImmutableDeploymentMapping`, which refuses a row
+// whose `databaseName` differs. Over a retired terminal row the caller passes
+// that row's database ID, so an operator reading the refusal can tell the
+// retired deployment's own resurrected database from a foreign one answering
+// to the same name.
 async function assertReservedDatabaseNameFree(
   backend: ProvisioningBackend,
   spec: DeploymentSpec,
-  reservedName: string,
+  retiredDatabaseId?: string,
 ): Promise<void> {
   const existingDatabase = await backend.findDatabase(spec);
   if (existingDatabase) {
+    const retired = retiredDatabaseId
+      ? `; the retired terminal record held database '${retiredDatabaseId}'`
+      : '';
     throw new Error(
-      `refusing to claim pre-existing database '${existingDatabase.id}:${existingDatabase.name}' for reserved name '${reservedName}'`,
+      `refusing to claim pre-existing database '${existingDatabase.id}:${existingDatabase.name}' for reserved name '${spec.databaseName}'${retired}`,
     );
   }
 }
@@ -725,9 +788,16 @@ async function provisionDeploymentUnderLease(
     );
   }
   const stored = await store.get(spec.tenantTag, spec.environment);
+  // The terminal reading of the stored row, taken ONCE: `terminal` is the row
+  // only while its phase is the terminal one, and `terminalResidue` is what
+  // that row still describes. Both the retirement test below and the refusal
+  // that renders the reason read these two bindings.
+  const terminal = stored?.phase === 'decommissioned' ? stored : undefined;
+  const terminalResidue =
+    terminal === undefined ? undefined : retainedTerminalResidue(terminal);
   const retiredPrior =
-    stored !== undefined && isRetiredTerminalRecord(stored)
-      ? stored
+    terminal !== undefined && isRetiredTerminalRecord(terminal, terminalResidue)
+      ? terminal
       : undefined;
   // Normalized ONCE, here: `prior` is what the lifecycle guards, the immutable
   // mapping asserts, the phase refusal, `record` and `databaseReservationOwned`
@@ -736,15 +806,15 @@ async function provisionDeploymentUnderLease(
   // at false and disable the failed-provision unwind for the database and
   // Worker this attempt created.
   const prior = retiredPrior === undefined ? stored : undefined;
+  if (retiredPrior) {
+    assertRetiredDeploymentMode(retiredPrior, backend, spec);
+  }
   if (prior) {
     assertNoActiveDecommission(prior, 'provisionDeployment');
     // The fixed redirect IS this entry's cleanup guard: it must fire before
     // the generic non-resumable-phase refusal so a rollback that admitted the
     // bounded engine routes to cleanup instead of a provisioning retry.
-    if (
-      prior.phase === 'cleanup-advancing' ||
-      prior.cleanupIntent !== undefined
-    ) {
+    if (hasActiveCleanup(prior)) {
       throw new Error(
         `deployment '${spec.tenantTag}:${spec.environment}' has an active bounded cleanup; complete it with cleanupDeploymentArtifacts() or advanceCleanupDeployment() before provisioning again`,
       );
@@ -779,17 +849,14 @@ async function provisionDeploymentUnderLease(
   if (prior) {
     assertImmutableDeploymentMapping(prior, backend, spec);
     assertPlatformDurableObjectHistory(prior, spec);
-    // A terminal row that reaches here failed `isRetiredTerminalRecord`, so it
-    // still describes residue. It refuses by that reason instead of by the
-    // generic phase message, because the remedy is a physical one the operator
-    // performs before the record can be cleared.
-    const residue =
-      prior.phase === 'decommissioned'
-        ? retainedTerminalResidue(prior)
-        : undefined;
-    if (residue !== undefined) {
+    // A terminal row that reaches here failed `isRetiredTerminalRecord` on the
+    // residue normalization already read, so it still describes that residue.
+    // It refuses by that reason instead of by the generic phase message,
+    // because the remedy is a physical one the operator performs before the
+    // record can be cleared.
+    if (terminalResidue !== undefined) {
       throw new Error(
-        `deployment '${spec.tenantTag}:${spec.environment}' has a decommissioned record with ${residue}; confirm the residual physical resources are removed, then clear the record with forceDecommissionDeployment() before provisioning this name again`,
+        `deployment '${spec.tenantTag}:${spec.environment}' has a decommissioned record with ${terminalResidue}; confirm the residual physical resources are removed, then clear the record with forceDecommissionDeployment() before provisioning this name again`,
       );
     }
     if (!RESUMABLE_PROVISIONING_PHASES.has(prior.phase)) {
@@ -959,11 +1026,15 @@ async function provisionDeploymentUnderLease(
     // is an unconditional upsert, so the reserved-name proof runs before the
     // claim: proving it afterwards would have replaced the export location,
     // digest and size that `decommissionDeployment` replays from, for a
-    // provision that then refuses. An absent prior keeps the original order,
-    // where the durable reservation written first is what
-    // `cleanupDeploymentArtifacts()` clears with a receipt.
+    // provision that then refuses. An absent prior proves the name after its
+    // reservation is written, so `cleanupDeploymentArtifacts()` has a durable
+    // row to clear with a receipt.
     if (retiredPrior !== undefined) {
-      await assertReservedDatabaseNameFree(backend, spec, spec.databaseName);
+      await assertReservedDatabaseNameFree(
+        backend,
+        spec,
+        retiredPrior.databaseId,
+      );
     }
     if (!record) {
       const reservation: DatabaseReference = {
@@ -982,11 +1053,7 @@ async function provisionDeploymentUnderLease(
     }
     if (record.phase === 'database-reserved') {
       if (retiredPrior === undefined) {
-        await assertReservedDatabaseNameFree(
-          backend,
-          spec,
-          record.databaseName,
-        );
+        await assertReservedDatabaseNameFree(backend, spec);
       }
       record = {
         ...record,

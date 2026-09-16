@@ -28,8 +28,11 @@ import {
   FLEET_OPERATION_RECORD_BYTE_BOUND,
   FLEET_OPERATION_RECORD_ROW_BYTE_BOUND,
   FLEET_OPERATION_ROW_PAYLOAD_BYTE_BOUND,
+  FLEET_OPERATION_SINGLE_UPDATE_ROW_MESSAGE,
   FLEET_OPERATION_STRING_BYTE_BOUND,
   FLEET_OPERATION_TOKEN_BYTE_BOUND,
+  type FleetOperationRunRecord,
+  type FleetOperationStagedRow,
   FleetOperationStateError,
   FleetOperationTokenError,
   FleetOperationTokenFutureError,
@@ -37,11 +40,18 @@ import {
   FleetOperationTokenOperationError,
   fleetOperationIntakeDigest,
   fleetOperationItemsIntake,
+  fleetOperationOtherKindMessage,
   fleetOperationRunRecordFromUnknown,
   fleetOperationStagedRowFromUnknown,
+  fleetOperationWatermarkRunMessage,
   isDurableAuditDetailSafe,
   parseFleetOperationToken,
 } from '../src/fleet-operation-state.js';
+import type { FleetRecord } from '../src/types.js';
+import {
+  FakeOperationStore,
+  uuidFor,
+} from './fixtures/fleet-operation-fakes.js';
 
 const OPERATION_ID = '123e4567-e89b-42d3-a456-426614174000';
 const NOW = '2026-09-01T00:00:00.000Z';
@@ -542,6 +552,34 @@ describe('fleet operation state', () => {
     );
   });
 
+  it('audit stage codec refuses a persisted cursor that is not a safe non-negative integer', () => {
+    // The guard the forced-generation reader rests on: a cursor read back out
+    // of D1 indexes the audited collection, so a fractional, negative or
+    // out-of-range value has to fail the decode rather than the array read.
+    for (const expectedOrdinal of [
+      4.5,
+      -1,
+      Number.MAX_SAFE_INTEGER + 1,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      '4',
+      null,
+    ]) {
+      expect(() =>
+        fleetAuditStageFromUnknown({
+          step: 'r2-missing-identity',
+          expectedOrdinal,
+        }),
+      ).toThrow(FleetOperationStateError);
+    }
+    expect(
+      fleetAuditStageFromUnknown({
+        step: 'r2-missing-identity',
+        expectedOrdinal: 0,
+      }),
+    ).toEqual({ step: 'r2-missing-identity', expectedOrdinal: 0 });
+  });
+
   it('nextAuditStage successor chain over all 13 stages (same-step on exhausted: false)', () => {
     const initial = {
       step: 'provider-findings',
@@ -681,5 +719,472 @@ describe('fleet operation state', () => {
         .update(canonical);
     }
     expect(digestFor([a, b])).toBe(oracle.digest('hex'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The shared FakeOperationStore's own contract, beside the port it implements
+// rather than inside one of its consumers: a suite that drives the fake reads
+// its guarded-progress behaviour from here.
+// ---------------------------------------------------------------------------
+
+describe('operation fake guarded progress contract', () => {
+  const operationId = uuidFor(990);
+  const initial = {
+    version: 1,
+    operationId,
+    kind: 'migration',
+    state: 'running',
+    progress: {
+      kind: 'migration',
+      revision: 0,
+      itemCount: 1,
+      activeItemOrdinal: 0,
+      completedItemCount: 0,
+    },
+    updatedAt: '2026-09-05T00:00:00.000Z',
+  } as const;
+  const intended: FleetOperationRunRecord = {
+    ...initial,
+    progress: { ...initial.progress, revision: 1 },
+  };
+  const row: FleetOperationStagedRow = {
+    rowKind: 'item',
+    ordinal: 0,
+    payload: {
+      ordinal: 0,
+      tenantTag: 'fake',
+      environment: 'production',
+      entryRecordDigest: 'a'.repeat(64),
+      status: 'pending',
+    },
+  };
+  const different = {
+    ...row,
+    payload: { ...row.payload, tenantTag: 'other' },
+  };
+
+  it('loses the next successful progress response after a refused commit and accepts its retry', async () => {
+    const store = new FakeOperationStore();
+    store.operations.set(operationId, initial);
+    store.heads.set('migration', operationId);
+    const lostResponse = new Error('progress response lost');
+    store.loseNextSuccessfulCommitProgressResponse = lostResponse;
+    await store.withAccountOperationLease('migration', async (lease) => {
+      const input = {
+        operationId,
+        expectedRevision: 0,
+        runRecord: intended,
+        rows: [row],
+        expectedRowWatermarks: { item: 1 },
+      };
+      const refused = lease.commitProgress({ ...input, expectedRevision: 2 });
+      await expect(refused).rejects.toBeInstanceOf(Error);
+      await expect(refused).rejects.toHaveProperty(
+        'message',
+        `fleet operation '${operationId}' is no longer at the expected revision`,
+      );
+      expect(store.loseNextSuccessfulCommitProgressResponse).toBe(lostResponse);
+      expect(store.operations.get(operationId)).toEqual(initial);
+      expect(store.rows.size).toBe(0);
+      expect(store.heads.get('migration')).toBe(operationId);
+
+      await expect(lease.commitProgress(input)).rejects.toBe(lostResponse);
+      expect(store.loseNextSuccessfulCommitProgressResponse).toBeUndefined();
+      expect(store.operations.get(operationId)).toEqual(intended);
+      expect(store.rows.get(`${operationId}:item`)).toEqual([row]);
+      const operationsBeforeRetry = structuredClone([...store.operations]);
+      const rowsBeforeRetry = structuredClone([...store.rows]);
+      const headsBeforeRetry = [...store.heads];
+      await expect(lease.commitProgress(input)).resolves.toEqual(intended);
+      expect([...store.operations]).toEqual(operationsBeforeRetry);
+      expect([...store.rows]).toEqual(rowsBeforeRetry);
+      expect([...store.heads]).toEqual(headsBeforeRetry);
+    });
+  });
+
+  it.each([
+    { method: 'finalizeOperation', state: 'running' },
+    { method: 'finalizeOperation', state: 'finalized' },
+    { method: 'finalizeOperation', state: 'failed' },
+    { method: 'failOperation', state: 'running' },
+    { method: 'failOperation', state: 'finalized' },
+    { method: 'failOperation', state: 'failed' },
+  ] as const)('$method refuses a foreign-kind $state record using the captured lease', async ({
+    method,
+    state,
+  }) => {
+    const store = new FakeOperationStore();
+    const source = state === 'running' ? initial : intended;
+    store.rows.set(`${operationId}:item`, [row]);
+    store.heads.set('migration', operationId);
+    store.heads.set('audit', uuidFor(991));
+    store.operations.set(
+      operationId,
+      fleetOperationRunRecordFromUnknown({
+        ...source,
+        state,
+        progress: {
+          ...source.progress,
+          ...(state === 'failed'
+            ? { failure: { reason: 'operator-abandoned' } }
+            : {}),
+          ...(state === 'finalized' ? { completedItemCount: 1 } : {}),
+        },
+      }),
+    );
+    const operationsBefore = structuredClone([...store.operations]);
+    const rowsBefore = structuredClone([...store.rows]);
+    const headsBefore = [...store.heads];
+    await store.withAccountOperationLease('audit', async (lease) => {
+      const runRecord = fleetOperationRunRecordFromUnknown({
+        ...source,
+        kind: 'audit',
+        state: method === 'finalizeOperation' ? 'finalized' : 'failed',
+        progress: {
+          kind: 'audit',
+          revision: 1,
+          stage: { step: 'finalize' },
+          generation: 1,
+          auditTimeMs: 0,
+          staleAfterMs: 60_000,
+          recordCount: 0,
+          findingCount: 0,
+          factCount: 0,
+          ...(method === 'failOperation'
+            ? { failure: { reason: 'operator-abandoned' } }
+            : {}),
+        },
+      });
+      const input = { operationId, expectedRevision: 0, runRecord };
+      const result =
+        method === 'finalizeOperation'
+          ? lease.finalizeOperation({ ...input, expectedRowCounts: {} })
+          : lease.failOperation(input);
+      await expect(result).rejects.toBeInstanceOf(Error);
+      await expect(result).rejects.toHaveProperty(
+        'message',
+        fleetOperationOtherKindMessage(operationId),
+      );
+      expect([...store.operations]).toEqual(operationsBefore);
+      expect([...store.rows]).toEqual(rowsBefore);
+      expect([...store.heads]).toEqual(headsBefore);
+    });
+  });
+
+  it.each([
+    'missing-operation',
+    'watermark',
+    'other-record',
+    'different-row',
+    'missing-row',
+    'converged',
+  ] as const)('orders the %s convergence identity', async (variant) => {
+    const store = new FakeOperationStore();
+    if (variant !== 'missing-operation') {
+      store.operations.set(
+        operationId,
+        variant === 'other-record'
+          ? { ...intended, state: 'failed' }
+          : intended,
+      );
+    }
+    store.rows.set(
+      `${operationId}:item`,
+      variant === 'missing-row'
+        ? []
+        : [variant === 'converged' ? row : different],
+    );
+    const operationsBefore = structuredClone([...store.operations]);
+    const rowsBefore = structuredClone([...store.rows]);
+    await store.withAccountOperationLease('migration', async (lease) => {
+      const commit = lease.commitProgress({
+        operationId,
+        expectedRevision: 0,
+        runRecord: intended,
+        updateRows:
+          variant === 'different-row'
+            ? [
+                { ...row, ordinal: 1, payload: { ...row.payload, ordinal: 1 } },
+                row,
+              ]
+            : [row],
+        expectedRowWatermarks: {
+          item: variant === 'watermark' ? 2 : variant === 'missing-row' ? 0 : 1,
+        },
+      });
+      if (variant === 'converged') {
+        await expect(commit).resolves.toEqual(intended);
+      } else {
+        const message =
+          variant === 'missing-operation'
+            ? `no fleet operation '${operationId}'`
+            : variant === 'different-row'
+              ? `fleet operation '${operationId}' staged rows diverge from the persisted operation`
+              : `fleet operation '${operationId}' is no longer at the expected revision`;
+        await expect(commit).rejects.toBeInstanceOf(Error);
+        await expect(commit).rejects.toHaveProperty('message', message);
+      }
+    });
+    expect([...store.operations]).toEqual(operationsBefore);
+    expect([...store.rows]).toEqual(rowsBefore);
+  });
+
+  it('enforces watermark writer obligations', async () => {
+    for (const insert of [false, true]) {
+      const store = new FakeOperationStore();
+      store.operations.set(operationId, initial);
+      store.rows.set(`${operationId}:item`, [row]);
+      await store.withAccountOperationLease('migration', async (lease) => {
+        await expect(
+          lease.commitProgress({
+            operationId,
+            expectedRevision: 0,
+            runRecord: intended,
+            ...(insert ? { rows: [different] } : {}),
+            expectedRowWatermarks: { item: 2 },
+          }),
+        ).rejects.toThrow(
+          insert
+            ? fleetOperationWatermarkRunMessage('item')
+            : `fleet operation '${operationId}' is no longer at the expected revision`,
+        );
+      });
+      expect(store.operations.get(operationId)).toEqual(initial);
+      expect(store.rows.get(`${operationId}:item`)).toEqual([row]);
+    }
+  });
+
+  it('refuses noncontiguous rows and malformed mutations on stale-revision replay', async () => {
+    const replay = new FakeOperationStore();
+    const secondRow: FleetOperationStagedRow = {
+      ...row,
+      ordinal: 1,
+      payload: { ...row.payload, ordinal: 1 },
+    };
+    const twoItems = {
+      ...intended,
+      progress: {
+        ...initial.progress,
+        revision: 1,
+        itemCount: 2,
+      },
+    };
+    replay.operations.set(operationId, twoItems);
+    replay.rows.set(`${operationId}:item`, [row, secondRow]);
+    await replay.withAccountOperationLease('migration', async (lease) => {
+      await expect(
+        lease.commitProgress({
+          operationId,
+          expectedRevision: 0,
+          runRecord: twoItems,
+          rows: [row],
+          expectedRowWatermarks: { item: 2 },
+        }),
+      ).rejects.toThrow(fleetOperationWatermarkRunMessage('item'));
+    });
+    expect(replay.operations.get(operationId)).toEqual(twoItems);
+    expect(replay.rows.get(`${operationId}:item`)).toEqual([row, secondRow]);
+    for (const mutations of [
+      { rows: [secondRow, secondRow] },
+      { rows: [secondRow], updateRows: [secondRow] },
+      { updateRows: [secondRow, secondRow] },
+      { updateRows: [{ ...row, rowKind: 'record' as const }] },
+    ]) {
+      await replay.withAccountOperationLease('migration', async (lease) => {
+        await expect(
+          lease.commitProgress({
+            operationId,
+            expectedRevision: 0,
+            runRecord: twoItems,
+            expectedRowWatermarks: { item: 2 },
+            ...mutations,
+          }),
+        ).rejects.toBeInstanceOf(FleetOperationStateError);
+      });
+      expect(replay.operations.get(operationId)).toEqual(twoItems);
+      expect(replay.rows.get(`${operationId}:item`)).toEqual([row, secondRow]);
+    }
+  });
+
+  it('refuses missing updates and different immutable bytes before sibling writes, and accepts exact retries', async () => {
+    const secondRow = {
+      ...row,
+      ordinal: 1,
+      payload: { ...row.payload, ordinal: 1 },
+    };
+    const updated = {
+      ...secondRow,
+      payload: { ...secondRow.payload, tenantTag: 'updated' },
+    };
+    const sibling = {
+      ...row,
+      ordinal: 2,
+      payload: { ...row.payload, ordinal: 2 },
+    };
+    const missing = {
+      ...row,
+      ordinal: 3,
+      payload: { ...row.payload, ordinal: 3 },
+    };
+    for (const variant of ['missing-update', 'different-insert', 'exact']) {
+      const store = new FakeOperationStore();
+      store.operations.set(operationId, initial);
+      store.heads.set('migration', operationId);
+      store.rows.set(`${operationId}:item`, [row, secondRow]);
+      const input = {
+        operationId,
+        expectedRevision: 0,
+        runRecord: intended,
+        rows: [sibling, variant === 'different-insert' ? different : row],
+        updateRows:
+          variant === 'missing-update' ? [updated, missing] : [updated],
+        expectedRowWatermarks: { item: 1 },
+      };
+      await store.withAccountOperationLease('migration', async (lease) => {
+        const result = await lease
+          .commitProgress(input)
+          .catch((error: unknown) => error);
+        if (variant === 'exact') {
+          expect(store.operations.get(operationId)).toEqual(intended);
+          expect(store.rows.get(`${operationId}:item`)).toEqual([
+            row,
+            updated,
+            sibling,
+          ]);
+          expect(result).toEqual(intended);
+          expect(await lease.commitProgress(input)).toEqual(intended);
+          expect(store.operations.get(operationId)).toEqual(intended);
+          expect(store.rows.get(`${operationId}:item`)).toEqual([
+            row,
+            updated,
+            sibling,
+          ]);
+        } else {
+          expect(store.operations.get(operationId)).toEqual(initial);
+          expect(store.rows.get(`${operationId}:item`)).toEqual([
+            row,
+            secondRow,
+          ]);
+          expect(store.heads.get('migration')).toBe(operationId);
+          expect(result).toBeInstanceOf(Error);
+          if (variant === 'missing-update') {
+            expect(result).toHaveProperty(
+              'message',
+              `fleet operation '${operationId}' is no longer at the expected revision`,
+            );
+          }
+        }
+      });
+    }
+  });
+
+  it('compares record payloads canonically for fresh commits and convergence', async () => {
+    const record: FleetRecord = {
+      tenantTag: 'canonical',
+      backend: 'plain-worker',
+      environment: 'production',
+      scriptName: 'canonical-worker',
+      databaseId: 'db-canonical',
+      databaseName: 'database-canonical',
+      schemaVersion: 1,
+      artifactVersion: 'v1',
+      desiredSpecDigest: 'a'.repeat(64),
+      durableObjectBindings: [
+        { name: 'RUNNER', className: 'Runner', namespaceId: 'ns-canonical' },
+      ],
+      routeHostname: 'canonical.example.test',
+      phase: 'ready',
+      updatedAt: NOW,
+    };
+    const stored: FleetOperationStagedRow = {
+      rowKind: 'record',
+      ordinal: 0,
+      payload: { ...record },
+    };
+    const reordered = {
+      ...stored,
+      payload: Object.fromEntries(Object.entries(record).reverse()),
+    };
+    expect(JSON.stringify(stored.payload)).not.toBe(
+      JSON.stringify(reordered.payload),
+    );
+    const auditInitial = {
+      ...initial,
+      kind: 'audit' as const,
+      progress: { kind: 'audit' as const, revision: 0 },
+    };
+    const auditIntended = {
+      ...auditInitial,
+      progress: { ...auditInitial.progress, revision: 1 },
+    };
+    const store = new FakeOperationStore();
+    store.operations.set(operationId, auditInitial);
+    store.rows.set(`${operationId}:record`, [stored]);
+    await store.withAccountOperationLease('audit', async (lease) => {
+      const input = {
+        operationId,
+        expectedRevision: 0,
+        runRecord: auditIntended,
+        rows: [reordered],
+        expectedRowWatermarks: { record: 1 },
+      };
+      const error = await lease
+        .commitProgress({
+          ...input,
+          rows: [
+            { ...stored, ordinal: 1 },
+            { ...stored, payload: { ...stored.payload, tenantTag: 'other' } },
+          ],
+        })
+        .catch((error: unknown) => error);
+      expect(store.operations.get(operationId)).toEqual(auditInitial);
+      expect(store.rows.get(`${operationId}:record`)).toEqual([stored]);
+      expect(error).toBeInstanceOf(Error);
+      for (let retry = 0; retry < 2; retry += 1) {
+        expect(await lease.commitProgress(input)).toEqual(auditIntended);
+        expect(store.operations.get(operationId)).toEqual(auditIntended);
+        expect(store.rows.get(`${operationId}:record`)).toEqual([stored]);
+        expect(JSON.stringify(store.rows.get(`${operationId}:record`))).toBe(
+          JSON.stringify([stored]),
+        );
+      }
+    });
+  });
+
+  it('refuses multiple failure updates before changing rows or releasing the head', async () => {
+    const secondRow = {
+      ...row,
+      ordinal: 1,
+      payload: { ...row.payload, ordinal: 1 },
+    };
+    const store = new FakeOperationStore();
+    store.operations.set(operationId, initial);
+    store.heads.set('migration', operationId);
+    store.rows.set(`${operationId}:item`, [row, secondRow]);
+    await store.withAccountOperationLease('migration', async (lease) => {
+      let error: unknown;
+      try {
+        await lease.failOperation({
+          operationId,
+          expectedRevision: 0,
+          runRecord: { ...intended, state: 'failed' },
+          updateRows: [row, secondRow].map((item) => ({
+            ...item,
+            payload: { ...item.payload, status: 'failed' },
+          })),
+        });
+      } catch (caught) {
+        error = caught;
+      }
+      expect(store.operations.get(operationId)).toEqual(initial);
+      expect(store.rows.get(`${operationId}:item`)).toEqual([row, secondRow]);
+      expect(store.heads.get('migration')).toBe(operationId);
+      expect(error).toBeInstanceOf(Error);
+      expect(error).toHaveProperty(
+        'message',
+        FLEET_OPERATION_SINGLE_UPDATE_ROW_MESSAGE,
+      );
+    });
   });
 });

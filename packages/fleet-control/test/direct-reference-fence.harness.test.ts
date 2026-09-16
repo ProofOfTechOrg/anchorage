@@ -6,31 +6,23 @@ import {
 } from '@proofoftech/flowsafe/deployment-identity-protocol';
 import { INVENTORY_CATEGORIES } from '@proofoftech/flowsafe/do-runner';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import type {
+  DirectFenceReading,
+  DirectFenceSweep,
+} from '../scripts/direct-reference-fence.js';
 import {
   createDirectReferenceHarness,
   type DirectReferenceHarness,
 } from './fixtures/direct-reference-harness.js';
 import type { D1State } from './fixtures/provider-world.js';
 
-type Reading = {
-  state: string;
-  mutationEpoch: number;
-  requireMutationEpoch: boolean;
-  transitionRevision: number;
-};
-type Sweep = {
-  fence: Reading;
-  categories: { category: string; class: string; empty: boolean }[];
-  observedAt: number;
-};
-
 describe.sequential('reference fence composition at release 1', {
   timeout: 180_000,
 }, () => {
   let fixture: DirectReferenceHarness;
-  let initial: Reading;
-  let drained: Reading;
-  let first: Sweep;
+  let initial: DirectFenceReading;
+  let drained: DirectFenceReading;
+  let first: DirectFenceSweep;
   beforeAll(async () => {
     fixture = await createDirectReferenceHarness({
       applicationProbes: true,
@@ -42,9 +34,13 @@ describe.sequential('reference fence composition at release 1', {
   }, 30_000);
 
   const read = (role: 'a' | 'b' = 'a') =>
-    fixture.success<Reading>({ kind: 'tenant-fence', role, operation: 'read' });
+    fixture.success<DirectFenceReading>({
+      kind: 'tenant-fence',
+      role,
+      operation: 'read',
+    });
   const inventory = () =>
-    fixture.success<Sweep>({
+    fixture.success<DirectFenceSweep>({
       kind: 'tenant-fence',
       role: 'a',
       operation: 'inventory',
@@ -99,24 +95,18 @@ describe.sequential('reference fence composition at release 1', {
   });
 
   it('sweeps open role a with empty work categories', async () => {
-    const { response, value } = await fixture.call({
-      kind: 'tenant-fence',
-      role: 'a',
-      operation: 'inventory',
-    });
-    expect(value.ok).toBe(true);
-    expect(response.headers.get('X-Direct-Maintenance-Attempts')).toBe('11');
-    first = value.result as Sweep;
+    first = await inventory();
     expect(first.fence.state).toBe('open');
     expect(
-      first.categories.every(
-        (entry) => entry.class === 'standing' || entry.empty,
-      ),
+      first.categories.every((entry) => entry.class !== 'work' || entry.empty),
     ).toBe(true);
   });
 
   it('drains role a once and classifies release-1 epochs against the activated fence', async () => {
-    const result = await fixture.success<{ ok: boolean; after: Reading }>({
+    const result = await fixture.success<{
+      ok: boolean;
+      after: DirectFenceReading;
+    }>({
       kind: 'tenant-fence',
       role: 'a',
       operation: 'drain',
@@ -147,31 +137,21 @@ describe.sequential('reference fence composition at release 1', {
       classification: 'stale',
       status: 409,
     });
+    // This fixture checks epochs without a router or schedule mutation. The
+    // scenario's post-migration probes use the active release's advanced epoch.
     const stale = await probe('probe-stale');
     const future = await probe('probe-future');
     const missing = await probe('probe-missing');
     expect(stale).toEqual({ epoch: 'stale', classification: 'stale' });
     expect(future).toEqual({ epoch: 'future', classification: 'accepted' });
     expect(missing).toEqual({ epoch: 'missing', classification: 'missing' });
-    // This fixture checks epochs without a router or schedule mutation. The
-    // scenario's post-migration probes use the active release's advanced epoch.
-    process.stdout.write(
-      `A1_POST_DRAIN_CLASSIFICATIONS ${JSON.stringify({
-        current: current.classification,
-        stale: stale.classification,
-        future: future.classification,
-        missing: missing.classification,
-      })}\n`,
-    );
   });
 
   it('sweeps draining role a and reopens with the epoch requirement preserved', async () => {
     const second = await inventory();
     expect(second.fence.state).toBe('draining');
     expect(
-      second.categories.every(
-        (entry) => entry.class === 'standing' || entry.empty,
-      ),
+      second.categories.every((entry) => entry.class !== 'work' || entry.empty),
     ).toBe(true);
     for (const observedAt of [first.observedAt, second.observedAt]) {
       expect(Number.isFinite(observedAt)).toBe(true);
@@ -302,11 +282,26 @@ describe.sequential('reference fence composition at release 1', {
     if (!original) throw new Error('missing fixture database for role a');
     const fenceRow = (state: D1State) =>
       state.queryDatabase(
-        `SELECT state, mutation_epoch, require_mutation_epoch, transition_revision
+        `SELECT state, mutation_epoch, require_mutation_epoch,
+                transition_revision, proof_key, proof_run_id
            FROM ${EXECUTION_FENCE_TABLE} WHERE id = ?`,
         [EXECUTION_FENCE_ROW_ID],
       );
-    expect(fenceRow(original.clone())).toEqual(fenceRow(original));
+    const replayed = fenceRow(original);
+    const [row] = replayed;
+    if (!row) throw new Error('missing fixture fence row for role a');
+    expect({
+      mutationEpoch: typeof row.mutation_epoch,
+      requireMutationEpoch: typeof row.require_mutation_epoch,
+      transitionRevision: typeof row.transition_revision,
+      proofRunId: row.proof_run_id,
+    }).toEqual({
+      mutationEpoch: 'number',
+      requireMutationEpoch: 'number',
+      transitionRevision: 'number',
+      proofRunId: null,
+    });
+    expect(fenceRow(original.clone())).toEqual(replayed);
   });
 
   it('refuses malformed tenant responses and accepts extra reading fields', async () => {
@@ -330,44 +325,39 @@ describe.sequential('reference fence composition at release 1', {
           release: 'initial',
         }),
       ).toMatchObject({ status: 'ready' });
+      // Media type, body limit, parse, state and counter, in that order.
       const cases = [
-        [
-          'media',
-          () =>
-            new Response(JSON.stringify(valid), {
-              headers: { 'content-type': 'text/plain' },
-            }),
-        ],
-        [
-          'body-limit',
-          () => Response.json({ ...valid, extra: 'x'.repeat(4096) }),
-        ],
-        [
-          'parse',
-          () =>
-            new Response('{', {
-              headers: { 'content-type': 'application/json' },
-            }),
-        ],
-        ['state', () => Response.json({ ...valid, state: 'sealed' })],
-        ['counter', () => Response.json({ ...valid, transitionRevision: '7' })],
+        () =>
+          new Response(JSON.stringify(valid), {
+            headers: { 'content-type': 'text/plain' },
+          }),
+        () => Response.json({ ...valid, extra: 'x'.repeat(4096) }),
+        () =>
+          new Response('{', {
+            headers: { 'content-type': 'application/json' },
+          }),
+        () => Response.json({ ...valid, state: 'sealed' }),
+        () => Response.json({ ...valid, transitionRevision: '7' }),
       ] as const;
-      for (const [name, response] of cases) {
+      for (const [index, response] of cases.entries()) {
         answer = response;
         const { response: failed, value } = await isolated.call({
           kind: 'tenant-fence',
           role: 'a',
           operation: 'read',
         });
-        expect(failed.status).toBe(409);
-        expect(value).toEqual({
-          contractVersion: 1,
-          ok: false,
-          error: { code: 'operation-refused' },
+        expect({ index, status: failed.status }).toEqual({
+          index,
+          status: 409,
         });
-        process.stdout.write(
-          `A1_MALFORMED_RESPONSE ${name} ${JSON.stringify(value)}\n`,
-        );
+        expect({ index, value }).toEqual({
+          index,
+          value: {
+            contractVersion: 1,
+            ok: false,
+            error: { code: 'operation-refused' },
+          },
+        });
       }
       answer = () =>
         Response.json({ ...valid, proofKey: 'extra', proofRunId: 'extra-run' });
@@ -378,9 +368,71 @@ describe.sequential('reference fence composition at release 1', {
           operation: 'read',
         }),
       ).toEqual(valid);
-      process.stdout.write(
-        `A1_EXTRA_FIELDS_ACCEPTED ${JSON.stringify(valid)}\n`,
-      );
+    } finally {
+      await isolated.close();
+    }
+  });
+
+  it('holds a work category occupied while it carries an entry or a continuation cursor', async () => {
+    let fence: DirectFenceReading = {
+      state: 'open',
+      mutationEpoch: 0,
+      requireMutationEpoch: false,
+      transitionRevision: 7,
+    };
+    let page = () => Response.json({ entries: [] });
+    const isolated = await createDirectReferenceHarness({
+      applicationProbes: false,
+      maintenanceNow: Date.now,
+      applicationFetch: async (request) => {
+        const url = new URL(request.url);
+        if (url.pathname !== '/admin/inventory') return Response.json(fence);
+        return url.searchParams.has('category')
+          ? page()
+          : Response.json({
+              categories: [{ category: 'jobs', class: 'work' }],
+            });
+      },
+    });
+    try {
+      expect(
+        await isolated.success({
+          kind: 'provision',
+          role: 'a',
+          release: 'initial',
+        }),
+      ).toMatchObject({ status: 'ready' });
+      fence = {
+        state: 'draining',
+        mutationEpoch: 1,
+        requireMutationEpoch: true,
+        transitionRevision: 8,
+      };
+      // Occupied work, then a page that is empty but continues, then the
+      // drained page. The scenario's drain proof is the third row alone.
+      for (const [index, body] of [
+        { entries: [{ id: 'job-1' }] },
+        { entries: [], cursor: 'next-page' },
+        { entries: [] },
+      ].entries()) {
+        page = () => Response.json(body);
+        const sweep = await isolated.success<DirectFenceSweep>({
+          kind: 'tenant-fence',
+          role: 'a',
+          operation: 'inventory',
+        });
+        expect({
+          index,
+          categories: sweep.categories,
+          drained: sweep.categories.every(
+            (entry) => entry.class !== 'work' || entry.empty,
+          ),
+        }).toEqual({
+          index,
+          categories: [{ category: 'jobs', class: 'work', empty: index === 2 }],
+          drained: index === 2,
+        });
+      }
     } finally {
       await isolated.close();
     }

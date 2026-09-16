@@ -8,19 +8,28 @@ import { fileURLToPath } from 'node:url';
 import { runInNewContext } from 'node:vm';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DirectBootstrapError } from '../scripts/direct-credentialed-bootstrap.mjs';
+import * as directRuntime from '../scripts/direct-credentialed-conformance-runtime.mjs';
 import {
+  DIRECT_ADMISSION_VARIABLES,
   DIRECT_CONFORMANCE_USAGE,
+  DIRECT_CREDENTIAL_VARIABLES,
   DIRECT_FIXED_OUTPUT,
   DIRECT_INTERNAL_ERROR_DIAGNOSTIC,
   DIRECT_OUTPUT_PREFIX,
   DIRECT_USAGE_DIAGNOSTIC,
   type DirectConformanceMode,
   type DirectConformanceModules,
+  directWritesStderr,
   parseDirectConformanceArgs,
   resolveDirectExitCode,
   runDirectConformance,
 } from '../scripts/direct-credentialed-conformance-runtime.mjs';
+import {
+  DIRECT_EVIDENCE_KEYS,
+  DirectEvidenceWriteError,
+} from '../scripts/direct-credentialed-evidence.mjs';
 import type { DirectInvocationClient } from '../scripts/direct-credentialed-invocation.mjs';
+import { validateProviderAuth } from '../scripts/direct-credentialed-provider.mjs';
 import {
   DIRECT_RUN_MAX_RESUME_COUNT,
   type DirectRunSnapshot,
@@ -45,9 +54,6 @@ vi.mock('cloudflare', async (importOriginal) => {
     default: class extends actual.default {
       constructor(options: ConstructorParameters<typeof actual.default>[0]) {
         probes.sdk(options);
-        expect(process.env.CLOUDFLARE_CUSTOM_HEADERS).toBeUndefined();
-        expect(process.env.CLOUDFLARE_LOG).toBeUndefined();
-        expect(process.env.CLOUDFLARE_BASE_URL).toBeUndefined();
         super(options);
       }
     },
@@ -60,25 +66,23 @@ const env = {
   FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET: 'private-invoke-seed',
 };
 const now = () => Date.parse('2026-09-13T00:00:00.000Z');
+/** The bytes the entry writes to each descriptor for an in-process result. */
+function streamsOf(result: Awaited<ReturnType<typeof runDirectConformance>>) {
+  return {
+    stdout: result.stdoutLine ?? '',
+    stderr: directWritesStderr(result) ? (result.stderrLine ?? '') : '',
+  };
+}
 function expectCredentialSafeOutput(
   result:
     | Awaited<ReturnType<typeof runDirectConformance>>
-    | {
-        code: number | null;
-        stdout: string;
-        stderr: string;
-        transcript: string;
-      },
+    | { code: number | null; stdout: string; stderr: string },
   credentials: Readonly<Record<string, string | undefined>> = env,
 ) {
-  const stdout = 'stdout' in result ? result.stdout : (result.stdoutLine ?? '');
-  const stderr =
-    'stderr' in result
-      ? result.stderr
-      : result.exitCode !== 0 && result.exitCode !== 3
-        ? (result.stderrLine ?? '')
-        : '';
   if ('stdoutLine' in result) {
+    // Total rendering: only a stderr-only refusal withholds the stdout summary,
+    // so a result that would print nothing at all fails here.
+    expect(result.stdoutLine === null).toBe(result.stderrOnly === true);
     if (result.stdoutLine !== null) {
       expect(result.stdoutLine.startsWith(DIRECT_OUTPUT_PREFIX)).toBe(true);
       expect(result.stdoutLine.endsWith('\n')).toBe(true);
@@ -92,22 +96,19 @@ function expectCredentialSafeOutput(
     }
     if (result.stderrOnly) {
       expect(result.exitCode).toBe(2);
-      expect(result.stdoutLine).toBeNull();
       if (result.stderrLine !== null)
         expect(DIRECT_FIXED_OUTPUT).toContain(result.stderrLine);
     }
   }
-  const transcript =
-    'transcript' in result ? result.transcript : stdout + stderr;
-  for (const variable of [
-    'CLOUDFLARE_API_TOKEN',
-    'FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET',
-  ]) {
+  // One discriminant for the whole helper, and one check per descriptor.
+  const { stdout, stderr } =
+    'stdoutLine' in result ? streamsOf(result) : result;
+  for (const variable of DIRECT_CREDENTIAL_VARIABLES) {
     const credential = credentials[variable];
     if (typeof credential !== 'string' || credential.length === 0) continue;
-    expect(transcript.includes(credential)).toBe(false);
-    if ('stderrLine' in result)
-      expect(result.stderrLine?.includes(credential) ?? false).toBe(false);
+    // Either descriptor order, because a reader interleaves two pipes.
+    expect((stdout + stderr).includes(credential)).toBe(false);
+    expect((stderr + stdout).includes(credential)).toBe(false);
   }
   return { stdout, stderr };
 }
@@ -116,6 +117,25 @@ afterEach(async () => {
   vi.clearAllMocks();
   await cleanupDirectRunState();
 });
+const NO_RETAINED_IDENTITIES = {
+  fleetUuid: null,
+  quotaUuid: null,
+  exportBucket: null,
+  scriptName: null,
+  activeVersionId: null,
+};
+/**
+ * The invalid-input diagnostic for `variable`, in one place rather than per
+ * test. `freezes complete fixed output lines from the emitted constants` checks
+ * it against the CLI's own list for every admission variable.
+ */
+function invalidInputLine(variable: string) {
+  return `${JSON.stringify({ code: 'invalid-input', variable })}\n`;
+}
+/** Reads the credentials the real runtime reads, so the entry's guard is armed. */
+function armGuard(input: { env: Record<string, string | undefined> }) {
+  for (const variable of DIRECT_CREDENTIAL_VARIABLES) void input.env[variable];
+}
 
 async function world(fleetUuid?: string) {
   const f = await fixture(1000);
@@ -159,7 +179,11 @@ async function world(fleetUuid?: string) {
   const modules = {
     preflight: vi.fn(async () => f.prepared),
     openRunState: vi.fn(async () => journal),
-    inspectRunState: vi.fn(async () => ({ snapshot, close: journal.close })),
+    inspectRunState: vi.fn(async () => ({
+      directory: actual.directory,
+      snapshot,
+      close: journal.close,
+    })),
     bootstrap: vi.fn<DirectConformanceModules['bootstrap']>(
       async () => ({}) as DirectInvocationClient,
     ),
@@ -169,13 +193,7 @@ async function world(fleetUuid?: string) {
     teardown: vi.fn<DirectConformanceModules['teardown']>(async () => ({
       status: 'cleaned',
       facts: {
-        retainedIdentities: {
-          fleetUuid: null,
-          quotaUuid: null,
-          exportBucket: null,
-          scriptName: null,
-          activeVersionId: null,
-        },
+        retainedIdentities: NO_RETAINED_IDENTITIES,
         receipts: maximalTeardown().receipts,
         residual: null,
         providerRequests: 7,
@@ -221,13 +239,7 @@ function retained(
       reason,
       phase: 'refused',
       facts: {
-        retainedIdentities: {
-          fleetUuid: null,
-          quotaUuid: null,
-          exportBucket: null,
-          scriptName: null,
-          activeVersionId: null,
-        },
+        retainedIdentities: NO_RETAINED_IDENTITIES,
         receipts: teardownState().receipts,
         residual: null,
         providerRequests: 9,
@@ -240,6 +252,19 @@ function retained(
 const entry = fileURLToPath(
   new URL('../scripts/direct-credentialed-conformance.mjs', import.meta.url),
 );
+/**
+ * One run directory holding one `--import` module, for the spawned entry tests.
+ * A module that writes back into the directory receives it.
+ */
+async function preloaded(source: string | ((directory: string) => string)) {
+  const f = await fixture();
+  const preload = join(f.directory, 'preload.mjs');
+  await writeFile(
+    preload,
+    typeof source === 'string' ? source : source(f.directory),
+  );
+  return { f, preload };
+}
 async function child(
   command: string,
   args: string[],
@@ -254,22 +279,19 @@ async function child(
   });
   let stdout = '';
   let stderr = '';
-  let transcript = '';
   spawned.stdout.setEncoding('utf8');
   spawned.stderr.setEncoding('utf8');
   spawned.stdout.on('data', (chunk) => {
     stdout += chunk;
-    transcript += chunk;
   });
   spawned.stderr.on('data', (chunk) => {
     stderr += chunk;
-    transcript += chunk;
   });
   const code = await new Promise<number | null>((resolve, reject) => {
     spawned.once('error', reject);
     spawned.once('close', resolve);
   });
-  const result = { code, stdout, stderr, transcript };
+  const result = { code, stdout, stderr };
   expectCredentialSafeOutput(result, readCredentials);
   return result;
 }
@@ -279,20 +301,19 @@ async function entryWithRuntime(
   credentials: Record<string, string | undefined>,
   reenterStderr = false,
 ) {
-  const result = {
-    code: null as number | null,
-    stdout: '',
-    stderr: '',
-    transcript: '',
-  };
+  const result = { code: null as number | null, stdout: '', stderr: '' };
   const handlers = new Map<string, () => void>();
   const source = await readFile(entry, 'utf8');
-  runInNewContext(source.replace(/^import \{[\s\S]*?\} from '[^']+';/m, ''), {
-    parseDirectConformanceArgs,
-    resolveDirectExitCode,
+  // The harness evaluates the entry with its imports supplied as context. A
+  // strip that stopped matching would evaluate a different program, so the
+  // removal is checked rather than assumed, and the names come from the real
+  // module namespace so they cannot drift from the entry's import list.
+  const stripped = source.replace(/^import \{[\s\S]*?\} from '[^']+';\n/m, '');
+  expect(stripped).not.toBe(source);
+  expect(stripped).not.toMatch(/^\s*import\b/mu);
+  runInNewContext(stripped, {
+    ...directRuntime,
     runDirectConformance: run,
-    DIRECT_INTERNAL_ERROR_DIAGNOSTIC,
-    DIRECT_USAGE_DIAGNOSTIC,
     process: {
       argv: ['node', entry, '--run'],
       env: credentials,
@@ -303,13 +324,11 @@ async function entryWithRuntime(
       stdout: {
         write: (line: string) => {
           result.stdout += line;
-          result.transcript += line;
         },
       },
       stderr: {
         write: (line: string) => {
           result.stderr += line;
-          result.transcript += line;
           if (reenterStderr) {
             reenterStderr = false;
             handlers.get('unhandledRejection')?.();
@@ -339,6 +358,13 @@ describe.sequential('direct CLI runtime', () => {
     ]);
     expect(DIRECT_FIXED_OUTPUT).toContain(DIRECT_USAGE_DIAGNOSTIC);
     expect(DIRECT_FIXED_OUTPUT).toContain(DIRECT_INTERNAL_ERROR_DIAGNOSTIC);
+    // Membership derived from the emitted constants rather than copied: every
+    // admission variable contributes its diagnostic, and nothing else does.
+    for (const variable of DIRECT_ADMISSION_VARIABLES)
+      expect(DIRECT_FIXED_OUTPUT).toContain(invalidInputLine(variable));
+    expect(
+      DIRECT_FIXED_OUTPUT.filter((line) => line.includes('invalid-input')),
+    ).toEqual(DIRECT_ADMISSION_VARIABLES.map(invalidInputLine));
   });
 
   it.each([
@@ -356,14 +382,17 @@ describe.sequential('direct CLI runtime', () => {
     'variable',
   ])('refuses a fixed-output credential with a safe fixed diagnostic or silence (%s)', async (secret) => {
     const f = await fixture(680);
-    for (const variable of [
-      'CLOUDFLARE_API_TOKEN',
-      'FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET',
-    ]) {
+    // The refusal under test is the fixed-output collision, not the guard
+    // beside it: every table value is a token this row's sibling admits.
+    expect(() => validateProviderAuth(secret)).not.toThrow();
+    expect(DIRECT_FIXED_OUTPUT.some((line) => line.includes(secret))).toBe(
+      true,
+    );
+    for (const variable of DIRECT_CREDENTIAL_VARIABLES) {
       const credentials = { ...env, [variable]: secret };
       const distPresent = vi.fn(() => false);
       const openRunState = vi.fn();
-      const diagnostic = `${JSON.stringify({ code: 'invalid-input', variable })}\n`;
+      const diagnostic = invalidInputLine(variable);
       const stderrLine = diagnostic.includes(secret) ? null : diagnostic;
       const result = await runDirectConformance({
         mode: 'run',
@@ -461,7 +490,6 @@ describe.sequential('direct CLI runtime', () => {
       code: 2,
       stdout: '',
       stderr: '',
-      transcript: '',
     });
     expect(existsSync(f.base)).toBe(false);
   });
@@ -481,12 +509,8 @@ describe.sequential('direct CLI runtime', () => {
       code: 2,
       stdout: '',
       stderr: DIRECT_USAGE_DIAGNOSTIC,
-      transcript: DIRECT_USAGE_DIAGNOSTIC,
     });
-    const f = await fixture();
-    const preload = join(f.directory, 'preload.mjs');
-    await writeFile(
-      preload,
+    const { preload } = await preloaded(
       `setTimeout(() => { throw new Error('secret-stack'); }, 0);\n`,
     );
     const failure = await child(
@@ -500,7 +524,6 @@ describe.sequential('direct CLI runtime', () => {
       code: 1,
       stdout: '',
       stderr: DIRECT_USAGE_DIAGNOSTIC + DIRECT_INTERNAL_ERROR_DIAGNOSTIC,
-      transcript: DIRECT_USAGE_DIAGNOSTIC + DIRECT_INTERNAL_ERROR_DIAGNOSTIC,
     });
   });
 
@@ -508,10 +531,7 @@ describe.sequential('direct CLI runtime', () => {
     'CLOUDFLARE_API_TOKEN',
     'FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET',
   ] as const)('drops a later rejection diagnostic when %s spans consecutive stderr lines', async (variable) => {
-    const f = await fixture();
-    const preload = join(f.directory, 'preload.mjs');
-    await writeFile(
-      preload,
+    const { f, preload } = await preloaded(
       `const write = process.stderr.write.bind(process.stderr);
 process.stderr.write = (...args) => {
   const result = write(...args);
@@ -531,7 +551,7 @@ process.stderr.write = (...args) => {
       undefined,
       credentials,
     );
-    const refusal = `${JSON.stringify({ code: 'invalid-input', variable })}\n`;
+    const refusal = invalidInputLine(variable);
     expect(refusal).not.toContain(credentials[variable]);
     expect(DIRECT_INTERNAL_ERROR_DIAGNOSTIC).not.toContain(
       credentials[variable],
@@ -543,12 +563,7 @@ process.stderr.write = (...args) => {
       code: 1,
       stdout: '',
       stderr: refusal,
-      transcript: refusal,
     });
-    expect(result.stderr).not.toContain(credentials.CLOUDFLARE_API_TOKEN);
-    expect(result.stderr).not.toContain(
-      credentials.FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET,
-    );
     expect(existsSync(f.base)).toBe(false);
   });
 
@@ -556,8 +571,7 @@ process.stderr.write = (...args) => {
     'CLOUDFLARE_API_TOKEN',
     'FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET',
   ])('drops the stderr copy when %s spans stdout and stderr', async (variable) => {
-    const summary =
-      '{"code":"invalid-input","variable":"FLEET_DIRECT_CONFORMANCE_CONFIG"}\n';
+    const summary = invalidInputLine('FLEET_DIRECT_CONFORMANCE_CONFIG');
     const stdout = `${DIRECT_OUTPUT_PREFIX}${summary}`;
     const secret = 'CONFIG"}\n{"code"';
     expect(stdout).not.toContain(secret);
@@ -565,8 +579,7 @@ process.stderr.write = (...args) => {
     expect(stdout + summary).toContain(secret);
     const result = await entryWithRuntime(
       async (input) => {
-        void input.env.CLOUDFLARE_API_TOKEN;
-        void input.env.FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET;
+        armGuard(input);
         return {
           exitCode: 2,
           summary: JSON.parse(summary),
@@ -577,7 +590,7 @@ process.stderr.write = (...args) => {
       },
       { ...env, [variable]: secret },
     );
-    expect(result).toEqual({ code: 2, stdout, stderr: '', transcript: stdout });
+    expect(result).toEqual({ code: 2, stdout, stderr: '' });
   });
 
   it.each([
@@ -590,11 +603,11 @@ process.stderr.write = (...args) => {
     );
     const summary = { names: { worker: secret } };
     const stderrLine = `${JSON.stringify(summary)}\n`;
+    let observedMode: unknown;
     const result = await entryWithRuntime(
       async (input) => {
-        expect(input.mode).toBe('run');
-        void input.env.CLOUDFLARE_API_TOKEN;
-        void input.env.FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET;
+        observedMode = input.mode;
+        armGuard(input);
         return {
           exitCode: 0,
           summary,
@@ -605,16 +618,79 @@ process.stderr.write = (...args) => {
       },
       { ...env, [variable]: secret },
     );
-    expect(result).toEqual({ code: 5, stdout: '', stderr: '', transcript: '' });
+    expect(observedMode).toBe('run');
+    expect(result).toEqual({ code: 5, stdout: '', stderr: '' });
+  });
+
+  it.each(
+    DIRECT_CREDENTIAL_VARIABLES,
+  )('drops the stderr copy when %s spans stderr before stdout', async (variable) => {
+    const stderrLine = '{"a":"Y"}\n';
+    const stdoutLine = `${DIRECT_OUTPUT_PREFIX}{"a":"X"}\n`;
+    const secret = 'Y"}\nDIRECT';
+    // The credential spans only the reverse boundary: a reader that takes
+    // stderr before stdout sees it, the writer's own order never does.
+    expect(stdoutLine + stderrLine).not.toContain(secret);
+    expect(stderrLine + stdoutLine).toContain(secret);
+    const result = await entryWithRuntime(
+      async (input) => {
+        armGuard(input);
+        return {
+          exitCode: 1,
+          summary: JSON.parse(stderrLine),
+          evidencePath: null,
+          stdoutLine,
+          stderrLine,
+        };
+      },
+      { ...env, [variable]: secret },
+    );
+    expect(result).toEqual({ code: 1, stdout: stdoutLine, stderr: '' });
+  });
+
+  it.each([
+    // A key name the projection writes, and the index an array element carries.
+    'retainedIdentities',
+    '1',
+  ])('refuses the evidence artifact key %s as a credential before the run starts', async (secret) => {
+    expect(DIRECT_FIXED_OUTPUT.some((line) => line.includes(secret))).toBe(
+      false,
+    );
+    expect(() => validateProviderAuth(secret)).not.toThrow();
+    for (const variable of DIRECT_CREDENTIAL_VARIABLES) {
+      const f = await fixture(1000);
+      const openRunState = vi.fn();
+      const result = await runDirectConformance({
+        mode: 'run',
+        configPath: f.configPath,
+        env: { ...env, [variable]: secret },
+        now,
+        modules: { openRunState, preflight: async () => f.prepared },
+      });
+      expect(result).toMatchObject({
+        exitCode: 2,
+        summary: { code: 'invalid-input', variable },
+        stderrLine: invalidInputLine(variable),
+        stderrOnly: true,
+      });
+      expectCredentialSafeOutput(result, { ...env, [variable]: secret });
+      expect(openRunState).not.toHaveBeenCalled();
+      expect(existsSync(f.base)).toBe(false);
+    }
+  });
+
+  it('names every evidence artifact key in the admission vocabulary', () => {
+    expect(DIRECT_EVIDENCE_KEYS).toContain('retainedIdentities');
+    expect(DIRECT_EVIDENCE_KEYS.every((key) => /^[\w.-]+$/u.test(key))).toBe(
+      true,
+    );
   });
 
   it('reserves transcript bytes before a synchronous diagnostic re-enters the guard', async () => {
-    const stderrLine =
-      '{"code":"invalid-input","variable":"CLOUDFLARE_API_TOKEN"}\n';
+    const stderrLine = invalidInputLine('CLOUDFLARE_API_TOKEN');
     const result = await entryWithRuntime(
       async (input) => {
-        void input.env.CLOUDFLARE_API_TOKEN;
-        void input.env.FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET;
+        armGuard(input);
         return {
           exitCode: 2,
           summary: JSON.parse(stderrLine),
@@ -631,7 +707,6 @@ process.stderr.write = (...args) => {
       code: 1,
       stdout: '',
       stderr: stderrLine,
-      transcript: stderrLine,
     });
   });
 
@@ -642,67 +717,85 @@ process.stderr.write = (...args) => {
       { ...env, FLEET_DIRECT_CONFORMANCE_CONFIG: f.configPath },
       {
         get(target, key) {
-          if (
-            key === 'CLOUDFLARE_API_TOKEN' ||
-            key === 'FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET'
-          )
-            reads.push(key);
+          if (DIRECT_CREDENTIAL_VARIABLES.includes(key as string))
+            reads.push(key as string);
           return Reflect.get(target, key);
         },
       },
     );
+    // The two observations the entry's own callbacks would swallow are
+    // captured here and asserted after the call completes.
+    let readsAtPreflight: string[] | undefined;
+    let readsAfterRun: string[] | undefined;
     const result = await entryWithRuntime(async (input) => {
       const result = await runDirectConformance({
         ...input,
         modules: {
           preflight: async () => {
-            expect(reads).toEqual([]);
+            readsAtPreflight = [...reads];
             return f.prepared;
           },
           distPresent: () => false,
         },
       });
-      expect(reads).toEqual([
-        'CLOUDFLARE_API_TOKEN',
-        'FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET',
-      ]);
+      readsAfterRun = [...reads];
       return result;
     }, credentials);
+    expect(readsAtPreflight).toEqual([]);
+    expect(readsAfterRun).toEqual([...DIRECT_CREDENTIAL_VARIABLES]);
     expect(result.code).toBe(2);
     expect(result.stdout).toContain('dist-missing');
     expect(existsSync(f.base)).toBe(false);
   });
 
-  it('returns null stderr for an unknown admission variable', async () => {
+  it('arms the entry guard for a live refusal returned before the credential read', async () => {
+    const credentials = {
+      CLOUDFLARE_ACCOUNT_ID: 'account',
+      CLOUDFLARE_API_TOKEN: 'FLEET_DIRECT_CONFORMANCE_CONFIG',
+      FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET: 'private-invoke-seed',
+    };
+    const withheld = await child(
+      process.execPath,
+      [entry, '--run'],
+      undefined,
+      credentials,
+    );
+    expect(withheld).toEqual({
+      code: 5,
+      stdout: '',
+      stderr: '',
+    });
+    const line = invalidInputLine('FLEET_DIRECT_CONFORMANCE_CONFIG');
+    const printed = await child(process.execPath, [entry, '--run'], undefined, {
+      ...credentials,
+      CLOUDFLARE_API_TOKEN: 'private-api-seed',
+    });
+    expect(printed.code).toBe(2);
+    expect(printed.stdout).toBe(`${DIRECT_OUTPUT_PREFIX}${line}`);
+    expect(printed.stderr).toBe(line);
+  });
+
+  it.each(
+    DIRECT_ADMISSION_VARIABLES,
+  )('emits the diagnostic of the loop that refused %s', async (variable) => {
     const f = await fixture();
-    const parse = JSON.parse;
-    const decode = vi
-      .spyOn(JSON, 'parse')
-      .mockImplementation((text, reviver) => {
-        const decoded = parse(text, reviver);
-        if (decoded?.code === 'invalid-input')
-          return { ...decoded, variable: 'UNKNOWN_VARIABLE' };
-        return decoded;
-      });
-    try {
-      const result = await runDirectConformance({
-        mode: 'run',
-        configPath: f.configPath,
-        env: { ...env, CLOUDFLARE_API_TOKEN: '' },
-        modules: { preflight: async () => f.prepared },
-      });
-      expect(result).toEqual({
-        exitCode: 2,
-        summary: { code: 'invalid-input', variable: 'UNKNOWN_VARIABLE' },
-        evidencePath: null,
-        stdoutLine: null,
-        stderrLine: null,
-        stderrOnly: true,
-      });
-      expectCredentialSafeOutput(result, { ...env, CLOUDFLARE_API_TOKEN: '' });
-    } finally {
-      decode.mockRestore();
-    }
+    const result = await runDirectConformance({
+      mode: 'run',
+      configPath: f.configPath,
+      env: { ...env, [variable]: '' },
+      modules: { preflight: async () => f.prepared },
+    });
+    // The line travels with the refusal, so it names the variable the loop
+    // refused whatever a decoded summary says.
+    expect(result).toEqual({
+      exitCode: 2,
+      summary: { code: 'invalid-input', variable },
+      evidencePath: null,
+      stdoutLine: null,
+      stderrLine: invalidInputLine(variable),
+      stderrOnly: true,
+    });
+    expectCredentialSafeOutput(result, { ...env, [variable]: '' });
   });
 
   it('resolves terminal exit codes with evidence failure before internal error and stable ties', () => {
@@ -728,10 +821,7 @@ process.stderr.write = (...args) => {
     'Promise.reject(new Error("secret-stack"))',
     'throw new Error("secret-stack")',
   ])('prints help and a later timer error with noncolliding credentials (%s)', async (failure) => {
-    const f = await fixture();
-    const preload = join(f.directory, 'preload.mjs');
-    await writeFile(
-      preload,
+    const { preload } = await preloaded(
       `const write = process.stdout.write.bind(process.stdout);
 process.stdout.write = (...args) => {
   const result = write(...args);
@@ -750,14 +840,10 @@ process.stdout.write = (...args) => {
       `${DIRECT_OUTPUT_PREFIX}${JSON.stringify({ usage: DIRECT_CONFORMANCE_USAGE })}\n`,
     );
     expect(result.stderr).toBe('{"code":"internal-error"}\n');
-    expect(result.transcript).toBe(result.stdout + result.stderr);
   });
 
   it('preserves an internal error when help completion subsequently sets its exit code', async () => {
-    const f = await fixture();
-    const preload = join(f.directory, 'preload.mjs');
-    await writeFile(
-      preload,
+    const { preload } = await preloaded(
       `const write = process.stdout.write.bind(process.stdout);
 process.stdout.write = (...args) => {
   process.emit('unhandledRejection', new Error('secret-stack'));
@@ -809,31 +895,38 @@ process.stdout.write = (...args) => {
     'CLOUDFLARE_API_TOKEN',
     'FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET',
     undefined,
-  ])('prints exact help without reading credentials (%s)', async (variable) => {
-    const f = await fixture();
-    const preload = join(f.directory, 'preload.mjs');
-    const readsPath = join(f.directory, 'reads.json');
-    await writeFile(
-      preload,
-      `import { writeFileSync } from 'node:fs';
+  ])('prints exact help without reading credentials or configuration (%s)', async (variable) => {
+    const probed = [
+      ...DIRECT_CREDENTIAL_VARIABLES,
+      'FLEET_DIRECT_CONFORMANCE_CONFIG',
+    ];
+    const { f, preload } = await preloaded((directory) => {
+      const path = JSON.stringify(join(directory, 'reads.json'));
+      return `import { writeFileSync } from 'node:fs';
 const reads = [];
 process.env = new Proxy(process.env, {
   get(target, key) {
-    if (['CLOUDFLARE_API_TOKEN', 'FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET'].includes(key)) reads.push(key);
+    if (${JSON.stringify(probed)}.includes(key)) reads.push(key);
     return Reflect.get(target, key);
   },
 });
-process.on('exit', () => writeFileSync(${JSON.stringify(readsPath)}, JSON.stringify(reads)));\n`,
-    );
+process.on('exit', () => writeFileSync(${path}, JSON.stringify(reads)));\n`;
+    });
+    const readsPath = join(f.directory, 'reads.json');
     const result = await child(
       process.execPath,
       ['--import', preload, entry, '--help'],
       undefined,
-      variable ? { [variable]: 'DIRECT_CONFORMANCE' } : {},
+      {
+        ...(variable ? { [variable]: 'DIRECT_CONFORMANCE' } : {}),
+        FLEET_DIRECT_CONFORMANCE_CONFIG: f.configPath,
+      },
       {},
     );
     const stdout = `${DIRECT_OUTPUT_PREFIX}${JSON.stringify({ usage: DIRECT_CONFORMANCE_USAGE })}\n`;
-    expect(result).toEqual({ code: 0, stdout, stderr: '', transcript: stdout });
+    expect(result).toEqual({ code: 0, stdout, stderr: '' });
+    // Help is exempt from both reads in the same expression: the credentials
+    // and the configuration path.
     expect(JSON.parse(await readFile(readsPath, 'utf8'))).toEqual([]);
     expect(existsSync(f.base)).toBe(false);
   });
@@ -842,13 +935,10 @@ process.on('exit', () => writeFileSync(${JSON.stringify(readsPath)}, JSON.string
     'CLOUDFLARE_API_TOKEN',
     'FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET',
   ])('prints local preflight without reading colliding %s', async (variable) => {
-    const f = await fixture();
-    const preload = join(f.directory, 'preload.mjs');
-    await writeFile(
-      preload,
+    const { f, preload } = await preloaded(
       `process.env = new Proxy(process.env, {
   get(target, key) {
-    if (['CLOUDFLARE_API_TOKEN', 'FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET'].includes(key)) throw new Error('credential-read');
+    if (${JSON.stringify(DIRECT_CREDENTIAL_VARIABLES)}.includes(key)) throw new Error('credential-read');
     return Reflect.get(target, key);
   },
 });\n`,
@@ -887,10 +977,6 @@ process.on('exit', () => writeFileSync(${JSON.stringify(readsPath)}, JSON.string
     expectCredentialSafeOutput(result, {});
     const expected = `${DIRECT_OUTPUT_PREFIX}${JSON.stringify({ usage: DIRECT_CONFORMANCE_USAGE })}\n`;
     expect(result.stdoutLine).toBe(expected);
-    const spawned = await child(process.execPath, [entry, '--help']);
-    expect(spawned.code).toBe(0);
-    expect(spawned.stdout).toBe(expected);
-    expect(spawned.stderr).toBe('');
   });
 
   it.each([
@@ -1001,7 +1087,7 @@ process.on('exit', () => writeFileSync(${JSON.stringify(readsPath)}, JSON.string
     ]);
     expect(result.code).toBe(1);
     expect(result.stderr).toBe(
-      '{"code":"invalid-input","variable":"FLEET_DIRECT_CONFORMANCE_CONFIG"}\n' +
+      invalidInputLine('FLEET_DIRECT_CONFORMANCE_CONFIG') +
         DIRECT_INTERNAL_ERROR_DIAGNOSTIC,
     );
     expect(result.stderr).not.toContain('secret-stack');
@@ -1026,13 +1112,7 @@ process.on('exit', () => writeFileSync(${JSON.stringify(readsPath)}, JSON.string
     expect(result.summary).toMatchObject({
       status: 'cleaned',
       teardownCall: null,
-      retainedIdentities: {
-        fleetUuid: null,
-        quotaUuid: null,
-        exportBucket: null,
-        scriptName: null,
-        activeVersionId: null,
-      },
+      retainedIdentities: NO_RETAINED_IDENTITIES,
     });
   });
 
@@ -1359,10 +1439,11 @@ process.on('exit', () => writeFileSync(${JSON.stringify(readsPath)}, JSON.string
   });
 
   it.each([
-    [2, `Bearer ${'x'.repeat(6993)}`],
-    [1, env.FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET],
-  ] as const)('prints the inspected preflight bytes when toJSON changes after %s safe serializations', async (safeSerializations, forbidden) => {
+    `Bearer ${'x'.repeat(6993)}`,
+    env.FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET,
+  ])('prints the one inspected preflight serialization when toJSON later yields %s', async (forbidden) => {
     const f = await fixture();
+    const safeSerializations = 1;
     let serializations = 0;
     const result = await runDirectConformance({
       mode: 'preflight',
@@ -1399,6 +1480,37 @@ process.on('exit', () => writeFileSync(${JSON.stringify(readsPath)}, JSON.string
     expect(result.stdoutLine).not.toContain('Bearer');
   });
 
+  it('refuses a preflight summary whose first serialization yields a forbidden literal', async () => {
+    const f = await fixture();
+    let serializations = 0;
+    const result = await runDirectConformance({
+      mode: 'preflight',
+      configPath: f.configPath,
+      env,
+      modules: {
+        preflight: async () => ({
+          ...f.prepared,
+          names: {
+            ...f.prepared.names,
+            toJSON: () => {
+              serializations += 1;
+              return 'Bearer forbidden';
+            },
+          },
+        }),
+      },
+    });
+    expect(serializations).toBe(1);
+    expect(result.exitCode).toBe(5);
+    expect(result.summary).toMatchObject({
+      code: 'evidence-failed',
+      sentinelClass: 'literal',
+      keyPath: 'names',
+    });
+    expectCredentialSafeOutput(result);
+    expect(result.stdoutLine).not.toContain('Bearer');
+  });
+
   it('prints inspected rawJSON resumeCount bytes without introducing a credential by reserialization', async () => {
     const rawJSON = (JSON as typeof JSON & { rawJSON(text: string): number })
       .rawJSON;
@@ -1425,22 +1537,7 @@ process.on('exit', () => writeFileSync(${JSON.stringify(readsPath)}, JSON.string
     const expected = `${DIRECT_OUTPUT_PREFIX}${JSON.stringify(result.summary).replace('"resumeCount":1000', '"resumeCount":1e3')}\n`;
     expect(result.stdoutLine).toBe(expected);
     expect(result.stderrLine).toBe(expected.slice(DIRECT_OUTPUT_PREFIX.length));
-    const printed = await child(
-      process.execPath,
-      [
-        '-e',
-        'process.stdout.write(process.argv[1])',
-        result.stdoutLine as string,
-      ],
-      undefined,
-      { CLOUDFLARE_API_TOKEN: credentials.CLOUDFLARE_API_TOKEN },
-    );
-    expect(printed).toEqual({
-      code: 0,
-      stdout: expected,
-      stderr: '',
-      transcript: expected,
-    });
+    expect(result.stdoutLine).not.toContain(credentials.CLOUDFLARE_API_TOKEN);
   });
 
   it.each([
@@ -1511,19 +1608,38 @@ process.on('exit', () => writeFileSync(${JSON.stringify(readsPath)}, JSON.string
       },
     });
     expectCredentialSafeOutput(result, {});
-    expect(result.exitCode).toBe(bytes === 4096 ? 0 : 1);
+    // The oversized line is replaced; the preflight keeps the code it resolved.
+    expect(result.exitCode).toBe(0);
     expect(result.stdoutLine).toBe(
       bytes === 4096
         ? expected
         : 'DIRECT_CONFORMANCE {"code":"internal-error"}\n',
     );
-    const printed = await child(process.execPath, [
-      '-e',
-      'process.stdout.write(process.argv[1])',
-      result.stdoutLine as string,
-    ]);
-    expect(printed.stdout).toBe(result.stdoutLine);
-    expect(Buffer.byteLength(printed.stdout)).toBeLessThanOrEqual(4096);
+    expect(Buffer.byteLength(result.stdoutLine as string)).toBeLessThanOrEqual(
+      4096,
+    );
+  });
+
+  it('keeps a failed run exit code when its oversized summary is replaced', async () => {
+    const w = await world();
+    w.set({
+      scenario: completeScenario(),
+      binding: { ...w.snapshot().binding, resourcePrefix: 'p'.repeat(4096) },
+    });
+    w.modules.teardown.mockRejectedValue(new DirectRunStateError());
+    const result = await runDirectConformance({
+      mode: 'resume',
+      configPath: w.f.configPath,
+      env,
+      modules: w.modules,
+      now,
+      git: () => null,
+    });
+    expectCredentialSafeOutput(result);
+    expect(result.stdoutLine).toBe(
+      'DIRECT_CONFORMANCE {"code":"internal-error"}\n',
+    );
+    expect(result.exitCode).toBe(1);
   });
 
   it('bounds a sentinel replacement whose key path exceeds the stdout byte limit', async () => {
@@ -1601,7 +1717,7 @@ process.on('exit', () => writeFileSync(${JSON.stringify(readsPath)}, JSON.string
     expect(result.exitCode).toBe(5);
     expect(result.summary).toEqual({
       code: 'evidence-failed',
-      sentinelClass: 'identity-shape',
+      refusalClass: 'identity-shape',
       keyPath: 'retainedIdentities.fleetUuid',
       evidenceWritten: false,
     });
@@ -1689,6 +1805,83 @@ process.on('exit', () => writeFileSync(${JSON.stringify(readsPath)}, JSON.string
     });
     expect(result.exitCode).toBe(2);
     expectCredentialSafeOutput(result, {});
+  });
+
+  it('reports the publication state when a byte hit collapses a summary without the flag', async () => {
+    const w = await world();
+    w.set({
+      teardown: { ...maximalTeardown(), phase: 'complete', failure: null },
+    });
+    const credentials = { ...env, CLOUDFLARE_API_TOKEN: 'E {"status"' };
+    const parse = JSON.parse;
+    let stripped = false;
+    const decode = vi
+      .spyOn(JSON, 'parse')
+      .mockImplementation((text, reviver) => {
+        const decoded = parse(text, reviver);
+        if (
+          !stripped &&
+          decoded !== null &&
+          typeof decoded === 'object' &&
+          'evidenceWritten' in decoded
+        ) {
+          stripped = true;
+          const { evidenceWritten: _flag, ...rest } = decoded;
+          return rest;
+        }
+        return decoded;
+      });
+    try {
+      const result = await runDirectConformance({
+        mode: 'run',
+        configPath: w.f.configPath,
+        env: credentials,
+        modules: w.modules,
+        now,
+        git: () => null,
+      });
+      expect(stripped).toBe(true);
+      expect(result.exitCode).toBe(5);
+      expect(result.stdoutLine).toBe(
+        'DIRECT_CONFORMANCE {"code":"evidence-failed","evidenceWritten":true}\n',
+      );
+      expect(existsSync(result.evidencePath as string)).toBe(true);
+      expectCredentialSafeOutput(result, credentials);
+    } finally {
+      decode.mockRestore();
+    }
+  });
+
+  it('reports a durability failure after replacement as exit 5 with evidence published', async () => {
+    const w = await world();
+    w.set({
+      teardown: { ...maximalTeardown(), phase: 'complete', failure: null },
+    });
+    const result = await runDirectConformance({
+      mode: 'resume',
+      configPath: w.f.configPath,
+      env,
+      now,
+      git: () => null,
+      modules: {
+        ...w.modules,
+        writeEvidence: async () => {
+          throw new DirectEvidenceWriteError();
+        },
+      },
+    });
+    expectCredentialSafeOutput(result);
+    expect(result).toMatchObject({
+      exitCode: 5,
+      // The artifact replaced its predecessor before the fault, so the run
+      // names the file it published.
+      evidencePath: join(w.journal.directory, 'evidence.json'),
+      summary: { code: 'evidence-failed', evidenceWritten: true },
+    });
+    expect(result.stdoutLine).toBe(
+      'DIRECT_CONFORMANCE {"code":"evidence-failed","evidenceWritten":true}\n',
+    );
+    expect(w.journal.close).toHaveBeenCalledOnce();
   });
 
   it('reports a failed evidence write as exit 5 after closing the journal', async () => {

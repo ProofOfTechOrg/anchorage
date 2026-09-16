@@ -18,7 +18,12 @@ import {
   DIRECT_RESIDUAL_SURFACES,
   DIRECT_TEARDOWN_FAILURES,
   DIRECT_TEARDOWN_MAXIMA,
+  DIRECT_TEARDOWN_RECOVERABLE_FAILURES,
+  REFERENCE_SECRET_NAMES,
+} from './direct-credentialed-reference-vocabulary.mjs';
+import {
   DirectRunStateError,
+  mutationPending,
 } from './direct-credentialed-run-state.mjs';
 
 const ERROR_CODES = new Set(DIRECT_TEARDOWN_FAILURES);
@@ -32,13 +37,14 @@ const PROVIDER_CODES = Object.freeze({
 const SETTLE_DELAY_MS = 3_000;
 const OBJECT_SETTLE_ATTEMPTS = 3;
 const OBJECT_SETTLE_DELAY_MS = 2_000;
-// The reference upload binds exactly these secrets. Teardown asserts the set it
-// observes instead of following whatever the script currently carries.
-const REFERENCE_SECRET_NAMES = Object.freeze([
-  'CLOUDFLARE_API_TOKEN',
-  'DIRECT_DEPLOYMENT_SECRETS',
-  'FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET',
-]);
+// Teardown asserts the set it observes against the set the reference upload
+// binds, sorted because a listing's order is the provider's. Reading the
+// upload's own list makes a bootstrap-side change visible here.
+const EXPECTED_SECRET_NAMES = Object.freeze([...REFERENCE_SECRET_NAMES].sort());
+// Exactly the two receipt objects a complete scenario exports; the journal's
+// `exportObjects` maximum bounds what a record may carry and is not this
+// expectation.
+const CONFIRMED_EXPORT_KEYS = 2;
 const BOOTSTRAP_RECEIPTS = Object.freeze([
   'fleet',
   'quota',
@@ -54,13 +60,6 @@ const EMPTY_RECEIPTS = Object.freeze({
   quota: null,
   exportObjects: Object.freeze([]),
   exports: null,
-});
-const NO_IDENTITIES = Object.freeze({
-  fleetUuid: null,
-  quotaUuid: null,
-  exportBucket: null,
-  scriptName: null,
-  activeVersionId: null,
 });
 const MUTATION_OPTIONS = Object.freeze({ maxRetries: 0 });
 
@@ -157,7 +156,7 @@ function checkedInput(input) {
   }
 }
 
-function survivingIdentities(bootstrap, receipts) {
+export function survivingIdentities(bootstrap, receipts) {
   return Object.freeze({
     fleetUuid: receipts.fleet ? null : (bootstrap?.fleet?.uuid ?? null),
     quotaUuid: receipts.quota ? null : (bootstrap?.quota?.uuid ?? null),
@@ -182,8 +181,7 @@ function confirmedExportKeys(scenario, prefix) {
   add(scenario?.proofs.exports.a);
   add(scenario?.proofs.exports.b);
   for (const proof of scenario?.proofs.exportVerifications ?? []) add(proof);
-  if (keys.length !== DIRECT_TEARDOWN_MAXIMA.exportObjects)
-    refuse('invalid-state');
+  if (keys.length !== CONFIRMED_EXPORT_KEYS) refuse('invalid-state');
   return keys;
 }
 
@@ -198,7 +196,7 @@ export async function teardownDirectReference(input) {
       reason: code,
       phase: 'refused',
       facts: Object.freeze({
-        retainedIdentities: NO_IDENTITIES,
+        retainedIdentities: survivingIdentities(null, EMPTY_RECEIPTS),
         receipts: EMPTY_RECEIPTS,
         residual: null,
         providerRequests: 0,
@@ -254,11 +252,7 @@ export async function teardownDirectReference(input) {
     residual = teardown.residual;
   };
   try {
-    if (
-      snapshot.lastInvocation?.state === 'pending' ||
-      snapshot.bootstrap?.pending
-    )
-      refuse('outcome-unknown');
+    if (mutationPending(snapshot)) refuse('outcome-unknown');
     if (!bootstrap || BOOTSTRAP_RECEIPTS.some((key) => !bootstrap[key]))
       refuse('invalid-state');
     if (phase === 'complete' && teardown.failure === null)
@@ -267,10 +261,15 @@ export async function teardownDirectReference(input) {
     const script = names.referenceWorker;
     const bucket = bootstrap.exports.name;
     const zoneId = bootstrap.context.zoneId;
-    // A recorded refusal is terminal for automation: it never advances into a
-    // deletion phase, whatever the scenario reached afterwards.
+    // A recorded refusal is terminal for automation unless its reason is one a
+    // later run clears: an incomplete scenario, or an invocation or bootstrap
+    // mutation that was pending. The two operands beside it are the
+    // preconditions themselves, so a re-entry advances only once they hold;
+    // an identity mismatch, a forbidden answer and an exhausted budget stay
+    // terminal.
     const refusing =
-      teardown?.phase === 'refused' ||
+      (teardown?.phase === 'refused' &&
+        !DIRECT_TEARDOWN_RECOVERABLE_FAILURES.includes(teardown.failure)) ||
       snapshot.scenario?.phase !== 'complete' ||
       snapshot.scenario.failure !== null;
     const confirmed = refusing
@@ -301,25 +300,32 @@ export async function teardownDirectReference(input) {
           globalCount: disposable ? count : null,
           exhaustive,
         });
+      // A row whose classifying field is unusable is not evidence of absence,
+      // so it refuses here. Databases and buckets reach the same refusal one
+      // step earlier, in the identity and name checks their listings run.
       const matching = (rows, field) =>
         rows
-          .map((row) => row[field])
-          .filter(
-            (value) => typeof value === 'string' && value.startsWith(prefix),
-          );
-      const databaseIdentity = (row) => {
+          .map((row) => {
+            const value = row?.[field];
+            if (typeof value !== 'string') refuse('provider-unavailable');
+            return value;
+          })
+          .filter((value) => value.startsWith(prefix));
+      const listed = (page, field) =>
+        surface(matching(page.rows, field), page.exhaustive, page.rows.length);
+      const databaseRowKeys = (row) => {
         identifier(row.name);
         return [identifier(row.uuid)];
       };
       const databases = await inventory(
         numbered.d1.database.list({ ...selectors, name: prefix }),
-        databaseIdentity,
+        databaseRowKeys,
         bound,
       );
       const allDatabases = disposable
         ? await inventory(
             numbered.d1.database.list(selectors),
-            databaseIdentity,
+            databaseRowKeys,
             bound,
           )
         : [];
@@ -333,7 +339,11 @@ export async function teardownDirectReference(input) {
         sdk,
         selectors,
         jurisdiction: 'default',
+        bound,
       });
+      // Both listings are scoped to the zone the bootstrap recorded, so the
+      // `globalCount` each contributes below covers that zone and not the
+      // account — the scope `bucketJurisdictions` records for the bucket count.
       const domains = await singlePage(
         single.workers.domains.list({ ...selectors, zone_id: zoneId }),
       );
@@ -344,8 +354,10 @@ export async function teardownDirectReference(input) {
       try {
         queues = await singlePage(single.queues.list(selectors));
       } catch (error) {
-        // A 404 states the account carries no queue collection: an empty page
-        // the provider did not attest.
+        // A 404 is read as an account that carries no queue collection. No
+        // provider capture in this repository attests that reading, so the
+        // empty page it stands in for is recorded `exhaustive: false` and the
+        // counts below are this reading rather than a page the provider sent.
         if (!(error instanceof APIError) || error.status !== 404) throw error;
         queues = { rows: [], exhaustive: false };
       }
@@ -401,27 +413,11 @@ export async function teardownDirectReference(input) {
             true,
             namespaces.length,
           ),
-          scripts: surface(
-            matching(scripts.rows, 'id'),
-            scripts.exhaustive,
-            scripts.rows.length,
-          ),
+          scripts: listed(scripts, 'id'),
           buckets: surface(matching(buckets, 'name'), true, buckets.length),
-          domains: surface(
-            matching(domains.rows, 'service'),
-            domains.exhaustive,
-            domains.rows.length,
-          ),
-          routes: surface(
-            matching(routes.rows, 'script'),
-            routes.exhaustive,
-            routes.rows.length,
-          ),
-          queues: surface(
-            matching(queues.rows, 'queue_name'),
-            queues.exhaustive,
-            queues.rows.length,
-          ),
+          domains: listed(domains, 'service'),
+          routes: listed(routes, 'script'),
+          queues: listed(queues, 'queue_name'),
         },
         bucketJurisdictions: ['default'],
         dispatch,
@@ -469,7 +465,8 @@ export async function teardownDirectReference(input) {
       kind,
       key,
       nextPhase,
-      prepare,
+      field,
+      append = false,
       probe,
       identity,
       call,
@@ -479,17 +476,26 @@ export async function teardownDirectReference(input) {
       const pending = teardown?.pending ?? null;
       if (pending && (pending.kind !== kind || pending.key !== key))
         refuse('invalid-state');
+      const merged = (settledByReread) => {
+        const entry = { ...receipt(), ...settlement(settledByReread) };
+        return {
+          ...receipts,
+          [field]: append ? [...receipts[field], entry] : entry,
+        };
+      };
+      // The probe runs first because the identity reads are not
+      // `probeAbsent`-wrapped: a 404 there refuses instead of settling.
       if ((await probe()) === 'absent') {
-        await write({ phase: nextPhase, receipts: receipt(true) });
+        // The phase advances even where the probe settles the step:
+        // `recordTeardown` admits one position at a time, so a phase left
+        // behind here makes the next write a two-position jump it refuses.
+        await write({ phase: nextPhase, receipts: merged(true) });
         return;
       }
-      // Ownership attestation gates every dispatch, not only a resumed one, and
-      // runs only against a resource the probe has proved present. Steps whose
-      // probe already establishes identity carry none of their own.
-      await identity?.();
-      // Reads that gate the delete run outside its ambiguity window: a refusal
-      // here leaves nothing pending because nothing was issued.
-      await prepare?.();
+      // Attestation runs ahead of the pending write. On a first attempt a
+      // refusal here has issued nothing; on a resume the pending record it
+      // refuses in front of is the earlier run's.
+      await identity();
       if (!pending)
         await write({
           phase: nextPhase,
@@ -504,7 +510,7 @@ export async function teardownDirectReference(input) {
         settledByReread = true;
       }
       if ((await probe()) !== 'absent') refuse('outcome-unknown');
-      await write({ receipts: receipt(settledByReread) });
+      await write({ receipts: merged(settledByReread) });
     };
 
     const ingressProbe = async () => {
@@ -515,7 +521,11 @@ export async function teardownDirectReference(input) {
           return value;
         }),
       );
-      return seen === 'absent' || observed?.enabled === false
+      // The same predicate the disable call checks its own answer against: a
+      // script still reachable on a preview URL carries ingress, whatever
+      // `enabled` says.
+      return seen === 'absent' ||
+        (observed?.enabled === false && observed.previews_enabled === false)
         ? 'absent'
         : 'present';
     };
@@ -523,6 +533,11 @@ export async function teardownDirectReference(input) {
       probeAbsent(status.workers.scripts.get(script, selectors).asResponse());
     const databaseProbe = (uuid) => () =>
       probeAbsent(sdk.d1.database.get(uuid, selectors));
+    const databaseIdentity = (uuid, name) => async () => {
+      const observed = await sdk.d1.database.get(uuid, selectors);
+      if (observed?.uuid !== uuid || observed.name !== name)
+        refuse('identity-mismatch');
+    };
     const objectProbe = (key) => () =>
       probeAbsent(
         status.r2.buckets.objects
@@ -639,6 +654,7 @@ export async function teardownDirectReference(input) {
       await mutate({
         kind: 'disable-reference-ingress',
         nextPhase: 'ingress',
+        field: 'ingress',
         probe: ingressProbe,
         identity: scriptIdentity,
         call: async () => {
@@ -650,27 +666,30 @@ export async function teardownDirectReference(input) {
           if (answer?.enabled !== false || answer.previews_enabled !== false)
             refuse('provider-unavailable');
         },
-        receipt: (settledByReread) => ({
-          ...receipts,
-          ingress: settlement(settledByReread),
-        }),
+        receipt: () => ({}),
       });
 
     if (!receipts.worker) {
+      // The attestation lists the secrets; a script the probe already finds
+      // absent settles without one and records the empty set.
       let secretNames = [];
       await mutate({
         kind: 'delete-reference-worker',
         nextPhase: 'worker',
+        field: 'worker',
         probe: scriptProbe,
-        identity: scriptIdentity,
-        prepare: async () => {
-          const listed = await singlePage(
+        identity: async () => {
+          await scriptIdentity();
+          const page = await singlePage(
             single.workers.scripts.secrets.list(script, selectors),
           );
-          // The complete observed set is what is compared: a name
-          // `recordableName` rejects is still a secret the script carries.
-          const observed = listed.rows.map((row) => row.name).sort();
-          if (!isDeepStrictEqual(observed, [...REFERENCE_SECRET_NAMES]))
+          // The observed set is compared whole: a name `recordableName` rejects
+          // is still a secret the script carries. The comparison is an
+          // equality, so a page that returned fewer rows than the script holds
+          // refuses here rather than passing, and the page's own `exhaustive`
+          // decides nothing.
+          const observed = page.rows.map((row) => row.name).sort();
+          if (!isDeepStrictEqual(observed, [...EXPECTED_SECRET_NAMES]))
             refuse('identity-mismatch');
           secretNames = observed;
         },
@@ -680,14 +699,7 @@ export async function teardownDirectReference(input) {
             { ...selectors },
             MUTATION_OPTIONS,
           ),
-        receipt: (settledByReread) => ({
-          ...receipts,
-          worker: {
-            scriptName: script,
-            secretNames,
-            ...settlement(settledByReread),
-          },
-        }),
+        receipt: () => ({ scriptName: script, secretNames }),
       });
     }
 
@@ -699,50 +711,56 @@ export async function teardownDirectReference(input) {
       await mutate({
         kind,
         nextPhase: field,
+        field,
         probe: databaseProbe(uuid),
-        identity: async () => {
-          const observed = await sdk.d1.database.get(uuid, selectors);
-          if (observed?.uuid !== uuid || observed.name !== name)
-            refuse('identity-mismatch');
-        },
+        identity: databaseIdentity(uuid, name),
         call: () =>
           settled.d1.database.delete(uuid, selectors, MUTATION_OPTIONS),
-        receipt: (settledByReread) => ({
-          ...receipts,
-          [field]: { uuid, ...settlement(settledByReread) },
-        }),
+        receipt: () => ({ uuid }),
       });
     }
 
+    // The listing carries no `exhaustive`, and needs none: `validateEnvelope`
+    // refuses a non-empty cursor, so a page that returns at all is the last
+    // one the provider has.
+    const listObjects = async (scoped) =>
+      (
+        await singlePage(
+          single.r2.buckets.objects.list(bucket, {
+            ...selectors,
+            jurisdiction: 'default',
+            ...(scoped ? { prefix: `${prefix}/receipts/v1/` } : {}),
+          }),
+        )
+      ).rows;
+    const inspect = (rows) => {
+      for (const row of rows)
+        if (typeof row?.key !== 'string' || !confirmed.includes(row.key))
+          refuse('unexpected-object');
+      return rows;
+    };
     if (receipts.exportObjects.length < confirmed.length) {
-      const listObjects = async (scoped) =>
-        (
-          await singlePage(
-            single.r2.buckets.objects.list(bucket, {
-              ...selectors,
-              jurisdiction: 'default',
-              ...(scoped ? { prefix: `${prefix}/receipts/v1/` } : {}),
-            }),
-          )
-        ).rows;
-      const inspect = (rows) => {
-        for (const row of rows)
-          if (typeof row?.key !== 'string' || !confirmed.includes(row.key))
-            refuse('unexpected-object');
-        return rows;
-      };
+      // One attestation for the whole block: the call below proves the bucket,
+      // and each delete's `identity` reads that same proof.
+      let attested;
+      const attestBucket = () => (attested ??= bucketIdentity());
+      // Ownership is attested before the content checks, so an unexpected
+      // object cannot pre-empt the proof that this is the run's own bucket.
+      // An absent bucket refuses as `provider-unavailable` here exactly as it
+      // does from the listings.
+      await attestBucket();
       inspect(await listObjects(true));
       inspect(await listObjects(false));
-      // The listings already prove the bucket present, so this attestation
-      // needs no probe of its own.
-      await bucketIdentity();
       for (const key of confirmed) {
         if (receipts.exportObjects.some((entry) => entry.key === key)) continue;
         await mutate({
           kind: 'delete-export-object',
           key,
           nextPhase: 'export-objects',
+          field: 'exportObjects',
+          append: true,
           probe: objectProbe(key),
+          identity: attestBucket,
           call: () =>
             settled.r2.buckets.objects.delete(
               key,
@@ -753,27 +771,27 @@ export async function teardownDirectReference(input) {
               },
               MUTATION_OPTIONS,
             ),
-          receipt: (settledByReread) => ({
-            ...receipts,
-            exportObjects: [
-              ...receipts.exportObjects,
-              { key, ...settlement(settledByReread) },
-            ],
-          }),
+          receipt: () => ({ key }),
         });
       }
+    }
+
+    if (!receipts.exports) {
+      // The empty prefix is owed by the run that deletes the bucket, not by
+      // the run that issued the object deletes: a resume holding every object
+      // receipt reads the prefix here rather than inheriting an earlier run's
+      // reading. Once `exports` is receipted the bucket is gone, so this is
+      // also the last point at which the listing has anything to address.
       for (let attempt = 1; attempt <= OBJECT_SETTLE_ATTEMPTS; attempt += 1) {
         transport.assertBudget();
         if (inspect(await listObjects(true)).length === 0) break;
         if (attempt === OBJECT_SETTLE_ATTEMPTS) refuse('provider-unavailable');
         await delay(OBJECT_SETTLE_DELAY_MS);
       }
-    }
-
-    if (!receipts.exports)
       await mutate({
         kind: 'delete-export-r2',
         nextPhase: 'exports',
+        field: 'exports',
         probe: bucketProbe,
         identity: bucketIdentity,
         call: () =>
@@ -782,11 +800,9 @@ export async function teardownDirectReference(input) {
             { ...selectors, jurisdiction: 'default' },
             MUTATION_OPTIONS,
           ),
-        receipt: (settledByReread) => ({
-          ...receipts,
-          exports: { name: bucket, ...settlement(settledByReread) },
-        }),
+        receipt: () => ({ name: bucket }),
       });
+    }
 
     if (phase !== 'residual' && phase !== 'complete')
       await write({ phase: 'residual' });

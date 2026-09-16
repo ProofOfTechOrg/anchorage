@@ -43,7 +43,7 @@ import { providerWorld } from './fixtures/provider-world.js';
 function apiFailure(
   status: number,
   message = 'provider failure',
-  headers?: Readonly<Record<string, string>>,
+  headers: Readonly<Record<string, string>> = {},
 ): Response {
   return Response.json(
     {
@@ -52,7 +52,7 @@ function apiFailure(
       messages: [],
       result: null,
     },
-    { status, ...(headers === undefined ? {} : { headers }) },
+    { status, headers },
   );
 }
 
@@ -1203,45 +1203,66 @@ describe('CloudflareProvisioningClient plain-worker plane', () => {
     ).toBe('target');
   });
 
+  // The deployment and version reads, with what each does when the provider
+  // answers 404: `absence: 'undefined'` is a read the absence gate in
+  // `src/cloudflare-ordinary-worker-operations.ts` covers, `absence: 'throws'`
+  // one it does not. The three titles below read this set instead of restating
+  // it.
+  const DEPLOYMENT_VERSION_READS: readonly Readonly<{
+    absence: 'undefined' | 'throws';
+    read: (
+      client: CloudflareProvisioningClient,
+      scriptName: string,
+    ) => Promise<unknown>;
+  }>[] = [
+    {
+      absence: 'undefined',
+      read: (client, scriptName) =>
+        client.ordinaryWorkerDeploymentStatus(scriptName),
+    },
+    {
+      absence: 'undefined',
+      read: (client, scriptName) =>
+        client.listOrdinaryWorkerVersions(scriptName),
+    },
+    {
+      absence: 'undefined',
+      read: (client, scriptName) =>
+        client.findOrdinaryWorkerVersion(scriptName, 'v1'),
+    },
+    {
+      absence: 'throws',
+      read: (client, scriptName) =>
+        client.viewOrdinaryWorkerVersion(scriptName, 'v1'),
+    },
+  ];
+
   it('returns undefined only for provider 404 deployment and version reads', async () => {
     const fixture = recordingFetch(() => apiFailure(404));
     const client = plainClient({ fetch: fixture.fetch });
-    await expect(
-      client.ordinaryWorkerDeploymentStatus('missing'),
-    ).resolves.toBeUndefined();
-    await expect(
-      client.listOrdinaryWorkerVersions('missing'),
-    ).resolves.toBeUndefined();
-    await expect(
-      client.findOrdinaryWorkerVersion('missing', 'v1'),
-    ).resolves.toBeUndefined();
-    await expect(
-      client.viewOrdinaryWorkerVersion('missing', 'v1'),
-    ).rejects.toThrow();
+    for (const { absence, read } of DEPLOYMENT_VERSION_READS) {
+      const outcome = expect(read(client, 'missing'));
+      if (absence === 'undefined') {
+        await outcome.resolves.toBeUndefined();
+      } else {
+        await outcome.rejects.toThrow();
+      }
+    }
   });
 
   it.each([
     403, 429, 500,
   ])('propagates provider %s from every deployment and version read', async (status) => {
-    // The SDK's `shouldRetry` retries a 429, so this row spends the client's
-    // whole retry budget on each read; `retry-after-ms` holds every one of
-    // those retries to a millisecond of real-timer backoff.
+    // The SDK's `shouldRetry` retries 429 and 500, so those rows spend the
+    // client's whole retry budget on each read; `retry-after-ms` holds every
+    // one of those retries to a millisecond of real-timer backoff. A 403 is
+    // not retried, so the header is unread on that row.
     const fixture = recordingFetch(() =>
-      apiFailure(
-        status,
-        'provider failure',
-        status === 429 ? { 'retry-after-ms': '1' } : undefined,
-      ),
+      apiFailure(status, 'provider failure', { 'retry-after-ms': '1' }),
     );
     const client = plainClient({ fetch: fixture.fetch });
-    const operations = [
-      () => client.ordinaryWorkerDeploymentStatus('plain'),
-      () => client.listOrdinaryWorkerVersions('plain'),
-      () => client.findOrdinaryWorkerVersion('plain', 'v1'),
-      () => client.viewOrdinaryWorkerVersion('plain', 'v1'),
-    ];
-    for (const operation of operations) {
-      await expect(operation()).rejects.toMatchObject({ status });
+    for (const { read } of DEPLOYMENT_VERSION_READS) {
+      await expect(read(client, 'plain')).rejects.toMatchObject({ status });
     }
   });
 
@@ -1255,12 +1276,6 @@ describe('CloudflareProvisioningClient plain-worker plane', () => {
       Promise.reject(new Error('transport timed out')),
     );
     const client = plainClient({ fetch: fixture.fetch });
-    const operations = [
-      () => client.ordinaryWorkerDeploymentStatus('plain'),
-      () => client.listOrdinaryWorkerVersions('plain'),
-      () => client.findOrdinaryWorkerVersion('plain', 'v1'),
-      () => client.viewOrdinaryWorkerVersion('plain', 'v1'),
-    ];
     // The SDK's error classes never assign `name` (core/error.js:78-93), so a
     // raw rejection reports the base `Error` name and the subclass itself is
     // what identifies a timeout; `sanitizeProviderError` is what stamps the
@@ -1269,9 +1284,9 @@ describe('CloudflareProvisioningClient plain-worker plane', () => {
       | Readonly<{ settled: 'resolved'; value: unknown }>
       | Readonly<{ settled: 'rejected'; timeout: boolean; message: unknown }>;
     const outcomes: ReadOutcome[] = [];
-    for (const operation of operations) {
+    for (const { read } of DEPLOYMENT_VERSION_READS) {
       outcomes.push(
-        await operation().then(
+        await read(client, 'plain').then(
           (value): ReadOutcome => ({ settled: 'resolved', value }),
           (error: unknown): ReadOutcome => ({
             settled: 'rejected',
@@ -1282,21 +1297,22 @@ describe('CloudflareProvisioningClient plain-worker plane', () => {
       );
     }
 
-    expect(outcomes).toEqual(
-      operations.map(() => ({
-        settled: 'rejected',
-        timeout: true,
-        message: 'Request timed out.',
-      })),
-    );
     // A read that resolved to `undefined` would have classified the timeout as
-    // absence, which is the outcome this requirement forbids.
+    // absence, which is the outcome this requirement forbids. It stands before
+    // the aggregate below, which fails first on the same outcome.
     expect(
       outcomes.filter(
         (outcome) =>
           outcome.settled === 'resolved' && outcome.value === undefined,
       ),
     ).toEqual([]);
+    expect(outcomes).toEqual(
+      DEPLOYMENT_VERSION_READS.map(() => ({
+        settled: 'rejected',
+        timeout: true,
+        message: 'Request timed out.',
+      })),
+    );
   });
 
   it.each([

@@ -46,7 +46,10 @@ import type {
   FleetStateStore,
   ProvisioningBackend,
 } from './types.js';
-import { assertNoActiveDecommission } from './types.js';
+import {
+  assertNoActiveDecommission,
+  SETTLED_BACKEND_SWITCH_SUBPHASES,
+} from './types.js';
 import { validateDeploymentSpec } from './validation.js';
 
 const ACTION_ERROR = 'cleanup advance action is malformed';
@@ -89,7 +92,11 @@ export interface AdvanceCleanupDeploymentOptions {
   readonly action: CleanupAdvanceAction;
   /** Provider-fetch attempt budget for each bounded attachment scan, integer 9..1,000. */
   readonly maxProviderRequests: number;
-  /** Call-local cancellation, never persisted. */
+  /**
+   * Call-local cancellation, never persisted. This engine forwards it to the
+   * bounded attachment scan, which is where it is honoured; the engine takes
+   * no step of its own on it.
+   */
   readonly signal?: AbortSignal;
   /** Timestamp source; called once for each accepted write. */
   readonly clock?: () => number;
@@ -382,12 +389,13 @@ async function commit(
 }
 
 function assertBackendSwitchInactiveForCleanup(record: FleetRecord): void {
-  // Byte-identical to backend-switch.ts assertBackendSwitchInactive; the
-  // transport-neutral rule forbids importing that module from this engine.
+  // The settled-subphase set is the one backend-switch.ts
+  // assertBackendSwitchInactive reads, so the two cannot drift apart. This
+  // engine reads it from types.ts because the transport-neutral rule forbids
+  // importing backend-switch.ts here and permits types.ts.
   if (
     record.backendSwitchIntent &&
-    record.backendSwitchIntent.subphase !== 'rolled-back' &&
-    record.backendSwitchIntent.subphase !== 'finalized'
+    !SETTLED_BACKEND_SWITCH_SUBPHASES.has(record.backendSwitchIntent.subphase)
   ) {
     throw new Error(
       `deployment '${record.tenantTag}:${record.environment}' has active backend switch '${record.backendSwitchIntent.subphase}'`,

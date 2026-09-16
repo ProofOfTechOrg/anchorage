@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { readBoundedBody } from '@proofoftech/flowsafe/host-kit';
 import type { DirectRunManifest } from './direct-credentialed-conformance-preflight.mjs';
 import {
   createDirectReferenceContext,
@@ -23,7 +22,11 @@ import { dispatchDirectInventory } from './direct-reference-inventory.js';
 import type { DirectOperationSlot } from './direct-reference-journal.js';
 import { dispatchDirectLifecycle } from './direct-reference-lifecycle.js';
 import { dispatchDirectR4 } from './direct-reference-r4.js';
-import type { DirectReferenceTransportSnapshot } from './direct-reference-transport.js';
+import {
+  type DirectReferenceTransportSnapshot,
+  decodeDirectJsonObject,
+  readBoundedDirectResponse,
+} from './direct-reference-transport.js';
 
 const operationSlots: readonly DirectOperationSlot[] = [
   'inventory-before',
@@ -74,93 +77,51 @@ export async function probeDirectTenant(
       : operation === 'object-delete'
         ? 'DELETE'
         : 'GET';
-  const cleanup = new AbortController();
-  const signal = AbortSignal.any([
+  const readsJson = method === 'GET';
+  const { text: encoded } = await readBoundedDirectResponse({
+    fetch: context.transport.applicationFetch,
+    url,
+    method,
+    token,
+    acceptStatuses: readsJson ? [200] : [204],
+    mediaType: readsJson ? 'application/json' : undefined,
+    byteLimit: readsJson ? 1024 : 0,
     invocationSignal,
-    cleanup.signal,
-    AbortSignal.timeout(context.transport.effectiveRequestTimeoutMs),
-  ]);
-  let response: Response | undefined;
-  let bodySettled: Promise<void> | undefined;
-  try {
-    response = await context.transport.applicationFetch(url, {
-      method,
-      headers: { authorization: `Bearer ${token}` },
-      signal,
-    });
-    const media = response.headers
-      .get('content-type')
-      ?.split(';')[0]
-      ?.trim()
-      .toLowerCase();
+    requestTimeoutMs: context.transport.effectiveRequestTimeoutMs,
+  });
+  if (!readsJson) return { role, operation, returned: true };
+  const value = decodeDirectJsonObject(encoded);
+  const fields = Object.keys(value).sort().join(',');
+  if (operation === 'health') {
     if (
-      response.status !== (method === 'GET' ? 200 : 204) ||
-      (method === 'GET' && media !== 'application/json')
+      fields !== 'marker,release' ||
+      (value.release !== '1' && value.release !== '2') ||
+      (value.marker !== 'initial' &&
+        value.marker !== 'next' &&
+        value.marker !== null)
     )
       throw new DirectReferenceExecutionError();
-    const stream = new TransformStream<Uint8Array, Uint8Array>();
-    bodySettled = response.body
-      ?.pipeTo(stream.writable, { signal })
-      .catch(() => undefined);
-    const bodyInit = {
-      method: 'POST',
-      headers: response.headers,
-      body: response.body ? stream.readable : undefined,
-      signal,
-      duplex: 'half' as const,
-    };
-    const bounded = await readBoundedBody(
-      new Request(url, bodyInit),
-      method === 'GET' ? 1024 : 0,
-    );
-    if (!bounded.ok) throw new DirectReferenceExecutionError();
-    if (method !== 'GET') return { role, operation, returned: true };
-    let decoded: unknown;
-    try {
-      decoded = JSON.parse(bounded.text);
-    } catch {
-      throw new DirectReferenceExecutionError();
-    }
-    if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded))
-      throw new DirectReferenceExecutionError();
-    const value = decoded as Record<string, unknown>;
-    const fields = Object.keys(value).sort().join(',');
-    if (operation === 'health') {
-      if (
-        fields !== 'marker,release' ||
-        (value.release !== '1' && value.release !== '2') ||
-        (value.marker !== 'initial' &&
-          value.marker !== 'next' &&
-          value.marker !== null)
-      )
-        throw new DirectReferenceExecutionError();
-      return { role, operation, release: value.release, marker: value.marker };
-    }
-    if (fields === 'present' && value.present === false)
-      return { role, operation, present: false };
-    if (
-      fields !== 'present,sha256,size' ||
-      value.present !== true ||
-      typeof value.size !== 'number' ||
-      !Number.isSafeInteger(value.size) ||
-      value.size < 1 ||
-      typeof value.sha256 !== 'string' ||
-      !/^[a-f0-9]{64}$/u.test(value.sha256)
-    )
-      throw new DirectReferenceExecutionError();
-    return {
-      role,
-      operation,
-      present: true,
-      size: value.size,
-      sha256: value.sha256,
-    };
-  } finally {
-    cleanup.abort();
-    await bodySettled;
-    if (response && !response.bodyUsed && !response.body?.locked)
-      await response.body?.cancel().catch(() => undefined);
+    return { role, operation, release: value.release, marker: value.marker };
   }
+  if (fields === 'present' && value.present === false)
+    return { role, operation, present: false };
+  if (
+    fields !== 'present,sha256,size' ||
+    value.present !== true ||
+    typeof value.size !== 'number' ||
+    !Number.isSafeInteger(value.size) ||
+    value.size < 1 ||
+    typeof value.sha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/u.test(value.sha256)
+  )
+    throw new DirectReferenceExecutionError();
+  return {
+    role,
+    operation,
+    present: true,
+    size: value.size,
+    sha256: value.sha256,
+  };
 }
 
 async function dispatch(

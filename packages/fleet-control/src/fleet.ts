@@ -69,6 +69,7 @@ import {
   assertNoActiveDecommission,
   EXTERNAL_MIGRATION_SUBPHASES,
   effectiveLifecyclePhase,
+  hasActiveCleanup,
   isPlatformCatalogRecord,
 } from './types.js';
 import {
@@ -189,12 +190,6 @@ function pendingArtifactVersion(record: FleetRecord): string | undefined {
   );
 }
 
-function hasActiveCleanup(record: FleetRecord): boolean {
-  return (
-    record.phase === 'cleanup-advancing' || record.cleanupIntent !== undefined
-  );
-}
-
 /**
  * Script keys a deployment under active bounded cleanup may still own live.
  * They feed the orphan suppressions only: the bounded engine, not the drift
@@ -230,8 +225,15 @@ function cleanupKnownScriptKeys(record: FleetRecord): readonly string[] {
   return keys;
 }
 
+/**
+ * The phase a retained record keeps once its decommission completes. It is
+ * retained state rather than a phase that advances, which is what the audit
+ * expectations and the staleness check below read it as.
+ */
+const TERMINAL_LIFECYCLE_PHASE = 'decommissioned' satisfies ProvisioningPhase;
+
 function expectsDatabase(record: FleetRecord): boolean {
-  return effectiveLifecyclePhase(record) !== 'decommissioned';
+  return effectiveLifecyclePhase(record) !== TERMINAL_LIFECYCLE_PHASE;
 }
 
 function expectsWorker(record: FleetRecord): boolean {
@@ -1075,12 +1077,13 @@ export function auditNamespaceExpectationsStage(
 }
 
 /** Lifecycle phases whose records no longer expect their R2 buckets. */
-const R2_EXPECTATION_EXCLUDED_PHASES = Object.freeze([
-  'application-resources-deleted',
-  'database-exported',
-  'database-deleting',
-  'decommissioned',
-] as const satisfies readonly ProvisioningPhase[]);
+const R2_EXPECTATION_EXCLUDED_PHASES: readonly ProvisioningPhase[] =
+  Object.freeze([
+    'application-resources-deleted',
+    'database-exported',
+    'database-deleting',
+    TERMINAL_LIFECYCLE_PHASE,
+  ] as const satisfies readonly ProvisioningPhase[]);
 
 export function auditR2ExpectedStage(
   input: Readonly<{
@@ -1101,9 +1104,7 @@ export function auditR2ExpectedStage(
   const findings: DriftFinding[] = [];
   for (const record of input.records) {
     const phase = effectiveLifecyclePhase(record);
-    if (R2_EXPECTATION_EXCLUDED_PHASES.some((excluded) => excluded === phase)) {
-      continue;
-    }
+    if (R2_EXPECTATION_EXCLUDED_PHASES.includes(phase)) continue;
     for (const resource of record.applicationResources ?? []) {
       if (resource.state !== 'created' || !resource.creationDate) continue;
       const prior = input.expectedBuckets.get(resource.bucketName);
@@ -1256,13 +1257,12 @@ export async function auditRecordStep(
     input.liveByScript.get(`${record.backend}:${liveScriptName(record)}`) ?? [];
   const inventoryDeployment = inventoryMatches[0];
   const recordUpdatedAt = Date.parse(record.updatedAt);
-  // `decommissioned` is terminal, not a phase that advances: a retained
-  // terminal row ages past `staleAfterMs` and stays there until a host clears
-  // it, so reading it as stalled provisioning misclassifies intended retained
-  // state as incomplete provisioning.
+  // A retained terminal row ages past `staleAfterMs` and stays there until a
+  // host clears it, so reading it as stalled provisioning misclassifies
+  // intended retained state as incomplete provisioning.
   if (
     phase !== 'ready' &&
-    phase !== 'decommissioned' &&
+    phase !== TERMINAL_LIFECYCLE_PHASE &&
     (!Number.isFinite(recordUpdatedAt) ||
       input.auditNow - recordUpdatedAt > input.staleAfterMs)
   ) {
@@ -3618,6 +3618,12 @@ async function migrationSettleReady(
           outboundPolicy: targetPlatform.outboundPolicy,
         }
       : {}),
+    // Written unconditionally, unlike the conditional spreads around it: the
+    // key belongs to a migrated record whatever its value, and carries
+    // `undefined` when a finalized state provider supplies no tag. The frozen
+    // migration baseline records it that way and the golden suite compares
+    // with `toStrictEqual`, which reads a present `undefined` key differently
+    // from an absent one, so a conditional spread here changes what it pins.
     durableObjectTag: finalizedStateProvider
       ? current.durableObjectTag
       : targetDurableObjectTag(spec),

@@ -44,14 +44,17 @@ interface ScenarioCall {
     | 'injected-response-loss'
     | 'reference-refused';
   readonly attempts: DirectInvocationAttempts | null;
-  /** Settled force-terminal calls require a nullable before identity; prepared and other calls omit it. */
-  readonly before?: Readonly<{ databaseId: string; scriptName: string }> | null;
   readonly migration: Readonly<{
     itemOrdinal: 0 | 1;
     cursor: number;
     step: string;
     itemsSha256: string;
   }> | null;
+  /**
+   * Settled force-terminal calls require a nullable before identity; prepared
+   * and other calls omit it. Declared last, as `callShape` persists it.
+   */
+  readonly before?: Readonly<{ databaseId: string; scriptName: string }> | null;
 }
 interface ScenarioProcess {
   readonly pid: number;

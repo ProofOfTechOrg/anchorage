@@ -1,21 +1,37 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { ExecutionFenceState as FenceState } from '@proofoftech/flowsafe/do-runner';
-import { readBoundedBody } from '@proofoftech/flowsafe/host-kit';
 import type { DirectRunManifest } from './direct-credentialed-conformance-preflight.mjs';
 import type { DirectReferenceContext } from './direct-reference-context.js';
 import type { DirectReferenceAction } from './direct-reference-contract.mjs';
 import { DirectReferenceExecutionError } from './direct-reference-http.js';
+import {
+  decodeDirectJsonObject,
+  readBoundedDirectResponse,
+} from './direct-reference-transport.js';
 
-type Reading = {
+export type DirectFenceReading = {
   state: FenceState;
   mutationEpoch: number;
   requireMutationEpoch: boolean;
   transitionRevision: number;
 };
 
+export type DirectFenceSweep = {
+  fence: DirectFenceReading;
+  categories: { category: string; class: string; empty: boolean }[];
+  observedAt: number;
+};
+
+/** The epoch label each probe operation sends to the tenant. */
+const PROBE_EPOCHS = Object.freeze({
+  'probe-missing': 'missing',
+  'probe-stale': 'stale',
+  'probe-future': 'future',
+});
+
 type FenceTransitionResult =
-  | { ok: true; after: Reading }
+  | { ok: true; after: DirectFenceReading }
   | {
       ok: false;
       reason: {
@@ -61,7 +77,7 @@ function text(value: unknown): string {
   return value;
 }
 
-function reading(value: Record<string, unknown>): Reading {
+function reading(value: Record<string, unknown>): DirectFenceReading {
   return {
     state: state(value.state),
     mutationEpoch: counter(value.mutationEpoch),
@@ -118,80 +134,32 @@ export async function dispatchDirectFence(
   if (!spec.routeHostname) throw new DirectReferenceExecutionError();
   const { operation } = action;
   const application =
-    operation === 'mutate-current' || operation.startsWith('probe-');
+    operation === 'mutate-current' || Object.hasOwn(PROBE_EPOCHS, operation);
   const secrets = context.secrets(action.role);
-  const token = application
+  const supplied = application
     ? secrets.application?.APP_PROBE_TOKEN
     : secrets.maintenanceAdmin;
-  if (typeof token !== 'string' || !token)
+  if (typeof supplied !== 'string' || !supplied)
     throw new DirectReferenceExecutionError();
+  const token: string = supplied;
 
   async function request(path: string, body?: unknown) {
-    const url = new URL(path, `https://${spec.routeHostname}`);
-    const cleanup = new AbortController();
-    const signal = AbortSignal.any([
-      invocationSignal,
-      cleanup.signal,
-      AbortSignal.timeout(context.transport.effectiveRequestTimeoutMs),
-    ]);
-    let response: Response | undefined;
-    let bodySettled: Promise<void> | undefined;
-    try {
-      const fetch = application
+    const { status, text: encoded } = await readBoundedDirectResponse({
+      fetch: application
         ? context.transport.applicationFetch
-        : context.transport.maintenanceFetch;
-      response = await fetch(url, {
-        method: body === undefined ? 'GET' : 'POST',
-        headers: {
-          authorization: `Bearer ${token}`,
-          ...(body === undefined ? {} : { 'content-type': 'application/json' }),
-        },
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-        signal,
-      });
-      const media = response.headers
-        .get('content-type')
-        ?.split(';')[0]
-        ?.trim()
-        .toLowerCase();
-      if (
-        (response.status !== 200 &&
-          !(
-            response.status === 409 &&
-            (operation === 'drain' || operation === 'reopen')
-          )) ||
-        media !== 'application/json'
-      )
-        throw new DirectReferenceExecutionError();
-      const stream = new TransformStream<Uint8Array, Uint8Array>();
-      bodySettled = response.body
-        ?.pipeTo(stream.writable, { signal })
-        .catch(() => undefined);
-      const bodyInit = {
-        method: 'POST',
-        headers: response.headers,
-        body: response.body ? stream.readable : undefined,
-        signal,
-        duplex: 'half' as const,
-      };
-      const bounded = await readBoundedBody(
-        new Request(url, bodyInit),
-        operation === 'inventory' ? 65536 : 4096,
-      );
-      if (!bounded.ok) throw new DirectReferenceExecutionError();
-      let decoded: unknown;
-      try {
-        decoded = JSON.parse(bounded.text);
-      } catch {
-        throw new DirectReferenceExecutionError();
-      }
-      return { status: response.status, value: object(decoded) };
-    } finally {
-      cleanup.abort();
-      await bodySettled;
-      if (response && !response.bodyUsed && !response.body?.locked)
-        await response.body?.cancel().catch(() => undefined);
-    }
+        : context.transport.maintenanceFetch,
+      url: new URL(path, `https://${spec.routeHostname}`),
+      method: body === undefined ? 'GET' : 'POST',
+      token,
+      body,
+      acceptStatuses:
+        operation === 'drain' || operation === 'reopen' ? [200, 409] : [200],
+      mediaType: 'application/json',
+      byteLimit: operation === 'inventory' ? 65536 : 4096,
+      invocationSignal,
+      requestTimeoutMs: context.transport.effectiveRequestTimeoutMs,
+    });
+    return { status, value: decodeDirectJsonObject(encoded) };
   }
 
   if (operation === 'read')
@@ -222,7 +190,7 @@ export async function dispatchDirectFence(
     const index = (await request('/admin/inventory')).value;
     if (!Array.isArray(index.categories))
       throw new DirectReferenceExecutionError();
-    const categories = [];
+    const categories: DirectFenceSweep['categories'] = [];
     for (const entry of index.categories) {
       const descriptor = object(entry);
       const category = text(descriptor.category);
@@ -256,8 +224,15 @@ export async function dispatchDirectFence(
       ...(value.status === undefined ? {} : { status: counter(value.status) }),
     };
   }
-  const epoch = operation.slice('probe-'.length);
+  if (
+    operation !== 'probe-missing' &&
+    operation !== 'probe-stale' &&
+    operation !== 'probe-future'
+  )
+    throw new DirectReferenceExecutionError();
+  const epoch = PROBE_EPOCHS[operation];
   const { value } = await request('/__direct/fence-probe', { epoch });
+  const classification = text(value.classification);
   if (
     value.epoch !== epoch ||
     ![
@@ -267,12 +242,12 @@ export async function dispatchDirectFence(
       'future',
       'fenced',
       'unexpected',
-    ].includes(text(value.classification))
+    ].includes(classification)
   )
     throw new DirectReferenceExecutionError();
   return {
     epoch,
-    classification: value.classification,
+    classification,
     ...(value.status === undefined ? {} : { status: counter(value.status) }),
   };
 }

@@ -29,9 +29,9 @@ const ROW_TABLE = 'anchorage_fleet_inventory_rows';
 const FACT_TABLE = 'anchorage_fleet_inventory_deployment_facts';
 const LEASE_TABLE = 'anchorage_fleet_inventory_leases';
 const PIN_TABLE = 'anchorage_fleet_inventory_pins';
-// Duplicated from state-store.ts:132-133 on purpose: that module does not
-// export the two integers, and widening its surface for them would couple the
-// inventory store to the deployment store for nothing.
+// state-store.ts:132-133 holds the same two integers and exports neither;
+// widening its surface for them couples the inventory store to the deployment
+// store.
 const LEASE_TTL_MS = 15 * 60_000;
 const LEASE_RENEWAL_INTERVAL_MS = 5 * 60_000;
 // Byte-identical to state-store.ts:134. The Wrangler harness lease clock
@@ -294,9 +294,9 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
       pinned_at_ms INTEGER NOT NULL,
       PRIMARY KEY (account_id, generation, pinned_by)
     )`);
-    // These tables are new, so there is no ALTER path: a column that is absent
-    // or of the wrong type means someone else owns the name, and a write would
-    // silently drop values rather than fail.
+    // There is no ALTER path: a column that is absent or of the wrong type
+    // means someone else owns the name, and a write would silently drop
+    // values rather than fail.
     for (const [table, columns] of Object.entries(EXPECTED_COLUMNS)) {
       const present = await this.#db.query(`PRAGMA table_info(${table})`);
       for (const [name, type] of Object.entries(columns)) {
@@ -453,6 +453,10 @@ export class D1FleetInventoryRunStore implements FleetInventoryRunStore {
     errors.push(...renewalErrors);
     if (releaseFailed) errors.push(releaseError);
     if (errors.length === 1) throw errors[0];
+    // A run that fails beside a lease renewal or release failure reaches the
+    // caller inside the aggregate, first in `errors`: a caller that reads only
+    // `message` sees the cleanup summary, and the reason the run itself raised
+    // is in `AggregateError.errors[0]`.
     if (errors.length > 1) {
       throw new AggregateError(
         errors,

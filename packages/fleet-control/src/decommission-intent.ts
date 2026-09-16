@@ -22,7 +22,11 @@ import type {
   FleetRecord,
   NormalDecommissionLifecyclePhase,
 } from './types.js';
-import { BACKEND_SWITCH_SUBPHASES, isPlatformCatalogRecord } from './types.js';
+import {
+  BACKEND_SWITCH_SUBPHASES,
+  isPlatformCatalogRecord,
+  RETIRED_BACKEND_SWITCH_SUBPHASE,
+} from './types.js';
 
 export const DECOMMISSION_INTENT_BYTE_BOUND = 96 * 1024;
 const TOKEN_BYTE_BOUND = 1024;
@@ -608,7 +612,7 @@ function assertCompleteRecord(
     source.migrationIntent !== undefined ||
     (mode === 'normal' && switchIntent !== undefined) ||
     (mode === 'backend-switch' &&
-      (switchIntent?.subphase !== 'decommissioned' ||
+      (switchIntent?.subphase !== RETIRED_BACKEND_SWITCH_SUBPHASE ||
         !switchIntent.databaseExport ||
         switchIntent.databaseExport.location !==
           source.databaseExportLocation ||

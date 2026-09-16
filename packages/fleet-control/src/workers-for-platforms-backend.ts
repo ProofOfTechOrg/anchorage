@@ -15,10 +15,7 @@ import {
   applicationSecretNames,
   applicationSecretValues,
 } from './application-bindings.js';
-import {
-  CredentialedRedirectRefusedError,
-  isRedirectStatus,
-} from './cloudflare-provider-errors.js';
+import { refuseRedirectStatus } from './cloudflare-provider-errors.js';
 import {
   cancelBodyWithoutAwait,
   captureDatabaseExportReceiptCapability,
@@ -83,6 +80,8 @@ const RELEASE_DIGEST_LENGTH = 48;
 const DEFAULT_MAINTENANCE_REQUEST_TIMEOUT_MS = 15_000;
 const MAINTENANCE_CAPABILITY_MAX_TTL_SECONDS = 60;
 const MAINTENANCE_CAPABILITY_SKEW_SECONDS = 5;
+const UNREAD_MAINTENANCE_BODY =
+  'Workers for Platforms maintenance health is read from the signed receipt header';
 
 export function externalReleaseScriptName(spec: DeploymentSpec): string {
   const digest = deploymentSpecDigest(spec);
@@ -483,20 +482,16 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
     // The maintenance requests below carry a minted capability token as a
     // bearer credential to a tenant Worker URL. Forcing the policy after the
     // spread denies a call site the chance to opt into following a redirect to
-    // an address the control plane did not choose. The refusal belongs here
-    // because both consumers read only the signed receipt header and then
-    // build a fresh response, so a 3xx carrying a valid receipt would
-    // otherwise succeed.
+    // an address the control plane did not choose. By the rule at
+    // refuseRedirectStatus the refusal belongs in this wrapper: both consumers
+    // read only the signed receipt header and then build a fresh response, so a
+    // 3xx carrying a valid receipt would otherwise succeed.
     this.#fetch = async (input, init) => {
       const response = await fetchFn(input, { ...init, redirect: 'manual' });
-      if (isRedirectStatus(response.status)) {
-        const refusal = new CredentialedRedirectRefusedError(
-          'Workers for Platforms maintenance request',
-          response.status,
-        );
-        cancelBodyWithoutAwait(response.body, refusal);
-        throw refusal;
-      }
+      refuseRedirectStatus(
+        response,
+        'Workers for Platforms maintenance request',
+      );
       return response;
     };
     this.#hostRoutingKvId = options.hostRoutingKvId;
@@ -1924,6 +1919,10 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
         signal: AbortSignal.timeout(this.#maintenanceRequestTimeoutMs),
       },
     );
+    // The health payload is the signed receipt header: neither exit below
+    // reads the maintenance response body, and the success path hands
+    // readMaintenanceHealth a fresh response built from the verified receipt.
+    cancelBodyWithoutAwait(response.body, UNREAD_MAINTENANCE_BODY);
     const receipt = response.headers.get(MAINTENANCE_RECEIPT_HEADER);
     const result = receipt
       ? await verifyMaintenanceReceipt({
@@ -2020,6 +2019,10 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
         signal: AbortSignal.timeout(this.#maintenanceRequestTimeoutMs),
       },
     );
+    // The health payload is the signed receipt header: neither exit below
+    // reads the maintenance response body, and the success path hands
+    // readMaintenanceHealth a fresh response built from the verified receipt.
+    cancelBodyWithoutAwait(response.body, UNREAD_MAINTENANCE_BODY);
     const receipt = response.headers.get(MAINTENANCE_RECEIPT_HEADER);
     const result = receipt
       ? await verifyMaintenanceReceipt({

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { readBoundedBody } from '@proofoftech/flowsafe/host-kit';
 import type { DirectConformanceConfig } from './direct-credentialed-conformance-config.mjs';
 import { DirectReferenceExecutionError } from './direct-reference-http.js';
 
@@ -162,4 +163,97 @@ export class DirectReferenceTransport {
     }
     return response;
   }
+}
+
+export interface DirectBoundedRequestOptions {
+  readonly fetch: typeof fetch;
+  readonly url: URL;
+  readonly method: string;
+  readonly token: string;
+  readonly body?: unknown;
+  /** Statuses the caller treats as an answer; anything else is refused. */
+  readonly acceptStatuses: readonly number[];
+  /** Required response media type, or `undefined` for an empty-body answer. */
+  readonly mediaType?: string;
+  readonly byteLimit: number;
+  readonly invocationSignal: AbortSignal;
+  readonly requestTimeoutMs: number;
+}
+
+/**
+ * Issues one bearer-authorized request against a tenant route and reads its
+ * body under `byteLimit`. A `mediaType` of `undefined` accepts an empty body,
+ * which is what the 204 answers to object writes and deletes carry.
+ */
+export async function readBoundedDirectResponse(
+  options: DirectBoundedRequestOptions,
+): Promise<{ status: number; text: string }> {
+  const cleanup = new AbortController();
+  const signal = AbortSignal.any([
+    options.invocationSignal,
+    cleanup.signal,
+    AbortSignal.timeout(options.requestTimeoutMs),
+  ]);
+  let response: Response | undefined;
+  let bodySettled: Promise<void> | undefined;
+  try {
+    response = await options.fetch(options.url, {
+      method: options.method,
+      headers: {
+        authorization: `Bearer ${options.token}`,
+        ...(options.body === undefined
+          ? {}
+          : { 'content-type': 'application/json' }),
+      },
+      ...(options.body === undefined
+        ? {}
+        : { body: JSON.stringify(options.body) }),
+      signal,
+    });
+    const media = response.headers
+      .get('content-type')
+      ?.split(';')[0]
+      ?.trim()
+      .toLowerCase();
+    if (
+      !options.acceptStatuses.includes(response.status) ||
+      (options.mediaType !== undefined && media !== options.mediaType)
+    )
+      throw new DirectReferenceExecutionError();
+    const stream = new TransformStream<Uint8Array, Uint8Array>();
+    bodySettled = response.body
+      ?.pipeTo(stream.writable, { signal })
+      .catch(() => undefined);
+    const bodyInit = {
+      method: 'POST',
+      headers: response.headers,
+      body: response.body ? stream.readable : undefined,
+      signal,
+      duplex: 'half' as const,
+    };
+    const bounded = await readBoundedBody(
+      new Request(options.url, bodyInit),
+      options.byteLimit,
+    );
+    if (!bounded.ok) throw new DirectReferenceExecutionError();
+    return { status: response.status, text: bounded.text };
+  } finally {
+    cleanup.abort();
+    await bodySettled;
+    if (response && !response.bodyUsed && !response.body?.locked)
+      await response.body?.cancel().catch(() => undefined);
+  }
+}
+
+/** Decodes a bounded body as a JSON object, refusing anything else. */
+export function decodeDirectJsonObject(text: string): Record<string, unknown> {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(text);
+  } catch {
+    throw new DirectReferenceExecutionError();
+  }
+  if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded))
+    throw new DirectReferenceExecutionError();
+  return decoded as Record<string, unknown>;
 }

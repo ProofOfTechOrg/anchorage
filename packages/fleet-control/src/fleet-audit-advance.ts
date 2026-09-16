@@ -125,7 +125,10 @@ export interface AdvanceFleetAuditOptions {
   readonly auditClock?: () => number;
   /** Feeds only the re-arm's authority clock (§6.1); default `Date.now`. */
   readonly authorityClock?: () => number;
-  /** Call-local only; never persisted. */
+  /**
+   * Call-local only; never persisted. Read at the entry and before each
+   * record step; a step already in flight runs to completion.
+   */
   readonly signal?: AbortSignal;
 }
 
@@ -215,9 +218,9 @@ export class FleetAuditAdvanceCapabilityError extends Error {
  * Probes one injected port for the members a capability names. `target` is
  * `object` rather than a port type because this coordinator gates two
  * unrelated ports (the operation store and the inventory store) through the
- * same table, and it is deliberately named for the audit capability set
- * rather than for one store — the R3 sibling's `assertStoreCapability` gates
- * a single store and keeps the narrower name.
+ * same table, and it is named for the audit capability set rather than for
+ * one store — the R3 sibling's `assertStoreCapability` gates a single store
+ * and keeps the narrower name.
  */
 function assertCapability(
   target: object,
@@ -285,7 +288,7 @@ function resultFromRun(run: FleetOperationRunRecord): FleetAuditAdvanceResult {
  */
 function pendingFromCommitted(
   committed: FleetOperationRunRecord,
-): FleetAuditAdvanceResult {
+): Extract<FleetAuditAdvanceResult, { status: 'pending' }> {
   return {
     status: 'pending',
     token: fleetOperationTokenOf(committed),
@@ -411,8 +414,13 @@ function chunked<T>(
   // typed over the whole stage union and so returns `number | undefined`.
   if (ordinal === undefined) return malformed();
   // A global stage never persists a cursor at the end of its own source, so
-  // the only admissible cursor for an empty source is zero.
-  if (source.length === 0 ? ordinal > 0 : ordinal >= source.length) {
+  // the only admissible cursor for an empty source is zero. A negative
+  // ordinal is inadmissible on any source: `slice` reads it as an offset from
+  // the end, where a stage cursor means an offset from the start.
+  if (
+    ordinal < 0 ||
+    (source.length === 0 ? ordinal > 0 : ordinal >= source.length)
+  ) {
     return malformed();
   }
   const slice = source.slice(ordinal, ordinal + maxItemsPerCall);
@@ -897,6 +905,7 @@ async function advanceOneChunk(
       });
       return pendingFromCommitted(committed);
     }
+    const perRecordAuditedRecords = fleetAuditAuditedRecords(records);
     return advancePerRecordChunk(
       options,
       lease,
@@ -905,7 +914,7 @@ async function advanceOneChunk(
       perRecordStage,
       inventory,
       records,
-      fleetAuditAuditedRecords(records),
+      perRecordAuditedRecords,
     );
   }
   const auditedRecords = fleetAuditAuditedRecords(records);
@@ -1096,13 +1105,13 @@ async function startAudit(
       }
       const record = started.record;
       const recordProgress = fleetAuditProgressFromUnknown(record.progress);
-      const pinGenerationValue =
-        started.outcome === 'adopted-running'
-          ? recordProgress.generation
-          : generation;
+      // The pin goes on the generation the PERSISTED record carries. A release
+      // reads `progress.generation` off durable state, so a pin on any other
+      // value is released at a generation nobody holds and leaks the real one
+      // for as long as the two disagree.
       try {
         await options.inventoryStore.pinGeneration({
-          generation: pinGenerationValue,
+          generation: recordProgress.generation,
           pinnedBy: fleetAuditPinOwner(operationId),
         });
       } catch {
@@ -1122,14 +1131,6 @@ async function startAudit(
       });
       const committedProgress: FleetAuditProgress = {
         ...recordProgress,
-        // Forced, not spread: the pin was taken at `pinGenerationValue`,
-        // while `recordProgress` carries whatever generation the store
-        // echoed back. Every later `releasePin` reads `progress.generation`
-        // off the persisted record — `failAudit` unguarded, and
-        // `abandonFleetAuditOperation` on both arms — so a store echoing a
-        // different generation on the `created` outcome would otherwise
-        // release a pin that was never taken and leak the real one.
-        generation: pinGenerationValue,
         revision: 1,
       };
       try {
@@ -1146,7 +1147,7 @@ async function startAudit(
         return pendingFromCommitted(committed);
       } catch {
         // Every throw from the revision-1 replay resolves to the same answer,
-        // and the catch is deliberately unnarrowed for that reason: for a
+        // and the catch is unnarrowed for that reason: for a
         // far-advanced running (or since-terminal) operation the CAS cannot
         // converge, and for a lost lease or a store fault the operation's
         // current authoritative state is still the only truthful reply. The
@@ -1235,8 +1236,16 @@ export type FleetAuditFindingsPage =
 
 /**
  * Read terminal audit findings, passing each returned cursor to the next call.
- * The store owns the final-page signal; findingCount does not certify page
- * completeness here.
+ * The store raises the final-page signal and this reader checks it against
+ * `FleetAuditProgress.findingCount`: a final page accounting for fewer rows
+ * than that count is malformed. A final page accounting for more is served,
+ * because an interrupted global chunk leaves finding rows staged above the
+ * count its commit never reached. No total-page bound is imposed.
+ *
+ * `limit` reaches the store as the caller wrote it, and a conforming store
+ * serves a `limit` above its documented 1,000-row ceiling at that ceiling, so
+ * an over-large page request costs the rows beyond it and leaves the rest to
+ * the cursor.
  */
 export async function readFleetAuditFindingsPage(
   store: FleetOperationStore,
@@ -1275,6 +1284,13 @@ export async function readFleetAuditFindingsPage(
     driftFindingRowFromUnknown(row.payload),
   );
   const lastRow = sortedRows.at(-1);
+  const accounted = lastRow === undefined ? firstOrdinal : lastRow.ordinal + 1;
+  if (
+    page.done &&
+    accounted < fleetAuditProgressFromUnknown(run.progress).findingCount
+  ) {
+    return malformed();
+  }
   if (lastRow === undefined) return { findings, done: true };
   return page.done
     ? { findings, done: true, nextAfterOrdinal: lastRow.ordinal }

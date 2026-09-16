@@ -2,6 +2,7 @@
 
 import type { PreparedDirectConformance } from './direct-credentialed-conformance-preflight.mjs';
 import type {
+  DirectBootstrapState,
   DirectResidualObservation,
   DirectRunJournal,
   DirectTeardownFailure,
@@ -46,6 +47,16 @@ export type DirectTeardownOutcome =
       phase: DirectTeardownPhase;
       facts: DirectTeardownProofs;
     }>;
+
+/**
+ * The identities a teardown has not removed. A receipt for a resource means the
+ * resource is gone, so the identity it carried is no longer retained; the
+ * evidence projection reads this derivation rather than repeating it.
+ */
+export function survivingIdentities(
+  bootstrap: DirectBootstrapState | null | undefined,
+  receipts: Partial<DirectTeardownReceipts>,
+): DirectTeardownProofs['retainedIdentities'];
 
 export function teardownDirectReference(
   input: Readonly<{

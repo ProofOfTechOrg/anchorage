@@ -22,8 +22,15 @@ import {
 } from '../scripts/direct-credentialed-conformance-preflight.mjs';
 
 // TypeScript's CommonJS namespace exposes createSourceFile as a non-configurable
-// getter, so the compiler seam is reachable only by mocking the module.
-const compiler = vi.hoisted(() => ({ failOnCall: 0 }));
+// getter: `vi.spyOn(ts, 'createSourceFile')` throws, so this seam mocks the
+// module. The source text identifies which artifact is being inspected; the
+// file name the script passes is a constant and cannot.
+const compiler = vi.hoisted(() => ({
+  failOnSource: null as string | null,
+  // The message the seam raises, distinctive enough for a test to assert that
+  // the compiler's own words never reach the caller.
+  sentinel: 'secret-sentinel Maximum call stack size exceeded',
+}));
 
 vi.mock('typescript', async (importOriginal) => {
   const actual = await importOriginal<{
@@ -32,17 +39,24 @@ vi.mock('typescript', async (importOriginal) => {
   const createSourceFile = (
     ...args: Parameters<typeof actual.default.createSourceFile>
   ) => {
-    if (compiler.failOnCall > 0) {
-      compiler.failOnCall -= 1;
-      if (compiler.failOnCall === 0)
-        throw new RangeError('Maximum call stack size exceeded');
-    }
+    if (
+      compiler.failOnSource !== null &&
+      args[1].includes(compiler.failOnSource)
+    )
+      throw new RangeError(compiler.sentinel);
     return actual.default.createSourceFile(...args);
   };
   return {
     ...actual,
     createSourceFile,
-    default: { ...actual.default, createSourceFile },
+    // Delegated rather than copied, so a namespace member the script starts
+    // using resolves against the live module instead of a snapshot of it.
+    default: new Proxy(actual.default, {
+      get: (target, key, receiver) =>
+        key === 'createSourceFile'
+          ? createSourceFile
+          : Reflect.get(target, key, receiver),
+    }),
   };
 });
 
@@ -89,6 +103,7 @@ function prepare(configPath: string) {
 }
 
 afterEach(async () => {
+  compiler.failOnSource = null;
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
   await Promise.all(
@@ -169,11 +184,55 @@ describe('direct artifact preflight', () => {
     'reference',
     'tenant',
   ] as const)('contains compiler failures for the %s role', async (role) => {
-    compiler.failOnCall = role === 'reference' ? 1 : 2;
-    const f = await fixture();
+    const marker = `// overflow-${role}`;
+    compiler.failOnSource = marker;
+    const f = await fixture(
+      REFERENCE + (role === 'reference' ? `\n${marker}` : ''),
+      TENANT + (role === 'tenant' ? `\n${marker}` : ''),
+    );
     await expect(prepare(f.configPath)).rejects.toThrow(
       `direct conformance preflight has invalid ${role} artifact module inspection`,
     );
+    // `toThrow(string)` is a substring match, so the replacement message alone
+    // would also pass for a message that carried the compiler's words too.
+    await expect(prepare(f.configPath)).rejects.not.toThrow(/secret-sentinel/u);
+  });
+
+  it.each([
+    'reference',
+    'tenant',
+  ] as const)('refuses nesting past the bound for the %s role before the compiler runs', async (role) => {
+    const suffix = (depth: number) =>
+      `\nconst deep = ${'('.repeat(depth)}1${')'.repeat(depth)};`;
+    compiler.failOnSource = 'const deep =';
+    const admitted = await fixture(
+      REFERENCE + (role === 'reference' ? suffix(100) : ''),
+      TENANT + (role === 'tenant' ? suffix(100) : ''),
+    );
+    await expect(prepare(admitted.configPath)).rejects.toThrow(
+      `direct conformance preflight has invalid ${role} artifact module inspection`,
+    );
+    const refused = await fixture(
+      REFERENCE + (role === 'reference' ? suffix(600) : ''),
+      TENANT + (role === 'tenant' ? suffix(600) : ''),
+    );
+    await expect(prepare(refused.configPath)).rejects.toThrow(
+      `direct conformance preflight has invalid ${role} artifact nesting`,
+    );
+  });
+
+  it.each([
+    'reference',
+    'tenant',
+  ] as const)('admits nesting under the bound for the %s role', async (role) => {
+    const suffix = `\nconst deep = ${'('.repeat(100)}1${')'.repeat(100)};`;
+    const f = await fixture(
+      REFERENCE + (role === 'reference' ? suffix : ''),
+      TENANT + (role === 'tenant' ? suffix : ''),
+    );
+    await expect(prepare(f.configPath)).resolves.toMatchObject({
+      manifest: { fixtureVersion: 1 },
+    });
   });
 
   it('rejects a JSON import attribute for the generated JavaScript manifest', async () => {
@@ -404,6 +463,12 @@ describe('direct artifact preflight', () => {
       await f.save();
     }
     await expect(prepare(f.configPath)).rejects.toThrow(/tenant artifact/);
+    if (kind === 'invalid-utf8')
+      // The decoder's own wording is replaced, not appended: a `toThrow`
+      // substring match on the relabel would pass either way.
+      await expect(prepare(f.configPath)).rejects.not.toThrow(
+        /encoding|encoded data|TextDecoder/iu,
+      );
   });
 
   it('rejects a FIFO without waiting for a writer', async () => {

@@ -445,7 +445,7 @@ export const MIGRATION_SUCCESS_BASELINE_OPS = [
 ] as const satisfies readonly MigrationOpLogEntry[];
 
 export const MIGRATION_STOP_BASELINE_ERROR =
-  "deployment 'bravo:production' has active backend switch 'candidate-deployed'" as const satisfies string;
+  "deployment 'bravo:production' has active backend switch 'candidate-deploy-authorized'" as const satisfies string;
 
 export const MIGRATION_STOP_BASELINE_OPS = [
   'withDeploymentLease',

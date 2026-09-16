@@ -3848,6 +3848,9 @@ describe('WorkersForPlatformsBackend', () => {
     const cancelled = vi.fn();
     const redirected: typeof fetch = async (input, init) => {
       const attested = await attestedHealthResponse(input, init);
+      expect(attested.headers.get(MAINTENANCE_RECEIPT_HEADER)).toEqual(
+        expect.any(String),
+      );
       void attested.body?.cancel();
       return new Response(new ReadableStream({ cancel: cancelled }), {
         status: 302,
@@ -3879,6 +3882,61 @@ describe('WorkersForPlatformsBackend', () => {
       message:
         'Workers for Platforms maintenance request refused a redirect with status 302',
     });
+    expect(cancelled).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    'ensureMaintenance',
+    'inspect',
+  ] as const)('cancels the unread %s maintenance response body', async (operation) => {
+    const cancelled = vi.fn();
+    const streamed: typeof fetch = async (input, init) => {
+      const attested = await attestedHealthResponse(input, init);
+      void attested.body?.cancel();
+      return new Response(new ReadableStream({ cancel: cancelled }), {
+        headers: attested.headers,
+      });
+    };
+    const backend = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client: new FakeApi(),
+      fetch: streamed,
+      hostRoutingKvId: 'host-routes',
+      platformProfileFor: () => platformProfile(),
+    });
+
+    await (operation === 'ensureMaintenance'
+      ? backend.ensureMaintenance(
+          deployment,
+          secrets.maintenanceAdmin,
+          fence,
+          'etag-v1',
+        )
+      : backend.inspect(deployment, secrets.maintenanceAdmin));
+
+    expect(cancelled).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancels the maintenance response body when no receipt attests it', async () => {
+    const cancelled = vi.fn();
+    const backend = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client: new FakeApi(),
+      fetch: async () =>
+        new Response(new ReadableStream({ cancel: cancelled })),
+      hostRoutingKvId: 'host-routes',
+      platformProfileFor: () => platformProfile(),
+    });
+
+    await expect(
+      backend.ensureMaintenance(
+        deployment,
+        secrets.maintenanceAdmin,
+        fence,
+        'etag-v1',
+      ),
+    ).rejects.toThrow(/did not attest fleet specification digest/);
+
     expect(cancelled).toHaveBeenCalledTimes(1);
   });
 

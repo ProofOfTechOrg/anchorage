@@ -11,7 +11,11 @@ import {
   inventory,
   openDirectProviderSession,
 } from './direct-credentialed-provider.mjs';
-import { DirectRunStateError } from './direct-credentialed-run-state.mjs';
+import { REFERENCE_SECRET_NAMES } from './direct-credentialed-reference-vocabulary.mjs';
+import {
+  DirectRunStateError,
+  mutationPending,
+} from './direct-credentialed-run-state.mjs';
 
 // The SDK's repeated type query parameters return no rows from the live API.
 const ZONE_TYPES = Object.freeze(['full', 'partial', 'secondary', 'internal']);
@@ -108,11 +112,7 @@ async function checkedInput(input) {
       )
     )
       refuse('invalid-input');
-    if (
-      snapshot.lastInvocation?.state === 'pending' ||
-      snapshot.bootstrap?.pending
-    )
-      refuse('outcome-unknown');
+    if (mutationPending(snapshot)) refuse('outcome-unknown');
     if (
       snapshot.invocationCount > 0 &&
       (!snapshot.bootstrap?.upload || !snapshot.bootstrap?.ingress)
@@ -573,11 +573,6 @@ export async function bootstrapDirectConformance(input) {
         text: JSON.stringify(runBinding),
       },
     ];
-    const secretNames = [
-      'CLOUDFLARE_API_TOKEN',
-      'FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET',
-      'DIRECT_DEPLOYMENT_SECRETS',
-    ];
     if (!state.upload) {
       await workerAbsent();
       const { generateDirectDeploymentSecrets } = await import(
@@ -604,7 +599,7 @@ export async function bootstrapDirectConformance(input) {
         },
         bindings: [
           ...bindings,
-          ...secretNames.map((name, index) => ({
+          ...REFERENCE_SECRET_NAMES.map((name, index) => ({
             name,
             type: 'secret_text',
             text: values[index],
@@ -721,7 +716,7 @@ export async function bootstrapDirectConformance(input) {
     );
     const expectedBindings = providerBindingsToPlainWorkerShape([
       ...bindings,
-      ...secretNames.map((name) => ({ name, type: 'secret_text' })),
+      ...REFERENCE_SECRET_NAMES.map((name) => ({ name, type: 'secret_text' })),
     ]).sort((a, b) => a.name.localeCompare(b.name));
     const checkBindings = (value) => {
       if (!Array.isArray(value)) refuse();

@@ -13,6 +13,7 @@ import {
   canonicalFleetOperationBytes,
   FLEET_OPERATION_KINDS,
   FLEET_OPERATION_ROW_KINDS,
+  FLEET_OPERATION_SINGLE_UPDATE_ROW_MESSAGE,
   FLEET_OPERATION_STAGE_BATCH_STATEMENTS,
   type FleetOperationKind,
   type FleetOperationLease,
@@ -23,10 +24,12 @@ import {
   type FleetOperationStore,
   FleetOperationStoreCapabilityError,
   fleetOperationOtherKindMessage,
+  fleetOperationPageLimit,
   fleetOperationRunRecordFromUnknown,
   fleetOperationSafeInteger,
   fleetOperationSha256,
   fleetOperationStagedRowFromUnknown,
+  fleetOperationWatermarkRunMessage,
 } from './fleet-operation-state.js';
 import type { FleetStateDatabase } from './state-store.js';
 
@@ -223,9 +226,7 @@ function validateCommitWatermarks(
     );
     const prefix = watermark - below.length;
     if (below.some((row) => row.ordinal < prefix)) {
-      throw new Error(
-        `commitProgress ${rowKind} rows below the watermark must be the contiguous run ending at it`,
-      );
+      throw new Error(fleetOperationWatermarkRunMessage(rowKind));
     }
     rowStatement.push(accountId, operationId, rowKind, prefix, prefix);
     runUpdate.push(accountId, operationId, rowKind, watermark, watermark);
@@ -451,6 +452,10 @@ export class D1FleetOperationStore implements FleetOperationStore {
     errors.push(...renewalErrors);
     if (releaseFailed) errors.push(releaseError);
     if (errors.length === 1) throw errors[0];
+    // An operation that fails beside a lease renewal or release failure
+    // reaches the caller inside the aggregate, first in `errors`: a caller
+    // that reads only `message` sees the cleanup summary, and the reason the
+    // operation itself raised is in `AggregateError.errors[0]`.
     if (errors.length > 1) {
       throw new AggregateError(
         errors,
@@ -826,6 +831,10 @@ export class D1FleetOperationStore implements FleetOperationStore {
       },
     ]);
     const written = result.at(-1) ?? [];
+    // The accepted path returns the intended record rather than a reread of
+    // it: this batch wrote those exact bytes under the revision guard. The
+    // converged path returns the persisted record instead, because there the
+    // bytes came from another writer and only the decode establishes them.
     if (written.length === 1 && written[0]?.operation_id === operationId) {
       return runRecord;
     }
@@ -841,6 +850,11 @@ export class D1FleetOperationStore implements FleetOperationStore {
     }>[],
     watermarks: readonly [FleetOperationRowKind, number][],
   ): Promise<FleetOperationRunRecord> {
+    // Reading the operation first fixes the record the row reads below are
+    // interpreted against, at the cost of staleness in the record returned: a
+    // concurrent abandon during those reads leaves this record reporting
+    // `running` for an operation already durably `failed`. The next call
+    // reads that state and refuses.
     const persisted = await this.readOperationById(operationId);
     if (!persisted) throw unknownOperation(operationId);
     for (const [rowKind, watermark] of watermarks) {
@@ -865,6 +879,9 @@ export class D1FleetOperationStore implements FleetOperationStore {
             AND row_kind = ? AND ordinal = ?`,
         [this.#accountId, operationId, row.rowKind, row.ordinal],
       );
+      // An opportunistic cross-check against a fault, not a defence: a writer
+      // able to change this row can change the operation record beside it and
+      // pass both comparisons.
       if (!stored[0]) complete = false;
       else if (rowString(stored[0], 'payload') !== bytes) {
         throw operationDivergence(operationId);
@@ -1024,7 +1041,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
     const { operationId, expectedRevision } = input;
     const runRecord = fleetOperationRunRecordFromUnknown(input.runRecord);
     if ((input.updateRows?.length ?? 0) > 1) {
-      throw new Error('failOperation accepts at most one updateRow');
+      throw new Error(FLEET_OPERATION_SINGLE_UPDATE_ROW_MESSAGE);
     }
     const updateRows = (input.updateRows ?? []).map((row) =>
       stagedRowForKindFromUnknown(kind, row),
@@ -1149,7 +1166,11 @@ export class D1FleetOperationStore implements FleetOperationStore {
             AND row_kind = ? AND ordinal = ?`,
         [this.#accountId, operationId, row.rowKind, row.ordinal],
       );
-      if (!stored[0] || rowString(stored[0], 'payload') !== bytes) {
+      // A missing target row is a conflict, as it is on the convergence path:
+      // the row can still be staged under a later revision, while divergence
+      // reports the unrecoverable case of landed bytes that differ.
+      if (!stored[0]) throw operationConflict(operationId);
+      if (rowString(stored[0], 'payload') !== bytes) {
         throw operationDivergence(operationId);
       }
     }
@@ -1165,7 +1186,7 @@ export class D1FleetOperationStore implements FleetOperationStore {
   ): Promise<
     Readonly<{ rows: readonly FleetOperationStagedRow[]; done: boolean }>
   > {
-    assertLimit(input.limit);
+    const limit = fleetOperationPageLimit(input.limit);
     if (!FLEET_OPERATION_ROW_KINDS.includes(input.rowKind)) {
       throw new Error(
         `rowKind must be one of ${FLEET_OPERATION_ROW_KINDS.join(', ')}`,
@@ -1196,17 +1217,17 @@ export class D1FleetOperationStore implements FleetOperationStore {
         input.operationId,
         input.rowKind,
         input.afterOrdinal ?? -1,
-        input.limit + 1,
+        limit + 1,
       ],
     );
-    const rows = stored.slice(0, input.limit).map((row) =>
+    const rows = stored.slice(0, limit).map((row) =>
       stagedRowForKindFromUnknown(kind, {
         rowKind: rowString(row, 'row_kind'),
         ordinal: rowNumber(row, 'ordinal'),
         payload: parseJson(rowString(row, 'payload')),
       }),
     );
-    return { rows, done: stored.length <= input.limit };
+    return { rows, done: stored.length <= limit };
   }
 
   async pruneFleetOperations(

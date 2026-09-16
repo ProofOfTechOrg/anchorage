@@ -108,7 +108,11 @@ export interface AdvanceDecommissionDeploymentOptions {
   readonly action: DecommissionAdvanceAction;
   /** Provider-fetch attempt budget for each bounded attachment scan, integer 9..1,000. */
   readonly maxProviderRequests: number;
-  /** Call-local cancellation, never persisted. */
+  /**
+   * Call-local cancellation, never persisted. This engine forwards it to the
+   * bounded attachment scan, which is where it is honoured; the engine takes
+   * no step of its own on it.
+   */
   readonly signal?: AbortSignal;
   /** Timestamp source; called once for each accepted write. */
   readonly clock?: () => number;

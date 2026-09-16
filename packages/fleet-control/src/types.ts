@@ -364,6 +364,24 @@ export const BACKEND_SWITCH_SUBPHASES = [
 
 export type BackendSwitchSubphase = (typeof BACKEND_SWITCH_SUBPHASES)[number];
 
+/**
+ * The subphases at which a backend switch holds nothing: it either rolled back
+ * to the prior deployment or finalized onto the target. Every other subphase
+ * is an operation in flight.
+ */
+export const SETTLED_BACKEND_SWITCH_SUBPHASES = new Set<BackendSwitchSubphase>([
+  'rolled-back',
+  'finalized',
+]);
+
+/**
+ * The subphase a backend-switch teardown reaches once it has committed the
+ * database export and released the application resources it tracked. A record
+ * carrying a switch intent is read as a completed teardown only here.
+ */
+export const RETIRED_BACKEND_SWITCH_SUBPHASE =
+  'decommissioned' satisfies BackendSwitchSubphase;
+
 export interface PlainBackendSnapshot {
   readonly scriptName: string;
   readonly artifactVersion: string;
@@ -716,7 +734,11 @@ export interface DecommissionAttachmentScanInput {
   readonly progress: DecommissionAttachmentProgress;
   /** Reserved provider-attempt ceiling; an integer from 9 through 1,000. */
   readonly maxProviderRequests: number;
-  /** Call-local cancellation; never persisted in a shell or Queue token. */
+  /**
+   * Call-local cancellation; never persisted in a shell or Queue token. The
+   * scan checks it before each provider request and hands it to the request
+   * itself, so an in-flight attempt aborts with it.
+   */
   readonly signal?: AbortSignal;
 }
 
@@ -1093,18 +1115,22 @@ export function assertNoActiveDecommission(
 }
 
 /**
- * Refuses lifecycle entries while a bounded cleanup is active. Cleanup has no
- * terminal intent state — the terminal deletes the Fleet row — so ANY present
- * intent is active.
+ * Whether a bounded cleanup holds this record. Cleanup has no terminal intent
+ * state — the terminal deletes the Fleet row — so ANY present intent is
+ * active.
  */
+export function hasActiveCleanup(record: FleetRecord): boolean {
+  return (
+    record.phase === 'cleanup-advancing' || record.cleanupIntent !== undefined
+  );
+}
+
+/** Refuses lifecycle entries while a bounded cleanup is active. */
 export function assertNoActiveCleanup(
   record: FleetRecord,
   operation: string,
 ): void {
-  if (
-    record.phase === 'cleanup-advancing' ||
-    record.cleanupIntent !== undefined
-  ) {
+  if (hasActiveCleanup(record)) {
     throw new Error(`${operation} cannot run during an active cleanup`);
   }
 }

@@ -210,37 +210,63 @@ async function readBefore(context: DirectReferenceContext) {
   return { identity, resource };
 }
 
+type ForcePlane = ReturnType<DirectReferenceContext['createForcePlane']>;
+
+/**
+ * Refuses a lease on any deployment but `tenantTag`/`environment`, and hands
+ * `capture` the record read under the held lease before the caller's own
+ * operation runs.
+ */
+function interceptDeploymentLease(
+  plane: ForcePlane,
+  tenantTag: string,
+  environment: string,
+  capture: (
+    record: FleetRecord | undefined,
+    lease: FleetStateLease,
+  ) => Promise<void>,
+): void {
+  const underLease = plane.store.withDeploymentLease.bind(plane.store);
+  plane.store.withDeploymentLease = (
+    leasedTag,
+    leasedEnvironment,
+    operation,
+  ) => {
+    if (leasedTag !== tenantTag || leasedEnvironment !== environment)
+      throw new DirectReferenceExecutionError();
+    return underLease(leasedTag, leasedEnvironment, async (lease) => {
+      await capture(await plane.store.get(leasedTag, leasedEnvironment), lease);
+      return operation(lease);
+    });
+  };
+}
+
 export async function forceDirectTerminal(
   context: DirectReferenceContext,
   manifest: DirectRunManifest,
   role: 'a',
-) {
+): Promise<{
+  returned: true;
+  before: { databaseId: string; scriptName: string } | null;
+  after: { present: false };
+}> {
   const names = manifest.names.roles[role];
   const plane = context.createForcePlane();
-  const underLease = plane.store.withDeploymentLease.bind(plane.store);
   let before: { databaseId: string; scriptName: string } | null = null;
-  plane.store.withDeploymentLease = (tenantTag, environment, operation) => {
-    if (tenantTag !== names.tenantTag || environment !== manifest.environment)
-      throw new DirectReferenceExecutionError();
-    return underLease(tenantTag, environment, async (lease) => {
-      const record = await plane.store.get(tenantTag, environment);
-      if (record) {
-        if (
-          record.phase !== 'decommissioned' ||
-          (record.decommissionIntent &&
-            record.decommissionIntent.state !== 'complete') ||
-          record.cleanupIntent ||
-          context.roleFor(record) !== role
-        )
-          throw new DirectReferenceExecutionError();
-        before = {
-          databaseId: record.databaseId,
-          scriptName: record.scriptName,
-        };
-      }
-      return operation(lease);
-    });
-  };
+  interceptDeploymentLease(
+    plane,
+    names.tenantTag,
+    manifest.environment,
+    async (record) => {
+      if (!record) return;
+      if (record.phase !== 'decommissioned' || context.roleFor(record) !== role)
+        throw new DirectReferenceExecutionError();
+      before = {
+        databaseId: record.databaseId,
+        scriptName: record.scriptName,
+      };
+    },
+  );
   await forceDecommissionDeployment({
     backend: plane.backend,
     store: plane.store,
@@ -258,7 +284,6 @@ export async function recoverDirectForce(
 ) {
   const names = manifest.names.roles.recovery;
   const plane = context.createForcePlane();
-  const underLease = plane.store.withDeploymentLease.bind(plane.store);
   let observed: Awaited<ReturnType<typeof readBefore>>;
   const capture = async (
     record: FleetRecord | undefined,
@@ -344,14 +369,12 @@ export async function recoverDirectForce(
     await lease.assertOwned();
     context.transport.assertWithinBudget();
   };
-  plane.store.withDeploymentLease = (tenantTag, environment, operation) => {
-    if (tenantTag !== names.tenantTag || environment !== manifest.environment)
-      throw new DirectReferenceExecutionError();
-    return underLease(tenantTag, environment, async (lease) => {
-      await capture(await plane.store.get(tenantTag, environment), lease);
-      return operation(lease);
-    });
-  };
+  interceptDeploymentLease(
+    plane,
+    names.tenantTag,
+    manifest.environment,
+    capture,
+  );
   await forceDecommissionDeployment({
     backend: plane.backend,
     store: plane.store,
@@ -367,7 +390,6 @@ export async function recoverDirectForce(
 
 type ForceBefore = NonNullable<Awaited<ReturnType<typeof readBefore>>>;
 type ForceResource = ReturnType<typeof forceResource>;
-type ForcePlane = ReturnType<DirectReferenceContext['createForcePlane']>;
 
 interface DirectForceFootprint {
   readonly version: 1;

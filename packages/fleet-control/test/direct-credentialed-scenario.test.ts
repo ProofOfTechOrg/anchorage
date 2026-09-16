@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { spawn } from 'node:child_process';
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
   EXECUTION_FENCE_ROW_ID,
@@ -19,7 +18,6 @@ import {
   openDirectRunState,
 } from '../scripts/direct-credentialed-run-state.mjs';
 import {
-  type DirectScenarioOutcome,
   type DirectScenarioState,
   runDirectCredentialedScenario,
 } from '../scripts/direct-credentialed-scenario.mjs';
@@ -30,13 +28,12 @@ import {
 import {
   hash,
   jsonHash,
+  recordFacts,
 } from '../scripts/direct-credentialed-scenario-checks.mjs';
 import { DIRECT_TENANT_OBJECT_BODY } from '../scripts/direct-credentialed-tenant-object.mjs';
 import type { DirectReferenceAction } from '../scripts/direct-reference-contract.mjs';
 import { directObservationFixture } from './fixtures/direct-observations.js';
-import { createDirectReferenceHarness } from './fixtures/direct-reference-harness.js';
 import {
-  cleanupDirectRunState,
   type MutableScenario,
   PROCESS,
   present,
@@ -44,29 +41,73 @@ import {
   scenarioJournal,
   scenarioWith,
 } from './fixtures/direct-run-state-builder.js';
+import {
+  childResumeDirectScenario as childResume,
+  directScenarioCleanup as cleanup,
+  closeDirectScenarioFixtures,
+  type DirectScenarioNodeResponse,
+  createDirectScenarioFixture as fixture,
+  resumeDirectScenarioJournal as resume,
+} from './fixtures/direct-scenario-harness.js';
 
-const cleanup: (() => Promise<void>)[] = [];
-afterEach(async () => {
-  const results = await Promise.allSettled(
-    cleanup
-      .splice(0)
-      .reverse()
-      .map((close) => close()),
-  );
-  await cleanupDirectRunState();
-  const failed = results.filter((result) => result.status === 'rejected');
-  expect(failed).toEqual([]);
-});
+afterEach(closeDirectScenarioFixtures);
 
-async function resume(f: Awaited<ReturnType<typeof fixture>>) {
-  const resumed = await openDirectRunState({
-    configPath: f.local.configPath,
-    prepared: f.local.prepared,
-    accountId: 'account',
-    mode: 'resume',
-  });
-  cleanup.push(() => resumed.close());
-  return resumed;
+type FenceMutationAfter = {
+  state: string;
+  mutationEpoch: number;
+  requireMutationEpoch: boolean;
+  transitionRevision: number;
+};
+
+/**
+ * One armed interception of the reference Worker's own fence answer. The first
+ * `tenant-fence` reply whose new state matches `operation` is replaced by the
+ * CAS conflict `reason` describes; every later reply passes through, so the
+ * case pins what the run does with a single conflict rather than a stream.
+ */
+function fenceConflict(
+  operation: 'drain' | 'reopen',
+  reason: (after: FenceMutationAfter) => Record<string, unknown>,
+  onConflict?: () => void,
+) {
+  let armed = true;
+  const nodeResponse: DirectScenarioNodeResponse = async (
+    _request,
+    response,
+  ) => {
+    if (
+      !armed ||
+      !response.headers.get('content-type')?.includes('application/json')
+    )
+      return response;
+    const value = (await response.clone().json()) as {
+      action?: string;
+      result?: { after?: FenceMutationAfter };
+    };
+    const after = value.result?.after;
+    if (
+      value.action !== 'tenant-fence' ||
+      after?.state !== (operation === 'drain' ? 'draining' : 'open')
+    )
+      return response;
+    armed = false;
+    onConflict?.();
+    return Response.json(
+      {
+        ...value,
+        result: {
+          ok: false,
+          reason: {
+            code: 'FENCE_CAS_CONFLICT',
+            ...reason(after),
+            conflict: 'expectation-mismatch',
+          },
+        },
+      },
+      { status: response.status, headers: response.headers },
+    );
+  };
+  return { nodeResponse, fired: () => !armed };
 }
 
 describe.sequential('scenario proof failures in native reference state', {
@@ -500,164 +541,6 @@ describe('scenario journal refusal boundaries', () => {
   });
 });
 
-async function fixture(
-  options: {
-    nodeResponse?: NonNullable<
-      Parameters<typeof createDirectReferenceHarness>[0]
-    >['nodeResponse'];
-  } = {},
-) {
-  const local = await directObservationFixture(30_000, 'confirmed', {
-    invocationTimeoutMs: 600_000,
-    maxProviderRequests: 1000,
-  });
-  cleanup.push(() => local.close());
-  const native = await createDirectReferenceHarness({
-    manifest: local.prepared.manifest,
-    binding: {
-      version: 1,
-      accountId: 'account',
-      fleetDatabaseId: 'fleet-id',
-      quotaDatabaseId: 'quota-id',
-      exportBucketName: local.prepared.names.exportBucket,
-      referenceModuleSetSha256: local.prepared.referenceModuleSetSha256,
-      accountWorkersDevSubdomain: 'attested-account',
-    },
-    maintenanceNow: Date.now,
-    applicationProbes: true,
-    nodeProviderRest: true,
-    ...(options.nodeResponse ? { nodeResponse: options.nodeResponse } : {}),
-  });
-  cleanup.push(() => native.close());
-  const input = (journal: DirectRunJournal = local.journal) => ({
-    prepared: local.prepared,
-    journal,
-    apiToken: 'inert-provider-token',
-    fetch: native.fetch,
-    invocation: createDirectInvocationClient({
-      prepared: local.prepared,
-      journal,
-      accountWorkersDevSubdomain: native.binding.accountWorkersDevSubdomain,
-      invokeSecret: 'inert-invoke',
-      fetch: native.fetch,
-    }),
-  });
-  return { local, native, input };
-}
-
-async function childResume(
-  f: Awaited<ReturnType<typeof fixture>>,
-  fault?:
-    | 'export-fsync'
-    | 'fence-reopen-after-settle'
-    | 'fence-drain-role-split',
-) {
-  await f.local.journal.close();
-  const script = join(f.local.directory, 'resume.mjs');
-  const moduleUrl = (name: string) =>
-    new URL(`../scripts/${name}.mjs`, import.meta.url).href;
-  await writeFile(
-    script,
-    `
-import {preflightDirectConformance} from ${JSON.stringify(moduleUrl('direct-credentialed-conformance-preflight'))};
-import {openDirectRunState} from ${JSON.stringify(moduleUrl('direct-credentialed-run-state'))};
-import {createDirectInvocationClient} from ${JSON.stringify(moduleUrl('direct-credentialed-invocation'))};
-import {runDirectCredentialedScenario} from ${JSON.stringify(moduleUrl('direct-credentialed-scenario'))};
-import fs from 'node:fs/promises';
-import {syncBuiltinESMExports} from 'node:module';
-${fault === 'export-fsync' ? `const realOpen=fs.open;let injected=false;fs.open=async(...args)=>{const handle=await realOpen(...args);if(String(args[0]).includes('/.journal-')){const realWrite=handle.writeFile.bind(handle),realSync=handle.sync.bind(handle);let proof=false;handle.writeFile=async(value,...rest)=>{const state=JSON.parse(String(value));proof=Boolean(state.scenario?.proofs.exports.a);return realWrite(value,...rest);};handle.sync=async()=>{if(proof&&!injected){injected=true;console.log('SCENARIO_FAULT export-fsync');throw new Error('fixture proof fsync failure');}return realSync();};}return handle;};syncBuiltinESMExports();` : ''}
-const prepared=await preflightDirectConformance({configPath:${JSON.stringify(f.local.configPath)}});
-const journal=await openDirectRunState({configPath:${JSON.stringify(f.local.configPath)},prepared,accountId:'account',mode:'resume'});
-${
-  fault === 'fence-reopen-after-settle'
-    ? `const faulted = Object.freeze({
-  ...journal,
-  recordScenario: async (...args) => {
-    const result = await journal.recordScenario(...args);
-    const [scenario] = args;
-    if (scenario.phase === 'fence-reopen' &&
-        scenario.mutation?.outcome === 'returned' &&
-        scenario.mutation?.action?.kind === 'tenant-fence' &&
-        scenario.mutation?.action?.operation === 'reopen' &&
-        scenario.mutation?.action?.role === 'a' &&
-        scenario.proofs.fence.reopen.a?.after === null) {
-      console.log('SCENARIO_FAULT fence-reopen-after-settle');
-      process.exit(0);
-    }
-    return result;
-  },
-});`
-    : fault === 'fence-drain-role-split'
-      ? `const faulted = Object.freeze({
-  ...journal,
-  recordScenario: async (...args) => {
-    const result = await journal.recordScenario(...args);
-    const [scenario] = args;
-    if (scenario.phase === 'fence-drain' &&
-        scenario.proofs.fence.drain.a?.after != null &&
-        scenario.proofs.fence.sweeps.a !== null &&
-        scenario.proofs.fence.drain.b?.after === null &&
-        scenario.proofs.fence.drain.b?.ordinal === null) {
-      console.log('SCENARIO_FAULT fence-drain-role-split');
-      process.exit(0);
-    }
-    return result;
-  },
-});`
-      : 'const faulted = journal;'
-}
-const originalFetch=globalThis.fetch;
-const fetch=async(input,init)=>{const request=new Request(input,init);const url=new URL(request.url);if(url.origin!=='https://api.cloudflare.com'&&url.origin!==${JSON.stringify(`https://${f.local.prepared.names.referenceWorker}.attested-account.workers.dev`)})throw new Error('unexpected child origin');const headers=new Headers(request.headers);headers.set('X-Direct-Fixture-Url',request.url);return originalFetch(${JSON.stringify(f.native.bridgeUrl)},{method:request.method,headers,body:request.body,signal:request.signal,redirect:'manual',duplex:'half'});};
-globalThis.fetch=async()=>{throw new Error('unexpected child network');};
-try {const invocation=createDirectInvocationClient({prepared,journal: faulted,accountWorkersDevSubdomain:'attested-account',invokeSecret:'inert-invoke',fetch});const result=await runDirectCredentialedScenario({prepared,journal: faulted,invocation,apiToken:'inert-provider-token',fetch});console.log('SCENARIO_RESULT '+JSON.stringify(result));}finally{await faulted.close();}
-`,
-  );
-  const child = spawn(process.execPath, [script], {
-    env: { PATH: process.env.PATH },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  let stdout = '';
-  let stderr = '';
-  child.stdout.on('data', (chunk) => {
-    stdout += String(chunk);
-  });
-  child.stderr.on('data', (chunk) => {
-    stderr += String(chunk);
-  });
-  const status = await new Promise<number | null>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL');
-    }, 540_000);
-    child.once('error', (error) => {
-      clearTimeout(timer);
-      reject(error);
-    });
-    child.once('close', (code) => {
-      clearTimeout(timer);
-      resolve(code);
-    });
-  });
-  expect({ status, stderr }).toEqual({ status: 0, stderr: '' });
-  const line = stdout
-    .split('\n')
-    .find((line) => line.startsWith('SCENARIO_RESULT '));
-  if (!line) {
-    if (
-      fault !== 'fence-reopen-after-settle' &&
-      fault !== 'fence-drain-role-split'
-    )
-      throw new Error(`child returned no result: ${stdout}`);
-    return { result: null, stdout, stderr };
-  }
-  return {
-    result: JSON.parse(
-      line.slice('SCENARIO_RESULT '.length),
-    ) as DirectScenarioOutcome,
-    stdout,
-    stderr,
-  };
-}
-
 describe.sequential('fixed Node scenario through native reference dispatch', {
   timeout: 660_000,
 }, () => {
@@ -750,9 +633,6 @@ describe.sequential('fixed Node scenario through native reference dispatch', {
         mutationEpoch: 1,
         ordinal: expect.any(Number),
       });
-      process.stdout.write(
-        `A1_SWEEP_INTERVAL ${role} ${fence.sweeps[role]?.intervalMs}\n`,
-      );
       expect(proofs.initial[role]?.trafficPercentage).toBe(100);
       expect(proofs.candidate[role]?.trafficPercentage).toBe(0);
       expect(proofs.final[role]?.trafficPercentage).toBe(100);
@@ -775,11 +655,8 @@ describe.sequential('fixed Node scenario through native reference dispatch', {
       proofs.inventories.before?.routeHostnames,
     );
     expect(proofs.inventories.after?.routeHostnames).toEqual(
-      ['a', 'b']
-        .map(
-          (role) =>
-            f.local.prepared.names.roles[role as 'a' | 'b'].routeHostname,
-        )
+      (['a', 'b'] as const)
+        .map((role) => f.local.prepared.names.roles[role].routeHostname)
         .sort(),
     );
     expect(proofs.effects).toHaveLength(2);
@@ -820,13 +697,8 @@ describe.sequential('fixed Node scenario through native reference dispatch', {
       DIRECT_SCENARIO_INVOCATION_BUDGET;
     const phaseCalls: Record<string, number> =
       JSON.parse(serialized).scenario.phaseCalls;
-    process.stdout.write(
-      `A1_TERMINAL_FORCE_PHASE_CALLS ${phaseCalls['force-terminal-a']}\n`,
-    );
-    for (const phase of ['fence-drain', 'fence-reopen', 'fence-proofs']) {
+    for (const phase of ['fence-drain', 'fence-reopen', 'fence-proofs'])
       expect(phaseCalls[phase]).toBe(9);
-      process.stdout.write(`A1_PHASE_CALLS ${phase} ${phaseCalls[phase]}\n`);
-    }
     expect(
       Object.entries(phaseCalls).filter(
         ([phase, calls]) => calls > (budget[phase]?.ceiling ?? 0),
@@ -848,49 +720,20 @@ describe.sequential('fence composition through native reference dispatch', {
     ['reopen', 'open', 2],
     ['drain', 'open', 1],
   ] as const)('refuses a %s conflict at %s epoch %i without a later mutation', async (operation, state, mutationEpoch) => {
-    let armed = true;
     let mutations: string[] | undefined;
-    const f = await fixture({
-      nodeResponse: async (_request, response) => {
-        if (
-          !armed ||
-          !response.headers.get('content-type')?.includes('application/json')
-        )
-          return response;
-        const value = (await response.clone().json()) as {
-          action?: string;
-          result?: {
-            ok?: boolean;
-            after?: { state: string; transitionRevision: number };
-          };
-        };
-        if (
-          value.action !== 'tenant-fence' ||
-          value.result?.after?.state !==
-            (operation === 'drain' ? 'draining' : 'open')
-        )
-          return response;
-        armed = false;
+    const conflict = fenceConflict(
+      operation,
+      (after) => ({
+        state,
+        mutationEpoch,
+        requireMutationEpoch: true,
+        transitionRevision: after.transitionRevision,
+      }),
+      () => {
         mutations = [...f.native.world.mutationLog];
-        return Response.json(
-          {
-            ...value,
-            result: {
-              ok: false,
-              reason: {
-                code: 'FENCE_CAS_CONFLICT',
-                state,
-                mutationEpoch,
-                requireMutationEpoch: true,
-                transitionRevision: value.result.after.transitionRevision,
-                conflict: 'expectation-mismatch',
-              },
-            },
-          },
-          { status: response.status, headers: response.headers },
-        );
       },
-    });
+    );
+    const f = await fixture({ nodeResponse: conflict.nodeResponse });
     const first = await runDirectCredentialedScenario(f.input());
     if (operation === 'reopen') {
       expect(first).toEqual({ status: 'restart-required' });
@@ -906,7 +749,7 @@ describe.sequential('fence composition through native reference dispatch', {
         phase: 'fence-drain',
       });
     }
-    expect(armed).toBe(false);
+    expect(conflict.fired()).toBe(true);
     const disk = JSON.parse(
       await readFile(join(f.local.journal.directory, 'journal.json'), 'utf8'),
     );
@@ -918,55 +761,17 @@ describe.sequential('fence composition through native reference dispatch', {
     'drain',
     'reopen',
   ] as const)('accepts a flattened %s conflict with an intervening revision', async (operation) => {
-    let armed = true;
-    const f = await fixture({
-      nodeResponse: async (_request, response) => {
-        if (
-          !armed ||
-          !response.headers.get('content-type')?.includes('application/json')
-        )
-          return response;
-        const value = (await response.clone().json()) as {
-          action?: string;
-          result?: {
-            after?: {
-              state: string;
-              mutationEpoch: number;
-              requireMutationEpoch: boolean;
-              transitionRevision: number;
-            };
-          };
-        };
-        if (
-          value.action !== 'tenant-fence' ||
-          value.result?.after?.state !==
-            (operation === 'drain' ? 'draining' : 'open')
-        )
-          return response;
-        armed = false;
-        return Response.json(
-          {
-            ...value,
-            result: {
-              ok: false,
-              reason: {
-                code: 'FENCE_CAS_CONFLICT',
-                ...value.result.after,
-                transitionRevision: value.result.after.transitionRevision + 1,
-                conflict: 'expectation-mismatch',
-              },
-            },
-          },
-          { status: response.status, headers: response.headers },
-        );
-      },
-    });
+    const conflict = fenceConflict(operation, (after) => ({
+      ...after,
+      transitionRevision: after.transitionRevision + 1,
+    }));
+    const f = await fixture({ nodeResponse: conflict.nodeResponse });
     expect(await runDirectCredentialedScenario(f.input())).toEqual({
       status: 'restart-required',
     });
     const child = await childResume(f);
     expect(child.result).toMatchObject({ status: 'complete' });
-    expect(armed).toBe(false);
+    expect(conflict.fired()).toBe(true);
     if (child.result?.status !== 'complete')
       throw new Error('scenario did not complete');
     const entry = child.result.facts.fence[operation].a;
@@ -1357,15 +1162,35 @@ describe('scenario resume re-entry against a settled journal', () => {
     return state;
   };
 
-  it.each([
-    ['interrupted at mutation settlement', 0, false, 'matching'],
-    ['persisted nonzero-attempt witness', 1, false, 'matching'],
-    ['interrupted at proof persistence', 0, true, 'matching'],
-    ['persisted absent-row no-op witness', 0, false, 'absent'],
-    ['persisted foreign before identity', 0, false, 'foreign'],
-  ] as const)('terminal force resume: %s', async (_title, provider, persisted, identity) => {
-    const target = await scenarioJournal(DIRECT_SCENARIO_MIN_INVOCATIONS);
-    const attempts = { provider, maintenance: 0, application: 0 };
+  type ControlRead = { records: { role: string }[] };
+
+  const withControlRead = <Result>(
+    invocation: DirectInvocationClient,
+    rewrite: (result: Result) => object,
+  ): DirectInvocationClient => ({
+    async invoke(action) {
+      const outcome = await invocation.invoke(action);
+      if (action.kind !== 'control-read') return outcome;
+      return { ...outcome, result: rewrite(outcome.result as Result) };
+    },
+  });
+
+  const withoutRoleA = (result: ControlRead) => ({
+    ...result,
+    records: result.records.map((record) =>
+      record.role === 'a' ? { role: 'a', present: false } : record,
+    ),
+  });
+
+  const seedTerminalForceResume = async (
+    target: Journal,
+    attempts: { provider: number; maintenance: number; application: number },
+    options: {
+      persisted?: boolean;
+      identity?: 'matching' | 'absent' | 'foreign';
+    } = {},
+  ) => {
+    const identity = options.identity ?? 'matching';
     const state = seed('force-terminal-a', (state) => {
       state.mutation = settledCall(
         'force-terminal',
@@ -1391,16 +1216,9 @@ describe('scenario resume re-entry against a settled journal', () => {
         resumedProcess: { ...RESUMED },
         replayOrdinal: 3,
       }) as MutableScenario['proofs']['restart'];
-      state.records[0] = {
-        role: 'a',
-        present: false,
-        phase: null,
-        desiredSpecDigest: null,
-        pendingSpecDigest: null,
-        artifactVersion: null,
-        pendingArtifactVersion: null,
-        databaseId: null,
-      };
+      state.records = state.records.map((entry) =>
+        entry.role === 'a' ? recordFacts({ role: 'a', present: false }) : entry,
+      );
     });
     const proof = {
       databaseId: present(state.proofs.decommission.a).databaseId,
@@ -1408,63 +1226,168 @@ describe('scenario resume re-entry against a settled journal', () => {
       ordinal: 3,
       attempts,
     };
-    if (persisted) state.proofs.terminalForce.a = proof;
+    if (options.persisted) state.proofs.terminalForce.a = proof;
     const frozen = JSON.stringify(state.proofs.terminalForce);
     await expect(target.journal.recordScenario(state)).resolves.toBeUndefined();
     expect(stored(target).phase).toBe('force-terminal-a');
     const { invocation, actions } = reference(target, { interrupted: true });
-    const absent: DirectInvocationClient = {
-      async invoke(action) {
-        const outcome = await invocation.invoke(action);
-        if (action.kind !== 'control-read') return outcome;
-        const result = outcome.result as { records: { role: string }[] };
-        return {
-          ...outcome,
-          result: {
-            ...result,
-            records: result.records.map((record) =>
-              record.role === 'a' ? { role: 'a', present: false } : record,
-            ),
-          },
-        };
-      },
-    };
-    const result = await run(target, absent);
+    return { state, proof, frozen, actions, invocation };
+  };
+
+  const noForceTerminal = (actions: DirectReferenceAction[]) =>
     expect(
       actions.filter((action) => action.kind === 'force-terminal'),
     ).toEqual([]);
-    if (provider || identity !== 'matching') {
-      expect(result).toMatchObject({
-        status: 'failed',
-        reason: 'observation-mismatch',
-        phase: 'force-terminal-a',
-      });
-      expect(stored(target).proofs.terminalForce.a).toBeNull();
-    } else {
-      expect(stored(target).phase).toBe('force-recovery');
-      expect(stored(target).proofs.terminalForce.a).toEqual(proof);
-      if (persisted)
-        expect(JSON.stringify(stored(target).proofs.terminalForce)).toBe(
-          frozen,
-        );
-    }
+
+  it.each([
+    ['interrupted at mutation settlement', false],
+    ['interrupted at proof persistence', true],
+  ] as const)('terminal force resume: %s', async (_title, persisted) => {
+    const target = await scenarioJournal(DIRECT_SCENARIO_MIN_INVOCATIONS);
+    const { proof, frozen, actions, invocation } =
+      await seedTerminalForceResume(
+        target,
+        { provider: 0, maintenance: 0, application: 0 },
+        { persisted },
+      );
+    await run(target, withControlRead(invocation, withoutRoleA));
+    noForceTerminal(actions);
+    expect(stored(target).phase).toBe('force-recovery');
+    expect(stored(target).proofs.terminalForce.a).toEqual(proof);
+    if (persisted)
+      expect(JSON.stringify(stored(target).proofs.terminalForce)).toBe(frozen);
+  });
+
+  it('terminal force resume: persisted nonzero-attempt witness', async () => {
+    const target = await scenarioJournal(DIRECT_SCENARIO_MIN_INVOCATIONS);
+    const { actions, invocation } = await seedTerminalForceResume(target, {
+      provider: 1,
+      maintenance: 0,
+      application: 0,
+    });
+    const result = await run(target, withControlRead(invocation, withoutRoleA));
+    noForceTerminal(actions);
+    expect(result).toMatchObject({
+      status: 'failed',
+      reason: 'observation-mismatch',
+      phase: 'force-terminal-a',
+    });
+    expect(stored(target).proofs.terminalForce.a).toBeNull();
   });
 
   it.each([
-    ['matching identity', 'matching', null],
-    ['absent row', null, null],
-    ['missing identity', undefined, null],
+    ['persisted absent-row no-op witness', 'absent'],
+    ['persisted foreign before identity', 'foreign'],
+  ] as const)('terminal force resume: %s', async (_title, identity) => {
+    const target = await scenarioJournal(DIRECT_SCENARIO_MIN_INVOCATIONS);
+    const { actions, invocation } = await seedTerminalForceResume(
+      target,
+      { provider: 0, maintenance: 0, application: 0 },
+      { identity },
+    );
+    const result = await run(target, withControlRead(invocation, withoutRoleA));
+    noForceTerminal(actions);
+    expect(result).toMatchObject({
+      status: 'failed',
+      reason: 'observation-mismatch',
+      phase: 'force-terminal-a',
+    });
+    expect(stored(target).proofs.terminalForce.a).toBeNull();
+  });
+
+  it('terminal force resume: reconciles the mutation against the record it still holds', async () => {
+    const target = await scenarioJournal(DIRECT_SCENARIO_MIN_INVOCATIONS);
+    const attempts = { provider: 0, maintenance: 0, application: 0 };
+    const state = seed('force-terminal-a', (state) => {
+      state.mutation = settledCall(
+        'force-terminal',
+        'returned',
+        3,
+        { role: 'a' },
+        attempts,
+      ) as MutableScenario['mutation'];
+      present(state.mutation).before = {
+        databaseId: present(state.proofs.decommission.a).databaseId,
+        scriptName: present(state.proofs.decommission.a).scriptName,
+      };
+      state.proofs.terminalForce = { a: null };
+      present(state.proofs.steps[0]).step = 'arm-maintenance';
+      present(state.proofs.steps[1]).step = 'arm-maintenance';
+      state.proofs.restart = restartProof(target.f, {
+        resumedProcess: { ...RESUMED },
+        replayOrdinal: 3,
+      }) as MutableScenario['proofs']['restart'];
+      // The mutation settled after the last reconciliation and role a is still
+      // recorded present, so the resumed run reads the deletion through the
+      // reconciliation the force permits rather than from a record that
+      // already agreed with the provider.
+      state.reconciledOrdinal = 2;
+    });
+    await target.journal.recordScenario(state);
+    expect(stored(target).records[0]).toMatchObject({
+      role: 'a',
+      present: true,
+    });
+    const { invocation, actions } = reference(target, { interrupted: true });
+    await run(target, withControlRead(invocation, withoutRoleA));
+    noForceTerminal(actions);
+    expect(stored(target).phase).toBe('force-recovery');
+    expect(stored(target).proofs.terminalForce.a).toEqual({
+      databaseId: present(state.proofs.decommission.a).databaseId,
+      scriptName: present(state.proofs.decommission.a).scriptName,
+      ordinal: 3,
+      attempts,
+    });
+    expect(stored(target).records[0]).toMatchObject({
+      role: 'a',
+      present: false,
+    });
+    expect(stored(target).reconciledOrdinal).toBeGreaterThan(3);
+  });
+
+  // Columns: the witness the reference returns, the invocation failure it
+  // raises instead, and the reason the run reports. A refused reference is the
+  // one row whose own code reaches the caller.
+  it.each([
+    ['matching identity', 'matching', null, 'observation-mismatch'],
+    ['absent row', null, null, 'observation-mismatch'],
+    ['missing identity', undefined, null, 'observation-mismatch'],
     [
       'extra identity key',
       { databaseId: 'db', scriptName: 'script', extra: true },
       null,
+      'observation-mismatch',
     ],
-    ['non-string databaseId', { databaseId: 1, scriptName: 'script' }, null],
-    ['non-string scriptName', { databaseId: 'db', scriptName: null }, null],
-    ['array identity', [], null],
-    ['lost response', undefined, 'injected-response-loss'],
-    ['refused response', undefined, 'reference-refused'],
-  ] as const)('terminal force settlement: %s', async (_title, witness, failure) => {
+    [
+      'non-string databaseId',
+      { databaseId: 1, scriptName: 'script' },
+      null,
+      'observation-mismatch',
+    ],
+    [
+      'non-string scriptName',
+      { databaseId: 'db', scriptName: null },
+      null,
+      'observation-mismatch',
+    ],
+    // Two string members, both named, one outside the journal's identifier
+    // charset: the refusal lands before settlement, not at the persist that
+    // would follow it.
+    [
+      'out-of-charset databaseId',
+      { databaseId: 'db one', scriptName: 'script' },
+      null,
+      'observation-mismatch',
+    ],
+    ['array identity', [], null, 'observation-mismatch'],
+    [
+      'lost response',
+      undefined,
+      'injected-response-loss',
+      'observation-mismatch',
+    ],
+    ['refused response', undefined, 'reference-refused', 'reference-refused'],
+  ] as const)('terminal force settlement: %s', async (_title, witness, failure, reason) => {
     const target = await scenarioJournal(DIRECT_SCENARIO_MIN_INVOCATIONS);
     const state = seed('force-terminal-a', (state) => {
       state.proofs.terminalForce = { a: null };
@@ -1500,7 +1423,9 @@ describe('scenario resume re-entry against a settled journal', () => {
         };
       },
     };
-    let settled: DirectScenarioState['mutation'] = null;
+    // Left unassigned so a row that never settles is distinguishable from one
+    // that settled on a null call.
+    let settled: DirectScenarioState['mutation'] | undefined;
     const journal: DirectRunJournal = {
       ...target.journal,
       async recordScenario(value) {
@@ -1523,21 +1448,32 @@ describe('scenario resume re-entry against a settled journal', () => {
     expect(result).toMatchObject({
       status: 'failed',
       phase: 'force-terminal-a',
-      reason:
-        failure === 'reference-refused' ? failure : 'observation-mismatch',
+      reason,
     });
     expect(
       actions.filter((action) => action.kind === 'force-terminal'),
     ).toHaveLength(1);
     expect(stored(target).proofs.terminalForce.a).toBeNull();
-    if (failure || witness === null || witness === 'matching') {
+    if (witness === 'matching')
       expect(settled).toMatchObject({
-        outcome: failure ?? 'returned',
-        before: failure ? null : before,
+        outcome: 'returned',
+        before,
         attempts: { provider: 0, maintenance: 0, application: 0 },
       });
-    } else {
-      expect(settled).toBeNull();
+    else if (failure)
+      expect(settled).toMatchObject({
+        outcome: failure,
+        before: null,
+        attempts: { provider: 0, maintenance: 0, application: 0 },
+      });
+    else if (witness === null)
+      expect(settled).toMatchObject({
+        outcome: 'returned',
+        before: null,
+        attempts: { provider: 0, maintenance: 0, application: 0 },
+      });
+    else {
+      expect(settled).toBeUndefined();
       expect(stored(target).mutation?.outcome).toBe('prepared');
       expect(stored(target).mutation).not.toHaveProperty('before');
       expect(stored(target).failure?.code).toBe('observation-mismatch');
@@ -1550,20 +1486,13 @@ describe('scenario resume re-entry against a settled journal', () => {
       seed('migration-start', () => {}) as DirectScenarioState,
     );
     const { invocation } = reference(target, { interrupted: false });
-    const duplicating: DirectInvocationClient = {
-      async invoke(action) {
-        const outcome = await invocation.invoke(action);
-        if (action.kind !== 'control-read') return outcome;
-        const result = outcome.result as { operations: readonly unknown[] };
-        return {
-          ...outcome,
-          result: {
-            ...result,
-            operations: [...result.operations, ...result.operations],
-          },
-        };
-      },
-    };
+    const duplicating = withControlRead(
+      invocation,
+      (result: { operations: readonly unknown[] }) => ({
+        ...result,
+        operations: [...result.operations, ...result.operations],
+      }),
+    );
     expect(await run(target, duplicating)).toMatchObject({
       status: 'failed',
       reason: 'observation-mismatch',

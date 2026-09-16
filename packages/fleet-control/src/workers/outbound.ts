@@ -13,6 +13,10 @@ import {
 } from '../deployment-context.js';
 import { parseHostRoutingTarget } from '../host-routing.js';
 
+// The HTTP statuses that carry a `Location`: an egress proxy refuses a response
+// carrying one rather than following it on the tenant's behalf.
+const REDIRECT_STATUSES: readonly number[] = [301, 302, 303, 307, 308];
+
 export interface FleetOutboundEnv {
   readonly scriptName: string;
   readonly tenantTag: string;
@@ -219,7 +223,7 @@ export default {
       }),
     );
     const response = await fetch(request, { redirect: 'manual' });
-    if ([301, 302, 303, 307, 308].includes(response.status)) {
+    if (REDIRECT_STATUSES.includes(response.status)) {
       console.warn(
         JSON.stringify({
           type: 'fleet-egress-redirect-denied',
@@ -269,7 +273,7 @@ export class StateEgress {
     const response = await fetch(stripStateEgressHeaders(request), {
       redirect: 'manual',
     });
-    if ([301, 302, 303, 307, 308].includes(response.status)) {
+    if (REDIRECT_STATUSES.includes(response.status)) {
       return new Response('egress redirect denied', { status: 502 });
     }
     return response;

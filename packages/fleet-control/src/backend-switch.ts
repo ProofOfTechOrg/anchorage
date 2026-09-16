@@ -100,6 +100,7 @@ import {
   BACKEND_SWITCH_SUBPHASES,
   effectiveLifecyclePhase,
   PROVISIONING_PHASES,
+  SETTLED_BACKEND_SWITCH_SUBPHASES,
 } from './types.js';
 import { validateDeploymentSpec } from './validation.js';
 
@@ -2499,6 +2500,24 @@ function withoutConsumedSwitchEntryCarriers(
   return stable;
 }
 
+// The top-level `applicationResources` a switch teardown's record carries: the
+// `applicationR2Progress` entries the teardown persists, projected back onto
+// the resources they track. `assertCompleteRecord` compares a record's own
+// states against this same projection, so the paths that write a teardown
+// record share the one expression that produces it.
+function switchTeardownApplicationResources(
+  intent: BackendSwitchIntent,
+): readonly import('./types.js').ApplicationR2Resource[] {
+  return (
+    intent.applicationR2Progress ??
+    intent.decommissionSnapshot?.applicationResources.map((resource) => ({
+      resource,
+      subphase: resource.state,
+    })) ??
+    []
+  ).map(({ resource, subphase }) => ({ ...resource, state: subphase }));
+}
+
 /** @internal Atomically consumes switch-entry carriers and installs its shell. */
 export function normalizeSwitchDecommissionEntry(
   record: FleetRecord,
@@ -2510,13 +2529,7 @@ export function normalizeSwitchDecommissionEntry(
     throw new Error('backend switch decommission authorization was lost');
   }
   const stable = withoutConsumedSwitchEntryCarriers(record);
-  const applicationResources = (
-    intent.applicationR2Progress ??
-    snapshot.applicationResources.map((resource) => ({
-      resource,
-      subphase: resource.state,
-    }))
-  ).map(({ resource, subphase }) => ({ ...resource, state: subphase }));
+  const applicationResources = switchTeardownApplicationResources(intent);
   return {
     ...stable,
     desiredSpecDigest: snapshot.desiredSpecDigest,
@@ -2566,8 +2579,7 @@ export function finalizedBridgeForRecord(record: FleetRecord): BridgeSnapshot {
 export function assertBackendSwitchInactive(record: FleetRecord): void {
   if (
     record.backendSwitchIntent &&
-    record.backendSwitchIntent.subphase !== 'rolled-back' &&
-    record.backendSwitchIntent.subphase !== 'finalized'
+    !SETTLED_BACKEND_SWITCH_SUBPHASES.has(record.backendSwitchIntent.subphase)
   ) {
     throw new Error(
       `deployment '${record.tenantTag}:${record.environment}' has active backend switch '${record.backendSwitchIntent.subphase}'`,
@@ -3358,10 +3370,7 @@ export async function switchPlainDeploymentToWorkersForPlatforms(options: {
       ) {
         throw new Error('backend switch request differs from durable intent');
       }
-      if (
-        intent.subphase === 'rolled-back' ||
-        intent.subphase === 'finalized'
-      ) {
+      if (SETTLED_BACKEND_SWITCH_SUBPHASES.has(intent.subphase)) {
         throw new Error(`backend switch is already ${intent.subphase}`);
       }
       if (intent.subphase === 'ready') return intent;
@@ -4274,6 +4283,7 @@ async function decommissionBackendSwitchLegacy(options: {
         const record: FleetRecord = {
           ...lease.current(),
           phase: 'decommissioned',
+          applicationResources: switchTeardownApplicationResources(intent),
           databaseExportLocation: durableExport.location,
           databaseExportSha256: durableExport.sha256,
           databaseExportSize: durableExport.size,
@@ -4884,14 +4894,7 @@ async function putBackendSwitchOwnership(
   patch: Partial<FleetRecord> = {},
 ): Promise<FleetRecord> {
   const current = lease.current();
-  const applicationResources = (
-    switchIntent.applicationR2Progress ??
-    switchIntent.decommissionSnapshot?.applicationResources.map((resource) => ({
-      resource,
-      subphase: resource.state,
-    })) ??
-    []
-  ).map(({ resource, subphase }) => ({ ...resource, state: subphase }));
+  const applicationResources = switchTeardownApplicationResources(switchIntent);
   const nextRecord: FleetRecord = {
     ...current,
     ...patch,

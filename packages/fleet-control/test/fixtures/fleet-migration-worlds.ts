@@ -311,7 +311,11 @@ class RecordingPlainBackend implements ProvisioningBackend {
     if (!spec) {
       throw new Error(`no spec fixture for database '${database.id}'`);
     }
-    // The final per-version slice can equal spec.migrations by content.
+    // `verify` means the caller passed the spec's own array, so the token is
+    // decided by reference identity. The final per-version slice can equal
+    // `spec.migrations` by content and by length, so a content or length
+    // comparison here would relabel that slice as a verify pass and change
+    // what the recorded operation means — a token the goldens freeze.
     this.ops.push(
       migrations === spec.migrations
         ? 'applyMigrations:verify'
@@ -706,6 +710,14 @@ function baseSpec(
   };
 }
 
+// `phase` defaults to `ready` here, and the worlds below admit from it. A
+// `ready` admission exercises the interaction contract the goldens freeze —
+// the ordered provider calls and the committed records — and not the
+// synchronous admission guards: a golden run stays green with one of those
+// guards removed. The compensating control for the guards is
+// `test/fleet.test.ts` plus `pnpm run architecture:check`; the migrating-phase
+// retry admission in `fleet.ts`, which a `ready` admission never reaches, is
+// pinned in `test/fleet-migration-advance.test.ts`.
 function baseRecord(
   tenantTag: string,
   backend: ProvisioningBackendKind,
@@ -1016,8 +1028,11 @@ export async function runFleetMigrationSuccessBaseline(): Promise<{
   return { result, ops: world.ops };
 }
 
+// `bravo` stops the migration on a subphase drawn only from
+// `BACKEND_SWITCH_SUBPHASES`, so the refusal this baseline freezes cannot be
+// read as an `ExternalMigrationSubphase` of the same spelling.
 const STOP_REFUSAL =
-  "deployment 'bravo:production' has active backend switch 'candidate-deployed'";
+  "deployment 'bravo:production' has active backend switch 'candidate-deploy-authorized'";
 
 function stopWorld(): WorldRun {
   const ops: MigrationOpLogEntry[] = [];
@@ -1099,7 +1114,7 @@ function stopWorld(): WorldRun {
         }),
       },
       rollbackUntil: '2026-06-08T00:00:00.000Z',
-      subphase: 'candidate-deployed',
+      subphase: 'candidate-deploy-authorized',
     },
   });
 

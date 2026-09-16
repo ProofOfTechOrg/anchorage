@@ -351,6 +351,8 @@ export class PlainWorkerProvisioningApiFake
           this.scripts.has(scriptName) ||
           this.versions.has(scriptName) ||
           this.deployments.has(scriptName),
+        workersDevEnabled: false,
+        previewUrlsEnabled: false,
         customDomains: this.domains.filter(
           (domain) => domain.service === scriptName,
         ),

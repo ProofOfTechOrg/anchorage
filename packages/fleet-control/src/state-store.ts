@@ -57,6 +57,7 @@ import {
   effectiveLifecyclePhase,
   isPlatformCatalogRecord,
   PROVISIONING_PHASES,
+  SETTLED_BACKEND_SWITCH_SUBPHASES,
 } from './types.js';
 import { deploymentKey } from './validation.js';
 
@@ -2129,8 +2130,7 @@ export class D1FleetStateStore
     if (
       record.migrationIntent &&
       record.backendSwitchIntent &&
-      record.backendSwitchIntent.subphase !== 'finalized' &&
-      record.backendSwitchIntent.subphase !== 'rolled-back'
+      !SETTLED_BACKEND_SWITCH_SUBPHASES.has(record.backendSwitchIntent.subphase)
     ) {
       throw new Error(
         'only a settled backend switch can coexist with migration intent',

@@ -14,6 +14,7 @@ import type {
 import { emptyFleetInventoryRowCounts } from '../../src/fleet-inventory-state.js';
 import {
   canonicalFleetOperationBytes,
+  FLEET_OPERATION_SINGLE_UPDATE_ROW_MESSAGE,
   FLEET_OPERATION_STAGE_BATCH_STATEMENTS,
   type FleetOperationKind,
   type FleetOperationLease,
@@ -23,7 +24,9 @@ import {
   FleetOperationStateError,
   type FleetOperationStore,
   fleetOperationOtherKindMessage,
+  fleetOperationPageLimit,
   fleetOperationStagedRowFromUnknown,
+  fleetOperationWatermarkRunMessage,
 } from '../../src/fleet-operation-state.js';
 import type {
   FleetInventoryDeployment,
@@ -32,13 +35,24 @@ import type {
 
 // ---------------------------------------------------------------------------
 // In-memory FleetOperationStore and FleetInventoryRunStore fakes for the
-// bounded audit coordinator, plus the frozen clock their generation refs are
-// stamped with. Suites that pin audit behaviour against a fabricated world and
-// suites that pin it against a real ProviderWorld share these, so a change to
-// the durable contract lands in one place.
+// bounded audit coordinator, the frozen clock their generation refs are
+// stamped with, and the seeded operation-id helper their rows are keyed by —
+// more than the operation fakes the file is named for. Suites that pin audit
+// behaviour against a fabricated world and suites that pin it against a real
+// ProviderWorld share these, so a change to the durable contract lands in one
+// place.
 // ---------------------------------------------------------------------------
 
-/** The frozen instant this fixture stamps finalized generations with. */
+/**
+ * The frozen instant this fixture stamps finalized generation refs and run
+ * records with. It governs what this file writes, not what a consumer audits
+ * against: a consumer pins its own audit and authority clocks, and two that do
+ * disagree — `fleet-audit-advance.test.ts` pins them to this instant,
+ * `cross-backend-continuation.test.ts` to its own `AUDIT_NOW_MS`. A further
+ * clock reaches the port through this fake's terminal writes, which stamp
+ * `terminalAtMs` from `Date.now()`, so a `finalizedAtMs` assertion reads the
+ * wall clock rather than a pinned one.
+ */
 export const AUDIT_NOW = Date.parse('2026-06-01T00:00:00.000Z');
 
 export function uuidFor(seed: number): string {
@@ -46,8 +60,10 @@ export function uuidFor(seed: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// Fake FleetInventoryRunStore: registers a finalized generation directly from
-// a FleetResourceInventory, going through the real materialization codec.
+// The FleetInventoryRunStore fake: registers a finalized generation directly
+// from a FleetResourceInventory, going through the real materialization codec.
+// Named for what it carries because `fleet-inventory-advance.test.ts` declares
+// its own local fake of the same interface for a different purpose.
 // ---------------------------------------------------------------------------
 
 function stageInventoryFixture(inventory: FleetResourceInventory): {
@@ -226,7 +242,9 @@ function stageInventoryFixture(inventory: FleetResourceInventory): {
   return { rows, facts, options };
 }
 
-export class FakeInventoryRunStore implements FleetInventoryRunStore {
+export class RegisteredGenerationInventoryRunStore
+  implements FleetInventoryRunStore
+{
   readonly refs = new Map<number, FleetInventoryGenerationRef>();
   readonly generations = new Map<
     number,
@@ -244,7 +262,8 @@ export class FakeInventoryRunStore implements FleetInventoryRunStore {
   /**
    * When set, `latestFinalizedGeneration` throws it instead of answering, so
    * an unwanted call fails its title outright rather than being counted after
-   * the fact (§11's "instrumented to fail the test if invoked").
+   * the fact: a title that must prove the method is never reached instruments
+   * it to fail rather than asserting a call count afterwards.
    *
    * Arming is the caller's job because this fake has no notion of "the replay
    * path" and cannot detect one; a title arms it once its own legitimate call
@@ -297,8 +316,10 @@ export class FakeInventoryRunStore implements FleetInventoryRunStore {
   async withAccountInventoryLease<T>(
     operation: (lease: FleetInventoryLease) => Promise<T>,
   ): Promise<T> {
-    // Unused by the audit coordinator (pinGeneration/releasePin are
-    // store-level, not lease-level); a throwing stub is sufficient.
+    // The lease handed to the callback answers nothing: `assertOwned`
+    // rejects and no other member exists, so a caller that reaches for the
+    // lease path fails its title instead of reading fabricated state.
+    // `pinGeneration` and `releasePin` are store-level and take no lease.
     return operation({
       assertOwned: () => Promise.reject(new Error('unused')),
     } as unknown as FleetInventoryLease);
@@ -417,6 +438,12 @@ export class FakeOperationStore implements FleetOperationStore {
         }
       },
       startOperation: async (input) => this.#startOperation(input),
+      // Head-scoped, where `D1FleetOperationStore` delegates this member to
+      // the head-independent `readOperationById` and so reaches a terminal
+      // row too. The coordinators fall back to `readOperationById` for a row
+      // the head no longer names — `abandonFleetAuditOperation` at the
+      // `run ?? readOperationById` read — so this answer exercises that
+      // fallback rather than hiding it.
       readOperation: async (operationId) => {
         const op = this.operations.get(operationId);
         if (!op) return undefined;
@@ -470,14 +497,15 @@ export class FakeOperationStore implements FleetOperationStore {
       input.rowKind,
       (this.rowPageReadCounts.get(input.rowKind) ?? 0) + 1,
     );
+    const limit = fleetOperationPageLimit(input.limit);
     const key = this.#rowsKey(input.operationId, input.rowKind);
     const all = [...(this.rows.get(key) ?? [])].sort(
       (left, right) => left.ordinal - right.ordinal,
     );
     const after = input.afterOrdinal ?? -1;
     const filtered = all.filter((row) => row.ordinal > after);
-    const page = filtered.slice(0, input.limit);
-    return { rows: page, done: filtered.length <= input.limit };
+    const page = filtered.slice(0, limit);
+    return { rows: page, done: filtered.length <= limit };
   }
 
   async pruneFleetOperations(): Promise<
@@ -584,7 +612,7 @@ export class FakeOperationStore implements FleetOperationStore {
       const prefix = (watermark as number) - below.length;
       if (below.some((row) => row.ordinal < prefix)) {
         throw new Error(
-          `commitProgress ${rowKind} rows below the watermark must be the contiguous run ending at it`,
+          fleetOperationWatermarkRunMessage(rowKind as FleetOperationRowKind),
         );
       }
     }
@@ -667,10 +695,7 @@ export class FakeOperationStore implements FleetOperationStore {
         );
       }
     }
-    if (
-      persisted.progress.revision !== runRecord.progress.revision ||
-      JSON.stringify(persisted) !== JSON.stringify(runRecord)
-    ) {
+    if (JSON.stringify(persisted) !== JSON.stringify(runRecord)) {
       throw new Error(
         `fleet operation '${operationId}' is no longer at the expected revision`,
       );
@@ -754,6 +779,7 @@ export class FakeOperationStore implements FleetOperationStore {
     }
     const finalized: FleetOperationRunRecord = {
       ...runRecord,
+      // The wall clock, not a pinned audit clock (see AUDIT_NOW).
       terminalAtMs: Date.now(),
     };
     this.operations.set(operationId, finalized);
@@ -769,7 +795,7 @@ export class FakeOperationStore implements FleetOperationStore {
   ): Promise<void> {
     const { operationId, expectedRevision, runRecord, updateRows = [] } = input;
     if (updateRows.length > 1) {
-      throw new Error('failOperation accepts at most one updateRow');
+      throw new Error(FLEET_OPERATION_SINGLE_UPDATE_ROW_MESSAGE);
     }
     const current = this.operations.get(operationId);
     if (current && current.kind !== kind) {
@@ -793,6 +819,7 @@ export class FakeOperationStore implements FleetOperationStore {
     }
     const failed: FleetOperationRunRecord = {
       ...runRecord,
+      // The wall clock, not a pinned audit clock (see AUDIT_NOW).
       terminalAtMs: Date.now(),
     };
     this.operations.set(operationId, failed);

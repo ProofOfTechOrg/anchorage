@@ -111,7 +111,9 @@ class FakeRunner implements CommandRunner {
   readonly #handler: RunnerHandler;
 
   constructor(
-    handler: RunnerHandler = async () => ({ stdout: '', stderr: '' }),
+    handler: RunnerHandler = async (arguments_) => {
+      throw new Error(`unstubbed wrangler argv: ${arguments_.join(' ')}`);
+    },
     maxDurationMs = 5 * 60_000,
   ) {
     this.#handler = handler;
@@ -154,6 +156,8 @@ class FakeRouteApi implements PlainWorkerRouteApi {
     'MAINTENANCE_ADMIN_SECRET',
   ]);
   secretRevocationNoop = false;
+  /** A detach the provider accepts while the custom domain survives it. */
+  domainDetachNoop = false;
   afterDeleteControlSecret: ((secretName: string) => void) | undefined;
   secretListReads = 0;
   secretListError: Error | undefined;
@@ -317,6 +321,7 @@ class FakeRouteApi implements PlainWorkerRouteApi {
 
   async detachCustomDomain(domainId: string): Promise<void> {
     this.calls.push({ operation: 'detach', domainId });
+    if (this.domainDetachNoop) return;
     this.domains = this.domains.filter((domain) => domain.id !== domainId);
   }
 
@@ -2894,49 +2899,15 @@ export default {
       deleteDeploymentWorker(backend(runner, { routeApi })),
     ).rejects.toThrow(/remains after delete/);
 
-    const stickyRoute: PlainWorkerRouteApi = {
-      ...databaseRouteMethods(),
-      async listWorkerDatabaseAttachments() {
-        return [];
+    const stickyRoute = new FakeRouteApi([
+      {
+        id: 'sticky-domain',
+        hostname: deployment.routeHostname,
+        service: deployment.scriptName,
       },
-      async listOrdinaryWorkerSecretNames() {
-        return [];
-      },
-      async deleteControlSecrets() {},
-      async inspectActiveWorkerRoute(): Promise<never> {
-        throw new Error('unused');
-      },
-      async listCustomDomains() {
-        return [
-          {
-            id: 'sticky-domain',
-            hostname: deployment.routeHostname,
-            service: deployment.scriptName,
-          },
-        ];
-      },
-      async inspectOrdinaryWorkerFootprint() {
-        return {
-          scriptPresent: true,
-          workersDevEnabled: false,
-          previewUrlsEnabled: false,
-          customDomains: [
-            {
-              id: 'sticky-domain',
-              hostname: deployment.routeHostname,
-              service: deployment.scriptName,
-            },
-          ],
-          zoneRoutes: [],
-        };
-      },
-      async listDurableObjectNamespaces() {
-        return [];
-      },
-      attachCustomDomain: vi.fn(),
-      detachCustomDomain: vi.fn(),
-      disableOrdinaryWorkerPublicAccess: vi.fn(),
-    };
+    ]);
+    stickyRoute.scriptPresent = true;
+    stickyRoute.domainDetachNoop = true;
     const stickyRunner = ownedWorkerRunner();
     const stickySubject = backend(stickyRunner, { routeApi: stickyRoute });
     await expect(

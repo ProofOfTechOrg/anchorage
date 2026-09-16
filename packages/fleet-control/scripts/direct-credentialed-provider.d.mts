@@ -82,6 +82,7 @@ export function bucketPages(
     sdk: Cloudflare;
     selectors: Readonly<{ account_id: string }>;
     jurisdiction: 'default' | 'eu' | 'fedramp';
+    bound: number;
   }>,
 ): Promise<Readonly<Record<string, unknown>>[]>;
 

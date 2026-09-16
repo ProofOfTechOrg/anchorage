@@ -1884,6 +1884,16 @@ describe('backend switch state machine', () => {
     expect(
       completed.applicationR2Progress?.map((entry) => entry.subphase),
     ).toEqual(['deleted', 'deleted']);
+    // The terminal record carries those deletions at top level, the reading
+    // `provisionDeployment` admits a retired row against.
+    expect(
+      [...(store.record.applicationResources ?? [])]
+        .map(({ name, state }) => ({ name, state }))
+        .sort((left, right) => left.name.localeCompare(right.name)),
+    ).toEqual([
+      { name: 'ARCHIVE', state: 'deleted' },
+      { name: 'FILES', state: 'deleted' },
+    ]);
     expect(backendSwitchIntentFromUnknown(structuredClone(completed))).toEqual(
       completed,
     );

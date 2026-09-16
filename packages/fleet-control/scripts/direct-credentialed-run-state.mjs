@@ -3,15 +3,45 @@
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { lstat, mkdir, open, rename, rmdir, unlink } from 'node:fs/promises';
+import {
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  rename,
+  rmdir,
+  unlink,
+} from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import PQueue from 'p-queue';
-import { deriveDirectConformanceNames } from './direct-credentialed-conformance-config.mjs';
+import {
+  DNS_LABEL,
+  deriveDirectConformanceNames,
+} from './direct-credentialed-conformance-config.mjs';
+import {
+  DIRECT_RESIDUAL_SURFACES,
+  DIRECT_TEARDOWN_FAILURES,
+  DIRECT_TEARDOWN_MAXIMA,
+  DIRECT_TEARDOWN_MUTATIONS,
+  DIRECT_TEARDOWN_PHASES,
+  DIRECT_TEARDOWN_RECOVERABLE_FAILURES,
+} from './direct-credentialed-reference-vocabulary.mjs';
 import { DIRECT_SCENARIO_PHASES } from './direct-credentialed-scenario-budget.mjs';
 import {
   DIRECT_REFERENCE_BODY_LIMIT,
   readDirectReferenceRequest,
 } from './direct-reference-contract.mjs';
+
+// Consumers bind to the teardown vocabulary through this module's declaration
+// surface, so it travels with the journal schemas that read it.
+export {
+  DIRECT_RESIDUAL_SURFACES,
+  DIRECT_TEARDOWN_FAILURES,
+  DIRECT_TEARDOWN_MAXIMA,
+  DIRECT_TEARDOWN_MUTATIONS,
+  DIRECT_TEARDOWN_PHASES,
+  DIRECT_TEARDOWN_RECOVERABLE_FAILURES,
+};
 
 const ERROR_CODES = new Set([
   'invalid-state',
@@ -22,6 +52,9 @@ const ERROR_CODES = new Set([
   'invocation-budget-exhausted',
   'unsupported-scenario-version',
 ]);
+// The action members a call is recorded under. A resumed `force-terminal-a`
+// reads `kind` and `role` back from the settled call to recognize its own
+// force, so dropping either name stops that phase recognizing it.
 const SUMMARY_FIELDS = [
   'kind',
   'role',
@@ -95,10 +128,15 @@ function digest(value) {
 }
 
 export const DIRECT_RUN_MAX_RESUME_COUNT = 999_999;
-const RUN_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
+/**
+ * The 24-byte ISO-8601 shape every timestamp in the journal and in the evidence
+ * artifact carries. The pattern is anchored and stateless, so callers share it.
+ */
+export const DIRECT_RUN_TIMESTAMP =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 
 function runTimestamp(value) {
-  if (typeof value !== 'string' || !RUN_TIMESTAMP.test(value)) invalid();
+  if (typeof value !== 'string' || !DIRECT_RUN_TIMESTAMP.test(value)) invalid();
   const parsed = Date.parse(value);
   if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== value)
     invalid();
@@ -160,6 +198,30 @@ export function actionSummary(action) {
         action[key],
       ]),
     ),
+  );
+}
+
+// The identifier grammar every journalled name and identity carries. It has no
+// `g` flag and holds no state, so the decoder and the predicate below share it.
+const SCENARIO_ID = /^[A-Za-z0-9_.:-]{1,128}$/u;
+
+/**
+ * True for a settled force-terminal `before` identity: `null`, or exactly
+ * `databaseId` and `scriptName`, both inside `SCENARIO_ID`. The scenario's
+ * settlement guard reads this, so the identity it admits is the one the
+ * journal's own `before` shape admits.
+ */
+export function isForceIdentity(value) {
+  if (value === null) return true;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  return (
+    Object.keys(value).length === 2 &&
+    Object.hasOwn(value, 'databaseId') &&
+    Object.hasOwn(value, 'scriptName') &&
+    typeof value.databaseId === 'string' &&
+    typeof value.scriptName === 'string' &&
+    SCENARIO_ID.test(value.databaseId) &&
+    SCENARIO_ID.test(value.scriptName)
   );
 }
 
@@ -349,58 +411,6 @@ export const DIRECT_SCENARIO_OPERATION_SLOTS = Object.freeze([
   'decommission-recovery',
 ]);
 
-export const DIRECT_TEARDOWN_PHASES = Object.freeze([
-  'refused',
-  'ingress',
-  'worker',
-  'fleet',
-  'quota',
-  'export-objects',
-  'exports',
-  'residual',
-  'complete',
-]);
-
-export const DIRECT_TEARDOWN_MUTATIONS = Object.freeze([
-  'disable-reference-ingress',
-  'delete-reference-worker',
-  'delete-fleet-d1',
-  'delete-quota-d1',
-  'delete-export-object',
-  'delete-export-r2',
-]);
-
-export const DIRECT_TEARDOWN_FAILURES = Object.freeze([
-  'scenario-incomplete',
-  'outcome-unknown',
-  'unexpected-object',
-  'identity-mismatch',
-  'residual-present',
-  'forbidden',
-  'provider-unavailable',
-  'budget-exhausted',
-  'invalid-state',
-]);
-
-export const DIRECT_RESIDUAL_SURFACES = Object.freeze([
-  'databases',
-  'durableObjectNamespaces',
-  'scripts',
-  'buckets',
-  'domains',
-  'routes',
-  'queues',
-]);
-
-export const DIRECT_TEARDOWN_MAXIMA = Object.freeze({
-  nameBytes: 255,
-  keyBytes: 1024,
-  prefixNames: 16,
-  secretNames: 8,
-  exportObjects: 2,
-  settleAttempts: 5,
-});
-
 const TEARDOWN_RECEIPT_FIELD = Object.freeze({
   'disable-reference-ingress': 'ingress',
   'delete-reference-worker': 'worker',
@@ -426,19 +436,18 @@ const scenarioNumber = (value) => {
   return value;
 };
 const scenarioId = (value) => {
-  if (typeof value !== 'string' || !/^[A-Za-z0-9_.:-]{1,128}$/u.test(value))
-    invalid();
+  if (typeof value !== 'string' || !SCENARIO_ID.test(value)) invalid();
   return value;
 };
+// A recorded route hostname is two or more of the configuration module's DNS
+// labels, inside the 253-byte name bound, carrying a letter so a numeric name
+// cannot pass. It keeps `invalid()` as its failure channel: what the journal
+// admits is a run-state refusal, not a configuration one.
 const scenarioHostname = (value) => {
-  if (
-    typeof value !== 'string' ||
-    value.length > 253 ||
-    !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/u.test(
-      value,
-    ) ||
-    !/[a-z]/u.test(value)
-  )
+  if (typeof value !== 'string' || value.length > 253 || !/[a-z]/u.test(value))
+    invalid();
+  const labels = value.split('.');
+  if (labels.length < 2 || labels.some((label) => !DNS_LABEL.test(label)))
     invalid();
   return value;
 };
@@ -448,8 +457,17 @@ const scenarioEnum =
     if (!values.includes(value)) invalid();
     return value;
   };
-const nullable = (schema) => (value) =>
-  value === null ? null : scenarioShape(value, schema);
+// A schema that admits null carries the mark, so the one declaration also
+// answers which members of a shape may still be absent.
+const NULLABLE = Symbol('nullable');
+const nullable = (schema) => {
+  const decode = (value) =>
+    value === null ? null : scenarioShape(value, schema);
+  decode[NULLABLE] = true;
+  return decode;
+};
+const nullableKeys = (shape) =>
+  Object.keys(shape).filter((key) => shape[key]?.[NULLABLE] === true);
 const scenarioFlag = scenarioEnum(true, false);
 const boundedArray = (schema, max) => {
   if (!Number.isSafeInteger(max) || max < 0) invalid();
@@ -623,7 +641,7 @@ const footprintShape = {
   database: { id: scenarioId, expectedName: scenarioId, observedName: null },
   worker: {
     scriptName: scenarioId,
-    scriptPresent: scenarioEnum(true, false),
+    scriptPresent: scenarioFlag,
     workersDevEnabled: scenarioEnum(false, null),
     previewUrlsEnabled: scenarioEnum(false, null),
     customDomains: noEntries,
@@ -758,7 +776,7 @@ const operationsShape = boundedArray(
 const recordsShape = boundedArray(
   {
     role: scenarioRole,
-    present: scenarioEnum(true, false),
+    present: scenarioFlag,
     phase: nullable(scenarioId),
     desiredSpecDigest: nullable(digest),
     pendingSpecDigest: nullable(digest),
@@ -849,6 +867,106 @@ const fenceProbesShape = {
   mutationEpoch: scenarioNumber,
   ordinal: scenarioNumber,
 };
+const fenceGroupShape = Object.freeze({
+  drain: fenceTransitionShape,
+  sweeps: fenceSweepsShape,
+  reopen: fenceTransitionShape,
+  probes: fenceProbesShape,
+});
+// One schema, built once: `decodeScenario` reads it on every call rather
+// than rebuilding the nested literal, so the module carries one shape idiom.
+const scenarioSchema = {
+  version: 1,
+  phase: scenarioEnum(...DIRECT_SCENARIO_PHASES),
+  startedOrdinal: scenarioNumber,
+  callCount: scenarioNumber,
+  phaseCalls: Object.fromEntries(
+    DIRECT_SCENARIO_PHASES.map((phase) => [phase, scenarioNumber]),
+  ),
+  attempts: attemptsShape,
+  sdkRequests: scenarioNumber,
+  inventoryCalls: { before: scenarioNumber, after: scenarioNumber },
+  lastCall: nullable(callShape),
+  mutation: nullable(callShape),
+  reconciledOrdinal: scenarioNumber,
+  operations: operationsShape,
+  records: recordsShape,
+  failure: nullable({
+    code: scenarioEnum(...DIRECT_SCENARIO_FAILURES),
+    ordinal: scenarioNumber,
+    detail: optional(scenarioEnum(...DIRECT_SCENARIO_FAILURE_DETAILS)),
+  }),
+  proofs: {
+    initial: {
+      a: nullable(workerVersionShape),
+      b: nullable(workerVersionShape),
+      recovery: nullable(workerVersionShape),
+    },
+    candidate: {
+      a: nullable(workerVersionShape),
+      b: nullable(workerVersionShape),
+    },
+    final: {
+      a: nullable(workerVersionShape),
+      b: nullable(workerVersionShape),
+    },
+    objects: {
+      a: nullable({ size: scenarioNumber, sha256: digest }),
+      b: nullable({ size: scenarioNumber, sha256: digest }),
+    },
+    objectDeletions: {
+      a: nullable(scenarioNumber),
+      b: nullable(scenarioNumber),
+    },
+    recoveryExportAbsent: {
+      beforeOrdinal: nullable(scenarioNumber),
+      afterOrdinal: nullable(scenarioNumber),
+    },
+    health: healthShape,
+    inventories: {
+      before: nullable(inventoryShape),
+      after: nullable(inventoryShape),
+    },
+    audits: { before: nullable(auditShape), after: nullable(auditShape) },
+    fence: Object.fromEntries(
+      Object.entries(fenceGroupShape).map(([group, shape]) => [
+        group,
+        { a: nullable(shape), b: nullable(shape) },
+      ]),
+    ),
+    restart: nullable({
+      process: processShape,
+      resumedProcess: nullable(processShape),
+      lossOrdinal: scenarioNumber,
+      operationId: scenarioId,
+      witnessSha256: digest,
+      claimSha256: digest,
+      successorSha256: digest,
+      itemsSha256: digest,
+      replayOrdinal: nullable(scenarioNumber),
+    }),
+    steps: stepsShape,
+    effects: effectsShape,
+    cleanup: nullable(cleanupShape),
+    exports: { a: nullable(exportShape), b: nullable(exportShape) },
+    exportVerifications: exportVerificationsShape,
+    decommission: {
+      a: nullable(decommissionShape),
+      b: nullable(decommissionShape),
+    },
+    terminalForce: {
+      a: nullable({
+        databaseId: scenarioId,
+        scriptName: scenarioId,
+        ordinal: scenarioNumber,
+        attempts: attemptsShape,
+      }),
+    },
+    force: nullable(footprintShape),
+    residual: nullable(footprintShape),
+  },
+};
+
 function decodeScenario(value, invocationCount) {
   if (
     value &&
@@ -858,109 +976,7 @@ function decodeScenario(value, invocationCount) {
     value.version !== 1
   )
     throw new DirectRunStateError('unsupported-scenario-version');
-  const result = scenarioShape(value, {
-    version: 1,
-    phase: scenarioEnum(...DIRECT_SCENARIO_PHASES),
-    startedOrdinal: scenarioNumber,
-    callCount: scenarioNumber,
-    phaseCalls: Object.fromEntries(
-      DIRECT_SCENARIO_PHASES.map((phase) => [phase, scenarioNumber]),
-    ),
-    attempts: attemptsShape,
-    sdkRequests: scenarioNumber,
-    inventoryCalls: { before: scenarioNumber, after: scenarioNumber },
-    lastCall: nullable(callShape),
-    mutation: nullable(callShape),
-    reconciledOrdinal: scenarioNumber,
-    operations: operationsShape,
-    records: recordsShape,
-    failure: nullable({
-      code: scenarioEnum(...DIRECT_SCENARIO_FAILURES),
-      ordinal: scenarioNumber,
-      detail: optional(scenarioEnum(...DIRECT_SCENARIO_FAILURE_DETAILS)),
-    }),
-    proofs: {
-      initial: {
-        a: nullable(workerVersionShape),
-        b: nullable(workerVersionShape),
-        recovery: nullable(workerVersionShape),
-      },
-      candidate: {
-        a: nullable(workerVersionShape),
-        b: nullable(workerVersionShape),
-      },
-      final: {
-        a: nullable(workerVersionShape),
-        b: nullable(workerVersionShape),
-      },
-      objects: {
-        a: nullable({ size: scenarioNumber, sha256: digest }),
-        b: nullable({ size: scenarioNumber, sha256: digest }),
-      },
-      objectDeletions: {
-        a: nullable(scenarioNumber),
-        b: nullable(scenarioNumber),
-      },
-      recoveryExportAbsent: {
-        beforeOrdinal: nullable(scenarioNumber),
-        afterOrdinal: nullable(scenarioNumber),
-      },
-      health: healthShape,
-      inventories: {
-        before: nullable(inventoryShape),
-        after: nullable(inventoryShape),
-      },
-      audits: { before: nullable(auditShape), after: nullable(auditShape) },
-      fence: {
-        drain: {
-          a: nullable(fenceTransitionShape),
-          b: nullable(fenceTransitionShape),
-        },
-        sweeps: {
-          a: nullable(fenceSweepsShape),
-          b: nullable(fenceSweepsShape),
-        },
-        reopen: {
-          a: nullable(fenceTransitionShape),
-          b: nullable(fenceTransitionShape),
-        },
-        probes: {
-          a: nullable(fenceProbesShape),
-          b: nullable(fenceProbesShape),
-        },
-      },
-      restart: nullable({
-        process: processShape,
-        resumedProcess: nullable(processShape),
-        lossOrdinal: scenarioNumber,
-        operationId: scenarioId,
-        witnessSha256: digest,
-        claimSha256: digest,
-        successorSha256: digest,
-        itemsSha256: digest,
-        replayOrdinal: nullable(scenarioNumber),
-      }),
-      steps: stepsShape,
-      effects: effectsShape,
-      cleanup: nullable(cleanupShape),
-      exports: { a: nullable(exportShape), b: nullable(exportShape) },
-      exportVerifications: exportVerificationsShape,
-      decommission: {
-        a: nullable(decommissionShape),
-        b: nullable(decommissionShape),
-      },
-      terminalForce: {
-        a: nullable({
-          databaseId: scenarioId,
-          scriptName: scenarioId,
-          ordinal: scenarioNumber,
-          attempts: attemptsShape,
-        }),
-      },
-      force: nullable(footprintShape),
-      residual: nullable(footprintShape),
-    },
-  });
+  const result = scenarioShape(value, scenarioSchema);
   if (
     result.startedOrdinal > invocationCount ||
     result.callCount > invocationCount - result.startedOrdinal ||
@@ -1094,20 +1110,13 @@ function validateScenarioProofs(state, invocationCount) {
     ...Object.values(proof.recoveryExportAbsent),
     ...proof.health.map((entry) => entry.ordinal),
     ...proof.steps.map((entry) => entry.ordinal),
-    ...Object.values(proof.fence.drain).flatMap((entry) =>
-      entry && entry.ordinal !== null ? [entry.ordinal] : [],
-    ),
-    ...Object.values(proof.fence.reopen).flatMap((entry) =>
-      entry && entry.ordinal !== null ? [entry.ordinal] : [],
-    ),
-    ...Object.values(proof.fence.probes).flatMap((entry) =>
-      entry ? [entry.ordinal] : [],
+    // A null reaches the bound check and is skipped there, so each group
+    // contributes whatever ordinal it carries.
+    ...['drain', 'reopen', 'probes'].flatMap((group) =>
+      Object.values(proof.fence[group]).map((entry) => entry?.ordinal ?? null),
     ),
     ...Object.values(proof.fence.sweeps).flatMap((entry) =>
-      entry ? [entry.first.ordinal] : [],
-    ),
-    ...Object.values(proof.fence.sweeps).flatMap((entry) =>
-      entry && entry.second !== null ? [entry.second.ordinal] : [],
+      entry ? [entry.first.ordinal, entry.second?.ordinal ?? null] : [],
     ),
   ])
     if (ordinal !== null) need(ordinal <= invocationCount);
@@ -1162,16 +1171,12 @@ function bootstrapContext(value, binding) {
   const zoneName = identifier(value.zoneName, 253);
   if (
     !/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/u.test(zoneName) ||
-    zoneName
-      .split('.')
-      .some(
-        (label) => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(label),
-      ) ||
+    zoneName.split('.').some((label) => !DNS_LABEL.test(label)) ||
     (ownedHostname !== zoneName && !ownedHostname.endsWith(`.${zoneName}`))
   )
     invalid();
   const subdomain = identifier(value.accountWorkersDevSubdomain);
-  if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(subdomain)) invalid();
+  if (!DNS_LABEL.test(subdomain)) invalid();
   object(value.dispatch, ['kind', 'count']);
   const { kind, count } = value.dispatch;
   if (
@@ -1312,7 +1317,6 @@ const teardownText = (max) => (value) => {
   if (Buffer.byteLength(value) > max) invalid();
   return value;
 };
-const teardownFlag = scenarioEnum(true, false);
 const teardownSettleAttempts = (value) => {
   scenarioNumber(value);
   if (value < 1 || value > DIRECT_TEARDOWN_MAXIMA.settleAttempts) invalid();
@@ -1330,7 +1334,7 @@ const residualSurfaceShape = {
     DIRECT_TEARDOWN_MAXIMA.prefixNames,
   ),
   globalCount: nullable(scenarioNumber),
-  exhaustive: teardownFlag,
+  exhaustive: scenarioFlag,
 };
 const residualShape = {
   version: 1,
@@ -1344,12 +1348,12 @@ const residualShape = {
     status: nullable(scenarioNumber),
     prefixCount: scenarioNumber,
   },
-  versionsGone: nullable(teardownFlag),
+  versionsGone: nullable(scenarioFlag),
   settleAttempts: teardownSettleAttempts,
 };
 const teardownSettlement = {
   ordinal: scenarioNumber,
-  settledByReread: teardownFlag,
+  settledByReread: scenarioFlag,
 };
 const teardownShape = {
   version: 1,
@@ -1448,7 +1452,18 @@ function decodeTeardown(value) {
   return result;
 }
 
-function assertPrivate(stat, directory) {
+// The narrower of the two pending gates: an invocation or bootstrap mutation
+// whose outcome the journal does not know. `assertSettled` adds teardown's own
+// pending mutation; the paths that publish a teardown receipt do not, because
+// that mutation is the one they are recording.
+export function mutationPending(snapshot) {
+  return (
+    snapshot.lastInvocation?.state === 'pending' ||
+    Boolean(snapshot.bootstrap?.pending)
+  );
+}
+
+export function assertPrivate(stat, directory) {
   if (
     stat.uid !== process.getuid() ||
     (stat.mode & 0o7777) !== (directory ? 0o700 : 0o600) ||
@@ -1457,7 +1472,7 @@ function assertPrivate(stat, directory) {
     invalid();
 }
 
-function fileFlags(access) {
+export function fileFlags(access) {
   return access | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 }
 
@@ -1564,8 +1579,28 @@ function serialize(snapshot) {
   return `${JSON.stringify(snapshot)}\n`;
 }
 
+// The staging name a snapshot is written under, before the rename that makes
+// it `journal.json`.
+const JOURNAL_TEMPORARY_PREFIX = '.journal-';
+const JOURNAL_TEMPORARY_SUFFIX = '.tmp';
+
+// A signal between a snapshot's create and its rename leaves the staging file
+// behind. The run holds the directory's lock, so any sibling left there is a
+// dead one from an interrupted publication.
+async function sweepStagedSnapshots(directory) {
+  for (const name of await readdir(directory))
+    if (
+      name.startsWith(JOURNAL_TEMPORARY_PREFIX) &&
+      name.endsWith(JOURNAL_TEMPORARY_SUFFIX)
+    )
+      await unlink(join(directory, name));
+}
+
 async function writeSnapshot(directory, handle, snapshot) {
-  const temporary = join(directory, `.journal-${randomUUID()}.tmp`);
+  const temporary = join(
+    directory,
+    `${JOURNAL_TEMPORARY_PREFIX}${randomUUID()}${JOURNAL_TEMPORARY_SUFFIX}`,
+  );
   let file;
   let created = false;
   try {
@@ -1670,6 +1705,10 @@ function runJournal(directory, directoryHandle, base, lock, initial) {
       throw error;
     }
   };
+  // Every publication decodes the whole snapshot, whatever the caller already
+  // decoded for its own checks: what reaches the journal is what a resume will
+  // read back. A caller that has just decoded one section therefore pays a
+  // second decode of it, and that is the price of the invariant.
   const publishSnapshot = async (fields) => {
     const next = await decodeSnapshot(
       { ...snapshot, ...fields },
@@ -1679,11 +1718,7 @@ function runJournal(directory, directoryHandle, base, lock, initial) {
   };
   const publishBootstrap = (bootstrap) => publishSnapshot({ bootstrap });
   const assertSettled = () => {
-    if (
-      snapshot.lastInvocation?.state === 'pending' ||
-      snapshot.bootstrap?.pending ||
-      snapshot.teardown?.pending
-    )
+    if (mutationPending(snapshot) || snapshot.teardown?.pending)
       throw new DirectRunStateError('outcome-unknown');
   };
   const teardownStarted = () =>
@@ -1761,12 +1796,11 @@ function runJournal(directory, directoryHandle, base, lock, initial) {
               );
             }
           }
-          for (const [group, later] of [
-            ['drain', ['after', 'ordinal']],
-            ['reopen', ['after', 'ordinal']],
-            ['sweeps', ['second', 'intervalMs']],
-            ['probes', []],
-          ])
+          // Which members may still arrive is the decode shape's own
+          // statement: a member it admits as null is one a later record may
+          // fill, and every other member is preserved as recorded.
+          for (const [group, shape] of Object.entries(fenceGroupShape)) {
+            const later = nullableKeys(shape);
             for (const role of ['a', 'b']) {
               const entry = previous.proofs.fence[group][role];
               if (entry === null) continue;
@@ -1776,6 +1810,7 @@ function runJournal(directory, directoryHandle, base, lock, initial) {
                 if (!later.includes(key) || expected !== null)
                   equalShape(fresh[key], expected);
             }
+          }
           for (const role of ['a', 'b']) {
             if (previous.proofs.exports[role]) {
               const { sourceInvocationOrdinal, ...proof } =
@@ -1804,10 +1839,7 @@ function runJournal(directory, directoryHandle, base, lock, initial) {
     },
     recordResume() {
       return enqueue(async () => {
-        if (
-          snapshot.lastInvocation?.state === 'pending' ||
-          snapshot.bootstrap?.pending
-        )
+        if (mutationPending(snapshot))
           throw new DirectRunStateError('outcome-unknown');
         const current = snapshot.resumeCount ?? 0;
         if (current >= DIRECT_RUN_MAX_RESUME_COUNT) return;
@@ -1817,19 +1849,27 @@ function runJournal(directory, directoryHandle, base, lock, initial) {
     recordTeardown(value) {
       return enqueue(async () => {
         // Receipts publish while their own mutation is still pending, so this
-        // path checks the invocation and bootstrap gates without `assertSettled`.
-        if (
-          snapshot.lastInvocation?.state === 'pending' ||
-          snapshot.bootstrap?.pending
-        )
+        // path takes the narrower gate rather than `assertSettled`.
+        if (mutationPending(snapshot))
           throw new DirectRunStateError('outcome-unknown');
         const teardown = decodeTeardown(value);
         const previous = snapshot.teardown;
         if (previous) {
           const position = (phase) => DIRECT_TEARDOWN_PHASES.indexOf(phase);
+          // A recorded refusal re-enters deletion only when its reason is one
+          // a later run can clear, and then only into the phase that follows
+          // it, so re-entry takes the same one-step progression as any other
+          // advance.
+          const reenterable =
+            previous.phase === 'refused' &&
+            DIRECT_TEARDOWN_RECOVERABLE_FAILURES.includes(previous.failure);
           if (
             previous.phase === 'refused'
-              ? teardown.phase !== 'refused'
+              ? teardown.phase !== 'refused' &&
+                !(
+                  reenterable &&
+                  position(teardown.phase) === position('refused') + 1
+                )
               : teardown.phase === 'refused' ||
                 position(teardown.phase) < position(previous.phase) ||
                 position(teardown.phase) > position(previous.phase) + 1
@@ -2066,11 +2106,9 @@ export async function openDirectRunState(input) {
       if (!(await exists(directory)))
         throw new DirectRunStateError('run-missing');
       directoryHandle = await privateDirectory(directory);
+      await sweepStagedSnapshots(directory);
       snapshot = await readSnapshot(join(directory, 'journal.json'), binding);
-      if (
-        snapshot.lastInvocation?.state === 'pending' ||
-        snapshot.bootstrap?.pending
-      )
+      if (mutationPending(snapshot))
         throw new DirectRunStateError('outcome-unknown');
     }
     return runJournal(directory, directoryHandle, base, lock, snapshot);
@@ -2097,6 +2135,7 @@ export async function inspectDirectRunState(input) {
     );
     let closePromise;
     return Object.freeze({
+      directory: attached.directory,
       snapshot,
       close() {
         closePromise ??= (async () => {

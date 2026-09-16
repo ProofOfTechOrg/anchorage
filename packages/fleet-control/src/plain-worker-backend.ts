@@ -293,8 +293,10 @@ export class PlainWorkerBackend implements ProvisioningBackend {
     // The maintenance requests below carry the maintenance admin secret as a
     // bearer credential to a tenant Worker URL. Forcing the policy after the
     // spread denies a call site the chance to opt into following a redirect to
-    // an address the control plane did not choose. A 3xx then reaches
-    // readMaintenanceHealth, which refuses any response that is not ok.
+    // an address the control plane did not choose. By the rule at
+    // refuseRedirectStatus this transport leaves the status to its consumer: a
+    // 3xx reaches readMaintenanceHealth, which refuses any response that is not
+    // ok and cancels its body.
     this.#fetch = (input, init) =>
       fetchFn(input, { ...init, redirect: 'manual' });
     this.#maintenanceRequestTimeoutMs = maintenanceRequestTimeoutMs;
@@ -1690,6 +1692,9 @@ export class PlainWorkerBackend implements ProvisioningBackend {
         response.headers.get('cache-control') === 'no-store' ||
         response.headers.has('www-authenticate')
       ) {
+        // readMaintenanceHealth consumes the body on the ok path and cancels
+        // it on the refusal path. The route-not-ready branch below cancels
+        // because nothing reads that response at all.
         const maintenance = await readMaintenanceHealth(response);
         const message = mismatch(maintenance);
         if (!message) return maintenance;

@@ -23,6 +23,7 @@ import {
   type WorkerAttachmentScanProgress,
   type WorkerAttachmentScanTarget,
 } from './cloudflare-worker-attachment-scan-state.js';
+import { cancelBodyWithoutAwait } from './database-export-store.js';
 
 export {
   CloudflareAttachmentScanProgressError,
@@ -363,14 +364,22 @@ export async function listDispatchScriptPage(
 ): Promise<DispatchScriptPage> {
   let response: Response | undefined;
   for (let attempt = 0; attempt < CLOUDFLARE_SDK_MAX_ATTEMPTS; attempt += 1) {
+    // A superseded attempt's body is never read. Cancelling it before the
+    // signal check covers the abort exit as well as the next request.
+    cancelBodyWithoutAwait(
+      response?.body,
+      'Cloudflare dispatch script listing attempt superseded',
+    );
     checkSignal(input.signal);
     response = await context.requestDispatchScriptPage(input);
     if (response.status !== 429 && response.status < 500) break;
   }
   if (!response?.ok) {
-    throw new Error(
+    const refusal = new Error(
       `Cloudflare dispatch script listing failed with status ${response?.status ?? 'unknown'}`,
     );
+    cancelBodyWithoutAwait(response?.body, refusal);
+    throw refusal;
   }
   const payload: unknown = await response.json();
   const record = plainRecord(payload);

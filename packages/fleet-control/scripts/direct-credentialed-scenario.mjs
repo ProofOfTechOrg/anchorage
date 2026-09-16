@@ -14,6 +14,7 @@ import {
   DIRECT_SCENARIO_FAILURE_DETAILS,
   DIRECT_SCENARIO_FAILURES,
   DirectRunStateError,
+  isForceIdentity,
 } from './direct-credentialed-run-state.mjs';
 import {
   DIRECT_SCENARIO_MIN_INVOCATIONS,
@@ -173,18 +174,8 @@ export async function runDirectCredentialedScenario(input) {
       attempts,
     };
     if (action.kind === 'force-terminal') {
-      const before = error ? null : response?.result?.before;
-      requireFact(
-        before === null ||
-          (typeof before === 'object' &&
-            !Array.isArray(before) &&
-            Object.keys(before).length === 2 &&
-            Object.hasOwn(before, 'databaseId') &&
-            Object.hasOwn(before, 'scriptName') &&
-            typeof before.databaseId === 'string' &&
-            typeof before.scriptName === 'string'),
-        'observation-mismatch',
-      );
+      const before = error ? null : response.result?.before;
+      requireFact(isForceIdentity(before), 'observation-mismatch');
       settled.before = before;
     }
     state.lastCall = settled;
@@ -314,6 +305,23 @@ export async function runDirectCredentialedScenario(input) {
     state.proofs.fence[operation][role].after = after;
     state.proofs.fence[operation][role].ordinal = state.mutation.ordinal;
     await persist();
+  };
+  const fenceStage = async (role, operation) => {
+    if (state.proofs.fence[operation][role] === null) {
+      const before = await invoke({
+        kind: 'tenant-fence',
+        role,
+        operation: 'read',
+      });
+      state.proofs.fence[operation][role] = {
+        before,
+        after: null,
+        ordinal: null,
+      };
+      await persist();
+    }
+    if (state.proofs.fence[operation][role].after === null)
+      await fenceTransition(role, operation);
   };
   const fenceSweep = async (role) => {
     const result = await invoke({
@@ -461,7 +469,7 @@ export async function runDirectCredentialedScenario(input) {
     const routeHostnames = routes
       .flatMap((rows) => rows.map((row) => row.hostname))
       .sort();
-    equal(routeHostnames.length, 2);
+    equal(routeHostnames.length, NORMAL_ROLES.length);
     const proof = {
       operationId: selected.operationId,
       generation: selected.generation,
@@ -488,6 +496,11 @@ export async function runDirectCredentialedScenario(input) {
       proof.scriptNames,
       NORMAL_ROLES.map((role) => prepared.names.roles[role].scriptName).sort(),
     );
+    for (const [index, role] of NORMAL_ROLES.entries())
+      equal(
+        routes[index].map((row) => row.hostname),
+        [prepared.names.roles[role].routeHostname],
+      );
     if (when === 'after') {
       requireFact(
         proof.generation > state.proofs.inventories.before.generation,
@@ -496,11 +509,6 @@ export async function runDirectCredentialedScenario(input) {
         proof.routeHostnames,
         state.proofs.inventories.before.routeHostnames,
       );
-      for (const [index, role] of NORMAL_ROLES.entries())
-        equal(
-          routes[index].map((row) => row.hostname),
-          [prepared.names.roles[role].routeHostname],
-        );
     }
     state.proofs.inventories[when] = proof;
     await persist();
@@ -854,21 +862,7 @@ export async function runDirectCredentialedScenario(input) {
           break;
         case 'fence-drain':
           for (const role of NORMAL_ROLES) {
-            if (state.proofs.fence.drain[role] === null) {
-              const before = await invoke({
-                kind: 'tenant-fence',
-                role,
-                operation: 'read',
-              });
-              state.proofs.fence.drain[role] = {
-                before,
-                after: null,
-                ordinal: null,
-              };
-              await persist();
-            }
-            if (state.proofs.fence.drain[role].after === null)
-              await fenceTransition(role, 'drain');
+            await fenceStage(role, 'drain');
             if (state.proofs.fence.sweeps[role] === null) {
               const first = await fenceSweep(role);
               state.proofs.fence.sweeps[role] = {
@@ -893,21 +887,7 @@ export async function runDirectCredentialedScenario(input) {
               );
               await persist();
             }
-            if (state.proofs.fence.reopen[role] === null) {
-              const before = await invoke({
-                kind: 'tenant-fence',
-                role,
-                operation: 'read',
-              });
-              state.proofs.fence.reopen[role] = {
-                before,
-                after: null,
-                ordinal: null,
-              };
-              await persist();
-            }
-            if (state.proofs.fence.reopen[role].after === null)
-              await fenceTransition(role, 'reopen');
+            await fenceStage(role, 'reopen');
           }
           await advancePhase();
           break;
@@ -1112,26 +1092,17 @@ export async function runDirectCredentialedScenario(input) {
               prior?.action.kind === 'force-terminal' &&
               prior.action.role === 'a';
             if (resumed) {
-              // The force settles and persists its attempts before returning.
-              // Repeating it answers from the absent-record branch and replaces
-              // the deleting call's witness with a no-op's zeros.
+              // The force settles and persists its attempts and the identity it
+              // deleted before returning. Repeating it answers from the
+              // absent-record branch, which replaces the deleting call's witness
+              // with a no-op's zeros and its `before` with null, so the
+              // settlement this run persisted is what proves the call deleted
+              // the row. A prior that settled any other way is therefore
+              // terminal here: re-issuing the force recovers neither witness.
               requireFact(
                 prior.outcome === 'returned' && prior.attempts !== null,
                 'proof-unavailable',
               );
-              equal(prior.attempts, zeroAttempts());
-              equal(prior.before, {
-                databaseId: state.proofs.decommission.a.databaseId,
-                scriptName: state.proofs.decommission.a.scriptName,
-              });
-              await sync();
-              equal(record('a'), { role: 'a', present: false });
-              state.proofs.terminalForce.a = {
-                databaseId: prior.before.databaseId,
-                scriptName: prior.before.scriptName,
-                ordinal: prior.ordinal,
-                attempts: prior.attempts,
-              };
             } else {
               const result = await mutate({
                 kind: 'force-terminal',
@@ -1140,20 +1111,21 @@ export async function runDirectCredentialedScenario(input) {
               requireFact(
                 result.returned === true && result.after.present === false,
               );
-              equal(state.mutation.attempts, zeroAttempts());
-              equal(result.before, {
-                databaseId: state.proofs.decommission.a.databaseId,
-                scriptName: state.proofs.decommission.a.scriptName,
-              });
-              await sync();
-              equal(record('a'), { role: 'a', present: false });
-              state.proofs.terminalForce.a = {
-                databaseId: result.before.databaseId,
-                scriptName: result.before.scriptName,
-                ordinal: state.mutation.ordinal,
-                attempts: state.mutation.attempts,
-              };
             }
+            const settled = resumed ? prior : state.mutation;
+            equal(settled.attempts, zeroAttempts());
+            equal(settled.before, {
+              databaseId: state.proofs.decommission.a.databaseId,
+              scriptName: state.proofs.decommission.a.scriptName,
+            });
+            await sync();
+            equal(record('a'), { role: 'a', present: false });
+            state.proofs.terminalForce.a = {
+              databaseId: settled.before.databaseId,
+              scriptName: settled.before.scriptName,
+              ordinal: settled.ordinal,
+              attempts: settled.attempts,
+            };
             await persist();
           }
           await advancePhase();
@@ -1162,6 +1134,9 @@ export async function runDirectCredentialedScenario(input) {
         case 'force-recovery': {
           await sync();
           if (control.forceBefore) {
+            // The recorded force is what `forceBefore` came from, so a
+            // settlement this run cannot read leaves the phase terminal:
+            // a second force observes its own call, not the one that ran.
             requireFact(
               state.mutation?.action.kind === 'force-recovery' &&
                 state.mutation.outcome === 'returned',

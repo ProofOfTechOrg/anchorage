@@ -122,6 +122,16 @@ export interface ProviderScript {
   secretNames: Set<string>;
 }
 
+/** The deployment identity a script reports until a fixture seeds its own. */
+export const FIXTURE_DEPLOYMENT_ID = 'deployment';
+
+/** The one deployment identity both the read and the write path answer with. */
+export function deploymentIdentity(
+  script: Pick<ProviderScript, 'deploymentId'> | undefined,
+): string {
+  return script?.deploymentId ?? FIXTURE_DEPLOYMENT_ID;
+}
+
 export interface ProviderDatabase {
   readonly databaseId: string;
   readonly name: string;
@@ -304,10 +314,13 @@ export class ProviderWorld {
     name: string;
     scripts: Array<{ name: string; bindings: readonly unknown[] }>;
   }> = [];
+  readonly queues: Array<{ queueId: string; queueName: string }> = [];
   readonly exports = new Map<string, Uint8Array>();
   readonly mutationLog: string[] = [];
   maintenanceOrigin = 'https://control-acme.example.test';
   routeOrigin = 'https://acme.example.test';
+  /** The account subdomain the provider answers workers.dev reads with. */
+  accountSubdomain = 'attested-account';
   #allocators = new WorldAllocators();
   readonly #failures = new Map<string, ProviderFailure>();
   readonly #afterEffects = new Map<string, AfterEffect>();
@@ -548,6 +561,7 @@ export class ProviderWorld {
     const cloned = new ProviderWorld(this.databaseIdMode);
     cloned.maintenanceOrigin = this.maintenanceOrigin;
     cloned.routeOrigin = this.routeOrigin;
+    cloned.accountSubdomain = this.accountSubdomain;
     cloned.#allocators = this.#allocators.clone();
     for (const [name, script] of this.scripts) {
       cloned.seedScript(name, {
@@ -570,6 +584,7 @@ export class ProviderWorld {
       ...this.customDomains.map((domain) => ({ ...domain })),
     );
     cloned.zones.push(...this.zones.map((zone) => ({ ...zone })));
+    cloned.queues.push(...this.queues.map((queue) => ({ ...queue })));
     cloned.routes.push(...this.routes.map((route) => ({ ...route })));
     cloned.durableObjectNamespaces.push(
       ...this.durableObjectNamespaces.map((namespace) => ({ ...namespace })),

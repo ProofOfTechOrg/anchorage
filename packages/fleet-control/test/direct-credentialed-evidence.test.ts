@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { readdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { chmod, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   buildDirectEvidence,
+  DIRECT_CONFORMANCE_COMMANDS,
+  DIRECT_EVIDENCE_IDENTITY_PATHS,
+  DIRECT_EVIDENCE_KEYS,
   DIRECT_EVIDENCE_LITERALS,
   inspectDirectEvidence,
-  scanDirectEvidence,
   writeDirectEvidence,
 } from '../scripts/direct-credentialed-evidence.mjs';
 import { DIRECT_RESIDUAL_SURFACES } from '../scripts/direct-credentialed-run-state.mjs';
@@ -59,6 +61,19 @@ const object = (value: unknown): Record<string, unknown> => {
 };
 const keys = (value: unknown, expected: readonly string[]) =>
   expect(Object.keys(object(value))).toEqual(expected);
+// The publication path inspects; a test that only wants the verdict reads the
+// same inspection's `hit`.
+const inspected = (
+  evidence: object,
+  sentinels: { secrets: readonly string[]; literals: readonly string[] },
+) => inspectDirectEvidence(evidence, sentinels).hit;
+const leafAt = (document: unknown, keyPath: string) =>
+  keyPath
+    .split('.')
+    .reduce<unknown>(
+      (value, key) => (value == null ? value : object(value)[key]),
+      document,
+    );
 
 async function evidenceFixture() {
   const { f, journal } = await completeScenarioJournal();
@@ -81,8 +96,36 @@ async function evidenceFixture() {
 }
 
 describe.sequential('direct evidence', () => {
+  it('covers every projected key with the admission vocabulary', async () => {
+    const { evidence } = await evidenceFixture();
+    const vocabulary = new Set(DIRECT_EVIDENCE_KEYS);
+    // Array elements are addressed by index rather than by a projected name;
+    // admission covers those through its digits-only rule instead.
+    const walk = (value: unknown, found: Set<string>) => {
+      if (Array.isArray(value)) for (const child of value) walk(child, found);
+      else if (value && typeof value === 'object')
+        for (const [key, child] of Object.entries(value)) {
+          found.add(key);
+          walk(child, found);
+        }
+      return found;
+    };
+    const projected = [...walk(evidence, new Set<string>())];
+    // A projected key outside the list is a credential collision admission
+    // would not have refused, so this walk is the list's completeness check.
+    expect(projected.filter((key) => !vocabulary.has(key))).toEqual([]);
+    expect(Object.isFrozen(DIRECT_EVIDENCE_KEYS)).toBe(true);
+    expect(new Set(DIRECT_EVIDENCE_KEYS).size).toBe(
+      DIRECT_EVIDENCE_KEYS.length,
+    );
+    expect(evidence.commands).toEqual([
+      DIRECT_CONFORMANCE_COMMANDS.run,
+      DIRECT_CONFORMANCE_COMMANDS.resume,
+    ]);
+  });
+
   it('pins the allowlist key set and order at every projected shape', async () => {
-    const { evidence, snapshot } = await evidenceFixture();
+    const { evidence, f, snapshot } = await evidenceFixture();
     keys(evidence, topKeys);
     process.stdout.write(
       `EVIDENCE_KEYS ${JSON.stringify(Object.keys(evidence))}\n`,
@@ -104,6 +147,16 @@ describe.sequential('direct evidence', () => {
       'exports',
       'inventories',
       'terminalForce',
+    ]);
+    keys(evidence.cost, [
+      'basis',
+      'referenceProvider',
+      'referenceMaintenance',
+      'referenceApplication',
+      'sdkRequests',
+      'referenceInvocations',
+      'teardownProvider',
+      'billed',
     ]);
     expect(evidence.cost).toEqual({
       basis: 'request-counters',
@@ -134,6 +187,9 @@ describe.sequential('direct evidence', () => {
       });
     }
     keys(scenario.terminalForce, ['a']);
+    const forced = object(object(scenario.terminalForce).a);
+    keys(forced, ['databaseId', 'scriptName', 'ordinal', 'attempts']);
+    keys(forced.attempts, ['provider', 'maintenance', 'application']);
     expect(scenario.terminalForce).toEqual(
       snapshot.scenario.proofs.terminalForce,
     );
@@ -169,6 +225,7 @@ describe.sequential('direct evidence', () => {
         keys(transition.before, readingKeys);
         keys(transition.after, readingKeys);
       }
+    keys(scenario.exports, ['a', 'b']);
     for (const role of ['a', 'b']) {
       const sweeps = object(object(fence.sweeps)[role]);
       keys(sweeps, ['first', 'second', 'intervalMs']);
@@ -229,6 +286,24 @@ describe.sequential('direct evidence', () => {
       snapshot.teardown.residual?.bucketJurisdictions,
     );
     keys(evidence.teardownCall, ['status', 'failure', 'providerRequests']);
+    const retained = buildDirectEvidence({
+      snapshot,
+      prepared: f.prepared,
+      mode: 'resume',
+      outcome: {
+        status: 'retained',
+        exitCode: 4,
+        teardownCall: {
+          status: 'retained',
+          failure: { code: 'residual-present' },
+          providerRequests: 12,
+        },
+      },
+      times: { finishedAt: '2026-09-13T00:00:00.000Z' },
+      commit: 'a'.repeat(40),
+    });
+    keys(retained.teardownCall, ['status', 'failure', 'providerRequests']);
+    keys(object(retained.teardownCall).failure, ['code']);
     keys(evidence.retainedIdentities, [
       'fleetUuid',
       'quotaUuid',
@@ -267,6 +342,7 @@ describe.sequential('direct evidence', () => {
       commit: null,
     });
     expect(object(evidence.scenario).failure).toEqual(scenario.failure);
+    keys(object(evidence.scenario).failure, ['code', 'ordinal', 'detail']);
     expect(
       await writeDirectEvidence({
         directory: f.runDirectory,
@@ -446,23 +522,68 @@ describe.sequential('direct evidence', () => {
   it('refuses a credential completed by the evidence trailing newline', async () => {
     const { f } = await evidenceFixture();
     const evidence = { version: 1 };
-    const sentinels = { secrets: ['}\n'], literals: [] };
-    expect(inspectDirectEvidence(evidence, sentinels)).toEqual({
-      hit: { sentinelClass: 'env-secret', keyPath: '' },
+    const newlineSentinels = { secrets: ['}\n'], literals: [] };
+    const hit = { sentinelClass: 'env-secret', keyPath: '' };
+    expect(inspectDirectEvidence(evidence, newlineSentinels)).toEqual({
+      hit,
       serialized: '{"version":1}\n',
     });
     expect(
       await writeDirectEvidence({
         directory: f.runDirectory,
         evidence,
-        sentinels,
+        sentinels: newlineSentinels,
+      }),
+    ).toEqual({ written: false, ...hit });
+    expect(await readdir(f.runDirectory)).toEqual(['journal.json']);
+  });
+
+  it('reports the empty path for a credential no member span carries', async () => {
+    const separated = { version: 1, mode: 'run' };
+    // The sentinel spans the comma between two members, so it belongs to the
+    // document's structure and to no member of it.
+    expect(
+      inspectDirectEvidence(separated, {
+        secrets: ['1,"mode"'],
+        literals: [],
       }),
     ).toEqual({
-      written: false,
-      sentinelClass: 'env-secret',
-      keyPath: '',
+      hit: { sentinelClass: 'env-secret', keyPath: '' },
+      serialized: '{"version":1,"mode":"run"}\n',
     });
-    expect(await readdir(f.runDirectory)).toEqual(['journal.json']);
+    // A sentinel a member does carry is named by that member instead.
+    expect(
+      inspected(separated, { secrets: ['"mode":"run"'], literals: [] }),
+    ).toEqual({ sentinelClass: 'env-secret', keyPath: 'mode' });
+  });
+
+  it('sweeps an abandoned staging sibling and refuses a directory that is not private', async () => {
+    const { f, evidence } = await evidenceFixture();
+    const abandoned = join(f.runDirectory, '.evidence-abandoned.tmp');
+    await writeFile(abandoned, 'interrupted\n', { mode: 0o600 });
+    expect(
+      await writeDirectEvidence({
+        directory: f.runDirectory,
+        evidence,
+        sentinels,
+      }),
+    ).toEqual({ written: true });
+    expect((await readdir(f.runDirectory)).sort()).toEqual([
+      'evidence.json',
+      'journal.json',
+    ]);
+    await chmod(f.runDirectory, 0o755);
+    try {
+      expect(
+        await writeDirectEvidence({
+          directory: f.runDirectory,
+          evidence,
+          sentinels,
+        }),
+      ).toEqual({ written: false });
+    } finally {
+      await chmod(f.runDirectory, 0o700);
+    }
   });
 
   it('publishes the scanned bytes including the newline observed during read-back', async () => {
@@ -478,11 +599,13 @@ describe.sequential('direct evidence', () => {
         sentinels,
         readBack: async (path) => {
           received = await readFile(path);
-          expect(received).toEqual(scanned);
           return received;
         },
       }),
     ).toEqual({ written: true });
+    // The writer swallows a throw from `readBack`, so what the callback
+    // observed is asserted once the call has returned.
+    expect(received).toEqual(scanned);
     expect(received).toEqual(Buffer.from(`${JSON.stringify(evidence)}\n`));
     expect(await readFile(join(f.runDirectory, 'evidence.json'))).toEqual(
       scanned,
@@ -547,7 +670,7 @@ describe.sequential('direct evidence', () => {
       bootstrap: { toJSON: () => ({ dispatch: 'safe' }) },
     };
     const byteSentinels = { secrets: [], literals: ['"dispatch":'] };
-    expect(scanDirectEvidence(evidence, byteSentinels)).toEqual({
+    expect(inspected(evidence, byteSentinels)).toEqual({
       sentinelClass: 'literal',
       keyPath: 'bootstrap',
     });
@@ -572,14 +695,14 @@ describe.sequential('direct evidence', () => {
   ])('refuses decoded serialization containing a %s', async (_label, secret) => {
     const { f } = await evidenceFixture();
     const evidence = { bootstrap: { toJSON: () => secret } };
-    const sentinels = { secrets: [secret], literals: [] };
+    const decodedSentinels = { secrets: [secret], literals: [] };
     const hit = { sentinelClass: 'env-secret', keyPath: 'bootstrap' };
-    expect(scanDirectEvidence(evidence, sentinels)).toEqual(hit);
+    expect(inspected(evidence, decodedSentinels)).toEqual(hit);
     expect(
       await writeDirectEvidence({
         directory: f.runDirectory,
         evidence,
-        sentinels,
+        sentinels: decodedSentinels,
       }),
     ).toEqual({ written: false, ...hit });
     expect(await readdir(f.runDirectory)).toEqual(['journal.json']);
@@ -590,15 +713,15 @@ describe.sequential('direct evidence', () => {
     const rawJSON = (JSON as typeof JSON & { rawJSON(text: string): object })
       .rawJSON;
     const evidence = { bootstrap: { dispatch: rawJSON('"\\u0073eed"') } };
-    const sentinels = { secrets: ['seed'], literals: [] };
+    const escapedSentinels = { secrets: ['seed'], literals: [] };
     expect(JSON.stringify(evidence)).toContain('\\u0073');
     const hit = { sentinelClass: 'env-secret', keyPath: 'bootstrap.dispatch' };
-    expect(scanDirectEvidence(evidence, sentinels)).toEqual(hit);
+    expect(inspected(evidence, escapedSentinels)).toEqual(hit);
     expect(
       await writeDirectEvidence({
         directory: f.runDirectory,
         evidence,
-        sentinels,
+        sentinels: escapedSentinels,
       }),
     ).toEqual({ written: false, ...hit });
     expect(await readdir(f.runDirectory)).toEqual(['journal.json']);
@@ -610,32 +733,83 @@ describe.sequential('direct evidence', () => {
     const evidence = {
       bootstrap: { toJSON: () => ({ [secret]: 'Bearer hidden' }) },
     };
-    const sentinels = { secrets: [secret], literals: DIRECT_EVIDENCE_LITERALS };
+    const keySentinels = {
+      secrets: [secret],
+      literals: DIRECT_EVIDENCE_LITERALS,
+    };
     const hit = { sentinelClass: 'env-secret', keyPath: `bootstrap.${secret}` };
-    expect(scanDirectEvidence(evidence, sentinels)).toEqual(hit);
+    expect(inspected(evidence, keySentinels)).toEqual(hit);
     expect(
       await writeDirectEvidence({
         directory: f.runDirectory,
         evidence,
-        sentinels,
+        sentinels: keySentinels,
       }),
     ).toEqual({ written: false, ...hit });
     expect(await readdir(f.runDirectory)).toEqual(['journal.json']);
   });
 
+  it('guards exactly the projection leaves the shared inventory names', async () => {
+    const { evidence } = await evidenceFixture();
+    expect(Object.isFrozen(DIRECT_EVIDENCE_IDENTITY_PATHS)).toBe(true);
+    // Every guarded path resolves to a projected identity leaf, so a renamed
+    // or moved projection key fails here rather than leaving a guard that
+    // never matches again.
+    expect(
+      DIRECT_EVIDENCE_IDENTITY_PATHS.filter((keyPath) => {
+        const leaf = leafAt(evidence, keyPath);
+        return leaf !== null && typeof leaf !== 'string';
+      }),
+    ).toEqual([]);
+    // Prefix-derived names are the rule's exclusions, not omissions.
+    for (const keyPath of [
+      'retainedIdentities.exportBucket',
+      'retainedIdentities.scriptName',
+      'scenario.terminalForce.a.scriptName',
+    ])
+      expect(DIRECT_EVIDENCE_IDENTITY_PATHS).not.toContain(keyPath);
+    // So are the scenario paths: the journal decodes each with `scenarioId`,
+    // whose accepted set the identity shape contains, so a guard here could
+    // only refuse a record the journal already admitted.
+    for (const keyPath of [
+      'scenario.initial.a.versionId',
+      'scenario.candidate.b.versionId',
+      'scenario.final.a.versionId',
+      'scenario.terminalForce.a.databaseId',
+    ]) {
+      expect(DIRECT_EVIDENCE_IDENTITY_PATHS).not.toContain(keyPath);
+      expect(leafAt(evidence, keyPath)).toBeTypeOf('string');
+    }
+  });
+
   it.each([
-    'retainedIdentities.fleetUuid',
-    'retainedIdentities.quotaUuid',
-    'retainedIdentities.activeVersionId',
-    'bootstrap.activeVersionId',
     'scenario.initial.a.versionId',
-    'scenario.initial.b.versionId',
-    'scenario.initial.recovery.versionId',
-    'scenario.candidate.a.versionId',
-    'scenario.candidate.b.versionId',
-    'scenario.final.a.versionId',
     'scenario.final.b.versionId',
-  ])('enforces identity shape without nulling malformed proof at %s', async (keyPath) => {
+    'scenario.terminalForce.a.databaseId',
+  ])('publishes a scenario-charset identity at %s', async (keyPath) => {
+    const { f, evidence } = await evidenceFixture();
+    // `a:b` is outside the identity shape and inside `scenarioId`, so the
+    // journal admits it and the evidence boundary no longer refuses it.
+    const carried = JSON.parse(JSON.stringify(evidence)) as Record<
+      string,
+      unknown
+    >;
+    const keys = keyPath.split('.');
+    const leaf = keys.pop() as string;
+    object(leafAt(carried, keys.join('.')))[leaf] = 'a:b';
+    expect(inspected(carried, sentinels)).toBeNull();
+    expect(
+      await writeDirectEvidence({
+        directory: f.runDirectory,
+        evidence: carried,
+        sentinels,
+      }),
+    ).toEqual({ written: true });
+  });
+
+  it.each(
+    DIRECT_EVIDENCE_IDENTITY_PATHS,
+  )('enforces identity shape without nulling malformed proof at %s', async (keyPath) => {
     const { f } = await evidenceFixture();
     for (const [value, valid] of [
       [null, true],
@@ -656,10 +830,8 @@ describe.sequential('direct evidence', () => {
           .reduceRight<unknown>((child, key) => ({ [key]: child }), value),
       );
       const before = JSON.stringify(evidence);
-      const hit = { sentinelClass: 'identity-shape', keyPath };
-      expect(scanDirectEvidence(evidence, sentinels)).toEqual(
-        valid ? null : hit,
-      );
+      const hit = { refusalClass: 'identity-shape', keyPath };
+      expect(inspected(evidence, sentinels)).toEqual(valid ? null : hit);
       if (!valid) {
         expect(
           await writeDirectEvidence({

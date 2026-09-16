@@ -22,6 +22,7 @@ import {
   type DeploymentSpec,
   effectiveLifecyclePhase,
   type FleetRecord,
+  type FleetResourceInventory,
   type FleetStateLease,
   type FleetStateStore,
   type PlainWorkerUploadIntent,
@@ -29,6 +30,7 @@ import {
 } from '../../src/types.js';
 import { WranglerLoopBackend } from '../../src/wrangler-loop-backend.js';
 import {
+  type CloudflareFetchRecord,
   recordingFetch,
   restProjection,
   testRateCoordinator,
@@ -471,6 +473,8 @@ export interface PlainWorkerHarness {
   readonly world: ProviderWorld;
   readonly exportStore: HarnessExportStore;
   readonly store: HarnessFleetStore;
+  /** Every provider request this harness's backend dispatched, in order. */
+  readonly requests: readonly CloudflareFetchRecord[];
   readonly exportDirectory?: string;
 }
 
@@ -518,6 +522,7 @@ export function wranglerHarness(
     store: new HarnessFleetStore(world, undefined, {
       snapshot: options.snapshot,
     }),
+    requests: projected.requests,
     exportDirectory,
   };
 }
@@ -542,7 +547,26 @@ export function directHarness(
     store: new HarnessFleetStore(world, undefined, {
       snapshot: options.snapshot,
     }),
+    requests: projected.requests,
   };
+}
+
+/**
+ * Collects `world`'s fleet inventory over the same plain-Worker client the
+ * harnesses use, for a suite that needs a finalized generation rather than a
+ * backend.
+ */
+export function collectWorldInventory(
+  world: ProviderWorld,
+): Promise<FleetResourceInventory> {
+  return plainOnlyClient(
+    recordingFetch(restProjection(world)),
+    new HarnessExportStore(),
+  ).collectFleetInventory({
+    databaseNamePrefix: 'fleet-',
+    scriptNamePrefix: 'fleet-',
+    includeDispatchNamespace: false,
+  });
 }
 
 export function hostileCauseProxy(): object {

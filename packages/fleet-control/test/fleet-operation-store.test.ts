@@ -12,6 +12,7 @@ import type {
 import type { FleetMigrationProgress } from '../src/fleet-migration-state.js';
 import {
   classifyFleetOperationToken,
+  FLEET_OPERATION_SINGLE_UPDATE_ROW_MESSAGE,
   type FleetOperationKind,
   type FleetOperationLease,
   type FleetOperationRowKind,
@@ -19,6 +20,7 @@ import {
   type FleetOperationStagedRow,
   FleetOperationStoreCapabilityError,
   fleetOperationOtherKindMessage,
+  fleetOperationWatermarkRunMessage,
 } from '../src/fleet-operation-state.js';
 import type { FleetStateDatabase } from '../src/state-store.js';
 
@@ -58,6 +60,13 @@ class MemoryD1 implements FleetStateDatabase {
   hideBatchResults = false;
   /** Makes the next committed batch throw as if its response were lost. */
   failNextBatchAfterCommit = false;
+  /**
+   * Leaves the next batch's last statement unapplied and answers it with no
+   * rows, as a lease that expires mid-batch does to the statements behind it.
+   */
+  refuseNextBatchTrailingStatement = false;
+  /** Runs once after the next batch commits, for a row that vanishes under a call. */
+  afterNextBatch: (() => void) | undefined;
 
   async query(
     sql: string,
@@ -81,16 +90,25 @@ class MemoryD1 implements FleetStateDatabase {
       ...statements.map(({ bindings = [] }) => bindings.length),
     );
     if (statements.length === 0) return [];
+    const refuseTrailing = this.refuseNextBatchTrailingStatement;
+    this.refuseNextBatchTrailingStatement = false;
+    const applied = refuseTrailing ? statements.slice(0, -1) : statements;
     const results: Readonly<Record<string, unknown>>[][] = [];
     this.sqlite.exec('BEGIN IMMEDIATE');
     try {
-      for (const { sql, bindings = [] } of statements) {
+      for (const { sql, bindings = [] } of applied) {
         results.push(this.sqlite.prepare(sql).all(...bindings));
       }
       this.sqlite.exec('COMMIT');
     } catch (error) {
       this.sqlite.exec('ROLLBACK');
       throw error;
+    }
+    if (refuseTrailing) results.push([]);
+    const afterBatch = this.afterNextBatch;
+    if (afterBatch) {
+      this.afterNextBatch = undefined;
+      afterBatch();
     }
     if (this.failNextBatchAfterCommit) {
       this.failNextBatchAfterCommit = false;
@@ -951,6 +969,54 @@ describe('D1FleetOperationStore', () => {
     expect(result.progress.revision).toBe(1);
   });
 
+  it('rows landed by a mid-batch lease expiry recover only on a byte-identical retry', async () => {
+    const db = new MemoryD1();
+    const target = store(db);
+    await target.withAccountOperationLease('audit', async (lease) => {
+      const created = await start(lease);
+      const transition = {
+        operationId: OPERATION_ID,
+        expectedRevision: 0,
+        runRecord: advanced(created.record),
+        rows: [findingRow(0, 'payload A'), findingRow(1, 'payload B')],
+      };
+      // The lease expires between the row inserts and the run-record update,
+      // so the rows land while the progress update matches nothing.
+      db.refuseNextBatchTrailingStatement = true;
+      expect((await rejection(lease.commitProgress(transition))).message).toBe(
+        `fleet operation '${OPERATION_ID}' is no longer at the expected revision`,
+      );
+      expect(
+        (await target.readOperationById(OPERATION_ID))?.progress.revision,
+      ).toBe(0);
+      expect(
+        (await readRows(target, 'finding')).map((row) => row.payload.detail),
+      ).toEqual(['payload A', 'payload B']);
+      // A retry that rebuilds ordinal 1 from different bytes cannot land over
+      // the row already staged under that ordinal, and takes nothing with it.
+      await expect(
+        lease.commitProgress({
+          ...transition,
+          rows: [findingRow(0, 'payload A'), findingRow(1, 'payload C')],
+        }),
+      ).rejects.toThrow();
+      expect(
+        (await readRows(target, 'finding')).map((row) => row.payload.detail),
+      ).toEqual(['payload A', 'payload B']);
+      expect(
+        (await target.readOperationById(OPERATION_ID))?.progress.revision,
+      ).toBe(0);
+      // The retry that reproduces every per-ordinal payload converges over the
+      // landed rows and completes the transition they were staged for.
+      expect((await lease.commitProgress(transition)).progress.revision).toBe(
+        1,
+      );
+    });
+    expect(
+      (await readRows(target, 'finding')).map((row) => row.payload.detail),
+    ).toEqual(['payload A', 'payload B']);
+  });
+
   it('corruption on divergent replay', async () => {
     const db = new MemoryD1();
     const error = await store(db).withAccountOperationLease(
@@ -1109,7 +1175,7 @@ describe('D1FleetOperationStore', () => {
         }),
       );
       expect(refused.message).toBe(
-        'commitProgress finding rows below the watermark must be the contiguous run ending at it',
+        fleetOperationWatermarkRunMessage('finding'),
       );
       expect(db.batchSizes.slice(batchMark)).toEqual([]);
     });
@@ -1646,13 +1712,51 @@ describe('D1FleetOperationStore', () => {
         return rejected;
       },
     );
-    expect(error.message).toBe('failOperation accepts at most one updateRow');
+    expect(error.message).toBe(FLEET_OPERATION_SINGLE_UPDATE_ROW_MESSAGE);
     expect((await target.readOperationById(OPERATION_ID))?.state).toBe(
       'running',
     );
     expect(
       (await target.readOperationById(OPERATION_ID))?.progress.revision,
     ).toBe(0);
+  });
+
+  it('failOperation reports a vanished update target as a conflict, as convergence does', async () => {
+    const db = new MemoryD1();
+    const target = store(db);
+    const error = await target.withAccountOperationLease(
+      'migration',
+      async (lease) => {
+        const created = await start(lease, 'migration');
+        await lease.stageRows({
+          operationId: OPERATION_ID,
+          expectedRevision: 0,
+          rows: [itemRow('pending')],
+        });
+        // The item row is deleted between the failure batch and the readback
+        // that verifies it, the one window in which the readback finds the
+        // target gone.
+        db.afterNextBatch = () => {
+          db.sqlite
+            .prepare(
+              `DELETE FROM anchorage_fleet_operation_rows
+                WHERE row_kind = 'item' AND ordinal = 0`,
+            )
+            .all();
+        };
+        return rejection(
+          lease.failOperation({
+            operationId: OPERATION_ID,
+            expectedRevision: 0,
+            runRecord: advanced(created.record, 'failed'),
+            updateRows: [itemRow('failed')],
+          }),
+        );
+      },
+    );
+    expect(error.message).toBe(
+      `fleet operation '${OPERATION_ID}' is no longer at the expected revision`,
+    );
   });
 
   it('terminal transitions advance the revision (stale-token discriminator)', async () => {
@@ -1773,22 +1877,22 @@ describe('D1FleetOperationStore', () => {
         rows: [findingRow(2), findingRow(0), findingRow(1)],
       });
     });
-    await expect(
-      target.readOperationRowsPage({
-        operationId: OPERATION_ID,
-        rowKind: 'finding',
-        limit: 0,
-      }),
-    ).rejects.toThrow('limit must be an integer from 1 to 1000');
-    for (const limit of [1001, 1.5]) {
+    for (const limit of [0, 1.5]) {
       await expect(
         target.readOperationRowsPage({
           operationId: OPERATION_ID,
           rowKind: 'finding',
           limit,
         }),
-      ).rejects.toThrow('limit must be an integer from 1 to 1000');
+      ).rejects.toThrow('limit must be an integer of at least 1');
     }
+    await expect(
+      target.readOperationRowsPage({
+        operationId: OPERATION_ID,
+        rowKind: 'finding',
+        limit: 1001,
+      }),
+    ).resolves.toMatchObject({ done: true });
     await expect(
       target.readOperationRowsPage({
         operationId: OPERATION_ID,
@@ -1837,6 +1941,55 @@ describe('D1FleetOperationStore', () => {
         limit: 2,
       }),
     ).rejects.toThrow('fleet operation state is malformed');
+  });
+
+  it('readOperationRowsPage serves the documented 1,000-row page and clamps a larger limit to it', async () => {
+    const db = new MemoryD1();
+    const target = store(db);
+    await target.withAccountOperationLease('audit', async (lease) => {
+      await start(lease);
+      await lease.stageRows({
+        operationId: OPERATION_ID,
+        expectedRevision: 0,
+        rows: [findingRow(0)],
+      });
+    });
+    const insert = db.sqlite.prepare(
+      `INSERT INTO anchorage_fleet_operation_rows
+        (account_id, operation_id, row_kind, ordinal, payload)
+        VALUES (?, ?, 'finding', ?, ?)`,
+    );
+    for (let ordinal = 1; ordinal <= 1_000; ordinal += 1) {
+      insert.all(
+        'account-primary',
+        OPERATION_ID,
+        ordinal,
+        JSON.stringify(findingRow(ordinal).payload),
+      );
+    }
+    const full = await target.readOperationRowsPage({
+      operationId: OPERATION_ID,
+      rowKind: 'finding',
+      limit: 1_000,
+    });
+    expect(full.rows).toHaveLength(1_000);
+    expect(full.rows.at(-1)?.ordinal).toBe(999);
+    expect(full.done).toBe(false);
+    const clamped = await target.readOperationRowsPage({
+      operationId: OPERATION_ID,
+      rowKind: 'finding',
+      limit: 5_000,
+    });
+    expect(clamped.rows).toHaveLength(1_000);
+    expect(clamped.done).toBe(false);
+    const rest = await target.readOperationRowsPage({
+      operationId: OPERATION_ID,
+      rowKind: 'finding',
+      afterOrdinal: 999,
+      limit: 5_000,
+    });
+    expect(rest.rows.map((row) => row.ordinal)).toEqual([1_000]);
+    expect(rest.done).toBe(true);
   });
 
   it('prune protects the active and the latest finalized operation per kind', async () => {

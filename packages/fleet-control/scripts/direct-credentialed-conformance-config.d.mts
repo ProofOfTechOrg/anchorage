@@ -2,6 +2,12 @@
 
 export const DIRECT_CONFORMANCE_CONTRACT_VERSION: 1;
 
+/**
+ * One DNS label: 1-63 characters, alphanumeric at both ends. The configured
+ * host and a journalled route hostname are both built on it.
+ */
+export const DNS_LABEL: RegExp;
+
 export interface DirectAuxiliaryWasmIntent {
   readonly file: string;
   readonly name: string;

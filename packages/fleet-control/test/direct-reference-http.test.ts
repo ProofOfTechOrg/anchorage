@@ -398,6 +398,9 @@ describe('direct reference HTTP boundary inside workerd', () => {
   beforeAll(async () => {
     directory = await mkdtemp(join(tmpdir(), 'direct-http-'));
     const main = join(directory, 'worker.ts');
+    // The 100 ms invocation deadline belongs to the probe modes, whose bodies
+    // never settle; a request without a probe carries a deadline wide enough
+    // that the workerd round trip cannot spend it.
     await writeFile(
       main,
       `import {handleDirectReferenceHttpRequest} from ${JSON.stringify(fileURLToPath(new URL('../scripts/direct-reference-http.ts', import.meta.url)))};
@@ -406,7 +409,7 @@ describe('direct reference HTTP boundary inside workerd', () => {
       let calls=0;
       if(mode==='stalled')request=new Request(${JSON.stringify(endpoint)},{method:'POST',headers:{authorization:'Bearer ${invokeSecret}'},body:new ReadableStream({cancel(){return new Promise(()=>{});}})});
       if(mode==='oversize')request=new Request(${JSON.stringify(endpoint)},{method:'POST',headers:{authorization:'Bearer ${invokeSecret}'},body:new ReadableStream({start(c){c.enqueue(new Uint8Array(17000));},cancel(){return new Promise(()=>{});}})});
-      const response=await handleDirectReferenceHttpRequest(request,{invokeSecret:'${invokeSecret}',configSha256:'${configSha256}',invocationTimeoutMs:100,dispatch:async(action)=>{calls++;return {status:'blocked',action};}});
+      const response=await handleDirectReferenceHttpRequest(request,{invokeSecret:'${invokeSecret}',configSha256:'${configSha256}',invocationTimeoutMs:mode?100:30000,dispatch:async(action)=>{calls++;return {status:'blocked',action};}});
       response.headers.set('x-fixture-dispatches',String(calls));return response;
     }};`,
     );

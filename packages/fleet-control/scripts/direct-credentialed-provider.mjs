@@ -317,6 +317,10 @@ function proofFetch(transport, shape, bound) {
             (totalCount !== undefined && totalCount !== rows.length)
           )
             refuse('provider-unavailable');
+          // A positive rule, stated independently of the refusals above it: the
+          // attestation records what the provider corroborated rather than what
+          // survived a refusal, so a relaxed refusal downgrades the page to
+          // `exhaustive: false` instead of silently attesting it.
           singlePageAttestations.set(
             rows,
             totalCount === rows.length ||
@@ -396,10 +400,7 @@ export async function singlePage(promise) {
   return { rows, exhaustive: singlePageAttestations.get(rows) ?? false };
 }
 
-export async function bucketPages({ sdk, selectors, jurisdiction }) {
-  const { CLOUDFLARE_INVENTORY_BOUND: bound } = await import(
-    '../src/cloudflare-client-config.ts'
-  );
+export async function bucketPages({ sdk, selectors, jurisdiction, bound }) {
   const rows = [];
   let startAfter;
   // Only an empty page proves the end: a full page that happens to be last is

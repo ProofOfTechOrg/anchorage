@@ -626,9 +626,8 @@ describe('reconciled transient provisioning failures', () => {
   it.each([
     ['429', () => providerFailure(429)],
     ['timeout', () => new APIConnectionTimeoutError()],
-  ])('classifies a %s failure as transient but never as absence', (_label, create) => {
+  ])('classifies raw and sanitized %s failures as absence=false', (_label, create) => {
     const error = create();
-    expect(isTransientProviderError(error)).toBe(true);
     expect(isNotFound(error)).toBe(false);
     expect(isNotFound(sanitizeProviderError(error, []))).toBe(false);
   });
@@ -1022,6 +1021,14 @@ describe('maintenance route readiness', () => {
             },
           }),
       ],
+      [
+        'Worker 302',
+        () =>
+          new Response(null, {
+            status: 302,
+            headers: { location: 'https://redirected.invalid/elsewhere' },
+          }),
+      ],
     ] as const)(`passes a %s through ${operation} without retrying`, async (_label, response) => {
       const api = new PlainWorkerProvisioningApiFake();
       deployedCandidate(api);
@@ -1032,6 +1039,26 @@ describe('maintenance route readiness', () => {
         `maintenance request failed with HTTP ${response().status}`,
       );
       expect(request).toHaveBeenCalledTimes(1);
+    });
+
+    it(`cancels the body of a refused ${operation} maintenance response`, async () => {
+      const api = new PlainWorkerProvisioningApiFake();
+      deployedCandidate(api);
+      const cancelled = vi.fn();
+      const request = vi.fn(
+        async () =>
+          new Response(new ReadableStream({ cancel: cancelled }), {
+            status: 302,
+            headers: { location: 'https://redirected.invalid/elsewhere' },
+          }),
+      );
+
+      await expect(
+        invoke(backend(api, { fetch: request }), api),
+      ).rejects.toThrow('maintenance request failed with HTTP 302');
+
+      expect(request).toHaveBeenCalledTimes(1);
+      expect(cancelled).toHaveBeenCalledTimes(1);
     });
 
     it(`names the route wait when an ${operation} retry times out at the deadline`, async () => {

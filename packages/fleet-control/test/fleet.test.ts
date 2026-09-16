@@ -2602,11 +2602,25 @@ describe('fleet operations', () => {
     expect(findings.map(({ kind }) => kind)).toContain(
       'incomplete-provisioning',
     );
+  });
 
-    // A terminal row is retained state, not a phase that advances.
+  it('reports no incomplete provisioning for a retained terminal record', async () => {
+    const base = record('acme');
+    // A terminal row is retained state, not a phase that advances, so ageing
+    // past staleAfterMs is retention rather than stalled provisioning.
     const retired: FleetRecord = { ...base, phase: 'decommissioned' };
-    const retiredFindings = await audit([retired]);
-    expect(retiredFindings.map(({ kind }) => kind)).not.toContain(
+    const backend = new FleetBackend();
+    const findings = await auditFleetDrift({
+      store: storeFor([retired]),
+      records: [retired],
+      inventory: inventoryFor([base]),
+      backendFor: () => backend,
+      specFor: (item) => spec(item),
+      maintenanceSecretFor: () => 'maintenance-admin-secret-value-00001',
+      staleAfterMs: 1_000,
+      now: 10_000,
+    });
+    expect(findings.map(({ kind }) => kind)).not.toContain(
       'incomplete-provisioning',
     );
   });

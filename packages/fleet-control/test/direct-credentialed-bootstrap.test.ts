@@ -13,6 +13,7 @@ import {
   openDirectRunState,
 } from '../scripts/direct-credentialed-run-state.mjs';
 import { DIRECT_REFERENCE_PATH } from '../scripts/direct-reference-contract.mjs';
+import { providerJson as json } from './fixtures/direct-observations.js';
 
 const awaitReferenceIngress = invocation.awaitReferenceIngress;
 
@@ -58,13 +59,6 @@ const journals = new Set<DirectRunJournal>();
 const unexpectedRequests: string[] = [];
 const hash = (value: string | Uint8Array) =>
   createHash('sha256').update(value).digest('hex');
-const json = (result: unknown, result_info?: unknown) =>
-  Response.json({
-    success: true,
-    errors: [],
-    result,
-    ...(result_info === undefined ? {} : { result_info }),
-  });
 const absent = () =>
   Response.json(
     { success: false, errors: [{ code: 10000, message: 'synthetic absence' }] },

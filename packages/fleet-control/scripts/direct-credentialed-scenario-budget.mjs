@@ -5,7 +5,10 @@
 // cumulative cap on one phase across resumes, wide enough for re-entries that each
 // repeat the entry `sync()` and its observation. Ceilings bound a runaway phase and
 // may sum past the configured budget, because they are a cap and not a reservation.
-// `reserve` is 1.25x measured rounded up to a multiple of 4, minimum 4.
+// `reserve` is what a phase holds back for itself and the phases after it:
+// `checkInvocationHeadroom` refuses a call once the remaining budget falls
+// below the reserves still to come, so a run that cannot reach `complete`
+// stops at the phase that discovers it rather than part-way through a later one.
 // DIRECT_SCENARIO_MIN_INVOCATIONS adds the bootstrap control read and resume
 // headroom to the sum of every `reserve`: it is the floor
 // `referenceWorker.maxInvocations` clears.

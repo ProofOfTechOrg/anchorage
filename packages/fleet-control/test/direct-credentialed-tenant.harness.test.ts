@@ -151,6 +151,19 @@ describe.sequential('direct tenant fixture in workerd', {
     expect(response.status).toBe(200);
     return response.json() as Promise<ExecutionFenceVersionedReading>;
   };
+  const fencePost = (path: string, body?: string) =>
+    appFetch(path, {
+      method: 'POST',
+      headers: applicationHeaders,
+      ...(body === undefined ? {} : { body }),
+    });
+  const fenceProbe = (epoch: unknown) =>
+    fencePost('/__direct/fence-probe', JSON.stringify({ epoch }));
+  const fenceMutate = (body?: Record<string, unknown>) =>
+    fencePost(
+      '/__direct/fence-mutate',
+      body === undefined ? undefined : JSON.stringify(body),
+    );
 
   beforeAll(async () => {
     directory = await mkdtemp(join(tmpdir(), 'fleet-direct-tenant-'));
@@ -440,11 +453,7 @@ describe.sequential('direct tenant fixture in workerd', {
       requireMutationEpoch: false,
     });
     for (const epoch of ['current', 'stale', 'missing', 'future']) {
-      const response = await appFetch('/__direct/fence-probe', {
-        method: 'POST',
-        headers: applicationHeaders,
-        body: JSON.stringify({ epoch }),
-      });
+      const response = await fenceProbe(epoch);
       expect(response.status).toBe(200);
       expect(await response.json()).toEqual({
         epoch,
@@ -452,11 +461,7 @@ describe.sequential('direct tenant fixture in workerd', {
       });
     }
     for (const body of [undefined, '{}']) {
-      const response = await appFetch('/__direct/fence-mutate', {
-        method: 'POST',
-        headers: applicationHeaders,
-        ...(body === undefined ? {} : { body }),
-      });
+      const response = await fencePost('/__direct/fence-mutate', body);
       expect(response.status).toBe(200);
       expect(await response.json()).toEqual({ accepted: true });
     }
@@ -466,11 +471,7 @@ describe.sequential('direct tenant fixture in workerd', {
       ['/__direct/fence-probe', '{"epoch":"bogus"}'],
       ['/__direct/fence-probe', undefined],
     ] as const) {
-      const response = await appFetch(path, {
-        method: 'POST',
-        headers: applicationHeaders,
-        ...(body === undefined ? {} : { body }),
-      });
+      const response = await fencePost(path, body);
       expect(response.status).toBe(400);
       expect(
         (await env.DB.prepare('SELECT id FROM mastra_schedules').all()).results,
@@ -479,11 +480,7 @@ describe.sequential('direct tenant fixture in workerd', {
   });
 
   it('refuses a draining create and admits a draining delete after rejecting malformed ids', async () => {
-    const created = await appFetch('/__direct/fence-mutate', {
-      method: 'POST',
-      headers: applicationHeaders,
-      body: JSON.stringify({ phase: 'create' }),
-    });
+    const created = await fenceMutate({ phase: 'create' });
     expect(created.status).toBe(200);
     const creation = (await created.json()) as {
       accepted: boolean;
@@ -506,34 +503,33 @@ describe.sequential('direct tenant fixture in workerd', {
       mutationEpoch: 0,
       requireMutationEpoch: false,
     });
-    const refused = await appFetch('/__direct/fence-mutate', {
-      method: 'POST',
-      headers: applicationHeaders,
-      body: JSON.stringify({ phase: 'create' }),
-    });
+    const refused = await fenceMutate({ phase: 'create' });
     expect(refused.status).toBe(200);
     expect(await refused.json()).toEqual({
       accepted: false,
       code: 'EXECUTION_FENCED',
       status: 503,
     });
+    const fenced = await fenceProbe('current');
+    expect(fenced.status).toBe(200);
+    // The probe reads the same refusal as a classification rather than as the
+    // unclassified answer it reports for a code it cannot place.
+    expect(await fenced.json()).toEqual({
+      epoch: 'current',
+      classification: 'fenced',
+    });
     const env = await worker.getEnv();
     for (const malformed of ['..', 'x/y', '%', `${scheduleId}?ignored`]) {
-      const response = await appFetch('/__direct/fence-mutate', {
-        method: 'POST',
-        headers: applicationHeaders,
-        body: JSON.stringify({ phase: 'delete', scheduleId: malformed }),
+      const response = await fenceMutate({
+        phase: 'delete',
+        scheduleId: malformed,
       });
       expect(response.status).toBe(400);
       expect(
         (await env.DB.prepare('SELECT id FROM mastra_schedules').all()).results,
       ).toEqual([{ id: scheduleId }]);
     }
-    const deleted = await appFetch('/__direct/fence-mutate', {
-      method: 'POST',
-      headers: applicationHeaders,
-      body: JSON.stringify({ phase: 'delete', scheduleId }),
-    });
+    const deleted = await fenceMutate({ phase: 'delete', scheduleId });
     expect(deleted.status).toBe(200);
     expect(await deleted.json()).toMatchObject({ accepted: true });
     expect(
@@ -548,6 +544,26 @@ describe.sequential('direct tenant fixture in workerd', {
       mutationEpoch: 0,
       requireMutationEpoch: false,
     });
+  });
+
+  it('separates an unclassified mutation answer from a fence refusal', async () => {
+    const env = await worker.getEnv();
+    const unknown = await fenceMutate({
+      phase: 'delete',
+      scheduleId: 'absent-schedule',
+    });
+    expect(unknown.status).toBe(200);
+    // The schedule router answers a schedule it cannot find with no `reason`
+    // member, so the route reports the answer it could not read rather than a
+    // refusal code the tenant never received.
+    expect(await unknown.json()).toEqual({
+      accepted: false,
+      code: 'unexpected',
+      status: 404,
+    });
+    expect(
+      (await env.DB.prepare('SELECT id FROM mastra_schedules').all()).results,
+    ).toEqual([]);
   });
 
   it('refuses the pre-cutover artifact and admits the next artifact on the same activated fence', async () => {
@@ -577,11 +593,7 @@ describe.sequential('direct tenant fixture in workerd', {
       requireMutationEpoch: true,
       transitionRevision: draining.transitionRevision + 1,
     });
-    const stale = await appFetch('/__direct/fence-mutate', {
-      method: 'POST',
-      headers: applicationHeaders,
-      body: JSON.stringify({ phase: 'both' }),
-    });
+    const stale = await fenceMutate({ phase: 'both' });
     expect(stale.status).toBe(200);
     const staleOutcome = await stale.json();
     expect(staleOutcome).toEqual({
@@ -593,17 +605,10 @@ describe.sequential('direct tenant fixture in workerd', {
     await server.update(options('2'));
     worker = server.getWorker<HarnessBindings>();
     expect(await readFence()).toEqual(reopened);
-    const current = await appFetch('/__direct/fence-mutate', {
-      method: 'POST',
-      headers: applicationHeaders,
-      body: JSON.stringify({ phase: 'both' }),
-    });
+    const current = await fenceMutate({ phase: 'both' });
     expect(current.status).toBe(200);
     const currentOutcome = await current.json();
     expect(currentOutcome).toEqual({ accepted: true });
-    process.stdout.write(
-      `A1_ARTIFACT_EPOCH ${JSON.stringify({ release1: staleOutcome, release2: currentOutcome })}\n`,
-    );
   });
 
   it('classifies missing, future and stale epochs after reopen and admits the current epoch', async () => {
@@ -613,11 +618,7 @@ describe.sequential('direct tenant fixture in workerd', {
       ['stale', 'stale'],
       ['current', 'accepted'],
     ]) {
-      const response = await appFetch('/__direct/fence-probe', {
-        method: 'POST',
-        headers: applicationHeaders,
-        body: JSON.stringify({ epoch }),
-      });
+      const response = await fenceProbe(epoch);
       expect(response.status).toBe(200);
       expect(await response.json()).toEqual({ epoch, classification });
     }
@@ -714,9 +715,31 @@ describe.sequential('direct tenant fixture in workerd', {
 });
 
 describe('direct reference harness provider surface', () => {
+  const ACCOUNT = 'https://api.cloudflare.com/client/v4/accounts/account';
+  const deployment = `${ACCOUNT}/workers/scripts/absent-script/deployments/deployment`;
+  const version = `${ACCOUNT}/workers/scripts/pinned-script/versions/pinned-version`;
+
+  const seedVersion = (
+    harness: Awaited<ReturnType<typeof createDirectReferenceHarness>>,
+  ) =>
+    harness.world.seedScript('pinned-script', {
+      versions: [
+        {
+          versionId: 'pinned-version',
+          tag: undefined,
+          bindings: [],
+          mainModule: 'index.mjs',
+          modules: [],
+        },
+      ],
+      subdomain: { enabled: false, previewsEnabled: false },
+    });
+
+  const versionResources = async (response: Response) =>
+    ((await response.json()) as { result: { resources: object } }).result
+      .resources;
+
   it('answers the Node-side deployment read only when the harness opts in', async () => {
-    const deployment =
-      'https://api.cloudflare.com/client/v4/accounts/account/workers/scripts/absent-script/deployments/deployment';
     const gated = await createDirectReferenceHarness();
     try {
       expect((await gated.projection.fetch(deployment)).status).toBe(404);
@@ -733,6 +756,34 @@ describe('direct reference harness provider surface', () => {
         status: 200,
         id: 'deployment',
       });
+    } finally {
+      await opted.close();
+    }
+  });
+
+  it('adds the observed runtime to a bare version read only when the harness opts in', async () => {
+    const gated = await createDirectReferenceHarness();
+    try {
+      seedVersion(gated);
+      const response = await gated.projection.fetch(version);
+      expect(response.status).toBe(200);
+      // The gated projection answers the fixture's own version record, so a
+      // consumer reading `script_runtime` here would be reading the observer,
+      // not the provider.
+      expect(await versionResources(response)).not.toHaveProperty(
+        'script_runtime',
+      );
+    } finally {
+      await gated.close();
+    }
+    const opted = await createDirectReferenceHarness({
+      nodeProviderRest: true,
+    });
+    try {
+      seedVersion(opted);
+      const response = await opted.projection.fetch(version);
+      expect(response.status).toBe(200);
+      expect(await versionResources(response)).toHaveProperty('script_runtime');
     } finally {
       await opted.close();
     }

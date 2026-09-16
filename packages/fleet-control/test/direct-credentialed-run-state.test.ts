@@ -22,13 +22,18 @@ import {
   actionSummary,
   DIRECT_RUN_MAX_JOURNAL_BYTES,
   DIRECT_RUN_MAX_RESUME_COUNT,
+  DIRECT_RUN_TIMESTAMP,
   DIRECT_SCENARIO_ARRAY_MAXIMA,
+  DIRECT_SCENARIO_FAILURE_DETAILS,
+  DIRECT_SCENARIO_FAILURES,
   DIRECT_SCENARIO_OPERATION_SLOTS,
   type DirectBootstrapMutationReceipt,
   type DirectRunJournal,
   inspectDirectRunState,
+  isForceIdentity,
   openDirectRunState,
 } from '../scripts/direct-credentialed-run-state.mjs';
+import { requireFact } from '../scripts/direct-credentialed-scenario-checks.mjs';
 import type { DirectOperationSlot } from '../scripts/direct-reference-journal.js';
 import {
   bootstrapContext,
@@ -1032,6 +1037,60 @@ describeLinux('durable scenario state', () => {
     expect(journal.snapshot().scenario?.mutation).toEqual(call);
   });
 
+  it.each([
+    ['a null identity', null, true],
+    [
+      'both members inside the charset',
+      { databaseId: 'database-a', scriptName: 'script.a:1' },
+      true,
+    ],
+    [
+      'the longest member the charset admits',
+      { databaseId: 'a'.repeat(128), scriptName: 'script-a' },
+      true,
+    ],
+    [
+      'a member outside the charset',
+      { databaseId: 'database a', scriptName: 'script-a' },
+      false,
+    ],
+    [
+      'a member past the charset length',
+      { databaseId: 'a'.repeat(129), scriptName: 'script-a' },
+      false,
+    ],
+    [
+      'an extra identity key',
+      { databaseId: 'database-a', scriptName: 'script-a', extra: true },
+      false,
+    ],
+    ['a missing identity key', { databaseId: 'database-a' }, false],
+    ['a non-string member', { databaseId: 1, scriptName: 'script-a' }, false],
+    ['an array', [], false],
+    ['a string', 'database-a', false],
+  ] as const)('guards the force identity the journal admits: %s', async (_title, before, admitted) => {
+    expect(isForceIdentity(before)).toBe(admitted);
+    const { journal } = await scenarioJournal();
+    const state = scenarioWith((value) => {
+      const call: NonNullable<MutableScenario['lastCall']> = {
+        ordinal: 3,
+        action: { kind: 'force-terminal', role: 'a' },
+        outcome: 'returned',
+        attempts: { provider: 0, maintenance: 0, application: 0 },
+        migration: null,
+      };
+      Object.assign(call, { before });
+      value.lastCall = call;
+      value.mutation = call;
+    });
+    if (!admitted) {
+      await refuses(journal, state);
+      return;
+    }
+    await journal.recordScenario(state);
+    expect(journal.snapshot().scenario?.mutation?.before).toEqual(before);
+  });
+
   it('projects and round-trips a drain summary with both expected counters', async () => {
     const action = {
       kind: 'tenant-fence' as const,
@@ -1045,9 +1104,7 @@ describeLinux('durable scenario state', () => {
     const state = scenarioWith((value) => {
       present(value.lastCall).action = action;
       present(value.mutation).action = action;
-      delete present(value.lastCall).before;
-      delete present(value.mutation).before;
-    });
+    }, 'audit-page');
     await journal.recordScenario(state);
     await closed(journal);
     const resumed = await opened({ ...f.input, mode: 'resume' });
@@ -1063,7 +1120,6 @@ describeLinux('durable scenario state', () => {
     await refuses(
       journal,
       scenarioWith((state) => {
-        delete present(state.lastCall).before;
         present(state.lastCall).action = {
           kind: 'tenant-fence',
           role: 'a',
@@ -1072,7 +1128,7 @@ describeLinux('durable scenario state', () => {
           expectedRevision: 2,
           [field]: 0.5,
         };
-      }),
+      }, 'audit-page'),
     );
   });
 
@@ -1390,27 +1446,48 @@ describeLinux('durable scenario state', () => {
     await refuses(fresh.journal, state);
   });
 
+  it.each([
+    ['fleet-a.example.test', true],
+    ['a.b', true],
+    // The journal admits a numeric last label; the configuration module's own
+    // `hostname` refuses that host, and this set is the journal's, not its.
+    ['route.9', true],
+    [`${'a'.repeat(63)}.test`, true],
+    ['A.example.test', false],
+    ['-a.example.test', false],
+    ['a-.example.test', false],
+    [`${'a'.repeat(64)}.test`, false],
+    ['single', false],
+    ['1.2', false],
+    ['a..b', false],
+    ['a.example.test.', false],
+  ])('admits the route hostname %s in the journal: %s', async (hostname, admitted) => {
+    const { journal } = await scenarioJournal();
+    const state = scenarioWith((value) => {
+      present(value.proofs.inventories.before).routeHostnames = [hostname];
+    });
+    if (!admitted) {
+      await refuses(journal, state);
+      return;
+    }
+    await journal.recordScenario(state);
+    expect(
+      journal.snapshot().scenario?.proofs.inventories.before?.routeHostnames,
+    ).toEqual([hostname]);
+  });
+
   it('publishes a maximal scenario inside the journal byte bound', async () => {
     const { f, journal } = await scenarioJournal();
     await journal.recordScenario(maximalScenario('audit-page'));
     const migrationBytes = Buffer.byteLength(
       await readFile(join(f.runDirectory, 'journal.json'), 'utf8'),
     );
-    process.stdout.write(
-      `A1_MAXIMAL_SCENARIO_JOURNAL_BYTES audit-page-migration ${migrationBytes}\n`,
-    );
     await journal.recordScenario(maximalScenario());
     const serialized = await readFile(
       join(f.runDirectory, 'journal.json'),
       'utf8',
     );
-    process.stdout.write(
-      `A1_MAXIMAL_SCENARIO_JOURNAL_BYTES force-terminal ${Buffer.byteLength(serialized)}\n`,
-    );
     expect(Buffer.byteLength(serialized)).toBeGreaterThan(migrationBytes);
-    process.stdout.write(
-      `A1_MAXIMAL_SCENARIO_JOURNAL_FREE_BYTES ${DIRECT_RUN_MAX_JOURNAL_BYTES - Buffer.byteLength(serialized)}\n`,
-    );
     expect(Buffer.byteLength(serialized)).toBeLessThan(
       DIRECT_RUN_MAX_JOURNAL_BYTES - 118 * 1024,
     );
@@ -1418,6 +1495,47 @@ describeLinux('durable scenario state', () => {
       discover: { evidenceSha256: DIGEST, evidenceCount: MAX_COUNT },
       verify: { evidenceSha256: DIGEST, evidenceCount: MAX_COUNT },
     });
+  });
+
+  it('pins the scenario failure vocabularies its producers are typed against', () => {
+    // The declaration states each as a tuple and `requireFact` types its
+    // `detail` from one of them, so the runtime arrays and the declared
+    // tuples are pinned together here.
+    expect([...DIRECT_SCENARIO_FAILURES]).toEqual([
+      'observation-mismatch',
+      'outcome-unknown',
+      'proof-unavailable',
+      'budget-exhausted',
+      'invocation-budget-exhausted',
+      'reference-refused',
+      'invalid-input',
+      'provider-unavailable',
+      'journal-failed',
+      'blocked',
+    ]);
+    expect([...DIRECT_SCENARIO_FAILURE_DETAILS]).toEqual([
+      'platform-page',
+      'transport-failure',
+      'non-contract-answer',
+      'delivery-window-expired',
+      'phase-ceiling',
+      'run-reserve',
+      'below-scenario-floor',
+    ]);
+    for (const vocabulary of [
+      DIRECT_SCENARIO_FAILURES,
+      DIRECT_SCENARIO_FAILURE_DETAILS,
+    ])
+      expect(Object.isFrozen(vocabulary)).toBe(true);
+    const detail: (typeof DIRECT_SCENARIO_FAILURE_DETAILS)[number] =
+      'phase-ceiling';
+    const code: (typeof DIRECT_SCENARIO_FAILURES)[number] = 'budget-exhausted';
+    expect(() => requireFact(false, code, detail)).toThrowError(code);
+    expect(() =>
+      // @ts-expect-error A producer spells a member of the vocabulary, and a
+      // widened parameter type makes this suppression itself an error.
+      requireFact(false, code, 'not-a-recorded-detail'),
+    ).toThrowError(code);
   });
 
   it('publishes the journal fields in the order the decoder establishes', async () => {
@@ -1438,19 +1556,24 @@ describeLinux('durable scenario state', () => {
     ]);
   });
 
-  it('refuses a stored journal larger than the byte bound before parsing it', async () => {
+  it.each([
+    [DIRECT_RUN_MAX_JOURNAL_BYTES, true],
+    [DIRECT_RUN_MAX_JOURNAL_BYTES + 1, false],
+  ])('reads a stored journal of %d bytes before parsing it (admitted=%s)', async (size, admitted) => {
     const { f, journal } = await scenarioJournal();
     await journal.recordScenario(maximalScenario());
     const path = join(f.runDirectory, 'journal.json');
     const serialized = await readFile(path, 'utf8');
     await closed(journal);
-    await writeFile(
-      path,
-      serialized.padEnd(DIRECT_RUN_MAX_JOURNAL_BYTES + 1, ' '),
-    );
-    await expect(
-      openDirectRunState({ ...f.input, mode: 'resume' }),
-    ).rejects.toMatchObject({ code: 'invalid-state' });
+    await writeFile(path, serialized.padEnd(size, ' '));
+    const opening = openDirectRunState({ ...f.input, mode: 'resume' });
+    if (!admitted) {
+      await expect(opening).rejects.toMatchObject({ code: 'invalid-state' });
+      return;
+    }
+    const resumed = await opening;
+    expect(resumed.snapshot().scenario).not.toBeUndefined();
+    await closed(resumed);
   });
 
   it('refuses ordinals the durable invocation count cannot account for', async () => {
@@ -1679,16 +1802,30 @@ describeLinux('durable scenario state', () => {
           `from ${JSON.stringify(new URL(name, source).href)}`,
       );
     expect(await load(absolute(text))).toEqual({ status: 0, refused: false });
-    for (const [key, declaration] of declarations) {
+    for (const [key, declaration] of declarations)
       expect({ key, occurrences: text.split(declaration).length - 1 }).toEqual({
         key,
         occurrences: 1,
       });
-      expect({
-        key,
-        ...(await load(absolute(text.replace(declaration, '')))),
-      }).toEqual({ key, status: 1, refused: true });
-    }
+    // One child per declared maximum, four at a time: the children are
+    // independent and IO-bound, and the bound keeps the enumeration from
+    // taking a core for every entry the table grows.
+    const pending = [...declarations];
+    const refusals: Record<
+      string,
+      { status: number | null; refused: boolean }
+    > = {};
+    await Promise.all(
+      Array.from({ length: 4 }, async () => {
+        for (let entry = pending.shift(); entry; entry = pending.shift())
+          refusals[entry[0]] = await load(absolute(text.replace(entry[1], '')));
+      }),
+    );
+    expect(refusals).toEqual(
+      Object.fromEntries(
+        declarations.map(([key]) => [key, { status: 1, refused: true }]),
+      ),
+    );
   }, 60_000);
 
   it.each([
@@ -1716,6 +1853,17 @@ describeLinux('durable scenario state', () => {
     );
     await unknown.journal.recordScenario(maximalScenario());
     expect(unknown.journal.snapshot().scenario?.failure).toEqual({
+      code: 'observation-mismatch',
+      ordinal: MAX_COUNT,
+      detail: 'below-scenario-floor',
+    });
+    const omitted = await scenarioJournal();
+    await omitted.journal.recordScenario(
+      scenarioWith((state) => {
+        delete present(state.failure).detail;
+      }),
+    );
+    expect(omitted.journal.snapshot().scenario?.failure).toEqual({
       code: 'observation-mismatch',
       ordinal: MAX_COUNT,
     });
@@ -1919,13 +2067,10 @@ describeLinux('durable teardown state', () => {
       },
     ];
     for (const [index, mutate] of cases.entries())
-      await expect({
-        index,
-        outcome: await journal.recordTeardown(teardownWith(mutate)).then(
-          () => 'accepted',
-          (error: { code?: string }) => error.code,
-        ),
-      }).toEqual({ index, outcome: 'invalid-state' });
+      await expect(
+        journal.recordTeardown(teardownWith(mutate)),
+        `teardown case ${index}`,
+      ).rejects.toMatchObject({ code: 'invalid-state' });
   });
 
   it('publishes a receipt while its mutation is pending and refuses every regression', async () => {
@@ -1994,7 +2139,7 @@ describeLinux('durable teardown state', () => {
       ).rejects.toMatchObject({ code: 'invalid-state' });
   });
 
-  it('keeps a refused teardown terminal and rewritable in place', async () => {
+  it('keeps a refused teardown rewritable in place', async () => {
     const { journal } = await completeScenarioJournal();
     const refused = (attempts: number) =>
       teardownWith((state) => {
@@ -2012,17 +2157,51 @@ describeLinux('durable teardown state', () => {
     await expect(
       journal.recordTeardown(
         teardownWith((state) => {
-          state.pending = { kind: 'disable-reference-ingress' };
+          state.phase = 'worker';
           state.providerRequests = 2;
         }),
       ),
     ).rejects.toMatchObject({ code: 'invalid-state' });
   });
 
+  it.each([
+    ['scenario-incomplete', true],
+    ['outcome-unknown', true],
+    ['identity-mismatch', false],
+    ['forbidden', false],
+    ['budget-exhausted', false],
+  ] as const)('re-enters deletion from a %s refusal (recoverable=%s)', async (failure, recoverable) => {
+    const { journal } = await completeScenarioJournal();
+    await journal.recordTeardown(
+      teardownWith((state) => {
+        state.phase = 'refused';
+        state.failure = failure;
+        state.residual = residualObservation();
+      }),
+    );
+    const reentry = journal.recordTeardown(
+      teardownWith((state) => {
+        state.pending = { kind: 'disable-reference-ingress' };
+      }),
+    );
+    if (!recoverable) {
+      await expect(reentry).rejects.toMatchObject({ code: 'invalid-state' });
+      expect(journal.snapshot().teardown?.phase).toBe('refused');
+      return;
+    }
+    await reentry;
+    expect(journal.snapshot().teardown).toMatchObject({
+      phase: 'ingress',
+      residual: null,
+    });
+  });
+
   it('accepts the worst-case teardown inside the byte bound and refuses an undecodable one without poisoning', async () => {
     const { f, journal } = await completeScenarioJournal();
+    const path = join(f.runDirectory, 'journal.json');
     await journal.assertTeardownCapacity(maximalTeardown());
     expect(journal.snapshot().teardown).toBeUndefined();
+    const stored = await readFile(path, 'utf8');
     await expect(
       journal.assertTeardownCapacity(
         teardownWith((state) => {
@@ -2032,17 +2211,13 @@ describeLinux('durable teardown state', () => {
         }),
       ),
     ).rejects.toMatchObject({ code: 'invalid-state' });
+    // Unpoisoned: the refused check leaves no part of its record behind, in
+    // the snapshot or in the stored journal, and a worst-case teardown still
+    // records afterwards.
+    expect(journal.snapshot().teardown).toBeUndefined();
+    expect(await readFile(path, 'utf8')).toBe(stored);
     await journal.recordTeardown(maximalTeardown());
-    const serialized = await readFile(
-      join(f.runDirectory, 'journal.json'),
-      'utf8',
-    );
-    process.stdout.write(
-      `A1_COMPLETE_TEARDOWN_JOURNAL_BYTES ${Buffer.byteLength(serialized)}\n`,
-    );
-    process.stdout.write(
-      `A1_COMPLETE_TEARDOWN_JOURNAL_FREE_BYTES ${DIRECT_RUN_MAX_JOURNAL_BYTES - Buffer.byteLength(serialized)}\n`,
-    );
+    const serialized = await readFile(path, 'utf8');
     expect(
       DIRECT_RUN_MAX_JOURNAL_BYTES - Buffer.byteLength(serialized),
     ).toBeGreaterThan(90 * 1024);
@@ -2148,7 +2323,12 @@ describeLinux('CLI metadata and inspection', () => {
     });
     try {
       expect(inspection.snapshot).toEqual(snapshot);
-      expect(Object.keys(inspection)).toEqual(['snapshot', 'close']);
+      expect(Object.keys(inspection)).toEqual([
+        'directory',
+        'snapshot',
+        'close',
+      ]);
+      expect(inspection.directory).toBe(f.runDirectory);
       await expect(
         inspectDirectRunState({ ...f.input, mode: 'inspect' }),
       ).rejects.toMatchObject({ code: 'lock-unavailable' });
@@ -2271,6 +2451,17 @@ describeLinux('CLI metadata and inspection', () => {
   });
 
   it.each([
+    ['2026-09-13T00:00:00.000Z', true],
+    ['2026-09-13T00:00:00Z', false],
+    ['2026-09-13T00:00:00.000+00:00', false],
+    ['2026-09-13T00:00:00.0000Z', false],
+  ] as const)('shares one 24-byte ISO-8601 pattern that accepts %s: %s', (value, accepted) => {
+    // The journal decoder and the CLI summary clock apply this one pattern.
+    expect(DIRECT_RUN_TIMESTAMP.test(value)).toBe(accepted);
+    expect(DIRECT_RUN_TIMESTAMP.flags).toBe('u');
+  });
+
+  it.each([
     'createdAt',
     'resumeCount',
   ])('refuses version-1 journals carrying %s', async (key) => {
@@ -2310,11 +2501,13 @@ describeLinux('CLI metadata and inspection', () => {
     const countBytes = Buffer.byteLength(
       `"resumeCount":${DIRECT_RUN_MAX_RESUME_COUNT},`,
     );
-    console.log('CLI_METADATA_BYTES', {
-      timeBytes,
-      countBytes,
-      total: timeBytes + countBytes,
-    });
+    process.stdout.write(
+      `CLI_METADATA_BYTES ${JSON.stringify({
+        timeBytes,
+        countBytes,
+        total: timeBytes + countBytes,
+      })}\n`,
+    );
     expect([timeBytes, countBytes, timeBytes + countBytes]).toEqual([
       39, 21, 60,
     ]);

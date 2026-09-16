@@ -42,7 +42,11 @@ export interface AdvanceFleetInventoryOptions {
   readonly action: FleetInventoryAdvanceAction;
   readonly maxProviderRequests: number;
   readonly maxStagedRowsPerChunk?: number;
-  /** Call-local cancellation; it is never persisted. */
+  /**
+   * Call-local cancellation; it is never persisted. This engine forwards it
+   * to the stage advance, which is where it is honoured; the engine takes no
+   * step of its own on it.
+   */
   readonly signal?: AbortSignal;
 }
 
@@ -173,7 +177,6 @@ async function advanceChunk(
       `fleet inventory run '${run.operationId}' failed and cannot be continued`,
     );
   }
-  // Lease loss is detected at the dispatch boundary, before any provider work.
   await lease.assertOwned();
   const executed = run.progress.stage;
   if (executed.step === 'finalize') {
@@ -261,8 +264,6 @@ export async function advanceFleetInventory(
       throw new FleetInventoryRunTokenOperationError(token.operationId);
     }
     if (classifyFleetInventoryRunToken(token, run) === 'stale') {
-      // The caller is behind the persisted run, so the authoritative current
-      // result is returned without touching the provider.
       return run.state === 'finalized'
         ? completeFromRun(options.store, lease, run)
         : { status: 'pending', token: runToken(run) };

@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // This module holds the classification and redaction helpers that Cloudflare
-// provider transports apply to SDK errors and to raw provider responses.
-// Its two sanitizer consumers use different members: the ordinary-Worker
-// upload dispatch (cloudflare-ordinary-worker-operations.ts) calls
-// sanitizeProviderError, while the client's D1 export calls
-// readErrorFieldSafely and sanitizedErrorName. Both modules import
-// isNotFound.
+// provider transports apply to SDK errors and to raw provider responses, and
+// refuseRedirectStatus, the redirect refusal those transports share with the
+// tenant-Worker maintenance transport, whose responses are not provider
+// responses.
 
 import { APIConnectionError, APIError } from 'cloudflare';
+import { cancelBodyWithoutAwait } from './database-export-store.js';
 import { readField } from './json-field-reads.js';
 
 const MAX_SANITIZED_ERROR_CAUSE_DEPTH = 8;
@@ -163,22 +162,46 @@ export function isNotFound(error: unknown): boolean {
 
 const REDIRECT_STATUSES: readonly number[] = [301, 302, 303, 307, 308];
 
-/** Matches the Worker egress proxy's enumeration in workers/outbound.ts. */
-export function isRedirectStatus(status: number): boolean {
+/**
+ * Matches the HTTP statuses that carry a `Location`. A credentialed transport
+ * refuses a response carrying one.
+ */
+function isRedirectStatus(status: number): boolean {
   return REDIRECT_STATUSES.includes(status);
 }
 
 /**
- * A credentialed transport received a redirect. The message names the
- * operation and the status but never the address, because the same refusal
- * covers signed export URLs and tenant maintenance endpoints whose addresses
- * belong inside the caller's redaction boundary.
+ * A credentialed transport received a redirect. The message names the operation
+ * and the status, never the address: a redirect target the control plane did not
+ * choose belongs inside the caller's redaction boundary.
  */
-export class CredentialedRedirectRefusedError extends Error {
+class CredentialedRedirectRefusedError extends Error {
   constructor(operation: string, status: number) {
     super(`${operation} refused a redirect with status ${status}`);
     this.name = 'CredentialedRedirectRefusedError';
   }
+}
+
+/**
+ * Refuses a redirect status on a credentialed transport and cancels the body
+ * nothing reads.
+ *
+ * Where a credentialed transport's redirect refusal belongs: at the point that
+ * reads the raw response, whenever the consumer there does not itself classify
+ * the response status. A transport whose consumer classifies the status instead
+ * forces `redirect: 'manual'` and leaves the refusal to that consumer.
+ */
+export function refuseRedirectStatus(
+  response: Response,
+  operation: string,
+): void {
+  if (!isRedirectStatus(response.status)) return;
+  const refusal = new CredentialedRedirectRefusedError(
+    operation,
+    response.status,
+  );
+  cancelBodyWithoutAwait(response.body, refusal);
+  throw refusal;
 }
 
 /**

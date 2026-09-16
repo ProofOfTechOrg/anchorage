@@ -49,8 +49,11 @@ export function phaseInvocationReserve(phase) {
 }
 
 export function checkInvocationHeadroom(phase, phaseCalls, remaining) {
+  requireFact(
+    Number.isSafeInteger(remaining) && remaining >= 0,
+    'invalid-input',
+  );
   requireFact(remaining > 0, 'invocation-budget-exhausted');
-  requireFact(Number.isSafeInteger(remaining), 'invalid-input');
   requireFact(
     Object.hasOwn(DIRECT_SCENARIO_INVOCATION_BUDGET, phase),
     'invalid-input',
@@ -129,6 +132,7 @@ export function expectedVersion(record, release, candidate = false) {
 }
 
 export function checkItemConvergence(items) {
+  requireFact(Array.isArray(items) && items.length >= 2);
   if (items[1].status !== 'pending') equal(items[0].status, 'complete');
 }
 
@@ -139,7 +143,9 @@ export function checkTrafficDistribution(candidate, previous) {
     [previous.versionId, 100],
     [candidate.versionId, 0],
   ]);
-  equal(candidate.currentDeployment.versions.length, weights.size);
+  // The staged deployment carries the previous version and the candidate, so
+  // the count is two and does not follow the map the comparison below builds.
+  equal(candidate.currentDeployment.versions.length, 2);
   equal(
     new Map(
       candidate.currentDeployment.versions.map((entry) => [

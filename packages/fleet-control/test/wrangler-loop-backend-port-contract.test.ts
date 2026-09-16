@@ -658,7 +658,7 @@ describe('WranglerLoopBackend provisioning port contract', () => {
     });
   });
 
-  it('refuses a matching D1 list row whose uuid is empty', async () => {
+  it('refuses a D1 list row whose uuid is empty', async () => {
     const runner = new FakeRunner(async () => ({
       stdout: JSON.stringify([{ uuid: '', name: spec.databaseName }]),
       stderr: '',

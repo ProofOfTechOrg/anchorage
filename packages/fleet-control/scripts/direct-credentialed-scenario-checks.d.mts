@@ -7,6 +7,7 @@ import type {
   DirectWorkerVersionObservation,
 } from './direct-credentialed-observations.mjs';
 import type {
+  DIRECT_SCENARIO_FAILURE_DETAILS,
   DIRECT_SCENARIO_OPERATION_SLOTS,
   DirectRunActionSummary,
 } from './direct-credentialed-run-state.mjs';
@@ -150,10 +151,15 @@ export interface DirectScenarioAllowedChanges {
 export const NORMAL_ROLES: readonly DirectScenarioNormalRole[];
 export const SCENARIO_ROLES: readonly DirectFixtureRole[];
 
+/**
+ * `detail` is the scenario's own failure-detail vocabulary, so a producer
+ * cannot spell one the journal schema and the evidence projection would then
+ * drop.
+ */
 export function requireFact(
   condition: unknown,
   code?: string,
-  detail?: string,
+  detail?: (typeof DIRECT_SCENARIO_FAILURE_DETAILS)[number],
 ): asserts condition;
 export function equal(actual: unknown, expected: unknown): void;
 export function parse(value: unknown): unknown;
@@ -180,8 +186,13 @@ export function expectedVersion(
   release: '1' | '2',
   candidate?: boolean,
 ): DirectExpectedWorkerVersion;
+/** The check reads items one and two, so it takes a pair or longer. */
 export function checkItemConvergence(
-  items: readonly DirectScenarioMigrationItem[],
+  items: readonly [
+    DirectScenarioMigrationItem,
+    DirectScenarioMigrationItem,
+    ...DirectScenarioMigrationItem[],
+  ],
 ): void;
 export function checkTrafficDistribution(
   candidate: DirectWorkerVersionObservation,

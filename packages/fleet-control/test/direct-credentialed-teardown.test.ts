@@ -4,12 +4,15 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DirectProviderError } from '../scripts/direct-credentialed-provider.mjs';
+import { REFERENCE_SECRET_NAMES } from '../scripts/direct-credentialed-reference-vocabulary.mjs';
 import {
   DIRECT_TEARDOWN_MAXIMA,
   type DirectRunJournal,
 } from '../scripts/direct-credentialed-run-state.mjs';
 import type { DirectTeardownOutcome } from '../scripts/direct-credentialed-teardown.mjs';
 import { teardownDirectReference } from '../scripts/direct-credentialed-teardown.mjs';
+import { CLOUDFLARE_INVENTORY_BOUND } from '../src/cloudflare-client-config.js';
+import { providerJson as json } from './fixtures/direct-observations.js';
 import {
   bootstrapContext,
   cleanupDirectRunState,
@@ -21,17 +24,16 @@ import {
   opened,
   present,
   scenarioJournal,
+  teardownWith,
 } from './fixtures/direct-run-state-builder.js';
 
 const API_TOKEN = 'teardown/provider-token+sentinel==';
 const ACCOUNT = 'account';
 const ROOT = `/client/v4/accounts/${ACCOUNT}`;
 const ROUTES = '/client/v4/zones/zone/workers/routes';
-const SECRET_NAMES = [
-  'CLOUDFLARE_API_TOKEN',
-  'DIRECT_DEPLOYMENT_SECRETS',
-  'FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET',
-];
+// The listing answers in the provider's order, which teardown sorts before it
+// compares; the names themselves are the upload's own list.
+const SECRET_NAMES = [...REFERENCE_SECRET_NAMES].sort();
 const unexpectedRequests: string[] = [];
 
 type Hook = (
@@ -39,14 +41,9 @@ type Hook = (
   url: URL,
 ) => Promise<Response | undefined> | Response | undefined;
 type Row = Record<string, unknown>;
+// The world collections whose rows the residual scan classifies by one field.
+type ListedSurface = 'scripts' | 'routes' | 'domains' | 'queues' | 'namespaces';
 
-const json = (result: unknown, result_info?: unknown) =>
-  Response.json({
-    success: true,
-    errors: [],
-    result,
-    ...(result_info === undefined ? {} : { result_info }),
-  });
 const absent = (status = 404) =>
   Response.json(
     { success: false, errors: [{ code: 10000, message: 'synthetic absence' }] },
@@ -62,6 +59,13 @@ const deployments = (versionId: string) =>
         versions: [{ version_id: versionId, percentage: 100 }],
       },
     ],
+  });
+// The bucket read the identity check refuses: the run's own name carrying a
+// creation date that is not the one the bootstrap recorded.
+const changedBucket = (w: { names: { exportBucket: string } }) =>
+  json({
+    name: w.names.exportBucket,
+    creation_date: '2020-01-01T00:00:00.000Z',
   });
 const paged = (url: URL, rows: Row[]) =>
   json(url.searchParams.has('page') ? [] : rows);
@@ -136,8 +140,9 @@ async function world(
     ...(state.scriptPresent ? [{ id: names.referenceWorker }] : []),
     ...state.scripts,
   ];
-  // The live shapes carry no `result_info` on scripts and routes, so the
-  // default world sends none; `corroborate` opts into the attested shape.
+  // The default world sends no `result_info` on any listing: the live shape for
+  // scripts and routes, and the uncorroborated case for the rest.
+  // `corroborate` opts into the attested shape.
   const listing = (rows: Row[]) =>
     options.corroborate === true
       ? json(rows, { total_count: rows.length })
@@ -159,16 +164,7 @@ async function world(
         return json({ enabled: state.ingress, previews_enabled: false });
       if (path === `${script}/secrets`)
         return json(state.secretNames.map((name) => ({ name })));
-      if (path === `${script}/deployments`)
-        return json({
-          deployments: [
-            {
-              id: 'deployment',
-              strategy: 'percentage',
-              versions: [{ version_id: 'version', percentage: 100 }],
-            },
-          ],
-        });
+      if (path === `${script}/deployments`) return deployments('version');
       if (path === `${script}/versions`)
         return state.scriptPresent ? json({ items: state.versions }) : absent();
       if (path === script)
@@ -314,37 +310,58 @@ describeLinux('direct reference teardown', () => {
     const outcome = await w.run();
     expect(outcome.status).toBe('cleaned');
     expect(w.requests).toEqual([
+      // disable-reference-ingress: probe, identity, disable, reread
       `GET ${w.script}/subdomain`,
       `GET ${w.script}/deployments`,
       `POST ${w.script}/subdomain`,
       `GET ${w.script}/subdomain`,
+
+      // delete-reference-worker: probe, identity (version and secret set),
+      // delete, reread
       `GET ${w.script}`,
       `GET ${w.script}/deployments`,
       `GET ${w.script}/secrets`,
       `DELETE ${w.script}`,
       `GET ${w.script}`,
+
+      // delete-fleet-d1: probe, identity, delete, reread
       `GET ${ROOT}/d1/database/fleet-uuid`,
       `GET ${ROOT}/d1/database/fleet-uuid`,
       `DELETE ${ROOT}/d1/database/fleet-uuid`,
       `GET ${ROOT}/d1/database/fleet-uuid`,
+
+      // delete-quota-d1: probe, identity, delete, reread
       `GET ${ROOT}/d1/database/quota-uuid`,
       `GET ${ROOT}/d1/database/quota-uuid`,
       `DELETE ${ROOT}/d1/database/quota-uuid`,
       `GET ${ROOT}/d1/database/quota-uuid`,
-      `GET ${w.bucketPath}/objects`,
-      `GET ${w.bucketPath}/objects`,
+
+      // export objects: one bucket attestation, then the prefix-scoped and
+      // whole-bucket listings that admit the keys
       `GET ${w.bucketPath}`,
+      `GET ${w.bucketPath}/objects`,
+      `GET ${w.bucketPath}/objects`,
+
+      // delete-export-object a: probe, delete, reread
       `GET ${w.bucketPath}/objects/${w.keyA}`,
       `DELETE ${w.bucketPath}/objects/${w.keyA}`,
       `GET ${w.bucketPath}/objects/${w.keyA}`,
+
+      // delete-export-object b: probe, delete, reread
       `GET ${w.bucketPath}/objects/${w.keyB}`,
       `DELETE ${w.bucketPath}/objects/${w.keyB}`,
       `GET ${w.bucketPath}/objects/${w.keyB}`,
+
+      // the prefix settles empty before the bucket goes
       `GET ${w.bucketPath}/objects`,
+
+      // delete-export-r2: probe, identity, delete, reread
       `GET ${w.bucketPath}`,
       `GET ${w.bucketPath}`,
       `DELETE ${w.bucketPath}`,
       `GET ${w.bucketPath}`,
+
+      // the residual scan, one surface at a time
       `GET ${ROOT}/d1/database`,
       `GET ${ROOT}/d1/database`,
       `GET ${ROOT}/workers/durable_objects/namespaces`,
@@ -356,6 +373,8 @@ describeLinux('direct reference teardown', () => {
       `GET ${ROOT}/workers/dispatch/namespaces`,
       `GET ${w.script}/versions`,
     ]);
+    // Each ordinal below is the position of that step's own reread in the list
+    // above: the receipt is written once the probe has seen the resource gone.
     expect(outcome.facts.receipts).toMatchObject({
       ingress: { ordinal: 4, settledByReread: false },
       worker: {
@@ -422,7 +441,13 @@ describeLinux('direct reference teardown', () => {
       phase: 'refused',
     });
     expect(w.requests).toEqual([]);
-    expect(outcome.facts.retainedIdentities.fleetUuid).toBe('fleet-uuid');
+    expect(outcome.facts.retainedIdentities).toEqual({
+      fleetUuid: 'fleet-uuid',
+      quotaUuid: 'quota-uuid',
+      exportBucket: w.names.exportBucket,
+      scriptName: w.names.referenceWorker,
+      activeVersionId: 'version',
+    });
   });
 
   it('refuses a pending bootstrap mutation and an incomplete bootstrap before any provider call', async () => {
@@ -436,10 +461,17 @@ describeLinux('direct reference teardown', () => {
         apiToken: API_TOKEN,
         fetch: never(),
       });
-    expect(retained(await call()).reason).toBe('invalid-state');
+    const incomplete = retained(await call());
+    expect(incomplete).toMatchObject({
+      reason: 'invalid-state',
+      phase: 'refused',
+    });
     await journal.beginBootstrapMutation('create-fleet-d1');
     const pending = retained(await call());
-    expect(pending.reason).toBe('outcome-unknown');
+    expect(pending).toMatchObject({
+      reason: 'outcome-unknown',
+      phase: 'refused',
+    });
     expect(pending.facts.retainedIdentities).toEqual({
       fleetUuid: null,
       quotaUuid: null,
@@ -483,14 +515,40 @@ describeLinux('direct reference teardown', () => {
     });
   });
 
-  it('refuses a confirmed export set that is not exactly two keys', async () => {
+  it('re-enters deletion from a recorded refusal the run has since cleared', async () => {
+    const w = await world();
+    await w.journal.recordTeardown(
+      teardownWith((state) => {
+        state.phase = 'refused';
+        state.failure = 'scenario-incomplete';
+      }),
+    );
+    const outcome = await w.run();
+    expect(outcome.status).toBe('cleaned');
+    expect((await diskState(w.journal)).teardown).toMatchObject({
+      phase: 'complete',
+      failure: null,
+    });
+  });
+
+  it.each([
+    1, 3,
+  ])('refuses a confirmed export set of %d keys', async (count) => {
     const w = await world({ complete: false });
     const state = completeScenario();
     const a = present(state.proofs.exports.a);
-    present(state.proofs.exports.b).receipt = structuredClone(a.receipt);
-    state.proofs.exportVerifications = state.proofs.exportVerifications.map(
-      () => structuredClone(a),
-    );
+    if (count === 1) {
+      present(state.proofs.exports.b).receipt = structuredClone(a.receipt);
+      state.proofs.exportVerifications = state.proofs.exportVerifications.map(
+        () => structuredClone(a),
+      );
+    } else {
+      // A third distinct receipt: the count is exactly two, not "at most the
+      // journal's `exportObjects` maximum".
+      const third = structuredClone(a);
+      third.receipt.operationId = `${a.receipt.operationId}-third`;
+      state.proofs.exportVerifications = [third];
+    }
     await w.journal.recordScenario(state);
     const outcome = retained(await w.run());
     expect(outcome.reason).toBe('invalid-state');
@@ -583,6 +641,27 @@ describeLinux('direct reference teardown', () => {
         : undefined,
     );
     expect(retained(await w.run()).reason).toBe('provider-unavailable');
+
+    const resumed = await world();
+    resumed.setHook((request, url) =>
+      request.method === 'DELETE' && url.pathname === resumed.script
+        ? json([])
+        : undefined,
+    );
+    expect(retained(await resumed.run()).reason).toBe('outcome-unknown');
+    resumed.setHook((request, url) =>
+      request.method === 'GET' && url.pathname === resumed.script
+        ? absent(500)
+        : undefined,
+    );
+    expect(retained(await resumed.run()).reason).toBe('provider-unavailable');
+    // The probe refuses ahead of every write, so the record the earlier run
+    // left pending is still the record a later run re-enters on.
+    expect((await diskState(resumed.journal)).teardown).toMatchObject({
+      phase: 'worker',
+      pending: { kind: 'delete-reference-worker' },
+      receipts: { worker: null },
+    });
   });
 
   it('retains a pending mutation whose reread still shows the resource', async () => {
@@ -621,11 +700,34 @@ describeLinux('direct reference teardown', () => {
       uuid: 'fleet-uuid',
       settledByReread: true,
     });
+    // No second delete of any shape for that database: the resumed run reads
+    // it and settles the receipt by that read.
     expect(
       w.requests
         .slice(mark)
-        .filter((entry) => entry === `DELETE ${ROOT}/d1/database/fleet-uuid`),
-    ).toEqual([]);
+        .filter((entry) => entry.includes(`${ROOT}/d1/database/fleet-uuid`)),
+    ).toEqual([`GET ${ROOT}/d1/database/fleet-uuid`]);
+  });
+
+  it('lists the receipts prefix on a resume whose object receipts are complete', async () => {
+    const w = await world();
+    w.setHook((request, url) =>
+      request.method === 'DELETE' && url.pathname === w.bucketPath
+        ? json([])
+        : undefined,
+    );
+    const first = retained(await w.run());
+    expect(first.reason).toBe('outcome-unknown');
+    expect(first.facts.receipts.exportObjects).toHaveLength(2);
+    w.setHook(undefined);
+    w.state.objects.add(`${w.prefix}/receipts/v1/other/object.sql`);
+    const mark = w.requests.length;
+    // Every object receipt is recorded, so the deletes are skipped; the prefix
+    // is still read before the bucket goes, and an object that was not there
+    // when the receipts were written refuses here.
+    expect(retained(await w.run()).reason).toBe('unexpected-object');
+    expect(w.requests.slice(mark)).toEqual([`GET ${w.bucketPath}/objects`]);
+    expect(w.state.bucketPresent).toBe(true);
   });
 
   it('re-issues a present pending mutation once the identity matches', async () => {
@@ -663,20 +765,9 @@ describeLinux('direct reference teardown', () => {
       w.setHook((request, url) => {
         if (request.method !== 'GET') return undefined;
         if (kind === 'bucket' && url.pathname === w.bucketPath)
-          return json({
-            name: w.names.exportBucket,
-            creation_date: '2020-01-01T00:00:00.000Z',
-          });
+          return changedBucket(w);
         if (kind === 'script' && url.pathname === `${w.script}/deployments`)
-          return json({
-            deployments: [
-              {
-                id: 'deployment',
-                strategy: 'percentage',
-                versions: [{ version_id: 'other-version', percentage: 100 }],
-              },
-            ],
-          });
+          return deployments('other-version');
         return undefined;
       });
       expect(retained(await w.run()).reason).toBe('identity-mismatch');
@@ -694,6 +785,27 @@ describeLinux('direct reference teardown', () => {
     expect(w.requests).not.toContain(`DELETE ${w.script}`);
   });
 
+  it('keeps ingress present while preview URLs stay enabled', async () => {
+    const w = await world();
+    let reads = 0;
+    w.setHook((request, url) => {
+      if (request.method !== 'GET' || url.pathname !== `${w.script}/subdomain`)
+        return undefined;
+      reads += 1;
+      return reads === 1
+        ? json({ enabled: false, previews_enabled: true })
+        : undefined;
+    });
+    const outcome = await w.run();
+    expect(outcome.status).toBe('cleaned');
+    // On `enabled` alone that first read settles the step: the disable is never
+    // issued and the receipt records a reread that never happened.
+    expect(w.requests).toContain(`POST ${w.script}/subdomain`);
+    expect(outcome.facts.receipts.ingress).toMatchObject({
+      settledByReread: false,
+    });
+  });
+
   it('refuses a first-attempt export bucket delete whose creation date changed', async () => {
     const w = await world();
     let reads = 0;
@@ -701,12 +813,7 @@ describeLinux('direct reference teardown', () => {
       if (request.method !== 'GET' || url.pathname !== w.bucketPath)
         return undefined;
       reads += 1;
-      return reads === 1
-        ? undefined
-        : json({
-            name: w.names.exportBucket,
-            creation_date: '2020-01-01T00:00:00.000Z',
-          });
+      return reads === 1 ? undefined : changedBucket(w);
     });
     expect(retained(await w.run()).reason).toBe('identity-mismatch');
     expect(w.requests).toContain(`DELETE ${w.bucketPath}/objects/${w.keyB}`);
@@ -746,7 +853,7 @@ describeLinux('direct reference teardown', () => {
   it('refuses a secret set carrying an extra unrecordable name', async () => {
     for (const extra of [
       'n'.repeat(DIRECT_TEARDOWN_MAXIMA.nameBytes + 1),
-      'CONTROLNAME',
+      `CONTROL${String.fromCharCode(1)}NAME`,
     ]) {
       const w = await world();
       w.state.secretNames.push(extra);
@@ -772,10 +879,7 @@ describeLinux('direct reference teardown', () => {
     const w = await world();
     w.setHook((request, url) =>
       request.method === 'GET' && url.pathname === w.bucketPath
-        ? json({
-            name: w.names.exportBucket,
-            creation_date: '2020-01-01T00:00:00.000Z',
-          })
+        ? changedBucket(w)
         : undefined,
     );
     expect(retained(await w.run()).reason).toBe('identity-mismatch');
@@ -879,6 +983,51 @@ describeLinux('direct reference teardown', () => {
         : undefined,
     );
     expect(retained(await nameless.run()).reason).toBe('provider-unavailable');
+
+    // A page that repeats the name it was asked to start after: the ordering
+    // rule is `<=`, so a repeat refuses exactly as an out-of-order name does.
+    const repeated = await world();
+    repeated.setHook((request, url) =>
+      request.method === 'GET' && url.pathname === `${ROOT}/r2/buckets`
+        ? json({ buckets: [{ name: 'zzz' }] })
+        : undefined,
+    );
+    expect(retained(await repeated.run()).reason).toBe('provider-unavailable');
+  });
+
+  it('bounds the bucket inventory with the session limit it is given', async () => {
+    const w = await world();
+    w.setHook((request, url) =>
+      request.method === 'GET' && url.pathname === `${ROOT}/r2/buckets`
+        ? json({
+            buckets: Array.from(
+              { length: CLOUDFLARE_INVENTORY_BOUND + 1 },
+              (_row, index) => ({
+                name: `bucket-${`${index}`.padStart(6, '0')}`,
+              }),
+            ),
+          })
+        : undefined,
+    );
+    // Without the session's bound the loop would read the whole page, see an
+    // empty second page and settle; the refusal is the bound arriving.
+    expect(retained(await w.run()).reason).toBe('provider-unavailable');
+  });
+
+  it('refuses a listed row whose classifying field is not a string', async () => {
+    for (const [surface, row] of [
+      ['scripts', {}],
+      ['routes', { script: 7 }],
+      ['domains', {}],
+      ['queues', {}],
+      ['namespaces', { id: 'orphan' }],
+    ] as [ListedSurface, Row][]) {
+      // A shared account records no global count, so without this refusal the
+      // unclassifiable row would leave a zero prefix count and settle.
+      const w = await world({ disposableAccount: false });
+      w.state[surface].push(row);
+      expect(retained(await w.run()).reason).toBe('provider-unavailable');
+    }
   });
 
   it('terminates the bucket loop only on an empty page', async () => {
@@ -970,6 +1119,25 @@ describeLinux('direct reference teardown', () => {
     ).toBe(1);
   });
 
+  it('lists domains and routes inside the recorded zone', async () => {
+    const w = await world();
+    const scoped: string[] = [];
+    w.setHook((_request, url) => {
+      if (url.pathname === `${ROOT}/workers/domains`)
+        scoped.push(`domains zone_id=${url.searchParams.get('zone_id')}`);
+      if (url.pathname === ROUTES) scoped.push(`routes ${url.pathname}`);
+      return undefined;
+    });
+    const outcome = await w.run();
+    expect(outcome.status).toBe('cleaned');
+    // Both counts these surfaces record are the zone's, the way
+    // `bucketJurisdictions` records the jurisdiction the bucket count covers.
+    expect(scoped).toEqual(['domains zone_id=zone', `routes ${ROUTES}`]);
+    expect(present(outcome.facts.residual).bucketJurisdictions).toEqual([
+      'default',
+    ]);
+  });
+
   it('retains the pending mutation when the budget is exhausted mid-sequence', async () => {
     const w = await world();
     w.setHook((request, url) => {
@@ -979,13 +1147,16 @@ describeLinux('direct reference teardown', () => {
     });
     const outcome = retained(await w.run());
     expect(outcome.reason).toBe('budget-exhausted');
+    // Mid-sequence: the phases before the exhausted call keep their receipts,
+    // and the call it stopped on stays pending rather than being rolled back.
     expect((await diskState(w.journal)).teardown).toMatchObject({
       phase: 'worker',
       pending: { kind: 'delete-reference-worker' },
+      receipts: { ingress: { settledByReread: false }, worker: null },
     });
   });
 
-  it('records a prefixed queue as a residual and settles when none is left', async () => {
+  it('records a prefixed queue as a residual', async () => {
     const left = await world();
     left.state.queues.push({ queue_name: `${left.prefix}-left-behind` });
     const retainedOutcome = retained(await left.run());
@@ -996,18 +1167,9 @@ describeLinux('direct reference teardown', () => {
       globalCount: 1,
       exhaustive: false,
     });
-    const empty = await world();
-    const outcome = await empty.run();
-    expect(outcome.status).toBe('cleaned');
-    expect(present(outcome.facts.residual).surfaces.queues).toEqual({
-      prefixCount: 0,
-      prefixNames: [],
-      globalCount: 0,
-      exhaustive: false,
-    });
   });
 
-  it('records the provider attestation on every single-page surface', async () => {
+  it('records the provider attestation on scripts, domains, routes and queues', async () => {
     const surfaces = ['scripts', 'domains', 'routes', 'queues'] as const;
     const plain = await world();
     const uncorroborated = await plain.run();
@@ -1066,6 +1228,9 @@ describeLinux('direct reference teardown', () => {
     expect((await w.run()).status).toBe('cleaned');
     await closed(w.journal);
     const path = join(w.journal.directory, 'journal.json');
+    // Control: the same journal resumes while the surface is there, so the
+    // refusal below is the missing surface and not another part of the record.
+    await closed(await opened({ ...w.f.input, mode: 'resume' }));
     const snapshot = JSON.parse(await readFile(path, 'utf8')) as {
       teardown: { residual: { surfaces: Record<string, unknown> } };
     };

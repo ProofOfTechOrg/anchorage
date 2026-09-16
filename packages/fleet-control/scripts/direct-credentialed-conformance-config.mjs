@@ -12,7 +12,13 @@ export const DIRECT_CONFORMANCE_CONTRACT_VERSION = 1;
 const PREFIX = /^fc[a-f0-9]{24}$/u;
 const DIGEST = /^[a-f0-9]{64}$/u;
 const DATE = /^\d{4}-\d{2}-\d{2}$/u;
-const DNS_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
+/**
+ * One DNS label: 1-63 characters, alphanumeric at both ends. `hostname` below
+ * applies it to a configured host, and the run journal applies it to a recorded
+ * route hostname, so the label grammar has one definition. The pattern carries
+ * no `g` flag and holds no state, so both readers can test against it.
+ */
+export const DNS_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
 const RUNTIME_KEYS = [
   'artifact',
   'compatibilityDate',
@@ -226,6 +232,10 @@ export function validateDirectConformanceConfig(value, options = {}) {
   );
   if (input.contractVersion !== DIRECT_CONFORMANCE_CONTRACT_VERSION)
     throw invalid('contractVersion');
+  // `disposableAccount: true` is an assertion about the account, not about the
+  // run: teardown records a global count on the surfaces it scans, queues
+  // among them, so a resource the account already held there is read as a
+  // residual this run failed to remove.
   if (typeof input.disposableAccount !== 'boolean')
     throw invalid('disposableAccount');
   const environment = string(input.environment, 'environment');

@@ -30,6 +30,7 @@ import {
   FLEET_OPERATION_INTAKE_BYTE_BOUND,
   FLEET_OPERATION_ITEM_BOUND,
   FLEET_OPERATION_RECORD_ROW_BYTE_BOUND,
+  FLEET_OPERATION_SINGLE_UPDATE_ROW_MESSAGE,
   FLEET_OPERATION_STAGE_BATCH_STATEMENTS,
   type FleetOperationKind,
   type FleetOperationLease,
@@ -43,8 +44,10 @@ import {
   FleetOperationTokenOperationError,
   fleetOperationIntakeDigest,
   fleetOperationOtherKindMessage,
+  fleetOperationPageLimit,
   fleetOperationRunRecordFromUnknown,
   fleetOperationStagedRowFromUnknown,
+  fleetOperationWatermarkRunMessage,
 } from '../src/fleet-operation-state.js';
 import {
   canonicalDeploymentEgressPolicy,
@@ -254,7 +257,9 @@ class MemoryOperationStore implements FleetOperationStore {
               )
             )
               throw new Error(
-                `commitProgress ${kind} rows below the watermark must be the contiguous run ending at it`,
+                fleetOperationWatermarkRunMessage(
+                  kind as FleetOperationRowKind,
+                ),
               );
           }
           const prior = this.operations.get(input.operationId);
@@ -395,7 +400,7 @@ class MemoryOperationStore implements FleetOperationStore {
           this.calls.push('fail');
           this.failures.push(copy(input));
           if ((input.updateRows?.length ?? 0) > 1)
-            throw new Error('failOperation accepts at most one updateRow');
+            throw new Error(FLEET_OPERATION_SINGLE_UPDATE_ROW_MESSAGE);
           const prior = this.operations.get(input.operationId);
           if (!prior)
             throw new Error(`no fleet operation '${input.operationId}'`);
@@ -476,12 +481,7 @@ class MemoryOperationStore implements FleetOperationStore {
     input: Parameters<FleetOperationStore['readOperationRowsPage']>[0],
   ) {
     this.beforePage?.();
-    if (
-      !Number.isSafeInteger(input.limit) ||
-      input.limit < 1 ||
-      input.limit > 1000
-    )
-      throw new Error('limit must be an integer from 1 to 1000');
+    const limit = fleetOperationPageLimit(input.limit);
     const qualifying = (this.rows.get(input.operationId) ?? [])
       .filter(
         (row) =>
@@ -489,10 +489,10 @@ class MemoryOperationStore implements FleetOperationStore {
           row.ordinal > (input.afterOrdinal ?? -1),
       )
       .sort((a, b) => a.ordinal - b.ordinal);
-    const rows = qualifying.slice(0, input.limit).map(copy);
+    const rows = qualifying.slice(0, limit).map(copy);
     return {
       rows: this.reversePages ? rows.reverse() : rows,
-      done: qualifying.length <= input.limit,
+      done: qualifying.length <= limit,
     };
   }
 
@@ -1209,6 +1209,34 @@ function expectItemFailure(world: World, ordinal = 0) {
   ).toHaveLength(1);
 }
 
+function armOptions(
+  world: World,
+  extra: Partial<AdvanceFleetMigrationOptions>,
+): void {
+  const base = world.options;
+  world.options = (action) => ({ ...base(action), ...extra });
+}
+
+/**
+ * A start driven through `world.options`, so an `armOptions` override reaches
+ * it. `world.start()` calls the module-local `options` const instead, which no
+ * override can see.
+ */
+function armedStart(
+  world: World,
+  id = uuid(),
+  records: readonly FleetRecord[] = [world.initial],
+): Promise<FleetMigrationAdvanceResult> {
+  return advanceFleetMigration(
+    world.options({
+      kind: 'start',
+      operationId: id,
+      records,
+      canaryTenantTags: [],
+    }),
+  );
+}
+
 function providerMutations(world: World) {
   return world.ops.filter((op) =>
     /^(apply:|seed:|deploy$|maintenance$|promote$|platform$|settle$|retire:)/u.test(
@@ -1578,7 +1606,7 @@ describe('migration operation fake guarded progress contract', () => {
       expect(store.heads.get('migration')).toBe(uuid());
       expect(error).toHaveProperty(
         'message',
-        'failOperation accepts at most one updateRow',
+        FLEET_OPERATION_SINGLE_UPDATE_ROW_MESSAGE,
       );
     });
   });
@@ -4443,36 +4471,35 @@ describe('bounded fleet migration abort signal and completion callback', () => {
     });
   });
 
-  it('completion invokes onComplete once with the returned result, after the durable finalize', async () => {
+  it('completion invokes onComplete once with the returned result, after the durable finalize and with the operation lease released', async () => {
     const world = createWorld();
     const seen: unknown[] = [];
     const states: (string | undefined)[] = [];
-    const base = world.options;
-    world.options = (action) => ({
-      ...base(action),
+    const held: boolean[] = [];
+    armOptions(world, {
       async onComplete(result) {
         seen.push(result);
         states.push(world.operationStore.operations.get(uuid())?.state);
+        held.push(world.operationStore.locked.has('migration'));
       },
     });
-    const final = await drainWorld(world);
+    const final = await drainWorld(world, await armedStart(world));
     if (final.status !== 'complete') throw new Error('expected a complete run');
     expect(seen).toEqual([final.result]);
     expect(seen[0]).toBe(final.result);
     expect(states).toEqual(['finalized']);
+    expect(held).toEqual([false]);
   });
 
   it('a continue on the finalized operation delivers onComplete again', async () => {
     const world = createWorld();
     const seen: unknown[] = [];
-    const base = world.options;
-    world.options = (action) => ({
-      ...base(action),
+    armOptions(world, {
       onComplete(result) {
         seen.push(result);
       },
     });
-    const final = await drainWorld(world);
+    const final = await drainWorld(world, await armedStart(world));
     if (final.status !== 'complete') throw new Error('expected a complete run');
     const replayed = await continueWorld(world, final);
     if (replayed.status !== 'complete')
@@ -4480,6 +4507,30 @@ describe('bounded fleet migration abort signal and completion callback', () => {
     expect(seen).toHaveLength(2);
     expect(seen[1]).toBe(replayed.result);
     expect(replayed.result).toEqual(final.result);
+    expect(
+      world.operationStore.calls.filter((call) => call === 'finalize'),
+    ).toHaveLength(1);
+  });
+
+  it('a replayed start carrying the same intake delivers onComplete again, with the operation lease released', async () => {
+    const world = createWorld();
+    const seen: unknown[] = [];
+    const held: boolean[] = [];
+    armOptions(world, {
+      onComplete(result) {
+        seen.push(result);
+        held.push(world.operationStore.locked.has('migration'));
+      },
+    });
+    const final = await drainWorld(world, await armedStart(world));
+    if (final.status !== 'complete') throw new Error('expected a complete run');
+    const replayed = await armedStart(world);
+    if (replayed.status !== 'complete')
+      throw new Error('expected a complete replay');
+    expect(seen).toHaveLength(2);
+    expect(seen[1]).toBe(replayed.result);
+    expect(replayed.result).toEqual(final.result);
+    expect(held).toEqual([false, false]);
     expect(
       world.operationStore.calls.filter((call) => call === 'finalize'),
     ).toHaveLength(1);
@@ -4498,23 +4549,14 @@ describe('bounded fleet migration abort signal and completion callback', () => {
             throw sentinel;
           }
         : () => Promise.reject(sentinel);
-    world.options = (action) => ({ ...base(action), onComplete });
-    let next: FleetMigrationAdvanceResult = await world.start();
-    let rejected: unknown;
-    for (let count = 0; count < 100 && next.status === 'pending'; count += 1) {
-      try {
-        next = await continueWorld(world, next);
-      } catch (error) {
-        rejected = error;
-        break;
-      }
-    }
-    expect(rejected).toBe(sentinel);
+    armOptions(world, { onComplete });
+    const started = await armedStart(world);
+    await expect(drainWorld(world, started)).rejects.toBe(sentinel);
     expect(world.operationStore.operations.get(uuid())).toMatchObject({
       state: 'finalized',
     });
     world.options = base;
-    expect(await continueWorld(world, next)).toMatchObject({
+    expect(await continueWorld(world, started)).toMatchObject({
       status: 'complete',
     });
   });
@@ -4523,17 +4565,15 @@ describe('bounded fleet migration abort signal and completion callback', () => {
     const plain = createWorld();
     const drained = await drainWorld(plain);
     const armed = createWorld();
-    const base = armed.options;
     const controller = new AbortController();
     const seen: unknown[] = [];
-    armed.options = (action) => ({
-      ...base(action),
+    armOptions(armed, {
       signal: controller.signal,
       onComplete(result) {
         seen.push(result);
       },
     });
-    expect(await drainWorld(armed)).toEqual(drained);
+    expect(await drainWorld(armed, await armedStart(armed))).toEqual(drained);
     expect(armed.ops).toEqual(plain.ops);
     expect(armed.operationStore.calls).toEqual(plain.operationStore.calls);
     expect(armed.operationStore.item()).toEqual(plain.operationStore.item());

@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import type { Stats } from 'node:fs';
 import type { DirectConformanceNames } from './direct-credentialed-conformance-config.mjs';
 import type { PreparedDirectConformance } from './direct-credentialed-conformance-preflight.mjs';
+import type {
+  DirectResidualSurface,
+  DirectTeardownFailure,
+  DirectTeardownMutation,
+  DirectTeardownPhase,
+} from './direct-credentialed-reference-vocabulary.mjs';
 import type { DirectScenarioState } from './direct-credentialed-scenario.mjs';
 import type { DirectReferenceAction } from './direct-reference-contract.mjs';
 
@@ -122,46 +129,19 @@ export interface DirectBootstrapState {
   readonly pending: DirectBootstrapMutation | null;
 }
 
-export type DirectTeardownPhase =
-  | 'refused'
-  | 'ingress'
-  | 'worker'
-  | 'fleet'
-  | 'quota'
-  | 'export-objects'
-  | 'exports'
-  | 'residual'
-  | 'complete';
-
-export type DirectTeardownMutation =
-  | 'disable-reference-ingress'
-  | 'delete-reference-worker'
-  | 'delete-fleet-d1'
-  | 'delete-quota-d1'
-  | 'delete-export-object'
-  | 'delete-export-r2';
-
-export type DirectTeardownFailure =
-  | 'scenario-incomplete'
-  | 'outcome-unknown'
-  | 'unexpected-object'
-  | 'identity-mismatch'
-  | 'residual-present'
-  | 'forbidden'
-  | 'provider-unavailable'
-  | 'budget-exhausted'
-  | 'invalid-state';
-
-export type DirectResidualSurface =
-  | 'databases'
-  | 'durableObjectNamespaces'
-  | 'scripts'
-  | 'buckets'
-  | 'domains'
-  | 'routes'
-  | 'queues';
+export type {
+  DirectResidualSurface,
+  DirectTeardownFailure,
+  DirectTeardownMutation,
+  DirectTeardownPhase,
+} from './direct-credentialed-reference-vocabulary.mjs';
 
 export interface DirectResidualObservation {
+  /**
+   * One shape, one version, for as long as the journal has one shape: a
+   * journal carrying another is refused by the schema rather than migrated,
+   * so this field never moves off `1`.
+   */
   readonly version: 1;
   readonly surfaces: Readonly<
     Record<
@@ -170,6 +150,15 @@ export interface DirectResidualObservation {
         prefixCount: number;
         prefixNames: readonly string[];
         globalCount: number | null;
+        /**
+         * One name over three derivations, so read it per surface.
+         * `scripts`, `domains`, `routes` and `queues` are single pages and
+         * carry the provider's own `result_info` attestation. `databases`,
+         * `durableObjectNamespaces` and `buckets` are paged to an empty page
+         * and carry `true` from that completed loop. A `queues` collection the
+         * account does not have answers 404, which records `false`: an empty
+         * page the provider never attested.
+         */
         exhaustive: boolean;
       }>
     >
@@ -282,22 +271,14 @@ export const DIRECT_SCENARIO_OPERATION_SLOTS: readonly [
   'decommission-recovery',
 ];
 
-export const DIRECT_TEARDOWN_PHASES: readonly DirectTeardownPhase[];
-
-export const DIRECT_TEARDOWN_MUTATIONS: readonly DirectTeardownMutation[];
-
-export const DIRECT_TEARDOWN_FAILURES: readonly DirectTeardownFailure[];
-
-export const DIRECT_RESIDUAL_SURFACES: readonly DirectResidualSurface[];
-
-export const DIRECT_TEARDOWN_MAXIMA: Readonly<{
-  nameBytes: number;
-  keyBytes: number;
-  prefixNames: number;
-  secretNames: number;
-  exportObjects: number;
-  settleAttempts: number;
-}>;
+export {
+  DIRECT_RESIDUAL_SURFACES,
+  DIRECT_TEARDOWN_FAILURES,
+  DIRECT_TEARDOWN_MAXIMA,
+  DIRECT_TEARDOWN_MUTATIONS,
+  DIRECT_TEARDOWN_PHASES,
+  DIRECT_TEARDOWN_RECOVERABLE_FAILURES,
+} from './direct-credentialed-reference-vocabulary.mjs';
 
 export const DIRECT_RUN_MAX_JOURNAL_BYTES: number;
 
@@ -323,6 +304,14 @@ export function actionSummary(
   action: DirectReferenceAction,
 ): DirectRunActionSummary;
 
+/**
+ * True for a settled force-terminal `before` identity: `null`, or exactly
+ * `databaseId` and `scriptName`, both inside the identifier grammar the
+ * journal's own `before` shape decodes with. A caller guarding an observed
+ * identity reads this instead of restating that rule.
+ */
+export function isForceIdentity(value: unknown): boolean;
+
 export function openDirectRunState(
   input: Readonly<{
     configPath: string;
@@ -335,7 +324,33 @@ export function openDirectRunState(
 
 export const DIRECT_RUN_MAX_RESUME_COUNT: number;
 
+/**
+ * True while the journal does not know the outcome of an invocation or of a
+ * bootstrap mutation. Teardown's own pending mutation is deliberately not part
+ * of it: the paths that publish a teardown receipt are recording that
+ * mutation.
+ */
+export function mutationPending(snapshot: DirectRunSnapshot): boolean;
+
+/** The open flags every private journal and evidence handle carries. */
+export function fileFlags(access: number): number;
+
+/**
+ * Refuses a handle whose owner, mode, type or link count is not the private
+ * one this lane writes: `0700` for a directory, `0600` for a single-linked
+ * file owned by the current user.
+ */
+export function assertPrivate(stat: Stats, directory: boolean): void;
+
+/**
+ * The 24-byte ISO-8601 shape every journal and evidence timestamp carries.
+ * Anchored and stateless, so callers share the one pattern.
+ */
+export const DIRECT_RUN_TIMESTAMP: RegExp;
+
 export type DirectRunStateInspection = Readonly<{
+  /** The run directory this module owns, so a caller derives no layout of its own. */
+  directory: string;
   snapshot: DirectRunSnapshot;
   close(): Promise<void>;
 }>;

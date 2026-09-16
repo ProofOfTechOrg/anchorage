@@ -13,8 +13,6 @@ Public behavior:
 
 Source map:
 
-- `scripts/`: repository conformance tooling; `direct-credentialed-conformance.mjs` is the direct-API CLI entry, with runtime orchestration, journal, evidence, bootstrap, scenario, and teardown modules beside it
-
 - `provision.ts`, `decommission-advance.ts`, `backend-switch.ts`, `fleet.ts`: deployment lifecycle state machines (the Worker-safe bounded normal coordinator is isolated in `decommission-advance.ts`; the root-only bounded switch coordinator remains in `backend-switch.ts`)
 - `workers-for-platforms-backend.ts`, `plain-worker-backend.ts`, `wrangler-loop-backend.ts`, `cloudflare-api-plain-worker-backend.ts`: provisioning backends (the Workers for Platforms backend, the shared ordinary-Worker core, and its Wrangler and direct-API adapters)
 - `cloudflare-client.ts`, `cloudflare-ordinary-worker-operations.ts`, `cloudflare-provider-errors.ts`, `cloudflare-rate-coordinator.ts`: provider API (the client, the ordinary-Worker operations behind it, the SDK-error helpers) and its shared quota fence
@@ -28,9 +26,11 @@ Source map:
 - `fleet-inventory-state.ts`, `fleet-inventory-advance.ts`, `d1-fleet-inventory-run-store.ts`: inventory state, coordinator and generation storage
 - `fleet-migration-state.ts`, `fleet-migration-advance.ts`: migration state and coordinator
 - `workers/`: the platform's own deployed Workers, published as separate export entries
+- `scripts/`: repository conformance tooling; `direct-credentialed-conformance.mjs` is the direct-API CLI entry, with runtime orchestration, journal, evidence, bootstrap, scenario, and teardown modules beside it
 
 ```bash
 pnpm fleet-control:check
 pnpm test:packed-fleet-control
 pnpm fleet-control:credentialed
+pnpm fleet-control:credentialed:direct
 ```

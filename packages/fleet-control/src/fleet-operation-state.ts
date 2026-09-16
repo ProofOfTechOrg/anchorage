@@ -192,13 +192,49 @@ export function fleetOperationOtherKindMessage(operationId: string): string {
   return `fleet operation '${operationId}' belongs to the other operation kind`;
 }
 
+/**
+ * The fixed refusal message raised when `failOperation` is handed more than
+ * one `updateRows` entry. It lives here so that `D1FleetOperationStore` and
+ * every store double emit byte-identical text.
+ */
+export const FLEET_OPERATION_SINGLE_UPDATE_ROW_MESSAGE =
+  'failOperation accepts at most one updateRow';
+
+/**
+ * The fixed refusal message raised when a `commitProgress` insert below a
+ * claimed watermark is not the contiguous run ending at it. It lives here so
+ * that `D1FleetOperationStore` and every store double emit byte-identical
+ * text for one row kind.
+ */
+export function fleetOperationWatermarkRunMessage(
+  rowKind: FleetOperationRowKind,
+): string {
+  return `commitProgress ${rowKind} rows below the watermark must be the contiguous run ending at it`;
+}
+
+/**
+ * The page size a store serves for a caller's `limit`: the requested size up
+ * to `FLEET_OPERATION_ROW_PAGE_LIMIT`, and that ceiling above it, so a caller
+ * asking for a larger page reads the largest page a store serves instead of
+ * losing the read to a refusal. A `limit` that is not a safe integer of at
+ * least 1 refuses.
+ */
+export function fleetOperationPageLimit(limit: number): number {
+  if (!Number.isSafeInteger(limit) || limit < 1) {
+    throw new Error('limit must be an integer of at least 1');
+  }
+  return Math.min(limit, FLEET_OPERATION_ROW_PAGE_LIMIT);
+}
+
 export interface FleetOperationStore {
   /**
    * Runs `operation` under an account-wide exclusive lease for one operation
    * kind. The lease is acquired before the callback runs and released after
-   * the returned promise settles, whether it resolves or rejects. Contention
-   * is refused, not queued: a caller that cannot take the lease receives an
-   * error rather than waiting for the holder.
+   * the returned promise settles, whether it resolves or rejects, and the
+   * promise this method returns settles only after that release completes, so
+   * a caller that awaits it holds no lease when the next call takes one.
+   * Contention is refused, not queued: a caller that cannot take the lease
+   * receives an error rather than waiting for the holder.
    */
   withAccountOperationLease<T>(
     kind: FleetOperationKind,
@@ -219,9 +255,11 @@ export interface FleetOperationStore {
    * do not rely on the ordering of rows within a page. A page contains the
    * smallest qualifying ordinals; omitting a row whose ordinal is below one
    * the page returns is non-conforming. An implementation must accept any
-   * `limit` from 1 through 1,000, and refuses one outside the range it
-   * supports rather than clamping it, so an out-of-range `limit` fails closed
-   * at the store. The upper end is a hard requirement, not a preference:
+   * `limit` from 1 through 1,000 and serves a larger one at 1,000 — the one
+   * documented ceiling, which `fleetOperationPageLimit` applies — so a `limit`
+   * above the ceiling costs the caller the rows beyond it rather than the
+   * read. A `limit` that is not a safe integer of at least 1 refuses. The
+   * upper end is a hard requirement, not a preference:
    * `readAllFleetOperationRows` passes this module's
    * `FLEET_OPERATION_ROW_PAGE_LIMIT` — 1,000, and unexported, so the bound is
    * restated here as a literal — as the `limit` on every page it requests,
@@ -471,10 +509,12 @@ function fleetOperationBoundedPlain(value: unknown, maxBytes: number): unknown {
     ) {
       return malformed();
     }
-    // The spread is bounded: `cloneBoundedPlainData` admits no array longer
-    // than `FLEET_OPERATION_NODE_BOUND`, so it stays far below the engine's
-    // argument limit and cannot raise the `RangeError` that would escape this
-    // walk unconverted.
+    // The spread is bounded: `cloneBoundedPlainData` charges every value of
+    // the document against one budget of `FLEET_OPERATION_NODE_BOUND` nodes
+    // and admits no array longer than the budget still unspent, so an array
+    // reaching this walk holds fewer elements than that bound — far below the
+    // engine's argument limit, so the spread cannot raise the `RangeError`
+    // that would escape this walk unconverted.
     if (Array.isArray(current)) pending.push(...current);
     else if (current && typeof current === 'object') {
       for (const [key, entry] of Object.entries(current)) {
@@ -807,8 +847,8 @@ export function isDurableAuditDetailSafe(value: unknown): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Store-facing helpers. These sit below the pure codec primitives, and the
-// section above must stay free of store IO.
+// Store readers and record projections. They sit below the pure codec
+// primitives so that the section above stays free of store IO.
 // ---------------------------------------------------------------------------
 
 /**
