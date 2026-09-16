@@ -15,16 +15,16 @@ import {
   isTenantIsolationEvaluator,
   networkEgress,
 } from '../policy-engine/tool-policy.js';
-import { D1IdempotencyStore } from './d1-idempotency-store.js';
-import { D1RateLimitStore } from './d1-rate-limit-store.js';
-import type { EgressFetchBase } from './egress-fetch.js';
 import type {
   AtomicIdempotencyStore,
   ConnectorPolicies,
   InspectableIdempotencyStore,
   PermissionManifest,
   RateLimitStore,
-} from './index.js';
+} from './contracts.js';
+import { D1IdempotencyStore } from './d1-idempotency-store.js';
+import { D1RateLimitStore } from './d1-rate-limit-store.js';
+import type { EgressFetchBase } from './egress-fetch.js';
 
 const auditRecordMethod = AuditLogger.prototype.record;
 const auditHasExternalSinkMethod = AuditLogger.prototype.hasExternalSink;
@@ -229,6 +229,21 @@ function snapshotRateLimitStore(store: D1RateLimitStore): RateLimitStore {
   });
 }
 
+// Policy members the preset pins between validation and construction. The
+// order decides which member a multi-member tamper is reported against, since
+// the first mismatch throws.
+const PINNED_PRESET_MEMBERS: readonly (keyof ConnectorPolicies)[] = [
+  'networkEgress',
+  'idempotencyKeyMigration',
+  'writePermissions',
+  'evaluators',
+  'idempotencyStore',
+  'rateLimitStore',
+  'audit',
+  'fetch',
+  'requireEgressEnforcement',
+];
+
 function assertUnchangedSurface(
   connectorId: string,
   name: keyof ConnectorPolicies,
@@ -358,60 +373,16 @@ export function assertSingleTenantConnectorPolicies(
     };
   }
 
-  const currentNetworkEgress = policies.networkEgress;
-  const currentWritePermissions = policies.writePermissions;
-  const currentEvaluators = policies.evaluators;
-  const currentIdempotencyStore = policies.idempotencyStore;
-  const currentIdempotencyKeyMigration = policies.idempotencyKeyMigration;
-  const currentRateLimitStore = policies.rateLimitStore;
   const currentAudit = policies.audit;
-  const currentFetch = policies.fetch;
-  const currentRequireEgressEnforcement = policies.requireEgressEnforcement;
   const baseline = metadata.snapshot.policies;
-  assertUnchangedSurface(
-    connectorId,
-    'networkEgress',
-    currentNetworkEgress,
-    baseline.networkEgress,
-  );
-  assertUnchangedSurface(
-    connectorId,
-    'idempotencyKeyMigration',
-    currentIdempotencyKeyMigration,
-    baseline.idempotencyKeyMigration,
-  );
-  assertUnchangedSurface(
-    connectorId,
-    'writePermissions',
-    currentWritePermissions,
-    baseline.writePermissions,
-  );
-  assertUnchangedSurface(
-    connectorId,
-    'evaluators',
-    currentEvaluators,
-    baseline.evaluators,
-  );
-  assertUnchangedSurface(
-    connectorId,
-    'idempotencyStore',
-    currentIdempotencyStore,
-    baseline.idempotencyStore,
-  );
-  assertUnchangedSurface(
-    connectorId,
-    'rateLimitStore',
-    currentRateLimitStore,
-    baseline.rateLimitStore,
-  );
-  assertUnchangedSurface(connectorId, 'audit', currentAudit, baseline.audit);
-  assertUnchangedSurface(connectorId, 'fetch', currentFetch, baseline.fetch);
-  assertUnchangedSurface(
-    connectorId,
-    'requireEgressEnforcement',
-    currentRequireEgressEnforcement,
-    baseline.requireEgressEnforcement,
-  );
+  for (const member of PINNED_PRESET_MEMBERS) {
+    assertUnchangedSurface(
+      connectorId,
+      member,
+      policies[member],
+      baseline[member],
+    );
+  }
   if (
     currentAudit !== undefined &&
     currentAudit.record !== metadata.snapshot.auditMember

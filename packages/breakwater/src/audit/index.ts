@@ -14,7 +14,7 @@ import type {
   ConnectorDecisionCode,
   ConnectorPolicyName,
 } from '../connector-decision.js';
-import type { Actor } from '../rbac/index.js';
+import type { Actor } from '../rbac/actor.js';
 
 /** Request-context key for trusted agent and run correlation fields. */
 export const AGENT_AUDIT_CONTEXT_KEY = 'breakwater.auditContext';

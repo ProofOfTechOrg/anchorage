@@ -343,10 +343,11 @@ The object persists the next alarm before each duty and runs one due duty per in
 1. Replace `createStarterAgentModule()` instructions, tools, metadata, and allowed roles.
 2. Keep every external side effect behind `createConnector()`.
 3. Add each connector's real egress hosts to its permission manifest and use the guarded `fetch`.
-4. Add workflow metadata and committed workflows together; registration fails fast if they drift.
-5. Add provider adapters to both the webhook map and provider-host list, then add their ids to the subscription allowlist.
-6. Replace console audit sinks with your Queue or SIEM transport.
-7. Add a durable run-cap implementation before exposing unattended execution commercially.
+4. Re-decide `permissions.egressEnforcement` for every connector you derive. The starter's connector declares `'enforced'` because it issues no HTTP request: it writes through a D1 binding, which the declaration does not cover. A derived connector that reaches the network through a vendor SDK or a child process carrying its own transport declares `'declaration-only'` instead. `connectorEgressPosture(tool)` reads back what a connector resolved to, and connector audit events carry it as `detail.egressEnforcement`.
+5. Add workflow metadata and committed workflows together; registration fails fast if they drift.
+6. Add provider adapters to both the webhook map and provider-host list, then add their ids to the subscription allowlist.
+7. Replace console audit sinks with your Queue or SIEM transport.
+8. Add a durable run-cap implementation before exposing unattended execution commercially.
 
 Every Anchorage import in `src/` uses a documented package export. `check:imports` rejects source or distribution deep imports and relative reaches into sibling packages.
 

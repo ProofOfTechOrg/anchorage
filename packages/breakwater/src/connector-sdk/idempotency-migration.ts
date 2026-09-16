@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import type { IdempotencyInspection, IdempotencyRecord } from './index.js';
+import type { IdempotencyInspection, IdempotencyRecord } from './contracts.js';
 
 export interface AtomicLegacyIdempotencyMigrationRequest {
   sourceKey: string;

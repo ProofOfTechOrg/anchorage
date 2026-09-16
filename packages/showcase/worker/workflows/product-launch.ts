@@ -67,6 +67,10 @@ export const productLaunchModule: WorkflowModule<ShowcaseModuleDeps> = {
         sideEffect: 'destructive',
         requiresApproval: true,
         egress: [DEPLOY_HOST],
+        // The webhook rides the host-supplied deploy.fetch, a transport the
+        // egress guard never sees, so the host above is checked against
+        // organization policy, never against the socket.
+        egressEnforcement: 'declaration-only',
         idempotencyKey: true,
         dryRun: true,
       },

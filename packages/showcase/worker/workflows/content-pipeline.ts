@@ -66,6 +66,9 @@ export const contentPipelineModule: WorkflowModule<ShowcaseModuleDeps> = {
       outputSchema: z.object({ published: z.boolean(), key: z.string() }),
       permissions: {
         sideEffect: 'write',
+        // The publish is an R2 artifact-store binding, which the egress guard
+        // never sees and which carries no HTTP request of its own.
+        egressEnforcement: 'enforced',
         requiresApproval: true,
         idempotencyKey: true,
       },

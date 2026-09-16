@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// This module imports only types from ./index.js; runtime collaborators arrive as parameters.
+// This module imports only types from ./contracts.js; runtime collaborators arrive as parameters.
 // Nothing at module scope calls an imported binding.
 
 import { z } from 'zod';
@@ -17,13 +17,13 @@ import {
   assertEgressHostList,
   egressDomainAllowed,
 } from '../policy-engine/tool-policy.js';
-import type { EgressFetchBase, EgressResponse } from './egress-fetch.js';
 import type {
   Connector,
   ConnectorEgressPosture,
   ConnectorInvocationOptions,
   PermissionManifest,
-} from './index.js';
+} from './contracts.js';
+import type { EgressFetchBase, EgressResponse } from './egress-fetch.js';
 
 export interface ConnectorConformanceCase<TInput = unknown> {
   readonly name: string;
@@ -77,6 +77,12 @@ export interface ConnectorConformanceFinding {
   readonly case?: string;
   /** Which supplied policy member was not wired; POLICIES_NOT_WIRED only. */
   readonly member?: 'fetch' | 'audit' | 'both';
+  /**
+   * The settled case whose abandoned work produced this run-level finding.
+   * Present only on a finding observed after that case settled, where `case`
+   * is absent because the case's own result is already on the report.
+   */
+  readonly observedAfterCase?: string;
   readonly reason: string;
 }
 
@@ -96,30 +102,35 @@ export interface ConnectorConformanceCaseResult {
   /**
    * Hosts this case reached THROUGH the guard: the hostnames of the calls the
    * harness-owned base transport allowed, de-duplicated in first-call order.
-   * A measurement, never a copy of the case's own `expect.hosts` (§5.4 step 22).
+   * Filled when the case was invoked, did not time out, and verified its
+   * instrumentation intact at settlement; empty otherwise.
+   * A measurement, never a copy of the case's own `expect.hosts`.
    */
   readonly guardedHosts: readonly string[];
-  /** Refused attempts recorded for this case; run-level escapes are not here (see below). */
+  /** Refused attempts recorded for this case; an escape recorded at run level is on `report.findings` instead. */
   readonly escapes: readonly ConnectorConformanceEscape[];
   /**
    * The `decisionCode` of every event this case's AuditLogger recorded inside
    * the invocation window, in record order; `undefined` for an event from an
    * emitter that stamps none, so a foreign boundary writing to the same logger
-   * stays visible rather than being filtered away (§3.10).
+   * stays visible rather than being filtered away. Filled under the
+   * same condition as `guardedHosts`; empty otherwise.
    */
   readonly decisionCodes: readonly (ConnectorDecisionCode | undefined)[];
-  /** Calls that reached the harness-owned base transport, allowed or refused (§3.10). */
+  /**
+   * Calls that reached the harness-owned base transport, allowed or refused,
+   * counted when the case settles.
+   */
   readonly transportCalls: number;
   /**
    * Witness events on this case's AuditLogger: recorded inside the invocation
    * window, carrying a decisionCode, and stamped with this case's SUBJECT as
-   * `resource` — a collaborator connector built on the same logger is not one
-   * (§3.10).
+   * `resource` — a collaborator connector built on the same logger is not one.
    */
   readonly auditEvents: number;
   /**
    * This case's findings: the subset of report.findings whose `case` is this
-   * name. Case names are unique per run (§5.3), so the subset is well defined.
+   * name. Case names are unique per run, so the subset is well defined.
    */
   readonly findings: readonly ConnectorConformanceFinding[];
 }
@@ -128,7 +139,7 @@ export interface ConnectorConformanceReport {
   readonly conformant: boolean;
   /**
    * Absent whenever no subject's posture was resolved; the run's findings say
-   * why. Assigned at step 6 (§5.4).
+   * why.
    */
   readonly posture?: ConnectorEgressPosture;
   /**
@@ -136,9 +147,9 @@ export interface ConnectorConformanceReport {
    * unless every entry's transaction completed: a failure at ANY entry rolls back
    * the whole stack, including the failing entry on a (d) write or (e) verification
    * failure; an (a) validation or descriptor-read failure precedes capture and push,
-   * so the stack holds only entries attempted before it, and step 14 never runs
-   * for either failure path (§5.4 steps 12-14).
-   * Labels are unique per run (§5.3). Empty when no case ran.
+   * so the stack holds only entries attempted before it, and neither failure
+   * path verifies the entry afterwards.
+   * Labels are unique per run. Empty when no case ran.
    */
   readonly instrumented: readonly string[];
   readonly cases: readonly ConnectorConformanceCaseResult[];
@@ -148,7 +159,7 @@ export interface ConnectorConformanceReport {
    * objects is on its ConnectorConformanceCaseResult.
    */
   readonly findings: readonly ConnectorConformanceFinding[];
-  /** The finite-case limitation this report does not exceed. The module constant, on every report a run produces, refusals included — `refuseRun` sets it too (§5.4 step 6, §5.2). */
+  /** The finite-case limitation this report does not exceed. The module constant, on every report a run produces, refusals included — `refuseRun` sets it too. */
   readonly limit: string;
 }
 
@@ -206,28 +217,75 @@ export class ConnectorConformanceError extends Error {
 }
 
 export const CONFORMANCE_LIMIT =
-  'conformance covers only the supplied cases, in this isolate, for the duration of each case; the channels it does not observe are listed at https://github.com/ProofOfTechOrg/anchorage/blob/main/packages/breakwater/CONNECTORS.md#conformance-limits';
+  'conformance covers only the supplied cases, in this isolate, for the duration of each case; channels a run observes, and channels it does not, are described under Conformance limits in the CONNECTORS.md that ships with this package, at https://github.com/ProofOfTechOrg/anchorage/blob/main/packages/breakwater/CONNECTORS.md#conformance-limits';
 
 class ConformanceRefusal extends Error {}
 
-let activeRun: symbol | undefined;
-let isolatePoisoned = false;
-let timedOutCase: string | undefined;
+/** The label of the harness-owned global fetch entry point. */
+const GLOBAL_FETCH_LABEL = 'globalThis.fetch';
+/** The base transport the harness hands the factory for its policies. */
+const POLICIES_FETCH_LABEL = 'policies.fetch';
 
-const refuseRun = (
-  findings: readonly ConnectorConformanceFinding[],
-  report?: ConnectorConformanceReport,
-): never => {
-  throw new ConnectorConformanceError(
-    report ?? {
-      conformant: false,
-      instrumented: [],
-      cases: [],
-      findings,
-      limit: CONFORMANCE_LIMIT,
-    },
-  );
+/** Milliseconds a case runs before it is abandoned as never-settling. */
+const DEFAULT_CASE_TIMEOUT_MS = 2000;
+
+/**
+ * The run holding this module instance; undefined while it accepts one. This
+ * guard and `poisonedByCase` are scoped to this module instance, so a second
+ * copy of this module carries its own pair and neither sees the other's runs.
+ * The package's `.` and `./connector-sdk` entry points resolve to one copy;
+ * `scripts/packed-consumer-test.mjs` asserts that identity against the packed
+ * tarball.
+ */
+let activeRun: symbol | undefined;
+/** The case whose timeout poisoned this isolate; undefined while it accepts runs. */
+let poisonedByCase: string | undefined;
+
+/** Refuse before a report exists: the findings stand on a synthetic one. */
+const refuseRun = (findings: readonly ConnectorConformanceFinding[]): never => {
+  throw new ConnectorConformanceError({
+    conformant: false,
+    instrumented: [],
+    cases: [],
+    findings,
+    limit: CONFORMANCE_LIMIT,
+  });
 };
+
+/** Refuse with the report the run built, its findings and limit already on it. */
+const refuseReport = (report: ConnectorConformanceReport): never => {
+  throw new ConnectorConformanceError(report);
+};
+
+/**
+ * A destination that changes when the phase it belongs to ends. The transport
+ * and the traps a phase hands to connector code hold this object, so where a
+ * call arriving after that phase is recorded is a property of the object
+ * rather than of a variable every recorder has to consult.
+ */
+interface PhaseSink<T> {
+  readonly record: (value: T) => void;
+  readonly close: () => void;
+}
+
+function phaseSink<T>(
+  open: (value: T) => void,
+  late: (value: T) => void,
+): PhaseSink<T> {
+  let closed = false;
+  return {
+    record: (value) => {
+      if (closed) {
+        late(value);
+        return;
+      }
+      open(value);
+    },
+    close: () => {
+      closed = true;
+    },
+  };
+}
 
 interface TimerGlobals {
   setTimeout(handler: () => void, timeoutMs: number): unknown;
@@ -245,6 +303,10 @@ interface UrlLike {
 
 type UrlConstructor = new (input: string) => UrlLike;
 
+type TextEncoderConstructor = new () => {
+  encode(input: string): Uint8Array<ArrayBuffer>;
+};
+
 function requireGlobal<T>(name: string): T {
   const ctor = (globalThis as Record<string, unknown>)[name];
   if (typeof ctor !== 'function') {
@@ -255,9 +317,14 @@ function requireGlobal<T>(name: string): T {
   return ctor as T;
 }
 
+/**
+ * The recorders take their host from here, and a record is what makes a refusal
+ * observable, so this answers `null` rather than throwing — including when the
+ * URL global the run required at its start is no longer a constructor.
+ */
 function urlOf(input: unknown): UrlLike | null {
-  const UrlCtor = requireGlobal<UrlConstructor>('URL');
   try {
+    const UrlCtor = requireGlobal<UrlConstructor>('URL');
     if (typeof input === 'string') return new UrlCtor(input);
     if (typeof input !== 'object' || input === null) return null;
     const candidate = input as { href?: unknown; url?: unknown };
@@ -279,16 +346,13 @@ function hrefOf(input: unknown): string | null {
 
 function trap(
   entryPoint: string,
-  record: (attempt: ConnectorConformanceEscape) => void,
+  escapes: PhaseSink<ConnectorConformanceEscape>,
 ) {
   return (...args: readonly unknown[]): never => {
-    record({ entryPoint, host: hostOf(args[0]), refused: true });
+    escapes.record({ entryPoint, host: hostOf(args[0]), refused: true });
     throw new ConformanceRefusal(`connector reached ${entryPoint}`);
   };
 }
-
-const hostDeclared = (host: string, declared: readonly string[]): boolean =>
-  egressDomainAllowed(host, declared);
 
 function buildResponse(
   url: string,
@@ -314,10 +378,7 @@ function buildResponse(
     json: async () => JSON.parse(body),
     text: async () => body,
     arrayBuffer: async () => {
-      const Encoder =
-        requireGlobal<
-          new () => { encode(input: string): Uint8Array<ArrayBuffer> }
-        >('TextEncoder');
+      const Encoder = requireGlobal<TextEncoderConstructor>('TextEncoder');
       return new Encoder().encode(body).buffer;
     },
   };
@@ -335,7 +396,7 @@ function createCaseTransport(
   respond:
     | ((request: ConnectorConformanceRequest) => ConnectorConformanceResponse)
     | undefined,
-  record: (attempt: ConnectorConformanceEscape) => void,
+  escapes: PhaseSink<ConnectorConformanceEscape>,
 ): CaseTransport {
   let subject: object | undefined;
   let calls = 0;
@@ -351,9 +412,13 @@ function createCaseTransport(
       url === null ||
       host === null ||
       declared === undefined ||
-      !hostDeclared(host, declared)
+      !egressDomainAllowed(host, declared)
     ) {
-      record({ entryPoint: 'policies.fetch', host, refused: true });
+      escapes.record({
+        entryPoint: POLICIES_FETCH_LABEL,
+        host,
+        refused: true,
+      });
       throw new ConformanceRefusal(
         'connector called the supplied base transport directly',
       );
@@ -384,6 +449,9 @@ function validateOptions<TInput>(
     isConnectorDecisionCode,
     'must be a connector decision code',
   );
+  // `connector-decision.ts` publishes the denial-code set through this
+  // `@internal` capture function's throw path and through no guard of its own,
+  // so a code it rejects is one this schema rejects.
   const denialCode = z.custom<ConnectorDenialCode>((value) => {
     try {
       captureConnectorDenialMetadata({ code: value });
@@ -471,7 +539,7 @@ function validateOptions<TInput>(
     }
     names.add(c.name);
   });
-  const labels = new Set(['globalThis.fetch', 'policies.fetch']);
+  const labels = new Set<string>([GLOBAL_FETCH_LABEL, POLICIES_FETCH_LABEL]);
   result.data.entryPoints?.forEach((entry, index) => {
     if (labels.has(entry.label)) {
       throw new TypeError(
@@ -484,17 +552,26 @@ function validateOptions<TInput>(
   return result.data as ConnectorConformanceOptions<TInput>;
 }
 
-const MANIFEST_MEMBERS = [
-  'sideEffect',
-  'egress',
-  'idempotencyKey',
-  'requiresApproval',
-  'dryRun',
-  'rateLimit',
-  'background',
-  'requiredPermissions',
-  'egressEnforcement',
-] as const;
+/**
+ * Every member of `PermissionManifest`. The `Record` makes the list a
+ * compile-time obligation: a member the interface gains is a missing property
+ * here, and a name it does not have is an excess one.
+ */
+const MANIFEST_MEMBER_SET: Record<keyof PermissionManifest, true> = {
+  sideEffect: true,
+  egress: true,
+  idempotencyKey: true,
+  requiresApproval: true,
+  dryRun: true,
+  rateLimit: true,
+  background: true,
+  requiredPermissions: true,
+  egressEnforcement: true,
+};
+
+const MANIFEST_MEMBERS = Object.keys(
+  MANIFEST_MEMBER_SET,
+) as (keyof PermissionManifest)[];
 
 function manifestsMatch(
   claimed: PermissionManifest,
@@ -533,11 +610,19 @@ function manifestsMatch(
 }
 
 interface CapturedEntry extends ConnectorConformanceEntryPoint {
-  assignmentRecorded: boolean;
-  readonly existed: boolean;
   readonly descriptor: PropertyDescriptor | undefined;
   readonly trap: ReturnType<typeof trap>;
   readonly installedDescriptor: PropertyDescriptor;
+}
+
+/** The outcome of one install attempt over a set of entry points. */
+interface InstalledEntries {
+  /** The installed entries, or undefined when the install failed and unwound. */
+  readonly stack: readonly CapturedEntry[] | undefined;
+  /** Labels the subject assigned over the install; one finding per label. */
+  readonly assigned: ReadonlySet<string>;
+  /** Whether the entries this install put back matched their descriptors. */
+  readonly restored: boolean;
 }
 
 type RecordFinding = (finding: ConnectorConformanceFinding) => void;
@@ -562,6 +647,13 @@ function describeDescriptor(d: PropertyDescriptor | undefined): string {
   return `data property (writable: ${d.writable}, configurable: ${d.configurable})`;
 }
 
+/**
+ * The vocabulary for a value a consumer's own code threw, where the message or
+ * the string form is the diagnostic: `FACTORY_FAILED` and the two
+ * instrumentation findings. A function is described by type instead, because
+ * its string form is its source text. `describeValue` is the other vocabulary,
+ * for a value the subject threw.
+ */
 function errorMessage(error: unknown): string {
   try {
     if (error instanceof Error) {
@@ -574,21 +666,41 @@ function errorMessage(error: unknown): string {
         ? error === null
           ? 'null'
           : 'a non-Error object'
-        : String(error);
+        : typeof error === 'function'
+          ? describeValue(error)
+          : String(error);
   } catch {
     return 'unreadable error';
   }
 }
 
+/**
+ * The connector owns `constructor.name`, so the reason carries it only when it
+ * is a plain identifier of at most 64 characters. Anything else joins the
+ * unavailable and unreadable names as `unknown`.
+ */
+const CONSTRUCTOR_NAME_PATTERN = /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/;
+
 function errorConstructorName(value: unknown): string {
   try {
     const name = Object.getPrototypeOf(value)?.constructor?.name;
-    return typeof name === 'string' && name.length > 0 ? name : 'unknown';
+    return typeof name === 'string' && CONSTRUCTOR_NAME_PATTERN.test(name)
+      ? name
+      : 'unknown';
   } catch {
     return 'unknown';
   }
 }
 
+/**
+ * Which kind of failure a subject's thrown value is, for a value the harness
+ * does not own: each `instanceof` walks a prototype chain the connector can
+ * trap, so the whole classification sits inside one `try` and a value that
+ * cannot say what it is takes the `foreign` branch. Prefer this where the
+ * answer is a classification over several constructors; prefer `isInstanceOf`
+ * for a single constructor, and `readProperty` for one property of such a
+ * value.
+ */
 function classifyInvocationError(
   value: unknown,
 ): 'boundary' | 'policy' | 'refusal' | 'foreign' {
@@ -615,6 +727,11 @@ function invocationFailureReason(error: unknown): string {
   }
 }
 
+/**
+ * The vocabulary for a value the SUBJECT threw or returned, where the type is
+ * the whole diagnostic: `CASE_INVOCATION_FAILED`, `SUBJECT_UNREGISTERED`, and
+ * the function arm of `errorMessage`. It copies no byte of the value.
+ */
 function describeValue(value: unknown): string {
   if (value === undefined) return 'undefined';
   if (value === null) return 'null';
@@ -622,12 +739,18 @@ function describeValue(value: unknown): string {
 }
 
 function unregisteredReason(value: unknown): string {
-  return `the factory returned ${describeValue(value)} that createConnector() did not build${
+  return `the factory returned ${describeValue(value)} that this copy of createConnector() did not build${
     typeof value === 'object' && value !== null
       ? ': a plain Mastra tool, or a connector from a second copy of the package'
       : ''
   }`;
 }
+
+/** Calls after a replacement the harness knows the trap did not serve. */
+const CALLS_UNOBSERVED = '; calls made after the replacement were not observed';
+/** Calls after a replacement the harness did not determine either way. */
+const CALLS_UNCHECKED =
+  '; whether calls made after the replacement reached the trap was not checked';
 
 function verifyEntries(
   stack: readonly CapturedEntry[],
@@ -638,7 +761,10 @@ function verifyEntries(
     const { target, property, label, trap: installedTrap } = entry;
     let shape: string;
     let difference = 'descriptor differs from the one the harness installed';
-    let callsUnobserved = false;
+    // Empty where the descriptor answers whether the trap kept serving calls,
+    // and the answer is yes. The other two answers are stated, so silence here
+    // never has to carry one of them.
+    let calls = '';
     try {
       const descriptor = Object.getOwnPropertyDescriptor(target, property);
       shape = describeDescriptor(descriptor);
@@ -646,10 +772,15 @@ function verifyEntries(
         const effective = (target as Record<string, unknown>)[property];
         if (effective === installedTrap) continue;
         difference = 'effective value differs from the installed trap';
-        callsUnobserved = true;
+        calls = CALLS_UNOBSERVED;
         shape += ` resolving to ${describeValue(effective)}`;
       } else if (descriptor !== undefined && 'value' in descriptor) {
-        callsUnobserved = descriptor.value !== installedTrap;
+        if (descriptor.value !== installedTrap) calls = CALLS_UNOBSERVED;
+      } else if (descriptor !== undefined) {
+        // An accessor answers each read itself, so the descriptor says nothing
+        // about what a call after the replacement reached, and the harness does
+        // not invoke a consumer's getter to find out.
+        calls = CALLS_UNCHECKED;
       }
     } catch {
       difference = 'descriptor or effective value could not be verified';
@@ -658,7 +789,7 @@ function verifyEntries(
     intact = false;
     record({
       code: 'INSTRUMENTATION_REPLACED',
-      reason: `${label} ${difference}: ${shape}${callsUnobserved ? '; calls made after the replacement were not observed' : ''}`,
+      reason: `${label} ${difference}: ${shape}${calls}`,
     });
   }
   return intact;
@@ -686,20 +817,18 @@ function holdsInstalledDescriptor(
 function restoreEntries(
   stack: readonly CapturedEntry[],
   record: RecordFinding,
-): void {
+): boolean {
   const failures: { label: string; error: unknown }[] = [];
-  for (const { target, property, existed, descriptor, label } of [
-    ...stack,
-  ].reverse()) {
+  for (const { target, property, descriptor, label } of [...stack].reverse()) {
     try {
-      if (existed && descriptor !== undefined) {
+      if (descriptor !== undefined) {
         Object.defineProperty(target, property, descriptor);
       } else {
         delete (target as Record<string, unknown>)[property];
       }
       const back = Object.getOwnPropertyDescriptor(target, property);
       const same =
-        existed && descriptor !== undefined
+        descriptor !== undefined
           ? back !== undefined &&
             'value' in back &&
             Object.is(back.value, descriptor.value) &&
@@ -725,17 +854,20 @@ function restoreEntries(
       // Diagnostics cannot interrupt restoration or the caller's timer cleanup.
     }
   }
+  return failures.length === 0;
 }
 
 function installEntries(
   entries: readonly ConnectorConformanceEntryPoint[],
-  recordEscape: (attempt: ConnectorConformanceEscape) => void,
+  escapes: PhaseSink<ConnectorConformanceEscape>,
   record: RecordFinding,
-  subject: 'case' | 'probe factory',
-): CapturedEntry[] | undefined {
+  installer: 'case' | 'probe factory',
+): InstalledEntries {
   const stack: CapturedEntry[] = [];
+  const assigned = new Set<string>();
   for (const entry of entries) {
     const { target, property, label } = entry;
+    const completed = stack.length;
     try {
       const descriptor = Object.getOwnPropertyDescriptor(target, property);
       if (!instrumentable(descriptor)) {
@@ -749,17 +881,17 @@ function installEntries(
           throw new Error('inherited accessor');
         }
       }
-      const replacement = trap(label, recordEscape);
+      const replacement = trap(label, escapes);
       const installedDescriptor: PropertyDescriptor =
         descriptor === undefined || descriptor.configurable === true
           ? {
               get: () => replacement,
               set: () => {
-                if (captured.assignmentRecorded) return;
-                captured.assignmentRecorded = true;
+                if (assigned.has(label)) return;
+                assigned.add(label);
                 record({
                   code: 'INSTRUMENTATION_REPLACED',
-                  reason: `the ${subject} assigned ${label} during execution; the assignment was not applied and the trap was kept`,
+                  reason: `the ${installer} assigned ${label} during execution; the assignment was not applied and the trap was kept`,
                 });
               },
               enumerable: descriptor?.enumerable ?? true,
@@ -768,8 +900,6 @@ function installEntries(
           : { ...descriptor, value: replacement };
       const captured = {
         ...entry,
-        assignmentRecorded: false,
-        existed: descriptor !== undefined,
         descriptor,
         trap: replacement,
         installedDescriptor,
@@ -793,15 +923,16 @@ function installEntries(
         );
       }
     } catch (error) {
-      restoreEntries(stack, record);
+      verifyEntries(stack.slice(0, completed), record);
+      const restored = restoreEntries(stack, record);
       record({
         code: 'INSTRUMENTATION_UNSUPPORTED',
         reason: `assertConnectorConformance cannot instrument ${label}: ${errorMessage(error)}`,
       });
-      return undefined;
+      return { stack: undefined, assigned, restored };
     }
   }
-  return stack;
+  return { stack, assigned, restored: true };
 }
 
 function raceTimeout(
@@ -839,8 +970,159 @@ function escapeFinding(
 ): ConnectorConformanceFinding {
   return {
     code: 'NETWORK_IO_OUTSIDE_RUNTIME_FETCH',
-    reason: `connector reached ${attempt.entryPoint} outside runtime.fetch (host: ${attempt.host ?? 'unparseable'})`,
+    // A call on the supplied base transport went through the harness, not
+    // around it: what the transport refused is a host its registered egress
+    // declaration does not cover. A call on any other entry point reached an
+    // instrument the connector was not given, which is the bypass.
+    reason:
+      attempt.entryPoint === POLICIES_FETCH_LABEL
+        ? `connector reached ${attempt.entryPoint} for a host the registered egress declaration does not cover (host: ${attempt.host ?? 'unparseable'})`
+        : `connector reached ${attempt.entryPoint} outside runtime.fetch (host: ${attempt.host ?? 'unparseable'})`,
   };
+}
+
+/**
+ * The same finding at run level, naming the phase that had already ended when
+ * it arrived. A finding recorded here belongs to no case: the case result it
+ * would have joined is already on the report. `settledCase` carries that case's
+ * name as a field beside the reason, for a caller reading the report by machine;
+ * the probe phase ends under no case name and passes none.
+ */
+function observedAfter(
+  finding: ConnectorConformanceFinding,
+  phase: string,
+  settledCase?: string,
+): ConnectorConformanceFinding {
+  return {
+    ...finding,
+    ...(settledCase === undefined ? {} : { observedAfterCase: settledCase }),
+    reason: `${finding.reason}; observed after ${phase}`,
+  };
+}
+
+/**
+ * A value a connector registry can hold as a key. `createConnector()`
+ * registers the tool it returns, so a value that cannot be a key is one no
+ * registry answers for.
+ */
+function registrySubject(value: unknown): object | undefined {
+  return (typeof value === 'object' && value !== null) ||
+    typeof value === 'function'
+    ? (value as object)
+    : undefined;
+}
+
+/** What a case proved, and the measurements the classification read. */
+interface CaseObservation {
+  readonly proved: ConnectorConformanceCaseResult['proved'];
+  readonly guardedHosts: readonly string[];
+  readonly decisionCodes: readonly (ConnectorDecisionCode | undefined)[];
+}
+
+/** Everything an eligible case measured, as the classification reads it. */
+interface CaseEvidence {
+  readonly expect: ConnectorConformanceCase['expect'];
+  /** The registered egress declaration, read once for the run. */
+  readonly declaredEgress: readonly string[];
+  readonly escapes: readonly ConnectorConformanceEscape[];
+  readonly auditEvents: readonly {
+    readonly event: AuditEvent;
+    readonly inWindow: boolean;
+  }[];
+  readonly witnesses: readonly AuditEvent[];
+  readonly transportCalls: number;
+  readonly transportHosts: readonly string[];
+  /** Present when the invocation threw; the value is inside it. */
+  readonly invocation: { readonly thrown: unknown } | undefined;
+}
+
+/**
+ * Classify a case that was invoked, kept its instrumentation and settled in
+ * time. It reads measurements and records findings; it performs no I/O and
+ * holds no state between cases.
+ */
+function observeCase(
+  evidence: CaseEvidence,
+  record: RecordFinding,
+): CaseObservation {
+  const guardedHosts = [...new Set(evidence.transportHosts)];
+  const decisionCodes = evidence.auditEvents
+    .filter((e) => e.inWindow)
+    .map((e) => e.event.decisionCode);
+  // A value whose classification cannot be read is by definition none of the
+  // three known kinds, so it takes the foreign branch.
+  const invocationKind = classifyInvocationError(evidence.invocation?.thrown);
+  const boundaryError = invocationKind === 'boundary';
+  if (evidence.invocation !== undefined && invocationKind === 'foreign') {
+    record({
+      code: 'CASE_INVOCATION_FAILED',
+      reason: invocationFailureReason(evidence.invocation.thrown),
+    });
+  }
+  const missingFetch =
+    evidence.transportCalls === 0 &&
+    evidence.escapes.some(
+      (attempt) =>
+        attempt.entryPoint === GLOBAL_FETCH_LABEL &&
+        attempt.host !== null &&
+        egressDomainAllowed(attempt.host, evidence.declaredEgress),
+    );
+  const missingAudit = !boundaryError && evidence.witnesses.length === 0;
+  if (missingFetch || missingAudit) {
+    record({
+      code: 'POLICIES_NOT_WIRED',
+      member: missingFetch ? (missingAudit ? 'both' : 'fetch') : 'audit',
+      reason: missingFetch
+        ? 'either the factory did not wire policies.fetch, or the connector called the ambient global directly for a host it declares; the escape record beside this finding is authoritative for the request itself.' +
+          (missingAudit
+            ? ' The subject recorded no audit witness on the supplied logger.'
+            : '')
+        : // A failed invocation is evidence the boundary was NOT reached, so
+          // the absent witness is what that failure left behind, not a wiring
+          // conclusion the run can draw.
+          evidence.invocation !== undefined
+          ? 'the invocation failed before the subject could record an audit witness on the supplied logger'
+          : 'the subject reached its gate boundary but recorded no audit witness on the supplied logger; wire policies.audit',
+    });
+  }
+  if (boundaryError && evidence.witnesses.length === 0) {
+    record({
+      code: 'CASE_EXPECTATION_UNMET',
+      reason:
+        "the case produced no audit event because the connector's gate boundary was never reached; a pre-boundary refusal is not expressible by any expectation and belongs in an ordinary connector test",
+    });
+    return { proved: 'nothing', guardedHosts, decisionCodes };
+  }
+  const proved = evidence.witnesses.some(
+    (event) =>
+      event.decision === 'denied' && event.policyKind === 'egress-fetch',
+  )
+    ? 'guarded-denial'
+    : evidence.witnesses.some(
+          (event) =>
+            event.decision === 'denied' && event.policyKind !== 'egress-fetch',
+        )
+      ? 'policy-denied'
+      : guardedHosts.length > 0
+        ? 'guarded-request'
+        : 'no-network';
+  const expected = evidence.expect;
+  const evidenceMatches =
+    expected.outcome === 'guarded-request'
+      ? expected.hosts.every((host) =>
+          guardedHosts.some((actual) => egressDomainAllowed(actual, [host])),
+        )
+      : expected.outcome === 'no-network' ||
+        evidence.witnesses.some(
+          (event) => event.decisionCode === expected.code,
+        );
+  if (proved !== expected.outcome || !evidenceMatches) {
+    record({
+      code: 'CASE_EXPECTATION_UNMET',
+      reason: `case expected ${expected.outcome} but proved ${proved}, or its required hosts or code were not observed`,
+    });
+  }
+  return { proved, guardedHosts, decisionCodes };
 }
 
 export function createConformanceAssertion(collaborators: {
@@ -856,14 +1138,15 @@ export function createConformanceAssertion(collaborators: {
     collaborators;
   return async function assertConnectorConformance<TInput, TOutput>(
     factory: ConnectorConformanceFactory<TInput, TOutput>,
-    options: ConnectorConformanceOptions<TInput>,
+    rawOptions: ConnectorConformanceOptions<TInput>,
   ): Promise<ConnectorConformanceReport> {
-    const normalized = validateOptions(options);
+    const normalized = validateOptions(rawOptions);
     requireGlobal<TimerGlobals['setTimeout']>('setTimeout');
     requireGlobal<TimerGlobals['clearTimeout']>('clearTimeout');
     requireGlobal<UrlConstructor>('URL');
+    requireGlobal<TextEncoderConstructor>('TextEncoder');
     const globalEntry = {
-      label: 'globalThis.fetch',
+      label: GLOBAL_FETCH_LABEL,
       target: globalThis,
       property: 'fetch',
     };
@@ -892,11 +1175,11 @@ export function createConformanceAssertion(collaborators: {
         },
       ]);
     }
-    if (isolatePoisoned) {
+    if (poisonedByCase !== undefined) {
       refuseRun([
         {
           code: 'ISOLATE_POISONED',
-          reason: `case '${timedOutCase}' timed out in this isolate; no further run is accepted`,
+          reason: `case '${poisonedByCase}' timed out in this isolate; no further run is accepted`,
         },
       ]);
     }
@@ -906,36 +1189,55 @@ export function createConformanceAssertion(collaborators: {
     const instrumented = new Set<string>();
     let posture: ConnectorEgressPosture | undefined;
     let runClosed = false;
+    const recordRun: RecordFinding = (finding) => {
+      // The run is closed and the report the caller holds is fixed, so this
+      // finding is recorded nowhere: CONFORMANCE_LIMIT covers a run for the
+      // duration of its own cases.
+      if (runClosed) return;
+      findings.push(finding);
+    };
+    /**
+     * Close the run and take the findings its report delivers: the flag is
+     * set here, and what the report carries is a copy the recorders can no
+     * longer reach.
+     */
+    const closeRun = (): readonly ConnectorConformanceFinding[] => {
+      runClosed = true;
+      return [...findings];
+    };
     try {
-      const recordRun: RecordFinding = (finding) => {
-        if (runClosed) return;
-        findings.push(finding);
-      };
-      const recordProbeEscape = (attempt: ConnectorConformanceEscape) => {
-        recordRun(escapeFinding(attempt));
-      };
-      const probeStack = installEntries(
+      const probeEscapes = phaseSink<ConnectorConformanceEscape>(
+        (attempt) => {
+          recordRun(escapeFinding(attempt));
+        },
+        (attempt) => {
+          recordRun(
+            observedAfter(escapeFinding(attempt), 'the probe factory returned'),
+          );
+        },
+      );
+      const probeInstall = installEntries(
         [globalEntry],
-        recordProbeEscape,
+        probeEscapes,
         recordRun,
         'probe factory',
       );
-      if (probeStack === undefined) {
-        runClosed = true;
-        return refuseRun(findings);
-      }
-      let probe!: Connector<TInput, TOutput>;
+      const probeStack = probeInstall.stack;
+      if (probeStack === undefined) return refuseRun(closeRun());
+      let probe: unknown;
+      let factoryFailed = false;
+      let probeIntact = true;
+      let probeRestored = true;
       try {
         const probeTransport = createCaseTransport(
           connectorManifest,
           undefined,
-          recordProbeEscape,
+          probeEscapes,
         );
-        const probeEvents: AuditEvent[] = [];
         const probeLogger = new AuditLogger({
-          sink: (event) => {
-            probeEvents.push(event);
-          },
+          // The probe reads no event. The sink is what makes the logger an
+          // exporting one, which a factory's own policies can require.
+          sink: () => {},
         });
         probe = factory({
           policies: Object.freeze({
@@ -944,24 +1246,30 @@ export function createConformanceAssertion(collaborators: {
           }),
         });
       } catch (error) {
+        factoryFailed = true;
         recordRun({ code: 'FACTORY_FAILED', reason: errorMessage(error) });
       } finally {
-        verifyEntries(probeStack, recordRun);
-        restoreEntries(probeStack, recordRun);
+        probeIntact = verifyEntries(probeStack, recordRun);
+        probeRestored = restoreEntries(probeStack, recordRun);
       }
+      probeEscapes.close();
       if (
-        findings.some(
-          (f) =>
-            f.code === 'FACTORY_FAILED' ||
-            f.code === 'INSTRUMENTATION_REPLACED' ||
-            f.code === 'INSTRUMENTATION_NOT_RESTORED',
-        )
+        factoryFailed ||
+        !probeIntact ||
+        !probeRestored ||
+        probeInstall.assigned.size > 0
       ) {
-        runClosed = true;
-        return refuseRun(findings);
+        return refuseRun(closeRun());
       }
-      posture = connectorEgressPosture(probe);
-      const probeManifest = connectorManifest(probe);
+      const probeSubject = registrySubject(probe);
+      posture =
+        probeSubject === undefined
+          ? undefined
+          : connectorEgressPosture(probeSubject);
+      const probeManifest =
+        probeSubject === undefined
+          ? undefined
+          : connectorManifest(probeSubject);
       if (posture === undefined || probeManifest === undefined) {
         recordRun({
           code: 'SUBJECT_UNREGISTERED',
@@ -974,13 +1282,18 @@ export function createConformanceAssertion(collaborators: {
             reason: 'the connector declares a declaration-only egress posture',
           });
         }
-        if (!manifestsMatch(normalized.manifest, probeManifest)) {
+        // One read of the claimed manifest's members: a getter cannot answer
+        // one way for this comparison and another way afterwards.
+        const claimedManifest = { ...normalized.manifest };
+        if (!manifestsMatch(claimedManifest, probeManifest)) {
           recordRun({
             code: 'MANIFEST_MISMATCH',
             reason: 'the registered manifest differs from the claimed manifest',
           });
         }
         if (posture === 'enforced') {
+          // The registered egress declaration, read once for the whole run.
+          const declaredEgress = probeManifest.egress ?? [];
           if (normalized.cases.length === 0) {
             recordRun({
               code: 'NO_CASES',
@@ -991,29 +1304,33 @@ export function createConformanceAssertion(collaborators: {
           let stopped = false;
           for (const [index, c] of normalized.cases.entries()) {
             const caseName = c.name;
+            const settled = `case '${caseName}' settled`;
             const escapes: ConnectorConformanceEscape[] = [];
             const caseFindings: ConnectorConformanceFinding[] = [];
-            const recordCase: RecordFinding = (finding) => {
-              const scoped = { ...finding, case: caseName };
-              findings.push(scoped);
-              caseFindings.push(scoped);
-            };
-            let caseSettled = false;
-            const recordEscape = (attempt: ConnectorConformanceEscape) => {
-              if (runClosed) return;
-              if (caseSettled) {
-                const finding = escapeFinding(attempt);
-                recordRun({
-                  ...finding,
-                  reason: `${finding.reason}; observed after case '${caseName}' settled`,
-                });
-                return;
-              }
-              escapes.push(attempt);
-            };
-            const stack = installEntries(
+            const escapeSink = phaseSink<ConnectorConformanceEscape>(
+              (attempt) => {
+                escapes.push(attempt);
+              },
+              (attempt) => {
+                recordRun(
+                  observedAfter(escapeFinding(attempt), settled, caseName),
+                );
+              },
+            );
+            const findingSink = phaseSink<ConnectorConformanceFinding>(
+              (finding) => {
+                const scoped = { ...finding, case: caseName };
+                recordRun(scoped);
+                caseFindings.push(scoped);
+              },
+              (finding) => {
+                recordRun(observedAfter(finding, settled, caseName));
+              },
+            );
+            const recordCase: RecordFinding = findingSink.record;
+            const caseInstall = installEntries(
               entries,
-              recordEscape,
+              escapeSink,
               recordCase,
               'case',
             );
@@ -1031,47 +1348,65 @@ export function createConformanceAssertion(collaborators: {
             let invoked = false;
             let timedOut = false;
             let instrumentationIntact = true;
-            let invocationError: unknown;
-            let invocationFailed = false;
+            let invocation: { readonly thrown: unknown } | undefined;
+            let restoredAfterCase = true;
             let timer: unknown;
-            if (stack !== undefined) {
-              for (const entry of stack) instrumented.add(entry.label);
+            const caseStack = caseInstall.stack;
+            if (caseStack !== undefined) {
+              for (const entry of caseStack) instrumented.add(entry.label);
               try {
                 caseTransport = createCaseTransport(
                   connectorManifest,
                   c.respond,
-                  recordEscape,
+                  escapeSink,
                 );
                 const caseLogger = new AuditLogger({
                   sink: (event) => {
                     try {
+                      // The witness set holds the harness's own copy of every
+                      // event, never the object the connector still holds.
                       caseAuditEvents.push({ event: { ...event }, inWindow });
-                    } catch {}
+                    } catch {
+                      // An event that cannot be copied leaves no witness, so
+                      // the case reports absent wiring rather than accepting
+                      // evidence the harness could not read.
+                    }
                   },
                 });
-                let connector!: Connector<TInput, TOutput>;
-                let factoryReturned = false;
+                let produced: { readonly value: unknown } | undefined;
                 try {
-                  connector = factory({
-                    policies: Object.freeze({
-                      fetch: caseTransport.fetch,
-                      audit: caseLogger,
+                  produced = {
+                    value: factory({
+                      policies: Object.freeze({
+                        fetch: caseTransport.fetch,
+                        audit: caseLogger,
+                      }),
                     }),
-                  });
-                  factoryReturned = true;
+                  };
                 } catch (error) {
                   recordCase({
                     code: 'FACTORY_FAILED',
                     reason: errorMessage(error),
                   });
                 }
-                if (factoryReturned) {
-                  const casePosture = connectorEgressPosture(connector);
-                  const caseManifest = connectorManifest(connector);
-                  if (casePosture === undefined || caseManifest === undefined) {
+                if (produced !== undefined) {
+                  const caseSubject = registrySubject(produced.value);
+                  const casePosture =
+                    caseSubject === undefined
+                      ? undefined
+                      : connectorEgressPosture(caseSubject);
+                  const caseManifest =
+                    caseSubject === undefined
+                      ? undefined
+                      : connectorManifest(caseSubject);
+                  if (
+                    caseSubject === undefined ||
+                    casePosture === undefined ||
+                    caseManifest === undefined
+                  ) {
                     recordCase({
                       code: 'SUBJECT_UNREGISTERED',
-                      reason: unregisteredReason(connector),
+                      reason: unregisteredReason(produced.value),
                     });
                   } else if (casePosture !== posture) {
                     recordCase({
@@ -1085,6 +1420,9 @@ export function createConformanceAssertion(collaborators: {
                         'the case subject manifest differs from the probe',
                     });
                   } else {
+                    // The registry answered for this subject, so it is a
+                    // connector createConnector() built.
+                    const connector = caseSubject as Connector<TInput, TOutput>;
                     caseTransport.bind(connector);
                     subjectId = connector.id;
                     invoked = true;
@@ -1092,7 +1430,7 @@ export function createConformanceAssertion(collaborators: {
                     inWindow = true;
                     await raceTimeout(
                       invokeConnector(connector, c.input, c.invocation),
-                      c.timeoutMs ?? 2000,
+                      c.timeoutMs ?? DEFAULT_CASE_TIMEOUT_MS,
                       () => {
                         timedOut = true;
                       },
@@ -1104,20 +1442,18 @@ export function createConformanceAssertion(collaborators: {
                 }
               } catch (error) {
                 if (timedOut) {
-                  isolatePoisoned = true;
-                  timedOutCase = caseName;
+                  poisonedByCase = caseName;
                   recordCase({
                     code: 'CASE_TIMEOUT',
-                    reason: `case '${caseName}' timed out after ${c.timeoutMs ?? 2000} ms`,
+                    reason: `case '${caseName}' timed out after ${c.timeoutMs ?? DEFAULT_CASE_TIMEOUT_MS} ms`,
                   });
                 } else {
-                  invocationError = error;
-                  invocationFailed = true;
+                  invocation = { thrown: error };
                 }
               } finally {
                 inWindow = false;
-                instrumentationIntact = verifyEntries(stack, recordCase);
-                restoreEntries(stack, recordCase);
+                instrumentationIntact = verifyEntries(caseStack, recordCase);
+                restoredAfterCase = restoreEntries(caseStack, recordCase);
                 if (timer !== undefined) {
                   try {
                     globalTimers().clearTimeout(timer);
@@ -1128,119 +1464,63 @@ export function createConformanceAssertion(collaborators: {
               }
             }
             const caseEscapes = [...escapes];
-            caseSettled = true;
+            escapeSink.close();
             for (const attempt of caseEscapes)
               recordCase(escapeFinding(attempt));
-            if (!invoked && invocationFailed) {
+            if (
+              !invoked &&
+              invocation !== undefined &&
+              // A refusal is the harness's own throw: the attempt behind it is
+              // already a NETWORK_IO_OUTSIDE_RUNTIME_FETCH finding, and the
+              // sentinel names a class no consumer can see. The invoked path
+              // excludes it through the same classification.
+              classifyInvocationError(invocation.thrown) !== 'refusal'
+            ) {
               recordCase({
                 code: 'CASE_INVOCATION_FAILED',
-                reason: invocationFailureReason(invocationError),
+                reason: invocationFailureReason(invocation.thrown),
               });
             }
             const witnesses = caseAuditEvents
               .filter(isWitness)
               .map((e) => e.event);
             const transportCalls = caseTransport?.calls() ?? 0;
-            let proved: ConnectorConformanceCaseResult['proved'] = 'nothing';
-            let guardedHosts: string[] = [];
-            let decisionCodes: (ConnectorDecisionCode | undefined)[] = [];
-            if (invoked && !timedOut && instrumentationIntact) {
-              guardedHosts = [...new Set(caseTransport?.hosts() ?? [])];
-              decisionCodes = caseAuditEvents
-                .filter((e) => e.inWindow)
-                .map((e) => e.event.decisionCode);
-              // A value whose classification cannot be read is by definition
-              // none of the three known kinds, so it takes the foreign branch.
-              const invocationKind = classifyInvocationError(invocationError);
-              const boundaryError = invocationKind === 'boundary';
-              if (invocationFailed && invocationKind === 'foreign') {
-                recordCase({
-                  code: 'CASE_INVOCATION_FAILED',
-                  reason: invocationFailureReason(invocationError),
-                });
-              }
-              const missingFetch =
-                transportCalls === 0 &&
-                caseEscapes.some(
-                  (attempt) =>
-                    attempt.entryPoint === 'globalThis.fetch' &&
-                    attempt.host !== null &&
-                    hostDeclared(attempt.host, probeManifest.egress ?? []),
-                );
-              const missingAudit = !boundaryError && witnesses.length === 0;
-              if (missingFetch || missingAudit) {
-                recordCase({
-                  code: 'POLICIES_NOT_WIRED',
-                  member: missingFetch
-                    ? missingAudit
-                      ? 'both'
-                      : 'fetch'
-                    : 'audit',
-                  reason: missingFetch
-                    ? 'either the factory did not wire policies.fetch, or the connector called the ambient global directly for a host it declares; the escape record beside this finding is authoritative for the request itself.' +
-                      (missingAudit
-                        ? ' The subject recorded no audit witness on the supplied logger.'
-                        : '')
-                    : 'the subject reached its gate boundary but recorded no audit witness on the supplied logger; wire policies.audit',
-                });
-              }
-              if (boundaryError && witnesses.length === 0) {
-                recordCase({
-                  code: 'CASE_EXPECTATION_UNMET',
-                  reason:
-                    "the case produced no audit event because the connector's gate boundary was never reached; a pre-boundary refusal is not expressible by any expectation and belongs in an ordinary connector test",
-                });
-              } else {
-                proved = witnesses.some(
-                  (event) =>
-                    event.decision === 'denied' &&
-                    event.policyKind === 'egress-fetch',
-                )
-                  ? 'guarded-denial'
-                  : witnesses.some(
-                        (event) =>
-                          event.decision === 'denied' &&
-                          event.policyKind !== 'egress-fetch',
-                      )
-                    ? 'policy-denied'
-                    : guardedHosts.length > 0
-                      ? 'guarded-request'
-                      : 'no-network';
-                const expected = c.expect;
-                const evidenceMatches =
-                  expected.outcome === 'guarded-request'
-                    ? expected.hosts.every((host) =>
-                        guardedHosts.some((actual) =>
-                          egressDomainAllowed(actual, [host]),
-                        ),
-                      )
-                    : expected.outcome === 'no-network' ||
-                      witnesses.some(
-                        (event) => event.decisionCode === expected.code,
-                      );
-                if (proved !== expected.outcome || !evidenceMatches) {
-                  recordCase({
-                    code: 'CASE_EXPECTATION_UNMET',
-                    reason: `case expected ${expected.outcome} but proved ${proved}, or its required hosts or code were not observed`,
-                  });
-                }
-              }
-            }
+            // An invocation failure under a replaced instrument or a timeout
+            // raises no CASE_INVOCATION_FAILED of its own: the case is
+            // ineligible, and the INSTRUMENTATION_REPLACED or CASE_TIMEOUT
+            // finding beside it is why it proves nothing.
+            const observation: CaseObservation =
+              invoked && !timedOut && instrumentationIntact
+                ? observeCase(
+                    {
+                      expect: c.expect,
+                      declaredEgress,
+                      escapes: caseEscapes,
+                      auditEvents: caseAuditEvents,
+                      witnesses,
+                      transportCalls,
+                      transportHosts: caseTransport?.hosts() ?? [],
+                      invocation,
+                    },
+                    recordCase,
+                  )
+                : { proved: 'nothing', guardedHosts: [], decisionCodes: [] };
             cases.push({
               name: caseName,
-              proved,
-              guardedHosts,
+              proved: observation.proved,
+              guardedHosts: observation.guardedHosts,
               escapes: caseEscapes,
-              decisionCodes,
+              decisionCodes: observation.decisionCodes,
               transportCalls,
               auditEvents: witnesses.length,
               findings: [...caseFindings],
             });
+            findingSink.close();
+            const restorationFailed =
+              !caseInstall.restored || !restoredAfterCase;
             const stoppingCode = timedOut
               ? 'CASE_TIMEOUT'
-              : caseFindings.some(
-                    (f) => f.code === 'INSTRUMENTATION_NOT_RESTORED',
-                  )
+              : restorationFailed
                 ? 'INSTRUMENTATION_NOT_RESTORED'
                 : undefined;
             if (stoppingCode !== undefined) {
@@ -1260,7 +1540,7 @@ export function createConformanceAssertion(collaborators: {
           if (
             invokedAny &&
             !stopped &&
-            (probeManifest.egress?.length ?? 0) > 0 &&
+            declaredEgress.length > 0 &&
             !cases.some((c) => c.transportCalls > 0)
           ) {
             recordRun({
@@ -1274,8 +1554,7 @@ export function createConformanceAssertion(collaborators: {
     } finally {
       activeRun = undefined;
     }
-    runClosed = true;
-    const runFindings = [...findings];
+    const runFindings = closeRun();
     const report: ConnectorConformanceReport = {
       conformant: runFindings.length === 0,
       ...(posture === undefined ? {} : { posture }),
@@ -1284,7 +1563,7 @@ export function createConformanceAssertion(collaborators: {
       findings: runFindings,
       limit: CONFORMANCE_LIMIT,
     };
-    if (!report.conformant) refuseRun(report.findings, report);
+    if (!report.conformant) refuseReport(report);
     return report;
   };
 }

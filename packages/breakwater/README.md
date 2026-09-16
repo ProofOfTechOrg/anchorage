@@ -352,8 +352,8 @@ the result at their gateway boundary.
 
 A fixed window can admit traffic on both sides of a boundary, approaching
 twice the nominal count in a short interval. Use another `RateLimitStore`
-implementation if you require token-bucket or GCRA semantics.
-Counts must be safe integers from 1 through `Number.MAX_SAFE_INTEGER`.
+implementation if you require token-bucket or GCRA semantics. Counts must be
+safe integers from 1 through `Number.MAX_SAFE_INTEGER`.
 `D1RateLimitStore` commits its increment and rollover cleanup in one D1 batch,
 so cleanup failure cannot consume quota for a rejected call.
 
@@ -450,9 +450,8 @@ process-tree termination, timeout, and output limits.
 
 The returned `text` is functional agent output and may contain sensitive data.
 The `command` redacts the prompt and `--flag=value` option values. Validation
-failures, error messages, error metadata, and
-breakwater-generated audit reasons do not contain the prompt or captured
-stdout and stderr.
+failures, error messages, error metadata, and breakwater-generated audit
+reasons do not contain the prompt or captured stdout and stderr.
 
 The adapter does not sandbox the child. It inherits the parent environment and
 credentials, and `cwd` is the workspace the CLI may modify. Its manifest
@@ -476,9 +475,9 @@ This enforcement cannot see:
 - raw sockets or child-process network traffic.
 
 Route every connector request through `runtime.fetch`. Use host-level network
-controls when code outside that seam must also be constrained.
-Declare `permissions.egressEnforcement: 'declaration-only'` for traffic outside
-the guard; `connectorEgressPosture()` reads the resolved posture and connector
+controls when code outside that seam must also be constrained. Declare
+`permissions.egressEnforcement: 'declaration-only'` for traffic outside the
+guard; `connectorEgressPosture()` reads the resolved posture and connector
 audit events record it as `detail.egressEnforcement`.
 
 ## Public API

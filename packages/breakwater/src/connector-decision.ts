@@ -354,6 +354,13 @@ export function connectorErrorDecision(
  * trap answers with a throw; a value that cannot say what it is, is not the
  * constructor asked about.
  *
+ * The test for reaching for it: the operand is a value the SDK did not
+ * construct, and the answer can reach a conformance report. An operand the SDK
+ * built — every `validateOutput` failure, a `Promise` the SDK awaits, a store
+ * the caller passed to the constructor — carries no trap and takes a bare
+ * `instanceof`. Where the answer is a classification over several constructors,
+ * one guarded classification covers them all.
+ *
  * @internal
  */
 export function isInstanceOf<T>(
@@ -367,7 +374,14 @@ export function isInstanceOf<T>(
   }
 }
 
-/** @internal */
+/**
+ * `value[key]` for a value the caller does not own. The read runs whatever
+ * `get` accessor the value carries, so a property that answers with a throw is
+ * not the value asked about. The companion of `isInstanceOf` for one property
+ * of such a value, under the same test.
+ *
+ * @internal
+ */
 export function readProperty<T extends object, K extends keyof T>(
   value: T,
   key: K,

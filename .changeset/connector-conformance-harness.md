@@ -10,9 +10,11 @@ a trap that records the attempt and refuses. A case that reaches one fails with 
 base transport refuses any host the registered manifest does not declare, so calling it around the
 guard fails the same way.
 
-On an absent or configurable entry point, the harness installs an accessor whose getter returns the trap. An assignment to that instrumented entry point is recorded when it happens as `INSTRUMENTATION_REPLACED` and is not applied; the trap stays in place. A writable non-configurable data property uses assignment installation, which offers no defence against assignments during execution. A redefinition still in place when the case settles or times out, or when the probe factory returns, is reported as `INSTRUMENTATION_REPLACED`. A redefinition or deletion that the case itself reverses before it settles, like a reference to `fetch` captured before the run, is outside what the harness observes. It reports the requests that pass through its trap. A detected redefinition makes the case prove `nothing` and skip expectation checks. An assignment attempt or detected redefinition during probe construction refuses the run.
+On an absent or configurable entry point, the harness installs an accessor whose getter returns the trap. An assignment to that instrumented entry point is recorded when it happens as `INSTRUMENTATION_REPLACED` and is not applied; the trap stays in place. A writable non-configurable data property uses assignment installation, which offers no defence against assignments during execution. A redefinition or assignment still in place when the case settles or times out, or when the probe factory returns, is reported as `INSTRUMENTATION_REPLACED`. A redefinition or deletion the case itself reverses before it settles is one of the channels listed under [Conformance limits](https://github.com/ProofOfTechOrg/anchorage/blob/main/packages/breakwater/CONNECTORS.md#conformance-limits). When verification fails, the case is ineligible for the outcome check and proves `nothing`. An `INSTRUMENTATION_UNSUPPORTED` or `INSTRUMENTATION_REPLACED` finding during probe construction refuses the run.
 
-`CASE_INVOCATION_FAILED`: Invocation failed before or during invocation; the reason names the error's constructor, uses `unknown` when that name is unavailable or unreadable, or describes a thrown non-Error value by type, without the message or value. During invocation, policy denials, boundary errors, and harness refusals retain their existing classifications.
+A case reports `CASE_INVOCATION_FAILED` when invocation setup fails or the invocation itself fails; the reason names the error's constructor, uses `unknown` when that name is unavailable, unreadable, or not a plain identifier of at most 64 characters, or describes a thrown non-Error value by type, without the message or value. During invocation, policy denials, boundary errors, and harness refusals retain their existing classifications, and a setup failure carrying a harness refusal is reported as the escape behind it rather than as an invocation failure.
+
+The harness requires `TextEncoder` with its other host globals before a run starts, reports an entry point replaced before an install failure unwinds it, and names the phase — a settled case, or the probe factory — when an attempt or a finding arrives after it.
 
 Instrumentation is restored after the case settles, after a throw, after a partial install, and after
 a per-case timeout; a restoration that cannot be proved fails the run and ends it, rather than
@@ -27,7 +29,7 @@ case runs, and the case is when a case's own work makes the global uninstrumenta
 way the finding names the descriptor shape it found, and a failure at any entry point restores the
 whole rollback stack: a (d) install or (e) verification failure includes the failing entry point; an
 (a) validation or descriptor-read failure precedes capture and push, so the stack holds only the
-entry points attempted before it (C8-2). A restore the target silently ignores
+entry points attempted before it. A restore the target silently ignores
 is reported as a failed restoration. Two entry points naming one
 property is refused before any case runs, and so are two cases sharing a name, two entry points
 sharing a label, and an overlapping or nested run. A factory that throws is reported as a
@@ -43,11 +45,14 @@ with no cases raises one finding, not both. A case whose expectations depend on 
 did not wire is reported as a wiring failure naming the member, alongside the escape record, which is
 kept. Every report states the finite-case limit:
 
-> conformance covers only the supplied cases, in this isolate, for the duration of each case; the channels it does not observe are listed at https://github.com/ProofOfTechOrg/anchorage/blob/main/packages/breakwater/CONNECTORS.md#conformance-limits
+> conformance covers only the supplied cases, in this isolate, for the duration of each case; channels a run observes, and channels it does not, are described under Conformance limits in the CONNECTORS.md that ships with this package, at https://github.com/ProofOfTechOrg/anchorage/blob/main/packages/breakwater/CONNECTORS.md#conformance-limits
 
 The harness itself uses no Node built-ins, no `vm`, and no filesystem, and runs on workerd. The
 barrel it ships from imports `@mastra/core/tools`, whose bundled chunks statically import Node
 built-ins under unprefixed specifiers, so a Worker importing the barrel needs Node.js compatibility
 enabled — the `nodejs_compat` compatibility flag, or a `compatibility_date` recent enough that your
-Workers runtime turns it on by default. Check your runtime's compatibility-date documentation; in the
-Wrangler/miniflare this package develops against, the default-on date is 2026-08-04.
+Workers runtime turns it on by default; check your runtime's compatibility-date documentation for
+that date. The flag is a necessary condition, not a sufficient one: the workerd build behind the
+runtime also has to load the barrel. Loading it crashed `workerd@1.20260730.1` during module
+resolution in this package's own workerd test pool, and `workerd@1.20260903.1` loads it, which is
+the build this repository pins through a pnpm override on `miniflare@5.20260730.0-alpha`.

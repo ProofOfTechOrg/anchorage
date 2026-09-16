@@ -32,6 +32,7 @@ import {
 } from '../connector-sdk/index.js';
 import { replaceConnectorInvocation } from '../connector-sdk/invocation-registry.js';
 import { createDefaultExec, DefaultExecFailure } from './default-exec.js';
+import type { AgentCliExec, AgentCliExecResult } from './exec-contract.js';
 
 /** Input accepted by an agent CLI connector. */
 export interface AgentCliInput {
@@ -58,22 +59,7 @@ export interface AgentCliOutput {
   simulated?: boolean;
 }
 
-/** Raw process result returned by an injected {@link AgentCliExec}. */
-export interface AgentCliExecResult {
-  /** Standard output captured from the process. */
-  stdout: string;
-  /** Standard error captured from the process. */
-  stderr: string;
-  /** Integer process exit code. */
-  exitCode: number;
-}
-
-/** Spawn seam — inject in tests or to sandbox/containerize execution. */
-export type AgentCliExec = (
-  command: string,
-  args: readonly string[],
-  options: { cwd?: string; timeoutMs: number },
-) => Promise<AgentCliExecResult>;
+export type { AgentCliExec, AgentCliExecResult } from './exec-contract.js';
 
 /** Describes how to invoke and parse one agent CLI. */
 export interface AgentCliDefinition {
@@ -131,7 +117,11 @@ export interface AgentCliConnectorOptions {
   idempotencyKey?: boolean;
   /** Connector id override (running two differently-configured instances). */
   id?: string;
-  /** Passed through to createConnector (audit, stores, evaluators). */
+  /**
+   * Passed through to createConnector (audit, stores, evaluators). A
+   * `requireEgressEnforcement` member here throws the construction `TypeError`
+   * {@link createAgentCliConnector} describes.
+   */
   policies?: ConnectorPolicies;
   /**
    * Cap on retained stdout/stderr per stream in the default exec (node's
@@ -384,6 +374,11 @@ function redactDisplayFlag(flag: string): string {
  * Wrap any agent CLI as an approval-gated breakwater connector. The two
  * shipped definitions are createClaudeCodeConnector / createCodexConnector;
  * this is the seam for third-party CLIs.
+ *
+ * The adapter's manifest declares `egressEnforcement: 'declaration-only'`,
+ * because the child process carries its own transport. Construction therefore
+ * throws a `TypeError` when `options.policies` sets
+ * `requireEgressEnforcement`, which that posture cannot satisfy.
  */
 export function createAgentCliConnector(
   definition: AgentCliDefinition,
@@ -673,7 +668,9 @@ export const CODEX_CLI: AgentCliDefinition = {
 
 /**
  * Create an approval-gated Claude Code connector using
- * {@link CLAUDE_CODE_CLI}.
+ * {@link CLAUDE_CODE_CLI}. Construction throws a `TypeError` on
+ * `options.policies.requireEgressEnforcement`, as
+ * {@link createAgentCliConnector} describes.
  */
 export function createClaudeCodeConnector(
   options?: AgentCliConnectorOptions,
@@ -683,6 +680,9 @@ export function createClaudeCodeConnector(
 
 /**
  * Create an approval-gated Codex connector using {@link CODEX_CLI}.
+ * Construction throws a `TypeError` on
+ * `options.policies.requireEgressEnforcement`, as
+ * {@link createAgentCliConnector} describes.
  */
 export function createCodexConnector(
   options?: AgentCliConnectorOptions,

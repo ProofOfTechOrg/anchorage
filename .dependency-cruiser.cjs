@@ -181,7 +181,7 @@ module.exports = {
       name: 'no-new-architecture-cycles',
       severity: 'error',
       from: {
-        path: '^(?:packages/flowsafe/src|packages/fleet-control/src|packages/agent-starter/(?:src|test|scripts)|scripts/architecture-fixtures)/',
+        path: '^(?:packages/flowsafe/src|packages/fleet-control/src|packages/breakwater/src|packages/agent-starter/(?:src|test|scripts)|scripts/architecture-fixtures)/',
       },
       to: {
         circular: true,

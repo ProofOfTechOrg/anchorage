@@ -77,6 +77,22 @@ describe('singleTenantConnectorPolicies', () => {
     ).toThrow(/requireEgressEnforcement/);
   });
 
+  it('leaves requireEgressEnforcement off a preset built without it', () => {
+    // #given
+    const policies = singleTenantConnectorPolicies(productionOptions());
+    // #when
+    const connector = createConnector({
+      id: 'records.undeclared',
+      description: 'Read without declaring a posture',
+      permissions: { sideEffect: 'read' },
+      policies,
+      execute: async () => ({ ok: true }),
+    });
+    // #then
+    expect(policies).not.toHaveProperty('requireEgressEnforcement');
+    expect(connectorEgressPosture(connector)).toBe('declaration-only');
+  });
+
   it('refuses a preset whose requireEgressEnforcement was added after validation', () => {
     // #given
     const baseline = singleTenantConnectorPolicies(productionOptions());

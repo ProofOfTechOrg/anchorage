@@ -6,7 +6,11 @@
 // model call) evaluated on a streaming cadence. Both are best-effort — see
 // each export's doc for its accepted evasion surface.
 
-import type { OutputChannel, PolicyEvaluator, PolicyPhase } from './index.js';
+import type {
+  OutputChannel,
+  PolicyEvaluator,
+  PolicyPhase,
+} from './evaluator-contract.js';
 import type { PolicyDecision } from './tool-policy.js';
 
 // ---------------------------------------------------------------------------

@@ -436,6 +436,58 @@ describe('connector egress posture', () => {
     expect(connectorEgressPosture(tool)).toBe('declaration-only');
   });
 
+  it('gates a manifest declaring egress hosts on its posture, not on the hosts', () => {
+    // #given
+    const egress = ['api.example.com'];
+    const policies = { requireEgressEnforcement: true as const };
+    // #when / #then — the same declared hosts, refused under 'declaration-only'
+    // and admitted under 'enforced'.
+    expect(() =>
+      makeConnector({
+        permissions: {
+          sideEffect: 'read',
+          egress,
+          egressEnforcement: 'declaration-only',
+        },
+        policies,
+      }),
+    ).toThrow(/requireEgressEnforcement/);
+    const { tool } = makeConnector({
+      permissions: {
+        sideEffect: 'read',
+        egress,
+        egressEnforcement: 'enforced',
+      },
+      policies,
+    });
+    expect(connectorEgressPosture(tool)).toBe('enforced');
+    expect(connectorManifest(tool)?.egress).toEqual(egress);
+  });
+
+  it('audits the posture connectorEgressPosture reads back', async () => {
+    // #given
+    for (const declared of [
+      undefined,
+      'enforced',
+      'declaration-only',
+    ] as const) {
+      const audit = new AuditLogger();
+      const { tool } = makeConnector({
+        permissions: {
+          sideEffect: 'read',
+          ...(declared === undefined ? {} : { egressEnforcement: declared }),
+        },
+        policies: { audit },
+      });
+      // #when
+      await expect(run(tool, input)).resolves.toEqual({ ok: true });
+      // #then — one resolution serves the readback and the audit detail.
+      expect(audit.events()[0]?.detail).toMatchObject({
+        egressEnforcement: connectorEgressPosture(tool),
+      });
+    }
+  });
+
   it('records the resolved posture on an allowed connector decision', async () => {
     // #given
     for (const egressEnforcement of [
@@ -1431,55 +1483,47 @@ describe('invokeConnector', () => {
     );
   });
 
-  it('rejects with the connector policy error when its connector property cannot be read', async () => {
-    const audit = new AuditLogger();
-    const id = 'direct.unreadable-connector';
-    const hostile = new Proxy(
-      new ConnectorPolicyError(id, 'custom-policy', 'application-owned denial'),
-      {
-        get(target, key, receiver) {
-          if (key === 'connector') throw new Error('trap');
-          return Reflect.get(target, key, receiver);
-        },
-      },
-    );
-    const tool = createConnector<unknown, unknown>({
-      id,
+  const unreadableConnectorId = 'direct.unreadable-connector';
+  it.each([
+    {
+      label:
+        'the connector policy error when its connector property cannot be read',
+      id: unreadableConnectorId,
       description:
         'Throw a policy error whose connector property cannot be read',
-      execute: async () => {
-        throw hostile;
-      },
-      permissions: { sideEffect: 'read' },
-      policies: { audit },
-    });
-    const failure = await invokeConnector(tool, {}).catch(
-      (error: unknown) => error,
-    );
-    expect(failure).toBe(hostile);
-    expect(audit.events()).toEqual([
-      expect.objectContaining({
-        decision: 'error',
-        decisionCode: 'CONNECTOR_EXECUTION_FAILED',
-        detail: expect.objectContaining({ stage: 'execute' }),
-      }),
-    ]);
-  });
-
-  it('rejects with the connector value when its prototype chain cannot be read', async () => {
-    // #given
-    const audit = new AuditLogger();
-    const hostile = new Proxy(
-      { marker: 'unreadable-prototype' },
-      {
-        getPrototypeOf(): never {
-          throw new Error('prototype unreadable');
+      hostile: new Proxy(
+        new ConnectorPolicyError(
+          unreadableConnectorId,
+          'custom-policy',
+          'application-owned denial',
+        ),
+        {
+          get(target, key, receiver) {
+            if (key === 'connector') throw new Error('trap');
+            return Reflect.get(target, key, receiver);
+          },
         },
-      },
-    );
-    const tool = createConnector<unknown, unknown>({
+      ),
+    },
+    {
+      label: 'the connector value when its prototype chain cannot be read',
       id: 'direct.unreadable-prototype',
       description: 'Throw a value whose prototype chain cannot be read',
+      hostile: new Proxy(
+        { marker: 'unreadable-prototype' },
+        {
+          getPrototypeOf(): never {
+            throw new Error('prototype unreadable');
+          },
+        },
+      ),
+    },
+  ])('rejects with $label', async ({ id, description, hostile }) => {
+    // #given
+    const audit = new AuditLogger();
+    const tool = createConnector<unknown, unknown>({
+      id,
+      description,
       execute: async () => {
         throw hostile;
       },

@@ -152,26 +152,6 @@ function expectProcessAbsent(pid: number): void {
 }
 
 describe('createClaudeCodeConnector', () => {
-  it('declares a declaration-only egress posture on the Agent CLI manifest', () => {
-    // #given
-    const exec = mockExec();
-    // #when
-    const tools = [
-      createAgentCliConnector(privateDefinition(), { exec }),
-      createClaudeCodeConnector({ exec }),
-      createCodexConnector({ exec }),
-    ];
-    // #then
-    for (const tool of tools) {
-      expect(connectorManifest(tool)).toHaveProperty(
-        'egressEnforcement',
-        'declaration-only',
-      );
-      expect(connectorEgressPosture(tool)).toBe('declaration-only');
-    }
-    expect(exec).not.toHaveBeenCalled();
-  });
-
   it('builds headless args, forwards cwd/timeout, parses the JSON result', async () => {
     // #given
     const exec = mockExec({
@@ -269,6 +249,26 @@ describe('createCodexConnector', () => {
 });
 
 describe('agent CLI connector enforcement', () => {
+  it('declares a declaration-only egress posture on the Agent CLI manifest', () => {
+    // #given
+    const exec = mockExec();
+    // #when
+    const tools = [
+      createAgentCliConnector(privateDefinition(), { exec }),
+      createClaudeCodeConnector({ exec }),
+      createCodexConnector({ exec }),
+    ];
+    // #then
+    for (const tool of tools) {
+      expect(connectorManifest(tool)).toHaveProperty(
+        'egressEnforcement',
+        'declaration-only',
+      );
+      expect(connectorEgressPosture(tool)).toBe('declaration-only');
+    }
+    expect(exec).not.toHaveBeenCalled();
+  });
+
   it('preserves custom denial metadata while replacing the CLI reason', async () => {
     const audit = new AuditLogger();
     const exec = mockExec();

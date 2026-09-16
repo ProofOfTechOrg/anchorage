@@ -9,25 +9,29 @@ import { describe, expect, it, vi } from 'vitest';
 import { STATE_COOKIE } from '#worker/demo-auth';
 import handler, { ShowcaseRunner } from '#worker/worker';
 
+// The node:sqlite-backed D1 facade this suite drives, matching
+// packages/agent-starter/test/sqlite.ts — the retained source — byte for byte
+// from `interface SqliteStatement` to the end of `sqliteUnitDatabase`.
+// showcase declares no dependency on anchorage-agent-starter, and that package
+// publishes no `exports` entry, so no specifier resolves it from here.
 interface SqliteStatement {
   get(...params: unknown[]): unknown;
-  run(...params: unknown[]): unknown;
   all(...params: unknown[]): unknown[];
 }
 
-interface SqliteDatabase {
+export interface SqliteDatabase {
   prepare(sql: string): SqliteStatement;
   exec(sql: string): void;
 }
 
-function openSqlite(): SqliteDatabase {
+export function openSqlite(): SqliteDatabase {
   const getBuiltin = (
     globalThis as {
       process?: { getBuiltinModule?: (id: string) => unknown };
     }
   ).process?.getBuiltinModule;
   if (!getBuiltin) {
-    throw new Error('node:sqlite unavailable — tests require node >= 22.13');
+    throw new Error('node:sqlite unavailable; tests require Node.js 22.13+');
   }
   const mod = getBuiltin('node:sqlite') as {
     DatabaseSync: new (path: string) => SqliteDatabase;
@@ -35,17 +39,19 @@ function openSqlite(): SqliteDatabase {
   return new mod.DatabaseSync(':memory:');
 }
 
-function sqliteUnitDatabase(db: SqliteDatabase): unknown {
+export function sqliteUnitDatabase(db: SqliteDatabase): unknown {
   const runSync = Symbol('runSync');
 
   function statement(sql: string, params: unknown[]): Record<string, unknown> {
     const execute = () => {
-      const outcome = db.prepare(sql).run(...params) as {
-        changes?: number | bigint;
+      const results = db.prepare(sql).all(...params);
+      const outcome = db.prepare('SELECT changes() AS count').get() as {
+        count: number | bigint;
       };
       return {
         success: true,
-        meta: { changes: Number(outcome?.changes ?? 0) },
+        results,
+        meta: { changes: Number(outcome.count) },
       };
     };
     return {
@@ -55,7 +61,7 @@ function sqliteUnitDatabase(db: SqliteDatabase): unknown {
           | Record<string, unknown>
           | undefined;
         if (row === undefined) return null;
-        return column !== undefined ? (row[column] ?? null) : row;
+        return column === undefined ? row : (row[column] ?? null);
       },
       run: async () => execute(),
       [runSync]: execute,
@@ -66,6 +72,7 @@ function sqliteUnitDatabase(db: SqliteDatabase): unknown {
       }),
     };
   }
+
   return {
     prepare: (sql: string) => statement(sql, []),
     batch: async (
@@ -177,6 +184,64 @@ async function call(
   await Promise.all(pending);
   return response as unknown as Response;
 }
+
+// The facade above is a copy, not an import, so pin the result shape its D1
+// consumers read: a drift in either copy fails here.
+describe('the node:sqlite D1 facade', () => {
+  interface PreparedResult {
+    success: boolean;
+    results: unknown[];
+    meta: { changes: number };
+  }
+  interface Prepared {
+    bind(...values: unknown[]): Prepared;
+    first(column?: string): Promise<unknown>;
+    run(): Promise<PreparedResult>;
+  }
+  interface Facade {
+    prepare(sql: string): Prepared;
+    batch(statements: Prepared[]): Promise<PreparedResult[]>;
+  }
+
+  function openFacade(): Facade {
+    const sqlite = openSqlite();
+    sqlite.exec('CREATE TABLE t (k TEXT PRIMARY KEY, v TEXT NOT NULL)');
+    return sqliteUnitDatabase(sqlite) as Facade;
+  }
+
+  it('reports success, results and the changed-row count from run()', async () => {
+    const db = openFacade();
+    expect(
+      await db
+        .prepare('INSERT INTO t (k, v) VALUES (?, ?)')
+        .bind('a', 'one')
+        .run(),
+    ).toEqual({ success: true, results: [], meta: { changes: 1 } });
+    expect(
+      await db.prepare('SELECT v FROM t WHERE k = ?').bind('a').first('v'),
+    ).toBe('one');
+    expect(
+      await db.prepare('SELECT v FROM t WHERE k = ?').bind('zz').first(),
+    ).toBeNull();
+  });
+
+  it('commits a batch as one transaction and rolls all of it back on a failure', async () => {
+    const db = openFacade();
+    await db.batch([
+      db.prepare('INSERT INTO t (k, v) VALUES (?, ?)').bind('a', 'one'),
+      db.prepare('INSERT INTO t (k, v) VALUES (?, ?)').bind('b', 'two'),
+    ]);
+    expect(await db.prepare('SELECT count(*) AS n FROM t').first('n')).toBe(2);
+
+    await expect(
+      db.batch([
+        db.prepare('INSERT INTO t (k, v) VALUES (?, ?)').bind('c', 'three'),
+        db.prepare('INSERT INTO t (k, v) VALUES (?, ?)').bind('a', 'dup'),
+      ]),
+    ).rejects.toThrow();
+    expect(await db.prepare('SELECT count(*) AS n FROM t').first('n')).toBe(2);
+  });
+});
 
 describe('showcase worker fetch(): auth composition', () => {
   it('abandons run approvals once and accepts a cleanup replay', async () => {

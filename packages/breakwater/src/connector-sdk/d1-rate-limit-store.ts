@@ -12,7 +12,7 @@
 // D1IdempotencyStore: tests back the interface with node:sqlite, Workers
 // pass env.DB.
 
-import type { RateLimitStore } from './index.js';
+import type { RateLimitStore } from './contracts.js';
 
 /** The subset of D1Database this store uses. */
 export interface RateLimitDatabase {
