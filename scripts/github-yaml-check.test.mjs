@@ -1,18 +1,24 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import {
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { afterEach, test } from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { parse } from 'yaml';
 import {
   checkGithubYamlFiles,
   runGithubYamlCheck,
 } from './github-yaml-check.mjs';
+
+const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 const temporaryDirectories = [];
 
@@ -41,6 +47,28 @@ function captureRun(githubDirectory) {
     stdout: { write: (chunk) => (stdout += chunk) },
   });
   return { exitCode, stderr, stdout };
+}
+
+// The assertion is read out of the tracked workflow, not restated here, so the
+// case evaluates what ships rather than a copy of it.
+function verifyGateScript() {
+  const workflow = parse(
+    readFileSync(join(repositoryRoot, '.github/workflows/ci.yml'), 'utf8'),
+  );
+  const steps = workflow.jobs.verify.steps.filter((step) => 'run' in step);
+  assert.equal(steps.length, 1, 'the verify gate job has one run step');
+  return steps[0].run;
+}
+
+function runVerifyGate(script, needs) {
+  return spawnSync('bash', ['-e', '-c', script], {
+    encoding: 'utf8',
+    env: { ...process.env, NEEDS: JSON.stringify(needs) },
+  });
+}
+
+function resultListing(needs) {
+  return Object.entries(needs).map(([job, { result }]) => `${job}: ${result}`);
 }
 
 test('counts a valid YAML mapping', () => {
@@ -363,4 +391,47 @@ test('prints parser warnings without failing the run', () => {
     ),
   );
   assert.equal(run.stdout, 'GitHub YAML check passed (1 files).\n');
+});
+
+test('the ci.yml gate rejects an empty or non-success needs context', (t) => {
+  if (spawnSync('jq', ['--version']).status !== 0) {
+    t.skip('jq is not on PATH, so the gate assertion cannot be evaluated');
+    return;
+  }
+
+  const script = verifyGateScript();
+  const cases = [
+    { needs: {}, succeeds: false },
+    {
+      needs: {
+        'verify-core': { result: 'success' },
+        'direct-scenario': { result: 'success' },
+      },
+      succeeds: true,
+    },
+    ...['failure', 'cancelled', 'skipped'].map((result) => ({
+      needs: {
+        'verify-core': { result: 'success' },
+        'direct-scenario': { result },
+      },
+      succeeds: false,
+    })),
+  ];
+
+  for (const { needs, succeeds } of cases) {
+    const label = JSON.stringify(needs);
+    const run = runVerifyGate(script, needs);
+
+    assert.equal(run.error, undefined, label);
+    if (succeeds) {
+      assert.equal(run.status, 0, label);
+    } else {
+      assert.ok(run.status > 0, label);
+    }
+    assert.deepEqual(
+      run.stdout.split('\n').filter((line) => line !== ''),
+      resultListing(needs),
+      label,
+    );
+  }
 });

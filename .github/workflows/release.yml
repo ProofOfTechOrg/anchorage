@@ -67,10 +67,11 @@ jobs:
         run: pnpm build
 
       # ci.yml runs this too, but ci.yml and this workflow start CONCURRENTLY on
-      # a push to main and main requires no status check, so a red CI cannot
-      # stop a publish. Repeating it here fails in this job, before the publish
-      # step, on this checkout. It is fully offline and adds no new dependency, but
-      # it runs each prerequisite's prepack build, so it is not free.
+      # a push to main, and `verify` is the required check on a pull request
+      # into main, not on a push to it, so a red CI cannot stop a publish.
+      # Repeating it here fails in this job, before the publish step, on this
+      # checkout. It is fully offline and adds no new dependency, but it runs
+      # each prerequisite's prepack build, so it is not free.
       - name: Verify release publish invocation
         run: pnpm test:release-invocation
 
