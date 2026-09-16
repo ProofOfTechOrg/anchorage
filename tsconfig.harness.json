@@ -6,6 +6,7 @@
   },
   "include": [
     "packages/breakwater/worker-tests/**/*.ts",
+    "packages/fleet-control/vitest.direct-scenario.config.ts",
     "packages/flowsafe/src/cloudflare-fidelity.workerd.test.ts",
     "packages/flowsafe/test-support/cloudflare-test-worker.ts",
     "packages/flowsafe/test-support/harness-probe.ts",
@@ -14,6 +15,7 @@
     "vitest.config.ts",
     "vitest.breakwater-workers.config.mts",
     "vitest.flowsafe-harness.config.ts",
-    "vitest.flowsafe-workers.config.ts"
+    "vitest.flowsafe-workers.config.ts",
+    "vitest.workerd-lifecycle.config.ts"
   ]
 }

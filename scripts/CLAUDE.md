@@ -32,7 +32,7 @@ Repository documentation, architecture, and publication checks. Markdown syntax 
 
 Run a recorder manually with an explicit mode. Use `--check` to compare derived values without writing, or `--write` to replace the configured baseline and format it with Biome. Missing, unknown, or conflicting modes return status 2.
 
-`--check` compares configured exports. It does not establish refusal-guard coverage; retain the ordinary guard tests and architecture checks alongside the golden assertions.
+`--check` compares the exports a recorder's `exports` declarations name: each declaration selects one export from the committed generated module and the derived value it is compared with. An export the committed module holds without a matching declaration is compared against nothing. `--check` does not establish refusal-guard coverage; retain the ordinary guard tests and architecture checks alongside the golden assertions.
 
 Run these checks before accepting a generated-file change:
 

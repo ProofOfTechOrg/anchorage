@@ -367,6 +367,9 @@ async function main(config, argv) {
     );
     return 1;
   }
+  // `config.exports` drives the comparison: each declaration selects one
+  // committed export by `name` and its derived counterpart by `key`, so a
+  // committed export with no matching declaration is compared against nothing.
   const committed = await import(pathToFileURL(baselineFilePath).href);
   const differences = config.exports.flatMap((declaration) =>
     structuralDifferences(

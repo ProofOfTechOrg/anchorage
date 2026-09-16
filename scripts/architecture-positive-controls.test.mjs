@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { existsSync, globSync, readdirSync, readFileSync } from 'node:fs';
 import { builtinModules, createRequire, isBuiltin } from 'node:module';
-import { relative } from 'node:path';
+import { join, relative } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
@@ -376,6 +377,108 @@ test('every extra cruise entry is keyed by an architecture rule', () => {
     assert.ok(
       ruleNames.has(ruleName),
       `extraEntries names '${ruleName}', which is not an architecture rule`,
+    );
+  }
+});
+
+// Membership is resolved by parsing the config sources: loading the projects
+// through vitest would pull the Workers pool and workerd into this process.
+test('every root vitest project resolves the files it declares', () => {
+  const fleetRequire = createRequire(
+    new URL('../packages/fleet-control/package.json', import.meta.url),
+  );
+  const ts = fleetRequire('typescript');
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const parse = (configPath) => {
+    const fileName = join(root, configPath);
+    return ts.createSourceFile(
+      fileName,
+      readFileSync(fileName, 'utf8'),
+      ts.ScriptTarget.Latest,
+      true,
+    );
+  };
+  const initializerOf = (source, property, configPath) => {
+    const found = [];
+    const visit = (node) => {
+      if (
+        ts.isPropertyAssignment(node) &&
+        ts.isIdentifier(node.name) &&
+        node.name.text === property
+      ) {
+        found.push(node.initializer);
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(source);
+    assert.equal(found.length, 1, `${configPath} sets '${property}' once`);
+    return found[0];
+  };
+  const stringsOf = (source, property, configPath) => {
+    const initializer = initializerOf(source, property, configPath);
+    assert.ok(
+      ts.isArrayLiteralExpression(initializer),
+      `${configPath} sets '${property}' to an array literal`,
+    );
+    return initializer.elements
+      .filter((element) => ts.isStringLiteralLike(element))
+      .map((element) => element.text);
+  };
+
+  const entries = stringsOf(
+    parse('vitest.config.ts'),
+    'projects',
+    'vitest.config.ts',
+  );
+  const resolved = new Set();
+  for (const entry of entries) {
+    const matches = globSync(entry, { cwd: root });
+    assert.ok(matches.length > 0, `root project '${entry}' resolves no file`);
+    for (const match of matches) {
+      resolved.add(match.split('\\').join('/'));
+    }
+  }
+  const packageProjects = readdirSync(join(root, 'packages'), {
+    withFileTypes: true,
+  })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => `packages/${entry.name}/vitest.config.ts`)
+    .filter((configPath) => existsSync(join(root, configPath)));
+  assert.deepEqual(
+    [...resolved].sort(),
+    [
+      ...packageProjects,
+      'packages/fleet-control/vitest.direct-scenario.config.ts',
+      'vitest.breakwater-workers.config.mts',
+      'vitest.flowsafe-harness.config.ts',
+      'vitest.flowsafe-workers.config.ts',
+      'vitest.workerd-lifecycle.config.ts',
+    ].sort(),
+  );
+
+  const directPath = 'packages/fleet-control/vitest.direct-scenario.config.ts';
+  const direct = parse(directPath);
+  const projectName = initializerOf(direct, 'name', directPath);
+  assert.ok(
+    ts.isStringLiteralLike(projectName),
+    `${directPath} names its project with a string literal`,
+  );
+  assert.equal(projectName.text, 'fleet-control-direct-scenario');
+  const directInclude = stringsOf(direct, 'include', directPath);
+  const packageExclude = stringsOf(
+    parse('packages/fleet-control/vitest.config.ts'),
+    'exclude',
+    'packages/fleet-control/vitest.config.ts',
+  );
+  assert.ok(directInclude.length > 0, `${directPath} includes no file`);
+  for (const entry of directInclude) {
+    assert.ok(
+      globSync(entry, { cwd: join(root, 'packages/fleet-control') }).length > 0,
+      `fleet-control-direct-scenario include '${entry}' resolves no file`,
+    );
+    assert.ok(
+      packageExclude.includes(entry),
+      `the package project does not exclude '${entry}'`,
     );
   }
 });
