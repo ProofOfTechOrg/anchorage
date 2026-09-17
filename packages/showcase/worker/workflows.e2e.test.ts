@@ -276,7 +276,10 @@ describe('product-launch: two approval gates re-queued through host-kit', () => 
       expect.objectContaining({
         resource: DEPLOY_CONNECTOR,
         decision: 'allowed',
-        detail: expect.objectContaining({ dryRun: true }),
+        detail: expect.objectContaining({
+          dryRun: true,
+          egressEnforcement: 'declaration-only',
+        }),
       }),
     );
 
@@ -375,10 +378,12 @@ describe('access-request: gated grant with cross-workflow isolation', () => {
       granted: true,
       resource: 'prod-database',
     });
+    // #then — the grant connector's declared 'enforced' posture reaches audit
     expect(harness.audit.events()).toContainEqual(
       expect.objectContaining({
         resource: ACCESS_CONNECTOR,
         decision: 'allowed',
+        detail: expect.objectContaining({ egressEnforcement: 'enforced' }),
       }),
     );
   });

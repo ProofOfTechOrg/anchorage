@@ -1036,7 +1036,6 @@ async function handleNotificationDispatch(options: {
   }
 
   assertNotificationSourceKeysPatched();
-  await assertNotificationDeliveryPolicyPatched();
   const deliveryStorage = captureNotificationDeliveryStorage(options.storage);
   const selections: ReturnType<typeof captureNotificationDeliverySelection>[] =
     [];

@@ -566,6 +566,27 @@ describe('singleTenantConnectorPolicies', () => {
     ).toThrow(/single-tenant preset audit\.record changed/);
   });
 
+  it('reads the preset audit member once', () => {
+    const complete = singleTenantConnectorPolicies(productionOptions());
+    const baselineAudit = complete.audit;
+    const changing = { ...complete } as Record<PropertyKey, unknown>;
+    let reads = 0;
+    Object.defineProperty(changing, 'audit', {
+      enumerable: true,
+      get: () => (reads++ === 0 ? baselineAudit : { record: () => undefined }),
+    });
+
+    createConnector({
+      id: 'records.audit-read-once',
+      description: 'Read one record',
+      permissions: { sideEffect: 'read' },
+      policies: changing as never,
+      execute: async () => ({ ok: true }),
+    });
+
+    expect(reads).toBe(1);
+  });
+
   it('uses the frozen evaluator snapshot after a changing accessor', async () => {
     const complete = singleTenantConnectorPolicies({
       audit: { mode: 'development', allowUnaudited: true },

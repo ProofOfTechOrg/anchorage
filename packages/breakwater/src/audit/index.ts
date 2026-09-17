@@ -52,16 +52,30 @@ export interface AgentAuditContext {
   delegatedBy?: string;
 }
 
-const AGENT_AUDIT_OPTIONAL_FIELDS = [
-  'tenantId',
-  'runId',
-  'threadId',
-  'resourceId',
-  'principalKind',
-  'principalId',
-  'purpose',
-  'delegatedBy',
-] as const;
+// `agentId` and `entryPath` are required and read by name below; the rest are
+// what the copy loop walks.
+type AgentAuditOptionalField = Exclude<
+  keyof AgentAuditContext,
+  'agentId' | 'entryPath'
+>;
+
+// Exhaustive over those members: one the interface gains is a missing property
+// here, one it drops an excess property. `Object.keys` preserves the literal's
+// insertion order, which is the order the copy below writes the fields in.
+const AGENT_AUDIT_OPTIONAL_FIELD_SET: Record<AgentAuditOptionalField, true> = {
+  tenantId: true,
+  runId: true,
+  threadId: true,
+  resourceId: true,
+  principalKind: true,
+  principalId: true,
+  purpose: true,
+  delegatedBy: true,
+};
+
+const AGENT_AUDIT_OPTIONAL_FIELDS = Object.keys(
+  AGENT_AUDIT_OPTIONAL_FIELD_SET,
+) as AgentAuditOptionalField[];
 
 /**
  * Read only the documented scalar fields from trusted request context.

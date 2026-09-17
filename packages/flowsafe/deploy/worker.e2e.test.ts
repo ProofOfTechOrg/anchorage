@@ -909,11 +909,10 @@ describe('deploy worker alarm-owned maintenance duties', () => {
     const surfaces = errorSpy.mock.calls
       .map(([line]) => String(line))
       .filter((line) => line.includes('maintenance-error'));
-    // Every surface assertion in this describe names the cause its case
-    // injected, not just the surface: a fixture-shaped failure — a context with
-    // no cursor callback, a table the fixture never created — reaches the same
-    // surface, and a bare surface check passes while the isolation under test
-    // was never exercised.
+    // The assertion below names the cause this case injected, not just the
+    // surface: a fixture-shaped failure — a context with no cursor callback, a
+    // table the fixture never created — reaches the same surface, and a bare
+    // surface check passes while the isolation under test was never exercised.
     expect(
       surfaces.some(
         (line) =>
@@ -1066,7 +1065,7 @@ describe('deploy worker alarm-owned maintenance duties', () => {
 
   it('gives each maintenance invocation its own retention cursor', async () => {
     // #given — a stale terminal snapshot for the purge to reclaim, and two
-    // contexts built the way every call site in this file builds one
+    // independent contexts from retentionContext()
     const { env, sqlite } = makeEnv();
     createSnapshotTable(sqlite);
     seedRun(sqlite, {
@@ -1083,9 +1082,7 @@ describe('deploy worker alarm-owned maintenance duties', () => {
     await maintenanceWorker.runMaintenanceDuty('purge', env, driven);
 
     // #then — the purge advanced a cursor, it is readable on the context that
-    // duty was given, and it reached no other. A module-level context shared by
-    // every call site here would hand the next invocation this one's cursor,
-    // and every other case in this file would still pass.
+    // duty was given, and it reached no other.
     expect(remainingRunIds(sqlite)).toEqual([]);
     expect(driven.retentionCursor).toMatchObject({ version: 1 });
     expect(sibling.retentionCursor).toBeUndefined();

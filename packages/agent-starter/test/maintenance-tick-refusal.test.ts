@@ -57,8 +57,10 @@ const mocks = vi.hoisted(() => {
       (
         _options: NotificationDispatchTickOptions,
       ): (() => Promise<NotificationDispatchTickResult>) => {
+        // Stands in for an unpatched core's refusal. It does not copy the
+        // sentence flowsafe emits; PATCH_MESSAGE is what the cases match.
         throw new TypeError(
-          'notification dispatch requires the @mastra/core patch flowsafe ships; apply it at the application root (getting started: "Apply the flowsafe patch to @mastra/core")',
+          'mocked unpatched core: Apply the flowsafe patch to @mastra/core',
         );
       },
     ),

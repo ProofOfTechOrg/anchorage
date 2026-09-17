@@ -195,6 +195,12 @@ function defineWorkflows(env: Env): RunnerRuntime {
     permissions: {
       sideEffect: 'write',
       requiresApproval: true,
+      // A connector a host copies into a deployment states the posture it runs
+      // under, and this template is that copy. A fixture whose subject is
+      // something else omits the field and takes connectorEgressPosture's
+      // 'declaration-only' default instead. The line is what the connector
+      // stands for, not production versus test — examples/gtm-outbound.e2e.test.ts
+      // declares it from a test file for the same reason.
       egressEnforcement: 'enforced',
     },
     execute: async () => ({ published: true }),

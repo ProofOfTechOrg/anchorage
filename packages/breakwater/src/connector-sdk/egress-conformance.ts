@@ -24,6 +24,7 @@ import type {
   PermissionManifest,
 } from './contracts.js';
 import type { EgressFetchBase, EgressResponse } from './egress-fetch.js';
+import { resolveEgressPosture } from './egress-posture.js';
 
 export interface ConnectorConformanceCase<TInput = unknown> {
   readonly name: string;
@@ -250,11 +251,6 @@ const refuseRun = (findings: readonly ConnectorConformanceFinding[]): never => {
     findings,
     limit: CONFORMANCE_LIMIT,
   });
-};
-
-/** Refuse with the report the run built, its findings and limit already on it. */
-const refuseReport = (report: ConnectorConformanceReport): never => {
-  throw new ConnectorConformanceError(report);
 };
 
 /**
@@ -600,10 +596,7 @@ function manifestsMatch(
             left.every((value, index) => Object.is(value, right[index]));
     }
     if (key === 'egressEnforcement') {
-      return (
-        (claimed[key] ?? 'declaration-only') ===
-        (registered[key] ?? 'declaration-only')
-      );
+      return resolveEgressPosture(claimed) === resolveEgressPosture(registered);
     }
     return Object.is(claimed[key] ?? undefined, registered[key] ?? undefined);
   });
@@ -648,11 +641,10 @@ function describeDescriptor(d: PropertyDescriptor | undefined): string {
 }
 
 /**
- * The vocabulary for a value a consumer's own code threw, where the message or
- * the string form is the diagnostic: `FACTORY_FAILED` and the two
- * instrumentation findings. A function is described by type instead, because
- * its string form is its source text. `describeValue` is the other vocabulary,
- * for a value the subject threw.
+ * The vocabulary for a value a consumer's own code threw: the error's message
+ * where it reads as one, otherwise the value's own string form. A function is
+ * described by type instead, because its string form is its source text.
+ * `describeValue` is the other vocabulary, for a value the subject threw.
  */
 function errorMessage(error: unknown): string {
   try {
@@ -728,9 +720,9 @@ function invocationFailureReason(error: unknown): string {
 }
 
 /**
- * The vocabulary for a value the SUBJECT threw or returned, where the type is
- * the whole diagnostic: `CASE_INVOCATION_FAILED`, `SUBJECT_UNREGISTERED`, and
- * the function arm of `errorMessage`. It copies no byte of the value.
+ * The vocabulary for a value the SUBJECT threw or returned: its type, and
+ * nothing of the value itself. A reason built from it carries no byte the
+ * subject supplied.
  */
 function describeValue(value: unknown): string {
   if (value === undefined) return 'undefined';
@@ -761,9 +753,9 @@ function verifyEntries(
     const { target, property, label, trap: installedTrap } = entry;
     let shape: string;
     let difference = 'descriptor differs from the one the harness installed';
-    // Empty where the descriptor answers whether the trap kept serving calls,
-    // and the answer is yes. The other two answers are stated, so silence here
-    // never has to carry one of them.
+    // Empty where a data property still holds the installed trap, so calls
+    // kept reaching it, and on the catch arm, where neither the descriptor nor
+    // the effective value could be read.
     let calls = '';
     try {
       const descriptor = Object.getOwnPropertyDescriptor(target, property);
@@ -781,6 +773,10 @@ function verifyEntries(
         // about what a call after the replacement reached, and the harness does
         // not invoke a consumer's getter to find out.
         calls = CALLS_UNCHECKED;
+      } else {
+        // The entry point is gone, so a read after the replacement resolves
+        // through the prototype chain or to undefined, and not to the trap.
+        calls = CALLS_UNOBSERVED;
       }
     } catch {
       difference = 'descriptor or effective value could not be verified';
@@ -970,9 +966,9 @@ function escapeFinding(
 ): ConnectorConformanceFinding {
   return {
     code: 'NETWORK_IO_OUTSIDE_RUNTIME_FETCH',
-    // A call on the supplied base transport went through the harness, not
-    // around it: what the transport refused is a host its registered egress
-    // declaration does not cover. A call on any other entry point reached an
+    // A call the supplied base transport refused reached the harness's own
+    // transport rather than going around it; CONNECTORS.md states the
+    // conditions it refuses on. A call on any other entry point reached an
     // instrument the connector was not given, which is the bypass.
     reason:
       attempt.entryPoint === POLICIES_FETCH_LABEL
@@ -1012,11 +1008,10 @@ function registrySubject(value: unknown): object | undefined {
     : undefined;
 }
 
-/** What a case proved, and the measurements the classification read. */
+/** What a case proved, and the hosts the classification read. */
 interface CaseObservation {
   readonly proved: ConnectorConformanceCaseResult['proved'];
   readonly guardedHosts: readonly string[];
-  readonly decisionCodes: readonly (ConnectorDecisionCode | undefined)[];
 }
 
 /** Everything an eligible case measured, as the classification reads it. */
@@ -1025,10 +1020,6 @@ interface CaseEvidence {
   /** The registered egress declaration, read once for the run. */
   readonly declaredEgress: readonly string[];
   readonly escapes: readonly ConnectorConformanceEscape[];
-  readonly auditEvents: readonly {
-    readonly event: AuditEvent;
-    readonly inWindow: boolean;
-  }[];
   readonly witnesses: readonly AuditEvent[];
   readonly transportCalls: number;
   readonly transportHosts: readonly string[];
@@ -1046,9 +1037,6 @@ function observeCase(
   record: RecordFinding,
 ): CaseObservation {
   const guardedHosts = [...new Set(evidence.transportHosts)];
-  const decisionCodes = evidence.auditEvents
-    .filter((e) => e.inWindow)
-    .map((e) => e.event.decisionCode);
   // A value whose classification cannot be read is by definition none of the
   // three known kinds, so it takes the foreign branch.
   const invocationKind = classifyInvocationError(evidence.invocation?.thrown);
@@ -1091,7 +1079,7 @@ function observeCase(
       reason:
         "the case produced no audit event because the connector's gate boundary was never reached; a pre-boundary refusal is not expressible by any expectation and belongs in an ordinary connector test",
     });
-    return { proved: 'nothing', guardedHosts, decisionCodes };
+    return { proved: 'nothing', guardedHosts };
   }
   const proved = evidence.witnesses.some(
     (event) =>
@@ -1122,7 +1110,7 @@ function observeCase(
       reason: `case expected ${expected.outcome} but proved ${proved}, or its required hosts or code were not observed`,
     });
   }
-  return { proved, guardedHosts, decisionCodes };
+  return { proved, guardedHosts };
 }
 
 export function createConformanceAssertion(collaborators: {
@@ -1484,33 +1472,35 @@ export function createConformanceAssertion(collaborators: {
             const witnesses = caseAuditEvents
               .filter(isWitness)
               .map((e) => e.event);
+            const decisionCodes = caseAuditEvents
+              .filter((e) => e.inWindow)
+              .map((e) => e.event.decisionCode);
             const transportCalls = caseTransport?.calls() ?? 0;
             // An invocation failure under a replaced instrument or a timeout
             // raises no CASE_INVOCATION_FAILED of its own: the case is
             // ineligible, and the INSTRUMENTATION_REPLACED or CASE_TIMEOUT
             // finding beside it is why it proves nothing.
-            const observation: CaseObservation =
-              invoked && !timedOut && instrumentationIntact
-                ? observeCase(
-                    {
-                      expect: c.expect,
-                      declaredEgress,
-                      escapes: caseEscapes,
-                      auditEvents: caseAuditEvents,
-                      witnesses,
-                      transportCalls,
-                      transportHosts: caseTransport?.hosts() ?? [],
-                      invocation,
-                    },
-                    recordCase,
-                  )
-                : { proved: 'nothing', guardedHosts: [], decisionCodes: [] };
+            const eligible = invoked && !timedOut && instrumentationIntact;
+            const observation: CaseObservation = eligible
+              ? observeCase(
+                  {
+                    expect: c.expect,
+                    declaredEgress,
+                    escapes: caseEscapes,
+                    witnesses,
+                    transportCalls,
+                    transportHosts: caseTransport?.hosts() ?? [],
+                    invocation,
+                  },
+                  recordCase,
+                )
+              : { proved: 'nothing', guardedHosts: [] };
             cases.push({
               name: caseName,
               proved: observation.proved,
               guardedHosts: observation.guardedHosts,
               escapes: caseEscapes,
-              decisionCodes: observation.decisionCodes,
+              decisionCodes: eligible ? decisionCodes : [],
               transportCalls,
               auditEvents: witnesses.length,
               findings: [...caseFindings],
@@ -1563,7 +1553,7 @@ export function createConformanceAssertion(collaborators: {
       findings: runFindings,
       limit: CONFORMANCE_LIMIT,
     };
-    if (!report.conformant) refuseReport(report);
+    if (!report.conformant) throw new ConnectorConformanceError(report);
     return report;
   };
 }

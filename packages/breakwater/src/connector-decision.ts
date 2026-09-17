@@ -354,11 +354,13 @@ export function connectorErrorDecision(
  * trap answers with a throw; a value that cannot say what it is, is not the
  * constructor asked about.
  *
- * The test for reaching for it: the operand is a value the SDK did not
- * construct, and the answer can reach a conformance report. An operand the SDK
- * built — every `validateOutput` failure, a `Promise` the SDK awaits, a store
- * the caller passed to the constructor — carries no trap and takes a bare
- * `instanceof`. Where the answer is a classification over several constructors,
+ * The test for reaching for it: the operand came from the connector — a value
+ * it returned or threw — rather than from the host or from the SDK. A
+ * `validateOutput` failure, a `Promise` the SDK awaits and a store the caller
+ * passed to the constructor sit on the trusted side and take a bare
+ * `instanceof`. An enclosing `try` that already covers the read guards it too,
+ * which is what a bare `instanceof` on a connector's thrown value inside one
+ * relies on. Where the answer is a classification over several constructors,
  * one guarded classification covers them all.
  *
  * @internal

@@ -59,7 +59,7 @@ export const accessRequestModule: WorkflowModule<ShowcaseModuleDeps> = {
       permissions: {
         sideEffect: 'write',
         // execute logs the grant and returns; no HTTP request leaves this
-        // connector, so none goes around runtime.fetch.
+        // connector.
         egressEnforcement: 'enforced',
         requiresApproval: true,
       },

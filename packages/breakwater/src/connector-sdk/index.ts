@@ -70,6 +70,7 @@ import {
   EgressGuardError,
   egressFetch,
 } from './egress-fetch.js';
+import { resolveEgressPosture } from './egress-posture.js';
 import {
   idempotencyStorageKey,
   isAmbiguousLegacyIdempotencyIdentity,
@@ -546,14 +547,6 @@ export function connectorManifest(
   return manifests.get(tool);
 }
 
-// Resolves the omitted-field default for both the readback below and the value
-// createConnector gates on and audits, so the two cannot drift apart.
-function resolveEgressPosture(
-  manifest: PermissionManifest,
-): ConnectorEgressPosture {
-  return manifest.egressEnforcement ?? 'declaration-only';
-}
-
 /** Resolved egress posture; `undefined` for a tool createConnector did not build. */
 export function connectorEgressPosture(
   tool: object,
@@ -926,14 +919,18 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
   // the outer Mastra schema remains separately fingerprinted for direct calls.
   const outputStandard = outputValidator?.['~standard'];
   const outputValidate = outputStandard?.validate;
-  if (manifest.idempotencyKey && !policies.idempotencyStore) {
+  const store = policies.idempotencyStore;
+  if (manifest.idempotencyKey && !store) {
     throw new TypeError(
       `connector ${id}: permissions.idempotencyKey requires policies.idempotencyStore (InMemoryIdempotencyStore works for dev/tests)`,
     );
   }
+  // Sampled once here; the execute path and the legacy migrator read it again
+  // per call, which is why this read is not shared with them.
+  const declaredKeyMigration = policies.idempotencyKeyMigration;
   if (
-    policies.idempotencyKeyMigration !== undefined &&
-    policies.idempotencyKeyMigration !== 'legacy-writers-drained'
+    declaredKeyMigration !== undefined &&
+    declaredKeyMigration !== 'legacy-writers-drained'
   ) {
     throw new TypeError(
       `connector ${id}: policies.idempotencyKeyMigration must be 'legacy-writers-drained' when provided`,
@@ -977,19 +974,21 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     manifest.rateLimit !== undefined
       ? parseRateLimit(id, manifest.rateLimit)
       : undefined;
-  if (rateLimitSpec && !policies.rateLimitStore) {
+  const rateLimitStore = rateLimitSpec ? policies.rateLimitStore : undefined;
+  if (rateLimitSpec && !rateLimitStore) {
     throw new TypeError(
       `connector ${id}: permissions.rateLimit requires policies.rateLimitStore (InMemoryRateLimitStore works for dev/tests)`,
     );
   }
   const rateLimit =
-    rateLimitSpec && policies.rateLimitStore
-      ? { ...rateLimitSpec, store: policies.rateLimitStore }
+    rateLimitSpec && rateLimitStore
+      ? { ...rateLimitSpec, store: rateLimitStore }
       : undefined;
 
   const auditRecord = validatedPolicies.auditRecord;
+  const networkEgressPolicy = policies.networkEgress;
   const gates: readonly ToolPolicyEvaluator[] = [
-    ...(policies.networkEgress ? [networkEgress(policies.networkEgress)] : []),
+    ...(networkEgressPolicy ? [networkEgress(networkEgressPolicy)] : []),
     ...(policies.evaluators ?? []),
   ];
   const needsApproval = approvalRequired(
@@ -997,7 +996,6 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     manifest,
     policies.writePermissions,
   );
-  const store = policies.idempotencyStore;
   if (
     manifest.idempotencyKey &&
     store &&

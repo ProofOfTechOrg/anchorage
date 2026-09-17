@@ -16,6 +16,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ThreadScope } from '../do-runner/index.js';
 import {
   assertNotificationDeliveryPolicyPatched,
+  assertNotificationSourceKeysPatched,
   createNotificationDispatchTick,
   type NotificationDispatchTickOptions,
 } from './notification-dispatch.js';
@@ -24,11 +25,11 @@ import { createThreadSignalRoutes } from './thread-do-routes.js';
 // The module shape both mock registrations build: `summarizeNotifications`
 // unpatched, or patched for the delivery-policy case, which reaches the
 // asynchronous probe only when the synchronous one passes.
-const unpatchedNotifications = vi.hoisted(
+const coreWithUnpatchedDeliveryPolicy = vi.hoisted(
   () =>
     (
       actual: typeof import('@mastra/core/notifications'),
-      patchedAccumulator: boolean,
+      { patchedAccumulator }: { patchedAccumulator: boolean },
     ) => {
       const normalize = (
         decision: NotificationDeliveryPolicyDecision,
@@ -77,20 +78,24 @@ const unpatchedNotifications = vi.hoisted(
 );
 
 vi.mock('@mastra/core/notifications', async (importOriginal) =>
-  unpatchedNotifications(
+  coreWithUnpatchedDeliveryPolicy(
     await importOriginal<typeof import('@mastra/core/notifications')>(),
-    false,
+    { patchedAccumulator: false },
   ),
 );
 
 // Vitest caches a factory's result per registration, so a case that needs the
 // other accumulator registers its own factory rather than resetting modules
 // around a switch the cached result would keep ignoring.
-const mockNotifications = (patchedAccumulator: boolean): void => {
+const mockNotifications = ({
+  patchedAccumulator,
+}: {
+  patchedAccumulator: boolean;
+}): void => {
   vi.doMock('@mastra/core/notifications', async (importOriginal) =>
-    unpatchedNotifications(
+    coreWithUnpatchedDeliveryPolicy(
       await importOriginal<typeof import('@mastra/core/notifications')>(),
-      patchedAccumulator,
+      { patchedAccumulator },
     ),
   );
   vi.resetModules();
@@ -151,6 +156,16 @@ async function withCapturedErrors(
     console.error = consoleError;
   }
   return { response, logged };
+}
+
+/** The message an emitted refusal carries, for a byte-exact pin. */
+async function refusalMessage(refuse: () => unknown): Promise<string> {
+  try {
+    await refuse();
+  } catch (error) {
+    return String((error as Error).message);
+  }
+  throw new Error('the probe under test did not refuse');
 }
 
 describe('notification dispatch against an unpatched @mastra/core', () => {
@@ -242,12 +257,21 @@ describe('notification dispatch against an unpatched @mastra/core', () => {
       PATCH_MESSAGE,
     );
   });
+
+  it('emits each refusal composed from the shared citation, byte for byte', async () => {
+    expect(await refusalMessage(assertNotificationSourceKeysPatched)).toBe(
+      'notification dispatch requires the @mastra/core patch flowsafe ships; apply it at the application root (getting started: "Apply the flowsafe patch to @mastra/core")',
+    );
+    expect(await refusalMessage(assertNotificationDeliveryPolicyPatched)).toBe(
+      'notification ingestion requires the @mastra/core patch flowsafe ships; apply it at the application root (getting started: "Apply the flowsafe patch to @mastra/core")',
+    );
+  });
 });
 
 describe('notification ingestion against a core patched for summaries alone', () => {
   it("refuses without reaching core's sender", async () => {
     const sendNotificationSignal = vi.fn();
-    mockNotifications(true);
+    mockNotifications({ patchedAccumulator: true });
     try {
       // Both probes memoize per module instance, and the instance the cases
       // above hold has recorded the summary half as unpatched, so this case
@@ -283,7 +307,7 @@ describe('notification ingestion against a core patched for summaries alone', ()
       expect(logged.some((line) => PATCH_MESSAGE.test(line))).toBe(true);
       expect(sendNotificationSignal).not.toHaveBeenCalled();
     } finally {
-      mockNotifications(false);
+      mockNotifications({ patchedAccumulator: false });
     }
   });
 });

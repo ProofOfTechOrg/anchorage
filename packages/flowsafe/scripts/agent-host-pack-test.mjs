@@ -471,7 +471,7 @@ register('./graph-loader.mjs', import.meta.url);
     'run-provenance',
   ]) {
     const declaration = readFileSync(
-      join(packageDirectory, 'dist', 'do-runner', `${leaf}.d.ts`),
+      join(packageDirectory, 'dist', `do-runner/${leaf}.d.ts`),
       'utf8',
     );
     assert.doesNotMatch(
@@ -1169,28 +1169,54 @@ void [legacyContext, epochContext, legacyScope, epochScope, legacyInput, epochIn
   // declarations it resolves, so the deadline entries' declaration axis is
   // pinned here the way the loader probe pins their runtime axis: each entry
   // declares one module, and the module they share reaches the runner through
-  // the single type-only import its exported projections need.
-  const packedDeclarationSpecifiers = (fileName) => {
+  // the single type-only import its exported projections need. The argument is
+  // a `dist`-relative path, so an entry outside `do-runner` takes the same pin.
+  // Each pattern is one line form a declaration states an edge in — a `from`
+  // clause on an import or a re-export, a side-effect import, a dynamic
+  // import, a module augmentation, a triple-slash reference. A form missing
+  // from this list is an edge the pins below cannot see.
+  const declarationEdgePatterns = [
+    /\bfrom\s*['"]([^'"]+)['"]\s*;?\s*$/,
+    /^\s*import\s*['"]([^'"]+)['"]\s*;?\s*$/,
+    /\bimport\(\s*['"]([^'"]+)['"]\s*\)/,
+    /^\s*declare\s+module\s+['"]([^'"]+)['"]/,
+    /^\s*\/\/\/\s*<reference\s+(?:path|types|lib)\s*=\s*['"]([^'"]+)['"]/,
+  ];
+  const packedDeclarationSpecifiers = (distPath) => {
     const declaration = readFileSync(
-      join(packageDirectory, 'dist', 'do-runner', fileName),
+      join(packageDirectory, 'dist', distPath),
       'utf8',
     );
     return [
       ...new Set(
-        [...declaration.matchAll(/(?:from|import\()\s*['"]([^'"]+)['"]/g)].map(
-          (match) => match[1],
-        ),
+        declaration
+          .split('\n')
+          .flatMap((line) =>
+            declarationEdgePatterns
+              .map((pattern) => pattern.exec(line)?.[1])
+              .filter((specifier) => specifier !== undefined),
+          ),
       ),
     ].sort();
   };
-  assert.deepEqual(packedDeclarationSpecifiers('constants.d.ts'), [
+  assert.deepEqual(packedDeclarationSpecifiers('do-runner/constants.d.ts'), [
     './suspension-deadline.js',
   ]);
-  assert.deepEqual(packedDeclarationSpecifiers('testing.d.ts'), [
+  assert.deepEqual(packedDeclarationSpecifiers('do-runner/testing.d.ts'), [
     './suspension-deadline.js',
   ]);
-  assert.deepEqual(packedDeclarationSpecifiers('suspension-deadline.d.ts'), [
-    './runtime.js',
+  assert.deepEqual(
+    packedDeclarationSpecifiers('do-runner/suspension-deadline.d.ts'),
+    ['./runtime.js'],
+  );
+  // `./host-kit/module` carries the module-authoring contract on its own
+  // subpath: breakwater's AuditLogger reaches a module author through this
+  // declaration, and `host-kit-no-breakwater` keeps it out of host-kit's
+  // barrel. The pin is what makes that split observable in the packed tarball.
+  assert.deepEqual(packedDeclarationSpecifiers('host-kit/module.d.ts'), [
+    '../do-runner/index.js',
+    './workflow-meta.js',
+    '@proofoftech/breakwater',
   ]);
   writeFileSync(
     join(consumer, 'tsconfig.es2022.json'),
@@ -1359,7 +1385,7 @@ for (const name of ['claim', 'release', 'settleRun']) {
 }
 for (const api of [flowsafe, doRunner, hostKit]) assert.equal('rollbackFencedStart' in api, false);
 for (const api of [flowsafe, approvals, doRunner, hostKit, host, agentRunner, schedules, signals]) {
-  for (const name of ['captureActorContext', 'captureAgentStartAuthority', 'captureStartRunOptions', 'startAuthorities', 'AgentStartAuthority', 'executionFenceAdmissionValues', 'captureExecutionFenceAdmissionSchema', 'executionFenceAdmissionSql', 'AgentRunSelectorMismatchError', 'assertNotificationSourceKeysPatched', 'captureNotificationDeliveryObservation', 'captureNotificationDeliverySelection', 'captureNotificationDeliveryStorage', 'recordNotificationDeliveryFailure']) {
+  for (const name of ['captureActorContext', 'captureAgentStartAuthority', 'captureStartRunOptions', 'startAuthorities', 'AgentStartAuthority', 'executionFenceAdmissionValues', 'captureExecutionFenceAdmissionSchema', 'executionFenceAdmissionSql', 'AgentRunSelectorMismatchError', 'assertNotificationSourceKeysPatched', 'assertNotificationDeliveryPolicyPatched', 'captureNotificationDeliveryObservation', 'captureNotificationDeliverySelection', 'captureNotificationDeliveryStorage', 'recordNotificationDeliveryFailure']) {
     assert.equal(name in api, false, name);
   }
 }

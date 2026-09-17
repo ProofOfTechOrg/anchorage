@@ -2,11 +2,15 @@
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "noEmit": true,
+    // tsc enforces rootDir even under noEmit, so widen it to the repo root to
+    // admit vitest.config.ts, which sits beside this file rather than under
+    // src, into this (emit-free) program.
+    "rootDir": "../..",
     // Tests run under Node via vitest; vitest 4 no longer leaks timer globals
     // through its own types, so the test program needs Node's. The build
     // tsconfig deliberately stays types-free — the library is runtime-agnostic.
     "types": ["node"]
   },
-  "include": ["src"],
+  "include": ["src", "vitest.config.ts"],
   "exclude": []
 }

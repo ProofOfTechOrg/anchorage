@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-// Evaluator contract — the phase, channel, context and evaluator shapes a
-// policy is written against.
+// Evaluator contract — the declarations an evaluator module needs without
+// reaching the barrel that imports them back: the phase, channel, context and
+// evaluator shapes that cross that edge.
 //
 // A type-only leaf, so content-inspection.ts and any other evaluator module
-// take the contract without importing the barrel that imports them back.
+// take the contract without importing the barrel. That need is the criterion
+// for what moves here; a declaration the barrel alone consumes stays in the
+// barrel.
 
 import type { MastraDBMessage } from '@mastra/core/agent/message-list';
 import type { RequestContext } from '@mastra/core/request-context';

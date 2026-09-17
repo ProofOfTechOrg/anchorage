@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// The in-memory DurableKeyValueStorage every Durable Object suite drives.
+// An in-memory DurableKeyValueStorage for Durable Object suites.
 //
 // Durable Object storage serializes on write and hands back a fresh object on
 // read, so this fixture clones in both directions. One that stored and returned
@@ -25,8 +25,6 @@ export interface DurableKeyValueStorageFixture {
   values: Map<string, unknown>;
   /** Each armed alarm time, in call order; `deleteAlarm` leaves them recorded. */
   alarms: number[];
-  /** `get:<key>`, `put:<key>`, `delete:<key>`, `setAlarm`, `deleteAlarm`. */
-  events: string[];
 }
 
 export function durableKeyValueStorageFixture(
@@ -62,6 +60,5 @@ export function durableKeyValueStorageFixture(
     state: { storage } as unknown as DurableObjectState,
     values,
     alarms,
-    events,
   };
 }

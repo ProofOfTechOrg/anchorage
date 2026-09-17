@@ -74,16 +74,44 @@ try {
   );
   run(join(root, 'node_modules/.bin/tsc'), ['-p', 'tsconfig.json'], consumer);
 
-  const client = readFileSync(
-    join(temporary, 'package', 'dist', 'signals', 'client.js'),
-    'utf8',
-  );
+  const packedSignalsFile = (fileName) =>
+    readFileSync(
+      join(temporary, 'package', 'dist', 'signals', fileName),
+      'utf8',
+    );
+  // Each pattern is one line form a module names another in: a `from` clause
+  // on an import or a re-export, a side-effect import, a dynamic import, a
+  // `require`, a module augmentation, a triple-slash reference. A form missing
+  // from this list is an edge the two checks below cannot see.
+  const edgePatterns = [
+    /\bfrom\s*['"][^'"]+['"]\s*;?\s*$/,
+    /^\s*import\s*['"][^'"]+['"]\s*;?\s*$/,
+    /\bimport\(\s*['"][^'"]+['"]\s*\)/,
+    /\brequire\(\s*['"][^'"]+['"]\s*\)/,
+    /^\s*declare\s+module\s+['"][^'"]+['"]/,
+    /^\s*\/\/\/\s*<reference\s+(?:path|types|lib)\s*=/,
+  ];
+  const namesAnotherModule = (source) =>
+    source
+      .split('\n')
+      .some((line) => edgePatterns.some((pattern) => pattern.test(line)));
+
+  const client = packedSignalsFile('client.js');
   if (
-    /^import\s/m.test(client) ||
+    namesAnotherModule(client) ||
     /node:|agent-runner|do-runner/.test(client)
   ) {
     throw new Error(
       'packed signals/client pulled a runtime or Node-only import',
+    );
+  }
+  // The declaration axis of the same entry. A browser consumer resolves this
+  // `.d.ts` and whatever it names, so a type reaching in from the runner or the
+  // host kit would hand that graph to a consumer who installed the browser
+  // entry alone.
+  if (namesAnotherModule(packedSignalsFile('client.d.ts'))) {
+    throw new Error(
+      'packed signals/client declaration named a module outside the browser entry',
     );
   }
   console.log('packed browser signals/client import passed');

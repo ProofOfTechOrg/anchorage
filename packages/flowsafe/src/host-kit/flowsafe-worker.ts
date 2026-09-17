@@ -667,9 +667,12 @@ export type MaintenanceDuty = 'deadline' | 'sweep' | 'purge' | 'tick';
 
 /**
  * The cursor seam a duty resumes from and advances. Each field is optional
- * because the deadline sweep and the retention purge own one pair each, and a
+ * because the deadline duty and the retention purge own one pair each, and a
  * caller driving one duty has nothing to say about the other's cursor. The
  * purge takes `MaintenancePurgeDutyContext` instead, which requires its half.
+ * The deadline duty reads `deadlineCursor` only alongside
+ * `advanceDeadlineCursor`: a cursor supplied without the callback that
+ * advances it is ignored.
  */
 export interface MaintenanceDutyContext {
   deadlineCursor?: RunDeadlineCursor;
@@ -683,8 +686,9 @@ export interface MaintenanceDutyContext {
  * because the layer it feeds requires it: `purgeExpiredWorkflowRuns` declares
  * `advanceCursor` non-optional (do-runner/d1-storage.ts), and a purge with
  * nowhere to record its progress rescans the same terminal rows on every
- * alarm. Declaring it optional on the shared context and enforcing it at run
- * time turned a host's wiring mistake into a purge that reports failure.
+ * alarm. The type keeps a typed host from omitting it; `hasRetentionCursorSeam`
+ * refuses an untyped one under `config-error` before any purge surface runs,
+ * rather than letting the purge report a `retention-purge` failure.
  */
 export interface MaintenancePurgeDutyContext extends MaintenanceDutyContext {
   advanceRetentionCursor(cursor: RunRetentionCursor): Promise<void>;

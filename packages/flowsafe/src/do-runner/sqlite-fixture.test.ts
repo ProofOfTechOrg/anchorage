@@ -1,39 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it } from 'vitest';
-import {
-  openSqlite,
-  type SqliteUnitDatabase,
-  sqliteUnitDatabase,
-} from '../../test-support/sqlite.js';
-import type { ResourceOwnershipDatabase } from '../approval-api/resource-ownership.js';
-import type { SignalDatabase } from '../signals/d1-shared.js';
-import type { ExecutionFenceDatabase } from './execution-fence.js';
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import type { InitialAdmissionDatabase } from './fenced-workflow-capability.js';
-import type { SnapshotDatabase } from './workflow-snapshot-row.js';
 
-// The declared return of sqliteUnitDatabase is what the `as` assertion in each
-// suite that drives it is checked against. These erased assertions hold the
-// facade against the D1 subsets those suites name, so a narrowing of the facade
-// fails here rather than at the assertion sites. `ScheduleDatabase` is an alias
-// of `SignalDatabase` (schedules-d1.ts:87). Same technique as
-// test-support/d1-type-compatibility.ts, which holds the D1 side of this seam.
-type AssertTrue<T extends true> = T;
-type _FacadeSatisfiesSignalDatabase = AssertTrue<
-  SqliteUnitDatabase extends SignalDatabase ? true : false
->;
-type _FacadeSatisfiesSnapshotDatabase = AssertTrue<
-  SqliteUnitDatabase extends SnapshotDatabase ? true : false
->;
-type _FacadeSatisfiesInitialAdmissionDatabase = AssertTrue<
-  SqliteUnitDatabase extends InitialAdmissionDatabase ? true : false
->;
-type _FacadeSatisfiesExecutionFenceDatabase = AssertTrue<
-  SqliteUnitDatabase extends ExecutionFenceDatabase ? true : false
->;
-type _FacadeSatisfiesResourceOwnershipDatabase = AssertTrue<
-  SqliteUnitDatabase extends ResourceOwnershipDatabase ? true : false
->;
+// PLACEMENT: the erased pins that hold sqliteUnitDatabase's declared return
+// against the D1 subsets these cases name live beside the D1 side of the same
+// seam, in test-support/d1-type-compatibility.ts. `architecture:check:rules`
+// drops packages/flowsafe/src/**/*.test.ts, so a pin written here would sit
+// outside the graph that gate reads.
 
 describe('native SQLite unit batch transport', () => {
   it('returns actual rows, executes DML once and preserves changes through SELECT', async () => {

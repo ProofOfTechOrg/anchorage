@@ -3136,16 +3136,68 @@ function siblingSource(file: string): string {
   );
 }
 
+/**
+ * Each pattern is one line form a TypeScript source names another module in: a
+ * `from` clause on an import or a re-export, a side-effect import, a dynamic
+ * import, a module augmentation, a triple-slash reference. A form missing from
+ * this list is an edge `declaredEdges` cannot see.
+ */
+const EDGE_PATTERNS: readonly RegExp[] = [
+  /\bfrom\s*'([^']+)'\s*;?\s*$/,
+  /^\s*import\s*'([^']+)'\s*;?\s*$/,
+  /\bimport\(\s*'([^']+)'\s*\)/,
+  /^\s*declare\s+module\s+'([^']+)'/,
+  /^\s*\/\/\/\s*<reference\s+(?:path|types|lib)\s*=\s*"([^"]+)"/,
+];
+
+/** The module specifiers a source names, in source order. */
+function declaredEdges(source: string): string[] {
+  return source
+    .split('\n')
+    .flatMap((line) =>
+      EDGE_PATTERNS.map((pattern) => pattern.exec(line)?.[1]).filter(
+        (specifier): specifier is string => specifier !== undefined,
+      ),
+    );
+}
+
 describe('start-reservation contract evidence', () => {
+  it('reads an edge out of each specifier form it lists', () => {
+    // The positive control for the case below: `architecture:check:rules`
+    // cruises packages but drops packages/flowsafe/src/**/*.test.ts, so no
+    // dependency-cruiser rule covers the leaf constraint and nothing outside
+    // this file checks the scan that does. A specifier form the patterns miss
+    // would leave that case green while the edge it forbids was added.
+    expect(
+      declaredEdges(
+        [
+          "import { a } from './from-clause.js';",
+          "export type { B } from './re-export.js';",
+          "import './side-effect.js';",
+          "const c = await import('./dynamic.js');",
+          "declare module './augmented.js' {",
+          '/// <reference types="triple-slash" />',
+          "const notAnEdge = 'plain string';",
+        ].join('\n'),
+      ),
+    ).toEqual([
+      './from-clause.js',
+      './re-export.js',
+      './side-effect.js',
+      './dynamic.js',
+      './augmented.js',
+      'triple-slash',
+    ]);
+  });
+
   it('keeps the reservation contract a leaf of three declared edges', () => {
     // Source edges, not a cycle check: a cycle rule admits a one-way edge from
     // this leaf into a store, a fence, Runtime or a capability, and admitting
     // one would put the fence's codecs behind the graph they decode for. Type-
     // only edges count — they are erased, and the boundary is not.
-    const edges = siblingSource('./start-reservation-contract.ts')
-      .split('\n')
-      .map((line) => / from '([^']+)';$/.exec(line)?.[1])
-      .filter((specifier): specifier is string => specifier !== undefined);
+    const edges = declaredEdges(
+      siblingSource('./start-reservation-contract.ts'),
+    );
     expect(edges).toEqual([
       '../approval-api/principal-identity.js',
       './execution-admission.js',
@@ -3162,8 +3214,9 @@ describe('start-reservation contract evidence', () => {
   });
 
   it('publishes the reservation refusal constructor rather than a second copy', () => {
-    // A forwarding copy would satisfy every instanceof test inside the store
-    // and fail every one a consumer writes against the package surface.
+    // A forwarding copy would be a second constructor object: an instanceof
+    // written against the package surface would refuse the error the store
+    // threw.
     expect(BarrelStartReservationUnreadableError).toBe(
       StartReservationUnreadableError,
     );

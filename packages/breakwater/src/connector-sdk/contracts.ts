@@ -1,10 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
-// Connector contracts — the manifest, store, policy and connector shapes the
-// SDK is written against.
+// Connector contracts — the declarations a connector-sdk sibling needs without
+// reaching the barrel that imports them back: manifest, store, policy and
+// connector shapes that cross that edge.
 //
 // A type-only leaf, so the preset, the D1 stores, the key migration and the
-// conformance harness take these declarations without importing the barrel
-// that imports them back.
+// conformance harness take these declarations without importing the barrel.
+// That need is the criterion for what moves here; a declaration the barrel
+// alone consumes stays in the barrel.
+//
+// `AuditLogger` arrives from the `../audit/index.js` barrel rather than from a
+// leaf because audit publishes it as a class. The edge is admissible while
+// audit reaches nothing under `connector-sdk/`; the day it does, the cycle
+// fails the build instead of passing silently.
 
 import type { RequestContext } from '@mastra/core/request-context';
 import type { Tool, ToolExecutionContext } from '@mastra/core/tools';

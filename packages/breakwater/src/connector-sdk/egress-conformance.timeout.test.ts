@@ -4,9 +4,14 @@
 // a vitest invocation of their own, rather than beside the harness suite.
 import { describe, expect, it, vi } from 'vitest';
 import {
+  type Execute,
+  manifest,
+  noEgress,
+  quietCase,
+  requestCase,
+} from './egress-conformance.fixtures.js';
+import {
   assertConnectorConformance,
-  type ConnectorConfig,
-  type ConnectorConformanceCase,
   ConnectorConformanceError,
   type ConnectorConformanceFactory,
   type ConnectorConformanceReport,
@@ -15,27 +20,6 @@ import {
   type PermissionManifest,
 } from './index.js';
 
-const manifest: PermissionManifest = {
-  sideEffect: 'read',
-  egress: ['api.vendor.example'],
-  egressEnforcement: 'enforced',
-};
-const noEgress: PermissionManifest = {
-  sideEffect: 'read',
-  egressEnforcement: 'enforced',
-};
-const requestCase: ConnectorConformanceCase = {
-  name: 'request',
-  input: {},
-  expect: { outcome: 'guarded-request', hosts: ['api.vendor.example'] },
-};
-const quietCase: ConnectorConformanceCase = {
-  name: 'quiet',
-  input: {},
-  expect: { outcome: 'no-network' },
-};
-
-type Execute = ConnectorConfig<unknown, unknown>['execute'];
 function factory(
   execute: Execute = async (_input, _context, runtime) => {
     await runtime.fetch('https://api.vendor.example');

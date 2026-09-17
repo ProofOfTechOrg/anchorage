@@ -231,18 +231,25 @@ function snapshotRateLimitStore(store: D1RateLimitStore): RateLimitStore {
 
 // Policy members the preset pins between validation and construction. The
 // order decides which member a multi-member tamper is reported against, since
-// the first mismatch throws.
-const PINNED_PRESET_MEMBERS: readonly (keyof ConnectorPolicies)[] = [
-  'networkEgress',
-  'idempotencyKeyMigration',
-  'writePermissions',
-  'evaluators',
-  'idempotencyStore',
-  'rateLimitStore',
-  'audit',
-  'fetch',
-  'requireEgressEnforcement',
-];
+// the first mismatch throws; `Object.keys` preserves the literal's insertion
+// order, so the order written here is the order checked. Exhaustive over
+// ConnectorPolicies: a member the interface gains is a missing property here,
+// one it drops an excess property.
+const PINNED_PRESET_MEMBER_SET: Record<keyof ConnectorPolicies, true> = {
+  networkEgress: true,
+  idempotencyKeyMigration: true,
+  writePermissions: true,
+  evaluators: true,
+  idempotencyStore: true,
+  rateLimitStore: true,
+  audit: true,
+  fetch: true,
+  requireEgressEnforcement: true,
+};
+
+const PINNED_PRESET_MEMBERS = Object.keys(
+  PINNED_PRESET_MEMBER_SET,
+) as (keyof ConnectorPolicies)[];
 
 function assertUnchangedSurface(
   connectorId: string,
@@ -373,7 +380,6 @@ export function assertSingleTenantConnectorPolicies(
     };
   }
 
-  const currentAudit = policies.audit;
   const baseline = metadata.snapshot.policies;
   for (const member of PINNED_PRESET_MEMBERS) {
     assertUnchangedSurface(
@@ -383,6 +389,10 @@ export function assertSingleTenantConnectorPolicies(
       baseline[member],
     );
   }
+  // The loop read `policies.audit` once and proved it identical to the
+  // baseline's, so the frozen snapshot carries the value the `.record` check
+  // needs — a second read of an accessor-backed `policies` would not.
+  const currentAudit = baseline.audit;
   if (
     currentAudit !== undefined &&
     currentAudit.record !== metadata.snapshot.auditMember

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 import { APPROVAL_ROLES } from '@proofoftech/flowsafe/approval-api';
 import { mintHmacToken, toApprovalActor } from '@proofoftech/flowsafe/host-kit';
@@ -48,9 +48,13 @@ async function main() {
   process.stdout.write(`${token}\n`);
 }
 
-const invokedPath = process.argv[1]
-  ? pathToFileURL(resolve(process.argv[1])).href
-  : undefined;
-if (invokedPath === import.meta.url) {
+// Both sides are realpathed, so a symlinked invocation still resolves to this
+// module's own path.
+const isMain =
+  process.argv[1] !== undefined &&
+  realpathSync(process.argv[1]) ===
+    realpathSync(fileURLToPath(import.meta.url));
+
+if (isMain) {
   await main();
 }

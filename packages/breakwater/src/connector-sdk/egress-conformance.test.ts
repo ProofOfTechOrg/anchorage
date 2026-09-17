@@ -3,11 +3,17 @@ import { existsSync, readFileSync } from 'node:fs';
 import { createTool } from '@mastra/core/tools';
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
+import {
+  type Execute,
+  manifest,
+  noEgress,
+  quietCase,
+  requestCase,
+} from './egress-conformance.fixtures.js';
 import { CONFORMANCE_LIMIT } from './egress-conformance.js';
 import {
   assertConnectorConformance,
   type Connector,
-  type ConnectorConfig,
   type ConnectorConformanceCase,
   ConnectorConformanceError,
   type ConnectorConformanceFactory,
@@ -23,31 +29,11 @@ import {
   singleTenantConnectorPolicies,
 } from './index.js';
 
-const manifest: PermissionManifest = {
-  sideEffect: 'read',
-  egress: ['api.vendor.example'],
-  egressEnforcement: 'enforced',
-};
-const noEgress: PermissionManifest = {
-  sideEffect: 'read',
-  egressEnforcement: 'enforced',
-};
-const requestCase: ConnectorConformanceCase = {
-  name: 'request',
-  input: {},
-  expect: { outcome: 'guarded-request', hosts: ['api.vendor.example'] },
-};
-const quietCase: ConnectorConformanceCase = {
-  name: 'quiet',
-  input: {},
-  expect: { outcome: 'no-network' },
-};
 const fetchReason =
   'either the factory did not wire policies.fetch, or the connector called the ambient global directly for a host it declares; the escape record beside this finding is authoritative for the request itself.';
 const boundaryReason =
   "the case produced no audit event because the connector's gate boundary was never reached; a pre-boundary refusal is not expressible by any expectation and belongs in an ordinary connector test";
 
-type Execute = ConnectorConfig<unknown, unknown>['execute'];
 function factory(
   execute: Execute = async (_input, _context, runtime) => {
     await runtime.fetch('https://api.vendor.example');
@@ -658,6 +644,32 @@ describe('connector egress conformance', () => {
       { entryPoint: 'globalThis.fetch', host: 'exfil.example', refused: true },
     ]);
     expect(report.findings[0]?.reason).not.toContain('not observed');
+    expect(Object.getOwnPropertyDescriptor(globalThis, 'fetch')).toEqual(saved);
+  });
+
+  it('reports INSTRUMENTATION_REPLACED with unobserved calls when a case deletes the entry point', async () => {
+    // #given
+    const saved = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
+    // #when
+    const report = await rejected(
+      assertConnectorConformance(
+        quietFactory(async () => {
+          Reflect.deleteProperty(globalThis, 'fetch');
+          return {};
+        }),
+        { manifest: noEgress, cases: [quietCase] },
+      ),
+    );
+    // #then
+    expect(report.conformant).toBe(false);
+    expect(report.findings).toEqual([
+      {
+        code: 'INSTRUMENTATION_REPLACED',
+        case: 'quiet',
+        reason:
+          'globalThis.fetch descriptor differs from the one the harness installed: absent property; calls made after the replacement were not observed',
+      },
+    ]);
     expect(Object.getOwnPropertyDescriptor(globalThis, 'fetch')).toEqual(saved);
   });
 
@@ -1672,22 +1684,30 @@ describe('connector egress conformance', () => {
   });
 
   it('keeps the published limit text identical to the harness constant', () => {
-    for (const relative of [
+    // #given
+    const documents = [
       '../../CONNECTORS.md',
       '../../../../docs/connector-interface.md',
-    ]) {
-      expect(
-        readFileSync(new URL(relative, import.meta.url), 'utf8'),
-        relative,
-      ).toContain(CONFORMANCE_LIMIT);
-    }
+    ];
     // Changesets are consumed at versioning.
     const changeset = new URL(
       '../../../../.changeset/connector-conformance-harness.md',
       import.meta.url,
     );
-    if (existsSync(changeset)) {
-      expect(readFileSync(changeset, 'utf8')).toContain(CONFORMANCE_LIMIT);
+    // #when
+    const published = documents.map((relative) => ({
+      relative,
+      text: readFileSync(new URL(relative, import.meta.url), 'utf8'),
+    }));
+    const changesetText = existsSync(changeset)
+      ? readFileSync(changeset, 'utf8')
+      : undefined;
+    // #then
+    for (const { relative, text } of published) {
+      expect(text, relative).toContain(CONFORMANCE_LIMIT);
+    }
+    if (changesetText !== undefined) {
+      expect(changesetText).toContain(CONFORMANCE_LIMIT);
     }
   });
 

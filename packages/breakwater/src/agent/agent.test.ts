@@ -855,6 +855,9 @@ describe('Mastra Agent execution-entry inventory', () => {
       'streamLegacy',
       'streamUntilIdle',
     ];
+    // A narrowed handle can only omit, so a setter or data-returning member
+    // is harmless here; flowsafe blocks these same members on the instance
+    // Mastra calls in-process.
     const explicitlyNonExecution = [
       '__fork',
       '__getDrainPendingSignals',
@@ -872,10 +875,7 @@ describe('Mastra Agent execution-entry inventory', () => {
       '__setDeclaredSchedules',
       '__setMemory',
       '__setPubSub',
-      // Installs another agent as the target the thread runtime drives. The
-      // narrowed handle omits it rather than throwing, so nothing reaches it
-      // through this surface; flowsafe blocks the same member on its INSTANCE,
-      // which Mastra calls in-process.
+      // Installs another agent as the target the thread runtime drives.
       '__setThreadRuntimeAgent',
       '__setTools',
       '__setWorkspace',
@@ -886,9 +886,7 @@ describe('Mastra Agent execution-entry inventory', () => {
       'browser',
       // Cancels queued idle signals; it can stop pending work, never start it.
       'cancelQueuedMessages',
-      // Opts the agent in as a thread's remote wake target, leaving a live
-      // subscription behind. The handle omits it, so no caller can take that
-      // claim through this surface.
+      // Opts the agent in as a thread's remote wake target and subscriber.
       'claimThreadOwnership',
       'clearObjective',
       'combineProcessorsIntoWorkflow',
@@ -1077,7 +1075,7 @@ describe('Mastra Agent execution-entry inventory', () => {
     if (installedCore === declaredPeer) {
       expect(
         forwardClassified.filter((name) => own.includes(name)),
-        `the pin caught up to these on @mastra/core ${installedCore} — drop them from forwardClassified so the stale check covers them again`,
+        `the pin caught up to these on @mastra/core ${installedCore} — drop them from forwardClassified so the stale check covers them again, and prune its sibling allowance in the same pass: the VERSION_SKEW table in flowsafe's durable-agent-surface.test.ts`,
       ).toEqual([]);
     } else {
       expect(

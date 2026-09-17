@@ -71,7 +71,8 @@ const modules: Array<[string, typeof esm]> = [
 
 // The getting-started guide's confirmation record. With the patch applied,
 // `bySource.constructor` carries this record's own count instead of the
-// inherited Object.prototype member.
+// inherited Object.prototype member, and core's own source-policy lookup
+// resolves the configured action instead of that member.
 const PATCH_PROBE: NotificationRecord = {
   id: 'n',
   threadId: 't',

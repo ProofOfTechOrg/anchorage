@@ -1545,6 +1545,20 @@ describe('createFlowsafeWorker maintenance duties', () => {
     });
   });
 
+  it('refuses the purge duty invoked with no context', async () => {
+    capturedLogs();
+    const worker = makeWorker();
+    const { env } = makeEnv();
+
+    // @ts-expect-error the purge duty takes a context carrying the seam
+    const outcome = await worker.runMaintenanceDuty('purge', env);
+
+    expect(outcome).toEqual({
+      ok: false,
+      error: 'retention purge requires advanceRetentionCursor',
+    });
+  });
+
   it.each([
     undefined,
     null,

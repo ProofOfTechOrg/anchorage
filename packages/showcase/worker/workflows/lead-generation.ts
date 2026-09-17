@@ -89,8 +89,7 @@ export const leadGenerationModule: WorkflowModule<ShowcaseModuleDeps> = {
         requiresApproval: true,
         egress: [CRM_HOST],
         // The assign rides the host-supplied crm.fetch, a transport the egress
-        // guard never sees, so the host above is checked against organization
-        // policy, never against the socket.
+        // guard never sees.
         egressEnforcement: 'declaration-only',
         rateLimit: '5/min',
       },

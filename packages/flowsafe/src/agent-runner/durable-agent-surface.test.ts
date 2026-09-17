@@ -176,7 +176,12 @@ const nonExecution = [
   // `aborted || this.#isRunExecuting(runId)` (:6585), a boolean existence
   // oracle for a run id the caller may not own. Both stay classified on the
   // Agent level too: they are on Agent.prototype at the pin and shadowed here
-  // only at 1.67.0.
+  // only at 1.67.0. Breakwater's narrowed handle omits both
+  // (agent.test.ts:828-829, in `intentionallyUnavailable`), a divergence
+  // running the opposite way to the ones durable-agent-runner.ts records, where
+  // breakwater is the weaker side: a handle can omit a member, while an
+  // instance Mastra calls in-process can only refuse it, and neither of these
+  // matches a blocked ground.
   'abortRunStream',
   'abortThreadStream',
   'agent',
@@ -243,10 +248,9 @@ const nonExecution = [
   'requestContextSchema',
   // The abort primitive the two methods above share (:6626), and never blocked;
   // the inventory asserts that rather than leaving it to this note. core calls
-  // it from #abortDurableRun (:6601) and from the `abort` closure it returns
-  // with each durable stream result (:6814, :7095, :7265, :7796), so refusing
-  // it would reject the abort handle handed to every consumer of a run this
-  // class itself started.
+  // it from #abortDurableRun (:6598, calling at :6601) and from the `abort`
+  // closure it returns with each durable stream result (:6814, :7095, :7265,
+  // :7796).
   'requestRemoteAbort',
   'resolveProcessorById',
   'runRegistry',
@@ -291,6 +295,10 @@ const agentSurface = Object.getOwnPropertyNames(Agent.prototype).filter(
  * five still have route callers. Any run core mints through them reaches a
  * terminal output without entering RunnerRuntime; see the runner module comment
  * for the cleanup mechanism.
+ *
+ * For the members that resolve their target through the thread runtime's agent
+ * field, the containment holds only while `__setThreadRuntimeAgent` is blocked,
+ * which is what keeps that target this instance.
  */
 const delegatingToGuard = [
   // Opts the agent in as a thread's remote wake target: the thread runtime
@@ -300,8 +308,6 @@ const delegatingToGuard = [
   // override — but the runId assertion is not what contains it, since a
   // pubsub-supplied id is path-safe like any other; the terminal refusal
   // `executeWorkflow` raises for a runId with no `#startRequesters` entry is.
-  // The containment holds only while `__setThreadRuntimeAgent` is blocked,
-  // which is what makes `owner.agent` this instance.
   'claimThreadOwnership',
   'queueMessage',
   'resumeStreamUntilIdle',
@@ -355,10 +361,19 @@ const agentNonExecution = [
   'convertTools',
   'deriveSubAgentBackgroundConfig',
   // Returns the peer advertisements one pubsub instance carries —
-  // agentId/resourceId/threadId plus optional label, title and metadata
-  // (storage-MbGlKLkB.js:425-437), and no run ids. Honest caveat: that
-  // disclosure is empty only while one PubSub instance serves one thread, which
-  // is a deployment property this inventory cannot assert.
+  // agentId/resourceId/threadId plus sourceId and optional label, title and
+  // metadata (storage-MbGlKLkB.js:425-437), and no run ids. sourceId is the
+  // addressing half: claimThreadOwnership's listener drops an
+  // idle-signal-enqueued whose `data.targetSourceId` is not its own, so holding
+  // a peer's sourceId is what lets another process wake that peer's claimed
+  // thread. What bounds the disclosure is the thread DO, not pubsub identity:
+  // the thread runtime falls back to a module-global emitter when the agent
+  // carries none (storage-MbGlKLkB.js:151-152) and flowsafe's own pubsub is
+  // opt-in (do-runner/pubsub.ts), while host-kit/thread-topology.ts:126
+  // addresses the DO by idFromName(threadId), which do-runner/thread-do.ts:8
+  // states serializes every send and subscribe for a thread onto one isolate.
+  // The residual is a host injecting one PubSub across threads through the
+  // init({ pubsub }) seam (do-runner/init.ts:67).
   'discoverThreadPeers',
   // Field accessor for the durable flag.
   'durable',
@@ -624,7 +639,10 @@ function testAgent(id = 'writer'): Agent {
  * longer merely PROBED: the companion control below drives each of them through
  * a stock DurableAgent on this same spied storage and ASSERTS that the
  * workflows store was reached, so a core that stops touching storage on one of
- * them fails loudly rather than turning its row quietly vacuous.
+ * them fails loudly rather than turning its row quietly vacuous. The vacuous
+ * rows take the inverted half of that control, which drives them the same way
+ * and asserts the store was NOT reached — so each grading below is checked
+ * rather than claimed, in whichever direction it goes.
  *
  *  - Non-vacuous, one store method each: `getWorkflowRunById` for recover and
  *    the whole resume family; `listWorkflowRuns` for recoverActiveRuns,
@@ -636,7 +654,7 @@ function testAgent(id = 'writer'): Agent {
  *    settles, so at assertion time the base has touched `getStore` >= 1 rather
  *    than the larger figure a fully drained run reaches. Do not pin a number.
  *  - generateLegacy / streamLegacy: VACUOUS by construction, and so listed
- *    in `vacuousByConstruction`, which is what the control excludes.
+ *    in `vacuousByConstruction`, which is where the control splits.
  *    `testAgent()` uses a v2 model, and the legacy handler rejects a non-v1
  *    model before touching storage at all, so the base reaches no store
  *    either. Their non-vacuous evidence is the refusal MESSAGE assertion —
@@ -649,9 +667,10 @@ function testAgent(id = 'writer'): Agent {
  *    (dist/agent-Dk0N0Nlg.js:33609-33611), and `listActiveThreadRuns` hands
  *    `getPubSub()` (:33560-33562) to the thread-stream runtime, which reads
  *    its state from a WeakMap keyed by that pubsub instance
- *    (dist/storage-MbGlKLkB.js:150, :294-298) and iterates two in-memory maps
- *    (:1011-1023). Neither path resolves a store, so there is nothing for the
- *    control to observe at either core. Their non-vacuous evidence is the
+ *    (dist/storage-MbGlKLkB.js:150, :294-298) and then reads the in-memory maps
+ *    and sets that state holds (:1011-1023). Neither path resolves a store, so
+ *    the base reaches none here either — which is what the inverted control
+ *    asserts on a core that exposes them. Their non-vacuous evidence is the
  *    refusal MESSAGE assertion too — the base returns where the override
  *    throws FlowSafe's tabled reason.
  *
@@ -1241,8 +1260,9 @@ describe('FlowsafeDurableAgent blocked recovery entry points', () => {
    * run) — swallowed, because the claim is only that storage was reached BEFORE
    * they did.
    *
-   * The rows in `vacuousByConstruction` are excluded: their base path reaches
-   * no store to spy on, for the reasons registeredAgent()'s notes give.
+   * The rows in `vacuousByConstruction` take the inverted control below: their
+   * base path reaches no store to spy on, for the reasons registeredAgent()'s
+   * notes give, so what is worth asserting about them is that absence.
    */
   const vacuousByConstruction: readonly string[] = [
     '__setThreadRuntimeAgent',
@@ -1250,6 +1270,27 @@ describe('FlowsafeDurableAgent blocked recovery entry points', () => {
     'listActiveThreadRuns',
     'streamLegacy',
   ];
+
+  /**
+   * A member the INSTALLED core does not expose on the base has no base path to
+   * observe in either direction, so neither control can bite on it. Require
+   * that absence to be a RECORDED skew rather than skipping on it: an absence
+   * no VERSION_SKEW row names means the override refuses a member neither
+   * supported core has, and belongs nowhere.
+   */
+  const baseCarries = (agent: DurableAgent, method: string): boolean => {
+    if (
+      typeof (agent as unknown as Record<string, unknown>)[method] ===
+      'function'
+    ) {
+      return true;
+    }
+    expect(
+      skewNames,
+      `${method}() is blocked and has a behavioral row, but @mastra/core ${installedCore} does not expose it on the base at all. Either record it in VERSION_SKEW with the level it holds on the other supported core, or drop the override and its row.`,
+    ).toContain(method);
+    return false;
+  };
 
   for (const { method, invoke } of blockedCalls.filter(
     (call) => !vacuousByConstruction.includes(call.method),
@@ -1259,23 +1300,7 @@ describe('FlowsafeDurableAgent blocked recovery entry points', () => {
       const { agent, getStore } = await registerWithSpies(
         new DurableAgent({ agent: testAgent() }),
       );
-
-      // #given a member the INSTALLED core does not expose has nothing to read
-      // and nothing to prove, so this row cannot bite here. Require that
-      // absence to be a RECORDED skew rather than skipping on it: an unlisted
-      // absence means the override refuses a member neither supported core has,
-      // and belongs nowhere. Self-expiring, unlike a second exclusion list —
-      // the row bites again the moment the installed core grows the member.
-      if (
-        typeof (agent as unknown as Record<string, unknown>)[method] !==
-        'function'
-      ) {
-        expect(
-          skewNames,
-          `${method}() is blocked and has a behavioral row, but @mastra/core ${installedCore} does not expose it on the base at all. Either record it in VERSION_SKEW with the level it holds on the other supported core, or drop the override and its row.`,
-        ).toContain(method);
-        return;
-      }
+      if (!baseCarries(agent, method)) return;
 
       // #when the base implementation runs
       await invoke(agent as unknown as FlowsafeDurableAgent).catch(
@@ -1287,6 +1312,39 @@ describe('FlowsafeDurableAgent blocked recovery entry points', () => {
         getStore,
         `${method}() no longer reaches storage on the unmodified base, so the refusal row's "read nothing on the way out" assertion now passes vacuously — re-read the base implementation and re-grade the row in registeredAgent()'s notes`,
       ).toHaveBeenCalled();
+    });
+  }
+
+  /**
+   * The inverted control, for the rows the loop above excludes. Their grading —
+   * the base reaches no store either, so the refusal row's "read nothing on the
+   * way out" proves nothing about storage for them — is a claim about core, so
+   * drive them the same way and require the store to stay untouched. A core
+   * that starts reading storage on one of them fails here and the row moves
+   * into the loop above, which is what makes the exclusion expire on its own
+   * rather than rest on the notes.
+   */
+  for (const { method, invoke } of blockedCalls.filter((call) =>
+    vacuousByConstruction.includes(call.method),
+  )) {
+    it(`${method}() reaches no storage on the unmodified base`, async () => {
+      // #given the same spied storage and the same stock DurableAgent
+      const { agent, getStore } = await registerWithSpies(
+        new DurableAgent({ agent: testAgent() }),
+      );
+      if (!baseCarries(agent, method)) return;
+
+      // #when the base implementation runs
+      await invoke(agent as unknown as FlowsafeDurableAgent).catch(
+        () => undefined,
+      );
+
+      // #then it never resolved a store, which is the grading that keeps it out
+      // of the control above
+      expect(
+        getStore,
+        `${method}() now reaches storage on the unmodified base, so its refusal row is no longer vacuous — drop it from vacuousByConstruction, which moves it into the control above, and re-grade it in registeredAgent()'s notes`,
+      ).not.toHaveBeenCalled();
     });
   }
 

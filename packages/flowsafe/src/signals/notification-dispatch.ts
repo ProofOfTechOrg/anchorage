@@ -470,6 +470,10 @@ const SOURCE_KEY_PROBE: NotificationRecord = {
   createdAt: new Date(0),
   updatedAt: new Date(0),
 };
+// The getting-started citation both patch refusals carry.
+const PATCH_CITATION =
+  'apply it at the application root (getting started: "Apply the flowsafe patch to @mastra/core")';
+
 let sourceKeysPatched: boolean | undefined;
 
 export function assertNotificationSourceKeysPatched(): void {
@@ -478,7 +482,7 @@ export function assertNotificationSourceKeysPatched(): void {
     'number';
   if (!sourceKeysPatched) {
     throw new TypeError(
-      'notification dispatch requires the @mastra/core patch flowsafe ships; apply it at the application root (getting started: "Apply the flowsafe patch to @mastra/core")',
+      `notification dispatch requires the @mastra/core patch flowsafe ships; ${PATCH_CITATION}`,
     );
   }
 }
@@ -490,8 +494,8 @@ let deliveryPolicyPatched: Promise<boolean> | undefined;
  * resolveNotificationDeliveryDecision guards its own keys, so a source named
  * after an Object.prototype member resolves the configured default instead
  * of the inherited member. The lookup is asynchronous, so this probe is the
- * async sibling of assertNotificationSourceKeysPatched and is consulted at
- * the async handlers that reach the sender.
+ * async sibling of assertNotificationSourceKeysPatched, awaited before a
+ * handler reaches core's sender.
  */
 export async function assertNotificationDeliveryPolicyPatched(): Promise<void> {
   deliveryPolicyPatched ??= resolveNotificationDeliveryDecision({
@@ -505,7 +509,7 @@ export async function assertNotificationDeliveryPolicyPatched(): Promise<void> {
   );
   if (!(await deliveryPolicyPatched)) {
     throw new TypeError(
-      'notification ingestion requires the @mastra/core patch flowsafe ships; apply it at the application root (getting started: "Apply the flowsafe patch to @mastra/core")',
+      `notification ingestion requires the @mastra/core patch flowsafe ships; ${PATCH_CITATION}`,
     );
   }
 }
