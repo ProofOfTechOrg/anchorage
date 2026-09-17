@@ -51,19 +51,26 @@ function captureRun(githubDirectory) {
 
 // The assertion is read out of the tracked workflow, not restated here, so the
 // case evaluates what ships rather than a copy of it.
-function verifyGateScript() {
+function readVerifyGateScript() {
   const workflow = parse(
     readFileSync(join(repositoryRoot, '.github/workflows/ci.yml'), 'utf8'),
   );
-  const steps = workflow.jobs.verify.steps.filter((step) => 'run' in step);
+  const job = workflow.jobs.verify;
+  const steps = job.steps.filter((step) => 'run' in step);
   assert.equal(steps.length, 1, 'the verify gate job has one run step');
-  return steps[0].run;
+  return { job, step: steps[0] };
 }
 
-function runVerifyGate(script, needs) {
-  return spawnSync('bash', ['-e', '-c', script], {
+function runVerifyGate(step, needs) {
+  const variables = Object.keys(step.env);
+  assert.equal(
+    variables.length,
+    1,
+    'the verify gate step carries the needs context in one env variable',
+  );
+  return spawnSync('bash', ['-e', '-c', step.run], {
     encoding: 'utf8',
-    env: { ...process.env, NEEDS: JSON.stringify(needs) },
+    env: { ...process.env, [variables[0]]: JSON.stringify(needs) },
   });
 }
 
@@ -393,13 +400,36 @@ test('prints parser warnings without failing the run', () => {
   assert.equal(run.stdout, 'GitHub YAML check passed (1 files).\n');
 });
 
+// The two cases below pin ci.yml's `verify` gate rather than the checker. They
+// live here because the checker already parses every .github workflow, and a
+// suite of their own would add a verify-core step to run it.
+// This one reads the gate's shape and shells out to nothing, so it reports the
+// deletions below on every machine.
+test('the ci.yml gate job stays reachable and depends on at least one job', () => {
+  const { job } = readVerifyGateScript();
+
+  assert.equal(
+    job.if,
+    'always()',
+    'without `if: always()` a failed dependency skips the gate job, and GitHub reports a skipped required check as success',
+  );
+  assert.ok(
+    Array.isArray(job.needs) && job.needs.length > 0,
+    'an empty `needs` list leaves the gate passing with nothing verified',
+  );
+});
+
+// `bash -e -c` reproduces the runner's default shell for a `run` block that
+// declares no `shell:` key, and the env variable the script reads is taken from
+// the step rather than restated, so the wiring at ci.yml is what runs here. The
+// job's single-run-step shape is asserted in readVerifyGateScript above.
 test('the ci.yml gate rejects an empty or non-success needs context', (t) => {
   if (spawnSync('jq', ['--version']).status !== 0) {
     t.skip('jq is not on PATH, so the gate assertion cannot be evaluated');
     return;
   }
 
-  const script = verifyGateScript();
+  const { step } = readVerifyGateScript();
   const cases = [
     { needs: {}, succeeds: false },
     {
@@ -420,7 +450,7 @@ test('the ci.yml gate rejects an empty or non-success needs context', (t) => {
 
   for (const { needs, succeeds } of cases) {
     const label = JSON.stringify(needs);
-    const run = runVerifyGate(script, needs);
+    const run = runVerifyGate(step, needs);
 
     assert.equal(run.error, undefined, label);
     if (succeeds) {

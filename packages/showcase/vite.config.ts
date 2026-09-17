@@ -12,9 +12,9 @@ export default defineConfig({
   // The root pnpm override `miniflare@5.20260730.0-alpha>workerd` (package.json)
   // selects a miniflare version rather than a consumer, so it reaches this
   // plugin as well as the Workers test pool: the miniflare that
-  // @cloudflare/vite-plugin 1.50.0 resolves runs on workerd 1.20260903.1, while
-  // the plugin's own workerd dependency stays 1.20260730.1. The showcase accepts
-  // that local dev and build runtime; the override keeps its approved selector.
+  // @cloudflare/vite-plugin resolves runs on the overridden workerd, while the
+  // plugin's own workerd dependency stays 1.20260730.1. Both consumers resolve
+  // that one miniflare, so no override key reaches one without the other.
   plugins: [react(), cloudflare()],
   resolve: {
     // Mirrors tsconfig.json paths — @/ (SPA) and @flowsafe/ (deep DOM-free

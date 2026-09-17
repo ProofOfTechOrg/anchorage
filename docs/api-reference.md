@@ -86,14 +86,15 @@ The subpath also exposes `D1FleetStateDatabase`, `D1CloudflareApiRateCoordinator
 
 Safe browser imports:
 
+- `@proofoftech/breakwater/policy-engine`, `@proofoftech/breakwater/rbac`, and `@proofoftech/breakwater/audit`, which the showcase control room bundles into its browser build
 - `@proofoftech/flowsafe/approval-ui`
 - `@proofoftech/flowsafe/signals/client`
-- `@proofoftech/flowsafe/do-runner/constants` and `@proofoftech/flowsafe/do-runner/testing`, which carry the suspension deadline values, duration predicate, timeout detector and fixture minter without the runner graph
+- `@proofoftech/flowsafe/do-runner/constants` and `@proofoftech/flowsafe/do-runner/testing`, which load without the runner graph
 - `ApprovalApiClient` and structural client types
 
 Server or Worker imports:
 
-- breakwater processors and connector SDK
+- the `@proofoftech/breakwater` barrel, the `@proofoftech/breakwater/agent` processors, and `@proofoftech/breakwater/connector-sdk`
 - flowsafe approval API, agent host, the `@proofoftech/flowsafe/do-runner` entry, host kit, agents, schedules, signals, providers, tasks, artifacts, and audit export
 
 Node-only execution:

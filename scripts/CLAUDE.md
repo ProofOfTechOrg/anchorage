@@ -9,8 +9,8 @@ Repository documentation, architecture, and publication checks. Markdown syntax 
   and external links.
 - `docs-check.test.mjs` — `node:test` fixtures for the documentation checker.
 - `github-yaml-check.mjs` — validates every YAML file under `.github`.
-- `github-yaml-check.test.mjs` — `node:test` fixtures for the GitHub YAML checker.
-- `publish-ordered.mjs` — publishes Breakwater before the Changesets remainder and gates release on prerequisite peer floors.
+- `github-yaml-check.test.mjs` — `node:test` fixtures for the GitHub YAML checker, and the cases that pin `ci.yml`'s `verify` gate.
+- `publish-ordered.mjs` — publishes the `PUBLISH_PREREQUISITES` packages before the Changesets remainder and gates release on prerequisite peer floors.
 - `publish-ordered.test.mjs` — `node:test` fixtures for publish ordering, the
   publish argv and cwd shape, and the tag line `changesets/action` greps for.
 - `publish-invocation-check.mjs` — dry-runs the real publish command per package and validates peer-floor grammar in CI and the release pre-flight.
@@ -32,7 +32,7 @@ Repository documentation, architecture, and publication checks. Markdown syntax 
 
 Run a recorder manually with an explicit mode. Use `--check` to compare derived values without writing, or `--write` to replace the configured baseline and format it with Biome. Missing, unknown, or conflicting modes return status 2.
 
-`--check` compares the exports a recorder's `exports` declarations name: each declaration selects one export from the committed generated module and the derived value it is compared with. An export the committed module holds without a matching declaration is compared against nothing. `--check` does not establish refusal-guard coverage; retain the ordinary guard tests and architecture checks alongside the golden assertions.
+`--check` compares the exports a recorder's `exports` declarations name. An export the committed module holds without a matching declaration is compared against nothing. `--check` does not establish refusal-guard coverage; retain the ordinary guard tests and architecture checks alongside the golden assertions.
 
 Run these checks before accepting a generated-file change:
 

@@ -167,7 +167,7 @@ The deployment-identity gate runs before every control-plane route, so a binding
 
 `GET` and successful `POST /admin/execution-fence` return `{ state, mutationEpoch, requireMutationEpoch, transitionRevision, proofKey?, proofRunId? }`, without internal receipts. Optional mode has epoch zero and `requireMutationEpoch: false`. Every newly applied administrative command increments the revision, including a same-state command. Proof-run binding changes neither counter.
 
-`POST` accepts `{ expected, next, proofKey?, expectedMutationEpoch?, expectedRevision?, advanceMutationEpoch? }`. Supply both expected counters together as nonnegative safe-integer numbers. `advanceMutationEpoch` must be boolean when supplied; true requires the expected pair, increments the epoch once, and sets the sticky requirement in that same CAS. Ordinary state changes preserve the epoch and requirement. Invalid input returns `400`, and exhausted counters never wrap. The host owns state-transition policy; entering `proof-only` requires a path-safe proof key.
+`POST` accepts `{ expected, next, proofKey?, expectedMutationEpoch?, expectedRevision?, advanceMutationEpoch? }`. Supply both expected counters together as nonnegative safe-integer numbers. `advanceMutationEpoch` must be boolean when supplied; `true` requires the expected pair, increments the epoch once, and sets the sticky requirement in that same CAS. Ordinary state changes preserve the epoch and requirement. Invalid input returns `400`, and exhausted counters never wrap. The host owns state-transition policy; entering `proof-only` requires a path-safe proof key.
 
 An upgraded CAS compares state, epoch, and revision. An exact retry succeeds only while that exact command is the last applied upgraded command, preserving any subsequently bound proof run and the write timestamp. Matching the resulting state is not enough. An intervening admin command invalidates the retry. A valid mismatch returns `409` with `reason.code: 'FENCE_CAS_CONFLICT'`, the full current reading, and `reason.conflict: 'expectation-mismatch'`.
 
@@ -189,7 +189,7 @@ Set `mutationEpoch` on `createFlowsafeWorker()` to a nonnegative safe-integer nu
 
 The topologies stamp `x-flowsafe-mutation-epoch` for internal calls, replacing or removing incoming values. `createActorResolver()` refuses that header on public requests. Both Durable Object shells capture it before deployment verification and decode the captured value only afterward.
 
-The Fleet Control guide carries the procedure that applies this configuration: [roll out an artifact under the execution fence](fleet-control.md#roll-out-an-artifact-under-the-execution-fence) coordinates the epoch with a bounded migration of one deployment.
+[Roll out an artifact under the execution fence](fleet-control.md#roll-out-an-artifact-under-the-execution-fence) in the Fleet Control guide carries the procedure that applies this configuration.
 
 Fenced Runtime starts enforce the captured caller epoch at the initial D1 write and bind their generated execution identity with the winning claim and proof. Both hosts journal preparation and recover only exact owned generations. Generation-aware retention still requires implementation and acceptance before enabling artifact epochs across the deployment. An explicitly unfenced Runtime retains ordinary persistence and supplies no atomic fence guarantee.
 

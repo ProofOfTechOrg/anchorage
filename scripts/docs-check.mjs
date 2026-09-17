@@ -1,7 +1,13 @@
 #!/usr/bin/env node
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import {
+  existsSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+} from 'node:fs';
 import {
   basename,
   dirname,
@@ -12,7 +18,7 @@ import {
   resolve,
   sep,
 } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import GithubSlugger from 'github-slugger';
 import { toString as markdownText } from 'mdast-util-to-string';
 import remarkGfm from 'remark-gfm';
@@ -32,7 +38,6 @@ const INTERNAL_MILESTONE_PATTERN =
   /\b(?:CI-M-\d{3}(?:-\d{3})?|DL-\d{3}|INV-\d+|M-\d{3}|RA-\d{3}|[A-Z]-S\d+|R-[A-Z0-9][A-Z0-9-]*|[A-Z]-D\d+|D(?:[2-9]|\d{2,})|F\d+|P\d+(?:-lite)?|Track [A-Z]|Phase \d+)\b/g;
 const VOLATILE_COUNT_PATTERN =
   /(?<![\w.-])\d[\d,]*(?![.\d])\s+(?:tests?|test files?|packages?)\b/gi;
-const GITHUB_LINE_FRAGMENT_PATTERN = /^L\d+(?:C\d+)?(?:-L\d+(?:C\d+)?)?$/;
 const REPOSITORY_URL = 'https://github.com/ProofOfTechOrg/anchorage';
 const REQUIRED_PUBLIC_URLS = [
   'https://anchorage.proofoftech.org/',
@@ -316,13 +321,13 @@ function internalFileError(root, sourceFile, resolved, target) {
 }
 
 const REPOSITORY_BLOB_PREFIX = `${REPOSITORY_URL}/blob/main/`;
+const GITHUB_LINE_FRAGMENT_PATTERN = /^L\d+(?:C\d+)?(?:-L\d+(?:C\d+)?)?$/;
 
 // A copy-ready README cannot carry a relative link out of its package, so it
 // names such a file or heading through the permanent GitHub URL instead.
-// Resolve that URL back into this repository, with or without a fragment, and
-// report the first message `localTargetError`, `internalFileError` or
-// `absoluteAnchorError` returns. The package-boundary guard stays on the
-// relative branch, because a permanent GitHub URL is the remedy it prescribes.
+// Resolve that URL back into this repository, with or without a fragment. The
+// package-boundary guard stays on the relative branch, because a permanent
+// GitHub URL is the remedy it prescribes.
 // A URL that does not match the prefix (another host, a `tree/` path, a
 // `blob/<sha>` pin) is left to the `--external` run, which fetches it and
 // fails on 404/410; that run cannot see a bad fragment, because GitHub answers
@@ -460,6 +465,8 @@ function checkLocalLinks(root, markdownFiles, manifests) {
         }
         const inRepository = repositoryBlobTarget(root, link.target);
         if (inRepository) {
+          // Report the first message `localTargetError`, `internalFileError`
+          // or `absoluteAnchorError` returns.
           const message =
             localTargetError(inRepository, link.target) ??
             internalFileError(root, sourceFile, inRepository, link.target) ??
@@ -1059,9 +1066,17 @@ async function main() {
   }
 }
 
-const invokedPath = process.argv[1]
-  ? pathToFileURL(resolve(process.argv[1])).href
-  : undefined;
-if (invokedPath === import.meta.url) {
+// Both sides are realpathed, so a symlinked invocation still resolves to this
+// module's own path. An entry path that resolves to nothing names some other
+// module, which importers of this one rely on.
+let invokedFilePath;
+try {
+  invokedFilePath =
+    process.argv[1] === undefined ? undefined : realpathSync(process.argv[1]);
+} catch (error) {
+  if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') throw error;
+}
+
+if (invokedFilePath === realpathSync(fileURLToPath(import.meta.url))) {
   await main();
 }

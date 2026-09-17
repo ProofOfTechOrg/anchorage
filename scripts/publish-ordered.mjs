@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -278,6 +278,17 @@ async function main() {
   });
 }
 
-if (fileURLToPath(import.meta.url) === process.argv[1]) {
+// Both sides are realpathed, so a symlinked invocation still resolves to this
+// module's own path. An entry path that resolves to nothing names some other
+// module, which importers of this one rely on.
+let invokedFilePath;
+try {
+  invokedFilePath =
+    process.argv[1] === undefined ? undefined : realpathSync(process.argv[1]);
+} catch (error) {
+  if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') throw error;
+}
+
+if (invokedFilePath === realpathSync(fileURLToPath(import.meta.url))) {
   await main();
 }

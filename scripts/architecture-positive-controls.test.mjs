@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { existsSync, globSync, readdirSync, readFileSync } from 'node:fs';
 import { builtinModules, createRequire, isBuiltin } from 'node:module';
-import { join, relative } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
@@ -35,6 +35,21 @@ const migrationAdvance =
 const fleet = 'packages/fleet-control/src/fleet.ts';
 const cloudflareClient = 'packages/fleet-control/src/cloudflare-client.ts';
 const d1Database = 'packages/fleet-control/src/d1-fleet-state-database.ts';
+const fleetRequire = createRequire(
+  new URL('../packages/fleet-control/package.json', import.meta.url),
+);
+const ts = fleetRequire('typescript');
+const root = fileURLToPath(new URL('..', import.meta.url));
+const directScenarioProject =
+  'packages/fleet-control/vitest.direct-scenario.config.ts';
+const fleetControlProject = 'packages/fleet-control/vitest.config.ts';
+const rootProjectNames = {
+  [directScenarioProject]: 'fleet-control-direct-scenario',
+  'vitest.breakwater-workers.config.mts': 'breakwater-workers',
+  'vitest.flowsafe-harness.config.ts': 'flowsafe-harness',
+  'vitest.flowsafe-workers.config.ts': 'flowsafe-workers',
+  'vitest.workerd-lifecycle.config.ts': 'workerd-lifecycle',
+};
 
 function adjacencyOf(report, keep) {
   return new Map(
@@ -203,11 +218,6 @@ function assertFollowedImports(adjacency, sources) {
 }
 
 test('production transport class implementations are forbidden operation targets', () => {
-  const fleetRequire = createRequire(
-    new URL('../packages/fleet-control/package.json', import.meta.url),
-  );
-  const ts = fleetRequire('typescript');
-  const root = fileURLToPath(new URL('..', import.meta.url));
   const sourceRoot = fileURLToPath(
     new URL('../packages/fleet-control/src/', import.meta.url),
   );
@@ -381,55 +391,96 @@ test('every extra cruise entry is keyed by an architecture rule', () => {
   }
 });
 
-// Membership is resolved by parsing the config sources: loading the projects
-// through vitest would pull the Workers pool and workerd into this process.
-test('every root vitest project resolves the files it declares', () => {
-  const fleetRequire = createRequire(
-    new URL('../packages/fleet-control/package.json', import.meta.url),
+// These controls read the config sources instead of loading the projects
+// through vitest, which would pull the Workers pool and workerd into this
+// process. Resolution is node's `globSync`, assumed to answer a `projects`
+// entry and an `include` entry the way vitest's and tsc's own resolvers do;
+// what the controls add over vitest's startup error is the `deepEqual` over
+// the resolved entries, which names a config no entry reaches.
+const parse = (projectPath) => {
+  const fileName = join(root, projectPath);
+  return ts.createSourceFile(
+    fileName,
+    readFileSync(fileName, 'utf8'),
+    ts.ScriptTarget.Latest,
+    true,
   );
-  const ts = fleetRequire('typescript');
-  const root = fileURLToPath(new URL('..', import.meta.url));
-  const parse = (configPath) => {
-    const fileName = join(root, configPath);
-    return ts.createSourceFile(
-      fileName,
-      readFileSync(fileName, 'utf8'),
+};
+const initializerOf = (source, property) => {
+  const found = [];
+  const visit = (node) => {
+    if (
+      ts.isPropertyAssignment(node) &&
+      ts.isIdentifier(node.name) &&
+      node.name.text === property
+    ) {
+      found.push(node.initializer);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  assert.equal(
+    found.length,
+    1,
+    `${relative(root, source.fileName)} sets '${property}' once`,
+  );
+  return found[0];
+};
+// The array element that is not a string literal and still leaves the parse
+// complete: vitest's own default exclude list, spread into a package `exclude`.
+const readableSpread = 'configDefaults.exclude';
+const stringsOf = (source, property) => {
+  const label = relative(root, source.fileName);
+  const initializer = initializerOf(source, property);
+  assert.ok(
+    ts.isArrayLiteralExpression(initializer),
+    `${label} sets '${property}' to an array literal`,
+  );
+  const strings = [];
+  for (const element of initializer.elements) {
+    if (ts.isStringLiteralLike(element)) {
+      strings.push(element.text);
+      continue;
+    }
+    assert.ok(
+      ts.isSpreadElement(element) &&
+        element.expression.getText(source) === readableSpread,
+      `${label} sets '${property}' with an element this control cannot read: ${element.getText(source)}`,
+    );
+  }
+  return strings;
+};
+
+test('the config parse refuses an array element it cannot read', () => {
+  const synthetic = (elements) =>
+    ts.createSourceFile(
+      join(root, 'vitest.synthetic.config.ts'),
+      `export default { test: { projects: [${elements}] } };`,
       ts.ScriptTarget.Latest,
       true,
     );
-  };
-  const initializerOf = (source, property, configPath) => {
-    const found = [];
-    const visit = (node) => {
-      if (
-        ts.isPropertyAssignment(node) &&
-        ts.isIdentifier(node.name) &&
-        node.name.text === property
-      ) {
-        found.push(node.initializer);
-      }
-      ts.forEachChild(node, visit);
-    };
-    visit(source);
-    assert.equal(found.length, 1, `${configPath} sets '${property}' once`);
-    return found[0];
-  };
-  const stringsOf = (source, property, configPath) => {
-    const initializer = initializerOf(source, property, configPath);
-    assert.ok(
-      ts.isArrayLiteralExpression(initializer),
-      `${configPath} sets '${property}' to an array literal`,
+  for (const elements of [
+    "...['packages/missing-*/vitest.config.ts']",
+    "{ test: { name: 'inline' } }",
+    'declaredElsewhere',
+  ]) {
+    assert.throws(
+      () => stringsOf(synthetic(elements), 'projects'),
+      /cannot read/,
+      elements,
     );
-    return initializer.elements
-      .filter((element) => ts.isStringLiteralLike(element))
-      .map((element) => element.text);
-  };
-
-  const entries = stringsOf(
-    parse('vitest.config.ts'),
-    'projects',
-    'vitest.config.ts',
+  }
+  assert.deepEqual(
+    stringsOf(
+      synthetic("...configDefaults.exclude, 'packages/*/vitest.config.ts'"),
+      'projects',
+    ),
+    ['packages/*/vitest.config.ts'],
   );
+});
+
+test('the root vitest projects resolve to exactly the config files the repository holds', () => {
+  const entries = stringsOf(parse('vitest.config.ts'), 'projects');
   const resolved = new Set();
   for (const entry of entries) {
     const matches = globSync(entry, { cwd: root });
@@ -443,42 +494,73 @@ test('every root vitest project resolves the files it declares', () => {
   })
     .filter((entry) => entry.isDirectory())
     .map((entry) => `packages/${entry.name}/vitest.config.ts`)
-    .filter((configPath) => existsSync(join(root, configPath)));
+    .filter((projectPath) => existsSync(join(root, projectPath)));
+  const rootProjects = globSync('vitest.*.config.*', { cwd: root }).map(
+    (match) => match.split('\\').join('/'),
+  );
   assert.deepEqual(
     [...resolved].sort(),
-    [
-      ...packageProjects,
-      'packages/fleet-control/vitest.direct-scenario.config.ts',
-      'vitest.breakwater-workers.config.mts',
-      'vitest.flowsafe-harness.config.ts',
-      'vitest.flowsafe-workers.config.ts',
-      'vitest.workerd-lifecycle.config.ts',
-    ].sort(),
+    [...packageProjects, ...rootProjects, directScenarioProject].sort(),
   );
+});
 
-  const directPath = 'packages/fleet-control/vitest.direct-scenario.config.ts';
-  const direct = parse(directPath);
-  const projectName = initializerOf(direct, 'name', directPath);
-  assert.ok(
-    ts.isStringLiteralLike(projectName),
-    `${directPath} names its project with a string literal`,
-  );
-  assert.equal(projectName.text, 'fleet-control-direct-scenario');
-  const directInclude = stringsOf(direct, 'include', directPath);
-  const packageExclude = stringsOf(
-    parse('packages/fleet-control/vitest.config.ts'),
-    'exclude',
-    'packages/fleet-control/vitest.config.ts',
-  );
-  assert.ok(directInclude.length > 0, `${directPath} includes no file`);
-  for (const entry of directInclude) {
+test('every root vitest project declares its expected name', () => {
+  for (const [projectPath, expected] of Object.entries(rootProjectNames)) {
+    const projectName = initializerOf(parse(projectPath), 'name');
     assert.ok(
-      globSync(entry, { cwd: join(root, 'packages/fleet-control') }).length > 0,
-      `fleet-control-direct-scenario include '${entry}' resolves no file`,
+      ts.isStringLiteralLike(projectName),
+      `${projectPath} names its project with a string literal`,
     );
+    assert.equal(projectName.text, expected, projectPath);
+  }
+});
+
+test('the direct-scenario suites are declared by that project and excluded from the package project', () => {
+  const expectedInclude = [
+    'test/direct-credentialed-scenario.test.ts',
+    'test/direct-reference-fence.harness.test.ts',
+  ];
+  const directInclude = stringsOf(parse(directScenarioProject), 'include');
+  const packageExclude = stringsOf(parse(fleetControlProject), 'exclude');
+  assert.deepEqual([...directInclude].sort(), [...expectedInclude].sort());
+  for (const entry of directInclude) {
     assert.ok(
       packageExclude.includes(entry),
       `the package project does not exclude '${entry}'`,
+    );
+  }
+});
+
+test('every root vitest project include entry resolves to a file', () => {
+  for (const projectPath of Object.keys(rootProjectNames)) {
+    const projectRoot = dirname(join(root, projectPath));
+    for (const entry of stringsOf(parse(projectPath), 'include')) {
+      assert.ok(
+        globSync(entry, { cwd: projectRoot }).length > 0,
+        `${projectPath} include '${entry}' resolves no file`,
+      );
+    }
+  }
+});
+
+test('every tsconfig.harness.json include entry resolves to a file', () => {
+  const harnessPath = join(root, 'tsconfig.harness.json');
+  const { config: harness, error } = ts.readConfigFile(harnessPath, (path) =>
+    readFileSync(path, 'utf8'),
+  );
+  assert.equal(
+    error,
+    undefined,
+    error && ts.flattenDiagnosticMessageText(error.messageText, '\n'),
+  );
+  assert.ok(
+    Array.isArray(harness.include) && harness.include.length > 0,
+    'tsconfig.harness.json declares no include entry',
+  );
+  for (const entry of harness.include) {
+    assert.ok(
+      globSync(entry, { cwd: root }).length > 0,
+      `tsconfig.harness.json include '${entry}' resolves no file`,
     );
   }
 });
@@ -495,7 +577,7 @@ for (const [ruleName, fixture] of Object.entries(controls)) {
       ...entries,
     ];
     const result = spawnSync(process.execPath, args, {
-      cwd: fileURLToPath(new URL('..', import.meta.url)),
+      cwd: root,
       encoding: 'utf8',
       maxBuffer: 64 * 1024 * 1024,
     });

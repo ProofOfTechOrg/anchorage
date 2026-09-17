@@ -389,6 +389,38 @@ test('reachability follows absolute repository links into the docs tree', () => 
   );
 });
 
+test('reachability skips ignored schemes, off-repository URLs, and missing blob targets', () => {
+  const root = fixture({
+    'docs/README.md': `# Documentation
+
+[Mirror](https://example.com/docs/stranded-external.md)
+[Archive](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/archive/stranded-blob.md)
+[Contact](mailto:docs@example.com)
+`,
+    'docs/stranded-external.md': '# Stranded external\n',
+    'docs/stranded-blob.md': '# Stranded blob\n',
+  });
+
+  const result = checkRepository({
+    root,
+    markdownFiles: markdownFiles(root, [
+      'docs/README.md',
+      'docs/stranded-external.md',
+      'docs/stranded-blob.md',
+    ]),
+    packageChecks: false,
+  });
+
+  assert.deepEqual(
+    result.errors.map((error) => `${error.file}: ${error.message}`),
+    [
+      'docs/README.md: link target does not exist: https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/archive/stranded-blob.md',
+      'docs/stranded-blob.md: guide is not reachable from a public documentation index',
+      'docs/stranded-external.md: guide is not reachable from a public documentation index',
+    ],
+  );
+});
+
 test('absolute repository links obey the internal-file policy', () => {
   const root = fixture({
     'packages/example/README.md': `# Example
@@ -502,6 +534,34 @@ Public F4 remains visible.
   assert.deepEqual(
     result.errors.map((error) => error.message),
     ['internal milestone token is not public documentation: F4'],
+  );
+});
+
+test('the root README carries every canonical public URL', () => {
+  const root = fixture({
+    'package.json': '{\n  "name": "anchorage"\n}\n',
+    'README.md': `# Anchorage
+
+- [Demo](https://anchorage.proofoftech.org/)
+- [Source](https://github.com/ProofOfTechOrg/anchorage)
+- [Breakwater](https://www.npmjs.com/package/@proofoftech/breakwater)
+- [Flowsafe](https://www.npmjs.com/package/@proofoftech/flowsafe)
+- [Fleet control](https://www.npmjs.com/package/@proofoftech/fleet-control)
+`,
+  });
+
+  const result = checkRepository({
+    root,
+    markdownFiles: markdownFiles(root, ['README.md']),
+    packageChecks: false,
+    orphanChecks: false,
+  });
+
+  assert.deepEqual(
+    result.errors.map((error) => `${error.file}: ${error.message}`),
+    [
+      'README.md: README is missing the canonical public URL: https://proofoftechorg.github.io/anchorage/',
+    ],
   );
 });
 
