@@ -719,12 +719,9 @@ function assertRetiredDeploymentMode(
 }
 
 // Refuses a database that already answers to the name this provision reserves.
-// The reserved name is `spec.databaseName` at every call site: a prior that
-// reached here passed `assertImmutableDeploymentMapping`, which refuses a row
-// whose `databaseName` differs. Over a retired terminal row the caller passes
-// that row's database ID, so an operator reading the refusal can tell the
-// retired deployment's own resurrected database from a foreign one answering
-// to the same name.
+// Over a retired terminal row the caller passes that row's database ID, so an
+// operator reading the refusal can tell the retired deployment's own
+// resurrected database from a foreign one answering to the same name.
 async function assertReservedDatabaseNameFree(
   backend: ProvisioningBackend,
   spec: DeploymentSpec,

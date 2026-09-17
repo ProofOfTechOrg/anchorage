@@ -30,6 +30,7 @@ import { directDeploymentSpec } from '../../scripts/direct-credentialed-spec.js'
 import {
   DIRECT_TENANT_OBJECT_BODY,
   DIRECT_TENANT_OBJECT_KEY,
+  DIRECT_TENANT_ROUTES,
   directTenantMutationEpoch,
   directTenantProbeEpoch,
 } from '../../scripts/direct-credentialed-tenant-object.mjs';
@@ -64,12 +65,9 @@ const ADMIN_ROUTES: readonly string[] = Object.freeze([
 ]);
 
 /** Tenant routes the harness answers with the application probe credential. */
-const APPLICATION_ROUTES: readonly string[] = Object.freeze([
-  '/__direct/health',
-  '/__direct/object',
-  '/__direct/fence-mutate',
-  '/__direct/fence-probe',
-]);
+const APPLICATION_ROUTES: readonly string[] = Object.freeze(
+  Object.values(DIRECT_TENANT_ROUTES),
+);
 
 /** The union a supplied `applicationFetch` is handed. */
 const TENANT_ROUTES: readonly string[] = Object.freeze([
@@ -491,7 +489,10 @@ export async function createDirectReferenceHarness(
       releaseBinding && typeof releaseBinding === 'object'
         ? Reflect.get(releaseBinding, 'text')
         : undefined;
-    if (url.pathname === '/__direct/health' && request.method === 'GET') {
+    if (
+      url.pathname === DIRECT_TENANT_ROUTES.health &&
+      request.method === 'GET'
+    ) {
       const rows = database.d1.queryDatabase(
         'SELECT marker FROM direct_conformance_fixture WHERE id=1',
       );
@@ -501,17 +502,23 @@ export async function createDirectReferenceHarness(
       return fixtureExecutionFence(request, database.d1);
     if (url.pathname === '/admin/inventory')
       return fixtureInventory(request, url, database.d1);
-    if (url.pathname === '/__direct/fence-mutate' && request.method === 'POST')
+    if (
+      url.pathname === DIRECT_TENANT_ROUTES.fenceMutate &&
+      request.method === 'POST'
+    )
       return fixtureFenceOutcome(
         database.d1,
         directTenantMutationEpoch(release),
       );
-    if (url.pathname === '/__direct/fence-probe' && request.method === 'POST')
+    if (
+      url.pathname === DIRECT_TENANT_ROUTES.fenceProbe &&
+      request.method === 'POST'
+    )
       return fixtureFenceProbe(request, database.d1, release);
     const bucket = record.applicationResources?.find(
       (resource) => resource.name === 'PROBE_BUCKET',
     );
-    if (!bucket || url.pathname !== '/__direct/object')
+    if (!bucket || url.pathname !== DIRECT_TENANT_ROUTES.object)
       throw new Error('unknown fixture application route');
     const key = `${bucket.jurisdiction}:${bucket.bucketName}/${DIRECT_TENANT_OBJECT_KEY}`;
     if (request.method === 'POST') {

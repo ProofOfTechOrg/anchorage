@@ -1007,7 +1007,7 @@ describe('operation fake guarded progress contract', () => {
     }
   });
 
-  it('refuses missing updates and different immutable bytes before sibling writes, and accepts exact retries', async () => {
+  it('migration kind: refuses missing updates and different immutable bytes before sibling writes, and accepts exact retries', async () => {
     const secondRow = {
       ...row,
       ordinal: 1,
@@ -1079,7 +1079,7 @@ describe('operation fake guarded progress contract', () => {
     }
   });
 
-  it('compares record payloads canonically for fresh commits and convergence', async () => {
+  it('audit kind: compares record payloads canonically for fresh commits and convergence', async () => {
     const record: FleetRecord = {
       tenantTag: 'canonical',
       backend: 'plain-worker',
@@ -1152,7 +1152,7 @@ describe('operation fake guarded progress contract', () => {
     });
   });
 
-  it('refuses multiple failure updates before changing rows or releasing the head', async () => {
+  it('migration kind: refuses multiple failure updates before changing rows or releasing the head', async () => {
     const secondRow = {
       ...row,
       ordinal: 1,

@@ -37,12 +37,12 @@ export const FLEET_OPERATION_INTAKE_BYTE_BOUND = 16 * 1024 * 1024;
 export const FLEET_OPERATION_STAGE_BATCH_STATEMENTS = 100;
 /**
  * Per-kind cap on the non-`record` staged rows one read may return: at most
- * 99 rows per record times 10,000 records. The 99 is the per-record
- * batch ceiling the audit coordinator enforces over the `finding` and `fact`
- * rows one record emits together, the remaining statement of the batch being
- * the run record's own update. It derives no bound for a global stage's
- * findings, nor for R4-C.2's `item` rows, where this constant is a plain
- * ceiling rather than a derived bound.
+ * 99 rows per record times 10,000 records. The 99 is the per-record batch
+ * ceiling the audit coordinator enforces over the `finding` and `fact` rows
+ * one record emits together, the remaining statement of the batch being the
+ * run record's own update. It derives no bound for a global stage's
+ * findings, nor for the migration coordinator's `item` rows, where this
+ * constant is a plain ceiling rather than a derived bound.
  */
 export const FLEET_OPERATION_ROW_READ_BOUND =
   (FLEET_OPERATION_STAGE_BATCH_STATEMENTS - 1) * FLEET_OPERATION_ITEM_BOUND;
@@ -129,8 +129,8 @@ export interface FleetOperationItemsIntakeInput {
 /**
  * Why an intake was refused. `itemOrdinal` names the offending item for the
  * per-item reasons; the audit coordinator maps every reason to a fixed
- * message and does not read it, but it is carried so R4-C.2's migration
- * intake — which refuses one item out of a batch — can report which.
+ * message and does not read it, but it is carried so the migration intake —
+ * which refuses one item out of a batch — can report which.
  */
 export type FleetOperationIntakeRefusal =
   | { readonly reason: 'item-count' }
@@ -185,8 +185,8 @@ export class FleetOperationStoreCapabilityError extends Error {
 /**
  * The fixed refusal message raised when a persisted operation carries the
  * other operation kind. It lives here so that the audit coordinator's sites,
- * `D1FleetOperationStore`'s start probe and its two terminal probes, and
- * R4-C.2's migration coordinator all emit byte-identical text.
+ * `D1FleetOperationStore`'s start probe and its two terminal probes, and the
+ * migration coordinator all emit byte-identical text.
  */
 export function fleetOperationOtherKindMessage(operationId: string): string {
   return `fleet operation '${operationId}' belongs to the other operation kind`;
@@ -256,11 +256,10 @@ export interface FleetOperationStore {
    * smallest qualifying ordinals; omitting a row whose ordinal is below one
    * the page returns is non-conforming. An implementation must accept any
    * `limit` from 1 through 1,000 and serves a larger one at 1,000 — the one
-   * documented ceiling, which `fleetOperationPageLimit` applies — so a `limit`
-   * above the ceiling costs the caller the rows beyond it rather than the
-   * read. A `limit` that is not a safe integer of at least 1 refuses. The
-   * upper end is a hard requirement, not a preference:
-   * `readAllFleetOperationRows` passes this module's
+   * documented ceiling — so a `limit` above the ceiling costs the caller the
+   * rows beyond it rather than the read. A `limit` that is not a safe integer
+   * of at least 1 refuses. The upper end is a hard requirement, not a
+   * preference: `readAllFleetOperationRows` passes this module's
    * `FLEET_OPERATION_ROW_PAGE_LIMIT` — 1,000, and unexported, so the bound is
    * restated here as a literal — as the `limit` on every page it requests,
    * with no negotiation, so a store supporting a narrower range throws on
@@ -296,6 +295,17 @@ export interface FleetOperationStore {
     }>,
   ): Promise<Readonly<{ deleted: number; releasedPins: number }>>;
 }
+
+/**
+ * The {@link FleetOperationStore} members a bounded advance coordinator calls
+ * and gates an injected store on. It lives here so that a coordinator reads
+ * the port's own list rather than restating it.
+ */
+export const FLEET_OPERATION_STORE_ADVANCE_MEMBERS = Object.freeze([
+  'withAccountOperationLease',
+  'readOperationById',
+  'readOperationRowsPage',
+] as const satisfies readonly (keyof FleetOperationStore)[]);
 
 export interface FleetOperationLease {
   /**
@@ -383,8 +393,8 @@ export interface FleetOperationLease {
    * stamping its terminal time. `expectedRowCounts` asserts the FINAL row
    * count per kind, so a run that lost or double-wrote rows cannot finalize.
    * `requireAllItemsComplete` additionally demands that the number of `item`
-   * rows in a complete state equals the progress item count — R4-C.2's
-   * per-item migration contract, unused by the audit coordinator. Returns the
+   * rows in a complete state equals the progress item count — the per-item
+   * migration contract, unused by the audit coordinator. Returns the
    * persisted terminal record.
    */
   finalizeOperation(

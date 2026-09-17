@@ -95,6 +95,7 @@ import type {
   ProvisioningPhase,
 } from './types.js';
 import {
+  applicationR2ResourceFromProgress,
   assertNoActiveCleanup,
   assertNoActiveDecommission,
   BACKEND_SWITCH_SUBPHASES,
@@ -2502,9 +2503,8 @@ function withoutConsumedSwitchEntryCarriers(
 
 // The top-level `applicationResources` a switch teardown's record carries: the
 // `applicationR2Progress` entries the teardown persists, projected back onto
-// the resources they track. `assertCompleteRecord` compares a record's own
-// states against this same projection, so the paths that write a teardown
-// record share the one expression that produces it.
+// the resources they track through `applicationR2ResourceFromProgress`, which
+// `assertCompleteRecord` also reads to compare a record's own states.
 function switchTeardownApplicationResources(
   intent: BackendSwitchIntent,
 ): readonly import('./types.js').ApplicationR2Resource[] {
@@ -2515,7 +2515,7 @@ function switchTeardownApplicationResources(
       subphase: resource.state,
     })) ??
     []
-  ).map(({ resource, subphase }) => ({ ...resource, state: subphase }));
+  ).map(applicationR2ResourceFromProgress);
 }
 
 /** @internal Atomically consumes switch-entry carriers and installs its shell. */
@@ -4205,10 +4205,9 @@ async function decommissionBackendSwitchLegacy(options: {
 
         await convergeApplicationR2Deletion({
           spec: options.targetSpec,
-          resources: applicationR2Progress.map(({ resource, subphase }) => ({
-            ...resource,
-            state: subphase,
-          })),
+          resources: applicationR2Progress.map(
+            applicationR2ResourceFromProgress,
+          ),
           backend: {
             findApplicationR2Bucket: (resource) =>
               options.provider.findSwitchApplicationR2(resource),
@@ -5646,6 +5645,11 @@ export interface AdvanceBackendSwitchDecommissionOptions {
   readonly currentSpec?: DeploymentSpec;
   readonly action: DecommissionAdvanceAction;
   readonly maxProviderRequests: number;
+  /**
+   * Call-local cancellation, never persisted. This engine forwards it to the
+   * bounded attachment scan, which is where it is honoured; the engine takes
+   * no step of its own on it.
+   */
   readonly signal?: AbortSignal;
   readonly clock?: () => number;
   readonly randomUUID: () => string;

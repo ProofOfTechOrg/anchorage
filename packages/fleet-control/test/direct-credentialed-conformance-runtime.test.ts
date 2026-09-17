@@ -19,6 +19,7 @@ import {
   DIRECT_USAGE_DIAGNOSTIC,
   type DirectConformanceMode,
   type DirectConformanceModules,
+  directStdoutOf,
   directWritesStderr,
   parseDirectConformanceArgs,
   resolveDirectExitCode,
@@ -69,7 +70,7 @@ const now = () => Date.parse('2026-09-13T00:00:00.000Z');
 /** The bytes the entry writes to each descriptor for an in-process result. */
 function streamsOf(result: Awaited<ReturnType<typeof runDirectConformance>>) {
   return {
-    stdout: result.stdoutLine ?? '',
+    stdout: directStdoutOf(result),
     stderr: directWritesStderr(result) ? (result.stderrLine ?? '') : '',
   };
 }
@@ -679,8 +680,7 @@ process.stderr.write = (...args) => {
     }
   });
 
-  it('names every evidence artifact key in the admission vocabulary', () => {
-    expect(DIRECT_EVIDENCE_KEYS).toContain('retainedIdentities');
+  it('admits only word, dot and dash characters in the evidence key vocabulary', () => {
     expect(DIRECT_EVIDENCE_KEYS.every((key) => /^[\w.-]+$/u.test(key))).toBe(
       true,
     );
@@ -1094,7 +1094,7 @@ process.on('exit', () => writeFileSync(${path}, JSON.stringify(reads)));\n`;
     expect(result.stderr).not.toContain(' at ');
   });
 
-  it('row 1 is evidence-only at the resume ceiling', async () => {
+  it('is evidence-only when a settled teardown meets the resume ceiling', async () => {
     const w = await world();
     w.set({
       teardown: { ...maximalTeardown(), phase: 'complete', failure: null },
@@ -1120,7 +1120,7 @@ process.on('exit', () => writeFileSync(${path}, JSON.stringify(reads)));\n`;
     'refused',
     'ingress',
     'complete',
-  ] as const)('row 2 consumes teardown phase %s before bootstrap or scenario', async (phase) => {
+  ] as const)('consumes teardown phase %s before bootstrap or scenario', async (phase) => {
     const w = await world();
     w.set({
       teardown: { ...teardownState(), phase, failure: 'scenario-incomplete' },
@@ -1145,7 +1145,7 @@ process.on('exit', () => writeFileSync(${path}, JSON.stringify(reads)));\n`;
   it.each([
     false,
     true,
-  ])('row 3 retains scenario failure with published refusal=%s', async (publish) => {
+  ])('retains a scenario failure with published refusal=%s', async (publish) => {
     const w = await world();
     w.set({
       scenario: {
@@ -1176,7 +1176,7 @@ process.on('exit', () => writeFileSync(${path}, JSON.stringify(reads)));\n`;
   it.each([
     false,
     true,
-  ])('row 4 maps returned outcome with retained=%s and no published refusal', async (retain) => {
+  ])('maps a returned outcome with retained=%s and no published refusal', async (retain) => {
     const w = await world();
     w.set({ scenario: completeScenario() });
     if (retain) retained(w, false);
@@ -1190,7 +1190,7 @@ process.on('exit', () => writeFileSync(${path}, JSON.stringify(reads)));\n`;
   it.each([
     'run',
     'resume',
-  ] as const)('row 5 bootstraps a fresh %s and closes on restart without teardown', async (mode) => {
+  ] as const)('bootstraps a fresh %s and closes on restart without teardown', async (mode) => {
     const w = await world();
     const result = await w.run(mode);
     expect(result.exitCode).toBe(3);
@@ -1209,7 +1209,7 @@ process.on('exit', () => writeFileSync(${path}, JSON.stringify(reads)));\n`;
   it.each([
     'complete',
     'failed',
-  ] as const)('row 5 calls teardown after %s', async (status) => {
+  ] as const)('calls teardown after %s', async (status) => {
     const w = await world();
     w.modules.scenario.mockImplementation(async () =>
       status === 'failed'

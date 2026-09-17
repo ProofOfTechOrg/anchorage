@@ -7,9 +7,11 @@ import { join } from 'node:path';
 import { preflightDirectConformance } from '../../scripts/direct-credentialed-conformance-preflight.mjs';
 import {
   DIRECT_RESIDUAL_SURFACES,
+  DIRECT_TEARDOWN_MAXIMA,
+} from '../../scripts/direct-credentialed-reference-vocabulary.mjs';
+import {
   DIRECT_SCENARIO_ARRAY_MAXIMA,
   DIRECT_SCENARIO_OPERATION_SLOTS,
-  DIRECT_TEARDOWN_MAXIMA,
   type DirectBootstrapContext,
   type DirectBootstrapMutationReceipt,
   type DirectResidualObservation,

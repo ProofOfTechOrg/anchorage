@@ -389,10 +389,10 @@ async function commit(
 }
 
 function assertBackendSwitchInactiveForCleanup(record: FleetRecord): void {
-  // The settled-subphase set is the one backend-switch.ts
-  // assertBackendSwitchInactive reads, so the two cannot drift apart. This
-  // engine reads it from types.ts because the transport-neutral rule forbids
-  // importing backend-switch.ts here and permits types.ts.
+  // Reads the same settled-subphase set as backend-switch.ts's
+  // assertBackendSwitchInactive. This engine reads it from types.ts because
+  // the transport-neutral rule forbids importing backend-switch.ts here and
+  // permits types.ts.
   if (
     record.backendSwitchIntent &&
     !SETTLED_BACKEND_SWITCH_SUBPHASES.has(record.backendSwitchIntent.subphase)

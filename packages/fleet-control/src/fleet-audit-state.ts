@@ -139,9 +139,10 @@ export type FleetAuditFactPayload =
  * Byte-bounded provider-claimed text: a string within the module's string
  * byte bound, with NO non-empty requirement.
  *
- * Admitting the empty string is the deliberate §5.1 EXCEPTION round 3
- * established, not an oversight — do not add a `value.length > 0` clause
- * back. `fleetOperationBoundedString`, which still carried that superseded
+ * Admitting the empty string is the exception this predicate exists for:
+ * provider-claimed text carries no non-empty requirement, so a
+ * `value.length > 0` clause here refuses a conforming value.
+ * `fleetOperationBoundedString`, which still carried that superseded
  * clause under a near-identical name, was deleted for exactly that reason;
  * the name here says what the predicate is for rather than what it bounds.
  */

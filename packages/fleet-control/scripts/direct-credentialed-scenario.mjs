@@ -15,6 +15,7 @@ import {
   DIRECT_SCENARIO_FAILURES,
   DirectRunStateError,
   isForceIdentity,
+  mutationPending,
 } from './direct-credentialed-run-state.mjs';
 import {
   DIRECT_SCENARIO_MIN_INVOCATIONS,
@@ -123,11 +124,7 @@ export async function runDirectCredentialedScenario(input) {
   };
   const invoke = async (action, mutates = false, migration = null) => {
     const snapshot = journal.snapshot();
-    requireFact(
-      snapshot.lastInvocation?.state !== 'pending' &&
-        !snapshot.bootstrap?.pending,
-      'outcome-unknown',
-    );
+    requireFact(!mutationPending(snapshot), 'outcome-unknown');
     const remaining =
       snapshot.binding.maxInvocations - snapshot.invocationCount;
     checkInvocationHeadroom(state.phase, state.phaseCalls, remaining);
@@ -804,11 +801,7 @@ export async function runDirectCredentialedScenario(input) {
     busy.add(journal);
     acquired = true;
     const snapshot = journal.snapshot();
-    requireFact(
-      snapshot.lastInvocation?.state !== 'pending' &&
-        !snapshot.bootstrap?.pending,
-      'outcome-unknown',
-    );
+    requireFact(!mutationPending(snapshot), 'outcome-unknown');
     requireFact(
       snapshot.bootstrap?.controlReadOrdinal &&
         snapshot.binding.configSha256 === prepared.configSha256 &&
@@ -1227,12 +1220,7 @@ export async function runDirectCredentialedScenario(input) {
     const detail = failureDetails.has(error?.detail) ? error.detail : undefined;
     let code = observed;
     const snapshot = acquired ? journal.snapshot() : null;
-    if (
-      state &&
-      snapshot &&
-      snapshot.lastInvocation?.state !== 'pending' &&
-      !snapshot.bootstrap?.pending
-    ) {
+    if (state && snapshot && !mutationPending(snapshot)) {
       state.failure ??= {
         code: observed,
         ordinal: snapshot.invocationCount,

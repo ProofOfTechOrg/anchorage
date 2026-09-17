@@ -6,6 +6,7 @@ import {
   DIRECT_INTERNAL_ERROR_DIAGNOSTIC,
   DIRECT_USAGE_DIAGNOSTIC,
   directLineCarries,
+  directStdoutOf,
   directWritesStderr,
   isDirectLiveMode,
   parseDirectConformanceArgs,
@@ -85,10 +86,8 @@ if (mode === null) {
     .then((result) => {
       armGuard();
       setExitCode(result.exitCode);
-      if (
-        result.stdoutLine !== null &&
-        !write(process.stdout, result.stdoutLine)
-      )
+      const stdout = directStdoutOf(result);
+      if (stdout !== '' && !write(process.stdout, stdout))
         setExitCode(exits.evidenceFailed);
       if (directWritesStderr(result)) write(process.stderr, result.stderrLine);
     })

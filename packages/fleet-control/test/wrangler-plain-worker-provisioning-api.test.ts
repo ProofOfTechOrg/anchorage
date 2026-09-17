@@ -60,11 +60,28 @@ function scratchDirectories(): string[] {
   return directories;
 }
 
+/**
+ * Lands one write between the export's size read and its hash. The adapter
+ * reads the size through `node:fs/promises` and hashes through a `node:fs`
+ * stream, so a hook inside the size read is what puts a write between them.
+ */
+const exportRace = vi.hoisted<{
+  growAfterSizeRead: ((path: string) => Promise<void>) | undefined;
+}>(() => ({ growAfterSizeRead: undefined }));
+
 vi.mock('node:fs/promises', async () => {
   const { createFsPromisesMock } = await import(
     './fixtures/wrangler-fs-mock.js'
   );
-  return createFsPromisesMock(fsControl);
+  const mock = await createFsPromisesMock(fsControl);
+  return {
+    ...mock,
+    async stat(...arguments_: Parameters<typeof mock.stat>) {
+      const metadata = await mock.stat(...arguments_);
+      await exportRace.growAfterSizeRead?.(String(arguments_[0]));
+      return metadata;
+    },
+  };
 });
 
 const exportDirectories = registerScratchCleanup(fsControl, {
@@ -83,7 +100,9 @@ class FakeRunner implements CommandRunner {
   constructor(
     readonly handler: (
       arguments_: readonly string[],
-    ) => Promise<CommandResult> = async () => ({ stdout: '', stderr: '' }),
+    ) => Promise<CommandResult> = async (arguments_) => {
+      throw new Error(`unstubbed wrangler argv: ${arguments_.join(' ')}`);
+    },
   ) {}
 
   run(arguments_: readonly string[]): Promise<CommandResult> {
@@ -91,6 +110,13 @@ class FakeRunner implements CommandRunner {
     return this.handler(arguments_);
   }
 }
+
+/**
+ * A runner that answers any argv with an empty success, for a case whose
+ * subject is the filesystem outcome rather than the argv.
+ */
+const succeedingRunner = () =>
+  new FakeRunner(async () => ({ stdout: '', stderr: '' }));
 
 async function api(
   runner: CommandRunner,
@@ -1036,7 +1062,7 @@ describe('WranglerPlainWorkerProvisioningApi mutations', () => {
     scratchDirectories().length = 0;
     fsControl.failFleetCleanup = true;
     fsControl.cleanupError = undefined;
-    const cleanup = await api(new FakeRunner());
+    const cleanup = await api(succeedingRunner());
     await expect(
       cleanup.uploadCandidate(uploadIntent('staged'), mutationFence()),
     ).resolves.toEqual({
@@ -1078,7 +1104,7 @@ describe('WranglerPlainWorkerProvisioningApi mutations', () => {
   });
 
   it('returns delete outcomes and rethrows non-absence failures', async () => {
-    const deleted = await api(new FakeRunner());
+    const deleted = await api(succeedingRunner());
     await expect(
       deleted.deleteWorkerScript('worker', mutationFence()),
     ).resolves.toBe('deleted');
@@ -1134,7 +1160,7 @@ describe('WranglerPlainWorkerProvisioningApi mutations', () => {
 
     scratchDirectories().length = 0;
     fsControl.failFleetCleanup = true;
-    const cleanup = await api(new FakeRunner());
+    const cleanup = await api(succeedingRunner());
     await expect(
       cleanup.uploadCandidate(uploadIntent('staged'), mutationFence()),
     ).resolves.toEqual({
@@ -1820,5 +1846,71 @@ describe('WranglerPlainWorkerProvisioningApi exports', () => {
       'durable database export store returned mismatched committed integrity',
     );
     await expectExportScratchRemoved(output());
+  });
+
+  it('refuses an export whose bytes change between the size read and the hash', async () => {
+    const exportDirectory = await mkdtemp(
+      join(tmpdir(), 'anchorage-fleet-receipt-'),
+    );
+    exportDirectories.add(exportDirectory);
+    let outputPath = '';
+    const runner = new FakeRunner(async (arguments_) => {
+      outputPath = arguments_[arguments_.indexOf('--output') + 1] as string;
+      await writeFile(outputPath, 'select 1;');
+      return { stdout: '', stderr: '' };
+    });
+    const store: DurableDatabaseExportStore = {
+      receiptAuthority: RECEIPT_AUTHORITY,
+      async write() {
+        throw new Error('legacy export must not run');
+      },
+      async writeReceipt() {
+        throw new Error('a changed export must not reach the receipt store');
+      },
+    };
+    const subject = await api(runner, { exportDirectory, exportStore: store });
+    const exportReceipt = subject.exportDatabaseReceipt;
+    if (!exportReceipt) {
+      throw new Error('expected receipt export capability');
+    }
+    const actual =
+      await vi.importActual<typeof import('node:fs/promises')>(
+        'node:fs/promises',
+      );
+    exportRace.growAfterSizeRead = async (path) => {
+      await actual.appendFile(path, ' select 2;');
+    };
+    try {
+      await expect(
+        exportReceipt(RECEIPT_IDENTITY, mutationFence()),
+      ).rejects.toThrow('Wrangler database export changed while being hashed');
+    } finally {
+      exportRace.growAfterSizeRead = undefined;
+    }
+    await expectExportScratchRemoved(outputPath);
+  });
+});
+
+describe('WranglerPlainWorkerProvisioningApi inventory shape', () => {
+  it('refuses a Wrangler inventory result that is not a list', async () => {
+    const subject = new WranglerPlainWorkerProvisioningApi({
+      runner: {
+        maxDurationMs: 5 * 60_000,
+        async run() {
+          return {
+            stdout: JSON.stringify({ success: true, result: 'not-a-list' }),
+            stderr: '',
+          };
+        },
+      },
+      routeApi: routeApi(),
+      // `listDatabases` reads no file, so this path is never created.
+      exportDirectory: join(tmpdir(), 'wrangler-inventory-shape'),
+      exportStore: memoryStore(),
+    });
+
+    await expect(subject.listDatabases()).rejects.toThrow(
+      'Wrangler inventory result has an invalid list shape',
+    );
   });
 });

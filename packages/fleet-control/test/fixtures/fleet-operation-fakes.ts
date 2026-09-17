@@ -46,12 +46,10 @@ import type {
 /**
  * The frozen instant this fixture stamps finalized generation refs and run
  * records with. It governs what this file writes, not what a consumer audits
- * against: a consumer pins its own audit and authority clocks, and two that do
- * disagree — `fleet-audit-advance.test.ts` pins them to this instant,
- * `cross-backend-continuation.test.ts` to its own `AUDIT_NOW_MS`. A further
- * clock reaches the port through this fake's terminal writes, which stamp
- * `terminalAtMs` from `Date.now()`, so a `finalizedAtMs` assertion reads the
- * wall clock rather than a pinned one.
+ * against: a consumer pins its own audit and authority clocks, which need not
+ * equal this instant. A further clock reaches the port through this fake's
+ * terminal writes, which stamp `terminalAtMs` from `Date.now()`, so a
+ * `finalizedAtMs` assertion reads the wall clock rather than a pinned one.
  */
 export const AUDIT_NOW = Date.parse('2026-06-01T00:00:00.000Z');
 

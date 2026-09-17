@@ -190,7 +190,10 @@ export class PlainWorkerProvisioningApiFake
   ): Promise<PlainWorkerMutationOutcome> {
     await this.#request('createDatabase', fence);
     if (this.createDatabaseOutcome.status === 'succeeded') {
-      this.databases.set(name, { id: name, name, created: false });
+      // A provider database id is not its name. Keeping them unequal means a
+      // consumer that passes the name where an id belongs finds nothing.
+      const id = `db-${name}`;
+      this.databases.set(id, { id, name, created: false });
     }
     return this.createDatabaseOutcome;
   }
@@ -391,7 +394,9 @@ export class PlainWorkerProvisioningApiFake
     fence: ExternalMutationFence,
   ): Promise<void> {
     await this.#request('attachCustomDomain', fence);
-    this.domains.push({ id: target.hostname, ...target });
+    // A provider domain id is not its hostname: detachment addresses the id,
+    // ownership checks the hostname, so the fixture keeps the two unequal.
+    this.domains.push({ id: `domain-${target.hostname}`, ...target });
   }
 
   async detachCustomDomain(

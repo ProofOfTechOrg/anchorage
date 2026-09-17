@@ -61,10 +61,9 @@ import {
 
 // ---------------------------------------------------------------------------
 // Fixed identities, clocks, and small builders. This world is INLINE and
-// INDEPENDENT of `test/fixtures/fleet-audit-world.ts` (§10 SECOND-WORLD NOTE):
-// it never imports that fixture. The durable operation and inventory store
-// fakes come from `test/fixtures/fleet-operation-fakes.ts`, which carries no
-// world of its own.
+// INDEPENDENT of `test/fixtures/fleet-audit-world.ts`: it never imports that
+// fixture. The durable operation and inventory store fakes come from
+// `test/fixtures/fleet-operation-fakes.ts`, which carries no world of its own.
 // ---------------------------------------------------------------------------
 
 /**
@@ -2215,7 +2214,7 @@ describe('advanceFleetAudit', () => {
     expect(emptyPage).not.toHaveProperty('nextAfterOrdinal');
   });
 
-  it('second-world drain-vs-bounded equivalence modulo the §5.5 difference set', async () => {
+  it('second-world drain-vs-bounded equivalence over one frozen clock', async () => {
     const control = baseRecord('control2');
     const missing = baseRecord('missing2');
     const routeDup = baseRecord('routedup2');
@@ -2243,7 +2242,7 @@ describe('advanceFleetAudit', () => {
       cleanRoute(routeDup, { scriptName: 'route-dup-ghost2' }),
     );
 
-    // §5.5 EQUIVALENCE SCOPE: both paths run over the SAME frozen clock.
+    // Both paths read one frozen clock; the equivalence holds only over that.
     const harness = buildHarness(records, inventory, {
       auditClock: () => AUDIT_NOW,
       authorityClock: () => AUDIT_NOW,

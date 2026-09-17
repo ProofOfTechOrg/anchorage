@@ -431,6 +431,19 @@ export interface BackendSwitchApplicationR2Progress {
   readonly subphase: ApplicationR2Resource['state'];
 }
 
+/**
+ * The resource a switch-teardown progress entry tracks, carrying that entry's
+ * subphase as its state. The paths that write a teardown record's
+ * `applicationResources` and the admission that compares a record against it
+ * read this one expression, so a comparison cannot drift from what the write
+ * produced.
+ */
+export function applicationR2ResourceFromProgress(
+  progress: BackendSwitchApplicationR2Progress,
+): ApplicationR2Resource {
+  return { ...progress.resource, state: progress.subphase };
+}
+
 export interface BackendSwitchDecommissionRelease {
   readonly release: ExternalReleaseSnapshot;
   readonly subphase: 'present' | 'delete-authorized' | 'deleted';

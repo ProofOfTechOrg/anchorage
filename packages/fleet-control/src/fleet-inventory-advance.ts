@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// The 9..1,000 provider-request contract and its refusal bytes are shared with
-// the attachment scanner; duplicating the message would let the two drift.
+// Shares the request-budget contract cloudflare-fleet-inventory.ts states.
 import { assertWorkerAttachmentProviderRequestBudget } from './cloudflare-worker-attachment-scan-state.js';
 import {
   advanceFleetInventoryProgress,
   type CollectFleetInventoryOptions,
   canonicalFleetInventoryRunOptions,
   classifyFleetInventoryRunToken,
+  FLEET_INVENTORY_GENERATION_READ_MEMBERS,
   type FleetInventoryGenerationRef,
   type FleetInventoryLease,
   type FleetInventoryProviderContext,
@@ -85,10 +85,7 @@ const CAPABILITY_MEMBERS: Readonly<
   Record<FleetInventoryAdvanceCapability, readonly string[]>
 > = Object.freeze({
   'inventory-run-store': Object.freeze(['withAccountInventoryLease']),
-  'generation-read': Object.freeze([
-    'readFinalizedGeneration',
-    'readRunByOperation',
-  ]),
+  'generation-read': FLEET_INVENTORY_GENERATION_READ_MEMBERS,
   'generation-pin': Object.freeze(['pinGeneration']),
 });
 

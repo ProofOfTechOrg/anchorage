@@ -64,6 +64,11 @@ export function directLineCarries(
   line: string,
   values: readonly (string | undefined)[],
 ): boolean;
+/**
+ * The bytes a result renders on stdout: the summary line, or the empty string
+ * where the safe rendering is silence.
+ */
+export function directStdoutOf(result: DirectConformanceResult): string;
 export function directWritesStderr(result: DirectConformanceResult): boolean;
 /**
  * Resolves one process exit code from several. `evidenceFailed` ranks above

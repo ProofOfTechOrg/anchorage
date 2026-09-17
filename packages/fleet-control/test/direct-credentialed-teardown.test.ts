@@ -4,11 +4,11 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DirectProviderError } from '../scripts/direct-credentialed-provider.mjs';
-import { REFERENCE_SECRET_NAMES } from '../scripts/direct-credentialed-reference-vocabulary.mjs';
 import {
   DIRECT_TEARDOWN_MAXIMA,
-  type DirectRunJournal,
-} from '../scripts/direct-credentialed-run-state.mjs';
+  REFERENCE_SECRET_NAMES,
+} from '../scripts/direct-credentialed-reference-vocabulary.mjs';
+import type { DirectRunJournal } from '../scripts/direct-credentialed-run-state.mjs';
 import type { DirectTeardownOutcome } from '../scripts/direct-credentialed-teardown.mjs';
 import { teardownDirectReference } from '../scripts/direct-credentialed-teardown.mjs';
 import { CLOUDFLARE_INVENTORY_BOUND } from '../src/cloudflare-client-config.js';
@@ -355,8 +355,8 @@ describeLinux('direct reference teardown', () => {
       // the prefix settles empty before the bucket goes
       `GET ${w.bucketPath}/objects`,
 
-      // delete-export-r2: probe, identity, delete, reread
-      `GET ${w.bucketPath}`,
+      // delete-export-r2: probe, delete, reread — its identity is the
+      // attestation above
       `GET ${w.bucketPath}`,
       `DELETE ${w.bucketPath}`,
       `GET ${w.bucketPath}`,
@@ -387,7 +387,7 @@ describeLinux('direct reference teardown', () => {
       quota: { uuid: 'quota-uuid', ordinal: 17, settledByReread: false },
       exports: {
         name: w.names.exportBucket,
-        ordinal: 31,
+        ordinal: 30,
         settledByReread: false,
       },
     });
@@ -722,11 +722,14 @@ describeLinux('direct reference teardown', () => {
     w.setHook(undefined);
     w.state.objects.add(`${w.prefix}/receipts/v1/other/object.sql`);
     const mark = w.requests.length;
-    // Every object receipt is recorded, so the deletes are skipped; the prefix
-    // is still read before the bucket goes, and an object that was not there
-    // when the receipts were written refuses here.
+    // Every object receipt is recorded, so the deletes are skipped; ownership
+    // is attested, the prefix is still read before the bucket goes, and an
+    // object that was not there when the receipts were written refuses here.
     expect(retained(await w.run()).reason).toBe('unexpected-object');
-    expect(w.requests.slice(mark)).toEqual([`GET ${w.bucketPath}/objects`]);
+    expect(w.requests.slice(mark)).toEqual([
+      `GET ${w.bucketPath}`,
+      `GET ${w.bucketPath}/objects`,
+    ]);
     expect(w.state.bucketPresent).toBe(true);
   });
 
@@ -806,18 +809,41 @@ describeLinux('direct reference teardown', () => {
     });
   });
 
-  it('refuses a first-attempt export bucket delete whose creation date changed', async () => {
+  it('attests the export bucket once for the object deletes and the bucket delete', async () => {
     const w = await world();
-    let reads = 0;
-    w.setHook((request, url) => {
-      if (request.method !== 'GET' || url.pathname !== w.bucketPath)
-        return undefined;
-      reads += 1;
-      return reads === 1 ? undefined : changedBucket(w);
-    });
+    const outcome = await w.run();
+    expect(outcome.status).toBe('cleaned');
+    // The attestation, then the bucket delete's own probe and reread. A second
+    // attestation would read the bucket a fourth time.
+    expect(
+      w.requests.filter((entry) => entry === `GET ${w.bucketPath}`),
+    ).toHaveLength(3);
+    expect(w.requests.indexOf(`GET ${w.bucketPath}`)).toBeLessThan(
+      w.requests.findIndex((entry) =>
+        entry.startsWith(`DELETE ${w.bucketPath}`),
+      ),
+    );
+  });
+
+  it('refuses a resume owing only the bucket delete before it reads the prefix', async () => {
+    const w = await world();
+    w.setHook((request, url) =>
+      request.method === 'DELETE' && url.pathname === w.bucketPath
+        ? json([])
+        : undefined,
+    );
+    expect(retained(await w.run()).reason).toBe('outcome-unknown');
+    w.setHook((request, url) =>
+      request.method === 'GET' && url.pathname === w.bucketPath
+        ? changedBucket(w)
+        : undefined,
+    );
+    w.state.objects.add(`${w.prefix}/receipts/v1/other/object.sql`);
+    const mark = w.requests.length;
+    // Ownership is proven first, so the changed identity refuses ahead of the
+    // listing that would otherwise report the object as unexpected.
     expect(retained(await w.run()).reason).toBe('identity-mismatch');
-    expect(w.requests).toContain(`DELETE ${w.bucketPath}/objects/${w.keyB}`);
-    expect(w.requests).not.toContain(`DELETE ${w.bucketPath}`);
+    expect(w.requests.slice(mark)).toEqual([`GET ${w.bucketPath}`]);
     expect(w.state.bucketPresent).toBe(true);
   });
 

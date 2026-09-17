@@ -834,6 +834,31 @@ describe('normal export raw-byte proof', () => {
     });
   });
 
+  it('releases the unread export body before the refusal reaches the caller', async () => {
+    const f = await fixture();
+    const input = await f.exportInput();
+    const releases: unknown[] = [];
+    f.hook(
+      () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(Buffer.from(SQL_SENTINEL));
+            },
+            cancel(reason) {
+              releases.push(reason);
+            },
+          }),
+          { status: 206 },
+        ),
+    );
+    await expect(verifyDirectDecommissionExport(input)).rejects.toMatchObject(
+      errorShape,
+    );
+    expect(releases).toHaveLength(1);
+    expect(f.requests).toHaveLength(1);
+  });
+
   it('derives exact R2 key and returns frozen receipt with source ordinal', async () => {
     const f = await fixture();
     const input = await f.exportInput();

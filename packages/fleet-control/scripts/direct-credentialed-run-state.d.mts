@@ -271,15 +271,6 @@ export const DIRECT_SCENARIO_OPERATION_SLOTS: readonly [
   'decommission-recovery',
 ];
 
-export {
-  DIRECT_RESIDUAL_SURFACES,
-  DIRECT_TEARDOWN_FAILURES,
-  DIRECT_TEARDOWN_MAXIMA,
-  DIRECT_TEARDOWN_MUTATIONS,
-  DIRECT_TEARDOWN_PHASES,
-  DIRECT_TEARDOWN_RECOVERABLE_FAILURES,
-} from './direct-credentialed-reference-vocabulary.mjs';
-
 export const DIRECT_RUN_MAX_JOURNAL_BYTES: number;
 
 export const DIRECT_SCENARIO_ARRAY_MAXIMA: Readonly<{
@@ -341,6 +332,17 @@ export function fileFlags(access: number): number;
  * file owned by the current user.
  */
 export function assertPrivate(stat: Stats, directory: boolean): void;
+
+/**
+ * Removes the staging files a `prefix`/`suffix` pair names from `directory`,
+ * which an interrupted publication leaves behind between a create and its
+ * rename.
+ */
+export function sweepStagedFiles(
+  directory: string,
+  prefix: string,
+  suffix: string,
+): Promise<void>;
 
 /**
  * The 24-byte ISO-8601 shape every journal and evidence timestamp carries.

@@ -13,11 +13,11 @@ import {
   DIRECT_EVIDENCE_LITERALS,
   inspectDirectEvidence,
 } from '../scripts/direct-credentialed-evidence.mjs';
-import { REFERENCE_SECRET_NAMES } from '../scripts/direct-credentialed-reference-vocabulary.mjs';
 import {
   DIRECT_RESIDUAL_SURFACES,
-  openDirectRunState,
-} from '../scripts/direct-credentialed-run-state.mjs';
+  REFERENCE_SECRET_NAMES,
+} from '../scripts/direct-credentialed-reference-vocabulary.mjs';
+import { openDirectRunState } from '../scripts/direct-credentialed-run-state.mjs';
 import {
   directBridgePreamble,
   directModuleUrl,

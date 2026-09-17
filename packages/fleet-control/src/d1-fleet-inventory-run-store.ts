@@ -29,14 +29,14 @@ const ROW_TABLE = 'anchorage_fleet_inventory_rows';
 const FACT_TABLE = 'anchorage_fleet_inventory_deployment_facts';
 const LEASE_TABLE = 'anchorage_fleet_inventory_leases';
 const PIN_TABLE = 'anchorage_fleet_inventory_pins';
-// state-store.ts:132-133 holds the same two integers and exports neither;
-// widening its surface for them couples the inventory store to the deployment
-// store.
+// state-store.ts declares LEASE_TTL_MS and LEASE_RENEWAL_INTERVAL_MS with the
+// same values and exports neither; widening its surface for them couples the
+// inventory store to the deployment store.
 const LEASE_TTL_MS = 15 * 60_000;
 const LEASE_RENEWAL_INTERVAL_MS = 5 * 60_000;
-// Byte-identical to state-store.ts:134. The Wrangler harness lease clock
-// rewrites exactly this substring, so every SQL string in this module must
-// express database time with this token and no other time expression.
+// Byte-identical to state-store.ts's DB_NOW_MS. The Wrangler harness lease
+// clock rewrites exactly this substring, so every SQL string in this module
+// must express database time with this token and no other time expression.
 const DB_NOW_MS = "CAST(unixepoch('subsec') * 1000 AS INTEGER)";
 const PRUNE_LIMIT_MAX = 1_000;
 const ROW_KIND_CHECK = FLEET_INVENTORY_ROW_KINDS.map(

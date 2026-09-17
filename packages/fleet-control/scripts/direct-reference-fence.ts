@@ -2,6 +2,7 @@
 
 import type { ExecutionFenceState as FenceState } from '@proofoftech/flowsafe/do-runner';
 import type { DirectRunManifest } from './direct-credentialed-conformance-preflight.mjs';
+import { DIRECT_TENANT_ROUTES } from './direct-credentialed-tenant-object.mjs';
 import type { DirectReferenceContext } from './direct-reference-context.js';
 import type { DirectReferenceAction } from './direct-reference-contract.mjs';
 import { DirectReferenceExecutionError } from './direct-reference-http.js';
@@ -29,6 +30,10 @@ const PROBE_EPOCHS = Object.freeze({
   'probe-stale': 'stale',
   'probe-future': 'future',
 });
+
+/** Membership in `PROBE_EPOCHS`, and the narrowing its index needs. */
+const isProbeOperation = (value: string): value is keyof typeof PROBE_EPOCHS =>
+  Object.hasOwn(PROBE_EPOCHS, value);
 
 type FenceTransitionResult =
   | { ok: true; after: DirectFenceReading }
@@ -134,7 +139,7 @@ export async function dispatchDirectFence(
   if (!spec.routeHostname) throw new DirectReferenceExecutionError();
   const { operation } = action;
   const application =
-    operation === 'mutate-current' || Object.hasOwn(PROBE_EPOCHS, operation);
+    operation === 'mutate-current' || isProbeOperation(operation);
   const secrets = context.secrets(action.role);
   const supplied = application
     ? secrets.application?.APP_PROBE_TOKEN
@@ -212,7 +217,7 @@ export async function dispatchDirectFence(
     return { fence, categories, observedAt: Date.now() };
   }
   if (operation === 'mutate-current') {
-    const { value } = await request('/__direct/fence-mutate', {
+    const { value } = await request(DIRECT_TENANT_ROUTES.fenceMutate, {
       phase: 'both',
     });
     return {
@@ -224,14 +229,9 @@ export async function dispatchDirectFence(
       ...(value.status === undefined ? {} : { status: counter(value.status) }),
     };
   }
-  if (
-    operation !== 'probe-missing' &&
-    operation !== 'probe-stale' &&
-    operation !== 'probe-future'
-  )
-    throw new DirectReferenceExecutionError();
+  if (!isProbeOperation(operation)) throw new DirectReferenceExecutionError();
   const epoch = PROBE_EPOCHS[operation];
-  const { value } = await request('/__direct/fence-probe', { epoch });
+  const { value } = await request(DIRECT_TENANT_ROUTES.fenceProbe, { epoch });
   const classification = text(value.classification);
   if (
     value.epoch !== epoch ||

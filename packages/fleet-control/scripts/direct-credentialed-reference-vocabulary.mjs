@@ -47,8 +47,8 @@ export const DIRECT_TEARDOWN_FAILURES = Object.freeze([
 ]);
 
 // A recorded refusal carrying one of these reasons is one a later run can
-// clear: the scenario can complete, and a pending invocation or bootstrap
-// mutation can settle. Every other reason stays terminal for automation.
+// clear: each is re-checked by the guard that raises it, so a re-entry advances
+// once that guard passes. Every other reason stays terminal for automation.
 export const DIRECT_TEARDOWN_RECOVERABLE_FAILURES = Object.freeze([
   'scenario-incomplete',
   'outcome-unknown',

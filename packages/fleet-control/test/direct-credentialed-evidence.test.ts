@@ -12,7 +12,7 @@ import {
   inspectDirectEvidence,
   writeDirectEvidence,
 } from '../scripts/direct-credentialed-evidence.mjs';
-import { DIRECT_RESIDUAL_SURFACES } from '../scripts/direct-credentialed-run-state.mjs';
+import { DIRECT_RESIDUAL_SURFACES } from '../scripts/direct-credentialed-reference-vocabulary.mjs';
 import { DIRECT_SCENARIO_PHASES } from '../scripts/direct-credentialed-scenario-budget.mjs';
 import {
   cleanupDirectRunState,
@@ -749,7 +749,7 @@ describe.sequential('direct evidence', () => {
     expect(await readdir(f.runDirectory)).toEqual(['journal.json']);
   });
 
-  it('guards exactly the projection leaves the shared inventory names', async () => {
+  it('guards the identity-path leaves and excludes the prefix-derived and scenario-charset ones', async () => {
     const { evidence } = await evidenceFixture();
     expect(Object.isFrozen(DIRECT_EVIDENCE_IDENTITY_PATHS)).toBe(true);
     // Every guarded path resolves to a projected identity leaf, so a renamed
@@ -769,8 +769,8 @@ describe.sequential('direct evidence', () => {
     ])
       expect(DIRECT_EVIDENCE_IDENTITY_PATHS).not.toContain(keyPath);
     // So are the scenario paths: the journal decodes each with `scenarioId`,
-    // whose accepted set the identity shape contains, so a guard here could
-    // only refuse a record the journal already admitted.
+    // whose charset is strictly wider than the identity shape, so a guard here
+    // refuses values the journal admits.
     for (const keyPath of [
       'scenario.initial.a.versionId',
       'scenario.candidate.b.versionId',

@@ -32,17 +32,6 @@ import {
   readDirectReferenceRequest,
 } from './direct-reference-contract.mjs';
 
-// Consumers bind to the teardown vocabulary through this module's declaration
-// surface, so it travels with the journal schemas that read it.
-export {
-  DIRECT_RESIDUAL_SURFACES,
-  DIRECT_TEARDOWN_FAILURES,
-  DIRECT_TEARDOWN_MAXIMA,
-  DIRECT_TEARDOWN_MUTATIONS,
-  DIRECT_TEARDOWN_PHASES,
-  DIRECT_TEARDOWN_RECOVERABLE_FAILURES,
-};
-
 const ERROR_CODES = new Set([
   'invalid-state',
   'run-exists',
@@ -1476,6 +1465,18 @@ export function fileFlags(access) {
   return access | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 }
 
+/**
+ * Removes the staging files a `prefix`/`suffix` pair names from `directory`. A
+ * signal between a staging file's create and its rename leaves it behind, and
+ * the run holds the directory's lock, so any sibling the pair matches is a dead
+ * one from an interrupted publication.
+ */
+export async function sweepStagedFiles(directory, prefix, suffix) {
+  for (const name of await readdir(directory))
+    if (name.startsWith(prefix) && name.endsWith(suffix))
+      await unlink(join(directory, name));
+}
+
 async function privateDirectory(path) {
   const handle = await open(
     path,
@@ -1583,18 +1584,6 @@ function serialize(snapshot) {
 // it `journal.json`.
 const JOURNAL_TEMPORARY_PREFIX = '.journal-';
 const JOURNAL_TEMPORARY_SUFFIX = '.tmp';
-
-// A signal between a snapshot's create and its rename leaves the staging file
-// behind. The run holds the directory's lock, so any sibling left there is a
-// dead one from an interrupted publication.
-async function sweepStagedSnapshots(directory) {
-  for (const name of await readdir(directory))
-    if (
-      name.startsWith(JOURNAL_TEMPORARY_PREFIX) &&
-      name.endsWith(JOURNAL_TEMPORARY_SUFFIX)
-    )
-      await unlink(join(directory, name));
-}
 
 async function writeSnapshot(directory, handle, snapshot) {
   const temporary = join(
@@ -2106,7 +2095,11 @@ export async function openDirectRunState(input) {
       if (!(await exists(directory)))
         throw new DirectRunStateError('run-missing');
       directoryHandle = await privateDirectory(directory);
-      await sweepStagedSnapshots(directory);
+      await sweepStagedFiles(
+        directory,
+        JOURNAL_TEMPORARY_PREFIX,
+        JOURNAL_TEMPORARY_SUFFIX,
+      );
       snapshot = await readSnapshot(join(directory, 'journal.json'), binding);
       if (mutationPending(snapshot))
         throw new DirectRunStateError('outcome-unknown');

@@ -2,12 +2,16 @@
 
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { open, readdir, readFile, rename, unlink } from 'node:fs/promises';
+import { open, readFile, rename, unlink } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { DIRECT_INVOCATION_FAILURE_DETAILS } from './direct-credentialed-invocation.mjs';
 import { DIRECT_RESIDUAL_SURFACES } from './direct-credentialed-reference-vocabulary.mjs';
-import { assertPrivate, fileFlags } from './direct-credentialed-run-state.mjs';
+import {
+  assertPrivate,
+  fileFlags,
+  sweepStagedFiles,
+} from './direct-credentialed-run-state.mjs';
 import { DIRECT_SCENARIO_PHASES } from './direct-credentialed-scenario-budget.mjs';
 import { survivingIdentities } from './direct-credentialed-teardown.mjs';
 
@@ -357,11 +361,13 @@ export function buildDirectEvidence({
  * `identifier` — any trimmed, control-free string up to 128 characters — which
  * is wider than the identity shape below, so these are the paths at which a
  * decoded journal can still carry a value the evidence boundary must refuse.
- * Two rules keep a path out of the list: a value the journal already bounds to
- * the scenario charset (`run-state.mjs`'s `scenarioId`, whose accepted set the
- * identity shape contains) reaches this boundary narrower than the guard, and a
- * prefix-derived name such as `retainedIdentities.exportBucket` or
- * `retainedIdentities.scriptName` is the run's own, not the provider's.
+ * Two rules keep a path out of the list. A prefix-derived name such as
+ * `retainedIdentities.exportBucket` or `retainedIdentities.scriptName` is the
+ * run's own, not the provider's. A value the journal bounds to the scenario
+ * charset (`run-state.mjs`'s `scenarioId`) rests on that bound alone: the
+ * charset is strictly wider than the identity shape — it accepts `:`, and a
+ * leading `.`, `-` or `_` — so a guard on such a path refuses values the
+ * journal admits rather than restating a check it has already made.
  * `test/direct-credentialed-evidence.test.ts` resolves every member against a
  * maximal artifact, so a renamed or moved projection key is a red test rather
  * than a guard that silently stops matching.
@@ -455,13 +461,7 @@ export async function writeDirectEvidence({
       fileFlags(constants.O_RDONLY | constants.O_DIRECTORY),
     );
     assertPrivate(await parent.stat(), true);
-    // A signal between the create below and the rename leaves the temporary
-    // file behind. The run holds the directory's lock, so any sibling left
-    // there is a dead one from an interrupted publication, and it is swept
-    // before a new one is created.
-    for (const name of await readdir(directory))
-      if (name.startsWith(TEMPORARY_PREFIX) && name.endsWith(TEMPORARY_SUFFIX))
-        await unlink(join(directory, name));
+    await sweepStagedFiles(directory, TEMPORARY_PREFIX, TEMPORARY_SUFFIX);
     const path = join(
       directory,
       `${TEMPORARY_PREFIX}${randomUUID()}${TEMPORARY_SUFFIX}`,

@@ -482,7 +482,7 @@ describe('reconciled transient provisioning failures', () => {
           verify() {
             expect([...api.databases.values()]).toEqual([
               {
-                id: spec.databaseName,
+                id: 'db-acme-production',
                 name: spec.databaseName,
                 created: false,
               },
@@ -2049,7 +2049,7 @@ describe('PlainWorkerBackend core policy', () => {
     );
     expect(api.domains).toEqual([
       {
-        id: spec.routeHostname,
+        id: 'domain-app.example.test',
         hostname: spec.routeHostname,
         service: spec.scriptName,
       },

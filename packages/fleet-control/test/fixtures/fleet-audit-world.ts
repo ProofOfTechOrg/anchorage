@@ -396,10 +396,10 @@ const routeDup = baseRecord('routedup');
  * and `platformResources.egressProxy` (separate live deployment entries in
  * `inventory.deployments`) carry the drift.
  *
- * This record ALSO carries the world's only multi-namespace-id story
- * (§8.6): a second `durableObjectBindings` entry reuses
- * `SHARED_EXPECTED_NAMESPACE` (already claimed by `namespaceDupA`/`namespaceDupB`
- * above), so this record's OWN pass through the fleet.ts:762 inner loop
+ * This record ALSO carries the world's only multi-namespace-id story: a second
+ * `durableObjectBindings` entry reuses `SHARED_EXPECTED_NAMESPACE` (already
+ * claimed by `namespaceDupA`/`namespaceDupB` above), so this record's OWN pass
+ * through the fleet.ts:762 inner loop
  * lands the namespace's THIRD claimant, landing the world's second
  * `duplicate-namespace` finding; a populated
  * `platformResources.stateWorker.namespaceIds` adds a namespace id present
@@ -922,7 +922,7 @@ class RecordingFleetStore implements FleetStateStore {
         this.ops.push('renew');
       },
       put: async (record) => {
-        // Pins §6.1's authority clock wiring: `commitInvocationAuthority`
+        // Pins the authority clock wiring: `commitInvocationAuthority`
         // must stamp `updatedAt` from the audited authority clock
         // (`options.now`), not a bare `Date.now()`. The audit re-wired to
         // the latter must fail loudly, not pass silently through to a

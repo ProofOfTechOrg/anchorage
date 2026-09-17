@@ -99,17 +99,12 @@ const evidenceFailureLines = Object.freeze({
   false: evidenceFailureLine(false),
   true: evidenceFailureLine(true),
 });
-// A null prototype keeps the lookup total: a variable the table does not carry
-// reads as `undefined` rather than as an inherited member.
 const invalidInputLines = Object.freeze(
-  Object.assign(
-    Object.create(null),
-    Object.fromEntries(
-      DIRECT_ADMISSION_VARIABLES.map((variable) => [
-        variable,
-        fixedLineOf({ code: codes.invalidInput, variable }),
-      ]),
-    ),
+  Object.fromEntries(
+    DIRECT_ADMISSION_VARIABLES.map((variable) => [
+      variable,
+      fixedLineOf({ code: codes.invalidInput, variable }),
+    ]),
   ),
 );
 /**
@@ -135,7 +130,7 @@ export function parseDirectConformanceArgs(argv) {
   if (args.length === 0) return 'preflight';
   if (
     args.length === 1 &&
-    ['--preflight', '--run', '--resume', '--help'].includes(args[0])
+    DIRECT_CONFORMANCE_MODES.map((mode) => `--${mode}`).includes(args[0])
   )
     return args[0].slice(2);
   return null;
@@ -151,6 +146,14 @@ export function directLineCarries(line, values) {
     (value) =>
       typeof value === 'string' && value.length > 0 && line.includes(value),
   );
+}
+
+/**
+ * The bytes a result renders on stdout: the summary line, or none where the
+ * safe rendering is silence.
+ */
+export function directStdoutOf(result) {
+  return result.stdoutLine ?? '';
 }
 
 /**
@@ -424,8 +427,8 @@ export async function runDirectConformance(input) {
     if (journal) {
       if (input.mode === 'resume') await journal.recordResume();
       const snapshot = journal.snapshot();
-      // Dispatch row 1: a settled teardown leaves nothing to drive, so the run
-      // is evidence-only.
+      // A settled teardown leaves nothing to drive, so the run is
+      // evidence-only.
       if (
         snapshot.teardown?.phase === 'complete' &&
         snapshot.teardown.failure === null
@@ -443,10 +446,9 @@ export async function runDirectConformance(input) {
           ...(input.fetch ? { fetch: input.fetch } : {}),
         };
         let restart = false;
-        // Dispatch row 5: no recorded teardown and no settled scenario. Rows 2,
-        // 3 and 4 are this predicate's complement — a recorded teardown, a
-        // failed scenario, a complete scenario — and each skips straight to
-        // teardown on the journal's own record.
+        // No recorded teardown and no settled scenario. This predicate's
+        // complement — a recorded teardown, a failed scenario, a complete
+        // scenario — skips straight to teardown on the journal's own record.
         if (
           snapshot.teardown === undefined &&
           (snapshot.scenario === undefined ||
@@ -475,7 +477,7 @@ export async function runDirectConformance(input) {
             teardownCall: null,
           };
         } else {
-          // Rows 2 through 5 converge here.
+          // The other branches converge here.
           const teardown = await modules.teardown({
             ...networkInput,
             ...(input.delay ? { delay: input.delay } : {}),

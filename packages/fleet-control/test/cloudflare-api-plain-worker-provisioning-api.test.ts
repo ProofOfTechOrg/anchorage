@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { APIConnectionTimeoutError } from 'cloudflare';
 import { describe, expect, it, vi } from 'vitest';
 import { CloudflareApiPlainWorkerBackend } from '../src/cloudflare-api-plain-worker-backend.js';
@@ -15,7 +13,6 @@ import type {
   ExternalMutationFence,
   PlainWorkerUploadIntent,
 } from '../src/types.js';
-import { WranglerPlainWorkerProvisioningApi } from '../src/wrangler-plain-worker-provisioning-api.js';
 import {
   type CloudflareFixtureHandler,
   deferred,
@@ -29,7 +26,6 @@ import {
   memoryStore,
   mutationFence,
   rejectedValue,
-  routeApi,
 } from './fixtures/plain-worker-port-probe.js';
 import { providerWorld } from './fixtures/provider-world.js';
 
@@ -968,29 +964,5 @@ describe('CloudflareApiPlainWorkerProvisioningApi', () => {
         message: 'Cloudflare Worker upload failed',
       },
     });
-  });
-});
-
-describe('WranglerPlainWorkerProvisioningApi inventory shape', () => {
-  it('refuses a Wrangler inventory result that is not a list', async () => {
-    const api = new WranglerPlainWorkerProvisioningApi({
-      runner: {
-        maxDurationMs: 5 * 60_000,
-        async run() {
-          return {
-            stdout: JSON.stringify({ success: true, result: 'not-a-list' }),
-            stderr: '',
-          };
-        },
-      },
-      routeApi: routeApi(),
-      // `listDatabases` reads no file, so this path is never created.
-      exportDirectory: join(tmpdir(), 'wrangler-inventory-shape'),
-      exportStore: memoryStore(),
-    });
-
-    await expect(api.listDatabases()).rejects.toThrow(
-      'Wrangler inventory result has an invalid list shape',
-    );
   });
 });

@@ -2516,6 +2516,45 @@ describe('bounded fleet migration', () => {
     }
   });
 
+  it('a migrating-phase admission refuses a migration candidate whose live artifact version left the persisted release', async () => {
+    const world = createWorld({ external: true });
+    await advanceTo(world, 'arm-maintenance');
+    const migrating = world.current();
+    expect(migrating.phase).toBe('migrating');
+    expect(migrating.migrationIntent?.subphase).toBe('candidate-deployed');
+    const release = migrating.pendingRelease as ExternalReleaseSnapshot;
+    expect(release.artifactVersion).toBe(`v${world.spec.schemaVersion}`);
+    const resumed = new MemoryOperationStore();
+    armOptions(world, { operationStore: resumed });
+    let next = await armedStart(world, uuid(2), [migrating]);
+    for (let count = 0; count < 80; count += 1) {
+      const staged = resumed.item(uuid(2));
+      if (staged.plan?.[staged.planCursor ?? -1]?.step === 'deploy-candidate') {
+        break;
+      }
+      if (next.status !== 'pending') {
+        throw new Error('terminated before deploy-candidate');
+      }
+      next = await continueWorld(world, next);
+    }
+    const item = resumed.item(uuid(2));
+    expect(item.plan?.[item.planCursor ?? -1]?.step).toBe('deploy-candidate');
+    // The release name now serves a different artifact than the record pins.
+    world.releases.set(
+      release.physicalScriptName,
+      world.liveFor(world.spec, 'v9'),
+    );
+    world.ops.length = 0;
+    await expect(continueWorld(world, next)).rejects.toThrow(
+      `migration candidate immutable release '${release.physicalScriptName}' does not match persisted artifact version '${release.artifactVersion}'`,
+    );
+    expect(resumed.item(uuid(2)).status).toBe('failed');
+    expect(world.current().pendingRelease?.artifactVersion).toBe(
+      release.artifactVersion,
+    );
+    expect(providerMutations(world)).toEqual([]);
+  });
+
   it('retire-post follows the ready commit and refuses a restored migrating carrier', async () => {
     for (const restored of [false, true]) {
       const world = createWorld({ external: true });

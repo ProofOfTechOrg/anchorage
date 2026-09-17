@@ -24,6 +24,7 @@ import {
   classifyFleetOperationToken,
   FLEET_OPERATION_ITEM_BOUND,
   FLEET_OPERATION_RECORD_ROW_BYTE_BOUND,
+  FLEET_OPERATION_STORE_ADVANCE_MEMBERS,
   type FleetOperationFailure,
   type FleetOperationLease,
   type FleetOperationRunRecord,
@@ -139,11 +140,7 @@ class FleetMigrationTargetDriftError extends Error {
 type MigrationRun = ReturnType<typeof fleetMigrationOperationRecordFromUnknown>;
 
 function assertOperationStore(store: FleetOperationStore): void {
-  for (const member of [
-    'withAccountOperationLease',
-    'readOperationById',
-    'readOperationRowsPage',
-  ] as const) {
+  for (const member of FLEET_OPERATION_STORE_ADVANCE_MEMBERS) {
     if (
       !store ||
       !Reflect.has(store, member) ||

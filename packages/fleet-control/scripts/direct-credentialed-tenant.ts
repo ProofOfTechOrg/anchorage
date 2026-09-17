@@ -35,6 +35,7 @@ import {
 import {
   DIRECT_TENANT_OBJECT_BODY,
   DIRECT_TENANT_OBJECT_KEY,
+  DIRECT_TENANT_ROUTES,
   directTenantMutationEpoch,
   directTenantProbeEpoch,
 } from './direct-credentialed-tenant-object.mjs';
@@ -65,10 +66,10 @@ type FenceRoute = (
   body?: string,
 ) => Promise<FenceOutcome>;
 
-async function readFenceBody(request: Request, probe: boolean) {
+async function readFenceBody(request: Request, emptyBodyAllowed: boolean) {
   const input = await readBoundedBody(request, 256);
   if (!input.ok) return null;
-  if (input.text === '') return probe ? null : {};
+  if (input.text === '') return emptyBodyAllowed ? {} : null;
   let value: unknown;
   try {
     value = JSON.parse(input.text);
@@ -196,7 +197,7 @@ function fenceMutateAnswer({ response, result }: FenceOutcome) {
 }
 
 async function handleFenceProbe(request: Request, env: DirectTenantEnv) {
-  const parsed = await readFenceBody(request, true);
+  const parsed = await readFenceBody(request, false);
   if (!parsed) return new Response('Invalid body', { status: 400 });
   const label = parsed.epoch;
   if (
@@ -224,7 +225,7 @@ async function handleFenceMutate(
   env: DirectTenantEnv,
   resolve: ActorResolver,
 ) {
-  const parsed = await readFenceBody(request, false);
+  const parsed = await readFenceBody(request, true);
   if (!parsed) return new Response('Invalid body', { status: 400 });
   const phase = parsed.phase === undefined ? 'both' : parsed.phase;
   if (phase !== 'both' && phase !== 'create' && phase !== 'delete')
@@ -268,12 +269,12 @@ const config: FlowsafeWorkerConfig<DirectTenantEnv> = {
     if (!(await kit.resolve(request)))
       return new Response('Unauthorized', { status: 401 });
     if (request.method === 'POST') {
-      if (path === '/__direct/fence-probe')
+      if (path === DIRECT_TENANT_ROUTES.fenceProbe)
         return handleFenceProbe(request, env);
-      if (path === '/__direct/fence-mutate')
+      if (path === DIRECT_TENANT_ROUTES.fenceMutate)
         return handleFenceMutate(request, env, kit.resolve);
     }
-    if (path === '/__direct/health' && request.method === 'GET') {
+    if (path === DIRECT_TENANT_ROUTES.health && request.method === 'GET') {
       const row = await env.DB.prepare(
         'SELECT marker FROM direct_conformance_fixture WHERE id = 1',
       ).first<{ marker: string }>();
@@ -282,7 +283,7 @@ const config: FlowsafeWorkerConfig<DirectTenantEnv> = {
         marker: row?.marker ?? null,
       });
     }
-    if (path === '/__direct/object') {
+    if (path === DIRECT_TENANT_ROUTES.object) {
       if (request.method === 'POST') {
         await env.PROBE_BUCKET.put(
           DIRECT_TENANT_OBJECT_KEY,

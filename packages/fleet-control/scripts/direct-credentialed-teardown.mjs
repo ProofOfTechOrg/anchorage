@@ -262,11 +262,12 @@ export async function teardownDirectReference(input) {
     const bucket = bootstrap.exports.name;
     const zoneId = bootstrap.context.zoneId;
     // A recorded refusal is terminal for automation unless its reason is one a
-    // later run clears: an incomplete scenario, or an invocation or bootstrap
-    // mutation that was pending. The two operands beside it are the
-    // preconditions themselves, so a re-entry advances only once they hold;
-    // an identity mismatch, a forbidden answer and an exhausted budget stay
-    // terminal.
+    // later run clears: an incomplete scenario, or an invocation, bootstrap or
+    // teardown mutation whose outcome was unknown. Each of those reasons is
+    // re-checked by the guard that raises it — the scenario operands in this
+    // expression, `mutationPending` above, and `mutate`'s own re-probe for the
+    // refusal it records; an identity mismatch, a forbidden answer and an
+    // exhausted budget stay terminal.
     const refusing =
       (teardown?.phase === 'refused' &&
         !DIRECT_TEARDOWN_RECOVERABLE_FAILURES.includes(teardown.failure)) ||
@@ -739,11 +740,11 @@ export async function teardownDirectReference(input) {
           refuse('unexpected-object');
       return rows;
     };
+    // One attestation for the whole bucket sequence: the first call proves the
+    // bucket, and every step below reads that same proof.
+    let attested;
+    const attestBucket = () => (attested ??= bucketIdentity());
     if (receipts.exportObjects.length < confirmed.length) {
-      // One attestation for the whole block: the call below proves the bucket,
-      // and each delete's `identity` reads that same proof.
-      let attested;
-      const attestBucket = () => (attested ??= bucketIdentity());
       // Ownership is attested before the content checks, so an unexpected
       // object cannot pre-empt the proof that this is the run's own bucket.
       // An absent bucket refuses as `provider-unavailable` here exactly as it
@@ -777,6 +778,9 @@ export async function teardownDirectReference(input) {
     }
 
     if (!receipts.exports) {
+      // A resume that owes only this step has skipped the block above, so the
+      // attestation happens here, ahead of the content check below.
+      await attestBucket();
       // The empty prefix is owed by the run that deletes the bucket, not by
       // the run that issued the object deletes: a resume holding every object
       // receipt reads the prefix here rather than inheriting an earlier run's
@@ -793,7 +797,7 @@ export async function teardownDirectReference(input) {
         nextPhase: 'exports',
         field: 'exports',
         probe: bucketProbe,
-        identity: bucketIdentity,
+        identity: attestBucket,
         call: () =>
           settled.r2.buckets.delete(
             bucket,

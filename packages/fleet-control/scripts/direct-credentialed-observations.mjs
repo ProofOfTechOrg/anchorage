@@ -14,6 +14,7 @@ import {
   openDirectProviderSession,
   validateProviderAuth,
 } from './direct-credentialed-provider.mjs';
+import { mutationPending } from './direct-credentialed-run-state.mjs';
 
 const CODES = new Set([
   'invalid-input',
@@ -38,6 +39,17 @@ export class DirectObservationError extends Error {
 
 function refuse(code = 'observation-mismatch') {
   throw new DirectObservationError(code);
+}
+// Releases a body no one will read, handing the cancellation the refusal that
+// reached the exit. Not awaited: a hostile source can hang its own cancel.
+function cancelAndRefuse(response, code = 'observation-mismatch') {
+  const refusal = new DirectObservationError(code);
+  try {
+    void response?.body?.cancel(refusal).catch(() => {});
+  } catch {
+    /* The abortable pipe owns a locked source. */
+  }
+  throw refusal;
 }
 function object(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) refuse();
@@ -95,8 +107,7 @@ function context(input) {
       maxInvocations: config.referenceWorker.maxInvocations,
     });
     const bootstrap = snapshot.bootstrap;
-    if (snapshot.lastInvocation?.state === 'pending' || bootstrap?.pending)
-      refuse('outcome-unknown');
+    if (mutationPending(snapshot)) refuse('outcome-unknown');
     if (
       snapshot.version !== 2 ||
       !bootstrap ||
@@ -651,13 +662,13 @@ export async function verifyDirectDecommissionExport(input) {
       (response.headers.has('content-encoding') &&
         response.headers.get('content-encoding') !== 'identity')
     )
-      refuse();
+      cancelAndRefuse(response);
     const length = response.headers.get('content-length');
     if (
       length !== null &&
       (!/^[1-9][0-9]*$/u.test(length) || Number(length) !== metadata.size)
     )
-      refuse();
+      cancelAndRefuse(response);
     if (!response.body) refuse();
     const reader = response.body.getReader();
     const digest = createHash('sha256');

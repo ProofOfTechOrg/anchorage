@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { DirectRunManifest } from './direct-credentialed-conformance-preflight.mjs';
+import { DIRECT_TENANT_ROUTES } from './direct-credentialed-tenant-object.mjs';
 import {
   createDirectReferenceContext,
   type DirectReferenceContext,
@@ -68,7 +69,9 @@ export async function probeDirectTenant(
     throw new DirectReferenceExecutionError();
   const { role, operation } = action;
   const url = new URL(
-    operation === 'health' ? '/__direct/health' : '/__direct/object',
+    operation === 'health'
+      ? DIRECT_TENANT_ROUTES.health
+      : DIRECT_TENANT_ROUTES.object,
     `https://${spec.routeHostname}`,
   );
   const method =

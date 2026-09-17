@@ -36,7 +36,6 @@ import {
 } from './fleet-inventory-advance.js';
 import type { FleetInventoryGenerationRef } from './fleet-inventory-state.js';
 import {
-  type AdvanceFleetMigrationOptions,
   abandonFleetMigrationOperation,
   advanceFleetMigration,
   type FleetMigrationAdvanceAction,
@@ -329,8 +328,9 @@ export interface CloudflareAdvanceFleetMigrationOptions {
   readonly clock?: () => number;
   readonly signal?: AbortSignal;
   /**
-   * Carries {@link AdvanceFleetMigrationOptions.onComplete}'s delivery
-   * contract.
+   * Carries the delivery contract of
+   * {@link index!AdvanceFleetMigrationOptions.onComplete |
+   * AdvanceFleetMigrationOptions.onComplete}.
    */
   readonly onComplete?: (
     result: FleetMigrationResultRef,

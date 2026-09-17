@@ -80,6 +80,9 @@ const RELEASE_DIGEST_LENGTH = 48;
 const DEFAULT_MAINTENANCE_REQUEST_TIMEOUT_MS = 15_000;
 const MAINTENANCE_CAPABILITY_MAX_TTL_SECONDS = 60;
 const MAINTENANCE_CAPABILITY_SKEW_SECONDS = 5;
+// The reason a maintenance response body goes unread: the health payload is
+// the signed receipt header, and the success path hands readMaintenanceHealth
+// a fresh response built from the verified receipt.
 const UNREAD_MAINTENANCE_BODY =
   'Workers for Platforms maintenance health is read from the signed receipt header';
 
@@ -1919,9 +1922,6 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
         signal: AbortSignal.timeout(this.#maintenanceRequestTimeoutMs),
       },
     );
-    // The health payload is the signed receipt header: neither exit below
-    // reads the maintenance response body, and the success path hands
-    // readMaintenanceHealth a fresh response built from the verified receipt.
     cancelBodyWithoutAwait(response.body, UNREAD_MAINTENANCE_BODY);
     const receipt = response.headers.get(MAINTENANCE_RECEIPT_HEADER);
     const result = receipt
@@ -2019,9 +2019,6 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
         signal: AbortSignal.timeout(this.#maintenanceRequestTimeoutMs),
       },
     );
-    // The health payload is the signed receipt header: neither exit below
-    // reads the maintenance response body, and the success path hands
-    // readMaintenanceHealth a fresh response built from the verified receipt.
     cancelBodyWithoutAwait(response.body, UNREAD_MAINTENANCE_BODY);
     const receipt = response.headers.get(MAINTENANCE_RECEIPT_HEADER);
     const result = receipt

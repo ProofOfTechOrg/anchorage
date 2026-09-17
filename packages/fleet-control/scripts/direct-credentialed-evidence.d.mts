@@ -58,9 +58,10 @@ export const DIRECT_CONFORMANCE_COMMANDS: Readonly<{
 export const DIRECT_EVIDENCE_KEYS: readonly string[];
 /**
  * The dotted paths of the projected provider strings the journal decodes with
- * `identifier`, each guarded against the identity shape. A value the journal
- * bounds to the scenario charset, and a prefix-derived name, are absent by
- * rule: neither can reach this boundary wider than the guard.
+ * `identifier`, each guarded against the identity shape. A prefix-derived name
+ * is absent because it is the run's own; a value the journal bounds to the
+ * scenario charset is absent because that charset is strictly wider than the
+ * identity shape, so a guard on it refuses values the journal admits.
  */
 export const DIRECT_EVIDENCE_IDENTITY_PATHS: readonly string[];
 /**

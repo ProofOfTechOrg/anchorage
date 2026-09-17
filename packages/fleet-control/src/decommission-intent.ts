@@ -23,6 +23,7 @@ import type {
   NormalDecommissionLifecyclePhase,
 } from './types.js';
 import {
+  applicationR2ResourceFromProgress,
   BACKEND_SWITCH_SUBPHASES,
   isPlatformCatalogRecord,
   RETIRED_BACKEND_SWITCH_SUBPHASE,
@@ -304,12 +305,7 @@ function applicationResourceProgressMatches(
   }
   return (
     JSON.stringify(source.applicationResources ?? []) ===
-    JSON.stringify(
-      progress.map(({ resource, subphase }) => ({
-        ...resource,
-        state: subphase,
-      })),
-    )
+    JSON.stringify(progress.map(applicationR2ResourceFromProgress))
   );
 }
 

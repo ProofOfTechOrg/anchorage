@@ -568,9 +568,8 @@ interface DutySegment {
 
 /**
  * Composes one stale-duty finding segment as a template plus an optional raw
- * diagnostic (R4-B.2), so a caller can persist the template alone and
- * separately compose the legacy byte-identical string with the diagnostic
- * inlined.
+ * diagnostic, so a caller can persist the template alone and separately
+ * compose the legacy byte-identical string with the diagnostic inlined.
  */
 function staleDutySegment(
   duty: DutyHealth,
@@ -606,9 +605,9 @@ function staleDutySegment(
 }
 
 // ---------------------------------------------------------------------------
-// Audit set-builders (R4-B.2): pure derivations over `records`/`inventory`
-// that both the drain and the bounded coordinator's global stages consume.
-// None emits findings.
+// Audit set-builders: pure derivations over `records`/`inventory` that
+// both the drain and the bounded coordinator's global stages consume. None
+// emits findings.
 //
 // Two idioms satisfy that no-emission requirement, and the difference is
 // driven by the stages' inputs, not by taste. The default is to run the
@@ -757,9 +756,9 @@ export function fleetAuditExpectedNamespaceIds(
  * namespace-expecting record, in record then namespace order. The
  * `namespace-expectations` stage (emission), its prefix/full seed (the map),
  * and the records-derived duplicate set (the collisions) all run through it,
- * so the claim rule exists once (R4-B.2 §6.4 SEED DERIVATION). `owners` is
- * mutated in place; `onClaim` receives the prior owner, undefined when this
- * record has just become the owner.
+ * so the claim rule exists once. `owners` is mutated in place; `onClaim`
+ * receives the prior owner, undefined when this record has just become the
+ * owner.
  *
  * Declared here with the other set-builders, ahead of its emitting caller
  * `auditNamespaceExpectationsStage` in the stage section below.
@@ -783,12 +782,12 @@ function walkNamespaceClaims(
 }
 
 /**
- * The records-derived expected-duplicate seed (R4-B.2 §6.1): the set of
- * namespace ids more than one audited, namespace-expecting record claims.
- * Pure over `auditedRecords`, independent of chunk position. It runs the very
- * walker the `namespace-expectations` stage runs, so this is the same
- * collision set that stage accumulates by the time it completes — not merely
- * a second derivation that agrees with it.
+ * The records-derived expected-duplicate seed: the set of namespace ids more
+ * than one audited, namespace-expecting record claims. Pure over
+ * `auditedRecords`, independent of chunk position. It runs the very walker
+ * the `namespace-expectations` stage runs, so this is the same collision set
+ * that stage accumulates by the time it completes — not merely a second
+ * derivation that agrees with it.
  */
 export function fleetAuditRecordsDerivedDuplicateNamespaceIds(
   auditedRecords: readonly FleetRecord[],
@@ -837,20 +836,20 @@ export function fleetAuditExpectedBucketsSeed(
 ): Map<string, FleetAuditExpectedBucketEntry> {
   const expectedBuckets = new Map<string, FleetAuditExpectedBucketEntry>();
   // The emitting stage over an EMPTY map is exactly the non-emitting
-  // rebuild; its findings are discarded (R4-B.2 §6.4 SEED DERIVATION).
-  // Discarding them allocates one `DriftFinding` per duplicate bucket claim
-  // on every call, including the two full-map rebuilds the bounded
-  // `r2-orphans`/`r2-missing-identity` stages run over every audited record.
-  // That garbage is per duplicate claim, not per record, so it stays far
-  // below the documented O(records²) record-row re-parse term.
+  // rebuild; its findings are discarded. Discarding them allocates one
+  // `DriftFinding` per duplicate bucket claim on every call, including the
+  // two full-map rebuilds the bounded `r2-orphans`/`r2-missing-identity`
+  // stages run over every audited record. That garbage is per duplicate
+  // claim, not per record, so it stays far below the documented O(records²)
+  // record-row re-parse term.
   auditR2ExpectedStage({ records, expectedBuckets });
   return expectedBuckets;
 }
 
 // ---------------------------------------------------------------------------
-// Audit global stage functions (R4-B.2). Each takes an iteration slice plus
-// its derived sets and returns the findings for that slice, in the same
-// order `auditFleetDrift`'s pre-decomposition body pushed them.
+// Audit global stage functions. Each takes an iteration slice plus its
+// derived sets and returns the findings for that slice, in the same order
+// `auditFleetDrift`'s pre-decomposition body pushed them.
 // ---------------------------------------------------------------------------
 
 export function auditRegistrationOrphansStage(
@@ -1041,11 +1040,11 @@ export function auditNamespaceExpectationsStage(
     /**
      * An INPUT the stage reads and also mutates: the caller supplies the
      * claims already made (empty for the drain's one full-array call, the
-     * §6.1 prefix rebuild for a bounded chunk), and the stage adds this
-     * slice's claims to it as it walks. Reading it is load-bearing — it is
-     * what makes a `duplicate-namespace` collision visible across a chunk
-     * boundary. No caller reads the mutation back today; the map is passed in
-     * rather than built here so the prefix can be seeded.
+     * prefix rebuild for a bounded chunk), and the stage adds this slice's
+     * claims to it as it walks. Reading it is load-bearing — it is what makes
+     * a `duplicate-namespace` collision visible across a chunk boundary. No
+     * caller reads the mutation back today; the map is passed in rather than
+     * built here so the prefix can be seeded.
      */
     expectedNamespaceOwners: Map<string, FleetRecord>;
   }>,
@@ -1091,10 +1090,10 @@ export function auditR2ExpectedStage(
     /**
      * An INPUT the stage reads and also mutates: the caller supplies the
      * claims already made (empty for the drain's one full-array call, the
-     * §6.1 prefix rebuild for a bounded chunk), and the stage adds this
-     * slice's claims to it as it walks. Reading it is load-bearing — a bucket
-     * already in the map is what makes an `r2-bucket-drift` collision visible
-     * across a chunk boundary. The drain reads the finished map back for its
+     * prefix rebuild for a bounded chunk), and the stage adds this slice's
+     * claims to it as it walks. Reading it is load-bearing — a bucket already
+     * in the map is what makes an `r2-bucket-drift` collision visible across a
+     * chunk boundary. The drain reads the finished map back for its
      * `r2-orphans` and `r2-missing-identity` stages; the bounded path rebuilds
      * it with `fleetAuditExpectedBucketsSeed` instead.
      */
@@ -1186,12 +1185,11 @@ export function auditR2MissingIdentityStage(
 }
 
 // ---------------------------------------------------------------------------
-// Per-record audit step (R4-B.2). Frozen result shape per §6.3: `findings`
-// carries the sanitized durable detail; `legacyDetails` is index-paired and
-// holds the exact legacy byte composition only where it differs (raw
-// diagnostic bytes), null where identical. The drain emits
-// `legacyDetails[i] ?? detail`; the bounded coordinator persists `detail`
-// alone.
+// Per-record audit step. Frozen result shape: `findings` carries the
+// sanitized durable detail; `legacyDetails` is index-paired and holds the
+// exact legacy byte composition only where it differs (raw diagnostic bytes),
+// null where identical. The drain emits `legacyDetails[i] ?? detail`; the
+// bounded coordinator persists `detail` alone.
 // ---------------------------------------------------------------------------
 
 export interface FleetAuditRecordStepResult {
@@ -1221,9 +1219,9 @@ export interface FleetAuditRecordStepInput {
   readonly maintenanceSecretFor: (record: FleetRecord) => string;
   readonly store: FleetStateStore;
   readonly staleAfterMs: number;
-  /** Drives every staleness comparison (§6.1). */
+  /** Drives every staleness comparison. */
   readonly auditNow: number;
-  /** Feeds only the re-arm's `commitInvocationAuthority` clock (§6.1). */
+  /** Feeds only the re-arm's `commitInvocationAuthority` clock. */
   readonly authorityNowProvider: () => number;
 }
 

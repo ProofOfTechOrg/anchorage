@@ -48,13 +48,17 @@ import {
   withheldAuditDetail,
 } from './fleet-audit-state.js';
 import { readFleetInventoryGeneration } from './fleet-inventory-advance.js';
-import type { FleetInventoryRunStore } from './fleet-inventory-state.js';
+import {
+  FLEET_INVENTORY_GENERATION_READ_MEMBERS,
+  type FleetInventoryRunStore,
+} from './fleet-inventory-state.js';
 import {
   assertFleetOperationId,
   classifyFleetOperationToken,
   FLEET_OPERATION_ITEM_BOUND,
   FLEET_OPERATION_RECORD_ROW_BYTE_BOUND,
   FLEET_OPERATION_STAGE_BATCH_STATEMENTS,
+  FLEET_OPERATION_STORE_ADVANCE_MEMBERS,
   type FleetOperationFailure,
   type FleetOperationLease,
   type FleetOperationRunRecord,
@@ -123,7 +127,7 @@ export interface AdvanceFleetAuditOptions {
    * `updatedAt` from wall clock. Defaults to `Date.now`.
    */
   readonly auditClock?: () => number;
-  /** Feeds only the re-arm's authority clock (§6.1); default `Date.now`. */
+  /** Feeds only the re-arm's authority clock; default `Date.now`. */
   readonly authorityClock?: () => number;
   /**
    * Call-local only; never persisted. Read at the entry and before each
@@ -194,15 +198,8 @@ const CAPABILITY_MESSAGES: Readonly<
 const CAPABILITY_MEMBERS: Readonly<
   Record<FleetAuditAdvanceCapability, readonly string[]>
 > = Object.freeze({
-  'operation-store': Object.freeze([
-    'withAccountOperationLease',
-    'readOperationById',
-    'readOperationRowsPage',
-  ]),
-  'generation-read': Object.freeze([
-    'readFinalizedGeneration',
-    'readRunByOperation',
-  ]),
+  'operation-store': FLEET_OPERATION_STORE_ADVANCE_MEMBERS,
+  'generation-read': FLEET_INVENTORY_GENERATION_READ_MEMBERS,
   'generation-pin': Object.freeze(['pinGeneration', 'releasePin']),
 });
 
@@ -219,8 +216,8 @@ export class FleetAuditAdvanceCapabilityError extends Error {
  * `object` rather than a port type because this coordinator gates two
  * unrelated ports (the operation store and the inventory store) through the
  * same table, and it is named for the audit capability set rather than for
- * one store — the R3 sibling's `assertStoreCapability` gates a single store
- * and keeps the narrower name.
+ * one store — fleet-inventory-advance.ts's `assertStoreCapability` gates a
+ * single store and keeps the narrower name.
  */
 function assertCapability(
   target: object,
@@ -317,10 +314,10 @@ function fleetAuditFindingKind(
 }
 
 /**
- * Non-throwing durable write gate (§5.1/§6.4): the bounded path gates; the
- * drain never does. Only `detail` is gated: `tenantTag` and `environment`
- * reach the row verbatim, which is the round-3 adjudication, so the name says
- * gated DETAIL rather than a sanitized row.
+ * Non-throwing durable write gate: the bounded path gates; the drain never
+ * does. Only `detail` is gated: `tenantTag` and `environment` reach the row
+ * verbatim, which is the round-3 adjudication, so the name says gated DETAIL
+ * rather than a sanitized row.
  */
 function findingRowWithGatedDetail(
   finding: DriftFinding,
@@ -811,8 +808,8 @@ async function advancePerRecordChunk(
     findingRows.push(row);
   }
 
-  // §5.5 DETECTION MECHANISM: the coordinator computes the batch-budget
-  // overflow itself and never lets the store's own guard fire.
+  // The coordinator computes the batch-budget overflow itself and never lets
+  // the store's own guard fire.
   if (
     findingRows.length + newFacts.length + 1 >
     FLEET_OPERATION_STAGE_BATCH_STATEMENTS
@@ -905,7 +902,6 @@ async function advanceOneChunk(
       });
       return pendingFromCommitted(committed);
     }
-    const perRecordAuditedRecords = fleetAuditAuditedRecords(records);
     return advancePerRecordChunk(
       options,
       lease,
@@ -914,7 +910,7 @@ async function advanceOneChunk(
       perRecordStage,
       inventory,
       records,
-      perRecordAuditedRecords,
+      fleetAuditAuditedRecords(records),
     );
   }
   const auditedRecords = fleetAuditAuditedRecords(records);
@@ -1147,14 +1143,14 @@ async function startAudit(
         return pendingFromCommitted(committed);
       } catch {
         // Every throw from the revision-1 replay resolves to the same answer,
-        // and the catch is unnarrowed for that reason: for a
-        // far-advanced running (or since-terminal) operation the CAS cannot
-        // converge, and for a lost lease or a store fault the operation's
-        // current authoritative state is still the only truthful reply. The
-        // caller therefore receives exactly what a stale-token continue would
-        // return (§5.5) — which is a report of durable state, never a claim
-        // that this call succeeded. If no state can be read back at all, the
-        // reads below throw rather than invent one.
+        // and the catch is unnarrowed for that reason: for a far-advanced
+        // running (or since-terminal) operation the CAS cannot converge, and
+        // for a lost lease or a store fault the operation's current
+        // authoritative state is still the only truthful reply. The caller
+        // therefore receives exactly what a stale-token continue would return
+        // — which is a report of durable state, never a claim that this call
+        // succeeded. If no state can be read back at all, the reads below
+        // throw rather than invent one.
         const current = await lease.readOperation(operationId);
         if (current) return resultFromRun(current);
         const persisted =
@@ -1299,7 +1295,7 @@ export async function readFleetAuditFindingsPage(
 
 /**
  * Unblocks a stuck RUNNING audit operation, or releases any surviving pin on
- * an already-terminal one (§5.5 ABANDONMENT). Idempotent throughout.
+ * an already-terminal one. Idempotent throughout.
  */
 export async function abandonFleetAuditOperation(
   input: Readonly<{

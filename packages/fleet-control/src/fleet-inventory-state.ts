@@ -380,6 +380,16 @@ export interface FleetInventoryRunStore {
   ): Promise<Readonly<{ deleted: number }>>;
 }
 
+/**
+ * The {@link FleetInventoryRunStore} members a bounded coordinator calls to
+ * read a finalized generation, and gates an injected store on. It lives here
+ * so that a coordinator reads the port's own list rather than restating it.
+ */
+export const FLEET_INVENTORY_GENERATION_READ_MEMBERS = Object.freeze([
+  'readFinalizedGeneration',
+  'readRunByOperation',
+] as const satisfies readonly (keyof FleetInventoryRunStore)[]);
+
 /** Fixed refusal shared by both durable-text controls. */
 export class FleetInventoryFindingValueError extends Error {
   constructor(readonly field: string) {
