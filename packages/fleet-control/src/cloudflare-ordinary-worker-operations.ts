@@ -463,8 +463,8 @@ export async function dispatchOrdinaryWorkerUpload(
     const subdomain = context.client.workers.scripts.subdomain;
     const uploadParameters = {
       account_id: context.accountId,
-      // cloudflare/internal/uploads.mjs:102-129 bracket-flattens objects;
-      // Wrangler 4.118.0 serializes the same metadata value as JSON.
+      // The SDK's addFormValue bracket-flattens objects; Wrangler 4.118.0
+      // serializes the same metadata value as JSON.
       metadata: metadata as never,
     };
     const body = namedWorkerUploadBody(files, metadata);

@@ -2504,7 +2504,8 @@ function withoutConsumedSwitchEntryCarriers(
 // The top-level `applicationResources` a switch teardown's record carries: the
 // `applicationR2Progress` entries the teardown persists, projected back onto
 // the resources they track through `applicationR2ResourceFromProgress`, which
-// `assertCompleteRecord` also reads to compare a record's own states.
+// `applicationResourceProgressMatches` also reads to compare a record's own
+// states.
 function switchTeardownApplicationResources(
   intent: BackendSwitchIntent,
 ): readonly import('./types.js').ApplicationR2Resource[] {

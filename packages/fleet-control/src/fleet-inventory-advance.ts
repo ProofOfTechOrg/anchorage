@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Shares the request-budget contract cloudflare-fleet-inventory.ts states.
+// Shares the request-budget contract that
+// cloudflare-worker-attachment-scan-state.ts declares.
 import { assertWorkerAttachmentProviderRequestBudget } from './cloudflare-worker-attachment-scan-state.js';
 import {
   advanceFleetInventoryProgress,

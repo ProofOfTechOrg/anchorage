@@ -2,6 +2,7 @@
 
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
+import { cancelBodyWithoutAwait } from './direct-credentialed-body-cancel.mjs';
 import { DIRECT_INVOCATION_FAILURE_DETAILS } from './direct-credentialed-invocation.mjs';
 import {
   validateProviderAuth as auth,
@@ -54,14 +55,6 @@ function object(value) {
 
 function equal(value, expected) {
   if (!isDeepStrictEqual(value, expected)) refuse();
-}
-
-function cancel(response) {
-  try {
-    void response?.body?.cancel().catch(() => {});
-  } catch {
-    /* The abortable pipe owns a locked source. */
-  }
 }
 
 async function checkedInput(input) {
@@ -378,7 +371,7 @@ async function assertAbsent(request, APIError) {
     if (error instanceof APIError && error.status === 404) return;
     throw error;
   } finally {
-    cancel(response);
+    cancelBodyWithoutAwait(response?.body);
   }
 }
 

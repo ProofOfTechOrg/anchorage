@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { cancelBodyWithoutAwait } from '../scripts/direct-credentialed-body-cancel.mjs';
 import {
   openDirectProviderSession,
   singlePage,
@@ -155,4 +156,53 @@ it('requests identity encoding for the export object GET through the native SDK'
     'Bearer inert-provider-token',
   );
   expect(request.headers.get('cf-r2-jurisdiction')).toBe('default');
+});
+
+describe('the body-cancel leaf', () => {
+  it('hands the body and the reason to the built package on first call', async () => {
+    const cancel = vi.fn(() => Promise.resolve());
+    const reason = new Error('refusal');
+    expect(cancelBodyWithoutAwait({ cancel }, reason)).toBeUndefined();
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    // The first call is what loads the built module, so the release lands a
+    // filesystem read later rather than on the next turn.
+    await vi.waitFor(() => {
+      expect(cancel).toHaveBeenCalledTimes(1);
+    });
+    expect(cancel).toHaveBeenCalledWith(reason);
+  });
+
+  it('issues every release after the first in the calling turn', async () => {
+    const first = vi.fn(() => Promise.resolve());
+    cancelBodyWithoutAwait({ cancel: first }, new Error('warm'));
+    await vi.waitFor(() => {
+      expect(first).toHaveBeenCalledTimes(1);
+    });
+    const second = vi.fn(() => Promise.resolve());
+    const reason = new Error('refusal');
+    cancelBodyWithoutAwait({ cancel: second }, reason);
+    expect(second).toHaveBeenCalledWith(reason);
+  });
+
+  it('reads a body that carries no cancel and calls nothing', async () => {
+    let reads = 0;
+    const body = {
+      get cancel() {
+        reads += 1;
+        return undefined;
+      },
+    };
+    const reason = new Error('refusal');
+    for (const absent of [undefined, null, {}, 'body'])
+      expect(cancelBodyWithoutAwait(absent, reason)).toBeUndefined();
+    expect(cancelBodyWithoutAwait(body, reason)).toBeUndefined();
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    await vi.waitFor(() => {
+      expect(reads).toBe(1);
+    });
+  });
 });

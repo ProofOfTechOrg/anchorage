@@ -3,9 +3,8 @@
 export const DIRECT_TENANT_OBJECT_KEY = 'direct-conformance-fixture';
 export const DIRECT_TENANT_OBJECT_BODY = 'direct-conformance-fixture-data';
 
-// The `/__direct/*` routes the tenant Worker answers. The reference harness
-// admits this set rather than restating it, so the harness and the router
-// cannot disagree about which requests exist.
+// The `/__direct/*` routes the tenant Worker answers. The router and the
+// clients that call it import these values, so a rename is one edit for them.
 export const DIRECT_TENANT_ROUTES = Object.freeze({
   health: '/__direct/health',
   object: '/__direct/object',

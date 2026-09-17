@@ -480,13 +480,17 @@ describe('reconciled transient provisioning failures', () => {
           },
           invoke: () => subject.ensureDatabase(spec, fence),
           verify() {
-            expect([...api.databases.values()]).toEqual([
+            const databases = [...api.databases.values()];
+            expect(databases).toEqual([
               {
-                id: 'db-acme-production',
+                id: expect.any(String),
                 name: spec.databaseName,
                 created: false,
               },
             ]);
+            // The obligation is that a provider id is not the name a consumer
+            // passes, not the fake's own formula for deriving one.
+            expect(databases[0]?.id).not.toBe(spec.databaseName);
           },
         };
       }
@@ -2049,11 +2053,14 @@ describe('PlainWorkerBackend core policy', () => {
     );
     expect(api.domains).toEqual([
       {
-        id: 'domain-app.example.test',
+        id: expect.any(String),
         hostname: spec.routeHostname,
         service: spec.scriptName,
       },
     ]);
+    // The obligation is that a provider domain id is not the hostname
+    // ownership checks read, not the fake's own formula for deriving one.
+    expect(api.domains[0]?.id).not.toBe(spec.routeHostname);
   });
 
   it('checks maintenance digest through injected fetch', async () => {

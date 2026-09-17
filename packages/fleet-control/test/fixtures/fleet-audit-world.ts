@@ -7,11 +7,12 @@
  * never rewrite their own input.
  *
  * The world freezes the SHIPPED behavior of `auditFleetDrift` in
- * `src/fleet.ts` (lines 560-1403) before its internals are decomposed into
- * bounded stages (R4-B.2), so the decomposition can be proven
+ * `src/fleet.ts` — the findings and collaborator calls its bounded stage
+ * helpers and `auditRecordStep` produce — so that decomposition is proven
  * behavior-equivalent. It drives every finding kind `auditFleetDrift` itself
  * pushes except `duplicate-database` (pinned exact-order by
- * fleet.test.ts:803); provider-supplied inventory-finding kinds are
+ * `test/fleet.test.ts`'s "finds duplicate ownership, version drift, and
+ * re-arms stale maintenance"); provider-supplied inventory-finding kinds are
  * represented by the single seeded `stale-route`. It also records both
  * the exact findings array AND the exact sequence of calls the function makes
  * onto its `store`, `backendFor`, `specFor`, and `maintenanceSecretFor`
@@ -26,28 +27,30 @@
  * few specific `findings.push(...)` sites in `auditFleetDrift`; a handful of
  * sites are deliberately left uncovered by this world and pinned instead by
  * the existing exact-order titles in `test/fleet.test.ts`:
- *   - fleet.ts:1047, :1059, :1103, :1273 (the `String(error)` resolver- and
- *     inspection-failure catch sites) — this world's `backendFor`/
+ *   - `auditRecordStep`'s four `String(error)` catch sites (`'backend
+ *     resolver failed'`, `'spec resolver failed'`, `'maintenance secret
+ *     resolver failed'`, `'inspection failed'`) — this world's `backendFor`/
  *     `specFor`/`maintenanceSecretFor`/`inspect` collaborators never throw,
- *     so only `test/fleet.test.ts:2384` ("contains resolver, inspection,
- *     and maintenance re-arm failures per deployment") exercises them.
- *   - fleet.ts:1291, :1300, :1313, :1328 (the `database-mismatch`,
- *     `duplicate-database`, `duplicate-namespace`, and `version-drift`
- *     checks that compare against `backend.inspect()`'s OWN reported
- *     identity, not the per-record inventory entry) — pinned instead by
- *     `test/fleet.test.ts:803` ("finds duplicate ownership, version drift,
- *     and re-arms stale maintenance"); `duplicate-database` (fleet.ts:1300)
- *     has no story in this world at all.
- *   - fleet.ts:1393 (`maintenance re-arm failed`) IS covered here (by
- *     `rearmFail`, below), so `test/fleet.test.ts:2384`'s pin of the same
- *     site is redundant with this world, not a gap it fills.
- *   - fleet.ts:581-608 and the fleet.ts:866 `continue` (the active-bounded-
- *     cleanup suppression branch) — no record in this world has an active
- *     cleanup, so the branch is deliberately unexercised here; pinned
- *     instead by `test/fleet.test.ts:2454` ("suppresses drift findings in
- *     both directions for a deployment under active bounded cleanup") and
- *     `test/fleet.test.ts:2536` ("reports no incomplete provisioning for a
- *     stale blocked cleanup record").
+ *     so only `test/fleet.test.ts`'s "contains resolver, inspection, and
+ *     maintenance re-arm failures per deployment" exercises them.
+ *   - `auditRecordStep`'s `database-mismatch`, `duplicate-database`,
+ *     `duplicate-namespace`, and `version-drift` checks against
+ *     `backend.inspect()`'s OWN reported identity, not the per-record
+ *     inventory entry — pinned instead by `test/fleet.test.ts`'s "finds
+ *     duplicate ownership, version drift, and re-arms stale maintenance";
+ *     `duplicate-database` has no story in this world at all.
+ *   - `auditRecordStep`'s `'maintenance re-arm failed'` `audit-error` IS
+ *     covered here (by `rearmFail`, below), so the pin of the same site in
+ *     "contains resolver, inspection, and maintenance re-arm failures per
+ *     deployment" is redundant with this world, not a gap it fills.
+ *   - `fleetAuditAuditedRecords`' `hasActiveCleanup` filter and
+ *     `auditRecordStep`'s `hasActiveCleanup` early return (the
+ *     active-bounded-cleanup suppression branch) — no record in this world
+ *     has an active cleanup, so the branch is deliberately unexercised here;
+ *     pinned instead by `test/fleet.test.ts`'s "suppresses drift findings in
+ *     both directions for a deployment under active bounded cleanup" and
+ *     "reports no incomplete provisioning for a stale blocked cleanup
+ *     record".
  */
 
 import { auditFleetDrift, type DriftFinding } from '../../src/fleet.js';
@@ -230,7 +233,7 @@ function bareDeployment(
 }
 
 // ---------------------------------------------------------------------------
-// Records. Every record but `control` cites the fleet.ts lines its story targets.
+// Records: the clean `control` deployment and the drift stories.
 // ---------------------------------------------------------------------------
 
 /** A fully healthy deployment: proves the audit does not false-positive. */
@@ -238,16 +241,18 @@ const control = baseRecord('control');
 
 /**
  * Two live `inventory.deployments` entries answer this record's one expected
- * script key -> fleet.ts:680 `duplicate-deployment` ("appears N times").
+ * script key -> `auditDeploymentGapsStage`'s `duplicate-deployment`
+ * ("appears N times").
  */
 const liveDup = baseRecord('livedup');
 
 /**
  * Two records share `scriptName` ("shared-record-script"), so both fall
- * under one `recordsByScript` key with two members -> fleet.ts:871
- * `duplicate-deployment` ("is registered N times"), for BOTH records. `b` is
- * phase `worker-deployed` (not `ready`) so it exits at the fleet.ts:965 gate
- * before any of the ready-only per-record checks can also fire.
+ * under one `recordsByScript` key with two members ->
+ * `auditRecordStep`'s `duplicate-deployment` ("is registered N times"), for
+ * BOTH records. `b` is phase `worker-deployed` (not `ready`) so it exits at
+ * `auditRecordStep`'s `phase !== 'ready'` return before any of the
+ * ready-only per-record checks can also fire.
  */
 const recordDupA = baseRecord('recdupa', {
   scriptName: 'shared-record-script',
@@ -259,8 +264,8 @@ const recordDupB = baseRecord('recdupb', {
 
 /**
  * Two records both declare `durableObjectBindings` under the SAME namespace
- * id -> fleet.ts:766 `duplicate-namespace` (expected side), for the second
- * one processed.
+ * id -> `auditNamespaceExpectationsStage`'s `duplicate-namespace` (expected
+ * side), for the second one processed.
  */
 const SHARED_EXPECTED_NAMESPACE = 'ns-shared-expected';
 const namespaceDupA = baseRecord('dupexpnsa', {
@@ -283,8 +288,8 @@ const namespaceDupB = baseRecord('dupexpnsb', {
 });
 
 /**
- * Expects a namespace id absent from `inventory.namespaceIds` -> fleet.ts:776
- * `missing-namespace`.
+ * Expects a namespace id absent from `inventory.namespaceIds` ->
+ * `auditNamespaceExpectationsStage`'s `missing-namespace`.
  */
 const MISSING_EXPECTED_NAMESPACE = 'ns-missing-expected';
 const missingNamespace = baseRecord('missingns', {
@@ -298,8 +303,9 @@ const missingNamespace = baseRecord('missingns', {
 });
 
 /**
- * Two records both claim the same R2 bucket -> fleet.ts:811 `r2-bucket-drift`
- * ("claimed by more than one deployment"), for the second one processed.
+ * Two records both claim the same R2 bucket -> `auditR2ExpectedStage`'s
+ * `r2-bucket-drift` ("claimed by more than one deployment"), for the second
+ * one processed.
  */
 const SHARED_BUCKET_CREATION_DATE = '2026-01-01T00:00:00.000Z';
 const bucketDupA = baseRecord('r2dupa', {
@@ -327,7 +333,10 @@ const bucketDupB = baseRecord('r2dupb', {
   ],
 });
 
-/** Claims a bucket absent from `inventory.r2Buckets` -> fleet.ts:844 `missing-r2-bucket`. */
+/**
+ * Claims a bucket absent from `inventory.r2Buckets` ->
+ * `auditR2MissingIdentityStage`'s `missing-r2-bucket`.
+ */
 const bucketMissing = baseRecord('r2missing', {
   applicationResources: [
     {
@@ -343,8 +352,8 @@ const bucketMissing = baseRecord('r2missing', {
 
 /**
  * Claims a bucket present in `inventory.r2Buckets` under a different
- * jurisdiction and creation date -> fleet.ts:854 `r2-bucket-drift` ("changed
- * its persisted creation identity").
+ * jurisdiction and creation date -> `auditR2MissingIdentityStage`'s
+ * `r2-bucket-drift` ("changed its persisted creation identity").
  */
 const bucketDrift = baseRecord('r2drift', {
   applicationResources: [
@@ -359,38 +368,50 @@ const bucketDrift = baseRecord('r2drift', {
   ],
 });
 
-/** No live deployment at all answers this record's expected key -> fleet.ts:672 `missing-deployment`. */
+/**
+ * No live deployment at all answers this record's expected key ->
+ * `auditDeploymentGapsStage`'s `missing-deployment`.
+ */
 const missingDeploy = baseRecord('missingdeploy');
 
-/** The live inventory deployment's `databaseIds` mismatch -> fleet.ts:974 `database-mismatch`. */
+/**
+ * The live inventory deployment's `databaseIds` mismatch ->
+ * `auditRecordStep`'s inventory `database-mismatch`.
+ */
 const dbMismatch = baseRecord('dbmismatch');
 
-/** The live inventory deployment's Durable Object bindings mismatch -> fleet.ts:1012 `binding-drift`. */
+/**
+ * The live inventory deployment's Durable Object bindings mismatch ->
+ * `auditRecordStep`'s expected-vs-live `binding-drift`.
+ */
 const bindingMismatch = baseRecord('bindingmismatch');
 
 /**
  * No live deployment route and no matching `inventory.routes` entry ->
- * fleet.ts:996 `route-drift` ("does not contain exactly route") AND
- * fleet.ts:1036 `route-drift` ("is missing or mismatched").
+ * `auditRecordStep`'s `route-drift` ("does not contain exactly route") AND
+ * its second `route-drift` ("is missing or mismatched").
  */
 const routeBroken = baseRecord('routebroken');
 
-/** Two `inventory.routes` entries share this record's hostname -> fleet.ts:1021 `duplicate-route`. */
+/**
+ * Two `inventory.routes` entries share this record's hostname ->
+ * `auditRecordStep`'s `duplicate-route`.
+ */
 const routeDup = baseRecord('routedup');
 
 /**
  * Declares `platformResources.stateWorker` AND `platformResources.egressProxy`.
  * Each declared worker's one matching live deployment entry carries the
  * wrong ownership metadata (no `resourceRole`, wrong `resourceGroupId`) ->
- * fleet.ts:1146 `version-drift` ("has drifted ownership or artifact
- * metadata"), fired ONCE PER WORKER (two `version-drift` findings). The
- * state worker's live entry ALSO carries the wrong database/binding count
- * -> fleet.ts:1224 `binding-drift` ("trusted state Worker ... has drifted
- * database, Durable Object, or egress bindings"). The egress worker's live
- * entry has no `plainTextBindings` at all, and since
- * `options.inventory.hostRoutingKvId` is never set in this world,
- * fleet.ts:1245's `!options.inventory.hostRoutingKvId` disjunct alone
- * guarantees fleet.ts:1256 `binding-drift` ("trusted egress Worker ... has
+ * `auditRecordStep`'s trusted-Worker `version-drift` ("has drifted ownership
+ * or artifact metadata"), fired ONCE PER WORKER (two `version-drift`
+ * findings). The state worker's live entry ALSO carries the wrong
+ * database/binding count -> its `platform-state` arm's `binding-drift`
+ * ("trusted state Worker ... has drifted database, Durable Object, or egress
+ * bindings"). The egress worker's live entry has no `plainTextBindings` at
+ * all, and since `options.inventory.hostRoutingKvId` is never set in this
+ * world, the `!input.hostRoutingKvId` disjunct alone guarantees the
+ * `deployment-egress` arm's `binding-drift` ("trusted egress Worker ... has
  * drifted policy or attribution bindings") ADDITIONALLY. The record's OWN
  * worker inspects clean; only the declared `platformResources.stateWorker`
  * and `platformResources.egressProxy` (separate live deployment entries in
@@ -399,12 +420,11 @@ const routeDup = baseRecord('routedup');
  * This record ALSO carries the world's only multi-namespace-id story: a second
  * `durableObjectBindings` entry reuses `SHARED_EXPECTED_NAMESPACE` (already
  * claimed by `namespaceDupA`/`namespaceDupB` above), so this record's OWN pass
- * through the fleet.ts:762 inner loop
- * lands the namespace's THIRD claimant, landing the world's second
- * `duplicate-namespace` finding; a populated
- * `platformResources.stateWorker.namespaceIds` adds a namespace id present
- * nowhere in the inventory, landing a `missing-namespace` finding in the
- * same inner loop. The two land on different fleet.ts:762 arms within one
+ * through `walkNamespaceClaims`' inner loop lands the namespace's THIRD
+ * claimant, landing the world's second `duplicate-namespace` finding; a
+ * populated `platformResources.stateWorker.namespaceIds` adds a namespace id
+ * present nowhere in the inventory, landing a `missing-namespace` finding in
+ * the same inner loop. The two land on different arms of that loop within one
  * record's iteration, proving the loop actually iterates more than once.
  */
 const PLATFORM_STATE_SCRIPT_NAME = 'platform-drift-state-worker';
@@ -441,40 +461,45 @@ const platformDrift = baseRecord('platformdrift', {
 
 /**
  * `spec.authoredBy` is `platform` with an `egressProxyService` declared, so
- * fleet.ts:1071-1073 expects one `EGRESS_PROXY` service binding on the live
- * deployment; the clean inventory entry never sets `serviceBindings`
- * (defaults to none) -> fleet.ts:1091 `binding-drift` ("drifted trusted
- * channel bindings").
+ * `auditRecordStep`'s `expectedServiceBindings` holds one `EGRESS_PROXY`
+ * service binding for the live deployment; the clean inventory entry never
+ * sets `serviceBindings` (defaults to none) -> its `binding-drift` ("drifted
+ * trusted channel bindings").
  */
 const CHANNEL_EGRESS_SERVICE_NAME = 'channel-egress-worker';
 const channelDrift = baseRecord('channeldrift');
 
-/** `backend.inspect()` returns `undefined` -> fleet.ts:1282 `missing-deployment` ("script is absent"). */
+/**
+ * `backend.inspect()` returns `undefined` -> `auditRecordStep`'s
+ * `missing-deployment` ("script is absent").
+ */
 const inspectAbsent = baseRecord('inspectabsent');
 
 /**
  * Unarmed live maintenance drives the full re-arm sequence to a successful
- * commit -> fleet.ts:1353 `maintenance-stale`, and the op log's
+ * commit -> `auditRecordStep`'s `maintenance-stale`, and the op log's
  * `withDeploymentLease`/`get`/`put`/`assertOwned:<key>`/`ensureMaintenance`
- * sequence (fleet.ts:1360-1391). No prior `invocationAuthority`, so
- * `commitInvocationAuthority` performs the `put`.
+ * sequence from the re-arm block that follows it. No prior
+ * `invocationAuthority`, so `commitInvocationAuthority` performs the `put`.
  */
 const maintStale = baseRecord('maintstale');
 
 /**
  * Unarmed live maintenance triggers the same re-arm sequence, but
- * `backend.ensureMaintenance()` throws -> fleet.ts:1353 `maintenance-stale`
- * THEN fleet.ts:1393 `audit-error` ("maintenance re-arm failed:").
+ * `backend.ensureMaintenance()` throws -> `auditRecordStep`'s
+ * `maintenance-stale` THEN its re-arm `catch`'s `audit-error`
+ * ("maintenance re-arm failed:").
  */
 const rearmFail = baseRecord('rearmfail');
 
 /**
- * Phase is not `ready` and `updatedAt` is stale -> fleet.ts:887
+ * Phase is not `ready` and `updatedAt` is stale -> `auditRecordStep`'s
  * `incomplete-provisioning`. Not a `CLEANLY_INVENTORIED_RECORDS` member, so
  * its own script and expected namespace are absent from inventory too ->
- * fleet.ts:672 `missing-deployment` and fleet.ts:776 `missing-namespace`
- * also fire, as accepted collateral of that omission (this record's story
- * is incomplete-provisioning, not inventory cleanliness).
+ * `auditDeploymentGapsStage`'s `missing-deployment` and
+ * `auditNamespaceExpectationsStage`'s `missing-namespace` also fire, as
+ * accepted collateral of that omission (this record's story is
+ * incomplete-provisioning, not inventory cleanliness).
  */
 const staleNotReady = baseRecord('stalenotready', {
   phase: 'worker-deployed',
@@ -485,17 +510,18 @@ const staleNotReady = baseRecord('stalenotready', {
  * A workers-for-platforms record whose `pendingRelease` AND `activeRelease`
  * live entries BOTH mismatch their persisted identity — the pending live
  * entry sets no `desiredSpecDigest` at all; the active live entry mismatches
- * `artifactVersion` — so fleet.ts:909 `version-drift` fires TWICE, once per
- * release. Its `pendingRelease` carries no `topology` -> fleet.ts:928
- * `audit-error` ("has no durable binding topology"), fired ONCE (pending
- * only; `activeRelease` has a topology, so it falls to the fleet.ts:934
- * comparison instead). The active release's live entry ALSO mismatches
- * `databaseIds` -> fleet.ts:920 `database-mismatch`, and mismatches Durable
- * Object topology -> fleet.ts:957 `binding-drift` (both fired ONCE, active
- * only — the pending release's own `databaseIds` matches, and its missing
- * topology short-circuits it out of the fleet.ts:934 comparison). Phase
- * `worker-deployed` keeps this record out of the ready-only per-record
- * checks (fleet.ts:965 gate).
+ * `artifactVersion` — so `auditRecordStep`'s release-loop `version-drift`
+ * fires TWICE, once per release. Its `pendingRelease` carries no `topology`
+ * -> that loop's `!release.topology` arm raises `audit-error` ("has no
+ * durable binding topology"), fired ONCE (pending only; `activeRelease` has
+ * a topology, so it falls to the release-topology comparison instead). The
+ * active release's live entry ALSO mismatches `databaseIds` -> the loop's
+ * `database-mismatch`, and mismatches Durable Object topology -> its
+ * `binding-drift` (both fired ONCE, active only — the pending release's own
+ * `databaseIds` matches, and its missing topology short-circuits it out of
+ * the release-topology comparison). Phase `worker-deployed` keeps this
+ * record out of the ready-only per-record checks (`auditRecordStep`'s
+ * `phase !== 'ready'` return).
  */
 const WFP_ACTIVE_PHYSICAL_NAME = 'wfp-release-active';
 const WFP_PENDING_PHYSICAL_NAME = 'wfp-release-pending';
@@ -527,7 +553,7 @@ const wfpRelease = baseRecord('wfprelease', {
     specDigest: SPEC_DIGEST,
     artifactVersion: 'release-v2-pending',
     releaseSchemaVersion: 1,
-    // No `topology`: fleet.ts:927-933's `!release.topology` arm.
+    // No `topology`: `auditRecordStep`'s `!release.topology` arm.
   },
 });
 
@@ -604,10 +630,10 @@ const CLEANLY_INVENTORIED_RECORDS: readonly FleetRecord[] = [
 
 function fleetAuditWorldInventory(): FleetResourceInventory {
   // `scriptRegistrations` models a workers-for-platforms dispatch
-  // registration: fleet.ts:618-634's orphan check always keys it as
+  // registration: `auditRegistrationOrphansStage` always keys it as
   // `workers-for-platforms:<scriptName>`, regardless of a registration's own
   // fields, so a plain-worker record must never get one — only `wfpRelease`
-  // (backend `workers-for-platforms`) and the deliberate fleet.ts:629 ghost
+  // (backend `workers-for-platforms`) and the deliberate ghost registration
   // below need entries here.
   const scriptRegistrations: FleetResourceInventory['scriptRegistrations'][number][] =
     [];
@@ -622,9 +648,10 @@ function fleetAuditWorldInventory(): FleetResourceInventory {
       // `missingNamespace` is excluded here (but stays a CLEANLY_INVENTORIED_RECORDS
       // member for deployments/databaseIds/routes): its whole story is that
       // `MISSING_EXPECTED_NAMESPACE` is absent from fleet inventory
-      // (fleet.ts:776), so folding its own expected namespace id into this
-      // derivation — the opposite of its design — would silently launder it
-      // into "present" and defeat the story.
+      // (`auditNamespaceExpectationsStage`'s `missing-namespace`), so folding
+      // its own expected namespace id into this derivation — the opposite of
+      // its design — would silently launder it into "present" and defeat the
+      // story.
       ...CLEANLY_INVENTORIED_RECORDS.filter(
         (record) => record !== missingNamespace,
       ).flatMap((record) =>
@@ -638,7 +665,8 @@ function fleetAuditWorldInventory(): FleetResourceInventory {
     cleanRoute(record),
   );
 
-  // fleet.ts:629 — a registered script with no live fleet owner at all.
+  // `auditRegistrationOrphansStage` — a registered script with no live fleet
+  // owner at all.
   scriptRegistrations.push({
     scriptName: 'ghost-registered-script',
     tenantTag: 'ghost-registration',
@@ -647,7 +675,8 @@ function fleetAuditWorldInventory(): FleetResourceInventory {
     routeHostname: 'ghost-registration.example.test',
   });
 
-  // fleet.ts:647 — an unregistered live script with no owning record.
+  // `auditDeploymentOrphansStage` — an unregistered live script with no
+  // owning record.
   deployments.push(
     bareDeployment({
       scriptName: 'ghost-live-script',
@@ -658,11 +687,11 @@ function fleetAuditWorldInventory(): FleetResourceInventory {
     }),
   );
 
-  // fleet.ts:680 — a second live entry answering `liveDup`'s expected key.
-  // `routeHostnames: []` keeps this second entry from ALSO satisfying
-  // fleet.ts:981-989's per-record route-ownership count, which only wants
-  // exactly one owning live entry; two identical route claims would trip
-  // fleet.ts:996 too.
+  // `auditDeploymentGapsStage`'s `duplicate-deployment` — a second live entry
+  // answering `liveDup`'s expected key. `routeHostnames: []` keeps this
+  // second entry from ALSO satisfying `auditRecordStep`'s
+  // `routeOwnerDeployments` count, which only wants exactly one owning live
+  // entry; two identical route claims would trip its `route-drift` too.
   deployments.push(
     cleanInventoryDeployment(liveDup, {
       tenantTag: 'livedup-ghost-owner',
@@ -670,15 +699,16 @@ function fleetAuditWorldInventory(): FleetResourceInventory {
     }),
   );
 
-  // fleet.ts:871 — the second `recordDupB` claimant of `shared-record-script`
-  // is deliberately NOT added here: `recordDupA`'s clean entry is the only live
-  // deployment under that script name, which is what makes `recordDupB`'s own
-  // `recordsByScript` lookup see two RECORDS behind one live entry.
+  // `auditRecordStep`'s `duplicate-deployment` — the second `recordDupB`
+  // claimant of `shared-record-script` is deliberately NOT added here:
+  // `recordDupA`'s clean entry is the only live deployment under that script
+  // name, which is what makes `recordDupB`'s own `recordsByScript` lookup see
+  // two RECORDS behind one live entry.
 
-  // fleet.ts:697 — an unregistered database id.
+  // `auditOrphanDatabasesStage` — an unregistered database id.
   databaseIds.push('db-orphan-ghost');
 
-  // fleet.ts:731 — a route with no owning record.
+  // `auditOrphanRoutesStage` — a route with no owning record.
   routes.push({
     backend: 'plain-worker',
     hostname: 'orphan-route.example.test',
@@ -687,29 +717,31 @@ function fleetAuditWorldInventory(): FleetResourceInventory {
     environment: ENVIRONMENT,
   });
 
-  // fleet.ts:753 — an unregistered namespace id.
+  // `auditNamespaceOrphansStage` — an unregistered namespace id.
   namespaceIds.push('ns-orphan-ghost');
 
-  // fleet.ts:1021 — a second route sharing `routeDup`'s hostname.
+  // `auditRecordStep`'s `duplicate-route` — a second route sharing
+  // `routeDup`'s hostname.
   routes.push(cleanRoute(routeDup, { scriptName: 'route-dup-ghost-script' }));
 
   const r2Buckets: NonNullable<FleetResourceInventory['r2Buckets']> = [
-    // fleet.ts:811's second claimant (`bucketDupB`) is deliberately NOT added
-    // as its own live bucket: the single `shared-bucket` entry below is
-    // what both records compete over.
+    // `auditR2ExpectedStage`'s second claimant (`bucketDupB`) is deliberately
+    // NOT added as its own live bucket: the single `shared-bucket` entry
+    // below is what both records compete over.
     {
       bucketName: 'shared-bucket',
       jurisdiction: 'default',
       creationDate: SHARED_BUCKET_CREATION_DATE,
     },
-    // fleet.ts:854 — present, but under a different jurisdiction/creation
-    // date than `bucketDrift`'s persisted claim.
+    // `auditR2MissingIdentityStage`'s `r2-bucket-drift` — present, but under
+    // a different jurisdiction/creation date than `bucketDrift`'s persisted
+    // claim.
     {
       bucketName: 'bucket-drift',
       jurisdiction: 'eu',
       creationDate: '2026-03-01T00:00:00.000Z',
     },
-    // fleet.ts:833 — an unclaimed live bucket.
+    // `auditR2OrphansStage` — an unclaimed live bucket.
     {
       bucketName: 'bucket-orphan-ghost',
       jurisdiction: 'default',
@@ -717,12 +749,12 @@ function fleetAuditWorldInventory(): FleetResourceInventory {
     },
   ];
 
-  // fleet.ts:974 — the live deployment's databaseIds mismatch the record.
-  // `dbMismatch.databaseId` itself is added to the top-level `databaseIds`
-  // list so fleet.ts:970-972's THIRD conjunct
-  // (`!options.inventory.databaseIds.includes(record.databaseId)`) does not
-  // ALSO fire on its own, and a clean route entry keeps fleet.ts:996/:1036
-  // from firing alongside the deliberate database mismatch.
+  // `auditRecordStep`'s inventory `database-mismatch` — the live deployment's
+  // databaseIds mismatch the record. `dbMismatch.databaseId` itself is added
+  // to the top-level `databaseIds` list so that check's third disjunct
+  // (`!input.inventoryDatabaseIds.includes(record.databaseId)`) does not ALSO
+  // fire on its own, and a clean route entry keeps the two `route-drift`
+  // checks from firing alongside the deliberate database mismatch.
   databaseIds.push(dbMismatch.databaseId);
   deployments.push(
     cleanInventoryDeployment(dbMismatch, {
@@ -731,8 +763,9 @@ function fleetAuditWorldInventory(): FleetResourceInventory {
   );
   routes.push(cleanRoute(dbMismatch));
 
-  // fleet.ts:1012 — the live deployment's Durable Object bindings mismatch.
-  // Same THIRD-conjunct and route-cleanliness reasoning as `dbMismatch`.
+  // `auditRecordStep`'s expected-vs-live `binding-drift` — the live
+  // deployment's Durable Object bindings mismatch. Same third-disjunct and
+  // route-cleanliness reasoning as `dbMismatch`.
   databaseIds.push(bindingMismatch.databaseId);
   deployments.push(
     cleanInventoryDeployment(bindingMismatch, {
@@ -752,20 +785,22 @@ function fleetAuditWorldInventory(): FleetResourceInventory {
   namespaceIds.push('ns-bindingmismatch-wrong');
   routes.push(cleanRoute(bindingMismatch));
 
-  // fleet.ts:996/:1036 — `routeBroken` gets a live deployment (so its
-  // registry/provider-inventory presence checks pass cleanly) but NO
-  // route in either `routeHostnames` or `inventory.routes`. Its own
-  // `databaseId` is still added to the top-level list so fleet.ts:970-972's
-  // database check does not ALSO fire alongside the deliberate route drift.
+  // `auditRecordStep`'s two `route-drift` checks — `routeBroken` gets a live
+  // deployment (so its registry/provider-inventory presence checks pass
+  // cleanly) but NO route in either `routeHostnames` or `inventory.routes`.
+  // Its own `databaseId` is still added to the top-level list so the
+  // inventory database check does not ALSO fire alongside the deliberate
+  // route drift.
   databaseIds.push(routeBroken.databaseId);
   deployments.push(
     cleanInventoryDeployment(routeBroken, { routeHostnames: [] }),
   );
 
-  // fleet.ts:1146/:1224 — the one live deployment behind `platformDrift`'s
+  // `auditRecordStep`'s trusted-Worker `version-drift` and `platform-state`
+  // `binding-drift` — the one live deployment behind `platformDrift`'s
   // declared `stateWorker`, with wrong ownership metadata (no
   // `resourceRole`, wrong `resourceGroupId`/`artifactVersion`) and an empty
-  // `databaseIds` (fleet.ts:1168 expects exactly one matching entry).
+  // `databaseIds` (that arm expects exactly one matching entry).
   deployments.push(
     bareDeployment({
       scriptName: PLATFORM_STATE_SCRIPT_NAME,
@@ -775,17 +810,19 @@ function fleetAuditWorldInventory(): FleetResourceInventory {
     }),
   );
   // No `scriptRegistrations` entry for the state-worker key: it is
-  // `plain-worker`-backed, so fleet.ts:659-666's `registered` check is
-  // unconditionally true for it regardless (`expected.backend !==
-  // 'workers-for-platforms'`), and — as fleet.ts:629's ghost registration
-  // above demonstrates — ANY `scriptRegistrations` entry is read as a
-  // workers-for-platforms dispatch registration by fleet.ts:618-634's own
-  // orphan check, so adding one here would wrongly orphan this script.
+  // `plain-worker`-backed, so `auditDeploymentGapsStage`'s `registered` check
+  // is unconditionally true for it regardless (`expected.backend !==
+  // 'workers-for-platforms'`), and — as the ghost registration above
+  // demonstrates — ANY `scriptRegistrations` entry is read as a
+  // workers-for-platforms dispatch registration by
+  // `auditRegistrationOrphansStage`, so adding one here would wrongly orphan
+  // this script.
 
-  // fleet.ts:1256 — the one live deployment behind `platformDrift`'s
-  // declared `egressProxy`. `options.inventory.hostRoutingKvId` is never
-  // set in this world, so fleet.ts:1245's `!options.inventory.hostRoutingKvId`
-  // disjunct alone guarantees the drift regardless of every other field.
+  // `auditRecordStep`'s `deployment-egress` `binding-drift` — the one live
+  // deployment behind `platformDrift`'s declared `egressProxy`.
+  // `options.inventory.hostRoutingKvId` is never set in this world, so the
+  // arm's `!input.hostRoutingKvId` disjunct alone guarantees the drift
+  // regardless of every other field.
   deployments.push(
     bareDeployment({
       scriptName: PLATFORM_EGRESS_SCRIPT_NAME,
@@ -795,15 +832,15 @@ function fleetAuditWorldInventory(): FleetResourceInventory {
     }),
   );
 
-  // fleet.ts:1091 — `channelDrift` is already in `CLEANLY_INVENTORIED_RECORDS`,
-  // which gives it its ONE clean live deployment entry (`serviceBindings`
-  // deliberately left unset there — it is what fleet.ts:1085-1090 compares
-  // against the channel service its `platform`-authored spec expects); no
-  // second entry is added here.
+  // `auditRecordStep`'s trusted-channel `binding-drift` — `channelDrift` is
+  // already in `CLEANLY_INVENTORIED_RECORDS`, which gives it its ONE clean
+  // live deployment entry (`serviceBindings` deliberately left unset there —
+  // it is what that check compares against the channel service its
+  // `platform`-authored spec expects); no second entry is added here.
 
-  // fleet.ts:909/:920/:928/:957 — the WfP release-snapshot story. Both
+  // `auditRecordStep`'s release loop — the WfP release-snapshot story. Both
   // physical release script names get exactly one live deployment and one
-  // registration (so the pre-per-record loop sees them as present and
+  // registration (so the pre-per-record stages see them as present and
   // registered, never orphaned or duplicated); the active release's live
   // entry deliberately mismatches artifact version, database id, and
   // Durable Object topology against `wfpRelease.activeRelease`.
@@ -848,8 +885,9 @@ function fleetAuditWorldInventory(): FleetResourceInventory {
   );
 
   return {
-    // fleet.ts:574 — the seed: every provider-supplied finding is copied
-    // verbatim into the result, ahead of anything the audit itself adds.
+    // `auditFleetDrift`'s `[...options.inventory.findings]` seed: every
+    // provider-supplied finding is copied verbatim into the result, ahead of
+    // anything the audit itself adds.
     findings: [
       {
         tenantTag: 'seed-provider',
@@ -928,8 +966,8 @@ class RecordingFleetStore implements FleetStateStore {
         // the latter must fail loudly, not pass silently through to a
         // baseline that would then encode the wrong clock as "correct". The
         // throw below surfaces as an `audit-error` finding inside
-        // `auditFleetDrift` (fleet.ts:1392-1399 swallows it — fail-soft by
-        // design), same as the credential-delivery pins in
+        // `auditFleetDrift` (`auditRecordStep`'s re-arm `catch` swallows it —
+        // fail-soft by design), same as the credential-delivery pins in
         // `RecordingBackend.ensureMaintenance`/`inspect` below, which record
         // into `fenceViolations` too; `runFleetAuditBaseline`'s post-run
         // throw — a fresh Error aggregating the recorded fence-violation
@@ -1107,9 +1145,9 @@ class RecordingBackend implements ProvisioningBackend {
  * inspect-time drift (`inspectAbsent` returns `undefined`; `maintStale` and
  * `rearmFail` report unarmed maintenance). `missingDeploy`, `recordDupB`,
  * `staleNotReady`, and `wfpRelease` are absent from this map entirely:
- * `missingDeploy` never reaches `inspect` at all, exiting at fleet.ts:966's
- * `!inventoryDeployment` check, while the other three exit earlier still, at
- * fleet.ts:965's `phase !== 'ready'` gate.
+ * `missingDeploy` never reaches `inspect` at all, exiting at
+ * `auditRecordStep`'s `!inventoryDeployment` return, while the other three
+ * exit earlier still, at its `phase !== 'ready'` return.
  */
 function inspectResultsByTenant(): Map<string, LiveDeployment | undefined> {
   const live = new Map<string, LiveDeployment | undefined>();
@@ -1170,8 +1208,8 @@ export async function runFleetAuditBaseline(): Promise<{
       specForRecord(record),
     ]),
   );
-  // fleet.ts:1091's channel-binding-drift check only evaluates a non-empty
-  // expectation for a `platform`-authored spec that declares
+  // `auditRecordStep`'s trusted-channel `binding-drift` check only evaluates
+  // a non-empty expectation for a `platform`-authored spec that declares
   // `egressProxyService`; every other record stays `authoredBy: 'external'`.
   specByTenant.set(
     channelDrift.tenantTag,

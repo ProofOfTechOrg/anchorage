@@ -177,10 +177,11 @@ async function failedInitialUpload(error: Error): Promise<unknown> {
 
 function nestedTransportFailure(leaf: Error): Error {
   // The SDK inspects the rejection and its immediate cause before wrapping
-  // (client.mjs:378-390); depth 3 places the hostile leaf below both, so every
-  // row reaches this boundary whichever operation is hostile. Some hazards
-  // (a prototype trap, a cause or constructor accessor) may reach it from a
-  // shallower depth; depth 3 is sufficient for every row.
+  // (the client's makeRequest timeout detection); depth 3 places the hostile
+  // leaf below both, so every row reaches this boundary whichever operation
+  // is hostile. Some hazards (a prototype trap, a cause or constructor
+  // accessor) may reach it from a shallower depth; depth 3 is sufficient for
+  // every row.
   return new Error('outer transport failure', {
     cause: new Error('middle transport failure', { cause: leaf }),
   });
@@ -1276,7 +1277,8 @@ describe('CloudflareProvisioningClient plain-worker plane', () => {
       Promise.reject(new Error('transport timed out')),
     );
     const client = plainClient({ fetch: fixture.fetch });
-    // The SDK's error classes never assign `name` (core/error.js:78-93), so a
+    // The SDK's error classes never assign `name` — `APIConnectionError` and
+    // `APIConnectionTimeoutError` only chain constructors — so a
     // raw rejection reports the base `Error` name and the subclass itself is
     // what identifies a timeout; `sanitizeProviderError` is what stamps the
     // constructor name the sanitized chains elsewhere in this file read.
@@ -2031,8 +2033,9 @@ describe('CloudflareProvisioningClient plain-worker plane', () => {
   });
 
   it('keeps the SDK timeout subclass as a sanitized Error cause', async () => {
-    // cloudflare/client.mjs:389 classifies this text as a timeout, then the SDK
-    // constructs APIConnectionTimeoutError without the injected error as cause.
+    // The client's makeRequest timeout detection classifies this text as a
+    // timeout, then the SDK constructs APIConnectionTimeoutError without the
+    // injected error as cause.
     const failure = await failedInitialUpload(new Error('transport timed out'));
     const chain = boundedErrorCauses(failure);
 

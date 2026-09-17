@@ -605,6 +605,20 @@ describe('credentialed conformance command', () => {
     );
   });
 
+  it('releases a contract response body its refusal never reads', () => {
+    const source = readFileSync(scriptPath, 'utf8');
+    expect(source).toMatch(
+      /function assertResponse\(response, condition, message\) \{\s*if \(condition\) return;\s*const refusal = new Error\(message\);\s*cancelBodyWithoutAwait\(response\.body, refusal\);\s*throw refusal;/u,
+    );
+    expect(source).toMatch(
+      /assertResponse\(\s*response,\s*response\.status === expectedStatus,/u,
+    );
+    expect(source).toMatch(
+      /assertResponse\(\s*overLimit,\s*overLimit\.status === config\.conformance\.cpuOverLimitStatus,/u,
+    );
+    expect(source).toContain('cancelBodyWithoutAwait(overLimit.body);');
+  });
+
   it('runs every mandatory probe in release order and returns only asserted truth', async () => {
     const deployments = [{ id: 'a' }, { id: 'b' }];
     const calls: string[] = [];

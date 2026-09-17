@@ -137,7 +137,7 @@ const SDK_TRANSPORT_TIMEOUT_MS = 2_147_483_647;
 const DRAIN_GENERATION = 1;
 /**
  * The in-memory drain runs each stage to completion, so it hands every chunk
- * the largest budget the shared 9..1,000 provider-request contract allows.
+ * the largest budget `assertWorkerAttachmentProviderRequestBudget` admits.
  */
 const DRAIN_PROVIDER_REQUEST_BUDGET = 1_000;
 const R2_INVENTORY_PAGE_SIZE = 1_000;

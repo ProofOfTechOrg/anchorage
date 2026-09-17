@@ -118,8 +118,9 @@ const HOST_ROUTING_KV_ENTRIES: readonly (readonly [string, string])[] = [
     }),
   ],
   // Owner-checked registration whose live dispatch Worker binds another
-  // database, so the drain records the ownership mismatch at
-  // cloudflare-client.ts:1666-1679.
+  // database, so the drain records the ownership mismatch through
+  // `advanceRegistrationChecks`' `ownerMatches` check in
+  // `cloudflare-fleet-inventory.ts`.
   [
     '__anchorage_script__:fleet-drifted',
     JSON.stringify({
@@ -175,7 +176,8 @@ const HOST_ROUTING_KV_ENTRIES: readonly (readonly [string, string])[] = [
     }),
   ],
   // Consistent policy metadata with an unusable state-egress block, so
-  // parseHostRoutingTarget refuses it at cloudflare-client.ts:1560-1570.
+  // parseHostRoutingTarget refuses it inside `classifyHostRoutingKey`, which
+  // records a `malformed-route` finding for invalid state-egress metadata.
   [
     'bad-state-egress.example.test',
     JSON.stringify({
@@ -247,8 +249,9 @@ const DISPATCH_SCRIPT_SETTINGS: Readonly<
       'do:v3',
     ],
   },
-  // No `spec:` tag, so inspectDispatchWorker refuses this registration and the
-  // drain records the String(error) detail at cloudflare-client.ts:1627-1630.
+  // No `spec:` tag, so inspectDispatchWorker refuses this registration and
+  // `advanceRegistrationChecks`' catch records the String(error) detail
+  // through `diagnostic`.
   'fleet-broken': {
     bindings: [{ type: 'd1', name: 'DB', database_id: 'db-broken' }],
     tags: ['fleet:anchorage', 'tenant:beta', 'environment:staging', 'schema:2'],
@@ -406,8 +409,8 @@ export function fleetInventoryDrainWorld(): ProviderWorld {
     subdomain: { enabled: false, previewsEnabled: false },
   });
   // A trusted Worker reachable on workers.dev with no zone route, so the drain
-  // records the public-access arm of incomplete-deployment at
-  // cloudflare-client.ts:1931-1934.
+  // records the public-access arm of incomplete-deployment —
+  // `advanceOrdinaryScriptDetail`'s `publiclyReachable` branch.
   world.seedScript('fleet-egress', {
     versions: [
       {
@@ -435,8 +438,9 @@ export function fleetInventoryDrainWorld(): ProviderWorld {
     deployment: [{ versionId: 'version-fleet-egress', percentage: 100 }],
     subdomain: { enabled: true, previewsEnabled: false },
   });
-  // No FLEET_SCHEMA_VERSION, so the per-script inventory throws and the drain
-  // records the String(error) detail at cloudflare-client.ts:1974-1978.
+  // No FLEET_SCHEMA_VERSION, so the per-script inventory throws and
+  // `advanceOrdinaryScriptDetail`'s catch records the String(error) detail
+  // through `diagnostic`.
   world.seedScript('fleet-unreadable', {
     versions: [
       {

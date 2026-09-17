@@ -4,6 +4,7 @@ import { validateHeaderValue } from 'node:http';
 import https from 'node:https';
 import { Readable } from 'node:stream';
 import { readBoundedBody } from '@proofoftech/flowsafe/host-kit';
+import { cancelBodyWithoutAwait } from './direct-credentialed-body-cancel.mjs';
 import {
   deriveDirectConformanceNames,
   validateDirectConformanceConfig,
@@ -102,14 +103,6 @@ function reservationError(error) {
     // Foreign rejection inspection can invoke traps.
   }
   return new DirectInvocationError();
-}
-
-function cancelResponse(response) {
-  try {
-    void response?.body?.cancel().catch(() => {});
-  } catch {
-    // The abortable pipe owns cancellation while its source is locked.
-  }
 }
 
 function readAttempts(headers, maxAttempts) {
@@ -238,7 +231,7 @@ export async function awaitReferenceIngress(input) {
         } catch {
           return false;
         } finally {
-          cancelResponse(response);
+          cancelBodyWithoutAwait(response?.body);
         }
       })();
       consecutive = (await Promise.race([exchange, expired]))
@@ -533,7 +526,7 @@ export function createDirectInvocationClient(input) {
                   const redeliver =
                     readOnly || (platformPage && response.status === 404);
                   if (!redeliver) unknown(answerDetail);
-                  cancelResponse(response);
+                  cancelBodyWithoutAwait(response?.body);
                   response = undefined;
                   const remaining = deliveryExpiresAt - performance.now();
                   if (remaining <= 0)
@@ -564,7 +557,7 @@ export function createDirectInvocationClient(input) {
                 }
               }
             } finally {
-              if (signal.aborted) cancelResponse(response);
+              if (signal.aborted) cancelBodyWithoutAwait(response?.body);
             }
           })();
           outcome = await Promise.race([exchange, aborted]);
@@ -593,7 +586,7 @@ export function createDirectInvocationClient(input) {
         if (retryTimer !== undefined) clearTimeout(retryTimer);
         if (abortRead) signal.removeEventListener('abort', abortRead);
         deadline.abort();
-        cancelResponse(response);
+        cancelBodyWithoutAwait(response?.body);
         busy = false;
       }
     },

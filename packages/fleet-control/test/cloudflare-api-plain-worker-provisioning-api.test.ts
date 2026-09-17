@@ -827,8 +827,9 @@ describe('CloudflareApiPlainWorkerProvisioningApi', () => {
       timedOut.api.deleteWorkerScript('slow', ownedFence()),
     );
 
-    // The SDK's error classes never assign `name` (core/error.js:78-93), so the
-    // subclass itself is what identifies a timeout on a raw rejection.
+    // The SDK's error classes never assign `name` — `APIConnectionError` and
+    // `APIConnectionTimeoutError` only chain constructors — so the subclass
+    // itself is what identifies a timeout on a raw rejection.
     expect(timeout).toBeInstanceOf(APIConnectionTimeoutError);
     expect((timeout as Error).message).toBe('Request timed out.');
     // The absence gate reads `status === 404`; a timeout carries no status at

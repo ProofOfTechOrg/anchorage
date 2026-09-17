@@ -141,10 +141,8 @@ export type FleetAuditFactPayload =
  *
  * Admitting the empty string is the exception this predicate exists for:
  * provider-claimed text carries no non-empty requirement, so a
- * `value.length > 0` clause here refuses a conforming value.
- * `fleetOperationBoundedString`, which still carried that superseded
- * clause under a near-identical name, was deleted for exactly that reason;
- * the name here says what the predicate is for rather than what it bounds.
+ * `value.length > 0` clause here refuses a conforming value. The name says
+ * what the predicate is for rather than what it bounds.
  */
 function boundedProviderText(value: unknown): value is string {
   return (

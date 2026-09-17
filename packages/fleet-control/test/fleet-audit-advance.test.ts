@@ -2949,7 +2949,8 @@ describe('advanceFleetAudit', () => {
     expect(harness.inventoryStore.releasedPins).toHaveLength(
       releasesBeforeStaleContinue,
     );
-    // R4-A: “prune releases the audit pin FIRST; the crash window leaves an unpinned terminal operation the next call deletes”.
+    // Prune releases the audit pin FIRST: a crash in that window leaves an
+    // unpinned terminal operation for the next call to delete.
   });
 
   it("a multi-duty maintenance-stale finding (≥2 failing duties + the not-armed marker, raw bytes mid-string, including an empty-string lastError producing legacy's trailing ': ') persists the templates-only joined detail with no lastError bytes anywhere; the drain emits legacyDetails[i] byte-identically", async () => {

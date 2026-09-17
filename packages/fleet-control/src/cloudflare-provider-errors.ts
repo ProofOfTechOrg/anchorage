@@ -106,8 +106,8 @@ export function sanitizeProviderError(
 ): unknown {
   // Wrapped paths supply an SDK-constructed operand. A value that escapes when
   // the SDK itself throws on the rejection before wrapping it (castToError's
-  // instanceof, internal/errors.mjs:11; the String()/in coercions at
-  // client.mjs:389-390) is outside this boundary's no-throw promise.
+  // instanceof; the String()/in coercions in the client's makeRequest timeout
+  // detection) is outside this boundary's no-throw promise.
   if (!(error instanceof APIError)) return error;
   const sanitized = new Error('Cloudflare Worker upload failed');
   sanitized.name = 'CloudflareProviderError';
@@ -138,10 +138,9 @@ export function sanitizeProviderError(
       // APIConnectionError keeps a cause chain because, for a rejected fetch,
       // that chain is the fence or transport failure the adapter classifies
       // through. The SDK drops the underlying error on its timeout arm
-      // (APIConnectionTimeoutError is constructed without a cause,
-      // core/error.mjs:81-85), so that chain is one constant level. Every other
-      // APIError (a provider response or the SDK's own abort error) collapses
-      // to { name }.
+      // (APIConnectionTimeoutError is constructed without a cause), so that
+      // chain is one constant level. Every other APIError (a provider response
+      // or the SDK's own abort error) collapses to { name }.
       value:
         error instanceof APIConnectionError
           ? sanitizedErrorCause(error, secretValues)

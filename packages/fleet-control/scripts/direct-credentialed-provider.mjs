@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { validateHeaderValue } from 'node:http';
+import { cancelBodyWithoutAwait } from './direct-credentialed-body-cancel.mjs';
 
 const API_BASE = 'https://api.cloudflare.com/client/v4';
 const MAX_ATTEMPTS = 512;
@@ -55,14 +56,6 @@ export function validateProviderAuth(value) {
     refuse('invalid-input');
 }
 
-function cancel(response) {
-  try {
-    void response?.body?.cancel().catch(() => {});
-  } catch {
-    /* The abortable pipe owns a locked source. */
-  }
-}
-
 function providerTransport(fetchRequest, timeoutMs) {
   const expiresAt = performance.now() + MAX_DURATION_MS;
   const active = new Set();
@@ -105,13 +98,13 @@ function providerTransport(fetchRequest, timeoutMs) {
       let abort;
       let timer;
       let rawReader;
-      const finish = () => {
+      const finish = (reason) => {
         clearTimeout(timer);
         signal.removeEventListener('abort', abort);
-        controller.abort();
-        cancel(bounded ?? response);
+        controller.abort(reason);
+        cancelBodyWithoutAwait((bounded ?? response)?.body, reason);
         if (rawReader) {
-          void rawReader.cancel().catch(() => {});
+          void rawReader.cancel(reason).catch(() => {});
           rawReader = undefined;
         }
         active.delete(finish);
@@ -137,7 +130,7 @@ function providerTransport(fetchRequest, timeoutMs) {
           fetchRequest(input, { ...init, signal, redirect: 'manual' }),
         ).then((value) => {
           if (signal.aborted) {
-            cancel(value);
+            cancelBodyWithoutAwait(value?.body, signal.reason);
             signal.throwIfAborted();
           }
           return value;
@@ -173,8 +166,8 @@ function providerTransport(fetchRequest, timeoutMs) {
                   finish();
                 }
               },
-              cancel() {
-                finish();
+              cancel(reason) {
+                finish(reason);
               },
             }),
             {
@@ -260,7 +253,7 @@ function proofFetch(transport, shape, bound) {
       // The SDK skips its parser, and so this validation, on an empty body.
       (shape === 'settled' && response.headers.get('content-length') === '0')
     ) {
-      cancel(response);
+      cancelBodyWithoutAwait(response.body);
       refuse('provider-unavailable');
     }
     // SDK parser selection must reach the validated JSON method.
@@ -447,7 +440,7 @@ export async function probeAbsent(promise) {
   const { APIError } = await import('cloudflare');
   try {
     const value = await promise;
-    if (value instanceof Response) cancel(value);
+    if (value instanceof Response) cancelBodyWithoutAwait(value.body);
     return 'present';
   } catch (error) {
     const raised = providerErrorFrom(error);

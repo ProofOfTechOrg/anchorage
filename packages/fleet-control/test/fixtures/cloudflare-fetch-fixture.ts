@@ -218,9 +218,9 @@ export type CloudflareFixtureHandler = (
   request: CloudflareFixtureRequest,
 ) => Response | Promise<Response>;
 
-// cloudflare/internal/uploads.mjs:51-74 probes whether this fetch
-// implementation encodes a real FormData body (instead of stringifying it)
-// before deciding whether multipart uploads are usable.
+// The SDK's supportsFormData probe checks whether this fetch implementation
+// encodes a real FormData body (instead of stringifying it) before deciding
+// whether multipart uploads are usable.
 class UnsupportedFormDataResponse {
   constructor(readonly body: unknown) {}
 

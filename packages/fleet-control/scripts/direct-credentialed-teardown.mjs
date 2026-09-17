@@ -741,7 +741,7 @@ export async function teardownDirectReference(input) {
       return rows;
     };
     // One attestation for the whole bucket sequence: the first call proves the
-    // bucket, and every step below reads that same proof.
+    // bucket, and each delete's `identity` reads that same proof.
     let attested;
     const attestBucket = () => (attested ??= bucketIdentity());
     if (receipts.exportObjects.length < confirmed.length) {

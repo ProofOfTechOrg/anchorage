@@ -315,8 +315,9 @@ function fleetAuditFindingKind(
 
 /**
  * Non-throwing durable write gate: the bounded path gates; the drain never
- * does. Only `detail` is gated: `tenantTag` and `environment` reach the row
- * verbatim, which is the round-3 adjudication, so the name says gated DETAIL
+ * does. Only `detail` is gated: intake refuses a record whose `tenantTag` or
+ * `environment` misses the deployment identifier grammar, while `detail` is
+ * provider-claimed text under no such grammar, so the name says gated DETAIL
  * rather than a sanitized row.
  */
 function findingRowWithGatedDetail(

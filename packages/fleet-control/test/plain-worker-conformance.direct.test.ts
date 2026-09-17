@@ -174,8 +174,8 @@ describe('sanitizer boundary through the shared fixtures', () => {
     });
     const chain = errorChain(rejection);
 
-    // The SDK classifies timeout text in client.mjs:386-388 and constructs
-    // APIConnectionTimeoutError without a cause in core/error.mjs:81-85.
+    // The client's makeRequest timeout detection classifies timeout text, and
+    // APIConnectionTimeoutError is constructed without a cause.
     expect(chain.match(/Request timed out\./gu)).toHaveLength(1);
     expect(chain).not.toContain('transport timed out');
   });

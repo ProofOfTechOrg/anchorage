@@ -5,6 +5,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { exactActiveVersionId } from '../src/active-route.ts';
 import { isPortablePathSegment } from '../src/export-file-name.ts';
 import { providerBindingsToPlainWorkerShape } from '../src/provider-binding-inventory.ts';
+import { cancelBodyWithoutAwait } from './direct-credentialed-body-cancel.mjs';
 import {
   deriveDirectConformanceNames,
   validateDirectConformanceConfig,
@@ -42,13 +43,9 @@ function refuse(code = 'observation-mismatch') {
 }
 // Releases a body no one will read, handing the cancellation the refusal that
 // reached the exit. Not awaited: a hostile source can hang its own cancel.
-function cancelAndRefuse(response, code = 'observation-mismatch') {
-  const refusal = new DirectObservationError(code);
-  try {
-    void response?.body?.cancel(refusal).catch(() => {});
-  } catch {
-    /* The abortable pipe owns a locked source. */
-  }
+function cancelAndRefuse(response) {
+  const refusal = new DirectObservationError('observation-mismatch');
+  cancelBodyWithoutAwait(response?.body, refusal);
   throw refusal;
 }
 function object(value) {

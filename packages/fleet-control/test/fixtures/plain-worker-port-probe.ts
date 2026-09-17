@@ -13,10 +13,11 @@ export function routeApi(
 ): PlainWorkerRouteApi {
   return {
     async withMutationFence(fence, operation) {
-      // Models the tolerated legacy entry-asserting shape from
-      // test/wrangler-loop-backend.test.ts:201-206. Real adapters are required
-      // only to assert each mutating request; B2's conformance fixture should
-      // default to the non-asserting production shape.
+      // Models the tolerated legacy entry-asserting shape,
+      // FakeRouteApi.withMutationFence in test/wrangler-loop-backend.test.ts.
+      // Real adapters are required only to assert each mutating request; a
+      // conformance fixture should default to the non-asserting production
+      // shape.
       await fence.assertOwned();
       return operation();
     },

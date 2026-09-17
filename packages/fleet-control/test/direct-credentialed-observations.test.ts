@@ -834,7 +834,7 @@ describe('normal export raw-byte proof', () => {
     });
   });
 
-  it('releases the unread export body before the refusal reaches the caller', async () => {
+  it('releases the unread export body the refusal leaves behind', async () => {
     const f = await fixture();
     const input = await f.exportInput();
     const releases: unknown[] = [];
@@ -855,8 +855,40 @@ describe('normal export raw-byte proof', () => {
     await expect(verifyDirectDecommissionExport(input)).rejects.toMatchObject(
       errorShape,
     );
-    expect(releases).toHaveLength(1);
+    // The first release in a process waits on the body-cancel leaf's own load.
+    await vi.waitFor(() => {
+      expect(releases).toHaveLength(1);
+    });
     expect(f.requests).toHaveLength(1);
+  });
+
+  it('hands the refusal to the source as the export body cancel reason', async () => {
+    const f = await fixture();
+    const input = await f.exportInput();
+    const releases: unknown[] = [];
+    f.hook(
+      () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(Buffer.from(SQL_SENTINEL));
+            },
+            cancel(reason) {
+              releases.push(reason);
+            },
+          }),
+          { headers: { 'content-length': '1' } },
+        ),
+    );
+    await expect(verifyDirectDecommissionExport(input)).rejects.toMatchObject({
+      code: 'observation-mismatch',
+    });
+    expect(releases).toEqual([
+      expect.objectContaining({
+        name: 'DirectObservationError',
+        message: 'observation-mismatch',
+      }),
+    ]);
   });
 
   it('derives exact R2 key and returns frozen receipt with source ordinal', async () => {

@@ -210,8 +210,9 @@ export class WranglerPlainWorkerProvisioningApi
     fence: ExternalMutationFence,
     operation: () => Promise<T>,
   ): Promise<T> {
-    // Tolerates the legacy entry-asserting double in
-    // test/wrangler-loop-backend.test.ts:201-206; production asserts per request.
+    // Tolerates the legacy entry-asserting double,
+    // FakeRouteApi.withMutationFence in test/wrangler-loop-backend.test.ts;
+    // production asserts per request.
     if (this.#mutationFenceScope.getStore() === fence) return operation();
     return this.#routeApi.withMutationFence(fence, () =>
       this.#mutationFenceScope.run(fence, operation),

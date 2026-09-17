@@ -11,8 +11,6 @@ import {
   type CloudflareWorkerAttachmentScanContext,
   listDispatchScriptPage,
 } from './cloudflare-worker-attachment-scan.js';
-// The 9..1,000 provider-request contract and its refusal bytes are shared with
-// the attachment scanner; duplicating the message would let the two drift.
 import { assertWorkerAttachmentProviderRequestBudget } from './cloudflare-worker-attachment-scan-state.js';
 import {
   assertInventoryFindingValue,

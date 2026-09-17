@@ -1891,6 +1891,10 @@ describe('WranglerPlainWorkerProvisioningApi exports', () => {
   });
 });
 
+// Lifted from `test/cloudflare-api-plain-worker-provisioning-api.test.ts` with
+// its assertion text unchanged. The local binding is `subject` rather than
+// `api` because this file declares a module-level `api(runner, options)`
+// helper that the original name would shadow inside the block.
 describe('WranglerPlainWorkerProvisioningApi inventory shape', () => {
   it('refuses a Wrangler inventory result that is not a list', async () => {
     const subject = new WranglerPlainWorkerProvisioningApi({
