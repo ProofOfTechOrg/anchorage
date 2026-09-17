@@ -872,6 +872,11 @@ describe('Mastra Agent execution-entry inventory', () => {
       '__setDeclaredSchedules',
       '__setMemory',
       '__setPubSub',
+      // Installs another agent as the target the thread runtime drives. The
+      // narrowed handle omits it rather than throwing, so nothing reaches it
+      // through this surface; flowsafe blocks the same member on its INSTANCE,
+      // which Mastra calls in-process.
+      '__setThreadRuntimeAgent',
       '__setTools',
       '__setWorkspace',
       '__updateInstructions',
@@ -879,12 +884,21 @@ describe('Mastra Agent execution-entry inventory', () => {
       'assertSupportsPreparedModels',
       'agent',
       'browser',
+      // Cancels queued idle signals; it can stop pending work, never start it.
+      'cancelQueuedMessages',
+      // Opts the agent in as a thread's remote wake target, leaving a live
+      // subscription behind. The handle omits it, so no caller can take that
+      // claim through this surface.
+      'claimThreadOwnership',
       'clearObjective',
       'combineProcessorsIntoWorkflow',
       'constructor',
       'convertTools',
       'deriveSubAgentBackgroundConfig',
       'disableBackgroundTasks',
+      // Returns the peer advertisements one pub/sub instance carries; no run
+      // ids, and nothing to drive.
+      'discoverThreadPeers',
       'durable',
       'enableBackgroundTasks',
       // Pure title-generation prefilter; it cannot initiate agent execution.
@@ -980,6 +994,8 @@ describe('Mastra Agent execution-entry inventory', () => {
       'setChannels',
       'setObjective',
       'stripParentToolParts',
+      // Registers a queued-message-count listener; it drives nothing.
+      'subscribeThreadEvents',
       'subscribeToThread',
       'updateModelInModelList',
       'updateObjectiveOptions',
@@ -995,10 +1011,15 @@ describe('Mastra Agent execution-entry inventory', () => {
     const forwardClassified = [
       '__markStoredVersionApplied',
       '__setDeclaredSchedules',
+      '__setThreadRuntimeAgent',
+      'cancelQueuedMessages',
+      'claimThreadOwnership',
+      'discoverThreadPeers',
       'filterUiMessagesByThread',
       'getDeclaredSchedules',
       'listActiveThreadRuns',
       'resolveNotificationDeliveryDecision',
+      'subscribeThreadEvents',
     ];
     const classified = [
       ...wrapped,

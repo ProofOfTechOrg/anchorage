@@ -251,11 +251,13 @@ jobs:
       # to @mastra/core@1.53.0 through pnpm.patchedDependencies, and pnpm
       # refuses an install whose patch targets a version no longer in the
       # graph. This job drops that entry in its disposable checkout and
-      # resolves the newest core unpatched, so constructing a delivering
-      # notification dispatch tick, and ingesting or dispatching notifications
-      # through the thread routes, refuse with a message naming the patch and
-      # notification-source-keys.test.ts reports its probe cases as the
-      # readable signal. See the maintainer guide's Mastra compatibility
+      # resolves the newest core unpatched. What the run then reports is two
+      # things: both packages' surface inventories classify the newest core's
+      # members, so a red one names the member nobody has read yet; and
+      # notification-source-keys.test.ts reports whether that core still needs
+      # the pinned patch — its probe cases fail and its patched-behavior blocks
+      # skip while the seam is open upstream, and both go green on a core that
+      # carries the fixes. See the maintainer guide's Mastra compatibility
       # section.
       - name: Bump @mastra/core to newest 1.x
         id: mastra_versions

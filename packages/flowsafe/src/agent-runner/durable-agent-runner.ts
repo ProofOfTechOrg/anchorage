@@ -200,11 +200,53 @@
 // resumeNetwork, approveNetworkToolCall, declineNetworkToolCall,
 // generateLegacy, streamLegacy and sendToolApproval are all
 // `intentionallyUnavailable` (packages/breakwater/src/agent/agent.test.ts:824).
-// It diverges on listSuspendedRuns (:955), which it files under
-// `explicitlyNonExecution` — the same divergence as listActiveRuns (:935), and
+// It diverges on listSuspendedRuns (:969), which it files under
+// `explicitlyNonExecution` — the same divergence as listActiveRuns (:949), and
 // for the same reason: a narrowed HANDLE can only omit, so a data-returning
 // member is harmless there, while an INSTANCE Mastra calls in-process must
 // throw.
+//
+// Two more Agent-level members are blocked for cores NEWER than the pin. Read
+// from the @mastra/core 1.67.0 dist, which the mastra-compat canary installs;
+// offsets here are 1.67.0-vintage, in agent-Dk0N0Nlg.js unless another file is
+// named, and the 1.53.0 offsets above are left as the provenance of that read.
+// The pinned peer exposes neither member, so on 1.53.0 each refusal stands
+// where the base would have raised a TypeError, and shadows a real
+// implementation only once the peer moves.
+//
+//   - listActiveThreadRuns() (:38214) is the discovery ground one scope wider
+//     than listActiveRuns. It takes no arguments and returns `{ runId,
+//     resourceId, threadId }` for every tracked thread on the pubsub instance
+//     (storage-MbGlKLkB.js:1011-1023), and that state is keyed by pubsub
+//     instance rather than by agent (`#statesByPubSub`, :150, read through
+//     #getState :294), so it narrows by neither principal nor agent where the
+//     two listings above at least narrow by agentId. The in-process sibling
+//     getActiveThreadRunId() stays non-execution because it makes the caller
+//     name the (resourceId, threadId) pair: it confirms where this enumerates.
+//     Breakwater files it `explicitlyNonExecution` (agent.test.ts:950) — the
+//     same handle-versus-instance divergence recorded just above, and recorded
+//     here for the same reason. Cost, stated rather than left to be
+//     rediscovered: core's AgentController aggregates this member across its
+//     backing agents (agent-controller-CKgKFyMR.js:5722-5725), so that
+//     aggregation now throws. It is already unusable over this class — the same
+//     controller calls the blocked sendToolApproval() at :4089 and :4118.
+//   - __setThreadRuntimeAgent() (:33609) installs another agent as the target
+//     every thread-runtime path resolves through #getThreadRuntimeAgent()
+//     (:33612, `this.#threadRuntimeAgent ?? this`): subscribeToThread
+//     (:38197), claimThreadOwnership (:38203), sendMessage (:38331),
+//     queueMessage (:38337) and sendStateSignal (:38355). That is the fourth
+//     ground by installation rather than by call: the containment those
+//     inherited members rely on IS virtual dispatch on `this`, so one call
+//     moves all five onto an agent carrying none of these overrides — no
+//     caller-minted runId assertion, no executeWorkflow, no #startRequesters
+//     backstop. It is public in the type surface (agent.d.ts:229 declares it
+//     with no modifier), so unlike getLegacyHandler it takes no private cast.
+//
+// Neither carries the `override` keyword, and that is load-bearing rather than
+// an oversight: TypeScript rejects `override` on a member the base does not
+// declare, and 1.53.0 declares neither, so the keyword would fail the pinned
+// typecheck that gates every merge. Each signature must still satisfy the base
+// it acquires on newest; the caveat on each member says how.
 //
 // Blocking them keeps the single-resume and no-capability guarantees true by
 // construction: resumeViaRuntime() is the ONLY way a run resumes.
@@ -557,8 +599,9 @@ const THREAD_TOOL_APPROVAL_REASON =
  *  3. snapshot deletion owned by deployment-scoped retention;
  *  4. a SECOND execution surface that runs the agent outside RunnerRuntime
  *     entirely, or that mints a run id below the caller — the network loop's
- *     own workflow, the legacy handler, and the thread runtime's tool-approval
- *     continuation.
+ *     own workflow, the legacy handler, the thread runtime's tool-approval
+ *     continuation, and the setter that installs a different agent as the
+ *     thread runtime's execution target.
  *
  * Deliberately NOT re-exported from `./index.js` (a named-exports-only barrel),
  * so this stays off the public `@proofoftech/flowsafe/agent-runner` subpath.
@@ -579,6 +622,8 @@ export const BLOCKED_RUN_ENTRIES = {
     "core scopes the running-run listing by agentId plus the caller's own optional thread and resource ids, never by per-principal ownership, so it bypasses the host topology's run-ownership checks and returns run, thread and resource ids the caller does not own",
   listSuspendedRuns:
     "core scopes the suspended-run listing by agentId plus the caller's own optional thread and resource ids, never by per-principal ownership, so it bypasses the host topology's run-ownership checks and returns run, thread and resource ids the caller does not own",
+  listActiveThreadRuns:
+    'core scopes the active thread-run listing by nothing at all: it takes no arguments and returns the run, thread and resource ids of every thread tracked on the pubsub instance, which core keys by pubsub instance rather than by agent, so it enumerates ids across every principal AND every agent that shares the instance',
   deleteRunSnapshots:
     'durable-agent snapshot rows are retained until deployment-scoped retention purge removes them',
   network: `${NETWORK_FAMILY_REASON}, and it mints an unowned run id when the caller omits one`,
@@ -588,6 +633,8 @@ export const BLOCKED_RUN_ENTRIES = {
   generateLegacy: LEGACY_FAMILY_REASON,
   streamLegacy: LEGACY_FAMILY_REASON,
   sendToolApproval: THREAD_TOOL_APPROVAL_REASON,
+  __setThreadRuntimeAgent:
+    "it installs the agent every thread-runtime path then drives — subscribeToThread, claimThreadOwnership, sendMessage, queueMessage and sendStateSignal all resolve their target through the field it writes — so one call moves those starts onto an agent that carries none of this class's overrides: no caller-minted run id, no executeWorkflow, and no terminal refusal for a run the host start seam never registered",
 } as const;
 
 /**
@@ -1147,6 +1194,30 @@ export class FlowsafeDurableAgent<
   }
 
   /**
+   * Refuse the thread-level run enumerator newer cores add.
+   * `listActiveThreadRuns()` takes no arguments and returns a runId plus the
+   * resourceId and threadId parsed out of the key for every thread tracked on
+   * the pubsub instance, and core keys that state by pubsub instance rather
+   * than by agent — so it is the same discovery ground as
+   * {@link FlowsafeDurableAgent.listActiveRuns} with the last scoping gone.
+   * The in-process sibling `getActiveThreadRunId()` stays inherited because it
+   * makes the caller name the (resourceId, threadId) pair it confirms.
+   *
+   * Signature caveat, and the reason this one is not `async`: the base declares
+   * it SYNCHRONOUS (`listActiveThreadRuns(): ActiveThreadRun[]`), so the
+   * `async … Promise<never>` shape every other refusal here carries would not
+   * be assignable to it. No `override` keyword either — the pinned 1.53.0
+   * declares no such member, and `override` on a member the base lacks is a
+   * type error. Both are re-checks for a peer bump.
+   */
+  listActiveThreadRuns(): never {
+    throw unavailableRunEntry(
+      'listActiveThreadRuns',
+      BLOCKED_RUN_ENTRIES.listActiveThreadRuns,
+    );
+  }
+
+  /**
    * Refuse the multi-agent network start. `network()` does not touch the
    * durable-agentic-loop at all: it compiles a SEPARATE workflow and drives it
    * with `createRun + run.stream` on the default engine, so the whole
@@ -1268,6 +1339,31 @@ export class FlowsafeDurableAgent<
     throw unavailableRunEntry(
       'sendToolApproval',
       BLOCKED_RUN_ENTRIES.sendToolApproval,
+    );
+  }
+
+  /**
+   * Refuse the thread-runtime target swap newer cores add. It sets one private
+   * field, and every thread-runtime path — `subscribeToThread`,
+   * `claimThreadOwnership`, `sendMessage`, `queueMessage`, `sendStateSignal` —
+   * resolves its target through that field, falling back to `this`. So the
+   * containment those five inherited members rely on is virtual dispatch on
+   * `this`, and one call to this setter moves all five onto an agent with none
+   * of these overrides in the chain. That is the fourth ground reached by
+   * installing a second execution surface rather than by calling one.
+   *
+   * Signature caveat: the parameter is `unknown` rather than core's
+   * `Agent<any, any, any, any>` because the pinned 1.53.0 declares no such
+   * member at all, while newest 1.x does — `unknown` is the one supertype of
+   * core's parameter, so it satisfies that base without depending on method
+   * bivariance, and it constrains nothing on the pin, where there is no base
+   * member to satisfy. No `override` keyword, for the same reason as
+   * {@link FlowsafeDurableAgent.listActiveThreadRuns}.
+   */
+  __setThreadRuntimeAgent(_agent: unknown): never {
+    throw unavailableRunEntry(
+      '__setThreadRuntimeAgent',
+      BLOCKED_RUN_ENTRIES.__setThreadRuntimeAgent,
     );
   }
 

@@ -84,17 +84,26 @@ const blockedEntries = Object.keys(BLOCKED_RUN_ENTRIES) as ReadonlyArray<
  * core DROPPING a durable blocked member pass silently, whereas an exact-match
  * assertion turns that into a failure that demands re-reading the member.
  *
- * Three families beyond the discovery member: the NETWORK four, which drive
+ * Families beyond the two discovery members: the NETWORK four, which drive
  * the multi-agent loop's own workflow with `createRun + run.stream/resumeStream`
  * outside RunnerRuntime (and `network()` mints its own run id); the LEGACY
  * pair, which run the agent's tools through AgentLegacyHandler while minting a
- * run id and skipping `requireAgentExecutionFGA`; and `sendToolApproval`,
- * whose continuation branch starts a run under a `randomUUID()` fallback.
+ * run id and skipping `requireAgentExecutionFGA`; `sendToolApproval`, whose
+ * continuation branch starts a run under a `randomUUID()` fallback; and
+ * `__setThreadRuntimeAgent`, which installs the agent the thread runtime drives
+ * in place of this one.
+ *
+ * `__setThreadRuntimeAgent` and `listActiveThreadRuns` sit on no prototype at
+ * all on the pinned core, which exposes neither, so they carry VERSION_SKEW
+ * rows. The exact-match assertion holds at both versions all the same: absent
+ * from DurableAgent.prototype counts as outside it.
  */
 const blockedOnAgentPrototype = [
+  '__setThreadRuntimeAgent',
   'approveNetworkToolCall',
   'declineNetworkToolCall',
   'generateLegacy',
+  'listActiveThreadRuns',
   'listSuspendedRuns',
   'network',
   'resumeNetwork',
@@ -124,14 +133,20 @@ const blockedByRunner = blockedEntries.filter(
 );
 
 /**
- * Constructors, accessors, registration hooks and delegators. None of them can
- * start, resume or re-drive a run, and none reads snapshot storage.
+ * Constructors, accessors, registration hooks, delegators and stop-only
+ * controls. None of them can start, resume or re-drive a run, and none reads
+ * snapshot storage.
  *
  * Honest caveat: `getWorkflow`, `getDurableWorkflows` and `listWorkflows`
  * return objects that themselves expose `createRun().start()`, and they are
  * load-bearing rather than removable — `executeWorkflow` and `resumeViaRuntime`
  * both read `this.getWorkflow()`. So this partition classifies ENTRY POINTS ON
  * THE AGENT, not the capabilities of the objects they hand back.
+ *
+ * Offsets in the reasons below are @mastra/core 1.67.0-vintage, in
+ * dist/create-durable-agent-DFHwqN2K.js unless another file is named; the
+ * members carrying one are absent from the pinned peer's durable prototype and
+ * so have a VERSION_SKEW row.
  */
 const nonExecution = [
   '__fork',
@@ -141,6 +156,11 @@ const nonExecution = [
   '__getStaticAgents',
   '__hasSubAgentsConfigured',
   '__registerMastra',
+  // Writes declarative schedule metadata onto the wrapped agent (:6240). A
+  // schedule Mastra later syncs into schedule storage still reaches this agent
+  // through a start seam, where a run the host never registered is terminally
+  // refused — so the worst case is a fail-closed refusal, not a start.
+  '__setDeclaredSchedules',
   '__setMastra',
   '__setMemory',
   '__setPubSub',
@@ -148,6 +168,17 @@ const nonExecution = [
   '__setWorkspace',
   '__updateInstructions',
   '__updateModel',
+  // Stop an in-flight run; there is no path from either to starting one. What
+  // they gained at 1.67.0 is reach and disclosure, not a mint: #abortDurableRun
+  // (:6598) flips any locally held controller and then calls
+  // requestRemoteAbort (:6626), which publishes an abort request over pubsub
+  // (:272) to whichever process holds the run — and abortRunStream returns
+  // `aborted || this.#isRunExecuting(runId)` (:6585), a boolean existence
+  // oracle for a run id the caller may not own. Both stay classified on the
+  // Agent level too: they are on Agent.prototype at the pin and shadowed here
+  // only at 1.67.0.
+  'abortRunStream',
+  'abortThreadStream',
   'agent',
   'browser',
   'cache',
@@ -159,12 +190,18 @@ const nonExecution = [
   // Publishes an error event onto the run's feed; executeWorkflow and
   // resumeViaRuntime both use it after a terminal summary.
   'emitError',
+  // The fire-and-forget half of emitError (:6548), which core calls from its
+  // own failure paths; it publishes onto a run's feed and starts nothing.
+  'emitErrorInBackground',
   'enableBackgroundTasks',
   'getBackgroundTasksConfig',
   'getChannels',
   'getConfiguredProcessorIds',
   'getConfiguredProcessorWorkflows',
   'getConfiguredToolHooks',
+  // Reads that schedule metadata back off the wrapped agent (:6233); it returns
+  // no run ids and touches no storage.
+  'getDeclaredSchedules',
   'getDefaultGenerateOptionsLegacy',
   'getDefaultNetworkOptions',
   'getDefaultOptions',
@@ -204,6 +241,13 @@ const nonExecution = [
   'pubsub',
   'pubsubInternal',
   'requestContextSchema',
+  // The abort primitive the two methods above share (:6626), and never blocked;
+  // the inventory asserts that rather than leaving it to this note. core calls
+  // it from #abortDurableRun (:6601) and from the `abort` closure it returns
+  // with each durable stream result (:6814, :7095, :7265, :7796), so refusing
+  // it would reject the abort handle handed to every consumer of a run this
+  // class itself started.
+  'requestRemoteAbort',
   'resolveProcessorById',
   'runRegistry',
   'runRegistryInternal',
@@ -225,11 +269,11 @@ const classified: readonly string[] = [
  *
  * The inventory above covers DurableAgent.prototype. But Mastra calls the
  * INSTANCE, and the instance also inherits every `Agent.prototype` member
- * DurableAgent does not shadow — 82 of them, including the network family, the
- * legacy pair and sendToolApproval, all of which drive execution. Classifying
- * only the durable half would leave that surface unpinned, so it gets the same
- * treatment: every name in exactly one list, nothing unclassified, nothing
- * stale.
+ * DurableAgent does not shadow — a surface whose size differs between the two
+ * supported cores, including the network family, the legacy pair and
+ * sendToolApproval, all of which drive execution. Classifying only the durable
+ * half would leave that surface unpinned, so it gets the same treatment: every
+ * name in exactly one list, nothing unclassified, nothing stale.
  * ---------------------------------------------------------------------------
  */
 const agentSurface = Object.getOwnPropertyNames(Agent.prototype).filter(
@@ -249,6 +293,16 @@ const agentSurface = Object.getOwnPropertyNames(Agent.prototype).filter(
  * for the cleanup mechanism.
  */
 const delegatingToGuard = [
+  // Opts the agent in as a thread's remote wake target: the thread runtime
+  // keeps the claim and, on an idle signal published by another process, drives
+  // `owner.agent.stream(...)` (storage-MbGlKLkB.js:672) with a run id from that
+  // message. `owner.agent` is `this`, so that lands on the guarded stream
+  // override — but the runId assertion is not what contains it, since a
+  // pubsub-supplied id is path-safe like any other; the terminal refusal
+  // `executeWorkflow` raises for a runId with no `#startRequesters` entry is.
+  // The containment holds only while `__setThreadRuntimeAgent` is blocked,
+  // which is what makes `owner.agent` this instance.
+  'claimThreadOwnership',
   'queueMessage',
   'resumeStreamUntilIdle',
   'sendMessage',
@@ -267,10 +321,17 @@ const delegatingToGuard = [
  * listActiveRuns / recoverActiveRuns / observe / prepare. DurableAgent shadows
  * all six, so they are not in this surface at all — the test below asserts
  * that rather than trusting it.
+ *
+ * Offsets in the reasons below are @mastra/core 1.67.0-vintage, in
+ * dist/agent-Dk0N0Nlg.js unless another file is named; a member carrying one is
+ * absent from the pinned peer's Agent prototype, or sits there at a different
+ * level, and so has a VERSION_SKEW row.
  */
 const agentNonExecution = [
   '__getDrainPendingSignals',
   '__listLLMRequestProcessors',
+  // Sets the flag core's __fork path reads (:35357).
+  '__markStoredVersionApplied',
   '__registerPrimitives',
   '__resetToOriginalModel',
   // Run the processor chain, not a run. No run id, no storage.
@@ -278,16 +339,31 @@ const agentNonExecution = [
   '__runOutputProcessors',
   '__runProcessInputStep',
   // Stop an in-flight stream; there is no path from either to starting one.
+  // Classified on the durable level too: DurableAgent shadows both at 1.67.0
+  // and they leave this surface there, and the durable entry carries the reason
+  // for the cross-process reach that override adds.
   'abortRunStream',
   'abortThreadStream',
   'assertSupportsPreparedModels',
+  // Removes pending idle signals from the in-process queue, matched on the
+  // agent core passes — `this`, not the thread-runtime target (:38342) — and on
+  // ids the caller already holds. It cancels work; it starts none.
+  'cancelQueuedMessages',
   // Objective read/write over thread state; drives nothing.
   'clearObjective',
   'combineProcessorsIntoWorkflow',
   'convertTools',
   'deriveSubAgentBackgroundConfig',
+  // Returns the peer advertisements one pubsub instance carries —
+  // agentId/resourceId/threadId plus optional label, title and metadata
+  // (storage-MbGlKLkB.js:425-437), and no run ids. Honest caveat: that
+  // disclosure is empty only while one PubSub instance serves one thread, which
+  // is a deployment property this inventory cannot assert.
+  'discoverThreadPeers',
   // Field accessor for the durable flag.
   'durable',
+  // Pure title-generation prefilter over a message list (:35450).
+  'filterUiMessagesByThread',
   'formatMessagePartsForTitle',
   'formatMessagesForTitle',
   'formatTools',
@@ -336,6 +412,12 @@ const agentNonExecution = [
   'resolveInputProcessors',
   'resolveModelConfig',
   'resolveModelSelection',
+  // Runs the configured delivery policy for one notification record and returns
+  // a decision. Core reads that decision's `streamOptions` when it wakes an
+  // idle thread (storage-MbGlKLkB.js:2814-2816), inside a try/catch that
+  // degrades to a bare wake — so it feeds a start core makes, and cannot make
+  // one.
+  'resolveNotificationDeliveryDecision',
   'resolveOverrideScorerReferences',
   'resolveSkills',
   'resolveTitleGenerationConfig',
@@ -343,6 +425,9 @@ const agentNonExecution = [
   'resolveToolHooks',
   'setObjective',
   'stripParentToolParts',
+  // Registers a listener that receives queued-message counts for the thread the
+  // caller names (:38348); it discloses a count and drives nothing.
+  'subscribeThreadEvents',
   // Reattaches to a thread's pubsub replay; cannot drive a run.
   'subscribeToThread',
   'updateModelInModelList',
@@ -356,6 +441,114 @@ const agentClassified: readonly string[] = [
   ...delegatingToGuard,
   ...agentNonExecution,
 ];
+
+/**
+ * ---------------------------------------------------------------------------
+ * The VERSION SKEW between the two supported cores.
+ *
+ * Both partitions above demand exact equality with the installed surface:
+ * nothing unclassified, nothing stale. But two cores are supported — the
+ * workspace installs the declared peer pin, and the mastra-compat canary job
+ * installs the newest 1.x and runs this suite against that — and one partition
+ * cannot equal two surfaces. So every name whose PRESENCE differs between them
+ * is recorded here, with the prototype level it sits on at each version;
+ * `null` means it is on neither prototype there. A member that MOVED level is
+ * ONE row naming both levels, not two list edits in opposite directions.
+ *
+ * A row excuses its name from the stale check at the level the installed core
+ * does not carry it on. It never excuses it from being classified: every level
+ * a row names must hold that name in one of its lists, so a moved member is
+ * classified on both sides, and the two `unclassified` assertions stay exact in
+ * both directions.
+ *
+ * A row leaves the table when both cores agree. The expiry assertion below says
+ * when, by checking the table's claim about the INSTALLED core rather than
+ * trusting it.
+ * ---------------------------------------------------------------------------
+ */
+type SkewLevel = 'durable' | 'agent' | null;
+
+const VERSION_SKEW = {
+  __markStoredVersionApplied: { pin: null, newest: 'agent' },
+  __setDeclaredSchedules: { pin: null, newest: 'durable' },
+  __setThreadRuntimeAgent: { pin: null, newest: 'agent' },
+  abortRunStream: { pin: 'agent', newest: 'durable' },
+  abortThreadStream: { pin: 'agent', newest: 'durable' },
+  cancelQueuedMessages: { pin: null, newest: 'agent' },
+  claimThreadOwnership: { pin: null, newest: 'agent' },
+  discoverThreadPeers: { pin: null, newest: 'agent' },
+  emitErrorInBackground: { pin: null, newest: 'durable' },
+  filterUiMessagesByThread: { pin: null, newest: 'agent' },
+  getDeclaredSchedules: { pin: null, newest: 'durable' },
+  listActiveThreadRuns: { pin: null, newest: 'agent' },
+  requestRemoteAbort: { pin: null, newest: 'durable' },
+  resolveNotificationDeliveryDecision: { pin: null, newest: 'agent' },
+  subscribeThreadEvents: { pin: null, newest: 'agent' },
+} as const satisfies Record<string, { pin: SkewLevel; newest: SkewLevel }>;
+
+type SkewName = keyof typeof VERSION_SKEW;
+const skewNames = Object.keys(VERSION_SKEW) as SkewName[];
+
+interface FsModule {
+  readFileSync(path: URL, encoding: 'utf8'): string;
+}
+interface ModuleModule {
+  createRequire(url: string): (id: string) => unknown;
+}
+
+/**
+ * Node builtins load through process.getBuiltinModule (the spdx.test.ts
+ * pattern): this file compiles in the workers-typed package test pass, which
+ * has no @types/node to resolve a `node:` specifier against, and this package's
+ * src forbids importing one statically.
+ */
+function builtin<T>(id: string): T {
+  const getBuiltin = (
+    globalThis as {
+      process?: { getBuiltinModule?: (id: string) => unknown };
+    }
+  ).process?.getBuiltinModule;
+  if (!getBuiltin) {
+    throw new Error(`${id} unavailable — tests require node >= 22`);
+  }
+  return getBuiltin(id) as T;
+}
+
+// The workers-typed ImportMeta carries no `url`; at runtime (vitest on node) it
+// is always present.
+const HERE = (import.meta as unknown as { url: string }).url;
+const installedCore = (
+  builtin<ModuleModule>('node:module').createRequire(HERE)(
+    '@mastra/core/package.json',
+  ) as { version: string }
+).version;
+const declaredPeer = (
+  JSON.parse(
+    builtin<FsModule>('node:fs').readFileSync(
+      new URL('../../package.json', HERE),
+      'utf8',
+    ),
+  ) as { peerDependencies: Record<string, string> }
+).peerDependencies['@mastra/core'];
+
+/** Which core is installed decides which half of every row applies. */
+const onPin = installedCore === declaredPeer;
+const levelHere = (name: SkewName): SkewLevel =>
+  onPin ? VERSION_SKEW[name].pin : VERSION_SKEW[name].newest;
+
+/**
+ * The names one level's stale check must excuse: recorded as skewed, not on
+ * that level in the installed core, and classified at that level. The last
+ * clause is load-bearing — it keeps the other level's rows out of this level's
+ * arithmetic, so each length assertion below still counts its own partition.
+ */
+const exemptFor = (
+  level: Exclude<SkewLevel, null>,
+  lists: readonly string[],
+): string[] =>
+  skewNames.filter((name) => levelHere(name) !== level && lists.includes(name));
+const exemptDurable = exemptFor('durable', classified);
+const exemptAgent = exemptFor('agent', agentClassified);
 
 const RUN_ID = 'run-1';
 const APPROVED = { approved: true };
@@ -442,13 +635,25 @@ function testAgent(id = 'writer'): Agent {
  *    `network()` resolves as soon as it has a stream object, before its loop
  *    settles, so at assertion time the base has touched `getStore` >= 1 rather
  *    than the larger figure a fully drained run reaches. Do not pin a number.
- *  - generateLegacy / streamLegacy: VACUOUS by construction, and therefore the
- *    two rows the control excludes. `testAgent()` uses a v2 model, and the
- *    legacy handler rejects a non-v1 model before touching storage at all, so
- *    the base reaches no store either. Their non-vacuous evidence is the
- *    refusal MESSAGE assertion — the base throws core's model-support error,
- *    the override throws FlowSafe's tabled reason, and only the latter
- *    satisfies the row.
+ *  - generateLegacy / streamLegacy: VACUOUS by construction, and so listed
+ *    in `vacuousByConstruction`, which is what the control excludes.
+ *    `testAgent()` uses a v2 model, and the legacy handler rejects a non-v1
+ *    model before touching storage at all, so the base reaches no store
+ *    either. Their non-vacuous evidence is the refusal MESSAGE assertion —
+ *    the base throws core's model-support error, the override throws
+ *    FlowSafe's tabled reason, and only the latter satisfies the row.
+ *  - listActiveThreadRuns / __setThreadRuntimeAgent: VACUOUS by construction
+ *    as well, and in `vacuousByConstruction` on that ground rather than on the
+ *    pin exposing neither of them. In the core that does, @mastra/core 1.67.0,
+ *    `__setThreadRuntimeAgent` writes a private field
+ *    (dist/agent-Dk0N0Nlg.js:33609-33611), and `listActiveThreadRuns` hands
+ *    `getPubSub()` (:33560-33562) to the thread-stream runtime, which reads
+ *    its state from a WeakMap keyed by that pubsub instance
+ *    (dist/storage-MbGlKLkB.js:150, :294-298) and iterates two in-memory maps
+ *    (:1011-1023). Neither path resolves a store, so there is nothing for the
+ *    control to observe at either core. Their non-vacuous evidence is the
+ *    refusal MESSAGE assertion too — the base returns where the override
+ *    throws FlowSafe's tabled reason.
  *
  * All spies are installed after construction AND after that resolution, so
  * neither Mastra's own setup nor the resolution itself can be mistaken for a
@@ -545,6 +750,14 @@ const blockedCalls: ReadonlyArray<{
     invoke: (agent) => agent.listSuspendedRuns(),
   },
   {
+    method: 'listActiveThreadRuns',
+    // An ASYNC arrow although the member is synchronous, and that is not
+    // decoration: the loop below evaluates invoke(agent) before attaching its
+    // .catch, so a synchronous throw would escape the row that exists to
+    // capture it and fail the test with the refusal it is asserting.
+    invoke: async (agent) => agent.listActiveThreadRuns(),
+  },
+  {
     method: 'deleteRunSnapshots',
     invoke: (agent) =>
       protectedEntry(agent, 'deleteRunSnapshots').call(agent, RUN_ID),
@@ -608,6 +821,12 @@ const blockedCalls: ReadonlyArray<{
         approved: true,
       }),
   },
+  {
+    method: '__setThreadRuntimeAgent',
+    // Async for the same reason as listActiveThreadRuns. The argument is a
+    // plain Agent because that is exactly what installing one would hand it.
+    invoke: async (agent) => agent.__setThreadRuntimeAgent(testAgent()),
+  },
 ];
 
 describe('FlowsafeDurableAgent prototype surface inventory', () => {
@@ -632,21 +851,26 @@ describe('FlowsafeDurableAgent prototype surface inventory', () => {
     );
     expect(
       unclassified,
-      `@mastra/core exposes new DurableAgent member(s) [${unclassified.join(', ')}]. Read each implementation in the installed dist, then add it to exactly one list in this file: guardedByRunner (needs an INV-1 override), guardedByDelegation (reaches a guarded entry through 'this.'), nonExecution (cannot start, resume or re-drive a run, and returns no run ids), or — if it matches ANY of the four blocked grounds: (1) re-drives a persisted run below executeWorkflow, (2) discovers runs without the host topology's per-principal ownership checks, (3) deletes snapshot rows retention owns, or (4) is a second execution surface outside RunnerRuntime, or mints a run id below the caller — add it to BLOCKED_RUN_ENTRIES in durable-agent-runner.ts with its reason, an override that throws, and a row in blockedCalls below.`,
+      `@mastra/core exposes new DurableAgent member(s) [${unclassified.join(', ')}]. Read each implementation in the installed dist, then add it to exactly one list in this file: guardedByRunner (needs an INV-1 override), guardedByDelegation (reaches a guarded entry through 'this.'), nonExecution (cannot start, resume or re-drive a run, and returns no run ids), or — if it matches ANY of the four blocked grounds: (1) re-drives a persisted run below executeWorkflow, (2) discovers runs without the host topology's per-principal ownership checks, (3) deletes snapshot rows retention owns, or (4) is a second execution surface outside RunnerRuntime, or mints a run id below the caller — add it to BLOCKED_RUN_ENTRIES in durable-agent-runner.ts with its reason, an override that throws, and a row in blockedCalls below. If the OTHER supported core does not carry it here, give it a VERSION_SKEW row too, naming the prototype level it sits on at each version.`,
     ).toEqual([]);
 
-    // #then and nothing classified has since been removed from it
-    const stale = classified.filter((property) => !surface.includes(property));
+    // #then and nothing classified has since been removed from it, beyond the
+    // members a VERSION_SKEW row says this core does not carry here
+    const stale = classified.filter(
+      (property) =>
+        !surface.includes(property) && !exemptDurable.includes(property),
+    );
     expect(
       stale,
-      `this file classifies DurableAgent member(s) [${stale.join(', ')}] that the installed core no longer exposes — drop them, and drop any override that exists only for them.`,
+      `this file classifies DurableAgent member(s) [${stale.join(', ')}] that @mastra/core ${installedCore} does not expose there — drop them, and drop any override that exists only for them, or, if the other supported core carries them, give each a VERSION_SKEW row naming the level it sits on at each version.`,
     ).toEqual([]);
 
-    // #then and the partition covers the surface exactly, name for name
+    // #then and the partition covers the surface exactly, name for name, plus
+    // exactly the skewed members this core does not carry here
     expect(
-      classified,
-      'the classified lists must partition the durable surface exactly — same length means no member is counted twice or missed',
-    ).toHaveLength(surface.length);
+      classified.length,
+      `the classified lists must partition the durable surface exactly — every member once, plus exactly the ${exemptDurable.length} skewed member(s) @mastra/core ${installedCore} does not expose on DurableAgent.prototype`,
+    ).toBe(surface.length + exemptDurable.length);
 
     // #then and it is entirely string-keyed: this partition enumerates own
     // STRING names, so a symbol-keyed execution member would sail past every
@@ -743,23 +967,26 @@ describe('FlowsafeDurableAgent prototype surface inventory', () => {
     );
     expect(
       unclassified,
-      `@mastra/core exposes new inherited Agent member(s) [${unclassified.join(', ')}] that FlowsafeDurableAgent also inherits. Read each implementation in the installed dist, then add it to exactly one list: delegatingToGuard (reaches a guarded or blocked member through 'this.'), agentNonExecution (cannot start, resume or re-drive a run, and returns no run ids), or — if it matches any of the four blocked grounds: (1) re-drives a persisted run below executeWorkflow, (2) discovers runs without the host topology's per-principal ownership checks, (3) deletes snapshot rows retention owns, or (4) is a second execution surface outside RunnerRuntime, or mints a run id below the caller — add it to BLOCKED_RUN_ENTRIES with a reason, an override that throws, and a row in blockedCalls.`,
+      `@mastra/core exposes new inherited Agent member(s) [${unclassified.join(', ')}] that FlowsafeDurableAgent also inherits. Read each implementation in the installed dist, then add it to exactly one list: delegatingToGuard (reaches a guarded or blocked member through 'this.'), agentNonExecution (cannot start, resume or re-drive a run, and returns no run ids), or — if it matches any of the four blocked grounds: (1) re-drives a persisted run below executeWorkflow, (2) discovers runs without the host topology's per-principal ownership checks, (3) deletes snapshot rows retention owns, or (4) is a second execution surface outside RunnerRuntime, or mints a run id below the caller — add it to BLOCKED_RUN_ENTRIES with a reason, an override that throws, and a row in blockedCalls. If the OTHER supported core does not carry it here — because it is newer than the pin, or because DurableAgent shadows it there — give it a VERSION_SKEW row naming the level it sits on at each version, and classify it on every level that row names.`,
     ).toEqual([]);
 
-    // #then and nothing classified has since been removed from it
+    // #then and nothing classified has since been removed from it, beyond the
+    // members a VERSION_SKEW row says this core does not carry here
     const stale = agentClassified.filter(
-      (property) => !agentSurface.includes(property),
+      (property) =>
+        !agentSurface.includes(property) && !exemptAgent.includes(property),
     );
     expect(
       stale,
-      `this file classifies inherited Agent member(s) [${stale.join(', ')}] the installed core no longer exposes there — drop them, and drop any override that exists only for them.`,
+      `this file classifies inherited Agent member(s) [${stale.join(', ')}] that @mastra/core ${installedCore} does not expose there — drop them, and drop any override that exists only for them, or, if DurableAgent has merely started shadowing them, give each a VERSION_SKEW row naming both levels and classify it on the durable side as well.`,
     ).toEqual([]);
 
-    // #then and the surface is the size this file was written against
+    // #then and the partition covers that surface exactly, plus exactly the
+    // skewed members this core does not carry at this level
     expect(
-      agentSurface,
-      'the count of Agent.prototype members DurableAgent does not shadow has moved; re-derive the three Agent-level lists from the installed dist',
-    ).toHaveLength(82);
+      agentClassified.length,
+      `the classified lists must partition the inherited Agent surface exactly — every member once, plus exactly the ${exemptAgent.length} skewed member(s) @mastra/core ${installedCore} does not expose there`,
+    ).toBe(agentSurface.length + exemptAgent.length);
 
     // #then and it is entirely string-keyed: this partition enumerates own
     // STRING names, so a symbol-keyed execution member would sail past every
@@ -768,6 +995,45 @@ describe('FlowsafeDurableAgent prototype surface inventory', () => {
       Object.getOwnPropertySymbols(Agent.prototype),
       'Agent.prototype now carries symbol-keyed member(s), which the name-based partition above cannot see — read each one and either classify it or block it',
     ).toEqual([]);
+  });
+
+  it('keeps the version-skew table honest against the installed core', () => {
+    // #given the table's two halves are selected by comparing the installed
+    // core with the declared peer, which only means "the pinned run" while that
+    // peer is an EXACT version. Against a range, a pinned install would compare
+    // unequal, take the canary half, and excuse the wrong names on both levels.
+    expect(
+      declaredPeer,
+      'the version-skew halves key on @mastra/core being an exact peer pin; widen the peer and this mechanism must be redesigned',
+    ).toMatch(/^\d+\.\d+\.\d+$/);
+
+    // #when the installed core's two surfaces are enumerated
+    const surface = Object.getOwnPropertyNames(DurableAgent.prototype);
+
+    // #then every level a row names still holds that name in one of the lists
+    // for that level: a row excuses a name from the stale check, it never
+    // classifies it, and a member that moved level is classified on both sides
+    for (const name of skewNames) {
+      for (const level of [VERSION_SKEW[name].pin, VERSION_SKEW[name].newest]) {
+        if (!level) continue;
+        expect(
+          level === 'durable' ? classified : agentClassified,
+          `VERSION_SKEW says ${name} sits on the ${level} prototype at one of the two supported cores, so it must appear in one of that level's partition lists — the row excuses it from the stale check, it does not classify it`,
+        ).toContain(name);
+      }
+    }
+
+    // #then and the table's claim about the INSTALLED core holds. Checking the
+    // claim rather than one direction catches all three ways a row goes wrong —
+    // the pin catches up, the member moves level again, or it dies upstream —
+    // and the message names which of them to look for.
+    for (const name of skewNames) {
+      const claimed = levelHere(name);
+      expect(
+        { durable: surface.includes(name), agent: agentSurface.includes(name) },
+        `VERSION_SKEW says ${name} sits on ${claimed ?? 'neither prototype'} at @mastra/core ${installedCore} (declared peer ${declaredPeer}). Re-read the installed dist: if both supported cores now agree, drop the row and let the stale check cover it again; if it is on neither core, delete it from the classification lists too; if it moved level again, update the row and classify it on the level it moved to.`,
+      ).toEqual({ durable: claimed === 'durable', agent: claimed === 'agent' });
+    }
   });
 
   it('keeps the base durable delegators out of the inherited surface', () => {
@@ -864,6 +1130,27 @@ describe('FlowsafeDurableAgent prototype surface inventory', () => {
     }
   });
 
+  it('keeps requestRemoteAbort untabled and inherited', () => {
+    // #given the abort primitive core reaches on its own, classified in
+    // nonExecution. Blocking it would be a well-formed block — a tabled reason,
+    // an override and a behavioral row — so the structural assertions above
+    // hold either way and its exemption needs an assertion of its own.
+    const why =
+      'core calls it from #abortDurableRun and from the `abort` closure it returns with each durable stream result, so refusing it rejects the abort handle of every run this class itself started';
+
+    // #then no tabled reason, so nothing here demands an override for it
+    expect(
+      Object.hasOwn(BLOCKED_RUN_ENTRIES, 'requestRemoteAbort'),
+      `requestRemoteAbort() must stay out of BLOCKED_RUN_ENTRIES: ${why}`,
+    ).toBe(false);
+
+    // #then and no own override, which is where a refusal would live
+    expect(
+      Object.hasOwn(FlowsafeDurableAgent.prototype, 'requestRemoteAbort'),
+      `requestRemoteAbort() must stay inherited: ${why}`,
+    ).toBe(false);
+  });
+
   it('keeps resumeViaRuntime as the only resume path', () => {
     // #given resumeViaRuntime is FlowSafe's own, not part of core's surface
     const agent = createFlowsafeDurableAgent({
@@ -954,11 +1241,13 @@ describe('FlowsafeDurableAgent blocked recovery entry points', () => {
    * run) — swallowed, because the claim is only that storage was reached BEFORE
    * they did.
    *
-   * generateLegacy/streamLegacy are excluded: they are vacuous by construction,
-   * for the reason registeredAgent() records.
+   * The rows in `vacuousByConstruction` are excluded: their base path reaches
+   * no store to spy on, for the reasons registeredAgent()'s notes give.
    */
   const vacuousByConstruction: readonly string[] = [
+    '__setThreadRuntimeAgent',
     'generateLegacy',
+    'listActiveThreadRuns',
     'streamLegacy',
   ];
 
@@ -970,6 +1259,23 @@ describe('FlowsafeDurableAgent blocked recovery entry points', () => {
       const { agent, getStore } = await registerWithSpies(
         new DurableAgent({ agent: testAgent() }),
       );
+
+      // #given a member the INSTALLED core does not expose has nothing to read
+      // and nothing to prove, so this row cannot bite here. Require that
+      // absence to be a RECORDED skew rather than skipping on it: an unlisted
+      // absence means the override refuses a member neither supported core has,
+      // and belongs nowhere. Self-expiring, unlike a second exclusion list —
+      // the row bites again the moment the installed core grows the member.
+      if (
+        typeof (agent as unknown as Record<string, unknown>)[method] !==
+        'function'
+      ) {
+        expect(
+          skewNames,
+          `${method}() is blocked and has a behavioral row, but @mastra/core ${installedCore} does not expose it on the base at all. Either record it in VERSION_SKEW with the level it holds on the other supported core, or drop the override and its row.`,
+        ).toContain(method);
+        return;
+      }
 
       // #when the base implementation runs
       await invoke(agent as unknown as FlowsafeDurableAgent).catch(
