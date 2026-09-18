@@ -11,6 +11,11 @@ const FORBIDDEN_CHARACTER =
 
 const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
 
+// Command position rather than line start: `CORE=$(pnpm --filter …)` invokes
+// pnpm too. The capture is the subcommand, which separates the install from
+// everything that needs one.
+const PNPM_COMMAND = /(?:^|[\n;&|(]|\$\()\s*pnpm(?:\s+(\S+))?/gu;
+
 function toPosix(path) {
   return path.split(sep).join('/');
 }
@@ -60,6 +65,46 @@ function githubYamlFiles(directory, errors) {
 
   visit(directory);
   return files;
+}
+
+function isWorkflowFile(githubDirectory, file) {
+  return toPosix(relative(githubDirectory, file)).startsWith('workflows/');
+}
+
+function firstUninstalledPnpmStep(job) {
+  let installed = false;
+  const steps = Array.isArray(job?.steps) ? job.steps : [];
+  for (const [index, step] of steps.entries()) {
+    if (typeof step?.run !== 'string') continue;
+    for (const [, subcommand] of step.run.matchAll(PNPM_COMMAND)) {
+      if (subcommand === 'install') installed = true;
+      else if (!installed) return { index, step };
+    }
+  }
+  return undefined;
+}
+
+// pnpm resolves a workspace script, and the binaries it runs, out of
+// node_modules: a job that reaches one before any step installs fails on the
+// runner over the script it was about to run, not over the missing install.
+function workflowInstallDiagnostics(githubDirectory, file, workflow) {
+  const jobs = workflow?.jobs;
+  if (!jobs || typeof jobs !== 'object') return [];
+  const diagnostics = [];
+  for (const [name, job] of Object.entries(jobs)) {
+    const offender = firstUninstalledPnpmStep(job);
+    if (!offender) continue;
+    const step = offender.step.name ?? `step ${offender.index + 1}`;
+    diagnostics.push(
+      fileDiagnostic(
+        githubDirectory,
+        file,
+        'MISSING_PNPM_INSTALL',
+        `job \`${name}\` invokes pnpm in \`${step}\` with no earlier install step`,
+      ),
+    );
+  }
+  return diagnostics;
 }
 
 function parserDiagnostic(githubDirectory, file, error) {
@@ -175,9 +220,10 @@ export function checkGithubYamlFiles(githubDirectory) {
       ),
     );
 
+    let contents;
     try {
       // Materialization surfaces unresolved aliases that parsing alone retains.
-      document.toJS();
+      contents = document.toJS();
     } catch (error) {
       errors.push(
         fileDiagnostic(
@@ -197,6 +243,14 @@ export function checkGithubYamlFiles(githubDirectory) {
           'NOT_A_MAPPING',
           'not a YAML mapping',
         ),
+      );
+      continue;
+    }
+
+    // Only workflows declare jobs; .github's other YAML is ISSUE_TEMPLATE.
+    if (isWorkflowFile(githubDirectory, file)) {
+      errors.push(
+        ...workflowInstallDiagnostics(githubDirectory, file, contents),
       );
     }
   }

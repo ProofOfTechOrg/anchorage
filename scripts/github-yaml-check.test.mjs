@@ -407,6 +407,47 @@ test('prints parser warnings without failing the run', () => {
   assert.equal(run.stdout, 'GitHub YAML check passed (1 files).\n');
 });
 
+test('reports a job that invokes pnpm with no earlier install step', () => {
+  const githubDirectory = fixture({
+    'workflows/ci.yml': `jobs:
+  uninstalled:
+    steps:
+      - name: Read the installed version
+        run: |
+          VERSION=$(pnpm --filter pkg exec node -p 1)
+  installed:
+    steps:
+      - run: pnpm install --frozen-lockfile
+      - name: Build
+        run: pnpm -r build
+`,
+  });
+  const result = checkGithubYamlFiles(githubDirectory);
+
+  assert.deepEqual(
+    result.errors.map(({ file, code, message }) => ({ file, code, message })),
+    [
+      {
+        file: `${basename(githubDirectory)}/workflows/ci.yml`,
+        code: 'MISSING_PNPM_INSTALL',
+        message:
+          'job `uninstalled` invokes pnpm in `Read the installed version` with no earlier install step',
+      },
+    ],
+  );
+});
+
+// The checker already parses every tracked workflow, so a job that reaches
+// pnpm before installing fails here rather than on the runner.
+test('every tracked workflow installs before it invokes pnpm', () => {
+  const result = checkGithubYamlFiles(join(repositoryRoot, '.github'));
+
+  assert.deepEqual(
+    result.errors.filter(({ code }) => code === 'MISSING_PNPM_INSTALL'),
+    [],
+  );
+});
+
 // The cases below pin ci.yml rather than the checker. They live here because
 // the checker already parses every .github workflow, and a suite of their own
 // would add a verify-core step to run it.
@@ -426,24 +467,25 @@ test('the ci.yml gate job stays reachable and depends on at least one job', () =
   );
 });
 
-// The canary's `continue-on-error` keys are what keep an upstream @mastra/core
-// release off the merge path: one at the job, and one on each step this case
-// names. This case shells out to nothing either.
-test('the ci.yml canary stays non-gating at the job and at the steps expected to go red, whose ids the summary reads', () => {
+// The canary's step-level `continue-on-error` keys keep an expected upstream
+// red from skipping the tripwire suites after them, so the final step is where
+// those two outcomes reach the job status. This case shells out to nothing
+// either.
+test('the ci.yml canary reds the job from a final outcome step that reads the ids it pins', () => {
   const job = readWorkflow().jobs['mastra-compat'];
 
   assert.ok(job, 'the compat canary is the job named `mastra-compat`');
-  assert.equal(
-    job['continue-on-error'],
-    true,
-    'without the job-level key an upstream @mastra/core release wedges unrelated pull requests',
+  assert.ok(
+    !('continue-on-error' in job),
+    'a job-level `continue-on-error` reports the canary green however the probe went',
   );
 
+  const steps = job.steps ?? [];
   for (const [name, id] of [
     ['Typecheck libraries against newest core', 'typecheck'],
     ['Bundle the flowsafe spike Worker against newest core', 'bundle'],
   ]) {
-    const step = (job.steps ?? []).find((candidate) => candidate.name === name);
+    const step = steps.find((candidate) => candidate.name === name);
 
     assert.ok(step, `the canary runs a step named "${name}"`);
     assert.equal(
@@ -454,7 +496,37 @@ test('the ci.yml canary stays non-gating at the job and at the steps expected to
     assert.equal(
       step.id,
       id,
-      `the run summary reads steps.${id}.outcome, so "${name}" carries that id`,
+      `the outcome step reads steps.${id}.outcome, so "${name}" carries that id`,
+    );
+  }
+
+  const testIndex = steps.findIndex(
+    (step) => step.name === 'Test libraries against newest core',
+  );
+  assert.ok(
+    testIndex >= 0,
+    'the canary runs a step named "Test libraries against newest core"',
+  );
+
+  const outcomeIndex = steps.length - 1;
+  assert.ok(
+    outcomeIndex > testIndex,
+    "the outcome step is the canary's last step, after the tripwire suites",
+  );
+  const outcome = steps[outcomeIndex];
+  assert.equal(
+    outcome.if,
+    'always()',
+    'without `if: always()` a red tripwire suite skips the outcome step',
+  );
+  for (const reference of [
+    'steps.typecheck.outcome',
+    'steps.bundle.outcome',
+    '$GITHUB_STEP_SUMMARY',
+  ]) {
+    assert.ok(
+      outcome.run.includes(reference),
+      `the outcome step reads ${reference}`,
     );
   }
 });
