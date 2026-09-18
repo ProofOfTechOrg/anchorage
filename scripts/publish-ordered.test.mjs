@@ -8,6 +8,9 @@ import {
   prerequisitePeerFloorViolations,
   publishInvocation,
   publishRelease,
+  VISIBILITY_DEADLINE_MS,
+  VISIBILITY_POLL_MS,
+  waitUntilPublished,
 } from './publish-ordered.mjs';
 
 /**
@@ -113,6 +116,106 @@ test('an already published prerequisite remains an ordered no-op', async () => {
     ...PUBLISH_PREREQUISITES.map(() => 'tag check'),
     'changesets',
   ]);
+});
+
+/**
+ * The visibility wait is a real-time loop against a registry that takes
+ * minutes, so it is exercised on a clock the wait itself advances: `sleep`
+ * records its duration and moves `now` forward by it. Nothing here waits on a
+ * real timer, and nothing asserts a magnitude for the exported constants — the
+ * budget is a judgement call, the loop's use of it is not.
+ */
+function fakeClock() {
+  const sleeps = [];
+  let current = 0;
+  return {
+    sleeps,
+    now: () => current,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+      current += ms;
+    },
+  };
+}
+
+test('a prerequisite already visible on the first probe never sleeps', async () => {
+  const clock = fakeClock();
+
+  await waitUntilPublished('@proofoftech/breakwater', '9.9.9', {
+    now: clock.now,
+    sleep: clock.sleep,
+    isPublished: () => true,
+  });
+
+  assert.deepEqual(clock.sleeps, []);
+});
+
+test('a prerequisite that appears later is polled at the visibility interval', async () => {
+  const clock = fakeClock();
+  let probes = 0;
+
+  await waitUntilPublished('@proofoftech/flowsafe', '9.9.9', {
+    now: clock.now,
+    sleep: clock.sleep,
+    isPublished: () => {
+      probes += 1;
+      return probes === 3;
+    },
+  });
+
+  assert.equal(probes, 3);
+  assert.deepEqual(clock.sleeps, [VISIBILITY_POLL_MS, VISIBILITY_POLL_MS]);
+});
+
+test('an expired wait names the package and the last probe failure', async () => {
+  const silent = fakeClock();
+
+  await assert.rejects(
+    waitUntilPublished('@proofoftech/breakwater', '9.9.9', {
+      now: silent.now,
+      sleep: silent.sleep,
+      isPublished: () => false,
+    }),
+    { message: '@proofoftech/breakwater@9.9.9 did not become visible on npm' },
+  );
+  assert.equal(
+    silent.sleeps.reduce((total, ms) => total + ms, 0),
+    VISIBILITY_DEADLINE_MS,
+  );
+
+  const failing = fakeClock();
+
+  await assert.rejects(
+    waitUntilPublished('@proofoftech/flowsafe', '9.9.9', {
+      now: failing.now,
+      sleep: failing.sleep,
+      isPublished: () => {
+        throw new Error('npm view failed: E500');
+      },
+    }),
+    {
+      message:
+        '@proofoftech/flowsafe@9.9.9 did not become visible on npm (last probe error: npm view failed: E500)',
+    },
+  );
+});
+
+test('a probe that throws counts as not yet visible', async () => {
+  const clock = fakeClock();
+  let probes = 0;
+
+  await waitUntilPublished('@proofoftech/breakwater', '9.9.9', {
+    now: clock.now,
+    sleep: clock.sleep,
+    isPublished: () => {
+      probes += 1;
+      if (probes === 1) throw new Error('npm view failed: E500');
+      return true;
+    },
+  });
+
+  assert.equal(probes, 2);
+  assert.deepEqual(clock.sleeps, [VISIBILITY_POLL_MS]);
 });
 
 test('a satisfied prerequisite peer floor passes', () => {
