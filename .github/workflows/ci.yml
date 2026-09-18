@@ -272,20 +272,23 @@ jobs:
       - name: Bump @mastra/core to newest 1.x
         id: mastra_versions
         run: |
-          # A registry blip reds the probe for the wrong reason, so each lookup
-          # gets three attempts. The capture keeps the shell's -e from aborting
-          # the step on an attempt that is about to be retried, and an E404 is a
-          # permanent answer that ends the attempts.
+          # A registry blip reds the probe for the wrong reason, so a lookup is
+          # retried; an E404 is a permanent answer that ends the attempts.
+          # Errexit does not reach inside `$( )`, so the function tests each
+          # stage itself: the lookup through `if`, the reduction through `||`
+          # and a non-empty result. The fetch bounds keep one attempt from
+          # spending the job's budget inside npm's own retries.
           newest_version() {
-            local attempt status output
+            local attempt output version
             for attempt in 1 2 3; do
-              output=$(npm view "$1" version --json 2>&1) && status=0 || status=$?
-              if [ "$status" -eq 0 ]; then
-                printf '%s' "$output" | node -e 'const d=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(Array.isArray(d)?d.at(-1):d)'
+              [ "$attempt" -eq 1 ] || sleep 20
+              if output=$(npm view "$1" version --json --fetch-timeout=30000 --fetch-retries=1 --fetch-retry-mintimeout=1000 --fetch-retry-maxtimeout=5000); then
+                version=$(printf '%s' "$output" | node -e 'const d=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(Array.isArray(d)?d.at(-1):d)') || return 1
+                [ -n "$version" ] || return 1
+                printf '%s\n' "$version"
                 return 0
               fi
               case "$output" in *E404*) break ;; esac
-              [ "$attempt" -eq 3 ] || sleep 20
             done
             printf 'npm view %s failed: %s\n' "$1" "$output" >&2
             return 1
@@ -333,6 +336,7 @@ jobs:
         run: pnpm --filter @proofoftech/flowsafe spike:bundle-check
 
       - name: Test libraries against newest core
+        id: tests
         run: pnpm --filter @proofoftech/breakwater test && pnpm --filter @proofoftech/flowsafe test
 
       # The typecheck and bundle steps swallow their own status, so this step
@@ -346,6 +350,7 @@ jobs:
         run: |
           echo "library typecheck against newest core: ${{ steps.typecheck.outcome }}" >> "$GITHUB_STEP_SUMMARY"
           echo "spike bundle against newest core: ${{ steps.bundle.outcome }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "library suites against newest core: ${{ steps.tests.outcome }}" >> "$GITHUB_STEP_SUMMARY"
           if [ "${{ steps.typecheck.outcome }}" = failure ] || [ "${{ steps.bundle.outcome }}" = failure ]; then
             exit 1
           fi

@@ -10,6 +10,7 @@ import {
   publishRelease,
   VISIBILITY_DEADLINE_MS,
   VISIBILITY_POLL_MS,
+  viewInvocation,
   waitUntilPublished,
 } from './publish-ordered.mjs';
 
@@ -59,6 +60,26 @@ function peerFloorFixture({
       },
     ],
   ]);
+}
+
+/**
+ * The visibility wait is a real-time loop against a registry that takes
+ * minutes, so it is exercised on a clock the wait itself advances: `sleep`
+ * records its duration and moves `now` forward by it.
+ */
+function fakeClock() {
+  const sleeps = [];
+  let current = 0;
+  return {
+    sleeps,
+    seams: {
+      now: () => current,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        current += ms;
+      },
+    },
+  };
 }
 
 test('publishes Breakwater then Flowsafe before the remaining Changesets release', async () => {
@@ -118,32 +139,44 @@ test('an already published prerequisite remains an ordered no-op', async () => {
   ]);
 });
 
-/**
- * The visibility wait is a real-time loop against a registry that takes
- * minutes, so it is exercised on a clock the wait itself advances: `sleep`
- * records its duration and moves `now` forward by it. Nothing here waits on a
- * real timer, and nothing asserts a magnitude for the exported constants — the
- * budget is a judgement call, the loop's use of it is not.
- */
-function fakeClock() {
-  const sleeps = [];
-  let current = 0;
-  return {
-    sleeps,
-    now: () => current,
-    sleep: async (ms) => {
-      sleeps.push(ms);
-      current += ms;
-    },
-  };
-}
+test('the visibility probe revalidates the packument and bounds its fetch', () => {
+  const args = viewInvocation('@proofoftech/breakwater', '9.9.9');
+
+  assert.deepEqual(args.slice(0, 4), [
+    'view',
+    '@proofoftech/breakwater@9.9.9',
+    'version',
+    '--json',
+  ]);
+  for (const flag of [
+    '--prefer-online',
+    '--fetch-timeout=30000',
+    '--fetch-retries=1',
+    '--fetch-retry-mintimeout=1000',
+    '--fetch-retry-maxtimeout=5000',
+  ]) {
+    assert.ok(
+      args.includes(flag),
+      `a probe without ${flag} runs on npm's own defaults: ${args.join(' ')}`,
+    );
+  }
+});
+
+// The floor is the 2026-09-18 release's measured 8m32s from acceptance to
+// visibility, so a deadline cut below what has already been observed reds here
+// rather than on the next release.
+test('the visibility deadline clears the measured publish-to-visibility lag', () => {
+  assert.ok(
+    VISIBILITY_DEADLINE_MS > 512_000,
+    `${VISIBILITY_DEADLINE_MS}ms leaves no margin over a wait already measured at 8m32s`,
+  );
+});
 
 test('a prerequisite already visible on the first probe never sleeps', async () => {
   const clock = fakeClock();
 
   await waitUntilPublished('@proofoftech/breakwater', '9.9.9', {
-    now: clock.now,
-    sleep: clock.sleep,
+    ...clock.seams,
     isPublished: () => true,
   });
 
@@ -155,8 +188,7 @@ test('a prerequisite that appears later is polled at the visibility interval', a
   let probes = 0;
 
   await waitUntilPublished('@proofoftech/flowsafe', '9.9.9', {
-    now: clock.now,
-    sleep: clock.sleep,
+    ...clock.seams,
     isPublished: () => {
       probes += 1;
       return probes === 3;
@@ -167,35 +199,64 @@ test('a prerequisite that appears later is polled at the visibility interval', a
   assert.deepEqual(clock.sleeps, [VISIBILITY_POLL_MS, VISIBILITY_POLL_MS]);
 });
 
-test('an expired wait names the package and the last probe failure', async () => {
-  const silent = fakeClock();
+test('an asynchronous probe is awaited rather than read as a truthy promise', async () => {
+  const clock = fakeClock();
+  let probes = 0;
+
+  await waitUntilPublished('@proofoftech/breakwater', '9.9.9', {
+    ...clock.seams,
+    isPublished: async () => ++probes === 2,
+  });
+
+  assert.equal(probes, 2);
+  assert.deepEqual(clock.sleeps, [VISIBILITY_POLL_MS]);
+});
+
+// A version that appears in the last poll interval is still published, so the
+// deadline is what the wait probes at, not what it stops short of.
+test('an expiring wait probes at the deadline before it gives up', async () => {
+  const clock = fakeClock();
+  let probes = 0;
 
   await assert.rejects(
     waitUntilPublished('@proofoftech/breakwater', '9.9.9', {
-      now: silent.now,
-      sleep: silent.sleep,
-      isPublished: () => false,
+      ...clock.seams,
+      isPublished: () => {
+        probes += 1;
+        return false;
+      },
     }),
     { message: '@proofoftech/breakwater@9.9.9 did not become visible on npm' },
   );
+
   assert.equal(
-    silent.sleeps.reduce((total, ms) => total + ms, 0),
+    clock.sleeps.reduce((total, ms) => total + ms, 0),
     VISIBILITY_DEADLINE_MS,
   );
+  assert.equal(probes, VISIBILITY_DEADLINE_MS / VISIBILITY_POLL_MS + 1);
+});
 
-  const failing = fakeClock();
+test('an expired wait names a probe that failed during it', async () => {
+  const clock = fakeClock();
+  const probeError = new Error('npm view failed: E500');
+  let probes = 0;
 
   await assert.rejects(
     waitUntilPublished('@proofoftech/flowsafe', '9.9.9', {
-      now: failing.now,
-      sleep: failing.sleep,
+      ...clock.seams,
       isPublished: () => {
-        throw new Error('npm view failed: E500');
+        probes += 1;
+        if (probes === 1) throw probeError;
+        return false;
       },
     }),
-    {
-      message:
-        '@proofoftech/flowsafe@9.9.9 did not become visible on npm (last probe error: npm view failed: E500)',
+    (error) => {
+      assert.equal(
+        error.message,
+        '@proofoftech/flowsafe@9.9.9 did not become visible on npm (a probe failed during the wait: npm view failed: E500)',
+      );
+      assert.equal(error.cause, probeError);
+      return true;
     },
   );
 });
@@ -205,8 +266,7 @@ test('a probe that throws counts as not yet visible', async () => {
   let probes = 0;
 
   await waitUntilPublished('@proofoftech/breakwater', '9.9.9', {
-    now: clock.now,
-    sleep: clock.sleep,
+    ...clock.seams,
     isPublished: () => {
       probes += 1;
       if (probes === 1) throw new Error('npm view failed: E500');
@@ -220,6 +280,20 @@ test('a probe that throws counts as not yet visible', async () => {
 
 test('a satisfied prerequisite peer floor passes', () => {
   assert.deepEqual(prerequisitePeerFloorViolations(peerFloorFixture()), []);
+});
+
+// Deleting the peer declaration is what empties the edge set, and both gates
+// iterate it, so an empty set has to fail rather than pass unexercised.
+test('manifests with no prerequisite peer edge fail the gate closed', () => {
+  const violations = prerequisitePeerFloorViolations(
+    new Map([
+      ['@proofoftech/breakwater', { version: '0.13.0' }],
+      ['@proofoftech/flowsafe', { version: '0.21.0' }],
+    ]),
+  );
+
+  assert.equal(violations.length, 1);
+  assert.match(violations[0], /peer-floor gates would verify nothing/);
 });
 
 test('an unsatisfied peer floor names both packages', () => {

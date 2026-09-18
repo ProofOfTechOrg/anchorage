@@ -33,10 +33,11 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
-    # Covers two prerequisite visibility waits of VISIBILITY_DEADLINE_MS
-    # (scripts/publish-ordered.mjs) on top of install, build and the pre-flight.
-    # The `concurrency` group above has no `cancel-in-progress`, so a wedged run
-    # holds the next release behind it for this whole budget.
+    # Covers PUBLISH_PREREQUISITES.length visibility waits of
+    # VISIBILITY_DEADLINE_MS (scripts/publish-ordered.mjs) plus the rest of the
+    # job. The `concurrency` group above has no `cancel-in-progress`, so a run
+    # queued behind a wedged one is cancelled when a third push queues, not
+    # merely delayed.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4

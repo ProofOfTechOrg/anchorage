@@ -29,6 +29,7 @@
 import {
   command,
   failureReason,
+  missingPrerequisitePeerEdge,
   PUBLISH_PREREQUISITES,
   peerFloorGrammarViolations,
   prerequisiteManifests,
@@ -40,7 +41,12 @@ const manifests = prerequisiteManifests();
 // Version containment belongs to publishRelease after pending changesets bump versions.
 const peerFloorGrammar = peerFloorGrammarViolations(manifests);
 const peerEdges = [...prerequisitePeerEdges(manifests)];
+const missingPeerEdge = missingPrerequisitePeerEdge(manifests);
 let invocationFailed = false;
+
+if (missingPeerEdge) {
+  console.error(`FAIL ${missingPeerEdge}`);
+}
 
 for (const { ownerName, message } of peerFloorGrammar) {
   const { directory } = PUBLISH_PREREQUISITES.find(
@@ -75,7 +81,7 @@ if (peerFloorGrammar.length > 0) {
   );
 }
 
-if (peerFloorGrammar.length > 0 || invocationFailed) {
+if (peerFloorGrammar.length > 0 || missingPeerEdge || invocationFailed) {
   process.exit(1);
 }
 

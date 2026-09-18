@@ -12,9 +12,12 @@ const FORBIDDEN_CHARACTER =
 const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
 
 // Command position rather than line start: `CORE=$(pnpm --filter …)` invokes
-// pnpm too. The capture is the subcommand, which separates the install from
-// everything that needs one.
-const PNPM_COMMAND = /(?:^|[\n;&|(]|\$\()\s*pnpm(?:\s+(\S+))?/gu;
+// pnpm too. The capture is the rest of the invocation, whose first non-flag
+// token is the subcommand that separates the install from everything needing
+// one.
+const PNPM_COMMAND = /(?:^|[\n;&|(]|\$\()\s*pnpm(?![\w.-])([^\n;&|)]*)/gu;
+
+const PNPM_INSTALL_SUBCOMMANDS = new Set(['install', 'i']);
 
 function toPosix(path) {
   return path.split(sep).join('/');
@@ -71,13 +74,35 @@ function isWorkflowFile(githubDirectory, file) {
   return toPosix(relative(githubDirectory, file)).startsWith('workflows/');
 }
 
+// A flag can precede the subcommand, so `pnpm -r install` reads as an install
+// and `pnpm --version` as neither: an invocation of nothing but flags reaches
+// no workspace script.
+function pnpmSubcommand(invocation) {
+  return invocation
+    .split(/\s+/u)
+    .find((token) => token !== '' && !token.startsWith('-'));
+}
+
+// pnpm/action-setup installs from its own `run_install` input, so an installed
+// job can carry no install text at all.
+function installsThroughActionSetup(step) {
+  return (
+    typeof step?.uses === 'string' &&
+    step.uses.startsWith('pnpm/action-setup') &&
+    Boolean(step.with?.run_install)
+  );
+}
+
 function firstUninstalledPnpmStep(job) {
   let installed = false;
   const steps = Array.isArray(job?.steps) ? job.steps : [];
   for (const [index, step] of steps.entries()) {
+    if (installsThroughActionSetup(step)) installed = true;
     if (typeof step?.run !== 'string') continue;
-    for (const [, subcommand] of step.run.matchAll(PNPM_COMMAND)) {
-      if (subcommand === 'install') installed = true;
+    for (const [, invocation] of step.run.matchAll(PNPM_COMMAND)) {
+      const subcommand = pnpmSubcommand(invocation);
+      if (subcommand === undefined) continue;
+      if (PNPM_INSTALL_SUBCOMMANDS.has(subcommand)) installed = true;
       else if (!installed) return { index, step };
     }
   }
