@@ -66,7 +66,9 @@ export interface D1StorageOptions {
    * lower layer never depends on `signals/` (which imports do-runner) — build
    * them with `createSignalStorageDomains()` and pass them here. The default
    * workflow domain supports explicit initial-admission scopes; false/custom
-   * workflow overrides retain precedence.
+   * workflow overrides retain precedence. `workflowDefinitions` and `knowledge`
+   * are injectable through this seam on the same terms: @mastra/cloudflare-d1
+   * backs neither, so each resolves undefined unless a host supplies one.
    */
   domains?: MastraStorageDomains;
 }
@@ -83,6 +85,7 @@ export function createD1Storage(
   const domainSource = suppliedDomains ?? {};
   const capturedDomains = {
     workflows: domainSource.workflows,
+    workflowDefinitions: domainSource.workflowDefinitions,
     scores: domainSource.scores,
     memory: domainSource.memory,
     channels: domainSource.channels,
@@ -104,6 +107,7 @@ export function createD1Storage(
     harness: domainSource.harness,
     toolProviderConnections: domainSource.toolProviderConnections,
     threadState: domainSource.threadState,
+    knowledge: domainSource.knowledge,
   } satisfies Record<keyof MastraStorageDomains, unknown>;
   const { workflows: suppliedWorkflows, ...otherDomains } = capturedDomains;
   const id = suppliedId ?? 'flowsafe';

@@ -26,7 +26,9 @@ Contributions — new connectors, policies, bug fixes, and docs — are welcome.
   blueprint.
 
 Every PR must pass the verification gate below; CI
-(`.github/workflows/ci.yml`) runs it on push and PR.
+(`.github/workflows/ci.yml`) runs it on push and PR. `verify` is the only
+required check, so a red `mastra-compat` canary on a PR reports a Mastra
+release to investigate, not a fault in the contribution.
 
 ## Development setup
 
@@ -138,13 +140,4 @@ Anchorage is an independent implementation built ON Mastra. Contributions must
 not fork or modify Mastra source code, wrap Mastra Enterprise features to
 bypass their licensing, or copy any third-party proprietary implementation.
 
-The single permitted exception is
-`packages/flowsafe/patches/@mastra__core@1.53.0.patch`, which changes the
-published `@mastra/core@1.53.0` runtime chunks so that `summarizeNotifications`
-counts sources in a null-prototype object and the delivery policy's `sources`
-lookup reads own properties only (mastra-ai/mastra#23693, #23694). It is applied
-through pnpm `patchedDependencies` and leaves the shipped source maps untouched.
-It is removed when a `@mastra/core` release carrying the upstream fix is
-adopted, following the procedure in the
-[maintainer guide's Mastra compatibility section](docs/maintainer-guide.md#mastra-compatibility).
-No other Mastra modification is permitted.
+No Mastra modification is permitted.

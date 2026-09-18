@@ -93,10 +93,10 @@ const blockedEntries = Object.keys(BLOCKED_RUN_ENTRIES) as ReadonlyArray<
  * `__setThreadRuntimeAgent`, which installs the agent the thread runtime drives
  * in place of this one.
  *
- * `__setThreadRuntimeAgent` and `listActiveThreadRuns` sit on no prototype at
- * all on the pinned core, which exposes neither, so they carry VERSION_SKEW
- * rows. The exact-match assertion holds at both versions all the same: absent
- * from DurableAgent.prototype counts as outside it.
+ * `__setThreadRuntimeAgent` and `listActiveThreadRuns` sit on Agent.prototype
+ * at the pinned core, like the rest of this list. The exact-match assertion
+ * reads the same either way: absent from DurableAgent.prototype counts as
+ * outside it.
  */
 const blockedOnAgentPrototype = [
   '__setThreadRuntimeAgent',
@@ -144,9 +144,10 @@ const blockedByRunner = blockedEntries.filter(
  * THE AGENT, not the capabilities of the objects they hand back.
  *
  * Offsets in the reasons below are @mastra/core 1.67.0-vintage, in
- * dist/create-durable-agent-DFHwqN2K.js unless another file is named; the
- * members carrying one are absent from the pinned peer's durable prototype and
- * so have a VERSION_SKEW row.
+ * dist/create-durable-agent-DFHwqN2K.js unless another file is named. A member
+ * whose prototype level differs between the pinned peer and a newer core gets a
+ * VERSION_SKEW row; the table is empty while the pinned peer is the newest core
+ * this inventory was read against.
  */
 const nonExecution = [
   '__fork',
@@ -174,10 +175,8 @@ const nonExecution = [
   // requestRemoteAbort (:6626), which publishes an abort request over pubsub
   // (:272) to whichever process holds the run — and abortRunStream returns
   // `aborted || this.#isRunExecuting(runId)` (:6585), a boolean existence
-  // oracle for a run id the caller may not own. Both stay classified on the
-  // Agent level too: they are on Agent.prototype at the pin and shadowed here
-  // only at 1.67.0. Breakwater's narrowed handle omits both
-  // (agent.test.ts, in `intentionallyUnavailable`), a divergence
+  // oracle for a run id the caller may not own. Breakwater's narrowed handle
+  // omits both (agent.test.ts, in `intentionallyUnavailable`), a divergence
   // running the opposite way to the ones durable-agent-runner.ts records, where
   // breakwater is the weaker side: a handle can omit a member, while an
   // instance Mastra calls in-process can only refuse it, and neither of these
@@ -329,9 +328,10 @@ const delegatingToGuard = [
  * that rather than trusting it.
  *
  * Offsets in the reasons below are @mastra/core 1.67.0-vintage, in
- * dist/agent-Dk0N0Nlg.js unless another file is named; a member carrying one is
- * absent from the pinned peer's Agent prototype, or sits there at a different
- * level, and so has a VERSION_SKEW row.
+ * dist/agent-Dk0N0Nlg.js unless another file is named. A member whose prototype
+ * level differs between the pinned peer and a newer core gets a VERSION_SKEW
+ * row; the table is empty while the pinned peer is the newest core this
+ * inventory was read against.
  */
 const agentNonExecution = [
   '__getDrainPendingSignals',
@@ -344,12 +344,6 @@ const agentNonExecution = [
   '__runInputProcessors',
   '__runOutputProcessors',
   '__runProcessInputStep',
-  // Stop an in-flight stream; there is no path from either to starting one.
-  // Classified on the durable level too: DurableAgent shadows both at 1.67.0
-  // and they leave this surface there, and the durable entry carries the reason
-  // for the cross-process reach that override adds.
-  'abortRunStream',
-  'abortThreadStream',
   'assertSupportsPreparedModels',
   // Removes pending idle signals from the in-process queue, matched on the
   // agent core passes — `this`, not the thread-runtime target (:38342) — and on
@@ -482,27 +476,17 @@ const agentClassified: readonly string[] = [
  * ---------------------------------------------------------------------------
  */
 type SkewLevel = 'durable' | 'agent' | null;
+interface SkewRow {
+  pin: SkewLevel;
+  newest: SkewLevel;
+}
 
-const VERSION_SKEW = {
-  __markStoredVersionApplied: { pin: null, newest: 'agent' },
-  __setDeclaredSchedules: { pin: null, newest: 'durable' },
-  __setThreadRuntimeAgent: { pin: null, newest: 'agent' },
-  abortRunStream: { pin: 'agent', newest: 'durable' },
-  abortThreadStream: { pin: 'agent', newest: 'durable' },
-  cancelQueuedMessages: { pin: null, newest: 'agent' },
-  claimThreadOwnership: { pin: null, newest: 'agent' },
-  discoverThreadPeers: { pin: null, newest: 'agent' },
-  emitErrorInBackground: { pin: null, newest: 'durable' },
-  filterUiMessagesByThread: { pin: null, newest: 'agent' },
-  getDeclaredSchedules: { pin: null, newest: 'durable' },
-  listActiveThreadRuns: { pin: null, newest: 'agent' },
-  requestRemoteAbort: { pin: null, newest: 'durable' },
-  resolveNotificationDeliveryDecision: { pin: null, newest: 'agent' },
-  subscribeThreadEvents: { pin: null, newest: 'agent' },
-} as const satisfies Record<string, { pin: SkewLevel; newest: SkewLevel }>;
+const VERSION_SKEW: Record<string, SkewRow> = {};
 
-type SkewName = keyof typeof VERSION_SKEW;
-const skewNames = Object.keys(VERSION_SKEW) as readonly SkewName[];
+// Rows are read as entries, never indexed by name: the name and its row travel
+// together, so every read below is total whatever the table holds.
+const skewRows = Object.entries(VERSION_SKEW);
+const skewNames = skewRows.map(([name]) => name);
 
 interface FsModule {
   readFileSync(path: URL, encoding: 'utf8'): string;
@@ -548,8 +532,7 @@ const declaredPeer = (
 
 /** Which core is installed decides which half of every row applies. */
 const onPin = installedCore === declaredPeer;
-const levelHere = (name: SkewName): SkewLevel =>
-  onPin ? VERSION_SKEW[name].pin : VERSION_SKEW[name].newest;
+const levelHere = (row: SkewRow): SkewLevel => (onPin ? row.pin : row.newest);
 
 /**
  * The names one level's stale check must excuse: recorded as skewed, not on
@@ -561,7 +544,9 @@ const exemptFor = (
   level: Exclude<SkewLevel, null>,
   lists: readonly string[],
 ): string[] =>
-  skewNames.filter((name) => levelHere(name) !== level && lists.includes(name));
+  skewRows
+    .filter(([name, row]) => levelHere(row) !== level && lists.includes(name))
+    .map(([name]) => name);
 const exemptDurable = exemptFor('durable', classified);
 const exemptAgent = exemptFor('agent', agentClassified);
 
@@ -633,17 +618,16 @@ function testAgent(id = 'writer'): Agent {
  * base. Resolving the store once up front is safe: `getStore` memoizes, so the
  * spied object is the one core gets.
  *
- * How much each row's "read nothing" assertion is worth, against base
- * @mastra/core 1.53.0 — this is NOT uniform, and pretending it is would be the
- * same vacuity trap the workflow-level spy was. The non-vacuous rows are no
- * longer merely PROBED: the companion control below drives each of them through
- * a stock DurableAgent on this same spied storage and ASSERTS that the
- * workflows store was reached, so a core that stops touching storage on one of
- * them fails loudly rather than turning its row quietly vacuous. The vacuous
- * rows take the inverted half of that control, which drives them the same way
- * and asserts the store was NOT reached — so each grading below is checked
- * rather than claimed, in whichever direction it goes, on a core that exposes
- * the member.
+ * How much each row's "read nothing" assertion is worth, against the pinned
+ * core — this is NOT uniform, and pretending it is would be the same vacuity
+ * trap the workflow-level spy was. The non-vacuous rows are not merely PROBED:
+ * the companion control below drives each of them through a stock DurableAgent
+ * on this same spied storage and ASSERTS that the workflows store was reached,
+ * so a core that stops touching storage on one of them fails loudly rather than
+ * turning its row quietly vacuous. The vacuous rows take the inverted half of
+ * that control, which drives them the same way and asserts the store was NOT
+ * reached — so each grading below is checked rather than claimed, in whichever
+ * direction it goes, on a core that exposes the member.
  *
  *  - Non-vacuous, one store method each: `getWorkflowRunById` for recover and
  *    the whole resume family; `listWorkflowRuns` for recoverActiveRuns,
@@ -662,8 +646,8 @@ function testAgent(id = 'writer'): Agent {
  *    the base throws core's model-support error, the override throws
  *    FlowSafe's tabled reason, and only the latter satisfies the row.
  *  - listActiveThreadRuns / __setThreadRuntimeAgent: VACUOUS by construction
- *    as well, and in `vacuousByConstruction` on that ground rather than on the
- *    pin exposing neither of them. In the core that does, @mastra/core 1.67.0,
+ *    as well, and in `vacuousByConstruction` on that ground rather than on any
+ *    version skew. At @mastra/core 1.67.0,
  *    `__setThreadRuntimeAgent` writes a private field
  *    (dist/agent-Dk0N0Nlg.js:33609-33611), and `listActiveThreadRuns` hands
  *    `getPubSub()` (:33560-33562) to the thread-stream runtime, which reads
@@ -1032,8 +1016,8 @@ describe('FlowsafeDurableAgent prototype surface inventory', () => {
     // #then every level a row names still holds that name in one of the lists
     // for that level: a row excuses a name from the stale check, it never
     // classifies it, and a member that moved level is classified on both sides
-    for (const name of skewNames) {
-      for (const level of [VERSION_SKEW[name].pin, VERSION_SKEW[name].newest]) {
+    for (const [name, row] of skewRows) {
+      for (const level of [row.pin, row.newest]) {
         if (!level) continue;
         expect(
           level === 'durable' ? classified : agentClassified,
@@ -1046,8 +1030,8 @@ describe('FlowsafeDurableAgent prototype surface inventory', () => {
     // claim rather than one direction catches all three ways a row goes wrong —
     // the pin catches up, the member moves level again, or it dies upstream —
     // and the message names which of them to look for.
-    for (const name of skewNames) {
-      const claimed = levelHere(name);
+    for (const [name, row] of skewRows) {
+      const claimed = levelHere(row);
       expect(
         { durable: surface.includes(name), agent: agentSurface.includes(name) },
         `VERSION_SKEW says ${name} sits on ${claimed ?? 'neither prototype'} at @mastra/core ${installedCore} (declared peer ${declaredPeer}). Re-read the installed dist: if both supported cores now agree, drop the row and let the stale check cover it again; if it is on neither core, delete it from the classification lists too; if it moved level again, update the row and classify it on the level it moved to.`,

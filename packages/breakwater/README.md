@@ -38,10 +38,10 @@ schedule work, or run durable agent loops on Cloudflare.
 ## Install it
 
 breakwater is ESM-only, requires Node.js 22.13.0 or newer (engine range `>=22.13.0`),
-and requires `@mastra/core` `1.53.0`.
+and requires `@mastra/core` `1.67.0`.
 
 ```bash
-npm install @proofoftech/breakwater @mastra/core@1.53.0
+npm install @proofoftech/breakwater @mastra/core@1.67.0
 ```
 
 Connector authors who define Zod schemas should also declare Zod directly:

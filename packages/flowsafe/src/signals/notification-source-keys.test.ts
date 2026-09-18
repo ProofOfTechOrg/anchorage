@@ -69,11 +69,13 @@ const modules: Array<[string, typeof esm]> = [
   ['cjs', cjs],
 ];
 
-// The getting-started guide's confirmation record. With the patch applied,
-// `bySource.constructor` carries this record's own count instead of the
-// inherited Object.prototype member, and core's own source-policy lookup
-// resolves the configured action instead of that member.
-const PATCH_PROBE: NotificationRecord = {
+// The record that separates own keys from inherited ones: on a core that
+// guards its own keys, `bySource.constructor` carries this record's own count
+// instead of the inherited Object.prototype member, and core's source-policy
+// lookup resolves the configured action instead of that member. Upstream fixed
+// both — mastra-ai/mastra#23693 and #23694 — and these cases are this
+// repository's regression coverage of that fix.
+const OWN_KEY_PROBE: NotificationRecord = {
   id: 'n',
   threadId: 't',
   source: 'constructor',
@@ -85,35 +87,24 @@ const PATCH_PROBE: NotificationRecord = {
   updatedAt: new Date(0),
 };
 
-const patched = new Map(
-  modules.map(
-    ([label, core]) =>
-      [
-        label,
-        typeof core.summarizeNotifications([PATCH_PROBE]).bySource
-          .constructor === 'number',
-      ] as const,
-  ),
-);
-
 it('loads the CJS lane as its own module realization', () => {
   expect(cjs.summarizeNotifications).not.toBe(summarizeNotifications);
 });
 
 it.each(
   modules,
-)('reports the @mastra/core patch applied (%s)', (_label, core) => {
+)('counts a prototype-named source as an own numeric entry (%s)', (_label, core) => {
   expect(
-    typeof core.summarizeNotifications([PATCH_PROBE]).bySource.constructor,
+    typeof core.summarizeNotifications([OWN_KEY_PROBE]).bySource.constructor,
   ).toBe('number');
 });
 
 it.each(
   modules,
-)('reports the @mastra/core delivery policy patch applied (%s)', async (_label, core) => {
+)('resolves a prototype-named source to the configured default (%s)', async (_label, core) => {
   const decision = await core.resolveNotificationDeliveryDecision({
     config: { sources: {}, default: 'discard' },
-    record: PATCH_PROBE,
+    record: OWN_KEY_PROBE,
     threadState: 'idle',
     now: new Date(0),
   });
@@ -232,351 +223,336 @@ async function policyAgent(deliveryPolicy: NotificationDeliveryPolicyConfig) {
 }
 
 for (const [label, core] of modules) {
-  describe.skipIf(!patched.get(label))(
-    `core notification summary source keys (${label})`,
-    () => {
-      it('counts prototype-colliding sources as own numeric entries', () => {
-        const summary = core.summarizeNotifications(BATCH);
+  describe(`core notification summary source keys (${label})`, () => {
+    it('counts prototype-colliding sources as own numeric entries', () => {
+      const summary = core.summarizeNotifications(BATCH);
 
-        // No source name resolves an inherited member instead of its own count. An
-        // own `__proto__` entry requires an accumulator that never invokes the
-        // inherited setter, which a read-side guard alone cannot produce.
-        expect(Object.entries(summary.bySource)).toEqual([
-          ['__proto__', 1],
-          ['constructor', 1],
-          ['toString', 1],
-          ['hasOwnProperty', 1],
-          ['', 1],
-          ['crm', 2],
-        ]);
-        for (const source of [
-          '__proto__',
-          'constructor',
-          'toString',
-          'hasOwnProperty',
-          '',
-          'crm',
-        ]) {
-          expect(Object.hasOwn(summary.bySource, source)).toBe(true);
-          expect(typeof summary.bySource[source]).toBe('number');
-        }
-        expect(Object.hasOwn(summary.bySource, 'valueOf')).toBe(false);
+      // No source name resolves an inherited member instead of its own count. An
+      // own `__proto__` entry requires an accumulator that never invokes the
+      // inherited setter, which a read-side guard alone cannot produce.
+      expect(Object.entries(summary.bySource)).toEqual([
+        ['__proto__', 1],
+        ['constructor', 1],
+        ['toString', 1],
+        ['hasOwnProperty', 1],
+        ['', 1],
+        ['crm', 2],
+      ]);
+      for (const source of [
+        '__proto__',
+        'constructor',
+        'toString',
+        'hasOwnProperty',
+        '',
+        'crm',
+      ]) {
+        expect(Object.hasOwn(summary.bySource, source)).toBe(true);
+        expect(typeof summary.bySource[source]).toBe('number');
+      }
+      expect(Object.hasOwn(summary.bySource, 'valueOf')).toBe(false);
 
-        expect(summary.pending).toBe(7);
-        expect(summary.threadId).toBe('thread-keys');
-        expect(summary.resourceId).toBe('resource-keys');
-        expect(summary.agentId).toBe('agent-keys');
-        expect(summary.byPriority).toEqual({
-          low: 3,
-          medium: 2,
-          high: 1,
-          urgent: 1,
-        });
-        expect(summary.notificationIds).toEqual([
-          'n1',
-          'n2',
-          'n3',
-          'n4',
-          'n5',
-          'n6',
-          'n7',
-        ]);
+      expect(summary.pending).toBe(7);
+      expect(summary.threadId).toBe('thread-keys');
+      expect(summary.resourceId).toBe('resource-keys');
+      expect(summary.agentId).toBe('agent-keys');
+      expect(summary.byPriority).toEqual({
+        low: 3,
+        medium: 2,
+        high: 1,
+        urgent: 1,
+      });
+      expect(summary.notificationIds).toEqual([
+        'n1',
+        'n2',
+        'n3',
+        'n4',
+        'n5',
+        'n6',
+        'n7',
+      ]);
+    });
+
+    it('renders own counts in the summary text and metadata groups', () => {
+      const summary = core.summarizeNotifications(BATCH);
+
+      expect(core.notificationSummaryContents(summary)).toBe(
+        ': 1, __proto__: 1, constructor: 1, crm: 2, hasOwnProperty: 1, toString: 1',
+      );
+      expect(core.notificationSummarySignalMetadata(summary)).toEqual({
+        signal: 'summary',
+        pending: 7,
+        groups: [
+          { source: '', count: 1 },
+          { source: '__proto__', count: 1 },
+          { source: 'constructor', count: 1 },
+          { source: 'crm', count: 2 },
+          { source: 'hasOwnProperty', count: 1 },
+          { source: 'toString', count: 1 },
+        ],
+        byPriority: { low: 3, medium: 2, high: 1, urgent: 1 },
+        notificationIds: ['n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n7'],
+        priority: 'urgent',
+      });
+    });
+
+    it('keeps the empty and no-pending shapes', () => {
+      const empty = core.summarizeNotifications([]);
+      expect(empty).toMatchObject({
+        threadId: '',
+        pending: 0,
+        byPriority: {},
+        notificationIds: [],
+      });
+      expect(Object.entries(empty.bySource)).toEqual([]);
+      expect(core.notificationSummaryContents(empty)).toBe(
+        'No pending notifications',
+      );
+      expect(core.notificationSummarySignalMetadata(empty)).toEqual({
+        signal: 'summary',
+        pending: 0,
+        groups: [],
+        byPriority: {},
+        notificationIds: [],
       });
 
-      it('renders own counts in the summary text and metadata groups', () => {
-        const summary = core.summarizeNotifications(BATCH);
-
-        expect(core.notificationSummaryContents(summary)).toBe(
-          ': 1, __proto__: 1, constructor: 1, crm: 2, hasOwnProperty: 1, toString: 1',
-        );
-        expect(core.notificationSummarySignalMetadata(summary)).toEqual({
-          signal: 'summary',
-          pending: 7,
-          groups: [
-            { source: '', count: 1 },
-            { source: '__proto__', count: 1 },
-            { source: 'constructor', count: 1 },
-            { source: 'crm', count: 2 },
-            { source: 'hasOwnProperty', count: 1 },
-            { source: 'toString', count: 1 },
-          ],
-          byPriority: { low: 3, medium: 2, high: 1, urgent: 1 },
-          notificationIds: ['n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n7'],
-          priority: 'urgent',
-        });
+      const terminal = core.summarizeNotifications([
+        record('n9', 'constructor', 'high', 'delivered'),
+      ]);
+      expect(terminal).toMatchObject({
+        threadId: 'thread-keys',
+        resourceId: 'resource-keys',
+        agentId: 'agent-keys',
+        pending: 0,
+        byPriority: {},
+        notificationIds: [],
       });
-
-      it('keeps the empty and no-pending shapes', () => {
-        const empty = core.summarizeNotifications([]);
-        expect(empty).toMatchObject({
-          threadId: '',
-          pending: 0,
-          byPriority: {},
-          notificationIds: [],
-        });
-        expect(Object.entries(empty.bySource)).toEqual([]);
-        expect(core.notificationSummaryContents(empty)).toBe(
-          'No pending notifications',
-        );
-        expect(core.notificationSummarySignalMetadata(empty)).toEqual({
-          signal: 'summary',
-          pending: 0,
-          groups: [],
-          byPriority: {},
-          notificationIds: [],
-        });
-
-        const terminal = core.summarizeNotifications([
-          record('n9', 'constructor', 'high', 'delivered'),
-        ]);
-        expect(terminal).toMatchObject({
-          threadId: 'thread-keys',
-          resourceId: 'resource-keys',
-          agentId: 'agent-keys',
-          pending: 0,
-          byPriority: {},
-          notificationIds: [],
-        });
-        expect(Object.entries(terminal.bySource)).toEqual([]);
-        expect(core.notificationSummaryContents(terminal)).toBe(
-          'No pending notifications',
-        );
-      });
-    },
-  );
+      expect(Object.entries(terminal.bySource)).toEqual([]);
+      expect(core.notificationSummaryContents(terminal)).toBe(
+        'No pending notifications',
+      );
+    });
+  });
 }
 
 for (const [label, core] of modules) {
-  describe.skipIf(!patched.get(label))(
-    `core notification delivery policy source lookup (${label})`,
-    () => {
-      const input = (
-        source: string,
-        priority: NotificationPriority = 'low',
-      ) => ({
-        record: record('p1', source, priority),
-        threadState: 'idle' as const,
-        now: CREATED_AT,
-      });
+  describe(`core notification delivery policy source lookup (${label})`, () => {
+    const input = (source: string, priority: NotificationPriority = 'low') => ({
+      record: record('p1', source, priority),
+      threadState: 'idle' as const,
+      now: CREATED_AT,
+    });
 
-      it.each(
-        POLICY_SOURCES,
-      )('falls through an empty source map to the default action for %s', async (source) => {
-        await expect(
-          core.resolveNotificationDeliveryDecision({
-            config: { sources: {}, default: 'discard' },
-            ...input(source),
-          }),
-        ).resolves.toEqual({ action: 'discard' });
-      });
+    it.each(
+      POLICY_SOURCES,
+    )('falls through an empty source map to the default action for %s', async (source) => {
+      await expect(
+        core.resolveNotificationDeliveryDecision({
+          config: { sources: {}, default: 'discard' },
+          ...input(source),
+        }),
+      ).resolves.toEqual({ action: 'discard' });
+    });
 
-      it('honors an explicit own source entry', async () => {
-        const config = {
-          sources: sourcePolicy([
-            ['constructor', 'persist'],
-            ['__proto__', 'queue'],
-          ]),
-          default: 'discard' as const,
-        };
-        await expect(
-          core.resolveNotificationDeliveryDecision({
-            config,
-            ...input('constructor'),
-          }),
-        ).resolves.toEqual({ action: 'persist' });
-        await expect(
-          core.resolveNotificationDeliveryDecision({
-            config,
-            ...input('__proto__'),
-          }),
-        ).resolves.toEqual({ action: 'queue' });
-        await expect(
-          core.resolveNotificationDeliveryDecision({
-            config,
-            ...input('toString'),
-          }),
-        ).resolves.toEqual({ action: 'discard' });
-      });
+    it('honors an explicit own source entry', async () => {
+      const config = {
+        sources: sourcePolicy([
+          ['constructor', 'persist'],
+          ['__proto__', 'queue'],
+        ]),
+        default: 'discard' as const,
+      };
+      await expect(
+        core.resolveNotificationDeliveryDecision({
+          config,
+          ...input('constructor'),
+        }),
+      ).resolves.toEqual({ action: 'persist' });
+      await expect(
+        core.resolveNotificationDeliveryDecision({
+          config,
+          ...input('__proto__'),
+        }),
+      ).resolves.toEqual({ action: 'queue' });
+      await expect(
+        core.resolveNotificationDeliveryDecision({
+          config,
+          ...input('toString'),
+        }),
+      ).resolves.toEqual({ action: 'discard' });
+    });
 
-      it('keeps decide precedence over the source map', async () => {
-        await expect(
-          core.resolveNotificationDeliveryDecision({
-            config: {
-              decide: () => 'deliver',
-              sources: sourcePolicy([['constructor', 'persist']]),
-              default: 'discard',
-            },
-            ...input('constructor'),
-          }),
-        ).resolves.toEqual({ action: 'deliver' });
-      });
+    it('keeps decide precedence over the source map', async () => {
+      await expect(
+        core.resolveNotificationDeliveryDecision({
+          config: {
+            decide: () => 'deliver',
+            sources: sourcePolicy([['constructor', 'persist']]),
+            default: 'discard',
+          },
+          ...input('constructor'),
+        }),
+      ).resolves.toEqual({ action: 'deliver' });
+    });
 
-      it('keeps the priority fallback between the source map and the default', async () => {
-        await expect(
-          core.resolveNotificationDeliveryDecision({
-            config: {
-              sources: {},
-              priorities: { low: 'queue' },
-              default: 'discard',
-            },
-            ...input('constructor'),
-          }),
-        ).resolves.toEqual({ action: 'queue' });
-      });
-    },
-  );
+    it('keeps the priority fallback between the source map and the default', async () => {
+      await expect(
+        core.resolveNotificationDeliveryDecision({
+          config: {
+            sources: {},
+            priorities: { low: 'queue' },
+            default: 'discard',
+          },
+          ...input('constructor'),
+        }),
+      ).resolves.toEqual({ action: 'queue' });
+    });
+  });
 }
 
 // Core's inline sender builds its own summary from the helper it imports
 // lexically and hands it straight to the thread runtime, so overriding
 // `agent.sendSignal` never observes it. It only summarizes while the thread is
 // active, which a registered run provides without any model call.
-describe.skipIf(!patched.get('esm'))(
-  'core inline notification summary sender',
-  () => {
-    it.each([
-      ['medium', 'constructor', 'active-batch-summary'],
-      ['high', '__proto__', 'active-high-summary-then-full'],
-    ] as const)('emits an own-keyed inline summary for an active %s notification', async (priority, source, reason) => {
-      // #given — an ordinary core agent with a run in flight
-      const { doGenerate, doStream, model } = unreachableModel();
-      const memory = new MockMemory();
-      const agent = new Agent({
-        id: 'inline-summary',
-        name: 'Inline summary',
-        instructions: 'Never runs.',
-        model,
-        memory,
+describe('core inline notification summary sender', () => {
+  it.each([
+    ['medium', 'constructor', 'active-batch-summary'],
+    ['high', '__proto__', 'active-high-summary-then-full'],
+  ] as const)('emits an own-keyed inline summary for an active %s notification', async (priority, source, reason) => {
+    // #given — an ordinary core agent with a run in flight
+    const { doGenerate, doStream, model } = unreachableModel();
+    const memory = new MockMemory();
+    const agent = new Agent({
+      id: 'inline-summary',
+      name: 'Inline summary',
+      instructions: 'Never runs.',
+      model,
+      memory,
+    });
+    const mastra = new Mastra({
+      storage: new InMemoryStore(),
+      agents: { 'inline-summary': agent },
+      logger: false,
+    });
+    const threadId = crypto.randomUUID();
+    const runtime = mastra.agentThreadStreamRuntime;
+    const pubsub = agent.getPubSub();
+
+    try {
+      await memory.saveThread({
+        thread: {
+          id: threadId,
+          resourceId: 'resource-keys',
+          createdAt: CREATED_AT,
+          updatedAt: CREATED_AT,
+          metadata: {},
+        },
       });
-      const mastra = new Mastra({
-        storage: new InMemoryStore(),
-        agents: { 'inline-summary': agent },
-        logger: false,
+      await agent.stream('active turn', {
+        runId: crypto.randomUUID(),
+        memory: { thread: threadId, resource: 'resource-keys' },
       });
-      const threadId = crypto.randomUUID();
-      const runtime = mastra.agentThreadStreamRuntime;
-      const pubsub = agent.getPubSub();
-
-      try {
-        await memory.saveThread({
-          thread: {
-            id: threadId,
-            resourceId: 'resource-keys',
-            createdAt: CREATED_AT,
-            updatedAt: CREATED_AT,
-            metadata: {},
-          },
-        });
-        await agent.stream('active turn', {
-          runId: crypto.randomUUID(),
-          memory: { thread: threadId, resource: 'resource-keys' },
-        });
-        await vi.waitFor(() =>
-          expect(
-            runtime.getThreadState(
-              { threadId, resourceId: 'resource-keys' },
-              pubsub,
-            ),
-          ).toBe('active'),
-        );
-        const emitted = vi.spyOn(runtime, 'sendSignal');
-
-        // #when
-        const result = await agent.sendNotificationSignal(
-          { source, kind: 'changed', summary: 'payload', priority },
-          {
-            threadId,
-            resourceId: 'resource-keys',
-            ifIdle: { behavior: 'persist' },
-          },
-        );
-
-        // #then — the emitted summary counts the colliding source once
-        expect(result.decision).toMatchObject({ action: 'summarize', reason });
-        const summaries = emitted.mock.calls
-          .map(([, signal]) => signal)
-          .filter((signal) => signal.tagName === 'notification-summary');
-        expect(summaries.map((signal) => signal.contents)).toEqual([
-          `${source}: 1`,
-        ]);
+      await vi.waitFor(() =>
         expect(
-          (summaries[0]?.metadata as { notification?: unknown } | undefined)
-            ?.notification,
-        ).toEqual({
-          signal: 'summary',
-          pending: 1,
-          groups: [{ source, count: 1 }],
-          byPriority: { [priority]: 1 },
-          notificationIds: [result.record.id],
-          priority,
-        });
-        // A summarized high notification keeps its full-delivery cursor; a medium
-        // one has none to keep.
-        const { deliverAt } = result.decision as { deliverAt?: Date };
-        if (priority === 'high') expect(deliverAt).toBeInstanceOf(Date);
-        else expect(deliverAt).toBeUndefined();
-        expect(doStream).not.toHaveBeenCalled();
-        expect(doGenerate).not.toHaveBeenCalled();
-      } finally {
-        runtime.abortThread({ threadId, resourceId: 'resource-keys' }, pubsub);
-      }
-      expect(unhandled).toEqual([]);
-    });
-  },
-);
+          runtime.getThreadState(
+            { threadId, resourceId: 'resource-keys' },
+            pubsub,
+          ),
+        ).toBe('active'),
+      );
+      const emitted = vi.spyOn(runtime, 'sendSignal');
 
-describe.skipIf(!patched.get('esm'))(
-  'ordinary core agent delivery policy',
-  () => {
-    it.each([
-      'ordinary',
-      'constructor',
-      'toString',
-      '__proto__',
-    ] as const)('discards %s under an empty source map with a discard default', async (source) => {
-      const agent = await policyAgent({ sources: {}, default: 'discard' });
+      // #when
+      const result = await agent.sendNotificationSignal(
+        { source, kind: 'changed', summary: 'payload', priority },
+        {
+          threadId,
+          resourceId: 'resource-keys',
+          ifIdle: { behavior: 'persist' },
+        },
+      );
 
-      const result = await agent.send(source, 'low');
-
-      expect(result.record.status).toBe('discarded');
-      expect(result.decision).toMatchObject({ action: 'discard' });
-      expect(await agent.messages()).toHaveLength(0);
-      expect(agent.doGenerate).not.toHaveBeenCalled();
-      expect(agent.doStream).not.toHaveBeenCalled();
-    });
-
-    it('honors an explicit own source entry through the sender', async () => {
-      const agent = await policyAgent({
-        sources: sourcePolicy([['constructor', 'persist']]),
-        default: 'discard',
+      // #then — the emitted summary counts the colliding source once
+      expect(result.decision).toMatchObject({ action: 'summarize', reason });
+      const summaries = emitted.mock.calls
+        .map(([, signal]) => signal)
+        .filter((signal) => signal.tagName === 'notification-summary');
+      expect(summaries.map((signal) => signal.contents)).toEqual([
+        `${source}: 1`,
+      ]);
+      expect(
+        (summaries[0]?.metadata as { notification?: unknown } | undefined)
+          ?.notification,
+      ).toEqual({
+        signal: 'summary',
+        pending: 1,
+        groups: [{ source, count: 1 }],
+        byPriority: { [priority]: 1 },
+        notificationIds: [result.record.id],
+        priority,
       });
+      // A summarized high notification keeps its full-delivery cursor; a medium
+      // one has none to keep.
+      const { deliverAt } = result.decision as { deliverAt?: Date };
+      if (priority === 'high') expect(deliverAt).toBeInstanceOf(Date);
+      else expect(deliverAt).toBeUndefined();
+      expect(doStream).not.toHaveBeenCalled();
+      expect(doGenerate).not.toHaveBeenCalled();
+    } finally {
+      runtime.abortThread({ threadId, resourceId: 'resource-keys' }, pubsub);
+    }
+    expect(unhandled).toEqual([]);
+  });
+});
 
-      const result = await agent.send('constructor', 'low');
+describe('ordinary core agent delivery policy', () => {
+  it.each([
+    'ordinary',
+    'constructor',
+    'toString',
+    '__proto__',
+  ] as const)('discards %s under an empty source map with a discard default', async (source) => {
+    const agent = await policyAgent({ sources: {}, default: 'discard' });
 
-      expect(result.record.status).toBe('pending');
-      expect(result.decision).toMatchObject({ action: 'persist' });
-      expect(agent.doGenerate).not.toHaveBeenCalled();
-      expect(agent.doStream).not.toHaveBeenCalled();
+    const result = await agent.send(source, 'low');
+
+    expect(result.record.status).toBe('discarded');
+    expect(result.decision).toMatchObject({ action: 'discard' });
+    expect(await agent.messages()).toHaveLength(0);
+    expect(agent.doGenerate).not.toHaveBeenCalled();
+    expect(agent.doStream).not.toHaveBeenCalled();
+  });
+
+  it('honors an explicit own source entry through the sender', async () => {
+    const agent = await policyAgent({
+      sources: sourcePolicy([['constructor', 'persist']]),
+      default: 'discard',
     });
 
-    it('keeps decide precedence and the priority fallback through the sender', async () => {
-      const decided = await policyAgent({
-        decide: () => 'queue',
-        sources: {},
-        default: 'discard',
-      });
-      const decidedResult = await decided.send('constructor', 'low');
-      expect(decidedResult.decision).toMatchObject({ action: 'queue' });
-      expect(decided.doGenerate).not.toHaveBeenCalled();
+    const result = await agent.send('constructor', 'low');
 
-      const prioritized = await policyAgent({
-        sources: {},
-        priorities: { low: 'queue' },
-        default: 'discard',
-      });
-      const prioritizedResult = await prioritized.send('constructor', 'low');
-      expect(prioritizedResult.decision).toMatchObject({ action: 'queue' });
-      expect(prioritized.doGenerate).not.toHaveBeenCalled();
+    expect(result.record.status).toBe('pending');
+    expect(result.decision).toMatchObject({ action: 'persist' });
+    expect(agent.doGenerate).not.toHaveBeenCalled();
+    expect(agent.doStream).not.toHaveBeenCalled();
+  });
+
+  it('keeps decide precedence and the priority fallback through the sender', async () => {
+    const decided = await policyAgent({
+      decide: () => 'queue',
+      sources: {},
+      default: 'discard',
     });
-  },
-);
+    const decidedResult = await decided.send('constructor', 'low');
+    expect(decidedResult.decision).toMatchObject({ action: 'queue' });
+    expect(decided.doGenerate).not.toHaveBeenCalled();
+
+    const prioritized = await policyAgent({
+      sources: {},
+      priorities: { low: 'queue' },
+      default: 'discard',
+    });
+    const prioritizedResult = await prioritized.send('constructor', 'low');
+    expect(prioritizedResult.decision).toMatchObject({ action: 'queue' });
+    expect(prioritized.doGenerate).not.toHaveBeenCalled();
+  });
+});

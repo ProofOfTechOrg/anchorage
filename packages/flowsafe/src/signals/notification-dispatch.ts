@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import {
-  type NotificationRecord,
-  type NotificationsStorage,
-  resolveNotificationDeliveryDecision,
-  summarizeNotifications,
+import type {
+  NotificationRecord,
+  NotificationsStorage,
 } from '@mastra/core/notifications';
 
 import type { ActorContext } from '../approval-api/index.js';
@@ -451,70 +449,6 @@ export function captureNotificationDeliveryStorage(
   };
 }
 
-// Guarded reaches into Core's patched functions: the thread-DO dispatch
-// route's summary group, the notification ingestion gate's prospective
-// summary, and Core's inline sender behind agent.sendNotificationSignal.
-// Unpatched, a source named after an Object.prototype member is miscounted in
-// the summary a receipt is recorded against, and Core's own source-policy
-// lookup resolves an inherited entry instead of the configured action. A
-// behaviour probe rather than a prototype check lets any correct upstream fix
-// pass. The record is the getting-started guide's confirmation record.
-const SOURCE_KEY_PROBE: NotificationRecord = {
-  id: 'n',
-  threadId: 't',
-  source: 'constructor',
-  kind: 'k',
-  priority: 'low',
-  status: 'pending',
-  summary: 's',
-  createdAt: new Date(0),
-  updatedAt: new Date(0),
-};
-// The getting-started citation both patch refusals carry.
-const PATCH_CITATION =
-  'apply it at the application root (getting started: "Apply the flowsafe patch to @mastra/core")';
-
-let sourceKeysPatched: boolean | undefined;
-
-export function assertNotificationSourceKeysPatched(): void {
-  sourceKeysPatched ??=
-    typeof summarizeNotifications([SOURCE_KEY_PROBE]).bySource.constructor ===
-    'number';
-  if (!sourceKeysPatched) {
-    throw new TypeError(
-      `notification dispatch requires the @mastra/core patch flowsafe ships; ${PATCH_CITATION}`,
-    );
-  }
-}
-
-let deliveryPolicyPatched: Promise<boolean> | undefined;
-
-/**
- * The second subject of the @mastra/core patch: the source-policy lookup in
- * resolveNotificationDeliveryDecision guards its own keys, so a source named
- * after an Object.prototype member resolves the configured default instead
- * of the inherited member. The lookup is asynchronous, so this probe is the
- * async sibling of assertNotificationSourceKeysPatched, awaited at the
- * ingestion gate, whose delivery runs through agent.sendNotificationSignal
- * and reaches that lookup.
- */
-export async function assertNotificationDeliveryPolicyPatched(): Promise<void> {
-  deliveryPolicyPatched ??= resolveNotificationDeliveryDecision({
-    config: { sources: {}, default: 'discard' },
-    record: SOURCE_KEY_PROBE,
-    threadState: 'idle',
-    now: new Date(0),
-  }).then(
-    (decision) => decision.action === 'discard',
-    () => false,
-  );
-  if (!(await deliveryPolicyPatched)) {
-    throw new TypeError(
-      `notification ingestion requires the @mastra/core patch flowsafe ships; ${PATCH_CITATION}`,
-    );
-  }
-}
-
 function errorMessage(error: unknown): string {
   try {
     return String(error instanceof Error ? error.message : error);
@@ -733,7 +667,6 @@ export function createNotificationDispatchTick(
   const { storage } = options;
   const deliveryStorage = captureNotificationDeliveryStorage(storage);
   if (limit === 0) return async () => ({ due: 0, delivered: 0, failed: 0 });
-  assertNotificationSourceKeysPatched();
   const { topology, resolveContext, now: clock, executionFence } = options;
   return async () => {
     // The fence, before the due read and before any delivery. This runs on a

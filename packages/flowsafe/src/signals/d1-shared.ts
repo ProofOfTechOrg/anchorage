@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Track C (M-004) — the D1 seam the flowsafe-owned signal domains
 // (D1NotificationsStorage, D1ThreadStateStorage) share. @mastra/cloudflare-d1
-// 1.1.1 ships NO notifications/thread-state domain (unlike backgroundTasks), so
+// 1.3.2 ships NO notifications/thread-state domain (unlike backgroundTasks), so
 // these two are hand-written to mirror core's abstract domain + InMemory
 // reference — the project's "custom state store" caveat does not bite here
 // because Mastra's own D1 adapter simply does not own these tables.

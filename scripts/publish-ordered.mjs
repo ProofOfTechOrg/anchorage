@@ -145,8 +145,8 @@ function compareVersions(left, right) {
 /**
  * Release-only version gate, wired through publishRelease after the Version
  * Packages PR. Between a floor raise and that PR, the source tree legitimately
- * fails it: Flowsafe requires Breakwater >=0.13.0 while the pending changeset
- * `.changeset/silver-hounds-listen.md` still leaves Breakwater at 0.12.0.
+ * fails it: Flowsafe requires Breakwater >=0.15.0 while the pending changeset
+ * `.changeset/lucky-moons-attend.md` still leaves Breakwater at 0.14.0.
  */
 export function prerequisitePeerFloorViolations(manifests) {
   const missingEdge = missingPrerequisitePeerEdge(manifests);

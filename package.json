@@ -90,9 +90,6 @@
       "miniflare@5.20260730.0-alpha>workerd": "1.20260903.1",
       "nanoid@3": "3.3.17",
       "undici": "7.29.0"
-    },
-    "patchedDependencies": {
-      "@mastra/core@1.53.0": "packages/flowsafe/patches/@mastra__core@1.53.0.patch"
     }
   }
 }
