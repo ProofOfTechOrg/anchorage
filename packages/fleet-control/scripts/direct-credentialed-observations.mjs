@@ -41,8 +41,8 @@ export class DirectObservationError extends Error {
 function refuse(code = 'observation-mismatch') {
   throw new DirectObservationError(code);
 }
-// Releases a body no one will read, handing the cancellation the refusal that
-// reached the exit. Not awaited: a hostile source can hang its own cancel.
+// Releases the response body the refusal leaves unread, handing the source
+// that same refusal.
 function cancelAndRefuse(response) {
   const refusal = new DirectObservationError('observation-mismatch');
   cancelBodyWithoutAwait(response?.body, refusal);

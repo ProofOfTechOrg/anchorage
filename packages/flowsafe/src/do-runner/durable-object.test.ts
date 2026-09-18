@@ -3568,7 +3568,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
     });
     const env = makeProductionEnv();
     // An abandoned start attempt: recovery releases the claim and clears the
-    // journal, which is the branch that used to delete the alarm outright.
+    // journal, the branch closest to deleting the alarm outright.
     env.runtime = {
       recoverStartAttempt: vi.fn(async () => null),
       ...statusStub(async () => null),
@@ -3653,7 +3653,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
     expect(storedDeadlines(values)?.entries).toEqual([
       armedEntry('gate', movedAt),
     ]);
-    // #then — a discarded deadline is observable; it used to vanish in silence
+    // #then — a discarded deadline is observable, not silent
     expect(
       logged.some((message) =>
         message.includes(
@@ -4184,9 +4184,9 @@ describe('DurableObjectRunner suspension deadlines', () => {
     }
 
     // #then — no conclusion drawn from a read that never reached storage. The
-    // fallback presents no provenance and a 'pending' status, which used to
-    // walk straight into the abandoned-shell branch and DELETE a live row and
-    // its snapshot behind a lagging read.
+    // fallback presents no provenance and a 'pending' status, the shape the
+    // abandoned-shell branch would DELETE a live row and its snapshot from
+    // behind a lagging read.
     expect(deletes.calls()).toBe(0);
     expect(settle).not.toHaveBeenCalled();
     expect(values.has('flowsafe:run-owner-recovery:v1')).toBe(true);
@@ -4293,10 +4293,10 @@ describe('DurableObjectRunner suspension deadlines', () => {
       }),
     );
 
-    // #then — retryable, and no second run: this route used to refuse with a
-    // 500 (`has no matching committed owner`) once the same recovery had
-    // deleted the row and released its claim behind the lagging read. The
-    // journal survives for a wake that can read it.
+    // #then — retryable, and no second run: a 500 (`has no matching committed
+    // owner`) is what this route gives when the same recovery deletes the row
+    // and releases its claim behind the lagging read. The journal survives for
+    // a wake that can read it.
     expect(response.status).toBe(503);
     await expect(response.json()).resolves.toMatchObject({
       error: expect.stringContaining('state is not readable'),
@@ -4885,10 +4885,9 @@ describe('DurableObjectRunner suspension deadlines', () => {
   it('clears the record on a terminal deadline route that transitions nothing', async () => {
     const { state, values } = durableKeyValueStorageFixture();
     const env = makeProductionEnv();
-    // A deadline request whose compare-and-swap no longer matches: the route
-    // returns the current terminal summary without finalizing, and it is the
-    // one terminal path that used to leave the record armed for a run that can
-    // never suspend again.
+    // A deadline request whose compare-and-swap does not match: the route
+    // returns the current terminal summary without finalizing, a terminal path
+    // that can leave the record armed for a run that can never suspend again.
     env.runtime = {
       cancelActiveExecution: vi.fn(async () => undefined),
       ...statusStub(async () => ({ runId: 'run-noop', status: 'timed_out' })),
@@ -5323,8 +5322,8 @@ describe('DurableObjectRunner suspension deadlines', () => {
       log.mockRestore();
     }
 
-    // #then — the deadline fired: the entry was recognized, not treated as a
-    // moved fence and dropped, which is how it used to disappear in silence.
+    // #then — the deadline fired: the entry is recognized, not treated as a
+    // moved fence and dropped, which is how it disappears in silence.
     const status = await runner.fetch(
       deploymentIdentityRequest('http://do/runs/timed-dotted/run-dotted'),
     );
@@ -5589,9 +5588,9 @@ describe('DurableObjectRunner suspension deadlines', () => {
     const suspendedAt = started.suspendedAt?.gate as number;
 
     // #then — the start succeeded, the run is suspended with a derivable
-    // deadline, and nothing recorded it. Settling the reservation used to
-    // happen first and re-arm from storage, finding neither record nor journal
-    // and DELETING the alarm: no record, no wake, deadline lost forever.
+    // deadline, and nothing recorded it. Settling the reservation first would
+    // re-arm from storage, find neither record nor journal and DELETE the
+    // alarm: no record, no wake, deadline lost forever.
     expect(started.status).toBe('suspended');
     expect(storedDeadlines(values)).toBeUndefined();
     expect(events).not.toContain('deleteAlarm');
@@ -6030,10 +6029,10 @@ describe('DurableObjectRunner suspension deadlines', () => {
     ['an empty runId', 'timed:'],
     ['an empty workflowId', ':run'],
   ])('never lets an object name with %s steer a status read on a no-record wake', async (_label, name) => {
-    // 'a/b:c' used to reach status('a/b', 'c'): every other entry point
-    // validates with isPathSafeId before touching the runtime, and a record
-    // written from an unvalidated name would discard itself on read-back.
-    // The other four shapes were already skipped — regression pins.
+    // 'a/b:c' splits into status('a/b', 'c') unless the name is validated:
+    // every other entry point validates with isPathSafeId before touching the
+    // runtime, and a record written from an unvalidated name would discard
+    // itself on read-back. The other four shapes are skipped — regression pins.
     const events: string[] = [];
     const { storage } = durableKeyValueStorageFixture(events);
     const state = { id: { name }, storage } as unknown as DurableObjectState;

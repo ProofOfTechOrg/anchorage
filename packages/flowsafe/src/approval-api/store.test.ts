@@ -60,7 +60,7 @@ function d1Like(db: SqliteDatabase): ApprovalDatabase {
       // D1-shaped envelope: real D1's run() resolves { meta: { changes } },
       // not node:sqlite's raw { changes } — a caller reading changes via
       // d1Changes()'s meta.changes optional chain would silently see 0
-      // without this wrap (latent here since no test used to read it; see
+      // without this wrap (a test that reads changes is what observes it; see
       // retention.test.ts's purgeExpired coverage).
       run: async () => {
         const outcome = db.prepare(sql).run(...params) as {
@@ -484,10 +484,10 @@ function describeStoreContract(
     });
 
     it('throws on a garbage time bound with ZERO matching records too (F6: eager validation)', async () => {
-      // #given — an EMPTY bound store: no record reaches matchesFilter, so the
-      // in-memory list() used to skip the per-record parse and return [] where
-      // D1's appendListFilters throws unconditionally (types.ts: both backends
-      // fail identically). Eager validation closes that lazy hole.
+      // #given — an EMPTY bound store: no record reaches matchesFilter, so a
+      // per-record parse never runs; a lazy in-memory list() would return []
+      // where D1's appendListFilters throws unconditionally (types.ts: both
+      // backends fail identically). Eager validation closes that lazy hole.
       const store = await makeStore();
 
       // #when / #then — a loud throw on both backends, not a silent empty page
@@ -517,8 +517,8 @@ function describeStoreContract(
       // #given — one shared createdAt; ids differing only in case pin the
       // collation: 'B' (0x42) < 'a' (0x61) bytewise (SQLite BINARY, the
       // cursor row-value compare, compareStrings), but 'a' < 'B' under a
-      // locale collation — the old in-memory localeCompare sort disagreed
-      // with D1 here
+      // locale collation — a localeCompare sort in memory diverges from D1
+      // exactly here
       const store = await makeStore();
       const bytewiseFirst = makeRecord({ id: 'tie-B', runId: 'r-tie-1' });
       const bytewiseSecond = makeRecord({ id: 'tie-a', runId: 'r-tie-2' });
@@ -1504,8 +1504,8 @@ describe('D1ApprovalStore schema upgrade', () => {
   });
 
   it('a legacy step-less approval (no run_scoped) mints NOTHING on the upgraded table', async () => {
-    // #given — an older single-deployment table holding exactly the record
-    // the OLD grant rule treated as a run-wide standing grant
+    // #given — an older single-deployment table holding exactly the record a
+    // run-wide standing-grant rule would mint from
     const sqlite = openSqlite();
     sqlite.prepare(SINGLE_DEPLOYMENT_LEGACY_DDL).run();
     sqlite

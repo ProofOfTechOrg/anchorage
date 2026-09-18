@@ -776,8 +776,8 @@ export class ApprovalService {
    * change loosened the fingerprint check.
    *
    * router.ts does not route it. The in-repo reconcile path calls
-   * supersedeStaleAsPrincipal instead (host-kit/approval-bridge.ts:360,
-   * :454); this is the ApprovalActor form of the same transition. Authorized
+   * supersedeStaleAsPrincipal instead (host-kit/approval-bridge.ts); this is
+   * the ApprovalActor form of the same transition. Authorized
    * like create() (CAN_CREATE, not CAN_REVIEW): superseding is the "un-file"
    * half of the same filing operation, not a reviewer decision.
    *

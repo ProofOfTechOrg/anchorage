@@ -1,8 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { promisify } from 'node:util';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from 'vitest';
 import {
   observeDirectWorkerVersion,
   readDirectSettlementEffects,
@@ -834,61 +843,76 @@ describe('normal export raw-byte proof', () => {
     });
   });
 
-  it('releases the unread export body the refusal leaves behind', async () => {
-    const f = await fixture();
-    const input = await f.exportInput();
-    const releases: unknown[] = [];
-    f.hook(
-      () =>
-        new Response(
-          new ReadableStream({
-            start(controller) {
-              controller.enqueue(Buffer.from(SQL_SENTINEL));
-            },
-            cancel(reason) {
-              releases.push(reason);
-            },
-          }),
-          { status: 206 },
+  describe('releases through the body-cancel leaf', () => {
+    beforeAll(() => {
+      expect(
+        existsSync(
+          new URL('../dist/database-export-store.js', import.meta.url),
         ),
-    );
-    await expect(verifyDirectDecommissionExport(input)).rejects.toMatchObject(
-      errorShape,
-    );
-    // The first release in a process waits on the body-cancel leaf's own load.
-    await vi.waitFor(() => {
-      expect(releases).toHaveLength(1);
+        'run pnpm --filter @proofoftech/fleet-control build before this block',
+      ).toBe(true);
     });
-    expect(f.requests).toHaveLength(1);
-  });
 
-  it('hands the refusal to the source as the export body cancel reason', async () => {
-    const f = await fixture();
-    const input = await f.exportInput();
-    const releases: unknown[] = [];
-    f.hook(
-      () =>
-        new Response(
-          new ReadableStream({
-            start(controller) {
-              controller.enqueue(Buffer.from(SQL_SENTINEL));
-            },
-            cancel(reason) {
-              releases.push(reason);
-            },
-          }),
-          { headers: { 'content-length': '1' } },
-        ),
-    );
-    await expect(verifyDirectDecommissionExport(input)).rejects.toMatchObject({
-      code: 'observation-mismatch',
+    it('releases the unread export body the refusal leaves behind', async () => {
+      const f = await fixture();
+      const input = await f.exportInput();
+      const releases: unknown[] = [];
+      f.hook(
+        () =>
+          new Response(
+            new ReadableStream({
+              start(controller) {
+                controller.enqueue(Buffer.from(SQL_SENTINEL));
+              },
+              cancel(reason) {
+                releases.push(reason);
+              },
+            }),
+            { status: 206 },
+          ),
+      );
+      await expect(verifyDirectDecommissionExport(input)).rejects.toMatchObject(
+        errorShape,
+      );
+      // A release issued before the leaf's load resolves is deferred to it.
+      await vi.waitFor(() => {
+        expect(releases).toHaveLength(1);
+      });
+      expect(f.requests).toHaveLength(1);
     });
-    expect(releases).toEqual([
-      expect.objectContaining({
-        name: 'DirectObservationError',
-        message: 'observation-mismatch',
-      }),
-    ]);
+
+    it('hands the refusal to the source as the export body cancel reason', async () => {
+      const f = await fixture();
+      const input = await f.exportInput();
+      const releases: unknown[] = [];
+      f.hook(
+        () =>
+          new Response(
+            new ReadableStream({
+              start(controller) {
+                controller.enqueue(Buffer.from(SQL_SENTINEL));
+              },
+              cancel(reason) {
+                releases.push(reason);
+              },
+            }),
+            { headers: { 'content-length': '1' } },
+          ),
+      );
+      await expect(verifyDirectDecommissionExport(input)).rejects.toMatchObject(
+        {
+          code: 'observation-mismatch',
+        },
+      );
+      await vi.waitFor(() => {
+        expect(releases.at(-1)).toEqual(
+          expect.objectContaining({
+            name: 'DirectObservationError',
+            message: 'observation-mismatch',
+          }),
+        );
+      });
+    });
   });
 
   it('derives exact R2 key and returns frozen receipt with source ordinal', async () => {

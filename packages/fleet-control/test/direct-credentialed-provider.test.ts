@@ -1,6 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from 'vitest';
 import { cancelBodyWithoutAwait } from '../scripts/direct-credentialed-body-cancel.mjs';
 import {
   openDirectProviderSession,
@@ -159,6 +170,13 @@ it('requests identity encoding for the export object GET through the native SDK'
 });
 
 describe('the body-cancel leaf', () => {
+  beforeAll(() => {
+    expect(
+      existsSync(new URL('../dist/database-export-store.js', import.meta.url)),
+      'run pnpm --filter @proofoftech/fleet-control build before this block',
+    ).toBe(true);
+  });
+
   it('hands the body and the reason to the built package on first call', async () => {
     const cancel = vi.fn(() => Promise.resolve());
     const reason = new Error('refusal');
@@ -166,15 +184,15 @@ describe('the body-cancel leaf', () => {
     await new Promise((resolve) => {
       setImmediate(resolve);
     });
-    // The first call is what loads the built module, so the release lands a
-    // filesystem read later rather than on the next turn.
+    // The load starts at module evaluation, so a release issued before it
+    // resolves lands with it rather than on the next turn.
     await vi.waitFor(() => {
       expect(cancel).toHaveBeenCalledTimes(1);
     });
     expect(cancel).toHaveBeenCalledWith(reason);
   });
 
-  it('issues every release after the first in the calling turn', async () => {
+  it("issues a release in the calling turn once the leaf's load has resolved", async () => {
     const first = vi.fn(() => Promise.resolve());
     cancelBodyWithoutAwait({ cancel: first }, new Error('warm'));
     await vi.waitFor(() => {
@@ -204,5 +222,66 @@ describe('the body-cancel leaf', () => {
     await vi.waitFor(() => {
       expect(reads).toBe(1);
     });
+  });
+});
+
+// The `dist/` edge the credentialed CLI entries carry is the leaf's dynamic
+// `import()`, which resolves at runtime and leaves the static module graph
+// free of `dist/`. This walk follows `from`-clause specifiers only, so it
+// permits that `import()` and refuses a static specifier that would replace
+// it. It reads the CLI's own source tree and decides nothing about what a
+// tenant artifact may import.
+describe('the credentialed CLI entry module graphs', () => {
+  const packageRoot = fileURLToPath(new URL('..', import.meta.url));
+  const distPrefix = `${resolve(packageRoot, 'dist')}${sep}`;
+  const leaf = resolve(
+    packageRoot,
+    'scripts/direct-credentialed-body-cancel.mjs',
+  );
+  const edge =
+    /(?:^|\n)\s*(?:import|export)[^;'"]*?\bfrom\s*['"]([^'"]+)['"]/gu;
+
+  function sourceOf(file: string) {
+    try {
+      return readFileSync(file, 'utf8');
+    } catch {
+      // A relative specifier naming no readable file — a `.ts` module read
+      // through its `.js` specifier — ends the walk at that path. The
+      // specifier itself is still checked by the caller.
+      return undefined;
+    }
+  }
+
+  function staticGraph(entry: string) {
+    const read = new Set<string>();
+    const targets = new Set<string>();
+    const queue = [resolve(packageRoot, entry)];
+    while (queue.length > 0) {
+      const file = queue.pop();
+      if (file === undefined || read.has(file)) continue;
+      const source = sourceOf(file);
+      if (source === undefined) continue;
+      read.add(file);
+      for (const match of source.matchAll(edge)) {
+        const specifier = match[1] ?? '';
+        if (!specifier.startsWith('./') && !specifier.startsWith('../'))
+          continue;
+        const target = resolve(dirname(file), specifier);
+        targets.add(target);
+        queue.push(target);
+      }
+    }
+    return { read, targets };
+  }
+
+  it.each([
+    'scripts/direct-credentialed-conformance.mjs',
+    'scripts/credentialed-conformance.mjs',
+  ])('names no dist/ specifier from %s', (entry) => {
+    const { read, targets } = staticGraph(entry);
+    expect([...read]).toContain(leaf);
+    expect(
+      [...targets].filter((target) => target.startsWith(distPrefix)),
+    ).toEqual([]);
   });
 });

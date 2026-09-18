@@ -310,12 +310,11 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-// Releases a body the refusal leaves unread, handing the cancellation that
-// same refusal. Not awaited: a hostile source can hang its own cancel.
+// Releases a body the refusal leaves unread, handing it that same refusal.
 function assertResponse(response, condition, message) {
   if (condition) return;
   const refusal = new Error(message);
-  cancelBodyWithoutAwait(response.body, refusal);
+  cancelBodyWithoutAwait(response?.body, refusal);
   throw refusal;
 }
 
@@ -867,7 +866,7 @@ async function assertEgressAndLimitProbes(deployment) {
     `CPU over-limit request returned ${overLimit.status}`,
   );
   // The over-limit probe reads the status alone.
-  cancelBodyWithoutAwait(overLimit.body);
+  cancelBodyWithoutAwait(overLimit?.body);
   const recovery = await contractRequest(deployment, 'cpu-control');
   assert(
     recovery.completed === true,

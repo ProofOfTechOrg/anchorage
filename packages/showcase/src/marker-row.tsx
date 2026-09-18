@@ -1,6 +1,5 @@
-// The one marker+text row primitive behind the explainer surfaces — the
-// landing's demo points, the tour steps, and the reality legend — extracted
-// on the third copy so their row styling cannot drift apart.
+// A marker glyph beside its text, in the row styling the explainer surfaces
+// share.
 
 import { HStack } from '@astryxdesign/core/HStack';
 import { Text } from '@astryxdesign/core/Text';

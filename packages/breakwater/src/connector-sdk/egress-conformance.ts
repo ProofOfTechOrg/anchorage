@@ -567,7 +567,7 @@ const MANIFEST_MEMBER_SET: Record<keyof PermissionManifest, true> = {
 
 const MANIFEST_MEMBERS = Object.keys(
   MANIFEST_MEMBER_SET,
-) as (keyof PermissionManifest)[];
+) as readonly (keyof PermissionManifest)[];
 
 function manifestsMatch(
   claimed: PermissionManifest,

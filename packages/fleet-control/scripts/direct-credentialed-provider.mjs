@@ -98,6 +98,12 @@ function providerTransport(fetchRequest, timeoutMs) {
       let abort;
       let timer;
       let rawReader;
+      // `reason` is the refusal that ended this request. The `pull` catch,
+      // the outer catch and the bounded stream's `cancel(reason)` hold one
+      // and pass it. `close()` and the `chunk.done` arm run on completion,
+      // and the JSON proxy's `finally` runs on success as well as failure,
+      // so they call it bare. The deadline timer aborts without a reason:
+      // a budget is not a refusal.
       const finish = (reason) => {
         clearTimeout(timer);
         signal.removeEventListener('abort', abort);
@@ -163,7 +169,7 @@ function providerTransport(fetchRequest, timeoutMs) {
                   output.enqueue(chunk.value);
                 } catch (error) {
                   output.error(error);
-                  finish();
+                  finish(error);
                 }
               },
               cancel(reason) {
@@ -214,7 +220,7 @@ function providerTransport(fetchRequest, timeoutMs) {
           },
         });
       } catch (error) {
-        finish();
+        finish(error);
         throw error;
       }
     },

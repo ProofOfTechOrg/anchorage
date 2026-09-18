@@ -4,10 +4,8 @@
     "noEmit": true,
     // tsc enforces rootDir even under noEmit, so it has to cover
     // vitest.config.ts, which sits beside this file rather than under src. The
-    // value is the repo root rather than the package directory so the package
-    // test programs agree on one value: packages/flowsafe/tsconfig.test.json
-    // and packages/showcase/tsconfig.worker.json both widen to the repo root
-    // for the source they admit from outside their own package.
+    // repository root is a bound wide enough to cover the program's inputs
+    // wherever they sit, so the value does not move when they do.
     "rootDir": "../..",
     // Tests run under Node via vitest; vitest 4 no longer leaks timer globals
     // through its own types, so the test program needs Node's. The build

@@ -6,7 +6,7 @@
   },
   // Membership rule: a harness file that no package program compiles belongs
   // here — the Workers-pool suites, their support modules, and the vitest
-  // configs that declare them, package-local ones included. `tsc` skips an
+  // configs that declare them. `tsc` skips an
   // `include` entry that matches no file, so
   // `scripts/architecture-positive-controls.test.mjs` asserts each entry
   // resolves.

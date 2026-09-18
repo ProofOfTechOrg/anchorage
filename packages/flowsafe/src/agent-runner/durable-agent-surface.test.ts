@@ -177,7 +177,7 @@ const nonExecution = [
   // oracle for a run id the caller may not own. Both stay classified on the
   // Agent level too: they are on Agent.prototype at the pin and shadowed here
   // only at 1.67.0. Breakwater's narrowed handle omits both
-  // (agent.test.ts:828-829, in `intentionallyUnavailable`), a divergence
+  // (agent.test.ts, in `intentionallyUnavailable`), a divergence
   // running the opposite way to the ones durable-agent-runner.ts records, where
   // breakwater is the weaker side: a handle can omit a member, while an
   // instance Mastra calls in-process can only refuse it, and neither of these
@@ -1168,9 +1168,9 @@ describe('FlowsafeDurableAgent prototype surface inventory', () => {
   });
 
   it('keeps the runner module comment naming every blocked entry', () => {
-    // #given docs/maintainer-guide.md names two mirrors that a core bump
-    // updates from the reason table in the same commit; the document above is
-    // one and the runner's own module comment is the other. That comment is
+    // #given docs/maintainer-guide.md names the mirrors a core bump updates
+    // from the reason table in the same commit; the document above is one and
+    // the runner's own module comment is another. That comment is
     // the contiguous leading `//` block of durable-agent-runner.ts — from the
     // top to the first line that does not start with `//`. The boundary is
     // what keeps this honest: the block ends above the file's first import,
@@ -1199,7 +1199,7 @@ describe('FlowsafeDurableAgent prototype surface inventory', () => {
     // all, and naming one is not an error.
     expect(
       blockedEntries.filter((method) => !named.has(method)),
-      'BLOCKED_RUN_ENTRIES names an entry the runner module comment does not. docs/maintainer-guide.md makes the reason table authoritative and this comment one of its two mirrors, updated from the table in the same commit — never left to drift behind it.',
+      'BLOCKED_RUN_ENTRIES names an entry the runner module comment does not. docs/maintainer-guide.md makes the reason table authoritative and this comment one of its mirrors, updated from the table in the same commit — never left to drift behind it.',
     ).toEqual([]);
   });
 

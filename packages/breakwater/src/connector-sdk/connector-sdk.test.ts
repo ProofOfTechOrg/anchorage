@@ -29,6 +29,7 @@ import {
   ConnectorEvaluatorError,
   ConnectorInvocationError,
   type ConnectorInvocationOptions,
+  type ConnectorPolicies,
   ConnectorPolicyError,
   ConnectorStoreError,
   ConnectorValidationError,
@@ -626,6 +627,33 @@ function countingConfig(
   return { config, reads: () => reads };
 }
 
+// The same count over one caller-supplied `policies` member.
+function countingPolicies(
+  field: keyof ConnectorPolicies,
+  overrides: Partial<ConnectorConfig> = {},
+): { config: ConnectorConfig; reads: () => number } {
+  const policies: ConnectorPolicies = { ...overrides.policies };
+  const value = policies[field];
+  let reads = 0;
+  Object.defineProperty(policies, field, {
+    configurable: true,
+    enumerable: true,
+    get() {
+      reads += 1;
+      return value;
+    },
+  });
+  const config: ConnectorConfig = {
+    id: 'salesforce.createContact',
+    description: 'Create a Salesforce contact',
+    execute: async () => ({ ok: true }),
+    permissions: { sideEffect: 'write' },
+    ...overrides,
+    policies,
+  };
+  return { config, reads: () => reads };
+}
+
 describe('caller-supplied member reads', () => {
   it('reads config.permissions once for the required-permission check and the manifest', () => {
     // #given
@@ -665,6 +693,52 @@ describe('caller-supplied member reads', () => {
     const { config, reads } = countingConfig('dryRunExecute', {
       dryRunExecute: async () => ({ ok: true }),
       permissions: { sideEffect: 'write', dryRun: true },
+    });
+
+    // #when / #then
+    createConnectorBase(config);
+    expect(reads()).toBe(1);
+  });
+
+  it('reads policies.idempotencyStore once', () => {
+    // #given
+    const { config, reads } = countingPolicies('idempotencyStore', {
+      permissions: { sideEffect: 'write', idempotencyKey: true },
+      policies: { idempotencyStore: new InMemoryIdempotencyStore() },
+    });
+
+    // #when / #then
+    createConnectorBase(config);
+    expect(reads()).toBe(1);
+  });
+
+  it('reads policies.idempotencyKeyMigration once at construction', () => {
+    // #given
+    const { config, reads } = countingPolicies('idempotencyKeyMigration', {
+      policies: { idempotencyKeyMigration: 'legacy-writers-drained' },
+    });
+
+    // #when / #then
+    createConnectorBase(config);
+    expect(reads()).toBe(1);
+  });
+
+  it('reads policies.rateLimitStore once', () => {
+    // #given
+    const { config, reads } = countingPolicies('rateLimitStore', {
+      permissions: { sideEffect: 'write', rateLimit: '2/min' },
+      policies: { rateLimitStore: new InMemoryRateLimitStore() },
+    });
+
+    // #when / #then
+    createConnectorBase(config);
+    expect(reads()).toBe(1);
+  });
+
+  it('reads policies.networkEgress once', () => {
+    // #given
+    const { config, reads } = countingPolicies('networkEgress', {
+      policies: { networkEgress: { allowedDomains: ['api.salesforce.com'] } },
     });
 
     // #when / #then

@@ -682,9 +682,7 @@ process.stderr.write = (...args) => {
 
   // This case asserts the vocabulary's character shape only. Membership of the
   // individual keys is carried by `test/direct-credentialed-evidence.test.ts`'s
-  // "covers every projected key with the admission vocabulary", which walks a
-  // maximal artifact and refuses any projected key outside
-  // `DIRECT_EVIDENCE_KEYS`.
+  // "covers every projected key with the admission vocabulary".
   it('admits only word, dot and dash characters in the evidence key vocabulary', () => {
     expect(DIRECT_EVIDENCE_KEYS.every((key) => /^[\w.-]+$/u.test(key))).toBe(
       true,

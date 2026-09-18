@@ -427,9 +427,9 @@ test('the ci.yml gate job stays reachable and depends on at least one job', () =
 });
 
 // The canary's `continue-on-error` keys are what keep an upstream @mastra/core
-// release off the merge path: one at the job, and one on each step whose red
-// is expected. This case shells out to nothing either.
-test('the ci.yml canary stays non-gating at the job and at the steps expected to go red', () => {
+// release off the merge path: one at the job, and one on each step this case
+// names. This case shells out to nothing either.
+test('the ci.yml canary stays non-gating at the job and at the steps expected to go red, whose ids the summary reads', () => {
   const job = readWorkflow().jobs['mastra-compat'];
 
   assert.ok(job, 'the compat canary is the job named `mastra-compat`');
@@ -439,9 +439,9 @@ test('the ci.yml canary stays non-gating at the job and at the steps expected to
     'without the job-level key an upstream @mastra/core release wedges unrelated pull requests',
   );
 
-  for (const name of [
-    'Typecheck libraries against newest core',
-    'Bundle the flowsafe spike Worker against newest core',
+  for (const [name, id] of [
+    ['Typecheck libraries against newest core', 'typecheck'],
+    ['Bundle the flowsafe spike Worker against newest core', 'bundle'],
   ]) {
     const step = (job.steps ?? []).find((candidate) => candidate.name === name);
 
@@ -450,6 +450,11 @@ test('the ci.yml canary stays non-gating at the job and at the steps expected to
       step['continue-on-error'],
       true,
       `without the step-level key on "${name}" its expected red skips the tripwire suites after it`,
+    );
+    assert.equal(
+      step.id,
+      id,
+      `the run summary reads steps.${id}.outcome, so "${name}" carries that id`,
     );
   }
 });

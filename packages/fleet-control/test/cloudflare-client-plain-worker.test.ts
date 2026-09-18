@@ -355,6 +355,26 @@ describe('CloudflareProvisioningClient subdomain ingress proof', () => {
     expect(subdomainReads()).toHaveLength(1);
   });
 
+  it('cancels a refused subdomain body with the refusal it throws', async () => {
+    const cancelled = vi.fn();
+    const { client, subdomainReads } = fixture(
+      () =>
+        new Response(new ReadableStream({ cancel: cancelled }), {
+          headers: { 'content-type': 'text/plain' },
+        }),
+    );
+
+    const read = client.inspectOrdinaryWorkerFootprint('plain');
+    const refusal = await read.catch((error: unknown) => error);
+
+    await expect(read).rejects.toThrow(
+      "ordinary Worker 'plain' returned incomplete public-access metadata",
+    );
+    expect(cancelled).toHaveBeenCalledTimes(1);
+    expect(cancelled.mock.calls[0]?.[0]).toBe(refusal);
+    expect(subdomainReads()).toHaveLength(1);
+  });
+
   it('accepts null errors and messages in subdomain ingress metadata', async () => {
     const { client } = fixture(() =>
       Response.json({
@@ -1277,11 +1297,11 @@ describe('CloudflareProvisioningClient plain-worker plane', () => {
       Promise.reject(new Error('transport timed out')),
     );
     const client = plainClient({ fetch: fixture.fetch });
-    // The SDK's error classes never assign `name` — `APIConnectionError` and
-    // `APIConnectionTimeoutError` only chain constructors — so a
-    // raw rejection reports the base `Error` name and the subclass itself is
-    // what identifies a timeout; `sanitizeProviderError` is what stamps the
-    // constructor name the sanitized chains elsewhere in this file read.
+    // Neither `APIConnectionError` nor `APIConnectionTimeoutError` assigns
+    // `name` — the SDK's error classes never do — so a raw rejection reports
+    // the base `Error` name and the subclass itself is what identifies a
+    // timeout; `sanitizeProviderError` is what stamps the constructor name the
+    // sanitized chains elsewhere in this file read.
     type ReadOutcome =
       | Readonly<{ settled: 'resolved'; value: unknown }>
       | Readonly<{ settled: 'rejected'; timeout: boolean; message: unknown }>;

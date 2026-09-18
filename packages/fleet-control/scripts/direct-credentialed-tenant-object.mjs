@@ -4,7 +4,7 @@ export const DIRECT_TENANT_OBJECT_KEY = 'direct-conformance-fixture';
 export const DIRECT_TENANT_OBJECT_BODY = 'direct-conformance-fixture-data';
 
 // The `/__direct/*` routes the tenant Worker answers. The router and the
-// clients that call it import these values, so a rename is one edit for them.
+// reference clients import these values, so a rename is one edit for them.
 export const DIRECT_TENANT_ROUTES = Object.freeze({
   health: '/__direct/health',
   object: '/__direct/object',

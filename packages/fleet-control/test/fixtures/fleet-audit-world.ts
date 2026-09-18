@@ -8,7 +8,7 @@
  *
  * The world freezes the SHIPPED behavior of `auditFleetDrift` in
  * `src/fleet.ts` — the findings and collaborator calls its bounded stage
- * helpers and `auditRecordStep` produce — so that decomposition is proven
+ * helpers and `auditRecordStep` produce — so any change to them is provably
  * behavior-equivalent. It drives every finding kind `auditFleetDrift` itself
  * pushes except `duplicate-database` (pinned exact-order by
  * `test/fleet.test.ts`'s "finds duplicate ownership, version drift, and
@@ -27,12 +27,13 @@
  * few specific `findings.push(...)` sites in `auditFleetDrift`; a handful of
  * sites are deliberately left uncovered by this world and pinned instead by
  * the existing exact-order titles in `test/fleet.test.ts`:
- *   - `auditRecordStep`'s four `String(error)` catch sites (`'backend
- *     resolver failed'`, `'spec resolver failed'`, `'maintenance secret
- *     resolver failed'`, `'inspection failed'`) — this world's `backendFor`/
- *     `specFor`/`maintenanceSecretFor`/`inspect` collaborators never throw,
- *     so only `test/fleet.test.ts`'s "contains resolver, inspection, and
- *     maintenance re-arm failures per deployment" exercises them.
+ *   - `auditRecordStep`'s resolver- and inspection-failure `String(error)`
+ *     catch sites (`'backend resolver failed'`, `'spec resolver failed'`,
+ *     `'maintenance secret resolver failed'`, `'inspection failed'`) — this
+ *     world's `backendFor`/`specFor`/`maintenanceSecretFor`/`inspect`
+ *     collaborators never throw, so only `test/fleet.test.ts`'s "contains
+ *     resolver, inspection, and maintenance re-arm failures per deployment"
+ *     exercises them.
  *   - `auditRecordStep`'s `database-mismatch`, `duplicate-database`,
  *     `duplicate-namespace`, and `version-drift` checks against
  *     `backend.inspect()`'s OWN reported identity, not the per-record

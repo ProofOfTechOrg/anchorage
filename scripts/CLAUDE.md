@@ -20,8 +20,9 @@ Repository documentation, architecture, and publication checks. Markdown syntax 
   `.dependency-cruiser.cjs` forbids anything under `packages/` from importing
   fleet control.
 - `architecture-positive-controls.test.mjs` — `node:test` positive controls for the `.dependency-cruiser.cjs` rules and the root vitest and `tsconfig.harness.json` registries; run with `pnpm architecture:controls`.
-- `entry-point.mjs` — `isInvokedAsEntryPoint(importMetaUrl)`, the entry-point predicate the root scripts guard their side effects with. The disposition it carries is documented on the export.
+- `entry-point.mjs` — `isInvokedAsEntryPoint(moduleUrl)`, the entry-point predicate the root scripts guard their side effects with. `moduleUrl` is a `file:` URL, as a string or a `URL`. The disposition it carries is documented on the export.
 - `entry-point.test.mjs` — run with `node --test scripts/entry-point.test.mjs`.
+- `child-process-fixture.mjs` — the `node:test` child-process harness: a temporary repository root, a spawned child under a watchdog, and the reader for the event log that child writes.
 - [`baseline-recorder.mjs`](baseline-recorder.mjs): recorder configuration and supported literal values are documented on `runBaselineRecorder`.
 - [`baseline-recorder.test.mjs`](baseline-recorder.test.mjs): run with `node --test scripts/baseline-recorder.test.mjs`.
 - [`record-drain-baseline.mjs`](record-drain-baseline.mjs): inventory recorder. Golden assertions live in [`cloudflare-client.test.ts`](../packages/fleet-control/test/cloudflare-client.test.ts).

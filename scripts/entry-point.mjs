@@ -7,7 +7,8 @@ import { fileURLToPath } from 'node:url';
 import { isMainThread } from 'node:worker_threads';
 
 /**
- * Reports whether the process entry point is the module `importMetaUrl` names.
+ * Reports whether the process entry point is the module the `file:` URL
+ * `moduleUrl` (a string or `URL`) names.
  *
  * Both sides are realpathed, so a symlinked invocation still resolves to the
  * module's own path, and an entry path that resolves to nothing names some
@@ -19,7 +20,7 @@ import { isMainThread } from 'node:worker_threads';
  * inherit the parent process's eval flags, so `execArgv` decides on the main
  * thread alone.
  */
-export function isInvokedAsEntryPoint(importMetaUrl) {
+export function isInvokedAsEntryPoint(moduleUrl) {
   const entry = process.argv[1];
   if (!entry) return false;
   if (
@@ -38,5 +39,5 @@ export function isInvokedAsEntryPoint(importMetaUrl) {
     if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return false;
     throw error;
   }
-  return invokedFilePath === realpathSync(fileURLToPath(importMetaUrl));
+  return invokedFilePath === realpathSync(fileURLToPath(moduleUrl));
 }

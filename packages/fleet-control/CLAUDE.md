@@ -20,13 +20,13 @@ Source map:
 - `decommission-intent.ts`: strict durable decommission shell and continuation-token codecs
 - `decommission-database.ts`: provider-neutral bounded D1 reference, receipt, export-result, and deletion-settlement choreography
 - `json-field-reads.ts`: JSON field readers shared by provider adapters and error sanitization
-- `state-store.ts`, `migration-ledger.ts`, `d1-fleet-state-database.ts`, `database-export-store.ts`, `export-file-name.ts`, `export-store.ts`, `r2-export-store.ts`: durable fleet state (`d1-fleet-state-database.ts` adapts a Workers D1 binding to the state store's database port; `database-export-store.ts` declares `DurableDatabaseExportStore`, which `export-store.ts` implements over the filesystem and `r2-export-store.ts` over an R2 binding, and declares `cancelBodyWithoutAwait`; `export-file-name.ts` holds the portable-segment check both stores use)
+- `state-store.ts`, `migration-ledger.ts`, `d1-fleet-state-database.ts`, `database-export-store.ts`, `export-file-name.ts`, `export-store.ts`, `r2-export-store.ts`: durable fleet state (`d1-fleet-state-database.ts` adapts a Workers D1 binding to the state store's database port; `database-export-store.ts` declares `DurableDatabaseExportStore`, which `export-store.ts` implements over the filesystem and `r2-export-store.ts` over an R2 binding, and declares `cancelBodyWithoutAwait`, the unawaited response-body release that hands the source the caller's refusal; `export-file-name.ts` holds the portable-segment check both stores use)
 - `fleet-operation-state.ts`, `d1-fleet-operation-store.ts`: bounded operation ports, codecs and D1 storage
 - `fleet-audit-state.ts`, `fleet-audit-advance.ts`: bounded audit state and coordinator
 - `fleet-inventory-state.ts`, `fleet-inventory-advance.ts`, `d1-fleet-inventory-run-store.ts`: inventory state, coordinator and generation storage
 - `fleet-migration-state.ts`, `fleet-migration-advance.ts`: migration state and coordinator
 - `workers/`: the platform's own deployed Workers, published as separate export entries
-- `scripts/`: repository conformance tooling; `direct-credentialed-conformance.mjs` is the direct-API CLI entry and composes the `direct-credentialed-*` modules beside it
+- `scripts/`: repository conformance tooling; `direct-credentialed-conformance.mjs` is the direct-API CLI entry and composes the `direct-credentialed-*` modules beside it. The prefix names the module family, not the set of importers: `credentialed-conformance.mjs` imports `direct-credentialed-body-cancel.mjs` as well
 
 ```bash
 pnpm fleet-control:check

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-// The manifests and cases the two `src` conformance suites drive. Keep vitest
+// The manifests and cases the `src` conformance suites drive. Keep vitest
 // out of it: it sits under `src`, and the build program excludes it by name
-// (`tsconfig.json:8`) rather than by the `.test.ts` suffix. That exclusion, and
-// its own program and vitest project, are why the workers suite under
-// `worker-tests/` carries copies of these declarations instead of importing
-// them.
+// (`tsconfig.json`'s `exclude`) rather than by the `.test.ts` suffix. That
+// exclusion, and its own program and vitest project, are why the workers suite
+// under `worker-tests/` carries copies of these declarations instead of
+// importing them.
 //
 // The imports name the `connector-sdk` leaves, not the barrel, which imports
 // this directory's modules back.

@@ -140,7 +140,7 @@ Rolling this release back is not symmetric: 0.17.x has no deadline reader, so th
 A `@mastra/core` bump carries these obligations:
 
 - The reason table in `durable-agent-runner.ts` is authoritative, and `durable-agent-surface.test.ts` is what forces the read.
-- The runner's module comment and [Durable agents](durable-agents.md) are the table's two mirrors, updated from the table in the same commit — never left to drift behind it. The surface test pins each mirror against the table.
+- The runner's module comment and [Durable agents](durable-agents.md) mirror the table, and are updated from it in the same commit — never left to drift behind it. The surface test fails when a mirror stops naming a blocked entry.
 - Both two-core allowances are pruned when the pin moves: Breakwater's `forwardClassified` of every name the new pin now exposes, and the surface test's `VERSION_SKEW` of every row whose two levels the new pin makes agree. Their own tests assert both.
 - `packages/flowsafe/src/do-runner/d1-storage.ts`'s exhaustive storage-domain capture is re-read: its `satisfies Record<keyof MastraStorageDomains, unknown>` stops compiling when the new core adds a domain, which is what the canary's `Typecheck libraries against newest core` step reports; 1.67.0 adds `workflowDefinitions` and `knowledge`. Naming the new domains in that capture does not compile against the pinned core, so they are classified when the pin moves.
 - The `@mastra/core` patch is retired or re-cut in the same commit, through the procedure above.

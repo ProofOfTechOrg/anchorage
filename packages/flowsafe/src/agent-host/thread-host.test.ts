@@ -4230,7 +4230,7 @@ describe('createThreadAgentHost automated entry', () => {
 
   it('denies a scheduled start when the agent declares no automation', async () => {
     // #given — the agent's roles still include 'operator', which is exactly the
-    // role the schedule path used to fabricate to get in.
+    // role a schedule path would fabricate to get in.
     const fixture = harness(['writer'], {
       principal: SCHEDULER,
     });

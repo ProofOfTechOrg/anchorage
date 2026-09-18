@@ -10,6 +10,7 @@ import {
   sanitizeProviderError,
 } from './cloudflare-provider-errors.js';
 import { namedWorkerUploadBody } from './cloudflare-worker-upload.js';
+import { cancelBodyWithoutAwait } from './database-export-store.js';
 import {
   readArrayField,
   readField,
@@ -199,10 +200,11 @@ export async function ordinaryWorkerSubdomain(
     response.status !== 200 ||
     !(media === 'application/json' || media?.endsWith('+json'))
   ) {
-    void response.body?.cancel().catch(() => undefined);
-    throw new Error(
+    const refusal = new Error(
       `ordinary Worker '${scriptName}' returned incomplete public-access metadata`,
     );
+    cancelBodyWithoutAwait(response.body, refusal);
+    throw refusal;
   }
   const body: unknown = await response.json();
   const result = readField(body, 'result');

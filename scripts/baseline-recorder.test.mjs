@@ -1,25 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
 import {
   chmodSync,
-  copyFileSync,
   existsSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
-  rmSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { createRequire } from 'node:module';
-import { tmpdir } from 'node:os';
 import { delimiter, dirname, join, resolve } from 'node:path';
 import { test } from 'node:test';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { pathToFileURL } from 'node:url';
+import {
+  activity,
+  createChildProcessFixture,
+  repositoryRoot,
+} from './child-process-fixture.mjs';
 
-const repositoryRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+const { createRoot, run } = createChildProcessFixture({
+  prefix: 'anchorage-baseline-recorder-',
+  watchdog: 'recorder',
+  scripts: ['baseline-recorder.mjs', 'entry-point.mjs'],
+  argv: ['--check'],
+});
 
 function put(root, path, source) {
   const target = join(root, path);
@@ -41,18 +46,7 @@ function fixture(
     after = '',
   } = {},
 ) {
-  const directory = mkdtempSync(join(tmpdir(), 'anchorage-baseline-recorder-'));
-  t.after(() => rmSync(directory, { recursive: true, force: true }));
-  const root = join(directory, 'repo');
-  mkdirSync(join(root, 'scripts'), { recursive: true });
-  copyFileSync(
-    join(repositoryRoot, 'scripts/baseline-recorder.mjs'),
-    join(root, 'scripts/baseline-recorder.mjs'),
-  );
-  copyFileSync(
-    join(repositoryRoot, 'scripts/entry-point.mjs'),
-    join(root, 'scripts/entry-point.mjs'),
-  );
+  const { root, directory, events } = createRoot(t);
   const { packageManager } = JSON.parse(
     readFileSync(join(repositoryRoot, 'package.json'), 'utf8'),
   );
@@ -71,7 +65,6 @@ function fixture(
     'biome.json',
     '{"javascript":{"formatter":{"quoteStyle":"single"}}}\n',
   );
-  const events = join(root, 'events.log');
   const mark = `import { appendFileSync } from 'node:fs';
 const mark = (event) => appendFileSync(${JSON.stringify(events)}, event + '\\n');`;
   const worldPath = put(
@@ -112,69 +105,6 @@ ${after}
     baselinePath,
     baselineFile,
   };
-}
-
-async function run(
-  f,
-  argv = ['--check'],
-  {
-    flags = ['--experimental-transform-types'],
-    entry = f.entry,
-    cwd = f.directory,
-    env = {},
-    input,
-  } = {},
-) {
-  const child = spawn(
-    process.execPath,
-    ['--no-warnings', ...flags, entry, ...argv],
-    {
-      cwd,
-      env: {
-        ...process.env,
-        NODE_OPTIONS: '',
-        COREPACK_ENABLE_NETWORK: '0',
-        COREPACK_ENABLE_AUTO_PIN: '0',
-        ...env,
-      },
-      stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
-      detached: process.platform !== 'win32',
-    },
-  );
-  let stdout = '';
-  let stderr = '';
-  let timedOut = false;
-  if (input !== undefined) child.stdin.end(input);
-  child.stdout.setEncoding('utf8').on('data', (chunk) => {
-    stdout += chunk;
-  });
-  child.stderr.setEncoding('utf8').on('data', (chunk) => {
-    stderr += chunk;
-  });
-  const timer = setTimeout(() => {
-    timedOut = true;
-    if (process.platform === 'win32') child.kill('SIGKILL');
-    else process.kill(-child.pid, 'SIGKILL');
-  }, 15_000);
-  try {
-    const result = await new Promise((settle, reject) => {
-      child.once('error', reject);
-      child.once('close', (status, signal) => settle({ status, signal }));
-    });
-    assert.equal(
-      timedOut,
-      false,
-      `recorder watchdog expired\n${stdout}\n${stderr}`,
-    );
-    assert.equal(result.signal, null, stderr);
-    return { ...result, stdout, stderr };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function activity(f) {
-  return existsSync(f.events) ? readFileSync(f.events, 'utf8') : '';
 }
 
 function matchOutput(f) {

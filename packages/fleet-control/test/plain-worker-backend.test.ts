@@ -483,7 +483,7 @@ describe('reconciled transient provisioning failures', () => {
             const databases = [...api.databases.values()];
             expect(databases).toEqual([
               {
-                id: expect.any(String),
+                id: expect.stringMatching(/.+/u),
                 name: spec.databaseName,
                 created: false,
               },
@@ -2053,7 +2053,7 @@ describe('PlainWorkerBackend core policy', () => {
     );
     expect(api.domains).toEqual([
       {
-        id: expect.any(String),
+        id: expect.stringMatching(/.+/u),
         hostname: spec.routeHostname,
         service: spec.scriptName,
       },

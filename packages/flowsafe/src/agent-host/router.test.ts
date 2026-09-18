@@ -826,8 +826,8 @@ describe('createAgentRouter', () => {
 
   it('passes a 5xx refusal through with its status and reason intact', async () => {
     // #given — the run DO refusing because the deployment is fenced. This is a
-    // 5xx, which this router used to collapse into a bare 500 — turning "retry
-    // after the migration" into "I am broken" for every agent caller.
+    // 5xx: collapsing it into a bare 500 turns "retry after the migration"
+    // into "I am broken" for every agent caller.
     const host = topology();
     host.start.mockRejectedValueOnce(
       new RunRouteError(

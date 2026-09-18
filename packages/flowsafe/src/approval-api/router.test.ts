@@ -161,8 +161,8 @@ describe('createApprovalRouter', () => {
     // #given — the type-level pin: an unclassified field makes `true` not
     // assignable to the union below, so this file stops COMPILING until the
     // new field is deliberately sorted into CLIENT_CREATE_FIELDS or
-    // TCB_ONLY_CREATE_FIELDS. That is the fail-closed inversion of the old
-    // body spread, where a forgotten denylist entry silently granted.
+    // TCB_ONLY_CREATE_FIELDS. An allowlist is fail-closed here; a denylisted
+    // body spread grants silently on the entry someone forgets.
     type Classified =
       | (typeof CLIENT_CREATE_FIELDS)[number]
       | (typeof TCB_ONLY_CREATE_FIELDS)[number];
@@ -581,8 +581,8 @@ describe('createApprovalRouter', () => {
   });
 
   it('404s POST /sla/sweep because the sweep is maintenance-owned TCB code', async () => {
-    // #given — the route USED to exist and was an unfiltered cross-tenant
-    // read+write behind a role check; it must never come back
+    // #given — as a route it would be an unfiltered cross-tenant read+write
+    // behind a role check; the 404 is what keeps it out
     const { handle } = makeHandler();
 
     // #when

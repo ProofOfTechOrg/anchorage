@@ -199,9 +199,9 @@
 // network four (network, resumeNetwork, approveNetworkToolCall,
 // declineNetworkToolCall), the legacy pair (generateLegacy, streamLegacy) and
 // sendToolApproval, which it files `intentionallyUnavailable`
-// (packages/breakwater/src/agent/agent.test.ts:824). It diverges on
-// listSuspendedRuns (:967), which it files under `explicitlyNonExecution` —
-// the same divergence as listActiveRuns (:947), and for the same reason: a
+// (packages/breakwater/src/agent/agent.test.ts). It diverges on
+// listSuspendedRuns, which it files under `explicitlyNonExecution` — the same
+// divergence as listActiveRuns, and for the same reason: a
 // narrowed HANDLE can only omit, so a data-returning member is harmless there,
 // while an INSTANCE Mastra calls in-process must throw. The two members
 // blocked below for newer cores diverge the same way; each entry records it.
@@ -224,7 +224,7 @@
 //     sibling getActiveThreadRunId() stays non-execution because it makes the
 //     caller name the (resourceId, threadId) pair: it confirms where this
 //     enumerates. Breakwater files it `explicitlyNonExecution`
-//     (agent.test.ts:948) for the reason it files listActiveRuns there: a
+//     (agent.test.ts) for the reason it files listActiveRuns there: a
 //     narrowed HANDLE can only omit, so a data-returning member is harmless
 //     there, while an INSTANCE Mastra calls in-process must throw. Cost, stated
 //     rather than left to be rediscovered: core's AgentController aggregates
@@ -234,22 +234,20 @@
 //     blocked sendToolApproval() at :4089 and :4118.
 //   - __setThreadRuntimeAgent() (:33609) installs another agent as the target
 //     the thread-runtime paths resolve through #getThreadRuntimeAgent()
-//     (:33612, `this.#threadRuntimeAgent ?? this`); at this core they are
-//     subscribeToThread (:38197), claimThreadOwnership (:38203), sendMessage
-//     (:38331), queueMessage (:38337), sendStateSignal (:38355),
-//     sendNotificationSignal (through #sendNotificationSignalBatch, :38442 and
-//     :38510) and sendSignal (:38562). That is the fourth ground by
-//     installation rather than by call: the containment those inherited
-//     members rely on IS virtual dispatch on `this`, so one call moves every
-//     run those paths start onto an agent carrying none of these overrides —
-//     no caller-minted runId assertion, no executeWorkflow, no
-//     #startRequesters backstop. subscribeToThread drives no run of its own;
-//     the field moves its replay target all the same. It is public in the type
-//     surface (agent.d.ts:229 declares it with no modifier), so unlike
-//     getLegacyHandler it takes no private cast. Breakwater files it
-//     `explicitlyNonExecution` (agent.test.ts:879) for the reason it files the
-//     listings there: a narrowed HANDLE can only omit, so a setter is harmless
-//     there, while an INSTANCE Mastra calls in-process must throw.
+//     (:33612, `this.#threadRuntimeAgent ?? this`); the refusal in
+//     BLOCKED_RUN_ENTRIES names those paths, for the core it is written
+//     against. That is the fourth ground by installation rather than by call:
+//     the containment those inherited members rely on IS virtual dispatch on
+//     `this`, so one call moves every run those paths start onto an agent
+//     carrying none of these overrides — no caller-minted runId assertion, no
+//     executeWorkflow, no #startRequesters backstop. subscribeToThread drives
+//     no run of its own; the field moves its replay target all the same. It is
+//     public in the type surface (agent.d.ts:229 declares it with no
+//     modifier), so unlike getLegacyHandler it takes no private cast.
+//     Breakwater files it `explicitlyNonExecution` (agent.test.ts) for the
+//     reason it files the listings there: a narrowed HANDLE can only omit, so
+//     a setter is harmless there, while an INSTANCE Mastra calls in-process
+//     must throw.
 //
 // Neither carries the `override` keyword, and that is load-bearing rather than
 // an oversight: TypeScript rejects `override` on a member the base does not
@@ -1358,14 +1356,12 @@ export class FlowsafeDurableAgent<
 
   /**
    * Refuse the thread-runtime target swap newer cores add. It sets one private
-   * field, and the thread-runtime paths — on @mastra/core 1.67.0,
-   * `subscribeToThread`, `claimThreadOwnership`, `sendMessage`,
-   * `queueMessage`, `sendStateSignal`, `sendNotificationSignal` and
-   * `sendSignal` — resolve their target through that field, falling back to
-   * `this`. So the containment those inherited members rely on is virtual
-   * dispatch on `this`, and one call to this setter moves every run they
-   * start, and `subscribeToThread`'s replay target with them, onto an agent
-   * with none of these overrides in the chain. That is the fourth ground
+   * field that the thread-runtime paths resolve their target through, falling
+   * back to `this`; the refusal in `BLOCKED_RUN_ENTRIES` names those paths,
+   * for the core it is written against. So the containment those inherited
+   * members rely on is virtual dispatch on `this`, and one call to this setter
+   * moves every run they start, and their replay targets with them, onto an
+   * agent with none of these overrides in the chain. That is the fourth ground
    * reached by installing a second execution surface rather than by calling
    * one.
    *
