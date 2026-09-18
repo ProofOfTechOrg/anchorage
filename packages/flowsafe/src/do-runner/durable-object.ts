@@ -779,14 +779,12 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
   }
 
   /**
-   * The run-owner journal's absence policy, one rule across its entry points:
-   * arming (here, and the alarm it takes through #armAlarmFor) and clearing
-   * (#clearRunOwnerRecovery) are advisory and do nothing on a host with no
-   * storage, while promoting a claim to `prepared` (#prepareRunOwner) requires
-   * storage and refuses without it. A host that journals nothing leaves no
-   * claim for a wake to recover, so arming and clearing have nothing to do; a
-   * prepared run whose journal cannot be written leaves a claim no wake can
-   * find, which is why that half fails the start instead.
+   * Arming is advisory: on a host with no storage this returns having
+   * journaled nothing. A host that journals nothing leaves no claim for a
+   * wake to recover, so there is nothing to arm. Promoting a claim to
+   * `prepared` (#prepareRunOwner) instead requires storage and refuses
+   * without it — a prepared run whose journal cannot be written leaves a
+   * claim no wake can find, so that path fails the start instead.
    */
   async #armRunOwnerRecovery(recovery: RunOwnerRecovery): Promise<void> {
     const storage = this.state?.storage;

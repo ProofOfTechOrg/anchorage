@@ -599,6 +599,98 @@ describe('connector id validation', () => {
   });
 });
 
+// Counts createConnector's reads of one caller-supplied `config` member. An
+// accessor answers each read itself, so a member read twice can give the
+// refusal check one value and the construction that follows another.
+function countingConfig(
+  field: keyof ConnectorConfig,
+  overrides: Partial<ConnectorConfig> = {},
+): { config: ConnectorConfig; reads: () => number } {
+  const config: ConnectorConfig = {
+    id: 'salesforce.createContact',
+    description: 'Create a Salesforce contact',
+    execute: async () => ({ ok: true }),
+    permissions: { sideEffect: 'write' },
+    ...overrides,
+  };
+  const value = config[field];
+  let reads = 0;
+  Object.defineProperty(config, field, {
+    configurable: true,
+    enumerable: true,
+    get() {
+      reads += 1;
+      return value;
+    },
+  });
+  return { config, reads: () => reads };
+}
+
+describe('caller-supplied member reads', () => {
+  it('reads config.permissions once for the required-permission check and the manifest', () => {
+    // #given
+    const { config, reads } = countingConfig('permissions');
+
+    // #when
+    createConnectorBase(config);
+
+    // #then
+    expect(reads()).toBe(1);
+  });
+
+  it('reads config.inputSchema once', () => {
+    // #given
+    const { config, reads } = countingConfig('inputSchema', {
+      inputSchema: z.unknown(),
+    });
+
+    // #when / #then
+    createConnectorBase(config);
+    expect(reads()).toBe(1);
+  });
+
+  it('reads config.outputSchema once', () => {
+    // #given
+    const { config, reads } = countingConfig('outputSchema', {
+      outputSchema: z.unknown(),
+    });
+
+    // #when / #then
+    createConnectorBase(config);
+    expect(reads()).toBe(1);
+  });
+
+  it('reads config.dryRunExecute once for both construction checks', () => {
+    // #given
+    const { config, reads } = countingConfig('dryRunExecute', {
+      dryRunExecute: async () => ({ ok: true }),
+      permissions: { sideEffect: 'write', dryRun: true },
+    });
+
+    // #when / #then
+    createConnectorBase(config);
+    expect(reads()).toBe(1);
+  });
+
+  it('reads invokeConnector toolCallId once for its check and the call identity', async () => {
+    // #given
+    const { tool } = makeConnector({ permissions: { sideEffect: 'read' } });
+    let reads = 0;
+    const options: ConnectorInvocationOptions = {
+      get toolCallId() {
+        reads += 1;
+        return 'call-1';
+      },
+    };
+
+    // #when
+    await invokeConnector(tool, input, options);
+
+    // #then
+    expect(reads).toBe(1);
+  });
+});
+
 describe('createConnector classification', () => {
   it('compiles to a working Mastra tool', async () => {
     // #given

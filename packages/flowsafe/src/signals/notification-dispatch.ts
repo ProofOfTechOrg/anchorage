@@ -494,8 +494,9 @@ let deliveryPolicyPatched: Promise<boolean> | undefined;
  * resolveNotificationDeliveryDecision guards its own keys, so a source named
  * after an Object.prototype member resolves the configured default instead
  * of the inherited member. The lookup is asynchronous, so this probe is the
- * async sibling of assertNotificationSourceKeysPatched, awaited before a
- * handler reaches core's sender.
+ * async sibling of assertNotificationSourceKeysPatched, awaited at the
+ * ingestion gate, whose delivery runs through agent.sendNotificationSignal
+ * and reaches that lookup.
  */
 export async function assertNotificationDeliveryPolicyPatched(): Promise<void> {
   deliveryPolicyPatched ??= resolveNotificationDeliveryDecision({

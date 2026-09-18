@@ -9,12 +9,11 @@ const src = (path: string) => new URL(path, import.meta.url).pathname;
 // so API requests, bindings, Durable Objects, and WebSockets use the deployed
 // topology while Vite bundles the SPA and approval-ui components.
 export default defineConfig({
-  // The root pnpm override `miniflare@5.20260730.0-alpha>workerd` (package.json)
-  // selects a miniflare version rather than a consumer, so it reaches this
-  // plugin as well as the Workers test pool: the miniflare that
+  // `vitest.breakwater-workers.config.mts` carries the miniflare/workerd
+  // override record that governs this plugin too: the override selects a
+  // miniflare version rather than a consumer, so the miniflare
   // @cloudflare/vite-plugin resolves runs on the overridden workerd, while the
-  // plugin's own workerd dependency stays 1.20260730.1. Both consumers resolve
-  // that one miniflare, so no override key reaches one without the other.
+  // plugin's own workerd dependency stays 1.20260730.1.
   plugins: [react(), cloudflare()],
   resolve: {
     // Mirrors tsconfig.json paths — @/ (SPA) and @flowsafe/ (deep DOM-free

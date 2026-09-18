@@ -32,12 +32,19 @@ const RESERVED_PROCESSOR_IDS = new Set([
   'breakwater-policy-engine',
 ]);
 
-const GUARDED_CALL_OPTION_KEYS = new Set([
-  'requestContext',
-  'runId',
-  'memory',
-  'abortSignal',
-]);
+// Exhaustive over GuardedAgentCallOptions: a member the interface gains is a
+// missing property here, one it drops an excess property.
+const GUARDED_CALL_OPTION_KEY_SET: Record<keyof GuardedAgentCallOptions, true> =
+  {
+    requestContext: true,
+    runId: true,
+    memory: true,
+    abortSignal: true,
+  };
+
+const GUARDED_CALL_OPTION_KEYS = new Set(
+  Object.keys(GUARDED_CALL_OPTION_KEY_SET),
+);
 
 /** Well-known inter-package key for guarded host compatibility metadata. */
 export const GUARDED_AGENT_HOST_PROTOCOL = Symbol.for(
@@ -68,27 +75,9 @@ const UNSAFE_CONSTRUCTION_KEYS = new Set([
   'rawConfig',
 ]);
 
-const INPUT_PROCESSOR_FORBIDDEN_HOOKS = [
-  'processInputStep',
-  'computeStateSignal',
-  'processLLMRequest',
-  'processLLMResponse',
-  'processOutputStream',
-  'processOutputResult',
-  'processOutputStep',
-  'processAPIError',
-] as const;
-
-const OUTPUT_PROCESSOR_FORBIDDEN_HOOKS = [
-  'processInput',
-  'processInputStep',
-  'computeStateSignal',
-  'processLLMRequest',
-  'processLLMResponse',
-  'processOutputStep',
-  'processAPIError',
-] as const;
-
+// The hooks of core's Processor the guarded surfaces reason about. The two
+// forbidden sets below are derived from it, so a name dropped here is an excess
+// property there.
 type ProcessorHook = Extract<
   keyof Processor,
   | 'processInput'
@@ -101,6 +90,57 @@ type ProcessorHook = Extract<
   | 'processOutputStep'
   | 'processAPIError'
 >;
+
+// The hooks an application input processor may not implement: ProcessorHook
+// without the one it must implement.
+type InputProcessorForbiddenHook = Exclude<ProcessorHook, 'processInput'>;
+
+// The hooks an application output processor may not implement: ProcessorHook
+// without the two it must implement.
+type OutputProcessorForbiddenHook = Exclude<
+  ProcessorHook,
+  'processOutputStream' | 'processOutputResult'
+>;
+
+// Exhaustive over InputProcessorForbiddenHook: a hook ProcessorHook gains is a
+// missing property here, one it drops an excess property. `Object.keys`
+// preserves the literal's insertion order, so the order written here is the
+// order checked, and a processor implementing several is refused for the first.
+const INPUT_PROCESSOR_FORBIDDEN_HOOK_SET: Record<
+  InputProcessorForbiddenHook,
+  true
+> = {
+  processInputStep: true,
+  computeStateSignal: true,
+  processLLMRequest: true,
+  processLLMResponse: true,
+  processOutputStream: true,
+  processOutputResult: true,
+  processOutputStep: true,
+  processAPIError: true,
+};
+
+const INPUT_PROCESSOR_FORBIDDEN_HOOKS = Object.keys(
+  INPUT_PROCESSOR_FORBIDDEN_HOOK_SET,
+) as readonly InputProcessorForbiddenHook[];
+
+// Exhaustive over OutputProcessorForbiddenHook on the same terms.
+const OUTPUT_PROCESSOR_FORBIDDEN_HOOK_SET: Record<
+  OutputProcessorForbiddenHook,
+  true
+> = {
+  processInput: true,
+  processInputStep: true,
+  computeStateSignal: true,
+  processLLMRequest: true,
+  processLLMResponse: true,
+  processOutputStep: true,
+  processAPIError: true,
+};
+
+const OUTPUT_PROCESSOR_FORBIDDEN_HOOKS = Object.keys(
+  OUTPUT_PROCESSOR_FORBIDDEN_HOOK_SET,
+) as readonly OutputProcessorForbiddenHook[];
 
 /**
  * Application input processor accepted by {@link createGuardedAgent}.

@@ -23,6 +23,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { ModuleKind, ScriptTarget, transpile } from 'typescript';
 import { parse as parseYaml } from 'yaml';
+import { specifiersIn } from '../test-support/module-edges.ts';
 import { assertAttwEsmPackage } from './attw-pack-check.mjs';
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -1171,34 +1172,14 @@ void [legacyContext, epochContext, legacyScope, epochScope, legacyInput, epochIn
   // declares one module, and the module they share reaches the runner through
   // the single type-only import its exported projections need. The argument is
   // a `dist`-relative path, so an entry outside `do-runner` takes the same pin.
-  // Each pattern is one line form a declaration states an edge in — a `from`
-  // clause on an import or a re-export, a side-effect import, a dynamic
-  // import, a module augmentation, a triple-slash reference. A form missing
-  // from this list is an edge the pins below cannot see.
-  const declarationEdgePatterns = [
-    /\bfrom\s*['"]([^'"]+)['"]\s*;?\s*$/,
-    /^\s*import\s*['"]([^'"]+)['"]\s*;?\s*$/,
-    /\bimport\(\s*['"]([^'"]+)['"]\s*\)/,
-    /^\s*declare\s+module\s+['"]([^'"]+)['"]/,
-    /^\s*\/\/\/\s*<reference\s+(?:path|types|lib)\s*=\s*['"]([^'"]+)['"]/,
-  ];
-  const packedDeclarationSpecifiers = (distPath) => {
-    const declaration = readFileSync(
-      join(packageDirectory, 'dist', distPath),
-      'utf8',
-    );
-    return [
+  const packedDeclarationSpecifiers = (distPath) =>
+    [
       ...new Set(
-        declaration
-          .split('\n')
-          .flatMap((line) =>
-            declarationEdgePatterns
-              .map((pattern) => pattern.exec(line)?.[1])
-              .filter((specifier) => specifier !== undefined),
-          ),
+        specifiersIn(
+          readFileSync(join(packageDirectory, 'dist', distPath), 'utf8'),
+        ),
       ),
     ].sort();
-  };
   assert.deepEqual(packedDeclarationSpecifiers('do-runner/constants.d.ts'), [
     './suspension-deadline.js',
   ]);

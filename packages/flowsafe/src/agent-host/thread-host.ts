@@ -1501,9 +1501,8 @@ export function createThreadAgentHost(
   };
 
   // Reconciling approvals is trusted platform work with no person behind it.
-  // It used to mint role:'operator', which is why an approval bridge looked
-  // indistinguishable from a human operator in the audit trail. The bridge
-  // mints its own principal from this id.
+  // The bridge mints its own principal from this id, so the audit trail shows
+  // an automated principal rather than a human operator.
   const systemPrincipalId = options.systemPrincipalId ?? 'flowsafe-system';
   // Deliberately NOT vouched. Its only consumer projects it to an ApprovalActor
   // for a role-gated READ, which grants nothing an automated principal does not

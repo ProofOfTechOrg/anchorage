@@ -1,5 +1,5 @@
 ---
-'@proofoftech/breakwater': patch
+'@proofoftech/breakwater': minor
 ---
 
 Point the connector conformance report's `limit` at the documented channel list. The field carried a

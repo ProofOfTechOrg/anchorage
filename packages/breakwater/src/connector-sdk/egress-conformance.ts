@@ -642,8 +642,9 @@ function describeDescriptor(d: PropertyDescriptor | undefined): string {
 
 /**
  * The vocabulary for a value a consumer's own code threw: the error's message
- * where it reads as one, otherwise the value's own string form. A function is
- * described by type instead, because its string form is its source text.
+ * where it reads as one, otherwise what `CONNECTORS.md` records under
+ * `FACTORY_FAILED`. A function is described by type, because its string form is
+ * its source text.
  * `describeValue` is the other vocabulary, for a value the subject threw.
  */
 function errorMessage(error: unknown): string {
@@ -754,8 +755,8 @@ function verifyEntries(
     let shape: string;
     let difference = 'descriptor differs from the one the harness installed';
     // Empty where a data property still holds the installed trap, so calls
-    // kept reaching it, and on the catch arm, where neither the descriptor nor
-    // the effective value could be read.
+    // kept reaching it, and on the catch arm, where the descriptor or the
+    // effective value could not be read.
     let calls = '';
     try {
       const descriptor = Object.getOwnPropertyDescriptor(target, property);

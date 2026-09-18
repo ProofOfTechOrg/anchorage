@@ -19,6 +19,10 @@ export default defineConfig({
       // `packages/fleet-control/vitest.config.ts`, so an option added there
       // does not reach the direct-scenario suites.
       'packages/fleet-control/vitest.direct-scenario.config.ts',
+      // Root rule: a `vitest.*.config.*` at the repository root is registered
+      // here — by glob where a family shares a name shape, by explicit name
+      // otherwise — and `scripts/architecture-positive-controls.test.mjs` turns
+      // an unregistered one red.
       'vitest.*-workers.config.*',
       'vitest.flowsafe-harness.config.ts',
       'vitest.workerd-lifecycle.config.ts',

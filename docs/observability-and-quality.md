@@ -234,7 +234,7 @@ The merge gate covers:
 - production builds;
 - packed consumer tests for public npm exports;
 - generated API documentation;
-- documentation links, anchors, exports, npm-safe links, and orphan checks;
+- the documentation checks `scripts/docs-check.mjs` composes (links, anchors, exports, npm-safe links and orphan pages among them);
 - showcase public metadata and token-free bundle assertions;
 - react-doctor;
 - deterministic workerd restart/security spike;

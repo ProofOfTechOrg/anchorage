@@ -181,7 +181,7 @@ module.exports = {
       name: 'no-new-architecture-cycles',
       severity: 'error',
       from: {
-        path: '^(?:packages|scripts/architecture-fixtures)/',
+        path: ['^packages/', '^scripts/architecture-fixtures/'],
       },
       to: {
         circular: true,

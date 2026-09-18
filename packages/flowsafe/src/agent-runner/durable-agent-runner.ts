@@ -233,19 +233,20 @@
 //     It is already unusable over this class — the same controller calls the
 //     blocked sendToolApproval() at :4089 and :4118.
 //   - __setThreadRuntimeAgent() (:33609) installs another agent as the target
-//     every thread-runtime path resolves through #getThreadRuntimeAgent()
-//     (:33612, `this.#threadRuntimeAgent ?? this`): subscribeToThread
-//     (:38197), claimThreadOwnership (:38203), sendMessage (:38331),
-//     queueMessage (:38337), sendStateSignal (:38355), sendNotificationSignal
-//     (through #sendNotificationSignalBatch, :38442 and :38510) and sendSignal
-//     (:38562). That is the fourth ground by installation rather than by call:
-//     the containment those inherited members rely on IS virtual dispatch on
-//     `this`, so one call moves every run those paths start onto an agent
-//     carrying none of these overrides — no caller-minted runId assertion, no
-//     executeWorkflow, no #startRequesters backstop. subscribeToThread drives
-//     no run of its own; the field moves its replay target all the same. It is
-//     public in the type surface (agent.d.ts:229 declares it with no modifier),
-//     so unlike getLegacyHandler it takes no private cast. Breakwater files it
+//     the thread-runtime paths resolve through #getThreadRuntimeAgent()
+//     (:33612, `this.#threadRuntimeAgent ?? this`); at this core they are
+//     subscribeToThread (:38197), claimThreadOwnership (:38203), sendMessage
+//     (:38331), queueMessage (:38337), sendStateSignal (:38355),
+//     sendNotificationSignal (through #sendNotificationSignalBatch, :38442 and
+//     :38510) and sendSignal (:38562). That is the fourth ground by
+//     installation rather than by call: the containment those inherited
+//     members rely on IS virtual dispatch on `this`, so one call moves every
+//     run those paths start onto an agent carrying none of these overrides —
+//     no caller-minted runId assertion, no executeWorkflow, no
+//     #startRequesters backstop. subscribeToThread drives no run of its own;
+//     the field moves its replay target all the same. It is public in the type
+//     surface (agent.d.ts:229 declares it with no modifier), so unlike
+//     getLegacyHandler it takes no private cast. Breakwater files it
 //     `explicitlyNonExecution` (agent.test.ts:879) for the reason it files the
 //     listings there: a narrowed HANDLE can only omit, so a setter is harmless
 //     there, while an INSTANCE Mastra calls in-process must throw.
@@ -647,7 +648,7 @@ export const BLOCKED_RUN_ENTRIES = {
   streamLegacy: LEGACY_FAMILY_REASON,
   sendToolApproval: THREAD_TOOL_APPROVAL_REASON,
   __setThreadRuntimeAgent:
-    "it installs the agent every thread-runtime path resolves its target through — subscribeToThread, claimThreadOwnership, sendMessage, queueMessage, sendStateSignal, sendNotificationSignal and sendSignal all read the field it writes — so one call moves every run those paths start, and subscribeToThread's replay target with them, onto an agent that carries none of this class's overrides: no caller-minted run id, no executeWorkflow, and no terminal refusal for a run the host start seam never registered",
+    "it installs the agent the thread-runtime paths resolve their target through — on @mastra/core 1.67.0 these are subscribeToThread, claimThreadOwnership, sendMessage, queueMessage, sendStateSignal, sendNotificationSignal and sendSignal, which read the field it writes — so one call moves every run those paths start, and subscribeToThread's replay target with them, onto an agent that carries none of this class's overrides: no caller-minted run id, no executeWorkflow, and no terminal refusal for a run the host start seam never registered",
 } as const;
 
 /**
@@ -1357,15 +1358,16 @@ export class FlowsafeDurableAgent<
 
   /**
    * Refuse the thread-runtime target swap newer cores add. It sets one private
-   * field, and every thread-runtime path — `subscribeToThread`,
-   * `claimThreadOwnership`, `sendMessage`, `queueMessage`, `sendStateSignal`,
-   * `sendNotificationSignal` and `sendSignal` — resolves its target through
-   * that field, falling back to `this`. So the containment those inherited
-   * members rely on is virtual dispatch on `this`, and one call to this setter
-   * moves every run they start, and `subscribeToThread`'s replay target with
-   * them, onto an agent with none of these overrides in the chain. That is the
-   * fourth ground reached by installing a second execution surface rather than
-   * by calling one.
+   * field, and the thread-runtime paths — on @mastra/core 1.67.0,
+   * `subscribeToThread`, `claimThreadOwnership`, `sendMessage`,
+   * `queueMessage`, `sendStateSignal`, `sendNotificationSignal` and
+   * `sendSignal` — resolve their target through that field, falling back to
+   * `this`. So the containment those inherited members rely on is virtual
+   * dispatch on `this`, and one call to this setter moves every run they
+   * start, and `subscribeToThread`'s replay target with them, onto an agent
+   * with none of these overrides in the chain. That is the fourth ground
+   * reached by installing a second execution surface rather than by calling
+   * one.
    *
    * Signature caveat: the parameter is `unknown` rather than core's
    * `Agent<any, any, any, any>` because the pinned 1.53.0 declares no such

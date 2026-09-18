@@ -6,9 +6,7 @@ import type { InitialAdmissionDatabase } from './fenced-workflow-capability.js';
 
 // PLACEMENT: the erased pins that hold sqliteUnitDatabase's declared return
 // against the D1 subsets these cases name live beside the D1 side of the same
-// seam, in test-support/d1-type-compatibility.ts. `architecture:check:rules`
-// drops packages/flowsafe/src/**/*.test.ts, so a pin written here would sit
-// outside the graph that gate reads.
+// seam, in test-support/d1-type-compatibility.ts, whose header states why.
 
 describe('native SQLite unit batch transport', () => {
   it('returns actual rows, executes DML once and preserves changes through SELECT', async () => {

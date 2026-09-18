@@ -502,7 +502,7 @@ const VERSION_SKEW = {
 } as const satisfies Record<string, { pin: SkewLevel; newest: SkewLevel }>;
 
 type SkewName = keyof typeof VERSION_SKEW;
-const skewNames = Object.keys(VERSION_SKEW) as SkewName[];
+const skewNames = Object.keys(VERSION_SKEW) as readonly SkewName[];
 
 interface FsModule {
   readFileSync(path: URL, encoding: 'utf8'): string;
@@ -642,7 +642,8 @@ function testAgent(id = 'writer'): Agent {
  * them fails loudly rather than turning its row quietly vacuous. The vacuous
  * rows take the inverted half of that control, which drives them the same way
  * and asserts the store was NOT reached — so each grading below is checked
- * rather than claimed, in whichever direction it goes.
+ * rather than claimed, in whichever direction it goes, on a core that exposes
+ * the member.
  *
  *  - Non-vacuous, one store method each: `getWorkflowRunById` for recover and
  *    the whole resume family; `listWorkflowRuns` for recoverActiveRuns,
@@ -670,9 +671,8 @@ function testAgent(id = 'writer'): Agent {
  *    (dist/storage-MbGlKLkB.js:150, :294-298) and then reads the in-memory maps
  *    and sets that state holds (:1011-1023). Neither path resolves a store, so
  *    the base reaches none here either — which is what the inverted control
- *    asserts on a core that exposes them. Their non-vacuous evidence is the
- *    refusal MESSAGE assertion too — the base returns where the override
- *    throws FlowSafe's tabled reason.
+ *    asserts. Their non-vacuous evidence is the refusal MESSAGE assertion too
+ *    — the base returns where the override throws FlowSafe's tabled reason.
  *
  * All spies are installed after construction AND after that resolution, so
  * neither Mastra's own setup nor the resolution itself can be mistaken for a
@@ -1124,6 +1124,85 @@ describe('FlowsafeDurableAgent prototype surface inventory', () => {
     ).toEqual(expected);
   });
 
+  it('keeps the durable-agents document naming every blocked entry', () => {
+    // #given docs/maintainer-guide.md makes the reason table authoritative and
+    // that document its mirror, and names this suite as the read a core bump
+    // forces. The document is resolved from import.meta.url, not
+    // process.cwd(): this suite runs under the package filter and under the
+    // root vitest project, which have different working directories.
+    const opener =
+      'The runner refuses every inherited entry point that falls under one of four grounds:';
+    const lines = builtin<FsModule>('node:fs')
+      .readFileSync(new URL('../../../../docs/durable-agents.md', HERE), 'utf8')
+      .split('\n');
+    const openerIndex = lines.indexOf(opener);
+    expect(
+      openerIndex,
+      `docs/durable-agents.md no longer carries "${opener}" — re-anchor this pin on the sentence that opens the grounds list.`,
+    ).toBeGreaterThanOrEqual(0);
+
+    // #when the backticked member names of the grounds bullets are collected
+    const bullets: string[] = [];
+    for (const line of lines.slice(openerIndex + 1)) {
+      if (line.startsWith('- ')) {
+        bullets.push(line);
+        continue;
+      }
+      if (bullets.length > 0) break;
+    }
+    const documented = new Set(
+      (bullets.join('\n').match(/`[A-Za-z_]+\(\)`/g) ?? []).map((backticked) =>
+        backticked.slice(1, -3),
+      ),
+    );
+
+    // #then every key of the reason table is among them. A SUBSET tie, not an
+    // equality: those bullets also name the thread-runtime readers and the
+    // entry points that already enforce the host-minted run id, in the same
+    // backticked form and with nothing separating them, so a name the document
+    // carries that is no key belongs there.
+    expect(
+      blockedEntries.filter((method) => !documented.has(method)),
+      'BLOCKED_RUN_ENTRIES names an entry that docs/durable-agents.md leaves out of its four grounds. The reason table is authoritative — document the entry under the ground it falls in, in the same commit.',
+    ).toEqual([]);
+  });
+
+  it('keeps the runner module comment naming every blocked entry', () => {
+    // #given docs/maintainer-guide.md names two mirrors that a core bump
+    // updates from the reason table in the same commit; the document above is
+    // one and the runner's own module comment is the other. That comment is
+    // the contiguous leading `//` block of durable-agent-runner.ts — from the
+    // top to the first line that does not start with `//`. The boundary is
+    // what keeps this honest: the block ends above the file's first import,
+    // far above BLOCKED_RUN_ENTRIES, so the pin cannot read the table it
+    // checks and pass for free.
+    const source = builtin<FsModule>('node:fs')
+      .readFileSync(new URL('./durable-agent-runner.ts', HERE), 'utf8')
+      .split('\n');
+    const commentEnd = source.findIndex((line) => !line.startsWith('//'));
+    expect(
+      commentEnd,
+      'durable-agent-runner.ts no longer opens with a `//` module comment — re-anchor this pin on whatever block now carries the four grounds.',
+    ).toBeGreaterThan(0);
+
+    // #when every member name in that block is collected. The comment writes
+    // them bare beside their dist offsets — listActiveThreadRuns() (:38214) —
+    // where the document backticks them, so the form here is `member()` with
+    // no fence around it.
+    const comment = source.slice(0, commentEnd).join('\n');
+    const named = new Set(
+      (comment.match(/[A-Za-z_]+\(\)/g) ?? []).map((call) => call.slice(0, -2)),
+    );
+
+    // #then every key of the reason table is among them — the same subset tie
+    // the document pin takes. The block names members that are not blocked at
+    // all, and naming one is not an error.
+    expect(
+      blockedEntries.filter((method) => !named.has(method)),
+      'BLOCKED_RUN_ENTRIES names an entry the runner module comment does not. docs/maintainer-guide.md makes the reason table authoritative and this comment one of its two mirrors, updated from the table in the same commit — never left to drift behind it.',
+    ).toEqual([]);
+  });
+
   it('keeps internal protocol constants off the public subpath', () => {
     // #then BLOCKED_RUN_ENTRIES is a reason table and
     // FLOWSAFE_PERSISTENCE_FORBIDDEN is a wire-format metadata key; exporting
@@ -1264,7 +1343,7 @@ describe('FlowsafeDurableAgent blocked recovery entry points', () => {
    * base path reaches no store to spy on, for the reasons registeredAgent()'s
    * notes give, so what is worth asserting about them is that absence.
    */
-  const vacuousByConstruction: readonly string[] = [
+  const vacuousByConstruction: readonly (keyof typeof BLOCKED_RUN_ENTRIES)[] = [
     '__setThreadRuntimeAgent',
     'generateLegacy',
     'listActiveThreadRuns',

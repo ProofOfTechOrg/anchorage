@@ -89,10 +89,12 @@ import {
 } from './durable-agent-runner.js';
 
 // A fake runtime that records register() and start() and models the shared-id
-// registry so the idempotency path is exercised. Cast to RunnerRuntime because
-// the runner only ever calls register/workflowIds/start/pubsub. `startResult`
-// overrides the summary start() resolves to (e.g. a 'failed' run); `pubsub`
-// exposes an identity for the inheritance test.
+// registry so the idempotency path is exercised. The cast to RunnerRuntime
+// stands on what the literal below implements — registerAgent, register,
+// workflowIds, start, resume, and pubsub when an override supplies it; a
+// runner call to any other member of the interface reaches undefined here and
+// throws. `startResult` overrides the summary start() resolves to (e.g. a
+// 'failed' run); `pubsub` exposes an identity for the inheritance test.
 function fakeRuntime(
   overrides: {
     pubsub?: unknown;

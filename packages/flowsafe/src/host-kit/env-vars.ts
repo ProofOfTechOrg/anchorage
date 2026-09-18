@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-// Env-var parsing shared by the Worker hosts (previously copied verbatim
-// into each). Fallback-not-fail is the numeric contract: maintenance and
-// auth must keep running on a typo'd var, and the config-error log line is
-// the operator's tripwire. The boolean contract is the opposite where it
-// matters: a kill switch fed garbage must KILL, not silently carry on — the
-// caller names its fail-closed value.
+// Env-var parsing shared by the Worker hosts. Fallback-not-fail is the
+// numeric contract: maintenance and auth must keep running on a typo'd var,
+// and the config-error log line is the operator's tripwire. The boolean
+// contract is the opposite where it matters: a kill switch fed garbage must
+// KILL, not silently carry on — the caller names its fail-closed value.
 
 export interface NumberVarOptions {
   /**

@@ -4,6 +4,10 @@ import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 
 import {
+  namesAnotherModule,
+  specifiersIn,
+} from '../../test-support/module-edges.js';
+import {
   openSqlite,
   type SqliteDatabase,
   sqliteUnitDatabase,
@@ -3136,45 +3140,20 @@ function siblingSource(file: string): string {
   );
 }
 
-/**
- * Each pattern is one line form a TypeScript source names another module in: a
- * `from` clause on an import or a re-export, a side-effect import, a dynamic
- * import, a module augmentation, a triple-slash reference. A form missing from
- * this list is an edge `declaredEdges` cannot see.
- */
-const EDGE_PATTERNS: readonly RegExp[] = [
-  /\bfrom\s*'([^']+)'\s*;?\s*$/,
-  /^\s*import\s*'([^']+)'\s*;?\s*$/,
-  /\bimport\(\s*'([^']+)'\s*\)/,
-  /^\s*declare\s+module\s+'([^']+)'/,
-  /^\s*\/\/\/\s*<reference\s+(?:path|types|lib)\s*=\s*"([^"]+)"/,
-];
-
-/** The module specifiers a source names, in source order. */
-function declaredEdges(source: string): string[] {
-  return source
-    .split('\n')
-    .flatMap((line) =>
-      EDGE_PATTERNS.map((pattern) => pattern.exec(line)?.[1]).filter(
-        (specifier): specifier is string => specifier !== undefined,
-      ),
-    );
-}
-
 describe('start-reservation contract evidence', () => {
   it('reads an edge out of each specifier form it lists', () => {
-    // The positive control for the case below: `architecture:check:rules`
-    // cruises packages but drops packages/flowsafe/src/**/*.test.ts, so no
-    // dependency-cruiser rule covers the leaf constraint and nothing outside
-    // this file checks the scan that does. A specifier form the patterns miss
-    // would leave that case green while the edge it forbids was added.
+    // The positive control for the case below and for the packed gates in
+    // ../../scripts, which scan with the same patterns: a specifier form the
+    // list misses would leave a scan green while the edge it forbids was
+    // added.
     expect(
-      declaredEdges(
+      specifiersIn(
         [
           "import { a } from './from-clause.js';",
           "export type { B } from './re-export.js';",
           "import './side-effect.js';",
           "const c = await import('./dynamic.js');",
+          "const d = require('./required.js');",
           "declare module './augmented.js' {",
           '/// <reference types="triple-slash" />',
           "const notAnEdge = 'plain string';",
@@ -3185,9 +3164,15 @@ describe('start-reservation contract evidence', () => {
       './re-export.js',
       './side-effect.js',
       './dynamic.js',
+      './required.js',
       './augmented.js',
       'triple-slash',
     ]);
+  });
+
+  it('separates a source that names a module from one that names none', () => {
+    expect(namesAnotherModule("export * from './barrel.js';")).toBe(true);
+    expect(namesAnotherModule("const notAnEdge = 'plain string';")).toBe(false);
   });
 
   it('keeps the reservation contract a leaf of three declared edges', () => {
@@ -3195,7 +3180,7 @@ describe('start-reservation contract evidence', () => {
     // this leaf into a store, a fence, Runtime or a capability, and admitting
     // one would put the fence's codecs behind the graph they decode for. Type-
     // only edges count — they are erased, and the boundary is not.
-    const edges = declaredEdges(
+    const edges = specifiersIn(
       siblingSource('./start-reservation-contract.ts'),
     );
     expect(edges).toEqual([

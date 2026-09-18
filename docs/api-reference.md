@@ -86,7 +86,7 @@ The subpath also exposes `D1FleetStateDatabase`, `D1CloudflareApiRateCoordinator
 
 Safe browser imports:
 
-- `@proofoftech/breakwater/policy-engine`, `@proofoftech/breakwater/rbac`, and `@proofoftech/breakwater/audit`, which the showcase control room bundles into its browser build
+- `@proofoftech/breakwater/policy-engine`, `@proofoftech/breakwater/rbac`, and `@proofoftech/breakwater/audit`
 - `@proofoftech/flowsafe/approval-ui`
 - `@proofoftech/flowsafe/signals/client`
 - `@proofoftech/flowsafe/do-runner/constants` and `@proofoftech/flowsafe/do-runner/testing`, which load without the runner graph

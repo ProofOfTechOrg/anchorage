@@ -71,19 +71,22 @@ directory when a `.github/**/*.{yml,yaml}` file is staged (lint-staged);
 pre-push runs react-doctor on the branch's changed files
 (`pnpm react-doctor:diff`; bypass with `git push --no-verify`). CI also runs a
 non-blocking compatibility probe against the newest `@mastra/core` 1.x release.
-The `verify` gate job requires every job in its `needs` list to succeed,
-`verify-core` and `direct-scenario` among them.
+The `protect main` ruleset requires the status check named `verify`, the gate
+job in `ci.yml`; `verify-core` and `direct-scenario` are in that job's `needs`
+list. Read the job for the rule it applies to that list.
 
 The showcase app uses mandatory absolute imports — `@/*` for `src`,
 `#worker/*` for worker modules, `@flowsafe/*` for deep flowsafe source
 imports — enforced by Biome.
 
-`pnpm docs:check` validates local links, Markdown anchors, documentation
-reachability, package README export coverage, published-package links, and
-TypeDoc entry-point coverage. It also requires one `@mastra/core` value across
-the `packages/*` manifests' `peerDependencies`, `devDependencies`, and
-`dependencies`, including private packages, plus peer/devDependency parity for
-libraries.
+`pnpm docs:check` runs the checks `scripts/docs-check.mjs` composes in
+`checkRepository`: local links, Markdown anchors, documentation reachability,
+package README export coverage, published-package links, the canonical public
+URLs the root README must carry, and TypeDoc entry-point coverage are among
+them. `checkMastraCoreAgreement` is another — it requires one `@mastra/core`
+value across the `packages/*` manifests' `peerDependencies`, `devDependencies`,
+and `dependencies`, including private packages, plus peer/devDependency parity
+for libraries.
 `pnpm docs:api` builds the generated API site in `docs/api/`; that directory is
 ignored and must not be committed. The scheduled external-link workflow runs
 `pnpm docs:check:external`.

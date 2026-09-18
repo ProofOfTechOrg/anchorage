@@ -1,5 +1,5 @@
 ---
-'@proofoftech/breakwater': patch
+'@proofoftech/breakwater': minor
 ---
 
 Build the connector conformance report even when a case throws a value that cannot say what it is.

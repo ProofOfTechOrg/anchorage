@@ -20,7 +20,7 @@ The workspace requires Node 22.22.0 or later and pnpm 10.16 or later. `packageMa
 
 ## Verification
 
-The commands below mirror the CI `verify-core` job after dependency installation, in order; `pnpm test` also covers the direct scenario project that CI runs in its own `direct-scenario` job, and the `verify` gate job requires every job in its `needs` list, these two among them, to succeed:
+The commands below mirror the CI `verify-core` job after dependency installation, in order; `pnpm test` also covers the direct scenario project that CI runs in its own `direct-scenario` job, and both jobs are in the `verify` gate job's `needs` list:
 
 ```bash
 pnpm github:check
@@ -129,15 +129,25 @@ A changeset describing the patch clears itself at release.
 
 The canary's typecheck and test steps cannot see a published-dist bundling regression: neither links Mastra's shipped output through a bundler. `pnpm --filter @proofoftech/flowsafe spike:bundle-check` is the canary's bundling proof, and against the pinned peer that role belongs to `spike:verify` and the showcase build inside `verify-core`. Note that its `--outdir .wrangler/bundle-check` resolves relative to the wrangler CONFIG directory, not the working directory, so the output lands in `packages/flowsafe/spike/.wrangler/bundle-check`; a working-directory-relative path silently writes one level deeper, outside the ignored path. The bundle step and the newest-core typecheck step each carry their own `continue-on-error`, so an expected upstream failure still lets the tripwire suites after them run.
 
-A second tripwire guards the durable agent surface. `packages/flowsafe/src/agent-runner/durable-agent-surface.test.ts` classifies every own member of Mastra's `DurableAgent.prototype`, and fails on any member the file does not classify. On a core upgrade it therefore demands reading the new member's implementation in the installed dist before classifying it — as a guarded entry point, a delegator, a refusal, or something that cannot drive a run. Never satisfy it by widening the non-execution list without that read. It pins the inherited `Agent.prototype` members the same way, since Mastra calls the agent instance and the instance inherits both surfaces. Breakwater carries its own inventory of `Agent.prototype` in `packages/breakwater/src/agent/agent.test.ts`, classifying the same surface for what a narrowed guarded handle may expose. The maintenance contract on a core bump: the reason table in `durable-agent-runner.ts` is authoritative, the surface test is what forces the read, the runner's module comment and [Durable agents](durable-agents.md) are updated from the table in the same commit — never left to drift behind it — and both two-core allowances are pruned when the pin moves — Breakwater's `forwardClassified` of every name the new pin now exposes, and the surface test's `VERSION_SKEW` of every row whose two levels the new pin makes agree — which their own tests assert. A core bump also re-reads `packages/flowsafe/src/do-runner/d1-storage.ts`'s exhaustive storage-domain capture: its `satisfies Record<keyof MastraStorageDomains, unknown>` stops compiling when the new core adds a domain, which is what the canary's `Typecheck libraries against newest core` step reports; 1.67.0 adds `workflowDefinitions` and `knowledge`. Naming the new domains in that capture does not compile against the pinned core, so they are classified when the pin moves. The `@mastra/core` patch is retired or re-cut in the same commit, through the procedure above.
+A second tripwire guards the durable agent surface. `packages/flowsafe/src/agent-runner/durable-agent-surface.test.ts` classifies every own member of Mastra's `DurableAgent.prototype`, and fails on any member the file does not classify. On a core upgrade it therefore demands reading the new member's implementation in the installed dist before classifying it — as a guarded entry point, a delegator, a refusal, or something that cannot drive a run. Never satisfy it by widening the non-execution list without that read. It pins the inherited `Agent.prototype` members the same way, since Mastra calls the agent instance and the instance inherits both surfaces. Breakwater carries its own inventory of `Agent.prototype` in `packages/breakwater/src/agent/agent.test.ts`, classifying the same surface for what a narrowed guarded handle may expose.
 
 Per-suspension deadlines couple to one undocumented Mastra behavior: a step arms a deadline through a reserved key in the payload it hands `suspend()`, which only reaches flowsafe because Mastra substitutes the schema-parsed suspend payload into the run summary (verified in the declared peer, 1.53.0). A change there — a different substitution, a different key for a nested suspension, or resume-data validation moving — silently disarms every deadline. Tripwire tests in `packages/flowsafe/src/do-runner/runtime.test.ts` pin the observed behavior: the reserved key surviving a schema that declares it, being stripped by a strict schema that does not, surviving a loose schema, and a nested suspension being refused rather than armed. Check them on every Mastra upgrade and treat a failure as a behavior change to document, never as a test to relax.
 
 Rolling this release back is not symmetric: 0.17.x has no deadline reader, so the first alarm a downgraded run object takes deletes the alarm and orphans every armed record. Re-upgrading heals only runs that later receive another lifecycle boundary — which excludes exactly the runs a suspension deadline exists for, since a suspended run waiting on a signal has no boundary but its own wake. Prefer rolling forward; if a downgrade is unavoidable, treat every deadline armed before it as lost.
 
+### Core bump maintenance contract
+
+A `@mastra/core` bump carries these obligations:
+
+- The reason table in `durable-agent-runner.ts` is authoritative, and `durable-agent-surface.test.ts` is what forces the read.
+- The runner's module comment and [Durable agents](durable-agents.md) are the table's two mirrors, updated from the table in the same commit — never left to drift behind it. The surface test pins each mirror against the table.
+- Both two-core allowances are pruned when the pin moves: Breakwater's `forwardClassified` of every name the new pin now exposes, and the surface test's `VERSION_SKEW` of every row whose two levels the new pin makes agree. Their own tests assert both.
+- `packages/flowsafe/src/do-runner/d1-storage.ts`'s exhaustive storage-domain capture is re-read: its `satisfies Record<keyof MastraStorageDomains, unknown>` stops compiling when the new core adds a domain, which is what the canary's `Typecheck libraries against newest core` step reports; 1.67.0 adds `workflowDefinitions` and `knowledge`. Naming the new domains in that capture does not compile against the pinned core, so they are classified when the pin moves.
+- The `@mastra/core` patch is retired or re-cut in the same commit, through the procedure above.
+
 ## Public documentation
 
-`pnpm docs:check` validates local links and anchors, package export coverage, TypeDoc entry coverage, npm-safe package links, orphaned public pages, stale internal markers, manifest-backed Node engine and peer-dependency claims, and one `@mastra/core` value across the `packages/*` manifests' `peerDependencies`, `devDependencies`, and `dependencies`, including private packages, with peer/devDependency parity for libraries. `pnpm docs:api` builds all supported API surfaces, including the React UI in its own TypeScript program.
+`pnpm docs:check` runs the checks `scripts/docs-check.mjs` composes in `checkRepository`. They include local links and anchors, the canonical public URLs the root README must carry, package export coverage, TypeDoc entry coverage, npm-safe package links, orphaned public pages, stale internal markers, manifest-backed Node engine and peer-dependency claims, and one `@mastra/core` value across the `packages/*` manifests' `peerDependencies`, `devDependencies`, and `dependencies`, including private packages, with peer/devDependency parity for libraries. `pnpm docs:api` builds all supported API surfaces, including the React UI in its own TypeScript program.
 
 Do not place implementation plans or agent instructions in the public navigation. Uncommitted designs belong under `docs/proposals/` with an explicit proposal banner.
 
@@ -155,7 +165,7 @@ Repository administrators separately own:
 
 Do not change those external controls as a side effect of an unrelated code change.
 The `protect main` ruleset requires the status check named `verify`, the gate job
-in `ci.yml`; it fails unless its `needs` list carries at least one job and every
-job in that list reports success, so a new gating job joins the list, not the
-ruleset. A push to `main` starts `ci.yml` and `release.yml` concurrently, and the
-release workflow does not wait for CI's result.
+in `ci.yml`. Read that job for the rule it applies to its `needs` list; a new
+gating job joins that list, not the ruleset. A push to `main` starts `ci.yml` and
+`release.yml` concurrently, and the release workflow does not wait for CI's
+result.

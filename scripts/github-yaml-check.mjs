@@ -1,7 +1,9 @@
-import { lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
+import { lstatSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, extname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isMap, parseDocument } from 'yaml';
+
+import { isInvokedAsEntryPoint } from './entry-point.mjs';
 
 const FORBIDDEN_CHARACTER =
   // biome-ignore lint/suspicious/noControlCharactersInRegex: YAML excludes these code points from streams.
@@ -232,17 +234,6 @@ function main() {
   process.exitCode = runGithubYamlCheck(join(root, '.github'));
 }
 
-// Both sides are realpathed, so a symlinked invocation still resolves to this
-// module's own path. An entry path that resolves to nothing names some other
-// module, which importers of this one rely on.
-let invokedFilePath;
-try {
-  invokedFilePath =
-    process.argv[1] === undefined ? undefined : realpathSync(process.argv[1]);
-} catch (error) {
-  if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') throw error;
-}
-
-if (invokedFilePath === realpathSync(fileURLToPath(import.meta.url))) {
+if (isInvokedAsEntryPoint(import.meta.url)) {
   main();
 }

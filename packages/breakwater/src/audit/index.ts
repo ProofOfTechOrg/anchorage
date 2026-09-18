@@ -75,7 +75,7 @@ const AGENT_AUDIT_OPTIONAL_FIELD_SET: Record<AgentAuditOptionalField, true> = {
 
 const AGENT_AUDIT_OPTIONAL_FIELDS = Object.keys(
   AGENT_AUDIT_OPTIONAL_FIELD_SET,
-) as AgentAuditOptionalField[];
+) as readonly AgentAuditOptionalField[];
 
 /**
  * Read only the documented scalar fields from trusted request context.

@@ -53,7 +53,7 @@ function gitRevision() {
   return result.stdout.trim();
 }
 
-function convert(optionsFile, jsonFile, htmlDirectory, revision) {
+function convert(optionsFile, jsonFile, htmlDirectory, sourceRevision) {
   run(pnpm, [
     'exec',
     'typedoc',
@@ -65,7 +65,7 @@ function convert(optionsFile, jsonFile, htmlDirectory, revision) {
     '--out',
     htmlDirectory,
     '--gitRevision',
-    revision,
+    sourceRevision,
   ]);
 
   if (!existsSync(jsonFile)) {

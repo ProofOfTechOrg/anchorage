@@ -11,6 +11,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { namesAnotherModule } from '../test-support/module-edges.ts';
 import { assertAttwEsmPackage } from './attw-pack-check.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -79,22 +80,6 @@ try {
       join(temporary, 'package', 'dist', 'signals', fileName),
       'utf8',
     );
-  // Each pattern is one line form a module names another in: a `from` clause
-  // on an import or a re-export, a side-effect import, a dynamic import, a
-  // `require`, a module augmentation, a triple-slash reference. A form missing
-  // from this list is an edge the two checks below cannot see.
-  const edgePatterns = [
-    /\bfrom\s*['"][^'"]+['"]\s*;?\s*$/,
-    /^\s*import\s*['"][^'"]+['"]\s*;?\s*$/,
-    /\bimport\(\s*['"][^'"]+['"]\s*\)/,
-    /\brequire\(\s*['"][^'"]+['"]\s*\)/,
-    /^\s*declare\s+module\s+['"][^'"]+['"]/,
-    /^\s*\/\/\/\s*<reference\s+(?:path|types|lib)\s*=/,
-  ];
-  const namesAnotherModule = (source) =>
-    source
-      .split('\n')
-      .some((line) => edgePatterns.some((pattern) => pattern.test(line)));
 
   const client = packedSignalsFile('client.js');
   if (

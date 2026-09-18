@@ -510,6 +510,29 @@ describe('guarded construction and processor validation', () => {
   });
 
   it.each([
+    'processInput',
+    'processInputStep',
+    'computeStateSignal',
+    'processLLMRequest',
+    'processLLMResponse',
+    'processOutputStep',
+    'processAPIError',
+  ])('rejects output processor hook %s', (hook) => {
+    const processor = {
+      id: `output-${hook}`,
+      processOutputStream: (args: ProcessOutputStreamArgs) => args.part,
+      processOutputResult: (args: ProcessOutputResultArgs) => args.messages,
+      [hook]: () => undefined,
+    };
+
+    expect(() =>
+      guarded({
+        applicationOutputProcessors: [processor as never],
+      }),
+    ).toThrow(new RegExp(`must not implement ${hook}`));
+  });
+
+  it.each([
     'breakwater-rbac',
     'breakwater-policy-engine',
   ])("rejects reserved application processor id '%s'", (id) => {
@@ -856,8 +879,7 @@ describe('Mastra Agent execution-entry inventory', () => {
       'streamUntilIdle',
     ];
     // A narrowed handle can only omit, so a setter or data-returning member
-    // is harmless here; flowsafe blocks these same members on the instance
-    // Mastra calls in-process.
+    // is harmless here.
     const explicitlyNonExecution = [
       '__fork',
       '__getDrainPendingSignals',

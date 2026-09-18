@@ -12,7 +12,6 @@
   // resolves.
   "include": [
     "packages/breakwater/worker-tests/**/*.ts",
-    "packages/fleet-control/vitest.direct-scenario.config.ts",
     "packages/flowsafe/src/cloudflare-fidelity.workerd.test.ts",
     "packages/flowsafe/test-support/cloudflare-test-worker.ts",
     "packages/flowsafe/test-support/harness-probe.ts",

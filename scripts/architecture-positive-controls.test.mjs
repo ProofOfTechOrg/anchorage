@@ -43,6 +43,12 @@ const root = fileURLToPath(new URL('..', import.meta.url));
 const directScenarioProject =
   'packages/fleet-control/vitest.direct-scenario.config.ts';
 const fleetControlProject = 'packages/fleet-control/vitest.config.ts';
+const rootProjectPaths = [
+  ...globSync('vitest.*.config.*', { cwd: root }).map((match) =>
+    match.split('\\').join('/'),
+  ),
+  directScenarioProject,
+];
 const rootProjectNames = {
   [directScenarioProject]: 'fleet-control-direct-scenario',
   'vitest.breakwater-workers.config.mts': 'breakwater-workers',
@@ -252,7 +258,7 @@ test('production transport class implementations are forbidden operation targets
     assert.ok(module, `missing module symbol for ${file}`);
     const exported = checker
       .getExportsOfModule(module)
-      .find((symbol) => symbol.name === name);
+      .find((candidate) => candidate.name === name);
     assert.ok(exported, `missing port ${name} in ${file}`);
     const symbol =
       exported.flags & ts.SymbolFlags.Alias
@@ -328,7 +334,8 @@ test('production transport class implementations are forbidden operation targets
 
 test('Worker control-plane core policy admits crypto and async_hooks', () => {
   const rule = architectureRules.find(
-    (rule) => rule.name === 'fleet-control-worker-entry-limits-core-imports',
+    (candidate) =>
+      candidate.name === 'fleet-control-worker-entry-limits-core-imports',
   );
   assert.ok(rule);
   const entry = 'packages/fleet-control/src/cloudflare-control-plane.ts';
@@ -395,8 +402,9 @@ test('every extra cruise entry is keyed by an architecture rule', () => {
 // through vitest, which would pull the Workers pool and workerd into this
 // process. Resolution is node's `globSync`, assumed to answer a `projects`
 // entry and an `include` entry the way vitest's and tsc's own resolvers do;
-// what the controls add over vitest's startup error is the `deepEqual` over
-// the resolved entries, which names a config no entry reaches.
+// what the membership control below adds over vitest's startup error is the
+// `deepEqual` over the resolved entries, which names a config no entry
+// reaches.
 const parse = (projectPath) => {
   const fileName = join(root, projectPath);
   return ts.createSourceFile(
@@ -495,23 +503,24 @@ test('the root vitest projects resolve to exactly the config files the repositor
     .filter((entry) => entry.isDirectory())
     .map((entry) => `packages/${entry.name}/vitest.config.ts`)
     .filter((projectPath) => existsSync(join(root, projectPath)));
-  const rootProjects = globSync('vitest.*.config.*', { cwd: root }).map(
-    (match) => match.split('\\').join('/'),
-  );
   assert.deepEqual(
     [...resolved].sort(),
-    [...packageProjects, ...rootProjects, directScenarioProject].sort(),
+    [...packageProjects, ...rootProjectPaths].sort(),
   );
 });
 
 test('every root vitest project declares its expected name', () => {
-  for (const [projectPath, expected] of Object.entries(rootProjectNames)) {
+  assert.deepEqual(
+    Object.keys(rootProjectNames).sort(),
+    [...rootProjectPaths].sort(),
+  );
+  for (const projectPath of rootProjectPaths) {
     const projectName = initializerOf(parse(projectPath), 'name');
     assert.ok(
       ts.isStringLiteralLike(projectName),
       `${projectPath} names its project with a string literal`,
     );
-    assert.equal(projectName.text, expected, projectPath);
+    assert.equal(projectName.text, rootProjectNames[projectPath], projectPath);
   }
 });
 
@@ -532,7 +541,7 @@ test('the direct-scenario suites are declared by that project and excluded from 
 });
 
 test('every root vitest project include entry resolves to a file', () => {
-  for (const projectPath of Object.keys(rootProjectNames)) {
+  for (const projectPath of rootProjectPaths) {
     const projectRoot = dirname(join(root, projectPath));
     for (const entry of stringsOf(parse(projectPath), 'include')) {
       assert.ok(

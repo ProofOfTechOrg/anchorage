@@ -124,7 +124,7 @@ The account SDK and raw transport, the plain Worker maintenance transport, and t
 
 ### Direct Cloudflare API backend
 
-`CloudflareApiPlainWorkerBackend` runs only in the trusted control plane. Give its `CloudflareProvisioningClient` an account-scoped token limited to the account it provisions. The direct backend needs `Workers Scripts Edit`, `D1 Edit`, `Zone Read`, `Workers Routes Read`, `Workers Routes Write`, and `API Tokens Read`. Add [`Workers R2 Storage Edit`](https://developers.cloudflare.com/r2/api/tokens/#permission-groups) only when the fleet provisions application R2 buckets. Cloudflare requires `D1 Edit` for HTTP API writes, including identity seeding and ledgered migrations. The [Fleet Control guide's environment requirements](fleet-control.md#implement-the-artifact-contract) name the same grants for a credentialed run and lead where the two disagree.
+`CloudflareApiPlainWorkerBackend` runs only in the trusted control plane. Give its `CloudflareProvisioningClient` an account-scoped token limited to the account it provisions. The direct backend needs `Workers Scripts Edit`, `D1 Edit`, `Zone Read`, `Workers Routes Read`, `Workers Routes Write`, and `API Tokens Read`. Add [`Workers R2 Storage Edit`](https://developers.cloudflare.com/r2/api/tokens/#permission-groups) only when the fleet provisions application R2 buckets. Cloudflare requires `D1 Edit` for HTTP API writes, including identity seeding and ledgered migrations. The [Fleet Control guide's environment requirements](fleet-control.md#implement-the-artifact-contract) name the grants a credentialed run needs and lead where the two disagree.
 
 The direct backend's client paths call these Cloudflare API route families:
 

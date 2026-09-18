@@ -146,13 +146,14 @@ jobs:
 
       # The Workers for Platforms artifact contract. The paid gate
       # (pnpm fleet-control:credentialed) needs a scratch account with a
-      # subscription, so these two steps are what stands between a contract
-      # change and finding out on a billed run: the first proves the shipped
-      # operator configuration still satisfies fleet control's own validators
-      # and matches the harness wrangler configs, the second builds every
-      # artifact `build-conformance.mjs`'s `ARTIFACTS` list declares and drives
-      # every locally-provable action on real workerd, including one approval
-      # suspended across the v1-to-v2 release update.
+      # subscription, so the steps below are what stands between a contract
+      # change and finding out on a billed run: `test:conformance-config`
+      # proves the shipped operator configuration still satisfies fleet
+      # control's own validators and matches the harness wrangler configs, and
+      # `conformance:verify` builds every artifact `build-conformance.mjs`'s
+      # `ARTIFACTS` list declares and drives every locally-provable action on
+      # real workerd, including one approval suspended across the v1-to-v2
+      # release update.
       - name: Verify the conformance operator configuration
         run: pnpm test:conformance-config
 
@@ -216,11 +217,12 @@ jobs:
   # shape, the reprocess-part key, the adapter's table inventory). The supported
   # peer is exactly 1.53.0; run the library suites against the newest
   # published 1.x as a signal for a deliberate future compatibility update.
-  # The tripwire tests are the teeth: the runtime.test.ts merge pin, the
+  # Tripwires the job exercises include the runtime.test.ts merge pin, the
   # ProcessorRunner reprocess-key probe, mastra-schema-guard, the
-  # durable-agent-surface inventory, and breakwater's own agent.test.ts
+  # durable-agent-surface inventory, breakwater's own agent.test.ts
   # Agent.prototype inventory (whose forwardClassified allowlist is asserted
-  # against THIS job's newer core, not just the pin). See the maintainer
+  # against THIS job's newer core, not just the pin), and, through the
+  # typecheck step, d1-storage.ts's storage-domain capture. See the maintainer
   # guide's Mastra compatibility section for why bundling needs its own step.
   mastra-compat:
     runs-on: ubuntu-latest
@@ -295,7 +297,10 @@ jobs:
           test "$EXPECTED_CORE" = "$INSTALLED_CORE"
           test "$EXPECTED_D1" = "$INSTALLED_D1"
 
+      # Step-level continue-on-error, not just the job's: a red step would
+      # otherwise skip the bundling and tripwire steps below.
       - name: Typecheck libraries against newest core
+        id: typecheck
         continue-on-error: true
         run: pnpm --filter @proofoftech/breakwater typecheck && pnpm --filter @proofoftech/flowsafe typecheck
 
@@ -309,11 +314,12 @@ jobs:
         continue-on-error: true
         run: pnpm --filter @proofoftech/flowsafe spike:bundle-check
 
-      # Step-level continue-on-error hides the bundle result from the job status
-      # by design; surface it on the run summary so a flip (upstream fix, or a
+      # Step-level continue-on-error hides these results from the job status by
+      # design; surface them on the run summary so a flip (upstream fix, or a
       # new regression) is visible without opening the log.
-      - name: Report bundling outcome
+      - name: Report typecheck and bundling outcomes
         run: |
+          echo "library typecheck against newest core: ${{ steps.typecheck.outcome }}" >> "$GITHUB_STEP_SUMMARY"
           echo "spike bundle against newest core: ${{ steps.bundle.outcome }}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Test libraries against newest core

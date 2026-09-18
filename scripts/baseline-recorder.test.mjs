@@ -49,6 +49,10 @@ function fixture(
     join(repositoryRoot, 'scripts/baseline-recorder.mjs'),
     join(root, 'scripts/baseline-recorder.mjs'),
   );
+  copyFileSync(
+    join(repositoryRoot, 'scripts/entry-point.mjs'),
+    join(root, 'scripts/entry-point.mjs'),
+  );
   const { packageManager } = JSON.parse(
     readFileSync(join(repositoryRoot, 'package.json'), 'utf8'),
   );
@@ -153,9 +157,9 @@ async function run(
     else process.kill(-child.pid, 'SIGKILL');
   }, 15_000);
   try {
-    const result = await new Promise((resolve, reject) => {
+    const result = await new Promise((settle, reject) => {
       child.once('error', reject);
-      child.once('close', (status, signal) => resolve({ status, signal }));
+      child.once('close', (status, signal) => settle({ status, signal }));
     });
     assert.equal(
       timedOut,

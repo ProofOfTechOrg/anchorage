@@ -6,7 +6,8 @@ import { register } from 'node:module';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import process from 'node:process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { isMainThread } from 'node:worker_threads';
+
+import { isInvokedAsEntryPoint } from './entry-point.mjs';
 
 const REPOSITORY_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 // `pnpm exec` rather than a hard-coded node_modules/.bin path, matching
@@ -410,8 +411,9 @@ async function main(config, argv) {
  * key order and undefined-valued key presence are significant.
  */
 export async function runBaselineRecorder(config) {
-  const entry = process.argv[1];
-  if (!entry) return;
+  // An entry-less process has nothing to compare, so it returns ahead of the
+  // scriptUrl validation rather than throwing on a caller that configured none.
+  if (!process.argv[1]) return;
   let scriptUrl;
   try {
     scriptUrl = new URL(config.scriptUrl);
@@ -425,23 +427,6 @@ export async function runBaselineRecorder(config) {
   if (!statSync(recorderFilePath).isFile()) {
     throw new Error('recorder scriptUrl must name a file');
   }
-  // Worker files inherit the parent process's eval flags.
-  if (
-    entry === '-' ||
-    (!isMainThread && !isAbsolute(entry)) ||
-    (isMainThread &&
-      process.execArgv.some((argument) =>
-        /^(?:-[ep]|--(?:eval|print)(?:=|$))/u.test(argument),
-      ))
-  )
-    return;
-  let invokedFilePath;
-  try {
-    invokedFilePath = realpathSync(resolve(entry));
-  } catch (error) {
-    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return;
-    throw error;
-  }
-  if (invokedFilePath !== recorderFilePath) return;
+  if (!isInvokedAsEntryPoint(scriptUrl)) return;
   process.exitCode = await main(config, process.argv.slice(2));
 }

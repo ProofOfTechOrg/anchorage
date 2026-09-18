@@ -47,9 +47,10 @@ import {
 import type {
   AtomicIdempotencyStore,
   Connector,
+  ConnectorConfig,
   ConnectorEgressPosture,
   ConnectorInvocationOptions,
-  ConnectorPolicies,
+  ConnectorRuntime,
   IdempotencyInspection,
   IdempotencyRecord,
   IdempotencyReservation,
@@ -64,7 +65,6 @@ import {
   type ConnectorConformanceReport,
   createConformanceAssertion,
 } from './egress-conformance.js';
-import type { EgressGuardedFetch } from './egress-fetch.js';
 import {
   EgressDeniedError,
   EgressGuardError,
@@ -360,68 +360,13 @@ export class InMemoryRateLimitStore implements RateLimitStore {
   }
 }
 
-export type { ConnectorPolicies } from './contracts.js';
-
-/**
- * Per-execution runtime handed to `execute`/`dryRunExecute` as the third
- * argument. `fetch` is bound to the manifest's declared `egress`: every
- * actual request — redirect hops included — must resolve to a declared host
- * or it is denied (`ConnectorPolicyError`, policy 'egress-fetch') and
- * audited. This is the runtime half of the egress posture (the networkEgress
- * policy gates the declared list; this guard pins actual requests to it), so
- * actual ⊆ declared ⊆ org-allowed. A manifest with no `egress` gets a fetch
- * that denies everything. A vendor SDK carrying its own HTTP stack bypasses
- * the guard — route its traffic through this fetch (most SDKs accept a
- * fetch/transport option), or declare that connector
- * `permissions.egressEnforcement: 'declaration-only'`, the posture
- * `connectorEgressPosture()` then reads back.
- */
-export interface ConnectorRuntime {
-  /** Fetch guarded by the connector manifest's declared egress hosts. */
-  fetch: EgressGuardedFetch;
-}
-
-/** Definition compiled by `createConnector()` into an enforced Mastra tool. */
-export interface ConnectorConfig<TInput = unknown, TOutput = unknown> {
-  /**
-   * Stable, colon-free connector identifier. The colon restriction keeps the
-   * unchanged `[scope:]connector` rate-budget key injective.
-   */
-  id: string;
-  /** Description presented to the model and tool consumers. */
-  description: string;
-  /** Optional schema that Mastra validates before connector policies run. */
-  inputSchema?: PublicSchema<TInput>;
-  /**
-   * Optional schema Breakwater validates/transforms before replay commit;
-   * Mastra consumes the captured Standard Schema result without rerunning it.
-   */
-  outputSchema?: PublicSchema<TOutput>;
-  /** Execute the connector after every configured gate has allowed the call. */
-  execute: (
-    inputData: TInput,
-    context: ToolExecutionContext,
-    runtime: ConnectorRuntime,
-  ) => Promise<TOutput>;
-  /**
-   * Side-effect-free simulation of `execute`, returning the same output
-   * shape. Required when `permissions.dryRun` is declared, forbidden
-   * otherwise — the manifest must state what the connector supports. Gets
-   * the same egress-guarded runtime as `execute`: a simulation's read-only
-   * vendor calls stay inside the declared egress too.
-   */
-  dryRunExecute?: (
-    inputData: TInput,
-    context: ToolExecutionContext,
-    runtime: ConnectorRuntime,
-  ) => Promise<TOutput>;
-  /** Enforced declaration of side effects and supported controls. */
-  permissions: PermissionManifest;
-  /** Omit for an ungated connector (classification + audit only). */
-  policies?: ConnectorPolicies;
-}
-
-export type { Connector, ConnectorInvocationOptions } from './contracts.js';
+export type {
+  Connector,
+  ConnectorConfig,
+  ConnectorInvocationOptions,
+  ConnectorPolicies,
+  ConnectorRuntime,
+} from './contracts.js';
 
 /** Exact suspension identity shared by a resume leg and its grants. */
 export interface ConnectorApprovalSuspension {
@@ -881,13 +826,14 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
       `connector id '${id}' must not contain a colon: the rate-limit budget key remains '<scope>:<id>', so a colon in id can collide two distinct tuples on a shared store. Use a colon-free id (camelCase or dot-delimited).`,
     );
   }
+  const permissions = config.permissions;
   const requiredPermissions = normalizedRequiredPermissions(
     id,
-    config.permissions.requiredPermissions,
+    permissions.requiredPermissions,
   );
   const manifest: PermissionManifest = Object.freeze({
-    ...config.permissions,
-    egress: Object.freeze([...(config.permissions.egress ?? [])]),
+    ...permissions,
+    egress: Object.freeze([...(permissions.egress ?? [])]),
     ...(requiredPermissions !== undefined ? { requiredPermissions } : {}),
   });
   assertEgressHostList(
@@ -907,14 +853,14 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
   const baseEgressGuard = egressFetch(manifest.egress ?? [], {
     fetch: policies.fetch,
   });
+  const inputSchema = config.inputSchema;
   const toolInputSchema =
-    config.inputSchema === undefined
+    inputSchema === undefined
       ? undefined
-      : pinInputValidationBoundary(config.inputSchema);
+      : pinInputValidationBoundary(inputSchema);
+  const outputSchema = config.outputSchema;
   const outputValidator =
-    config.outputSchema === undefined
-      ? undefined
-      : toStandardSchema(config.outputSchema);
+    outputSchema === undefined ? undefined : toStandardSchema(outputSchema);
   // Keep the backing validator and receiver fixed just like the input facade;
   // the outer Mastra schema remains separately fingerprinted for direct calls.
   const outputStandard = outputValidator?.['~standard'];
@@ -936,12 +882,15 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
       `connector ${id}: policies.idempotencyKeyMigration must be 'legacy-writers-drained' when provided`,
     );
   }
-  if (manifest.dryRun && !config.dryRunExecute) {
+  // Sampled once here; the dry-run branch reads it again per call, which is
+  // why that read is not shared with this one.
+  const dryRunExecute = config.dryRunExecute;
+  if (manifest.dryRun && !dryRunExecute) {
     throw new TypeError(
       `connector ${id}: permissions.dryRun requires config.dryRunExecute (the side-effect-free simulation)`,
     );
   }
-  if (config.dryRunExecute && !manifest.dryRun) {
+  if (dryRunExecute && !manifest.dryRun) {
     throw new TypeError(
       `connector ${id}: config.dryRunExecute requires permissions.dryRun (the manifest must declare what the connector supports)`,
     );
@@ -1927,7 +1876,8 @@ export async function invokeConnector<TInput, TOutput>(
       'invokeConnector refuses a connector whose execution boundary was modified after construction',
     );
   }
-  if (options.toolCallId !== undefined && !nonEmptyString(options.toolCallId)) {
+  const toolCallId = options.toolCallId;
+  if (toolCallId !== undefined && !nonEmptyString(toolCallId)) {
     throw new ConnectorInvocationError(
       invocation.id,
       'CONNECTOR_INVOCATION_OPTIONS_INVALID',
@@ -1937,9 +1887,7 @@ export async function invokeConnector<TInput, TOutput>(
 
   const state: DirectInvocationState = {
     entered: false,
-    ...(options.toolCallId === undefined
-      ? {}
-      : { toolCallId: options.toolCallId }),
+    ...(toolCallId === undefined ? {} : { toolCallId }),
   };
   const context: DirectInvocationContext = {
     requestContext: options.requestContext ?? new RequestContext(),

@@ -1,5 +1,5 @@
 ---
-'@proofoftech/breakwater': patch
+'@proofoftech/breakwater': minor
 ---
 
 Name the settled case on a late conformance finding as a field, not only in prose.

@@ -13,9 +13,8 @@ import { defineConfig } from 'vitest/config';
 //
 // `wrangler.configPath` and the test `include` resolve against different bases.
 // `configPath` is file-relative, built from `import.meta.url`. The `include` is
-// repository-relative because this config sits at the repository root:
-// `vitest.config.ts` registers this file by path, and vitest roots a project at
-// its config file's own directory.
+// repository-relative because this config sits at the repository root: vitest
+// roots a project at its config file's own directory.
 export default defineConfig({
   plugins: [
     cloudflareTest({

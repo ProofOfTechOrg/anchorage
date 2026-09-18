@@ -9,7 +9,7 @@ Repository documentation, architecture, and publication checks. Markdown syntax 
   and external links.
 - `docs-check.test.mjs` — `node:test` fixtures for the documentation checker.
 - `github-yaml-check.mjs` — validates every YAML file under `.github`.
-- `github-yaml-check.test.mjs` — `node:test` fixtures for the GitHub YAML checker, and the cases that pin `ci.yml`'s `verify` gate.
+- `github-yaml-check.test.mjs` — `node:test` fixtures for the GitHub YAML checker, and the cases that pin `ci.yml` rather than the checker.
 - `publish-ordered.mjs` — publishes the `PUBLISH_PREREQUISITES` packages before the Changesets remainder and gates release on prerequisite peer floors.
 - `publish-ordered.test.mjs` — `node:test` fixtures for publish ordering, the
   publish argv and cwd shape, and the tag line `changesets/action` greps for.
@@ -19,6 +19,9 @@ Repository documentation, architecture, and publication checks. Markdown syntax 
   satisfy fleet control's own validators. Lives here because
   `.dependency-cruiser.cjs` forbids anything under `packages/` from importing
   fleet control.
+- `architecture-positive-controls.test.mjs` — `node:test` positive controls for the `.dependency-cruiser.cjs` rules and the root vitest and `tsconfig.harness.json` registries; run with `pnpm architecture:controls`.
+- `entry-point.mjs` — `isInvokedAsEntryPoint(importMetaUrl)`, the entry-point predicate the root scripts guard their side effects with. The disposition it carries is documented on the export.
+- `entry-point.test.mjs` — run with `node --test scripts/entry-point.test.mjs`.
 - [`baseline-recorder.mjs`](baseline-recorder.mjs): recorder configuration and supported literal values are documented on `runBaselineRecorder`.
 - [`baseline-recorder.test.mjs`](baseline-recorder.test.mjs): run with `node --test scripts/baseline-recorder.test.mjs`.
 - [`record-drain-baseline.mjs`](record-drain-baseline.mjs): inventory recorder. Golden assertions live in [`cloudflare-client.test.ts`](../packages/fleet-control/test/cloudflare-client.test.ts).
@@ -27,6 +30,8 @@ Repository documentation, architecture, and publication checks. Markdown syntax 
 - [`workerd-server-lifecycle.mjs`](workerd-server-lifecycle.mjs)
 - `workerd-server-lifecycle.test.mjs` — its vitest suite, run through the root
   `vitest.workerd-lifecycle.config.ts` project.
+- `flowsafe-harness.test.ts` — the wrangler `createTestHarness` suite for the flowsafe worker, run through the root `vitest.flowsafe-harness.config.ts` project.
+- `r2-type-compatibility.ts` — type-only assertion that the root toolchain's `R2Bucket` satisfies flowsafe's `ArtifactBucket` seam; a member of the `tsconfig.harness.json` program (`pnpm typecheck:harness`).
 
 ## Record or compare a baseline
 

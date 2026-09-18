@@ -33,6 +33,7 @@
     "examples",
     "vitest.config.ts",
     "test-support/d1-type-compatibility.ts",
+    "test-support/module-edges.ts",
     "test-support/r2-type-compatibility.ts",
     "deploy/worker.ts",
     "deploy/worker.e2e.test.ts"

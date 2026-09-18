@@ -370,26 +370,30 @@ function expectP3EpochRefusal(
   });
 }
 
-function expectP3Preserved(result: P3ScheduleResult) {
-  expect(JSON.stringify(result.after)).toBe(JSON.stringify(result.intervened));
-  expect(result.fenceAfter).toEqual(result.fenceBeforeRelease);
-  expectP3Metrics(result.metrics);
+function expectP3Preserved(scheduleResult: P3ScheduleResult) {
+  expect(JSON.stringify(scheduleResult.after)).toBe(
+    JSON.stringify(scheduleResult.intervened),
+  );
+  expect(scheduleResult.fenceAfter).toEqual(scheduleResult.fenceBeforeRelease);
+  expectP3Metrics(scheduleResult.metrics);
 }
 
-function expectP3RunRefused(result: P3RunResult) {
-  expect(JSON.stringify(result.after)).toBe(JSON.stringify(result.before));
-  expect(result.effectsAfterRequest).toBe(0);
-  expect(result.cachedAfterRequest).toBe(false);
-  expect(result.activeAfterRequest).toBe(false);
-  expect(result.after.snapshots).toEqual([]);
-  expect(result.positive).toMatchObject({
+function expectP3RunRefused(runResult: P3RunResult) {
+  expect(JSON.stringify(runResult.after)).toBe(
+    JSON.stringify(runResult.before),
+  );
+  expect(runResult.effectsAfterRequest).toBe(0);
+  expect(runResult.cachedAfterRequest).toBe(false);
+  expect(runResult.activeAfterRequest).toBe(false);
+  expect(runResult.after.snapshots).toEqual([]);
+  expect(runResult.positive).toMatchObject({
     status: 'success',
     result: { value: 'positive' },
   });
-  expect(result.effects).toBe(1);
-  expect(result.positiveRows.snapshots).toHaveLength(1);
-  expect(result.fenceAfter).toEqual(result.fenceBeforeRelease);
-  expectP3Metrics(result.metrics);
+  expect(runResult.effects).toBe(1);
+  expect(runResult.positiveRows.snapshots).toHaveLength(1);
+  expect(runResult.fenceAfter).toEqual(runResult.fenceBeforeRelease);
+  expectP3Metrics(runResult.metrics);
 }
 
 describe.sequential('FlowSafe Wrangler test harness', () => {

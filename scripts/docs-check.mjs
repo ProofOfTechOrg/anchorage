@@ -1,13 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from 'node:child_process';
-import {
-  existsSync,
-  readdirSync,
-  readFileSync,
-  realpathSync,
-  statSync,
-} from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import {
   basename,
   dirname,
@@ -25,6 +19,8 @@ import remarkGfm from 'remark-gfm';
 import remarkParse from 'remark-parse';
 import { unified } from 'unified';
 import { visit } from 'unist-util-visit';
+
+import { isInvokedAsEntryPoint } from './entry-point.mjs';
 
 const IGNORED_DIRECTORIES = new Set([
   '.git',
@@ -825,7 +821,6 @@ function markdownGraph(root, markdownFiles) {
       if (
         resolved &&
         !resolved.outsideRoot &&
-        existsSync(resolved.path) &&
         extname(resolved.path).toLowerCase() === '.md' &&
         known.has(resolved.path)
       ) {
@@ -1066,17 +1061,6 @@ async function main() {
   }
 }
 
-// Both sides are realpathed, so a symlinked invocation still resolves to this
-// module's own path. An entry path that resolves to nothing names some other
-// module, which importers of this one rely on.
-let invokedFilePath;
-try {
-  invokedFilePath =
-    process.argv[1] === undefined ? undefined : realpathSync(process.argv[1]);
-} catch (error) {
-  if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') throw error;
-}
-
-if (invokedFilePath === realpathSync(fileURLToPath(import.meta.url))) {
+if (isInvokedAsEntryPoint(import.meta.url)) {
   await main();
 }

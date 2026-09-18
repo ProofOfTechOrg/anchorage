@@ -249,7 +249,7 @@ const PINNED_PRESET_MEMBER_SET: Record<keyof ConnectorPolicies, true> = {
 
 const PINNED_PRESET_MEMBERS = Object.keys(
   PINNED_PRESET_MEMBER_SET,
-) as (keyof ConnectorPolicies)[];
+) as readonly (keyof ConnectorPolicies)[];
 
 function assertUnchangedSurface(
   connectorId: string,

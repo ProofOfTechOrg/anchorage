@@ -14,6 +14,7 @@
 // fails the build instead of passing silently.
 
 import type { RequestContext } from '@mastra/core/request-context';
+import type { PublicSchema } from '@mastra/core/schema';
 import type { Tool, ToolExecutionContext } from '@mastra/core/tools';
 
 import type { AuditLogger } from '../audit/index.js';
@@ -24,7 +25,7 @@ import type {
   WritePermissionsPolicy,
 } from '../policy-engine/tool-policy.js';
 import type { Permission } from '../rbac/permission.js';
-import type { EgressFetchBase } from './egress-fetch.js';
+import type { EgressFetchBase, EgressGuardedFetch } from './egress-fetch.js';
 
 /**
  * Whether a connector's declared egress binds its actual traffic.
@@ -257,6 +258,65 @@ export interface ConnectorPolicies {
    * field accepts the literal `true` alone.
    */
   requireEgressEnforcement?: true;
+}
+
+/**
+ * Per-execution runtime handed to `execute`/`dryRunExecute` as the third
+ * argument. `fetch` is bound to the manifest's declared `egress`: every
+ * actual request — redirect hops included — must resolve to a declared host
+ * or it is denied (`ConnectorPolicyError`, policy 'egress-fetch') and
+ * audited. This is the runtime half of the egress posture (the networkEgress
+ * policy gates the declared list; this guard pins actual requests to it), so
+ * actual ⊆ declared ⊆ org-allowed. A manifest with no `egress` gets a fetch
+ * that denies everything. A vendor SDK carrying its own HTTP stack bypasses
+ * the guard — route its traffic through this fetch (most SDKs accept a
+ * fetch/transport option), or declare that connector
+ * `permissions.egressEnforcement: 'declaration-only'`, the posture
+ * `connectorEgressPosture()` then reads back.
+ */
+export interface ConnectorRuntime {
+  /** Fetch guarded by the connector manifest's declared egress hosts. */
+  fetch: EgressGuardedFetch;
+}
+
+/** Definition compiled by `createConnector()` into an enforced Mastra tool. */
+export interface ConnectorConfig<TInput = unknown, TOutput = unknown> {
+  /**
+   * Stable, colon-free connector identifier. The colon restriction keeps the
+   * unchanged `[scope:]connector` rate-budget key injective.
+   */
+  id: string;
+  /** Description presented to the model and tool consumers. */
+  description: string;
+  /** Optional schema that Mastra validates before connector policies run. */
+  inputSchema?: PublicSchema<TInput>;
+  /**
+   * Optional schema Breakwater validates/transforms before replay commit;
+   * Mastra consumes the captured Standard Schema result without rerunning it.
+   */
+  outputSchema?: PublicSchema<TOutput>;
+  /** Execute the connector after every configured gate has allowed the call. */
+  execute: (
+    inputData: TInput,
+    context: ToolExecutionContext,
+    runtime: ConnectorRuntime,
+  ) => Promise<TOutput>;
+  /**
+   * Side-effect-free simulation of `execute`, returning the same output
+   * shape. Required when `permissions.dryRun` is declared, forbidden
+   * otherwise — the manifest must state what the connector supports. Gets
+   * the same egress-guarded runtime as `execute`: a simulation's read-only
+   * vendor calls stay inside the declared egress too.
+   */
+  dryRunExecute?: (
+    inputData: TInput,
+    context: ToolExecutionContext,
+    runtime: ConnectorRuntime,
+  ) => Promise<TOutput>;
+  /** Enforced declaration of side effects and supported controls. */
+  permissions: PermissionManifest;
+  /** Omit for an ungated connector (classification + audit only). */
+  policies?: ConnectorPolicies;
 }
 
 /** Breakwater connector with the execution function guaranteed at construction. */

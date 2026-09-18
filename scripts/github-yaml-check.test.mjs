@@ -51,18 +51,25 @@ function captureRun(githubDirectory) {
 
 // The assertion is read out of the tracked workflow, not restated here, so the
 // case evaluates what ships rather than a copy of it.
-function readVerifyGateScript() {
-  const workflow = parse(
+function readWorkflow() {
+  return parse(
     readFileSync(join(repositoryRoot, '.github/workflows/ci.yml'), 'utf8'),
   );
-  const job = workflow.jobs.verify;
-  const steps = job.steps.filter((step) => 'run' in step);
+}
+
+function readVerifyGateJob() {
+  const job = readWorkflow().jobs.verify;
+  assert.ok(
+    job,
+    'the `protect main` ruleset requires the status check named `verify`, which is this job',
+  );
+  const steps = (job.steps ?? []).filter((step) => 'run' in step);
   assert.equal(steps.length, 1, 'the verify gate job has one run step');
   return { job, step: steps[0] };
 }
 
 function runVerifyGate(step, needs) {
-  const variables = Object.keys(step.env);
+  const variables = Object.keys(step.env ?? {});
   assert.equal(
     variables.length,
     1,
@@ -400,13 +407,13 @@ test('prints parser warnings without failing the run', () => {
   assert.equal(run.stdout, 'GitHub YAML check passed (1 files).\n');
 });
 
-// The two cases below pin ci.yml's `verify` gate rather than the checker. They
-// live here because the checker already parses every .github workflow, and a
-// suite of their own would add a verify-core step to run it.
+// The cases below pin ci.yml rather than the checker. They live here because
+// the checker already parses every .github workflow, and a suite of their own
+// would add a verify-core step to run it.
 // This one reads the gate's shape and shells out to nothing, so it reports the
 // deletions below on every machine.
 test('the ci.yml gate job stays reachable and depends on at least one job', () => {
-  const { job } = readVerifyGateScript();
+  const { job } = readVerifyGateJob();
 
   assert.equal(
     job.if,
@@ -419,17 +426,45 @@ test('the ci.yml gate job stays reachable and depends on at least one job', () =
   );
 });
 
+// The canary's `continue-on-error` keys are what keep an upstream @mastra/core
+// release off the merge path: one at the job, and one on each step whose red
+// is expected. This case shells out to nothing either.
+test('the ci.yml canary stays non-gating at the job and at the steps expected to go red', () => {
+  const job = readWorkflow().jobs['mastra-compat'];
+
+  assert.ok(job, 'the compat canary is the job named `mastra-compat`');
+  assert.equal(
+    job['continue-on-error'],
+    true,
+    'without the job-level key an upstream @mastra/core release wedges unrelated pull requests',
+  );
+
+  for (const name of [
+    'Typecheck libraries against newest core',
+    'Bundle the flowsafe spike Worker against newest core',
+  ]) {
+    const step = (job.steps ?? []).find((candidate) => candidate.name === name);
+
+    assert.ok(step, `the canary runs a step named "${name}"`);
+    assert.equal(
+      step['continue-on-error'],
+      true,
+      `without the step-level key on "${name}" its expected red skips the tripwire suites after it`,
+    );
+  }
+});
+
 // `bash -e -c` reproduces the runner's default shell for a `run` block that
 // declares no `shell:` key, and the env variable the script reads is taken from
 // the step rather than restated, so the wiring at ci.yml is what runs here. The
-// job's single-run-step shape is asserted in readVerifyGateScript above.
+// job's single-run-step shape is asserted in readVerifyGateJob above.
 test('the ci.yml gate rejects an empty or non-success needs context', (t) => {
   if (spawnSync('jq', ['--version']).status !== 0) {
     t.skip('jq is not on PATH, so the gate assertion cannot be evaluated');
     return;
   }
 
-  const { step } = readVerifyGateScript();
+  const { step } = readVerifyGateJob();
   const cases = [
     { needs: {}, succeeds: false },
     {
