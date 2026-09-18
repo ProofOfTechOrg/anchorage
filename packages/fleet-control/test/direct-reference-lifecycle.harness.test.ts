@@ -7,6 +7,7 @@ import type { DirectDecommissionExportMetadata } from '../scripts/direct-referen
 import type { CleanupAdvanceResult } from '../src/cleanup-advance.js';
 import type { DecommissionAdvanceResult } from '../src/decommission-advance.js';
 import { deploymentSpecDigest } from '../src/spec-digest.js';
+import { directFixtureManifest } from './fixtures/direct-credentialed-config.js';
 import {
   createDirectReferenceHarness,
   type DirectReferenceHarness,
@@ -641,7 +642,17 @@ describe.sequential('private force through native control state', {
   });
 
   it('preserves force witnesses and resumes settled residual cleanup after exhausting the provider budget', async () => {
-    const fixture = await createDirectReferenceHarness();
+    const base = directFixtureManifest();
+    // The residual recovery runs out of this budget mid-invocation.
+    const fixture = await createDirectReferenceHarness({
+      manifest: {
+        ...base,
+        referenceRuntime: {
+          ...base.referenceRuntime,
+          maxProviderRequests: 100,
+        },
+      },
+    });
     try {
       const names = fixture.manifest.names.roles.recovery;
       const environment = fixture.manifest.environment;
@@ -814,10 +825,10 @@ describe.sequential('private force through native control state', {
         .all();
       const exports = await fixture.exportBytes.list();
       const exhausted = await fixture.call({ kind: 'recover-force-residual' });
-      expect(exhausted.response.status).toBe(500);
+      expect(exhausted.response.status).toBe(503);
       expect(exhausted.value).toMatchObject({
         ok: false,
-        error: { code: 'operation-refused' },
+        error: { code: 'budget-exhausted' },
       });
       expect(exhausted.response.headers.get('X-Direct-Provider-Attempts')).toBe(
         '100',

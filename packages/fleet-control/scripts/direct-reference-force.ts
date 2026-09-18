@@ -772,6 +772,7 @@ function assertForceWorkerAbsent(observation: DirectForceFootprint): void {
 }
 
 async function assertForceAttachments(
+  context: Pick<DirectReferenceContext, 'transport'>,
   plane: Pick<ForcePlane, 'client'>,
   resource: ForceResource,
   allowRetainedWorker: boolean,
@@ -782,6 +783,7 @@ async function assertForceAttachments(
       plane.client.listWorkerR2Attachments(bucket.bucketName),
     ),
   ]);
+  context.transport.assertWithinBudget();
   for (const read of reads) {
     if (
       fulfilled(read).some(
@@ -831,6 +833,7 @@ export async function recoverDirectForceResidual(
               buckets.map((bucket) => bucket.bucketName),
             ),
           ] as const);
+          context.transport.assertWithinBudget();
           if (fulfilled(reads[0]) || fulfilled(reads[1]))
             throw new DirectReferenceExecutionError();
           await lease.assertOwned();
@@ -868,6 +871,7 @@ export async function recoverDirectForceResidual(
           assertForceWorkerAbsent(current.observation);
         }
         await assertForceAttachments(
+          context,
           plane,
           resource,
           current.observation.worker.scriptPresent,
@@ -879,6 +883,7 @@ export async function recoverDirectForceResidual(
               : plane.backend.assertApplicationR2Empty(bucket, fence),
           ),
         );
+        context.transport.assertWithinBudget();
         for (const read of emptyReads) fulfilled(read);
         const database: DatabaseReference = {
           id: resource.database.id,
@@ -916,6 +921,7 @@ export async function recoverDirectForceResidual(
             plane.client.listWorkerDatabaseAttachments(resource.database.id),
             plane.backend.assertApplicationR2Detached(bucket, fence),
           ] as const);
+          context.transport.assertWithinBudget();
           const present = fulfilled(reads[0]);
           if (fulfilled(reads[1]) || fulfilled(reads[2]).length > 0)
             throw new DirectReferenceExecutionError();
@@ -941,7 +947,7 @@ export async function recoverDirectForceResidual(
           )
         )
           throw new DirectReferenceExecutionError();
-        await assertForceAttachments(plane, resource, false);
+        await assertForceAttachments(context, plane, resource, false);
         await fence.assertOwned();
         return { returned: true, ...final };
       });
