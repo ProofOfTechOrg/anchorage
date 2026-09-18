@@ -8,6 +8,7 @@
 // (grants.ts) derives requestContext grants from approved records at
 // start/resume. Nothing here ever reads capability data from client input.
 
+import type { D1RunExecutionIdentity } from '../do-runner/execution-admission.js';
 import {
   admitsExistingRun,
   ExecutionFencedError,
@@ -15,6 +16,7 @@ import {
   readExecutionFence,
 } from '../do-runner/execution-fence.js';
 import { isPathSafeId } from '../do-runner/path-safe-id.js';
+import { validateTablePrefix } from '../do-runner/table-prefix.js';
 import type {
   ApprovalActor,
   ApprovalAuditSink,
@@ -192,6 +194,7 @@ export interface ApprovalServiceOptions {
    * someone made rather than one they missed. See ExecutionFenceWiring.
    */
   executionFence: ExecutionFenceWiring;
+  workflowTablePrefix?: string;
   /** Injectable clock (tests, deterministic SLA math). */
   now?: () => Date;
 }
@@ -220,6 +223,7 @@ export class ApprovalService {
   ) => Promise<unknown>;
   readonly #allowSelfDecision?: SelfDecisionPolicy;
   readonly #executionFence: ExecutionFenceWiring;
+  readonly #workflowTablePrefix?: string;
   readonly #now: () => Date;
 
   constructor(options: ApprovalServiceOptions) {
@@ -231,6 +235,10 @@ export class ApprovalService {
     this.#resumeRun = options.resumeRun;
     this.#allowSelfDecision = options.allowSelfDecision;
     this.#executionFence = options.executionFence;
+    this.#workflowTablePrefix = validateTablePrefix(
+      options.workflowTablePrefix,
+      'workflowTablePrefix',
+    )?.toLowerCase();
     this.#now = options.now ?? (() => new Date());
   }
 
@@ -261,11 +269,10 @@ export class ApprovalService {
    * for platform bridges (suspension reconcile, agent host) that have no person
    * behind them.
    *
-   * These callers used to fabricate `role: 'operator'` to satisfy CAN_CREATE.
-   * They cannot simply project onto a role instead: automated principals
-   * project to the least-privileged role precisely so they can never decide,
-   * and `viewer` is not in CAN_CREATE. So the role gate is replaced here — not
-   * widened — by a trusted-kind check.
+   * This entry gates on the principal's vouched kind, not on CAN_CREATE. A
+   * role projection cannot stand in for that gate: an automated principal
+   * projects onto the least-privileged role precisely so it can never decide,
+   * and `viewer` is not in CAN_CREATE.
    *
    * There is deliberately NO principal-taking claim/decide/delegate. Filing a
    * request is trusted platform work; deciding one is a human judgement, and an
@@ -467,16 +474,49 @@ export class ApprovalService {
    * definition of what "no fence" does, so the opt-out cannot be a ternary this
    * gate gets subtly wrong.
    */
-  async #assertDecidable(id: string): Promise<void> {
-    const reading = await readExecutionFence(this.#executionFence);
+  async #assertDecidable(
+    id: string,
+  ): Promise<D1RunExecutionIdentity | undefined> {
+    const fence = this.#executionFence;
+    const reading = await readExecutionFence(fence);
     if (reading.state === 'open' || reading.state === 'draining') return;
-    const runId =
-      reading.state === 'proof-only'
-        ? (await this.#store.get(id))?.runId
-        : undefined;
-    if (!admitsExistingRun(reading, runId)) {
-      throw new ExecutionFencedError(reading.state, 'approval decision');
+    if (
+      reading.state === 'proof-only' &&
+      fence !== 'none' &&
+      this.#workflowTablePrefix !== undefined
+    ) {
+      const record = await this.#store.get(id);
+      if (record !== null && record !== undefined) {
+        const { workflowId, runId } = record;
+        const execution = await fence.readCurrentRunExecution({
+          tablePrefix: this.#workflowTablePrefix,
+          workflowId,
+          runId,
+        });
+        if (execution !== undefined && admitsExistingRun(reading, execution))
+          return execution;
+      }
     }
+    throw new ExecutionFencedError(reading.state, 'approval decision');
+  }
+
+  async #assertRetainedDecidable(
+    execution: D1RunExecutionIdentity | undefined,
+  ): Promise<void> {
+    if (execution === undefined) return;
+    const fence = this.#executionFence;
+    if (fence === 'none')
+      throw new ExecutionFencedError('proof-only', 'approval decision');
+    const reading = await fence.read();
+    const current = await fence.readCurrentRunExecution(execution);
+    if (
+      !admitsExistingRun(
+        { state: 'proof-only', proofExecution: execution },
+        current,
+      ) ||
+      !admitsExistingRun(reading, execution)
+    )
+      throw new ExecutionFencedError(reading.state, 'approval decision');
   }
 
   async decide(
@@ -491,7 +531,7 @@ export class ApprovalService {
       `approval:${id}`,
     );
     this.#assertDecisionInput(input);
-    await this.#assertDecidable(id);
+    const admitted = await this.#assertDecidable(id);
     // Role-scoped SoD: an exempt decider (allowSelfDecision: true, or a role
     // named in { roles }) skips the pre-read entirely; everyone else keeps
     // today's read-then-CAS self-request denial.
@@ -591,6 +631,7 @@ export class ApprovalService {
       updatedAt: now,
     };
     if (input.comment !== undefined) patch.comment = input.comment;
+    await this.#assertRetainedDecidable(admitted);
     const updated = await this.#transitionOrExplain(id, 'decide', authorized, {
       from: OPEN_STATUSES,
       patch,
@@ -734,15 +775,11 @@ export class ApprovalService {
    * merely by its stale fingerprint — it can never mint even if a future
    * change loosened the fingerprint check.
    *
-   * Never routed by router.ts (an ApprovalService method the HTTP surface
-   * never wires up) — reachable only from host-kit's
-   * reconcileApprovalsForSummary, itself only invoked from createRunRouter's
-   * optional reconcileApprovals hook on a status() read, never from a
-   * request body. Authorized like create() (CAN_CREATE, not CAN_REVIEW):
-   * the only principal that ever calls this is the same system principal create()
-   * already accepts for reconcile-filed records — superseding is the
-   * symmetric "un-file" half of that same self-healing operation, not a
-   * reviewer decision.
+   * router.ts does not route it. The in-repo reconcile path calls
+   * supersedeStaleAsPrincipal instead (host-kit/approval-bridge.ts); this is
+   * the ApprovalActor form of the same transition. Authorized
+   * like create() (CAN_CREATE, not CAN_REVIEW): superseding is the "un-file"
+   * half of the same filing operation, not a reviewer decision.
    *
    * Returns null — mirroring the store's own CAS contract, rather than
    * throwing — when the record is unknown or already left the OPEN set (a
@@ -1244,7 +1281,11 @@ export class ApprovalService {
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  try {
+    return String(error instanceof Error ? error.message : error);
+  } catch {
+    return 'unreadable error';
+  }
 }
 
 // Maps a per-record decide() failure to BatchDecideItem.code — the same

@@ -1,11 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-// Unit coverage for the host-kit approval bridge: the payload-shape edge cases
-// of requestedConnectors, the (suspendedAt, resumeCount) capture in
-// queueApprovalForSuspension, the multi-gate re-queue + fail-closed guard in
-// resumeRunWithRequeue (plus its audit signal on a re-queue failure), and the
-// self-healing reconcileApprovalsForSummary. These are the
-// pieces the showcase Worker and dev backend both depend on, so they get
-// direct tests independent of any workflow.
 
 import { describe, expect, it } from 'vitest';
 
@@ -44,6 +37,34 @@ const REVIEWER: ApprovalActor = {
   id: 'ray',
   role: 'reviewer',
 };
+
+const filingFailures = [
+  {
+    name: 'ordinary Error',
+    create: () => new Error('store unavailable'),
+    diagnostic: 'store unavailable',
+  },
+  {
+    name: 'throwing message getter',
+    create: () =>
+      Object.defineProperty(new Error(), 'message', {
+        get() {
+          throw new Error('message getter failed');
+        },
+      }),
+    diagnostic: 'unreadable error',
+  },
+  {
+    name: 'BigInt message',
+    create: () => Object.defineProperty(new Error(), 'message', { value: 1n }),
+    diagnostic: '1',
+  },
+  {
+    name: 'null-prototype rejection',
+    create: () => Object.create(null),
+    diagnostic: 'unreadable error',
+  },
+];
 
 describe('abandonApprovalsForRun', () => {
   it('closes open approvals as stable system bookkeeping and a later decision cannot resume', async () => {
@@ -423,6 +444,34 @@ function suspendedSummary(
 }
 
 describe('queueApprovalForSuspension', () => {
+  it.each(
+    filingFailures,
+  )('files sibling gates after a failure with $name', async ({
+    create,
+    diagnostic,
+  }) => {
+    const store = new InMemoryApprovalStore();
+    const originalCreate = store.create.bind(store);
+    store.create = async (record) => {
+      if (record.stepPath?.[0] === 'gateA') throw create();
+      return originalCreate(record);
+    };
+    const service = new ApprovalService({ store, executionFence: 'none' });
+    const summary: RunSummary = {
+      runId: 'acme_run-partial',
+      status: 'suspended',
+      suspended: [['gateA'], ['gateB']],
+      suspendedAt: { gateA: 111, gateB: 222 },
+    };
+
+    await expect(
+      queueApprovalForSuspension(service, 'wf', summary, 'starter', SYSTEM),
+    ).rejects.toThrow(`gateA: ${diagnostic}`);
+
+    const open = await store.list({ status: 'pending' });
+    expect(open.map(({ stepPath }) => stepPath)).toEqual([['gateB']]);
+  });
+
   it('persists tool-call scope when an agent payload also carries connectors', async () => {
     const store = new InMemoryApprovalStore();
     const service = new ApprovalService({ store, executionFence: 'none' });
@@ -588,6 +637,55 @@ describe('queueApprovalForSuspension', () => {
 });
 
 describe('resumeRunWithRequeue', () => {
+  it.each(
+    filingFailures,
+  )('audits a service lookup failure with $name and preserves the original rejection', async ({
+    create,
+    diagnostic,
+  }) => {
+    const store = new InMemoryApprovalStore();
+    const service = new ApprovalService({ store, executionFence: 'none' });
+    const { record } = await service.createAsPrincipal(
+      {
+        workflowId: 'wf',
+        runId: 'acme_run-lookup',
+        title: 'approval',
+        requestedBy: 'starter',
+        requestedByKind: 'human',
+      },
+      SYSTEM_PRINCIPAL,
+    );
+    const decided = await service.decide(
+      record.id,
+      { decision: 'approve' },
+      REVIEWER,
+    );
+    const original = create();
+    const events: ApprovalAuditEvent[] = [];
+    const base: ResumeRunFn = async () =>
+      suspendedSummary(record.runId, 'gate2', ['c'], 9);
+    const wrapped = resumeRunWithRequeue(
+      base,
+      () => {
+        throw original;
+      },
+      SYSTEM,
+      (event) => {
+        events.push(event);
+      },
+    );
+
+    await expect(wrapped(decided.record, 'approve')).rejects.toBe(original);
+    expect(events).toEqual([
+      expect.objectContaining({
+        action: 'approval.requeue',
+        decision: 'error',
+        reason: diagnostic,
+        resource: `approval:${record.id}`,
+      }),
+    ]);
+  });
+
   it('re-queues the next gate attributed to the decider (SoD across gates)', async () => {
     // #given — a service whose base resume re-suspends the run at a 2nd gate
     const store = new InMemoryApprovalStore();

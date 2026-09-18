@@ -70,7 +70,13 @@ export const gtmOutboundModule: WorkflowModule<ShowcaseModuleDeps> = {
         outcome: z.enum(CONNECTOR_OUTCOMES),
         delivered: z.number(),
       }),
-      permissions: { sideEffect: 'write', requiresApproval: true },
+      permissions: {
+        sideEffect: 'write',
+        // The send is the Cloudflare Email Service binding, which the egress
+        // guard never sees and which carries no HTTP request of its own.
+        egressEnforcement: 'enforced',
+        requiresApproval: true,
+      },
       policies: { audit },
       execute: async ({ drafts }) => {
         if (!email) {

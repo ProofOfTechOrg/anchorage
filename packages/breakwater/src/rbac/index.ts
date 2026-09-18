@@ -14,6 +14,7 @@ import type {
 import type { RequestContext } from '@mastra/core/request-context';
 
 import type { AuditLogger } from '../audit/index.js';
+import type { Actor, Role } from './actor.js';
 import { authorizeActor } from './authorize.js';
 import {
   assertPrincipalKinds,
@@ -21,8 +22,7 @@ import {
   type PrincipalKind,
 } from './principal.js';
 
-/** Role labels accepted by the built-in actor contract. */
-export type Role = 'admin' | 'builder' | 'operator' | 'reviewer' | 'viewer';
+export type { Role } from './actor.js';
 
 /** All role labels accepted by `RBACMiddleware`. */
 export const ROLES: readonly Role[] = [
@@ -33,6 +33,14 @@ export const ROLES: readonly Role[] = [
   'viewer',
 ];
 
+export type {
+  AuditEvent,
+  AuditLoggerOptions,
+  AuditSink,
+} from '../audit/index.js';
+// Audit moved to its own module; keep the historical rbac export surface.
+export { AuditLogger } from '../audit/index.js';
+export type { Actor } from './actor.js';
 // Re-exported for hosts; `assertPrincipalKinds` stays internal to the package.
 export type { Permission, PrincipalPermissions } from './permission.js';
 export {
@@ -46,29 +54,6 @@ export {
   PRINCIPAL_KINDS,
   principalKindOf,
 } from './principal.js';
-
-/** Authenticated identity evaluated by RBAC and attached to audit events. */
-export interface Actor {
-  /** Stable actor identifier from the host authentication system. */
-  id: string;
-  /**
-   * Role used by the middleware's exact allowlist. Meaningful only for the
-   * 'human' kind; for automated kinds the role allowlist is not consulted at
-   * all and hosts should project the least-privileged label. See
-   * `authorizeActor`.
-   */
-  role: Role;
-  /** Absent means 'human', so an existing host keeps its exact behavior. */
-  kind?: PrincipalKind;
-}
-
-export type {
-  AuditEvent,
-  AuditLoggerOptions,
-  AuditSink,
-} from '../audit/index.js';
-// Audit moved to its own module; keep the historical rbac export surface.
-export { AuditLogger } from '../audit/index.js';
 
 /** requestContext key the default actor lookup reads. */
 export const ACTOR_CONTEXT_KEY = 'breakwater.actor';

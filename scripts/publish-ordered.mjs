@@ -3,6 +3,8 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { isInvokedAsEntryPoint } from './entry-point.mjs';
+
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
 // Ordered because `changeset publish` fans out with Promise.all: it has no
@@ -278,6 +280,6 @@ async function main() {
   });
 }
 
-if (fileURLToPath(import.meta.url) === process.argv[1]) {
+if (isInvokedAsEntryPoint(import.meta.url)) {
   await main();
 }

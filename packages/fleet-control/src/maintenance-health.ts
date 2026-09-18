@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { cancelBodyWithoutAwait } from './database-export-store.js';
 import { isSha256 } from './deployment-context.js';
 import type { DeploymentSpec, MaintenanceHealth } from './types.js';
 
@@ -42,7 +43,11 @@ export async function readMaintenanceHealth(
   response: Response,
 ): Promise<MaintenanceHealth> {
   if (!response.ok) {
-    throw new Error(`maintenance request failed with HTTP ${response.status}`);
+    const refusal = new Error(
+      `maintenance request failed with HTTP ${response.status}`,
+    );
+    cancelBodyWithoutAwait(response.body, refusal);
+    throw refusal;
   }
   const body: unknown = await response.json();
   if (!body || typeof body !== 'object') {

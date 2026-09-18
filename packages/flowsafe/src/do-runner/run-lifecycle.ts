@@ -4,7 +4,7 @@ import {
   type ExecutionPrincipalKind,
   isExecutionPrincipalId,
   isExecutionPrincipalKind,
-} from '../approval-api/principal.js';
+} from '../approval-api/principal-identity.js';
 import { isPathSafeId } from './path-safe-id.js';
 
 /** Runtime-owned request-context key for durable run lifecycle metadata. */
@@ -15,6 +15,28 @@ export type RunTerminalStatus = 'cancelled' | 'timed_out';
 export interface RunTerminalErrorEnvelope {
   code: 'CANCELLED' | 'TIMED_OUT';
   message: string;
+}
+
+export interface RunLifecycleBlockedReason {
+  code: 'DISPUTED_SETTLEMENT';
+  message: string;
+}
+
+export class RunLifecycleBlockedError extends Error {
+  readonly reason: RunLifecycleBlockedReason;
+
+  constructor(reason: RunLifecycleBlockedReason) {
+    super(reason.message);
+    this.name = 'RunLifecycleBlockedError';
+    this.reason = reason;
+  }
+}
+
+export interface RunTerminalCleanup {
+  revision: number;
+  status: RunTerminalStatus;
+  cleanupCompleted: boolean;
+  scheduleDispatch?: RunScheduleDispatch;
 }
 
 /**
@@ -62,6 +84,61 @@ export interface RunLifecycleState {
   };
 }
 
+export function nextLifecycleRevision(current: number): number {
+  if (
+    !Number.isSafeInteger(current) ||
+    current < 0 ||
+    current === Number.MAX_SAFE_INTEGER
+  )
+    throw new Error('run lifecycle revision cannot advance');
+  return current + 1;
+}
+
+export function terminalCleanupFor(
+  lifecycle: RunLifecycleState | undefined,
+): RunTerminalCleanup | undefined {
+  const terminal = lifecycle?.terminal;
+  if (!lifecycle || !terminal) return undefined;
+  return {
+    revision: lifecycle.revision,
+    status: terminal.status,
+    cleanupCompleted: terminal.cleanupCompletedAt !== undefined,
+    ...(lifecycle.scheduleDispatch
+      ? { scheduleDispatch: lifecycle.scheduleDispatch }
+      : {}),
+  };
+}
+
+export function projectTerminalLifecycle(
+  lifecycle: RunLifecycleState | undefined,
+  status: RunTerminalStatus,
+  nowMs: number,
+  replayPrincipals: RunLifecyclePrincipal[],
+): RunLifecycleState & {
+  terminal: NonNullable<RunLifecycleState['terminal']>;
+} {
+  const base = lifecycle
+    ? Object.fromEntries(
+        Object.entries(lifecycle).filter(([key]) => key !== 'transitionIntent'),
+      )
+    : { version: 1 as const, revision: 0 };
+  return {
+    ...base,
+    version: 1,
+    revision: nextLifecycleRevision(lifecycle?.revision ?? 0),
+    terminal: {
+      status,
+      error: {
+        code: status === 'cancelled' ? 'CANCELLED' : 'TIMED_OUT',
+        message:
+          status === 'cancelled' ? 'run was cancelled' : 'run deadline expired',
+      },
+      transitionedAt: nowMs,
+      replayPrincipals,
+    },
+  };
+}
+
 function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -78,22 +155,27 @@ function economicOperations(
   if (value === undefined) return undefined;
   if (!Array.isArray(value))
     throw new Error('stored run lifecycle is malformed');
-  return value.map((entry) => {
-    const operation = record(entry);
+  const length = value.length;
+  if (!Number.isSafeInteger(length) || length < 0 || length > 0xffff_ffff) {
+    throw new Error('stored run lifecycle is malformed');
+  }
+  const operations: RunEconomicOperation[] = [];
+  for (let index = 0; index < length; index++) {
+    if (!(index in value)) throw new Error('stored run lifecycle is malformed');
+    const operation = record(value[index]);
+    if (!operation) throw new Error('stored run lifecycle is malformed');
+    const { id, settlementState } = operation;
     if (
-      !operation ||
-      !isPathSafeId(operation.id) ||
-      typeof operation.settlementState !== 'string' ||
-      operation.settlementState.length === 0 ||
-      operation.settlementState.length > 100
+      !isPathSafeId(id) ||
+      typeof settlementState !== 'string' ||
+      settlementState.length === 0 ||
+      settlementState.length > 100
     ) {
       throw new Error('stored run lifecycle is malformed');
     }
-    return {
-      id: operation.id,
-      settlementState: operation.settlementState,
-    };
-  });
+    operations.push({ id, settlementState });
+  }
+  return operations;
 }
 
 function scheduleDispatch(value: unknown): RunScheduleDispatch | undefined {

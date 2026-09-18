@@ -52,10 +52,17 @@ export default defineConfig({
         replacement: new URL(`./src/${subpath}/index.ts`, import.meta.url)
           .pathname,
       })),
+      // The two deadline subpaths are single modules rather than directory
+      // barrels, so they carry their own aliases instead of joining the list
+      // above, whose replacement appends `/index.ts`. tsconfig.test.json
+      // mirrors them with `paths`.
+      ...['do-runner/constants', 'do-runner/testing'].map((subpath) => ({
+        find: new RegExp(`^@proofoftech/flowsafe/${subpath}$`),
+        replacement: new URL(`./src/${subpath}.ts`, import.meta.url).pathname,
+      })),
     ],
   },
   test: {
     exclude: [...configDefaults.exclude, '**/*.workerd.test.ts'],
-    passWithNoTests: true,
   },
 });

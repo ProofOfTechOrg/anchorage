@@ -4,6 +4,12 @@
     "noEmit": true,
     "types": ["node", "@cloudflare/workers-types"]
   },
+  // Membership rule: a harness file that no package program compiles belongs
+  // here — the Workers-pool suites, their support modules, and the vitest
+  // configs that declare them. `tsc` skips an
+  // `include` entry that matches no file, so
+  // `scripts/architecture-positive-controls.test.mjs` asserts each entry
+  // resolves.
   "include": [
     "packages/breakwater/worker-tests/**/*.ts",
     "packages/flowsafe/src/cloudflare-fidelity.workerd.test.ts",
@@ -14,6 +20,7 @@
     "vitest.config.ts",
     "vitest.breakwater-workers.config.mts",
     "vitest.flowsafe-harness.config.ts",
-    "vitest.flowsafe-workers.config.ts"
+    "vitest.flowsafe-workers.config.ts",
+    "vitest.workerd-lifecycle.config.ts"
   ]
 }

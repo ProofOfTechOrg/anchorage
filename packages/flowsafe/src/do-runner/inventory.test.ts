@@ -9,6 +9,7 @@
 // this surface must not have: an empty category is what an operator reads as
 // permission to migrate.
 
+import type { DurableObjectState } from '@cloudflare/workers-types';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 
@@ -34,6 +35,8 @@ import { APPROVALS_TABLE } from '../approval-api/types.js';
 import { EXECUTION_FENCE_SUSPEND_KEY } from '../background-tasks/index.js';
 import { createScheduleStorageDomains } from '../schedules/storage.js';
 import { D1SubscriptionStoreFactory } from '../signal-providers/index.js';
+import type { SignalDatabase } from '../signals/d1-shared.js';
+import { D1NotificationsStorage } from '../signals/notifications-d1.js';
 import { createSignalStorageDomains } from '../signals/storage.js';
 import { createD1Storage, RESOURCE_OWNER_TABLE } from './d1-storage.js';
 import { RUN_OWNER_RECOVERY_DELAY_MS } from './durable-object.js';
@@ -159,10 +162,7 @@ interface Fixture {
   inventory: DeploymentInventory;
 }
 
-/**
- * A deployment with every table created by its real owner, and one outstanding
- * item in each work category plus one row in each standing category.
- */
+/** A deployment with tables created by their production storage domains. */
 async function seeded(): Promise<Fixture> {
   const sqlite = openSqlite();
   const binding = sqliteUnitDatabase(sqlite);
@@ -234,14 +234,25 @@ async function seeded(): Promise<Fixture> {
     targetId: 'gated',
     mintRunId: () => 'abc_r2',
   });
-  await reservations.reserve({
+  const settled = await reservations.reserve({
     key: 'key-settled',
     owner: { kind: 'human', id: 'ada' },
     targetKind: 'workflow',
     targetId: 'gated',
     mintRunId: () => 'abc_r3',
   });
-  await reservations.settleRun('abc_r3');
+  const claimed = await reservations.claimReservation(settled.reservation);
+  if (!claimed) throw new Error('terminal inventory claim was lost');
+  const execution = {
+    tablePrefix: '',
+    workflowId: 'gated',
+    runId: 'abc_r3',
+    startToken: 'inventory-terminal-generation',
+    owner: claimed.owner,
+    target: { kind: 'workflow' as const, id: 'gated' },
+  };
+  await reservations.bindPreparedStart(claimed, execution);
+  await reservations.settleExecution(execution);
 
   // --- signal-subscriptions -------------------------------------------------
   await new D1SubscriptionStoreFactory(binding as never, {
@@ -416,12 +427,12 @@ describe('deployment drain inventory', () => {
     expect(INVENTORY_DRAIN_PROOF.proof).toContain(recoveryCadence);
   });
 
-  it('reads each work category with the predicate its production writer settles on', async () => {
-    // #given — one outstanding item per category beside settled siblings that
-    // must NOT be reported: a decided approval, a spent reservation, a
-    // completed background task, a delivered notification, settled fire
-    // history, and a released ownership row.
-    const { inventory } = await seeded();
+  it('reads outstanding work including pending notifications due or not yet due', async () => {
+    const { inventory, sqlite } = await seeded();
+    const summaryAt = new Date(NOW + 7_200_000).toISOString();
+    sqlite
+      .prepare('UPDATE mastra_notifications SET summaryAt = ? WHERE id = ?')
+      .run(summaryAt, 'ntf-later');
 
     // #when / #then — runs: the suspended run, annotated with its owner.
     const runs = await inventory.read('runs');
@@ -458,15 +469,14 @@ describe('deployment drain inventory', () => {
       ),
     ).toEqual([['trg-deferred']]);
 
-    // #then — notifications: only the DUE pending row is drainable work; the
-    // future-dated and the never-due rows are reported as a total instead.
     const notifications = await inventory.read('pending-notifications');
     expect(notifications.entries.map((entry) => entry.key)).toEqual([
       ['thr-1', 'ntf-due'],
+      ['thr-1', 'ntf-later'],
+      ['thr-1', 'ntf-never'],
     ]);
-    // `count` is this category's own rows (the DUE one); `notDue` describes
-    // the pending rows the page deliberately excludes.
-    expect(notifications.count).toBe(1);
+    expect(notifications.entries[1]?.detail.summaryAt).toBe(summaryAt);
+    expect(notifications.count).toBe(3);
     expect(notifications.totals).toEqual({ notDue: 2 });
 
     // #then — background tasks: nonterminal only, and the fence-parked one is
@@ -496,6 +506,178 @@ describe('deployment drain inventory', () => {
         (entry) => entry.key,
       ),
     ).toEqual([['key-live']]);
+  });
+
+  it.each([
+    {
+      name: 'ordinary year',
+      now: '2026-08-24T12:00:00.000Z',
+      dueOffset: '2026-08-24T15:59:59.999+04:00',
+      futureOffset: '2026-08-24T07:00:00-06:00',
+      equalOffset: '2026-08-24T16:00:00+0400',
+    },
+    {
+      name: 'negative year',
+      now: '-000100-01-01T12:00:00.000Z',
+      dueOffset: '-000100-01-01T15:59:59.999+04:00',
+      futureOffset: '-000100-01-01T07:00:00-06:00',
+      equalOffset: '-000100-01-01T16:00:00+0400',
+    },
+  ])('enumerates pending notifications and counts notDue by Date chronology for $name inventory', async ({
+    now,
+    dueOffset,
+    futureOffset,
+    equalOffset,
+  }) => {
+    const sqlite = openSqlite();
+    const binding = sqliteUnitDatabase(sqlite);
+    const notifications = new D1NotificationsStorage(
+      binding as SignalDatabase,
+      '',
+    );
+    await notifications.init();
+    const instant = new Date(now).getTime();
+    const future = '+010000-01-01T00:00:00.000Z';
+    const due = new Date(instant - 1).toISOString();
+    const rows = [
+      { id: 'a-expanded-future', deliverAt: future, summaryAt: null },
+      { id: 'b-ordinary-due', deliverAt: due, summaryAt: null },
+      { id: 'c-offset-due', deliverAt: dueOffset, summaryAt: null },
+      { id: 'd-offset-future', deliverAt: futureOffset, summaryAt: null },
+      { id: 'e-summary-due', deliverAt: future, summaryAt: dueOffset },
+      { id: 'f-never', deliverAt: null, summaryAt: null },
+      { id: 'g-equal', deliverAt: equalOffset, summaryAt: null },
+      {
+        id: 'h-negative-past',
+        deliverAt: '-000200-01-01T00:00:00.000Z',
+        summaryAt: null,
+      },
+      {
+        id: 'i-delivered',
+        deliverAt: due,
+        summaryAt: null,
+        status: 'delivered',
+      },
+    ];
+    const insert = sqlite.prepare(
+      `INSERT INTO mastra_notifications
+         (id, thread_id, source, kind, priority, status, summary, coalescedCount,
+          createdAt, updatedAt, deliverAt, summaryAt, deliveryAttempts)
+       VALUES (?, 'thread', 'source', 'kind', 'medium', ?, 'summary', 1, ?, ?, ?, ?, 0)`,
+    );
+    for (const row of rows) {
+      for (const cursor of [row.deliverAt, row.summaryAt]) {
+        if (cursor !== null)
+          expect(Number.isFinite(new Date(cursor).getTime())).toBe(true);
+      }
+      insert.run(
+        row.id,
+        row.status ?? 'pending',
+        now,
+        now,
+        row.deliverAt,
+        row.summaryAt,
+      );
+    }
+    const expected = rows
+      .filter(
+        (row) =>
+          row.status !== 'delivered' &&
+          [row.deliverAt, row.summaryAt].some(
+            (cursor) =>
+              cursor !== null && new Date(cursor).getTime() <= instant,
+          ),
+      )
+      .map((row) => row.id)
+      .sort();
+    const inventory = new DeploymentInventory(binding as InventoryDatabase, {
+      now: () => instant,
+    });
+    const first = await inventory.read('pending-notifications', { limit: 1 });
+    expect(first.entries.map((entry) => entry.key[1])).toEqual([
+      'a-expanded-future',
+    ]);
+    expect(first.count).toBe(8);
+    expect(first.totals).toEqual({ notDue: 3 });
+    expect(await drain(inventory, 'pending-notifications', 1)).toEqual(
+      [
+        'a-expanded-future',
+        'b-ordinary-due',
+        'c-offset-due',
+        'd-offset-future',
+        'e-summary-due',
+        'f-never',
+        'g-equal',
+        'h-negative-past',
+      ].map((id) => JSON.stringify(['thread', id])),
+    );
+    const dueNotifications = await notifications.listDueNotifications({
+      now: new Date(instant),
+      limit: rows.length,
+    });
+    expect(dueNotifications.map((row) => row.id).sort()).toEqual(expected);
+  });
+
+  it('enumerates a pending notification that is not yet due beside the due ones', async () => {
+    const { inventory } = await seeded();
+    const first = await inventory.read('pending-notifications', { limit: 1 });
+    expect(first.entries.map((entry) => entry.key)).toEqual([
+      ['thr-1', 'ntf-due'],
+    ]);
+    expect(first.count).toBe(3);
+    expect(first.totals).toEqual({ notDue: 2 });
+    expect(first.cursor).toBeDefined();
+    const second = await inventory.read('pending-notifications', {
+      cursor: first.cursor,
+      limit: 1,
+    });
+    expect(second.entries).toEqual([
+      {
+        key: ['thr-1', 'ntf-later'],
+        detail: expect.objectContaining({
+          deliverAt: new Date(NOW + 3_600_000).toISOString(),
+        }),
+      },
+    ]);
+    expect(second.count).toBeUndefined();
+    expect(second.totals).toBeUndefined();
+  });
+
+  it('enumerates a pending notification carrying neither deliverAt nor summaryAt and counts it as notDue', async () => {
+    const { inventory, sqlite } = await seeded();
+    sqlite.exec("DELETE FROM mastra_notifications WHERE id <> 'ntf-never'");
+    const page = await inventory.read('pending-notifications');
+    expect(page.entries).toEqual([
+      {
+        key: ['thr-1', 'ntf-never'],
+        detail: {
+          source: 'src',
+          kind: 'kind',
+          priority: 'medium',
+          agentId: 'agent',
+        },
+      },
+    ]);
+    expect(page.count).toBe(1);
+    expect(page.totals).toEqual({ notDue: 1 });
+    expect(page.cursor).toBeUndefined();
+  });
+
+  it('keeps a sweep non-empty while only a not-yet-due notification is pending', async () => {
+    const { inventory, sqlite } = await seeded();
+    sqlite.exec("DELETE FROM mastra_notifications WHERE id <> 'ntf-later'");
+    const pages = await inventory.sweep();
+    const notifications = pages.find(
+      (page) => page.category === 'pending-notifications',
+    );
+    expect(notifications).toMatchObject({
+      class: 'work',
+      entries: [{ key: ['thr-1', 'ntf-later'] }],
+      count: 1,
+      totals: { notDue: 1 },
+    });
+    expect(notifications?.entries).toHaveLength(1);
+    expect(notifications?.cursor).toBeUndefined();
   });
 
   it('reports standing configuration without asking a drain to empty it', async () => {
@@ -571,7 +753,7 @@ describe('deployment drain inventory', () => {
     // means on the same deployment.
     const { sqlite, inventory } = await seeded();
     const iso = new Date(NOW).toISOString();
-    const snapshot = (cleanup: string | null): string =>
+    const snapshot = (cleanup: number | null): string =>
       JSON.stringify({
         status: 'timed_out',
         requestContext: {
@@ -594,7 +776,7 @@ describe('deployment drain inventory', () => {
            (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
          VALUES (?, ?, NULL, ?, ?, ?)`,
       )
-      .run('gated', 'abc_cleaned', snapshot(iso), iso, iso);
+      .run('gated', 'abc_cleaned', snapshot(NOW), iso, iso);
 
     // #when
     const runs = await inventory.read('runs');
@@ -604,6 +786,69 @@ describe('deployment drain inventory', () => {
       'abc_cleaning',
       'abc_r1',
     ]);
+  });
+
+  it.each([
+    ['status', '{"status":"success","status":"running"}'],
+    ['escaped status', '{"status":"success","sta\\u0074us":"running"}'],
+    [
+      'requestContext',
+      '{"status":"cancelled","requestContext":{"flowsafe.runLifecycle":{"terminal":{"cleanupCompletedAt":1}}},"requestContext":{}}',
+    ],
+    [
+      'flowsafe.runLifecycle',
+      '{"status":"cancelled","requestContext":{"flowsafe.runLifecycle":{"terminal":{"cleanupCompletedAt":1}},"flowsafe.runLifecycle":{}}}',
+    ],
+    [
+      'terminal',
+      '{"status":"cancelled","requestContext":{"flowsafe.runLifecycle":{"terminal":{"cleanupCompletedAt":1},"terminal":{}}}}',
+    ],
+    [
+      'cleanupCompletedAt',
+      '{"status":"cancelled","requestContext":{"flowsafe.runLifecycle":{"terminal":{"cleanupCompletedAt":1,"cleanupCompletedAt":null}}}}',
+    ],
+  ])('counts a duplicate eligibility path %s as live work', async (_path, snapshot) => {
+    const { sqlite, inventory } = await seeded();
+    const update = sqlite.prepare(
+      'UPDATE mastra_workflow_snapshot SET snapshot=? WHERE workflow_name=? AND run_id=?',
+    );
+    update.run(snapshot, 'gated', 'abc_r1');
+    const runs = await inventory.read('runs');
+    expect(runs.entries.map((entry) => entry.key[1])).toEqual(['abc_r1']);
+    update.run('{"status":"success"}', 'gated', 'abc_r1');
+    expect((await inventory.read('runs')).entries).toEqual([]);
+  });
+
+  it.each([
+    ['null', false],
+    ['false', false],
+    ['true', false],
+    ['"done"', false],
+    ['{}', false],
+    ['[]', false],
+    ['-1', false],
+    ['0.5', false],
+    ['9007199254740992', false],
+    ['1e309', false],
+    ['-1e309', false],
+    ['0', true],
+    ['1.0', true],
+    ['1e0', true],
+    ['9007199254740991', true],
+  ] as const)('classifies cleanup timestamp %s in the public run inventory', async (marker, complete) => {
+    const { sqlite, inventory } = await seeded();
+    sqlite
+      .prepare(
+        'UPDATE mastra_workflow_snapshot SET snapshot=? WHERE workflow_name=? AND run_id=?',
+      )
+      .run(
+        `{"status":"timed_out","requestContext":{"flowsafe.runLifecycle":{"terminal":{"cleanupCompletedAt":${marker}}}}}`,
+        'gated',
+        'abc_r1',
+      );
+    expect(
+      (await inventory.read('runs')).entries.map((entry) => entry.key[1]),
+    ).toEqual(complete ? [] : ['abc_r1']);
   });
 
   it('reads a table that was never created as an EMPTY category, not a fault', async () => {
@@ -883,6 +1128,7 @@ describe('deployment drain inventory', () => {
     const sqlite = openSqlite();
     const binding = sqliteUnitDatabase(sqlite);
     const storage = createD1Storage({ binding: binding as never });
+    await storage.init();
     await createResourceOwnershipSchema(binding as never);
     sqlite.exec(
       `CREATE TABLE flowsafe_deployment (
@@ -908,6 +1154,14 @@ describe('deployment drain inventory', () => {
     const held = new Promise<void>((resolve) => {
       releaseStep = resolve;
     });
+    let announcePreparing: () => void = () => undefined;
+    const preparing = new Promise<void>((resolve) => {
+      announcePreparing = resolve;
+    });
+    let releasePreparation: () => void = () => undefined;
+    const prepared = new Promise<void>((resolve) => {
+      releasePreparation = resolve;
+    });
 
     const fence = new ExecutionFenceStore(binding as never);
     await fence.seed('open');
@@ -915,7 +1169,17 @@ describe('deployment drain inventory', () => {
     const buildRuntime = (): RunnerRuntime => {
       const { createWorkflow, createStep, runtime } = init(
         { storage },
-        { executionFence: fence, startIdempotency: reservations },
+        {
+          executionFence: fence,
+          startIdempotency: reservations,
+          requestContextForRun: async (_workflowId, _runId, leg) => {
+            if (leg.kind === 'start') {
+              announcePreparing();
+              await prepared;
+            }
+            return {};
+          },
+        },
       );
       const gate = createStep({
         id: 'gate',
@@ -958,13 +1222,38 @@ describe('deployment drain inventory', () => {
       }
     }
     const secret = 'inventory-ownership-pin-secret-00001';
-    const runner = new OwnerRunner(undefined, {
+    const runId = 'abc_inflight';
+    const values = new Map<string, unknown>();
+    let alarm: number | null = null;
+    const state = {
+      id: { name: `gated:${runId}` },
+      storage: {
+        async get<T>(key: string): Promise<T | undefined> {
+          return values.get(key) as T | undefined;
+        },
+        async put(key: string, value: unknown) {
+          values.set(key, structuredClone(value));
+        },
+        async delete(key: string) {
+          return values.delete(key);
+        },
+        async getAlarm() {
+          return alarm;
+        },
+        async setAlarm(at: number | Date) {
+          alarm = at instanceof Date ? at.getTime() : at;
+        },
+        async deleteAlarm() {
+          alarm = null;
+        },
+      },
+    } as unknown as DurableObjectState;
+    const runner = new OwnerRunner(state, {
       owners: new D1ResourceOwnershipStore(binding as never),
       DEPLOYMENT_TENANT: 'acme',
       DEPLOYMENT_IDENTITY_SECRET: secret,
       DB: binding,
     });
-    const runId = 'abc_inflight';
     const post = (path: string, body: unknown): Request =>
       new Request(`http://do${path}`, {
         method: 'POST',
@@ -983,39 +1272,66 @@ describe('deployment drain inventory', () => {
       now: () => NOW,
     });
 
-    // #when — the start is IN FLIGHT: ownership reserved, step executing, and
-    // nothing persisted yet.
+    // #when — ownership is reserved before any snapshot; the held step then
+    // exposes the overlap between the running row and that reservation.
     const start = runner.fetch(
       post('/runs', { workflowId: 'gated', runId, inputData: {} }),
     );
-    await started;
+    try {
+      await Promise.race([
+        preparing,
+        start.then(async (response) => {
+          throw new Error(
+            `start returned before preparation: ${JSON.stringify(await response.clone().json())}`,
+          );
+        }),
+      ]);
+      expect((await inventory.read('runs')).entries).toEqual([]);
+      expect((await inventory.read('resource-owners')).entries).toEqual([
+        {
+          key: ['run', runId],
+          detail: { owner_kind: 'human', owner_id: 'ada' },
+        },
+      ]);
+      releasePreparation();
+      await Promise.race([
+        started,
+        start.then(async (response) => {
+          throw new Error(
+            `start returned before its held step: ${JSON.stringify(await response.clone().json())}`,
+          );
+        }),
+      ]);
 
-    // #then — the reservation is UNSETTLED while the start is in flight. This
-    // is the assertion the invariant lives in: it fails if settlement moves
-    // ahead of the persisted summary.
-    const inFlight = await inventory.read('resource-owners');
-    expect(inFlight.entries).toEqual([
-      {
-        key: ['run', runId],
-        detail: { owner_kind: 'human', owner_id: 'ada' },
-      },
-    ]);
-    expect(inFlight.count).toBe(1);
+      // #then — the reservation is UNSETTLED while the start is in flight. This
+      // is the assertion the invariant lives in: it fails if settlement moves
+      // ahead of the persisted summary.
+      const inFlight = await inventory.read('resource-owners');
+      expect(inFlight.entries).toEqual([
+        {
+          key: ['run', runId],
+          detail: { owner_kind: 'human', owner_id: 'ada' },
+        },
+      ]);
+      expect(inFlight.count).toBe(1);
 
-    // #then — and the executing run is not hidden from `runs` either: the
-    // engine's own `running` snapshot is already there. Recorded because the
-    // two categories overlap DURING execution and diverge only at settlement,
-    // which is what the next step asserts.
-    expect(
-      (await inventory.read('runs')).entries.map((entry) => [
-        entry.key[1],
-        entry.detail.status,
-      ]),
-    ).toEqual([[runId, 'running']]);
+      // #then — and the executing run is not hidden from `runs` either: the
+      // engine's own `running` snapshot is already there. Recorded because the
+      // two categories overlap DURING execution and diverge only at settlement,
+      // which is what the next step asserts.
+      expect(
+        (await inventory.read('runs')).entries.map((entry) => [
+          entry.key[1],
+          entry.detail.status,
+        ]),
+      ).toEqual([[runId, 'running']]);
 
-    // #when — the step reaches its first suspend, so a summary persists and the
-    // reservation settles.
-    releaseStep();
+      // #when — the step reaches its first suspend, so a summary persists and the
+      // reservation settles.
+    } finally {
+      releasePreparation();
+      releaseStep();
+    }
     const summary = (await (await start).json()) as { status: string };
     expect(summary.status).toBe('suspended');
 

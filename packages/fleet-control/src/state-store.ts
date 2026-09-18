@@ -1,7 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { createHash, randomUUID } from 'node:crypto';
-import { backendSwitchIntentFromUnknown } from './backend-switch.js';
+import {
+  BACKEND_SWITCH_RECORD_ERROR,
+  backendSwitchFleetRecordFromUnknown,
+  backendSwitchIntentFromUnknown,
+  structuralBackendSwitchFleetRecordFromUnknown,
+} from './backend-switch.js';
+import {
+  CLEANUP_INTENT_BYTE_BOUND,
+  canonicalCleanupEvidenceBytes,
+  cleanupAdvanceIntentFromUnknown,
+  cleanupReceiptEvidenceFromUnknown,
+  cleanupTerminalReceiptFromUnknown,
+  invocationAuthorityCarrierFromUnknown,
+  normalizeCleanupAdvanceIntent,
+} from './cleanup-intent.js';
+import {
+  DECOMMISSION_INTENT_BYTE_BOUND,
+  decommissionAdvanceIntentFromUnknown,
+  normalizeDecommissionAdvanceIntent,
+} from './decommission-intent.js';
 import { isDeploymentScriptName, isSha256 } from './deployment-context.js';
 import {
   assertPlatformResourcesMatchTarget,
@@ -16,6 +35,7 @@ import {
   externalReleaseTopologyFromUnknown,
 } from './release-topology.js';
 import type {
+  CleanupTerminalReceipt,
   DeploymentEgressPolicy,
   DurableObjectMigration,
   ExternalMigrationIntent,
@@ -32,7 +52,13 @@ import type {
   PlatformPlaneStateStore,
   ProvisioningPhase,
 } from './types.js';
-import { PROVISIONING_PHASES } from './types.js';
+import {
+  EXTERNAL_MIGRATION_SUBPHASES,
+  effectiveLifecyclePhase,
+  isPlatformCatalogRecord,
+  PROVISIONING_PHASES,
+  SETTLED_BACKEND_SWITCH_SUBPHASES,
+} from './types.js';
 import { deploymentKey } from './validation.js';
 
 export interface FleetStateDatabase {
@@ -108,6 +134,7 @@ const TABLE = 'anchorage_fleet_deployments';
 const LEASE_TABLE = 'anchorage_fleet_leases';
 const PLATFORM_CLAIM_TABLE = 'anchorage_platform_plane_claims';
 const PLATFORM_LEASE_TABLE = 'anchorage_platform_plane_leases';
+const CLEANUP_RECEIPT_TABLE = 'anchorage_fleet_cleanup_receipts';
 const LEASE_TTL_MS = 15 * 60_000;
 const LEASE_RENEWAL_INTERVAL_MS = 5 * 60_000;
 const DB_NOW_MS = "CAST(unixepoch('subsec') * 1000 AS INTEGER)";
@@ -133,6 +160,9 @@ const FLEET_ROW_COLUMNS = [
   'platform_target',
   'migration_intent',
   'backend_switch_intent',
+  'decommission_intent',
+  'cleanup_intent',
+  'invocation_authority',
   'durable_object_tag',
   'durable_object_migration_history',
   'durable_object_migration_history_digest',
@@ -146,18 +176,16 @@ const FLEET_ROW_COLUMNS = [
   'database_export_size',
   'settled_settlement_key',
   'updated_at',
+  'wfp_mode',
 ] as const;
 
-/**
- * Nullable TEXT columns added to a table that already shipped, in the order
- * they were added. Each is created by ALTER on an existing database and by the
- * CREATE above on a new one, and each is asserted present afterwards: a column
- * that silently failed to appear would not fail a write, it would drop the
- * value on every write.
- */
 export const ADDED_NULLABLE_TEXT_COLUMNS = [
   'backend_switch_intent',
   'settled_settlement_key',
+  'decommission_intent',
+  'cleanup_intent',
+  'invocation_authority',
+  'wfp_mode',
 ] as const;
 
 function isDuplicateColumnError(
@@ -226,6 +254,7 @@ function rowNumber(
 function optionalReleaseSnapshot(
   value: unknown,
   key: string,
+  mutableScriptName?: string,
 ): ExternalReleaseSnapshot | undefined {
   if (value === null || value === undefined) return undefined;
   if (typeof value !== 'string') {
@@ -257,7 +286,16 @@ function optionalReleaseSnapshot(
     'application' in release ? release.application : undefined,
     `${key}.application`,
   );
-  if (release.artifactVersion !== 'pending' && !topology) {
+  const ownMutableArtifact =
+    mutableScriptName !== undefined &&
+    mutableScriptName.length > 0 &&
+    release.physicalScriptName === mutableScriptName &&
+    release.artifactVersion.length > 0;
+  if (
+    release.artifactVersion !== 'pending' &&
+    !topology &&
+    !ownMutableArtifact
+  ) {
     throw new Error(`fleet state row has invalid ${key}`);
   }
   if (
@@ -372,15 +410,6 @@ function optionalPlatformTarget(
     'platform_target',
   );
 }
-
-const EXTERNAL_MIGRATION_SUBPHASES = [
-  'planned',
-  'schema-applied',
-  'platform-applied',
-  'candidate-deployed',
-  'candidate-armed',
-  'route-published',
-] as const satisfies readonly ExternalMigrationSubphase[];
 
 function optionalMigrationIntent(
   value: unknown,
@@ -585,11 +614,256 @@ function optionalPlatformResources(
   };
 }
 
+function invalidDecommissionIntent(): Error {
+  return new Error('fleet state row has invalid decommission_intent');
+}
+
+function invalidCleanupIntent(): Error {
+  return new Error('fleet state row has invalid cleanup_intent');
+}
+
+function invalidInvocationAuthority(): Error {
+  return new Error('fleet state row has invalid invocation_authority');
+}
+
+function optionalDecommissionIntent(
+  value: unknown,
+  record: Omit<FleetRecord, 'decommissionIntent'>,
+): FleetRecord['decommissionIntent'] {
+  if (value === null || value === undefined) return undefined;
+  if (
+    typeof value !== 'string' ||
+    value.length > DECOMMISSION_INTENT_BYTE_BOUND
+  ) {
+    throw invalidDecommissionIntent();
+  }
+  let parsed: unknown;
+  try {
+    if (
+      new TextEncoder().encode(value).byteLength >
+      DECOMMISSION_INTENT_BYTE_BOUND
+    ) {
+      throw invalidDecommissionIntent();
+    }
+    parsed = JSON.parse(value) as unknown;
+    return decommissionAdvanceIntentFromUnknown(parsed, record);
+  } catch {
+    throw invalidDecommissionIntent();
+  }
+}
+
+function optionalCleanupIntent(
+  value: unknown,
+  record: Omit<FleetRecord, 'cleanupIntent'>,
+): FleetRecord['cleanupIntent'] {
+  if (value === null || value === undefined) return undefined;
+  if (typeof value !== 'string' || value.length > CLEANUP_INTENT_BYTE_BOUND) {
+    throw invalidCleanupIntent();
+  }
+  let parsed: unknown;
+  try {
+    if (
+      new TextEncoder().encode(value).byteLength > CLEANUP_INTENT_BYTE_BOUND
+    ) {
+      throw invalidCleanupIntent();
+    }
+    parsed = JSON.parse(value) as unknown;
+    return cleanupAdvanceIntentFromUnknown(parsed, record);
+  } catch {
+    throw invalidCleanupIntent();
+  }
+}
+
+function optionalInvocationAuthority(
+  value: unknown,
+): FleetRecord['invocationAuthority'] {
+  if (value === null || value === undefined) return undefined;
+  if (typeof value !== 'string') throw invalidInvocationAuthority();
+  try {
+    return invocationAuthorityCarrierFromUnknown(JSON.parse(value) as unknown);
+  } catch {
+    throw invalidInvocationAuthority();
+  }
+}
+
+/**
+ * Mirrors the cleanup-specific #putUnderLease invariant: an active cleanup
+ * owns the whole record, so no other durable intent may ride beside it.
+ * Phase pairing is enforced by effectiveLifecyclePhase.
+ */
+function assertCleanupIntentExclusive(record: FleetRecord): void {
+  if (!record.cleanupIntent) return;
+  if (record.decommissionIntent) {
+    throw new Error('cleanup intent cannot coexist with a decommission intent');
+  }
+  if (record.migrationIntent) {
+    throw new Error('cleanup intent cannot coexist with a migration intent');
+  }
+  // No switch-bearing record can legitimately carry a cleanup intent: cleanup
+  // admission is restricted to prepublication phases, and every record with a
+  // backend-switch intent — settled or not — lives at 'ready' or later.
+  if (record.backendSwitchIntent) {
+    throw new Error(
+      'cleanup intent cannot coexist with a backend switch intent',
+    );
+  }
+}
+
+function validateRecordCrossFields(record: FleetRecord): void {
+  const phase = effectiveLifecyclePhase(record);
+  assertCleanupIntentExclusive(record);
+  const catalog = isPlatformCatalogRecord(record);
+  if (
+    catalog &&
+    [
+      record.activeRelease,
+      record.pendingRelease,
+      record.migrationPriorRelease,
+      record.rollbackRelease,
+      record.retiringRelease,
+    ].some(
+      (release) => release && release.physicalScriptName !== record.scriptName,
+    )
+  )
+    throw new Error('fleet state row has a foreign catalog release');
+  if (
+    Object.hasOwn(record, 'wfpMode') &&
+    (!catalog ||
+      record.platformResources ||
+      record.platformTarget ||
+      record.migrationIntent ||
+      record.backendSwitchIntent)
+  )
+    throw new Error('fleet state row has inconsistent wfp_mode');
+  const {
+    activeRelease,
+    backend,
+    migrationIntent,
+    migrationPriorRelease,
+    outboundPolicy,
+    pendingArtifactVersion,
+    pendingRelease,
+    pendingSpecDigest,
+    platformResources,
+    platformTarget,
+    schemaVersion,
+  } = record;
+  // The retained target authorizes recovery of a state upload whose response is lost.
+  const legacyMigrationTeardown =
+    backend === 'workers-for-platforms' &&
+    record.wfpMode === undefined &&
+    record.cleanupIntent === undefined &&
+    record.decommissionIntent === undefined &&
+    record.backendSwitchIntent === undefined &&
+    record.desiredSpecDigest === migrationIntent?.targetSpecDigest &&
+    [
+      'decommissioning',
+      'traffic-removed',
+      'credentials-revoked',
+      'worker-deleted',
+      'platform-credentials-revoked',
+    ].includes(record.phase);
+  if (
+    (backend === 'workers-for-platforms' && !outboundPolicy) ||
+    (backend === 'plain-worker' && outboundPolicy) ||
+    (platformResources &&
+      (platformResources.outboundPolicy ?? platformResources.egressProxy)
+        ?.policyId !== outboundPolicy?.policyId) ||
+    (platformResources &&
+      JSON.stringify(
+        (platformResources.outboundPolicy ?? platformResources.egressProxy)
+          ?.policyHosts,
+      ) !== JSON.stringify(outboundPolicy?.policyHosts)) ||
+    (platformResources &&
+      (platformResources.outboundPolicy ?? platformResources.egressProxy)
+        ?.policyDigest !== outboundPolicy?.policyDigest)
+  ) {
+    throw new Error('fleet state row has inconsistent outbound_policy');
+  }
+  if (
+    (platformTarget &&
+      JSON.stringify(platformTarget.outboundPolicy) !==
+        JSON.stringify(outboundPolicy)) ||
+    (migrationIntent && phase !== 'migrating' && !legacyMigrationTeardown) ||
+    (migrationIntent &&
+      migrationIntent.targetSpecDigest !==
+        migrationIntent.targetRelease.specDigest) ||
+    (migrationIntent &&
+      migrationIntent.target.d1SchemaVersion !==
+        (migrationIntent.platformOnly === true
+          ? schemaVersion
+          : migrationIntent.targetRelease.releaseSchemaVersion)) ||
+    (migrationIntent &&
+      JSON.stringify(migrationIntent.priorRelease) !==
+        JSON.stringify(activeRelease)) ||
+    (migrationIntent?.platformOnly === true
+      ? JSON.stringify(migrationIntent.targetRelease) !==
+          JSON.stringify(activeRelease) ||
+        migrationPriorRelease !== undefined ||
+        pendingRelease !== undefined ||
+        ['candidate-deployed', 'candidate-armed'].includes(
+          migrationIntent.subphase,
+        )
+      : migrationIntent !== undefined &&
+        (JSON.stringify(migrationIntent.priorRelease) !==
+          JSON.stringify(migrationPriorRelease) ||
+          JSON.stringify(migrationIntent.targetRelease) !==
+            JSON.stringify(pendingRelease)))
+  ) {
+    throw new Error('fleet state row has inconsistent migration intent');
+  }
+  if (
+    ((backend === 'plain-worker' || catalog) &&
+      (platformTarget || migrationIntent)) ||
+    (backend === 'workers-for-platforms' &&
+      platformResources !== undefined &&
+      platformTarget === undefined) ||
+    (backend === 'workers-for-platforms' &&
+      !catalog &&
+      phase === 'migrating' &&
+      migrationIntent === undefined)
+  ) {
+    throw new Error('fleet state row has inconsistent platform target');
+  }
+  if (
+    pendingArtifactVersion !== undefined &&
+    ((backend !== 'plain-worker' && !catalog) ||
+      phase !== 'migrating' ||
+      typeof pendingSpecDigest !== 'string' ||
+      pendingArtifactVersion.length === 0 ||
+      pendingArtifactVersion === 'pending')
+  ) {
+    throw new Error('fleet state row has inconsistent pending artifact');
+  }
+  if (platformResources && platformTarget) {
+    assertPlatformResourcesMatchTarget(platformResources, platformTarget);
+  }
+  if (
+    migrationIntent &&
+    [
+      'platform-applied',
+      'candidate-deployed',
+      'candidate-armed',
+      'route-published',
+    ].includes(migrationIntent.subphase) &&
+    JSON.stringify(platformTarget) !== JSON.stringify(migrationIntent.target)
+  ) {
+    throw new Error('fleet state row has inconsistent migration target');
+  }
+}
+
 function toRecord(row: Readonly<Record<string, unknown>>): FleetRecord {
   const backend = rowString(row, 'backend');
   if (backend !== 'plain-worker' && backend !== 'workers-for-platforms') {
     throw new Error('fleet state row has invalid backend');
   }
+  const wfpMode = row.wfp_mode;
+  if (
+    wfpMode !== null &&
+    wfpMode !== undefined &&
+    wfpMode !== 'platform-catalog'
+  )
+    throw new Error('fleet state row has invalid wfp_mode');
   const phase = rowString(row, 'phase');
   if (!PROVISIONING_PHASES.includes(phase as ProvisioningPhase)) {
     throw new Error('fleet state row has invalid phase');
@@ -922,25 +1196,34 @@ function toRecord(row: Readonly<Record<string, unknown>>): FleetRecord {
   ) {
     throw new Error('fleet state row has invalid durable_object_bindings');
   }
+  const mutableScriptName =
+    backend === 'plain-worker' || wfpMode === 'platform-catalog'
+      ? rowString(row, 'script_name')
+      : undefined;
   const activeRelease = optionalReleaseSnapshot(
     row.active_release,
     'active_release',
+    mutableScriptName,
   );
   const pendingRelease = optionalReleaseSnapshot(
     row.pending_release,
     'pending_release',
+    mutableScriptName,
   );
   const migrationPriorRelease = optionalReleaseSnapshot(
     row.migration_prior_release,
     'migration_prior_release',
+    mutableScriptName,
   );
   const rollbackRelease = optionalReleaseSnapshot(
     row.rollback_release,
     'rollback_release',
+    mutableScriptName,
   );
   const retiringRelease = optionalReleaseSnapshot(
     row.retiring_release,
     'retiring_release',
+    mutableScriptName,
   );
   const tenantTag = rowString(row, 'tenant_tag');
   const environment = rowString(row, 'environment');
@@ -998,100 +1281,11 @@ function toRecord(row: Readonly<Record<string, unknown>>): FleetRecord {
   ) {
     throw new Error('fleet state row has invalid backend_switch_intent');
   }
-  if (
-    (backend === 'workers-for-platforms' && !outboundPolicy) ||
-    (backend === 'plain-worker' && outboundPolicy) ||
-    (platformResources &&
-      (platformResources.outboundPolicy ?? platformResources.egressProxy)
-        ?.policyId !== outboundPolicy?.policyId) ||
-    (platformResources &&
-      JSON.stringify(
-        (platformResources.outboundPolicy ?? platformResources.egressProxy)
-          ?.policyHosts,
-      ) !== JSON.stringify(outboundPolicy?.policyHosts)) ||
-    (platformResources &&
-      (platformResources.outboundPolicy ?? platformResources.egressProxy)
-        ?.policyDigest !== outboundPolicy?.policyDigest)
-  ) {
-    throw new Error('fleet state row has inconsistent outbound_policy');
-  }
-  if (
-    (platformTarget &&
-      JSON.stringify(platformTarget.outboundPolicy) !==
-        JSON.stringify(outboundPolicy)) ||
-    (migrationIntent && phase !== 'migrating') ||
-    (migrationIntent &&
-      migrationIntent.targetSpecDigest !==
-        migrationIntent.targetRelease.specDigest) ||
-    (migrationIntent &&
-      migrationIntent.target.d1SchemaVersion !==
-        (migrationIntent.platformOnly === true
-          ? schemaVersion
-          : migrationIntent.targetRelease.releaseSchemaVersion)) ||
-    (migrationIntent &&
-      JSON.stringify(migrationIntent.priorRelease) !==
-        JSON.stringify(activeRelease)) ||
-    (migrationIntent?.platformOnly === true
-      ? JSON.stringify(migrationIntent.targetRelease) !==
-          JSON.stringify(activeRelease) ||
-        migrationPriorRelease !== undefined ||
-        pendingRelease !== undefined ||
-        ['candidate-deployed', 'candidate-armed'].includes(
-          migrationIntent.subphase,
-        )
-      : migrationIntent !== undefined &&
-        (JSON.stringify(migrationIntent.priorRelease) !==
-          JSON.stringify(migrationPriorRelease) ||
-          JSON.stringify(migrationIntent.targetRelease) !==
-            JSON.stringify(pendingRelease)))
-  ) {
-    throw new Error('fleet state row has inconsistent migration intent');
-  }
-  if (
-    (backend === 'plain-worker' && (platformTarget || migrationIntent)) ||
-    (backend === 'workers-for-platforms' &&
-      platformResources !== undefined &&
-      platformTarget === undefined) ||
-    (backend === 'workers-for-platforms' &&
-      phase === 'migrating' &&
-      migrationIntent === undefined)
-  ) {
-    throw new Error('fleet state row has inconsistent platform target');
-  }
-  if (
-    row.pending_artifact_version !== undefined &&
-    row.pending_artifact_version !== null &&
-    (backend !== 'plain-worker' ||
-      phase !== 'migrating' ||
-      typeof row.pending_spec_digest !== 'string' ||
-      typeof row.pending_artifact_version !== 'string' ||
-      row.pending_artifact_version.length === 0 ||
-      row.pending_artifact_version === 'pending')
-  ) {
-    throw new Error('fleet state row has inconsistent pending artifact');
-  }
-  if (platformResources && platformTarget) {
-    assertPlatformResourcesMatchTarget(platformResources, platformTarget);
-  }
-  if (
-    migrationIntent &&
-    [
-      'platform-applied',
-      'candidate-deployed',
-      'candidate-armed',
-      'route-published',
-    ].includes(migrationIntent.subphase)
-  ) {
-    if (
-      JSON.stringify(platformTarget) !== JSON.stringify(migrationIntent.target)
-    ) {
-      throw new Error('fleet state row has inconsistent migration target');
-    }
-  }
-  return {
+  const provisional: Omit<FleetRecord, 'decommissionIntent'> = {
     tenantTag,
     environment,
     backend,
+    ...(wfpMode === 'platform-catalog' ? { wfpMode } : {}),
     scriptName: rowString(row, 'script_name'),
     databaseId: rowString(row, 'database_id'),
     databaseName: rowString(row, 'database_name'),
@@ -1141,6 +1335,180 @@ function toRecord(row: Readonly<Record<string, unknown>>): FleetRecord {
       : {}),
     updatedAt: rowString(row, 'updated_at'),
   };
+  let rawDecommissionIntent: unknown;
+  try {
+    const value = row.decommission_intent;
+    if (value !== null && value !== undefined) {
+      if (
+        typeof value !== 'string' ||
+        value.length > DECOMMISSION_INTENT_BYTE_BOUND ||
+        new TextEncoder().encode(value).byteLength >
+          DECOMMISSION_INTENT_BYTE_BOUND
+      ) {
+        throw new Error();
+      }
+      rawDecommissionIntent = JSON.parse(value) as unknown;
+    }
+  } catch {
+    if (backendSwitchIntent) throw new Error(BACKEND_SWITCH_RECORD_ERROR);
+    throw invalidDecommissionIntent();
+  }
+  let rawCleanupIntent: unknown;
+  try {
+    const value = row.cleanup_intent;
+    if (value !== null && value !== undefined) {
+      if (
+        typeof value !== 'string' ||
+        value.length > CLEANUP_INTENT_BYTE_BOUND ||
+        new TextEncoder().encode(value).byteLength > CLEANUP_INTENT_BYTE_BOUND
+      ) {
+        throw new Error();
+      }
+      rawCleanupIntent = JSON.parse(value) as unknown;
+    }
+  } catch {
+    if (backendSwitchIntent) throw new Error(BACKEND_SWITCH_RECORD_ERROR);
+    throw invalidCleanupIntent();
+  }
+  let rawInvocationAuthority: unknown;
+  try {
+    const value = row.invocation_authority;
+    if (value !== null && value !== undefined) {
+      if (typeof value !== 'string') throw new Error();
+      rawInvocationAuthority = JSON.parse(value) as unknown;
+    }
+  } catch {
+    if (backendSwitchIntent) throw new Error(BACKEND_SWITCH_RECORD_ERROR);
+    throw invalidInvocationAuthority();
+  }
+  const reconstructed = structuralBackendSwitchFleetRecordFromUnknown({
+    ...provisional,
+    ...(rawDecommissionIntent === undefined
+      ? {}
+      : { decommissionIntent: rawDecommissionIntent }),
+    ...(rawCleanupIntent === undefined
+      ? {}
+      : { cleanupIntent: rawCleanupIntent }),
+    ...(rawInvocationAuthority === undefined
+      ? {}
+      : { invocationAuthority: rawInvocationAuthority }),
+  });
+  if (reconstructed.carriesBackendSwitchAuthority) {
+    const canonical = backendSwitchFleetRecordFromUnknown(
+      reconstructed.record,
+    ).record;
+    validateRecordCrossFields(canonical);
+    return canonical;
+  }
+  const {
+    decommissionIntent: _rawDecommissionIntent,
+    cleanupIntent: _rawCleanupIntent,
+    invocationAuthority: _rawInvocationAuthority,
+    ...normalProvisional
+  } = reconstructed.record;
+  const decommissionIntent = optionalDecommissionIntent(
+    row.decommission_intent,
+    normalProvisional,
+  );
+  if (
+    normalProvisional.phase === 'decommission-advancing' &&
+    !decommissionIntent
+  ) {
+    throw invalidDecommissionIntent();
+  }
+  const cleanupIntent = optionalCleanupIntent(
+    row.cleanup_intent,
+    normalProvisional,
+  );
+  if (normalProvisional.phase === 'cleanup-advancing' && !cleanupIntent) {
+    throw invalidCleanupIntent();
+  }
+  const invocationAuthority = optionalInvocationAuthority(
+    row.invocation_authority,
+  );
+  const record: FleetRecord = {
+    ...normalProvisional,
+    ...(decommissionIntent ? { decommissionIntent } : {}),
+    ...(cleanupIntent ? { cleanupIntent } : {}),
+    ...(invocationAuthority ? { invocationAuthority } : {}),
+  };
+  validateRecordCrossFields(record);
+  return record;
+}
+
+function normalizeRecordForWrite(record: FleetRecord): FleetRecord {
+  const reconstructed = structuralBackendSwitchFleetRecordFromUnknown(record);
+  record = reconstructed.record;
+  if (reconstructed.carriesBackendSwitchAuthority) {
+    const canonical = backendSwitchFleetRecordFromUnknown(record).record;
+    validateRecordCrossFields(canonical);
+    return canonical;
+  }
+  const hasDecommissionIntent = Object.hasOwn(record, 'decommissionIntent');
+  const suppliedDecommissionIntent = record.decommissionIntent;
+  if (hasDecommissionIntent && suppliedDecommissionIntent === undefined) {
+    throw invalidDecommissionIntent();
+  }
+  const hasCleanupIntent = Object.hasOwn(record, 'cleanupIntent');
+  const suppliedCleanupIntent = record.cleanupIntent;
+  if (hasCleanupIntent && suppliedCleanupIntent === undefined) {
+    throw invalidCleanupIntent();
+  }
+  const hasInvocationAuthority = Object.hasOwn(record, 'invocationAuthority');
+  const suppliedInvocationAuthority = record.invocationAuthority;
+  if (hasInvocationAuthority && suppliedInvocationAuthority === undefined) {
+    throw invalidInvocationAuthority();
+  }
+  const provisional = { ...record };
+  delete provisional.decommissionIntent;
+  delete provisional.cleanupIntent;
+  let decommissionIntent: FleetRecord['decommissionIntent'];
+  try {
+    decommissionIntent = hasDecommissionIntent
+      ? normalizeDecommissionAdvanceIntent(
+          suppliedDecommissionIntent as NonNullable<
+            FleetRecord['decommissionIntent']
+          >,
+          provisional,
+        )
+      : undefined;
+  } catch {
+    throw invalidDecommissionIntent();
+  }
+  let cleanupIntent: FleetRecord['cleanupIntent'];
+  try {
+    cleanupIntent = hasCleanupIntent
+      ? normalizeCleanupAdvanceIntent(
+          suppliedCleanupIntent as NonNullable<FleetRecord['cleanupIntent']>,
+          provisional,
+        )
+      : undefined;
+  } catch {
+    throw invalidCleanupIntent();
+  }
+  let invocationAuthority: FleetRecord['invocationAuthority'];
+  try {
+    invocationAuthority = hasInvocationAuthority
+      ? invocationAuthorityCarrierFromUnknown(suppliedInvocationAuthority)
+      : undefined;
+  } catch {
+    throw invalidInvocationAuthority();
+  }
+  delete provisional.invocationAuthority;
+  const normalized: FleetRecord = {
+    ...provisional,
+    ...(decommissionIntent ? { decommissionIntent } : {}),
+    ...(cleanupIntent ? { cleanupIntent } : {}),
+    ...(invocationAuthority ? { invocationAuthority } : {}),
+  };
+  if (record.phase === 'decommission-advancing' && !decommissionIntent) {
+    throw invalidDecommissionIntent();
+  }
+  if (record.phase === 'cleanup-advancing' && !cleanupIntent) {
+    throw invalidCleanupIntent();
+  }
+  validateRecordCrossFields(normalized);
+  return normalized;
 }
 
 export class D1FleetStateStore
@@ -1207,6 +1575,9 @@ export class D1FleetStateStore
       platform_target TEXT,
       migration_intent TEXT,
       backend_switch_intent TEXT,
+      decommission_intent TEXT,
+      cleanup_intent TEXT,
+      invocation_authority TEXT,
       durable_object_tag TEXT,
       durable_object_migration_history TEXT,
       durable_object_migration_history_digest TEXT,
@@ -1220,6 +1591,7 @@ export class D1FleetStateStore
       database_export_size INTEGER,
       settled_settlement_key TEXT,
       updated_at TEXT NOT NULL,
+      wfp_mode TEXT,
       PRIMARY KEY (tenant_tag, environment),
       UNIQUE (backend, script_name),
       UNIQUE (database_id),
@@ -1232,7 +1604,6 @@ export class D1FleetStateStore
       try {
         await this.#db.execute(`ALTER TABLE ${TABLE} ADD COLUMN ${name} TEXT`);
       } catch (error) {
-        // A replica that added the same column between the read and the write.
         if (!isDuplicateColumnError(error, name)) throw error;
       }
       fleetColumns = await this.#db.query(`PRAGMA table_info(${TABLE})`);
@@ -1265,6 +1636,20 @@ export class D1FleetStateStore
       resource_set_key TEXT PRIMARY KEY,
       owner_token TEXT NOT NULL,
       expires_at INTEGER NOT NULL
+    )`);
+    await this.#db.execute(`CREATE TABLE IF NOT EXISTS ${CLEANUP_RECEIPT_TABLE} (
+      operation_id TEXT NOT NULL PRIMARY KEY,
+      tenant_tag TEXT NOT NULL,
+      environment TEXT NOT NULL,
+      backend TEXT NOT NULL,
+      script_name TEXT NOT NULL,
+      database_id TEXT NOT NULL,
+      database_name TEXT NOT NULL,
+      authority TEXT NOT NULL CHECK (authority IN ('manual-cleanup', 'provisioning-rollback')),
+      admitted_phase TEXT NOT NULL,
+      disposition TEXT NOT NULL CHECK (disposition IN ('prepublication-owned-no-export', 'reservation-cleared')),
+      evidence TEXT NOT NULL,
+      completed_at_ms INTEGER NOT NULL
     )`);
   }
 
@@ -1317,6 +1702,10 @@ export class D1FleetStateStore
         put: (record) =>
           this.#putUnderLease(tenantTag, environment, token, record),
         delete: () => this.#deleteUnderLease(tenantTag, environment, token),
+        completeCleanup: (input) =>
+          this.#completeCleanupUnderLease(tenantTag, environment, token, input),
+        deleteReleasingClaims: () =>
+          this.#deleteReleasingClaimsUnderLease(tenantTag, environment, token),
       }),
       operation,
     });
@@ -1706,22 +2095,54 @@ export class D1FleetStateStore
     token: string,
     record: FleetRecord,
   ): Promise<void> {
+    record = normalizeRecordForWrite(record);
     deploymentKey(record.tenantTag, record.environment);
     if (record.tenantTag !== tenantTag || record.environment !== environment) {
       throw new Error(
         `deployment lease '${tenantTag}:${environment}' cannot write '${record.tenantTag}:${record.environment}'`,
       );
     }
+    const decommissionIntent = record.decommissionIntent
+      ? JSON.stringify(record.decommissionIntent)
+      : null;
+    if (
+      typeof decommissionIntent === 'string' &&
+      (decommissionIntent.length > DECOMMISSION_INTENT_BYTE_BOUND ||
+        new TextEncoder().encode(decommissionIntent).byteLength >
+          DECOMMISSION_INTENT_BYTE_BOUND)
+    ) {
+      throw invalidDecommissionIntent();
+    }
+    const cleanupIntent = record.cleanupIntent
+      ? JSON.stringify(record.cleanupIntent)
+      : null;
+    if (
+      typeof cleanupIntent === 'string' &&
+      (cleanupIntent.length > CLEANUP_INTENT_BYTE_BOUND ||
+        new TextEncoder().encode(cleanupIntent).byteLength >
+          CLEANUP_INTENT_BYTE_BOUND)
+    ) {
+      throw invalidCleanupIntent();
+    }
+    const invocationAuthority = record.invocationAuthority
+      ? JSON.stringify(record.invocationAuthority)
+      : null;
     if (
       record.migrationIntent &&
       record.backendSwitchIntent &&
-      record.backendSwitchIntent.subphase !== 'finalized' &&
-      record.backendSwitchIntent.subphase !== 'rolled-back'
+      !SETTLED_BACKEND_SWITCH_SUBPHASES.has(record.backendSwitchIntent.subphase)
     ) {
       throw new Error(
         'only a settled backend switch can coexist with migration intent',
       );
     }
+    if (
+      (record.cleanupIntent && record.phase !== 'cleanup-advancing') ||
+      (record.phase === 'cleanup-advancing' && !record.cleanupIntent)
+    ) {
+      throw invalidCleanupIntent();
+    }
+    assertCleanupIntentExclusive(record);
     const releases = [
       record.activeRelease,
       record.pendingRelease,
@@ -1785,6 +2206,9 @@ export class D1FleetStateStore
       record.backendSwitchIntent
         ? JSON.stringify(record.backendSwitchIntent)
         : null,
+      decommissionIntent,
+      cleanupIntent,
+      invocationAuthority,
       record.durableObjectTag ?? null,
       record.durableObjectMigrationHistory
         ? JSON.stringify(record.durableObjectMigrationHistory)
@@ -1802,26 +2226,30 @@ export class D1FleetStateStore
       record.databaseExportSize ?? null,
       record.settledSettlementKey ?? null,
       record.updatedAt,
+      record.wfpMode ?? null,
     ] as const;
     const upsertSql = `INSERT INTO ${TABLE} (
         tenant_tag, environment, backend, script_name, database_id,
         database_name, schema_version, artifact_version, desired_spec_digest,
         pending_spec_digest, pending_artifact_version, active_release, pending_release, migration_prior_release,
         rollback_release, retiring_release, outbound_policy, platform_resources,
-        platform_target, migration_intent, backend_switch_intent, durable_object_tag,
+        platform_target, migration_intent, backend_switch_intent, decommission_intent, cleanup_intent,
+        invocation_authority, durable_object_tag,
         durable_object_migration_history, durable_object_migration_history_digest,
         durable_object_bindings, application_resources, application_bindings,
         route_hostname, phase,
         database_export_location, database_export_sha256,
-        database_export_size, settled_settlement_key, updated_at
+        database_export_size, settled_settlement_key, updated_at, wfp_mode
       ) SELECT CASE WHEN EXISTS (
         SELECT 1 FROM ${LEASE_TABLE}
         WHERE tenant_tag = ? AND environment = ? AND owner_token = ?
           AND expires_at > ${DB_NOW_MS}
       ) THEN ? ELSE NULL END,
-      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
       WHERE true
       ON CONFLICT (tenant_tag, environment) DO UPDATE SET
+        tenant_tag = CASE WHEN ${TABLE}.wfp_mode IS NULL OR ${TABLE}.wfp_mode IS excluded.wfp_mode
+          THEN excluded.tenant_tag ELSE NULL END,
         backend = excluded.backend,
         script_name = excluded.script_name,
         database_id = excluded.database_id,
@@ -1841,6 +2269,9 @@ export class D1FleetStateStore
         platform_target = excluded.platform_target,
         migration_intent = excluded.migration_intent,
         backend_switch_intent = excluded.backend_switch_intent,
+        decommission_intent = excluded.decommission_intent,
+        cleanup_intent = excluded.cleanup_intent,
+        invocation_authority = excluded.invocation_authority,
         durable_object_tag = excluded.durable_object_tag,
         durable_object_migration_history = excluded.durable_object_migration_history,
         durable_object_migration_history_digest = excluded.durable_object_migration_history_digest,
@@ -1853,7 +2284,8 @@ export class D1FleetStateStore
         database_export_sha256 = excluded.database_export_sha256,
         database_export_size = excluded.database_export_size,
         settled_settlement_key = excluded.settled_settlement_key,
-        updated_at = excluded.updated_at
+        updated_at = excluded.updated_at,
+        wfp_mode = excluded.wfp_mode
       RETURNING tenant_tag, environment`;
     let results: readonly (readonly Readonly<Record<string, unknown>>[])[];
     try {
@@ -1962,6 +2394,8 @@ export class D1FleetStateStore
     let workerClaim: DeploymentClaim;
     if (record.backend === 'plain-worker') {
       workerClaim = ['worker-script', record.scriptName, 'deployment-worker'];
+    } else if (isPlatformCatalogRecord(record)) {
+      workerClaim = ['dispatch-script', record.scriptName, 'deployment-worker'];
     } else if (record.platformResources) {
       const state = record.platformResources.stateWorker;
       if (state.plane === 'ordinary') {
@@ -2126,6 +2560,371 @@ export class D1FleetStateStore
     if (owned.length !== 1 || owned[0]?.owner_token !== token) {
       throw this.#leaseLost(tenantTag, environment);
     }
+  }
+
+  /**
+   * One atomic batch: immutable receipt insert, identity-scoped claims
+   * release, and Fleet-row delete, each guarded by the live lease and the
+   * exact operation AND revision. Atomicity assumption: `#db.batch` delegates
+   * to `D1Database.batch`, which D1 executes as a single auto-commit
+   * transaction; the harness partial-state convergence test proves it.
+   */
+  async #completeCleanupUnderLease(
+    tenantTag: string,
+    environment: string,
+    token: string,
+    input: Readonly<{
+      receipt: CleanupTerminalReceipt;
+      expectedRevision: number;
+    }>,
+  ): Promise<CleanupTerminalReceipt> {
+    const receipt = cleanupTerminalReceiptFromUnknown(input.receipt);
+    if (receipt.completedAtMs !== undefined) {
+      throw new Error('cleanup receipt completedAtMs is database-assigned');
+    }
+    if (
+      receipt.tenantTag !== tenantTag ||
+      receipt.environment !== environment
+    ) {
+      throw new Error(
+        `deployment lease '${tenantTag}:${environment}' cannot write '${receipt.tenantTag}:${receipt.environment}'`,
+      );
+    }
+    if (
+      !Number.isSafeInteger(input.expectedRevision) ||
+      input.expectedRevision < 0
+    ) {
+      throw new Error(
+        'completeCleanup expectedRevision must be a non-negative safe integer',
+      );
+    }
+    // json_extract yields a JSON number (SQLite INTEGER affinity), so the
+    // revision binding MUST be a JS Number.
+    const expectedRevision = Number(input.expectedRevision);
+    const evidence = canonicalCleanupEvidenceBytes(receipt.evidence);
+    const identity = `deployment:${tenantTag}:${environment}`;
+    const rowGuard = `EXISTS (
+        SELECT 1 FROM ${TABLE}
+        WHERE tenant_tag = ? AND environment = ?
+          AND phase = 'cleanup-advancing'
+          AND json_extract(cleanup_intent, '$.operationId') = ?
+          AND json_extract(cleanup_intent, '$.revision') = ?)`;
+    const leaseGuard = `EXISTS (
+        SELECT 1 FROM ${LEASE_TABLE}
+        WHERE tenant_tag = ? AND environment = ? AND owner_token = ?
+          AND expires_at > ${DB_NOW_MS})`;
+    let results:
+      | readonly (readonly Readonly<Record<string, unknown>>[])[]
+      | undefined;
+    let batchFailed = false;
+    let batchError: unknown;
+    try {
+      results = await this.#db.batch([
+        {
+          sql: `INSERT INTO ${CLEANUP_RECEIPT_TABLE} (
+            operation_id, tenant_tag, environment, backend, script_name,
+            database_id, database_name, authority, admitted_phase, disposition,
+            evidence, completed_at_ms
+          ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${DB_NOW_MS}
+          WHERE ${leaseGuard}
+            AND ${rowGuard}
+          RETURNING operation_id`,
+          bindings: [
+            receipt.operationId,
+            receipt.tenantTag,
+            receipt.environment,
+            receipt.backend,
+            receipt.scriptName,
+            receipt.databaseId,
+            receipt.databaseName,
+            receipt.authority,
+            receipt.admittedPhase,
+            receipt.disposition,
+            evidence,
+            tenantTag,
+            environment,
+            token,
+            tenantTag,
+            environment,
+            receipt.operationId,
+            expectedRevision,
+          ],
+        },
+        {
+          sql: `DELETE FROM ${PLATFORM_CLAIM_TABLE}
+          WHERE account_id = ? AND resource_set_key = ?
+            AND platform_plane_identity = ?
+            AND ${leaseGuard}
+            AND ${rowGuard}
+          RETURNING resource_type, resource_name`,
+          bindings: [
+            this.#accountId,
+            identity,
+            identity,
+            tenantTag,
+            environment,
+            token,
+            tenantTag,
+            environment,
+            receipt.operationId,
+            expectedRevision,
+          ],
+        },
+        {
+          sql: `DELETE FROM ${TABLE}
+          WHERE tenant_tag = ? AND environment = ?
+            AND phase = 'cleanup-advancing'
+            AND json_extract(cleanup_intent, '$.operationId') = ?
+            AND json_extract(cleanup_intent, '$.revision') = ?
+            AND ${leaseGuard}
+          RETURNING tenant_tag, environment`,
+          bindings: [
+            tenantTag,
+            environment,
+            receipt.operationId,
+            expectedRevision,
+            tenantTag,
+            environment,
+            token,
+          ],
+        },
+      ]);
+    } catch (error) {
+      batchFailed = true;
+      batchError = error;
+    }
+    if (results) {
+      const inserted = results[0] ?? [];
+      const deletedRow = results[2] ?? [];
+      if (
+        inserted.length === 1 &&
+        inserted[0]?.operation_id === receipt.operationId &&
+        deletedRow.length === 1 &&
+        deletedRow[0]?.tenant_tag === tenantTag &&
+        deletedRow[0]?.environment === environment
+      ) {
+        return await this.#readPersistedCleanupReceipt(receipt, evidence);
+      }
+    }
+    const owned = await this.#db.query(
+      `SELECT owner_token FROM ${LEASE_TABLE}
+      WHERE tenant_tag = ? AND environment = ? AND owner_token = ?
+        AND expires_at > ${DB_NOW_MS}`,
+      [tenantTag, environment, token],
+    );
+    if (owned.length !== 1 || owned[0]?.owner_token !== token) {
+      throw this.#leaseLost(tenantTag, environment);
+    }
+    const stored = await this.#db.query(
+      `SELECT * FROM ${CLEANUP_RECEIPT_TABLE} WHERE operation_id = ?`,
+      [receipt.operationId],
+    );
+    const storedRow = stored[0];
+    if (stored.length === 1 && storedRow) {
+      if (!this.#cleanupReceiptRowMatches(storedRow, receipt, evidence)) {
+        throw new Error(
+          `cleanup receipt conflict for operation '${receipt.operationId}'`,
+        );
+      }
+      const rows = await this.#db.query(
+        `SELECT tenant_tag FROM ${TABLE}
+        WHERE tenant_tag = ? AND environment = ?`,
+        [tenantTag, environment],
+      );
+      const claims = await this.#db.query(
+        `SELECT resource_type FROM ${PLATFORM_CLAIM_TABLE}
+        WHERE account_id = ? AND resource_set_key = ?`,
+        [this.#accountId, identity],
+      );
+      if (rows.length === 0 && claims.length === 0) {
+        return this.#cleanupReceiptFromRow(storedRow);
+      }
+      throw new Error(
+        `deployment '${tenantTag}:${environment}' has a mixed atomic cleanup commit`,
+      );
+    }
+    if (batchFailed) throw batchError;
+    throw new Error(
+      `deployment '${tenantTag}:${environment}' has no matching active cleanup operation`,
+    );
+  }
+
+  async #readPersistedCleanupReceipt(
+    receipt: CleanupTerminalReceipt,
+    evidence: string,
+  ): Promise<CleanupTerminalReceipt> {
+    const stored = await this.#db.query(
+      `SELECT * FROM ${CLEANUP_RECEIPT_TABLE} WHERE operation_id = ?`,
+      [receipt.operationId],
+    );
+    const row = stored[0];
+    if (
+      stored.length !== 1 ||
+      !row ||
+      !this.#cleanupReceiptRowMatches(row, receipt, evidence)
+    ) {
+      throw new Error(
+        `cleanup receipt conflict for operation '${receipt.operationId}'`,
+      );
+    }
+    return this.#cleanupReceiptFromRow(row);
+  }
+
+  #cleanupReceiptRowMatches(
+    row: Readonly<Record<string, unknown>>,
+    receipt: CleanupTerminalReceipt,
+    evidence: string,
+  ): boolean {
+    let storedEvidence: string;
+    try {
+      const parsed = cleanupReceiptEvidenceFromUnknown(
+        JSON.parse(String(row.evidence)) as unknown,
+      );
+      storedEvidence = canonicalCleanupEvidenceBytes(parsed);
+    } catch {
+      return false;
+    }
+    return (
+      row.operation_id === receipt.operationId &&
+      row.tenant_tag === receipt.tenantTag &&
+      row.environment === receipt.environment &&
+      row.backend === receipt.backend &&
+      row.script_name === receipt.scriptName &&
+      row.database_id === receipt.databaseId &&
+      row.database_name === receipt.databaseName &&
+      row.authority === receipt.authority &&
+      row.admitted_phase === receipt.admittedPhase &&
+      row.disposition === receipt.disposition &&
+      storedEvidence === evidence
+    );
+  }
+
+  #cleanupReceiptFromRow(
+    row: Readonly<Record<string, unknown>>,
+  ): CleanupTerminalReceipt {
+    try {
+      const evidence = row.evidence;
+      if (typeof evidence !== 'string') throw new Error();
+      return cleanupTerminalReceiptFromUnknown({
+        version: 1,
+        operationId: row.operation_id,
+        tenantTag: row.tenant_tag,
+        environment: row.environment,
+        backend: row.backend,
+        scriptName: row.script_name,
+        databaseId: row.database_id,
+        databaseName: row.database_name,
+        authority: row.authority,
+        admittedPhase: row.admitted_phase,
+        disposition: row.disposition,
+        evidence: JSON.parse(evidence) as unknown,
+        completedAtMs: Number(row.completed_at_ms),
+      });
+    } catch {
+      throw new Error('fleet state row has invalid cleanup receipt');
+    }
+  }
+
+  /**
+   * Force path: releases this deployment's current claims and deletes the
+   * Fleet row in one lease-guarded batch, with the same converged/lease-lost
+   * postcondition as the plain row delete. No receipt is written or read.
+   */
+  async #deleteReleasingClaimsUnderLease(
+    tenantTag: string,
+    environment: string,
+    token: string,
+  ): Promise<void> {
+    const identity = `deployment:${tenantTag}:${environment}`;
+    const results = await this.#db.batch([
+      {
+        sql: `DELETE FROM ${PLATFORM_CLAIM_TABLE}
+        WHERE account_id = ? AND resource_set_key = ?
+          AND platform_plane_identity = ?
+          AND EXISTS (
+            SELECT 1 FROM ${LEASE_TABLE}
+            WHERE tenant_tag = ? AND environment = ? AND owner_token = ?
+              AND expires_at > ${DB_NOW_MS})
+        RETURNING resource_type, resource_name`,
+        bindings: [
+          this.#accountId,
+          identity,
+          identity,
+          tenantTag,
+          environment,
+          token,
+        ],
+      },
+      {
+        sql: `DELETE FROM ${TABLE}
+        WHERE tenant_tag = ? AND environment = ?
+          AND EXISTS (
+            SELECT 1 FROM ${LEASE_TABLE}
+            WHERE tenant_tag = ? AND environment = ? AND owner_token = ?
+              AND expires_at > ${DB_NOW_MS}
+          )
+        RETURNING tenant_tag, environment`,
+        bindings: [tenantTag, environment, tenantTag, environment, token],
+      },
+    ]);
+    const deleted = results[1] ?? [];
+    if (deleted.length === 1) return;
+    const owned = await this.#db.query(
+      `SELECT owner_token FROM ${LEASE_TABLE}
+      WHERE tenant_tag = ? AND environment = ? AND owner_token = ?
+        AND expires_at > ${DB_NOW_MS}`,
+      [tenantTag, environment, token],
+    );
+    if (owned.length !== 1 || owned[0]?.owner_token !== token) {
+      throw this.#leaseLost(tenantTag, environment);
+    }
+  }
+
+  async readCleanupReceipt(
+    operationId: string,
+  ): Promise<CleanupTerminalReceipt | undefined> {
+    if (typeof operationId !== 'string' || operationId.length === 0) {
+      throw new Error('readCleanupReceipt requires an operation id');
+    }
+    await this.#ensureSchema();
+    const rows = await this.#db.query(
+      `SELECT * FROM ${CLEANUP_RECEIPT_TABLE} WHERE operation_id = ?`,
+      [operationId],
+    );
+    const row = rows[0];
+    if (rows.length === 0 || !row) return undefined;
+    if (rows.length > 1) {
+      throw new Error('cleanup receipt key is not unique');
+    }
+    return this.#cleanupReceiptFromRow(row);
+  }
+
+  async pruneCleanupReceipts(
+    input: Readonly<{ completedBeforeMs: number; limit: number }>,
+  ): Promise<Readonly<{ deleted: number }>> {
+    const { completedBeforeMs, limit } = input;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) {
+      throw new Error(
+        'pruneCleanupReceipts limit must be an integer from 1 to 1000',
+      );
+    }
+    if (!Number.isSafeInteger(completedBeforeMs)) {
+      throw new Error(
+        'pruneCleanupReceipts completedBeforeMs must be a safe integer',
+      );
+    }
+    await this.#ensureSchema();
+    const deleted = await this.#db.query(
+      `DELETE FROM ${CLEANUP_RECEIPT_TABLE}
+      WHERE operation_id IN (
+        SELECT operation_id FROM ${CLEANUP_RECEIPT_TABLE}
+        WHERE completed_at_ms < ?
+        ORDER BY completed_at_ms ASC, operation_id ASC
+        LIMIT ?)
+      RETURNING operation_id`,
+      [completedBeforeMs, limit],
+    );
+    return { deleted: deleted.length };
   }
 
   async list(): Promise<readonly FleetRecord[]> {

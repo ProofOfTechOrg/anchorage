@@ -1,36 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
-/// <reference types="@cloudflare/workers-types" />
+import type {
+  D1Database,
+  ExportedHandler,
+  Request,
+  Response as WorkerResponse,
+} from '@cloudflare/workers-types';
 
-import {
-  applyMigrationsWithLedger,
-  type MigrationDatabase,
-} from '../../src/migration-ledger.js';
+import { D1FleetStateDatabase } from '../../src/d1-fleet-state-database.js';
+import { applyMigrationsWithLedger } from '../../src/migration-ledger.js';
+
+declare const Response: typeof WorkerResponse;
 
 interface Env {
   DB: D1Database;
 }
 
 const LEDGER = 'anchorage_fleet_migrations';
-
-function database(db: D1Database): MigrationDatabase {
-  const statement = (sql: string, bindings: readonly unknown[]) => {
-    const prepared = db.prepare(sql);
-    return bindings.length > 0 ? prepared.bind(...bindings) : prepared;
-  };
-  return {
-    async query(sql, bindings = []) {
-      const result = await statement(sql, bindings).all<
-        Readonly<Record<string, unknown>>
-      >();
-      return result.results;
-    },
-    async batch(statements) {
-      await db.batch(
-        statements.map(({ sql, bindings = [] }) => statement(sql, bindings)),
-      );
-    },
-  };
-}
 
 function errorShape(error: unknown): { name: string; message: string } {
   return error instanceof Error
@@ -72,7 +57,7 @@ async function atomicRollback(db: D1Database): Promise<unknown> {
     .run();
   let failure: unknown;
   try {
-    await applyMigrationsWithLedger(database(db), [
+    await applyMigrationsWithLedger(new D1FleetStateDatabase(db), [
       {
         version,
         sql: `INSERT INTO migration_atomic_values (value) VALUES ('must-rollback')`,
@@ -109,7 +94,7 @@ async function concurrentApplication(db: D1Database): Promise<unknown> {
   };
   const outcomes = await Promise.allSettled(
     Array.from({ length: 12 }, () =>
-      applyMigrationsWithLedger(database(db), [migration]),
+      applyMigrationsWithLedger(new D1FleetStateDatabase(db), [migration]),
     ),
   );
   const values = await db
@@ -132,6 +117,54 @@ async function concurrentApplication(db: D1Database): Promise<unknown> {
   };
 }
 
+async function coldApplication(db: D1Database): Promise<unknown> {
+  const version = 1;
+  await db
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS migration_cold_values (value TEXT NOT NULL)`,
+    )
+    .run();
+  await db.prepare(`DELETE FROM migration_cold_values`).run();
+  // No ensureLedger: the ledger's own CREATE runs inside the race.
+  await db.prepare(`DROP TABLE IF EXISTS ${LEDGER}`).run();
+  const coldBefore = await db
+    .prepare(
+      `SELECT COUNT(*) AS count FROM sqlite_master
+       WHERE type = 'table' AND name = ?`,
+    )
+    .bind(LEDGER)
+    .first<{ count: number }>();
+  const migration = {
+    version,
+    sql: `INSERT INTO migration_cold_values (value) VALUES ('once')`,
+  };
+  const outcomes = await Promise.allSettled(
+    Array.from({ length: 2 }, () =>
+      applyMigrationsWithLedger(new D1FleetStateDatabase(db), [migration]),
+    ),
+  );
+  const values = await db
+    .prepare(`SELECT COUNT(*) AS count FROM migration_cold_values`)
+    .first<{ count: number }>();
+  const ledger = await db
+    .prepare(`SELECT COUNT(*) AS count FROM ${LEDGER} WHERE version = ?`)
+    .bind(version)
+    .first<{ count: number }>();
+  return {
+    coldBefore: coldBefore?.count,
+    settlements: outcomes.map((outcome) =>
+      outcome.status === 'fulfilled'
+        ? { status: outcome.status }
+        : {
+            status: outcome.status,
+            message: errorShape(outcome.reason).message,
+          },
+    ),
+    values: values?.count,
+    ledger: ledger?.count,
+  };
+}
+
 async function changedHistoricalSql(db: D1Database): Promise<unknown> {
   const version = 1;
   await ensureLedger(db);
@@ -142,7 +175,7 @@ async function changedHistoricalSql(db: D1Database): Promise<unknown> {
     .run();
   await db.prepare(`DELETE FROM migration_history_values`).run();
   await db.prepare(`DELETE FROM ${LEDGER}`).run();
-  await applyMigrationsWithLedger(database(db), [
+  await applyMigrationsWithLedger(new D1FleetStateDatabase(db), [
     {
       version,
       sql: `INSERT INTO migration_history_values (value) VALUES ('original')`,
@@ -150,7 +183,7 @@ async function changedHistoricalSql(db: D1Database): Promise<unknown> {
   ]);
   let failure: unknown;
   try {
-    await applyMigrationsWithLedger(database(db), [
+    await applyMigrationsWithLedger(new D1FleetStateDatabase(db), [
       {
         version,
         sql: `INSERT INTO migration_history_values (value) VALUES ('changed')`,
@@ -175,7 +208,7 @@ async function commitAcrossBoundary(db: D1Database): Promise<unknown> {
     .run();
   await db.prepare(`DELETE FROM migration_boundary_values`).run();
   await db.prepare(`DELETE FROM ${LEDGER}`).run();
-  await applyMigrationsWithLedger(database(db), [
+  await applyMigrationsWithLedger(new D1FleetStateDatabase(db), [
     {
       version,
       sql: `INSERT INTO migration_boundary_values (value) VALUES ('durable')`,
@@ -205,7 +238,7 @@ async function readAcrossBoundary(db: D1Database): Promise<unknown> {
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<WorkerResponse> {
     const url = new URL(request.url);
     if (request.method !== 'POST' || url.pathname !== '/migration-ledger') {
       return new Response('not found', { status: 404 });
@@ -217,6 +250,8 @@ export default {
           return Response.json(await atomicRollback(env.DB));
         case 'concurrent-application':
           return Response.json(await concurrentApplication(env.DB));
+        case 'cold-application':
+          return Response.json(await coldApplication(env.DB));
         case 'changed-history':
           return Response.json(await changedHistoricalSql(env.DB));
         case 'commit-boundary':

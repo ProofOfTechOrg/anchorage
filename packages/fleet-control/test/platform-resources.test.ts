@@ -20,6 +20,7 @@ import type {
   ExternalReleaseSnapshot,
   FleetRecord,
 } from '../src/types.js';
+import { decommissionAdvancingRecordFixture } from './fixtures/decommission-intent-fixture.js';
 
 const spec: DeploymentSpec = {
   tenantTag: 'acme',
@@ -247,6 +248,75 @@ describe('external platform resource identity', () => {
         item === activeRelease ? 'active' : 'pending',
       ),
     ).toEqual(expected);
+  });
+
+  it('uses the effective lifecycle phase for route authority and diagnostics', () => {
+    const activeRelease: ExternalReleaseSnapshot = {
+      physicalScriptName: 'release-active',
+      specDigest: 'a'.repeat(64),
+      artifactVersion: 'etag-active',
+      releaseSchemaVersion: 2,
+    };
+    const target: ExternalPlatformTargetDescription = {
+      maintenanceCapabilityPublicKey: profile.maintenanceCapabilityPublicKey,
+      stateArtifactDigest: '1'.repeat(64),
+      stateDurableObjectHistoryDigest: '2'.repeat(64),
+      sharedOutboundWorkerName: 'shared-outbound',
+      stateEgressCredentialDigest: '3'.repeat(64),
+      d1SchemaVersion: 2,
+      d1SchemaHistoryDigest: '4'.repeat(64),
+      outboundPolicy: canonicalDeploymentEgressPolicy({
+        policyId: 'policy-acme',
+        tenantTag: 'acme',
+        environment: 'production',
+        allowedHosts: ['api.example.com'],
+      }),
+    };
+    const ready: FleetRecord = {
+      tenantTag: 'acme',
+      environment: 'production',
+      backend: 'workers-for-platforms',
+      scriptName: 'acme-production',
+      databaseId: 'db-acme',
+      databaseName: 'acme-production',
+      schemaVersion: 2,
+      artifactVersion: activeRelease.artifactVersion,
+      desiredSpecDigest: activeRelease.specDigest,
+      activeRelease,
+      platformTarget: target,
+      durableObjectBindings: [],
+      routeHostname: 'acme.example.test',
+      phase: 'ready',
+      updatedAt: '2026-08-11T00:00:00.000Z',
+    };
+
+    expect(
+      externalRouteExpectations(
+        decommissionAdvancingRecordFixture(ready, 'ready'),
+      ),
+    ).toEqual([{ release: activeRelease, target }]);
+    expect(() =>
+      externalRouteExpectations(
+        decommissionAdvancingRecordFixture(
+          {
+            ...ready,
+            pendingRelease: activeRelease,
+            platformTarget: undefined,
+          },
+          'publishing',
+        ),
+      ),
+    ).toThrow(
+      'external publishing route authority has no persisted platform target',
+    );
+    expect(() =>
+      externalRouteExpectations(
+        decommissionAdvancingRecordFixture(
+          { ...ready, activeRelease: undefined },
+          'ready',
+        ),
+      ),
+    ).toThrow('external ready route authority has no persisted release');
   });
 
   it('rejects publishing without its intended release and platform target', () => {

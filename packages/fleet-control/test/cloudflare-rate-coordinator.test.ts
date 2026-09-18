@@ -4,6 +4,7 @@ import type { D1Database } from '@cloudflare/workers-types';
 import { describe, expect, it, vi } from 'vitest';
 import { CloudflareProvisioningClient } from '../src/cloudflare-client.js';
 import { D1CloudflareApiRateCoordinator } from '../src/cloudflare-rate-coordinator.js';
+import { envelope } from './fixtures/cloudflare-fetch-fixture.js';
 
 const WINDOW_MS = 5 * 60_000;
 
@@ -98,22 +99,6 @@ class RateDatabase {
 
 function directBinding(database: RateDatabase): D1Database {
   return database as unknown as D1Database;
-}
-
-function envelope(result: unknown): Response {
-  return Response.json({
-    success: true,
-    errors: [],
-    messages: [],
-    result,
-    result_info: {
-      page: 1,
-      per_page: 20,
-      count: Array.isArray(result) ? result.length : 1,
-      total_count: Array.isArray(result) ? result.length : 1,
-      total_pages: 1,
-    },
-  });
 }
 
 describe('D1CloudflareApiRateCoordinator', () => {

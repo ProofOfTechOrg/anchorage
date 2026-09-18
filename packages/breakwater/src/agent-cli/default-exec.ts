@@ -2,7 +2,7 @@
 // Package-internal Node executor. Runtime built-ins stay behind structural
 // lookups so importing the public agent-cli entry point remains portable.
 
-import type { AgentCliExec, AgentCliExecResult } from './index.js';
+import type { AgentCliExec, AgentCliExecResult } from './exec-contract.js';
 import {
   type TextCodecLookups,
   type TextDecoderLike,

@@ -6,16 +6,26 @@ on:
   pull_request:
     branches: [main, dev]
 
-# Both jobs only read the repo — and the compat job deliberately executes
+# A new run cancels the in-flight one for the same ref and event. The event
+# name is part of the key, so the push run and the pull_request run for one
+# commit sit in different groups and neither cancels the run the required
+# check reads. The separation must not rest on `github.ref` differing per
+# event, which is why the key names the event: a trigger added on a branch ref
+# would otherwise share the push run's group.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# These jobs only read the repo — and the compat job deliberately executes
 # packages younger than the workspace release-age buffer, so the token it
 # can reach must stay read-only.
 permissions:
   contents: read
 
 jobs:
-  verify:
+  verify-core:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -32,12 +42,13 @@ jobs:
 
       # The repo's verification gate, in order.
 
-      # Every .github YAML file, not just this one: only ci.yml triggers on a PR,
-      # and issue templates have no trigger at all.
+      # Every .github YAML file, not just this one: a workflow that does not
+      # trigger on a PR, and an issue template with no trigger at all, are
+      # otherwise parsed for the first time after the change lands.
       - name: Check .github YAML syntax
         run: pnpm github:check
 
-      - name: Test the .github YAML checker
+      - name: Test the .github YAML checker and the verify gate it pins
         run: pnpm github:check:test
 
       - name: Lint
@@ -46,9 +57,16 @@ jobs:
       - name: Typecheck
         run: pnpm typecheck
 
-      # Root vitest workspace: every package's suite in one process.
+      # Root vitest workspace: every package's suite in one process, minus the
+      # direct scenario project, which the `direct-scenario` job below runs at
+      # the same time. The Typecheck step above produces the fleet-control dist
+      # this step consumes: fleet-control's `pretypecheck` runs its `prebuild`
+      # and `build`. The cap is about 1.8x the slowest measured run of this step
+      # (968 s), so it clears a slow run; it is the cap that fires first only
+      # while the job's other steps leave the 45-minute job budget unspent.
       - name: Test
-        run: pnpm test
+        timeout-minutes: 30
+        run: pnpm test:without-direct-scenario
 
       - name: Build
         run: pnpm build
@@ -77,11 +95,11 @@ jobs:
       - name: Verify packed breakwater surface
         run: pnpm test:packed-breakwater
 
-      # Three of fleet-control's four export entries are Workers entry points
-      # that no in-repo consumer reaches through the package boundary, so Build
-      # proves nothing about its export map. Pack and consume the tarball, and
-      # assert the trusted-configuration constructor still fails closed in the
-      # published artifact.
+      # fleet-control's `./workers/*` export entries are Workers entry points.
+      # `packages/fleet-control/scripts/packed-consumer-test.mjs` packs and
+      # consumes the tarball, resolving those entries through the package
+      # boundary and asserting the trusted-configuration constructor still
+      # fails closed in the published artifact.
       - name: Verify packed fleet-control surface
         run: pnpm test:packed-fleet-control
 
@@ -128,28 +146,83 @@ jobs:
 
       # The Workers for Platforms artifact contract. The paid gate
       # (pnpm fleet-control:credentialed) needs a scratch account with a
-      # subscription, so these two steps are what stands between a contract
-      # change and finding out on a billed run: the first proves the shipped
-      # operator configuration still satisfies fleet control's own validators
-      # and matches the harness wrangler configs, the second builds all three
-      # artifacts and drives every locally-provable action on real workerd,
-      # including one approval suspended across the v1-to-v2 release update.
+      # subscription, so the steps below are what stands between a contract
+      # change and finding out on a billed run: `test:conformance-config`
+      # proves the shipped operator configuration still satisfies fleet
+      # control's own validators and matches the harness wrangler configs, and
+      # `conformance:verify` builds every artifact `build-conformance.mjs`'s
+      # `ARTIFACTS` list declares and drives every locally-provable action on
+      # real workerd, including one approval suspended across the v1-to-v2
+      # release update.
       - name: Verify the conformance operator configuration
         run: pnpm test:conformance-config
 
       - name: Conformance artifacts verify (workerd)
         run: pnpm conformance:verify
 
+  # The direct credentialed scenario and the offline fence suite: full
+  # scenario runs against the reference and tenant Workers on local workerd,
+  # about 35 minutes, independent of every `verify-core` step. The suites
+  # import @proofoftech/flowsafe subpaths and the fleet-control package from
+  # their dists, so the job builds fleet-control (whose prebuild builds
+  # breakwater and flowsafe) before running them.
+  direct-scenario:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reads the pnpm version from package.json "packageManager".
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Build fleet-control and its prerequisites
+        run: pnpm --filter @proofoftech/fleet-control build
+
+      - name: Direct scenario suites (workerd)
+        run: pnpm test:direct-scenario
+
+  # The `protect main` ruleset requires the status check named `verify`. This
+  # job is that check: it depends on the gating jobs and fails unless `needs`
+  # carries at least one entry and every entry reports success, so a red or
+  # cancelled `direct-scenario` blocks a merge to main exactly as a red
+  # `verify-core` does, a job added to `needs` is gating without a further edit
+  # (the assertion reads the whole `needs` context), and an emptied `needs`
+  # list fails the check instead of passing it with nothing verified.
+  # `if: always()` makes the job run when a dependency fails or is cancelled;
+  # without it the job would be skipped, and GitHub reports a skipped job as
+  # success for a required check.
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [verify-core, direct-scenario]
+    if: always()
+    steps:
+      - name: Require a non-empty needs context in which every job succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          printf '%s' "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          printf '%s' "$NEEDS" | jq -e 'to_entries | length > 0 and all(.value.result == "success")' > /dev/null
+
   # Mastra compat matrix: the libraries pin behavioral contracts to
   # @mastra/core internals (resume-context merge-over semantics, snapshot
-  # shape, the reprocess-part key, the six-table inventory). The supported
+  # shape, the reprocess-part key, the adapter's table inventory). The supported
   # peer is exactly 1.53.0; run the library suites against the newest
   # published 1.x as a signal for a deliberate future compatibility update.
-  # The tripwire tests are the teeth: the runtime.test.ts merge pin, the
+  # Tripwires the job exercises include the runtime.test.ts merge pin, the
   # ProcessorRunner reprocess-key probe, mastra-schema-guard, the
-  # durable-agent-surface inventory, and breakwater's own agent.test.ts
+  # durable-agent-surface inventory, breakwater's own agent.test.ts
   # Agent.prototype inventory (whose forwardClassified allowlist is asserted
-  # against THIS job's newer core, not just the pin). See the maintainer
+  # against THIS job's newer core, not just the pin), and, through the
+  # typecheck step, d1-storage.ts's storage-domain capture. See the maintainer
   # guide's Mastra compatibility section for why bundling needs its own step.
   mastra-compat:
     runs-on: ubuntu-latest
@@ -180,6 +253,23 @@ jobs:
       # @mastra/* exclude does not cover and which would wedge the probe on
       # ERR_PNPM_NO_MATURE_MATCHING_VERSION. Scoped to this one resolution;
       # every real install keeps the workspace gate.
+      # The workspace pins packages/flowsafe/patches/@mastra__core@1.53.0.patch
+      # to @mastra/core@1.53.0 through pnpm.patchedDependencies, and pnpm
+      # refuses an install whose patch targets a version no longer in the
+      # graph. This job drops that entry in its disposable checkout and
+      # resolves the newest core unpatched. What the run then reports includes:
+      # the typecheck below, whose red names a type the newest core changed —
+      # today MastraStorageDomains gains workflowDefinitions and knowledge,
+      # which packages/flowsafe/src/do-runner/d1-storage.ts's exhaustive
+      # capture refuses until the pin moves; both packages' surface
+      # inventories, whose red names either the member nobody has read yet or
+      # the skew row that stopped being true, in its own message; and
+      # notification-source-keys.test.ts, which reports whether that core still
+      # needs the pinned patch. Its probe cases fail and its patched-behavior
+      # blocks skip while the seam is open upstream; on a core carrying both
+      # patch subjects upstream the blocks run rather than skip, and the run
+      # here is what confirms they pass. See the maintainer guide's Mastra
+      # compatibility section.
       - name: Bump @mastra/core to newest 1.x
         id: mastra_versions
         run: |
@@ -187,6 +277,7 @@ jobs:
           D1_VERSION=$(npm view '@mastra/cloudflare-d1@^1' version --json | node -e 'const d=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(Array.isArray(d)?d.at(-1):d)')
           echo "core=$CORE_VERSION" >> "$GITHUB_OUTPUT"
           echo "d1=$D1_VERSION" >> "$GITHUB_OUTPUT"
+          node -e 'const fs=require("node:fs");const m=JSON.parse(fs.readFileSync("package.json","utf8"));delete m.pnpm.patchedDependencies;fs.writeFileSync("package.json",`${JSON.stringify(m,null,2)}\n`)'
           pnpm -r update --config.minimum-release-age=0 "@mastra/core@$CORE_VERSION" "@mastra/cloudflare-d1@$D1_VERSION"
           pnpm --filter @proofoftech/breakwater list @mastra/core
           pnpm --filter @proofoftech/flowsafe list @mastra/core @mastra/cloudflare-d1
@@ -206,7 +297,11 @@ jobs:
           test "$EXPECTED_CORE" = "$INSTALLED_CORE"
           test "$EXPECTED_D1" = "$INSTALLED_D1"
 
+      # Step-level continue-on-error, not just the job's: a red step would
+      # otherwise skip the bundling and tripwire steps below.
       - name: Typecheck libraries against newest core
+        id: typecheck
+        continue-on-error: true
         run: pnpm --filter @proofoftech/breakwater typecheck && pnpm --filter @proofoftech/flowsafe typecheck
 
       # Bundles the flowsafe spike Worker so this job can see a published-dist
@@ -219,11 +314,12 @@ jobs:
         continue-on-error: true
         run: pnpm --filter @proofoftech/flowsafe spike:bundle-check
 
-      # Step-level continue-on-error hides the bundle result from the job status
-      # by design; surface it on the run summary so a flip (upstream fix, or a
+      # Step-level continue-on-error hides these results from the job status by
+      # design; surface them on the run summary so a flip (upstream fix, or a
       # new regression) is visible without opening the log.
-      - name: Report bundling outcome
+      - name: Report typecheck and bundling outcomes
         run: |
+          echo "library typecheck against newest core: ${{ steps.typecheck.outcome }}" >> "$GITHUB_STEP_SUMMARY"
           echo "spike bundle against newest core: ${{ steps.bundle.outcome }}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Test libraries against newest core

@@ -1,6 +1,7 @@
 # RBAC navigation
 
 - `index.ts`: roles, actor request-context lookup, and `RBACMiddleware`
+- `actor.ts`: the actor and role declarations RBAC authorizes and audit attributes
 - `principal.ts`: principal kinds and the shared kind-allowlist validator
 - `authorize.ts`: the one gate both the processor and direct calls run through
 - `rbac.test.ts`: authorization and audit coverage

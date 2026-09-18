@@ -64,7 +64,13 @@ export const wireTransferModule: WorkflowModule<ShowcaseModuleDeps> = {
         confirmation: z.string(),
         reference: z.string(),
       }),
-      permissions: { sideEffect: 'write', requiresApproval: true },
+      permissions: {
+        sideEffect: 'write',
+        // execute records the envelope and returns; no payment rail and no
+        // HTTP request leave this connector.
+        egressEnforcement: 'enforced',
+        requiresApproval: true,
+      },
       policies: { audit },
       execute: async ({ amount, currency, beneficiary, reference }) => {
         console.log(

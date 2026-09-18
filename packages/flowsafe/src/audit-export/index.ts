@@ -95,8 +95,8 @@ export interface AuditExportOptions<TEvent = unknown> {
 }
 
 /**
- * The whole Worker `queue()` handler for the audit-export consumer,
- * previously copied verbatim into each host: guard the endpoint config —
+ * The whole Worker `queue()` handler for the audit-export consumer, so a host
+ * binds it without writing its own: guard the endpoint config —
  * a consumer bound without an endpoint logs a config-error and RETRIES the
  * batch (fail closed: nothing is acked unconfirmed, and the DLQ eventually
  * surfaces the misconfig) — then delegate to createAuditQueueConsumer.

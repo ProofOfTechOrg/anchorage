@@ -53,18 +53,19 @@ function gitRevision() {
   return result.stdout.trim();
 }
 
-function convert(optionsFile, jsonFile, htmlDirectory, revision) {
+function convert(optionsFile, jsonFile, htmlDirectory, sourceRevision) {
   run(pnpm, [
     'exec',
     'typedoc',
     '--options',
     optionsFile,
+    '--treatWarningsAsErrors',
     '--json',
     jsonFile,
     '--out',
     htmlDirectory,
     '--gitRevision',
-    revision,
+    sourceRevision,
   ]);
 
   if (!existsSync(jsonFile)) {
@@ -119,8 +120,8 @@ const temporaryDirectory = mkdtempSync(join(tmpdir(), 'anchorage-api-docs-'));
 const revision = gitRevision();
 
 try {
-  // Flowsafe too: the fleet-control pass typechecks against its dist, and
-  // this script must work on a tree where CI's Build step has not run.
+  // Flowsafe too: the fleet-control pass typechecks against Flowsafe's dist,
+  // and this script must work on a tree where CI's Build step has not run.
   run(pnpm, [
     '--filter',
     '@proofoftech/breakwater',

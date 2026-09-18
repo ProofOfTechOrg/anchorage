@@ -7,19 +7,24 @@ import type { MastraModelConfig } from '@mastra/core/llm';
 import { Mastra } from '@mastra/core/mastra';
 import { MockMemory } from '@mastra/core/memory';
 import { RequestContext } from '@mastra/core/request-context';
-import { InMemoryStore } from '@mastra/core/storage';
+import { InMemoryStore, MastraCompositeStore } from '@mastra/core/storage';
 import {
   ACTOR_CONTEXT_KEY,
   AuditLogger,
   createGuardedAgent,
 } from '@proofoftech/breakwater';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import { FLOWSAFE_PERSISTENCE_FORBIDDEN } from '../agent-runner/durable-agent-runner.js';
 import {
   createFlowsafeDurableAgent,
   type FlowsafeDurableAgent,
 } from '../agent-runner/index.js';
-import { humanPrincipal } from '../approval-api/index.js';
+import {
+  humanPrincipal,
+  trustAutomationPrincipal,
+} from '../approval-api/index.js';
+import type { ExecutionFenceDatabase } from '../do-runner/execution-fence.js';
 import {
   createHostPubSub,
   InvalidRunRequestError,
@@ -27,6 +32,9 @@ import {
   type RunnerRuntime,
   type ThreadScope,
 } from '../do-runner/index.js';
+import type { SignalDatabase } from './d1-shared.js';
+import { DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS } from './notification-dispatch.js';
+import { D1NotificationsStorage } from './notifications-d1.js';
 import { createThreadSignalRoutes } from './thread-do-routes.js';
 
 const RESOURCE_ID = 'resource-real';
@@ -94,7 +102,15 @@ async function createHarness(options: { canPersist?: boolean } = {}) {
   const pubsub = createHostPubSub();
   const memory = new MockMemory();
   const { runtime, start } = fakeRuntime(pubsub);
-  const mastra = new Mastra({ storage: new InMemoryStore(), logger: false });
+  const notifications = new D1NotificationsStorage(
+    sqliteUnitDatabase(openSqlite()) as SignalDatabase,
+  );
+  const storage = new MastraCompositeStore({
+    id: 'real-notification-test',
+    default: new InMemoryStore(),
+    domains: { notifications },
+  });
+  const mastra = new Mastra({ storage, logger: false });
   const agent = createFlowsafeDurableAgent({
     agent: guardedTestAgent(memory),
     runtime,
@@ -116,7 +132,7 @@ async function createHarness(options: { canPersist?: boolean } = {}) {
       return storage;
     },
   });
-  return { agent, mastra, memory, pubsub, routes, start };
+  return { agent, mastra, memory, notifications, pubsub, routes, start };
 }
 
 function scope(
@@ -201,6 +217,83 @@ afterEach(() => {
 });
 
 describe('thread signal routes with a real durable agent', () => {
+  it.each([
+    'deliver',
+    'exhausted',
+  ] as const)('dispatches through D1 notification storage with a real agent: %s', async (mode) => {
+    const harness = await createHarness();
+    const threadId = crypto.randomUUID();
+    await seedThread(harness.memory, threadId);
+    const now = new Date();
+    const record = await harness.notifications.createNotification({
+      threadId,
+      resourceId: RESOURCE_ID,
+      agentId: 'writer',
+      source: 'provider',
+      kind: 'changed',
+      summary: 'notification input',
+      deliverAt: now,
+    });
+    if (mode === 'exhausted') {
+      await harness.notifications.updateNotification({
+        threadId,
+        id: record.id,
+        deliveryAttempts: DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS,
+        lastDeliveryError: 'target refused',
+        lastDeliveryAttemptAt: now,
+      });
+    }
+    const send = vi.spyOn(harness.agent, 'sendSignal');
+    const response = await harness.routes(
+      post('/signal/notifications/dispatch', {
+        notificationIds: [record.id],
+        resourceId: RESOURCE_ID,
+        agentId: 'writer',
+        now: now.toISOString(),
+      }),
+      {
+        ...scope(harness.pubsub, threadId),
+        principal: trustAutomationPrincipal({
+          kind: 'system',
+          id: 'notification-dispatch',
+          purpose: 'notification.dispatch',
+        }),
+      },
+    );
+    expect(response?.status).toBe(200);
+    const persisted = await harness.notifications.getNotification({
+      threadId,
+      id: record.id,
+    });
+    if (mode === 'exhausted') {
+      expect(await response?.json()).toMatchObject({
+        delivered: 0,
+        failed: 0,
+        discarded: 1,
+      });
+      expect(send).not.toHaveBeenCalled();
+      expect(persisted).toMatchObject({
+        status: 'discarded',
+        deliveryAttempts: DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS,
+        lastDeliveryError: 'target refused',
+        lastDeliveryAttemptAt: now,
+        deliveryReason: 'delivery-attempts-exhausted',
+        discardedAt: expect.any(Date),
+      });
+      expect(persisted?.deliverAt).toBeUndefined();
+      expect(persisted?.summaryAt).toBeUndefined();
+    } else {
+      expect(await response?.json()).toMatchObject({ delivered: 1, failed: 0 });
+      expect(send).toHaveBeenCalledOnce();
+      expect(persisted).toMatchObject({
+        status: 'delivered',
+        deliveredSignalId: expect.any(String),
+      });
+      expect(await recalled(harness.memory, threadId)).toHaveLength(1);
+    }
+    expect(harness.start).not.toHaveBeenCalled();
+  });
+
   it('persists an idle queue message without a run', async () => {
     const harness = await createHarness();
     const threadId = crypto.randomUUID();
@@ -518,6 +611,89 @@ describe('thread signal routes with a real durable agent', () => {
     expect(unhandled).toEqual([]);
   });
 
+  // A low-priority owner notification is deferred to the dispatcher, which is
+  // where the real durable agent and the real D1 store reach Core's summary
+  // helper over a batch. The source strings here name Object.prototype members.
+  it('summarizes prototype-colliding owner notifications through the dispatcher', async () => {
+    // #given — deferred owner notifications with colliding source names
+    const harness = await createHarness();
+    const threadId = crypto.randomUUID();
+    await seedThread(harness.memory, threadId);
+    const ids: string[] = [];
+    for (const source of ['constructor', '__proto__']) {
+      const response = await harness.routes(
+        post('/signal/notification', {
+          source,
+          kind: 'changed',
+          summary: `${source} input`,
+          priority: 'low',
+        }),
+        scope(harness.pubsub, threadId),
+      );
+      expect(response?.status).toBe(200);
+      const body = (await response?.json()) as {
+        record: { record: { id: string; source: string }; decision: unknown };
+      };
+      expect(body.record.decision).toMatchObject({ action: 'summarize' });
+      expect(body.record.record.source).toBe(source);
+      ids.push(body.record.record.id);
+    }
+
+    // #when — the dispatcher summarizes the due batch
+    const send = vi.spyOn(harness.agent, 'sendSignal');
+    const response = await harness.routes(
+      post('/signal/notifications/dispatch', {
+        notificationIds: ids,
+        resourceId: RESOURCE_ID,
+        agentId: 'writer',
+        now: new Date(Date.now() + 60_000).toISOString(),
+      }),
+      {
+        ...scope(harness.pubsub, threadId),
+        principal: trustAutomationPrincipal({
+          kind: 'system',
+          id: 'notification-dispatch',
+          purpose: 'notification.dispatch',
+        }),
+      },
+    );
+
+    // #then — each colliding source is counted once, as its own entry
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toMatchObject({ delivered: 2, failed: 0 });
+    expect(send).toHaveBeenCalledOnce();
+    const summary = send.mock.calls[0]?.[0] as unknown as {
+      tagName: string;
+      contents: string;
+      attributes: Record<string, unknown>;
+      metadata: Record<string, unknown>;
+    };
+    expect(summary.tagName).toBe('notification-summary');
+    expect(summary.contents).toBe('__proto__: 1, constructor: 1');
+    expect(summary.attributes).toMatchObject({ pending: 2 });
+    expect(summary.metadata.notification).toMatchObject({
+      signal: 'summary',
+      pending: 2,
+      groups: [
+        { source: '__proto__', count: 1 },
+        { source: 'constructor', count: 1 },
+      ],
+      byPriority: { low: 2 },
+      priority: 'low',
+    });
+    for (const id of ids) {
+      expect(
+        await harness.notifications.getNotification({ threadId, id }),
+      ).toMatchObject({
+        status: 'pending',
+        summaryAt: undefined,
+        summarySignalId: expect.any(String),
+      });
+    }
+    expect(harness.start).not.toHaveBeenCalled();
+    expect(unhandled).toEqual([]);
+  });
+
   it('terminally closes direct calls and protects a registered host start', async () => {
     const harness = await createHarness();
     const directThreadId = crypto.randomUUID();
@@ -585,6 +761,17 @@ describe('thread signal routes with a real durable agent', () => {
           },
           'operator',
           'human',
+          undefined,
+          undefined,
+          undefined,
+          {
+            startIdentity: {
+              owner: { kind: 'human', id: 'operator' },
+              target: { kind: 'agent', id: 'writer', threadId: directThreadId },
+            },
+            agentStart: { threaded: false },
+            onPreparedStartIdentity: undefined,
+          },
         ),
         'untilIdle refusal',
       ),
@@ -608,6 +795,17 @@ describe('thread signal routes with a real durable agent', () => {
       { runId: hostId, requestContext: actorContext() },
       'operator',
       'human',
+      undefined,
+      undefined,
+      undefined,
+      {
+        startIdentity: {
+          owner: { kind: 'human', id: 'operator' },
+          target: { kind: 'agent', id: 'writer', threadId: hostId },
+        },
+        agentStart: { threaded: false },
+        onPreparedStartIdentity: undefined,
+      },
     );
     await vi.waitFor(() => expect(harness.start).toHaveBeenCalledOnce());
     await expect(
@@ -646,6 +844,17 @@ describe('thread signal routes with a real durable agent', () => {
         { runId: hostId, requestContext: actorContext() },
         'operator',
         'human',
+        undefined,
+        undefined,
+        undefined,
+        {
+          startIdentity: {
+            owner: { kind: 'human', id: 'operator' },
+            target: { kind: 'agent', id: 'writer', threadId: hostId },
+          },
+          agentStart: { threaded: false },
+          onPreparedStartIdentity: undefined,
+        },
       ),
       'suspended host stream persistence',
     );
@@ -665,6 +874,17 @@ describe('thread signal routes with a real durable agent', () => {
         { runId: hostId, requestContext: actorContext() },
         'operator',
         'human',
+        undefined,
+        undefined,
+        undefined,
+        {
+          startIdentity: {
+            owner: { kind: 'human', id: 'operator' },
+            target: { kind: 'agent', id: 'writer', threadId: hostId },
+          },
+          agentStart: { threaded: false },
+          onPreparedStartIdentity: undefined,
+        },
       ),
     ).rejects.toBeInstanceOf(InvalidRunRequestError);
     expect(globalRunRegistry.get(hostId)).toBe(liveEntry);
@@ -690,4 +910,100 @@ describe('thread signal routes with a real durable agent', () => {
     ).emitError(hostId, new Error('test cleanup'));
     await within(first.output.consumeStream(), 'suspended stream cleanup');
   }, 15_000);
+});
+
+describe('FS8 D3 proof activation actual agent authority', () => {
+  it('uses the actual wrapper workflow and refuses a replaced generation after content inspection', async () => {
+    const sqlite = openSqlite();
+    const db = sqliteUnitDatabase(sqlite) as ExecutionFenceDatabase;
+    const pubsub = createHostPubSub();
+    const runner = init({ DB: db }, { pubsub, tablePrefix: 'proof_' });
+    const fence = runner.executionFence;
+    if (!fence) throw new Error('fixture fence missing');
+    const memory = new MockMemory();
+    const agent = createFlowsafeDurableAgent({
+      agent: guardedTestAgent(memory),
+      runtime: runner.runtime,
+      pubsub,
+      cache: false,
+    });
+    const workflowId = agent.getWorkflow().id;
+    const threadId = 'thread-real-proof';
+    const runId = 'run-real-proof';
+    const source = {
+      version: 2,
+      startToken: 'generation',
+      attemptToken: 'attempt',
+      resumeCounts: [],
+      startIdentity: {
+        owner: { kind: 'human', id: 'operator' },
+        target: { kind: 'agent', id: 'writer', threadId },
+      },
+      agentStart: { threaded: true },
+    };
+    sqlite.exec(
+      'CREATE TABLE proof_mastra_workflow_snapshot (workflow_name TEXT, run_id TEXT, resourceId TEXT, snapshot TEXT, createdAt TEXT, updatedAt TEXT, PRIMARY KEY (workflow_name,run_id))',
+    );
+    const write = () =>
+      sqlite
+        .prepare(
+          'INSERT OR REPLACE INTO proof_mastra_workflow_snapshot VALUES (?,?,?,?,?,?)',
+        )
+        .run(
+          workflowId,
+          runId,
+          threadId,
+          JSON.stringify({
+            runId,
+            status: 'suspended',
+            requestContext: { 'flowsafe.runProvenance': source },
+            steps: {},
+            suspendedPaths: {},
+          }),
+          '2026-09-07T00:00:00Z',
+          '2026-09-07T00:00:00Z',
+        );
+    write();
+    await fence.seed('migration-locked');
+    await fence.transition({
+      expected: 'migration-locked',
+      next: 'proof-only',
+      proofKey: 'proof',
+    });
+    sqlite
+      .prepare(
+        'UPDATE flowsafe_execution_fence SET proof_run_id = ?, proof_table_prefix = ?, proof_workflow_id = ?, proof_start_token = ?',
+      )
+      .run(runId, 'proof_', workflowId, 'generation');
+    vi.spyOn(agent, 'getActiveThreadRunId').mockReturnValue(runId);
+    const send = vi.spyOn(agent, 'sendMessage');
+    const saves = vi.spyOn(memory, 'saveMessages');
+    expect(
+      await agent.proofExecutionFor(runner.runtime, threadId, runId),
+    ).toMatchObject({
+      workflowId,
+      startToken: 'generation',
+      tablePrefix: 'proof_',
+    });
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => agent as unknown as Agent,
+      resolveResourceId: () => threadId,
+      contentPolicy: async () => {
+        source.startToken = 'replacement';
+        write();
+        return { allowed: true };
+      },
+    });
+    const response = await route(
+      post('/signal/queue', { contents: 'held content' }),
+      {
+        threadId,
+        principal: humanPrincipal({ id: 'operator', role: 'operator' }),
+        init: runner,
+      },
+    );
+    expect(send).not.toHaveBeenCalled();
+    expect(saves).not.toHaveBeenCalled();
+    expect(response?.status).toBe(503);
+  });
 });

@@ -35,7 +35,9 @@ git clone https://github.com/ProofOfTechOrg/anchorage.git
 cd anchorage
 ```
 
-The verification list below mirrors the CI `verify` job in order:
+The verification list below mirrors the CI `verify-core` job in order;
+`pnpm test` also covers the direct scenario project that CI runs in its own
+`direct-scenario` job:
 
 ```bash
 pnpm install --frozen-lockfile
@@ -69,17 +71,22 @@ directory when a `.github/**/*.{yml,yaml}` file is staged (lint-staged);
 pre-push runs react-doctor on the branch's changed files
 (`pnpm react-doctor:diff`; bypass with `git push --no-verify`). CI also runs a
 non-blocking compatibility probe against the newest `@mastra/core` 1.x release.
+The `protect main` ruleset requires the status check named `verify`, the gate
+job in `ci.yml`; `verify-core` and `direct-scenario` are in that job's `needs`
+list. Read the job for the rule it applies to that list.
 
 The showcase app uses mandatory absolute imports — `@/*` for `src`,
 `#worker/*` for worker modules, `@flowsafe/*` for deep flowsafe source
 imports — enforced by Biome.
 
-`pnpm docs:check` validates local links, Markdown anchors, documentation
-reachability, package README export coverage, published-package links, and
-TypeDoc entry-point coverage. It also requires one `@mastra/core` value across
-the `packages/*` manifests' `peerDependencies`, `devDependencies`, and
-`dependencies`, including private packages, plus peer/devDependency parity for
-libraries.
+`pnpm docs:check` runs the checks `scripts/docs-check.mjs` composes in
+`checkRepository`: local links, Markdown anchors, documentation reachability,
+package README export coverage, published-package links, the canonical public
+URLs the root README must carry, and TypeDoc entry-point coverage are among
+them. `checkMastraCoreAgreement` is another — it requires one `@mastra/core`
+value across the `packages/*` manifests' `peerDependencies`, `devDependencies`,
+and `dependencies`, including private packages, plus peer/devDependency parity
+for libraries.
 `pnpm docs:api` builds the generated API site in `docs/api/`; that directory is
 ignored and must not be committed. The scheduled external-link workflow runs
 `pnpm docs:check:external`.
@@ -91,7 +98,8 @@ repository maintenance and docs-only changes do not need one.
 
 ## Releasing
 
-Versioning and publishing run through [changesets](.changeset/README.md), with
+Versioning and publishing run through
+[Changesets](https://github.com/changesets/changesets), with
 version bumps happening ON `dev` (bump-on-dev). Feature and fix PRs target the
 `dev` integration branch and include a changeset (`pnpm exec changeset` — pick
 the packages, a semver bump, and write the CHANGELOG entry) when they change
@@ -129,3 +137,14 @@ tier.
 Anchorage is an independent implementation built ON Mastra. Contributions must
 not fork or modify Mastra source code, wrap Mastra Enterprise features to
 bypass their licensing, or copy any third-party proprietary implementation.
+
+The single permitted exception is
+`packages/flowsafe/patches/@mastra__core@1.53.0.patch`, which changes the
+published `@mastra/core@1.53.0` runtime chunks so that `summarizeNotifications`
+counts sources in a null-prototype object and the delivery policy's `sources`
+lookup reads own properties only (mastra-ai/mastra#23693, #23694). It is applied
+through pnpm `patchedDependencies` and leaves the shipped source maps untouched.
+It is removed when a `@mastra/core` release carrying the upstream fix is
+adopted, following the procedure in the
+[maintainer guide's Mastra compatibility section](docs/maintainer-guide.md#mastra-compatibility).
+No other Mastra modification is permitted.

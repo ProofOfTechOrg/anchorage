@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 import { APPROVAL_ROLES } from '@proofoftech/flowsafe/approval-api';
 import { mintHmacToken, toApprovalActor } from '@proofoftech/flowsafe/host-kit';
@@ -48,9 +48,18 @@ async function main() {
   process.stdout.write(`${token}\n`);
 }
 
-const invokedPath = process.argv[1]
-  ? pathToFileURL(resolve(process.argv[1])).href
-  : undefined;
-if (invokedPath === import.meta.url) {
+// Both sides are realpathed, so a symlinked invocation still resolves to this
+// module's own path. An entry path that resolves to nothing names some other
+// module, which importers of this one rely on.
+// `scripts/entry-point.mjs` holds the root form of this disposition.
+let invokedFilePath;
+try {
+  invokedFilePath =
+    process.argv[1] === undefined ? undefined : realpathSync(process.argv[1]);
+} catch (error) {
+  if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') throw error;
+}
+
+if (invokedFilePath === realpathSync(fileURLToPath(import.meta.url))) {
   await main();
 }

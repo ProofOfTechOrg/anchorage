@@ -1,48 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track C (M-004), CI-M-004-004 — the P6 ingestion trust boundary (DL-006).
-//
-// Signals/notifications/messages inject XML-wrapped content INTO the model's
-// context (core's signalToXmlMarkup), so every ingest is an UNTRUSTED input
-// channel into the agent. This Worker-side router uses the same resource-first
-// authorization rule as addressed run routes:
-//
-//   1. resolve (authenticate and bind actor context) -> 401 / 403
-//   2. registry-backed thread ownership (requireResourceAccess) -> 404 (no existence oracle)
-//   3. coarse role (RUN_START_ROLES by default)   -> 403   (reviewer/viewer read-only)
-//   4. size cap on the raw body, THEN JSON parse   -> 413 / 400
-//   5. body names NO client memory id (assertNoClientMemoryIds) -> 400
-//   6. attribute-key allowlist                     -> 400
-//   7. deployment rate cap                          -> 429
-//   8. audit (signal.ingest) + forward via the topology
-//
-// Every ingest is AUDITED (signal.ingest), accepted OR rejected — and a rejection
-// is audited at the step that refuses it, INCLUDING the three POST-auth denials
-// that read like an attack on this untrusted channel: the role 403, the
-// malformed thread 404 and the
-// memory-id 400 (a smuggled TCB-only id). Pre-auth failures (401, or a resolver
-// throw → 403) are NOT audited: the caller is unauthenticated, so auditing there
-// would let an anonymous flood write the log.
-//
-// The threadId travels in the PATH (the client references its OWN thread, like a
-// runId on the status/resume routes) and is 404'd if foreign BEFORE any DO is
-// addressed — no wake, no oracle. The BODY may never name threadId/resourceId
-// (assertNoClientMemoryIds): a client that picks its own memory id picks whose
-// memory it reads. The forward goes through createThreadTopology, which
-// overwrites the trusted principal header from the resolved context.
-//
-// XML-injection neutralization is CORE's: signalToXmlMarkup entity-escapes the
-// contents and attribute VALUES and re-validates tag/attribute NAMES — a single
-// layer, and core is a SOFT pin, so a regression there is caught by the C-S5
-// render test (thread-do-routes.test.ts), which fails flowsafe CI if core stops
-// escaping. The ROUTE adds its own line but does NOT re-escape the contents: the
-// thread routes validate `tagName` as an XML name at ingest, and this gate
-// allowlists attribute KEYS and size-caps the payload. Optional content policy
-// runs later at the common thread-DO boundary over core's canonical escaped XML,
-// where provider, schedule, notification, and direct delivery all converge.
-//
-// sendToolApproval is deliberately NOT an ingress here (P8): the dashboard stays
-// the sole approval decision path; this router never mints capability.
 
+import { captureActorContext } from '../approval-api/actor-context.js';
 import {
   type ActorContext,
   ActorResolutionError,
@@ -50,8 +8,10 @@ import {
   type ApprovalRole,
   RUN_START_ROLES,
 } from '../approval-api/index.js';
+import { hostErrorText } from '../host-kit/host-approval-service.js';
 import {
   assertNoClientMemoryIds,
+  type BoundThreadTargetValidator,
   RunRouteError,
   requireResourceAccess,
   type ThreadTopology,
@@ -72,7 +32,7 @@ const CHANNEL_PATHS = {
 
 export type SignalChannel = keyof typeof CHANNEL_PATHS;
 
-/** The structured audit event every ingest emits (accepted OR rejected). */
+/** A structured signal ingestion outcome. */
 export interface SignalIngestAuditEvent {
   type: 'signal.ingest';
   deploymentTag?: string;
@@ -103,9 +63,11 @@ export interface SignalRouterOptions {
   resolve: ActorResolver;
   /** The sanctioned reach into a thread DO — stamps the principal header. */
   topology: ThreadTopology;
-  /** Who may signal. Default RUN_START_ROLES (operator/admin) — reviewers/viewers are read-only. */
+  /** Require a bound thread before ingestion. Omission uses registry access policy. */
+  validateThreadTarget?: BoundThreadTargetValidator;
+  /** Who may signal. Default RUN_START_ROLES. */
   roles?: readonly ApprovalRole[];
-  /** Every ingest is audited through this (accepted + rejected). Absent ⇒ no audit (wire one). */
+  /** Receives authenticated ingestion outcomes; sink failures do not change responses. */
   audit?: SignalAuditSink;
   /** Deployment rate cap. Absent means unmetered. */
   rateLimit?: SignalRateLimiter;
@@ -137,7 +99,7 @@ function json(payload: unknown, status = 200): Response {
 }
 
 export function createSignalRouter(options: SignalRouterOptions): SignalRouter {
-  const { resolve, topology } = options;
+  const { resolve, topology, validateThreadTarget, audit: auditSink } = options;
   const roles = options.roles ?? RUN_START_ROLES;
   const maxContentBytes = nonnegativeSafeInteger(
     options.maxContentBytes ?? 16_384,
@@ -165,48 +127,56 @@ export function createSignalRouter(options: SignalRouterOptions): SignalRouter {
     const threadId = safeDecodeSegment(segments[baseSegments.length]);
     if (threadId === undefined) return null;
     const channelSeg = segments[baseSegments.length + 1] ?? '';
-    if (!(channelSeg in CHANNEL_PATHS)) return null;
+    if (!Object.hasOwn(CHANNEL_PATHS, channelSeg)) return null;
     const channel = channelSeg as SignalChannel;
     if (request.method !== 'POST') {
       return json({ error: 'method not allowed' }, 405);
     }
 
-    // Hoisted ABOVE the try so the outer catch can audit the POST-auth denials
-    // that surface as thrown RunRouteErrors (the target 404, the memory-id
-    // 400). `context` is undefined until resolve succeeds and the closure no-ops
-    // while it is, so a pre-auth throw is never audited. `contentBytes` is filled
-    // at the size-cap step (0 for pre-parse rejections).
     let context: ActorContext | undefined;
     let contentBytes = 0;
     const audit = async (
       outcome: 'accepted' | 'rejected',
       reason?: string,
     ): Promise<void> => {
-      if (!options.audit || !context) return;
-      await options.audit({
-        type: 'signal.ingest',
-        ...(context.deploymentTag !== undefined
-          ? { deploymentTag: context.deploymentTag }
-          : {}),
-        actorId: context.actor.id,
-        threadId,
-        channel,
-        outcome,
-        ...(reason !== undefined ? { reason } : {}),
-        contentBytes,
-        timestamp: new Date().toISOString(),
-      });
+      if (!auditSink || !context) return;
+      try {
+        await auditSink.call(options, {
+          type: 'signal.ingest',
+          ...(context.deploymentTag !== undefined
+            ? { deploymentTag: context.deploymentTag }
+            : {}),
+          actorId: context.actor.id,
+          threadId,
+          channel,
+          outcome,
+          ...(reason !== undefined ? { reason } : {}),
+          contentBytes,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (error) {
+        try {
+          console.error(
+            JSON.stringify({
+              type: 'signal.ingest-audit-error',
+              threadId,
+              channel,
+              reason: hostErrorText(error, true),
+            }),
+            error,
+          );
+        } catch {
+          // Diagnostics cannot change the request's selected outcome.
+        }
+      }
     };
 
     try {
-      // 1. Resolve and authenticate. ActorResolutionError maps to 403 in the
-      // catch and is not audited (pre-auth).
-      context = await resolve(request);
-      if (!context) return json({ error: 'authentication required' }, 401);
+      const resolved = await resolve(request);
+      if (!resolved) return json({ error: 'authentication required' }, 401);
+      context = captureActorContext(resolved);
       const actor = context.actor;
 
-      // 2. Resolve ownership before the role gate. A foreign opaque id and a
-      // missing one are the same 404, including for a read-only role.
       await requireResourceAccess(
         context,
         'thread',
@@ -214,15 +184,13 @@ export function createSignalRouter(options: SignalRouterOptions): SignalRouter {
         'write',
         'thread',
       );
+      await validateThreadTarget?.call(options, context, { threadId });
 
-      // 3. Coarse role: signalling mutates agent context.
       if (!roles.includes(actor.role)) {
         await audit('rejected', 'forbidden-role');
         return json({ error: 'forbidden' }, 403);
       }
 
-      // 4. Size cap at the wire: read the body as text, bound it, THEN parse. A
-      // 16 KiB signal is generous; an unbounded one is a context-stuffing vector.
       const rawBody = await readBoundedBody(
         request,
         maxContentBytes,
@@ -257,10 +225,8 @@ export function createSignalRouter(options: SignalRouterOptions): SignalRouter {
         return json({ error: 'a JSON object body is required' }, 400);
       }
 
-      // 5. No client memory id ANYWHERE in the body (assertNoClientMemoryIds 400s).
       assertNoClientMemoryIds(body);
 
-      // 6. Attribute-key allowlist (defense-in-depth over core's name validation).
       if (allowlist && body.attributes !== undefined) {
         const attrs = body.attributes;
         if (
@@ -281,7 +247,6 @@ export function createSignalRouter(options: SignalRouterOptions): SignalRouter {
         }
       }
 
-      // 7. Deployment rate cap.
       if (options.rateLimit) {
         const allowed = await options.rateLimit();
         if (!allowed) {
@@ -290,18 +255,29 @@ export function createSignalRouter(options: SignalRouterOptions): SignalRouter {
         }
       }
 
-      // 8. Audit the accepted ingest, then forward through the topology (which
-      // overwrites the principal header — a forged one cannot ride along).
-      await audit('accepted');
-      return await topology.send(context, threadId, CHANNEL_PATHS[channel], {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: rawBody.text === '' ? '{}' : rawBody.text,
-      });
+      const response = await topology.send(
+        context,
+        threadId,
+        CHANNEL_PATHS[channel],
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: rawBody.text === '' ? '{}' : rawBody.text,
+        },
+      );
+      await audit(
+        response.ok ? 'accepted' : 'rejected',
+        response.ok
+          ? undefined
+          : response.status === 404
+            ? 'invalid-thread'
+            : `downstream-${response.status}`,
+      );
+      return response.status === 404
+        ? json({ error: 'thread not found' }, 404)
+        : response;
     } catch (error) {
       if (error instanceof RunRouteError) {
-        // A post-auth denial: the target 404 or a smuggled memory-id 400.
-        // audit the rejection before mapping the status the router surfaces.
         await audit(
           'rejected',
           error.status === 404
@@ -310,12 +286,16 @@ export function createSignalRouter(options: SignalRouterOptions): SignalRouter {
               ? 'client-memory-id'
               : `route-error-${error.status}`,
         );
-        return json({ error: error.message }, error.status);
+        return json(
+          { error: error.status === 404 ? 'thread not found' : error.message },
+          error.status,
+        );
       }
       if (error instanceof ActorResolutionError) {
-        // Pre-auth (the resolver itself threw): unauthenticated, so not audited.
+        await audit('rejected', 'forbidden');
         return json({ error: 'forbidden' }, 403);
       }
+      await audit('rejected', 'internal-error');
       return internalErrorResponse('signals.ingest', error);
     }
   };

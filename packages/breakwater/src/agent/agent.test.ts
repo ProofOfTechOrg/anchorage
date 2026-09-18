@@ -510,6 +510,29 @@ describe('guarded construction and processor validation', () => {
   });
 
   it.each([
+    'processInput',
+    'processInputStep',
+    'computeStateSignal',
+    'processLLMRequest',
+    'processLLMResponse',
+    'processOutputStep',
+    'processAPIError',
+  ])('rejects output processor hook %s', (hook) => {
+    const processor = {
+      id: `output-${hook}`,
+      processOutputStream: (args: ProcessOutputStreamArgs) => args.part,
+      processOutputResult: (args: ProcessOutputResultArgs) => args.messages,
+      [hook]: () => undefined,
+    };
+
+    expect(() =>
+      guarded({
+        applicationOutputProcessors: [processor as never],
+      }),
+    ).toThrow(new RegExp(`must not implement ${hook}`));
+  });
+
+  it.each([
     'breakwater-rbac',
     'breakwater-policy-engine',
   ])("rejects reserved application processor id '%s'", (id) => {
@@ -855,6 +878,8 @@ describe('Mastra Agent execution-entry inventory', () => {
       'streamLegacy',
       'streamUntilIdle',
     ];
+    // A narrowed handle can only omit, so a setter or data-returning member
+    // is harmless here.
     const explicitlyNonExecution = [
       '__fork',
       '__getDrainPendingSignals',
@@ -872,6 +897,8 @@ describe('Mastra Agent execution-entry inventory', () => {
       '__setDeclaredSchedules',
       '__setMemory',
       '__setPubSub',
+      // Installs another agent as the target the thread runtime drives.
+      '__setThreadRuntimeAgent',
       '__setTools',
       '__setWorkspace',
       '__updateInstructions',
@@ -879,12 +906,19 @@ describe('Mastra Agent execution-entry inventory', () => {
       'assertSupportsPreparedModels',
       'agent',
       'browser',
+      // Cancels queued idle signals; it can stop pending work, never start it.
+      'cancelQueuedMessages',
+      // Opts the agent in as a thread's remote wake target and subscriber.
+      'claimThreadOwnership',
       'clearObjective',
       'combineProcessorsIntoWorkflow',
       'constructor',
       'convertTools',
       'deriveSubAgentBackgroundConfig',
       'disableBackgroundTasks',
+      // Returns the peer advertisements one pub/sub instance carries; no run
+      // ids, and nothing to drive.
+      'discoverThreadPeers',
       'durable',
       'enableBackgroundTasks',
       // Pure title-generation prefilter; it cannot initiate agent execution.
@@ -980,6 +1014,8 @@ describe('Mastra Agent execution-entry inventory', () => {
       'setChannels',
       'setObjective',
       'stripParentToolParts',
+      // Registers a queued-message-count listener; it drives nothing.
+      'subscribeThreadEvents',
       'subscribeToThread',
       'updateModelInModelList',
       'updateObjectiveOptions',
@@ -995,10 +1031,15 @@ describe('Mastra Agent execution-entry inventory', () => {
     const forwardClassified = [
       '__markStoredVersionApplied',
       '__setDeclaredSchedules',
+      '__setThreadRuntimeAgent',
+      'cancelQueuedMessages',
+      'claimThreadOwnership',
+      'discoverThreadPeers',
       'filterUiMessagesByThread',
       'getDeclaredSchedules',
       'listActiveThreadRuns',
       'resolveNotificationDeliveryDecision',
+      'subscribeThreadEvents',
     ];
     const classified = [
       ...wrapped,
@@ -1056,7 +1097,7 @@ describe('Mastra Agent execution-entry inventory', () => {
     if (installedCore === declaredPeer) {
       expect(
         forwardClassified.filter((name) => own.includes(name)),
-        `the pin caught up to these on @mastra/core ${installedCore} — drop them from forwardClassified so the stale check covers them again`,
+        `the pin caught up to these on @mastra/core ${installedCore} — drop them from forwardClassified so the stale check covers them again, and prune its sibling allowance in the same pass: the VERSION_SKEW table in flowsafe's durable-agent-surface.test.ts`,
       ).toEqual([]);
     } else {
       expect(

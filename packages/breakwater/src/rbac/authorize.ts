@@ -3,7 +3,7 @@
 import type { RequestContext } from '@mastra/core/request-context';
 
 import { type AuditLogger, agentAuditDetail } from '../audit/index.js';
-import type { Actor, Role } from './index.js';
+import type { Actor, Role } from './actor.js';
 import { type PrincipalKind, principalKindOf } from './principal.js';
 
 export interface ActorAuthorizationOptions {

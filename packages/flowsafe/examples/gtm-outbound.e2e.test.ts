@@ -70,7 +70,11 @@ function buildHarness(): Harness {
     description: 'Sends the approved outreach batch',
     inputSchema: z.object({ count: z.number() }),
     outputSchema: z.object({ sent: z.boolean() }),
-    permissions: { sideEffect: 'write', requiresApproval: true },
+    permissions: {
+      sideEffect: 'write',
+      requiresApproval: true,
+      egressEnforcement: 'enforced',
+    },
     policies: { audit },
     execute: async () => {
       sends += 1;

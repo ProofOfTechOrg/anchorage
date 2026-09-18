@@ -1,6 +1,7 @@
 # Agent CLI navigation
 
 - `index.ts`: generic, Claude Code, and Codex adapters
+- `exec-contract.ts`: the spawn seam's process result and injectable runner
 - `tail-accumulator.ts`: bounded UTF-8 output capture
 - `agent-cli.test.ts`: argv, approval, dry-run, timeout, output, and diagnostics coverage
 

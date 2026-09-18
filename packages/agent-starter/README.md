@@ -56,6 +56,8 @@ All six use the deployment's D1 database. `createComposedStorage()` overlays not
 
 ## Provision one physical deployment
 
+Application roots outside this workspace must apply the `@mastra/core` patch flowsafe ships — see [Apply the flowsafe patch to @mastra/core](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/getting-started.md#apply-the-flowsafe-patch-to-mastracore); this workspace applies it through the root `pnpm.patchedDependencies`.
+
 Each organization needs a dedicated Worker, D1 database, Durable Object namespaces, and internal Durable Object credential. Replace every `replace-me` segment in `wrangler.jsonc` with the stable lowercase deployment tag before creating resources. For tag `acme`, use Worker `anchorage-agent-starter-acme` and D1 database `anchorage-agent-starter-acme`; the unique Worker name creates the deployment's Durable Object namespaces. Then stamp the same tag into the new D1 database before any application schema or traffic:
 
 ```bash
@@ -272,6 +274,8 @@ The route verifies `X-Hub-Signature-256` over raw bytes before parsing or subscr
 
 ## Schedules and unattended work
 
+Schedule routes use the composed Worker's captured artifact epoch and the concrete D1 store's `FENCED_SCHEDULE_STORAGE` capability on the same database. After activation, missing, stale and future epochs refuse mutations, including pause/delete and already-matching pause/resume requests. Configure the epoch through the trusted host configuration; request data cannot supply it. Admitted trigger settlement can finish a pending deletion after an epoch change.
+
 The one-minute tick claims due schedules with D1 CAS, starts generic workflows or the same runtime-driven thread agent, and dispatches due notifications through the owning thread Durable Object.
 
 Agent schedules must name `agentId: "anchorage-agent"`. A threaded schedule uses a `threadId` and `resourceId` returned by the start route. Stored request context cannot contain Breakwater grant keys or runtime-reserved keys. Every fire gets a fresh opaque run id.
@@ -339,10 +343,11 @@ The object persists the next alarm before each duty and runs one due duty per in
 1. Replace `createStarterAgentModule()` instructions, tools, metadata, and allowed roles.
 2. Keep every external side effect behind `createConnector()`.
 3. Add each connector's real egress hosts to its permission manifest and use the guarded `fetch`.
-4. Add workflow metadata and committed workflows together; registration fails fast if they drift.
-5. Add provider adapters to both the webhook map and provider-host list, then add their ids to the subscription allowlist.
-6. Replace console audit sinks with your Queue or SIEM transport.
-7. Add a durable run-cap implementation before exposing unattended execution commercially.
+4. Re-decide `permissions.egressEnforcement` for every connector you derive. The starter's connector declares `'enforced'` because it issues no HTTP request: it writes through a D1 binding, which the declaration does not cover. A derived connector that reaches the network through a vendor SDK or a child process carrying its own transport declares `'declaration-only'` instead. `connectorEgressPosture(tool)` reads back what a connector resolved to, and connector audit events carry it as `detail.egressEnforcement`.
+5. Add workflow metadata and committed workflows together; registration fails fast if they drift.
+6. Add provider adapters to both the webhook map and provider-host list, then add their ids to the subscription allowlist.
+7. Replace console audit sinks with your Queue or SIEM transport.
+8. Add a durable run-cap implementation before exposing unattended execution commercially.
 
 Every Anchorage import in `src/` uses a documented package export. `check:imports` rejects source or distribution deep imports and relative reaches into sibling packages.
 

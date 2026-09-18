@@ -2,7 +2,7 @@
 
 # Operate the isolated deployment fleet
 
-`@proofoftech/fleet-control` is the trusted control-plane package for physically isolated deployments. It contains staged Wrangler Versions and Workers for Platforms backends, fenced durable fleet state, resumable provisioning and decommissioning, content-addressed external release promotion and schema-compatible rollback, authoritative bidirectional inventory, durable export sinks, and the shared platform Workers.
+`@proofoftech/fleet-control` is the trusted control-plane package for physically isolated deployments. It contains direct Cloudflare API and staged Wrangler ordinary-Worker backends, a Workers for Platforms backend, fenced durable fleet state, resumable provisioning and decommissioning, content-addressed external release promotion and schema-compatible rollback, authoritative bidirectional inventory, durable export sinks, and the shared platform Workers.
 
 Read [Provision physically isolated deployments](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/fleet-control.md) for the supported lifecycle, security boundary, and credentialed conformance gate.
 
@@ -16,7 +16,7 @@ Install it only in the one service that owns provisioning. Read [Import it only 
 pnpm add @proofoftech/fleet-control
 ```
 
-The package is ESM only and requires Node `>=22.22.0`. It depends on `@proofoftech/flowsafe`, which supplies the deployment identity protocol, the maintenance capability, and the audit export contract that fleet control provisions against.
+The package is ESM only. Node hosts require Node `>=22.22.0`; a Cloudflare Worker control plane imports `@proofoftech/fleet-control/cloudflare-control-plane`. The required type peer is `@cloudflare/workers-types >=5.20260730.1 <6`; this repository verifies `5.20260905.1`. It depends on `@proofoftech/flowsafe`, which supplies the deployment identity protocol, the maintenance capability, and the audit export contract that fleet control provisions against.
 
 That dependency is pinned to one exact FlowSafe release, deliberately. If you also depend on FlowSafe directly, pin it to the same release rather than letting a range resolve a second copy: FlowSafe's Durable Object classes are nominal and its maintenance receipt audience is fixed on both the minting and verifying side, so two copies fail closed at the maintenance boundary with no local signal.
 
@@ -37,13 +37,34 @@ Fleet Control does not install a runtime Wrangler dependency. Keep the selected 
 | Export | Contents |
 | --- | --- |
 | `@proofoftech/fleet-control` | Provisioning, migration, promotion, rollback, decommission, inventory, fleet state, and the Cloudflare client and rate coordinator. |
+| `@proofoftech/fleet-control/cloudflare-control-plane` | Trusted ordinary-Worker control-plane factory, bounded lifecycle operations, D1 adapter and shared quota coordinator, R2 export store, and their data and error types. |
 | `@proofoftech/fleet-control/workers/dispatch` | Platform dispatch Worker that routes to a deployment's user script under a verified maintenance capability. |
 | `@proofoftech/fleet-control/workers/outbound` | Shared outbound Worker: the declared-egress proxy and the named `StateEgress` entrypoint. |
 | `@proofoftech/fleet-control/workers/audit-consumer` | Control-plane queue consumer for backend-owned deployment audit events. |
 
-The three Worker exports are deployment artifacts for the platform's own Workers, not helpers to import into an application Worker.
+The `workers/*` entries are deployment artifacts for the platform's own Workers.
+
+The root entry exposes `plainWorkerIngressModule(spec)` for upload-budget checks and ordinary Worker ingress tests. Keep its returned module separate from the input specification; the backend appends it during upload.
+
+Import `createCloudflareControlPlane` from `cloudflare-control-plane` in a [dedicated trusted control-plane Worker](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/fleet-control.md#run-the-trusted-control-plane-in-a-worker). Supply direct Fleet and quota D1 bindings, a private export R2 binding, and a host-owned Cloudflare token. Authorize incoming operations before calling the factory's methods. Never expose the token, bindings, or factory to a tenant-serving Worker. Queue delivery tokens identify requested work; durable Fleet state determines whether it can advance.
+
+Size inventory and audit workloads for the [documented memory and read-cost envelope](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/fleet-control.md#audit-an-account-under-a-request-budget). A provider-request budget does not establish a memory or CPU bound.
+
+Choose a backend from the artifact trust boundary and the provider integration available to your control plane:
+
+| Backend | Use it when |
+| --- | --- |
+| `CloudflareApiPlainWorkerBackend` | Platform-authored ordinary Workers should use Cloudflare APIs without a Wrangler process |
+| `WranglerLoopBackend` | Platform-authored ordinary Workers can use a host-provided Wrangler `>=4.118 <5` command |
+| `WorkersForPlatformsBackend` | External project releases require an untrusted dispatch namespace and isolated trusted state |
+
+Construct `CloudflareApiPlainWorkerBackend` with a `CloudflareProvisioningClient` whose options include `plane: 'plain-worker'`, a shared rate coordinator, and a durable `exportStore`. Plain-only clients reject any `dispatchNamespace` key.
+
+Set `cpuLimitMs` and `subrequestLimit` in `DeploymentSpec` to request ordinary-Worker runtime budgets. The direct and Wrangler adapters forward configured values in initial and staged uploads.
 
 Construct `WorkersForPlatformsBackend` with a dispatch namespace, one named shared outbound Worker, and a state-egress root secret. All three values are mandatory. The constructor rejects an incomplete dispatch-native configuration before it can call a provider.
+
+`PlainWorkerBackend` is the shared ordinary-Worker core that both built-in ordinary-Worker backends wrap. It is not intended for subclassing outside Fleet Control.
 
 An ordinary state Worker can exist only as the finalized result of the dedicated plain-to-Workers-for-Platforms switch. Pass its narrow finalized-state provider back to provision, migration, and rollback operations. That provider exact-inspects and advances the retained bridge without allowing the normal backend to originate ordinary state resources.
 
@@ -52,6 +73,14 @@ The state-egress credential digest is immutable after a deployment adopts or cre
 Construct `CloudflareProvisioningClient` with a `CloudflareApiRateCoordinator`. Production replicas must construct `D1CloudflareApiRateCoordinator` with one shared direct Workers `D1Database` binding and an explicit, nonsecret `quotaScope` for the Cloudflare user or account-token quota. The coordinator calls only the binding's `prepare()` and `batch()` methods. Its runtime guard rejects objects without that interface, but JavaScript cannot prove whether a structurally compatible object is a direct binding or a remote facade. The trusted host must enforce the direct-binding requirement because remote coordination queries would consume the same Cloudflare Client API quota being coordinated. Every caller that shares the provider quota must share the binding and scope. The coordinator reserves at most 1,100 Anchorage-originated requests in each rolling five-minute window across replicas. Never derive the scope from, persist, or log the API token. A non-Worker control plane must call a separately deployed coordinator service instead of passing a remote database adapter. `ProcessLocalCloudflareApiRateCoordinator` is only for local tests and the single-process credentialed runner; it does not coordinate replicas.
 
 Plain-worker, dispatch-worker, backend-switch, and control-worker inspection consumes every provider binding entry before exact attestation. Unknown types, malformed entries, duplicate names, unrepresented bindings, and missing complete inventories fail closed, including expected-empty groups. Secret names come from the authoritative secret-list API when ordinary version resources omit them. Wrangler-backed D1 ownership, migrations, exact-ID lookup, and deletion use Cloudflare's direct APIs. Every mutation runs under the active mutation fence. D1 deletion treats only provider 404 as absence and confirms that the immutable ID is absent without spawning `wrangler d1 delete`. A custom `PlainWorkerRouteApi` must provide `getDatabase` and `deleteDatabase` before destructive D1 teardown; Fleet Control fails closed when either capability is absent. SQLite recognizes anonymous `?` and numbered `?NNN` parameters, literals, quoted identifiers, and comments without string replacement. D1 does not support named SQLite parameters.
+
+Use `advanceFleetMigration()` for durable, caller-driven upgrades one admission or frozen plan step at a time. It adds a `FleetOperationStore` beside the deployment store, returns continuation tokens, and exposes running item metadata through `readFleetMigrationItemsPage()`. `abandonFleetMigrationOperation()` fails an operation without rolling back deployment mutations; `migrateFleet()` remains the one-call drain. Read the [recovery and cost boundaries](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/fleet-control.md#upgrade-a-fleet-in-resumable-steps) before choosing an operation size. The root entry remains control-plane-only and is not the curated Worker entry. Read [Roll out an artifact under the execution fence](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/fleet-control.md#roll-out-an-artifact-under-the-execution-fence) before migrating a deployment whose writers enforce a mutation epoch.
+
+Use `advanceDecommissionDeployment()` for Queue-driven bounded normal teardown. Use root-only `advanceBackendSwitchDecommission()` for one bounded backend-switch step from a trusted Node control plane. Both APIs return durable continuation tokens and perform at most one scan chunk or one lifecycle/resource action group per call. Their asynchronous one-call compatibility paths drain the same engines for existing callers.
+
+Use `advanceCleanupDeployment()` for bounded no-export cleanup of an owned prepublication deployment, and `cleanupDeploymentArtifacts()` as its asynchronous one-call drain. Eligibility is classified by `classifyCleanupDatabaseEligibility()` from the durable invocation-authority carrier: deployments whose candidate invocation was durably authorized, Workers for Platforms and external-artifact candidates, and ambiguous legacy rows refuse toward export-backed decommissioning. A completed cleanup persists an immutable operation-keyed terminal receipt and releases the deployment's ownership claims atomically with its row deletion; read receipts with `D1FleetStateStore.readCleanupReceipt()` and prune them explicitly with `pruneCleanupReceipts()`. A failed provision whose rollback admits the engine stays durably `cleanup-advancing` until the cleanup completes, and `provisionDeployment({ failureCleanup: 'bounded' })` surfaces the resumable outcome through `ProvisioningError.cleanup`.
+
+A custom backend-switch provider must expose every bounded capability required by the state it resumes: attachment scanning, paired export receipt authority and export, exact database read and owner read, database residual checks, and bounded deletion. A plain pending artifact also requires `captureSwitchEntryPendingArtifact()`. The built-in provider reads that exact version plus the authoritative secret-name inventory and preserves provider Durable Object selectors, service entrypoints, R2 jurisdiction, D1 alias agreement, and namespace IDs. A missing capability, unrecognized binding field, changed authority, or non-exact observation fails before mutation. After Fleet D1 commits the operation snapshot, retries never recapture live pending-version authority.
 
 Use `forceDecommissionDeployment()` only when the host has lost the retained credentials or artifact required to rebuild a `DeploymentSpec`. The operation accepts the durable tenant and environment key instead of a specification. It runs under the deployment lease, removes every ordinary custom domain for the persisted script, disables and verifies public ingress, deletes the script’s current secrets, and deletes D1 by its persisted immutable ID after matching the persisted database name. It then removes the fleet ledger row.
 
@@ -66,6 +95,8 @@ Run the package checks with:
 ```bash
 pnpm fleet-control:check
 ```
+
+The repository also includes a Linux-only [direct-API credentialed proof](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/fleet-control.md#run-the-direct-api-credentialed-proof). Run `pnpm fleet-control:credentialed:direct -- --preflight` for local validation, then use `--run` and a fresh-process `--resume` after exit `3`. Offline acceptance starts from confirmed receipts and verifies bootstrap revalidation, scenario execution, and teardown against local workerd; resource creation and live provider behavior require credentials. The guide documents the configuration, environment, exit codes, and `evidence.json` artifact for recovery approval.
 
 The paid namespace gate uses [`scripts/credentialed-conformance.example.json`](https://github.com/ProofOfTechOrg/anchorage/blob/main/packages/fleet-control/scripts/credentialed-conformance.example.json) as its configuration shape. The configuration must declare `contractVersion: 1`, two trusted state profiles, the audit queue, positive CPU and subrequest limits, and allowed and denied upstream URLs. Structural validation checks the versioned configuration, required environment values, and private-key shape before artifact reads or fleet imports. The runner then builds both deployment specifications and trusted profiles. Production specification, secret, profile, migration, route, date, and canonical JSON Web Key (JWK) validators check both releases before the runner constructs a Cloudflare client or provisioning backend.
 

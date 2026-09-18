@@ -9,7 +9,7 @@ import {
 } from '../../../scripts/workerd-server-lifecycle.mjs';
 
 const FLOWSAFE = dirname(dirname(fileURLToPath(import.meta.url)));
-const WRANGLER = join(FLOWSAFE, 'node_modules/.bin/wrangler');
+const WRANGLER = join(FLOWSAFE, '../../node_modules/.bin/wrangler');
 const CONFIG = join(FLOWSAFE, 'spike/durability-benchmark.wrangler.jsonc');
 const PORT = parsePort(
   process.env.DURABILITY_BENCHMARK_PORT ?? 8801,

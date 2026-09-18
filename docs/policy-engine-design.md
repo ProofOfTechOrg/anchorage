@@ -183,6 +183,8 @@ Add evaluators through `ConnectorPolicies.evaluators`. Keep them deterministic a
 
 An evaluator may inspect trusted request-context values, but must never promote client input into an approval grant or isolation scope.
 
+Tool evaluators can return `{ allowed: false, reason }` or add a `ConnectorDenialCode` and its code-specific `details`. Built-in codes are independent of renamed evaluators. Legacy custom denials use `EVALUATOR_DENIED`; malformed new metadata and evaluator exceptions use `EVALUATOR_FAILED`. The connector SDK validates and copies those fields before emitting its error and audit event. See the [decision-code contract](connector-interface.md#connector-decision-codes). Agent and content policy seams keep their existing result and abort behavior.
+
 ## Connector execution order
 
 The SDK uses this order:
@@ -210,7 +212,7 @@ attempt can retry. Output-validation failure after execution leaves an atomic
 reservation pending until stale takeover or operator recovery because an
 immediate release could duplicate the completed side effect.
 
-Every allow, denial, and gate failure emits structured audit. Arbitrary thrown values are mapped to static safe audit reasons rather than copied into audit output.
+SDK events that reach the configured audit wrapper include `decisionCode`, `policyKind` and `retryable`. Arbitrary thrown values use static audit reasons rather than their exception text.
 
 ## Data lifecycle policy
 

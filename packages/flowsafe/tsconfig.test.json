@@ -21,12 +21,19 @@
       "@proofoftech/flowsafe/agent-host": ["./src/agent-host/index.ts"],
       "@proofoftech/flowsafe/audit-export": ["./src/audit-export/index.ts"],
       "@proofoftech/flowsafe/do-runner": ["./src/do-runner/index.ts"],
+      "@proofoftech/flowsafe/do-runner/constants": [
+        "./src/do-runner/constants.ts"
+      ],
+      "@proofoftech/flowsafe/do-runner/testing": ["./src/do-runner/testing.ts"],
       "@proofoftech/flowsafe/host-kit": ["./src/host-kit/index.ts"]
     }
   },
   "include": [
     "src",
     "examples",
+    "vitest.config.ts",
+    "test-support/d1-type-compatibility.ts",
+    "test-support/module-edges.ts",
     "test-support/r2-type-compatibility.ts",
     "deploy/worker.ts",
     "deploy/worker.e2e.test.ts"

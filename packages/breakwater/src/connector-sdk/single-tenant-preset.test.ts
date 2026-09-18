@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 import { RequestContext } from '@mastra/core/request-context';
 import type { Tool, ToolExecutionContext } from '@mastra/core/tools';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { AuditLogger } from '../audit/index.js';
 import {
   backgroundExecution,
+  networkEgress,
   tenantIsolation,
 } from '../policy-engine/index.js';
 import {
+  connectorEgressPosture,
   connectorManifest,
   createConnector,
   D1IdempotencyStore,
@@ -45,6 +47,91 @@ function productionOptions(): SingleTenantConnectorPoliciesOptions {
 }
 
 describe('singleTenantConnectorPolicies', () => {
+  it('pins requireEgressEnforcement through the single-tenant preset', () => {
+    // #given
+    const options = {
+      ...productionOptions(),
+      requireEgressEnforcement: true as const,
+    };
+    const policies = singleTenantConnectorPolicies(options);
+    // #when
+    const connector = createConnector({
+      id: 'records.read',
+      description: 'Read one record',
+      permissions: { sideEffect: 'read', egressEnforcement: 'enforced' },
+      policies,
+      execute: async () => ({ ok: true }),
+    });
+    // #then
+    expect(Object.isFrozen(policies)).toBe(true);
+    expect(policies.requireEgressEnforcement).toBe(true);
+    expect(connectorEgressPosture(connector)).toBe('enforced');
+    expect(() =>
+      createConnector({
+        id: 'records.unenforced',
+        description: 'Read without declaring enforced egress',
+        permissions: { sideEffect: 'read' },
+        policies,
+        execute: async () => ({ ok: true }),
+      }),
+    ).toThrow(/requireEgressEnforcement/);
+  });
+
+  it('leaves requireEgressEnforcement off a preset built without it', () => {
+    // #given
+    const policies = singleTenantConnectorPolicies(productionOptions());
+    // #when
+    const connector = createConnector({
+      id: 'records.undeclared',
+      description: 'Read without declaring a posture',
+      permissions: { sideEffect: 'read' },
+      policies,
+      execute: async () => ({ ok: true }),
+    });
+    // #then
+    expect(policies).not.toHaveProperty('requireEgressEnforcement');
+    expect(connectorEgressPosture(connector)).toBe('declaration-only');
+  });
+
+  it('refuses a preset whose requireEgressEnforcement was added after validation', () => {
+    // #given
+    const baseline = singleTenantConnectorPolicies(productionOptions());
+    const added = { ...baseline, requireEgressEnforcement: true as const };
+    const required = singleTenantConnectorPolicies({
+      ...productionOptions(),
+      requireEgressEnforcement: true,
+    });
+    const removed = { ...required };
+    delete removed.requireEgressEnforcement;
+    // #when / #then
+    for (const policies of [added, removed]) {
+      expect(() =>
+        createConnector({
+          id: 'records.read',
+          description: 'Read one record',
+          permissions: { sideEffect: 'read' },
+          policies,
+          execute: async () => ({ ok: true }),
+        }),
+      ).toThrow(
+        'single-tenant preset requireEgressEnforcement was replaced, removed, or added after validation',
+      );
+    }
+  });
+
+  it('refuses an unknown posture key in the single-tenant preset options', () => {
+    // #given
+    const options = {
+      ...productionOptions(),
+      egressEnforcement: 'enforced',
+    };
+    // #when / #then
+    expect(() => singleTenantConnectorPolicies(options)).toThrow(TypeError);
+    expect(() => singleTenantConnectorPolicies(options)).toThrow(
+      /invalid options:.*egressEnforcement/,
+    );
+  });
+
   it('constructs a complete frozen policy set and validates the manifest', () => {
     const policies = singleTenantConnectorPolicies(productionOptions());
     const connector = createConnector({
@@ -479,6 +566,27 @@ describe('singleTenantConnectorPolicies', () => {
     ).toThrow(/single-tenant preset audit\.record changed/);
   });
 
+  it('reads the preset audit member once', () => {
+    const complete = singleTenantConnectorPolicies(productionOptions());
+    const baselineAudit = complete.audit;
+    const changing = { ...complete } as Record<PropertyKey, unknown>;
+    let reads = 0;
+    Object.defineProperty(changing, 'audit', {
+      enumerable: true,
+      get: () => (reads++ === 0 ? baselineAudit : { record: () => undefined }),
+    });
+
+    createConnector({
+      id: 'records.audit-read-once',
+      description: 'Read one record',
+      permissions: { sideEffect: 'read' },
+      policies: changing as never,
+      execute: async () => ({ ok: true }),
+    });
+
+    expect(reads).toBe(1);
+  });
+
   it('uses the frozen evaluator snapshot after a changing accessor', async () => {
     const complete = singleTenantConnectorPolicies({
       audit: { mode: 'development', allowUnaudited: true },
@@ -510,7 +618,47 @@ describe('singleTenantConnectorPolicies', () => {
       connector.execute?.({}, {
         requestContext: new RequestContext(),
       } as ToolExecutionContext),
-    ).rejects.toMatchObject({ policy: 'always-deny' });
+    ).rejects.toMatchObject({
+      policy: 'always-deny',
+      code: 'EVALUATOR_DENIED',
+      policyKind: 'evaluator',
+      retryable: false,
+    });
     expect(reads).toBe(1);
+  });
+
+  it('retains built-in decision metadata through the bound evaluator snapshot', async () => {
+    const evaluator = networkEgress({
+      allowedDomains: [],
+      name: 'organization-check',
+    });
+    const policies = singleTenantConnectorPolicies({
+      audit: { mode: 'development', allowUnaudited: true },
+      egress: { allowedDomains: ['api.example.com'] },
+      permissions: { principalPermissions: 'not-configured' },
+      evaluators: [evaluator],
+    });
+    evaluator.evaluate = () => ({ allowed: true });
+    const execute = vi.fn(async () => ({ ok: true }));
+    const connector = createConnector({
+      id: 'records.coded-snapshot',
+      description: 'Read one remote record',
+      permissions: { sideEffect: 'read', egress: ['api.example.com'] },
+      policies,
+      execute,
+    });
+
+    await expect(
+      connector.execute?.({}, {
+        requestContext: new RequestContext(),
+      } as ToolExecutionContext),
+    ).rejects.toMatchObject({
+      policy: 'organization-check',
+      code: 'EGRESS_HOST_NOT_ALLOWED_BY_ORG',
+      policyKind: 'network-egress',
+      retryable: false,
+      details: { declaredHost: 'api.example.com' },
+    });
+    expect(execute).not.toHaveBeenCalled();
   });
 });

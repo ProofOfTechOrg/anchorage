@@ -388,7 +388,7 @@ export function samePrincipal(
  * breakwater's gate does not consult the role allowlist for a non-human kind,
  * making this value inert there — it is the least-privileged role precisely so
  * that any consumer which reads `actor.role` WITHOUT understanding `kind` gets
- * the minimum rather than the `operator` these paths used to fabricate.
+ * the minimum.
  *
  * `viewer` also holds no decider role, so an automated principal projected onto
  * `ApprovalService` can never satisfy DECIDER_ROLES and approve anything.

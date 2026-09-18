@@ -11,6 +11,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { namesAnotherModule } from '../test-support/module-edges.ts';
 import { assertAttwEsmPackage } from './attw-pack-check.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -74,16 +75,28 @@ try {
   );
   run(join(root, 'node_modules/.bin/tsc'), ['-p', 'tsconfig.json'], consumer);
 
-  const client = readFileSync(
-    join(temporary, 'package', 'dist', 'signals', 'client.js'),
-    'utf8',
-  );
+  const packedSignalsFile = (fileName) =>
+    readFileSync(
+      join(temporary, 'package', 'dist', 'signals', fileName),
+      'utf8',
+    );
+
+  const client = packedSignalsFile('client.js');
   if (
-    /^import\s/m.test(client) ||
+    namesAnotherModule(client) ||
     /node:|agent-runner|do-runner/.test(client)
   ) {
     throw new Error(
       'packed signals/client pulled a runtime or Node-only import',
+    );
+  }
+  // The declaration axis of the same entry. A browser consumer resolves this
+  // `.d.ts` and whatever it names, so a type reaching in from the runner or the
+  // host kit would hand that graph to a consumer who installed the browser
+  // entry alone.
+  if (namesAnotherModule(packedSignalsFile('client.d.ts'))) {
+    throw new Error(
+      'packed signals/client declaration named a module outside the browser entry',
     );
   }
   console.log('packed browser signals/client import passed');

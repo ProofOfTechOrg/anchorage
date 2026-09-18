@@ -42,6 +42,8 @@ function harnessOptions() {
 }
 
 describe.sequential('migration ledger real-D1 fidelity', {
+  // The hooks below repeat this value because hooks take vitest's
+  // hookTimeout, not this option; every title inherits it.
   timeout: 30_000,
 }, () => {
   let server: TestHarness;
@@ -98,6 +100,24 @@ describe.sequential('migration ledger real-D1 fidelity', {
     ).resolves.toEqual({
       fulfilled: 12,
       rejected: [],
+      values: 1,
+      ledger: 1,
+    });
+  });
+
+  it('converges concurrent first applications on a cold ledger', async () => {
+    await expect(
+      probe<{
+        coldBefore: number;
+        settlements: Array<
+          { status: 'fulfilled' } | { status: 'rejected'; message: string }
+        >;
+        values: number;
+        ledger: number;
+      }>('cold-application'),
+    ).resolves.toEqual({
+      coldBefore: 0,
+      settlements: [{ status: 'fulfilled' }, { status: 'fulfilled' }],
       values: 1,
       ledger: 1,
     });

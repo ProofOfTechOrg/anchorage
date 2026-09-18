@@ -15,16 +15,16 @@ import {
   isTenantIsolationEvaluator,
   networkEgress,
 } from '../policy-engine/tool-policy.js';
-import { D1IdempotencyStore } from './d1-idempotency-store.js';
-import { D1RateLimitStore } from './d1-rate-limit-store.js';
-import type { EgressFetchBase } from './egress-fetch.js';
 import type {
   AtomicIdempotencyStore,
   ConnectorPolicies,
   InspectableIdempotencyStore,
   PermissionManifest,
   RateLimitStore,
-} from './index.js';
+} from './contracts.js';
+import { D1IdempotencyStore } from './d1-idempotency-store.js';
+import { D1RateLimitStore } from './d1-rate-limit-store.js';
+import type { EgressFetchBase } from './egress-fetch.js';
 
 const auditRecordMethod = AuditLogger.prototype.record;
 const auditHasExternalSinkMethod = AuditLogger.prototype.hasExternalSink;
@@ -90,6 +90,8 @@ export interface SingleTenantConnectorPoliciesOptions {
   evaluators?: readonly ToolPolicyEvaluator[];
   /** Optional base fetch used by the connector runtime guard. */
   fetch?: EgressFetchBase;
+  /** Refuse connectors whose egress posture is not enforced. */
+  requireEgressEnforcement?: true;
 }
 
 const singleTenantPreset = Symbol('breakwater.singleTenantConnectorPolicies');
@@ -166,6 +168,7 @@ const optionsSchema = z.strictObject({
       'must be a fetch function',
     )
     .optional(),
+  requireEgressEnforcement: z.literal(true).optional(),
 });
 
 function parseOptions(options: SingleTenantConnectorPoliciesOptions) {
@@ -225,6 +228,28 @@ function snapshotRateLimitStore(store: D1RateLimitStore): RateLimitStore {
     increment: Object.freeze(d1IncrementMethod.bind(store)),
   });
 }
+
+// Policy members the preset pins between validation and construction. The
+// order decides which member a multi-member tamper is reported against, since
+// the first mismatch throws; `Object.keys` preserves the literal's insertion
+// order, so the order written here is the order checked. Exhaustive over
+// ConnectorPolicies: a member the interface gains is a missing property here,
+// one it drops an excess property.
+const PINNED_PRESET_MEMBER_SET: Record<keyof ConnectorPolicies, true> = {
+  networkEgress: true,
+  idempotencyKeyMigration: true,
+  writePermissions: true,
+  evaluators: true,
+  idempotencyStore: true,
+  rateLimitStore: true,
+  audit: true,
+  fetch: true,
+  requireEgressEnforcement: true,
+};
+
+const PINNED_PRESET_MEMBERS = Object.keys(
+  PINNED_PRESET_MEMBER_SET,
+) as readonly (keyof ConnectorPolicies)[];
 
 function assertUnchangedSurface(
   connectorId: string,
@@ -317,6 +342,9 @@ export function singleTenantConnectorPolicies(
     ...(rateLimitStore === undefined ? {} : { rateLimitStore }),
     ...(audit === undefined ? {} : { audit }),
     ...(parsed.fetch === undefined ? {} : { fetch: parsed.fetch }),
+    ...(parsed.requireEgressEnforcement === undefined
+      ? {}
+      : { requireEgressEnforcement: parsed.requireEgressEnforcement }),
   });
   const snapshot: SingleTenantPolicySnapshot = Object.freeze({
     policies: enforcedPolicies,
@@ -352,53 +380,19 @@ export function assertSingleTenantConnectorPolicies(
     };
   }
 
-  const currentNetworkEgress = policies.networkEgress;
-  const currentWritePermissions = policies.writePermissions;
-  const currentEvaluators = policies.evaluators;
-  const currentIdempotencyStore = policies.idempotencyStore;
-  const currentIdempotencyKeyMigration = policies.idempotencyKeyMigration;
-  const currentRateLimitStore = policies.rateLimitStore;
-  const currentAudit = policies.audit;
-  const currentFetch = policies.fetch;
   const baseline = metadata.snapshot.policies;
-  assertUnchangedSurface(
-    connectorId,
-    'networkEgress',
-    currentNetworkEgress,
-    baseline.networkEgress,
-  );
-  assertUnchangedSurface(
-    connectorId,
-    'idempotencyKeyMigration',
-    currentIdempotencyKeyMigration,
-    baseline.idempotencyKeyMigration,
-  );
-  assertUnchangedSurface(
-    connectorId,
-    'writePermissions',
-    currentWritePermissions,
-    baseline.writePermissions,
-  );
-  assertUnchangedSurface(
-    connectorId,
-    'evaluators',
-    currentEvaluators,
-    baseline.evaluators,
-  );
-  assertUnchangedSurface(
-    connectorId,
-    'idempotencyStore',
-    currentIdempotencyStore,
-    baseline.idempotencyStore,
-  );
-  assertUnchangedSurface(
-    connectorId,
-    'rateLimitStore',
-    currentRateLimitStore,
-    baseline.rateLimitStore,
-  );
-  assertUnchangedSurface(connectorId, 'audit', currentAudit, baseline.audit);
-  assertUnchangedSurface(connectorId, 'fetch', currentFetch, baseline.fetch);
+  for (const member of PINNED_PRESET_MEMBERS) {
+    assertUnchangedSurface(
+      connectorId,
+      member,
+      policies[member],
+      baseline[member],
+    );
+  }
+  // The loop read `policies.audit` once and proved it identical to the
+  // baseline's, so the frozen snapshot carries the value the `.record` check
+  // needs — a second read of an accessor-backed `policies` would not.
+  const currentAudit = baseline.audit;
   if (
     currentAudit !== undefined &&
     currentAudit.record !== metadata.snapshot.auditMember

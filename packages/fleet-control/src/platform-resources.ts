@@ -17,9 +17,11 @@ import type {
   ExternalReleaseSnapshot,
   ExternalReleaseTopology,
   FleetRecord,
+  MaintenanceSigningProfile,
   ProvisioningBackend,
   TrustedWorkerArtifact,
 } from './types.js';
+import { effectiveLifecyclePhase } from './types.js';
 
 export const FLEET_AUDIT_PROXY_BINDING = 'AUDIT_PROXY';
 export const FLEET_AUDIT_PROXY_STATE_BINDING = 'FLEET_AUDIT_PROXY_OBJECT';
@@ -52,10 +54,11 @@ function currentRouteExpectations(
   record: FleetRecord,
   releases: readonly (ExternalReleaseSnapshot | undefined)[],
 ): readonly ExternalRouteExpectation[] {
+  const phase = effectiveLifecyclePhase(record);
   const target = record.platformTarget;
   if (!target) {
     throw new Error(
-      `external ${record.phase} route authority has no persisted platform target`,
+      `external ${phase} route authority has no persisted platform target`,
     );
   }
   const expectations = dedupeExternalRouteExpectations(
@@ -63,7 +66,7 @@ function currentRouteExpectations(
   );
   if (expectations.length === 0) {
     throw new Error(
-      `external ${record.phase} route authority has no persisted release`,
+      `external ${phase} route authority has no persisted release`,
     );
   }
   return expectations;
@@ -73,8 +76,9 @@ export function externalRouteExpectations(
   record: FleetRecord,
 ): readonly ExternalRouteExpectation[] {
   if (record.backend !== 'workers-for-platforms') return [];
+  const phase = effectiveLifecyclePhase(record);
   if (
-    record.phase === 'traffic-removed' ||
+    phase === 'traffic-removed' ||
     (record.backendSwitchIntent?.subphase.startsWith('decommission-') ===
       true &&
       record.backendSwitchIntent.subphase !== 'decommission-traffic-authorized')
@@ -92,9 +96,7 @@ export function externalRouteExpectations(
   }
   if (
     record.migrationIntent &&
-    ['migrating', 'decommissioning', 'credentials-revoked'].includes(
-      record.phase,
-    )
+    ['migrating', 'decommissioning', 'credentials-revoked'].includes(phase)
   ) {
     const intent = record.migrationIntent;
     if (
@@ -122,22 +124,19 @@ export function externalRouteExpectations(
     }
     return [prior];
   }
-  if (record.phase === 'rolling-back') {
+  if (phase === 'rolling-back') {
     return currentRouteExpectations(record, [
       record.activeRelease,
       record.pendingRelease,
     ]);
   }
-  if (record.phase === 'publishing') {
+  if (phase === 'publishing') {
     return currentRouteExpectations(record, [record.pendingRelease]);
   }
-  if (record.phase === 'ready') {
+  if (phase === 'ready') {
     return currentRouteExpectations(record, [record.activeRelease]);
   }
-  if (
-    record.phase === 'decommissioning' ||
-    record.phase === 'credentials-revoked'
-  ) {
+  if (phase === 'decommissioning' || phase === 'credentials-revoked') {
     return currentRouteExpectations(record, [
       record.activeRelease,
       record.pendingRelease,
@@ -598,21 +597,9 @@ function validateArtifact(
   }
 }
 
-export function validateExternalPlatformProfile(
-  spec: DeploymentSpec,
-  profile: ExternalPlatformProfile,
+export function validateMaintenanceSigningProfile(
+  profile: MaintenanceSigningProfile,
 ): void {
-  if (spec.authoredBy !== 'external') {
-    throw new Error('external platform resources require an external release');
-  }
-  if (profile.runtimeContractVersion !== 1) {
-    throw new Error('unsupported trusted platform runtime contract');
-  }
-  if (profile.backwardCompatibleWithRetainedReleases !== true) {
-    throw new Error(
-      'trusted platform profile must attest compatibility with retained releases',
-    );
-  }
   if (
     typeof profile.maintenanceCapabilityPublicKey !== 'string' ||
     canonicalMaintenanceCapabilityPublicKey(
@@ -623,7 +610,7 @@ export function validateExternalPlatformProfile(
   }
   const privateKey = profile.maintenanceCapabilityPrivateKey;
   if (
-    privateKey.kty !== 'OKP' ||
+    privateKey?.kty !== 'OKP' ||
     privateKey.crv !== 'Ed25519' ||
     privateKey.alg !== 'EdDSA' ||
     typeof privateKey.kid !== 'string' ||
@@ -650,6 +637,24 @@ export function validateExternalPlatformProfile(
       'maintenance capability private signer does not match its public verifier',
     );
   }
+}
+
+export function validateExternalPlatformProfile(
+  spec: DeploymentSpec,
+  profile: ExternalPlatformProfile,
+): void {
+  if (spec.authoredBy !== 'external') {
+    throw new Error('external platform resources require an external release');
+  }
+  if (profile.runtimeContractVersion !== 1) {
+    throw new Error('unsupported trusted platform runtime contract');
+  }
+  if (profile.backwardCompatibleWithRetainedReleases !== true) {
+    throw new Error(
+      'trusted platform profile must attest compatibility with retained releases',
+    );
+  }
+  validateMaintenanceSigningProfile(profile);
   validateArtifact(profile.stateWorker, 'state Worker artifact');
   if (profile.legacyBridgeWorker) {
     validateArtifact(profile.legacyBridgeWorker, 'legacy bridge artifact');

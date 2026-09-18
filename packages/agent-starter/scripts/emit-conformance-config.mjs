@@ -12,7 +12,7 @@
  * command that fails for every reason the configuration can be wrong.
  */
 
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 const contractPath = fileURLToPath(
@@ -166,4 +166,18 @@ function main() {
   console.log(`wrote ${CONFORMANCE_CONFIG_PATH}`);
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) main();
+// Both sides are realpathed, so a symlinked invocation still resolves to this
+// module's own path. An entry path that resolves to nothing names some other
+// module, which importers of this one rely on.
+// `scripts/entry-point.mjs` holds the root form of this disposition.
+let invokedFilePath;
+try {
+  invokedFilePath =
+    process.argv[1] === undefined ? undefined : realpathSync(process.argv[1]);
+} catch (error) {
+  if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') throw error;
+}
+
+if (invokedFilePath === realpathSync(fileURLToPath(import.meta.url))) {
+  main();
+}

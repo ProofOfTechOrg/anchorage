@@ -212,6 +212,7 @@ export class ConformanceState {
         // resumes, and a conformance state script on a locked deployment must
         // refuse rather than record a decision with nothing behind it.
         executionFence: executionFenceFor(this.#env.DB),
+        workflowTablePrefix: '',
       },
     );
   }

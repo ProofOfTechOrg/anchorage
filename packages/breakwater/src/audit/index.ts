@@ -10,7 +10,11 @@
 
 import type { RequestContext } from '@mastra/core/request-context';
 
-import type { Actor } from '../rbac/index.js';
+import type {
+  ConnectorDecisionCode,
+  ConnectorPolicyName,
+} from '../connector-decision.js';
+import type { Actor } from '../rbac/actor.js';
 
 /** Request-context key for trusted agent and run correlation fields. */
 export const AGENT_AUDIT_CONTEXT_KEY = 'breakwater.auditContext';
@@ -48,16 +52,30 @@ export interface AgentAuditContext {
   delegatedBy?: string;
 }
 
-const AGENT_AUDIT_OPTIONAL_FIELDS = [
-  'tenantId',
-  'runId',
-  'threadId',
-  'resourceId',
-  'principalKind',
-  'principalId',
-  'purpose',
-  'delegatedBy',
-] as const;
+// `agentId` and `entryPath` are required and read by name below; the rest are
+// what the copy loop walks.
+type AgentAuditOptionalField = Exclude<
+  keyof AgentAuditContext,
+  'agentId' | 'entryPath'
+>;
+
+// Exhaustive over those members: one the interface gains is a missing property
+// here, one it drops an excess property. `Object.keys` preserves the literal's
+// insertion order, which is the order the copy below writes the fields in.
+const AGENT_AUDIT_OPTIONAL_FIELD_SET: Record<AgentAuditOptionalField, true> = {
+  tenantId: true,
+  runId: true,
+  threadId: true,
+  resourceId: true,
+  principalKind: true,
+  principalId: true,
+  purpose: true,
+  delegatedBy: true,
+};
+
+const AGENT_AUDIT_OPTIONAL_FIELDS = Object.keys(
+  AGENT_AUDIT_OPTIONAL_FIELD_SET,
+) as readonly AgentAuditOptionalField[];
 
 /**
  * Read only the documented scalar fields from trusted request context.
@@ -125,6 +143,9 @@ export interface AuditEvent {
   resource: string;
   /** 'error' = the gate itself failed (evaluator/getActor threw), not a denial. */
   decision: 'allowed' | 'denied' | 'error';
+  decisionCode?: ConnectorDecisionCode;
+  retryable?: boolean;
+  policyKind?: ConnectorPolicyName;
   /** Human-readable decision or failure reason. */
   reason?: string;
   /** Additional structured fields supplied by the emitting boundary. */
@@ -168,19 +189,21 @@ export class AuditLogger {
       this.#buffer.splice(0, this.#buffer.length - this.#maxBuffered);
     }
     if (this.#sink) {
-      // Availability over export reliability: a failing sink must not abort
-      // the agent run. The buffer keeps the event; the error goes to
-      // onSinkError.
       try {
-        const result = this.#sink(stamped);
-        if (result instanceof Promise) {
-          result.catch((error: unknown) => this.#onSinkError?.(error, stamped));
-        }
+        Promise.resolve(this.#sink(stamped)).catch((error: unknown) => {
+          this.#reportSinkError(error, stamped);
+        });
       } catch (error) {
-        this.#onSinkError?.(error, stamped);
+        this.#reportSinkError(error, stamped);
       }
     }
     return stamped;
+  }
+
+  #reportSinkError(error: unknown, event: AuditEvent): void {
+    try {
+      Promise.resolve(this.#onSinkError?.(error, event)).catch(() => {});
+    } catch {}
   }
 
   /** Return a snapshot of the currently buffered events. */

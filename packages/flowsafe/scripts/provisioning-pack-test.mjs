@@ -40,6 +40,7 @@ function invokeProvision(cwd, args, env = {}) {
     cwd,
     env: { ...process.env, ...env },
     encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
     stdio: 'pipe',
   });
 }
@@ -70,8 +71,17 @@ if (typeof sql !== 'string') {
 const statePath = process.env.FAKE_WRANGLER_STATE;
 const state = existsSync(statePath)
   ? JSON.parse(readFileSync(statePath, 'utf8'))
-  : { created: false, tag: undefined, fence: false, fenceState: undefined };
+  : { created: false, tag: undefined, fence: false, fenceStage: 0, fenceState: undefined };
 const FENCE = 'flowsafe_execution_fence';
+const fenceColumns = [
+  ['id', 'TEXT', 0, 1, null], ['state', 'TEXT', 1, 0, null],
+  ['proof_key', 'TEXT', 0, 0, null], ['proof_run_id', 'TEXT', 0, 0, null],
+  ['updated_at', 'INTEGER', 1, 0, null], ['last_transition_request', 'TEXT', 0, 0, null],
+  ['transition_revision', 'INTEGER', 1, 0, '0'], ['mutation_epoch', 'INTEGER', 1, 0, '0'],
+  ['require_mutation_epoch', 'INTEGER', 1, 0, '0'],
+  ['proof_table_prefix', 'TEXT', 0, 0, null], ['proof_workflow_id', 'TEXT', 0, 0, null],
+  ['proof_start_token', 'TEXT', 0, 0, null],
+];
 const schema = \`CREATE TABLE flowsafe_deployment (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   tenant_tag TEXT NOT NULL,
@@ -86,16 +96,34 @@ if (sql.startsWith('SELECT name, sql')) {
     ...(state.created ? [{ name: 'flowsafe_deployment', sql: schema }] : []),
     ...(state.fence ? [{ name: FENCE, sql: 'CREATE' }] : []),
   ];
+  const padBytes = Number(process.env.FAKE_WRANGLER_PAD_BYTES ?? 0);
+  if (padBytes > 0) {
+    results.push({ name: 'sqlite_pad', sql: 'x'.repeat(padBytes) });
+  }
 } else if (sql.startsWith('CREATE TABLE IF NOT EXISTS ' + FENCE)) {
   state.fence = true;
+  results = [];
+} else if (sql === 'PRAGMA table_xinfo(' + FENCE + ')') {
+  results = state.fence ? fenceColumns.slice(0, 5 + state.fenceStage).map(([name, type, notnull, pk, dflt_value], cid) => ({ name, type, notnull, pk, dflt_value, cid, hidden: 0 })) : [];
+} else if (sql.startsWith('SELECT * FROM ' + FENCE)) {
+  results = state.fenceRow ? [state.fenceRow] : [];
+} else if (sql.startsWith('ALTER TABLE ' + FENCE + ' ADD COLUMN ')) {
+  const name = sql.slice(('ALTER TABLE ' + FENCE + ' ADD COLUMN ').length).split(' ')[0];
+  if (!state.fenceRow || name !== fenceColumns[5 + state.fenceStage]?.[0]) throw new Error('unexpected fence ALTER stage');
+  state.fenceRow[name] = fenceColumns[5 + state.fenceStage][4] === null ? null : 0;
+  state.fenceStage += 1;
   results = [];
 } else if (sql.startsWith('INSERT OR IGNORE INTO ' + FENCE)) {
   if (!state.fence) {
     process.stderr.write('fence row seeded before its table\\n');
     process.exit(5);
   }
-  state.fenceState =
-    state.fenceState ?? sql.match(/'deployment', '([^']+)'/)?.[1];
+  if (state.fenceStage === 0 && !state.fenceRow) {
+    const values = sql.match(/SELECT 'deployment', '([^']+)', NULL, NULL, '(\\d+)'/);
+    if (!values) throw new Error('invalid fence INSERT');
+    state.fenceState = values[1];
+    state.fenceRow = { id: 'deployment', state: values[1], proof_key: null, proof_run_id: null, updated_at: Number(values[2]) };
+  }
   results = [];
 } else if (sql.startsWith('CREATE TABLE')) {
   state.created = true;
@@ -238,8 +266,13 @@ import {
   INITIAL_EXECUTION_FENCE_STATES,
   deploymentIdentityHeaders,
 } from '@proofoftech/flowsafe/deployment-identity-protocol';
+const { ExecutionFenceUnreadableError: LegacyUnreadable } = await import(new URL('./node_modules/@proofoftech/flowsafe/dist/do-runner/execution-fence.js', import.meta.url));
+const { ExecutionFenceUnreadableError: HelperUnreadable, normalizeD1RunExecutionIdentity } = await import(new URL('./node_modules/@proofoftech/flowsafe/dist/do-runner/execution-admission.js', import.meta.url));
 
 const secret = 'x'.repeat(32);
+assert.equal(LegacyUnreadable, HelperUnreadable);
+assert.ok(new LegacyUnreadable('test') instanceof HelperUnreadable);
+assert.deepEqual(normalizeD1RunExecutionIdentity({ tablePrefix: 'Tenant_', workflowId: 'workflow', runId: 'run', startToken: 'generation' }), { tablePrefix: 'tenant_', workflowId: 'workflow', runId: 'run', startToken: 'generation' });
 assert.equal(typeof EXECUTION_FENCE_DDL, 'string');
 assert.equal(EXECUTION_FENCE_ROW_ID, 'deployment');
 assert.deepEqual(EXECUTION_FENCE_STATES, [
@@ -275,7 +308,22 @@ assert.deepEqual(
 import {
   DEPLOYMENT_IDENTITY_HEADER as LEGACY_DEPLOYMENT_IDENTITY_HEADER,
   deploymentIdentityHeaders as legacyDeploymentIdentityHeaders,
+  ExecutionFenceStore,
+  type ExecutionFenceReading,
+  type ExecutionFenceVersionedReading,
 } from '@proofoftech/flowsafe/do-runner';
+import {
+  type ExecutionFenceReading as HostReading,
+  type ExecutionFenceVersionedReading as HostVersionedReading,
+  type ExecutionFenceTransition,
+  executionFenceReadingPayload,
+} from '@proofoftech/flowsafe/host-kit';
+import * as RunnerAdmission from '@proofoftech/flowsafe/do-runner';
+import * as HostAdmission from '@proofoftech/flowsafe/host-kit';
+import {
+  type ActorContext, ApprovalService, createActorResolver,
+  createPrincipalActorContext, humanPrincipal, InMemoryApprovalStoreFactory,
+} from '@proofoftech/flowsafe/approval-api';
 
 const secret = 'x'.repeat(32);
 const headers: Record<string, string> = deploymentIdentityHeaders(secret);
@@ -288,6 +336,105 @@ void headers;
 void legacyHeaders;
 void header;
 void initialFenceState;
+const legacyReading: ExecutionFenceReading = { state: 'open' };
+const hostLegacyReading: HostReading = legacyReading;
+const command: ExecutionFenceTransition = {
+  expected: 'open', next: 'draining', expectedMutationEpoch: 0,
+  expectedRevision: 0, advanceMutationEpoch: true,
+};
+async function checkFenceTypes(store: ExecutionFenceStore) {
+  const versioned: ExecutionFenceVersionedReading = await store.read();
+  const hostVersioned: HostVersionedReading = executionFenceReadingPayload(versioned);
+  const epoch: number = hostVersioned.mutationEpoch;
+  await store.transition(command);
+  await store.recordProofRun('proof', 'run');
+  await store.recordProofRun('proof', 'run', versioned);
+  return { epoch, hostLegacyReading };
+}
+void checkFenceTypes;
+const physical = { tablePrefix: '', workflowId: 'workflow', runId: 'run', startToken: 'generation' };
+const logical = { owner: { kind: 'human', id: 'owner' }, target: { kind: 'workflow', id: 'workflow' } };
+const runIdentity: RunnerAdmission.RunExecutionIdentity = RunnerAdmission.normalizeRunExecutionIdentity(physical);
+const hostRunIdentity: HostAdmission.RunExecutionIdentity = runIdentity;
+const d1Identity: RunnerAdmission.D1RunExecutionIdentity = RunnerAdmission.normalizeD1RunExecutionIdentity(physical);
+const hostD1Identity: HostAdmission.D1RunExecutionIdentity = d1Identity;
+const startIdentity: RunnerAdmission.StartIdentity = RunnerAdmission.normalizeStartIdentity(logical);
+const hostStartIdentity: HostAdmission.StartIdentity = startIdentity;
+const executionIdentity: RunnerAdmission.StartExecutionIdentity = RunnerAdmission.normalizeStartExecutionIdentity({ ...physical, ...logical });
+const hostExecutionIdentity: HostAdmission.StartExecutionIdentity = executionIdentity;
+const d1StartIdentity: RunnerAdmission.D1StartExecutionIdentity = { ...d1Identity, ...startIdentity };
+const hostD1StartIdentity: HostAdmission.D1StartExecutionIdentity = d1StartIdentity;
+const epochContext: RunnerAdmission.MutationEpochContext = { mutationEpoch: 0 };
+const hostEpochContext: HostAdmission.MutationEpochContext = epochContext;
+for (const api of [RunnerAdmission, HostAdmission]) {
+  api.normalizeRunExecutionIdentity(physical);
+  api.normalizeD1RunExecutionIdentity(physical);
+  api.normalizeStartIdentity(logical);
+  api.normalizeStartExecutionIdentity({ ...physical, ...logical });
+  api.assertMutationEpoch({ mutationEpoch: 0, requireMutationEpoch: false }, api.normalizeMutationEpoch(0));
+  const wire = new Headers();
+  api.stampMutationEpoch(wire, 0);
+  api.mutationEpochFromHeader(wire.get(api.MUTATION_EPOCH_HEADER));
+  new api.InvalidExecutionIdentityError('runId');
+  new api.InvalidMutationEpochError();
+  new api.MutationEpochMismatchError('missing', 1);
+  new api.ExecutionFenceUnreadableError('test');
+}
+const legacyReservation: RunnerAdmission.StartReservation = {
+  key: 'key', owner: { kind: 'human', id: 'owner' }, targetKind: 'workflow',
+  targetId: 'workflow', runId: 'run', state: 'reserved', createdAt: 0, updatedAt: 0,
+};
+async function checkReservationTypes(store: RunnerAdmission.StartIdempotencyStore) {
+  const observed: RunnerAdmission.StartReservationReading | undefined = await store.read('key');
+  const binding: RunnerAdmission.StartReservationBinding | undefined = observed?.binding;
+  const reserved = await store.reserve({ key: 'key', owner: legacyReservation.owner, targetKind: 'workflow', targetId: 'workflow', mintRunId: () => 'run' });
+  const kind: 'legacy' | 'unbound' | 'bound' = reserved.reservation.binding.kind;
+  const claimed = await store.claimReservation(reserved.reservation);
+  if (claimed) {
+    await store.bindPreparedStart(claimed, executionIdentity);
+  }
+  await store.settleExecution(executionIdentity);
+  const alias = await store.reserve({ key: 'alias', owner: legacyReservation.owner, targetKind: 'workflow', targetId: 'workflow', mintRunId: () => 'run' });
+  await store.associateReservation(alias.reservation, executionIdentity);
+  const releasable = await store.reserve({ key: 'release', owner: legacyReservation.owner, targetKind: 'workflow', targetId: 'workflow', mintRunId: () => 'release-run' });
+  const releaseClaim = await store.claimReservation(releasable.reservation);
+  if (releaseClaim) await store.releaseReservation(releaseClaim);
+  // @ts-expect-error run-only claims are removed
+  await store.claim('key', 'run');
+  // @ts-expect-error run-only releases are removed
+  await store.release('key', 'run');
+  // @ts-expect-error run-only settlement is removed
+  await store.settleRun('run');
+  RunnerAdmission.admitsExistingRun({ state: 'proof-only', proofExecution: d1Identity }, d1Identity);
+  return { binding, kind };
+}
+void [hostRunIdentity, hostD1Identity, hostStartIdentity, hostExecutionIdentity, hostD1StartIdentity, hostEpochContext, checkReservationTypes];
+const actor = { id: 'owner', role: 'operator' } as const;
+const principal = humanPrincipal(actor);
+const factory = new InMemoryApprovalStoreFactory();
+const contextOptions = {
+  principal, storeFactory: factory,
+  buildService: (store: ReturnType<typeof factory.store>) => new ApprovalService({ store, executionFence: 'none' }),
+};
+const legacyContext: ActorContext = createPrincipalActorContext(contextOptions);
+const scopedContext: ActorContext = createPrincipalActorContext({ ...contextOptions, mutationEpoch: 2 });
+createActorResolver({ ...contextOptions, authenticate: () => actor, mutationEpoch: 2 });
+declare const hostInit: RunnerAdmission.InitResult;
+const legacyScope: RunnerAdmission.ThreadScope = { threadId: 'thread', principal, init: hostInit };
+const epochScope: RunnerAdmission.ThreadScope = { ...legacyScope, mutationEpoch: 2 };
+const legacyStart: HostAdmission.RunStartInput = { workflowId: 'workflow', runId: 'run', inputData: {}, principal };
+const epochStart: HostAdmission.RunStartInput = { ...legacyStart, mutationEpoch: 2 };
+const runtimeStart: RunnerAdmission.StartRunOptions = { runId: 'run', mutationEpoch: 2, requestedBy: actor.id, requestedByKind: 'human' };
+type EpochEnv = HostAdmission.FlowsafeWorkerEnv & { artifactEpoch: number };
+const workerConfig: HostAdmission.FlowsafeWorkerConfig<EpochEnv> = {
+  systemPrincipalId: 'system', workflows: [],
+  buildVerifier: () => ({ verify: async () => actor }),
+  maintenance: { sweepIntervalMs: 1000, purgeIntervalMs: 1000 },
+  mutationEpoch: env => env.artifactEpoch,
+};
+HostAdmission.createFlowsafeWorker(workerConfig);
+HostAdmission.createFlowsafeWorker({ ...workerConfig, mutationEpoch: 0 });
+void [legacyContext, scopedContext, legacyScope, epochScope, legacyStart, epochStart, runtimeStart];
 `,
   );
   writeFileSync(
@@ -528,7 +675,7 @@ void initialFenceState;
   );
   if (
     fenceDdlAt === -1 ||
-    fenceRowAt !== fenceDdlAt + 1 ||
+    fenceRowAt <= fenceDdlAt ||
     ownershipAt === -1 ||
     ownershipAt > fenceDdlAt
   ) {
@@ -536,7 +683,29 @@ void initialFenceState;
       `packed provisioning CLI did not seed the fence after proving ownership: ${JSON.stringify(executedSql)}`,
     );
   }
-  const seededState = JSON.parse(readFileSync(statePath, 'utf8')).fenceState;
+  const fenceAlters = executedSql.flatMap((sql, index) =>
+    sql.startsWith('ALTER TABLE flowsafe_execution_fence ADD COLUMN')
+      ? [index]
+      : [],
+  );
+  if (
+    fenceAlters.length !== 7 ||
+    fenceAlters.some((index) => index <= fenceRowAt)
+  ) {
+    throw new Error('fence columns were not added after the initial row');
+  }
+  const seededFence = JSON.parse(readFileSync(statePath, 'utf8'));
+  const seededState = seededFence.fenceState;
+  if (
+    seededFence.fenceStage !== 7 ||
+    ['proof_table_prefix', 'proof_workflow_id', 'proof_start_token'].some(
+      (name) => seededFence.fenceRow[name] !== null,
+    )
+  ) {
+    throw new Error(
+      'packed provisioning did not initialize null proof identity',
+    );
+  }
   if (seededState !== 'migration-locked') {
     throw new Error(
       `packed provisioning CLI seeded fence state '${seededState}', expected 'migration-locked'`,
@@ -623,6 +792,23 @@ void initialFenceState;
         `packed provisioning CLI passed incorrect preview Wrangler argv: ${JSON.stringify(invocation)}`,
       );
     }
+  }
+
+  const oversized = invokeProvision(consumerRoot, previewArgs, {
+    FAKE_WRANGLER_LOG: logPath,
+    FAKE_WRANGLER_STATE: statePath,
+    FAKE_WRANGLER_PAD_BYTES: String(1536 * 1024),
+  });
+  if (
+    oversized.status !== 0 ||
+    oversized.stdout !==
+      "Deployment identity 'acme' verified in consumer-db (preview), initial execution fence state 'open'.\n" ||
+    oversized.stderr !== ''
+  ) {
+    throw new Error(
+      `packed provisioning CLI failed on a Wrangler response above Node's default spawn capture (status=${oversized.status}, signal=${oversized.signal}, error=${oversized.error?.message ?? 'none'})\n${oversized.stderr}`,
+      { cause: oversized.error },
+    );
   }
 
   writeFileSync(

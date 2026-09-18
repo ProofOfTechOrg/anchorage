@@ -2,6 +2,8 @@
 
 Anchorage is a library, not a hosted control plane. Deploy one uniquely named Worker, D1 database, and set of Durable Object namespaces for each organization. The Worker script name is the Durable Object namespace boundary: replace the template's `replace-me` segment with the deployment tag and never reuse that script name for another organization. You also own optional R2 and Queue resources, the identity verifier, policies, maintenance schedules, and the provisioning system that keeps every resource set one-to-one.
 
+This reference configures the tenant application Worker. Run account-level Fleet operations in a separate [trusted control-plane Worker](fleet-control.md#run-the-trusted-control-plane-in-a-worker). Keep its provider token, Fleet/quota databases, and export bucket out of these tenant bindings.
+
 Choose one starting point:
 
 | Starting point | Use it for |
@@ -13,7 +15,7 @@ The baseline is intentionally smaller. Advanced features are supported and opt-i
 
 ## Cloudflare compatibility
 
-Use the Worker runtime with `nodejs_compat`, D1, and SQLite-backed Durable Objects. Treat Durable Object migration tags as append-only. Add a new migration tag when introducing the hub, thread, or provider-host class; never edit an already deployed tag.
+Use the Worker runtime with `nodejs_compat`, D1, and SQLite-backed Durable Objects. These settings belong to the tenant templates; the [Fleet host has its own runtime configuration](fleet-control.md#size-the-worker-for-its-workload). Treat Durable Object migration tags as append-only. Add a new migration tag when introducing the hub, thread, or provider-host class; never edit an already deployed tag.
 
 The checked-in configurations pin a compatibility date that the repository verifies. Review Cloudflare release notes before changing it.
 
@@ -32,7 +34,7 @@ Do not perform a physical-isolation cutover as an in-place update of a pooled Wo
 
 Provision the sentinel before application migrations or traffic. Install host-provided Wrangler `>=4.118 <5` in the application, then run `npx flowsafe-provision --database <database> --tag <tag> --initial-fence-state <open|migration-locked> --remote --config wrangler.jsonc`. Set distinct `DEPLOYMENT_IDENTITY_SECRET` and `MAINTENANCE_ADMIN_SECRET` values with `wrangler secret put`. Wrangler is not installed as a Flowsafe peer. The CLI is published with Flowsafe. It verifies the exact singleton schema, refuses to re-home an owned database, and refuses to adopt an unowned database that already contains application tables.
 
-The initial fence state is required and has no default. Choose `open` for an ordinary deployment or `migration-locked` for a deployment that must remain inert until a migration completes. A database created before Flowsafe 0.20 can lack the fence table or row; runtime reads treat that absence as `open` for upgrade compatibility.
+The initial fence state is required and has no default. Choose `open` for an ordinary deployment or `migration-locked` for a deployment that must remain inert until a migration completes. A database created before Flowsafe 0.20 can lack the table or have an empty five-column legacy table; those cases read as optional `open`. A missing row after any epoch/revision metadata column exists is unreadable and is never reseeded. Initialization adds the metadata columns without changing an existing row's state, proof fields, or timestamp; interrupted supported prefixes resume on retry.
 
 Treat `migration-locked` at birth as a verified postcondition. After provisioning, authenticate `GET /admin/execution-fence` and fail the provisioning operation unless the response state is `migration-locked`. This check also makes version skew loud: an older control plane that seeds a 0.20 database without establishing the required state cannot pass the postcondition.
 
@@ -94,7 +96,7 @@ Host routing belongs to the provisioning control plane. It must resolve a hostna
 | --- | --- | --- |
 | `DEPLOYMENT_TENANT` | None | Required provisioning tag. Protected routes return `503` unless it matches the D1 sentinel |
 | `DEPLOYMENT_IDENTITY_SECRET` | None | Required internal credential. Worker-to-Durable-Object requests fail before storage unless it matches |
-| `MAINTENANCE_ADMIN_SECRET` | None | Shared-secret credential. Execution-fence and inventory routes always return `503` when it is absent or malformed. Ensure-maintenance and maintenance-status instead accept a relayed fleet capability when `FLEET_MAINTENANCE_CAPABILITIES=required` and the secret is absent |
+| `MAINTENANCE_ADMIN_SECRET` | None | Shared-secret credential. Execution-fence and inventory routes always return `503` when it is absent or malformed. Ensure-maintenance and maintenance-status relay fleet capabilities when `FLEET_MAINTENANCE_CAPABILITIES=required`; a local Maintenance object retains this secret for receipt signing |
 | `APPROVAL_ACTOR_TOKENS` | Empty | Static verifier map. Empty means every authenticated route returns 401 |
 | `APPROVAL_SLA_SECONDS` | `14400` | SLA assigned to new approval records |
 | `APPROVAL_ALLOW_SELF_DECISION` | Unset | Separation of duties enabled. Accepts `true` or a comma-separated role list |
@@ -141,6 +143,10 @@ GET  /api/stream/run/:workflowId/:runId
 
 The stream routes mount only when streaming is configured. The approval create route is off unless the host explicitly enables its capability-free form.
 
+`POST /runs` accepts optional `requestContext`, a JSON object for non-reserved application values. A malformed shape or reserved key returns HTTP 400 with `reason: "reserved-context-key"`; the existing request-body bound still applies. Validation follows authentication and workflow authorization. The value reaches the run through the protected ordinary-start topology. Schedule starts use their verified stored target instead, including when that target omits context.
+
+Keyed retries validate context and execute host policy again. A valid divergent value does not replace the winning run's stored context or start another run. See [request-context precedence and persistence](do-runner-design.md#request-context).
+
 ### Control-plane routes
 
 The composed Worker mounts operational routes before tenant routers:
@@ -155,13 +161,41 @@ GET  /admin/maintenance-status
 
 The execution-fence and inventory routes require `Authorization: Bearer <maintenance_admin_secret>`. `MAINTENANCE_ADMIN_SECRET` must contain 32 to 256 visible ASCII characters and must differ from `DEPLOYMENT_IDENTITY_SECRET`. If the secret is absent, both routes return `503`; they never delegate authentication to a fleet capability.
 
-The ensure-maintenance and maintenance-status routes use the same shared-secret rule when `MAINTENANCE_ADMIN_SECRET` is configured. When `FLEET_MAINTENANCE_CAPABILITIES=required` and that secret is absent, they instead relay the caller's Ed25519 fleet capability token for downstream verification. The Worker does not compare the relayed token with a shared secret, and caps the credential at 2,048 characters.
+The ensure-maintenance and maintenance-status routes relay the caller’s Ed25519 fleet capability when `FLEET_MAINTENANCE_CAPABILITIES=required`, including when a local Maintenance object has a receipt-signing secret. A configured secret must still be well formed and distinct from deployment identity. The Maintenance object verifies the capability; a raw maintenance secret does not substitute for it. Without the required-capability marker, these routes use shared-secret authentication.
 
 The deployment-identity gate runs before every control-plane route, so a binding or sentinel mismatch still returns `503` before administration.
 
-`GET /admin/execution-fence` returns `{ state, proofKey?, proofRunId? }`. `POST /admin/execution-fence` accepts `{ expected, next, proofKey? }` and applies one CAS transition. A stale `expected` value returns `409` with `reason.code: 'FENCE_CAS_CONFLICT'` and the current state. The host owns transition policy; Flowsafe validates only the state vocabulary, CAS, and proof-key shape.
+`GET` and successful `POST /admin/execution-fence` return `{ state, mutationEpoch, requireMutationEpoch, transitionRevision, proofKey?, proofRunId? }`, without internal receipts. Optional mode has epoch zero and `requireMutationEpoch: false`. Every newly applied administrative command increments the revision, including a same-state command. Proof-run binding changes neither counter.
 
-`GET /admin/inventory` returns the category index. Add `?category=<category>&cursor=<cursor>&limit=<limit>` to page one category. Prove a drain only from `draining`: sweep every work category to empty twice, at least 60 seconds apart. Standing categories remain present by design, and persisted idle signals deliberately carry across the migration.
+`POST` accepts `{ expected, next, proofKey?, expectedMutationEpoch?, expectedRevision?, advanceMutationEpoch? }`. Supply both expected counters together as nonnegative safe-integer numbers. `advanceMutationEpoch` must be boolean when supplied; `true` requires the expected pair, increments the epoch once, and sets the sticky requirement in that same CAS. Ordinary state changes preserve the epoch and requirement. Invalid input returns `400`, and exhausted counters never wrap. The host owns state-transition policy; entering `proof-only` requires a path-safe proof key.
+
+An upgraded CAS compares state, epoch, and revision. An exact retry succeeds only while that exact command is the last applied upgraded command, preserving any subsequently bound proof run and the write timestamp. Matching the resulting state is not enough. An intervening admin command invalidates the retry. A valid mismatch returns `409` with `reason.code: 'FENCE_CAS_CONFLICT'`, the full current reading, and `reason.conflict: 'expectation-mismatch'`.
+
+Legacy `{ expected, next, proofKey? }` requests remain valid only before activation. They increment the revision, clear the previous upgraded receipt, and retain state-only ABA semantics. After activation, they return `409` with `reason.conflict: 'versioned-expectation-required'`. Storage failures, corrupt metadata, and write outcomes that strict readback cannot prove return `503` with `EXECUTION_FENCE_UNREADABLE`.
+
+Administrative metadata does not establish final-write run or schedule protection. Activate the requirement only for deployments whose writers all carry a final-write epoch check; schedule mutations do, asserting the caller epoch before the state gate and revalidating it inside the mutation's own batch, so a write that races an advancing epoch is refused or reported as an unknown outcome, never silently accepted. Use an authoritative D1 binding for administration and ordinary reads; an unconstrained replica facade cannot satisfy the store's freshness contract. The [runner design](do-runner-design.md#execution-fence-and-start-reservations) describes schema recovery, proof binding, and the legacy-absence limitation.
+
+Additive proof-identity columns preserve an active fence's epoch, revision, receipt, state, and timestamps. A complete stored proof identity includes its D1 prefix, workflow, run, and token. Admin reads and conflicts expose neither this identity nor its token; a newly applied admin command clears it with the proof-run binding, while an exact retry preserves it.
+
+Runtime, approval and signal proof gates compare the complete stored generation. The [identity-data helpers](do-runner-design.md#validate-execution-identity-data) validate representations without changing caller authority; an admin reading or validated identity alone cannot authorize execution or establish owning quiescence.
+
+`GET /admin/inventory` returns the category index. Add `?category=<category>&cursor=<cursor>&limit=<limit>` to page one category. Prove a drain only from `draining`: sweep every work category to empty twice, at least 60 seconds apart. A pending agent-inbox notification scheduled for later, or carrying no due timestamp, is work and keeps the proof open. Standing categories remain present by design, and persisted idle signals deliberately carry across the migration.
+
+### Configure the trusted caller epoch
+
+Set `mutationEpoch` on `createFlowsafeWorker()` to a nonnegative safe-integer number or a synchronous callback of the deployment environment. The factory captures the configured source once; each fetch captures its value before the first deployment-verification await. A callback must return a number or `undefined`, not a string, Promise or thenable. Invalid values return `400` before authentication or route work; invalid scalar configuration fails at construction.
+
+`createActorResolver()` and `createPrincipalActorContext()` also accept a scalar epoch. Custom resolvers must derive it from trusted host or verified credential data, never a client-selected field.
+
+The topologies stamp `x-flowsafe-mutation-epoch` for internal calls, replacing or removing incoming values. `createActorResolver()` refuses that header on public requests. Both Durable Object shells capture it before deployment verification and decode the captured value only afterward.
+
+[Roll out an artifact under the execution fence](fleet-control.md#roll-out-an-artifact-under-the-execution-fence) in the Fleet Control guide carries the procedure that applies this configuration.
+
+Fenced Runtime starts enforce the captured caller epoch at the initial D1 write and bind their generated execution identity with the winning claim and proof. Both hosts journal preparation and recover only exact owned generations. Generation-aware retention still requires implementation and acceptance before enabling artifact epochs across the deployment. An explicitly unfenced Runtime retains ordinary persistence and supplies no atomic fence guarantee.
+
+Custom run-router idempotency wiring must supply the topology's private `persistedStart(workflowId, runId)` callback alongside its store, fence and liveness probe. It carries one observed identity/result internally; ordinary public status is not a substitute. Use `claimReservation`, `releaseReservation`, `associateReservation`, `bindPreparedStart` and `settleExecution` with their exact observations. The old run-only methods and HTTP rollback helper are removed.
+
+The liveness callback must observe the owning execution surface and reject when that observation is unavailable. Returning `false` permits reclaiming an existing reserved key with no persisted result. The built-in topologies require a valid boolean response, and the agent host includes Core's retained stream registrations.
 
 ### Advanced routes
 
@@ -213,6 +247,15 @@ Other route factories accept a `basePath` when the exact public prefix is host-s
 
 Use the exported router and topology factories rather than recreating their gate order.
 
+The start policy receives the validated application context:
+
+| Composition | Hook signature |
+| --- | --- |
+| Direct router | `beforeStart(context, workflowId, inputData, requestContext)` |
+| Composed Worker | `beforeStart(context, env, workflowId, inputData, requestContext)` |
+
+Omitted context arrives as `undefined`. Existing hooks with fewer parameters remain compatible. The hook returns `Promise<void>`; reject a start by throwing a caller-safe `RunRouteError`. Its return value does not supply context. Apply business attribution rules here before the router chooses a new start or keyed replay.
+
 ## Alarm-driven maintenance
 
 The fixed maintenance Durable Object schedules four independent duties:
@@ -253,7 +296,7 @@ TTL retention, authorized domain deletion, and deployment decommissioning are se
 | Schedule triggers | Opt-in fire-history TTL |
 | Background tasks | Terminal-state TTL |
 | Provider subscriptions | No TTL; authorized deletion or deployment decommissioning |
-| `flowsafe_execution_fence` | Singleton deployment control row; no TTL. An absent pre-0.20 row reads as `open` |
+| `flowsafe_execution_fence` | Singleton deployment state, epoch, requirement, revision, and private last-command receipt; no TTL. Only legacy absence reads as optional `open` |
 | `flowsafe_start_idempotency` | Terminal reservations remain for at least the run-summary horizon, then purge with run retention |
 | `flowsafe_resource_owners` | Run retention and schedule deletion release their claims. Thread and resource claims require explicit host teardown or deployment decommissioning |
 | R2 artifacts | Delete with the owning snapshot purge and deployment decommissioning |

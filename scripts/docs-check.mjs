@@ -12,13 +12,15 @@ import {
   resolve,
   sep,
 } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import GithubSlugger from 'github-slugger';
 import { toString as markdownText } from 'mdast-util-to-string';
 import remarkGfm from 'remark-gfm';
 import remarkParse from 'remark-parse';
 import { unified } from 'unified';
 import { visit } from 'unist-util-visit';
+
+import { isInvokedAsEntryPoint } from './entry-point.mjs';
 
 const IGNORED_DIRECTORIES = new Set([
   '.git',
@@ -32,9 +34,10 @@ const INTERNAL_MILESTONE_PATTERN =
   /\b(?:CI-M-\d{3}(?:-\d{3})?|DL-\d{3}|INV-\d+|M-\d{3}|RA-\d{3}|[A-Z]-S\d+|R-[A-Z0-9][A-Z0-9-]*|[A-Z]-D\d+|D(?:[2-9]|\d{2,})|F\d+|P\d+(?:-lite)?|Track [A-Z]|Phase \d+)\b/g;
 const VOLATILE_COUNT_PATTERN =
   /(?<![\w.-])\d[\d,]*(?![.\d])\s+(?:tests?|test files?|packages?)\b/gi;
+const REPOSITORY_URL = 'https://github.com/ProofOfTechOrg/anchorage';
 const REQUIRED_PUBLIC_URLS = [
   'https://anchorage.proofoftech.org/',
-  'https://github.com/ProofOfTechOrg/anchorage',
+  REPOSITORY_URL,
   'https://www.npmjs.com/package/@proofoftech/breakwater',
   'https://www.npmjs.com/package/@proofoftech/flowsafe',
   'https://www.npmjs.com/package/@proofoftech/fleet-control',
@@ -253,11 +256,7 @@ function splitLocalTarget(target) {
   };
 }
 
-function resolveLocalTarget(root, sourceFile, target) {
-  const split = splitLocalTarget(target);
-  const candidate = split.path
-    ? resolve(dirname(sourceFile), split.path)
-    : sourceFile;
+function resolveAgainstRoot(root, split, candidate) {
   const relativeToRoot = relative(root, candidate);
   if (
     isAbsolute(relativeToRoot) ||
@@ -277,6 +276,63 @@ function resolveLocalTarget(root, sourceFile, target) {
     path: existsSync(readme) ? readme : candidate,
     directoryWithoutReadme: !existsSync(readme),
   };
+}
+
+function resolveLocalTarget(root, sourceFile, target) {
+  const split = splitLocalTarget(target);
+  const candidate = split.path
+    ? resolve(dirname(sourceFile), split.path)
+    : sourceFile;
+  return resolveAgainstRoot(root, split, candidate);
+}
+
+// Link diagnostics shared by the absolute and relative branches. Each returns
+// its message or `undefined`, so a caller decides whether to stop at the
+// first.
+function localTargetError(resolved, target) {
+  if (resolved.outsideRoot) {
+    return `link escapes the repository: ${target}`;
+  }
+  if (!existsSync(resolved.path)) {
+    return `link target does not exist: ${target}`;
+  }
+  if (resolved.directoryWithoutReadme) {
+    return `linked directory has no README.md: ${target}`;
+  }
+  return undefined;
+}
+
+function internalFileError(root, sourceFile, resolved, target) {
+  const targetRelative = toPosix(relative(root, resolved.path));
+  if (
+    basename(sourceFile).toLowerCase() !== 'claude.md' &&
+    (basename(resolved.path).toLowerCase() === 'claude.md' ||
+      targetRelative.split('/').includes('.notes') ||
+      (!targetRelative.startsWith('docs/proposals/') &&
+        /(?:^|[-_])(?:plan|roadmap)(?:[-_.]|$)/i.test(basename(resolved.path))))
+  ) {
+    return `public documentation links to an internal file: ${target}`;
+  }
+  return undefined;
+}
+
+const REPOSITORY_BLOB_PREFIX = `${REPOSITORY_URL}/blob/main/`;
+const GITHUB_LINE_FRAGMENT_PATTERN = /^L\d+(?:C\d+)?(?:-L\d+(?:C\d+)?)?$/;
+
+// A copy-ready README cannot carry a relative link out of its package, so it
+// names such a file or heading through the permanent GitHub URL instead.
+// Resolve that URL back into this repository, with or without a fragment. The
+// package-boundary guard stays on the relative branch, because a permanent
+// GitHub URL is the remedy it prescribes.
+// A URL that does not match the prefix (another host, a `tree/` path, a
+// `blob/<sha>` pin) is left to the `--external` run, which fetches it and
+// fails on 404/410; that run cannot see a bad fragment, because GitHub answers
+// 200 for one.
+function repositoryBlobTarget(root, target) {
+  if (!target.startsWith(REPOSITORY_BLOB_PREFIX)) return undefined;
+  const split = splitLocalTarget(target.slice(REPOSITORY_BLOB_PREFIX.length));
+  if (!split.path) return undefined;
+  return resolveAgainstRoot(root, split, resolve(root, split.path));
 }
 
 function manifestFileIncludes(manifest, packageRelativePath) {
@@ -347,6 +403,28 @@ function checkLocalLinks(root, markdownFiles, manifests) {
     return result;
   };
 
+  // Shared by both link branches like the diagnostics above, but declared
+  // here because it reads the anchor cache. A link with no fragment has
+  // nothing to check.
+  const anchorError = (resolved) => {
+    if (
+      resolved.anchor &&
+      extname(resolved.path).toLowerCase() === '.md' &&
+      !anchorsFor(resolved.path).has(resolved.anchor)
+    ) {
+      return `Markdown anchor does not exist: #${resolved.anchor}`;
+    }
+    return undefined;
+  };
+
+  // A permanent GitHub URL can address a line or a line range with GitHub's
+  // own `#L12`, `#L12-L20` or column-qualified grammar, which names no
+  // Markdown heading.
+  const absoluteAnchorError = (resolved) =>
+    GITHUB_LINE_FRAGMENT_PATTERN.test(resolved.anchor ?? '')
+      ? undefined
+      : anchorError(resolved);
+
   for (const sourceFile of markdownFiles) {
     const markdown = readFileSync(sourceFile, 'utf8');
     const packageContext = shippedPackageContext(sourceFile, manifests);
@@ -379,6 +457,19 @@ function checkLocalLinks(root, markdownFiles, manifests) {
               `external URL is invalid: ${link.target}`,
             ),
           );
+          continue;
+        }
+        const inRepository = repositoryBlobTarget(root, link.target);
+        if (inRepository) {
+          // Report the first message `localTargetError`, `internalFileError`
+          // or `absoluteAnchorError` returns.
+          const message =
+            localTargetError(inRepository, link.target) ??
+            internalFileError(root, sourceFile, inRepository, link.target) ??
+            absoluteAnchorError(inRepository);
+          if (message) {
+            errors.push(diagnostic(root, sourceFile, link.line, message));
+          }
         }
         continue;
       }
@@ -395,58 +486,20 @@ function checkLocalLinks(root, markdownFiles, manifests) {
       }
 
       const resolved = resolveLocalTarget(root, sourceFile, link.target);
-      if (resolved.outsideRoot) {
-        errors.push(
-          diagnostic(
-            root,
-            sourceFile,
-            link.line,
-            `link escapes the repository: ${link.target}`,
-          ),
-        );
-        continue;
-      }
-      if (!existsSync(resolved.path)) {
-        errors.push(
-          diagnostic(
-            root,
-            sourceFile,
-            link.line,
-            `link target does not exist: ${link.target}`,
-          ),
-        );
-        continue;
-      }
-      if (resolved.directoryWithoutReadme) {
-        errors.push(
-          diagnostic(
-            root,
-            sourceFile,
-            link.line,
-            `linked directory has no README.md: ${link.target}`,
-          ),
-        );
+      const targetError = localTargetError(resolved, link.target);
+      if (targetError) {
+        errors.push(diagnostic(root, sourceFile, link.line, targetError));
         continue;
       }
 
-      const targetRelative = toPosix(relative(root, resolved.path));
-      if (
-        basename(sourceFile).toLowerCase() !== 'claude.md' &&
-        (basename(resolved.path).toLowerCase() === 'claude.md' ||
-          targetRelative.split('/').includes('.notes') ||
-          (!targetRelative.startsWith('docs/proposals/') &&
-            /(?:^|[-_])(?:plan|roadmap)(?:[-_.]|$)/i.test(
-              basename(resolved.path),
-            )))
-      ) {
-        errors.push(
-          diagnostic(
-            root,
-            sourceFile,
-            link.line,
-            `public documentation links to an internal file: ${link.target}`,
-          ),
-        );
+      const internalError = internalFileError(
+        root,
+        sourceFile,
+        resolved,
+        link.target,
+      );
+      if (internalError) {
+        errors.push(diagnostic(root, sourceFile, link.line, internalError));
       }
 
       if (packageContext) {
@@ -468,19 +521,9 @@ function checkLocalLinks(root, markdownFiles, manifests) {
         }
       }
 
-      if (
-        resolved.anchor &&
-        extname(resolved.path).toLowerCase() === '.md' &&
-        !anchorsFor(resolved.path).has(resolved.anchor)
-      ) {
-        errors.push(
-          diagnostic(
-            root,
-            sourceFile,
-            link.line,
-            `Markdown anchor does not exist: #${resolved.anchor}`,
-          ),
-        );
+      const anchorMessage = anchorError(resolved);
+      if (anchorMessage) {
+        errors.push(diagnostic(root, sourceFile, link.line, anchorMessage));
       }
     }
   }
@@ -768,17 +811,16 @@ function markdownGraph(root, markdownFiles) {
   for (const sourceFile of markdownFiles) {
     const targets = new Set();
     for (const link of collectMarkdownLinks(readFileSync(sourceFile, 'utf8'))) {
+      if (!link.target || isIgnoredScheme(link.target)) continue;
+      // A permanent GitHub URL into this repository is an edge like a
+      // relative link, so reachability resolves it the way `checkLocalLinks`
+      // does.
+      const resolved = isExternal(link.target)
+        ? repositoryBlobTarget(root, link.target)
+        : resolveLocalTarget(root, sourceFile, link.target);
       if (
-        !link.target ||
-        isExternal(link.target) ||
-        isIgnoredScheme(link.target)
-      ) {
-        continue;
-      }
-      const resolved = resolveLocalTarget(root, sourceFile, link.target);
-      if (
+        resolved &&
         !resolved.outsideRoot &&
-        existsSync(resolved.path) &&
         extname(resolved.path).toLowerCase() === '.md' &&
         known.has(resolved.path)
       ) {
@@ -1019,9 +1061,6 @@ async function main() {
   }
 }
 
-const invokedPath = process.argv[1]
-  ? pathToFileURL(resolve(process.argv[1])).href
-  : undefined;
-if (invokedPath === import.meta.url) {
+if (isInvokedAsEntryPoint(import.meta.url)) {
   await main();
 }

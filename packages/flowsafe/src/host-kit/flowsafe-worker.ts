@@ -1,14 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-// createFlowsafeWorker — the whole production-Worker skeleton the deploy
-// template and the showcase host previously carried as near-byte copies:
-// the /healthz → routers → 404 fetch pipeline over one actor resolver, the
-// alarm-driven maintenance (deadline, sweep, purge, and optional schedule tick
-// never share an invocation). Hosts stay thin shells: they supply workflows,
-// their identity seam (buildVerifier), and their deployment-specific hooks —
-// preRoutes (extra unauthenticated/authenticated mounts), beforeStart/
-// beforeResume (e.g. a budget charge), notify (reviewer-facing transport), and
-// extraPurgeDuties (e.g. a host-specific purge). Everything here is structural:
-// host-kit never imports @cloudflare/workers-types.
 
 import type {
   ActorContext,
@@ -36,14 +26,20 @@ import {
   createAuditProxyQueue,
   type InfrastructureAuditEnvelope,
 } from '../audit-export/index.js';
+import { parseRunRetentionCursor } from '../do-runner/d1-storage.js';
 import { credentialsMatch } from '../do-runner/deployment-identity.js';
 import type { DurableObjectRunLifecycleHooks } from '../do-runner/durable-object.js';
+import {
+  InvalidMutationEpochError,
+  normalizeMutationEpoch,
+} from '../do-runner/execution-admission.js';
 import type {
   DeploymentIdentityDatabase,
   ExecutionFenceStore,
   PurgeExpiredBackgroundTasksResult,
   RunArtifactPurger,
   RunDeadlineCursor,
+  RunRetentionCursor,
   SnapshotDatabase,
   StartIdempotencyStore,
 } from '../do-runner/index.js';
@@ -88,6 +84,7 @@ import {
 import {
   approvalStoreFactoryFor,
   buildHostApprovalService,
+  hostErrorText,
   type MaintenanceOutcome,
   maintenancePrincipal,
   reconcileApprovalsOnStatusDetached,
@@ -205,8 +202,7 @@ export interface FlowsafeWorkerEnv {
   FLEET_DEPLOYMENT_SCRIPT?: string;
   /** Fleet resource group stamped onto trusted state. */
   FLEET_RESOURCE_GROUP?: string;
-  /** Distinguishes the trusted state runtime from an external candidate. */
-  FLEET_RESOURCE_ROLE?: 'platform-state';
+  FLEET_RESOURCE_ROLE?: 'platform-state' | 'platform-catalog';
   /** Per-deployment Worker-to-Durable-Object credential. */
   DEPLOYMENT_IDENTITY_SECRET: string;
   /** The runner DO namespace createDoRunTopology drives. */
@@ -333,6 +329,11 @@ export interface FlowsafeRunnerLifecycleConfig<Env extends FlowsafeWorkerEnv> {
 
 export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv>
   extends FlowsafeRunnerLifecycleConfig<Env> {
+  /**
+   * Trusted host epoch, captured before request authentication and storage waits.
+   * Callbacks return a number or undefined synchronously; client headers cannot supply it.
+   */
+  mutationEpoch?: number | ((env: Env) => unknown);
   /** The catalog createRunRouter serves and gates (hosts pass their metas). */
   workflows: ReadonlyArray<WorkflowMeta>;
   /**
@@ -374,6 +375,7 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv>
     env: Env,
     workflowId: string,
     inputData: unknown,
+    requestContext: Record<string, unknown> | undefined,
   ) => Promise<void>;
   /** Host policy immediately before a validated raw resume reaches the run DO. */
   beforeResume?: (
@@ -458,7 +460,10 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv>
    * (which needs the schedules store, its run-start seam — topology.start — and
    * the run-cap + audit config) and returns the closure here. The composer runs
    * it as its OWN failure-isolated alarm duty (own try/catch,
-   * own `schedule-tick` log line). INJECTED (not built here, structurally typed as
+   * own `schedule-tick` log line). The composer invokes THIS BUILDER outside
+   * that try, so a builder that throws is logged as `maintenance-error` with
+   * `surface: 'tick-duty'`; build a factory that can refuse at construction
+   * inside the returned closure. INJECTED (not built here, structurally typed as
    * `() => Promise<unknown>`) because createScheduleTick lives in `schedules/`,
    * which transitively imports host-kit — host-kit importing it back would cycle.
    * Absent (or `tickIntervalMs` unset) ⇒ no tick invocation.
@@ -484,16 +489,9 @@ interface ConfiguredApprovalServiceOptions {
   notify?: ApprovalNotificationSink;
   allowSelfDecision: SelfDecisionPolicy;
   stream?: ApprovalStreamSink;
-  /**
-   * REQUIRED, unlike its optional counterpart on HostApprovalServiceOptions:
-   * this interface is internal to the composer, both of its call sites are in
-   * this file, and every service the composer builds sits on a database whose
-   * fence it can name. Making it required is what keeps a third call site from
-   * being added later that silently builds an unfenced service — which would
-   * let a decision commit durably on a migration-locked deployment and then
-   * fail to resume.
-   */
+  /** Every composed service uses the captured database fence and namespace. */
   executionFence: ExecutionFenceStore;
+  workflowTablePrefix: string;
 }
 
 function buildConfiguredApprovalService<Env extends FlowsafeWorkerEnv>(
@@ -519,6 +517,7 @@ function buildConfiguredApprovalService<Env extends FlowsafeWorkerEnv>(
     allowSelfDecision: options.allowSelfDecision,
     stream: options.stream,
     executionFence: options.executionFence,
+    workflowTablePrefix: options.workflowTablePrefix,
   });
 }
 
@@ -551,6 +550,7 @@ export function createFlowsafeRunnerLifecycle<Env extends FlowsafeWorkerEnv>(
   const service = buildConfiguredApprovalService(config, env, topology, {
     store: approvalStoreFactoryFor(env.DB, storageTablePrefix).store(),
     executionFence: executionFenceForEnv(env),
+    workflowTablePrefix: (storageTablePrefix ?? '').toLowerCase(),
     waitUntil: options.waitUntil,
     notify: config.notify?.(env),
     allowSelfDecision,
@@ -665,9 +665,42 @@ async function validateFleetChannelTopology<Env extends FlowsafeWorkerEnv>(
 
 export type MaintenanceDuty = 'deadline' | 'sweep' | 'purge' | 'tick';
 
+/**
+ * The cursor seam a duty resumes from and advances. Each field is optional
+ * because the deadline duty and the retention purge own one pair each, and a
+ * caller driving one duty has nothing to say about the other's cursor. The
+ * purge takes `MaintenancePurgeDutyContext` instead, which requires its half.
+ * The deadline duty reads `deadlineCursor` only alongside
+ * `advanceDeadlineCursor`: a cursor supplied without the callback that
+ * advances it is ignored.
+ */
 export interface MaintenanceDutyContext {
   deadlineCursor?: RunDeadlineCursor;
   advanceDeadlineCursor?(cursor: RunDeadlineCursor): Promise<void>;
+  retentionCursor?: RunRetentionCursor;
+  advanceRetentionCursor?(cursor: RunRetentionCursor): Promise<void>;
+}
+
+/**
+ * The retention purge's own context. `advanceRetentionCursor` is required here
+ * because the layer it feeds requires it: `purgeExpiredWorkflowRuns` declares
+ * `advanceCursor` non-optional (do-runner/d1-storage.ts), and a purge with
+ * nowhere to record its progress rescans the same terminal rows on every
+ * alarm. The type keeps a typed host from omitting it; `hasRetentionCursorSeam`
+ * refuses an untyped one under `config-error` before any purge surface runs,
+ * rather than letting the purge report a `retention-purge` failure.
+ */
+export interface MaintenancePurgeDutyContext extends MaintenanceDutyContext {
+  advanceRetentionCursor(cursor: RunRetentionCursor): Promise<void>;
+}
+
+const RETENTION_CURSOR_SEAM_REASON =
+  'retention purge requires advanceRetentionCursor';
+
+function hasRetentionCursorSeam(
+  context: MaintenanceDutyContext | undefined,
+): context is MaintenancePurgeDutyContext {
+  return typeof context?.advanceRetentionCursor === 'function';
 }
 
 /** The Worker handler plus the maintenance duty seam consumed by its DO. */
@@ -677,8 +710,14 @@ export interface FlowsafeWorker<Env extends FlowsafeWorkerEnv> {
     env: Env,
     ctx: FlowsafeWorkerContext,
   ): Promise<Response>;
+  /** The purge duty requires the retention cursor seam; the others do not. */
   runMaintenanceDuty(
-    duty: MaintenanceDuty,
+    duty: 'purge',
+    env: Env,
+    context: MaintenancePurgeDutyContext,
+  ): Promise<MaintenanceOutcome>;
+  runMaintenanceDuty(
+    duty: Exclude<MaintenanceDuty, 'purge'>,
     env: Env,
     context?: MaintenanceDutyContext,
   ): Promise<MaintenanceOutcome>;
@@ -694,22 +733,6 @@ function json(payload: unknown, status = 200): Response {
 const MAINTENANCE_ADMIN_SECRET_PATTERN = /^[\x21-\x7e]{32,256}$/;
 const FLEET_SPEC_DIGEST_PATTERN = /^[a-f0-9]{64}$/;
 
-/**
- * What the shared admin gate decided. A union rather than `Response | null`
- * because an authorized answer carries two things a caller needs: the
- * credential the request presented, which the maintenance route forwards to its
- * Durable Object on the delegating path below, and WHETHER this was that
- * delegating path. Recovering the credential by re-reading the header would
- * either re-duplicate the Bearer extraction this gate exists to own, or need an
- * unreachable `undefined` branch to satisfy the types.
- *
- * `delegated` is reported rather than re-derived for the stronger reason: the
- * rule that makes `MAINTENANCE_ADMIN_SECRET === undefined` mean "delegating" is
- * enforced HERE — an absent secret refuses outright unless the caller asked to
- * delegate — so a route re-testing the env var is restating a decision it
- * cannot see, and would keep answering `true` if this gate's policy ever
- * changed. One decision, reported once.
- */
 type AdminCredentialDecision =
   | {
       readonly authorized: true;
@@ -722,38 +745,13 @@ type AdminCredentialDecision =
     }
   | { readonly authorized: false; readonly response: Response };
 
-/**
- * The credential preamble EVERY /admin surface runs before it does anything.
- *
- * One function rather than a copy per route because this is the trust boundary
- * itself (docs/security-threat-model.md, "The provisioning boundary"): it
- * proves MAINTENANCE_ADMIN_SECRET is configured, proves it is DISTINCT from the
- * deployment identity secret (sharing them would let a Worker-to-DO credential
- * move the fence, and vice versa), and constant-time compares the request's
- * Bearer token against it. A second copy is a second place for one of those
- * three to be dropped in a hurry, and the inventory route lands here next.
- *
- * The surfaces differ in exactly ONE thing, which is why it is a parameter
- * rather than a fork: what an ABSENT secret means. `/admin/execution-fence`
- * always refuses — the fence is the control that stops a deployment executing,
- * so an unauthenticated caller must never reach it. The maintenance routes
- * delegate instead when the fleet requires capability tokens, because there the
- * Durable Object verifies a signed capability and this Worker is only a relay;
- * the longer credential cap applies to that path alone, since a capability
- * token is not a shared secret.
- */
 async function authorizeAdminCredential<Env extends FlowsafeWorkerEnv>(
   request: Request,
   env: Env,
   options: {
     /** Names the surface in the config-error log and the 503 body. */
     readonly surface: string;
-    /**
-     * Whether an absent MAINTENANCE_ADMIN_SECRET delegates authentication
-     * downstream rather than refusing. The caller folds its own policy into
-     * this boolean so the gate stays about credentials only.
-     */
-    readonly delegateWhenUnconfigured: boolean;
+    readonly delegateCapability: boolean;
   },
 ): Promise<AdminCredentialDecision> {
   const { surface } = options;
@@ -775,12 +773,11 @@ async function authorizeAdminCredential<Env extends FlowsafeWorkerEnv>(
     response: json({ error: 'authentication required' }, 401),
   });
   const expected = env.MAINTENANCE_ADMIN_SECRET;
-  const delegating = expected === undefined && options.delegateWhenUnconfigured;
-  if (!delegating) {
-    if (
-      expected === undefined ||
-      !MAINTENANCE_ADMIN_SECRET_PATTERN.test(expected)
-    ) {
+  const delegating = options.delegateCapability;
+  if (expected === undefined) {
+    if (!delegating) return unavailable(`${surface} is not configured`);
+  } else {
+    if (!MAINTENANCE_ADMIN_SECRET_PATTERN.test(expected)) {
       return unavailable(`${surface} is not configured`);
     }
     if (await credentialsMatch(expected, env.DEPLOYMENT_IDENTITY_SECRET)) {
@@ -795,6 +792,7 @@ async function authorizeAdminCredential<Env extends FlowsafeWorkerEnv>(
     return unauthenticated();
   }
   if (
+    !delegating &&
     expected !== undefined &&
     !(await credentialsMatch(credential, expected))
   ) {
@@ -826,10 +824,7 @@ async function maintenanceAdminResponse<Env extends FlowsafeWorkerEnv>(
   }
   const gate = await authorizeAdminCredential(request, env, {
     surface: 'maintenance administration',
-    // An unconfigured secret is survivable HERE and only here: a fleet that
-    // requires capability tokens authenticates at the maintenance DO, which
-    // verifies a signed capability this Worker only relays.
-    delegateWhenUnconfigured: env.FLEET_MAINTENANCE_CAPABILITIES === 'required',
+    delegateCapability: env.FLEET_MAINTENANCE_CAPABILITIES === 'required',
   });
   if (!gate.authorized) return gate.response;
   const deploymentSpecDigest = env.FLEET_SPEC_DIGEST;
@@ -936,7 +931,7 @@ async function executionFenceAdminResponse<Env extends FlowsafeWorkerEnv>(
     // Unconfigured is 503, never open: the fence is the control that stops a
     // deployment executing, so an unauthenticated caller must never move it.
     // There is no capability-token relay behind this route to delegate to.
-    delegateWhenUnconfigured: false,
+    delegateCapability: false,
   });
   if (!gate.authorized) return gate.response;
   const fence = executionFenceForEnv(env);
@@ -972,13 +967,19 @@ async function executionFenceAdminResponse<Env extends FlowsafeWorkerEnv>(
       expected?: unknown;
       next?: unknown;
       proofKey?: unknown;
+      expectedMutationEpoch?: unknown;
+      expectedRevision?: unknown;
+      advanceMutationEpoch?: unknown;
     };
     const reading = await fence.transition({
       expected: assertExecutionFenceState(body.expected, 'expected'),
       next: assertExecutionFenceState(body.next, 'next'),
       ...(body.proofKey === undefined ? {} : { proofKey: body.proofKey }),
+      expectedMutationEpoch: body.expectedMutationEpoch,
+      expectedRevision: body.expectedRevision,
+      advanceMutationEpoch: body.advanceMutationEpoch,
     });
-    return json({ state: reading.state });
+    return json(executionFenceReadingPayload(reading));
   } catch (error) {
     if (error instanceof DoStatusError) {
       return json(
@@ -992,7 +993,7 @@ async function executionFenceAdminResponse<Env extends FlowsafeWorkerEnv>(
     console.error(
       JSON.stringify({
         type: 'execution-fence-admin-error',
-        reason: error instanceof Error ? error.message : String(error),
+        reason: hostErrorText(error, true),
       }),
     );
     return json({ error: 'execution fence administration failed' }, 500);
@@ -1057,7 +1058,7 @@ async function inventoryAdminResponse<Env extends FlowsafeWorkerEnv>(
     // Unconfigured is 503, never open: this read enumerates every outstanding
     // run, approval, and reservation on the deployment. There is no capability
     // relay behind it to delegate to, either.
-    delegateWhenUnconfigured: false,
+    delegateCapability: false,
   });
   if (!gate.authorized) return gate.response;
   try {
@@ -1104,7 +1105,7 @@ async function inventoryAdminResponse<Env extends FlowsafeWorkerEnv>(
     console.error(
       JSON.stringify({
         type: 'inventory-admin-error',
-        reason: error instanceof Error ? error.message : String(error),
+        reason: hostErrorText(error, true),
       }),
     );
     return json({ error: 'deployment inventory failed' }, 500);
@@ -1114,6 +1115,8 @@ async function inventoryAdminResponse<Env extends FlowsafeWorkerEnv>(
 export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
   config: FlowsafeWorkerConfig<Env>,
 ): FlowsafeWorker<Env> {
+  const epochSource = config.mutationEpoch;
+  if (typeof epochSource !== 'function') normalizeMutationEpoch(epochSource);
   const storageTablePrefix = validateTablePrefix(
     config.storageTablePrefix,
     'storageTablePrefix',
@@ -1126,8 +1129,10 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
     notify: ApprovalNotificationSink | undefined,
     selfDecision: SelfDecisionPolicy,
     stream: ApprovalStreamSink | undefined,
+    mutationEpoch: number | undefined,
   ): ActorResolver => {
     const base = createActorResolver({
+      mutationEpoch,
       authenticate: bearerActorAuthenticator(config.buildVerifier(env)),
       storeFactory: approvalStoreFactoryFor(env.DB, storageTablePrefix),
       deploymentTag: env.DEPLOYMENT_TENANT,
@@ -1135,6 +1140,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         buildConfiguredApprovalService(config, env, topology, {
           store,
           executionFence: executionFenceForEnv(env),
+          workflowTablePrefix: (storageTablePrefix ?? '').toLowerCase(),
           waitUntil,
           notify,
           stream,
@@ -1176,10 +1182,11 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
   async function runPurgeMaintenance(
     env: Env,
     trigger: string,
+    context: MaintenancePurgeDutyContext,
   ): Promise<MaintenanceOutcome> {
     const failures: string[] = [];
     const recordFailure = (surface: string, error: unknown): void => {
-      const failure = String(error);
+      const failure = hostErrorText(error).slice(0, 256);
       failures.push(`${surface}: ${failure}`);
       console.error(
         JSON.stringify({
@@ -1192,12 +1199,34 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
     };
     let purged: number | undefined;
     try {
+      const advanceCursor = context.advanceRetentionCursor;
+      const db = env.DB;
+      const prepare = db.prepare;
+      const batch = db.batch;
+      if (typeof prepare !== 'function' || typeof batch !== 'function') {
+        throw new Error(
+          'retention purge requires database.prepare() and batch()',
+        );
+      }
+      const retentionDb = {
+        prepare: prepare.bind(db),
+        batch: batch.bind(db),
+      };
+      const storedCursor = parseRunRetentionCursor(context.retentionCursor);
+      const cursor =
+        storedCursor?.tablePrefix ===
+          (storageTablePrefix?.toLowerCase() ?? '') &&
+        storedCursor.startIdempotencyTable === START_IDEMPOTENCY_TABLE
+          ? storedCursor
+          : undefined;
       const artifactStore = config.artifactStore?.(env);
       // The resource registry is lazy like Mastra's snapshot table. Retention
       // may be the first resource-aware operation in a fresh deployment, so
       // initialize it before asking the atomic purge to reference it.
-      await createResourceOwnershipSchema(env.DB);
-      purged = await purgeExpiredWorkflowRuns(env.DB, {
+      await createResourceOwnershipSchema(retentionDb);
+      purged = await purgeExpiredWorkflowRuns(retentionDb, {
+        cursor,
+        advanceCursor,
         // allowZero: RUN_RETENTION_DAYS=0 means "purge terminal runs now".
         ttlMs:
           numberVar(env.RUN_RETENTION_DAYS, 30, 'RUN_RETENTION_DAYS', {
@@ -1207,21 +1236,9 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
           60 *
           60 *
           1000,
-        // Pairs each expired run's R2 artifacts with its snapshot-row deletion
-        // (artifacts BEFORE the row — the row is the only record of their keys).
-        // Undefined on hosts that wire no R2, so the purge stays byte-identical.
         artifactStore,
         tablePrefix: storageTablePrefix,
-        // Snapshot + owner release share one D1 transaction, so retention
-        // cannot leave unbounded run-ownership tombstones or expose a live row
-        // without its authorization record.
         resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
-        // Start reservations join the same transaction, for the same reason:
-        // an idempotency key must never be reaped while the run it names is
-        // still readable, or the next retry of that key would start a second
-        // run beside the live one. The horizon defaults to run retention —
-        // START_IDEMPOTENCY_RETENTION_DAYS is what a host sets when its callers
-        // retry for longer than it keeps run summaries.
         startIdempotencyTable: START_IDEMPOTENCY_TABLE,
         ...(env.START_IDEMPOTENCY_RETENTION_DAYS === undefined
           ? {}
@@ -1242,9 +1259,6 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
     } catch (error) {
       recordFailure('retention-purge', error);
     }
-    // Own containment (inside runApprovalRetentionPurge), same isolation as
-    // the snapshot purge above: a failure in any one purge duty must never
-    // stop the others.
     const approvalPurge = await runApprovalRetentionPurge({
       store: approvalStoreFactoryFor(env.DB, storageTablePrefix).store(),
       retentionDays: env.APPROVAL_RETENTION_DAYS,
@@ -1254,11 +1268,6 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
       failures.push(`approval-retention-purge: ${approvalPurge.error}`);
     }
     const approvalsPurged = approvalPurge.ok ? approvalPurge.value : undefined;
-    // Agent-memory thread TTL, opt-in.
-    // Its OWN try/catch, like every sibling duty above and below: isolating one
-    // loop while a sibling shares its failure is a defect this codebase has
-    // already shipped once — a wedged thread purge must cost the run-snapshot
-    // purge, the approval purge, and the extra duties nothing.
     let threadsPurged: number | undefined;
     let threadMessagesPurged: number | undefined;
     // optionalNumberVar, not numberVar: this var GATES the duty rather than
@@ -1283,9 +1292,6 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         recordFailure('thread-retention-purge', error);
       }
     }
-    // Background-task TTL cleanup (opt-in). Its OWN try/catch, like
-    // every sibling duty: a wedged background-task purge must cost the
-    // run-snapshot, approval, and thread purges nothing.
     let backgroundTasksPurged: PurgeExpiredBackgroundTasksResult | undefined;
     if (config.backgroundTasks) {
       try {
@@ -1298,8 +1304,6 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         recordFailure('background-task-purge', error);
       }
     }
-    // Notification TTL cleanup (opt-in). Its OWN try/catch, like every sibling
-    // duty. optionalNumberVar (GATES the duty; unset/garbage => do not delete).
     let notificationsPurged: number | undefined;
     const notificationRetentionDays = optionalNumberVar(
       env.NOTIFICATION_RETENTION_DAYS,
@@ -1316,7 +1320,6 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         recordFailure('notification-purge', error);
       }
     }
-    // Thread-state TTL cleanup (opt-in). Same isolation + opt-in posture.
     let threadStatePurged: number | undefined;
     const threadStateRetentionDays = optionalNumberVar(
       env.THREAD_STATE_RETENTION_DAYS,
@@ -1333,9 +1336,6 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         recordFailure('thread-state-purge', error);
       }
     }
-    // Schedule-trigger history TTL cleanup (opt-in). Same isolation + opt-in
-    // posture. Only the fire HISTORY expires; schedule config rows are reaped
-    // only at deployment teardown.
     let scheduleTriggersPurged: number | undefined;
     const scheduleTriggerRetentionDays = optionalNumberVar(
       env.SCHEDULE_TRIGGER_RETENTION_DAYS,
@@ -1410,7 +1410,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
       console.log(JSON.stringify({ type: 'schedule-tick', trigger, result }));
       return { ok: true, value: undefined };
     } catch (error) {
-      const failure = String(error);
+      const failure = hostErrorText(error);
       console.error(
         JSON.stringify({
           type: 'schedule-tick-error',
@@ -1465,7 +1465,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
       );
       return { ok: true, value: undefined };
     } catch (error) {
-      const failure = String(error);
+      const failure = hostErrorText(error);
       console.error(
         JSON.stringify({
           type: 'deadline-sweep-error',
@@ -1480,6 +1480,9 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
   return {
     async fetch(request, env, ctx) {
       try {
+        const mutationEpoch = normalizeMutationEpoch(
+          typeof epochSource === 'function' ? epochSource(env) : epochSource,
+        );
         await ensureDeploymentIdentityBindings(env);
         await validateFleetChannelTopology(env);
         const url = new URL(request.url);
@@ -1532,8 +1535,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
                 console.error(
                   JSON.stringify({
                     type: 'stream-publish-error',
-                    reason:
-                      error instanceof Error ? error.message : String(error),
+                    reason: hostErrorText(error, true),
                   }),
                 ),
               ),
@@ -1546,6 +1548,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
           notify,
           selfDecision,
           streamSink,
+          mutationEpoch,
         );
 
         if (config.preRoutes) {
@@ -1630,11 +1633,12 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
           startIdempotency: {
             store: startIdempotencyForEnv(env),
             live: topology.startLiveness,
+            persistedStart: topology.persistedStart,
             executionFence: executionFenceForEnv(env),
           },
           beforeStart: beforeStart
-            ? (context, workflowId, inputData) =>
-                beforeStart(context, env, workflowId, inputData)
+            ? (context, workflowId, inputData, requestContext) =>
+                beforeStart(context, env, workflowId, inputData, requestContext)
             : undefined,
           beforeResume: beforeResume
             ? (context, workflowId, runId, body) =>
@@ -1655,10 +1659,16 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
           console.error(
             JSON.stringify({
               type: 'deployment-identity-error',
-              reason: error.message,
+              reason: hostErrorText(error, true),
             }),
           );
           return json({ error: 'deployment unavailable' }, 503);
+        }
+        if (error instanceof InvalidMutationEpochError) {
+          return json(
+            { error: error.message, reason: error.reason },
+            error.status,
+          );
         }
         // Backstop: a mounted router (or any handler fault) that THROWS before
         // returning a Response — e.g. a future unguarded path decode — is
@@ -1667,14 +1677,18 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         console.error(
           JSON.stringify({
             type: 'worker-fetch-error',
-            reason: error instanceof Error ? error.message : String(error),
+            reason: hostErrorText(error, true),
           }),
         );
         return json({ error: 'internal error' }, 500);
       }
     },
 
-    async runMaintenanceDuty(duty, env, context) {
+    async runMaintenanceDuty(
+      duty: MaintenanceDuty,
+      env: Env,
+      context?: MaintenanceDutyContext,
+    ): Promise<MaintenanceOutcome> {
       try {
         await ensureDeploymentIdentityBindings(env);
         await validateFleetChannelTopology(env);
@@ -1699,11 +1713,29 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
           });
         }
         if (duty === 'purge') {
-          return await runPurgeMaintenance(env, duty);
+          if (!hasRetentionCursorSeam(context)) {
+            // The same refusal the tick duty makes below for an unwired
+            // builder: the cursor seam is part of the purge's wiring, not one
+            // of its surfaces, so a host that omits it gets the misconfig
+            // named rather than its remaining surfaces purged and the run
+            // retention reported as failed. MaintenancePurgeDutyContext
+            // requires the seam; this is the check for hosts types do not
+            // reach.
+            console.error(
+              JSON.stringify({
+                type: 'config-error',
+                var: 'maintenance.purge.advanceRetentionCursor',
+                trigger: duty,
+                reason: RETENTION_CURSOR_SEAM_REASON,
+              }),
+            );
+            return { ok: false, error: RETENTION_CURSOR_SEAM_REASON };
+          }
+          return await runPurgeMaintenance(env, duty, context);
         }
         return await runScheduleTickDuty(env, duty);
       } catch (error) {
-        const failure = String(error);
+        const failure = hostErrorText(error);
         console.error(
           JSON.stringify({
             type: 'maintenance-error',
@@ -1722,6 +1754,8 @@ const MAINTENANCE_HEALTH_KEY = 'flowsafe:maintenance-health:v1';
 const MAINTENANCE_NONCES_KEY = 'flowsafe:maintenance-nonces:v1';
 const MAINTENANCE_DEADLINE_CURSOR_KEY =
   'flowsafe:maintenance-deadline-cursor:v1';
+const MAINTENANCE_RUN_RETENTION_CURSOR_KEY =
+  'flowsafe:maintenance-run-retention-cursor:v1';
 const DUTY_ORDER = ['deadline', 'sweep', 'purge', 'tick'] as const;
 
 export type MaintenanceDurableObjectConstructor<Env extends FlowsafeWorkerEnv> =
@@ -1900,6 +1934,12 @@ export function createFlowsafeMaintenanceDurableObject<
         });
       }
       if (!capability) return undefined;
+      if (
+        this.#env.FLEET_RESOURCE_ROLE === 'platform-catalog' &&
+        (capability.scriptName !== this.#env.FLEET_DEPLOYMENT_SCRIPT ||
+          capability.specDigest !== this.#env.FLEET_SPEC_DIGEST)
+      )
+        return undefined;
       if (operation === 'maintenance-status') return capability;
       const nowSeconds = Math.floor(Date.now() / 1_000);
       const consumed = await this.#state.storage.transaction(
@@ -2003,7 +2043,7 @@ export function createFlowsafeMaintenanceDurableObject<
         console.error(
           JSON.stringify({
             type: 'maintenance-do-error',
-            reason: error instanceof Error ? error.message : String(error),
+            reason: hostErrorText(error, true),
           }),
         );
         return json({ error: 'internal error' }, 500);
@@ -2040,20 +2080,39 @@ export function createFlowsafeMaintenanceDurableObject<
         hasDueDuty(health, intervals, now) ? now : followUpAt,
       );
 
-      let context: MaintenanceDutyContext | undefined;
+      // Each duty carries the cursor pair it owns, so the call sits inside the
+      // branch that builds it: the purge seam is required by its context type,
+      // which a single call over the whole duty union cannot satisfy.
+      let outcome: MaintenanceOutcome;
       if (duty === 'deadline') {
         const deadlineCursor = await this.#state.storage.get<RunDeadlineCursor>(
           MAINTENANCE_DEADLINE_CURSOR_KEY,
         );
-        context = {
+        outcome = await worker.runMaintenanceDuty(duty, this.#env, {
           ...(deadlineCursor ? { deadlineCursor } : {}),
           advanceDeadlineCursor: (cursor) =>
             this.#state.storage.transaction(async (transaction) => {
               await transaction.put(MAINTENANCE_DEADLINE_CURSOR_KEY, cursor);
             }),
-        };
+        });
+      } else if (duty === 'purge') {
+        const retentionCursor =
+          await this.#state.storage.get<RunRetentionCursor>(
+            MAINTENANCE_RUN_RETENTION_CURSOR_KEY,
+          );
+        outcome = await worker.runMaintenanceDuty(duty, this.#env, {
+          ...(retentionCursor === undefined ? {} : { retentionCursor }),
+          advanceRetentionCursor: (cursor) =>
+            this.#state.storage.transaction(async (transaction) => {
+              await transaction.put(
+                MAINTENANCE_RUN_RETENTION_CURSOR_KEY,
+                cursor,
+              );
+            }),
+        });
+      } else {
+        outcome = await worker.runMaintenanceDuty(duty, this.#env);
       }
-      const outcome = await worker.runMaintenanceDuty(duty, this.#env, context);
       await this.#recordOutcome(duty, Date.now(), outcome);
     }
   };

@@ -4,6 +4,10 @@ import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 
 import {
+  namesAnotherModule,
+  specifiersIn,
+} from '../../test-support/module-edges.js';
+import {
   openSqlite,
   type SqliteDatabase,
   sqliteUnitDatabase,
@@ -13,26 +17,48 @@ import {
 // re-export them (see its header), so a test that pinned them off the runtime
 // module would be pinning a second copy.
 import {
+  EXECUTION_FENCE_DDL,
   EXECUTION_FENCE_STATES,
   EXECUTION_FENCE_TABLE,
 } from '../deployment-identity-protocol.js';
+import { seedDeploymentIdentity } from './deployment-identity.js';
 import { doErrorResponse } from './do-error-response.js';
 import {
   admitsDrainableExecution,
   admitsExistingRun,
   admitsRunStart,
   admitsWorkAuthoring,
+  decodeExecutionFenceAdmissionRow,
   type ExecutionFenceDatabase,
   ExecutionFencedError,
   type ExecutionFenceReading,
   type ExecutionFenceState,
+  type ExecutionFenceStatement,
   ExecutionFenceStore,
   ExecutionFenceUnreadableError,
+  executionFenceReadingPayload,
   FenceTransitionConflictError,
   InvalidExecutionFenceRequestError,
+  validateExecutionFenceAdmissionSchema,
 } from './execution-fence.js';
+import { StartReservationUnreadableError as BarrelStartReservationUnreadableError } from './index.js';
 import { init } from './init.js';
 import type { RunnerRuntime } from './runtime.js';
+import {
+  decodeStartReservationAdmissionResult as reExportedDecode,
+  validateStartReservationAdmissionSchema as reExportedValidate,
+  StartIdempotencyStore,
+  StartReservationUnreadableError,
+} from './start-idempotency.js';
+import {
+  decodeStartReservationAdmissionResult,
+  validateStartReservationAdmissionSchema,
+} from './start-reservation-contract.js';
+
+const fenceDatabases = new WeakMap<
+  ExecutionFenceStore,
+  ExecutionFenceDatabase
+>();
 
 function fenceFixture(): {
   sqlite: SqliteDatabase;
@@ -40,8 +66,17 @@ function fenceFixture(): {
   fence: ExecutionFenceStore;
 } {
   const sqlite = openSqlite();
-  const db = sqliteUnitDatabase(sqlite) as ExecutionFenceDatabase;
-  return { sqlite, db, fence: new ExecutionFenceStore(db) };
+  const backing = sqliteUnitDatabase(sqlite) as ExecutionFenceDatabase;
+  const db = backing;
+  const fence = new ExecutionFenceStore(db);
+  fenceDatabases.set(fence, db);
+  return { sqlite, db, fence };
+}
+
+function databaseForFence(fence: ExecutionFenceStore): ExecutionFenceDatabase {
+  const db = fenceDatabases.get(fence);
+  if (!db) throw new Error('fixture fence database missing');
+  return db;
 }
 
 /** The schema as SQLite records it — the evidence a read wrote no DDL. */
@@ -58,6 +93,205 @@ function reading(
   return { state, ...extra };
 }
 
+const optionalMetadata = {
+  mutationEpoch: 0,
+  requireMutationEpoch: false,
+  transitionRevision: 0,
+};
+const proofColumns = [
+  'proof_table_prefix',
+  'proof_workflow_id',
+  'proof_start_token',
+];
+const emptyProofIdentity = {
+  proof_table_prefix: null,
+  proof_workflow_id: null,
+  proof_start_token: null,
+};
+const legacyFenceDdl = `CREATE TABLE flowsafe_execution_fence (
+  id TEXT PRIMARY KEY CHECK (id = 'deployment'),
+  state TEXT NOT NULL CHECK (state IN ('open', 'draining', 'migration-locked', 'proof-only')),
+  proof_key TEXT, proof_run_id TEXT, updated_at INTEGER NOT NULL
+)`;
+
+describe('strict initial-admission fence observations', () => {
+  it.each([
+    'row',
+    'schema',
+  ])('rejects inherited slots in the fence %s observation', async (mode) => {
+    const { sqlite, db } = fenceFixture();
+    await new ExecutionFenceStore(db).seed('open');
+    const sparse = (rows: unknown[]) =>
+      Object.setPrototypeOf(
+        new Array(rows.length),
+        Object.assign(Object.create(Array.prototype), rows),
+      );
+    if (mode === 'schema') {
+      const columns = sqlite
+        .prepare('PRAGMA table_xinfo(flowsafe_execution_fence)')
+        .all();
+      await expect(
+        validateExecutionFenceAdmissionSchema({ results: sparse(columns) }),
+      ).rejects.toThrow('invalid row');
+    } else {
+      const wrapped = interceptedDatabase(db, async (sql, execute) => {
+        const result = (await execute()) as { results: unknown[] };
+        return sql.startsWith('SELECT * FROM flowsafe_execution_fence')
+          ? { results: sparse(result.results) }
+          : result;
+      });
+      await expect(
+        new ExecutionFenceStore(wrapped).readForAdmission(),
+      ).rejects.toBeInstanceOf(ExecutionFenceUnreadableError);
+    }
+  });
+  it('does not let a custom iterator hide a malformed admission row', async () => {
+    const { db } = fenceFixture();
+    await new ExecutionFenceStore(db).seed('open');
+    const wrapped = interceptedDatabase(db, async (sql, execute) => {
+      const result = (await execute()) as { results: unknown[] };
+      if (!sql.startsWith('SELECT * FROM flowsafe_execution_fence'))
+        return result;
+      const rows = [null];
+      Object.defineProperty(rows, Symbol.iterator, {
+        value: function* () {
+          yield* result.results;
+        },
+      });
+      return { results: rows };
+    });
+    await expect(
+      new ExecutionFenceStore(wrapped).readForAdmission(),
+    ).rejects.toBeInstanceOf(ExecutionFenceUnreadableError);
+  });
+  it('rejects the first malformed schema envelope even if its getter later returns real columns', async () => {
+    const { sqlite, db } = fenceFixture();
+    await new ExecutionFenceStore(db).seed('open');
+    const columns = sqlite
+      .prepare('PRAGMA table_xinfo(flowsafe_execution_fence)')
+      .all();
+    let reads = 0;
+    await expect(
+      validateExecutionFenceAdmissionSchema({
+        get results() {
+          return ++reads === 1 ? [null] : columns;
+        },
+      }),
+    ).rejects.toThrow('invalid row');
+    expect(reads).toBe(1);
+  });
+  it.each([
+    'envelope',
+    'element',
+  ])('captures one %s observation before admission decoding', async (mode) => {
+    const { db } = fenceFixture();
+    await new ExecutionFenceStore(db).seed('open');
+    let reads = 0;
+    const wrapped = interceptedDatabase(db, async (sql, execute) => {
+      const result = (await execute()) as { results: unknown[] };
+      if (!sql.startsWith('SELECT * FROM flowsafe_execution_fence'))
+        return result;
+      if (mode === 'envelope')
+        return {
+          get results() {
+            return ++reads === 1 ? result.results : new Array(1);
+          },
+        };
+      const rows: unknown[] = [];
+      Object.defineProperty(rows, 0, {
+        get() {
+          return ++reads === 1 ? result.results[0] : undefined;
+        },
+      });
+      return { results: rows };
+    });
+    expect(
+      (await new ExecutionFenceStore(wrapped).readForAdmission()).reading.state,
+    ).toBe('open');
+    expect(reads).toBe(1);
+  });
+  it('requires real current metadata and never initializes on read', async () => {
+    const { sqlite, db } = fenceFixture();
+    const fence = new ExecutionFenceStore(db);
+    expect(fence.usesDatabase(db)).toBe(true);
+    expect(fence.usesDatabase({ ...db })).toBe(false);
+    await expect(fence.readForAdmission()).rejects.toBeInstanceOf(
+      ExecutionFenceUnreadableError,
+    );
+    expect(
+      sqlite
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .all(),
+    ).toEqual([]);
+    sqlite.exec(legacyFenceDdl);
+    sqlite.exec(
+      "INSERT INTO flowsafe_execution_fence VALUES ('deployment', 'open', NULL, NULL, 100)",
+    );
+    await expect(fence.readForAdmission()).rejects.toBeInstanceOf(
+      ExecutionFenceUnreadableError,
+    );
+    expect(
+      sqlite.prepare('PRAGMA table_xinfo(flowsafe_execution_fence)').all(),
+    ).toHaveLength(5);
+    await fence.seed('open');
+    const observation = await fence.readForAdmission();
+    expect(observation.schemaStage).toBe(7);
+    expect(Object.isFrozen(observation.raw)).toBe(true);
+    const mutable = { ...observation.raw };
+    const copied = decodeExecutionFenceAdmissionRow(mutable);
+    mutable.state = 'draining';
+    expect(copied.raw.state).toBe('open');
+    const schema = sqlite
+      .prepare('PRAGMA table_xinfo(flowsafe_execution_fence)')
+      .all();
+    await expect(
+      validateExecutionFenceAdmissionSchema({ results: schema }),
+    ).resolves.toBeUndefined();
+    await expect(
+      validateExecutionFenceAdmissionSchema({ results: schema.slice(0, -1) }),
+    ).rejects.toThrow('current fence schema');
+    sqlite.exec('DELETE FROM flowsafe_execution_fence');
+    await expect(fence.readForAdmission()).rejects.toBeInstanceOf(
+      ExecutionFenceUnreadableError,
+    );
+    expect(
+      sqlite.prepare('SELECT * FROM flowsafe_execution_fence').all(),
+    ).toEqual([]);
+  });
+});
+
+function rawFence(sqlite: SqliteDatabase): Record<string, unknown> {
+  return sqlite
+    .prepare(`SELECT * FROM ${EXECUTION_FENCE_TABLE}`)
+    .get() as Record<string, unknown>;
+}
+
+function interceptedDatabase(
+  db: ExecutionFenceDatabase,
+  intercept: (sql: string, execute: () => Promise<unknown>) => Promise<unknown>,
+): ExecutionFenceDatabase {
+  function statement(sql: string, values: unknown[]): ExecutionFenceStatement {
+    return {
+      bind: (...bound) => statement(sql, bound),
+      run: () =>
+        intercept(sql, () =>
+          db
+            .prepare(sql)
+            .bind(...values)
+            .run(),
+        ),
+      all: async <T>() =>
+        (await intercept(sql, () =>
+          db
+            .prepare(sql)
+            .bind(...values)
+            .all(),
+        )) as { results: T[] },
+    };
+  }
+  return { prepare: (sql) => statement(sql, []) };
+}
+
 describe('ExecutionFenceStore', () => {
   it('reads a database with no fence table as open, and writes no DDL doing it', async () => {
     // #given — a 0.19-era database: the fence table does not exist.
@@ -71,19 +305,21 @@ describe('ExecutionFenceStore', () => {
     // `CREATE TABLE IF NOT EXISTS` is a write path wearing a read's name; it
     // would make a fenced deployment mutate its own database to answer a
     // question, and would turn a revoked-write incident into an outage.
-    expect(observed).toEqual({ state: 'open' });
+    expect(observed).toEqual({ state: 'open', ...optionalMetadata });
     expect(schemaSnapshot(sqlite)).toEqual(before);
     expect(before).toEqual([]);
   });
 
   it('reads a seeded-but-rowless table as open', async () => {
     // #given — the table exists (a crash between DDL and the row).
-    const { db, fence } = fenceFixture();
-    await fence.seed('open');
-    await db.prepare(`DELETE FROM ${EXECUTION_FENCE_TABLE}`).run();
+    const { sqlite, fence } = fenceFixture();
+    sqlite.exec(legacyFenceDdl);
 
     // #then
-    await expect(fence.read()).resolves.toEqual({ state: 'open' });
+    await expect(fence.read()).resolves.toEqual({
+      state: 'open',
+      ...optionalMetadata,
+    });
   });
 
   it('seed() requires an explicit state and never overwrites an existing row', async () => {
@@ -96,7 +332,10 @@ describe('ExecutionFenceStore', () => {
 
     // #then — the operator's state survives. An upsert here would silently
     // reopen a fence a migration closed.
-    await expect(fence.read()).resolves.toEqual({ state: 'migration-locked' });
+    await expect(fence.read()).resolves.toEqual({
+      state: 'migration-locked',
+      ...optionalMetadata,
+    });
 
     // #and — the state is a required argument with no default, so a migration
     // host cannot forget it and silently get 'open'.
@@ -114,8 +353,12 @@ describe('ExecutionFenceStore', () => {
     const next = await fence.transition({ expected: 'open', next: 'draining' });
 
     // #then
-    expect(next).toEqual({ state: 'draining' });
-    await expect(fence.read()).resolves.toEqual({ state: 'draining' });
+    expect(next).toEqual({
+      state: 'draining',
+      ...optionalMetadata,
+      transitionRevision: 1,
+    });
+    await expect(fence.read()).resolves.toEqual(next);
   });
 
   it('materializes the implicit-open row of a database that has no fence table', async () => {
@@ -126,7 +369,11 @@ describe('ExecutionFenceStore', () => {
     await fence.transition({ expected: 'open', next: 'draining' });
 
     // #then
-    await expect(fence.read()).resolves.toEqual({ state: 'draining' });
+    await expect(fence.read()).resolves.toEqual({
+      state: 'draining',
+      ...optionalMetadata,
+      transitionRevision: 1,
+    });
   });
 
   it('refuses a CAS whose expected state is stale, and reports the CURRENT one', async () => {
@@ -145,8 +392,15 @@ describe('ExecutionFenceStore', () => {
     expect((refusal as FenceTransitionConflictError).reason).toEqual({
       code: 'FENCE_CAS_CONFLICT',
       state: 'draining',
+      ...optionalMetadata,
+      transitionRevision: 1,
+      conflict: 'expectation-mismatch',
     });
-    await expect(fence.read()).resolves.toEqual({ state: 'draining' });
+    await expect(fence.read()).resolves.toEqual({
+      state: 'draining',
+      ...optionalMetadata,
+      transitionRevision: 1,
+    });
   });
 
   it("requires a proofKey to enter 'proof-only', and rejects one anywhere else", async () => {
@@ -167,7 +421,10 @@ describe('ExecutionFenceStore', () => {
         proofKey: 'proof-1',
       }),
     ).rejects.toBeInstanceOf(InvalidExecutionFenceRequestError);
-    await expect(fence.read()).resolves.toEqual({ state: 'migration-locked' });
+    await expect(fence.read()).resolves.toEqual({
+      state: 'migration-locked',
+      ...optionalMetadata,
+    });
   });
 
   it('clears the proof run on entry to and exit from proof-only', async () => {
@@ -184,6 +441,8 @@ describe('ExecutionFenceStore', () => {
       state: 'proof-only',
       proofKey: 'proof-1',
       proofRunId: 'run-1',
+      ...optionalMetadata,
+      transitionRevision: 1,
     });
 
     // #when — a SECOND proof attempt under a new key.
@@ -197,11 +456,17 @@ describe('ExecutionFenceStore', () => {
     await expect(fence.read()).resolves.toEqual({
       state: 'proof-only',
       proofKey: 'proof-2',
+      ...optionalMetadata,
+      transitionRevision: 2,
     });
 
     // #and — leaving proof-only clears both fields.
     await fence.transition({ expected: 'proof-only', next: 'open' });
-    await expect(fence.read()).resolves.toEqual({ state: 'open' });
+    await expect(fence.read()).resolves.toEqual({
+      state: 'open',
+      ...optionalMetadata,
+      transitionRevision: 3,
+    });
   });
 
   describe('recordProofRun', () => {
@@ -328,7 +593,10 @@ describe('ExecutionFenceStore', () => {
 
     // #then — open, and `recordProofRun` reaches the same conclusion: a
     // database with no fence table cannot be in proof-only.
-    await expect(fence.read()).resolves.toEqual({ state: 'open' });
+    await expect(fence.read()).resolves.toEqual({
+      state: 'open',
+      ...optionalMetadata,
+    });
     await expect(fence.recordProofRun('proof-1', 'acme_r1')).resolves.toBe(
       false,
     );
@@ -440,6 +708,1407 @@ describe('ExecutionFenceStore', () => {
   });
 });
 
+describe('versioned execution fence persistence', () => {
+  const activation = {
+    expected: 'open',
+    next: 'draining',
+    expectedMutationEpoch: 0,
+    expectedRevision: 0,
+    advanceMutationEpoch: true,
+  } as const;
+  const activeReading = {
+    state: 'draining',
+    mutationEpoch: 1,
+    requireMutationEpoch: true,
+    transitionRevision: 1,
+  } as const;
+
+  it('keeps legacy readings optional and state-only predicate inputs compatible', async () => {
+    for (const state of EXECUTION_FENCE_STATES) {
+      const { sqlite, fence } = fenceFixture();
+      sqlite.exec(legacyFenceDdl);
+      await expect(fence.read()).resolves.toEqual({
+        state: 'open',
+        ...optionalMetadata,
+      });
+      sqlite
+        .prepare(`INSERT INTO ${EXECUTION_FENCE_TABLE} VALUES (?, ?, ?, ?, ?)`)
+        .run('deployment', state, 'old key', 'old run', 19);
+      const expected = {
+        state,
+        ...optionalMetadata,
+        proofKey: 'old key',
+        proofRunId: 'old run',
+      };
+      await expect(fence.read()).resolves.toEqual(expected);
+      expect(executionFenceReadingPayload(expected)).toEqual(expected);
+      expect(executionFenceReadingPayload({ state })).toEqual({ state });
+      expect(admitsRunStart({ state })).toBe(state === 'open');
+      expect(admitsWorkAuthoring({ state })).toBe(state === 'open');
+      expect(admitsExistingRun({ state })).toBe(
+        state === 'open' || state === 'draining',
+      );
+      expect(admitsDrainableExecution({ state })).toBe(
+        state === 'open' || state === 'draining',
+      );
+      expect(
+        sqlite.prepare(`PRAGMA table_xinfo(${EXECUTION_FENCE_TABLE})`).all(),
+      ).toHaveLength(5);
+    }
+    const { fence } = fenceFixture();
+    await expect(fence.read()).resolves.toEqual({
+      state: 'open',
+      ...optionalMetadata,
+    });
+    const conflict = new FenceTransitionConflictError('open', 'draining');
+    expect(conflict.message).toBe(
+      "execution fence transition expected state 'open' but found 'draining'",
+    );
+    expect(conflict.reason).toEqual({
+      code: 'FENCE_CAS_CONFLICT',
+      state: 'draining',
+    });
+  });
+
+  it('refuses a missing row once any FS8 column exists', async () => {
+    for (let stage = 1; stage <= 7; stage += 1) {
+      const { sqlite, db } = fenceFixture();
+      sqlite.exec(EXECUTION_FENCE_DDL);
+      const additions = [
+        'last_transition_request',
+        'transition_revision',
+        'mutation_epoch',
+        'require_mutation_epoch',
+        ...proofColumns,
+      ];
+      for (const column of additions.slice(stage).reverse())
+        sqlite.exec(
+          `ALTER TABLE ${EXECUTION_FENCE_TABLE} DROP COLUMN ${column}`,
+        );
+      const statements: string[] = [];
+      const fence = new ExecutionFenceStore(
+        interceptedDatabase(db, async (sql, execute) => {
+          statements.push(sql);
+          return execute();
+        }),
+      );
+      for (const action of [
+        () => fence.read(),
+        () => fence.seed('open'),
+        () => fence.transition(activation),
+      ]) {
+        await expect(action()).rejects.toBeInstanceOf(
+          ExecutionFenceUnreadableError,
+        );
+      }
+      expect(
+        sqlite.prepare(`SELECT * FROM ${EXECUTION_FENCE_TABLE}`).all(),
+      ).toEqual([]);
+      expect(
+        statements.filter((sql) => /^(INSERT|UPDATE|ALTER|CREATE)/.test(sql)),
+      ).toEqual([]);
+    }
+    for (const operation of ['read', 'seed'] as const) {
+      const { sqlite, db } = fenceFixture();
+      sqlite.exec(EXECUTION_FENCE_DDL);
+      let reads = 0;
+      const writes: string[] = [];
+      const regressed = new ExecutionFenceStore(
+        interceptedDatabase(db, async (sql, execute) => {
+          if (/^(INSERT|UPDATE|ALTER|CREATE)/.test(sql)) writes.push(sql);
+          if (sql.startsWith('SELECT *') && ++reads === 2) {
+            sqlite.exec(`DROP TABLE ${EXECUTION_FENCE_TABLE}`);
+            sqlite.exec(legacyFenceDdl);
+            sqlite.exec(
+              `INSERT INTO ${EXECUTION_FENCE_TABLE} VALUES ('deployment', 'open', NULL, NULL, 0)`,
+            );
+          }
+          return execute();
+        }),
+      );
+      await expect(
+        operation === 'read' ? regressed.read() : regressed.seed('open'),
+      ).rejects.toBeInstanceOf(ExecutionFenceUnreadableError);
+      expect(reads).toBe(2);
+      expect(writes).toEqual([]);
+    }
+  });
+
+  it('resumes every supported fence schema prefix without reopening the row', async () => {
+    for (const state of EXECUTION_FENCE_STATES) {
+      for (let stopAfter = 0; stopAfter <= 7; stopAfter += 1) {
+        const { sqlite, db } = fenceFixture();
+        let additions = 0;
+        let stopped = false;
+        const crashing = new ExecutionFenceStore(
+          interceptedDatabase(db, async (sql, execute) => {
+            if (stopped) throw new Error('process interrupted');
+            const result = await execute();
+            if (sql.startsWith('ALTER TABLE')) additions += 1;
+            if (
+              (sql.startsWith('INSERT OR IGNORE') ||
+                sql.startsWith('ALTER TABLE')) &&
+              additions === stopAfter
+            )
+              stopped = true;
+            return result;
+          }),
+          { now: () => 12 },
+        );
+        await expect(crashing.seed(state)).rejects.toBeInstanceOf(
+          ExecutionFenceUnreadableError,
+        );
+        expect(
+          sqlite.prepare(`PRAGMA table_xinfo(${EXECUTION_FENCE_TABLE})`).all(),
+        ).toHaveLength(5 + stopAfter);
+        const before = rawFence(sqlite);
+        const fence = new ExecutionFenceStore(db, { now: () => 99 });
+        await fence.seed('open');
+        await expect(fence.read()).resolves.toEqual({
+          state,
+          ...optionalMetadata,
+        });
+        expect(rawFence(sqlite)).toEqual({
+          ...before,
+          last_transition_request: null,
+          transition_revision: 0,
+          mutation_epoch: 0,
+          require_mutation_epoch: 0,
+          ...emptyProofIdentity,
+        });
+        expect(rawFence(sqlite).updated_at).toBe(12);
+      }
+    }
+  });
+
+  it('converges concurrent fence schema initialization without batch', async () => {
+    const { sqlite, db } = fenceFixture();
+    const second = new ExecutionFenceStore(db, { now: () => 21 });
+    let interleaved = false;
+    const first = new ExecutionFenceStore(
+      interceptedDatabase(db, async (sql, execute) => {
+        const result = await execute();
+        if (!interleaved && sql.startsWith('SELECT *')) {
+          interleaved = true;
+          await second.seed('migration-locked');
+        }
+        return result;
+      }),
+      { now: () => 13 },
+    );
+    await first.seed('open');
+    await expect(first.read()).resolves.toEqual({
+      state: 'migration-locked',
+      ...optionalMetadata,
+    });
+    expect(rawFence(sqlite).updated_at).toBe(21);
+    expect(
+      sqlite.prepare(`SELECT * FROM ${EXECUTION_FENCE_TABLE}`).all(),
+    ).toHaveLength(1);
+
+    const parallel = fenceFixture();
+    const outcomes = await Promise.allSettled([
+      parallel.fence.seed('draining'),
+      new ExecutionFenceStore(parallel.db).seed('proof-only'),
+    ]);
+    expect(outcomes.map((outcome) => outcome.status)).toEqual([
+      'fulfilled',
+      'fulfilled',
+    ]);
+    expect((await parallel.fence.read()).transitionRevision).toBe(0);
+    expect(
+      parallel.sqlite.prepare(`SELECT * FROM ${EXECUTION_FENCE_TABLE}`).all(),
+    ).toHaveLength(1);
+
+    const alterRace = fenceFixture();
+    let paused = false;
+    let duplicateAlter = false;
+    const racingInitializer = new ExecutionFenceStore(
+      interceptedDatabase(alterRace.db, async (sql, execute) => {
+        if (!paused && sql.startsWith('ALTER TABLE')) {
+          paused = true;
+          await alterRace.fence.seed('open');
+          try {
+            return await execute();
+          } catch (error) {
+            duplicateAlter = true;
+            throw error;
+          }
+        }
+        return execute();
+      }),
+    );
+    await racingInitializer.seed('migration-locked');
+    expect(duplicateAlter).toBe(true);
+    await expect(racingInitializer.read()).resolves.toEqual({
+      state: 'migration-locked',
+      ...optionalMetadata,
+    });
+  });
+
+  it('preserves active P1 metadata through every new proof-column prefix', async () => {
+    for (const stage of [4, 5, 6]) {
+      const { fence, sqlite, db } = fenceFixture();
+      const admitted = await fence.transition({
+        ...activation,
+        next: 'proof-only',
+        proofKey: 'key',
+      });
+      await fence.recordProofRun('key', 'run', admitted);
+      for (const column of proofColumns.slice(stage - 4).reverse())
+        sqlite.exec(
+          `ALTER TABLE ${EXECUTION_FENCE_TABLE} DROP COLUMN ${column}`,
+        );
+      const before = rawFence(sqlite);
+      await expect(fence.read()).resolves.toEqual({
+        ...admitted,
+        proofRunId: 'run',
+      });
+      await fence.seed('open');
+      expect(rawFence(sqlite)).toEqual({ ...before, ...emptyProofIdentity });
+      const writes: string[] = [];
+      await new ExecutionFenceStore(
+        interceptedDatabase(db, async (sql, execute) => {
+          if (/^(CREATE|INSERT|UPDATE|ALTER)/.test(sql)) writes.push(sql);
+          return execute();
+        }),
+      ).seed('open');
+      expect(writes).toEqual([]);
+    }
+    const { fence, sqlite, db } = fenceFixture();
+    await fence.transition(activation);
+    for (const column of [...proofColumns].reverse())
+      sqlite.exec(`ALTER TABLE ${EXECUTION_FENCE_TABLE} DROP COLUMN ${column}`);
+    let advanced = false;
+    const reader = new ExecutionFenceStore(
+      interceptedDatabase(db, async (sql, execute) => {
+        const result = await execute();
+        if (!advanced && sql.startsWith('SELECT *')) {
+          advanced = true;
+          await fence.seed('open');
+        }
+        return result;
+      }),
+    );
+    await expect(reader.read()).resolves.toEqual(activeReading);
+  });
+
+  it('distinguishes partial mutation defaults from partial proof defaults', async () => {
+    for (const stage of [1, 2, 3, 5, 6]) {
+      const { fence, sqlite, db } = fenceFixture();
+      if (stage >= 4) await fence.transition(activation);
+      else await fence.seed('open');
+      const names = [
+        'last_transition_request',
+        'transition_revision',
+        'mutation_epoch',
+        'require_mutation_epoch',
+        ...proofColumns,
+      ];
+      for (const column of names.slice(stage).reverse())
+        sqlite.exec(
+          `ALTER TABLE ${EXECUTION_FENCE_TABLE} DROP COLUMN ${column}`,
+        );
+      const column = stage < 4 ? names[stage - 1] : proofColumns[stage - 5];
+      sqlite
+        .prepare(`UPDATE ${EXECUTION_FENCE_TABLE} SET ${column} = ?`)
+        .run(stage === 1 ? 'receipt' : stage < 4 ? 1 : 'not-null');
+      const before = rawFence(sqlite);
+      const writes: string[] = [];
+      const subject = new ExecutionFenceStore(
+        interceptedDatabase(db, async (sql, execute) => {
+          if (/^(CREATE|INSERT|UPDATE|ALTER)/.test(sql)) writes.push(sql);
+          return execute();
+        }),
+      );
+      for (const action of [() => subject.read(), () => subject.seed('open')]) {
+        await expect(action()).rejects.toMatchObject({
+          cause: {
+            message: `${EXECUTION_FENCE_TABLE} has an invalid execution-fence schema (${stage < 4 ? 'partial metadata is not optional defaults' : 'partial proof identity is not null'})`,
+          },
+        });
+      }
+      expect(writes).toEqual([]);
+      expect(rawFence(sqlite)).toEqual(before);
+    }
+  });
+
+  it('decodes complete D1 proof identity but omits it from admin payloads', async () => {
+    const { fence, sqlite, db } = fenceFixture();
+    const admitted = await fence.transition({
+      ...activation,
+      next: 'proof-only',
+      proofKey: 'key',
+    });
+    await fence.recordProofRun('key', 'run', admitted);
+    sqlite.exec(
+      `UPDATE ${EXECUTION_FENCE_TABLE} SET proof_table_prefix = '', proof_workflow_id = 'workflow', proof_start_token = 'generation'`,
+    );
+    const proofExecution = {
+      tablePrefix: '',
+      workflowId: 'workflow',
+      runId: 'run',
+      startToken: 'generation',
+    };
+    await expect(fence.read()).resolves.toEqual({
+      ...admitted,
+      proofRunId: 'run',
+      proofExecution,
+    });
+    expect(executionFenceReadingPayload(await fence.read())).toEqual({
+      ...admitted,
+      proofRunId: 'run',
+    });
+    const valid = rawFence(sqlite);
+    for (const corruption of [
+      { proof_table_prefix: null },
+      { proof_workflow_id: null },
+      { proof_start_token: null },
+      { proof_table_prefix: 'Mixed_' },
+      { proof_table_prefix: 'bad-prefix' },
+      { proof_workflow_id: 'bad/workflow' },
+      { proof_start_token: 'bad token' },
+      { proof_run_id: null },
+      { proof_run_id: 'bad/run' },
+      { state: 'open' },
+      { proof_key: '' },
+    ]) {
+      const entries = Object.entries(corruption);
+      sqlite
+        .prepare(
+          `UPDATE ${EXECUTION_FENCE_TABLE} SET ${entries.map(([key]) => `${key} = ?`).join(', ')}`,
+        )
+        .run(...entries.map(([, value]) => value));
+      const before = rawFence(sqlite);
+      await expect(fence.read()).rejects.toBeInstanceOf(
+        ExecutionFenceUnreadableError,
+      );
+      await expect(fence.seed('open')).rejects.toBeInstanceOf(
+        ExecutionFenceUnreadableError,
+      );
+      expect(rawFence(sqlite)).toEqual(before);
+      sqlite
+        .prepare(
+          `UPDATE ${EXECUTION_FENCE_TABLE} SET ${Object.keys(valid)
+            .map((key) => `${key} = ?`)
+            .join(', ')}`,
+        )
+        .run(...Object.values(valid));
+    }
+    sqlite.exec(
+      `UPDATE ${EXECUTION_FENCE_TABLE} SET proof_table_prefix = 'Mixed_'`,
+    );
+    const before = rawFence(sqlite);
+    await seedDeploymentIdentity(db, 'acme', 'open');
+    expect(rawFence(sqlite)).toEqual(before);
+    await expect(fence.read()).rejects.toBeInstanceOf(
+      ExecutionFenceUnreadableError,
+    );
+  });
+
+  it('clears proof identity on a new admin command and preserves it on exact retry', async () => {
+    for (const upgraded of [false, true]) {
+      const { fence, sqlite } = fenceFixture();
+      const command = {
+        expected: 'open',
+        next: 'proof-only',
+        proofKey: 'key',
+        expectedMutationEpoch: 0,
+        expectedRevision: 0,
+      } as const;
+      const admitted = await fence.transition(command);
+      await fence.recordProofRun('key', 'run', admitted);
+      sqlite.exec(
+        `UPDATE ${EXECUTION_FENCE_TABLE} SET proof_table_prefix = 'tenant_', proof_workflow_id = 'workflow', proof_start_token = 'generation'`,
+      );
+      const before = rawFence(sqlite);
+      await expect(fence.transition(command)).resolves.toEqual(
+        await fence.read(),
+      );
+      expect(rawFence(sqlite)).toEqual(before);
+      await fence.transition({
+        expected: 'proof-only',
+        next: 'proof-only',
+        proofKey: 'key',
+        ...(upgraded ? { expectedMutationEpoch: 0, expectedRevision: 1 } : {}),
+      });
+      expect(rawFence(sqlite)).toMatchObject({
+        proof_run_id: null,
+        ...emptyProofIdentity,
+        transition_revision: 2,
+      });
+      expect((await fence.read()).proofExecution).toBeUndefined();
+    }
+  });
+
+  it('does not swallow an ALTER failure unless compatible metadata proves completion', async () => {
+    for (const outcome of ['before', 'after', 'incompatible'] as const) {
+      const { db, sqlite } = fenceFixture();
+      const failure = new Error('lost ALTER response');
+      let injected = false;
+      const fence = new ExecutionFenceStore(
+        interceptedDatabase(db, async (sql, execute) => {
+          if (injected || !sql.startsWith('ALTER TABLE')) return execute();
+          injected = true;
+          if (outcome === 'after') await execute();
+          if (outcome === 'incompatible')
+            sqlite.exec(
+              `ALTER TABLE ${EXECUTION_FENCE_TABLE} ADD COLUMN last_transition_request INTEGER`,
+            );
+          throw failure;
+        }),
+      );
+      if (outcome === 'after') {
+        await fence.seed('draining');
+        await expect(fence.read()).resolves.toEqual({
+          state: 'draining',
+          ...optionalMetadata,
+        });
+      } else {
+        const error = await fence
+          .seed('draining')
+          .catch((error: unknown) => error);
+        expect(error).toBeInstanceOf(ExecutionFenceUnreadableError);
+        if (outcome === 'before') expect((error as Error).cause).toBe(failure);
+        else
+          expect(String((error as Error).cause)).toContain(
+            'column last_transition_request differs',
+          );
+      }
+    }
+  });
+
+  it('activates the mutation epoch and requirement in one compare-and-set', async () => {
+    const { fence, db, sqlite } = fenceFixture();
+    await fence.seed('open');
+    const outcomes = await Promise.allSettled([
+      fence.transition(activation),
+      new ExecutionFenceStore(db).transition({
+        ...activation,
+        next: 'migration-locked',
+      }),
+    ]);
+    expect(
+      outcomes.filter((outcome) => outcome.status === 'fulfilled'),
+    ).toHaveLength(1);
+    expect(
+      outcomes.filter((outcome) => outcome.status === 'rejected'),
+    ).toHaveLength(1);
+    const stored = rawFence(sqlite);
+    expect(stored.mutation_epoch).toBe(1);
+    expect(stored.require_mutation_epoch).toBe(1);
+    expect(stored.transition_revision).toBe(1);
+    expect((await fence.read()).mutationEpoch).toBe(1);
+  });
+
+  it('converges an identical activation after a lost UPDATE response', async () => {
+    const { db, sqlite } = fenceFixture();
+    let now = 30;
+    const fence = new ExecutionFenceStore(
+      interceptedDatabase(db, async (sql, execute) => {
+        const result = await execute();
+        if (sql.startsWith('UPDATE')) throw new Error('response lost');
+        return result;
+      }),
+      { now: () => now },
+    );
+    await expect(fence.transition(activation)).resolves.toEqual(activeReading);
+    const before = rawFence(sqlite);
+    now = 40;
+    await expect(fence.transition(activation)).resolves.toEqual(activeReading);
+    expect(rawFence(sqlite)).toEqual(before);
+    expect(before.last_transition_request).toBe(
+      '[1,"open","draining",null,0,0,true]',
+    );
+  });
+
+  it('distinguishes a conflicting request from an identical resulting state', async () => {
+    const { fence, sqlite } = fenceFixture();
+    await fence.transition(activation);
+    const before = rawFence(sqlite);
+    for (const difference of [
+      { next: 'open' as const },
+      { advanceMutationEpoch: false },
+      { expectedMutationEpoch: 1 },
+      { expectedRevision: 1 },
+      { expected: 'draining' as const },
+      { next: 'proof-only' as const, proofKey: 'another-key' },
+    ]) {
+      await expect(
+        fence.transition({ ...activation, ...difference }),
+      ).rejects.toBeInstanceOf(FenceTransitionConflictError);
+      expect(rawFence(sqlite)).toEqual(before);
+    }
+    const proof = {
+      ...activation,
+      next: 'proof-only' as const,
+      proofKey: 'key-a',
+    };
+    const other = fenceFixture();
+    await other.fence.transition(proof);
+    await expect(
+      other.fence.transition({ ...proof, proofKey: 'key-b' }),
+    ).rejects.toBeInstanceOf(FenceTransitionConflictError);
+  });
+
+  it('rejects an upgraded stale revision after a same-epoch state cycle', async () => {
+    const { fence } = fenceFixture();
+    const initial = {
+      expected: 'open',
+      next: 'draining',
+      expectedMutationEpoch: 0,
+      expectedRevision: 0,
+    } as const;
+    await fence.transition(initial);
+    await fence.transition({
+      expected: 'draining',
+      next: 'open',
+      expectedMutationEpoch: 0,
+      expectedRevision: 1,
+    });
+    await expect(fence.transition(initial)).rejects.toBeInstanceOf(
+      FenceTransitionConflictError,
+    );
+    await expect(fence.read()).resolves.toEqual({
+      state: 'open',
+      ...optionalMetadata,
+      transitionRevision: 2,
+    });
+    await fence.transition({ expected: 'open', next: 'open' });
+    await expect(
+      fence.transition({ ...initial, expectedRevision: 2 }),
+    ).rejects.toBeInstanceOf(FenceTransitionConflictError);
+  });
+
+  it('keeps the artifact epoch and requirement through lock proof and reopen', async () => {
+    const { fence } = fenceFixture();
+    await fence.transition(activation);
+    let expected: ExecutionFenceState = 'draining';
+    let revision = 1;
+    for (const next of [
+      'migration-locked',
+      'proof-only',
+      'open',
+      'open',
+    ] as const) {
+      await expect(
+        fence.transition({
+          expected,
+          next,
+          expectedMutationEpoch: 1,
+          expectedRevision: revision,
+          ...(next === 'proof-only' ? { proofKey: 'proof-a' } : {}),
+        }),
+      ).resolves.toEqual({
+        state: next,
+        mutationEpoch: 1,
+        requireMutationEpoch: true,
+        transitionRevision: ++revision,
+        ...(next === 'proof-only' ? { proofKey: 'proof-a' } : {}),
+      });
+      expected = next;
+    }
+  });
+
+  it('preserves a bound proof run when the entry transition is retried', async () => {
+    const { fence, sqlite } = fenceFixture();
+    const command = {
+      ...activation,
+      next: 'proof-only' as const,
+      proofKey: 'proof-a',
+    };
+    const admitted = await fence.transition(command);
+    expect(await fence.recordProofRun('proof-a', 'run-a', admitted)).toBe(true);
+    const before = rawFence(sqlite);
+    await expect(fence.transition(command)).resolves.toEqual({
+      ...admitted,
+      proofRunId: 'run-a',
+    });
+    expect(rawFence(sqlite)).toEqual(before);
+    await expect(
+      fence.transition({
+        expected: 'proof-only',
+        next: 'proof-only',
+        proofKey: 'proof-a',
+        expectedMutationEpoch: 1,
+        expectedRevision: 1,
+      }),
+    ).resolves.toEqual({ ...admitted, transitionRevision: 2 });
+    expect(rawFence(sqlite).proof_run_id).toBeNull();
+  });
+
+  it('rejects an old proof admission after same-key proof reentry', async () => {
+    const { db, sqlite } = fenceFixture();
+    let now = 20;
+    const fence = new ExecutionFenceStore(db, { now: () => now });
+    const admitted = await fence.transition({
+      ...activation,
+      next: 'proof-only',
+      proofKey: 'proof-a',
+    });
+    await fence.transition({
+      expected: 'proof-only',
+      next: 'migration-locked',
+      expectedMutationEpoch: 1,
+      expectedRevision: 1,
+    });
+    const current = await fence.transition({
+      expected: 'migration-locked',
+      next: 'proof-only',
+      proofKey: 'proof-a',
+      expectedMutationEpoch: 1,
+      expectedRevision: 2,
+    });
+    expect(await fence.recordProofRun('proof-a', 'run-a', admitted)).toBe(
+      false,
+    );
+    expect(await fence.recordProofRun('proof-a', 'run-a', current)).toBe(true);
+    const before = rawFence(sqlite);
+    now = 99;
+    expect(await fence.recordProofRun('proof-a', 'run-a', current)).toBe(true);
+    expect(await fence.recordProofRun('proof-a', 'run-b', current)).toBe(false);
+    expect(rawFence(sqlite)).toEqual(before);
+  });
+
+  it('fences a queued legacy admin write at activation', async () => {
+    for (const legacyFirst of [true, false]) {
+      const { fence, db } = fenceFixture();
+      await fence.seed('open');
+      let triggered = false;
+      const queued = new ExecutionFenceStore(
+        interceptedDatabase(db, async (sql, execute) => {
+          if (!triggered && sql.startsWith('UPDATE')) {
+            triggered = true;
+            if (legacyFirst)
+              await fence.transition({ expected: 'open', next: 'open' });
+            else await fence.transition({ ...activation, next: 'open' });
+          }
+          return execute();
+        }),
+      );
+      await expect(
+        queued.transition(
+          legacyFirst ? activation : { expected: 'open', next: 'draining' },
+        ),
+      ).rejects.toBeInstanceOf(FenceTransitionConflictError);
+      await expect(fence.read()).resolves.toEqual({
+        state: 'open',
+        mutationEpoch: legacyFirst ? 0 : 1,
+        requireMutationEpoch: !legacyFirst,
+        transitionRevision: 1,
+      });
+    }
+  });
+
+  it('captures proof admission counters before storage waits', async () => {
+    for (const advance of [false, true]) {
+      for (const responseLost of [false, true]) {
+        const { fence, db, sqlite } = fenceFixture();
+        const admitted = {
+          ...(await fence.transition({
+            ...activation,
+            next: 'proof-only',
+            proofKey: 'key',
+          })),
+        };
+        const failure = new Error('proof response lost');
+        let replaced = false;
+        const queued = new ExecutionFenceStore(
+          interceptedDatabase(db, async (sql, execute) => {
+            const result = await execute();
+            if (!replaced && sql.startsWith('SELECT *')) {
+              replaced = true;
+              const current = await fence.transition({
+                expected: 'proof-only',
+                next: 'proof-only',
+                proofKey: 'key',
+                expectedMutationEpoch: 1,
+                expectedRevision: 1,
+                advanceMutationEpoch: advance,
+              });
+              admitted.mutationEpoch = current.mutationEpoch;
+              admitted.transitionRevision = current.transitionRevision;
+            }
+            if (responseLost && sql.startsWith('UPDATE')) {
+              expect(await fence.recordProofRun('key', 'run', admitted)).toBe(
+                true,
+              );
+              throw failure;
+            }
+            return result;
+          }),
+        );
+        if (responseLost) {
+          const error = await queued
+            .recordProofRun('key', 'run', admitted)
+            .catch((error: unknown) => error);
+          expect(error).toBeInstanceOf(ExecutionFenceUnreadableError);
+          expect((error as Error).cause).toBe(failure);
+        } else {
+          expect(await queued.recordProofRun('key', 'run', admitted)).toBe(
+            false,
+          );
+          expect(rawFence(sqlite).proof_run_id).toBeNull();
+        }
+        expect(rawFence(sqlite).transition_revision).toBe(2);
+        expect(rawFence(sqlite).mutation_epoch).toBe(advance ? 2 : 1);
+      }
+    }
+  });
+
+  it('refuses legacy proof binding after activation without upgrading its authority', async () => {
+    const { fence, db, sqlite } = fenceFixture();
+    await fence.transition({
+      expected: 'open',
+      next: 'proof-only',
+      proofKey: 'proof-a',
+    });
+    const queued = new ExecutionFenceStore(
+      interceptedDatabase(db, async (sql, execute) => {
+        if (sql.startsWith('UPDATE'))
+          await fence.transition({
+            expected: 'proof-only',
+            next: 'proof-only',
+            proofKey: 'proof-a',
+            expectedMutationEpoch: 0,
+            expectedRevision: 1,
+            advanceMutationEpoch: true,
+          });
+        return execute();
+      }),
+    );
+    expect(await queued.recordProofRun('proof-a', 'run-a')).toBe(false);
+    expect(rawFence(sqlite).proof_run_id).toBeNull();
+    await expect(fence.read()).resolves.toEqual({
+      state: 'proof-only',
+      proofKey: 'proof-a',
+      mutationEpoch: 1,
+      requireMutationEpoch: true,
+      transitionRevision: 2,
+    });
+  });
+
+  it('validates the captured advance flag before initialization', async () => {
+    const { fence, sqlite } = fenceFixture();
+    let reads = 0;
+    await expect(
+      fence.transition({
+        ...activation,
+        get advanceMutationEpoch() {
+          reads += 1;
+          return reads === 1 ? 'false' : false;
+        },
+      }),
+    ).rejects.toBeInstanceOf(InvalidExecutionFenceRequestError);
+    expect(reads).toBe(1);
+    expect(schemaSnapshot(sqlite)).toEqual([]);
+  });
+
+  it('validates exact counters and never wraps the epoch or revision', async () => {
+    const { fence, sqlite } = fenceFixture();
+    const invalid = [
+      -1,
+      0.5,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      '0',
+      null,
+      true,
+      Number.MAX_SAFE_INTEGER + 1,
+    ];
+    for (const value of invalid) {
+      for (const key of [
+        'expectedMutationEpoch',
+        'expectedRevision',
+      ] as const) {
+        await expect(
+          fence.transition({ ...activation, [key]: value }),
+        ).rejects.toBeInstanceOf(InvalidExecutionFenceRequestError);
+      }
+      await expect(
+        fence.recordProofRun('key', 'run', {
+          mutationEpoch: value as number,
+          transitionRevision: 0,
+        }),
+      ).rejects.toBeInstanceOf(InvalidExecutionFenceRequestError);
+      await expect(
+        fence.recordProofRun('key', 'run', {
+          mutationEpoch: 0,
+          transitionRevision: value as number,
+        }),
+      ).rejects.toBeInstanceOf(InvalidExecutionFenceRequestError);
+    }
+    for (const admitted of [
+      null,
+      {},
+      { mutationEpoch: 0 },
+      { transitionRevision: 0 },
+    ]) {
+      await expect(
+        fence.recordProofRun(
+          'key',
+          'run',
+          // @ts-expect-error runtime validation also rejects untyped partial authority
+          admitted,
+        ),
+      ).rejects.toBeInstanceOf(InvalidExecutionFenceRequestError);
+    }
+    for (const input of [
+      {
+        expected: 'open' as const,
+        next: 'open' as const,
+        expectedMutationEpoch: 0,
+      },
+      { expected: 'open' as const, next: 'open' as const, expectedRevision: 0 },
+      {
+        expected: 'open' as const,
+        next: 'open' as const,
+        advanceMutationEpoch: true,
+      },
+      { ...activation, expectedRevision: Number.MAX_SAFE_INTEGER },
+      { ...activation, expectedMutationEpoch: Number.MAX_SAFE_INTEGER },
+      ...[null, 0, 'false'].map((advanceMutationEpoch) => ({
+        ...activation,
+        advanceMutationEpoch,
+      })),
+    ])
+      await expect(fence.transition(input)).rejects.toBeInstanceOf(
+        InvalidExecutionFenceRequestError,
+      );
+    expect(schemaSnapshot(sqlite)).toEqual([]);
+    await fence.seed('open');
+    sqlite.exec(
+      `UPDATE ${EXECUTION_FENCE_TABLE} SET transition_revision = 9007199254740990`,
+    );
+    const maximum = {
+      ...activation,
+      advanceMutationEpoch: false,
+      expectedRevision: Number.MAX_SAFE_INTEGER - 1,
+    };
+    await fence.transition(maximum);
+    await expect(fence.transition(maximum)).resolves.toEqual({
+      state: 'draining',
+      ...optionalMetadata,
+      transitionRevision: Number.MAX_SAFE_INTEGER,
+    });
+    await expect(
+      fence.transition({ expected: 'draining', next: 'open' }),
+    ).rejects.toBeInstanceOf(FenceTransitionConflictError);
+    expect(rawFence(sqlite).transition_revision).toBe(Number.MAX_SAFE_INTEGER);
+
+    const nearMaximumEpoch = fenceFixture();
+    await nearMaximumEpoch.fence.transition(activation);
+    nearMaximumEpoch.sqlite
+      .prepare(
+        `UPDATE ${EXECUTION_FENCE_TABLE} SET mutation_epoch = ?, last_transition_request = ?`,
+      )
+      .run(
+        Number.MAX_SAFE_INTEGER - 1,
+        JSON.stringify([
+          1,
+          'open',
+          'draining',
+          null,
+          Number.MAX_SAFE_INTEGER - 2,
+          0,
+          true,
+        ]),
+      );
+    const lastEpoch = {
+      ...activation,
+      expected: 'draining' as const,
+      next: 'proof-only' as const,
+      proofKey: 'key',
+      expectedMutationEpoch: Number.MAX_SAFE_INTEGER - 1,
+      expectedRevision: 1,
+    };
+    const full = {
+      state: 'proof-only',
+      proofKey: 'key',
+      mutationEpoch: Number.MAX_SAFE_INTEGER,
+      requireMutationEpoch: true,
+      transitionRevision: 2,
+    };
+    await expect(nearMaximumEpoch.fence.transition(lastEpoch)).resolves.toEqual(
+      full,
+    );
+    await expect(nearMaximumEpoch.fence.transition(lastEpoch)).resolves.toEqual(
+      full,
+    );
+    expect(
+      await nearMaximumEpoch.fence.recordProofRun('key', 'run', {
+        mutationEpoch: Number.MAX_SAFE_INTEGER,
+        transitionRevision: 2,
+      }),
+    ).toBe(true);
+    await expect(
+      nearMaximumEpoch.fence.transition({
+        expected: 'proof-only',
+        next: 'open',
+        expectedMutationEpoch: Number.MAX_SAFE_INTEGER,
+        expectedRevision: 2,
+      }),
+    ).resolves.toEqual({
+      state: 'open',
+      mutationEpoch: Number.MAX_SAFE_INTEGER,
+      requireMutationEpoch: true,
+      transitionRevision: 3,
+    });
+  });
+
+  it('rejects malformed receipt bytes and incoherent upgraded rows', async () => {
+    const { fence, sqlite } = fenceFixture();
+    await fence.transition(activation);
+    const corruptions: Record<string, unknown>[] = [
+      { last_transition_request: '{' },
+      { last_transition_request: ' '.repeat(513) },
+      ...[
+        null,
+        {},
+        [],
+        [2, 'open', 'draining', null, 0, 0, true],
+        [1, 'open', 'draining', null, '0', 0, true],
+        [1, 'open', 'draining', null, 0, 0, 1],
+        [1, 'open', 'proof-only', 'bad key', 0, 0, true],
+        [1, 'open', 'draining', 'bad-key', 0, 0, true],
+        [1, 'open', 'draining', null, 0, 0, true, 0],
+      ].map((receipt) => ({
+        last_transition_request: JSON.stringify(receipt),
+      })),
+      { last_transition_request: '[1, "open","draining",null,0,0,true]' },
+      { state: 'open' },
+      { proof_key: 'unexpected' },
+      { proof_run_id: 'unexpected' },
+      { mutation_epoch: 2 },
+      { transition_revision: 2 },
+      { require_mutation_epoch: 0 },
+      { mutation_epoch: 0 },
+      { transition_revision: 0 },
+      { last_transition_request: null },
+    ];
+    const before = rawFence(sqlite);
+    for (const corruption of corruptions) {
+      const columns = Object.keys(corruption);
+      sqlite
+        .prepare(
+          `UPDATE ${EXECUTION_FENCE_TABLE} SET ${columns.map((key) => `${key} = ?`).join(', ')}`,
+        )
+        .run(...Object.values(corruption));
+      for (const action of [
+        () => fence.read(),
+        () => fence.seed('open'),
+        () => fence.transition(activation),
+      ]) {
+        await expect(action()).rejects.toBeInstanceOf(
+          ExecutionFenceUnreadableError,
+        );
+      }
+      sqlite
+        .prepare(
+          `UPDATE ${EXECUTION_FENCE_TABLE} SET ${Object.keys(before)
+            .map((key) => `${key} = ?`)
+            .join(', ')}`,
+        )
+        .run(...Object.values(before));
+    }
+    for (const result of [
+      null,
+      {},
+      { results: null },
+      { results: [undefined] },
+      { results: [before, before] },
+      { results: [{ ...before, transition_revision: 2 }] },
+    ]) {
+      let reads = 0;
+      const wrapped = new ExecutionFenceStore(
+        interceptedDatabase(fenceFixture().db, async (sql, execute) => {
+          if (sql.startsWith('UPDATE')) return result;
+          if (sql.startsWith('SELECT *')) reads += 1;
+          return execute();
+        }),
+      );
+      await wrapped.seed('open');
+      reads = 0;
+      await expect(wrapped.transition(activation)).rejects.toBeInstanceOf(
+        ExecutionFenceUnreadableError,
+      );
+      expect(reads).toBe(3);
+    }
+
+    for (const success of [false, undefined, null, 0, 'true']) {
+      for (const target of ['row', 'schema', 'transition', 'proof'] as const) {
+        const { db, fence: authority } = fenceFixture();
+        const admitted = await authority.transition({
+          ...activation,
+          next: 'proof-only',
+          proofKey: 'key',
+        });
+        let updateReturned = false;
+        let postUpdateReads = 0;
+        const malformed = new ExecutionFenceStore(
+          interceptedDatabase(db, async (sql, execute) => {
+            const result = await execute();
+            if (updateReturned && /^(SELECT|PRAGMA)/.test(sql))
+              postUpdateReads += 1;
+            const selected =
+              target === 'row'
+                ? sql.startsWith('SELECT *')
+                : target === 'schema'
+                  ? sql.startsWith('PRAGMA')
+                  : sql.startsWith('UPDATE');
+            if (!selected) return result;
+            if (sql.startsWith('UPDATE')) updateReturned = true;
+            return { ...(result as { results: unknown[] }), success };
+          }),
+        );
+        const operation =
+          target === 'transition'
+            ? malformed.transition({
+                expected: 'proof-only',
+                next: 'open',
+                expectedMutationEpoch: 1,
+                expectedRevision: 1,
+              })
+            : target === 'proof'
+              ? malformed.recordProofRun('key', 'run', admitted)
+              : malformed.read();
+        await expect(operation).rejects.toBeInstanceOf(
+          ExecutionFenceUnreadableError,
+        );
+        expect(postUpdateReads).toBe(0);
+      }
+    }
+
+    for (const [column, value] of [
+      ['last_transition_request', null],
+      ['transition_revision', '0'],
+      ['mutation_epoch', true],
+      ['require_mutation_epoch', false],
+      ['require_mutation_epoch', '1'],
+    ] as const) {
+      const { db, fence: valid } = fenceFixture();
+      await valid.transition(activation);
+      const malformed = new ExecutionFenceStore(
+        interceptedDatabase(db, async (sql, execute) => {
+          const result = await execute();
+          if (!sql.startsWith('SELECT *')) return result;
+          const rows = result as { results: Record<string, unknown>[] };
+          return {
+            results: rows.results.map((row) => ({ ...row, [column]: value })),
+          };
+        }),
+      );
+      await expect(malformed.read()).rejects.toBeInstanceOf(
+        ExecutionFenceUnreadableError,
+      );
+    }
+  });
+
+  it('rejects sparse result rows without uncertain-write recovery', async () => {
+    for (const target of ['row', 'schema', 'transition', 'proof'] as const) {
+      const { fence, db, sqlite } = fenceFixture();
+      const admitted = await fence.transition({
+        ...activation,
+        next: 'proof-only',
+        proofKey: 'key',
+      });
+      let malformedReturned = false;
+      let subsequentReads = 0;
+      const malformed = new ExecutionFenceStore(
+        interceptedDatabase(db, async (sql, execute) => {
+          if (malformedReturned && /^(SELECT|PRAGMA)/.test(sql))
+            subsequentReads += 1;
+          const result = await execute();
+          const selected =
+            target === 'row'
+              ? sql.startsWith('SELECT *')
+              : target === 'schema'
+                ? sql.startsWith('PRAGMA')
+                : sql.startsWith('UPDATE');
+          if (selected) {
+            const rows = result as { results: unknown[] };
+            expect(rows.results.length).toBeGreaterThan(0);
+            delete rows.results[0];
+            malformedReturned = true;
+          }
+          return result;
+        }),
+      );
+      const operation =
+        target === 'transition'
+          ? malformed.transition({
+              expected: 'proof-only',
+              next: 'open',
+              expectedMutationEpoch: 1,
+              expectedRevision: 1,
+            })
+          : target === 'proof'
+            ? malformed.recordProofRun('key', 'run', admitted)
+            : malformed.read();
+      await expect(operation).rejects.toBeInstanceOf(
+        ExecutionFenceUnreadableError,
+      );
+      expect(subsequentReads).toBe(0);
+      if (target === 'transition') expect(rawFence(sqlite).state).toBe('open');
+      if (target === 'proof') expect(rawFence(sqlite).proof_run_id).toBe('run');
+    }
+  });
+
+  it('rejects generated or hidden extra fence columns', async () => {
+    const { fence, sqlite } = fenceFixture();
+    await fence.seed('open');
+    sqlite.exec(
+      `ALTER TABLE ${EXECUTION_FENCE_TABLE} ADD COLUMN invisible TEXT GENERATED ALWAYS AS (state) VIRTUAL`,
+    );
+    expect(
+      sqlite.prepare(`PRAGMA table_info(${EXECUTION_FENCE_TABLE})`).all(),
+    ).toHaveLength(12);
+    expect(
+      sqlite.prepare(`PRAGMA table_xinfo(${EXECUTION_FENCE_TABLE})`).all(),
+    ).toHaveLength(13);
+    const schemaMessage = (reason: string) =>
+      `${EXECUTION_FENCE_TABLE} has an invalid execution-fence schema (${reason})`;
+    for (const action of [() => fence.read(), () => fence.seed('open')]) {
+      await expect(action()).rejects.toMatchObject({
+        cause: {
+          name: 'DeploymentIdentityError',
+          message: schemaMessage('unexpected columns'),
+        },
+      });
+    }
+    for (const [schema, diagnostic] of [
+      [
+        EXECUTION_FENCE_DDL.replace(
+          'last_transition_request TEXT',
+          'last_transition_request INTEGER',
+        ),
+        'column last_transition_request differs',
+      ],
+      [
+        EXECUTION_FENCE_DDL.replace(
+          'last_transition_request TEXT',
+          'last_transition_request TEXT DEFAULT NULL',
+        ),
+        'column last_transition_request differs',
+      ],
+      [
+        EXECUTION_FENCE_DDL.replace(
+          'transition_revision INTEGER NOT NULL DEFAULT 0',
+          "transition_revision INTEGER NOT NULL DEFAULT '0'",
+        ),
+        'column transition_revision differs',
+      ],
+      [
+        EXECUTION_FENCE_DDL.replace(
+          'proof_key TEXT,\n    proof_run_id TEXT',
+          'proof_run_id TEXT,\n    proof_key TEXT',
+        ),
+        'column proof_key differs',
+      ],
+      [
+        EXECUTION_FENCE_DDL.replace(
+          'last_transition_request TEXT',
+          'other_receipt TEXT',
+        ),
+        'column last_transition_request differs',
+      ],
+      [
+        EXECUTION_FENCE_DDL.replace(
+          'proof_key TEXT,',
+          'proof_key TEXT GENERATED ALWAYS AS (state) VIRTUAL,',
+        ),
+        'column proof_key differs',
+      ],
+      [
+        EXECUTION_FENCE_DDL.replace(
+          'proof_table_prefix TEXT',
+          'proof_table_prefix INTEGER',
+        ),
+        'column proof_table_prefix differs',
+      ],
+      [
+        EXECUTION_FENCE_DDL.replace(
+          'proof_start_token TEXT',
+          'proof_start_token TEXT DEFAULT NULL',
+        ),
+        'column proof_start_token differs',
+      ],
+      [
+        EXECUTION_FENCE_DDL.replace(
+          /\n {2}\)$/,
+          ',\n    future_column TEXT\n  )',
+        ),
+        'unexpected columns',
+      ],
+    ] as const) {
+      const malformed = fenceFixture();
+      malformed.sqlite.exec(schema);
+      malformed.sqlite.exec(
+        `INSERT INTO ${EXECUTION_FENCE_TABLE} (id, state, updated_at) VALUES ('deployment', 'open', 19)`,
+      );
+      const before = rawFence(malformed.sqlite);
+      const writes: string[] = [];
+      const observed = new ExecutionFenceStore(
+        interceptedDatabase(malformed.db, async (sql, execute) => {
+          if (/^(CREATE|INSERT|UPDATE|ALTER)/.test(sql)) writes.push(sql);
+          return execute();
+        }),
+      );
+      for (const action of [
+        () => observed.read(),
+        () => observed.seed('open'),
+      ]) {
+        await expect(action()).rejects.toMatchObject({
+          cause: {
+            name: 'DeploymentIdentityError',
+            message: schemaMessage(diagnostic),
+          },
+        });
+      }
+      expect(writes).toEqual([]);
+      expect(rawFence(malformed.sqlite)).toEqual(before);
+    }
+  });
+
+  it('distinguishes proof misses from missing or malformed modern state', async () => {
+    for (const outcome of [
+      'missing',
+      'malformed',
+      'changed',
+      'competing-bind',
+    ] as const) {
+      const { fence, sqlite, db } = fenceFixture();
+      const admitted = await fence.transition({
+        ...activation,
+        next: 'proof-only',
+        proofKey: 'key',
+      });
+      const raced = new ExecutionFenceStore(
+        interceptedDatabase(db, async (sql, execute) => {
+          if (!sql.startsWith('UPDATE')) return execute();
+          if (outcome === 'missing')
+            sqlite.exec(`DELETE FROM ${EXECUTION_FENCE_TABLE}`);
+          else if (outcome === 'malformed')
+            sqlite.exec(
+              `UPDATE ${EXECUTION_FENCE_TABLE} SET last_transition_request = 'broken', proof_key = 'different-key'`,
+            );
+          else if (outcome === 'changed')
+            await fence.transition({
+              expected: 'proof-only',
+              next: 'open',
+              expectedMutationEpoch: 1,
+              expectedRevision: 1,
+            });
+          else await fence.recordProofRun('key', 'other-run', admitted);
+          const result = await execute();
+          if (outcome === 'competing-bind') {
+            sqlite.exec(
+              `UPDATE ${EXECUTION_FENCE_TABLE} SET proof_run_id = NULL`,
+            );
+            await fence.recordProofRun('key', 'run', admitted);
+          }
+          return result;
+        }),
+      );
+      if (outcome === 'missing' || outcome === 'malformed')
+        await expect(
+          raced.recordProofRun('key', 'run', admitted),
+        ).rejects.toBeInstanceOf(ExecutionFenceUnreadableError);
+      else
+        expect(await raced.recordProofRun('key', 'run', admitted)).toBe(false);
+    }
+  });
+
+  it('preserves write uncertainty when readback cannot prove the exact command', async () => {
+    for (const outcome of [
+      'before',
+      'readback-fails',
+      'intervening',
+    ] as const) {
+      const { db, fence } = fenceFixture();
+      await fence.seed('open');
+      const failure = new Error('lost write response');
+      let wrote = false;
+      const uncertain = new ExecutionFenceStore(
+        interceptedDatabase(db, async (sql, execute) => {
+          if (sql.startsWith('UPDATE')) {
+            wrote = true;
+            if (outcome !== 'before') await execute();
+            if (outcome === 'intervening')
+              await fence.transition({
+                expected: 'draining',
+                next: 'open',
+                expectedMutationEpoch: 1,
+                expectedRevision: 1,
+              });
+            throw failure;
+          }
+          if (wrote && outcome === 'readback-fails')
+            throw new Error('readback failed');
+          return execute();
+        }),
+      );
+      const error = await uncertain
+        .transition(activation)
+        .catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(ExecutionFenceUnreadableError);
+      expect((error as Error).cause).toBe(failure);
+    }
+    for (const versioned of [false, true]) {
+      const { fence, db, sqlite } = fenceFixture();
+      const admitted = await fence.transition({
+        ...activation,
+        next: 'proof-only',
+        proofKey: 'key',
+        advanceMutationEpoch: versioned,
+      });
+      const lost = new ExecutionFenceStore(
+        interceptedDatabase(db, async (sql, execute) => {
+          const result = await execute();
+          if (sql.startsWith('UPDATE')) throw new Error('lost proof response');
+          return result;
+        }),
+      );
+      expect(
+        await lost.recordProofRun(
+          'key',
+          'run',
+          versioned ? admitted : undefined,
+        ),
+      ).toBe(true);
+      expect(rawFence(sqlite).proof_run_id).toBe('run');
+      expect(rawFence(sqlite).transition_revision).toBe(1);
+    }
+  });
+
+  it('runs all persistence operations on a database without batch', async () => {
+    const { db: backing } = fenceFixture();
+    const db = { prepare: (sql: string) => backing.prepare(sql) };
+    const fence = new ExecutionFenceStore(
+      interceptedDatabase(db, async (_sql, execute) => {
+        const result = await execute();
+        if (result && typeof result === 'object' && 'results' in result)
+          return { results: result.results };
+        return result;
+      }),
+    );
+    expect('batch' in db).toBe(false);
+    await fence.seed('proof-only');
+    const admitted = await fence.transition({
+      expected: 'proof-only',
+      next: 'proof-only',
+      proofKey: 'key',
+      expectedMutationEpoch: 0,
+      expectedRevision: 0,
+    });
+    expect(await fence.recordProofRun('key', 'run', admitted)).toBe(true);
+    await expect(fence.read()).resolves.toEqual({
+      ...admitted,
+      proofRunId: 'run',
+    });
+  });
+});
+
 describe('execution fence admission predicates', () => {
   it('admits a run START only in open, or in proof-only with the exact key', () => {
     expect(admitsRunStart(reading('open'))).toBe(true);
@@ -463,7 +2132,7 @@ describe('execution fence admission predicates', () => {
       proofKey: 'proof-1',
       proofRunId: 'run-1',
     });
-    expect(admitsExistingRun(proof, 'run-1')).toBe(true);
+    expect(admitsExistingRun(proof, 'run-1')).toBe(false);
     expect(admitsExistingRun(proof, 'run-2')).toBe(false);
     expect(admitsExistingRun(proof)).toBe(false);
     expect(admitsExistingRun(reading('proof-only'), 'run-1')).toBe(false);
@@ -557,6 +2226,7 @@ describe('init() fence wiring', () => {
     await executionFence?.seed('draining');
     await expect(runtime.executionFence?.read()).resolves.toEqual({
       state: 'draining',
+      ...optionalMetadata,
     });
     expect(
       schemaSnapshot(sqlite).some(
@@ -574,11 +2244,11 @@ describe('init() fence wiring', () => {
     expect(runtime.executionFence).toBeUndefined();
   });
 
-  it('takes a shared store for a { storage } source', async () => {
+  it('takes a shared store for a { DB } source', async () => {
     const { fence } = fenceFixture();
     const { runtime } = init(
-      { storage: new InMemoryStore() },
-      { startIdempotency: 'none', executionFence: fence },
+      { DB: databaseForFence(fence) },
+      { executionFence: fence },
     );
 
     expect(runtime.executionFence).toBe(fence);
@@ -601,7 +2271,9 @@ describe('init() fence wiring', () => {
 // is resumed, so a single fixture covers both start and resume.
 function fencedRuntime(fence: ExecutionFenceStore): RunnerRuntime {
   const { createWorkflow, createStep, runtime } = init(
-    { storage: new InMemoryStore() },
+    fenceDatabases.has(fence)
+      ? { DB: databaseForFence(fence) }
+      : { storage: new InMemoryStore() },
     { startIdempotency: 'none', executionFence: fence },
   );
   const gate = createStep({
@@ -624,6 +2296,77 @@ function fencedRuntime(fence: ExecutionFenceStore): RunnerRuntime {
 }
 
 describe('RunnerRuntime enforcement', () => {
+  it('FS8 D3 proof activation binds current Runtime provenance and refuses string-only proof', async () => {
+    const { sqlite, db } = fenceFixture();
+    const {
+      createStep,
+      createWorkflow,
+      runtime,
+      executionFence,
+      startIdempotency,
+    } = init({ DB: db });
+    await executionFence?.seed('open');
+    const step = createStep({
+      id: 'finish',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ done: z.boolean() }),
+      execute: async () => ({ done: true }),
+    });
+    createWorkflow({
+      id: 'unchanged',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ done: z.boolean() }),
+    })
+      .then(step)
+      .commit();
+    if (!startIdempotency) throw new Error('fixture reservation store missing');
+    const reserved = await startIdempotency.reserve({
+      key: 'key',
+      owner: { kind: 'human', id: 'owner' },
+      targetKind: 'workflow',
+      targetId: 'unchanged',
+      mintRunId: () => 'run',
+    });
+    const claim = await startIdempotency.claimReservation(reserved.reservation);
+    if (!claim) throw new Error('claim missing');
+    const result = await runtime.start('unchanged', {
+      runId: 'run',
+      inputData: {},
+      requestedBy: 'owner',
+      requestedByKind: 'human',
+      idempotencyKey: 'key',
+      startReservation: claim,
+    });
+    expect(result.status).toBe('success');
+    const row = sqlite
+      .prepare(
+        'SELECT snapshot FROM mastra_workflow_snapshot WHERE workflow_name = ? AND run_id = ?',
+      )
+      .get('unchanged', 'run') as { snapshot: string };
+    expect(
+      JSON.parse(row.snapshot).requestContext['flowsafe.runProvenance'].version,
+    ).toBe(2);
+    expect(await startIdempotency?.read('key')).toMatchObject({
+      state: 'terminal',
+      binding: { kind: 'bound' },
+    });
+    expect(
+      admitsExistingRun(
+        {
+          state: 'proof-only',
+          proofRunId: 'run',
+          proofExecution: {
+            tablePrefix: 'other_',
+            workflowId: 'other',
+            runId: 'run',
+            startToken: 'generation',
+          },
+        },
+        'run',
+      ),
+    ).toBe(false);
+  });
+
   it('starts and resumes freely while open', async () => {
     const { fence } = fenceFixture();
     await fence.seed('open');
@@ -705,16 +2448,31 @@ describe('RunnerRuntime enforcement', () => {
     ).rejects.toBeInstanceOf(ExecutionFencedError);
 
     // #and — the nominated start is admitted, and BINDS the proof run.
+    const store = new StartIdempotencyStore(databaseForFence(fence));
+    const reserved = await store.reserve({
+      key: 'proof-key-1',
+      owner: { kind: 'human', id: 'owner' },
+      targetKind: 'workflow',
+      targetId: 'gated',
+      mintRunId: () => 'proof-run',
+    });
+    const claim = await store.claimReservation(reserved.reservation);
+    if (!claim) throw new Error('claim missing');
     const started = await runtime.start('gated', {
       runId: 'proof-run',
       idempotencyKey: 'proof-key-1',
+      requestedBy: 'owner',
+      requestedByKind: 'human',
+      startReservation: claim,
       inputData: {},
     });
     expect(started.status).toBe('suspended');
-    await expect(fence.read()).resolves.toEqual({
+    await expect(fence.read()).resolves.toMatchObject({
       state: 'proof-only',
       proofKey: 'proof-key-1',
       proofRunId: 'proof-run',
+      ...optionalMetadata,
+      transitionRevision: 1,
     });
 
     // #and — a SECOND start under the same key is refused: the proof is one
@@ -725,7 +2483,7 @@ describe('RunnerRuntime enforcement', () => {
         idempotencyKey: 'proof-key-1',
         inputData: {},
       }),
-    ).rejects.toBeInstanceOf(ExecutionFencedError);
+    ).rejects.toMatchObject({ reason: { code: 'EXECUTION_FENCED' } });
 
     // #and — only the proof run may be resumed.
     await expect(
@@ -743,7 +2501,7 @@ describe('RunnerRuntime enforcement', () => {
     const { fence } = fenceFixture();
     await fence.seed('open');
     const { createWorkflow, createStep, runtime } = init(
-      { storage: new InMemoryStore() },
+      { DB: databaseForFence(fence) },
       { startIdempotency: 'none', executionFence: fence },
     );
     const drainMidRun = createStep({
@@ -772,7 +2530,11 @@ describe('RunnerRuntime enforcement', () => {
     // #then — in-flight compute is never preempted; only the NEXT start is
     // refused. The drain sequence is drain, then prove empty, then lock.
     expect(summary.status).toBe('success');
-    await expect(fence.read()).resolves.toEqual({ state: 'draining' });
+    await expect(fence.read()).resolves.toEqual({
+      state: 'draining',
+      ...optionalMetadata,
+      transitionRevision: 1,
+    });
     await expect(
       runtime.start('racing', { runId: 'run-racing-2', inputData: {} }),
     ).rejects.toBeInstanceOf(ExecutionFencedError);
@@ -801,5 +2563,650 @@ describe('RunnerRuntime enforcement', () => {
       .catch((thrown: unknown) => thrown);
     expect(error).toBeInstanceOf(ExecutionFenceUnreadableError);
     expect(doErrorResponse(error).status).toBe(503);
+  });
+});
+
+describe('FS8 D3 proof activation', () => {
+  const execution = {
+    tablePrefix: 'proof_',
+    workflowId: 'workflow',
+    runId: 'run',
+    startToken: 'generation',
+    owner: { kind: 'human' as const, id: 'owner' },
+    target: { kind: 'workflow' as const, id: 'workflow' },
+  };
+  async function fixture(
+    intercept?: (
+      sql: string,
+      execute: () => Promise<unknown>,
+    ) => Promise<unknown>,
+  ) {
+    const sqlite = openSqlite();
+    const backing = sqliteUnitDatabase(sqlite) as ExecutionFenceDatabase;
+    const db = intercept ? interceptedDatabase(backing, intercept) : backing;
+    const fence = new ExecutionFenceStore(db, { now: () => 50 });
+    const store = new StartIdempotencyStore(db, { now: () => 10 });
+    await fence.seed('migration-locked');
+    await fence.transition({
+      expected: 'migration-locked',
+      next: 'proof-only',
+      proofKey: 'key',
+      expectedMutationEpoch: 0,
+      expectedRevision: 0,
+    });
+    const { reservation } = await store.reserve({
+      key: 'key',
+      owner: execution.owner,
+      targetKind: 'workflow',
+      targetId: 'workflow',
+      mintRunId: () => 'run',
+    });
+    const bound = await store.associateReservation(reservation, execution);
+    sqlite.exec(
+      'CREATE TABLE proof_mastra_workflow_snapshot (workflow_name TEXT, run_id TEXT, resourceId TEXT, snapshot TEXT, createdAt TEXT, updatedAt TEXT, PRIMARY KEY(workflow_name,run_id))',
+    );
+    const snapshot = {
+      runId: 'run',
+      status: 'suspended',
+      requestContext: {
+        'flowsafe.runProvenance': {
+          version: 2,
+          startToken: 'generation',
+          attemptToken: 'attempt',
+          requestedBy: 'owner',
+          requestedByKind: 'human',
+          startIdentity: { owner: execution.owner, target: execution.target },
+          resumeCounts: [],
+          initialAdmission: true,
+        },
+      },
+    };
+    const writeSnapshot = (value: unknown = snapshot) =>
+      sqlite
+        .prepare(
+          'INSERT OR REPLACE INTO proof_mastra_workflow_snapshot VALUES (?,?,?,?,?,?)',
+        )
+        .run(
+          'workflow',
+          'run',
+          'resource',
+          JSON.stringify(value),
+          'created',
+          'updated',
+        );
+    writeSnapshot();
+    const frame = await fence.read();
+    const options = {
+      reservation: bound,
+      execution,
+      proof: {
+        key: 'key',
+        mutationEpoch: frame.mutationEpoch,
+        transitionRevision: frame.transitionRevision,
+      },
+      mutationEpoch: 0,
+      reservationStore: store,
+    };
+    const row = () =>
+      sqlite.prepare('SELECT * FROM flowsafe_execution_fence').get() as Record<
+        string,
+        unknown
+      >;
+    return { sqlite, db, fence, store, snapshot, writeSnapshot, options, row };
+  }
+
+  it('reads and nominates an exact current nonpending owned generation while preserving the receipt', async () => {
+    const h = await fixture();
+    const before = h.row();
+    expect(await h.fence.readCurrentRunExecution(execution)).toEqual({
+      tablePrefix: 'proof_',
+      workflowId: 'workflow',
+      runId: 'run',
+      startToken: 'generation',
+    });
+    expect(await h.fence.rebindProofRun(h.options)).toBe(true);
+    expect(h.row()).toMatchObject({
+      proof_run_id: 'run',
+      proof_table_prefix: 'proof_',
+      proof_workflow_id: 'workflow',
+      proof_start_token: 'generation',
+      updated_at: 50,
+      last_transition_request: before.last_transition_request,
+      transition_revision: before.transition_revision,
+    });
+    expect(await h.fence.rebindProofRun(h.options)).toBe(true);
+    expect(h.row().updated_at).toBe(50);
+  });
+
+  it.each([
+    'tablePrefix',
+    'workflowId',
+    'runId',
+    'startToken',
+  ] as const)('requires matching canonical physical field %s at the proof predicate', (field) => {
+    const proof = {
+      tablePrefix: 'proof_',
+      workflowId: 'workflow',
+      runId: 'run',
+      startToken: 'generation',
+    };
+    expect(
+      admitsExistingRun(
+        { state: 'proof-only', proofExecution: proof },
+        { ...proof },
+      ),
+    ).toBe(true);
+    expect(
+      admitsExistingRun(
+        { state: 'proof-only', proofExecution: proof },
+        { ...proof, [field]: field === 'tablePrefix' ? 'other_' : 'other' },
+      ),
+    ).toBe(false);
+    expect(
+      admitsExistingRun(
+        { state: 'proof-only', proofExecution: proof },
+        { ...proof, tablePrefix: 'PROOF_' },
+      ),
+    ).toBe(false);
+    expect(
+      admitsExistingRun({ state: 'proof-only', proofRunId: 'run' }, proof),
+    ).toBe(false);
+  });
+
+  it.each([
+    'missing',
+    'legacy',
+    'unowned',
+    'pending',
+    'replacement',
+  ] as const)('does not nominate a %s current snapshot', async (mode) => {
+    const h = await fixture();
+    if (mode === 'missing')
+      h.sqlite.exec('DELETE FROM proof_mastra_workflow_snapshot');
+    else {
+      const source = h.snapshot.requestContext['flowsafe.runProvenance'];
+      if (mode === 'legacy') source.version = 1;
+      if (mode === 'unowned')
+        delete (source as { startIdentity?: unknown }).startIdentity;
+      if (mode === 'pending') h.snapshot.status = 'pending';
+      if (mode === 'replacement') source.startToken = 'replacement';
+      h.writeSnapshot();
+    }
+    const before = h.row();
+    const result = await h.fence.rebindProofRun(h.options);
+    expect(h.row()).toEqual(before);
+    expect(result).toBe(false);
+  });
+
+  it.each([
+    'runId',
+    'status',
+    'container',
+    'provenance',
+  ] as const)('refuses malformed current snapshot %s as unreadable', async (field) => {
+    const h = await fixture();
+    const state: Record<string, unknown> = h.snapshot;
+    if (field === 'runId') state.runId = 'other';
+    if (field === 'status') state.status = 'unknown';
+    if (field === 'container') state.steps = [];
+    if (field === 'provenance')
+      state.requestContext = { 'flowsafe.runProvenance': { version: 2 } };
+    h.writeSnapshot(state);
+    const before = h.row();
+    const outcome = await h.fence
+      .rebindProofRun(h.options)
+      .catch((error) => error);
+    expect(h.row()).toEqual(before);
+    expect(outcome).toBeInstanceOf(ExecutionFenceUnreadableError);
+  });
+
+  const rowMutations = [
+    [
+      'snapshot-workflow',
+      "UPDATE proof_mastra_workflow_snapshot SET workflow_name = 'other'",
+    ],
+    [
+      'snapshot-run',
+      "UPDATE proof_mastra_workflow_snapshot SET run_id = 'other'",
+    ],
+    [
+      'snapshot-resource',
+      "UPDATE proof_mastra_workflow_snapshot SET resourceId = 'other'",
+    ],
+    [
+      'snapshot-bytes',
+      "UPDATE proof_mastra_workflow_snapshot SET snapshot = snapshot || ' '",
+    ],
+    [
+      'snapshot-created',
+      "UPDATE proof_mastra_workflow_snapshot SET createdAt = 'other'",
+    ],
+    [
+      'snapshot-updated',
+      "UPDATE proof_mastra_workflow_snapshot SET updatedAt = 'other'",
+    ],
+    ['reservation-key', "UPDATE flowsafe_start_idempotency SET key = 'other'"],
+    [
+      'reservation-owner-kind',
+      "UPDATE flowsafe_start_idempotency SET owner_kind = 'service'",
+    ],
+    [
+      'reservation-owner-id',
+      "UPDATE flowsafe_start_idempotency SET owner_id = 'other'",
+    ],
+    [
+      'reservation-target-kind',
+      "UPDATE flowsafe_start_idempotency SET target_kind = 'agent'",
+    ],
+    [
+      'reservation-target-id',
+      "UPDATE flowsafe_start_idempotency SET target_id = 'other'",
+    ],
+    [
+      'reservation-run',
+      "UPDATE flowsafe_start_idempotency SET run_id = 'other'",
+    ],
+    [
+      'reservation-thread',
+      "UPDATE flowsafe_start_idempotency SET thread_id = 'thread'",
+    ],
+    [
+      'reservation-state',
+      "UPDATE flowsafe_start_idempotency SET state = 'terminal'",
+    ],
+    [
+      'reservation-created',
+      'UPDATE flowsafe_start_idempotency SET created_at = 11',
+    ],
+    [
+      'reservation-updated',
+      'UPDATE flowsafe_start_idempotency SET updated_at = 11',
+    ],
+    [
+      'reservation-token',
+      "UPDATE flowsafe_start_idempotency SET start_token = 'other'",
+    ],
+    [
+      'reservation-prefix',
+      "UPDATE flowsafe_start_idempotency SET start_table_prefix = 'other_'",
+    ],
+    [
+      'reservation-workflow',
+      "UPDATE flowsafe_start_idempotency SET start_workflow_id = 'other'",
+    ],
+    [
+      'proof-state',
+      "UPDATE flowsafe_execution_fence SET state = 'migration-locked'",
+    ],
+    ['proof-key', "UPDATE flowsafe_execution_fence SET proof_key = 'other'"],
+    ['proof-epoch', 'UPDATE flowsafe_execution_fence SET mutation_epoch = 1'],
+    [
+      'proof-revision',
+      'UPDATE flowsafe_execution_fence SET transition_revision = 2',
+    ],
+    [
+      'proof-required',
+      'UPDATE flowsafe_execution_fence SET require_mutation_epoch = 1',
+    ],
+    [
+      'proof-receipt',
+      'UPDATE flowsafe_execution_fence SET last_transition_request = NULL',
+    ],
+  ] as const;
+  it.each(
+    rowMutations,
+  )('retains exact final SQL guard for %s', async (_label, mutation) => {
+    let mutate: (() => void) | undefined;
+    const h = await fixture(async (sql, execute) => {
+      if (
+        sql.startsWith('UPDATE flowsafe_execution_fence') &&
+        sql.includes('EXISTS')
+      ) {
+        mutate?.();
+        mutate = undefined;
+      }
+      return execute();
+    });
+    mutate = () => h.sqlite.exec(mutation);
+    const result = await h.fence
+      .rebindProofRun(h.options)
+      .catch((error) => error);
+    expect(h.row().proof_run_id).toBeNull();
+    expect(result).not.toBe(true);
+  });
+
+  it.each([
+    'converges',
+    'snapshot-changed',
+    'reservation-changed',
+    'round-changed',
+  ] as const)('uses one coherent response-loss query that %s', async (mode) => {
+    let afterWrite: (() => void) | undefined;
+    let convergenceReads = 0;
+    const h = await fixture(async (sql, execute) => {
+      if (
+        sql.startsWith('SELECT * FROM flowsafe_execution_fence') &&
+        sql.includes('EXISTS')
+      )
+        convergenceReads++;
+      if (
+        sql.startsWith('UPDATE flowsafe_execution_fence') &&
+        sql.includes('EXISTS')
+      ) {
+        await execute();
+        afterWrite?.();
+        throw new Error('response lost');
+      }
+      return execute();
+    });
+    afterWrite = () => {
+      if (mode === 'snapshot-changed')
+        h.sqlite.exec(
+          "UPDATE proof_mastra_workflow_snapshot SET snapshot = snapshot || ' '",
+        );
+      if (mode === 'reservation-changed')
+        h.sqlite.exec('UPDATE flowsafe_start_idempotency SET updated_at = 11');
+      if (mode === 'round-changed')
+        h.sqlite.exec(
+          'UPDATE flowsafe_execution_fence SET transition_revision = 2, last_transition_request = NULL',
+        );
+    };
+    const outcome = await h.fence
+      .rebindProofRun(h.options)
+      .catch((error) => error);
+    expect(h.row().proof_start_token).toBe('generation');
+    expect(convergenceReads).toBe(1);
+    if (mode === 'converges') expect(outcome).toBe(true);
+    else expect(outcome).toBeInstanceOf(ExecutionFenceUnreadableError);
+  });
+
+  it('preserves a late foreign fence row when the accepted schema lacks the singleton CHECK', async () => {
+    let inject: (() => void) | undefined;
+    const h = await fixture(async (sql, execute) => {
+      if (
+        sql.startsWith('UPDATE flowsafe_execution_fence') &&
+        sql.includes('EXISTS')
+      )
+        inject?.();
+      return execute();
+    });
+    const schema = h.sqlite
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE name = 'flowsafe_execution_fence'",
+      )
+      .get() as { sql: string };
+    const withoutIdCheck = schema.sql.replace("CHECK (id = 'deployment')", '');
+    expect(withoutIdCheck).not.toBe(schema.sql);
+    h.sqlite.exec(
+      'ALTER TABLE flowsafe_execution_fence RENAME TO previous_execution_fence',
+    );
+    h.sqlite.exec(withoutIdCheck);
+    h.sqlite.exec(
+      'INSERT INTO flowsafe_execution_fence SELECT * FROM previous_execution_fence',
+    );
+    h.sqlite.exec('DROP TABLE previous_execution_fence');
+    const foreignRow = () =>
+      h.sqlite
+        .prepare("SELECT * FROM flowsafe_execution_fence WHERE id = 'foreign'")
+        .get();
+    let before: unknown;
+    inject = () => {
+      h.sqlite.exec(
+        `INSERT INTO flowsafe_execution_fence
+          SELECT 'foreign', state, proof_key, proof_run_id, updated_at,
+            last_transition_request, transition_revision, mutation_epoch,
+            require_mutation_epoch, proof_table_prefix, proof_workflow_id, proof_start_token
+          FROM flowsafe_execution_fence WHERE id = 'deployment'`,
+      );
+      before = foreignRow();
+    };
+    const outcome = await h.fence
+      .rebindProofRun(h.options)
+      .catch((error) => error);
+    expect(foreignRow()).toEqual(before);
+    expect(outcome).toBe(true);
+    expect(
+      h.sqlite
+        .prepare(
+          "SELECT proof_start_token FROM flowsafe_execution_fence WHERE id = 'deployment'",
+        )
+        .get(),
+    ).toEqual({ proof_start_token: 'generation' });
+  });
+
+  it('does not converge after malformed RETURNING or known zero', async () => {
+    for (const mode of ['malformed', 'zero']) {
+      let enabled = false;
+      let reads = 0;
+      const h = await fixture(async (sql, execute) => {
+        if (enabled && sql.startsWith('SELECT') && sql.includes('EXISTS'))
+          reads++;
+        if (
+          enabled &&
+          sql.startsWith('UPDATE flowsafe_execution_fence') &&
+          sql.includes('EXISTS')
+        ) {
+          await execute();
+          return mode === 'zero'
+            ? { results: [] }
+            : { results: [{ bad: true }] };
+        }
+        return execute();
+      });
+      enabled = true;
+      const result = await h.fence
+        .rebindProofRun(h.options)
+        .catch((error) => error);
+      expect(h.row().proof_start_token).toBe('generation');
+      expect(reads).toBe(0);
+      if (mode === 'zero') expect(result).toBe(false);
+      else expect(result).toBeInstanceOf(ExecutionFenceUnreadableError);
+    }
+  });
+
+  it('refuses mismatched database ports before I/O and never lets the legacy setter alter or acknowledge a modern tuple', async () => {
+    const h = await fixture();
+    let prepares = 0;
+    const fence = new ExecutionFenceStore({
+      prepare: (sql) => {
+        prepares++;
+        return h.db.prepare(sql);
+      },
+    });
+    const bad = await fence.rebindProofRun(h.options).catch((error) => error);
+    expect(prepares).toBe(0);
+    expect((bad as { reason?: { code?: string } }).reason?.code).toBe(
+      'INVALID_EXECUTION_IDENTITY',
+    );
+    expect(await h.fence.rebindProofRun(h.options)).toBe(true);
+    const before = h.row();
+    const legacyOutcome = await h.fence
+      .recordProofRun('key', 'run', h.options.proof)
+      .catch((error) => error);
+    expect(h.row()).toEqual(before);
+    expect(legacyOutcome).toBe(false);
+    const lost = new ExecutionFenceStore(
+      interceptedDatabase(h.db, async (sql, execute) => {
+        if (sql.startsWith('UPDATE flowsafe_execution_fence'))
+          throw new Error('legacy response lost');
+        return execute();
+      }),
+    );
+    const outcome = await lost
+      .recordProofRun('key', 'run', h.options.proof)
+      .catch((error) => error);
+    expect(h.row()).toEqual(before);
+    expect(outcome).toBeInstanceOf(ExecutionFenceUnreadableError);
+  });
+  it.each([
+    'proof_run_id',
+    'proof_table_prefix',
+    'proof_workflow_id',
+    'proof_start_token',
+  ] as const)('preserves a late partial nomination when empty proof tuple %s is nonnull', async (column) => {
+    let inject: (() => void) | undefined;
+    const h = await fixture(async (sql, execute) => {
+      if (
+        sql.startsWith('UPDATE flowsafe_execution_fence') &&
+        sql.includes('EXISTS')
+      )
+        inject?.();
+      return execute();
+    });
+    let before: Record<string, unknown> | undefined;
+    inject = () => {
+      h.sqlite.exec(`UPDATE flowsafe_execution_fence SET ${column} = 'other'`);
+      before = h.row();
+    };
+    const outcome = await h.fence
+      .rebindProofRun(h.options)
+      .catch((error) => error);
+    expect(h.row()).toEqual(before);
+    expect(outcome).not.toBe(true);
+  });
+
+  it.each([
+    'proof_run_id',
+    'proof_table_prefix',
+    'proof_workflow_id',
+    'proof_start_token',
+  ] as const)('preserves a competing nomination when final proof tuple %s differs', async (column) => {
+    let inject: (() => void) | undefined;
+    const h = await fixture(async (sql, execute) => {
+      if (
+        sql.startsWith('UPDATE flowsafe_execution_fence') &&
+        sql.includes('EXISTS')
+      )
+        inject?.();
+      return execute();
+    });
+    let before: Record<string, unknown> | undefined;
+    inject = () => {
+      h.sqlite
+        .prepare(
+          'UPDATE flowsafe_execution_fence SET proof_run_id = ?, proof_table_prefix = ?, proof_workflow_id = ?, proof_start_token = ?',
+        )
+        .run(
+          column === 'proof_run_id' ? 'other' : 'run',
+          column === 'proof_table_prefix' ? 'other_' : 'proof_',
+          column === 'proof_workflow_id' ? 'other' : 'workflow',
+          column === 'proof_start_token' ? 'other' : 'generation',
+        );
+      before = h.row();
+    };
+    const outcome = await h.fence
+      .rebindProofRun(h.options)
+      .catch((error) => error);
+    expect(h.row()).toEqual(before);
+    expect(outcome).not.toBe(true);
+  });
+
+  it('retains the original source owner when a later initiator differs', async () => {
+    const h = await fixture();
+    h.snapshot.requestContext['flowsafe.runProvenance'].requestedBy =
+      'later-initiator';
+    h.writeSnapshot();
+    expect(await h.fence.rebindProofRun(h.options)).toBe(true);
+    expect(h.row().proof_start_token).toBe('generation');
+    expect((await h.store.read('key'))?.owner).toEqual(execution.owner);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The contracts the fence's reservation seam rests on, each carrying its own
+// evidence. `refuses mismatched database ports before I/O and never lets the
+// legacy setter alter or acknowledge a modern tuple` is the structural DB-port
+// control and establishes nothing beyond it, so the import boundary, the codec
+// definitions and the refusal constructor are asserted here instead of being
+// read off that one case.
+// ---------------------------------------------------------------------------
+
+type SourceReader = { readFileSync(path: string, encoding: string): string };
+
+/**
+ * A sibling module's source, through getBuiltinModule so this workers-typed
+ * program needs no Node ambient types — the idiom test-support/sqlite.ts uses.
+ */
+function siblingSource(file: string): string {
+  const fs = (
+    globalThis as {
+      process?: { getBuiltinModule?: (id: string) => unknown };
+    }
+  ).process?.getBuiltinModule?.('node:fs') as SourceReader | undefined;
+  if (!fs) throw new Error('node:fs unavailable — tests require node >= 22');
+  return fs.readFileSync(
+    new URL(file, (import.meta as ImportMeta & { url: string }).url).pathname,
+    'utf8',
+  );
+}
+
+describe('start-reservation contract evidence', () => {
+  it('reads an edge out of each specifier form it lists', () => {
+    // The positive control for the case below and for the packed gates in
+    // ../../scripts, which scan with the same patterns: a specifier form the
+    // list misses would leave a scan green while the edge it forbids was
+    // added.
+    expect(
+      specifiersIn(
+        [
+          "import { a } from './from-clause.js';",
+          "export type { B } from './re-export.js';",
+          "import './side-effect.js';",
+          "const c = await import('./dynamic.js');",
+          "const d = require('./required.js');",
+          "declare module './augmented.js' {",
+          '/// <reference types="triple-slash" />',
+          "const notAnEdge = 'plain string';",
+        ].join('\n'),
+      ),
+    ).toEqual([
+      './from-clause.js',
+      './re-export.js',
+      './side-effect.js',
+      './dynamic.js',
+      './required.js',
+      './augmented.js',
+      'triple-slash',
+    ]);
+  });
+
+  it('separates a source that names a module from one that names none', () => {
+    expect(namesAnotherModule("export * from './barrel.js';")).toBe(true);
+    expect(namesAnotherModule("const notAnEdge = 'plain string';")).toBe(false);
+  });
+
+  it('keeps the reservation contract a leaf of three declared edges', () => {
+    // Source edges, not a cycle check: a cycle rule admits a one-way edge from
+    // this leaf into a store, a fence, Runtime or a capability, and admitting
+    // one would put the fence's codecs behind the graph they decode for. Type-
+    // only edges count — they are erased, and the boundary is not.
+    const edges = specifiersIn(
+      siblingSource('./start-reservation-contract.ts'),
+    );
+    expect(edges).toEqual([
+      '../approval-api/principal-identity.js',
+      './execution-admission.js',
+      './path-safe-id.js',
+    ]);
+  });
+
+  it('gives the fence and the reservation store one definition of each codec', () => {
+    // The strict admission-codec suites drive these two functions through the
+    // store's re-export; the fence imports them from the leaf. Same function
+    // objects, so that evidence is evidence about the fence's own decode.
+    expect(reExportedDecode).toBe(decodeStartReservationAdmissionResult);
+    expect(reExportedValidate).toBe(validateStartReservationAdmissionSchema);
+  });
+
+  it('publishes the reservation refusal constructor rather than a second copy', () => {
+    // A forwarding copy would be a second constructor object: an instanceof
+    // written against the package surface would refuse the error the store
+    // threw.
+    expect(BarrelStartReservationUnreadableError).toBe(
+      StartReservationUnreadableError,
+    );
+    expect(new StartReservationUnreadableError('key')).toBeInstanceOf(
+      BarrelStartReservationUnreadableError,
+    );
   });
 });

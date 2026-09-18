@@ -3,7 +3,10 @@
 import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { ActiveRouteAttestationError } from '../src/active-route.js';
-import { canonicalApplicationBindings } from '../src/application-bindings.js';
+import {
+  canonicalApplicationBindings,
+  reserveApplicationR2Resources,
+} from '../src/application-bindings.js';
 import type {
   BridgeMutationPlan,
   BridgeSnapshot,
@@ -49,6 +52,7 @@ import type {
   SeedDeploymentIdentityOptions,
 } from '../src/types.js';
 import { externalReleaseScriptName } from '../src/workers-for-platforms-backend.js';
+import { decommissionAdvancingRecordFixture } from './fixtures/decommission-intent-fixture.js';
 
 const MAINTENANCE_PUBLIC_KEY =
   '{"kty":"OKP","crv":"Ed25519","alg":"EdDSA","kid":"fleet-maintenance-v1","x":"Lhp1XFeTJJx8FLOCKpn4nkO-tWuZZxXX8ziw0LEvUZo"}';
@@ -742,6 +746,7 @@ function inventoryFor(records: readonly FleetRecord[]): FleetResourceInventory {
     dispatchScriptCount: records.filter(
       (item) => item.backend === 'workers-for-platforms',
     ).length,
+    unavailableR2Jurisdictions: Object.freeze([]),
     scriptRegistrations: records.map((item) => ({
       scriptName: item.scriptName,
       tenantTag: item.tenantTag,
@@ -1096,6 +1101,7 @@ describe('fleet operations', () => {
       inventory: {
         findings: inventory.findings,
         dispatchScriptCount: inventory.dispatchScriptCount,
+        unavailableR2Jurisdictions: Object.freeze([]),
         scriptRegistrations: [
           ...inventory.scriptRegistrations,
           {
@@ -1228,6 +1234,7 @@ describe('fleet operations', () => {
       const inventory: FleetResourceInventory = {
         findings: [],
         dispatchScriptCount: releases.length,
+        unavailableR2Jurisdictions: Object.freeze([]),
         scriptRegistrations: releases.map((candidate) => ({
           scriptName: candidate.physicalScriptName,
           tenantTag: acme.tenantTag,
@@ -1594,6 +1601,7 @@ describe('fleet operations', () => {
     const inventory: FleetResourceInventory = {
       findings: [],
       dispatchScriptCount: 2,
+      unavailableR2Jurisdictions: Object.freeze([]),
       scriptRegistrations: [priorRelease, targetRelease].map((release) => ({
         scriptName: release.physicalScriptName,
         tenantTag: migrating.tenantTag,
@@ -1718,6 +1726,7 @@ describe('fleet operations', () => {
     const inventory: FleetResourceInventory = {
       findings: [],
       dispatchScriptCount: 0,
+      unavailableR2Jurisdictions: Object.freeze([]),
       scriptRegistrations: [],
       deployments: [],
       databaseIds: [],
@@ -1785,6 +1794,7 @@ describe('fleet operations', () => {
     const inventory: FleetResourceInventory = {
       findings: [],
       dispatchScriptCount: 1,
+      unavailableR2Jurisdictions: Object.freeze([]),
       scriptRegistrations: [
         {
           scriptName: active.physicalScriptName,
@@ -1910,6 +1920,7 @@ describe('fleet operations', () => {
         findings: [],
         hostRoutingKvId: 'host-routing-kv',
         dispatchScriptCount: 0,
+        unavailableR2Jurisdictions: Object.freeze([]),
         scriptRegistrations: [],
         deployments: expectsTrustedWorkers
           ? [
@@ -2010,6 +2021,7 @@ describe('fleet operations', () => {
       inventory: {
         findings: [],
         dispatchScriptCount: 0,
+        unavailableR2Jurisdictions: Object.freeze([]),
         scriptRegistrations: [],
         deployments: [],
         databaseIds: [releaseBearing.databaseId],
@@ -2063,6 +2075,7 @@ describe('fleet operations', () => {
       findings: [],
       hostRoutingKvId: 'host-routing-kv',
       dispatchScriptCount: 1,
+      unavailableR2Jurisdictions: Object.freeze([]),
       scriptRegistrations: [
         {
           scriptName: current.scriptName,
@@ -2237,6 +2250,7 @@ describe('fleet operations', () => {
         records: [current],
         inventory: {
           findings: [],
+          unavailableR2Jurisdictions: Object.freeze([]),
           scriptRegistrations: [],
           deployments: [],
           databaseIds: [current.databaseId],
@@ -2256,6 +2270,48 @@ describe('fleet operations', () => {
         ),
         phase,
       ).toEqual([]);
+    }
+  });
+
+  it('uses effective decommission phases for fleet and R2 expectations', async () => {
+    for (const phase of [
+      'ready',
+      'worker-deleted',
+      'platform-resources-deleted',
+      'application-resources-deleted',
+      'database-exported',
+    ] as const) {
+      const legacy: FleetRecord = {
+        ...record(`effective-${phase}`),
+        phase,
+        applicationResources: [
+          {
+            name: 'FILES',
+            bucketName: `effective-${phase}-bucket`,
+            jurisdiction: 'default',
+            state: 'created',
+            reservationNonce: 'a'.repeat(32),
+            creationDate: '2026-08-11T00:00:00.000Z',
+          },
+        ],
+      };
+      const inventory = inventoryFor([legacy]);
+      const audit = (current: FleetRecord) =>
+        auditFleetDrift({
+          store: storeFor([current]),
+          records: [current],
+          inventory,
+          backendFor: () => new FleetBackend(current.backend),
+          specFor: () => spec(legacy),
+          maintenanceSecretFor: () => 'maintenance-admin-secret-value-00001',
+          staleAfterMs: 1_000,
+          now: 10_000,
+        });
+
+      expect(
+        await audit(decommissionAdvancingRecordFixture(legacy, phase)),
+        phase,
+      ).toEqual(await audit(legacy));
     }
   });
 
@@ -2403,6 +2459,254 @@ describe('fleet operations', () => {
       }),
     );
     expect(backend.calls).toContain('inspect:healthy');
+  });
+
+  it('suppresses drift findings in both directions for a deployment under active bounded cleanup', async () => {
+    const cleaningBase = record('acme');
+    const [reserved] = reserveApplicationR2Resources({
+      ...spec(cleaningBase, 1),
+      application: { vars: [], secrets: [], r2Buckets: [{ name: 'DATA' }] },
+    });
+    if (!reserved) throw new Error('missing reserved application resource');
+    const dataResource = {
+      ...reserved,
+      state: 'created' as const,
+      creationDate: '2026-08-01T00:00:00.000Z',
+    };
+    const cleaning: FleetRecord = {
+      ...cleaningBase,
+      phase: 'cleanup-advancing',
+      applicationResources: [dataResource],
+    };
+    const withIntent: FleetRecord = {
+      ...cleaning,
+      cleanupIntent: {
+        version: 1,
+        operationId: '5b8e2f1a-3c4d-4e5f-8a9b-0c1d2e3f4a5b',
+        revision: 2,
+        generation: 0,
+        updatedAt: cleaning.updatedAt,
+        authority: { kind: 'manual-cleanup' },
+        identity: {
+          record: {
+            tenantTag: cleaning.tenantTag,
+            environment: cleaning.environment,
+            backend: cleaning.backend,
+            scriptName: cleaning.scriptName,
+            databaseId: cleaning.databaseId,
+            databaseName: cleaning.databaseName,
+            routeHostname: cleaning.routeHostname,
+          },
+          admittedPhase: 'worker-deployed',
+          externalArtifact: false,
+        },
+        state: { step: 'teardown-worker' },
+      },
+    };
+    const beta = record('beta');
+    const backend = new FleetBackend();
+    backend.live.set(beta.tenantTag, liveFor(beta));
+    const audit = (inventory: FleetResourceInventory) =>
+      auditFleetDrift({
+        store: storeFor([withIntent, beta]),
+        records: [withIntent, beta],
+        inventory,
+        backendFor: (item) => {
+          if (item.cleanupIntent) {
+            throw new Error('suppressed cleanup record must not be audited');
+          }
+          return backend;
+        },
+        specFor: (item) => spec(item),
+        maintenanceSecretFor: () => 'maintenance-admin-secret-value-00001',
+        staleAfterMs: 1_000,
+        now: 10_000,
+      });
+
+    // Still-present declared resources are known, never orphans.
+    const present = inventoryFor([cleaningBase, beta]);
+    await expect(
+      audit({
+        ...present,
+        r2Buckets: [
+          {
+            bucketName: dataResource.bucketName,
+            jurisdiction: dataResource.jurisdiction ?? 'default',
+            creationDate: dataResource.creationDate,
+          },
+        ],
+      }),
+    ).resolves.toEqual([]);
+
+    // Already-removed resources raise no expectation-based findings either:
+    // the bounded engine, not the drift audit, reconciles this deployment.
+    await expect(audit(inventoryFor([beta]))).resolves.toEqual([]);
+  });
+
+  it('reports no incomplete provisioning for a stale blocked cleanup record', async () => {
+    const base = record('acme');
+    const blocked: FleetRecord = {
+      ...base,
+      phase: 'cleanup-advancing',
+      cleanupIntent: {
+        version: 1,
+        operationId: '5b8e2f1a-3c4d-4e5f-8a9b-0c1d2e3f4a5b',
+        revision: 7,
+        generation: 1,
+        updatedAt: base.updatedAt,
+        authority: { kind: 'manual-cleanup' },
+        identity: {
+          record: {
+            tenantTag: base.tenantTag,
+            environment: base.environment,
+            backend: base.backend,
+            scriptName: base.scriptName,
+            databaseId: base.databaseId,
+            databaseName: base.databaseName,
+            routeHostname: base.routeHostname,
+          },
+          admittedPhase: 'worker-deployed',
+          externalArtifact: false,
+        },
+        state: {
+          step: 'blocked',
+          purpose: {
+            kind: 'cleanup-database-pre-delete',
+            databaseId: base.databaseId,
+            operationId: '5b8e2f1a-3c4d-4e5f-8a9b-0c1d2e3f4a5b',
+          },
+          attachment: { plane: 'ordinary', scriptName: 'holder-script' },
+        },
+      },
+    };
+    const backend = new FleetBackend();
+    const audit = (records: readonly FleetRecord[]) =>
+      auditFleetDrift({
+        store: storeFor(records),
+        records,
+        inventory: inventoryFor([base]),
+        backendFor: () => backend,
+        specFor: (item) => spec(item),
+        maintenanceSecretFor: () => 'maintenance-admin-secret-value-00001',
+        staleAfterMs: 1_000,
+        now: 10_000,
+      });
+
+    // A long-blocked cleanup stays visible through the record itself, never
+    // through incomplete-provisioning or other drift findings.
+    await expect(audit([blocked])).resolves.toEqual([]);
+
+    const stale: FleetRecord = { ...base, phase: 'worker-deployed' };
+    backend.live.set(stale.tenantTag, liveFor(stale));
+    const findings = await audit([stale]);
+    expect(findings.map(({ kind }) => kind)).toContain(
+      'incomplete-provisioning',
+    );
+  });
+
+  it('reports no incomplete provisioning for a retained terminal record', async () => {
+    const base = record('acme');
+    // A terminal row is retained state, not a phase that advances, so ageing
+    // past staleAfterMs is retention rather than stalled provisioning.
+    const retired: FleetRecord = { ...base, phase: 'decommissioned' };
+    const backend = new FleetBackend();
+    const findings = await auditFleetDrift({
+      store: storeFor([retired]),
+      records: [retired],
+      inventory: inventoryFor([base]),
+      backendFor: () => backend,
+      specFor: (item) => spec(item),
+      maintenanceSecretFor: () => 'maintenance-admin-secret-value-00001',
+      staleAfterMs: 1_000,
+      now: 10_000,
+    });
+    expect(findings.map(({ kind }) => kind)).not.toContain(
+      'incomplete-provisioning',
+    );
+  });
+
+  it('commits the invocation authority before migration staging, candidate maintenance, and promotion dispatches', async () => {
+    class TimelineFleetStore extends FleetStore {
+      constructor(private readonly timeline: string[]) {
+        super();
+      }
+
+      override async put(value: FleetRecord): Promise<void> {
+        await super.put(value);
+        const carrier = value.invocationAuthority;
+        this.timeline.push(
+          `put:${value.phase}:${
+            carrier
+              ? carrier.authorizedAt === null
+                ? 'null'
+                : 'authorized'
+              : 'absent'
+          }`,
+        );
+      }
+    }
+    const acme = record('acme');
+    const initialSpec = spec(acme, 1);
+    const activePhysicalScriptName = externalReleaseScriptName(initialSpec);
+    const backend = new ImmutableFleetBackend();
+    const priorTarget = backend.describeExternalPlatformTarget(initialSpec);
+    // A legacy record carries no invocation-authority carrier at all.
+    const current: FleetRecord = {
+      ...acme,
+      durableObjectBindings: [],
+      desiredSpecDigest: deploymentSpecDigest(initialSpec),
+      platformTarget: priorTarget,
+      outboundPolicy: priorTarget.outboundPolicy,
+      activeRelease: {
+        physicalScriptName: activePhysicalScriptName,
+        specDigest: deploymentSpecDigest(initialSpec),
+        artifactVersion: acme.artifactVersion,
+        releaseSchemaVersion: initialSpec.schemaVersion,
+      },
+    };
+    const target = spec(current, 2);
+    backend.routedScriptName = activePhysicalScriptName;
+    backend.releases.set(activePhysicalScriptName, {
+      ...liveFor(current),
+      scriptName: activePhysicalScriptName,
+      durableObjectBindings: [],
+    });
+    const store = new TimelineFleetStore(backend.calls);
+    await store.put(current);
+    backend.calls.length = 0;
+
+    await migrateFleet({
+      store,
+      records: [current],
+      canaryTenantTags: [],
+      backendFor: () => backend,
+      specFor: () => target,
+      secretsFor: () => ({
+        deploymentIdentity: 'deployment-identity-secret-value-0001',
+        maintenanceAdmin: 'maintenance-admin-secret-value-00001',
+      }),
+    });
+
+    const timeline = backend.calls;
+    const flip = timeline.indexOf('put:migrating:authorized');
+    const deploy = timeline.indexOf(
+      `deploy:acme:${externalReleaseScriptName(target)}`,
+    );
+    const maintenance = timeline.indexOf('maintenance:acme');
+    const promote = timeline.indexOf(
+      `promote:acme:${externalReleaseScriptName(target)}`,
+    );
+    // Staging puts never carry the flip; a dedicated durable put commits the
+    // carrier before the candidate upload, and maintenance plus promotion
+    // dispatch only after that same committed authority.
+    expect(timeline.slice(0, flip)).toContain('put:migrating:absent');
+    expect(flip).toBeGreaterThanOrEqual(0);
+    expect(flip).toBeLessThan(deploy);
+    expect(deploy).toBeLessThan(maintenance);
+    expect(maintenance).toBeLessThan(promote);
+    const migrated = await store.get('acme', 'production');
+    expect(migrated?.phase).toBe('ready');
+    expect(typeof migrated?.invocationAuthority?.authorizedAt).toBe('string');
   });
 
   it('migrates explicit canaries first and stops before the remaining fleet', async () => {
@@ -2640,8 +2944,14 @@ describe('fleet operations', () => {
 
   it('persists the advanced Durable Object tag and rejects a stale migration base', async () => {
     const priorHistory = [{ tag: 'v1', newClasses: ['Runner'] }];
+    const {
+      activeRelease: _active,
+      platformTarget: _target,
+      ...catalog
+    } = record('acme');
     const acme = {
-      ...record('acme'),
+      ...catalog,
+      wfpMode: 'platform-catalog' as const,
       durableObjectTag: 'v1',
       durableObjectMigrationHistory: priorHistory,
       durableObjectMigrationHistoryDigest:

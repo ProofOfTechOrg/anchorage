@@ -28,12 +28,20 @@ import {
   RunStateUnreadableError,
   type ThreadScope,
 } from '../do-runner/index.js';
+import type { SignalDatabase } from './d1-shared.js';
+import { D1NotificationsStorage } from './notifications-d1.js';
 import {
   createThreadSignalRoutes,
   type SignalContentPolicy,
   type SignalContentPolicyInput,
   type SignalContentPolicyResult,
 } from './thread-do-routes.js';
+
+function notificationStore(): D1NotificationsStorage {
+  return new D1NotificationsStorage(
+    sqliteUnitDatabase(openSqlite()) as SignalDatabase,
+  );
+}
 
 interface AgentCall {
   method: string;
@@ -822,7 +830,10 @@ describe('createThreadSignalRoutes', () => {
     expect(calls).toHaveLength(0);
   });
 
-  it('resolves throwing memory lazily and fails closed only at persist gates', async () => {
+  it.each([
+    'returns',
+    'throws',
+  ])('resolves throwing memory lazily and fails closed only at persist gates when the logger %s', async (logger) => {
     const throwingMemoryAgent = () => {
       const mocked = mockAgent();
       const getMemory = vi.fn(() => {
@@ -880,7 +891,9 @@ describe('createThreadSignalRoutes', () => {
     expect(notifying.getMemory).not.toHaveBeenCalled();
 
     const persisting = throwingMemoryAgent();
-    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {
+      if (logger === 'throws') throw new Error('logger failed');
+    });
     try {
       const persistingRoutes = createThreadSignalRoutes({
         resolveAgent: () => persisting.agent,
@@ -890,10 +903,12 @@ describe('createThreadSignalRoutes', () => {
         post('/signal/queue', { contents: 'persist' }),
         scopeWith(undefined),
       );
+      expect(queueResponse?.status).toBe(200);
       expect(await queueResponse?.json()).toEqual({
         decision: { action: 'discard', reason: 'memory-unavailable' },
       });
       expect(persisting.getMemory).toHaveBeenCalledOnce();
+      expect(persisting.calls).toHaveLength(0);
       expect(log).toHaveBeenCalledWith(
         JSON.stringify({
           type: 'signal-memory-resolution-failed',
@@ -1621,7 +1636,7 @@ describe('createThreadSignalRoutes', () => {
 
   it('dispatches a due notification through a server-minted idle wake and marks it delivered', async () => {
     const { agent } = mockAgent();
-    const storage = new InMemoryNotificationsStorage();
+    const storage = notificationStore();
     const record = await storage.createNotification({
       id: 'due-idle',
       threadId: 'acme_t1',
@@ -1681,7 +1696,7 @@ describe('createThreadSignalRoutes', () => {
     });
     (agent as unknown as { sendSignal: typeof sendSignal }).sendSignal =
       sendSignal;
-    const storage = new InMemoryNotificationsStorage();
+    const storage = notificationStore();
     const record = await storage.createNotification({
       id: 'stale-delivery',
       threadId: 'acme_t1',
@@ -1716,7 +1731,7 @@ describe('createThreadSignalRoutes', () => {
 
   it('deduplicates notification ids in first-seen order', async () => {
     const { agent } = mockAgent();
-    const storage = new InMemoryNotificationsStorage();
+    const storage = notificationStore();
     const record = await storage.createNotification({
       id: 'duplicate',
       threadId: 'acme_t1',
@@ -1780,7 +1795,7 @@ describe('createThreadSignalRoutes', () => {
     (
       agent as unknown as { getActiveThreadRunId: () => string }
     ).getActiveThreadRunId = () => 'active';
-    const storage = new InMemoryNotificationsStorage();
+    const storage = notificationStore();
     const summary = await storage.createNotification({
       id: 'low-summary',
       threadId: 'acme_t1',
@@ -1880,7 +1895,7 @@ describe('createThreadSignalRoutes', () => {
     (
       agent as unknown as { getActiveThreadRunId: () => string }
     ).getActiveThreadRunId = () => 'active';
-    const storage = new InMemoryNotificationsStorage();
+    const storage = notificationStore();
     const createdAt = new Date('2026-07-20T10:00:00.000Z');
     const summary = await storage.createNotification({
       id: 'tied-summary',
@@ -1944,7 +1959,7 @@ describe('createThreadSignalRoutes', () => {
     );
     (agent as unknown as { sendSignal: typeof sendSignal }).sendSignal =
       sendSignal;
-    const storage = new InMemoryNotificationsStorage();
+    const storage = notificationStore();
     const bothDue = await storage.createNotification({
       id: 'both-due',
       threadId: 'acme_t1',
@@ -2000,7 +2015,7 @@ describe('createThreadSignalRoutes', () => {
         getActiveThreadRunId: () => string | undefined;
       }
     ).getActiveThreadRunId = () => activeRunId;
-    const storage = new InMemoryNotificationsStorage();
+    const storage = notificationStore();
     const record = await storage.createNotification({
       id: 'summarized-high',
       threadId: 'acme_t1',
@@ -2064,7 +2079,7 @@ describe('createThreadSignalRoutes', () => {
     (
       agent as unknown as { getActiveThreadRunId: () => string }
     ).getActiveThreadRunId = () => 'active';
-    const storage = new InMemoryNotificationsStorage();
+    const storage = notificationStore();
     const record = await storage.createNotification({
       id: 'summarized-urgent',
       threadId: 'acme_t1',
@@ -2114,7 +2129,7 @@ describe('createThreadSignalRoutes', () => {
         getActiveThreadRunId: () => string | undefined;
       }
     ).getActiveThreadRunId = () => activeRunId;
-    const storage = new InMemoryNotificationsStorage();
+    const storage = notificationStore();
     const createSummarizedHigh = async (id: string) => {
       const record = await storage.createNotification({
         id,
@@ -2211,7 +2226,7 @@ describe('createThreadSignalRoutes', () => {
 
     for (const testCase of cases) {
       const { agent, calls } = mockAgent();
-      const storage = new InMemoryNotificationsStorage();
+      const storage = notificationStore();
       const record = await storage.createNotification({
         id: testCase.name,
         threadId: 'acme_t1',
@@ -2259,7 +2274,7 @@ describe('createThreadSignalRoutes', () => {
     const routes = createThreadSignalRoutes({
       resolveAgent: () => agent,
       resolveResourceId: () => 'acme_res',
-      resolveNotificationsStorage: () => new InMemoryNotificationsStorage(),
+      resolveNotificationsStorage: () => notificationStore(),
     });
 
     const response = await routes(
@@ -2280,7 +2295,7 @@ describe('createThreadSignalRoutes', () => {
 
   it('skips a future notification after re-fetching under the lane', async () => {
     const { agent, calls } = mockAgent();
-    const storage = new InMemoryNotificationsStorage();
+    const storage = notificationStore();
     const record = await storage.createNotification({
       id: 'future',
       threadId: 'acme_t1',
@@ -2325,7 +2340,7 @@ describe('createThreadSignalRoutes', () => {
     }));
     (agent as unknown as { sendSignal: typeof sendSignal }).sendSignal =
       sendSignal;
-    const storage = new InMemoryNotificationsStorage();
+    const storage = notificationStore();
     const record = await storage.createNotification({
       id: 'overlap',
       threadId: 'acme_t1',
@@ -2377,7 +2392,7 @@ describe('createThreadSignalRoutes', () => {
     }));
     (agent as unknown as { sendSignal: typeof sendSignal }).sendSignal =
       sendSignal;
-    const storage = new InMemoryNotificationsStorage();
+    const storage = notificationStore();
     const record = await storage.createNotification({
       id: 'summary-overlap',
       threadId: 'acme_t1',
@@ -2443,7 +2458,7 @@ describe('createThreadSignalRoutes', () => {
         sendNotificationSignal: typeof sendNotificationSignal;
       }
     ).sendNotificationSignal = sendNotificationSignal;
-    const storage = new InMemoryNotificationsStorage();
+    const storage = notificationStore();
     const record = await storage.createNotification({
       id: 'lane-order',
       threadId: 'acme_t1',
@@ -2490,7 +2505,7 @@ describe('createThreadSignalRoutes', () => {
     const routes = createThreadSignalRoutes({
       resolveAgent: () => agent,
       resolveResourceId: () => 'acme_res',
-      resolveNotificationsStorage: () => new InMemoryNotificationsStorage(),
+      resolveNotificationsStorage: () => notificationStore(),
     });
     const input = (count: number) => ({
       notificationIds: Array.from(
@@ -2525,7 +2540,7 @@ describe('createThreadSignalRoutes', () => {
     (
       agent as unknown as { getActiveThreadRunId: () => string }
     ).getActiveThreadRunId = () => 'acme_active-run';
-    const storage = new InMemoryNotificationsStorage();
+    const storage = notificationStore();
     const record = await storage.createNotification({
       id: 'due-active',
       threadId: 'acme_t1',
@@ -2572,7 +2587,7 @@ describe('createThreadSignalRoutes', () => {
     }));
     (agent as unknown as { sendSignal: typeof sendSignal }).sendSignal =
       sendSignal;
-    const storage = new InMemoryNotificationsStorage();
+    const storage = notificationStore();
     const record = await storage.createNotification({
       id: 'persist-wait',
       threadId: 'acme_t1',
@@ -2635,7 +2650,7 @@ describe('createThreadSignalRoutes', () => {
     }));
     (agent as unknown as { sendSignal: typeof sendSignal }).sendSignal =
       sendSignal;
-    const storage = new InMemoryNotificationsStorage();
+    const storage = notificationStore();
     const record = await storage.createNotification({
       id: 'persist-reject',
       threadId: 'acme_t1',
@@ -2703,7 +2718,7 @@ describe('createThreadSignalRoutes', () => {
     }));
     (agent as unknown as { sendSignal: typeof sendSignal }).sendSignal =
       sendSignal;
-    const storage = new InMemoryNotificationsStorage();
+    const storage = notificationStore();
     const record = await storage.createNotification({
       id: 'low-summary',
       threadId: 'acme_t1',
@@ -2770,7 +2785,7 @@ describe('createThreadSignalRoutes', () => {
 
   it('fails an all-low summary when the agent has no memory', async () => {
     const { agent, calls } = mockAgent({ memory: undefined });
-    const storage = new InMemoryNotificationsStorage();
+    const storage = notificationStore();
     const record = await storage.createNotification({
       id: 'low-summary-no-memory',
       threadId: 'acme_t1',
@@ -2815,7 +2830,7 @@ describe('createThreadSignalRoutes', () => {
 
   it('executes a low summary as automation when it may not persist into the owner thread', async () => {
     const { agent, calls } = mockAgent();
-    const storage = new InMemoryNotificationsStorage();
+    const storage = notificationStore();
     const record = await storage.createNotification({
       id: 'low-system-summary',
       threadId: 'acme_t1',
@@ -2871,7 +2886,7 @@ describe('createThreadSignalRoutes', () => {
 
   it('retains wake behavior for a high-priority summary', async () => {
     const { agent } = mockAgent();
-    const storage = new InMemoryNotificationsStorage();
+    const storage = notificationStore();
     const record = await storage.createNotification({
       id: 'high-summary',
       threadId: 'acme_t1',
@@ -2917,13 +2932,100 @@ describe('createThreadSignalRoutes', () => {
     });
   });
 
+  it('summarizes a due batch of prototype-colliding sources as own counts', async () => {
+    const { agent } = mockAgent();
+    const storage = notificationStore();
+    const summaryAt = new Date(0);
+    const records = [];
+    // Mixed priorities keep one summary group while taking the sending branch
+    // rather than the all-low persist-without-wake branch.
+    for (const [id, source, priority] of [
+      ['due-proto', '__proto__', 'low'],
+      ['due-constructor', 'constructor', 'medium'],
+      ['due-crm', 'crm', 'low'],
+      ['due-crm-again', 'crm', 'medium'],
+    ] as const) {
+      records.push(
+        await storage.createNotification({
+          id,
+          threadId: 'acme_t1',
+          resourceId: 'acme_res',
+          agentId: 'agent',
+          source,
+          kind: 'digest',
+          summary: 'digest',
+          priority,
+          summaryAt,
+        }),
+      );
+    }
+    const startIdleRun = vi.fn(async ({ runId }) => ({ runId }));
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      resolveNotificationsStorage: () => storage,
+      consultRunCap: () => true,
+      startIdleRun,
+    });
+
+    const response = await routes(
+      post('/signal/notifications/dispatch', {
+        notificationIds: records.map((record) => record.id),
+        resourceId: 'acme_res',
+        agentId: 'agent',
+        now: '2026-07-20T12:00:00.000Z',
+      }),
+      scopeWith(undefined),
+    );
+
+    expect(await response?.json()).toEqual({ delivered: 4, failed: 0 });
+    expect(startIdleRun).toHaveBeenCalledTimes(1);
+    const signal = startIdleRun.mock.calls[0]?.[0]?.signal as unknown as {
+      contents: string;
+      attributes: Record<string, unknown>;
+      metadata: Record<string, unknown>;
+    };
+    expect(signal.contents).toBe('__proto__: 1, constructor: 1, crm: 2');
+    expect(signal.attributes).toMatchObject({ pending: 4 });
+    expect(signal.metadata.notification).toEqual({
+      signal: 'summary',
+      pending: 4,
+      groups: [
+        { source: '__proto__', count: 1 },
+        { source: 'constructor', count: 1 },
+        { source: 'crm', count: 2 },
+      ],
+      byPriority: { low: 2, medium: 2 },
+      notificationIds: [
+        'due-proto',
+        'due-constructor',
+        'due-crm',
+        'due-crm-again',
+      ],
+      priority: 'medium',
+    });
+
+    for (const record of records) {
+      expect(
+        await storage.getNotification({
+          threadId: record.threadId,
+          id: record.id,
+        }),
+      ).toMatchObject({
+        status: 'pending',
+        summaryAt: undefined,
+        summarySignalId: expect.any(String),
+      });
+    }
+  });
+
   it('rejects notification dispatch when the requested agent is missing or resolves incorrectly', async () => {
     const { agent, calls } = mockAgent();
     const resolveAgent = vi.fn(() => agent);
     const routes = createThreadSignalRoutes({
       resolveAgent,
       resolveResourceId: () => 'acme_res',
-      resolveNotificationsStorage: () => new InMemoryNotificationsStorage(),
+      resolveNotificationsStorage: () => notificationStore(),
     });
 
     const missing = await routes(
@@ -2955,7 +3057,7 @@ describe('createThreadSignalRoutes', () => {
 
   it('rejects a pending row bound to a different agent before sending', async () => {
     const { agent, calls } = mockAgent();
-    const storage = new InMemoryNotificationsStorage();
+    const storage = notificationStore();
     const record = await storage.createNotification({
       id: 'wrong-agent-row',
       threadId: 'acme_t1',
@@ -3551,6 +3653,48 @@ describe('createThreadSignalRoutes — signal content policy', () => {
     expect(inputs[1]?.text).toContain('crm: 1');
   });
 
+  it.each([
+    ['constructor', 'constructor: 1'],
+    ['__proto__', '__proto__: 1'],
+    ['toString', 'toString: 1'],
+    ['hasOwnProperty', 'hasOwnProperty: 1'],
+  ])('counts the prototype-colliding source %s once in the inspected summary', async (source, rendered) => {
+    // #given — the same gate, with a source string that names
+    // an Object.prototype member
+    const { agent, calls } = mockAgent();
+    const inputs: SignalContentPolicyInput[] = [];
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      contentPolicy: (input) => {
+        inputs.push(input);
+        return input.text.includes('notification-summary')
+          ? DENIED
+          : ({ allowed: true } as const);
+      },
+    });
+
+    // #when
+    const response = await routes(
+      post('/signal/notification', {
+        source,
+        kind: 'lead',
+        summary: 'benign summary',
+        priority: 'medium',
+      }),
+      scopeWith(undefined),
+    );
+
+    // #then — one pending record renders one count, not an inherited member
+    expect(response?.status).toBe(422);
+    expect(calls).toHaveLength(0);
+    expect(inputs).toHaveLength(2);
+    expect(inputs[1]?.text).toContain('<notification-summary');
+    expect(inputs[1]?.text).toContain('pending="1"');
+    expect(inputs[1]?.text).toContain(rendered);
+    expect(inputs[0]?.text).toContain(`source="${source}"`);
+  });
+
   it('inspects both schedule delivery branches and discards terminally on denial', async () => {
     // #given — distinct active/idle attributes; only the idle branch denies
     const { agent, calls } = mockAgent();
@@ -3645,7 +3789,7 @@ describe('createThreadSignalRoutes — signal content policy', () => {
   it('discards a denied due notification instead of retrying it', async () => {
     // #given
     const { agent } = mockAgent();
-    const storage = new InMemoryNotificationsStorage();
+    const storage = notificationStore();
     const record = await storage.createNotification({
       id: 'denied-one',
       threadId: 'acme_t1',
@@ -3704,7 +3848,7 @@ describe('createThreadSignalRoutes — signal content policy', () => {
   it('retries a due notification with a sanitized error when the policy fails', async () => {
     // #given
     const { agent } = mockAgent();
-    const storage = new InMemoryNotificationsStorage();
+    const storage = notificationStore();
     const record = await storage.createNotification({
       id: 'failed-one',
       threadId: 'acme_t1',
@@ -3755,7 +3899,7 @@ describe('createThreadSignalRoutes — signal content policy', () => {
   it('discards every member of a denied summary', async () => {
     // #given — two low notifications that summarize rather than deliver
     const { agent } = mockAgent();
-    const storage = new InMemoryNotificationsStorage();
+    const storage = notificationStore();
     const records: NotificationRecord[] = [];
     for (const id of ['sum-a', 'sum-b']) {
       records.push(
@@ -3845,33 +3989,40 @@ describe('createThreadSignalRoutes — signal content policy', () => {
     expect(inputs[0]?.runId).toBe('run_1');
   });
 
-  it.each([
-    { case: 'tag name', overrides: { tagName: 'not a name' } },
-    {
-      case: 'target attributes',
-      overrides: { attributes: { 'not a name': 'x' } },
-    },
-    {
-      case: 'active branch attributes',
-      overrides: {
-        ifActive: { behavior: 'deliver', attributes: { 'not a name': 'x' } },
+  it.each(
+    [
+      { case: 'tag name', overrides: { tagName: 'not a name' } },
+      {
+        case: 'target attributes',
+        overrides: { attributes: { 'not a name': 'x' } },
       },
-    },
-    {
-      case: 'idle branch attributes',
-      overrides: {
-        ifIdle: { behavior: 'wake', attributes: { 'not a name': 'x' } },
+      {
+        case: 'active branch attributes',
+        overrides: {
+          ifActive: { behavior: 'deliver', attributes: { 'not a name': 'x' } },
+        },
       },
-    },
-  ])('settles a schedule whose $case cannot be rendered as a terminal discard', async ({
+      {
+        case: 'idle branch attributes',
+        overrides: {
+          ifIdle: { behavior: 'wake', attributes: { 'not a name': 'x' } },
+        },
+      },
+    ].flatMap((testCase) =>
+      ['returns', 'throws'].map((logger) => ({ ...testCase, logger })),
+    ),
+  )('settles a schedule whose $case cannot be rendered as a terminal discard when the logger $logger', async ({
     overrides,
+    logger,
   }) => {
     // #given — core's assertXmlName would throw on this name at render time,
     // and no later tick could ever render it either
     const { agent, calls } = mockAgent();
     const settle = vi.fn(async () => undefined);
     const { policy, inputs } = recordingPolicy();
-    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {
+      if (logger === 'throws') throw new Error('logger failed');
+    });
 
     try {
       // #when
@@ -3947,7 +4098,7 @@ describe('createThreadSignalRoutes — signal content policy', () => {
   it('keeps a summary storage failure inside its own dispatch group', async () => {
     // #given — a denied summary whose terminal discard write fails
     const { agent } = mockAgent();
-    const storage = new InMemoryNotificationsStorage();
+    const storage = notificationStore();
     const records: NotificationRecord[] = [];
     for (const id of ['sum-a', 'sum-b']) {
       records.push(
@@ -4009,7 +4160,7 @@ describe('createThreadSignalRoutes — signal content policy', () => {
     // #given — the FIRST member's terminal discard write lands and the second
     // throws, so the group's catch sweeps records that are already settled
     const { agent } = mockAgent();
-    const storage = new InMemoryNotificationsStorage();
+    const storage = notificationStore();
     const records: NotificationRecord[] = [];
     for (const id of ['sum-a', 'sum-b']) {
       records.push(
@@ -4188,7 +4339,7 @@ describe('createThreadSignalRoutes and the deployment execution fence', () => {
     expect(calls).toEqual([]);
   });
 
-  it('admits proof-only delivery to the nominated run and nothing else', async () => {
+  it('refuses legacy run-only proof delivery before all signal effects', async () => {
     // #given — a proof state already bound to 'active-run'.
     const fence = await fenceAt('migration-locked');
     await fence.transition({
@@ -4211,7 +4362,7 @@ describe('createThreadSignalRoutes and the deployment execution fence', () => {
       post('/signal', { contents: 'hi' }),
       scopeWith(undefined, fence),
     );
-    expect(admitted?.status).toBe(200);
+    expect(admitted?.status).toBe(503);
 
     // #and — a thread whose active run is NOT the proof run does not.
     (
@@ -4258,5 +4409,1564 @@ describe('createThreadSignalRoutes and the deployment execution fence', () => {
     expect(await res?.json()).toMatchObject({
       reason: { code: 'EXECUTION_FENCE_UNREADABLE' },
     });
+  });
+});
+
+describe('FS8 D3 proof activation signal boundaries', () => {
+  async function modern() {
+    const sqlite = openSqlite();
+    const db = sqliteUnitDatabase(sqlite) as ExecutionFenceDatabase;
+    const fence = new ExecutionFenceStore(db);
+    await fence.seed('migration-locked');
+    await fence.transition({
+      expected: 'migration-locked',
+      next: 'proof-only',
+      proofKey: 'proof',
+    });
+    sqlite.exec(
+      "UPDATE flowsafe_execution_fence SET proof_run_id = 'active-run', proof_table_prefix = 'proof_', proof_workflow_id = 'actual-agent-workflow', proof_start_token = 'generation'",
+    );
+    sqlite.exec(
+      'CREATE TABLE proof_mastra_workflow_snapshot (workflow_name TEXT, run_id TEXT, resourceId TEXT, snapshot TEXT, createdAt TEXT, updatedAt TEXT)',
+    );
+    const source = {
+      version: 2,
+      startToken: 'generation',
+      attemptToken: 'attempt',
+      resumeCounts: [],
+    };
+    const write = () => {
+      sqlite.exec('DELETE FROM proof_mastra_workflow_snapshot');
+      sqlite
+        .prepare(
+          'INSERT INTO proof_mastra_workflow_snapshot VALUES (?,?,?,?,?,?)',
+        )
+        .run(
+          'actual-agent-workflow',
+          'active-run',
+          'acme_res',
+          JSON.stringify({
+            runId: 'active-run',
+            status: 'suspended',
+            requestContext: { 'flowsafe.runProvenance': source },
+          }),
+          'created',
+          'updated',
+        );
+    };
+    write();
+    const mock = mockAgent();
+    let active: string | undefined = 'active-run';
+    const runtime = { executionFence: fence };
+    Object.assign(mock.agent, {
+      getActiveThreadRunId: () => active,
+      proofExecutionFor: async (
+        expected: unknown,
+        _thread: string,
+        runId: string,
+      ) => {
+        if (expected !== runtime) throw new Error('runtime mismatch');
+        return fence.readCurrentRunExecution({
+          tablePrefix: 'proof_',
+          workflowId: 'actual-agent-workflow',
+          runId,
+        });
+      },
+    });
+    const scope = {
+      ...scopeWith(undefined, fence),
+      init: { runtime, executionFence: fence },
+    } as unknown as ThreadScope;
+    const replace = () => {
+      source.startToken = 'replacement';
+      write();
+    };
+    return {
+      ...mock,
+      sqlite,
+      fence,
+      scope,
+      replace,
+      setActive: (value: string | undefined) => {
+        active = value;
+      },
+    };
+  }
+
+  const routes = [
+    ['/signal/message', { contents: 'hello', ifIdle: 'persist' }],
+    ['/signal/queue', { contents: 'hello' }],
+    ['/signal', { contents: 'hello', ifIdle: 'persist' }],
+    [
+      '/signal/state',
+      { id: 'state', cacheKey: 'key', contents: 'hello', value: 'one' },
+    ],
+    [
+      '/signal/notification',
+      { source: 'test', kind: 'update', summary: 'hello' },
+    ],
+  ] as const;
+  it.each(
+    routes,
+  )('preserves the original generation at the final Core boundary %s route', async (path, body) => {
+    const h = await modern();
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      contentPolicy: async () => {
+        h.replace();
+        return { allowed: true };
+      },
+    });
+    const response = await route(post(path, body), h.scope);
+    expect(h.calls).toEqual([]);
+    expect(response?.status).toBe(503);
+    expect(await response?.json()).toMatchObject({
+      reason: { code: 'EXECUTION_FENCED' },
+    });
+  });
+
+  function activeIdRace(h: Awaited<ReturnType<typeof modern>>) {
+    let armed = false;
+    const read = h.fence.readCurrentRunExecution.bind(h.fence);
+    const raced: Awaited<ReturnType<typeof read>>[] = [];
+    const proofRead = vi
+      .spyOn(h.fence, 'readCurrentRunExecution')
+      .mockImplementation(async (address) => {
+        const execution = await read(address);
+        if (armed) {
+          armed = false;
+          h.setActive('other');
+          raced.push(execution);
+        }
+        return execution;
+      });
+    return {
+      arm: () => {
+        armed = true;
+      },
+      raced,
+      proofRead,
+    };
+  }
+
+  const originalProof = {
+    tablePrefix: 'proof_',
+    workflowId: 'actual-agent-workflow',
+    runId: 'active-run',
+    startToken: 'generation',
+  };
+
+  it.each(
+    routes,
+  )('refuses an active ID changed during the final proof read at %s route', async (path, body) => {
+    const h = await modern();
+    const race = activeIdRace(h);
+    let policyCalls = 0;
+    const contentPolicy = vi.fn(async () => {
+      policyCalls++;
+      if (path === '/signal/notification' && policyCalls === 2) race.arm();
+      return { allowed: true as const };
+    });
+    const getMemory = h.agent.getMemory.bind(h.agent);
+    const memory = vi
+      .spyOn(h.agent, 'getMemory')
+      .mockImplementation(async () => {
+        const available = await getMemory();
+        race.arm();
+        return available;
+      });
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      contentPolicy,
+    });
+    const response = await route(post(path, body), h.scope);
+    expect(h.calls).toEqual([]);
+    expect(race.raced).toEqual([originalProof]);
+    expect(race.proofRead).toHaveBeenCalledTimes(2);
+    expect(contentPolicy).toHaveBeenCalledTimes(
+      path === '/signal/notification' ? 2 : 1,
+    );
+    expect(memory).toHaveBeenCalledTimes(
+      path === '/signal/notification' ? 0 : 1,
+    );
+    expect(response?.status).toBe(503);
+    expect(await response?.json()).toMatchObject({
+      reason: { code: 'EXECUTION_FENCED' },
+    });
+  });
+
+  it('refuses an active ID changed during the final proof read at active-only signal', async () => {
+    const h = await modern();
+    const race = activeIdRace(h);
+    const contentPolicy = vi.fn(async () => {
+      race.arm();
+      return { allowed: true as const };
+    });
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      contentPolicy,
+    });
+    const response = await route(
+      post('/signal', { contents: 'hello' }),
+      h.scope,
+    );
+    expect(h.calls).toEqual([]);
+    expect(race.raced).toEqual([originalProof]);
+    expect(race.proofRead).toHaveBeenCalledTimes(2);
+    expect(contentPolicy).toHaveBeenCalledTimes(1);
+    expect(response?.status).toBe(503);
+    expect(await response?.json()).toMatchObject({
+      reason: { code: 'EXECUTION_FENCED' },
+    });
+  });
+
+  it('refuses an active ID changed during the final proof read at schedule Core', async () => {
+    const h = await modern();
+    const race = activeIdRace(h);
+    const begin = vi.fn(async () => ({ state: 'ready' as const }));
+    const settle = vi.fn(async () => undefined);
+    const contentPolicy = vi.fn(async () => {
+      race.arm();
+      return { allowed: true as const };
+    });
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      resolveScheduleTarget: async () =>
+        scheduleTarget({
+          resourceId: 'acme_res',
+          ifIdle: { behavior: 'persist' },
+        }),
+      resolveScheduleDispatchStore: () => ({ begin, settle }),
+      contentPolicy,
+    });
+    const response = await route(
+      post('/signal/schedule', {
+        scheduleId: 'schedule_1',
+        dispatchId: 'dispatch_1',
+        runId: 'run_1',
+      }),
+      h.scope,
+    );
+    expect(h.calls).toEqual([]);
+    expect(begin).toHaveBeenCalledExactlyOnceWith('schedule_1', 'dispatch_1');
+    expect(settle).not.toHaveBeenCalled();
+    expect(race.raced).toEqual([originalProof]);
+    expect(race.proofRead).toHaveBeenCalledTimes(3);
+    expect(contentPolicy).toHaveBeenCalledTimes(1);
+    expect(response?.status).toBe(503);
+    expect(await response?.json()).toMatchObject({
+      reason: { code: 'EXECUTION_FENCED' },
+    });
+  });
+
+  it('refuses an active ID changed during the final proof read at notification persistence', async () => {
+    const h = await modern();
+    const race = activeIdRace(h);
+    const storage = notificationStore();
+    const create = vi.spyOn(storage, 'createNotification');
+    const update = vi.spyOn(storage, 'updateNotification');
+    const record = await storage.createNotification({
+      threadId: 'acme_t1',
+      resourceId: 'acme_res',
+      agentId: 'agent',
+      source: 'test',
+      kind: 'update',
+      summary: 'hello',
+      priority: 'low',
+      deliverAt: new Date(0),
+      summaryAt: new Date(0),
+    });
+    const before = await storage.getNotification({
+      threadId: 'acme_t1',
+      id: record.id,
+    });
+    const getMemory = h.agent.getMemory.bind(h.agent);
+    const memory = vi
+      .spyOn(h.agent, 'getMemory')
+      .mockImplementation(async () => {
+        const available = await getMemory();
+        race.arm();
+        return available;
+      });
+    const contentPolicy = vi.fn(async () => ({ allowed: true as const }));
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      resolveNotificationsStorage: () => storage,
+      contentPolicy,
+    });
+    const response = await route(
+      post('/signal/notifications/dispatch', {
+        agentId: 'agent',
+        resourceId: 'acme_res',
+        notificationIds: [record.id],
+      }),
+      h.scope,
+    );
+    expect(h.calls).toEqual([]);
+    expect(
+      await storage.getNotification({ threadId: 'acme_t1', id: record.id }),
+    ).toEqual(before);
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(update).not.toHaveBeenCalled();
+    expect(race.raced).toEqual([originalProof]);
+    expect(race.proofRead).toHaveBeenCalledTimes(2);
+    expect(memory).toHaveBeenCalledTimes(1);
+    expect(contentPolicy).toHaveBeenCalledTimes(1);
+    expect(response?.status).toBe(503);
+    expect(await response?.json()).toMatchObject({
+      reason: { code: 'EXECUTION_FENCED' },
+    });
+  });
+
+  it('refuses an active ID changed during the final proof read at wake delivery', async () => {
+    const h = await modern();
+    const race = activeIdRace(h);
+    const getMemory = h.agent.getMemory.bind(h.agent);
+    const memory = vi
+      .spyOn(h.agent, 'getMemory')
+      .mockImplementation(async () => {
+        const available = await getMemory();
+        race.arm();
+        return available;
+      });
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      serializeDispatch: async (_scope, operation) => operation(),
+    });
+    const response = await route(
+      post('/signal/message', { contents: 'hello', ifIdle: 'wake' }),
+      h.scope,
+    );
+    expect(h.calls).toEqual([]);
+    expect(race.raced).toEqual([originalProof]);
+    expect(race.proofRead).toHaveBeenCalledTimes(3);
+    expect(memory).toHaveBeenCalledTimes(1);
+    expect(response?.status).toBe(503);
+    expect(await response?.json()).toMatchObject({
+      reason: { code: 'EXECUTION_FENCED' },
+    });
+  });
+
+  it.each([
+    'serialized-selection',
+    'memory',
+    'active-id',
+  ] as const)('preserves wake generation through %s before delivering', async (boundary) => {
+    const h = await modern();
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      serializeDispatch: async (_scope, operation) => operation(),
+      resolveBlockingRun:
+        boundary === 'serialized-selection'
+          ? async () => {
+              h.replace();
+              return undefined;
+            }
+          : undefined,
+    });
+    if (boundary !== 'serialized-selection')
+      Object.assign(h.agent, {
+        getMemory: async () => {
+          if (boundary === 'memory') h.replace();
+          else h.setActive('other');
+          return {};
+        },
+      });
+    const response = await route(
+      post('/signal/message', { contents: 'hello', ifIdle: 'wake' }),
+      h.scope,
+    );
+    expect(h.calls).toEqual([]);
+    expect(response?.status).toBe(503);
+  });
+
+  it('admits current proof delivery and refuses an idle thread at the all-route gate', async () => {
+    const h = await modern();
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+    });
+    const delivered = await route(
+      post('/signal', { contents: 'hello' }),
+      h.scope,
+    );
+    expect(h.calls).toHaveLength(1);
+    expect(delivered?.status).toBe(200);
+    h.calls.length = 0;
+    h.setActive(undefined);
+    const refused = await route(
+      post('/signal', { contents: 'hello' }),
+      h.scope,
+    );
+    expect(h.calls).toEqual([]);
+    expect(refused?.status).toBe(503);
+  });
+
+  it.each([
+    'brand',
+    'method',
+    'runtime-fence',
+  ] as const)('requires trusted wrapper %s at the all-route gate', async (missing) => {
+    const h = await modern();
+    if (missing === 'brand')
+      delete (h.agent as unknown as Record<symbol, unknown>)[
+        RUNTIME_DRIVEN_AGENT
+      ];
+    if (missing === 'method')
+      delete (h.agent as unknown as { proofExecutionFor?: unknown })
+        .proofExecutionFor;
+    if (missing === 'runtime-fence')
+      Object.assign(h.scope.init.runtime, { executionFence: 'none' });
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+    });
+    const response = await route(
+      post('/signal', { contents: 'hello' }),
+      h.scope,
+    );
+    expect(h.calls).toEqual([]);
+    expect(response?.status).toBe(503);
+  });
+
+  it.each([
+    'begin',
+    'recovered-receipt',
+    'blocked-receipt',
+    'discard-receipt',
+    'core',
+  ] as const)('preserves schedule effects at the final %s boundary', async (boundary) => {
+    const h = await modern();
+    const begin = vi.fn(async () => ({ state: 'ready' as const }));
+    const settle = vi.fn(async () => undefined);
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      resolveScheduleTarget: async () =>
+        scheduleTarget({
+          resourceId: 'acme_res',
+          ifIdle: { behavior: 'persist' },
+        }),
+      resolveScheduleDispatchStore: async () => {
+        if (boundary === 'begin') h.replace();
+        return { begin, settle };
+      },
+      resolveScheduleRunStatus:
+        boundary === 'recovered-receipt'
+          ? async () => {
+              h.replace();
+              return { runId: 'active-run', status: 'success' };
+            }
+          : undefined,
+      serializeDispatch: async (_scope, operation) => operation(),
+      resolveBlockingRun:
+        boundary === 'blocked-receipt'
+          ? async () => {
+              h.replace();
+              return {
+                runId: 'active-run',
+                principal: { kind: 'human', id: 'other', role: 'operator' },
+              };
+            }
+          : undefined,
+      contentPolicy:
+        boundary === 'discard-receipt' || boundary === 'core'
+          ? async () => {
+              h.replace();
+              return boundary === 'discard-receipt'
+                ? { allowed: false, outcome: 'denied' }
+                : { allowed: true };
+            }
+          : undefined,
+    });
+    const response = await route(
+      post('/signal/schedule', {
+        scheduleId: 'schedule_1',
+        dispatchId: 'dispatch_1',
+        runId: 'run_1',
+      }),
+      h.scope,
+    );
+    expect(h.calls).toEqual([]);
+    expect(settle).not.toHaveBeenCalled();
+    expect(begin).toHaveBeenCalledTimes(boundary === 'begin' ? 0 : 1);
+    expect(response?.status).toBe(503);
+  });
+
+  it('checks notification storage creation after resolving its store', async () => {
+    const h = await modern();
+    const storage = new InMemoryNotificationsStorage();
+    const create = vi.spyOn(storage, 'createNotification');
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      canPersist: () => false,
+      resolveNotificationsStorage: async () => {
+        h.replace();
+        return storage;
+      },
+    });
+    const response = await route(
+      post('/signal/notification', {
+        source: 'test',
+        kind: 'update',
+        summary: 'hello',
+      }),
+      h.scope,
+    );
+    expect(create).not.toHaveBeenCalled();
+    expect(h.calls).toEqual([]);
+    expect(response?.status).toBe(503);
+  });
+
+  it.each([
+    'denial',
+    'failure',
+    'persist',
+    'wake',
+  ] as const)('does not mutate notification receipts after a %s proof refusal', async (boundary) => {
+    const h = await modern();
+    const storage = notificationStore();
+    const record = await storage.createNotification({
+      threadId: 'acme_t1',
+      resourceId: 'acme_res',
+      agentId: 'agent',
+      source: 'test',
+      kind: 'update',
+      summary: 'hello',
+      priority: boundary === 'persist' ? 'low' : 'urgent',
+      deliverAt: new Date(0),
+      summaryAt: boundary === 'persist' ? new Date(0) : undefined,
+    });
+    const before = await storage.getNotification({
+      threadId: 'acme_t1',
+      id: record.id,
+    });
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      resolveNotificationsStorage: () => storage,
+      contentPolicy: async () => {
+        h.replace();
+        return boundary === 'denial'
+          ? { allowed: false, outcome: 'denied' }
+          : boundary === 'failure'
+            ? { allowed: false, outcome: 'error' }
+            : { allowed: true };
+      },
+    });
+    const response = await route(
+      post('/signal/notifications/dispatch', {
+        agentId: 'agent',
+        resourceId: 'acme_res',
+        notificationIds: [record.id],
+      }),
+      h.scope,
+    );
+    expect(
+      await storage.getNotification({ threadId: 'acme_t1', id: record.id }),
+    ).toEqual(before);
+    expect(h.calls).toEqual([]);
+    expect(response?.status).toBe(503);
+  });
+  it('preserves an exhausted receipt when proof changes during notification selection', async () => {
+    const h = await modern();
+    const storage = notificationStore();
+    const record = await storage.createNotification({
+      threadId: 'acme_t1',
+      resourceId: 'acme_res',
+      agentId: 'agent',
+      source: 'test',
+      kind: 'ready',
+      summary: 'ready',
+      deliverAt: new Date(0),
+    });
+    await storage.updateNotification({
+      threadId: 'acme_t1',
+      id: record.id,
+      deliveryAttempts: 10,
+      lastDeliveryError: 'prior refusal',
+    });
+    const before = await storage.getNotification({
+      threadId: 'acme_t1',
+      id: record.id,
+    });
+    const get = storage.getNotification.bind(storage);
+    const conditional = vi.spyOn(
+      storage,
+      'updateNotificationDeliveryIfUnchanged',
+    );
+    storage.getNotification = async (lookup) => {
+      const current = await get(lookup);
+      h.replace();
+      return current;
+    };
+    const contentPolicy = vi.fn(async () => ({ allowed: true as const }));
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      resolveNotificationsStorage: () => storage,
+      contentPolicy,
+    });
+    const response = await routes(
+      post('/signal/notifications/dispatch', {
+        agentId: 'agent',
+        resourceId: 'acme_res',
+        notificationIds: [record.id],
+      }),
+      h.scope,
+    );
+    expect(response?.status).toBe(503);
+    expect(conditional).not.toHaveBeenCalled();
+    expect(contentPolicy).not.toHaveBeenCalled();
+    expect(h.calls).toEqual([]);
+    expect(await get({ threadId: 'acme_t1', id: record.id })).toEqual(before);
+  });
+
+  it('refuses a foreign initial proof generation before content-policy effects', async () => {
+    const h = await modern();
+    h.replace();
+    const contentPolicy = vi.fn(async () => ({ allowed: true as const }));
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      contentPolicy,
+    });
+    const response = await route(
+      post('/signal', { contents: 'hello' }),
+      h.scope,
+    );
+    expect(contentPolicy).not.toHaveBeenCalled();
+    expect(h.calls).toEqual([]);
+    expect(response?.status).toBe(503);
+  });
+
+  it('refuses a serialized wake replacement before resolving memory', async () => {
+    const h = await modern();
+    const memory = vi.spyOn(h.agent, 'getMemory');
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      serializeDispatch: async (_scope, operation) => operation(),
+      resolveBlockingRun: async () => {
+        h.replace();
+        return undefined;
+      },
+    });
+    const response = await route(
+      post('/signal', { contents: 'hello', ifIdle: 'wake' }),
+      h.scope,
+    );
+    expect(memory).not.toHaveBeenCalled();
+    expect(h.calls).toEqual([]);
+    expect(response?.status).toBe(503);
+  });
+
+  it('checks the active-only signal Core boundary after content inspection', async () => {
+    const h = await modern();
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      contentPolicy: async () => {
+        h.replace();
+        return { allowed: true };
+      },
+    });
+    const response = await route(
+      post('/signal', { contents: 'hello' }),
+      h.scope,
+    );
+    expect(h.calls).toEqual([]);
+    expect(response?.status).toBe(503);
+  });
+
+  it('checks a retained completed schedule receipt after its store await', async () => {
+    const h = await modern();
+    let second = false;
+    const settle = vi.fn(async () => {
+      if (!second) throw new Error('receipt transport failed');
+    });
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      resolveScheduleTarget: async () =>
+        scheduleTarget({
+          resourceId: 'acme_res',
+          ifIdle: { behavior: 'persist' },
+        }),
+      resolveScheduleDispatchStore: async () => {
+        if (second) h.replace();
+        return { begin: async () => ({ state: 'ready' as const }), settle };
+      },
+    });
+    const body = {
+      scheduleId: 'schedule_1',
+      dispatchId: 'dispatch_1',
+      runId: 'run_1',
+    };
+    const first = await route(post('/signal/schedule', body), h.scope);
+    expect(h.calls).toHaveLength(1);
+    expect(first?.status).toBe(502);
+    second = true;
+    const response = await route(post('/signal/schedule', body), h.scope);
+    expect(h.calls).toHaveLength(1);
+    expect(settle).toHaveBeenCalledTimes(1);
+    expect(response?.status).toBe(503);
+  });
+
+  it('preserves the completed Core effect but refuses a changed final schedule receipt', async () => {
+    const h = await modern();
+    const send = h.agent.sendSignal.bind(h.agent);
+    Object.assign(h.agent, {
+      sendSignal: (...args: Parameters<Agent['sendSignal']>) => {
+        const result = send(...args);
+        h.replace();
+        return result;
+      },
+    });
+    const settle = vi.fn(async () => undefined);
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      resolveScheduleTarget: async () =>
+        scheduleTarget({
+          resourceId: 'acme_res',
+          ifIdle: { behavior: 'persist' },
+        }),
+      resolveScheduleDispatchStore: () => ({
+        begin: async () => ({ state: 'ready' as const }),
+        settle,
+      }),
+    });
+    const response = await route(
+      post('/signal/schedule', {
+        scheduleId: 'schedule_1',
+        dispatchId: 'dispatch_1',
+        runId: 'run_1',
+      }),
+      h.scope,
+    );
+    expect(h.calls).toHaveLength(1);
+    expect(settle).not.toHaveBeenCalled();
+    expect(response?.status).toBe(503);
+  });
+
+  it.each([
+    'individual',
+    'summary',
+  ] as const)('does not convert a final %s notification delivery receipt refusal into failure bookkeeping', async (mode) => {
+    const h = await modern();
+    const storage = notificationStore();
+    const record = await storage.createNotification({
+      threadId: 'acme_t1',
+      resourceId: 'acme_res',
+      agentId: 'agent',
+      source: 'test',
+      kind: 'update',
+      summary: 'hello',
+      priority: mode === 'summary' ? 'low' : 'urgent',
+      summaryAt: mode === 'summary' ? new Date(0) : undefined,
+      deliverAt: new Date(0),
+    });
+    const before = await storage.getNotification({
+      threadId: 'acme_t1',
+      id: record.id,
+    });
+    const send = h.agent.sendSignal.bind(h.agent);
+    Object.assign(h.agent, {
+      sendSignal: (...args: Parameters<Agent['sendSignal']>) => {
+        const result = send(...args);
+        h.replace();
+        return result;
+      },
+    });
+    const route = createThreadSignalRoutes({
+      resolveAgent: () => h.agent,
+      resolveResourceId: () => 'acme_res',
+      resolveNotificationsStorage: () => storage,
+    });
+    const response = await route(
+      post('/signal/notifications/dispatch', {
+        agentId: 'agent',
+        resourceId: 'acme_res',
+        notificationIds: [record.id],
+      }),
+      h.scope,
+    );
+    expect(
+      await storage.getNotification({ threadId: 'acme_t1', id: record.id }),
+    ).toEqual(before);
+    expect(h.calls).toHaveLength(1);
+    expect(response?.status).toBe(503);
+  });
+});
+
+describe('notification delivery failure receipts', () => {
+  const dispatchNow = '2026-07-20T12:00:00.000Z';
+  const input = {
+    threadId: 'acme_t1',
+    resourceId: 'acme_res',
+    agentId: 'agent',
+    source: 'test',
+    kind: 'ready',
+    summary: 'ready',
+    priority: 'urgent' as const,
+    deliverAt: new Date(0),
+  };
+  function fixture(
+    overrides: Partial<Parameters<typeof createThreadSignalRoutes>[0]> = {},
+  ) {
+    const storage = notificationStore();
+    const { agent, calls } = mockAgent();
+    const contentPolicy = vi.fn((_input: SignalContentPolicyInput) => ({
+      allowed: false as const,
+      outcome: 'error' as const,
+    }));
+    const consultRunCap = vi.fn(async () => true);
+    const startIdleRun = vi.fn(async ({ runId }: { runId: string }) => ({
+      runId,
+    }));
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      resolveNotificationsStorage: () => storage,
+      contentPolicy,
+      consultRunCap,
+      startIdleRun,
+      ...overrides,
+    });
+    const dispatch = (ids: string[], body: Record<string, unknown> = {}) =>
+      routes(
+        post('/signal/notifications/dispatch', {
+          notificationIds: ids,
+          agentId: 'agent',
+          resourceId: 'acme_res',
+          now: dispatchNow,
+          ...body,
+        }),
+        scopeWith(undefined),
+      );
+    return {
+      storage,
+      agent,
+      calls,
+      contentPolicy,
+      consultRunCap,
+      startIdleRun,
+      dispatch,
+    };
+  }
+
+  it.each([
+    0,
+    -1,
+    1.5,
+    NaN,
+    Infinity,
+    Number.MAX_SAFE_INTEGER + 1,
+  ])('rejects maximum attempts %s before resolving dependencies', (maxDeliveryAttempts) => {
+    const resolveAgent = vi.fn();
+    const resolveNotificationsStorage = vi.fn();
+    expect(() =>
+      createThreadSignalRoutes({
+        resolveAgent,
+        resolveNotificationsStorage,
+        maxDeliveryAttempts,
+      }),
+    ).toThrow(RangeError);
+    expect(resolveAgent).not.toHaveBeenCalled();
+    expect(resolveNotificationsStorage).not.toHaveBeenCalled();
+  });
+
+  it('rejects Core-only dispatch storage before notification reads or effects', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    const get = vi.spyOn(storage, 'getNotification');
+    const update = vi.spyOn(storage, 'updateNotification');
+    const h = fixture({ resolveNotificationsStorage: () => storage });
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      expect((await h.dispatch(['missing']))?.status).toBe(502);
+      expect(get).not.toHaveBeenCalled();
+      expect(update).not.toHaveBeenCalled();
+      expect(h.contentPolicy).not.toHaveBeenCalled();
+      expect(h.consultRunCap).not.toHaveBeenCalled();
+      expect(h.startIdleRun).not.toHaveBeenCalled();
+      expect(h.calls).toEqual([]);
+      expect((await h.dispatch([]))?.status).toBe(400);
+      expect(
+        (await h.dispatch(['missing'], { resourceId: 'wrong' }))?.status,
+      ).toBe(404);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('retains the default tenth failure receipt and exits the due set', async () => {
+    const h = fixture();
+    const record = await h.storage.createNotification(input);
+    let now = new Date(dispatchNow);
+    for (let attempt = 1; attempt <= 10; attempt++) {
+      const response = await h.dispatch([record.id], {
+        now: now.toISOString(),
+        maxDeliveryAttempts: 999,
+      });
+      expect(await response?.json()).toEqual(
+        attempt < 10
+          ? { delivered: 0, failed: 1 }
+          : { delivered: 0, failed: 0, discarded: 1 },
+      );
+      const current = await h.storage.getNotification({
+        threadId: input.threadId,
+        id: record.id,
+      });
+      expect(current).toMatchObject({
+        deliveryAttempts: attempt,
+        lastDeliveryError: 'signal content policy failed',
+        lastDeliveryAttemptAt: now,
+      });
+      if (attempt < 10) {
+        if (!current?.deliverAt) throw new Error('retry cursor missing');
+        now = current.deliverAt;
+      }
+    }
+    expect(
+      await h.storage.getNotification({
+        threadId: input.threadId,
+        id: record.id,
+      }),
+    ).toMatchObject({
+      status: 'discarded',
+      deliveryReason: 'delivery-attempts-exhausted',
+      deliverAt: undefined,
+      summaryAt: undefined,
+      discardedAt: expect.any(Date),
+    });
+    expect(
+      await h.storage.listDueNotifications({ now: new Date('2099-01-01') }),
+    ).toEqual([]);
+    expect(h.contentPolicy).toHaveBeenCalledTimes(10);
+  });
+
+  it.each([
+    10,
+    Number.MAX_SAFE_INTEGER,
+  ])('discards an already exhausted count of %s without target effects', async (deliveryAttempts) => {
+    const h = fixture();
+    const record = await h.storage.createNotification({
+      ...input,
+      summaryAt: new Date(0),
+    });
+    await h.storage.updateNotification({
+      threadId: input.threadId,
+      id: record.id,
+      deliveryAttempts,
+      lastDeliveryError: 'original refusal',
+      lastDeliveryAttemptAt: new Date(123),
+    });
+    expect(await (await h.dispatch([record.id]))?.json()).toEqual({
+      delivered: 0,
+      failed: 0,
+      discarded: 1,
+    });
+    expect(
+      await h.storage.getNotification({
+        threadId: input.threadId,
+        id: record.id,
+      }),
+    ).toMatchObject({
+      status: 'discarded',
+      deliveryAttempts,
+      lastDeliveryError: 'original refusal',
+      lastDeliveryAttemptAt: new Date(123),
+      deliverAt: undefined,
+      summaryAt: undefined,
+    });
+    expect(h.contentPolicy).not.toHaveBeenCalled();
+    expect(h.consultRunCap).not.toHaveBeenCalled();
+    expect(h.startIdleRun).not.toHaveBeenCalled();
+    expect(h.calls).toEqual([]);
+  });
+
+  it('finishes the initial binding scan before terminalizing exhausted rows', async () => {
+    const h = fixture({ maxDeliveryAttempts: 1 });
+    const exhausted = await h.storage.createNotification(input);
+    await h.storage.updateNotification({
+      threadId: input.threadId,
+      id: exhausted.id,
+      deliveryAttempts: 1,
+    });
+    const wrong = await h.storage.createNotification({
+      ...input,
+      resourceId: 'other',
+    });
+    const conditional = vi.spyOn(
+      h.storage,
+      'updateNotificationDeliveryIfUnchanged',
+    );
+    expect((await h.dispatch([exhausted.id, wrong.id]))?.status).toBe(404);
+    expect(conditional).not.toHaveBeenCalled();
+    expect(
+      await h.storage.getNotification({
+        threadId: input.threadId,
+        id: exhausted.id,
+      }),
+    ).toMatchObject({ status: 'pending', deliveryAttempts: 1 });
+  });
+
+  it.each([
+    'initial',
+    'fresh',
+  ] as const)('refuses a returned physical key mismatch at the %s read without writing', async (phase) => {
+    const h = fixture();
+    const record = await h.storage.createNotification(input);
+    const get = h.storage.getNotification.bind(h.storage);
+    let reads = 0;
+    h.storage.getNotification = async (lookup) => {
+      const current = await get(lookup);
+      if (++reads === (phase === 'initial' ? 1 : 2) && current)
+        return { ...current, threadId: 'other-thread' };
+      return current;
+    };
+    const conditional = vi.spyOn(
+      h.storage,
+      'updateNotificationDeliveryIfUnchanged',
+    );
+    const response = await h.dispatch([record.id]);
+    expect(response?.status).toBe(phase === 'initial' ? 404 : 200);
+    if (phase === 'fresh')
+      expect(await response?.json()).toEqual({
+        delivered: 0,
+        failed: 0,
+        skipped: 1,
+      });
+    expect(conditional).not.toHaveBeenCalled();
+    expect(h.contentPolicy).not.toHaveBeenCalled();
+    expect(
+      await get({ threadId: input.threadId, id: record.id }),
+    ).toMatchObject({ status: 'pending', deliveryAttempts: 0 });
+  });
+
+  it('does not send an exhausted selection after its observation changes', async () => {
+    const h = fixture({ maxDeliveryAttempts: 1 });
+    const first = await h.storage.createNotification({ ...input, id: 'first' });
+    await h.storage.updateNotification({
+      threadId: input.threadId,
+      id: first.id,
+      deliveryAttempts: 1,
+      lastDeliveryError: 'old refusal',
+    });
+    const second = await h.storage.createNotification({
+      ...input,
+      id: 'second',
+    });
+    await h.storage.updateNotification({
+      threadId: input.threadId,
+      id: second.id,
+      status: 'delivered',
+    });
+    const get = h.storage.getNotification.bind(h.storage);
+    h.storage.getNotification = async (lookup) => {
+      if (lookup.id === second.id)
+        await h.storage.createNotification({
+          ...input,
+          id: first.id,
+          summary: 'replacement',
+        });
+      return get(lookup);
+    };
+    expect(await (await h.dispatch([first.id, second.id]))?.json()).toEqual({
+      delivered: 0,
+      failed: 1,
+      skipped: 1,
+    });
+    expect(await get({ threadId: input.threadId, id: first.id })).toMatchObject(
+      { status: 'pending', summary: 'replacement', deliveryAttempts: 0 },
+    );
+    expect(h.contentPolicy).not.toHaveBeenCalled();
+    expect(h.startIdleRun).not.toHaveBeenCalled();
+  });
+
+  it('captures policy and bound methods before store awaits and ignores body policy', async () => {
+    const storage = notificationStore();
+    const record = await storage.createNotification(input);
+    const { agent } = mockAgent();
+    const options = {
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      resolveNotificationsStorage: async () => {
+        options.maxDeliveryAttempts = 100;
+        return storage;
+      },
+      maxDeliveryAttempts: 1,
+      contentPolicy: () => ({
+        allowed: false as const,
+        outcome: 'error' as const,
+      }),
+    };
+    const conditional = vi.spyOn(
+      storage,
+      'updateNotificationDeliveryIfUnchanged',
+    );
+    const get = storage.getNotification.bind(storage);
+    storage.getNotification = async (lookup) => {
+      storage.updateNotificationDeliveryIfUnchanged = vi.fn(async () => {
+        throw new Error('mutated capability');
+      });
+      storage.getNotification = vi.fn(async () => {
+        throw new Error('mutated reader');
+      });
+      return get(lookup);
+    };
+    const routes = createThreadSignalRoutes(options);
+    const response = await routes(
+      post('/signal/notifications/dispatch', {
+        notificationIds: [record.id],
+        agentId: 'agent',
+        resourceId: 'acme_res',
+        now: dispatchNow,
+        maxDeliveryAttempts: 100,
+      }),
+      scopeWith(undefined),
+    );
+    expect(await response?.json()).toEqual({
+      delivered: 0,
+      failed: 0,
+      discarded: 1,
+    });
+    expect(conditional).toHaveBeenCalledOnce();
+    expect(
+      await get({ threadId: input.threadId, id: record.id }),
+    ).toMatchObject({ status: 'discarded', deliveryAttempts: 1 });
+  });
+
+  it.each([
+    'fresh-exhausted',
+    'fresh-malformed',
+    'fresh-failure',
+    'read-failure',
+  ] as const)('uses the actual individual observation for %s', async (mode) => {
+    const h = fixture({ maxDeliveryAttempts: 2 });
+    const record = await h.storage.createNotification(input);
+    const get = h.storage.getNotification.bind(h.storage);
+    const conditional = vi.spyOn(
+      h.storage,
+      'updateNotificationDeliveryIfUnchanged',
+    );
+    let reads = 0;
+    h.storage.getNotification = async (lookup) => {
+      if (++reads === 2) {
+        if (mode === 'read-failure') throw new Error('fresh read failed');
+        await h.storage.updateNotification({
+          ...lookup,
+          deliveryAttempts: mode === 'fresh-exhausted' ? 2 : 1,
+          lastDeliveryError: 'previous error',
+        });
+        const current = await get(lookup);
+        if (!current) throw new Error('notification fixture missing');
+        return mode === 'fresh-malformed'
+          ? { ...current, deliveryAttempts: null as unknown as number }
+          : current;
+      }
+      return get(lookup);
+    };
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      expect(await (await h.dispatch([record.id]))?.json()).toEqual(
+        mode === 'fresh-failure' || mode === 'fresh-exhausted'
+          ? { delivered: 0, failed: 0, discarded: 1 }
+          : { delivered: 0, failed: 1 },
+      );
+      if (mode === 'fresh-malformed')
+        expect(conditional).not.toHaveBeenCalled();
+      else expect(conditional).toHaveBeenCalledOnce();
+      const current = await get({ threadId: input.threadId, id: record.id });
+      expect(current?.deliveryAttempts).toBe(
+        mode === 'fresh-exhausted' || mode === 'fresh-failure' ? 2 : 1,
+      );
+      expect(current?.lastDeliveryError).toBe(
+        mode === 'fresh-exhausted' || mode === 'fresh-malformed'
+          ? 'previous error'
+          : mode === 'read-failure'
+            ? 'fresh read failed'
+            : 'signal content policy failed',
+      );
+      expect(h.contentPolicy).toHaveBeenCalledTimes(
+        mode === 'fresh-failure' ? 1 : 0,
+      );
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it.each([
+    null,
+    '1',
+    -1,
+    0.5,
+    NaN,
+    Infinity,
+    Number.MAX_SAFE_INTEGER + 1,
+  ])('contains malformed selected attempts %s without guessing a receipt', async (deliveryAttempts) => {
+    const h = fixture();
+    const malformed = await h.storage.createNotification(input);
+    const neighbor = await h.storage.createNotification(input);
+    const get = h.storage.getNotification.bind(h.storage);
+    h.storage.getNotification = async (lookup) => {
+      const current = await get(lookup);
+      if (!current) throw new Error('notification fixture missing');
+      return lookup.id === malformed.id
+        ? { ...current, deliveryAttempts: deliveryAttempts as number }
+        : current;
+    };
+    const conditional = vi.spyOn(
+      h.storage,
+      'updateNotificationDeliveryIfUnchanged',
+    );
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {
+      throw new Error('logger failed');
+    });
+    try {
+      expect(
+        await (await h.dispatch([malformed.id, neighbor.id]))?.json(),
+      ).toEqual({ delivered: 0, failed: 2 });
+      expect(conditional).toHaveBeenCalledOnce();
+      expect(conditional.mock.calls[0]?.[0].expected.id).toBe(neighbor.id);
+      expect(h.contentPolicy).toHaveBeenCalledOnce();
+      expect(
+        await get({ threadId: input.threadId, id: malformed.id }),
+      ).toMatchObject({ deliveryAttempts: 0, lastDeliveryError: undefined });
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it.each([
+    'summary',
+    'individual',
+  ] as const)('detaches %s rendering and failure observations from mutable storage objects', async (mode) => {
+    const h = fixture();
+    const first = await h.storage.createNotification({
+      ...input,
+      id: 'first',
+      summary: 'original summary',
+      payload: { value: 'original payload' },
+      ...(mode === 'summary'
+        ? { summaryAt: new Date(0), priority: 'low' as const }
+        : {}),
+    });
+    const second =
+      mode === 'summary'
+        ? await h.storage.createNotification({
+            ...input,
+            id: 'second',
+            summaryAt: new Date(0),
+            priority: 'low',
+          })
+        : undefined;
+    const get = h.storage.getNotification.bind(h.storage);
+    const shared = await get({ threadId: input.threadId, id: first.id });
+    if (!shared) throw new Error('notification fixture missing');
+    h.storage.getNotification = async (lookup) => {
+      if (lookup.id === first.id) return shared;
+      shared.source = 'mutated-source';
+      shared.summary = 'mutated summary';
+      (shared.payload as { value: string }).value = 'mutated payload';
+      shared.updatedAt.setTime(0);
+      return get(lookup);
+    };
+    h.contentPolicy.mockImplementation(() => {
+      shared.summary = 'mutated after rendering';
+      (shared.payload as { value: string }).value = 'mutated after rendering';
+      shared.updatedAt.setTime(0);
+      return { allowed: false, outcome: 'error' };
+    });
+    const conditional = vi.spyOn(
+      h.storage,
+      'updateNotificationDeliveryIfUnchanged',
+    );
+    expect(
+      await (
+        await h.dispatch(second ? [first.id, second.id] : [first.id])
+      )?.json(),
+    ).toEqual({ delivered: 0, failed: second ? 2 : 1 });
+    expect(h.contentPolicy.mock.calls[0]?.[0]).toMatchObject({
+      text: expect.stringContaining(
+        mode === 'summary' ? 'test: 2' : 'original summary',
+      ),
+    });
+    expect(conditional.mock.calls[0]?.[0].expected).toMatchObject({
+      summary: 'original summary',
+      payload: '{"value":"original payload"}',
+      updatedAt: first.updatedAt.toISOString(),
+    });
+    expect(await get({ threadId: input.threadId, id: first.id })).toMatchObject(
+      { deliveryAttempts: 1, summary: 'original summary' },
+    );
+  });
+
+  it('settles successful summary members before a later receipt write fails', async () => {
+    const h = fixture({ contentPolicy: undefined });
+    const first = await h.storage.createNotification({
+      ...input,
+      id: 'first',
+      priority: 'low',
+      summaryAt: new Date(0),
+      deliverAt: new Date('2099-01-01'),
+    });
+    const second = await h.storage.createNotification({
+      ...input,
+      id: 'second',
+      priority: 'low',
+      summaryAt: new Date(0),
+      deliverAt: new Date('2099-01-01'),
+    });
+    const update = h.storage.updateNotification.bind(h.storage);
+    h.storage.updateNotification = async (patch) => {
+      if (patch.id === second.id && patch.summarySignalId)
+        throw new Error('second receipt failed');
+      return update(patch);
+    };
+    const conditional = vi.spyOn(
+      h.storage,
+      'updateNotificationDeliveryIfUnchanged',
+    );
+    expect(await (await h.dispatch([first.id, second.id]))?.json()).toEqual({
+      delivered: 1,
+      failed: 1,
+    });
+    expect(conditional).toHaveBeenCalledOnce();
+    expect(conditional.mock.calls[0]?.[0].expected.id).toBe(second.id);
+    expect(
+      await h.storage.getNotification({
+        threadId: input.threadId,
+        id: first.id,
+      }),
+    ).toMatchObject({
+      summaryAt: undefined,
+      summarySignalId: 's',
+      deliveryAttempts: 0,
+    });
+    expect(
+      await h.storage.getNotification({
+        threadId: input.threadId,
+        id: second.id,
+      }),
+    ).toMatchObject({
+      summaryAt: new Date(new Date(dispatchNow).getTime() + 1000),
+      deliverAt: new Date('2099-01-01'),
+      deliveryAttempts: 1,
+      lastDeliveryError: 'second receipt failed',
+    });
+  });
+
+  it.each([
+    'individual',
+    'summary',
+    'denial',
+  ] as const)('preserves a committed %s receipt after general update response loss', async (mode) => {
+    const h = fixture({
+      contentPolicy:
+        mode === 'denial'
+          ? () => ({ allowed: false, outcome: 'denied' })
+          : undefined,
+    });
+    const record = await h.storage.createNotification({
+      ...input,
+      ...(mode === 'summary'
+        ? { priority: 'low' as const, summaryAt: new Date(0) }
+        : {}),
+    });
+    const update = h.storage.updateNotification.bind(h.storage);
+    let receipt: NotificationRecord | null = null;
+    h.storage.updateNotification = async (patch) => {
+      receipt = await update(patch);
+      throw new Error('general update response lost');
+    };
+    const conditional = vi.spyOn(
+      h.storage,
+      'updateNotificationDeliveryIfUnchanged',
+    );
+    const get = vi.spyOn(h.storage, 'getNotification');
+    expect(await (await h.dispatch([record.id]))?.json()).toEqual({
+      delivered: 0,
+      failed: 1,
+    });
+    expect(conditional).toHaveBeenCalledOnce();
+    expect(get).toHaveBeenCalledTimes(mode === 'summary' ? 1 : 2);
+    expect(
+      await h.storage.getNotification({
+        threadId: input.threadId,
+        id: record.id,
+      }),
+    ).toEqual(receipt);
+    expect(receipt).toMatchObject({
+      deliveryAttempts: 0,
+      lastDeliveryError: undefined,
+      ...(mode === 'summary'
+        ? { summarySignalId: 's', summaryAt: undefined }
+        : mode === 'denial'
+          ? { status: 'discarded', deliveryReason: 'content-policy-denied' }
+          : { status: 'delivered', deliveredSignalId: expect.any(String) }),
+    });
+  });
+
+  it.each([
+    'before',
+    'after',
+  ] as const)('contains summary bookkeeping response loss %s commit and continues the plan', async (timing) => {
+    const h = fixture();
+    const first = await h.storage.createNotification({
+      ...input,
+      id: 'first',
+      priority: 'medium',
+      summaryAt: new Date(0),
+    });
+    const second = await h.storage.createNotification({
+      ...input,
+      id: 'second',
+      priority: 'medium',
+      summaryAt: new Date(0),
+    });
+    const neighbor = await h.storage.createNotification({
+      ...input,
+      id: 'neighbor',
+      priority: 'low',
+    });
+    const write = h.storage.updateNotificationDeliveryIfUnchanged.bind(
+      h.storage,
+    );
+    const conditional = vi
+      .spyOn(h.storage, 'updateNotificationDeliveryIfUnchanged')
+      .mockImplementation(async (patch) => {
+        if (patch.expected.id === first.id) {
+          if (timing === 'after') await write(patch);
+          throw new Error('bookkeeping response lost');
+        }
+        return write(patch);
+      });
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {
+      throw new Error('logger failed');
+    });
+    try {
+      expect(
+        await (await h.dispatch([first.id, second.id, neighbor.id]))?.json(),
+      ).toEqual({ delivered: 0, failed: 3 });
+      expect(
+        conditional.mock.calls.map(([patch]) => patch.expected.id),
+      ).toEqual([first.id, second.id, neighbor.id]);
+      expect(h.contentPolicy).toHaveBeenCalledTimes(2);
+      for (const id of [first.id, second.id, neighbor.id]) {
+        expect(
+          await h.storage.getNotification({ threadId: input.threadId, id }),
+        ).toMatchObject({
+          deliveryAttempts: id === first.id && timing === 'before' ? 0 : 1,
+          lastDeliveryError:
+            id === first.id && timing === 'before'
+              ? undefined
+              : 'signal content policy failed',
+        });
+      }
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('starts an absent attempt counter at zero without discarding a summary-only receipt', async () => {
+    const h = fixture();
+    const record = await h.storage.createNotification(input);
+    await h.storage.updateNotification({
+      threadId: input.threadId,
+      id: record.id,
+      summarySignalId: 'old-summary',
+    });
+    const get = h.storage.getNotification.bind(h.storage);
+    h.storage.getNotification = async (lookup) => {
+      const current = await get(lookup);
+      if (current) delete current.deliveryAttempts;
+      return current;
+    };
+    expect(await (await h.dispatch([record.id]))?.json()).toEqual({
+      delivered: 0,
+      failed: 1,
+    });
+    expect(
+      await get({ threadId: input.threadId, id: record.id }),
+    ).toMatchObject({
+      status: 'pending',
+      deliveryAttempts: 1,
+      summarySignalId: 'old-summary',
+    });
+    expect(h.contentPolicy).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    'before',
+    'after',
+  ] as const)('counts conditional exhaustion response loss %s commit from its exact readback', async (timing) => {
+    const h = fixture({ maxDeliveryAttempts: 1 });
+    const record = await h.storage.createNotification(input);
+    const write = h.storage.updateNotificationDeliveryIfUnchanged.bind(
+      h.storage,
+    );
+    const conditional = vi
+      .spyOn(h.storage, 'updateNotificationDeliveryIfUnchanged')
+      .mockImplementation(async (patch) => {
+        if (timing === 'after') await write(patch);
+        throw new Error('exhaustion response lost');
+      });
+    const get = vi.spyOn(h.storage, 'getNotification');
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      expect(await (await h.dispatch([record.id]))?.json()).toEqual(
+        timing === 'after'
+          ? { delivered: 0, failed: 0, discarded: 1 }
+          : { delivered: 0, failed: 1 },
+      );
+      expect(conditional).toHaveBeenCalledOnce();
+      expect(get).toHaveBeenCalledTimes(3);
+      expect(
+        await h.storage.getNotification({
+          threadId: input.threadId,
+          id: record.id,
+        }),
+      ).toMatchObject({
+        status: timing === 'after' ? 'discarded' : 'pending',
+        deliveryAttempts: timing === 'after' ? 1 : 0,
+      });
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('retains dispatch time when a general receipt writer mutates its Date argument', async () => {
+    const h = fixture({ contentPolicy: undefined });
+    const first = await h.storage.createNotification({ ...input, id: 'first' });
+    const second = await h.storage.createNotification({
+      ...input,
+      id: 'second',
+      deliverAt: new Date(new Date(dispatchNow).getTime() - 1),
+    });
+    const update = h.storage.updateNotification.bind(h.storage);
+    h.storage.updateNotification = async (patch) => {
+      if (patch.id === first.id) {
+        patch.lastDeliveryAttemptAt?.setTime(0);
+        throw new Error('first general receipt failed');
+      }
+      return update(patch);
+    };
+    expect(await (await h.dispatch([first.id, second.id]))?.json()).toEqual({
+      delivered: 1,
+      failed: 1,
+    });
+    for (const id of [first.id, second.id]) {
+      expect(
+        await h.storage.getNotification({ threadId: input.threadId, id }),
+      ).toMatchObject({ lastDeliveryAttemptAt: new Date(dispatchNow) });
+    }
   });
 });

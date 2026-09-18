@@ -1,0 +1,22 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["@cloudflare/workers-types", "node"],
+    "customConditions": ["workerd", "worker", "browser"]
+  },
+  "files": [
+    "direct-credentialed-tenant.ts",
+    "direct-credentialed-spec.ts",
+    "direct-reference-journal.ts",
+    "direct-reference-http.ts",
+    "direct-reference-transport.ts",
+    "direct-reference-context.ts",
+    "direct-reference-observations.ts",
+    "direct-reference-lifecycle.ts",
+    "direct-reference-fence.ts",
+    "direct-reference-r4.ts",
+    "direct-reference-worker.ts"
+  ],
+  "include": []
+}

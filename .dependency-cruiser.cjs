@@ -1,13 +1,18 @@
+const { builtinModules } = require('node:module');
+
+const CLOUDFLARE_CONTROL_PLANE_ENTRY =
+  '^packages/fleet-control/src/cloudflare-control-plane\\.ts$';
+const CLOUDFLARE_FORBIDDEN_CORE = `^(?:node:(?!(?:crypto|async_hooks)$).+|${[
+  ...new Set(builtinModules.map((name) => name.replace(/^node:/, ''))),
+]
+  .filter((name) => name !== 'crypto' && name !== 'async_hooks')
+  .map((name) => name.replace(/[.*+?^$(){}|[\]\\]/g, '\\$&'))
+  .join('|')})$`;
+
 const FLOWSAFE_PUBLIC_ENTRY =
   '^packages/flowsafe/src/(?:index|host-kit/index|agent-runner/index|signals/client)\\.ts$';
-// `principal-identity` is the import-free half of `principal` (the kind list
-// and the two identity predicates). It is admitted here for the same reason the
-// others are, and is strictly leafier than any of them: it imports nothing at
-// all, so it cannot widen what do-runner reaches through approval-api.
 const ALLOWED_APPROVAL_API_LEAVES =
   '^packages/flowsafe/src/approval-api/(?:principal-identity|principal|contract|types)\\.ts$';
-// NOT extended with `principal-identity`: this is the exception list for the
-// one tolerated import cycle, and a module with no imports can never be in one.
 const KNOWN_APPROVAL_API_CYCLE =
   '^packages/flowsafe/src/approval-api/(?:principal|contract|types)\\.ts$';
 
@@ -15,10 +20,36 @@ const KNOWN_APPROVAL_API_CYCLE =
 module.exports = {
   forbidden: [
     {
+      name: 'fleet-control-worker-entry-avoids-node-host-adapters',
+      severity: 'error',
+      from: {
+        path: [
+          CLOUDFLARE_CONTROL_PLANE_ENTRY,
+          '^scripts/architecture-fixtures/control-plane-imports-node-host\\.ts$',
+        ],
+      },
+      to: {
+        path: '^packages/fleet-control/src/(?:export-store|wrangler-loop-backend|wrangler-plain-worker-provisioning-api|wrangler-runner)\\.ts$',
+        reachable: true,
+      },
+    },
+    {
+      name: 'fleet-control-worker-entry-limits-core-imports',
+      severity: 'error',
+      from: {
+        path: [
+          CLOUDFLARE_CONTROL_PLANE_ENTRY,
+          '^scripts/architecture-fixtures/control-plane-imports-forbidden-core\\.ts$',
+        ],
+      },
+      to: {
+        path: CLOUDFLARE_FORBIDDEN_CORE,
+        reachable: true,
+      },
+    },
+    {
       name: 'flowsafe-public-entry-no-agent-host',
       severity: 'error',
-      comment:
-        'Public, host-kit, runner, and signals-client entrypoints must stay independent of the optional agent host.',
       from: {
         path: [
           FLOWSAFE_PUBLIC_ENTRY,
@@ -33,8 +64,6 @@ module.exports = {
     {
       name: 'flowsafe-public-entry-no-breakwater',
       severity: 'error',
-      comment:
-        'The same entrypoints must not transitively acquire the optional Breakwater peer.',
       from: {
         path: [
           FLOWSAFE_PUBLIC_ENTRY,
@@ -49,8 +78,6 @@ module.exports = {
     {
       name: 'do-runner-approval-api-leaves-only',
       severity: 'error',
-      comment:
-        'do-runner may reach approval-api only through principal.ts, its import-free principal-identity.ts half, contract.ts, and their type-only types.ts leaf.',
       from: {
         path: [
           '^packages/flowsafe/src/do-runner/index\\.ts$',
@@ -66,8 +93,7 @@ module.exports = {
     {
       name: 'host-kit-no-durable-agent',
       severity: 'error',
-      comment:
-        'The host-kit barrel uses the pure approval-shapes leaf and must not pull Mastra durable Agent Node built-ins.',
+      comment: 'Mastra durable Agent dependencies require Node built-ins.',
       from: {
         path: [
           '^packages/flowsafe/src/host-kit/index\\.ts$',
@@ -82,8 +108,7 @@ module.exports = {
     {
       name: 'host-kit-no-breakwater',
       severity: 'error',
-      comment:
-        'Breakwater belongs to the separate host-kit/module authoring subpath, not the route-hosting barrel.',
+      comment: 'Breakwater belongs to the separate module-authoring subpath.',
       from: {
         path: [
           '^packages/flowsafe/src/host-kit/index\\.ts$',
@@ -111,8 +136,6 @@ module.exports = {
     {
       name: 'agent-starter-no-private-bare-entrypoints',
       severity: 'error',
-      comment:
-        'Starter code imports documented package exports, never src/dist entrypoints or repository-root source paths.',
       from: {
         path: [
           '^packages/agent-starter/(?:src|test|scripts)/',
@@ -126,8 +149,6 @@ module.exports = {
     {
       name: 'agent-starter-no-relative-package-reaches',
       severity: 'error',
-      comment:
-        'Starter code must not bypass package exports with a relative edge into a sibling package.',
       from: {
         path: [
           '^packages/agent-starter/(?:src|test|scripts)/',
@@ -143,7 +164,7 @@ module.exports = {
       name: 'fleet-control-is-control-plane-only',
       severity: 'error',
       comment:
-        'Fleet control holds account credentials, routing ownership, and tenant lifecycle. Publishing it removed the registry barrier, so no other package may reach it, by bare name or by any subpath. Stated as everything-except rather than an allowlist of today packages, and architecture:check:rules cruises packages as ONE root, so a new package or source directory is covered the day it lands. Showcase and the flowsafe deploy template alias imports through bundler config this file does not resolve, so coverage is per-module direct-import rather than transitive.',
+        'Fleet control holds account credentials, routing ownership, and tenant lifecycle authority. Showcase and the Flowsafe deploy template use bundler aliases that this resolver cannot follow.',
       from: {
         path: [
           '^packages/',
@@ -159,14 +180,270 @@ module.exports = {
     {
       name: 'no-new-architecture-cycles',
       severity: 'error',
-      comment:
-        'The principal-contract-types type cycle is the sole existing exception; any cycle involving another module fails.',
       from: {
-        path: '^(?:packages/flowsafe/src|packages/agent-starter/(?:src|test|scripts)|scripts/architecture-fixtures)/',
+        path: ['^packages/', '^scripts/architecture-fixtures/'],
       },
       to: {
         circular: true,
         via: { pathNot: KNOWN_APPROVAL_API_CYCLE },
+      },
+    },
+    {
+      name: 'fleet-control-client-layers-are-one-way',
+      severity: 'error',
+      from: {
+        path: [
+          '^packages/fleet-control/src/',
+          '^scripts/architecture-fixtures/fleet-control-leaf-imports-client\\.ts$',
+        ],
+        pathNot:
+          '^packages/fleet-control/src/(?:cloudflare-api-plain-worker-backend|cloudflare-api-plain-worker-provisioning-api|cloudflare-client|cloudflare-control-plane|index)\\.ts$',
+      },
+      to: {
+        path: '^packages/fleet-control/src/cloudflare-client\\.ts$',
+        reachable: true,
+      },
+    },
+    {
+      name: 'fleet-control-decommission-state-does-not-reach-provider',
+      severity: 'error',
+      comment:
+        'Persisted state codecs must not acquire credentials or transport dependencies.',
+      from: {
+        path: [
+          '^packages/fleet-control/src/(?:strict-plain-data|cloudflare-worker-attachment-scan-state|decommission-intent|decommission-advance|state-store)\\.ts$',
+          '^scripts/architecture-fixtures/decommission-state-imports-provider\\.ts$',
+        ],
+      },
+      to: {
+        path: '(?:^packages/fleet-control/src/(?:cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors)\\.ts$|^cloudflare(?:/|$)|(?:^|/)node_modules/(?:\\.pnpm/)?cloudflare(?:@|/))',
+        reachable: true,
+      },
+    },
+    {
+      name: 'fleet-control-cleanup-state-does-not-reach-provider',
+      severity: 'error',
+      from: {
+        path: [
+          '^packages/fleet-control/src/cleanup-intent\\.ts$',
+          '^scripts/architecture-fixtures/cleanup-state-imports-provider\\.ts$',
+        ],
+      },
+      to: {
+        path: '(?:^packages/fleet-control/src/(?:cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors)\\.ts$|^cloudflare(?:/|$)|(?:^|/)node_modules/(?:\\.pnpm/)?cloudflare(?:@|/))',
+        reachable: true,
+      },
+    },
+    {
+      name: 'fleet-control-inventory-state-does-not-reach-provider',
+      severity: 'error',
+      from: {
+        path: [
+          '^packages/fleet-control/src/(?:fleet-inventory-state|d1-fleet-inventory-run-store)\\.ts$',
+          '^scripts/architecture-fixtures/inventory-state-imports-provider\\.ts$',
+        ],
+      },
+      to: {
+        path: '(?:^packages/fleet-control/src/(?:cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors)\\.ts$|^cloudflare(?:/|$)|(?:^|/)node_modules/(?:\\.pnpm/)?cloudflare(?:@|/))',
+        reachable: true,
+      },
+    },
+    {
+      name: 'fleet-control-operation-state-does-not-reach-provider',
+      severity: 'error',
+      from: {
+        path: [
+          '^packages/fleet-control/src/(?:fleet-operation-state|fleet-audit-state|fleet-migration-state|d1-fleet-operation-store)\\.ts$',
+          '^scripts/architecture-fixtures/operation-state-imports-provider\\.ts$',
+        ],
+      },
+      to: {
+        path: '(?:^packages/fleet-control/src/(?:cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors)\\.ts$|^cloudflare(?:/|$)|(?:^|/)node_modules/(?:\\.pnpm/)?cloudflare(?:@|/))',
+        reachable: true,
+      },
+    },
+    {
+      name: 'fleet-control-decommission-advance-is-transport-neutral',
+      severity: 'error',
+      from: {
+        path: [
+          '^packages/fleet-control/src/decommission-advance\\.ts$',
+          '^scripts/architecture-fixtures/decommission-advance-imports-provider\\.ts$',
+        ],
+      },
+      to: {
+        path: '(?:^packages/fleet-control/src/(?:backend-switch|cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors|workers-for-platforms-backend-switch-provider|wrangler-plain-worker-provisioning-api|wrangler-loop-backend|wrangler-runner|export-file-name|export-store|r2-export-store|d1-fleet-state-database|provision|fleet|index)\\.ts$|^packages/fleet-control/src/workers/|^cloudflare(?:/|$)|(?:^|/)node_modules/(?:\\.pnpm/)?cloudflare(?:@|/))',
+        reachable: true,
+      },
+    },
+    {
+      name: 'fleet-control-inventory-advance-is-transport-neutral',
+      severity: 'error',
+      from: {
+        path: [
+          '^packages/fleet-control/src/fleet-inventory-advance\\.ts$',
+          '^scripts/architecture-fixtures/inventory-advance-imports-provider\\.ts$',
+        ],
+      },
+      to: {
+        path: '(?:^packages/fleet-control/src/(?:backend-switch|cloudflare-fleet-inventory|cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors|workers-for-platforms-backend-switch-provider|wrangler-plain-worker-provisioning-api|wrangler-loop-backend|wrangler-runner|export-file-name|export-store|r2-export-store|d1-fleet-state-database|provision|fleet|index)\\.ts$|^packages/fleet-control/src/workers/|^cloudflare(?:/|$)|(?:^|/)node_modules/(?:\\.pnpm/)?cloudflare(?:@|/))',
+        reachable: true,
+      },
+    },
+    {
+      name: 'fleet-control-operation-advance-avoids-concrete-transports',
+      severity: 'error',
+      comment:
+        'The reachable graph includes SDK types used by provider-neutral ports. Runtime SDK imports need a separate direct-edge rule because reachable restrictions cannot exempt erased edges.',
+      from: {
+        path: [
+          '^packages/fleet-control/src/(?:fleet-audit-advance|fleet-migration-advance)\\.ts$',
+          '^scripts/architecture-fixtures/operation-advance-imports-provider\\.ts$',
+        ],
+      },
+      to: {
+        path: '(?:^packages/fleet-control/src/(?:cloudflare-fleet-inventory|cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors|cloudflare-rate-coordinator|workers-for-platforms-backend-switch-provider|workers-for-platforms-backend|plain-worker-backend|cloudflare-api-plain-worker-backend|wrangler-plain-worker-provisioning-api|cloudflare-api-plain-worker-provisioning-api|wrangler-loop-backend|wrangler-runner|export-file-name|export-store|r2-export-store|d1-fleet-state-database|index)\\.ts$|^packages/fleet-control/src/workers/)',
+        reachable: true,
+      },
+    },
+    {
+      name: 'fleet-control-runtime-sdk-stays-in-provider-modules',
+      severity: 'error',
+      comment:
+        'A direct-edge restriction can exempt erased SDK types without allowing runtime SDK values through the type-inclusive reachable graph.',
+      from: {
+        path: [
+          '^packages/fleet-control/src/',
+          '^scripts/architecture-fixtures/runtime-sdk-import\\.ts$',
+        ],
+        pathNot:
+          '^packages/fleet-control/src/(?:cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors)\\.ts$',
+      },
+      to: {
+        path: '(?:^cloudflare(?:/|$)|(?:^|/)node_modules/(?:\\.pnpm/)?cloudflare(?:@|/))',
+        dependencyTypesNot: ['type-only', 'type-import'],
+      },
+    },
+    {
+      name: 'fleet-control-cleanup-advance-is-transport-neutral',
+      severity: 'error',
+      from: {
+        path: [
+          '^packages/fleet-control/src/cleanup-advance\\.ts$',
+          '^scripts/architecture-fixtures/cleanup-advance-imports-provider\\.ts$',
+        ],
+      },
+      to: {
+        path: '(?:^packages/fleet-control/src/(?:backend-switch|cloudflare-worker-attachment-scan|cloudflare-client|cloudflare-ordinary-worker-operations|cloudflare-provider-errors|workers-for-platforms-backend-switch-provider|wrangler-plain-worker-provisioning-api|wrangler-loop-backend|wrangler-runner|export-file-name|export-store|r2-export-store|d1-fleet-state-database|provision|fleet|index)\\.ts$|^packages/fleet-control/src/workers/|^cloudflare(?:/|$)|(?:^|/)node_modules/(?:\\.pnpm/)?cloudflare(?:@|/))',
+        reachable: true,
+      },
+    },
+    {
+      name: 'fleet-control-decommission-database-is-provider-neutral',
+      severity: 'error',
+      from: {
+        path: [
+          '^packages/fleet-control/src/decommission-database\\.ts$',
+          '^scripts/architecture-fixtures/decommission-database-imports-provider\\.ts$',
+        ],
+      },
+      to: {
+        path: '.*',
+        pathNot:
+          '^packages/fleet-control/src/(?:database-export-store|strict-plain-data)\\.ts$',
+        dependencyTypesNot: ['type-only', 'type-import'],
+      },
+    },
+    {
+      name: 'fleet-control-backend-switch-does-not-reach-its-provider',
+      severity: 'error',
+      comment:
+        'The concrete provider implements the coordinator ports; reverse reach couples coordination to its transport.',
+      from: {
+        path: [
+          '^packages/fleet-control/src/backend-switch\\.ts$',
+          '^scripts/architecture-fixtures/decommission-database-imports-provider\\.ts$',
+        ],
+      },
+      to: {
+        path: '^packages/fleet-control/src/workers-for-platforms-backend-switch-provider\\.ts$',
+        reachable: true,
+      },
+    },
+    {
+      name: 'fleet-control-strict-plain-data-is-import-free',
+      severity: 'error',
+      comment:
+        'Validation must not execute package code before rejecting hostile input.',
+      from: {
+        path: [
+          '^packages/fleet-control/src/strict-plain-data\\.ts$',
+          '^scripts/architecture-fixtures/decommission-state-imports-provider\\.ts$',
+        ],
+      },
+      to: {
+        path: '.*',
+        reachable: true,
+      },
+    },
+    {
+      name: 'fleet-control-ports-do-not-reach-d1-adapter',
+      severity: 'error',
+      comment:
+        'Binding adapters depend on the ports; store implementations accept injected databases.',
+      from: {
+        path: [
+          '^packages/fleet-control/src/(?:state-store|migration-ledger|d1-fleet-inventory-run-store|d1-fleet-operation-store)\\.ts$',
+          '^scripts/architecture-fixtures/fleet-control-port-imports-d1-adapter\\.ts$',
+        ],
+      },
+      to: {
+        path: '^packages/fleet-control/src/d1-fleet-state-database\\.ts$',
+        reachable: true,
+      },
+    },
+    {
+      name: 'fleet-control-worker-reachable-modules-avoid-node-builtins',
+      severity: 'error',
+      comment:
+        'Node built-ins require nodejs_compat. A harness with that flag can mask an incompatible import for consumers without it.',
+      from: {
+        path: [
+          '^packages/fleet-control/src/(?:d1-fleet-state-database|database-export-store|export-file-name|r2-export-store)\\.ts$',
+          '^packages/fleet-control/src/workers/',
+          '^scripts/architecture-fixtures/fleet-control-worker-reachable-imports-node-builtin\\.ts$',
+        ],
+      },
+      to: { dependencyTypes: ['core'] },
+    },
+    {
+      name: 'fleet-control-client-does-not-reach-its-consumers',
+      severity: 'error',
+      from: {
+        path: [
+          '^packages/fleet-control/src/cloudflare-client\\.ts$',
+          '^scripts/architecture-fixtures/fleet-control-client-imports-consumer\\.ts$',
+        ],
+      },
+      to: {
+        path: '^packages/fleet-control/src/(?:cloudflare-api-plain-worker-backend|cloudflare-api-plain-worker-provisioning-api|cloudflare-control-plane|index)\\.ts$',
+        reachable: true,
+      },
+    },
+    {
+      name: 'fleet-control-export-port-does-not-reach-adapters',
+      severity: 'error',
+      comment:
+        'Adapters implement the port; reverse reach introduces a dependency cycle, including through type imports.',
+      from: {
+        path: [
+          '^packages/fleet-control/src/database-export-store\\.ts$',
+          '^scripts/architecture-fixtures/fleet-control-export-port-imports-adapter\\.ts$',
+        ],
+      },
+      to: {
+        path: '^packages/fleet-control/src/(?:export-store|r2-export-store)\\.ts$',
+        reachable: true,
       },
     },
   ],
@@ -190,8 +467,6 @@ module.exports = {
     {
       name: 'host-kit-reaches-approval-shapes',
       severity: 'error',
-      comment:
-        'The barrel must continue reaching the pure approval-shapes leaf instead of the durable agent barrel.',
       module: {
         path: [
           '^packages/flowsafe/src/host-kit/index\\.ts$',

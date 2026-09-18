@@ -134,6 +134,8 @@ Both D1 and in-memory stores implement compare-and-swap transitions:
 
 The service always routes batch work through the same single-record methods. Batch APIs do not bypass authorization, attribution, notification, audit, or resume logic.
 
+When constructing `ApprovalService` or `buildHostApprovalService` directly, supply the trusted `workflowTablePrefix` for its D1 workflow storage. The empty string means the default namespace; omission means unknown. Built-in Worker and starter compositions pass their actual prefix. Proof-only decisions require a complete matching workflow/run/generation at that namespace and recheck the originally selected generation after separation-of-duties/history waits, before the approval CAS. A replacement run cannot inherit the earlier decision authority. These checks preserve the existing terminal-run SQL guard; they do not make approval storage and external resume effects one transaction.
+
 ## SLA and notifications
 
 `sweepSLA(store, options)` reads the deployment store and transitions overdue open requests to `escalated`. Run it through the maintenance Durable Object duty, never an HTTP route.

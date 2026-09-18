@@ -165,7 +165,11 @@ function defineFlowsafeWorkflow(env: Env): RunnerRuntime {
       runId: z.string(),
     }),
     outputSchema: z.object({ effectCount: z.number() }),
-    permissions: { sideEffect: 'write', requiresApproval: true },
+    permissions: {
+      sideEffect: 'write',
+      requiresApproval: true,
+      egressEnforcement: 'enforced',
+    },
     execute: async (input) => ({
       effectCount: (await recordEffect(env.DB, 'flowsafe', input.runId, input))
         .effectCount,
@@ -423,6 +427,7 @@ function flowsafeService(env: Env): ApprovalService {
     // This one DECIDES, and decide() commits before it resumes: same database,
     // same fence as the runs it moves.
     executionFence: executionFenceFor(env.DB as unknown as never),
+    workflowTablePrefix: '',
   });
 }
 

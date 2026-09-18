@@ -684,6 +684,47 @@ describe('createScheduleTick', () => {
     );
   });
 
+  it('audits an unadvanceable cron, writes no trigger, and leaves the row due', async () => {
+    // #given a stored row whose cron is syntactically legal — so a facade that
+    // validates at create can have accepted it — but has no future occurrence,
+    // which is what computeNextFireAt throws on
+    const store = new FakeStore();
+    store.seed(
+      workflowSchedule({ id: 'schedule_corrupt', cron: '0 0 30 2 *' }),
+    );
+    const start = vi.fn();
+    const events: ScheduleTickAuditEvent[] = [];
+    const tick = createScheduleTick({
+      store,
+      start,
+      audit: (event) => {
+        events.push(event);
+      },
+      now: () => NOW,
+    });
+
+    // #when
+    const first = await tick();
+
+    // #then the pass audits the failure and dispatches nothing; nextFireAt is
+    // untouched, so no trigger identifies a claim
+    expect(first).toMatchObject({ due: 1, failed: 1, fired: 0, lost: 0 });
+    expect(start).not.toHaveBeenCalled();
+    expect(store.triggers).toEqual([]);
+    expect(store.schedules.get('schedule_corrupt')?.nextFireAt).toBe(
+      NOW - 1000,
+    );
+    expect(events).toEqual([
+      expect.objectContaining({ outcome: 'failed', reason: 'invalid-cron' }),
+    ]);
+
+    // #and the row is still due: it is selected again and holds a slot of the
+    // bounded page until an operator repairs or removes it
+    expect(await tick()).toMatchObject({ due: 1, failed: 1 });
+    expect(store.triggers).toEqual([]);
+    expect(events).toHaveLength(2);
+  });
+
   it('rejects invalid limits synchronously and treats zero as a no-op', async () => {
     const store = new FakeStore();
     store.seed(workflowSchedule());
@@ -1273,5 +1314,53 @@ describe('createScheduleTick and the deployment execution fence', () => {
     expect(result.due).toBe(0);
     expect(start).not.toHaveBeenCalled();
     expect(store.schedules.get('schedule_a')?.nextFireAt).toBe(NOW - 1000);
+  });
+});
+
+describe('FS8 D3 host activation pending schedule status', () => {
+  it('retains a deferred signal without resending or publishing finality while initial admission is pending', async () => {
+    const store = new FakeStore();
+    store.seed(
+      workflowSchedule({
+        id: 'agent_schedule',
+        target: {
+          type: 'agent',
+          agentId: 'a1',
+          prompt: 'go',
+          threadId: 'acme_thread',
+          resourceId: 'acme_resource',
+          signalType: 'reactive',
+          tagName: 'scheduled',
+        },
+      }),
+    );
+    const signalAgent = vi.fn(async (_input: ScheduleTickSignalAgentInput) => {
+      throw new Error('response lost');
+    });
+    const pending = Object.assign(
+      new Error('run start has no durable execution outcome'),
+      { status: 503, reason: { code: 'RUN_START_PENDING' } },
+    );
+    const tick = createScheduleTick({
+      store,
+      start: vi.fn(),
+      signalAgent,
+      status: async () => {
+        throw pending;
+      },
+      now: () => NOW,
+    });
+    await tick();
+    const first = structuredClone(store.triggers[0]);
+    expect(first).toMatchObject({ outcome: 'deferred' });
+    const result = await tick();
+    expect(store.triggers[0]).toMatchObject({
+      id: first?.id,
+      runId: first?.runId,
+      outcome: 'deferred',
+      metadata: { dispatchRef: first?.metadata?.dispatchRef },
+    });
+    expect(signalAgent).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({ deferred: 1, fired: 0, failed: 0 });
   });
 });

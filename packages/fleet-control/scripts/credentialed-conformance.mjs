@@ -22,6 +22,7 @@ import {
   runCredentialedConformance,
   validateOperationalConformance,
 } from './credentialed-conformance-runtime.mjs';
+import { cancelBodyWithoutAwait } from './direct-credentialed-body-cancel.mjs';
 
 const REQUIRED_ENVIRONMENT_VARIABLES = Object.freeze([
   'FLEET_CONFORMANCE_CONFIG',
@@ -288,7 +289,11 @@ const client = new CloudflareProvisioningClient({
 });
 // This narrow read client sits outside the client's coordinated fetch path.
 // One explicit acquire therefore covers exactly one SDK request, with no retry.
-const cloudflare = new Cloudflare({ apiToken, maxRetries: 0 });
+const cloudflare = new Cloudflare({
+  apiToken,
+  logLevel: 'off',
+  maxRetries: 0,
+});
 const backend = new WorkersForPlatformsBackend({
   client,
   hostRoutingKvId: config.hostRoutingKvId,
@@ -303,6 +308,14 @@ const backend = new WorkersForPlatformsBackend({
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
+}
+
+// Releases a body the refusal leaves unread, handing it that same refusal.
+function assertResponse(response, condition, message) {
+  if (condition) return;
+  const refusal = new Error(message);
+  cancelBodyWithoutAwait(response?.body, refusal);
+  throw refusal;
 }
 
 async function listPlainWorkerVersionIds(runner, scriptName) {
@@ -691,7 +704,8 @@ async function contractRequest(
       redirect: 'manual',
     },
   );
-  assert(
+  assertResponse(
+    response,
     response.status === expectedStatus,
     `${action} returned ${response.status}, expected ${expectedStatus}`,
   );
@@ -846,10 +860,13 @@ async function assertEgressAndLimitProbes(deployment) {
       redirect: 'manual',
     },
   );
-  assert(
+  assertResponse(
+    overLimit,
     overLimit.status === config.conformance.cpuOverLimitStatus,
     `CPU over-limit request returned ${overLimit.status}`,
   );
+  // The over-limit probe reads the status alone.
+  cancelBodyWithoutAwait(overLimit?.body);
   const recovery = await contractRequest(deployment, 'cpu-control');
   assert(
     recovery.completed === true,

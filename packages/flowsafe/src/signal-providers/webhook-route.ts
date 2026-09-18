@@ -2,22 +2,6 @@
 // Webhook ingress that terminates on the Worker, plus the human-only
 // subscribe/unsubscribe surface.
 //
-// THE WEBHOOK GATE (its "auth" IS the signature, not a bearer token):
-//   1. path + method match (else null / 405)
-//   2. provider registered AND its secret configured (else null — route absent,
-//      byte-identical to an unconfigured deployment)
-//   3. read the RAW bytes, size-capped (413)
-//   4. VERIFY the provider signature over the raw bytes — BEFORE any parse, any
-//      subscription lookup, any delivery. A forged signature is REJECTED (401)
-//      and audited. No state is touched on the reject path.
-//   5. parse JSON (400 on malformed)
-//   6. extract the external resource key(s) from the payload
-//   7. map key -> deployment subscription rows — the payload NEVER names a
-//      thread/resource; the row is the authority
-//   8. per-provider deployment rate cap (429-equivalent: skip delivery, audited)
-//   9. deliver each matched row through the topology (which validates the
-//      path-safe thread address), audit the accepted ingest
-//
 // A forged-signature flood must not amplify into the audit log: the reject is
 // UNBOUNDED (every forgery is refused) but the forgery AUDIT is bounded to
 // `maxForgeryAuditsPerWindow` per provider per window (a fixed in-isolate
@@ -45,6 +29,7 @@ import {
   isExecutionFenceRefusal,
   readExecutionFence,
 } from '../do-runner/index.js';
+import { hostErrorText } from '../host-kit/host-approval-service.js';
 import {
   assertNoClientMemoryIds,
   type BoundThreadTargetValidator,
@@ -270,18 +255,44 @@ export function createWebhookRouter(
     return true;
   };
 
+  const reportError = (event: {
+    type:
+      | 'signal-provider.webhook-audit-error'
+      | 'signal-provider.webhook-delivery-error'
+      | 'signal-provider.webhook-delivery-rejected'
+      | 'signal-provider.webhook-error';
+    providerId: string;
+    reason?: string;
+    terminal?: boolean;
+    status?: number;
+  }): void => {
+    try {
+      console.error(JSON.stringify(event));
+    } catch {
+      // Diagnostics cannot change the request's selected outcome.
+    }
+  };
+
   const auditWebhook = async (
     event: Omit<WebhookAuditEvent, 'type' | 'timestamp'>,
   ): Promise<void> => {
     if (!audit) return;
-    await audit({
-      type: 'signal-provider.webhook',
-      ...(options.deploymentTag !== undefined
-        ? { deploymentTag: options.deploymentTag }
-        : {}),
-      timestamp: new Date().toISOString(),
-      ...event,
-    });
+    try {
+      await audit.call(options, {
+        type: 'signal-provider.webhook',
+        ...(options.deploymentTag !== undefined
+          ? { deploymentTag: options.deploymentTag }
+          : {}),
+        timestamp: new Date().toISOString(),
+        ...event,
+      });
+    } catch (error) {
+      reportError({
+        type: 'signal-provider.webhook-audit-error',
+        providerId: event.providerId,
+        reason: hostErrorText(error, true),
+      });
+    }
   };
 
   return async (request) => {
@@ -308,6 +319,7 @@ export function createWebhookRouter(
     // verify with a zero-length HMAC key (Node WebCrypto throws on it, and an
     // empty key that another runtime accepts would be a trivial forgery bypass):
     // `!secret` catches both undefined and ''.
+    if (!Object.hasOwn(providers, providerId)) return null;
     const provider = providers[providerId];
     const secret = secretForProvider(providerId);
     if (!provider || !secret) return null;
@@ -424,14 +436,12 @@ export function createWebhookRouter(
           built = provider.buildNotification(payload, row);
         } catch (error) {
           failed += 1;
-          console.error(
-            JSON.stringify({
-              type: 'signal-provider.webhook-delivery-error',
-              providerId,
-              terminal: true,
-              reason: error instanceof Error ? error.message : String(error),
-            }),
-          );
+          reportError({
+            type: 'signal-provider.webhook-delivery-error',
+            providerId,
+            terminal: true,
+            reason: hostErrorText(error, true),
+          });
           continue;
         }
         try {
@@ -449,55 +459,41 @@ export function createWebhookRouter(
           if (outcome === 'denied') denied += 1;
           else if (outcome === 'failed') failed += 1;
           else deferred += 1;
-          console.error(
-            JSON.stringify({
-              type: 'signal-provider.webhook-delivery-rejected',
-              providerId,
-              status: response.status,
-              terminal: isTerminalDelivery(outcome),
-            }),
-          );
+          reportError({
+            type: 'signal-provider.webhook-delivery-rejected',
+            providerId,
+            status: response.status,
+            terminal: isTerminalDelivery(outcome),
+          });
         } catch (error) {
           const outcome = classifyDeliveryError(error);
           if (outcome === 'denied') denied += 1;
           else if (outcome === 'failed') failed += 1;
           else deferred += 1;
-          console.error(
-            JSON.stringify({
-              type: 'signal-provider.webhook-delivery-error',
-              providerId,
-              terminal: isTerminalDelivery(outcome),
-              reason: error instanceof Error ? error.message : String(error),
-            }),
-          );
+          reportError({
+            type: 'signal-provider.webhook-delivery-error',
+            providerId,
+            terminal: isTerminalDelivery(outcome),
+            reason: hostErrorText(error, true),
+          });
         }
       }
 
-      try {
-        await auditWebhook({
-          providerId,
-          outcome: 'accepted',
-          matched: matched.length,
-          delivered,
-          ...(denied > 0 ? { denied } : {}),
-          ...(failed > 0 ? { failed } : {}),
-          ...(deferred > 0 ? { deferred } : {}),
-          ...(!deliveryAllowed
-            ? { reason: 'rate-limited' }
-            : deferred > 0
-              ? { reason: 'delivery-deferred' }
-              : {}),
-          contentBytes: rawBody.length,
-        });
-      } catch (error) {
-        console.error(
-          JSON.stringify({
-            type: 'signal-provider.webhook-audit-error',
-            providerId,
-            reason: error instanceof Error ? error.message : String(error),
-          }),
-        );
-      }
+      await auditWebhook({
+        providerId,
+        outcome: 'accepted',
+        matched: matched.length,
+        delivered,
+        ...(denied > 0 ? { denied } : {}),
+        ...(failed > 0 ? { failed } : {}),
+        ...(deferred > 0 ? { deferred } : {}),
+        ...(!deliveryAllowed
+          ? { reason: 'rate-limited' }
+          : deferred > 0
+            ? { reason: 'delivery-deferred' }
+            : {}),
+        contentBytes: rawBody.length,
+      });
       // A deferred row answers the sender with a 5xx so its own at-least-once
       // redelivery is what recovers the notification; this deployment has
       // nowhere durable to park an unvetted provider payload, and losing an
@@ -527,13 +523,11 @@ export function createWebhookRouter(
           error.status,
         );
       }
-      console.error(
-        JSON.stringify({
-          type: 'signal-provider.webhook-error',
-          providerId,
-          reason: error instanceof Error ? error.message : String(error),
-        }),
-      );
+      reportError({
+        type: 'signal-provider.webhook-error',
+        providerId,
+        reason: hostErrorText(error, true),
+      });
       return json({ error: 'internal error' }, 500);
     }
   };
@@ -548,7 +542,7 @@ export interface SubscriptionRouterOptions {
   subscriptions: SubscriptionStoreFactory;
   /** Prove subscriptions target durable bound memory, not ephemeral run ids. */
   validateThreadTarget: BoundThreadTargetValidator;
-  /** Who may manage subscriptions. Default RUN_START_ROLES (operator/admin). */
+  /** Who may manage subscriptions. Default RUN_START_ROLES. */
   roles?: readonly ApprovalRole[];
   /** The provider ids a subscription may name. Absent ⇒ any PROVIDER_ID_PATTERN slug. */
   knownProviders?: readonly string[];
@@ -581,7 +575,7 @@ export type SubscriptionRouter = (request: Request) => Promise<Response | null>;
 export function createSubscriptionRouter(
   options: SubscriptionRouterOptions,
 ): SubscriptionRouter {
-  const { resolve, subscriptions } = options;
+  const { resolve, subscriptions, audit: auditSink } = options;
   const roles = options.roles ?? RUN_START_ROLES;
   const base = options.basePath ?? '/api/threads';
   const baseSegments = base.split('/').filter(Boolean);
@@ -628,6 +622,29 @@ export function createSubscriptionRouter(
           : 'list';
 
     let context: ActorContext | undefined;
+    const reportError = (
+      type:
+        | 'signal-provider.subscription-audit-error'
+        | 'signal-provider.polling-reconcile-error',
+      error: unknown,
+      providerId?: string,
+    ): void => {
+      try {
+        console.error(
+          JSON.stringify({
+            type,
+            ...(context?.deploymentTag !== undefined
+              ? { deploymentTag: context.deploymentTag }
+              : {}),
+            ...(providerId !== undefined ? { providerId } : {}),
+            action,
+            reason: hostErrorText(error, true),
+          }),
+        );
+      } catch {
+        // Diagnostics cannot change the request's selected outcome.
+      }
+    };
     const audit = async (
       outcome: 'accepted' | 'rejected',
       extra: {
@@ -637,19 +654,27 @@ export function createSubscriptionRouter(
         reason?: string;
       } = {},
     ): Promise<void> => {
-      if (!options.audit || !context) return;
-      await options.audit({
-        type: 'signal-provider.subscription',
-        ...(context.deploymentTag !== undefined
-          ? { deploymentTag: context.deploymentTag }
-          : {}),
-        actorId: context.actor.id,
-        threadId,
-        action,
-        outcome,
-        ...extra,
-        timestamp: new Date().toISOString(),
-      });
+      if (!auditSink || !context) return;
+      try {
+        await auditSink.call(options, {
+          type: 'signal-provider.subscription',
+          ...(context.deploymentTag !== undefined
+            ? { deploymentTag: context.deploymentTag }
+            : {}),
+          actorId: context.actor.id,
+          threadId,
+          action,
+          outcome,
+          ...extra,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (error) {
+        reportError(
+          'signal-provider.subscription-audit-error',
+          error,
+          extra.providerId,
+        );
+      }
     };
 
     const finishCommittedMutation = async (
@@ -666,42 +691,22 @@ export function createSubscriptionRouter(
           pollingLifecycle = 'reconciled';
         } catch (error) {
           pollingLifecycle = 'failed';
-          console.error(
-            JSON.stringify({
-              type: 'signal-provider.polling-reconcile-error',
-              ...(context?.deploymentTag !== undefined
-                ? { deploymentTag: context.deploymentTag }
-                : {}),
-              providerId,
-              action,
-              reason: error instanceof Error ? error.message : String(error),
-            }),
+          reportError(
+            'signal-provider.polling-reconcile-error',
+            error,
+            providerId,
           );
         }
       }
 
-      try {
-        await audit('accepted', {
-          providerId,
-          externalResourceId,
-          ...(pollingLifecycle === undefined ? {} : { pollingLifecycle }),
-          ...(pollingLifecycle === 'failed'
-            ? { reason: 'polling-reconcile-failed' }
-            : {}),
-        });
-      } catch (error) {
-        console.error(
-          JSON.stringify({
-            type: 'signal-provider.subscription-audit-error',
-            ...(context?.deploymentTag !== undefined
-              ? { deploymentTag: context.deploymentTag }
-              : {}),
-            providerId,
-            action,
-            reason: error instanceof Error ? error.message : String(error),
-          }),
-        );
-      }
+      await audit('accepted', {
+        providerId,
+        externalResourceId,
+        ...(pollingLifecycle === undefined ? {} : { pollingLifecycle }),
+        ...(pollingLifecycle === 'failed'
+          ? { reason: 'polling-reconcile-failed' }
+          : {}),
+      });
     };
 
     try {
@@ -866,11 +871,7 @@ export function createSubscriptionRouter(
       if (error instanceof ActorResolutionError) {
         return json({ error: 'forbidden' }, 403);
       }
-      try {
-        await audit('rejected', { reason: 'internal-error' });
-      } catch {
-        // Best-effort audit must not replace the generic response.
-      }
+      await audit('rejected', { reason: 'internal-error' });
       return internalErrorResponse('signal-providers.subscription', error);
     }
   };

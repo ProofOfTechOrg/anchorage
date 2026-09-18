@@ -44,7 +44,7 @@ import {
 } from '../../../scripts/workerd-server-lifecycle.mjs';
 
 const FLOWSAFE = dirname(dirname(fileURLToPath(import.meta.url)));
-const WRANGLER = join(FLOWSAFE, 'node_modules/.bin/wrangler');
+const WRANGLER = join(FLOWSAFE, '../../node_modules/.bin/wrangler');
 const CONFIG = join(FLOWSAFE, 'spike/wrangler.jsonc');
 const PORT = parsePort(
   process.env.SPIKE_VERIFY_PORT ?? 8799,
@@ -55,6 +55,14 @@ const FAULT = process.env.SPIKE_VERIFY_FAULT || undefined;
 const RUN_BODY = {
   workflowId: 'demo-approval',
   inputData: { topic: 'launch' },
+};
+const APPLICATION_CONTEXT_KEY = 'spike.attribution';
+const APPLICATION_CONTEXT = {
+  [APPLICATION_CONTEXT_KEY]: 'accepted-application-value',
+};
+const INPUT_CONTEXT_SMUGGLE = {
+  [APPLICATION_CONTEXT_KEY]: 'input-top-level-value',
+  requestContext: { [APPLICATION_CONTEXT_KEY]: 'input-nested-value' },
 };
 // Track A: the agent tool-call gate suspends with the durable-agent approval
 // shape (R-003) rather than an explicit `connectors` array.
@@ -378,12 +386,14 @@ async function startCountedWithKey(
   idempotencyKey,
   counterId,
   headers = AUTH.operator,
+  requestContext,
 ) {
   return http('POST', '/runs', {
     body: {
       workflowId: COUNTED_WORKFLOW_ID,
       inputData: { topic: 'launch', counterId },
       idempotencyKey,
+      requestContext,
     },
     headers,
   });
@@ -961,11 +971,45 @@ async function main() {
     },
   );
 
+  await step(
+    'RC0 run context: reserved body values fail before execution',
+    async () => {
+      for (const requestContext of [
+        { 'breakwater.actor': { id: 'mallory', role: 'admin' } },
+        { 'breakwater.unlistedCapability': true },
+        { 'flowsafe.runProvenance': { requestedBy: 'mallory' } },
+      ]) {
+        const rejected = await http('POST', '/runs', {
+          body: {
+            workflowId: COUNTED_WORKFLOW_ID,
+            inputData: { topic: 'launch', counterId: 'context-refusals' },
+            requestContext,
+          },
+          headers: AUTH.operator,
+        });
+        assert(
+          rejected.status === 400 &&
+            rejected.body?.reason === 'reserved-context-key',
+          'a reserved application context is refused with the typed 400 reason',
+          rejected,
+        );
+      }
+      assert(
+        (await executionCount('context-refusals')) === 0,
+        'reserved-body refusals never execute the counted workflow',
+      );
+    },
+  );
+
   const run = await step(
     'A1 start: run suspends at approval gate',
     async () => {
       const { status, body } = await http('POST', '/runs', {
-        body: RUN_BODY,
+        body: {
+          ...RUN_BODY,
+          inputData: { ...RUN_BODY.inputData, ...INPUT_CONTEXT_SMUGGLE },
+          requestContext: APPLICATION_CONTEXT,
+        },
         headers: AUTH.operator,
       });
       assert(status === 200, `POST /runs -> ${status}`, body);
@@ -1269,6 +1313,12 @@ async function main() {
         'resumed run published',
         body.resume?.summary?.result,
       );
+      assert(
+        body.resume?.summary?.result?.applicationValue ===
+          APPLICATION_CONTEXT[APPLICATION_CONTEXT_KEY],
+        'the connector reads the accepted application value after process restart',
+        body.resume?.summary?.result,
+      );
     });
   }
 
@@ -1282,6 +1332,40 @@ async function main() {
     assert(body.status === 'success', 'final run status', body.status);
     assert(body.result?.published === true, 'published', body.result);
     assert(body.result?.approvedBy === 'ray', 'approvedBy', body.result);
+    assert(
+      body.result?.applicationValue ===
+        APPLICATION_CONTEXT[APPLICATION_CONTEXT_KEY],
+      'the connector result persists the body context rather than inputData attribution',
+      body.result,
+    );
+  });
+
+  await step('RC1 inputData cannot create connector context', async () => {
+    const started = await http('POST', '/runs', {
+      body: {
+        ...RUN_BODY,
+        inputData: { ...RUN_BODY.inputData, ...INPUT_CONTEXT_SMUGGLE },
+      },
+      headers: AUTH.operator,
+    });
+    assert(
+      started.status === 200 && started.body.status === 'suspended',
+      'the input-only run suspends for approval',
+      started,
+    );
+    const decided = await http(
+      'POST',
+      `/api/approvals/${started.body.approval?.id}/decide`,
+      { headers: AUTH.reviewer, body: { decision: 'approve' } },
+    );
+    assert(
+      decided.status === 200 &&
+        decided.body.resume?.summary?.status === 'success' &&
+        decided.body.resume?.summary?.result?.published === true &&
+        decided.body.resume?.summary?.result?.applicationValue === undefined,
+      'the connector executes without application context from inputData',
+      decided,
+    );
   });
 
   await step('B forged-resume: no grant -> fails closed', async () => {
@@ -2132,6 +2216,31 @@ async function main() {
         'verified stored initialState reaches core workflow execution',
         body.leg,
       );
+      assert(
+        body.leg?.applicationValue ===
+          APPLICATION_CONTEXT[APPLICATION_CONTEXT_KEY],
+        'the scheduled leg reads the exact stored application value',
+        body.leg,
+      );
+      const api = await http('POST', '/runs', {
+        headers: AUTH.operator,
+        body: {
+          workflowId: 'sched-echo',
+          inputData: INPUT_CONTEXT_SMUGGLE,
+          requestContext: APPLICATION_CONTEXT,
+        },
+      });
+      assert(
+        api.status === 200 &&
+          api.body.status === 'success' &&
+          api.body.result?.applicationValue === body.leg.applicationValue &&
+          api.body.result?.reservedLeaked === false &&
+          api.body.result?.workflowScopePresent === true &&
+          api.body.result?.isolationScopePresent === false &&
+          api.body.result?.initialStatePresent === false,
+        'API and scheduled starts read the same application value with runtime scope intact',
+        api,
+      );
     },
   );
 
@@ -2686,7 +2795,12 @@ async function main() {
     'FI1 idempotent start: a retry after a workerd kill+restart returns the ' +
       'SAME run, and the paid first step ran exactly ONCE',
     async () => {
-      const first = await startCountedWithKey('spike-key-1', 'fi1');
+      const first = await startCountedWithKey(
+        'spike-key-1',
+        'fi1',
+        AUTH.operator,
+        APPLICATION_CONTEXT,
+      );
       assert(
         first.status === 200 && first.body.status === 'suspended',
         'the first keyed start must run normally',
@@ -2709,7 +2823,12 @@ async function main() {
         join(tmpDir, 'idempotent-restart.log'),
       );
 
-      const retry = await startCountedWithKey('spike-key-1', 'fi1');
+      const retry = await startCountedWithKey(
+        'spike-key-1',
+        'fi1',
+        AUTH.operator,
+        { [APPLICATION_CONTEXT_KEY]: 'divergent-retry-value' },
+      );
       assert(
         retry.status === 200 && retry.body.runId === first.body.runId,
         'the retry must replay the first run, not start a second',
@@ -2724,6 +2843,24 @@ async function main() {
         executions === 1,
         'a retry after process death must execute the first step no second time',
         { executions, first: first.body, retry: retry.body },
+      );
+      const decided = await http(
+        'POST',
+        `/api/approvals/${first.body.approval?.id}/decide`,
+        { headers: AUTH.reviewer, body: { decision: 'approve' } },
+      );
+      assert(
+        decided.status === 200 &&
+          decided.body.resume?.summary?.status === 'success' &&
+          decided.body.resume?.summary?.result?.published === true &&
+          decided.body.resume?.summary?.result?.applicationValue ===
+            APPLICATION_CONTEXT[APPLICATION_CONTEXT_KEY],
+        'the keyed run connector retains the first context after a divergent retry',
+        decided,
+      );
+      assert(
+        (await executionCount('fi1')) === 1,
+        'resuming the replayed run leaves the first-step execution count unchanged',
       );
       return { runId: first.body.runId, approvalId: first.body.approval?.id };
     },

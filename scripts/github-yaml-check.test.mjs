@@ -1,18 +1,24 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import {
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { afterEach, test } from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { parse } from 'yaml';
 import {
   checkGithubYamlFiles,
   runGithubYamlCheck,
 } from './github-yaml-check.mjs';
+
+const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 const temporaryDirectories = [];
 
@@ -41,6 +47,42 @@ function captureRun(githubDirectory) {
     stdout: { write: (chunk) => (stdout += chunk) },
   });
   return { exitCode, stderr, stdout };
+}
+
+// The assertion is read out of the tracked workflow, not restated here, so the
+// case evaluates what ships rather than a copy of it.
+function readWorkflow() {
+  return parse(
+    readFileSync(join(repositoryRoot, '.github/workflows/ci.yml'), 'utf8'),
+  );
+}
+
+function readVerifyGateJob() {
+  const job = readWorkflow().jobs.verify;
+  assert.ok(
+    job,
+    'the `protect main` ruleset requires the status check named `verify`, which is this job',
+  );
+  const steps = (job.steps ?? []).filter((step) => 'run' in step);
+  assert.equal(steps.length, 1, 'the verify gate job has one run step');
+  return { job, step: steps[0] };
+}
+
+function runVerifyGate(step, needs) {
+  const variables = Object.keys(step.env ?? {});
+  assert.equal(
+    variables.length,
+    1,
+    'the verify gate step carries the needs context in one env variable',
+  );
+  return spawnSync('bash', ['-e', '-c', step.run], {
+    encoding: 'utf8',
+    env: { ...process.env, [variables[0]]: JSON.stringify(needs) },
+  });
+}
+
+function resultListing(needs) {
+  return Object.entries(needs).map(([job, { result }]) => `${job}: ${result}`);
 }
 
 test('counts a valid YAML mapping', () => {
@@ -363,4 +405,103 @@ test('prints parser warnings without failing the run', () => {
     ),
   );
   assert.equal(run.stdout, 'GitHub YAML check passed (1 files).\n');
+});
+
+// The cases below pin ci.yml rather than the checker. They live here because
+// the checker already parses every .github workflow, and a suite of their own
+// would add a verify-core step to run it.
+// This one reads the gate's shape and shells out to nothing, so it reports the
+// deletions below on every machine.
+test('the ci.yml gate job stays reachable and depends on at least one job', () => {
+  const { job } = readVerifyGateJob();
+
+  assert.equal(
+    job.if,
+    'always()',
+    'without `if: always()` a failed dependency skips the gate job, and GitHub reports a skipped required check as success',
+  );
+  assert.ok(
+    Array.isArray(job.needs) && job.needs.length > 0,
+    'an empty `needs` list leaves the gate passing with nothing verified',
+  );
+});
+
+// The canary's `continue-on-error` keys are what keep an upstream @mastra/core
+// release off the merge path: one at the job, and one on each step this case
+// names. This case shells out to nothing either.
+test('the ci.yml canary stays non-gating at the job and at the steps expected to go red, whose ids the summary reads', () => {
+  const job = readWorkflow().jobs['mastra-compat'];
+
+  assert.ok(job, 'the compat canary is the job named `mastra-compat`');
+  assert.equal(
+    job['continue-on-error'],
+    true,
+    'without the job-level key an upstream @mastra/core release wedges unrelated pull requests',
+  );
+
+  for (const [name, id] of [
+    ['Typecheck libraries against newest core', 'typecheck'],
+    ['Bundle the flowsafe spike Worker against newest core', 'bundle'],
+  ]) {
+    const step = (job.steps ?? []).find((candidate) => candidate.name === name);
+
+    assert.ok(step, `the canary runs a step named "${name}"`);
+    assert.equal(
+      step['continue-on-error'],
+      true,
+      `without the step-level key on "${name}" its expected red skips the tripwire suites after it`,
+    );
+    assert.equal(
+      step.id,
+      id,
+      `the run summary reads steps.${id}.outcome, so "${name}" carries that id`,
+    );
+  }
+});
+
+// `bash -e -c` reproduces the runner's default shell for a `run` block that
+// declares no `shell:` key, and the env variable the script reads is taken from
+// the step rather than restated, so the wiring at ci.yml is what runs here. The
+// job's single-run-step shape is asserted in readVerifyGateJob above.
+test('the ci.yml gate rejects an empty or non-success needs context', (t) => {
+  if (spawnSync('jq', ['--version']).status !== 0) {
+    t.skip('jq is not on PATH, so the gate assertion cannot be evaluated');
+    return;
+  }
+
+  const { step } = readVerifyGateJob();
+  const cases = [
+    { needs: {}, succeeds: false },
+    {
+      needs: {
+        'verify-core': { result: 'success' },
+        'direct-scenario': { result: 'success' },
+      },
+      succeeds: true,
+    },
+    ...['failure', 'cancelled', 'skipped'].map((result) => ({
+      needs: {
+        'verify-core': { result: 'success' },
+        'direct-scenario': { result },
+      },
+      succeeds: false,
+    })),
+  ];
+
+  for (const { needs, succeeds } of cases) {
+    const label = JSON.stringify(needs);
+    const run = runVerifyGate(step, needs);
+
+    assert.equal(run.error, undefined, label);
+    if (succeeds) {
+      assert.equal(run.status, 0, label);
+    } else {
+      assert.ok(run.status > 0, label);
+    }
+    assert.deepEqual(
+      run.stdout.split('\n').filter((line) => line !== ''),
+      resultListing(needs),
+      label,
+    );
+  }
 });

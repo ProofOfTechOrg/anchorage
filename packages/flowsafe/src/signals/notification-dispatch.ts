@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import type {
-  NotificationRecord,
-  NotificationsStorage,
+import {
+  type NotificationRecord,
+  type NotificationsStorage,
+  resolveNotificationDeliveryDecision,
+  summarizeNotifications,
 } from '@mastra/core/notifications';
 
 import type { ActorContext } from '../approval-api/index.js';
@@ -13,13 +15,84 @@ import {
   readExecutionFence,
 } from '../do-runner/index.js';
 import type { ThreadTopology } from '../host-kit/index.js';
-import { nonnegativeSafeInteger } from '../numeric-config.js';
+import {
+  nonnegativeSafeInteger,
+  positiveSafeInteger,
+} from '../numeric-config.js';
+import { jsonOrNull } from './d1-shared.js';
+
+/** Scalar values preserve the attempted observation across asynchronous writes. */
+export type NotificationDeliveryObservation = Readonly<{
+  id: string;
+  threadId: string;
+  source: string;
+  kind: string;
+  priority: NotificationRecord['priority'];
+  status: NotificationRecord['status'];
+  summary: string;
+  payload: string | null;
+  resourceId: string | null;
+  agentId: string | null;
+  sourceId: string | null;
+  dedupeKey: string | null;
+  coalesceKey: string | null;
+  coalescedCount: number;
+  attributes: string | null;
+  createdAt: string;
+  updatedAt: string;
+  deliverAt: string | null;
+  summaryAt: string | null;
+  deliveryReason: string | null;
+  deliveryAttempts: number;
+  lastDeliveryAttemptAt: string | null;
+  lastDeliveryError: string | null;
+  deliveredSignalId: string | null;
+  summarySignalId: string | null;
+  deliveredAt: string | null;
+  seenAt: string | null;
+  dismissedAt: string | null;
+  archivedAt: string | null;
+  discardedAt: string | null;
+  metadata: string | null;
+}>;
+
+export type NotificationDeliveryFailure =
+  | Readonly<{
+      type: 'retry';
+      updatedAt: string;
+      deliveryAttempts: number;
+      lastDeliveryAttemptAt: string;
+      lastDeliveryError: string;
+      deliverAt?: string;
+      summaryAt?: string;
+    }>
+  | Readonly<{
+      type: 'discard';
+      updatedAt: string;
+      deliveryAttempts: number;
+      lastDeliveryAttemptAt: string;
+      lastDeliveryError: string;
+    }>
+  | Readonly<{ type: 'exhausted'; updatedAt: string }>;
+
+export type NotificationDeliveryUpdateResult =
+  | { applied: true; record: NotificationRecord }
+  | { applied: false };
+
+export interface NotificationDeliveryStorage extends NotificationsStorage {
+  updateNotificationDeliveryIfUnchanged(input: {
+    expected: NotificationDeliveryObservation;
+    failure: NotificationDeliveryFailure;
+  }): Promise<NotificationDeliveryUpdateResult>;
+}
 
 /** Maximum route-valid ids in one trusted thread-DO dispatch request. */
 export const MAX_NOTIFICATION_DISPATCH_IDS = 100;
 
+export const DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS = 10;
+
 export interface NotificationDispatchTickOptions {
-  storage: NotificationsStorage;
+  storage: NotificationDeliveryStorage;
   topology: ThreadTopology;
   /** Builds the system-authorized context used after row bindings validate. */
   resolveContext(): ActorContext;
@@ -29,6 +102,8 @@ export interface NotificationDispatchTickOptions {
    * intentional no-op. Values above 100 are split into route-valid chunks.
    */
   limit?: number;
+  /** Failed rounds before terminal discard. Must be a positive safe integer. */
+  maxDeliveryAttempts?: number;
   /**
    * The deployment execution fence, read ONCE per pass, or `'none'` for a tick
    * with no database behind it. A drain still dispatches — the thread routes
@@ -47,7 +122,7 @@ export interface NotificationDispatchTickResult {
   due: number;
   delivered: number;
   failed: number;
-  /** Terminal content-policy denials. Omitted when zero for wire compatibility. */
+  /** Confirmed terminal discards. Omitted when zero for wire compatibility. */
   discarded?: number;
 }
 
@@ -186,8 +261,291 @@ export function packNotificationDispatchItems(
   return batches;
 }
 
+function textValue(value: unknown): string {
+  if (typeof value !== 'string') {
+    throw new TypeError('notification text must be a string');
+  }
+  return value;
+}
+
+function optionalText(value: unknown): string | null {
+  return value === undefined || value === null ? null : textValue(value);
+}
+
+function dateValue(value: unknown): string {
+  if (!(value instanceof Date) || !Number.isFinite(value.getTime())) {
+    throw new TypeError('notification timestamp must be a finite Date');
+  }
+  return value.toISOString();
+}
+
+function optionalDate(value: unknown): string | null {
+  return value === undefined || value === null ? null : dateValue(value);
+}
+
+function parsedJson(value: string): unknown {
+  try {
+    return JSON.parse(value, (_key, parsed: unknown) => {
+      if (typeof parsed === 'number' && !Number.isFinite(parsed)) {
+        throw new TypeError('notification JSON contains a nonfinite number');
+      }
+      return parsed;
+    });
+  } catch {
+    throw new TypeError('notification JSON is malformed');
+  }
+}
+
+function jsonValue(value: unknown): string | null {
+  try {
+    const encoded = jsonOrNull(value);
+    if (encoded === null) return null;
+    if (typeof encoded !== 'string') {
+      throw new TypeError('notification value is not JSON serializable');
+    }
+    parsedJson(encoded);
+    return encoded;
+  } catch {
+    throw new TypeError('notification value is not JSON serializable');
+  }
+}
+
+export function captureNotificationDeliveryObservation(
+  record: NotificationRecord,
+): NotificationDeliveryObservation {
+  const priority = record.priority;
+  const status = record.status;
+  if (!['low', 'medium', 'high', 'urgent'].includes(priority)) {
+    throw new TypeError('notification priority is invalid');
+  }
+  if (
+    ![
+      'pending',
+      'delivered',
+      'seen',
+      'dismissed',
+      'archived',
+      'discarded',
+    ].includes(status)
+  ) {
+    throw new TypeError('notification status is invalid');
+  }
+  const coalescedCount =
+    record.coalescedCount === undefined ? 1 : record.coalescedCount;
+  if (typeof coalescedCount !== 'number' || !Number.isFinite(coalescedCount)) {
+    throw new TypeError('notification coalesced count must be finite');
+  }
+  return Object.freeze({
+    id: textValue(record.id),
+    threadId: textValue(record.threadId),
+    source: textValue(record.source),
+    kind: textValue(record.kind),
+    priority,
+    status,
+    summary: textValue(record.summary),
+    payload: jsonValue(record.payload),
+    resourceId: optionalText(record.resourceId),
+    agentId: optionalText(record.agentId),
+    sourceId: optionalText(record.sourceId),
+    dedupeKey: optionalText(record.dedupeKey),
+    coalesceKey: optionalText(record.coalesceKey),
+    coalescedCount,
+    attributes: jsonValue(record.attributes),
+    createdAt: dateValue(record.createdAt),
+    updatedAt: dateValue(record.updatedAt),
+    deliverAt: optionalDate(record.deliverAt),
+    summaryAt: optionalDate(record.summaryAt),
+    deliveryReason: optionalText(record.deliveryReason),
+    deliveryAttempts: nonnegativeSafeInteger(
+      record.deliveryAttempts === undefined ? 0 : record.deliveryAttempts,
+      'notification delivery attempts',
+    ),
+    lastDeliveryAttemptAt: optionalDate(record.lastDeliveryAttemptAt),
+    lastDeliveryError: optionalText(record.lastDeliveryError),
+    deliveredSignalId: optionalText(record.deliveredSignalId),
+    summarySignalId: optionalText(record.summarySignalId),
+    deliveredAt: optionalDate(record.deliveredAt),
+    seenAt: optionalDate(record.seenAt),
+    dismissedAt: optionalDate(record.dismissedAt),
+    archivedAt: optionalDate(record.archivedAt),
+    discardedAt: optionalDate(record.discardedAt),
+    metadata: jsonValue(record.metadata),
+  });
+}
+
+function decodedDate(value: string): Date {
+  const date = new Date(textValue(value));
+  if (dateValue(date) !== value) {
+    throw new TypeError('notification observation timestamp must be ISO');
+  }
+  return date;
+}
+
+function decodedOptionalDate(value: string | null): Date | undefined {
+  return value === null ? undefined : decodedDate(value);
+}
+
+function decodedJson(value: string | null): unknown {
+  return value === null ? undefined : parsedJson(textValue(value));
+}
+
+function recordFromObservation(
+  expected: NotificationDeliveryObservation,
+): NotificationRecord {
+  return {
+    ...expected,
+    payload: decodedJson(expected.payload),
+    resourceId: expected.resourceId ?? undefined,
+    agentId: expected.agentId ?? undefined,
+    sourceId: expected.sourceId ?? undefined,
+    dedupeKey: expected.dedupeKey ?? undefined,
+    coalesceKey: expected.coalesceKey ?? undefined,
+    attributes: decodedJson(
+      expected.attributes,
+    ) as NotificationRecord['attributes'],
+    createdAt: decodedDate(expected.createdAt),
+    updatedAt: decodedDate(expected.updatedAt),
+    deliverAt: decodedOptionalDate(expected.deliverAt),
+    summaryAt: decodedOptionalDate(expected.summaryAt),
+    deliveryReason: expected.deliveryReason ?? undefined,
+    lastDeliveryAttemptAt: decodedOptionalDate(expected.lastDeliveryAttemptAt),
+    lastDeliveryError: expected.lastDeliveryError ?? undefined,
+    deliveredSignalId: expected.deliveredSignalId ?? undefined,
+    summarySignalId: expected.summarySignalId ?? undefined,
+    deliveredAt: decodedOptionalDate(expected.deliveredAt),
+    seenAt: decodedOptionalDate(expected.seenAt),
+    dismissedAt: decodedOptionalDate(expected.dismissedAt),
+    archivedAt: decodedOptionalDate(expected.archivedAt),
+    discardedAt: decodedOptionalDate(expected.discardedAt),
+    metadata: decodedJson(expected.metadata) as NotificationRecord['metadata'],
+  };
+}
+
+export function captureNotificationDeliverySelection(
+  record: NotificationRecord,
+): {
+  record: NotificationRecord;
+  expected: NotificationDeliveryObservation;
+} {
+  const expected = captureNotificationDeliveryObservation(record);
+  return { record: recordFromObservation(expected), expected };
+}
+
+export function captureNotificationDeliveryStorage(
+  storage: NotificationsStorage,
+): Pick<
+  NotificationDeliveryStorage,
+  'getNotification' | 'updateNotificationDeliveryIfUnchanged'
+> {
+  const update = (storage as Partial<NotificationDeliveryStorage>)
+    .updateNotificationDeliveryIfUnchanged;
+  const get = storage.getNotification;
+  if (typeof update !== 'function' || typeof get !== 'function') {
+    throw new TypeError(
+      'notification dispatch requires conditional delivery storage',
+    );
+  }
+  return {
+    getNotification: get.bind(storage),
+    updateNotificationDeliveryIfUnchanged: update.bind(storage),
+  };
+}
+
+// Guarded reaches into Core's patched functions: the thread-DO dispatch
+// route's summary group, the notification ingestion gate's prospective
+// summary, and Core's inline sender behind agent.sendNotificationSignal.
+// Unpatched, a source named after an Object.prototype member is miscounted in
+// the summary a receipt is recorded against, and Core's own source-policy
+// lookup resolves an inherited entry instead of the configured action. A
+// behaviour probe rather than a prototype check lets any correct upstream fix
+// pass. The record is the getting-started guide's confirmation record.
+const SOURCE_KEY_PROBE: NotificationRecord = {
+  id: 'n',
+  threadId: 't',
+  source: 'constructor',
+  kind: 'k',
+  priority: 'low',
+  status: 'pending',
+  summary: 's',
+  createdAt: new Date(0),
+  updatedAt: new Date(0),
+};
+// The getting-started citation both patch refusals carry.
+const PATCH_CITATION =
+  'apply it at the application root (getting started: "Apply the flowsafe patch to @mastra/core")';
+
+let sourceKeysPatched: boolean | undefined;
+
+export function assertNotificationSourceKeysPatched(): void {
+  sourceKeysPatched ??=
+    typeof summarizeNotifications([SOURCE_KEY_PROBE]).bySource.constructor ===
+    'number';
+  if (!sourceKeysPatched) {
+    throw new TypeError(
+      `notification dispatch requires the @mastra/core patch flowsafe ships; ${PATCH_CITATION}`,
+    );
+  }
+}
+
+let deliveryPolicyPatched: Promise<boolean> | undefined;
+
+/**
+ * The second subject of the @mastra/core patch: the source-policy lookup in
+ * resolveNotificationDeliveryDecision guards its own keys, so a source named
+ * after an Object.prototype member resolves the configured default instead
+ * of the inherited member. The lookup is asynchronous, so this probe is the
+ * async sibling of assertNotificationSourceKeysPatched, awaited at the
+ * ingestion gate, whose delivery runs through agent.sendNotificationSignal
+ * and reaches that lookup.
+ */
+export async function assertNotificationDeliveryPolicyPatched(): Promise<void> {
+  deliveryPolicyPatched ??= resolveNotificationDeliveryDecision({
+    config: { sources: {}, default: 'discard' },
+    record: SOURCE_KEY_PROBE,
+    threadState: 'idle',
+    now: new Date(0),
+  }).then(
+    (decision) => decision.action === 'discard',
+    () => false,
+  );
+  if (!(await deliveryPolicyPatched)) {
+    throw new TypeError(
+      `notification ingestion requires the @mastra/core patch flowsafe ships; ${PATCH_CITATION}`,
+    );
+  }
+}
+
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  try {
+    return String(error instanceof Error ? error.message : error);
+  } catch {
+    return 'unreadable error';
+  }
+}
+
+function logFailure(
+  type: string,
+  error: unknown,
+  field: 'error' | 'reason' = 'error',
+): void {
+  try {
+    console.error(JSON.stringify({ type, [field]: errorMessage(error) }));
+  } catch {
+    // Diagnostic failures cannot interrupt notification bookkeeping.
+  }
+}
+
+export function reportNotificationDeliveryError(error: unknown): void {
+  logFailure('notification-dispatch-bookkeeping-error', error);
+}
+
+function observationsMatch(
+  left: NotificationDeliveryObservation,
+  right: NotificationDeliveryObservation,
+): boolean {
+  return (Object.keys(left) as (keyof NotificationDeliveryObservation)[]).every(
+    (key) => left[key] === right[key],
+  );
 }
 
 const NOTIFICATION_RETRY_BASE_MS = 1_000;
@@ -196,51 +554,163 @@ const NOTIFICATION_RETRY_MAX_MS = 5 * 60_000;
 /**
  * Record one delivery failure and move every currently-due cursor forward.
  * Without the cursor move, one permanently blocked row can monopolize a
- * bounded deployment-wide due scan forever.
+ * bounded deployment-wide due scan. The attempt bound is the other half of the
+ * same guarantee: a row that keeps failing leaves the due scan.
  */
-export async function deferNotificationAfterFailure(
-  storage: NotificationsStorage,
-  record: NotificationRecord,
+export async function recordNotificationDeliveryFailure(
+  storage: Pick<
+    NotificationDeliveryStorage,
+    'getNotification' | 'updateNotificationDeliveryIfUnchanged'
+  >,
+  expected: NotificationDeliveryObservation,
   now: Date,
-  error: unknown,
-): Promise<void> {
-  const attempts = (record.deliveryAttempts ?? 0) + 1;
-  const delay = Math.min(
-    NOTIFICATION_RETRY_MAX_MS,
-    NOTIFICATION_RETRY_BASE_MS * 2 ** Math.min(attempts - 1, 8),
-  );
-  const retryAt = new Date(now.getTime() + delay);
-  await storage.updateNotification({
-    id: record.id,
-    threadId: record.threadId,
-    deliveryAttempts: attempts,
-    lastDeliveryAttemptAt: now,
-    lastDeliveryError: errorMessage(error),
-    ...(record.deliverAt && record.deliverAt.getTime() <= now.getTime()
-      ? { deliverAt: retryAt }
-      : {}),
-    ...(record.summaryAt && record.summaryAt.getTime() <= now.getTime()
-      ? { summaryAt: retryAt }
-      : {}),
-  });
-}
-
-async function recordFailure(
-  storage: NotificationsStorage,
-  record: NotificationRecord,
-  now: Date,
-  error: unknown,
-): Promise<void> {
+  maxDeliveryAttempts: number,
+  action: { type: 'failure'; error: unknown } | { type: 'exhausted' },
+): Promise<'deferred' | 'discarded' | 'unchanged' | 'uncertain'> {
   try {
-    await deferNotificationAfterFailure(storage, record, now, error);
-  } catch (updateError) {
-    console.error(
-      JSON.stringify({
-        type: 'notification-dispatch-bookkeeping-error',
-        notificationId: record.id,
-        error: errorMessage(updateError),
-      }),
+    positiveSafeInteger(
+      maxDeliveryAttempts,
+      'notification maximum delivery attempts',
     );
+    // Re-capturing the caller-supplied observation from its own record checks
+    // its canonical form before the conditional write: a custom store does not
+    // run D1's value validation, so a non-canonical timestamp or non-JSON
+    // payload text would otherwise reach the write unchecked.
+    const observed = captureNotificationDeliveryObservation(
+      recordFromObservation(expected),
+    );
+    if (!observationsMatch(observed, expected)) {
+      throw new TypeError('notification delivery observation is invalid');
+    }
+    if (observed.status !== 'pending' || observed.deliveredSignalId)
+      return 'unchanged';
+    const attemptAt = dateValue(now);
+    const attemptTime = Date.parse(attemptAt);
+    const updatedAt = new Date().toISOString();
+    let failure: NotificationDeliveryFailure;
+    if (observed.deliveryAttempts >= maxDeliveryAttempts) {
+      failure = { type: 'exhausted', updatedAt };
+    } else {
+      if (action.type !== 'failure') {
+        throw new RangeError(
+          'notification delivery attempts are not exhausted',
+        );
+      }
+      const attempts = observed.deliveryAttempts + 1;
+      const receipt = {
+        updatedAt,
+        deliveryAttempts: attempts,
+        lastDeliveryAttemptAt: attemptAt,
+        lastDeliveryError: errorMessage(action.error),
+      };
+      if (attempts >= maxDeliveryAttempts) {
+        failure = { type: 'discard', ...receipt };
+      } else {
+        const delay = Math.min(
+          NOTIFICATION_RETRY_MAX_MS,
+          NOTIFICATION_RETRY_BASE_MS * 2 ** Math.min(attempts - 1, 8),
+        );
+        const retryAt = new Date(attemptTime + delay).toISOString();
+        failure = {
+          type: 'retry',
+          ...receipt,
+          ...(observed.deliverAt !== null &&
+          Date.parse(observed.deliverAt) <= attemptTime
+            ? { deliverAt: retryAt }
+            : {}),
+          ...(observed.summaryAt !== null &&
+          Date.parse(observed.summaryAt) <= attemptTime
+            ? { summaryAt: retryAt }
+            : {}),
+        };
+      }
+    }
+    Object.freeze(failure);
+    const target: NotificationDeliveryObservation = Object.freeze({
+      ...observed,
+      updatedAt,
+      ...(failure.type === 'exhausted'
+        ? {}
+        : {
+            deliveryAttempts: failure.deliveryAttempts,
+            lastDeliveryAttemptAt: failure.lastDeliveryAttemptAt,
+            lastDeliveryError: failure.lastDeliveryError,
+          }),
+      ...(failure.type === 'retry'
+        ? {
+            ...(failure.deliverAt === undefined
+              ? {}
+              : { deliverAt: failure.deliverAt }),
+            ...(failure.summaryAt === undefined
+              ? {}
+              : { summaryAt: failure.summaryAt }),
+          }
+        : {
+            status: 'discarded',
+            deliveryReason: 'delivery-attempts-exhausted',
+            discardedAt: updatedAt,
+            deliverAt: null,
+            summaryAt: null,
+          }),
+    });
+    const confirmed = failure.type === 'retry' ? 'deferred' : 'discarded';
+    try {
+      const result = await storage.updateNotificationDeliveryIfUnchanged({
+        expected: observed,
+        failure,
+      });
+      if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        throw new TypeError(
+          'notification delivery update returned an invalid result',
+        );
+      }
+      const keys = Reflect.ownKeys(result);
+      if (
+        result.applied === false &&
+        keys.length === 1 &&
+        keys[0] === 'applied'
+      ) {
+        return 'unchanged';
+      }
+      if (
+        result.applied !== true ||
+        keys.length !== 2 ||
+        !keys.includes('applied') ||
+        !keys.includes('record') ||
+        !observationsMatch(
+          target,
+          captureNotificationDeliveryObservation(result.record),
+        )
+      ) {
+        throw new TypeError(
+          'notification delivery update did not confirm its receipt',
+        );
+      }
+      return confirmed;
+    } catch (error) {
+      try {
+        const current = await storage.getNotification({
+          threadId: observed.threadId,
+          id: observed.id,
+        });
+        if (
+          current &&
+          observationsMatch(
+            target,
+            captureNotificationDeliveryObservation(current),
+          )
+        ) {
+          return confirmed;
+        }
+      } catch (readError) {
+        logFailure('notification-dispatch-bookkeeping-read-error', readError);
+      }
+      logFailure('notification-dispatch-bookkeeping-error', error);
+      return 'uncertain';
+    }
+  } catch (error) {
+    logFailure('notification-dispatch-bookkeeping-error', error);
+    return 'uncertain';
   }
 }
 
@@ -256,8 +726,16 @@ export function createNotificationDispatchTick(
     options.limit ?? 100,
     'notification dispatch tick limit',
   );
+  const maxDeliveryAttempts = positiveSafeInteger(
+    options.maxDeliveryAttempts ?? DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS,
+    'notification maximum delivery attempts',
+  );
+  const { storage } = options;
+  const deliveryStorage = captureNotificationDeliveryStorage(storage);
+  if (limit === 0) return async () => ({ due: 0, delivered: 0, failed: 0 });
+  assertNotificationSourceKeysPatched();
+  const { topology, resolveContext, now: clock, executionFence } = options;
   return async () => {
-    if (limit === 0) return { due: 0, delivered: 0, failed: 0 };
     // The fence, before the due read and before any delivery. This runs on a
     // maintenance alarm, so a fence that cannot be READ degrades closed by
     // skipping the pass and logging: throwing would fail the duty, and
@@ -265,23 +743,18 @@ export function createNotificationDispatchTick(
     let admitted: boolean;
     try {
       admitted = admitsDrainableExecution(
-        await readExecutionFence(options.executionFence),
+        await readExecutionFence(executionFence),
       );
     } catch (error) {
-      console.error(
-        JSON.stringify({
-          type: 'notification-dispatch-fence-error',
-          // `reason`, matching schedule-tick-fence-error: the two alarm lanes
-          // degrade closed identically, so an operator greps one field.
-          reason: errorMessage(error),
-        }),
-      );
+      // `reason` matches schedule-tick-fence-error, so the two alarm lanes
+      // degrade closed identically and an operator greps one field.
+      logFailure('notification-dispatch-fence-error', error, 'reason');
       return { due: 0, delivered: 0, failed: 0 };
     }
     if (!admitted) return { due: 0, delivered: 0, failed: 0 };
-    const now = options.now?.() ?? new Date();
-    const due = await options.storage.listDueNotifications({
-      now,
+    const nowMs = (clock?.() ?? new Date()).getTime();
+    const due = await storage.listDueNotifications({
+      now: new Date(nowMs),
       limit,
     });
     const result: NotificationDispatchTickResult = {
@@ -290,34 +763,69 @@ export function createNotificationDispatchTick(
       failed: 0,
     };
     const groups = new Map<string, DeliveryGroup>();
-
+    const selected = new Map<
+      NotificationRecord,
+      NotificationDeliveryObservation
+    >();
+    const seen = new Map<string, Set<string>>();
     for (const record of due) {
+      try {
+        const threadId = textValue(record.threadId);
+        const id = textValue(record.id);
+        const ids = seen.get(threadId) ?? new Set<string>();
+        if (ids.has(id)) continue;
+        ids.add(id);
+        seen.set(threadId, ids);
+        const selection = captureNotificationDeliverySelection(record);
+        selected.set(selection.record, selection.expected);
+      } catch (error) {
+        result.failed += 1;
+        reportNotificationDeliveryError(error);
+      }
+    }
+    const recordFailure = async (
+      expected: NotificationDeliveryObservation,
+      action: { type: 'failure'; error: unknown } | { type: 'exhausted' },
+    ) => {
+      const outcome = await recordNotificationDeliveryFailure(
+        deliveryStorage,
+        expected,
+        new Date(nowMs),
+        maxDeliveryAttempts,
+        action,
+      );
+      if (outcome === 'discarded') {
+        result.discarded = (result.discarded ?? 0) + 1;
+      } else {
+        result.failed += 1;
+      }
+    };
+
+    for (const [record, expected] of selected) {
+      if (expected.status !== 'pending' || expected.deliveredSignalId) continue;
+      if (expected.deliveryAttempts >= maxDeliveryAttempts) {
+        await recordFailure(expected, { type: 'exhausted' });
+        continue;
+      }
       if (
         !isPathSafeId(record.threadId) ||
         !record.resourceId ||
         !isPathSafeId(record.resourceId)
       ) {
-        result.failed += 1;
-        await recordFailure(
-          options.storage,
-          record,
-          now,
-          new Error('notification has malformed memory ids'),
-        );
+        await recordFailure(expected, {
+          type: 'failure',
+          error: new Error('notification has malformed memory ids'),
+        });
         continue;
       }
       if (typeof record.agentId !== 'string' || record.agentId.length === 0) {
-        result.failed += 1;
-        await recordFailure(
-          options.storage,
-          record,
-          now,
-          new Error('notification has no agent id'),
-        );
+        await recordFailure(expected, {
+          type: 'failure',
+          error: new Error('notification has no agent id'),
+        });
         continue;
       }
       const resourceId = record.resourceId;
-      if (!resourceId) continue;
       const key = `${record.threadId}\0${resourceId}\0${record.agentId}`;
       const group = groups.get(key) ?? {
         threadId: record.threadId,
@@ -331,13 +839,13 @@ export function createNotificationDispatchTick(
 
     for (const group of groups.values()) {
       const batches = packNotificationDispatchItems(
-        planNotificationDispatch(group.records, now),
+        planNotificationDispatch(group.records, new Date(nowMs)),
       );
       let batchThreadState: 'active' | 'idle' | null = null;
       for (const records of batches) {
         try {
-          const context = options.resolveContext();
-          const response = await options.topology.send(
+          const context = resolveContext();
+          const response = await topology.send(
             context,
             group.threadId,
             '/signal/notifications/dispatch',
@@ -348,7 +856,7 @@ export function createNotificationDispatchTick(
                 notificationIds: records.map((record) => record.id),
                 resourceId: group.resourceId,
                 agentId: group.agentId,
-                now: now.toISOString(),
+                now: new Date(nowMs).toISOString(),
                 batchThreadState,
               }),
             },
@@ -377,9 +885,10 @@ export function createNotificationDispatchTick(
             batchThreadState = body.batchThreadState;
           }
         } catch (error) {
-          result.failed += records.length;
           for (const record of records) {
-            await recordFailure(options.storage, record, now, error);
+            const expected = selected.get(record);
+            if (expected)
+              await recordFailure(expected, { type: 'failure', error });
           }
         }
       }

@@ -195,16 +195,70 @@
 // caveat as getWorkflow() returning a startable object, and reaching it takes a
 // deliberate private cast, which is a first-party act.
 //
-// Corroboration: breakwater's guarded handle reaches the same verdict on seven
-// of the eight members blocked here that live on Agent.prototype — network,
-// resumeNetwork, approveNetworkToolCall, declineNetworkToolCall,
-// generateLegacy, streamLegacy and sendToolApproval are all
-// `intentionallyUnavailable` (packages/breakwater/src/agent/agent.test.ts:824).
-// It diverges on listSuspendedRuns (:955), which it files under
-// `explicitlyNonExecution` — the same divergence as listActiveRuns (:935), and
-// for the same reason: a narrowed HANDLE can only omit, so a data-returning
-// member is harmless there, while an INSTANCE Mastra calls in-process must
-// throw.
+// Corroboration: breakwater's guarded handle reaches the same verdict on the
+// network four (network, resumeNetwork, approveNetworkToolCall,
+// declineNetworkToolCall), the legacy pair (generateLegacy, streamLegacy) and
+// sendToolApproval, which it files `intentionallyUnavailable`
+// (packages/breakwater/src/agent/agent.test.ts). It diverges on
+// listSuspendedRuns, which it files under `explicitlyNonExecution` — the same
+// divergence as listActiveRuns, and for the same reason: a
+// narrowed HANDLE can only omit, so a data-returning member is harmless there,
+// while an INSTANCE Mastra calls in-process must throw. The two members
+// blocked below for newer cores diverge the same way; each entry records it.
+//
+// Two more Agent-level members are blocked for cores NEWER than the pin. Read
+// from the @mastra/core 1.67.0 dist, which the mastra-compat canary installs;
+// offsets here are 1.67.0-vintage, in agent-Dk0N0Nlg.js unless another file is
+// named, and the 1.53.0 offsets above are left as the provenance of that read.
+// The pinned peer exposes neither member, so on 1.53.0 each refusal stands
+// where the base would have raised a TypeError, and shadows a real
+// implementation only once the peer moves.
+//
+//   - listActiveThreadRuns() (:38214) is the discovery ground one scope wider
+//     than listActiveRuns. It takes no arguments and returns `{ runId,
+//     resourceId, threadId }` for every thread on the pubsub instance with a
+//     run in flight (storage-MbGlKLkB.js:1011-1023), and that state is keyed
+//     by pubsub instance rather than by agent (`#statesByPubSub`, :150, read
+//     through #getState :294), so it narrows by neither principal nor agent
+//     where the two listings above at least narrow by agentId. The in-process
+//     sibling getActiveThreadRunId() stays non-execution because it makes the
+//     caller name the (resourceId, threadId) pair: it confirms where this
+//     enumerates. Breakwater files it `explicitlyNonExecution`
+//     (agent.test.ts) for the reason it files listActiveRuns there: a
+//     narrowed HANDLE can only omit, so a data-returning member is harmless
+//     there, while an INSTANCE Mastra calls in-process must throw. Cost, stated
+//     rather than left to be rediscovered: core's AgentController aggregates
+//     this member across its backing agents
+//     (agent-controller-CKgKFyMR.js:5722-5725), so that aggregation now throws.
+//     It is already unusable over this class — the same controller calls the
+//     blocked sendToolApproval() at :4089 and :4118.
+//   - __setThreadRuntimeAgent() (:33609) installs another agent as the target
+//     the thread-runtime paths resolve through #getThreadRuntimeAgent()
+//     (:33612, `this.#threadRuntimeAgent ?? this`); the refusal in
+//     BLOCKED_RUN_ENTRIES names those paths, for the core it is written
+//     against. That is the fourth ground by installation rather than by call:
+//     the containment those inherited members rely on IS virtual dispatch on
+//     `this`, so one call moves every run those paths start onto an agent
+//     carrying none of these overrides — no caller-minted runId assertion, no
+//     executeWorkflow, no #startRequesters backstop. subscribeToThread drives
+//     no run of its own; the field moves its replay target all the same. It is
+//     public in the type surface (agent.d.ts:229 declares it with no
+//     modifier), so unlike getLegacyHandler it takes no private cast.
+//     Breakwater files it `explicitlyNonExecution` (agent.test.ts) for the
+//     reason it files the listings there: a narrowed HANDLE can only omit, so
+//     a setter is harmless there, while an INSTANCE Mastra calls in-process
+//     must throw.
+//
+// Neither carries the `override` keyword, and that is load-bearing rather than
+// an oversight: TypeScript rejects `override` on a member the base does not
+// declare, and 1.53.0 declares neither, so the keyword would fail the pinned
+// typecheck that gates every merge. Each signature must still satisfy the base
+// it acquires on newest; the caveat on each member says how. Both re-checks
+// come due together, when the declared peer reaches a core that carries either
+// member: the VERSION_SKEW expiry assertion in durable-agent-surface.test.ts
+// goes red there, because each member's row claims the installed core carries
+// it on neither prototype. That message speaks about the row alone; these two
+// members' keyword and signature move with it.
 //
 // Blocking them keeps the single-resume and no-capability guarantees true by
 // construction: resumeViaRuntime() is the ONLY way a run resumes.
@@ -253,11 +307,67 @@ import {
   isExecutionPrincipalKind,
 } from '../approval-api/principal.js';
 import {
+  type D1RunExecutionIdentity,
+  normalizeMutationEpoch,
+  normalizeStartIdentity,
+  type RunExecutionIdentity,
+  type StartExecutionIdentity,
+  type StartIdentity,
+} from '../do-runner/execution-admission.js';
+import {
   InvalidRunRequestError,
   isPathSafeId,
-  type RunnerRuntime,
-  type RunSummary,
+  RunStateUnreadableError,
 } from '../do-runner/index.js';
+import { resourceIdFromKey } from '../do-runner/memory-id.js';
+import type {
+  AuthoritativeStartState,
+  LegacyRunState,
+  RunnerRuntime,
+  RunSummary,
+  StartRunOptions,
+} from '../do-runner/runtime.js';
+import {
+  captureReservation,
+  type StartReservationReading,
+} from '../do-runner/start-reservation-contract.js';
+
+/** @internal One owned snapshot observation; pending never carries a summary. */
+export type AuthoritativeAgentStartState = AuthoritativeStartState & {
+  readonly execution: StartExecutionIdentity;
+  readonly threaded: boolean;
+};
+
+/** @internal Selected ordinary agent data without generation authority. */
+export type LegacyAgentRunState = LegacyRunState & {
+  readonly threaded: boolean;
+};
+
+/** @internal A coherent snapshot belongs to another agent or thread. */
+export class AgentRunSelectorMismatchError extends RunStateUnreadableError {
+  constructor(workflowId: string, runId: string) {
+    super(workflowId, runId);
+    this.name = 'AgentRunSelectorMismatchError';
+  }
+}
+
+/** @internal Host-owned start authority captured before streaming. */
+export interface AgentStartAuthority {
+  readonly startReservation?: StartReservationReading;
+  readonly mutationEpoch?: number;
+  readonly startIdentity: StartIdentity & {
+    readonly target: {
+      readonly kind: 'agent';
+      readonly id: string;
+      readonly threadId: string;
+    };
+  };
+  readonly agentStart: { readonly threaded: boolean };
+  readonly onPreparedStartIdentity:
+    | ((execution: RunExecutionIdentity) => void | Promise<void>)
+    | undefined;
+  readonly runOwnerGuard?: StartRunOptions['runOwnerGuard'];
+}
 
 /**
  * The shared workflow id every durable-agent loop compiles to (core's
@@ -284,6 +394,108 @@ const BREAKWATER_GUARDED_AGENT_HOST_PROTOCOL = Symbol.for(
 interface BreakwaterGuardedAgentHostProtocol {
   readonly version: 1;
   readonly supportsDurableStructuredOutput: false;
+}
+
+function captureAgentStartAuthority(
+  source: AgentStartAuthority,
+  requestedBy: string,
+  requestedByKind: ExecutionPrincipalKind,
+): AgentStartAuthority {
+  if (source === null || typeof source !== 'object' || Array.isArray(source)) {
+    throw new InvalidRunRequestError('agent start authority is required');
+  }
+  const {
+    mutationEpoch: rawEpoch,
+    startIdentity: rawIdentity,
+    agentStart: rawAgentStart,
+    onPreparedStartIdentity,
+    runOwnerGuard: rawGuard,
+    startReservation: rawReservation,
+  } = source;
+  if (
+    rawIdentity === undefined ||
+    rawAgentStart === undefined ||
+    !Object.hasOwn(source, 'onPreparedStartIdentity')
+  ) {
+    throw new InvalidRunRequestError('agent start authority is incomplete');
+  }
+  const startReservation =
+    rawReservation === undefined
+      ? undefined
+      : captureReservation(rawReservation, 'started');
+  const mutationEpoch = normalizeMutationEpoch(rawEpoch);
+  const identity = normalizeStartIdentity(rawIdentity);
+  if (identity.target.kind !== 'agent') {
+    throw new InvalidRunRequestError(
+      'agent start authority requires an agent target',
+    );
+  }
+  if (
+    identity.owner.id !== requestedBy ||
+    identity.owner.kind !== requestedByKind
+  ) {
+    throw new InvalidRunRequestError(
+      'startIdentity owner does not match requester',
+    );
+  }
+  if (
+    rawAgentStart === null ||
+    typeof rawAgentStart !== 'object' ||
+    Array.isArray(rawAgentStart)
+  ) {
+    throw new InvalidRunRequestError('agentStart is malformed');
+  }
+  const { threaded } = rawAgentStart;
+  if (typeof threaded !== 'boolean') {
+    throw new InvalidRunRequestError('agentStart is malformed');
+  }
+  if (
+    onPreparedStartIdentity !== undefined &&
+    typeof onPreparedStartIdentity !== 'function'
+  ) {
+    throw new InvalidRunRequestError('onPreparedStartIdentity is malformed');
+  }
+  let runOwnerGuard: AgentStartAuthority['runOwnerGuard'];
+  if (rawGuard !== undefined) {
+    if (
+      rawGuard === null ||
+      typeof rawGuard !== 'object' ||
+      Array.isArray(rawGuard)
+    ) {
+      throw new InvalidRunRequestError('runOwnerGuard is malformed');
+    }
+    const { owner: rawOwner, reservationToken } = rawGuard;
+    if (
+      rawOwner === null ||
+      typeof rawOwner !== 'object' ||
+      Array.isArray(rawOwner)
+    ) {
+      throw new InvalidRunRequestError('runOwnerGuard is malformed');
+    }
+    const { kind, id } = rawOwner;
+    if (
+      !isExecutionPrincipalKind(kind) ||
+      !isExecutionPrincipalId(id) ||
+      !isPathSafeId(reservationToken)
+    ) {
+      throw new InvalidRunRequestError('runOwnerGuard is malformed');
+    }
+    runOwnerGuard = Object.freeze({
+      owner: Object.freeze({ kind, id }),
+      reservationToken,
+    });
+  }
+  return Object.freeze({
+    mutationEpoch,
+    startIdentity: Object.freeze({
+      owner: identity.owner,
+      target: identity.target,
+    }),
+    agentStart: Object.freeze({ threaded }),
+    onPreparedStartIdentity,
+    runOwnerGuard,
+    startReservation,
+  });
 }
 
 function snapshotDurableCallOptions<T extends object>(options: T): T;
@@ -399,8 +611,9 @@ const THREAD_TOOL_APPROVAL_REASON =
  *  3. snapshot deletion owned by deployment-scoped retention;
  *  4. a SECOND execution surface that runs the agent outside RunnerRuntime
  *     entirely, or that mints a run id below the caller — the network loop's
- *     own workflow, the legacy handler, and the thread runtime's tool-approval
- *     continuation.
+ *     own workflow, the legacy handler, the thread runtime's tool-approval
+ *     continuation, and the setter that installs a different agent as the
+ *     thread runtime's execution target.
  *
  * Deliberately NOT re-exported from `./index.js` (a named-exports-only barrel),
  * so this stays off the public `@proofoftech/flowsafe/agent-runner` subpath.
@@ -421,6 +634,8 @@ export const BLOCKED_RUN_ENTRIES = {
     "core scopes the running-run listing by agentId plus the caller's own optional thread and resource ids, never by per-principal ownership, so it bypasses the host topology's run-ownership checks and returns run, thread and resource ids the caller does not own",
   listSuspendedRuns:
     "core scopes the suspended-run listing by agentId plus the caller's own optional thread and resource ids, never by per-principal ownership, so it bypasses the host topology's run-ownership checks and returns run, thread and resource ids the caller does not own",
+  listActiveThreadRuns:
+    'core scopes the active thread-run listing by nothing at all: it takes no arguments and returns the run, thread and resource ids of every thread on the pubsub instance with a run in flight, which core keys by pubsub instance rather than by agent, so it enumerates ids across every principal AND every agent that shares the instance',
   deleteRunSnapshots:
     'durable-agent snapshot rows are retained until deployment-scoped retention purge removes them',
   network: `${NETWORK_FAMILY_REASON}, and it mints an unowned run id when the caller omits one`,
@@ -430,6 +645,8 @@ export const BLOCKED_RUN_ENTRIES = {
   generateLegacy: LEGACY_FAMILY_REASON,
   streamLegacy: LEGACY_FAMILY_REASON,
   sendToolApproval: THREAD_TOOL_APPROVAL_REASON,
+  __setThreadRuntimeAgent:
+    "it installs the agent the thread-runtime paths resolve their target through — on @mastra/core 1.67.0 these are subscribeToThread, claimThreadOwnership, sendMessage, queueMessage, sendStateSignal, sendNotificationSignal and sendSignal, which read the field it writes — so one call moves every run those paths start, and subscribeToThread's replay target with them, onto an agent that carries none of this class's overrides: no caller-minted run id, no executeWorkflow, and no terminal refusal for a run the host start seam never registered",
 } as const;
 
 /**
@@ -582,6 +799,7 @@ export class FlowsafeDurableAgent<
    * `finally`, so nothing outlives the start it belongs to.
    */
   readonly #startIdempotencyKeys = new Map<string, string>();
+  readonly #startAuthorities = new Map<string, AgentStartAuthority>();
   readonly #startScheduleDispatches = new Map<
     string,
     { scheduleId: string; dispatchId: string }
@@ -647,16 +865,21 @@ export class FlowsafeDurableAgent<
    * consumption make that exemption unavailable to callers.
    */
   #assertRunIdNotLive(runId: string): void {
-    if (
-      this.#startRequesters.has(runId) ||
-      this.#persistenceWaiters.has(runId) ||
-      globalRunRegistry.has(runId) ||
-      this.runRegistryInternal.has(runId)
-    ) {
+    if (this.isRunLive(runId)) {
       throw new InvalidRunRequestError(
         'run id is live in the run registry — a registered run cannot be re-entered',
       );
     }
+  }
+
+  /** @internal */
+  isRunLive(runId: string): boolean {
+    return (
+      this.#startRequesters.has(runId) ||
+      this.#persistenceWaiters.has(runId) ||
+      globalRunRegistry.has(runId) ||
+      this.runRegistryInternal.has(runId)
+    );
   }
 
   #assertGuardedStructuredOutput(options: unknown): void {
@@ -730,7 +953,7 @@ export class FlowsafeDurableAgent<
     requestedBy: string,
     requestedByKind: ExecutionPrincipalKind,
     attemptToken = crypto.randomUUID(),
-    scheduleDispatch?: { scheduleId: string; dispatchId: string },
+    scheduleDispatch: { scheduleId: string; dispatchId: string } | undefined,
     /**
      * The idempotency key the thread topology already RESERVED for this run.
      *
@@ -745,7 +968,8 @@ export class FlowsafeDurableAgent<
      * core, because core owns the call between `stream()` and
      * `executeWorkflow()` and carries no field this could ride in.
      */
-    idempotencyKey?: string,
+    idempotencyKey: string | undefined,
+    authority: AgentStartAuthority,
   ): Promise<
     Awaited<ReturnType<DurableAgent<TAgentId, TTools, TOutput>['stream']>>
   > {
@@ -763,6 +987,26 @@ export class FlowsafeDurableAgent<
     if (!isExecutionPrincipalKind(requestedByKind)) {
       throw new InvalidRunRequestError('requestedByKind is malformed');
     }
+    const capturedAuthority = captureAgentStartAuthority(
+      authority,
+      requestedBy,
+      requestedByKind,
+    );
+    let capturedScheduleDispatch: typeof scheduleDispatch;
+    if (scheduleDispatch !== undefined) {
+      if (
+        scheduleDispatch === null ||
+        typeof scheduleDispatch !== 'object' ||
+        Array.isArray(scheduleDispatch)
+      ) {
+        throw new Error('stored run lifecycle is malformed');
+      }
+      const { scheduleId, dispatchId } = scheduleDispatch;
+      if (!isPathSafeId(scheduleId) || !isPathSafeId(dispatchId)) {
+        throw new Error('stored run lifecycle is malformed');
+      }
+      capturedScheduleDispatch = Object.freeze({ scheduleId, dispatchId });
+    }
     const runId = callOptions.runId;
     this.#assertRunIdNotLive(runId);
     let resolve!: () => void;
@@ -776,8 +1020,9 @@ export class FlowsafeDurableAgent<
     this.#startRequesters.set(runId, requestedBy);
     this.#startRequesterKinds.set(runId, requestedByKind);
     this.#startAttemptTokens.set(runId, attemptToken);
-    if (scheduleDispatch) {
-      this.#startScheduleDispatches.set(runId, scheduleDispatch);
+    this.#startAuthorities.set(runId, capturedAuthority);
+    if (capturedScheduleDispatch) {
+      this.#startScheduleDispatches.set(runId, capturedScheduleDispatch);
     }
     if (idempotencyKey !== undefined) {
       this.#startIdempotencyKeys.set(runId, idempotencyKey);
@@ -806,6 +1051,7 @@ export class FlowsafeDurableAgent<
       this.#startAttemptTokens.delete(runId);
       this.#startScheduleDispatches.delete(runId);
       this.#startIdempotencyKeys.delete(runId);
+      this.#startAuthorities.delete(runId);
     }
   }
 
@@ -960,6 +1206,30 @@ export class FlowsafeDurableAgent<
   }
 
   /**
+   * Refuse the thread-level run enumerator newer cores add.
+   * `listActiveThreadRuns()` takes no arguments and returns a runId plus the
+   * resourceId and threadId parsed out of the key for every thread on the
+   * pubsub instance with a run in flight, and core keys that state by pubsub
+   * instance rather than by agent — so it is the same discovery ground as
+   * {@link FlowsafeDurableAgent.listActiveRuns} with the last scoping gone.
+   * The in-process sibling `getActiveThreadRunId()` stays inherited because it
+   * makes the caller name the (resourceId, threadId) pair it confirms.
+   *
+   * Signature caveat, and the reason this one is not `async`: the base declares
+   * it SYNCHRONOUS (`listActiveThreadRuns(): ActiveThreadRun[]`), so the
+   * `async … Promise<never>` shape every other refusal here carries would not
+   * be assignable to it. No `override` keyword either — the pinned 1.53.0
+   * declares no such member, and `override` on a member the base lacks is a
+   * type error. Both are re-checks for a peer bump.
+   */
+  listActiveThreadRuns(): never {
+    throw unavailableRunEntry(
+      'listActiveThreadRuns',
+      BLOCKED_RUN_ENTRIES.listActiveThreadRuns,
+    );
+  }
+
+  /**
    * Refuse the multi-agent network start. `network()` does not touch the
    * durable-agentic-loop at all: it compiles a SEPARATE workflow and drives it
    * with `createRun + run.stream` on the default engine, so the whole
@@ -1081,6 +1351,32 @@ export class FlowsafeDurableAgent<
     throw unavailableRunEntry(
       'sendToolApproval',
       BLOCKED_RUN_ENTRIES.sendToolApproval,
+    );
+  }
+
+  /**
+   * Refuse the thread-runtime target swap newer cores add. It sets one private
+   * field that the thread-runtime paths resolve their target through, falling
+   * back to `this`; the refusal in `BLOCKED_RUN_ENTRIES` names those paths,
+   * for the core it is written against. So the containment those inherited
+   * members rely on is virtual dispatch on `this`, and one call to this setter
+   * moves every run they start, and their replay targets with them, onto an
+   * agent with none of these overrides in the chain. That is the fourth ground
+   * reached by installing a second execution surface rather than by calling
+   * one.
+   *
+   * Signature caveat: the parameter is `unknown` rather than core's
+   * `Agent<any, any, any, any>` because the pinned 1.53.0 declares no such
+   * member at all, while newest 1.x does — `unknown` is the one supertype of
+   * core's parameter, so it satisfies that base without depending on method
+   * bivariance, and it constrains nothing on the pin, where there is no base
+   * member to satisfy. No `override` keyword, for the same reason as
+   * {@link FlowsafeDurableAgent.listActiveThreadRuns}.
+   */
+  __setThreadRuntimeAgent(_agent: unknown): never {
+    throw unavailableRunEntry(
+      '__setThreadRuntimeAgent',
+      BLOCKED_RUN_ENTRIES.__setThreadRuntimeAgent,
     );
   }
 
@@ -1480,6 +1776,177 @@ export class FlowsafeDurableAgent<
     }
   }
 
+  /** @internal Include validated legacy agent data for ordinary host operations. */
+  authoritativeAgentStartState(
+    expectedRuntime: RunnerRuntime,
+    threadId: string,
+    runId: string,
+    options: { readonly includeLegacy: true },
+  ): Promise<AuthoritativeAgentStartState | LegacyAgentRunState | null>;
+  /** @internal Select the actual private Runtime/workflow and immutable agent owner once. */
+  authoritativeAgentStartState(
+    expectedRuntime: RunnerRuntime,
+    threadId: string,
+    runId: string,
+  ): Promise<AuthoritativeAgentStartState | null>;
+  async authoritativeAgentStartState(
+    expectedRuntime: RunnerRuntime,
+    threadId: string,
+    runId: string,
+    options?: { readonly includeLegacy: true },
+  ): Promise<AuthoritativeAgentStartState | LegacyAgentRunState | null> {
+    const includeLegacy = options?.includeLegacy === true;
+    const runtime = this.#runtime;
+    const workflowId = this.getWorkflow().id;
+    const agentId = this.#wrappedAgent.id;
+    try {
+      if (
+        expectedRuntime !== runtime ||
+        !isPathSafeId(threadId) ||
+        !isPathSafeId(runId)
+      )
+        throw new Error('agent observation selector is invalid');
+      const state = includeLegacy
+        ? await runtime.authoritativeStartState(workflowId, runId, {
+            includeLegacy: true,
+          })
+        : await runtime.authoritativeStartState(workflowId, runId);
+      if (state === null) return null;
+      if (state.kind === 'legacy') {
+        if (!includeLegacy)
+          throw new Error('legacy agent observation requires explicit opt-in');
+        const context = state.snapshot.requestContext;
+        const input = state.snapshot.context?.input as
+          | {
+              agentId?: unknown;
+              runId?: unknown;
+              messageListState?: {
+                memoryInfo?: {
+                  threadId?: unknown;
+                  resourceId?: unknown;
+                } | null;
+              };
+            }
+          | undefined;
+        const correlation = context?.['breakwater.auditContext'] as
+          | Record<string, unknown>
+          | undefined;
+        const memory = input?.messageListState?.memoryInfo;
+        const observedAgentId = input?.agentId;
+        const observedThreadId = context?.threadId;
+        if (!isPathSafeId(observedAgentId) || !isPathSafeId(observedThreadId))
+          throw new Error('legacy agent observation identity is malformed');
+        const observedResourceId = resourceIdFromKey(observedThreadId);
+        if (
+          state.address.workflowId !== workflowId ||
+          state.address.runId !== runId ||
+          (input?.runId !== undefined && input.runId !== runId) ||
+          context?.runId !== runId ||
+          context.resourceId !== observedResourceId ||
+          correlation?.agentId !== observedAgentId ||
+          correlation.threadId !== observedThreadId ||
+          correlation.resourceId !== observedResourceId ||
+          (memory !== null &&
+            (memory?.threadId !== observedThreadId ||
+              memory.resourceId !== observedResourceId))
+        )
+          throw new Error(
+            'legacy agent observation context contradicts identity',
+          );
+        if (observedAgentId !== agentId || observedThreadId !== threadId)
+          throw new AgentRunSelectorMismatchError(workflowId, runId);
+        return { ...state, threaded: memory !== null };
+      }
+      const identity = state.provenance.startIdentity;
+      const threaded = state.provenance.agentStart?.threaded;
+      if (
+        identity?.target.kind !== 'agent' ||
+        typeof threaded !== 'boolean' ||
+        state.execution.workflowId !== workflowId ||
+        state.execution.runId !== runId
+      )
+        throw new Error('agent observation identity is malformed');
+      const observedAgentId = identity.target.id;
+      const observedThreadId = identity.target.threadId;
+      const observedResourceId = resourceIdFromKey(observedThreadId);
+      const context = state.snapshot.requestContext;
+      const record = (value: unknown): Record<string, unknown> => {
+        if (value === null || typeof value !== 'object' || Array.isArray(value))
+          throw new Error('agent observation context is malformed');
+        return value as Record<string, unknown>;
+      };
+      const check = (value: unknown, selectors: Record<string, string>) => {
+        if (value === undefined) return;
+        const values = record(value);
+        for (const [key, expected] of Object.entries(selectors))
+          if (Object.hasOwn(values, key) && values[key] !== expected)
+            throw new Error('agent observation context contradicts identity');
+      };
+      check(context, {
+        runId,
+        threadId: observedThreadId,
+        resourceId: observedResourceId,
+      });
+      check(context?.['breakwater.auditContext'], {
+        agentId: observedAgentId,
+        threadId: observedThreadId,
+        resourceId: observedResourceId,
+      });
+      const input = state.snapshot.context?.input;
+      if (input !== undefined) {
+        check(input, { agentId: observedAgentId, runId });
+        const messageList = record(input).messageListState;
+        if (messageList !== undefined) {
+          const values = record(messageList);
+          if (Object.hasOwn(values, 'memoryInfo')) {
+            const memory = values.memoryInfo;
+            if (memory === null) {
+              if (threaded) throw new Error('agent mode contradicts memory');
+            } else {
+              const selected = record(memory);
+              if (
+                !threaded ||
+                selected.threadId !== observedThreadId ||
+                selected.resourceId !== observedResourceId
+              )
+                throw new Error('agent mode contradicts memory');
+            }
+          }
+        }
+      }
+      if (observedAgentId !== agentId || observedThreadId !== threadId)
+        throw new AgentRunSelectorMismatchError(workflowId, runId);
+      return {
+        ...state,
+        execution: { ...state.execution, ...identity },
+        threaded,
+      } as AuthoritativeAgentStartState;
+    } catch (cause) {
+      if (cause instanceof RunStateUnreadableError) throw cause;
+      throw new RunStateUnreadableError(workflowId, runId, { cause });
+    }
+  }
+
+  /** @internal Initial identity can correlate proof without granting replay success. */
+  async proofExecutionFor(
+    expectedRuntime: RunnerRuntime,
+    threadId: string,
+    runId: string,
+  ): Promise<D1RunExecutionIdentity | undefined> {
+    const state = await this.authoritativeAgentStartState(
+      expectedRuntime,
+      threadId,
+      runId,
+    );
+    if (state?.storage !== 'd1') return undefined;
+    return {
+      tablePrefix: state.execution.tablePrefix,
+      workflowId: state.execution.workflowId,
+      runId: state.execution.runId,
+      startToken: state.execution.startToken,
+    };
+  }
+
   /**
    * Drive the durable-agentic-loop through RunnerRuntime instead of the base
    * `createRun + run.start`. stream()/generate() have already parked the
@@ -1505,13 +1972,7 @@ export class FlowsafeDurableAgent<
       const attemptToken = this.#startAttemptTokens.get(runId);
       const scheduleDispatch = this.#startScheduleDispatches.get(runId);
       const idempotencyKey = this.#startIdempotencyKeys.get(runId);
-      const startOptions = {
-        runId,
-        inputData: workflowInput,
-        ...(attemptToken === undefined ? {} : { attemptToken }),
-        ...(scheduleDispatch === undefined ? {} : { scheduleDispatch }),
-        ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
-      };
+      const authority = this.#startAuthorities.get(runId);
       if (requestedBy === undefined || requestedByKind === undefined) {
         if (requestedBy !== undefined || requestedByKind !== undefined) {
           throw new InvalidRunRequestError(
@@ -1539,10 +2000,40 @@ export class FlowsafeDurableAgent<
         if (!published) throw refusal;
         return;
       }
-      summary = await this.#runtime.start(this.getWorkflow().id, {
-        ...startOptions,
+      const {
+        runId: coreRunId,
+        agentId: coreAgentId,
+        ...payload
+      } = workflowInput;
+      if (!authority) {
+        throw new InvalidRunRequestError(
+          'registered run is missing agent start authority',
+        );
+      }
+      if (
+        coreRunId !== runId ||
+        authority.startIdentity.target.id !== this.#wrappedAgent.id ||
+        coreAgentId !== authority.startIdentity.target.id
+      ) {
+        throw new InvalidRunRequestError(
+          'Core input does not match agent start authority',
+        );
+      }
+      const workflow = this.getWorkflow();
+      summary = await this.#runtime.start(workflow.id, {
+        runId,
+        inputData: { ...payload, runId: coreRunId, agentId: coreAgentId },
+        ...(attemptToken === undefined ? {} : { attemptToken }),
+        ...(scheduleDispatch === undefined ? {} : { scheduleDispatch }),
+        ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
         requestedBy,
         requestedByKind,
+        mutationEpoch: authority.mutationEpoch,
+        startIdentity: authority.startIdentity,
+        agentStart: authority.agentStart,
+        onPreparedStartIdentity: authority.onPreparedStartIdentity,
+        runOwnerGuard: authority.runOwnerGuard,
+        startReservation: authority.startReservation,
       });
       waiter?.resolve();
     } catch (error) {

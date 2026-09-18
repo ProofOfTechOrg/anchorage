@@ -8,7 +8,7 @@ name: Version
 # commits on main and the old main -> dev back-sync is gone. With no pending
 # changesets this is a fast no-op.
 #
-# Release ritual (root CLAUDE.md "Branching and releases"): confirm this PR is
+# Release ritual (docs/maintainer-guide.md "Release flow"): confirm this PR is
 # current, merge it into dev, then IMMEDIATELY cut and merge the release PR
 # (dev -> main). The freeze window between those two merges is guarded by
 # release.yml's pending-changesets tripwire, not by convention.

@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track D (M-006) — schedules: the D1 domain, the CAS tick, and the authenticated
-// facade. Subpath-only (`@proofoftech/flowsafe/schedules`), like agent-runner /
-// background-tasks / signals / goals: host-side wiring a consumer opts into, not
-// in the root barrel.
+export {
+  FENCED_SCHEDULE_STORAGE,
+  type FencedScheduleMutationCapability,
+  ScheduleMutationConflictError,
+  ScheduleMutationOutcomeUnknownError,
+  type ScheduleResumeMutation,
+} from './mutation-contract.js';
 
-// The facade router (CI-M-006-003).
 export {
   createScheduleRouter,
   type ScheduleFacadeStore,
@@ -14,7 +16,6 @@ export {
   type ScheduleRouter,
   type ScheduleRouterOptions,
 } from './router.js';
-// The D1 schedules storage domain (CI-M-006-001).
 export {
   D1SchedulesStorage,
   parseScheduleAgentDispatchReceipt,
@@ -38,7 +39,6 @@ export {
   scheduleCreatorRole,
   scheduleWithCreatorRole,
 } from './target-policy.js';
-// The CAS tick (CI-M-006-002).
 export {
   type AgentScheduleTarget,
   buildScheduledLegContext,

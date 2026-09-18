@@ -1,5 +1,86 @@
 # @proofoftech/flowsafe
 
+## 0.21.0
+
+### Minor Changes
+
+- c8c5039: The pending-notifications inventory lists pending agent-inbox notifications whether due, scheduled for later, or carrying no due timestamp. Its count includes these rows, its notDue total identifies those not yet due, and entry details expose summaryAt alongside deliverAt.
+
+  Pending notifications keep the deployment drain proof open until delivered, discarded, or deleted. Rescheduling alone does not clear the proof; a pending notification with neither timestamp requires a direct write or deletion because dispatch and retention leave it pending.
+
+- 4cb59a1: Bound notification delivery to ten failed attempts by default, configurable through `maxDeliveryAttempts` on tick and thread-route factories. Discard exhausted rows before another send, retain their error/count receipts, and remove them from due scans while preserving retry delays below the bound.
+
+  Require conditional failure writes through `NotificationDeliveryStorage` for dispatch. `D1NotificationsStorage` implements the atomic operation; custom stores must adopt it. Preserve newer summary, delivery and content-denial receipts after response loss, and count each local outcome once without inferring unconfirmed success. Ordinary Core storage still serves notification ingestion; the `@mastra/core` patch is required for either path. Require a custom `SignalDatabase` or `ScheduleDatabase` `batch()` to resolve elements carrying `results`, as a real `D1Result` does; `SnapshotDatabase` and `InitialAdmissionDatabase` `batch()` declare the same element.
+
+  Compare notification dates chronologically before bounded selection and retention, including expanded years and numeric offsets. Direct database writers must use ISO dates or explicitly zoned ISO date-times; conditional failure writes reject raw timestamp text outside that grammar, and neither due selection nor retention matches such a value.
+
+  Ship the `@mastra/core@1.53.0` patch under `patches/`. Application roots must apply it for own-property-safe summary source counts and source delivery policies; `@mastra/core@1.53.0` otherwise reads inherited `Object.prototype` members at both sites (mastra-ai/mastra#23693, mastra-ai/mastra#23694). The getting-started guide documents the pnpm, npm and Yarn routes. Flowsafe refuses to construct a notification dispatch tick that does delivery work, and refuses notification ingestion and dispatch requests, when the installed `@mastra/core` lacks the patch.
+
+- f05e598: Refuse two `Agent` entry points that `@mastra/core` releases newer than the declared peer expose. `FlowsafeDurableAgent.listActiveThreadRuns()` throws instead of returning the run, thread and resource ids of every thread on the pubsub instance with a run in flight, which Core scopes by neither principal nor agent. `FlowsafeDurableAgent.__setThreadRuntimeAgent()` throws instead of installing another agent as the target the thread-runtime paths resolve through — on `@mastra/core` 1.67.0 these are `subscribeToThread()`, `claimThreadOwnership()`, `sendMessage()`, `queueMessage()`, `sendStateSignal()`, `sendNotificationSignal()` and `sendSignal()` — where one call would move every run those paths start, and `subscribeToThread()`'s replay target with them, onto an agent that carries none of the wrapper's guards. Both refusals carry the reason table's message; an installed 1.53.0 exposes neither member on Core, so no call that resolves today changes, and a caller that feature-detects either member now finds it on the wrapper and takes the refusal where the call was a `TypeError` before.
+
+  The durable-agent surface inventory now holds against the pinned peer and against newer 1.x releases together.
+
+- 6f54bc6: Require the retention cursor seam on the purge duty. `runMaintenanceDuty('purge', env, context)` takes the new `MaintenancePurgeDutyContext`, whose `advanceRetentionCursor` is required, matching the `advanceCursor` the run-retention purge itself requires; the other duties keep the optional `MaintenanceDutyContext`. `FlowsafeWorker.runMaintenanceDuty` declares that split as two overloads — `'purge'` with a required `MaintenancePurgeDutyContext`, and `Exclude<MaintenanceDuty, 'purge'>` with the optional `MaintenanceDutyContext` — so a caller holding a union-typed `duty` narrows it to one branch before calling: a single call spanning the whole union matches neither overload and no longer compiles. A purge invocation whose context omits the callback is refused under a `config-error` naming `maintenance.purge.advanceRetentionCursor` before any purge surface runs, rather than purging the remaining surfaces and reporting a `retention-purge` failure.
+- 6f54bc6: Capture the conditional-delivery capability when a notification dispatch tick is built, whatever its `limit`. `createNotificationDispatchTick()` reads `storage` and refuses one without `updateNotificationDeliveryIfUnchanged` for every configuration, including `limit: 0`, so the `NotificationDeliveryStorage` requirement no longer depends on the limit. A `limit: 0` tick still resolves `{ due: 0, delivered: 0, failed: 0 }` without reading due rows, calling storage, or needing the `@mastra/core` patch; invalid numeric policy still fails ahead of the capture.
+
+  The notification ingestion route refuses when the installed `@mastra/core` lacks the delivery-policy half of that patch. `createThreadSignalRoutes()` probes `resolveNotificationDeliveryDecision` at the ingestion gate, where delivery runs through `agent.sendNotificationSignal` and reaches the delivery-policy lookup, and answers 502 with the message naming the patch on the server log. The dispatch route carries the synchronous source-key probe its summaries need, and delivers through `agent.sendSignal`, which never reaches that lookup. The probe resolves once per isolate; tick construction keeps its synchronous probe and is unaffected.
+
+- 647092e: Expose `isArmableSuspensionDeadlineMs` and `suspensionDeadlinesOf` from `do-runner`, together with the `SuspensionDeadlineEntry` and `RejectedSuspensionDeadline` types that projection returns. Add the lightweight `do-runner/constants` entry for deadline values and timeout detection, and `do-runner/testing` for constructing fixtures with the same timeout envelope as the alarm path.
+
+  Reuse the existing arming bounds, derivation and alarm payload factory. The test helper does not authorize a resume or mint an approval grant.
+
+- e79b92a: Accept optional non-reserved `requestContext` on authenticated run starts and carry it through the protected Durable Object topology into stored application context. Expose the validated value to router and Worker start-policy hooks while preserving shorter hook signatures.
+
+  Reject malformed context and reserved keys with HTTP 400. Verified schedule targets retain precedence, including absent context; provider application values override stored values and trusted capabilities retain their authority. Application context survives resume. Keyed replay validates input and runs host policy again, then preserves the first writer's context without comparing or overwriting it.
+
+  Correct public agent status, stream and ordinary termination lookups to return not found for a coherent snapshot belonging to another agent or thread. Private replay, proof and recovery retain strict failures so a foreign snapshot cannot be treated as absent.
+
+- 6bd8bfc: Add versioned execution-fence administration with artifact epochs, a sticky epoch requirement, transition revisions and exact last-command retry receipts. Upgrade supported legacy schemas additively without changing existing state or timestamps. Missing rows in new-format schemas fail closed. Admin responses omit receipts, proof execution identity and tokens; legacy commands remain compatible only while the epoch requirement is optional.
+
+  Activate v2 Runtime generations with independently generated execution tokens and preserved original principal, logical target, caller epoch and agent mode across resume legs. Fenced starts require the actual D1 domain's positive initial-write witness before engine entry, binding the winning reservation and proof in the same admission transaction. Capable D1 without a fence keeps its actual namespace and ordinary persistence options; custom storage explicitly asserts no D1 namespace. Unfenced keyed starts bind their prepared identity before creation and retain uncertain outcomes.
+
+  Persist preparing, prepared and prepared-unfenced journals in both managed hosts. Recover exact owned initial generations through the existing raw-row conditional repair without replaying effects or deleting tokenless snapshots. Require strict terminal reservation settlement before approval, dispatch, owner and lifecycle cleanup, then clear only the matching journal. Cold agent alarms initialize actual wrappers with the verified instance scope. Legacy journals and uncertain unfenced pending/absent outcomes remain unresolved.
+
+  Keep the thread blocking-run check and run-record installation under the same lock. Validate workflow journals against the owning object's address and recheck complete agent journals after recovery waits before releasing reservations. Keyed recovery requires its configured reservation store before bookkeeping, including nonterminal outcomes.
+
+  Share cold agent-wrapper initialization across concurrent requests. Probe the owning execution's liveness before reclaiming an existing reserved key, so a stream awaiting Core cleanup keeps retries pending without stranding the key. Unreadable liveness replies refuse the retry instead of authorizing a claim.
+
+  Require a matching nonpending durable observation before modern start/resume success or the agent persistence acknowledgement. Return `RUN_START_PENDING` for a valid initial generation, preserving journals, watchdogs and pending schedule/deadline budgets. Project root-local summaries from the same selected observation, retaining detailed nested resume preparation and legacy compatibility.
+
+  Preserve valid v1 and absent-provenance ordinary status, resume and lifecycle completion through one authoritative observation. Apply the existing binding, canonical-record and principal checks to legacy status. Legacy terminal cleanup requires no recovery journal and a confirmed raw terminal outcome; it never manufactures generation identity or spends a start key. Normal termination retains canonical agent records until lifecycle completion confirms.
+
+  Create modern-unbound reservations and replace run-only claim, release and settlement with exact observed-row operations. Claim/release stamps advance without serving as generation tokens; only the caller's own valid write result proves a winning claim. Private replay compares the full generation before pending/result classification and preserves the value from its one authoritative read. Alias binding and prepared binding retain their distinct response-loss rules. Remove `claim`, `release`, `settleRun` and `rollbackFencedStart`; custom router wiring must provide the private `persistedStart` callback.
+
+  Guard replay proof nomination with its original proof round/caller epoch, current exact snapshot and bound reservation at the final SQL write. Legacy proof setters cannot overwrite modern identity. Runtime, workflow-host, approval and signal re-entry gates compare complete physical generations and retain their original expectation through relevant waits. Direct approval compositions now pass an explicit trusted workflow namespace. External effects are not transactional with these checks.
+
+  Capture trusted authority before asynchronous work across Worker configuration, protected JSON/header transport and the eighth agent-start authority argument. Keep public bodies and application context from supplying a winning claim. Preserve source-owner versus initiating-principal attribution, exact lifecycle counter exhaustion checks and rejection of sparse economic-operation lists.
+
+  Make workflow retention generation-aware, protect run owners across supported snapshot namespaces, and pair reservation cleanup with the complete bound execution. Preserve reserved owners, uncertain generations and legacy keys that cannot be safely associated. Recheck schema and selected identity at the mutation; keep artifact deletion ahead of D1 cleanup.
+
+  Custom `purgeExpiredWorkflowRuns` callers must now provide transactional `database.batch()` and an `advanceCursor` callback, retain its exported `RunRetentionCursor`, and supply that cursor on the next call. Composed maintenance persists the cursor across alarms and restarts. Finite scan cycles revisit skipped candidates without letting continuous inserts extend the current cycle; unproved D1 outcomes and failed cursor writes do not advance progress.
+
+  Enforce captured caller epochs and semantic fence/schema observations in final D1 schedule mutations. Guard owned deletion participants independently, preserve admitted trigger settlement, and provide fixed pause/resume methods plus guarded no-op observations. Resume rejects a concurrent cron/timezone change. Fenced custom facades require the same-binding `FENCED_SCHEDULE_STORAGE` capability before activation; direct D1 authoring requires `batch()` and refuses omitted epochs once enforcement is active. Publish structured schedule conflict and unknown-outcome errors, retain server-side causes, and contain route audit failures without changing the selected response.
+
+  Apply the shared final schema, singleton and typed semantic fence check to Runtime initial admission. Refuse unreadable authority before snapshot or dependent reservation/proof writes while preserving exact committed-write recovery.
+
+- 323c2ce: Add optional `SignalRouterOptions.validateThreadTarget` using the existing bound-thread validator contract, with captured actor context before asynchronous validation. Hosts can enforce strict ownership before forwarding. Normalize thread refusals with status 404 and audit the final downstream result.
+
+  Contain audit and diagnostic failures in signal, objective, subscription and webhook routes so they preserve the selected response. Use own-property lookup for signal channels, objective methods and webhook provider configuration.
+
+### Patch Changes
+
+- a027f13: Return a generic internal-error response for unexpected run-router failures while retaining the original error in server diagnostics. Preserve typed refusal status, message and reason contracts. Contain diagnostic conversion and logging failures so they cannot prevent the generic HTTP response.
+- a086f24: `flowsafe-provision` sets a 64 MiB `maxBuffer` on the `wrangler d1 execute --json` child process whose output it parses. Node's default is 1 MiB counted across the captured stdout and stderr together, so a response past that was truncated and the run surfaced as `failed to execute Wrangler 4` with an `ENOBUFS` cause instead of the parsed rows.
+- 8c43533: Support signed maintenance for platform-authored Workers for Platforms catalogs. Catalog signing profiles can supply the maintenance keys without external-state artifacts. Catalog uploads receive their public verifier and local identity; FlowSafe relays capabilities while retaining the local receipt secret and validates the catalog script and digest before maintenance work.
+
+  Existing catalog artifacts need a rebuilt FlowSafe runtime and explicit maintenance enrollment. The host configures the matching global dispatcher verifier.
+
+  Persist catalog ownership explicitly in Fleet records and preserve it through native D1 migration and export-backed teardown. Catalog cleanup checks its own script and namespace authority. Force re-entry on completed or reserved records uses claim-releasing deletion when the store supports it.
+
+  Preserve the prior mutable Worker schema identity while D1 advances and retain migration authority through compatibility teardown retries. Permit declared catalog binding changes with exact owner and uploaded-target checks.
+
+  Allow ordinary spec-free force recovery after a candidate upload by clearing migration-only scalar fields when teardown begins, while preserving the recorded resource identity.
+
 ## 0.20.0
 
 ### Minor Changes

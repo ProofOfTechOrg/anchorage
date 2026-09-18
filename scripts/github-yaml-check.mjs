@@ -1,7 +1,9 @@
 import { lstatSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, extname, join, relative, resolve, sep } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { isMap, parseDocument } from 'yaml';
+
+import { isInvokedAsEntryPoint } from './entry-point.mjs';
 
 const FORBIDDEN_CHARACTER =
   // biome-ignore lint/suspicious/noControlCharactersInRegex: YAML excludes these code points from streams.
@@ -232,9 +234,6 @@ function main() {
   process.exitCode = runGithubYamlCheck(join(root, '.github'));
 }
 
-const invokedPath = process.argv[1]
-  ? pathToFileURL(resolve(process.argv[1])).href
-  : undefined;
-if (invokedPath === import.meta.url) {
+if (isInvokedAsEntryPoint(import.meta.url)) {
   main();
 }

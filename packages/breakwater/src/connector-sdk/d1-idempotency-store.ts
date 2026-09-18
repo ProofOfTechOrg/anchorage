@@ -8,18 +8,18 @@
 // platform-agnostic — no @cloudflare/workers-types import — so tests back
 // the interfaces with node:sqlite and Workers pass env.DB directly.
 
-import {
-  ATOMIC_LEGACY_IDEMPOTENCY_MIGRATION,
-  type AtomicLegacyIdempotencyMigrationRequest,
-  type AtomicLegacyIdempotencyMigrationResult,
-} from './idempotency-migration.js';
 import type {
   AtomicIdempotencyStore,
   IdempotencyInspection,
   IdempotencyRecord,
   IdempotencyReservation,
   InspectableIdempotencyStore,
-} from './index.js';
+} from './contracts.js';
+import {
+  ATOMIC_LEGACY_IDEMPOTENCY_MIGRATION,
+  type AtomicLegacyIdempotencyMigrationRequest,
+  type AtomicLegacyIdempotencyMigrationResult,
+} from './idempotency-migration.js';
 import { newToken } from './new-token.js';
 
 /** The subset of D1Database this store uses. */

@@ -1,5 +1,7 @@
 import { defineConfig } from 'vitest/config';
 
+// `vitest.breakwater-workers.config.mts` carries the miniflare/workerd override
+// record and the pool-upgrade rule that govern this config too.
 export default defineConfig(async () => {
   const { cloudflareTest } = await import('@cloudflare/vitest-pool-workers');
   return {

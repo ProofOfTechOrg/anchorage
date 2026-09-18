@@ -252,7 +252,7 @@ const account = await invokeConnector(accountLookup, {
 });
 ```
 
-Pass a trusted `RequestContext` when the connector uses grants, identity, dry-run, idempotency, or isolation keys. `invokeConnector()` preserves Mastra schema validation and every Breakwater gate. It rejects plain tools and connectors whose ID, execution function, or schema surface changed after construction. Validation failures throw a redacted `ConnectorValidationError` with the connector ID and `input` or `output` phase.
+Pass a trusted `RequestContext` when the connector uses grants, identity, dry-run, idempotency, or isolation keys. `invokeConnector()` preserves Mastra schema validation and every Breakwater gate. It rejects plain tools and connectors whose ID, execution function, or schema surface changed after construction. Validation failures throw a redacted `ConnectorValidationError` with a stable kind/code, connector ID and `input` or `output` phase.
 
 The permission manifest is enforced:
 
@@ -352,8 +352,8 @@ the result at their gateway boundary.
 
 A fixed window can admit traffic on both sides of a boundary, approaching
 twice the nominal count in a short interval. Use another `RateLimitStore`
-implementation if you require token-bucket or GCRA semantics.
-Counts must be safe integers from 1 through `Number.MAX_SAFE_INTEGER`.
+implementation if you require token-bucket or GCRA semantics. Counts must be
+safe integers from 1 through `Number.MAX_SAFE_INTEGER`.
 `D1RateLimitStore` commits its increment and rollover cleanup in one D1 batch,
 so cleanup failure cannot consume quota for a rejected call.
 
@@ -450,9 +450,8 @@ process-tree termination, timeout, and output limits.
 
 The returned `text` is functional agent output and may contain sensitive data.
 The `command` redacts the prompt and `--flag=value` option values. Validation
-failures, error messages, error metadata, and
-breakwater-generated audit reasons do not contain the prompt or captured
-stdout and stderr.
+failures, error messages, error metadata, and breakwater-generated audit
+reasons do not contain the prompt or captured stdout and stderr.
 
 The adapter does not sandbox the child. It inherits the parent environment and
 credentials, and `cwd` is the workspace the CLI may modify. Its manifest
@@ -476,7 +475,10 @@ This enforcement cannot see:
 - raw sockets or child-process network traffic.
 
 Route every connector request through `runtime.fetch`. Use host-level network
-controls when code outside that seam must also be constrained.
+controls when code outside that seam must also be constrained. Declare
+`permissions.egressEnforcement: 'declaration-only'` for traffic outside the
+guard; `connectorEgressPosture()` reads the resolved posture and connector
+audit events record it as `detail.egressEnforcement`.
 
 ## Public API
 
@@ -521,17 +523,21 @@ for compatibility.
 
 ### Connector SDK exports
 
+Use the [connector decision-code guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/connector-interface.md#connector-decision-codes) to classify failures and audit events. The exported `ConnectorDecisionCode` and `ConnectorPolicyName` types support machine handling while diagnostic policy names remain open strings. Retryability preserves the same operation identity; it does not add automatic retries.
+
 | Runtime exports | Purpose |
 | --- | --- |
-| `createConnector`, `connectorManifest` | Build an enforced Mastra connector and inspect its immutable manifest |
+| `createConnector`, `connectorManifest`, `connectorEgressPosture` | Build an enforced Mastra connector and inspect its immutable manifest and resolved egress posture |
+| `assertConnectorConformance`, `ConnectorConformanceError` | Assert supplied connector cases against trapped egress entry points and inspect the failure report |
 | `invokeConnector` | Invoke an unmodified connector from trusted host or workflow code without fabricating a Mastra tool context |
 | `singleTenantConnectorPolicies` | Build the validated connector-policy baseline for one physically isolated deployment |
-| `ConnectorPolicyError`, `ConnectorValidationError` | Structured policy denial and redacted direct-invocation validation failure |
+| `ConnectorPolicyError`, `ConnectorStoreError`, `ConnectorEvaluatorError`, `ConnectorValidationError`, `ConnectorInvocationError` | Stable classification for authored connector failures |
+| `CONNECTOR_DECISIONS`, `isConnectorDecisionCode`, `connectorDecisionRetryable` | Decision catalogue and retryability without parsing diagnostic prose |
 | `CONNECTOR_GRANTS_CONTEXT_KEY`, `CONNECTOR_EXECUTION_CONTEXT_KEY`, `DRY_RUN_CONTEXT_KEY`, `IDEMPOTENCY_KEY_CONTEXT_KEY` | Stable connector request-context keys |
 | `InMemoryIdempotencyStore`, `D1IdempotencyStore` | Development and durable replay stores |
 | `inspectLegacyConnectorIdempotency`, `migrateLegacyConnectorIdempotency` | Inventory and atomically migrate one externally proven ambiguous legacy D1 row without exposing storage keys |
 | `InMemoryRateLimitStore`, `D1RateLimitStore` | Development and durable fixed-window stores |
-| `egressFetch`, `EgressDeniedError` | Standalone fetch guard and its default denial |
+| `egressFetch`, `EgressDeniedError`, `EgressGuardError` | Standalone fetch guard and coded request/redirect refusals |
 
 Type exports: `Connector`, `ConnectorInvocationOptions`, `PermissionManifest`, `ConnectorConfig`, `ConnectorPolicies`,
 `SingleTenantConnectorPolicies`, `SingleTenantConnectorPoliciesOptions`,
@@ -539,7 +545,7 @@ Type exports: `Connector`, `ConnectorInvocationOptions`, `PermissionManifest`, `
 `SingleTenantPermissionPosture`,
 `ConnectorApprovalGrant`, `ConnectorApprovalGrantBase`,
 `ConnectorApprovalSuspension`, `ConnectorExecutionIdentity`,
-`ConnectorRuntime`, `IdempotencyStore`,
+`ConnectorRuntime`, `ConnectorEgressPosture`, `IdempotencyStore`,
 `AtomicIdempotencyStore`,
 `InspectableIdempotencyStore`, `IdempotencyInspection`,
 `IdempotencyRecord`, `IdempotencyReservation`, `RateLimitStore`,
@@ -550,7 +556,7 @@ Type exports: `Connector`, `ConnectorInvocationOptions`, `PermissionManifest`, `
 `IdempotencyStatement`, `IdempotencyBatchResult`, `D1RateLimitStoreOptions`, `RateLimitDatabase`,
 `RateLimitStatement`, `RateLimitBatchResult`, `EgressDenial`, `EgressFetchOptions`,
 `EgressFetchBase`, `EgressGuardedFetch`, `EgressRequestInit`,
-`EgressResponse`, and `EgressResponseHeaders`.
+`EgressResponse`, `EgressResponseHeaders`, `ConnectorConformanceCase`, `ConnectorConformanceCaseResult`, `ConnectorConformanceEntryPoint`, `ConnectorConformanceEscape`, `ConnectorConformanceFactory`, `ConnectorConformanceFinding`, `ConnectorConformanceFindingCode`, `ConnectorConformanceOptions`, `ConnectorConformanceReport`, `ConnectorConformanceRequest`, `ConnectorConformanceResponse`, `ConnectorConformanceRuntime`.
 
 ### Agent CLI exports
 

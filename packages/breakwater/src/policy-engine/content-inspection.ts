@@ -6,7 +6,11 @@
 // model call) evaluated on a streaming cadence. Both are best-effort — see
 // each export's doc for its accepted evasion surface.
 
-import type { OutputChannel, PolicyEvaluator, PolicyPhase } from './index.js';
+import type {
+  OutputChannel,
+  PolicyEvaluator,
+  PolicyPhase,
+} from './evaluator-contract.js';
 import type { PolicyDecision } from './tool-policy.js';
 
 // ---------------------------------------------------------------------------
@@ -28,7 +32,7 @@ const SECRET_ASSIGNMENT_RE =
 // candidateFloorForThreshold(DEFAULT_ENTROPY_THRESHOLD): the shortest length
 // whose maximum Shannon entropy log2(23) ~= 4.52 reaches the 4.5 bits/char
 // default bar (log2(20..22) = 4.32..4.46 < 4.5 — those lengths can never fire
-// at 4.5, the dead zone the old {20} floor used to match). A caller-configured
+// at 4.5, which is the dead zone a {20} floor matches). A caller-configured
 // threshold derives its OWN floor in highEntropyDetector (a 4.0 bar reaches
 // back down to floor 20, a 5.0 bar up to 32), so this constant is the default
 // only — see candidateFloorForThreshold. Exported only for the white-box
@@ -206,7 +210,7 @@ function secretAssignmentDetector(): Detector {
 // (shannonEntropy >= threshold) is unchanged — deliberately NOT the rejected
 // per-candidate clamp min(threshold, log2(len)) (RA-004), which would flag any
 // all-distinct run regardless of the configured bar. DL-005 (F5) set the {23}
-// floor for the 4.5 default only; hardcoding it silently dropped the 20..22-char
+// floor for the 4.5 default only; hardcoding it silently drops the 20..22-char
 // candidates a lower configured threshold can still legitimately flag
 // (4.0 -> floor 20 -> log2(20)=4.32 >= 4.0). Examples:
 //   4.5 -> max(20, ceil(2^4.5)=23) = 23   (default; byte-identical to DL-005)

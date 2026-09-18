@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { captureActorContext } from '../approval-api/actor-context.js';
 import {
   type ActorContext,
   type ApprovalDecision,
@@ -7,14 +8,37 @@ import {
   defaultResumeData,
 } from '../approval-api/index.js';
 import {
+  isExecutionPrincipalId,
+  isExecutionPrincipalKind,
+} from '../approval-api/principal.js';
+import {
+  APPROVAL_PRIORITIES,
+  APPROVAL_STATUSES,
+  canonicalApprovalResumeTarget,
+} from '../approval-api/types.js';
+import type { StartExecutionIdentity } from '../do-runner/execution-admission.js';
+import {
   beginIdempotentStart,
   type ExecutionFenceWiring,
   isPathSafeId,
+  type PersistedStartResult,
   requireStartIdempotency,
-  rollbackFencedStart,
+  resourceIdFromKey,
   type StartIdempotencyWiring,
   type StartReservation,
+  type StartReservationReading,
 } from '../do-runner/index.js';
+import {
+  captureReservation,
+  type StartReservationOwner,
+} from '../do-runner/start-reservation-contract.js';
+import {
+  doStartLiveness,
+  persistedStartExecution,
+  persistedStartRecord,
+  publicRunSummary,
+  publicStartFields,
+} from '../host-kit/do-response.js';
 import {
   type BoundThreadTarget,
   type BoundThreadTargetValidator,
@@ -273,9 +297,10 @@ export function createAgentThreadTopology<Id>(
     context: ActorContext,
     agentId: string,
     reservation: StartReservation,
-  ): Promise<AgentRunEnvelope | undefined> => {
+  ): Promise<PersistedStartResult<AgentRunEnvelope> | undefined> => {
     const threadId = reservation.threadId;
-    if (threadId === undefined || !isPathSafeId(threadId)) return undefined;
+    if (threadId === undefined || !isPathSafeId(threadId))
+      throw new RunRouteError(503, 'persisted start is not readable');
     const response = await threads.send(
       context,
       threadId,
@@ -285,21 +310,17 @@ export function createAgentThreadTopology<Id>(
         reservation.runId,
       )}?resourceId=${encodeURIComponent(
         context.resourceIdFromKey(threadId),
-      )}&dispatch=1`,
+      )}&dispatch=1&replay=1`,
     );
     if (response.status === 404) return undefined;
-    return envelope(response);
+    return persistedEnvelope(response, {
+      agentId,
+      threadId,
+      resourceId: context.resourceIdFromKey(threadId),
+      runId: reservation.runId,
+      owner: reservation.owner,
+    });
   };
-  /**
-   * Is the reserved run executing in its thread object right now?
-   *
-   * Asked of the RECORDED thread, which is the only object that could be
-   * running it: an agent run is bound to one thread for its whole life. An
-   * unreachable or unparseable answer reads as NOT live, the fail-closed
-   * direction here — it produces the refusal that asks a human to investigate,
-   * where a default of "live" would answer a permanently dead run with a
-   * permanently retryable 503.
-   */
   const reservedRunLive = async (
     context: ActorContext,
     agentId: string,
@@ -314,12 +335,7 @@ export function createAgentThreadTopology<Id>(
         agentId,
       )}/${encodeURIComponent(reservation.runId)}/start-liveness`,
     );
-    if (response.status !== 200) return false;
-    try {
-      return ((await response.json()) as { live?: unknown }).live === true;
-    } catch {
-      return false;
-    }
+    return doStartLiveness(response);
   };
   return {
     requireBoundThread: async (context, target: BoundThreadTarget) => {
@@ -353,8 +369,40 @@ export function createAgentThreadTopology<Id>(
       );
       if (!response.ok) throw await errorFrom(response);
     },
-    start: async (context, input) => {
-      const threaded = input.threaded !== false;
+    start: async (sourceContext, sourceInput) => {
+      const context = captureActorContext(sourceContext);
+      const { principal, mutationEpoch } = context;
+      const {
+        agentId,
+        entryPath,
+        runId: suppliedRunId,
+        threadId: suppliedThreadId,
+        resourceId: suppliedResourceId,
+        topologyThreadId,
+        threaded: suppliedThreaded,
+        scheduleId,
+        dispatchId,
+        idempotencyKey,
+        prompt,
+        requestContext,
+        streamRequestContext,
+        providerOptions,
+      } = sourceInput;
+      const input = {
+        agentId,
+        entryPath,
+        threadId: suppliedThreadId,
+        resourceId: suppliedResourceId,
+        topologyThreadId,
+        scheduleId,
+        dispatchId,
+        idempotencyKey,
+        prompt,
+        requestContext,
+        streamRequestContext,
+        providerOptions,
+      };
+      const threaded = suppliedThreaded !== false;
       if (
         (input.entryPath === 'schedule.fire') !==
           (input.scheduleId !== undefined) ||
@@ -388,10 +436,10 @@ export function createAgentThreadTopology<Id>(
       // its own, which is what makes two same-key starts converge instead of
       // becoming two runs.
       const mintRunId = (): string =>
-        input.runId === undefined
+        suppliedRunId === undefined
           ? context.newRunId()
-          : isPathSafeId(input.runId)
-            ? input.runId
+          : isPathSafeId(suppliedRunId)
+            ? suppliedRunId
             : (() => {
                 throw new RunRouteError(404, 'run not found');
               })();
@@ -419,10 +467,15 @@ export function createAgentThreadTopology<Id>(
         targetThreadId: string,
         targetRunId: string,
         idempotencyKey?: string,
-      ): Promise<AgentRunEnvelope> =>
-        envelope(
+        suppliedReservation?: StartReservationReading,
+      ): Promise<AgentRunEnvelope> => {
+        const startReservation =
+          suppliedReservation === undefined
+            ? undefined
+            : captureReservation(suppliedReservation, 'started');
+        return envelope(
           await threads.send(
-            context,
+            { principal, mutationEpoch },
             targetThreadId,
             `${AGENT_HOST_ROUTE_PREFIX}/start`,
             {
@@ -441,6 +494,7 @@ export function createAgentThreadTopology<Id>(
                 // The key rides the internal Worker-to-DO channel only, so the
                 // fence's proof-only state can match it inside the runtime.
                 ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
+                ...(startReservation === undefined ? {} : { startReservation }),
                 ...(input.scheduleId !== undefined
                   ? { scheduleId: input.scheduleId }
                   : {}),
@@ -451,6 +505,7 @@ export function createAgentThreadTopology<Id>(
             },
           ),
         );
+      };
       if (input.idempotencyKey === undefined) {
         // Unkeyed starts take the path they always took, on the thread this
         // call resolved.
@@ -462,8 +517,8 @@ export function createAgentThreadTopology<Id>(
         {
           key: input.idempotencyKey,
           owner: {
-            kind: context.principal.kind,
-            id: context.principal.id,
+            kind: principal.kind,
+            id: principal.id,
           },
           targetKind: 'agent',
           targetId: input.agentId,
@@ -477,28 +532,22 @@ export function createAgentThreadTopology<Id>(
             reservedRunLive(context, input.agentId, reservation),
         },
         options.executionFence,
+        mutationEpoch,
       );
       if (decision.kind === 'replay') return decision.persisted;
       // The RESERVATION's thread and run, not this call's: on a re-claim of a
       // reservation an earlier crashed caller left behind, the recorded thread
       // is where that run belongs and this call's freshly minted one is not.
       const { reservation } = decision;
-      const startThreadId = reservation.threadId ?? threadId;
-      try {
-        return await sendStart(
-          startThreadId,
-          reservation.runId,
-          reservation.key,
-        );
-      } catch (error) {
-        // Only a fence refusal gives the claim back — see rollbackFencedStart.
-        return rollbackFencedStart(
-          store,
-          reservation.key,
-          reservation.runId,
-          error,
-        );
-      }
+      const startThreadId = reservation.threadId;
+      if (!isPathSafeId(startThreadId))
+        throw new RunRouteError(503, 'persisted start is not readable');
+      return sendStart(
+        startThreadId,
+        reservation.runId,
+        reservation.key,
+        reservation,
+      );
     },
     status: statusFromHost,
     dispatchStatus: dispatchStatusFromHost,
@@ -614,4 +663,211 @@ export function createAgentThreadTopology<Id>(
       );
     },
   };
+}
+
+function publicApproval(
+  value: unknown,
+  execution: StartExecutionIdentity,
+): ApprovalRecord {
+  const record = publicStartFields(value, [
+    'id',
+    'workflowId',
+    'runId',
+    'stepPath',
+    'title',
+    'summary',
+    'payload',
+    'connectors',
+    'grantScope',
+    'toolCallId',
+    'priority',
+    'status',
+    'requestedBy',
+    'requestedByKind',
+    'claimedBy',
+    'decidedBy',
+    'decision',
+    'comment',
+    'delegatedTo',
+    'createdAt',
+    'updatedAt',
+    'claimedAt',
+    'decidedAt',
+    'escalatedAt',
+    'slaDeadlineAt',
+    'suspendedAt',
+    'resumedAt',
+    'resumeCount',
+    'runScoped',
+    'resumeTarget',
+  ]);
+  const invalid = (): never => {
+    throw new RunRouteError(503, 'persisted start is not readable');
+  };
+  if (
+    !isPathSafeId(record.id) ||
+    record.workflowId !== execution.workflowId ||
+    record.runId !== execution.runId ||
+    typeof record.title !== 'string' ||
+    typeof record.createdAt !== 'string' ||
+    typeof record.updatedAt !== 'string' ||
+    !(APPROVAL_PRIORITIES as readonly unknown[]).includes(record.priority) ||
+    !(APPROVAL_STATUSES as readonly unknown[]).includes(record.status)
+  )
+    invalid();
+  for (const field of ['connectors', 'stepPath']) {
+    if (
+      (field === 'connectors' || record[field] !== undefined) &&
+      (!Array.isArray(record[field]) ||
+        (record[field] as unknown[]).some((part) => typeof part !== 'string'))
+    )
+      invalid();
+  }
+  for (const field of [
+    'summary',
+    'toolCallId',
+    'claimedBy',
+    'decidedBy',
+    'comment',
+    'delegatedTo',
+    'claimedAt',
+    'decidedAt',
+    'escalatedAt',
+    'slaDeadlineAt',
+  ]) {
+    if (record[field] !== undefined && typeof record[field] !== 'string')
+      invalid();
+  }
+  if (
+    record.requestedBy !== undefined &&
+    !isExecutionPrincipalId(record.requestedBy)
+  )
+    invalid();
+  if (
+    record.requestedByKind !== undefined &&
+    (!isExecutionPrincipalKind(record.requestedByKind) ||
+      record.requestedBy === undefined)
+  )
+    invalid();
+  if (
+    record.grantScope !== undefined &&
+    !['tool-call', 'suspension', 'run'].includes(record.grantScope as string)
+  )
+    invalid();
+  if (
+    record.decision !== undefined &&
+    record.decision !== 'approve' &&
+    record.decision !== 'reject'
+  )
+    invalid();
+  if (record.runScoped !== undefined && typeof record.runScoped !== 'boolean')
+    invalid();
+  for (const field of ['suspendedAt', 'resumedAt', 'resumeCount']) {
+    const value = record[field];
+    if (
+      value !== undefined &&
+      (typeof value !== 'number' ||
+        !Number.isFinite(value) ||
+        (field === 'resumeCount' &&
+          (!Number.isSafeInteger(value) || value < 0)))
+    )
+      invalid();
+  }
+  if (record.resumeTarget !== undefined) {
+    const target = canonicalApprovalResumeTarget(record.resumeTarget);
+    if (!target) invalid();
+    if (
+      target?.kind === 'agent-thread' &&
+      (execution.target.kind !== 'agent' ||
+        target.agentId !== execution.target.id ||
+        target.threadId !== execution.target.threadId ||
+        target.resourceId !== resourceIdFromKey(target.threadId))
+    )
+      invalid();
+    record.resumeTarget = target;
+  }
+  return record as unknown as ApprovalRecord;
+}
+
+/** @internal Project the private replay envelope without execution authority. */
+export function publicAgentRunEnvelope(
+  value: unknown,
+  execution: StartExecutionIdentity,
+  expected: {
+    agentId: string;
+    threadId: string;
+    resourceId: string;
+    runId: string;
+  },
+): AgentRunEnvelope {
+  const source = publicStartFields(value, [
+    'agentId',
+    'threadId',
+    'resourceId',
+    'runId',
+    'summary',
+    'approval',
+    'approvals',
+  ]);
+  if (
+    source.agentId !== expected.agentId ||
+    source.threadId !== expected.threadId ||
+    source.resourceId !== expected.resourceId ||
+    source.runId !== expected.runId
+  )
+    throw new RunRouteError(503, 'persisted start is not readable');
+  const result: AgentRunEnvelope = {
+    agentId: expected.agentId,
+    threadId: expected.threadId,
+    resourceId: expected.resourceId,
+    runId: expected.runId,
+    summary: publicRunSummary(source.summary, expected.runId),
+  };
+  if (source.approval !== undefined)
+    result.approval = publicApproval(source.approval, execution);
+  if (source.approvals !== undefined) {
+    if (!Array.isArray(source.approvals))
+      throw new RunRouteError(503, 'persisted start is not readable');
+    result.approvals = source.approvals.map((approval) =>
+      publicApproval(approval, execution),
+    );
+  }
+  return result;
+}
+
+async function persistedEnvelope(
+  response: Response,
+  expected: {
+    agentId: string;
+    threadId: string;
+    resourceId: string;
+    runId: string;
+    owner: StartReservationOwner;
+  },
+): Promise<PersistedStartResult<AgentRunEnvelope>> {
+  if (!response.ok) throw await errorFrom(response);
+  try {
+    const payload = persistedStartRecord(await response.json());
+    const execution = persistedStartExecution(payload.execution);
+    if (
+      execution.runId !== expected.runId ||
+      execution.owner.kind !== expected.owner.kind ||
+      execution.owner.id !== expected.owner.id ||
+      execution.target.kind !== 'agent' ||
+      execution.target.id !== expected.agentId ||
+      execution.target.threadId !== expected.threadId
+    )
+      throw new Error('selector mismatch');
+    if (payload.kind === 'initial' && !Object.hasOwn(payload, 'value'))
+      return { kind: 'initial', execution };
+    if (payload.kind !== 'result' || !Object.hasOwn(payload, 'value'))
+      throw new Error('invalid result');
+    return {
+      kind: 'result',
+      execution,
+      value: publicAgentRunEnvelope(payload.value, execution, expected),
+    };
+  } catch {
+    throw new RunRouteError(503, 'persisted start is not readable');
+  }
 }

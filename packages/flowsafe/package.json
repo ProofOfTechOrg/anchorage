@@ -1,11 +1,12 @@
 {
   "name": "@proofoftech/flowsafe",
-  "version": "0.20.0",
+  "version": "0.21.0",
   "publishConfig": {
     "access": "public"
   },
   "files": [
     "dist",
+    "patches/@mastra__core@1.53.0.patch",
     "deployment-identity-protocol.d.mts",
     "deployment-identity-protocol.mjs",
     "scripts/seed-deployment-identity.mjs",
@@ -47,6 +48,8 @@
     "./artifacts": "./dist/artifacts/index.js",
     "./audit-export": "./dist/audit-export/index.js",
     "./do-runner": "./dist/do-runner/index.js",
+    "./do-runner/constants": "./dist/do-runner/constants.js",
+    "./do-runner/testing": "./dist/do-runner/testing.js",
     "./goals": "./dist/goals/index.js",
     "./host-kit": "./dist/host-kit/index.js",
     "./host-kit/module": "./dist/host-kit/module.js",
@@ -67,6 +70,7 @@
     "dev": "tsc --watch",
     "test": "vitest run",
     "test:agent-host-export": "node scripts/agent-host-pack-test.mjs",
+    "test:packed-surface": "node scripts/agent-host-pack-test.mjs",
     "test:provisioning-export": "node scripts/provisioning-pack-test.mjs",
     "test:signals-client-export": "node scripts/signals-client-pack-test.mjs",
     "test:watch": "vitest",
@@ -113,7 +117,6 @@
     "types-react-dom-18": "npm:@types/react-dom@^18.3.7",
     "typescript": "^5.6",
     "vitest": "^4.1.8",
-    "wrangler": "4.118.0",
     "zod": "4.4.3"
   },
   "keywords": [

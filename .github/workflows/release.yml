@@ -66,11 +66,12 @@ jobs:
       - name: Build
         run: pnpm build
 
-      # ci.yml runs this too, but ci.yml and this workflow start CONCURRENTLY on
-      # a push to main and main requires no status check, so a red CI cannot
-      # stop a publish. Repeating it here fails in this job, before the publish
-      # step, on this checkout. It is fully offline and adds no new dependency, but
-      # it runs each prerequisite's prepack build, so it is not free.
+      # ci.yml runs this too, but a push to main starts ci.yml and this workflow
+      # CONCURRENTLY and this job does not wait for CI's result, so a red CI
+      # cannot stop a publish. Repeating it here fails in this job, before the
+      # publish step, on this checkout. It is fully offline and adds no new
+      # dependency, but it runs each prerequisite's prepack build, so it is not
+      # free.
       - name: Verify release publish invocation
         run: pnpm test:release-invocation
 

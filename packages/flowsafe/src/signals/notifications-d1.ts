@@ -24,8 +24,13 @@ import {
   NotificationsStorage,
   type UpdateNotificationInput,
 } from '@mastra/core/notifications';
-import { DUE_NOTIFICATION_SQL } from '../do-runner/notification-predicate.js';
+import {
+  DUE_NOTIFICATION_SQL,
+  notificationTimestampMillis,
+  notificationTimestampSql,
+} from '../do-runner/notification-predicate.js';
 import { validateTablePrefix } from '../do-runner/table-prefix.js';
+import { nonnegativeSafeInteger } from '../numeric-config.js';
 import {
   d1Changes,
   dateOrUndefined,
@@ -35,6 +40,12 @@ import {
   type SignalDatabase,
   type SignalStatement,
 } from './d1-shared.js';
+import type {
+  NotificationDeliveryFailure,
+  NotificationDeliveryObservation,
+  NotificationDeliveryStorage,
+  NotificationDeliveryUpdateResult,
+} from './notification-dispatch.js';
 
 /** The raw row shape `mastra_notifications` stores and `rowToRecord` reads. */
 interface NotificationRow {
@@ -128,6 +139,183 @@ const NOTIFICATION_UPDATE_COLUMNS = NOTIFICATION_COLUMNS.filter(
   (column) => column !== 'id' && column !== 'thread_id',
 );
 
+type NotificationColumn = (typeof NOTIFICATION_COLUMNS)[number];
+
+const NOTIFICATION_DATE_COLUMNS = new Set<NotificationColumn>([
+  'createdAt',
+  'updatedAt',
+  'deliverAt',
+  'summaryAt',
+  'lastDeliveryAttemptAt',
+  'deliveredAt',
+  'seenAt',
+  'dismissedAt',
+  'archivedAt',
+  'discardedAt',
+]);
+
+const NOTIFICATION_REQUIRED_TEXT_COLUMNS = new Set<NotificationColumn>([
+  'id',
+  'thread_id',
+  'source',
+  'kind',
+  'summary',
+]);
+
+function notificationDeliveryDate(value: unknown, canonical: boolean): number {
+  const time =
+    typeof value === 'string' ? notificationTimestampMillis(value) : NaN;
+  if (
+    !Number.isFinite(time) ||
+    (canonical && new Date(time).toISOString() !== value)
+  ) {
+    throw new TypeError('Notification delivery timestamp is malformed');
+  }
+  return time;
+}
+
+function validateNotificationDeliveryValues(
+  values: unknown[],
+  canonicalDates: boolean,
+): void {
+  for (const [index, column] of NOTIFICATION_COLUMNS.entries()) {
+    const value = values[index];
+    if (column === 'deliveryAttempts') {
+      nonnegativeSafeInteger(value as number, 'notification deliveryAttempts');
+    } else if (column === 'coalescedCount') {
+      if (typeof value !== 'number' || !Number.isFinite(value)) {
+        throw new TypeError('Notification coalescedCount is malformed');
+      }
+    } else if (column === 'priority') {
+      if (!['urgent', 'high', 'medium', 'low'].includes(value as string)) {
+        throw new TypeError('Notification priority is malformed');
+      }
+    } else if (column === 'status') {
+      if (
+        ![
+          'pending',
+          'delivered',
+          'seen',
+          'dismissed',
+          'archived',
+          'discarded',
+        ].includes(value as string)
+      ) {
+        throw new TypeError('Notification status is malformed');
+      }
+    } else if (NOTIFICATION_DATE_COLUMNS.has(column)) {
+      if (value !== null || column === 'createdAt' || column === 'updatedAt') {
+        notificationDeliveryDate(value, canonicalDates);
+      }
+    } else if (
+      column === 'payload' ||
+      column === 'attributes' ||
+      column === 'metadata'
+    ) {
+      if (value === null) continue;
+      if (typeof value !== 'string') {
+        throw new TypeError('Notification delivery JSON is malformed');
+      }
+      try {
+        JSON.parse(value, (_key, parsed: unknown) => {
+          if (typeof parsed === 'number' && !Number.isFinite(parsed)) {
+            throw new TypeError();
+          }
+          return parsed;
+        });
+      } catch {
+        throw new TypeError('Notification delivery JSON is malformed');
+      }
+    } else if (
+      typeof value !== 'string' &&
+      (value !== null || NOTIFICATION_REQUIRED_TEXT_COLUMNS.has(column))
+    ) {
+      throw new TypeError(`Notification ${column} is malformed`);
+    }
+  }
+}
+
+function notificationDeliveryRowValues(row: NotificationRow): unknown[] {
+  if (typeof row !== 'object' || row === null || Array.isArray(row)) {
+    throw new TypeError('Notification delivery row is malformed');
+  }
+  const values = NOTIFICATION_COLUMNS.map((column) => row[column]);
+  validateNotificationDeliveryValues(values, false);
+  return values;
+}
+
+function notificationFailureUpdates(
+  expected: NotificationDeliveryObservation,
+  failure: NotificationDeliveryFailure,
+): Partial<Record<NotificationColumn, string | number | null>> {
+  const allowed = new Set<PropertyKey>(['type', 'updatedAt']);
+  const updates: Partial<Record<NotificationColumn, string | number | null>> = {
+    updatedAt: failure.updatedAt,
+  };
+  notificationDeliveryDate(failure.updatedAt, true);
+  if (failure.type !== 'exhausted') {
+    if (failure.type !== 'retry' && failure.type !== 'discard') {
+      throw new TypeError('Notification delivery failure type is malformed');
+    }
+    for (const key of [
+      'deliveryAttempts',
+      'lastDeliveryAttemptAt',
+      'lastDeliveryError',
+    ]) {
+      allowed.add(key);
+    }
+    nonnegativeSafeInteger(
+      failure.deliveryAttempts,
+      'notification deliveryAttempts',
+    );
+    if (
+      expected.deliveryAttempts === Number.MAX_SAFE_INTEGER ||
+      failure.deliveryAttempts !== expected.deliveryAttempts + 1
+    ) {
+      throw new RangeError('Notification delivery failure must increment once');
+    }
+    const attemptedAt = notificationDeliveryDate(
+      failure.lastDeliveryAttemptAt,
+      true,
+    );
+    if (typeof failure.lastDeliveryError !== 'string') {
+      throw new TypeError('Notification lastDeliveryError is malformed');
+    }
+    updates.deliveryAttempts = failure.deliveryAttempts;
+    updates.lastDeliveryAttemptAt = failure.lastDeliveryAttemptAt;
+    updates.lastDeliveryError = failure.lastDeliveryError;
+    if (failure.type === 'retry') {
+      for (const cursor of ['deliverAt', 'summaryAt'] as const) {
+        allowed.add(cursor);
+        const original = expected[cursor];
+        const retry = failure[cursor];
+        if (
+          original !== null &&
+          notificationDeliveryDate(original, true) <= attemptedAt
+        ) {
+          if (notificationDeliveryDate(retry, true) <= attemptedAt) {
+            throw new RangeError('Notification retry cursor must advance');
+          }
+          updates[cursor] = retry;
+        } else if (retry !== undefined) {
+          throw new RangeError('Notification retry cursor was not due');
+        }
+      }
+    }
+  }
+  if (Reflect.ownKeys(failure).some((key) => !allowed.has(key))) {
+    throw new TypeError('Notification delivery failure has unexpected fields');
+  }
+  if (failure.type !== 'retry') {
+    updates.status = 'discarded';
+    updates.deliveryReason = 'delivery-attempts-exhausted';
+    updates.discardedAt = failure.updatedAt;
+    updates.deliverAt = null;
+    updates.summaryAt = null;
+  }
+  return updates;
+}
+
 function validLimit(limit: number | undefined): limit is number {
   return limit !== undefined && Number.isSafeInteger(limit) && limit >= 0;
 }
@@ -145,7 +333,10 @@ function isDuplicateColumn(error: unknown): boolean {
  */
 export const NOTIFICATION_SEQUENCE_TABLE = 'flowsafe_notification_sequence';
 
-export class D1NotificationsStorage extends NotificationsStorage {
+export class D1NotificationsStorage
+  extends NotificationsStorage
+  implements NotificationDeliveryStorage
+{
   readonly #db: SignalDatabase;
   readonly #table: string;
   readonly #sequenceTable: string;
@@ -493,7 +684,7 @@ export class D1NotificationsStorage extends NotificationsStorage {
     const { results } = await this.#db
       .prepare(
         `SELECT * FROM ${this.#table} WHERE ${clauses.join(' AND ')}
-         ORDER BY updatedAt DESC${sqlLimit !== undefined ? ' LIMIT ?' : ''}`,
+         ORDER BY ${notificationTimestampSql('updatedAt')} DESC${sqlLimit !== undefined ? ' LIMIT ?' : ''}`,
       )
       .bind(...binds)
       .all<NotificationRow>();
@@ -525,8 +716,8 @@ export class D1NotificationsStorage extends NotificationsStorage {
   async listDueNotifications(
     input: ListDueNotificationsInput,
   ): Promise<NotificationRecord[]> {
+    const now = notificationTimestampMillis(input.now);
     await this.#ensureSchema();
-    const now = input.now.toISOString();
     const clauses = [DUE_NOTIFICATION_SQL];
     const binds: unknown[] = [now, now];
     if (input.agentId !== undefined) {
@@ -541,16 +732,22 @@ export class D1NotificationsStorage extends NotificationsStorage {
     if (sqlLimit !== undefined) binds.push(sqlLimit);
     const { results } = await this.#db
       .prepare(
-        `SELECT * FROM ${this.#table}
-         WHERE ${clauses.join(' AND ')}
+        `SELECT * FROM (
+           SELECT *,
+             ${notificationTimestampSql('deliverAt')} AS deliveryTime,
+             ${notificationTimestampSql('summaryAt')} AS summaryTime,
+             ${notificationTimestampSql('updatedAt')} AS updatedTime
+           FROM ${this.#table}
+           WHERE ${clauses.join(' AND ')}
+         )
          ORDER BY
            CASE
-             WHEN deliverAt IS NULL THEN summaryAt
-             WHEN summaryAt IS NULL THEN deliverAt
-             WHEN deliverAt <= summaryAt THEN deliverAt
-             ELSE summaryAt
+             WHEN deliveryTime IS NULL THEN summaryTime
+             WHEN summaryTime IS NULL THEN deliveryTime
+             WHEN deliveryTime <= summaryTime THEN deliveryTime
+             ELSE summaryTime
            END ASC,
-           updatedAt ASC${sqlLimit !== undefined ? ' LIMIT ?' : ''}`,
+           updatedTime ASC${sqlLimit !== undefined ? ' LIMIT ?' : ''}`,
       )
       .bind(...binds)
       .all<NotificationRow>();
@@ -652,6 +849,68 @@ export class D1NotificationsStorage extends NotificationsStorage {
       );
     }
     return rowToRecord(updated);
+  }
+
+  async updateNotificationDeliveryIfUnchanged(input: {
+    expected: NotificationDeliveryObservation;
+    failure: NotificationDeliveryFailure;
+  }): Promise<NotificationDeliveryUpdateResult> {
+    const expected = { ...input.expected };
+    const failure = { ...input.failure };
+    const expectedValues = NOTIFICATION_COLUMNS.map(
+      (column) => expected[column === 'thread_id' ? 'threadId' : column],
+    );
+    validateNotificationDeliveryValues(expectedValues, true);
+    if (expected.status !== 'pending' || expected.deliveredSignalId) {
+      return { applied: false };
+    }
+    const updates = notificationFailureUpdates(expected, failure);
+    const targetValues = NOTIFICATION_COLUMNS.map((column, index) =>
+      Object.hasOwn(updates, column) ? updates[column] : expectedValues[index],
+    );
+    const entries = Object.entries(updates);
+    const sets = entries.map(([column]) => `${column} = ?`);
+    const setValues = entries.map(([, value]) => value);
+
+    await this.#ensureSchema();
+    const row = await this.#db
+      .prepare(
+        `SELECT * FROM ${this.#table}
+         WHERE thread_id COLLATE BINARY IS ? AND id COLLATE BINARY IS ?`,
+      )
+      .bind(expected.threadId, expected.id)
+      .first<NotificationRow>();
+    if (row === null) return { applied: false };
+    const rawValues = notificationDeliveryRowValues(row);
+    const currentValues = recordValues(rowToRecord(row));
+    if (currentValues.some((value, index) => value !== expectedValues[index])) {
+      return { applied: false };
+    }
+    const guards = NOTIFICATION_COLUMNS.map(
+      (column) => `${column} COLLATE BINARY IS ?`,
+    );
+    const updated = await this.#db
+      .prepare(
+        `UPDATE ${this.#table}
+         SET ${sets.join(', ')}
+         WHERE status COLLATE BINARY IS 'pending'
+           AND (deliveredSignalId IS NULL OR deliveredSignalId = '')
+           AND ${guards.join(' AND ')}
+         RETURNING *`,
+      )
+      .bind(...setValues, ...rawValues)
+      .first<NotificationRow>();
+    if (updated === null) return { applied: false };
+    notificationDeliveryRowValues(updated);
+    const record = rowToRecord(updated);
+    if (
+      recordValues(record).some((value, index) => value !== targetValues[index])
+    ) {
+      throw new Error(
+        'Notification delivery update returned a different receipt',
+      );
+    }
+    return { applied: true, record };
   }
 
   async dangerouslyClearAll(): Promise<void> {

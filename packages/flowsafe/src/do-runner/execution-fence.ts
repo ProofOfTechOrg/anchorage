@@ -33,34 +33,60 @@
 //   it is logged, swallowed, and left for the next wake, because a thrown alarm
 //   is retried by workerd and would answer a storage incident with a storm.
 //
-// ABSENT ROW (and absent TABLE) READ AS `open`. That is the 0.19-to-0.20
+// An absent legacy row (or absent TABLE) reads as `open`. That is the 0.19-to-0.20
 // upgrade rule and nothing more: a database seeded before this table existed
 // must keep serving. Provisioning writes an explicit row from 0.20 on, so a
 // deployment that means to start locked says so rather than relying on a
 // default — `seed()` therefore takes the state as a REQUIRED argument.
 
 import {
-  EXECUTION_FENCE_DDL,
+  type DeploymentIdentityProtocolExecutor,
+  type DeploymentIdentityProtocolRow,
+  decodeExecutionFenceMutationMetadata,
+  EXECUTION_FENCE_CURRENT_SCHEMA_STAGE,
   EXECUTION_FENCE_ROW_ID,
   EXECUTION_FENCE_STATES,
   EXECUTION_FENCE_TABLE,
+  type ExecutionFenceSchemaStage,
+  initializeExecutionFenceProtocol,
+  readExecutionFenceSchemaProtocol,
 } from '#deployment-identity-protocol';
 import { missingTableReadsEmpty } from './cause-chain.js';
 import { DoStatusError } from './do-status-error.js';
+import {
+  type D1RunExecutionIdentity,
+  type D1StartExecutionIdentity,
+  ExecutionFenceUnreadableError,
+  InvalidExecutionIdentityError,
+  normalizeD1RunExecutionIdentity,
+  normalizeMutationEpoch,
+  normalizeStartExecutionIdentity,
+  type ProofEntryExpectation,
+  type RunExecutionIdentity,
+} from './execution-admission.js';
+import { RUN_PROVENANCE_CONTEXT_KEY } from './execution-context.js';
 import { isPathSafeId } from './path-safe-id.js';
+import {
+  decodeProgressRunProvenance,
+  decodeRunStartIdentity,
+} from './run-provenance.js';
+import { isRunStatus } from './run-terminal-state.js';
+import {
+  captureBoundReservation,
+  decodeStartReservationAdmissionResult,
+  START_IDEMPOTENCY_TABLE,
+  type StartReservationReading,
+  sameReservationIdentity,
+  validateStartReservationAdmissionSchema,
+} from './start-reservation-contract.js';
+import {
+  type D1RunAddress,
+  decodeRawWorkflowSnapshotResult,
+  prepareRawWorkflowSnapshotRead,
+  type RawWorkflowSnapshot,
+} from './workflow-snapshot-row.js';
 
-/**
- * Rows affected by a write, read from D1's `{ meta: { changes } }` envelope —
- * the same accessor d1-storage exports as `d1Changes`, restated here so this
- * module imports only leaf modules. Every surface that consults the fence
- * imports it, including ones that must not drag the D1 storage adapter (and
- * @mastra/cloudflare-d1 with it) into their bundle.
- */
-function changesOf(result: unknown): number {
-  const changes = (result as { meta?: { changes?: number } } | undefined)?.meta
-    ?.changes;
-  return typeof changes === 'number' ? changes : 0;
-}
+export { ExecutionFenceUnreadableError } from './execution-admission.js';
 
 /**
  * The state vocabulary, the table, that table's fixed row key, and the DDL
@@ -122,12 +148,28 @@ export interface ExecutionFenceReading {
   readonly proofKey?: string;
   /** The run the proof-only state has already admitted, once one started. */
   readonly proofRunId?: string;
+  readonly mutationEpoch?: number;
+  readonly requireMutationEpoch?: boolean;
+  readonly transitionRevision?: number;
+  /** Server-side proof identity; omitted from the admin JSON projection. */
+  readonly proofExecution?: D1RunExecutionIdentity;
+}
+
+/** An authoritative store reading, including durable administrative versioning. */
+export interface ExecutionFenceVersionedReading extends ExecutionFenceReading {
+  readonly mutationEpoch: number;
+  readonly requireMutationEpoch: boolean;
+  readonly transitionRevision: number;
 }
 
 /** The reading every unfenced surface uses — see `ExecutionFenceStore` absence. */
-export const OPEN_EXECUTION_FENCE: ExecutionFenceReading = Object.freeze({
-  state: 'open',
-});
+export const OPEN_EXECUTION_FENCE: ExecutionFenceVersionedReading =
+  Object.freeze({
+    state: 'open',
+    mutationEpoch: 0,
+    requireMutationEpoch: false,
+    transitionRevision: 0,
+  });
 
 /**
  * Read the fence a surface was wired with, resolving the typed opt-out.
@@ -147,7 +189,7 @@ export const OPEN_EXECUTION_FENCE: ExecutionFenceReading = Object.freeze({
  */
 export async function readExecutionFence(
   fence: ExecutionFenceWiring | undefined,
-): Promise<ExecutionFenceReading> {
+): Promise<ExecutionFenceVersionedReading> {
   if (fence === undefined || fence === 'none') return OPEN_EXECUTION_FENCE;
   return fence.read();
 }
@@ -239,31 +281,38 @@ export class FenceTransitionConflictError extends DoStatusError {
   readonly reason: {
     readonly code: 'FENCE_CAS_CONFLICT';
     readonly state: ExecutionFenceState;
+    readonly mutationEpoch?: number;
+    readonly requireMutationEpoch?: boolean;
+    readonly transitionRevision?: number;
+    readonly proofKey?: string;
+    readonly proofRunId?: string;
+    readonly conflict?:
+      | 'expectation-mismatch'
+      | 'versioned-expectation-required';
   };
 
-  constructor(expected: ExecutionFenceState, current: ExecutionFenceState) {
+  constructor(
+    expected: ExecutionFenceState,
+    current: ExecutionFenceState,
+    details?: {
+      reading: ExecutionFenceVersionedReading;
+      conflict: 'expectation-mismatch' | 'versioned-expectation-required';
+    },
+  ) {
     super(
-      `execution fence transition expected state '${expected}' but found '${current}'`,
+      details === undefined
+        ? `execution fence transition expected state '${expected}' but found '${current}'`
+        : 'execution fence transition conflicts with the current reading',
     );
     this.name = 'FenceTransitionConflictError';
-    this.reason = { code: 'FENCE_CAS_CONFLICT', state: current };
-  }
-}
-
-/**
- * The fence could not be READ. Deliberately distinct from
- * ExecutionFencedError: no state was observed, so nothing may conclude the
- * deployment is open — which is why this carries the same 503 a refusal does
- * and every request-path caller lets it propagate.
- */
-export class ExecutionFenceUnreadableError extends DoStatusError {
-  readonly status = 503;
-  readonly reason: { readonly code: 'EXECUTION_FENCE_UNREADABLE' };
-
-  constructor(message: string, options?: ErrorOptions) {
-    super(message, options);
-    this.name = 'ExecutionFenceUnreadableError';
-    this.reason = { code: 'EXECUTION_FENCE_UNREADABLE' };
+    this.reason =
+      details === undefined
+        ? { code: 'FENCE_CAS_CONFLICT', state: current }
+        : {
+            code: 'FENCE_CAS_CONFLICT',
+            ...executionFenceReadingPayload(details.reading),
+            conflict: details.conflict,
+          };
   }
 }
 
@@ -303,17 +352,30 @@ export function executionFencedResponse(
  * null would invite a caller to read "no proof run yet" out of a state that has
  * no proof at all.
  */
-export function executionFenceReadingPayload(reading: ExecutionFenceReading): {
-  state: ExecutionFenceState;
-  proofKey?: string;
-  proofRunId?: string;
-} {
+export function executionFenceReadingPayload(
+  reading: ExecutionFenceVersionedReading,
+): ExecutionFenceVersionedReading;
+export function executionFenceReadingPayload(
+  reading: ExecutionFenceReading,
+): ExecutionFenceReading;
+export function executionFenceReadingPayload(
+  reading: ExecutionFenceReading,
+): ExecutionFenceReading {
   return {
     state: reading.state,
     ...(reading.proofKey === undefined ? {} : { proofKey: reading.proofKey }),
     ...(reading.proofRunId === undefined
       ? {}
       : { proofRunId: reading.proofRunId }),
+    ...(reading.mutationEpoch === undefined
+      ? {}
+      : { mutationEpoch: reading.mutationEpoch }),
+    ...(reading.requireMutationEpoch === undefined
+      ? {}
+      : { requireMutationEpoch: reading.requireMutationEpoch }),
+    ...(reading.transitionRevision === undefined
+      ? {}
+      : { transitionRevision: reading.transitionRevision }),
   };
 }
 
@@ -363,7 +425,7 @@ const FENCE_REFUSAL_CODES: ReadonlySet<string> = new Set([
  *
  * The two codes are matched by name rather than by any structural sniff: only
  * refusals this package authors publish them, and both are declared as literals
- * on the classes above, so a code arriving over the wire came from one of them.
+ * on the corresponding error classes, so a code arriving over the wire came from one of them.
  */
 export function isExecutionFenceRefusal(
   error: unknown,
@@ -466,15 +528,30 @@ export function admitsRunStart(
  */
 export function admitsExistingRun(
   reading: ExecutionFenceReading,
-  runId?: string,
+  candidate?: string | RunExecutionIdentity,
 ): boolean {
   if (reading.state === 'open' || reading.state === 'draining') return true;
-  if (reading.state !== 'proof-only') return false;
-  return (
-    reading.proofRunId !== undefined &&
-    runId !== undefined &&
-    runId === reading.proofRunId
-  );
+  if (
+    reading.state !== 'proof-only' ||
+    typeof candidate !== 'object' ||
+    candidate === null ||
+    candidate.tablePrefix === null
+  )
+    return false;
+  try {
+    const execution = normalizeD1RunExecutionIdentity(candidate);
+    const proof = reading.proofExecution;
+    return (
+      execution.tablePrefix === candidate.tablePrefix &&
+      proof !== undefined &&
+      proof.tablePrefix === execution.tablePrefix &&
+      proof.workflowId === execution.workflowId &&
+      proof.runId === execution.runId &&
+      proof.startToken === execution.startToken
+    );
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -499,34 +576,268 @@ export function admitsDrainableExecution(
   return reading.state === 'open' || reading.state === 'draining';
 }
 
-interface ExecutionFenceRow {
-  state?: unknown;
-  proof_key?: unknown;
-  proof_run_id?: unknown;
+type FenceTransitionReceipt = readonly [
+  1,
+  ExecutionFenceState,
+  ExecutionFenceState,
+  string | null,
+  number,
+  number,
+  boolean,
+];
+
+interface StoredExecutionFence {
+  reading: ExecutionFenceVersionedReading;
+  receipt: string | null;
+  schemaStage: ExecutionFenceSchemaStage;
+  raw: DeploymentIdentityProtocolRow;
 }
 
-function readingFromRow(row: ExecutionFenceRow): ExecutionFenceReading {
+/** @internal Exact current-stage observation for initial admission. */
+export interface ExecutionFenceAdmissionObservation {
+  readonly reading: ExecutionFenceVersionedReading;
+  readonly schemaStage: 7;
+  readonly raw: DeploymentIdentityProtocolRow;
+}
+
+const FENCE_ADMISSION_FIELDS = [
+  'state',
+  'mutation_epoch',
+  'require_mutation_epoch',
+  'transition_revision',
+  'last_transition_request',
+  'proof_key',
+  'proof_run_id',
+  'proof_table_prefix',
+  'proof_workflow_id',
+  'proof_start_token',
+] as const;
+
+/** @internal */
+export function executionFenceAdmissionValues(
+  observation: ExecutionFenceAdmissionObservation,
+): readonly unknown[] {
+  const values = FENCE_ADMISSION_FIELDS.map((key) => observation.raw[key]);
+  for (const value of values.slice(4)) {
+    if (value !== null && typeof value !== 'string') {
+      throw new ExecutionFenceUnreadableError(
+        'execution fence semantic fields are not readable',
+      );
+    }
+  }
+  return Object.freeze(values);
+}
+
+/** @internal */
+export function executionFenceAdmissionSql(input: {
+  readonly callerEpoch: string;
+  readonly semantic: readonly string[];
+  readonly schema: string;
+  readonly statePredicate: string;
+}): string {
+  const { callerEpoch, semantic, schema, statePredicate } = input;
+  if (semantic.length !== FENCE_ADMISSION_FIELDS.length) {
+    throw new Error('execution fence admission parameter frame is invalid');
+  }
+  const nullable = FENCE_ADMISSION_FIELDS.slice(4)
+    .map((key, index) => {
+      const parameter = semantic[index + 4];
+      return `typeof(f.${key}) IN ('null', 'text')
+      AND typeof(f.${key}) = typeof(${parameter})
+      AND f.${key} COLLATE BINARY IS ${parameter}`;
+    })
+    .join(' AND ');
+  return `(SELECT json_group_array(json_array(name, type, "notnull", dflt_value, pk, hidden))
+    FROM (SELECT name, type, "notnull", dflt_value, pk, hidden
+      FROM pragma_table_xinfo('${EXECUTION_FENCE_TABLE}') ORDER BY cid)) COLLATE BINARY = ${schema}
+    AND (SELECT COUNT(*) FROM ${EXECUTION_FENCE_TABLE}) = 1
+    AND EXISTS (SELECT 1 FROM ${EXECUTION_FENCE_TABLE} AS f
+      WHERE typeof(f.id) = 'text' AND f.id COLLATE BINARY = 'deployment'
+        AND typeof(f.state) = 'text' AND f.state COLLATE BINARY IS ${semantic[0]}
+        AND typeof(f.mutation_epoch) = 'integer' AND f.mutation_epoch IS ${semantic[1]}
+        AND typeof(f.require_mutation_epoch) = 'integer' AND f.require_mutation_epoch IS ${semantic[2]}
+        AND typeof(f.transition_revision) = 'integer' AND f.transition_revision IS ${semantic[3]}
+        AND ${nullable}
+        AND (f.require_mutation_epoch = 0 OR f.mutation_epoch = ${callerEpoch})
+        AND (${statePredicate}))`;
+}
+
+function isFenceCounter(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function decodeTransitionReceipt(text: string): FenceTransitionReceipt {
+  const value: unknown = JSON.parse(text);
+  if (
+    text.length > 512 ||
+    !Array.isArray(value) ||
+    value.length !== 7 ||
+    value[0] !== 1 ||
+    !isExecutionFenceState(value[1]) ||
+    !isExecutionFenceState(value[2]) ||
+    (value[2] === 'proof-only' ? !isPathSafeId(value[3]) : value[3] !== null) ||
+    !isFenceCounter(value[4]) ||
+    !isFenceCounter(value[5]) ||
+    value[5] === Number.MAX_SAFE_INTEGER ||
+    typeof value[6] !== 'boolean' ||
+    (value[6] && value[4] === Number.MAX_SAFE_INTEGER) ||
+    JSON.stringify(value) !== text
+  ) {
+    throw new Error('execution fence transition receipt is malformed');
+  }
+  return [1, value[1], value[2], value[3], value[4], value[5], value[6]];
+}
+
+function readingFromRow(
+  row: DeploymentIdentityProtocolRow,
+): StoredExecutionFence {
+  row = Object.freeze(
+    Object.fromEntries(
+      Object.getOwnPropertyNames(row).map((key) => [key, row[key]]),
+    ),
+  );
+  const metadata = decodeExecutionFenceMutationMetadata(row);
   const { state } = row;
-  if (!isExecutionFenceState(state)) {
-    // Fail CLOSED on a state name this build does not know: a hand-edited row,
-    // or a row written by a NEWER flowsafe that added a state. Returning
-    // `open` for either would answer "I do not understand this fence" with
-    // "there is no fence", which is the one answer that must never be wrong.
-    throw new ExecutionFenceUnreadableError(
-      `execution fence row carries an unrecognized state '${String(state)}'`,
-    );
+  if (row.id !== EXECUTION_FENCE_ROW_ID || !isExecutionFenceState(state)) {
+    throw new Error('execution fence row is not a recognized singleton');
   }
   const proofKey = row.proof_key;
   const proofRunId = row.proof_run_id;
+  let proofExecution: D1RunExecutionIdentity | undefined;
+  if (metadata.proofStartToken !== null) {
+    proofExecution = normalizeD1RunExecutionIdentity({
+      tablePrefix: metadata.proofTablePrefix,
+      workflowId: metadata.proofWorkflowId,
+      runId: proofRunId,
+      startToken: metadata.proofStartToken,
+    });
+    if (
+      proofExecution.tablePrefix !== metadata.proofTablePrefix ||
+      !isPathSafeId(proofKey)
+    ) {
+      throw new Error('execution fence proof identity is not canonical');
+    }
+  }
+  if (metadata.lastTransitionRequest !== null) {
+    const [, , next, key, epoch, revision, advance] = decodeTransitionReceipt(
+      metadata.lastTransitionRequest,
+    );
+    if (
+      state !== next ||
+      metadata.mutationEpoch !== epoch + Number(advance) ||
+      metadata.transitionRevision !== revision + 1 ||
+      (state === 'proof-only'
+        ? proofKey !== key || (proofRunId !== null && !isPathSafeId(proofRunId))
+        : proofKey !== null || proofRunId !== null)
+    ) {
+      throw new Error(
+        'execution fence row disagrees with its transition receipt',
+      );
+    }
+  }
   return {
-    state,
-    ...(typeof proofKey === 'string' && proofKey.length > 0
-      ? { proofKey }
-      : {}),
-    ...(typeof proofRunId === 'string' && proofRunId.length > 0
-      ? { proofRunId }
-      : {}),
+    reading: {
+      state,
+      mutationEpoch: metadata.mutationEpoch,
+      requireMutationEpoch: metadata.requireMutationEpoch,
+      transitionRevision: metadata.transitionRevision,
+      ...(proofExecution === undefined ? {} : { proofExecution }),
+      ...(typeof proofKey === 'string' && proofKey.length > 0
+        ? { proofKey }
+        : {}),
+      ...(typeof proofRunId === 'string' && proofRunId.length > 0
+        ? { proofRunId }
+        : {}),
+    },
+    receipt: metadata.lastTransitionRequest,
+    schemaStage: metadata.schemaStage,
+    raw: row,
   };
+}
+
+function fenceResultRows(result: unknown): DeploymentIdentityProtocolRow[] {
+  if (
+    result === null ||
+    typeof result !== 'object' ||
+    ('success' in result && result.success !== true) ||
+    !('results' in result)
+  ) {
+    throw new Error('execution fence statement returned an invalid result');
+  }
+  const rows: unknown = result.results;
+  if (!Array.isArray(rows))
+    throw new Error('execution fence statement returned an invalid result');
+  const length = rows.length;
+  if (!Number.isSafeInteger(length) || length < 0)
+    throw new Error('execution fence statement returned an invalid result');
+  return Array.from({ length }, (_, index) => {
+    if (!Object.hasOwn(rows, index))
+      throw new Error('execution fence statement returned an invalid row');
+    const row = rows[index];
+    if (row === null || typeof row !== 'object' || Array.isArray(row)) {
+      throw new Error('execution fence statement returned an invalid row');
+    }
+    return row;
+  });
+}
+
+function returningFence(result: unknown): StoredExecutionFence | undefined {
+  const rows = fenceResultRows(result);
+  if (rows.length > 1)
+    throw new Error('execution fence UPDATE returned multiple rows');
+  const row = rows[0];
+  if (row === undefined) return undefined;
+  const stored = readingFromRow(row);
+  if (stored.schemaStage !== EXECUTION_FENCE_CURRENT_SCHEMA_STAGE)
+    throw new Error('execution fence UPDATE returned a legacy row');
+  return stored;
+}
+
+/** @internal Validate an already-observed current-schema RETURNING row. */
+export function decodeExecutionFenceAdmissionRow(
+  row: DeploymentIdentityProtocolRow,
+): ExecutionFenceAdmissionObservation {
+  const stored = readingFromRow(row);
+  if (stored.schemaStage !== 7)
+    throw new Error('initial admission requires current fence metadata');
+  return Object.freeze({
+    reading: Object.freeze(stored.reading),
+    schemaStage: 7,
+    raw: stored.raw,
+  });
+}
+
+/** @internal Validate actual PRAGMA rows from a consistent readback batch. */
+export async function validateExecutionFenceAdmissionSchema(
+  result: unknown,
+): Promise<void> {
+  const columns = fenceResultRows(result);
+  if ((await readExecutionFenceSchemaProtocol(async () => columns)) !== 7)
+    throw new Error('initial admission requires the current fence schema');
+}
+
+/** @internal */
+export async function captureExecutionFenceAdmissionSchema(
+  result: unknown,
+): Promise<string> {
+  const rows = fenceResultRows(result).map((row) =>
+    Object.freeze(
+      Object.fromEntries(
+        Object.getOwnPropertyNames(row).map((key) => [key, row[key]]),
+      ),
+    ),
+  );
+  await validateExecutionFenceAdmissionSchema({ results: rows });
+  return JSON.stringify(
+    rows.map(({ name, type, notnull, dflt_value, pk, hidden }) => [
+      name,
+      type,
+      notnull,
+      dflt_value,
+      pk,
+      hidden,
+    ]),
+  );
 }
 
 /**
@@ -543,6 +854,73 @@ function readingFromRow(row: ExecutionFenceRow): ExecutionFenceReading {
  */
 function isMissingFenceTable(error: unknown): boolean {
   return missingTableReadsEmpty(error, EXECUTION_FENCE_TABLE);
+}
+
+async function selectedProofObservation(
+  db: ExecutionFenceDatabase,
+  address: D1RunAddress,
+) {
+  try {
+    const prepared = prepareRawWorkflowSnapshotRead(db, address);
+    const raw = decodeRawWorkflowSnapshotResult(
+      await prepared.statement.all(),
+      prepared.address,
+    );
+    if (raw === undefined) return undefined;
+    const snapshot: unknown = JSON.parse(raw.snapshot);
+    if (
+      snapshot === null ||
+      typeof snapshot !== 'object' ||
+      Array.isArray(snapshot)
+    )
+      throw new Error('proof snapshot is malformed');
+    const state = snapshot as Record<string, unknown>;
+    if (state.runId !== raw.runId || !isRunStatus(state.status))
+      throw new Error('proof snapshot identity or status is malformed');
+    for (const key of ['requestContext', 'context', 'steps']) {
+      const value = state[key];
+      if (
+        value !== undefined &&
+        (value === null || typeof value !== 'object' || Array.isArray(value))
+      )
+        throw new Error('proof snapshot container is malformed');
+    }
+    const source = (
+      state.requestContext as Record<string, unknown> | undefined
+    )?.[RUN_PROVENANCE_CONTEXT_KEY];
+    const start = decodeRunStartIdentity(source);
+    if (start === undefined) return { raw, status: state.status };
+    const provenance = decodeProgressRunProvenance(source);
+    const execution = normalizeD1RunExecutionIdentity({
+      ...prepared.address,
+      startToken: provenance.startToken,
+    });
+    return { raw, status: state.status, execution, provenance };
+  } catch (cause) {
+    throw new ExecutionFenceUnreadableError('proof snapshot is not readable', {
+      cause,
+    });
+  }
+}
+
+function reservationValues(row: StartReservationReading): unknown[] {
+  if (row.binding.kind !== 'bound')
+    throw new InvalidExecutionIdentityError('admission');
+  return [
+    row.key,
+    row.owner.kind,
+    row.owner.id,
+    row.targetKind,
+    row.targetId,
+    row.runId,
+    row.threadId ?? null,
+    row.state,
+    row.createdAt,
+    row.updatedAt,
+    row.binding.execution.startToken,
+    row.binding.execution.tablePrefix,
+    row.binding.execution.workflowId,
+  ];
 }
 
 export interface ExecutionFenceStoreOptions {
@@ -567,6 +945,9 @@ export interface ExecutionFenceTransition {
    * field exists to police arrived pre-blessed at the type level.
    */
   proofKey?: unknown;
+  expectedMutationEpoch?: unknown;
+  expectedRevision?: unknown;
+  advanceMutationEpoch?: unknown;
 }
 
 /**
@@ -594,32 +975,41 @@ export class ExecutionFenceStore {
    * question, and would turn a read-only replica or a revoked-write incident
    * into an outage instead of a degrade.
    *
-   * A missing table and a missing row both read as `open` — the 0.19 upgrade
-   * rule. Anything else that fails becomes ExecutionFenceUnreadableError, so
-   * no caller can mistake a storage fault for an open deployment.
+   * A missing table or missing legacy row reads as `open`. A missing modern row is
+   * unreadable and is never silently recreated.
    */
-  async read(): Promise<ExecutionFenceReading> {
-    let rows: ExecutionFenceRow[];
+  async read(): Promise<ExecutionFenceVersionedReading> {
+    return (await this.#readStored())?.reading ?? OPEN_EXECUTION_FENCE;
+  }
+
+  usesDatabase(binding: object): boolean {
+    return this.#db === binding;
+  }
+
+  /** @internal Pure strict observation; seed only on the admission preparation path. */
+  async readForAdmission(): Promise<ExecutionFenceAdmissionObservation> {
     try {
-      rows = (
+      const rows = fenceResultRows(
         await this.#db
-          .prepare(
-            `SELECT state, proof_key, proof_run_id FROM ${EXECUTION_FENCE_TABLE}
-             WHERE id = ?`,
-          )
-          .bind(EXECUTION_FENCE_ROW_ID)
-          .all<ExecutionFenceRow>()
-      ).results;
+          .prepare(`SELECT * FROM ${EXECUTION_FENCE_TABLE} LIMIT 2`)
+          .all(),
+      );
+      const row = rows[0];
+      if (rows.length !== 1 || row === undefined)
+        throw new Error('initial admission requires an exact fence singleton');
+      const observation = decodeExecutionFenceAdmissionRow(row);
+      await validateExecutionFenceAdmissionSchema(
+        await this.#db
+          .prepare(`PRAGMA table_xinfo(${EXECUTION_FENCE_TABLE})`)
+          .all(),
+      );
+      return observation;
     } catch (error) {
-      if (isMissingFenceTable(error)) return OPEN_EXECUTION_FENCE;
       throw new ExecutionFenceUnreadableError(
-        'execution fence state is not readable',
+        'initial admission requires current fence metadata',
         { cause: error },
       );
     }
-    const row = rows[0];
-    if (row === undefined) return OPEN_EXECUTION_FENCE;
-    return readingFromRow(row);
   }
 
   /**
@@ -638,15 +1028,8 @@ export class ExecutionFenceStore {
    */
   async seed(state: ExecutionFenceState): Promise<void> {
     const safeState = assertExecutionFenceState(state, 'seed state');
-    await this.#createTable();
-    await this.#db
-      .prepare(
-        `INSERT OR IGNORE INTO ${EXECUTION_FENCE_TABLE}
-           (id, state, proof_key, proof_run_id, updated_at)
-         VALUES (?, ?, NULL, NULL, ?)`,
-      )
-      .bind(EXECUTION_FENCE_ROW_ID, safeState, this.#now())
-      .run();
+    await this.#initialize(safeState);
+    await this.#readStored();
   }
 
   /**
@@ -662,51 +1045,112 @@ export class ExecutionFenceStore {
    */
   async transition(
     input: ExecutionFenceTransition,
-  ): Promise<ExecutionFenceReading> {
+  ): Promise<ExecutionFenceVersionedReading> {
     const expected = assertExecutionFenceState(
       input.expected,
       'expected state',
     );
     const next = assertExecutionFenceState(input.next, 'next state');
     const proofKey = this.#proofKeyFor(next, input.proofKey);
-    await this.#createTable();
-    // Materialize the implicit-open row of a pre-0.20 database. INSERT OR
-    // IGNORE, so a seeded database is untouched and the CAS below is still the
-    // only thing that decides the outcome.
-    await this.#db
-      .prepare(
-        `INSERT OR IGNORE INTO ${EXECUTION_FENCE_TABLE}
-           (id, state, proof_key, proof_run_id, updated_at)
-         VALUES (?, 'open', NULL, NULL, ?)`,
-      )
-      .bind(EXECUTION_FENCE_ROW_ID, this.#now())
-      .run();
-    // proof_run_id is cleared unconditionally: ENTERING proof-only must not
-    // inherit a previous proof's run, and LEAVING it must not leave a stale
-    // admission behind for the next one to trip over.
-    const changed = changesOf(
-      await this.#db
-        .prepare(
-          `UPDATE ${EXECUTION_FENCE_TABLE}
-             SET state = ?, proof_key = ?, proof_run_id = NULL, updated_at = ?
-           WHERE id = ? AND state = ?`,
-        )
-        .bind(
-          next,
-          proofKey ?? null,
-          this.#now(),
-          EXECUTION_FENCE_ROW_ID,
-          expected,
-        )
-        .run(),
-    );
-    if (changed === 0) {
-      throw new FenceTransitionConflictError(
-        expected,
-        (await this.read()).state,
+    const { expectedMutationEpoch: epoch, expectedRevision: revision } = input;
+    const rawAdvance = input.advanceMutationEpoch;
+    const advance = rawAdvance ?? false;
+    const upgraded = epoch !== undefined || revision !== undefined;
+    if (
+      (rawAdvance !== undefined && typeof rawAdvance !== 'boolean') ||
+      (upgraded && (!isFenceCounter(epoch) || !isFenceCounter(revision))) ||
+      (advance && !upgraded) ||
+      revision === Number.MAX_SAFE_INTEGER ||
+      (advance && epoch === Number.MAX_SAFE_INTEGER)
+    ) {
+      throw new InvalidExecutionFenceRequestError(
+        'fence expectations must be paired safe counters and advanceMutationEpoch must be boolean',
       );
     }
-    return { state: next, ...(proofKey === undefined ? {} : { proofKey }) };
+    const receipt = upgraded
+      ? JSON.stringify([
+          1,
+          expected,
+          next,
+          proofKey ?? null,
+          epoch,
+          revision,
+          advance,
+        ])
+      : null;
+    await this.#initialize('open');
+    await this.#readStored();
+    let result: unknown;
+    try {
+      const statement = upgraded
+        ? this.#db
+            .prepare(
+              `UPDATE ${EXECUTION_FENCE_TABLE}
+           SET state = ?1, proof_key = ?2, proof_run_id = NULL,
+               proof_table_prefix = NULL, proof_workflow_id = NULL, proof_start_token = NULL,
+               mutation_epoch = mutation_epoch + ?3,
+               require_mutation_epoch = CASE WHEN ?3 = 1 THEN 1 ELSE require_mutation_epoch END,
+               transition_revision = transition_revision + 1,
+               last_transition_request = ?4, updated_at = ?5
+           WHERE id = ?6 AND state = ?7
+             AND mutation_epoch = ?8 AND transition_revision = ?9
+             AND require_mutation_epoch IN (0, 1)
+             AND transition_revision < 9007199254740991
+             AND (?3 = 0 OR mutation_epoch < 9007199254740991)
+           RETURNING *`,
+            )
+            .bind(
+              next,
+              proofKey ?? null,
+              Number(advance),
+              receipt,
+              this.#now(),
+              EXECUTION_FENCE_ROW_ID,
+              expected,
+              epoch,
+              revision,
+            )
+        : this.#db
+            .prepare(
+              `UPDATE ${EXECUTION_FENCE_TABLE}
+           SET state = ?, proof_key = ?, proof_run_id = NULL,
+               proof_table_prefix = NULL, proof_workflow_id = NULL, proof_start_token = NULL,
+               transition_revision = transition_revision + 1,
+               last_transition_request = NULL, updated_at = ?
+           WHERE id = ? AND state = ? AND require_mutation_epoch = 0
+             AND mutation_epoch = 0 AND transition_revision < 9007199254740991
+           RETURNING *`,
+            )
+            .bind(
+              next,
+              proofKey ?? null,
+              this.#now(),
+              EXECUTION_FENCE_ROW_ID,
+              expected,
+            );
+      result = await statement.all();
+    } catch (error) {
+      if (receipt !== null) {
+        const stored = await this.#readStored().catch(() => undefined);
+        if (stored?.receipt === receipt) return stored.reading;
+      }
+      throw new ExecutionFenceUnreadableError(
+        'execution fence transition could not be recorded',
+        { cause: error },
+      );
+    }
+    const returned = this.#decodeReturned(result);
+    if (returned !== undefined) return returned.reading;
+    const stored = await this.#readStored();
+    if (receipt !== null && stored?.receipt === receipt) return stored.reading;
+    const reading = stored?.reading ?? OPEN_EXECUTION_FENCE;
+    throw new FenceTransitionConflictError(expected, reading.state, {
+      reading,
+      conflict:
+        !upgraded && reading.requireMutationEpoch
+          ? 'versioned-expectation-required'
+          : 'expectation-mismatch',
+    });
   }
 
   /**
@@ -719,7 +1163,16 @@ export class ExecutionFenceStore {
    * Re-writing the SAME runId is admitted so a retry of an interrupted start
    * converges instead of deadlocking on its own earlier write.
    */
-  async recordProofRun(proofKey: string, runId: string): Promise<boolean> {
+  async recordProofRun(
+    proofKey: string,
+    runId: string,
+    admitted?: Pick<
+      ExecutionFenceVersionedReading,
+      'mutationEpoch' | 'transitionRevision'
+    >,
+  ): Promise<boolean> {
+    const epoch = admitted?.mutationEpoch;
+    const revision = admitted?.transitionRevision;
     if (!isPathSafeId(proofKey)) {
       throw new InvalidExecutionFenceRequestError(
         'proofKey must be a URL-path-safe identifier',
@@ -730,27 +1183,303 @@ export class ExecutionFenceStore {
         'proof runId must be a URL-path-safe identifier',
       );
     }
-    try {
-      return (
-        changesOf(
-          await this.#db
-            .prepare(
-              `UPDATE ${EXECUTION_FENCE_TABLE}
-                 SET proof_run_id = ?, updated_at = ?
-               WHERE id = ? AND state = 'proof-only' AND proof_key = ?
-                 AND (proof_run_id IS NULL OR proof_run_id = ?)`,
-            )
-            .bind(runId, this.#now(), EXECUTION_FENCE_ROW_ID, proofKey, runId)
-            .run(),
-        ) > 0
+    if (
+      admitted !== undefined &&
+      (admitted === null ||
+        typeof admitted !== 'object' ||
+        !isFenceCounter(epoch) ||
+        !isFenceCounter(revision))
+    ) {
+      throw new InvalidExecutionFenceRequestError(
+        'proof admission must contain safe epoch and revision counters',
       );
+    }
+    const observed = await this.#readStored();
+    if (observed === undefined) return false;
+    if (observed.schemaStage < EXECUTION_FENCE_CURRENT_SCHEMA_STAGE) {
+      await this.#initialize(observed.reading.state);
+      await this.#readStored();
+    }
+    let result: unknown;
+    try {
+      const statement = this.#db
+        .prepare(
+          `UPDATE ${EXECUTION_FENCE_TABLE}
+       SET updated_at = CASE WHEN proof_run_id IS NULL THEN ? ELSE updated_at END,
+           proof_run_id = ?
+       WHERE id = ? AND state = 'proof-only' AND proof_key = ?
+         AND (proof_run_id IS NULL OR proof_run_id = ?)
+         AND proof_table_prefix IS NULL AND proof_workflow_id IS NULL AND proof_start_token IS NULL
+         AND ${
+           admitted === undefined
+             ? 'require_mutation_epoch = 0 AND mutation_epoch = 0'
+             : 'mutation_epoch = ? AND transition_revision = ?'
+}
+       RETURNING *`,
+        )
+        .bind(
+          this.#now(),
+          runId,
+          EXECUTION_FENCE_ROW_ID,
+          proofKey,
+          runId,
+          ...(admitted === undefined ? [] : [epoch, revision]),
+        );
+      result = await statement.all();
     } catch (error) {
-      // A database with no fence table cannot be in proof-only, so there is
-      // nothing to record and nothing to conclude beyond "not admitted".
-      if (isMissingFenceTable(error)) return false;
+      const stored = await this.#readStored().catch(() => undefined);
+      const reading = stored?.reading;
+      if (
+        reading?.state === 'proof-only' &&
+        reading.proofKey === proofKey &&
+        reading.proofRunId === runId &&
+        reading.proofExecution === undefined &&
+        stored?.raw.proof_table_prefix === null &&
+        stored.raw.proof_workflow_id === null &&
+        stored.raw.proof_start_token === null &&
+        (admitted === undefined
+          ? !reading.requireMutationEpoch && reading.mutationEpoch === 0
+          : reading.mutationEpoch === epoch &&
+            reading.transitionRevision === revision)
+      ) {
+        return true;
+      }
       throw new ExecutionFenceUnreadableError(
         'execution fence proof run could not be recorded',
         { cause: error },
+      );
+    }
+    const returned = this.#decodeReturned(result);
+    if (returned !== undefined) {
+      if (
+        returned.reading.proofExecution !== undefined ||
+        returned.raw.proof_table_prefix !== null ||
+        returned.raw.proof_workflow_id !== null ||
+        returned.raw.proof_start_token !== null
+      )
+        throw new ExecutionFenceUnreadableError(
+          'legacy proof write returned a modern binding',
+        );
+      return true;
+    }
+    await this.#readStored();
+    return false;
+  }
+
+  async readCurrentRunExecution(
+    address: D1RunAddress,
+  ): Promise<D1RunExecutionIdentity | undefined> {
+    return (await selectedProofObservation(this.#db, address))?.execution;
+  }
+
+  async rebindProofRun(options: {
+    reservation: StartReservationReading;
+    execution: D1StartExecutionIdentity;
+    proof: ProofEntryExpectation;
+    mutationEpoch?: number;
+    reservationStore: { usesDatabase(binding: object): boolean };
+  }): Promise<boolean> {
+    const {
+      reservation: input,
+      execution: rawExecution,
+      proof: rawProof,
+      mutationEpoch,
+      reservationStore,
+    } = options;
+    const reservation = captureBoundReservation(input);
+    const { tablePrefix, workflowId, runId, startToken, owner, target } =
+      rawExecution;
+    const normalized = normalizeStartExecutionIdentity({
+      tablePrefix,
+      workflowId,
+      runId,
+      startToken,
+      owner,
+      target,
+    });
+    const execution = normalizeD1RunExecutionIdentity(normalized);
+    const {
+      key,
+      mutationEpoch: epoch,
+      transitionRevision: revision,
+    } = rawProof;
+    const callerEpoch = normalizeMutationEpoch(mutationEpoch);
+    const usesDatabase = reservationStore.usesDatabase;
+    const now = this.#now();
+    if (
+      tablePrefix !== execution.tablePrefix ||
+      key !== reservation.key ||
+      !isFenceCounter(epoch) ||
+      !isFenceCounter(revision) ||
+      typeof now !== 'number' ||
+      !Number.isFinite(now) ||
+      typeof usesDatabase !== 'function' ||
+      !Reflect.apply(usesDatabase, reservationStore, [this.#db]) ||
+      reservation.binding.kind !== 'bound' ||
+      normalized.owner.kind !== reservation.owner.kind ||
+      normalized.owner.id !== reservation.owner.id ||
+      normalized.target.kind !== reservation.targetKind ||
+      normalized.target.id !== reservation.targetId ||
+      (normalized.target.kind === 'agent'
+        ? normalized.target.threadId
+        : undefined) !== reservation.threadId ||
+      !admitsExistingRun(
+        { state: 'proof-only', proofExecution: execution },
+        reservation.binding.execution,
+      )
+    )
+      throw new InvalidExecutionIdentityError('admission');
+    try {
+      const observed = await this.readForAdmission();
+      const requireSchemas = async () => {
+        await validateExecutionFenceAdmissionSchema(
+          await this.#db
+            .prepare(`PRAGMA table_xinfo(${EXECUTION_FENCE_TABLE})`)
+            .all(),
+        );
+        validateStartReservationAdmissionSchema(
+          await this.#db
+            .prepare(`PRAGMA table_xinfo(${START_IDEMPOTENCY_TABLE})`)
+            .all(),
+        );
+      };
+      await requireSchemas();
+      const current = decodeStartReservationAdmissionResult(
+        await this.#db
+          .prepare(
+            `SELECT * FROM ${START_IDEMPOTENCY_TABLE} WHERE key = ? LIMIT 2`,
+          )
+          .bind(key)
+          .all(),
+      );
+      const selected = await selectedProofObservation(this.#db, execution);
+      const reading = observed.reading;
+      if (
+        current === undefined ||
+        current.binding.kind !== 'bound' ||
+        !sameReservationIdentity(current, reservation) ||
+        JSON.stringify(reservationValues(current)) !==
+          JSON.stringify(reservationValues(reservation)) ||
+        selected?.execution === undefined ||
+        selected.status === 'pending' ||
+        !admitsExistingRun(
+          { state: 'proof-only', proofExecution: execution },
+          selected.execution,
+        ) ||
+        selected.provenance?.startIdentity?.owner.kind !==
+          reservation.owner.kind ||
+        selected.provenance.startIdentity.owner.id !== reservation.owner.id ||
+        selected.provenance.startIdentity.target.kind !==
+          reservation.targetKind ||
+        selected.provenance.startIdentity.target.id !== reservation.targetId ||
+        (selected.provenance.startIdentity.target.kind === 'agent'
+          ? selected.provenance.startIdentity.target.threadId
+          : undefined) !== reservation.threadId ||
+        reading.state !== 'proof-only' ||
+        reading.proofKey !== key ||
+        reading.mutationEpoch !== epoch ||
+        reading.transitionRevision !== revision ||
+        (reading.requireMutationEpoch && callerEpoch !== epoch) ||
+        (reading.proofRunId !== undefined &&
+          !admitsExistingRun(reading, execution))
+      )
+        return false;
+      const raw: RawWorkflowSnapshot = selected.raw;
+      const snapshotPredicate = `EXISTS (SELECT 1 FROM "${execution.tablePrefix}mastra_workflow_snapshot"
+        WHERE workflow_name = ? AND run_id = ? AND resourceId IS ? AND snapshot = ? AND createdAt = ? AND updatedAt = ?)`;
+      const reservationPredicate = `EXISTS (SELECT 1 FROM ${START_IDEMPOTENCY_TABLE}
+        WHERE key = ? AND owner_kind = ? AND owner_id = ? AND target_kind = ? AND target_id = ? AND run_id = ?
+        AND thread_id IS ? AND state = ? AND created_at = ? AND updated_at = ?
+        AND start_token = ? AND start_table_prefix IS ? AND start_workflow_id = ?)`;
+      const framePredicate = `id = 'deployment' AND state = 'proof-only' AND proof_key = ?
+        AND mutation_epoch = ? AND transition_revision = ? AND require_mutation_epoch = ? AND last_transition_request IS ?
+        AND (require_mutation_epoch = 0 OR mutation_epoch = ?)`;
+      const exactTuple =
+        'proof_run_id = ? AND proof_table_prefix = ? AND proof_workflow_id = ? AND proof_start_token = ?';
+      const emptyTuple =
+        'proof_run_id IS NULL AND proof_table_prefix IS NULL AND proof_workflow_id IS NULL AND proof_start_token IS NULL';
+      const tuple = [
+        execution.runId,
+        execution.tablePrefix,
+        execution.workflowId,
+        execution.startToken,
+      ];
+      const frame = [
+        key,
+        epoch,
+        revision,
+        Number(reading.requireMutationEpoch),
+        observed.raw.last_transition_request,
+        callerEpoch ?? null,
+      ];
+      const rowValues = [
+        raw.workflowId,
+        raw.runId,
+        raw.resourceId,
+        raw.snapshot,
+        raw.createdAt,
+        raw.updatedAt,
+        ...reservationValues(reservation),
+      ];
+      const expectedTime =
+        reading.proofRunId === undefined ? now : observed.raw.updated_at;
+      const validateReturned = (result: unknown): boolean => {
+        const returned = this.#decodeReturned(result);
+        if (returned === undefined) return false;
+        const next = returned.reading;
+        if (
+          next.state !== 'proof-only' ||
+          next.proofKey !== key ||
+          next.mutationEpoch !== epoch ||
+          next.transitionRevision !== revision ||
+          next.requireMutationEpoch !== reading.requireMutationEpoch ||
+          returned.receipt !== observed.raw.last_transition_request ||
+          !admitsExistingRun(next, execution) ||
+          returned.raw.updated_at !== expectedTime
+        )
+          throw new ExecutionFenceUnreadableError(
+            'proof nomination returned an unexpected fence',
+          );
+        return true;
+      };
+      let result: unknown;
+      try {
+        result = await this.#db
+          .prepare(`UPDATE ${EXECUTION_FENCE_TABLE}
+          SET updated_at = CASE WHEN proof_run_id IS NULL THEN ? ELSE updated_at END,
+            proof_run_id = ?, proof_table_prefix = ?, proof_workflow_id = ?, proof_start_token = ?
+          WHERE ${framePredicate} AND ((${emptyTuple}) OR (${exactTuple}))
+            AND ${snapshotPredicate} AND ${reservationPredicate} RETURNING *`)
+          .bind(now, ...tuple, ...frame, ...tuple, ...rowValues)
+          .all();
+      } catch (cause) {
+        try {
+          const converged = await this.#db
+            .prepare(`SELECT * FROM ${EXECUTION_FENCE_TABLE}
+            WHERE ${framePredicate} AND ${exactTuple} AND ${snapshotPredicate} AND ${reservationPredicate} LIMIT 2`)
+            .bind(...frame, ...tuple, ...rowValues)
+            .all();
+          await requireSchemas();
+          if (validateReturned(converged)) return true;
+        } catch {
+          /* Preserve the failed write's cause. */
+        }
+        throw new ExecutionFenceUnreadableError(
+          'proof nomination could not be recorded',
+          { cause },
+        );
+      }
+      const nominated = validateReturned(result);
+      if (!nominated) {
+        await requireSchemas();
+        await this.readForAdmission();
+      }
+      return nominated;
+    } catch (cause) {
+      if (cause instanceof ExecutionFenceUnreadableError) throw cause;
+      throw new ExecutionFenceUnreadableError(
+        'proof nomination is not readable',
+        { cause },
       );
     }
   }
@@ -777,7 +1506,87 @@ export class ExecutionFenceStore {
     return undefined;
   }
 
-  async #createTable(): Promise<void> {
-    await this.#db.prepare(EXECUTION_FENCE_DDL).run();
+  readonly #execute: DeploymentIdentityProtocolExecutor = async (statement) => {
+    const prepared = this.#db
+      .prepare(statement.sql)
+      .bind(...statement.bindings);
+    if (statement.mode === 'write') {
+      await prepared.run();
+      return [];
+    }
+    return fenceResultRows(await prepared.all<DeploymentIdentityProtocolRow>());
+  };
+
+  async #initialize(state: ExecutionFenceState): Promise<void> {
+    try {
+      await initializeExecutionFenceProtocol(this.#execute, {
+        state,
+        seededAt: this.#now(),
+      });
+    } catch (error) {
+      throw new ExecutionFenceUnreadableError(
+        'execution fence could not be initialized',
+        { cause: error },
+      );
+    }
+  }
+
+  #decodeReturned(result: unknown): StoredExecutionFence | undefined {
+    try {
+      return returningFence(result);
+    } catch (error) {
+      throw new ExecutionFenceUnreadableError(
+        'execution fence UPDATE result is not readable',
+        { cause: error },
+      );
+    }
+  }
+
+  async #readStored(): Promise<StoredExecutionFence | undefined> {
+    try {
+      let minimumStage = 0;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        let rows: readonly DeploymentIdentityProtocolRow[];
+        try {
+          rows = await this.#execute({
+            mode: 'read',
+            sql: `SELECT * FROM ${EXECUTION_FENCE_TABLE} LIMIT 2`,
+            bindings: [],
+          });
+        } catch (error) {
+          if (attempt === 0 && isMissingFenceTable(error)) return undefined;
+          throw error;
+        }
+        const stage = await readExecutionFenceSchemaProtocol(this.#execute);
+        if (
+          !Array.isArray(rows) ||
+          stage === undefined ||
+          stage < minimumStage
+        ) {
+          throw new Error(
+            'execution fence row observation has no compatible schema',
+          );
+        }
+        if (rows.length === 0 && attempt === 0) {
+          if (stage === 0) return undefined;
+          minimumStage = stage;
+          continue;
+        }
+        if (rows.length !== 1)
+          throw new Error('execution fence row is not an exact singleton');
+        const stored = readingFromRow(rows[0]);
+        if (stored.schemaStage > stage)
+          throw new Error(
+            'execution fence schema observation precedes row metadata',
+          );
+        return stored;
+      }
+      throw new Error('execution fence row is missing');
+    } catch (error) {
+      throw new ExecutionFenceUnreadableError(
+        'execution fence state is not readable',
+        { cause: error },
+      );
+    }
   }
 }

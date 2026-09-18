@@ -56,7 +56,13 @@ export const accessRequestModule: WorkflowModule<ShowcaseModuleDeps> = {
         resource: z.string(),
         role: z.string(),
       }),
-      permissions: { sideEffect: 'write', requiresApproval: true },
+      permissions: {
+        sideEffect: 'write',
+        // execute logs the grant and returns; no HTTP request leaves this
+        // connector.
+        egressEnforcement: 'enforced',
+        requiresApproval: true,
+      },
       policies: {
         audit,
         evaluators: [

@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+
+import { isRunStartPendingError } from '../do-runner/execution-admission.js';
 // createScheduleTick. WE OWN THE TICK: a Durable Object alarm drives
 // listDueSchedules -> CAS updateScheduleNextFire claim -> fire, bypassing
 // core's pubsub worker loop entirely under the "one chokepoint, no second
@@ -773,6 +775,7 @@ export function createScheduleTick(
       } catch (error) {
         let pendingError = error;
         if (
+          !isRunStartPendingError(error) &&
           ref.target === 'agent' &&
           ref.mode === 'signal' &&
           options.signalAgent
@@ -951,6 +954,10 @@ export function createScheduleTick(
     // NOT CAS-claim it (leaving nextFireAt would hot-loop, but a permanently
     // corrupt row is an ops data-integrity issue, not a hot-loop the tick should
     // mask by advancing to an arbitrary time); audit the failure and move on.
+    // The row therefore stays due and every later pass selects it again, holding
+    // a slot of the bounded page until an operator repairs or removes it. The
+    // audit event is the record this branch writes: the trigger receipt belongs
+    // to the CAS claim below, which the branch returns before reaching.
     let newNextFireAt: number;
     try {
       newNextFireAt = computeNextFireAt(schedule.cron, {

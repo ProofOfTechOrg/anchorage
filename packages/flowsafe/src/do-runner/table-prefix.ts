@@ -12,7 +12,10 @@ export function validateTablePrefix(
   value: string | undefined,
   fieldName = 'tablePrefix',
 ): string | undefined {
-  if (value !== undefined && !TABLE_PREFIX_PATTERN.test(value)) {
+  if (
+    value !== undefined &&
+    (typeof value !== 'string' || !TABLE_PREFIX_PATTERN.test(value))
+  ) {
     throw new Error(
       `Invalid ${fieldName}: use an empty prefix or start with a letter or underscore and continue with letters, numbers, or underscores.`,
     );

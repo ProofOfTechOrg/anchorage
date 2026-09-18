@@ -196,6 +196,262 @@ test('missing files, directory READMEs, and Markdown anchors fail', () => {
   );
 });
 
+test('relative links obey the internal-file policy', () => {
+  const root = fixture({
+    'docs/guide.md': `# Guide
+
+[Notes](../CLAUDE.md)
+[Plan](release-plan.md#target-heading)
+`,
+    'CLAUDE.md': '# Repository navigation\n',
+    'docs/release-plan.md': '# Target heading\n',
+  });
+
+  const result = checkRepository({
+    root,
+    markdownFiles: markdownFiles(root, [
+      'docs/guide.md',
+      'CLAUDE.md',
+      'docs/release-plan.md',
+    ]),
+    packageChecks: false,
+    orphanChecks: false,
+  });
+
+  assert.deepEqual(
+    result.errors.map((error) => error.message),
+    [
+      'public documentation links to an internal file: ../CLAUDE.md',
+      'public documentation links to an internal file: release-plan.md#target-heading',
+    ],
+  );
+});
+
+test('absolute repository links resolve target files and Markdown anchors', () => {
+  const root = fixture({
+    'packages/example/README.md': `# Example
+
+[Anchored](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/guide.md#target-heading)
+[Whole file](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/guide.md)
+`,
+    'docs/guide.md': '# Target heading\n',
+  });
+
+  const result = checkRepository({
+    root,
+    markdownFiles: markdownFiles(root, [
+      'packages/example/README.md',
+      'docs/guide.md',
+    ]),
+    packageChecks: false,
+    orphanChecks: false,
+  });
+
+  assert.deepEqual(result.errors, []);
+});
+
+test('absolute repository links fail on a missing Markdown anchor', () => {
+  const root = fixture({
+    'packages/example/README.md': `# Example
+
+[Guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/guide.md#absent)
+`,
+    'docs/guide.md': '# Target heading\n',
+  });
+
+  const result = checkRepository({
+    root,
+    markdownFiles: markdownFiles(root, [
+      'packages/example/README.md',
+      'docs/guide.md',
+    ]),
+    packageChecks: false,
+    orphanChecks: false,
+  });
+
+  assert.deepEqual(
+    result.errors.map((error) => error.message),
+    ['Markdown anchor does not exist: #absent'],
+  );
+});
+
+test('absolute repository links fail on a missing target file', () => {
+  const root = fixture({
+    'packages/example/README.md': `# Example
+
+[Anchored](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/missing.md#target-heading)
+[Whole file](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/missing.md)
+`,
+  });
+
+  const result = checkRepository({
+    root,
+    markdownFiles: markdownFiles(root, ['packages/example/README.md']),
+    packageChecks: false,
+    orphanChecks: false,
+  });
+
+  assert.deepEqual(
+    result.errors.map((error) => error.message),
+    [
+      'link target does not exist: https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/missing.md#target-heading',
+      'link target does not exist: https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/missing.md',
+    ],
+  );
+});
+
+test('absolute repository links fail on a path that escapes the repository', () => {
+  const outer = fixture({
+    'repo/packages/example/README.md': `# Example
+
+[Anchored](https://github.com/ProofOfTechOrg/anchorage/blob/main/../outside.md#target-heading)
+[Whole file](https://github.com/ProofOfTechOrg/anchorage/blob/main/../outside.md)
+`,
+    'outside.md': '# Target heading\n',
+  });
+  const root = join(outer, 'repo');
+
+  const result = checkRepository({
+    root,
+    markdownFiles: markdownFiles(root, ['packages/example/README.md']),
+    packageChecks: false,
+    orphanChecks: false,
+  });
+
+  assert.deepEqual(
+    result.errors.map((error) => error.message),
+    [
+      'link escapes the repository: https://github.com/ProofOfTechOrg/anchorage/blob/main/../outside.md#target-heading',
+      'link escapes the repository: https://github.com/ProofOfTechOrg/anchorage/blob/main/../outside.md',
+    ],
+  );
+});
+
+test('absolute repository links accept GitHub line fragments', () => {
+  const root = fixture({
+    'packages/example/README.md': `# Example
+
+[Line](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/guide.md#L12)
+[Range](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/guide.md#L12-L20)
+[Missing line](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/missing.md#L12)
+`,
+    'docs/guide.md': '# Target heading\n',
+  });
+
+  const result = checkRepository({
+    root,
+    markdownFiles: markdownFiles(root, [
+      'packages/example/README.md',
+      'docs/guide.md',
+    ]),
+    packageChecks: false,
+    orphanChecks: false,
+  });
+
+  assert.deepEqual(
+    result.errors.map((error) => error.message),
+    [
+      'link target does not exist: https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/missing.md#L12',
+    ],
+  );
+});
+
+test('reachability follows absolute repository links into the docs tree', () => {
+  const root = fixture({
+    'docs/README.md': `# Documentation
+
+[Guide](guide.md)
+`,
+    'docs/guide.md': `# Guide
+
+[Reference](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/reference.md)
+`,
+    'docs/reference.md': '# Reference\n',
+    'docs/unlinked.md': '# Unlinked\n',
+  });
+
+  const result = checkRepository({
+    root,
+    markdownFiles: markdownFiles(root, [
+      'docs/README.md',
+      'docs/guide.md',
+      'docs/reference.md',
+      'docs/unlinked.md',
+    ]),
+    packageChecks: false,
+  });
+
+  assert.deepEqual(
+    result.errors.map((error) => `${error.file}: ${error.message}`),
+    [
+      'docs/unlinked.md: guide is not reachable from a public documentation index',
+    ],
+  );
+});
+
+test('reachability skips ignored schemes, off-repository URLs, and missing blob targets', () => {
+  const root = fixture({
+    'docs/README.md': `# Documentation
+
+[Mirror](https://example.com/docs/stranded-external.md)
+[Archive](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/archive/stranded-blob.md)
+[Contact](mailto:docs@example.com)
+`,
+    'docs/stranded-external.md': '# Stranded external\n',
+    'docs/stranded-blob.md': '# Stranded blob\n',
+  });
+
+  const result = checkRepository({
+    root,
+    markdownFiles: markdownFiles(root, [
+      'docs/README.md',
+      'docs/stranded-external.md',
+      'docs/stranded-blob.md',
+    ]),
+    packageChecks: false,
+  });
+
+  assert.deepEqual(
+    result.errors.map((error) => `${error.file}: ${error.message}`),
+    [
+      'docs/README.md: link target does not exist: https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/archive/stranded-blob.md',
+      'docs/stranded-blob.md: guide is not reachable from a public documentation index',
+      'docs/stranded-external.md: guide is not reachable from a public documentation index',
+    ],
+  );
+});
+
+test('absolute repository links obey the internal-file policy', () => {
+  const root = fixture({
+    'packages/example/README.md': `# Example
+
+[Notes](https://github.com/ProofOfTechOrg/anchorage/blob/main/CLAUDE.md)
+[Plan](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/release-plan.md#target-heading)
+`,
+    'CLAUDE.md': '# Repository navigation\n',
+    'docs/release-plan.md': '# Target heading\n',
+  });
+
+  const result = checkRepository({
+    root,
+    markdownFiles: markdownFiles(root, [
+      'packages/example/README.md',
+      'CLAUDE.md',
+      'docs/release-plan.md',
+    ]),
+    packageChecks: false,
+    orphanChecks: false,
+  });
+
+  assert.deepEqual(
+    result.errors.map((error) => error.message),
+    [
+      'public documentation links to an internal file: https://github.com/ProofOfTechOrg/anchorage/blob/main/CLAUDE.md',
+      'public documentation links to an internal file: https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/release-plan.md#target-heading',
+    ],
+  );
+});
+
 test('invalid and unsafe URLs fail before the scheduled network check', () => {
   const root = fixture({
     'README.md': `[Invalid](https://[invalid)
@@ -278,6 +534,34 @@ Public F4 remains visible.
   assert.deepEqual(
     result.errors.map((error) => error.message),
     ['internal milestone token is not public documentation: F4'],
+  );
+});
+
+test('the root README carries every canonical public URL', () => {
+  const root = fixture({
+    'package.json': '{\n  "name": "anchorage"\n}\n',
+    'README.md': `# Anchorage
+
+- [Demo](https://anchorage.proofoftech.org/)
+- [Source](https://github.com/ProofOfTechOrg/anchorage)
+- [Breakwater](https://www.npmjs.com/package/@proofoftech/breakwater)
+- [Flowsafe](https://www.npmjs.com/package/@proofoftech/flowsafe)
+- [Fleet control](https://www.npmjs.com/package/@proofoftech/fleet-control)
+`,
+  });
+
+  const result = checkRepository({
+    root,
+    markdownFiles: markdownFiles(root, ['README.md']),
+    packageChecks: false,
+    orphanChecks: false,
+  });
+
+  assert.deepEqual(
+    result.errors.map((error) => `${error.file}: ${error.message}`),
+    [
+      'README.md: README is missing the canonical public URL: https://proofoftechorg.github.io/anchorage/',
+    ],
   );
 });
 

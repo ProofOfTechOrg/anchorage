@@ -32,9 +32,11 @@ const audit = new AuditLogger({
 });
 ```
 
-Sink failure does not change the gated application decision. The event remains in the ring until eviction. This improves application availability but means export health needs a separate alert.
+Sink or `onSinkError` failure does not change the gated application decision. Synchronous exceptions and rejected promises remain isolated. The event remains in the ring until eviction. This improves application availability but means export health needs a separate alert.
 
 `combineAuditSinks()` invokes every sink and aggregates synchronous and asynchronous failures after all sinks settle.
+
+Connector SDK events include `decisionCode`, `policyKind` and `retryable` from the same classification as their authored errors. These fields remain optional on the shared `AuditEvent` because other producers have their own contracts. A nested connector failure can retain the inner code while the outer event records `decision: "error"`. See the [connector decision catalogue](connector-interface.md#connector-decision-codes) for retry and post-effect store semantics.
 
 ## Audit-derived metrics
 
@@ -232,7 +234,7 @@ The merge gate covers:
 - production builds;
 - packed consumer tests for public npm exports;
 - generated API documentation;
-- documentation links, anchors, exports, npm-safe links, and orphan checks;
+- the documentation checks `scripts/docs-check.mjs` composes (links, anchors, exports, npm-safe links and orphan pages among them);
 - showcase public metadata and token-free bundle assertions;
 - react-doctor;
 - deterministic workerd restart/security spike;

@@ -11,7 +11,10 @@ import { AuditLogger } from '../audit/index.js';
 import {
   CONNECTOR_EXECUTION_CONTEXT_KEY,
   CONNECTOR_GRANTS_CONTEXT_KEY,
+  ConnectorEvaluatorError,
   ConnectorPolicyError,
+  ConnectorStoreError,
+  connectorEgressPosture,
   connectorManifest,
   DRY_RUN_CONTEXT_KEY,
   IDEMPOTENCY_KEY_CONTEXT_KEY,
@@ -246,6 +249,134 @@ describe('createCodexConnector', () => {
 });
 
 describe('agent CLI connector enforcement', () => {
+  it('declares a declaration-only egress posture on the Agent CLI manifest', () => {
+    // #given
+    const exec = mockExec();
+    // #when
+    const tools = [
+      createAgentCliConnector(privateDefinition(), { exec }),
+      createClaudeCodeConnector({ exec }),
+      createCodexConnector({ exec }),
+    ];
+    // #then
+    for (const tool of tools) {
+      expect(connectorManifest(tool)).toHaveProperty(
+        'egressEnforcement',
+        'declaration-only',
+      );
+      expect(connectorEgressPosture(tool)).toBe('declaration-only');
+    }
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('preserves custom denial metadata while replacing the CLI reason', async () => {
+    const audit = new AuditLogger();
+    const exec = mockExec();
+    const tool = createCodexConnector({
+      exec,
+      requiresApproval: false,
+      policies: {
+        audit,
+        evaluators: [
+          {
+            name: 'custom-quota-name',
+            evaluate: () => ({
+              allowed: false,
+              reason: 'custom budget exhausted',
+              code: 'RATE_LIMIT_EXCEEDED',
+              details: { limit: 3, windowMs: 1_000 },
+            }),
+          },
+        ],
+      },
+    });
+    const failure = await run(tool, { prompt: 'request' }, makeContext()).catch(
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(ConnectorPolicyError);
+    expect(failure).toMatchObject({
+      connector: 'agent-cli.codex',
+      policy: 'custom-quota-name',
+      kind: 'connector-policy',
+      code: 'RATE_LIMIT_EXCEEDED',
+      policyKind: 'rate-limit',
+      retryable: true,
+      reason: 'agent CLI connector policy denied execution',
+      details: { limit: 3, windowMs: 1_000 },
+    });
+    expect(failure).not.toHaveProperty('cause');
+    expect(audit.events()).toEqual([
+      expect.objectContaining({
+        decisionCode: 'RATE_LIMIT_EXCEEDED',
+        policyKind: 'rate-limit',
+        retryable: true,
+      }),
+    ]);
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'rate-limit',
+    'idempotency',
+  ] as const)('preserves a %s store failure code without its private cause', async (store) => {
+    const audit = new AuditLogger();
+    const exec = mockExec();
+    const secret = new Error('private-store-cause');
+    const tool = createCodexConnector({
+      exec,
+      requiresApproval: false,
+      ...(store === 'rate-limit'
+        ? { rateLimit: '1/min' }
+        : { idempotencyKey: true }),
+      policies: {
+        audit,
+        ...(store === 'rate-limit'
+          ? {
+              rateLimitStore: {
+                increment: async () => {
+                  throw secret;
+                },
+              },
+            }
+          : {
+              idempotencyKeyMigration: 'legacy-writers-drained' as const,
+              idempotencyStore: {
+                get: async () => {
+                  throw secret;
+                },
+                put: async () => {},
+              },
+            }),
+      },
+    });
+    const failure = await run(
+      tool,
+      { prompt: 'request' },
+      makeContext({ idempotencyKey: 'operation' }),
+    ).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(ConnectorStoreError);
+    expect(failure).toMatchObject({
+      kind: 'connector-store',
+      code: 'STORE_UNAVAILABLE',
+      connector: 'agent-cli.codex',
+      store,
+      operation: store === 'rate-limit' ? 'increment' : 'get',
+      policyKind: 'store',
+      retryable: true,
+    });
+    expect(failure).not.toHaveProperty('cause');
+    expect(errorSurface(failure)).not.toContain('private-store-cause');
+    expect(JSON.stringify(audit.events())).not.toContain('private-store-cause');
+    expect(audit.events()).toEqual([
+      expect.objectContaining({
+        decisionCode: 'STORE_UNAVAILABLE',
+        policyKind: 'store',
+        retryable: true,
+      }),
+    ]);
+    expect(exec).not.toHaveBeenCalled();
+  });
+
   it('denies without a grant and never spawns (approval-gated by default)', async () => {
     // #given
     const exec = mockExec();
@@ -258,6 +389,12 @@ describe('agent CLI connector enforcement', () => {
 
     // #then
     expect(failure).toBeInstanceOf(ConnectorPolicyError);
+    expect(failure).toMatchObject({
+      code: 'APPROVAL_GRANT_MISSING',
+      kind: 'connector-policy',
+      policyKind: 'write-permissions',
+      retryable: false,
+    });
     expect(exec).not.toHaveBeenCalled();
   });
 
@@ -724,7 +861,22 @@ describe('agent CLI private-data boundaries', () => {
       makeContext(),
     ).catch((error: unknown) => error);
 
-    expect(failure).toMatchObject({ code: 'connector-failed' });
+    expect(failure).toBeInstanceOf(ConnectorEvaluatorError);
+    expect(failure).toMatchObject({
+      code: 'EVALUATOR_FAILED',
+      kind: 'connector-evaluator',
+      policyKind: 'evaluator',
+      retryable: false,
+      policy: 'private-evaluator',
+    });
+    expect(failure).not.toHaveProperty('cause');
+    expect(audit.events()).toEqual([
+      expect.objectContaining({
+        decisionCode: 'EVALUATOR_FAILED',
+        policyKind: 'evaluator',
+        retryable: false,
+      }),
+    ]);
     expect(errorSurface(failure)).not.toContain(PRIVATE_PROMPT);
     expect(errorSurface(failure)).not.toContain(PRIVATE_PROCESS_OUTPUT);
     expect(JSON.stringify(audit.events())).not.toContain(PRIVATE_PROMPT);

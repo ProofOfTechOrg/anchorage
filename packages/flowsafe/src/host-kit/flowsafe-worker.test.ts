@@ -1,12 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-// Unit proof for the composed Worker skeleton: the fetch pipeline order, the
-// hook seams (preRoutes/beforeStart/beforeResume/notify/extra
-// duties), and failure-isolated deadline, sweep, purge, and optional schedule
-// tick dispatch. The HEAVYWEIGHT behavior proof stays the two host e2e suites
-// (deploy/worker.e2e.test.ts and the showcase worker e2e set), which drive
-// the real hosts through this same composer — this file covers the composer's
-// own contract over fakes: node:sqlite behind a narrow SQL unit facade, a stub DO
-// namespace, and a static verifier.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -21,20 +13,34 @@ import {
   FlowsafeFleetAuditProxy,
 } from '../audit-export/index.js';
 import {
+  DeploymentIdentityError,
   EXECUTION_PRINCIPAL_HEADER,
+  executionFenceFor,
+  InvalidMutationEpochError,
+  MUTATION_EPOCH_HEADER,
   type RunDeadlineCursor,
   type RunSummary,
+  startIdempotencyFor,
 } from '../do-runner/index.js';
+import {
+  createScheduleRouter,
+  createScheduleTargetPolicy,
+  D1SchedulesStorage,
+  type ScheduleDatabase,
+} from '../schedules/index.js';
 import type { ResumeRunFn } from './approval-bridge.js';
+import type { RunnerStubLike } from './do-run-topology.js';
 import {
   createFlowsafeWorker,
   type FlowsafeWorkerConfig,
   type FlowsafeWorkerEnv,
   MAINTENANCE_INSTANCE_NAME,
   type MaintenanceHealth,
+  type MaintenancePurgeDutyContext,
 } from './flowsafe-worker.js';
 import { approvalStoreFactoryFor } from './host-approval-service.js';
 import { MAINTENANCE_RECEIPT_HEADER } from './maintenance-capability.js';
+import { RunRouteError } from './run-route-error.js';
 import { staticTokenVerifier } from './verifier.js';
 import type { WorkflowMeta } from './workflow-meta.js';
 
@@ -166,6 +172,317 @@ function makeWorker(
     ...overrides,
   });
 }
+
+function retentionContext(): MaintenancePurgeDutyContext {
+  const context: MaintenancePurgeDutyContext = {
+    advanceRetentionCursor: async (cursor) => {
+      context.retentionCursor = structuredClone(cursor);
+    },
+  };
+  return context;
+}
+
+function cWorkerDeferred() {
+  let release!: () => void;
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { promise, release };
+}
+
+describe('C Worker epoch capture', () => {
+  it.each([
+    '/runs',
+    '/healthz',
+    '/admin/maintenance-status',
+  ])('C captures Worker epoch before identity SQL for %s', async (path) => {
+    type EpochEnv = FlowsafeWorkerEnv & { epoch: number };
+    const order: string[] = [];
+    const observed: Array<number | undefined> = [];
+    let sourceReads = 0;
+    const source = vi.fn((env: EpochEnv) => {
+      order.push('epoch');
+      return env.epoch;
+    });
+    const config: FlowsafeWorkerConfig<EpochEnv> = {
+      systemPrincipalId: 'test-system',
+      workflows: WORKFLOWS,
+      maintenance: { sweepIntervalMs: 1, purgeIntervalMs: 1 },
+      get mutationEpoch() {
+        sourceReads++;
+        return source;
+      },
+      buildVerifier: () => staticTokenVerifier(ACTORS),
+      beforeStart: async (context) => {
+        observed.push(context.mutationEpoch);
+      },
+    };
+    const worker = createFlowsafeWorker(config);
+    expect(sourceReads).toBe(1);
+    expect(source).not.toHaveBeenCalled();
+    Object.defineProperty(config, 'mutationEpoch', { value: () => 99 });
+    for (const epoch of [0, Number.MAX_SAFE_INTEGER]) {
+      const h = makeEnv();
+      const env: EpochEnv = { ...h.env, epoch };
+      const entered = cWorkerDeferred();
+      const hold = cWorkerDeferred();
+      const nativePrepare = env.DB.prepare.bind(env.DB);
+      let held = false;
+      const prepare = vi.spyOn(env.DB, 'prepare').mockImplementation((sql) => {
+        const statement = nativePrepare(sql);
+        if (!held && sql.includes('sqlite_schema')) {
+          const bind = statement.bind.bind(statement);
+          statement.bind = (...values: unknown[]) => {
+            const bound = bind(...values);
+            const all = bound.all.bind(bound);
+            bound.all = async <T>() => {
+              const result = await all<T>();
+              held = true;
+              order.push('sql');
+              entered.release();
+              await hold.promise;
+              return result;
+            };
+            return bound;
+          };
+        }
+        return statement;
+      });
+      const pending = worker.fetch(
+        authed(
+          `http://host${path}`,
+          path === '/runs'
+            ? {
+                method: 'POST',
+                body: JSON.stringify({ workflowId: 'wf', inputData: {} }),
+              }
+            : {},
+        ),
+        env,
+        h.ctx,
+      );
+      try {
+        await entered.promise;
+        expect(order.slice(-2)).toEqual(['epoch', 'sql']);
+        env.epoch = 3;
+        hold.release();
+        const response = await pending;
+        expect(response.status).toBe(
+          path === '/admin/maintenance-status' ? 503 : 200,
+        );
+        if (path === '/runs') expect(observed.at(-1)).toBe(epoch);
+      } finally {
+        hold.release();
+        await pending;
+        await h.flush();
+        prepare.mockRestore();
+      }
+    }
+    expect(sourceReads).toBe(1);
+    expect(source).toHaveBeenCalledTimes(2);
+  });
+
+  it('C Worker epoch remains captured through authentication', async () => {
+    const h = makeEnv();
+    const entered = cWorkerDeferred();
+    const hold = cWorkerDeferred();
+    let epoch = 2;
+    const seen: unknown[] = [];
+    const worker = makeWorker({
+      mutationEpoch: () => epoch,
+      buildVerifier: () => ({
+        verify: async () => {
+          entered.release();
+          await hold.promise;
+          return { id: 'ada', role: 'admin' };
+        },
+      }),
+      beforeStart: async (context) => {
+        seen.push(context.mutationEpoch);
+      },
+    });
+    const pending = worker.fetch(
+      authed('http://host/runs', {
+        method: 'POST',
+        body: '{"workflowId":"wf"}',
+      }),
+      h.env,
+      h.ctx,
+    );
+    try {
+      await entered.promise;
+      epoch = 9;
+      hold.release();
+      expect((await pending).status).toBe(200);
+      expect(seen).toEqual([2]);
+    } finally {
+      hold.release();
+      await pending;
+      await h.flush();
+    }
+  });
+
+  it.each([
+    null,
+    '2',
+    true,
+    -1,
+    0.5,
+    NaN,
+    Infinity,
+    Number.MAX_SAFE_INTEGER + 1,
+  ])('C Worker rejects invalid scalar setup and callback without effects (%s)', async (value) => {
+    expect(() => makeWorker({ mutationEpoch: value as number })).toThrow(
+      InvalidMutationEpochError,
+    );
+    const h = makeEnv();
+    const prepare = vi.spyOn(h.env.DB, 'prepare');
+    const auth = vi.fn(() => staticTokenVerifier(ACTORS));
+    const route = vi.fn();
+    const response = await makeWorker({
+      mutationEpoch: () => value,
+      buildVerifier: auth,
+      preRoutes: route,
+    }).fetch(authed('http://host/workflows'), h.env, h.ctx);
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      error: new InvalidMutationEpochError().message,
+      reason: { code: 'INVALID_MUTATION_EPOCH' },
+    });
+    expect(prepare).not.toHaveBeenCalled();
+    expect(auth).not.toHaveBeenCalled();
+    expect(route).not.toHaveBeenCalled();
+    expect(h.doCalls).toEqual([]);
+    await h.flush();
+  });
+
+  it.each([
+    'promise',
+    'thenable',
+  ] as const)('C Worker never awaits an epoch callback result (%s)', async (kind) => {
+    const then = vi.fn();
+    const value = kind === 'promise' ? Promise.resolve(2) : { then };
+    const h = makeEnv();
+    const prepare = vi.spyOn(h.env.DB, 'prepare');
+    const response = await makeWorker({ mutationEpoch: () => value }).fetch(
+      authed('http://host/healthz'),
+      h.env,
+      h.ctx,
+    );
+    expect(response.status).toBe(400);
+    expect(then).not.toHaveBeenCalled();
+    expect(prepare).not.toHaveBeenCalled();
+    await h.flush();
+  });
+
+  it.each([
+    new Error('private sentinel'),
+    {
+      name: 'InvalidMutationEpochError',
+      status: 400,
+      reason: { code: 'INVALID_MUTATION_EPOCH' },
+      message: 'private sentinel',
+    },
+  ])('C Worker keeps generic callback errors redacted', async (error) => {
+    capturedLogs();
+    const h = makeEnv();
+    const prepare = vi.spyOn(h.env.DB, 'prepare');
+    const response = await makeWorker({
+      mutationEpoch: () => {
+        throw error;
+      },
+    }).fetch(authed('http://host/healthz'), h.env, h.ctx);
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: 'internal error' });
+    expect(prepare).not.toHaveBeenCalled();
+    await h.flush();
+  });
+
+  it.each([
+    {
+      name: 'throwing message getter',
+      failure: () =>
+        Object.defineProperty(new Error(), 'message', {
+          get() {
+            throw new Error('message getter failed');
+          },
+        }),
+      diagnostic: 'unreadable error',
+    },
+    {
+      name: 'BigInt message',
+      failure: () =>
+        Object.defineProperty(new Error(), 'message', { value: 1n }),
+      diagnostic: '1',
+    },
+    {
+      name: 'null-prototype rejection',
+      failure: () => Object.create(null),
+      diagnostic: 'unreadable error',
+    },
+  ])('contains a callback failure with $name while logging the failure', async ({
+    failure,
+    diagnostic,
+  }) => {
+    const logs = capturedLogs();
+    const h = makeEnv();
+    const response = await makeWorker({
+      mutationEpoch: () => {
+        throw failure();
+      },
+    }).fetch(authed('http://host/healthz'), h.env, h.ctx);
+
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: 'internal error' });
+    expect(logs.errors().map((line) => JSON.parse(line))).toContainEqual({
+      type: 'worker-fetch-error',
+      reason: diagnostic,
+    });
+    await h.flush();
+  });
+
+  it.each([
+    {
+      name: 'throwing message getter',
+      descriptor: {
+        get() {
+          throw new Error('message getter failed');
+        },
+      },
+      diagnostic: 'unreadable error',
+    },
+    {
+      name: 'BigInt message',
+      descriptor: { value: 1n },
+      diagnostic: '1',
+    },
+  ])('contains deployment identity failures with $name', async ({
+    descriptor,
+    diagnostic,
+  }) => {
+    const logs = capturedLogs();
+    const h = makeEnv();
+    const failure = Object.defineProperty(
+      new DeploymentIdentityError('unavailable'),
+      'message',
+      descriptor,
+    );
+
+    const response = await makeWorker({
+      mutationEpoch: () => {
+        throw failure;
+      },
+    }).fetch(authed('http://host/healthz'), h.env, h.ctx);
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: 'deployment unavailable' });
+    expect(logs.errors().map((line) => JSON.parse(line))).toContainEqual({
+      type: 'deployment-identity-error',
+      reason: diagnostic,
+    });
+    await h.flush();
+  });
+});
 
 function authed(url: string, init: RequestInit = {}): Request {
   return new Request(url, {
@@ -435,10 +752,15 @@ describe('createFlowsafeWorker fetch pipeline', () => {
     );
   });
 
-  it('relays a one-shot fleet capability without holding the signing secret', async () => {
+  it.each([
+    undefined,
+    'local-maintenance-receipt-secret-0001',
+  ])('relays a fleet capability with local receipt secret %s', async (receiptSecret) => {
     const worker = makeWorker();
     const { env, ctx } = makeEnv();
     env.FLEET_MAINTENANCE_CAPABILITIES = 'required';
+    if (receiptSecret !== undefined)
+      env.MAINTENANCE_ADMIN_SECRET = receiptSecret;
     env.FLEET_SPEC_DIGEST = 'a'.repeat(64);
     const fetch = vi.fn(async () => {
       const response = Response.json({ alarmAt: 1 });
@@ -467,7 +789,7 @@ describe('createFlowsafeWorker fetch pipeline', () => {
       method: 'POST',
       headers: { authorization: 'Bearer one-shot-capability' },
     });
-    expect(env.MAINTENANCE_ADMIN_SECRET).toBeUndefined();
+    expect(env.MAINTENANCE_ADMIN_SECRET).toBe(receiptSecret);
   });
 
   it('refuses to reuse the Worker-to-DO credential for maintenance administration', async () => {
@@ -639,6 +961,79 @@ describe('createFlowsafeWorker fetch pipeline', () => {
     expect(buildResumeRun.mock.calls[0]?.[1]).toBe(env);
   });
 
+  it.each([
+    undefined,
+    { 'app.attribution': 'ada', nested: { value: 1 } },
+  ])('passes context as the fifth policy argument and serializes it to the run DO: %j', async (requestContext) => {
+    const beforeStart = vi.fn<
+      NonNullable<FlowsafeWorkerConfig<FlowsafeWorkerEnv>['beforeStart']>
+    >(async () => {});
+    const worker = makeWorker({ beforeStart });
+    const h = makeEnv();
+    const transport = vi.fn<RunnerStubLike['fetch']>(async (_url, init) => {
+      const body = JSON.parse(init?.body ?? '{}') as { runId: string };
+      return Response.json(successSummary(body.runId));
+    });
+    h.env.RUNNER = {
+      idFromName: (name) => name,
+      get: () => ({ fetch: transport }),
+    };
+    const inputData = { topic: 'launch' };
+    const response = await worker.fetch(
+      authed('http://host/runs', {
+        method: 'POST',
+        body: JSON.stringify({ workflowId: 'wf', inputData, requestContext }),
+      }),
+      h.env,
+      h.ctx,
+    );
+    await h.flush();
+
+    expect(response.status).toBe(200);
+    expect(beforeStart).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ actor: { id: 'ada', role: 'admin' } }),
+      h.env,
+      'wf',
+      inputData,
+      requestContext,
+    );
+    expect(transport).toHaveBeenCalledOnce();
+    const forwarded = JSON.parse(transport.mock.calls[0]?.[1]?.body ?? '{}');
+    expect(forwarded.requestContext).toEqual(requestContext);
+    expect(Object.hasOwn(forwarded, 'requestContext')).toBe(
+      requestContext !== undefined,
+    );
+  });
+
+  it('rejects application attribution in host policy before contacting the run DO', async () => {
+    const beforeStart = vi.fn<
+      NonNullable<FlowsafeWorkerConfig<FlowsafeWorkerEnv>['beforeStart']>
+    >(async (_context, _env, _workflowId, _inputData, requestContext) => {
+      expect(requestContext).toEqual({ 'app.attribution': 'forbidden' });
+      throw new RunRouteError(403, 'attribution is not allowed');
+    });
+    const worker = makeWorker({ beforeStart });
+    const h = makeEnv();
+    const response = await worker.fetch(
+      authed('http://host/runs', {
+        method: 'POST',
+        body: JSON.stringify({
+          workflowId: 'wf',
+          requestContext: { 'app.attribution': 'forbidden' },
+        }),
+      }),
+      h.env,
+      h.ctx,
+    );
+    await h.flush();
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({
+      error: 'attribution is not allowed',
+    });
+    expect(beforeStart).toHaveBeenCalledOnce();
+    expect(h.doCalls).toEqual([]);
+  });
+
   it('runs the context-aware start and resume policies before the topology thunks', async () => {
     // #given
     const wrapped: string[] = [];
@@ -784,6 +1179,91 @@ describe('createFlowsafeWorker fetch pipeline', () => {
     // #then — no schedule handling, as before the seam existed
     expect(unmounted.status).toBe(404);
   });
+
+  it('carries the configured epoch through authentication into the schedule store', async () => {
+    const h = makeEnv();
+    const store = new D1SchedulesStorage(h.env.DB as ScheduleDatabase);
+    const fence = executionFenceFor(h.env.DB);
+    await fence.seed('open');
+    const initial = await fence.read();
+    const draining = await fence.transition({
+      expected: 'open',
+      next: 'draining',
+      expectedMutationEpoch: initial.mutationEpoch,
+      expectedRevision: initial.transitionRevision,
+      advanceMutationEpoch: true,
+    });
+    await fence.transition({
+      expected: 'draining',
+      next: 'open',
+      expectedMutationEpoch: draining.mutationEpoch,
+      expectedRevision: draining.transitionRevision,
+    });
+    const entered = cWorkerDeferred();
+    const hold = cWorkerDeferred();
+    let epoch = 1;
+    const verify = vi.fn(async () => {
+      entered.release();
+      await hold.promise;
+      return { id: 'ada', role: 'admin' as const };
+    });
+    const worker = makeWorker({
+      mutationEpoch: () => epoch,
+      buildVerifier: () => ({ verify }),
+      buildScheduleRouter: (resolve) =>
+        createScheduleRouter({
+          resolve,
+          store,
+          executionFence: fence,
+          targetPolicy: createScheduleTargetPolicy({
+            workflows: WORKFLOWS,
+            agents: [],
+          }),
+          validateThreadTarget: async () => undefined,
+        }),
+    });
+    const request = () =>
+      authed('http://host/api/schedules', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ workflowId: 'wf', cron: '*/5 * * * *' }),
+      });
+    const pending = worker.fetch(request(), h.env, h.ctx);
+    try {
+      expect(
+        await Promise.race([
+          entered.promise.then(() => true),
+          pending.then(() => false),
+        ]),
+      ).toBe(true);
+      epoch = 2;
+      hold.release();
+      const response = await pending;
+      expect(response.status).toBe(201);
+      const created = (await response.json()) as { schedule: { id: string } };
+      expect((await store.listSchedules()).map((row) => row.id)).toEqual([
+        created.schedule.id,
+      ]);
+    } finally {
+      hold.release();
+      await pending;
+    }
+    const future = await worker.fetch(request(), h.env, h.ctx);
+    expect(future.status).toBe(409);
+    expect(await future.json()).toMatchObject({
+      reason: {
+        code: 'MUTATION_EPOCH_MISMATCH',
+        classification: 'future',
+        mutationEpoch: 1,
+      },
+    });
+    const forged = request();
+    forged.headers.set(MUTATION_EPOCH_HEADER, '1');
+    const rejected = await worker.fetch(forged, h.env, h.ctx);
+    expect(rejected.status).toBe(403);
+    expect(verify).toHaveBeenCalledTimes(2);
+    expect(await store.listSchedules()).toHaveLength(1);
+  });
 });
 
 describe('createFlowsafeWorker maintenance duties', () => {
@@ -873,7 +1353,8 @@ describe('createFlowsafeWorker maintenance duties', () => {
           resourceId TEXT,
           snapshot TEXT NOT NULL,
           createdAt TEXT NOT NULL,
-          updatedAt TEXT NOT NULL
+          updatedAt TEXT NOT NULL,
+          UNIQUE(workflow_name, run_id)
         )`,
       )
       .run();
@@ -1041,13 +1522,305 @@ describe('createFlowsafeWorker maintenance duties', () => {
     const { env } = makeEnv();
 
     // #when
-    await worker.runMaintenanceDuty('purge', env);
+    await worker.runMaintenanceDuty('purge', env, retentionContext());
 
     // #then
     const lines = maintenanceLines(logs.lines());
     expect(lines).toHaveLength(1);
     expect(lines[0]).toMatchObject({ purged: 0, approvalsPurged: 0 });
     expect(lines[0]).not.toHaveProperty('escalated');
+  });
+
+  it('requires the retention cursor seam in the purge duty signature', async () => {
+    capturedLogs();
+    const worker = makeWorker();
+    const { env } = makeEnv();
+
+    // @ts-expect-error the purge context requires advanceRetentionCursor
+    const outcome = await worker.runMaintenanceDuty('purge', env, {});
+
+    expect(outcome).toEqual({
+      ok: false,
+      error: 'retention purge requires advanceRetentionCursor',
+    });
+  });
+
+  it('refuses the purge duty invoked with no context', async () => {
+    capturedLogs();
+    const worker = makeWorker();
+    const { env } = makeEnv();
+
+    // @ts-expect-error the purge duty takes a context carrying the seam
+    const outcome = await worker.runMaintenanceDuty('purge', env);
+
+    expect(outcome).toEqual({
+      ok: false,
+      error: 'retention purge requires advanceRetentionCursor',
+    });
+  });
+
+  it.each([
+    undefined,
+    null,
+    false,
+  ])('refuses a missing or non-callable retention callback before any purge surface: %j', async (advanceRetentionCursor) => {
+    const logs = capturedLogs();
+    const artifactStore = vi.fn(() => ({ deleteRun: async () => 0 }));
+    const extraPurgeDuties = vi.fn(async () => ({ extraDuty: 'ran' }));
+    const worker = makeWorker({ artifactStore, extraPurgeDuties });
+    const { env } = makeEnv();
+    await seedIdleThread(env);
+
+    const outcome = await worker.runMaintenanceDuty(
+      'purge',
+      {
+        ...env,
+        THREAD_RETENTION_DAYS: '30',
+      },
+      // MaintenancePurgeDutyContext requires the seam, so this branch belongs
+      // to hosts the types do not reach; the cast is what one looks like.
+      { advanceRetentionCursor } as unknown as MaintenancePurgeDutyContext,
+    );
+
+    // #then — a wiring fault, not a purge that failed: the invocation is
+    // refused under its own config-error and no surface runs, so the idle
+    // thread survives and no combined maintenance line lands.
+    expect(outcome).toEqual({
+      ok: false,
+      error: 'retention purge requires advanceRetentionCursor',
+    });
+    expect(
+      logs
+        .errors()
+        .filter((line) => line.includes('config-error'))
+        .map((line) => JSON.parse(line) as Record<string, unknown>),
+    ).toEqual([
+      {
+        type: 'config-error',
+        var: 'maintenance.purge.advanceRetentionCursor',
+        trigger: 'purge',
+        reason: 'retention purge requires advanceRetentionCursor',
+      },
+    ]);
+    expect(artifactStore).not.toHaveBeenCalled();
+    expect(extraPurgeDuties).not.toHaveBeenCalled();
+    expect(await threadIds(env)).toEqual(['acme_idle']);
+    expect(maintenanceLines(logs.lines())).toEqual([]);
+    expect(
+      await env.DB.prepare(
+        "SELECT name FROM sqlite_schema WHERE name = 'flowsafe_resource_owners'",
+      ).all(),
+    ).toMatchObject({ results: [] });
+  });
+
+  it.each([
+    undefined,
+    null,
+    false,
+    {},
+  ])('requires a callable batch for retention without changing the optional environment contract: %j', async (batch) => {
+    const logs = capturedLogs();
+    const artifactStore = vi.fn(() => ({ deleteRun: async () => 0 }));
+    const extraPurgeDuties = vi.fn(async () => ({ extraDuty: 'ran' }));
+    const worker = makeWorker({ artifactStore, extraPurgeDuties });
+    const { env } = makeEnv();
+    const dbWithoutBatch: FlowsafeWorkerEnv['DB'] = {
+      prepare: env.DB.prepare.bind(env.DB),
+    };
+    env.DB =
+      batch === undefined
+        ? dbWithoutBatch
+        : ({ ...dbWithoutBatch, batch } as FlowsafeWorkerEnv['DB']);
+    const context = retentionContext();
+
+    const outcome = await worker.runMaintenanceDuty('purge', env, context);
+
+    expect(outcome).toEqual({
+      ok: false,
+      error: expect.stringContaining('database.prepare() and batch()'),
+    });
+    expect(context.retentionCursor).toBeUndefined();
+    expect(artifactStore).not.toHaveBeenCalled();
+    expect(extraPurgeDuties).toHaveBeenCalledOnce();
+    expect(maintenanceLines(logs.lines())[0]).toMatchObject({
+      approvalsPurged: 0,
+      extraDuty: 'ran',
+    });
+    expect(
+      await env.DB.prepare(
+        "SELECT name FROM sqlite_schema WHERE name = 'flowsafe_resource_owners'",
+      ).all(),
+    ).toMatchObject({ results: [] });
+    expect(await worker.runMaintenanceDuty('sweep', env)).toMatchObject({
+      ok: true,
+    });
+  });
+
+  it('uses captured DB receivers and cursor values when the artifact factory changes their source', async () => {
+    capturedLogs();
+    const { env } = makeEnv();
+    const realDb = env.DB;
+    await realDb
+      .prepare(`CREATE TABLE mastra_workflow_snapshot (
+      workflow_name TEXT NOT NULL, run_id TEXT NOT NULL, resourceId TEXT,
+      snapshot TEXT NOT NULL, createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL,
+      UNIQUE(workflow_name, run_id)
+    )`)
+      .run();
+    const old = new Date(Date.now() - 90 * 86_400_000).toISOString();
+    for (const runId of ['already-scanned', 'eligible']) {
+      await realDb
+        .prepare(`INSERT INTO mastra_workflow_snapshot
+        VALUES ('wf', ?, NULL, ?, ?, ?)`)
+        .bind(
+          runId,
+          JSON.stringify({
+            status: 'success',
+            requestContext: {
+              'flowsafe.runProvenance': {
+                version: 2,
+                startToken: `start-${runId}`,
+              },
+            },
+          }),
+          old,
+          old,
+        )
+        .run();
+    }
+    const context = retentionContext();
+    const input = {
+      version: 1 as const,
+      tablePrefix: '',
+      startIdempotencyTable: 'flowsafe_start_idempotency',
+      snapshots: { afterRowId: 1, highWaterRowId: 2 },
+    };
+    context.retentionCursor = input;
+    let batchCalls = 0;
+    const batch = realDb.batch?.bind(realDb);
+    if (!batch) throw new Error('SQLite fixture requires batch');
+    const receiverDb: FlowsafeWorkerEnv['DB'] = {
+      prepare(query) {
+        expect(this).toBe(receiverDb);
+        return realDb.prepare(query);
+      },
+      async batch(statements) {
+        expect(this).toBe(receiverDb);
+        batchCalls += 1;
+        return batch(statements);
+      },
+    };
+    env.DB = receiverDb;
+    const artifactCalls: string[] = [];
+    const worker = makeWorker({
+      artifactStore: () => {
+        receiverDb.prepare = (query) => {
+          if (
+            query.includes('mastra_workflow_snapshot') ||
+            query.includes('flowsafe_resource_owners')
+          ) {
+            throw new Error('replacement prepare');
+          }
+          return realDb.prepare(query);
+        };
+        receiverDb.batch = async () => {
+          throw new Error('replacement batch');
+        };
+        input.snapshots.afterRowId = 0;
+        context.advanceRetentionCursor = async () => {
+          throw new Error('replacement callback');
+        };
+        return {
+          deleteRun: async (_workflowId, runId) => {
+            artifactCalls.push(runId);
+            return 0;
+          },
+        };
+      },
+    });
+
+    const outcome = await worker.runMaintenanceDuty('purge', env, context);
+
+    expect(outcome).toMatchObject({ ok: true });
+    expect(batchCalls).toBeGreaterThan(0);
+    expect(artifactCalls).toEqual(['eligible']);
+    expect(
+      await realDb.prepare('SELECT run_id FROM mastra_workflow_snapshot').all(),
+    ).toMatchObject({
+      results: [{ run_id: 'already-scanned' }],
+    });
+    expect(context.retentionCursor).toEqual({
+      version: 1,
+      tablePrefix: '',
+      startIdempotencyTable: 'flowsafe_start_idempotency',
+    });
+  });
+
+  it('contains an unprintable persistence rejection without starving sibling purges', async () => {
+    const logs = capturedLogs();
+    const extraPurgeDuties = vi.fn(async () => ({ extraDuty: 'ran' }));
+    const worker = makeWorker({ extraPurgeDuties });
+    const { env } = makeEnv();
+    await seedIdleThread(env);
+
+    const outcome = await worker.runMaintenanceDuty(
+      'purge',
+      {
+        ...env,
+        THREAD_RETENTION_DAYS: '30',
+      },
+      {
+        advanceRetentionCursor: async () => {
+          throw Object.create(null);
+        },
+      },
+    );
+
+    expect(outcome).toEqual({
+      ok: false,
+      error: expect.stringContaining('retention-purge'),
+    });
+    expect(extraPurgeDuties).toHaveBeenCalledOnce();
+    expect(await threadIds(env)).toEqual([]);
+    expect(maintenanceLines(logs.lines())[0]).toMatchObject({
+      approvalsPurged: 0,
+      threadsPurged: 1,
+      extraDuty: 'ran',
+    });
+  });
+
+  it('contains an unprintable approval rejection without starving sibling purges', async () => {
+    const logs = capturedLogs();
+    const extraPurgeDuties = vi.fn(async () => ({ extraDuty: 'ran' }));
+    const worker = makeWorker({ extraPurgeDuties });
+    const { env } = makeEnv();
+    await seedIdleThread(env);
+    vi.spyOn(
+      approvalStoreFactoryFor(env.DB).store(),
+      'purgeExpired',
+    ).mockRejectedValue(Object.create(null));
+
+    const outcome = await worker.runMaintenanceDuty(
+      'purge',
+      {
+        ...env,
+        THREAD_RETENTION_DAYS: '30',
+      },
+      retentionContext(),
+    );
+
+    expect(outcome).toEqual({
+      ok: false,
+      error: expect.stringContaining(
+        'approval-retention-purge: unreadable error',
+      ),
+    });
+    expect(extraPurgeDuties).toHaveBeenCalledOnce();
+    expect(await threadIds(env)).toEqual([]);
+    expect(maintenanceLines(logs.lines())[0]).toMatchObject({
+      threadsPurged: 1,
+      extraDuty: 'ran',
+    });
   });
 
   it('isolates purge-duty failures: a broken snapshot purge stops neither the approval purge nor extra duties', async () => {
@@ -1069,17 +1842,25 @@ describe('createFlowsafeWorker maintenance duties', () => {
     });
 
     // #when
-    await worker.runMaintenanceDuty('purge', { ...env, DB: throwingDb });
+    await worker.runMaintenanceDuty(
+      'purge',
+      { ...env, DB: throwingDb },
+      retentionContext(),
+    );
 
     // #then — the failure is on record and the OTHER duties still folded
-    // into the one combined maintenance line
+    // into the one combined maintenance line. The line must name the cause
+    // this case injects, not only the surface: a fixture-shaped failure
+    // reaches the same surface, and a bare surface check passes while the
+    // isolation under test was never exercised.
     expect(
       logs
         .errors()
         .some(
           (line) =>
             line.includes('maintenance-error') &&
-            line.includes('retention-purge'),
+            line.includes('retention-purge') &&
+            line.includes('snapshot table wedged'),
         ),
     ).toBe(true);
     const lines = maintenanceLines(logs.lines());
@@ -1088,11 +1869,6 @@ describe('createFlowsafeWorker maintenance duties', () => {
     expect(lines[0]?.purged).toBeUndefined();
   });
 
-  // The agent-memory thread TTL (docs/agent-memory-isolation.md#thread-retention) as the
-  // purge alarm's third duty. Seeds the two memory tables the real
-  // @mastra/cloudflare-d1 schema creates (mastra-schema-guard.test.ts pins the
-  // column names); a fresh test DB has neither, which is itself the
-  // memory-less-deployment case the first test below rides.
   async function seedIdleThread(env: FlowsafeWorkerEnv): Promise<void> {
     await env.DB.prepare(
       'CREATE TABLE mastra_threads (id TEXT PRIMARY KEY, updatedAt TEXT NOT NULL)',
@@ -1129,7 +1905,7 @@ describe('createFlowsafeWorker maintenance duties', () => {
     await seedIdleThread(env);
 
     // #when
-    await worker.runMaintenanceDuty('purge', env);
+    await worker.runMaintenanceDuty('purge', env, retentionContext());
 
     // #then — the duty never ran: nothing in the log, nothing deleted
     const lines = maintenanceLines(logs.lines());
@@ -1145,10 +1921,14 @@ describe('createFlowsafeWorker maintenance duties', () => {
     await seedIdleThread(env);
 
     // #when
-    await worker.runMaintenanceDuty('purge', {
-      ...env,
-      THREAD_RETENTION_DAYS: '30',
-    });
+    await worker.runMaintenanceDuty(
+      'purge',
+      {
+        ...env,
+        THREAD_RETENTION_DAYS: '30',
+      },
+      retentionContext(),
+    );
 
     // #then — reaped WITH its messages, reported in the combined line
     const lines = maintenanceLines(logs.lines());
@@ -1160,7 +1940,6 @@ describe('createFlowsafeWorker maintenance duties', () => {
     });
   });
 
-  // Background-task TTL cleanup as the purge alarm's opt-in duty.
   async function seedOldCompletedTask(env: FlowsafeWorkerEnv): Promise<void> {
     await env.DB.prepare(
       `CREATE TABLE mastra_background_tasks (
@@ -1183,7 +1962,7 @@ describe('createFlowsafeWorker maintenance duties', () => {
     await seedOldCompletedTask(env);
 
     // #when
-    await worker.runMaintenanceDuty('purge', env);
+    await worker.runMaintenanceDuty('purge', env, retentionContext());
 
     // #then — the duty never ran when the feature was absent
     const lines = maintenanceLines(logs.lines());
@@ -1199,7 +1978,7 @@ describe('createFlowsafeWorker maintenance duties', () => {
     await seedOldCompletedTask(env);
 
     // #when
-    await worker.runMaintenanceDuty('purge', env);
+    await worker.runMaintenanceDuty('purge', env, retentionContext());
 
     // #then — reaped, reported in the combined maintenance line
     const lines = maintenanceLines(logs.lines());
@@ -1250,9 +2029,6 @@ describe('createFlowsafeWorker maintenance duties', () => {
   });
 
   it('isolates a THROWING thread purge: neither the snapshot purge, the approval purge, nor extra duties are starved', async () => {
-    // #given — a DB whose mastra_threads statements THROW (not merely missing).
-    // Isolating one duty while a sibling shares its failure is a defect class
-    // this codebase has already shipped once.
     const logs = capturedLogs();
     const { env } = makeEnv();
     const realDb = env.DB;
@@ -1270,11 +2046,15 @@ describe('createFlowsafeWorker maintenance duties', () => {
     });
 
     // #when
-    await worker.runMaintenanceDuty('purge', {
-      ...env,
-      DB: throwingDb,
-      THREAD_RETENTION_DAYS: '30',
-    });
+    await worker.runMaintenanceDuty(
+      'purge',
+      {
+        ...env,
+        DB: throwingDb,
+        THREAD_RETENTION_DAYS: '30',
+      },
+      retentionContext(),
+    );
 
     // #then — its own error surface, and every sibling duty still folded into
     // the one combined line
@@ -1284,7 +2064,8 @@ describe('createFlowsafeWorker maintenance duties', () => {
         .some(
           (line) =>
             line.includes('maintenance-error') &&
-            line.includes('thread-retention-purge'),
+            line.includes('thread-retention-purge') &&
+            line.includes('threads table wedged'),
         ),
     ).toBe(true);
     const lines = maintenanceLines(logs.lines());
@@ -1315,11 +2096,15 @@ describe('createFlowsafeWorker maintenance duties', () => {
     const worker = makeWorker();
 
     // #when
-    await worker.runMaintenanceDuty('purge', {
-      ...env,
-      DB: throwingDb,
-      THREAD_RETENTION_DAYS: '30',
-    });
+    await worker.runMaintenanceDuty(
+      'purge',
+      {
+        ...env,
+        DB: throwingDb,
+        THREAD_RETENTION_DAYS: '30',
+      },
+      retentionContext(),
+    );
 
     // #then — the thread TTL ran anyway
     const lines = maintenanceLines(logs.lines());
@@ -1337,10 +2122,14 @@ describe('createFlowsafeWorker maintenance duties', () => {
     await seedIdleThread(env);
 
     // #when
-    await worker.runMaintenanceDuty('purge', {
-      ...env,
-      THREAD_RETENTION_DAYS: '',
-    });
+    await worker.runMaintenanceDuty(
+      'purge',
+      {
+        ...env,
+        THREAD_RETENTION_DAYS: '',
+      },
+      retentionContext(),
+    );
 
     // #then — inert, exactly as if unset
     expect(maintenanceLines(logs.lines())[0]).not.toHaveProperty(
@@ -1361,10 +2150,14 @@ describe('createFlowsafeWorker maintenance duties', () => {
     await seedIdleThread(env);
 
     // #when
-    await worker.runMaintenanceDuty('purge', {
-      ...env,
-      THREAD_RETENTION_DAYS: '-5',
-    });
+    await worker.runMaintenanceDuty(
+      'purge',
+      {
+        ...env,
+        THREAD_RETENTION_DAYS: '-5',
+      },
+      retentionContext(),
+    );
 
     // #then — the operator's tripwire fires and NOTHING was deleted
     expect(
@@ -1393,7 +2186,11 @@ describe('createFlowsafeWorker maintenance duties', () => {
     const { env } = makeEnv();
 
     // #when
-    const outcome = await worker.runMaintenanceDuty('purge', env);
+    const outcome = await worker.runMaintenanceDuty(
+      'purge',
+      env,
+      retentionContext(),
+    );
 
     // #then — belt containment: the combined line still lands
     expect(
@@ -1402,7 +2199,8 @@ describe('createFlowsafeWorker maintenance duties', () => {
         .some(
           (line) =>
             line.includes('maintenance-error') &&
-            line.includes('extra-purge-duties'),
+            line.includes('extra-purge-duties') &&
+            line.includes('reaper wedged'),
         ),
     ).toBe(true);
     expect(maintenanceLines(logs.lines())).toHaveLength(1);
@@ -1469,7 +2267,8 @@ describe('createFlowsafeWorker storage table prefix', () => {
         resourceId TEXT,
         snapshot TEXT NOT NULL,
         createdAt TEXT NOT NULL,
-        updatedAt TEXT NOT NULL
+        updatedAt TEXT NOT NULL,
+        UNIQUE(workflow_name, run_id)
       )`,
     ).run();
     await env.DB.prepare(
@@ -1583,13 +2382,17 @@ describe('createFlowsafeWorker storage table prefix', () => {
       storageTablePrefix,
       backgroundTasks: {},
     });
-    await worker.runMaintenanceDuty('purge', {
-      ...env,
-      THREAD_RETENTION_DAYS: '30',
-      NOTIFICATION_RETENTION_DAYS: '30',
-      THREAD_STATE_RETENTION_DAYS: '30',
-      SCHEDULE_TRIGGER_RETENTION_DAYS: '30',
-    });
+    await worker.runMaintenanceDuty(
+      'purge',
+      {
+        ...env,
+        THREAD_RETENTION_DAYS: '30',
+        NOTIFICATION_RETENTION_DAYS: '30',
+        THREAD_STATE_RETENTION_DAYS: '30',
+        SCHEDULE_TRIGGER_RETENTION_DAYS: '30',
+      },
+      retentionContext(),
+    );
   }
 
   async function expectDomains(
@@ -1767,7 +2570,7 @@ describe('createFlowsafeWorker schedule tick duty', () => {
     const { env } = makeEnv();
 
     // #when the purge duty runs while the tick builder is present
-    await worker.runMaintenanceDuty('purge', env);
+    await worker.runMaintenanceDuty('purge', env, retentionContext());
 
     // #then the tick was never invoked; the purge ran as before
     expect(tickFn).not.toHaveBeenCalled();
@@ -1980,7 +2783,109 @@ describe('createFlowsafeWorker execution-fence administration', () => {
     });
   }
 
-  it('reads and moves the fence for an authenticated control plane', async () => {
+  it('keeps complete proof identity out of admin success and conflict payloads', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = ADMIN_SECRET;
+    const command = {
+      expected: 'open',
+      next: 'proof-only',
+      proofKey: 'key',
+      expectedMutationEpoch: 0,
+      expectedRevision: 0,
+    };
+    expect(
+      (
+        await worker.fetch(
+          fenceRequest({ method: 'POST', body: command }),
+          env,
+          ctx,
+        )
+      ).status,
+    ).toBe(200);
+    await env.DB.prepare(
+      "UPDATE flowsafe_execution_fence SET proof_run_id = 'run', proof_table_prefix = 'tenant_', proof_workflow_id = 'workflow', proof_start_token = 'private-generation'",
+    ).run();
+    const before = (
+      await env.DB.prepare('SELECT * FROM flowsafe_execution_fence').all()
+    ).results;
+    const expected = {
+      state: 'proof-only',
+      mutationEpoch: 0,
+      requireMutationEpoch: false,
+      transitionRevision: 1,
+      proofKey: 'key',
+      proofRunId: 'run',
+    };
+    for (const request of [
+      fenceRequest({ method: 'GET' }),
+      fenceRequest({ method: 'POST', body: command }),
+    ]) {
+      const response = await worker.fetch(request, env, ctx);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual(expected);
+    }
+    expect(
+      (await env.DB.prepare('SELECT * FROM flowsafe_execution_fence').all())
+        .results,
+    ).toEqual(before);
+    const conflict = await worker.fetch(
+      fenceRequest({
+        method: 'POST',
+        body: { ...command, expectedRevision: 2 },
+      }),
+      env,
+      ctx,
+    );
+    expect(conflict.status).toBe(409);
+    expect(await conflict.json()).toEqual({
+      error: 'execution fence transition conflicts with the current reading',
+      reason: {
+        code: 'FENCE_CAS_CONFLICT',
+        ...expected,
+        conflict: 'expectation-mismatch',
+      },
+    });
+    const reset = await worker.fetch(
+      fenceRequest({
+        method: 'POST',
+        body: {
+          expected: 'proof-only',
+          next: 'proof-only',
+          proofKey: 'key',
+          expectedMutationEpoch: 0,
+          expectedRevision: 1,
+          proofExecution: { startToken: 'forged' },
+        },
+      }),
+      env,
+      ctx,
+    );
+    expect(reset.status).toBe(200);
+    expect(await reset.json()).toEqual({
+      state: 'proof-only',
+      mutationEpoch: 0,
+      requireMutationEpoch: false,
+      transitionRevision: 2,
+      proofKey: 'key',
+    });
+    expect(
+      (
+        await env.DB.prepare(
+          'SELECT proof_run_id, proof_table_prefix, proof_workflow_id, proof_start_token FROM flowsafe_execution_fence',
+        ).all()
+      ).results,
+    ).toEqual([
+      {
+        proof_run_id: null,
+        proof_table_prefix: null,
+        proof_workflow_id: null,
+        proof_start_token: null,
+      },
+    ]);
+  });
+
+  it('returns versioned readings for both admin methods', async () => {
     // #given
     const worker = makeWorker();
     const { env, ctx } = makeEnv();
@@ -1993,7 +2898,12 @@ describe('createFlowsafeWorker execution-fence administration', () => {
       ctx,
     );
     expect(initial.status).toBe(200);
-    expect(await initial.json()).toEqual({ state: 'open' });
+    expect(await initial.json()).toEqual({
+      state: 'open',
+      mutationEpoch: 0,
+      requireMutationEpoch: false,
+      transitionRevision: 0,
+    });
 
     // #when — the control plane drains, then locks.
     const drained = await worker.fetch(
@@ -2005,7 +2915,12 @@ describe('createFlowsafeWorker execution-fence administration', () => {
       ctx,
     );
     expect(drained.status).toBe(200);
-    expect(await drained.json()).toEqual({ state: 'draining' });
+    expect(await drained.json()).toEqual({
+      state: 'draining',
+      mutationEpoch: 0,
+      requireMutationEpoch: false,
+      transitionRevision: 1,
+    });
 
     // #then — a STALE expectation is a 409 carrying the current state, so the
     // loser of a control-plane race can re-plan without a second round trip.
@@ -2052,6 +2967,154 @@ describe('createFlowsafeWorker execution-fence administration', () => {
     expect(await observed.json()).toEqual({
       state: 'proof-only',
       proofKey: 'proof-1',
+      mutationEpoch: 0,
+      requireMutationEpoch: false,
+      transitionRevision: 3,
+    });
+  });
+
+  it('requires versioned expectations after activation', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = ADMIN_SECRET;
+    const command = {
+      expected: 'open',
+      next: 'draining',
+      expectedMutationEpoch: 0,
+      expectedRevision: 0,
+      advanceMutationEpoch: true,
+    };
+    const active = {
+      state: 'draining',
+      mutationEpoch: 1,
+      requireMutationEpoch: true,
+      transitionRevision: 1,
+    };
+    const activated = await worker.fetch(
+      fenceRequest({ method: 'POST', body: command }),
+      env,
+      ctx,
+    );
+    expect(activated.status).toBe(200);
+    expect(await activated.json()).toEqual(active);
+    for (const [body, conflict] of [
+      [
+        { expected: 'draining', next: 'open' },
+        'versioned-expectation-required',
+      ],
+      [{ ...command, next: 'open' }, 'expectation-mismatch'],
+    ]) {
+      const response = await worker.fetch(
+        fenceRequest({ method: 'POST', body }),
+        env,
+        ctx,
+      );
+      expect(response.status).toBe(409);
+      expect(await response.json()).toEqual({
+        error: 'execution fence transition conflicts with the current reading',
+        reason: { code: 'FENCE_CAS_CONFLICT', ...active, conflict },
+      });
+    }
+  });
+
+  it('keeps exact CAS response-loss retry identity through admin JSON', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = ADMIN_SECRET;
+    const db = env.DB;
+    const prepare = db.prepare.bind(db);
+    vi.spyOn(db, 'prepare').mockImplementation((sql) => {
+      const original = prepare(sql);
+      if (!sql.startsWith('UPDATE flowsafe_execution_fence')) return original;
+      const bind = original.bind.bind(original);
+      original.bind = (...values) => {
+        const bound = bind(...values);
+        const all = bound.all.bind(bound);
+        bound.all = async () => {
+          await all();
+          throw new Error('UPDATE response lost');
+        };
+        return bound;
+      };
+      return original;
+    });
+    const command = {
+      expected: 'open',
+      next: 'proof-only',
+      proofKey: 'proof-a',
+      expectedMutationEpoch: 0,
+      expectedRevision: 0,
+      advanceMutationEpoch: true,
+    };
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const response = await worker.fetch(
+        fenceRequest({ method: 'POST', body: command }),
+        env,
+        ctx,
+      );
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        state: 'proof-only',
+        proofKey: 'proof-a',
+        mutationEpoch: 1,
+        requireMutationEpoch: true,
+        transitionRevision: 1,
+      });
+    }
+    const changed = await worker.fetch(
+      fenceRequest({
+        method: 'POST',
+        body: { ...command, proofKey: 'proof-b' },
+      }),
+      env,
+      ctx,
+    );
+    expect(changed.status).toBe(503);
+    expect(await changed.json()).toEqual({
+      error: 'execution fence transition could not be recorded',
+      reason: { code: 'EXECUTION_FENCE_UNREADABLE' },
+    });
+  });
+
+  it('does not expose receipts or accept malformed epoch fields', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = ADMIN_SECRET;
+    const command = {
+      expected: 'open',
+      next: 'open',
+      expectedMutationEpoch: 0,
+      expectedRevision: 0,
+    };
+    for (const invalid of [
+      { expectedMutationEpoch: '0' },
+      { expectedMutationEpoch: null },
+      { expectedRevision: '0' },
+      { expectedRevision: -1 },
+      { expectedRevision: 0.5 },
+      { advanceMutationEpoch: 'true' },
+      { advanceMutationEpoch: null },
+    ]) {
+      const response = await worker.fetch(
+        fenceRequest({ method: 'POST', body: { ...command, ...invalid } }),
+        env,
+        ctx,
+      );
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({
+        reason: { code: 'INVALID_EXECUTION_FENCE_REQUEST' },
+      });
+    }
+    const response = await worker.fetch(
+      fenceRequest({ method: 'POST', body: command }),
+      env,
+      ctx,
+    );
+    expect(await response.json()).toEqual({
+      state: 'open',
+      mutationEpoch: 0,
+      requireMutationEpoch: false,
+      transitionRevision: 1,
     });
   });
 
@@ -2272,5 +3335,149 @@ describe('createFlowsafeWorker drain inventory', () => {
       ctx,
     );
     expect(response.status).toBe(405);
+  });
+});
+
+describe('FS8 D3 proof activation Worker composition', () => {
+  it.each([
+    '',
+    'PROOF_',
+  ])('passes its captured trusted namespace %s into actual approval decisions', async (configuredPrefix) => {
+    const h = makeEnv();
+    const prefix = configuredPrefix.toLowerCase();
+    const runId = 'acme_run-proof';
+    const fence = executionFenceFor(h.env.DB);
+    await fence.seed('migration-locked');
+    await fence.transition({
+      expected: 'migration-locked',
+      next: 'proof-only',
+      proofKey: 'key',
+    });
+    await h.env.DB.prepare(
+      'UPDATE flowsafe_execution_fence SET proof_run_id = ?, proof_table_prefix = ?, proof_workflow_id = ?, proof_start_token = ?',
+    )
+      .bind(runId, prefix, 'wf', 'generation')
+      .run();
+    await h.env.DB.prepare(
+      `CREATE TABLE ${prefix}mastra_workflow_snapshot (workflow_name TEXT, run_id TEXT, resourceId TEXT, snapshot TEXT, createdAt TEXT, updatedAt TEXT)`,
+    ).run();
+    await h.env.DB.prepare(
+      `INSERT INTO ${prefix}mastra_workflow_snapshot VALUES (?,?,?,?,?,?)`,
+    )
+      .bind(
+        'wf',
+        runId,
+        null,
+        JSON.stringify({
+          runId,
+          status: 'suspended',
+          requestContext: {
+            'flowsafe.runProvenance': {
+              version: 2,
+              startToken: 'generation',
+              attemptToken: 'attempt',
+              resumeCounts: [],
+            },
+          },
+        }),
+        'created',
+        'updated',
+      )
+      .run();
+    const store = approvalStoreFactoryFor(h.env.DB, prefix).store();
+    const now = new Date().toISOString();
+    const { record } = await store.create({
+      id: 'approval-proof',
+      workflowId: 'wf',
+      runId,
+      title: 'proof',
+      connectors: [],
+      priority: 'normal',
+      status: 'pending',
+      requestedBy: 'other',
+      requestedByKind: 'human',
+      createdAt: now,
+      updatedAt: now,
+    });
+    const overrides: Partial<FlowsafeWorkerConfig<FlowsafeWorkerEnv>> = {
+      storageTablePrefix: configuredPrefix,
+      buildResumeRun: () => async () => successSummary(runId),
+    };
+    const worker = makeWorker(overrides);
+    overrides.storageTablePrefix = 'changed_';
+    const response = await worker.fetch(
+      authed(`http://host/api/approvals/${record.id}/decide`, {
+        method: 'POST',
+        body: JSON.stringify({ decision: 'approve' }),
+      }),
+      h.env,
+      h.ctx,
+    );
+    expect((await store.get(record.id))?.status).toBe('approved');
+    expect(response.status).toBe(200);
+    await h.flush();
+  });
+
+  it.each([
+    'initial',
+    'result',
+  ] as const)('uses the private persistedStart %s callback through the actual Worker router', async (kind) => {
+    const h = makeEnv();
+    const store = startIdempotencyFor(h.env.DB);
+    await store.reserve({
+      key: 'key',
+      owner: { kind: 'human', id: 'ada' },
+      targetKind: 'workflow',
+      targetId: 'wf',
+      mintRunId: () => 'acme_run-proof',
+    });
+    const requests: string[] = [];
+    const summary = successSummary('acme_run-proof');
+    h.env.RUNNER = {
+      idFromName: (name) => name,
+      get: () => ({
+        fetch: async (url: string) => {
+          requests.push(url);
+          if (url.includes('?replay=1'))
+            return new Response(
+              JSON.stringify({
+                kind,
+                execution: {
+                  tablePrefix: '',
+                  workflowId: 'wf',
+                  runId: 'acme_run-proof',
+                  startToken: 'generation',
+                  owner: { kind: 'human', id: 'ada' },
+                  target: { kind: 'workflow', id: 'wf' },
+                },
+                ...(kind === 'result' ? { value: summary } : {}),
+              }),
+            );
+          if (url.includes('start-liveness'))
+            return new Response(JSON.stringify({ live: true }));
+          throw new Error('public status or start was unexpectedly used');
+        },
+      }),
+    };
+    const response = await makeWorker().fetch(
+      authed('http://host/runs', {
+        method: 'POST',
+        body: JSON.stringify({ workflowId: 'wf', idempotencyKey: 'key' }),
+      }),
+      h.env,
+      h.ctx,
+    );
+    const reservation = await store.read('key');
+    expect(reservation?.binding.kind).toBe(
+      kind === 'result' ? 'bound' : 'unbound',
+    );
+    expect(requests[0]).toContain('?replay=1');
+    expect(response.status).toBe(kind === 'result' ? 200 : 503);
+    if (kind === 'result') expect(await response.json()).toMatchObject(summary);
+    else
+      expect(await response.json()).toMatchObject({
+        reason: { code: 'IDEMPOTENT_START_PENDING' },
+      });
+    await h.flush();
   });
 });

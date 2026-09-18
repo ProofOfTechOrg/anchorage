@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import type { RunSummary } from './runtime.js';
 import {
   dueSuspensionDeadline,
+  isArmableSuspensionDeadlineMs,
   isReadableRunSummary,
   isSuspensionTimeoutResumeData,
   MASTRA_WORKFLOW_META_KEY,
@@ -77,6 +78,53 @@ function storedRecord(
 ): SuspensionDeadlineRecord {
   return { version: 1, workflowId: 'gated', runId: 'run-1', entries };
 }
+
+describe('isArmableSuspensionDeadlineMs', () => {
+  it('retains the public duration bounds', () => {
+    expect(MIN_SUSPENSION_DEADLINE_MS).toBe(1_000);
+    expect(MAX_SUSPENSION_DEADLINE_MS).toBe(31_536_000_000);
+  });
+
+  it.each([
+    ['minimum', 1_000, true],
+    ['within range', 900_000, true],
+    ['maximum', 31_536_000_000, true],
+    ['below minimum', 999, false],
+    ['above maximum', 31_536_000_001, false],
+    ['zero', 0, false],
+    ['negative', -1_000, false],
+    ['fractional', 1_500.5, false],
+    ['unsafe integer', Number.MAX_SAFE_INTEGER + 1, false],
+    ['NaN', Number.NaN, false],
+    ['infinity', Number.POSITIVE_INFINITY, false],
+    ['negative infinity', Number.NEGATIVE_INFINITY, false],
+    ['string', '1000', false],
+    ['boolean', true, false],
+    ['null', null, false],
+    ['undefined', undefined, false],
+    ['object', { valueOf: () => 1_000 }, false],
+    ['array', [1_000], false],
+    ['bigint', 1_000n, false],
+    ['symbol', Symbol('deadline'), false],
+  ])('agrees with arming for %s', (_label, value, accepted) => {
+    expect(isArmableSuspensionDeadlineMs(value)).toBe(accepted);
+    expect(suspensionDeadlinesOf(armedSummary(value)).entries.length > 0).toBe(
+      accepted,
+    );
+  });
+
+  it('preserves distinct integer and range rejection reasons', () => {
+    expect(suspensionDeadlinesOf(armedSummary(1_500.5)).rejected).toEqual([
+      { step: 'gate', reason: 'flowsafe.deadlineMs must be a safe integer' },
+    ]);
+    expect(suspensionDeadlinesOf(armedSummary(999)).rejected).toEqual([
+      {
+        step: 'gate',
+        reason: 'flowsafe.deadlineMs must be between 1000 and 31536000000 ms',
+      },
+    ]);
+  });
+});
 
 describe('suspensionDeadlinesOf', () => {
   it('arms nothing for a run that is not suspended', () => {
@@ -921,6 +969,21 @@ describe('isReadableRunSummary', () => {
 });
 
 describe('suspension timeout resume data', () => {
+  it('accepts a test fixture without suspension fences or retry state', () => {
+    const data = suspensionTimeoutResumeData(
+      { step: 'gate', deadlineAt: 1_751_883_300_000 },
+      1_751_883_300_123,
+    );
+    expect(data).toEqual({
+      'flowsafe.suspensionTimeout': {
+        step: 'gate',
+        deadlineAt: 1_751_883_300_000,
+        expiredAt: 1_751_883_300_123,
+      },
+    });
+    expect(isSuspensionTimeoutResumeData(data)).toBe(true);
+  });
+
   it('wraps the expired entry under the reserved key', () => {
     const entry: SuspensionDeadlineEntry = {
       step: 'gate',

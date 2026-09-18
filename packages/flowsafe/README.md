@@ -25,7 +25,7 @@ Compatibility:
 - Node.js 22.13.0 or later (engine range `>=22.13.0`)
 - ESM only
 - TypeScript `moduleResolution: "NodeNext"`, `"Node16"`, or `"Bundler"`
-- `@mastra/core` `1.53.0`
+- `@mastra/core` `1.53.0`, with the patch this package ships under `patches/` applied at your application root — see [Apply the flowsafe patch to @mastra/core](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/getting-started.md#apply-the-flowsafe-patch-to-mastracore)
 - `react` and `react-dom` `>=18 <20` (React 18 or 19) for the optional approval UI
 - `@proofoftech/breakwater` `>=0.13.0 <1.0.0` when used
 - host-provided Wrangler `>=4.118 <5` for the optional `flowsafe-provision` CLI
@@ -38,6 +38,8 @@ Compatibility:
 | `@proofoftech/flowsafe/agent-host` | Server-only guarded-agent catalogs, authenticated run routes, thread hosting, NDJSON observation, and approval-only resume |
 | `@proofoftech/flowsafe/approval-api` | Approval records, actor resolver, service, deployment store, REST router, grants, SLA, retention, notifications, and stream events |
 | `@proofoftech/flowsafe/do-runner` | Durable Object runner, D1 storage, deployment sentinel, run summaries, snapshot provenance, identities, pub/sub, and retention |
+| `@proofoftech/flowsafe/do-runner/constants` | Suspension deadline values, duration validation, and timeout detection |
+| `@proofoftech/flowsafe/do-runner/testing` | Timeout resume fixtures for workflow tests |
 | `@proofoftech/flowsafe/approval-ui` | Styling-library-agnostic React dashboard, DOM-free API client, headless hook, and live transport |
 | `@proofoftech/flowsafe/host-kit` | Authenticator and verifier seams, topologies, run/stream routers, approval bridges, and composed Worker |
 | `@proofoftech/flowsafe/host-kit/module` | Import-safe workflow module contract |
@@ -101,7 +103,7 @@ export class AppRunner extends DurableObjectRunner<Env> {
 }
 ```
 
-`init()` creates D1-backed Mastra storage from the conventional `DB` binding unless you inject storage. Workflow definitions use the same `createWorkflow()` and `createStep()` shape as Mastra. Flowsafe pins `@mastra/cloudflare-d1` 1.1.1 because the shipped D1 storage is written against that release's domain surface: it subclasses the adapter's background-tasks domain to apply the `TaskFilter.resourceId` predicate the adapter declares but omits from its SQL builder, and hand-writes the schedules, notifications, and thread-state domains the adapter does not ship at all. The pin also holds the adapter on its `@cloudflare/workers-types` v4 peer, which is the major Flowsafe and Agent Starter still build against.
+`init()` creates D1-backed Mastra storage from the conventional `DB` binding unless you inject storage. Workflow definitions use the same `createWorkflow()` and `createStep()` shape as Mastra. Flowsafe pins `@mastra/cloudflare-d1` 1.1.1 because the shipped D1 storage is written against that release's domain surface: it subclasses the adapter's background-tasks domain to apply the `TaskFilter.resourceId` predicate the adapter declares but omits from its SQL builder, and hand-writes the schedules, notifications, and thread-state domains the adapter does not ship at all. The pin also holds the adapter on its `@cloudflare/workers-types` v4 peer, which is the major Flowsafe still builds against.
 
 If the deployment uses a table prefix, pass one shared constant to storage and host maintenance:
 
@@ -176,7 +178,7 @@ A suspended step can carry its own deadline. It arms one by adding the reserved 
 import {
   isSuspensionTimeoutResumeData,
   SUSPENSION_DEADLINE_PAYLOAD_KEY,
-} from '@proofoftech/flowsafe/do-runner';
+} from '@proofoftech/flowsafe/do-runner/constants';
 import { z } from 'zod';
 
 const gate = createStep({
@@ -200,7 +202,11 @@ const gate = createStep({
 });
 ```
 
-The value is relative milliseconds between `MIN_SUSPENSION_DEADLINE_MS` and `MAX_SUSPENSION_DEADLINE_MS`. A step that declares a Zod `suspendSchema` must declare the reserved field or use a loose object, because Mastra substitutes the parsed suspend payload and a strict schema strips unknown keys. A step that declares a `resumeSchema` must accept the timeout envelope as well as its own signal shape, or the timeout resume fails validation and the deadline is abandoned after the runner's retries. The timeout resume delivers `SUSPENSION_TIMEOUT_RESUME_KEY` wrapping the expired step, its deadline, and the expiry time; branch on `isSuspensionTimeoutResumeData()` instead of the literal key, and build the same envelope in your own tests from that key and the `SuspensionTimeoutEnvelope` and `SuspensionTimeoutResumeData` types. Only the runner mints it: a resume request that carries the reserved key is rejected. It records `requestedByKind: 'system'` with the reserved `SUSPENSION_DEADLINE_PRINCIPAL_ID`, and it is not an approval decision: it mints no grant and records no reviewer.
+Use `isArmableSuspensionDeadlineMs(value)` to validate relative milliseconds against the runner's safe-integer and inclusive duration bounds. Import it, those duration bounds and the reserved payload keys from `@proofoftech/flowsafe/do-runner/constants` to avoid loading the runner graph; the per-run cap `MAX_SUSPENSION_DEADLINES_PER_RUN` comes from `@proofoftech/flowsafe/do-runner`. A step declaring a Zod `suspendSchema` must declare the reserved field or use a loose object, because Mastra replaces the suspend payload with parsed output. Its `resumeSchema` must accept the timeout envelope as well as the signal shape.
+
+For workflow tests, import `suspensionTimeoutResumeData` from `@proofoftech/flowsafe/do-runner/testing` and call it with `{ step, deadlineAt }` and an expiry time. It returns the alarm's envelope shape; `isSuspensionTimeoutResumeData` checks that shape without authenticating its origin. Public resume requests containing the reserved key are rejected. Alarm resumes record system provenance and do not grant approval.
+
+Import `suspensionDeadlinesOf` from `@proofoftech/flowsafe/do-runner` to inspect a `RunSummary`. It returns derived entries and rejected requests without scheduling a wake or mutating the summary. See the [acceptance rules](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/do-runner-design.md#inspect-and-test-suspension-deadlines).
 
 Only a top-level suspended step can arm a deadline. A step suspended inside a nested workflow is reported under the nested path while its suspension time is recorded against the enclosing step, so there is nothing to fence the resume against; the deadline is refused and logged instead of armed.
 
@@ -302,15 +308,42 @@ Fleet control planes can import the same fail-closed sentinel implementation fro
 
 One Flowsafe deployment is one tenant, so the execution fence controls the complete deployment. `open` admits all work. `draining` refuses new run mints and future-work authoring while existing runs and deliveries finish. It still accepts new background-task enqueues and dispatches queued tasks because both are drainable work. Background-task enqueue, dispatch, and stale-task re-drive are refused in `migration-locked` and `proof-only`. Signal wakes that would mint a run persist instead. `migration-locked` refuses execution, and `proof-only` admits only the nominated start and its bound run. The fence never preempts compute already in flight.
 
-Provisioning requires `--initial-fence-state open` or `--initial-fence-state migration-locked`; it never chooses a default. A pre-0.20 database without a fence row reads as `open`. For locked-at-birth provisioning, read `GET /admin/execution-fence` afterward and fail unless it reports `migration-locked`.
+Provisioning requires `--initial-fence-state open` or `--initial-fence-state migration-locked`; it never chooses a default. An absent pre-0.20 table or empty five-column legacy table reads as optional `open`. Initialization adds epoch/revision metadata without reopening existing state. A missing row once any metadata column exists is unreadable and is never silently refilled. For locked-at-birth provisioning, read `GET /admin/execution-fence` afterward and fail unless it reports `migration-locked`.
 
-Use `GET /admin/inventory` while the fence remains `draining`. A drain is proven only after every work category is empty across two complete sweeps at least 60 seconds apart. Readings are point-in-time observations rather than snapshots and can move in either direction while draining admits work. Empty results cannot over-count, and keyset pagination never skips a row that existed before the sweep began. If you need a hard guarantee, re-sweep once after transitioning to `migration-locked`: an empty post-lock sweep is conclusive; a non-empty one means work is still outstanding, either because it entered after the proof or because the lock parked it before it finished. Return to `draining` and repeat the proof. An inventory read taken under `migration-locked` measures what the fence parked rather than what the deployment would otherwise be doing. Schedules and signal subscriptions are standing configuration and need not empty. Persisted idle signals are deliberately unenumerable and carry into the replacement deployment.
+Administrative readings include `mutationEpoch`, `requireMutationEpoch`, and `transitionRevision`. Upgraded commands compare expected state, epoch, and revision; exact retries preserve proof bindings and timestamps while that command remains the last applied command. Advancing the epoch also sets its sticky requirement; ordinary lock, proof, and reopen transitions preserve both. Upgrade the deployment's writers and configure their trusted artifact epoch before activation. See the [administration contract](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/deployment-reference.md#control-plane-routes) for request fields, compatibility, and conflicts.
+
+The `do-runner` and `host-kit` entry points export `normalizeRunExecutionIdentity`, `normalizeD1RunExecutionIdentity`, `normalizeStartIdentity`, `normalizeStartExecutionIdentity`, and mutation-epoch validation/header helpers. They copy validated identity data without authenticating it. String D1 prefixes normalize to lowercase; null explicitly means no D1 namespace and differs from the empty default prefix.
+
+New reservations are unbound until an exact winning claim or an observed result binds their physical execution. Runtime generates a separate execution token for each new run generation, and proof-only re-entry compares its namespace, workflow, run and generation. Stored `proofExecution` stays server-side and is omitted from admin JSON.
+
+D1 schedule mutations enforce the captured caller epoch at their final SQL boundary. A fenced custom facade must provide `FENCED_SCHEDULE_STORAGE` on the same database as its configured fence. Direct D1 methods require `batch()` and accept a trailing `MutationEpochContext`; omission refuses after activation. Pause/delete and HTTP no-ops retain epoch checks. Use the [schedule guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/durable-agents.md#add-schedules) for fixed pause/resume methods, custom facade compatibility and uncertain-write outcomes.
+
+With a configured fence, Runtime requires the actual D1 domain's positive initial-write witness before engine entry. Without a fence, capable D1 keeps its real namespace and ordinary persistence behavior; custom storage explicitly asserts no D1 namespace. Managed hosts persist preparation journals and require a matching nonpending durable outcome before acknowledging execution. A valid pending generation returns `RUN_START_PENDING` with status 503; keyed retries use the idempotent-start refusal contract. See the [runner design](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/do-runner-design.md#execution-fence-and-start-reservations) for exact claims, replay and recovery.
+
+Use `GET /admin/inventory` while the fence remains `draining`. A drain is proven only after every work category is empty across two complete sweeps at least 60 seconds apart. A pending agent-inbox notification scheduled for later, or carrying no due timestamp, is work and keeps the proof open. Readings are point-in-time observations rather than snapshots and can move in either direction while draining admits work. Empty results cannot over-count, and keyset pagination never skips a row that existed before the sweep began. If you need a hard guarantee, re-sweep once after transitioning to `migration-locked`: an empty post-lock sweep is conclusive; a non-empty one means work is still outstanding, either because it entered after the proof or because the lock parked it before it finished. Return to `draining` and repeat the proof. An inventory read taken under `migration-locked` measures what the fence parked rather than what the deployment would otherwise be doing. Schedules and signal subscriptions are standing configuration and need not empty. Persisted idle signals are deliberately unenumerable and carry into the replacement deployment.
 
 ### Runtime ids are opaque
 
 The host mints opaque, path-safe run and thread ids. `RunnerRuntime.start()` requires a host-owned run id and has no generation fallback. The id scopes the snapshot, Durable Object, approval lookup, stream address, and artifact path, but it carries no customer identity.
 
 Callers that need exactly-once start behavior supply an `idempotencyKey`, never a run ID. The key is available on `POST /runs`, trusted agent-host starts, and `streamUntilPersisted()`. A retry returns the same persisted run. `IDEMPOTENT_START_PENDING` includes `pendingSince`; re-probe the point-in-time `IDEMPOTENT_START_UNRESOLVABLE` result before acting. A key remains valid until its reservation-retention horizon expires.
+
+### Pass application context at start
+
+An authenticated `POST /runs` can supply a non-reserved application context:
+
+```json
+{
+  "workflowId": "publish",
+  "inputData": { "topic": "release notes" },
+  "idempotencyKey": "publish-request-123",
+  "requestContext": { "app.agentId": "agent_123" }
+}
+```
+
+`requestContext` must be an object when present. Invalid shapes and reserved keys return HTTP 400 with `reason: "reserved-context-key"`. The router validates it after authentication and workflow authorization, then passes it to the host's `beforeStart` policy. Use that hook for application-specific attribution rules; possession of a run token does not establish an arbitrary context value's business meaning.
+
+The protected topology carries this value into `storedRequestContext`. Provider application values override stored values, while trusted execution identity and capabilities retain their authority. Verified schedule targets supply their own context, including an omitted value. Persisted application values survive resume; a keyed replay retains the winning run's context and still performs validation and host policy checks. See the [request-context guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/do-runner-design.md#request-context) and [host policy signatures](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/deployment-reference.md#host-composition).
 
 ### Stores are deployment-wide
 
@@ -406,13 +439,21 @@ Agent event replay lasts only as long as the configured Mastra cache. The defaul
 
 ### Signals and notifications
 
-`createThreadSignalRoutes()` hosts message, queue, signal, state, and notification delivery in the thread Durable Object. `createSignalRouter()` is the Worker trust boundary: authenticate, authorize, ownership-check, cap, parse, reject memory ids, allowlist attributes, rate-limit, audit, then forward.
+`createThreadSignalRoutes()` hosts message, queue, signal, state, and notification delivery in the thread Durable Object. `createSignalRouter()` authenticates Worker requests before reaching those routes. Its optional `validateThreadTarget` uses the existing `BoundThreadTargetValidator` type for host-specific binding or ownership restrictions. See the [signal-ingress guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/durable-agents.md#expose-signal-ingestion) for strict-owner composition.
+
+Signal acceptance is audited after the downstream response succeeds. Thread refusals with status 404 use a consistent public response across registry, validator and downstream checks. An audit-sink failure retains the selected response.
 
 The thread routes reject a signal whose `tagName` is not an XML name, and drop an attributes object carrying a value Mastra cannot render or a key that is not an XML name. Both are what core would otherwise throw on while rendering the signal inside the agent turn.
 
 Configure `ThreadSignalRoutesOptions.contentPolicy` when signal content needs a domain policy before it becomes model input. The Thread Durable Object invokes this structural callback for direct ingestion, provider delivery, schedule fires, and notification dispatch. Its `text` is Mastra's canonical escaped XML representation. A denial stops direct delivery with 422, settles a scheduled fire as discarded, or terminally discards the affected notification.
 
-A policy failure is opaque, and each lane recovers the way it already recovers from any other failure: direct delivery returns 503, schedule state is left unsettled so the lease expires and a later tick retries, and notification dispatch uses its existing backoff. A webhook whose matched deliveries the deployment could not decide is answered with 503 so the provider's own at-least-once redelivery recovers it; each delivery carries a dedupe key derived from the signed bytes and the subscription, so a redelivery coalesces into a still-pending row rather than duplicating it. A content denial is terminal and answers 2xx, because redelivering the identical bytes would only be denied again. Poll deliveries report the same three outcomes and depend on the adapter re-reporting state it has not seen accepted. Give a network-backed policy its own timeout and failure budget inside the callback; FlowSafe imposes neither.
+A policy failure is opaque: direct delivery returns 503, schedule state is left unsettled so the lease expires and a later tick retries, and notification dispatch records a bounded retry. A webhook whose matched deliveries the deployment could not decide is answered with 503 so the provider's own at-least-once redelivery recovers it; each delivery carries a dedupe key derived from the signed bytes and the subscription, so a redelivery coalesces into a still-pending row rather than duplicating it. A content denial is terminal and answers 2xx, because redelivering the identical bytes would only be denied again. Poll deliveries report the same three outcomes and depend on the adapter re-reporting state it has not seen accepted. Give a network-backed policy its own timeout and failure budget inside the callback; FlowSafe imposes neither.
+
+Configure the same positive safe-integer `maxDeliveryAttempts` on `createNotificationDispatchTick()` and `createThreadSignalRoutes()`. Both default to `DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS`. A recorded failure at the bound discards the notification with `deliveryReason: "delivery-attempts-exhausted"`, retaining its count and last error. An already-exhausted row is never sent; its discard is conditional on the observed record remaining current. Below the bound, existing retry delays apply.
+
+Dispatch requires `NotificationDeliveryStorage`; `D1NotificationsStorage` implements it. A custom store's `updateNotificationDeliveryIfUnchanged()` must compare the captured observation and apply the failure patch atomically against its other writers. Ordinary Core storage still serves notification ingestion; the `@mastra/core` patch is required for either path. See the [delivery and receipt guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/durable-agents.md#bound-notification-delivery) for custom-store migration, lost responses and receipt retention.
+
+Summary source counts and a configured source delivery policy read own properties only where the shipped `@mastra/core` patch is applied; without it a source named after an `Object.prototype` member is miscounted in the summary core renders and selects an inherited policy entry instead of the configured priority or default action. Flowsafe refuses notification ingestion and dispatch on an unpatched install, and refuses to construct a notification dispatch tick that does delivery work.
 
 Adapt Breakwater without adding a FlowSafe runtime dependency on it:
 
@@ -495,6 +536,10 @@ Complete wiring is in the [durable-agents guide](https://github.com/ProofOfTechO
 
 The composed `createFlowsafeWorker()` owns the shared route and maintenance-duty pipeline. Hosts inject workflows, identity verification, topology-backed optional routers, budget wrappers, notification transport, an invocation-scoped artifact-store factory, the storage table prefix, schedule tick, and extra purge duties.
 
+Configure `mutationEpoch` with a nonnegative safe integer or a synchronous environment callback. The Worker captures it before deployment verification or authentication, then forwards it through trusted contexts and protected internal headers. Start paths preserve the original actor, principal, epoch and selectors across waits, including class-backed context method receivers. Do not accept the epoch from public headers or start JSON.
+
+The internal durable-agent host start requires an eighth `AgentStartAuthority` argument, with an explicit `onPreparedStartIdentity` property. Built-in hosts supply `undefined` while Runtime and owner journals remain v1. This transport does not activate final-write epoch checks or managed recovery; the [deployment reference](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/deployment-reference.md#configure-the-trusted-caller-epoch) and [durable-agents guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/durable-agents.md) describe the boundary.
+
 Protect `GET` and `POST /admin/execution-fence` plus `GET /admin/inventory` with a distinct `MAINTENANCE_ADMIN_SECRET`. Fence transitions use CAS and return `409` with `FENCE_CAS_CONFLICT` when the expected state is stale. Fenced execution returns `503` with an `EXECUTION_FENCED` reason. The agent-host and stream routers preserve structured `503` and `409` refusals instead of collapsing them to a generic `500`.
 
 Every leaf option that accepts `ExecutionFenceWiring` requires an explicit store or `'none'`. Run-router, agent-thread-topology, and storage initialization also require explicit start-idempotency wiring. Use `'none'` only when no database exists. `BackgroundTaskHost` no longer exposes its manager; call `enqueue()`, `getTask()`, `listTasks()`, or `stream()` on the host and use `BackgroundTaskReads` for read-only route composition.
@@ -544,3 +589,5 @@ pnpm --filter @proofoftech/flowsafe spike:verify:llm
 ## License
 
 Apache-2.0.
+
+`patches/@mastra__core@1.53.0.patch` is a modification of `@mastra/core` `1.53.0`, which is licensed under Apache-2.0 and copyright its authors. It changes that package's published runtime chunks to correct the two defects reported as mastra-ai/mastra#23693 and mastra-ai/mastra#23694.

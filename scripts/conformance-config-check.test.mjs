@@ -184,20 +184,20 @@ test('the harness wrangler configurations match the contract', () => {
       [...stateClasses, contract.newDurableObjectBinding.className],
     ],
   ]) {
-    const config = wranglerConfig(name);
+    const harnessConfig = wranglerConfig(name);
     assert.deepEqual(
-      migrationClasses(config.migrations).sort(),
+      migrationClasses(harnessConfig.migrations).sort(),
       [...expected].sort(),
       `${name} migrations do not match the contract`,
     );
     assert.deepEqual(
-      config.durable_objects.bindings
+      harnessConfig.durable_objects.bindings
         .map((binding) => binding.class_name)
         .sort(),
       [...expected].sort(),
       `${name} Durable Object bindings do not match the contract`,
     );
-    assert.equal(config.compatibility_date, contract.compatibilityDate);
+    assert.equal(harnessConfig.compatibility_date, contract.compatibilityDate);
   }
 
   // The candidate owns no class and binds only into the state script; release
@@ -243,9 +243,17 @@ test('the harness wrangler configurations match the contract', () => {
       .split('\n}')[0]
       .matchAll(/readonly ([A-Z][A-Z0-9_]*)\??: NamespaceLike/gu),
   ].map((match) => match[1]);
-  assert.ok(
-    declaredCandidateBindings.length > 0,
-    'no candidate Durable Object bindings were found to compare',
+  // `contract.json` lists the trusted state script's bindings and names the
+  // audit proxy by class, so the candidate's namespace set is written out here.
+  const expectedCandidateBindings = [
+    'AUDIT_PROXY',
+    'CONFORMANCE_STATE',
+    'CONFORMANCE_V2',
+  ];
+  assert.deepEqual(
+    [...declaredCandidateBindings].sort(),
+    expectedCandidateBindings,
+    'ConformanceCandidateEnv declares a different namespace binding set',
   );
   assert.deepEqual(
     candidateV2.durable_objects.bindings.map((binding) => binding.name).sort(),
@@ -278,8 +286,8 @@ test('the harness fixtures are equal across every configuration', () => {
 
   for (const field of ['DEPLOYMENT_IDENTITY_SECRET', 'DEPLOYMENT_TENANT']) {
     const values = configs
-      .filter(([, config]) => config.vars?.[field] !== undefined)
-      .map(([name, config]) => [name, config.vars[field]]);
+      .filter(([, harnessConfig]) => harnessConfig.vars?.[field] !== undefined)
+      .map(([name, harnessConfig]) => [name, harnessConfig.vars[field]]);
     assert.ok(
       values.length === configs.length,
       `${field} is absent from ${configs.length - values.length} configuration(s)`,

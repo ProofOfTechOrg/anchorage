@@ -3,7 +3,7 @@
 // ISO-cutoff comparisons execute in SQLite, while the Wrangler harness owns
 // D1 concurrency, transaction, and runtime fidelity.
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   openSqlite,
@@ -34,6 +34,8 @@ import { D1ThreadStateStorage } from '../signals/thread-state-d1.js';
 import type { D1DatabaseBinding } from './cf-types.js';
 import {
   createD1Storage,
+  type PurgeExpiredRunsOptions,
+  parseRunRetentionCursor,
   purgeExpiredBackgroundTasks,
   purgeExpiredNotifications,
   purgeExpiredScheduleTriggers,
@@ -42,14 +44,21 @@ import {
   purgeExpiredWorkflowRuns,
   RUN_TTL_FLOWSAFE_PURGE_TABLES,
   type RunDeadlineCursor,
+  type RunRetentionCursor,
   type SnapshotDatabase,
   type SnapshotStatement,
   sweepExpiredRunDeadlines,
 } from './d1-storage.js';
+import { normalizeStartExecutionIdentity } from './execution-admission.js';
+import { FENCED_WORKFLOW_STORAGE } from './fenced-workflow-capability.js';
+import { FencedWorkflowsStorageD1 } from './fenced-workflows-d1.js';
+import { parseRunLifecycle } from './run-lifecycle.js';
+import { decodeRunStartIdentity } from './run-provenance.js';
 import {
   START_IDEMPOTENCY_DDL,
   START_IDEMPOTENCY_TABLE,
 } from './start-idempotency.js';
+import { validateTablePrefix } from './table-prefix.js';
 
 // Domain-local result-envelope adapter for pure purge SQL units. It maps
 // node:sqlite's affected-row count to the structural SnapshotDatabase seam;
@@ -72,13 +81,20 @@ function d1Like(db: SqliteDatabase): SnapshotDatabase {
   return { prepare: (sql: string) => statement(sql, []) };
 }
 
+type RetentionTestDatabase = SnapshotDatabase &
+  Required<Pick<SnapshotDatabase, 'batch'>>;
+
+function retentionDb(db: SqliteDatabase): RetentionTestDatabase {
+  return sqliteUnitDatabase(db) as RetentionTestDatabase;
+}
+
 function lifecycleStores(db: SqliteDatabase): {
-  snapshots: SnapshotDatabase;
+  snapshots: RetentionTestDatabase;
   resources: D1ResourceOwnershipStore;
 } {
   const binding = sqliteUnitDatabase(db);
   return {
-    snapshots: binding as SnapshotDatabase,
+    snapshots: binding as RetentionTestDatabase,
     resources: new D1ResourceOwnershipStore(
       binding as ResourceOwnershipDatabase,
     ),
@@ -98,7 +114,8 @@ function createSnapshotTable(db: SqliteDatabase, prefix = ''): void {
       resourceId TEXT,
       snapshot TEXT NOT NULL,
       createdAt TEXT NOT NULL,
-      updatedAt TEXT NOT NULL
+      updatedAt TEXT NOT NULL,
+      UNIQUE(workflow_name, run_id)
     )`,
   ).run();
 }
@@ -248,6 +265,11 @@ interface PublicStoragePrefixCase {
 
 const PUBLIC_STORAGE_PREFIX_CASES = [
   {
+    name: 'FencedWorkflowsStorageD1',
+    construct: (binding, tablePrefix) =>
+      new FencedWorkflowsStorageD1({ binding: binding as never, tablePrefix }),
+  },
+  {
     name: 'D1NotificationsStorage',
     construct: (binding, tablePrefix) =>
       new D1NotificationsStorage(
@@ -317,7 +339,12 @@ const PUBLIC_PURGE_CASES = [
   {
     name: 'purgeExpiredWorkflowRuns',
     run: (db, tablePrefix, now) =>
-      purgeExpiredWorkflowRuns(db, { ttlMs: DAY_MS, tablePrefix, now }),
+      purgeExpiredWorkflowRuns(db as RetentionTestDatabase, {
+        advanceCursor: async () => {},
+        ttlMs: DAY_MS,
+        tablePrefix,
+        now,
+      }),
   },
   {
     name: 'purgeExpiredThreads',
@@ -347,6 +374,56 @@ const PUBLIC_PURGE_CASES = [
 ] satisfies PublicPurgeCase[];
 
 describe('sweepExpiredRunDeadlines', () => {
+  it.each([
+    'transition',
+    'cursor',
+  ] as const)('contains a throwing Error.message during %s failure reporting', async (boundary) => {
+    const db = openSqlite();
+    createSnapshotTable(db);
+    seedDeadlineRun(db, {
+      runId: 'poison',
+      status: 'suspended',
+      revision: 1,
+      deadlineAt: NOW - 2,
+    });
+    seedDeadlineRun(db, {
+      runId: 'eligible',
+      status: 'suspended',
+      revision: 1,
+      deadlineAt: NOW - 1,
+    });
+    const failure = Object.defineProperty(new Error(), 'message', {
+      get() {
+        throw new Error('message getter failed');
+      },
+    });
+    const attempts: string[] = [];
+    const advances: string[] = [];
+    let cursor: RunDeadlineCursor | undefined;
+    await expect(
+      sweepExpiredRunDeadlines(d1Like(db), {
+        now: () => NOW,
+        transition: async (candidate) => {
+          attempts.push(candidate.runId);
+          if (boundary === 'transition' && candidate.runId === 'poison')
+            throw failure;
+        },
+        advanceCursor: async (next) => {
+          advances.push(next.runId);
+          if (boundary === 'cursor' && next.runId === 'poison') throw failure;
+          cursor = next;
+        },
+      }),
+    ).rejects.toThrow(/1 of 2 run\(s\) failed \(wf\/poison:/);
+    expect(attempts).toEqual(['poison', 'eligible']);
+    expect(advances).toEqual(['poison', 'eligible']);
+    expect(cursor).toEqual({
+      workflowId: 'wf',
+      runId: 'eligible',
+      deadlineAt: NOW - 1,
+    });
+  });
+
   it('bounds a pass, isolates failures, and re-drives the failed row', async () => {
     const db = openSqlite();
     createSnapshotTable(db);
@@ -592,6 +669,133 @@ describe('sweepExpiredRunDeadlines', () => {
 });
 
 describe('createD1Storage table prefix', () => {
+  it('rejects non-string prefixes without coercion', () => {
+    const coerce = vi.fn(() => 'safe_');
+    const object = {
+      toString: coerce,
+      [Symbol.toPrimitive]: coerce,
+      get length() {
+        coerce();
+        return 5;
+      },
+    };
+    for (const value of [
+      true,
+      false,
+      null,
+      1,
+      [],
+      new String('safe_'),
+      object,
+    ]) {
+      const prefix = value as unknown as string;
+      expect(() => validateTablePrefix(prefix)).toThrow(
+        'Invalid tablePrefix: use an empty prefix',
+      );
+      const prepare = vi.fn();
+      const binding = { prepare } as unknown as D1DatabaseBinding;
+      expect(() => createD1Storage({ binding, tablePrefix: prefix })).toThrow(
+        'Invalid tablePrefix: use an empty prefix',
+      );
+      for (const { construct } of PUBLIC_STORAGE_PREFIX_CASES)
+        expect(() => construct(binding, prefix)).toThrow(
+          'Invalid tablePrefix: use an empty prefix',
+        );
+      expect(prepare).not.toHaveBeenCalled();
+    }
+    expect(coerce).not.toHaveBeenCalled();
+    for (const value of [
+      undefined,
+      '',
+      '_tenant_01_',
+      'tenant_01_',
+      MAX_TABLE_PREFIX,
+    ])
+      expect(validateTablePrefix(value)).toBe(value);
+    expect(() => validateTablePrefix(OVERLONG_TABLE_PREFIX, 'custom')).toThrow(
+      'Invalid custom: must be at most 39 characters',
+    );
+  });
+
+  it('preserves inherited and non-enumerable disabled or custom domain overrides', async () => {
+    const binding = sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding;
+    const custom = new FencedWorkflowsStorageD1({ binding: binding as never });
+    for (const mode of ['inherited', 'non-enumerable']) {
+      for (const workflows of [false, custom]) {
+        const values = { workflows, threadState: false, notifications: false };
+        const domains =
+          mode === 'inherited'
+            ? Object.create(values)
+            : Object.defineProperties(
+                {},
+                Object.fromEntries(
+                  Object.entries(values).map(([key, value]) => [
+                    key,
+                    { value },
+                  ]),
+                ),
+              );
+        Object.defineProperty(domains, 'ignored', {
+          enumerable: true,
+          get() {
+            throw new Error('unknown getter');
+          },
+        });
+        const storage = createD1Storage({ binding, domains });
+        expect(await storage.getStore('workflows')).toBe(
+          workflows === false ? undefined : custom,
+        );
+        expect(await storage.getStore('threadState')).toBeUndefined();
+        expect(await storage.getStore('notifications')).toBeUndefined();
+      }
+    }
+  });
+
+  it('captures composition inputs before either storage constructor', async () => {
+    const first = sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding;
+    const second = sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding;
+    let bindingReads = 0;
+    let workflowReads = 0;
+    let domainReads = 0;
+    let prefixReads = 0;
+    let idReads = 0;
+    const domains = {
+      get workflows() {
+        workflowReads += 1;
+        return workflowReads === 1 ? undefined : (false as const);
+      },
+    };
+    const storage = createD1Storage({
+      get binding() {
+        return ++bindingReads === 1 ? first : second;
+      },
+      get id() {
+        idReads += 1;
+        return 'captured';
+      },
+      get tablePrefix() {
+        return ++prefixReads === 1 ? 'First_' : 'second_';
+      },
+      get domains() {
+        domainReads += 1;
+        return domains;
+      },
+    });
+    await storage.init();
+    const workflows = await storage.getStore('workflows');
+    expect(workflows).toBeInstanceOf(FencedWorkflowsStorageD1);
+    if (!(workflows instanceof FencedWorkflowsStorageD1))
+      throw new Error('missing owned workflow domain');
+    expect(workflows[FENCED_WORKFLOW_STORAGE]?.database).toBe(first);
+    expect(workflows[FENCED_WORKFLOW_STORAGE]?.tablePrefix).toBe('first_');
+    expect([
+      bindingReads,
+      workflowReads,
+      domainReads,
+      prefixReads,
+      idReads,
+    ]).toEqual([1, 1, 1, 1, 1]);
+  });
   it('uses the shared Mastra-compatible identifier rule', () => {
     const binding = sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding;
 
@@ -657,7 +861,8 @@ describe('public purge table-prefix validation', () => {
   }) => {
     let prepareCalls = 0;
     let nowCalls = 0;
-    const db: SnapshotDatabase = {
+    const db: RetentionTestDatabase = {
+      batch: async () => [],
       prepare: () => {
         prepareCalls += 1;
         throw new Error('prepare must not run');
@@ -683,7 +888,8 @@ describe('public purge table-prefix validation', () => {
   }) => {
     let prepareCalls = 0;
     let nowCalls = 0;
-    const db: SnapshotDatabase = {
+    const db: RetentionTestDatabase = {
+      batch: async () => [],
       prepare: () => {
         prepareCalls += 1;
         throw new Error('prepare must not run');
@@ -705,8 +911,6 @@ describe('public purge table-prefix validation', () => {
 
 describe('purgeExpiredWorkflowRuns', () => {
   it('deletes only stale TERMINAL runs and returns the count', async () => {
-    // #given — every terminal status seeded fresh AND stale, every live
-    // status seeded stale
     const sqlite = openSqlite();
     createSnapshotTable(sqlite);
     for (const status of TERMINAL) {
@@ -731,16 +935,11 @@ describe('purgeExpiredWorkflowRuns', () => {
         updatedAt: NOW - 30 * DAY_MS,
       });
     }
-
-    // #when — 7-day TTL
-    const deleted = await purgeExpiredWorkflowRuns(d1Like(sqlite), {
+    const deleted = await purgeExpiredWorkflowRuns(retentionDb(sqlite), {
+      advanceCursor: async () => {},
       ttlMs: 7 * DAY_MS,
       now: () => NOW,
     });
-
-    // #then — exactly the six stale terminal rows are gone; fresh terminal
-    // rows and ALL live rows (however old — a stale suspended run is a
-    // pending approval, not garbage) survive
     expect(deleted).toBe(TERMINAL.length);
     expect(remainingRunIds(sqlite)).toEqual(
       [
@@ -769,7 +968,8 @@ describe('purgeExpiredWorkflowRuns', () => {
     });
 
     await expect(
-      purgeExpiredWorkflowRuns(d1Like(sqlite), {
+      purgeExpiredWorkflowRuns(retentionDb(sqlite), {
+        advanceCursor: async () => {},
         ttlMs: 7 * DAY_MS,
         now: () => NOW,
       }),
@@ -778,7 +978,6 @@ describe('purgeExpiredWorkflowRuns', () => {
   });
 
   it('returns 0 when nothing qualifies', async () => {
-    // #given
     const sqlite = openSqlite();
     createSnapshotTable(sqlite);
     seedRun(sqlite, {
@@ -786,10 +985,9 @@ describe('purgeExpiredWorkflowRuns', () => {
       status: 'success',
       updatedAt: NOW - 1 * DAY_MS,
     });
-
-    // #when / #then
     expect(
-      await purgeExpiredWorkflowRuns(d1Like(sqlite), {
+      await purgeExpiredWorkflowRuns(retentionDb(sqlite), {
+        advanceCursor: async () => {},
         ttlMs: 7 * DAY_MS,
         now: () => NOW,
       }),
@@ -821,6 +1019,7 @@ describe('purgeExpiredWorkflowRuns', () => {
 
     expect(
       await purgeExpiredWorkflowRuns(snapshots, {
+        advanceCursor: async () => {},
         ttlMs: 7 * DAY_MS,
         now: () => NOW,
         resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
@@ -852,6 +1051,7 @@ describe('purgeExpiredWorkflowRuns', () => {
 
     await expect(
       purgeExpiredWorkflowRuns(snapshots, {
+        advanceCursor: async () => {},
         ttlMs: 7 * DAY_MS,
         now: () => NOW,
         resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
@@ -881,7 +1081,7 @@ describe('purgeExpiredWorkflowRuns', () => {
     });
     const backingBatch = binding.batch?.bind(binding);
     if (!backingBatch) throw new Error('test D1 adapter must provide batch');
-    const racing: SnapshotDatabase = {
+    const racing: RetentionTestDatabase = {
       prepare: binding.prepare.bind(binding),
       batch: async (statements) => {
         sqlite
@@ -895,6 +1095,7 @@ describe('purgeExpiredWorkflowRuns', () => {
 
     expect(
       await purgeExpiredWorkflowRuns(racing, {
+        advanceCursor: async () => {},
         ttlMs: 7 * DAY_MS,
         now: () => NOW,
         resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
@@ -908,7 +1109,6 @@ describe('purgeExpiredWorkflowRuns', () => {
   });
 
   it('respects the table prefix', async () => {
-    // #given — two tables in one database, only the prefixed one targeted
     const sqlite = openSqlite();
     createSnapshotTable(sqlite);
     createSnapshotTable(sqlite, 'flowsafe_');
@@ -923,23 +1123,18 @@ describe('purgeExpiredWorkflowRuns', () => {
       updatedAt: NOW - 8 * DAY_MS,
       prefix: 'flowsafe_',
     });
-
-    // #when
-    const deleted = await purgeExpiredWorkflowRuns(d1Like(sqlite), {
+    const deleted = await purgeExpiredWorkflowRuns(retentionDb(sqlite), {
+      advanceCursor: async () => {},
       ttlMs: 7 * DAY_MS,
       tablePrefix: 'flowsafe_',
       now: () => NOW,
     });
-
-    // #then
     expect(deleted).toBe(1);
     expect(remainingRunIds(sqlite)).toEqual(['unprefixed']);
     expect(remainingRunIds(sqlite, 'flowsafe_')).toEqual([]);
   });
 
   it('skips malformed snapshot rows instead of aborting the purge', async () => {
-    // #given — a corrupt (non-JSON) snapshot beside a valid stale terminal
-    // row and a valid stale live row
     const sqlite = openSqlite();
     createSnapshotTable(sqlite);
     seedRun(sqlite, {
@@ -960,21 +1155,16 @@ describe('purgeExpiredWorkflowRuns', () => {
          VALUES ('wf', 'corrupt', NULL, 'not-json{oops', ?, ?)`,
       )
       .run(corruptIso, corruptIso);
-
-    // #when — one corrupt row must not abort reclaiming the valid ones
-    const deleted = await purgeExpiredWorkflowRuns(d1Like(sqlite), {
+    const deleted = await purgeExpiredWorkflowRuns(retentionDb(sqlite), {
+      advanceCursor: async () => {},
       ttlMs: 7 * DAY_MS,
       now: () => NOW,
     });
-
-    // #then — the valid stale terminal row is gone; the corrupt row (not
-    // provably terminal — fail safe) and the live row survive
     expect(deleted).toBe(1);
     expect(remainingRunIds(sqlite)).toEqual(['corrupt', 'stale-live']);
   });
 
   it('treats the TTL boundary exclusively: exactly-at-cutoff rows survive', async () => {
-    // #given — a run whose updatedAt equals the cutoff instant
     const sqlite = openSqlite();
     createSnapshotTable(sqlite);
     seedRun(sqlite, {
@@ -982,10 +1172,9 @@ describe('purgeExpiredWorkflowRuns', () => {
       status: 'success',
       updatedAt: NOW - 7 * DAY_MS,
     });
-
-    // #when / #then — strict < : the boundary row is not yet expired
     expect(
-      await purgeExpiredWorkflowRuns(d1Like(sqlite), {
+      await purgeExpiredWorkflowRuns(retentionDb(sqlite), {
+        advanceCursor: async () => {},
         ttlMs: 7 * DAY_MS,
         now: () => NOW,
       }),
@@ -993,20 +1182,17 @@ describe('purgeExpiredWorkflowRuns', () => {
   });
 
   it('treats a MISSING snapshot table as zero purgeable runs (Mastra creates it lazily)', async () => {
-    // #given — a database where no run ever persisted, so Mastra's lazy
-    // CREATE TABLE never happened
     const sqlite = openSqlite();
-
-    // #when / #then — maintenance purge must not fail until some unrelated run
-    // initializes the schema
     expect(
-      await purgeExpiredWorkflowRuns(d1Like(sqlite), {
+      await purgeExpiredWorkflowRuns(retentionDb(sqlite), {
+        advanceCursor: async () => {},
         ttlMs: 7 * DAY_MS,
         now: () => NOW,
       }),
     ).toBe(0);
     expect(
-      await purgeExpiredWorkflowRuns(d1Like(sqlite), {
+      await purgeExpiredWorkflowRuns(retentionDb(sqlite), {
+        advanceCursor: async () => {},
         ttlMs: 7 * DAY_MS,
         now: () => NOW,
         artifactStore: {
@@ -1019,8 +1205,6 @@ describe('purgeExpiredWorkflowRuns', () => {
   });
 
   it("pairs each purged run's artifact deletion with its snapshot row when artifactStore is wired", async () => {
-    // #given — a stale terminal run beside a fresh terminal and a stale live
-    // one; only the first is eligible
     const sqlite = openSqlite();
     createSnapshotTable(sqlite);
     seedRun(sqlite, {
@@ -1045,16 +1229,12 @@ describe('purgeExpiredWorkflowRuns', () => {
         return 2;
       },
     };
-
-    // #when
-    const deleted = await purgeExpiredWorkflowRuns(d1Like(sqlite), {
+    const deleted = await purgeExpiredWorkflowRuns(retentionDb(sqlite), {
+      advanceCursor: async () => {},
       ttlMs: 7 * DAY_MS,
       now: () => NOW,
       artifactStore,
     });
-
-    // #then — exactly the purged run's artifacts went with its row; the
-    // survivors keep theirs; deployment teardown deletes the bound bucket.
     expect(deleted).toBe(1);
     expect(deletedArtifacts).toEqual(['wf/stale-done']);
     expect(remainingRunIds(sqlite)).toEqual(['fresh-done', 'stale-open']);
@@ -1077,7 +1257,7 @@ describe('purgeExpiredWorkflowRuns', () => {
     });
     const backingBatch = binding.batch?.bind(binding);
     if (!backingBatch) throw new Error('test D1 adapter must provide batch');
-    const racing: SnapshotDatabase = {
+    const racing: RetentionTestDatabase = {
       prepare: binding.prepare.bind(binding),
       batch: async (statements) => {
         sqlite
@@ -1091,6 +1271,7 @@ describe('purgeExpiredWorkflowRuns', () => {
 
     expect(
       await purgeExpiredWorkflowRuns(racing, {
+        advanceCursor: async () => {},
         ttlMs: 7 * DAY_MS,
         now: () => NOW,
         artifactStore: { deleteRun: async () => 1 },
@@ -1104,10 +1285,7 @@ describe('purgeExpiredWorkflowRuns', () => {
     });
   });
 
-  it('LIMIT-batches the artifact-paired path; the shrinking eligible set is the cursor', async () => {
-    // #given — three stale terminal runs, batch size 2 (the subrequest-
-    // budget guard: an unbounded first backlog would blow the Workers
-    // per-invocation cap)
+  it('bounds artifact work per invocation', async () => {
     const sqlite = openSqlite();
     createSnapshotTable(sqlite);
     for (const runId of ['stale-a', 'stale-b', 'stale-c']) {
@@ -1130,12 +1308,14 @@ describe('purgeExpiredWorkflowRuns', () => {
       artifactStore,
       limit: 2,
     };
-
-    // #when — two passes
-    const first = await purgeExpiredWorkflowRuns(d1Like(sqlite), options);
-    const second = await purgeExpiredWorkflowRuns(d1Like(sqlite), options);
-
-    // #then — the batches advance without a cursor row and stay paired
+    const first = await purgeExpiredWorkflowRuns(retentionDb(sqlite), {
+      advanceCursor: async () => {},
+      ...options,
+    });
+    const second = await purgeExpiredWorkflowRuns(retentionDb(sqlite), {
+      advanceCursor: async () => {},
+      ...options,
+    });
     expect(first).toBe(2);
     expect(second).toBe(1);
     expect(deletedArtifacts.sort()).toEqual(['stale-a', 'stale-b', 'stale-c']);
@@ -1143,9 +1323,6 @@ describe('purgeExpiredWorkflowRuns', () => {
   });
 
   it("a failing artifact delete leaves that run's snapshot row for the next sweep (artifacts-first ordering)", async () => {
-    // #given — artifacts go BEFORE the row: if this order ever flips, a
-    // crash between the two strands the artifacts forever (the row is their
-    // only enumerable record)
     const sqlite = openSqlite();
     createSnapshotTable(sqlite);
     seedRun(sqlite, {
@@ -1158,23 +1335,18 @@ describe('purgeExpiredWorkflowRuns', () => {
         throw new Error('R2 unavailable');
       },
     };
-
-    // #when / #then — the failure propagates (the purge duty logs it)...
     await expect(
-      purgeExpiredWorkflowRuns(d1Like(sqlite), {
+      purgeExpiredWorkflowRuns(retentionDb(sqlite), {
+        advanceCursor: async () => {},
         ttlMs: 7 * DAY_MS,
         now: () => NOW,
         artifactStore,
       }),
     ).rejects.toThrow('R2 unavailable');
-    // ...and the row survives as the retry cursor
     expect(remainingRunIds(sqlite)).toEqual(['stale-done']);
   });
 
   it("one run's wedged artifact delete does not stall the eligible rows behind it", async () => {
-    // #given — five stale terminal runs; only the middle one's deleteRun is
-    // permanently broken. Without per-run isolation the loop aborts at the
-    // same scan position EVERY firing and the runs behind it never purge.
     const sqlite = openSqlite();
     createSnapshotTable(sqlite);
     for (const runId of ['r1-ok', 'r2-ok', 'r3-bad', 'r4-ok', 'r5-ok']) {
@@ -1191,17 +1363,16 @@ describe('purgeExpiredWorkflowRuns', () => {
       },
     };
     const options = { ttlMs: 7 * DAY_MS, now: () => NOW, artifactStore };
-
-    // #when / #then — the pass purges the other four, then reports the
-    // failure (naming the run) so the purge duty's error surface still fires
     await expect(
-      purgeExpiredWorkflowRuns(d1Like(sqlite), options),
-    ).rejects.toThrow('wf/r3-bad: permanently broken');
+      purgeExpiredWorkflowRuns(retentionDb(sqlite), {
+        advanceCursor: async () => {},
+        ...options,
+      }),
+    ).rejects.toThrow('permanently broken');
     expect(remainingRunIds(sqlite)).toEqual(['r3-bad']);
-
-    // #then — a later pass with the store healed reaps the survivor
     expect(
-      await purgeExpiredWorkflowRuns(d1Like(sqlite), {
+      await purgeExpiredWorkflowRuns(retentionDb(sqlite), {
+        advanceCursor: async () => {},
         ...options,
         artifactStore: { deleteRun: async () => 1 },
       }),
@@ -1725,7 +1896,6 @@ describe('purgeExpiredThreads (agent-memory thread TTL)', () => {
 
 describe('purgeExpiredWorkflowRuns row-only batching', () => {
   it('LIMIT-batches the bulk path: one firing reclaims at most `limit` rows; the next resumes at the survivors', async () => {
-    // #given — more expired terminal rows than one batch
     const sqlite = openSqlite();
     createSnapshotTable(sqlite);
     for (let index = 0; index < 5; index += 1) {
@@ -1735,22 +1905,20 @@ describe('purgeExpiredWorkflowRuns row-only batching', () => {
         updatedAt: NOW - 40 * DAY_MS,
       });
     }
-    const db = d1Like(sqlite);
-
-    // #when — two firings at limit 3
+    const db = retentionDb(sqlite);
     const first = await purgeExpiredWorkflowRuns(db, {
+      advanceCursor: async () => {},
       ttlMs: 30 * DAY_MS,
       limit: 3,
       now: () => NOW,
     });
     const survivors = remainingRunIds(sqlite).length;
     const second = await purgeExpiredWorkflowRuns(db, {
+      advanceCursor: async () => {},
       ttlMs: 30 * DAY_MS,
       limit: 3,
       now: () => NOW,
     });
-
-    // #then — the shrinking eligible set is the cursor across firings
     expect(first).toBe(3);
     expect(survivors).toBe(2);
     expect(second).toBe(2);
@@ -1956,11 +2124,20 @@ async function signalDb(sqlite: SqliteDatabase): Promise<SignalDatabase> {
 
 function seedNotification(
   db: SqliteDatabase,
-  row: { id: string; threadId: string; status: string; updatedAt: number },
+  row: {
+    id: string;
+    threadId: string;
+    status: string;
+    updatedAt: number | string;
+    tablePrefix?: string;
+  },
 ): void {
-  const iso = new Date(row.updatedAt).toISOString();
+  const iso =
+    typeof row.updatedAt === 'string'
+      ? row.updatedAt
+      : new Date(row.updatedAt).toISOString();
   db.prepare(
-    `INSERT INTO mastra_notifications
+    `INSERT INTO ${row.tablePrefix ?? ''}mastra_notifications
        (id, thread_id, source, kind, priority, status, summary, coalescedCount,
         createdAt, updatedAt, deliveryAttempts)
      VALUES (?, ?, 'x', 'y', 'medium', ?, 'z', 1, ?, ?, 0)`,
@@ -2019,11 +2196,162 @@ describe('purgeExpiredNotifications', () => {
     expect(ids).toEqual(['ancient-pending', 'fresh-delivered']);
   });
 
-  it('reads a missing table as zero', async () => {
+  describe.each(['', 'tenant_'])('table prefix %j', (tablePrefix) => {
+    it.each([
+      {
+        name: 'ordinary year',
+        now: '2026-07-07T12:00:00.000Z',
+        oldOffset: '2026-07-06T15:59:59.999+04:00',
+        futureOffset: '2026-07-06T07:00:00-06:00',
+        equalOffset: '2026-07-06T16:00:00+0400',
+      },
+      {
+        name: 'negative year',
+        now: '-000100-01-02T12:00:00.000Z',
+        oldOffset: '-000100-01-01T15:59:59.999+04:00',
+        futureOffset: '-000100-01-01T07:00:00-06:00',
+        equalOffset: '-000100-01-01T16:00:00+0400',
+      },
+    ])('applies notification TTL by Date chronology for $name', async ({
+      now,
+      oldOffset,
+      futureOffset,
+      equalOffset,
+    }) => {
+      const sqlite = openSqlite();
+      const binding = sqliteUnitDatabase(sqlite) as SignalDatabase;
+      await new D1NotificationsStorage(binding, tablePrefix).init();
+      const instant = new Date(now).getTime();
+      const cutoff = instant - DAY_MS;
+      const rows = [
+        {
+          id: 'extended-future',
+          status: 'delivered',
+          updatedAt: '+010000-01-01T00:00:00.000Z',
+        },
+        {
+          id: 'negative-past',
+          status: 'seen',
+          updatedAt: '-000200-01-01T00:00:00.000Z',
+        },
+        {
+          id: 'old-canonical',
+          status: 'dismissed',
+          updatedAt: new Date(cutoff - 1).toISOString(),
+        },
+        { id: 'old-offset', status: 'archived', updatedAt: oldOffset },
+        {
+          id: 'future-offset',
+          status: 'discarded',
+          updatedAt: futureOffset,
+        },
+        { id: 'equal-offset', status: 'delivered', updatedAt: equalOffset },
+        {
+          id: 'equal-canonical',
+          status: 'discarded',
+          updatedAt: new Date(cutoff).toISOString(),
+        },
+        { id: 'pending-old', status: 'pending', updatedAt: oldOffset },
+      ];
+      for (const row of rows) {
+        expect(Number.isFinite(new Date(row.updatedAt).getTime())).toBe(true);
+        seedNotification(sqlite, { ...row, threadId: 'thread', tablePrefix });
+      }
+      if (tablePrefix !== '') {
+        await new D1NotificationsStorage(binding, '').init();
+        seedNotification(sqlite, {
+          id: 'other-prefix',
+          threadId: 'thread',
+          status: 'delivered',
+          updatedAt: oldOffset,
+        });
+      }
+      const retained = rows.filter(
+        (row) =>
+          row.status === 'pending' ||
+          new Date(row.updatedAt).getTime() >= cutoff,
+      );
+      expect(
+        await purgeExpiredNotifications(d1Like(sqlite), {
+          ttlMs: DAY_MS,
+          tablePrefix,
+          now: () => instant,
+        }),
+      ).toBe(rows.length - retained.length);
+      expect(
+        sqlite
+          .prepare(
+            `SELECT id, status, updatedAt FROM ${tablePrefix}mastra_notifications ORDER BY id`,
+          )
+          .all(),
+      ).toEqual(retained.sort((a, b) => a.id.localeCompare(b.id)));
+      if (tablePrefix !== '') {
+        expect(
+          sqlite.prepare('SELECT id FROM mastra_notifications').all(),
+        ).toEqual([{ id: 'other-prefix' }]);
+      }
+    });
+
+    it('reads a missing table as zero', async () => {
+      const sqlite = openSqlite();
+      expect(
+        await purgeExpiredNotifications(d1Like(sqlite), {
+          ttlMs: DAY_MS,
+          tablePrefix,
+        }),
+      ).toBe(0);
+    });
+  });
+
+  it.each([
+    'invalid',
+    '0',
+    '2026-07-06T00:00:00',
+    '2026-07-06T00:00:00Z\0',
+    '+275760-09-13T00:00:00.001Z',
+  ])('retains unsupported raw updatedAt %j', async (updatedAt) => {
     const sqlite = openSqlite();
+    await signalDb(sqlite);
+    seedNotification(sqlite, {
+      id: 'unreadable',
+      threadId: 'thread',
+      status: 'delivered',
+      updatedAt,
+    });
     expect(
-      await purgeExpiredNotifications(d1Like(sqlite), { ttlMs: DAY_MS }),
+      await purgeExpiredNotifications(d1Like(sqlite), {
+        ttlMs: DAY_MS,
+        now: () => NOW,
+      }),
     ).toBe(0);
+    expect(sqlite.prepare('SELECT id FROM mastra_notifications').all()).toEqual(
+      [{ id: 'unreadable' }],
+    );
+  });
+
+  it.each([
+    { now: NaN, ttlMs: DAY_MS },
+    { now: Infinity, ttlMs: DAY_MS },
+    { now: 8_640_000_000_000_001, ttlMs: 0 },
+    { now: -8_640_000_000_000_000, ttlMs: 1 },
+  ])('rejects a cutoff outside the finite Date range: %j', async ({
+    now,
+    ttlMs,
+  }) => {
+    const sqlite = openSqlite();
+    await signalDb(sqlite);
+    seedNotification(sqlite, {
+      id: 'retained',
+      threadId: 'thread',
+      status: 'delivered',
+      updatedAt: NOW - 2 * DAY_MS,
+    });
+    await expect(
+      purgeExpiredNotifications(d1Like(sqlite), { ttlMs, now: () => now }),
+    ).rejects.toThrow();
+    expect(sqlite.prepare('SELECT id FROM mastra_notifications').all()).toEqual(
+      [{ id: 'retained' }],
+    );
   });
 });
 
@@ -2204,20 +2532,6 @@ describe('purgeExpiredScheduleTriggers', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Start-reservation retention.
-//
-// The reservation is what makes a spent idempotency key answerable, so its
-// retention has one hard rule and one soft one:
-//
-//   HARD  a reservation must NEVER be deleted while the run it names is still
-//         readable. Break it and the very next retry of that key mints a fresh
-//         run beside the live one — the exact double-execution the key was
-//         bought to prevent.
-//   SOFT  a reservation must eventually be deleted, or the one table this
-//         deployment cannot drain grows forever.
-// ---------------------------------------------------------------------------
-
 function createReservationTable(db: SqliteDatabase): void {
   db.prepare(START_IDEMPOTENCY_DDL).run();
 }
@@ -2264,8 +2578,7 @@ function reservationRows(
 }
 
 describe('purgeExpiredWorkflowRuns — start reservations', () => {
-  it('deletes a spent reservation in the SAME batch as its run’s snapshot', async () => {
-    // #given a completed run past both horizons, with its key already settled
+  it('removes an expired snapshot and legacy reservation', async () => {
     const sqlite = openSqlite();
     createSnapshotTable(sqlite);
     createReservationTable(sqlite);
@@ -2281,24 +2594,18 @@ describe('purgeExpiredWorkflowRuns — start reservations', () => {
       state: 'terminal',
       updatedAt: NOW - 8 * DAY_MS,
     });
-
-    // #when
     await purgeExpiredWorkflowRuns(sqliteUnitDatabase(sqlite) as never, {
+      advanceCursor: async () => {},
       ttlMs: 7 * DAY_MS,
       resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
       startIdempotencyTable: START_IDEMPOTENCY_TABLE,
       now: () => NOW,
     });
-
-    // #then both are gone, and gone together
     expect(remainingRunIds(sqlite)).toEqual([]);
     expect(reservationRows(sqlite)).toEqual([]);
   });
 
   it('KEEPS a reservation whose horizon has not elapsed, so a late retry is told ALREADY_SETTLED', async () => {
-    // #given a run at the run-TTL boundary but a key-validity horizon twice as
-    // long — the configuration a host uses when its callers retry for longer
-    // than it keeps run summaries
     const sqlite = openSqlite();
     createSnapshotTable(sqlite);
     createReservationTable(sqlite);
@@ -2314,19 +2621,14 @@ describe('purgeExpiredWorkflowRuns — start reservations', () => {
       state: 'terminal',
       updatedAt: NOW - 8 * DAY_MS,
     });
-
-    // #when
     await purgeExpiredWorkflowRuns(sqliteUnitDatabase(sqlite) as never, {
+      advanceCursor: async () => {},
       ttlMs: 7 * DAY_MS,
       startIdempotencyTtlMs: 30 * DAY_MS,
       resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
       startIdempotencyTable: START_IDEMPOTENCY_TABLE,
       now: () => NOW,
     });
-
-    // #then the snapshot is reclaimed and the reservation OUTLIVES it. That
-    // ordering is the whole point: a retry after this pass hits
-    // ALREADY_SETTLED instead of looking like a brand-new key.
     expect(remainingRunIds(sqlite)).toEqual([]);
     expect(reservationRows(sqlite)).toEqual([
       expect.objectContaining({ key: 'key-old', state: 'terminal' }),
@@ -2334,9 +2636,6 @@ describe('purgeExpiredWorkflowRuns — start reservations', () => {
   });
 
   it('floors the reservation horizon at the run TTL, whatever a caller asks for', async () => {
-    // #given a caller asking for a horizon SHORTER than run retention — a
-    // configuration in which a reservation would be reaped while its run is
-    // still readable, and the next retry of that key would start a second run
     const sqlite = openSqlite();
     createSnapshotTable(sqlite);
     createReservationTable(sqlite);
@@ -2351,25 +2650,18 @@ describe('purgeExpiredWorkflowRuns — start reservations', () => {
       state: 'terminal',
       updatedAt: NOW - 1 * DAY_MS,
     });
-
-    // #when
     await purgeExpiredWorkflowRuns(sqliteUnitDatabase(sqlite) as never, {
+      advanceCursor: async () => {},
       ttlMs: 7 * DAY_MS,
       startIdempotencyTtlMs: 1,
       startIdempotencyTable: START_IDEMPOTENCY_TABLE,
       now: () => NOW,
     });
-
-    // #then the run is not eligible, and neither is its reservation: the floor
-    // makes the dangerous configuration unreachable rather than merely unwise.
     expect(remainingRunIds(sqlite)).toEqual(['run-live']);
     expect(reservationRows(sqlite)).toHaveLength(1);
   });
 
-  it('marks a reservation the terminal reconcile missed, instead of stranding it', async () => {
-    // #given a run that completed and was purged, but whose reservation is
-    // still 'started' — the shape a crash between the terminal persist and
-    // settleRun leaves behind
+  it('preserves an unsettled legacy reservation after snapshot expiry', async () => {
     const sqlite = openSqlite();
     createSnapshotTable(sqlite);
     createReservationTable(sqlite);
@@ -2384,31 +2676,23 @@ describe('purgeExpiredWorkflowRuns — start reservations', () => {
       state: 'started',
       updatedAt: NOW - 8 * DAY_MS,
     });
-
-    // #when
     await purgeExpiredWorkflowRuns(sqliteUnitDatabase(sqlite) as never, {
+      advanceCursor: async () => {},
       ttlMs: 7 * DAY_MS,
       startIdempotencyTable: START_IDEMPOTENCY_TABLE,
       now: () => NOW,
     });
-
-    // #then it is terminal, its horizon re-stamped from THIS moment, and it
-    // survives this pass — so it is both purgeable later and out of the drain
-    // inventory now.
     expect(reservationRows(sqlite)).toEqual([
       {
         key: 'key-stranded',
         run_id: 'run-old',
-        state: 'terminal',
-        updated_at: NOW,
+        state: 'started',
+        updated_at: NOW - 8 * DAY_MS,
       },
     ]);
   });
 
   it('reaps a reservation ORPHANED by an earlier pass, once past its horizon', async () => {
-    // #given a reservation whose run's snapshot was purged long ago. The
-    // batch pairing can never see it again — its run is not in any eligible
-    // set — so without a sweep of its own this row would live forever.
     const sqlite = openSqlite();
     createSnapshotTable(sqlite);
     createReservationTable(sqlite);
@@ -2424,23 +2708,18 @@ describe('purgeExpiredWorkflowRuns — start reservations', () => {
       state: 'terminal',
       updatedAt: NOW - 1 * DAY_MS,
     });
-
-    // #when
     await purgeExpiredWorkflowRuns(sqliteUnitDatabase(sqlite) as never, {
+      advanceCursor: async () => {},
       ttlMs: 7 * DAY_MS,
       startIdempotencyTable: START_IDEMPOTENCY_TABLE,
       now: () => NOW,
     });
-
-    // #then only the one past its horizon
     expect(reservationRows(sqlite).map((row) => row.key)).toEqual([
       'key-young-orphan',
     ]);
   });
 
   it('never reaps an orphan candidate whose run is still readable', async () => {
-    // #given a reservation older than every horizon whose run STILL EXISTS —
-    // a live suspended run, which retention never touches
     const sqlite = openSqlite();
     createSnapshotTable(sqlite);
     createReservationTable(sqlite);
@@ -2455,26 +2734,16 @@ describe('purgeExpiredWorkflowRuns — start reservations', () => {
       state: 'terminal',
       updatedAt: NOW - 90 * DAY_MS,
     });
-
-    // #when
     await purgeExpiredWorkflowRuns(sqliteUnitDatabase(sqlite) as never, {
+      advanceCursor: async () => {},
       ttlMs: 7 * DAY_MS,
       startIdempotencyTable: START_IDEMPOTENCY_TABLE,
       now: () => NOW,
     });
-
-    // #then it survives. `NOT EXISTS (snapshot)` is not an optimization — it
-    // is what makes the HARD rule structural rather than a consequence of
-    // whatever a host configured the horizon to be.
     expect(reservationRows(sqlite)).toHaveLength(1);
   });
 
   it('sweeps orphans on the strict side of the horizon, and never one whose snapshot survives', async () => {
-    // #given the three rows the sweep's predicate has to separate, in ONE pass
-    // so they are judged by the same cutoff. With no `startIdempotencyTtlMs`
-    // the horizon is the run TTL, so the boundary is exactly NOW - 7 days and
-    // the comparison is `updated_at < cutoff` — strict, because a row AT the
-    // cutoff has not yet outlived it.
     const sqlite = openSqlite();
     createSnapshotTable(sqlite);
     createReservationTable(sqlite);
@@ -2491,8 +2760,6 @@ describe('purgeExpiredWorkflowRuns — start reservations', () => {
       state: 'terminal',
       updatedAt: cutoff - 1,
     });
-    // Old enough to sweep on age alone, but its run is still readable — a
-    // suspended run, which run retention never reclaims.
     seedRun(sqlite, {
       runId: 'run-still-here',
       status: 'suspended',
@@ -2504,19 +2771,12 @@ describe('purgeExpiredWorkflowRuns — start reservations', () => {
       state: 'terminal',
       updatedAt: NOW - 90 * DAY_MS,
     });
-
-    // #when
     await purgeExpiredWorkflowRuns(sqliteUnitDatabase(sqlite) as never, {
+      advanceCursor: async () => {},
       ttlMs: 7 * DAY_MS,
       startIdempotencyTable: START_IDEMPOTENCY_TABLE,
       now: () => NOW,
     });
-
-    // #then exactly the row PAST the horizon is gone. The at-cutoff row is the
-    // boundary this test exists for: a `<=` here would reap a key on the last
-    // instant it is still meant to answer ALREADY_SETTLED, and the retry that
-    // arrives in that instant would start a second run. The snapshot-backed row
-    // survives on `NOT EXISTS`, whatever its age, which is the HARD rule.
     expect(reservationRows(sqlite).map((row) => row.key)).toEqual([
       'key-at-cutoff',
       'key-with-snapshot',
@@ -2524,10 +2784,6 @@ describe('purgeExpiredWorkflowRuns — start reservations', () => {
   });
 
   it('still purges runs on a deployment where no key has ever been used', async () => {
-    // #given the reservation table wired but never created — its DDL is lazy,
-    // so a deployment on which nobody used a key has none. A batch naming a
-    // missing table fails as ONE TRANSACTION, which would take run retention
-    // down with it.
     const sqlite = openSqlite();
     createSnapshotTable(sqlite);
     await createResourceOwnershipSchema(sqliteUnitDatabase(sqlite) as never);
@@ -2536,27 +2792,21 @@ describe('purgeExpiredWorkflowRuns — start reservations', () => {
       status: 'success',
       updatedAt: NOW - 8 * DAY_MS,
     });
-
-    // #when
     const deleted = await purgeExpiredWorkflowRuns(
       sqliteUnitDatabase(sqlite) as never,
       {
+        advanceCursor: async () => {},
         ttlMs: 7 * DAY_MS,
         resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
         startIdempotencyTable: START_IDEMPOTENCY_TABLE,
         now: () => NOW,
       },
     );
-
-    // #then retention is enforced anyway: an absent table holds no reservation
-    // to reap, which is not a reason to stop reclaiming runs.
     expect(deleted).toBe(1);
     expect(remainingRunIds(sqlite)).toEqual([]);
   });
 
-  it('pairs reservations on the artifact path too', async () => {
-    // #given the per-run path a host with R2 artifacts takes — a different
-    // batch, and therefore a second place the pairing could have been missed
+  it('removes an expired snapshot and legacy reservation with an artifact store', async () => {
     const sqlite = openSqlite();
     createSnapshotTable(sqlite);
     createReservationTable(sqlite);
@@ -2571,28 +2821,23 @@ describe('purgeExpiredWorkflowRuns — start reservations', () => {
       state: 'terminal',
       updatedAt: NOW - 8 * DAY_MS,
     });
-
-    // #when
     await purgeExpiredWorkflowRuns(sqliteUnitDatabase(sqlite) as never, {
+      advanceCursor: async () => {},
       ttlMs: 7 * DAY_MS,
       artifactStore: { deleteRun: async () => 0 },
       startIdempotencyTable: START_IDEMPOTENCY_TABLE,
       now: () => NOW,
     });
-
-    // #then
     expect(remainingRunIds(sqlite)).toEqual([]);
     expect(reservationRows(sqlite)).toEqual([]);
   });
 
   it('refuses a reservation table name that is not a safe SQL identifier', async () => {
-    // #given — the name is interpolated into every statement above
     const sqlite = openSqlite();
     createSnapshotTable(sqlite);
-
-    // #when / #then
     await expect(
       purgeExpiredWorkflowRuns(sqliteUnitDatabase(sqlite) as never, {
+        advanceCursor: async () => {},
         ttlMs: DAY_MS,
         startIdempotencyTable: 'reservations; DROP TABLE x',
       }),
@@ -2602,16 +2847,2221 @@ describe('purgeExpiredWorkflowRuns — start reservations', () => {
 
 describe('RUN_TTL_FLOWSAFE_PURGE_TABLES', () => {
   it('names the production constants, not literals, so a rename fails here', () => {
-    // #given — the flowsafe-owned half of what run retention deletes from.
-    // It is separate from RUN_TTL_PURGE_TABLES because the schema guard's
-    // biconditional is over the `mastra_%` inventory: folding ours in would
-    // make that guard assert an equality it cannot mean.
-    //
-    // #then each entry is the EXPORTED name its purge statement interpolates.
-    // A rename of either table changes both sides at once, so this cannot drift
-    // the way a copied literal would.
     expect([...RUN_TTL_FLOWSAFE_PURGE_TABLES].sort()).toEqual(
       [RESOURCE_OWNERSHIP_TABLE, START_IDEMPOTENCY_TABLE].sort(),
     );
   });
+});
+
+function retentionSnapshot(
+  db: SqliteDatabase,
+  runId: string,
+  options: {
+    prefix?: string;
+    workflowId?: string;
+    token?: string;
+    provenance?: unknown;
+    status?: string;
+    padding?: string;
+  } = {},
+): void {
+  const execution = normalizeStartExecutionIdentity({
+    tablePrefix: options.prefix ?? '',
+    workflowId: options.workflowId ?? 'wf',
+    runId,
+    startToken: options.token ?? 'S1',
+    owner: { kind: 'human', id: 'initiator' },
+    target: { kind: 'workflow', id: 'logical' },
+  });
+  const provenance = options.provenance ?? {
+    version: 2,
+    startToken: execution.startToken,
+    startIdentity: { owner: execution.owner, target: execution.target },
+  };
+  if (options.provenance === undefined) decodeRunStartIdentity(provenance);
+  db.prepare(`INSERT INTO "${options.prefix ?? ''}mastra_workflow_snapshot"
+    (workflow_name,run_id,resourceId,snapshot,createdAt,updatedAt) VALUES (?,?,NULL,?,?,?)`).run(
+    options.workflowId ?? 'wf',
+    runId,
+    JSON.stringify({
+      status: options.status ?? 'success',
+      requestContext: { 'flowsafe.runProvenance': provenance },
+      padding: options.padding,
+    }),
+    new Date(NOW - 9 * DAY_MS).toISOString(),
+    new Date(NOW - 8 * DAY_MS).toISOString(),
+  );
+}
+
+function retentionReservation(
+  db: SqliteDatabase,
+  key: string,
+  overrides: Record<string, unknown> = {},
+): void {
+  const row = {
+    key,
+    owner_kind: 'human',
+    owner_id: 'initiator',
+    target_kind: 'workflow',
+    target_id: 'logical',
+    run_id: 'run',
+    thread_id: null,
+    state: 'terminal',
+    created_at: NOW - 10 * DAY_MS,
+    updated_at: NOW - 8 * DAY_MS,
+    start_token: 'S1',
+    start_table_prefix: '',
+    start_workflow_id: 'wf',
+    ...overrides,
+  };
+  db.prepare(
+    `INSERT INTO ${START_IDEMPOTENCY_TABLE} (${Object.keys(row).join(',')}) VALUES (${Object.keys(
+      row,
+    )
+      .map(() => '?')
+      .join(',')})`,
+  ).run(...Object.values(row));
+}
+
+function retentionCycle(options: Partial<PurgeExpiredRunsOptions> = {}) {
+  let cursor: RunRetentionCursor | undefined;
+  const advances: RunRetentionCursor[] = [];
+  return {
+    advances,
+    get cursor() {
+      return cursor;
+    },
+    options(): PurgeExpiredRunsOptions {
+      return {
+        ttlMs: 7 * DAY_MS,
+        now: () => NOW,
+        startIdempotencyTable: START_IDEMPOTENCY_TABLE,
+        cursor,
+        advanceCursor: async (next) => {
+          cursor = structuredClone(next);
+          advances.push(cursor);
+        },
+        ...options,
+      };
+    },
+  };
+}
+
+function retentionIntercept(
+  db: RetentionTestDatabase,
+  hooks: {
+    read?: (sql: string, result: unknown) => unknown;
+    beforeBatch?: () => void;
+    afterBatch?: (results: unknown[]) => unknown[];
+    statement?: (sql: string, values: unknown[]) => void;
+  },
+): RetentionTestDatabase {
+  function wrap(
+    sql: string,
+    statement: SnapshotStatement,
+    values: unknown[],
+  ): SnapshotStatement {
+    return {
+      ...statement,
+      all: async <T>() => {
+        hooks.statement?.(sql, values);
+        const result = await statement.all<T>();
+        return (hooks.read ? hooks.read(sql, result) : result) as {
+          results: T[];
+        };
+      },
+    };
+  }
+  const statements = new WeakMap<
+    SnapshotStatement,
+    { sql: string; values: unknown[] }
+  >();
+  function tracked(
+    sql: string,
+    statement: SnapshotStatement,
+    values: unknown[],
+  ): SnapshotStatement {
+    const wrapped = wrap(sql, statement, values);
+    wrapped.bind = (...bound) => tracked(sql, statement.bind(...bound), bound);
+    statements.set(wrapped, { sql, values });
+    return wrapped;
+  }
+  return {
+    prepare: (sql) => tracked(sql, db.prepare(sql), []),
+    batch: async (prepared) => {
+      for (const statement of prepared) {
+        const entry = statements.get(statement);
+        if (!entry) throw new Error('untracked statement');
+        hooks.statement?.(entry.sql, entry.values);
+      }
+      hooks.beforeBatch?.();
+      const results = await db.batch(prepared);
+      // The hooks hand back `unknown[]` on purpose: that is what a wrong
+      // adapter returns.
+      return hooks.afterBatch
+        ? (hooks.afterBatch(results) as Awaited<
+            ReturnType<RetentionTestDatabase['batch']>
+          >)
+        : results;
+    },
+  };
+}
+
+function retentionWorld() {
+  const sqlite = openSqlite();
+  createSnapshotTable(sqlite);
+  createReservationTable(sqlite);
+  return { sqlite, db: retentionDb(sqlite), cycle: retentionCycle() };
+}
+
+function replaceRetentionSnapshot(
+  db: SqliteDatabase,
+  snapshot: unknown,
+  runId = 'run',
+): void {
+  db.prepare(
+    'UPDATE mastra_workflow_snapshot SET snapshot=? WHERE run_id=?',
+  ).run(
+    typeof snapshot === 'string' ? snapshot : JSON.stringify(snapshot),
+    runId,
+  );
+}
+
+interface RetentionSnapshotFixture {
+  status: string;
+  padding: string;
+  requestContext: {
+    'flowsafe.runProvenance': {
+      version: number | boolean;
+      startToken: string;
+      startIdentity: {
+        owner: { kind: string; id: string };
+        target: { kind: string; id: string; threadId?: string };
+        padding?: string;
+      } | null;
+      agentStart?: unknown;
+      attemptToken?: string;
+      resumeCounts?: unknown;
+    };
+  };
+}
+
+function currentRetentionSnapshot(
+  db: SqliteDatabase,
+  runId = 'run',
+): RetentionSnapshotFixture {
+  const row = db
+    .prepare('SELECT snapshot FROM mastra_workflow_snapshot WHERE run_id=?')
+    .get(runId) as { snapshot: string };
+  return JSON.parse(row.snapshot);
+}
+
+describe('generation-safe run retention', () => {
+  it.each([
+    null,
+    false,
+    0,
+    '',
+    [],
+    {},
+    { version: 2, tablePrefix: '' },
+    {
+      version: 1,
+      tablePrefix: '',
+      snapshots: { afterRowId: 2, highWaterRowId: 1 },
+    },
+    {
+      version: 1,
+      tablePrefix: '',
+      snapshots: { afterRowId: -Infinity, highWaterRowId: 1 },
+    },
+    {
+      version: 1,
+      tablePrefix: '',
+      reservations: { afterRowId: 0, highWaterRowId: 1 },
+    },
+    { version: 1, tablePrefix: '', extra: true },
+  ])('rejects malformed persisted cursor %j before I/O', async (cursor) => {
+    const prepare = vi.fn();
+    await expect(
+      purgeExpiredWorkflowRuns(
+        { prepare, batch: vi.fn() },
+        { ttlMs: 0, cursor: cursor as never, advanceCursor: vi.fn() },
+      ),
+    ).rejects.toThrow();
+    expect(prepare).not.toHaveBeenCalled();
+  });
+
+  it('captures cursor scope and negative positions without invoking accessors', () => {
+    const input = {
+      version: 1 as const,
+      tablePrefix: 'TENANT_',
+      startIdempotencyTable: 'Keys',
+      snapshots: { afterRowId: -9, highWaterRowId: -2 },
+    };
+    const parsed = parseRunRetentionCursor(input);
+    input.snapshots.afterRowId = 0;
+    expect(parsed).toEqual({
+      version: 1,
+      tablePrefix: 'tenant_',
+      startIdempotencyTable: 'keys',
+      snapshots: { afterRowId: -9, highWaterRowId: -2 },
+    });
+    expect(Object.isFrozen(parsed)).toBe(true);
+    expect(Object.isFrozen(parsed?.snapshots)).toBe(true);
+    const getter = vi.fn(() => 1);
+    expect(() =>
+      parseRunRetentionCursor(
+        Object.defineProperty({ tablePrefix: '' }, 'version', { get: getter }),
+      ),
+    ).toThrow();
+    expect(getter).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { ttlMs: -1 },
+    { ttlMs: Infinity },
+    { startIdempotencyTtlMs: NaN },
+    { limit: 0 },
+    { limit: 0.5 },
+    { limit: Infinity },
+    { now: () => Infinity },
+    { now: () => 8.64e15 },
+    { now: null },
+    { advanceCursor: undefined },
+    { artifactStore: {} },
+    { cursor: { version: 1, tablePrefix: 'other_' } },
+    { resourceOwnerTable: 'x'.repeat(90_000) },
+  ])('rejects invalid captured options before SQL %j', async (invalid) => {
+    const prepare = vi.fn();
+    await expect(
+      purgeExpiredWorkflowRuns({ prepare, batch: vi.fn() }, {
+        ttlMs: 0,
+        advanceCursor: vi.fn(),
+        ...invalid,
+      } as never),
+    ).rejects.toThrow();
+    expect(prepare).not.toHaveBeenCalled();
+  });
+
+  it('requires batch for a snapshot-only purge', async () => {
+    const prepare = vi.fn();
+    await expect(
+      purgeExpiredWorkflowRuns({ prepare } as never, {
+        ttlMs: 0,
+        advanceCursor: vi.fn(),
+      }),
+    ).rejects.toThrow(/batch/);
+    expect(prepare).not.toHaveBeenCalled();
+  });
+
+  it('captures callbacks, methods and one clock before the first read', async () => {
+    const { sqlite, db, cycle } = retentionWorld();
+    retentionSnapshot(sqlite, 'run');
+    const callback = vi.fn();
+    const artifactStore = {
+      deleteRun: async () => {
+        callback();
+        return 0;
+      },
+    };
+    const now = vi.fn(() => NOW);
+    const options = { ...cycle.options(), artifactStore, now };
+    const capturedAdvance = options.advanceCursor;
+    const intercepted = retentionIntercept(db, {
+      read: (_sql, result) => {
+        options.ttlMs = Infinity;
+        options.advanceCursor = async () => {
+          throw new Error('replaced cursor');
+        };
+        artifactStore.deleteRun = async () => {
+          throw new Error('replaced artifacts');
+        };
+        intercepted.batch = async () => {
+          throw new Error('replaced batch');
+        };
+        return result;
+      },
+    });
+    expect(await purgeExpiredWorkflowRuns(intercepted, options)).toBe(1);
+    expect(now).toHaveBeenCalledTimes(1);
+    expect(callback).toHaveBeenCalledTimes(1);
+    expect(cycle.advances).toHaveLength(2);
+    expect(options.advanceCursor).not.toBe(capturedAdvance);
+  });
+
+  it.each([
+    [
+      'generation',
+      (
+        p: RetentionSnapshotFixture['requestContext']['flowsafe.runProvenance'],
+      ) => {
+        p.startToken = 'S2';
+      },
+    ],
+    [
+      'owner',
+      (
+        p: RetentionSnapshotFixture['requestContext']['flowsafe.runProvenance'],
+      ) => {
+        if (p.startIdentity) p.startIdentity.owner.id = 'other';
+      },
+    ],
+    [
+      'null versus missing',
+      (
+        p: RetentionSnapshotFixture['requestContext']['flowsafe.runProvenance'],
+      ) => {
+        p.agentStart = null;
+      },
+    ],
+    [
+      'boolean versus number',
+      (
+        p: RetentionSnapshotFixture['requestContext']['flowsafe.runProvenance'],
+      ) => {
+        p.version = true;
+      },
+    ],
+    [
+      'explicit null identity',
+      (
+        p: RetentionSnapshotFixture['requestContext']['flowsafe.runProvenance'],
+      ) => {
+        p.startIdentity = null;
+      },
+    ],
+  ])('preserves current snapshot and key after changed %s', async (_name, change) => {
+    const { sqlite, db, cycle } = retentionWorld();
+    retentionSnapshot(sqlite, 'run');
+    retentionReservation(sqlite, 'key', { state: 'started' });
+    const intercepted = retentionIntercept(db, {
+      beforeBatch: () => {
+        const snapshot = currentRetentionSnapshot(sqlite);
+        change(snapshot.requestContext['flowsafe.runProvenance']);
+        replaceRetentionSnapshot(sqlite, snapshot);
+      },
+    });
+    expect(await purgeExpiredWorkflowRuns(intercepted, cycle.options())).toBe(
+      0,
+    );
+    expect(remainingRunIds(sqlite)).toEqual(['run']);
+    expect(reservationRows(sqlite)[0]?.state).toBe('started');
+    expect(cycle.cursor?.snapshots).toBeUndefined();
+  });
+
+  it.each([
+    '{"status":"success","requestContext":{},"requestContext":{"flowsafe.runProvenance":{"version":2,"startToken":"S2"}}}',
+    '{"status":"success","requestContext":{"flowsafe.runProvenance":{"version":2,"startToken":"S1","version":1}}}',
+    '{"status":"success","requestContext":{"flowsafe.runProvenance":{"version":2,"startToken":"S1"},"flowsafe.runProvenance":{"version":2,"startToken":"S2"}}}',
+  ])('preserves ambiguous duplicate provenance paths during selection and recheck', async (raw) => {
+    const { sqlite, db, cycle } = retentionWorld();
+    retentionSnapshot(sqlite, 'run');
+    const intercepted = retentionIntercept(db, {
+      beforeBatch: () => replaceRetentionSnapshot(sqlite, raw),
+    });
+    expect(await purgeExpiredWorkflowRuns(intercepted, cycle.options())).toBe(
+      0,
+    );
+    expect(await purgeExpiredWorkflowRuns(db, cycle.options())).toBe(0);
+    expect(remainingRunIds(sqlite)).toEqual(['run']);
+  });
+
+  it('permits H, progress and large unowned payload changes with the same owned capsule', async () => {
+    const { sqlite, db, cycle } = retentionWorld();
+    retentionSnapshot(sqlite, 'run', { padding: 'x'.repeat(200_000) });
+    let largestSelector = 0;
+    const intercepted = retentionIntercept(db, {
+      beforeBatch: () => {
+        const snapshot = currentRetentionSnapshot(sqlite);
+        snapshot.requestContext['flowsafe.runProvenance'].attemptToken =
+          'other-H';
+        snapshot.requestContext['flowsafe.runProvenance'].resumeCounts = [
+          ['step', 2],
+        ];
+        snapshot.padding += 'more';
+        replaceRetentionSnapshot(sqlite, snapshot);
+      },
+      statement: (sql, values) => {
+        if (sql.includes('DELETE FROM "mastra_workflow_snapshot"'))
+          largestSelector = String(values[3]).length;
+      },
+    });
+    expect(await purgeExpiredWorkflowRuns(intercepted, cycle.options())).toBe(
+      1,
+    );
+    expect(largestSelector).toBeLessThan(1000);
+  });
+
+  it.each([
+    'snapshot',
+    'createdAt',
+    'updatedAt',
+    'resourceId',
+  ])('preserves a changed legacy %s field', async (field) => {
+    const { sqlite, db, cycle } = retentionWorld();
+    seedRun(sqlite, {
+      runId: 'run',
+      status: 'success',
+      updatedAt: NOW - 8 * DAY_MS,
+    });
+    const intercepted = retentionIntercept(db, {
+      beforeBatch: () => {
+        const value =
+          field === 'snapshot'
+            ? '{"status":"success","changed":true}'
+            : field === 'resourceId'
+              ? 'new-resource'
+              : new Date(NOW - 7.5 * DAY_MS).toISOString();
+        sqlite
+          .prepare(`UPDATE mastra_workflow_snapshot SET ${field}=?`)
+          .run(value);
+      },
+    });
+    expect(await purgeExpiredWorkflowRuns(intercepted, cycle.options())).toBe(
+      0,
+    );
+    expect(remainingRunIds(sqlite)).toEqual(['run']);
+  });
+
+  it('does not treat rowid reuse as snapshot identity', async () => {
+    const { sqlite, db, cycle } = retentionWorld();
+    seedRun(sqlite, {
+      runId: 'run',
+      status: 'success',
+      updatedAt: NOW - 8 * DAY_MS,
+    });
+    const intercepted = retentionIntercept(db, {
+      beforeBatch: () => {
+        sqlite.exec('DELETE FROM mastra_workflow_snapshot');
+        retentionSnapshot(sqlite, 'replacement');
+      },
+    });
+    expect(await purgeExpiredWorkflowRuns(intercepted, cycle.options())).toBe(
+      0,
+    );
+    expect(remainingRunIds(sqlite)).toEqual(['replacement']);
+  });
+
+  it.each([
+    'sibling-prefix',
+    'sibling-workflow',
+    'reserved-owner',
+  ])('protects %s ownership while removing an expired snapshot', async (kind) => {
+    const { sqlite, db, cycle } = retentionWorld();
+    await createResourceOwnershipSchema(db as never);
+    const resources = new D1ResourceOwnershipStore(db as never);
+    await resources.claim('run', 'run', {
+      kind: 'human',
+      id: 'resource-owner',
+    });
+    retentionSnapshot(sqlite, 'run');
+    if (kind === 'reserved-owner')
+      sqlite.exec(
+        `UPDATE ${RESOURCE_OWNERSHIP_TABLE} SET reservation_token='claim-token'`,
+      );
+    else {
+      if (kind === 'sibling-prefix') createSnapshotTable(sqlite, 'sibling_');
+      retentionSnapshot(sqlite, 'run', {
+        prefix: kind === 'sibling-prefix' ? 'sibling_' : '',
+        workflowId: 'other',
+      });
+      sqlite.exec(
+        `UPDATE ${kind === 'sibling-prefix' ? 'sibling_' : ''}mastra_workflow_snapshot SET snapshot='corrupt' WHERE workflow_name='other'`,
+      );
+    }
+    expect(
+      await purgeExpiredWorkflowRuns(db, {
+        ...cycle.options(),
+        resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
+      }),
+    ).toBe(1);
+    expect(
+      sqlite
+        .prepare(
+          `SELECT owner_kind,owner_id,reservation_token FROM ${RESOURCE_OWNERSHIP_TABLE} WHERE resource_kind='run' AND resource_id='run'`,
+        )
+        .get(),
+    ).toEqual({
+      owner_kind: 'human',
+      owner_id: 'resource-owner',
+      reservation_token: kind === 'reserved-owner' ? 'claim-token' : null,
+    });
+  });
+
+  it('releases a resource owner distinct from the initiating principal', async () => {
+    const { sqlite, db, cycle } = retentionWorld();
+    const resources = new D1ResourceOwnershipStore(db as never);
+    await resources.claim('run', 'run', {
+      kind: 'human',
+      id: 'resource-owner',
+    });
+    retentionSnapshot(sqlite, 'run');
+    expect(
+      await purgeExpiredWorkflowRuns(db, {
+        ...cycle.options(),
+        resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
+      }),
+    ).toBe(1);
+    expect(await resources.owner('run', 'run')).toBeUndefined();
+  });
+
+  it.each([
+    ['start_token', 'S2'],
+    ['start_table_prefix', 'other_'],
+    ['start_workflow_id', 'other'],
+    ['run_id', 'other'],
+    ['owner_kind', 'agent'],
+    ['owner_id', 'other'],
+    ['target_kind', 'agent'],
+    ['target_id', 'other'],
+    ['thread_id', 'thread'],
+  ])('does not terminalize a different bound tuple field %s', async (field, value) => {
+    const { sqlite, db, cycle } = retentionWorld();
+    retentionSnapshot(sqlite, 'run');
+    retentionReservation(sqlite, 'mismatch', {
+      state: 'started',
+      [field]: value,
+    });
+    retentionReservation(sqlite, 'matching', { state: 'started' });
+    expect(await purgeExpiredWorkflowRuns(db, cycle.options())).toBe(1);
+    expect(reservationRows(sqlite)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          key: 'matching',
+          state: 'terminal',
+          updated_at: NOW,
+        }),
+        expect.objectContaining({
+          key: 'mismatch',
+          state: 'started',
+          updated_at: NOW - 8 * DAY_MS,
+        }),
+      ]),
+    );
+  });
+
+  it('settles complete aliases and preserves terminal stamps, unbound and legacy records', async () => {
+    const { sqlite, db, cycle } = retentionWorld();
+    retentionSnapshot(sqlite, 'run');
+    for (const key of ['alias-one', 'alias-two'])
+      retentionReservation(sqlite, key, { state: 'reserved' });
+    retentionReservation(sqlite, 'terminal', { updated_at: NOW - DAY_MS });
+    retentionReservation(sqlite, 'legacy', {
+      state: 'started',
+      start_token: null,
+      start_table_prefix: null,
+      start_workflow_id: null,
+    });
+    retentionReservation(sqlite, 'unbound', {
+      state: 'reserved',
+      start_token: '',
+      start_table_prefix: null,
+      start_workflow_id: null,
+    });
+    retentionReservation(sqlite, 'null-bound', {
+      state: 'started',
+      start_table_prefix: null,
+    });
+    expect(await purgeExpiredWorkflowRuns(db, cycle.options())).toBe(1);
+    expect(reservationRows(sqlite)).toEqual(
+      expect.arrayContaining([
+        ...['alias-one', 'alias-two'].map((key) =>
+          expect.objectContaining({ key, state: 'terminal', updated_at: NOW }),
+        ),
+        expect.objectContaining({ key: 'terminal', updated_at: NOW - DAY_MS }),
+        expect.objectContaining({ key: 'legacy', state: 'started' }),
+        expect.objectContaining({ key: 'unbound', state: 'reserved' }),
+        expect.objectContaining({ key: 'null-bound', state: 'started' }),
+      ]),
+    );
+  });
+
+  it('pairs an inherited logical identity at its physical child address and leaves unattributed snapshots unpaired', async () => {
+    const { sqlite, db, cycle } = retentionWorld();
+    retentionSnapshot(sqlite, 'child', { workflowId: 'physical-child' });
+    retentionReservation(sqlite, 'child-key', {
+      run_id: 'child',
+      start_workflow_id: 'physical-child',
+      state: 'started',
+    });
+    retentionReservation(sqlite, 'root-key', {
+      run_id: 'child',
+      start_workflow_id: 'logical',
+      state: 'started',
+    });
+    retentionSnapshot(sqlite, 'unattributed', {
+      provenance: { version: 2, startToken: 'S1' },
+    });
+    retentionReservation(sqlite, 'unattributed-key', {
+      run_id: 'unattributed',
+      state: 'started',
+    });
+    expect(await purgeExpiredWorkflowRuns(db, cycle.options())).toBe(2);
+    expect(reservationRows(sqlite)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ key: 'child-key', state: 'terminal' }),
+        expect.objectContaining({ key: 'root-key', state: 'started' }),
+        expect.objectContaining({ key: 'unattributed-key', state: 'started' }),
+      ]),
+    );
+  });
+
+  it.each([
+    'same',
+    'different',
+    'absent',
+    'missing-namespace',
+    'legacy',
+    'malformed',
+    'oversize',
+    'unbound',
+    'null-bound',
+  ])('classifies orphan %s without inferring namespace or generation', async (kind) => {
+    const { sqlite, db, cycle } = retentionWorld();
+    retentionReservation(
+      sqlite,
+      'key',
+      kind === 'missing-namespace'
+        ? { start_table_prefix: 'missing_' }
+        : kind === 'null-bound'
+          ? { start_table_prefix: null }
+          : kind === 'unbound'
+            ? {
+                start_token: '',
+                start_table_prefix: null,
+                start_workflow_id: null,
+              }
+            : {},
+    );
+    if (!['absent', 'missing-namespace'].includes(kind)) {
+      retentionSnapshot(sqlite, 'run', {
+        status: 'suspended',
+        token: kind === 'different' ? 'S2' : 'S1',
+      });
+      if (kind === 'legacy')
+        replaceRetentionSnapshot(sqlite, { status: 'suspended' });
+      if (kind === 'malformed') replaceRetentionSnapshot(sqlite, 'broken');
+      if (kind === 'oversize') {
+        const snapshot = currentRetentionSnapshot(sqlite);
+        const identity =
+          snapshot.requestContext['flowsafe.runProvenance'].startIdentity;
+        if (!identity) throw new Error('fixture requires start identity');
+        identity.padding = 'x'.repeat(4096);
+        replaceRetentionSnapshot(sqlite, snapshot);
+      }
+    }
+    expect(await purgeExpiredWorkflowRuns(db, cycle.options())).toBe(0);
+    expect(reservationRows(sqlite)).toHaveLength(
+      ['different', 'absent', 'missing-namespace'].includes(kind) ? 0 : 1,
+    );
+  });
+
+  it('rechecks the observed different generation before orphan expiry', async () => {
+    const { sqlite, db, cycle } = retentionWorld();
+    retentionSnapshot(sqlite, 'run', { token: 'S2', status: 'suspended' });
+    retentionReservation(sqlite, 'key');
+    const intercepted = retentionIntercept(db, {
+      beforeBatch: () => {
+        const snapshot = currentRetentionSnapshot(sqlite);
+        snapshot.requestContext['flowsafe.runProvenance'].startToken = 'S1';
+        replaceRetentionSnapshot(sqlite, snapshot);
+      },
+    });
+    await purgeExpiredWorkflowRuns(intercepted, cycle.options());
+    expect(reservationRows(sqlite)).toHaveLength(1);
+  });
+
+  it('rechecks a raw orphan key when its timestamp or binding changes', async () => {
+    const { sqlite, db, cycle } = retentionWorld();
+    retentionReservation(sqlite, 'key');
+    const intercepted = retentionIntercept(db, {
+      beforeBatch: () =>
+        sqlite.exec(
+          `UPDATE ${START_IDEMPOTENCY_TABLE} SET start_token='S2',updated_at=updated_at+0.5`,
+        ),
+    });
+    await purgeExpiredWorkflowRuns(intercepted, cycle.options());
+    expect(reservationRows(sqlite)).toHaveLength(1);
+  });
+
+  it('expires independent orphans without a snapshot table and preserves legacy raw thread values', async () => {
+    const { sqlite, db, cycle } = retentionWorld();
+    sqlite.exec('DROP TABLE mastra_workflow_snapshot');
+    retentionReservation(sqlite, 'bound');
+    retentionReservation(sqlite, 'legacy', {
+      start_token: null,
+      start_table_prefix: null,
+      start_workflow_id: null,
+      thread_id: 'invalid/thread',
+      created_at: -2.5,
+      updated_at: -1.5,
+    });
+    expect(await purgeExpiredWorkflowRuns(db, cycle.options())).toBe(0);
+    expect(reservationRows(sqlite)).toEqual([]);
+  });
+});
+
+describe('run retention schema, progress and result contracts', () => {
+  it.each([
+    0, 1, 2, 3,
+  ])('supports reservation schema stage %i with compatible legacy rows', async (stage) => {
+    const { sqlite, db, cycle } = retentionWorld();
+    retentionReservation(sqlite, 'legacy', {
+      start_token: null,
+      start_table_prefix: null,
+      start_workflow_id: null,
+      thread_id: 'not/a/path',
+      updated_at: -1.5,
+    });
+    for (const column of [
+      'start_workflow_id',
+      'start_table_prefix',
+      'start_token',
+    ].slice(0, 3 - stage))
+      sqlite.exec(
+        `ALTER TABLE ${START_IDEMPOTENCY_TABLE} DROP COLUMN ${column}`,
+      );
+    expect(await purgeExpiredWorkflowRuns(db, cycle.options())).toBe(0);
+    expect(reservationRows(sqlite)).toEqual([]);
+  });
+
+  it.each([
+    1, 2,
+  ])('retains nonnull partial companion data at stage %i', async (stage) => {
+    const { sqlite, db, cycle } = retentionWorld();
+    retentionReservation(sqlite, 'partial');
+    for (const column of ['start_workflow_id', 'start_table_prefix'].slice(
+      0,
+      3 - stage,
+    ))
+      sqlite.exec(
+        `ALTER TABLE ${START_IDEMPOTENCY_TABLE} DROP COLUMN ${column}`,
+      );
+    await purgeExpiredWorkflowRuns(db, cycle.options());
+    expect(reservationRows(sqlite)).toHaveLength(1);
+  });
+
+  it.each([
+    'view',
+    'bad-prefix',
+    'overlong-prefix',
+    'namespace-overflow',
+    'reservation-view',
+    'reservation-columns',
+    'reservation-order',
+  ])('refuses unsupported schema %s before artifact or mutation work', async (kind) => {
+    const { sqlite, db, cycle } = retentionWorld();
+    retentionSnapshot(sqlite, 'run');
+    if (kind === 'view')
+      sqlite.exec(
+        'CREATE VIEW other_mastra_workflow_snapshot AS SELECT * FROM mastra_workflow_snapshot',
+      );
+    if (kind === 'bad-prefix')
+      sqlite.exec('CREATE TABLE "bad-prefix_mastra_workflow_snapshot" (x)');
+    if (kind === 'overlong-prefix')
+      sqlite.exec(
+        `CREATE TABLE "${'x'.repeat(40)}mastra_workflow_snapshot" (x)`,
+      );
+    if (kind === 'namespace-overflow')
+      for (let i = 0; i < 64; i++) createSnapshotTable(sqlite, `n${i}_`);
+    if (kind === 'reservation-view') {
+      sqlite.exec(
+        `ALTER TABLE ${START_IDEMPOTENCY_TABLE} RENAME TO reserved_rows; CREATE VIEW ${START_IDEMPOTENCY_TABLE} AS SELECT * FROM reserved_rows`,
+      );
+    }
+    if (kind === 'reservation-columns')
+      sqlite.exec(
+        `ALTER TABLE ${START_IDEMPOTENCY_TABLE} ADD COLUMN unexpected TEXT`,
+      );
+    if (kind === 'reservation-order')
+      sqlite.exec(
+        `ALTER TABLE ${START_IDEMPOTENCY_TABLE} RENAME COLUMN start_token TO other`,
+      );
+    const deleteRun = vi.fn(async () => 0);
+    const beforeBatch = vi.fn();
+    await expect(
+      purgeExpiredWorkflowRuns(retentionIntercept(db, { beforeBatch }), {
+        ...cycle.options(),
+        artifactStore: { deleteRun },
+      }),
+    ).rejects.toThrow();
+    expect(deleteRun).not.toHaveBeenCalled();
+    expect(beforeBatch).not.toHaveBeenCalled();
+    expect(remainingRunIds(sqlite)).toEqual(['run']);
+    expect(cycle.advances).toEqual([]);
+  });
+
+  it('rebuilds a held group when a reservation table appears, without repeating artifacts', async () => {
+    const { sqlite, db, cycle } = retentionWorld();
+    sqlite.exec(`DROP TABLE ${START_IDEMPOTENCY_TABLE}`);
+    retentionSnapshot(sqlite, 'run');
+    const deleteRun = vi.fn(async () => {
+      createReservationTable(sqlite);
+      retentionReservation(sqlite, 'key', { state: 'started' });
+      return 0;
+    });
+    expect(
+      await purgeExpiredWorkflowRuns(db, {
+        ...cycle.options(),
+        artifactStore: { deleteRun },
+      }),
+    ).toBe(1);
+    expect(deleteRun).toHaveBeenCalledTimes(1);
+    expect(reservationRows(sqlite)).toEqual([
+      expect.objectContaining({
+        key: 'key',
+        state: 'terminal',
+        updated_at: NOW,
+      }),
+    ]);
+  });
+
+  it.each([
+    'create',
+    'rename',
+    'drop',
+  ])('rebuilds pending snapshot work after namespace %s', async (kind) => {
+    const { sqlite, db, cycle } = retentionWorld();
+    retentionSnapshot(sqlite, 'run');
+    createSnapshotTable(sqlite, 'sibling_');
+    let count = 0;
+    const intercepted = retentionIntercept(db, {
+      beforeBatch: () => {
+        if (count++ > 0) return;
+        if (kind === 'create') createSnapshotTable(sqlite, 'new_');
+        if (kind === 'rename')
+          sqlite.exec(
+            'ALTER TABLE sibling_mastra_workflow_snapshot RENAME TO renamed_mastra_workflow_snapshot',
+          );
+        if (kind === 'drop') sqlite.exec('DROP TABLE mastra_workflow_snapshot');
+      },
+    });
+    expect(await purgeExpiredWorkflowRuns(intercepted, cycle.options())).toBe(
+      kind === 'drop' ? 0 : 1,
+    );
+    expect(count).toBe(2);
+    expect(cycle.cursor?.snapshots).toBeUndefined();
+  });
+
+  it('uses one invocation-wide schema retry and retains the phase cursor on second churn', async () => {
+    const { sqlite, db, cycle } = retentionWorld();
+    retentionSnapshot(sqlite, 'run');
+    const deleteRun = vi.fn(async () => 0);
+    let changes = 0;
+    const intercepted = retentionIntercept(db, {
+      beforeBatch: () => createSnapshotTable(sqlite, `changed${changes++}_`),
+    });
+    await expect(
+      purgeExpiredWorkflowRuns(intercepted, {
+        ...cycle.options(),
+        artifactStore: { deleteRun },
+      }),
+    ).rejects.toThrow(/repeatedly/);
+    expect(changes).toBe(2);
+    expect(deleteRun).toHaveBeenCalledTimes(1);
+    expect(cycle.advances).toEqual([]);
+    expect(remainingRunIds(sqlite)).toEqual(['run']);
+  });
+
+  it('rereads pending legacy keys through a schema upgrade and preserves changed keys', async () => {
+    const { sqlite, db, cycle } = retentionWorld();
+    for (const key of ['unchanged', 'changed'])
+      retentionReservation(sqlite, key, {
+        start_token: null,
+        start_table_prefix: null,
+        start_workflow_id: null,
+      });
+    for (const column of [
+      'start_workflow_id',
+      'start_table_prefix',
+      'start_token',
+    ])
+      sqlite.exec(
+        `ALTER TABLE ${START_IDEMPOTENCY_TABLE} DROP COLUMN ${column}`,
+      );
+    let batches = 0;
+    const intercepted = retentionIntercept(db, {
+      beforeBatch: () => {
+        if (batches++ > 0) return;
+        for (const column of [
+          'start_token',
+          'start_table_prefix',
+          'start_workflow_id',
+        ])
+          sqlite.exec(
+            `ALTER TABLE ${START_IDEMPOTENCY_TABLE} ADD COLUMN ${column} TEXT`,
+          );
+        sqlite.exec(
+          `UPDATE ${START_IDEMPOTENCY_TABLE} SET updated_at=updated_at+1 WHERE key='changed'`,
+        );
+      },
+    });
+    await purgeExpiredWorkflowRuns(intercepted, cycle.options());
+    expect(reservationRows(sqlite).map((row) => row.key)).toEqual(['changed']);
+  });
+
+  it('does not reinterpret a bound orphan as legacy after schema downgrade', async () => {
+    const { sqlite, db, cycle } = retentionWorld();
+    retentionReservation(sqlite, 'key');
+    let batches = 0;
+    const intercepted = retentionIntercept(db, {
+      beforeBatch: () => {
+        if (batches++ > 0) return;
+        for (const column of [
+          'start_workflow_id',
+          'start_table_prefix',
+          'start_token',
+        ])
+          sqlite.exec(
+            `ALTER TABLE ${START_IDEMPOTENCY_TABLE} DROP COLUMN ${column}`,
+          );
+      },
+    });
+    await expect(
+      purgeExpiredWorkflowRuns(intercepted, cycle.options()),
+    ).rejects.toThrow(/no such column/);
+    expect(reservationRows(sqlite)).toHaveLength(1);
+    expect(cycle.advances).toHaveLength(1);
+  });
+
+  it('reclassifies a mixed pending orphan group after namespace appearance', async () => {
+    const { sqlite, db, cycle } = retentionWorld();
+    retentionReservation(sqlite, 'absent', {
+      run_id: 'absent',
+      start_table_prefix: 'late_',
+    });
+    retentionReservation(sqlite, 'different', {
+      run_id: 'different',
+      start_table_prefix: 'late_',
+    });
+    retentionReservation(sqlite, 'same', {
+      run_id: 'same',
+      start_table_prefix: 'late_',
+    });
+    let batches = 0;
+    const intercepted = retentionIntercept(db, {
+      beforeBatch: () => {
+        if (batches++ > 0) return;
+        createSnapshotTable(sqlite, 'late_');
+        retentionSnapshot(sqlite, 'different', {
+          prefix: 'late_',
+          token: 'S2',
+          status: 'suspended',
+        });
+        retentionSnapshot(sqlite, 'same', {
+          prefix: 'late_',
+          status: 'suspended',
+        });
+      },
+    });
+    await purgeExpiredWorkflowRuns(intercepted, cycle.options());
+    expect(reservationRows(sqlite).map((row) => row.key)).toEqual(['same']);
+  });
+
+  it('advances past more than a page of malformed and oversized capsules', async () => {
+    const { sqlite, db } = retentionWorld();
+    const cycle = retentionCycle({ limit: 90 });
+    for (let i = 0; i < 95; i++)
+      retentionSnapshot(sqlite, `poison-${i}`, {
+        provenance:
+          i % 2
+            ? { version: true }
+            : {
+                version: 2,
+                startToken: 'S1',
+                startIdentity: { padding: 'x'.repeat(4096) },
+              },
+      });
+    retentionSnapshot(sqlite, 'eligible');
+    expect(await purgeExpiredWorkflowRuns(db, cycle.options())).toBe(0);
+    expect(cycle.cursor?.snapshots).toEqual({
+      afterRowId: 90,
+      highWaterRowId: 96,
+    });
+    expect(await purgeExpiredWorkflowRuns(db, cycle.options())).toBe(1);
+    expect(remainingRunIds(sqlite)).not.toContain('eligible');
+    expect(cycle.cursor?.snapshots).toBeUndefined();
+  });
+
+  it('bounds artifact failure diagnostics and reaches later rows with persisted progress', async () => {
+    const { sqlite, db } = retentionWorld();
+    for (let i = 0; i < 92; i++) retentionSnapshot(sqlite, `bad-${i}`);
+    retentionSnapshot(sqlite, 'eligible');
+    const cycle = retentionCycle({
+      artifactStore: {
+        deleteRun: async (_wf, run) => {
+          if (run.startsWith('bad')) throw Object.create(null);
+          return 0;
+        },
+      },
+    });
+    await expect(purgeExpiredWorkflowRuns(db, cycle.options())).rejects.toThrow(
+      /artifact deletion failed/,
+    );
+    expect(cycle.cursor?.snapshots).toEqual({
+      afterRowId: 90,
+      highWaterRowId: 93,
+    });
+    await expect(purgeExpiredWorkflowRuns(db, cycle.options())).rejects.toThrow(
+      /artifact deletion failed/,
+    );
+    expect(remainingRunIds(sqlite)).not.toContain('eligible');
+    expect(remainingRunIds(sqlite)).toHaveLength(92);
+    expect(cycle.cursor?.snapshots).toBeUndefined();
+  });
+
+  it('reports bounded diagnostics for unsupported snapshot and reservation pages', async () => {
+    const { sqlite, db } = retentionWorld();
+    const cycle = retentionCycle();
+    const diagnostics = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      for (let index = 0; index < 95; index++) {
+        retentionSnapshot(sqlite, `bad-snapshot-${index}`, {
+          provenance: { version: true },
+        });
+        retentionReservation(sqlite, `bad-reservation-${index}`, {
+          start_token: null,
+          start_table_prefix: null,
+          start_workflow_id: null,
+          target_id: 'x'.repeat(5000),
+        });
+      }
+      retentionSnapshot(sqlite, 'eligible');
+      retentionReservation(sqlite, 'eligible');
+      expect(await purgeExpiredWorkflowRuns(db, cycle.options())).toBe(0);
+      expect(diagnostics).toHaveBeenCalledTimes(2);
+      expect(await purgeExpiredWorkflowRuns(db, cycle.options())).toBe(1);
+      expect(diagnostics).toHaveBeenCalledTimes(4);
+      expect(diagnostics.mock.calls.map(([line]) => JSON.parse(line))).toEqual([
+        { type: 'run-retention-skip', kind: 'snapshot', tablePrefix: '' },
+        { type: 'run-retention-skip', kind: 'reservation', tablePrefix: '' },
+        { type: 'run-retention-skip', kind: 'snapshot', tablePrefix: '' },
+        { type: 'run-retention-skip', kind: 'reservation', tablePrefix: '' },
+      ]);
+      expect(
+        diagnostics.mock.calls.every(
+          ([line]) => typeof line === 'string' && line.length < 256,
+        ),
+      ).toBe(true);
+      expect(remainingRunIds(sqlite)).not.toContain('eligible');
+      expect(reservationRows(sqlite).map((row) => row.key)).not.toContain(
+        'eligible',
+      );
+    } finally {
+      diagnostics.mockRestore();
+    }
+  });
+
+  it('uses negative rowids and a fixed high water despite continuous inserts', async () => {
+    const { sqlite, db } = retentionWorld();
+    for (const [index, rid] of [-5, -3, -1].entries()) {
+      retentionSnapshot(sqlite, `initial-${index}`, { status: 'suspended' });
+      sqlite
+        .prepare('UPDATE mastra_workflow_snapshot SET rowid=? WHERE run_id=?')
+        .run(rid, `initial-${index}`);
+    }
+    const cycle = retentionCycle({ limit: 1 });
+    await purgeExpiredWorkflowRuns(db, cycle.options());
+    expect(cycle.cursor?.snapshots).toEqual({
+      afterRowId: -5,
+      highWaterRowId: -1,
+    });
+    retentionSnapshot(sqlite, 'new-one');
+    await purgeExpiredWorkflowRuns(db, cycle.options());
+    expect(cycle.cursor?.snapshots).toEqual({
+      afterRowId: -3,
+      highWaterRowId: -1,
+    });
+    retentionSnapshot(sqlite, 'new-two');
+    await purgeExpiredWorkflowRuns(db, cycle.options());
+    expect(cycle.cursor?.snapshots).toBeUndefined();
+    expect(remainingRunIds(sqlite)).toContain('new-one');
+  });
+
+  it('advances independent reservation positions past malformed rows and oversized legacy keys', async () => {
+    const { sqlite, db } = retentionWorld();
+    for (let i = 0; i < 92; i++)
+      retentionReservation(sqlite, `bad-${i}`, {
+        start_token: null,
+        start_table_prefix: null,
+        start_workflow_id: null,
+        target_id: 'x'.repeat(5000),
+      });
+    retentionReservation(sqlite, 'eligible');
+    const cycle = retentionCycle();
+    await purgeExpiredWorkflowRuns(db, cycle.options());
+    expect(cycle.cursor?.reservations).toEqual({
+      afterRowId: 90,
+      highWaterRowId: 93,
+    });
+    await purgeExpiredWorkflowRuns(db, cycle.options());
+    expect(cycle.cursor?.reservations).toBeUndefined();
+    expect(reservationRows(sqlite).map((row) => row.key)).not.toContain(
+      'eligible',
+    );
+    expect(reservationRows(sqlite)).toHaveLength(92);
+  });
+
+  it.each([
+    'lost',
+    'short',
+    'sparse',
+    'failure',
+    'missing-meta',
+    'negative',
+    'fractional',
+    'string-count',
+    'schema-missing',
+    'schema-count',
+    'schema-false-with-changes',
+  ])('does not checkpoint an uncertain batch result: %s', async (failure) => {
+    const { sqlite, db, cycle } = retentionWorld();
+    retentionSnapshot(sqlite, 'run');
+    const intercepted = retentionIntercept(db, {
+      afterBatch: (results) => {
+        if (failure === 'lost') throw new Error('response lost');
+        if (failure === 'short') return results.slice(1);
+        if (failure === 'sparse') {
+          delete results[1];
+          return results;
+        }
+        if (failure === 'failure')
+          results[1] = { success: false, meta: { changes: 1 } };
+        if (failure === 'missing-meta') results[1] = {};
+        if (failure === 'negative') results[1] = { meta: { changes: -1 } };
+        if (failure === 'fractional') results[1] = { meta: { changes: 0.5 } };
+        if (failure === 'string-count') results[1] = { meta: { changes: '1' } };
+        if (failure === 'schema-missing') results[0] = { results: [] };
+        if (failure === 'schema-count')
+          results[0] = { results: [{ schema_ok: true }] };
+        if (failure === 'schema-false-with-changes')
+          results[0] = { results: [{ schema_ok: 0 }] };
+        return results;
+      },
+    });
+    await expect(
+      purgeExpiredWorkflowRuns(intercepted, cycle.options()),
+    ).rejects.toThrow();
+    expect(cycle.advances).toEqual([]);
+    expect(remainingRunIds(sqlite)).toEqual([]);
+    expect(await purgeExpiredWorkflowRuns(db, cycle.options())).toBe(0);
+  });
+
+  it('stops before orphan work when snapshot cursor persistence fails after commit', async () => {
+    const { sqlite, db, cycle } = retentionWorld();
+    retentionSnapshot(sqlite, 'run');
+    retentionReservation(sqlite, 'orphan', { run_id: 'gone' });
+    const advanceCursor = vi.fn(async () => {
+      throw new Error('cursor storage failed');
+    });
+    await expect(
+      purgeExpiredWorkflowRuns(db, { ...cycle.options(), advanceCursor }),
+    ).rejects.toThrow('cursor storage failed');
+    expect(advanceCursor).toHaveBeenCalledTimes(1);
+    expect(remainingRunIds(sqlite)).toEqual([]);
+    expect(reservationRows(sqlite)).toHaveLength(1);
+    expect(await purgeExpiredWorkflowRuns(db, cycle.options())).toBe(0);
+    expect(reservationRows(sqlite)).toEqual([]);
+  });
+
+  it('rolls back snapshot, owner and key when a later paired mutation fails', async () => {
+    const { sqlite, db, cycle } = retentionWorld();
+    const resources = new D1ResourceOwnershipStore(db as never);
+    await resources.claim('run', 'run', {
+      kind: 'human',
+      id: 'resource-owner',
+    });
+    retentionSnapshot(sqlite, 'run');
+    retentionReservation(sqlite, 'key', { state: 'started' });
+    sqlite.exec(
+      `CREATE TRIGGER reject_retention_key BEFORE UPDATE ON ${START_IDEMPOTENCY_TABLE} BEGIN SELECT RAISE(ABORT,'key failure'); END`,
+    );
+    await expect(
+      purgeExpiredWorkflowRuns(db, {
+        ...cycle.options(),
+        resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
+      }),
+    ).rejects.toThrow('key failure');
+    expect(remainingRunIds(sqlite)).toEqual(['run']);
+    expect(await resources.owner('run', 'run')).toEqual({
+      kind: 'human',
+      id: 'resource-owner',
+    });
+    expect(reservationRows(sqlite)[0]?.state).toBe('started');
+    expect(cycle.advances).toEqual([]);
+  });
+});
+
+describe('run retention SQL boundaries', () => {
+  it('preserves case-sensitive identity and state under NOCASE column declarations', async () => {
+    const sqlite = openSqlite();
+    sqlite.exec(`CREATE TABLE mastra_workflow_snapshot (workflow_name TEXT COLLATE NOCASE NOT NULL, run_id TEXT COLLATE NOCASE NOT NULL,
+      resourceId TEXT COLLATE NOCASE, snapshot TEXT COLLATE NOCASE NOT NULL, createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL, UNIQUE(workflow_name,run_id))`);
+    sqlite.exec(
+      START_IDEMPOTENCY_DDL.replaceAll('TEXT', 'TEXT COLLATE NOCASE'),
+    );
+    retentionSnapshot(sqlite, 'run');
+    retentionReservation(sqlite, 'matching', { state: 'started' });
+    retentionReservation(sqlite, 'token-case', {
+      state: 'started',
+      start_token: 's1',
+    });
+    retentionReservation(sqlite, 'owner-case', {
+      state: 'started',
+      owner_id: 'INITIATOR',
+    });
+    retentionReservation(sqlite, 'state-case', { state: 'STARTED' });
+    const db = retentionDb(sqlite);
+    const cycle = retentionCycle();
+    expect(await purgeExpiredWorkflowRuns(db, cycle.options())).toBe(1);
+    expect(reservationRows(sqlite)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ key: 'matching', state: 'terminal' }),
+        expect.objectContaining({ key: 'token-case', state: 'started' }),
+        expect.objectContaining({ key: 'owner-case', state: 'started' }),
+        expect.objectContaining({ key: 'state-case', state: 'STARTED' }),
+      ]),
+    );
+  });
+
+  it('preserves a snapshot when its workflow name changes case', async () => {
+    const { sqlite, db, cycle } = retentionWorld();
+    retentionSnapshot(sqlite, 'run');
+    const intercepted = retentionIntercept(db, {
+      beforeBatch: () =>
+        sqlite.exec("UPDATE mastra_workflow_snapshot SET workflow_name='WF'"),
+    });
+    expect(await purgeExpiredWorkflowRuns(intercepted, cycle.options())).toBe(
+      0,
+    );
+    expect(remainingRunIds(sqlite)).toEqual(['run']);
+  });
+
+  it('requires finite numeric terminal-key expiry and accepts negative fractional epochs', async () => {
+    const { sqlite, db, cycle } = retentionWorld();
+    retentionSnapshot(sqlite, 'run');
+    for (const key of [
+      'negative-infinity',
+      'positive-infinity',
+      'text',
+      'fractional',
+      'at-cutoff',
+    ])
+      retentionReservation(sqlite, key);
+    sqlite.exec(`UPDATE ${START_IDEMPOTENCY_TABLE} SET updated_at=-9e999 WHERE key='negative-infinity';
+      UPDATE ${START_IDEMPOTENCY_TABLE} SET updated_at=9e999 WHERE key='positive-infinity';
+      UPDATE ${START_IDEMPOTENCY_TABLE} SET updated_at='garbage' WHERE key='text';
+      UPDATE ${START_IDEMPOTENCY_TABLE} SET created_at=-2.5,updated_at=-1.5 WHERE key='fractional'`);
+    sqlite
+      .prepare(
+        `UPDATE ${START_IDEMPOTENCY_TABLE} SET updated_at=? WHERE key='at-cutoff'`,
+      )
+      .run(NOW - 7 * DAY_MS);
+    expect(await purgeExpiredWorkflowRuns(db, cycle.options())).toBe(1);
+    expect(reservationRows(sqlite).map((row) => row.key)).toEqual([
+      'at-cutoff',
+      'negative-infinity',
+      'positive-infinity',
+      'text',
+    ]);
+  });
+
+  it('accepts registry names beyond 63 characters and rejects complete SQL overflow before artifacts', async () => {
+    const { sqlite, db, cycle } = retentionWorld();
+    const name = `keys_${'x'.repeat(80)}`;
+    sqlite.exec(`ALTER TABLE ${START_IDEMPOTENCY_TABLE} RENAME TO ${name}`);
+    retentionSnapshot(sqlite, 'run');
+    expect(
+      await purgeExpiredWorkflowRuns(db, {
+        ...cycle.options(),
+        startIdempotencyTable: name,
+      }),
+    ).toBe(1);
+    retentionSnapshot(sqlite, 'second');
+    const deleteRun = vi.fn(async () => 0);
+    await expect(
+      purgeExpiredWorkflowRuns(db, {
+        ...cycle.options(),
+        startIdempotencyTable: undefined,
+        cursor: undefined,
+        resourceOwnerTable: 'x'.repeat(89_000),
+        artifactStore: { deleteRun },
+      }),
+    ).rejects.toThrow(/budget/);
+    expect(deleteRun).not.toHaveBeenCalled();
+    expect(remainingRunIds(sqlite)).toEqual(['second']);
+  });
+
+  it('measures complete modern maximum-form statements and selectors over 64 namespaces', async () => {
+    const { sqlite, db, cycle } = retentionWorld();
+    await createResourceOwnershipSchema(db as never);
+    for (let i = 0; i < 63; i++) createSnapshotTable(sqlite, `namespace${i}_`);
+    const largeIdentity = {
+      owner: { kind: 'human', id: 'a'.repeat(200) },
+      target: { kind: 'agent', id: 'a'.repeat(200), threadId: 't'.repeat(200) },
+      padding: '\\"'.repeat(650),
+    };
+    for (let i = 0; i < 90; i++) {
+      retentionSnapshot(sqlite, `run-${i}`, {
+        workflowId: 'w'.repeat(200),
+        provenance: {
+          version: 2,
+          startToken: 's'.repeat(200),
+          startIdentity: largeIdentity,
+          agentStart: { threaded: true },
+        },
+        padding: 'x'.repeat(20_000),
+      });
+    }
+    const metrics = {
+      statements: 0,
+      maxSqlBytes: 0,
+      maxBindings: 0,
+      maxSelectorBytes: 0,
+    };
+    const intercepted = retentionIntercept(db, {
+      statement: (sql, values) => {
+        metrics.statements++;
+        metrics.maxSqlBytes = Math.max(
+          metrics.maxSqlBytes,
+          new TextEncoder().encode(sql).length,
+        );
+        metrics.maxBindings = Math.max(metrics.maxBindings, values.length);
+        for (const value of values)
+          if (typeof value === 'string' && value.startsWith('['))
+            metrics.maxSelectorBytes = Math.max(
+              metrics.maxSelectorBytes,
+              new TextEncoder().encode(value).length,
+            );
+        expect(new TextEncoder().encode(sql).length).toBeLessThanOrEqual(
+          90_000,
+        );
+        expect(values.length).toBeLessThanOrEqual(100);
+      },
+    });
+    expect(
+      await purgeExpiredWorkflowRuns(intercepted, {
+        ...cycle.options(),
+        resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
+        limit: 1000,
+      }),
+    ).toBe(90);
+    expect(metrics.maxSelectorBytes).toBeGreaterThan(500_000);
+    expect(metrics.maxSelectorBytes).toBeLessThanOrEqual(1_000_000);
+    expect(metrics.maxBindings).toBe(13);
+    expect(metrics.statements).toBe(9);
+    console.info('RETENTION_MODERN_MAX', JSON.stringify(metrics));
+  });
+
+  it('measures a complete legacy page and cross-namespace orphan observations', async () => {
+    const { sqlite, db, cycle } = retentionWorld();
+    await createResourceOwnershipSchema(db as never);
+    for (let i = 0; i < 63; i++) createSnapshotTable(sqlite, `n${i}_`);
+    for (let i = 0; i < 90; i++) {
+      seedRun(sqlite, {
+        runId: `legacy-${i}`,
+        status: 'success',
+        updatedAt: NOW - 8 * DAY_MS,
+      });
+    }
+    for (let i = 0; i < 90; i++) {
+      const namespace = i % 64;
+      const prefix = namespace === 0 ? '' : `n${namespace - 1}_`;
+      retentionReservation(sqlite, `orphan-${i}`, {
+        run_id: `current-${i}`,
+        start_table_prefix: prefix,
+      });
+      if (i < 64)
+        retentionSnapshot(sqlite, `current-${i}`, {
+          prefix,
+          token: 'S2',
+          status: 'suspended',
+        });
+    }
+    const metrics = {
+      statements: 0,
+      maxSqlBytes: 0,
+      maxBindings: 0,
+      legacyReads: 0,
+    };
+    const intercepted = retentionIntercept(db, {
+      statement: (sql, values) => {
+        metrics.statements++;
+        metrics.maxSqlBytes = Math.max(
+          metrics.maxSqlBytes,
+          new TextEncoder().encode(sql).length,
+        );
+        metrics.maxBindings = Math.max(metrics.maxBindings, values.length);
+        if (
+          sql.startsWith('SELECT workflow_name, run_id, resourceId, snapshot')
+        )
+          metrics.legacyReads++;
+        expect(values.length).toBeLessThanOrEqual(100);
+        expect(new TextEncoder().encode(sql).length).toBeLessThanOrEqual(
+          90_000,
+        );
+      },
+    });
+    expect(
+      await purgeExpiredWorkflowRuns(intercepted, {
+        ...cycle.options(),
+        resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
+      }),
+    ).toBe(90);
+    expect(reservationRows(sqlite)).toEqual([]);
+    expect(metrics.legacyReads).toBe(90);
+    expect(metrics.maxBindings).toBe(18);
+    expect(metrics.statements).toBe(608);
+    console.info('RETENTION_LEGACY_ORPHAN_MAX', JSON.stringify(metrics));
+  });
+});
+
+describe('run retention cleanup timestamp contract', () => {
+  const markers = [
+    ['null', false],
+    ['false', false],
+    ['true', false],
+    ['"done"', false],
+    ['{}', false],
+    ['[]', false],
+    ['-1', false],
+    ['0.5', false],
+    ['9007199254740992', false],
+    ['1e309', false],
+    ['-1e309', false],
+    ['0', true],
+    ['1.0', true],
+    ['1e0', true],
+    ['9007199254740991', true],
+  ] as const;
+
+  async function cleanupFixture(
+    kind: 'modern' | 'legacy',
+    status: 'cancelled' | 'timed_out' = 'cancelled',
+  ) {
+    const world = retentionWorld();
+    retentionSnapshot(world.sqlite, 'run', { status });
+    retentionReservation(world.sqlite, 'key', {
+      state: 'started',
+      ...(kind === 'legacy'
+        ? {
+            start_token: null,
+            start_table_prefix: null,
+            start_workflow_id: null,
+          }
+        : {}),
+    });
+    const resources = new D1ResourceOwnershipStore(world.db as never);
+    await resources.claim('run', 'run', {
+      kind: 'human',
+      id: 'resource-owner',
+    });
+    const snapshot = currentRetentionSnapshot(world.sqlite);
+    const raw = JSON.stringify({
+      ...snapshot,
+      requestContext: {
+        ...(kind === 'modern' ? snapshot.requestContext : {}),
+        'flowsafe.runLifecycle': {
+          version: 1,
+          revision: 1,
+          terminal: {
+            status,
+            error:
+              status === 'cancelled'
+                ? { code: 'CANCELLED', message: 'run was cancelled' }
+                : { code: 'TIMED_OUT', message: 'run deadline expired' },
+            transitionedAt: 0,
+            replayPrincipals: [{ kind: 'human', id: 'initiator' }],
+            cleanupCompletedAt: 0,
+          },
+        },
+      },
+    });
+    return {
+      ...world,
+      resources,
+      snapshot(marker: string) {
+        return raw.replace(
+          '"cleanupCompletedAt":0',
+          `"cleanupCompletedAt":${marker}`,
+        );
+      },
+    };
+  }
+
+  it.each(
+    markers,
+  )('classifies modern cleanup timestamp %s before artifacts', async (marker, complete) => {
+    const h = await cleanupFixture('modern');
+    const raw = h.snapshot(marker);
+    const lifecycle = JSON.parse(raw).requestContext['flowsafe.runLifecycle'];
+    if (complete)
+      expect(parseRunLifecycle(lifecycle)?.terminal?.cleanupCompletedAt).toBe(
+        JSON.parse(marker),
+      );
+    else expect(() => parseRunLifecycle(lifecycle)).toThrow();
+    replaceRetentionSnapshot(h.sqlite, raw);
+    const deleteRun = vi.fn(async () => 0);
+    expect(
+      await purgeExpiredWorkflowRuns(h.db, {
+        ...h.cycle.options(),
+        resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
+        artifactStore: { deleteRun },
+      }),
+    ).toBe(complete ? 1 : 0);
+    expect(deleteRun).toHaveBeenCalledTimes(complete ? 1 : 0);
+    expect(remainingRunIds(h.sqlite)).toEqual(complete ? [] : ['run']);
+    expect(await h.resources.owner('run', 'run')).toEqual(
+      complete ? undefined : { kind: 'human', id: 'resource-owner' },
+    );
+    expect(reservationRows(h.sqlite)).toEqual([
+      expect.objectContaining({
+        state: complete ? 'terminal' : 'started',
+        updated_at: complete ? NOW : NOW - 8 * DAY_MS,
+      }),
+    ]);
+  });
+
+  it.each(
+    markers,
+  )('revalidates legacy cleanup timestamp %s before artifacts', async (marker, complete) => {
+    const h = await cleanupFixture('legacy');
+    replaceRetentionSnapshot(h.sqlite, h.snapshot('0'));
+    const deleteRun = vi.fn(async () => 0);
+    let rawReads = 0;
+    const intercepted = retentionIntercept(h.db, {
+      statement: (sql) => {
+        if (
+          sql.startsWith('SELECT workflow_name, run_id, resourceId, snapshot')
+        ) {
+          rawReads++;
+          replaceRetentionSnapshot(h.sqlite, h.snapshot(marker));
+        }
+      },
+    });
+    expect(
+      await purgeExpiredWorkflowRuns(intercepted, {
+        ...h.cycle.options(),
+        resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
+        artifactStore: { deleteRun },
+      }),
+    ).toBe(complete ? 1 : 0);
+    expect(rawReads).toBe(1);
+    expect(deleteRun).toHaveBeenCalledTimes(complete ? 1 : 0);
+    expect(remainingRunIds(h.sqlite)).toEqual(complete ? [] : ['run']);
+    expect(await h.resources.owner('run', 'run')).toEqual(
+      complete ? undefined : { kind: 'human', id: 'resource-owner' },
+    );
+    expect(reservationRows(h.sqlite)).toEqual([
+      expect.objectContaining({
+        state: 'started',
+        updated_at: NOW - 8 * DAY_MS,
+      }),
+    ]);
+  });
+
+  it.each([
+    ['false', false],
+    ['0', true],
+  ] as const)('classifies initial legacy cleanup timestamp %s before artifacts', async (marker, complete) => {
+    const h = await cleanupFixture('legacy', 'timed_out');
+    replaceRetentionSnapshot(h.sqlite, h.snapshot(marker));
+    const deleteRun = vi.fn(async () => 0);
+    expect(
+      await purgeExpiredWorkflowRuns(h.db, {
+        ...h.cycle.options(),
+        resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
+        artifactStore: { deleteRun },
+      }),
+    ).toBe(complete ? 1 : 0);
+    expect(deleteRun).toHaveBeenCalledTimes(complete ? 1 : 0);
+    expect(remainingRunIds(h.sqlite)).toEqual(complete ? [] : ['run']);
+    expect(await h.resources.owner('run', 'run')).toEqual(
+      complete ? undefined : { kind: 'human', id: 'resource-owner' },
+    );
+    expect(reservationRows(h.sqlite)).toEqual([
+      expect.objectContaining({
+        state: 'started',
+        updated_at: NOW - 8 * DAY_MS,
+      }),
+    ]);
+  });
+
+  describe.each(['modern', 'legacy'] as const)('%s held mutation', (kind) => {
+    it.each([
+      'false',
+      '1e309',
+    ])('preserves a replacement with cleanup timestamp %s', async (marker) => {
+      const h = await cleanupFixture(kind, 'timed_out');
+      replaceRetentionSnapshot(h.sqlite, h.snapshot('0'));
+      const deleteRun = vi.fn(async () => {
+        replaceRetentionSnapshot(h.sqlite, h.snapshot(marker));
+        return 0;
+      });
+      expect(
+        await purgeExpiredWorkflowRuns(h.db, {
+          ...h.cycle.options(),
+          resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
+          artifactStore: { deleteRun },
+        }),
+      ).toBe(0);
+      expect(deleteRun).toHaveBeenCalledTimes(1);
+      expect(remainingRunIds(h.sqlite)).toEqual(['run']);
+      expect(await h.resources.owner('run', 'run')).toEqual({
+        kind: 'human',
+        id: 'resource-owner',
+      });
+      expect(reservationRows(h.sqlite)).toEqual([
+        expect.objectContaining({
+          state: 'started',
+          updated_at: NOW - 8 * DAY_MS,
+        }),
+      ]);
+    });
+  });
+});
+
+describe('run retention rejection and preservation controls', () => {
+  describe.each(['selection', 'held mutation'] as const)('%s', (boundary) => {
+    it.each([
+      'status',
+      'escaped status',
+      'requestContext',
+      'flowsafe.runLifecycle',
+      'terminal',
+      'cleanupCompletedAt',
+    ])('preserves duplicate eligibility path %s', async (path) => {
+      const { sqlite, db, cycle } = retentionWorld();
+      retentionSnapshot(sqlite, 'run', { status: 'cancelled' });
+      retentionReservation(sqlite, 'key', {
+        state: boundary === 'selection' ? 'terminal' : 'started',
+      });
+      const resources = new D1ResourceOwnershipStore(db as never);
+      await resources.claim('run', 'run', {
+        kind: 'human',
+        id: 'resource-owner',
+      });
+      const terminal = {
+        status: 'cancelled',
+        error: { code: 'CANCELLED', message: 'run was cancelled' },
+        transitionedAt: NOW - 9 * DAY_MS,
+        replayPrincipals: [{ kind: 'human', id: 'initiator' }],
+      };
+      const incomplete = { version: 1, revision: 1, terminal };
+      const complete = {
+        ...incomplete,
+        terminal: { ...terminal, cleanupCompletedAt: NOW - 8 * DAY_MS },
+      };
+      expect(parseRunLifecycle(incomplete)?.terminal).not.toHaveProperty(
+        'cleanupCompletedAt',
+      );
+      expect(parseRunLifecycle(complete)?.terminal).toHaveProperty(
+        'cleanupCompletedAt',
+      );
+      const snapshot = currentRetentionSnapshot(sqlite);
+      const context = {
+        ...snapshot.requestContext,
+        'flowsafe.runLifecycle': complete,
+      };
+      const ordinary = JSON.stringify({ ...snapshot, requestContext: context });
+      const replacements: Record<string, [string, string]> = {
+        status: [
+          '"status":"cancelled"',
+          '"status":"cancelled","status":"running"',
+        ],
+        'escaped status': [
+          '"status":"cancelled"',
+          '"status":"cancelled","sta\\u0074us":"running"',
+        ],
+        requestContext: [
+          `"requestContext":${JSON.stringify(context)}`,
+          `"requestContext":${JSON.stringify(context)},"requestContext":${JSON.stringify({ ...context, 'flowsafe.runLifecycle': incomplete })}`,
+        ],
+        'flowsafe.runLifecycle': [
+          `"flowsafe.runLifecycle":${JSON.stringify(complete)}`,
+          `"flowsafe.runLifecycle":${JSON.stringify(complete)},"flowsafe.runLifecycle":${JSON.stringify(incomplete)}`,
+        ],
+        terminal: [
+          `"terminal":${JSON.stringify(complete.terminal)}`,
+          `"terminal":${JSON.stringify(complete.terminal)},"terminal":${JSON.stringify(terminal)}`,
+        ],
+        cleanupCompletedAt: [
+          `"cleanupCompletedAt":${NOW - 8 * DAY_MS}`,
+          `"cleanupCompletedAt":${NOW - 8 * DAY_MS},"cleanupCompletedAt":null`,
+        ],
+      };
+      const replacement = replacements[path];
+      if (!replacement) throw new Error('missing duplicate-path fixture');
+      const ambiguous = ordinary.replace(...replacement);
+      expect(ambiguous).not.toBe(ordinary);
+      const decoded = JSON.parse(ambiguous);
+      if (path.endsWith('status')) expect(decoded.status).toBe('running');
+      else if (path === 'cleanupCompletedAt')
+        expect(() =>
+          parseRunLifecycle(decoded.requestContext['flowsafe.runLifecycle']),
+        ).toThrow();
+      else
+        expect(
+          parseRunLifecycle(decoded.requestContext['flowsafe.runLifecycle'])
+            ?.terminal,
+        ).not.toHaveProperty('cleanupCompletedAt');
+      replaceRetentionSnapshot(
+        sqlite,
+        boundary === 'selection' ? ambiguous : ordinary,
+      );
+      const deleteRun = vi.fn(async () => 0);
+      const intercepted = retentionIntercept(db, {
+        beforeBatch: () => {
+          if (boundary === 'held mutation')
+            replaceRetentionSnapshot(sqlite, ambiguous);
+        },
+      });
+      expect(
+        await purgeExpiredWorkflowRuns(intercepted, {
+          ...cycle.options(),
+          resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
+          artifactStore: { deleteRun },
+        }),
+      ).toBe(0);
+      expect(remainingRunIds(sqlite)).toEqual(['run']);
+      expect(reservationRows(sqlite)).toEqual([
+        expect.objectContaining({
+          key: 'key',
+          state: boundary === 'selection' ? 'terminal' : 'started',
+          updated_at: NOW - 8 * DAY_MS,
+        }),
+      ]);
+      expect(await resources.owner('run', 'run')).toEqual({
+        kind: 'human',
+        id: 'resource-owner',
+      });
+      expect(deleteRun).toHaveBeenCalledTimes(boundary === 'selection' ? 0 : 1);
+
+      replaceRetentionSnapshot(sqlite, ordinary);
+      expect(
+        await purgeExpiredWorkflowRuns(db, {
+          ...cycle.options(),
+          resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
+        }),
+      ).toBe(1);
+      expect(remainingRunIds(sqlite)).toEqual([]);
+      expect(await resources.owner('run', 'run')).toBeUndefined();
+      expect(reservationRows(sqlite)).toEqual(
+        boundary === 'selection'
+          ? []
+          : [expect.objectContaining({ state: 'terminal', updated_at: NOW })],
+      );
+    });
+  });
+
+  describe.each([
+    'snapshot page',
+    'orphan observation',
+    'absent orphan observation',
+  ] as const)('%s', (boundary) => {
+    it.each([
+      'missing',
+      'numeric',
+      'invalid JSON',
+    ])('rejects a malformed owned capsule projection: %s', async (kind) => {
+      const { sqlite, db, cycle } = retentionWorld();
+      if (boundary !== 'absent orphan observation')
+        retentionSnapshot(sqlite, 'run', {
+          token: boundary === 'orphan observation' ? 'S2' : 'S1',
+          status: boundary === 'orphan observation' ? 'suspended' : 'success',
+        });
+      retentionReservation(sqlite, 'key');
+      let interceptedReads = 0;
+      const intercepted = retentionIntercept(db, {
+        read: (sql, result) => {
+          const target =
+            boundary === 'snapshot page'
+              ? sql.includes('WITH bounds') && sql.includes(' AS eligible')
+              : sql.includes('SELECT c.key AS candidate');
+          if (!target) return result;
+          const row = (result as { results: Record<string, unknown>[] })
+            .results[0];
+          if (!row) throw new Error('missing capsule projection fixture');
+          interceptedReads++;
+          if (kind === 'missing') delete row.owned_1;
+          if (kind === 'numeric') row.owned_1 = 123;
+          if (kind === 'invalid JSON') row.owned_1 = '{';
+          return result;
+        },
+      });
+      await expect(
+        purgeExpiredWorkflowRuns(intercepted, cycle.options()),
+      ).rejects.toThrow();
+      expect(interceptedReads).toBe(1);
+      expect(remainingRunIds(sqlite)).toEqual(
+        boundary === 'absent orphan observation' ? [] : ['run'],
+      );
+      expect(reservationRows(sqlite)).toHaveLength(1);
+      expect(cycle.advances).toHaveLength(boundary === 'snapshot page' ? 0 : 1);
+      expect(await purgeExpiredWorkflowRuns(db, cycle.options())).toBe(
+        boundary === 'snapshot page' ? 1 : 0,
+      );
+      expect(reservationRows(sqlite)).toEqual([]);
+    });
+
+    it('advances past an explicit null owned capsule projection', async () => {
+      const { sqlite, db, cycle } = retentionWorld();
+      if (boundary !== 'absent orphan observation')
+        retentionSnapshot(sqlite, 'run', {
+          token: boundary === 'orphan observation' ? 'S2' : 'S1',
+          status: boundary === 'orphan observation' ? 'suspended' : 'success',
+        });
+      retentionReservation(sqlite, 'key');
+      let interceptedReads = 0;
+      const intercepted = retentionIntercept(db, {
+        read: (sql, result) => {
+          const target =
+            boundary === 'snapshot page'
+              ? sql.includes('WITH bounds') && sql.includes(' AS eligible')
+              : sql.includes('SELECT c.key AS candidate');
+          if (!target) return result;
+          const row = (result as { results: Record<string, unknown>[] })
+            .results[0];
+          if (!row) throw new Error('missing capsule projection fixture');
+          row.owned_1 = null;
+          interceptedReads++;
+          return result;
+        },
+      });
+      expect(await purgeExpiredWorkflowRuns(intercepted, cycle.options())).toBe(
+        0,
+      );
+      expect(interceptedReads).toBe(1);
+      expect(cycle.advances).toHaveLength(2);
+      expect(cycle.cursor?.snapshots).toBeUndefined();
+      expect(cycle.cursor?.reservations).toBeUndefined();
+      expect(remainingRunIds(sqlite)).toEqual(
+        boundary === 'absent orphan observation' ? [] : ['run'],
+      );
+      expect(reservationRows(sqlite)).toHaveLength(
+        boundary === 'absent orphan observation' ? 0 : 1,
+      );
+    });
+  });
+
+  describe.each([
+    'present',
+    'absent',
+  ] as const)('%s orphan snapshot', (presence) => {
+    it.each([
+      'workflow_name',
+      'run_id',
+    ])('rejects a mismatched orphan observation address: %s', async (field) => {
+      const { sqlite, db, cycle } = retentionWorld();
+      if (presence === 'present')
+        retentionSnapshot(sqlite, 'run', { token: 'S2', status: 'suspended' });
+      retentionReservation(sqlite, 'key');
+      let interceptedReads = 0;
+      const intercepted = retentionIntercept(db, {
+        read: (sql, result) => {
+          if (!sql.includes('SELECT c.key AS candidate')) return result;
+          const row = (result as { results: Record<string, unknown>[] })
+            .results[0];
+          if (!row) throw new Error('missing orphan observation fixture');
+          row[field] = 'other';
+          interceptedReads++;
+          return result;
+        },
+      });
+      await expect(
+        purgeExpiredWorkflowRuns(intercepted, cycle.options()),
+      ).rejects.toThrow();
+      expect(interceptedReads).toBe(1);
+      expect(cycle.advances).toHaveLength(1);
+      expect(reservationRows(sqlite)).toHaveLength(1);
+      expect(await purgeExpiredWorkflowRuns(db, cycle.options())).toBe(0);
+      expect(reservationRows(sqlite)).toEqual([]);
+    });
+  });
+
+  describe.each(['initial page', 'schema retry'] as const)('%s', (boundary) => {
+    it.each([
+      'missing',
+      'numeric',
+      'invalid JSON',
+      'array',
+      'incomplete object',
+      'null',
+    ])('handles a reservation projection with %s raw', async (kind) => {
+      const { sqlite, db, cycle } = retentionWorld();
+      retentionReservation(sqlite, 'key');
+      let batches = 0;
+      let interceptedReads = 0;
+      const intercepted = retentionIntercept(db, {
+        beforeBatch: () => {
+          if (boundary === 'schema retry' && batches++ === 0)
+            createSnapshotTable(sqlite, 'late_');
+        },
+        read: (sql, result) => {
+          const target =
+            boundary === 'initial page'
+              ? sql.includes('WITH bounds') && sql.includes(' AS raw')
+              : sql.startsWith('SELECT CASE') && sql.includes(' AS raw');
+          if (!target) return result;
+          const row = (result as { results: Record<string, unknown>[] })
+            .results[0];
+          if (!row) throw new Error('missing reservation projection fixture');
+          interceptedReads++;
+          if (kind === 'missing') delete row.raw;
+          if (kind === 'numeric') row.raw = 123;
+          if (kind === 'invalid JSON') row.raw = '{';
+          if (kind === 'array') row.raw = '[]';
+          if (kind === 'incomplete object') row.raw = '{}';
+          if (kind === 'null') row.raw = null;
+          return result;
+        },
+      });
+      const outcome = purgeExpiredWorkflowRuns(intercepted, cycle.options());
+      if (kind === 'null') {
+        await expect(outcome).resolves.toBe(0);
+        expect(cycle.advances).toHaveLength(2);
+        expect(cycle.cursor?.reservations).toBeUndefined();
+      } else {
+        await expect(outcome).rejects.toThrow();
+        expect(cycle.advances).toHaveLength(1);
+      }
+      expect(interceptedReads).toBe(1);
+      if (boundary === 'schema retry') expect(batches).toBeGreaterThan(0);
+      expect(reservationRows(sqlite)).toHaveLength(1);
+      expect(await purgeExpiredWorkflowRuns(db, cycle.options())).toBe(0);
+      expect(reservationRows(sqlite)).toEqual([]);
+    });
+  });
+
+  it.each([
+    'missing-rows',
+    'sparse-page',
+    'changed-high-water',
+    'missing-position',
+    'missing-capsule',
+    'wrong-eligibility',
+  ])('retains page progress on malformed read result %s', async (kind) => {
+    const { sqlite, db, cycle } = retentionWorld();
+    retentionSnapshot(sqlite, 'run');
+    const intercepted = retentionIntercept(db, {
+      read: (sql, result) => {
+        if (!sql.includes('WITH bounds')) return result;
+        const page = result as { results: Record<string, unknown>[] };
+        if (kind === 'missing-rows') return { results: undefined };
+        if (kind === 'sparse-page') return { results: new Array(1) };
+        const row = page.results[0];
+        if (!row) throw new Error('fixture page missing');
+        if (kind === 'changed-high-water') row.h = NaN;
+        if (kind === 'missing-position') delete row.rid;
+        if (kind === 'missing-capsule') delete row.owned_1;
+        if (kind === 'wrong-eligibility') row.eligible = '1';
+        return page;
+      },
+    });
+    await expect(
+      purgeExpiredWorkflowRuns(intercepted, cycle.options()),
+    ).rejects.toThrow();
+    expect(remainingRunIds(sqlite)).toEqual(['run']);
+    expect(cycle.advances).toEqual([]);
+  });
+
+  it.each([
+    'failed-envelope',
+    'missing-raw-field',
+    'multiple-rows',
+  ])('refuses malformed legacy read %s without advancing', async (kind) => {
+    const { sqlite, db, cycle } = retentionWorld();
+    seedRun(sqlite, {
+      runId: 'run',
+      status: 'success',
+      updatedAt: NOW - 8 * DAY_MS,
+    });
+    const intercepted = retentionIntercept(db, {
+      read: (sql, result) => {
+        if (
+          !sql.startsWith('SELECT workflow_name, run_id, resourceId, snapshot')
+        )
+          return result;
+        const page = result as {
+          results: Record<string, unknown>[];
+          success: boolean;
+        };
+        if (kind === 'failed-envelope') page.success = false;
+        if (kind === 'missing-raw-field' && page.results[0])
+          delete page.results[0].snapshot;
+        if (kind === 'multiple-rows' && page.results[0])
+          page.results.push(page.results[0]);
+        return page;
+      },
+    });
+    await expect(
+      purgeExpiredWorkflowRuns(intercepted, cycle.options()),
+    ).rejects.toThrow();
+    expect(remainingRunIds(sqlite)).toEqual(['run']);
+    expect(cycle.advances).toEqual([]);
+  });
+
+  it('retains the reservation phase position after an orphan response is lost', async () => {
+    const { sqlite, db, cycle } = retentionWorld();
+    retentionReservation(sqlite, 'key');
+    const intercepted = retentionIntercept(db, {
+      afterBatch: () => {
+        throw new Error('orphan response lost');
+      },
+    });
+    await expect(
+      purgeExpiredWorkflowRuns(intercepted, cycle.options()),
+    ).rejects.toThrow('orphan response lost');
+    expect(cycle.advances).toHaveLength(1);
+    expect(reservationRows(sqlite)).toEqual([]);
+    await purgeExpiredWorkflowRuns(db, cycle.options());
+    expect(cycle.advances).toHaveLength(3);
+  });
+
+  it('does not retry an arbitrary missing-table message when its schema is unchanged', async () => {
+    const { sqlite, db, cycle } = retentionWorld();
+    retentionSnapshot(sqlite, 'run');
+    const beforeBatch = vi.fn(() => {
+      throw new Error('no such table mastra_workflow_snapshot');
+    });
+    await expect(
+      purgeExpiredWorkflowRuns(
+        retentionIntercept(db, { beforeBatch }),
+        cycle.options(),
+      ),
+    ).rejects.toThrow('no such table');
+    expect(beforeBatch).toHaveBeenCalledTimes(1);
+    expect(remainingRunIds(sqlite)).toEqual(['run']);
+    expect(cycle.advances).toEqual([]);
+  });
+
+  it('preserves an agent capsule changed from boolean false to numeric zero', async () => {
+    const { sqlite, db, cycle } = retentionWorld();
+    const provenance = {
+      version: 2,
+      startToken: 'S1',
+      startIdentity: {
+        owner: { kind: 'human', id: 'initiator' },
+        target: { kind: 'agent', id: 'agent', threadId: 'thread' },
+      },
+      agentStart: { threaded: false },
+    };
+    decodeRunStartIdentity(provenance);
+    retentionSnapshot(sqlite, 'run', { provenance });
+    retentionReservation(sqlite, 'key', {
+      state: 'started',
+      target_kind: 'agent',
+      target_id: 'agent',
+      thread_id: 'thread',
+    });
+    const intercepted = retentionIntercept(db, {
+      beforeBatch: () => {
+        replaceRetentionSnapshot(sqlite, {
+          status: 'success',
+          requestContext: {
+            'flowsafe.runProvenance': {
+              ...provenance,
+              agentStart: { threaded: 0 },
+            },
+          },
+        });
+      },
+    });
+    expect(await purgeExpiredWorkflowRuns(intercepted, cycle.options())).toBe(
+      0,
+    );
+    expect(reservationRows(sqlite)[0]?.state).toBe('started');
+    replaceRetentionSnapshot(sqlite, {
+      status: 'success',
+      requestContext: { 'flowsafe.runProvenance': provenance },
+    });
+    expect(await purgeExpiredWorkflowRuns(db, cycle.options())).toBe(1);
+    expect(reservationRows(sqlite)[0]?.state).toBe('terminal');
+  });
+
+  it('keeps same-S orphan identity conservative after an exact current address insertion', async () => {
+    const { sqlite, db, cycle } = retentionWorld();
+    retentionReservation(sqlite, 'key');
+    const intercepted = retentionIntercept(db, {
+      beforeBatch: () =>
+        retentionSnapshot(sqlite, 'run', { status: 'suspended' }),
+    });
+    await purgeExpiredWorkflowRuns(intercepted, cycle.options());
+    expect(reservationRows(sqlite)).toHaveLength(1);
+    expect(remainingRunIds(sqlite)).toEqual(['run']);
+  });
+
+  it('uses BINARY owner membership under NOCASE resource IDs', async () => {
+    const { sqlite, db, cycle } = retentionWorld();
+    await createResourceOwnershipSchema(db as never);
+    sqlite.exec(
+      `ALTER TABLE ${RESOURCE_OWNERSHIP_TABLE} RENAME TO original_owners`,
+    );
+    const schema = sqlite
+      .prepare("SELECT sql FROM sqlite_schema WHERE name='original_owners'")
+      .get() as { sql: string };
+    sqlite.exec(
+      schema.sql
+        .replace('"original_owners"', RESOURCE_OWNERSHIP_TABLE)
+        .replaceAll('TEXT', 'TEXT COLLATE NOCASE'),
+    );
+    const resources = new D1ResourceOwnershipStore(db as never);
+    await resources.claim('run', 'run', { kind: 'human', id: 'owner' });
+    retentionSnapshot(sqlite, 'run');
+    retentionSnapshot(sqlite, 'RUN', { status: 'suspended' });
+    expect(
+      await purgeExpiredWorkflowRuns(db, {
+        ...cycle.options(),
+        resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
+      }),
+    ).toBe(1);
+    expect(
+      sqlite
+        .prepare(`SELECT resource_id FROM ${RESOURCE_OWNERSHIP_TABLE}`)
+        .all(),
+    ).toEqual([]);
+    expect(remainingRunIds(sqlite)).toEqual(['RUN']);
+  });
+
+  it('preserves escaped token bytes when decoding yields the same value', async () => {
+    const { sqlite, db, cycle } = retentionWorld();
+    retentionSnapshot(sqlite, 'run');
+    const intercepted = retentionIntercept(db, {
+      beforeBatch: () => {
+        const snapshot = currentRetentionSnapshot(sqlite);
+        replaceRetentionSnapshot(
+          sqlite,
+          JSON.stringify(snapshot).replace('"S1"', '"\\u00531"'),
+        );
+      },
+    });
+    expect(await purgeExpiredWorkflowRuns(intercepted, cycle.options())).toBe(
+      0,
+    );
+    expect(remainingRunIds(sqlite)).toEqual(['run']);
+  });
+
+  it('honors zero TTL without deleting an exact-cutoff snapshot', async () => {
+    const { sqlite, db } = retentionWorld();
+    seedRun(sqlite, { runId: 'before', status: 'success', updatedAt: NOW - 1 });
+    seedRun(sqlite, { runId: 'at', status: 'success', updatedAt: NOW });
+    const cycle = retentionCycle({ ttlMs: 0 });
+    expect(await purgeExpiredWorkflowRuns(db, cycle.options())).toBe(1);
+    expect(remainingRunIds(sqlite)).toEqual(['at']);
+  });
+});
+
+it('retains a same-generation orphan key when its current token uses JSON escapes', async () => {
+  const { sqlite, db, cycle } = retentionWorld();
+  retentionSnapshot(sqlite, 'run', { status: 'suspended' });
+  retentionReservation(sqlite, 'key');
+  const snapshot = currentRetentionSnapshot(sqlite);
+  replaceRetentionSnapshot(
+    sqlite,
+    JSON.stringify(snapshot).replace('"S1"', '"\\u00531"'),
+  );
+  expect(await purgeExpiredWorkflowRuns(db, cycle.options())).toBe(0);
+  expect(reservationRows(sqlite)).toHaveLength(1);
+  expect(remainingRunIds(sqlite)).toEqual(['run']);
 });

@@ -16,6 +16,8 @@ export {
   reserveApplicationR2Resources,
 } from './application-bindings.js';
 export {
+  type AdvanceBackendSwitchDecommissionOptions,
+  advanceBackendSwitchDecommission,
   BACKEND_SWITCH_SUBPHASES,
   type BackendSwitchApplicationR2Progress,
   type BackendSwitchCandidateSnapshot,
@@ -38,19 +40,69 @@ export {
   switchPlainDeploymentToWorkersForPlatforms,
 } from './backend-switch.js';
 export {
+  type AdvanceCleanupDeploymentOptions,
+  advanceCleanupDeployment,
+  type CleanupAdvanceAction,
+  type CleanupAdvanceCapability,
+  CleanupAdvanceCapabilityError,
+  CleanupAdvanceRestartError,
+  type CleanupAdvanceResult,
+} from './cleanup-advance.js';
+export {
+  CleanupAdvanceTokenDeploymentError,
+  CleanupAdvanceTokenError,
+  CleanupAdvanceTokenFutureError,
+  CleanupAdvanceTokenOperationError,
+  classifyCleanupDatabaseEligibility,
+} from './cleanup-intent.js';
+export {
+  CloudflareApiPlainWorkerBackend,
+  type CloudflareApiPlainWorkerBackendOptions,
+} from './cloudflare-api-plain-worker-backend.js';
+export {
   type CloudflareClientOptions,
+  CloudflarePlaneCapabilityError,
   CloudflareProvisioningClient,
   type ControlWorkerInspection,
   type ControlWorkerSpec,
+  cloudflareFleetInventoryContext,
   type DurableDatabaseExportStore,
   type OrdinaryWorkerFootprint,
+  type PlainWorkerCloudflareClientOptions,
 } from './cloudflare-client.js';
+export type {
+  PreparedOrdinaryWorkerDeploymentVersions,
+  PreparedOrdinaryWorkerUpload,
+} from './cloudflare-ordinary-worker-operations.js';
 export {
   type CloudflareApiRateCoordinator,
   D1CloudflareApiRateCoordinator,
   type D1CloudflareApiRateCoordinatorOptions,
   ProcessLocalCloudflareApiRateCoordinator,
 } from './cloudflare-rate-coordinator.js';
+export {
+  D1FleetInventoryRunStore,
+  type D1FleetInventoryRunStoreOptions,
+} from './d1-fleet-inventory-run-store.js';
+export {
+  D1FleetOperationStore,
+  type D1FleetOperationStoreOptions,
+} from './d1-fleet-operation-store.js';
+export {
+  type AdvanceDecommissionDeploymentOptions,
+  advanceDecommissionDeployment,
+  type DecommissionAdvanceAction,
+  type DecommissionAdvanceCapability,
+  DecommissionAdvanceCapabilityError,
+  DecommissionAdvanceRestartError,
+  type DecommissionAdvanceResult,
+} from './decommission-advance.js';
+export {
+  DecommissionAdvanceTokenDeploymentError,
+  DecommissionAdvanceTokenError,
+  DecommissionAdvanceTokenFutureError,
+  DecommissionAdvanceTokenOperationError,
+} from './decommission-intent.js';
 export { FileSystemDatabaseExportStore } from './export-store.js';
 export {
   auditFleetDrift,
@@ -60,7 +112,94 @@ export {
   migrateFleet,
   rollbackExternalRelease,
 } from './fleet.js';
+export {
+  type AdvanceFleetAuditOptions,
+  abandonFleetAuditOperation,
+  advanceFleetAudit,
+  type FleetAuditAdvanceAction,
+  type FleetAuditAdvanceCapability,
+  FleetAuditAdvanceCapabilityError,
+  type FleetAuditAdvanceResult,
+  type FleetAuditFindingsPage,
+  type FleetAuditResultRef,
+  readFleetAuditFindingsPage,
+} from './fleet-audit-advance.js';
+export type {
+  FleetAuditProgress,
+  FleetAuditStage,
+} from './fleet-audit-state.js';
+export {
+  type AdvanceFleetInventoryOptions,
+  advanceFleetInventory,
+  type FleetInventoryAdvanceAction,
+  type FleetInventoryAdvanceCapability,
+  FleetInventoryAdvanceCapabilityError,
+  type FleetInventoryAdvanceResult,
+  readFleetInventoryGeneration,
+} from './fleet-inventory-advance.js';
+export {
+  type CollectFleetInventoryOptions,
+  type FleetInventoryDeploymentFactKind,
+  type FleetInventoryFailureReason,
+  type FleetInventoryGeneration,
+  type FleetInventoryGenerationRef,
+  type FleetInventoryLease,
+  type FleetInventoryProviderContext,
+  type FleetInventoryRowKind,
+  type FleetInventoryRunOptions,
+  type FleetInventoryRunProgress,
+  type FleetInventoryRunRecord,
+  type FleetInventoryRunStore,
+  type FleetInventoryRunToken,
+  FleetInventoryRunTokenError,
+  FleetInventoryRunTokenFutureError,
+  FleetInventoryRunTokenOperationError,
+  type FleetInventoryStage,
+  type FleetInventoryStagedFact,
+  type FleetInventoryStagedRow,
+  type FleetInventoryStageInput,
+  type FleetInventoryStageResult,
+} from './fleet-inventory-state.js';
+export {
+  type AdvanceFleetMigrationOptions,
+  abandonFleetMigrationOperation,
+  advanceFleetMigration,
+  type FleetMigrationAdvanceAction,
+  type FleetMigrationAdvanceCapability,
+  FleetMigrationAdvanceCapabilityError,
+  type FleetMigrationAdvanceResult,
+  type FleetMigrationResultRef,
+  readFleetMigrationItemsPage,
+} from './fleet-migration-advance.js';
+export type {
+  FleetMigrationItem,
+  FleetMigrationPlanEntry,
+  FleetMigrationProgress,
+  FleetMigrationStep,
+} from './fleet-migration-state.js';
+export {
+  type FleetOperationFailure,
+  type FleetOperationKind,
+  type FleetOperationLease,
+  type FleetOperationProgress,
+  type FleetOperationRowKind,
+  type FleetOperationRunRecord,
+  type FleetOperationStagedRow,
+  FleetOperationStateError,
+  type FleetOperationStore,
+  FleetOperationStoreCapabilityError,
+  type FleetOperationToken,
+  FleetOperationTokenError,
+  FleetOperationTokenFutureError,
+  FleetOperationTokenKindError,
+  FleetOperationTokenOperationError,
+} from './fleet-operation-state.js';
 export type { HostRoutingTarget } from './host-routing.js';
+export {
+  PlainWorkerBackend,
+  type PlainWorkerBackendOptions,
+  plainWorkerIngressModule,
+} from './plain-worker-backend.js';
 export {
   type PlatformPlaneClient,
   type PlatformPlaneResult,
@@ -102,11 +241,36 @@ export {
   type ApplicationR2Binding,
   type ApplicationR2BucketSnapshot,
   type ApplicationR2Resource,
+  assertNoActiveCleanup,
+  type CleanupAdvanceIntent,
+  type CleanupAdvanceState,
+  type CleanupAdvanceToken,
+  type CleanupAttachmentProgress,
+  type CleanupAttachmentPurpose,
+  type CleanupAttachmentScan,
+  type CleanupAuthority,
+  type CleanupReceiptEvidence,
+  type CleanupTerminalReceipt,
   type D1Migration,
   type DatabaseExport,
+  type DatabaseExportIntegrity,
+  type DatabaseExportReceiptIdentity,
   type DatabaseReference,
+  type DecommissionAdvanceIntent,
+  type DecommissionAdvanceToken,
+  type DecommissionAdvanceTokenClassification,
+  type DecommissionAttachmentProgress,
+  type DecommissionAttachmentPurpose,
+  type DecommissionAttachmentScanEvidence,
+  type DecommissionAttachmentScanInput,
+  type DecommissionAttachmentScanResult,
   type DecommissionAuditEvent,
   type DecommissionAuditSink,
+  type DecommissionBlockedAttachment,
+  type DecommissionIntentCommon,
+  type DecommissionOperationIdentity,
+  type DecommissionOperationMode,
+  type DecommissionRecordIdentity,
   type DecommissionResult,
   type DeploymentApplicationBindings,
   type DeploymentEgressPolicy,
@@ -124,6 +288,7 @@ export {
   type ExternalReleaseTopology,
   type FleetInventoryDeployment,
   type FleetInventoryFinding,
+  type FleetInventoryR2Jurisdiction,
   type FleetRecord,
   type FleetResourceInventory,
   type FleetSettlementContext,
@@ -133,11 +298,27 @@ export {
   type FleetStateStore,
   type ForceDecommissionStep,
   type InitialExecutionFenceState,
+  type InvocationAuthorityCarrier,
   type LiveDeployment,
   type MaintenanceHealth,
+  type MaintenanceSigningProfile,
+  type NormalDecommissionLifecyclePhase,
   type ObservedActiveRoute,
+  type OrdinaryWorkerDeploymentVersion,
+  type PlainWorkerCleanupOutcome,
   type PlainWorkerCustomDomain,
+  type PlainWorkerDatabaseExportResult,
+  type PlainWorkerDatabaseInventoryEntry,
+  type PlainWorkerDeploymentStatus,
+  type PlainWorkerMutationOutcome,
+  type PlainWorkerProvisioningApi,
   type PlainWorkerRouteApi,
+  type PlainWorkerUploadIntent,
+  type PlainWorkerUploadIntentBase,
+  type PlainWorkerUploadOutcome,
+  type PlainWorkerVersionBinding,
+  type PlainWorkerVersionDetail,
+  type PlainWorkerVersionSummary,
   type PlatformPlaneLease,
   type PlatformPlaneResourceSet,
   type PlatformPlaneStateStore,

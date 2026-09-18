@@ -190,6 +190,7 @@ function wranglerQuery(options, sql) {
   if (options.persistTo) args.push('--persist-to', options.persistTo);
   const result = spawnSync(process.execPath, [wranglerEntrypoint(), ...args], {
     encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   if (result.error) {
@@ -265,12 +266,18 @@ async function main() {
   );
 }
 
-const isMain =
-  process.argv[1] !== undefined &&
-  realpathSync(process.argv[1]) ===
-    realpathSync(fileURLToPath(import.meta.url));
+// Both sides are realpathed, so a symlinked invocation still resolves to this
+// module's own path. An entry path that resolves to nothing names some other
+// module, which importers of this one rely on.
+let invokedFilePath;
+try {
+  invokedFilePath =
+    process.argv[1] === undefined ? undefined : realpathSync(process.argv[1]);
+} catch (error) {
+  if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') throw error;
+}
 
-if (isMain) {
+if (invokedFilePath === realpathSync(fileURLToPath(import.meta.url))) {
   main().catch((error) => {
     reportFailure(error);
     process.exitCode = 1;

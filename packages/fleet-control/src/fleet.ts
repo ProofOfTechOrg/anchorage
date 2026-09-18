@@ -8,10 +8,18 @@ import {
 } from './application-bindings.js';
 import {
   assertBackendSwitchInactive,
+  commitInvocationAuthority,
   type FinalizedOrdinaryStateProvider,
   finalizedBridgeForRecord,
   reconcileFinalizedBackendSwitchState,
 } from './backend-switch.js';
+import { activeExternalRelease } from './decommission-advance.js';
+import type {
+  FleetMigrationItem,
+  FleetMigrationPlanEntry,
+  FleetMigrationStep,
+} from './fleet-migration-state.js';
+import { FLEET_MIGRATION_PLAN_BOUND } from './fleet-operation-state.js';
 import {
   assertExternalPlatformTarget,
   assertExternalPlatformTargetCompatibility,
@@ -40,9 +48,11 @@ import type {
   DeploymentSecrets,
   DeploymentSpec,
   ExternalMigrationIntent,
+  ExternalMigrationSubphase,
   ExternalPlatformTargetDescription,
   ExternalReleaseSnapshot,
   ExternalReleaseTopology,
+  FleetInventoryDeployment,
   FleetInventoryFinding,
   FleetRecord,
   FleetResourceInventory,
@@ -52,6 +62,15 @@ import type {
   LiveDeployment,
   MaintenanceHealth,
   ProvisioningBackend,
+  ProvisioningPhase,
+} from './types.js';
+import {
+  assertNoActiveCleanup,
+  assertNoActiveDecommission,
+  EXTERNAL_MIGRATION_SUBPHASES,
+  effectiveLifecyclePhase,
+  hasActiveCleanup,
+  isPlatformCatalogRecord,
 } from './types.js';
 import {
   targetDurableObjectTag,
@@ -171,11 +190,54 @@ function pendingArtifactVersion(record: FleetRecord): string | undefined {
   );
 }
 
+/**
+ * Script keys a deployment under active bounded cleanup may still own live.
+ * They feed the orphan suppressions only: the bounded engine, not the drift
+ * audit, is the reconciliation authority while its teardown runs.
+ */
+function cleanupKnownScriptKeys(record: FleetRecord): readonly string[] {
+  const keys = [
+    `${record.backend}:${record.scriptName}`,
+    ...[
+      record.activeRelease,
+      record.pendingRelease,
+      record.rollbackRelease,
+      record.retiringRelease,
+      record.migrationPriorRelease,
+    ]
+      .filter((release) => release !== undefined)
+      .map((release) => `${record.backend}:${release.physicalScriptName}`),
+  ];
+  if (record.platformResources) {
+    keys.push(
+      `${
+        record.platformResources.stateWorker.plane === 'dispatch'
+          ? 'workers-for-platforms'
+          : 'plain-worker'
+      }:${record.platformResources.stateWorker.scriptName}`,
+    );
+    if (record.platformResources.egressProxy) {
+      keys.push(
+        `plain-worker:${record.platformResources.egressProxy.scriptName}`,
+      );
+    }
+  }
+  return keys;
+}
+
+/**
+ * The phase a retained record keeps once its decommission completes. It is
+ * retained state rather than a phase that advances, which is what the audit
+ * expectations and the staleness check below read it as.
+ */
+const TERMINAL_LIFECYCLE_PHASE = 'decommissioned' satisfies ProvisioningPhase;
+
 function expectsDatabase(record: FleetRecord): boolean {
-  return record.phase !== 'decommissioned';
+  return effectiveLifecyclePhase(record) !== TERMINAL_LIFECYCLE_PHASE;
 }
 
 function expectsWorker(record: FleetRecord): boolean {
+  const phase = effectiveLifecyclePhase(record);
   return ![
     'database-reserved',
     'database-create-authorized',
@@ -188,10 +250,11 @@ function expectsWorker(record: FleetRecord): boolean {
     'database-exported',
     'database-deleting',
     'decommissioned',
-  ].includes(record.phase);
+  ].includes(phase);
 }
 
 function expectsRoute(record: FleetRecord): boolean {
+  const phase = effectiveLifecyclePhase(record);
   return [
     'publishing',
     'ready',
@@ -199,10 +262,11 @@ function expectsRoute(record: FleetRecord): boolean {
     'rolling-back',
     'decommissioning',
     'credentials-revoked',
-  ].includes(record.phase);
+  ].includes(phase);
 }
 
 function expectsPlatformResources(record: FleetRecord): boolean {
+  const phase = effectiveLifecyclePhase(record);
   return (
     record.platformResources !== undefined &&
     ![
@@ -210,7 +274,7 @@ function expectsPlatformResources(record: FleetRecord): boolean {
       'database-exported',
       'database-deleting',
       'decommissioned',
-    ].includes(record.phase)
+    ].includes(phase)
   );
 }
 
@@ -221,9 +285,15 @@ function liveScriptName(record: FleetRecord): string {
 function expectedReleaseSnapshots(
   record: FleetRecord,
 ): readonly ExternalReleaseSnapshot[] {
-  if (!expectsWorker(record) || record.backend === 'plain-worker') return [];
+  if (
+    !expectsWorker(record) ||
+    record.backend === 'plain-worker' ||
+    isPlatformCatalogRecord(record)
+  )
+    return [];
+  const phase = effectiveLifecyclePhase(record);
   const snapshots = (() => {
-    switch (record.phase) {
+    switch (phase) {
       case 'worker-deployed':
       case 'maintenance-armed':
       case 'publishing':
@@ -276,7 +346,9 @@ function expectedReleaseSnapshots(
 
 function expectedScriptNames(record: FleetRecord): readonly string[] {
   if (!expectsWorker(record)) return [];
-  if (record.backend === 'plain-worker') return [record.scriptName];
+  if (record.backend === 'plain-worker' || isPlatformCatalogRecord(record))
+    return [record.scriptName];
+  const phase = effectiveLifecyclePhase(record);
   const releases = expectedReleaseSnapshots(record);
   const names = releases.map((release) => release.physicalScriptName);
   if (
@@ -291,7 +363,7 @@ function expectedScriptNames(record: FleetRecord): readonly string[] {
       'decommissioning',
       'traffic-removed',
       'credentials-revoked',
-    ].includes(record.phase)
+    ].includes(phase)
   ) {
     names.push(record.scriptName);
   }
@@ -316,6 +388,12 @@ function routeMatchesRecord(
   route: FleetResourceInventory['routes'][number],
   record: FleetRecord,
 ): boolean {
+  if (isPlatformCatalogRecord(record))
+    return (
+      route.scriptName === record.scriptName &&
+      routePolicyMatches(route, record) &&
+      route.stateEgress === undefined
+    );
   if (record.backend === 'workers-for-platforms') {
     return externalRouteExpectations(record).some((expected) => {
       const target = externalHostRoutingTarget(record, expected);
@@ -388,6 +466,7 @@ function expectedNamespaceIdsForRecord(record: FleetRecord): readonly string[] {
 }
 
 function allowedRouteScriptNames(record: FleetRecord): readonly string[] {
+  if (isPlatformCatalogRecord(record)) return [record.scriptName];
   if (record.backend === 'workers-for-platforms') {
     return externalRouteExpectations(record).map(
       (expected) => expected.release.physicalScriptName,
@@ -482,46 +561,124 @@ function configuredDuties(health: MaintenanceHealth): readonly DutyHealth[] {
   ];
 }
 
-function staleDutyReason(
+interface DutySegment {
+  readonly template: string;
+  readonly diagnostic: string | null;
+}
+
+/**
+ * Composes one stale-duty finding segment as a template plus an optional raw
+ * diagnostic, so a caller can persist the template alone and separately
+ * compose the legacy byte-identical string with the diagnostic inlined.
+ */
+function staleDutySegment(
   duty: DutyHealth,
   deployedAt: number | undefined,
   now: number,
   staleAfterMs: number,
-): string | undefined {
+): DutySegment | undefined {
   if (duty.lastError !== undefined) {
-    return `${duty.name} last attempt failed${
-      duty.lastAttemptAt === undefined || duty.lastAttemptAt === null
-        ? ''
-        : ` at ${duty.lastAttemptAt}`
-    }: ${duty.lastError}`;
+    return {
+      template: `${duty.name} last attempt failed${
+        duty.lastAttemptAt === undefined || duty.lastAttemptAt === null
+          ? ''
+          : ` at ${duty.lastAttemptAt}`
+      }`,
+      diagnostic: duty.lastError,
+    };
   }
   const reference = duty.lastSuccessAt ?? deployedAt;
   if (reference === undefined) {
-    return `${duty.name} has no success or deployment freshness reference`;
+    return {
+      template: `${duty.name} has no success or deployment freshness reference`,
+      diagnostic: null,
+    };
   }
   if (now - reference <= staleAfterMs) return undefined;
-  return duty.lastSuccessAt === null
-    ? `${duty.name} has not succeeded within the deployment grace period`
-    : `${duty.name} last succeeded ${now - duty.lastSuccessAt}ms ago`;
+  return {
+    template:
+      duty.lastSuccessAt === null
+        ? `${duty.name} has not succeeded within the deployment grace period`
+        : `${duty.name} last succeeded ${now - duty.lastSuccessAt}ms ago`,
+    diagnostic: null,
+  };
 }
 
-export async function auditFleetDrift(options: {
-  readonly store: FleetStateStore;
-  readonly records: readonly FleetRecord[];
-  readonly inventory: FleetResourceInventory;
-  readonly backendFor: (record: FleetRecord) => ProvisioningBackend;
-  readonly specFor: (record: FleetRecord) => DeploymentSpec;
-  readonly maintenanceSecretFor: (record: FleetRecord) => string;
-  readonly staleAfterMs: number;
-  readonly now?: number;
-}): Promise<readonly DriftFinding[]> {
-  if (!Number.isSafeInteger(options.staleAfterMs) || options.staleAfterMs < 1) {
-    throw new Error('staleAfterMs must be a positive safe integer');
+// ---------------------------------------------------------------------------
+// Audit set-builders: pure derivations over `records`/`inventory` that
+// both the drain and the bounded coordinator's global stages consume. None
+// emits findings.
+//
+// Two idioms satisfy that no-emission requirement, and the difference is
+// driven by the stages' inputs, not by taste. The default is to run the
+// emitting stage itself and discard its findings, which is what
+// `fleetAuditExpectedBucketsSeed` does with `auditR2ExpectedStage`: that stage
+// takes only `records` plus the map it fills, so seeding needs nothing the
+// caller does not already have. `auditNamespaceExpectationsStage` also takes
+// `inventoryNamespaceIds`, so calling it as a seed would mean fabricating an
+// inventory input; `fleetAuditExpectedNamespaceOwnersSeed` and
+// `fleetAuditRecordsDerivedDuplicateNamespaceIds` therefore drive the shared
+// private `walkNamespaceClaims` the stage drives instead, which keeps the
+// claim rule single-sourced either way.
+// ---------------------------------------------------------------------------
+
+export function fleetAuditAuditedRecords(
+  records: readonly FleetRecord[],
+): readonly FleetRecord[] {
+  return records.filter((record) => !hasActiveCleanup(record));
+}
+
+/** The five orphan-suppression sets seeded from records under active cleanup. */
+export interface FleetAuditKnownSets {
+  readonly knownScriptKeys: ReadonlySet<string>;
+  readonly knownRouteKeys: ReadonlySet<string>;
+  readonly knownDatabaseIds: ReadonlySet<string>;
+  readonly knownNamespaceIds: ReadonlySet<string>;
+  readonly knownBucketNames: ReadonlySet<string>;
+}
+
+export function fleetAuditKnownSets(
+  records: readonly FleetRecord[],
+): FleetAuditKnownSets {
+  const knownScriptKeys = new Set<string>();
+  const knownRouteKeys = new Set<string>();
+  const knownDatabaseIds = new Set<string>();
+  const knownNamespaceIds = new Set<string>();
+  const knownBucketNames = new Set<string>();
+  for (const record of records) {
+    if (!hasActiveCleanup(record)) continue;
+    const scriptKeys = cleanupKnownScriptKeys(record);
+    for (const key of scriptKeys) {
+      knownScriptKeys.add(key);
+      const scriptName = key.slice(key.indexOf(':') + 1);
+      knownRouteKeys.add(`${record.routeHostname}:${scriptName}`);
+    }
+    knownDatabaseIds.add(record.databaseId);
+    for (const binding of record.durableObjectBindings) {
+      knownNamespaceIds.add(binding.namespaceId);
+    }
+    for (const namespaceId of record.platformResources?.stateWorker
+      .namespaceIds ?? []) {
+      knownNamespaceIds.add(namespaceId);
+    }
+    for (const resource of record.applicationResources ?? []) {
+      knownBucketNames.add(resource.bucketName);
+    }
   }
-  const now = options.now ?? Date.now();
-  const findings: DriftFinding[] = [...options.inventory.findings];
+  return {
+    knownScriptKeys,
+    knownRouteKeys,
+    knownDatabaseIds,
+    knownNamespaceIds,
+    knownBucketNames,
+  };
+}
+
+export function fleetAuditRecordsByScript(
+  auditedRecords: readonly FleetRecord[],
+): ReadonlyMap<string, readonly FleetRecord[]> {
   const recordsByScript = new Map<string, FleetRecord[]>();
-  for (const record of options.records) {
+  for (const record of auditedRecords) {
     for (const expected of expectedDeploymentKeys(record)) {
       const key = `${expected.backend}:${expected.scriptName}`;
       const matches = recordsByScript.get(key) ?? [];
@@ -529,11 +686,187 @@ export async function auditFleetDrift(options: {
       recordsByScript.set(key, matches);
     }
   }
-  for (const registration of options.inventory.scriptRegistrations) {
+  return recordsByScript;
+}
+
+export function fleetAuditLiveByScript(
+  deployments: readonly FleetInventoryDeployment[],
+): ReadonlyMap<string, readonly FleetInventoryDeployment[]> {
+  const liveByScript = new Map<string, FleetInventoryDeployment[]>();
+  for (const deployment of deployments) {
+    const key = `${deployment.backend}:${deployment.scriptName}`;
+    const matches = liveByScript.get(key) ?? [];
+    matches.push(deployment);
+    liveByScript.set(key, matches);
+  }
+  return liveByScript;
+}
+
+export function fleetAuditRegisteredDatabaseIds(
+  auditedRecords: readonly FleetRecord[],
+): ReadonlySet<string> {
+  return new Set(
+    auditedRecords.filter(expectsDatabase).map((record) => record.databaseId),
+  );
+}
+
+export function fleetAuditExpectedRoutes(
+  auditedRecords: readonly FleetRecord[],
+): ReadonlyMap<
+  string,
+  Readonly<{ record: FleetRecord; scriptNames: readonly string[] }>
+> {
+  return new Map(
+    auditedRecords
+      .filter(expectsRoute)
+      .map((record) => [
+        record.routeHostname,
+        { record, scriptNames: allowedRouteScriptNames(record) },
+      ]),
+  );
+}
+
+export function fleetAuditLiveRoutesByHostname(
+  routes: readonly FleetResourceInventory['routes'][number][],
+): ReadonlyMap<string, readonly FleetResourceInventory['routes'][number][]> {
+  const liveRoutesByHostname = new Map<
+    string,
+    FleetResourceInventory['routes'][number][]
+  >();
+  for (const route of routes) {
+    const routeMatches = liveRoutesByHostname.get(route.hostname) ?? [];
+    routeMatches.push(route);
+    liveRoutesByHostname.set(route.hostname, routeMatches);
+  }
+  return liveRoutesByHostname;
+}
+
+export function fleetAuditExpectedNamespaceIds(
+  auditedRecords: readonly FleetRecord[],
+): ReadonlySet<string> {
+  return new Set(
+    auditedRecords
+      .filter(expectsNamespaces)
+      .flatMap(expectedNamespaceIdsForRecord),
+  );
+}
+
+/**
+ * The one first-owner-wins walk over the namespace claims of every
+ * namespace-expecting record, in record then namespace order. The
+ * `namespace-expectations` stage (emission), its prefix/full seed (the map),
+ * and the records-derived duplicate set (the collisions) all run through it,
+ * so the claim rule exists once. `owners` is mutated in place; `onClaim`
+ * receives the prior owner, undefined when this record has just become the
+ * owner.
+ *
+ * Declared here with the other set-builders, ahead of its emitting caller
+ * `auditNamespaceExpectationsStage` in the stage section below.
+ */
+function walkNamespaceClaims(
+  records: readonly FleetRecord[],
+  owners: Map<string, FleetRecord>,
+  onClaim: (
+    record: FleetRecord,
+    namespaceId: string,
+    priorOwner: FleetRecord | undefined,
+  ) => void,
+): void {
+  for (const record of records.filter(expectsNamespaces)) {
+    for (const namespaceId of expectedNamespaceIdsForRecord(record)) {
+      const priorOwner = owners.get(namespaceId);
+      if (!priorOwner) owners.set(namespaceId, record);
+      onClaim(record, namespaceId, priorOwner);
+    }
+  }
+}
+
+/**
+ * The records-derived expected-duplicate seed: the set of namespace ids more
+ * than one audited, namespace-expecting record claims. Pure over
+ * `auditedRecords`, independent of chunk position. It runs the very walker
+ * the `namespace-expectations` stage runs, so this is the same collision set
+ * that stage accumulates by the time it completes — not merely a second
+ * derivation that agrees with it.
+ */
+export function fleetAuditRecordsDerivedDuplicateNamespaceIds(
+  auditedRecords: readonly FleetRecord[],
+): ReadonlySet<string> {
+  const duplicates = new Set<string>();
+  walkNamespaceClaims(
+    auditedRecords,
+    new Map(),
+    (_record, namespaceId, priorOwner) => {
+      if (priorOwner) duplicates.add(namespaceId);
+    },
+  );
+  return duplicates;
+}
+
+/**
+ * Delegates to the shared first-owner-wins walker with an empty claim
+ * callback, so it accumulates the owner map the `namespace-expectations`
+ * stage accumulates while emitting nothing. Used both to seed a bounded
+ * chunk's prefix and (over the full audited-record list) to reconstruct the
+ * stage's finished map.
+ */
+export function fleetAuditExpectedNamespaceOwnersSeed(
+  records: readonly FleetRecord[],
+): Map<string, FleetRecord> {
+  const owners = new Map<string, FleetRecord>();
+  walkNamespaceClaims(records, owners, () => {});
+  return owners;
+}
+
+export type FleetAuditExpectedBucketEntry = Readonly<{
+  record: FleetRecord;
+  resource: NonNullable<FleetRecord['applicationResources']>[number];
+}>;
+
+/**
+ * Delegates to the emitting `r2-expected` stage — `auditR2ExpectedStage`,
+ * declared in the stage section below — and keeps only the map it fills, so
+ * the claim rule is the stage body itself rather than a second copy of it.
+ * Used both to seed a bounded chunk's prefix and (over the full
+ * audited-record list) to reconstruct the stage's finished map for
+ * `r2-orphans`/`r2-missing-identity`.
+ */
+export function fleetAuditExpectedBucketsSeed(
+  records: readonly FleetRecord[],
+): Map<string, FleetAuditExpectedBucketEntry> {
+  const expectedBuckets = new Map<string, FleetAuditExpectedBucketEntry>();
+  // The emitting stage over an EMPTY map is exactly the non-emitting
+  // rebuild; its findings are discarded. Discarding them allocates one
+  // `DriftFinding` per duplicate bucket claim on every call, including the
+  // two full-map rebuilds the bounded `r2-orphans`/`r2-missing-identity`
+  // stages run over every audited record. That garbage is per duplicate
+  // claim, not per record, so it stays far below the documented O(records²)
+  // record-row re-parse term.
+  auditR2ExpectedStage({ records, expectedBuckets });
+  return expectedBuckets;
+}
+
+// ---------------------------------------------------------------------------
+// Audit global stage functions. Each takes an iteration slice plus its
+// derived sets and returns the findings for that slice, in the same order
+// `auditFleetDrift`'s pre-decomposition body pushed them.
+// ---------------------------------------------------------------------------
+
+export function auditRegistrationOrphansStage(
+  input: Readonly<{
+    scriptRegistrations: readonly FleetResourceInventory['scriptRegistrations'][number][];
+    deployments: readonly FleetInventoryDeployment[];
+    recordsByScript: ReadonlyMap<string, readonly FleetRecord[]>;
+    knownScriptKeys: ReadonlySet<string>;
+  }>,
+): readonly DriftFinding[] {
+  const findings: DriftFinding[] = [];
+  for (const registration of input.scriptRegistrations) {
     const key = `workers-for-platforms:${registration.scriptName}`;
     if (
-      !recordsByScript.has(key) &&
-      !options.inventory.deployments.some(
+      !input.recordsByScript.has(key) &&
+      !input.knownScriptKeys.has(key) &&
+      !input.deployments.some(
         (deployment) =>
           deployment.backend === 'workers-for-platforms' &&
           deployment.scriptName === registration.scriptName,
@@ -547,16 +880,20 @@ export async function auditFleetDrift(options: {
       });
     }
   }
-  const liveByScript = new Map<
-    string,
-    FleetResourceInventory['deployments'][number][]
-  >();
-  for (const deployment of options.inventory.deployments) {
+  return findings;
+}
+
+export function auditDeploymentOrphansStage(
+  input: Readonly<{
+    deployments: readonly FleetInventoryDeployment[];
+    recordsByScript: ReadonlyMap<string, readonly FleetRecord[]>;
+    knownScriptKeys: ReadonlySet<string>;
+  }>,
+): readonly DriftFinding[] {
+  const findings: DriftFinding[] = [];
+  for (const deployment of input.deployments) {
     const key = `${deployment.backend}:${deployment.scriptName}`;
-    const matches = liveByScript.get(key) ?? [];
-    matches.push(deployment);
-    liveByScript.set(key, matches);
-    if (!recordsByScript.has(key)) {
+    if (!input.recordsByScript.has(key) && !input.knownScriptKeys.has(key)) {
       findings.push({
         tenantTag: deployment.tenantTag,
         environment: deployment.environment,
@@ -565,13 +902,24 @@ export async function auditFleetDrift(options: {
       });
     }
   }
-  for (const record of options.records) {
+  return findings;
+}
+
+export function auditDeploymentGapsStage(
+  input: Readonly<{
+    records: readonly FleetRecord[];
+    liveByScript: ReadonlyMap<string, readonly FleetInventoryDeployment[]>;
+    scriptRegistrations: readonly FleetResourceInventory['scriptRegistrations'][number][];
+  }>,
+): readonly DriftFinding[] {
+  const findings: DriftFinding[] = [];
+  for (const record of input.records) {
     for (const expected of expectedDeploymentKeys(record)) {
       const key = `${expected.backend}:${expected.scriptName}`;
-      const liveMatches = liveByScript.get(key) ?? [];
+      const liveMatches = input.liveByScript.get(key) ?? [];
       const registered =
         expected.backend !== 'workers-for-platforms' ||
-        options.inventory.scriptRegistrations.some(
+        input.scriptRegistrations.some(
           (registration) =>
             registration.scriptName === expected.scriptName &&
             registration.tenantTag === record.tenantTag &&
@@ -599,11 +947,22 @@ export async function auditFleetDrift(options: {
       }
     }
   }
-  const registeredDatabaseIds = new Set(
-    options.records.filter(expectsDatabase).map((record) => record.databaseId),
-  );
-  for (const databaseId of options.inventory.databaseIds) {
-    if (!registeredDatabaseIds.has(databaseId)) {
+  return findings;
+}
+
+export function auditOrphanDatabasesStage(
+  input: Readonly<{
+    databaseIds: readonly string[];
+    registeredDatabaseIds: ReadonlySet<string>;
+    knownDatabaseIds: ReadonlySet<string>;
+  }>,
+): readonly DriftFinding[] {
+  const findings: DriftFinding[] = [];
+  for (const databaseId of input.databaseIds) {
+    if (
+      !input.registeredDatabaseIds.has(databaseId) &&
+      !input.knownDatabaseIds.has(databaseId)
+    ) {
       findings.push({
         tenantTag: 'unknown',
         environment: 'unknown',
@@ -612,23 +971,25 @@ export async function auditFleetDrift(options: {
       });
     }
   }
-  const expectedRoutes = new Map(
-    options.records
-      .filter(expectsRoute)
-      .map((record) => [
-        record.routeHostname,
-        { record, scriptNames: allowedRouteScriptNames(record) },
-      ]),
-  );
-  const liveRoutesByHostname = new Map<
-    string,
-    FleetResourceInventory['routes'][number][]
-  >();
-  for (const route of options.inventory.routes) {
-    const routeMatches = liveRoutesByHostname.get(route.hostname) ?? [];
-    routeMatches.push(route);
-    liveRoutesByHostname.set(route.hostname, routeMatches);
-    const expected = expectedRoutes.get(route.hostname);
+  return findings;
+}
+
+export function auditOrphanRoutesStage(
+  input: Readonly<{
+    routes: readonly FleetResourceInventory['routes'][number][];
+    expectedRoutes: ReadonlyMap<
+      string,
+      Readonly<{ record: FleetRecord; scriptNames: readonly string[] }>
+    >;
+    knownRouteKeys: ReadonlySet<string>;
+  }>,
+): readonly DriftFinding[] {
+  const findings: DriftFinding[] = [];
+  for (const route of input.routes) {
+    const expected = input.expectedRoutes.get(route.hostname);
+    if (input.knownRouteKeys.has(`${route.hostname}:${route.scriptName}`)) {
+      continue;
+    }
     if (
       !expected ||
       expected.record.backend !== route.backend ||
@@ -645,17 +1006,22 @@ export async function auditFleetDrift(options: {
       });
     }
   }
-  const databases = new Map<string, FleetRecord>();
-  const expectedNamespaceOwners = new Map<string, FleetRecord>();
-  const liveNamespaceOwners = new Map<string, FleetRecord>();
-  const duplicateNamespaceIds = new Set<string>();
-  const expectedNamespaceIds = new Set(
-    options.records
-      .filter(expectsNamespaces)
-      .flatMap(expectedNamespaceIdsForRecord),
-  );
-  for (const namespaceId of options.inventory.namespaceIds) {
-    if (!expectedNamespaceIds.has(namespaceId)) {
+  return findings;
+}
+
+export function auditNamespaceOrphansStage(
+  input: Readonly<{
+    namespaceIds: readonly string[];
+    expectedNamespaceIds: ReadonlySet<string>;
+    knownNamespaceIds: ReadonlySet<string>;
+  }>,
+): readonly DriftFinding[] {
+  const findings: DriftFinding[] = [];
+  for (const namespaceId of input.namespaceIds) {
+    if (
+      !input.expectedNamespaceIds.has(namespaceId) &&
+      !input.knownNamespaceIds.has(namespaceId)
+    ) {
       findings.push({
         tenantTag: 'unknown',
         environment: 'unknown',
@@ -664,21 +1030,39 @@ export async function auditFleetDrift(options: {
       });
     }
   }
-  for (const record of options.records.filter(expectsNamespaces)) {
-    for (const namespaceId of expectedNamespaceIdsForRecord(record)) {
-      const namespaceOwner = expectedNamespaceOwners.get(namespaceId);
+  return findings;
+}
+
+export function auditNamespaceExpectationsStage(
+  input: Readonly<{
+    records: readonly FleetRecord[];
+    inventoryNamespaceIds: readonly string[];
+    /**
+     * An INPUT the stage reads and also mutates: the caller supplies the
+     * claims already made (empty for the drain's one full-array call, the
+     * prefix rebuild for a bounded chunk), and the stage adds this slice's
+     * claims to it as it walks. Reading it is load-bearing — it is what makes
+     * a `duplicate-namespace` collision visible across a chunk boundary. No
+     * caller reads the mutation back today; the map is passed in rather than
+     * built here so the prefix can be seeded.
+     */
+    expectedNamespaceOwners: Map<string, FleetRecord>;
+  }>,
+): readonly DriftFinding[] {
+  const findings: DriftFinding[] = [];
+  walkNamespaceClaims(
+    input.records,
+    input.expectedNamespaceOwners,
+    (record, namespaceId, namespaceOwner) => {
       if (namespaceOwner) {
-        duplicateNamespaceIds.add(namespaceId);
         findings.push({
           tenantTag: record.tenantTag,
           environment: record.environment,
           kind: 'duplicate-namespace',
           detail: `namespace '${namespaceId}' also bound to ${namespaceOwner.tenantTag}:${namespaceOwner.environment}`,
         });
-      } else {
-        expectedNamespaceOwners.set(namespaceId, record);
       }
-      if (!options.inventory.namespaceIds.includes(namespaceId)) {
+      if (!input.inventoryNamespaceIds.includes(namespaceId)) {
         findings.push({
           tenantTag: record.tenantTag,
           environment: record.environment,
@@ -686,32 +1070,43 @@ export async function auditFleetDrift(options: {
           detail: `expected Durable Object namespace '${namespaceId}' is absent from fleet inventory`,
         });
       }
-    }
-  }
+    },
+  );
+  return findings;
+}
 
-  const expectedBuckets = new Map<
-    string,
-    {
-      readonly record: FleetRecord;
-      readonly resource: NonNullable<
-        FleetRecord['applicationResources']
-      >[number];
-    }
-  >();
-  for (const record of options.records) {
-    if (
-      [
-        'application-resources-deleted',
-        'database-exported',
-        'database-deleting',
-        'decommissioned',
-      ].includes(record.phase)
-    ) {
-      continue;
-    }
+/** Lifecycle phases whose records no longer expect their R2 buckets. */
+const R2_EXPECTATION_EXCLUDED_PHASES: readonly ProvisioningPhase[] =
+  Object.freeze([
+    'application-resources-deleted',
+    'database-exported',
+    'database-deleting',
+    TERMINAL_LIFECYCLE_PHASE,
+  ] as const satisfies readonly ProvisioningPhase[]);
+
+export function auditR2ExpectedStage(
+  input: Readonly<{
+    records: readonly FleetRecord[];
+    /**
+     * An INPUT the stage reads and also mutates: the caller supplies the
+     * claims already made (empty for the drain's one full-array call, the
+     * prefix rebuild for a bounded chunk), and the stage adds this slice's
+     * claims to it as it walks. Reading it is load-bearing — a bucket already
+     * in the map is what makes an `r2-bucket-drift` collision visible across a
+     * chunk boundary. The drain reads the finished map back for its
+     * `r2-orphans` and `r2-missing-identity` stages; the bounded path rebuilds
+     * it with `fleetAuditExpectedBucketsSeed` instead.
+     */
+    expectedBuckets: Map<string, FleetAuditExpectedBucketEntry>;
+  }>,
+): readonly DriftFinding[] {
+  const findings: DriftFinding[] = [];
+  for (const record of input.records) {
+    const phase = effectiveLifecyclePhase(record);
+    if (R2_EXPECTATION_EXCLUDED_PHASES.includes(phase)) continue;
     for (const resource of record.applicationResources ?? []) {
       if (resource.state !== 'created' || !resource.creationDate) continue;
-      const prior = expectedBuckets.get(resource.bucketName);
+      const prior = input.expectedBuckets.get(resource.bucketName);
       if (prior) {
         findings.push({
           tenantTag: record.tenantTag,
@@ -720,18 +1115,28 @@ export async function auditFleetDrift(options: {
           detail: `R2 bucket '${resource.bucketName}' is claimed by more than one deployment`,
         });
       } else {
-        expectedBuckets.set(resource.bucketName, { record, resource });
+        input.expectedBuckets.set(resource.bucketName, { record, resource });
       }
     }
   }
-  const liveBuckets = new Map(
-    (options.inventory.r2Buckets ?? []).map((bucket) => [
-      bucket.bucketName,
-      bucket,
-    ]),
-  );
-  for (const bucket of options.inventory.r2Buckets ?? []) {
-    if (!expectedBuckets.has(bucket.bucketName)) {
+  return findings;
+}
+
+export function auditR2OrphansStage(
+  input: Readonly<{
+    r2Buckets: readonly NonNullable<
+      FleetResourceInventory['r2Buckets']
+    >[number][];
+    expectedBuckets: ReadonlyMap<string, FleetAuditExpectedBucketEntry>;
+    knownBucketNames: ReadonlySet<string>;
+  }>,
+): readonly DriftFinding[] {
+  const findings: DriftFinding[] = [];
+  for (const bucket of input.r2Buckets) {
+    if (
+      !input.expectedBuckets.has(bucket.bucketName) &&
+      !input.knownBucketNames.has(bucket.bucketName)
+    ) {
       findings.push({
         tenantTag: 'unknown',
         environment: 'unknown',
@@ -740,7 +1145,22 @@ export async function auditFleetDrift(options: {
       });
     }
   }
-  for (const { record, resource } of expectedBuckets.values()) {
+  return findings;
+}
+
+export function auditR2MissingIdentityStage(
+  input: Readonly<{
+    expectedBucketEntries: readonly FleetAuditExpectedBucketEntry[];
+    r2Buckets: readonly NonNullable<
+      FleetResourceInventory['r2Buckets']
+    >[number][];
+  }>,
+): readonly DriftFinding[] {
+  const liveBuckets = new Map(
+    input.r2Buckets.map((bucket) => [bucket.bucketName, bucket]),
+  );
+  const findings: DriftFinding[] = [];
+  for (const { record, resource } of input.expectedBucketEntries) {
     const live = liveBuckets.get(resource.bucketName);
     if (!live) {
       findings.push({
@@ -761,536 +1181,773 @@ export async function auditFleetDrift(options: {
       });
     }
   }
+  return findings;
+}
 
-  for (const record of options.records) {
-    const recordMatches =
-      recordsByScript.get(`${record.backend}:${liveScriptName(record)}`) ?? [];
-    if (recordMatches.length > 1) {
-      findings.push({
+// ---------------------------------------------------------------------------
+// Per-record audit step. Frozen result shape: `findings` carries the
+// sanitized durable detail; `legacyDetails` is index-paired and holds the
+// exact legacy byte composition only where it differs (raw diagnostic bytes),
+// null where identical. The drain emits `legacyDetails[i] ?? detail`; the
+// bounded coordinator persists `detail` alone.
+// ---------------------------------------------------------------------------
+
+export interface FleetAuditRecordStepResult {
+  readonly findings: readonly DriftFinding[];
+  readonly legacyDetails: readonly (string | null)[];
+}
+
+export interface FleetAuditRecordStepInput {
+  readonly record: FleetRecord;
+  readonly recordsByScript: ReadonlyMap<string, readonly FleetRecord[]>;
+  readonly liveByScript: ReadonlyMap<
+    string,
+    readonly FleetInventoryDeployment[]
+  >;
+  readonly liveRoutesByHostname: ReadonlyMap<
+    string,
+    readonly FleetResourceInventory['routes'][number][]
+  >;
+  readonly inventoryDatabaseIds: readonly string[];
+  readonly hostRoutingKvId: string | undefined;
+  /** Cross-record inspection facts; mutated in place across a caller's loop. */
+  readonly databases: Map<string, FleetRecord>;
+  readonly liveNamespaceOwners: Map<string, FleetRecord>;
+  readonly duplicateNamespaceIds: Set<string>;
+  readonly backendFor: (record: FleetRecord) => ProvisioningBackend;
+  readonly specFor: (record: FleetRecord) => DeploymentSpec;
+  readonly maintenanceSecretFor: (record: FleetRecord) => string;
+  readonly store: FleetStateStore;
+  readonly staleAfterMs: number;
+  /** Drives every staleness comparison. */
+  readonly auditNow: number;
+  /** Feeds only the re-arm's `commitInvocationAuthority` clock. */
+  readonly authorityNowProvider: () => number;
+}
+
+export async function auditRecordStep(
+  input: FleetAuditRecordStepInput,
+): Promise<FleetAuditRecordStepResult> {
+  const { record } = input;
+  const findings: DriftFinding[] = [];
+  const legacyDetails: (string | null)[] = [];
+  const push = (finding: DriftFinding, legacyDetail: string | null = null) => {
+    findings.push(finding);
+    legacyDetails.push(legacyDetail);
+  };
+  // A stale or blocked bounded cleanup must not read as incomplete-
+  // provisioning, version, binding, or route drift; an empty per-record
+  // ordinal advances with zero findings and zero provider work.
+  if (hasActiveCleanup(record)) return { findings, legacyDetails };
+  const phase = effectiveLifecyclePhase(record);
+  const recordMatches =
+    input.recordsByScript.get(`${record.backend}:${liveScriptName(record)}`) ??
+    [];
+  if (recordMatches.length > 1) {
+    push({
+      tenantTag: record.tenantTag,
+      environment: record.environment,
+      kind: 'duplicate-deployment',
+      detail: `script '${record.scriptName}' is registered ${recordMatches.length} times`,
+    });
+  }
+  const inventoryMatches =
+    input.liveByScript.get(`${record.backend}:${liveScriptName(record)}`) ?? [];
+  const inventoryDeployment = inventoryMatches[0];
+  const recordUpdatedAt = Date.parse(record.updatedAt);
+  // A retained terminal row ages past `staleAfterMs` and stays there until a
+  // host clears it, so reading it as stalled provisioning misclassifies
+  // intended retained state as incomplete provisioning.
+  if (
+    phase !== 'ready' &&
+    phase !== TERMINAL_LIFECYCLE_PHASE &&
+    (!Number.isFinite(recordUpdatedAt) ||
+      input.auditNow - recordUpdatedAt > input.staleAfterMs)
+  ) {
+    push({
+      tenantTag: record.tenantTag,
+      environment: record.environment,
+      kind: 'incomplete-provisioning',
+      detail: `phase '${phase}' has not advanced`,
+    });
+  }
+  const expectedReleases = expectedReleaseSnapshots(record);
+  for (const release of expectedReleases) {
+    const matches =
+      input.liveByScript.get(
+        `${record.backend}:${release.physicalScriptName}`,
+      ) ?? [];
+    if (matches.length !== 1) continue;
+    const liveRelease = matches[0];
+    if (!liveRelease) continue;
+    if (
+      liveRelease.tenantTag !== record.tenantTag ||
+      liveRelease.environment !== record.environment ||
+      liveRelease.artifactVersion !== release.artifactVersion ||
+      liveRelease.schemaVersion !== release.releaseSchemaVersion ||
+      liveRelease.desiredSpecDigest !== release.specDigest
+    ) {
+      push({
         tenantTag: record.tenantTag,
         environment: record.environment,
-        kind: 'duplicate-deployment',
-        detail: `script '${record.scriptName}' is registered ${recordMatches.length} times`,
+        kind: 'version-drift',
+        detail: `lifecycle release '${release.physicalScriptName}' does not match its persisted identity, artifact, schema, and spec digest`,
       });
     }
-    const inventoryMatches =
-      liveByScript.get(`${record.backend}:${liveScriptName(record)}`) ?? [];
-    const inventoryDeployment = inventoryMatches[0];
-    const recordUpdatedAt = Date.parse(record.updatedAt);
     if (
-      record.phase !== 'ready' &&
-      (!Number.isFinite(recordUpdatedAt) ||
-        now - recordUpdatedAt > options.staleAfterMs)
+      liveRelease.databaseIds.length !== 1 ||
+      liveRelease.databaseIds[0] !== record.databaseId
     ) {
-      findings.push({
-        tenantTag: record.tenantTag,
-        environment: record.environment,
-        kind: 'incomplete-provisioning',
-        detail: `phase '${record.phase}' has not advanced`,
-      });
-    }
-    const expectedReleases = expectedReleaseSnapshots(record);
-    for (const release of expectedReleases) {
-      const matches =
-        liveByScript.get(`${record.backend}:${release.physicalScriptName}`) ??
-        [];
-      if (matches.length !== 1) continue;
-      const liveRelease = matches[0];
-      if (!liveRelease) continue;
-      if (
-        liveRelease.tenantTag !== record.tenantTag ||
-        liveRelease.environment !== record.environment ||
-        liveRelease.artifactVersion !== release.artifactVersion ||
-        liveRelease.schemaVersion !== release.releaseSchemaVersion ||
-        liveRelease.desiredSpecDigest !== release.specDigest
-      ) {
-        findings.push({
-          tenantTag: record.tenantTag,
-          environment: record.environment,
-          kind: 'version-drift',
-          detail: `lifecycle release '${release.physicalScriptName}' does not match its persisted identity, artifact, schema, and spec digest`,
-        });
-      }
-      if (
-        liveRelease.databaseIds.length !== 1 ||
-        liveRelease.databaseIds[0] !== record.databaseId
-      ) {
-        findings.push({
-          tenantTag: record.tenantTag,
-          environment: record.environment,
-          kind: 'database-mismatch',
-          detail: `lifecycle release '${release.physicalScriptName}' is not bound exactly to database '${record.databaseId}'`,
-        });
-      }
-      if (!release.topology) {
-        findings.push({
-          tenantTag: record.tenantTag,
-          environment: record.environment,
-          kind: 'audit-error',
-          detail: `lifecycle release '${release.physicalScriptName}' has no durable binding topology`,
-        });
-      } else if (
-        JSON.stringify(
-          liveRelease.durableObjectBindings.map(fullBindingKey).sort(),
-        ) !==
-          JSON.stringify(
-            release.topology.durableObjectBindings.map(fullBindingKey).sort(),
-          ) ||
-        JSON.stringify(namedTargetKeys(liveRelease.serviceBindings ?? [])) !==
-          JSON.stringify(namedTargetKeys(release.topology.serviceBindings)) ||
-        JSON.stringify(
-          namedTargetKeys(liveRelease.queueProducerBindings ?? []),
-        ) !==
-          JSON.stringify(
-            namedTargetKeys(release.topology.queueProducerBindings),
-          ) ||
-        JSON.stringify([...liveRelease.secretNames].sort()) !==
-          JSON.stringify([...release.topology.secretNames].sort()) ||
-        !liveApplicationTopologyMatches(
-          release.topology.application,
-          liveRelease,
-          DEPLOYMENT_PLATFORM_VARIABLE_NAMES,
-        )
-      ) {
-        findings.push({
-          tenantTag: record.tenantTag,
-          environment: record.environment,
-          kind: 'binding-drift',
-          detail: `lifecycle release '${release.physicalScriptName}' has drifted Durable Object, service, queue, application variable, R2, or secret topology`,
-        });
-      }
-    }
-    if (record.phase !== 'ready') continue;
-    if (!inventoryDeployment) {
-      continue;
-    }
-    if (
-      inventoryDeployment.databaseIds.length !== 1 ||
-      inventoryDeployment.databaseIds[0] !== record.databaseId ||
-      !options.inventory.databaseIds.includes(record.databaseId)
-    ) {
-      findings.push({
+      push({
         tenantTag: record.tenantTag,
         environment: record.environment,
         kind: 'database-mismatch',
-        detail: `fleet inventory does not contain exactly database '${record.databaseId}' for '${record.scriptName}'`,
+        detail: `lifecycle release '${release.physicalScriptName}' is not bound exactly to database '${record.databaseId}'`,
       });
     }
-    const routeOwnerDeployments = allowedRouteScriptNames(record).flatMap(
-      (scriptName) => liveByScript.get(`${record.backend}:${scriptName}`) ?? [],
-    );
-    if (
-      routeOwnerDeployments.filter(
-        (deployment) =>
-          deployment.routeHostnames.length === 1 &&
-          deployment.routeHostnames[0] === record.routeHostname,
-      ).length !== 1 ||
-      routeOwnerDeployments.some((deployment) =>
-        deployment.routeHostnames.some(
-          (hostname) => hostname !== record.routeHostname,
-        ),
-      )
-    ) {
-      findings.push({
+    if (!release.topology) {
+      push({
         tenantTag: record.tenantTag,
         environment: record.environment,
-        kind: 'route-drift',
-        detail: `deployment inventory does not contain exactly route '${record.routeHostname}'`,
+        kind: 'audit-error',
+        detail: `lifecycle release '${release.physicalScriptName}' has no durable binding topology`,
       });
-    }
-    const expectedBindingKeys = [...record.durableObjectBindings]
-      .map(bindingKey)
-      .sort();
-    const liveBindingKeys = [...inventoryDeployment.durableObjectBindings]
-      .map(bindingKey)
-      .sort();
-    if (
-      JSON.stringify(expectedBindingKeys) !== JSON.stringify(liveBindingKeys)
+    } else if (
+      JSON.stringify(
+        liveRelease.durableObjectBindings.map(fullBindingKey).sort(),
+      ) !==
+        JSON.stringify(
+          release.topology.durableObjectBindings.map(fullBindingKey).sort(),
+        ) ||
+      JSON.stringify(namedTargetKeys(liveRelease.serviceBindings ?? [])) !==
+        JSON.stringify(namedTargetKeys(release.topology.serviceBindings)) ||
+      JSON.stringify(
+        namedTargetKeys(liveRelease.queueProducerBindings ?? []),
+      ) !==
+        JSON.stringify(
+          namedTargetKeys(release.topology.queueProducerBindings),
+        ) ||
+      JSON.stringify([...liveRelease.secretNames].sort()) !==
+        JSON.stringify([...release.topology.secretNames].sort()) ||
+      !liveApplicationTopologyMatches(
+        release.topology.application,
+        liveRelease,
+        DEPLOYMENT_PLATFORM_VARIABLE_NAMES,
+      )
     ) {
-      findings.push({
+      push({
         tenantTag: record.tenantTag,
         environment: record.environment,
         kind: 'binding-drift',
-        detail: `expected ${expectedBindingKeys.join(',') || 'no bindings'}, found ${liveBindingKeys.join(',') || 'no bindings'}`,
+        detail: `lifecycle release '${release.physicalScriptName}' has drifted Durable Object, service, queue, application variable, R2, or secret topology`,
       });
     }
-    const routeMatches = liveRoutesByHostname.get(record.routeHostname) ?? [];
-    if (routeMatches.length > 1) {
-      findings.push({
-        tenantTag: record.tenantTag,
-        environment: record.environment,
-        kind: 'duplicate-route',
-        detail: `route '${record.routeHostname}' appears ${routeMatches.length} times`,
-      });
-    }
-    const route = routeMatches[0];
-    if (
-      !route ||
-      route.backend !== record.backend ||
-      route.tenantTag !== record.tenantTag ||
-      route.environment !== record.environment ||
-      !routeMatchesRecord(route, record)
-    ) {
-      findings.push({
-        tenantTag: record.tenantTag,
-        environment: record.environment,
-        kind: 'route-drift',
-        detail: `route '${record.routeHostname}' is missing or mismatched`,
-      });
-    }
-    let backend: ProvisioningBackend;
-    try {
-      backend = options.backendFor(record);
-    } catch (error) {
-      findings.push({
+  }
+  if (phase !== 'ready') return { findings, legacyDetails };
+  if (!inventoryDeployment) {
+    return { findings, legacyDetails };
+  }
+  if (
+    inventoryDeployment.databaseIds.length !== 1 ||
+    inventoryDeployment.databaseIds[0] !== record.databaseId ||
+    !input.inventoryDatabaseIds.includes(record.databaseId)
+  ) {
+    push({
+      tenantTag: record.tenantTag,
+      environment: record.environment,
+      kind: 'database-mismatch',
+      detail: `fleet inventory does not contain exactly database '${record.databaseId}' for '${record.scriptName}'`,
+    });
+  }
+  const routeOwnerDeployments = allowedRouteScriptNames(record).flatMap(
+    (scriptName) =>
+      input.liveByScript.get(`${record.backend}:${scriptName}`) ?? [],
+  );
+  if (
+    routeOwnerDeployments.filter(
+      (deployment) =>
+        deployment.routeHostnames.length === 1 &&
+        deployment.routeHostnames[0] === record.routeHostname,
+    ).length !== 1 ||
+    routeOwnerDeployments.some((deployment) =>
+      deployment.routeHostnames.some(
+        (hostname) => hostname !== record.routeHostname,
+      ),
+    )
+  ) {
+    push({
+      tenantTag: record.tenantTag,
+      environment: record.environment,
+      kind: 'route-drift',
+      detail: `deployment inventory does not contain exactly route '${record.routeHostname}'`,
+    });
+  }
+  const expectedBindingKeys = [...record.durableObjectBindings]
+    .map(bindingKey)
+    .sort();
+  const liveBindingKeys = [...inventoryDeployment.durableObjectBindings]
+    .map(bindingKey)
+    .sort();
+  if (JSON.stringify(expectedBindingKeys) !== JSON.stringify(liveBindingKeys)) {
+    push({
+      tenantTag: record.tenantTag,
+      environment: record.environment,
+      kind: 'binding-drift',
+      detail: `expected ${expectedBindingKeys.join(',') || 'no bindings'}, found ${liveBindingKeys.join(',') || 'no bindings'}`,
+    });
+  }
+  const routeMatches =
+    input.liveRoutesByHostname.get(record.routeHostname) ?? [];
+  if (routeMatches.length > 1) {
+    push({
+      tenantTag: record.tenantTag,
+      environment: record.environment,
+      kind: 'duplicate-route',
+      detail: `route '${record.routeHostname}' appears ${routeMatches.length} times`,
+    });
+  }
+  const route = routeMatches[0];
+  if (
+    !route ||
+    route.backend !== record.backend ||
+    route.tenantTag !== record.tenantTag ||
+    route.environment !== record.environment ||
+    !routeMatchesRecord(route, record)
+  ) {
+    push({
+      tenantTag: record.tenantTag,
+      environment: record.environment,
+      kind: 'route-drift',
+      detail: `route '${record.routeHostname}' is missing or mismatched`,
+    });
+  }
+  let backend: ProvisioningBackend;
+  try {
+    backend = input.backendFor(record);
+  } catch (error) {
+    push(
+      {
         tenantTag: record.tenantTag,
         environment: record.environment,
         kind: 'audit-error',
-        detail: `backend resolver failed: ${String(error)}`,
-      });
-      continue;
-    }
-    let spec: DeploymentSpec;
-    try {
-      spec = options.specFor(record);
-    } catch (error) {
-      findings.push({
+        detail: 'backend resolver failed',
+      },
+      `backend resolver failed: ${String(error)}`,
+    );
+    return { findings, legacyDetails };
+  }
+  let spec: DeploymentSpec;
+  try {
+    spec = input.specFor(record);
+  } catch (error) {
+    push(
+      {
         tenantTag: record.tenantTag,
         environment: record.environment,
         kind: 'audit-error',
-        detail: `spec resolver failed: ${String(error)}`,
-      });
-      continue;
-    }
-    if (inventoryDeployment) {
-      const expectedServiceBindings =
-        spec.authoredBy === 'external'
-          ? []
-          : spec.egressProxyService
-            ? [{ name: 'EGRESS_PROXY', service: spec.egressProxyService }]
-            : [];
-      const expectedQueueBindings =
-        spec.authoredBy === 'external'
-          ? []
-          : spec.queueProducer
-            ? [
-                {
-                  name: spec.queueProducer.binding,
-                  queueName: spec.queueProducer.queueName,
-                },
-              ]
-            : [];
+        detail: 'spec resolver failed',
+      },
+      `spec resolver failed: ${String(error)}`,
+    );
+    return { findings, legacyDetails };
+  }
+  const expectedServiceBindings =
+    spec.authoredBy === 'external'
+      ? []
+      : spec.egressProxyService
+        ? [{ name: 'EGRESS_PROXY', service: spec.egressProxyService }]
+        : [];
+  const expectedQueueBindings =
+    spec.authoredBy === 'external'
+      ? []
+      : spec.queueProducer
+        ? [
+            {
+              name: spec.queueProducer.binding,
+              queueName: spec.queueProducer.queueName,
+            },
+          ]
+        : [];
+  if (
+    JSON.stringify(inventoryDeployment.serviceBindings ?? []) !==
+      JSON.stringify(expectedServiceBindings) ||
+    JSON.stringify(inventoryDeployment.queueProducerBindings ?? []) !==
+      JSON.stringify(expectedQueueBindings)
+  ) {
+    push({
+      tenantTag: record.tenantTag,
+      environment: record.environment,
+      kind: 'binding-drift',
+      detail: `release '${inventoryDeployment.scriptName}' has drifted trusted channel bindings`,
+    });
+  }
+  let maintenanceSecret: string;
+  try {
+    maintenanceSecret = input.maintenanceSecretFor(record);
+  } catch (error) {
+    push(
+      {
+        tenantTag: record.tenantTag,
+        environment: record.environment,
+        kind: 'audit-error',
+        detail: 'maintenance secret resolver failed',
+      },
+      `maintenance secret resolver failed: ${String(error)}`,
+    );
+    return { findings, legacyDetails };
+  }
+  if (record.platformResources) {
+    const groupId = externalPlatformResourceGroupId(spec);
+    const platformExpectations = [
+      {
+        role: 'platform-state' as const,
+        snapshot: record.platformResources.stateWorker,
+        backend:
+          record.platformResources.stateWorker.plane === 'dispatch'
+            ? ('workers-for-platforms' as const)
+            : ('plain-worker' as const),
+      },
+      ...(record.platformResources.egressProxy
+        ? [
+            {
+              role: 'deployment-egress' as const,
+              snapshot: record.platformResources.egressProxy,
+              backend: 'plain-worker' as const,
+            },
+          ]
+        : []),
+    ];
+    for (const expected of platformExpectations) {
+      const matches =
+        input.liveByScript.get(
+          `${expected.backend}:${expected.snapshot.scriptName}`,
+        ) ?? [];
+      const resource = matches[0];
+      if (matches.length !== 1 || !resource) continue;
       if (
-        JSON.stringify(inventoryDeployment.serviceBindings ?? []) !==
-          JSON.stringify(expectedServiceBindings) ||
-        JSON.stringify(inventoryDeployment.queueProducerBindings ?? []) !==
-          JSON.stringify(expectedQueueBindings)
+        resource.resourceRole !== expected.role ||
+        resource.resourceGroupId !== groupId ||
+        resource.tenantTag !== record.tenantTag ||
+        resource.environment !== record.environment ||
+        resource.artifactVersion !== expected.snapshot.artifactVersion
       ) {
-        findings.push({
+        push({
           tenantTag: record.tenantTag,
           environment: record.environment,
-          kind: 'binding-drift',
-          detail: `release '${inventoryDeployment.scriptName}' has drifted trusted channel bindings`,
+          kind: 'version-drift',
+          detail: `trusted Worker '${expected.snapshot.scriptName}' has drifted ownership or artifact metadata`,
         });
       }
-    }
-    let maintenanceSecret: string;
-    try {
-      maintenanceSecret = options.maintenanceSecretFor(record);
-    } catch (error) {
-      findings.push({
-        tenantTag: record.tenantTag,
-        environment: record.environment,
-        kind: 'audit-error',
-        detail: `maintenance secret resolver failed: ${String(error)}`,
-      });
-      continue;
-    }
-    if (record.platformResources) {
-      const groupId = externalPlatformResourceGroupId(spec);
-      const platformExpectations = [
-        {
-          role: 'platform-state' as const,
-          snapshot: record.platformResources.stateWorker,
-          backend:
-            record.platformResources.stateWorker.plane === 'dispatch'
-              ? ('workers-for-platforms' as const)
-              : ('plain-worker' as const),
-        },
-        ...(record.platformResources.egressProxy
-          ? [
-              {
-                role: 'deployment-egress' as const,
-                snapshot: record.platformResources.egressProxy,
-                backend: 'plain-worker' as const,
-              },
-            ]
-          : []),
-      ];
-      for (const expected of platformExpectations) {
-        const matches =
-          liveByScript.get(
-            `${expected.backend}:${expected.snapshot.scriptName}`,
-          ) ?? [];
-        const resource = matches[0];
-        if (matches.length !== 1 || !resource) continue;
-        if (
-          resource.resourceRole !== expected.role ||
-          resource.resourceGroupId !== groupId ||
-          resource.tenantTag !== record.tenantTag ||
-          resource.environment !== record.environment ||
-          resource.artifactVersion !== expected.snapshot.artifactVersion
-        ) {
-          findings.push({
-            tenantTag: record.tenantTag,
-            environment: record.environment,
-            kind: 'version-drift',
-            detail: `trusted Worker '${expected.snapshot.scriptName}' has drifted ownership or artifact metadata`,
-          });
-        }
-        if (expected.role === 'platform-state') {
-          const expectedDoKeys =
-            record.platformResources.stateWorker.durableObjectBindings
-              .map(
-                (binding) =>
-                  `${binding.name}:${binding.className}:${binding.namespaceId}`,
-              )
-              .sort();
-          const liveDoKeys = resource.durableObjectBindings
+      if (expected.role === 'platform-state') {
+        const expectedDoKeys =
+          record.platformResources.stateWorker.durableObjectBindings
             .map(
               (binding) =>
                 `${binding.name}:${binding.className}:${binding.namespaceId}`,
             )
             .sort();
-          if (
-            resource.databaseIds.length !== 1 ||
-            resource.databaseIds[0] !== record.databaseId ||
-            JSON.stringify(expectedDoKeys) !== JSON.stringify(liveDoKeys) ||
-            JSON.stringify(resource.serviceBindings ?? []) !==
-              JSON.stringify(
-                record.platformResources.sharedOutboundWorkerName
+        const liveDoKeys = resource.durableObjectBindings
+          .map(
+            (binding) =>
+              `${binding.name}:${binding.className}:${binding.namespaceId}`,
+          )
+          .sort();
+        if (
+          resource.databaseIds.length !== 1 ||
+          resource.databaseIds[0] !== record.databaseId ||
+          JSON.stringify(expectedDoKeys) !== JSON.stringify(liveDoKeys) ||
+          JSON.stringify(resource.serviceBindings ?? []) !==
+            JSON.stringify(
+              record.platformResources.sharedOutboundWorkerName
+                ? [
+                    {
+                      name: 'OUTBOUND_PROXY',
+                      service:
+                        record.platformResources.sharedOutboundWorkerName,
+                      entrypoint: 'StateEgress',
+                    },
+                  ]
+                : record.platformResources.egressProxy
                   ? [
                       {
-                        name: 'OUTBOUND_PROXY',
+                        name: 'EGRESS_PROXY',
                         service:
-                          record.platformResources.sharedOutboundWorkerName,
-                        entrypoint: 'StateEgress',
-                      },
-                    ]
-                  : record.platformResources.egressProxy
-                    ? [
-                        {
-                          name: 'EGRESS_PROXY',
-                          service:
-                            record.platformResources.egressProxy.scriptName,
-                        },
-                      ]
-                    : [],
-              ) ||
-            JSON.stringify(resource.queueProducerBindings ?? []) !==
-              JSON.stringify(
-                record.platformResources.auditQueueName
-                  ? [
-                      {
-                        name: 'AUDIT_QUEUE',
-                        queueName: record.platformResources.auditQueueName,
+                          record.platformResources.egressProxy.scriptName,
                       },
                     ]
                   : [],
-              ) ||
-            JSON.stringify(resource.secretNames) !==
-              JSON.stringify(
-                [
-                  'DEPLOYMENT_IDENTITY_SECRET',
-                  'MAINTENANCE_ADMIN_SECRET',
-                  ...(record.platformResources.sharedOutboundWorkerName
-                    ? ['OUTBOUND_PROXY_CREDENTIAL']
-                    : []),
-                ].sort(),
-              ) ||
-            resource.plainTextBindings?.FLEET_DEPLOYMENT_SCRIPT !==
-              spec.scriptName ||
-            resource.plainTextBindings?.FLEET_MAINTENANCE_CAPABILITIES !==
-              'required' ||
-            resource.plainTextBindings
-              ?.FLEET_MAINTENANCE_CAPABILITY_PUBLIC_KEY !==
-              record.platformResources.maintenanceCapabilityPublicKey ||
-            (resource.plainTextBindings?.FLEET_AUDIT_PROXY_INGRESS ??
-              undefined) !==
-              (record.platformResources.auditQueueName ? 'required' : undefined)
-          ) {
-            findings.push({
-              tenantTag: record.tenantTag,
-              environment: record.environment,
-              kind: 'binding-drift',
-              detail: `trusted state Worker '${expected.snapshot.scriptName}' has drifted database, Durable Object, or egress bindings`,
-            });
-          }
-        } else if (
-          resource.databaseIds.length !== 0 ||
-          resource.durableObjectBindings.length !== 0 ||
-          (resource.serviceBindings?.length ?? 0) !== 0 ||
-          resource.secretNames.length !== 0 ||
-          resource.plainTextBindings?.policyId !==
-            (
-              record.platformResources.outboundPolicy ??
-              record.platformResources.egressProxy
-            )?.policyId ||
-          resource.plainTextBindings?.routeHostname !==
-            record.routeHostname.toLowerCase() ||
-          resource.plainTextBindings?.scriptName !==
-            record.platformResources.stateWorker.scriptName ||
-          !options.inventory.hostRoutingKvId ||
-          resource.plainTextBindings?.hostRoutingKvId !==
-            options.inventory.hostRoutingKvId ||
-          JSON.stringify(resource.kvNamespaceBindings ?? []) !==
-            JSON.stringify([
-              {
-                name: 'HOSTS',
-                namespaceId: options.inventory.hostRoutingKvId,
-              },
-            ])
+            ) ||
+          JSON.stringify(resource.queueProducerBindings ?? []) !==
+            JSON.stringify(
+              record.platformResources.auditQueueName
+                ? [
+                    {
+                      name: 'AUDIT_QUEUE',
+                      queueName: record.platformResources.auditQueueName,
+                    },
+                  ]
+                : [],
+            ) ||
+          JSON.stringify(resource.secretNames) !==
+            JSON.stringify(
+              [
+                'DEPLOYMENT_IDENTITY_SECRET',
+                'MAINTENANCE_ADMIN_SECRET',
+                ...(record.platformResources.sharedOutboundWorkerName
+                  ? ['OUTBOUND_PROXY_CREDENTIAL']
+                  : []),
+              ].sort(),
+            ) ||
+          resource.plainTextBindings?.FLEET_DEPLOYMENT_SCRIPT !==
+            spec.scriptName ||
+          resource.plainTextBindings?.FLEET_MAINTENANCE_CAPABILITIES !==
+            'required' ||
+          resource.plainTextBindings
+            ?.FLEET_MAINTENANCE_CAPABILITY_PUBLIC_KEY !==
+            record.platformResources.maintenanceCapabilityPublicKey ||
+          (resource.plainTextBindings?.FLEET_AUDIT_PROXY_INGRESS ??
+            undefined) !==
+            (record.platformResources.auditQueueName ? 'required' : undefined)
         ) {
-          findings.push({
+          push({
             tenantTag: record.tenantTag,
             environment: record.environment,
             kind: 'binding-drift',
-            detail: `trusted egress Worker '${expected.snapshot.scriptName}' has drifted policy or attribution bindings`,
+            detail: `trusted state Worker '${expected.snapshot.scriptName}' has drifted database, Durable Object, or egress bindings`,
           });
         }
+      } else if (
+        resource.databaseIds.length !== 0 ||
+        resource.durableObjectBindings.length !== 0 ||
+        (resource.serviceBindings?.length ?? 0) !== 0 ||
+        resource.secretNames.length !== 0 ||
+        resource.plainTextBindings?.policyId !==
+          (
+            record.platformResources.outboundPolicy ??
+            record.platformResources.egressProxy
+          )?.policyId ||
+        resource.plainTextBindings?.routeHostname !==
+          record.routeHostname.toLowerCase() ||
+        resource.plainTextBindings?.scriptName !==
+          record.platformResources.stateWorker.scriptName ||
+        !input.hostRoutingKvId ||
+        resource.plainTextBindings?.hostRoutingKvId !== input.hostRoutingKvId ||
+        JSON.stringify(resource.kvNamespaceBindings ?? []) !==
+          JSON.stringify([
+            {
+              name: 'HOSTS',
+              namespaceId: input.hostRoutingKvId,
+            },
+          ])
+      ) {
+        push({
+          tenantTag: record.tenantTag,
+          environment: record.environment,
+          kind: 'binding-drift',
+          detail: `trusted egress Worker '${expected.snapshot.scriptName}' has drifted policy or attribution bindings`,
+        });
       }
     }
-    let live: Awaited<ReturnType<ProvisioningBackend['inspect']>>;
-    try {
-      live = await backend.inspect(
-        spec,
-        maintenanceSecret,
-        activeArtifactVersion(record),
-      );
-    } catch (error) {
-      findings.push({
+  }
+  let live: Awaited<ReturnType<ProvisioningBackend['inspect']>>;
+  try {
+    live = await backend.inspect(
+      spec,
+      maintenanceSecret,
+      activeArtifactVersion(record),
+    );
+  } catch (error) {
+    push(
+      {
         tenantTag: record.tenantTag,
         environment: record.environment,
         kind: 'audit-error',
-        detail: `inspection failed: ${String(error)}`,
-      });
-      continue;
-    }
-    if (!live) {
-      findings.push({
-        tenantTag: record.tenantTag,
-        environment: record.environment,
-        kind: 'missing-deployment',
-        detail: `script '${record.scriptName}' is absent`,
-      });
-      continue;
-    }
-    if (live.databaseId !== record.databaseId) {
-      findings.push({
-        tenantTag: record.tenantTag,
-        environment: record.environment,
-        kind: 'database-mismatch',
-        detail: `expected ${record.databaseId}, found ${live.databaseId}`,
-      });
-    }
-    const databaseOwner = databases.get(live.databaseId);
-    if (databaseOwner) {
-      findings.push({
-        tenantTag: record.tenantTag,
-        environment: record.environment,
-        kind: 'duplicate-database',
-        detail: `database also bound to ${databaseOwner.tenantTag}:${databaseOwner.environment}`,
-      });
-    } else {
-      databases.set(live.databaseId, record);
-    }
-    for (const binding of live.durableObjectBindings) {
-      const namespaceOwner = liveNamespaceOwners.get(binding.namespaceId);
-      if (namespaceOwner && !duplicateNamespaceIds.has(binding.namespaceId)) {
-        duplicateNamespaceIds.add(binding.namespaceId);
-        findings.push({
-          tenantTag: record.tenantTag,
-          environment: record.environment,
-          kind: 'duplicate-namespace',
-          detail: `namespace '${binding.namespaceId}' also bound to ${namespaceOwner.tenantTag}:${namespaceOwner.environment}`,
-        });
-      } else if (!namespaceOwner) {
-        liveNamespaceOwners.set(binding.namespaceId, record);
-      }
-    }
+        detail: 'inspection failed',
+      },
+      `inspection failed: ${String(error)}`,
+    );
+    return { findings, legacyDetails };
+  }
+  if (!live) {
+    push({
+      tenantTag: record.tenantTag,
+      environment: record.environment,
+      kind: 'missing-deployment',
+      detail: `script '${record.scriptName}' is absent`,
+    });
+    return { findings, legacyDetails };
+  }
+  if (live.databaseId !== record.databaseId) {
+    push({
+      tenantTag: record.tenantTag,
+      environment: record.environment,
+      kind: 'database-mismatch',
+      detail: `expected ${record.databaseId}, found ${live.databaseId}`,
+    });
+  }
+  const databaseOwner = input.databases.get(live.databaseId);
+  if (databaseOwner) {
+    push({
+      tenantTag: record.tenantTag,
+      environment: record.environment,
+      kind: 'duplicate-database',
+      detail: `database also bound to ${databaseOwner.tenantTag}:${databaseOwner.environment}`,
+    });
+  } else {
+    input.databases.set(live.databaseId, record);
+  }
+  for (const binding of live.durableObjectBindings) {
+    const namespaceOwner = input.liveNamespaceOwners.get(binding.namespaceId);
     if (
-      live.artifactVersion !== record.artifactVersion ||
-      live.schemaVersion !==
-        (record.activeRelease?.releaseSchemaVersion ?? record.schemaVersion)
+      namespaceOwner &&
+      !input.duplicateNamespaceIds.has(binding.namespaceId)
     ) {
-      findings.push({
+      input.duplicateNamespaceIds.add(binding.namespaceId);
+      push({
         tenantTag: record.tenantTag,
         environment: record.environment,
-        kind: 'version-drift',
-        detail: `expected artifact/schema ${record.artifactVersion}/${record.activeRelease?.releaseSchemaVersion ?? record.schemaVersion}, found ${live.artifactVersion}/${live.schemaVersion}`,
+        kind: 'duplicate-namespace',
+        detail: `namespace '${binding.namespaceId}' also bound to ${namespaceOwner.tenantTag}:${namespaceOwner.environment}`,
       });
+    } else if (!namespaceOwner) {
+      input.liveNamespaceOwners.set(binding.namespaceId, record);
     }
-    const deployedAt = Date.parse(record.updatedAt);
-    const dutyFailures = configuredDuties(live.maintenance)
-      .map((duty) =>
-        staleDutyReason(
-          duty,
-          Number.isFinite(deployedAt) ? deployedAt : undefined,
-          now,
-          options.staleAfterMs,
-        ),
+  }
+  if (
+    live.artifactVersion !== record.artifactVersion ||
+    live.schemaVersion !==
+      (record.activeRelease?.releaseSchemaVersion ?? record.schemaVersion)
+  ) {
+    push({
+      tenantTag: record.tenantTag,
+      environment: record.environment,
+      kind: 'version-drift',
+      detail: `expected artifact/schema ${record.artifactVersion}/${record.activeRelease?.releaseSchemaVersion ?? record.schemaVersion}, found ${live.artifactVersion}/${live.schemaVersion}`,
+    });
+  }
+  const deployedAt = Date.parse(record.updatedAt);
+  const dutySegments = configuredDuties(live.maintenance)
+    .map((duty) =>
+      staleDutySegment(
+        duty,
+        Number.isFinite(deployedAt) ? deployedAt : undefined,
+        input.auditNow,
+        input.staleAfterMs,
+      ),
+    )
+    .filter((segment): segment is DutySegment => segment !== undefined);
+  if (!live.maintenance.armed || dutySegments.length > 0) {
+    const segments = [
+      ...(!live.maintenance.armed
+        ? [
+            {
+              template: 'maintenance scheduler is not armed',
+              diagnostic: null,
+            } satisfies DutySegment,
+          ]
+        : []),
+      ...dutySegments,
+    ];
+    const detail = segments.map((segment) => segment.template).join('; ');
+    const legacyDetail = segments
+      .map(
+        (segment) =>
+          segment.template +
+          (segment.diagnostic !== null ? `: ${segment.diagnostic}` : ''),
       )
-      .filter((reason): reason is string => reason !== undefined);
-    if (!live.maintenance.armed || dutyFailures.length > 0) {
-      const reasons = [
-        ...(!live.maintenance.armed
-          ? ['maintenance scheduler is not armed']
-          : []),
-        ...dutyFailures,
-      ];
-      findings.push({
+      .join('; ');
+    push(
+      {
         tenantTag: record.tenantTag,
         environment: record.environment,
         kind: 'maintenance-stale',
-        detail: reasons.join('; '),
-      });
-      try {
-        await options.store.withDeploymentLease(
-          record.tenantTag,
-          record.environment,
-          async (lease) => {
-            const current = await options.store.get(
-              record.tenantTag,
-              record.environment,
+        detail,
+      },
+      segments.some((segment) => segment.diagnostic !== null)
+        ? legacyDetail
+        : null,
+    );
+    try {
+      await input.store.withDeploymentLease(
+        record.tenantTag,
+        record.environment,
+        async (lease) => {
+          const current = await input.store.get(
+            record.tenantTag,
+            record.environment,
+          );
+          if (
+            !current ||
+            current.phase !== record.phase ||
+            current.desiredSpecDigest !== record.desiredSpecDigest ||
+            current.updatedAt !== record.updatedAt
+          ) {
+            throw new Error(
+              'deployment changed after audit inspection; maintenance re-arm aborted',
             );
-            if (
-              !current ||
-              current.phase !== record.phase ||
-              current.desiredSpecDigest !== record.desiredSpecDigest ||
-              current.updatedAt !== record.updatedAt
-            ) {
-              throw new Error(
-                'deployment changed after audit inspection; maintenance re-arm aborted',
-              );
-            }
-            await lease.assertOwned();
-            await backend.ensureMaintenance(
-              spec,
-              maintenanceSecret,
-              lease,
-              activeArtifactVersion(record),
-            );
-          },
-        );
-      } catch (error) {
-        findings.push({
+          }
+          await commitInvocationAuthority(
+            lease,
+            current,
+            input.authorityNowProvider,
+          );
+          await lease.assertOwned();
+          await backend.ensureMaintenance(
+            spec,
+            maintenanceSecret,
+            lease,
+            activeArtifactVersion(record),
+          );
+        },
+      );
+    } catch (error) {
+      push(
+        {
           tenantTag: record.tenantTag,
           environment: record.environment,
           kind: 'audit-error',
-          detail: `maintenance re-arm failed: ${String(error)}`,
-        });
-      }
+          detail: 'maintenance re-arm failed',
+        },
+        `maintenance re-arm failed: ${String(error)}`,
+      );
     }
+  }
+  return { findings, legacyDetails };
+}
+
+export async function auditFleetDrift(options: {
+  readonly store: FleetStateStore;
+  readonly records: readonly FleetRecord[];
+  readonly inventory: FleetResourceInventory;
+  readonly backendFor: (record: FleetRecord) => ProvisioningBackend;
+  readonly specFor: (record: FleetRecord) => DeploymentSpec;
+  readonly maintenanceSecretFor: (record: FleetRecord) => string;
+  readonly staleAfterMs: number;
+  readonly now?: number;
+}): Promise<readonly DriftFinding[]> {
+  if (!Number.isSafeInteger(options.staleAfterMs) || options.staleAfterMs < 1) {
+    throw new Error('staleAfterMs must be a positive safe integer');
+  }
+  const now = options.now ?? Date.now();
+  const findings: DriftFinding[] = [...options.inventory.findings];
+  // A deployment under active bounded cleanup is audit-suppressed in both
+  // directions: it feeds no expectations (no missing/duplicate findings) and
+  // its declared resource identities join the known sets below so its
+  // still-present resources never read as orphans. The bounded engine is the
+  // reconciliation authority; a long-blocked cleanup stays visible through
+  // the record itself, never through drift findings.
+  const auditedRecords = fleetAuditAuditedRecords(options.records);
+  const known = fleetAuditKnownSets(options.records);
+  const recordsByScript = fleetAuditRecordsByScript(auditedRecords);
+  findings.push(
+    ...auditRegistrationOrphansStage({
+      scriptRegistrations: options.inventory.scriptRegistrations,
+      deployments: options.inventory.deployments,
+      recordsByScript,
+      knownScriptKeys: known.knownScriptKeys,
+    }),
+  );
+  findings.push(
+    ...auditDeploymentOrphansStage({
+      deployments: options.inventory.deployments,
+      recordsByScript,
+      knownScriptKeys: known.knownScriptKeys,
+    }),
+  );
+  const liveByScript = fleetAuditLiveByScript(options.inventory.deployments);
+  findings.push(
+    ...auditDeploymentGapsStage({
+      records: auditedRecords,
+      liveByScript,
+      scriptRegistrations: options.inventory.scriptRegistrations,
+    }),
+  );
+  findings.push(
+    ...auditOrphanDatabasesStage({
+      databaseIds: options.inventory.databaseIds,
+      registeredDatabaseIds: fleetAuditRegisteredDatabaseIds(auditedRecords),
+      knownDatabaseIds: known.knownDatabaseIds,
+    }),
+  );
+  findings.push(
+    ...auditOrphanRoutesStage({
+      routes: options.inventory.routes,
+      expectedRoutes: fleetAuditExpectedRoutes(auditedRecords),
+      knownRouteKeys: known.knownRouteKeys,
+    }),
+  );
+  findings.push(
+    ...auditNamespaceOrphansStage({
+      namespaceIds: options.inventory.namespaceIds,
+      expectedNamespaceIds: fleetAuditExpectedNamespaceIds(auditedRecords),
+      knownNamespaceIds: known.knownNamespaceIds,
+    }),
+  );
+  const expectedNamespaceOwners = new Map<string, FleetRecord>();
+  findings.push(
+    ...auditNamespaceExpectationsStage({
+      records: auditedRecords,
+      inventoryNamespaceIds: options.inventory.namespaceIds,
+      expectedNamespaceOwners,
+    }),
+  );
+  const expectedBuckets = new Map<string, FleetAuditExpectedBucketEntry>();
+  findings.push(
+    ...auditR2ExpectedStage({ records: auditedRecords, expectedBuckets }),
+  );
+  findings.push(
+    ...auditR2OrphansStage({
+      r2Buckets: options.inventory.r2Buckets ?? [],
+      expectedBuckets,
+      knownBucketNames: known.knownBucketNames,
+    }),
+  );
+  findings.push(
+    ...auditR2MissingIdentityStage({
+      expectedBucketEntries: [...expectedBuckets.values()],
+      r2Buckets: options.inventory.r2Buckets ?? [],
+    }),
+  );
+  const liveRoutesByHostname = fleetAuditLiveRoutesByHostname(
+    options.inventory.routes,
+  );
+  const databases = new Map<string, FleetRecord>();
+  const liveNamespaceOwners = new Map<string, FleetRecord>();
+  // A third full walk over every namespace claim:
+  // `fleetAuditExpectedNamespaceIds` collected the claimed ids for
+  // `namespace-orphans` above, and the `namespace-expectations` stage then
+  // visited each claim again. The walker made the collision rule
+  // single-sourced but not its execution; having the stage report its
+  // collisions instead would remove this pass. Recorded rather than changed:
+  // the drain is not the bounded path's hot loop.
+  const duplicateNamespaceIds = new Set(
+    fleetAuditRecordsDerivedDuplicateNamespaceIds(auditedRecords),
+  );
+  for (const record of options.records) {
+    const result = await auditRecordStep({
+      record,
+      recordsByScript,
+      liveByScript,
+      liveRoutesByHostname,
+      inventoryDatabaseIds: options.inventory.databaseIds,
+      hostRoutingKvId: options.inventory.hostRoutingKvId,
+      databases,
+      liveNamespaceOwners,
+      duplicateNamespaceIds,
+      backendFor: options.backendFor,
+      specFor: options.specFor,
+      maintenanceSecretFor: options.maintenanceSecretFor,
+      store: options.store,
+      staleAfterMs: options.staleAfterMs,
+      auditNow: now,
+      authorityNowProvider: () => options.now ?? Date.now(),
+    });
+    findings.push(
+      ...result.findings.map((finding, index) => ({
+        ...finding,
+        detail: result.legacyDetails[index] ?? finding.detail,
+      })),
+    );
   }
   return findings;
 }
@@ -1350,6 +2007,1777 @@ async function retireCommittedRelease(
   return cleared;
 }
 
+interface AdmittedFleetMigrationContext {
+  readonly lease: FleetStateLease;
+  readonly database: NonNullable<
+    Awaited<ReturnType<typeof reconcilePersistedDatabase>>
+  >;
+  readonly backend: ProvisioningBackend;
+  readonly spec: DeploymentSpec;
+  readonly secrets: DeploymentSecrets;
+  readonly targetDigest: string;
+  readonly finalizedStateProvider?: FinalizedOrdinaryStateProvider;
+  readonly settlementFor?: (
+    record: FleetRecord,
+  ) => FleetSettlementHost | undefined;
+  readonly attestationOptions: AttestConvergedActiveRouteOptions;
+  readonly clock: () => number;
+  readonly immutableExternal: boolean;
+  readonly targetRelease?: ExternalReleaseSnapshot;
+  readonly targetPlatform?: ExternalPlatformTargetDescription;
+  readonly platformOnlyTarget?: ExternalPlatformTargetDescription;
+  readonly targetPhysicalScriptName?: string;
+}
+
+type FleetMigrationDependencies = Pick<
+  Parameters<typeof migrateFleet>[0],
+  | 'store'
+  | 'backendFor'
+  | 'specFor'
+  | 'secretsFor'
+  | 'finalizedStateProviderFor'
+  | 'settlementFor'
+> &
+  Readonly<{
+    lease: FleetStateLease;
+    attestationOptions: AttestConvergedActiveRouteOptions;
+    clock: () => number;
+    ordinal: number;
+  }>;
+
+type FleetMigrationPlanKind = 'ready' | 'platform-only' | 'full';
+
+function fleetMigrationPlanKindOf(
+  plan: readonly FleetMigrationPlanEntry[],
+): FleetMigrationPlanKind {
+  if (plan.some(({ step }) => step.startsWith('platform-only-'))) {
+    return 'platform-only';
+  }
+  return plan.some(({ step }) => step === 'seed-identity') ? 'full' : 'ready';
+}
+
+async function runFleetMigrationPreamble(
+  deps: FleetMigrationDependencies,
+  tenantTag: string,
+  environment: string,
+  doBaseExpectation: 'strict' | 'resumption',
+): Promise<
+  Readonly<{ admitted: AdmittedFleetMigrationContext; reread: FleetRecord }>
+> {
+  const { lease } = deps;
+  const stored = await deps.store.get(tenantTag, environment);
+  if (!stored) throw new Error('fleet migration record disappeared');
+  assertNoActiveDecommission(stored, 'migrateFleet');
+  assertNoActiveCleanup(stored, 'migrateFleet');
+  assertBackendSwitchInactive(stored);
+  const storedSchemaVersion = stored.schemaVersion;
+  const backend = deps.backendFor(stored);
+  const spec = deps.specFor(stored);
+  const secrets = deps.secretsFor(stored);
+  const finalizedOrdinaryState =
+    stored.backendSwitchIntent?.subphase === 'finalized' &&
+    stored.platformResources?.stateWorker.plane === 'ordinary';
+  const finalizedStateProvider = finalizedOrdinaryState
+    ? deps.finalizedStateProviderFor?.(stored)
+    : undefined;
+  if (finalizedOrdinaryState) {
+    finalizedBridgeForRecord(stored);
+    if (!finalizedStateProvider) {
+      throw new Error(
+        'finalized ordinary state requires its backend-switch provider',
+      );
+    }
+  }
+  validateDeploymentSpec(spec);
+  validateDeploymentSecrets(spec, secrets);
+  assertImmutableDeploymentMapping(stored, backend, spec);
+  assertPlatformDurableObjectHistory(stored, spec);
+  if (stored.phase !== 'ready' && stored.phase !== 'migrating') {
+    throw new Error(`cannot migrate deployment in phase '${stored.phase}'`);
+  }
+  const targetDigest = deploymentSpecDigest(spec);
+  const immutableExternal =
+    backend.immutableExternalArtifacts === true &&
+    spec.authoredBy === 'external';
+  const targetPhysicalScriptName = immutableExternal
+    ? backend.releaseScriptName?.(spec)
+    : undefined;
+  if (immutableExternal && !targetPhysicalScriptName) {
+    throw new Error(
+      'immutable external backend did not provide a physical release name',
+    );
+  }
+  if (
+    spec.migrations.some(
+      (migration) =>
+        migration.version > storedSchemaVersion &&
+        migration.rollbackCompatible !== true,
+    )
+  ) {
+    throw new Error(
+      'staged D1 migrations must attest rollbackCompatible before candidate creation',
+    );
+  }
+  const targetRelease: ExternalReleaseSnapshot | undefined =
+    targetPhysicalScriptName
+      ? {
+          physicalScriptName: targetPhysicalScriptName,
+          specDigest: targetDigest,
+          artifactVersion: 'pending',
+          releaseSchemaVersion: spec.schemaVersion,
+          application: applicationBindingTopology(
+            spec,
+            stored.applicationResources ?? [],
+          ),
+        }
+      : undefined;
+  const targetPlatform = immutableExternal
+    ? finalizedStateProvider
+      ? finalizedStateProvider.describeFinalizedBridgeTarget(spec, stored)
+      : describeExternalPlatformTarget(backend, spec)
+    : undefined;
+  if (stored.platformTarget && targetPlatform) {
+    assertExternalPlatformTargetCompatibility(
+      stored.platformTarget,
+      targetPlatform,
+    );
+  }
+  const platformOnlyTarget = targetPlatform
+    ? effectiveAppliedPlatformTarget(stored, targetPlatform)
+    : undefined;
+  if (
+    stored.phase === 'migrating' &&
+    (immutableExternal
+      ? stored.migrationIntent?.platformOnly === true
+        ? stored.migrationIntent.targetSpecDigest !== targetDigest ||
+          JSON.stringify(stored.migrationIntent.target) !==
+            JSON.stringify(platformOnlyTarget)
+        : stored.pendingRelease?.specDigest !== targetDigest ||
+          stored.pendingRelease?.physicalScriptName !==
+            targetPhysicalScriptName ||
+          stored.pendingRelease.releaseSchemaVersion !== spec.schemaVersion ||
+          stored.migrationIntent?.targetSpecDigest !== targetDigest
+      : stored.pendingSpecDigest !== targetDigest)
+  ) {
+    throw new Error('migration retry uses a different desired specification');
+  }
+  if (
+    spec.previousDurableObjectTag !== stored.durableObjectTag &&
+    (doBaseExpectation === 'strict' ||
+      (stored.durableObjectTag !== targetDurableObjectTag(spec) &&
+        !(
+          spec.authoredBy === 'external' &&
+          stored.platformResources?.stateWorker.plane === 'ordinary' &&
+          stored.durableObjectTag ===
+            stored.platformResources.stateWorker.durableObjectTag
+        )))
+  ) {
+    throw new Error(
+      `Durable Object migration base mismatch for ${stored.tenantTag}:${stored.environment}: expected '${stored.durableObjectTag ?? 'none'}'`,
+    );
+  }
+  const database = await reconcilePersistedDatabase(
+    backend,
+    stored,
+    false,
+    lease,
+  );
+  if (!database) {
+    throw new Error(`persisted database '${stored.databaseId}' is absent`);
+  }
+  return {
+    reread: stored,
+    admitted: {
+      lease,
+      database,
+      backend,
+      spec,
+      secrets,
+      targetDigest,
+      finalizedStateProvider,
+      settlementFor: deps.settlementFor,
+      attestationOptions: deps.attestationOptions,
+      get clock() {
+        return deps.clock;
+      },
+      immutableExternal,
+      targetRelease,
+      targetPlatform,
+      platformOnlyTarget,
+      targetPhysicalScriptName,
+    },
+  };
+}
+
+function platformOnlyChangeOf(
+  current: FleetRecord,
+  admitted: AdmittedFleetMigrationContext,
+): boolean {
+  return (
+    current.desiredSpecDigest === admitted.targetDigest &&
+    admitted.platformOnlyTarget !== undefined &&
+    current.platformTarget !== undefined &&
+    JSON.stringify(current.platformTarget) !==
+      JSON.stringify(admitted.platformOnlyTarget)
+  );
+}
+
+function assertFleetMigrationNonReadyGuards(
+  admitted: AdmittedFleetMigrationContext,
+  stored: FleetRecord,
+  frozenPlanKind?: FleetMigrationPlanKind,
+): void {
+  const { spec, immutableExternal, targetRelease, targetPlatform } = admitted;
+  const platformOnlyChange = platformOnlyChangeOf(stored, admitted);
+  if (
+    spec.schemaVersion < stored.schemaVersion &&
+    frozenPlanKind !== 'platform-only' &&
+    !platformOnlyChange &&
+    stored.migrationIntent?.platformOnly !== true
+  ) {
+    throw new Error(
+      `schema downgrade refused for ${stored.tenantTag}:${stored.environment}`,
+    );
+  }
+  if (immutableExternal && !stored.activeRelease) {
+    throw new Error(
+      'immutable external migration has no durable active release metadata',
+    );
+  }
+  if (
+    immutableExternal &&
+    targetRelease &&
+    targetPlatform &&
+    (!stored.platformTarget || !stored.outboundPolicy)
+  ) {
+    throw new Error(
+      'immutable external migration has no durable prior platform target and policy',
+    );
+  }
+}
+
+export async function admitFleetMigrationItem(
+  deps: FleetMigrationDependencies,
+  tenantTag: string,
+  environment: string,
+): Promise<
+  Readonly<{
+    admitted: AdmittedFleetMigrationContext;
+    plan: readonly FleetMigrationPlanEntry[];
+    reread: FleetRecord;
+  }>
+> {
+  const { admitted, reread } = await runFleetMigrationPreamble(
+    deps,
+    tenantTag,
+    environment,
+    'strict',
+  );
+  const plan: FleetMigrationPlanEntry[] = [];
+  if (reread.phase === 'ready' && reread.retiringRelease) {
+    plan.push({ step: 'retire-pre' });
+  }
+  const platformOnlyChange = platformOnlyChangeOf(reread, admitted);
+  if (
+    reread.phase === 'ready' &&
+    reread.desiredSpecDigest === admitted.targetDigest &&
+    !platformOnlyChange
+  ) {
+    plan.push(
+      { step: 'ready-target-backfill' },
+      { step: 'ready-platform-resources' },
+      { step: 'ready-maintenance' },
+      { step: 'ready-promote' },
+      { step: 'ready-attest-settle' },
+      { step: 'ready-retire-post' },
+    );
+  } else {
+    if (reread.phase === 'ready') plan.push({ step: 'admit-migrating' });
+    plan.push({ step: 'assert-migrating' });
+    const platformOnly =
+      reread.phase === 'ready'
+        ? platformOnlyChange
+        : reread.migrationIntent?.platformOnly === true;
+    if (platformOnly) {
+      plan.push(
+        { step: 'platform-only-schema' },
+        { step: 'platform-only-resources' },
+        { step: 'platform-only-maintenance' },
+        { step: 'platform-only-promote' },
+        { step: 'platform-only-ready' },
+      );
+    } else {
+      plan.push({ step: 'seed-identity' });
+      const pending = admitted.spec.migrations.filter(
+        ({ version }) => version > reread.schemaVersion,
+      );
+      if (pending.length === 0) plan.push({ step: 'apply-migrations' });
+      for (const { version } of pending) {
+        plan.push({ step: 'apply-migrations', targetSchemaVersion: version });
+      }
+      plan.push(
+        { step: 'migration-schema-applied' },
+        { step: 'platform-resources' },
+        { step: 'pending-topology' },
+        { step: 'deploy-candidate' },
+        { step: 'arm-maintenance' },
+        { step: 'promote' },
+        { step: 'settle-ready' },
+        { step: 'retire-post' },
+      );
+    }
+  }
+  if (plan.length > FLEET_MIGRATION_PLAN_BOUND) {
+    throw new Error(
+      `fleet migration plan for item ${deps.ordinal} exceeds the plan bound of 64 steps`,
+    );
+  }
+  if (fleetMigrationPlanKindOf(plan) !== 'ready') {
+    assertFleetMigrationNonReadyGuards(admitted, reread);
+  }
+  return { admitted, plan, reread };
+}
+
+export async function revalidateFleetMigrationAdmission(
+  deps: FleetMigrationDependencies,
+  plan: readonly FleetMigrationPlanEntry[],
+  targetSpecDigest: string,
+  tenantTag: string,
+  environment: string,
+): Promise<
+  | Readonly<{ admitted: AdmittedFleetMigrationContext; reread: FleetRecord }>
+  | Readonly<{ reason: 'target-drift' }>
+> {
+  const result = await runFleetMigrationPreamble(
+    deps,
+    tenantTag,
+    environment,
+    'resumption',
+  );
+  if (result.admitted.targetDigest !== targetSpecDigest) {
+    return { reason: 'target-drift' };
+  }
+  const planKind = fleetMigrationPlanKindOf(plan);
+  if (planKind !== 'ready') {
+    assertFleetMigrationNonReadyGuards(
+      result.admitted,
+      result.reread,
+      planKind,
+    );
+  }
+  return result;
+}
+
+const MIGRATION_STEP_SUBPHASE: Readonly<
+  Partial<Record<FleetMigrationStep, ExternalMigrationSubphase>>
+> = {
+  'admit-migrating': 'planned',
+  'platform-only-schema': 'schema-applied',
+  'platform-only-resources': 'platform-applied',
+  'platform-only-promote': 'route-published',
+  'migration-schema-applied': 'schema-applied',
+  'platform-resources': 'platform-applied',
+  'deploy-candidate': 'candidate-deployed',
+  'arm-maintenance': 'candidate-armed',
+  promote: 'route-published',
+};
+
+function refuseFleetMigrationPlan(): never {
+  throw new Error('fleet migration item no longer matches its frozen plan');
+}
+
+function assertFleetMigrationFloors(
+  admitted: AdmittedFleetMigrationContext,
+  plan: readonly FleetMigrationPlanEntry[],
+  planCursor: number,
+  current: FleetRecord,
+): void {
+  const reachable: ExternalMigrationSubphase[] = ['planned'];
+  let subphaseFloor: ExternalMigrationSubphase | undefined;
+  let schemaFloor = 0;
+  let candidateCompleted = false;
+  for (const [index, { step, targetSchemaVersion }] of plan.entries()) {
+    const subphase = MIGRATION_STEP_SUBPHASE[step];
+    if (subphase && step !== 'admit-migrating') reachable.push(subphase);
+    if (index >= planCursor) continue;
+    if (subphase) subphaseFloor = subphase;
+    if (step === 'apply-migrations') {
+      schemaFloor = Math.max(
+        schemaFloor,
+        targetSchemaVersion ?? admitted.spec.schemaVersion,
+      );
+    }
+    if (step === 'deploy-candidate') candidateCompleted = true;
+  }
+  if (current.schemaVersion < schemaFloor) refuseFleetMigrationPlan();
+  if (admitted.immutableExternal) {
+    let previous = -1;
+    for (const subphase of reachable) {
+      const index = EXTERNAL_MIGRATION_SUBPHASES.indexOf(subphase);
+      if (index <= previous) refuseFleetMigrationPlan();
+      previous = index;
+    }
+    const subphase = current.migrationIntent?.subphase;
+    if (
+      (subphase !== undefined && !reachable.includes(subphase)) ||
+      (subphaseFloor !== undefined &&
+        (subphase === undefined ||
+          reachable.indexOf(subphase) < reachable.indexOf(subphaseFloor)))
+    ) {
+      refuseFleetMigrationPlan();
+    }
+  } else if (
+    candidateCompleted &&
+    current.pendingArtifactVersion === undefined
+  ) {
+    refuseFleetMigrationPlan();
+  }
+}
+
+export async function assertFleetMigrationPlanCompatibility(
+  admitted: AdmittedFleetMigrationContext,
+  item: Required<Pick<FleetMigrationItem, 'plan' | 'planCursor'>>,
+  current: FleetRecord,
+): Promise<void> {
+  const { plan, planCursor } = item;
+  if (
+    !Number.isSafeInteger(planCursor) ||
+    planCursor < 0 ||
+    !plan[planCursor]
+  ) {
+    refuseFleetMigrationPlan();
+  }
+  const planKind = fleetMigrationPlanKindOf(plan);
+  if (planKind === 'ready') {
+    if (
+      current.phase !== 'ready' ||
+      current.desiredSpecDigest !== admitted.targetDigest ||
+      platformOnlyChangeOf(current, admitted) ||
+      (admitted.targetPlatform &&
+        planCursor >
+          plan.findIndex(({ step }) => step === 'ready-target-backfill') &&
+        !current.platformTarget)
+    ) {
+      refuseFleetMigrationPlan();
+    }
+    return;
+  }
+  const terminal = plan.findIndex(
+    ({ step }) =>
+      step ===
+      (planKind === 'platform-only' ? 'platform-only-ready' : 'settle-ready'),
+  );
+  if (terminal < 0) refuseFleetMigrationPlan();
+  if (planCursor >= terminal) {
+    if (isConvergedTerminalCommit(current, admitted, planKind)) return;
+    if (planCursor > terminal) refuseFleetMigrationPlan();
+  }
+  const admission = plan.findIndex(({ step }) => step === 'admit-migrating');
+  if (
+    admission >= 0 &&
+    (planCursor < admission ||
+      (planCursor === admission && current.phase === 'ready'))
+  ) {
+    const platformOnly = platformOnlyChangeOf(current, admitted);
+    if (
+      current.phase !== 'ready' ||
+      (current.desiredSpecDigest === admitted.targetDigest && !platformOnly) ||
+      platformOnly !== (planKind === 'platform-only')
+    ) {
+      refuseFleetMigrationPlan();
+    }
+    return;
+  }
+  if (
+    current.phase !== 'migrating' ||
+    (current.migrationIntent?.platformOnly === true) !==
+      (planKind === 'platform-only')
+  ) {
+    refuseFleetMigrationPlan();
+  }
+  assertFleetMigrationFloors(admitted, plan, planCursor, current);
+  const assertion = plan.findIndex(({ step }) => step === 'assert-migrating');
+  if (assertion >= 0 && planCursor > assertion) {
+    await assertMigratingCarrierState(admitted, current);
+  }
+}
+
+function isPlatformOnlyTerminalProjection(
+  current: FleetRecord,
+  admitted: AdmittedFleetMigrationContext,
+): boolean {
+  const { platformOnlyTarget } = admitted;
+  return (
+    platformOnlyTarget !== undefined &&
+    JSON.stringify(current.platformTarget) ===
+      JSON.stringify(platformOnlyTarget) &&
+    JSON.stringify(current.outboundPolicy) ===
+      JSON.stringify(platformOnlyTarget.outboundPolicy)
+  );
+}
+
+function isFullTerminalProjection(
+  current: FleetRecord,
+  admitted: AdmittedFleetMigrationContext,
+): boolean {
+  const { spec, targetPlatform, targetRelease } = admitted;
+  if (
+    current.schemaVersion !== spec.schemaVersion ||
+    current.pendingSpecDigest !== undefined ||
+    current.pendingArtifactVersion !== undefined ||
+    current.pendingRelease !== undefined ||
+    current.migrationPriorRelease !== undefined
+  )
+    return false;
+  if (
+    targetPlatform &&
+    (JSON.stringify(current.platformTarget) !==
+      JSON.stringify(targetPlatform) ||
+      JSON.stringify(current.outboundPolicy) !==
+        JSON.stringify(targetPlatform.outboundPolicy))
+  )
+    return false;
+  if (
+    targetRelease &&
+    (!current.activeRelease ||
+      current.activeRelease.physicalScriptName !==
+        targetRelease.physicalScriptName ||
+      current.activeRelease.releaseSchemaVersion !==
+        targetRelease.releaseSchemaVersion)
+  )
+    return false;
+  const expectedApplication = targetRelease
+    ? (current.activeRelease?.application ??
+      applicationBindingTopology(spec, current.applicationResources ?? []))
+    : applicationBindingTopology(spec, current.applicationResources ?? []);
+  return (
+    JSON.stringify(current.applicationBindings) ===
+    JSON.stringify(expectedApplication)
+  );
+}
+
+function isConvergedTerminalCommit(
+  current: FleetRecord,
+  admitted: AdmittedFleetMigrationContext,
+  planKind: 'platform-only' | 'full',
+): boolean {
+  return (
+    current.phase === 'ready' &&
+    current.migrationIntent === undefined &&
+    current.desiredSpecDigest === admitted.targetDigest &&
+    !platformOnlyChangeOf(current, admitted) &&
+    (planKind === 'platform-only'
+      ? isPlatformOnlyTerminalProjection(current, admitted)
+      : isFullTerminalProjection(current, admitted))
+  );
+}
+
+export async function assertMigratingCarrierState(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<void> {
+  const {
+    lease,
+    spec,
+    immutableExternal,
+    targetPlatform,
+    platformOnlyTarget,
+    finalizedStateProvider,
+  } = admitted;
+  if (
+    immutableExternal &&
+    (!current.migrationIntent ||
+      (current.migrationIntent.platformOnly !== true &&
+        (!current.migrationPriorRelease || !current.pendingRelease)))
+  ) {
+    throw new Error(
+      'immutable external migration lost its durable release intent',
+    );
+  }
+  if (targetPlatform && current.migrationIntent) {
+    assertExternalPlatformTarget(
+      current.migrationIntent.target,
+      current.migrationIntent.platformOnly === true
+        ? (platformOnlyTarget as ExternalPlatformTargetDescription)
+        : targetPlatform,
+      'migration retry',
+    );
+  }
+  if (finalizedStateProvider && targetPlatform) {
+    const finalizedPlan = finalizedStateProvider.describeFinalizedState({
+      targetSpec: spec,
+      currentRecord: current,
+      target: current.migrationIntent?.target ?? targetPlatform,
+    });
+    await finalizedStateProvider.assertFinalizedState({
+      targetSpec: spec,
+      currentRecord: current,
+      target: current.migrationIntent?.target ?? targetPlatform,
+      plan: finalizedPlan,
+      fence: lease,
+    });
+  }
+}
+
+async function migrationRetirePre(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const { lease, database, backend, spec } = admitted;
+  if (current.phase === 'ready' && current.retiringRelease) {
+    current = await retireCommittedRelease(
+      backend,
+      spec,
+      database,
+      current,
+      lease,
+      admitted.clock,
+    );
+  }
+  return current;
+}
+
+async function migrationReadyTargetBackfill(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const { lease, targetPlatform } = admitted;
+  if (targetPlatform) {
+    if (!current.platformTarget) {
+      if (!current.platformResources) {
+        throw new Error(
+          'ready external deployment has no trusted platform resources',
+        );
+      }
+      assertPlatformResourcesMatchTarget(
+        current.platformResources,
+        targetPlatform,
+      );
+      current = {
+        ...current,
+        platformTarget: targetPlatform,
+        outboundPolicy: targetPlatform.outboundPolicy,
+        updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+      };
+      await lease.put(current);
+    }
+  }
+  return current;
+}
+
+async function migrationReadyPlatformResources(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const {
+    lease,
+    database,
+    backend,
+    spec,
+    secrets,
+    finalizedStateProvider,
+    targetPlatform,
+    platformOnlyTarget,
+  } = admitted;
+  if (targetPlatform) {
+    const rollbackCompatibleTarget = platformOnlyTarget ?? targetPlatform;
+    assertExternalPlatformTarget(
+      current.platformTarget,
+      rollbackCompatibleTarget,
+      'ready deployment',
+    );
+    current = await convergeExternalPlatformResources(
+      backend,
+      spec,
+      database,
+      secrets,
+      rollbackCompatibleTarget,
+      current,
+      lease,
+      admitted.clock,
+      finalizedStateProvider,
+    );
+  }
+  return current;
+}
+
+async function migrationReadyMaintenance(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const {
+    lease,
+    backend,
+    spec,
+    secrets,
+    targetDigest,
+    immutableExternal,
+    targetRelease,
+  } = admitted;
+  const live = await backend.inspect(
+    spec,
+    secrets.maintenanceAdmin,
+    activeArtifactVersion(current),
+  );
+  if (!live) throw new Error('ready migration target is missing');
+  assertLiveDeploymentMatches(
+    live,
+    current,
+    spec,
+    targetDigest,
+    current.activeRelease?.application,
+  );
+  if (immutableExternal && current.activeRelease) {
+    assertExternalReleaseArtifactVersion(
+      live,
+      current.activeRelease,
+      'ready migration',
+    );
+  }
+  if (
+    targetRelease &&
+    (current.activeRelease?.physicalScriptName !==
+      targetRelease.physicalScriptName ||
+      current.activeRelease.releaseSchemaVersion !==
+        targetRelease.releaseSchemaVersion ||
+      current.activeRelease.artifactVersion !== live.artifactVersion)
+  ) {
+    throw new Error(
+      'ready immutable release metadata does not exactly match the target',
+    );
+  }
+  let maintenance = live.maintenance;
+  if (!maintenance.armed) {
+    current = await commitInvocationAuthority(lease, current, admitted.clock);
+    await lease.assertOwned();
+    maintenance = await backend.ensureMaintenance(
+      spec,
+      secrets.maintenanceAdmin,
+      lease,
+      activeArtifactVersion(current),
+    );
+  }
+  if (!maintenance.armed) throw new Error('maintenance did not re-arm');
+  return current;
+}
+
+async function migrationReadyPromote(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const { lease, backend, spec, targetPhysicalScriptName } = admitted;
+  current = await commitInvocationAuthority(lease, current, admitted.clock);
+  await lease.assertOwned();
+  await backend.promoteWorker(
+    spec,
+    buildPromotionGuard(current, targetPhysicalScriptName ?? spec.scriptName),
+    current.outboundPolicy,
+    lease,
+    activeArtifactVersion(current),
+  );
+  return current;
+}
+
+async function migrationReadyAttestSettle(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const {
+    lease,
+    backend,
+    spec,
+    targetDigest,
+    settlementFor,
+    attestationOptions,
+  } = admitted;
+  // The steady-state path: an unchanged deployment reconciled again.
+  // It re-promotes because a crash could have left the route behind,
+  // so it must re-attest — but it must not re-settle, or a fleet on a
+  // reconcile schedule would settle forever.
+  const convergence = await settlePromotedRoute({
+    backend,
+    spec,
+    record: current,
+    entry: 'ready-convergence',
+    target: current.activeRelease,
+    prior: current.rollbackRelease,
+    expectedSpecDigest: targetDigest,
+    expectedArtifactVersion: activeArtifactVersion(current),
+    settlementHost: settlementFor?.(current),
+    attestation: attestationOptions,
+    skipWhenAlreadySettled: true,
+  });
+  if (convergence.settled) {
+    current = {
+      ...current,
+      settledSettlementKey: convergence.settlementKey,
+      updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+    };
+    await lease.put(current);
+  }
+  return current;
+}
+
+async function migrationReadyRetirePost(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const { lease, database, backend, spec } = admitted;
+  return retireCommittedRelease(
+    backend,
+    spec,
+    database,
+    current,
+    lease,
+    admitted.clock,
+  );
+}
+
+async function migrationAdmitMigrating(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+  planKind: FleetMigrationPlanKind,
+): Promise<FleetRecord> {
+  const {
+    lease,
+    targetDigest,
+    immutableExternal,
+    targetRelease,
+    targetPlatform,
+    platformOnlyTarget,
+    spec,
+  } = admitted;
+  const preserveMutableArtifact =
+    current.phase === 'ready' &&
+    !targetRelease &&
+    spec.authoredBy === 'platform';
+  const mutableActiveRelease = preserveMutableArtifact
+    ? activeExternalRelease(current)
+    : undefined;
+  if (preserveMutableArtifact && !mutableActiveRelease)
+    throw new Error(
+      'mutable migration requires a recorded prior Worker artifact',
+    );
+  const externalIntent: ExternalMigrationIntent | undefined =
+    immutableExternal && targetRelease && targetPlatform
+      ? planKind === 'platform-only'
+        ? {
+            platformOnly: true,
+            targetSpecDigest: targetDigest,
+            priorRelease: current.activeRelease as ExternalReleaseSnapshot,
+            priorTarget:
+              current.platformTarget as ExternalPlatformTargetDescription,
+            priorOutboundPolicy:
+              current.outboundPolicy as DeploymentEgressPolicy,
+            targetRelease: current.activeRelease as ExternalReleaseSnapshot,
+            target: platformOnlyTarget as ExternalPlatformTargetDescription,
+            subphase: 'planned',
+          }
+        : {
+            targetSpecDigest: targetDigest,
+            priorRelease: current.activeRelease as ExternalReleaseSnapshot,
+            priorTarget:
+              current.platformTarget as ExternalPlatformTargetDescription,
+            priorOutboundPolicy:
+              current.outboundPolicy as DeploymentEgressPolicy,
+            targetRelease,
+            target: targetPlatform,
+            subphase: 'planned',
+          }
+      : undefined;
+  const migrationRecord: FleetRecord =
+    current.phase === 'ready'
+      ? {
+          ...current,
+          phase: 'migrating',
+          ...(mutableActiveRelease
+            ? { activeRelease: mutableActiveRelease }
+            : {}),
+          ...(externalIntent?.platformOnly
+            ? { migrationIntent: externalIntent }
+            : targetRelease
+              ? {
+                  pendingRelease: targetRelease,
+                  migrationPriorRelease: current.activeRelease,
+                  migrationIntent: externalIntent,
+                }
+              : {}),
+          ...(!targetRelease ? { pendingSpecDigest: targetDigest } : {}),
+          updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+        }
+      : current;
+  if (current.phase === 'ready') await lease.put(migrationRecord);
+  return migrationRecord;
+}
+
+async function migrationAssertMigrating(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  await assertMigratingCarrierState(admitted, current);
+  return current;
+}
+
+async function migrationPlatformOnlySchema(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const { lease } = admitted;
+  const intent = current.migrationIntent as ExternalMigrationIntent;
+  if (intent.subphase === 'planned') {
+    current = {
+      ...current,
+      migrationIntent: {
+        ...intent,
+        subphase: 'schema-applied',
+      },
+      updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+    };
+    await lease.put(current);
+  }
+  return current;
+}
+
+async function migrationPlatformOnlyResources(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const { lease, database, backend, spec, secrets, finalizedStateProvider } =
+    admitted;
+  const platformMigrationTarget = (
+    current.migrationIntent as ExternalMigrationIntent
+  ).target;
+  current = await convergeExternalPlatformResources(
+    backend,
+    spec,
+    database,
+    secrets,
+    platformMigrationTarget,
+    current,
+    lease,
+    admitted.clock,
+    finalizedStateProvider,
+  );
+  if (current.migrationIntent?.subphase === 'schema-applied') {
+    current = {
+      ...current,
+      migrationIntent: {
+        ...current.migrationIntent,
+        subphase: 'platform-applied',
+      },
+      updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+    };
+    await lease.put(current);
+  }
+  return current;
+}
+
+async function migrationPlatformOnlyMaintenance(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+  entry: FleetRecord,
+): Promise<FleetRecord> {
+  const { lease, backend, spec, secrets, targetDigest } = admitted;
+  const platformMigrationRelease = (
+    current.migrationIntent as ExternalMigrationIntent
+  ).targetRelease;
+  const maintenancePreflight = await backend.inspect(
+    spec,
+    secrets.maintenanceAdmin,
+    platformMigrationRelease.artifactVersion,
+  );
+  if (!maintenancePreflight) {
+    throw new Error('platform-only migration release is missing');
+  }
+  assertLiveDeploymentMatches(
+    maintenancePreflight,
+    entry,
+    spec,
+    targetDigest,
+    platformMigrationRelease.application,
+  );
+  assertExternalReleaseArtifactVersion(
+    maintenancePreflight,
+    platformMigrationRelease,
+    'platform-only maintenance',
+  );
+  current = await commitInvocationAuthority(lease, current, admitted.clock);
+  await lease.assertOwned();
+  const maintenance = await backend.ensureMaintenance(
+    spec,
+    secrets.maintenanceAdmin,
+    lease,
+    platformMigrationRelease.artifactVersion,
+  );
+  if (!maintenance.armed) {
+    throw new Error(
+      'platform-only migration maintenance is unarmed before route publication',
+    );
+  }
+  return current;
+}
+
+async function migrationPlatformOnlyPromote(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+  entry: FleetRecord,
+): Promise<FleetRecord> {
+  const {
+    lease,
+    backend,
+    spec,
+    secrets,
+    targetDigest,
+    targetPhysicalScriptName,
+  } = admitted;
+  const platformMigrationTarget = (
+    current.migrationIntent as ExternalMigrationIntent
+  ).target;
+  const platformMigrationRelease = (
+    current.migrationIntent as ExternalMigrationIntent
+  ).targetRelease;
+  if (current.migrationIntent?.subphase === 'platform-applied') {
+    const publicationPreflight = await backend.inspect(
+      spec,
+      secrets.maintenanceAdmin,
+      platformMigrationRelease.artifactVersion,
+    );
+    if (!publicationPreflight) {
+      throw new Error('platform-only migration release is missing');
+    }
+    assertLiveDeploymentMatches(
+      publicationPreflight,
+      entry,
+      spec,
+      targetDigest,
+      platformMigrationRelease.application,
+    );
+    assertExternalReleaseArtifactVersion(
+      publicationPreflight,
+      platformMigrationRelease,
+      'platform-only publication',
+    );
+    // The preceding maintenance step durably committed invocation authority.
+    await lease.assertOwned();
+    await backend.promoteWorker(
+      spec,
+      buildPromotionGuard(current, targetPhysicalScriptName ?? spec.scriptName),
+      platformMigrationTarget.outboundPolicy,
+      lease,
+      platformMigrationRelease.artifactVersion,
+    );
+    current = {
+      ...current,
+      migrationIntent: {
+        ...current.migrationIntent,
+        subphase: 'route-published',
+      },
+      updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+    };
+    await lease.put(current);
+  }
+  return current;
+}
+
+async function migrationPlatformOnlyReady(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+  entry: FleetRecord,
+): Promise<FleetRecord> {
+  const {
+    lease,
+    backend,
+    spec,
+    secrets,
+    targetDigest,
+    settlementFor,
+    attestationOptions,
+  } = admitted;
+  if (isConvergedTerminalCommit(current, admitted, 'platform-only'))
+    return current;
+  const platformMigrationTarget = (
+    current.migrationIntent as ExternalMigrationIntent
+  ).target;
+  const platformMigrationRelease = (
+    current.migrationIntent as ExternalMigrationIntent
+  ).targetRelease;
+  const live = await backend.inspect(
+    spec,
+    secrets.maintenanceAdmin,
+    platformMigrationRelease.artifactVersion,
+  );
+  if (!live) throw new Error('platform-only migration release is missing');
+  assertLiveDeploymentMatches(
+    live,
+    entry,
+    spec,
+    targetDigest,
+    platformMigrationRelease.application,
+  );
+  assertExternalReleaseArtifactVersion(
+    live,
+    platformMigrationRelease,
+    'platform-only settlement',
+  );
+  const platformSettlement = await settlePromotedRoute({
+    backend,
+    spec,
+    record: current,
+    entry: 'platform-only',
+    target: platformMigrationRelease,
+    prior: current.rollbackRelease,
+    expectedSpecDigest: targetDigest,
+    expectedArtifactVersion: platformMigrationRelease.artifactVersion,
+    settlementHost: settlementFor?.(current),
+    attestation: attestationOptions,
+  });
+  const settled = { ...current };
+  delete settled.migrationIntent;
+  const migrated: FleetRecord = {
+    ...settled,
+    phase: 'ready',
+    platformTarget: platformMigrationTarget,
+    outboundPolicy: platformMigrationTarget.outboundPolicy,
+    ...(platformSettlement.settled
+      ? { settledSettlementKey: platformSettlement.settlementKey }
+      : {}),
+    updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+  };
+  await lease.put(migrated);
+  return migrated;
+}
+
+async function migrationSeedIdentity(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+  entry: FleetRecord,
+): Promise<FleetRecord> {
+  const { lease, database, backend } = admitted;
+  await lease.assertOwned();
+  // Re-stamping a database this deployment already owns: the ownership
+  // sentinel short-circuits, and the only thing that can still happen is
+  // the fence row being CREATED where none exists.
+  //
+  // 'open' is hard-coded, and migrateFleet takes no fence option, for one
+  // reason: the deployment being migrated is `ready` or `migrating` — it
+  // is EXECUTING right now. A pre-0.20 database has no fence row and
+  // therefore reads as open; materializing that row must record what the
+  // deployment already IS, not impose something new. Seeding
+  // 'migration-locked' here would silently stop a live deployment in the
+  // middle of its own migration. Closing a fence is an operator action
+  // through POST /admin/execution-fence, never a side effect of a
+  // schema pass.
+  await backend.seedDeploymentIdentity(database, entry.tenantTag, lease, {
+    initialExecutionFenceState: 'open',
+  });
+  return current;
+}
+
+async function migrationApplyMigrations(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+  entry: FleetRecord,
+  planEntry: FleetMigrationPlanEntry,
+  finalOccurrence: boolean,
+): Promise<FleetRecord> {
+  const { backend, database, lease, spec } = admitted;
+  const { targetSchemaVersion } = planEntry;
+  if (
+    targetSchemaVersion === undefined ||
+    (current.schemaVersion >= targetSchemaVersion && finalOccurrence)
+  ) {
+    await lease.assertOwned();
+    await backend.applyMigrations(database, spec.migrations, lease);
+  } else if (current.schemaVersion < targetSchemaVersion) {
+    await lease.assertOwned();
+    await backend.applyMigrations(
+      database,
+      spec.migrations.slice(0, targetSchemaVersion),
+      lease,
+    );
+    current = {
+      ...current,
+      schemaVersion: targetSchemaVersion,
+      updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+    };
+    await lease.put(current);
+  }
+  if (finalOccurrence && current.schemaVersion !== spec.schemaVersion) {
+    throw new Error(
+      `missing D1 migration path from ${entry.schemaVersion} to ${spec.schemaVersion}`,
+    );
+  }
+  return current;
+}
+
+async function migrationSchemaApplied(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const { lease } = admitted;
+  if (current.migrationIntent?.subphase === 'planned') {
+    current = {
+      ...current,
+      migrationIntent: {
+        ...current.migrationIntent,
+        subphase: 'schema-applied',
+      },
+      updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+    };
+    await lease.put(current);
+  }
+  return current;
+}
+
+async function migrationPlatformResources(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const {
+    lease,
+    database,
+    backend,
+    spec,
+    secrets,
+    finalizedStateProvider,
+    targetPlatform,
+  } = admitted;
+  if (targetPlatform) {
+    current = await convergeExternalPlatformResources(
+      backend,
+      spec,
+      database,
+      secrets,
+      current.migrationIntent?.target ?? targetPlatform,
+      current,
+      lease,
+      admitted.clock,
+      finalizedStateProvider,
+    );
+    if (current.migrationIntent?.subphase === 'schema-applied') {
+      current = {
+        ...current,
+        migrationIntent: {
+          ...current.migrationIntent,
+          subphase: 'platform-applied',
+        },
+        updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+      };
+      await lease.put(current);
+    }
+  }
+  return current;
+}
+
+async function migrationPendingTopology(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const { lease, spec } = admitted;
+  if (current.pendingRelease && current.platformResources) {
+    const topology = externalReleaseTopology(
+      spec,
+      current.platformResources,
+      current.applicationResources,
+    );
+    current = {
+      ...current,
+      pendingRelease: { ...current.pendingRelease, topology },
+      ...(current.migrationIntent
+        ? {
+            migrationIntent: {
+              ...current.migrationIntent,
+              targetRelease: {
+                ...current.migrationIntent.targetRelease,
+                topology,
+              },
+            },
+          }
+        : {}),
+      updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+    };
+    await lease.put(current);
+  }
+  return current;
+}
+
+async function migrationDeployCandidate(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+  entry: FleetRecord,
+): Promise<FleetRecord> {
+  const {
+    lease,
+    database,
+    backend,
+    spec,
+    secrets,
+    targetDigest,
+    immutableExternal,
+    targetPhysicalScriptName,
+  } = admitted;
+  let live: LiveDeployment | undefined;
+  if (current.migrationIntent?.subphase !== 'platform-applied') {
+    live = await backend.inspect(
+      spec,
+      secrets.maintenanceAdmin,
+      pendingArtifactVersion(current),
+    );
+  }
+  if (
+    current.pendingRelease &&
+    current.pendingRelease.artifactVersion !== 'pending'
+  ) {
+    assertExternalReleaseArtifactVersion(
+      live,
+      current.pendingRelease,
+      'migration candidate',
+    );
+  }
+  if (
+    current.migrationIntent?.subphase === 'platform-applied' ||
+    !live ||
+    live.desiredSpecDigest !== targetDigest
+  ) {
+    current = await commitInvocationAuthority(lease, current, admitted.clock);
+    await lease.assertOwned();
+    const deployed = await backend.deployWorker(
+      spec,
+      database,
+      secrets,
+      current.platformResources,
+      lease,
+      current.pendingRelease?.artifactVersion ??
+        current.pendingArtifactVersion ??
+        (immutableExternal ? 'pending' : undefined),
+      current.migrationIntent?.targetRelease.application ??
+        current.pendingRelease?.application ??
+        applicationBindingTopology(spec, current.applicationResources ?? []),
+    );
+    if (
+      targetPhysicalScriptName &&
+      deployed.physicalScriptName !== targetPhysicalScriptName
+    ) {
+      throw new Error('backend deployed an unexpected physical release');
+    }
+  }
+  live = await backend.inspect(
+    spec,
+    secrets.maintenanceAdmin,
+    pendingArtifactVersion(current),
+  );
+  if (!live) throw new Error('migration candidate is missing');
+  assertLiveDeploymentMatches(
+    live,
+    entry,
+    spec,
+    targetDigest,
+    current.migrationIntent?.targetRelease.application ??
+      current.pendingRelease?.application ??
+      applicationBindingTopology(spec, current.applicationResources ?? []),
+  );
+  if (current.pendingRelease) {
+    assertExternalReleaseArtifactVersion(
+      live,
+      current.pendingRelease,
+      'migration candidate',
+    );
+  }
+  if (
+    targetPhysicalScriptName &&
+    live.scriptName !== targetPhysicalScriptName
+  ) {
+    throw new Error('migration candidate has an unexpected physical name');
+  }
+  if (
+    current.migrationIntent &&
+    current.pendingRelease?.artifactVersion === 'pending'
+  ) {
+    const intendedTopology = current.pendingRelease.topology;
+    if (!intendedTopology) {
+      throw new Error('migration candidate has no intended binding topology');
+    }
+    const pendingRelease = {
+      ...current.migrationIntent.targetRelease,
+      artifactVersion: live.artifactVersion,
+      topology: externalReleaseTopologyFromLive(live, intendedTopology),
+    };
+    current = {
+      ...current,
+      pendingRelease,
+      migrationIntent: {
+        ...current.migrationIntent,
+        targetRelease: pendingRelease,
+        subphase: 'candidate-deployed',
+      },
+      updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+    };
+    await lease.put(current);
+  } else if (
+    !immutableExternal &&
+    current.pendingArtifactVersion === undefined
+  ) {
+    current = {
+      ...current,
+      pendingArtifactVersion: live.artifactVersion,
+      updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+    };
+    await lease.put(current);
+  }
+  return current;
+}
+
+async function migrationArmMaintenance(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const { lease, backend, spec, secrets } = admitted;
+  current = await commitInvocationAuthority(lease, current, admitted.clock);
+  await lease.assertOwned();
+  const maintenance = await backend.ensureMaintenance(
+    spec,
+    secrets.maintenanceAdmin,
+    lease,
+    pendingArtifactVersion(current),
+  );
+  if (!maintenance.armed) throw new Error('maintenance did not re-arm');
+  if (current.migrationIntent?.subphase === 'candidate-deployed') {
+    current = {
+      ...current,
+      migrationIntent: {
+        ...current.migrationIntent,
+        subphase: 'candidate-armed',
+      },
+      updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+    };
+    await lease.put(current);
+  }
+  return current;
+}
+
+async function migrationPromote(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+  entry: FleetRecord,
+): Promise<FleetRecord> {
+  const {
+    lease,
+    backend,
+    spec,
+    secrets,
+    targetDigest,
+    targetPhysicalScriptName,
+  } = admitted;
+  const publicationPreflight = await backend.inspect(
+    spec,
+    secrets.maintenanceAdmin,
+    pendingArtifactVersion(current),
+  );
+  if (!publicationPreflight) {
+    throw new Error('migration candidate is missing before publication');
+  }
+  assertLiveDeploymentMatches(
+    publicationPreflight,
+    entry,
+    spec,
+    targetDigest,
+    current.migrationIntent?.targetRelease.application ??
+      current.pendingRelease?.application ??
+      applicationBindingTopology(spec, current.applicationResources ?? []),
+  );
+  if (current.pendingRelease) {
+    assertExternalReleaseArtifactVersion(
+      publicationPreflight,
+      current.pendingRelease,
+      'migration publication',
+    );
+  }
+  // The preceding maintenance step durably committed invocation authority.
+  await lease.assertOwned();
+  await backend.promoteWorker(
+    spec,
+    buildPromotionGuard(current, targetPhysicalScriptName ?? spec.scriptName),
+    current.migrationIntent?.target.outboundPolicy ?? current.outboundPolicy,
+    lease,
+    pendingArtifactVersion(current),
+  );
+  if (current.migrationIntent) {
+    current = {
+      ...current,
+      migrationIntent: {
+        ...current.migrationIntent,
+        subphase: 'route-published',
+      },
+      updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+    };
+    await lease.put(current);
+  }
+  return current;
+}
+
+async function migrationSettleReady(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+  entry: FleetRecord,
+): Promise<FleetRecord> {
+  const {
+    lease,
+    backend,
+    spec,
+    secrets,
+    targetDigest,
+    finalizedStateProvider,
+    settlementFor,
+    attestationOptions,
+    targetPlatform,
+    targetPhysicalScriptName,
+  } = admitted;
+  if (isConvergedTerminalCommit(current, admitted, 'full')) return current;
+  const live = await backend.inspect(
+    spec,
+    secrets.maintenanceAdmin,
+    pendingArtifactVersion(current),
+  );
+  if (!live) {
+    throw new Error(
+      `deployment did not converge after migration for ${entry.tenantTag}:${entry.environment}`,
+    );
+  }
+  assertLiveDeploymentMatches(
+    live,
+    entry,
+    spec,
+    targetDigest,
+    current.migrationIntent?.targetRelease.application ??
+      current.pendingRelease?.application ??
+      applicationBindingTopology(spec, current.applicationResources ?? []),
+  );
+  if (current.pendingRelease) {
+    assertExternalReleaseArtifactVersion(
+      live,
+      current.pendingRelease,
+      'migration settlement',
+    );
+  }
+  if (
+    targetPhysicalScriptName &&
+    live.scriptName !== targetPhysicalScriptName
+  ) {
+    throw new Error('promoted release has an unexpected physical name');
+  }
+  const rollbackRelease = current.migrationPriorRelease;
+  const retiringRelease = targetPhysicalScriptName
+    ? entry.rollbackRelease
+    : undefined;
+  const committedTargetRelease = current.pendingRelease;
+  if (
+    targetPhysicalScriptName &&
+    (!committedTargetRelease ||
+      committedTargetRelease.physicalScriptName !== targetPhysicalScriptName ||
+      !committedTargetRelease.topology)
+  ) {
+    throw new Error('promoted release has no exact persisted binding topology');
+  }
+  const migrationSettlement = await settlePromotedRoute({
+    backend,
+    spec,
+    record: current,
+    entry: 'migration',
+    target: committedTargetRelease,
+    prior: rollbackRelease,
+    expectedSpecDigest: targetDigest,
+    expectedArtifactVersion: live.artifactVersion,
+    settlementHost: settlementFor?.(current),
+    attestation: attestationOptions,
+  });
+  const settled = { ...current };
+  delete settled.pendingRelease;
+  delete settled.migrationPriorRelease;
+  delete settled.pendingSpecDigest;
+  delete settled.pendingArtifactVersion;
+  delete settled.migrationIntent;
+  if (spec.authoredBy === 'platform') delete settled.activeRelease;
+  const migrated: FleetRecord = {
+    ...settled,
+    phase: 'ready',
+    desiredSpecDigest: targetDigest,
+    schemaVersion: spec.schemaVersion,
+    artifactVersion: live.artifactVersion,
+    ...(targetPhysicalScriptName
+      ? {
+          activeRelease: committedTargetRelease as ExternalReleaseSnapshot,
+          rollbackRelease,
+          ...(retiringRelease ? { retiringRelease } : {}),
+        }
+      : {}),
+    ...(targetPlatform
+      ? {
+          platformTarget: targetPlatform,
+          outboundPolicy: targetPlatform.outboundPolicy,
+        }
+      : {}),
+    // Written unconditionally, unlike the conditional spreads around it: the
+    // key belongs to a migrated record whatever its value, and carries
+    // `undefined` when a finalized state provider supplies no tag. The frozen
+    // migration baseline records it that way and the golden suite compares
+    // with `toStrictEqual`, which reads a present `undefined` key differently
+    // from an absent one, so a conditional spread here changes what it pins.
+    durableObjectTag: finalizedStateProvider
+      ? current.durableObjectTag
+      : targetDurableObjectTag(spec),
+    ...(spec.authoredBy === 'platform'
+      ? {
+          durableObjectMigrationHistory: canonicalDurableObjectMigrationHistory(
+            spec.durableObjectMigrations,
+          ),
+          durableObjectMigrationHistoryDigest:
+            durableObjectMigrationHistoryDigest(spec.durableObjectMigrations),
+        }
+      : {}),
+    durableObjectBindings: live.durableObjectBindings,
+    applicationBindings:
+      committedTargetRelease?.application ??
+      applicationBindingTopology(spec, current.applicationResources ?? []),
+    ...(migrationSettlement.settled
+      ? { settledSettlementKey: migrationSettlement.settlementKey }
+      : {}),
+    updatedAt: new Date((admitted.clock ?? Date.now)()).toISOString(),
+  };
+  await lease.put(migrated);
+  return migrated;
+}
+
+async function migrationRetirePost(
+  admitted: AdmittedFleetMigrationContext,
+  current: FleetRecord,
+): Promise<FleetRecord> {
+  const { lease, database, backend, spec } = admitted;
+  return retireCommittedRelease(
+    backend,
+    spec,
+    database,
+    current,
+    lease,
+    admitted.clock,
+  );
+}
+
+type FleetMigrationStepResult =
+  | Readonly<{ done: false; record: FleetRecord; resultOnDone?: never }>
+  | Readonly<{ done: true; record: FleetRecord; resultOnDone: FleetRecord }>;
+
+export async function executeNextMigrationStep(
+  admitted: AdmittedFleetMigrationContext,
+  plan: readonly FleetMigrationPlanEntry[],
+  planCursor: number,
+  recordViews: Readonly<{ entry: FleetRecord; current: FleetRecord }>,
+): Promise<FleetMigrationStepResult> {
+  const planEntry = plan[planCursor];
+  if (!planEntry) {
+    throw new Error('fleet migration item no longer matches its frozen plan');
+  }
+  const { entry } = recordViews;
+  let { current } = recordViews;
+  switch (planEntry.step) {
+    case 'retire-pre':
+      current = await migrationRetirePre(admitted, current);
+      break;
+    case 'ready-target-backfill':
+      current = await migrationReadyTargetBackfill(admitted, current);
+      break;
+    case 'ready-platform-resources':
+      current = await migrationReadyPlatformResources(admitted, current);
+      break;
+    case 'ready-maintenance':
+      current = await migrationReadyMaintenance(admitted, current);
+      break;
+    case 'ready-promote':
+      current = await migrationReadyPromote(admitted, current);
+      break;
+    case 'ready-attest-settle':
+      current = await migrationReadyAttestSettle(admitted, current);
+      break;
+    case 'ready-retire-post':
+      current = await migrationReadyRetirePost(admitted, current);
+      break;
+    case 'admit-migrating':
+      current = await migrationAdmitMigrating(
+        admitted,
+        current,
+        fleetMigrationPlanKindOf(plan),
+      );
+      break;
+    case 'assert-migrating':
+      current = await migrationAssertMigrating(admitted, current);
+      break;
+    case 'platform-only-schema':
+      current = await migrationPlatformOnlySchema(admitted, current);
+      break;
+    case 'platform-only-resources':
+      current = await migrationPlatformOnlyResources(admitted, current);
+      break;
+    case 'platform-only-maintenance':
+      current = await migrationPlatformOnlyMaintenance(
+        admitted,
+        current,
+        entry,
+      );
+      break;
+    case 'platform-only-promote':
+      current = await migrationPlatformOnlyPromote(admitted, current, entry);
+      break;
+    case 'platform-only-ready':
+      current = await migrationPlatformOnlyReady(admitted, current, entry);
+      break;
+    case 'seed-identity':
+      current = await migrationSeedIdentity(admitted, current, entry);
+      break;
+    case 'apply-migrations':
+      current = await migrationApplyMigrations(
+        admitted,
+        current,
+        entry,
+        planEntry,
+        !plan
+          .slice(planCursor + 1)
+          .some(({ step }) => step === 'apply-migrations'),
+      );
+      break;
+    case 'migration-schema-applied':
+      current = await migrationSchemaApplied(admitted, current);
+      break;
+    case 'platform-resources':
+      current = await migrationPlatformResources(admitted, current);
+      break;
+    case 'pending-topology':
+      current = await migrationPendingTopology(admitted, current);
+      break;
+    case 'deploy-candidate':
+      current = await migrationDeployCandidate(admitted, current, entry);
+      break;
+    case 'arm-maintenance':
+      current = await migrationArmMaintenance(admitted, current);
+      break;
+    case 'promote':
+      current = await migrationPromote(admitted, current, entry);
+      break;
+    case 'settle-ready':
+      current = await migrationSettleReady(admitted, current, entry);
+      break;
+    case 'retire-post':
+      current = await migrationRetirePost(admitted, current);
+      break;
+  }
+  if (
+    planEntry.step === 'ready-retire-post' ||
+    planEntry.step === 'platform-only-ready' ||
+    planEntry.step === 'retire-post'
+  ) {
+    return { done: true, record: current, resultOnDone: current };
+  }
+  return { done: false, record: current };
+}
+
 export async function migrateFleet(options: {
   readonly store: FleetStateStore;
   readonly records: readonly FleetRecord[];
@@ -1406,957 +3834,43 @@ export async function migrateFleet(options: {
     ...options.routeAttestation,
   };
   const updated: FleetRecord[] = [];
-  for (const record of ordered) {
+  for (const [index, record] of ordered.entries()) {
     const next = await options.store.withDeploymentLease(
       record.tenantTag,
       record.environment,
       async (lease) => {
-        let stored = await options.store.get(
+        const { admitted, plan, reread } = await admitFleetMigrationItem(
+          {
+            store: options.store,
+            backendFor: (record) => options.backendFor(record),
+            specFor: (record) => options.specFor(record),
+            secretsFor: (record) => options.secretsFor(record),
+            finalizedStateProviderFor: (record) =>
+              options.finalizedStateProviderFor?.(record),
+            settlementFor: (record) => options.settlementFor?.(record),
+            lease,
+            attestationOptions,
+            // Read at each legacy site: helpers capture the clock function,
+            // while direct nullish calls keep its receiver unbound.
+            get clock() {
+              return options.clock ?? Date.now;
+            },
+            ordinal: index + 1,
+          },
           record.tenantTag,
           record.environment,
         );
-        if (!stored) throw new Error('fleet migration record disappeared');
-        assertBackendSwitchInactive(stored);
-        const storedSchemaVersion = stored.schemaVersion;
-        const backend = options.backendFor(stored);
-        const spec = options.specFor(stored);
-        const secrets = options.secretsFor(stored);
-        const finalizedOrdinaryState =
-          stored.backendSwitchIntent?.subphase === 'finalized' &&
-          stored.platformResources?.stateWorker.plane === 'ordinary';
-        const finalizedStateProvider = finalizedOrdinaryState
-          ? options.finalizedStateProviderFor?.(stored)
-          : undefined;
-        if (finalizedOrdinaryState) {
-          finalizedBridgeForRecord(stored);
-          if (!finalizedStateProvider) {
-            throw new Error(
-              'finalized ordinary state requires its backend-switch provider',
-            );
-          }
-        }
-        validateDeploymentSpec(spec);
-        validateDeploymentSecrets(spec, secrets);
-        assertImmutableDeploymentMapping(stored, backend, spec);
-        assertPlatformDurableObjectHistory(stored, spec);
-        if (stored.phase !== 'ready' && stored.phase !== 'migrating') {
-          throw new Error(
-            `cannot migrate deployment in phase '${stored.phase}'`,
-          );
-        }
-        const targetDigest = deploymentSpecDigest(spec);
-        const immutableExternal =
-          backend.immutableExternalArtifacts === true &&
-          spec.authoredBy === 'external';
-        const targetPhysicalScriptName = immutableExternal
-          ? backend.releaseScriptName?.(spec)
-          : undefined;
-        if (immutableExternal && !targetPhysicalScriptName) {
-          throw new Error(
-            'immutable external backend did not provide a physical release name',
-          );
-        }
-        if (
-          spec.migrations.some(
-            (migration) =>
-              migration.version > storedSchemaVersion &&
-              migration.rollbackCompatible !== true,
-          )
-        ) {
-          throw new Error(
-            'staged D1 migrations must attest rollbackCompatible before candidate creation',
-          );
-        }
-        const targetRelease: ExternalReleaseSnapshot | undefined =
-          targetPhysicalScriptName
-            ? {
-                physicalScriptName: targetPhysicalScriptName,
-                specDigest: targetDigest,
-                artifactVersion: 'pending',
-                releaseSchemaVersion: spec.schemaVersion,
-                application: applicationBindingTopology(
-                  spec,
-                  stored.applicationResources ?? [],
-                ),
-              }
-            : undefined;
-        const targetPlatform = immutableExternal
-          ? finalizedStateProvider
-            ? finalizedStateProvider.describeFinalizedBridgeTarget(spec, stored)
-            : describeExternalPlatformTarget(backend, spec)
-          : undefined;
-        if (stored.platformTarget && targetPlatform) {
-          assertExternalPlatformTargetCompatibility(
-            stored.platformTarget,
-            targetPlatform,
-          );
-        }
-        const platformOnlyTarget = targetPlatform
-          ? effectiveAppliedPlatformTarget(stored, targetPlatform)
-          : undefined;
-        const platformOnlyChange =
-          stored.desiredSpecDigest === targetDigest &&
-          platformOnlyTarget !== undefined &&
-          stored.platformTarget !== undefined &&
-          JSON.stringify(stored.platformTarget) !==
-            JSON.stringify(platformOnlyTarget);
-        if (
-          stored.phase === 'migrating' &&
-          (immutableExternal
-            ? stored.migrationIntent?.platformOnly === true
-              ? stored.migrationIntent.targetSpecDigest !== targetDigest ||
-                JSON.stringify(stored.migrationIntent.target) !==
-                  JSON.stringify(platformOnlyTarget)
-              : stored.pendingRelease?.specDigest !== targetDigest ||
-                stored.pendingRelease?.physicalScriptName !==
-                  targetPhysicalScriptName ||
-                stored.pendingRelease.releaseSchemaVersion !==
-                  spec.schemaVersion ||
-                stored.migrationIntent?.targetSpecDigest !== targetDigest
-            : stored.pendingSpecDigest !== targetDigest)
-        ) {
-          throw new Error(
-            'migration retry uses a different desired specification',
-          );
-        }
-        if (spec.previousDurableObjectTag !== stored.durableObjectTag) {
-          throw new Error(
-            `Durable Object migration base mismatch for ${stored.tenantTag}:${stored.environment}: expected '${stored.durableObjectTag ?? 'none'}'`,
-          );
-        }
-        const database = await reconcilePersistedDatabase(
-          backend,
-          stored,
-          false,
-          lease,
-        );
-        if (!database) {
-          throw new Error(
-            `persisted database '${stored.databaseId}' is absent`,
-          );
-        }
-        if (stored.phase === 'ready' && stored.retiringRelease) {
-          stored = await retireCommittedRelease(
-            backend,
-            spec,
-            database,
-            stored,
-            lease,
-            options.clock ?? Date.now,
-          );
-        }
-        if (
-          stored.phase === 'ready' &&
-          stored.desiredSpecDigest === targetDigest &&
-          !platformOnlyChange
-        ) {
-          if (targetPlatform) {
-            const rollbackCompatibleTarget =
-              platformOnlyTarget ?? targetPlatform;
-            if (!stored.platformTarget) {
-              if (!stored.platformResources) {
-                throw new Error(
-                  'ready external deployment has no trusted platform resources',
-                );
-              }
-              assertPlatformResourcesMatchTarget(
-                stored.platformResources,
-                targetPlatform,
-              );
-              stored = {
-                ...stored,
-                platformTarget: targetPlatform,
-                outboundPolicy: targetPlatform.outboundPolicy,
-                updatedAt: new Date(
-                  (options.clock ?? Date.now)(),
-                ).toISOString(),
-              };
-              await lease.put(stored);
-            }
-            assertExternalPlatformTarget(
-              stored.platformTarget,
-              rollbackCompatibleTarget,
-              'ready deployment',
-            );
-            stored = await convergeExternalPlatformResources(
-              backend,
-              spec,
-              database,
-              secrets,
-              rollbackCompatibleTarget,
-              stored,
-              lease,
-              options.clock ?? Date.now,
-              finalizedStateProvider,
-            );
-          }
-          const live = await backend.inspect(
-            spec,
-            secrets.maintenanceAdmin,
-            activeArtifactVersion(stored),
-          );
-          if (!live) throw new Error('ready migration target is missing');
-          assertLiveDeploymentMatches(
-            live,
-            stored,
-            spec,
-            targetDigest,
-            stored.activeRelease?.application,
-          );
-          if (immutableExternal && stored.activeRelease) {
-            assertExternalReleaseArtifactVersion(
-              live,
-              stored.activeRelease,
-              'ready migration',
-            );
-          }
-          if (
-            targetRelease &&
-            (stored.activeRelease?.physicalScriptName !==
-              targetRelease.physicalScriptName ||
-              stored.activeRelease.releaseSchemaVersion !==
-                targetRelease.releaseSchemaVersion ||
-              stored.activeRelease.artifactVersion !== live.artifactVersion)
-          ) {
-            throw new Error(
-              'ready immutable release metadata does not exactly match the target',
-            );
-          }
-          let maintenance = live.maintenance;
-          if (!maintenance.armed) {
-            await lease.assertOwned();
-            maintenance = await backend.ensureMaintenance(
-              spec,
-              secrets.maintenanceAdmin,
-              lease,
-              activeArtifactVersion(stored),
-            );
-          }
-          if (!maintenance.armed) throw new Error('maintenance did not re-arm');
-          await lease.assertOwned();
-          await backend.promoteWorker(
-            spec,
-            buildPromotionGuard(
-              stored,
-              targetPhysicalScriptName ?? spec.scriptName,
-            ),
-            stored.outboundPolicy,
-            lease,
-            activeArtifactVersion(stored),
-          );
-          // The steady-state path: an unchanged deployment reconciled again.
-          // It re-promotes because a crash could have left the route behind,
-          // so it must re-attest — but it must not re-settle, or a fleet on a
-          // reconcile schedule would settle forever.
-          const convergence = await settlePromotedRoute({
-            backend,
-            spec,
-            record: stored,
-            entry: 'ready-convergence',
-            target: stored.activeRelease,
-            prior: stored.rollbackRelease,
-            expectedSpecDigest: targetDigest,
-            expectedArtifactVersion: activeArtifactVersion(stored),
-            settlementHost: options.settlementFor?.(stored),
-            attestation: attestationOptions,
-            skipWhenAlreadySettled: true,
+        let entry = reread;
+        let current = reread;
+        for (let cursor = 0; ; cursor += 1) {
+          const step = await executeNextMigrationStep(admitted, plan, cursor, {
+            entry,
+            current,
           });
-          if (convergence.settled) {
-            stored = {
-              ...stored,
-              settledSettlementKey: convergence.settlementKey,
-              updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-            };
-            await lease.put(stored);
-          }
-          return retireCommittedRelease(
-            backend,
-            spec,
-            database,
-            stored,
-            lease,
-            options.clock ?? Date.now,
-          );
+          current = step.record;
+          if (plan[cursor]?.step === 'retire-pre') entry = current;
+          if (step.done) return step.resultOnDone;
         }
-        if (
-          spec.schemaVersion < stored.schemaVersion &&
-          !platformOnlyChange &&
-          stored.migrationIntent?.platformOnly !== true
-        ) {
-          throw new Error(
-            `schema downgrade refused for ${stored.tenantTag}:${stored.environment}`,
-          );
-        }
-        if (immutableExternal && !stored.activeRelease) {
-          throw new Error(
-            'immutable external migration has no durable active release metadata',
-          );
-        }
-        if (
-          immutableExternal &&
-          targetRelease &&
-          targetPlatform &&
-          (!stored.platformTarget || !stored.outboundPolicy)
-        ) {
-          throw new Error(
-            'immutable external migration has no durable prior platform target and policy',
-          );
-        }
-        const externalIntent: ExternalMigrationIntent | undefined =
-          immutableExternal && targetRelease && targetPlatform
-            ? platformOnlyChange
-              ? {
-                  platformOnly: true,
-                  targetSpecDigest: targetDigest,
-                  priorRelease: stored.activeRelease as ExternalReleaseSnapshot,
-                  priorTarget:
-                    stored.platformTarget as ExternalPlatformTargetDescription,
-                  priorOutboundPolicy:
-                    stored.outboundPolicy as DeploymentEgressPolicy,
-                  targetRelease:
-                    stored.activeRelease as ExternalReleaseSnapshot,
-                  target:
-                    platformOnlyTarget as ExternalPlatformTargetDescription,
-                  subphase: 'planned',
-                }
-              : {
-                  targetSpecDigest: targetDigest,
-                  priorRelease: stored.activeRelease as ExternalReleaseSnapshot,
-                  priorTarget:
-                    stored.platformTarget as ExternalPlatformTargetDescription,
-                  priorOutboundPolicy:
-                    stored.outboundPolicy as DeploymentEgressPolicy,
-                  targetRelease,
-                  target: targetPlatform,
-                  subphase: 'planned',
-                }
-            : undefined;
-        let migrationRecord: FleetRecord =
-          stored.phase === 'ready'
-            ? {
-                ...stored,
-                phase: 'migrating',
-                ...(externalIntent?.platformOnly
-                  ? { migrationIntent: externalIntent }
-                  : targetRelease
-                    ? {
-                        pendingRelease: targetRelease,
-                        migrationPriorRelease: stored.activeRelease,
-                        migrationIntent: externalIntent,
-                      }
-                    : {}),
-                ...(!targetRelease ? { pendingSpecDigest: targetDigest } : {}),
-                updatedAt: new Date(
-                  (options.clock ?? Date.now)(),
-                ).toISOString(),
-              }
-            : stored;
-        if (stored.phase === 'ready') await lease.put(migrationRecord);
-        if (
-          immutableExternal &&
-          (!migrationRecord.migrationIntent ||
-            (migrationRecord.migrationIntent.platformOnly !== true &&
-              (!migrationRecord.migrationPriorRelease ||
-                !migrationRecord.pendingRelease)))
-        ) {
-          throw new Error(
-            'immutable external migration lost its durable release intent',
-          );
-        }
-        if (targetPlatform && migrationRecord.migrationIntent) {
-          assertExternalPlatformTarget(
-            migrationRecord.migrationIntent.target,
-            migrationRecord.migrationIntent.platformOnly === true
-              ? (platformOnlyTarget as ExternalPlatformTargetDescription)
-              : targetPlatform,
-            'migration retry',
-          );
-        }
-        if (finalizedStateProvider && targetPlatform) {
-          const finalizedPlan = finalizedStateProvider.describeFinalizedState({
-            targetSpec: spec,
-            currentRecord: migrationRecord,
-            target: migrationRecord.migrationIntent?.target ?? targetPlatform,
-          });
-          await finalizedStateProvider.assertFinalizedState({
-            targetSpec: spec,
-            currentRecord: migrationRecord,
-            target: migrationRecord.migrationIntent?.target ?? targetPlatform,
-            plan: finalizedPlan,
-            fence: lease,
-          });
-        }
-        if (migrationRecord.migrationIntent?.platformOnly === true) {
-          const platformMigrationTarget =
-            migrationRecord.migrationIntent.target;
-          const platformMigrationRelease =
-            migrationRecord.migrationIntent.targetRelease;
-          if (migrationRecord.migrationIntent.subphase === 'planned') {
-            migrationRecord = {
-              ...migrationRecord,
-              migrationIntent: {
-                ...migrationRecord.migrationIntent,
-                subphase: 'schema-applied',
-              },
-              updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-            };
-            await lease.put(migrationRecord);
-          }
-          migrationRecord = await convergeExternalPlatformResources(
-            backend,
-            spec,
-            database,
-            secrets,
-            platformMigrationTarget,
-            migrationRecord,
-            lease,
-            options.clock ?? Date.now,
-            finalizedStateProvider,
-          );
-          if (migrationRecord.migrationIntent?.subphase === 'schema-applied') {
-            migrationRecord = {
-              ...migrationRecord,
-              migrationIntent: {
-                ...migrationRecord.migrationIntent,
-                subphase: 'platform-applied',
-              },
-              updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-            };
-            await lease.put(migrationRecord);
-          }
-          const maintenancePreflight = await backend.inspect(
-            spec,
-            secrets.maintenanceAdmin,
-            platformMigrationRelease.artifactVersion,
-          );
-          if (!maintenancePreflight) {
-            throw new Error('platform-only migration release is missing');
-          }
-          assertLiveDeploymentMatches(
-            maintenancePreflight,
-            stored,
-            spec,
-            targetDigest,
-            platformMigrationRelease.application,
-          );
-          assertExternalReleaseArtifactVersion(
-            maintenancePreflight,
-            platformMigrationRelease,
-            'platform-only maintenance',
-          );
-          await lease.assertOwned();
-          const maintenance = await backend.ensureMaintenance(
-            spec,
-            secrets.maintenanceAdmin,
-            lease,
-            platformMigrationRelease.artifactVersion,
-          );
-          if (!maintenance.armed) {
-            throw new Error(
-              'platform-only migration maintenance is unarmed before route publication',
-            );
-          }
-          if (
-            migrationRecord.migrationIntent?.subphase === 'platform-applied'
-          ) {
-            const publicationPreflight = await backend.inspect(
-              spec,
-              secrets.maintenanceAdmin,
-              platformMigrationRelease.artifactVersion,
-            );
-            if (!publicationPreflight) {
-              throw new Error('platform-only migration release is missing');
-            }
-            assertLiveDeploymentMatches(
-              publicationPreflight,
-              stored,
-              spec,
-              targetDigest,
-              platformMigrationRelease.application,
-            );
-            assertExternalReleaseArtifactVersion(
-              publicationPreflight,
-              platformMigrationRelease,
-              'platform-only publication',
-            );
-            await lease.assertOwned();
-            await backend.promoteWorker(
-              spec,
-              buildPromotionGuard(
-                migrationRecord,
-                targetPhysicalScriptName ?? spec.scriptName,
-              ),
-              platformMigrationTarget.outboundPolicy,
-              lease,
-              platformMigrationRelease.artifactVersion,
-            );
-            migrationRecord = {
-              ...migrationRecord,
-              migrationIntent: {
-                ...migrationRecord.migrationIntent,
-                subphase: 'route-published',
-              },
-              updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-            };
-            await lease.put(migrationRecord);
-          }
-          const live = await backend.inspect(
-            spec,
-            secrets.maintenanceAdmin,
-            platformMigrationRelease.artifactVersion,
-          );
-          if (!live)
-            throw new Error('platform-only migration release is missing');
-          assertLiveDeploymentMatches(
-            live,
-            stored,
-            spec,
-            targetDigest,
-            platformMigrationRelease.application,
-          );
-          assertExternalReleaseArtifactVersion(
-            live,
-            platformMigrationRelease,
-            'platform-only settlement',
-          );
-          const platformSettlement = await settlePromotedRoute({
-            backend,
-            spec,
-            record: migrationRecord,
-            entry: 'platform-only',
-            target: platformMigrationRelease,
-            prior: migrationRecord.rollbackRelease,
-            expectedSpecDigest: targetDigest,
-            expectedArtifactVersion: platformMigrationRelease.artifactVersion,
-            settlementHost: options.settlementFor?.(migrationRecord),
-            attestation: attestationOptions,
-          });
-          const settled = { ...migrationRecord };
-          delete settled.migrationIntent;
-          const migrated: FleetRecord = {
-            ...settled,
-            phase: 'ready',
-            platformTarget: platformMigrationTarget,
-            outboundPolicy: platformMigrationTarget.outboundPolicy,
-            ...(platformSettlement.settled
-              ? { settledSettlementKey: platformSettlement.settlementKey }
-              : {}),
-            updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-          };
-          await lease.put(migrated);
-          return migrated;
-        }
-        await lease.assertOwned();
-        // Re-stamping a database this deployment already owns: the ownership
-        // sentinel short-circuits, and the only thing that can still happen is
-        // the fence row being CREATED where none exists.
-        //
-        // 'open' is hard-coded, and migrateFleet takes no fence option, for one
-        // reason: the deployment being migrated is `ready` or `migrating` — it
-        // is EXECUTING right now. A pre-0.20 database has no fence row and
-        // therefore reads as open; materializing that row must record what the
-        // deployment already IS, not impose something new. Seeding
-        // 'migration-locked' here would silently stop a live deployment in the
-        // middle of its own migration. Closing a fence is an operator action
-        // through POST /admin/execution-fence, never a side effect of a
-        // schema pass.
-        await backend.seedDeploymentIdentity(
-          database,
-          stored.tenantTag,
-          lease,
-          {
-            initialExecutionFenceState: 'open',
-          },
-        );
-        const pendingMigrations = spec.migrations.filter(
-          (candidate) => candidate.version > migrationRecord.schemaVersion,
-        );
-        if (pendingMigrations.length === 0) {
-          await lease.assertOwned();
-          await backend.applyMigrations(database, spec.migrations, lease);
-        }
-        for (const migration of pendingMigrations) {
-          await lease.assertOwned();
-          await backend.applyMigrations(
-            database,
-            spec.migrations.slice(0, migration.version),
-            lease,
-          );
-          migrationRecord = {
-            ...migrationRecord,
-            schemaVersion: migration.version,
-            updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-          };
-          await lease.put(migrationRecord);
-        }
-        if (migrationRecord.schemaVersion !== spec.schemaVersion) {
-          throw new Error(
-            `missing D1 migration path from ${stored.schemaVersion} to ${spec.schemaVersion}`,
-          );
-        }
-        if (migrationRecord.migrationIntent?.subphase === 'planned') {
-          migrationRecord = {
-            ...migrationRecord,
-            migrationIntent: {
-              ...migrationRecord.migrationIntent,
-              subphase: 'schema-applied',
-            },
-            updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-          };
-          await lease.put(migrationRecord);
-        }
-        if (targetPlatform) {
-          migrationRecord = await convergeExternalPlatformResources(
-            backend,
-            spec,
-            database,
-            secrets,
-            migrationRecord.migrationIntent?.target ?? targetPlatform,
-            migrationRecord,
-            lease,
-            options.clock ?? Date.now,
-            finalizedStateProvider,
-          );
-          if (migrationRecord.migrationIntent?.subphase === 'schema-applied') {
-            migrationRecord = {
-              ...migrationRecord,
-              migrationIntent: {
-                ...migrationRecord.migrationIntent,
-                subphase: 'platform-applied',
-              },
-              updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-            };
-            await lease.put(migrationRecord);
-          }
-        }
-        if (
-          migrationRecord.pendingRelease &&
-          migrationRecord.platformResources
-        ) {
-          const topology = externalReleaseTopology(
-            spec,
-            migrationRecord.platformResources,
-            migrationRecord.applicationResources,
-          );
-          migrationRecord = {
-            ...migrationRecord,
-            pendingRelease: { ...migrationRecord.pendingRelease, topology },
-            ...(migrationRecord.migrationIntent
-              ? {
-                  migrationIntent: {
-                    ...migrationRecord.migrationIntent,
-                    targetRelease: {
-                      ...migrationRecord.migrationIntent.targetRelease,
-                      topology,
-                    },
-                  },
-                }
-              : {}),
-            updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-          };
-          await lease.put(migrationRecord);
-        }
-        let live: LiveDeployment | undefined;
-        if (migrationRecord.migrationIntent?.subphase !== 'platform-applied') {
-          live = await backend.inspect(
-            spec,
-            secrets.maintenanceAdmin,
-            pendingArtifactVersion(migrationRecord),
-          );
-        }
-        if (
-          migrationRecord.pendingRelease &&
-          migrationRecord.pendingRelease.artifactVersion !== 'pending'
-        ) {
-          assertExternalReleaseArtifactVersion(
-            live,
-            migrationRecord.pendingRelease,
-            'migration candidate',
-          );
-        }
-        if (
-          migrationRecord.migrationIntent?.subphase === 'platform-applied' ||
-          !live ||
-          live.desiredSpecDigest !== targetDigest
-        ) {
-          await lease.assertOwned();
-          const deployed = await backend.deployWorker(
-            spec,
-            database,
-            secrets,
-            migrationRecord.platformResources,
-            lease,
-            migrationRecord.pendingRelease?.artifactVersion ??
-              migrationRecord.pendingArtifactVersion ??
-              (immutableExternal ? 'pending' : undefined),
-            migrationRecord.migrationIntent?.targetRelease.application ??
-              migrationRecord.pendingRelease?.application ??
-              applicationBindingTopology(
-                spec,
-                migrationRecord.applicationResources ?? [],
-              ),
-          );
-          if (
-            targetPhysicalScriptName &&
-            deployed.physicalScriptName !== targetPhysicalScriptName
-          ) {
-            throw new Error('backend deployed an unexpected physical release');
-          }
-        }
-        live = await backend.inspect(
-          spec,
-          secrets.maintenanceAdmin,
-          pendingArtifactVersion(migrationRecord),
-        );
-        if (!live) throw new Error('migration candidate is missing');
-        assertLiveDeploymentMatches(
-          live,
-          stored,
-          spec,
-          targetDigest,
-          migrationRecord.migrationIntent?.targetRelease.application ??
-            migrationRecord.pendingRelease?.application,
-        );
-        if (migrationRecord.pendingRelease) {
-          assertExternalReleaseArtifactVersion(
-            live,
-            migrationRecord.pendingRelease,
-            'migration candidate',
-          );
-        }
-        if (
-          targetPhysicalScriptName &&
-          live.scriptName !== targetPhysicalScriptName
-        ) {
-          throw new Error(
-            'migration candidate has an unexpected physical name',
-          );
-        }
-        if (
-          migrationRecord.migrationIntent &&
-          migrationRecord.pendingRelease?.artifactVersion === 'pending'
-        ) {
-          const intendedTopology = migrationRecord.pendingRelease.topology;
-          if (!intendedTopology) {
-            throw new Error(
-              'migration candidate has no intended binding topology',
-            );
-          }
-          const pendingRelease = {
-            ...migrationRecord.migrationIntent.targetRelease,
-            artifactVersion: live.artifactVersion,
-            topology: externalReleaseTopologyFromLive(live, intendedTopology),
-          };
-          migrationRecord = {
-            ...migrationRecord,
-            pendingRelease,
-            migrationIntent: {
-              ...migrationRecord.migrationIntent,
-              targetRelease: pendingRelease,
-              subphase: 'candidate-deployed',
-            },
-            updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-          };
-          await lease.put(migrationRecord);
-        } else if (
-          !immutableExternal &&
-          migrationRecord.pendingArtifactVersion === undefined
-        ) {
-          migrationRecord = {
-            ...migrationRecord,
-            pendingArtifactVersion: live.artifactVersion,
-            updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-          };
-          await lease.put(migrationRecord);
-        }
-        await lease.assertOwned();
-        const maintenance = await backend.ensureMaintenance(
-          spec,
-          secrets.maintenanceAdmin,
-          lease,
-          pendingArtifactVersion(migrationRecord),
-        );
-        if (!maintenance.armed) throw new Error('maintenance did not re-arm');
-        if (
-          migrationRecord.migrationIntent?.subphase === 'candidate-deployed'
-        ) {
-          migrationRecord = {
-            ...migrationRecord,
-            migrationIntent: {
-              ...migrationRecord.migrationIntent,
-              subphase: 'candidate-armed',
-            },
-            updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-          };
-          await lease.put(migrationRecord);
-        }
-        const publicationPreflight = await backend.inspect(
-          spec,
-          secrets.maintenanceAdmin,
-          pendingArtifactVersion(migrationRecord),
-        );
-        if (!publicationPreflight) {
-          throw new Error('migration candidate is missing before publication');
-        }
-        assertLiveDeploymentMatches(
-          publicationPreflight,
-          stored,
-          spec,
-          targetDigest,
-          migrationRecord.migrationIntent?.targetRelease.application ??
-            migrationRecord.pendingRelease?.application,
-        );
-        if (migrationRecord.pendingRelease) {
-          assertExternalReleaseArtifactVersion(
-            publicationPreflight,
-            migrationRecord.pendingRelease,
-            'migration publication',
-          );
-        }
-        await lease.assertOwned();
-        await backend.promoteWorker(
-          spec,
-          buildPromotionGuard(
-            migrationRecord,
-            targetPhysicalScriptName ?? spec.scriptName,
-          ),
-          migrationRecord.migrationIntent?.target.outboundPolicy ??
-            migrationRecord.outboundPolicy,
-          lease,
-          pendingArtifactVersion(migrationRecord),
-        );
-        if (migrationRecord.migrationIntent) {
-          migrationRecord = {
-            ...migrationRecord,
-            migrationIntent: {
-              ...migrationRecord.migrationIntent,
-              subphase: 'route-published',
-            },
-            updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-          };
-          await lease.put(migrationRecord);
-        }
-        live = await backend.inspect(
-          spec,
-          secrets.maintenanceAdmin,
-          pendingArtifactVersion(migrationRecord),
-        );
-        if (!live) {
-          throw new Error(
-            `deployment did not converge after migration for ${stored.tenantTag}:${stored.environment}`,
-          );
-        }
-        assertLiveDeploymentMatches(
-          live,
-          stored,
-          spec,
-          targetDigest,
-          migrationRecord.migrationIntent?.targetRelease.application ??
-            migrationRecord.pendingRelease?.application,
-        );
-        if (migrationRecord.pendingRelease) {
-          assertExternalReleaseArtifactVersion(
-            live,
-            migrationRecord.pendingRelease,
-            'migration settlement',
-          );
-        }
-        if (
-          targetPhysicalScriptName &&
-          live.scriptName !== targetPhysicalScriptName
-        ) {
-          throw new Error('promoted release has an unexpected physical name');
-        }
-        const rollbackRelease = migrationRecord.migrationPriorRelease;
-        const retiringRelease = targetPhysicalScriptName
-          ? stored.rollbackRelease
-          : undefined;
-        const committedTargetRelease = migrationRecord.pendingRelease;
-        if (
-          targetPhysicalScriptName &&
-          (!committedTargetRelease ||
-            committedTargetRelease.physicalScriptName !==
-              targetPhysicalScriptName ||
-            !committedTargetRelease.topology)
-        ) {
-          throw new Error(
-            'promoted release has no exact persisted binding topology',
-          );
-        }
-        const migrationSettlement = await settlePromotedRoute({
-          backend,
-          spec,
-          record: migrationRecord,
-          entry: 'migration',
-          target: committedTargetRelease,
-          prior: rollbackRelease,
-          expectedSpecDigest: targetDigest,
-          expectedArtifactVersion: live.artifactVersion,
-          settlementHost: options.settlementFor?.(migrationRecord),
-          attestation: attestationOptions,
-        });
-        const settled = { ...migrationRecord };
-        delete settled.pendingRelease;
-        delete settled.migrationPriorRelease;
-        delete settled.pendingSpecDigest;
-        delete settled.pendingArtifactVersion;
-        delete settled.migrationIntent;
-        const migrated: FleetRecord = {
-          ...settled,
-          phase: 'ready',
-          desiredSpecDigest: targetDigest,
-          schemaVersion: spec.schemaVersion,
-          artifactVersion: live.artifactVersion,
-          ...(targetPhysicalScriptName
-            ? {
-                activeRelease:
-                  committedTargetRelease as ExternalReleaseSnapshot,
-                rollbackRelease,
-                ...(retiringRelease ? { retiringRelease } : {}),
-              }
-            : {}),
-          ...(targetPlatform
-            ? {
-                platformTarget: targetPlatform,
-                outboundPolicy: targetPlatform.outboundPolicy,
-              }
-            : {}),
-          durableObjectTag: finalizedStateProvider
-            ? migrationRecord.durableObjectTag
-            : targetDurableObjectTag(spec),
-          ...(spec.authoredBy === 'platform'
-            ? {
-                durableObjectMigrationHistory:
-                  canonicalDurableObjectMigrationHistory(
-                    spec.durableObjectMigrations,
-                  ),
-                durableObjectMigrationHistoryDigest:
-                  durableObjectMigrationHistoryDigest(
-                    spec.durableObjectMigrations,
-                  ),
-              }
-            : {}),
-          durableObjectBindings: live.durableObjectBindings,
-          applicationBindings:
-            committedTargetRelease?.application ??
-            applicationBindingTopology(
-              spec,
-              migrationRecord.applicationResources ?? [],
-            ),
-          ...(migrationSettlement.settled
-            ? { settledSettlementKey: migrationSettlement.settlementKey }
-            : {}),
-          updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
-        };
-        await lease.put(migrated);
-        return retireCommittedRelease(
-          backend,
-          spec,
-          database,
-          migrated,
-          lease,
-          options.clock ?? Date.now,
-        );
       },
     );
     updated.push(next);
@@ -2404,6 +3918,8 @@ export async function rollbackExternalRelease(options: {
         currentSpec.environment,
       );
       if (!stored) throw new Error('rollback deployment is not registered');
+      assertNoActiveDecommission(stored, 'rollbackExternalRelease');
+      assertNoActiveCleanup(stored, 'rollbackExternalRelease');
       assertBackendSwitchInactive(stored);
       const finalizedOrdinaryState =
         stored.backendSwitchIntent?.subphase === 'finalized' &&
@@ -2573,6 +4089,11 @@ export async function rollbackExternalRelease(options: {
         target,
         'rollback target',
       );
+      intent = await commitInvocationAuthority(
+        lease,
+        intent,
+        options.clock ?? Date.now,
+      );
       await lease.assertOwned();
       await backend.deployWorker(
         rollbackSpec,
@@ -2601,6 +4122,9 @@ export async function rollbackExternalRelease(options: {
         target.application,
       );
       assertExternalReleaseArtifactVersion(live, target, 'rollback target');
+      // No flip here or before the promotion below: the unconditional
+      // rollback-deploy flip above already committed the carrier durably
+      // earlier in this same call.
       await lease.assertOwned();
       const health = await backend.ensureMaintenance(
         rollbackSpec,

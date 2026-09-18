@@ -29,6 +29,7 @@ export const RESERVED_EXECUTION_CONTEXT_KEYS: readonly string[] = [
   GOAL_REQUEST_CONTEXT_KEY,
   RUN_PROVENANCE_CONTEXT_KEY,
   RUN_LIFECYCLE_CONTEXT_KEY,
+  'startReservation',
   'runId',
   'threadId',
   'resourceId',

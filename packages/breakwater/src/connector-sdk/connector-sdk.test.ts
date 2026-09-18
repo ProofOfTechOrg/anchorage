@@ -26,9 +26,14 @@ import {
   CONNECTOR_GRANTS_CONTEXT_KEY,
   type Connector,
   type ConnectorConfig,
+  ConnectorEvaluatorError,
+  ConnectorInvocationError,
   type ConnectorInvocationOptions,
+  type ConnectorPolicies,
   ConnectorPolicyError,
+  ConnectorStoreError,
   ConnectorValidationError,
+  connectorEgressPosture,
   connectorManifest,
   createConnector as createConnectorBase,
   DRY_RUN_CONTEXT_KEY,
@@ -40,6 +45,7 @@ import {
   InMemoryRateLimitStore,
   invokeConnector,
 } from './index.js';
+import { replaceConnectorInvocation } from './invocation-registry.js';
 
 // Most tests exercise post-migration behavior. Migration-boundary tests call
 // createConnectorBase directly so absence of the explicit acknowledgement and
@@ -318,6 +324,257 @@ function makeConnector(
   return { tool, execute };
 }
 
+describe('connector egress posture', () => {
+  it('carries a declared egressEnforcement onto the frozen manifest', () => {
+    // #given
+    for (const egressEnforcement of ['enforced', 'declaration-only'] as const) {
+      const permissions = { sideEffect: 'read' as const, egressEnforcement };
+      // #when
+      const { tool } = makeConnector({ permissions });
+      const manifest = connectorManifest(tool);
+      // #then
+      expect(manifest).toEqual({ ...permissions, egress: [] });
+      expect(Object.isFrozen(manifest)).toBe(true);
+      expect(manifest).not.toBe(permissions);
+    }
+  });
+
+  it('leaves egressEnforcement absent from the manifest when it is not declared', () => {
+    // #given / #when
+    const { tool } = makeConnector({ permissions: { sideEffect: 'read' } });
+    // #then
+    expect(connectorManifest(tool)).toEqual({ sideEffect: 'read', egress: [] });
+    expect(connectorManifest(tool)).not.toHaveProperty('egressEnforcement');
+  });
+
+  it('resolves an undeclared posture to declaration-only', () => {
+    // #given / #when
+    const { tool } = makeConnector({ permissions: { sideEffect: 'read' } });
+    // #then
+    expect(connectorEgressPosture(tool)).toBe('declaration-only');
+  });
+
+  it('resolves a declared enforced posture to enforced', () => {
+    // #given / #when
+    const { tool } = makeConnector({
+      permissions: { sideEffect: 'read', egressEnforcement: 'enforced' },
+    });
+    // #then
+    expect(connectorEgressPosture(tool)).toBe('enforced');
+  });
+
+  it('returns undefined for a tool createConnector did not build', () => {
+    // #given
+    const tool = createTool({
+      id: 'plain.read',
+      description: 'Read without a connector manifest',
+      execute: async () => ({ ok: true }),
+    });
+    // #when / #then
+    expect(connectorEgressPosture(tool)).toBeUndefined();
+    expect(connectorEgressPosture({})).toBeUndefined();
+  });
+
+  it('refuses an egressEnforcement value outside the two literals at construction', () => {
+    // #given
+    for (const value of ['Enforced', '', null, true, false, 0, {}, []]) {
+      const permissions = {
+        sideEffect: 'read',
+        egressEnforcement: value,
+      } as unknown as ConnectorConfig['permissions'];
+      // #when / #then
+      expect(() => makeConnector({ permissions })).toThrow(TypeError);
+      expect(() => makeConnector({ permissions })).toThrow(
+        "permissions.egressEnforcement must be 'enforced' or 'declaration-only'",
+      );
+    }
+  });
+
+  it('refuses construction when requireEgressEnforcement meets an undeclared posture', () => {
+    // #given
+    const config = {
+      permissions: { sideEffect: 'read' as const },
+      policies: { requireEgressEnforcement: true as const },
+    };
+    // #when / #then
+    expect(() => makeConnector(config)).toThrow(TypeError);
+    expect(() => makeConnector(config)).toThrow(/requireEgressEnforcement/);
+  });
+
+  it('refuses construction when requireEgressEnforcement meets declaration-only', () => {
+    // #given
+    const config = {
+      permissions: {
+        sideEffect: 'read' as const,
+        egressEnforcement: 'declaration-only' as const,
+      },
+      policies: { requireEgressEnforcement: true as const },
+    };
+    // #when / #then
+    expect(() => makeConnector(config)).toThrow(TypeError);
+    expect(() => makeConnector(config)).toThrow(/requireEgressEnforcement/);
+  });
+
+  it('admits construction when requireEgressEnforcement meets an enforced posture', () => {
+    // #given / #when
+    const { tool } = makeConnector({
+      permissions: { sideEffect: 'read', egressEnforcement: 'enforced' },
+      policies: { requireEgressEnforcement: true },
+    });
+    // #then
+    expect(connectorEgressPosture(tool)).toBe('enforced');
+  });
+
+  it('admits a declaration-only connector when the deployment sets no posture requirement', () => {
+    // #given / #when
+    const { tool } = makeConnector({
+      permissions: {
+        sideEffect: 'read',
+        egressEnforcement: 'declaration-only',
+      },
+    });
+    // #then
+    expect(connectorEgressPosture(tool)).toBe('declaration-only');
+  });
+
+  it('gates a manifest declaring egress hosts on its posture, not on the hosts', () => {
+    // #given
+    const egress = ['api.example.com'];
+    const policies = { requireEgressEnforcement: true as const };
+    // #when / #then — the same declared hosts, refused under 'declaration-only'
+    // and admitted under 'enforced'.
+    expect(() =>
+      makeConnector({
+        permissions: {
+          sideEffect: 'read',
+          egress,
+          egressEnforcement: 'declaration-only',
+        },
+        policies,
+      }),
+    ).toThrow(/requireEgressEnforcement/);
+    const { tool } = makeConnector({
+      permissions: {
+        sideEffect: 'read',
+        egress,
+        egressEnforcement: 'enforced',
+      },
+      policies,
+    });
+    expect(connectorEgressPosture(tool)).toBe('enforced');
+    expect(connectorManifest(tool)?.egress).toEqual(egress);
+  });
+
+  it('audits the posture connectorEgressPosture reads back', async () => {
+    // #given
+    for (const declared of [
+      undefined,
+      'enforced',
+      'declaration-only',
+    ] as const) {
+      const audit = new AuditLogger();
+      const { tool } = makeConnector({
+        permissions: {
+          sideEffect: 'read',
+          ...(declared === undefined ? {} : { egressEnforcement: declared }),
+        },
+        policies: { audit },
+      });
+      // #when
+      await expect(run(tool, input)).resolves.toEqual({ ok: true });
+      // #then — one resolution serves the readback and the audit detail.
+      expect(audit.events()[0]?.detail).toMatchObject({
+        egressEnforcement: connectorEgressPosture(tool),
+      });
+    }
+  });
+
+  it('records the resolved posture on an allowed connector decision', async () => {
+    // #given
+    for (const egressEnforcement of [
+      undefined,
+      'enforced',
+      'declaration-only',
+    ] as const) {
+      const audit = new AuditLogger();
+      const permissions = {
+        sideEffect: 'read' as const,
+        ...(egressEnforcement === undefined ? {} : { egressEnforcement }),
+      };
+      const { tool } = makeConnector({ permissions, policies: { audit } });
+      const error = registerSafeAuditError(new Error('private failure'), {
+        reason: 'registered failure',
+        detail: {
+          egressEnforcement:
+            egressEnforcement === 'enforced' ? 'declaration-only' : 'enforced',
+        },
+      });
+      const failing = makeConnector({
+        permissions,
+        policies: { audit },
+        execute: async () => {
+          throw error;
+        },
+      }).tool;
+      // #when
+      await expect(run(tool, input)).resolves.toEqual({ ok: true });
+      await expect(run(failing, input)).rejects.toBe(error);
+      // #then
+      expect(audit.events()).toMatchObject([
+        {
+          decision: 'allowed',
+          decisionCode: 'CONNECTOR_ALLOWED',
+          detail: {
+            egressEnforcement: egressEnforcement ?? 'declaration-only',
+          },
+        },
+        {
+          decision: 'error',
+          reason: 'registered failure',
+          detail: {
+            stage: 'execute',
+            egressEnforcement: egressEnforcement ?? 'declaration-only',
+          },
+        },
+      ]);
+    }
+  });
+
+  it('records the resolved posture on a denied connector decision', async () => {
+    // #given
+    for (const egressEnforcement of [
+      undefined,
+      'enforced',
+      'declaration-only',
+    ] as const) {
+      const audit = new AuditLogger();
+      const { tool, execute } = makeConnector({
+        permissions: {
+          sideEffect: 'write',
+          requiresApproval: true,
+          ...(egressEnforcement === undefined ? {} : { egressEnforcement }),
+        },
+        policies: { audit },
+      });
+      // #when
+      await expect(run(tool, input)).rejects.toBeInstanceOf(
+        ConnectorPolicyError,
+      );
+      // #then
+      expect(execute).not.toHaveBeenCalled();
+      expect(audit.events()).toMatchObject([
+        {
+          decision: 'denied',
+          decisionCode: 'APPROVAL_GRANT_MISSING',
+          detail: {
+            egressEnforcement: egressEnforcement ?? 'declaration-only',
+          },
+        },
+      ]);
+    }
+  });
+});
+
 describe('connector id validation', () => {
   it("rejects an id containing ':' because the unchanged rate-budget tuple needs a colon-free final component", () => {
     // #given / #when — active rate-limit windows retain the legacy
@@ -340,6 +597,171 @@ describe('connector id validation', () => {
     // #when / #then — the guard rejects nothing shipped
     expect(() => makeConnector({ id: 'createContact' })).not.toThrow();
     expect(() => makeConnector({ id: 'agent-cli.claude-code' })).not.toThrow();
+  });
+});
+
+// Counts createConnector's reads of one caller-supplied `config` member. An
+// accessor answers each read itself, so a member read twice can give the
+// refusal check one value and the construction that follows another.
+function countingConfig(
+  field: keyof ConnectorConfig,
+  overrides: Partial<ConnectorConfig> = {},
+): { config: ConnectorConfig; reads: () => number } {
+  const config: ConnectorConfig = {
+    id: 'salesforce.createContact',
+    description: 'Create a Salesforce contact',
+    execute: async () => ({ ok: true }),
+    permissions: { sideEffect: 'write' },
+    ...overrides,
+  };
+  const value = config[field];
+  let reads = 0;
+  Object.defineProperty(config, field, {
+    configurable: true,
+    enumerable: true,
+    get() {
+      reads += 1;
+      return value;
+    },
+  });
+  return { config, reads: () => reads };
+}
+
+// The same count over one caller-supplied `policies` member.
+function countingPolicies(
+  field: keyof ConnectorPolicies,
+  overrides: Partial<ConnectorConfig> = {},
+): { config: ConnectorConfig; reads: () => number } {
+  const policies: ConnectorPolicies = { ...overrides.policies };
+  const value = policies[field];
+  let reads = 0;
+  Object.defineProperty(policies, field, {
+    configurable: true,
+    enumerable: true,
+    get() {
+      reads += 1;
+      return value;
+    },
+  });
+  const config: ConnectorConfig = {
+    id: 'salesforce.createContact',
+    description: 'Create a Salesforce contact',
+    execute: async () => ({ ok: true }),
+    permissions: { sideEffect: 'write' },
+    ...overrides,
+    policies,
+  };
+  return { config, reads: () => reads };
+}
+
+describe('caller-supplied member reads', () => {
+  it('reads config.permissions once for the required-permission check and the manifest', () => {
+    // #given
+    const { config, reads } = countingConfig('permissions');
+
+    // #when
+    createConnectorBase(config);
+
+    // #then
+    expect(reads()).toBe(1);
+  });
+
+  it('reads config.inputSchema once', () => {
+    // #given
+    const { config, reads } = countingConfig('inputSchema', {
+      inputSchema: z.unknown(),
+    });
+
+    // #when / #then
+    createConnectorBase(config);
+    expect(reads()).toBe(1);
+  });
+
+  it('reads config.outputSchema once', () => {
+    // #given
+    const { config, reads } = countingConfig('outputSchema', {
+      outputSchema: z.unknown(),
+    });
+
+    // #when / #then
+    createConnectorBase(config);
+    expect(reads()).toBe(1);
+  });
+
+  it('reads config.dryRunExecute once for both construction checks', () => {
+    // #given
+    const { config, reads } = countingConfig('dryRunExecute', {
+      dryRunExecute: async () => ({ ok: true }),
+      permissions: { sideEffect: 'write', dryRun: true },
+    });
+
+    // #when / #then
+    createConnectorBase(config);
+    expect(reads()).toBe(1);
+  });
+
+  it('reads policies.idempotencyStore once', () => {
+    // #given
+    const { config, reads } = countingPolicies('idempotencyStore', {
+      permissions: { sideEffect: 'write', idempotencyKey: true },
+      policies: { idempotencyStore: new InMemoryIdempotencyStore() },
+    });
+
+    // #when / #then
+    createConnectorBase(config);
+    expect(reads()).toBe(1);
+  });
+
+  it('reads policies.idempotencyKeyMigration once at construction', () => {
+    // #given
+    const { config, reads } = countingPolicies('idempotencyKeyMigration', {
+      policies: { idempotencyKeyMigration: 'legacy-writers-drained' },
+    });
+
+    // #when / #then
+    createConnectorBase(config);
+    expect(reads()).toBe(1);
+  });
+
+  it('reads policies.rateLimitStore once', () => {
+    // #given
+    const { config, reads } = countingPolicies('rateLimitStore', {
+      permissions: { sideEffect: 'write', rateLimit: '2/min' },
+      policies: { rateLimitStore: new InMemoryRateLimitStore() },
+    });
+
+    // #when / #then
+    createConnectorBase(config);
+    expect(reads()).toBe(1);
+  });
+
+  it('reads policies.networkEgress once', () => {
+    // #given
+    const { config, reads } = countingPolicies('networkEgress', {
+      policies: { networkEgress: { allowedDomains: ['api.salesforce.com'] } },
+    });
+
+    // #when / #then
+    createConnectorBase(config);
+    expect(reads()).toBe(1);
+  });
+
+  it('reads invokeConnector toolCallId once for its check and the call identity', async () => {
+    // #given
+    const { tool } = makeConnector({ permissions: { sideEffect: 'read' } });
+    let reads = 0;
+    const options: ConnectorInvocationOptions = {
+      get toolCallId() {
+        reads += 1;
+        return 'call-1';
+      },
+    };
+
+    // #when
+    await invokeConnector(tool, input, options);
+
+    // #then
+    expect(reads).toBe(1);
   });
 });
 
@@ -1186,7 +1608,7 @@ describe('invokeConnector', () => {
     expect(execute).not.toHaveBeenCalled();
   });
 
-  it('rethrows connector policy and application errors unchanged', async () => {
+  it('wraps evaluator throws and preserves application error identity', async () => {
     const policyError = new ConnectorPolicyError(
       'direct.policy-error',
       'custom-policy',
@@ -1208,7 +1630,10 @@ describe('invokeConnector', () => {
         ],
       },
     });
-    await expect(invokeConnector(policyTool, {})).rejects.toBe(policyError);
+    await expect(invokeConnector(policyTool, {})).rejects.toMatchObject({
+      code: 'EVALUATOR_FAILED',
+      cause: policyError,
+    });
 
     const applicationError = new Error('application-owned failure');
     const applicationTool = createConnector<unknown, unknown>({
@@ -1222,6 +1647,68 @@ describe('invokeConnector', () => {
     await expect(invokeConnector(applicationTool, {})).rejects.toBe(
       applicationError,
     );
+  });
+
+  const unreadableConnectorId = 'direct.unreadable-connector';
+  it.each([
+    {
+      label:
+        'the connector policy error when its connector property cannot be read',
+      id: unreadableConnectorId,
+      description:
+        'Throw a policy error whose connector property cannot be read',
+      hostile: new Proxy(
+        new ConnectorPolicyError(
+          unreadableConnectorId,
+          'custom-policy',
+          'application-owned denial',
+        ),
+        {
+          get(target, key, receiver) {
+            if (key === 'connector') throw new Error('trap');
+            return Reflect.get(target, key, receiver);
+          },
+        },
+      ),
+    },
+    {
+      label: 'the connector value when its prototype chain cannot be read',
+      id: 'direct.unreadable-prototype',
+      description: 'Throw a value whose prototype chain cannot be read',
+      hostile: new Proxy(
+        { marker: 'unreadable-prototype' },
+        {
+          getPrototypeOf(): never {
+            throw new Error('prototype unreadable');
+          },
+        },
+      ),
+    },
+  ])('rejects with $label', async ({ id, description, hostile }) => {
+    // #given
+    const audit = new AuditLogger();
+    const tool = createConnector<unknown, unknown>({
+      id,
+      description,
+      execute: async () => {
+        throw hostile;
+      },
+      permissions: { sideEffect: 'read' },
+      policies: { audit },
+    });
+    // #when
+    const failure = await invokeConnector(tool, {}).catch(
+      (error: unknown) => error,
+    );
+    // #then
+    expect(failure).toBe(hostile);
+    expect(audit.events()).toEqual([
+      expect.objectContaining({
+        decision: 'error',
+        decisionCode: 'CONNECTOR_EXECUTION_FAILED',
+        detail: expect.objectContaining({ stage: 'execute' }),
+      }),
+    ]);
   });
 });
 
@@ -1432,7 +1919,9 @@ describe('custom tool-boundary evaluators', () => {
       },
     });
     // #when / #then
-    await expect(run(tool, input)).rejects.toThrow(PRIVATE_BACKEND_SENTINEL);
+    await expect(run(tool, input)).rejects.toMatchObject({
+      cause: expect.objectContaining({ message: PRIVATE_BACKEND_SENTINEL }),
+    });
     expect(execute).not.toHaveBeenCalled();
     expect(audit.events()).toMatchObject([
       {
@@ -2548,12 +3037,15 @@ describe('idempotency', () => {
     // #when / #then
     await expect(
       run(tool, input, makeContext({ idempotencyKey: 'k1' })),
-    ).rejects.toThrow(PRIVATE_BACKEND_SENTINEL);
+    ).rejects.toMatchObject({
+      code: 'STORE_UNAVAILABLE',
+      cause: expect.objectContaining({ message: PRIVATE_BACKEND_SENTINEL }),
+    });
     expect(execute).not.toHaveBeenCalled();
     expect(audit.events()).toMatchObject([
       {
         decision: 'error',
-        reason: 'idempotency store inspect failed',
+        reason: 'idempotency store get failed',
         detail: { stage: 'idempotency-store' },
       },
     ]);
@@ -3226,11 +3718,12 @@ describe('atomic idempotency (reserve path)', () => {
       },
     });
 
-    // #when / #then — the raw error propagates, execute never ran, and the
-    // reservation is released so the key stays retryable
     await expect(
       run(tool, input, makeContext({ idempotencyKey: 'k1' })),
-    ).rejects.toThrow('counter backend down');
+    ).rejects.toMatchObject({
+      code: 'STORE_UNAVAILABLE',
+      cause: expect.objectContaining({ message: 'counter backend down' }),
+    });
     expect(execute).not.toHaveBeenCalled();
     expect(store.release).toHaveBeenCalledWith(
       expect.stringMatching(/^bw2_i_u_[0-9a-f]+_[0-9a-f]+$/),
@@ -3269,15 +3762,20 @@ describe('atomic idempotency (reserve path)', () => {
       },
     });
 
-    // #when / #then — the caller receives an Error carrying the message
-    // (the primitive rides on `cause`), execute never ran
     const failure = await run(
       tool,
       input,
       makeContext({ idempotencyKey: 'k1' }),
     ).catch((error: unknown) => error);
-    expect(failure).toBeInstanceOf(Error);
-    expect((failure as Error).message).toBe('counter backend down (primitive)');
+    expect(failure).toBeInstanceOf(ConnectorStoreError);
+    expect(failure).toMatchObject({
+      code: 'STORE_UNAVAILABLE',
+      operation: 'increment',
+      retryable: true,
+    });
+    expect((failure as Error).message).not.toContain(
+      'counter backend down (primitive)',
+    );
     expect((failure as Error).cause).toBe('counter backend down (primitive)');
     expect(execute).not.toHaveBeenCalled();
     // #then — still exactly ONE audit record; no misattributed second
@@ -3323,7 +3821,10 @@ describe('atomic idempotency (reserve path)', () => {
     // #when / #then
     await expect(
       run(tool, input, makeContext({ idempotencyKey: 'k1' })),
-    ).rejects.toThrow(PRIVATE_BACKEND_SENTINEL);
+    ).rejects.toMatchObject({
+      code: 'STORE_UNAVAILABLE',
+      cause: expect.objectContaining({ message: PRIVATE_BACKEND_SENTINEL }),
+    });
     expect(execute).not.toHaveBeenCalled();
     expect(audit.events()).toMatchObject([
       {
@@ -3467,7 +3968,8 @@ describe('atomic idempotency (reserve path)', () => {
     for (const outcome of outcomes) {
       expect(outcome.status).toBe('rejected');
       expect((outcome as PromiseRejectedResult).reason).toMatchObject({
-        message: 'd1 reserve down',
+        code: 'STORE_UNAVAILABLE',
+        cause: expect.objectContaining({ message: 'd1 reserve down' }),
       });
     }
     expect(execute).not.toHaveBeenCalled();
@@ -3836,7 +4338,10 @@ describe('rate limit', () => {
       },
     });
     // #when / #then
-    await expect(run(tool, input)).rejects.toThrow(PRIVATE_BACKEND_SENTINEL);
+    await expect(run(tool, input)).rejects.toMatchObject({
+      code: 'STORE_UNAVAILABLE',
+      cause: expect.objectContaining({ message: PRIVATE_BACKEND_SENTINEL }),
+    });
     expect(execute).not.toHaveBeenCalled();
     expect(audit.events()).toMatchObject([
       {
@@ -4700,5 +5205,1040 @@ describe('_background model-override defense (DL-005)', () => {
     // override, so the breakwater _background presence check is defense-in-depth
     // for direct/nested calls only (the grant is the real agent-path boundary)
     expect(resolved.runInBackground).toBe(false);
+  });
+});
+
+describe('connector decision taxonomy', () => {
+  const denialCases: readonly {
+    label: string;
+    code: string;
+    policyKind: string;
+    retryable?: boolean;
+    config: Partial<ConnectorConfig>;
+    context?: () => ToolExecutionContext;
+    input?: unknown;
+    details?: Record<string, unknown>;
+  }[] = [
+    {
+      label: 'organization egress',
+      code: 'EGRESS_HOST_NOT_ALLOWED_BY_ORG',
+      policyKind: 'network-egress',
+      config: {
+        permissions: { sideEffect: 'read', egress: ['private.example.com'] },
+        policies: {
+          networkEgress: { name: 'renamed-egress', allowedDomains: [] },
+        },
+      },
+      details: { declaredHost: 'private.example.com' },
+    },
+    {
+      label: 'missing permission projection',
+      code: 'PERMISSION_PROJECTION_INVALID',
+      policyKind: 'required-permissions',
+      config: {
+        permissions: {
+          sideEffect: 'read',
+          requiredPermissions: ['contacts.write'],
+        },
+      },
+      details: { requiredPermissions: ['contacts.write'] },
+    },
+    {
+      label: 'missing required permission',
+      code: 'PERMISSION_MISSING',
+      policyKind: 'required-permissions',
+      config: {
+        permissions: {
+          sideEffect: 'read',
+          requiredPermissions: ['contacts.write', 'crm.access'],
+        },
+      },
+      context: () =>
+        makeContext({
+          principalPermissions: {
+            permissions: ['contacts.write', 'private.effective'],
+            policyVersion: 'v7',
+          },
+        }),
+      details: {
+        requiredPermissions: ['contacts.write', 'crm.access'],
+        missingPermissions: ['crm.access'],
+        permissionPolicyVersion: 'v7',
+      },
+    },
+    {
+      label: 'missing approval grant',
+      code: 'APPROVAL_GRANT_MISSING',
+      policyKind: 'write-permissions',
+      config: { permissions: { sideEffect: 'destructive' } },
+    },
+    {
+      label: 'rate exhausted',
+      code: 'RATE_LIMIT_EXCEEDED',
+      policyKind: 'rate-limit',
+      retryable: true,
+      config: {
+        permissions: { sideEffect: 'read', rateLimit: '1/min' },
+        policies: { rateLimitStore: { increment: () => 2 } },
+      },
+      details: { limit: 1, windowMs: 60_000 },
+    },
+    {
+      label: 'missing idempotency key',
+      code: 'IDEMPOTENCY_KEY_MISSING',
+      policyKind: 'idempotency',
+      config: {
+        permissions: { sideEffect: 'read', idempotencyKey: true },
+        policies: { idempotencyStore: new InMemoryIdempotencyStore() },
+      },
+    },
+    {
+      label: 'dry-run unavailable',
+      code: 'DRY_RUN_UNSUPPORTED',
+      policyKind: 'dry-run',
+      config: {},
+      context: () => makeContext({ dryRun: true }),
+    },
+    {
+      label: 'foreground override',
+      code: 'BACKGROUND_OVERRIDE_DENIED',
+      policyKind: 'background',
+      config: {},
+      input: { _background: { enabled: false } },
+    },
+    {
+      label: 'missing workflow scope',
+      code: 'WORKFLOW_SCOPE_MISSING',
+      policyKind: 'cross-workflow-isolation',
+      config: {
+        policies: {
+          evaluators: [
+            crossWorkflowIsolation({
+              name: 'renamed-workflow',
+              targetScopeOf: (call) =>
+                (call.input as { workflowId: string }).workflowId,
+            }),
+          ],
+        },
+      },
+      input: { workflowId: 'other' },
+    },
+    {
+      label: 'foreign workflow',
+      code: 'CROSS_WORKFLOW_ACCESS_DENIED',
+      policyKind: 'cross-workflow-isolation',
+      config: {
+        policies: {
+          evaluators: [
+            crossWorkflowIsolation({
+              name: 'renamed-workflow',
+              targetScopeOf: (call) =>
+                (call.input as { workflowId: string }).workflowId,
+            }),
+          ],
+        },
+      },
+      context: () => {
+        const context = makeContext();
+        context.requestContext?.set(WORKFLOW_SCOPE_CONTEXT_KEY, 'own');
+        return context;
+      },
+      input: { workflowId: 'other' },
+    },
+    {
+      label: 'missing isolation scope',
+      code: 'ISOLATION_SCOPE_MISSING',
+      policyKind: 'tenant-isolation',
+      config: {
+        policies: { evaluators: [tenantIsolation({ name: 'renamed-tenant' })] },
+      },
+    },
+    {
+      label: 'custom evaluator with built-in diagnostic name',
+      code: 'EVALUATOR_DENIED',
+      policyKind: 'evaluator',
+      config: {
+        policies: {
+          evaluators: [
+            {
+              name: 'network-egress',
+              evaluate: () => ({
+                allowed: false,
+                reason: 'custom diagnostic wording',
+              }),
+            },
+          ],
+        },
+      },
+    },
+  ];
+
+  it.each(denialCases)('matches the error and audit for $label', async ({
+    code,
+    policyKind,
+    retryable = false,
+    config,
+    context,
+    input: value,
+    details,
+  }) => {
+    const audit = new AuditLogger();
+    const execute = vi.fn(async () => 'executed');
+    const tool = createConnector({
+      id: 'taxonomy.denial',
+      description: 'Exercise a connector refusal',
+      permissions: { sideEffect: 'read' },
+      ...config,
+      policies: { ...config.policies, audit },
+      execute,
+    });
+    const error = await run(tool, value ?? {}, context?.()).catch(
+      (failure: unknown) => failure,
+    );
+    expect(error).toBeInstanceOf(ConnectorPolicyError);
+    expect(error).toMatchObject({
+      code,
+      policyKind,
+      retryable,
+      connector: 'taxonomy.denial',
+    });
+    expect((error as ConnectorPolicyError).details).toEqual(details);
+    expect(execute).not.toHaveBeenCalled();
+    expect(audit.events()).toHaveLength(1);
+    expect(audit.events()[0]).toMatchObject({
+      decision: 'denied',
+      decisionCode: code,
+      policyKind,
+      retryable,
+    });
+    expect(
+      JSON.stringify((error as ConnectorPolicyError).details ?? null),
+    ).not.toContain('private.effective');
+    expect(JSON.stringify(audit.events())).not.toContain('private.effective');
+  });
+
+  it.each([
+    [
+      'legacy pending',
+      'pending',
+      false,
+      true,
+      'IDEMPOTENCY_CONFLICT',
+      'idempotency',
+      true,
+    ],
+    [
+      'ambiguous legacy replay',
+      'replay',
+      true,
+      true,
+      'IDEMPOTENCY_LEGACY_AMBIGUOUS',
+      'idempotency-key-migration',
+      false,
+    ],
+    [
+      'migration unacknowledged',
+      'absent',
+      false,
+      false,
+      'IDEMPOTENCY_MIGRATION_REQUIRED',
+      'idempotency-key-migration',
+      false,
+    ],
+    [
+      'current reservation pending',
+      'absent',
+      false,
+      true,
+      'IDEMPOTENCY_CONFLICT',
+      'idempotency',
+      true,
+    ],
+  ] as const)('classifies %s without entering execute', async (_label, legacyState, ambiguous, acknowledged, code, policyKind, retryable) => {
+    const audit = new AuditLogger();
+    const execute = vi.fn(async () => 'executed');
+    const reserve = vi.fn(() => ({ state: 'pending' as const }));
+    const store = {
+      inspect: () =>
+        legacyState === 'replay'
+          ? { state: 'replay' as const, record: { result: 'legacy' } }
+          : { state: legacyState },
+      get: vi.fn(() => undefined),
+      reserve,
+      put: vi.fn(),
+      release: vi.fn(),
+    };
+    const tool = createConnectorBase({
+      id: 'taxonomy.pending',
+      description: 'Observe reservation refusal',
+      permissions: { sideEffect: 'read', idempotencyKey: true },
+      policies: {
+        audit,
+        idempotencyStore: store,
+        ...(acknowledged
+          ? { idempotencyKeyMigration: 'legacy-writers-drained' as const }
+          : {}),
+      },
+      execute,
+    });
+    const error = await run(
+      tool,
+      {},
+      makeContext({ idempotencyKey: ambiguous ? 'a:b' : 'k1' }),
+    ).catch((failure: unknown) => failure);
+    expect(error).toMatchObject({ code, policyKind, retryable });
+    expect(audit.events()).toMatchObject([
+      { decision: 'denied', decisionCode: code, policyKind, retryable },
+    ]);
+    expect(execute).not.toHaveBeenCalled();
+    expect(store.put).not.toHaveBeenCalled();
+    expect(store.release).not.toHaveBeenCalled();
+    expect(reserve).toHaveBeenCalledTimes(
+      legacyState === 'absent' && acknowledged ? 1 : 0,
+    );
+  });
+
+  it.each([
+    'increment',
+    'legacy-get',
+    'inspect',
+    'get',
+    'reserve',
+  ] as const)('wraps %s before execution with the original cause', async (phase) => {
+    for (const cause of [
+      new Error(PRIVATE_BACKEND_SENTINEL),
+      { secret: PRIVATE_BACKEND_SENTINEL },
+      PRIVATE_BACKEND_SENTINEL,
+      null,
+      undefined,
+    ]) {
+      const audit = new AuditLogger();
+      const execute = vi.fn(async () => 'executed');
+      const fail = () => {
+        throw cause;
+      };
+      const store = {
+        get: vi.fn((key: string) => {
+          if (
+            phase === 'legacy-get' ||
+            (phase === 'get' && key.startsWith('bw2_'))
+          )
+            return fail();
+          return undefined;
+        }),
+        put: vi.fn(),
+        ...(phase === 'inspect' || phase === 'reserve'
+          ? {
+              inspect: vi.fn(() => {
+                if (phase === 'inspect') return fail();
+                return { state: 'absent' as const };
+              }),
+            }
+          : {}),
+        ...(phase === 'reserve'
+          ? { reserve: vi.fn(fail), release: vi.fn() }
+          : {}),
+      };
+      const tool = createConnector({
+        id: 'taxonomy.store',
+        description: 'Observe store failure',
+        permissions: {
+          sideEffect: 'read',
+          ...(phase === 'increment'
+            ? { rateLimit: '1/min' }
+            : { idempotencyKey: true }),
+        },
+        policies: {
+          audit,
+          ...(phase === 'increment'
+            ? { rateLimitStore: { increment: fail } }
+            : { idempotencyStore: store }),
+        },
+        execute,
+      });
+      const error = await run(
+        tool,
+        {},
+        makeContext({ idempotencyKey: 'private-key' }),
+      ).catch((failure: unknown) => failure);
+      expect(error).toBeInstanceOf(ConnectorStoreError);
+      expect(error).toMatchObject({
+        code: 'STORE_UNAVAILABLE',
+        policyKind: 'store',
+        retryable: true,
+        operation: phase === 'legacy-get' ? 'get' : phase,
+        store: phase === 'increment' ? 'rate-limit' : 'idempotency',
+      });
+      expect((error as Error).cause).toBe(cause);
+      expect((error as Error).message).not.toContain(PRIVATE_BACKEND_SENTINEL);
+      expect(audit.events()).toMatchObject([
+        {
+          decision: 'error',
+          decisionCode: 'STORE_UNAVAILABLE',
+          policyKind: 'store',
+          retryable: true,
+        },
+      ]);
+      expect(JSON.stringify(audit.events())).not.toContain(
+        PRIVATE_BACKEND_SENTINEL,
+      );
+      expect(execute).not.toHaveBeenCalled();
+      expect(store.put).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each([
+    false,
+    true,
+  ])('keeps successful output after put fails (atomic %s)', async (atomic) => {
+    const audit = new AuditLogger();
+    const cause = new Error(PRIVATE_BACKEND_SENTINEL);
+    const release = vi.fn();
+    const execute = vi.fn(async () => ({ value: 'completed' }));
+    const store = {
+      get: () => undefined,
+      put: vi.fn(() => {
+        throw cause;
+      }),
+      ...(atomic
+        ? {
+            inspect: () => ({ state: 'absent' as const }),
+            reserve: () => ({ state: 'reserved' as const, token: 'lease' }),
+            release,
+          }
+        : {}),
+    };
+    const tool = createConnector({
+      id: 'taxonomy.commit',
+      description: 'Retain completed result',
+      permissions: { sideEffect: 'read', idempotencyKey: true },
+      policies: { audit, idempotencyStore: store },
+      execute,
+    });
+    await expect(
+      run(tool, {}, makeContext({ idempotencyKey: 'same-logical-operation' })),
+    ).resolves.toEqual({ value: 'completed' });
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(store.put).toHaveBeenCalledTimes(1);
+    expect(release).not.toHaveBeenCalled();
+    expect(audit.events()).toMatchObject([
+      {
+        decision: 'error',
+        decisionCode: 'STORE_COMMIT_FAILED',
+        policyKind: 'store',
+        retryable: false,
+      },
+      {
+        decision: 'allowed',
+        decisionCode: 'CONNECTOR_ALLOWED',
+        policyKind: 'execution',
+        retryable: false,
+      },
+    ]);
+    expect(JSON.stringify(audit.events())).not.toContain(
+      PRIVATE_BACKEND_SENTINEL,
+    );
+  });
+
+  it('preserves the original execute failure after release fails', async () => {
+    const original = { arbitrary: 'application exception' };
+    const audit = new AuditLogger();
+    const store = {
+      get: () => undefined,
+      inspect: () => ({ state: 'absent' as const }),
+      reserve: () => ({ state: 'reserved' as const, token: 'lease' }),
+      put: vi.fn(),
+      release: vi.fn(() => {
+        throw PRIVATE_BACKEND_SENTINEL;
+      }),
+    };
+    const tool = createConnector({
+      id: 'taxonomy.release',
+      description: 'Preserve original failure',
+      permissions: { sideEffect: 'read', idempotencyKey: true },
+      policies: { audit, idempotencyStore: store },
+      execute: async () => {
+        throw original;
+      },
+    });
+    await expect(
+      run(tool, {}, makeContext({ idempotencyKey: 'same-key' })),
+    ).rejects.toBe(original);
+    expect(store.release).toHaveBeenCalledTimes(1);
+    expect(store.put).not.toHaveBeenCalled();
+    expect(audit.events()).toMatchObject([
+      {
+        decision: 'error',
+        decisionCode: 'STORE_RELEASE_FAILED',
+        policyKind: 'store',
+        retryable: false,
+      },
+      {
+        decision: 'error',
+        decisionCode: 'CONNECTOR_EXECUTION_FAILED',
+        policyKind: 'execution',
+        retryable: false,
+      },
+    ]);
+    expect(JSON.stringify(audit.events())).not.toContain(
+      PRIVATE_BACKEND_SENTINEL,
+    );
+  });
+
+  it.each([
+    { code: 'NOT_A_CODE' },
+    { code: 'CONNECTOR_ALLOWED' },
+    {
+      code: 'RATE_LIMIT_EXCEEDED',
+      details: { url: 'https://secret.example/path' },
+    },
+    { details: { host: 'example.com' } },
+    { code: 'EVALUATOR_DENIED', retryable: true },
+    { code: 'EVALUATOR_DENIED', policyKind: 'rate-limit' },
+    Object.create({ code: 'RATE_LIMIT_EXCEEDED' }) as object,
+    Object.defineProperty({}, 'code', {
+      get() {
+        throw new Error(PRIVATE_BACKEND_SENTINEL);
+      },
+    }),
+  ])('contains malformed evaluator metadata %# inside its failure boundary', async (metadata) => {
+    const audit = new AuditLogger();
+    const execute = vi.fn(async () => 'executed');
+    const decision = Object.defineProperties(
+      { allowed: false as const, reason: 'custom' },
+      Object.getOwnPropertyDescriptors(metadata),
+    );
+    Object.setPrototypeOf(decision, Object.getPrototypeOf(metadata));
+    const tool = createConnector({
+      id: 'taxonomy.evaluator',
+      description: 'Reject invalid decision metadata',
+      permissions: { sideEffect: 'read' },
+      policies: {
+        audit,
+        evaluators: [{ name: 'custom', evaluate: () => decision }],
+      },
+      execute,
+    });
+    const error = await run(tool, {}).catch((failure: unknown) => failure);
+    expect(error).toBeInstanceOf(ConnectorEvaluatorError);
+    expect(error).toMatchObject({
+      code: 'EVALUATOR_FAILED',
+      policyKind: 'evaluator',
+      retryable: false,
+      policy: 'custom',
+    });
+    expect((error as Error).cause).toBeInstanceOf(TypeError);
+    expect(execute).not.toHaveBeenCalled();
+    expect(audit.events()).toMatchObject([
+      {
+        decision: 'error',
+        decisionCode: 'EVALUATOR_FAILED',
+        policyKind: 'evaluator',
+        retryable: false,
+      },
+    ]);
+    expect(JSON.stringify(audit.events())).not.toContain('secret.example');
+    expect(JSON.stringify(audit.events())).not.toContain(
+      PRIVATE_BACKEND_SENTINEL,
+    );
+  });
+
+  it('captures evaluator metadata and reason once with its receiver intact', async () => {
+    const audit = new AuditLogger();
+    let receiver: unknown;
+    let reasonReads = 0;
+    const evaluator = {
+      name: 'custom-throttle',
+      evaluate() {
+        receiver = this;
+        return {
+          allowed: false as const,
+          get reason() {
+            reasonReads += 1;
+            return 'capacity';
+          },
+          code: 'RATE_LIMIT_EXCEEDED' as const,
+          details: { limit: 2, windowMs: 1000 },
+        };
+      },
+    };
+    const { tool, execute } = makeConnector({
+      policies: { audit, evaluators: [evaluator] },
+    });
+    const error = await run(tool, input).catch((failure: unknown) => failure);
+    expect(receiver).toBe(evaluator);
+    expect(reasonReads).toBe(1);
+    expect(error).toMatchObject({
+      code: 'RATE_LIMIT_EXCEEDED',
+      policy: 'custom-throttle',
+      reason: 'capacity',
+      retryable: true,
+      details: { limit: 2, windowMs: 1000 },
+    });
+    expect(audit.events()).toMatchObject([
+      {
+        decisionCode: 'RATE_LIMIT_EXCEEDED',
+        policyKind: 'rate-limit',
+        retryable: true,
+      },
+    ]);
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('keeps nested denial metadata on the outer execute failure', async () => {
+    const audit = new AuditLogger();
+    const inner = createConnector({
+      id: 'taxonomy.inner',
+      description: 'Deny a nested write',
+      permissions: { sideEffect: 'destructive' },
+      policies: { audit },
+      execute: async () => 'unexpected',
+    });
+    let innerError: unknown;
+    const outer = createConnector({
+      id: 'taxonomy.outer',
+      description: 'Propagate nested refusal',
+      permissions: { sideEffect: 'read' },
+      policies: { audit },
+      execute: async (_, context) => {
+        try {
+          return await run(inner, {}, context);
+        } catch (error) {
+          innerError = error;
+          throw error;
+        }
+      },
+    });
+    const error = await run(outer, {}).catch((failure: unknown) => failure);
+    expect(error).toBe(innerError);
+    expect(error).toMatchObject({
+      code: 'APPROVAL_GRANT_MISSING',
+      connector: 'taxonomy.inner',
+    });
+    expect(audit.events()).toMatchObject([
+      {
+        resource: 'taxonomy.inner',
+        decision: 'denied',
+        decisionCode: 'APPROVAL_GRANT_MISSING',
+        policyKind: 'write-permissions',
+        retryable: false,
+      },
+      {
+        resource: 'taxonomy.outer',
+        decision: 'error',
+        decisionCode: 'APPROVAL_GRANT_MISSING',
+        policyKind: 'write-permissions',
+        retryable: false,
+      },
+    ]);
+  });
+
+  it.each([
+    'unregistered',
+    'modified',
+    'options',
+    'unverifiable',
+  ] as const)('types the %s invocation boundary without execute or audit', async (boundary) => {
+    const audit = new AuditLogger();
+    const execute = vi.fn(async () => 'executed');
+    const tool = createConnector({
+      id: 'taxonomy.invocation',
+      description: 'Check invocation ownership',
+      permissions: { sideEffect: 'read' },
+      policies: { audit },
+      execute,
+    });
+    const codes = {
+      unregistered: 'CONNECTOR_UNREGISTERED',
+      modified: 'CONNECTOR_BOUNDARY_MODIFIED',
+      options: 'CONNECTOR_INVOCATION_OPTIONS_INVALID',
+      unverifiable: 'CONNECTOR_BOUNDARY_UNVERIFIABLE',
+    } as const;
+    const target = boundary === 'unregistered' ? { ...tool } : tool;
+    if (boundary === 'modified')
+      Object.defineProperty(tool, 'id', {
+        get() {
+          throw new Error(PRIVATE_BACKEND_SENTINEL);
+        },
+      });
+    if (boundary === 'unverifiable') {
+      const original = tool.execute;
+      tool.execute = async () => 'unchecked';
+      replaceConnectorInvocation(tool, original);
+    }
+    const error = await invokeConnector(
+      target,
+      {},
+      boundary === 'options' ? { toolCallId: '' } : {},
+    ).catch((failure: unknown) => failure);
+    expect(error).toBeInstanceOf(ConnectorInvocationError);
+    expect(error).toBeInstanceOf(TypeError);
+    expect(error).toMatchObject({
+      code: codes[boundary],
+      policyKind: 'invocation',
+      retryable: false,
+      connector:
+        boundary === 'unregistered' ? undefined : 'taxonomy.invocation',
+    });
+    expect(exposedErrorText(error)).not.toContain(PRIVATE_BACKEND_SENTINEL);
+    expect(execute).not.toHaveBeenCalled();
+    expect(audit.events()).toEqual([]);
+  });
+
+  it.each([
+    'input',
+    'output',
+  ] as const)('keeps direct %s validation redacted with its literal code', async (phase) => {
+    const audit = new AuditLogger();
+    const execute = vi.fn(async () => 'invalid output');
+    const tool = createConnector({
+      id: 'taxonomy.validation',
+      description: 'Validate direct input and output',
+      permissions: { sideEffect: 'read' },
+      policies: { audit },
+      ...(phase === 'input'
+        ? { inputSchema: z.number() }
+        : { outputSchema: z.number() }),
+      execute: execute as never,
+    });
+    const error = await invokeConnector(tool, 'invalid input' as never).catch(
+      (failure: unknown) => failure,
+    );
+    const code =
+      phase === 'input'
+        ? 'CONNECTOR_INPUT_INVALID'
+        : 'CONNECTOR_OUTPUT_INVALID';
+    expect(error).toBeInstanceOf(ConnectorValidationError);
+    expect(error).toMatchObject({
+      phase,
+      code,
+      policyKind: 'validation',
+      retryable: false,
+    });
+    expect(Object.hasOwn(error as object, 'cause')).toBe(false);
+    expect(exposedErrorText(error)).not.toContain('invalid input');
+    expect(exposedErrorText(error)).not.toContain('invalid output');
+    if (phase === 'input') {
+      expect(execute).not.toHaveBeenCalled();
+      expect(audit.events()).toEqual([]);
+    } else {
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(audit.events()).toMatchObject([
+        {
+          decision: 'error',
+          decisionCode: code,
+          policyKind: 'validation',
+          retryable: false,
+        },
+      ]);
+    }
+  });
+});
+
+describe('runtime fetch decision projection', () => {
+  it.each([
+    ['input', 'EGRESS_INPUT_INVALID', null, 0, 0],
+    ['url', 'EGRESS_URL_INVALID', null, 0, 0],
+    ['scheme', 'EGRESS_SCHEME_NOT_ALLOWED', 'api.example.com', 0, 0],
+    ['host', 'EGRESS_HOST_NOT_DECLARED', 'other.example.com', 0, 0],
+    ['redirect-url', 'EGRESS_REDIRECT_URL_INVALID', null, 1, 1],
+    [
+      'redirect-scheme',
+      'EGRESS_REDIRECT_SCHEME_NOT_ALLOWED',
+      'api.example.com',
+      1,
+      1,
+    ],
+    ['redirect-host', 'EGRESS_REDIRECT_HOST_DENIED', 'other.example.com', 1, 1],
+    ['opaque', 'EGRESS_REDIRECT_UNVERIFIABLE', 'api.example.com', 1, 1],
+    ['limit', 'EGRESS_REDIRECT_LIMIT_EXCEEDED', 'api.example.com', 21, 21],
+    ['body', 'EGRESS_REDIRECT_BODY_UNREPLAYABLE', 'api.example.com', 1, 1],
+  ] as const)('retains the %s refusal code and releases each discarded response', async (scenario, code, host, hop, requests) => {
+    const cancel = vi.fn();
+    const audit = new AuditLogger();
+    const location =
+      scenario === 'redirect-url'
+        ? 'https://['
+        : scenario === 'redirect-scheme'
+          ? 'file://api.example.com/private-path'
+          : scenario === 'redirect-host'
+            ? 'https://other.example.com/private-path?secret=private-query'
+            : 'https://api.example.com/next';
+    const fetch = vi.fn(async () => ({
+      status: scenario === 'opaque' ? 0 : 307,
+      headers: { get: () => location },
+      body: { cancel },
+    }));
+    const tool = createConnector({
+      id: 'taxonomy.fetch',
+      description: 'Observe fetch refusal',
+      permissions: { sideEffect: 'read', egress: ['api.example.com'] },
+      policies: { audit, fetch },
+      execute: async (_input, _context, runtime) =>
+        runtime.fetch(
+          scenario === 'input'
+            ? ({} as never)
+            : scenario === 'url'
+              ? 'https://['
+              : scenario === 'scheme'
+                ? 'file://api.example.com/private-path'
+                : scenario === 'host'
+                  ? 'https://other.example.com/private-path?secret=private-query'
+                  : 'https://api.example.com/start',
+          scenario === 'body'
+            ? { method: 'POST', body: { getReader() {} } }
+            : undefined,
+        ),
+    });
+    const error = await run(tool, {}).catch((failure: unknown) => failure);
+    expect(error).toBeInstanceOf(ConnectorPolicyError);
+    expect(error).toMatchObject({
+      code,
+      policyKind: 'egress-fetch',
+      retryable: false,
+      details: { host, hop },
+    });
+    expect((error as Error).message).not.toContain('undefined');
+    expect(exposedErrorText(error)).not.toContain('private-path');
+    expect(exposedErrorText(error)).not.toContain('private-query');
+    expect(fetch).toHaveBeenCalledTimes(requests);
+    expect(cancel).toHaveBeenCalledTimes(requests);
+    expect(audit.events()).toMatchObject([
+      {
+        decision: 'denied',
+        decisionCode: code,
+        policyKind: 'egress-fetch',
+        retryable: false,
+        detail: { host, hop },
+      },
+    ]);
+  });
+});
+
+describe('successful connector decision records', () => {
+  it('keeps authorization, approval, takeover and outcome records distinct', async () => {
+    const audit = new AuditLogger();
+    const store = {
+      get: () => undefined,
+      inspect: () => ({ state: 'absent' as const }),
+      reserve: () => ({
+        state: 'reserved' as const,
+        token: 'lease',
+        tookOver: true,
+      }),
+      put() {},
+      release() {},
+    };
+    const tool = createConnector({
+      id: 'taxonomy.allowed',
+      description: 'Exercise approval and takeover',
+      permissions: {
+        sideEffect: 'destructive',
+        requiredPermissions: ['contacts.write'],
+        idempotencyKey: true,
+      },
+      policies: {
+        audit,
+        idempotencyStore: store,
+      },
+      execute: async () => 'completed',
+    });
+    await expect(
+      run(
+        tool,
+        {},
+        makeContext({
+          idempotencyKey: 'k1',
+          approved: ['taxonomy.allowed'],
+          principalPermissions: {
+            permissions: ['contacts.write'],
+            policyVersion: 'v7',
+          },
+        }),
+      ),
+    ).resolves.toBe('completed');
+    expect(audit.events()).toMatchObject([
+      {
+        action: 'connector.authorize',
+        decisionCode: 'PERMISSION_GRANTED',
+        policyKind: 'required-permissions',
+        retryable: false,
+      },
+      {
+        action: 'connector.approval',
+        decisionCode: 'APPROVAL_GRANTED',
+        policyKind: 'write-permissions',
+        retryable: false,
+      },
+      {
+        action: 'connector.execute',
+        decisionCode: 'IDEMPOTENCY_TAKEOVER',
+        policyKind: 'idempotency',
+        retryable: false,
+      },
+      {
+        action: 'connector.execute',
+        decisionCode: 'CONNECTOR_ALLOWED',
+        policyKind: 'execution',
+        retryable: false,
+      },
+    ]);
+  });
+
+  it('records successful dry-run and replay with the same outcome code', async () => {
+    const audit = new AuditLogger();
+    const execute = vi.fn(async () => 'completed');
+    const tool = createConnector({
+      id: 'taxonomy.results',
+      description: 'Observe successful outcomes',
+      permissions: { sideEffect: 'read', idempotencyKey: true, dryRun: true },
+      policies: { audit, idempotencyStore: new InMemoryIdempotencyStore() },
+      execute,
+      dryRunExecute: async () => 'simulated',
+    });
+    await expect(run(tool, {}, makeContext({ dryRun: true }))).resolves.toBe(
+      'simulated',
+    );
+    await expect(
+      run(tool, {}, makeContext({ idempotencyKey: 'k1' })),
+    ).resolves.toBe('completed');
+    await expect(
+      run(tool, {}, makeContext({ idempotencyKey: 'k1' })),
+    ).resolves.toBe('completed');
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(audit.events()).toMatchObject([
+      {
+        decisionCode: 'CONNECTOR_ALLOWED',
+        retryable: false,
+        detail: { dryRun: true },
+      },
+      { decisionCode: 'CONNECTOR_ALLOWED', retryable: false },
+      {
+        decisionCode: 'CONNECTOR_ALLOWED',
+        retryable: false,
+        detail: { replayed: true },
+      },
+    ]);
+  });
+});
+
+describe('audit observer isolation during connector settlement', () => {
+  function failingAudit(): AuditLogger {
+    return new AuditLogger({
+      sink: () => {
+        throw new Error('sink failure');
+      },
+      onSinkError: () => {
+        throw new Error('observer failure');
+      },
+    });
+  }
+
+  it('returns a completed atomic result and retains its reservation after commit and observer failures', async () => {
+    const store = new InMemoryIdempotencyStore();
+    vi.spyOn(store, 'put').mockRejectedValue(new Error('commit failure'));
+    const release = vi.spyOn(store, 'release');
+    const execute = vi.fn(async () => ({ receipt: 'completed' }));
+    const audit = failingAudit();
+    const connector = createConnectorBase({
+      id: 'audit.atomic-result',
+      description: 'Local effect counter',
+      permissions: { sideEffect: 'read', idempotencyKey: true },
+      policies: {
+        audit,
+        idempotencyStore: store,
+        idempotencyKeyMigration: 'legacy-writers-drained',
+      },
+      execute,
+    });
+    const requestContext = new RequestContext();
+    requestContext.set(IDEMPOTENCY_KEY_CONTEXT_KEY, 'same-operation');
+    await expect(
+      invokeConnector(connector, {}, { requestContext }),
+    ).resolves.toEqual({ receipt: 'completed' });
+    await expect(
+      invokeConnector(connector, {}, { requestContext }),
+    ).rejects.toMatchObject({
+      code: 'IDEMPOTENCY_CONFLICT',
+      retryable: true,
+    });
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(release).not.toHaveBeenCalled();
+    expect(
+      audit.events().map((event) => [event.decisionCode, event.retryable]),
+    ).toEqual([
+      ['STORE_COMMIT_FAILED', false],
+      ['CONNECTOR_ALLOWED', false],
+      ['IDEMPOTENCY_CONFLICT', true],
+    ]);
+  });
+
+  it('returns a completed non-atomic result after commit and observer failures', async () => {
+    const execute = vi.fn(async () => ({ receipt: 'completed' }));
+    const audit = failingAudit();
+    const connector = createConnectorBase({
+      id: 'audit.non-atomic-result',
+      description: 'Local effect counter',
+      permissions: { sideEffect: 'read', idempotencyKey: true },
+      policies: {
+        audit,
+        idempotencyKeyMigration: 'legacy-writers-drained',
+        idempotencyStore: {
+          get: async () => undefined,
+          put: async () => {
+            throw new Error('commit failure');
+          },
+        },
+      },
+      execute,
+    });
+    const requestContext = new RequestContext();
+    requestContext.set(IDEMPOTENCY_KEY_CONTEXT_KEY, 'operation');
+    await expect(
+      invokeConnector(connector, {}, { requestContext }),
+    ).resolves.toEqual({ receipt: 'completed' });
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(
+      audit.events().map((event) => [event.decisionCode, event.retryable]),
+    ).toEqual([
+      ['STORE_COMMIT_FAILED', false],
+      ['CONNECTOR_ALLOWED', false],
+    ]);
+  });
+
+  it('preserves the original failure when reservation release and its observer fail', async () => {
+    const store = new InMemoryIdempotencyStore();
+    const release = vi
+      .spyOn(store, 'release')
+      .mockRejectedValue(new Error('release failure'));
+    const original = new Error('original execution failure');
+    const execute = vi.fn(async () => {
+      throw original;
+    });
+    const audit = failingAudit();
+    const connector = createConnectorBase({
+      id: 'audit.release-failure',
+      description: 'Local failing execution',
+      permissions: { sideEffect: 'read', idempotencyKey: true },
+      policies: {
+        audit,
+        idempotencyStore: store,
+        idempotencyKeyMigration: 'legacy-writers-drained',
+      },
+      execute,
+    });
+    const requestContext = new RequestContext();
+    requestContext.set(IDEMPOTENCY_KEY_CONTEXT_KEY, 'operation');
+    await expect(
+      invokeConnector(connector, {}, { requestContext }),
+    ).rejects.toBe(original);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(
+      audit.events().map((event) => [event.decisionCode, event.retryable]),
+    ).toEqual([
+      ['STORE_RELEASE_FAILED', false],
+      ['CONNECTOR_EXECUTION_FAILED', false],
+    ]);
   });
 });

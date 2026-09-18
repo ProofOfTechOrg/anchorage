@@ -38,3 +38,17 @@ describe('execution-context trust boundary', () => {
     expect(Object.hasOwn(safe, '__proto__')).toBe(false);
   });
 });
+
+describe('FS8 D3 protected replay stored authority boundary', () => {
+  it('strips a top-level original-claim lookalike while preserving application payloads', () => {
+    const payload = { startReservation: { key: 'application-key' } };
+    const context = {
+      startReservation: { key: 'authority-key', binding: { kind: 'unbound' } },
+      payload,
+    };
+    expect(stripReservedExecutionContext(context)).toEqual({ payload });
+    expect(() => assertNoReservedExecutionContext(context)).toThrow(
+      ReservedExecutionContextError,
+    );
+  });
+});
