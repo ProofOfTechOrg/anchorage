@@ -157,9 +157,12 @@ export function prerequisitePeerFloorViolations(manifests) {
 }
 
 function published(name, version) {
+  // `--prefer-online` revalidates the cached packument. Without it npm answers
+  // a poll from a cached copy that predates the publish, so the wait below
+  // would read its own stale cache for the whole deadline.
   const result = command(
     'npm',
-    ['view', `${name}@${version}`, 'version', '--json'],
+    ['view', `${name}@${version}`, 'version', '--json', '--prefer-online'],
     { capture: true },
   );
   if (result.status === 0) {
@@ -208,13 +211,48 @@ function publishPackage(target, version) {
   }
 }
 
-async function waitUntilPublished(name, version) {
-  const deadline = Date.now() + 60_000;
-  while (Date.now() < deadline) {
-    if (published(name, version)) return;
-    await new Promise((resolve) => setTimeout(resolve, 1_000));
+// npm processes a publish asynchronously: it acknowledges the tarball and
+// serves that version to `npm view` minutes later. The 2026-09-18 release
+// measured 8m32s from acceptance to visibility on the runner, and this deadline
+// is roughly 3.5x that measurement. The poll is spaced because each probe is an
+// uncached registry round trip and the wait it paces is measured in minutes, so
+// detection latency is the cheaper side of the trade.
+export const VISIBILITY_DEADLINE_MS = 30 * 60_000;
+export const VISIBILITY_POLL_MS = 15_000;
+
+/**
+ * The seams exist so the deadline and poll interval are exercised on a fake
+ * clock; `main` takes the defaults. The probe may answer synchronously, as
+ * `published` does, or with a promise; the loop awaits it.
+ *
+ * A probe that throws is a registry failure, not an answer, so it counts as
+ * not-yet-visible and the deadline still bounds the wait. The pre-publish
+ * `published` call in `publishRelease` keeps throwing instead: there, an
+ * unreadable registry must not be read as "unpublished" and republish.
+ */
+export async function waitUntilPublished(
+  name,
+  version,
+  {
+    now = Date.now,
+    sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    isPublished = published,
+  } = {},
+) {
+  const deadline = now() + VISIBILITY_DEADLINE_MS;
+  let lastProbeError;
+  while (now() < deadline) {
+    try {
+      if (await isPublished(name, version)) return;
+    } catch (error) {
+      lastProbeError = error;
+    }
+    await sleep(VISIBILITY_POLL_MS);
   }
-  throw new Error(`${name}@${version} did not become visible on npm`);
+  const cause = lastProbeError
+    ? ` (last probe error: ${lastProbeError.message})`
+    : '';
+  throw new Error(`${name}@${version} did not become visible on npm${cause}`);
 }
 
 /**
