@@ -777,9 +777,11 @@ export class ApprovalService {
    *
    * router.ts does not route it. The in-repo reconcile path calls
    * supersedeStaleAsPrincipal instead (host-kit/approval-bridge.ts); this is
-   * the ApprovalActor form of the same transition. Authorized
-   * like create() (CAN_CREATE, not CAN_REVIEW): superseding is the "un-file"
-   * half of the same filing operation, not a reviewer decision.
+   * the host-facing ApprovalActor form of the same transition, exported
+   * through `./approval-api` for hosts that file and un-file approvals under
+   * an actor. Authorized like create() (CAN_CREATE, not CAN_REVIEW):
+   * superseding is the "un-file" half of the same filing operation, not a
+   * reviewer decision.
    *
    * Returns null — mirroring the store's own CAS contract, rather than
    * throwing — when the record is unknown or already left the OPEN set (a
