@@ -131,7 +131,7 @@ for (const [argv, diagnostic] of [
   test(`rejects modes ${JSON.stringify(argv)} before world execution`, async (t) => {
     const f = fixture(t, { after: "mark('returned');" });
     const before = readFileSync(f.baselinePath);
-    const result = await run(f, argv, { flags: [] });
+    const result = await run(f, { entry: f.entry, argv: argv, flags: [] });
     assert.equal(result.status, 2, result.stderr);
     assert.equal(result.stdout, '');
     assert.equal(
@@ -146,7 +146,7 @@ for (const [argv, diagnostic] of [
 test('repeated check mode matches outside the repository without writing', async (t) => {
   const f = fixture(t);
   const before = readFileSync(f.baselinePath);
-  const result = await run(f, ['--check', '--check']);
+  const result = await run(f, { entry: f.entry, argv: ['--check', '--check'] });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, matchOutput(f));
   assert.equal(result.stderr, '');
@@ -178,7 +178,7 @@ for (const entryKind of [
       entry = join(linked, 'scripts/record.mjs');
     }
     const before = readFileSync(f.baselinePath);
-    const result = await run(f, ['--check'], { entry, flags: [] });
+    const result = await run(f, { argv: ['--check'], entry, flags: [] });
     assert.equal(result.status, 1, result.stderr);
     assert.equal(result.stdout, '');
     assert.equal(
@@ -198,7 +198,7 @@ test('an importing entry remains inert and keeps its exit status', async (t) => 
     'importer.mjs',
     `process.exitCode = 7; await import('./scripts/record.mjs');`,
   );
-  const result = await run(f, ['--write'], { entry, flags: [] });
+  const result = await run(f, { argv: ['--write'], entry, flags: [] });
   assert.equal(result.status, 7, result.stderr);
   assert.equal(result.stdout + result.stderr, '');
   assert.equal(activity(f), '');
@@ -210,7 +210,8 @@ for (const alias of [false, true]) {
     const f = fixture(t);
     if (alias) symlinkSync(f.entry, join(f.directory, '-'), 'file');
     const before = readFileSync(f.baselinePath);
-    const result = await run(f, ['--write'], {
+    const result = await run(f, {
+      argv: ['--write'],
       entry: '-',
       flags: ['--input-type=module'],
       input: `process.exitCode = 7; await import(${JSON.stringify(pathToFileURL(f.entry).href)});`,
@@ -237,14 +238,11 @@ for (const option of [
       const program = `process.exitCode = 7; void import(${JSON.stringify(pathToFileURL(f.entry).href)});`;
       const positional = matchingFile ? f.entry : 'not-a-script';
       const attached = option.endsWith('=');
-      const result = await run(
-        f,
-        attached ? ['--write'] : [positional, '--write'],
-        {
-          flags: [attached ? `${option}${program}` : option],
-          entry: attached ? positional : program,
-        },
-      );
+      const result = await run(f, {
+        argv: attached ? ['--write'] : [positional, '--write'],
+        flags: [attached ? `${option}${program}` : option],
+        entry: attached ? positional : program,
+      });
       assert.equal(result.status, 7, result.stderr);
       assert.equal(result.stdout, option.includes('p') ? 'undefined\n' : '');
       assert.equal(result.stderr, '');
@@ -262,7 +260,7 @@ test('an absent importing entry path stays inert', async (t) => {
     'importer.mjs',
     "process.exitCode = 7; process.argv[1] = 'missing-importer.mjs'; await import('./scripts/record.mjs');",
   );
-  const result = await run(f, ['--write'], { entry });
+  const result = await run(f, { argv: ['--write'], entry });
   assert.equal(result.status, 7, result.stderr);
   assert.equal(result.stdout + result.stderr, '');
   assert.equal(activity(f), '');
@@ -277,7 +275,7 @@ worker.stdout.pipe(process.stdout);
 worker.stderr.pipe(process.stderr);
 worker.on('error', error => { throw error; });
 worker.on('exit', code => { process.exitCode = code; });`;
-  const result = await run(f, [], { flags: ['-e'], entry: program });
+  const result = await run(f, { argv: [], flags: ['-e'], entry: program });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, matchOutput(f));
   assert.equal(result.stderr, '');
@@ -299,7 +297,7 @@ worker.stderr.pipe(process.stderr);
 worker.on('error', error => { throw error; });
 worker.on('exit', code => { process.exitCode = code; });`,
   );
-  const result = await run(f, [], { entry });
+  const result = await run(f, { argv: [], entry });
   assert.equal(result.status, 7, result.stderr);
   assert.equal(result.stdout + result.stderr, '');
   assert.equal(activity(f), '');
@@ -311,7 +309,7 @@ test('an absent argv entry remains inert even without a configured URL', async (
     before: 'process.argv.splice(1); process.exitCode = 7;',
     config: 'scriptUrl: undefined,',
   });
-  const result = await run(f, ['--write']);
+  const result = await run(f, { entry: f.entry, argv: ['--write'] });
   assert.equal(result.status, 7, result.stderr);
   assert.equal(result.stdout + result.stderr, '');
   assert.equal(activity(f), '');
@@ -324,7 +322,10 @@ for (const scriptUrl of [
 ]) {
   test(`rejects invalid recorder identity ${scriptUrl}`, async (t) => {
     const f = fixture(t, { config: `scriptUrl: ${scriptUrl},` });
-    assertError(await run(f), 'recorder scriptUrl must be a file URL');
+    assertError(
+      await run(f, { entry: f.entry }),
+      'recorder scriptUrl must be a file URL',
+    );
     assert.equal(activity(f), '');
   });
 }
@@ -333,7 +334,7 @@ test('a missing script URL target fails loudly', async (t) => {
   const f = fixture(t, {
     config: "scriptUrl: new URL('./missing.mjs', import.meta.url),",
   });
-  const result = await run(f);
+  const result = await run(f, { entry: f.entry });
   assert.equal(result.status, 1);
   assert.match(result.stderr, /Error: ENOENT:.*missing\.mjs/);
   assert.equal(result.stdout, '');
@@ -344,7 +345,10 @@ test('a directory script URL target fails loudly', async (t) => {
   const f = fixture(t, {
     config: "scriptUrl: new URL('./', import.meta.url),",
   });
-  assertError(await run(f), 'recorder scriptUrl must name a file');
+  assertError(
+    await run(f, { entry: f.entry }),
+    'recorder scriptUrl must name a file',
+  );
   assert.equal(activity(f), '');
 });
 
@@ -363,7 +367,7 @@ export function run() { return { value: { answer: new Box(42).value, choice } };
     );
     put(f.root, 'fixtures/choice.js', "export const choice = 'js';");
     put(f.root, 'fixtures/choice.ts', "export const choice = 'ts';");
-    const result = await run(f, ['--check'], { flags });
+    const result = await run(f, { entry: f.entry, argv: ['--check'], flags });
     assert.equal(result.status, 0, result.stderr);
     assert.equal(result.stdout, matchOutput(f));
     assert.equal(result.stderr, '');
@@ -379,7 +383,10 @@ test('transform child errors return to the parent without another world run', as
     world: "export function run() { throw new Error('WORLD_REFUSED'); }",
     after: "mark('returned');",
   });
-  assertError(await run(f, ['--check'], { flags: [] }), 'WORLD_REFUSED');
+  assertError(
+    await run(f, { entry: f.entry, argv: ['--check'], flags: [] }),
+    'WORLD_REFUSED',
+  );
   assert.equal(activity(f), 'import\nrun\nreturned\n');
 });
 
@@ -391,7 +398,7 @@ test('preserves a transform child exit status set during natural completion', as
     }`,
     after: "mark('returned');",
   });
-  const result = await run(f, ['--check'], { flags: [] });
+  const result = await run(f, { entry: f.entry, argv: ['--check'], flags: [] });
   assert.equal(result.status, 23, result.stderr);
   assert.equal(result.stdout, matchOutput(f));
   assert.equal(result.stderr, '');
@@ -403,7 +410,7 @@ test('transform child spawn errors remain failures', async (t) => {
     before:
       "Object.defineProperty(process, 'execPath', { value: '/missing-recorder-node' });",
   });
-  const result = await run(f, ['--check'], { flags: [] });
+  const result = await run(f, { entry: f.entry, argv: ['--check'], flags: [] });
   assert.equal(result.status, 1);
   assert.match(result.stderr, /spawnSync \/missing-recorder-node ENOENT/);
   assert.equal(result.stdout, '');
@@ -417,7 +424,7 @@ test('signal termination of a transform child returns failure', {
     world: "export function run() { process.kill(process.pid, 'SIGTERM'); }",
     after: "mark('returned');",
   });
-  const result = await run(f, ['--check'], { flags: [] });
+  const result = await run(f, { entry: f.entry, argv: ['--check'], flags: [] });
   assert.equal(result.status, 1);
   assert.equal(result.stdout + result.stderr, '');
   assert.equal(activity(f), 'import\nrun\nreturned\n');
@@ -440,7 +447,7 @@ for (const flags of [[], ['--experimental-transform-types']]) {
       ),
       `  value[4096]: committed 'COMMITTED_FINAL_SENTINEL' / derived 'DERIVED_FINAL_SENTINEL'`,
     ];
-    const result = await run(f, ['--check'], { flags });
+    const result = await run(f, { entry: f.entry, argv: ['--check'], flags });
     assert.equal(result.status, 1);
     assert.equal(result.stdout, '');
     assert.deepEqual(result.stderr.split('\n'), [
@@ -457,7 +464,7 @@ test('file URL imports preserve spaces, percent, query and fragment characters',
     worldModule: 'fixtures/space % # ?/world.ts',
     baselineFile: 'fixtures/space % # ?/baseline.ts',
   });
-  const result = await run(f);
+  const result = await run(f, { entry: f.entry });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, matchOutput(f));
   assert.equal(result.stderr, '');
@@ -482,7 +489,7 @@ for (const field of ['worldModule', 'baselineFile']) {
       const before = readFileSync(f.baselinePath);
       const prefix = diagnostic.startsWith('resolve') ? 'must' : 'must be a';
       assertError(
-        await run(f, ['--write']),
+        await run(f, { entry: f.entry, argv: ['--write'] }),
         `${field} ${prefix} ${diagnostic}`,
       );
       assert.equal(activity(f), '');
@@ -496,7 +503,7 @@ test('normalizes relative paths within the repository', async (t) => {
     config:
       "worldModule: './fixtures/../fixtures/world.ts', baselineFile: './fixtures/../fixtures/baseline.ts',",
   });
-  const result = await run(f);
+  const result = await run(f, { entry: f.entry });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stderr, '');
   assert.equal(activity(f), 'import\nrun\n');
@@ -504,7 +511,7 @@ test('normalizes relative paths within the repository', async (t) => {
 
 test('distinguishes a missing world from an existing world with a missing dependency', async (t) => {
   const missing = fixture(t, { config: "worldModule: 'fixtures/absent.ts'," });
-  const result = await run(missing);
+  const result = await run(missing, { entry: missing.entry });
   assert.equal(result.status, 1);
   assert.equal(result.stdout, '');
   assert.equal(result.stderr, 'fixture world is missing: fixtures/absent.ts\n');
@@ -513,7 +520,7 @@ test('distinguishes a missing world from an existing world with a missing depend
     world:
       "import './nested-missing.js'; export function run() { return { value: 42 }; }",
   });
-  const failure = await run(nested);
+  const failure = await run(nested, { entry: nested.entry });
   assert.equal(failure.status, 1);
   assert.equal(failure.stdout, '');
   assert.match(failure.stderr, /ERR_MODULE_NOT_FOUND/);
@@ -524,7 +531,7 @@ test('distinguishes a missing world from an existing world with a missing depend
 
 test('missing baseline prints an explicit write hint without creating a file', async (t) => {
   const f = fixture(t, { committed: null });
-  const result = await run(f);
+  const result = await run(f, { entry: f.entry });
   assert.equal(result.status, 1);
   assert.equal(result.stdout, '');
   assert.equal(
@@ -538,7 +545,7 @@ test('a broken committed import retains its own error', async (t) => {
   const f = fixture(t, {
     committed: "import './baseline-dependency.js'; export const BASELINE = {};",
   });
-  const result = await run(f);
+  const result = await run(f, { entry: f.entry });
   assert.equal(result.status, 1);
   assert.equal(result.stdout, '');
   assert.match(result.stderr, /baseline-dependency\.js/);
@@ -552,7 +559,7 @@ test('requires configured committed export presence even opposite undefined', as
     committed: 'export const OTHER = undefined;',
   });
   assertError(
-    await run(f),
+    await run(f, { entry: f.entry }),
     "committed export 'BASELINE': missing own property",
   );
 });
@@ -570,7 +577,7 @@ for (const mode of ['--check', '--write']) {
       });
       const before = readFileSync(f.baselinePath);
       assertError(
-        await run(f, [mode]),
+        await run(f, { entry: f.entry, argv: [mode] }),
         "derived key 'value': missing own property",
       );
       assert.deepEqual(readFileSync(f.baselinePath), before);
@@ -583,7 +590,7 @@ test('an extra unconfigured export remains outside comparison', async (t) => {
     committed:
       'export const BASELINE = { answer: 42 }; export const OTHER = new Date();',
   });
-  const result = await run(f);
+  const result = await run(f, { entry: f.entry });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, matchOutput(f));
 });
@@ -664,7 +671,7 @@ for (const [name, value, committed, differences] of [
       committed: `export const BASELINE = ${committed};`,
     });
     const before = readFileSync(f.baselinePath);
-    const result = await run(f);
+    const result = await run(f, { entry: f.entry });
     assert.equal(result.status, 1, result.stderr);
     assert.equal(result.stdout, '');
     assert.equal(
@@ -755,9 +762,10 @@ for (const [name, expression, message, suffix = ''] of unsupported) {
         committed: `export const BASELINE = ${derived ? 'null' : value};`,
       });
       const before = readFileSync(f.baselinePath);
-      const result = await run(f, [
-        side.endsWith('write') ? '--write' : '--check',
-      ]);
+      const result = await run(f, {
+        entry: f.entry,
+        argv: [side.endsWith('write') ? '--write' : '--check'],
+      });
       const location = derived
         ? "derived key 'value'"
         : "committed export 'BASELINE'";
@@ -774,7 +782,7 @@ test('rejects a configured key accessor without calling it', async (t) => {
       'export function run() { return { get value() { throw new Error("GETTER_EXECUTED"); } }; }',
   });
   assertError(
-    await run(f, ['--write']),
+    await run(f, { entry: f.entry, argv: ['--write'] }),
     "derived key 'value': expected an enumerable data property",
   );
 });
@@ -789,7 +797,7 @@ test('checks later declarations even after an earlier structural mismatch', asyn
       "exports: [{ name: 'BASELINE', key: 'value', satisfies: 'unknown' }, { name: 'SECOND', key: 'second', satisfies: 'unknown' }],",
   });
   assertError(
-    await run(f),
+    await run(f, { entry: f.entry }),
     'committed export \'SECOND\'["nested"]: expected a plain map or ordinary array',
   );
 });
@@ -809,7 +817,10 @@ test('explicit repeated write preserves literal fidelity and world source with t
       "exports: [{ name: 'BASELINE', key: 'value', satisfies: 'unknown', jsDoc: '/** Preserve key presence. */' }, { name: 'SECOND', key: 'value', satisfies: 'unknown' }],",
   });
   const before = readFileSync(f.worldPath);
-  const written = await run(f, ['--write', '--write']);
+  const written = await run(f, {
+    entry: f.entry,
+    argv: ['--write', '--write'],
+  });
   assert.equal(written.status, 0, written.stderr);
   assert.equal(written.stdout, 'wrote fixtures/baseline.ts: fixture summary\n');
   assert.equal(written.stderr, '');
@@ -821,7 +832,7 @@ test('explicit repeated write preserves literal fidelity and world source with t
   assert.doesNotMatch(source, /^undefined$/m);
   assert.match(source, /\[['"]__proto__['"]\]/);
   assert.match(source, /-0/);
-  const checked = await run(f);
+  const checked = await run(f, { entry: f.entry });
   assert.equal(checked.status, 0, checked.stderr);
   assert.equal(checked.stdout, matchOutput(f));
   assert.equal(checked.stderr, '');
@@ -841,7 +852,7 @@ assert.equal(BASELINE.numbers[3], Infinity);
 assert.equal(BASELINE.numbers[4], -Infinity);
 `,
   );
-  const imported = await run(f, [], { entry });
+  const imported = await run(f, { argv: [], entry });
   assert.equal(imported.status, 0, imported.stderr);
   assert.equal(imported.stdout + imported.stderr, '');
 });
@@ -859,7 +870,9 @@ writeFileSync(${JSON.stringify(join(f.root, 'formatter-call.json'))}, JSON.strin
 process.stderr.write('FORMATTER_REFUSED\\n'); process.exitCode = 17;\n`,
   );
   chmodSync(command, 0o755);
-  const result = await run(f, ['--write'], {
+  const result = await run(f, {
+    entry: f.entry,
+    argv: ['--write'],
     env: { PATH: `${join(f.root, 'bin')}${delimiter}${process.env.PATH}` },
   });
   assertError(result, 'biome refused the generated baseline');
@@ -875,7 +888,9 @@ process.stderr.write('FORMATTER_REFUSED\\n'); process.exitCode = 17;\n`,
 
 test('formatter spawn errors remain failures', async (t) => {
   const f = fixture(t);
-  const result = await run(f, ['--write'], {
+  const result = await run(f, {
+    entry: f.entry,
+    argv: ['--write'],
     env: { PATH: join(f.root, 'missing-bin') },
   });
   assert.equal(result.status, 1);
@@ -891,7 +906,7 @@ test('unsupported later derived declarations cannot replace an earlier valid exp
   });
   const before = readFileSync(f.baselinePath);
   assertError(
-    await run(f, ['--write']),
+    await run(f, { entry: f.entry, argv: ['--write'] }),
     "derived key 'second': expected a plain map or ordinary array",
   );
   assert.deepEqual(readFileSync(f.baselinePath), before);
@@ -903,7 +918,7 @@ test('a non-enumerable configured key is refused', async (t) => {
       'export function run() { return Object.defineProperty({}, "value", { value: 42 }); }',
   });
   assertError(
-    await run(f, ['--write']),
+    await run(f, { entry: f.entry, argv: ['--write'] }),
     "derived key 'value': expected an enumerable data property",
   );
 });
@@ -911,7 +926,7 @@ test('a non-enumerable configured key is refused', async (t) => {
 test('drains a long usage diagnostic before returning status 2', async (t) => {
   const argument = `--${'x'.repeat(64 * 1024)}`;
   const f = fixture(t);
-  const result = await run(f, [argument], { flags: [] });
+  const result = await run(f, { entry: f.entry, argv: [argument], flags: [] });
   assert.equal(result.status, 2);
   assert.equal(result.stdout, '');
   assert.equal(
@@ -926,7 +941,7 @@ test('drains a long success summary through the transform parent', async (t) => 
   const f = fixture(t, {
     config: `summary: () => ${JSON.stringify(summary)},`,
   });
-  const result = await run(f, ['--check'], { flags: [] });
+  const result = await run(f, { entry: f.entry, argv: ['--check'], flags: [] });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(
     result.stdout,
@@ -940,7 +955,7 @@ test('writes valid TypeScript for scalar literals, undefined, null and nonfinite
     world: `export function run() { return { u: undefined, n: null, nan: NaN, pos: Infinity, neg: -Infinity, zero: -0, bool: false, text: 'ok' }; }`,
     config: `exports: ['u', 'n', 'nan', 'pos', 'neg', 'zero', 'bool', 'text'].map(key => ({ name: key.toUpperCase(), key, satisfies: 'unknown' })),`,
   });
-  const written = await run(f, ['--write']);
+  const written = await run(f, { entry: f.entry, argv: ['--write'] });
   assert.equal(written.status, 0, written.stderr);
   assert.equal(written.stderr, '');
   const require = createRequire(
@@ -960,7 +975,7 @@ test('writes valid TypeScript for scalar literals, undefined, null and nonfinite
       ),
     [],
   );
-  const checked = await run(f);
+  const checked = await run(f, { entry: f.entry });
   assert.equal(checked.status, 0, checked.stderr);
   assert.equal(checked.stdout, matchOutput(f));
   assert.equal(checked.stderr, '');
@@ -969,7 +984,7 @@ test('writes valid TypeScript for scalar literals, undefined, null and nonfinite
 test('installed formatter refusal propagates for invalid generated TypeScript', async (t) => {
   const f = fixture(t, { config: "imports: 'import {'," });
   const before = readFileSync(f.worldPath);
-  const result = await run(f, ['--write']);
+  const result = await run(f, { entry: f.entry, argv: ['--write'] });
   assertError(result, 'biome refused the generated baseline');
   assert.match(result.stderr, /parse/);
   assert.deepEqual(readFileSync(f.worldPath), before);
@@ -979,10 +994,10 @@ test('string rendering preserves control characters, Unicode and lone surrogates
   const value =
     'quotes \'" backslash \\ control \0\b\f\n\r\t\v Unicode \u2028\u2029 \u{1f680} lone \ud800 \udfff';
   const f = fixture(t, { value: JSON.stringify(value) });
-  const written = await run(f, ['--write']);
+  const written = await run(f, { entry: f.entry, argv: ['--write'] });
   assert.equal(written.status, 0, written.stderr);
   assert.equal(written.stderr, '');
-  const checked = await run(f);
+  const checked = await run(f, { entry: f.entry });
   assert.equal(checked.status, 0, checked.stderr);
   assert.equal(checked.stdout, matchOutput(f));
   assert.equal(checked.stderr, '');
@@ -994,7 +1009,7 @@ test('accepts a null-prototype derived container with an own undefined key', asy
     world:
       'export function run() { return Object.assign(Object.create(null), { value: undefined }); }',
   });
-  const result = await run(f);
+  const result = await run(f, { entry: f.entry });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, matchOutput(f));
   assert.equal(result.stderr, '');

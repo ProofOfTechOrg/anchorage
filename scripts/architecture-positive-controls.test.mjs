@@ -576,7 +576,7 @@ test('every tsconfig.harness.json include entry resolves to a file', () => {
 
 const projectSelector = /--project\s+'?([^'\s]+)'?/gu;
 
-test('every vitest project a root script selects is declared', () => {
+test('space-separated --project selections in root scripts name root projects', () => {
   const { scripts } = JSON.parse(
     readFileSync(join(root, 'package.json'), 'utf8'),
   );
@@ -594,7 +594,7 @@ test('every vitest project a root script selects is declared', () => {
   for (const [script, projectName] of selections) {
     assert.ok(
       declared.has(projectName),
-      `script '${script}' selects '${projectName}', which no root vitest project config declares`,
+      `script '${script}' selects '${projectName}', absent from rootProjectNames`,
     );
   }
 });

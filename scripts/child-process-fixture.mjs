@@ -26,11 +26,18 @@ export function activity(f) {
 
 /**
  * Builds the child-process harness a `node:test` suite drives its cases with:
- * `createRoot` for a temporary repository root, `run` for one child against it.
+ * `createRoot` returns `{ root, directory, events }` for a temporary repository.
+ * `run(f, { entry, argv, flags, cwd, env, input })` requires a nonempty string
+ * entry, which can be a script path, stdin's dash, or eval program text.
  *
  * `prefix` names the temporary directory, `watchdog` labels the timeout
  * diagnostic, `scripts` lists the repository scripts each root receives, and
  * `flags` and `argv` are the child's command line either side of its entry.
+ * Children inherit the environment, then default `NODE_OPTIONS` to empty and
+ * `COREPACK_ENABLE_NETWORK` and `COREPACK_ENABLE_AUTO_PIN` to `0`. Per-call
+ * `env` overrides those defaults and inherited values.
+ * These defaults exclude inherited Node flags and keep child package-manager
+ * calls offline without Corepack pinning a version in the fixture manifest.
  */
 export function createChildProcessFixture({
   prefix,
@@ -55,15 +62,20 @@ export function createChildProcessFixture({
 
   async function run(
     f,
-    argv = defaultArgv,
     {
+      entry,
+      argv = defaultArgv,
       flags = defaultFlags,
-      entry = f.entry,
       cwd = f.directory,
       env = {},
       input,
     } = {},
   ) {
+    if (typeof entry !== 'string' || entry.length === 0) {
+      throw new TypeError(
+        'child-process fixture entry must be a nonempty string',
+      );
+    }
     const child = spawn(
       process.execPath,
       ['--no-warnings', ...flags, entry, ...argv],

@@ -13,7 +13,9 @@
  */
 
 import { readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isMainThread } from 'node:worker_threads';
 
 const contractPath = fileURLToPath(
   new URL('../src/conformance/contract.json', import.meta.url),
@@ -166,18 +168,30 @@ function main() {
   console.log(`wrote ${CONFORMANCE_CONFIG_PATH}`);
 }
 
-// Both sides are realpathed, so a symlinked invocation still resolves to this
-// module's own path. An entry path that resolves to nothing names some other
-// module, which importers of this one rely on.
-// `scripts/entry-point.mjs` holds the root form of this disposition.
-let invokedFilePath;
-try {
-  invokedFilePath =
-    process.argv[1] === undefined ? undefined : realpathSync(process.argv[1]);
-} catch (error) {
-  if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') throw error;
+// The repository's `scripts/entry-point.mjs` holds the root form; it is not
+// published, so this module carries its own.
+function isInvokedAsEntryPoint(moduleUrl) {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  if (
+    entry === '-' ||
+    (!isMainThread && !isAbsolute(entry)) ||
+    (isMainThread &&
+      process.execArgv.some((argument) =>
+        /^(?:-[ep]|--(?:eval|print)(?:=|$))/u.test(argument),
+      ))
+  )
+    return false;
+  let invokedFilePath;
+  try {
+    invokedFilePath = realpathSync(resolve(entry));
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return false;
+    throw error;
+  }
+  return invokedFilePath === realpathSync(fileURLToPath(moduleUrl));
 }
 
-if (invokedFilePath === realpathSync(fileURLToPath(import.meta.url))) {
+if (isInvokedAsEntryPoint(import.meta.url)) {
   main();
 }
