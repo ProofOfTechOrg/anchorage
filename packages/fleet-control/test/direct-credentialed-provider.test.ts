@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { existsSync, readFileSync } from 'node:fs';
-import { dirname, resolve, sep } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { readFileSync } from 'node:fs';
+import { resolve, sep } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import ts from 'typescript';
 import {
   afterEach,
   beforeAll,
@@ -17,6 +18,7 @@ import {
   openDirectProviderSession,
   singlePage,
 } from '../scripts/direct-credentialed-provider.mjs';
+import { expectBuiltDist } from './fixtures/built-dist.js';
 
 const sessions: Awaited<ReturnType<typeof openDirectProviderSession>>[] = [];
 
@@ -171,10 +173,11 @@ it('requests identity encoding for the export object GET through the native SDK'
 
 describe('the body-cancel leaf', () => {
   beforeAll(() => {
-    expect(
-      existsSync(new URL('../dist/database-export-store.js', import.meta.url)),
+    expectBuiltDist(
+      '../dist/database-export-store.js',
+      import.meta.url,
       'run pnpm --filter @proofoftech/fleet-control build before this block',
-    ).toBe(true);
+    );
   });
 
   it('hands the body and the reason to the built package on first call', async () => {
@@ -225,21 +228,17 @@ describe('the body-cancel leaf', () => {
   });
 });
 
-// The `dist/` edge the credentialed CLI entries carry is the leaf's dynamic
-// `import()`, which resolves at runtime and leaves the static module graph
-// free of `dist/`. This walk follows `from`-clause specifiers only, so it
-// permits that `import()` and refuses a static specifier that would replace
-// it. It reads the CLI's own source tree and decides nothing about what a
-// tenant artifact may import.
+// Static import and export declarations must keep the CLI entry graphs free
+// of dist targets. Dynamic imports in the body-cancel leaf and credentialed
+// CLI resolve at runtime; this control does not inspect tenant artifacts.
 describe('the credentialed CLI entry module graphs', () => {
   const packageRoot = fileURLToPath(new URL('..', import.meta.url));
-  const distPrefix = `${resolve(packageRoot, 'dist')}${sep}`;
+  const distRoot = resolve(packageRoot, 'dist');
+  const distPrefix = `${distRoot}${sep}`;
   const leaf = resolve(
     packageRoot,
     'scripts/direct-credentialed-body-cancel.mjs',
   );
-  const edge =
-    /(?:^|\n)\s*(?:import|export)[^;'"]*?\bfrom\s*['"]([^'"]+)['"]/gu;
 
   function sourceOf(file: string) {
     try {
@@ -252,22 +251,43 @@ describe('the credentialed CLI entry module graphs', () => {
     }
   }
 
-  function staticGraph(entry: string) {
+  function expectOutsideDist(target: string) {
+    expect(
+      target === distRoot || target.startsWith(distPrefix),
+      `static declaration resolves into dist: ${target}`,
+    ).toBe(false);
+  }
+
+  function staticGraph(entry: string, readSource = sourceOf) {
     const read = new Set<string>();
     const targets = new Set<string>();
     const queue = [resolve(packageRoot, entry)];
     while (queue.length > 0) {
       const file = queue.pop();
       if (file === undefined || read.has(file)) continue;
-      const source = sourceOf(file);
+      const source = readSource(file);
       if (source === undefined) continue;
       read.add(file);
-      for (const match of source.matchAll(edge)) {
-        const specifier = match[1] ?? '';
+      const parsed = ts.createSourceFile(
+        file,
+        source,
+        ts.ScriptTarget.ESNext,
+        false,
+      );
+      for (const statement of parsed.statements) {
+        if (
+          (!ts.isImportDeclaration(statement) &&
+            !ts.isExportDeclaration(statement)) ||
+          !statement.moduleSpecifier ||
+          !ts.isStringLiteral(statement.moduleSpecifier)
+        )
+          continue;
+        const specifier = statement.moduleSpecifier.text;
         if (!specifier.startsWith('./') && !specifier.startsWith('../'))
           continue;
-        const target = resolve(dirname(file), specifier);
+        const target = fileURLToPath(new URL(specifier, pathToFileURL(file)));
         targets.add(target);
+        expectOutsideDist(target);
         queue.push(target);
       }
     }
@@ -278,10 +298,77 @@ describe('the credentialed CLI entry module graphs', () => {
     'scripts/direct-credentialed-conformance.mjs',
     'scripts/credentialed-conformance.mjs',
   ])('names no dist/ specifier from %s', (entry) => {
-    const { read, targets } = staticGraph(entry);
+    const { read } = staticGraph(entry);
     expect([...read]).toContain(leaf);
-    expect(
-      [...targets].filter((target) => target.startsWith(distPrefix)),
-    ).toEqual([]);
+  });
+
+  function fixtureSource(
+    source: string,
+    nested = 'export const value = true;',
+  ) {
+    const files = new Map([
+      [resolve(packageRoot, 'scripts/graph-fixture.mjs'), source],
+      [resolve(packageRoot, 'scripts/nested.mjs'), nested],
+    ]);
+    return (file: string) => files.get(file);
+  }
+
+  it.each([
+    ['single-quoted side-effect import', "import '../dist/index.js';"],
+    ['double-quoted side-effect import', 'import "../dist/index.js";'],
+    ['from import', "import { value } from '../dist/index.js';"],
+    ['named re-export', "export { value } from '../dist/index.js';"],
+    ['star re-export', "export * from '../dist/index.js';"],
+    ['exact dist directory', "import '../dist';"],
+    ['dist directory with slash', "export * from '../dist/';"],
+    ['escaped directory', String.raw`import '../\x64ist/index.js';`],
+    [
+      'encoded directory with query and fragment',
+      "import '../%64ist/index.js?probe=1#fragment';",
+    ],
+    ['normalized dot segments', "import '../scripts/../dist/index.js';"],
+  ])('refuses %s through the graph assertion', (_name, source) => {
+    const readSource = vi.fn(fixtureSource(source));
+    expect(() => staticGraph('scripts/graph-fixture.mjs', readSource)).toThrow(
+      'static declaration resolves into dist:',
+    );
+    expect(readSource).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a dist re-export reached through a relative module', () => {
+    expect(() =>
+      staticGraph(
+        'scripts/graph-fixture.mjs',
+        fixtureSource(
+          "import './nested.mjs';",
+          "export * from '../dist/index.js';",
+        ),
+      ),
+    ).toThrow('static declaration resolves into dist:');
+  });
+
+  it('allows relative modules, dist-extra, and non-static import text', () => {
+    const source = `
+import './nested.mjs';
+export * from '../dist-extra/index.js';
+import 'a-package/dist';
+// import '../dist/comment.js';
+/* export * from '../dist/block-comment.js'; */
+const text = \`
+import '../dist/template.js';
+\`;
+void import('../dist/dynamic.js');
+`;
+    const graph = staticGraph(
+      'scripts/graph-fixture.mjs',
+      fixtureSource(source),
+    );
+    expect([...graph.read]).toContain(
+      resolve(packageRoot, 'scripts/nested.mjs'),
+    );
+    expect([...graph.targets]).toEqual([
+      resolve(packageRoot, 'scripts/nested.mjs'),
+      resolve(packageRoot, 'dist-extra/index.js'),
+    ]);
   });
 });

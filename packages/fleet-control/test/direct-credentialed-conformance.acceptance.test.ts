@@ -18,6 +18,7 @@ import {
   REFERENCE_SECRET_NAMES,
 } from '../scripts/direct-credentialed-reference-vocabulary.mjs';
 import { openDirectRunState } from '../scripts/direct-credentialed-run-state.mjs';
+import { expectBuiltDist } from './fixtures/built-dist.js';
 import {
   directBridgePreamble,
   directModuleUrl,
@@ -197,10 +198,11 @@ describe.sequential('direct credentialed CLI native offline acceptance', {
   timeout: SUITE_TIMEOUT_MS,
 }, () => {
   beforeAll(() => {
-    expect(
-      existsSync(new URL('../dist/index.js', import.meta.url)),
+    expectBuiltDist(
+      '../dist/index.js',
+      import.meta.url,
       'run pnpm --filter @proofoftech/fleet-control build before acceptance',
-    ).toBe(true);
+    );
   });
 
   it('revalidates, restarts, cleans, rereads evidence, and refuses existing runs and concurrent resumes', async () => {

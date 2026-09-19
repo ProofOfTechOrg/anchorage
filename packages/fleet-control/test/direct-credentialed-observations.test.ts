@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
 import { promisify } from 'node:util';
 import {
   afterEach,
@@ -17,6 +16,7 @@ import {
   readDirectSettlementEffects,
   verifyDirectDecommissionExport,
 } from '../scripts/direct-credentialed-observations.mjs';
+import { expectBuiltDist } from './fixtures/built-dist.js';
 import {
   directObservationFixture,
   OBSERVATION_TOKEN,
@@ -845,12 +845,11 @@ describe('normal export raw-byte proof', () => {
 
   describe('releases through the body-cancel leaf', () => {
     beforeAll(() => {
-      expect(
-        existsSync(
-          new URL('../dist/database-export-store.js', import.meta.url),
-        ),
+      expectBuiltDist(
+        '../dist/database-export-store.js',
+        import.meta.url,
         'run pnpm --filter @proofoftech/fleet-control build before this block',
-      ).toBe(true);
+      );
     });
 
     it('releases the unread export body the refusal leaves behind', async () => {

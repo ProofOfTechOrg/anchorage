@@ -314,7 +314,7 @@ function assert(condition, message) {
 function assertResponse(response, condition, message) {
   if (condition) return;
   const refusal = new Error(message);
-  cancelBodyWithoutAwait(response?.body, refusal);
+  cancelBodyWithoutAwait(response.body, refusal);
   throw refusal;
 }
 
@@ -866,7 +866,7 @@ async function assertEgressAndLimitProbes(deployment) {
     `CPU over-limit request returned ${overLimit.status}`,
   );
   // The over-limit probe reads the status alone.
-  cancelBodyWithoutAwait(overLimit?.body);
+  cancelBodyWithoutAwait(overLimit.body);
   const recovery = await contractRequest(deployment, 'cpu-control');
   assert(
     recovery.completed === true,
