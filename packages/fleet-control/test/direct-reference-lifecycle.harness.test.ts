@@ -1,13 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { createHash } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import {
+  createDirectInvocationClient,
+  DirectInvocationError,
+} from '../scripts/direct-credentialed-invocation.mjs';
+import {
+  type DirectRunJournal,
+  openDirectRunState,
+} from '../scripts/direct-credentialed-run-state.mjs';
 import { directDeploymentSpec } from '../scripts/direct-credentialed-spec.js';
 import type { DirectDecommissionExportMetadata } from '../scripts/direct-reference-lifecycle.js';
 import type { CleanupAdvanceResult } from '../src/cleanup-advance.js';
 import type { DecommissionAdvanceResult } from '../src/decommission-advance.js';
 import { deploymentSpecDigest } from '../src/spec-digest.js';
-import { directFixtureManifest } from './fixtures/direct-credentialed-config.js';
+import { directObservationFixture } from './fixtures/direct-observations.js';
 import {
   createDirectReferenceHarness,
   type DirectReferenceHarness,
@@ -642,18 +652,25 @@ describe.sequential('private force through native control state', {
   });
 
   it('preserves force witnesses and resumes settled residual cleanup after exhausting the provider budget', async () => {
-    const base = directFixtureManifest();
-    // The residual recovery runs out of this budget mid-invocation.
-    const fixture = await createDirectReferenceHarness({
-      manifest: {
-        ...base,
-        referenceRuntime: {
-          ...base.referenceRuntime,
-          maxProviderRequests: 100,
-        },
-      },
+    const local = await directObservationFixture(30_000, 'absent', {
+      invocationTimeoutMs: 600_000,
+      maxProviderRequests: 100,
     });
+    let fixture: DirectReferenceHarness | undefined;
+    let resumedJournal: DirectRunJournal | undefined;
     try {
+      fixture = await createDirectReferenceHarness({
+        manifest: local.prepared.manifest,
+        binding: {
+          version: 1,
+          accountId: 'account',
+          fleetDatabaseId: '00000000-0000-0000-0000-000000000011',
+          quotaDatabaseId: '00000000-0000-0000-0000-000000000012',
+          exportBucketName: local.prepared.names.exportBucket,
+          referenceModuleSetSha256: local.prepared.referenceModuleSetSha256,
+          accountWorkersDevSubdomain: 'direct-fixture',
+        },
+      });
       const names = fixture.manifest.names.roles.recovery;
       const environment = fixture.manifest.environment;
       const absent = await fixture.call({ kind: 'force-recovery' });
@@ -824,7 +841,35 @@ describe.sequential('private force through native control state', {
         .prepare('SELECT * FROM direct_reference_operations ORDER BY slot')
         .all();
       const exports = await fixture.exportBytes.list();
-      const exhausted = await fixture.call({ kind: 'recover-force-residual' });
+      const responses: Response[] = [];
+      const nativeFetch = fixture.fetch;
+      const clientOptions = {
+        prepared: local.prepared,
+        accountWorkersDevSubdomain: fixture.binding.accountWorkersDevSubdomain,
+        invokeSecret: 'inert-invoke',
+        fetch: (async (input, init) => {
+          const response = await nativeFetch(input, init);
+          responses.push(response.clone());
+          return response;
+        }) as typeof fetch,
+      };
+      const client = createDirectInvocationClient({
+        ...clientOptions,
+        journal: local.journal,
+      });
+      const refused = await client
+        .invoke({ kind: 'recover-force-residual' })
+        .catch((error: unknown) => error);
+      expect(refused).toBeInstanceOf(DirectInvocationError);
+      expect(refused).toMatchObject({
+        code: 'reference-refused',
+        referenceCode: 'budget-exhausted',
+        attempts: { provider: 100, maintenance: 0, application: 0 },
+      });
+      expect(responses).toHaveLength(1);
+      const response = responses[0];
+      if (!response) throw new Error('reference response is absent');
+      const exhausted = { response, value: await response.json() };
       expect(exhausted.response.status).toBe(503);
       expect(exhausted.value).toMatchObject({
         ok: false,
@@ -833,6 +878,20 @@ describe.sequential('private force through native control state', {
       expect(exhausted.response.headers.get('X-Direct-Provider-Attempts')).toBe(
         '100',
       );
+      expect(
+        exhausted.response.headers.get('X-Direct-Maintenance-Attempts'),
+      ).toBe('0');
+      expect(
+        exhausted.response.headers.get('X-Direct-Application-Attempts'),
+      ).toBe('0');
+      const journalPath = join(local.journal.directory, 'journal.json');
+      expect(JSON.parse(await readFile(journalPath, 'utf8'))).toMatchObject({
+        invocationCount: 1,
+        lastInvocation: {
+          action: { kind: 'recover-force-residual' },
+          state: 'settled',
+        },
+      });
       expect(retainedScript.present).toBe(false);
       expect(retainedScript.versions).toEqual([]);
       for (const resource of ready.applicationResources ?? [])
@@ -855,11 +914,31 @@ describe.sequential('private force through native control state', {
             .all()
         ).results,
       ).toEqual(operations.results);
+      await local.journal.close();
       await fixture.reload();
-      const recovered = await fixture.success<{
+      resumedJournal = await openDirectRunState({
+        configPath: local.configPath,
+        prepared: local.prepared,
+        accountId: 'account',
+        mode: 'resume',
+      });
+      const resumedClient = createDirectInvocationClient({
+        ...clientOptions,
+        journal: resumedJournal,
+      });
+      const recovered = (
+        await resumedClient.invoke({ kind: 'recover-force-residual' })
+      ).result as {
         returned: true;
         observation: Record<string, unknown>;
-      }>({ kind: 'recover-force-residual' });
+      };
+      expect(JSON.parse(await readFile(journalPath, 'utf8'))).toMatchObject({
+        invocationCount: 2,
+        lastInvocation: {
+          action: { kind: 'recover-force-residual' },
+          state: 'settled',
+        },
+      });
       expect(
         fixture.projection.requests.filter(
           (request) => request.method === 'DELETE',
@@ -944,7 +1023,15 @@ describe.sequential('private force through native control state', {
       );
       expect(fixture.world.exports.size).toBe(exportCount);
     } finally {
-      await fixture.close();
+      try {
+        await resumedJournal?.close();
+      } finally {
+        try {
+          await fixture?.close();
+        } finally {
+          await local.close();
+        }
+      }
     }
   });
 

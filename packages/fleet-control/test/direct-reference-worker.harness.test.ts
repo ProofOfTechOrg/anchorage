@@ -11,8 +11,10 @@ import { DIRECT_REFERENCE_PATH } from '../scripts/direct-reference-contract.mjs'
 import { directFixtureManifest } from './fixtures/direct-credentialed-config.js';
 
 const manifest = directFixtureManifest();
+const deadlineManifest = directFixtureManifest({ invocationTimeoutMs: 1000 });
 const fleetDatabaseId = '00000000-0000-0000-0000-000000000001';
 const quotaDatabaseId = '00000000-0000-0000-0000-000000000002';
+const deadlineFleetDatabaseId = '00000000-0000-0000-0000-000000000003';
 const binding = {
   version: 1,
   accountId: 'account',
@@ -55,7 +57,9 @@ import {recordDirectResource,directSettlementHost} from ${source('../scripts/dir
 import {fleetSettlementKey} from ${source('../src/settlement.ts')};
 import {deploymentSpecDigest} from ${source('../src/spec-digest.ts')};
 const manifest=${JSON.stringify(manifest)};
+const deadlineManifest=${JSON.stringify(deadlineManifest)};
 const binding=${JSON.stringify(binding)};
+const deadlineBinding=${JSON.stringify({ ...binding, fleetDatabaseId: deadlineFleetDatabaseId })};
 const secretMap=${JSON.stringify(secrets)};
 function single(result){return Response.json({success:true,errors:[],messages:[],result});}
 function page(result){return single(result);}
@@ -88,10 +92,11 @@ export default {async fetch(request,env){
   if(mode==='bad-secrets')current.DIRECT_DEPLOYMENT_SECRETS=JSON.stringify({...secretMap,a:{application:{APP_PROBE_TOKEN:'invalid'}}});
   if(mode==='auth-probe')current=new Proxy(current,{get(target,key){if(key==='FLEET_DB'||key==='QUOTA_DB'||key==='EXPORTS')throw new Error('binding touched before authentication');return Reflect.get(target,key);}});
   if(mode==='deadline'){
+    current={...current,FLEET_DB:env.DEADLINE_FLEET_DB,DIRECT_RUN_BINDING:JSON.stringify(deadlineBinding)};
     let count=0,ended=false,observedFailure=null;const oldNow=performance.now,oldSnapshot=DirectReferenceTransport.prototype.snapshot;
     Object.defineProperty(performance,'now',{configurable:true,value:()=>ended?1001:(count++===0?0:10)});
     DirectReferenceTransport.prototype.snapshot=function(){ended=true;const value=oldSnapshot.call(this);observedFailure=value.failure;return value;};
-    try{const worker=createDirectReferenceWorker({...manifest,referenceRuntime:{...manifest.referenceRuntime,invocationTimeoutMs:1000}},{fetch:provider});const response=await worker.fetch(request,current);return Response.json({status:response.status,observedFailure,body:await response.json(),providerCalls:calls.length});}
+    try{const worker=createDirectReferenceWorker(deadlineManifest,{fetch:provider});const response=await worker.fetch(request,current);return Response.json({status:response.status,observedFailure,body:await response.json(),providerCalls:calls.length});}
     finally{Object.defineProperty(performance,'now',{configurable:true,value:oldNow});DirectReferenceTransport.prototype.snapshot=oldSnapshot;}
   }
   if(mode==='residual-claims'){
@@ -173,6 +178,11 @@ export default {async fetch(request,env){
                 database_name: 'reference-quota',
                 database_id: quotaDatabaseId,
               },
+              {
+                binding: 'DEADLINE_FLEET_DB',
+                database_name: 'reference-deadline-fleet',
+                database_id: deadlineFleetDatabaseId,
+              },
             ],
             r2_buckets: [
               { binding: 'EXPORTS', bucket_name: manifest.names.exportBucket },
@@ -215,7 +225,10 @@ export default {async fetch(request,env){
         headers: { authorization },
         body: JSON.stringify({
           contractVersion: 1,
-          configSha256: manifest.configSha256,
+          configSha256:
+            mode === 'deadline'
+              ? deadlineManifest.configSha256
+              : manifest.configSha256,
           action,
         }),
       });

@@ -12,11 +12,23 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const hostModule =
   /(?:^|\/)fleet-control\/dist\/(?:export-store|wrangler-loop-backend|wrangler-plain-worker-provisioning-api|wrangler-runner)\.js$/u;
+
+export function assertDirectArtifactSourceInputs(directory, inputPaths) {
+  const sourceRoot = join(directory, 'src');
+  const sourceInputs = inputPaths.filter((path) =>
+    path.startsWith(`${sourceRoot}${sep}`),
+  );
+  assert.deepEqual(
+    [...new Set(sourceInputs)].sort(),
+    [join(sourceRoot, 'export-file-name.ts')],
+    'reference Worker source inputs must be exactly the shared receipt-key leaf',
+  );
+}
 
 export async function verifyDirectArtifactsPacked({
   consumerDirectory,
@@ -88,10 +100,7 @@ export async function verifyDirectArtifactsPacked({
       `default reference must resolve the consumer's ${entry}`,
     );
   }
-  assert.ok(
-    inputPaths.every((path) => !path.startsWith(`${join(directory, 'src')}/`)),
-    'private config host helpers must not enter the reference Worker graph',
-  );
+  assertDirectArtifactSourceInputs(directory, inputPaths);
   const mainPath = join(metadataDirectory, 'out', 'reference.js');
   const output = Object.entries(metadata.outputs).find(
     ([path]) => resolve(metadataDirectory, path) === mainPath,

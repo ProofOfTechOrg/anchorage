@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import { DIRECT_MAX_UPLOAD_BYTES } from '../scripts/direct-credentialed-conformance-preflight.mjs';
 import {
@@ -28,6 +29,52 @@ import {
 } from './fixtures/direct-credentialed-config.js';
 
 describe('direct fixture specifications', () => {
+  it.each([
+    undefined,
+    {},
+  ])('preserves the raw example digest with overrides %j', (overrides) => {
+    const raw = readFileSync(
+      new URL(
+        '../scripts/direct-credentialed-conformance.example.json',
+        import.meta.url,
+      ),
+    );
+    expect(directFixtureManifest(overrides).configSha256).toBe(
+      createHash('sha256').update(raw).digest('hex'),
+    );
+  });
+
+  it.each([
+    { maxProviderRequests: 100 },
+    { invocationTimeoutMs: 1000 },
+    { maxProviderRequests: 100, invocationTimeoutMs: 1000 },
+  ])('validates runtime overrides and digests their configuration bytes %j', (overrides) => {
+    const raw = readFileSync(
+      new URL(
+        '../scripts/direct-credentialed-conformance.example.json',
+        import.meta.url,
+      ),
+    );
+    const expected = JSON.parse(raw.toString('utf8'));
+    Object.assign(expected.referenceWorker, overrides);
+    const manifest = directFixtureManifest(overrides);
+    expect(manifest.referenceRuntime).toMatchObject(overrides);
+    expect(manifest.configSha256).toBe(
+      createHash('sha256').update(JSON.stringify(expected)).digest('hex'),
+    );
+    expect(manifest.configSha256).not.toBe(
+      directFixtureManifest().configSha256,
+    );
+  });
+
+  it.each([
+    8, 1001,
+  ])('rejects an invalid fixture provider budget %s', (maxProviderRequests) => {
+    expect(() => directFixtureManifest({ maxProviderRequests })).toThrow(
+      /referenceWorker\.maxProviderRequests/u,
+    );
+  });
+
   it.each([
     undefined,
     '',
