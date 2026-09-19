@@ -132,6 +132,7 @@ describe('connector egress conformance', () => {
         {
           entryPoint: 'globalThis.fetch',
           host: 'exfil.example',
+          cause: 'outside-runtime-fetch',
           refused: true,
         },
       ]);
@@ -427,7 +428,12 @@ describe('connector egress conformance', () => {
       expect.objectContaining({ code: 'NETWORK_IO_OUTSIDE_RUNTIME_FETCH' }),
     );
     expect(report.cases[0]?.escapes).toEqual([
-      { entryPoint: 'globalThis.fetch', host: 'exfil.example', refused: true },
+      {
+        entryPoint: 'globalThis.fetch',
+        host: 'exfil.example',
+        cause: 'outside-runtime-fetch',
+        refused: true,
+      },
     ]);
     expect(Object.getOwnPropertyDescriptor(globalThis, 'fetch')).toEqual(saved);
   });
@@ -474,7 +480,12 @@ describe('connector egress conformance', () => {
       expect.objectContaining({ code: 'NETWORK_IO_OUTSIDE_RUNTIME_FETCH' }),
     );
     expect(report.cases[0]?.escapes).toEqual([
-      { entryPoint: 'holder.fetch', host: 'exfil.example', refused: true },
+      {
+        entryPoint: 'holder.fetch',
+        host: 'exfil.example',
+        cause: 'outside-runtime-fetch',
+        refused: true,
+      },
     ]);
     expect(Object.getOwnPropertyDescriptor(holder, 'fetch')).toEqual(original);
     expect(Object.getOwnPropertyDescriptor(globalThis, 'fetch')).toEqual(saved);
@@ -641,7 +652,12 @@ describe('connector egress conformance', () => {
       }),
     ]);
     expect(report.cases[0]?.escapes).toEqual([
-      { entryPoint: 'globalThis.fetch', host: 'exfil.example', refused: true },
+      {
+        entryPoint: 'globalThis.fetch',
+        host: 'exfil.example',
+        cause: 'outside-runtime-fetch',
+        refused: true,
+      },
     ]);
     expect(report.findings[0]?.reason).not.toContain('not observed');
     expect(Object.getOwnPropertyDescriptor(globalThis, 'fetch')).toEqual(saved);
@@ -1153,7 +1169,7 @@ describe('connector egress conformance', () => {
         code: 'NETWORK_IO_OUTSIDE_RUNTIME_FETCH',
         observedAfterCase: 'capture',
         reason:
-          "connector reached policies.fetch for a host the registered egress declaration does not cover (host: exfil.example); observed after case 'capture' settled",
+          "connector reached policies.fetch directly; the harness refused it: the host is not declared (host: exfil.example); observed after case 'capture' settled",
       },
     ]);
     expect(report.findings[0]).not.toHaveProperty('case');
@@ -1215,7 +1231,7 @@ describe('connector egress conformance', () => {
       {
         code: 'NETWORK_IO_OUTSIDE_RUNTIME_FETCH',
         reason:
-          'connector reached policies.fetch for a host the registered egress declaration does not cover (host: exfil.example); observed after the probe factory returned',
+          'connector reached policies.fetch directly; the harness refused it: no egress declaration is bound (host: exfil.example); observed after the probe factory returned',
       },
     ]);
     expect(report.findings[0]).not.toHaveProperty('case');
@@ -1358,7 +1374,12 @@ describe('connector egress conformance', () => {
     // #then
     expect(refusal).toBeInstanceOf(Error);
     expect(report.cases[0]?.escapes).toEqual([
-      { entryPoint: 'globalThis.fetch', host: null, refused: true },
+      {
+        entryPoint: 'globalThis.fetch',
+        host: null,
+        cause: 'outside-runtime-fetch',
+        refused: true,
+      },
     ]);
     expect(report.findings).toEqual([
       {
@@ -2688,7 +2709,12 @@ describe('connector egress conformance', () => {
     );
     // #then
     expect(report.cases[0]?.escapes).toEqual([
-      { entryPoint: 'globalThis.fetch', host: 'exfil.example', refused: true },
+      {
+        entryPoint: 'globalThis.fetch',
+        host: 'exfil.example',
+        cause: 'outside-runtime-fetch',
+        refused: true,
+      },
     ]);
   });
 
@@ -2712,6 +2738,74 @@ describe('connector egress conformance', () => {
     expect(globalThis.fetch).toBe(saved);
   });
 
+  it.each([
+    ['unparseable-url', 'the URL is unparseable', null],
+    ['unparseable-host', 'the host is unparseable', null],
+    [
+      'no-egress-declaration',
+      'no egress declaration is bound',
+      'api.vendor.example',
+    ],
+    ['host-not-declared', 'the host is not declared', 'exfil.example'],
+  ] as const)('records the %s cause and reason for a refused base transport', async (cause, clause, host) => {
+    let factoryCalls = 0;
+    let hrefReads = 0;
+    let methodReads = 0;
+    const subject: ConnectorConformanceFactory<unknown, unknown> = (rt) => {
+      factoryCalls += 1;
+      const base = rt.policies.fetch as (
+        input: unknown,
+        init?: { readonly method?: string },
+      ) => Promise<unknown>;
+      const address =
+        cause === 'unparseable-url'
+          ? 'not-a-url'
+          : cause === 'unparseable-host'
+            ? {
+                get href() {
+                  if (++hrefReads > 2) throw new TypeError('host read refused');
+                  return 'https://api.vendor.example/path';
+                },
+              }
+            : cause === 'host-not-declared'
+              ? 'https://exfil.example/path'
+              : 'https://api.vendor.example/path';
+      const attempt = () =>
+        base(address, {
+          get method() {
+            methodReads += 1;
+            return 'GET';
+          },
+        });
+      if (cause === 'no-egress-declaration' && factoryCalls === 2) {
+        expect(attempt).toThrow(
+          'connector called the supplied base transport directly',
+        );
+      }
+      return factory(async () => {
+        if (cause !== 'no-egress-declaration') await attempt();
+        return {};
+      })(rt);
+    };
+    const report = await rejected(
+      assertConnectorConformance(subject, {
+        manifest,
+        cases: [quietCase],
+      }),
+    );
+    expect(report.cases[0]?.escapes).toEqual([
+      { entryPoint: 'policies.fetch', host, cause, refused: true },
+    ]);
+    expect(report.cases[0]?.findings).toContainEqual({
+      code: 'NETWORK_IO_OUTSIDE_RUNTIME_FETCH',
+      case: 'quiet',
+      reason: `connector reached policies.fetch directly; the harness refused it: ${clause} (host: ${host ?? 'unparseable'})`,
+    });
+    expect(report.cases[0]?.transportCalls).toBe(1);
+    expect(methodReads).toBe(0);
+    if (cause === 'unparseable-host') expect(hrefReads).toBe(3);
+  });
+
   it('records a direct call on the supplied base transport as an escape naming policies.fetch', async () => {
     // #given
     const subject: ConnectorConformanceFactory<unknown, unknown> = (rt) =>
@@ -2727,7 +2821,12 @@ describe('connector egress conformance', () => {
     );
     // #then
     expect(report.cases[0]?.escapes).toEqual([
-      { entryPoint: 'policies.fetch', host: 'exfil.example', refused: true },
+      {
+        entryPoint: 'policies.fetch',
+        host: 'exfil.example',
+        cause: 'host-not-declared',
+        refused: true,
+      },
     ]);
     expect(report.cases[0]?.findings).toContainEqual(
       expect.objectContaining({
@@ -2792,7 +2891,7 @@ describe('connector egress conformance', () => {
     expect(report.findings).toContainEqual({
       code: 'NETWORK_IO_OUTSIDE_RUNTIME_FETCH',
       reason:
-        'connector reached policies.fetch for a host the registered egress declaration does not cover (host: exfil.example)',
+        'connector reached policies.fetch directly; the harness refused it: no egress declaration is bound (host: exfil.example)',
     });
     expect(report.findings).toContainEqual(
       expect.objectContaining({ code: 'FACTORY_FAILED' }),

@@ -599,27 +599,33 @@ test('every vitest project a root script selects is declared', () => {
   }
 });
 
-test('the scripts index lists exactly the files beside it', () => {
-  const indexPath = 'scripts/CLAUDE.md';
-  const lines = readFileSync(join(root, indexPath), 'utf8').split('\n');
-  const heading = lines.indexOf('## Contents');
-  assert.notEqual(heading, -1, `${indexPath} holds no '## Contents' section`);
-  const rest = lines.slice(heading + 1);
-  const next = rest.findIndex((line) => line.startsWith('## '));
-  const listed = rest
-    .slice(0, next === -1 ? rest.length : next)
-    .filter((line) => line.startsWith('- '))
-    .map((line) => {
-      const named = /^- \[?`([^`]+)`/u.exec(line);
-      assert.ok(named, `${indexPath} lists an entry without a name: ${line}`);
-      return named[1];
-    });
-  // The list names files. A directory under `scripts/` is outside its claim.
-  const present = readdirSync(join(root, 'scripts'), { withFileTypes: true })
-    .filter((entry) => entry.isFile() && entry.name !== 'CLAUDE.md')
-    .map((entry) => entry.name);
-  assert.deepEqual([...listed].sort(), [...present].sort());
-});
+for (const [directory, section] of [
+  ['scripts', '## Contents'],
+  ['packages/breakwater/src/agent', '# Guarded agent navigation'],
+  ['packages/breakwater/src/audit', '# Audit navigation'],
+]) {
+  test(`the ${directory} index lists exactly the files beside it`, () => {
+    const indexPath = `${directory}/CLAUDE.md`;
+    const lines = readFileSync(join(root, indexPath), 'utf8').split('\n');
+    const heading = lines.indexOf(section);
+    assert.notEqual(heading, -1, `${indexPath} holds no '${section}' section`);
+    const rest = lines.slice(heading + 1);
+    const next = rest.findIndex((line) => line.startsWith('## '));
+    const listed = rest
+      .slice(0, next === -1 ? rest.length : next)
+      .filter((line) => line.startsWith('- '))
+      .map((line) => {
+        const named = /^- \[?`([^`]+)`/u.exec(line);
+        assert.ok(named, `${indexPath} lists an entry without a name: ${line}`);
+        return named[1];
+      });
+    // The index covers files beside it, excluding subdirectories.
+    const present = readdirSync(join(root, directory), { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name !== 'CLAUDE.md')
+      .map((entry) => entry.name);
+    assert.deepEqual([...listed].sort(), [...present].sort());
+  });
+}
 
 for (const [ruleName, fixture] of Object.entries(controls)) {
   test(`${ruleName} rejects its positive control`, () => {

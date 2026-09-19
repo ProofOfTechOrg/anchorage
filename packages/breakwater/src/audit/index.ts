@@ -52,11 +52,11 @@ export interface AgentAuditContext {
   delegatedBy?: string;
 }
 
-// `agentId` and `entryPath` are required and read by name below; the rest are
-// what the copy loop walks.
+const AGENT_AUDIT_REQUIRED_FIELDS = ['agentId', 'entryPath'] as const;
+
 type AgentAuditOptionalField = Exclude<
   keyof AgentAuditContext,
-  'agentId' | 'entryPath'
+  (typeof AGENT_AUDIT_REQUIRED_FIELDS)[number]
 >;
 
 // Exhaustive over those members: one the interface gains is a missing property
@@ -90,17 +90,17 @@ export function agentAuditContextFromRequestContext(
   if (!value || typeof value !== 'object') return undefined;
   try {
     const candidate = value as Record<string, unknown>;
-    if (
-      typeof candidate.agentId !== 'string' ||
-      candidate.agentId.length === 0 ||
-      typeof candidate.entryPath !== 'string' ||
-      candidate.entryPath.length === 0
-    ) {
-      return undefined;
+    for (const field of AGENT_AUDIT_REQUIRED_FIELDS) {
+      if (
+        typeof candidate[field] !== 'string' ||
+        candidate[field].length === 0
+      ) {
+        return undefined;
+      }
     }
     const context: AgentAuditContext = {
-      agentId: candidate.agentId,
-      entryPath: candidate.entryPath,
+      agentId: candidate.agentId as string,
+      entryPath: candidate.entryPath as string,
     };
     for (const field of AGENT_AUDIT_OPTIONAL_FIELDS) {
       const fieldValue = candidate[field];

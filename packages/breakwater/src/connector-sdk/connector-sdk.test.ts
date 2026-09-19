@@ -600,9 +600,23 @@ describe('connector id validation', () => {
   });
 });
 
-// Counts createConnector's reads of one caller-supplied `config` member. An
-// accessor answers each read itself, so a member read twice can give the
-// refusal check one value and the construction that follows another.
+function countingAccessor<T extends object>(
+  target: T,
+  field: keyof T,
+): () => number {
+  const value = target[field];
+  let reads = 0;
+  Object.defineProperty(target, field, {
+    configurable: true,
+    enumerable: true,
+    get() {
+      reads += 1;
+      return value;
+    },
+  });
+  return () => reads;
+}
+
 function countingConfig(
   field: keyof ConnectorConfig,
   overrides: Partial<ConnectorConfig> = {},
@@ -614,35 +628,15 @@ function countingConfig(
     permissions: { sideEffect: 'write' },
     ...overrides,
   };
-  const value = config[field];
-  let reads = 0;
-  Object.defineProperty(config, field, {
-    configurable: true,
-    enumerable: true,
-    get() {
-      reads += 1;
-      return value;
-    },
-  });
-  return { config, reads: () => reads };
+  return { config, reads: countingAccessor(config, field) };
 }
 
-// The same count over one caller-supplied `policies` member.
 function countingPolicies(
   field: keyof ConnectorPolicies,
   overrides: Partial<ConnectorConfig> = {},
 ): { config: ConnectorConfig; reads: () => number } {
   const policies: ConnectorPolicies = { ...overrides.policies };
-  const value = policies[field];
-  let reads = 0;
-  Object.defineProperty(policies, field, {
-    configurable: true,
-    enumerable: true,
-    get() {
-      reads += 1;
-      return value;
-    },
-  });
+  const reads = countingAccessor(policies, field);
   const config: ConnectorConfig = {
     id: 'salesforce.createContact',
     description: 'Create a Salesforce contact',
@@ -651,100 +645,81 @@ function countingPolicies(
     ...overrides,
     policies,
   };
-  return { config, reads: () => reads };
+  return { config, reads };
 }
 
+const CONFIG_READ_CASES: Record<
+  keyof ConnectorConfig,
+  Partial<ConnectorConfig> | null
+> = {
+  id: {},
+  permissions: {},
+  inputSchema: { inputSchema: z.unknown() },
+  outputSchema: { outputSchema: z.unknown() },
+  dryRunExecute: {
+    dryRunExecute: async () => ({ ok: true }),
+    permissions: { sideEffect: 'write', dryRun: true },
+  },
+  description: null,
+  execute: null,
+  policies: null,
+};
+
+const POLICY_READ_CASES: Record<
+  keyof ConnectorPolicies,
+  Partial<ConnectorConfig> | null
+> = {
+  idempotencyStore: {
+    permissions: { sideEffect: 'write', idempotencyKey: true },
+    policies: { idempotencyStore: new InMemoryIdempotencyStore() },
+  },
+  idempotencyKeyMigration: {
+    policies: { idempotencyKeyMigration: 'legacy-writers-drained' },
+  },
+  rateLimitStore: {
+    permissions: { sideEffect: 'write', rateLimit: '2/min' },
+    policies: { rateLimitStore: new InMemoryRateLimitStore() },
+  },
+  networkEgress: {
+    policies: { networkEgress: { allowedDomains: ['api.salesforce.com'] } },
+  },
+  // These members stay inline because construction reads them once.
+  fetch: null,
+  requireEgressEnforcement: null,
+  evaluators: null,
+  writePermissions: null,
+  // The preset validator captures the audit binding.
+  audit: null,
+};
+
 describe('caller-supplied member reads', () => {
-  it('reads config.permissions once for the required-permission check and the manifest', () => {
-    // #given
-    const { config, reads } = countingConfig('permissions');
-
-    // #when
-    createConnectorBase(config);
-
-    // #then
-    expect(reads()).toBe(1);
-  });
-
-  it('reads config.inputSchema once', () => {
-    // #given
-    const { config, reads } = countingConfig('inputSchema', {
-      inputSchema: z.unknown(),
+  // The rule is "the members createConnectorBase hoists into a local before
+  // using them more than once". A further hoist needs a fixture in the records
+  // above; their keys require classification when the public interfaces grow.
+  // invokeConnector's toolCallId case covers its check and call-identity local.
+  for (const [field, overrides] of Object.entries(CONFIG_READ_CASES)) {
+    if (overrides === null) continue;
+    it(`reads config.${field} once`, () => {
+      const { config, reads } = countingConfig(
+        field as keyof ConnectorConfig,
+        overrides,
+      );
+      createConnectorBase(config);
+      expect(reads()).toBe(1);
     });
+  }
 
-    // #when / #then
-    createConnectorBase(config);
-    expect(reads()).toBe(1);
-  });
-
-  it('reads config.outputSchema once', () => {
-    // #given
-    const { config, reads } = countingConfig('outputSchema', {
-      outputSchema: z.unknown(),
+  for (const [field, overrides] of Object.entries(POLICY_READ_CASES)) {
+    if (overrides === null) continue;
+    it(`reads policies.${field} once at construction`, () => {
+      const { config, reads } = countingPolicies(
+        field as keyof ConnectorPolicies,
+        overrides,
+      );
+      createConnectorBase(config);
+      expect(reads()).toBe(1);
     });
-
-    // #when / #then
-    createConnectorBase(config);
-    expect(reads()).toBe(1);
-  });
-
-  it('reads config.dryRunExecute once for both construction checks', () => {
-    // #given
-    const { config, reads } = countingConfig('dryRunExecute', {
-      dryRunExecute: async () => ({ ok: true }),
-      permissions: { sideEffect: 'write', dryRun: true },
-    });
-
-    // #when / #then
-    createConnectorBase(config);
-    expect(reads()).toBe(1);
-  });
-
-  it('reads policies.idempotencyStore once', () => {
-    // #given
-    const { config, reads } = countingPolicies('idempotencyStore', {
-      permissions: { sideEffect: 'write', idempotencyKey: true },
-      policies: { idempotencyStore: new InMemoryIdempotencyStore() },
-    });
-
-    // #when / #then
-    createConnectorBase(config);
-    expect(reads()).toBe(1);
-  });
-
-  it('reads policies.idempotencyKeyMigration once at construction', () => {
-    // #given
-    const { config, reads } = countingPolicies('idempotencyKeyMigration', {
-      policies: { idempotencyKeyMigration: 'legacy-writers-drained' },
-    });
-
-    // #when / #then
-    createConnectorBase(config);
-    expect(reads()).toBe(1);
-  });
-
-  it('reads policies.rateLimitStore once', () => {
-    // #given
-    const { config, reads } = countingPolicies('rateLimitStore', {
-      permissions: { sideEffect: 'write', rateLimit: '2/min' },
-      policies: { rateLimitStore: new InMemoryRateLimitStore() },
-    });
-
-    // #when / #then
-    createConnectorBase(config);
-    expect(reads()).toBe(1);
-  });
-
-  it('reads policies.networkEgress once', () => {
-    // #given
-    const { config, reads } = countingPolicies('networkEgress', {
-      policies: { networkEgress: { allowedDomains: ['api.salesforce.com'] } },
-    });
-
-    // #when / #then
-    createConnectorBase(config);
-    expect(reads()).toBe(1);
-  });
+  }
 
   it('reads invokeConnector toolCallId once for its check and the call identity', async () => {
     // #given

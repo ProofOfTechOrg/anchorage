@@ -68,6 +68,12 @@ export interface ConnectorConformanceEscape {
   readonly entryPoint: string;
   /** Hostname only; null when the argument yielded no parseable URL. */
   readonly host: string | null;
+  readonly cause:
+    | 'unparseable-url'
+    | 'unparseable-host'
+    | 'no-egress-declaration'
+    | 'host-not-declared'
+    | 'outside-runtime-fetch';
   /** Every recorded escape was refused; the record is written before the refusal. */
   readonly refused: true;
 }
@@ -345,7 +351,12 @@ function trap(
   escapes: PhaseSink<ConnectorConformanceEscape>,
 ) {
   return (...args: readonly unknown[]): never => {
-    escapes.record({ entryPoint, host: hostOf(args[0]), refused: true });
+    escapes.record({
+      entryPoint,
+      host: hostOf(args[0]),
+      cause: 'outside-runtime-fetch',
+      refused: true,
+    });
     throw new ConformanceRefusal(`connector reached ${entryPoint}`);
   };
 }
@@ -410,9 +421,18 @@ function createCaseTransport(
       declared === undefined ||
       !egressDomainAllowed(host, declared)
     ) {
+      const cause =
+        url === null
+          ? 'unparseable-url'
+          : host === null
+            ? 'unparseable-host'
+            : declared === undefined
+              ? 'no-egress-declaration'
+              : 'host-not-declared';
       escapes.record({
         entryPoint: POLICIES_FETCH_LABEL,
         host,
+        cause,
         refused: true,
       });
       throw new ConformanceRefusal(
@@ -962,6 +982,17 @@ function raceTimeout(
   });
 }
 
+const ESCAPE_CAUSE_DESCRIPTIONS: Record<
+  ConnectorConformanceEscape['cause'],
+  string
+> = {
+  'unparseable-url': 'the URL is unparseable',
+  'unparseable-host': 'the host is unparseable',
+  'no-egress-declaration': 'no egress declaration is bound',
+  'host-not-declared': 'the host is not declared',
+  'outside-runtime-fetch': 'the entry point is outside runtime.fetch',
+};
+
 function escapeFinding(
   attempt: ConnectorConformanceEscape,
 ): ConnectorConformanceFinding {
@@ -973,7 +1004,7 @@ function escapeFinding(
     // instrument the connector was not given, which is the bypass.
     reason:
       attempt.entryPoint === POLICIES_FETCH_LABEL
-        ? `connector reached ${attempt.entryPoint} for a host the registered egress declaration does not cover (host: ${attempt.host ?? 'unparseable'})`
+        ? `connector reached ${attempt.entryPoint} directly; the harness refused it: ${ESCAPE_CAUSE_DESCRIPTIONS[attempt.cause]} (host: ${attempt.host ?? 'unparseable'})`
         : `connector reached ${attempt.entryPoint} outside runtime.fetch (host: ${attempt.host ?? 'unparseable'})`,
   };
 }

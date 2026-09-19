@@ -5,8 +5,8 @@
 //
 // A type-only leaf, so the preset, the D1 stores, the key migration and the
 // conformance harness take these declarations without importing the barrel.
-// That need is the criterion for what moves here; a declaration the barrel
-// alone consumes stays in the barrel.
+// That need, or a reference from a declaration in this leaf, is the criterion
+// for what moves here; a declaration the barrel alone consumes stays there.
 //
 // `AuditLogger` arrives from the `../audit/index.js` barrel rather than from a
 // leaf because audit publishes it as a class. The edge is admissible while
