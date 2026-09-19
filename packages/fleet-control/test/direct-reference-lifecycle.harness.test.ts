@@ -3,7 +3,7 @@
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import {
   createDirectInvocationClient,
   DirectInvocationError,
@@ -563,6 +563,116 @@ describe.sequential('private force through native control state', {
     ).toBe(true);
     return { ready, receipt };
   }
+
+  it.each([
+    'metadata',
+    'SDK timeout',
+  ] as const)('settles a native %s refusal through the real client', async (kind) => {
+    const local = await directObservationFixture(1000, 'absent', {
+      invocationTimeoutMs: 600_000,
+    });
+    let fixture: DirectReferenceHarness | undefined;
+    let restore: (() => void) | undefined;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const held: Promise<Response>[] = [];
+    const responses: Response[] = [];
+    let intercepted = 0;
+    try {
+      fixture = await createDirectReferenceHarness({
+        manifest: local.prepared.manifest,
+        binding: {
+          version: 1,
+          accountId: 'account',
+          fleetDatabaseId: '00000000-0000-0000-0000-000000000011',
+          quotaDatabaseId: '00000000-0000-0000-0000-000000000012',
+          exportBucketName: local.prepared.names.exportBucket,
+          referenceModuleSetSha256: local.prepared.referenceModuleSetSha256,
+          accountWorkersDevSubdomain: 'direct-fixture',
+        },
+      });
+      const { ready } = await readyRecovery(fixture);
+      await fixture.success({ kind: 'force-recovery' });
+      await fixture.success({ kind: 'force-observe' });
+      const resource = ready.applicationResources?.[0];
+      if (!resource)
+        throw new Error('native refusal needs an application bucket');
+      const original = fixture.projection.fetch;
+      const spy = vi
+        .spyOn(fixture.projection, 'fetch')
+        .mockImplementation(async (input, init) => {
+          const request = new Request(input, init);
+          const response = await original(input, init);
+          const url = new URL(request.url);
+          if (
+            request.method !== 'GET' ||
+            url.origin !== 'https://api.cloudflare.com' ||
+            url.pathname !==
+              `/client/v4/accounts/account/r2/buckets/${resource.bucketName}` ||
+            request.headers.get('cf-r2-jurisdiction') !== resource.jurisdiction
+          )
+            return response;
+          intercepted++;
+          if (kind === 'metadata') {
+            const body = (await response.json()) as {
+              result: Record<string, unknown>;
+            };
+            body.result.creation_date = 'invalid';
+            const headers = new Headers(response.headers);
+            headers.delete('content-length');
+            return Response.json(body, { status: response.status, headers });
+          }
+          const pending = gate.then(() => response);
+          held.push(pending);
+          void pending.catch(() => {});
+          return pending;
+        });
+      restore = () => spy.mockRestore();
+      const nativeFetch = fixture.fetch;
+      const client = createDirectInvocationClient({
+        prepared: local.prepared,
+        journal: local.journal,
+        accountWorkersDevSubdomain: 'direct-fixture',
+        invokeSecret: 'inert-invoke',
+        fetch: (async (input, init) => {
+          const response = await nativeFetch(input, init);
+          responses.push(response.clone());
+          return response;
+        }) as typeof fetch,
+      });
+      const error = await client
+        .invoke({ kind: 'recover-force-residual' })
+        .catch((value: unknown) => value);
+      expect(intercepted).toBeGreaterThan(0);
+      expect(error).toMatchObject({
+        code: 'reference-refused',
+        referenceCode: 'operation-refused',
+      });
+      expect(responses).toHaveLength(1);
+      expect(responses[0]?.status).toBe(409);
+      expect(await responses[0]?.json()).toEqual({
+        contractVersion: 1,
+        ok: false,
+        error: { code: 'operation-refused' },
+      });
+      expect(
+        JSON.parse(
+          await readFile(join(local.journal.directory, 'journal.json'), 'utf8'),
+        ).lastInvocation.state,
+      ).toBe('settled');
+      expect(fixture.bridgeErrors).toEqual([]);
+    } finally {
+      restore?.();
+      release();
+      const settled = await Promise.allSettled(held);
+      await local.close();
+      await fixture?.close();
+      for (const result of settled) expect(result.status).toBe('fulfilled');
+      expect(fixture?.bridgeErrors ?? []).toEqual([]);
+    }
+  });
 
   it.each([
     'fence',

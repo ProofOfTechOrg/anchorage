@@ -13,6 +13,10 @@ import {
   handleDirectReferenceHttpRequest,
 } from '../scripts/direct-reference-http.js';
 import { DirectReferenceJournalError } from '../scripts/direct-reference-journal.js';
+import {
+  providerRefusalCases,
+  undispatchedCause,
+} from './fixtures/direct-provider-errors.js';
 
 const configSha256 = 'a'.repeat(64);
 const invokeSecret = 'direct-test-secret';
@@ -47,6 +51,105 @@ function fixture(overrides: Partial<DirectReferenceHttpOptions> = {}) {
 }
 
 describe('direct reference HTTP boundary', () => {
+  it.each(
+    providerRefusalCases,
+  )('classifies producer $name without exposing its payload', async ({
+    produce,
+  }) => {
+    const error = await produce();
+    const { handle, dispatch } = fixture();
+    dispatch.mockRejectedValue(error);
+    const response = await handle(request());
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({
+      contractVersion: 1,
+      ok: false,
+      error: { code: 'operation-refused' },
+    });
+    expect(response.headers.get('cache-control')).toBe('no-store');
+  });
+
+  it.each([
+    ['unwrapped cause', undispatchedCause],
+    [
+      'early match invariant',
+      new Error('complete attachment scan returned an early match'),
+    ],
+    [
+      'R2 suffix',
+      new Error("R2 returned incomplete metadata for 'fixture-bucket' secret"),
+    ],
+    [
+      'R2 newline',
+      new Error("R2 returned incomplete metadata for 'fixture-bucket'\n"),
+    ],
+    [
+      'date newline',
+      new Error("R2 bucket 'fixture-bucket' has no valid creation date\n"),
+    ],
+    ['illegal bucket', new Error("R2 returned incomplete metadata for '-bad'")],
+    [
+      'oversize bucket',
+      new Error(`R2 returned incomplete metadata for '${'a'.repeat(64)}'`),
+    ],
+    [
+      'wrong class',
+      new TypeError("R2 returned incomplete metadata for 'fixture-bucket'"),
+    ],
+    [
+      'plain object',
+      {
+        name: 'CloudflareAttachmentScanDriftError',
+        message:
+          'Cloudflare attachment inventory changed during a resumable scan',
+      },
+    ],
+    ...[
+      'CloudflareAttachmentScanDriftError',
+      'CloudflareAttachmentScanProgressError',
+      'CloudflareProviderRequestNotDispatchedError',
+      'APIConnectionTimeoutError',
+      'TimeoutError',
+    ].map((name) => [
+      name,
+      Object.assign(new Error('private-token'), { name }),
+    ]),
+    ...['name', 'message'].map((property) => [
+      `${property} getter`,
+      Object.defineProperty(new Error('private-token'), property, {
+        get() {
+          throw new Error('private getter');
+        },
+      }),
+    ]),
+  ])('keeps foreign provider near miss %s at fixed 500', async (_label, error) => {
+    const { handle, dispatch } = fixture();
+    dispatch.mockRejectedValue(error);
+    const response = await handle(request());
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({
+      contractVersion: 1,
+      ok: false,
+      error: { code: 'operation-refused' },
+    });
+  });
+
+  it('snapshots signature properties once', async () => {
+    const error = await providerRefusalCases[2].produce();
+    const name = error.name,
+      message = error.message;
+    const readName = vi.fn(() => name),
+      readMessage = vi.fn(() => message);
+    Object.defineProperties(error, {
+      name: { get: readName },
+      message: { get: readMessage },
+    });
+    const { handle, dispatch } = fixture();
+    dispatch.mockRejectedValue(error);
+    expect((await handle(request())).status).toBe(409);
+    expect(readName).toHaveBeenCalledTimes(1);
+    expect(readMessage).toHaveBeenCalledTimes(1);
+  });
   it('uses a trusted shared start time through response serialization', async () => {
     const now = vi.spyOn(performance, 'now').mockReturnValue(10);
     try {

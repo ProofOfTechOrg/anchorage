@@ -4,6 +4,7 @@ import {
   bearerActorAuthenticator,
   staticTokenVerifier,
 } from '@proofoftech/flowsafe/host-kit';
+import { APIConnectionTimeoutError } from 'cloudflare';
 import {
   DIRECT_REFERENCE_PATH,
   type DirectReferenceAction,
@@ -105,8 +106,32 @@ function failureFromException(error: unknown): Response {
       const status = statuses[code];
       if (status !== undefined) return failure(code, status);
     }
+    if (error instanceof Error || error instanceof DOMException) {
+      const name = error.name;
+      const message = error.message;
+      if (
+        error instanceof APIConnectionTimeoutError ||
+        (error instanceof DOMException && name === 'TimeoutError') ||
+        (name === 'CloudflareAttachmentScanDriftError' &&
+          message ===
+            'Cloudflare attachment inventory changed during a resumable scan') ||
+        (name === 'CloudflareAttachmentScanProgressError' &&
+          message === 'Cloudflare attachment scan progress is malformed') ||
+        (name === 'CloudflareProviderRequestNotDispatchedError' &&
+          message === 'Cloudflare provider request was not dispatched') ||
+        (name === 'Error' &&
+          typeof message === 'string' &&
+          (/^R2 returned incomplete metadata for '[a-z0-9][a-z0-9-]{1,61}[a-z0-9]'$(?![\s\S])/u.test(
+            message,
+          ) ||
+            /^R2 bucket '[a-z0-9][a-z0-9-]{1,61}[a-z0-9]' has no valid creation date$(?![\s\S])/u.test(
+              message,
+            )))
+      )
+        return failure('operation-refused', 409);
+    }
   } catch {
-    // Class and code inspection can invoke traps on a foreign rejection.
+    // Error inspection can invoke traps on a foreign rejection.
   }
   return failure('operation-refused', 500);
 }
