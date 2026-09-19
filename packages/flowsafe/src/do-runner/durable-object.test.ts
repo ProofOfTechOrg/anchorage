@@ -4293,10 +4293,8 @@ describe('DurableObjectRunner suspension deadlines', () => {
       }),
     );
 
-    // #then — retryable, and no second run: a 500 (`has no matching committed
-    // owner`) is what this route gives when the same recovery deletes the row
-    // and releases its claim behind the lagging read. The journal survives for
-    // a wake that can read it.
+    // #then — a retryable 503 (`state is not readable`), and no second run.
+    // The journal survives for a wake that can read it.
     expect(response.status).toBe(503);
     await expect(response.json()).resolves.toMatchObject({
       error: expect.stringContaining('state is not readable'),
@@ -6029,10 +6027,9 @@ describe('DurableObjectRunner suspension deadlines', () => {
     ['an empty runId', 'timed:'],
     ['an empty workflowId', ':run'],
   ])('never lets an object name with %s steer a status read on a no-record wake', async (_label, name) => {
-    // 'a/b:c' splits into status('a/b', 'c') unless the name is validated:
-    // every other entry point validates with isPathSafeId before touching the
-    // runtime, and a record written from an unvalidated name would discard
-    // itself on read-back. The other four shapes are skipped — regression pins.
+    // 'a/b:c' splits into status('a/b', 'c') unless the name is validated;
+    // a record written from an unvalidated name would discard itself on
+    // read-back. The other four shapes are skipped — regression pins.
     const events: string[] = [];
     const { storage } = durableKeyValueStorageFixture(events);
     const state = { id: { name }, storage } as unknown as DurableObjectState;
