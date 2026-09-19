@@ -50,6 +50,10 @@ import {
   single,
 } from './cloudflare-fetch-fixture.js';
 import { directFixtureManifest } from './direct-credentialed-config.js';
+import type {
+  directForceBudgetProbe,
+  ForceBudgetStage,
+} from './direct-force-budget-probe.js';
 import {
   type D1State,
   deploymentIdentity,
@@ -857,11 +861,17 @@ export async function createDirectReferenceHarness(
     const workerSource = fileURLToPath(
       new URL('../../scripts/direct-reference-worker.ts', import.meta.url),
     );
+    const budgetProbeSource = fileURLToPath(
+      new URL('./direct-force-budget-probe.ts', import.meta.url),
+    );
     await writeFile(
       main,
       `import {createDirectReferenceWorker} from ${JSON.stringify(workerSource)};
-const worker=createDirectReferenceWorker(${JSON.stringify(manifest)},{fetch:async(input,init)=>{const request=new Request(input,init);if(request.url==='data:,')return fetch(request);const headers=new Headers(request.headers);headers.set('X-Direct-Fixture-Url',request.url);return fetch('http://127.0.0.1:${address.port}/',{method:request.method,headers,body:request.body,signal:request.signal,redirect:'manual'});}});
-let instance; export default {async fetch(request,env){instance??=crypto.randomUUID();const response=await worker.fetch(request,{...env,CLOUDFLARE_API_TOKEN:'inert-provider-token',FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET:'inert-invoke',DIRECT_RUN_BINDING:${JSON.stringify(JSON.stringify(binding))},DIRECT_DEPLOYMENT_SECRETS:${JSON.stringify(JSON.stringify(secrets))}});response.headers.set('X-Fixture-Instance',instance);return response;}};`,
+import {directForceBudgetProbe} from ${JSON.stringify(budgetProbeSource)};
+const manifest=${JSON.stringify(manifest)};
+const providerFetch=async(input,init)=>{const request=new Request(input,init);if(request.url==='data:,')return fetch(request);const headers=new Headers(request.headers);headers.set('X-Direct-Fixture-Url',request.url);return fetch('http://127.0.0.1:${address.port}/',{method:request.method,headers,body:request.body,signal:request.signal,redirect:'manual'});};
+const worker=createDirectReferenceWorker(manifest,{fetch:providerFetch});
+let instance; export default {async fetch(request,env){instance??=crypto.randomUUID();const current={...env,CLOUDFLARE_API_TOKEN:'inert-provider-token',FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET:'inert-invoke',DIRECT_RUN_BINDING:${JSON.stringify(JSON.stringify(binding))},DIRECT_DEPLOYMENT_SECRETS:${JSON.stringify(JSON.stringify(secrets))}};const response=new URL(request.url).pathname==='/__fixture/force-budget'?Response.json(await directForceBudgetProbe(manifest,current,(await request.json()).stage,providerFetch,request.signal)):await worker.fetch(request,current);response.headers.set('X-Fixture-Instance',instance);return response;}};`,
     );
     const options = {
       root: directory,
@@ -1011,6 +1021,20 @@ let instance; export default {async fetch(request,env){instance??=crypto.randomU
       } as RequestInit);
     }) as typeof fetch,
     call,
+    async forceBudgetProbe(stage: ForceBudgetStage) {
+      const response = await server
+        .getWorker()
+        .fetch('https://reference.test/__fixture/force-budget', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ stage }),
+        });
+      if (!response.ok)
+        throw new Error(`force budget probe failed: ${await response.text()}`);
+      return response.json() as Promise<
+        Awaited<ReturnType<typeof directForceBudgetProbe>>
+      >;
+    },
     success,
     journal,
     reload,

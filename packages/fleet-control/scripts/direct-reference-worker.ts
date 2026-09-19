@@ -212,6 +212,11 @@ export function createDirectReferenceWorker(
           let result: unknown;
           try {
             result = await dispatch(context, manifest, action, signal);
+          } catch (error) {
+            if (context.transport.snapshot().failure === 'attempts') {
+              context.transport.assertWithinBudget();
+            }
+            throw error;
           } finally {
             metrics = context.transport.snapshot();
           }

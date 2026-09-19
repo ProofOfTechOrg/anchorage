@@ -17,6 +17,7 @@ import type { DirectDecommissionExportMetadata } from '../scripts/direct-referen
 import type { CleanupAdvanceResult } from '../src/cleanup-advance.js';
 import type { DecommissionAdvanceResult } from '../src/decommission-advance.js';
 import { deploymentSpecDigest } from '../src/spec-digest.js';
+import { directFixtureManifest } from './fixtures/direct-credentialed-config.js';
 import { directObservationFixture } from './fixtures/direct-observations.js';
 import {
   createDirectReferenceHarness,
@@ -562,6 +563,79 @@ describe.sequential('private force through native control state', {
     ).toBe(true);
     return { ready, receipt };
   }
+
+  it.each([
+    'fence',
+    'empty',
+    'bucket',
+  ] as const)('keeps the %s post-settle budget assertion ahead of a raw rejection', async (stage) => {
+    const fixture = await createDirectReferenceHarness({
+      manifest: directFixtureManifest({
+        maxProviderRequests: 400,
+        invocationTimeoutMs: 600_000,
+      }),
+    });
+    try {
+      const { ready } = await readyRecovery(fixture);
+      await fixture.success({ kind: 'force-recovery' });
+      await fixture.success({ kind: 'force-observe' });
+      const resources = ready.applicationResources ?? [];
+      expect(resources.length).toBeGreaterThan(0);
+      for (const resource of resources) {
+        expect(
+          fixture.buckets.has(
+            `${resource.jurisdiction}:${resource.bucketName}`,
+          ),
+        ).toBe(true);
+      }
+      const before = await fixture.journal().readForceBefore();
+      const after = await fixture.journal().readForceAfter();
+      expect(before).toBeDefined();
+      expect(after).toBeDefined();
+      const deletes = fixture.projection.requests.filter(
+        (request) => request.method === 'DELETE',
+      );
+      const result = await fixture.forceBudgetProbe(stage);
+      expect(result).toMatchObject({
+        stage,
+        selected: true,
+        typed: true,
+        code: 'budget-exhausted',
+        rawSentinel: false,
+        overflowRefused: true,
+        snapshot: { failure: 'attempts' },
+      });
+      expect(result.nativeFillers).toBe(result.expectedFillers);
+      expect(result.expectedFillers).toBeGreaterThan(0);
+      expect(
+        result.snapshot.providerAttempts +
+          result.snapshot.maintenanceAttempts +
+          result.snapshot.applicationAttempts,
+      ).toBe(fixture.manifest.referenceRuntime.maxProviderRequests);
+      expect(fixture.world.scripts.get(ready.scriptName)?.present).toBe(
+        stage !== 'bucket',
+      );
+      if (stage !== 'bucket') {
+        expect(
+          fixture.projection.requests.filter(
+            (request) => request.method === 'DELETE',
+          ),
+        ).toEqual(deletes);
+      }
+      for (const resource of resources) {
+        expect(
+          fixture.buckets.has(
+            `${resource.jurisdiction}:${resource.bucketName}`,
+          ),
+        ).toBe(true);
+      }
+      expect(await fixture.journal().readForceBefore()).toEqual(before);
+      expect(await fixture.journal().readForceAfter()).toEqual(after);
+      expect(fixture.bridgeErrors).toEqual([]);
+    } finally {
+      await fixture.close();
+    }
+  });
 
   it('force terminal guards the leased identity and clears a terminal row without provider requests', async () => {
     const fixture = await createDirectReferenceHarness();

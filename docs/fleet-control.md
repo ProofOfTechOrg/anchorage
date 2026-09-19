@@ -662,6 +662,8 @@ The scenario force-decommissions role `a`'s terminal row and records that the ca
 
 Start with the [direct configuration shape](../packages/fleet-control/scripts/direct-credentialed-conformance.example.json). Supply the reference and tenant artifacts and their digests, an owned hostname, a disposable resource prefix, explicit request and invocation limits, and `disposableAccount`, the boolean that decides whether the residual scan records account-wide counts beside the prefix-scoped ones. Keep credentials outside the configuration. For the deployment protocol, follow [Roll out an artifact under the execution fence](#roll-out-an-artifact-under-the-execution-fence).
 
+`referenceWorker.maxProviderRequests` counts provider, maintenance, and application HTTP attempts within one invocation; `referenceWorker.subrequestLimit` is a separate platform subrequest limit.
+
 Run this lane on Linux from a repository checkout. It uses a filesystem lock and stores the journal and evidence under `.direct-conformance/<resourcePrefix>/` beside the configuration file. Preserve that directory and the configuration bytes when resuming.
 
 Set these environment variables:
